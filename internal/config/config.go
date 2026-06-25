@@ -7,12 +7,25 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type AIProviderConfig struct {
+	BaseURL      string `yaml:"base_url"`
+	APIKey       string `yaml:"api_key"`
+	DefaultModel string `yaml:"default_model"`
+}
+
+type AIConfig struct {
+	DefaultProvider  string                    `yaml:"default_provider"`
+	FallbackProvider string                    `yaml:"fallback_provider"`
+	Providers        map[string]AIProviderConfig `yaml:"providers"`
+}
+
 type Config struct {
-	Models    ModelConfig    `yaml:"models"`
-	Execution ExecutionConfig `yaml:"execution"`
-	Fallback  FallbackConfig  `yaml:"fallback"`
-	Lynx      LynxConfig      `yaml:"lynx"`
-	MCP       MCPConfig       `yaml:"mcp"`
+	AI        AIConfig         `yaml:"ai"`
+	Models    ModelConfig      `yaml:"models"`
+	Execution ExecutionConfig  `yaml:"execution"`
+	Fallback  FallbackConfig   `yaml:"fallback"`
+	Lynx      LynxConfig       `yaml:"lynx"`
+	MCP       MCPConfig        `yaml:"mcp"`
 }
 
 type ModelConfig struct {
@@ -68,6 +81,17 @@ func Load() (*Config, error) {
 
 func Default() *Config {
 	return &Config{
+		AI: AIConfig{
+			DefaultProvider:  "anthropic",
+			FallbackProvider: "openai",
+			Providers: map[string]AIProviderConfig{
+				"ollama": {
+					BaseURL:      "http://localhost:11434/v1",
+					APIKey:       "ollama",
+					DefaultModel: "qwen2.5-coder:7b",
+				},
+			},
+		},
 		Models: ModelConfig{
 			Default:  "claude-sonnet-4-20250514",
 			Provider: "anthropic",
