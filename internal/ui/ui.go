@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/review"
@@ -25,6 +26,7 @@ type model struct {
 	output   []string
 	width    int
 	height   int
+	gitEng   *git.Engine
 
 	showSuggestions bool
 	suggestionType  string
@@ -32,86 +34,127 @@ type model struct {
 	suggestionIdx   int
 }
 
+const (
+	mintGreen    = "#a6e3a1"
+	dimmedGray   = "#a6adc8"
+	darkGreen    = "#1b4d3e"
+	textColor    = "#cdd6f4"
+	surfaceColor = "#313244"
+	subtleGray   = "#6c7086"
+	errorRed     = "#f38ba8"
+	warningColor = "#fab387"
+	infoBlue     = "#89b4fa"
+	goldColor    = "#f9e2af"
+	pinkColor    = "#f5c2e7"
+	cyanColor    = "#89dceb"
+	tealColor    = "#94e2d5"
+	peachColor   = "#fab387"
+)
+
 var (
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#00FFFF")).
+			Foreground(lipgloss.Color(mintGreen)).
 			Padding(0, 1)
 
 	modeStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#FFA500")).
+			Foreground(lipgloss.Color(dimmedGray)).
 			Padding(0, 1)
 
 	outputStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#E0E0E0")).
+			Foreground(lipgloss.Color(textColor)).
 			Padding(0, 1)
 
 	promptStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#00FF00")).
+			Foreground(lipgloss.Color(mintGreen)).
 			Bold(true)
 
 	separatorStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#666666"))
+			Foreground(lipgloss.Color(darkGreen))
 
 	infoStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#888888"))
+			Foreground(lipgloss.Color(dimmedGray))
 
 	investigationStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#FFD700")).
+				Foreground(lipgloss.Color(goldColor)).
 				Padding(0, 1)
 
 	evidenceStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#87CEEB"))
+			Foreground(lipgloss.Color(cyanColor))
 
 	hypothesisStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#98FB98"))
+			Foreground(lipgloss.Color(tealColor))
 
 	errorStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FF6B6B"))
+			Foreground(lipgloss.Color(errorRed))
 
 	reviewStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FF69B4")).
+			Foreground(lipgloss.Color(pinkColor)).
 			Padding(0, 1)
 
 	riskCriticalStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#FF0000")).
+				Foreground(lipgloss.Color(errorRed)).
 				Bold(true)
 
 	riskHighStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FF4500"))
+			Foreground(lipgloss.Color(peachColor))
 
 	riskMediumStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFA500"))
+			Foreground(lipgloss.Color(warningColor))
 
 	riskLowStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFD700"))
+			Foreground(lipgloss.Color(goldColor))
 
 	riskInfoStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#87CEEB"))
+			Foreground(lipgloss.Color(infoBlue))
 
 	scoreStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#00FF00")).
+			Foreground(lipgloss.Color(mintGreen)).
 			Padding(0, 1)
 
 	suggestionBoxStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("#00FFFF")).
 				Padding(0, 1).
 				Margin(0, 0)
 
 	suggestionHeaderStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("#00FFFF")).
+				Foreground(lipgloss.Color(mintGreen)).
 				Padding(0, 0)
 
 	suggestionSelectedStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#00FF00")).
+				Foreground(lipgloss.Color(mintGreen)).
 				Bold(true)
 
 	suggestionItemStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#AAAAAA"))
+				Foreground(lipgloss.Color(dimmedGray))
+
+	footerLeftStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(dimmedGray))
+
+	footerRightStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(dimmedGray))
+
+	footerModelStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(mintGreen))
+
+	logoStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color(mintGreen))
+
+	contextStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(dimmedGray))
+
+	hintStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(subtleGray))
+
+	menuTitleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color(textColor))
+
+	headerLineStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(darkGreen))
 )
 
 var allCommands = []string{
@@ -129,19 +172,22 @@ var allCommands = []string{
 }
 
 func NewProgram(cfg *config.Config, sess *session.Session) *tea.Program {
+	eng := git.NewEngine(".")
+
 	m := &model{
-		cfg:      cfg,
-		sess:     sess,
+		cfg:    cfg,
+		sess:   sess,
+		gitEng: eng,
 		resolver: modes.NewResolver(),
 		output: []string{
-			"Welcome to Izen — human-centered coding intelligence",
+			"Welcome to Izen \u2014 human-centered coding intelligence",
 		},
 	}
 	m.resolver.Set(sess.Mode)
 
 	m.output = append(m.output,
-		fmt.Sprintf("Mode: /%s — %s", sess.Mode, sess.Mode.Description()),
-		separatorStyle.Render(strings.Repeat("─", 40)),
+		fmt.Sprintf("Mode: /%s \u2014 %s", sess.Mode, sess.Mode.Description()),
+		separatorStyle.Render(strings.Repeat("\u2500", 40)),
 	)
 
 	return tea.NewProgram(m, tea.WithAltScreen())
@@ -170,11 +216,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case tea.KeyEnter:
-			m.dismissSuggestions()
 			line := m.input.String()
 			m.input.Reset()
+
+			if m.showSuggestions && len(m.suggestions) > 0 {
+				line = m.suggestions[m.suggestionIdx]
+			}
+			m.dismissSuggestions()
+
 			if line != "" {
-				m.handleInput(line)
+				cmd := m.handleInput(line)
+				return m, cmd
 			}
 			return m, nil
 
@@ -249,60 +301,152 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) View() string {
-	var b strings.Builder
+	width := m.width
+	if width < 40 {
+		width = 40
+	}
 
-	b.WriteString(titleStyle.Render("Izen"))
-	b.WriteString(" ")
-	b.WriteString(modeStyle.Render("/" + m.resolver.Current().String()))
-	b.WriteString("\n\n")
+	header := m.renderHeader(width)
+	footer := m.renderFooter(width)
 
-	maxOutput := m.height - 5
+	footerHeight := 3
+	headerHeight := 3
+
+	bodyHeight := m.height - headerHeight - footerHeight
+	if bodyHeight < 3 {
+		bodyHeight = 3
+	}
+
+	var body strings.Builder
+	maxOutput := bodyHeight - 2
 	if maxOutput < 1 {
 		maxOutput = 1
 	}
 
 	start := 0
-	if len(m.output) > maxOutput {
+	if len(m.output) > maxOutput && m.showSuggestions == false {
 		start = len(m.output) - maxOutput
+	} else if len(m.output) > maxOutput && m.showSuggestions {
+		suggLines := len(m.suggestions) + 3
+		avail := maxOutput - suggLines
+		if avail < 1 {
+			avail = 1
+		}
+		if len(m.output) > avail {
+			start = len(m.output) - avail
+		}
 	}
 	for _, line := range m.output[start:] {
-		b.WriteString(outputStyle.Render(line))
-		b.WriteString("\n")
+		body.WriteString(outputStyle.Render(line))
+		body.WriteString("\n")
 	}
 
 	if m.showSuggestions && len(m.suggestions) > 0 {
-		b.WriteString("\n")
-		m.renderSuggestions(&b)
-		b.WriteString("\n")
+		body.WriteString("\n")
+		m.renderSuggestions(&body)
+		body.WriteString("\n")
 	}
 
-	b.WriteString("\n")
-	b.WriteString(promptStyle.Render("> "))
-	b.WriteString(m.input.String())
+	body.WriteString("\n")
+	body.WriteString(promptStyle.Render("> "))
+	body.WriteString(m.input.String())
 
-	return b.String()
+	return lipgloss.JoinVertical(lipgloss.Top,
+		header,
+		body.String(),
+		footer,
+	)
+}
+
+func (m *model) renderHeader(width int) string {
+	var h strings.Builder
+
+	logo := logoStyle.Render("Z")
+	h.WriteString(logo)
+
+	h.WriteString("   ")
+
+	wd, _ := os.Getwd()
+	shortWd := shortenPath(wd)
+	ctxText := shortWd
+	if m.sess.Objective != "" {
+		obj := m.sess.Objective
+		if len(obj) > 40 {
+			obj = obj[:40] + "..."
+		}
+		ctxText = ctxText + "  \u2502  " + obj
+	}
+	h.WriteString(contextStyle.Render(ctxText))
+	h.WriteString("\n")
+
+	sep := strings.Repeat("\u2500", width)
+	h.WriteString(separatorStyle.Render(sep))
+
+	return h.String()
+}
+
+func (m *model) renderFooter(width int) string {
+	var f strings.Builder
+
+	sep := strings.Repeat("\u2500", width)
+	f.WriteString(separatorStyle.Render(sep))
+	f.WriteString("\n")
+
+	wd, _ := os.Getwd()
+	shortWd := shortenPath(wd)
+
+	branch, _ := m.gitEng.Branch()
+	left := shortWd
+	if branch != "" {
+		left = left + " (" + branch + ")"
+	}
+
+	provider := m.cfg.Models.Provider
+	modelName := m.cfg.Models.Default
+	if provider == "" {
+		provider = "unknown"
+	}
+	right := "(" + provider + ") " + modelName + " \u2022 active"
+	rightStyled := footerModelStyle.Render(right)
+
+	leftStyled := footerLeftStyle.Render(left)
+	leftW := lipgloss.Width(leftStyled)
+	rightW := lipgloss.Width(rightStyled)
+	gap := width - leftW - rightW
+	if gap < 1 {
+		gap = 1
+	}
+
+	line := leftStyled + strings.Repeat(" ", gap) + rightStyled
+	f.WriteString(line)
+
+	return f.String()
+}
+
+func shortenPath(p string) string {
+	home, _ := os.UserHomeDir()
+	if strings.HasPrefix(p, home) {
+		return "~" + p[len(home):]
+	}
+	return p
 }
 
 func (m *model) renderSuggestions(b *strings.Builder) {
-	header := " Commands "
+	header := "commands"
 	if m.suggestionType == "@" {
-		header = " Files "
+		header = "files"
 	}
-	b.WriteString(suggestionBoxStyle.Render(func() string {
-		var sb strings.Builder
-		sb.WriteString(suggestionHeaderStyle.Render(header))
-		sb.WriteString("\n")
-		for i, s := range m.suggestions {
-			if i == m.suggestionIdx {
-				sb.WriteString(suggestionSelectedStyle.Render("▸ " + s))
-			} else {
-				sb.WriteString(suggestionItemStyle.Render("  " + s))
-			}
-			sb.WriteString("\n")
+	b.WriteString(menuTitleStyle.Render("select a " + header))
+	b.WriteString("\n")
+	for i, s := range m.suggestions {
+		if i == m.suggestionIdx {
+			b.WriteString(suggestionSelectedStyle.Render("-> " + s))
+		} else {
+			b.WriteString(suggestionItemStyle.Render("   " + s))
 		}
-		sb.WriteString(infoStyle.Render(" [Tab] cycle  [Enter] select  [Esc] dismiss"))
-		return sb.String()
-	}()))
+		b.WriteString("\n")
+	}
+	b.WriteString(hintStyle.Render("press enter to confirm or esc to go back"))
 }
 
 func (m *model) dismissSuggestions() {
@@ -373,10 +517,10 @@ func filterFiles(prefix string) []string {
 	return matches
 }
 
-func (m *model) handleInput(line string) {
+func (m *model) handleInput(line string) tea.Cmd {
 	line = strings.TrimSpace(line)
 	if line == "" {
-		return
+		return nil
 	}
 
 	line = m.expandFileRefs(line)
@@ -384,28 +528,27 @@ func (m *model) handleInput(line string) {
 	switch {
 	case line == "/help" || line == "/?":
 		m.output = append(m.output, "Available modes:")
-		m.output = append(m.output, "  /ask          — explain, inspect, understand (read-only)")
-		m.output = append(m.output, "  /plan         — architecture, migrations, refactors (no exec)")
-		m.output = append(m.output, "  /build        — implement, refactor, write tests (controlled exec)")
-		m.output = append(m.output, "  /investigate  — debug bugs, failures, regressions")
-		m.output = append(m.output, "  /review       — audit changes, detect risks")
+		m.output = append(m.output, "  /ask          - explain, inspect, understand (read-only)")
+		m.output = append(m.output, "  /plan         - architecture, migrations, refactors (no exec)")
+		m.output = append(m.output, "  /build        - implement, refactor, write tests (controlled exec)")
+		m.output = append(m.output, "  /investigate  - debug bugs, failures, regressions")
+		m.output = append(m.output, "  /review       - audit changes, detect risks")
 		m.output = append(m.output, "")
 		m.output = append(m.output, "Commands:")
-		m.output = append(m.output, "  /help         — show this help")
-		m.output = append(m.output, "  /mode <name>  — switch mode")
-		m.output = append(m.output, "  /exit         — exit Izen")
-		m.output = append(m.output, "  Ctrl+C / Esc  — exit Izen")
+		m.output = append(m.output, "  /help         - show this help")
+		m.output = append(m.output, "  /mode <name>  - switch mode")
+		m.output = append(m.output, "  /exit         - exit Izen")
+		m.output = append(m.output, "  Ctrl+C / Esc  - exit Izen")
 		m.output = append(m.output, "")
 		m.output = append(m.output, "File References:")
-		m.output = append(m.output, "  @<pattern>    — reference a file (e.g. @main.go)")
-		return
+		m.output = append(m.output, "  @<pattern>    - reference a file (e.g. @main.go)")
+		return nil
 
 	case line == "/exit" || line == "/quit":
 		m.sess.SetMode(m.resolver.Current())
 		m.sess.Save()
 		m.output = append(m.output, "Goodbye.")
-		m.input.Reset()
-		return
+		return tea.Quit
 
 	case strings.HasPrefix(line, "/mode"):
 		parts := strings.Fields(line)
@@ -416,13 +559,13 @@ func (m *model) handleInput(line string) {
 				m.sess.SetMode(mode)
 				m.sess.Save()
 				m.output = append(m.output,
-					fmt.Sprintf("Mode: /%s — %s", mode, mode.Description()),
+					fmt.Sprintf("Mode: /%s \u2014 %s", mode, mode.Description()),
 				)
-				return
+				return nil
 			}
 		}
 		m.output = append(m.output, "Usage: /mode <ask|plan|build|investigate|review>")
-		return
+		return nil
 
 	case strings.HasPrefix(line, "/objective"):
 		obj := strings.TrimPrefix(line, "/objective")
@@ -434,7 +577,7 @@ func (m *model) handleInput(line string) {
 		} else {
 			m.output = append(m.output, "Usage: /objective <description>")
 		}
-		return
+		return nil
 	}
 
 	newMode := m.resolver.Resolve(line)
@@ -444,13 +587,13 @@ func (m *model) handleInput(line string) {
 		m.sess.SetMode(newMode)
 		m.sess.Save()
 		m.output = append(m.output,
-			fmt.Sprintf("Switched to /%s — %s", newMode, newMode.Description()),
+			fmt.Sprintf("Switched to /%s \u2014 %s", newMode, newMode.Description()),
 		)
 	}
 
 	content := stripModePrefix(line)
 	if content == "" {
-		return
+		return nil
 	}
 
 	switch m.resolver.Current() {
@@ -463,6 +606,7 @@ func (m *model) handleInput(line string) {
 			fmt.Sprintf("[%s] %s", strings.ToUpper(m.resolver.Current().String()), content),
 		)
 	}
+	return nil
 }
 
 func stripModePrefix(line string) string {
@@ -502,7 +646,7 @@ func (m *model) handleInvestigateInput(line string) {
 	sess := m.sess
 	investDir := filepath.Join(".izen", "investigations")
 
-	m.output = append(m.output, separatorStyle.Render("━ Running investigation ━"))
+	m.output = append(m.output, separatorStyle.Render("\u2501 Running investigation \u2501"))
 
 	eng := investigate.NewEngine(".", line, nil, nil)
 	result, err := eng.Run()
@@ -526,12 +670,12 @@ func (m *model) handleInvestigateInput(line string) {
 	}
 
 	for _, h := range result.Hypotheses {
-		statusSym := "○"
+		statusSym := "\u25cb"
 		switch h.Status {
 		case investigate.HypothesisConfirmed:
-			statusSym = "✓"
+			statusSym = "\u2713"
 		case investigate.HypothesisRejected:
-			statusSym = "✗"
+			statusSym = "\u2717"
 		}
 		m.output = append(m.output, hypothesisStyle.Render(
 			fmt.Sprintf("  %s %s [%s] (%.0f%%)", statusSym, h.Theory, h.Status, h.Confidence*100)))
@@ -553,13 +697,13 @@ func (m *model) handleInvestigateInput(line string) {
 	sess.SetInvestigationID(result.Problem)
 	os.MkdirAll(investDir, 0755)
 
-	m.output = append(m.output, separatorStyle.Render("━ Investigation complete ━"))
+	m.output = append(m.output, separatorStyle.Render("\u2501 Investigation complete \u2501"))
 }
 
 func (m *model) handleReviewInput(line string) {
 	sess := m.sess
 
-	m.output = append(m.output, separatorStyle.Render("━ Running review ━"))
+	m.output = append(m.output, separatorStyle.Render("\u2501 Running review \u2501"))
 
 	eng := review.NewEngine(".", nil, nil)
 	result, err := eng.Run()
@@ -575,7 +719,7 @@ func (m *model) handleReviewInput(line string) {
 	}
 
 	m.output = append(m.output, reviewStyle.Render(
-		fmt.Sprintf("Review: %s → %s", result.BaseBranch, result.Branch)))
+		fmt.Sprintf("Review: %s \u2192 %s", result.BaseBranch, result.Branch)))
 	m.output = append(m.output, reviewStyle.Render(
 		fmt.Sprintf("Commit: %s | Files: %d | Duration: %s",
 			result.CommitHash, len(result.FilesChanged), result.Duration)))
@@ -600,7 +744,7 @@ func (m *model) handleReviewInput(line string) {
 			case "deleted":
 				statusSym = "-"
 			case "renamed":
-				statusSym = "→"
+				statusSym = "\u2192"
 			}
 			m.output = append(m.output, infoStyle.Render(
 				fmt.Sprintf("  %s %s (+%d/-%d)", statusSym, f.Path, f.Additions, f.Deletions)))
@@ -641,7 +785,7 @@ func (m *model) handleReviewInput(line string) {
 					code = code[:50] + "..."
 				}
 				m.output = append(m.output, style.Render(
-					fmt.Sprintf("    %s:%d — %s", f.File, f.Line, f.Description)))
+					fmt.Sprintf("    %s:%d \u2014 %s", f.File, f.Line, f.Description)))
 			}
 		}
 	}
@@ -656,5 +800,5 @@ func (m *model) handleReviewInput(line string) {
 	sess.SetReviewID(result.Branch + "@" + result.CommitHash)
 	review.SaveReport(result, ".")
 
-	m.output = append(m.output, separatorStyle.Render("━ Review complete ━"))
+	m.output = append(m.output, separatorStyle.Render("\u2501 Review complete \u2501"))
 }
