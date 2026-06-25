@@ -20,11 +20,16 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/review"
+	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
 type tokenMsg string
-type streamDoneMsg struct{ content string }
+type streamDoneMsg struct {
+	content     string
+	tokenInput  int
+	tokenOutput int
+}
 type streamErrMsg struct{ err error }
 
 type model struct {
@@ -38,7 +43,11 @@ type model struct {
 	height   int
 	gitEng   *git.Engine
 
-	streamCh chan tea.Msg
+	streamCh       chan tea.Msg
+	responseBuffer strings.Builder
+	streaming      bool
+	tokenInput     int
+	tokenOutput    int
 
 	showSuggestions bool
 	suggestionType  string
@@ -269,12 +278,22 @@ func (m *model) Init() tea.Cmd {
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tokenMsg:
-		m.output = append(m.output, string(msg))
+		chunk := string(msg)
+		m.responseBuffer.WriteString(chunk)
 		return m, m.readStream()
 
 	case streamDoneMsg:
 		m.streamCh = nil
+		m.streaming = false
+		m.tokenInput += msg.tokenInput
+		m.tokenOutput += msg.tokenOutput
+		finalContent := msg.content
+		if finalContent == "" {
+			finalContent = m.responseBuffer.String()
+		}
+		m.output = append(m.output, finalContent)
 		m.output = append(m.output, separatorStyle.Render("\u2501 Response complete \u2501"))
+		m.responseBuffer.Reset()
 		return m, nil
 
 	case streamErrMsg:
@@ -337,6 +356,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.dismissSuggestions()
 			}
+			return m, nil
+
+		case tea.KeySpace:
+			m.input.WriteString(" ")
+			m.updateSuggestions()
 			return m, nil
 
 		case tea.KeyRunes:
@@ -419,6 +443,11 @@ func (m *model) View() string {
 	}
 	for _, line := range m.output[start:] {
 		body.WriteString(outputStyle.Render(line))
+		body.WriteString("\n")
+	}
+
+	if m.streaming && m.responseBuffer.Len() > 0 {
+		body.WriteString(outputStyle.Render(m.responseBuffer.String()))
 		body.WriteString("\n")
 	}
 
@@ -564,7 +593,31 @@ func (m *model) renderFooter(width int) string {
 
 	provider := m.cfg.ActiveProviderName()
 	modelName := m.cfg.ActiveModelName()
-	right := "(" + provider + ") " + modelName + " \u2022 active"
+
+	totalTokens := m.tokenInput + m.tokenOutput
+	maxContext := 32768
+	pct := float64(totalTokens) / float64(maxContext) * 100
+
+	var tokensStr string
+	if totalTokens >= 1000 {
+		tokensStr = fmt.Sprintf("%.1fk/%dk", float64(totalTokens)/1000, maxContext/1000)
+	} else {
+		tokensStr = fmt.Sprintf("%d/%dk", totalTokens, maxContext/1000)
+	}
+
+	var costStr string
+	switch provider {
+	case "ollama":
+		costStr = "$0.00 (local)"
+	default:
+		rateInput := 3.0 / 1_000_000
+		rateOutput := 15.0 / 1_000_000
+		cost := float64(m.tokenInput)*rateInput + float64(m.tokenOutput)*rateOutput
+		costStr = fmt.Sprintf("$%.4f", cost)
+	}
+
+	right := fmt.Sprintf("(%s) %s \u2022 %s tokens (%.1f%%) \u2022 %s | active",
+		provider, modelName, tokensStr, pct, costStr)
 
 	leftStyled := footerLeftStyle.Render(left)
 	rightStyled := footerModelStyle.Render(right)
@@ -725,17 +778,20 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		stream, err := m.provider.ExecuteStream(ctx, req)
+		rawStream, err := m.provider.ExecuteStream(ctx, req)
 		if err != nil {
 			m.streamCh <- streamErrMsg{err: err}
 			return
 		}
-		defer stream.Close()
+		defer rawStream.Close()
 
-		m.streamCh <- tokenMsg("--- streaming response ---")
-
+		tokIn, tokOut := 0, 0
 		var full strings.Builder
 		buf := make([]byte, 4096)
+		stream := rawStream
+		if sr, ok := rawStream.(*providers.StreamResult); ok {
+			stream = sr
+		}
 		for {
 			n, err := stream.Read(buf)
 			if n > 0 {
@@ -744,7 +800,10 @@ func (m *model) streamCmd(content string) tea.Cmd {
 				m.streamCh <- tokenMsg(chunk)
 			}
 			if err == io.EOF {
-				m.streamCh <- streamDoneMsg{content: full.String()}
+				if sr, ok := rawStream.(*providers.StreamResult); ok {
+					tokIn, tokOut = sr.Usage()
+				}
+				m.streamCh <- streamDoneMsg{content: full.String(), tokenInput: tokIn, tokenOutput: tokOut}
 				return
 			}
 			if err != nil {
@@ -875,6 +934,8 @@ func (m *model) handleInput(line string) tea.Cmd {
 		m.output = append(m.output,
 			fmt.Sprintf("[%s] %s", strings.ToUpper(m.resolver.Current().String()), content),
 		)
+		m.streaming = true
+		m.responseBuffer.Reset()
 		return m.streamCmd(content)
 	}
 }

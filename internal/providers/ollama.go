@@ -190,13 +190,34 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		return nil, fmt.Errorf("ollama: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	return &sseReader{body: resp.Body}, nil
+	sr := &sseReader{body: resp.Body}
+	return &StreamResult{ReadCloser: sr, sr: sr}, nil
+}
+
+type StreamResult struct {
+	io.ReadCloser
+	sr *sseReader
+}
+
+func (r *StreamResult) Usage() (input, output int) {
+	if r.sr != nil && r.sr.finalUsage != nil {
+		return r.sr.finalUsage.PromptTokens, r.sr.finalUsage.CompletionTokens
+	}
+	return 0, 0
 }
 
 type sseReader struct {
-	body   io.ReadCloser
-	reader *bufio.Reader
-	closed bool
+	body      io.ReadCloser
+	reader    *bufio.Reader
+	closed    bool
+	finalUsage *usage
+}
+
+func (s *sseReader) Usage() (input, output int) {
+	if s.finalUsage != nil {
+		return s.finalUsage.PromptTokens, s.finalUsage.CompletionTokens
+	}
+	return 0, 0
 }
 
 func (s *sseReader) Read(p []byte) (int, error) {
@@ -237,6 +258,10 @@ func (s *sseReader) Read(p []byte) (int, error) {
 
 		if len(chunk.Choices) == 0 {
 			continue
+		}
+
+		if chunk.Usage != nil {
+			s.finalUsage = chunk.Usage
 		}
 
 		if chunk.Choices[0].Delta != nil && chunk.Choices[0].Delta.Content != "" {
