@@ -803,6 +803,10 @@ func (m *model) streamCmd(content string) tea.Cmd {
 				if sr, ok := rawStream.(*providers.StreamResult); ok {
 					tokIn, tokOut = sr.Usage()
 				}
+				if tokIn == 0 && tokOut == 0 {
+					tokIn = len(content) / 4
+					tokOut = full.Len() / 4
+				}
 				m.streamCh <- streamDoneMsg{content: full.String(), tokenInput: tokIn, tokenOutput: tokOut}
 				return
 			}

@@ -13,7 +13,41 @@ import (
 	"github.com/PizenLabs/izen/internal/ui"
 )
 
+var Version = "0.1.0"
+
+func printMinimalistHelp() {
+	fmt.Println("izen — human-centered coding intelligence")
+	fmt.Println()
+	fmt.Println("Usage:")
+	fmt.Println("  izen                    Start the interactive TUI")
+	fmt.Println("  izen version            Show version information")
+	fmt.Println("  izen help               Show this help message")
+	fmt.Println()
+	fmt.Println("Interactive Commands (inside TUI):")
+	fmt.Println("  /ask          Explain, inspect, understand (read-only)")
+	fmt.Println("  /plan         Architecture, migrations, refactors (no exec)")
+	fmt.Println("  /build        Implement, refactor, write tests (controlled exec)")
+	fmt.Println("  /investigate  Debug bugs, failures, regressions")
+	fmt.Println("  /review       Audit changes, detect risks")
+	fmt.Println("  /help         Show interactive help")
+	fmt.Println("  /mode <name>  Switch mode")
+	fmt.Println("  /q            Exit Izen")
+	fmt.Println("  !<cmd>        Run a shell command")
+	fmt.Println("  Ctrl+C / Esc  Exit Izen")
+}
+
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "version":
+			fmt.Printf("izen version v%s (PizenLabs)\n", Version)
+			os.Exit(0)
+		case "help", "--help", "-h":
+			printMinimalistHelp()
+			os.Exit(0)
+		}
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)

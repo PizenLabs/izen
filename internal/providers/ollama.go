@@ -138,6 +138,14 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		tokenIn = ollamaResp.Usage.PromptTokens
 		tokenOut = ollamaResp.Usage.CompletionTokens
 	}
+	if tokenIn == 0 && tokenOut == 0 {
+		promptLen := 0
+		for _, m := range req.Messages {
+			promptLen += len(m.Content)
+		}
+		tokenIn = promptLen / 4
+		tokenOut = len(content) / 4
+	}
 
 	return &ai.Response{
 		Content:     content,
