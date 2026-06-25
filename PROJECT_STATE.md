@@ -86,7 +86,7 @@ izen/
 | 5 | Context Engine — Context builder, signal compression | Complete |
 | 6 | Investigate Mode — Hypothesis-evidence loop, proximity slicing, test iteration | Complete |
 | **7** | **Lynx Monolith Integration & Deep Semantic** | **Complete** |
-| 8 | Review Mode, Risk Audit & MCP Ecosystem | Pending |
+| 8 | Review Mode, Risk Audit & MCP Ecosystem | Complete |
 
 ---
 
@@ -179,6 +179,16 @@ internal/lynx/embed_none.go                     (81 lines)  — Fallback binary 
 internal/lynx/lynx.go                           (97 lines)  — Controller, cache queries, semantic heuristics
 internal/lynx/mutation.go                       (468 lines) — go/ast + go/types mutation tracing
 internal/lynx/lynx_test.go                      (195 lines) — 12 tests
+internal/mcp/gateway.go                         (186 lines) — MCP gateway interface + manager
+internal/mcp/github.go                          (202 lines) — GitHub Issues integration
+internal/mcp/jira.go                            (256 lines) — Jira integration
+internal/mcp/linear.go                          (268 lines) — Linear integration
+internal/modes/review/types.go                  (138 lines) — Review types (State, DiffFile, RiskFinding, ReviewResult)
+internal/modes/review/state.go                  (102 lines) — 6-state review state machine
+internal/modes/review/diff.go                   (217 lines) — Git diff parsing and impact analysis
+internal/modes/review/risk.go                   (471 lines) — AST-based risk audit sandbox
+internal/modes/review/impact.go                 (321 lines) — Impact radius and import chain analysis
+internal/modes/review/engine.go                 (283 lines) — Review orchestrator
 ```
 
 ### Test Coverage
@@ -190,19 +200,22 @@ internal/lynx/lynx_test.go                      (195 lines) — 12 tests
 | internal/git | (via execution) | All pass |
 | internal/graph | 3 | All pass |
 | internal/lynx | 12 | All pass |
+| internal/mcp | 28 | All pass |
 | internal/modes/investigate | 40 | All pass |
+| internal/modes/review | 62 | All pass |
 | internal/retrieval | 8 | All pass |
-| **Total** | **~93** | **100% pass** |
+| **Total** | **~183** | **100% pass** |
 
 ---
 
 ## Todo
 
-### Phase 8 — Review Mode, Risk Audit & MCP Ecosystem
-- [ ] Review Engine: Git diff impact radius analysis
-- [ ] Risk Audit Sandbox: pre-flight AST validation
-- [ ] MCP Gateway: GitHub Issues, Jira, Linear integrations
-- [ ] `/review` mode state machine and UI
+### Phase 8 — Review Mode, Risk Audit & MCP Ecosystem (Complete)
+- [x] Review Engine: git diff impact radius analysis
+- [x] Risk Audit Sandbox: pre-flight AST validation
+- [x] MCP Gateway: GitHub Issues, Jira, Linear integrations
+- [x] `/review` mode state machine and UI
+- [x] Tests: 62 review mode tests + 28 MCP tests (90 total, all pass)
 
 ### Cross-cutting
 - [ ] Provider implementations (OpenAI, Anthropic, OpenRouter clients)
@@ -248,12 +261,12 @@ internal/lynx/lynx_test.go                      (195 lines) — 12 tests
 |--------|-------|
 | Go files | 37 |
 | Total LOC (source) | ~5,400 |
-| Total LOC (tests) | ~1,913 |
-| Test count | ~93 |
+| Total LOC (tests) | ~3,000 |
+| Test count | ~183 |
 | Dependencies | bubbletea, lipgloss, tree-sitter, yaml.v3 |
 | External submodules | lynx (Rust) |
 | Build time | < 1s (no embed), ~1s (with embed) |
-| Phase completion | 7/8 (87.5%) |
+| Phase completion | 8/8 (100%) |
 
 ---
 

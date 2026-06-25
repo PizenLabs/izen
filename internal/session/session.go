@@ -16,6 +16,7 @@ type Session struct {
 	Questions       []string   `json:"questions,omitempty"`
 	Checkpoints     []string   `json:"checkpoints,omitempty"`
 	InvestigationID string     `json:"investigation_id,omitempty"`
+	ReviewID        string     `json:"review_id,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
 	path            string
@@ -98,6 +99,25 @@ func (s *Session) InvestigationDir() string {
 
 func (s *Session) SaveInvestigation(data []byte) error {
 	dir := s.InvestigationDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "report.json"), data, 0644)
+}
+
+func (s *Session) SetReviewID(id string) {
+	s.ReviewID = id
+}
+
+func (s *Session) ReviewDir() string {
+	if s.ReviewID == "" {
+		return filepath.Join(".izen", "reviews")
+	}
+	return filepath.Join(".izen", "reviews", s.ReviewID)
+}
+
+func (s *Session) SaveReview(data []byte) error {
+	dir := s.ReviewDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
+	"github.com/PizenLabs/izen/internal/modes/review"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -62,6 +63,31 @@ var (
 
 	errorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FF6B6B"))
+
+	reviewStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FF69B4")).
+			Padding(0, 1)
+
+	riskCriticalStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FF0000")).
+				Bold(true)
+
+	riskHighStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FF4500"))
+
+	riskMediumStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFA500"))
+
+	riskLowStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFD700"))
+
+	riskInfoStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#87CEEB"))
+
+	scoreStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#00FF00")).
+			Padding(0, 1)
 )
 
 func NewProgram(cfg *config.Config, sess *session.Session) *tea.Program {
@@ -221,9 +247,12 @@ func (m *model) handleInput(line string) {
 		}
 
 	default:
-		if m.resolver.Current() == modes.ModeInvestigate {
+		switch m.resolver.Current() {
+		case modes.ModeInvestigate:
 			m.handleInvestigateInput(line)
-		} else {
+		case modes.ModeReview:
+			m.handleReviewInput(line)
+		default:
 			m.output = append(m.output,
 				fmt.Sprintf("[%s] %s", strings.ToUpper(m.resolver.Current().String()), line),
 			)
@@ -287,4 +316,107 @@ func (m *model) handleInvestigateInput(line string) {
 	os.MkdirAll(investDir, 0755)
 
 	m.output = append(m.output, separatorStyle.Render("━ Investigation complete ━"))
+}
+
+func (m *model) handleReviewInput(line string) {
+	sess := m.sess
+
+	m.output = append(m.output, separatorStyle.Render("━ Running review ━"))
+
+	eng := review.NewEngine(".", nil, nil)
+	result, err := eng.Run()
+
+	if err != nil {
+		m.output = append(m.output, errorStyle.Render("Review error: "+err.Error()))
+		return
+	}
+
+	if result.Error != "" {
+		m.output = append(m.output, infoStyle.Render(result.Error))
+		return
+	}
+
+	m.output = append(m.output, reviewStyle.Render(
+		fmt.Sprintf("Review: %s → %s", result.BaseBranch, result.Branch)))
+	m.output = append(m.output, reviewStyle.Render(
+		fmt.Sprintf("Commit: %s | Files: %d | Duration: %s",
+			result.CommitHash, len(result.FilesChanged), result.Duration)))
+
+	scoreColor := scoreStyle
+	if result.Score < 50 {
+		scoreColor = errorStyle
+	} else if result.Score < 75 {
+		scoreColor = riskHighStyle
+	}
+	m.output = append(m.output, scoreColor.Render(
+		fmt.Sprintf("Review Score: %d/100 | Risk Score: %d/100",
+			result.Score, result.ImpactRadius.RiskScore)))
+
+	if len(result.FilesChanged) > 0 {
+		m.output = append(m.output, infoStyle.Render("Changed Files:"))
+		for _, f := range result.FilesChanged {
+			statusSym := "~"
+			switch f.Status {
+			case "added":
+				statusSym = "+"
+			case "deleted":
+				statusSym = "-"
+			case "renamed":
+				statusSym = "→"
+			}
+			m.output = append(m.output, infoStyle.Render(
+				fmt.Sprintf("  %s %s (+%d/-%d)", statusSym, f.Path, f.Additions, f.Deletions)))
+		}
+	}
+
+	if len(result.ImpactRadius.IndirectFiles) > 0 {
+		impactMsg := fmt.Sprintf("Impact Radius: %d direct, %d indirect files, %d packages",
+			len(result.ImpactRadius.DirectFiles),
+			len(result.ImpactRadius.IndirectFiles),
+			len(result.ImpactRadius.AffectedPkgs))
+		m.output = append(m.output, riskMediumStyle.Render(impactMsg))
+	}
+
+	severityOrder := []review.RiskSeverity{review.RiskCritical, review.RiskHigh, review.RiskMedium, review.RiskLow, review.RiskInfo}
+	severityStyles := map[review.RiskSeverity]lipgloss.Style{
+		review.RiskCritical: riskCriticalStyle,
+		review.RiskHigh:     riskHighStyle,
+		review.RiskMedium:   riskMediumStyle,
+		review.RiskLow:      riskLowStyle,
+		review.RiskInfo:     riskInfoStyle,
+	}
+
+	for _, sev := range severityOrder {
+		var sevFindings []review.RiskFinding
+		for _, f := range result.RiskFindings {
+			if f.Severity == sev {
+				sevFindings = append(sevFindings, f)
+			}
+		}
+		if len(sevFindings) > 0 {
+			style := severityStyles[sev]
+			m.output = append(m.output, style.Render(
+				fmt.Sprintf("  [%s] (%d findings)", strings.ToUpper(string(sev)), len(sevFindings))))
+			for _, f := range sevFindings {
+				code := f.Code
+				if len(code) > 50 {
+					code = code[:50] + "..."
+				}
+				m.output = append(m.output, style.Render(
+					fmt.Sprintf("    %s:%d — %s", f.File, f.Line, f.Description)))
+			}
+		}
+	}
+
+	if len(result.Recommendations) > 0 {
+		m.output = append(m.output, reviewStyle.Render("Recommendations:"))
+		for i, rec := range result.Recommendations {
+			m.output = append(m.output, infoStyle.Render(fmt.Sprintf("  %d. %s", i+1, rec)))
+		}
+	}
+
+	sess.SetReviewID(result.Branch + "@" + result.CommitHash)
+	review.SaveReport(result, ".")
+
+	m.output = append(m.output, separatorStyle.Render("━ Review complete ━"))
 }
