@@ -41,6 +41,15 @@ func (e *Engine) IsRepo() bool {
 	return err == nil
 }
 
+func (e *Engine) Init() error {
+	out, err := e.git("init")
+	if err != nil {
+		return err
+	}
+	_ = out
+	return nil
+}
+
 func (e *Engine) Status() ([]StatusEntry, error) {
 	out, err := e.git("status", "--porcelain")
 	if err != nil {
