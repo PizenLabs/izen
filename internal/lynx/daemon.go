@@ -13,22 +13,24 @@ import (
 )
 
 type Process struct {
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stdout   io.ReadCloser
-	stderr   io.ReadCloser
-	mu       sync.Mutex
-	running  bool
-	stopCh   chan struct{}
-	root     string
-	started  time.Time
-	ready    bool
+	cmd           *exec.Cmd
+	stdin         io.WriteCloser
+	stdout        io.ReadCloser
+	stderr        io.ReadCloser
+	mu            sync.Mutex
+	running       bool
+	stopCh        chan struct{}
+	root          string
+	started       time.Time
+	stderrBuf     strings.Builder
+	stderrDone    chan struct{}
 }
 
 func NewProcess(root string) *Process {
 	return &Process{
-		root:   root,
-		stopCh: make(chan struct{}),
+		root:       root,
+		stopCh:     make(chan struct{}),
+		stderrDone: make(chan struct{}),
 	}
 }
 
@@ -78,50 +80,22 @@ func (p *Process) Start() error {
 	p.running = true
 	p.started = time.Now()
 
-	go p.drainStderr()
-	go p.waitForReady()
+	go p.captureStderr()
 
 	return nil
 }
 
-func (p *Process) waitForReady() {
-	scanner := bufio.NewScanner(p.stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024)
-
-	deadline := time.After(10 * time.Second)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		if strings.Contains(line, `"id"`) || strings.Contains(line, "initialize") {
-			p.mu.Lock()
-			p.ready = true
-			p.mu.Unlock()
-			return
-		}
-
-		select {
-		case <-deadline:
-			p.mu.Lock()
-			p.ready = true
-			p.mu.Unlock()
-			return
-		default:
-		}
-	}
-
-	p.mu.Lock()
-	p.ready = true
-	p.mu.Unlock()
+func (p *Process) StderrLog() string {
+	return p.stderrBuf.String()
 }
 
-func (p *Process) drainStderr() {
+func (p *Process) captureStderr() {
+	defer close(p.stderrDone)
 	scanner := bufio.NewScanner(p.stderr)
 	for scanner.Scan() {
 		line := scanner.Text()
+		p.stderrBuf.WriteString(line)
+		p.stderrBuf.WriteByte('\n')
 		if strings.Contains(line, "error") || strings.Contains(line, "Error") {
 			fmt.Fprintf(os.Stderr, "lynx: %s\n", line)
 		}
@@ -130,11 +104,14 @@ func (p *Process) drainStderr() {
 
 func (p *Process) Stop() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if !p.running {
+		p.mu.Unlock()
 		return nil
 	}
+
+	p.running = false
+	p.mu.Unlock()
 
 	close(p.stopCh)
 
@@ -154,8 +131,8 @@ func (p *Process) Stop() error {
 		<-done
 	}
 
-	p.running = false
-	p.ready = false
+	<-p.stderrDone
+
 	return nil
 }
 
@@ -163,12 +140,6 @@ func (p *Process) IsRunning() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.running
-}
-
-func (p *Process) IsReady() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.ready
 }
 
 func (p *Process) Stdin() io.WriteCloser {
@@ -180,7 +151,7 @@ func (p *Process) Stdout() io.ReadCloser {
 }
 
 func (p *Process) Uptime() time.Duration {
-	if !p.running {
+	if !p.IsRunning() {
 		return 0
 	}
 	return time.Since(p.started)
@@ -219,27 +190,40 @@ func (d *Daemon) Start() error {
 		return fmt.Errorf("lynx start daemon: %w", err)
 	}
 
-	deadline := time.After(10 * time.Second)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
+	// The Lynx MCP server does not write to stdout until it receives a
+	// request.  Wait briefly for the process to either initialize and
+	// block on stdin, or crash.
+	aliveDeadline := time.After(3 * time.Second)
+	alive := false
 	for {
+		if p.IsRunning() {
+			alive = true
+			break
+		}
 		select {
-		case <-ticker.C:
-			if p.IsReady() {
-				d.process = p
-				d.client = NewClient(p)
-				if err := d.client.Initialize(); err != nil {
-					p.Stop()
-					return fmt.Errorf("lynx initialize: %w", err)
-				}
-				return nil
+		case <-aliveDeadline:
+			stderrLog := p.StderrLog()
+			if stderrLog != "" {
+				return fmt.Errorf("lynx process exited: %s", stderrLog)
 			}
-		case <-deadline:
-			p.Stop()
-			return fmt.Errorf("lynx daemon startup timeout")
+			return fmt.Errorf("lynx process exited prematurely")
+		default:
+			time.Sleep(50 * time.Millisecond)
 		}
 	}
+	if !alive {
+		return fmt.Errorf("lynx process exited before initialization")
+	}
+
+	d.process = p
+	d.client = NewClient(p)
+
+	if err := d.client.Initialize(); err != nil {
+		p.Stop()
+		return fmt.Errorf("lynx initialize: %w", err)
+	}
+
+	return nil
 }
 
 func (d *Daemon) Stop() error {
