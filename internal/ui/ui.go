@@ -217,29 +217,45 @@ var globalCommands = []string{
 	"/help",
 	"/mode",
 	"/objective",
-	"/q",
-	"/exit",
+	"/quit",
 }
 
-var allCommands []string
-
-func init() {
-	allCommands = append(allCommands, coreModes...)
-	seen := map[string]bool{}
-	for _, cmds := range utilityCommands {
-		for _, c := range cmds {
-			if !seen[c] {
-				allCommands = append(allCommands, c)
-				seen[c] = true
-			}
+func cmdCategory(cmd string) string {
+	for _, c := range coreModes {
+		if c == cmd {
+			return "core"
 		}
 	}
 	for _, c := range globalCommands {
-		if !seen[c] {
-			allCommands = append(allCommands, c)
-			seen[c] = true
+		if c == cmd {
+			return "global"
 		}
 	}
+	return "utility"
+}
+
+func (m *model) filterCommands(prefix string) []string {
+	var result []string
+	matches := func(cmd string) bool {
+		return prefix == "" || strings.HasPrefix(cmd, "/"+prefix)
+	}
+	currentMode := m.resolver.Current()
+	for _, c := range coreModes {
+		if matches(c) {
+			result = append(result, c)
+		}
+	}
+	for _, c := range utilityCommands[currentMode] {
+		if matches(c) {
+			result = append(result, c)
+		}
+	}
+	for _, c := range globalCommands {
+		if matches(c) {
+			result = append(result, c)
+		}
+	}
+	return result
 }
 
 func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea.Program {
@@ -372,7 +388,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case current == "/":
 				m.showSuggestions = true
 				m.suggestionType = "/"
-				m.suggestions = filterCommands("")
+				m.suggestions = m.filterCommands("")
 				m.suggestionIdx = 0
 
 			case current == "@":
@@ -382,7 +398,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.suggestionIdx = 0
 
 			case m.showSuggestions && m.suggestionType == "/" && strings.HasPrefix(current, "/"):
-				m.suggestions = filterCommands(current[1:])
+				m.suggestions = m.filterCommands(current[1:])
 				m.suggestionIdx = 0
 				if len(m.suggestions) == 1 && m.suggestions[0] == current {
 					m.showSuggestions = false
@@ -661,19 +677,29 @@ func (m *model) renderSuggestions(b *strings.Builder) {
 	b.WriteString(menuTitleStyle.Render("command palette"))
 	b.WriteString("\n")
 
+	prevCat := ""
 	for i, s := range m.suggestions {
-		isCore := false
-		for _, c := range coreModes {
-			if c == s {
-				isCore = true
-				break
+		cat := cmdCategory(s)
+		if cat != prevCat {
+			prevCat = cat
+			var label string
+			switch cat {
+			case "core":
+				label = "Core Modes"
+			case "utility":
+				label = "Utilities (" + m.resolver.Current().String() + ")"
+			case "global":
+				label = "Global"
 			}
+			b.WriteString(utilitiesLabelStyle.Render("  " + label))
+			b.WriteString("\n")
 		}
+
 		if i == m.suggestionIdx {
 			b.WriteString(suggestionSelectedStyle.Render("-> " + s))
 		} else {
 			style := suggestionItemStyle
-			if isCore {
+			if cat == "core" {
 				style = style.Foreground(lipgloss.Color(textColor))
 			}
 			b.WriteString(style.Render("   " + s))
@@ -699,7 +725,7 @@ func (m *model) updateSuggestions() {
 	if strings.HasPrefix(current, "/") {
 		m.showSuggestions = true
 		m.suggestionType = "/"
-		m.suggestions = filterCommands(current[1:])
+		m.suggestions = m.filterCommands(current[1:])
 		m.suggestionIdx = 0
 		if len(m.suggestions) == 1 && m.suggestions[0] == current {
 			m.showSuggestions = false
@@ -717,21 +743,6 @@ func (m *model) updateSuggestions() {
 		return
 	}
 	m.dismissSuggestions()
-}
-
-func filterCommands(prefix string) []string {
-	if prefix == "" {
-		result := make([]string, len(allCommands))
-		copy(result, allCommands)
-		return result
-	}
-	var result []string
-	for _, cmd := range allCommands {
-		if strings.HasPrefix(cmd, "/"+prefix) {
-			result = append(result, cmd)
-		}
-	}
-	return result
 }
 
 func filterFiles(prefix string) []string {
@@ -855,60 +866,10 @@ func (m *model) handleInput(line string) tea.Cmd {
 
 	line = m.expandFileRefs(line)
 
-	switch {
-	case line == "/help" || line == "/?":
-		m.output = append(m.output, "Available modes:")
-		m.output = append(m.output, "  /ask          - explain, inspect, understand (read-only)")
-		m.output = append(m.output, "  /plan         - architecture, migrations, refactors (no exec)")
-		m.output = append(m.output, "  /build        - implement, refactor, write tests (controlled exec)")
-		m.output = append(m.output, "  /investigate  - debug bugs, failures, regressions")
-		m.output = append(m.output, "  /review       - audit changes, detect risks")
-		m.output = append(m.output, "")
-		m.output = append(m.output, "Commands:")
-		m.output = append(m.output, "  /help         - show this help")
-		m.output = append(m.output, "  /mode <name>  - switch mode")
-		m.output = append(m.output, "  /q            - exit Izen")
-		m.output = append(m.output, "  !<cmd>        - run a shell command")
-		m.output = append(m.output, "  Ctrl+C / Esc  - exit Izen")
-		m.output = append(m.output, "")
-		m.output = append(m.output, "File References:")
-		m.output = append(m.output, "  @<pattern>    - reference a file (e.g. @main.go)")
-		return nil
-
-	case line == "/q" || line == "/quit" || line == "/exit":
-		m.sess.SetMode(m.resolver.Current())
-		m.sess.Save()
-		m.output = append(m.output, "Goodbye.")
-		return tea.Quit
-
-	case strings.HasPrefix(line, "/mode"):
-		parts := strings.Fields(line)
-		if len(parts) == 2 {
-			mode, ok := modes.Parse(parts[1])
-			if ok {
-				m.resolver.Set(mode)
-				m.sess.SetMode(mode)
-				m.sess.Save()
-				m.output = append(m.output,
-					fmt.Sprintf("Mode: /%s \u2014 %s", mode, mode.Description()),
-				)
-				return nil
-			}
-		}
-		m.output = append(m.output, "Usage: /mode <ask|plan|build|investigate|review>")
-		return nil
-
-	case strings.HasPrefix(line, "/objective"):
-		obj := strings.TrimPrefix(line, "/objective")
-		obj = strings.TrimSpace(obj)
-		if obj != "" {
-			m.sess.SetObjective(obj)
-			m.sess.Save()
-			m.output = append(m.output, "Objective set: "+obj)
-		} else {
-			m.output = append(m.output, "Usage: /objective <description>")
-		}
-		return nil
+	// HARD INTERCEPTION: any / command must be routed through the
+	// command state machine and NEVER fall through to the LLM engine.
+	if strings.HasPrefix(line, "/") {
+		return m.handleCommand(line)
 	}
 
 	newMode := m.resolver.Resolve(line)
@@ -942,6 +903,124 @@ func (m *model) handleInput(line string) tea.Cmd {
 		m.responseBuffer.Reset()
 		return m.streamCmd(content)
 	}
+}
+
+func (m *model) handleCommand(cmd string) tea.Cmd {
+	switch {
+	case cmd == "/help" || cmd == "/?":
+		m.output = append(m.output, "Available modes:")
+		m.output = append(m.output, "  /ask          - explain, inspect, understand (read-only)")
+		m.output = append(m.output, "  /plan         - architecture, migrations, refactors (no exec)")
+		m.output = append(m.output, "  /build        - implement, refactor, write tests (controlled exec)")
+		m.output = append(m.output, "  /investigate  - debug bugs, failures, regressions")
+		m.output = append(m.output, "  /review       - audit changes, detect risks")
+		m.output = append(m.output, "")
+		m.output = append(m.output, "Commands:")
+		m.output = append(m.output, "  /help         - show this help")
+		m.output = append(m.output, "  /mode <name>  - switch mode")
+		m.output = append(m.output, "  /quit         - exit Izen")
+		m.output = append(m.output, "  !<cmd>        - run a shell command")
+		m.output = append(m.output, "  Ctrl+C / Esc  - exit Izen")
+		m.output = append(m.output, "")
+		m.output = append(m.output, "File References:")
+		m.output = append(m.output, "  @<pattern>    - reference a file (e.g. @main.go)")
+		return nil
+
+	case cmd == "/quit":
+		m.sess.SetMode(m.resolver.Current())
+		m.sess.Save()
+		m.output = append(m.output, "Goodbye.")
+		return tea.Quit
+
+	case strings.HasPrefix(cmd, "/mode"):
+		parts := strings.Fields(cmd)
+		if len(parts) == 2 {
+			mode, ok := modes.Parse(parts[1])
+			if ok {
+				m.resolver.Set(mode)
+				m.sess.SetMode(mode)
+				m.sess.Save()
+				m.output = append(m.output,
+					fmt.Sprintf("Mode: /%s \u2014 %s", mode, mode.Description()),
+				)
+				return nil
+			}
+		}
+		m.output = append(m.output, "Usage: /mode <ask|plan|build|investigate|review>")
+		return nil
+
+	case strings.HasPrefix(cmd, "/objective"):
+		obj := strings.TrimPrefix(cmd, "/objective")
+		obj = strings.TrimSpace(obj)
+		if obj != "" {
+			m.sess.SetObjective(obj)
+			m.sess.Save()
+			m.output = append(m.output, "Objective set: "+obj)
+		} else {
+			m.output = append(m.output, "Usage: /objective <description>")
+		}
+		return nil
+
+	case cmd == "/clear":
+		m.output = nil
+		return nil
+
+	case cmd == "/models":
+		m.output = append(m.output, infoStyle.Render("Active model: "+m.cfg.ActiveModelName()))
+		return nil
+
+	case cmd == "/undo":
+		m.output = append(m.output, infoStyle.Render("/undo: undo not yet implemented"))
+		return nil
+
+	case cmd == "/commit":
+		m.output = append(m.output, infoStyle.Render("/commit: commit not yet implemented"))
+		return nil
+
+	case cmd == "/checkpoint":
+		m.output = append(m.output, infoStyle.Render("/checkpoint: checkpoint not yet implemented"))
+		return nil
+
+	case cmd == "/history":
+		m.output = append(m.output, infoStyle.Render("/history: history not yet implemented"))
+		return nil
+
+	case cmd == "/resume":
+		m.output = append(m.output, infoStyle.Render("/resume: resume not yet implemented"))
+		return nil
+
+	case cmd == "/tokens":
+		m.output = append(m.output, infoStyle.Render(
+			fmt.Sprintf("Tokens used: %d in / %d out", m.tokenInput, m.tokenOutput)))
+		return nil
+	}
+
+	// Check for core mode switch with optional content (e.g. "/build implement login")
+	for _, mode := range []modes.Mode{modes.ModeAsk, modes.ModePlan, modes.ModeBuild, modes.ModeInvestigate, modes.ModeReview} {
+		prefix := "/" + mode.String()
+		if strings.HasPrefix(strings.ToLower(cmd), prefix) {
+			m.resolver.Set(mode)
+			m.sess.SetMode(mode)
+			m.sess.Save()
+			m.output = append(m.output,
+				fmt.Sprintf("Switched to /%s \u2014 %s", mode, mode.Description()),
+			)
+			content := strings.TrimSpace(cmd[len(prefix):])
+			if content == "" {
+				return nil
+			}
+			m.output = append(m.output,
+				fmt.Sprintf("[%s] %s", strings.ToUpper(mode.String()), content),
+			)
+			m.streaming = true
+			m.responseBuffer.Reset()
+			return m.streamCmd(content)
+		}
+	}
+
+	m.output = append(m.output, errorStyle.Render(
+		"Unknown command: "+cmd+" (type /help for available commands)"))
+	return nil
 }
 
 func execShell(cmd string) (string, error) {
