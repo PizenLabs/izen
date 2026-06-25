@@ -94,9 +94,12 @@ func extractPackage(n *sitter.Node, src []byte, lang Language) string {
 			continue
 		}
 		if child.Type() == "package_clause" {
-			nameNode := child.ChildByFieldName("name")
-			if nameNode != nil {
-				return nameNode.Content(src)
+			nc := int(child.NamedChildCount())
+			for j := range nc {
+				gc := child.NamedChild(j)
+				if gc != nil && gc.Type() == "package_identifier" {
+					return gc.Content(src)
+				}
 			}
 		}
 	}
