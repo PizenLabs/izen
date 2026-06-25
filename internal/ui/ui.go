@@ -2,7 +2,9 @@ package ui
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/modes"
@@ -20,15 +23,22 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 )
 
+type tokenMsg string
+type streamDoneMsg struct{ content string }
+type streamErrMsg struct{ err error }
+
 type model struct {
 	cfg      *config.Config
 	sess     *session.Session
+	provider ai.Provider
 	resolver *modes.Resolver
 	input    strings.Builder
 	output   []string
 	width    int
 	height   int
 	gitEng   *git.Engine
+
+	streamCh chan tea.Msg
 
 	showSuggestions bool
 	suggestionType  string
@@ -223,13 +233,20 @@ func init() {
 	}
 }
 
-func NewProgram(cfg *config.Config, sess *session.Session) *tea.Program {
+func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea.Program {
 	eng := git.NewEngine(".")
 
+	var provider ai.Provider
+	defaultP, _ := mgr.Default()
+	if defaultP != nil {
+		provider = defaultP
+	}
+
 	m := &model{
-		cfg:    cfg,
-		sess:   sess,
-		gitEng: eng,
+		cfg:      cfg,
+		sess:     sess,
+		provider: provider,
+		gitEng:   eng,
 		resolver: modes.NewResolver(),
 		output: []string{
 			"Welcome to Izen \u2014 human-centered coding intelligence",
@@ -251,6 +268,20 @@ func (m *model) Init() tea.Cmd {
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tokenMsg:
+		m.output = append(m.output, string(msg))
+		return m, m.readStream()
+
+	case streamDoneMsg:
+		m.streamCh = nil
+		m.output = append(m.output, separatorStyle.Render("\u2501 Response complete \u2501"))
+		return m, nil
+
+	case streamErrMsg:
+		m.streamCh = nil
+		m.output = append(m.output, errorStyle.Render("Stream error: "+msg.err.Error()))
+		return m, nil
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -531,11 +562,8 @@ func (m *model) renderFooter(width int) string {
 		left = left + " (" + branch + ")"
 	}
 
-	provider := m.cfg.Models.Provider
-	modelName := m.cfg.Models.Default
-	if provider == "" {
-		provider = "unknown"
-	}
+	provider := m.cfg.ActiveProviderName()
+	modelName := m.cfg.ActiveModelName()
 	right := "(" + provider + ") " + modelName + " \u2022 active"
 
 	leftStyled := footerLeftStyle.Render(left)
@@ -670,6 +698,75 @@ func filterFiles(prefix string) []string {
 	return matches
 }
 
+func (m *model) streamCmd(content string) tea.Cmd {
+	if m.streamCh != nil {
+		m.output = append(m.output, infoStyle.Render("Already streaming..."))
+		return nil
+	}
+	if m.provider == nil {
+		m.output = append(m.output, errorStyle.Render("No AI provider configured"))
+		return nil
+	}
+
+	m.streamCh = make(chan tea.Msg, 100)
+
+	modelName := m.cfg.ActiveModelName()
+	req := ai.Request{
+		Model: modelName,
+		Messages: []ai.Message{
+			{Role: "user", Content: content},
+		},
+		Stream: true,
+	}
+
+	go func() {
+		defer close(m.streamCh)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		stream, err := m.provider.ExecuteStream(ctx, req)
+		if err != nil {
+			m.streamCh <- streamErrMsg{err: err}
+			return
+		}
+		defer stream.Close()
+
+		m.streamCh <- tokenMsg("--- streaming response ---")
+
+		var full strings.Builder
+		buf := make([]byte, 4096)
+		for {
+			n, err := stream.Read(buf)
+			if n > 0 {
+				chunk := string(buf[:n])
+				full.WriteString(chunk)
+				m.streamCh <- tokenMsg(chunk)
+			}
+			if err == io.EOF {
+				m.streamCh <- streamDoneMsg{content: full.String()}
+				return
+			}
+			if err != nil {
+				m.streamCh <- streamErrMsg{err: err}
+				return
+			}
+		}
+	}()
+
+	return m.readStream()
+}
+
+func (m *model) readStream() tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-m.streamCh
+		if !ok {
+			return nil
+		}
+		return msg
+	}
+}
+
 func (m *model) handleInput(line string) tea.Cmd {
 	line = strings.TrimSpace(line)
 	if line == "" {
@@ -770,14 +867,16 @@ func (m *model) handleInput(line string) tea.Cmd {
 	switch m.resolver.Current() {
 	case modes.ModeInvestigate:
 		m.handleInvestigateInput(content)
+		return nil
 	case modes.ModeReview:
 		m.handleReviewInput(content)
+		return nil
 	default:
 		m.output = append(m.output,
 			fmt.Sprintf("[%s] %s", strings.ToUpper(m.resolver.Current().String()), content),
 		)
+		return m.streamCmd(content)
 	}
-	return nil
 }
 
 func execShell(cmd string) (string, error) {

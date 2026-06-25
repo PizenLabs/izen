@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -54,6 +55,50 @@ type LynxConfig struct {
 	SemanticThreshold float64 `yaml:"semantic_threshold"`
 	IndexOnStart      bool    `yaml:"index_on_start"`
 	MaxResults        int     `yaml:"max_results"`
+}
+
+func (c *Config) ActiveProviderName() string {
+	if c.AI.DefaultProvider != "" {
+		if _, ok := c.AI.Providers[c.AI.DefaultProvider]; ok {
+			return c.AI.DefaultProvider
+		}
+	}
+	if c.AI.FallbackProvider != "" {
+		if _, ok := c.AI.Providers[c.AI.FallbackProvider]; ok {
+			return c.AI.FallbackProvider
+		}
+	}
+	if c.Models.Provider != "" {
+		return c.Models.Provider
+	}
+	return "unknown"
+}
+
+func (c *Config) ActiveModelName() string {
+	provider := c.ActiveProviderName()
+	if provCfg, ok := c.AI.Providers[provider]; ok && provCfg.DefaultModel != "" {
+		return provCfg.DefaultModel
+	}
+	if c.Models.Default != "" {
+		return c.Models.Default
+	}
+	return "qwen2.5-coder:7b"
+}
+
+func (c *Config) Validate() error {
+	provider := c.ActiveProviderName()
+	if provider == "unknown" {
+		return fmt.Errorf("no AI provider configured")
+	}
+	model := c.ActiveModelName()
+	if model == "" {
+		return fmt.Errorf("no model configured for provider %q", provider)
+	}
+	provCfg, ok := c.AI.Providers[provider]
+	if !ok || provCfg.BaseURL == "" {
+		return fmt.Errorf("provider %q has no base_url configured", provider)
+	}
+	return nil
 }
 
 func Load() (*Config, error) {
