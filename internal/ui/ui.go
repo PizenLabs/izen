@@ -1,8 +1,10 @@
 package ui
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -155,20 +157,69 @@ var (
 
 	headerLineStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color(darkGreen))
+
+	modeTabActiveStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color(mintGreen)).
+				Padding(0, 1)
+
+	modeTabInactiveStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(dimmedGray)).
+				Padding(0, 1)
+
+	utilitiesStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(subtleGray))
+
+	utilitiesLabelStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(dimmedGray)).
+				Bold(true)
+
+	paletteHintStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(subtleGray))
 )
 
-var allCommands = []string{
+var coreModes = []string{
 	"/ask",
 	"/plan",
 	"/build",
 	"/investigate",
 	"/review",
+}
+
+var utilityCommands = map[modes.Mode][]string{
+	modes.ModeAsk:         {"/models", "/clear"},
+	modes.ModePlan:        {"/clear"},
+	modes.ModeBuild:       {"/undo", "/commit", "/checkpoint", "/clear"},
+	modes.ModeInvestigate: {"/history", "/resume", "/clear", "/tokens"},
+	modes.ModeReview:      {"/clear"},
+}
+
+var globalCommands = []string{
 	"/help",
-	"/?",
 	"/mode",
 	"/objective",
 	"/exit",
-	"/quit",
+}
+
+var allCommands []string
+
+func init() {
+	allCommands = append(allCommands, coreModes...)
+	seen := map[string]bool{}
+	for _, cmds := range utilityCommands {
+		for _, c := range cmds {
+			if !seen[c] {
+				allCommands = append(allCommands, c)
+				seen[c] = true
+			}
+		}
+	}
+	for _, c := range globalCommands {
+		if !seen[c] {
+			allCommands = append(allCommands, c)
+			seen[c] = true
+		}
+	}
 }
 
 func NewProgram(cfg *config.Config, sess *session.Session) *tea.Program {
@@ -307,12 +358,10 @@ func (m *model) View() string {
 	}
 
 	header := m.renderHeader(width)
-	footer := m.renderFooter(width)
+	modeBar := m.renderModeBar(width)
 
-	footerHeight := 3
-	headerHeight := 3
-
-	bodyHeight := m.height - headerHeight - footerHeight
+	fixedLines := 3 + 2 + 1 + 1 + 1
+	bodyHeight := m.height - fixedLines
 	if bodyHeight < 3 {
 		bodyHeight = 3
 	}
@@ -324,9 +373,9 @@ func (m *model) View() string {
 	}
 
 	start := 0
-	if len(m.output) > maxOutput && m.showSuggestions == false {
+	if len(m.output) > maxOutput && !m.showSuggestions {
 		start = len(m.output) - maxOutput
-	} else if len(m.output) > maxOutput && m.showSuggestions {
+	} else if len(m.output) > maxOutput {
 		suggLines := len(m.suggestions) + 3
 		avail := maxOutput - suggLines
 		if avail < 1 {
@@ -351,9 +400,16 @@ func (m *model) View() string {
 	body.WriteString(promptStyle.Render("> "))
 	body.WriteString(m.input.String())
 
+	utilitiesBar := m.renderUtilitiesBar(width)
+	separator := separatorStyle.Render(strings.Repeat("\u2500", width))
+	footer := m.renderFooter(width)
+
 	return lipgloss.JoinVertical(lipgloss.Top,
 		header,
+		modeBar,
 		body.String(),
+		utilitiesBar,
+		separator,
 		footer,
 	)
 }
@@ -363,34 +419,107 @@ func (m *model) renderHeader(width int) string {
 
 	logo := logoStyle.Render("Z")
 	h.WriteString(logo)
-
-	h.WriteString("   ")
+	h.WriteString("  ")
 
 	wd, _ := os.Getwd()
 	shortWd := shortenPath(wd)
 	ctxText := shortWd
 	if m.sess.Objective != "" {
 		obj := m.sess.Objective
-		if len(obj) > 40 {
-			obj = obj[:40] + "..."
+		avail := width - lipgloss.Width(logo) - 4
+		if avail < 10 {
+			avail = 10
+		}
+		if len(obj) > avail-4 {
+			obj = obj[:avail-4] + "..."
 		}
 		ctxText = ctxText + "  \u2502  " + obj
+	}
+
+	ctxLen := lipgloss.Width(contextStyle.Render(ctxText))
+	maxCtx := width - lipgloss.Width(logo) - 4
+	if ctxLen > maxCtx && maxCtx > 10 {
+		short := shortWd
+		if len(short) > maxCtx-4 {
+			short = short[:maxCtx-4] + "..."
+		}
+		ctxText = short
 	}
 	h.WriteString(contextStyle.Render(ctxText))
 	h.WriteString("\n")
 
-	sep := strings.Repeat("\u2500", width)
-	h.WriteString(separatorStyle.Render(sep))
+	mode := m.resolver.Current()
+	modeDesc := "/" + mode.String() + " \u2014 " + mode.Description()
+	modeDescW := lipgloss.Width(contextStyle.Render(modeDesc))
+	if modeDescW > width-8 {
+		modeDesc = "/" + mode.String()
+		if lipgloss.Width(contextStyle.Render(modeDesc)) > width-8 {
+			modeDesc = "/" + mode.String()
+		}
+	}
+	h.WriteString(modeStyle.Render("Mode:"))
+	h.WriteString(" ")
+	h.WriteString(contextStyle.Render(modeDesc))
 
 	return h.String()
 }
 
+func (m *model) renderModeBar(width int) string {
+	var b strings.Builder
+
+	current := "/" + m.resolver.Current().String()
+	for i, mname := range coreModes {
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		if mname == current {
+			b.WriteString(modeTabActiveStyle.Render(mname))
+		} else {
+			b.WriteString(modeTabInactiveStyle.Render(mname))
+		}
+	}
+
+	b.WriteString("\n")
+	sep := strings.Repeat("\u2500", width)
+	b.WriteString(separatorStyle.Render(sep))
+
+	return b.String()
+}
+
+func (m *model) renderUtilitiesBar(width int) string {
+	var b strings.Builder
+
+	cmds := utilityCommands[m.resolver.Current()]
+	if len(cmds) > 0 {
+		b.WriteString(utilitiesLabelStyle.Render("Utilities:"))
+		b.WriteString(" ")
+		for i, cmd := range cmds {
+			if i > 0 {
+				b.WriteString(" ")
+			}
+			b.WriteString(utilitiesStyle.Render(cmd))
+		}
+	}
+
+	paletteHint := "  / for palette  ! for bash"
+	paletteHintLen := lipgloss.Width(paletteHintStyle.Render(paletteHint))
+
+	utilLine := b.String()
+	utilW := lipgloss.Width(utilLine)
+	gap := width - utilW - paletteHintLen
+	if gap < 2 {
+		gap = 2
+	}
+	if gap > 0 {
+		b.WriteString(strings.Repeat(" ", gap))
+	}
+	b.WriteString(paletteHintStyle.Render(paletteHint))
+
+	return b.String()
+}
+
 func (m *model) renderFooter(width int) string {
 	var f strings.Builder
-
-	sep := strings.Repeat("\u2500", width)
-	f.WriteString(separatorStyle.Render(sep))
-	f.WriteString("\n")
 
 	wd, _ := os.Getwd()
 	shortWd := shortenPath(wd)
@@ -407,9 +536,9 @@ func (m *model) renderFooter(width int) string {
 		provider = "unknown"
 	}
 	right := "(" + provider + ") " + modelName + " \u2022 active"
-	rightStyled := footerModelStyle.Render(right)
 
 	leftStyled := footerLeftStyle.Render(left)
+	rightStyled := footerModelStyle.Render(right)
 	leftW := lipgloss.Width(leftStyled)
 	rightW := lipgloss.Width(rightStyled)
 	gap := width - leftW - rightW
@@ -432,17 +561,40 @@ func shortenPath(p string) string {
 }
 
 func (m *model) renderSuggestions(b *strings.Builder) {
-	header := "commands"
 	if m.suggestionType == "@" {
-		header = "files"
+		b.WriteString(menuTitleStyle.Render("select a file"))
+		b.WriteString("\n")
+		for i, s := range m.suggestions {
+			if i == m.suggestionIdx {
+				b.WriteString(suggestionSelectedStyle.Render("-> " + s))
+			} else {
+				b.WriteString(suggestionItemStyle.Render("   " + s))
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString(hintStyle.Render("press enter to confirm or esc to go back"))
+		return
 	}
-	b.WriteString(menuTitleStyle.Render("select a " + header))
+
+	b.WriteString(menuTitleStyle.Render("command palette"))
 	b.WriteString("\n")
+
 	for i, s := range m.suggestions {
+		isCore := false
+		for _, c := range coreModes {
+			if c == s {
+				isCore = true
+				break
+			}
+		}
 		if i == m.suggestionIdx {
 			b.WriteString(suggestionSelectedStyle.Render("-> " + s))
 		} else {
-			b.WriteString(suggestionItemStyle.Render("   " + s))
+			style := suggestionItemStyle
+			if isCore {
+				style = style.Foreground(lipgloss.Color(textColor))
+			}
+			b.WriteString(style.Render("   " + s))
 		}
 		b.WriteString("\n")
 	}
@@ -523,6 +675,23 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
+	if strings.HasPrefix(line, "!") {
+		shellCmd := strings.TrimSpace(line[1:])
+		if shellCmd == "" {
+			m.output = append(m.output, infoStyle.Render("Usage: !<shell command>"))
+			return nil
+		}
+		m.output = append(m.output, infoStyle.Render("$ "+shellCmd))
+		out, err := execShell(shellCmd)
+		if err != nil {
+			m.output = append(m.output, errorStyle.Render(err.Error()))
+		}
+		for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
+			m.output = append(m.output, outputStyle.Render(l))
+		}
+		return nil
+	}
+
 	line = m.expandFileRefs(line)
 
 	switch {
@@ -538,6 +707,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 		m.output = append(m.output, "  /help         - show this help")
 		m.output = append(m.output, "  /mode <name>  - switch mode")
 		m.output = append(m.output, "  /exit         - exit Izen")
+		m.output = append(m.output, "  !<cmd>        - run a shell command")
 		m.output = append(m.output, "  Ctrl+C / Esc  - exit Izen")
 		m.output = append(m.output, "")
 		m.output = append(m.output, "File References:")
@@ -607,6 +777,22 @@ func (m *model) handleInput(line string) tea.Cmd {
 		)
 	}
 	return nil
+}
+
+func execShell(cmd string) (string, error) {
+	c := exec.Command("bash", "-c", cmd)
+	var stdout, stderr bytes.Buffer
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+	err := c.Run()
+	out := stdout.String()
+	if stderr.Len() > 0 {
+		if out != "" {
+			out += "\n"
+		}
+		out += stderr.String()
+	}
+	return out, err
 }
 
 func stripModePrefix(line string) string {
