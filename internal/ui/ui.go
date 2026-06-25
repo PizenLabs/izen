@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -24,6 +25,11 @@ type model struct {
 	output   []string
 	width    int
 	height   int
+
+	showSuggestions bool
+	suggestionType  string
+	suggestions     []string
+	suggestionIdx   int
 }
 
 var (
@@ -88,7 +94,39 @@ var (
 			Bold(true).
 			Foreground(lipgloss.Color("#00FF00")).
 			Padding(0, 1)
+
+	suggestionBoxStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("#00FFFF")).
+				Padding(0, 1).
+				Margin(0, 0)
+
+	suggestionHeaderStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("#00FFFF")).
+				Padding(0, 0)
+
+	suggestionSelectedStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#00FF00")).
+				Bold(true)
+
+	suggestionItemStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#AAAAAA"))
 )
+
+var allCommands = []string{
+	"/ask",
+	"/plan",
+	"/build",
+	"/investigate",
+	"/review",
+	"/help",
+	"/?",
+	"/mode",
+	"/objective",
+	"/exit",
+	"/quit",
+}
 
 func NewProgram(cfg *config.Config, sess *session.Session) *tea.Program {
 	m := &model{
@@ -122,16 +160,36 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		switch msg.Type {
-		case tea.KeyCtrlC:
+		case tea.KeyCtrlC, tea.KeyEscape:
+			if m.showSuggestions {
+				m.dismissSuggestions()
+				return m, nil
+			}
 			m.sess.SetMode(m.resolver.Current())
 			m.sess.Save()
 			return m, tea.Quit
 
 		case tea.KeyEnter:
+			m.dismissSuggestions()
 			line := m.input.String()
 			m.input.Reset()
 			if line != "" {
 				m.handleInput(line)
+			}
+			return m, nil
+
+		case tea.KeyTab:
+			if m.showSuggestions && len(m.suggestions) > 0 {
+				m.suggestionIdx = (m.suggestionIdx + 1) % len(m.suggestions)
+			}
+			return m, nil
+
+		case tea.KeyShiftTab:
+			if m.showSuggestions && len(m.suggestions) > 0 {
+				m.suggestionIdx--
+				if m.suggestionIdx < 0 {
+					m.suggestionIdx = len(m.suggestions) - 1
+				}
 			}
 			return m, nil
 
@@ -140,11 +198,49 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(s) > 0 {
 				m.input.Reset()
 				m.input.WriteString(s[:len(s)-1])
+				m.updateSuggestions()
+			} else {
+				m.dismissSuggestions()
 			}
 			return m, nil
 
 		case tea.KeyRunes:
-			m.input.WriteString(string(msg.Runes))
+			s := string(msg.Runes)
+			m.input.WriteString(s)
+			current := m.input.String()
+
+			switch {
+			case current == "/":
+				m.showSuggestions = true
+				m.suggestionType = "/"
+				m.suggestions = filterCommands("")
+				m.suggestionIdx = 0
+
+			case current == "@":
+				m.showSuggestions = true
+				m.suggestionType = "@"
+				m.suggestions = filterFiles("")
+				m.suggestionIdx = 0
+
+			case m.showSuggestions && m.suggestionType == "/" && strings.HasPrefix(current, "/"):
+				m.suggestions = filterCommands(current[1:])
+				m.suggestionIdx = 0
+				if len(m.suggestions) == 1 && m.suggestions[0] == current {
+					m.showSuggestions = false
+				}
+
+			case m.showSuggestions && m.suggestionType == "@" && strings.HasPrefix(current, "@"):
+				m.suggestions = filterFiles(current[1:])
+				m.suggestionIdx = 0
+				if len(m.suggestions) == 1 && m.suggestions[0] == current[1:] {
+					m.showSuggestions = false
+				}
+
+			default:
+				if m.showSuggestions {
+					m.dismissSuggestions()
+				}
+			}
 			return m, nil
 		}
 	}
@@ -174,11 +270,107 @@ func (m *model) View() string {
 		b.WriteString("\n")
 	}
 
+	if m.showSuggestions && len(m.suggestions) > 0 {
+		b.WriteString("\n")
+		m.renderSuggestions(&b)
+		b.WriteString("\n")
+	}
+
 	b.WriteString("\n")
 	b.WriteString(promptStyle.Render("> "))
 	b.WriteString(m.input.String())
 
 	return b.String()
+}
+
+func (m *model) renderSuggestions(b *strings.Builder) {
+	header := " Commands "
+	if m.suggestionType == "@" {
+		header = " Files "
+	}
+	b.WriteString(suggestionBoxStyle.Render(func() string {
+		var sb strings.Builder
+		sb.WriteString(suggestionHeaderStyle.Render(header))
+		sb.WriteString("\n")
+		for i, s := range m.suggestions {
+			if i == m.suggestionIdx {
+				sb.WriteString(suggestionSelectedStyle.Render("▸ " + s))
+			} else {
+				sb.WriteString(suggestionItemStyle.Render("  " + s))
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString(infoStyle.Render(" [Tab] cycle  [Enter] select  [Esc] dismiss"))
+		return sb.String()
+	}()))
+}
+
+func (m *model) dismissSuggestions() {
+	m.showSuggestions = false
+	m.suggestionType = ""
+	m.suggestions = nil
+	m.suggestionIdx = 0
+}
+
+func (m *model) updateSuggestions() {
+	current := m.input.String()
+	if current == "" {
+		m.dismissSuggestions()
+		return
+	}
+	if strings.HasPrefix(current, "/") {
+		m.showSuggestions = true
+		m.suggestionType = "/"
+		m.suggestions = filterCommands(current[1:])
+		m.suggestionIdx = 0
+		if len(m.suggestions) == 1 && m.suggestions[0] == current {
+			m.showSuggestions = false
+		}
+		return
+	}
+	if strings.HasPrefix(current, "@") {
+		m.showSuggestions = true
+		m.suggestionType = "@"
+		m.suggestions = filterFiles(current[1:])
+		m.suggestionIdx = 0
+		if len(m.suggestions) == 1 && m.suggestions[0] == current[1:] {
+			m.showSuggestions = false
+		}
+		return
+	}
+	m.dismissSuggestions()
+}
+
+func filterCommands(prefix string) []string {
+	if prefix == "" {
+		result := make([]string, len(allCommands))
+		copy(result, allCommands)
+		return result
+	}
+	var result []string
+	for _, cmd := range allCommands {
+		if strings.HasPrefix(cmd, "/"+prefix) {
+			result = append(result, cmd)
+		}
+	}
+	return result
+}
+
+func filterFiles(prefix string) []string {
+	pattern := prefix + "*"
+	if prefix == "" {
+		pattern = "*"
+	}
+	matches, err := filepath.Glob(pattern)
+	if err != nil || len(matches) == 0 {
+		return nil
+	}
+	sort.Strings(matches)
+	limit := 15
+	if len(matches) > limit {
+		matches = matches[:limit]
+	}
+	return matches
 }
 
 func (m *model) handleInput(line string) {
@@ -187,16 +379,7 @@ func (m *model) handleInput(line string) {
 		return
 	}
 
-	newMode := m.resolver.Resolve(line)
-	if newMode != m.resolver.Current() {
-		m.resolver.Set(newMode)
-		m.sess.SetMode(newMode)
-		m.sess.Save()
-		m.output = append(m.output,
-			fmt.Sprintf("Switched to /%s — %s", newMode, newMode.Description()),
-		)
-		return
-	}
+	line = m.expandFileRefs(line)
 
 	switch {
 	case line == "/help" || line == "/?":
@@ -212,12 +395,17 @@ func (m *model) handleInput(line string) {
 		m.output = append(m.output, "  /mode <name>  — switch mode")
 		m.output = append(m.output, "  /exit         — exit Izen")
 		m.output = append(m.output, "  Ctrl+C / Esc  — exit Izen")
+		m.output = append(m.output, "")
+		m.output = append(m.output, "File References:")
+		m.output = append(m.output, "  @<pattern>    — reference a file (e.g. @main.go)")
+		return
 
 	case line == "/exit" || line == "/quit":
 		m.sess.SetMode(m.resolver.Current())
 		m.sess.Save()
 		m.output = append(m.output, "Goodbye.")
 		m.input.Reset()
+		return
 
 	case strings.HasPrefix(line, "/mode"):
 		parts := strings.Fields(line)
@@ -234,6 +422,7 @@ func (m *model) handleInput(line string) {
 			}
 		}
 		m.output = append(m.output, "Usage: /mode <ask|plan|build|investigate|review>")
+		return
 
 	case strings.HasPrefix(line, "/objective"):
 		obj := strings.TrimPrefix(line, "/objective")
@@ -245,19 +434,68 @@ func (m *model) handleInput(line string) {
 		} else {
 			m.output = append(m.output, "Usage: /objective <description>")
 		}
+		return
+	}
 
+	newMode := m.resolver.Resolve(line)
+	modeChanged := newMode != m.resolver.Current()
+	if modeChanged {
+		m.resolver.Set(newMode)
+		m.sess.SetMode(newMode)
+		m.sess.Save()
+		m.output = append(m.output,
+			fmt.Sprintf("Switched to /%s — %s", newMode, newMode.Description()),
+		)
+	}
+
+	content := stripModePrefix(line)
+	if content == "" {
+		return
+	}
+
+	switch m.resolver.Current() {
+	case modes.ModeInvestigate:
+		m.handleInvestigateInput(content)
+	case modes.ModeReview:
+		m.handleReviewInput(content)
 	default:
-		switch m.resolver.Current() {
-		case modes.ModeInvestigate:
-			m.handleInvestigateInput(line)
-		case modes.ModeReview:
-			m.handleReviewInput(line)
-		default:
-			m.output = append(m.output,
-				fmt.Sprintf("[%s] %s", strings.ToUpper(m.resolver.Current().String()), line),
-			)
+		m.output = append(m.output,
+			fmt.Sprintf("[%s] %s", strings.ToUpper(m.resolver.Current().String()), content),
+		)
+	}
+}
+
+func stripModePrefix(line string) string {
+	for _, mode := range []modes.Mode{modes.ModeAsk, modes.ModePlan, modes.ModeBuild, modes.ModeInvestigate, modes.ModeReview} {
+		prefix := "/" + mode.String()
+		if strings.HasPrefix(strings.ToLower(line), prefix) {
+			rest := strings.TrimSpace(line[len(prefix):])
+			return rest
 		}
 	}
+	return line
+}
+
+func (m *model) expandFileRefs(line string) string {
+	fields := strings.Fields(line)
+	changed := false
+	for i, field := range fields {
+		if strings.HasPrefix(field, "@") {
+			ref := field[1:]
+			if ref == "" {
+				continue
+			}
+			matches, err := filepath.Glob(ref)
+			if err == nil && len(matches) > 0 {
+				fields[i] = matches[0]
+				changed = true
+			}
+		}
+	}
+	if changed {
+		return strings.Join(fields, " ")
+	}
+	return line
 }
 
 func (m *model) handleInvestigateInput(line string) {
