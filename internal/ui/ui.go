@@ -198,6 +198,7 @@ var globalCommands = []string{
 	"/help",
 	"/mode",
 	"/objective",
+	"/q",
 	"/exit",
 }
 
@@ -706,7 +707,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 		m.output = append(m.output, "Commands:")
 		m.output = append(m.output, "  /help         - show this help")
 		m.output = append(m.output, "  /mode <name>  - switch mode")
-		m.output = append(m.output, "  /exit         - exit Izen")
+		m.output = append(m.output, "  /q            - exit Izen")
 		m.output = append(m.output, "  !<cmd>        - run a shell command")
 		m.output = append(m.output, "  Ctrl+C / Esc  - exit Izen")
 		m.output = append(m.output, "")
@@ -714,7 +715,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 		m.output = append(m.output, "  @<pattern>    - reference a file (e.g. @main.go)")
 		return nil
 
-	case line == "/exit" || line == "/quit":
+	case line == "/q" || line == "/quit" || line == "/exit":
 		m.sess.SetMode(m.resolver.Current())
 		m.sess.Save()
 		m.output = append(m.output, "Goodbye.")

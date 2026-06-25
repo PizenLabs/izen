@@ -5,6 +5,7 @@ lea
 **/__pycache__/
 *.pyc
 izen
+.izen
 
 # OS generated files
 .DS_Store
