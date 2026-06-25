@@ -4,7 +4,7 @@ lea
 .pi/
 **/__pycache__/
 *.pyc
-
+izen
 
 # OS generated files
 .DS_Store
