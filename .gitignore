@@ -6,6 +6,7 @@ lea
 *.pyc
 izen
 .izen
+diagnostic
 
 # OS generated files
 .DS_Store
