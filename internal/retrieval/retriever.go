@@ -6,7 +6,14 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lynx"
 )
+
+var globalLynx *lynx.Controller
+
+func SetLynxController(lc *lynx.Controller) {
+	globalLynx = lc
+}
 
 type Tier string
 
@@ -38,6 +45,8 @@ func (t Tier) Order() int {
 	}
 }
 
+const lynxConfidenceThreshold = 0.6
+
 type Retriever struct {
 	root     string
 	graph    *GraphLookup
@@ -60,6 +69,7 @@ func NewRetriever(root string, g *graph.Graph, opts ...RetrieverOption) *Retriev
 		fallback: NewFallbackChain(root),
 		tiers: []Tier{
 			TierGraph,
+			TierLynx,
 			TierGlob,
 			TierRipgrep,
 			TierGrep,
@@ -148,6 +158,18 @@ func (r *Retriever) executeTier(tier Tier, query Query) *ResultSet {
 			return nil
 		}
 
+	case TierLynx:
+		if globalLynx == nil {
+			return nil
+		}
+		if query.Symbol != "" {
+			return r.executeLynxResolve(query)
+		}
+		if query.Text != "" && len(query.Text) >= 5 {
+			return r.executeLynxSearch(query)
+		}
+		return nil
+
 	case TierGlob:
 		if r.fallback == nil {
 			return nil
@@ -189,12 +211,67 @@ func (r *Retriever) executeTier(tier Tier, query Query) *ResultSet {
 		}
 		return r.fallback.ReadFile(target)
 
-	case TierLynx:
-		return nil
-
 	default:
 		return nil
 	}
+}
+
+func (r *Retriever) executeLynxSearch(query Query) *ResultSet {
+	rawResults, err := globalLynx.SearchRaw(query.Text)
+	if err != nil {
+		return &ResultSet{
+			Strategy:   "lynx.semantic",
+			Confidence: 0,
+			Error:      fmt.Sprintf("lynx search: %v", err),
+		}
+	}
+
+	rs := &ResultSet{
+		Strategy:   "lynx.semantic",
+		Confidence: ConfSemantic.Float64(),
+	}
+	for _, rr := range rawResults {
+		rs.Add(Score(ConfSemantic, Result{
+			File:       rr.FilePath,
+			Line:       rr.StartLine,
+			Content:    rr.Content,
+			Strategy:   "lynx.semantic",
+			SymbolName: rr.SymbolName,
+		}))
+	}
+	if !rs.Empty() {
+		rs.Confidence = ConfSemantic.Float64()
+	}
+	return rs
+}
+
+func (r *Retriever) executeLynxResolve(query Query) *ResultSet {
+	rawResults, err := globalLynx.ResolveSymbolRaw(query.Symbol)
+	if err != nil {
+		return &ResultSet{
+			Strategy:   "lynx.resolve",
+			Confidence: 0,
+			Error:      fmt.Sprintf("lynx resolve: %v", err),
+		}
+	}
+
+	rs := &ResultSet{
+		Strategy:   "lynx.resolve",
+		Confidence: ConfFuzzy.Float64(),
+	}
+	for _, rr := range rawResults {
+		rs.Add(Score(ConfFuzzy, Result{
+			File:       rr.FilePath,
+			Line:       rr.StartLine,
+			Strategy:   "lynx.resolve",
+			SymbolName: query.Symbol,
+			Content:    rr.Content,
+		}))
+	}
+	if !rs.Empty() {
+		rs.Confidence = ConfFuzzy.Float64()
+	}
+	return rs
 }
 
 func (r *Retriever) SearchSymbol(name string) *ResultSet {

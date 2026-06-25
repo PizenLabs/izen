@@ -11,6 +11,7 @@ type Config struct {
 	Models    ModelConfig    `yaml:"models"`
 	Execution ExecutionConfig `yaml:"execution"`
 	Fallback  FallbackConfig  `yaml:"fallback"`
+	Lynx      LynxConfig      `yaml:"lynx"`
 	MCP       MCPConfig       `yaml:"mcp"`
 }
 
@@ -32,6 +33,14 @@ type FallbackConfig struct {
 type MCPConfig struct {
 	Enabled bool     `yaml:"enabled"`
 	Servers []string `yaml:"servers"`
+}
+
+type LynxConfig struct {
+	Enabled           bool    `yaml:"enabled"`
+	LazyStart         bool    `yaml:"lazy_start"`
+	SemanticThreshold float64 `yaml:"semantic_threshold"`
+	IndexOnStart      bool    `yaml:"index_on_start"`
+	MaxResults        int     `yaml:"max_results"`
 }
 
 func Load() (*Config, error) {
@@ -69,6 +78,13 @@ func Default() *Config {
 		},
 		Fallback: FallbackConfig{
 			Enabled: true,
+		},
+		Lynx: LynxConfig{
+			Enabled:           true,
+			LazyStart:         true,
+			SemanticThreshold: 0.6,
+			IndexOnStart:      false,
+			MaxResults:        20,
 		},
 		MCP: MCPConfig{
 			Enabled: false,

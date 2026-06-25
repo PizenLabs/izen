@@ -42,6 +42,10 @@ func ConfidenceFromStrategy(strategy string) Confidence {
 		return ConfPartial
 	case "lynx.semantic":
 		return ConfSemantic
+	case "lynx.resolve":
+		return ConfFuzzy
+	case "lynx.related":
+		return ConfSemantic
 	case "rg.pattern":
 		return ConfPattern
 	case "grep.text":
