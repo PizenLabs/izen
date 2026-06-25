@@ -2,6 +2,8 @@ package ui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -46,6 +49,19 @@ var (
 
 	infoStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#888888"))
+
+	investigationStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFD700")).
+				Padding(0, 1)
+
+	evidenceStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#87CEEB"))
+
+	hypothesisStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#98FB98"))
+
+	errorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FF6B6B"))
 )
 
 func NewProgram(cfg *config.Config, sess *session.Session) *tea.Program {
@@ -205,8 +221,70 @@ func (m *model) handleInput(line string) {
 		}
 
 	default:
-		m.output = append(m.output,
-			fmt.Sprintf("[%s] %s", strings.ToUpper(m.resolver.Current().String()), line),
-		)
+		if m.resolver.Current() == modes.ModeInvestigate {
+			m.handleInvestigateInput(line)
+		} else {
+			m.output = append(m.output,
+				fmt.Sprintf("[%s] %s", strings.ToUpper(m.resolver.Current().String()), line),
+			)
+		}
 	}
+}
+
+func (m *model) handleInvestigateInput(line string) {
+	sess := m.sess
+	investDir := filepath.Join(".izen", "investigations")
+
+	m.output = append(m.output, separatorStyle.Render("━ Running investigation ━"))
+
+	eng := investigate.NewEngine(".", line, nil, nil)
+	result, err := eng.Run()
+
+	if err != nil {
+		m.output = append(m.output, errorStyle.Render("Investigation error: "+err.Error()))
+		return
+	}
+
+	m.output = append(m.output, investigationStyle.Render(
+		fmt.Sprintf("Investigation: %s", result.Problem)))
+	m.output = append(m.output, investigationStyle.Render(
+		fmt.Sprintf("Duration: %s | Loops: %d | Hypotheses: %d | Evidence: %d",
+			result.Duration, result.Loops, len(result.Hypotheses), len(result.Evidence))))
+
+	if result.Resolved {
+		m.output = append(m.output, hypothesisStyle.Render(
+			fmt.Sprintf("Resolved: %s", result.Conclusion)))
+	} else {
+		m.output = append(m.output, infoStyle.Render("Investigation did not reach a conclusion"))
+	}
+
+	for _, h := range result.Hypotheses {
+		statusSym := "○"
+		switch h.Status {
+		case investigate.HypothesisConfirmed:
+			statusSym = "✓"
+		case investigate.HypothesisRejected:
+			statusSym = "✗"
+		}
+		m.output = append(m.output, hypothesisStyle.Render(
+			fmt.Sprintf("  %s %s [%s] (%.0f%%)", statusSym, h.Theory, h.Status, h.Confidence*100)))
+	}
+
+	for _, ev := range result.Evidence {
+		content := ev.Content
+		if len(content) > 60 {
+			content = content[:60] + "..."
+		}
+		m.output = append(m.output, evidenceStyle.Render(
+			fmt.Sprintf("  [%s] %s", ev.Source, content)))
+	}
+
+	if !result.Resolved && result.Error != "" {
+		m.output = append(m.output, errorStyle.Render("Error: "+result.Error))
+	}
+
+	sess.SetInvestigationID(result.Problem)
+	os.MkdirAll(investDir, 0755)
+
+	m.output = append(m.output, separatorStyle.Render("━ Investigation complete ━"))
 }

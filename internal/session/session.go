@@ -10,14 +10,15 @@ import (
 )
 
 type Session struct {
-	Objective   string     `json:"objective"`
-	Mode        modes.Mode `json:"mode"`
-	Assumptions []string   `json:"assumptions,omitempty"`
-	Questions   []string   `json:"questions,omitempty"`
-	Checkpoints []string   `json:"checkpoints,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
-	path        string
+	Objective       string     `json:"objective"`
+	Mode            modes.Mode `json:"mode"`
+	Assumptions     []string   `json:"assumptions,omitempty"`
+	Questions       []string   `json:"questions,omitempty"`
+	Checkpoints     []string   `json:"checkpoints,omitempty"`
+	InvestigationID string     `json:"investigation_id,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	path            string
 }
 
 func New() *Session {
@@ -82,4 +83,23 @@ func (s *Session) AddQuestion(q string) {
 
 func (s *Session) AddCheckpoint(c string) {
 	s.Checkpoints = append(s.Checkpoints, c)
+}
+
+func (s *Session) SetInvestigationID(id string) {
+	s.InvestigationID = id
+}
+
+func (s *Session) InvestigationDir() string {
+	if s.InvestigationID == "" {
+		return filepath.Join(".izen", "investigations")
+	}
+	return filepath.Join(".izen", "investigations", s.InvestigationID)
+}
+
+func (s *Session) SaveInvestigation(data []byte) error {
+	dir := s.InvestigationDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "report.json"), data, 0644)
 }

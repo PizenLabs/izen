@@ -1,0 +1,13 @@
+[package]
+name = "pizen-lynx-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+description = "Protocol definitions for Lynx."
+
+[dependencies]
+blake3 = "1.8.5"
+serde = { version = "1.0.228", features = ["derive"] }
