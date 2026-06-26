@@ -27,6 +27,13 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.push(roleSystem, "usage: !<shell command>")
 			return nil
 		}
+
+		currentMode := m.resolver.Current()
+		if currentMode.ReadOnly() {
+			m.push(roleError, fmt.Sprintf("shell execution blocked in /%s mode (read-only)", currentMode))
+			return nil
+		}
+
 		m.push(roleSystem, "$ "+shellCmd)
 		out, err := execShell(shellCmd)
 		if err != nil {
@@ -144,6 +151,12 @@ func (m *model) handleInput(line string) tea.Cmd {
 
 	switch m.resolver.Current() {
 	case modes.ModeInvestigate:
+		if m.investigateInvocationCount >= maxInvestigateInvocations {
+			m.push(roleError, fmt.Sprintf("max investigate invocations (%d) reached for this session", maxInvestigateInvocations))
+			m.push(roleSystem, infoStyle.Render("start a new session with /objective <desc> or restart"))
+			return nil
+		}
+		m.investigateInvocationCount++
 		return m.runInvestigateCmd(content)
 	case modes.ModeReview:
 		return m.runReviewCmd()

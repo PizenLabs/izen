@@ -55,7 +55,21 @@ izen/
 │   ├── ai/                       # ModelProvider interface
 │   ├── lynx/                     # Embedded Rust semantic search daemon controller
 │   ├── mcp/                      # Gateway: GitHub Issues, Jira, Linear
-│   └── ui/                       # Bubble Tea TUI
+│   └── ui/                       # Bubble Tea TUI (modular monolith)
+│       ├── program.go            # Entrypoint: NewProgram factory
+│       ├── model.go              # Model struct, message types, record
+│       ├── update.go             # Init, Update, message dispatch
+│       ├── view.go               # View, body/header/modebar/statusbar renderers
+│       ├── keys.go               # Keyboard event routing
+│       ├── commands.go           # Input dispatch, command handler
+│       ├── stream.go             # AI streaming (readStream / streamCmd)
+│       ├── agents.go             # Investigate & Review agent commands
+│       ├── proposals.go          # Build proposal extraction, apply, checkpoint
+│       ├── suggestions.go        # Command & file auto-complete, palette UI
+│       ├── styles.go             # Colour palette, lipgloss styles, helpers
+│       ├── highlight.go          # Code syntax highlighting
+│       ├── renderers.go          # Startup banner, confirmation box
+│       └── utils.go              # Path shortening, mode prefix, file refs
 ├── lynx/                         # Embedded Rust semantic search engine
 └── docs/architecture/            # Philosophy, tech stack, architecture docs
 ```

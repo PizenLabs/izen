@@ -68,7 +68,10 @@ type buildProposalsReadyMsg struct {
 	proposals []patchProposal
 }
 
-const version = "0.1.0"
+const (
+	version                  = "0.1.0"
+	maxInvestigateInvocations = 5
+)
 
 var coreModes = []string{"/ask", "/plan", "/build", "/investigate", "/review"}
 
@@ -121,6 +124,8 @@ type model struct {
 
 	execEng     *execution.Engine
 	buildOutput strings.Builder
+
+	investigateInvocationCount int
 }
 
 func (m *model) push(r role, text string) {
