@@ -383,7 +383,6 @@ func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea
 		execEng:       execution.NewEngine(".", cfg, sess),
 	}
 	m.resolver.Set(sess.Mode)
-	m.records = append(m.records, record{role: roleSystem, text: ""})
 
 	return tea.NewProgram(m)
 }
@@ -632,12 +631,13 @@ func (m *model) View() string {
 
 	header := m.renderHeader(width)
 	modeBar := m.renderModeBar(width)
+	banner := m.renderStartupBanner(width)
 	topDiv := hairlineStyle.Render(strings.Repeat("─", width))
 	body := m.renderBody(width)
 	botDiv := topDiv
 	status := m.renderStatusBar(width)
 
-	parts := []string{header, modeBar, topDiv, body}
+	parts := []string{header, modeBar, banner, topDiv, body}
 	if m.showSuggestions && len(m.suggestions) > 0 {
 		parts = append(parts, "\n"+m.renderSuggestions(width))
 	}
