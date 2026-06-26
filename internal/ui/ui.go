@@ -14,10 +14,12 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
@@ -50,6 +52,16 @@ type reviewResultMsg struct {
 }
 
 type agentDoneMsg struct{ label string }
+
+type patchProposal struct {
+	File    string
+	Content string
+	ID      string
+}
+
+type buildProposalsReadyMsg struct {
+	proposals []patchProposal
+}
 
 // ── Output record ─────────────────────────────────────────────────────────────
 
@@ -194,6 +206,16 @@ var (
 	hlType    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorPink))
 	hlCodeBg  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Background(lipgloss.Color(colorOverlay))
 	hlLang    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Bold(true)
+
+	// Confirmation prompt
+	confirmBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color(colorOrange)).
+			Padding(0, 1)
+	confirmKeyStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorOrange))
+	confirmDescStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+	confirmDimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	confirmFileStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 )
 
 // ── Gutter helpers ────────────────────────────────────────────────────────────
@@ -307,6 +329,15 @@ type model struct {
 
 	pendingFileRefs []string
 	attachedFiles   []string
+
+	viewport viewport.Model
+
+	awaitingConfirmation bool
+	pendingProposals     []patchProposal
+	acceptAll            bool
+
+	execEng    *execution.Engine
+	buildOutput strings.Builder
 }
 
 func (m *model) push(r role, text string) {
@@ -343,9 +374,11 @@ func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea
 		gitEng:        eng,
 		resolver:      modes.NewResolver(),
 		attachedFiles: make([]string, 0),
+		viewport:      viewport.New(80, 10),
+		execEng:       execution.NewEngine(".", cfg, sess),
 	}
 	m.resolver.Set(sess.Mode)
-
+	m.viewport.KeyMap = viewport.KeyMap{}
 	m.records = append(m.records, record{role: roleSystem, text: ""})
 
 	return tea.NewProgram(m, tea.WithAltScreen())
@@ -419,6 +452,41 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleAI, final)
 		m.push(roleStatus, "response complete")
 		m.responseBuffer.Reset()
+
+		if m.resolver.Current() == modes.ModeBuild && !m.awaitingConfirmation {
+			props := extractBuildProposals(final)
+			if len(props) > 0 {
+				if m.acceptAll {
+					for _, p := range props {
+						patch := &execution.Patch{
+							ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
+							File:     p.File,
+							Modified: p.Content,
+						}
+						orig, err := os.ReadFile(p.File)
+						if err == nil {
+							patch.Original = string(orig)
+						}
+						if err := m.execEng.Patches.Apply(patch); err != nil {
+							m.push(roleError, "apply failed: "+err.Error())
+						} else {
+							m.push(roleSystem, infoStyle.Render("applied: "+p.File))
+						}
+					}
+				} else {
+					m.pendingProposals = props
+					m.awaitingConfirmation = true
+					proposalMsg := "proposed changes:\n"
+					for _, p := range props {
+						proposalMsg += fmt.Sprintf("  • %s\n", p.File)
+					}
+					proposalMsg += "review changes above and confirm below"
+					m.push(roleSystem, infoStyle.Render(proposalMsg))
+				}
+			}
+		}
+
+		m.viewport.GotoBottom()
 		return m, nil
 
 	case streamErrMsg:
@@ -430,6 +498,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.viewport.Width = msg.Width
 		return m, nil
 
 	case tea.KeyMsg:
@@ -448,6 +517,23 @@ func tickCmd() tea.Cmd {
 // ── Key handling ──────────────────────────────────────────────────────────────
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.awaitingConfirmation {
+		switch msg.String() {
+		case "1":
+			return m, m.applySingleProposal()
+		case "2":
+			m.acceptAll = true
+			return m, m.applyAllProposals()
+		case "3", "esc":
+			m.awaitingConfirmation = false
+			m.pendingProposals = nil
+			m.acceptAll = false
+			m.push(roleSystem, infoStyle.Render("changes rejected"))
+			return m, nil
+		}
+		return m, nil
+	}
+
 	switch msg.Type {
 	case tea.KeyCtrlC, tea.KeyEscape:
 		if m.showSuggestions {
@@ -517,6 +603,28 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.updateSuggestions()
 		return m, nil
 
+	case tea.KeyPgUp:
+		m.viewport.HalfViewUp()
+		return m, nil
+
+	case tea.KeyPgDown:
+		m.viewport.HalfViewDown()
+		return m, nil
+
+	case tea.KeyUp:
+		if m.input.Len() == 0 {
+			m.viewport.LineUp(1)
+			return m, nil
+		}
+		return m, nil
+
+	case tea.KeyDown:
+		if m.input.Len() == 0 {
+			m.viewport.LineDown(1)
+			return m, nil
+		}
+		return m, nil
+
 	case tea.KeyRunes:
 		m.input.WriteString(string(msg.Runes))
 		m.updateSuggestions()
@@ -535,8 +643,7 @@ const (
 	chromeTopDiv  = 1 // separator after mode bar
 	chromeBotDiv  = 1 // separator before status
 	chromeStatus  = 1 // status bar at very bottom
-	chromePrompt  = 2 // blank + gutter+label+chevron+input+cursor
-	chromeFixed   = chromeHeader + chromeModeBar + chromeTopDiv + chromeBotDiv + chromeStatus + chromePrompt
+	chromePrompt = 2 // blank + gutter+label+chevron+input+cursor
 )
 
 func (m *model) View() string {
@@ -655,7 +762,6 @@ func highlightCode(lines []string) []string {
 func (m *model) renderBody(width int) string {
 	var body strings.Builder
 
-	// Calculate available lines for records.
 	statusLines := 0
 	if m.agentRunning || m.agentDone || m.streaming {
 		statusLines = 1
@@ -664,53 +770,33 @@ func (m *model) renderBody(width int) string {
 	if len(m.attachedFiles) > 0 {
 		contextLines = 1
 	}
-
-	available := m.height - chromeFixed - statusLines - contextLines
-	if available < 1 {
-		available = 1
+	confirmLines := 0
+	if m.awaitingConfirmation && len(m.pendingProposals) > 0 {
+		confirmLines = 1
 	}
 
-	// Slice records from the end.
-	start := 0
-	if len(m.records) > available {
-		start = len(m.records) - available
-	}
-	visible := m.records[start:]
-
-	// Highlight code blocks.
-	texts := make([]string, len(visible))
-	for i, rec := range visible {
-		texts[i] = rec.text
-	}
-	highlighted := highlightCode(texts)
-
-	// Render records.
-	for i, rec := range visible {
-		gutter := gutterFor(rec.role)
-		content := highlighted[i]
-		switch rec.role {
-		case roleUser:
-			body.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render(content))
-		case roleAI:
-			body.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render(content))
-		case roleError:
-			body.WriteString(gutter + errorStyle.Render(content))
-		case roleStatus:
-			body.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render(content))
-		default:
-			body.WriteString(gutter + outputStyle.Render(content))
-		}
-		body.WriteString("\n")
+	belowViewport := statusLines + contextLines + confirmLines + chromePrompt - 1
+	vpHeight := m.height - chromeHeader - chromeModeBar - chromeTopDiv - chromeBotDiv - chromeStatus - belowViewport
+	if vpHeight < 3 {
+		vpHeight = 3
 	}
 
-	// Dynamic status lines (agent / streaming).
+	m.viewport.Width = width
+	m.viewport.Height = vpHeight
+
+	recordsContent := m.renderRecordsContent(width)
+	m.viewport.SetContent(recordsContent)
+
+	body.WriteString(m.viewport.View())
+
+	// Dynamic status lines (agent / streaming) below viewport.
 	if m.agentRunning {
 		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame])
 		aiGutter := gutterAIStyle.Render("▌") + " "
-		body.WriteString(aiGutter + sp + "  " + lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render(m.agentLabel+"…") + "\n")
+		body.WriteString("\n" + aiGutter + sp + "  " + lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render(m.agentLabel+"…"))
 	} else if m.agentDone {
 		doneGutter := gutterStatusStyle.Render("▌") + " "
-		body.WriteString(doneGutter + labelStatusStyle.Render(m.agentLabel+" complete") + "\n")
+		body.WriteString("\n" + doneGutter + labelStatusStyle.Render(m.agentLabel+" complete"))
 	} else if m.streaming {
 		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame])
 		aiGutter := gutterAIStyle.Render("▌") + " "
@@ -718,16 +804,16 @@ func (m *model) renderBody(width int) string {
 			streamStyle := lipgloss.NewStyle().
 				Foreground(lipgloss.Color(colorText)).
 				Width(width - 4)
-			body.WriteString(aiGutter + streamStyle.Render(m.responseBuffer.String()) + "\n")
+			body.WriteString("\n" + aiGutter + streamStyle.Render(m.responseBuffer.String()))
 		} else {
-			body.WriteString(aiGutter + sp + "  " + infoStyle.Render("thinking…") + "\n")
+			body.WriteString("\n" + aiGutter + sp + "  " + infoStyle.Render("thinking…"))
 		}
 	}
 
 	// Context line: attached files badge.
 	if len(m.attachedFiles) > 0 {
 		var ctx strings.Builder
-		ctx.WriteString("  ")
+		ctx.WriteString("\n  ")
 		ctx.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Render("context"))
 		ctx.WriteString(" ")
 		for i, f := range m.attachedFiles {
@@ -737,7 +823,11 @@ func (m *model) renderBody(width int) string {
 			ctx.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Render(f))
 		}
 		body.WriteString(ctx.String())
-		body.WriteString("\n")
+	}
+
+	// Confirmation block.
+	if m.awaitingConfirmation && len(m.pendingProposals) > 0 {
+		body.WriteString(m.renderConfirmation(width))
 	}
 
 	// Prompt line.
@@ -745,6 +835,155 @@ func (m *model) renderBody(width int) string {
 	body.WriteString(promptLine)
 
 	return body.String()
+}
+
+// ── Viewport record content ────────────────────────────────────────────────────
+
+func (m *model) renderRecordsContent(width int) string {
+	var buf strings.Builder
+	for _, rec := range m.records {
+		gutter := gutterFor(rec.role)
+		content := rec.text
+		switch rec.role {
+		case roleUser:
+			buf.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render(content))
+		case roleAI:
+			buf.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render(content))
+		case roleError:
+			buf.WriteString(gutter + errorStyle.Render(content))
+		case roleStatus:
+			buf.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render(content))
+		default:
+			buf.WriteString(gutter + outputStyle.Render(content))
+		}
+		buf.WriteString("\n")
+	}
+	return buf.String()
+}
+
+// ── Confirmation block ─────────────────────────────────────────────────────────
+
+func (m *model) renderConfirmation(width int) string {
+	var inner strings.Builder
+	inner.WriteString("\n")
+	inner.WriteString(confirmDimStyle.Render("  proposed file changes:"))
+	for _, p := range m.pendingProposals {
+		inner.WriteString("\n  " + confirmFileStyle.Render("📝 "+p.File))
+	}
+	inner.WriteString("\n")
+	inner.WriteString(confirmKeyStyle.Render("  [1] Accept"))
+	inner.WriteString(confirmDescStyle.Render("  (apply this batch)"))
+	inner.WriteString("\n")
+	inner.WriteString(confirmKeyStyle.Render("  [2] Allow All"))
+	inner.WriteString(confirmDescStyle.Render("  (trust agent for session)"))
+	inner.WriteString("\n")
+	inner.WriteString(confirmKeyStyle.Render("  [3] Reject"))
+	inner.WriteString(confirmDescStyle.Render("  (cancel all changes)"))
+	inner.WriteString("\n")
+
+	boxWidth := 48
+	if width < boxWidth+4 {
+		boxWidth = width - 4
+	}
+	return confirmBoxStyle.Width(boxWidth).Render(inner.String())
+}
+
+// ── Confirmation actions ───────────────────────────────────────────────────────
+
+func (m *model) applySingleProposal() tea.Cmd {
+	if len(m.pendingProposals) == 0 {
+		m.awaitingConfirmation = false
+		return nil
+	}
+	p := m.pendingProposals[0]
+	patch := &execution.Patch{
+		ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
+		File:     p.File,
+		Modified: p.Content,
+	}
+	orig, err := os.ReadFile(p.File)
+	if err == nil {
+		patch.Original = string(orig)
+	}
+	if err := m.execEng.Patches.Apply(patch); err != nil {
+		m.push(roleError, "apply failed: "+err.Error())
+	} else {
+		m.push(roleSystem, infoStyle.Render("applied: "+p.File))
+	}
+	m.pendingProposals = m.pendingProposals[1:]
+	if len(m.pendingProposals) == 0 {
+		m.awaitingConfirmation = false
+	}
+	return nil
+}
+
+func (m *model) applyAllProposals() tea.Cmd {
+	for _, p := range m.pendingProposals {
+		patch := &execution.Patch{
+			ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
+			File:     p.File,
+			Modified: p.Content,
+		}
+		orig, err := os.ReadFile(p.File)
+		if err == nil {
+			patch.Original = string(orig)
+		}
+		if err := m.execEng.Patches.Apply(patch); err != nil {
+			m.push(roleError, "apply failed: "+err.Error())
+		} else {
+			m.push(roleSystem, infoStyle.Render("applied: "+p.File))
+		}
+	}
+	m.pendingProposals = nil
+	m.awaitingConfirmation = false
+	return nil
+}
+
+// ── Build proposal extraction ──────────────────────────────────────────────────
+
+func extractBuildProposals(response string) []patchProposal {
+	var proposals []patchProposal
+	lines := strings.Split(response, "\n")
+	var current *patchProposal
+	inBlock := false
+	content := &strings.Builder{}
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !inBlock {
+			if strings.HasPrefix(trimmed, "```") {
+				lang := strings.TrimPrefix(trimmed, "```")
+				inBlock = true
+				content.Reset()
+				if strings.Contains(lang, ":") {
+					parts := strings.SplitN(lang, ":", 2)
+					current = &patchProposal{File: strings.TrimSpace(parts[1])}
+				} else {
+					current = nil
+				}
+				continue
+			}
+		} else {
+			if strings.HasPrefix(trimmed, "```") {
+				inBlock = false
+				if current != nil && content.Len() > 0 {
+					current.Content = content.String()
+					clean := filepath.Clean(current.File)
+					if clean != "" && clean != "." {
+						current.File = clean
+						proposals = append(proposals, *current)
+					}
+				}
+				current = nil
+				continue
+			}
+			if current != nil {
+				content.WriteString(line)
+				content.WriteString("\n")
+			}
+		}
+	}
+	return proposals
 }
 
 // ── Prompt ────────────────────────────────────────────────────────────────────
