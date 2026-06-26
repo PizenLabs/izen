@@ -61,6 +61,7 @@ func (e *Engine) FeedStream(chunk string) {
 
 func (e *Engine) SetStreamContextFiles(files []string) {
 	e.StreamMon.SetContextFiles(files)
+	e.PatchQueue.SetContextFiles(files)
 }
 
 func (e *Engine) FlushStream() {

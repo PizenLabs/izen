@@ -37,19 +37,22 @@ func (sm *StreamMonitor) resolvePath(path string) string {
 		clean = filepath.Base(clean)
 	}
 
-	if _, err := os.Stat(clean); err == nil {
-		return clean
+	if len(sm.contextFiles) > 0 {
+		if len(sm.contextFiles) == 1 {
+			return sm.contextFiles[0]
+		}
+		for _, cf := range sm.contextFiles {
+			cfBase := filepath.Base(cf)
+			pathBase := filepath.Base(clean)
+			if cfBase == pathBase || cf == clean || strings.HasSuffix(cf, string(filepath.Separator)+clean) {
+				return cf
+			}
+		}
+		return sm.contextFiles[0]
 	}
 
-	for _, cf := range sm.contextFiles {
-		if _, err := os.Stat(cf); err != nil {
-			continue
-		}
-		cfBase := filepath.Base(cf)
-		pathBase := filepath.Base(clean)
-		if cfBase == pathBase || cf == clean || strings.HasSuffix(cf, string(filepath.Separator)+clean) {
-			return cf
-		}
+	if _, err := os.Stat(clean); err == nil {
+		return clean
 	}
 
 	return clean

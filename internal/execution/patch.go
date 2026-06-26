@@ -26,11 +26,12 @@ type StagedPatch struct {
 }
 
 type PatchQueue struct {
-	patches []StagedPatch
-	staged  bool
-	mu      sync.Mutex
-	pm      *PatchManager
-	root    string
+	patches      []StagedPatch
+	staged       bool
+	mu           sync.Mutex
+	pm           *PatchManager
+	root         string
+	contextFiles []string
 }
 
 func NewPatchQueue(root string, pm *PatchManager) *PatchQueue {
@@ -38,6 +39,24 @@ func NewPatchQueue(root string, pm *PatchManager) *PatchQueue {
 		pm:   pm,
 		root: root,
 	}
+}
+
+func (pq *PatchQueue) SetContextFiles(files []string) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	pq.contextFiles = files
+}
+
+func (pq *PatchQueue) validateContextTarget(file string) error {
+	if len(pq.contextFiles) == 0 {
+		return nil
+	}
+	for _, cf := range pq.contextFiles {
+		if cf == file {
+			return nil
+		}
+	}
+	return fmt.Errorf("patch target %s is not in the active context files: %v", file, pq.contextFiles)
 }
 
 func (pq *PatchQueue) IsStaged() bool {
@@ -78,6 +97,9 @@ func (pq *PatchQueue) ApplyNext() error {
 	if p.File == "" {
 		return fmt.Errorf("staged patch has empty file path")
 	}
+	if err := pq.validateContextTarget(p.File); err != nil {
+		return err
+	}
 	fullPath := filepath.Join(pq.root, p.File)
 	if _, err := os.Stat(filepath.Dir(fullPath)); err != nil {
 		return fmt.Errorf("target directory for %s does not exist: %w", p.File, err)
@@ -111,6 +133,9 @@ func (pq *PatchQueue) ApplyAll() (int, error) {
 	for _, p := range pq.patches {
 		if p.File == "" {
 			return applied, fmt.Errorf("staged patch has empty file path")
+		}
+		if err := pq.validateContextTarget(p.File); err != nil {
+			return applied, err
 		}
 		if p.Content == "" {
 			return applied, fmt.Errorf("staged patch for %s has empty content", p.File)
