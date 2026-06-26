@@ -71,6 +71,13 @@ type reviewResultMsg struct {
 
 type agentDoneMsg struct{ label string }
 
+type commitGeneratedMsg struct {
+	subject string
+	body    string
+	hash    string
+	err     error
+}
+
 type buildProposalsReadyMsg struct {
 	proposals []patchProposal
 }
@@ -80,7 +87,7 @@ const (
 	maxInvestigateInvocations = 5
 )
 
-var coreModes = []string{"/ask", "/plan", "/build", "/investigate", "/review", "/commit"}
+var coreModes = []string{"/ask", "/plan", "/build", "/investigate", "/review"}
 
 var utilityCommands = map[modes.Mode][]string{
 	modes.ModeAsk:         {"/models", "/clear"},
@@ -88,7 +95,6 @@ var utilityCommands = map[modes.Mode][]string{
 	modes.ModeBuild:       {"/undo", "/commit", "/checkpoint", "/clear"},
 	modes.ModeInvestigate: {"/history", "/resume", "/clear", "/tokens"},
 	modes.ModeReview:      {"/clear"},
-	modes.ModeCommit:      {"/clear", "/tokens"},
 }
 
 var globalCommands = []string{"/help", "/mode", "/objective", "/drop", "/quit"}

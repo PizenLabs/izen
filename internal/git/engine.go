@@ -116,6 +116,20 @@ func (e *Engine) Undo() (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
+func (e *Engine) LastCommitDiff() (string, error) {
+	return e.git("diff", "HEAD~1..HEAD", "--no-color")
+}
+
+func (e *Engine) AmendCommit(message string) error {
+	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("izen-amend-%d.txt", time.Now().UnixNano()))
+	if err := os.WriteFile(tmpFile, []byte(message), 0644); err != nil {
+		return err
+	}
+	defer os.Remove(tmpFile)
+	_, err := e.git("commit", "--amend", "-F", tmpFile)
+	return err
+}
+
 func (e *Engine) ResetHard(ref string) error {
 	_, err := e.git("reset", "--hard", ref)
 	return err

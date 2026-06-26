@@ -33,7 +33,6 @@ const (
 	colorModeBuild       = "#b9f0b4"
 	colorModeInvestigate = "#f9e2af"
 	colorModeReview      = "#f5c2e7"
-	colorModeCommit      = "#89b4fa"
 
 	colorGutterUser   = "#a6e3a1"
 	colorGutterAI     = "#89b4fa"
@@ -185,8 +184,6 @@ func modeAccentColor(m modes.Mode) lipgloss.Color {
 		return lipgloss.Color(colorModeInvestigate)
 	case modes.ModeReview:
 		return lipgloss.Color(colorModeReview)
-	case modes.ModeCommit:
-		return lipgloss.Color(colorModeCommit)
 	default:
 		return lipgloss.Color(colorAccent)
 	}

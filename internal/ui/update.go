@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -57,6 +58,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.saveReportFn != nil {
 			msg.saveReportFn()
 		}
+		return m, nil
+
+	case commitGeneratedMsg:
+		m.agentRunning = false
+		m.agentDone = true
+		if msg.err != nil {
+			m.push(roleError, "commit error: "+msg.err.Error())
+			return m, nil
+		}
+		m.push(roleSystem, infoStyle.Render(fmt.Sprintf("commit: %s", msg.subject)))
+		if msg.body != "" {
+			for _, l := range strings.Split(msg.body, "\n") {
+				m.push(roleSystem, infoStyle.Render(l))
+			}
+		}
+		m.push(roleStatus, fmt.Sprintf("amended as %s", msg.hash))
 		return m, nil
 
 	case tokenMsg:

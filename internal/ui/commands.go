@@ -176,7 +176,6 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /build       implement, refactor, write tests"))
 		m.push(roleSystem, infoStyle.Render("  /investigate debug bugs, failures, regressions"))
 		m.push(roleSystem, infoStyle.Render("  /review      audit changes, detect risks"))
-		m.push(roleSystem, infoStyle.Render("  /commit      generate conventional commit messages"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
 		m.push(roleSystem, infoStyle.Render("  /help         show this help"))
@@ -213,7 +212,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 				return nil
 			}
 		}
-		m.push(roleSystem, infoStyle.Render("usage: /mode <ask|plan|build|investigate|review|commit>"))
+		m.push(roleSystem, infoStyle.Render("usage: /mode <ask|plan|build|investigate|review>"))
 		return nil
 
 	case strings.HasPrefix(cmd, "/objective"):
@@ -272,16 +271,16 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case cmd == "/undo":
-		m.push(roleSystem, infoStyle.Render("/undo not yet implemented"))
-		return nil
+		return m.runUndoCmd()
+
+	case cmd == "/commit":
+		return m.runCommitCmdAgent()
 
 	case cmd == "/checkpoint":
 		m.push(roleSystem, infoStyle.Render("/checkpoint not yet implemented"))
 		return nil
 
 	case cmd == "/history":
-		m.push(roleSystem, infoStyle.Render("/history not yet implemented"))
-		return nil
 
 	case cmd == "/resume":
 		m.push(roleSystem, infoStyle.Render("/resume not yet implemented"))
@@ -290,7 +289,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 	for _, mode := range []modes.Mode{
 		modes.ModeAsk, modes.ModePlan, modes.ModeBuild,
-		modes.ModeInvestigate, modes.ModeReview, modes.ModeCommit,
+		modes.ModeInvestigate, modes.ModeReview,
 	} {
 		prefix := "/" + mode.String()
 		if strings.HasPrefix(strings.ToLower(cmd), prefix) {

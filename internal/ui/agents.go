@@ -1,14 +1,18 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/modes/commit"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/review"
+	"github.com/PizenLabs/izen/internal/prompt"
 )
 
 func (m *model) runInvestigateCmd(content string) tea.Cmd {
@@ -173,6 +177,104 @@ func (m *model) runReviewCmd() tea.Cmd {
 			records:      recs,
 			sessionKey:   sessionKey,
 			saveReportFn: func() { review.SaveReport(savedResult, ".") },
+		}
+	}
+}
+
+func (m *model) runUndoCmd() tea.Cmd {
+	checkpoints := m.sess.Checkpoints
+	if len(checkpoints) == 0 {
+		m.push(roleError, "no checkpoints to undo")
+		return nil
+	}
+
+	lastID := checkpoints[len(checkpoints)-1]
+	if err := m.execEng.Checkpoints.Restore(lastID); err != nil {
+		m.push(roleError, "undo failed: "+err.Error())
+		return nil
+	}
+
+	m.sess.Checkpoints = checkpoints[:len(checkpoints)-1]
+	m.sess.Save()
+	m.push(roleStatus, fmt.Sprintf("undone: restored to checkpoint %s", lastID))
+	return nil
+}
+
+func (m *model) runCommitCmdAgent() tea.Cmd {
+	m.agentRunning = true
+	m.agentDone = false
+	m.agentLabel = "generating commit message"
+	m.spinnerFrame = 0
+
+	return func() tea.Msg {
+		diff, err := m.gitEng.LastCommitDiff()
+		if err != nil {
+			return commitGeneratedMsg{err: fmt.Errorf("failed to get diff: %w", err)}
+		}
+
+		if strings.TrimSpace(diff) == "" {
+			return commitGeneratedMsg{err: fmt.Errorf("no changes in last commit — nothing to amend")}
+		}
+
+		payload := fmt.Sprintf("Generate a conventional commit message for these staged changes:\n\n%s", diff)
+		sys := prompt.CommitSystemPrompt()
+		msgs := []ai.Message{
+			{Role: "system", Content: sys},
+			{Role: "user", Content: payload},
+		}
+
+		req := ai.Request{
+			Model:    m.cfg.ActiveModelName(),
+			Messages: msgs,
+			Stream:   false,
+		}
+
+		resp, err := m.provider.Execute(context.Background(), req)
+		if err != nil {
+			return commitGeneratedMsg{err: fmt.Errorf("LLM call failed: %w", err)}
+		}
+
+		raw := resp.Content
+		lines := commit.CleanRawLLMOutput(raw)
+
+		var subject, body string
+		for i, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if i == 0 {
+				subject = commit.SanitizeSubject(line)
+			} else {
+				body += line + "\n"
+			}
+		}
+
+		if subject == "" {
+			subject = "chore(repo): update repository state"
+		}
+
+		bodyLines := strings.Split(strings.TrimSpace(body), "\n")
+		body = commit.SanitizeBody(bodyLines)
+
+		msg := commit.CommitMessage{Subject: subject, Body: body}
+		finalMessage := fmt.Sprintf("%s\n\n%s\n", msg.Subject, msg.Body)
+
+		if err := m.gitEng.AmendCommit(finalMessage); err != nil {
+			return commitGeneratedMsg{err: fmt.Errorf("amend failed: %w", err)}
+		}
+
+		hash, _ := m.gitEng.CurrentHash()
+		checkpoints := m.sess.Checkpoints
+		if len(checkpoints) > 0 {
+			m.sess.Checkpoints = checkpoints[:len(checkpoints)-1]
+			m.sess.Save()
+		}
+
+		return commitGeneratedMsg{
+			subject: msg.Subject,
+			body:    msg.Body,
+			hash:    hash,
 		}
 	}
 }

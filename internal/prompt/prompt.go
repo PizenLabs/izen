@@ -53,8 +53,6 @@ func ForMode(mode string) string {
 		return BuildSystemPrompt()
 	case "investigate":
 		return InvestigateSystemPrompt()
-	case "commit":
-		return CommitSystemPrompt()
 	default:
 		return ""
 	}
