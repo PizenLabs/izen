@@ -241,6 +241,93 @@ func TestPatchListEmpty(t *testing.T) {
 	}
 }
 
+func TestSanitizeDiffContentNewFile(t *testing.T) {
+	input := `@@ -0,0 +6 @@
++MIT License
++
++Copyright (c) 2024 Pizen Labs
++
++Permission is hereby granted`
+
+	expected := "MIT License\n\nCopyright (c) 2024 Pizen Labs\n\nPermission is hereby granted"
+	got := SanitizeDiffContent(input)
+	if got != expected {
+		t.Fatalf("SanitizeDiffContent(new file):\n got: %q\nwant: %q", got, expected)
+	}
+}
+
+func TestSanitizeDiffContentModification(t *testing.T) {
+	input := `--- a/foo.go
++++ b/foo.go
+@@ -1,5 +1,6 @@
+ package foo
+ 
+ func Hello() string {
+-	return "goodbye"
++	return "hello"
+ }
+`
+
+	expected := "package foo\n\nfunc Hello() string {\n\treturn \"hello\"\n}"
+	got := SanitizeDiffContent(input)
+	if got != expected {
+		t.Fatalf("SanitizeDiffContent(modification):\n got: %q\nwant: %q", got, expected)
+	}
+}
+
+func TestSanitizeDiffContentWithFence(t *testing.T) {
+	input := "```diff\n--- a/LICENSE\n+++ b/LICENSE\n@@ -0,0 +3 @@\n+MIT License\n+Copyright (c) 2024\n```"
+
+	expected := "MIT License\nCopyright (c) 2024"
+	got := SanitizeDiffContent(input)
+	if got != expected {
+		t.Fatalf("SanitizeDiffContent(with fence):\n got: %q\nwant: %q", got, expected)
+	}
+}
+
+func TestSanitizeDiffContentCleanCode(t *testing.T) {
+	input := "package main\n\nfunc main() {}\n"
+	got := SanitizeDiffContent(input)
+	if got != input {
+		t.Fatalf("SanitizeDiffContent(clean): expected passthrough, got %q", got)
+	}
+}
+
+func TestSanitizeDiffContentBlankLines(t *testing.T) {
+	input := `@@ -0,0 +3 @@
++line1
++
++line3`
+
+	expected := "line1\n\nline3"
+	got := SanitizeDiffContent(input)
+	if got != expected {
+		t.Fatalf("SanitizeDiffContent(blank lines):\n got: %q\nwant: %q", got, expected)
+	}
+}
+
+func TestSanitizeDiffContentContextLines(t *testing.T) {
+	input := `--- a/main.go
++++ b/main.go
+@@ -1,3 +1,4 @@
+ package main
+ 
++// new comment
+ func main() {}`
+
+	expected := "package main\n\n// new comment\nfunc main() {}"
+	got := SanitizeDiffContent(input)
+	if got != expected {
+		t.Fatalf("SanitizeDiffContent(context lines):\n got: %q\nwant: %q", got, expected)
+	}
+}
+
+func TestSanitizeDiffContentEmptyInput(t *testing.T) {
+	got := SanitizeDiffContent("")
+	if got != "" {
+		t.Fatalf("SanitizeDiffContent(empty): expected empty, got %q", got)
+	}
+}
 func TestPatchLoadNotFound(t *testing.T) {
 	dir, _ := os.MkdirTemp("", "izen-patch-load-*")
 	defer os.RemoveAll(dir)

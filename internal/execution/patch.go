@@ -220,7 +220,8 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 
-	if err := os.WriteFile(fullPath, []byte(patch.Modified), 0644); err != nil {
+	clean := SanitizeDiffContent(patch.Modified)
+	if err := os.WriteFile(fullPath, []byte(clean), 0644); err != nil {
 		return fmt.Errorf("write %s: %w", patch.File, err)
 	}
 
@@ -290,6 +291,46 @@ func (pm *PatchManager) List() ([]Patch, error) {
 func (pm *PatchManager) Remove(id string) error {
 	path := filepath.Join(pm.patDir, id+".json")
 	return os.Remove(path)
+}
+
+func SanitizeDiffContent(content string) string {
+	lines := strings.Split(content, "\n")
+	isDiff := false
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "@@") ||
+			strings.HasPrefix(line, "--- ") ||
+			strings.HasPrefix(line, "+++ ") {
+			isDiff = true
+			break
+		}
+	}
+
+	if !isDiff {
+		return content
+	}
+
+	var result []string
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "```diff"),
+			strings.HasPrefix(line, "```"),
+			strings.HasPrefix(line, "--- "),
+			strings.HasPrefix(line, "+++ "),
+			strings.HasPrefix(line, "@@"):
+			continue
+		case strings.HasPrefix(line, "-"):
+			continue
+		case strings.HasPrefix(line, "+"):
+			result = append(result, strings.TrimPrefix(line, "+"))
+		case strings.HasPrefix(line, " "):
+			result = append(result, strings.TrimPrefix(line, " "))
+		default:
+			result = append(result, line)
+		}
+	}
+
+	return strings.TrimRight(strings.Join(result, "\n"), "\n")
 }
 
 func (pm *PatchManager) store(patch *Patch) error {
