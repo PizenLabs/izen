@@ -315,7 +315,7 @@ func TestCompressFile(t *testing.T) {
 		},
 	}
 
-	fs := compressFile(fn, 2)
+	fs := CompressFile(fn, 2)
 	if len(fs.Symbols) > 2 {
 		t.Fatalf("expected max 2 symbols, got %d", len(fs.Symbols))
 	}

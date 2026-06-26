@@ -14,13 +14,14 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
+	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
+	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/review"
@@ -212,10 +213,10 @@ var (
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color(colorOrange)).
 			Padding(0, 1)
-	confirmKeyStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorOrange))
-	confirmDescStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
-	confirmDimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	confirmFileStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
+	confirmKeyStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorOrange))
+	confirmDescStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+	confirmDimStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	confirmFileStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 )
 
 // ── Gutter helpers ────────────────────────────────────────────────────────────
@@ -305,6 +306,8 @@ type model struct {
 	provider ai.Provider
 	resolver *modes.Resolver
 	gitEng   *git.Engine
+	graphEng *graph.Engine
+	graph    *graph.Graph
 
 	input   strings.Builder
 	records []record
@@ -330,13 +333,11 @@ type model struct {
 	pendingFileRefs []string
 	attachedFiles   []string
 
-	viewport viewport.Model
-
 	awaitingConfirmation bool
 	pendingProposals     []patchProposal
 	acceptAll            bool
 
-	execEng    *execution.Engine
+	execEng     *execution.Engine
 	buildOutput strings.Builder
 }
 
@@ -367,21 +368,24 @@ func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea
 		provider = defaultP
 	}
 
+	graphEng := graph.NewEngine(".")
+	g, _, _ := graphEng.BuildOrLoad()
+
 	m := &model{
 		cfg:           cfg,
 		sess:          sess,
 		provider:      provider,
 		gitEng:        eng,
+		graphEng:      graphEng,
+		graph:         g,
 		resolver:      modes.NewResolver(),
 		attachedFiles: make([]string, 0),
-		viewport:      viewport.New(80, 10),
 		execEng:       execution.NewEngine(".", cfg, sess),
 	}
 	m.resolver.Set(sess.Mode)
-	m.viewport.KeyMap = viewport.KeyMap{}
 	m.records = append(m.records, record{role: roleSystem, text: ""})
 
-	return tea.NewProgram(m, tea.WithAltScreen())
+	return tea.NewProgram(m)
 }
 
 // FIX #2: tick chain starts unconditionally — never dies between idle periods.
@@ -457,6 +461,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			props := extractBuildProposals(final)
 			if len(props) > 0 {
 				if m.acceptAll {
+					applied := 0
 					for _, p := range props {
 						patch := &execution.Patch{
 							ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
@@ -470,8 +475,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						if err := m.execEng.Patches.Apply(patch); err != nil {
 							m.push(roleError, "apply failed: "+err.Error())
 						} else {
+							applied++
 							m.push(roleSystem, infoStyle.Render("applied: "+p.File))
 						}
+					}
+					if applied > 0 {
+						m.createBuildCheckpoint(applied)
 					}
 				} else {
 					m.pendingProposals = props
@@ -480,13 +489,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					for _, p := range props {
 						proposalMsg += fmt.Sprintf("  • %s\n", p.File)
 					}
-					proposalMsg += "review changes above and confirm below"
+					proposalMsg += "\n  [1] Accept  [2] Allow All  [3] Reject"
 					m.push(roleSystem, infoStyle.Render(proposalMsg))
 				}
 			}
 		}
 
-		m.viewport.GotoBottom()
 		return m, nil
 
 	case streamErrMsg:
@@ -498,7 +506,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.viewport.Width = msg.Width
 		return m, nil
 
 	case tea.KeyMsg:
@@ -603,26 +610,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.updateSuggestions()
 		return m, nil
 
-	case tea.KeyPgUp:
-		m.viewport.HalfViewUp()
-		return m, nil
-
-	case tea.KeyPgDown:
-		m.viewport.HalfViewDown()
-		return m, nil
-
-	case tea.KeyUp:
-		if m.input.Len() == 0 {
-			m.viewport.LineUp(1)
-			return m, nil
-		}
-		return m, nil
-
-	case tea.KeyDown:
-		if m.input.Len() == 0 {
-			m.viewport.LineDown(1)
-			return m, nil
-		}
+	case tea.KeyPgUp, tea.KeyPgDown, tea.KeyUp, tea.KeyDown:
 		return m, nil
 
 	case tea.KeyRunes:
@@ -635,16 +623,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // ── View ──────────────────────────────────────────────────────────────────────
-
-const (
-	// Fixed chrome lines consumed by non-body elements.
-	chromeHeader  = 1 // header line
-	chromeModeBar = 1 // mode tab line
-	chromeTopDiv  = 1 // separator after mode bar
-	chromeBotDiv  = 1 // separator before status
-	chromeStatus  = 1 // status bar at very bottom
-	chromePrompt = 2 // blank + gutter+label+chevron+input+cursor
-)
 
 func (m *model) View() string {
 	width := m.width
@@ -665,7 +643,7 @@ func (m *model) View() string {
 	}
 	parts = append(parts, botDiv, status)
 
-	return lipgloss.JoinVertical(lipgloss.Top, parts...)
+	return strings.Join(parts, "\n")
 }
 
 // ── Code highlighting ──────────────────────────────────────────────────────────
@@ -762,41 +740,34 @@ func highlightCode(lines []string) []string {
 func (m *model) renderBody(width int) string {
 	var body strings.Builder
 
-	statusLines := 0
-	if m.agentRunning || m.agentDone || m.streaming {
-		statusLines = 1
+	for _, rec := range m.records {
+		gutter := gutterFor(rec.role)
+		content := rec.text
+		switch rec.role {
+		case roleUser:
+			body.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render(content))
+		case roleAI:
+			body.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render(content))
+		case roleError:
+			body.WriteString(gutter + errorStyle.Render(content))
+		case roleStatus:
+			body.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render(content))
+		default:
+			body.WriteString(gutter + outputStyle.Render(content))
+		}
+		body.WriteString("\n")
 	}
-	contextLines := 0
-	if len(m.attachedFiles) > 0 {
-		contextLines = 1
-	}
-	confirmLines := 0
-	if m.awaitingConfirmation && len(m.pendingProposals) > 0 {
-		confirmLines = 1
-	}
 
-	belowViewport := statusLines + contextLines + confirmLines + chromePrompt - 1
-	vpHeight := m.height - chromeHeader - chromeModeBar - chromeTopDiv - chromeBotDiv - chromeStatus - belowViewport
-	if vpHeight < 3 {
-		vpHeight = 3
-	}
-
-	m.viewport.Width = width
-	m.viewport.Height = vpHeight
-
-	recordsContent := m.renderRecordsContent(width)
-	m.viewport.SetContent(recordsContent)
-
-	body.WriteString(m.viewport.View())
-
-	// Dynamic status lines (agent / streaming) below viewport.
+	// Dynamic status lines (agent / streaming).
 	if m.agentRunning {
 		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame])
 		aiGutter := gutterAIStyle.Render("▌") + " "
-		body.WriteString("\n" + aiGutter + sp + "  " + lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render(m.agentLabel+"…"))
+		body.WriteString(aiGutter + sp + "  " + lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render(m.agentLabel+"…"))
+		body.WriteString("\n")
 	} else if m.agentDone {
 		doneGutter := gutterStatusStyle.Render("▌") + " "
-		body.WriteString("\n" + doneGutter + labelStatusStyle.Render(m.agentLabel+" complete"))
+		body.WriteString(doneGutter + labelStatusStyle.Render(m.agentLabel+" complete"))
+		body.WriteString("\n")
 	} else if m.streaming {
 		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame])
 		aiGutter := gutterAIStyle.Render("▌") + " "
@@ -804,10 +775,11 @@ func (m *model) renderBody(width int) string {
 			streamStyle := lipgloss.NewStyle().
 				Foreground(lipgloss.Color(colorText)).
 				Width(width - 4)
-			body.WriteString("\n" + aiGutter + streamStyle.Render(m.responseBuffer.String()))
+			body.WriteString(aiGutter + streamStyle.Render(m.responseBuffer.String()))
 		} else {
-			body.WriteString("\n" + aiGutter + sp + "  " + infoStyle.Render("thinking…"))
+			body.WriteString(aiGutter + sp + "  " + infoStyle.Render("thinking…"))
 		}
+		body.WriteString("\n")
 	}
 
 	// Context line: attached files badge.
@@ -823,11 +795,13 @@ func (m *model) renderBody(width int) string {
 			ctx.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Render(f))
 		}
 		body.WriteString(ctx.String())
+		body.WriteString("\n")
 	}
 
 	// Confirmation block.
 	if m.awaitingConfirmation && len(m.pendingProposals) > 0 {
 		body.WriteString(m.renderConfirmation(width))
+		body.WriteString("\n")
 	}
 
 	// Prompt line.
@@ -835,30 +809,6 @@ func (m *model) renderBody(width int) string {
 	body.WriteString(promptLine)
 
 	return body.String()
-}
-
-// ── Viewport record content ────────────────────────────────────────────────────
-
-func (m *model) renderRecordsContent(width int) string {
-	var buf strings.Builder
-	for _, rec := range m.records {
-		gutter := gutterFor(rec.role)
-		content := rec.text
-		switch rec.role {
-		case roleUser:
-			buf.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render(content))
-		case roleAI:
-			buf.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render(content))
-		case roleError:
-			buf.WriteString(gutter + errorStyle.Render(content))
-		case roleStatus:
-			buf.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render(content))
-		default:
-			buf.WriteString(gutter + outputStyle.Render(content))
-		}
-		buf.WriteString("\n")
-	}
-	return buf.String()
 }
 
 // ── Confirmation block ─────────────────────────────────────────────────────────
@@ -913,11 +863,13 @@ func (m *model) applySingleProposal() tea.Cmd {
 	m.pendingProposals = m.pendingProposals[1:]
 	if len(m.pendingProposals) == 0 {
 		m.awaitingConfirmation = false
+		m.createBuildCheckpoint(1)
 	}
 	return nil
 }
 
 func (m *model) applyAllProposals() tea.Cmd {
+	applied := 0
 	for _, p := range m.pendingProposals {
 		patch := &execution.Patch{
 			ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
@@ -931,12 +883,28 @@ func (m *model) applyAllProposals() tea.Cmd {
 		if err := m.execEng.Patches.Apply(patch); err != nil {
 			m.push(roleError, "apply failed: "+err.Error())
 		} else {
+			applied++
 			m.push(roleSystem, infoStyle.Render("applied: "+p.File))
 		}
 	}
 	m.pendingProposals = nil
 	m.awaitingConfirmation = false
+	if applied > 0 {
+		m.createBuildCheckpoint(applied)
+	}
 	return nil
+}
+
+// createBuildCheckpoint creates a git checkpoint after build mutations,
+// leaving an audit trail for rollback via /undo.
+func (m *model) createBuildCheckpoint(fileCount int) {
+	cp, err := m.execEng.Checkpoints.Create(fmt.Sprintf("izen build: %d file(s)", fileCount))
+	if err != nil {
+		m.push(roleSystem, infoStyle.Render("checkpoint: "+err.Error()))
+	} else {
+		m.push(roleSystem, infoStyle.Render(
+			fmt.Sprintf("checkpoint: %s (%d files)", cp.Hash[:8], fileCount)))
+	}
 }
 
 // ── Build proposal extraction ──────────────────────────────────────────────────
@@ -1460,8 +1428,10 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
-	// Collect file contents from @-references before expansion strips them.
+	// Collect file context from @-references using graph-powered symbol slices
+	// instead of raw file dumps, saving tokens and providing structural context.
 	var fileCtx strings.Builder
+	var refFiles []string
 	for _, field := range strings.Fields(line) {
 		if !strings.HasPrefix(field, "@") {
 			continue
@@ -1470,31 +1440,77 @@ func (m *model) handleInput(line string) tea.Cmd {
 		if ref == "" || ref == "." {
 			continue
 		}
-		data, err := os.ReadFile(ref)
-		if err != nil {
-			continue
-		}
-		if fileCtx.Len() > 0 {
-			fileCtx.WriteString("\n\n")
-		}
-		ext := filepath.Ext(ref)
-		lang := strings.TrimPrefix(ext, ".")
-		fileCtx.WriteString(fmt.Sprintf("File: %s\n```%s\n%s\n```", ref, lang, string(data)))
+		refFiles = append(refFiles, ref)
 	}
-	// Also read files selected via @ autocomplete.
-	for _, path := range m.pendingFileRefs {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		if fileCtx.Len() > 0 {
-			fileCtx.WriteString("\n\n")
-		}
-		ext := filepath.Ext(path)
-		lang := strings.TrimPrefix(ext, ".")
-		fileCtx.WriteString(fmt.Sprintf("File: %s\n```%s\n%s\n```", path, lang, string(data)))
-	}
+	// Also collect files selected via @ autocomplete.
+	refFiles = append(refFiles, m.pendingFileRefs...)
 	m.pendingFileRefs = nil
+
+	if m.graph != nil && len(refFiles) > 0 {
+		cb := ctxpkg.NewBuilder(".", m.graph, m.gitEng, m.sess)
+		renderer := ctxpkg.DefaultRenderer()
+		seen := make(map[string]bool)
+		for _, ref := range refFiles {
+			if seen[ref] {
+				continue
+			}
+			seen[ref] = true
+
+			// Try symbol lookup first (function name, type name, etc.)
+			symName := filepath.Base(ref)
+			symExt := filepath.Ext(symName)
+			if symExt != "" {
+				symName = strings.TrimSuffix(symName, symExt)
+			}
+			depCtx := cb.BuildDependencySlice(symName)
+
+			if len(depCtx.Files) == 0 {
+				// Fall back to file lookup via graph
+				fn := m.graph.LookupFile(ref)
+				if fn != nil {
+					fs := ctxpkg.CompressFile(fn, 30)
+					depCtx.Files = append(depCtx.Files, fs)
+				}
+			}
+
+			if len(depCtx.Files) > 0 {
+				if fileCtx.Len() > 0 {
+					fileCtx.WriteString("\n")
+				}
+				fileCtx.WriteString(renderer.Render(depCtx))
+			} else {
+				// Final fallback: read a small window of the file
+				data, err := os.ReadFile(ref)
+				if err == nil {
+					ext := filepath.Ext(ref)
+					lang := strings.TrimPrefix(ext, ".")
+					lines := strings.Split(string(data), "\n")
+					if len(lines) > 50 {
+						lines = lines[:50]
+					}
+					if fileCtx.Len() > 0 {
+						fileCtx.WriteString("\n\n")
+					}
+					fileCtx.WriteString(fmt.Sprintf("File: %s\n```%s\n%s\n```",
+						ref, lang, strings.Join(lines, "\n")))
+				}
+			}
+		}
+	} else if len(refFiles) > 0 {
+		// No graph available: read full file contents (legacy fallback).
+		for _, ref := range refFiles {
+			data, err := os.ReadFile(ref)
+			if err != nil {
+				continue
+			}
+			if fileCtx.Len() > 0 {
+				fileCtx.WriteString("\n\n")
+			}
+			ext := filepath.Ext(ref)
+			lang := strings.TrimPrefix(ext, ".")
+			fileCtx.WriteString(fmt.Sprintf("File: %s\n```%s\n%s\n```", ref, lang, string(data)))
+		}
+	}
 
 	line = m.expandFileRefs(line)
 

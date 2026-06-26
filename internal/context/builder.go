@@ -104,7 +104,7 @@ func (b *Builder) collectRelevantFiles(ctx *Context, req BuildRequest) {
 		if fn == nil {
 			continue
 		}
-		ctx.Files = append(ctx.Files, compressFile(fn, req.MaxSymbols))
+		ctx.Files = append(ctx.Files, CompressFile(fn, req.MaxSymbols))
 	}
 
 	sort.Slice(ctx.Files, func(i, j int) bool {
@@ -121,7 +121,7 @@ func (b *Builder) collectAllFiles(ctx *Context, req BuildRequest) {
 		return
 	}
 	for _, fn := range b.graph.Files {
-		ctx.Files = append(ctx.Files, compressFile(&fn, req.MaxSymbols))
+		ctx.Files = append(ctx.Files, CompressFile(&fn, req.MaxSymbols))
 		if req.MaxFiles > 0 && len(ctx.Files) >= req.MaxFiles {
 			break
 		}
@@ -152,7 +152,7 @@ func (b *Builder) AddError(ctx *Context, err error) {
 	}
 }
 
-func compressFile(fn *graph.FileNode, maxSymbols int) FileSlice {
+func CompressFile(fn *graph.FileNode, maxSymbols int) FileSlice {
 	fs := FileSlice{
 		Path:    fn.Path,
 		Package: fn.Package,
@@ -248,8 +248,60 @@ func (b *Builder) DependentsOf(target string) []FileSlice {
 	for _, dep := range deps {
 		fn := b.graph.LookupFile(dep)
 		if fn != nil {
-			slices = append(slices, compressFile(fn, 5))
+			slices = append(slices, CompressFile(fn, 5))
 		}
 	}
 	return slices
+}
+
+// BuildDependencySlice assembles a compact, token-efficient context for a given
+// symbol by retrieving its file's symbol table plus files that depend on it
+// (import callers). This avoids dumping raw file contents.
+func (b *Builder) BuildDependencySlice(symbol string) *Context {
+	ctx := &Context{
+		Objective: b.session.Objective,
+		Mode:      b.session.Mode.String(),
+		Query:     symbol,
+	}
+
+	if b.graph == nil {
+		return ctx
+	}
+
+	symbols := b.graph.LookupSymbol(symbol)
+	if len(symbols) == 0 {
+		return ctx
+	}
+
+	seen := make(map[string]bool)
+
+	// File containing the symbol.
+	sym := symbols[0]
+	if fn := b.graph.LookupFile(sym.File); fn != nil {
+		ctx.Files = append(ctx.Files, CompressFile(fn, 30))
+		seen[sym.File] = true
+
+		// This file's import callers (dependents).
+		for _, dep := range b.graph.Dependents[sym.File] {
+			if !seen[dep] {
+				if fn := b.graph.LookupFile(dep); fn != nil {
+					ctx.Files = append(ctx.Files, CompressFile(fn, 10))
+					seen[dep] = true
+				}
+			}
+		}
+
+		// This file's own imports (for call chain context).
+		for _, imp := range fn.Imports {
+			if !seen[imp] {
+				impFile := b.graph.LookupFile(imp)
+				if impFile != nil {
+					ctx.Files = append(ctx.Files, CompressFile(impFile, 5))
+					seen[imp] = true
+				}
+			}
+		}
+	}
+
+	return ctx
 }
