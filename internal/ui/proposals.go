@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -11,6 +12,8 @@ import (
 
 	"github.com/PizenLabs/izen/internal/execution"
 )
+
+var diffBlockRegex = regexp.MustCompile("(?s)```diff\\n(.*?)```")
 
 func extractBuildProposals(response string) []patchProposal {
 	var proposals []patchProposal
@@ -57,8 +60,95 @@ func extractBuildProposals(response string) []patchProposal {
 	return proposals
 }
 
+func extractDiffPatches(response string) []patchProposal {
+	var proposals []patchProposal
+	matches := diffBlockRegex.FindAllStringSubmatch(response, -1)
+	for _, m := range matches {
+		diffContent := strings.TrimSpace(m[1])
+		file, body := parseUnifiedDiff(diffContent)
+		if file == "" || body == "" {
+			file, body = parseUnifiedDiffHunks(diffContent)
+		}
+		if file != "" && body != "" {
+			clean := filepath.Clean(file)
+			if clean != "" && clean != "." {
+				proposals = append(proposals, patchProposal{
+					File:    clean,
+					Content: body,
+				})
+			}
+		}
+	}
+	return proposals
+}
+
+func parseUnifiedDiff(content string) (string, string) {
+	lines := strings.Split(content, "\n")
+	var filePath string
+	var body strings.Builder
+	inHunk := false
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "+++ b/") {
+			filePath = strings.TrimPrefix(line, "+++ b/")
+			continue
+		}
+		if strings.HasPrefix(line, "---") {
+			continue
+		}
+		if strings.HasPrefix(line, "@@") {
+			inHunk = true
+			body.WriteString(line)
+			body.WriteString("\n")
+			continue
+		}
+		if inHunk {
+			body.WriteString(line)
+			body.WriteString("\n")
+		}
+	}
+
+	return filePath, strings.TrimRight(body.String(), "\n")
+}
+
+func parseUnifiedDiffHunks(content string) (string, string) {
+	lines := strings.Split(content, "\n")
+	var filePath string
+	var body strings.Builder
+	inHunk := false
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "+++ ") {
+			raw := strings.TrimPrefix(line, "+++ ")
+			if strings.HasPrefix(raw, "b/") {
+				raw = raw[2:]
+			}
+			filePath = raw
+			continue
+		}
+		if strings.HasPrefix(line, "--- ") {
+			continue
+		}
+		if strings.HasPrefix(line, "@@") {
+			inHunk = true
+			body.WriteString(line)
+			body.WriteString("\n")
+			continue
+		}
+		if inHunk {
+			body.WriteString(line)
+			body.WriteString("\n")
+		}
+	}
+	if body.Len() > 0 {
+		return filePath, strings.TrimRight(body.String(), "\n")
+	}
+	return filePath, body.String()
+}
+
 func (m *model) applySingleProposal() tea.Cmd {
 	if len(m.pendingProposals) == 0 {
+		m.state = StateChat
 		m.awaitingConfirmation = false
 		return nil
 	}
@@ -79,8 +169,13 @@ func (m *model) applySingleProposal() tea.Cmd {
 	}
 	m.pendingProposals = m.pendingProposals[1:]
 	if len(m.pendingProposals) == 0 {
+		m.state = StateChat
 		m.awaitingConfirmation = false
 		m.createBuildCheckpoint(1)
+	} else {
+		diff := RenderInlineDiff(p.Content)
+		m.push(roleSystem, fmt.Sprintf("next diff for %s:\n%s", m.pendingProposals[0].File, diff))
+		m.push(roleSystem, infoStyle.Render("\n  [1] Accept  [2] Allow All  [3] Reject"))
 	}
 	return nil
 }
@@ -106,6 +201,7 @@ func (m *model) applyAllProposals() tea.Cmd {
 	}
 	m.pendingProposals = nil
 	m.awaitingConfirmation = false
+	m.state = StateChat
 	if applied > 0 {
 		m.createBuildCheckpoint(applied)
 	}

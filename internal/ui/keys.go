@@ -7,7 +7,7 @@ import (
 )
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.awaitingConfirmation {
+	if m.state == StateAwaitingApproval {
 		switch msg.String() {
 		case "1":
 			return m, m.applySingleProposal()
@@ -15,6 +15,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.acceptAll = true
 			return m, m.applyAllProposals()
 		case "3", "esc":
+			m.state = StateChat
 			m.awaitingConfirmation = false
 			m.pendingProposals = nil
 			m.acceptAll = false

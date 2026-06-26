@@ -222,3 +222,26 @@ func (m *model) renderStatusBar(width int) string {
 
 	return left.String() + strings.Repeat(" ", gap) + right.String()
 }
+
+func RenderInlineDiff(diff string) string {
+	if diff == "" {
+		return ""
+	}
+	diffGreen := lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))
+	diffRed := lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8"))
+	diffMuted := lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	var b strings.Builder
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			b.WriteString(diffGreen.Render(line))
+		} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+			b.WriteString(diffRed.Render(line))
+		} else if strings.HasPrefix(line, "@@") {
+			b.WriteString(diffMuted.Render(line))
+		} else {
+			b.WriteString(line)
+		}
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}

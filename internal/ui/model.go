@@ -26,6 +26,13 @@ const (
 	roleStatus
 )
 
+type UIState uint8
+
+const (
+	StateChat UIState = iota
+	StateAwaitingApproval
+)
+
 type record struct {
 	role role
 	text string
@@ -121,6 +128,8 @@ type model struct {
 	awaitingConfirmation bool
 	pendingProposals     []patchProposal
 	acceptAll            bool
+
+	state UIState
 
 	execEng     *execution.Engine
 	buildOutput strings.Builder

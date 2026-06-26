@@ -76,8 +76,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleStatus, "response complete")
 		m.responseBuffer.Reset()
 
-		if m.resolver.Current() == modes.ModeBuild && !m.awaitingConfirmation {
+		if m.resolver.Current() == modes.ModeBuild && m.state != StateAwaitingApproval {
 			props := extractBuildProposals(final)
+			diffProps := extractDiffPatches(final)
+			if len(diffProps) > 0 {
+				existing := make(map[string]bool)
+				for _, p := range props {
+					existing[p.File] = true
+				}
+				for _, d := range diffProps {
+					if !existing[d.File] {
+						props = append(props, d)
+					}
+				}
+			}
 			if len(props) > 0 {
 				if m.acceptAll {
 					applied := 0
@@ -103,6 +115,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				} else {
 					m.pendingProposals = props
+					m.state = StateAwaitingApproval
 					m.awaitingConfirmation = true
 					proposalMsg := "proposed changes:\n"
 					for _, p := range props {
