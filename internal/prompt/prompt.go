@@ -33,7 +33,10 @@ Rules:
 - Always include @@ hunk headers with line numbers.
 - Never output full file contents — only the minimal changes.
 - If you need to change multiple files, output one ` + "```diff" + ` block per file in sequence.
-- Use + for added lines, - for removed lines, and no prefix for context lines.`
+- Use + for added lines, - for removed lines, and no prefix for context lines.
+
+CRITICAL INSTRUCTION FOR TEXT/DOCUMENTATION FILES:
+When creating or modifying standalone text, documentation, or legal files (such as LICENSE, README.md, .gitignore, .env), you MUST output the raw text directly. DO NOT wrap the content inside code comments of any programming language (DO NOT use ` + "`/* ... */`" + `, ` + "`//`" + `, or ` + "`#`" + ` unless specifically requested by the user or required by the file spec like .env/.gitignore). Provide the official raw legal text or documentation text exactly as it is.`
 }
 
 func InvestigateSystemPrompt() string {
