@@ -176,6 +176,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /build       implement, refactor, write tests"))
 		m.push(roleSystem, infoStyle.Render("  /investigate debug bugs, failures, regressions"))
 		m.push(roleSystem, infoStyle.Render("  /review      audit changes, detect risks"))
+		m.push(roleSystem, infoStyle.Render("  /commit      generate conventional commit messages"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
 		m.push(roleSystem, infoStyle.Render("  /help         show this help"))
@@ -212,7 +213,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 				return nil
 			}
 		}
-		m.push(roleSystem, infoStyle.Render("usage: /mode <ask|plan|build|investigate|review>"))
+		m.push(roleSystem, infoStyle.Render("usage: /mode <ask|plan|build|investigate|review|commit>"))
 		return nil
 
 	case strings.HasPrefix(cmd, "/objective"):
@@ -274,10 +275,6 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("/undo not yet implemented"))
 		return nil
 
-	case cmd == "/commit":
-		m.push(roleSystem, infoStyle.Render("/commit not yet implemented"))
-		return nil
-
 	case cmd == "/checkpoint":
 		m.push(roleSystem, infoStyle.Render("/checkpoint not yet implemented"))
 		return nil
@@ -293,7 +290,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 	for _, mode := range []modes.Mode{
 		modes.ModeAsk, modes.ModePlan, modes.ModeBuild,
-		modes.ModeInvestigate, modes.ModeReview,
+		modes.ModeInvestigate, modes.ModeReview, modes.ModeCommit,
 	} {
 		prefix := "/" + mode.String()
 		if strings.HasPrefix(strings.ToLower(cmd), prefix) {

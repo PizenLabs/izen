@@ -80,7 +80,7 @@ const (
 	maxInvestigateInvocations = 5
 )
 
-var coreModes = []string{"/ask", "/plan", "/build", "/investigate", "/review"}
+var coreModes = []string{"/ask", "/plan", "/build", "/investigate", "/review", "/commit"}
 
 var utilityCommands = map[modes.Mode][]string{
 	modes.ModeAsk:         {"/models", "/clear"},
@@ -88,6 +88,7 @@ var utilityCommands = map[modes.Mode][]string{
 	modes.ModeBuild:       {"/undo", "/commit", "/checkpoint", "/clear"},
 	modes.ModeInvestigate: {"/history", "/resume", "/clear", "/tokens"},
 	modes.ModeReview:      {"/clear"},
+	modes.ModeCommit:      {"/clear", "/tokens"},
 }
 
 var globalCommands = []string{"/help", "/mode", "/objective", "/drop", "/quit"}

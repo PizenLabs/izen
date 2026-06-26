@@ -10,6 +10,7 @@ const (
 	ModeBuild
 	ModeInvestigate
 	ModeReview
+	ModeCommit
 )
 
 func (m Mode) String() string {
@@ -24,6 +25,8 @@ func (m Mode) String() string {
 		return "investigate"
 	case ModeReview:
 		return "review"
+	case ModeCommit:
+		return "commit"
 	default:
 		return "ask"
 	}
@@ -41,6 +44,8 @@ func (m Mode) Description() string {
 		return "debug bugs, failures, regressions — bounded loops"
 	case ModeReview:
 		return "audit changes, detect risks, inspect regressions"
+	case ModeCommit:
+		return "generate conventional commit messages from staged changes"
 	default:
 		return ""
 	}
@@ -62,6 +67,8 @@ func Parse(s string) (Mode, bool) {
 		return ModeInvestigate, true
 	case "review":
 		return ModeReview, true
+	case "commit":
+		return ModeCommit, true
 	default:
 		return ModeAsk, false
 	}
@@ -86,7 +93,7 @@ func (r *Resolver) Set(m Mode) {
 func (r *Resolver) Resolve(input string) Mode {
 	input = strings.TrimSpace(input)
 
-	for _, m := range []Mode{ModeAsk, ModePlan, ModeBuild, ModeInvestigate, ModeReview} {
+	for _, m := range []Mode{ModeAsk, ModePlan, ModeBuild, ModeInvestigate, ModeReview, ModeCommit} {
 		prefix := "/" + m.String()
 		if strings.HasPrefix(strings.ToLower(input), prefix) {
 			return m

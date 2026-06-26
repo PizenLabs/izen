@@ -34,6 +34,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		msgs = append([]ai.Message{{Role: "system", Content: sys}}, msgs...)
 	}
 
+	if m.resolver.Current() == modes.ModeCommit {
+		sys := prompt.CommitSystemPrompt()
+		msgs = append([]ai.Message{{Role: "system", Content: sys}}, msgs...)
+	}
+
 	req := ai.Request{
 		Model:    m.cfg.ActiveModelName(),
 		Messages: msgs,
