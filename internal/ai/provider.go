@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"io"
+	"strings"
 )
 
 type Message struct {
@@ -68,4 +69,40 @@ func (m *Manager) Names() []string {
 		names = append(names, n)
 	}
 	return names
+}
+
+type StreamForwarder struct {
+	closer  io.ReadCloser
+	onChunk func(string)
+	onDone  func(string)
+	buf     strings.Builder
+}
+
+func NewStreamForwarder(closer io.ReadCloser, onChunk func(string), onDone func(string)) *StreamForwarder {
+	return &StreamForwarder{
+		closer:  closer,
+		onChunk: onChunk,
+		onDone:  onDone,
+	}
+}
+
+func (sf *StreamForwarder) Read(p []byte) (int, error) {
+	n, err := sf.closer.Read(p)
+	if n > 0 {
+		chunk := string(p[:n])
+		sf.buf.WriteString(chunk)
+		if sf.onChunk != nil {
+			sf.onChunk(chunk)
+		}
+	}
+	if err == io.EOF {
+		if sf.onDone != nil {
+			sf.onDone(sf.buf.String())
+		}
+	}
+	return n, err
+}
+
+func (sf *StreamForwarder) Close() error {
+	return sf.closer.Close()
 }

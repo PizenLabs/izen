@@ -76,7 +76,7 @@ type buildProposalsReadyMsg struct {
 }
 
 const (
-	version                  = "0.1.0"
+	version                   = "0.1.0"
 	maxInvestigateInvocations = 5
 )
 

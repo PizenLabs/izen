@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,6 +17,110 @@ type Patch struct {
 	Modified  string    `json:"modified"`
 	CreatedAt time.Time `json:"created_at"`
 	Applied   bool      `json:"applied"`
+}
+
+type StagedPatch struct {
+	File    string
+	Content string
+}
+
+type PatchQueue struct {
+	patches []StagedPatch
+	staged  bool
+	mu      sync.Mutex
+	pm      *PatchManager
+	root    string
+}
+
+func NewPatchQueue(root string, pm *PatchManager) *PatchQueue {
+	return &PatchQueue{
+		pm:   pm,
+		root: root,
+	}
+}
+
+func (pq *PatchQueue) IsStaged() bool {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	return pq.staged
+}
+
+func (pq *PatchQueue) List() []StagedPatch {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	result := make([]StagedPatch, len(pq.patches))
+	copy(result, pq.patches)
+	return result
+}
+
+func (pq *PatchQueue) Stage(file, content string) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	for i, p := range pq.patches {
+		if p.File == file {
+			pq.patches[i].Content = content
+			return
+		}
+	}
+	pq.patches = append(pq.patches, StagedPatch{File: file, Content: content})
+	pq.staged = true
+}
+
+func (pq *PatchQueue) ApplyNext() error {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	if len(pq.patches) == 0 {
+		return fmt.Errorf("no staged patches")
+	}
+	p := pq.patches[0]
+	patch := &Patch{
+		ID:       fmt.Sprintf("staged-%d", time.Now().UnixNano()),
+		File:     p.File,
+		Modified: p.Content,
+	}
+	orig, err := os.ReadFile(filepath.Join(pq.root, p.File))
+	if err == nil {
+		patch.Original = string(orig)
+	}
+	if err := pq.pm.Apply(patch); err != nil {
+		return err
+	}
+	pq.patches = pq.patches[1:]
+	if len(pq.patches) == 0 {
+		pq.staged = false
+	}
+	return nil
+}
+
+func (pq *PatchQueue) ApplyAll() (int, error) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	applied := 0
+	for _, p := range pq.patches {
+		patch := &Patch{
+			ID:       fmt.Sprintf("staged-%d", time.Now().UnixNano()),
+			File:     p.File,
+			Modified: p.Content,
+		}
+		orig, err := os.ReadFile(filepath.Join(pq.root, p.File))
+		if err == nil {
+			patch.Original = string(orig)
+		}
+		if err := pq.pm.Apply(patch); err != nil {
+			return applied, err
+		}
+		applied++
+	}
+	pq.patches = nil
+	pq.staged = false
+	return applied, nil
+}
+
+func (pq *PatchQueue) Clear() {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	pq.patches = nil
+	pq.staged = false
 }
 
 type PatchManager struct {
