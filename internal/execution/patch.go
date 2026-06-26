@@ -22,6 +22,7 @@ type Patch struct {
 type StagedPatch struct {
 	File    string
 	Content string
+	RawDiff string
 }
 
 type PatchQueue struct {
@@ -53,16 +54,17 @@ func (pq *PatchQueue) List() []StagedPatch {
 	return result
 }
 
-func (pq *PatchQueue) Stage(file, content string) {
+func (pq *PatchQueue) Stage(file, content, rawDiff string) {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 	for i, p := range pq.patches {
 		if p.File == file {
 			pq.patches[i].Content = content
+			pq.patches[i].RawDiff = rawDiff
 			return
 		}
 	}
-	pq.patches = append(pq.patches, StagedPatch{File: file, Content: content})
+	pq.patches = append(pq.patches, StagedPatch{File: file, Content: content, RawDiff: rawDiff})
 	pq.staged = true
 }
 
@@ -73,12 +75,22 @@ func (pq *PatchQueue) ApplyNext() error {
 		return fmt.Errorf("no staged patches")
 	}
 	p := pq.patches[0]
+	if p.File == "" {
+		return fmt.Errorf("staged patch has empty file path")
+	}
+	fullPath := filepath.Join(pq.root, p.File)
+	if _, err := os.Stat(filepath.Dir(fullPath)); err != nil {
+		return fmt.Errorf("target directory for %s does not exist: %w", p.File, err)
+	}
+	if p.Content == "" {
+		return fmt.Errorf("staged patch for %s has empty content", p.File)
+	}
 	patch := &Patch{
 		ID:       fmt.Sprintf("staged-%d", time.Now().UnixNano()),
 		File:     p.File,
 		Modified: p.Content,
 	}
-	orig, err := os.ReadFile(filepath.Join(pq.root, p.File))
+	orig, err := os.ReadFile(fullPath)
 	if err == nil {
 		patch.Original = string(orig)
 	}
@@ -97,6 +109,12 @@ func (pq *PatchQueue) ApplyAll() (int, error) {
 	defer pq.mu.Unlock()
 	applied := 0
 	for _, p := range pq.patches {
+		if p.File == "" {
+			return applied, fmt.Errorf("staged patch has empty file path")
+		}
+		if p.Content == "" {
+			return applied, fmt.Errorf("staged patch for %s has empty content", p.File)
+		}
 		patch := &Patch{
 			ID:       fmt.Sprintf("staged-%d", time.Now().UnixNano()),
 			File:     p.File,
@@ -158,7 +176,20 @@ func (pm *PatchManager) Capture(file string) (*Patch, error) {
 }
 
 func (pm *PatchManager) Apply(patch *Patch) error {
-	fullPath := filepath.Join(pm.root, patch.File)
+	if patch.File == "" {
+		return fmt.Errorf("patch has empty file path")
+	}
+	if patch.Modified == "" {
+		return fmt.Errorf("patch for %s has empty content", patch.File)
+	}
+	cleaned := filepath.Clean(patch.File)
+	if cleaned == "." || cleaned == "/" {
+		return fmt.Errorf("invalid patch file path: %s", patch.File)
+	}
+	if strings.Contains(cleaned, "..") {
+		return fmt.Errorf("path traversal detected in patch file: %s", patch.File)
+	}
+	fullPath := filepath.Join(pm.root, cleaned)
 	dir := filepath.Dir(fullPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)

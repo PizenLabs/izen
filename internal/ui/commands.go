@@ -162,6 +162,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return m.runReviewCmd()
 	default:
 		m.responseBuffer.Reset()
+		m.execEng.SetStreamContextFiles(m.attachedFiles)
 		return m.streamCmd(content)
 	}
 }

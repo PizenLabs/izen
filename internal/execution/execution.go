@@ -59,6 +59,10 @@ func (e *Engine) FeedStream(chunk string) {
 	e.StreamMon.Feed(chunk)
 }
 
+func (e *Engine) SetStreamContextFiles(files []string) {
+	e.StreamMon.SetContextFiles(files)
+}
+
 func (e *Engine) FlushStream() {
 	e.StreamMon.Flush()
 	e.StreamMon.Reset()

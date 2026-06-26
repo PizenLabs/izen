@@ -1,21 +1,58 @@
 package execution
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 )
 
 type StreamMonitor struct {
-	buf         strings.Builder
-	cursor      int
-	queue       *PatchQueue
-	inBlock     bool
-	currentFile string
-	currentBody strings.Builder
+	buf          strings.Builder
+	cursor       int
+	queue        *PatchQueue
+	inBlock      bool
+	inDiffBlock  bool
+	currentFile  string
+	currentBody  strings.Builder
+	rawDiffBuf   strings.Builder
+	contextFiles []string
 }
 
 func NewStreamMonitor(queue *PatchQueue) *StreamMonitor {
 	return &StreamMonitor{queue: queue}
+}
+
+func (sm *StreamMonitor) SetContextFiles(files []string) {
+	sm.contextFiles = files
+}
+
+func (sm *StreamMonitor) resolvePath(path string) string {
+	if path == "" {
+		return ""
+	}
+
+	clean := filepath.Clean(path)
+
+	if filepath.IsAbs(clean) {
+		clean = filepath.Base(clean)
+	}
+
+	if _, err := os.Stat(clean); err == nil {
+		return clean
+	}
+
+	for _, cf := range sm.contextFiles {
+		if _, err := os.Stat(cf); err != nil {
+			continue
+		}
+		cfBase := filepath.Base(cf)
+		pathBase := filepath.Base(clean)
+		if cfBase == pathBase || cf == clean || strings.HasSuffix(cf, string(filepath.Separator)+clean) {
+			return cf
+		}
+	}
+
+	return clean
 }
 
 func (sm *StreamMonitor) Feed(chunk string) {
@@ -43,8 +80,10 @@ func (sm *StreamMonitor) Reset() {
 	sm.buf.Reset()
 	sm.cursor = 0
 	sm.inBlock = false
+	sm.inDiffBlock = false
 	sm.currentFile = ""
 	sm.currentBody.Reset()
+	sm.rawDiffBuf.Reset()
 }
 
 func (sm *StreamMonitor) processLine(line string) {
@@ -53,11 +92,16 @@ func (sm *StreamMonitor) processLine(line string) {
 	if !sm.inBlock {
 		if strings.HasPrefix(trimmed, "```") {
 			sm.inBlock = true
+			sm.inDiffBlock = false
+			sm.rawDiffBuf.Reset()
 			lang := strings.TrimPrefix(trimmed, "```")
 			if strings.Contains(lang, ":") {
 				parts := strings.SplitN(lang, ":", 2)
-				sm.currentFile = strings.TrimSpace(parts[1])
+				sm.currentFile = sm.resolvePath(strings.TrimSpace(parts[1]))
 			} else if lang == "diff" {
+				sm.inDiffBlock = true
+				sm.currentFile = ""
+			} else {
 				sm.currentFile = ""
 			}
 			return
@@ -67,12 +111,12 @@ func (sm *StreamMonitor) processLine(line string) {
 		if strings.HasPrefix(lo, "edit file") {
 			raw := strings.TrimSpace(trimmed[9:])
 			if raw != "" {
-				sm.currentFile = filepath.Clean(raw)
+				sm.currentFile = sm.resolvePath(filepath.Clean(raw))
 			}
 		} else if strings.HasPrefix(lo, "file:") {
 			raw := strings.TrimSpace(trimmed[5:])
 			if raw != "" {
-				sm.currentFile = filepath.Clean(raw)
+				sm.currentFile = sm.resolvePath(filepath.Clean(raw))
 			}
 		}
 		return
@@ -84,21 +128,31 @@ func (sm *StreamMonitor) processLine(line string) {
 	}
 
 	if strings.HasPrefix(line, "+++ b/") && sm.currentFile == "" {
-		sm.currentFile = strings.TrimSpace(strings.TrimPrefix(line, "+++ b/"))
+		sm.currentFile = sm.resolvePath(strings.TrimSpace(strings.TrimPrefix(line, "+++ b/")))
 	}
 
 	if sm.currentFile != "" {
 		sm.currentBody.WriteString(line)
 		sm.currentBody.WriteString("\n")
+		sm.rawDiffBuf.WriteString(line)
+		sm.rawDiffBuf.WriteString("\n")
+	} else if sm.inDiffBlock {
+		sm.rawDiffBuf.WriteString(line)
+		sm.rawDiffBuf.WriteString("\n")
 	}
 }
 
 func (sm *StreamMonitor) closeBlock() {
 	body := strings.TrimSpace(sm.currentBody.String())
-	if sm.currentFile != "" && body != "" {
-		sm.queue.Stage(sm.currentFile, body)
+	rawDiff := strings.TrimSpace(sm.rawDiffBuf.String())
+	if sm.inDiffBlock && rawDiff != "" {
+		sm.queue.Stage(sm.currentFile, body, rawDiff)
+	} else if sm.currentFile != "" && body != "" {
+		sm.queue.Stage(sm.currentFile, body, rawDiff)
 	}
 	sm.inBlock = false
+	sm.inDiffBlock = false
 	sm.currentFile = ""
 	sm.currentBody.Reset()
+	sm.rawDiffBuf.Reset()
 }
