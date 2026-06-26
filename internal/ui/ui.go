@@ -155,6 +155,8 @@ var (
 	paletteItemStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 	paletteCoreItemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 	paletteHintStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	palettePathStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	paletteSelectedPath  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 
 	// Header
 	logoStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreenBr))
@@ -240,7 +242,7 @@ var utilityCommands = map[modes.Mode][]string{
 	modes.ModeReview:      {"/clear"},
 }
 
-var globalCommands = []string{"/help", "/mode", "/objective", "/quit"}
+var globalCommands = []string{"/help", "/mode", "/objective", "/drop", "/quit"}
 
 func cmdCategory(cmd string) string {
 	for _, c := range coreModes {
@@ -304,6 +306,7 @@ type model struct {
 	suggestionIdx   int
 
 	pendingFileRefs []string
+	attachedFiles   []string
 }
 
 func (m *model) push(r role, text string) {
@@ -334,11 +337,12 @@ func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea
 	}
 
 	m := &model{
-		cfg:      cfg,
-		sess:     sess,
-		provider: provider,
-		gitEng:   eng,
-		resolver: modes.NewResolver(),
+		cfg:           cfg,
+		sess:          sess,
+		provider:      provider,
+		gitEng:        eng,
+		resolver:      modes.NewResolver(),
+		attachedFiles: make([]string, 0),
 	}
 	m.resolver.Set(sess.Mode)
 
@@ -468,6 +472,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					line = sel
 				}
 				m.pendingFileRefs = append(m.pendingFileRefs, sel)
+				m.attachedFiles = append(m.attachedFiles, sel)
 				m.dismissSuggestions()
 				m.input.WriteString(line)
 				return m, nil
@@ -651,14 +656,16 @@ func (m *model) renderBody(width int) string {
 	var body strings.Builder
 
 	// Calculate available lines for records.
-	// Always reserve chromeMaxSugg lines for suggestions (even when hidden)
-	// to prevent viewport jumping when the palette appears/disappears.
 	statusLines := 0
 	if m.agentRunning || m.agentDone || m.streaming {
 		statusLines = 1
 	}
+	contextLines := 0
+	if len(m.attachedFiles) > 0 {
+		contextLines = 1
+	}
 
-	available := m.height - chromeFixed - statusLines
+	available := m.height - chromeFixed - statusLines - contextLines
 	if available < 1 {
 		available = 1
 	}
@@ -715,6 +722,22 @@ func (m *model) renderBody(width int) string {
 		} else {
 			body.WriteString(aiGutter + sp + "  " + infoStyle.Render("thinking…") + "\n")
 		}
+	}
+
+	// Context line: attached files badge.
+	if len(m.attachedFiles) > 0 {
+		var ctx strings.Builder
+		ctx.WriteString("  ")
+		ctx.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Render("context"))
+		ctx.WriteString(" ")
+		for i, f := range m.attachedFiles {
+			if i > 0 {
+				ctx.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)).Render(" • "))
+			}
+			ctx.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Render(f))
+		}
+		body.WriteString(ctx.String())
+		body.WriteString("\n")
 	}
 
 	// Prompt line.
@@ -872,13 +895,39 @@ func (m *model) renderSuggestions(width int) string {
 	var inner strings.Builder
 
 	if m.suggestionType == "@" {
+		// Compute the widest base name for column alignment.
+		maxBase := 0
+		for _, s := range items {
+			if n := len(filepath.Base(s)); n > maxBase {
+				maxBase = n
+			}
+		}
+		gap := 2
+		if maxBase < 10 {
+			maxBase = 10
+		}
+
 		inner.WriteString(paletteSectionStyle.Render("files"))
 		inner.WriteString("\n")
 		for i, s := range items {
+			base := filepath.Base(s)
+			dir := s
+			// If the item itself is just a bare name (no path), dir stays empty.
+			if filepath.Dir(s) == "." {
+				dir = ""
+			}
+			padded := base + strings.Repeat(" ", maxBase-len(base)+gap)
+
 			if i == m.suggestionIdx {
-				inner.WriteString(paletteSelectedStyle.Render(" ❯ " + s))
+				inner.WriteString(paletteSelectedStyle.Render("❯ " + padded))
+				if dir != "" {
+					inner.WriteString(paletteSelectedPath.Render(dir))
+				}
 			} else {
-				inner.WriteString(paletteItemStyle.Render("   " + s))
+				inner.WriteString(paletteItemStyle.Render("  " + padded))
+				if dir != "" {
+					inner.WriteString(palettePathStyle.Render(dir))
+				}
 			}
 			inner.WriteString("\n")
 		}
@@ -919,7 +968,7 @@ func (m *model) renderSuggestions(width int) string {
 
 	inner.WriteString(paletteHintStyle.Render("tab · enter · esc"))
 
-	boxWidth := 40
+	boxWidth := 48
 	if width < boxWidth+4 {
 		boxWidth = width - 4
 	}
@@ -1427,6 +1476,8 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /help         show this help"))
 		m.push(roleSystem, infoStyle.Render("  /mode <name>  switch mode"))
 		m.push(roleSystem, infoStyle.Render("  /objective    set session objective"))
+		m.push(roleSystem, infoStyle.Render("  /drop         clear attached context files"))
+		m.push(roleSystem, infoStyle.Render("  /drop @<path> remove a specific attached file"))
 		m.push(roleSystem, infoStyle.Render("  /quit         exit"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>        run a shell command"))
 		m.push(roleSystem, "")
@@ -1472,6 +1523,37 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 	case cmd == "/clear":
 		m.records = nil
+		return nil
+
+	case cmd == "/drop":
+		m.attachedFiles = nil
+		m.push(roleSystem, infoStyle.Render("context cleared"))
+		return nil
+
+	case strings.HasPrefix(cmd, "/drop "):
+		target := strings.TrimSpace(strings.TrimPrefix(cmd, "/drop"))
+		if target == "" {
+			m.attachedFiles = nil
+			m.push(roleSystem, infoStyle.Render("context cleared"))
+			return nil
+		}
+		target = filepath.Clean(target)
+		filtered := make([]string, 0, len(m.attachedFiles))
+		for _, f := range m.attachedFiles {
+			if f != target {
+				filtered = append(filtered, f)
+			}
+		}
+		if len(filtered) == len(m.attachedFiles) {
+			m.push(roleSystem, infoStyle.Render("not attached: "+target))
+			return nil
+		}
+		m.attachedFiles = filtered
+		if len(m.attachedFiles) == 0 {
+			m.push(roleSystem, infoStyle.Render("context cleared"))
+		} else {
+			m.push(roleSystem, infoStyle.Render("dropped: "+target))
+		}
 		return nil
 
 	case cmd == "/models":
