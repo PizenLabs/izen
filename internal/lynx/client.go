@@ -39,14 +39,14 @@ type rpcError struct {
 }
 
 type SearchResult struct {
-	SymbolID     string   `json:"symbol_id"`
-	Score        float64  `json:"score"`
-	FilePath     string   `json:"file_path"`
-	StartLine    int      `json:"start_line"`
-	EndLine      int      `json:"end_line"`
-	Reasons      []string `json:"reasons"`
-	Content      string   `json:"content,omitempty"`
-	SymbolName   string   `json:"symbol_name,omitempty"`
+	SymbolID   string   `json:"symbol_id"`
+	Score      float64  `json:"score"`
+	FilePath   string   `json:"file_path"`
+	StartLine  int      `json:"start_line"`
+	EndLine    int      `json:"end_line"`
+	Reasons    []string `json:"reasons"`
+	Content    string   `json:"content,omitempty"`
+	SymbolName string   `json:"symbol_name,omitempty"`
 }
 
 func (c *Client) generateID() int64 {

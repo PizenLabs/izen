@@ -561,10 +561,10 @@ func (m *mockRetriever) ReadTarget(path string, lines int) ([]SearchResult, erro
 }
 
 type mockExecutor struct {
-	allResult     *TestResultSummary
-	packageResult map[string]*TestResultSummary
+	allResult      *TestResultSummary
+	packageResult  map[string]*TestResultSummary
 	specificResult map[string]*TestResultSummary
-	runAllErr     error
+	runAllErr      error
 }
 
 func newMockExecutor() *mockExecutor {

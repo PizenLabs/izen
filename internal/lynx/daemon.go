@@ -13,17 +13,17 @@ import (
 )
 
 type Process struct {
-	cmd           *exec.Cmd
-	stdin         io.WriteCloser
-	stdout        io.ReadCloser
-	stderr        io.ReadCloser
-	mu            sync.Mutex
-	running       bool
-	stopCh        chan struct{}
-	root          string
-	started       time.Time
-	stderrBuf     strings.Builder
-	stderrDone    chan struct{}
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	stdout     io.ReadCloser
+	stderr     io.ReadCloser
+	mu         sync.Mutex
+	running    bool
+	stopCh     chan struct{}
+	root       string
+	started    time.Time
+	stderrBuf  strings.Builder
+	stderrDone chan struct{}
 }
 
 func NewProcess(root string) *Process {

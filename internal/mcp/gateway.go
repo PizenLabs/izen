@@ -100,9 +100,9 @@ type CodeLink struct {
 }
 
 type LinkResult struct {
-	Issue   Issue     `json:"issue"`
+	Issue   Issue      `json:"issue"`
 	Links   []CodeLink `json:"links"`
-	Created time.Time `json:"created"`
+	Created time.Time  `json:"created"`
 }
 
 func (m *Manager) LinkIssueToCode(req LinkRequest, linkFn func(req LinkRequest) ([]CodeLink, error)) (*LinkResult, error) {
@@ -153,9 +153,9 @@ type JiraConfig struct {
 }
 
 type LinearConfig struct {
-	Enabled   bool   `yaml:"enabled"`
-	APIKey    string `yaml:"api_key"`
-	TeamID    string `yaml:"team_id"`
+	Enabled bool   `yaml:"enabled"`
+	APIKey  string `yaml:"api_key"`
+	TeamID  string `yaml:"team_id"`
 }
 
 func (i *CreateIssueInput) Validate() error {

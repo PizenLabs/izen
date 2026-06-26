@@ -5,7 +5,7 @@ import "time"
 type SymbolKind int
 
 const (
-	SymbolFunction  SymbolKind = iota
+	SymbolFunction SymbolKind = iota
 	SymbolMethod
 	SymbolType
 	SymbolStruct
@@ -92,15 +92,15 @@ type FileNode struct {
 }
 
 type Graph struct {
-	Root       string                `json:"root"`
-	Files      []FileNode            `json:"files"`
-	Imports    map[string][]string   `json:"imports"`
-	Dependents map[string][]string   `json:"dependents"`
-	SymbolIdx  map[string][]Symbol   `json:"symbol_index"`
-	FileMap    map[string]*FileNode  `json:"-"`
-	BuiltAt    time.Time             `json:"built_at"`
-	FileCount  int                   `json:"file_count"`
-	SymCount   int                   `json:"sym_count"`
+	Root       string               `json:"root"`
+	Files      []FileNode           `json:"files"`
+	Imports    map[string][]string  `json:"imports"`
+	Dependents map[string][]string  `json:"dependents"`
+	SymbolIdx  map[string][]Symbol  `json:"symbol_index"`
+	FileMap    map[string]*FileNode `json:"-"`
+	BuiltAt    time.Time            `json:"built_at"`
+	FileCount  int                  `json:"file_count"`
+	SymCount   int                  `json:"sym_count"`
 }
 
 func NewGraph(root string) *Graph {
@@ -151,12 +151,12 @@ func (g *Graph) FilesByPackage(pkg string) []FileNode {
 }
 
 type Stats struct {
-	FileCount     int   `json:"file_count"`
-	SymbolCount   int   `json:"symbol_count"`
-	ImportCount   int   `json:"import_count"`
-	FunctionCount int   `json:"function_count"`
-	MethodCount   int   `json:"method_count"`
-	TypeCount     int   `json:"type_count"`
+	FileCount     int    `json:"file_count"`
+	SymbolCount   int    `json:"symbol_count"`
+	ImportCount   int    `json:"import_count"`
+	FunctionCount int    `json:"function_count"`
+	MethodCount   int    `json:"method_count"`
+	TypeCount     int    `json:"type_count"`
 	Duration      string `json:"duration"`
 }
 

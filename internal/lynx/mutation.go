@@ -322,10 +322,10 @@ func (mt *MutationTracer) typeExprString(expr ast.Expr) string {
 }
 
 type TypeInfo struct {
-	Name       string `json:"name"`
-	Kind       string `json:"kind"`
-	File       string `json:"file"`
-	Line       int    `json:"line"`
+	Name       string   `json:"name"`
+	Kind       string   `json:"kind"`
+	File       string   `json:"file"`
+	Line       int      `json:"line"`
 	Methods    []string `json:"methods,omitempty"`
 	Fields     []string `json:"fields,omitempty"`
 	Implements []string `json:"implements,omitempty"`

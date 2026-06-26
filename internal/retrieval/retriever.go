@@ -18,12 +18,12 @@ func SetLynxController(lc *lynx.Controller) {
 type Tier string
 
 const (
-	TierGraph    Tier = "graph"
-	TierLynx     Tier = "lynx"
-	TierGlob     Tier = "glob"
-	TierRipgrep  Tier = "rg"
-	TierGrep     Tier = "grep"
-	TierRead     Tier = "read"
+	TierGraph   Tier = "graph"
+	TierLynx    Tier = "lynx"
+	TierGlob    Tier = "glob"
+	TierRipgrep Tier = "rg"
+	TierGrep    Tier = "grep"
+	TierRead    Tier = "read"
 )
 
 func (t Tier) Order() int {

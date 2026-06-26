@@ -14,10 +14,10 @@ import (
 )
 
 type OllamaProvider struct {
-	baseURL  string
-	apiKey   string
-	model    string
-	client   *http.Client
+	baseURL string
+	apiKey  string
+	model   string
+	client  *http.Client
 }
 
 func NewOllamaProvider(baseURL, apiKey, model string) *OllamaProvider {
@@ -54,10 +54,10 @@ type ollamaResponse struct {
 }
 
 type choice struct {
-	Index        int           `json:"index"`
+	Index        int              `json:"index"`
 	Message      *responseMessage `json:"message,omitempty"`
-	Delta        *delta        `json:"delta,omitempty"`
-	FinishReason string        `json:"finish_reason"`
+	Delta        *delta           `json:"delta,omitempty"`
+	FinishReason string           `json:"finish_reason"`
 }
 
 type responseMessage struct {
@@ -215,9 +215,9 @@ func (r *StreamResult) Usage() (input, output int) {
 }
 
 type sseReader struct {
-	body      io.ReadCloser
-	reader    *bufio.Reader
-	closed    bool
+	body       io.ReadCloser
+	reader     *bufio.Reader
+	closed     bool
 	finalUsage *usage
 }
 

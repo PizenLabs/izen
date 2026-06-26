@@ -8,7 +8,7 @@ import (
 type HypothesisStatus int
 
 const (
-	HypothesisActive   HypothesisStatus = iota
+	HypothesisActive HypothesisStatus = iota
 	HypothesisConfirmed
 	HypothesisRejected
 	HypothesisPending

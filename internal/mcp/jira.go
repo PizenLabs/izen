@@ -236,7 +236,7 @@ func (g *JiraGateway) doRequest(method, path string, body interface{}) ([]byte, 
 
 func (g *JiraGateway) parseIssue(item map[string]interface{}) *Issue {
 	issue := &Issue{
-		ID: item["key"].(string),
+		ID:  item["key"].(string),
 		URL: fmt.Sprintf("%s/browse/%s", g.config.URL, item["key"].(string)),
 	}
 

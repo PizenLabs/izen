@@ -5,7 +5,7 @@ import "fmt"
 type State int
 
 const (
-	StateObserve    State = iota
+	StateObserve State = iota
 	StateHypothesize
 	StateSearch
 	StateGather

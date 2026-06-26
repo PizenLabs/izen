@@ -75,7 +75,7 @@ func (g *LinearGateway) CreateIssue(input CreateIssueInput) (*Issue, error) {
 	var result struct {
 		Data struct {
 			IssueCreate struct {
-				Success bool `json:"success"`
+				Success bool                   `json:"success"`
 				Issue   map[string]interface{} `json:"issue"`
 			} `json:"issueCreate"`
 		} `json:"data"`

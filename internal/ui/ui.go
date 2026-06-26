@@ -36,21 +36,32 @@ type streamDoneMsg struct {
 }
 type streamErrMsg struct{ err error }
 type tickMsg time.Time
+
+type investigateResultMsg struct {
+	records    []record
+	sessionKey string
+	err        error
+}
+type reviewResultMsg struct {
+	records      []record
+	sessionKey   string
+	saveReportFn func()
+	err          error
+}
+
 type agentDoneMsg struct{ label string }
 
 // ── Output record ─────────────────────────────────────────────────────────────
-// Every line in the scroll buffer carries a role so the renderer can apply
-// the correct gutter color without re-parsing content.
 
 type role uint8
 
 const (
-	roleSystem role = iota // dim — info, status, separators
-	roleUser               // green gutter — the human's words
-	roleAI                 // blue gutter  — the model's response
-	roleError              // red gutter   — errors
-	roleCode               // no gutter    — inside a fenced block (internal)
-	roleStatus             // cyan gutter  — done / agent complete
+	roleSystem role = iota
+	roleUser
+	roleAI
+	roleError
+	roleCode
+	roleStatus
 )
 
 type record struct {
@@ -58,34 +69,33 @@ type record struct {
 	text string
 }
 
-// ── Wordmark ──────────────────────────────────────────────────────────────────
-// Thin typographic construction — single-width strokes, geometric balance.
-// Reads as "izen" without relying on block-fill mass.
-const izenAscii = `╻ ╻▀█ ┏━╸┏┓╻
-┃ ┃ ┃ ┣╸ ┃┗┫
-┗━┛ ╹ ┗━╸╹ ╹`
+// ── Version ───────────────────────────────────────────────────────────────────
 
-// ── Colour palette ────────────────────────────────────────────────────────────
-// Catppuccin Mocha base — keeps perceptual balance across token roles.
+const version = "0.1.0"
+
+// ── Colour palette (Catppuccin Mocha — dim, cohesive) ───────────────────────
+
 const (
-	colorText    = "#cdd6f4" // lavender — main body
-	colorAccent  = "#a6e3a1" // green    — user / interactive
+	colorText    = "#cdd6f4"
+	colorAccent  = "#a6e3a1"
 	colorGreen   = "#a6e3a1"
-	colorGreenBr = "#b9f0b4" // bright green — logo, done
-	colorRed     = "#f38ba8" // maroon   — errors
-	colorOrange  = "#fab387" // peach    — warnings
-	colorYellow  = "#f9e2af" // yellow   — investigations
-	colorCyan    = "#89dceb" // sky      — AI / streaming
-	colorTeal    = "#94e2d5" // teal     — hypothesis
-	colorPink    = "#f5c2e7" // pink     — review
-	colorBlue    = "#89b4fa" // blue     — AI gutter / info
-	colorMauve   = "#cba6f7" // mauve    — score / plan
+	colorGreenBr = "#b9f0b4"
+	colorRed     = "#f38ba8"
+	colorOrange  = "#fab387"
+	colorYellow  = "#f9e2af"
+	colorCyan    = "#89dceb"
+	colorTeal    = "#94e2d5"
+	colorPink    = "#f5c2e7"
+	colorBlue    = "#89b4fa"
+	colorMauve   = "#cba6f7"
 
 	colorSurface = "#1e1e2e"
 	colorOverlay = "#313244"
 	colorSubtle  = "#45475a"
 	colorMuted   = "#6c7086"
 	colorDimmed  = "#585b70"
+	colorBase    = "#181825"
+	colorCrust   = "#11111b"
 
 	colorModeAsk         = "#a6e3a1"
 	colorModePlan        = "#cba6f7"
@@ -93,27 +103,17 @@ const (
 	colorModeInvestigate = "#f9e2af"
 	colorModeReview      = "#f5c2e7"
 
-	// Gutter bars — the parallel lines that distinguish speakers
-	colorGutterUser   = "#a6e3a1" // green  — user turn
-	colorGutterAI     = "#89b4fa" // blue   — AI turn
-	colorGutterError  = "#f38ba8" // red    — error
-	colorGutterStatus = "#89dceb" // cyan   — status / done
-	colorGutterSystem = "#45475a" // subtle — system info
+	colorGutterUser   = "#a6e3a1"
+	colorGutterAI     = "#89b4fa"
+	colorGutterError  = "#f38ba8"
+	colorGutterStatus = "#89dceb"
+	colorGutterSystem = "#45475a"
 )
 
-// ── Snowflake-in-bloom spinner ────────────────────────────────────────────────
-// Crystal grows from a seed, blooms, breathes back. 100 ms per frame.
+// ── Spinner (Braille — smooth, compact) ─────────────────────────────────────
+
 var spinnerFrames = []string{
-	"·",  // seed
-	"✦",  // spark
-	"✧",  // open
-	"❄",  // crystal
-	"❅",  // bloom
-	"❆",  // full
-	"❅",  // recede
-	"❄",  // settle
-	"✧",  // dim
-	"✦",  // ember
+	"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
 }
 
 // ── Styles ────────────────────────────────────────────────────────────────────
@@ -122,32 +122,30 @@ var (
 	outputStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 	labelBoldStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
 
-	// Prompt — the single brightest element in the input zone
 	promptStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorAccent))
-	cursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Blink(true)
+	cursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 
-	// Chrome
 	sepStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
 	hairlineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 	infoStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 	spinnerStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Bold(true)
 	errorStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
+	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	subtleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
 
-	// Semantic
 	investigationStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow))
 	evidenceStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan))
 	hypothesisStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorTeal))
 	reviewStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colorPink))
 	scoreStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMauve))
 
-	// Risk
 	riskCriticalStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
 	riskHighStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange))
 	riskMediumStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow))
 	riskLowStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
 	riskInfoStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
 
-	// Palette (command / file picker)
+	// Palette / completion box
 	paletteBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color(colorSubtle)).
@@ -158,49 +156,73 @@ var (
 	paletteCoreItemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 	paletteHintStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 
-	// Header / nav
-	logoStyle           = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreenBr))
-	contextStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	modeLabelStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	// Header
+	logoStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreenBr))
+	versionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	dotStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	bulletStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).SetString(" • ")
+
+	// Mode tabs
+	modeTabActiveStyle   = lipgloss.NewStyle().Bold(true).Padding(0, 1)
 	modeTabInactiveStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)).Padding(0, 1)
-	utilitiesLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	utilitiesStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	footerStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	footerActiveStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	modeLabelStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+
+	// Status bar
+	statusLeftStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	statusRightStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	statusSepStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)).SetString(" │ ")
+
+	// Gutter
+	gutterUserStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterUser))
+	gutterAIStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterAI))
+	gutterErrorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterError))
+	gutterStatusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus))
+	gutterSysStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterSystem))
+
+	labelUserStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterUser))
+	labelAIStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterAI))
+	labelErrorStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterError))
+	labelStatusStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterStatus))
+
+	// Code highlighting
+	hlKeyword = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Bold(true)
+	hlString  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow))
+	hlComment = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	hlNumber  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))
+	hlType    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorPink))
+	hlCodeBg  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Background(lipgloss.Color(colorOverlay))
+	hlLang    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Bold(true)
 )
 
 // ── Gutter helpers ────────────────────────────────────────────────────────────
-// A gutter is the two-character left accent that identifies a speaker turn.
-// Format: "▌ " in the role colour. System lines use a hairline "╎ ".
 
 func gutterFor(r role) string {
 	switch r {
 	case roleUser:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterUser)).Render("▌") + " "
+		return gutterUserStyle.Render("▌") + " "
 	case roleAI:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterAI)).Render("▌") + " "
+		return gutterAIStyle.Render("▌") + " "
 	case roleError:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterError)).Render("▌") + " "
+		return gutterErrorStyle.Render("▌") + " "
 	case roleStatus:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render("▌") + " "
+		return gutterStatusStyle.Render("▌") + " "
 	case roleSystem:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterSystem)).Render("╎") + " "
+		return gutterSysStyle.Render("╎") + " "
 	default:
 		return "  "
 	}
 }
 
-// labelFor returns the small role tag shown on the first line of each turn.
 func labelFor(r role) string {
 	switch r {
 	case roleUser:
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterUser)).Render("you")
+		return labelUserStyle.Render("you")
 	case roleAI:
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterAI)).Render("izen")
+		return labelAIStyle.Render("izen")
 	case roleError:
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterError)).Render("error")
+		return labelErrorStyle.Render("error")
 	case roleStatus:
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterStatus)).Render("done")
+		return labelStatusStyle.Render("done")
 	default:
 		return ""
 	}
@@ -260,15 +282,11 @@ type model struct {
 	resolver *modes.Resolver
 	gitEng   *git.Engine
 
-	input  strings.Builder
-	// records is the scroll buffer — each entry carries role metadata for
-	// the gutter renderer. A single "message" may span multiple records
-	// (one per logical line).
+	input   strings.Builder
 	records []record
 	width   int
 	height  int
 
-	// streaming
 	streamCh       chan tea.Msg
 	responseBuffer strings.Builder
 	streaming      bool
@@ -276,20 +294,16 @@ type model struct {
 	tokenInput     int
 	tokenOutput    int
 
-	// agent animation
 	agentRunning bool
 	agentLabel   string
 	agentDone    bool
 
-	// suggestions
 	showSuggestions bool
 	suggestionType  string
 	suggestions     []string
 	suggestionIdx   int
 }
 
-// push appends a styled record. Multi-line text is split so each line
-// gets the same gutter applied independently in renderBody.
 func (m *model) push(r role, text string) {
 	lines := strings.Split(text, "\n")
 	for _, l := range lines {
@@ -297,11 +311,14 @@ func (m *model) push(r role, text string) {
 	}
 }
 
-// pushLines appends pre-split lines all with the same role.
 func (m *model) pushLines(r role, lines []string) {
 	for _, l := range lines {
 		m.records = append(m.records, record{role: r, text: l})
 	}
+}
+
+func (m *model) pushRecords(recs []record) {
+	m.records = append(m.records, recs...)
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -323,46 +340,17 @@ func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea
 	}
 	m.resolver.Set(sess.Mode)
 
-	// ── Splash screen ────────────────────────────────────────────────────────
-	// Art beside welcome text, zipped line-by-line.
-	artStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreenBr))
-	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-
-	artLines := strings.Split(izenAscii, "\n")
-	sideLines := []string{
-		"",
-		dimStyle.Render("human-centered coding intelligence"),
-		"",
-		dimStyle.Render("type /help to get started"),
-	}
-	maxL := len(artLines)
-	if len(sideLines) > maxL {
-		maxL = len(sideLines)
-	}
-	for i := 0; i < maxL; i++ {
-		art := ""
-		if i < len(artLines) {
-			art = artStyle.Render(fmt.Sprintf("%-14s", artLines[i]))
-		} else {
-			art = strings.Repeat(" ", 14)
-		}
-		side := ""
-		if i < len(sideLines) {
-			side = sideLines[i]
-		}
-		m.records = append(m.records, record{role: roleSystem, text: art + "  " + side})
-	}
-	m.records = append(m.records, record{role: roleSystem, text: ""})
-	m.records = append(m.records, record{
-		role: roleSystem,
-		text: dimStyle.Render(fmt.Sprintf("mode: /%s — %s", sess.Mode, sess.Mode.Description())),
-	})
+	// Compact intro — no ASCII art, minimal chrome
+	m.push(roleSystem, dimStyle.Render("type /help to get started — /ask /plan /build /investigate /review"))
 	m.records = append(m.records, record{role: roleSystem, text: ""})
 
 	return tea.NewProgram(m, tea.WithAltScreen())
 }
 
-func (m *model) Init() tea.Cmd { return nil }
+// FIX #2: tick chain starts unconditionally — never dies between idle periods.
+func (m *model) Init() tea.Cmd {
+	return tickCmd()
+}
 
 // ── Update ────────────────────────────────────────────────────────────────────
 
@@ -370,20 +358,45 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case tickMsg:
-		any := false
 		if m.streaming || m.agentRunning {
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
-			any = true
 		}
-		if any {
-			return m, tickCmd()
-		}
-		return m, nil
+		return m, tickCmd()
 
 	case agentDoneMsg:
 		m.agentRunning = false
 		m.agentDone = true
 		m.agentLabel = msg.label
+		return m, nil
+
+	case investigateResultMsg:
+		m.agentRunning = false
+		m.agentDone = true
+		if msg.err != nil {
+			m.push(roleError, "investigation error: "+msg.err.Error())
+			return m, nil
+		}
+		m.pushRecords(msg.records)
+		if msg.sessionKey != "" {
+			m.sess.SetInvestigationID(msg.sessionKey)
+		}
+		os.MkdirAll(filepath.Join(".izen", "investigations"), 0755)
+		return m, nil
+
+	case reviewResultMsg:
+		m.agentRunning = false
+		m.agentDone = true
+		if msg.err != nil {
+			m.push(roleError, "review error: "+msg.err.Error())
+			return m, nil
+		}
+		m.pushRecords(msg.records)
+		if msg.sessionKey != "" {
+			m.sess.SetReviewID(msg.sessionKey)
+		}
+		if msg.saveReportFn != nil {
+			msg.saveReportFn()
+		}
 		return m, nil
 
 	case tokenMsg:
@@ -455,7 +468,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					line = sel
 				}
 				m.dismissSuggestions()
-				// Let user continue editing after file insertion
 				m.input.WriteString(line)
 				return m, nil
 			}
@@ -496,8 +508,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case tea.KeySpace:
 		m.input.WriteString(" ")
-		// updateSuggestions handles: if @ mode and prefix contains a space,
-		// it dismisses — so the user can keep typing after inserting a file ref.
 		m.updateSuggestions()
 		return m, nil
 
@@ -552,98 +562,100 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // ── View ──────────────────────────────────────────────────────────────────────
 
+const (
+	// Fixed chrome lines consumed by non-body elements.
+	chromeHeader   = 1  // header line
+	chromeModeBar  = 1  // mode tab line
+	chromeTopDiv   = 1  // separator after mode bar
+	chromeBotDiv   = 1  // separator before status
+	chromeStatus   = 1  // status bar at very bottom
+	chromePrompt   = 2  // blank + gutter+label+chevron+input+cursor
+	chromeMaxSugg  = 14 // max lines for suggestion palette
+	chromeFixed    = chromeHeader + chromeModeBar + chromeTopDiv + chromeBotDiv + chromeStatus + chromePrompt
+	chromeReserved = chromeFixed + chromeMaxSugg // total reserved when suggestions visible
+)
+
 func (m *model) View() string {
 	width := m.width
 	if width < 40 {
 		width = 40
 	}
 
-	header      := m.renderHeader(width)
-	modeBar     := m.renderModeBar(width)
-	body        := m.renderBody(width)
-	utilitiesBar := m.renderUtilitiesBar(width)
-	sep         := sepStyle.Render(strings.Repeat("─", width))
-	footer      := m.renderFooter(width)
+	header := m.renderHeader(width)
+	modeBar := m.renderModeBar(width)
+	topDiv := hairlineStyle.Render(strings.Repeat("─", width))
+	body := m.renderBody(width)
+	botDiv := topDiv
+	status := m.renderStatusBar(width)
 
 	return lipgloss.JoinVertical(lipgloss.Top,
 		header,
 		modeBar,
+		topDiv,
 		body,
-		utilitiesBar,
-		sep,
-		footer,
+		botDiv,
+		status,
 	)
 }
 
 // ── Code highlighting ──────────────────────────────────────────────────────────
-// Lightweight syntax colouring for fenced blocks. No external deps.
-// Returns a new slice of display lines — may contain ANSI escapes.
-// Each output line should be written verbatim (no additional style wrapping).
+
+var goKeywords = map[string]bool{
+	"func": true, "var": true, "const": true, "type": true, "struct": true,
+	"interface": true, "map": true, "chan": true, "go": true, "defer": true,
+	"return": true, "if": true, "else": true, "for": true, "range": true,
+	"switch": true, "case": true, "default": true, "break": true, "continue": true,
+	"package": true, "import": true, "select": true, "nil": true, "true": true,
+	"false": true, "error": true, "string": true, "int": true, "bool": true,
+	"make": true, "new": true, "append": true, "len": true, "cap": true,
+	"delete": true, "close": true, "goroutine": true, "fallthrough": true,
+}
+
+var shKeywords = map[string]bool{
+	"echo": true, "cd": true, "ls": true, "mkdir": true, "rm": true,
+	"cat": true, "grep": true, "sed": true, "awk": true, "curl": true,
+	"export": true, "source": true, "sudo": true, "chmod": true,
+	"git": true, "go": true, "make": true, "docker": true,
+}
+
+var goTypes = map[string]bool{
+	"string": true, "int": true, "int8": true, "int16": true, "int32": true,
+	"int64": true, "uint": true, "float32": true, "float64": true, "byte": true,
+	"rune": true, "bool": true, "error": true, "any": true,
+}
+
+func colorTokens(line string) string {
+	if idx := strings.Index(line, "//"); idx >= 0 {
+		return line[:idx] + hlComment.Render(line[idx:])
+	}
+	if strings.HasPrefix(strings.TrimSpace(line), "#") {
+		return hlComment.Render(line)
+	}
+	if strings.ContainsAny(line, "\"'`") {
+		return hlString.Render(line)
+	}
+	words := strings.Fields(line)
+	out := make([]string, len(words))
+	for i, w := range words {
+		clean := strings.Trim(w, "(),;:{}&*[]")
+		switch {
+		case goTypes[clean]:
+			out[i] = strings.Replace(w, clean, hlType.Render(clean), 1)
+		case goKeywords[clean] || shKeywords[clean]:
+			out[i] = strings.Replace(w, clean, hlKeyword.Render(clean), 1)
+		case len(clean) > 0 && clean[0] >= '0' && clean[0] <= '9':
+			out[i] = strings.Replace(w, clean, hlNumber.Render(clean), 1)
+		default:
+			out[i] = w
+		}
+	}
+	return strings.Join(out, " ")
+}
 
 func highlightCode(lines []string) []string {
-	kw      := lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Bold(true)
-	strS    := lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow))
-	cmt     := lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	num     := lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))
-	typeS   := lipgloss.NewStyle().Foreground(lipgloss.Color(colorPink))
-	codeBg  := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Background(lipgloss.Color(colorOverlay))
-	langTag := lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Bold(true)
-
-	goKeywords := map[string]bool{
-		"func": true, "var": true, "const": true, "type": true, "struct": true,
-		"interface": true, "map": true, "chan": true, "go": true, "defer": true,
-		"return": true, "if": true, "else": true, "for": true, "range": true,
-		"switch": true, "case": true, "default": true, "break": true, "continue": true,
-		"package": true, "import": true, "select": true, "nil": true, "true": true,
-		"false": true, "error": true, "string": true, "int": true, "bool": true,
-		"make": true, "new": true, "append": true, "len": true, "cap": true,
-		"delete": true, "close": true, "goroutine": true, "fallthrough": true,
-	}
-	shKeywords := map[string]bool{
-		"echo": true, "cd": true, "ls": true, "mkdir": true, "rm": true,
-		"cat": true, "grep": true, "sed": true, "awk": true, "curl": true,
-		"export": true, "source": true, "sudo": true, "chmod": true,
-		"git": true, "go": true, "make": true, "docker": true,
-	}
-	goTypes := map[string]bool{
-		"string": true, "int": true, "int8": true, "int16": true, "int32": true,
-		"int64": true, "uint": true, "float32": true, "float64": true, "byte": true,
-		"rune": true, "bool": true, "error": true, "any": true,
-	}
-
-	colorTokens := func(line string) string {
-		// Comment
-		if idx := strings.Index(line, "//"); idx >= 0 {
-			return line[:idx] + cmt.Render(line[idx:])
-		}
-		if strings.HasPrefix(strings.TrimSpace(line), "#") {
-			return cmt.Render(line)
-		}
-		// String literals
-		if strings.ContainsAny(line, "\"'`") {
-			return strS.Render(line)
-		}
-		words := strings.Fields(line)
-		out := make([]string, len(words))
-		for i, w := range words {
-			clean := strings.Trim(w, "(),;:{}&*[]")
-			switch {
-			case goTypes[clean]:
-				out[i] = strings.Replace(w, clean, typeS.Render(clean), 1)
-			case goKeywords[clean] || shKeywords[clean]:
-				out[i] = strings.Replace(w, clean, kw.Render(clean), 1)
-			case len(clean) > 0 && clean[0] >= '0' && clean[0] <= '9':
-				out[i] = strings.Replace(w, clean, num.Render(clean), 1)
-			default:
-				out[i] = w
-			}
-		}
-		return strings.Join(out, " ")
-	}
-
-	result  := make([]string, 0, len(lines))
+	result := make([]string, 0, len(lines))
 	inBlock := false
-	lang    := ""
+	lang := ""
 
 	for _, line := range lines {
 		if !inBlock {
@@ -652,10 +664,9 @@ func highlightCode(lines []string) []string {
 				lang = strings.TrimPrefix(line, "```")
 				tag := ""
 				if lang != "" {
-					tag = "  " + langTag.Render(lang)
+					tag = "  " + hlLang.Render(lang)
 				}
-				// Opening bar — thin horizontal rule with language label
-				result = append(result, codeBg.Render("  ╾──"+tag))
+				result = append(result, hlCodeBg.Render("  ╾──"+tag))
 				continue
 			}
 			result = append(result, line)
@@ -664,79 +675,54 @@ func highlightCode(lines []string) []string {
 		if strings.HasPrefix(line, "```") {
 			inBlock = false
 			lang = ""
-			result = append(result, codeBg.Render("  ╼──"))
+			result = append(result, hlCodeBg.Render("  ╼──"))
 			continue
 		}
 		_ = lang
-		result = append(result, codeBg.Render("  │ ")+colorTokens(line))
+		result = append(result, hlCodeBg.Render("  │ ")+colorTokens(line))
 	}
 	if inBlock {
-		result = append(result, codeBg.Render("  ╼──"))
+		result = append(result, hlCodeBg.Render("  ╼──"))
 	}
 	return result
 }
 
 // ── Body renderer ─────────────────────────────────────────────────────────────
-// Layout (top → bottom):
-//
-//	[scroll zone]  — visible records with gutter bars
-//	[live stream]  — spinner + incremental response
-//	[suggestions]  — command / file picker when active
-//	[blank]
-//	[prompt line]  — "▌ you  ❯ <input>▋"
-//
-// The prompt is NOT boxed. Two parallel vertical bars (one for the user side,
-// one that's the gutter of the output above) create the visual rhythm.
 
 func (m *model) renderBody(width int) string {
-	// Chrome budget: header(2) + modeBar(2) + utilitiesBar(1) + sep(1) + footer(1) = 7
-	// Prompt zone: 2 lines (blank + prompt)
-	fixedLines  := 7
-	promptLines := 2
-	bodyHeight  := m.height - fixedLines
-	if bodyHeight < 4 {
-		bodyHeight = 4
-	}
-
 	var body strings.Builder
 
-	maxOutput := bodyHeight - promptLines
-	if maxOutput < 1 {
-		maxOutput = 1
-	}
-	if m.showSuggestions {
-		suggLines := min(len(m.suggestions), 10) + 4
-		maxOutput -= suggLines
-		if maxOutput < 1 {
-			maxOutput = 1
-		}
-	}
-	// Reserve lines for streaming / agent status
-	if m.streaming || m.agentRunning || m.agentDone {
-		maxOutput -= 2
-		if maxOutput < 1 {
-			maxOutput = 1
-		}
+	// Calculate available lines for records.
+	// Always reserve chromeMaxSugg lines for suggestions (even when hidden)
+	// to prevent viewport jumping when the palette appears/disappears.
+	statusLines := 0
+	if m.agentRunning || m.agentDone || m.streaming {
+		statusLines = 1
 	}
 
-	// ── Scroll output ─────────────────────────────────────────────────────────
+	available := m.height - chromeFixed - chromeMaxSugg - statusLines
+	if available < 1 {
+		available = 1
+	}
+
+	// Slice records from the end.
 	start := 0
-	if len(m.records) > maxOutput {
-		start = len(m.records) - maxOutput
+	if len(m.records) > available {
+		start = len(m.records) - available
 	}
 	visible := m.records[start:]
 
-	// Run code highlighting pass on the text content
+	// Highlight code blocks.
 	texts := make([]string, len(visible))
 	for i, rec := range visible {
 		texts[i] = rec.text
 	}
 	highlighted := highlightCode(texts)
 
+	// Render records.
 	for i, rec := range visible {
 		gutter := gutterFor(rec.role)
 		content := highlighted[i]
-		// For system/plain lines, use the existing outputStyle
 		switch rec.role {
 		case roleUser:
 			body.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render(content))
@@ -745,58 +731,69 @@ func (m *model) renderBody(width int) string {
 		case roleError:
 			body.WriteString(gutter + errorStyle.Render(content))
 		case roleStatus:
-			doneStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus))
-			body.WriteString(gutter + doneStyle.Render(content))
+			body.WriteString(gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render(content))
 		default:
 			body.WriteString(gutter + outputStyle.Render(content))
 		}
 		body.WriteString("\n")
 	}
 
-	// ── Agent / streaming status ───────────────────────────────────────────────
+	// Dynamic status lines (agent / streaming).
 	if m.agentRunning {
-		spinner      := spinnerStyle.Render(spinnerFrames[m.spinnerFrame])
-		agentLStyle  := lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow))
-		aiGutter     := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterAI)).Render("▌") + " "
-		body.WriteString(aiGutter + spinner + "  " + agentLStyle.Render(m.agentLabel+"…") + "\n")
+		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame])
+		aiGutter := gutterAIStyle.Render("▌") + " "
+		body.WriteString(aiGutter + sp + "  " + lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render(m.agentLabel+"…") + "\n")
 	} else if m.agentDone {
-		doneGutter := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render("▌") + " "
-		doneLabel  := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render(m.agentLabel+" complete")
-		body.WriteString(doneGutter + doneLabel + "\n")
-	}
-
-	if m.streaming {
-		spinner   := spinnerStyle.Render(spinnerFrames[m.spinnerFrame])
-		aiGutter  := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterAI)).Render("▌") + " "
+		doneGutter := gutterStatusStyle.Render("▌") + " "
+		body.WriteString(doneGutter + labelStatusStyle.Render(m.agentLabel+" complete") + "\n")
+	} else if m.streaming {
+		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame])
+		aiGutter := gutterAIStyle.Render("▌") + " "
 		if m.responseBuffer.Len() > 0 {
-			body.WriteString(aiGutter + outputStyle.Render(m.responseBuffer.String()) + "\n")
+			streamStyle := lipgloss.NewStyle().
+				Foreground(lipgloss.Color(colorText)).
+				Width(width - 4)
+			body.WriteString(aiGutter + streamStyle.Render(m.responseBuffer.String()) + "\n")
 		} else {
-			body.WriteString(aiGutter + spinner + infoStyle.Render("  thinking…") + "\n")
+			body.WriteString(aiGutter + sp + "  " + infoStyle.Render("thinking…") + "\n")
 		}
 	}
 
-	// ── Suggestions ───────────────────────────────────────────────────────────
+	// Suggestion zone — always fills the reserved space to keep viewport stable.
 	if m.showSuggestions && len(m.suggestions) > 0 {
 		body.WriteString("\n")
 		m.renderSuggestions(&body, width)
-		body.WriteString("\n")
+		// Pad remaining reserved lines so total height is predictable.
+		suggUsed := clampMin(len(m.suggestions), chromeMaxSugg-2) + 4
+		if suggUsed > chromeMaxSugg {
+			suggUsed = chromeMaxSugg
+		}
+		for i := suggUsed; i < chromeMaxSugg; i++ {
+			body.WriteString("\n")
+		}
+	} else {
+		// Fill reserved suggestion space with blank lines.
+		for i := 0; i < chromeMaxSugg; i++ {
+			body.WriteString("\n")
+		}
 	}
 
-	// ── Prompt line ───────────────────────────────────────────────────────────
-	// Two parallel columns mirroring the output gutter:
-	//   ▌ you  ❯ <typed text>▋
-	// The user gutter bar and the "you" label create visual pairing with
-	// the AI's "▌ izen" gutter above it in the scroll zone.
-	userGutter := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterUser)).Render("▌") + " "
-	userLabel  := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterUser)).Render("you")
-	chevron    := promptStyle.Render("  ❯ ")
-	inputText  := outputStyle.Render(m.input.String())
-	cursor     := cursorStyle.Render("▋")
-
-	body.WriteString("\n")
-	body.WriteString(userGutter + userLabel + chevron + inputText + cursor)
+	// Prompt line.
+	promptLine := m.renderPrompt(width)
+	body.WriteString(promptLine)
 
 	return body.String()
+}
+
+// ── Prompt ────────────────────────────────────────────────────────────────────
+
+func (m *model) renderPrompt(width int) string {
+	gutter := gutterUserStyle.Render("▌") + " "
+	label := labelUserStyle.Render("you")
+	chevron := promptStyle.Render(" ❯ ")
+	inputText := outputStyle.Render(m.input.String())
+	cursor := cursorStyle.Render("▋")
+	return "\n" + gutter + label + chevron + inputText + cursor
 }
 
 // ── Header ────────────────────────────────────────────────────────────────────
@@ -804,30 +801,33 @@ func (m *model) renderBody(width int) string {
 func (m *model) renderHeader(width int) string {
 	var h strings.Builder
 
-	logo := logoStyle.Render("izen")
-	h.WriteString(logo)
-	h.WriteString("  ")
+	// "izen v0.1.0" — compact logo + version
+	h.WriteString(logoStyle.Render("izen"))
+	h.WriteString(" ")
+	h.WriteString(versionStyle.Render("v" + version))
+	h.WriteString(bulletStyle.String())
 
-	wd, _     := os.Getwd()
-	shortWd   := shortenPath(wd)
-	ctxText   := shortWd
+	// Model info
+	provider := m.cfg.ActiveProviderName()
+	modelName := m.cfg.ActiveModelName()
+	h.WriteString(dimStyle.Render(provider + " " + modelName))
+	h.WriteString(bulletStyle.String())
+
+	// Working directory
+	wd, _ := os.Getwd()
+	shortWd := shortenPath(wd)
+	h.WriteString(dimStyle.Render(shortWd))
+
+	// Objective (if set)
 	if m.sess.Objective != "" {
-		obj   := m.sess.Objective
-		avail := width - lipgloss.Width(logo) - 6
+		obj := m.sess.Objective
+		avail := width - lipgloss.Width(h.String()) - 6
 		if avail > 10 && len(obj) > avail {
 			obj = obj[:avail-3] + "…"
 		}
-		ctxText = shortWd + "  ·  " + obj
+		h.WriteString(dotStyle.Render(" · "))
+		h.WriteString(infoStyle.Render(obj))
 	}
-	h.WriteString(contextStyle.Render(ctxText))
-	h.WriteString("\n")
-
-	mode      := m.resolver.Current()
-	modeColor := modeAccentColor(mode)
-	modeInd   := lipgloss.NewStyle().Bold(true).Foreground(modeColor).Render("/" + mode.String())
-	h.WriteString(modeLabelStyle.Render("mode  "))
-	h.WriteString(modeInd)
-	h.WriteString(contextStyle.Render("  — " + mode.Description()))
 
 	return h.String()
 }
@@ -843,68 +843,49 @@ func (m *model) renderModeBar(width int) string {
 			b.WriteString(hairlineStyle.Render("  "))
 		}
 		if mname == current {
-			mode, _     := modes.Parse(mname[1:])
-			activeStyle := lipgloss.NewStyle().Bold(true).Foreground(modeAccentColor(mode)).Padding(0, 0)
+			mode, _ := modes.Parse(mname[1:])
+			activeStyle := modeTabActiveStyle.Foreground(modeAccentColor(mode))
 			b.WriteString(activeStyle.Render(mname))
 		} else {
 			b.WriteString(modeTabInactiveStyle.Render(mname))
 		}
 	}
 
-	b.WriteString("\n")
-	b.WriteString(hairlineStyle.Render(strings.Repeat("─", width)))
-
-	return b.String()
-}
-
-// ── Utilities bar ─────────────────────────────────────────────────────────────
-
-func (m *model) renderUtilitiesBar(width int) string {
-	var b strings.Builder
-
-	cmds := utilityCommands[m.resolver.Current()]
-	if len(cmds) > 0 {
-		b.WriteString(utilitiesLabelStyle.Render("›"))
-		b.WriteString(" ")
-		for i, cmd := range cmds {
-			if i > 0 {
-				b.WriteString(hairlineStyle.Render("  "))
-			}
-			b.WriteString(utilitiesStyle.Render(cmd))
-		}
-	}
-
-	hint       := "/ palette  @ file  ! shell"
-	hintStyled := paletteHintStyle.Render(hint)
-	hintW      := lipgloss.Width(hintStyled)
-	utilW      := lipgloss.Width(b.String())
-	gap        := width - utilW - hintW
+	// Mode description on the right.
+	desc := m.resolver.Current().Description()
+	descStyled := dimStyle.Render("— " + desc)
+	barW := lipgloss.Width(b.String())
+	gap := width - barW - lipgloss.Width(descStyled) - 2
 	if gap < 2 {
 		gap = 2
 	}
 	b.WriteString(strings.Repeat(" ", gap))
-	b.WriteString(hintStyled)
+	b.WriteString(descStyled)
 
 	return b.String()
 }
 
-// ── Footer ────────────────────────────────────────────────────────────────────
+// ── Status bar (tmux/airline-style) ──────────────────────────────────────────
 
-func (m *model) renderFooter(width int) string {
-	wd, _     := os.Getwd()
-	shortWd   := shortenPath(wd)
+func (m *model) renderStatusBar(width int) string {
+	wd, _ := os.Getwd()
+	shortWd := shortenPath(wd)
 	branch, _ := m.gitEng.Branch()
-	left      := shortWd
+
+	// Left: path (branch)
+	var left strings.Builder
+	left.WriteString(statusLeftStyle.Render(shortWd))
 	if branch != "" {
-		left = left + " (" + branch + ")"
+		left.WriteString(statusLeftStyle.Render(" (" + branch + ")"))
 	}
 
+	// Right: provider model · tokens · cost
 	provider := m.cfg.ActiveProviderName()
 	modelName := m.cfg.ActiveModelName()
 
 	totalTokens := m.tokenInput + m.tokenOutput
-	maxContext  := 32768
-	pct         := float64(totalTokens) / float64(maxContext) * 100
+	maxContext := 32768
+	pct := float64(totalTokens) / float64(maxContext) * 100
 	var tokStr string
 	if totalTokens >= 1000 {
 		tokStr = fmt.Sprintf("%.1fk/%dk", float64(totalTokens)/1000, maxContext/1000)
@@ -914,31 +895,37 @@ func (m *model) renderFooter(width int) string {
 
 	var costStr string
 	if provider == "ollama" {
-		costStr = "$0.00 (local)"
+		costStr = "$0.00"
 	} else {
-		cost    := float64(m.tokenInput)*(3.0/1_000_000) + float64(m.tokenOutput)*(15.0/1_000_000)
-		costStr  = fmt.Sprintf("$%.4f", cost)
+		cost := float64(m.tokenInput)*(3.0/1_000_000) + float64(m.tokenOutput)*(15.0/1_000_000)
+		costStr = fmt.Sprintf("$%.4f", cost)
 	}
 
-	leftStyled  := footerStyle.Render(left)
-	right        := fmt.Sprintf("%s %s · %s (%.0f%%) · %s", provider, modelName, tokStr, pct, costStr)
-	rightStyled := footerActiveStyle.Render(right)
+	var right strings.Builder
+	right.WriteString(statusRightStyle.Render(provider))
+	right.WriteString(statusSepStyle.String())
+	right.WriteString(statusRightStyle.Render(modelName))
+	right.WriteString(statusSepStyle.String())
+	right.WriteString(statusRightStyle.Render(tokStr + fmt.Sprintf(" (%.0f%%)", pct)))
+	right.WriteString(statusSepStyle.String())
+	right.WriteString(statusRightStyle.Render(costStr))
 
-	leftW  := lipgloss.Width(leftStyled)
-	rightW := lipgloss.Width(rightStyled)
-	gap    := width - leftW - rightW
+	// Pad between left and right.
+	leftW := lipgloss.Width(left.String())
+	rightW := lipgloss.Width(right.String())
+	gap := width - leftW - rightW
 	if gap < 1 {
 		gap = 1
 	}
 
-	return leftStyled + strings.Repeat(" ", gap) + rightStyled
+	return left.String() + strings.Repeat(" ", gap) + right.String()
 }
 
 // ── Suggestions ───────────────────────────────────────────────────────────────
 
 func (m *model) renderSuggestions(b *strings.Builder, width int) {
 	maxVisible := 12
-	items       := m.suggestions
+	items := m.suggestions
 	if len(items) > maxVisible {
 		items = items[:maxVisible]
 	}
@@ -991,7 +978,7 @@ func (m *model) renderSuggestions(b *strings.Builder, width int) {
 		}
 	}
 
-	inner.WriteString(paletteHintStyle.Render("  tab/shift-tab navigate · enter confirm · esc dismiss"))
+	inner.WriteString(paletteHintStyle.Render("  tab/shift-tab · enter confirm · esc dismiss"))
 
 	boxWidth := 44
 	if width < boxWidth+4 {
@@ -1003,9 +990,9 @@ func (m *model) renderSuggestions(b *strings.Builder, width int) {
 
 func (m *model) dismissSuggestions() {
 	m.showSuggestions = false
-	m.suggestionType  = ""
-	m.suggestions     = nil
-	m.suggestionIdx   = 0
+	m.suggestionType = ""
+	m.suggestions = nil
+	m.suggestionIdx = 0
 }
 
 func (m *model) updateSuggestions() {
@@ -1016,24 +1003,22 @@ func (m *model) updateSuggestions() {
 	}
 	if strings.HasPrefix(current, "/") {
 		m.showSuggestions = true
-		m.suggestionType  = "/"
-		m.suggestions     = m.filterCommands(current[1:])
-		m.suggestionIdx   = 0
+		m.suggestionType = "/"
+		m.suggestions = m.filterCommands(current[1:])
+		m.suggestionIdx = 0
 		if len(m.suggestions) == 1 && m.suggestions[0] == current {
 			m.showSuggestions = false
 		}
 		return
 	}
-	// @ can appear anywhere mid-sentence
 	atIdx := strings.LastIndex(current, "@")
 	if atIdx >= 0 {
 		prefix := current[atIdx+1:]
-		// A space after the @ prefix means the user has moved on
 		if !strings.Contains(prefix, " ") {
 			m.showSuggestions = true
-			m.suggestionType  = "@"
-			m.suggestions     = filterFilesRecursive(prefix)
-			m.suggestionIdx   = 0
+			m.suggestionType = "@"
+			m.suggestions = filterFilesRecursive(prefix)
+			m.suggestionIdx = 0
 			if len(m.suggestions) == 1 && m.suggestions[0] == prefix {
 				m.showSuggestions = false
 			}
@@ -1067,12 +1052,14 @@ func (m *model) filterCommands(prefix string) []string {
 	return result
 }
 
-// filterFilesRecursive walks the cwd recursively, returning paths that have
-// the given prefix. Supports subdirectory navigation (e.g. "internal/ai").
+// ── @ file auto-complete ─────────────────────────────────────────────────────
+
 func filterFilesRecursive(prefix string) []string {
 	const limit = 20
 
-	prefix    = strings.TrimPrefix(prefix, "./")
+	prefix = strings.TrimPrefix(prefix, "./")
+
+	// Determine search root: the directory prefix, if any.
 	searchDir := "."
 	if idx := strings.LastIndex(prefix, "/"); idx >= 0 {
 		searchDir = prefix[:idx]
@@ -1089,31 +1076,54 @@ func filterFilesRecursive(prefix string) []string {
 		if len(results) >= limit {
 			return filepath.SkipAll
 		}
-		base := d.Name()
-		if strings.HasPrefix(base, ".") {
+
+		// Skip hidden files/dirs at the root level, but allow hidden subdir matches.
+		name := d.Name()
+		if strings.HasPrefix(name, ".") {
 			if d.IsDir() {
+				// Skip known noisy directories at any depth.
+				switch name {
+				case ".git", ".svn", ".DS_Store", ".izen":
+					return filepath.SkipDir
+				}
+				// Allow hidden dirs deeper in the tree if they're being explicitly searched.
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		if d.IsDir() {
-			switch base {
-			case "vendor", "node_modules", "dist", "build", "__pycache__":
+			switch name {
+			case "vendor", "node_modules", "dist", "build", "__pycache__", "target", ".next":
 				return filepath.SkipDir
 			}
 			return nil
 		}
+
 		rel := path
 		if strings.HasPrefix(rel, "./") {
 			rel = rel[2:]
 		}
-		if strings.HasPrefix(rel, prefix) {
+
+		// Match prefix against the relative path from the project root.
+		if prefix == "" || strings.HasPrefix(rel, prefix) || strings.Contains(strings.ToLower(rel), strings.ToLower(prefix)) {
 			results = append(results, rel)
 		}
 		return nil
 	})
 
-	sort.Strings(results)
+	sort.Slice(results, func(i, j int) bool {
+		// Prefer files with exact prefix match, then shorter paths.
+		iExact := strings.HasPrefix(results[i], prefix)
+		jExact := strings.HasPrefix(results[j], prefix)
+		if iExact != jExact {
+			return iExact
+		}
+		return len(results[i]) < len(results[j])
+	})
+
+	if len(results) > limit {
+		results = results[:limit]
+	}
 	return results
 }
 
@@ -1129,8 +1139,8 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		return nil
 	}
 
-	m.streamCh     = make(chan tea.Msg, 100)
-	m.streaming    = true
+	m.streamCh = make(chan tea.Msg, 1024)
+	m.streaming = true
 	m.spinnerFrame = 0
 
 	req := ai.Request{
@@ -1170,7 +1180,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 					tokIn, tokOut = sr.Usage()
 				}
 				if tokIn == 0 && tokOut == 0 {
-					tokIn  = len(content) / 4
+					tokIn = len(content) / 4
 					tokOut = full.Len() / 4
 				}
 				m.streamCh <- streamDoneMsg{content: full.String(), tokenInput: tokIn, tokenOutput: tokOut}
@@ -1204,7 +1214,6 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
-	// Shell passthrough
 	if strings.HasPrefix(line, "!") {
 		shellCmd := strings.TrimSpace(line[1:])
 		if shellCmd == "" {
@@ -1222,17 +1231,14 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
-	// Expand @file references before routing
 	line = m.expandFileRefs(line)
 
 	if strings.HasPrefix(line, "/") {
 		return m.handleCommand(line)
 	}
 
-	// Echo user turn with role label on first line only
 	m.push(roleUser, line)
 
-	// Possibly auto-switch mode
 	newMode := m.resolver.Resolve(line)
 	if newMode != m.resolver.Current() {
 		m.resolver.Set(newMode)
@@ -1250,16 +1256,184 @@ func (m *model) handleInput(line string) tea.Cmd {
 
 	switch m.resolver.Current() {
 	case modes.ModeInvestigate:
-		m.handleInvestigateInput(content)
-		return nil
+		return m.runInvestigateCmd(content)
 	case modes.ModeReview:
-		m.handleReviewInput(content)
-		return nil
+		return m.runReviewCmd()
 	default:
 		m.responseBuffer.Reset()
 		return m.streamCmd(content)
 	}
 }
+
+// ── Agent commands (non-blocking) ─────────────────────────────────────────────
+
+func (m *model) runInvestigateCmd(content string) tea.Cmd {
+	m.agentRunning = true
+	m.agentDone = false
+	m.agentLabel = "investigating"
+	m.spinnerFrame = 0
+
+	return func() tea.Msg {
+		eng := investigate.NewEngine(".", content, nil, nil)
+		result, err := eng.Run()
+		if err != nil {
+			return investigateResultMsg{err: err}
+		}
+
+		var recs []record
+		push := func(r role, text string) {
+			for _, l := range strings.Split(text, "\n") {
+				recs = append(recs, record{role: r, text: l})
+			}
+		}
+
+		push(roleAI, investigationStyle.Render(fmt.Sprintf("problem: %s", result.Problem)))
+		push(roleAI, investigationStyle.Render(fmt.Sprintf(
+			"duration: %s · loops: %d · hypotheses: %d · evidence: %d",
+			result.Duration, result.Loops, len(result.Hypotheses), len(result.Evidence))))
+
+		if result.Resolved {
+			push(roleStatus, hypothesisStyle.Render("✓ "+result.Conclusion))
+		} else {
+			push(roleSystem, infoStyle.Render("investigation inconclusive"))
+		}
+
+		for _, h := range result.Hypotheses {
+			sym := "○"
+			switch h.Status {
+			case investigate.HypothesisConfirmed:
+				sym = "✓"
+			case investigate.HypothesisRejected:
+				sym = "✗"
+			}
+			push(roleAI, hypothesisStyle.Render(
+				fmt.Sprintf("  %s %s [%s] (%.0f%%)", sym, h.Theory, h.Status, h.Confidence*100)))
+		}
+
+		for _, ev := range result.Evidence {
+			c := ev.Content
+			if len(c) > 60 {
+				c = c[:60] + "…"
+			}
+			push(roleAI, evidenceStyle.Render(fmt.Sprintf("  [%s] %s", ev.Source, c)))
+		}
+
+		if !result.Resolved && result.Error != "" {
+			push(roleError, "error: "+result.Error)
+		}
+
+		return investigateResultMsg{records: recs, sessionKey: result.Problem}
+	}
+}
+
+func (m *model) runReviewCmd() tea.Cmd {
+	m.agentRunning = true
+	m.agentDone = false
+	m.agentLabel = "reviewing"
+	m.spinnerFrame = 0
+
+	return func() tea.Msg {
+		eng := review.NewEngine(".", nil, nil)
+		result, err := eng.Run()
+		if err != nil {
+			return reviewResultMsg{err: err}
+		}
+
+		var recs []record
+		push := func(r role, text string) {
+			for _, l := range strings.Split(text, "\n") {
+				recs = append(recs, record{role: r, text: l})
+			}
+		}
+
+		if result.Error != "" {
+			push(roleSystem, infoStyle.Render(result.Error))
+			return reviewResultMsg{records: recs}
+		}
+
+		push(roleAI, reviewStyle.Render(fmt.Sprintf("review: %s → %s", result.BaseBranch, result.Branch)))
+		push(roleAI, reviewStyle.Render(fmt.Sprintf(
+			"commit: %s · files: %d · duration: %s",
+			result.CommitHash, len(result.FilesChanged), result.Duration)))
+
+		scoreColor := scoreStyle
+		if result.Score < 50 {
+			scoreColor = errorStyle
+		} else if result.Score < 75 {
+			scoreColor = riskHighStyle
+		}
+		push(roleAI, scoreColor.Render(fmt.Sprintf("score: %d/100  risk: %d/100", result.Score, result.ImpactRadius.RiskScore)))
+
+		if len(result.FilesChanged) > 0 {
+			push(roleAI, infoStyle.Render("changed files:"))
+			for _, f := range result.FilesChanged {
+				sym := "~"
+				switch f.Status {
+				case "added":
+					sym = "+"
+				case "deleted":
+					sym = "-"
+				case "renamed":
+					sym = "→"
+				}
+				push(roleAI, infoStyle.Render(fmt.Sprintf("  %s %s (+%d/-%d)", sym, f.Path, f.Additions, f.Deletions)))
+			}
+		}
+
+		if len(result.ImpactRadius.IndirectFiles) > 0 {
+			push(roleAI, riskMediumStyle.Render(fmt.Sprintf(
+				"impact: %d direct · %d indirect · %d packages",
+				len(result.ImpactRadius.DirectFiles),
+				len(result.ImpactRadius.IndirectFiles),
+				len(result.ImpactRadius.AffectedPkgs))))
+		}
+
+		sevOrder := []review.RiskSeverity{
+			review.RiskCritical, review.RiskHigh, review.RiskMedium, review.RiskLow, review.RiskInfo,
+		}
+		sevStyles := map[review.RiskSeverity]lipgloss.Style{
+			review.RiskCritical: riskCriticalStyle,
+			review.RiskHigh:     riskHighStyle,
+			review.RiskMedium:   riskMediumStyle,
+			review.RiskLow:      riskLowStyle,
+			review.RiskInfo:     riskInfoStyle,
+		}
+
+		for _, sev := range sevOrder {
+			var findings []review.RiskFinding
+			for _, f := range result.RiskFindings {
+				if f.Severity == sev {
+					findings = append(findings, f)
+				}
+			}
+			if len(findings) == 0 {
+				continue
+			}
+			style := sevStyles[sev]
+			push(roleAI, style.Render(fmt.Sprintf("  [%s] %d findings", strings.ToUpper(string(sev)), len(findings))))
+			for _, f := range findings {
+				push(roleAI, style.Render(fmt.Sprintf("    %s:%d — %s", f.File, f.Line, f.Description)))
+			}
+		}
+
+		if len(result.Recommendations) > 0 {
+			push(roleAI, reviewStyle.Render("recommendations:"))
+			for i, rec := range result.Recommendations {
+				push(roleAI, infoStyle.Render(fmt.Sprintf("  %d. %s", i+1, rec)))
+			}
+		}
+
+		sessionKey := result.Branch + "@" + result.CommitHash
+		savedResult := result
+		return reviewResultMsg{
+			records:      recs,
+			sessionKey:   sessionKey,
+			saveReportFn: func() { review.SaveReport(savedResult, ".") },
+		}
+	}
+}
+
+// ── Command handler ───────────────────────────────────────────────────────────
 
 func (m *model) handleCommand(cmd string) tea.Cmd {
 	switch {
@@ -1274,6 +1448,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
 		m.push(roleSystem, infoStyle.Render("  /help         show this help"))
 		m.push(roleSystem, infoStyle.Render("  /mode <name>  switch mode"))
+		m.push(roleSystem, infoStyle.Render("  /objective    set session objective"))
 		m.push(roleSystem, infoStyle.Render("  /quit         exit"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>        run a shell command"))
 		m.push(roleSystem, "")
@@ -1351,7 +1526,6 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 	}
 
-	// Core mode switches with optional inline content
 	for _, mode := range []modes.Mode{
 		modes.ModeAsk, modes.ModePlan, modes.ModeBuild,
 		modes.ModeInvestigate, modes.ModeReview,
@@ -1418,25 +1592,38 @@ func stripModePrefix(line string) string {
 	return line
 }
 
+// expandFileRefs resolves @-prefixed file references in the input line.
 func (m *model) expandFileRefs(line string) string {
-	fields  := strings.Fields(line)
+	fields := strings.Fields(line)
 	changed := false
 	for i, field := range fields {
 		if strings.HasPrefix(field, "@") {
-			ref := field[1:]
-			if ref == "" {
+			ref := filepath.Clean(field[1:])
+			if ref == "" || ref == "." {
 				continue
 			}
 			if _, err := os.Stat(ref); err == nil {
 				fields[i] = ref
-				changed    = true
+				changed = true
 				continue
 			}
+			// Try glob match.
 			matches, err := filepath.Glob(ref)
 			if err == nil && len(matches) > 0 {
 				fields[i] = matches[0]
-				changed    = true
+				changed = true
+				continue
 			}
+			// Try as-is without @ prefix (relative path from project root).
+			if _, err := os.Stat(field[1:]); err == nil {
+				fields[i] = field[1:]
+				changed = true
+				continue
+			}
+			// Unresolvable: warn but keep the reference.
+			m.push(roleSystem, infoStyle.Render("warn: @"+field[1:]+" not found — sending as literal"))
+			fields[i] = field[1:]
+			changed = true
 		}
 	}
 	if changed {
@@ -1445,165 +1632,9 @@ func (m *model) expandFileRefs(line string) string {
 	return line
 }
 
-func min(a, b int) int {
+func clampMin(a, b int) int {
 	if a < b {
 		return a
 	}
 	return b
-}
-
-// ── Agent handlers ────────────────────────────────────────────────────────────
-
-func (m *model) handleInvestigateInput(line string) {
-	m.agentRunning = true
-	m.agentDone    = false
-	m.agentLabel   = "investigating"
-	m.spinnerFrame = 0
-
-	eng    := investigate.NewEngine(".", line, nil, nil)
-	result, err := eng.Run()
-	if err != nil {
-		m.agentRunning = false
-		m.push(roleError, "investigation error: "+err.Error())
-		return
-	}
-
-	m.agentRunning = false
-	m.agentDone    = true
-
-	m.push(roleAI, investigationStyle.Render(fmt.Sprintf("problem: %s", result.Problem)))
-	m.push(roleAI, investigationStyle.Render(fmt.Sprintf(
-		"duration: %s · loops: %d · hypotheses: %d · evidence: %d",
-		result.Duration, result.Loops, len(result.Hypotheses), len(result.Evidence))))
-
-	if result.Resolved {
-		m.push(roleStatus, hypothesisStyle.Render("✓ "+result.Conclusion))
-	} else {
-		m.push(roleSystem, infoStyle.Render("investigation inconclusive"))
-	}
-
-	for _, h := range result.Hypotheses {
-		sym := "○"
-		switch h.Status {
-		case investigate.HypothesisConfirmed:
-			sym = "✓"
-		case investigate.HypothesisRejected:
-			sym = "✗"
-		}
-		m.push(roleAI, hypothesisStyle.Render(
-			fmt.Sprintf("  %s %s [%s] (%.0f%%)", sym, h.Theory, h.Status, h.Confidence*100)))
-	}
-
-	for _, ev := range result.Evidence {
-		content := ev.Content
-		if len(content) > 60 {
-			content = content[:60] + "…"
-		}
-		m.push(roleAI, evidenceStyle.Render(fmt.Sprintf("  [%s] %s", ev.Source, content)))
-	}
-
-	if !result.Resolved && result.Error != "" {
-		m.push(roleError, "error: "+result.Error)
-	}
-
-	m.sess.SetInvestigationID(result.Problem)
-	os.MkdirAll(filepath.Join(".izen", "investigations"), 0755)
-}
-
-func (m *model) handleReviewInput(_ string) {
-	m.agentRunning = true
-	m.agentDone    = false
-	m.agentLabel   = "reviewing"
-	m.spinnerFrame = 0
-
-	eng    := review.NewEngine(".", nil, nil)
-	result, err := eng.Run()
-	if err != nil {
-		m.agentRunning = false
-		m.push(roleError, "review error: "+err.Error())
-		return
-	}
-	if result.Error != "" {
-		m.agentRunning = false
-		m.push(roleSystem, infoStyle.Render(result.Error))
-		return
-	}
-
-	m.agentRunning = false
-	m.agentDone    = true
-
-	m.push(roleAI, reviewStyle.Render(fmt.Sprintf("review: %s → %s", result.BaseBranch, result.Branch)))
-	m.push(roleAI, reviewStyle.Render(fmt.Sprintf(
-		"commit: %s · files: %d · duration: %s",
-		result.CommitHash, len(result.FilesChanged), result.Duration)))
-
-	scoreColor := scoreStyle
-	if result.Score < 50 {
-		scoreColor = errorStyle
-	} else if result.Score < 75 {
-		scoreColor = riskHighStyle
-	}
-	m.push(roleAI, scoreColor.Render(fmt.Sprintf("score: %d/100  risk: %d/100", result.Score, result.ImpactRadius.RiskScore)))
-
-	if len(result.FilesChanged) > 0 {
-		m.push(roleAI, infoStyle.Render("changed files:"))
-		for _, f := range result.FilesChanged {
-			sym := "~"
-			switch f.Status {
-			case "added":
-				sym = "+"
-			case "deleted":
-				sym = "-"
-			case "renamed":
-				sym = "→"
-			}
-			m.push(roleAI, infoStyle.Render(fmt.Sprintf("  %s %s (+%d/-%d)", sym, f.Path, f.Additions, f.Deletions)))
-		}
-	}
-
-	if len(result.ImpactRadius.IndirectFiles) > 0 {
-		m.push(roleAI, riskMediumStyle.Render(fmt.Sprintf(
-			"impact: %d direct · %d indirect · %d packages",
-			len(result.ImpactRadius.DirectFiles),
-			len(result.ImpactRadius.IndirectFiles),
-			len(result.ImpactRadius.AffectedPkgs))))
-	}
-
-	sevOrder := []review.RiskSeverity{
-		review.RiskCritical, review.RiskHigh, review.RiskMedium, review.RiskLow, review.RiskInfo,
-	}
-	sevStyles := map[review.RiskSeverity]lipgloss.Style{
-		review.RiskCritical: riskCriticalStyle,
-		review.RiskHigh:     riskHighStyle,
-		review.RiskMedium:   riskMediumStyle,
-		review.RiskLow:      riskLowStyle,
-		review.RiskInfo:     riskInfoStyle,
-	}
-
-	for _, sev := range sevOrder {
-		var findings []review.RiskFinding
-		for _, f := range result.RiskFindings {
-			if f.Severity == sev {
-				findings = append(findings, f)
-			}
-		}
-		if len(findings) == 0 {
-			continue
-		}
-		style := sevStyles[sev]
-		m.push(roleAI, style.Render(fmt.Sprintf("  [%s] %d findings", strings.ToUpper(string(sev)), len(findings))))
-		for _, f := range findings {
-			m.push(roleAI, style.Render(fmt.Sprintf("    %s:%d — %s", f.File, f.Line, f.Description)))
-		}
-	}
-
-	if len(result.Recommendations) > 0 {
-		m.push(roleAI, reviewStyle.Render("recommendations:"))
-		for i, rec := range result.Recommendations {
-			m.push(roleAI, infoStyle.Render(fmt.Sprintf("  %d. %s", i+1, rec)))
-		}
-	}
-
-	m.sess.SetReviewID(result.Branch + "@" + result.CommitHash)
-	review.SaveReport(result, ".")
 }

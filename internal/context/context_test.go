@@ -164,7 +164,7 @@ func TestRenderFull(t *testing.T) {
 				Lines: 50,
 			},
 		},
-		Diff: "--- a/old\n+++ b/new\n@@ -1 +1 @@\n-hello\n+world",
+		Diff:   "--- a/old\n+++ b/new\n@@ -1 +1 @@\n-hello\n+world",
 		Status: []string{"modified test.txt"},
 		Errors: []string{"something went wrong"},
 	}

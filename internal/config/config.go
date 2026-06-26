@@ -15,18 +15,18 @@ type AIProviderConfig struct {
 }
 
 type AIConfig struct {
-	DefaultProvider  string                    `yaml:"default_provider"`
-	FallbackProvider string                    `yaml:"fallback_provider"`
+	DefaultProvider  string                      `yaml:"default_provider"`
+	FallbackProvider string                      `yaml:"fallback_provider"`
 	Providers        map[string]AIProviderConfig `yaml:"providers"`
 }
 
 type Config struct {
-	AI        AIConfig         `yaml:"ai"`
-	Models    ModelConfig      `yaml:"models"`
-	Execution ExecutionConfig  `yaml:"execution"`
-	Fallback  FallbackConfig   `yaml:"fallback"`
-	Lynx      LynxConfig       `yaml:"lynx"`
-	MCP       MCPConfig        `yaml:"mcp"`
+	AI        AIConfig        `yaml:"ai"`
+	Models    ModelConfig     `yaml:"models"`
+	Execution ExecutionConfig `yaml:"execution"`
+	Fallback  FallbackConfig  `yaml:"fallback"`
+	Lynx      LynxConfig      `yaml:"lynx"`
+	MCP       MCPConfig       `yaml:"mcp"`
 }
 
 type ModelConfig struct {

@@ -6,15 +6,15 @@ import (
 )
 
 type TestResultSummary struct {
-	Package    string   `json:"package"`
-	Passed     bool     `json:"passed"`
-	Total      int      `json:"total"`
-	PassedN    int      `json:"passed_n"`
-	FailedN    int      `json:"failed_n"`
-	Skipped    int      `json:"skipped"`
-	Failed     []string `json:"failed,omitempty"`
-	Output     string   `json:"output,omitempty"`
-	Frames     []StackFrame `json:"frames,omitempty"`
+	Package string       `json:"package"`
+	Passed  bool         `json:"passed"`
+	Total   int          `json:"total"`
+	PassedN int          `json:"passed_n"`
+	FailedN int          `json:"failed_n"`
+	Skipped int          `json:"skipped"`
+	Failed  []string     `json:"failed,omitempty"`
+	Output  string       `json:"output,omitempty"`
+	Frames  []StackFrame `json:"frames,omitempty"`
 }
 
 type TestLoop struct {

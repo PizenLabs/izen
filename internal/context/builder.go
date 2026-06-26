@@ -27,13 +27,13 @@ func NewBuilder(root string, g *graph.Graph, ge *git.Engine, sess *session.Sessi
 }
 
 type BuildRequest struct {
-	Query        string
-	Files        []string
-	Symbols      []string
-	IncludeDiff  bool
-	IncludeAll   bool
-	MaxFiles     int
-	MaxSymbols   int
+	Query       string
+	Files       []string
+	Symbols     []string
+	IncludeDiff bool
+	IncludeAll  bool
+	MaxFiles    int
+	MaxSymbols  int
 }
 
 func (b *Builder) Build(req BuildRequest) *Context {
@@ -190,12 +190,12 @@ func compressFile(fn *graph.FileNode, maxSymbols int) FileSlice {
 					break
 				}
 				fs.Symbols = append(fs.Symbols, SymbolRef{
-					Name:     s.Name,
-					Kind:     s.Kind.String(),
-					File:     s.File,
-					Line:     s.Line,
+					Name:      s.Name,
+					Kind:      s.Kind.String(),
+					File:      s.File,
+					Line:      s.Line,
 					Signature: s.Signature,
-					Exported: s.Exported,
+					Exported:  s.Exported,
 				})
 			}
 		} else {

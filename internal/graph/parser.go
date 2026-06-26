@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-		sitter "github.com/smacker/go-tree-sitter"
+	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/golang"
 	"github.com/smacker/go-tree-sitter/python"
 	"github.com/smacker/go-tree-sitter/rust"

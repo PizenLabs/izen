@@ -13,25 +13,25 @@ type Engine struct {
 	Slicer     *ProximitySlicer
 	TestLoop   *TestLoop
 
-	Problem    string
-	root       string
-	startedAt  time.Time
-	Result     *InvestigationResult
+	Problem   string
+	root      string
+	startedAt time.Time
+	Result    *InvestigationResult
 
 	retriever Retriever
 	executor  TestExecutor
 }
 
 type InvestigationResult struct {
-	Problem      string       `json:"problem"`
-	Resolved     bool         `json:"resolved"`
-	Conclusion   string       `json:"conclusion"`
-	Hypotheses   []Hypothesis `json:"hypotheses"`
-	Evidence     []Evidence   `json:"evidence"`
-	Proximity    []ProximitySlice `json:"proximity,omitempty"`
-	Loops        int          `json:"loops"`
-	Duration     string       `json:"duration"`
-	Error        string       `json:"error,omitempty"`
+	Problem    string           `json:"problem"`
+	Resolved   bool             `json:"resolved"`
+	Conclusion string           `json:"conclusion"`
+	Hypotheses []Hypothesis     `json:"hypotheses"`
+	Evidence   []Evidence       `json:"evidence"`
+	Proximity  []ProximitySlice `json:"proximity,omitempty"`
+	Loops      int              `json:"loops"`
+	Duration   string           `json:"duration"`
+	Error      string           `json:"error,omitempty"`
 }
 
 type Retriever interface {

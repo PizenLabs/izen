@@ -53,7 +53,7 @@ func TestRunnerSandboxAllowsSafe(t *testing.T) {
 
 func TestIsDangerous(t *testing.T) {
 	cases := []struct {
-		cmd      string
+		cmd       string
 		dangerous bool
 	}{
 		{"echo hello", false},

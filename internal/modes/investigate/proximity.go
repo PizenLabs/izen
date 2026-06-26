@@ -19,16 +19,16 @@ type StackFrame struct {
 }
 
 type ProximitySlice struct {
-	File    string   `json:"file"`
-	Line    int      `json:"line"`
-	Context []string `json:"context"`
-	Start   int      `json:"start"`
-	End     int      `json:"end"`
+	File    string     `json:"file"`
+	Line    int        `json:"line"`
+	Context []string   `json:"context"`
+	Start   int        `json:"start"`
+	End     int        `json:"end"`
 	Frame   StackFrame `json:"frame"`
 }
 
 var (
-	goStackTraceRe   = regexp.MustCompile(`^\s*(.+\.go):(\d+)(?::(\d+))?\s+(.*)$`)
+	goStackTraceRe    = regexp.MustCompile(`^\s*(.+\.go):(\d+)(?::(\d+))?\s+(.*)$`)
 	panicStackTraceRe = regexp.MustCompile(`^\s*(.+\.go):(\d+)`)
 	javaStackTraceRe  = regexp.MustCompile(`^\s+at\s+(.+?)\((.+\.go):(\d+)\)`)
 	pythonTracebackRe = regexp.MustCompile(`^\s*File\s+"(.+?)",\s+line\s+(\d+)`)
@@ -216,9 +216,9 @@ type runResultAdapter struct {
 	exitCode int
 }
 
-func (r *runResultAdapter) StdOut() string  { return r.stdout }
-func (r *runResultAdapter) StdErr() string  { return r.stderr }
-func (r *runResultAdapter) ExitCode() int   { return r.exitCode }
+func (r *runResultAdapter) StdOut() string { return r.stdout }
+func (r *runResultAdapter) StdErr() string { return r.stderr }
+func (r *runResultAdapter) ExitCode() int  { return r.exitCode }
 
 func NewRunResultAdapter(stdout, stderr string, exitCode int) StdoutStderrer {
 	return &runResultAdapter{stdout: stdout, stderr: stderr, exitCode: exitCode}

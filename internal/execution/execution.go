@@ -7,12 +7,12 @@ import (
 )
 
 type Engine struct {
-	Runner           *Runner
-	Test             *TestRunner
-	Patches          *PatchManager
-	Checkpoints      *CheckpointManager
-	Git              *git.Engine
-	root             string
+	Runner      *Runner
+	Test        *TestRunner
+	Patches     *PatchManager
+	Checkpoints *CheckpointManager
+	Git         *git.Engine
+	root        string
 }
 
 func NewEngine(root string, cfg *config.Config, sess *session.Session) *Engine {

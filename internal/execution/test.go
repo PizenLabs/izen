@@ -10,15 +10,15 @@ import (
 )
 
 type TestResult struct {
-	Package string        `json:"package"`
-	Passed  bool          `json:"passed"`
-	Total   int           `json:"total"`
-	PassedN int           `json:"passed_n"`
-	FailedN int           `json:"failed_n"`
-	Skipped int           `json:"skipped"`
-	Output  string        `json:"output"`
-	Failed  []FailedTest  `json:"failed,omitempty"`
-	Cover   string        `json:"coverage,omitempty"`
+	Package  string        `json:"package"`
+	Passed   bool          `json:"passed"`
+	Total    int           `json:"total"`
+	PassedN  int           `json:"passed_n"`
+	FailedN  int           `json:"failed_n"`
+	Skipped  int           `json:"skipped"`
+	Output   string        `json:"output"`
+	Failed   []FailedTest  `json:"failed,omitempty"`
+	Cover    string        `json:"coverage,omitempty"`
 	Duration time.Duration `json:"duration"`
 }
 

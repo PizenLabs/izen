@@ -11,18 +11,18 @@ import (
 )
 
 type Engine struct {
-	State      *StateMachine
-	Diff       *DiffAnalyzer
-	Auditor    *RiskAuditor
-	Impact     *ImpactAnalyzer
+	State   *StateMachine
+	Diff    *DiffAnalyzer
+	Auditor *RiskAuditor
+	Impact  *ImpactAnalyzer
 
-	root       string
-	target     string
-	startedAt  time.Time
-	Result     *ReviewResult
+	root      string
+	target    string
+	startedAt time.Time
+	Result    *ReviewResult
 
-	retriever  Retriever
-	graph      *graph.Graph
+	retriever Retriever
+	graph     *graph.Graph
 }
 
 func NewEngine(root string, retriever Retriever, g *graph.Graph) *Engine {

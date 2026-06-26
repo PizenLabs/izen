@@ -5,7 +5,7 @@ import "time"
 type State int
 
 const (
-	StateCollect     State = iota
+	StateCollect State = iota
 	StateAnalyzeDiff
 	StateImpactRadius
 	StateRiskAudit
@@ -69,22 +69,22 @@ type DiffHunk struct {
 }
 
 type AffectedSymbol struct {
-	Name      string `json:"name"`
-	Kind      string `json:"kind"`
-	File      string `json:"file"`
-	Line      int    `json:"line"`
-	Impact    string `json:"impact"`
-	Exported  bool   `json:"exported"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+	Impact   string `json:"impact"`
+	Exported bool   `json:"exported"`
 }
 
 type ImpactRadius struct {
-	DirectFiles   []string          `json:"direct_files"`
-	IndirectFiles []string          `json:"indirect_files"`
-	AffectedPkgs  []string          `json:"affected_pkgs"`
-	AffectedSyms  []AffectedSymbol  `json:"affected_syms"`
-	ImportChains  []ImportChain     `json:"import_chains,omitempty"`
-	RiskScore     int               `json:"risk_score"`
-	Complexity    int               `json:"complexity"`
+	DirectFiles   []string         `json:"direct_files"`
+	IndirectFiles []string         `json:"indirect_files"`
+	AffectedPkgs  []string         `json:"affected_pkgs"`
+	AffectedSyms  []AffectedSymbol `json:"affected_syms"`
+	ImportChains  []ImportChain    `json:"import_chains,omitempty"`
+	RiskScore     int              `json:"risk_score"`
+	Complexity    int              `json:"complexity"`
 }
 
 type ImportChain struct {
@@ -115,20 +115,20 @@ type RiskFinding struct {
 }
 
 type ReviewResult struct {
-	Branch          string         `json:"branch"`
-	BaseBranch      string         `json:"base_branch"`
-	CommitHash      string         `json:"commit_hash"`
-	Commits         int            `json:"commits"`
-	FilesChanged    []DiffFile     `json:"files_changed"`
-	ImpactRadius    ImpactRadius   `json:"impact_radius"`
-	RiskFindings    []RiskFinding  `json:"risk_findings"`
-	Summary         string         `json:"summary"`
-	Score           int            `json:"score"`
-	Recommendations []string       `json:"recommendations"`
-	States          []State        `json:"states"`
-	Duration        string         `json:"duration"`
-	Error           string         `json:"error,omitempty"`
-	CreatedAt       time.Time      `json:"created_at"`
+	Branch          string        `json:"branch"`
+	BaseBranch      string        `json:"base_branch"`
+	CommitHash      string        `json:"commit_hash"`
+	Commits         int           `json:"commits"`
+	FilesChanged    []DiffFile    `json:"files_changed"`
+	ImpactRadius    ImpactRadius  `json:"impact_radius"`
+	RiskFindings    []RiskFinding `json:"risk_findings"`
+	Summary         string        `json:"summary"`
+	Score           int           `json:"score"`
+	Recommendations []string      `json:"recommendations"`
+	States          []State       `json:"states"`
+	Duration        string        `json:"duration"`
+	Error           string        `json:"error,omitempty"`
+	CreatedAt       time.Time     `json:"created_at"`
 }
 
 type Retriever interface {

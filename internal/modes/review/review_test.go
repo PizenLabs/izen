@@ -850,7 +850,7 @@ func TestImpactAnalyzerExtractAffectedSymbols(t *testing.T) {
 	dir := t.TempDir()
 	g := graph.NewGraph(dir)
 	g.AddFile(graph.FileNode{
-		Path:    "pkg/foo.go",
+		Path: "pkg/foo.go",
 		Symbols: []graph.Symbol{
 			{Name: "Foo", Kind: graph.SymbolFunction, File: "pkg/foo.go", Line: 1, Exported: true},
 			{Name: "helper", Kind: graph.SymbolFunction, File: "pkg/foo.go", Line: 10, Exported: false},

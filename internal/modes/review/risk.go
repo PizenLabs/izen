@@ -13,8 +13,8 @@ import (
 )
 
 type RiskAuditor struct {
-	root    string
-	rules   []RiskRule
+	root  string
+	rules []RiskRule
 }
 
 type RiskRule struct {

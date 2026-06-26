@@ -10,12 +10,12 @@ type SymbolRef struct {
 }
 
 type FileSlice struct {
-	Path    string     `json:"path"`
-	Package string     `json:"package,omitempty"`
+	Path    string      `json:"path"`
+	Package string      `json:"package,omitempty"`
 	Symbols []SymbolRef `json:"symbols,omitempty"`
-	Imports []string   `json:"imports,omitempty"`
-	Lines   int        `json:"lines"`
-	Size    int64      `json:"size"`
+	Imports []string    `json:"imports,omitempty"`
+	Lines   int         `json:"lines"`
+	Size    int64       `json:"size"`
 }
 
 type Context struct {
@@ -29,10 +29,10 @@ type Context struct {
 }
 
 type Stats struct {
-	FileCount   int    `json:"file_count"`
-	SymbolCount int    `json:"symbol_count"`
-	DiffLines   int    `json:"diff_lines"`
-	PromptChars int    `json:"prompt_chars"`
+	FileCount   int `json:"file_count"`
+	SymbolCount int `json:"symbol_count"`
+	DiffLines   int `json:"diff_lines"`
+	PromptChars int `json:"prompt_chars"`
 }
 
 func (c *Context) Stats() Stats {
