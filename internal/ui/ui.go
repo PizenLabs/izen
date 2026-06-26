@@ -1066,6 +1066,9 @@ func filterFilesRecursive(prefix string) []string {
 
 		// Skip hidden files/dirs at the root level, but allow hidden subdir matches.
 		name := d.Name()
+		if name == "." {
+			return nil
+		}
 		if strings.HasPrefix(name, ".") {
 			if d.IsDir() {
 				// Skip known noisy directories at any depth.
