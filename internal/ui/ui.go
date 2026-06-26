@@ -340,8 +340,6 @@ func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea
 	}
 	m.resolver.Set(sess.Mode)
 
-	// Compact intro — no ASCII art, minimal chrome
-	m.push(roleSystem, dimStyle.Render("type /help to get started — /ask /plan /build /investigate /review"))
 	m.records = append(m.records, record{role: roleSystem, text: ""})
 
 	return tea.NewProgram(m, tea.WithAltScreen())
@@ -512,48 +510,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyRunes:
-		s := string(msg.Runes)
-		m.input.WriteString(s)
-		current := m.input.String()
-
-		switch {
-		case current == "/":
-			m.showSuggestions = true
-			m.suggestionType = "/"
-			m.suggestions = m.filterCommands("")
-			m.suggestionIdx = 0
-
-		case current == "@":
-			m.showSuggestions = true
-			m.suggestionType = "@"
-			m.suggestions = filterFilesRecursive("")
-			m.suggestionIdx = 0
-
-		case m.showSuggestions && m.suggestionType == "/" && strings.HasPrefix(current, "/"):
-			m.suggestions = m.filterCommands(current[1:])
-			m.suggestionIdx = 0
-			if len(m.suggestions) == 1 && m.suggestions[0] == current {
-				m.showSuggestions = false
-			}
-
-		case m.showSuggestions && m.suggestionType == "@":
-			atIdx := strings.LastIndex(current, "@")
-			if atIdx >= 0 {
-				prefix := current[atIdx+1:]
-				m.suggestions = filterFilesRecursive(prefix)
-				m.suggestionIdx = 0
-				if len(m.suggestions) == 1 && m.suggestions[0] == prefix {
-					m.showSuggestions = false
-				}
-			} else {
-				m.dismissSuggestions()
-			}
-
-		default:
-			if m.showSuggestions {
-				m.dismissSuggestions()
-			}
-		}
+		m.input.WriteString(string(msg.Runes))
+		m.updateSuggestions()
 		return m, nil
 	}
 
@@ -564,15 +522,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 const (
 	// Fixed chrome lines consumed by non-body elements.
-	chromeHeader   = 1  // header line
-	chromeModeBar  = 1  // mode tab line
-	chromeTopDiv   = 1  // separator after mode bar
-	chromeBotDiv   = 1  // separator before status
-	chromeStatus   = 1  // status bar at very bottom
-	chromePrompt   = 2  // blank + gutter+label+chevron+input+cursor
-	chromeMaxSugg  = 14 // max lines for suggestion palette
-	chromeFixed    = chromeHeader + chromeModeBar + chromeTopDiv + chromeBotDiv + chromeStatus + chromePrompt
-	chromeReserved = chromeFixed + chromeMaxSugg // total reserved when suggestions visible
+	chromeHeader  = 1 // header line
+	chromeModeBar = 1 // mode tab line
+	chromeTopDiv  = 1 // separator after mode bar
+	chromeBotDiv  = 1 // separator before status
+	chromeStatus  = 1 // status bar at very bottom
+	chromePrompt  = 2 // blank + gutter+label+chevron+input+cursor
+	chromeFixed   = chromeHeader + chromeModeBar + chromeTopDiv + chromeBotDiv + chromeStatus + chromePrompt
 )
 
 func (m *model) View() string {
@@ -588,14 +544,13 @@ func (m *model) View() string {
 	botDiv := topDiv
 	status := m.renderStatusBar(width)
 
-	return lipgloss.JoinVertical(lipgloss.Top,
-		header,
-		modeBar,
-		topDiv,
-		body,
-		botDiv,
-		status,
-	)
+	parts := []string{header, modeBar, topDiv, body}
+	if m.showSuggestions && len(m.suggestions) > 0 {
+		parts = append(parts, "\n"+m.renderSuggestions(width))
+	}
+	parts = append(parts, botDiv, status)
+
+	return lipgloss.JoinVertical(lipgloss.Top, parts...)
 }
 
 // ── Code highlighting ──────────────────────────────────────────────────────────
@@ -700,7 +655,7 @@ func (m *model) renderBody(width int) string {
 		statusLines = 1
 	}
 
-	available := m.height - chromeFixed - chromeMaxSugg - statusLines
+	available := m.height - chromeFixed - statusLines
 	if available < 1 {
 		available = 1
 	}
@@ -756,25 +711,6 @@ func (m *model) renderBody(width int) string {
 			body.WriteString(aiGutter + streamStyle.Render(m.responseBuffer.String()) + "\n")
 		} else {
 			body.WriteString(aiGutter + sp + "  " + infoStyle.Render("thinking…") + "\n")
-		}
-	}
-
-	// Suggestion zone — always fills the reserved space to keep viewport stable.
-	if m.showSuggestions && len(m.suggestions) > 0 {
-		body.WriteString("\n")
-		m.renderSuggestions(&body, width)
-		// Pad remaining reserved lines so total height is predictable.
-		suggUsed := clampMin(len(m.suggestions), chromeMaxSugg-2) + 4
-		if suggUsed > chromeMaxSugg {
-			suggUsed = chromeMaxSugg
-		}
-		for i := suggUsed; i < chromeMaxSugg; i++ {
-			body.WriteString("\n")
-		}
-	} else {
-		// Fill reserved suggestion space with blank lines.
-		for i := 0; i < chromeMaxSugg; i++ {
-			body.WriteString("\n")
 		}
 	}
 
@@ -923,8 +859,8 @@ func (m *model) renderStatusBar(width int) string {
 
 // ── Suggestions ───────────────────────────────────────────────────────────────
 
-func (m *model) renderSuggestions(b *strings.Builder, width int) {
-	maxVisible := 12
+func (m *model) renderSuggestions(width int) string {
+	maxVisible := 6
 	items := m.suggestions
 	if len(items) > maxVisible {
 		items = items[:maxVisible]
@@ -933,18 +869,18 @@ func (m *model) renderSuggestions(b *strings.Builder, width int) {
 	var inner strings.Builder
 
 	if m.suggestionType == "@" {
-		inner.WriteString(paletteSectionStyle.Render("  files"))
+		inner.WriteString(paletteSectionStyle.Render("files"))
 		inner.WriteString("\n")
 		for i, s := range items {
 			if i == m.suggestionIdx {
-				inner.WriteString(paletteSelectedStyle.Render("  ❯ " + s))
+				inner.WriteString(paletteSelectedStyle.Render(" ❯ " + s))
 			} else {
-				inner.WriteString(paletteItemStyle.Render("    " + s))
+				inner.WriteString(paletteItemStyle.Render("   " + s))
 			}
 			inner.WriteString("\n")
 		}
 	} else {
-		inner.WriteString(paletteSectionStyle.Render("  command palette"))
+		inner.WriteString(paletteSectionStyle.Render("commands"))
 		inner.WriteString("\n")
 
 		prevCat := ""
@@ -957,7 +893,7 @@ func (m *model) renderSuggestions(b *strings.Builder, width int) {
 				case "core":
 					label = "modes"
 				case "utility":
-					label = "utilities · " + m.resolver.Current().String()
+					label = m.resolver.Current().String()
 				case "global":
 					label = "global"
 				}
@@ -970,22 +906,21 @@ func (m *model) renderSuggestions(b *strings.Builder, width int) {
 				baseStyle = paletteCoreItemStyle
 			}
 			if i == m.suggestionIdx {
-				inner.WriteString(paletteSelectedStyle.Render("  ❯ " + s))
+				inner.WriteString(paletteSelectedStyle.Render(" ❯ " + s))
 			} else {
-				inner.WriteString(baseStyle.Render("    " + s))
+				inner.WriteString(baseStyle.Render("   " + s))
 			}
 			inner.WriteString("\n")
 		}
 	}
 
-	inner.WriteString(paletteHintStyle.Render("  tab/shift-tab · enter confirm · esc dismiss"))
+	inner.WriteString(paletteHintStyle.Render("tab · enter · esc"))
 
-	boxWidth := 44
+	boxWidth := 40
 	if width < boxWidth+4 {
 		boxWidth = width - 4
 	}
-	rendered := paletteBoxStyle.Width(boxWidth).Render(inner.String())
-	b.WriteString(rendered)
+	return paletteBoxStyle.Width(boxWidth).Render(inner.String())
 }
 
 func (m *model) dismissSuggestions() {
@@ -1630,11 +1565,4 @@ func (m *model) expandFileRefs(line string) string {
 		return strings.Join(fields, " ")
 	}
 	return line
-}
-
-func clampMin(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
