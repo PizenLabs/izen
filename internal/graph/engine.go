@@ -69,6 +69,9 @@ func (e *Engine) LoadCache() (*Graph, error) {
 	}
 
 	for i := range g.Files {
+		if g.FileMap == nil {
+			g.FileMap = make(map[string]*FileNode)
+		}
 		g.FileMap[g.Files[i].Path] = &g.Files[i]
 	}
 
