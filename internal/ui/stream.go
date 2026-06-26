@@ -8,6 +8,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
 )
 
@@ -25,12 +27,17 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streaming = true
 	m.spinnerFrame = 0
 
+	msgs := []ai.Message{{Role: "user", Content: content}}
+
+	if m.resolver.Current() == modes.ModeBuild {
+		sys := prompt.BuildSystemPrompt()
+		msgs = append([]ai.Message{{Role: "system", Content: sys}}, msgs...)
+	}
+
 	req := ai.Request{
-		Model: m.cfg.ActiveModelName(),
-		Messages: []ai.Message{
-			{Role: "user", Content: content},
-		},
-		Stream: true,
+		Model:    m.cfg.ActiveModelName(),
+		Messages: msgs,
+		Stream:   true,
 	}
 
 	go func() {

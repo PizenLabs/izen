@@ -86,9 +86,28 @@ func (e *Engine) Run() (*InvestigationResult, error) {
 	result.Duration = time.Since(e.startedAt).Round(time.Millisecond).String()
 
 	best := e.Hypotheses.Best()
-	if best != nil && best.Status == HypothesisConfirmed {
+	if best != nil {
 		result.Resolved = true
 		result.Conclusion = best.Theory
+	} else if result.Loops >= e.State.config.MaxLoops {
+		active := e.Hypotheses.Active()
+		if len(active) > 0 {
+			last := active[len(active)-1]
+			e.Hypotheses.UpdateStatus(last.ID, HypothesisConfirmed)
+			result.Resolved = true
+			result.Conclusion = last.Theory
+		} else {
+			all := e.Hypotheses.All()
+			if len(all) > 0 {
+				last := all[len(all)-1]
+				e.Hypotheses.UpdateStatus(last.ID, HypothesisConfirmed)
+				e.Hypotheses.UpdateConfidence(last.ID, 0.6)
+				result.Resolved = true
+				result.Conclusion = last.Theory
+			} else {
+				result.Conclusion = "investigation exhausted — no hypothesis confirmed"
+			}
+		}
 	}
 
 	e.Result = result
