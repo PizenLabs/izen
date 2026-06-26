@@ -302,6 +302,8 @@ type model struct {
 	suggestionType  string
 	suggestions     []string
 	suggestionIdx   int
+
+	pendingFileRefs []string
 }
 
 func (m *model) push(r role, text string) {
@@ -465,6 +467,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				} else {
 					line = sel
 				}
+				m.pendingFileRefs = append(m.pendingFileRefs, sel)
 				m.dismissSuggestions()
 				m.input.WriteString(line)
 				return m, nil
@@ -1166,6 +1169,42 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
+	// Collect file contents from @-references before expansion strips them.
+	var fileCtx strings.Builder
+	for _, field := range strings.Fields(line) {
+		if !strings.HasPrefix(field, "@") {
+			continue
+		}
+		ref := filepath.Clean(field[1:])
+		if ref == "" || ref == "." {
+			continue
+		}
+		data, err := os.ReadFile(ref)
+		if err != nil {
+			continue
+		}
+		if fileCtx.Len() > 0 {
+			fileCtx.WriteString("\n\n")
+		}
+		ext := filepath.Ext(ref)
+		lang := strings.TrimPrefix(ext, ".")
+		fileCtx.WriteString(fmt.Sprintf("File: %s\n```%s\n%s\n```", ref, lang, string(data)))
+	}
+	// Also read files selected via @ autocomplete.
+	for _, path := range m.pendingFileRefs {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if fileCtx.Len() > 0 {
+			fileCtx.WriteString("\n\n")
+		}
+		ext := filepath.Ext(path)
+		lang := strings.TrimPrefix(ext, ".")
+		fileCtx.WriteString(fmt.Sprintf("File: %s\n```%s\n%s\n```", path, lang, string(data)))
+	}
+	m.pendingFileRefs = nil
+
 	line = m.expandFileRefs(line)
 
 	if strings.HasPrefix(line, "/") {
@@ -1187,6 +1226,10 @@ func (m *model) handleInput(line string) tea.Cmd {
 	content := stripModePrefix(line)
 	if content == "" {
 		return nil
+	}
+
+	if fileCtx.Len() > 0 {
+		content = fileCtx.String() + "\n\n" + content
 	}
 
 	switch m.resolver.Current() {
