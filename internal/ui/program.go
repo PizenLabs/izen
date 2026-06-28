@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"os"
+
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 )
 
+// NewProgram initializes the active model state context and instantiates the runner engine.
 func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea.Program {
 	eng := git.NewEngine(".")
 
@@ -46,7 +49,9 @@ func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea
 	m.loadHistory()
 	m.historyIndex = len(m.history)
 
-	// AltScreen: Bubble Tea owns 100% of the terminal.
-	// The viewport component handles all scrollable history.
-	return tea.NewProgram(m, tea.WithAltScreen())
+	opts := []tea.ProgramOption{tea.WithAltScreen()}
+	if os.Getenv("IZEN_MOUSE") != "0" {
+		opts = append(opts, tea.WithMouseCellMotion())
+	}
+	return tea.NewProgram(m, opts...)
 }

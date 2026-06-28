@@ -248,6 +248,7 @@ func (m *model) rebuildViewport() {
 	if !m.vpReady {
 		return
 	}
+	followBottom := m.vp.AtBottom()
 	var lines []string
 	if m.showBanner {
 		for _, l := range strings.Split(m.renderStartupBanner(m.width), "\n") {
@@ -288,8 +289,9 @@ func (m *model) rebuildViewport() {
 	m.viewLines = lines
 	m.vp.SetContent(strings.Join(lines, "\n"))
 
-	// Anchor scroll metrics cleanly down to the viewport base
-	m.vp.GotoBottom()
+	if followBottom {
+		m.vp.GotoBottom()
+	}
 }
 
 // appendViewLine appends a rendered line and synchronizes viewport tracking.

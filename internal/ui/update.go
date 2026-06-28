@@ -3,9 +3,12 @@ package ui
 import (
 	"fmt"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -18,6 +21,104 @@ func (m *model) Init() tea.Cmd {
 	return tea.Batch(tickCmd(), animTickCmd())
 }
 
+// ── Mouse leak interception ───────────────────────────────────────────────────
+//
+// Under tmux with `set mouse = on`, SGR mouse byte sequences bypass Bubbletea's
+// mouse decoder and arrive as raw tea.KeyMsg strings. The pattern is always:
+//
+//   [<BUTTON;COL;ROW M   (press)
+//   [<BUTTON;COL;ROW m   (release)
+//
+// tmux consumes the leading ESC so we only see the bare bracket form.
+// Each scroll tick emits multiple of these in rapid succession — that's why
+// the input box fills with repeated "[<64;78;16M[<64;78;16M..." strings.
+//
+// Strategy: detect the pattern at the earliest possible point (before the type
+// switch), parse the button byte, and dispatch as a real viewport action.
+
+var sgrMousePattern = regexp.MustCompile(`(?:\x1b)?\[<(\d+);(\d+);(\d+)([Mm])`)
+
+// parseSGRMouse parses an SGR mouse sequence of the form
+// "ESC[<BUTTON;COL;ROW M/m" or "[<BUTTON;COL;ROW M/m" and returns (button, col, row, press, ok).
+// button 64/65 = wheel up/down, 0 = left click.
+func parseSGRMouse(s string) (button, col, row int, press, ok bool) {
+	s = strings.TrimPrefix(s, "\x1b")
+	if !strings.HasPrefix(s, "[<") {
+		return
+	}
+	if !strings.HasSuffix(s, "M") && !strings.HasSuffix(s, "m") {
+		return
+	}
+	press = strings.HasSuffix(s, "M")
+	payload := s[2 : len(s)-1] // strip "[<" prefix and M/m suffix
+	parts := strings.Split(payload, ";")
+	if len(parts) != 3 {
+		return
+	}
+	var e1, e2, e3 error
+	button, e1 = strconv.Atoi(parts[0])
+	col, e2 = strconv.Atoi(parts[1])
+	row, e3 = strconv.Atoi(parts[2])
+	if e1 != nil || e2 != nil || e3 != nil {
+		return
+	}
+	ok = true
+	return
+}
+
+// isSGRMouseLeak returns true if s is a complete or partial SGR mouse sequence
+// that leaked through from tmux. Used as a fast pre-check before full parse.
+func isSGRMouseLeak(s string) bool {
+	if strings.Contains(s, "[<") || strings.Contains(s, "\x1b[<") {
+		return true
+	}
+	// X10 normal encoding fallback
+	if strings.HasPrefix(s, "\x1b[M") || strings.HasPrefix(s, "\x1b[m") {
+		return true
+	}
+	return false
+}
+
+func sgrMouseLeaks(s string) []string {
+	matches := sgrMousePattern.FindAllString(s, -1)
+	if len(matches) > 0 {
+		return matches
+	}
+	if isSGRMouseLeak(s) {
+		return []string{s}
+	}
+	return nil
+}
+
+// dispatchMouseLeak parses an SGR mouse leak string and executes the matching
+// viewport action. A single KeyMsg value may contain multiple concatenated
+// sequences (e.g. "[<64;78;16M[<64;78;16M") from fast scrolling — we split and
+// process each one.
+func (m *model) dispatchMouseLeak(s string) {
+	for _, seq := range sgrMouseLeaks(s) {
+		button, _, row, press, ok := parseSGRMouse(seq)
+		if !ok {
+			continue
+		}
+		if !press {
+			continue // ignore release events
+		}
+		switch button {
+		case 64: // wheel up
+			m.vp.LineUp(3)
+		case 65: // wheel down
+			m.vp.LineDown(3)
+		case 0, 1, 2: // mouse click — copy line under cursor
+			content := m.vp.View()
+			lines := strings.Split(content, "\n")
+			if row > 0 && row <= len(lines) {
+				line := strings.TrimRight(lines[row-1], " ")
+				_ = clipboard.WriteAll(line)
+			}
+		}
+	}
+}
+
 // Update acts as the central state machine processor routing keyboard events and framework messages.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
@@ -25,9 +126,50 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		tiCmd tea.Cmd
 	)
 
+	// ── STAGE 0: Pre-switch mouse intercept ──────────────────────────────────
+	// Check for KeyMsg containing SGR mouse leaks BEFORE the type switch.
+	// This is the earliest possible interception point and catches all variants
+	// including the concatenated multi-sequence strings seen in the screenshot.
+	if kmsg, ok := msg.(tea.KeyMsg); ok {
+		if isSGRMouseLeak(kmsg.String()) {
+			if m.vpReady {
+				m.dispatchMouseLeak(kmsg.String())
+			}
+			return m, nil // swallow entirely — do not fall through
+		}
+	}
+
+	// ── STAGE 1: Native tea.MouseMsg (when WithMouseCellMotion is active) ────
+	if _, isMouse := msg.(tea.MouseMsg); isMouse {
+		if !m.vpReady {
+			return m, nil
+		}
+		mouseMsg := msg.(tea.MouseMsg)
+		switch mouseMsg.Type {
+		case tea.MouseWheelUp:
+			m.vp.LineUp(3)
+			return m, nil
+		case tea.MouseWheelDown:
+			m.vp.LineDown(3)
+			return m, nil
+		case tea.MouseLeft:
+			content := m.vp.View()
+			lines := strings.Split(content, "\n")
+			if mouseMsg.Y < len(lines) {
+				line := lines[mouseMsg.Y]
+				line = strings.TrimRight(line, " ")
+				if err := clipboard.WriteAll(line); err != nil {
+					// Safely ignore clipboard engine warnings
+				}
+			}
+			return m, nil
+		}
+		return m, nil
+	}
+
 	switch msg := msg.(type) {
 
-	// ── Window Sizing — dynamic dimensions & viewport calculation ─────────────
+	// ── Window Sizing ─────────────────────────────────────────────────────────
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -40,8 +182,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.vp.YPosition = 0
 			m.vp.HighPerformanceRendering = false
 			m.vpReady = true
-
-			// Initialize initial state structure: display welcome banner on fresh boot
 			m.showBanner = true
 			m.rebuildViewport()
 		} else {
@@ -51,7 +191,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	// ── Spinner Tick (100ms Clocks) ───────────────────────────────────────────
+	// ── Spinner Tick (100ms) ──────────────────────────────────────────────────
 	case tickMsg:
 		if m.streaming || m.agentRunning {
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
@@ -61,7 +201,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tickCmd()
 
-	// ── Animation Tick (25ms Clocks) — mode line color fader ──────────────────
+	// ── Animation Tick (25ms) ─────────────────────────────────────────────────
 	case animTickMsg:
 		if m.lineAnimating {
 			m.lineAnimProgress += 25.0 / 150.0
@@ -72,7 +212,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, animTickCmd()
 
-	// ── Agent Async Core Pipelines ────────────────────────────────────────────
+	// ── Agent pipelines ───────────────────────────────────────────────────────
 	case agentDoneMsg:
 		m.agentRunning = false
 		m.agentDone = true
@@ -125,7 +265,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleStatus, fmt.Sprintf("amended as %s", msg.hash))
 		return m, nil
 
-	// ── LLM Token Data Streaming Engines ──────────────────────────────────────
+	// ── Streaming ─────────────────────────────────────────────────────────────
 	case tokenMsg:
 		m.responseBuffer.WriteString(string(msg))
 		if m.vpReady {
@@ -144,7 +284,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.responseBuffer.Reset()
 
-		// Run lines processing pipeline through high-fidelity code diff syntax scanner
 		highlighted := highlightOutput(final)
 		for _, l := range strings.Split(highlighted, "\n") {
 			m.records = append(m.records, record{role: roleAI, text: l})
@@ -160,8 +299,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			c := float64(m.tokenInput)*(3.0/1_000_000) + float64(m.tokenOutput)*(15.0/1_000_000)
 			costStr = fmt.Sprintf("$%.4f", c)
 		}
-		doneStr := fmt.Sprintf("✓ done  •  %s  •  %s", tokStr, costStr)
-		m.push(roleStatus, doneStr)
+		m.push(roleStatus, fmt.Sprintf("✓ done  •  %s  •  %s", tokStr, costStr))
 
 		if m.resolver.Current() == modes.ModeBuild && m.state != StateAwaitingApproval {
 			props := extractBuildProposals(final)
@@ -204,11 +342,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.pendingProposals = props
 					m.state = StateAwaitingApproval
 					m.awaitingConfirmation = true
-					msg := "proposed changes:"
+					proposalMsg := "proposed changes:"
 					for _, p := range props {
-						msg += fmt.Sprintf("\n  • %s", p.File)
+						proposalMsg += fmt.Sprintf("\n    • %s", p.File)
 					}
-					m.push(roleSystem, infoStyle.Render(msg))
+					m.push(roleSystem, infoStyle.Render(proposalMsg))
 				}
 			}
 		}
@@ -221,35 +359,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleError, "stream error: "+msg.err.Error())
 		return m, nil
 
-	// ── Mouse Scroll Interception ─────────────────────────────────────────────
-	case tea.MouseMsg:
-		// Enable native mouse wheel controls for viewport scrolling
-		if m.vpReady {
-			switch msg.Type {
-			case tea.MouseWheelUp:
-				m.vp.LineUp(3)
-				return m, nil
-			case tea.MouseWheelDown:
-				m.vp.LineDown(3)
-				return m, nil
-			}
-		}
-
-	// ── High-Fidelity Keyboard Navigation Event Interception ─────────────────
+	// ── Keyboard ──────────────────────────────────────────────────────────────
 	case tea.KeyMsg:
-		// Reset state trigger catch: intercept /clear sequence to pop banner back out
+		// Stage 0 already filtered all mouse leaks above — any KeyMsg reaching
+		// here is a genuine key event.
+
 		if strings.TrimSpace(m.ti.Value()) == "/clear" && msg.String() == "enter" {
 			m.showBanner = true
 		} else if msg.String() == "enter" && strings.TrimSpace(m.ti.Value()) != "" {
-			// On chat submission: hide banner immediately to maximize code layout real estate
 			m.showBanner = false
 		}
 
-		// Handle active prompt box commands history tracking with Up and Down arrows
 		if !m.showSuggestions && !m.streaming && !m.agentRunning {
 			switch msg.Type {
 			case tea.KeyUp:
-				// Cycle backwards through chat history
 				if len(m.history) > 0 {
 					if m.historyIndex == -1 {
 						m.historyIndex = len(m.history) - 1
@@ -262,7 +385,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case tea.KeyDown:
-				// Cycle forwards through chat history or empty if at end
 				if m.historyIndex != -1 {
 					if m.historyIndex < len(m.history)-1 {
 						m.historyIndex++
@@ -276,20 +398,30 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case tea.KeyPgUp, tea.KeyPgDown:
-				// Keep raw page-up and page-down directly targeting the chat history log viewport
 				m.vp, vpCmd = m.vp.Update(msg)
 				return m, vpCmd
 			}
 		}
 
-		// Route all remaining keystrokes (Enter, Left/Right, Chars, Autocomplete) into handleKey
 		resModel, cmd := m.handleKey(msg)
 		return resModel, cmd
 	}
 
-	// Dynamic fallback sequence propagation across active containers
+	// ── Fallback propagation ──────────────────────────────────────────────────
 	m.vp, vpCmd = m.vp.Update(msg)
-	m.ti, tiCmd = m.ti.Update(msg)
+
+	// Only forward genuine key events to the text input.
+	if kmsg, ok := msg.(tea.KeyMsg); ok {
+		// Stage 0 should have already caught these, but belt-and-suspenders.
+		if isSGRMouseLeak(kmsg.String()) {
+			m.ti, tiCmd = m.ti, nil
+		} else {
+			m.ti, tiCmd = m.ti.Update(msg)
+		}
+	} else {
+		m.ti, tiCmd = m.ti, nil
+	}
+
 	return m, tea.Batch(vpCmd, tiCmd)
 }
 
