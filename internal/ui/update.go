@@ -23,27 +23,9 @@ func (m *model) Init() tea.Cmd {
 }
 
 // ── Mouse leak interception ───────────────────────────────────────────────────
-//
-// Under tmux with `set mouse = on`, SGR mouse byte sequences bypass Bubbletea's
-// mouse decoder and arrive as raw tea.KeyMsg strings. The pattern is always:
-//
-//   [<BUTTON;COL;ROW M   (press)
-//   [<BUTTON;COL;ROW m   (release)
-//
-// tmux consumes the leading ESC so we only see the bare bracket form.
-// Each scroll tick emits multiple of these in rapid succession — that's why
-// the input box fills with repeated "[<64;78;16M[<64;78;16M..." strings.
-//
-// Strategy: detect the pattern at the earliest possible point (before the type
-// switch), parse the button byte, and dispatch as a real viewport action.
-
 var sgrMousePattern = regexp.MustCompile(`(?:\x1b)?\[<(\d+);(\d+);(\d+)([Mm])`)
-
-// mouseFragmentRegex targets broken or single-character escape remnants
-// that leak sequentially when scrolling past the top/bottom viewport boundaries.
 var mouseFragmentRegex = regexp.MustCompile(`\[<\d*;?\d*;?\d*[Mm]?`)
 
-// parseSGRMouse decodes raw SGR protocol payload dimensions.
 func parseSGRMouse(s string) (button, col, row int, press, ok bool) {
 	s = strings.TrimPrefix(s, "\x1b")
 	if !strings.HasPrefix(s, "[<") {
@@ -69,7 +51,6 @@ func parseSGRMouse(s string) (button, col, row int, press, ok bool) {
 	return
 }
 
-// isSGRMouseLeak performs structural heuristic scans for terminal control markers.
 func isSGRMouseLeak(s string) bool {
 	if strings.Contains(s, "[<") || strings.Contains(s, "\x1b[<") {
 		return true
@@ -80,7 +61,6 @@ func isSGRMouseLeak(s string) bool {
 	return false
 }
 
-// sgrMouseLeaks extracts well-formed discrete sequence components.
 func sgrMouseLeaks(s string) []string {
 	matches := sgrMousePattern.FindAllString(s, -1)
 	if len(matches) > 0 {
@@ -92,13 +72,15 @@ func sgrMouseLeaks(s string) []string {
 	return nil
 }
 
-// dispatchMouseLeak converts low-level control codes into viewport structural operations.
+// dispatchMouseLeak handles raw escape data stream from input buffer.
 func (m *model) dispatchMouseLeak(s string) {
 	for _, seq := range sgrMouseLeaks(s) {
 		button, col, row, press, ok := parseSGRMouse(seq)
 		if !ok {
 			continue
 		}
+
+		// Normalize Ghostty + Shift protocol bindings (buttons 0, 4, 32, 36)
 		switch button {
 		case 64: // Wheel up
 			if press {
@@ -108,16 +90,11 @@ func (m *model) dispatchMouseLeak(s string) {
 			if press {
 				m.vp.LineDown(3)
 			}
-		case 0, 32: // Left press/release and left-button motion
+		case 0, 4, 32, 36:
 			point, inside := m.viewportPoint(col-1, row-1)
-			if button == 32 && press {
-				if m.mouseSelecting && inside {
-					m.currentMouseRow = point.row
-					m.currentMouseCol = point.col
-				}
-				continue
-			}
-			if press {
+
+			// Handle mouse down press
+			if press && (button == 0 || button == 4) {
 				if inside {
 					m.mouseSelecting = true
 					m.startMouseRow = point.row
@@ -127,13 +104,26 @@ func (m *model) dispatchMouseLeak(s string) {
 				}
 				continue
 			}
-			if m.mouseSelecting {
-				m.mouseSelecting = false
-				end := mouseSelectionPoint{row: m.currentMouseRow, col: m.currentMouseCol}
-				if inside {
-					end = point
+
+			// Handle active motion updates
+			if press && (button == 32 || button == 36) {
+				if m.mouseSelecting && inside {
+					m.currentMouseRow = point.row
+					m.currentMouseCol = point.col
 				}
-				m.copyMouseSelection(end)
+				continue
+			}
+
+			// Absolute release safety guarantee trigger
+			if !press {
+				if m.mouseSelecting {
+					m.mouseSelecting = false
+					end := mouseSelectionPoint{row: m.currentMouseRow, col: m.currentMouseCol}
+					if inside {
+						end = point
+					}
+					m.copyMouseSelection(end)
+				}
 			}
 		}
 	}
@@ -144,14 +134,11 @@ type mouseSelectionPoint struct {
 	col int
 }
 
-// viewportPoint normalizes screen space tracking to underlying viewport coordinates.
-// It subtracts layout chromium heights like focusLineHeight to map accurately.
 func (m *model) viewportPoint(x, y int) (mouseSelectionPoint, bool) {
 	if !m.vpReady {
 		return mouseSelectionPoint{}, false
 	}
 
-	// Subtract focusLineHeight because the viewport is offset vertically by the top chrome header
 	adjustedY := y - focusLineHeight
 	if adjustedY < 0 || adjustedY >= m.vp.Height {
 		return mouseSelectionPoint{}, false
@@ -174,6 +161,7 @@ func selectedViewportText(lines []string, start, end mouseSelectionPoint) string
 
 	sRow, sCol := start.row, start.col
 	eRow, eCol := end.row, end.col
+
 	if sRow < 0 {
 		sRow = 0
 	}
@@ -186,6 +174,7 @@ func selectedViewportText(lines []string, start, end mouseSelectionPoint) string
 	if eRow >= len(lines) {
 		eRow = len(lines) - 1
 	}
+
 	if sRow > eRow || (sRow == eRow && sCol > eCol) {
 		sRow, eRow = eRow, sRow
 		sCol, eCol = eCol, sCol
@@ -193,59 +182,84 @@ func selectedViewportText(lines []string, start, end mouseSelectionPoint) string
 
 	var selected strings.Builder
 	for row := sRow; row <= eRow; row++ {
-		line := []rune(ansi.Strip(lines[row]))
+		rawLine := ansi.Strip(lines[row])
+		line := []rune(rawLine)
+		lineLen := len(line)
+
+		if lineLen == 0 {
+			if row < eRow {
+				selected.WriteByte('\n')
+			}
+			continue
+		}
+
 		startCol := 0
 		if row == sRow {
 			startCol = sCol
 		}
-		endCol := len(line)
+
+		endCol := lineLen
 		if row == eRow {
 			endCol = eCol + 1
 		}
+
 		if startCol < 0 {
 			startCol = 0
 		}
-		if startCol > len(line) {
-			startCol = len(line)
+		if startCol > lineLen {
+			startCol = lineLen
 		}
 		if endCol < 0 {
 			endCol = 0
 		}
-		if endCol > len(line) {
-			endCol = len(line)
+		if endCol > lineLen {
+			endCol = lineLen
 		}
 		if endCol < startCol {
 			endCol = startCol
 		}
 
-		selected.WriteString(strings.TrimRight(string(line[startCol:endCol]), " \t"))
+		chunk := string(line[startCol:endCol])
+		selected.WriteString(strings.TrimRight(chunk, " \t"))
+
 		if row < eRow {
 			selected.WriteByte('\n')
 		}
 	}
 
-	return strings.TrimRight(selected.String(), " \t\r\n")
+	return strings.TrimSpace(selected.String())
 }
 
 func (m *model) copyMouseSelection(end mouseSelectionPoint) {
-	text := selectedViewportText(m.viewLines, mouseSelectionPoint{
-		row: m.startMouseRow,
+	content := m.vp.View()
+	lines := strings.Split(content, "\n")
+	if len(lines) == 0 {
+		return
+	}
+
+	localStart := mouseSelectionPoint{
+		row: m.startMouseRow - m.vp.YOffset,
 		col: m.startMouseCol,
-	}, end)
+	}
+	localEnd := mouseSelectionPoint{
+		row: end.row - m.vp.YOffset,
+		col: end.col,
+	}
+
+	text := selectedViewportText(lines, localStart, localEnd)
 	if text != "" {
 		_ = clipboard.WriteAll(text)
 	}
 }
 
-// Update acts as the central state machine processor routing keyboard events and framework messages.
+// Update maps layout engines and routes state machines.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
 		vpCmd tea.Cmd
 		tiCmd tea.Cmd
 	)
 
-	// ── STAGE 0: Pre-switch mouse intercept ──────────────────────────────────
-	// Intercept incoming key messages if they match SGR escape signatures.
+	// ── STAGE 0: Pre-switch raw mouse tracking intercept ──────────────────────
 	if kmsg, ok := msg.(tea.KeyMsg); ok {
 		if isSGRMouseLeak(kmsg.String()) {
 			if m.vpReady {
@@ -255,13 +269,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// ── STAGE 1: Native tea.MouseMsg handling ───────────────────────────────
-	// Handles scroll wheels, click selections, and drag-to-copy sequences.
+	// ── STAGE 1: Standard unified system tea.MouseMsg handling ────────────────
 	if _, isMouse := msg.(tea.MouseMsg); isMouse {
 		if !m.vpReady {
 			return m, nil
 		}
 		mouseMsg := msg.(tea.MouseMsg)
+
+		// Unified scroll handling
 		if mouseMsg.Button == tea.MouseButtonWheelUp || mouseMsg.Type == tea.MouseWheelUp {
 			m.vp.LineUp(3)
 			return m, nil
@@ -271,20 +286,19 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Handle bubbletea standard mouse structure action events
 		switch mouseMsg.Action {
 		case tea.MouseActionPress:
-			if mouseMsg.Button == tea.MouseButtonLeft || mouseMsg.Type == tea.MouseLeft {
-				point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y)
-				if !ok {
-					m.mouseSelecting = false
-					return m, nil
-				}
-				m.mouseSelecting = true
-				m.startMouseRow = point.row
-				m.startMouseCol = point.col
-				m.currentMouseRow = point.row
-				m.currentMouseCol = point.col
+			point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y)
+			if !ok {
+				m.mouseSelecting = false
+				return m, nil
 			}
+			m.mouseSelecting = true
+			m.startMouseRow = point.row
+			m.startMouseCol = point.col
+			m.currentMouseRow = point.row
+			m.currentMouseCol = point.col
 			return m, nil
 
 		case tea.MouseActionMotion:
@@ -313,7 +327,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 
-	// ── Window Sizing ─────────────────────────────────────────────────────────
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -335,7 +348,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	// ── Spinner Tick (100ms) ──────────────────────────────────────────────────
 	case tickMsg:
 		if m.streaming || m.agentRunning {
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
@@ -345,7 +357,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tickCmd()
 
-	// ── Animation Tick (25ms) ─────────────────────────────────────────────────
 	case animTickMsg:
 		if m.lineAnimating {
 			m.lineAnimProgress += 25.0 / 150.0
@@ -356,7 +367,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, animTickCmd()
 
-	// ── Agent pipelines ───────────────────────────────────────────────────────
 	case agentDoneMsg:
 		m.agentRunning = false
 		m.agentDone = true
@@ -409,7 +419,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleStatus, fmt.Sprintf("amended as %s", msg.hash))
 		return m, nil
 
-	// ── Streaming ─────────────────────────────────────────────────────────────
 	case tokenMsg:
 		m.responseBuffer.WriteString(string(msg))
 		if m.vpReady {
@@ -503,7 +512,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleError, "stream error: "+msg.err.Error())
 		return m, nil
 
-	// ── Keyboard ──────────────────────────────────────────────────────────────
 	case tea.KeyMsg:
 		if strings.TrimSpace(m.ti.Value()) == "/clear" && msg.String() == "enter" {
 			m.showBanner = true
@@ -548,17 +556,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return resModel, cmd
 	}
 
-	// ── Fallback propagation ──────────────────────────────────────────────────
-	// ONLY send messages to viewport fallback when not actively tracking a selection sequence,
-	// preventing Bubbletea's native viewport component from overriding or clearing our capture loop metrics.
 	if !m.mouseSelecting {
 		m.vp, vpCmd = m.vp.Update(msg)
 	}
 
 	m.ti, tiCmd = m.ti.Update(msg)
 
-	// Fallback Guard: Scan and purge asynchronous sequence fragments or leaks
-	// from accumulating inside the text input field value.
 	val := m.ti.Value()
 	if strings.Contains(val, "[<") || mouseFragmentRegex.MatchString(val) {
 		cleanVal := mouseFragmentRegex.ReplaceAllString(val, "")
@@ -572,13 +575,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func tickCmd() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
-		return tickMsg(t)
-	})
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func animTickCmd() tea.Cmd {
-	return tea.Tick(25*time.Millisecond, func(t time.Time) tea.Msg {
-		return animTickMsg(t)
-	})
+	return tea.Tick(25*time.Millisecond, func(t time.Time) tea.Msg { return animTickMsg(t) })
 }

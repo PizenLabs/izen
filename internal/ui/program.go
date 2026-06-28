@@ -50,7 +50,7 @@ func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea
 	m.historyIndex = len(m.history)
 
 	opts := []tea.ProgramOption{tea.WithAltScreen()}
-	if os.Getenv("IZEN_MOUSE") != "0" {
+	if os.Getenv("IZEN_MOUSE") == "1" {
 		opts = append(opts, tea.WithMouseCellMotion())
 	}
 	return tea.NewProgram(m, opts...)
