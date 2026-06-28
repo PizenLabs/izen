@@ -38,9 +38,11 @@ func (m *model) Init() tea.Cmd {
 
 var sgrMousePattern = regexp.MustCompile(`(?:\x1b)?\[<(\d+);(\d+);(\d+)([Mm])`)
 
-// parseSGRMouse parses an SGR mouse sequence of the form
-// "ESC[<BUTTON;COL;ROW M/m" or "[<BUTTON;COL;ROW M/m" and returns (button, col, row, press, ok).
-// button 64/65 = wheel up/down, 0 = left click.
+// mouseFragmentRegex targets broken or single-character escape remnants
+// that leak sequentially when scrolling past the top/bottom viewport boundaries.
+var mouseFragmentRegex = regexp.MustCompile(`\[<\d*;?\d*;?\d*[Mm]?`)
+
+// parseSGRMouse decodes raw SGR protocol payload dimensions.
 func parseSGRMouse(s string) (button, col, row int, press, ok bool) {
 	s = strings.TrimPrefix(s, "\x1b")
 	if !strings.HasPrefix(s, "[<") {
@@ -50,7 +52,7 @@ func parseSGRMouse(s string) (button, col, row int, press, ok bool) {
 		return
 	}
 	press = strings.HasSuffix(s, "M")
-	payload := s[2 : len(s)-1] // strip "[<" prefix and M/m suffix
+	payload := s[2 : len(s)-1]
 	parts := strings.Split(payload, ";")
 	if len(parts) != 3 {
 		return
@@ -66,19 +68,18 @@ func parseSGRMouse(s string) (button, col, row int, press, ok bool) {
 	return
 }
 
-// isSGRMouseLeak returns true if s is a complete or partial SGR mouse sequence
-// that leaked through from tmux. Used as a fast pre-check before full parse.
+// isSGRMouseLeak performs structural heuristic scans for terminal control markers.
 func isSGRMouseLeak(s string) bool {
 	if strings.Contains(s, "[<") || strings.Contains(s, "\x1b[<") {
 		return true
 	}
-	// X10 normal encoding fallback
 	if strings.HasPrefix(s, "\x1b[M") || strings.HasPrefix(s, "\x1b[m") {
 		return true
 	}
 	return false
 }
 
+// sgrMouseLeaks extracts well-formed discrete sequence components.
 func sgrMouseLeaks(s string) []string {
 	matches := sgrMousePattern.FindAllString(s, -1)
 	if len(matches) > 0 {
@@ -90,30 +91,31 @@ func sgrMouseLeaks(s string) []string {
 	return nil
 }
 
-// dispatchMouseLeak parses an SGR mouse leak string and executes the matching
-// viewport action. A single KeyMsg value may contain multiple concatenated
-// sequences (e.g. "[<64;78;16M[<64;78;16M") from fast scrolling — we split and
-// process each one.
+// dispatchMouseLeak converts low-level control codes into viewport structural operations.
 func (m *model) dispatchMouseLeak(s string) {
 	for _, seq := range sgrMouseLeaks(s) {
 		button, _, row, press, ok := parseSGRMouse(seq)
-		if !ok {
+		if !ok || !press {
 			continue
 		}
-		if !press {
-			continue // ignore release events
-		}
 		switch button {
-		case 64: // wheel up
+		case 64: // Wheel up
 			m.vp.LineUp(3)
-		case 65: // wheel down
+		case 65: // Wheel down
 			m.vp.LineDown(3)
-		case 0, 1, 2: // mouse click — copy line under cursor
+		case 0, 1, 2: // Left/Middle/Right click from raw SGR streams
+			if !m.vpReady {
+				continue
+			}
 			content := m.vp.View()
 			lines := strings.Split(content, "\n")
-			if row > 0 && row <= len(lines) {
-				line := strings.TrimRight(lines[row-1], " ")
-				_ = clipboard.WriteAll(line)
+			// SGR rows are 1-indexed. Offset by focusLineHeight to map correctly into the viewport space.
+			visualRow := row - 1 - focusLineHeight
+			if visualRow >= 0 && visualRow < len(lines) {
+				line := strings.TrimRight(lines[visualRow], " ")
+				if line != "" {
+					_ = clipboard.WriteAll(line)
+				}
 			}
 		}
 	}
@@ -127,19 +129,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	)
 
 	// ── STAGE 0: Pre-switch mouse intercept ──────────────────────────────────
-	// Check for KeyMsg containing SGR mouse leaks BEFORE the type switch.
-	// This is the earliest possible interception point and catches all variants
-	// including the concatenated multi-sequence strings seen in the screenshot.
+	// Intercept incoming key messages if they match SGR escape signatures.
 	if kmsg, ok := msg.(tea.KeyMsg); ok {
 		if isSGRMouseLeak(kmsg.String()) {
 			if m.vpReady {
 				m.dispatchMouseLeak(kmsg.String())
 			}
-			return m, nil // swallow entirely — do not fall through
+			return m, nil
 		}
 	}
 
-	// ── STAGE 1: Native tea.MouseMsg (when WithMouseCellMotion is active) ────
+	// ── STAGE 1: Native tea.MouseMsg handling ───────────────────────────────
+	// Handles mouse signals routed when WithMouseCellMotion context flags are enabled.
 	if _, isMouse := msg.(tea.MouseMsg); isMouse {
 		if !m.vpReady {
 			return m, nil
@@ -155,11 +156,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.MouseLeft:
 			content := m.vp.View()
 			lines := strings.Split(content, "\n")
-			if mouseMsg.Y < len(lines) {
-				line := lines[mouseMsg.Y]
+			// Normalize Y-axis to match the structural viewport position by subtracting layout offset height.
+			visualRow := mouseMsg.Y - focusLineHeight
+			if visualRow >= 0 && visualRow < len(lines) {
+				line := lines[visualRow]
 				line = strings.TrimRight(line, " ")
-				if err := clipboard.WriteAll(line); err != nil {
-					// Safely ignore clipboard engine warnings
+				if line != "" {
+					_ = clipboard.WriteAll(line)
 				}
 			}
 			return m, nil
@@ -361,9 +364,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ── Keyboard ──────────────────────────────────────────────────────────────
 	case tea.KeyMsg:
-		// Stage 0 already filtered all mouse leaks above — any KeyMsg reaching
-		// here is a genuine key event.
-
 		if strings.TrimSpace(m.ti.Value()) == "/clear" && msg.String() == "enter" {
 			m.showBanner = true
 		} else if msg.String() == "enter" && strings.TrimSpace(m.ti.Value()) != "" {
@@ -409,17 +409,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ── Fallback propagation ──────────────────────────────────────────────────
 	m.vp, vpCmd = m.vp.Update(msg)
+	m.ti, tiCmd = m.ti.Update(msg)
 
-	// Only forward genuine key events to the text input.
-	if kmsg, ok := msg.(tea.KeyMsg); ok {
-		// Stage 0 should have already caught these, but belt-and-suspenders.
-		if isSGRMouseLeak(kmsg.String()) {
-			m.ti, tiCmd = m.ti, nil
-		} else {
-			m.ti, tiCmd = m.ti.Update(msg)
+	// Fallback Guard: Scan and purge asynchronous sequence fragments or leaks
+	// from accumulating inside the text input field value.
+	val := m.ti.Value()
+	if strings.Contains(val, "[<") || mouseFragmentRegex.MatchString(val) {
+		cleanVal := mouseFragmentRegex.ReplaceAllString(val, "")
+		if cleanVal != val {
+			m.ti.SetValue(cleanVal)
+			m.ti.CursorEnd()
 		}
-	} else {
-		m.ti, tiCmd = m.ti, nil
 	}
 
 	return m, tea.Batch(vpCmd, tiCmd)
