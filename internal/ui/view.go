@@ -43,14 +43,14 @@ func (m *model) View() string {
 	return strings.Join(sections, "\n")
 }
 
-// ── Focus line ────────────────────────────────────────────────────────────────
+// ── Focus line ────────────────────────────────────────────────────────────
 
 func (m *model) renderFocusLine(width int) string {
 	color := animLineColor(m)
 	return lipgloss.NewStyle().Foreground(color).Render(strings.Repeat("─", width))
 }
 
-// ── Prompt box ────────────────────────────────────────────────────────────────
+// ── Prompt box ────────────────────────────────────────────────────────────
 
 func (m *model) renderPromptBox(width int) string {
 	mode := m.resolver.Current()
@@ -80,16 +80,31 @@ func (m *model) renderPromptBox(width int) string {
 		Render(inner)
 }
 
-// ── Status bar ────────────────────────────────────────────────────────────────
+// ── Status bar ────────────────────────────────────────────────────────────
 
 func (m *model) renderStatusBar(width int) string {
-	wd, _ := os.Getwd()
-	shortWd := shortenPath(wd)
+	// Get the path to display: prefer attached file, then pending file ref, then cwd
+	var displayPath string
+	if len(m.attachedFiles) > 0 {
+		displayPath = m.attachedFiles[0]
+	} else if len(m.pendingFileRefs) > 0 {
+		displayPath = m.pendingFileRefs[0]
+	} else {
+		wd, _ := os.Getwd()
+		displayPath = wd
+	}
+
+	// Shorten the path by replacing home directory with ~
+	home, _ := os.UserHomeDir()
+	if strings.HasPrefix(displayPath, home) {
+		displayPath = "~" + displayPath[len(home):]
+	}
+
 	branch, _ := m.gitEng.Branch()
 
 	// 1. Build Left Side (Context Path tracking)
 	var left strings.Builder
-	left.WriteString(statusLeftStyle.Render(shortWd))
+	left.WriteString(statusLeftStyle.Render(displayPath))
 
 	// Only display git branch details if we have enough horizontal layout width
 	if branch != "" && width >= 90 {
@@ -145,9 +160,23 @@ func (m *model) renderStatusBar(width int) string {
 		if !m.resolver.Current().ReadOnly() {
 			safeStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange)).Render("write")
 		}
-		cleanStr := dimStyle.Render("clean")
-		if m.awaitingConfirmation {
-			cleanStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render("pending")
+		// Removed static "clean" indicator as per directive
+
+		// For cloud providers, show separate input/output tokens
+		if provider != "ollama" {
+			// Format: "In: Xk - Out: Yk"
+			var inStr, outStr string
+			if m.tokenInput >= 1000 {
+				inStr = fmt.Sprintf("%.1fk", float64(m.tokenInput)/1000)
+			} else {
+				inStr = fmt.Sprintf("%d", m.tokenInput)
+			}
+			if m.tokenOutput >= 1000 {
+				outStr = fmt.Sprintf("%.1fk", float64(m.tokenOutput)/1000)
+			} else {
+				outStr = fmt.Sprintf("%d", m.tokenOutput)
+			}
+			tokStr = fmt.Sprintf("In: %s - Out: %s", inStr, outStr)
 		}
 
 		rightParts = []string{
@@ -155,7 +184,6 @@ func (m *model) renderStatusBar(width int) string {
 			statusRightStyle.Render(tokStr),
 			statusRightStyle.Render(costStr),
 			safeStr,
-			cleanStr,
 		}
 	}
 
@@ -172,7 +200,7 @@ func (m *model) renderStatusBar(width int) string {
 	return left.String() + strings.Repeat(" ", gap) + right
 }
 
-// ── Startup banner ────────────────────────────────────────────────────────────
+// ── Startup banner ────────────────────────────────────────────────────────
 
 var bannerModes = []struct{ name, desc string }{
 	{"/ask", "explain, inspect, understand"},
@@ -269,14 +297,14 @@ func (m *model) renderStartupBanner(termWidth int) string {
 }
 
 func padRight(s string, n int) string {
-	sw := lipgloss.Width(s)
+	sw := len(s)
 	if sw >= n {
 		return s
 	}
 	return s + strings.Repeat(" ", n-sw)
 }
 
-// ── Record renderer (for viewport content) ────────────────────────────────────
+// ── Record renderer (for viewport content) ────────────────────────────────
 
 func (m *model) printRecord(rec record) string {
 	gutter := gutterFor(rec.role)
@@ -302,22 +330,6 @@ func (m *model) printRecord(rec record) string {
 
 		var currentLine strings.Builder
 		for _, word := range words {
-			if len(word) > maxW {
-				if currentLine.Len() > 0 {
-					chunks = append(chunks, currentLine.String())
-					currentLine.Reset()
-				}
-				runes := []rune(word)
-				for i := 0; i < len(runes); i += maxW {
-					end := i + maxW
-					if end > len(runes) {
-						end = len(runes)
-					}
-					chunks = append(chunks, string(runes[i:end]))
-				}
-				continue
-			}
-
 			if currentLine.Len()+1+len(word) > maxW {
 				chunks = append(chunks, currentLine.String())
 				currentLine.Reset()
@@ -410,22 +422,6 @@ func (m *model) renderAdvancedDiff(diffContent string) string {
 
 		var currentLine strings.Builder
 		for _, word := range words {
-			if len(word) > maxW {
-				if currentLine.Len() > 0 {
-					chunks = append(chunks, currentLine.String())
-					currentLine.Reset()
-				}
-				runes := []rune(word)
-				for i := 0; i < len(runes); i += maxW {
-					end := i + maxW
-					if end > len(runes) {
-						end = len(runes)
-					}
-					chunks = append(chunks, string(runes[i:end]))
-				}
-				continue
-			}
-
 			if currentLine.Len()+1+len(word) > maxW {
 				chunks = append(chunks, currentLine.String())
 				currentLine.Reset()
@@ -511,7 +507,7 @@ func (m *model) renderAdvancedDiff(diffContent string) string {
 	return strings.Join(renderedLines, "\n")
 }
 
-// ── Confirmation dialog ───────────────────────────────────────────────────────
+// ── Confirmation dialog ───────────────────────────────────────────────────
 
 func (m *model) renderConfirmation(width int) string {
 	var inner strings.Builder

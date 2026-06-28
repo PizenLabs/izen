@@ -22,7 +22,8 @@ func (m *model) Init() tea.Cmd {
 	return tea.Batch(tickCmd(), animTickCmd())
 }
 
-// ── Mouse leak interception ───────────────────────────────────────────────────
+// ── Mouse leak interception ──────────────────────────────────────────────────
+
 var sgrMousePattern = regexp.MustCompile(`(?:\x1b)?\[<(\d+);(\d+);(\d+)([Mm])`)
 var mouseFragmentRegex = regexp.MustCompile(`\[<\d*;?\d*;?\d*[Mm]?`)
 
@@ -129,11 +130,13 @@ func (m *model) dispatchMouseLeak(s string) {
 	}
 }
 
+// mouseSelectionPoint represents a point in the viewport.
 type mouseSelectionPoint struct {
 	row int
 	col int
 }
 
+// viewportPoint converts viewport-relative coordinates to buffer coordinates.
 func (m *model) viewportPoint(x, y int) (mouseSelectionPoint, bool) {
 	if !m.vpReady {
 		return mouseSelectionPoint{}, false
@@ -158,6 +161,7 @@ func (m *model) viewportPoint(x, y int) (mouseSelectionPoint, bool) {
 	return mouseSelectionPoint{row: m.vp.YOffset + adjustedY, col: x}, true
 }
 
+// selectedViewportText returns the selected text in the viewport.
 func selectedViewportText(lines []string, start, end mouseSelectionPoint) string {
 	if len(lines) == 0 {
 		return ""
@@ -234,6 +238,7 @@ func selectedViewportText(lines []string, start, end mouseSelectionPoint) string
 	return strings.TrimSpace(selected.String())
 }
 
+// copyMouseSelection copies the selected text to the clipboard.
 func (m *model) copyMouseSelection(end mouseSelectionPoint) {
 	content := m.vp.View()
 	lines := strings.Split(content, "\n")
@@ -446,17 +451,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.records = append(m.records, record{role: roleAI, text: l})
 		}
 
-		total := m.tokenInput + m.tokenOutput
-		tokStr := fmt.Sprintf("%d/32k tokens", total)
-		if total >= 1000 {
-			tokStr = fmt.Sprintf("%.1fk/32k tokens", float64(total)/1000)
+		// Show delta tokens for this turn in the status message
+		delta := msg.tokenInput + msg.tokenOutput
+		deltaStr := fmt.Sprintf("%d", delta)
+		if delta >= 1000 {
+			deltaStr = fmt.Sprintf("%.1fk", float64(delta)/1000)
 		}
 		costStr := "$0.00"
 		if m.cfg.ActiveProviderName() != "ollama" {
 			c := float64(m.tokenInput)*(3.0/1_000_000) + float64(m.tokenOutput)*(15.0/1_000_000)
 			costStr = fmt.Sprintf("$%.4f", c)
 		}
-		m.push(roleStatus, fmt.Sprintf("✓ done  •  %s  •  %s", tokStr, costStr))
+		m.push(roleStatus, fmt.Sprintf("done - +%s tokens (this turn)  •  %s", deltaStr, costStr))
 
 		if m.resolver.Current() == modes.ModeBuild && m.state != StateAwaitingApproval {
 			props := extractBuildProposals(final)
@@ -546,6 +552,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else {
 						m.historyIndex = -1
 						m.ti.SetValue("")
+						m.ti.CursorEnd()
 					}
 				}
 				return m, nil
