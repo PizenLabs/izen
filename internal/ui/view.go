@@ -10,6 +10,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 )
 
+// View renders the entire multi-pane TUI architecture layout.
 func (m *model) View() string {
 	if !m.vpReady {
 		return "initializing…"
@@ -66,11 +67,10 @@ func (m *model) renderPromptBox(width int) string {
 		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)])
 		inner = prefix + " " + sp + "  " + infoStyle.Render("thinking…")
 	} else {
-		// Static solid block cursor for a distraction-free typing workspace
-		cursor := lipgloss.NewStyle().
-			Foreground(modeColor).
-			Render("█")
-		inner = prefix + " " + outputStyle.Render(m.ti.Value()) + cursor
+		// FIX: Use m.ti.View() directly to let the component control the cursor's visual position.
+		// Set the active styling directly onto the component wrapper to guarantee seamless cursor syncing.
+		m.ti.Cursor.Style = lipgloss.NewStyle().Foreground(modeColor)
+		inner = prefix + " " + m.ti.View()
 	}
 
 	return lipgloss.NewStyle().
@@ -181,7 +181,7 @@ func (m *model) renderStartupBanner(termWidth int) string {
 	}
 
 	const robotW = 8
-	const sep = "   "
+	const sep = "  "
 
 	rightCol := []string{
 		acS.Render("IZEN"),
@@ -273,12 +273,10 @@ func (m *model) printRecord(rec record) string {
 }
 
 // Internal professional engine for rendering clean code diff blocks with precise line metrics.
-// Splits lines before adding gutters to guarantee word-wrapped chunks obey container dimensions.
 func (m *model) renderAdvancedDiff(diffContent string) string {
 	lines := strings.Split(diffContent, "\n")
 	var renderedLines []string
 
-	// Premium low-contrast dark mode color palette configuration
 	styleDeletion := lipgloss.NewStyle().Background(lipgloss.Color("#3a1e24")).Foreground(lipgloss.Color("#f1707a"))
 	styleAddition := lipgloss.NewStyle().Background(lipgloss.Color("#18302b")).Foreground(lipgloss.Color("#6cd0a1"))
 
@@ -287,13 +285,11 @@ func (m *model) renderAdvancedDiff(diffContent string) string {
 	styleNormalText := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 	styleNormalGutter := lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 
-	// Dynamically calculate the safe text container width (leaving 12 chars for the line gutter layout)
 	contentWidth := m.width - 12
 	if contentWidth < 30 {
 		contentWidth = 30
 	}
 
-	// Helper inline function to forcefully split any long string by character count safely
 	wrapStringToWidth := func(text string, maxW int) []string {
 		if len(text) == 0 {
 			return []string{""}
@@ -301,7 +297,6 @@ func (m *model) renderAdvancedDiff(diffContent string) string {
 		var chunks []string
 		words := strings.Fields(text)
 		if len(words) == 0 {
-			// If it's a long string of continuous characters without spaces (e.g. minified code)
 			runes := []rune(text)
 			for i := 0; i < len(runes); i += maxW {
 				end := i + maxW
@@ -387,7 +382,7 @@ func (m *model) renderConfirmation(width int) string {
 	inner.WriteString("\n")
 	inner.WriteString(confirmDimStyle.Render("  proposed file changes:"))
 	for _, p := range m.pendingProposals {
-		inner.WriteString("\n  " + confirmFileStyle.Render("   "+p.File))
+		inner.WriteString("\n  " + confirmFileStyle.Render("    "+p.File))
 	}
 	inner.WriteString("\n")
 	inner.WriteString(confirmKeyStyle.Render("  [1] Accept") + confirmDescStyle.Render("  apply this batch"))

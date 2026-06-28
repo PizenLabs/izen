@@ -118,8 +118,8 @@ var utilityCommands = map[modes.Mode][]string{
 var globalCommands = []string{"/help", "/mode", "/objective", "/drop", "/quit"}
 
 // ── Elegant spinner frames ────────────────────────────────────────────────────
-// Geometric rotation: │ ╱ ── ╲  (subtle, not organic)
-var spinnerFrames = []string{"│", "╱", "──", "╲", "│", "╱", "──", "╲"}
+// Geometric Crystal Spin: High-density symmetric star-bloom rotational cycles
+var spinnerFrames = []string{" ⊹ ", " ⁕ ", " ⚙ ", " ❃ ", " ❄ ", " ❆ ", " ❃ ", " ⚙ ", " ⁕ ", " ⊹ "}
 
 // ── Model ─────────────────────────────────────────────────────────────────────
 

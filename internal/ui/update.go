@@ -240,14 +240,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Intercept Left/Right key controls so cursor shifts seamlessly inside input box
-		switch msg.Type {
-		case tea.KeyLeft, tea.KeyRight:
-			m.ti, tiCmd = m.ti.Update(msg)
-			return m, tiCmd
-		}
-
-		return m.handleKey(msg)
+		// Route all keystrokes into your custom autocomplete / interaction logic pipeline.
+		// handleKey handles updating the text input fields internally and returns the updated model/commands.
+		resModel, cmd := m.handleKey(msg)
+		return resModel, cmd
 	}
 
 	// Dynamic fallback sequence propagation across active containers
