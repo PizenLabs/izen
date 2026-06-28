@@ -38,4 +38,5 @@ vendor/
 *.swp
 *.swo
 .commit_suggest_history.json
+ignore.md
 

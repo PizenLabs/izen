@@ -56,7 +56,7 @@ func (m *model) renderPromptBox(width int) string {
 	mode := m.resolver.Current()
 	modeColor := modeLineColor(mode)
 	prefixStyle := lipgloss.NewStyle().Bold(true).Foreground(modeColor)
-	prefix := prefixStyle.Render(mode.String() + ">")
+	prefix := prefixStyle.Render(mode.String() + " ❯")
 
 	var inner string
 	if m.agentRunning {
