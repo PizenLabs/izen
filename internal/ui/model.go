@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
@@ -118,7 +119,6 @@ var utilityCommands = map[modes.Mode][]string{
 var globalCommands = []string{"/help", "/mode", "/objective", "/drop", "/quit"}
 
 // ── Elegant spinner frames ────────────────────────────────────────────────────
-// Geometric Crystal Spin: High-density symmetric star-bloom rotational cycles
 var spinnerFrames = []string{" ⊹ ", " ⁕ ", " ⚙ ", " ❃ ", " ❄ ", " ❆ ", " ❃ ", " ⚙ ", " ⁕ ", " ⊹ "}
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -208,6 +208,41 @@ func (m *model) viewportHeight() int {
 	return h
 }
 
+// wrapStreamText wraps raw text lines dynamically during an active live stream.
+func wrapStreamText(text string, maxW int) []string {
+	if len(text) == 0 {
+		return []string{""}
+	}
+	var chunks []string
+	lines := strings.Split(text, "\n")
+
+	for _, line := range lines {
+		words := strings.Fields(line)
+		if len(words) == 0 {
+			chunks = append(chunks, "")
+			continue
+		}
+
+		var currentLine strings.Builder
+		for _, word := range words {
+			if currentLine.Len()+1+len(word) > maxW {
+				chunks = append(chunks, currentLine.String())
+				currentLine.Reset()
+				currentLine.WriteString(word)
+			} else {
+				if currentLine.Len() > 0 {
+					currentLine.WriteString(" ")
+				}
+				currentLine.WriteString(word)
+			}
+		}
+		if currentLine.Len() > 0 {
+			chunks = append(chunks, currentLine.String())
+		}
+	}
+	return chunks
+}
+
 // rebuildViewport re-renders all records into the viewport content.
 func (m *model) rebuildViewport() {
 	if !m.vpReady {
@@ -223,67 +258,70 @@ func (m *model) rebuildViewport() {
 	for _, rec := range m.records {
 		lines = append(lines, m.printRecord(rec))
 	}
-	// Streaming in-progress: show live buffer
+
+	// Live streaming: wrap incoming chunk buffer on-the-fly to enforce terminal boundary safety
 	if m.streaming && m.responseBuffer.Len() > 0 {
 		gutter := gutterAIStyle.Render("▌") + " "
-		for _, l := range strings.Split(m.responseBuffer.String(), "\n") {
+		availableWidth := m.width - 2
+		if availableWidth < 20 {
+			availableWidth = 20
+		}
+
+		wrappedStream := wrapStreamText(m.responseBuffer.String(), availableWidth)
+		for _, l := range wrappedStream {
 			lines = append(lines, gutter+l)
 		}
 	} else if m.streaming {
-		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame])
+		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)])
 		lines = append(lines, gutterAIStyle.Render("▌")+" "+sp+"  "+infoStyle.Render("thinking…"))
 	}
+
 	if m.agentRunning {
-		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame])
-		label := lipglossColor(colorYellow).Render(m.agentLabel + "…")
+		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)])
+		label := lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render(m.agentLabel + "…")
 		lines = append(lines, gutterAIStyle.Render("▌")+" "+sp+"  "+label)
 	}
 	if m.awaitingConfirmation && len(m.pendingProposals) > 0 {
 		lines = append(lines, m.renderConfirmation(m.width))
 	}
+
 	m.viewLines = lines
 	m.vp.SetContent(strings.Join(lines, "\n"))
+
+	// Anchor scroll metrics cleanly down to the viewport base
 	m.vp.GotoBottom()
 }
 
-// appendViewLine appends a rendered line (which may contain multiple visual lines due to wrapping)
-// and updates viewport.
+// appendViewLine appends a rendered line and synchronizes viewport tracking.
 func (m *model) appendViewLine(line string) {
-	// Split the input line by newlines to get individual visual lines
 	visualLines := strings.Split(line, "\n")
-	// Add each visual line to our buffer
 	m.viewLines = append(m.viewLines, visualLines...)
-	// Update the viewport content
 	m.vp.SetContent(strings.Join(m.viewLines, "\n"))
-	// Scroll to bottom
 	m.vp.GotoBottom()
 }
 
 // ── Record helpers ─────────────────────────────────────────────────────────────
 
 func (m *model) push(r role, text string) {
-	lines := strings.Split(text, "\n")
-	for _, l := range lines {
-		rec := record{role: r, text: l}
-		m.records = append(m.records, rec)
-		if m.vpReady {
-			m.appendViewLine(m.printRecord(rec))
-		}
+	// Preserve complete original string to let printRecord's advanced layout algorithms resolve wrapping
+	rec := record{role: r, text: text}
+	m.records = append(m.records, rec)
+
+	if m.vpReady {
+		m.rebuildViewport()
 	}
 }
 
 func (m *model) pushLines(r role, lines []string) {
-	for _, l := range lines {
-		m.push(r, l)
-	}
+	m.push(r, strings.Join(lines, "\n"))
 }
 
 func (m *model) pushRecords(recs []record) {
 	for _, rec := range recs {
 		m.records = append(m.records, rec)
-		if m.vpReady {
-			m.appendViewLine(m.printRecord(rec))
-		}
+	}
+	if m.vpReady {
+		m.rebuildViewport()
 	}
 }
 

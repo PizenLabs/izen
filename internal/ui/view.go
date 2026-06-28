@@ -23,7 +23,7 @@ func (m *model) View() string {
 
 	var sections []string
 
-	// 1. Viewport (Manages the entire scrollable conversation history + dynamic banner)
+	// 1. Viewport (Manages scrollable conversation history + live stream buffer)
 	sections = append(sections, m.vp.View())
 
 	// 2. Suggestion palette (Floats dynamically above the prompt input area)
@@ -31,13 +31,13 @@ func (m *model) View() string {
 		sections = append(sections, m.renderSuggestions(width))
 	}
 
-	// 3. Focus line
+	// 3. Focus line separator rule
 	sections = append(sections, m.renderFocusLine(width))
 
-	// 4. Prompt box
+	// 4. Input Prompt box area
 	sections = append(sections, m.renderPromptBox(width))
 
-	// 5. Status bar
+	// 5. Responsive adaptive status bar
 	sections = append(sections, m.renderStatusBar(width))
 
 	return strings.Join(sections, "\n")
@@ -67,8 +67,7 @@ func (m *model) renderPromptBox(width int) string {
 		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)])
 		inner = prefix + " " + sp + "  " + infoStyle.Render("thinking…")
 	} else {
-		// FIX: Use m.ti.View() directly to let the component control the cursor's visual position.
-		// Set the active styling directly onto the component wrapper to guarantee seamless cursor syncing.
+		// Use native m.ti.View() to delegate terminal hardware cursor coordination.
 		m.ti.Cursor.Style = lipgloss.NewStyle().Foreground(modeColor)
 		inner = prefix + " " + m.ti.View()
 	}
@@ -88,12 +87,16 @@ func (m *model) renderStatusBar(width int) string {
 	shortWd := shortenPath(wd)
 	branch, _ := m.gitEng.Branch()
 
+	// 1. Build Left Side (Context Path tracking)
 	var left strings.Builder
 	left.WriteString(statusLeftStyle.Render(shortWd))
-	if branch != "" {
+
+	// Only display git branch details if we have enough horizontal layout width
+	if branch != "" && width >= 90 {
 		left.WriteString(dimStyle.Render(" (" + branch + ")"))
 	}
 
+	// 2. Resolve Core Token Metrics
 	provider := m.cfg.ActiveProviderName()
 	modelName := m.cfg.ActiveModelName()
 	total := m.tokenInput + m.tokenOutput
@@ -102,58 +105,74 @@ func (m *model) renderStatusBar(width int) string {
 
 	var tokStr string
 	if total >= 1000 {
-		tokStr = fmt.Sprintf("%.1fk/%dk (%.0f%%)", float64(total)/1000, maxCtx/1000, pct)
+		tokStr = fmt.Sprintf("%.1fk/%dk", float64(total)/1000, maxCtx/1000)
 	} else {
-		tokStr = fmt.Sprintf("%d/%dk (%.0f%%)", total, maxCtx/1000, pct)
+		tokStr = fmt.Sprintf("%d/%dk", total, maxCtx/1000)
+	}
+	if width >= 100 {
+		tokStr = fmt.Sprintf("%s (%.0f%%)", tokStr, pct)
 	}
 
+	// Calculate usage costs
 	var costStr string
 	if provider == "ollama" {
 		costStr = "$0.00"
 	} else {
 		c := float64(m.tokenInput)*(3.0/1_000_000) + float64(m.tokenOutput)*(15.0/1_000_000)
-		costStr = fmt.Sprintf("$%.4f", c)
+		costStr = fmt.Sprintf("$%.2f", c)
 	}
 
-	safeStr := dimStyle.Render("safe")
-	if !m.resolver.Current().ReadOnly() {
-		safeStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange)).Render("write")
-	}
-	cleanStr := dimStyle.Render("clean")
-	if m.awaitingConfirmation {
-		cleanStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render("pending")
-	}
-
+	// 3. Build Right Side dynamically based on available terminal width
+	var rightParts []string
 	sep := statusSepStyle.String()
-	right := strings.Join([]string{
-		statusRightStyle.Render(provider + " " + modelName),
-		statusRightStyle.Render(tokStr),
-		statusRightStyle.Render(costStr),
-		safeStr,
-		cleanStr,
-	}, sep)
 
+	if width < 75 {
+		// Ultra-compact layout: Optimal when sharing screen with split Neovim panes
+		rightParts = []string{
+			statusRightStyle.Render(modelName),
+			statusRightStyle.Render(tokStr),
+		}
+	} else if width < 105 {
+		// Balanced layout for standard medium windows
+		rightParts = []string{
+			statusRightStyle.Render(provider + " " + modelName),
+			statusRightStyle.Render(tokStr),
+			statusRightStyle.Render(costStr),
+		}
+	} else {
+		// Full layout mode for wide windows
+		safeStr := dimStyle.Render("safe")
+		if !m.resolver.Current().ReadOnly() {
+			safeStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange)).Render("write")
+		}
+		cleanStr := dimStyle.Render("clean")
+		if m.awaitingConfirmation {
+			cleanStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render("pending")
+		}
+
+		rightParts = []string{
+			statusRightStyle.Render(provider + " " + modelName),
+			statusRightStyle.Render(tokStr),
+			statusRightStyle.Render(costStr),
+			safeStr,
+			cleanStr,
+		}
+	}
+
+	right := strings.Join(rightParts, sep)
+
+	// 4. Compute dynamic spacer filling to align contents properly
 	leftW := lipgloss.Width(left.String())
 	rightW := lipgloss.Width(right)
 	gap := width - leftW - rightW
 	if gap < 1 {
 		gap = 1
 	}
+
 	return left.String() + strings.Repeat(" ", gap) + right
 }
 
 // ── Startup banner ────────────────────────────────────────────────────────────
-
-var robotArt = []string{
-	` ▓▓▓▓▓▓ `,
-	`▓▓░▓▓░▓▓`,
-	` ▓▓▓▓▓▓ `,
-	`▓▓▓▓▓▓▓▓`,
-	`▓▓ ▓▓ ▓▓`,
-	`▓▓▓▓▓▓▓▓`,
-	` ▓▓  ▓▓ `,
-	` ▓▓  ▓▓ `,
-}
 
 var bannerModes = []struct{ name, desc string }{
 	{"/ask", "explain, inspect, understand"},
@@ -180,8 +199,18 @@ func (m *model) renderStartupBanner(termWidth int) string {
 		innerW = 60
 	}
 
-	const robotW = 8
+	// Grid system metric setup for geometric block alignments
+	const robotW = 6
 	const sep = "  "
+
+	// Normalized clean block bounds structure to eliminate shifting metrics
+	cleanRobotArt := []string{
+		"  ██  ",
+		" █  █ ",
+		" ████ ",
+		" █ ██ ",
+		" █  █ ",
+	}
 
 	rightCol := []string{
 		acS.Render("IZEN"),
@@ -197,14 +226,14 @@ func (m *model) renderStartupBanner(termWidth int) string {
 	}
 
 	var rows []string
-	totalRows := len(robotArt)
+	totalRows := len(cleanRobotArt)
 	if len(rightCol) > totalRows {
 		totalRows = len(rightCol)
 	}
 	for i := 0; i < totalRows; i++ {
 		var robotPart string
-		if i < len(robotArt) {
-			robotPart = acS.Render(padRight(robotArt[i], robotW))
+		if i < len(cleanRobotArt) {
+			robotPart = acS.Render(padRight(cleanRobotArt[i], robotW))
 		} else {
 			robotPart = strings.Repeat(" ", robotW)
 		}
@@ -253,7 +282,6 @@ func (m *model) printRecord(rec record) string {
 	gutter := gutterFor(rec.role)
 	content := rec.text
 
-	// Helper function to wrap text to width
 	wrapStringToWidth := func(text string, maxW int) []string {
 		if len(text) == 0 {
 			return []string{""}
@@ -307,30 +335,19 @@ func (m *model) printRecord(rec record) string {
 		return chunks
 	}
 
-	// Trigger advanced split diff renderer if code modifications are detected
 	if rec.role == roleAI && (strings.Contains(content, "\n+") || strings.Contains(content, "\n-")) {
 		return gutter + m.renderAdvancedDiff(content)
 	}
 
-	// Calculate available width for content (gutter is 2 chars wide: e.g., "▌ " or "  ")
 	availableWidth := m.width - 2
 	if availableWidth < 20 {
 		availableWidth = 20
 	}
 
-	// Wrap content to available width
 	wrappedLines := wrapStringToWidth(content, availableWidth)
 
-	// Apply appropriate styling based on role
 	switch rec.role {
-	case roleUser:
-		styledLines := make([]string, len(wrappedLines))
-		style := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
-		for i, line := range wrappedLines {
-			styledLines[i] = gutter + style.Render(line)
-		}
-		return strings.Join(styledLines, "\n")
-	case roleAI:
+	case roleUser, roleAI:
 		styledLines := make([]string, len(wrappedLines))
 		style := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 		for i, line := range wrappedLines {
@@ -366,13 +383,9 @@ func (m *model) renderAdvancedDiff(diffContent string) string {
 
 	styleDeletion := lipgloss.NewStyle().Background(lipgloss.Color("#3a1e24")).Foreground(lipgloss.Color("#f1707a"))
 	styleAddition := lipgloss.NewStyle().Background(lipgloss.Color("#18302b")).Foreground(lipgloss.Color("#6cd0a1"))
-
-	styleGutterDel := lipgloss.NewStyle().Foreground(lipgloss.Color("#a6434b"))
-	styleGutterAdd := lipgloss.NewStyle().Foreground(lipgloss.Color("#3b9b71"))
 	styleNormalText := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
-	styleNormalGutter := lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 
-	contentWidth := m.width - 12
+	contentWidth := m.width - 14
 	if contentWidth < 30 {
 		contentWidth = 30
 	}
@@ -430,13 +443,36 @@ func (m *model) renderAdvancedDiff(diffContent string) string {
 		return chunks
 	}
 
+	leftLineNum := 1
+	rightLineNum := 1
+
 	for _, line := range lines {
+		if strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") {
+			continue
+		}
+
+		if strings.HasPrefix(line, "@@") {
+			wrappedLines := wrapStringToWidth(line, contentWidth)
+			for _, wl := range wrappedLines {
+				gutterStr := diffHunkStyle.Render("  ---  --- │ ")
+				textStr := diffHunkStyle.Render(wl)
+				renderedLines = append(renderedLines, gutterStr+textStr)
+			}
+			continue
+		}
+
 		if strings.HasPrefix(line, "-") {
 			cleanLine := strings.TrimPrefix(line, "-")
 			wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
 
-			for _, wl := range wrappedLines {
-				gutterStr := styleGutterDel.Render("  -     ")
+			for i, wl := range wrappedLines {
+				var gutterStr string
+				if i == 0 {
+					gutterStr = diffLineNumSty.Render(fmt.Sprintf("  %3d      │ - ", leftLineNum))
+					leftLineNum++
+				} else {
+					gutterStr = diffLineNumSty.Render("           │   ")
+				}
 				textStr := styleDeletion.Width(contentWidth).Render(wl)
 				renderedLines = append(renderedLines, gutterStr+textStr)
 			}
@@ -444,16 +480,29 @@ func (m *model) renderAdvancedDiff(diffContent string) string {
 			cleanLine := strings.TrimPrefix(line, "+")
 			wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
 
-			for _, wl := range wrappedLines {
-				gutterStr := styleGutterAdd.Render("  +     ")
+			for i, wl := range wrappedLines {
+				var gutterStr string
+				if i == 0 {
+					gutterStr = diffLineNumHLSty.Render(fmt.Sprintf("       %3d │ + ", rightLineNum))
+					rightLineNum++
+				} else {
+					gutterStr = diffLineNumHLSty.Render("           │   ")
+				}
 				textStr := styleAddition.Width(contentWidth).Render(wl)
 				renderedLines = append(renderedLines, gutterStr+textStr)
 			}
 		} else {
 			wrappedLines := wrapStringToWidth(line, contentWidth)
 
-			for _, wl := range wrappedLines {
-				gutterStr := styleNormalGutter.Render("        ")
+			for i, wl := range wrappedLines {
+				var gutterStr string
+				if i == 0 {
+					gutterStr = diffLineNumSty.Render(fmt.Sprintf("  %3d  %3d │   ", leftLineNum, rightLineNum))
+					leftLineNum++
+					rightLineNum++
+				} else {
+					gutterStr = diffLineNumSty.Render("           │   ")
+				}
 				textStr := styleNormalText.Width(contentWidth).Render(wl)
 				renderedLines = append(renderedLines, gutterStr+textStr)
 			}
@@ -485,7 +534,7 @@ func (m *model) renderConfirmation(width int) string {
 	return confirmBoxStyle.Width(boxWidth).Render(inner.String())
 }
 
-// renderModeBar used by suggestion widget.
+// renderModeBar builds the interactive suggestions palette component view.
 func (m *model) renderModeBar(_ int) string {
 	var b strings.Builder
 	current := "/" + m.resolver.Current().String()

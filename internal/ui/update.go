@@ -221,6 +221,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleError, "stream error: "+msg.err.Error())
 		return m, nil
 
+	// ── Mouse Scroll Interception ─────────────────────────────────────────────
+	case tea.MouseMsg:
+		// Enable native mouse wheel controls for viewport scrolling
+		if m.vpReady {
+			switch msg.Type {
+			case tea.MouseWheelUp:
+				m.vp.LineUp(3)
+				return m, nil
+			case tea.MouseWheelDown:
+				m.vp.LineDown(3)
+				return m, nil
+			}
+		}
+
 	// ── High-Fidelity Keyboard Navigation Event Interception ─────────────────
 	case tea.KeyMsg:
 		// Reset state trigger catch: intercept /clear sequence to pop banner back out
@@ -231,17 +245,44 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showBanner = false
 		}
 
-		// Handle standalone vertical scrolling if suggestion dropdowns are inactive
+		// Handle active prompt box commands history tracking with Up and Down arrows
 		if !m.showSuggestions && !m.streaming && !m.agentRunning {
 			switch msg.Type {
-			case tea.KeyPgUp, tea.KeyPgDown, tea.KeyUp, tea.KeyDown:
+			case tea.KeyUp:
+				// Cycle backwards through chat history
+				if len(m.history) > 0 {
+					if m.historyIndex == -1 {
+						m.historyIndex = len(m.history) - 1
+					} else if m.historyIndex > 0 {
+						m.historyIndex--
+					}
+					m.ti.SetValue(m.history[m.historyIndex])
+					m.ti.CursorEnd()
+				}
+				return m, nil
+
+			case tea.KeyDown:
+				// Cycle forwards through chat history or empty if at end
+				if m.historyIndex != -1 {
+					if m.historyIndex < len(m.history)-1 {
+						m.historyIndex++
+						m.ti.SetValue(m.history[m.historyIndex])
+						m.ti.CursorEnd()
+					} else {
+						m.historyIndex = -1
+						m.ti.SetValue("")
+					}
+				}
+				return m, nil
+
+			case tea.KeyPgUp, tea.KeyPgDown:
+				// Keep raw page-up and page-down directly targeting the chat history log viewport
 				m.vp, vpCmd = m.vp.Update(msg)
 				return m, vpCmd
 			}
 		}
 
-		// Route all keystrokes into your custom autocomplete / interaction logic pipeline.
-		// handleKey handles updating the text input fields internally and returns the updated model/commands.
+		// Route all remaining keystrokes (Enter, Left/Right, Chars, Autocomplete) into handleKey
 		resModel, cmd := m.handleKey(msg)
 		return resModel, cmd
 	}
