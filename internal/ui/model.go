@@ -1,9 +1,16 @@
 package ui
 
 import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
@@ -14,6 +21,8 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/session"
 )
+
+// ── Message types ─────────────────────────────────────────────────────────────
 
 type role uint8
 
@@ -55,6 +64,7 @@ type streamDoneMsg struct {
 type streamErrMsg struct{ err error }
 
 type tickMsg time.Time
+type animTickMsg time.Time
 
 type investigateResultMsg struct {
 	records    []record
@@ -82,9 +92,17 @@ type buildProposalsReadyMsg struct {
 	proposals []patchProposal
 }
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
 const (
 	version                   = "0.1.0"
 	maxInvestigateInvocations = 5
+
+	// Fixed heights of chrome elements (lines)
+	focusLineHeight = 1 // top colored rule
+	promptBoxHeight = 3 // border top + content + border bottom
+	statusBarHeight = 1
+	viewportPadding = 1 // breathing room
 )
 
 var coreModes = []string{"/ask", "/plan", "/build", "/investigate", "/review"}
@@ -99,6 +117,12 @@ var utilityCommands = map[modes.Mode][]string{
 
 var globalCommands = []string{"/help", "/mode", "/objective", "/drop", "/quit"}
 
+// ── Elegant spinner frames ────────────────────────────────────────────────────
+// Geometric rotation: │ ╱ ── ╲  (subtle, not organic)
+var spinnerFrames = []string{"│", "╱", "──", "╲", "│", "╱", "──", "╲"}
+
+// ── Model ─────────────────────────────────────────────────────────────────────
+
 type model struct {
 	cfg      *config.Config
 	sess     *session.Session
@@ -108,11 +132,23 @@ type model struct {
 	graphEng *graph.Engine
 	graph    *graph.Graph
 
-	input   strings.Builder
-	records []record
-	width   int
-	height  int
+	// Input
+	ti    textinput.Model
+	input strings.Builder // kept in sync with ti for suggestions.go
 
+	// Viewport for scrollable conversation history
+	vp        viewport.Model
+	vpReady   bool
+	viewLines []string // rendered lines fed into viewport
+
+	// Banner visibility state
+	showBanner bool
+
+	// Window dimensions
+	width  int
+	height int
+
+	// Streaming
 	streamCh       chan tea.Msg
 	responseBuffer strings.Builder
 	streaming      bool
@@ -120,18 +156,22 @@ type model struct {
 	tokenInput     int
 	tokenOutput    int
 
+	// Agent state
 	agentRunning bool
 	agentLabel   string
 	agentDone    bool
 
+	// Suggestions
 	showSuggestions bool
 	suggestionType  string
 	suggestions     []string
 	suggestionIdx   int
 
+	// File context
 	pendingFileRefs []string
 	attachedFiles   []string
 
+	// Proposals / approvals
 	awaitingConfirmation bool
 	pendingProposals     []patchProposal
 	acceptAll            bool
@@ -142,21 +182,153 @@ type model struct {
 	buildOutput strings.Builder
 
 	investigateInvocationCount int
+
+	// Command history
+	history      []string
+	historyIndex int
+	historyPath  string
+
+	// Mode-line animation
+	lineAnimProgress   float64
+	lineAnimTargetMode modes.Mode
+	lineAnimating      bool
+
+	// Records (source of truth; rendered into viewLines → viewport)
+	records []record
 }
+
+// ── Viewport helpers ──────────────────────────────────────────────────────────
+
+// viewportHeight calculates available lines for the conversation viewport.
+func (m *model) viewportHeight() int {
+	h := m.height - focusLineHeight - promptBoxHeight - statusBarHeight - viewportPadding
+	if h < 3 {
+		h = 3
+	}
+	return h
+}
+
+// rebuildViewport re-renders all records into the viewport content.
+func (m *model) rebuildViewport() {
+	if !m.vpReady {
+		return
+	}
+	var lines []string
+	if m.showBanner {
+		for _, l := range strings.Split(m.renderStartupBanner(m.width), "\n") {
+			lines = append(lines, l)
+		}
+		lines = append(lines, "")
+	}
+	for _, rec := range m.records {
+		lines = append(lines, m.printRecord(rec))
+	}
+	// Streaming in-progress: show live buffer
+	if m.streaming && m.responseBuffer.Len() > 0 {
+		gutter := gutterAIStyle.Render("▌") + " "
+		for _, l := range strings.Split(m.responseBuffer.String(), "\n") {
+			lines = append(lines, gutter+l)
+		}
+	} else if m.streaming {
+		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame])
+		lines = append(lines, gutterAIStyle.Render("▌")+" "+sp+"  "+infoStyle.Render("thinking…"))
+	}
+	if m.agentRunning {
+		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame])
+		label := lipglossColor(colorYellow).Render(m.agentLabel + "…")
+		lines = append(lines, gutterAIStyle.Render("▌")+" "+sp+"  "+label)
+	}
+	if m.awaitingConfirmation && len(m.pendingProposals) > 0 {
+		lines = append(lines, m.renderConfirmation(m.width))
+	}
+	m.viewLines = lines
+	m.vp.SetContent(strings.Join(lines, "\n"))
+	m.vp.GotoBottom()
+}
+
+// appendViewLine appends a single rendered line and updates viewport.
+func (m *model) appendViewLine(line string) {
+	m.viewLines = append(m.viewLines, line)
+	m.vp.SetContent(strings.Join(m.viewLines, "\n"))
+	m.vp.GotoBottom()
+}
+
+// ── Record helpers ─────────────────────────────────────────────────────────────
 
 func (m *model) push(r role, text string) {
 	lines := strings.Split(text, "\n")
 	for _, l := range lines {
-		m.records = append(m.records, record{role: r, text: l})
+		rec := record{role: r, text: l}
+		m.records = append(m.records, rec)
+		if m.vpReady {
+			m.appendViewLine(m.printRecord(rec))
+		}
 	}
 }
 
 func (m *model) pushLines(r role, lines []string) {
 	for _, l := range lines {
-		m.records = append(m.records, record{role: r, text: l})
+		m.push(r, l)
 	}
 }
 
 func (m *model) pushRecords(recs []record) {
-	m.records = append(m.records, recs...)
+	for _, rec := range recs {
+		m.records = append(m.records, rec)
+		if m.vpReady {
+			m.appendViewLine(m.printRecord(rec))
+		}
+	}
 }
+
+// ── History persistence ───────────────────────────────────────────────────────
+
+func (m *model) historyFilePath() string {
+	if m.historyPath != "" {
+		return m.historyPath
+	}
+	cfgDir, err := os.UserConfigDir()
+	if err != nil {
+		cfgDir = filepath.Join(os.Getenv("HOME"), ".config")
+	}
+	return filepath.Join(cfgDir, "izen", "history")
+}
+
+func (m *model) loadHistory() {
+	f, err := os.Open(m.historyFilePath())
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal([]byte(line), &s); err == nil {
+			m.history = append(m.history, s)
+		}
+	}
+}
+
+func (m *model) saveHistory() {
+	path := m.historyFilePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if len(m.history) == 0 {
+		return
+	}
+	last := m.history[len(m.history)-1]
+	b, _ := json.Marshal(last)
+	fmt.Fprintf(f, "%s\n", b)
+}
+
+func (m *model) inputString() string { return m.ti.Value() }

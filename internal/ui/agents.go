@@ -45,7 +45,6 @@ func (m *model) runInvestigateCmd(content string) tea.Cmd {
 		} else {
 			push(roleSystem, infoStyle.Render("investigation inconclusive"))
 		}
-
 		for _, h := range result.Hypotheses {
 			sym := "○"
 			switch h.Status {
@@ -57,7 +56,6 @@ func (m *model) runInvestigateCmd(content string) tea.Cmd {
 			push(roleAI, hypothesisStyle.Render(
 				fmt.Sprintf("  %s %s [%s] (%.0f%%)", sym, h.Theory, h.Status, h.Confidence*100)))
 		}
-
 		for _, ev := range result.Evidence {
 			c := ev.Content
 			if len(c) > 60 {
@@ -65,11 +63,9 @@ func (m *model) runInvestigateCmd(content string) tea.Cmd {
 			}
 			push(roleAI, evidenceStyle.Render(fmt.Sprintf("  [%s] %s", ev.Source, c)))
 		}
-
 		if !result.Resolved && result.Error != "" {
 			push(roleError, "error: "+result.Error)
 		}
-
 		return investigateResultMsg{records: recs, sessionKey: result.Problem}
 	}
 }
@@ -146,7 +142,6 @@ func (m *model) runReviewCmd() tea.Cmd {
 			review.RiskLow:      riskLowStyle,
 			review.RiskInfo:     riskInfoStyle,
 		}
-
 		for _, sev := range sevOrder {
 			var findings []review.RiskFinding
 			for _, f := range result.RiskFindings {
@@ -187,13 +182,11 @@ func (m *model) runUndoCmd() tea.Cmd {
 		m.push(roleError, "no checkpoints to undo")
 		return nil
 	}
-
 	lastID := checkpoints[len(checkpoints)-1]
 	if err := m.execEng.Checkpoints.Restore(lastID); err != nil {
 		m.push(roleError, "undo failed: "+err.Error())
 		return nil
 	}
-
 	m.sess.Checkpoints = checkpoints[:len(checkpoints)-1]
 	m.sess.Save()
 	m.push(roleStatus, fmt.Sprintf("undone: restored to checkpoint %s", lastID))
@@ -211,7 +204,6 @@ func (m *model) runCommitCmdAgent() tea.Cmd {
 		if err != nil {
 			return commitGeneratedMsg{err: fmt.Errorf("failed to get diff: %w", err)}
 		}
-
 		if strings.TrimSpace(diff) == "" {
 			return commitGeneratedMsg{err: fmt.Errorf("no changes in last commit — nothing to amend")}
 		}
@@ -222,13 +214,11 @@ func (m *model) runCommitCmdAgent() tea.Cmd {
 			{Role: "system", Content: sys},
 			{Role: "user", Content: payload},
 		}
-
 		req := ai.Request{
 			Model:    m.cfg.ActiveModelName(),
 			Messages: msgs,
 			Stream:   false,
 		}
-
 		resp, err := m.provider.Execute(context.Background(), req)
 		if err != nil {
 			return commitGeneratedMsg{err: fmt.Errorf("LLM call failed: %w", err)}
@@ -236,7 +226,6 @@ func (m *model) runCommitCmdAgent() tea.Cmd {
 
 		raw := resp.Content
 		lines := commit.CleanRawLLMOutput(raw)
-
 		var subject, body string
 		for i, line := range lines {
 			line = strings.TrimSpace(line)
@@ -249,32 +238,23 @@ func (m *model) runCommitCmdAgent() tea.Cmd {
 				body += line + "\n"
 			}
 		}
-
 		if subject == "" {
 			subject = "chore(repo): update repository state"
 		}
-
 		bodyLines := strings.Split(strings.TrimSpace(body), "\n")
 		body = commit.SanitizeBody(bodyLines)
-
 		msg := commit.CommitMessage{Subject: subject, Body: body}
 		finalMessage := fmt.Sprintf("%s\n\n%s\n", msg.Subject, msg.Body)
 
 		if err := m.gitEng.AmendCommit(finalMessage); err != nil {
 			return commitGeneratedMsg{err: fmt.Errorf("amend failed: %w", err)}
 		}
-
 		hash, _ := m.gitEng.CurrentHash()
 		checkpoints := m.sess.Checkpoints
 		if len(checkpoints) > 0 {
 			m.sess.Checkpoints = checkpoints[:len(checkpoints)-1]
 			m.sess.Save()
 		}
-
-		return commitGeneratedMsg{
-			subject: msg.Subject,
-			body:    msg.Body,
-			hash:    hash,
-		}
+		return commitGeneratedMsg{subject: msg.Subject, body: msg.Body, hash: hash}
 	}
 }

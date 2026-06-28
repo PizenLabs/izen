@@ -26,9 +26,9 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streamCh = make(chan tea.Msg, 1024)
 	m.streaming = true
 	m.spinnerFrame = 0
+	m.responseBuffer.Reset()
 
 	msgs := []ai.Message{{Role: "user", Content: content}}
-
 	if m.resolver.Current() == modes.ModeBuild {
 		sys := prompt.BuildSystemPrompt()
 		msgs = append([]ai.Message{{Role: "system", Content: sys}}, msgs...)
@@ -72,7 +72,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 					tokIn = len(content) / 4
 					tokOut = full.Len() / 4
 				}
-				m.streamCh <- streamDoneMsg{content: full.String(), tokenInput: tokIn, tokenOutput: tokOut}
+				m.streamCh <- streamDoneMsg{
+					content:     full.String(),
+					tokenInput:  tokIn,
+					tokenOutput: tokOut,
+				}
 				return
 			}
 			if err != nil {

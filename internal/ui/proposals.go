@@ -72,10 +72,7 @@ func extractDiffPatches(response string) []patchProposal {
 		if file != "" && body != "" {
 			clean := filepath.Clean(file)
 			if clean != "" && clean != "." {
-				proposals = append(proposals, patchProposal{
-					File:    clean,
-					Content: body,
-				})
+				proposals = append(proposals, patchProposal{File: clean, Content: body})
 			}
 		}
 	}
@@ -87,7 +84,6 @@ func parseUnifiedDiff(content string) (string, string) {
 	var filePath string
 	var body strings.Builder
 	inHunk := false
-
 	for _, line := range lines {
 		if strings.HasPrefix(line, "+++ b/") {
 			filePath = strings.TrimPrefix(line, "+++ b/")
@@ -107,7 +103,6 @@ func parseUnifiedDiff(content string) (string, string) {
 			body.WriteString("\n")
 		}
 	}
-
 	return filePath, strings.TrimRight(body.String(), "\n")
 }
 
@@ -116,7 +111,6 @@ func parseUnifiedDiffHunks(content string) (string, string) {
 	var filePath string
 	var body strings.Builder
 	inHunk := false
-
 	for _, line := range lines {
 		if strings.HasPrefix(line, "+++ ") {
 			raw := strings.TrimPrefix(line, "+++ ")
@@ -173,9 +167,13 @@ func (m *model) applySingleProposal() tea.Cmd {
 		m.awaitingConfirmation = false
 		m.createBuildCheckpoint(1)
 	} else {
-		diff := RenderInlineDiff(p.Content)
-		m.push(roleSystem, fmt.Sprintf("next diff for %s:\n%s", m.pendingProposals[0].File, diff))
-		m.push(roleSystem, infoStyle.Render("\n  [1] Accept  [2] Allow All  [3] Reject"))
+		// Show numbered diff of next proposal
+		rendered := RenderNumberedDiff(p.Content, m.width)
+		m.push(roleSystem, fmt.Sprintf("next: %s", m.pendingProposals[0].File))
+		for _, l := range strings.Split(rendered, "\n") {
+			m.push(roleSystem, l)
+		}
+		m.push(roleSystem, infoStyle.Render("  [1] Accept  [2] Allow All  [3] Reject"))
 	}
 	return nil
 }
@@ -216,29 +214,4 @@ func (m *model) createBuildCheckpoint(fileCount int) {
 		m.push(roleSystem, infoStyle.Render(
 			fmt.Sprintf("checkpoint: %s (%d files)", cp.Hash[:8], fileCount)))
 	}
-}
-
-func (m *model) renderConfirmation(width int) string {
-	var inner strings.Builder
-	inner.WriteString("\n")
-	inner.WriteString(confirmDimStyle.Render("  proposed file changes:"))
-	for _, p := range m.pendingProposals {
-		inner.WriteString("\n  " + confirmFileStyle.Render("📝 "+p.File))
-	}
-	inner.WriteString("\n")
-	inner.WriteString(confirmKeyStyle.Render("  [1] Accept"))
-	inner.WriteString(confirmDescStyle.Render("  (apply this batch)"))
-	inner.WriteString("\n")
-	inner.WriteString(confirmKeyStyle.Render("  [2] Allow All"))
-	inner.WriteString(confirmDescStyle.Render("  (trust agent for session)"))
-	inner.WriteString("\n")
-	inner.WriteString(confirmKeyStyle.Render("  [3] Reject"))
-	inner.WriteString(confirmDescStyle.Render("  (cancel all changes)"))
-	inner.WriteString("\n")
-
-	boxWidth := 48
-	if width < boxWidth+4 {
-		boxWidth = width - 4
-	}
-	return confirmBoxStyle.Width(boxWidth).Render(inner.String())
 }

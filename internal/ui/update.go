@@ -6,29 +6,78 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
 )
 
+// Init initializes background loop clock ticks for state rendering animations.
 func (m *model) Init() tea.Cmd {
-	return tickCmd()
+	return tea.Batch(tickCmd(), animTickCmd())
 }
 
+// Update acts as the central state machine processor routing keyboard events and framework messages.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var (
+		vpCmd tea.Cmd
+		tiCmd tea.Cmd
+	)
+
 	switch msg := msg.(type) {
 
+	// ── Window Sizing — dynamic dimensions & viewport calculation ─────────────
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.ti.Width = msg.Width - 8
+
+		vpH := m.viewportHeight()
+
+		if !m.vpReady {
+			m.vp = viewport.New(msg.Width, vpH)
+			m.vp.YPosition = 0
+			m.vp.HighPerformanceRendering = false
+			m.vpReady = true
+
+			// Initialize initial state structure: display welcome banner on fresh boot
+			m.showBanner = true
+			m.rebuildViewport()
+		} else {
+			m.vp.Width = msg.Width
+			m.vp.Height = vpH
+			m.rebuildViewport()
+		}
+		return m, nil
+
+	// ── Spinner Tick (100ms Clocks) ───────────────────────────────────────────
 	case tickMsg:
 		if m.streaming || m.agentRunning {
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
+			if m.vpReady {
+				m.rebuildViewport()
+			}
 		}
 		return m, tickCmd()
 
+	// ── Animation Tick (25ms Clocks) — mode line color fader ──────────────────
+	case animTickMsg:
+		if m.lineAnimating {
+			m.lineAnimProgress += 25.0 / 150.0
+			if m.lineAnimProgress >= 1.0 {
+				m.lineAnimProgress = 1.0
+				m.lineAnimating = false
+			}
+		}
+		return m, animTickCmd()
+
+	// ── Agent Async Core Pipelines ────────────────────────────────────────────
 	case agentDoneMsg:
 		m.agentRunning = false
 		m.agentDone = true
 		m.agentLabel = msg.label
+		m.rebuildViewport()
 		return m, nil
 
 	case investigateResultMsg:
@@ -76,8 +125,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleStatus, fmt.Sprintf("amended as %s", msg.hash))
 		return m, nil
 
+	// ── LLM Token Data Streaming Engines ──────────────────────────────────────
 	case tokenMsg:
 		m.responseBuffer.WriteString(string(msg))
+		if m.vpReady {
+			m.rebuildViewport()
+		}
 		return m, m.readStream()
 
 	case streamDoneMsg:
@@ -89,9 +142,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if final == "" {
 			final = m.responseBuffer.String()
 		}
-		m.push(roleAI, final)
-		m.push(roleStatus, "response complete")
 		m.responseBuffer.Reset()
+
+		// Run lines processing pipeline through high-fidelity code diff syntax scanner
+		highlighted := highlightOutput(final)
+		for _, l := range strings.Split(highlighted, "\n") {
+			m.records = append(m.records, record{role: roleAI, text: l})
+		}
+
+		total := m.tokenInput + m.tokenOutput
+		tokStr := fmt.Sprintf("%d/32k tokens", total)
+		if total >= 1000 {
+			tokStr = fmt.Sprintf("%.1fk/32k tokens", float64(total)/1000)
+		}
+		costStr := "$0.00"
+		if m.cfg.ActiveProviderName() != "ollama" {
+			c := float64(m.tokenInput)*(3.0/1_000_000) + float64(m.tokenOutput)*(15.0/1_000_000)
+			costStr = fmt.Sprintf("$%.4f", c)
+		}
+		doneStr := fmt.Sprintf("✓ done  •  %s  •  %s", tokStr, costStr)
+		m.push(roleStatus, doneStr)
 
 		if m.resolver.Current() == modes.ModeBuild && m.state != StateAwaitingApproval {
 			props := extractBuildProposals(final)
@@ -134,16 +204,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.pendingProposals = props
 					m.state = StateAwaitingApproval
 					m.awaitingConfirmation = true
-					proposalMsg := "proposed changes:\n"
+					msg := "proposed changes:"
 					for _, p := range props {
-						proposalMsg += fmt.Sprintf("  • %s\n", p.File)
+						msg += fmt.Sprintf("\n  • %s", p.File)
 					}
-					proposalMsg += "\n  [1] Accept  [2] Allow All  [3] Reject"
-					m.push(roleSystem, infoStyle.Render(proposalMsg))
+					m.push(roleSystem, infoStyle.Render(msg))
 				}
 			}
 		}
-
+		m.rebuildViewport()
 		return m, nil
 
 	case streamErrMsg:
@@ -152,20 +221,49 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleError, "stream error: "+msg.err.Error())
 		return m, nil
 
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		return m, nil
-
+	// ── High-Fidelity Keyboard Navigation Event Interception ─────────────────
 	case tea.KeyMsg:
+		// Reset state trigger catch: intercept /clear sequence to pop banner back out
+		if strings.TrimSpace(m.ti.Value()) == "/clear" && msg.String() == "enter" {
+			m.showBanner = true
+		} else if msg.String() == "enter" && strings.TrimSpace(m.ti.Value()) != "" {
+			// On chat submission: hide banner immediately to maximize code layout real estate
+			m.showBanner = false
+		}
+
+		// Handle standalone vertical scrolling if suggestion dropdowns are inactive
+		if !m.showSuggestions && !m.streaming && !m.agentRunning {
+			switch msg.Type {
+			case tea.KeyPgUp, tea.KeyPgDown, tea.KeyUp, tea.KeyDown:
+				m.vp, vpCmd = m.vp.Update(msg)
+				return m, vpCmd
+			}
+		}
+
+		// Intercept Left/Right key controls so cursor shifts seamlessly inside input box
+		switch msg.Type {
+		case tea.KeyLeft, tea.KeyRight:
+			m.ti, tiCmd = m.ti.Update(msg)
+			return m, tiCmd
+		}
+
 		return m.handleKey(msg)
 	}
 
-	return m, nil
+	// Dynamic fallback sequence propagation across active containers
+	m.vp, vpCmd = m.vp.Update(msg)
+	m.ti, tiCmd = m.ti.Update(msg)
+	return m, tea.Batch(vpCmd, tiCmd)
 }
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
 		return tickMsg(t)
+	})
+}
+
+func animTickCmd() tea.Cmd {
+	return tea.Tick(25*time.Millisecond, func(t time.Time) tea.Msg {
+		return animTickMsg(t)
 	})
 }

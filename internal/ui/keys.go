@@ -1,12 +1,14 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// ── Awaiting approval ────────────────────────────────────────────────────
 	if m.state == StateAwaitingApproval {
 		switch msg.String() {
 		case "1":
@@ -20,12 +22,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.pendingProposals = nil
 			m.acceptAll = false
 			m.push(roleSystem, infoStyle.Render("changes rejected"))
+			m.rebuildViewport()
 			return m, nil
 		}
 		return m, nil
 	}
 
 	switch msg.Type {
+	// ── Quit ─────────────────────────────────────────────────────────────────
 	case tea.KeyCtrlC, tea.KeyEscape:
 		if m.showSuggestions {
 			m.dismissSuggestions()
@@ -35,9 +39,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.sess.Save()
 		return m, tea.Quit
 
+	// ── Enter: submit ─────────────────────────────────────────────────────────
 	case tea.KeyEnter:
-		line := m.input.String()
-		m.input.Reset()
+		line := m.ti.Value()
+
 		if m.showSuggestions && len(m.suggestions) > 0 {
 			sel := m.suggestions[m.suggestionIdx]
 			if m.suggestionType == "@" {
@@ -51,18 +56,44 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.pendingFileRefs = append(m.pendingFileRefs, sel)
 				m.attachedFiles = append(m.attachedFiles, sel)
 				m.dismissSuggestions()
-				m.input.WriteString(line)
+				m.ti.SetValue(line)
+				m.syncInputFromTI()
 				return m, nil
 			}
 			line = sel
 		}
 		m.dismissSuggestions()
+
 		if line != "" {
+			// Banner: hide on first user message
+			if m.showBanner {
+				m.showBanner = false
+			}
+
+			// Echo user line into viewport
+			userLine := gutterUserStyle.Render("▌") + " " +
+				labelUserStyle.Render("you") +
+				promptStyle.Render(" > ") +
+				outputStyle.Render(line)
+			m.records = append(m.records, record{role: roleUser, text: userLine})
+
+			// History
+			m.history = append(m.history, line)
+			m.historyIndex = len(m.history)
+			m.saveHistory()
+
+			m.ti.SetValue("")
+			m.syncInputFromTI()
+			m.rebuildViewport()
+
 			cmd := m.handleInput(line)
 			return m, cmd
 		}
+		m.ti.SetValue("")
+		m.syncInputFromTI()
 		return m, nil
 
+	// ── Tab: cycle suggestions ────────────────────────────────────────────────
 	case tea.KeyTab:
 		if m.showSuggestions && len(m.suggestions) > 0 {
 			m.suggestionIdx = (m.suggestionIdx + 1) % len(m.suggestions)
@@ -78,30 +109,63 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case tea.KeyBackspace:
-		s := m.input.String()
-		if len(s) > 0 {
-			m.input.Reset()
-			m.input.WriteString(s[:len(s)-1])
-			m.updateSuggestions()
-		} else {
-			m.dismissSuggestions()
+	// ── Up/Down: command history (when no suggestions) ────────────────────────
+	case tea.KeyUp:
+		if m.showSuggestions && len(m.suggestions) > 0 {
+			m.suggestionIdx--
+			if m.suggestionIdx < 0 {
+				m.suggestionIdx = len(m.suggestions) - 1
+			}
+			return m, nil
 		}
+		if len(m.history) == 0 {
+			return m, nil
+		}
+		if m.historyIndex > 0 {
+			m.historyIndex--
+		}
+		m.ti.SetValue(m.history[m.historyIndex])
+		m.ti.CursorEnd()
+		m.syncInputFromTI()
 		return m, nil
 
-	case tea.KeySpace:
-		m.input.WriteString(" ")
+	case tea.KeyDown:
+		if m.showSuggestions && len(m.suggestions) > 0 {
+			m.suggestionIdx = (m.suggestionIdx + 1) % len(m.suggestions)
+			return m, nil
+		}
+		if m.historyIndex < len(m.history)-1 {
+			m.historyIndex++
+			m.ti.SetValue(m.history[m.historyIndex])
+			m.ti.CursorEnd()
+		} else {
+			m.historyIndex = len(m.history)
+			m.ti.SetValue("")
+		}
+		m.syncInputFromTI()
+		return m, nil
+
+	// ── All other keys → textinput ────────────────────────────────────────────
+	default:
+		var tiCmd tea.Cmd
+		m.ti, tiCmd = m.ti.Update(msg)
+		m.syncInputFromTI()
 		m.updateSuggestions()
-		return m, nil
-
-	case tea.KeyPgUp, tea.KeyPgDown, tea.KeyUp, tea.KeyDown:
-		return m, nil
-
-	case tea.KeyRunes:
-		m.input.WriteString(string(msg.Runes))
-		m.updateSuggestions()
-		return m, nil
+		return m, tiCmd
 	}
-
-	return m, nil
 }
+
+func (m *model) syncInputFromTI() {
+	m.input.Reset()
+	m.input.WriteString(m.ti.Value())
+}
+
+// printSystem / printInfo / printError — now push into viewport records.
+func printSystem(text string) {
+	// These are called from commands.go — they need model access.
+	// Use a no-op here; commands.go methods call m.push() directly now.
+	fmt.Print("") // suppress unused import
+}
+
+func printInfo(text string)  { _ = text }
+func printError(text string) { _ = text }

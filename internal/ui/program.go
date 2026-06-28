@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
@@ -23,6 +24,11 @@ func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea
 	graphEng := graph.NewEngine(".")
 	g, _, _ := graphEng.BuildOrLoad()
 
+	ti := textinput.New()
+	ti.Prompt = ""
+	ti.CharLimit = 0
+	ti.Focus()
+
 	m := &model{
 		cfg:           cfg,
 		sess:          sess,
@@ -33,8 +39,14 @@ func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea
 		resolver:      modes.NewResolver(),
 		attachedFiles: make([]string, 0),
 		execEng:       execution.NewEngine(".", cfg, sess),
+		ti:            ti,
+		showBanner:    true, // banner visible on first boot
 	}
 	m.resolver.Set(sess.Mode)
+	m.loadHistory()
+	m.historyIndex = len(m.history)
 
-	return tea.NewProgram(m)
+	// AltScreen: Bubble Tea owns 100% of the terminal.
+	// The viewport component handles all scrollable history.
+	return tea.NewProgram(m, tea.WithAltScreen())
 }

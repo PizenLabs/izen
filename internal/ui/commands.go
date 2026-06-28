@@ -27,13 +27,11 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.push(roleSystem, "usage: !<shell command>")
 			return nil
 		}
-
 		currentMode := m.resolver.Current()
 		if currentMode.ReadOnly() {
 			m.push(roleError, fmt.Sprintf("shell execution blocked in /%s mode (read-only)", currentMode))
 			return nil
 		}
-
 		m.push(roleSystem, "$ "+shellCmd)
 		out, err := execShell(shellCmd)
 		if err != nil {
@@ -69,14 +67,12 @@ func (m *model) handleInput(line string) tea.Cmd {
 				continue
 			}
 			seen[ref] = true
-
 			symName := filepath.Base(ref)
 			symExt := filepath.Ext(symName)
 			if symExt != "" {
 				symName = strings.TrimSuffix(symName, symExt)
 			}
 			depCtx := cb.BuildDependencySlice(symName)
-
 			if len(depCtx.Files) == 0 {
 				fn := m.graph.LookupFile(ref)
 				if fn != nil {
@@ -84,7 +80,6 @@ func (m *model) handleInput(line string) tea.Cmd {
 					depCtx.Files = append(depCtx.Files, fs)
 				}
 			}
-
 			if len(depCtx.Files) > 0 {
 				if fileCtx.Len() > 0 {
 					fileCtx.WriteString("\n")
@@ -128,15 +123,14 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return m.handleCommand(line)
 	}
 
-	m.push(roleUser, line)
-
 	newMode := m.resolver.Resolve(line)
 	if newMode != m.resolver.Current() {
-		m.resolver.Set(newMode)
+		m.startModeTransition(newMode)
 		m.sess.SetMode(newMode)
 		m.sess.Save()
 		modeColor := modeAccentColor(newMode)
-		modeLabel := lipgloss.NewStyle().Foreground(modeColor).Render(fmt.Sprintf("→ /%s — %s", newMode, newMode.Description()))
+		modeLabel := lipgloss.NewStyle().Foreground(modeColor).Render(
+			fmt.Sprintf("→ /%s — %s", newMode, newMode.Description()))
 		m.push(roleSystem, modeLabel)
 	}
 
@@ -144,7 +138,6 @@ func (m *model) handleInput(line string) tea.Cmd {
 	if content == "" {
 		return nil
 	}
-
 	if fileCtx.Len() > 0 {
 		content = fileCtx.String() + "\n\n" + content
 	}
@@ -152,7 +145,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 	switch m.resolver.Current() {
 	case modes.ModeInvestigate:
 		if m.investigateInvocationCount >= maxInvestigateInvocations {
-			m.push(roleError, fmt.Sprintf("max investigate invocations (%d) reached for this session", maxInvestigateInvocations))
+			m.push(roleError, fmt.Sprintf("max investigate invocations (%d) reached", maxInvestigateInvocations))
 			m.push(roleSystem, infoStyle.Render("start a new session with /objective <desc> or restart"))
 			return nil
 		}
@@ -178,17 +171,11 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /review      audit changes, detect risks"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
-		m.push(roleSystem, infoStyle.Render("  /help         show this help"))
-		m.push(roleSystem, infoStyle.Render("  /mode <name>  switch mode"))
-		m.push(roleSystem, infoStyle.Render("  /objective    set session objective"))
-		m.push(roleSystem, infoStyle.Render("  /drop         clear attached context files"))
-		m.push(roleSystem, infoStyle.Render("  /drop @<path> remove a specific attached file"))
-		m.push(roleSystem, infoStyle.Render("  /quit         exit"))
-		m.push(roleSystem, infoStyle.Render("  !<cmd>        run a shell command"))
+		m.push(roleSystem, infoStyle.Render("  /help  /mode  /objective  /drop  /clear  /quit"))
+		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /tokens  /history"))
+		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
-		m.push(roleSystem, labelBoldStyle.Render("file references"))
-		m.push(roleSystem, infoStyle.Render("  @<path>  reference a file anywhere in your message"))
-		m.push(roleSystem, infoStyle.Render("           supports subdirs, e.g. @internal/ai/client.go"))
+		m.push(roleSystem, infoStyle.Render("  @<path>  reference a file in your message"))
 		return nil
 
 	case cmd == "/quit":
@@ -202,7 +189,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		if len(parts) == 2 {
 			mode, ok := modes.Parse(parts[1])
 			if ok {
-				m.resolver.Set(mode)
+				m.startModeTransition(mode)
 				m.sess.SetMode(mode)
 				m.sess.Save()
 				modeColor := modeAccentColor(mode)
@@ -227,7 +214,10 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case cmd == "/clear":
+		// Reset conversation + restore banner
 		m.records = nil
+		m.showBanner = true
+		m.rebuildViewport()
 		return nil
 
 	case cmd == "/drop":
@@ -236,13 +226,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case strings.HasPrefix(cmd, "/drop "):
-		target := strings.TrimSpace(strings.TrimPrefix(cmd, "/drop"))
-		if target == "" {
-			m.attachedFiles = nil
-			m.push(roleSystem, infoStyle.Render("context cleared"))
-			return nil
-		}
-		target = filepath.Clean(target)
+		target := filepath.Clean(strings.TrimSpace(strings.TrimPrefix(cmd, "/drop")))
 		filtered := make([]string, 0, len(m.attachedFiles))
 		for _, f := range m.attachedFiles {
 			if f != target {
@@ -281,19 +265,24 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case cmd == "/history":
+		for i, h := range m.history {
+			m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  %d  %s", i+1, h)))
+		}
+		return nil
 
 	case cmd == "/resume":
 		m.push(roleSystem, infoStyle.Render("/resume not yet implemented"))
 		return nil
 	}
 
+	// Mode shorthand: "/ask some text" etc.
 	for _, mode := range []modes.Mode{
 		modes.ModeAsk, modes.ModePlan, modes.ModeBuild,
 		modes.ModeInvestigate, modes.ModeReview,
 	} {
 		prefix := "/" + mode.String()
 		if strings.HasPrefix(strings.ToLower(cmd), prefix) {
-			m.resolver.Set(mode)
+			m.startModeTransition(mode)
 			m.sess.SetMode(mode)
 			m.sess.Save()
 			modeColor := modeAccentColor(mode)
@@ -304,7 +293,8 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			if content == "" {
 				return nil
 			}
-			m.push(roleUser, content)
+			// Echo inline content as user message
+			m.records = append(m.records, record{role: roleUser, text: content})
 			m.responseBuffer.Reset()
 			return m.streamCmd(content)
 		}
@@ -312,6 +302,14 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 	m.push(roleError, "unknown command: "+cmd)
 	return nil
+}
+
+// startModeTransition kicks off the 150ms color-fade animation.
+func (m *model) startModeTransition(target modes.Mode) {
+	m.lineAnimTargetMode = target
+	m.lineAnimProgress = 0.0
+	m.lineAnimating = true
+	m.resolver.Set(target)
 }
 
 func execShell(cmd string) (string, error) {
