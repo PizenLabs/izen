@@ -147,8 +147,12 @@ func (m *model) viewportPoint(x, y int) (mouseSelectionPoint, bool) {
 	if x < 0 {
 		x = 0
 	}
-	if x >= m.width {
-		x = m.width - 1
+	maxWidth := m.width
+	if maxWidth <= 0 {
+		maxWidth = m.vp.Width
+	}
+	if maxWidth > 0 && x >= maxWidth {
+		x = maxWidth - 1
 	}
 
 	return mouseSelectionPoint{row: m.vp.YOffset + adjustedY, col: x}, true

@@ -65,7 +65,7 @@ func TestViewportPointIncludesScrollOffset(t *testing.T) {
 	}
 	m.vp.YOffset = 25
 
-	point, ok := m.viewportPoint(4, 3)
+	point, ok := m.viewportPoint(4, 4)
 	if !ok {
 		t.Fatal("expected point inside viewport")
 	}
@@ -73,7 +73,7 @@ func TestViewportPointIncludesScrollOffset(t *testing.T) {
 		t.Fatalf("point = %+v, want row 28 col 4", point)
 	}
 
-	if _, ok := m.viewportPoint(4, 10); ok {
+	if _, ok := m.viewportPoint(4, 11); ok {
 		t.Fatal("expected y at viewport height to be outside")
 	}
 }

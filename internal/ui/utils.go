@@ -4,8 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/PizenLabs/izen/internal/modes"
 )
 
 func shortenPath(p string) string {
@@ -14,19 +12,6 @@ func shortenPath(p string) string {
 		return "~" + p[len(home):]
 	}
 	return p
-}
-
-func stripModePrefix(line string) string {
-	for _, mode := range []modes.Mode{
-		modes.ModeAsk, modes.ModePlan, modes.ModeBuild,
-		modes.ModeInvestigate, modes.ModeReview,
-	} {
-		prefix := "/" + mode.String()
-		if strings.HasPrefix(strings.ToLower(line), prefix) {
-			return strings.TrimSpace(line[len(prefix):])
-		}
-	}
-	return line
 }
 
 func (m *model) expandFileRefs(line string) string {

@@ -109,14 +109,14 @@ const (
 var coreModes = []string{"/ask", "/plan", "/build", "/investigate", "/review"}
 
 var utilityCommands = map[modes.Mode][]string{
-	modes.ModeAsk:         {"/models", "/clear"},
+	modes.ModeAsk:         {"/clear"},
 	modes.ModePlan:        {"/clear"},
 	modes.ModeBuild:       {"/undo", "/commit", "/checkpoint", "/clear"},
-	modes.ModeInvestigate: {"/history", "/resume", "/clear", "/tokens"},
+	modes.ModeInvestigate: {"/clear"},
 	modes.ModeReview:      {"/clear"},
 }
 
-var globalCommands = []string{"/help", "/mode", "/objective", "/drop", "/quit"}
+var globalCommands = []string{"/help", "/?", "/mode", "/objective", "/drop", "/quit"}
 
 // ── Elegant spinner frames ────────────────────────────────────────────────────
 var spinnerFrames = []string{" ⊹ ", " ⁕ ", " ⚙ ", " ❃ ", " ❄ ", " ❆ ", " ❃ ", " ⚙ ", " ⁕ ", " ⊹ "}

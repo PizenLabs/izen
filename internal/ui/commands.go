@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"os"
@@ -14,6 +15,19 @@ import (
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/modes"
 )
+
+var validSystemCommands = map[string]struct{}{
+	"/help":       {},
+	"/?":          {},
+	"/quit":       {},
+	"/mode":       {},
+	"/objective":  {},
+	"/clear":      {},
+	"/drop":       {},
+	"/undo":       {},
+	"/commit":     {},
+	"/checkpoint": {},
+}
 
 func (m *model) handleInput(line string) tea.Cmd {
 	line = strings.TrimSpace(line)
@@ -37,12 +51,29 @@ func (m *model) handleInput(line string) tea.Cmd {
 		if err != nil {
 			m.push(roleError, err.Error())
 		}
-		for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
-			m.push(roleSystem, l)
+		scanner := bufio.NewScanner(strings.NewReader(strings.TrimRight(out, "\r\n")))
+		for scanner.Scan() {
+			m.push(roleSystem, scanner.Text())
 		}
 		return nil
 	}
 
+	if mode, content, ok := parseModeShorthand(line); ok {
+		m.setMode(mode)
+		if content == "" {
+			return nil
+		}
+		return m.handleMessageContent(content)
+	}
+
+	if strings.HasPrefix(line, "/") {
+		return m.handleCommand(line)
+	}
+
+	return m.handleMessageContent(line)
+}
+
+func (m *model) handleMessageContent(line string) tea.Cmd {
 	var fileCtx strings.Builder
 	var refFiles []string
 	for _, field := range strings.Fields(line) {
@@ -119,25 +150,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 
 	line = m.expandFileRefs(line)
 
-	if strings.HasPrefix(line, "/") {
-		return m.handleCommand(line)
-	}
-
-	newMode := m.resolver.Resolve(line)
-	if newMode != m.resolver.Current() {
-		m.startModeTransition(newMode)
-		m.sess.SetMode(newMode)
-		m.sess.Save()
-		modeColor := modeAccentColor(newMode)
-		modeLabel := lipgloss.NewStyle().Foreground(modeColor).Render(
-			fmt.Sprintf("→ /%s — %s", newMode, newMode.Description()))
-		m.push(roleSystem, modeLabel)
-	}
-
-	content := stripModePrefix(line)
-	if content == "" {
-		return nil
-	}
+	content := strings.TrimSpace(line)
 	if fileCtx.Len() > 0 {
 		content = fileCtx.String() + "\n\n" + content
 	}
@@ -160,7 +173,49 @@ func (m *model) handleInput(line string) tea.Cmd {
 	}
 }
 
+func parseModeShorthand(line string) (modes.Mode, string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(line))
+	for _, mode := range []modes.Mode{
+		modes.ModeAsk,
+		modes.ModePlan,
+		modes.ModeBuild,
+		modes.ModeInvestigate,
+		modes.ModeReview,
+	} {
+		prefix := "/" + mode.String()
+		if lower == prefix {
+			return mode, "", true
+		}
+		if strings.HasPrefix(lower, prefix+" ") {
+			return mode, strings.TrimSpace(line[len(prefix):]), true
+		}
+	}
+	return modes.ModeAsk, "", false
+}
+
+func (m *model) setMode(mode modes.Mode) {
+	if mode == m.resolver.Current() {
+		return
+	}
+	m.startModeTransition(mode)
+	m.sess.SetMode(mode)
+	m.sess.Save()
+	modeColor := modeAccentColor(mode)
+	modeLabel := lipgloss.NewStyle().Foreground(modeColor).Render(
+		fmt.Sprintf("→ /%s — %s", mode, mode.Description()))
+	m.push(roleSystem, modeLabel)
+}
+
 func (m *model) handleCommand(cmd string) tea.Cmd {
+	name := strings.Fields(cmd)
+	if len(name) == 0 {
+		return nil
+	}
+	if _, ok := validSystemCommands[name[0]]; !ok {
+		m.push(roleError, "unknown command: "+cmd)
+		return nil
+	}
+
 	switch {
 	case cmd == "/help" || cmd == "/?":
 		m.push(roleSystem, labelBoldStyle.Render("modes"))
@@ -172,7 +227,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
 		m.push(roleSystem, infoStyle.Render("  /help  /mode  /objective  /drop  /clear  /quit"))
-		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /tokens  /history"))
+		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, infoStyle.Render("  @<path>  reference a file in your message"))
@@ -189,13 +244,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		if len(parts) == 2 {
 			mode, ok := modes.Parse(parts[1])
 			if ok {
-				m.startModeTransition(mode)
-				m.sess.SetMode(mode)
-				m.sess.Save()
-				modeColor := modeAccentColor(mode)
-				modeLabel := lipgloss.NewStyle().Foreground(modeColor).Render(
-					fmt.Sprintf("→ /%s — %s", mode, mode.Description()))
-				m.push(roleSystem, modeLabel)
+				m.setMode(mode)
 				return nil
 			}
 		}
@@ -227,9 +276,13 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 	case strings.HasPrefix(cmd, "/drop "):
 		target := filepath.Clean(strings.TrimSpace(strings.TrimPrefix(cmd, "/drop")))
+		if target == "" || target == "." {
+			m.push(roleSystem, infoStyle.Render("usage: /drop <path>"))
+			return nil
+		}
 		filtered := make([]string, 0, len(m.attachedFiles))
 		for _, f := range m.attachedFiles {
-			if f != target {
+			if filepath.Clean(f) != target {
 				filtered = append(filtered, f)
 			}
 		}
@@ -245,15 +298,6 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		}
 		return nil
 
-	case cmd == "/models":
-		m.push(roleSystem, infoStyle.Render("active model: "+m.cfg.ActiveModelName()))
-		return nil
-
-	case cmd == "/tokens":
-		m.push(roleSystem, infoStyle.Render(
-			fmt.Sprintf("tokens: %d in / %d out", m.tokenInput, m.tokenOutput)))
-		return nil
-
 	case cmd == "/undo":
 		return m.runUndoCmd()
 
@@ -263,41 +307,6 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	case cmd == "/checkpoint":
 		m.push(roleSystem, infoStyle.Render("/checkpoint not yet implemented"))
 		return nil
-
-	case cmd == "/history":
-		for i, h := range m.history {
-			m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  %d  %s", i+1, h)))
-		}
-		return nil
-
-	case cmd == "/resume":
-		m.push(roleSystem, infoStyle.Render("/resume not yet implemented"))
-		return nil
-	}
-
-	// Mode shorthand: "/ask some text" etc.
-	for _, mode := range []modes.Mode{
-		modes.ModeAsk, modes.ModePlan, modes.ModeBuild,
-		modes.ModeInvestigate, modes.ModeReview,
-	} {
-		prefix := "/" + mode.String()
-		if strings.HasPrefix(strings.ToLower(cmd), prefix) {
-			m.startModeTransition(mode)
-			m.sess.SetMode(mode)
-			m.sess.Save()
-			modeColor := modeAccentColor(mode)
-			modeLabel := lipgloss.NewStyle().Foreground(modeColor).Render(
-				fmt.Sprintf("→ /%s — %s", mode, mode.Description()))
-			m.push(roleSystem, modeLabel)
-			content := strings.TrimSpace(cmd[len(prefix):])
-			if content == "" {
-				return nil
-			}
-			// Echo inline content as user message
-			m.records = append(m.records, record{role: roleUser, text: content})
-			m.responseBuffer.Reset()
-			return m.streamCmd(content)
-		}
 	}
 
 	m.push(roleError, "unknown command: "+cmd)
