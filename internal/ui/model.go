@@ -195,6 +195,13 @@ type model struct {
 
 	// Records (source of truth; rendered into viewLines → viewport)
 	records []record
+
+	// Copy
+	mouseSelecting  bool
+	startMouseCol   int
+	startMouseRow   int
+	currentMouseCol int
+	currentMouseRow int
 }
 
 // ── Viewport helpers ──────────────────────────────────────────────────────────

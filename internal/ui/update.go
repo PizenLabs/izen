@@ -11,6 +11,7 @@ import (
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
@@ -94,30 +95,145 @@ func sgrMouseLeaks(s string) []string {
 // dispatchMouseLeak converts low-level control codes into viewport structural operations.
 func (m *model) dispatchMouseLeak(s string) {
 	for _, seq := range sgrMouseLeaks(s) {
-		button, _, row, press, ok := parseSGRMouse(seq)
-		if !ok || !press {
+		button, col, row, press, ok := parseSGRMouse(seq)
+		if !ok {
 			continue
 		}
 		switch button {
 		case 64: // Wheel up
-			m.vp.LineUp(3)
+			if press {
+				m.vp.LineUp(3)
+			}
 		case 65: // Wheel down
-			m.vp.LineDown(3)
-		case 0, 1, 2: // Left/Middle/Right click from raw SGR streams
-			if !m.vpReady {
+			if press {
+				m.vp.LineDown(3)
+			}
+		case 0, 32: // Left press/release and left-button motion
+			point, inside := m.viewportPoint(col-1, row-1)
+			if button == 32 && press {
+				if m.mouseSelecting && inside {
+					m.currentMouseRow = point.row
+					m.currentMouseCol = point.col
+				}
 				continue
 			}
-			content := m.vp.View()
-			lines := strings.Split(content, "\n")
-			// SGR rows are 1-indexed. Offset by focusLineHeight to map correctly into the viewport space.
-			visualRow := row - 1 - focusLineHeight
-			if visualRow >= 0 && visualRow < len(lines) {
-				line := strings.TrimRight(lines[visualRow], " ")
-				if line != "" {
-					_ = clipboard.WriteAll(line)
+			if press {
+				if inside {
+					m.mouseSelecting = true
+					m.startMouseRow = point.row
+					m.startMouseCol = point.col
+					m.currentMouseRow = point.row
+					m.currentMouseCol = point.col
 				}
+				continue
+			}
+			if m.mouseSelecting {
+				m.mouseSelecting = false
+				end := mouseSelectionPoint{row: m.currentMouseRow, col: m.currentMouseCol}
+				if inside {
+					end = point
+				}
+				m.copyMouseSelection(end)
 			}
 		}
+	}
+}
+
+type mouseSelectionPoint struct {
+	row int
+	col int
+}
+
+// viewportPoint normalizes screen space tracking to underlying viewport coordinates.
+// It subtracts layout chromium heights like focusLineHeight to map accurately.
+func (m *model) viewportPoint(x, y int) (mouseSelectionPoint, bool) {
+	if !m.vpReady {
+		return mouseSelectionPoint{}, false
+	}
+
+	// Subtract focusLineHeight because the viewport is offset vertically by the top chrome header
+	adjustedY := y - focusLineHeight
+	if adjustedY < 0 || adjustedY >= m.vp.Height {
+		return mouseSelectionPoint{}, false
+	}
+
+	if x < 0 {
+		x = 0
+	}
+	if x >= m.width {
+		x = m.width - 1
+	}
+
+	return mouseSelectionPoint{row: m.vp.YOffset + adjustedY, col: x}, true
+}
+
+func selectedViewportText(lines []string, start, end mouseSelectionPoint) string {
+	if len(lines) == 0 {
+		return ""
+	}
+
+	sRow, sCol := start.row, start.col
+	eRow, eCol := end.row, end.col
+	if sRow < 0 {
+		sRow = 0
+	}
+	if eRow < 0 {
+		eRow = 0
+	}
+	if sRow >= len(lines) {
+		sRow = len(lines) - 1
+	}
+	if eRow >= len(lines) {
+		eRow = len(lines) - 1
+	}
+	if sRow > eRow || (sRow == eRow && sCol > eCol) {
+		sRow, eRow = eRow, sRow
+		sCol, eCol = eCol, sCol
+	}
+
+	var selected strings.Builder
+	for row := sRow; row <= eRow; row++ {
+		line := []rune(ansi.Strip(lines[row]))
+		startCol := 0
+		if row == sRow {
+			startCol = sCol
+		}
+		endCol := len(line)
+		if row == eRow {
+			endCol = eCol + 1
+		}
+		if startCol < 0 {
+			startCol = 0
+		}
+		if startCol > len(line) {
+			startCol = len(line)
+		}
+		if endCol < 0 {
+			endCol = 0
+		}
+		if endCol > len(line) {
+			endCol = len(line)
+		}
+		if endCol < startCol {
+			endCol = startCol
+		}
+
+		selected.WriteString(strings.TrimRight(string(line[startCol:endCol]), " \t"))
+		if row < eRow {
+			selected.WriteByte('\n')
+		}
+	}
+
+	return strings.TrimRight(selected.String(), " \t\r\n")
+}
+
+func (m *model) copyMouseSelection(end mouseSelectionPoint) {
+	text := selectedViewportText(m.viewLines, mouseSelectionPoint{
+		row: m.startMouseRow,
+		col: m.startMouseCol,
+	}, end)
+	if text != "" {
+		_ = clipboard.WriteAll(text)
 	}
 }
 
@@ -140,33 +256,58 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// ── STAGE 1: Native tea.MouseMsg handling ───────────────────────────────
-	// Handles mouse signals routed when WithMouseCellMotion context flags are enabled.
+	// Handles scroll wheels, click selections, and drag-to-copy sequences.
 	if _, isMouse := msg.(tea.MouseMsg); isMouse {
 		if !m.vpReady {
 			return m, nil
 		}
 		mouseMsg := msg.(tea.MouseMsg)
-		switch mouseMsg.Type {
-		case tea.MouseWheelUp:
+		if mouseMsg.Button == tea.MouseButtonWheelUp || mouseMsg.Type == tea.MouseWheelUp {
 			m.vp.LineUp(3)
 			return m, nil
-		case tea.MouseWheelDown:
+		}
+		if mouseMsg.Button == tea.MouseButtonWheelDown || mouseMsg.Type == tea.MouseWheelDown {
 			m.vp.LineDown(3)
 			return m, nil
-		case tea.MouseLeft:
-			content := m.vp.View()
-			lines := strings.Split(content, "\n")
-			// Normalize Y-axis to match the structural viewport position by subtracting layout offset height.
-			visualRow := mouseMsg.Y - focusLineHeight
-			if visualRow >= 0 && visualRow < len(lines) {
-				line := lines[visualRow]
-				line = strings.TrimRight(line, " ")
-				if line != "" {
-					_ = clipboard.WriteAll(line)
+		}
+
+		switch mouseMsg.Action {
+		case tea.MouseActionPress:
+			if mouseMsg.Button == tea.MouseButtonLeft || mouseMsg.Type == tea.MouseLeft {
+				point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y)
+				if !ok {
+					m.mouseSelecting = false
+					return m, nil
+				}
+				m.mouseSelecting = true
+				m.startMouseRow = point.row
+				m.startMouseCol = point.col
+				m.currentMouseRow = point.row
+				m.currentMouseCol = point.col
+			}
+			return m, nil
+
+		case tea.MouseActionMotion:
+			if m.mouseSelecting {
+				if point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y); ok {
+					m.currentMouseRow = point.row
+					m.currentMouseCol = point.col
 				}
 			}
 			return m, nil
+
+		case tea.MouseActionRelease:
+			if m.mouseSelecting {
+				m.mouseSelecting = false
+				end := mouseSelectionPoint{row: m.currentMouseRow, col: m.currentMouseCol}
+				if point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y); ok {
+					end = point
+				}
+				m.copyMouseSelection(end)
+			}
+			return m, nil
 		}
+
 		return m, nil
 	}
 
@@ -408,7 +549,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// ── Fallback propagation ──────────────────────────────────────────────────
-	m.vp, vpCmd = m.vp.Update(msg)
+	// ONLY send messages to viewport fallback when not actively tracking a selection sequence,
+	// preventing Bubbletea's native viewport component from overriding or clearing our capture loop metrics.
+	if !m.mouseSelecting {
+		m.vp, vpCmd = m.vp.Update(msg)
+	}
+
 	m.ti, tiCmd = m.ti.Update(msg)
 
 	// Fallback Guard: Scan and purge asynchronous sequence fragments or leaks
