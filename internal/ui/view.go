@@ -253,22 +253,109 @@ func (m *model) printRecord(rec record) string {
 	gutter := gutterFor(rec.role)
 	content := rec.text
 
+	// Helper function to wrap text to width
+	wrapStringToWidth := func(text string, maxW int) []string {
+		if len(text) == 0 {
+			return []string{""}
+		}
+		var chunks []string
+		words := strings.Fields(text)
+		if len(words) == 0 {
+			runes := []rune(text)
+			for i := 0; i < len(runes); i += maxW {
+				end := i + maxW
+				if end > len(runes) {
+					end = len(runes)
+				}
+				chunks = append(chunks, string(runes[i:end]))
+			}
+			return chunks
+		}
+
+		var currentLine strings.Builder
+		for _, word := range words {
+			if len(word) > maxW {
+				if currentLine.Len() > 0 {
+					chunks = append(chunks, currentLine.String())
+					currentLine.Reset()
+				}
+				runes := []rune(word)
+				for i := 0; i < len(runes); i += maxW {
+					end := i + maxW
+					if end > len(runes) {
+						end = len(runes)
+					}
+					chunks = append(chunks, string(runes[i:end]))
+				}
+				continue
+			}
+
+			if currentLine.Len()+1+len(word) > maxW {
+				chunks = append(chunks, currentLine.String())
+				currentLine.Reset()
+				currentLine.WriteString(word)
+			} else {
+				if currentLine.Len() > 0 {
+					currentLine.WriteString(" ")
+				}
+				currentLine.WriteString(word)
+			}
+		}
+		if currentLine.Len() > 0 {
+			chunks = append(chunks, currentLine.String())
+		}
+		return chunks
+	}
+
 	// Trigger advanced split diff renderer if code modifications are detected
 	if rec.role == roleAI && (strings.Contains(content, "\n+") || strings.Contains(content, "\n-")) {
 		return gutter + m.renderAdvancedDiff(content)
 	}
 
+	// Calculate available width for content (gutter is 2 chars wide: e.g., "▌ " or "  ")
+	availableWidth := m.width - 2
+	if availableWidth < 20 {
+		availableWidth = 20
+	}
+
+	// Wrap content to available width
+	wrappedLines := wrapStringToWidth(content, availableWidth)
+
+	// Apply appropriate styling based on role
 	switch rec.role {
 	case roleUser:
-		return gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render(content)
+		styledLines := make([]string, len(wrappedLines))
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+		for i, line := range wrappedLines {
+			styledLines[i] = gutter + style.Render(line)
+		}
+		return strings.Join(styledLines, "\n")
 	case roleAI:
-		return gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render(content)
+		styledLines := make([]string, len(wrappedLines))
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+		for i, line := range wrappedLines {
+			styledLines[i] = gutter + style.Render(line)
+		}
+		return strings.Join(styledLines, "\n")
 	case roleError:
-		return gutter + errorStyle.Render(content)
+		styledLines := make([]string, len(wrappedLines))
+		for i, line := range wrappedLines {
+			styledLines[i] = gutter + errorStyle.Render(line)
+		}
+		return strings.Join(styledLines, "\n")
 	case roleStatus:
-		return gutter + lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render(content)
+		styledLines := make([]string, len(wrappedLines))
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus))
+		for i, line := range wrappedLines {
+			styledLines[i] = gutter + style.Render(line)
+		}
+		return strings.Join(styledLines, "\n")
 	default:
-		return gutter + outputStyle.Render(content)
+		styledLines := make([]string, len(wrappedLines))
+		for i, line := range wrappedLines {
+			styledLines[i] = gutter + outputStyle.Render(line)
+		}
+		return strings.Join(styledLines, "\n")
 	}
 }
 

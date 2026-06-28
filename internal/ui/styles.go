@@ -10,10 +10,10 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 )
 
-// ── Catppuccin Mocha palette ──────────────────────────────────────────────────
+// ── Catppuccin Mocha Palette (Optimized Visual Hierarchy) ─────────────────────
 const (
-	colorText    = "#cdd6f4"
-	colorAccent  = "#a6e3a1"
+	colorText    = "#cdd6f4" // Dominant foreground text
+	colorAccent  = "#a6e3a1" // High-fidelity mint green
 	colorGreen   = "#a6e3a1"
 	colorGreenBr = "#b9f0b4"
 	colorRed     = "#f38ba8"
@@ -27,23 +27,23 @@ const (
 
 	colorSurface = "#1e1e2e"
 	colorOverlay = "#313244"
-	colorSubtle  = "#45475a"
-	colorMuted   = "#6c7086"
-	colorDimmed  = "#585b70"
+	colorSubtle  = "#45475a" // Clean structural borders
+	colorMuted   = "#6c7086" // Secondary contextual data
+	colorDimmed  = "#585b70" // Muted background data (Tokens, Stats)
 	colorBase    = "#181825"
 	colorCrust   = "#11111b"
 
 	// Diff background overlays
-	colorDiffAddBg  = "#1a2d1a" // dark green tint
-	colorDiffDelBg  = "#2d1a1a" // dark red tint
-	colorDiffAddFg  = "#a6e3a1" // mint green
-	colorDiffDelFg  = "#f38ba8" // coral red
-	colorDiffHunkFg = "#6c7086" // muted
-	colorDiffCtxFg  = "#7f849c" // dim context lines
+	colorDiffAddBg  = "#1a2d1a" // Subtle dark green tint
+	colorDiffDelBg  = "#2d1a1a" // Subtle dark red tint
+	colorDiffAddFg  = "#a6e3a1"
+	colorDiffDelFg  = "#f38ba8"
+	colorDiffHunkFg = "#585b70" // Dimmed hunk metrics
+	colorDiffCtxFg  = "#6c7086"
 
-	// Line number gutter
-	colorLineNumFg = "#45475a"
-	colorLineNumHL = "#6c7086"
+	// Line number gutter (High-Fidelity low-contrast tracking)
+	colorLineNumFg = "#45475a" // Hard dim for passive line numbers
+	colorLineNumHL = "#6c7086" // Active line highlight
 
 	// Mode accent colors — per design spec
 	colorModeAsk         = "#a6e3a1"
@@ -56,7 +56,7 @@ const (
 	colorGutterUser   = "#a6e3a1"
 	colorGutterAI     = "#89b4fa"
 	colorGutterError  = "#f38ba8"
-	colorGutterStatus = "#89dceb"
+	colorGutterStatus = "#585b70" // Dimmed status tracking gutter
 	colorGutterSystem = "#45475a"
 )
 
@@ -65,7 +65,7 @@ func lipglossColor(hex string) lipgloss.Style {
 	return lipgloss.NewStyle().Foreground(lipgloss.Color(hex))
 }
 
-// ── Color interpolation for mode-line fade ────────────────────────────────────
+// ── Color Interpolation For Mode-Line Fade ────────────────────────────────────
 
 func hexToRGB(hex string) (r, g, b float64) {
 	if len(hex) == 7 && hex[0] == '#' {
@@ -122,7 +122,7 @@ func modeLineColor(mode modes.Mode) lipgloss.Color {
 
 func modeAccentColor(m modes.Mode) lipgloss.Color { return modeLineColor(m) }
 
-// ── Shared text styles ────────────────────────────────────────────────────────
+// ── Shared Text Styles (Refactored Contrast Levels) ───────────────────────────
 var (
 	outputStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 	labelBoldStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
@@ -130,14 +130,14 @@ var (
 	sepStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
 	hairlineStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 	infoStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	spinnerStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Bold(true)
+	spinnerStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)) // Muted down from racy cyan
 	errorStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
-	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)) // Swapped from colorMuted for deeper dim
 	subtleStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
 
 	// Agent output styles
 	investigationStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow))
-	evidenceStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan))
+	evidenceStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)) // Lower distraction footprint
 	hypothesisStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorTeal))
 	reviewStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colorPink))
 	scoreStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMauve))
@@ -163,15 +163,15 @@ var (
 
 	// Chrome
 	logoStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreenBr))
-	versionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	versionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)) // Muted version info
 	dotStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	bulletStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).SetString(" • ")
+	bulletStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)).SetString(" • ")
 
 	modeTabActiveStyle   = lipgloss.NewStyle().Bold(true).Padding(0, 1)
 	modeTabInactiveStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)).Padding(0, 1)
 
 	statusLeftStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	statusRightStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	statusRightStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)) // Enforces low contrast on token metrics
 	statusSepStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)).SetString(" │ ")
 
 	// Gutter markers
@@ -193,9 +193,9 @@ var (
 	hlNumber  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))
 	hlType    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorPink))
 	hlCodeBg  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Background(lipgloss.Color(colorOverlay))
-	hlLang    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Bold(true)
+	hlLang    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)).Bold(true) // Dimmed down structural metadata
 
-	// Diff (line-numbered style)
+	// Diff (Dynamic Layout)
 	diffAddBgStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDiffAddFg)).Background(lipgloss.Color(colorDiffAddBg))
 	diffDelBgStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDiffDelFg)).Background(lipgloss.Color(colorDiffDelBg))
 	diffHunkStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDiffHunkFg))
@@ -214,7 +214,7 @@ var (
 	confirmFileStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 )
 
-// ── Gutter / label helpers ────────────────────────────────────────────────────
+// ── Gutter / Label Helpers ────────────────────────────────────────────────────
 
 func gutterFor(r role) string {
 	switch r {

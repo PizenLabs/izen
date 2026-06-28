@@ -246,10 +246,16 @@ func (m *model) rebuildViewport() {
 	m.vp.GotoBottom()
 }
 
-// appendViewLine appends a single rendered line and updates viewport.
+// appendViewLine appends a rendered line (which may contain multiple visual lines due to wrapping)
+// and updates viewport.
 func (m *model) appendViewLine(line string) {
-	m.viewLines = append(m.viewLines, line)
+	// Split the input line by newlines to get individual visual lines
+	visualLines := strings.Split(line, "\n")
+	// Add each visual line to our buffer
+	m.viewLines = append(m.viewLines, visualLines...)
+	// Update the viewport content
 	m.vp.SetContent(strings.Join(m.viewLines, "\n"))
+	// Scroll to bottom
 	m.vp.GotoBottom()
 }
 
