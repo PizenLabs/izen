@@ -9,6 +9,12 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 )
 
+type Message struct {
+	Role      string    `json:"role"`
+	Content   string    `json:"content"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
 type Session struct {
 	Objective       string     `json:"objective"`
 	Mode            modes.Mode `json:"mode"`
@@ -19,6 +25,7 @@ type Session struct {
 	ReviewID        string     `json:"review_id,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
+	History         []Message  `json:"history,omitempty"`
 	path            string
 }
 
@@ -122,4 +129,56 @@ func (s *Session) SaveReview(data []byte) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "report.json"), data, 0644)
+}
+
+// AddMessage appends a new message to the history and enforces the sliding window limit.
+func (s *Session) AddMessage(role, content string, maxTurns int) {
+	msg := Message{
+		Role:      role,
+		Content:   content,
+		Timestamp: time.Now(),
+	}
+	s.History = append(s.History, msg)
+
+	// Calculate maximum number of messages to keep (user-assistant pairs * 2)
+	maxMessages := maxTurns * 2
+	if len(s.History) > maxMessages {
+		// Keep only the most recent maxMessages messages
+		s.History = s.History[len(s.History)-maxMessages:]
+	}
+}
+
+// ClearHistory resets the history slice to empty.
+func (s *Session) ClearHistory() {
+	s.History = []Message{}
+}
+
+// WriteToGlobalLog appends a log entry to the global history log file.
+func WriteToGlobalLog(pizenDir string, role, content string) error {
+	logEntry := struct {
+		Timestamp string `json:"timestamp"`
+		Role      string `json:"role"`
+		Content   string `json:"content"`
+	}{
+		Timestamp: time.Now().Format(time.RFC3339),
+		Role:      role,
+		Content:   content,
+	}
+
+	data, err := json.Marshal(logEntry)
+	if err != nil {
+		return err
+	}
+	// Append newline for JSONL compliance
+	data = append(data, '\n')
+
+	logFile := filepath.Join(pizenDir, "history.log")
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	_, err = f.Write(data)
+	return err
 }
