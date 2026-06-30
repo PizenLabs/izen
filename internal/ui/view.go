@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 
@@ -210,6 +211,24 @@ var bannerModes = []struct{ name, desc string }{
 	{"/review", "analyze, critique, improve"},
 }
 
+func getGreeting() string {
+	userName := os.Getenv("USER")
+	if userName == "" {
+		userName = "User"
+	}
+	hour := time.Now().Hour()
+	switch {
+	case hour >= 5 && hour < 12:
+		return fmt.Sprintf("Hi %s, Good morning!", userName)
+	case hour >= 12 && hour < 17:
+		return fmt.Sprintf("Hi %s, Good afternoon!", userName)
+	case hour >= 17 && hour < 21:
+		return fmt.Sprintf("Hi %s, Good evening!", userName)
+	default:
+		return fmt.Sprintf("Hi %s, night owl!", userName)
+	}
+}
+
 func (m *model) renderStartupBanner(termWidth int) string {
 	ac := lipgloss.Color(colorGreenBr)
 	dm := lipgloss.Color(colorMuted)
@@ -241,6 +260,7 @@ func (m *model) renderStartupBanner(termWidth int) string {
 	}
 
 	rightCol := []string{
+		acS.Render(getGreeting()),
 		acS.Render("IZEN"),
 		txS.Render("engineering intelligence."),
 		txS.Render("human in control."),
