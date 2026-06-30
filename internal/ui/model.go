@@ -187,6 +187,9 @@ type model struct {
 	historyIndex int
 	historyPath  string
 
+	// Escape key press counter for quit
+	escPressCount int
+
 	// Mode-line animation
 	lineAnimProgress   float64
 	lineAnimTargetMode modes.Mode

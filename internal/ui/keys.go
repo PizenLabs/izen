@@ -28,9 +28,28 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Handle Escape key requiring three presses to quit
+	if msg.Type == tea.KeyEscape {
+		m.escPressCount++
+		if m.escPressCount >= 3 {
+			m.escPressCount = 0
+			if m.showSuggestions {
+				m.dismissSuggestions()
+				return m, nil
+			}
+			m.sess.SetMode(m.resolver.Current())
+			m.sess.Save()
+			return m, tea.Quit
+		}
+		// Wait for more ESC presses
+		return m, nil
+	}
+	// Reset escape counter on any other key
+	m.escPressCount = 0
+
 	switch msg.Type {
 	// ── Quit ─────────────────────────────────────────────────────────────────
-	case tea.KeyCtrlC, tea.KeyEscape:
+	case tea.KeyCtrlC:
 		if m.showSuggestions {
 			m.dismissSuggestions()
 			return m, nil
