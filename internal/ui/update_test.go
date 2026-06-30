@@ -1,9 +1,11 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestSGRMouseLeaksExtractsConcatenatedSequences(t *testing.T) {
@@ -65,7 +67,7 @@ func TestViewportPointIncludesScrollOffset(t *testing.T) {
 	}
 	m.vp.YOffset = 25
 
-	point, ok := m.viewportPoint(4, 4)
+	point, ok := m.viewportPoint(4, 3)
 	if !ok {
 		t.Fatal("expected point inside viewport")
 	}
@@ -73,8 +75,40 @@ func TestViewportPointIncludesScrollOffset(t *testing.T) {
 		t.Fatalf("point = %+v, want row 28 col 4", point)
 	}
 
-	if _, ok := m.viewportPoint(4, 11); ok {
+	if _, ok := m.viewportPoint(4, 10); ok {
 		t.Fatal("expected y at viewport height to be outside")
+	}
+}
+
+func TestMouseWheelScrollsViewport(t *testing.T) {
+	m := &model{
+		vpReady: true,
+		width:   80,
+		height:  20,
+		vp:      viewport.New(80, 5),
+	}
+	m.viewLines = []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
+	m.vp.SetContent(strings.Join(m.viewLines, "\n"))
+	m.vp.GotoBottom()
+
+	before := m.vp.YOffset
+	if before == 0 {
+		t.Fatal("expected viewport to have scrollable content")
+	}
+
+	_, _ = m.Update(tea.MouseMsg{
+		X:      4,
+		Y:      2,
+		Button: tea.MouseButtonWheelUp,
+		Type:   tea.MouseWheelUp,
+		Action: tea.MouseActionPress,
+	})
+
+	if m.vp.YOffset >= before {
+		t.Fatalf("wheel up did not scroll viewport: before=%d after=%d", before, m.vp.YOffset)
+	}
+	if m.mouseSelecting {
+		t.Fatal("wheel event must not start text selection")
 	}
 }
 

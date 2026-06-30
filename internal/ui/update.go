@@ -22,11 +22,15 @@ func (m *model) Init() tea.Cmd {
 	return tea.Batch(tickCmd(), animTickCmd())
 }
 
-// ── Mouse leak interception ──────────────────────────────────────────────────
+// ── Mouse Leak Interception & Buffering ──────────────────────────────────────
 
 var sgrMousePattern = regexp.MustCompile(`(?:\x1b)?\[<(\d+);(\d+);(\d+)([Mm])`)
-var mouseFragmentRegex = regexp.MustCompile(`\[<\d*;?\d*;?\d*[Mm]?`)
+var mouseFragmentRegex = regexp.MustCompile(`\[<.*|\[+.*|<+.*|;+.*`)
 
+// Global timestamp tracker to trap split microsecond terminal driver leaks
+var lastAnyMouseActivity time.Time
+
+// parseSGRMouse decodes raw SGR mouse sequences into structured data components.
 func parseSGRMouse(s string) (button, col, row int, press, ok bool) {
 	s = strings.TrimPrefix(s, "\x1b")
 	if !strings.HasPrefix(s, "[<") {
@@ -52,6 +56,7 @@ func parseSGRMouse(s string) (button, col, row int, press, ok bool) {
 	return
 }
 
+// isSGRMouseLeak detects if a raw key sequence contains mouse tracking signatures.
 func isSGRMouseLeak(s string) bool {
 	if strings.Contains(s, "[<") || strings.Contains(s, "\x1b[<") {
 		return true
@@ -62,6 +67,7 @@ func isSGRMouseLeak(s string) bool {
 	return false
 }
 
+// sgrMouseLeaks extracts valid mouse tracking sequence matches from text streams.
 func sgrMouseLeaks(s string) []string {
 	matches := sgrMousePattern.FindAllString(s, -1)
 	if len(matches) > 0 {
@@ -73,7 +79,7 @@ func sgrMouseLeaks(s string) []string {
 	return nil
 }
 
-// dispatchMouseLeak handles raw escape data stream from input buffer.
+// dispatchMouseLeak processes raw control sequences bypassed by terminal protocol overrides.
 func (m *model) dispatchMouseLeak(s string) {
 	for _, seq := range sgrMouseLeaks(s) {
 		button, col, row, press, ok := parseSGRMouse(seq)
@@ -81,20 +87,18 @@ func (m *model) dispatchMouseLeak(s string) {
 			continue
 		}
 
-		// Normalize Ghostty + Shift protocol bindings (buttons 0, 4, 32, 36)
 		switch button {
-		case 64: // Wheel up
-			if press {
-				m.vp.LineUp(3)
-			}
-		case 65: // Wheel down
-			if press {
-				m.vp.LineDown(3)
-			}
+		case 64, 96: // Fallback Wheel up sequence
+			m.mouseSelecting = false
+			m.vp.LineUp(3)
+			m.rebuildViewport()
+		case 65, 97: // Fallback Wheel down sequence
+			m.mouseSelecting = false
+			m.vp.LineDown(3)
+			m.rebuildViewport()
 		case 0, 4, 32, 36:
 			point, inside := m.viewportPoint(col-1, row-1)
 
-			// Handle mouse down press
 			if press && (button == 0 || button == 4) {
 				if inside {
 					m.mouseSelecting = true
@@ -106,7 +110,6 @@ func (m *model) dispatchMouseLeak(s string) {
 				continue
 			}
 
-			// Handle active motion updates
 			if press && (button == 32 || button == 36) {
 				if m.mouseSelecting && inside {
 					m.currentMouseRow = point.row
@@ -115,7 +118,6 @@ func (m *model) dispatchMouseLeak(s string) {
 				continue
 			}
 
-			// Absolute release safety guarantee trigger
 			if !press {
 				if m.mouseSelecting {
 					m.mouseSelecting = false
@@ -130,20 +132,19 @@ func (m *model) dispatchMouseLeak(s string) {
 	}
 }
 
-// mouseSelectionPoint represents a point in the viewport.
+// mouseSelectionPoint represents a specific cell position in the buffer.
 type mouseSelectionPoint struct {
 	row int
 	col int
 }
 
-// viewportPoint converts viewport-relative coordinates to buffer coordinates.
+// viewportPoint translates viewport-relative screen positions into global buffer indices.
 func (m *model) viewportPoint(x, y int) (mouseSelectionPoint, bool) {
 	if !m.vpReady {
 		return mouseSelectionPoint{}, false
 	}
 
-	adjustedY := y - focusLineHeight
-	if adjustedY < 0 || adjustedY >= m.vp.Height {
+	if y < 0 || y >= m.vp.Height {
 		return mouseSelectionPoint{}, false
 	}
 
@@ -158,10 +159,10 @@ func (m *model) viewportPoint(x, y int) (mouseSelectionPoint, bool) {
 		x = maxWidth - 1
 	}
 
-	return mouseSelectionPoint{row: m.vp.YOffset + adjustedY, col: x}, true
+	return mouseSelectionPoint{row: m.vp.YOffset + y, col: x}, true
 }
 
-// selectedViewportText returns the selected text in the viewport.
+// selectedViewportText extracts and strips ANSI sequences from a bound grid coordinate region.
 func selectedViewportText(lines []string, start, end mouseSelectionPoint) string {
 	if len(lines) == 0 {
 		return ""
@@ -190,6 +191,9 @@ func selectedViewportText(lines []string, start, end mouseSelectionPoint) string
 
 	var selected strings.Builder
 	for row := sRow; row <= eRow; row++ {
+		if row >= len(lines) {
+			break
+		}
 		rawLine := ansi.Strip(lines[row])
 		line := []rune(rawLine)
 		lineLen := len(line)
@@ -238,24 +242,19 @@ func selectedViewportText(lines []string, start, end mouseSelectionPoint) string
 	return strings.TrimSpace(selected.String())
 }
 
-// copyMouseSelection copies the selected text to the clipboard.
+// copyMouseSelection coordinates viewport context maps and writes matching text to clipboard.
 func (m *model) copyMouseSelection(end mouseSelectionPoint) {
-	content := m.vp.View()
-	lines := strings.Split(content, "\n")
+	lines := m.viewLines
+	if len(lines) == 0 {
+		content := m.vp.View()
+		lines = strings.Split(content, "\n")
+	}
 	if len(lines) == 0 {
 		return
 	}
 
-	localStart := mouseSelectionPoint{
-		row: m.startMouseRow - m.vp.YOffset,
-		col: m.startMouseCol,
-	}
-	localEnd := mouseSelectionPoint{
-		row: end.row - m.vp.YOffset,
-		col: end.col,
-	}
-
-	text := selectedViewportText(lines, localStart, localEnd)
+	startPoint := mouseSelectionPoint{row: m.startMouseRow, col: m.startMouseCol}
+	text := selectedViewportText(lines, startPoint, end)
 	if text != "" {
 		_ = clipboard.WriteAll(text)
 	}
@@ -268,36 +267,73 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		tiCmd tea.Cmd
 	)
 
-	// ── STAGE 0: Pre-switch raw mouse tracking intercept ──────────────────────
+	now := time.Now()
+
+	// ── STAGE 0: Absolute Time Shield & Broken Sequence Interception ──────────
 	if kmsg, ok := msg.(tea.KeyMsg); ok {
-		if isSGRMouseLeak(kmsg.String()) {
+		rawStr := kmsg.String()
+
+		// 1. Check if the keypress event falls within the active mouse tracking window
+		if now.Sub(lastAnyMouseActivity) < 150*time.Millisecond {
+			// Catch single or repeating control artifacts leaked at scrolling boundaries
+			if rawStr == "[" || rawStr == "<" || rawStr == ";" || rawStr == "\x1b" ||
+				strings.HasPrefix(rawStr, "m") || strings.HasPrefix(rawStr, "M") ||
+				strings.Contains(rawStr, "[") || strings.Contains(rawStr, "<") ||
+				mouseFragmentRegex.MatchString(rawStr) {
+				return m, nil // Swallow the ghost character completely
+			}
+		}
+
+		// 2. Instantly capture explicit inline bypass SGR mouse wheel sequences
+		if strings.Contains(rawStr, "[<64;") || strings.Contains(rawStr, "<64;") ||
+			strings.Contains(rawStr, "[<96;") || strings.Contains(rawStr, "<96;") {
+			lastAnyMouseActivity = now
+			m.mouseSelecting = false
+			m.vp.LineUp(3)
+			m.rebuildViewport()
+			return m, nil
+		}
+		if strings.Contains(rawStr, "[<65;") || strings.Contains(rawStr, "<65;") ||
+			strings.Contains(rawStr, "[<97;") || strings.Contains(rawStr, "<97;") {
+			lastAnyMouseActivity = now
+			m.mouseSelecting = false
+			m.vp.LineDown(3)
+			m.rebuildViewport()
+			return m, nil
+		}
+
+		// 3. Consume structural raw SGR mouse leaks natively
+		if isSGRMouseLeak(rawStr) {
+			lastAnyMouseActivity = now
 			if m.vpReady {
-				m.dispatchMouseLeak(kmsg.String())
+				m.dispatchMouseLeak(rawStr)
 			}
 			return m, nil
 		}
 	}
 
-	// ── STAGE 1: Standard unified system tea.MouseMsg handling ────────────────
+	// ── STAGE 1: Standard structured system tea.MouseMsg handling ─────────────
 	if _, isMouse := msg.(tea.MouseMsg); isMouse {
+		lastAnyMouseActivity = now
 		if !m.vpReady {
 			return m, nil
 		}
 		mouseMsg := msg.(tea.MouseMsg)
 
-		// Unified scroll handling
-		if mouseMsg.Button == tea.MouseButtonWheelUp || mouseMsg.Type == tea.MouseWheelUp {
+		switch mouseMsg.Type {
+		case tea.MouseWheelUp:
+			m.mouseSelecting = false
 			m.vp.LineUp(3)
+			m.rebuildViewport()
 			return m, nil
-		}
-		if mouseMsg.Button == tea.MouseButtonWheelDown || mouseMsg.Type == tea.MouseWheelDown {
-			m.vp.LineDown(3)
-			return m, nil
-		}
 
-		// Handle bubbletea standard mouse structure action events
-		switch mouseMsg.Action {
-		case tea.MouseActionPress:
+		case tea.MouseWheelDown:
+			m.mouseSelecting = false
+			m.vp.LineDown(3)
+			m.rebuildViewport()
+			return m, nil
+
+		case tea.MouseLeft:
 			point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y)
 			if !ok {
 				m.mouseSelecting = false
@@ -310,7 +346,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.currentMouseCol = point.col
 			return m, nil
 
-		case tea.MouseActionMotion:
+		case tea.MouseMotion:
 			if m.mouseSelecting {
 				if point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y); ok {
 					m.currentMouseRow = point.row
@@ -319,7 +355,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
-		case tea.MouseActionRelease:
+		case tea.MouseRelease:
 			if m.mouseSelecting {
 				m.mouseSelecting = false
 				end := mouseSelectionPoint{row: m.currentMouseRow, col: m.currentMouseCol}
@@ -451,7 +487,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.records = append(m.records, record{role: roleAI, text: l})
 		}
 
-		// Show delta tokens for this turn in the status message
 		delta := msg.tokenInput + msg.tokenOutput
 		deltaStr := fmt.Sprintf("%d", delta)
 		if delta >= 1000 {
@@ -567,21 +602,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return resModel, cmd
 	}
 
+	// ── STAGE 2: Viewport Update Deflection ───────────────────────────────────
+	// Block standard bubbletea viewport internal mapping from routing if mouse selection is in progress.
 	if !m.mouseSelecting {
 		m.vp, vpCmd = m.vp.Update(msg)
 	}
 
 	m.ti, tiCmd = m.ti.Update(msg)
-
-	val := m.ti.Value()
-	if strings.Contains(val, "[<") || mouseFragmentRegex.MatchString(val) {
-		cleanVal := mouseFragmentRegex.ReplaceAllString(val, "")
-		if cleanVal != val {
-			m.ti.SetValue(cleanVal)
-			m.ti.CursorEnd()
-		}
-	}
-
 	return m, tea.Batch(vpCmd, tiCmd)
 }
 

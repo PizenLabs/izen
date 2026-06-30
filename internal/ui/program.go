@@ -1,8 +1,6 @@
 package ui
 
 import (
-	"os"
-
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -49,9 +47,12 @@ func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea
 	m.loadHistory()
 	m.historyIndex = len(m.history)
 
-	opts := []tea.ProgramOption{tea.WithAltScreen()}
-	if os.Getenv("IZEN_MOUSE") == "1" {
-		opts = append(opts, tea.WithMouseCellMotion())
+	// Switch to WithMouseAllMotion to enable real-time custom drag selection maps
+	// and trigger "Release-to-Copy" automation cleanly.
+	opts := []tea.ProgramOption{
+		tea.WithAltScreen(),
+		tea.WithMouseAllMotion(),
 	}
+
 	return tea.NewProgram(m, opts...)
 }
