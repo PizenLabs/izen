@@ -85,7 +85,26 @@ func (m *model) renderPromptBox(width int) string {
 	mode := m.resolver.Current()
 	modeColor := modeLineColor(mode)
 	prefixStyle := lipgloss.NewStyle().Bold(true).Foreground(modeColor)
-	prefix := prefixStyle.Render(mode.String() + " ❯")
+
+	var prefix string
+	if width < 50 {
+		short := "?"
+		switch mode {
+		case modes.ModeAsk:
+			short = "?"
+		case modes.ModePlan:
+			short = "p"
+		case modes.ModeBuild:
+			short = "b"
+		case modes.ModeInvestigate:
+			short = "i"
+		case modes.ModeReview:
+			short = "r"
+		}
+		prefix = prefixStyle.Render(short + " ❯")
+	} else {
+		prefix = prefixStyle.Render(mode.String() + " ❯")
+	}
 
 	var inner string
 	if m.agentRunning {
@@ -141,20 +160,12 @@ func (m *model) renderActiveWidget(width int) string {
 // ── Runtime Status ────────────────────────────────────────────────────────
 
 func (m *model) renderRuntimeStatus(width int) string {
+	provider := m.cfg.ActiveProviderName()
+	isCloud := provider != "ollama" && provider != "local"
+
 	var parts []string
 
-	modelName := m.cfg.ActiveModelName()
-	parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render("model: "+modelName))
-
-	sandboxStr := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render("sandbox: local")
-	if !m.resolver.Current().ReadOnly() {
-		sandboxStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange)).Render("sandbox: write")
-	}
-	parts = append(parts, sandboxStr)
-
-	total := m.tokenInput + m.tokenOutput
-	parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Render(fmt.Sprintf("tokens: %d", total)))
-
+	// 1. Task (highest priority)
 	taskStr := "task: idle"
 	if m.agentRunning {
 		taskStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render("task: " + m.agentLabel)
@@ -163,15 +174,60 @@ func (m *model) renderRuntimeStatus(width int) string {
 	}
 	parts = append(parts, taskStr)
 
-	checkpointStr := "checkpoint: none"
-	if len(m.sess.Checkpoints) > 0 {
-		lastCP := m.sess.Checkpoints[len(m.sess.Checkpoints)-1]
-		checkpointStr = fmt.Sprintf("checkpoint: %s", lastCP)
+	// 2. Sandbox (highest priority)
+	sandboxStr := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render("sandbox: local")
+	if !m.resolver.Current().ReadOnly() {
+		sandboxStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange)).Render("sandbox: write")
 	}
-	parts = append(parts, checkpointStr)
+	parts = append(parts, sandboxStr)
+
+	// Scale dynamic components based on screen width
+	if width >= 50 {
+		// 3. Model
+		modelName := m.cfg.ActiveModelName()
+		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render("model: "+modelName))
+	}
+
+	if width >= 75 {
+		// 4. Tokens & Cost (Omit cost and % limit details for local models)
+		total := m.tokenInput + m.tokenOutput
+		var tokStr string
+		if isCloud {
+			maxCtx := 32768
+			pct := float64(total) / float64(maxCtx) * 100
+			c := float64(m.tokenInput)*(3.0/1_000_000) + float64(m.tokenOutput)*(15.0/1_000_000)
+			costStr := fmt.Sprintf("$%.2f", c)
+			tokStr = fmt.Sprintf("tokens: %d (%.0f%%) │ cost: %s", total, pct, costStr)
+		} else {
+			tokStr = fmt.Sprintf("tokens: %d", total)
+		}
+		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Render(tokStr))
+	}
+
+	if width >= 100 {
+		// 5. Checkpoint
+		checkpointStr := "checkpoint: none"
+		if len(m.sess.Checkpoints) > 0 {
+			lastCP := m.sess.Checkpoints[len(m.sess.Checkpoints)-1]
+			if len(lastCP) > 8 {
+				checkpointStr = fmt.Sprintf("checkpoint: %s", lastCP[:8])
+			} else {
+				checkpointStr = fmt.Sprintf("checkpoint: %s", lastCP)
+			}
+		}
+		parts = append(parts, checkpointStr)
+	}
 
 	sep := lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)).Render("  │  ")
-	return strings.Join(parts, sep)
+	joined := strings.Join(parts, sep)
+
+	// Safety fallback check to prevent line wrap under extremely tight terminal splitting
+	if lipgloss.Width(joined) > width && len(parts) > 2 {
+		parts = parts[:2]
+		joined = strings.Join(parts, sep)
+	}
+
+	return joined
 }
 
 // ── Footer ────────────────────────────────────────────────────────────────
@@ -184,20 +240,25 @@ func (m *model) renderFooter(width int) string {
 		branch = "detached"
 	}
 
-	workspaceGroup := fmt.Sprintf("workspace: %s (%s)", project, branch)
-
-	provider := m.cfg.ActiveProviderName()
-	modelName := m.cfg.ActiveModelName()
-	runtimeGroup := fmt.Sprintf("runtime: %s/%s", provider, modelName)
-
 	safeStr := "safe"
 	if !m.resolver.Current().ReadOnly() {
 		safeStr = "write"
 	}
-	executionGroup := fmt.Sprintf("execution: %s", safeStr)
 
-	left := workspaceGroup + "   •   " + runtimeGroup
-	right := executionGroup
+	var left, right string
+
+	if width < 50 {
+		left = fmt.Sprintf("(%s)", branch)
+		right = safeStr
+	} else if width < 75 {
+		left = fmt.Sprintf("workspace: %s (%s)", project, branch)
+		right = fmt.Sprintf("execution: %s", safeStr)
+	} else {
+		provider := m.cfg.ActiveProviderName()
+		modelName := m.cfg.ActiveModelName()
+		left = fmt.Sprintf("workspace: %s (%s)   •   runtime: %s/%s", project, branch, provider, modelName)
+		right = fmt.Sprintf("execution: %s", safeStr)
+	}
 
 	leftW := lipgloss.Width(left)
 	rightW := lipgloss.Width(right)
@@ -499,22 +560,53 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 					continue
 				}
 				item := plTrim
+				var prefixChar string
+				var prefixColor string
+				var text string
+
 				if strings.HasPrefix(item, "- [x]") || strings.HasPrefix(item, "[x]") || strings.HasPrefix(item, "✓") {
-					item = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen)).Render("✓ " + strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [x]"), "[x]"), "✓")))
+					prefixChar = "✓ "
+					prefixColor = colorGreen
+					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [x]"), "[x]"), "✓"))
 				} else if strings.HasPrefix(item, "- [/]") || strings.HasPrefix(item, "[/]") || strings.HasPrefix(item, "●") {
-					item = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange)).Render("● " + strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [/]"), "[/]"), "●")))
+					prefixChar = "● "
+					prefixColor = colorOrange
+					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [/]"), "[/]"), "●"))
 				} else if strings.HasPrefix(item, "- [ ]") || strings.HasPrefix(item, "[ ]") || strings.HasPrefix(item, "○") {
-					item = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)).Render("○ " + strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [ ]"), "[ ]"), "○")))
+					prefixChar = "○ "
+					prefixColor = colorDimmed
+					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [ ]"), "[ ]"), "○"))
 				} else if strings.HasPrefix(item, "✗") {
-					item = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRed)).Render("✗ " + strings.TrimSpace(strings.TrimPrefix(item, "✗")))
+					prefixChar = "✗ "
+					prefixColor = colorRed
+					text = strings.TrimSpace(strings.TrimPrefix(item, "✗"))
+				} else {
+					prefixChar = "• "
+					prefixColor = colorText
+					text = item
 				}
-				contentLines = append(contentLines, item)
+
+				// Wrap plan item text to inner width leaving room for list bullet
+				wrapW := widgetInnerWidth - 2
+				if wrapW < 10 {
+					wrapW = 10
+				}
+				wrappedText := wrapStreamText(text, wrapW)
+
+				prefixStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(prefixColor))
+				for idx, line := range wrappedText {
+					if idx == 0 {
+						contentLines = append(contentLines, prefixStyle.Render(prefixChar)+line)
+					} else {
+						contentLines = append(contentLines, "  "+line) // Indented wrap
+					}
+				}
 			}
 			rendered = renderWidget("Plan", strings.Join(contentLines, "\n"), availableWidth, colorModePlan)
 
 		case blockDiff:
 			file, symbol, linesRange, cleanDiff := parseDiffMetadata(block.raw)
-			diffRendered := m.renderAdvancedDiff(cleanDiff)
+			diffRendered := m.renderAdvancedDiff(cleanDiff, widgetInnerWidth)
 
 			var details []string
 			if file != "" {
@@ -540,10 +632,20 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 			rendered = renderWidget("Table", tableContent, availableWidth, colorAccent)
 
 		case blockEvidence:
-			rendered = renderWidget("Evidence", block.raw, availableWidth, colorModeInvestigate)
+			lines := strings.Split(block.raw, "\n")
+			var wrappedLines []string
+			for _, line := range lines {
+				wrappedLines = append(wrappedLines, wrapStreamText(line, widgetInnerWidth)...)
+			}
+			rendered = renderWidget("Evidence", strings.Join(wrappedLines, "\n"), availableWidth, colorModeInvestigate)
 
 		case blockRisk:
-			rendered = renderWidget("Risk Analysis", block.raw, availableWidth, colorModeReview)
+			lines := strings.Split(block.raw, "\n")
+			var wrappedLines []string
+			for _, line := range lines {
+				wrappedLines = append(wrappedLines, wrapStreamText(line, widgetInnerWidth)...)
+			}
+			rendered = renderWidget("Risk Analysis", strings.Join(wrappedLines, "\n"), availableWidth, colorModeReview)
 
 		case blockCommand:
 			cmdText := strings.TrimSpace(block.raw)
@@ -553,7 +655,12 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 					cmdText = strings.Join(lines[1:len(lines)-1], "\n")
 				}
 			}
-			rendered = renderWidget("Command", cmdText, availableWidth, colorModeBuild)
+			lines := strings.Split(cmdText, "\n")
+			var wrappedLines []string
+			for _, line := range lines {
+				wrappedLines = append(wrappedLines, wrapStreamText(line, widgetInnerWidth)...)
+			}
+			rendered = renderWidget("Command", strings.Join(wrappedLines, "\n"), availableWidth, colorModeBuild)
 
 		default:
 			wrapped := wrapStreamText(block.raw, availableWidth)
@@ -725,6 +832,35 @@ func renderTable(rawTable string, width int) string {
 		return rawTable
 	}
 
+	// Calculate sum of column widths including padding and grid lines
+	totalTableW := 0
+	for _, w := range colWidths {
+		totalTableW += w + 3
+	}
+	totalTableW += 1
+
+	// Fallback to compact key-value listing if split terminal screen is too small
+	if totalTableW > width || width < 60 {
+		var b strings.Builder
+		headers := grid[0]
+		for rowIdx := 1; rowIdx < len(grid); rowIdx++ {
+			row := grid[rowIdx]
+			if rowIdx > 1 {
+				b.WriteString("\n" + strings.Repeat("─", width) + "\n")
+			}
+			for colIdx, val := range row {
+				header := fmt.Sprintf("Col %d", colIdx+1)
+				if colIdx < len(headers) {
+					header = headers[colIdx]
+				}
+				line := fmt.Sprintf("• %s: %s", header, val)
+				wrapped := wrapStreamText(line, width)
+				b.WriteString(strings.Join(wrapped, "\n") + "\n")
+			}
+		}
+		return strings.TrimSuffix(b.String(), "\n")
+	}
+
 	var b strings.Builder
 	b.WriteString("┌")
 	for idx, w := range colWidths {
@@ -819,7 +955,7 @@ func parseDiffMetadata(diffBody string) (file, symbol, linesRange, cleanDiff str
 }
 
 // Internal professional engine for rendering clean code diff blocks with precise line metrics.
-func (m *model) renderAdvancedDiff(diffContent string) string {
+func (m *model) renderAdvancedDiff(diffContent string, innerWidth int) string {
 	lines := strings.Split(diffContent, "\n")
 	var renderedLines []string
 
@@ -827,9 +963,9 @@ func (m *model) renderAdvancedDiff(diffContent string) string {
 	styleAddition := lipgloss.NewStyle().Background(lipgloss.Color("#18302b")).Foreground(lipgloss.Color("#6cd0a1"))
 	styleNormalText := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 
-	contentWidth := m.width - 14
-	if contentWidth < 30 {
-		contentWidth = 30
+	contentWidth := innerWidth - 14
+	if contentWidth < 20 {
+		contentWidth = 20
 	}
 
 	wrapStringToWidth := func(text string, maxW int) []string {
