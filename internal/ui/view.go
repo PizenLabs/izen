@@ -3,6 +3,8 @@ package ui
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -10,6 +12,23 @@ import (
 
 	"github.com/PizenLabs/izen/internal/modes"
 )
+
+type blockType int
+
+const (
+	blockText blockType = iota
+	blockPlan
+	blockDiff
+	blockTable
+	blockEvidence
+	blockRisk
+	blockCommand
+)
+
+type contentBlock struct {
+	kind blockType
+	raw  string
+}
 
 // View renders the entire multi-pane TUI architecture layout.
 func (m *model) View() string {
@@ -24,7 +43,7 @@ func (m *model) View() string {
 
 	var sections []string
 
-	// 1. Viewport (Manages scrollable conversation history + live stream buffer)
+	// 1. Conversation Timeline (Viewport)
 	sections = append(sections, m.vp.View())
 
 	// 2. Suggestion palette (Floats dynamically above the prompt input area)
@@ -32,14 +51,23 @@ func (m *model) View() string {
 		sections = append(sections, m.renderSuggestions(width))
 	}
 
-	// 3. Focus line separator rule
+	// 3. Engineering Widgets (Active/pinned widget, e.g. active Proposal or Progress)
+	activeWidget := m.renderActiveWidget(width)
+	if activeWidget != "" {
+		sections = append(sections, activeWidget)
+	}
+
+	// 4. Focus separator line
 	sections = append(sections, m.renderFocusLine(width))
 
-	// 4. Input Prompt box area
+	// 5. Input Prompt box area
 	sections = append(sections, m.renderPromptBox(width))
 
-	// 5. Responsive adaptive status bar
-	sections = append(sections, m.renderStatusBar(width))
+	// 6. Runtime Status
+	sections = append(sections, m.renderRuntimeStatus(width))
+
+	// 7. Footer
+	sections = append(sections, m.renderFooter(width))
 
 	return strings.Join(sections, "\n")
 }
@@ -81,124 +109,111 @@ func (m *model) renderPromptBox(width int) string {
 		Render(inner)
 }
 
-// ── Status bar ────────────────────────────────────────────────────────────
+// ── Active Widget Area ────────────────────────────────────────────────────
 
-func (m *model) renderStatusBar(width int) string {
-	// Get the path to display: prefer attached file, then pending file ref, then cwd
-	var displayPath string
-	if len(m.attachedFiles) > 0 {
-		displayPath = m.attachedFiles[0]
-	} else if len(m.pendingFileRefs) > 0 {
-		displayPath = m.pendingFileRefs[0]
-	} else {
-		wd, _ := os.Getwd()
-		displayPath = wd
+func (m *model) renderActiveWidget(width int) string {
+	if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
+		var inner strings.Builder
+		inner.WriteString("Summary: Apply proposed code changes\n")
+		inner.WriteString("Files:\n")
+		for _, p := range m.pendingProposals {
+			inner.WriteString(fmt.Sprintf("  • %s\n", p.File))
+		}
+		inner.WriteString("Risk: Low (local changes review)\n")
+		inner.WriteString("Expected Outcome: Implement edits in workspace\n")
+		inner.WriteString(strings.Repeat("─", width-4) + "\n")
+		inner.WriteString("Apply?\n")
+		inner.WriteString("[1] Accept  [2] Allow All  [3] Reject")
+
+		return renderWidget("Proposal", inner.String(), width, colorOrange)
 	}
 
-	// Shorten the path by replacing home directory with ~
-	home, _ := os.UserHomeDir()
-	if strings.HasPrefix(displayPath, home) {
-		displayPath = "~" + displayPath[len(home):]
+	if m.agentRunning {
+		var inner strings.Builder
+		inner.WriteString(fmt.Sprintf("● Running task: %s…\n", m.agentLabel))
+		inner.WriteString("Execution in progress.")
+		return renderWidget("Progress", inner.String(), width, colorYellow)
 	}
 
+	return ""
+}
+
+// ── Runtime Status ────────────────────────────────────────────────────────
+
+func (m *model) renderRuntimeStatus(width int) string {
+	var parts []string
+
+	modelName := m.cfg.ActiveModelName()
+	parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render("model: "+modelName))
+
+	sandboxStr := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render("sandbox: local")
+	if !m.resolver.Current().ReadOnly() {
+		sandboxStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange)).Render("sandbox: write")
+	}
+	parts = append(parts, sandboxStr)
+
+	total := m.tokenInput + m.tokenOutput
+	parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Render(fmt.Sprintf("tokens: %d", total)))
+
+	taskStr := "task: idle"
+	if m.agentRunning {
+		taskStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render("task: " + m.agentLabel)
+	} else if m.streaming {
+		taskStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Render("task: streaming")
+	}
+	parts = append(parts, taskStr)
+
+	checkpointStr := "checkpoint: none"
+	if len(m.sess.Checkpoints) > 0 {
+		lastCP := m.sess.Checkpoints[len(m.sess.Checkpoints)-1]
+		checkpointStr = fmt.Sprintf("checkpoint: %s", lastCP)
+	}
+	parts = append(parts, checkpointStr)
+
+	sep := lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)).Render("  │  ")
+	return strings.Join(parts, sep)
+}
+
+// ── Footer ────────────────────────────────────────────────────────────────
+
+func (m *model) renderFooter(width int) string {
+	wd, _ := os.Getwd()
+	project := filepath.Base(wd)
 	branch, _ := m.gitEng.Branch()
-
-	// 1. Build Left Side (Context Path tracking)
-	var left strings.Builder
-	left.WriteString(statusLeftStyle.Render(displayPath))
-
-	// Only display git branch details if we have enough horizontal layout width
-	if branch != "" && width >= 90 {
-		left.WriteString(dimStyle.Render(" (" + branch + ")"))
+	if branch == "" {
+		branch = "detached"
 	}
 
-	// 2. Resolve Core Token Metrics
+	workspaceGroup := fmt.Sprintf("workspace: %s (%s)", project, branch)
+
 	provider := m.cfg.ActiveProviderName()
 	modelName := m.cfg.ActiveModelName()
-	total := m.tokenInput + m.tokenOutput
-	maxCtx := 32768
-	pct := float64(total) / float64(maxCtx) * 100
+	runtimeGroup := fmt.Sprintf("runtime: %s/%s", provider, modelName)
 
-	var tokStr string
-	if total >= 1000 {
-		tokStr = fmt.Sprintf("%.1fk/%dk", float64(total)/1000, maxCtx/1000)
-	} else {
-		tokStr = fmt.Sprintf("%d/%dk", total, maxCtx/1000)
+	safeStr := "safe"
+	if !m.resolver.Current().ReadOnly() {
+		safeStr = "write"
 	}
-	if width >= 100 {
-		tokStr = fmt.Sprintf("%s (%.0f%%)", tokStr, pct)
-	}
+	executionGroup := fmt.Sprintf("execution: %s", safeStr)
 
-	// Calculate usage costs
-	var costStr string
-	if provider == "ollama" {
-		costStr = "$0.00"
-	} else {
-		c := float64(m.tokenInput)*(3.0/1_000_000) + float64(m.tokenOutput)*(15.0/1_000_000)
-		costStr = fmt.Sprintf("$%.2f", c)
-	}
+	left := workspaceGroup + "   •   " + runtimeGroup
+	right := executionGroup
 
-	// 3. Build Right Side dynamically based on available terminal width
-	var rightParts []string
-	sep := statusSepStyle.String()
-
-	if width < 75 {
-		// Ultra-compact layout: Optimal when sharing screen with split Neovim panes
-		rightParts = []string{
-			statusRightStyle.Render(modelName),
-			statusRightStyle.Render(tokStr),
-		}
-	} else if width < 105 {
-		// Balanced layout for standard medium windows
-		rightParts = []string{
-			statusRightStyle.Render(provider + " " + modelName),
-			statusRightStyle.Render(tokStr),
-			statusRightStyle.Render(costStr),
-		}
-	} else {
-		// Full layout mode for wide windows
-		safeStr := dimStyle.Render("safe")
-		if !m.resolver.Current().ReadOnly() {
-			safeStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange)).Render("write")
-		}
-		// Removed static "clean" indicator as per directive
-
-		// For cloud providers, show separate input/output tokens
-		if provider != "ollama" {
-			// Format: "In: Xk - Out: Yk"
-			var inStr, outStr string
-			if m.tokenInput >= 1000 {
-				inStr = fmt.Sprintf("%.1fk", float64(m.tokenInput)/1000)
-			} else {
-				inStr = fmt.Sprintf("%d", m.tokenInput)
-			}
-			if m.tokenOutput >= 1000 {
-				outStr = fmt.Sprintf("%.1fk", float64(m.tokenOutput)/1000)
-			} else {
-				outStr = fmt.Sprintf("%d", m.tokenOutput)
-			}
-			tokStr = fmt.Sprintf("In: %s - Out: %s", inStr, outStr)
-		}
-
-		rightParts = []string{
-			statusRightStyle.Render(provider + " " + modelName),
-			statusRightStyle.Render(tokStr),
-			statusRightStyle.Render(costStr),
-			safeStr,
-		}
-	}
-
-	right := strings.Join(rightParts, sep)
-
-	// 4. Compute dynamic spacer filling to align contents properly
-	leftW := lipgloss.Width(left.String())
+	leftW := lipgloss.Width(left)
 	rightW := lipgloss.Width(right)
 	gap := width - leftW - rightW
 	if gap < 1 {
 		gap = 1
 	}
 
-	return left.String() + strings.Repeat(" ", gap) + right
+	footerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	return footerStyle.Render(left + strings.Repeat(" ", gap) + right)
+}
+
+// ── Legacy Status Bar Placeholder ─────────────────────────────────────────
+
+func (m *model) renderStatusBar(width int) string {
+	return ""
 }
 
 // ── Startup banner ────────────────────────────────────────────────────────
@@ -330,6 +345,15 @@ func (m *model) printRecord(rec record) string {
 	gutter := gutterFor(rec.role)
 	content := rec.text
 
+	if rec.role == roleAI {
+		return m.renderAIResponseBlocks(content, m.width)
+	}
+
+	availableWidth := m.width - 2
+	if availableWidth < 20 {
+		availableWidth = 20
+	}
+
 	wrapStringToWidth := func(text string, maxW int) []string {
 		if len(text) == 0 {
 			return []string{""}
@@ -367,19 +391,10 @@ func (m *model) printRecord(rec record) string {
 		return chunks
 	}
 
-	if rec.role == roleAI && (strings.Contains(content, "\n+") || strings.Contains(content, "\n-")) {
-		return gutter + m.renderAdvancedDiff(content)
-	}
-
-	availableWidth := m.width - 2
-	if availableWidth < 20 {
-		availableWidth = 20
-	}
-
 	wrappedLines := wrapStringToWidth(content, availableWidth)
 
 	switch rec.role {
-	case roleUser, roleAI:
+	case roleUser:
 		styledLines := make([]string, len(wrappedLines))
 		style := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 		for i, line := range wrappedLines {
@@ -406,6 +421,401 @@ func (m *model) printRecord(rec record) string {
 		}
 		return strings.Join(styledLines, "\n")
 	}
+}
+
+// ── Widget Box & Semantic Renderers ───────────────────────────────────────
+
+func renderWidget(title string, content string, width int, accentHex string) string {
+	if width < 10 {
+		width = 10
+	}
+	innerWidth := width - 2
+	var b strings.Builder
+
+	borderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(accentHex))
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
+
+	// Top border
+	b.WriteString(borderStyle.Render("╭"+strings.Repeat("─", innerWidth)+"╮") + "\n")
+
+	// Title line
+	titleLine := " " + title
+	titleLen := lipgloss.Width(titleLine)
+	if titleLen < innerWidth {
+		titleLine += strings.Repeat(" ", innerWidth-titleLen)
+	} else {
+		titleLine = titleLine[:innerWidth]
+	}
+	b.WriteString(borderStyle.Render("│") + titleStyle.Render(titleLine) + borderStyle.Render("│") + "\n")
+
+	// Divider
+	b.WriteString(borderStyle.Render("├"+strings.Repeat("─", innerWidth)+"┤") + "\n")
+
+	// Content lines
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		visualLen := lipgloss.Width(line)
+		var padded string
+		if visualLen < innerWidth {
+			padded = line + strings.Repeat(" ", innerWidth-visualLen)
+		} else {
+			padded = line
+		}
+		b.WriteString(borderStyle.Render("│") + padded + borderStyle.Render("│") + "\n")
+	}
+
+	// Bottom border
+	b.WriteString(borderStyle.Render("╰" + strings.Repeat("─", innerWidth) + "╯"))
+	return b.String()
+}
+
+func (m *model) renderAIResponseBlocks(content string, width int) string {
+	blocks := parseAIContent(content)
+	var renderedBlocks []string
+
+	availableWidth := width - 2
+	if availableWidth < 20 {
+		availableWidth = 20
+	}
+	widgetInnerWidth := availableWidth - 2
+	if widgetInnerWidth < 18 {
+		widgetInnerWidth = 18
+	}
+
+	gutter := gutterAIStyle.Render("▌") + " "
+
+	for _, block := range blocks {
+		var rendered string
+		switch block.kind {
+		case blockPlan:
+			planLines := strings.Split(block.raw, "\n")
+			var contentLines []string
+			for _, pl := range planLines {
+				plTrim := strings.TrimSpace(pl)
+				if plTrim == "" {
+					continue
+				}
+				if strings.HasPrefix(strings.ToLower(plTrim), "plan") || strings.HasPrefix(plTrim, "#") {
+					continue
+				}
+				item := plTrim
+				if strings.HasPrefix(item, "- [x]") || strings.HasPrefix(item, "[x]") || strings.HasPrefix(item, "✓") {
+					item = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen)).Render("✓ " + strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [x]"), "[x]"), "✓")))
+				} else if strings.HasPrefix(item, "- [/]") || strings.HasPrefix(item, "[/]") || strings.HasPrefix(item, "●") {
+					item = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange)).Render("● " + strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [/]"), "[/]"), "●")))
+				} else if strings.HasPrefix(item, "- [ ]") || strings.HasPrefix(item, "[ ]") || strings.HasPrefix(item, "○") {
+					item = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)).Render("○ " + strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [ ]"), "[ ]"), "○")))
+				} else if strings.HasPrefix(item, "✗") {
+					item = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRed)).Render("✗ " + strings.TrimSpace(strings.TrimPrefix(item, "✗")))
+				}
+				contentLines = append(contentLines, item)
+			}
+			rendered = renderWidget("Plan", strings.Join(contentLines, "\n"), availableWidth, colorModePlan)
+
+		case blockDiff:
+			file, symbol, linesRange, cleanDiff := parseDiffMetadata(block.raw)
+			diffRendered := m.renderAdvancedDiff(cleanDiff)
+
+			var details []string
+			if file != "" {
+				details = append(details, lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Render("File:   "+file))
+			}
+			if symbol != "" {
+				details = append(details, lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue)).Render("Symbol: "+symbol))
+			}
+			if linesRange != "" {
+				details = append(details, lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Render("Range:  "+linesRange))
+			}
+
+			var fullContent string
+			if len(details) > 0 {
+				fullContent = strings.Join(details, "\n") + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)).Render(strings.Repeat("─", widgetInnerWidth)) + "\n" + diffRendered
+			} else {
+				fullContent = diffRendered
+			}
+			rendered = renderWidget("Edit", fullContent, availableWidth, colorModeBuild)
+
+		case blockTable:
+			tableContent := renderTable(block.raw, widgetInnerWidth)
+			rendered = renderWidget("Table", tableContent, availableWidth, colorAccent)
+
+		case blockEvidence:
+			rendered = renderWidget("Evidence", block.raw, availableWidth, colorModeInvestigate)
+
+		case blockRisk:
+			rendered = renderWidget("Risk Analysis", block.raw, availableWidth, colorModeReview)
+
+		case blockCommand:
+			cmdText := strings.TrimSpace(block.raw)
+			if strings.HasPrefix(cmdText, "```") {
+				lines := strings.Split(cmdText, "\n")
+				if len(lines) > 2 {
+					cmdText = strings.Join(lines[1:len(lines)-1], "\n")
+				}
+			}
+			rendered = renderWidget("Command", cmdText, availableWidth, colorModeBuild)
+
+		default:
+			wrapped := wrapStreamText(block.raw, availableWidth)
+			var styledLines []string
+			style := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+			for _, w := range wrapped {
+				styledLines = append(styledLines, gutter+style.Render(highlightOutput(w)))
+			}
+			rendered = strings.Join(styledLines, "\n")
+		}
+
+		if rendered != "" {
+			renderedBlocks = append(renderedBlocks, rendered)
+		}
+	}
+
+	return strings.Join(renderedBlocks, "\n\n")
+}
+
+func parseAIContent(content string) []contentBlock {
+	var blocks []contentBlock
+	lines := strings.Split(content, "\n")
+
+	var currentBlock []string
+	var currentKind blockType = blockText
+
+	inCodeBlock := false
+	codeBlockLang := ""
+
+	flush := func() {
+		if len(currentBlock) == 0 {
+			return
+		}
+		raw := strings.Join(currentBlock, "\n")
+		raw = strings.TrimSpace(raw)
+		if raw != "" {
+			blocks = append(blocks, contentBlock{kind: currentKind, raw: raw})
+		}
+		currentBlock = nil
+		currentKind = blockText
+	}
+
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+
+		if strings.HasPrefix(trimmed, "```") {
+			if inCodeBlock {
+				currentBlock = append(currentBlock, line)
+				inCodeBlock = false
+				flush()
+			} else {
+				flush()
+				inCodeBlock = true
+				codeBlockLang = strings.TrimPrefix(trimmed, "```")
+				if strings.HasPrefix(codeBlockLang, "diff") {
+					currentKind = blockDiff
+				} else if codeBlockLang == "bash" || codeBlockLang == "sh" {
+					currentKind = blockCommand
+				} else {
+					currentKind = blockText
+				}
+				currentBlock = append(currentBlock, line)
+			}
+			continue
+		}
+
+		if inCodeBlock {
+			currentBlock = append(currentBlock, line)
+			continue
+		}
+
+		// Outside code block
+		if strings.HasPrefix(trimmed, "|") && strings.HasSuffix(trimmed, "|") {
+			if currentKind != blockTable {
+				flush()
+				currentKind = blockTable
+			}
+			currentBlock = append(currentBlock, line)
+			continue
+		}
+
+		isPlanLine := strings.HasPrefix(trimmed, "✓") || strings.HasPrefix(trimmed, "●") ||
+			strings.HasPrefix(trimmed, "○") || strings.HasPrefix(trimmed, "✗") ||
+			strings.HasPrefix(trimmed, "- [ ]") || strings.HasPrefix(trimmed, "- [x]") ||
+			strings.HasPrefix(trimmed, "- [/]")
+
+		if isPlanLine || (strings.HasPrefix(strings.ToLower(trimmed), "plan") && i < len(lines)-1 && (strings.HasPrefix(strings.TrimSpace(lines[i+1]), "-") || strings.HasPrefix(strings.TrimSpace(lines[i+1]), "1.") || strings.HasPrefix(strings.TrimSpace(lines[i+1]), "✓") || strings.HasPrefix(strings.TrimSpace(lines[i+1]), "●"))) {
+			if currentKind != blockPlan {
+				flush()
+				currentKind = blockPlan
+			}
+			currentBlock = append(currentBlock, line)
+			continue
+		}
+
+		if strings.HasPrefix(strings.ToLower(trimmed), "evidence") || strings.HasPrefix(strings.ToLower(trimmed), "source:") || strings.HasPrefix(strings.ToLower(trimmed), "confidence:") {
+			if currentKind != blockEvidence {
+				flush()
+				currentKind = blockEvidence
+			}
+			currentBlock = append(currentBlock, line)
+			continue
+		}
+
+		if strings.HasPrefix(strings.ToLower(trimmed), "risk") || strings.HasPrefix(strings.ToLower(trimmed), "score:") || strings.HasPrefix(strings.ToLower(trimmed), "breaking api:") {
+			if currentKind != blockRisk {
+				flush()
+				currentKind = blockRisk
+			}
+			currentBlock = append(currentBlock, line)
+			continue
+		}
+
+		if currentKind != blockText {
+			flush()
+		}
+
+		currentBlock = append(currentBlock, line)
+	}
+	flush()
+	return blocks
+}
+
+func renderTable(rawTable string, width int) string {
+	lines := strings.Split(rawTable, "\n")
+	var grid [][]string
+	var colWidths []int
+
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if trimmed == "" {
+			continue
+		}
+		if strings.Contains(trimmed, "---") && !strings.Contains(trimmed, "[a-zA-Z]") {
+			clean := strings.ReplaceAll(trimmed, "|", "")
+			clean = strings.ReplaceAll(clean, "-", "")
+			clean = strings.ReplaceAll(clean, " ", "")
+			if clean == "" {
+				continue
+			}
+		}
+		parts := strings.Split(trimmed, "|")
+		var row []string
+		for _, p := range parts {
+			row = append(row, strings.TrimSpace(p))
+		}
+		if len(row) > 0 && row[0] == "" {
+			row = row[1:]
+		}
+		if len(row) > 0 && row[len(row)-1] == "" {
+			row = row[:len(row)-1]
+		}
+		if len(row) > 0 {
+			grid = append(grid, row)
+			for len(colWidths) < len(row) {
+				colWidths = append(colWidths, 0)
+			}
+			for idx, val := range row {
+				valLen := lipgloss.Width(val)
+				if valLen > colWidths[idx] {
+					colWidths[idx] = valLen
+				}
+			}
+		}
+	}
+
+	if len(grid) == 0 {
+		return rawTable
+	}
+
+	var b strings.Builder
+	b.WriteString("┌")
+	for idx, w := range colWidths {
+		if idx > 0 {
+			b.WriteString("┬")
+		}
+		b.WriteString(strings.Repeat("─", w+2))
+	}
+	b.WriteString("┐\n")
+
+	for rowIdx, row := range grid {
+		if rowIdx > 0 && rowIdx == 1 {
+			b.WriteString("├")
+			for idx, w := range colWidths {
+				if idx > 0 {
+					b.WriteString("┼")
+				}
+				b.WriteString(strings.Repeat("─", w+2))
+			}
+			b.WriteString("┤\n")
+		}
+
+		b.WriteString("│")
+		for idx, w := range colWidths {
+			val := ""
+			if idx < len(row) {
+				val = row[idx]
+			}
+			padded := " " + val + " "
+			extra := w + 2 - lipgloss.Width(padded)
+			if extra > 0 {
+				padded += strings.Repeat(" ", extra)
+			}
+			b.WriteString(padded)
+			b.WriteString("│")
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("└")
+	for idx, w := range colWidths {
+		if idx > 0 {
+			b.WriteString("┴")
+		}
+		b.WriteString(strings.Repeat("─", w+2))
+	}
+	b.WriteString("┘")
+
+	return b.String()
+}
+
+func parseDiffMetadata(diffBody string) (file, symbol, linesRange, cleanDiff string) {
+	lines := strings.Split(diffBody, "\n")
+	var diffLines []string
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "```") {
+			continue
+		}
+		if strings.HasPrefix(line, "--- ") {
+			continue
+		}
+		if strings.HasPrefix(line, "+++ ") {
+			file = strings.TrimPrefix(line, "+++ ")
+			if strings.HasPrefix(file, "b/") {
+				file = file[2:]
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "@@") {
+			parts := strings.Split(line, "@@")
+			if len(parts) >= 3 {
+				header := strings.TrimSpace(parts[1])
+				symbol = strings.TrimSpace(parts[2])
+
+				subparts := strings.Fields(header)
+				if len(subparts) >= 2 {
+					newRange := strings.TrimPrefix(subparts[1], "+")
+					rangeParts := strings.Split(newRange, ",")
+					if len(rangeParts) >= 2 {
+						start, _ := strconv.Atoi(rangeParts[0])
+						count, _ := strconv.Atoi(rangeParts[1])
+						linesRange = fmt.Sprintf("Lines %d-%d", start, start+count-1)
+					}
+				}
+			}
+		}
+		diffLines = append(diffLines, line)
+	}
+	cleanDiff = strings.Join(diffLines, "\n")
+	return
 }
 
 // Internal professional engine for rendering clean code diff blocks with precise line metrics.
@@ -527,27 +937,10 @@ func (m *model) renderAdvancedDiff(diffContent string) string {
 	return strings.Join(renderedLines, "\n")
 }
 
-// ── Confirmation dialog ───────────────────────────────────────────────────
+// ── Confirmation dialog (Legacy fallback) ─────────────────────────────────
 
 func (m *model) renderConfirmation(width int) string {
-	var inner strings.Builder
-	inner.WriteString("\n")
-	inner.WriteString(confirmDimStyle.Render("  proposed file changes:"))
-	for _, p := range m.pendingProposals {
-		inner.WriteString("\n  " + confirmFileStyle.Render("    "+p.File))
-	}
-	inner.WriteString("\n")
-	inner.WriteString(confirmKeyStyle.Render("  [1] Accept") + confirmDescStyle.Render("  apply this batch"))
-	inner.WriteString("\n")
-	inner.WriteString(confirmKeyStyle.Render("  [2] Allow All") + confirmDescStyle.Render("  trust agent"))
-	inner.WriteString("\n")
-	inner.WriteString(confirmKeyStyle.Render("  [3] Reject") + confirmDescStyle.Render("  cancel all"))
-	inner.WriteString("\n")
-	boxWidth := 52
-	if width < boxWidth+4 {
-		boxWidth = width - 4
-	}
-	return confirmBoxStyle.Width(boxWidth).Render(inner.String())
+	return ""
 }
 
 // renderModeBar builds the interactive suggestions palette component view.

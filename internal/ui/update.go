@@ -482,10 +482,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.responseBuffer.Reset()
 
-		highlighted := highlightOutput(final)
-		for _, l := range strings.Split(highlighted, "\n") {
-			m.records = append(m.records, record{role: roleAI, text: l})
-		}
+		m.records = append(m.records, record{role: roleAI, text: final})
 
 		delta := msg.tokenInput + msg.tokenOutput
 		deltaStr := fmt.Sprintf("%d", delta)

@@ -12,7 +12,6 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
@@ -208,11 +207,25 @@ type model struct {
 
 // viewportHeight calculates available lines for the conversation viewport.
 func (m *model) viewportHeight() int {
-	h := m.height - focusLineHeight - promptBoxHeight - statusBarHeight - viewportPadding
+	// Base heights: Focus line (1) + Prompt Box (3) + Runtime Status (1) + Footer (1)
+	baseHeight := 1 + 3 + 1 + 1
+
+	// Add dynamic heights
+	widgetH := m.activeWidgetHeight()
+
+	h := m.height - baseHeight - widgetH - viewportPadding
 	if h < 3 {
 		h = 3
 	}
 	return h
+}
+
+func (m *model) activeWidgetHeight() int {
+	widget := m.renderActiveWidget(m.width)
+	if widget == "" {
+		return 0
+	}
+	return len(strings.Split(widget, "\n"))
 }
 
 // wrapStreamText wraps raw text lines dynamically during an active live stream.
@@ -255,6 +268,10 @@ func (m *model) rebuildViewport() {
 	if !m.vpReady {
 		return
 	}
+
+	// Sync viewport height dynamically
+	m.vp.Height = m.viewportHeight()
+
 	followBottom := m.vp.AtBottom()
 	var lines []string
 	if m.showBanner {
@@ -282,15 +299,6 @@ func (m *model) rebuildViewport() {
 	} else if m.streaming {
 		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)])
 		lines = append(lines, gutterAIStyle.Render("▌")+" "+sp+"  "+infoStyle.Render("thinking…"))
-	}
-
-	if m.agentRunning {
-		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)])
-		label := lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render(m.agentLabel + "…")
-		lines = append(lines, gutterAIStyle.Render("▌")+" "+sp+"  "+label)
-	}
-	if m.awaitingConfirmation && len(m.pendingProposals) > 0 {
-		lines = append(lines, m.renderConfirmation(m.width))
 	}
 
 	m.viewLines = lines
