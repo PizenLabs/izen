@@ -11,12 +11,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// ── Awaiting approval ────────────────────────────────────────────────────
 	if m.state == StateAwaitingApproval {
 		switch msg.String() {
-		case "1":
+		case "a", "A":
 			return m, m.applySingleProposal()
-		case "2":
+		case "l", "L":
 			m.acceptAll = true
 			return m, m.applyAllProposals()
-		case "3", "esc":
+		case "r", "R", "esc":
 			m.state = StateChat
 			m.awaitingConfirmation = false
 			m.pendingProposals = nil

@@ -15,10 +15,10 @@ import (
 
 var diffBlockRegex = regexp.MustCompile("(?s)```diff\\n(.*?)```")
 
-func extractBuildProposals(response string) []patchProposal {
-	var proposals []patchProposal
+func extractBuildProposals(response string) []SemanticProposal {
+	var proposals []SemanticProposal
 	lines := strings.Split(response, "\n")
-	var current *patchProposal
+	var current *SemanticProposal
 	inBlock := false
 	content := &strings.Builder{}
 
@@ -31,7 +31,12 @@ func extractBuildProposals(response string) []patchProposal {
 				content.Reset()
 				if strings.Contains(lang, ":") {
 					parts := strings.SplitN(lang, ":", 2)
-					current = &patchProposal{File: strings.TrimSpace(parts[1])}
+					current = &SemanticProposal{
+						ID: fmt.Sprintf("build-%d", time.Now().UnixNano()),
+						Target: SemanticTarget{
+							QualifiedName: strings.TrimSpace(parts[1]),
+						},
+					}
 				} else {
 					current = nil
 				}
@@ -41,10 +46,10 @@ func extractBuildProposals(response string) []patchProposal {
 			if strings.HasPrefix(trimmed, "```") {
 				inBlock = false
 				if current != nil && content.Len() > 0 {
-					current.Content = content.String()
-					clean := filepath.Clean(current.File)
+					current.Diff = content.String()
+					clean := filepath.Clean(current.Target.QualifiedName)
 					if clean != "" && clean != "." {
-						current.File = clean
+						current.Target.QualifiedName = clean
 						proposals = append(proposals, *current)
 					}
 				}
@@ -60,8 +65,8 @@ func extractBuildProposals(response string) []patchProposal {
 	return proposals
 }
 
-func extractDiffPatches(response string) []patchProposal {
-	var proposals []patchProposal
+func extractDiffPatches(response string) []SemanticProposal {
+	var proposals []SemanticProposal
 	matches := diffBlockRegex.FindAllStringSubmatch(response, -1)
 	for _, m := range matches {
 		diffContent := strings.TrimSpace(m[1])
@@ -72,7 +77,11 @@ func extractDiffPatches(response string) []patchProposal {
 		if file != "" && body != "" {
 			clean := filepath.Clean(file)
 			if clean != "" && clean != "." {
-				proposals = append(proposals, patchProposal{File: clean, Content: body})
+				proposals = append(proposals, SemanticProposal{
+					ID:     fmt.Sprintf("build-%d", time.Now().UnixNano()),
+					Target: SemanticTarget{QualifiedName: clean},
+					Diff:   body,
+				})
 			}
 		}
 	}
@@ -148,18 +157,18 @@ func (m *model) applySingleProposal() tea.Cmd {
 	}
 	p := m.pendingProposals[0]
 	patch := &execution.Patch{
-		ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
-		File:     p.File,
-		Modified: p.Content,
+		ID:       p.ID,
+		File:     p.Target.QualifiedName,
+		Modified: p.Diff,
 	}
-	orig, err := os.ReadFile(p.File)
+	orig, err := os.ReadFile(p.Target.QualifiedName)
 	if err == nil {
 		patch.Original = string(orig)
 	}
 	if err := m.execEng.Patches.Apply(patch); err != nil {
 		m.push(roleError, "apply failed: "+err.Error())
 	} else {
-		m.push(roleSystem, infoStyle.Render("applied: "+p.File))
+		m.push(roleSystem, infoStyle.Render("applied: "+p.Target.QualifiedName))
 	}
 	m.pendingProposals = m.pendingProposals[1:]
 	if len(m.pendingProposals) == 0 {
@@ -168,8 +177,8 @@ func (m *model) applySingleProposal() tea.Cmd {
 		m.createBuildCheckpoint(1)
 	} else {
 		// Show numbered diff of next proposal
-		rendered := RenderNumberedDiff(p.Content, m.width)
-		m.push(roleSystem, fmt.Sprintf("next: %s", m.pendingProposals[0].File))
+		rendered := RenderNumberedDiff(p.Diff, m.width)
+		m.push(roleSystem, fmt.Sprintf("next: %s", m.pendingProposals[0].Target.QualifiedName))
 		for _, l := range strings.Split(rendered, "\n") {
 			m.push(roleSystem, l)
 		}
@@ -182,11 +191,11 @@ func (m *model) applyAllProposals() tea.Cmd {
 	applied := 0
 	for _, p := range m.pendingProposals {
 		patch := &execution.Patch{
-			ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
-			File:     p.File,
-			Modified: p.Content,
+			ID:       p.ID,
+			File:     p.Target.QualifiedName,
+			Modified: p.Diff,
 		}
-		orig, err := os.ReadFile(p.File)
+		orig, err := os.ReadFile(p.Target.QualifiedName)
 		if err == nil {
 			patch.Original = string(orig)
 		}
@@ -194,7 +203,7 @@ func (m *model) applyAllProposals() tea.Cmd {
 			m.push(roleError, "apply failed: "+err.Error())
 		} else {
 			applied++
-			m.push(roleSystem, infoStyle.Render("applied: "+p.File))
+			m.push(roleSystem, infoStyle.Render("applied: "+p.Target.QualifiedName))
 		}
 	}
 	m.pendingProposals = nil

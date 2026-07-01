@@ -502,10 +502,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(diffProps) > 0 {
 				existing := make(map[string]bool)
 				for _, p := range props {
-					existing[p.File] = true
+					existing[p.Target.QualifiedName] = true
 				}
 				for _, d := range diffProps {
-					if !existing[d.File] {
+					if !existing[d.Target.QualifiedName] {
 						props = append(props, d)
 					}
 				}
@@ -516,10 +516,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					for _, p := range props {
 						patch := &execution.Patch{
 							ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
-							File:     p.File,
-							Modified: p.Content,
+							File:     p.Target.QualifiedName,
+							Modified: p.Diff,
 						}
-						orig, err := os.ReadFile(p.File)
+						orig, err := os.ReadFile(p.Target.QualifiedName)
 						if err == nil {
 							patch.Original = string(orig)
 						}
@@ -527,7 +527,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.push(roleError, "apply failed: "+err.Error())
 						} else {
 							applied++
-							m.push(roleSystem, infoStyle.Render("applied: "+p.File))
+							m.push(roleSystem, infoStyle.Render("applied: "+p.Target.QualifiedName))
 						}
 					}
 					if applied > 0 {
@@ -539,7 +539,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.awaitingConfirmation = true
 					proposalMsg := "proposed changes:"
 					for _, p := range props {
-						proposalMsg += fmt.Sprintf("\n    • %s", p.File)
+						proposalMsg += fmt.Sprintf("\n    • %s", p.Target.QualifiedName)
 					}
 					m.push(roleSystem, infoStyle.Render(proposalMsg))
 				}

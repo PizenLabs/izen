@@ -1,0 +1,325 @@
+package ui
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+)
+
+// SymbolRenderer renders a presentation-ready symbol card.
+type SymbolRenderer struct {
+	Width int
+}
+
+func (r *SymbolRenderer) Render(v SymbolCardViewModel) string {
+	var b strings.Builder
+	kind := v.Kind
+	if kind == "" {
+		kind = "Symbol"
+	}
+	b.WriteString(fmt.Sprintf("  Type:   %s\n", kind))
+	b.WriteString(fmt.Sprintf("  Symbol: %s\n", v.Name))
+	if v.Module != "" {
+		b.WriteString(fmt.Sprintf("  Module: %s\n", v.Module))
+	}
+	if v.Language != "" {
+		b.WriteString(fmt.Sprintf("  Lang:   %s\n", v.Language))
+	}
+	return b.String()
+}
+
+// RiskRenderer renders a presentation-ready risk card.
+type RiskRenderer struct {
+	Width int
+}
+
+func (r *RiskRenderer) Render(v RiskCardViewModel) string {
+	level := v.Level
+	if level == "" {
+		level = "UNKNOWN"
+	}
+	reason := v.Reason
+	if reason == "" {
+		reason = "No computed risks detected"
+	}
+	return fmt.Sprintf("  Level:  %s\n  Reason: %s\n", level, reason)
+}
+
+// ImpactRenderer renders a presentation-ready impact card.
+type ImpactRenderer struct {
+	Width int
+}
+
+func (r *ImpactRenderer) Render(v ImpactCardViewModel) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("  Direct:   %d file(s) modified\n", v.DirectCount))
+	b.WriteString(fmt.Sprintf("  Indirect: %d downstream caller(s) affected\n", v.IndirectCount))
+	if v.RiskScore > 0 {
+		b.WriteString(fmt.Sprintf("  Score:    %d/100\n", v.RiskScore))
+	}
+	if v.HasAPIChanges {
+		b.WriteString("  Scope:    PUBLIC API (Breaking Risk)\n")
+	} else {
+		b.WriteString("  Scope:    Internal implementation\n")
+	}
+	return b.String()
+}
+
+// DiffRenderer renders standard semantic/syntax-highlighted diff regions.
+type DiffRenderer struct {
+	Width int
+}
+
+func (r *DiffRenderer) Render(v DiffCardViewModel) string {
+	if v.Content == "" {
+		return ""
+	}
+
+	lines := strings.Split(v.Content, "\n")
+	var renderedLines []string
+
+	styleDeletion := lipgloss.NewStyle().Background(lipgloss.Color("#3a1e24")).Foreground(lipgloss.Color("#f1707a"))
+	styleAddition := lipgloss.NewStyle().Background(lipgloss.Color("#18302b")).Foreground(lipgloss.Color("#6cd0a1"))
+	styleNormalText := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+
+	contentWidth := r.Width - 14
+	if contentWidth < 20 {
+		contentWidth = 20
+	}
+
+	wrapStringToWidth := func(text string, maxW int) []string {
+		if len(text) == 0 {
+			return []string{""}
+		}
+		var chunks []string
+		words := strings.Fields(text)
+		if len(words) == 0 {
+			runes := []rune(text)
+			for i := 0; i < len(runes); i += maxW {
+				end := i + maxW
+				if end > len(runes) {
+					end = len(runes)
+				}
+				chunks = append(chunks, string(runes[i:end]))
+			}
+			return chunks
+		}
+
+		var currentLine strings.Builder
+		for _, word := range words {
+			if currentLine.Len()+1+len(word) > maxW {
+				chunks = append(chunks, currentLine.String())
+				currentLine.Reset()
+				currentLine.WriteString(word)
+			} else {
+				if currentLine.Len() > 0 {
+					currentLine.WriteString(" ")
+				}
+				currentLine.WriteString(word)
+			}
+		}
+		if currentLine.Len() > 0 {
+			chunks = append(chunks, currentLine.String())
+		}
+		return chunks
+	}
+
+	leftLineNum := 1
+	rightLineNum := 1
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") {
+			continue
+		}
+
+		if strings.HasPrefix(line, "@@") {
+			parts := strings.Split(line, "@@")
+			symbolHeader := ""
+			if len(parts) >= 3 {
+				symbolHeader = strings.TrimSpace(parts[2])
+			}
+
+			if symbolHeader != "" {
+				// Inject clear AST-aware symbol header representation
+				renderedLines = append(renderedLines, fmt.Sprintf("  ─── Change inside Symbol: %s ───", symbolHeader))
+			}
+
+			wrappedLines := wrapStringToWidth(line, contentWidth)
+			for _, wl := range wrappedLines {
+				gutterStr := diffHunkStyle.Render("  ---  --- │ ")
+				textStr := diffHunkStyle.Render(wl)
+				renderedLines = append(renderedLines, gutterStr+textStr)
+			}
+			continue
+		}
+
+		if strings.HasPrefix(line, "-") {
+			cleanLine := strings.TrimPrefix(line, "-")
+			wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
+
+			for i, wl := range wrappedLines {
+				var gutterStr string
+				if i == 0 {
+					gutterStr = diffLineNumSty.Render(fmt.Sprintf("  %3d      │ - ", leftLineNum))
+					leftLineNum++
+				} else {
+					gutterStr = diffLineNumSty.Render("           │   ")
+				}
+				textStr := styleDeletion.Width(contentWidth).Render(wl)
+				renderedLines = append(renderedLines, gutterStr+textStr)
+			}
+		} else if strings.HasPrefix(line, "+") {
+			cleanLine := strings.TrimPrefix(line, "+")
+			wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
+
+			for i, wl := range wrappedLines {
+				var gutterStr string
+				if i == 0 {
+					gutterStr = diffLineNumHLSty.Render(fmt.Sprintf("       %3d │ + ", rightLineNum))
+					rightLineNum++
+				} else {
+					gutterStr = diffLineNumHLSty.Render("           │   ")
+				}
+				textStr := styleAddition.Width(contentWidth).Render(wl)
+				renderedLines = append(renderedLines, gutterStr+textStr)
+			}
+		} else {
+			wrappedLines := wrapStringToWidth(line, contentWidth)
+
+			for i, wl := range wrappedLines {
+				var gutterStr string
+				if i == 0 {
+					gutterStr = diffLineNumSty.Render(fmt.Sprintf("  %3d  %3d │   ", leftLineNum, rightLineNum))
+					leftLineNum++
+					rightLineNum++
+				} else {
+					gutterStr = diffLineNumSty.Render("           │   ")
+				}
+				textStr := styleNormalText.Width(contentWidth).Render(wl)
+				renderedLines = append(renderedLines, gutterStr+textStr)
+			}
+		}
+	}
+	return strings.Join(renderedLines, "\n")
+}
+
+// MutationRenderer is the orchestrator that composes sub-renderers to output the final Mutation Card.
+type MutationRenderer struct {
+	Width int
+}
+
+func (r *MutationRenderer) Render(v MutationCardViewModel) string {
+	var lines []string
+
+	// Calculate content width (accounting for borders and padding)
+	contentWidth := r.Width - 4 // 2 for borders, 2 for padding
+	if contentWidth < 20 {
+		contentWidth = 20
+	}
+
+	// Top border - minimal visual noise
+	border := strings.Repeat("─", contentWidth)
+	if len(border) == 0 {
+		border = "─"
+	}
+	lines = append(lines, border)
+	lines = append(lines, "") // Empty line for spacing
+
+	// Header - compact, one line: "Edit • getGreeting()" or "Edit • LICENSE"
+	header := "Edit"
+	if v.Target.Name != "" {
+		// Show symbol name first, fallback to file info if needed
+		symbolName := v.Target.Name
+		// Try to extract just the function/method name from qualified name
+		if dotIdx := strings.LastIndex(symbolName, "."); dotIdx >= 0 {
+			symbolName = symbolName[dotIdx+1:]
+		}
+		if slashIdx := strings.LastIndex(symbolName, "/"); slashIdx >= 0 {
+			symbolName = symbolName[slashIdx+1:]
+		}
+		if symbolName != "" {
+			header += " • " + symbolName
+		} else {
+			header += " • " + v.Target.Name
+		}
+	} else {
+		header += " • Unknown"
+	}
+	lines = append(lines, header)
+	lines = append(lines, "") // Empty line for spacing
+
+	// Semantic Summary - max 2 lines above diff
+	if v.SemanticSummary != "" {
+		// Wrap summary to fit width, limit to 2 lines max
+		wrappedSummary := wrapText(v.SemanticSummary, contentWidth)
+		if len(wrappedSummary) > 2 {
+			wrappedSummary = wrappedSummary[:2]
+		}
+		for _, line := range wrappedSummary {
+			if len(line) > 0 {
+				lines = append(lines, line)
+			}
+		}
+		lines = append(lines, "") // Empty line after summary
+	}
+
+	// Diff Renderer - the evidence (takes most space)
+	if v.Diff.Content != "" {
+		// Create a diff renderer and render the diff
+		dr := &DiffRenderer{Width: contentWidth}
+		diffRendered := dr.Render(v.Diff)
+
+		// Split the diff into lines and add them with minimal padding
+		diffLines := strings.Split(diffRendered, "\n")
+		for _, line := range diffLines {
+			if len(line) > 0 {
+				lines = append(lines, line)
+			}
+		}
+		lines = append(lines, "") // Empty line after diff
+	}
+
+	// Scope - compact: "Scope Internal/Public"
+	scope := "Internal"
+	if v.Impact.HasAPIChanges {
+		scope = "Public"
+	}
+	lines = append(lines, formatCompactField("Scope", scope, contentWidth))
+
+	// Risk - compact: "Risk LOW"
+	riskLevel := v.Risk.Level
+	if riskLevel == "" {
+		riskLevel = "UNKNOWN"
+	}
+	lines = append(lines, formatCompactField("Risk", riskLevel, contentWidth))
+
+	// Checkpoint - compact: "Checkpoint cp-18312"
+	lines = append(lines, formatCompactField("Checkpoint", "cp-pending", contentWidth))
+
+	lines = append(lines, "") // Empty line before actions
+
+	// Decision Actions - always visible, sticky: "[A] Accept    [L] Allow All    [R] Reject"
+	lines = append(lines, "[A] Accept    [L] Allow All    [R] Reject")
+	lines = append(lines, "") // Empty line before bottom border
+
+	// Bottom border - minimal visual noise
+	lines = append(lines, border)
+
+	return strings.Join(lines, "\n")
+}
+
+// SemanticRenderer legacy wrapper to maintain compatibility while migrating.
+type SemanticRenderer struct {
+	Width int
+}
+
+func NewSemanticRenderer(width int) *SemanticRenderer {
+	return &SemanticRenderer{Width: width}
+}
+
+func (r *SemanticRenderer) RenderMutationCard(m SemanticMutation) string {
+	vm := ToMutationCardViewModel(m)
+	mr := &MutationRenderer{Width: r.Width}
+	return mr.Render(vm)
+}

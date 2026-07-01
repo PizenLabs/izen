@@ -47,12 +47,6 @@ type record struct {
 	text string
 }
 
-type patchProposal struct {
-	File    string
-	Content string
-	ID      string
-}
-
 type tokenMsg string
 
 type streamDoneMsg struct {
@@ -89,7 +83,7 @@ type commitGeneratedMsg struct {
 }
 
 type buildProposalsReadyMsg struct {
-	proposals []patchProposal
+	proposals []SemanticProposal
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -172,7 +166,7 @@ type model struct {
 
 	// Proposals / approvals
 	awaitingConfirmation bool
-	pendingProposals     []patchProposal
+	pendingProposals     []SemanticProposal
 	acceptAll            bool
 
 	state UIState

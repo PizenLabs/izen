@@ -132,19 +132,18 @@ func (m *model) renderPromptBox(width int) string {
 
 func (m *model) renderActiveWidget(width int) string {
 	if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
-		var inner strings.Builder
-		inner.WriteString("Summary: Apply proposed code changes\n")
-		inner.WriteString("Files:\n")
-		for _, p := range m.pendingProposals {
-			inner.WriteString(fmt.Sprintf("  • %s\n", p.File))
-		}
-		inner.WriteString("Risk: Low (local changes review)\n")
-		inner.WriteString("Expected Outcome: Implement edits in workspace\n")
-		inner.WriteString(strings.Repeat("─", width-4) + "\n")
-		inner.WriteString("Apply?\n")
-		inner.WriteString("[1] Accept  [2] Allow All  [3] Reject")
+		// Map domain proposal to presentation ViewModel
+		vm := ToMutationCardViewModelFromProposal(m.pendingProposals[0])
 
-		return renderWidget("Proposal", inner.String(), width, colorOrange)
+		if len(m.pendingProposals) > 1 {
+			vm.Purpose = fmt.Sprintf("Apply proposed code changes for %s and %d other files", vm.Target.Name, len(m.pendingProposals)-1)
+		} else {
+			vm.Purpose = fmt.Sprintf("Apply proposed code changes for %s", vm.Target.Name)
+		}
+
+		// Delegate rendering entirely to the stateless component
+		mr := &EnhancedMutationRenderer{Width: width}
+		return mr.Render(vm)
 	}
 
 	if m.agentRunning {
@@ -490,43 +489,50 @@ func renderWidget(title string, content string, width int, accentHex string) str
 	if width < 10 {
 		width = 10
 	}
-	innerWidth := width - 2
+	innerWidth := width // We are using the full width (no vertical borders)
+
 	var b strings.Builder
 
+	// Styles for the widget
 	borderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(accentHex))
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
 
-	// Top border
-	b.WriteString(borderStyle.Render("╭"+strings.Repeat("─", innerWidth)+"╮") + "\n")
+	// Top horizontal line
+	b.WriteString(borderStyle.Render(strings.Repeat("─", innerWidth)) + "\n")
 
-	// Title line
-	titleLine := " " + title
+	// Title line (without leading space)
+	titleLine := title
 	titleLen := lipgloss.Width(titleLine)
 	if titleLen < innerWidth {
 		titleLine += strings.Repeat(" ", innerWidth-titleLen)
 	} else {
 		titleLine = titleLine[:innerWidth]
 	}
-	b.WriteString(borderStyle.Render("│") + titleStyle.Render(titleLine) + borderStyle.Render("│") + "\n")
+	b.WriteString(titleStyle.Render(titleLine) + "\n")
 
-	// Divider
-	b.WriteString(borderStyle.Render("├"+strings.Repeat("─", innerWidth)+"┤") + "\n")
+	// Separator horizontal line
+	b.WriteString(borderStyle.Render(strings.Repeat("─", innerWidth)) + "\n")
 
 	// Content lines
 	lines := strings.Split(content, "\n")
 	for _, line := range lines {
-		visualLen := lipgloss.Width(line)
-		var padded string
-		if visualLen < innerWidth {
-			padded = line + strings.Repeat(" ", innerWidth-visualLen)
+		if len(line) > 0 {
+			// We don't truncate or wrap the line; we leave it as is.
+			// If the line is shorter than innerWidth, we pad with spaces to the right.
+			visualLen := lipgloss.Width(line)
+			if visualLen < innerWidth {
+				line += strings.Repeat(" ", innerWidth-visualLen)
+			}
+			// If the line is longer, we leave it (might exceed the width, but we are not changing wrapping behavior)
+			b.WriteString(line + "\n")
 		} else {
-			padded = line
+			b.WriteString("\n")
 		}
-		b.WriteString(borderStyle.Render("│") + padded + borderStyle.Render("│") + "\n")
 	}
 
-	// Bottom border
-	b.WriteString(borderStyle.Render("╰" + strings.Repeat("─", innerWidth) + "╯"))
+	// Bottom horizontal line
+	b.WriteString(borderStyle.Render(strings.Repeat("─", innerWidth)) + "\n")
+
 	return b.String()
 }
 
@@ -606,7 +612,8 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 
 		case blockDiff:
 			file, symbol, linesRange, cleanDiff := parseDiffMetadata(block.raw)
-			diffRendered := m.renderAdvancedDiff(cleanDiff, widgetInnerWidth)
+			dr := &DiffRenderer{Width: availableWidth}
+			diffRendered := dr.Render(ToDiffCardViewModel(cleanDiff))
 
 			var details []string
 			if file != "" {
@@ -952,125 +959,6 @@ func parseDiffMetadata(diffBody string) (file, symbol, linesRange, cleanDiff str
 	}
 	cleanDiff = strings.Join(diffLines, "\n")
 	return
-}
-
-// Internal professional engine for rendering clean code diff blocks with precise line metrics.
-func (m *model) renderAdvancedDiff(diffContent string, innerWidth int) string {
-	lines := strings.Split(diffContent, "\n")
-	var renderedLines []string
-
-	styleDeletion := lipgloss.NewStyle().Background(lipgloss.Color("#3a1e24")).Foreground(lipgloss.Color("#f1707a"))
-	styleAddition := lipgloss.NewStyle().Background(lipgloss.Color("#18302b")).Foreground(lipgloss.Color("#6cd0a1"))
-	styleNormalText := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
-
-	contentWidth := innerWidth - 14
-	if contentWidth < 20 {
-		contentWidth = 20
-	}
-
-	wrapStringToWidth := func(text string, maxW int) []string {
-		if len(text) == 0 {
-			return []string{""}
-		}
-		var chunks []string
-		words := strings.Fields(text)
-		if len(words) == 0 {
-			runes := []rune(text)
-			for i := 0; i < len(runes); i += maxW {
-				end := i + maxW
-				if end > len(runes) {
-					end = len(runes)
-				}
-				chunks = append(chunks, string(runes[i:end]))
-			}
-			return chunks
-		}
-
-		var currentLine strings.Builder
-		for _, word := range words {
-			if currentLine.Len()+1+len(word) > maxW {
-				chunks = append(chunks, currentLine.String())
-				currentLine.Reset()
-				currentLine.WriteString(word)
-			} else {
-				if currentLine.Len() > 0 {
-					currentLine.WriteString(" ")
-				}
-				currentLine.WriteString(word)
-			}
-		}
-		if currentLine.Len() > 0 {
-			chunks = append(chunks, currentLine.String())
-		}
-		return chunks
-	}
-
-	leftLineNum := 1
-	rightLineNum := 1
-
-	for _, line := range lines {
-		if strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") {
-			continue
-		}
-
-		if strings.HasPrefix(line, "@@") {
-			wrappedLines := wrapStringToWidth(line, contentWidth)
-			for _, wl := range wrappedLines {
-				gutterStr := diffHunkStyle.Render("  ---  --- │ ")
-				textStr := diffHunkStyle.Render(wl)
-				renderedLines = append(renderedLines, gutterStr+textStr)
-			}
-			continue
-		}
-
-		if strings.HasPrefix(line, "-") {
-			cleanLine := strings.TrimPrefix(line, "-")
-			wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
-
-			for i, wl := range wrappedLines {
-				var gutterStr string
-				if i == 0 {
-					gutterStr = diffLineNumSty.Render(fmt.Sprintf("  %3d      │ - ", leftLineNum))
-					leftLineNum++
-				} else {
-					gutterStr = diffLineNumSty.Render("           │   ")
-				}
-				textStr := styleDeletion.Width(contentWidth).Render(wl)
-				renderedLines = append(renderedLines, gutterStr+textStr)
-			}
-		} else if strings.HasPrefix(line, "+") {
-			cleanLine := strings.TrimPrefix(line, "+")
-			wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
-
-			for i, wl := range wrappedLines {
-				var gutterStr string
-				if i == 0 {
-					gutterStr = diffLineNumHLSty.Render(fmt.Sprintf("       %3d │ + ", rightLineNum))
-					rightLineNum++
-				} else {
-					gutterStr = diffLineNumHLSty.Render("           │   ")
-				}
-				textStr := styleAddition.Width(contentWidth).Render(wl)
-				renderedLines = append(renderedLines, gutterStr+textStr)
-			}
-		} else {
-			wrappedLines := wrapStringToWidth(line, contentWidth)
-
-			for i, wl := range wrappedLines {
-				var gutterStr string
-				if i == 0 {
-					gutterStr = diffLineNumSty.Render(fmt.Sprintf("  %3d  %3d │   ", leftLineNum, rightLineNum))
-					leftLineNum++
-					rightLineNum++
-				} else {
-					gutterStr = diffLineNumSty.Render("           │   ")
-				}
-				textStr := styleNormalText.Width(contentWidth).Render(wl)
-				renderedLines = append(renderedLines, gutterStr+textStr)
-			}
-		}
-	}
-	return strings.Join(renderedLines, "\n")
 }
 
 // ── Confirmation dialog (Legacy fallback) ─────────────────────────────────
