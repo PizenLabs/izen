@@ -670,13 +670,19 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 			rendered = renderWidget("Command", strings.Join(wrappedLines, "\n"), availableWidth, colorModeBuild)
 
 		default:
-			wrapped := wrapStreamText(block.raw, availableWidth)
-			var styledLines []string
-			style := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
-			for _, w := range wrapped {
-				styledLines = append(styledLines, gutter+style.Render(highlightOutput(w)))
+			// Route plain/markdown text through the semantic MarkdownRenderer
+			// per ASK_RENDERING.md pipeline: LLM response → AST → semantic UI
+			mr := NewMarkdownRenderer(availableWidth)
+			mdRendered := mr.Render(block.raw)
+			if mdRendered != "" {
+				// Prefix each line with the AI gutter indicator
+				mdLines := strings.Split(strings.TrimRight(mdRendered, "\n"), "\n")
+				var styledLines []string
+				for _, line := range mdLines {
+					styledLines = append(styledLines, gutter+line)
+				}
+				rendered = strings.Join(styledLines, "\n")
 			}
-			rendered = strings.Join(styledLines, "\n")
 		}
 
 		if rendered != "" {
