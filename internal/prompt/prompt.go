@@ -54,6 +54,8 @@ func ForMode(mode string) string {
 	switch mode {
 	case "build":
 		return BuildSystemPrompt()
+	case "plan":
+		return PlanSystemPrompt()
 	case "investigate":
 		return InvestigateSystemPrompt()
 	default:

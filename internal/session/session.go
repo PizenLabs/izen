@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
 // Message represents a chat message.
@@ -18,16 +19,17 @@ type Message struct {
 
 // Session represents a user session.
 type Session struct {
-	Objective       string     `json:"objective"`
-	Mode            modes.Mode `json:"mode"`
-	Assumptions     []string   `json:"assumptions,omitempty"`
-	Questions       []string   `json:"questions,omitempty"`
-	Checkpoints     []string   `json:"checkpoints,omitempty"`
-	InvestigationID string     `json:"investigation_id,omitempty"`
-	ReviewID        string     `json:"review_id,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
-	History         []Message  `json:"history,omitempty"`
+	Objective       string              `json:"objective"`
+	Mode            modes.Mode          `json:"mode"`
+	Assumptions     []string            `json:"assumptions,omitempty"`
+	Questions       []string            `json:"questions,omitempty"`
+	Checkpoints     []string            `json:"checkpoints,omitempty"`
+	InvestigationID string              `json:"investigation_id,omitempty"`
+	ReviewID        string              `json:"review_id,omitempty"`
+	CurrentPlan     *plan.ExecutionPlan `json:"current_plan,omitempty"`
+	CreatedAt       time.Time           `json:"created_at"`
+	UpdatedAt       time.Time           `json:"updated_at"`
+	History         []Message           `json:"history,omitempty"`
 	path            string
 }
 
@@ -109,6 +111,18 @@ func (s *Session) SetObjective(obj string) {
 // SetMode sets the session mode.
 func (s *Session) SetMode(m modes.Mode) {
 	s.Mode = m
+}
+
+// StagePlan stores an execution plan in the session and persists to disk.
+func (s *Session) StagePlan(p *plan.ExecutionPlan) {
+	s.CurrentPlan = p
+	_ = s.Save()
+}
+
+// ClearPlan removes the current execution plan from the session and persists to disk.
+func (s *Session) ClearPlan() {
+	s.CurrentPlan = nil
+	_ = s.Save()
 }
 
 // AddAssumption adds an assumption to the session.
