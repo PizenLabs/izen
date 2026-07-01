@@ -192,6 +192,9 @@ type model struct {
 	// Records (source of truth; rendered into viewLines → viewport)
 	records []record
 
+	// Cached prompt text for logging (set on submit, cleared after stream completion)
+	currentPrompt string
+
 	// Copy
 	mouseSelecting  bool
 	startMouseCol   int

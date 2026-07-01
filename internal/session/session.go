@@ -153,6 +153,16 @@ func (s *Session) ClearHistory() {
 	s.History = []Message{}
 }
 
+// LogDir returns the directory where session logs should be stored
+func (s *Session) LogDir() string {
+	// Determine the session path using the same logic as Session.Save()
+	path := s.path
+	if path == "" {
+		path = filepath.Join(".izen", "session.json")
+	}
+	return filepath.Dir(path)
+}
+
 // WriteToGlobalLog appends a log entry to the global history log file.
 func WriteToGlobalLog(pizenDir string, role, content string) error {
 	logEntry := struct {

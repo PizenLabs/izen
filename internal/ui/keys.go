@@ -84,6 +84,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.dismissSuggestions()
 
 		if line != "" {
+			// Cache prompt text for logging before clearing input
+			m.currentPrompt = line
+
 			// Banner: hide on first user message
 			if m.showBanner {
 				m.showBanner = false

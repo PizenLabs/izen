@@ -504,8 +504,8 @@ func renderASTTable(node *goldmarkext.Table, width int, source []byte) string {
 
 	// Collect all rows: first check for a TableHeader child, then TableRow children
 	type tableRow struct {
-		cells  []*goldmarkext.TableCell
-		aligns []goldmarkext.Alignment
+		cells    []*goldmarkext.TableCell
+		aligns   []goldmarkext.Alignment
 		isHeader bool
 	}
 	var rows []tableRow

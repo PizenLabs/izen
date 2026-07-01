@@ -28,7 +28,22 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.spinnerFrame = 0
 	m.responseBuffer.Reset()
 
-	msgs := []ai.Message{{Role: "user", Content: content}}
+	// SECTION 2: THE CONTEXT INJECTION (PRE-FLIGHT LLM REQUEST)
+	// Dialogue Thread Stitching: fetch active chat context from m.sess.History
+	var msgs []ai.Message
+	if history := m.sess.History; len(history) > 0 {
+		// Map session.Message structures to ai.Message structures
+		for _, msg := range history {
+			msgs = append(msgs, ai.Message{
+				Role:    msg.Role,
+				Content: msg.Content,
+			})
+		}
+	}
+
+	// Add the current user message
+	msgs = append(msgs, ai.Message{Role: "user", Content: content})
+
 	if m.resolver.Current() == modes.ModeBuild {
 		sys := prompt.BuildSystemPrompt()
 		msgs = append([]ai.Message{{Role: "system", Content: sys}}, msgs...)
@@ -72,11 +87,12 @@ func (m *model) streamCmd(content string) tea.Cmd {
 					tokIn = len(content) / 4
 					tokOut = full.Len() / 4
 				}
-				m.streamCh <- streamDoneMsg{
+				msg := streamDoneMsg{
 					content:     full.String(),
 					tokenInput:  tokIn,
 					tokenOutput: tokOut,
 				}
+				m.streamCh <- msg
 				return
 			}
 			if err != nil {

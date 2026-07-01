@@ -15,6 +15,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/session"
 )
 
 // Init initializes background loop clock ticks for state rendering animations.
@@ -483,6 +484,33 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.responseBuffer.Reset()
 
 		m.records = append(m.records, record{role: roleAI, text: final})
+
+		// SECTION 1: INTERCEPTING STREAM COMPLETION
+		// Use cached prompt text (captured before input buffer clearing)
+		promptText := m.currentPrompt
+		if promptText != "" {
+			// Memory Context Update: Store user and assistant messages in sliding window
+			m.sess.AddMessage("user", promptText, 5)
+			m.sess.AddMessage("assistant", final, 5)
+
+			// Securely commit session.json to disk
+			if err := m.sess.Save(); err != nil {
+				m.push(roleError, fmt.Sprintf("failed to save session: %v", err))
+			}
+
+			// Persistent Appending (The Diagnostic Ledger): Write to global history.log
+			// Use session's directory for log file location
+			logDir := m.sess.LogDir()
+			if err := session.WriteToGlobalLog(logDir, "user", promptText); err != nil {
+				m.push(roleError, fmt.Sprintf("Log Engine Failure: %v", err))
+			}
+			if err := session.WriteToGlobalLog(logDir, "assistant", final); err != nil {
+				m.push(roleError, fmt.Sprintf("Log Engine Failure: %v", err))
+			}
+
+			// Clear cached prompt after use
+			m.currentPrompt = ""
+		}
 
 		delta := msg.tokenInput + msg.tokenOutput
 		deltaStr := fmt.Sprintf("%d", delta)
