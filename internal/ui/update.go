@@ -596,6 +596,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.push(roleSystem, infoStyle.Render(proposalMsg))
 				}
 			}
+			m.sess.ClearPlan()
 		}
 		m.rebuildViewport()
 		return m, nil
