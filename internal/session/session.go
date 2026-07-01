@@ -9,12 +9,14 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 )
 
+// Message represents a chat message.
 type Message struct {
 	Role      string    `json:"role"`
 	Content   string    `json:"content"`
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// Session represents a user session.
 type Session struct {
 	Objective       string     `json:"objective"`
 	Mode            modes.Mode `json:"mode"`
@@ -29,19 +31,28 @@ type Session struct {
 	path            string
 }
 
+// New creates a new session.
 func New() *Session {
 	now := time.Now()
-	return &Session{
+	s := &Session{
 		Mode:      modes.ModeAsk,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	// Apply retention policy to checkpoints and patches directories.
+	_ = RunRetentionPolicy(filepath.Join(".izen", "checkpoints"), 15)
+	_ = RunRetentionPolicy(filepath.Join(".izen", "patches"), 15)
+	return s
 }
 
+// Load loads an existing session.
 func Load() (*Session, error) {
 	path := filepath.Join(".izen", "session.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return New(), nil
+		}
 		return nil, err
 	}
 
@@ -50,9 +61,26 @@ func Load() (*Session, error) {
 		return nil, err
 	}
 	s.path = path
+	// Ensure slices are not nil
+	if s.Assumptions == nil {
+		s.Assumptions = []string{}
+	}
+	if s.Questions == nil {
+		s.Questions = []string{}
+	}
+	if s.Checkpoints == nil {
+		s.Checkpoints = []string{}
+	}
+	if s.History == nil {
+		s.History = []Message{}
+	}
+	// Apply retention policy to checkpoints and patches directories.
+	_ = RunRetentionPolicy(filepath.Join(".izen", "checkpoints"), 15)
+	_ = RunRetentionPolicy(filepath.Join(".izen", "patches"), 15)
 	return &s, nil
 }
 
+// Save saves the session to disk.
 func (s *Session) Save() error {
 	if s.path == "" {
 		s.path = filepath.Join(".izen", "session.json")
@@ -73,30 +101,37 @@ func (s *Session) Save() error {
 	return os.WriteFile(s.path, data, 0644)
 }
 
+// SetObjective sets the session objective.
 func (s *Session) SetObjective(obj string) {
 	s.Objective = obj
 }
 
+// SetMode sets the session mode.
 func (s *Session) SetMode(m modes.Mode) {
 	s.Mode = m
 }
 
+// AddAssumption adds an assumption to the session.
 func (s *Session) AddAssumption(a string) {
 	s.Assumptions = append(s.Assumptions, a)
 }
 
+// AddQuestion adds a question to the session.
 func (s *Session) AddQuestion(q string) {
 	s.Questions = append(s.Questions, q)
 }
 
+// AddCheckpoint adds a checkpoint to the session.
 func (s *Session) AddCheckpoint(c string) {
 	s.Checkpoints = append(s.Checkpoints, c)
 }
 
+// SetInvestigationID sets the investigation ID.
 func (s *Session) SetInvestigationID(id string) {
 	s.InvestigationID = id
 }
 
+// InvestigationDir returns the directory for investigation data.
 func (s *Session) InvestigationDir() string {
 	if s.InvestigationID == "" {
 		return filepath.Join(".izen", "investigations")
@@ -104,6 +139,7 @@ func (s *Session) InvestigationDir() string {
 	return filepath.Join(".izen", "investigations", s.InvestigationID)
 }
 
+// SaveInvestigation saves investigation data to a file.
 func (s *Session) SaveInvestigation(data []byte) error {
 	dir := s.InvestigationDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -112,10 +148,12 @@ func (s *Session) SaveInvestigation(data []byte) error {
 	return os.WriteFile(filepath.Join(dir, "report.json"), data, 0644)
 }
 
+// SetReviewID sets the review ID.
 func (s *Session) SetReviewID(id string) {
 	s.ReviewID = id
 }
 
+// ReviewDir returns the directory for review data.
 func (s *Session) ReviewDir() string {
 	if s.ReviewID == "" {
 		return filepath.Join(".izen", "reviews")
@@ -123,6 +161,7 @@ func (s *Session) ReviewDir() string {
 	return filepath.Join(".izen", "reviews", s.ReviewID)
 }
 
+// SaveReview saves review data to a file.
 func (s *Session) SaveReview(data []byte) error {
 	dir := s.ReviewDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
