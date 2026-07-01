@@ -1,6 +1,11 @@
 package prompt
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+
+	"github.com/PizenLabs/izen/internal/modes/plan"
+)
 
 func BuildSystemPrompt() string {
 	return `CRITICAL: You are NOT allowed to print the entire file content using markdown block code blocks like ` + "```plaintext or ```go" + `.
@@ -54,6 +59,8 @@ func ForMode(mode string) string {
 	switch mode {
 	case "build":
 		return BuildSystemPrompt()
+	case "plan":
+		return PlanSystemPrompt()
 	case "investigate":
 		return InvestigateSystemPrompt()
 	default:
@@ -67,4 +74,39 @@ func BuildMessage(mode, userContent string) string {
 		return userContent
 	}
 	return fmt.Sprintf("System: %s\n\nUser: %s", sys, userContent)
+}
+
+// CompilePlanContext serializes an ExecutionPlan into a strict constraint block
+// for injection into the build mode system prompt.
+func CompilePlanContext(p *plan.ExecutionPlan) string {
+	if p == nil || len(p.Steps) == 0 {
+		return ""
+	}
+
+	var targetFiles []string
+	var allSymbols []string
+	var explanations []string
+	seenSymbols := make(map[string]bool)
+
+	for _, step := range p.Steps {
+		targetFiles = append(targetFiles, strings.ToUpper(step.Action)+": "+step.TargetFile)
+		for _, sym := range step.Symbols {
+			if !seenSymbols[sym] {
+				seenSymbols[sym] = true
+				allSymbols = append(allSymbols, sym)
+			}
+		}
+		if step.Explanation != "" {
+			explanations = append(explanations, step.Explanation)
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("[STRICT EXECUTION CONSTRAINT]\n")
+	b.WriteString("You must execute code mutations adhering strictly to the following approved plan:\n")
+	b.WriteString("- Target Files & Actions: " + strings.Join(targetFiles, ", ") + "\n")
+	b.WriteString("- Scope of Symbols: " + strings.Join(allSymbols, ", ") + "\n")
+	b.WriteString("- Blueprint Architecture: " + strings.Join(explanations, " | ") + "\n")
+	b.WriteString("Do not modify files or symbols outside this approved scope.\n")
+	return b.String()
 }
