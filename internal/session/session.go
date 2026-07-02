@@ -2,12 +2,11 @@ package session
 
 import (
 	"encoding/json"
+	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/plan"
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/PizenLabs/izen/internal/modes"
-	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
 // Message represents a chat message.
@@ -19,17 +18,17 @@ type Message struct {
 
 // Session represents a user session.
 type Session struct {
-	Objective       string              `json:"objective"`
-	Mode            modes.Mode          `json:"mode"`
-	Assumptions     []string            `json:"assumptions,omitempty"`
-	Questions       []string            `json:"questions,omitempty"`
-	Checkpoints     []string            `json:"checkpoints,omitempty"`
-	InvestigationID string              `json:"investigation_id,omitempty"`
-	ReviewID        string              `json:"review_id,omitempty"`
-	CurrentPlan     *plan.ExecutionPlan `json:"current_plan,omitempty"`
-	CreatedAt       time.Time           `json:"created_at"`
-	UpdatedAt       time.Time           `json:"updated_at"`
-	History         []Message           `json:"history,omitempty"`
+	Objective       string      `json:"objective"`
+	Mode            modes.Mode  `json:"mode"`
+	Assumptions     []string    `json:"assumptions,omitempty"`
+	Questions       []string    `json:"questions,omitempty"`
+	Checkpoints     []string    `json:"checkpoints,omitempty"`
+	InvestigationID string      `json:"investigation_id,omitempty"`
+	ReviewID        string      `json:"review_id,omitempty"`
+	CurrentTasks    []plan.Task `json:"current_tasks,omitempty"`
+	CreatedAt       time.Time   `json:"created_at"`
+	UpdatedAt       time.Time   `json:"updated_at"`
+	History         []Message   `json:"history,omitempty"`
 	path            string
 }
 
@@ -113,15 +112,19 @@ func (s *Session) SetMode(m modes.Mode) {
 	s.Mode = m
 }
 
-// StagePlan stores an execution plan in the session and persists to disk.
-func (s *Session) StagePlan(p *plan.ExecutionPlan) {
-	s.CurrentPlan = p
+// StageTaskList stores a markdown-parsed task list in the session and persists to disk.
+func (s *Session) StageTaskList(tasks *[]plan.Task) {
+	if tasks == nil {
+		s.CurrentTasks = nil
+	} else {
+		s.CurrentTasks = *tasks
+	}
 	_ = s.Save()
 }
 
-// ClearPlan removes the current execution plan from the session and persists to disk.
-func (s *Session) ClearPlan() {
-	s.CurrentPlan = nil
+// ClearTasks removes the current task list from the session and persists to disk.
+func (s *Session) ClearTasks() {
+	s.CurrentTasks = nil
 	_ = s.Save()
 }
 

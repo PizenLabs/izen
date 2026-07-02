@@ -10,6 +10,7 @@ import (
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -30,6 +31,10 @@ func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea
 	ti.CharLimit = 0
 	ti.Focus()
 
+	planStore := plan.NewPlanStore()
+	execEng := execution.NewEngine(".", cfg, sess)
+	execEng.SetPlanStore(planStore)
+
 	m := &model{
 		cfg:           cfg,
 		sess:          sess,
@@ -39,9 +44,10 @@ func NewProgram(cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea
 		graph:         g,
 		resolver:      modes.NewResolver(),
 		attachedFiles: make([]string, 0),
-		execEng:       execution.NewEngine(".", cfg, sess),
+		execEng:       execEng,
+		planStore:     planStore,
 		ti:            ti,
-		showBanner:    true, // banner visible on first boot
+		showBanner:    true,
 	}
 	m.resolver.Set(sess.Mode)
 	m.loadHistory()

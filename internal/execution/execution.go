@@ -3,6 +3,7 @@ package execution
 import (
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/git"
+	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -14,6 +15,7 @@ type Engine struct {
 	Git         *git.Engine
 	PatchQueue  *PatchQueue
 	StreamMon   *StreamMonitor
+	PlanStore   *plan.PlanStore
 	root        string
 }
 
@@ -67,4 +69,17 @@ func (e *Engine) SetStreamContextFiles(files []string) {
 func (e *Engine) FlushStream() {
 	e.StreamMon.Flush()
 	e.StreamMon.Reset()
+}
+
+// StepCompleted marks the N-th task as done in the current plan file.
+func (e *Engine) StepCompleted(stepNum int) error {
+	if e.PlanStore == nil {
+		return nil
+	}
+	return e.PlanStore.TickTaskHoanThanh(stepNum)
+}
+
+// SetPlanStore attaches a PlanStore to the execution engine for task tracking.
+func (e *Engine) SetPlanStore(ps *plan.PlanStore) {
+	e.PlanStore = ps
 }

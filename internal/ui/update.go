@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -527,17 +526,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleStatus, fmt.Sprintf("done - +%s tokens (this turn)  •  %s", deltaStr, costStr))
 
 		if m.resolver.Current() == modes.ModePlan {
-			planJSON := extractPlanJSON(final)
-			var parsedPlan plan.ExecutionPlan
-			if err := json.Unmarshal([]byte(planJSON), &parsedPlan); err != nil {
-				m.push(roleError, fmt.Sprintf("plan parse failure: %v", err))
-			} else {
-				m.sess.StagePlan(&parsedPlan)
+			tasks := plan.ParseMarkdownToTasks(final)
+			if len(tasks) > 0 {
+				m.sess.StageTaskList(&tasks)
 				width := m.width - 2
 				if width < 20 {
 					width = 20
 				}
-				rendered := NewMarkdownRenderer(width).Render(compilePlanMarkdown(&parsedPlan))
+				renderer := NewMarkdownRenderer(width)
+				rendered := renderer.Render(compileTaskListMarkdown(&tasks))
 				if rendered != "" {
 					m.records = append(m.records, record{role: roleAI, text: rendered})
 					if m.vpReady {
@@ -670,44 +667,16 @@ func animTickCmd() tea.Cmd {
 	return tea.Tick(25*time.Millisecond, func(t time.Time) tea.Msg { return animTickMsg(t) })
 }
 
-// extractPlanJSON strips markdown code fences if present, returning clean JSON text.
-func extractPlanJSON(raw string) string {
-	text := strings.TrimSpace(raw)
-	if strings.HasPrefix(text, "```") && strings.Contains(text, "\n") {
-		firstNewline := strings.Index(text, "\n")
-		text = text[firstNewline+1:]
-		if idx := strings.LastIndex(text, "```"); idx >= 0 {
-			text = strings.TrimSpace(text[:idx])
-		}
-	}
-	return text
-}
-
-// compilePlanMarkdown builds a structured markdown document from an ExecutionPlan.
-func compilePlanMarkdown(p *plan.ExecutionPlan) string {
+func compileTaskListMarkdown(tasks *[]plan.Task) string {
 	var b strings.Builder
 
-	b.WriteString("# EXECUTION PLAN ANALYSIS\n\n")
-
-	b.WriteString("## PREREQUISITES\n")
-	for _, pr := range p.Prerequisites {
-		b.WriteString(fmt.Sprintf("- %s\n", pr))
-	}
-	b.WriteString("\n")
-
-	b.WriteString("## IMPACT ANALYSIS\n")
-	b.WriteString(p.ImpactAnalysis)
-	b.WriteString("\n\n")
-
-	b.WriteString("## CHANGELOG EXECUTION STEPS\n")
-	for i, step := range p.Steps {
-		b.WriteString(fmt.Sprintf("%d. **[%s]** Target: `%s`\n", i+1, strings.ToUpper(step.Action), step.TargetFile))
-		if len(step.Symbols) > 0 {
-			b.WriteString(fmt.Sprintf("   - Affected Symbols: %s\n", strings.Join(step.Symbols, ", ")))
+	b.WriteString("# TASK LIST\n\n")
+	for _, task := range *tasks {
+		status := "- [ ]"
+		if task.IsDone {
+			status = "- [x]"
 		}
-		if step.Explanation != "" {
-			b.WriteString(fmt.Sprintf("   - Reasoning: %s\n", step.Explanation))
-		}
+		b.WriteString(fmt.Sprintf("%s **%s**: %s | %s\n\n", status, task.Type, task.Target, task.Description))
 	}
 
 	return b.String()

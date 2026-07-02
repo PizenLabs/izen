@@ -14,6 +14,8 @@ import (
 
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/prompt"
+	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
 var validSystemCommands = map[string]struct{}{
@@ -155,6 +157,15 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		content = fileCtx.String() + "\n\n" + content
 	}
 
+	if m.resolver.Current() == modes.ModeBuild && m.graph != nil {
+		compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.Objective)
+		compressed := compressor.CompressLines(content)
+		if compressed != "" && compressed != content {
+			content = retrieval.FormatCompressedFrame(compressed) + "\n\n" + content
+		}
+		go retrieval.BuildGlobalCompressor(m.graph, m.sess.Objective)
+	}
+
 	switch m.resolver.Current() {
 	case modes.ModeInvestigate:
 		if m.investigateInvocationCount >= maxInvestigateInvocations {
@@ -166,6 +177,11 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		return m.runInvestigateCmd(content)
 	case modes.ModeReview:
 		return m.runReviewCmd()
+	case modes.ModePlan:
+		m.responseBuffer.Reset()
+		m.execEng.SetStreamContextFiles(m.attachedFiles)
+		userContent := prompt.BuildPlanPrompt(m.sess.Objective, content)
+		return m.streamCmd(userContent)
 	default:
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)

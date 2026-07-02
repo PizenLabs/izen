@@ -1,34 +1,35 @@
 package prompt
 
+import "fmt"
+
+// PlanSystemPrompt defines the rigid operational boundaries.
 func PlanSystemPrompt() string {
-	return `You are generating a structured execution plan for a software engineering task.
+	return `### SYSTEM INSTRUCTIONS (NON-NEGOTIABLE)
+You are the automated Izen Task Parser. You do not talk, you do not explain, and you do not write sample code.
+Your only output format is a single, flat Markdown task list using exactly: - [ ] TYPE: Target | Description
 
-OUTPUT FORMAT:
-Your response MUST contain ONLY a single valid JSON object with no additional text, explanation, or markdown formatting outside the JSON. Do not wrap the JSON in code fences or quote blocks.
+CRITICAL CONSTRAINTS:
+1. Do NOT wrap your output in code blocks (no ` + "```" + `).
+2. Do NOT output a single word of introductory or concluding text.
+3. Every single line MUST start with "- [ ]".
 
-JSON SCHEMA:
-{
-  "steps": [
-    {
-      "target_file": "relative/path/to/file",
-      "action": "create" | "modify" | "delete",
-      "symbols": ["StructName", "FunctionName", "VariableName"],
-      "explanation": "Granular reasoning for this tactical change"
-    }
-  ],
-  "prerequisites": [
-    "System dependency or toolchain requirement"
-  ],
-  "impact_analysis": "Brief architectural assessment detailing downstream risks and effects"
+ALLOWED TYPES:
+- FILE_MUTATE : Target is the file path.
+- SHELL_EXEC  : Target is the shell command.
+- GIT_ACTION  : Target is the internal action.`
 }
 
-CONSTRAINTS:
-- The "action" field MUST be exactly one of: "create", "modify", "delete".
-- The "symbols" array MUST list affected identifiers (structs, functions, variables) derived from the code graph.
-- Each "explanation" MUST contain specific, granular logical reasoning for the change.
-- "prerequisites" MUST enumerate system dependencies, infrastructure, or toolchains required before execution.
-- "impact_analysis" MUST provide a concise architectural risk assessment.
-- Return ONLY the raw JSON object. No introductory phrases, no concluding remarks, no markdown.
-- Escape all internal quotes and control characters properly per JSON specification.
-- Do NOT include trailing commas or comments within the JSON structure.`
+// BuildPlanPrompt builds the user message content for plan generation.
+// System-level constraints are sent separately via the "system" role.
+func BuildPlanPrompt(objective string, contextStr string) string {
+	return fmt.Sprintf(`### REPOSITORY CONTEXT:
+%s
+
+### USER OBJECTIVE:
+%s
+
+### OUTPUT ENFORCEMENT:
+Generate the execution plan now. Do not include markdown code block fences. Start your very first line with "- [ ]".
+EXECUTION_PLAN_START:
+- [ ]`, contextStr, objective)
 }
