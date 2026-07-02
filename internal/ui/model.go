@@ -214,8 +214,9 @@ func (m *model) viewportHeight() int {
 
 	// Add dynamic heights
 	widgetH := m.activeWidgetHeight()
+	suggestionH := m.suggestionPaletteHeight()
 
-	h := m.height - baseHeight - widgetH - viewportPadding
+	h := m.height - baseHeight - widgetH - suggestionH - viewportPadding
 	if h < 3 {
 		h = 3
 	}
@@ -228,6 +229,14 @@ func (m *model) activeWidgetHeight() int {
 		return 0
 	}
 	return len(strings.Split(widget, "\n"))
+}
+
+func (m *model) suggestionPaletteHeight() int {
+	if !m.showSuggestions || len(m.suggestions) == 0 {
+		return 0
+	}
+	palette := m.renderSuggestions(m.width)
+	return len(strings.Split(palette, "\n"))
 }
 
 // wrapStreamText wraps raw text lines dynamically during an active live stream.

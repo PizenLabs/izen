@@ -8,13 +8,21 @@ import (
 )
 
 func (m *model) dismissSuggestions() {
+	prevHeight := m.suggestionPaletteHeight()
+
 	m.showSuggestions = false
 	m.suggestionType = ""
 	m.suggestions = nil
 	m.suggestionIdx = 0
+
+	if m.vpReady && prevHeight != m.suggestionPaletteHeight() {
+		m.rebuildViewport()
+	}
 }
 
 func (m *model) updateSuggestions() {
+	prevHeight := m.suggestionPaletteHeight()
+
 	current := m.input.String()
 	if current == "" {
 		m.dismissSuggestions()
@@ -28,6 +36,9 @@ func (m *model) updateSuggestions() {
 		if len(m.suggestions) == 1 && m.suggestions[0] == current {
 			m.showSuggestions = false
 		}
+		if m.vpReady && prevHeight != m.suggestionPaletteHeight() {
+			m.rebuildViewport()
+		}
 		return
 	}
 	atIdx := strings.LastIndex(current, "@")
@@ -40,6 +51,9 @@ func (m *model) updateSuggestions() {
 			m.suggestionIdx = 0
 			if len(m.suggestions) == 1 && m.suggestions[0] == prefix {
 				m.showSuggestions = false
+			}
+			if m.vpReady && prevHeight != m.suggestionPaletteHeight() {
+				m.rebuildViewport()
 			}
 			return
 		}

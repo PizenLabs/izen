@@ -8,6 +8,7 @@ import "strings"
 type Task struct {
 	StepNum     int    `json:"step_num"`
 	IsDone      bool   `json:"is_done"`
+	Status      string `json:"status"`      // "idle", "processing", "done"
 	Type        string `json:"type"`        // "FILE_MUTATE", "SHELL_EXEC", "GIT_ACTION"
 	Target      string `json:"target"`      // File path or exact CLI command
 	Description string `json:"description"` // Explanation of why this step exists
@@ -48,12 +49,15 @@ func ParseMarkdownToTasks(mdContent string) []Task {
 			desc := strings.TrimSpace(targetParts[1])
 
 			isDone := false
+			status := "idle"
 			if strings.HasPrefix(line, "- [x]") {
 				isDone = true
+				status = "done"
 			}
 			task := Task{
 				StepNum:     taskCount,
 				IsDone:      isDone,
+				Status:      status,
 				Type:        typeStr,
 				Target:      target,
 				Description: desc,

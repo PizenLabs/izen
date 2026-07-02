@@ -47,12 +47,6 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	if m.resolver.Current() == modes.ModeBuild {
 		sys := prompt.BuildSystemPrompt()
 		msgs = append([]ai.Message{{Role: "system", Content: sys}}, msgs...)
-		if m.sess.CurrentPlan != nil && len(m.sess.CurrentPlan.Steps) > 0 {
-			planCtx := prompt.CompilePlanContext(m.sess.CurrentPlan)
-			if planCtx != "" {
-				msgs = append([]ai.Message{{Role: "system", Content: planCtx}}, msgs...)
-			}
-		}
 	}
 	if m.resolver.Current() == modes.ModePlan {
 		sys := prompt.PlanSystemPrompt()

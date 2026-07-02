@@ -6,6 +6,8 @@ import (
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/PizenLabs/izen/internal/modes"
 )
 
 func TestSGRMouseLeaksExtractsConcatenatedSequences(t *testing.T) {
@@ -109,6 +111,60 @@ func TestMouseWheelScrollsViewport(t *testing.T) {
 	}
 	if m.mouseSelecting {
 		t.Fatal("wheel event must not start text selection")
+	}
+}
+
+func TestViewportHeightShrinksWhenSuggestionsVisible(t *testing.T) {
+	base := &model{
+		width:  100,
+		height: 40,
+	}
+	baseHeight := base.viewportHeight()
+
+	withSuggestions := &model{
+		width:           100,
+		height:          40,
+		showSuggestions: true,
+		suggestionType:  "@",
+		suggestions:     []string{"internal/ui/view.go", "internal/ui/model.go"},
+	}
+	suggestionHeight := withSuggestions.suggestionPaletteHeight()
+	if suggestionHeight == 0 {
+		t.Fatal("expected suggestion palette to have visible height")
+	}
+
+	got := withSuggestions.viewportHeight()
+	want := baseHeight - suggestionHeight
+	if got != want {
+		t.Fatalf("viewport height = %d, want %d (base=%d, suggestions=%d)", got, want, baseHeight, suggestionHeight)
+	}
+}
+
+func TestUpdateSuggestionsRebuildsViewportHeightImmediately(t *testing.T) {
+	m := &model{
+		vpReady:    true,
+		width:      100,
+		height:     40,
+		vp:         viewport.New(100, 10),
+		resolver:   modes.NewResolver(),
+		showBanner: false,
+	}
+	m.rebuildViewport()
+	before := m.vp.Height
+
+	m.input.WriteString("/")
+	m.updateSuggestions()
+
+	if !m.showSuggestions {
+		t.Fatal("expected suggestions to be visible after slash input")
+	}
+	if m.vp.Height >= before {
+		t.Fatalf("expected viewport height to shrink immediately: before=%d after=%d", before, m.vp.Height)
+	}
+
+	m.dismissSuggestions()
+	if m.vp.Height != before {
+		t.Fatalf("expected viewport height to restore after dismiss: before=%d after=%d", before, m.vp.Height)
 	}
 }
 

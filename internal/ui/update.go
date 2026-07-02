@@ -593,7 +593,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.push(roleSystem, infoStyle.Render(proposalMsg))
 				}
 			}
-			m.sess.ClearPlan()
+			m.sess.ClearTasks()
 		}
 		m.rebuildViewport()
 		return m, nil
@@ -672,11 +672,13 @@ func compileTaskListMarkdown(tasks *[]plan.Task) string {
 
 	b.WriteString("# TASK LIST\n\n")
 	for _, task := range *tasks {
-		status := "- [ ]"
-		if task.IsDone {
-			status = "- [x]"
+		glyph := "○"
+		if task.Status == "processing" {
+			glyph = "●"
+		} else if task.Status == "done" || task.IsDone {
+			glyph = "✓"
 		}
-		b.WriteString(fmt.Sprintf("%s **%s**: %s | %s\n\n", status, task.Type, task.Target, task.Description))
+		b.WriteString(fmt.Sprintf("%s **%s**: %s | %s\n\n", glyph, task.Type, task.Target, task.Description))
 	}
 
 	return b.String()
