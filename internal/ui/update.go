@@ -1,8 +1,10 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -499,14 +501,33 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.push(roleError, fmt.Sprintf("failed to save session: %v", err))
 			}
 
-			// Persistent Appending (The Diagnostic Ledger): Write to global history.log
-			// Use session's directory for log file location
-			logDir := m.sess.LogDir()
-			if err := session.WriteToGlobalLog(logDir, "user", promptText); err != nil {
-				m.push(roleError, fmt.Sprintf("Log Engine Failure: %v", err))
+			// History Stream (mutable, resettable on rollback): Write to history/input.log
+			if err := session.WriteToHistoryLog(".", "user", promptText); err != nil {
+				m.push(roleError, fmt.Sprintf("History Log Failure: %v", err))
 			}
-			if err := session.WriteToGlobalLog(logDir, "assistant", final); err != nil {
-				m.push(roleError, fmt.Sprintf("Log Engine Failure: %v", err))
+			if err := session.WriteToHistoryLog(".", "assistant", final); err != nil {
+				m.push(roleError, fmt.Sprintf("History Log Failure: %v", err))
+			}
+
+			// Audit Trail (immutable): Log mutations if build mode
+			if m.resolver.Current() == modes.ModeBuild || m.resolver.Current() == modes.ModeInvestigate {
+				auditEntry := struct {
+					Timestamp string `json:"timestamp"`
+					Role      string `json:"role"`
+					Mode      string `json:"mode"`
+					Preview   string `json:"preview"`
+				}{
+					Role:    "assistant",
+					Mode:    m.resolver.Current().String(),
+					Preview: truncateString(final, 200),
+				}
+				data, _ := json.Marshal(auditEntry)
+				data = append(data, '\n')
+				auditPath := filepath.Join(".izen", "audit", "mutations.log")
+				if f, err := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600); err == nil {
+					f.Write(data)
+					f.Close()
+				}
 			}
 
 			// Clear cached prompt after use

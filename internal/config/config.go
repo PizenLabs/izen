@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/PizenLabs/izen/internal/state"
 )
 
 type AIProviderConfig struct {
@@ -102,6 +104,10 @@ func (c *Config) Validate() error {
 }
 
 func Load() (*Config, error) {
+	if err := state.InitGlobalState(); err != nil {
+		fmt.Fprintf(os.Stderr, "izen: warning: global state init: %v\n", err)
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err

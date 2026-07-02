@@ -5,11 +5,13 @@ import (
 	"os"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/audit"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/lynx"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/session"
+	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/ui"
 )
 
@@ -59,10 +61,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	root := "."
+	if err := state.InitLocalState(root); err != nil {
+		fmt.Fprintf(os.Stderr, "izen: warning: local state init: %v\n", err)
+	}
+
+	if err := state.MigrateLegacyFiles(root); err != nil {
+		fmt.Fprintf(os.Stderr, "izen: migration warning: %v\n", err)
+	}
+
+	_ = state.CheckVersion(root, Version)
+
 	sess, err := session.Load()
 	if err != nil {
 		sess = session.New()
 	}
+
+	_ = audit.NewLogger(root)
 
 	mgr := ai.NewManager()
 	defaultProvider := cfg.ActiveProviderName()
@@ -74,7 +89,6 @@ func main() {
 	}
 
 	if cfg.Lynx.Enabled {
-		root := "."
 		lc := lynx.NewController(root, cfg.Lynx.LazyStart)
 		retrieval.SetLynxController(lc)
 

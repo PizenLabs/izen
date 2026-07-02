@@ -2,11 +2,12 @@ package session
 
 import (
 	"encoding/json"
-	"github.com/PizenLabs/izen/internal/modes"
-	"github.com/PizenLabs/izen/internal/modes/plan"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
 // Message represents a chat message.
@@ -211,7 +212,6 @@ func (s *Session) ClearHistory() {
 
 // LogDir returns the directory where session logs should be stored
 func (s *Session) LogDir() string {
-	// Determine the session path using the same logic as Session.Save()
 	path := s.path
 	if path == "" {
 		path = filepath.Join(".izen", "session.json")
@@ -220,31 +220,7 @@ func (s *Session) LogDir() string {
 }
 
 // WriteToGlobalLog appends a log entry to the global history log file.
+// Deprecated: Use history.WriteToHistoryLog or audit package for dual-stream logging.
 func WriteToGlobalLog(pizenDir string, role, content string) error {
-	logEntry := struct {
-		Timestamp string `json:"timestamp"`
-		Role      string `json:"role"`
-		Content   string `json:"content"`
-	}{
-		Timestamp: time.Now().Format(time.RFC3339),
-		Role:      role,
-		Content:   content,
-	}
-
-	data, err := json.Marshal(logEntry)
-	if err != nil {
-		return err
-	}
-	// Append newline for JSONL compliance
-	data = append(data, '\n')
-
-	logFile := filepath.Join(pizenDir, "history.log")
-	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = f.Write(data)
-	return err
+	return WriteToHistoryLog(pizenDir, role, content)
 }
