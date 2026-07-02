@@ -103,7 +103,7 @@ const (
 var coreModes = []string{"/ask", "/plan", "/build", "/investigate", "/review"}
 
 var utilityCommands = map[modes.Mode][]string{
-	modes.ModeAsk:         {"/clear"},
+	modes.ModeAsk:         {"/clear", "/arch"},
 	modes.ModePlan:        {"/clear"},
 	modes.ModeBuild:       {"/undo", "/commit", "/checkpoint", "/clear"},
 	modes.ModeInvestigate: {"/clear"},
