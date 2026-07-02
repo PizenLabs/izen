@@ -10,9 +10,20 @@ import (
 )
 
 var globalLynx *lynx.Controller
+var globalCompressor *ContextCompressor
 
 func SetLynxController(lc *lynx.Controller) {
 	globalLynx = lc
+}
+
+func SetGlobalCompressor(cc *ContextCompressor) {
+	globalCompressor = cc
+}
+
+func BuildGlobalCompressor(g *graph.Graph, objective string) {
+	if g != nil {
+		globalCompressor = NewContextCompressorFromGraph(g, objective)
+	}
 }
 
 type Tier string
@@ -218,6 +229,9 @@ func (r *Retriever) executeTier(tier Tier, query Query) *ResultSet {
 
 func (r *Retriever) executeLynxSearch(query Query) *ResultSet {
 	rawResults, err := globalLynx.SearchRaw(query.Text)
+	if err == nil && globalCompressor != nil && len(rawResults) > 0 {
+		rawResults = globalCompressor.CompressResults(rawResults)
+	}
 	if err != nil {
 		return &ResultSet{
 			Strategy:   "lynx.semantic",

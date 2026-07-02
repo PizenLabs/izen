@@ -15,6 +15,7 @@ import (
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/prompt"
+	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
 var validSystemCommands = map[string]struct{}{
@@ -154,6 +155,15 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 	content := strings.TrimSpace(line)
 	if fileCtx.Len() > 0 {
 		content = fileCtx.String() + "\n\n" + content
+	}
+
+	if m.resolver.Current() == modes.ModeBuild && m.graph != nil {
+		compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.Objective)
+		compressed := compressor.CompressLines(content)
+		if compressed != "" && compressed != content {
+			content = retrieval.FormatCompressedFrame(compressed) + "\n\n" + content
+		}
+		go retrieval.BuildGlobalCompressor(m.graph, m.sess.Objective)
 	}
 
 	switch m.resolver.Current() {
