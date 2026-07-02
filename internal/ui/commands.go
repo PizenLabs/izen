@@ -16,7 +16,6 @@ import (
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
-	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
@@ -195,7 +194,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
 
-		var planPrefix string
+		var b strings.Builder
 		if m.graph != nil {
 			compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.Objective)
 			go retrieval.BuildGlobalCompressor(m.graph, m.sess.Objective)
@@ -211,14 +210,17 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 					compressed := compressor.CompressResults(results)
 					skeleton := retrieval.FormatResultsAsSkeleton(compressed)
 					if skeleton != "" {
-						planPrefix = retrieval.FormatPlanFrame(skeleton) + "\n\n"
+						b.WriteString(retrieval.FormatPlanFrame(skeleton))
+						b.WriteString("\n\n")
 					}
 				}
 			}
 		}
 
-		userContent := planPrefix + prompt.BuildPlanPrompt(m.sess.Objective, content)
-		return m.streamCmd(userContent)
+		b.WriteString("### USER OBJECTIVE\n")
+		b.WriteString(content)
+
+		return m.streamCmd(b.String())
 	default:
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
