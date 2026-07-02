@@ -2,6 +2,7 @@ package retrieval
 
 import (
 	"bufio"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -223,4 +224,37 @@ func FormatCompressedFrame(content string) string {
 	b.WriteString(content)
 	b.WriteString("\n")
 	return b.String()
+}
+
+const PlanSkeletonFrame = "### REPOSITORY STRUCTURAL SKELETON"
+
+func FormatPlanFrame(content string) string {
+	if content == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(PlanSkeletonFrame)
+	b.WriteString("\n")
+	b.WriteString(content)
+	return b.String()
+}
+
+func FormatResultsAsSkeleton(results []lynx.SearchResult) string {
+	var b strings.Builder
+	for _, r := range results {
+		if r.Content == "" {
+			continue
+		}
+		b.WriteString(fmt.Sprintf("%s:%d\n", r.FilePath, r.StartLine))
+		if r.SymbolName != "" {
+			b.WriteString(fmt.Sprintf("  %s\n", r.SymbolName))
+		}
+		for _, line := range strings.Split(r.Content, "\n") {
+			if line != "" {
+				b.WriteString(fmt.Sprintf("  %s\n", line))
+			}
+		}
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }

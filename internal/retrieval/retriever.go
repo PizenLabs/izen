@@ -20,6 +20,14 @@ func SetGlobalCompressor(cc *ContextCompressor) {
 	globalCompressor = cc
 }
 
+func GetLynxController() *lynx.Controller {
+	return globalLynx
+}
+
+func GetGlobalCompressor() *ContextCompressor {
+	return globalCompressor
+}
+
 func BuildGlobalCompressor(g *graph.Graph, objective string) {
 	if g != nil {
 		globalCompressor = NewContextCompressorFromGraph(g, objective)

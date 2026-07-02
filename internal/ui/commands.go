@@ -193,7 +193,30 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 	case modes.ModePlan:
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
-		userContent := prompt.BuildPlanPrompt(m.sess.Objective, content)
+
+		var planPrefix string
+		if m.graph != nil {
+			compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.Objective)
+			go retrieval.BuildGlobalCompressor(m.graph, m.sess.Objective)
+
+			query := content
+			if m.sess.Objective != "" {
+				query = m.sess.Objective + " " + query
+			}
+			lc := retrieval.GetLynxController()
+			if lc != nil {
+				results, err := lc.SearchRaw(query)
+				if err == nil && len(results) > 0 {
+					compressed := compressor.CompressResults(results)
+					skeleton := retrieval.FormatResultsAsSkeleton(compressed)
+					if skeleton != "" {
+						planPrefix = retrieval.FormatPlanFrame(skeleton) + "\n\n"
+					}
+				}
+			}
+		}
+
+		userContent := planPrefix + prompt.BuildPlanPrompt(m.sess.Objective, content)
 		return m.streamCmd(userContent)
 	default:
 		m.responseBuffer.Reset()
