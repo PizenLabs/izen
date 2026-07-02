@@ -226,7 +226,7 @@ func FormatCompressedFrame(content string) string {
 	return b.String()
 }
 
-const PlanSkeletonFrame = "### REPOSITORY STRUCTURAL SKELETON"
+const PlanSkeletonFrame = "### REPOSITORY STRUCTURAL SKELETON (LYNX + AHO-CORASICK COMPRESSED)"
 
 func FormatPlanFrame(content string) string {
 	if content == "" {

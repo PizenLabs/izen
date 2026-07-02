@@ -31,6 +31,7 @@ var validSystemCommands = map[string]struct{}{
 	"/undo":       {},
 	"/commit":     {},
 	"/checkpoint": {},
+	"/arch":       {},
 }
 
 func (m *model) handleInput(line string) tea.Cmd {
@@ -279,7 +280,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
 		m.push(roleSystem, infoStyle.Render("  /help  /mode  /objective  /drop  /clear  /quit"))
-		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint"))
+		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, infoStyle.Render("  @<path>  reference a file in your message"))
@@ -358,6 +359,14 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 	case cmd == "/checkpoint":
 		m.push(roleSystem, infoStyle.Render("/checkpoint not yet implemented"))
+		return nil
+
+	case cmd == "/arch":
+		m.push(roleSystem, infoStyle.Render("scanning architecture..."))
+		arch := m.renderArch()
+		for _, line := range strings.Split(arch, "\n") {
+			m.push(roleSystem, infoStyle.Render(line))
+		}
 		return nil
 	}
 
