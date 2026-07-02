@@ -14,6 +14,7 @@ import (
 
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/prompt"
 )
 
 var validSystemCommands = map[string]struct{}{
@@ -166,6 +167,11 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		return m.runInvestigateCmd(content)
 	case modes.ModeReview:
 		return m.runReviewCmd()
+	case modes.ModePlan:
+		m.responseBuffer.Reset()
+		m.execEng.SetStreamContextFiles(m.attachedFiles)
+		userContent := prompt.BuildPlanPrompt(m.sess.Objective, content)
+		return m.streamCmd(userContent)
 	default:
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)

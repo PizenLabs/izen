@@ -54,6 +54,10 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			}
 		}
 	}
+	if m.resolver.Current() == modes.ModePlan {
+		sys := prompt.PlanSystemPrompt()
+		msgs = append([]ai.Message{{Role: "system", Content: sys}}, msgs...)
+	}
 
 	req := ai.Request{
 		Model:    m.cfg.ActiveModelName(),

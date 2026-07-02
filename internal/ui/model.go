@@ -19,6 +19,7 @@ import (
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -172,6 +173,7 @@ type model struct {
 	state UIState
 
 	execEng     *execution.Engine
+	planStore   *plan.PlanStore
 	buildOutput strings.Builder
 
 	investigateInvocationCount int
