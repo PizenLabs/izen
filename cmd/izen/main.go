@@ -62,6 +62,13 @@ func main() {
 	}
 
 	root := "."
+	if !state.HasLocalState(root) {
+		if !ui.ConfirmInit("Initialize Izen architecture for this repository?") {
+			fmt.Println("Aborted. Run 'izen' again when ready.")
+			os.Exit(0)
+		}
+	}
+
 	if err := state.InitLocalState(root); err != nil {
 		fmt.Fprintf(os.Stderr, "izen: warning: local state init: %v\n", err)
 	}

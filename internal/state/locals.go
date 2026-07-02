@@ -36,6 +36,18 @@ func LocalPath(root string, elems ...string) string {
 	return filepath.Join(all...)
 }
 
+func HasLocalState(root string) bool {
+	sessionPath := filepath.Join(root, LocalDir, SessionFile)
+	if fi, err := os.Stat(sessionPath); err == nil && !fi.IsDir() {
+		return true
+	}
+	dir := filepath.Join(root, LocalDir)
+	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+		return true
+	}
+	return false
+}
+
 func InitLocalState(root string) error {
 	dirs := []string{
 		LocalPath(root, GraphDir),
