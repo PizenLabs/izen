@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -14,6 +15,7 @@ import (
 
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
 )
@@ -70,6 +72,17 @@ func (m *model) handleInput(line string) tea.Cmd {
 
 	if strings.HasPrefix(line, "/") {
 		return m.handleCommand(line)
+	}
+
+	if m.resolver.Current() == modes.ModeBuild {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == "run" {
+			var stepNum int
+			if len(fields) >= 2 {
+				stepNum, _ = strconv.Atoi(fields[1])
+			}
+			return m.handleBuildRun(stepNum)
+		}
 	}
 
 	return m.handleMessageContent(line)
@@ -335,6 +348,58 @@ func (m *model) startModeTransition(target modes.Mode) {
 	m.lineAnimProgress = 0.0
 	m.lineAnimating = true
 	m.resolver.Set(target)
+}
+
+func (m *model) handleBuildRun(stepNum int) tea.Cmd {
+	tasks := m.sess.CurrentTasks
+	if len(tasks) == 0 {
+		m.push(roleStatus, "no tasks staged — use /plan first")
+		return nil
+	}
+	var targetTask *plan.Task
+	if stepNum > 0 {
+		for i, t := range tasks {
+			if t.StepNum == stepNum {
+				targetTask = &tasks[i]
+				break
+			}
+		}
+		if targetTask == nil {
+			m.push(roleStatus, fmt.Sprintf("task %d not found", stepNum))
+			return nil
+		}
+	} else {
+		for i, t := range tasks {
+			if t.Status == "idle" {
+				targetTask = &tasks[i]
+				break
+			}
+		}
+	}
+	if targetTask == nil {
+		m.push(roleStatus, "all tasks already completed")
+		return nil
+	}
+	targetTask.Status = "processing"
+	m.sess.StageTaskList(&tasks)
+	m.sess.Save()
+	m.push(roleStatus, fmt.Sprintf("executing step %d: %s — %s", targetTask.StepNum, targetTask.Type, targetTask.Target))
+
+	content := fmt.Sprintf("Execute step %d: %s\nTarget: %s\nDescription: %s",
+		targetTask.StepNum, targetTask.Type, targetTask.Target, targetTask.Description)
+
+	if m.graph != nil {
+		compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.Objective)
+		compressed := compressor.CompressLines(content)
+		if compressed != "" && compressed != content {
+			content = retrieval.FormatCompressedFrame(compressed) + "\n\n" + content
+		}
+		go retrieval.BuildGlobalCompressor(m.graph, m.sess.Objective)
+	}
+
+	m.responseBuffer.Reset()
+	m.execEng.SetStreamContextFiles(m.attachedFiles)
+	return m.streamCmd(content)
 }
 
 func execShell(cmd string) (string, error) {
