@@ -44,6 +44,10 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// Add the current user message
 	msgs = append(msgs, ai.Message{Role: "user", Content: content})
 
+	if m.resolver.Current() == modes.ModeAsk {
+		sys := prompt.AskSystemPrompt()
+		msgs = append([]ai.Message{{Role: "system", Content: sys}}, msgs...)
+	}
 	if m.resolver.Current() == modes.ModeBuild {
 		sys := prompt.BuildSystemPrompt()
 		msgs = append([]ai.Message{{Role: "system", Content: sys}}, msgs...)

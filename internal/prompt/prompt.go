@@ -52,6 +52,8 @@ INSTRUCTIONS:
 
 func ForMode(mode string) string {
 	switch mode {
+	case "ask":
+		return AskSystemPrompt()
 	case "build":
 		return BuildSystemPrompt()
 	case "plan":

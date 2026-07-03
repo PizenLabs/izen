@@ -236,6 +236,23 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 	default:
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
+
+		if m.resolver.Current() == modes.ModeAsk && len(refFiles) == 0 {
+			result := retrieval.RouteAsk(line, m.gitEng)
+			if len(result.Targets) > 0 && m.graph != nil {
+				cb := ctxpkg.NewBuilder(".", m.graph, m.gitEng, m.sess)
+				ctx := cb.Build(ctxpkg.BuildRequest{
+					Files:      result.Targets,
+					MaxFiles:   len(result.Targets),
+					MaxSymbols: 20,
+				})
+				if ctx != nil && len(ctx.Files) > 0 {
+					header := fmt.Sprintf("### LOCALIZED CONTEXT (%s)\n\n", result.Label)
+					content = header + ctxpkg.DefaultRenderer().Render(ctx) + "\n" + content
+				}
+			}
+		}
+
 		return m.streamCmd(content)
 	}
 }
