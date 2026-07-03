@@ -11,6 +11,13 @@ import (
 // Where TYPE is one of: FILE_MUTATE, SHELL_EXEC, GIT_ACTION
 var planBlockRegex = regexp.MustCompile(`^- \[([ x])\] (FILE_MUTATE|SHELL_EXEC|GIT_ACTION): (.+?) \| (.+)$`)
 
+// validTypes is the set of allowed task types.
+var validTypes = map[string]bool{
+	"FILE_MUTATE": true,
+	"SHELL_EXEC":  true,
+	"GIT_ACTION":  true,
+}
+
 // OutputBlock represents a single validated task block from the LLM output.
 type OutputBlock struct {
 	Checked    bool
@@ -35,31 +42,125 @@ type InvalidLine struct {
 	Reason     string
 }
 
+// mergeFragmentedLines pre-processes raw lines to stitch multi-line task
+// fragments that smaller SLMs produce (e.g. verbose TYPE on L1, rationale
+// continuation on L2).
+func mergeFragmentedLines(lines []string) []string {
+	merged := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+
+		body := stripAnyListPrefix(line)
+		if i+1 < len(lines) && isVerboseTaskHeader(body) && !strings.Contains(body, "| Rationale:") {
+			next := strings.TrimSpace(lines[i+1])
+			if cont := continuationText(next); cont != "" {
+				line = line + " | Rationale: " + cont
+				i++
+			}
+		}
+		merged = append(merged, line)
+	}
+	return merged
+}
+
+// isVerboseTaskHeader returns true if body uses verbose key-value format
+// "TYPE: X | Target: Y".
+func isVerboseTaskHeader(body string) bool {
+	return strings.HasPrefix(body, "TYPE:") && strings.Contains(body, "| Target:")
+}
+
+// continuationText extracts continuation prose from a candidate line.
+// Returns empty string if the line is not a continuation.
+func continuationText(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return ""
+	}
+	body := stripAnyListPrefix(trimmed)
+	for _, kw := range []string{"TYPE:", "FILE_MUTATE:", "SHELL_EXEC:", "GIT_ACTION:"} {
+		if strings.Contains(body, kw) {
+			return ""
+		}
+	}
+	return body
+}
+
+// stripAnyListPrefix removes a leading markdown list prefix from s.
+func stripAnyListPrefix(s string) string {
+	for _, p := range []string{"- [x] ", "- [ ] ", "* ", "- "} {
+		if strings.HasPrefix(s, p) {
+			return strings.TrimPrefix(s, p)
+		}
+	}
+	return s
+}
+
+// convertVerboseToCompact converts verbose key-value format to compact format.
+//
+//	Input:  "TYPE: FILE_MUTATE | Target: path | Rationale: desc"
+//	Output: "FILE_MUTATE: path | desc"
+func convertVerboseToCompact(body string) string {
+	if !strings.HasPrefix(body, "TYPE:") {
+		return body
+	}
+
+	rest := strings.TrimSpace(strings.TrimPrefix(body, "TYPE:"))
+
+	pipeIdx := strings.Index(rest, " | ")
+	if pipeIdx == -1 {
+		return body
+	}
+	taskType := strings.TrimSpace(rest[:pipeIdx])
+	rest = rest[pipeIdx+3:]
+
+	const tgtPrefix = "Target:"
+	tgtIdx := strings.Index(rest, tgtPrefix)
+	if tgtIdx == -1 {
+		return body
+	}
+	afterTarget := strings.TrimSpace(rest[tgtIdx+len(tgtPrefix):])
+
+	var target, rationale string
+	const ratPrefix = "| Rationale:"
+	ratIdx := strings.Index(afterTarget, ratPrefix)
+	if ratIdx != -1 {
+		target = strings.TrimSpace(afterTarget[:ratIdx])
+		rationale = strings.TrimSpace(afterTarget[ratIdx+len(ratPrefix):])
+	} else {
+		target = strings.TrimSpace(afterTarget)
+	}
+
+	if rationale != "" {
+		return taskType + ": " + target + " | " + rationale
+	}
+	return taskType + ": " + target
+}
+
 // ValidatePlanOutput parses and validates LLM output against the rigid schema.
 // Returns structured result with valid blocks and any schema violations.
 func ValidatePlanOutput(content string) *ValidationResult {
-	lines := strings.Split(content, "\n")
+	lines := mergeFragmentedLines(strings.Split(content, "\n"))
 	result := &ValidationResult{Valid: true}
 
 	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
+		normalized, skip, reason := normalizeLine(line)
+		if skip {
 			continue
 		}
 
-		if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "---") {
-			continue
-		}
-
-		matches := planBlockRegex.FindStringSubmatch(trimmed)
+		matches := planBlockRegex.FindStringSubmatch(normalized)
 		if matches == nil {
-			if strings.HasPrefix(trimmed, "- [") {
-				result.Invalid = append(result.Invalid, InvalidLine{
-					LineNumber: i + 1,
-					Content:    trimmed,
-					Reason:     "malformed task block — must match: - [ ] TYPE: Target | Rationale",
-				})
+			if reason == "" {
+				reason = "malformed task block — must match: - [ ] TYPE: Target | Rationale"
 			}
+			result.Invalid = append(result.Invalid, InvalidLine{
+				LineNumber: i + 1,
+				Content:    strings.TrimSpace(line),
+				Reason:     reason,
+			})
 			continue
 		}
 
@@ -69,7 +170,7 @@ func ValidatePlanOutput(content string) *ValidationResult {
 			Target:     matches[3],
 			Rationale:  matches[4],
 			LineNumber: i + 1,
-			RawLine:    trimmed,
+			RawLine:    strings.TrimSpace(line),
 		}
 		result.Blocks = append(result.Blocks, block)
 	}
@@ -78,6 +179,87 @@ func ValidatePlanOutput(content string) *ValidationResult {
 		result.Valid = false
 	}
 	return result
+}
+
+// normalizeLine applies resilient normalization to LLM output lines.
+// Steps: strip markdown list artifacts, convert verbose key-value format,
+// strip quotes/backticks from targets, apply graceful fallback for
+// FILE_MUTATE lines missing Rationale.
+// Returns (normalized line, skip bool, error reason string).
+func normalizeLine(line string) (string, bool, string) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return "", true, ""
+	}
+	if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "---") {
+		return "", true, ""
+	}
+
+	var checkboxPrefix string
+	body := trimmed
+
+	switch {
+	case strings.HasPrefix(body, "- [x] "):
+		checkboxPrefix = "- [x] "
+		body = strings.TrimPrefix(body, "- [x] ")
+	case strings.HasPrefix(body, "- [ ] "):
+		checkboxPrefix = "- [ ] "
+		body = strings.TrimPrefix(body, "- [ ] ")
+	case strings.HasPrefix(body, "* "):
+		checkboxPrefix = "- [ ] "
+		body = strings.TrimPrefix(body, "* ")
+	case strings.HasPrefix(body, "- "):
+		checkboxPrefix = "- [ ] "
+		body = strings.TrimPrefix(body, "- ")
+	default:
+		hasType := false
+		for typ := range validTypes {
+			if strings.Contains(trimmed, typ+":") || strings.Contains(trimmed, "TYPE:") {
+				hasType = true
+				break
+			}
+		}
+		if !hasType {
+			return "", true, ""
+		}
+		checkboxPrefix = "- [ ] "
+	}
+
+	body = convertVerboseToCompact(body)
+
+	colonIdx := strings.Index(body, ":")
+	if colonIdx == -1 {
+		return trimmed, false, "missing colon separator"
+	}
+
+	taskType := strings.TrimSpace(body[:colonIdx])
+	rest := strings.TrimSpace(body[colonIdx+1:])
+
+	if !validTypes[taskType] {
+		return trimmed, false, "invalid task type: " + taskType
+	}
+
+	var target, rationale string
+	pipeIdx := strings.Index(rest, " | ")
+	if pipeIdx != -1 {
+		target = strings.TrimSpace(rest[:pipeIdx])
+		rationale = strings.TrimSpace(rest[pipeIdx+3:])
+	} else {
+		target = strings.TrimSpace(rest)
+		if taskType == "FILE_MUTATE" {
+			rationale = "Code mutation requested by system plan"
+		}
+	}
+
+	for _, q := range []string{"'", "\"", "`"} {
+		if strings.HasPrefix(target, q) && strings.HasSuffix(target, q) {
+			target = target[len(q) : len(target)-len(q)]
+			break
+		}
+	}
+
+	normalized := fmt.Sprintf("%s%s: %s | %s", checkboxPrefix, taskType, target, rationale)
+	return normalized, false, ""
 }
 
 // FormatValidationError produces a human-readable error for TUI display.
@@ -97,10 +279,12 @@ func FormatValidationError(v *ValidationResult) string {
 // CollapsePlanSections strips headers and prose, keeping only task blocks.
 func CollapsePlanSections(content string) string {
 	var b strings.Builder
-	for _, line := range strings.Split(content, "\n") {
-		if planBlockRegex.MatchString(line) {
-			b.WriteString(line)
-			b.WriteString("\n")
+	for _, line := range mergeFragmentedLines(strings.Split(content, "\n")) {
+		if normalized, skip, _ := normalizeLine(line); !skip {
+			if planBlockRegex.MatchString(normalized) {
+				b.WriteString(normalized)
+				b.WriteString("\n")
+			}
 		}
 	}
 	return strings.TrimSpace(b.String())
@@ -108,7 +292,11 @@ func CollapsePlanSections(content string) string {
 
 // IsValidTaskLine checks if a single line matches the task block schema.
 func IsValidTaskLine(line string) bool {
-	return planBlockRegex.MatchString(strings.TrimSpace(line))
+	normalized, skip, _ := normalizeLine(line)
+	if skip {
+		return false
+	}
+	return planBlockRegex.MatchString(normalized)
 }
 
 const SchemaTemplate = `- [ ] FILE_MUTATE: path/to/file.go | describe the change
