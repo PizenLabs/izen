@@ -61,6 +61,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := state.EnsureRuntimeBinaries(); err != nil {
+		fmt.Fprintf(os.Stderr, "izen: runtime binary error: %v\n", err)
+		os.Exit(1)
+	}
+
 	root := "."
 	if !state.HasLocalState(root) {
 		if !ui.ConfirmInit("Initialize Izen architecture for this repository?") {
@@ -111,6 +116,15 @@ func main() {
 	}
 
 	p := ui.NewProgram(cfg, sess, mgr)
+
+	configCh := make(chan bool, 1)
+	config.StartConfigWatcher(configCh)
+	go func() {
+		for range configCh {
+			p.Send(config.ConfigChangeMsg{})
+		}
+	}()
+
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running Izen: %v\n", err)
 		os.Exit(1)

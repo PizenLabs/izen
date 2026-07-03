@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/PizenLabs/izen/internal/state"
 )
 
 type Engine struct {
@@ -90,7 +88,7 @@ func (e *Engine) SaveCache(graph *Graph) error {
 		return err
 	}
 
-	dir := state.LocalPath(e.root, state.GraphDir)
+	dir := filepath.Join(e.root, ".izen", "graph")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}

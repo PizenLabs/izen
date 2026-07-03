@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/PizenLabs/izen/internal/lynx"
 )
 
 const (
 	GlobalDirName        = ".izen"
-	GlobalConfigFile     = "izen.conf.yml"
+	GlobalConfigFile     = "config.yml"
 	GlobalCredentialsDir = "credentials"
 	GlobalProvidersFile  = "providers.json"
 	GlobalRuntimeDir     = "runtime"
@@ -31,6 +33,30 @@ func GlobalPath(elems ...string) string {
 	}
 	all := append([]string{home, GlobalDirName}, elems...)
 	return filepath.Join(all...)
+}
+
+func EnsureRuntimeBinaries() error {
+	rtDir := GlobalPath(GlobalRuntimeDir)
+	if err := os.MkdirAll(rtDir, 0755); err != nil {
+		return fmt.Errorf("runtime dir: %w", err)
+	}
+
+	target := filepath.Join(rtDir, "lx")
+	if _, err := os.Stat(target); err == nil {
+		return nil
+	}
+
+	data, err := lynx.BinaryBytes()
+	if err != nil {
+		return fmt.Errorf("read embedded lx binary: %w", err)
+	}
+
+	if err := os.WriteFile(target, data, 0755); err != nil {
+		return fmt.Errorf("write lx binary: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "izen: extracted lx binary (%d bytes) to %s\n", len(data), target)
+	return nil
 }
 
 func InitGlobalState() error {

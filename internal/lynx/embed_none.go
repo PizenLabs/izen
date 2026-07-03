@@ -8,8 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-
-	"github.com/PizenLabs/izen/internal/state"
 )
 
 const binaryName = "lx"
@@ -17,11 +15,19 @@ const binaryName = "lx"
 var lxBinPath string
 
 func globalBinaryDir() string {
-	return state.GlobalPath(state.GlobalRuntimeDir)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".izen", "runtime")
 }
 
 func localBinaryDir(root string) string {
 	return filepath.Join(root, ".izen", "bin")
+}
+
+func BinaryBytes() ([]byte, error) {
+	return nil, fmt.Errorf("lynx binary not embedded; build with -tags lynx_embed")
 }
 
 func BinaryPath() string {

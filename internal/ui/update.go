@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -623,6 +624,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamCh = nil
 		m.streaming = false
 		m.push(roleError, "stream error: "+msg.err.Error())
+		return m, nil
+
+	case config.ConfigChangeMsg:
+		newCfg, err := config.Load()
+		if err == nil {
+			m.cfg = newCfg
+		}
 		return m, nil
 
 	case tea.KeyMsg:

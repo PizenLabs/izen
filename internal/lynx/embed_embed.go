@@ -9,8 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-
-	"github.com/PizenLabs/izen/internal/state"
 )
 
 //go:embed bin/lx
@@ -21,11 +19,19 @@ const binaryName = "lx"
 var lxBinPath string
 
 func globalBinaryDir() string {
-	return state.GlobalPath(state.GlobalRuntimeDir)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".izen", "runtime")
 }
 
 func localBinaryDir(root string) string {
 	return filepath.Join(root, ".izen", "bin")
+}
+
+func BinaryBytes() ([]byte, error) {
+	return lxBinary.ReadFile("bin/lx")
 }
 
 func BinaryPath() string {
