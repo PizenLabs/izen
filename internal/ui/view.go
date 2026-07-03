@@ -10,7 +10,6 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/modes"
 )
 
@@ -44,8 +43,11 @@ func (m *model) View() string {
 
 	var sections []string
 
-	// 1. Focus Header (non-scroll objective dashboard)
-	sections = append(sections, m.renderFocusHeader(width))
+	// 1. Top Status Bar (objective + metrics — hidden when no state)
+	topBar := m.renderTopBar()
+	if topBar != "" {
+		sections = append(sections, topBar)
+	}
 
 	// 2. Conversation Timeline (Viewport)
 	sections = append(sections, m.vp.View())
@@ -76,53 +78,47 @@ func (m *model) View() string {
 	return strings.Join(sections, "\n")
 }
 
-func (m *model) renderFocusHeader(width int) string {
-	modeLabel := m.resolver.Current().String()
+func (m *model) renderTopBar() string {
 	obj := m.sess.ObjectiveState
-	intent := "none"
+	rawIntent := ""
 	scopeFiles := 0
-	budgetStatus := "OK"
 	if obj != nil {
-		intent = shortenObjectiveIntent(obj.RawIntent, width)
+		rawIntent = strings.TrimSpace(obj.RawIntent)
 		scopeFiles = len(obj.Scope.Files)
-		if obj.TokenBudget.RequiresApproval {
-			budgetStatus = "Warning"
-		}
-		if obj.CurrentStatus == domain.ObjectiveAnalyzing {
-			budgetStatus = "Analyzing"
-		}
 	}
 
-	header := fmt.Sprintf("[Mode: %s] | [Objective: %s] | [Scope: %d Files] | [Budget: %s]",
-		modeLabel, intent, scopeFiles, budgetStatus)
+	if rawIntent == "" && scopeFiles == 0 {
+		return ""
+	}
+
+	var parts []string
+	if rawIntent != "" {
+		objText := truncateStr(rawIntent, 40)
+		parts = append(parts, "⌖ "+objText)
+	}
+	if scopeFiles > 0 {
+		parts = append(parts, fmt.Sprintf("🗀 %d files", scopeFiles))
+	}
+
+	content := strings.Join(parts, "  •  ")
+	bar := " " + content + " "
 
 	return lipgloss.NewStyle().
-		Foreground(lipgloss.Color(colorText)).
-		Background(lipgloss.Color(colorOverlay)).
+		Background(lipgloss.Color(colorSurface)).
+		Foreground(lipgloss.Color(colorTopBarMetrics)).
 		Padding(0, 1).
-		Width(width).
-		Render(header)
+		Render(bar)
 }
 
-func shortenObjectiveIntent(raw string, width int) string {
-	text := strings.TrimSpace(raw)
-	if text == "" {
-		return "none"
+func truncateStr(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
 	}
-	limit := 56
-	if width < 90 {
-		limit = 24
-	} else if width < 120 {
-		limit = 40
+	if maxRunes <= 3 {
+		return string(runes[:maxRunes])
 	}
-	runes := []rune(text)
-	if len(runes) <= limit {
-		return text
-	}
-	if limit <= 1 {
-		return "…"
-	}
-	return string(runes[:limit-1]) + "…"
+	return string(runes[:maxRunes-3]) + "…"
 }
 
 // ── Focus line ────────────────────────────────────────────────────────────

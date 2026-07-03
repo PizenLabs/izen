@@ -222,14 +222,18 @@ type model struct {
 
 // viewportHeight calculates available lines for the conversation viewport.
 func (m *model) viewportHeight() int {
-	// Base heights: Focus Header (1) + Focus line (1) + Prompt Box (3) + Runtime Status (1) + Footer (1)
-	baseHeight := 1 + 1 + 3 + 1 + 1
+	// Base heights: Focus line (1) + Prompt Box (3) + Runtime Status (1) + Footer (1)
+	baseHeight := 1 + 3 + 1 + 1
 
-	// Add dynamic heights
+	// Dynamic: top bar (0 or 1), widget, suggestions
+	topBarH := 0
+	if m.renderTopBar() != "" {
+		topBarH = 1
+	}
 	widgetH := m.activeWidgetHeight()
 	suggestionH := m.suggestionPaletteHeight()
 
-	h := m.height - baseHeight - widgetH - suggestionH - viewportPadding
+	h := m.height - baseHeight - topBarH - widgetH - suggestionH - viewportPadding
 	if h < 3 {
 		h = 3
 	}
