@@ -103,7 +103,7 @@ jobs:
           cd bin
           sha256sum izen > izen_SHA256SUMS.txt
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             bin/izen
