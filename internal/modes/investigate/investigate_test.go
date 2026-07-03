@@ -490,13 +490,18 @@ func TestTestLoopConfig(t *testing.T) {
 
 func TestNewTestLoopDefault(t *testing.T) {
 	tl := NewTestLoop(0)
-	if tl.maxIterations != 3 {
-		t.Fatalf("expected default 3, got %d", tl.maxIterations)
+	if tl.maxIterations != hardLoopCeiling {
+		t.Fatalf("expected default %d, got %d", hardLoopCeiling, tl.maxIterations)
 	}
 
-	tl2 := NewTestLoop(5)
-	if tl2.maxIterations != 5 {
-		t.Fatalf("expected 5, got %d", tl2.maxIterations)
+	tl2 := NewTestLoop(10)
+	if tl2.maxIterations != hardLoopCeiling {
+		t.Fatalf("expected %d (hard ceiling), got %d", hardLoopCeiling, tl2.maxIterations)
+	}
+
+	tl3 := NewTestLoop(2)
+	if tl3.maxIterations != 2 {
+		t.Fatalf("expected 2, got %d", tl3.maxIterations)
 	}
 }
 

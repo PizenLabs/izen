@@ -146,7 +146,8 @@ func (e *Engine) stateObserve() error {
 	if e.executor != nil {
 		summary, _ := e.TestLoop.Run(e.executor, testLoopConfig{Strategy: "all"})
 		if summary != nil {
-			output := summary.Output
+			output := BoundedLogPreprocessor(summary.Output)
+			summary.Output = output
 			e.Evidence.Add(EvSourceTest, output, summary.Package, 0, 0.5)
 			e.Evidence.Add(EvSourceExecution, fmt.Sprintf("Tests: %d passed, %d failed, %d skipped",
 				summary.PassedN, summary.FailedN, summary.Skipped), "", 0, 0.6)
@@ -328,7 +329,9 @@ func (e *Engine) stateVerify() error {
 	if e.executor != nil {
 		summary, _ := e.TestLoop.Run(e.executor, testLoopConfig{Strategy: "all"})
 		if summary != nil {
-			e.Evidence.Add(EvSourceTest, summary.Output, summary.Package, 0, 0.5)
+			output := BoundedLogPreprocessor(summary.Output)
+			summary.Output = output
+			e.Evidence.Add(EvSourceTest, output, summary.Package, 0, 0.5)
 			e.Evidence.Add(EvSourceExecution, fmt.Sprintf("Verify: %d passed, %d failed",
 				summary.PassedN, summary.FailedN), "", 0, 0.6)
 
@@ -337,6 +340,11 @@ func (e *Engine) stateVerify() error {
 				return nil
 			}
 		}
+	}
+
+	currentLoop := e.State.IterationCount()
+	if currentLoop >= hardLoopCeiling {
+		return e.State.Transition(StatePropose)
 	}
 
 	return e.State.Transition(StateHypothesize)

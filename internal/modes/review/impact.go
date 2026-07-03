@@ -51,6 +51,9 @@ func (ia *ImpactAnalyzer) Analyze(files []DiffFile) (*ImpactRadius, error) {
 	importChains := ia.traceImportChains(radius.DirectFiles, radius.IndirectFiles)
 	radius.ImportChains = importChains
 
+	callChains := ia.TraceDownstreamCalls(radius.DirectFiles)
+	radius.CallChains = callChains
+
 	radius.Complexity = ia.estimateComplexity(radius.DirectFiles)
 
 	return radius, nil
@@ -96,6 +99,63 @@ func (ia *ImpactAnalyzer) findIndirectFiles(directFiles []string) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+// TraceDownstreamCalls computes the full downstream call chain for each directly
+// modified file by walking the graph's Dependents map. Each chain lists the
+// sequence of callers that depend on the modified file, forming an explicit
+// regression-risk trace.
+func (ia *ImpactAnalyzer) TraceDownstreamCalls(directFiles []string) []CallChain {
+	if ia.graph == nil {
+		return nil
+	}
+
+	var chains []CallChain
+	seen := make(map[string]bool)
+
+	for _, df := range directFiles {
+		chain := CallChain{
+			Source:  df,
+			Callers: ia.walkDependents(df, make(map[string]bool), 0),
+		}
+		if len(chain.Callers) > 0 {
+			key := df + ":" + strings.Join(chain.Callers, ",")
+			if !seen[key] {
+				seen[key] = true
+				chains = append(chains, chain)
+			}
+		}
+	}
+
+	sort.Slice(chains, func(i, j int) bool {
+		return len(chains[j].Callers) < len(chains[i].Callers)
+	})
+
+	if len(chains) > 20 {
+		chains = chains[:20]
+	}
+
+	return chains
+}
+
+func (ia *ImpactAnalyzer) walkDependents(file string, visited map[string]bool, depth int) []string {
+	if depth > 10 || visited[file] {
+		return nil
+	}
+	visited[file] = true
+
+	var callers []string
+	deps := ia.graph.Dependents[file]
+	for _, dep := range deps {
+		if !visited[dep] {
+			callers = append(callers, dep)
+		}
+	}
+	for _, dep := range deps {
+		transitive := ia.walkDependents(dep, visited, depth+1)
+		callers = append(callers, transitive...)
+	}
+	return callers
 }
 
 func (ia *ImpactAnalyzer) buildImportGraph(directFiles []string) map[string][]string {

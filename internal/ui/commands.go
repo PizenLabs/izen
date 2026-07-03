@@ -46,8 +46,8 @@ func (m *model) handleInput(line string) tea.Cmd {
 			return nil
 		}
 		currentMode := m.resolver.Current()
-		if currentMode.ReadOnly() {
-			m.push(roleError, fmt.Sprintf("shell execution blocked in /%s mode (read-only)", currentMode))
+		if !currentMode.CanShell() {
+			m.push(roleError, fmt.Sprintf("shell execution blocked in /%s mode (no CapShell)", currentMode))
 			return nil
 		}
 		m.push(roleSystem, "$ "+shellCmd)
