@@ -195,7 +195,7 @@ func (g *JiraGateway) GetComments(issueID string) ([]Comment, error) {
 
 func (g *JiraGateway) doRequest(method, path string, body interface{}) ([]byte, error) {
 	if !g.config.Enabled {
-		return nil, fmt.Errorf("Jira MCP is not enabled")
+		return nil, fmt.Errorf("jira MCP is not enabled")
 	}
 
 	var reqBody io.Reader
@@ -228,7 +228,7 @@ func (g *JiraGateway) doRequest(method, path string, body interface{}) ([]byte, 
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("Jira API error: %d %s", resp.StatusCode, string(respData))
+		return nil, fmt.Errorf("jira API error: %d %s", resp.StatusCode, string(respData))
 	}
 
 	return respData, nil

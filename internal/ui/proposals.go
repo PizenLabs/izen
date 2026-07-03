@@ -122,11 +122,7 @@ func parseUnifiedDiffHunks(content string) (string, string) {
 	inHunk := false
 	for _, line := range lines {
 		if strings.HasPrefix(line, "+++ ") {
-			raw := strings.TrimPrefix(line, "+++ ")
-			if strings.HasPrefix(raw, "b/") {
-				raw = raw[2:]
-			}
-			filePath = raw
+			filePath = strings.TrimPrefix(strings.TrimPrefix(line, "+++ "), "b/")
 			continue
 		}
 		if strings.HasPrefix(line, "--- ") {

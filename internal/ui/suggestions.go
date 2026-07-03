@@ -129,10 +129,7 @@ func filterFilesRecursive(prefix string) []string {
 			return nil
 		}
 
-		rel := path
-		if strings.HasPrefix(rel, "./") {
-			rel = rel[2:]
-		}
+		rel := strings.TrimPrefix(path, "./")
 
 		if prefix == "" || strings.HasPrefix(rel, prefix) || strings.Contains(strings.ToLower(rel), strings.ToLower(prefix)) {
 			results = append(results, rel)

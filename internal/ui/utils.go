@@ -13,14 +13,6 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-func shortenPath(p string) string {
-	home, _ := os.UserHomeDir()
-	if strings.HasPrefix(p, home) {
-		return "~" + p[len(home):]
-	}
-	return p
-}
-
 func (m *model) expandFileRefs(line string) string {
 	fields := strings.Fields(line)
 	changed := false

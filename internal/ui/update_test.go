@@ -102,7 +102,6 @@ func TestMouseWheelScrollsViewport(t *testing.T) {
 		X:      4,
 		Y:      2,
 		Button: tea.MouseButtonWheelUp,
-		Type:   tea.MouseWheelUp,
 		Action: tea.MouseActionPress,
 	})
 

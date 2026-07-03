@@ -334,7 +334,7 @@ type TypeInfo struct {
 func TypeCheck(root string) (*types.Package, *token.FileSet, error) {
 	fset := token.NewFileSet()
 
-	var pkgs []*ast.Package
+	var allFiles []*ast.File
 	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
@@ -351,27 +351,19 @@ func TypeCheck(root string) (*types.Package, *token.FileSet, error) {
 			return nil
 		}
 
-		pkg, err := parser.ParseFile(fset, path, src, parser.ParseComments)
+		f, err := parser.ParseFile(fset, path, src, parser.ParseComments)
 		if err != nil {
 			return nil
 		}
-		pkgs = append(pkgs, &ast.Package{
-			Name:  pkg.Name.Name,
-			Files: map[string]*ast.File{path: pkg},
-		})
+		allFiles = append(allFiles, f)
 		return nil
 	})
 
-	if len(pkgs) == 0 {
+	if len(allFiles) == 0 {
 		return nil, nil, fmt.Errorf("no Go packages found")
 	}
 
 	conf := types.Config{Importer: &passThroughImporter{}}
-
-	var allFiles []*ast.File
-	for _, f := range pkgs[0].Files {
-		allFiles = append(allFiles, f)
-	}
 
 	info := &types.Info{
 		Types:      make(map[ast.Expr]types.TypeAndValue),
@@ -401,67 +393,75 @@ func CollectTypes() ([]TypeInfo, error) {
 	targetDir := "."
 	fset := token.NewFileSet()
 
-	pkgs, err := parser.ParseDir(fset, targetDir, func(info os.FileInfo) bool {
-		if strings.Contains(info.Name(), "_test") {
-			return false
-		}
-		return true
-	}, parser.ParseComments)
+	entries, err := os.ReadDir(targetDir)
 	if err != nil {
-		return nil, fmt.Errorf("parse dir: %w", err)
+		return nil, fmt.Errorf("read dir: %w", err)
 	}
 
 	var typesInfo []TypeInfo
 
-	for _, pkg := range pkgs {
-		for _, f := range pkg.Files {
-			ast.Inspect(f, func(n ast.Node) bool {
-				gen, ok := n.(*ast.GenDecl)
-				if !ok {
-					return true
-				}
-
-				for _, spec := range gen.Specs {
-					typeSpec, ok := spec.(*ast.TypeSpec)
-					if !ok {
-						continue
-					}
-
-					pos := fset.Position(typeSpec.Pos())
-					info := TypeInfo{
-						Name: typeSpec.Name.Name,
-						File: pos.Filename,
-						Line: pos.Line,
-					}
-
-					switch t := typeSpec.Type.(type) {
-					case *ast.StructType:
-						info.Kind = "struct"
-						for _, field := range t.Fields.List {
-							if len(field.Names) > 0 {
-								for _, name := range field.Names {
-									info.Fields = append(info.Fields, name.Name)
-								}
-							}
-						}
-					case *ast.InterfaceType:
-						info.Kind = "interface"
-						for _, method := range t.Methods.List {
-							if len(method.Names) > 0 {
-								for _, name := range method.Names {
-									info.Methods = append(info.Methods, name.Name)
-								}
-							}
-						}
-					default:
-						info.Kind = "type"
-					}
-
-					typesInfo = append(typesInfo, info)
-				}
-				return true
-			})
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.Contains(entry.Name(), "_test") {
+			continue
 		}
+
+		path := filepath.Join(targetDir, entry.Name())
+		src, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+
+		f, err := parser.ParseFile(fset, path, src, parser.ParseComments)
+		if err != nil {
+			continue
+		}
+
+		ast.Inspect(f, func(n ast.Node) bool {
+			gen, ok := n.(*ast.GenDecl)
+			if !ok {
+				return true
+			}
+
+			for _, spec := range gen.Specs {
+				typeSpec, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+
+				pos := fset.Position(typeSpec.Pos())
+				info := TypeInfo{
+					Name: typeSpec.Name.Name,
+					File: pos.Filename,
+					Line: pos.Line,
+				}
+
+				switch t := typeSpec.Type.(type) {
+				case *ast.StructType:
+					info.Kind = "struct"
+					for _, field := range t.Fields.List {
+						if len(field.Names) > 0 {
+							for _, name := range field.Names {
+								info.Fields = append(info.Fields, name.Name)
+							}
+						}
+					}
+				case *ast.InterfaceType:
+					info.Kind = "interface"
+					for _, method := range t.Methods.List {
+						if len(method.Names) > 0 {
+							for _, name := range method.Names {
+								info.Methods = append(info.Methods, name.Name)
+							}
+						}
+					}
+				default:
+					info.Kind = "type"
+				}
+
+				typesInfo = append(typesInfo, info)
+			}
+			return true
+		})
 	}
 
 	sort.Slice(typesInfo, func(i, j int) bool {

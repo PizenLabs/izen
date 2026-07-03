@@ -96,11 +96,11 @@ func (m *model) dispatchMouseLeak(s string) {
 		switch button {
 		case 64, 96: // Fallback Wheel up sequence
 			m.mouseSelecting = false
-			m.vp.LineUp(3)
+			m.vp.ScrollUp(3)
 			m.rebuildViewport()
 		case 65, 97: // Fallback Wheel down sequence
 			m.mouseSelecting = false
-			m.vp.LineDown(3)
+			m.vp.ScrollDown(3)
 			m.rebuildViewport()
 		case 0, 4, 32, 36:
 			point, inside := m.viewportPoint(col-1, row-1)
@@ -295,7 +295,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			strings.Contains(rawStr, "[<96;") || strings.Contains(rawStr, "<96;") {
 			lastAnyMouseActivity = now
 			m.mouseSelecting = false
-			m.vp.LineUp(3)
+			m.vp.ScrollUp(3)
 			m.rebuildViewport()
 			return m, nil
 		}
@@ -303,7 +303,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			strings.Contains(rawStr, "[<97;") || strings.Contains(rawStr, "<97;") {
 			lastAnyMouseActivity = now
 			m.mouseSelecting = false
-			m.vp.LineDown(3)
+			m.vp.ScrollDown(3)
 			m.rebuildViewport()
 			return m, nil
 		}
@@ -326,33 +326,36 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		mouseMsg := msg.(tea.MouseMsg)
 
-		switch mouseMsg.Type {
-		case tea.MouseWheelUp:
-			m.mouseSelecting = false
-			m.vp.LineUp(3)
-			m.rebuildViewport()
-			return m, nil
-
-		case tea.MouseWheelDown:
-			m.mouseSelecting = false
-			m.vp.LineDown(3)
-			m.rebuildViewport()
-			return m, nil
-
-		case tea.MouseLeft:
-			point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y)
-			if !ok {
+		switch mouseMsg.Action {
+		case tea.MouseActionPress:
+			switch mouseMsg.Button {
+			case tea.MouseButtonWheelUp:
 				m.mouseSelecting = false
+				m.vp.ScrollUp(3)
+				m.rebuildViewport()
+				return m, nil
+
+			case tea.MouseButtonWheelDown:
+				m.mouseSelecting = false
+				m.vp.ScrollDown(3)
+				m.rebuildViewport()
+				return m, nil
+
+			case tea.MouseButtonLeft:
+				point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y)
+				if !ok {
+					m.mouseSelecting = false
+					return m, nil
+				}
+				m.mouseSelecting = true
+				m.startMouseRow = point.row
+				m.startMouseCol = point.col
+				m.currentMouseRow = point.row
+				m.currentMouseCol = point.col
 				return m, nil
 			}
-			m.mouseSelecting = true
-			m.startMouseRow = point.row
-			m.startMouseCol = point.col
-			m.currentMouseRow = point.row
-			m.currentMouseCol = point.col
-			return m, nil
 
-		case tea.MouseMotion:
+		case tea.MouseActionMotion:
 			if m.mouseSelecting {
 				if point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y); ok {
 					m.currentMouseRow = point.row
@@ -361,7 +364,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
-		case tea.MouseRelease:
+		case tea.MouseActionRelease:
 			if m.mouseSelecting {
 				m.mouseSelecting = false
 				end := mouseSelectionPoint{row: m.currentMouseRow, col: m.currentMouseCol}
@@ -388,7 +391,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.vpReady {
 			m.vp = viewport.New(msg.Width, vpH)
 			m.vp.YPosition = 0
-			m.vp.HighPerformanceRendering = false
 			m.vpReady = true
 			m.showBanner = true
 			m.rebuildViewport()
@@ -441,9 +443,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+msg.err.Error())
 		}
-		for _, rec := range msg.records {
-			m.records = append(m.records, rec)
-		}
+		m.records = append(m.records, msg.records...)
 		if msg.sessionKey != "" {
 			m.sess.SetInvestigationID(msg.sessionKey)
 		}

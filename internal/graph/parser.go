@@ -293,57 +293,6 @@ func extractGoTypeName(n *sitter.Node, src []byte) string {
 	return ""
 }
 
-func extractTSSymbols(n *sitter.Node, src []byte, file string, symbols *[]Symbol) {
-	c := int(n.NamedChildCount())
-	for i := range c {
-		child := n.NamedChild(i)
-		if child == nil {
-			continue
-		}
-
-		switch child.Type() {
-		case "function_declaration":
-			sym := makeSymbol(child, src, file, SymbolFunction)
-			*symbols = append(*symbols, sym)
-		case "method_definition":
-			sym := makeSymbol(child, src, file, SymbolMethod)
-			*symbols = append(*symbols, sym)
-		case "class_declaration":
-			sym := makeSymbol(child, src, file, SymbolType)
-			*symbols = append(*symbols, sym)
-		case "interface_declaration":
-			sym := makeSymbol(child, src, file, SymbolInterface)
-			*symbols = append(*symbols, sym)
-		case "type_alias_declaration":
-			sym := makeSymbol(child, src, file, SymbolType)
-			*symbols = append(*symbols, sym)
-		case "enum_declaration":
-			sym := makeSymbol(child, src, file, SymbolEnum)
-			*symbols = append(*symbols, sym)
-		case "lexical_declaration", "variable_declaration":
-			extractTSVarDeclarations(child, src, file, SymbolVariable, symbols)
-		}
-
-		extractTSSymbols(child, src, file, symbols)
-	}
-}
-
-func extractTSVarDeclarations(n *sitter.Node, src []byte, file string, kind SymbolKind, symbols *[]Symbol) {
-	c := int(n.NamedChildCount())
-	for i := range c {
-		child := n.NamedChild(i)
-		if child == nil || child.Type() != "variable_declarator" {
-			continue
-		}
-		nameNode := child.ChildByFieldName("name")
-		if nameNode != nil {
-			sym := makeSymbol(child, src, file, kind)
-			sym.Name = nameNode.Content(src)
-			*symbols = append(*symbols, sym)
-		}
-	}
-}
-
 func extractPythonSymbols(n *sitter.Node, src []byte, file string, symbols *[]Symbol) {
 	c := int(n.NamedChildCount())
 	for i := range c {

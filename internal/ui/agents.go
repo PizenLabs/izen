@@ -15,28 +15,6 @@ import (
 	"github.com/PizenLabs/izen/internal/prompt"
 )
 
-// needsLLMFallback detects ambiguous or shallow queries that the local diagnostic
-// engine cannot meaningfully resolve, guaranteeing the pipeline escalates to the
-// outbound LLM for contextual reasoning.
-func needsLLMFallback(content string) bool {
-	trimmed := strings.TrimSpace(content)
-	if trimmed == "" {
-		return false
-	}
-	lower := strings.ToLower(trimmed)
-	switch lower {
-	case "hi", "hello", "hey", "test", "help":
-		return true
-	}
-	if len(trimmed) < 5 {
-		return true
-	}
-	if strings.HasSuffix(lower, "?") && len(trimmed) < 20 {
-		return true
-	}
-	return false
-}
-
 func (m *model) runInvestigateCmd(content string) tea.Cmd {
 	return tea.Batch(
 		func() tea.Msg {

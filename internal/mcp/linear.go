@@ -262,7 +262,7 @@ func (g *LinearGateway) GetComments(issueID string) ([]Comment, error) {
 
 func (g *LinearGateway) doRequest(variables interface{}) ([]byte, error) {
 	if !g.config.Enabled {
-		return nil, fmt.Errorf("Linear MCP is not enabled")
+		return nil, fmt.Errorf("linear MCP is not enabled")
 	}
 
 	data, err := json.Marshal(variables)
@@ -290,7 +290,7 @@ func (g *LinearGateway) doRequest(variables interface{}) ([]byte, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("Linear API error: %d %s", resp.StatusCode, string(respData))
+		return nil, fmt.Errorf("linear API error: %d %s", resp.StatusCode, string(respData))
 	}
 
 	return respData, nil

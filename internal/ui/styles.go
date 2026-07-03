@@ -130,26 +130,8 @@ var (
 	outputStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 	labelBoldStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
 	promptStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorAccent))
-	sepStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
-	hairlineStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 	infoStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	spinnerStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)) // Muted down from racy cyan
 	errorStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
-	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)) // Swapped from colorMuted for deeper dim
-	subtleStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
-
-	// Agent output styles
-	investigationStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow))
-	evidenceStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)) // Lower distraction footprint
-	hypothesisStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorTeal))
-	reviewStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colorPink))
-	scoreStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMauve))
-
-	riskCriticalStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
-	riskHighStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange))
-	riskMediumStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow))
-	riskLowStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
-	riskInfoStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
 
 	// Suggestion palette
 	paletteBoxStyle = lipgloss.NewStyle().
@@ -164,19 +146,6 @@ var (
 	palettePathStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 	paletteSelectedPath  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 
-	// Chrome
-	logoStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreenBr))
-	versionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)) // Muted version info
-	dotStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	bulletStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)).SetString(" • ")
-
-	modeTabActiveStyle   = lipgloss.NewStyle().Bold(true).Padding(0, 1)
-	modeTabInactiveStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)).Padding(0, 1)
-
-	statusLeftStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	statusRightStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)) // Enforces low contrast on token metrics
-	statusSepStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)).SetString(" │ ")
-
 	// Gutter markers
 	gutterUserStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterUser))
 	gutterAIStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterAI))
@@ -184,19 +153,10 @@ var (
 	gutterStatusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus))
 	gutterSysStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterSystem))
 
-	labelUserStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterUser))
-	labelAIStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterAI))
-	labelErrorStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterError))
-	labelStatusStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterStatus))
+	labelUserStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterUser))
 
 	// Code highlight
-	hlKeyword = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Bold(true)
-	hlString  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow))
-	hlComment = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	hlNumber  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))
-	hlType    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorPink))
-	hlCodeBg  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Background(lipgloss.Color(colorOverlay))
-	hlLang    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed)).Bold(true) // Dimmed down structural metadata
+	hlCodeBg = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Background(lipgloss.Color(colorOverlay))
 
 	// Diff (Dynamic Layout)
 	diffAddBgStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDiffAddFg)).Background(lipgloss.Color(colorDiffAddBg))
@@ -205,16 +165,6 @@ var (
 	diffCtxStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDiffCtxFg))
 	diffLineNumSty   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorLineNumFg))
 	diffLineNumHLSty = lipgloss.NewStyle().Foreground(lipgloss.Color(colorLineNumHL))
-
-	// Confirmation dialog
-	confirmBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color(colorOrange)).
-			Padding(0, 1)
-	confirmKeyStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorOrange))
-	confirmDescStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
-	confirmDimStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	confirmFileStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 )
 
 // ── Gutter / Label Helpers ────────────────────────────────────────────────────
@@ -233,21 +183,6 @@ func gutterFor(r role) string {
 		return gutterSysStyle.Render("╎") + " "
 	default:
 		return "  "
-	}
-}
-
-func labelFor(r role) string {
-	switch r {
-	case roleUser:
-		return labelUserStyle.Render("you")
-	case roleAI:
-		return labelAIStyle.Render("izen")
-	case roleError:
-		return labelErrorStyle.Render("error")
-	case roleStatus:
-		return labelStatusStyle.Render("done")
-	default:
-		return ""
 	}
 }
 
