@@ -43,33 +43,82 @@ func (m *model) View() string {
 
 	var sections []string
 
-	// 1. Conversation Timeline (Viewport)
+	// 1. Top Status Bar (objective + metrics — hidden when no state)
+	topBar := m.renderTopBar()
+	if topBar != "" {
+		sections = append(sections, topBar)
+	}
+
+	// 2. Conversation Timeline (Viewport)
 	sections = append(sections, m.vp.View())
 
-	// 2. Suggestion palette (Floats dynamically above the prompt input area)
+	// 3. Suggestion palette (Floats dynamically above the prompt input area)
 	if m.showSuggestions && len(m.suggestions) > 0 {
 		sections = append(sections, m.renderSuggestions(width))
 	}
 
-	// 3. Engineering Widgets (Active/pinned widget, e.g. active Proposal or Progress)
+	// 4. Engineering Widgets (Active/pinned widget, e.g. active Proposal or Progress)
 	activeWidget := m.renderActiveWidget(width)
 	if activeWidget != "" {
 		sections = append(sections, activeWidget)
 	}
 
-	// 4. Focus separator line
+	// 5. Focus separator line
 	sections = append(sections, m.renderFocusLine(width))
 
-	// 5. Input Prompt box area
+	// 6. Input Prompt box area
 	sections = append(sections, m.renderPromptBox(width))
 
-	// 6. Runtime Status
+	// 7. Runtime Status
 	sections = append(sections, m.renderRuntimeStatus(width))
 
-	// 7. Footer
+	// 8. Footer
 	sections = append(sections, m.renderFooter(width))
 
 	return strings.Join(sections, "\n")
+}
+
+func (m *model) renderTopBar() string {
+	obj := m.sess.ObjectiveState
+	rawIntent := ""
+	scopeFiles := 0
+	if obj != nil {
+		rawIntent = strings.TrimSpace(obj.RawIntent)
+		scopeFiles = len(obj.Scope.Files)
+	}
+
+	if rawIntent == "" && scopeFiles == 0 {
+		return ""
+	}
+
+	var parts []string
+	if rawIntent != "" {
+		objText := truncateStr(rawIntent, 40)
+		parts = append(parts, "⌖ "+objText)
+	}
+	if scopeFiles > 0 {
+		parts = append(parts, fmt.Sprintf("🗀 %d files", scopeFiles))
+	}
+
+	content := strings.Join(parts, "  •  ")
+	bar := " " + content + " "
+
+	return lipgloss.NewStyle().
+		Background(lipgloss.Color(colorSurface)).
+		Foreground(lipgloss.Color(colorTopBarMetrics)).
+		Padding(0, 1).
+		Render(bar)
+}
+
+func truncateStr(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	if maxRunes <= 3 {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-3]) + "…"
 }
 
 // ── Focus line ────────────────────────────────────────────────────────────
@@ -216,6 +265,9 @@ func (m *model) renderRuntimeStatus(width int) string {
 			}
 		}
 		parts = append(parts, checkpointStr)
+	}
+	if m.uiNotice != "" && width >= 60 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render("notice: "+m.uiNotice))
 	}
 
 	sep := lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)).Render("  │  ")

@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -484,6 +485,29 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleStatus, fmt.Sprintf("amended as %s", msg.hash))
 		return m, nil
 
+	case objectiveAnalyzedMsg:
+		if msg.err != nil {
+			m.uiNotice = "Objective analysis failed: " + msg.err.Error()
+			if m.sess.ObjectiveState != nil {
+				m.sess.ObjectiveState.CurrentStatus = domain.ObjectiveIdle
+				m.sess.SetObjectiveState(m.sess.ObjectiveState)
+				_ = m.sess.Save()
+			}
+			return m, nil
+		}
+		if msg.objective == nil {
+			m.uiNotice = "Objective analysis failed: empty objective result."
+			return m, nil
+		}
+		m.sess.SetObjectiveState(msg.objective)
+		_ = m.sess.Save()
+		if msg.objective.TokenBudget.RequiresApproval {
+			m.uiNotice = "Objective needs manual approval. Run /objective approve."
+		} else {
+			m.uiNotice = "Objective planned and active."
+		}
+		return m, nil
+
 	case tokenMsg:
 		m.responseBuffer.WriteString(string(msg))
 		if m.vpReady {
@@ -494,6 +518,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamDoneMsg:
 		m.streamCh = nil
 		m.streaming = false
+		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
+			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
+			m.sess.SetObjectiveState(m.sess.ObjectiveState)
+			_ = m.sess.Save()
+		}
 		m.tokenInput += msg.tokenInput
 		m.tokenOutput += msg.tokenOutput
 		final := msg.content
@@ -656,6 +685,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamErrMsg:
 		m.streamCh = nil
 		m.streaming = false
+		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
+			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
+			m.sess.SetObjectiveState(m.sess.ObjectiveState)
+			_ = m.sess.Save()
+		}
 		m.push(roleError, "stream error: "+msg.err.Error())
 		return m, nil
 

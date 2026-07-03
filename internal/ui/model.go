@@ -17,6 +17,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
@@ -89,6 +90,11 @@ type commitGeneratedMsg struct {
 
 type buildProposalsReadyMsg struct {
 	proposals []SemanticProposal
+}
+
+type objectiveAnalyzedMsg struct {
+	objective *domain.Objective
+	err       error
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -207,6 +213,9 @@ type model struct {
 	startMouseRow   int
 	currentMouseCol int
 	currentMouseRow int
+
+	// Focus objective UI notifications (non-chat)
+	uiNotice string
 }
 
 // ── Viewport helpers ──────────────────────────────────────────────────────────
@@ -216,11 +225,15 @@ func (m *model) viewportHeight() int {
 	// Base heights: Focus line (1) + Prompt Box (3) + Runtime Status (1) + Footer (1)
 	baseHeight := 1 + 3 + 1 + 1
 
-	// Add dynamic heights
+	// Dynamic: top bar (0 or 1), widget, suggestions
+	topBarH := 0
+	if m.renderTopBar() != "" {
+		topBarH = 1
+	}
 	widgetH := m.activeWidgetHeight()
 	suggestionH := m.suggestionPaletteHeight()
 
-	h := m.height - baseHeight - widgetH - suggestionH - viewportPadding
+	h := m.height - baseHeight - topBarH - widgetH - suggestionH - viewportPadding
 	if h < 3 {
 		h = 3
 	}

@@ -58,6 +58,9 @@ const (
 	colorGutterError  = "#f38ba8"
 	colorGutterStatus = "#585b70" // Dimmed status tracking gutter
 	colorGutterSystem = "#45475a"
+
+	// Top Bar
+	colorTopBarMetrics = "#a6adc8" // Subtext0
 )
 
 // lipglossColor is a convenience helper.

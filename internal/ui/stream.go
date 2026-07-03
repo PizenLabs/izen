@@ -7,7 +7,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/PizenLabs/izen/internal/agents"
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
@@ -19,6 +21,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	if content == "" {
 		return nil
 	}
+	content = agents.InjectObjectiveContext(content, m.sess.ObjectiveState)
 	if m.streamCh != nil {
 		m.push(roleSystem, "[System] Stream blocked: an execution channel is currently active.")
 		return nil
@@ -32,6 +35,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streaming = true
 	m.spinnerFrame = 0
 	m.responseBuffer.Reset()
+	if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.HumanConfirmed {
+		m.sess.ObjectiveState.CurrentStatus = domain.ObjectiveExecuting
+		m.sess.SetObjectiveState(m.sess.ObjectiveState)
+		_ = m.sess.Save()
+	}
 
 	var msgs []ai.Message
 	if history := m.sess.History; len(history) > 0 {

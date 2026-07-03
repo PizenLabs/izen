@@ -14,6 +14,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/domain"
+	objengine "github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/retrieval"
@@ -177,12 +179,12 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 	}
 
 	if m.resolver.Current() == modes.ModeBuild && m.graph != nil {
-		compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.Objective)
+		compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.ObjectiveIntent())
 		compressed := compressor.CompressLines(content)
 		if compressed != "" && compressed != content {
 			content = retrieval.FormatCompressedFrame(compressed) + "\n\n" + content
 		}
-		go retrieval.BuildGlobalCompressor(m.graph, m.sess.Objective)
+		go retrieval.BuildGlobalCompressor(m.graph, m.sess.ObjectiveIntent())
 	}
 
 	switch m.resolver.Current() {
@@ -217,13 +219,13 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 
 		if m.graph != nil && assembly.EstimateTokens < plan.TokenBudgetForModel(modelName)-1000 {
 			query := content
-			if m.sess.Objective != "" {
-				query = m.sess.Objective + " " + query
+			if m.sess.ObjectiveIntent() != "" {
+				query = m.sess.ObjectiveIntent() + " " + query
 			}
 			lc := retrieval.GetLynxController()
 			if lc != nil {
-				compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.Objective)
-				go retrieval.BuildGlobalCompressor(m.graph, m.sess.Objective)
+				compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.ObjectiveIntent())
+				go retrieval.BuildGlobalCompressor(m.graph, m.sess.ObjectiveIntent())
 				results, err := lc.SearchRaw(query)
 				if err == nil && len(results) > 0 {
 					compressed := compressor.CompressResults(results)
@@ -322,6 +324,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
 		m.push(roleSystem, infoStyle.Render("  /help  /mode  /objective  /drop  /clear  /quit"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch"))
+		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, infoStyle.Render("  @<path>  reference a file in your message"))
@@ -346,13 +349,31 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case strings.HasPrefix(cmd, "/objective"):
-		obj := strings.TrimSpace(strings.TrimPrefix(cmd, "/objective"))
-		if obj != "" {
-			m.sess.SetObjective(obj)
+		objArg := strings.TrimSpace(strings.TrimPrefix(cmd, "/objective"))
+		if strings.EqualFold(objArg, "approve") {
+			if m.sess.ObjectiveState == nil {
+				m.uiNotice = "No active objective to approve."
+				return nil
+			}
+			m.sess.ObjectiveState.HumanConfirmed = true
+			if m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveAnalyzing || m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveIdle {
+				m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
+			}
+			m.sess.SetObjectiveState(m.sess.ObjectiveState)
 			m.sess.Save()
-			m.push(roleSystem, infoStyle.Render("objective: "+obj))
+			m.uiNotice = "Objective approved for outbound pipelines."
+			return nil
+		}
+		if objArg != "" {
+			m.resetObjectiveContextStacks()
+			obj := domain.NewObjective(objArg)
+			obj.CurrentStatus = domain.ObjectiveAnalyzing
+			m.sess.SetObjectiveState(obj)
+			m.sess.Save()
+			m.uiNotice = "Objective analysis started."
+			return m.analyzeObjectiveCmd(obj)
 		} else {
-			m.push(roleSystem, infoStyle.Render("usage: /objective <description>"))
+			m.uiNotice = "Usage: /objective <description>"
 		}
 		return nil
 
@@ -460,12 +481,12 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 		targetTask.StepNum, targetTask.Type, targetTask.Target, targetTask.Description)
 
 	if m.graph != nil {
-		compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.Objective)
+		compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.ObjectiveIntent())
 		compressed := compressor.CompressLines(content)
 		if compressed != "" && compressed != content {
 			content = retrieval.FormatCompressedFrame(compressed) + "\n\n" + content
 		}
-		go retrieval.BuildGlobalCompressor(m.graph, m.sess.Objective)
+		go retrieval.BuildGlobalCompressor(m.graph, m.sess.ObjectiveIntent())
 	}
 
 	m.responseBuffer.Reset()
@@ -487,4 +508,39 @@ func execShell(cmd string) (string, error) {
 		out += stderr.String()
 	}
 	return out, err
+}
+
+func (m *model) analyzeObjectiveCmd(obj *domain.Objective) tea.Cmd {
+	return func() tea.Msg {
+		resultCh := make(chan objectiveAnalyzedMsg, 1)
+		go func() {
+			if obj == nil {
+				resultCh <- objectiveAnalyzedMsg{err: fmt.Errorf("objective is nil")}
+				return
+			}
+			res := objengine.BuildObjectiveContext(obj.RawIntent, m.cfg.ActiveModelName(), m.graph)
+			obj.Scope = res.Scope
+			obj.TokenBudget = res.Budget
+			obj.Telemetry = append(obj.Telemetry[:0], res.Telemetry...)
+			obj.CurrentStatus = domain.ObjectivePlanned
+			obj.HumanConfirmed = !res.Budget.RequiresApproval
+			resultCh <- objectiveAnalyzedMsg{objective: obj}
+		}()
+		return <-resultCh
+	}
+}
+
+func (m *model) resetObjectiveContextStacks() {
+	m.pendingFileRefs = nil
+	m.attachedFiles = nil
+	m.investigateInvocationCount = 0
+	m.pendingProposals = nil
+	m.awaitingConfirmation = false
+	m.acceptAll = false
+	m.state = StateChat
+	m.sess.InvestigationID = ""
+	m.sess.ReviewID = ""
+	m.sess.ClearHistory()
+	m.sess.ClearTasks()
+	_ = m.sess.Save()
 }

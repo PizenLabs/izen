@@ -93,9 +93,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 
 			// Echo user line into viewport
-			userLine := gutterUserStyle.Render("▌") + " " +
+			userLine := gutterUserStyle.Render("|") + " " +
 				labelUserStyle.Render("you") +
-				promptStyle.Render(" > ") +
+				promptStyle.Render(" ⏵ ") +
 				outputStyle.Render(line)
 			m.records = append(m.records, record{role: roleUser, text: userLine})
 
