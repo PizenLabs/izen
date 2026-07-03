@@ -1,252 +1,485 @@
-Izen Philosophy & Command Registry
+# Izen Philosophy
 
-Izen is built on one central, non-negotiable belief:
+> AI should strengthen human judgment, not replace it.
 
-AI should strengthen human judgment, not replace it.
+This is the constitutional foundation of Izen.
 
-This is the foundation of everything. Every feature, workflow, and architectural decision must preserve this principle. If a feature increases automation but reduces human understanding, it must be rejected.
+Every feature, workflow, runtime behavior, and architectural decision must preserve this principle.
 
-Core Principles
+If a feature increases automation but reduces human understanding, it must be rejected.
 
-1. Human-Centered
+Izen is not an autonomous coding system.
 
-The human remains the source of truth. AI is an assistant, not an authority, not an owner, and not an autonomous operator. Izen exists to help humans understand code, inspect systems, plan changes, investigate failures, and execute safely. Human judgment remains final.
+Izen is a constrained cognitive runtime built to make the human stronger.
 
-Rule: Never optimize away human understanding.
+---
 
-2. Clarity Over Speed
+## Vision
 
-Fast is useful; clear is required. A fast answer that hides its reasoning is highly dangerous. Izen must optimize for this hierarchy of values:
+Izen exists to build a better relationship between humans and intelligence.
 
+Not faster by default.
+Not smarter by illusion.
+Not autonomous by trend.
 
-$$\text{Clarity} > \text{Control} > \text{Trust} > \text{Speed}$$
+But:
 
-Rule: Unclear speed is technical debt.
+- clearer
+- safer
+- more inspectable
+- more reversible
+- more structurally intelligent
 
-3. Explicit Over Implicit
+The long-term vision of Izen is to become:
 
-Nothing important should happen silently. The user must always know what Izen is doing, why it is doing it, what retrieval strategy it is using, and what fallback was triggered.
+> A local-first industrial cognition layer for engineering work.
 
-Example: [System]: Graph lookup failed. Escalating to semantic search.
+A workspace where:
 
-Example: [System]: Semantic confidence low. Fallback: ripgrep lookup.
+- structure is preferred over noise
+- understanding is preferred over guessing
+- plans are preferred over blind execution
+- reversibility is enforced
+- trust is earned through visibility
 
-Rule: Invisible behavior reduces trust.
+Izen is not designed for hype cycles.
 
-4. Minimal by Default & Resource Budgeting
+It is designed for durability.
 
-Complexity must be activated only when necessary. Simple inputs should remain simple and cheap. Context is financial and performance debt; every automated retrieval step must calculate and estimate its token weight before sending payloads to the language model.
+---
 
-Example: Sending "Hi" must never trigger repository scans, graph builds, semantic analysis, or execution engines.
+## Core Principles
 
-Rule: Complexity and resource consumption must be proportional to intent.
+### 1. Human-Centered
 
-5. Local-First
+The human remains the source of truth.
 
-Local is the default. Not cloud, not remote, not external. Izen assumes the machine running it owns the work. This makes it faster, safer, more private, and more transparent.
+AI is an assistant.
 
-Rule: Remote systems must remain optional.
+Not an authority.
+Not an owner.
+Not an autonomous operator.
 
-6. Security-Aware & Scoped Isolation
+Izen exists to help humans:
 
-Every capability has risk. Nothing should be trusted by default, especially shell execution, external Model Context Protocol (MCP) servers, file mutations, and external API providers.
+- understand code
+- inspect systems
+- plan changes
+- investigate failures
+- execute safely
 
-Rule: Capability without explicit boundaries becomes liability.
+Human judgment remains final.
 
-7. Reversible by Design
+**Rule:** Never optimize away human understanding.
 
-Every meaningful mutation must be easily recoverable. This includes file changes, generated patches, execution paths, and workspace plans. This is enforced through Git checkpoints, patch storage, and local audit logs.
+### 2. Clarity Over Speed
 
-Rule: If a mutation cannot be reversed, it must not be automated.
+Fast is useful.
 
-8. Structure Before Intelligence
+Clear is required.
 
-Raw context is expensive and noisy. Structured context is powerful. Izen should always prefer:
+A fast answer that hides reasoning is dangerous.
 
+Izen optimizes for:
 
-$$\text{Graph AST} \rightarrow \text{Symbol Definitions} \rightarrow \text{Call Chains} \rightarrow \text{Dependency Slices}$$
+> Clarity > Control > Trust > Speed
 
+**Rule:** Unclear speed is technical debt.
 
-before resorting to full files, full directories, or full repositories.
+### 3. Explicit Over Implicit
 
-Rule: Compress context before reasoning.
+Nothing important happens silently.
 
-9. Semantic-First, Text-Resilient
+The user must always know:
 
-The preferred retrieval sequence is:
+- what Izen is doing
+- why it is doing it
+- what retrieval path is active
+- what fallback was triggered
+- what failed
 
+Examples:
 
-$$\text{Graph AST Query} \rightarrow \text{Semantic Search} \rightarrow \text{Text Fallback}$$
+```
+[System] Graph lookup failed. Escalating to semantic search.
+[System] Semantic confidence low. Fallback: ripgrep lookup.
+```
 
+**Rule:** Invisible behavior reduces trust.
 
-We use the strongest structural understanding first, but reliable fallback mechanisms must always exist because real-world repositories are messy (containing malformed syntax, uncommitted drafts, huge configs, and logs).
+### 4. Minimal by Default
 
-Rule: Purity without resilience is fragile.
+Complexity must be proportional to intent.
 
-10. Modes Over Prompts
+Simple input must remain simple.
 
-Izen is strictly mode-driven, not prompt-driven. Modes define permissions, runtime behaviors, retrieval boundaries, and tool access—never superficial AI personalities.
+Saying:
 
-Rule: Behavior must be declarative and deterministic, not improvised.
+```
+Hi
+```
 
-11. UI as a High-Throughput Dashboard
+must never trigger:
 
-The terminal is an industrial workspace, not a casual chat app.
+- graph indexing
+- semantic retrieval
+- execution engines
+- repository scans
 
-Layout over Stream: Persistent metadata (active models, token usage, Git branch, mode status) must live in fixed, dedicated UI regions (Status Bars, Side Panes).
+Context is both cost and debt.
 
-No Scrolling for Info: Scrolling chat lines should strictly hold active reasoning and human dialogue.
+Every retrieval step must estimate token weight before model submission.
 
-Rule: Never make the user scroll through chat logs to find active metadata.
+**Rule:** Complexity must be intentional.
 
-Operational Rules
+### 5. Local-First
 
-Rule 1: Before adding a feature, ask: Does it improve human understanding? If no, do not build it.
+Local is the default.
 
-Rule 2: Before adding a feature, ask: Does it reduce noise? If no, do not build it.
+Not cloud.
+Not remote.
+Not external.
 
-Rule 3: Before adding a feature, ask: Does it preserve human control? If no, do not build it.
+Izen assumes the machine running it owns the work.
 
-Rule 4: Before adding a feature, ask: Does it increase trust? If no, do not build it.
+Benefits:
 
-Rule 5: Before adding a feature, ask: Does it fit local-first? If no, it must remain optional.
+- privacy
+- speed
+- transparency
+- lower failure surfaces
 
-Rule 6: Before adding retrieval logic, ask: Can this be solved with a Graph query first? If yes, avoid raw file reads.
+Remote systems remain optional.
 
-Rule 7: Before loading context, ask: Is this necessary right now? If no, delay loading.
+**Rule:** Remote is additive, never foundational.
 
-Rule 8: Before executing a shell command (!), ask: Does this command alter state outside the Git tree (e.g., databases, Docker containers, infrastructure)? If yes, warn the user that this action is irreversible via Git, and require explicit confirmation.
+### 6. Security-Aware & Scoped Isolation
 
-Rule 9: Before calling external systems, ask: Can local solve this first? If yes, prefer local.
+Every capability carries risk.
 
-Rule 10: Before increasing autonomy, ask: Does this reduce human understanding? If yes, reject it.
+Nothing should be trusted by default.
 
-Rule 11 (Diagnostic Rule): Before analyzing raw terminal outputs, stack traces, or logs, ask: Can this noise be parsed or pre-filtered locally (e.g., stripping timestamp bloat or duplicate polling lines)? If yes, filter locally first. Raw diagnostics must be skimmed by engines before being read by intelligence.
+Especially:
 
-Rule 12 (Token Budget Guard): If an operation’s calculated input token weight exceeds the current mode's target threshold, Izen must pause, report the weight to the user, and prompt for human pruning.
+- shell execution
+- MCP servers
+- file mutation
+- external APIs
+- infrastructure commands
 
-Anti-Patterns
+Capabilities must be bounded.
 
-Blind Autonomy
+**Rule:** Capability without boundaries becomes liability.
 
-Wrong: The AI decides, mutates, and runs things behind the scenes without user clarity.
+### 7. Reversible by Design
 
-Right: AI proposes a plan; human approves, adjusts, or rejects.
+Mutation must always have a return path.
 
-Context Dumping
+This includes:
 
-Wrong: Blindly dumping an entire repository or file into the model's context.
+- file changes
+- patch application
+- build outputs
+- workspace plans
+- shell-triggered state changes
 
-Right: Injecting only calculated dependency slices and compressed AST nodes.
+Enforced by:
 
-Silent Fallbacks
+- Git checkpoints
+- patch storage
+- audit logs
 
-Wrong: Semantic search failed, so the system silently falls back to a broad regex search without letting the user know.
+**Rule:** If it cannot be reversed, it must not be automated.
 
-Right: Explicitly logging every transition of retrieval strategies to the screen.
+### 8. Structure Before Intelligence
 
-Prompt Blob Architecture
+Raw context is expensive.
 
-Wrong: Controlling complex application behavior by piling long prose-based instructions inside LLM system prompts (agents/*.md).
+Structured context is leverage.
 
-Right: Code controls system boundaries and enforces invariants; prompts only seed intelligence. If the LLM violates a constraint, write a validator, parser, or AST filter in Go.
+Izen prefers:
 
-Hidden Memory
+> Graph AST → Symbol Definitions → Call Chains → Dependency Slices
 
-Wrong: Maintaining hidden conversational states that affect AI behavior without being visible to the user.
+before:
 
-Right: Making all contextual memory explicit, inspectable, and editable.
+- raw files
+- full folders
+- repository dumps
 
-Feature Accumulation
+Compression precedes reasoning.
 
-Wrong: Adding features simply because competitors or other frameworks have them.
+**Rule:** Compress context before intelligence.
 
-Right: Only building features that strictly align with Izen’s operational rules.
+### 9. Semantic-First, Text-Resilient
 
-The Omniscient Graph Trap
+Retrieval order:
 
-Wrong: Assuming the codebase dependency graph is always perfect and fully indexed.
+> Graph AST Query → Semantic Search → Text Fallback
 
-Right: Treating the graph as a map, not the ground truth. When the workspace is dirty, cross-reference AST structures with uncommitted Git diffs before reasoning.
+Structure first.
 
-Hardened Command Registry & Rationale
+Meaning second.
 
-To maintain an uncluttered, industrial TUI and eliminate interface noise, Izen enforces a minimal command set. Commands are classified strictly under three criteria: Human Control, State Reversibility, and Context Management.
+Text fallback always available.
 
-1. Retained Chat Commands
+Real-world repositories are messy.
 
-These are the only slash-commands allowed inside the chat input. They serve a functional purpose that cannot be mapped to static hotkeys without losing precision.
+Purity without fallback is fragility.
 
-/? or /help
+**Rule:** Purity without resilience is fragile.
 
-Rationale: Empowers human understanding of the workspace interface on demand.
+### 10. Modes Over Prompts
 
-/quit
+Izen is mode-driven.
 
-Rationale: Provides a predictable, explicit exit hatch that safely commits the active session state.
+Never personality-driven.
 
-/mode <ask|plan|build|investigate|review>
+Modes define:
 
-Rationale: Establishes a declarative boundary for AI capabilities. It is the primary way the human restricts what the AI is allowed to do.
+- permissions
+- runtime behavior
+- retrieval boundaries
+- tool access
 
-/objective <description>
+Prompts seed intelligence.
 
-Rationale: Expresses the user's high-level intent. This focuses the AI's generation and retrieval engines, keeping token noise low.
+Modes enforce behavior.
 
-/clear
+**Rule:** Behavior must be deterministic.
 
-Rationale: Resets the conversation viewport. Essential for human focus and clearing psychological noise.
+### 11. UI as a High-Throughput Dashboard
 
-/drop [target_path]
+The terminal is an industrial workspace.
 
-Rationale: Allows manual, fine-grained removal of files from the context stack, putting the user in complete control of inputs.
+Not a casual chat app.
 
-/undo
+Persistent metadata belongs in fixed regions:
 
-Rationale: Kicks off the reversibility engine to rollback file mutations and local changes.
+- status bars
+- side panes
+- runtime indicators
 
-/commit
+Scrolling is for:
 
-Rationale: Signals that the human has audited the changes and marked the current state as a safe baseline.
+- reasoning
+- human dialogue
+- active analysis
 
-/checkpoint
+Never for critical metadata.
 
-Rationale: Creates a manual, pre-emptive local snapshot before triggering complex or experimental runs.
+**Rule:** Metadata must remain visible.
 
-2. The Shell Escape Hatch
+### 12. Failure Is First-Class
 
-!<shell command>
+Failure is expected.
 
-Rationale: A high-utility escape hatch that allows engineers to query or run their system directly. It bypasses AI-mediation entirely, keeping the human as the dominant executor. It is bound by ReadOnly() mode guards and non-Git mutation guards.
+Not exceptional.
 
-3. Refactored / Eliminated Commands (The "Why")
+Examples:
 
-To protect Izen from feature bloat, several traditional commands have been removed or integrated into cleaner UX components:
+- graph failures
+- parser failures
+- semantic misses
+- provider outages
+- shell crashes
 
-Removed: /models & /tokens
+Failures must be:
 
-Why: Querying active models or token usage via chat command is an anti-pattern that violates UI as a High-Throughput Dashboard (Principle 11). Chat space is precious.
+- surfaced
+- logged
+- inspectable
+- resumable
 
-Refactored to: Persistent fields on the TUI Status Bar at the bottom of the terminal window. Active model and real-time token metrics are visible at a glance without polluting the terminal logs.
+**Rule:** Hidden failure is worse than failed execution.
 
-Removed: /history
+---
 
-Why: Printing history as a block of text in the viewport adds massive visual noise and disrupts the flow of code analysis.
+## Mode System
 
-Refactored to: Terminal-standard behavior. Pressing the Up and Down arrow keys in the chat input cycles through command and message history, preserving viewport cleanliness.
+Modes define operational boundaries.
 
-Removed: /resume
+Not personalities.
 
-Why: Explicitly typing a command to resume sessions is redundant and adds friction.
+A new mode may only exist if it creates a fundamentally new permission boundary.
 
-Refactored to: Implicit startup restoration. Izen automatically reads the local state of the last active directory session on boot or accepts a session ID via CLI flags (e.g., izen --session <id>).
+### Capability Matrix
 
-Final Rule
+| Mode        | Read | Write | Shell | Test | Patch | Checkpoint |
+|-------------|------|-------|-------|------|-------|------------|
+| ask         | Yes  | No    | No    | No   | No    | No         |
+| plan        | Yes  | No    | No    | No   | No    | Optional   |
+| build       | Yes  | Yes   | Yes   | Yes  | Yes   | Required   |
+| investigate | Yes  | No    | Yes   | Yes  | No    | Optional   |
+| review      | Yes  | No    | No    | No   | No    | No         |
 
-If a feature makes Izen more powerful but less understandable: do not build it.
+**Rule:** No new mode unless it introduces a fundamentally new permission boundary.
 
-If a feature makes Izen faster but less trustworthy: do not build it.
+---
 
-If a feature makes Izen more autonomous but less human-centered: do not build it.
+## Operational Rules
 
-Izen is not built to replace the human. It is built to make the human stronger.
+Before building anything:
+
+1. Does it improve human understanding?
+2. Does it reduce noise?
+3. Does it preserve human control?
+4. Does it increase trust?
+5. Does it fit local-first?
+6. Can Graph solve this first?
+7. Is this context necessary right now?
+8. Can this mutation be reversed?
+9. Can local solve this before external?
+10. Does this increase autonomy beyond understanding?
+11. Can raw diagnostics be pre-filtered locally?
+12. Does this exceed token budget?
+
+If any answer violates the philosophy:
+
+> do not build it.
+
+---
+
+## Anti-Patterns
+
+### Blind Autonomy
+
+**Wrong:** AI decides and executes without approval.
+
+**Right:** AI proposes. Human decides.
+
+### Context Dumping
+
+**Wrong:** Dumping full repositories.
+
+**Right:** Injecting compressed slices.
+
+### Silent Fallbacks
+
+**Wrong:** Fallbacks without visibility.
+
+**Right:** Fallbacks are logged.
+
+### Prompt Blob Architecture
+
+**Wrong:** System behavior hidden in giant prompts.
+
+**Right:** System boundaries enforced in code. Prompts only seed intelligence.
+
+### Hidden Memory
+
+**Wrong:** Invisible state influencing behavior.
+
+**Right:** Memory must be inspectable.
+
+### Feature Accumulation
+
+**Wrong:** Building because competitors have it.
+
+**Right:** Build only if philosophy allows it.
+
+### The Omniscient Graph Trap
+
+**Wrong:** Assuming graph truth is perfect.
+
+**Right:** Graph is a map, not reality. Dirty workspaces require diff cross-reference.
+
+---
+
+## Command Registry
+
+Minimal surface.
+
+High semantic density.
+
+Low noise.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `/help` | Reveal system capabilities. |
+| `/quit` | Explicit exit. Persist session safely. |
+| `/mode <ask\|plan\|build\|investigate\|review>` | Defines runtime boundary. Primary control surface. |
+| `/objective` | Declares human intent. Focuses retrieval and execution. |
+| `/clear` | Clears viewport. Resets cognitive noise. |
+| `/drop [target]` | Removes context manually. Preserves human control. |
+| `/undo` | Reverses local mutations. |
+| `/commit` | Marks a verified safe baseline. |
+| `/checkpoint` | Creates a pre-emptive rollback anchor. |
+
+### Architectural Map Engine (`/arch`)
+
+The `/arch` command strictly enforces the **Structure Before Intelligence** principle. It is a visual Trust Engine, preventing AI from guessing about the directory structure.
+
+**Operating Rules:**
+
+1. **Graph-First:** The Go engine must pre-construct a list of nodes (File/Symbol) and edges (Import/Call) from the Graph AST.
+2. **Strict Boundary:** If the repository is too large, `/arch` automatically limits the display depth (max depth = 3) to avoid memory overflow for both the user and the SLM.
+3. **Format Invariant:** The output must be normalized as a tree structure or a text-block diagram (Mermaid/Text-Block Diagram) for fixed display on the TUI; cumbersome dialog text is not allowed.
+
+### Shell Escape Hatch
+
+```
+!<command>
+```
+
+Direct system access.
+
+Bypasses AI mediation.
+
+Must obey:
+
+- read-only guards
+- non-Git mutation guards
+- explicit warnings
+
+---
+
+## Runtime Architecture
+
+**Global:** `~/.izen/`
+
+Contains:
+
+- runtime
+- lx engine
+- config
+- shared cache
+
+**Local:** `./.izen/`
+
+Contains:
+
+- session
+- graph
+- patches
+- checkpoints
+- history
+- audit
+
+**Rule:** Executables are global. Knowledge is local.
+
+---
+
+## Final Law
+
+If a feature makes Izen more powerful but less understandable:
+
+> Do not build it.
+
+If a feature makes Izen faster but less trustworthy:
+
+> Do not build it.
+
+If a feature makes Izen more autonomous but less human-centered:
+
+> Do not build it.
+
+If a feature violates reversibility, visibility, or explicit control:
+
+> Do not build it.
+
+Izen is not built to replace the human.
+
+It is built to strengthen human judgment.
