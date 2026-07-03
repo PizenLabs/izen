@@ -189,7 +189,12 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		m.investigateInvocationCount++
 		return m.runInvestigateCmd(content)
 	case modes.ModeReview:
-		return m.runReviewCmd()
+		target := ""
+		trimmed := strings.TrimSpace(content)
+		if strings.HasPrefix(strings.ToLower(trimmed), "check ") {
+			target = strings.TrimSpace(trimmed[6:])
+		}
+		return m.runReviewCmd(target)
 	case modes.ModePlan:
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)

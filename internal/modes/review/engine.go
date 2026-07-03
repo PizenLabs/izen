@@ -66,7 +66,7 @@ func (e *Engine) Run() (*ReviewResult, error) {
 		return result, err
 	}
 
-	if e.Diff.isRepo() && !e.Diff.hasChanges() {
+	if e.target == "" && e.Diff.isRepo() && !e.Diff.hasChanges() {
 		result.Error = "no changes to review — working tree is clean"
 		e.Result = result
 		return result, nil
@@ -115,6 +115,19 @@ func (e *Engine) executeCurrentState(result *ReviewResult) error {
 }
 
 func (e *Engine) stateCollect(result *ReviewResult) error {
+	if e.target != "" {
+		result.Branch, _ = e.Diff.getBranch()
+		result.BaseBranch = e.Diff.getBaseBranch()
+		result.CommitHash, _ = e.Diff.getHash()
+		result.Commits = 1
+		result.FilesChanged = []DiffFile{{
+			Path:     e.target,
+			Status:   "audit",
+			Language: strings.TrimPrefix(filepath.Ext(e.target), "."),
+		}}
+		return e.State.Transition(StateImpactRadius)
+	}
+
 	analysis, err := e.Diff.Analyze()
 	if err != nil {
 		return fmt.Errorf("collect changes: %w", err)
@@ -133,6 +146,10 @@ func (e *Engine) stateCollect(result *ReviewResult) error {
 }
 
 func (e *Engine) stateAnalyzeDiff(result *ReviewResult) error {
+	if e.target != "" {
+		return e.State.Transition(StateImpactRadius)
+	}
+
 	analysis, err := e.Diff.Analyze()
 	if err != nil {
 		return fmt.Errorf("analyze diff: %w", err)
@@ -176,8 +193,12 @@ func (e *Engine) stateReport(result *ReviewResult) error {
 func (e *Engine) generateSummary(result *ReviewResult) {
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf("Reviewing %d changed files in branch %s\n",
-		len(result.FilesChanged), result.Branch))
+	if e.target != "" {
+		b.WriteString(fmt.Sprintf("Auditing target: %s\n", e.target))
+	} else {
+		b.WriteString(fmt.Sprintf("Reviewing %d changed files in branch %s\n",
+			len(result.FilesChanged), result.Branch))
+	}
 
 	totalAdditions := 0
 	totalDeletions := 0

@@ -38,8 +38,9 @@ func (m *model) runInvestigateCmd(content string) tea.Cmd {
 		var recs []record
 
 		var b strings.Builder
-		b.WriteString(fmt.Sprintf("Problem: %s\n", result.Problem))
-		b.WriteString(fmt.Sprintf("Duration: %s · Loops: %d\n", result.Duration, result.Loops))
+		b.WriteString(fmt.Sprintf("Problem:    %s\n", result.Problem))
+		b.WriteString(fmt.Sprintf("Duration:   %s\n", result.Duration))
+		b.WriteString(fmt.Sprintf("Loops:      %d\n", result.Loops))
 		if result.Resolved {
 			b.WriteString(fmt.Sprintf("Conclusion: %s\n", result.Conclusion))
 		} else {
@@ -80,7 +81,7 @@ func (m *model) runInvestigateCmd(content string) tea.Cmd {
 	}
 }
 
-func (m *model) runReviewCmd() tea.Cmd {
+func (m *model) runReviewCmd(target string) tea.Cmd {
 	m.agentRunning = true
 	m.agentDone = false
 	m.agentLabel = "reviewing"
@@ -99,7 +100,13 @@ func (m *model) runReviewCmd() tea.Cmd {
 		}
 
 		eng := review.NewEngine(".", nil, nil)
-		result, err := eng.Run()
+		var result *review.ReviewResult
+		var err error
+		if target != "" {
+			result, err = eng.RunTarget(target)
+		} else {
+			result, err = eng.Run()
+		}
 		if err != nil {
 			return reviewResultMsg{err: err}
 		}
