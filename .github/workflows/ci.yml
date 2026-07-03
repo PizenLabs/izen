@@ -22,15 +22,18 @@ jobs:
       - name: Show Go version
         run: go version
 
-      - run: go mod download
+      - name: Download dependencies
+        run: go mod download
 
-      - run: go vet ./...
+      - name: Run go vet
+        run: go vet ./...
 
       - uses: dominikh/staticcheck-action@v1.4.1
         with:
           version: latest
 
-      - run: go test -race -count=1 ./...
+      - name: Run tests
+        run: go test -race -count=1 ./...
 
       - uses: golang/govulncheck-action@v1
         with:
@@ -62,16 +65,21 @@ jobs:
           workspaces: |
             lynx
 
-      - run: cargo fmt --all -- --check
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - run: cargo test --workspace --all-targets
+      - name: Run tests
+        run: cargo test --workspace --all-targets
 
   build:
     name: Build Binaries
     runs-on: ubuntu-latest
-    needs: [go, lynx]
+    needs:
+      - go
+      - lynx
 
     steps:
       - uses: actions/checkout@v4
@@ -95,9 +103,11 @@ jobs:
           workspaces: |
             lynx
 
-      - run: make build
+      - name: Build
+        run: make build
 
-      - run: ./bin/izen --version
+      - name: Verify binary
+        run: ./bin/izen --version
 
   release:
     name: Create Release
@@ -130,7 +140,8 @@ jobs:
           workspaces: |
             lynx
 
-      - run: make build
+      - name: Build release binary
+        run: make build
 
       - name: Generate checksums
         run: |
