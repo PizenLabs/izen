@@ -1,0 +1,111 @@
+---
+name: Bug Report
+description: Report a bug or unexpected behavior
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill out the sections below to help us reproduce and fix the issue.
+
+  - type: input
+    id: version
+    attributes:
+      label: Izen Version
+      description: Run `izen --version` or `go run ./cmd/izen --version`
+      placeholder: "0.1.1"
+    validations:
+      required: true
+
+  - type: input
+    id: go-version
+    attributes:
+      label: Go Version
+      description: Run `go version`
+      placeholder: "go1.26.4 darwin/arm64"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating System
+      placeholder: "macOS 14.5 / Ubuntu 24.04 / Windows 11"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: Clear and concise description of what the bug is
+      placeholder: "When I run `/investigate` on a Go project with 5000+ files, the TUI freezes..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps to reproduce the issue
+      placeholder: |
+        1. Create a Go project with `go mod init test`
+        2. Add 5000+ files...
+        3. Run `izen` and switch to `/investigate` mode
+        4. Type "find memory leak"
+        5. Observe freeze
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should have happened?
+      placeholder: "The investigation should start and show progress indicators..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened?
+      placeholder: "TUI freezes, CPU spikes to 100%, no response to keyboard input..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Error Output
+      description: Relevant logs, error messages, or stack traces (check `.izen/history.md` and `.izen/investigations/`)
+      render: shell
+      placeholder: |
+        [ERROR] graph: index panic: runtime error: index out of range
+        goroutine 45 [running]...
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Active Mode
+      options:
+        - "/ask"
+        - "/plan"
+        - "/build"
+        - "/investigate"
+        - "/review"
+        - "Not in a mode (startup)"
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I've searched existing issues for duplicates
+          required: true
+        - label: I've tested with the latest main branch
+          required: true
+        - label: This is not a security issue (report those to security@pizenlabs.dev)
+          required: true

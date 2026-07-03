@@ -1,0 +1,83 @@
+---
+name: Feature Request
+description: Suggest a new feature or enhancement
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Please check our [Philosophy](docs/architecture/PHILOSOPHY.md) first — every feature must align with our principles.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What problem does this solve? Why is it needed?
+      placeholder: "When investigating large codebases, I often need to..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: How should this work? Describe the user experience.
+      placeholder: "Add a new `/search` command that..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What other approaches did you consider?
+      placeholder: "Could use ripgrep directly, but..."
+
+  - type: checkboxes
+    id: philosophy
+    attributes:
+      label: Philosophy Check (see docs/architecture/PHILOSOPHY.md)
+      description: Does this feature align with our principles?
+      options:
+        - label: Improves human understanding (not replaces it)
+          required: true
+        - label: Reduces noise / complexity
+          required: true
+        - label: Preserves human control
+          required: true
+        - label: Increases trust through visibility
+          required: true
+        - label: Fits local-first (no cloud dependency)
+          required: true
+        - label: Mutations are reversible
+          required: true
+        - label: Graph-first / structure before intelligence
+          required: true
+        - label: Behavior is deterministic (mode-driven, not prompt-driven)
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Graph Engine (Tree-sitter, symbols)
+        - Retrieval (Graph, Lynx, fallback)
+        - Context Engine (prompt assembly)
+        - Execution (sandbox, patches, checkpoints)
+        - Investigate Mode
+        - Review Mode
+        - TUI / UI
+        - Configuration
+        - MCP Integrations
+        - Lynx (Rust engine)
+        - Documentation
+        - Other
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Mockups, related issues, references, etc.
+      placeholder: "Related to #123..."
