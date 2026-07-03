@@ -188,6 +188,9 @@ func renderInlineContent(node ast.Node, source []byte) string {
 		switch c := c.(type) {
 		case *ast.Text:
 			result.Write(c.Text(source))
+			if c.HardLineBreak() || c.SoftLineBreak() {
+				result.WriteString("\n")
+			}
 		case *ast.Emphasis:
 			if c.Level == 2 {
 				result.WriteString(renderStrong(c, source))
@@ -631,32 +634,40 @@ func wrapMText(text string, width int) []string {
 		return []string{text}
 	}
 
-	words := strings.Fields(text)
-	if len(words) == 0 {
-		return []string{text}
-	}
+	inputLines := strings.Split(text, "\n")
+	var result []string
 
-	var lines []string
-	var currentLine strings.Builder
+	for _, line := range inputLines {
+		if line == "" {
+			result = append(result, "")
+			continue
+		}
 
-	for _, word := range words {
-		if currentLine.Len() == 0 {
-			currentLine.WriteString(word)
-		} else if currentLine.Len()+1+len(word) <= width {
-			currentLine.WriteString(" ")
-			currentLine.WriteString(word)
-		} else {
-			lines = append(lines, currentLine.String())
-			currentLine.Reset()
-			currentLine.WriteString(word)
+		words := strings.Fields(line)
+		if len(words) == 0 {
+			result = append(result, line)
+			continue
+		}
+
+		var currentLine strings.Builder
+		for _, word := range words {
+			if currentLine.Len() == 0 {
+				currentLine.WriteString(word)
+			} else if currentLine.Len()+1+len(word) <= width {
+				currentLine.WriteString(" ")
+				currentLine.WriteString(word)
+			} else {
+				result = append(result, currentLine.String())
+				currentLine.Reset()
+				currentLine.WriteString(word)
+			}
+		}
+		if currentLine.Len() > 0 {
+			result = append(result, currentLine.String())
 		}
 	}
 
-	if currentLine.Len() > 0 {
-		lines = append(lines, currentLine.String())
-	}
-
-	return lines
+	return result
 }
 
 // padMRight pads string s on the right with spaces to the given width

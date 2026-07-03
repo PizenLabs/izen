@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -14,14 +15,41 @@ import (
 	"github.com/PizenLabs/izen/internal/prompt"
 )
 
+// needsLLMFallback detects ambiguous or shallow queries that the local diagnostic
+// engine cannot meaningfully resolve, guaranteeing the pipeline escalates to the
+// outbound LLM for contextual reasoning.
+func needsLLMFallback(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	switch lower {
+	case "hi", "hello", "hey", "test", "help":
+		return true
+	}
+	if len(trimmed) < 5 {
+		return true
+	}
+	if strings.HasSuffix(lower, "?") && len(trimmed) < 20 {
+		return true
+	}
+	return false
+}
+
 func (m *model) runInvestigateCmd(content string) tea.Cmd {
-	m.agentRunning = true
-	m.agentDone = false
-	m.agentLabel = "investigating"
-	m.spinnerFrame = 0
+	return tea.Batch(
+		func() tea.Msg {
+			return agentStartMsg{label: "investigating"}
+		},
+		m.runInvestigateAsyncCmd(content),
+	)
+}
+
+func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
+	currentMode := m.resolver.Current()
 
 	return func() tea.Msg {
-		currentMode := m.resolver.Current()
 		if !currentMode.CanShell() {
 			return investigateResultMsg{err: fmt.Errorf("investigate mode: shell execution denied by %s capabilities", currentMode)}
 		}
@@ -29,152 +57,243 @@ func (m *model) runInvestigateCmd(content string) tea.Cmd {
 			return investigateResultMsg{err: fmt.Errorf("investigate mode: write capability detected — violating capability contract")}
 		}
 
-		eng := investigate.NewEngine(".", content, nil, nil)
-		result, err := eng.Run()
-		if err != nil {
-			return investigateResultMsg{err: err}
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		type outcome struct {
+			result *investigate.InvestigationResult
+			err    error
+		}
+		outCh := make(chan outcome, 1)
+
+		go func() {
+			eng := investigate.NewEngine(".", content, nil, nil)
+			result, err := eng.RunContext(ctx)
+			outCh <- outcome{result: result, err: err}
+		}()
+
+		var result *investigate.InvestigationResult
+		var engErr error
+
+		select {
+		case o := <-outCh:
+			result = o.result
+			engErr = o.err
+		case <-ctx.Done():
+			engErr = fmt.Errorf("investigation timed out after 60s: %v", ctx.Err())
 		}
 
 		var recs []record
 
-		var b strings.Builder
-		b.WriteString(fmt.Sprintf("Problem: %s\n", result.Problem))
-		b.WriteString(fmt.Sprintf("Duration: %s · Loops: %d\n", result.Duration, result.Loops))
-		if result.Resolved {
-			b.WriteString(fmt.Sprintf("Conclusion: %s\n", result.Conclusion))
-		} else {
-			b.WriteString("Status: Inconclusive\n")
-		}
-
-		if len(result.Hypotheses) > 0 {
-			b.WriteString("\nHypotheses:\n")
-			for _, h := range result.Hypotheses {
-				sym := "○"
-				switch h.Status {
-				case investigate.HypothesisConfirmed:
-					sym = "✓"
-				case investigate.HypothesisRejected:
-					sym = "✗"
-				}
-				b.WriteString(fmt.Sprintf("  %s %s [%s] (%.0f%%)\n", sym, h.Theory, h.Status, h.Confidence*100))
+		if engErr != nil {
+			recs = append(recs, record{role: roleError, text: "investigation error: " + engErr.Error()})
+		} else if result != nil {
+			var b strings.Builder
+			b.WriteString(fmt.Sprintf("Problem:    %s\n", result.Problem))
+			b.WriteString(fmt.Sprintf("Duration:   %s\n", result.Duration))
+			b.WriteString(fmt.Sprintf("Loops:      %d\n", result.Loops))
+			if result.Resolved {
+				b.WriteString(fmt.Sprintf("Conclusion: %s\n", result.Conclusion))
+			} else {
+				b.WriteString("Status: Inconclusive\n")
 			}
-		}
 
-		if len(result.Evidence) > 0 {
-			b.WriteString("\nEvidence:\n")
-			for _, ev := range result.Evidence {
-				c := ev.Content
-				if len(c) > 60 {
-					c = c[:60] + "…"
+			if len(result.Hypotheses) > 0 {
+				b.WriteString("\nHypotheses:\n")
+				for _, h := range result.Hypotheses {
+					sym := "○"
+					switch h.Status {
+					case investigate.HypothesisConfirmed:
+						sym = "✓"
+					case investigate.HypothesisRejected:
+						sym = "✗"
+					}
+					b.WriteString(fmt.Sprintf("  %s %s [%s] (%.0f%%)\n", sym, h.Theory, h.Status, h.Confidence*100))
 				}
-				b.WriteString(fmt.Sprintf("  [%s] %s\n", ev.Source, c))
 			}
+
+			if len(result.Evidence) > 0 {
+				b.WriteString("\nEvidence:\n")
+				for _, ev := range result.Evidence {
+					c := ev.Content
+					if len(c) > 60 {
+						c = c[:60] + "…"
+					}
+					b.WriteString(fmt.Sprintf("  [%s] %s\n", ev.Source, c))
+				}
+			}
+
+			if !result.Resolved && result.Error != "" {
+				b.WriteString(fmt.Sprintf("\nError: %s\n", result.Error))
+			}
+
+			recs = append(recs, record{role: roleAI, text: b.String()})
 		}
 
-		if !result.Resolved && result.Error != "" {
-			b.WriteString(fmt.Sprintf("\nError: %s\n", result.Error))
-		}
+		esc := buildInvestigationEscalation(content, result, engErr)
 
-		recs = append(recs, record{role: roleAI, text: b.String()})
-		return investigateResultMsg{records: recs, sessionKey: result.Problem}
+		return investigateResultMsg{
+			records:           recs,
+			sessionKey:        content,
+			err:               engErr,
+			escalationContent: esc,
+		}
 	}
 }
 
-func (m *model) runReviewCmd() tea.Cmd {
-	m.agentRunning = true
-	m.agentDone = false
-	m.agentLabel = "reviewing"
-	m.spinnerFrame = 0
+func buildInvestigationEscalation(content string, result *investigate.InvestigationResult, engErr error) string {
+	var escBuilder strings.Builder
+	escBuilder.WriteString("## LOCAL TELEMETRY DIAGNOSTICS\n\n")
+	escBuilder.WriteString(fmt.Sprintf("**Original User Query:** %s\n\n", content))
 
-	return func() tea.Msg {
-		currentMode := m.resolver.Current()
-		if currentMode.CanWrite() {
-			return reviewResultMsg{err: fmt.Errorf("review mode: write capability detected — review must be 100%% read-only")}
-		}
-		if currentMode.CanShell() {
-			return reviewResultMsg{err: fmt.Errorf("review mode: shell capability detected — review must lock out shell execution")}
-		}
-		if currentMode.CanPatch() {
-			return reviewResultMsg{err: fmt.Errorf("review mode: patch capability detected — review must lock out patch generation")}
-		}
+	if result != nil {
+		escBuilder.WriteString(fmt.Sprintf("**Problem:** %s\n", result.Problem))
+		escBuilder.WriteString(fmt.Sprintf("**Duration:** %s\n", result.Duration))
+		escBuilder.WriteString(fmt.Sprintf("**Loops:** %d\n", result.Loops))
+		escBuilder.WriteString(fmt.Sprintf("**Resolved by engine:** %v\n\n", result.Resolved))
 
-		eng := review.NewEngine(".", nil, nil)
-		result, err := eng.Run()
-		if err != nil {
-			return reviewResultMsg{err: err}
-		}
-
-		var recs []record
-		if result.Error != "" {
-			recs = append(recs, record{role: roleSystem, text: result.Error})
-			return reviewResultMsg{records: recs}
-		}
-
-		var b strings.Builder
-		b.WriteString(fmt.Sprintf("Review: %s → %s\n", result.BaseBranch, result.Branch))
-		b.WriteString(fmt.Sprintf("Commit: %s · Files Changed: %d · Duration: %s\n", result.CommitHash, len(result.FilesChanged), result.Duration))
-		b.WriteString(fmt.Sprintf("Score: %d/100 · Risk Score: %d/100\n", result.Score, result.ImpactRadius.RiskScore))
-
-		if len(result.FilesChanged) > 0 {
-			b.WriteString("\nFiles Changed:\n")
-			for _, f := range result.FilesChanged {
-				sym := "~"
-				switch f.Status {
-				case "added":
-					sym = "+"
-				case "deleted":
-					sym = "-"
-				case "renamed":
-					sym = "→"
+		if len(result.Hypotheses) > 0 {
+			escBuilder.WriteString("### Hypotheses Tested\n\n")
+			for _, h := range result.Hypotheses {
+				statusSym := "✗"
+				if h.Status == investigate.HypothesisConfirmed {
+					statusSym = "✓"
 				}
-				b.WriteString(fmt.Sprintf("  %s %s (+%d/-%d)\n", sym, f.Path, f.Additions, f.Deletions))
+				escBuilder.WriteString(fmt.Sprintf("- **%s** — %s (%.0f%% confidence) %s\n", h.Theory, h.Status, h.Confidence*100, statusSym))
 			}
+			escBuilder.WriteString("\n")
 		}
 
-		if len(result.ImpactRadius.IndirectFiles) > 0 {
-			b.WriteString(fmt.Sprintf("\nImpact Radius:\n  Direct: %d · Indirect: %d · Affected Packages: %d\n",
-				len(result.ImpactRadius.DirectFiles), len(result.ImpactRadius.IndirectFiles), len(result.ImpactRadius.AffectedPkgs)))
+		if len(result.Evidence) > 0 {
+			escBuilder.WriteString("### Evidence Collected\n\n")
+			for _, ev := range result.Evidence {
+				escBuilder.WriteString(fmt.Sprintf("- `[%s]` %s\n", ev.Source, ev.Content))
+			}
+			escBuilder.WriteString("\n")
 		}
 
-		if len(result.RiskFindings) > 0 {
-			b.WriteString("\nRisk Findings:\n")
-			sevOrder := []review.RiskSeverity{
-				review.RiskCritical, review.RiskHigh, review.RiskMedium, review.RiskLow, review.RiskInfo,
+		if result.Conclusion != "" {
+			escBuilder.WriteString(fmt.Sprintf("**Conclusion:** %s\n\n", result.Conclusion))
+		}
+
+		if result.Error != "" {
+			escBuilder.WriteString(fmt.Sprintf("**Engine Error:** %s\n\n", result.Error))
+		}
+	} else {
+		escBuilder.WriteString("**Engine returned nil result**\n\n")
+	}
+
+	if engErr != nil {
+		escBuilder.WriteString(fmt.Sprintf("**Execution Error:** %s\n\n", engErr))
+	}
+
+	escBuilder.WriteString("---\n")
+	escBuilder.WriteString("Analyze the diagnostic telemetry above in context of the original user query. ")
+	escBuilder.WriteString("Provide a definitive resolution streamed back to the terminal.\n")
+	return escBuilder.String()
+}
+
+func (m *model) runReviewCmd(target string) tea.Cmd {
+	return tea.Sequence(
+		func() tea.Msg {
+			return agentStartMsg{label: "reviewing"}
+		},
+		func() tea.Msg {
+			currentMode := m.resolver.Current()
+			if currentMode.CanWrite() {
+				return reviewResultMsg{err: fmt.Errorf("review mode: write capability detected — review must be 100%% read-only")}
 			}
-			for _, sev := range sevOrder {
-				var findings []review.RiskFinding
-				for _, f := range result.RiskFindings {
-					if f.Severity == sev {
-						findings = append(findings, f)
+			if currentMode.CanShell() {
+				return reviewResultMsg{err: fmt.Errorf("review mode: shell capability detected — review must lock out shell execution")}
+			}
+			if currentMode.CanPatch() {
+				return reviewResultMsg{err: fmt.Errorf("review mode: patch capability detected — review must lock out patch generation")}
+			}
+
+			eng := review.NewEngine(".", nil, nil)
+			var result *review.ReviewResult
+			var err error
+			if target != "" {
+				result, err = eng.RunTarget(target)
+			} else {
+				result, err = eng.Run()
+			}
+			if err != nil {
+				return reviewResultMsg{err: err}
+			}
+
+			var recs []record
+			if result.Error != "" {
+				recs = append(recs, record{role: roleSystem, text: result.Error})
+				return reviewResultMsg{records: recs}
+			}
+
+			var b strings.Builder
+			b.WriteString(fmt.Sprintf("Review: %s → %s\n", result.BaseBranch, result.Branch))
+			b.WriteString(fmt.Sprintf("Commit: %s · Files Changed: %d · Duration: %s\n", result.CommitHash, len(result.FilesChanged), result.Duration))
+			b.WriteString(fmt.Sprintf("Score: %d/100 · Risk Score: %d/100\n", result.Score, result.ImpactRadius.RiskScore))
+
+			if len(result.FilesChanged) > 0 {
+				b.WriteString("\nFiles Changed:\n")
+				for _, f := range result.FilesChanged {
+					sym := "~"
+					switch f.Status {
+					case "added":
+						sym = "+"
+					case "deleted":
+						sym = "-"
+					case "renamed":
+						sym = "→"
+					}
+					b.WriteString(fmt.Sprintf("  %s %s (+%d/-%d)\n", sym, f.Path, f.Additions, f.Deletions))
+				}
+			}
+
+			if len(result.ImpactRadius.IndirectFiles) > 0 {
+				b.WriteString(fmt.Sprintf("\nImpact Radius:\n  Direct: %d · Indirect: %d · Affected Packages: %d\n",
+					len(result.ImpactRadius.DirectFiles), len(result.ImpactRadius.IndirectFiles), len(result.ImpactRadius.AffectedPkgs)))
+			}
+
+			if len(result.RiskFindings) > 0 {
+				b.WriteString("\nRisk Findings:\n")
+				sevOrder := []review.RiskSeverity{
+					review.RiskCritical, review.RiskHigh, review.RiskMedium, review.RiskLow, review.RiskInfo,
+				}
+				for _, sev := range sevOrder {
+					var findings []review.RiskFinding
+					for _, f := range result.RiskFindings {
+						if f.Severity == sev {
+							findings = append(findings, f)
+						}
+					}
+					if len(findings) == 0 {
+						continue
+					}
+					b.WriteString(fmt.Sprintf("  [%s] %d findings:\n", strings.ToUpper(string(sev)), len(findings)))
+					for _, f := range findings {
+						b.WriteString(fmt.Sprintf("    • %s:%d — %s\n", f.File, f.Line, f.Description))
 					}
 				}
-				if len(findings) == 0 {
-					continue
-				}
-				b.WriteString(fmt.Sprintf("  [%s] %d findings:\n", strings.ToUpper(string(sev)), len(findings)))
-				for _, f := range findings {
-					b.WriteString(fmt.Sprintf("    • %s:%d — %s\n", f.File, f.Line, f.Description))
+			}
+
+			if len(result.Recommendations) > 0 {
+				b.WriteString("\nRecommendations:\n")
+				for i, rec := range result.Recommendations {
+					b.WriteString(fmt.Sprintf("  %d. %s\n", i+1, rec))
 				}
 			}
-		}
 
-		if len(result.Recommendations) > 0 {
-			b.WriteString("\nRecommendations:\n")
-			for i, rec := range result.Recommendations {
-				b.WriteString(fmt.Sprintf("  %d. %s\n", i+1, rec))
+			recs = append(recs, record{role: roleAI, text: b.String()})
+
+			sessionKey := result.Branch + "@" + result.CommitHash
+			savedResult := result
+			return reviewResultMsg{
+				records:      recs,
+				sessionKey:   sessionKey,
+				saveReportFn: func() { review.SaveReport(savedResult, ".") },
 			}
-		}
-
-		recs = append(recs, record{role: roleAI, text: b.String()})
-
-		sessionKey := result.Branch + "@" + result.CommitHash
-		savedResult := result
-		return reviewResultMsg{
-			records:      recs,
-			sessionKey:   sessionKey,
-			saveReportFn: func() { review.SaveReport(savedResult, ".") },
-		}
-	}
+		},
+	)
 }
 
 func (m *model) runUndoCmd() tea.Cmd {
@@ -195,67 +314,67 @@ func (m *model) runUndoCmd() tea.Cmd {
 }
 
 func (m *model) runCommitCmdAgent() tea.Cmd {
-	m.agentRunning = true
-	m.agentDone = false
-	m.agentLabel = "generating commit message"
-	m.spinnerFrame = 0
-
-	return func() tea.Msg {
-		diff, err := m.gitEng.LastCommitDiff()
-		if err != nil {
-			return commitGeneratedMsg{err: fmt.Errorf("failed to get diff: %w", err)}
-		}
-		if strings.TrimSpace(diff) == "" {
-			return commitGeneratedMsg{err: fmt.Errorf("no changes in last commit — nothing to amend")}
-		}
-
-		payload := fmt.Sprintf("Generate a conventional commit message for these staged changes:\n\n%s", diff)
-		sys := prompt.CommitSystemPrompt()
-		msgs := []ai.Message{
-			{Role: "system", Content: sys},
-			{Role: "user", Content: payload},
-		}
-		req := ai.Request{
-			Model:    m.cfg.ActiveModelName(),
-			Messages: msgs,
-			Stream:   false,
-		}
-		resp, err := m.provider.Execute(context.Background(), req)
-		if err != nil {
-			return commitGeneratedMsg{err: fmt.Errorf("LLM call failed: %w", err)}
-		}
-
-		raw := resp.Content
-		lines := commit.CleanRawLLMOutput(raw)
-		var subject, body string
-		for i, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
+	return tea.Sequence(
+		func() tea.Msg {
+			return agentStartMsg{label: "generating commit message"}
+		},
+		func() tea.Msg {
+			diff, err := m.gitEng.LastCommitDiff()
+			if err != nil {
+				return commitGeneratedMsg{err: fmt.Errorf("failed to get diff: %w", err)}
 			}
-			if i == 0 {
-				subject = commit.SanitizeSubject(line)
-			} else {
-				body += line + "\n"
+			if strings.TrimSpace(diff) == "" {
+				return commitGeneratedMsg{err: fmt.Errorf("no changes in last commit — nothing to amend")}
 			}
-		}
-		if subject == "" {
-			subject = "chore(repo): update repository state"
-		}
-		bodyLines := strings.Split(strings.TrimSpace(body), "\n")
-		body = commit.SanitizeBody(bodyLines)
-		msg := commit.CommitMessage{Subject: subject, Body: body}
-		finalMessage := fmt.Sprintf("%s\n\n%s\n", msg.Subject, msg.Body)
 
-		if err := m.gitEng.AmendCommit(finalMessage); err != nil {
-			return commitGeneratedMsg{err: fmt.Errorf("amend failed: %w", err)}
-		}
-		hash, _ := m.gitEng.CurrentHash()
-		checkpoints := m.sess.Checkpoints
-		if len(checkpoints) > 0 {
-			m.sess.Checkpoints = checkpoints[:len(checkpoints)-1]
-			m.sess.Save()
-		}
-		return commitGeneratedMsg{subject: msg.Subject, body: msg.Body, hash: hash}
-	}
+			payload := fmt.Sprintf("Generate a conventional commit message for these staged changes:\n\n%s", diff)
+			sys := prompt.CommitSystemPrompt()
+			msgs := []ai.Message{
+				{Role: "system", Content: sys},
+				{Role: "user", Content: payload},
+			}
+			req := ai.Request{
+				Model:    m.cfg.ActiveModelName(),
+				Messages: msgs,
+				Stream:   false,
+			}
+			resp, err := m.provider.Execute(context.Background(), req)
+			if err != nil {
+				return commitGeneratedMsg{err: fmt.Errorf("LLM call failed: %w", err)}
+			}
+
+			raw := resp.Content
+			lines := commit.CleanRawLLMOutput(raw)
+			var subject, body string
+			for i, line := range lines {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				if i == 0 {
+					subject = commit.SanitizeSubject(line)
+				} else {
+					body += line + "\n"
+				}
+			}
+			if subject == "" {
+				subject = "chore(repo): update repository state"
+			}
+			bodyLines := strings.Split(strings.TrimSpace(body), "\n")
+			body = commit.SanitizeBody(bodyLines)
+			msg := commit.CommitMessage{Subject: subject, Body: body}
+			finalMessage := fmt.Sprintf("%s\n\n%s\n", msg.Subject, msg.Body)
+
+			if err := m.gitEng.AmendCommit(finalMessage); err != nil {
+				return commitGeneratedMsg{err: fmt.Errorf("amend failed: %w", err)}
+			}
+			hash, _ := m.gitEng.CurrentHash()
+			checkpoints := m.sess.Checkpoints
+			if len(checkpoints) > 0 {
+				m.sess.Checkpoints = checkpoints[:len(checkpoints)-1]
+				m.sess.Save()
+			}
+			return commitGeneratedMsg{subject: msg.Subject, body: msg.Body, hash: hash}
+		},
+	)
 }

@@ -20,7 +20,7 @@ import (
 )
 
 var validSystemCommands = map[string]struct{}{
-	"/help":       {},
+	"/help":       {}, // true,
 	"/?":          {},
 	"/quit":       {},
 	"/mode":       {},
@@ -36,6 +36,12 @@ var validSystemCommands = map[string]struct{}{
 func (m *model) handleInput(line string) tea.Cmd {
 	line = strings.TrimSpace(line)
 	if line == "" {
+		return nil
+	}
+
+	// Rigid active guards to block spamming inputs during background processes
+	if m.streaming || m.agentRunning {
+		m.push(roleSystem, "[System] Input blocked: task execution active.")
 		return nil
 	}
 
@@ -189,16 +195,19 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		m.investigateInvocationCount++
 		return m.runInvestigateCmd(content)
 	case modes.ModeReview:
-		return m.runReviewCmd()
+		target := ""
+		trimmed := strings.TrimSpace(content)
+		if strings.HasPrefix(strings.ToLower(trimmed), "check ") {
+			target = strings.TrimSpace(trimmed[6:])
+		}
+		return m.runReviewCmd(target)
 	case modes.ModePlan:
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
 
-		// 1. Assemble context deterministically using graph AST + git working tree.
 		cb := ctxpkg.NewBuilder(".", m.graph, m.gitEng, m.sess)
 		assembly := cb.BuildPlanAssembly(content, m.attachedFiles)
 
-		// 2. Check token budget against the active model's ceiling.
 		modelName := m.cfg.ActiveModelName()
 		if budgetErr := plan.CheckTokenBudget(modelName, assembly.EstimateTokens); budgetErr != nil {
 			m.push(roleError, budgetErr.Error())
@@ -206,7 +215,6 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			return nil
 		}
 
-		// 3. Optionally enrich context from Lynx (semantic fallback, third tier).
 		if m.graph != nil && assembly.EstimateTokens < plan.TokenBudgetForModel(modelName)-1000 {
 			query := content
 			if m.sess.Objective != "" {
@@ -278,6 +286,8 @@ func parseModeShorthand(line string) (modes.Mode, string, bool) {
 }
 
 func (m *model) setMode(mode modes.Mode) {
+	m.investigateInvocationCount = 0 // Unconditional state clearance to avoid hard lockout bugs during testing
+
 	if mode == m.resolver.Current() {
 		return
 	}
@@ -347,7 +357,6 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case cmd == "/clear":
-		// Reset conversation + restore banner
 		m.records = nil
 		m.showBanner = true
 		m.rebuildViewport()
@@ -405,7 +414,6 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	return nil
 }
 
-// startModeTransition kicks off the 150ms color-fade animation.
 func (m *model) startModeTransition(target modes.Mode) {
 	m.lineAnimTargetMode = target
 	m.lineAnimProgress = 0.0

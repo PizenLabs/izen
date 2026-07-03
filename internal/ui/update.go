@@ -24,7 +24,7 @@ import (
 
 // Init initializes background loop clock ticks for state rendering animations.
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(tickCmd(), animTickCmd())
+	return tea.Batch(m.spinnerTickCmd(), animTickCmd())
 }
 
 // ── Mouse Leak Interception & Buffering ──────────────────────────────────────
@@ -405,7 +405,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rebuildViewport()
 			}
 		}
-		return m, tickCmd()
+		return m, m.spinnerTickCmd()
 
 	case animTickMsg:
 		if m.lineAnimating {
@@ -416,6 +416,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, animTickCmd()
+
+	case agentStartMsg:
+		m.agentRunning = true
+		m.agentDone = false
+		m.agentLabel = msg.label
+		m.spinnerFrame = 0
+		if m.vpReady {
+			m.rebuildViewport()
+		}
+		return m, m.spinnerTickCmd()
 
 	case agentDoneMsg:
 		m.agentRunning = false
@@ -429,13 +439,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+msg.err.Error())
-			return m, nil
 		}
-		m.pushRecords(msg.records)
+		for _, rec := range msg.records {
+			m.records = append(m.records, rec)
+		}
 		if msg.sessionKey != "" {
 			m.sess.SetInvestigationID(msg.sessionKey)
 		}
-		return m, nil
+		// Force-reset streaming middleware flags to guarantee streamCmd can run
+		m.streamCh = nil
+		m.streaming = false
+		m.push(roleSystem, "[System] Engine diagnostics collected. Escalating to LLM for analysis...")
+		return m, m.streamCmd(msg.escalationContent)
 
 	case reviewResultMsg:
 		m.agentRunning = false
@@ -706,8 +721,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(vpCmd, tiCmd)
 }
 
-func tickCmd() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+func (m *model) spinnerTickCmd() tea.Cmd {
+	frame := m.spinnerFrame % len(spinnerFrames)
+	frameStr := spinnerFrames[frame]
+
+	var delay time.Duration
+	switch frameStr {
+	case " ⊹ ":
+		delay = 40 * time.Millisecond
+	case " ⁕ ":
+		delay = 70 * time.Millisecond
+	case " ❃ ", " ❄ ", " ❆ ":
+		delay = 250 * time.Millisecond
+	default:
+		delay = 100 * time.Millisecond
+	}
+
+	return tea.Tick(delay, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func animTickCmd() tea.Cmd {

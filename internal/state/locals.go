@@ -62,7 +62,7 @@ func InitLocalState(root string) error {
 		}
 	}
 	WriteRuntimeMeta(root, RuntimeMeta{
-		LxVersion:     "0.1.0",
+		LxVersion:     "0.1.1",
 		GraphVersion:  "v1",
 		SchemaVersion: "1",
 	})

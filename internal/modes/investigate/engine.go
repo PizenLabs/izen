@@ -1,6 +1,7 @@
 package investigate
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -69,11 +70,27 @@ func NewEngine(root, problem string, retriever Retriever, executor TestExecutor)
 }
 
 func (e *Engine) Run() (*InvestigationResult, error) {
+	return e.RunContext(context.Background())
+}
+
+func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 	result := &InvestigationResult{
 		Problem: e.Problem,
 	}
 
 	for !e.State.ShouldStop() {
+		select {
+		case <-ctx.Done():
+			result.Error = fmt.Sprintf("investigation cancelled: %v", ctx.Err())
+			result.Hypotheses = e.Hypotheses.All()
+			result.Evidence = e.Evidence.All()
+			result.Loops = e.State.IterationCount()
+			result.Duration = time.Since(e.startedAt).Round(time.Millisecond).String()
+			e.Result = result
+			return result, ctx.Err()
+		default:
+		}
+
 		if err := e.executeCurrentState(); err != nil {
 			result.Error = err.Error()
 			break
@@ -90,24 +107,7 @@ func (e *Engine) Run() (*InvestigationResult, error) {
 		result.Resolved = true
 		result.Conclusion = best.Theory
 	} else if result.Loops >= e.State.config.MaxLoops {
-		active := e.Hypotheses.Active()
-		if len(active) > 0 {
-			last := active[len(active)-1]
-			e.Hypotheses.UpdateStatus(last.ID, HypothesisConfirmed)
-			result.Resolved = true
-			result.Conclusion = last.Theory
-		} else {
-			all := e.Hypotheses.All()
-			if len(all) > 0 {
-				last := all[len(all)-1]
-				e.Hypotheses.UpdateStatus(last.ID, HypothesisConfirmed)
-				e.Hypotheses.UpdateConfidence(last.ID, 0.6)
-				result.Resolved = true
-				result.Conclusion = last.Theory
-			} else {
-				result.Conclusion = "investigation exhausted — no hypothesis confirmed"
-			}
-		}
+		result.Conclusion = "investigation exhausted — no hypothesis could be confirmed"
 	}
 
 	e.Result = result

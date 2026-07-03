@@ -24,6 +24,7 @@ type Process struct {
 	started    time.Time
 	stderrBuf  strings.Builder
 	stderrDone chan struct{}
+	doneCh     chan struct{}
 }
 
 func NewProcess(root string) *Process {
@@ -52,7 +53,8 @@ func (p *Process) Start() error {
 		return fmt.Errorf("mkdir .lynx: %w", err)
 	}
 
-	p.cmd = exec.Command(binPath, "mcp", storageDir)
+	p.doneCh = make(chan struct{})
+	p.cmd = exec.Command(binPath, "--storage-path", storageDir, "mcp")
 	p.cmd.Dir = p.root
 
 	stdin, err := p.cmd.StdinPipe()
@@ -81,12 +83,18 @@ func (p *Process) Start() error {
 	p.started = time.Now()
 
 	go p.captureStderr()
+	go p.waitForExit()
 
 	return nil
 }
 
 func (p *Process) StderrLog() string {
 	return p.stderrBuf.String()
+}
+
+func (p *Process) waitForExit() {
+	p.cmd.Wait()
+	close(p.doneCh)
 }
 
 func (p *Process) captureStderr() {
@@ -119,16 +127,13 @@ func (p *Process) Stop() error {
 		p.stdin.Close()
 	}
 
-	done := make(chan error, 1)
-	go func() {
-		done <- p.cmd.Wait()
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		p.cmd.Process.Kill()
-		<-done
+	if p.doneCh != nil {
+		select {
+		case <-p.doneCh:
+		case <-time.After(5 * time.Second):
+			p.cmd.Process.Kill()
+			<-p.doneCh
+		}
 	}
 
 	<-p.stderrDone
@@ -139,7 +144,16 @@ func (p *Process) Stop() error {
 func (p *Process) IsRunning() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.running
+	if !p.running || p.doneCh == nil {
+		return false
+	}
+	select {
+	case <-p.doneCh:
+		p.running = false
+		return false
+	default:
+		return true
+	}
 }
 
 func (p *Process) Stdin() io.WriteCloser {
