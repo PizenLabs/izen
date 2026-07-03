@@ -1,5 +1,5 @@
 BINARY_NAME=izen
-VERSION=0.1.0
+VERSION=0.1.1
 BUILD_DIR=bin
 LYNX_DIR=lynx
 LYNX_EMBED_DIR=internal/lynx/bin
