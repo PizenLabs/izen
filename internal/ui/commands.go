@@ -194,33 +194,45 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
 
-		var b strings.Builder
-		if m.graph != nil {
-			compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.Objective)
-			go retrieval.BuildGlobalCompressor(m.graph, m.sess.Objective)
+		// 1. Assemble context deterministically using graph AST + git working tree.
+		cb := ctxpkg.NewBuilder(".", m.graph, m.gitEng, m.sess)
+		assembly := cb.BuildPlanAssembly(content, m.attachedFiles)
 
+		// 2. Check token budget against the active model's ceiling.
+		modelName := m.cfg.ActiveModelName()
+		if budgetErr := plan.CheckTokenBudget(modelName, assembly.EstimateTokens); budgetErr != nil {
+			m.push(roleError, budgetErr.Error())
+			m.push(roleSystem, infoStyle.Render(budgetErr.BudgetActionHint()))
+			return nil
+		}
+
+		// 3. Optionally enrich context from Lynx (semantic fallback, third tier).
+		if m.graph != nil && assembly.EstimateTokens < plan.TokenBudgetForModel(modelName)-1000 {
 			query := content
 			if m.sess.Objective != "" {
 				query = m.sess.Objective + " " + query
 			}
 			lc := retrieval.GetLynxController()
 			if lc != nil {
+				compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.Objective)
+				go retrieval.BuildGlobalCompressor(m.graph, m.sess.Objective)
 				results, err := lc.SearchRaw(query)
 				if err == nil && len(results) > 0 {
 					compressed := compressor.CompressResults(results)
 					skeleton := retrieval.FormatResultsAsSkeleton(compressed)
 					if skeleton != "" {
-						b.WriteString(retrieval.FormatPlanFrame(skeleton))
-						b.WriteString("\n\n")
+						augmented := assembly.RawContext + "\n\n" + retrieval.FormatPlanFrame(skeleton)
+						augmentedTokens := plan.EstimateTokens(augmented)
+						if plan.CheckTokenBudget(modelName, augmentedTokens) == nil {
+							assembly.RawContext = augmented
+							assembly.EstimateTokens = augmentedTokens
+						}
 					}
 				}
 			}
 		}
 
-		b.WriteString("### USER OBJECTIVE\n")
-		b.WriteString(content)
-
-		return m.streamCmd(b.String())
+		return m.streamCmd(assembly.RawContext)
 	default:
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)

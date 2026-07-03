@@ -548,7 +548,25 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleStatus, fmt.Sprintf("done - +%s tokens (this turn)  •  %s", deltaStr, costStr))
 
 		if m.resolver.Current() == modes.ModePlan {
-			tasks := plan.ParseMarkdownToTasks(final)
+			// Validate output against the rigid block schema.
+			validation := plan.ValidatePlanOutput(final)
+			if !validation.Valid {
+				errMsg := plan.FormatValidationError(validation)
+				m.push(roleError, errMsg)
+				m.push(roleSystem, infoStyle.Render("regenerate with more precise intent"))
+			}
+
+			// Collapse to valid blocks only; fall back to raw parse if empty.
+			var blockContent string
+			if len(validation.Blocks) > 0 {
+				blockContent = plan.CollapsePlanSections(final)
+			}
+
+			tasks := plan.ParseMarkdownToTasks(blockContent)
+			if len(tasks) == 0 {
+				tasks = plan.ParseMarkdownToTasks(final)
+			}
+
 			if len(tasks) > 0 {
 				m.sess.StageTaskList(&tasks)
 				width := m.width - 2

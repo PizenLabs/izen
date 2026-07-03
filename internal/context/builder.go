@@ -7,6 +7,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -223,6 +224,33 @@ func statusLabel(staging, worktree string) string {
 	default:
 		return "changed"
 	}
+}
+
+// BuildPlanAssembly delegates to the deterministic Plan mode context assembler.
+// It returns a pre-filtered context with only the symbols matching the intent
+// keywords, plus the directory boundary map and dirty file status.
+func (b *Builder) BuildPlanAssembly(objective string, attachedFiles []string) *plan.AssemblyResult {
+	p := plan.NewPlanner(b.root, b.graph, b.git)
+	result := p.AssemblePlanContext(plan.AssemblyRequest{
+		Objective:     objective,
+		Keywords:      append(buildKeywords(objective), attachedFiles...),
+		AttachedFiles: attachedFiles,
+	})
+	result.AttachObjective(objective)
+	return result
+}
+
+// buildKeywords extracts intent-bearing tokens from a query string.
+func buildKeywords(query string) []string {
+	var kws []string
+	for _, tok := range strings.Fields(query) {
+		tok = strings.Trim(tok, ".,:;!?()[]{}\"'`")
+		if len(tok) < 3 {
+			continue
+		}
+		kws = append(kws, tok)
+	}
+	return kws
 }
 
 func (b *Builder) ImportGraph() string {
