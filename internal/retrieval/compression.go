@@ -226,6 +226,13 @@ func FormatCompressedFrame(content string) string {
 	return b.String()
 }
 
+const PlanInstructions = `You are the Execution Planning Engine for Izen. Your job is to output absolute, concrete step-by-step tasks based ONLY on the provided repository structural skeleton.
+
+CRITICAL INSTRUCTIONS:
+1. **Zero Speculation:** Identify the primary programming language from the provided skeleton. If the project contains .go files or Go packages, the entire plan MUST use Go tooling (go get, go build). Absolutely FORBIDDEN to mention Node.js, npm, Python, or any external stack not visible in the skeleton.
+2. **Absolute File Grounding:** Every FILE_MUTATE task description must reference exact file targets or structural layouts present in the Repository Skeleton. Do not invent boilerplate directory trees (like src/auth.js for a Go repo).
+3. **Action-Oriented Output:** Tasks must be immediately actionable via the /build engine. Keep descriptions concise, factual, and bound to the active workspace.`
+
 const PlanSkeletonFrame = "### REPOSITORY STRUCTURAL SKELETON (LYNX + AHO-CORASICK COMPRESSED)"
 
 func FormatPlanFrame(content string) string {
@@ -233,6 +240,8 @@ func FormatPlanFrame(content string) string {
 		return ""
 	}
 	var b strings.Builder
+	b.WriteString(PlanInstructions)
+	b.WriteString("\n\n")
 	b.WriteString(PlanSkeletonFrame)
 	b.WriteString("\n")
 	b.WriteString(content)

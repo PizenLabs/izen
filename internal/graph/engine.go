@@ -55,7 +55,11 @@ func (e *Engine) LoadCache() (*Graph, error) {
 	path := filepath.Join(e.root, cacheFile)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		legacy := filepath.Join(e.root, legacyCacheFile)
+		data, err = os.ReadFile(legacy)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var c Cache
@@ -84,12 +88,12 @@ func (e *Engine) SaveCache(graph *Graph) error {
 		return err
 	}
 
-	dir := filepath.Join(e.root, ".izen")
+	dir := filepath.Join(e.root, ".izen", "graph")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 
-	path := filepath.Join(dir, "graph.cache.v1")
+	path := filepath.Join(e.root, cacheFile)
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode cache: %w", err)

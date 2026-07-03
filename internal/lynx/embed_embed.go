@@ -14,31 +14,57 @@ import (
 //go:embed bin/lx
 var lxBinary embed.FS
 
-const binaryDir = ".izen/bin"
 const binaryName = "lx"
 
 var lxBinPath string
+
+func globalBinaryDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".izen", "runtime")
+}
+
+func localBinaryDir(root string) string {
+	return filepath.Join(root, ".izen", "bin")
+}
+
+func BinaryBytes() ([]byte, error) {
+	return lxBinary.ReadFile("bin/lx")
+}
 
 func BinaryPath() string {
 	return lxBinPath
 }
 
-func UnpackBinary(root string) (string, error) {
-	targetDir := filepath.Join(root, binaryDir)
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		return "", fmt.Errorf("mkdir bin: %w", err)
-	}
-
+func targetPath(dir string) string {
 	suffix := ""
 	if runtime.GOOS == "windows" {
 		suffix = ".exe"
 	}
-	target := filepath.Join(targetDir, binaryName+suffix)
+	return filepath.Join(dir, binaryName+suffix)
+}
+
+func UnpackBinary(root string) (string, error) {
+	globalDir := globalBinaryDir()
+	if err := os.MkdirAll(globalDir, 0755); err != nil {
+		return "", fmt.Errorf("mkdir global runtime: %w", err)
+	}
+
+	target := targetPath(globalDir)
 
 	existed := false
 	if _, err := os.Stat(target); err == nil {
 		existed = true
+		lxBinPath = target
 		return target, nil
+	}
+
+	legacyTarget := targetPath(localBinaryDir(root))
+	if _, err := os.Stat(legacyTarget); err == nil {
+		lxBinPath = legacyTarget
+		return legacyTarget, nil
 	}
 
 	src, err := lxBinary.Open("bin/lx")

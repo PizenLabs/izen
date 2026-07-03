@@ -14,7 +14,8 @@ type Cache struct {
 }
 
 const cacheVersion = "v1"
-const cacheFile = ".izen/graph.cache.v1"
+const legacyCacheFile = ".izen/graph.cache.v1"
+const cacheFile = ".izen/graph/ast.db"
 
 func EncodeCache(graph *Graph) (*Cache, error) {
 	return &Cache{

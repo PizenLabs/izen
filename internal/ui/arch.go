@@ -33,6 +33,11 @@ type archRoute struct {
 	Line   int
 }
 
+type treeItem struct {
+	label    string
+	children []treeItem
+}
+
 func buildArchTree(g *graph.Graph) []archPackage {
 	seen := make(map[string]bool)
 	packages := make(map[string]*archPackage)
@@ -161,6 +166,27 @@ func isRouteLike(sym graph.Symbol) bool {
 	return false
 }
 
+func writeTreeItems(sb *strings.Builder, items []treeItem, prefix string) {
+	for i, item := range items {
+		isLast := i == len(items)-1
+		connector := "├── "
+		if isLast {
+			connector = "└── "
+		}
+		sb.WriteString(prefix + connector + item.label + "\n")
+
+		if len(item.children) > 0 {
+			childPrefix := prefix
+			if isLast {
+				childPrefix += "    "
+			} else {
+				childPrefix += "│   "
+			}
+			writeTreeItems(sb, item.children, childPrefix)
+		}
+	}
+}
+
 func (m *model) renderArch() string {
 	if m.graph == nil {
 		return "no graph data available — run a build command first"
@@ -193,25 +219,32 @@ func (m *model) renderArch() string {
 		totalStructs += len(pkg.Structs)
 		totalRoutes += len(pkg.Routes)
 
+		var items []treeItem
+
 		for _, s := range pkg.Structs {
-			mark := " "
+			label := s.Name + " [" + s.Kind + "]"
 			if s.Exported {
-				mark = "!"
+				label = "[exp] " + label
 			}
-			b.WriteString(fmt.Sprintf("    %s %s [%s]\n", mark, s.Name, s.Kind))
+
+			var methods []treeItem
 			for _, m := range s.Methods {
-				mMark := " "
+				mLabel := m.Name + "()"
 				if m.Exported {
-					mMark = "!"
+					mLabel = "[exp] " + mLabel
 				}
-				b.WriteString(fmt.Sprintf("      %s %s()\n", mMark, m.Name))
+				methods = append(methods, treeItem{label: mLabel})
 			}
+
+			items = append(items, treeItem{label: label, children: methods})
 		}
 
 		for _, r := range pkg.Routes {
-			b.WriteString(fmt.Sprintf("    > %s  (%s:%d)\n", r.Symbol, r.File, r.Line))
+			label := fmt.Sprintf("%s  (%s:%d)", r.Symbol, r.File, r.Line)
+			items = append(items, treeItem{label: label})
 		}
 
+		writeTreeItems(&b, items, "  ")
 		b.WriteString("\n")
 	}
 

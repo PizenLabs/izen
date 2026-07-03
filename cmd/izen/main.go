@@ -4,12 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
-	"github.com/PizenLabs/izen/internal/lynx"
-	"github.com/PizenLabs/izen/internal/providers"
-	"github.com/PizenLabs/izen/internal/retrieval"
-	"github.com/PizenLabs/izen/internal/session"
+	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/ui"
 )
 
@@ -22,6 +18,10 @@ func printMinimalistHelp() {
 	fmt.Println("  izen                    Start the interactive TUI")
 	fmt.Println("  izen version            Show version information")
 	fmt.Println("  izen help               Show this help message")
+	fmt.Println("  izen auth login         Authenticate with a provider")
+	fmt.Println("  izen stats              Show usage statistics")
+	fmt.Println("  izen rollback           Review recent file mutations")
+	fmt.Println("  izen [path]             Start TUI at the given project path")
 	fmt.Println()
 	fmt.Println("Interactive Commands (inside TUI):")
 	fmt.Println("  /ask          Explain, inspect, understand (read-only)")
@@ -37,17 +37,46 @@ func printMinimalistHelp() {
 }
 
 func main() {
+	// ---- Phase 1: Global subcommand dispatch (no local state checks) ----
 	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "version":
+		arg := os.Args[1]
+		switch arg {
+		case "version", "-v", "--version":
 			fmt.Printf("izen version v%s (PizenLabs)\n", Version)
 			os.Exit(0)
 		case "help", "--help", "-h":
 			printMinimalistHelp()
 			os.Exit(0)
+		case "auth":
+			if len(os.Args) > 2 && os.Args[2] == "login" {
+				fmt.Println("Auth login is not yet implemented.")
+				os.Exit(0)
+			}
+			fmt.Println("Usage: izen auth login")
+			os.Exit(1)
+		case "stats":
+			fmt.Println("Stats are not yet implemented.")
+			os.Exit(0)
 		}
 	}
 
+	// ---- Phase 2: Local scope parsing ----
+	isRollbackMode := false
+	targetDir := "."
+	if len(os.Args) > 1 {
+		arg := os.Args[1]
+		switch arg {
+		case "rollback":
+			isRollbackMode = true
+			targetDir = "."
+		default:
+			if arg[0] != '-' {
+				targetDir = arg
+			}
+		}
+	}
+
+	// ---- Bootstrap common infrastructure ----
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
@@ -59,39 +88,34 @@ func main() {
 		os.Exit(1)
 	}
 
-	sess, err := session.Load()
-	if err != nil {
-		sess = session.New()
-	}
-
-	mgr := ai.NewManager()
-	defaultProvider := cfg.ActiveProviderName()
-	provCfg, ok := cfg.AI.Providers[defaultProvider]
-	if ok {
-		p := providers.NewOllamaProvider(provCfg.BaseURL, provCfg.APIKey, provCfg.DefaultModel)
-		mgr.Register(defaultProvider, p)
-		mgr.SetDefault(defaultProvider)
-	}
-
-	if cfg.Lynx.Enabled {
-		root := "."
-		lc := lynx.NewController(root, cfg.Lynx.LazyStart)
-		retrieval.SetLynxController(lc)
-
-		if err := lc.EnsureStarted(); err != nil {
-			fmt.Fprintf(os.Stderr, "izen: lynx warning: %v\n", err)
-		}
-
-		if cfg.Lynx.LazyStart {
-			lc.StartLazy()
-		}
-
-		defer lc.Stop()
-	}
-
-	p := ui.NewProgram(cfg, sess, mgr)
-	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error running Izen: %v\n", err)
+	if err := state.EnsureRuntimeBinaries(); err != nil {
+		fmt.Fprintf(os.Stderr, "izen: runtime binary error: %v\n", err)
 		os.Exit(1)
+	}
+
+	// ---- Local context boundary enforcement ----
+	root := targetDir
+	if !state.HasLocalState(root) {
+		if !ui.ConfirmInit("Initialize Izen architecture for this repository?") {
+			fmt.Println("Aborted. Run 'izen' again when ready.")
+			os.Exit(0)
+		}
+	}
+
+	if err := state.InitLocalState(root); err != nil {
+		fmt.Fprintf(os.Stderr, "izen: warning: local state init: %v\n", err)
+	}
+
+	if err := state.MigrateLegacyFiles(root); err != nil {
+		fmt.Fprintf(os.Stderr, "izen: migration warning: %v\n", err)
+	}
+
+	_ = state.CheckVersion(root, Version)
+
+	// ---- Phase 3: TUI boot routing ----
+	if isRollbackMode {
+		ui.RunRollbackEngine(cfg, root)
+	} else {
+		ui.RunMainDashboard(cfg, root)
 	}
 }

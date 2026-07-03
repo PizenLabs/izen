@@ -16,7 +16,6 @@ import (
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
-	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
@@ -195,30 +194,45 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
 
-		var planPrefix string
-		if m.graph != nil {
-			compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.Objective)
-			go retrieval.BuildGlobalCompressor(m.graph, m.sess.Objective)
+		// 1. Assemble context deterministically using graph AST + git working tree.
+		cb := ctxpkg.NewBuilder(".", m.graph, m.gitEng, m.sess)
+		assembly := cb.BuildPlanAssembly(content, m.attachedFiles)
 
+		// 2. Check token budget against the active model's ceiling.
+		modelName := m.cfg.ActiveModelName()
+		if budgetErr := plan.CheckTokenBudget(modelName, assembly.EstimateTokens); budgetErr != nil {
+			m.push(roleError, budgetErr.Error())
+			m.push(roleSystem, infoStyle.Render(budgetErr.BudgetActionHint()))
+			return nil
+		}
+
+		// 3. Optionally enrich context from Lynx (semantic fallback, third tier).
+		if m.graph != nil && assembly.EstimateTokens < plan.TokenBudgetForModel(modelName)-1000 {
 			query := content
 			if m.sess.Objective != "" {
 				query = m.sess.Objective + " " + query
 			}
 			lc := retrieval.GetLynxController()
 			if lc != nil {
+				compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.Objective)
+				go retrieval.BuildGlobalCompressor(m.graph, m.sess.Objective)
 				results, err := lc.SearchRaw(query)
 				if err == nil && len(results) > 0 {
 					compressed := compressor.CompressResults(results)
 					skeleton := retrieval.FormatResultsAsSkeleton(compressed)
 					if skeleton != "" {
-						planPrefix = retrieval.FormatPlanFrame(skeleton) + "\n\n"
+						augmented := assembly.RawContext + "\n\n" + retrieval.FormatPlanFrame(skeleton)
+						augmentedTokens := plan.EstimateTokens(augmented)
+						if plan.CheckTokenBudget(modelName, augmentedTokens) == nil {
+							assembly.RawContext = augmented
+							assembly.EstimateTokens = augmentedTokens
+						}
 					}
 				}
 			}
 		}
 
-		userContent := planPrefix + prompt.BuildPlanPrompt(m.sess.Objective, content)
-		return m.streamCmd(userContent)
+		return m.streamCmd(assembly.RawContext)
 	default:
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)

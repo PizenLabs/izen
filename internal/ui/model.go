@@ -110,7 +110,7 @@ var utilityCommands = map[modes.Mode][]string{
 	modes.ModeReview:      {"/clear"},
 }
 
-var globalCommands = []string{"/help", "/?", "/mode", "/objective", "/drop", "/quit"}
+var globalCommands = []string{"/help", "/?", "/mode", "/objective", "/drop", "/quit", "/arch"}
 
 // ── Elegant spinner frames ────────────────────────────────────────────────────
 var spinnerFrames = []string{" ⊹ ", " ⁕ ", " ⚙ ", " ❃ ", " ❄ ", " ❆ ", " ❃ ", " ⚙ ", " ⁕ ", " ⊹ "}

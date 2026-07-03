@@ -10,30 +10,55 @@ import (
 	"runtime"
 )
 
-const binaryDir = ".izen/bin"
 const binaryName = "lx"
 
 var lxBinPath string
+
+func globalBinaryDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".izen", "runtime")
+}
+
+func localBinaryDir(root string) string {
+	return filepath.Join(root, ".izen", "bin")
+}
+
+func BinaryBytes() ([]byte, error) {
+	return nil, fmt.Errorf("lynx binary not embedded; build with -tags lynx_embed")
+}
 
 func BinaryPath() string {
 	return lxBinPath
 }
 
-func UnpackBinary(root string) (string, error) {
-	targetDir := filepath.Join(root, binaryDir)
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		return "", fmt.Errorf("mkdir bin: %w", err)
-	}
-
+func targetPath(dir string) string {
 	suffix := ""
 	if runtime.GOOS == "windows" {
 		suffix = ".exe"
 	}
-	target := filepath.Join(targetDir, binaryName+suffix)
+	return filepath.Join(dir, binaryName+suffix)
+}
+
+func UnpackBinary(root string) (string, error) {
+	globalDir := globalBinaryDir()
+	if err := os.MkdirAll(globalDir, 0755); err != nil {
+		return "", fmt.Errorf("mkdir global runtime: %w", err)
+	}
+
+	target := targetPath(globalDir)
 
 	if _, err := os.Stat(target); err == nil {
 		lxBinPath = target
 		return target, nil
+	}
+
+	legacyTarget := targetPath(localBinaryDir(root))
+	if _, err := os.Stat(legacyTarget); err == nil {
+		lxBinPath = legacyTarget
+		return legacyTarget, nil
 	}
 
 	lynxSourceDir := filepath.Join(root, "lynx")
@@ -46,6 +71,10 @@ func UnpackBinary(root string) (string, error) {
 			build.Stdout = os.Stderr
 			build.Stderr = os.Stderr
 			if err := build.Run(); err == nil {
+				suffix := ""
+				if runtime.GOOS == "windows" {
+					suffix = ".exe"
+				}
 				builtBinary := filepath.Join(lynxSourceDir, "target", "release", binaryName+suffix)
 				if _, err := os.Stat(builtBinary); err == nil {
 					input, err := os.ReadFile(builtBinary)

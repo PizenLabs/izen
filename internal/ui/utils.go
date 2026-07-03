@@ -6,6 +6,13 @@ import (
 	"strings"
 )
 
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
 func shortenPath(p string) string {
 	home, _ := os.UserHomeDir()
 	if strings.HasPrefix(p, home) {

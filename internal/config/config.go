@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/PizenLabs/izen/internal/state"
 )
 
 type AIProviderConfig struct {
@@ -101,19 +104,41 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+func configPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".izen", "config.yml")
+}
+
+func legacyConfigPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".izen", "izen.conf.yml")
+}
+
 func Load() (*Config, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
+	if err := state.InitGlobalState(); err != nil {
+		fmt.Fprintf(os.Stderr, "izen: warning: global state init: %v\n", err)
 	}
 
-	path := filepath.Join(home, ".izen", "izen.conf.yml")
+	path := configPath()
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return Default(), nil
+		if !os.IsNotExist(err) {
+			return nil, err
 		}
-		return nil, err
+
+		legacy := legacyConfigPath()
+		if data, err = os.ReadFile(legacy); err == nil {
+			var cfg Config
+			if err := yaml.Unmarshal(data, &cfg); err == nil {
+				if saveErr := Save(&cfg); saveErr == nil {
+					os.Remove(legacy)
+					fmt.Fprintf(os.Stderr, "izen: migrated config from %s to %s\n", legacy, path)
+				}
+			}
+			return &cfg, nil
+		}
+
+		return Default(), nil
 	}
 
 	var cfg Config
@@ -172,11 +197,35 @@ func Save(cfg *Config) error {
 		return err
 	}
 
-	path := filepath.Join(dir, "izen.conf.yml")
+	path := filepath.Join(dir, "config.yml")
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return err
 	}
 
 	return os.WriteFile(path, data, 0644)
+}
+
+type ConfigChangeMsg struct{}
+
+func StartConfigWatcher(ch chan<- bool) {
+	path := configPath()
+	var lastMod time.Time
+	go func() {
+		for {
+			time.Sleep(2 * time.Second)
+			info, err := os.Stat(path)
+			if err != nil {
+				continue
+			}
+			mod := info.ModTime()
+			if mod.After(lastMod) && !lastMod.IsZero() {
+				select {
+				case ch <- true:
+				default:
+				}
+			}
+			lastMod = mod
+		}
+	}()
 }
