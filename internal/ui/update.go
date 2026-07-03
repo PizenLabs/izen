@@ -24,7 +24,7 @@ import (
 
 // Init initializes background loop clock ticks for state rendering animations.
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(tickCmd(), animTickCmd())
+	return tea.Batch(m.spinnerTickCmd(), animTickCmd())
 }
 
 // ── Mouse Leak Interception & Buffering ──────────────────────────────────────
@@ -405,7 +405,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rebuildViewport()
 			}
 		}
-		return m, tickCmd()
+		return m, m.spinnerTickCmd()
 
 	case animTickMsg:
 		if m.lineAnimating {
@@ -706,8 +706,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(vpCmd, tiCmd)
 }
 
-func tickCmd() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+func (m *model) spinnerTickCmd() tea.Cmd {
+	frame := m.spinnerFrame % len(spinnerFrames)
+	frameStr := spinnerFrames[frame]
+
+	var delay time.Duration
+	switch frameStr {
+	case " ⊹ ":
+		delay = 40 * time.Millisecond
+	case " ⁕ ":
+		delay = 70 * time.Millisecond
+	case " ❃ ", " ❄ ", " ❆ ":
+		delay = 250 * time.Millisecond
+	default:
+		delay = 100 * time.Millisecond
+	}
+
+	return tea.Tick(delay, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func animTickCmd() tea.Cmd {

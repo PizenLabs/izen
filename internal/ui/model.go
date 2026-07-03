@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
@@ -308,7 +310,7 @@ func (m *model) rebuildViewport() {
 			lines = append(lines, gutter+l)
 		}
 	} else if m.streaming {
-		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)])
+		sp := m.renderFlowingSpinner()
 		lines = append(lines, gutterAIStyle.Render("▌")+" "+sp+"  "+infoStyle.Render("thinking…"))
 	}
 
@@ -351,6 +353,25 @@ func (m *model) pushRecords(recs []record) {
 	if m.vpReady {
 		m.rebuildViewport()
 	}
+}
+
+// renderFlowingSpinner renders a single animated character with a smooth flowing
+// light effect: the color oscillates between dim and bright using a sine wave,
+// creating the feeling of seamless movement.
+func (m *model) renderFlowingSpinner() string {
+	n := len(spinnerFrames)
+	idx := m.spinnerFrame % n
+	frameStr := spinnerFrames[idx]
+
+	phase := float64(m.spinnerFrame) * (2 * math.Pi / float64(n))
+	t := (math.Sin(phase) + 1) / 2
+	t = t * t * (3 - 2*t) // smoothstep for butter-smooth oscillation
+
+	from := lipgloss.Color(colorSubtle)
+	to := lipgloss.Color(colorText)
+	color := interpolateColor(from, to, t)
+
+	return lipgloss.NewStyle().Foreground(color).Render(frameStr)
 }
 
 // ── History persistence ───────────────────────────────────────────────────────

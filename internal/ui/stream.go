@@ -110,7 +110,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		}
 	}()
 
-	return tea.Batch(m.readStream(), tickCmd())
+	return tea.Batch(m.readStream(), m.spinnerTickCmd())
 }
 
 func (m *model) readStream() tea.Cmd {

@@ -108,11 +108,11 @@ func (m *model) renderPromptBox(width int) string {
 
 	var inner string
 	if m.agentRunning {
-		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)])
+		sp := m.renderFlowingSpinner()
 		label := lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render(m.agentLabel + "…")
 		inner = prefix + " " + sp + "  " + label
 	} else if m.streaming && m.responseBuffer.Len() == 0 {
-		sp := spinnerStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)])
+		sp := m.renderFlowingSpinner()
 		inner = prefix + " " + sp + "  " + infoStyle.Render("thinking…")
 	} else {
 		// Use native m.ti.View() to delegate terminal hardware cursor coordination.
