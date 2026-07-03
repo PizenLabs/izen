@@ -142,15 +142,15 @@ func SanitizeSubject(line string) string {
 func IsImplementationLeak(line string) bool {
 	patterns := []*regexp.Regexp{
 		regexp.MustCompile("`.*?`"),
-		regexp.MustCompile("(?i)\\bpass\\s+\\d+\\b"),
-		regexp.MustCompile("(?i)\\bfunction\\b"),
-		regexp.MustCompile("(?i)\\bresolver\\b"),
-		regexp.MustCompile("(?i)\\bedge\\b"),
-		regexp.MustCompile("(?i)\\bconstant\\b"),
-		regexp.MustCompile("(?i)\\benum\\b"),
-		regexp.MustCompile("(?i)\\bphase\\b"),
-		regexp.MustCompile("(?i)\\binternal\\b"),
-		regexp.MustCompile("(?i)\\bstruct\\b"),
+		regexp.MustCompile(`(?i)\bpass\s+\d+\b`),
+		regexp.MustCompile(`(?i)\bfunction\b`),
+		regexp.MustCompile(`(?i)\bresolver\b`),
+		regexp.MustCompile(`(?i)\bedge\b`),
+		regexp.MustCompile(`(?i)\bconstant\b`),
+		regexp.MustCompile(`(?i)\benum\b`),
+		regexp.MustCompile(`(?i)\bphase\b`),
+		regexp.MustCompile(`(?i)\binternal\b`),
+		regexp.MustCompile(`(?i)\bstruct\b`),
 	}
 	for _, p := range patterns {
 		if p.MatchString(line) {
@@ -163,7 +163,7 @@ func IsImplementationLeak(line string) bool {
 // SanitizeBody normalizes bullet lines, dropping semantic duplicates and leaked syntax details.
 func SanitizeBody(lines []string) string {
 	var cleaned []string
-	conventionalScopeRegex := regexp.MustCompile("(?i)^[a-z]+\\(.+\\):")
+	conventionalScopeRegex := regexp.MustCompile(`(?i)^[a-z]+\(.+\):`)
 
 	for _, line := range lines {
 		text := strings.TrimSpace(line)

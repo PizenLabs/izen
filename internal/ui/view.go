@@ -79,6 +79,9 @@ func (m *model) View() string {
 }
 
 func (m *model) renderTopBar() string {
+	if m.sess == nil {
+		return ""
+	}
 	obj := m.sess.ObjectiveState
 	rawIntent := ""
 	scopeFiles := 0
@@ -325,12 +328,6 @@ func (m *model) renderFooter(width int) string {
 
 	footerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 	return footerStyle.Render(left + strings.Repeat(" ", gap) + right)
-}
-
-// ── Legacy Status Bar Placeholder ─────────────────────────────────────────
-
-func (m *model) renderStatusBar(width int) string {
-	return ""
 }
 
 // ── Startup banner ────────────────────────────────────────────────────────
@@ -994,10 +991,7 @@ func parseDiffMetadata(diffBody string) (file, symbol, linesRange, cleanDiff str
 			continue
 		}
 		if strings.HasPrefix(line, "+++ ") {
-			file = strings.TrimPrefix(line, "+++ ")
-			if strings.HasPrefix(file, "b/") {
-				file = file[2:]
-			}
+			file = strings.TrimPrefix(strings.TrimPrefix(line, "+++ "), "b/")
 			continue
 		}
 		if strings.HasPrefix(line, "@@") {
@@ -1022,28 +1016,4 @@ func parseDiffMetadata(diffBody string) (file, symbol, linesRange, cleanDiff str
 	}
 	cleanDiff = strings.Join(diffLines, "\n")
 	return
-}
-
-// ── Confirmation dialog (Legacy fallback) ─────────────────────────────────
-
-func (m *model) renderConfirmation(width int) string {
-	return ""
-}
-
-// renderModeBar builds the interactive suggestions palette component view.
-func (m *model) renderModeBar(_ int) string {
-	var b strings.Builder
-	current := "/" + m.resolver.Current().String()
-	for i, mname := range coreModes {
-		if i > 0 {
-			b.WriteString(hairlineStyle.Render("  "))
-		}
-		if mname == current {
-			mode, _ := modes.Parse(mname[1:])
-			b.WriteString(modeTabActiveStyle.Foreground(modeAccentColor(mode)).Render(mname))
-		} else {
-			b.WriteString(modeTabInactiveStyle.Render(mname))
-		}
-	}
-	return b.String()
 }

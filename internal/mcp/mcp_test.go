@@ -85,10 +85,7 @@ func TestManagerListEmpty(t *testing.T) {
 // ─── Gateway Interface Compliance Tests ─────────────────────────────────
 
 func TestMockGatewayImplementsInterface(t *testing.T) {
-	var gw Gateway = &mockGateway{name: "test"}
-	if gw == nil {
-		t.Fatal("mockGateway should implement Gateway")
-	}
+	var _ Gateway = &mockGateway{name: "test"}
 }
 
 func TestMockGatewayCreateIssue(t *testing.T) {

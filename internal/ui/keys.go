@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -181,13 +180,3 @@ func (m *model) syncInputFromTI() {
 	m.input.Reset()
 	m.input.WriteString(m.ti.Value())
 }
-
-// printSystem / printInfo / printError — now push into viewport records.
-func printSystem(text string) {
-	// These are called from commands.go — they need model access.
-	// Use a no-op here; commands.go methods call m.push() directly now.
-	fmt.Print("") // suppress unused import
-}
-
-func printInfo(text string)  { _ = text }
-func printError(text string) { _ = text }

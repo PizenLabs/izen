@@ -1298,10 +1298,7 @@ func TestDiffHunkMultiHunk(t *testing.T) {
 // ─── Retriever Interface Tests ─────────────────────────────────────────
 
 func TestRetrieverInterface(t *testing.T) {
-	var r Retriever = &mockRetriever{}
-	if r == nil {
-		t.Fatal("mockRetriever should implement Retriever")
-	}
+	var _ Retriever = &mockRetriever{}
 }
 
 func TestSearchResultDefaults(t *testing.T) {

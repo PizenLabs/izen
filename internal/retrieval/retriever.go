@@ -64,8 +64,6 @@ func (t Tier) Order() int {
 	}
 }
 
-const lynxConfidenceThreshold = 0.6
-
 type Retriever struct {
 	root     string
 	graph    *GraphLookup

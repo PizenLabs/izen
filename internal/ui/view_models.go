@@ -117,10 +117,7 @@ type RiskCardViewModel struct {
 
 // ToRiskCardViewModel maps a SemanticRisk domain model to a RiskCardViewModel.
 func ToRiskCardViewModel(r SemanticRisk) RiskCardViewModel {
-	return RiskCardViewModel{
-		Level:  r.Level,
-		Reason: r.Reason,
-	}
+	return RiskCardViewModel(r)
 }
 
 // DiffCardViewModel contains presentation-ready metadata for symbol-aware diffs.

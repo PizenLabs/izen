@@ -79,10 +79,7 @@ func (tl *TestLoop) RemainingLoops(current int) int {
 }
 
 func (tl *TestLoop) NarrowIteration(prev *TestResultSummary, frames []StackFrame) []string {
-	var candidates []string
-	for _, failed := range prev.Failed {
-		candidates = append(candidates, failed)
-	}
+	candidates := append([]string{}, prev.Failed...)
 	for _, frame := range frames {
 		pkg := extractPackageFromFile(frame.File)
 		if pkg != "" {

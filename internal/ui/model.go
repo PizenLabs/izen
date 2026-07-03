@@ -88,10 +88,6 @@ type commitGeneratedMsg struct {
 	err     error
 }
 
-type buildProposalsReadyMsg struct {
-	proposals []SemanticProposal
-}
-
 type objectiveAnalyzedMsg struct {
 	objective *domain.Objective
 	err       error
@@ -182,9 +178,8 @@ type model struct {
 
 	state UIState
 
-	execEng     *execution.Engine
-	planStore   *plan.PlanStore
-	buildOutput strings.Builder
+	execEng   *execution.Engine
+	planStore *plan.PlanStore
 
 	investigateInvocationCount int
 
@@ -303,9 +298,7 @@ func (m *model) rebuildViewport() {
 	followBottom := m.vp.AtBottom()
 	var lines []string
 	if m.showBanner {
-		for _, l := range strings.Split(m.renderStartupBanner(m.width), "\n") {
-			lines = append(lines, l)
-		}
+		lines = append(lines, strings.Split(m.renderStartupBanner(m.width), "\n")...)
 		lines = append(lines, "")
 	}
 	for _, rec := range m.records {
@@ -337,14 +330,6 @@ func (m *model) rebuildViewport() {
 	}
 }
 
-// appendViewLine appends a rendered line and synchronizes viewport tracking.
-func (m *model) appendViewLine(line string) {
-	visualLines := strings.Split(line, "\n")
-	m.viewLines = append(m.viewLines, visualLines...)
-	m.vp.SetContent(strings.Join(m.viewLines, "\n"))
-	m.vp.GotoBottom()
-}
-
 // ── Record helpers ─────────────────────────────────────────────────────────────
 
 func (m *model) push(r role, text string) {
@@ -357,14 +342,8 @@ func (m *model) push(r role, text string) {
 	}
 }
 
-func (m *model) pushLines(r role, lines []string) {
-	m.push(r, strings.Join(lines, "\n"))
-}
-
 func (m *model) pushRecords(recs []record) {
-	for _, rec := range recs {
-		m.records = append(m.records, rec)
-	}
+	m.records = append(m.records, recs...)
 	if m.vpReady {
 		m.rebuildViewport()
 	}
@@ -438,5 +417,3 @@ func (m *model) saveHistory() {
 	b, _ := json.Marshal(last)
 	fmt.Fprintf(f, "%s\n", b)
 }
-
-func (m *model) inputString() string { return m.ti.Value() }

@@ -9,7 +9,6 @@ import (
 // It writes raw LLM outputs to .izen/plans/plan-<id>.md and .izen/plans/current.md.
 // PlanStore provides SaveRawMarkdown for persisting raw output and TickTaskHoanThanh for marking tasks as completed.
 type PlanStore struct {
-	path string
 }
 
 // NewPlanStore creates a new PlanStore instance.

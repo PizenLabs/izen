@@ -72,7 +72,6 @@ var (
 	testResultRe = regexp.MustCompile(`^(ok|FAIL)\s+(\S+)\s+([\d.]+s)`)
 	failLineRe   = regexp.MustCompile(`^--- FAIL:\s+(.+?)\s`)
 	coverRe      = regexp.MustCompile(`coverage:\s+([\d.]+%)`)
-	packageRe    = regexp.MustCompile(`^(ok|FAIL)\s+`)
 )
 
 func parseTestOutput(output string) *TestResult {
