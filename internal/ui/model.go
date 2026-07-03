@@ -64,9 +64,10 @@ type tickMsg time.Time
 type animTickMsg time.Time
 
 type investigateResultMsg struct {
-	records    []record
-	sessionKey string
-	err        error
+	records           []record
+	sessionKey        string
+	err               error
+	escalationContent string // when Resolved=false, pipe investigation data to LLM for analysis
 }
 
 type reviewResultMsg struct {
@@ -76,6 +77,7 @@ type reviewResultMsg struct {
 	err          error
 }
 
+type agentStartMsg struct{ label string }
 type agentDoneMsg struct{ label string }
 
 type commitGeneratedMsg struct {
@@ -93,7 +95,7 @@ type buildProposalsReadyMsg struct {
 
 const (
 	version                   = "0.1.0"
-	maxInvestigateInvocations = 5
+	maxInvestigateInvocations = 20
 
 	// Fixed heights of chrome elements (lines)
 	focusLineHeight = 1 // top colored rule

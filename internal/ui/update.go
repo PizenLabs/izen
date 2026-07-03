@@ -417,6 +417,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, animTickCmd()
 
+	case agentStartMsg:
+		m.agentRunning = true
+		m.agentDone = false
+		m.agentLabel = msg.label
+		m.spinnerFrame = 0
+		if m.vpReady {
+			m.rebuildViewport()
+		}
+		return m, m.spinnerTickCmd()
+
 	case agentDoneMsg:
 		m.agentRunning = false
 		m.agentDone = true
@@ -429,13 +439,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+msg.err.Error())
-			return m, nil
 		}
-		m.pushRecords(msg.records)
+		for _, rec := range msg.records {
+			m.records = append(m.records, rec)
+		}
 		if msg.sessionKey != "" {
 			m.sess.SetInvestigationID(msg.sessionKey)
 		}
-		return m, nil
+		// Force-reset streaming middleware flags to guarantee streamCmd can run
+		m.streamCh = nil
+		m.streaming = false
+		m.push(roleSystem, "[System] Engine diagnostics collected. Escalating to LLM for analysis...")
+		return m, m.streamCmd(msg.escalationContent)
 
 	case reviewResultMsg:
 		m.agentRunning = false
