@@ -19,6 +19,9 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Show Go version
+        run: go version
+
       - run: go mod download
 
       - run: go vet ./...
@@ -44,7 +47,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy,rustfmt
+          components: clippy, rustfmt
+
+      - name: Show Rust version
+        run: |
+          rustc --version
+          cargo --version
 
       - uses: Swatinem/rust-cache@v2
 
@@ -68,6 +76,11 @@ jobs:
           cache: true
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Show Rust version
+        run: |
+          rustc --version
+          cargo --version
 
       - uses: Swatinem/rust-cache@v2
 
@@ -93,6 +106,11 @@ jobs:
           cache: true
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Show Rust version
+        run: |
+          rustc --version
+          cargo --version
 
       - uses: Swatinem/rust-cache@v2
 
