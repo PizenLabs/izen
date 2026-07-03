@@ -173,9 +173,10 @@ func (m *model) renderRuntimeStatus(width int) string {
 	}
 	parts = append(parts, taskStr)
 
-	// 2. Sandbox (highest priority)
-	sandboxStr := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render("sandbox: local")
-	if !m.resolver.Current().ReadOnly() {
+	// 2. Sandbox — bound to the current mode's write capability
+	mode := m.resolver.Current()
+	sandboxStr := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render("sandbox: read")
+	if mode.CanWrite() {
 		sandboxStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange)).Render("sandbox: write")
 	}
 	parts = append(parts, sandboxStr)
@@ -239,8 +240,12 @@ func (m *model) renderFooter(width int) string {
 		branch = "detached"
 	}
 
+	mode := m.resolver.Current()
 	safeStr := "safe"
-	if !m.resolver.Current().ReadOnly() {
+	if mode.CanShell() || mode.CanTest() {
+		safeStr = "sandboxed"
+	}
+	if mode.CanWrite() {
 		safeStr = "write"
 	}
 
