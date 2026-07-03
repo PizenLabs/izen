@@ -17,6 +17,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
@@ -89,6 +90,11 @@ type commitGeneratedMsg struct {
 
 type buildProposalsReadyMsg struct {
 	proposals []SemanticProposal
+}
+
+type objectiveAnalyzedMsg struct {
+	objective *domain.Objective
+	err       error
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -207,14 +213,17 @@ type model struct {
 	startMouseRow   int
 	currentMouseCol int
 	currentMouseRow int
+
+	// Focus objective UI notifications (non-chat)
+	uiNotice string
 }
 
 // ── Viewport helpers ──────────────────────────────────────────────────────────
 
 // viewportHeight calculates available lines for the conversation viewport.
 func (m *model) viewportHeight() int {
-	// Base heights: Focus line (1) + Prompt Box (3) + Runtime Status (1) + Footer (1)
-	baseHeight := 1 + 3 + 1 + 1
+	// Base heights: Focus Header (1) + Focus line (1) + Prompt Box (3) + Runtime Status (1) + Footer (1)
+	baseHeight := 1 + 1 + 3 + 1 + 1
 
 	// Add dynamic heights
 	widgetH := m.activeWidgetHeight()

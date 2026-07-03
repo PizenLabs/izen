@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 )
@@ -19,17 +20,18 @@ type Message struct {
 
 // Session represents a user session.
 type Session struct {
-	Objective       string      `json:"objective"`
-	Mode            modes.Mode  `json:"mode"`
-	Assumptions     []string    `json:"assumptions,omitempty"`
-	Questions       []string    `json:"questions,omitempty"`
-	Checkpoints     []string    `json:"checkpoints,omitempty"`
-	InvestigationID string      `json:"investigation_id,omitempty"`
-	ReviewID        string      `json:"review_id,omitempty"`
-	CurrentTasks    []plan.Task `json:"current_tasks,omitempty"`
-	CreatedAt       time.Time   `json:"created_at"`
-	UpdatedAt       time.Time   `json:"updated_at"`
-	History         []Message   `json:"history,omitempty"`
+	Objective       string            `json:"objective"`
+	ObjectiveState  *domain.Objective `json:"objective_state,omitempty"`
+	Mode            modes.Mode        `json:"mode"`
+	Assumptions     []string          `json:"assumptions,omitempty"`
+	Questions       []string          `json:"questions,omitempty"`
+	Checkpoints     []string          `json:"checkpoints,omitempty"`
+	InvestigationID string            `json:"investigation_id,omitempty"`
+	ReviewID        string            `json:"review_id,omitempty"`
+	CurrentTasks    []plan.Task       `json:"current_tasks,omitempty"`
+	CreatedAt       time.Time         `json:"created_at"`
+	UpdatedAt       time.Time         `json:"updated_at"`
+	History         []Message         `json:"history,omitempty"`
 	path            string
 }
 
@@ -76,6 +78,15 @@ func Load() (*Session, error) {
 	if s.History == nil {
 		s.History = []Message{}
 	}
+	if s.ObjectiveState == nil && s.Objective != "" {
+		obj := domain.NewObjective(s.Objective)
+		obj.CurrentStatus = domain.ObjectivePlanned
+		obj.HumanConfirmed = true
+		s.ObjectiveState = obj
+	}
+	if s.Objective == "" && s.ObjectiveState != nil {
+		s.Objective = s.ObjectiveState.RawIntent
+	}
 	// Apply retention policy to checkpoints and patches directories.
 	_ = RunRetentionPolicy(filepath.Join(".izen", "checkpoints"), 15)
 	_ = RunRetentionPolicy(filepath.Join(".izen", "patches"), 15)
@@ -106,6 +117,23 @@ func (s *Session) Save() error {
 // SetObjective sets the session objective.
 func (s *Session) SetObjective(obj string) {
 	s.Objective = obj
+	s.ObjectiveState = domain.NewObjective(obj)
+}
+
+func (s *Session) SetObjectiveState(obj *domain.Objective) {
+	s.ObjectiveState = obj
+	if obj == nil {
+		s.Objective = ""
+		return
+	}
+	s.Objective = obj.RawIntent
+}
+
+func (s *Session) ObjectiveIntent() string {
+	if s.ObjectiveState != nil && s.ObjectiveState.RawIntent != "" {
+		return s.ObjectiveState.RawIntent
+	}
+	return s.Objective
 }
 
 // SetMode sets the session mode.

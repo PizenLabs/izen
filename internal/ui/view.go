@@ -10,6 +10,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/modes"
 )
 
@@ -43,33 +44,85 @@ func (m *model) View() string {
 
 	var sections []string
 
-	// 1. Conversation Timeline (Viewport)
+	// 1. Focus Header (non-scroll objective dashboard)
+	sections = append(sections, m.renderFocusHeader(width))
+
+	// 2. Conversation Timeline (Viewport)
 	sections = append(sections, m.vp.View())
 
-	// 2. Suggestion palette (Floats dynamically above the prompt input area)
+	// 3. Suggestion palette (Floats dynamically above the prompt input area)
 	if m.showSuggestions && len(m.suggestions) > 0 {
 		sections = append(sections, m.renderSuggestions(width))
 	}
 
-	// 3. Engineering Widgets (Active/pinned widget, e.g. active Proposal or Progress)
+	// 4. Engineering Widgets (Active/pinned widget, e.g. active Proposal or Progress)
 	activeWidget := m.renderActiveWidget(width)
 	if activeWidget != "" {
 		sections = append(sections, activeWidget)
 	}
 
-	// 4. Focus separator line
+	// 5. Focus separator line
 	sections = append(sections, m.renderFocusLine(width))
 
-	// 5. Input Prompt box area
+	// 6. Input Prompt box area
 	sections = append(sections, m.renderPromptBox(width))
 
-	// 6. Runtime Status
+	// 7. Runtime Status
 	sections = append(sections, m.renderRuntimeStatus(width))
 
-	// 7. Footer
+	// 8. Footer
 	sections = append(sections, m.renderFooter(width))
 
 	return strings.Join(sections, "\n")
+}
+
+func (m *model) renderFocusHeader(width int) string {
+	modeLabel := m.resolver.Current().String()
+	obj := m.sess.ObjectiveState
+	intent := "none"
+	scopeFiles := 0
+	budgetStatus := "OK"
+	if obj != nil {
+		intent = shortenObjectiveIntent(obj.RawIntent, width)
+		scopeFiles = len(obj.Scope.Files)
+		if obj.TokenBudget.RequiresApproval {
+			budgetStatus = "Warning"
+		}
+		if obj.CurrentStatus == domain.ObjectiveAnalyzing {
+			budgetStatus = "Analyzing"
+		}
+	}
+
+	header := fmt.Sprintf("[Mode: %s] | [Objective: %s] | [Scope: %d Files] | [Budget: %s]",
+		modeLabel, intent, scopeFiles, budgetStatus)
+
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color(colorText)).
+		Background(lipgloss.Color(colorOverlay)).
+		Padding(0, 1).
+		Width(width).
+		Render(header)
+}
+
+func shortenObjectiveIntent(raw string, width int) string {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return "none"
+	}
+	limit := 56
+	if width < 90 {
+		limit = 24
+	} else if width < 120 {
+		limit = 40
+	}
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	if limit <= 1 {
+		return "…"
+	}
+	return string(runes[:limit-1]) + "…"
 }
 
 // ── Focus line ────────────────────────────────────────────────────────────
@@ -216,6 +269,9 @@ func (m *model) renderRuntimeStatus(width int) string {
 			}
 		}
 		parts = append(parts, checkpointStr)
+	}
+	if m.uiNotice != "" && width >= 60 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render("notice: "+m.uiNotice))
 	}
 
 	sep := lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)).Render("  │  ")
