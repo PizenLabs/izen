@@ -1,9 +1,13 @@
 package investigate
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
+
+var ErrWriteForbidden = errors.New("investigate mode: write operations are forbidden")
+var ErrPatchForbidden = errors.New("investigate mode: patch generation is forbidden")
 
 type TestResultSummary struct {
 	Package string       `json:"package"`
@@ -17,13 +21,15 @@ type TestResultSummary struct {
 	Frames  []StackFrame `json:"frames,omitempty"`
 }
 
+const hardLoopCeiling = 3
+
 type TestLoop struct {
 	maxIterations int
 }
 
 func NewTestLoop(maxIterations int) *TestLoop {
-	if maxIterations <= 0 {
-		maxIterations = 3
+	if maxIterations <= 0 || maxIterations > hardLoopCeiling {
+		maxIterations = hardLoopCeiling
 	}
 	return &TestLoop{maxIterations: maxIterations}
 }
@@ -60,6 +66,16 @@ func (tl *TestLoop) Run(exec TestExecutor, cfg testLoopConfig) (*TestResultSumma
 	}
 
 	return result, nil
+}
+
+// RemainingLoops returns how many diagnostic iterations are still available
+// before hitting the hard ceiling.
+func (tl *TestLoop) RemainingLoops(current int) int {
+	remaining := hardLoopCeiling - current
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
 }
 
 func (tl *TestLoop) NarrowIteration(prev *TestResultSummary, frames []StackFrame) []string {

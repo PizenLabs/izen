@@ -21,6 +21,14 @@ func (m *model) runInvestigateCmd(content string) tea.Cmd {
 	m.spinnerFrame = 0
 
 	return func() tea.Msg {
+		currentMode := m.resolver.Current()
+		if !currentMode.CanShell() {
+			return investigateResultMsg{err: fmt.Errorf("investigate mode: shell execution denied by %s capabilities", currentMode)}
+		}
+		if currentMode.CanWrite() {
+			return investigateResultMsg{err: fmt.Errorf("investigate mode: write capability detected — violating capability contract")}
+		}
+
 		eng := investigate.NewEngine(".", content, nil, nil)
 		result, err := eng.Run()
 		if err != nil {
@@ -79,6 +87,17 @@ func (m *model) runReviewCmd() tea.Cmd {
 	m.spinnerFrame = 0
 
 	return func() tea.Msg {
+		currentMode := m.resolver.Current()
+		if currentMode.CanWrite() {
+			return reviewResultMsg{err: fmt.Errorf("review mode: write capability detected — review must be 100%% read-only")}
+		}
+		if currentMode.CanShell() {
+			return reviewResultMsg{err: fmt.Errorf("review mode: shell capability detected — review must lock out shell execution")}
+		}
+		if currentMode.CanPatch() {
+			return reviewResultMsg{err: fmt.Errorf("review mode: patch capability detected — review must lock out patch generation")}
+		}
+
 		eng := review.NewEngine(".", nil, nil)
 		result, err := eng.Run()
 		if err != nil {

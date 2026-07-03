@@ -78,7 +78,7 @@ type StateConfig struct {
 
 func DefaultStateConfig() StateConfig {
 	return StateConfig{
-		MaxLoops: 5,
+		MaxLoops: hardLoopCeiling,
 	}
 }
 

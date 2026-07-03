@@ -83,6 +83,7 @@ type ImpactRadius struct {
 	AffectedPkgs  []string         `json:"affected_pkgs"`
 	AffectedSyms  []AffectedSymbol `json:"affected_syms"`
 	ImportChains  []ImportChain    `json:"import_chains,omitempty"`
+	CallChains    []CallChain      `json:"call_chains,omitempty"`
 	RiskScore     int              `json:"risk_score"`
 	Complexity    int              `json:"complexity"`
 }
@@ -90,6 +91,14 @@ type ImpactRadius struct {
 type ImportChain struct {
 	Source string   `json:"source"`
 	Chain  []string `json:"chain"`
+}
+
+// CallChain represents a downstream caller trace from a modified file.
+// Source is the modified file; Callers lists every file that directly or
+// transitively depends on it, forming an explicit regression-risk trace.
+type CallChain struct {
+	Source  string   `json:"source"`
+	Callers []string `json:"callers"`
 }
 
 type RiskSeverity string

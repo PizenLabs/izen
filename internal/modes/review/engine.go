@@ -1,6 +1,7 @@
 package review
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,7 +9,23 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/modes"
 )
+
+var ErrWriteForbidden = errors.New("review mode: write operations are forbidden")
+var ErrShellForbidden = errors.New("review mode: shell execution is forbidden")
+
+// VerifyModeCapability asserts that the given mode can perform review-level
+// read-only operations. Returns an error if the mode lacks CapRead.
+func VerifyModeCapability(m modes.Mode) error {
+	if !m.CanRead() {
+		return fmt.Errorf("mode %s lacks read capability", m)
+	}
+	if m.CanWrite() {
+		return fmt.Errorf("mode %s has write capability — not allowed in review context", m)
+	}
+	return nil
+}
 
 type Engine struct {
 	State   *StateMachine
@@ -41,6 +58,12 @@ func NewEngine(root string, retriever Retriever, g *graph.Graph) *Engine {
 func (e *Engine) Run() (*ReviewResult, error) {
 	result := &ReviewResult{
 		CreatedAt: time.Now(),
+	}
+
+	if err := VerifyModeCapability(modes.ModeReview); err != nil {
+		result.Error = err.Error()
+		e.Result = result
+		return result, err
 	}
 
 	if e.Diff.isRepo() && !e.Diff.hasChanges() {

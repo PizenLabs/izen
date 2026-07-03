@@ -2,7 +2,9 @@ package investigate
 
 import (
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
 )
 
 type EvidenceSource string
@@ -18,6 +20,146 @@ const (
 	EvSourceLog       EvidenceSource = "log"
 	EvSourceExecution EvidenceSource = "execution"
 )
+
+const (
+	maxLogInputBytes = 256 * 1024 // 256KB ceiling before truncation
+	maxStackFrames   = 30         // max frames to keep after pre-processing
+	maxLineLength    = 2000       // single line truncation threshold
+	maxOutputLines   = 500        // total output lines cap
+)
+
+// BoundedLogPreprocessor intercepts raw terminal/CI failure output and
+// extracts only the diagnostic signal — stack traces, error messages, and
+// test failure markers — while stripping high-volume noise (ANSI codes,
+// build cache logs, repetitive progress bars, Go module downloads, etc.).
+// Returns a token-safe condensed payload.
+func BoundedLogPreprocessor(raw string) string {
+	if len(raw) > maxLogInputBytes {
+		raw = raw[:maxLogInputBytes]
+	}
+
+	lines := strings.Split(raw, "\n")
+	if len(lines) > maxOutputLines {
+		lines = lines[:maxOutputLines]
+	}
+
+	var out []string
+	var stackFrameCount int
+	inNoiseBlock := false
+	noiseBlockLines := 0
+
+	for _, line := range lines {
+		trimmed := strings.TrimRightFunc(line, unicode.IsSpace)
+		clean := stripANSICodes(trimmed)
+
+		if clean == "" {
+			if inNoiseBlock {
+				noiseBlockLines++
+				if noiseBlockLines > 3 {
+					continue
+				}
+			}
+			out = append(out, "")
+			continue
+		}
+
+		if isNoiseLine(clean) {
+			if !inNoiseBlock {
+				inNoiseBlock = true
+				noiseBlockLines = 0
+			}
+			noiseBlockLines++
+			if noiseBlockLines > 2 {
+				continue
+			}
+			continue
+		}
+		inNoiseBlock = false
+		noiseBlockLines = 0
+
+		if isStackFrameLine(clean) {
+			stackFrameCount++
+			if stackFrameCount > maxStackFrames {
+				continue
+			}
+		}
+
+		if len(clean) > maxLineLength {
+			clean = clean[:maxLineLength] + "..."
+		}
+
+		out = append(out, clean)
+	}
+
+	condensed := strings.Join(out, "\n")
+	condensed = strings.TrimSpace(condensed)
+	if condensed == "" {
+		return raw
+	}
+	return condensed
+}
+
+func stripANSICodes(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
+				j++
+			}
+			if j < len(s) {
+				i = j + 1
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+func isNoiseLine(s string) bool {
+	lower := strings.ToLower(s)
+	switch {
+	case strings.HasPrefix(lower, "ok  ") || strings.HasPrefix(lower, "?   "):
+		return false
+	case strings.Contains(lower, "download") && strings.Contains(lower, "go"):
+		return true
+	case strings.Contains(lower, "cache") && strings.Contains(lower, "generated"):
+		return true
+	case strings.HasPrefix(lower, "progress"):
+		return true
+	case strings.HasPrefix(lower, "#") && strings.Contains(lower, "downloading"):
+		return true
+	case strings.Contains(lower, "go: finding module"):
+		return true
+	case strings.Contains(lower, "go: downloading"):
+		return true
+	case strings.Contains(lower, "go: extracting"):
+		return true
+	case strings.Count(lower, ".") > 20 && len(lower) > 100:
+		return true
+	default:
+		return false
+	}
+}
+
+func isStackFrameLine(s string) bool {
+	switch {
+	case strings.Contains(s, ".go:"):
+		return true
+	case strings.Contains(s, "File ") && strings.Contains(s, "line "):
+		return true
+	case strings.HasPrefix(s, "at ") && strings.Contains(s, ".go:"):
+		return true
+	case strings.HasPrefix(s, "\tat "):
+		return true
+	default:
+		return false
+	}
+}
 
 type Evidence struct {
 	ID         string         `json:"id"`
