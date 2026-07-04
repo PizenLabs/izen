@@ -41,7 +41,7 @@ jobs:
           ls -R
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: |
             coverage-go.out
