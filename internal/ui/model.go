@@ -44,6 +44,7 @@ type UIState uint8
 const (
 	StateChat UIState = iota
 	StateAwaitingApproval
+	StateAwaitingShellExec
 )
 
 type record struct {
@@ -175,6 +176,13 @@ type model struct {
 	awaitingConfirmation bool
 	pendingProposals     []SemanticProposal
 	acceptAll            bool
+
+	// Accepted proposals (collapsed single-line summaries)
+	acceptedProposals []acceptedProposal
+
+	// Shell execution proposals awaiting approval
+	pendingShellExec []shellExecBlock
+	shellAwaitingIdx int
 
 	state UIState
 

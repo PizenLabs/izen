@@ -13,26 +13,19 @@ type EnhancedMutationRenderer struct {
 }
 
 func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
-	// Calculate content width (accounting for borders and padding)
-	contentWidth := r.Width - 4 // 2 for borders, 2 for padding
+	contentWidth := r.Width - 4
 	if contentWidth < 20 {
 		contentWidth = 20
 	}
 
-	// Top border - minimal visual noise
 	border := strings.Repeat("─", contentWidth)
 	if len(border) == 0 {
 		border = "─"
 	}
 
-	// Header line with expand/collapse indicator
-	statusIcon := "•" // pending
-	expandIcon := "❯" // collapsed by default
+	expandStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 
-	if v.Expanded {
-		expandIcon = "▼" // expanded
-	}
-
+	// Header text — no expand/collapse toggle (moved to footer)
 	headerText := "Edit"
 	if v.Target.Name != "" {
 		symbolName := v.Target.Name
@@ -51,20 +44,20 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 		headerText += " • Unknown"
 	}
 
-	// Style for the expand indicator
-	expandStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-
-	// Build the header line with status and expand indicators
-	headerLine := fmt.Sprintf("%s %s %s", statusStyle.Render(statusIcon), expandStyle.Render(expandIcon), headerText)
+	// Footer line: expand/collapse toggle + action keybindings — always visible, anchored at bottom
+	expandIcon := "❯"
+	if v.Expanded {
+		expandIcon = "▼"
+	}
+	footerLine := fmt.Sprintf("%s  [A] Accept  [L] Allow All  [R] Reject",
+		expandStyle.Render(expandIcon))
 
 	if !v.Expanded {
-		// COLLAPSED: Render compact header + action buttons (always visible)
-		lines := make([]string, 0, 6)
+		// COLLAPSED: compact header + metadata + sticky footer
+		lines := make([]string, 0, 7)
 		lines = append(lines, border)
-		lines = append(lines, headerLine)
+		lines = append(lines, headerText)
 
-		// Add scope/risk info inline for compact view
 		scope := "Internal"
 		if v.Impact.HasAPIChanges {
 			scope = "Public"
@@ -76,19 +69,20 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 		metadata := fmt.Sprintf("Scope %s | Risk %s", scope, riskLevel)
 		lines = append(lines, expandStyle.Render("  "+metadata))
 
-		lines = append(lines, "") // Spacing before actions
-		lines = append(lines, "[A] Accept    [L] Allow All    [R] Reject")
+		lines = append(lines, "") // spacing
+		lines = append(lines, footerLine)
+		lines = append(lines, "") // spacing before border
 		lines = append(lines, border)
 		return strings.Join(lines, "\n")
 	}
 
-	// EXPANDED: Render full diff view
+	// EXPANDED: full diff view + sticky footer
 	var lines []string
 	lines = append(lines, border)
-	lines = append(lines, headerLine)
-	lines = append(lines, "") // Empty line for spacing
+	lines = append(lines, headerText)
+	lines = append(lines, "")
 
-	// Semantic Summary - max 2 lines above diff
+	// Semantic Summary
 	if v.SemanticSummary != "" {
 		summaryLines := wrapText(v.SemanticSummary, contentWidth)
 		if len(summaryLines) > 2 {
@@ -96,52 +90,42 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 		}
 		for _, line := range summaryLines {
 			if len(line) > 0 {
-				lines = append(lines, "  "+line) // Indent for visual separation
+				lines = append(lines, "  "+line)
 			}
 		}
-		lines = append(lines, "") // Empty line after summary
+		lines = append(lines, "")
 	}
 
-	// Diff - the evidence (takes most of the space)
+	// Diff content
 	if v.Diff.Content != "" {
 		dr := &DiffRenderer{Width: contentWidth, IsNewFile: v.IsNewFile}
 		diffRendered := dr.Render(v.Diff)
-
 		diffLines := strings.Split(diffRendered, "\n")
 		for _, line := range diffLines {
 			if len(line) > 0 {
 				lines = append(lines, line)
 			}
 		}
-		lines = append(lines, "") // Empty line after diff
+		lines = append(lines, "")
 	}
 
-	// Scope - compact: "Scope Internal/Public"
 	scope := "Internal"
 	if v.Impact.HasAPIChanges {
 		scope = "Public"
 	}
-	lines = append(lines, formatCompactField("Scope", scope, contentWidth))
-
-	// Risk - compact: "Risk LOW"
 	riskLevel := v.Risk.Level
 	if riskLevel == "" {
 		riskLevel = "UNKNOWN"
 	}
+	lines = append(lines, formatCompactField("Scope", scope, contentWidth))
 	lines = append(lines, formatCompactField("Risk", riskLevel, contentWidth))
+	lines = append(lines, "")
 
-	// Checkpoint - compact: "Checkpoint cp-18312"
-	lines = append(lines, formatCompactField("Checkpoint", "cp-pending", contentWidth))
+	// Sticky footer with toggle + actions
+	lines = append(lines, footerLine)
+	lines = append(lines, "") // spacing before bottom border
 
-	lines = append(lines, "") // Empty line before actions
-
-	// Decision Actions - always visible, sticky: "[A] Accept    [L] Allow All    [R] Reject"
-	lines = append(lines, "[A] Accept    [L] Allow All    [R] Reject")
-	lines = append(lines, "") // Empty line before bottom border
-
-	// Bottom border - minimal visual noise
 	lines = append(lines, border)
-
 	return strings.Join(lines, "\n")
 }
 

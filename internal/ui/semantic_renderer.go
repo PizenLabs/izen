@@ -256,26 +256,20 @@ type MutationRenderer struct {
 func (r *MutationRenderer) Render(v MutationCardViewModel) string {
 	var lines []string
 
-	// Calculate content width (accounting for borders and padding)
-	contentWidth := r.Width - 4 // 2 for borders, 2 for padding
+	contentWidth := r.Width - 4
 	if contentWidth < 20 {
 		contentWidth = 20
 	}
 
-	// Top border - minimal visual noise
+	expandStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 	border := strings.Repeat("─", contentWidth)
 	if len(border) == 0 {
 		border = "─"
 	}
-	lines = append(lines, border)
-	lines = append(lines, "") // Empty line for spacing
 
-	// Header - compact, one line: "Edit • getGreeting()" or "Edit • LICENSE"
 	header := "Edit"
 	if v.Target.Name != "" {
-		// Show symbol name first, fallback to file info if needed
 		symbolName := v.Target.Name
-		// Try to extract just the function/method name from qualified name
 		if dotIdx := strings.LastIndex(symbolName, "."); dotIdx >= 0 {
 			symbolName = symbolName[dotIdx+1:]
 		}
@@ -290,12 +284,39 @@ func (r *MutationRenderer) Render(v MutationCardViewModel) string {
 	} else {
 		header += " • Unknown"
 	}
-	lines = append(lines, header)
-	lines = append(lines, "") // Empty line for spacing
 
-	// Semantic Summary - max 2 lines above diff
+	// Footer with expand/collapse toggle + actions
+	expandIcon := "❯"
+	if v.Expanded {
+		expandIcon = "▼"
+	}
+	footerLine := fmt.Sprintf("%s  [A] Accept  [L] Allow All  [R] Reject",
+		expandStyle.Render(expandIcon))
+
+	lines = append(lines, border)
+	lines = append(lines, header)
+
+	if !v.Expanded {
+		scope := "Internal"
+		if v.Impact.HasAPIChanges {
+			scope = "Public"
+		}
+		riskLevel := v.Risk.Level
+		if riskLevel == "" {
+			riskLevel = "UNKNOWN"
+		}
+		lines = append(lines, expandStyle.Render("  Scope "+scope+" | Risk "+riskLevel))
+		lines = append(lines, "")
+		lines = append(lines, footerLine)
+		lines = append(lines, "")
+		lines = append(lines, border)
+		return strings.Join(lines, "\n")
+	}
+
+	// EXPANDED
+	lines = append(lines, "")
+
 	if v.SemanticSummary != "" {
-		// Wrap summary to fit width, limit to 2 lines max
 		wrappedSummary := wrapText(v.SemanticSummary, contentWidth)
 		if len(wrappedSummary) > 2 {
 			wrappedSummary = wrappedSummary[:2]
@@ -305,51 +326,38 @@ func (r *MutationRenderer) Render(v MutationCardViewModel) string {
 				lines = append(lines, line)
 			}
 		}
-		lines = append(lines, "") // Empty line after summary
+		lines = append(lines, "")
 	}
 
-	// Diff Renderer - the evidence (takes most space)
 	if v.Diff.Content != "" {
-		// Create a diff renderer and render the diff
 		dr := &DiffRenderer{Width: contentWidth, IsNewFile: v.IsNewFile}
 		diffRendered := dr.Render(v.Diff)
-
-		// Split the diff into lines and add them with minimal padding
 		diffLines := strings.Split(diffRendered, "\n")
 		for _, line := range diffLines {
 			if len(line) > 0 {
 				lines = append(lines, line)
 			}
 		}
-		lines = append(lines, "") // Empty line after diff
+		lines = append(lines, "")
 	}
 
-	// Scope - compact: "Scope Internal/Public"
 	scope := "Internal"
 	if v.Impact.HasAPIChanges {
 		scope = "Public"
 	}
-	lines = append(lines, formatCompactField("Scope", scope, contentWidth))
-
-	// Risk - compact: "Risk LOW"
 	riskLevel := v.Risk.Level
 	if riskLevel == "" {
 		riskLevel = "UNKNOWN"
 	}
+	lines = append(lines, formatCompactField("Scope", scope, contentWidth))
 	lines = append(lines, formatCompactField("Risk", riskLevel, contentWidth))
+	lines = append(lines, "")
 
-	// Checkpoint - compact: "Checkpoint cp-18312"
-	lines = append(lines, formatCompactField("Checkpoint", "cp-pending", contentWidth))
+	// Sticky footer with toggle + actions
+	lines = append(lines, footerLine)
+	lines = append(lines, "")
 
-	lines = append(lines, "") // Empty line before actions
-
-	// Decision Actions - always visible, sticky: "[A] Accept    [L] Allow All    [R] Reject"
-	lines = append(lines, "[A] Accept    [L] Allow All    [R] Reject")
-	lines = append(lines, "") // Empty line before bottom border
-
-	// Bottom border - minimal visual noise
 	lines = append(lines, border)
-
 	return strings.Join(lines, "\n")
 }
 
