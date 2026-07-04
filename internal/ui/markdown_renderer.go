@@ -651,12 +651,13 @@ func wrapMText(text string, width int) []string {
 
 		var currentLine strings.Builder
 		for _, word := range words {
-			if currentLine.Len() == 0 {
+			switch {
+			case currentLine.Len() == 0:
 				currentLine.WriteString(word)
-			} else if currentLine.Len()+1+len(word) <= width {
+			case currentLine.Len()+1+len(word) <= width:
 				currentLine.WriteString(" ")
 				currentLine.WriteString(word)
-			} else {
+			default:
 				result = append(result, currentLine.String())
 				currentLine.Reset()
 				currentLine.WriteString(word)

@@ -64,7 +64,7 @@ func (m *Manager) Default() (Provider, bool) {
 }
 
 func (m *Manager) Names() []string {
-	var names []string
+	names := make([]string, 0, len(m.providers))
 	for n := range m.providers {
 		names = append(names, n)
 	}

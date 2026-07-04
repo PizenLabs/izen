@@ -83,7 +83,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			m.streamCh <- streamErrMsg{err: err}
 			return
 		}
-		defer rawStream.Close()
+		defer func() { _ = rawStream.Close() }()
 
 		var full strings.Builder
 		tokIn, tokOut := 0, 0

@@ -86,7 +86,7 @@ func TestRunnerStderr(t *testing.T) {
 
 func TestRunInDir(t *testing.T) {
 	dir, _ := os.MkdirTemp("", "izen-exec-test-*")
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	if err := os.WriteFile(filepath.Join(dir, "marker.txt"), []byte("here"), 0644); err != nil {
 		t.Fatalf("write: %v", err)
@@ -166,7 +166,7 @@ func TestParseTestOutputWithCoverage(t *testing.T) {
 
 func TestPatchManager(t *testing.T) {
 	dir, _ := os.MkdirTemp("", "izen-patch-test-*")
-	defer os.RemoveAll(tmpDir(t, dir))
+	defer func() { _ = os.RemoveAll(tmpDir(t, dir)) }()
 
 	pm := NewPatchManager(dir)
 
@@ -229,7 +229,7 @@ func init() {
 
 func TestPatchListEmpty(t *testing.T) {
 	dir, _ := os.MkdirTemp("", "izen-patch-empty-*")
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	pm := NewPatchManager(dir)
 	patches, err := pm.List()
@@ -330,7 +330,7 @@ func TestSanitizeDiffContentEmptyInput(t *testing.T) {
 }
 func TestPatchLoadNotFound(t *testing.T) {
 	dir, _ := os.MkdirTemp("", "izen-patch-load-*")
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	pm := NewPatchManager(dir)
 	_, err := pm.Load("nonexistent")

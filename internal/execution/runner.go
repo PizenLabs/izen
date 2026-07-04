@@ -2,6 +2,8 @@ package execution
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -68,7 +70,7 @@ func (r *Runner) run(command, dir string) (*RunResult, error) {
 		}
 	}
 
-	cmd := exec.Command("sh", "-c", command)
+	cmd := exec.CommandContext(context.Background(), "sh", "-c", command)
 	cmd.Dir = dir
 
 	var stdout, stderr bytes.Buffer
@@ -81,7 +83,8 @@ func (r *Runner) run(command, dir string) (*RunResult, error) {
 	}
 
 	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
 		} else {
 			return result, err

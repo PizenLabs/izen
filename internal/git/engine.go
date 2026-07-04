@@ -2,6 +2,7 @@ package git
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -125,7 +126,7 @@ func (e *Engine) AmendCommit(message string) error {
 	if err := os.WriteFile(tmpFile, []byte(message), 0644); err != nil {
 		return err
 	}
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
 	_, err := e.git("commit", "--amend", "-F", tmpFile)
 	return err
 }
@@ -166,7 +167,7 @@ func (e *Engine) StashPop() (string, error) {
 }
 
 func (e *Engine) git(args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(context.Background(), "git", args...)
 	cmd.Dir = e.root
 
 	var stdout, stderr bytes.Buffer

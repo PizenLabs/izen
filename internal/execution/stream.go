@@ -101,10 +101,10 @@ func (sm *StreamMonitor) processLine(line string) {
 			if strings.Contains(lang, ":") {
 				parts := strings.SplitN(lang, ":", 2)
 				sm.currentFile = sm.resolvePath(strings.TrimSpace(parts[1]))
-			} else if lang == "diff" {
-				sm.inDiffBlock = true
-				sm.currentFile = ""
 			} else {
+				if lang == "diff" {
+					sm.inDiffBlock = true
+				}
 				sm.currentFile = ""
 			}
 			return

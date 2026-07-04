@@ -127,7 +127,7 @@ func TestBuilderQueryLookup(t *testing.T) {
 
 func TestBuilderWithDiff(t *testing.T) {
 	dir, _ := os.MkdirTemp("", "izen-ctx-diff-*")
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	ge := git.NewEngine(dir)
 	gitInit(t, dir)
@@ -369,7 +369,7 @@ func gitInit(t *testing.T, dir string) {
 
 func sh(t *testing.T, dir, name string, args ...string) {
 	t.Helper()
-	cmd := exec.Command(name, args...)
+	cmd := exec.CommandContext(t.Context(), name, args...)
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("%s %v: %s", name, args, string(out))

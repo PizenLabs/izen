@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -144,7 +145,7 @@ func (g *GitHubGateway) doRequest(method, path string, body interface{}) ([]byte
 		reqBody = strings.NewReader(string(data))
 	}
 
-	req, err := http.NewRequest(method, "https://api.github.com"+path, reqBody)
+	req, err := http.NewRequestWithContext(context.Background(), method, "https://api.github.com"+path, reqBody)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +160,7 @@ func (g *GitHubGateway) doRequest(method, path string, body interface{}) ([]byte
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respData, err := io.ReadAll(resp.Body)
 	if err != nil {

@@ -131,7 +131,7 @@ func Load() (*Config, error) {
 			var cfg Config
 			if err := yaml.Unmarshal(data, &cfg); err == nil {
 				if saveErr := Save(&cfg); saveErr == nil {
-					os.Remove(legacy)
+					_ = os.Remove(legacy)
 					fmt.Fprintf(os.Stderr, "izen: migrated config from %s to %s\n", legacy, path)
 				}
 			}

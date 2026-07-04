@@ -394,7 +394,7 @@ var dangerousPatterns = []struct {
 }
 
 func (ra *RiskAuditor) defaultRules() []RiskRule {
-	var rules []RiskRule
+	rules := make([]RiskRule, 0, len(dangerousPatterns))
 	for _, dp := range dangerousPatterns {
 		p := dp
 		rules = append(rules, RiskRule{

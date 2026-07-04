@@ -65,7 +65,7 @@ func writeAppend(path string, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("open history %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := f.Write(data); err != nil {
 		return fmt.Errorf("write history: %w", err)
 	}

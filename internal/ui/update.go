@@ -342,6 +342,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case tea.MouseButtonLeft:
+				// Check if click is on the active widget area (proposal header)
+				if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
+					widgetStartY := m.widgetScreenStartY()
+					widgetHeight := m.activeWidgetHeight()
+					if widgetStartY >= 0 && mouseMsg.Y >= widgetStartY && mouseMsg.Y < widgetStartY+widgetHeight {
+						// Click is within the widget area
+						headerLineIdx := 1 // Header is typically the second line (after top border)
+						if mouseMsg.Y == widgetStartY+headerLineIdx {
+							// Toggle expanded state on header click
+							m.pendingProposals[0].Expanded = !m.pendingProposals[0].Expanded
+							m.rebuildViewport()
+							return m, nil
+						}
+					}
+				}
+
 				point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y)
 				if !ok {
 					m.mouseSelecting = false
@@ -570,8 +586,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				data = append(data, '\n')
 				auditPath := filepath.Join(".izen", "audit", "mutations.log")
 				if f, err := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600); err == nil {
-					f.Write(data)
-					f.Close()
+					_, _ = f.Write(data)
+					_ = f.Close()
 				}
 			}
 
@@ -789,7 +805,7 @@ func compileTaskListMarkdown(tasks *[]plan.Task) string {
 		} else if task.Status == "done" || task.IsDone {
 			glyph = "✓"
 		}
-		b.WriteString(fmt.Sprintf("%s **%s**: %s | %s\n\n", glyph, task.Type, task.Target, task.Description))
+		fmt.Fprintf(&b, "%s **%s**: %s | %s\n\n", glyph, task.Type, task.Target, task.Description)
 	}
 
 	return b.String()

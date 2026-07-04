@@ -335,8 +335,11 @@ func TypeCheck(root string) (*types.Package, *token.FileSet, error) {
 	fset := token.NewFileSet()
 
 	var allFiles []*ast.File
-	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
 			return nil
 		}
 		if !strings.HasSuffix(path, ".go") {
@@ -348,12 +351,12 @@ func TypeCheck(root string) (*types.Package, *token.FileSet, error) {
 
 		src, err := os.ReadFile(path)
 		if err != nil {
-			return nil
+			return err
 		}
 
 		f, err := parser.ParseFile(fset, path, src, parser.ParseComments)
 		if err != nil {
-			return nil
+			return err
 		}
 		allFiles = append(allFiles, f)
 		return nil

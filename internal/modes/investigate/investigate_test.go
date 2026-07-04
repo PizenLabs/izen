@@ -63,32 +63,32 @@ func TestStateMachineFullPath(t *testing.T) {
 func TestStateMachineStopCondition(t *testing.T) {
 	sm := NewStateMachine(StateConfig{MaxLoops: 3})
 
-	sm.Transition(StateHypothesize)
-	sm.Transition(StateSearch)
-	sm.Transition(StateGather)
-	sm.Transition(StateEvaluate)
-	sm.Transition(StateNarrow)
+	_ = sm.Transition(StateHypothesize)
+	_ = sm.Transition(StateSearch)
+	_ = sm.Transition(StateGather)
+	_ = sm.Transition(StateEvaluate)
+	_ = sm.Transition(StateNarrow)
 
 	if sm.ShouldStop() {
 		t.Fatal("should not stop at 0 completed iterations after first hypothesize")
 	}
 
-	sm.Transition(StateHypothesize)
-	sm.Transition(StateSearch)
-	sm.Transition(StateGather)
-	sm.Transition(StateEvaluate)
-	sm.Transition(StateNarrow)
+	_ = sm.Transition(StateHypothesize)
+	_ = sm.Transition(StateSearch)
+	_ = sm.Transition(StateGather)
+	_ = sm.Transition(StateEvaluate)
+	_ = sm.Transition(StateNarrow)
 
 	if sm.ShouldStop() {
 		t.Fatal("should not stop at 1 iteration")
 	}
 
-	sm.Transition(StateHypothesize)
-	sm.Transition(StateSearch)
-	sm.Transition(StateGather)
-	sm.Transition(StateEvaluate)
-	sm.Transition(StateNarrow)
-	sm.Transition(StateHypothesize)
+	_ = sm.Transition(StateHypothesize)
+	_ = sm.Transition(StateSearch)
+	_ = sm.Transition(StateGather)
+	_ = sm.Transition(StateEvaluate)
+	_ = sm.Transition(StateNarrow)
+	_ = sm.Transition(StateHypothesize)
 
 	if !sm.ShouldStop() {
 		t.Fatal("should stop at 3 iterations (>= maxLoops)")
@@ -354,8 +354,8 @@ func TestExtractPackageFromFile(t *testing.T) {
 
 func TestStateMachineReset(t *testing.T) {
 	sm := NewStateMachine(DefaultStateConfig())
-	sm.Transition(StateHypothesize)
-	sm.Transition(StateSearch)
+	_ = sm.Transition(StateHypothesize)
+	_ = sm.Transition(StateSearch)
 
 	sm.Reset()
 	if sm.Current() != StateObserve {
@@ -373,16 +373,16 @@ func TestStateMachineIterationCount(t *testing.T) {
 		t.Fatal("expected 0 iterations initially")
 	}
 
-	sm.Transition(StateHypothesize)
+	_ = sm.Transition(StateHypothesize)
 	if sm.IterationCount() != 1 {
 		t.Fatalf("expected 1 iteration, got %d", sm.IterationCount())
 	}
 
-	sm.Transition(StateSearch)
-	sm.Transition(StateGather)
-	sm.Transition(StateEvaluate)
-	sm.Transition(StateNarrow)
-	sm.Transition(StateHypothesize)
+	_ = sm.Transition(StateSearch)
+	_ = sm.Transition(StateGather)
+	_ = sm.Transition(StateEvaluate)
+	_ = sm.Transition(StateNarrow)
+	_ = sm.Transition(StateHypothesize)
 
 	if sm.IterationCount() != 2 {
 		t.Fatalf("expected 2 iterations, got %d", sm.IterationCount())
@@ -803,7 +803,7 @@ func TestParseStackFramesVsEmpty(t *testing.T) {
 func TestNewRunResultAdapterInterface(t *testing.T) {
 	adapter := NewRunResultAdapter("out", "err", 1)
 
-	var iface StdoutStderrer = adapter
+	var iface = adapter
 	if iface.StdOut() != "out" {
 		t.Fatal("StdoutStderrer interface mismatch")
 	}
@@ -847,7 +847,7 @@ func TestEngineWithRetriever(t *testing.T) {
 
 func TestEngineStateDone(t *testing.T) {
 	eng := NewEngine(".", "test", nil, nil)
-	eng.State.Transition(StateDone)
+	_ = eng.State.Transition(StateDone)
 
 	err := eng.executeCurrentState()
 	if err != nil {

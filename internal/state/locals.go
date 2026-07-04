@@ -61,7 +61,7 @@ func InitLocalState(root string) error {
 			return fmt.Errorf("mkdir %s: %w", d, err)
 		}
 	}
-	WriteRuntimeMeta(root, RuntimeMeta{
+	_ = WriteRuntimeMeta(root, RuntimeMeta{
 		LxVersion:     "0.1.1",
 		GraphVersion:  "v1",
 		SchemaVersion: "1",
@@ -126,9 +126,9 @@ func MigrateLegacyFiles(root string) error {
 		if _, err := os.Stat(newHistory); os.IsNotExist(err) {
 			data, err := os.ReadFile(oldHistory)
 			if err == nil {
-				os.WriteFile(newHistory, data, 0644)
+				_ = os.WriteFile(newHistory, data, 0644)
 			}
-			os.Remove(oldHistory)
+			_ = os.Remove(oldHistory)
 		}
 	}
 

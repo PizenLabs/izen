@@ -229,8 +229,12 @@ func (m *model) viewportHeight() int {
 	suggestionH := m.suggestionPaletteHeight()
 
 	h := m.height - baseHeight - topBarH - widgetH - suggestionH - viewportPadding
-	if h < 3 {
-		h = 3
+
+	// Safety guard: viewport must never collapse below 5 lines.
+	// When a proposal widget is active, this ensures the conversation
+	// history remains scrollable even on small terminals.
+	if h < 5 {
+		h = 5
 	}
 	return h
 }
@@ -249,6 +253,25 @@ func (m *model) suggestionPaletteHeight() int {
 	}
 	palette := m.renderSuggestions(m.width)
 	return len(strings.Split(palette, "\n"))
+}
+
+// widgetScreenStartY calculates the screen Y position where the active widget begins.
+// Returns -1 if no widget is currently rendered.
+func (m *model) widgetScreenStartY() int {
+	if m.state != StateAwaitingApproval || len(m.pendingProposals) == 0 {
+		return -1
+	}
+
+	y := 0
+	// Top Bar
+	if m.renderTopBar() != "" {
+		y++
+	}
+	// Viewport
+	y += m.vp.Height
+	// Suggestions
+	y += m.suggestionPaletteHeight()
+	return y
 }
 
 // wrapStreamText wraps raw text lines dynamically during an active live stream.
@@ -386,7 +409,7 @@ func (m *model) loadHistory() {
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := sc.Text()
@@ -409,11 +432,11 @@ func (m *model) saveHistory() {
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if len(m.history) == 0 {
 		return
 	}
 	last := m.history[len(m.history)-1]
 	b, _ := json.Marshal(last)
-	fmt.Fprintf(f, "%s\n", b)
+	_, _ = fmt.Fprintf(f, "%s\n", b)
 }

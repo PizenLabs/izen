@@ -134,7 +134,7 @@ func (r *Router) handleModeWithArg(modeStr string) (bool, tea.Cmd) {
 		return true, nil
 	}
 	r.sess.SetMode(mode)
-	r.sess.Save()
+	_ = r.sess.Save()
 	r.sess.AddMessage("system", fmt.Sprintf("Switched to %s mode", mode), 1)
 	return true, nil
 }

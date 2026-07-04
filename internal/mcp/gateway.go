@@ -78,7 +78,7 @@ func (m *Manager) Get(name string) (Gateway, bool) {
 }
 
 func (m *Manager) List() []string {
-	var names []string
+	names := make([]string, 0, len(m.gateways))
 	for name := range m.gateways {
 		names = append(names, name)
 	}

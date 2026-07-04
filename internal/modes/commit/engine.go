@@ -1,6 +1,7 @@
 package commit
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -32,7 +33,7 @@ type CommitMessage struct {
 // GetStagedDiff extracts the staged git changes up to 180 lines, matching the reference script.
 func GetStagedDiff() (string, string, error) {
 	// Check status porcelain
-	statusCmd := exec.Command("git", "status", "--porcelain")
+	statusCmd := exec.CommandContext(context.Background(), "git", "status", "--porcelain")
 	statusOut, err := statusCmd.Output()
 	if err != nil {
 		return "", "", err
@@ -43,7 +44,7 @@ func GetStagedDiff() (string, string, error) {
 	}
 
 	// Fetch unified cached diff context
-	diffCmd := exec.Command("sh", "-c", "git diff --cached -w -U3 | head -n 180")
+	diffCmd := exec.CommandContext(context.Background(), "sh", "-c", "git diff --cached -w -U3 | head -n 180")
 	diffOut, _ := diffCmd.Output()
 	diffStr := strings.TrimSpace(string(diffOut))
 
@@ -221,8 +222,8 @@ func ExecuteCommit(msg CommitMessage) error {
 	if err := os.WriteFile(tmpFile, []byte(finalMessage), 0644); err != nil {
 		return err
 	}
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
 
-	cmd := exec.Command("git", "commit", "-F", tmpFile)
+	cmd := exec.CommandContext(context.Background(), "git", "commit", "-F", tmpFile)
 	return cmd.Run()
 }

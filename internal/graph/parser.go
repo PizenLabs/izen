@@ -67,7 +67,7 @@ func (p *Parser) ParseFile(root, relPath string, lang Language) (*FileNode, erro
 
 	tree, err := parser.ParseCtx(context.Background(), nil, source)
 	if err != nil {
-		return &fn, nil
+		return &fn, err
 	}
 
 	rootNode := tree.RootNode()
@@ -219,7 +219,7 @@ func extractGoTypeSpecs(n *sitter.Node, src []byte, file string, symbols *[]Symb
 		exported := isExportedName(name)
 
 		typeNode := child.ChildByFieldName("type")
-		var kind SymbolKind = SymbolType
+		var kind = SymbolType
 
 		if typeNode != nil {
 			switch typeNode.Type() {

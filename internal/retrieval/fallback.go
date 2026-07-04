@@ -3,6 +3,8 @@ package retrieval
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -54,12 +56,13 @@ func (fc *FallbackChain) Ripgrep(pattern string, filePattern string) *ResultSet 
 		args = append(args, "-g", filePattern)
 	}
 
-	cmd := exec.Command("rg", args...)
+	cmd := exec.CommandContext(context.Background(), "rg", args...)
 	cmd.Dir = fc.root
 
 	out, err := cmd.Output()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			if exitErr.ExitCode() == 1 {
 				return rs
 			}
@@ -92,12 +95,13 @@ func (fc *FallbackChain) Ripgrep(pattern string, filePattern string) *ResultSet 
 func (fc *FallbackChain) Grep(pattern string) *ResultSet {
 	rs := &ResultSet{Strategy: "grep.text"}
 
-	cmd := exec.Command("grep", "-rn", pattern, fc.root)
+	cmd := exec.CommandContext(context.Background(), "grep", "-rn", pattern, fc.root)
 	cmd.Dir = fc.root
 
 	out, err := cmd.Output()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			if exitErr.ExitCode() == 1 {
 				return rs
 			}
@@ -159,7 +163,7 @@ func (fc *FallbackChain) ReadLines(path string, startLine, endLine int) *ResultS
 		rs.Error = err.Error()
 		return rs
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	var content strings.Builder
 	scanner := bufio.NewScanner(file)
@@ -197,7 +201,7 @@ func parseRgLine(line string) (file string, lineNum int, content string) {
 	}
 	file = parts[0]
 	lineNum = 0
-	fmt.Sscanf(parts[1], "%d", &lineNum)
+	_, _ = fmt.Sscanf(parts[1], "%d", &lineNum)
 	return file, lineNum, parts[2]
 }
 
@@ -208,6 +212,6 @@ func parseGrepLine(line string) (file string, lineNum int, content string) {
 	}
 	file = parts[0]
 	lineNum = 0
-	fmt.Sscanf(parts[1], "%d", &lineNum)
+	_, _ = fmt.Sscanf(parts[1], "%d", &lineNum)
 	return file, lineNum, parts[2]
 }

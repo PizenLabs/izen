@@ -336,7 +336,7 @@ func (e *Engine) stateVerify() error {
 				summary.PassedN, summary.FailedN), "", 0, 0.6)
 
 			if summary.Passed && summary.FailedN == 0 {
-				e.State.Transition(StatePropose)
+				_ = e.State.Transition(StatePropose)
 				return nil
 			}
 		}

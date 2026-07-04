@@ -133,7 +133,7 @@ func RenderNumberedDiff(diffText string, width int) string {
 			inHunk = true
 			// parse @@ -oldStart,oldCount +newStart,newCount @@
 			var oS, oC, nS, nC int
-			fmt.Sscanf(line, "@@ -%d,%d +%d,%d @@", &oS, &oC, &nS, &nC)
+			_, _ = fmt.Sscanf(line, "@@ -%d,%d +%d,%d @@", &oS, &oC, &nS, &nC)
 			if oS > 0 {
 				oldStart = oS
 			}

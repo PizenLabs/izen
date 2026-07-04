@@ -2,6 +2,7 @@ package review
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -49,15 +50,15 @@ type DiffAnalysis struct {
 }
 
 func (da *DiffAnalyzer) getChangedFiles() ([]DiffFile, error) {
-	cmd := exec.Command("git", "diff", "--no-color", "--diff-filter=ACDMRTUXB")
+	cmd := exec.CommandContext(context.Background(), "git", "diff", "--no-color", "--diff-filter=ACDMRTUXB")
 	cmd.Dir = da.root
 	out, err := cmd.Output()
 	if err != nil {
-		cmd2 := exec.Command("git", "diff", "--cached", "--no-color")
+		cmd2 := exec.CommandContext(context.Background(), "git", "diff", "--cached", "--no-color")
 		cmd2.Dir = da.root
 		out2, err2 := cmd2.Output()
 		if err2 != nil {
-			cmd3 := exec.Command("git", "status", "--porcelain")
+			cmd3 := exec.CommandContext(context.Background(), "git", "status", "--porcelain")
 			cmd3.Dir = da.root
 			out3, _ := cmd3.Output()
 			return da.parsePorcelain(string(out3))
@@ -130,15 +131,16 @@ func (da *DiffAnalyzer) parseUnifiedDiff(diff string) ([]DiffFile, error) {
 			currentHunk = &DiffHunk{}
 			parts := strings.Split(line, " ")
 			for _, part := range parts {
-				if strings.HasPrefix(part, "-") && strings.Contains(part, ",") {
-					fmt.Sscanf(part, "-%d,%d", &currentHunk.StartOld, &currentHunk.CountOld)
-				} else if strings.HasPrefix(part, "+") && strings.Contains(part, ",") {
-					fmt.Sscanf(part, "+%d,%d", &currentHunk.StartNew, &currentHunk.CountNew)
-				} else if strings.HasPrefix(part, "-") {
-					fmt.Sscanf(part, "-%d", &currentHunk.StartOld)
+				switch {
+				case strings.HasPrefix(part, "-") && strings.Contains(part, ","):
+					_, _ = fmt.Sscanf(part, "-%d,%d", &currentHunk.StartOld, &currentHunk.CountOld)
+				case strings.HasPrefix(part, "+") && strings.Contains(part, ","):
+					_, _ = fmt.Sscanf(part, "+%d,%d", &currentHunk.StartNew, &currentHunk.CountNew)
+				case strings.HasPrefix(part, "-"):
+					_, _ = fmt.Sscanf(part, "-%d", &currentHunk.StartOld)
 					currentHunk.CountOld = 1
-				} else if strings.HasPrefix(part, "+") {
-					fmt.Sscanf(part, "+%d", &currentHunk.StartNew)
+				case strings.HasPrefix(part, "+"):
+					_, _ = fmt.Sscanf(part, "+%d", &currentHunk.StartNew)
 					currentHunk.CountNew = 1
 				}
 			}
@@ -207,7 +209,7 @@ func (da *DiffAnalyzer) mapStatus(staging, worktree string) string {
 }
 
 func (da *DiffAnalyzer) getBranch() (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
+	cmd := exec.CommandContext(context.Background(), "git", "rev-parse", "--abbrev-ref", "HEAD")
 	cmd.Dir = da.root
 	out, err := cmd.Output()
 	if err != nil {
@@ -225,13 +227,13 @@ func (da *DiffAnalyzer) getBaseBranch() string {
 		return branch + "~1"
 	}
 
-	cmd := exec.Command("git", "merge-base", branch, "main")
+	cmd := exec.CommandContext(context.Background(), "git", "merge-base", branch, "main")
 	cmd.Dir = da.root
 	if out, err := cmd.Output(); err == nil && len(out) > 0 {
 		return strings.TrimSpace(string(out))
 	}
 
-	cmd2 := exec.Command("git", "merge-base", branch, "master")
+	cmd2 := exec.CommandContext(context.Background(), "git", "merge-base", branch, "master")
 	cmd2.Dir = da.root
 	if out2, err := cmd2.Output(); err == nil && len(out2) > 0 {
 		return strings.TrimSpace(string(out2))
@@ -241,7 +243,7 @@ func (da *DiffAnalyzer) getBaseBranch() string {
 }
 
 func (da *DiffAnalyzer) getHash() (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--short", "HEAD")
+	cmd := exec.CommandContext(context.Background(), "git", "rev-parse", "--short", "HEAD")
 	cmd.Dir = da.root
 	out, err := cmd.Output()
 	if err != nil {
@@ -259,7 +261,7 @@ func (da *DiffAnalyzer) hasChanges() bool {
 	if !da.isRepo() {
 		return false
 	}
-	cmd := exec.Command("git", "status", "--porcelain")
+	cmd := exec.CommandContext(context.Background(), "git", "status", "--porcelain")
 	cmd.Dir = da.root
 	out, err := cmd.Output()
 	if err != nil {

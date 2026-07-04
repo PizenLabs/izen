@@ -23,8 +23,7 @@ func (m confirmModel) View() string {
 }
 
 func (m confirmModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	if msg, ok := msg.(tea.KeyMsg); ok {
 		switch msg.String() {
 		case "y", "Y":
 			m.result = true

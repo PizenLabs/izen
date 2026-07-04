@@ -215,7 +215,7 @@ func (m *model) renderArch() string {
 			continue
 		}
 
-		b.WriteString(fmt.Sprintf("  %s/\n", pkg.Name))
+		fmt.Fprintf(&b, "  %s/\n", pkg.Name)
 		totalStructs += len(pkg.Structs)
 		totalRoutes += len(pkg.Routes)
 
@@ -249,9 +249,9 @@ func (m *model) renderArch() string {
 	}
 
 	b.WriteString("---\n")
-	b.WriteString(fmt.Sprintf("packages: %d  |  ", len(packages)))
-	b.WriteString(fmt.Sprintf("types/structs/interfaces: %d  |  ", totalStructs))
-	b.WriteString(fmt.Sprintf("route-like symbols: %d\n", totalRoutes))
+	fmt.Fprintf(&b, "packages: %d  |  ", len(packages))
+	fmt.Fprintf(&b, "types/structs/interfaces: %d  |  ", totalStructs)
+	fmt.Fprintf(&b, "route-like symbols: %d\n", totalRoutes)
 
 	return b.String()
 }

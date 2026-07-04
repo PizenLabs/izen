@@ -54,11 +54,11 @@ func TestStateMachineInvalidTransitions(t *testing.T) {
 
 func TestStateMachineDoneHasNoTransitions(t *testing.T) {
 	sm := NewStateMachine(DefaultStateConfig())
-	sm.Transition(StateAnalyzeDiff)
-	sm.Transition(StateImpactRadius)
-	sm.Transition(StateRiskAudit)
-	sm.Transition(StateReport)
-	sm.Transition(StateDone)
+	_ = sm.Transition(StateAnalyzeDiff)
+	_ = sm.Transition(StateImpactRadius)
+	_ = sm.Transition(StateRiskAudit)
+	_ = sm.Transition(StateReport)
+	_ = sm.Transition(StateDone)
 
 	if err := sm.Transition(StateCollect); err == nil {
 		t.Fatal("expected error transitioning from Done")
@@ -67,10 +67,10 @@ func TestStateMachineDoneHasNoTransitions(t *testing.T) {
 
 func TestStateMachineLoopBack(t *testing.T) {
 	sm := NewStateMachine(DefaultStateConfig())
-	sm.Transition(StateAnalyzeDiff)
-	sm.Transition(StateImpactRadius)
-	sm.Transition(StateRiskAudit)
-	sm.Transition(StateReport)
+	_ = sm.Transition(StateAnalyzeDiff)
+	_ = sm.Transition(StateImpactRadius)
+	_ = sm.Transition(StateRiskAudit)
+	_ = sm.Transition(StateReport)
 
 	if err := sm.Transition(StateAnalyzeDiff); err != nil {
 		t.Fatalf("expected Report->AnalyzeDiff to be valid: %v", err)
@@ -83,11 +83,11 @@ func TestStateMachineShouldStop(t *testing.T) {
 		t.Fatal("should not stop at start")
 	}
 
-	sm.Transition(StateAnalyzeDiff)
-	sm.Transition(StateImpactRadius)
-	sm.Transition(StateRiskAudit)
-	sm.Transition(StateReport)
-	sm.Transition(StateDone)
+	_ = sm.Transition(StateAnalyzeDiff)
+	_ = sm.Transition(StateImpactRadius)
+	_ = sm.Transition(StateRiskAudit)
+	_ = sm.Transition(StateReport)
+	_ = sm.Transition(StateDone)
 
 	if !sm.ShouldStop() {
 		t.Fatal("should stop at Done")
@@ -97,10 +97,10 @@ func TestStateMachineShouldStop(t *testing.T) {
 func TestStateMachineMaxIterations(t *testing.T) {
 	sm := NewStateMachine(StateConfig{MaxIterations: 2})
 	for i := 0; i < 2; i++ {
-		sm.Transition(StateAnalyzeDiff)
-		sm.Transition(StateImpactRadius)
-		sm.Transition(StateRiskAudit)
-		sm.Transition(StateReport)
+		_ = sm.Transition(StateAnalyzeDiff)
+		_ = sm.Transition(StateImpactRadius)
+		_ = sm.Transition(StateRiskAudit)
+		_ = sm.Transition(StateReport)
 	}
 
 	if !sm.ShouldStop() {
@@ -110,8 +110,8 @@ func TestStateMachineMaxIterations(t *testing.T) {
 
 func TestStateMachineHistory(t *testing.T) {
 	sm := NewStateMachine(DefaultStateConfig())
-	sm.Transition(StateAnalyzeDiff)
-	sm.Transition(StateImpactRadius)
+	_ = sm.Transition(StateAnalyzeDiff)
+	_ = sm.Transition(StateImpactRadius)
 
 	history := sm.History()
 	expected := []State{StateCollect, StateAnalyzeDiff, StateImpactRadius}
@@ -127,7 +127,7 @@ func TestStateMachineHistory(t *testing.T) {
 
 func TestStateMachineReset(t *testing.T) {
 	sm := NewStateMachine(DefaultStateConfig())
-	sm.Transition(StateAnalyzeDiff)
+	_ = sm.Transition(StateAnalyzeDiff)
 	sm.Reset()
 
 	if sm.Current() != StateCollect {
@@ -345,7 +345,7 @@ func TestIsRepo(t *testing.T) {
 		t.Fatal("temp dir should not be a repo")
 	}
 
-	os.MkdirAll(filepath.Join(dir, ".git"), 0755)
+	_ = os.MkdirAll(filepath.Join(dir, ".git"), 0755)
 	if !da.isRepo() {
 		t.Fatal("should be a repo after creating .git")
 	}
@@ -406,7 +406,7 @@ func DoSomething() {
 }
 `
 	path := filepath.Join(dir, "main.go")
-	os.WriteFile(path, []byte(content), 0644)
+	_ = os.WriteFile(path, []byte(content), 0644)
 
 	ra := NewRiskAuditor(dir)
 	findings := ra.Audit([]DiffFile{{
@@ -434,7 +434,7 @@ func TestRiskAuditorSecretDetection(t *testing.T) {
 var secret = "sk-1234567890abcdef"
 `
 	path := filepath.Join(dir, "config.go")
-	os.WriteFile(path, []byte(content), 0644)
+	_ = os.WriteFile(path, []byte(content), 0644)
 
 	ra := NewRiskAuditor(dir)
 	findings := ra.Audit([]DiffFile{{
@@ -466,7 +466,7 @@ func Query(db *sql.DB, id string) {
 }
 `
 	path := filepath.Join(dir, "db.go")
-	os.WriteFile(path, []byte(content), 0644)
+	_ = os.WriteFile(path, []byte(content), 0644)
 
 	ra := NewRiskAuditor(dir)
 	findings := ra.Audit([]DiffFile{{
@@ -496,7 +496,7 @@ func start() {
 }
 `
 	path := filepath.Join(dir, "main.go")
-	os.WriteFile(path, []byte(content), 0644)
+	_ = os.WriteFile(path, []byte(content), 0644)
 
 	ra := NewRiskAuditor(dir)
 	findings := ra.Audit([]DiffFile{{
@@ -531,7 +531,7 @@ func unsafe() {
 }
 `
 	path := filepath.Join(dir, "main.go")
-	os.WriteFile(path, []byte(content), 0644)
+	_ = os.WriteFile(path, []byte(content), 0644)
 
 	ra := NewRiskAuditor(dir)
 	findings := ra.Audit([]DiffFile{{
@@ -560,7 +560,7 @@ func DoSomething() {
 }
 `
 	path := filepath.Join(dir, "main.go")
-	os.WriteFile(path, []byte(content), 0644)
+	_ = os.WriteFile(path, []byte(content), 0644)
 
 	ra := NewRiskAuditor(dir)
 	findings := ra.Audit([]DiffFile{{
@@ -589,7 +589,7 @@ func TestRiskAuditorTodoMarkerDetection(t *testing.T) {
 func main() {}
 `
 	path := filepath.Join(dir, "main.go")
-	os.WriteFile(path, []byte(content), 0644)
+	_ = os.WriteFile(path, []byte(content), 0644)
 
 	ra := NewRiskAuditor(dir)
 	findings := ra.Audit([]DiffFile{{
@@ -619,7 +619,7 @@ func main() {
 }
 `
 	path := filepath.Join(dir, "main.go")
-	os.WriteFile(path, []byte(content), 0644)
+	_ = os.WriteFile(path, []byte(content), 0644)
 
 	ra := NewRiskAuditor(dir)
 	findings := ra.Audit([]DiffFile{{
@@ -683,7 +683,7 @@ func main() {
 }
 `
 	path := filepath.Join(dir, "main.go")
-	os.WriteFile(path, []byte(content), 0644)
+	_ = os.WriteFile(path, []byte(content), 0644)
 
 	ra := NewRiskAuditor(dir)
 	findings := ra.Audit([]DiffFile{{
@@ -715,7 +715,7 @@ func main() {
 }
 `
 	path := filepath.Join(dir, "main.go")
-	os.WriteFile(path, []byte(content), 0644)
+	_ = os.WriteFile(path, []byte(content), 0644)
 
 	ra := NewRiskAuditor(dir)
 	findings := ra.Audit([]DiffFile{{
@@ -742,7 +742,7 @@ func TestRiskAuditorGenericFile(t *testing.T) {
 api_key = "12345"
 `
 	path := filepath.Join(dir, "config.yml")
-	os.WriteFile(path, []byte(content), 0644)
+	_ = os.WriteFile(path, []byte(content), 0644)
 
 	ra := NewRiskAuditor(dir)
 	findings := ra.Audit([]DiffFile{{
@@ -889,7 +889,7 @@ func complex() {
 }
 `
 	path := filepath.Join(dir, "main.go")
-	os.WriteFile(path, []byte(content), 0644)
+	_ = os.WriteFile(path, []byte(content), 0644)
 
 	ia := NewImpactAnalyzer(dir, nil)
 	c := ia.estimateComplexity([]string{"main.go"})
@@ -902,7 +902,7 @@ func TestImpactAnalyzerComplexityParseError(t *testing.T) {
 	dir := t.TempDir()
 	content := `this is not valid go {{{`
 	path := filepath.Join(dir, "bad.go")
-	os.WriteFile(path, []byte(content), 0644)
+	_ = os.WriteFile(path, []byte(content), 0644)
 
 	ia := NewImpactAnalyzer(dir, nil)
 	c := ia.estimateComplexity([]string{"bad.go"})
@@ -969,7 +969,7 @@ func TestEngineRunNoRepo(t *testing.T) {
 
 func TestEngineRunCleanRepo(t *testing.T) {
 	dir := t.TempDir()
-	os.MkdirAll(filepath.Join(dir, ".git"), 0755)
+	_ = os.MkdirAll(filepath.Join(dir, ".git"), 0755)
 
 	e := NewEngine(dir, &mockRetriever{}, nil)
 	result, err := e.Run()
@@ -983,8 +983,8 @@ func TestEngineRunCleanRepo(t *testing.T) {
 
 func TestEngineStateCollectWithDiff(t *testing.T) {
 	dir := t.TempDir()
-	os.MkdirAll(filepath.Join(dir, ".git"), 0755)
-	os.WriteFile(filepath.Join(dir, "test.go"), []byte("package main\n"), 0644)
+	_ = os.MkdirAll(filepath.Join(dir, ".git"), 0755)
+	_ = os.WriteFile(filepath.Join(dir, "test.go"), []byte("package main\n"), 0644)
 
 	e := NewEngine(dir, &mockRetriever{}, nil)
 	result := &ReviewResult{}

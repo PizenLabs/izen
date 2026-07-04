@@ -111,7 +111,7 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	if err != nil {
 		return nil, fmt.Errorf("ollama: do request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -193,7 +193,7 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("ollama: status %d: %s", resp.StatusCode, string(respBody))
 	}

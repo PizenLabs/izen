@@ -67,7 +67,7 @@ func TestLynxCacheExists(t *testing.T) {
 		t.Error("expected false for non-existent .lynx dir")
 	}
 
-	os.MkdirAll(filepath.Join(tmpDir, ".lynx"), 0755)
+	_ = os.MkdirAll(filepath.Join(tmpDir, ".lynx"), 0755)
 	if !LynxCacheExists(tmpDir) {
 		t.Error("expected true for existing .lynx dir")
 	}

@@ -3,6 +3,7 @@
 package lynx
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -66,7 +67,7 @@ func UnpackBinary(root string) (string, error) {
 		cargoPath, err := exec.LookPath("cargo")
 		if err == nil {
 			fmt.Fprintf(os.Stderr, "izen: building lynx from source...\n")
-			build := exec.Command(cargoPath, "build", "--release")
+			build := exec.CommandContext(context.Background(), cargoPath, "build", "--release")
 			build.Dir = lynxSourceDir
 			build.Stdout = os.Stderr
 			build.Stderr = os.Stderr
