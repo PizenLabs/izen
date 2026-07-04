@@ -1,0 +1,52 @@
+name: Codecov
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    name: Upload Coverage
+    runs-on: ubuntu-latest
+
+    if: >
+      github.event.workflow_run.conclusion == 'success'
+
+    timeout-minutes: 10
+
+    steps:
+      - name: Download Go Coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-go
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download Rust Coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-rust
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show downloaded files
+        run: |
+          pwd
+          ls -R
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: |
+            coverage-go.out
+            lcov.info
+          fail_ci_if_error: true
+          verbose: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
