@@ -44,9 +44,10 @@ type SemanticMutation struct {
 
 // SemanticProposal encapsulates a proposed change before it becomes a mutation.
 type SemanticProposal struct {
-	ID      string
-	Target  SemanticTarget
-	Diff    string
-	Risk    SemanticRisk
-	Context SemanticContext
+	ID       string
+	Target   SemanticTarget
+	Diff     string
+	Risk     SemanticRisk
+	Context  SemanticContext
+	Expanded bool // UI state: whether the diff is expanded or collapsed
 }

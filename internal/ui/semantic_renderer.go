@@ -68,7 +68,8 @@ func (r *ImpactRenderer) Render(v ImpactCardViewModel) string {
 
 // DiffRenderer renders standard semantic/syntax-highlighted diff regions.
 type DiffRenderer struct {
-	Width int
+	Width     int
+	IsNewFile bool // When true, render single-column line numbers (new file creation)
 }
 
 func (r *DiffRenderer) Render(v DiffCardViewModel) string {
@@ -128,6 +129,9 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 	leftLineNum := 1
 	rightLineNum := 1
 
+	// Use Surface2 color (#585b70) for line number gutter — subtle and clean
+	lineNumStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+
 	for _, line := range lines {
 		if strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") {
 			continue
@@ -154,50 +158,88 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 			continue
 		}
 
-		if strings.HasPrefix(line, "-") {
-			cleanLine := strings.TrimPrefix(line, "-")
-			wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
+		if r.IsNewFile {
+			// NEW FILE: Single-column line numbers (right-aligned, fixed padding)
+			if strings.HasPrefix(line, "+") {
+				cleanLine := strings.TrimPrefix(line, "+")
+				wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
 
-			for i, wl := range wrappedLines {
-				var gutterStr string
-				if i == 0 {
-					gutterStr = diffLineNumSty.Render(fmt.Sprintf("  %3d      │ - ", leftLineNum))
-					leftLineNum++
-				} else {
-					gutterStr = diffLineNumSty.Render("           │   ")
+				for i, wl := range wrappedLines {
+					var gutterStr string
+					if i == 0 {
+						gutterStr = lineNumStyle.Render(fmt.Sprintf("%2d │ ", rightLineNum))
+						rightLineNum++
+					} else {
+						gutterStr = lineNumStyle.Render("   │ ")
+					}
+					textStr := styleAddition.Width(contentWidth).Render(wl)
+					renderedLines = append(renderedLines, gutterStr+textStr)
 				}
-				textStr := styleDeletion.Width(contentWidth).Render(wl)
-				renderedLines = append(renderedLines, gutterStr+textStr)
-			}
-		} else if strings.HasPrefix(line, "+") {
-			cleanLine := strings.TrimPrefix(line, "+")
-			wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
-
-			for i, wl := range wrappedLines {
-				var gutterStr string
-				if i == 0 {
-					gutterStr = diffLineNumHLSty.Render(fmt.Sprintf("       %3d │ + ", rightLineNum))
-					rightLineNum++
-				} else {
-					gutterStr = diffLineNumHLSty.Render("           │   ")
+			} else if strings.HasPrefix(line, "-") {
+				// Skip deletions in new file mode (shouldn't happen, but safe)
+				continue
+			} else {
+				// Context lines (rare in new files, but handle gracefully)
+				wrappedLines := wrapStringToWidth(line, contentWidth)
+				for i, wl := range wrappedLines {
+					var gutterStr string
+					if i == 0 {
+						gutterStr = lineNumStyle.Render(fmt.Sprintf("%2d │ ", rightLineNum))
+						rightLineNum++
+					} else {
+						gutterStr = lineNumStyle.Render("   │ ")
+					}
+					textStr := styleNormalText.Width(contentWidth).Render(wl)
+					renderedLines = append(renderedLines, gutterStr+textStr)
 				}
-				textStr := styleAddition.Width(contentWidth).Render(wl)
-				renderedLines = append(renderedLines, gutterStr+textStr)
 			}
 		} else {
-			wrappedLines := wrapStringToWidth(line, contentWidth)
+			// STANDARD DIFF: Dual-column line numbers (old | new)
+			if strings.HasPrefix(line, "-") {
+				cleanLine := strings.TrimPrefix(line, "-")
+				wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
 
-			for i, wl := range wrappedLines {
-				var gutterStr string
-				if i == 0 {
-					gutterStr = diffLineNumSty.Render(fmt.Sprintf("  %3d  %3d │   ", leftLineNum, rightLineNum))
-					leftLineNum++
-					rightLineNum++
-				} else {
-					gutterStr = diffLineNumSty.Render("           │   ")
+				for i, wl := range wrappedLines {
+					var gutterStr string
+					if i == 0 {
+						gutterStr = diffLineNumSty.Render(fmt.Sprintf("  %3d      │ - ", leftLineNum))
+						leftLineNum++
+					} else {
+						gutterStr = diffLineNumSty.Render("           │   ")
+					}
+					textStr := styleDeletion.Width(contentWidth).Render(wl)
+					renderedLines = append(renderedLines, gutterStr+textStr)
 				}
-				textStr := styleNormalText.Width(contentWidth).Render(wl)
-				renderedLines = append(renderedLines, gutterStr+textStr)
+			} else if strings.HasPrefix(line, "+") {
+				cleanLine := strings.TrimPrefix(line, "+")
+				wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
+
+				for i, wl := range wrappedLines {
+					var gutterStr string
+					if i == 0 {
+						gutterStr = diffLineNumHLSty.Render(fmt.Sprintf("       %3d │ + ", rightLineNum))
+						rightLineNum++
+					} else {
+						gutterStr = diffLineNumHLSty.Render("           │   ")
+					}
+					textStr := styleAddition.Width(contentWidth).Render(wl)
+					renderedLines = append(renderedLines, gutterStr+textStr)
+				}
+			} else {
+				wrappedLines := wrapStringToWidth(line, contentWidth)
+
+				for i, wl := range wrappedLines {
+					var gutterStr string
+					if i == 0 {
+						gutterStr = diffLineNumSty.Render(fmt.Sprintf("  %3d  %3d │   ", leftLineNum, rightLineNum))
+						leftLineNum++
+						rightLineNum++
+					} else {
+						gutterStr = diffLineNumSty.Render("           │   ")
+					}
+					textStr := styleNormalText.Width(contentWidth).Render(wl)
+					renderedLines = append(renderedLines, gutterStr+textStr)
+				}
 			}
 		}
 	}
@@ -267,7 +309,7 @@ func (r *MutationRenderer) Render(v MutationCardViewModel) string {
 	// Diff Renderer - the evidence (takes most space)
 	if v.Diff.Content != "" {
 		// Create a diff renderer and render the diff
-		dr := &DiffRenderer{Width: contentWidth}
+		dr := &DiffRenderer{Width: contentWidth, IsNewFile: v.IsNewFile}
 		diffRendered := dr.Render(v.Diff)
 
 		// Split the diff into lines and add them with minimal padding

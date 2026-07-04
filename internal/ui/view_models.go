@@ -158,6 +158,8 @@ type MutationCardViewModel struct {
 	Risk            RiskCardViewModel
 	Diff            DiffCardViewModel
 	SemanticSummary string
+	Expanded        bool // UI state: whether the diff section is expanded
+	IsNewFile       bool // Whether this is a new file creation (no original content)
 }
 
 // ToMutationCardViewModel maps a SemanticMutation domain model to a MutationCardViewModel.
@@ -175,8 +177,32 @@ func ToMutationCardViewModel(m SemanticMutation) MutationCardViewModel {
 // ToMutationCardViewModelFromProposal maps a SemanticProposal directly to a MutationCardViewModel.
 func ToMutationCardViewModelFromProposal(p SemanticProposal) MutationCardViewModel {
 	return MutationCardViewModel{
-		Target: ToSymbolCardViewModel(p.Target),
-		Risk:   ToRiskCardViewModel(p.Risk),
-		Diff:   ToDiffCardViewModel(p.Diff),
+		Target:    ToSymbolCardViewModel(p.Target),
+		Risk:      ToRiskCardViewModel(p.Risk),
+		Diff:      ToDiffCardViewModel(p.Diff),
+		Expanded:  p.Expanded,
+		IsNewFile: isNewFileCreation(p.Diff),
 	}
+}
+
+// isNewFileCreation detects if a diff represents a new file creation.
+// A new file has no "--- a/..." line, only "+++ b/..." with all additions.
+func isNewFileCreation(diff string) bool {
+	if diff == "" {
+		return false
+	}
+	hasDeletion := false
+	hasAddition := false
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "--- ") && !strings.HasPrefix(line, "--- a/dev/null") {
+			hasDeletion = true
+		}
+		if strings.HasPrefix(line, "+++ ") {
+			hasAddition = true
+		}
+		if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+			hasDeletion = true
+		}
+	}
+	return hasAddition && !hasDeletion
 }

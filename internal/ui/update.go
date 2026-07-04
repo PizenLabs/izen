@@ -342,6 +342,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case tea.MouseButtonLeft:
+				// Check if click is on the active widget area (proposal header)
+				if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
+					widgetStartY := m.widgetScreenStartY()
+					widgetHeight := m.activeWidgetHeight()
+					if widgetStartY >= 0 && mouseMsg.Y >= widgetStartY && mouseMsg.Y < widgetStartY+widgetHeight {
+						// Click is within the widget area
+						headerLineIdx := 1 // Header is typically the second line (after top border)
+						if mouseMsg.Y == widgetStartY+headerLineIdx {
+							// Toggle expanded state on header click
+							m.pendingProposals[0].Expanded = !m.pendingProposals[0].Expanded
+							m.rebuildViewport()
+							return m, nil
+						}
+					}
+				}
+
 				point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y)
 				if !ok {
 					m.mouseSelecting = false

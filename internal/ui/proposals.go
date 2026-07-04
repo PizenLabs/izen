@@ -45,6 +45,9 @@ func extractBuildProposals(response string) []SemanticProposal {
 }
 
 // extractFileTagBlocks parses the FILE: <path> ... ``` ... ``` structured format.
+// When the target file already exists on disk, the raw content is converted into
+// a synthetic unified diff so the diff-rendering pipeline (green/red coloring,
+// line numbers) is always used for existing files.
 func extractFileTagBlocks(response string) []SemanticProposal {
 	var proposals []SemanticProposal
 	matches := fileTagBlockRegex.FindAllStringSubmatch(response, -1)
@@ -61,13 +64,62 @@ func extractFileTagBlocks(response string) []SemanticProposal {
 		if clean == "" || clean == "." {
 			continue
 		}
+
+		diff := body
+		// Safety net: if the file already exists on disk, the model should have
+		// used diff format. Convert the full-content overwrite into a synthetic
+		// unified diff so the renderer shows proper green/red coloring.
+		if origBytes, err := os.ReadFile(clean); err == nil {
+			origContent := string(origBytes)
+			if origContent != body {
+				// File exists and content differs — build a synthetic diff
+				diff = buildSyntheticDiff(clean, origContent, body)
+			}
+			// If origContent == body, the file is unchanged — still emit the
+			// proposal (the user may expect to see it) but keep it as-is.
+		}
+		// If os.ReadFile fails, the file doesn't exist — this is genuinely a
+		// new file creation, so leave `diff` as the raw content.
+
 		proposals = append(proposals, SemanticProposal{
-			ID:     fmt.Sprintf("build-%d", time.Now().UnixNano()),
-			Target: SemanticTarget{QualifiedName: clean},
-			Diff:   body,
+			ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
+			Target:   SemanticTarget{QualifiedName: clean},
+			Diff:     diff,
+			Expanded: true,
 		})
 	}
 	return proposals
+}
+
+// buildSyntheticDiff constructs a unified diff that replaces every line of the
+// old content with every line of the new content. This is a coarse-grained
+// "full replacement" diff — it won't show fine-grained line changes, but it
+// ensures the diff renderer produces colored output (red deletions, green
+// additions) rather than plain uncolored text.
+func buildSyntheticDiff(path, oldContent, newContent string) string {
+	oldLines := strings.Split(oldContent, "\n")
+	newLines := strings.Split(newContent, "\n")
+
+	var b strings.Builder
+	b.WriteString("--- a/")
+	b.WriteString(path)
+	b.WriteString("\n+++ b/")
+	b.WriteString(path)
+	b.WriteString("\n")
+	b.WriteString(fmt.Sprintf("@@ -1,%d +1,%d @@\n", len(oldLines), len(newLines)))
+
+	for _, line := range oldLines {
+		b.WriteString("-")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	for _, line := range newLines {
+		b.WriteString("+")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // extractLangPathBlocks parses ```lang:path blocks (original format).
@@ -103,6 +155,7 @@ func extractLangPathBlocks(response string) []SemanticProposal {
 				inBlock = false
 				if current != nil && content.Len() > 0 {
 					current.Diff = content.String()
+					current.Expanded = true
 					clean := filepath.Clean(current.Target.QualifiedName)
 					if clean != "" && clean != "." {
 						current.Target.QualifiedName = clean
@@ -134,9 +187,10 @@ func extractDiffPatches(response string) []SemanticProposal {
 			clean := filepath.Clean(file)
 			if clean != "" && clean != "." {
 				proposals = append(proposals, SemanticProposal{
-					ID:     fmt.Sprintf("build-%d", time.Now().UnixNano()),
-					Target: SemanticTarget{QualifiedName: clean},
-					Diff:   body,
+					ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
+					Target:   SemanticTarget{QualifiedName: clean},
+					Diff:     body,
+					Expanded: true,
 				})
 			}
 		}
@@ -178,10 +232,21 @@ func extractFallbackBlocks(response string) []SemanticProposal {
 			continue
 		}
 
+		diff := body
+		// Safety net: if the file already exists on disk, convert to synthetic diff
+		// so the renderer shows colored output instead of uncolored plaintext.
+		if origBytes, err := os.ReadFile(clean); err == nil {
+			origContent := string(origBytes)
+			if origContent != body {
+				diff = buildSyntheticDiff(clean, origContent, body)
+			}
+		}
+
 		proposals = append(proposals, SemanticProposal{
-			ID:     fmt.Sprintf("build-%d", time.Now().UnixNano()),
-			Target: SemanticTarget{QualifiedName: clean},
-			Diff:   body,
+			ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
+			Target:   SemanticTarget{QualifiedName: clean},
+			Diff:     diff,
+			Expanded: true,
 		})
 	}
 	return proposals

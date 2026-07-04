@@ -1,7 +1,10 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 // Enhanced Mutation Renderer aligned with REVIEW_LAYOUT.md design principles
@@ -10,8 +13,6 @@ type EnhancedMutationRenderer struct {
 }
 
 func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
-	var lines []string
-
 	// Calculate content width (accounting for borders and padding)
 	contentWidth := r.Width - 4 // 2 for borders, 2 for padding
 	if contentWidth < 20 {
@@ -23,15 +24,18 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 	if len(border) == 0 {
 		border = "─"
 	}
-	lines = append(lines, border)
-	lines = append(lines, "") // Empty line for spacing
 
-	// Header - compact, one line: "Edit • getGreeting()" or "Edit • LICENSE"
-	header := "Edit"
+	// Header line with expand/collapse indicator
+	statusIcon := "•" // pending
+	expandIcon := "❯" // collapsed by default
+
+	if v.Expanded {
+		expandIcon = "▼" // expanded
+	}
+
+	headerText := "Edit"
 	if v.Target.Name != "" {
-		// Show symbol name first, fallback to file info if needed
 		symbolName := v.Target.Name
-		// Try to extract just the function/method name from qualified name
 		if dotIdx := strings.LastIndex(symbolName, "."); dotIdx >= 0 {
 			symbolName = symbolName[dotIdx+1:]
 		}
@@ -39,19 +43,53 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 			symbolName = symbolName[slashIdx+1:]
 		}
 		if symbolName != "" {
-			header += " • " + symbolName
+			headerText += " • " + symbolName
 		} else {
-			header += " • " + v.Target.Name
+			headerText += " • " + v.Target.Name
 		}
 	} else {
-		header += " • Unknown"
+		headerText += " • Unknown"
 	}
-	lines = append(lines, header)
+
+	// Style for the expand indicator
+	expandStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+
+	// Build the header line with status and expand indicators
+	headerLine := fmt.Sprintf("%s %s %s", statusStyle.Render(statusIcon), expandStyle.Render(expandIcon), headerText)
+
+	if !v.Expanded {
+		// COLLAPSED: Render compact header + action buttons (always visible)
+		var lines []string
+		lines = append(lines, border)
+		lines = append(lines, headerLine)
+
+		// Add scope/risk info inline for compact view
+		scope := "Internal"
+		if v.Impact.HasAPIChanges {
+			scope = "Public"
+		}
+		riskLevel := v.Risk.Level
+		if riskLevel == "" {
+			riskLevel = "UNKNOWN"
+		}
+		metadata := fmt.Sprintf("Scope %s | Risk %s", scope, riskLevel)
+		lines = append(lines, expandStyle.Render("  "+metadata))
+
+		lines = append(lines, "") // Spacing before actions
+		lines = append(lines, "[A] Accept    [L] Allow All    [R] Reject")
+		lines = append(lines, border)
+		return strings.Join(lines, "\n")
+	}
+
+	// EXPANDED: Render full diff view
+	var lines []string
+	lines = append(lines, border)
+	lines = append(lines, headerLine)
 	lines = append(lines, "") // Empty line for spacing
 
 	// Semantic Summary - max 2 lines above diff
 	if v.SemanticSummary != "" {
-		// Wrap summary to fit width, limit to 2 lines max
 		summaryLines := wrapText(v.SemanticSummary, contentWidth)
 		if len(summaryLines) > 2 {
 			summaryLines = summaryLines[:2]
@@ -66,11 +104,9 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 
 	// Diff - the evidence (takes most of the space)
 	if v.Diff.Content != "" {
-		// Create a diff renderer to properly format the diff
-		dr := &DiffRenderer{Width: contentWidth}
+		dr := &DiffRenderer{Width: contentWidth, IsNewFile: v.IsNewFile}
 		diffRendered := dr.Render(v.Diff)
 
-		// Split into lines and add with minimal padding
 		diffLines := strings.Split(diffRendered, "\n")
 		for _, line := range diffLines {
 			if len(line) > 0 {
