@@ -62,7 +62,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 
 	opts := []tea.ProgramOption{
 		tea.WithAltScreen(),
-		tea.WithMouseAllMotion(),
+		tea.WithMouseCellMotion(),
 	}
 
 	return tea.NewProgram(m, opts...)
