@@ -203,10 +203,9 @@ func (m *model) renderActiveWidget(width int) string {
 			vm.Purpose = fmt.Sprintf("Apply proposed code changes for %s", vm.Target.Name)
 		}
 
-		mr := &EnhancedMutationRenderer{Width: width, ScrollOffset: m.proposalDiffOffset}
+		mr := &EnhancedMutationRenderer{Width: width}
 		widgetParts = append(widgetParts, mr.Render(vm))
-		widget := strings.Join(widgetParts, "\n")
-		return widget
+		return strings.Join(widgetParts, "\n")
 	}
 
 	if m.agentRunning {
@@ -786,6 +785,10 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 
 			// Shell Execution Proposal container with warning header
 			var container strings.Builder
+			innerContentWidth := widgetInnerWidth - 2
+			if innerContentWidth < 10 {
+				innerContentWidth = 10
+			}
 			shellLineStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 
 			container.WriteString(shellWarningStyle.Render("> System: Shell Execution Required <"))

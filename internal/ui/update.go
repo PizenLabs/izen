@@ -266,6 +266,35 @@ func (m *model) copyMouseSelection(end mouseSelectionPoint) {
 	}
 }
 
+// checkProposalFooterBounds checks if the mouse click at (x, y) falls on the footer line
+// of the proposal widget. The footer contains the expand/collapse toggle and action
+// keybindings, anchored at the bottom of the block. This replaces the old header-based
+// click detection so the toggle remains reachable regardless of diff length.
+func (m *model) checkProposalFooterBounds(x, y int) bool {
+	if m.state != StateAwaitingApproval || len(m.pendingProposals) == 0 {
+		return false
+	}
+
+	startY := m.widgetScreenStartY()
+	if startY < 0 {
+		return false
+	}
+
+	widgetH := m.activeWidgetHeight()
+	if widgetH < 3 {
+		return false
+	}
+
+	// The footer line (expand/collapse toggle + actions) is always at
+	// height-3 lines from the widget start (content above + empty + border).
+	footerY := startY + widgetH - 3
+	if y == footerY {
+		return true
+	}
+
+	return false
+}
+
 // Update maps layout engines and routes state machines.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── GLOBAL INTERCEPT: [P] Toggle Hotkey ──────────────────────────────────
@@ -349,38 +378,55 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if mouseMsg.Action == tea.MouseActionPress {
 			switch mouseMsg.Button {
 
-			// ── Wheel: Zero-Delay Bounded Diff Scroll ─────────────────────
-			case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
-				if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 && m.pendingProposals[0].Expanded {
-					if mouseMsg.Button == tea.MouseButtonWheelUp {
-						if m.proposalDiffOffset > 0 {
-							m.proposalDiffOffset--
-						}
-					} else {
-						m.proposalDiffOffset++
-					}
-					return m, nil
-				}
-				// Not expanded — scroll the main viewport.
+			case tea.MouseButtonWheelDown:
 				m.mouseSelecting = false
 				m.vp, vpCmd = m.vp.Update(msg)
 				m.rebuildViewport()
 				return m, vpCmd
+			}
+		}
 
-			// ── Left-Press: Begin viewport text selection (drag start) ────
-			case tea.MouseButtonLeft:
-				point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y)
-				if !ok {
-					m.mouseSelecting = false
-					return m, nil
+		// ── PHASE 2: Intercept Left-Clicks for Izen Components ────────────
+		if mouseMsg.Action == tea.MouseActionPress && mouseMsg.Button == tea.MouseButtonLeft {
+			// Check the widget footer (sticky expand/collapse toggle + actions)
+			if m.checkProposalFooterBounds(mouseMsg.X, mouseMsg.Y) {
+				for i := range m.pendingProposals {
+					if m.pendingProposals[i].Expanded {
+						m.pendingProposals[i].Expanded = false
+					} else {
+						// Toggle either the one matching this click or the first
+						if i == 0 {
+							m.pendingProposals[i].Expanded = true
+						}
+					}
 				}
-				m.mouseSelecting = true
-				m.startMouseRow = point.row
-				m.startMouseCol = point.col
-				m.currentMouseRow = point.row
-				m.currentMouseCol = point.col
+				// If all collapsed, expand first
+				allCollapsed := true
+				for i := range m.pendingProposals {
+					if m.pendingProposals[i].Expanded {
+						allCollapsed = false
+						break
+					}
+				}
+				if allCollapsed && len(m.pendingProposals) > 0 {
+					m.pendingProposals[0].Expanded = true
+				}
+				m.rebuildViewport()
 				return m, nil
 			}
+
+			// ── Left-Press: Begin viewport text selection (drag start) ────
+			point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y)
+			if !ok {
+				m.mouseSelecting = false
+				return m, nil
+			}
+			m.mouseSelecting = true
+			m.startMouseRow = point.row
+			m.startMouseCol = point.col
+			m.currentMouseRow = point.row
+			m.currentMouseCol = point.col
+			return m, nil
 		}
 
 		// ── Left-Release: Selection Finalization ───────────────────────────
