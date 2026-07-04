@@ -268,28 +268,6 @@ func (m *model) suggestionPaletteHeight() int {
 	return len(strings.Split(palette, "\n"))
 }
 
-// widgetScreenStartY calculates the screen Y position where the active widget begins.
-// Returns -1 if no widget is currently rendered.
-func (m *model) widgetScreenStartY() int {
-	if m.state != StateAwaitingApproval || len(m.pendingProposals) == 0 {
-		return -1
-	}
-
-	y := 0
-	// Top Bar
-	if m.renderTopBar() != "" {
-		y++
-	}
-	// Viewport — use actual rendered line count, not configured Height,
-	// because bubbletea's viewport may return fewer lines when content
-	// is shorter than the viewport window (it does not pad to Height).
-	vpView := m.vp.View()
-	y += len(strings.Split(vpView, "\n"))
-	// Suggestions
-	y += m.suggestionPaletteHeight()
-	return y
-}
-
 // wrapStreamText wraps raw text lines dynamically during an active live stream.
 func wrapStreamText(text string, maxW int) []string {
 	if len(text) == 0 {

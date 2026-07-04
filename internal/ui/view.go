@@ -786,10 +786,6 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 
 			// Shell Execution Proposal container with warning header
 			var container strings.Builder
-			innerContentWidth := widgetInnerWidth - 2
-			if innerContentWidth < 10 {
-				innerContentWidth = 10
-			}
 			shellLineStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 
 			container.WriteString(shellWarningStyle.Render("> System: Shell Execution Required <"))
