@@ -105,6 +105,8 @@ const (
 	promptBoxHeight = 3 // border top + content + border bottom
 	statusBarHeight = 1
 	viewportPadding = 1 // breathing room
+
+	maxProposalDiffHeight = 15 // max visible diff lines in expanded proposal widget
 )
 
 var coreModes = []string{"/ask", "/plan", "/build", "/investigate", "/review"}
@@ -219,6 +221,9 @@ type model struct {
 
 	// Focus objective UI notifications (non-chat)
 	uiNotice string
+
+	// Proposal widget diff scroll offset
+	proposalDiffOffset int
 }
 
 // ── Viewport helpers ──────────────────────────────────────────────────────────
@@ -275,8 +280,11 @@ func (m *model) widgetScreenStartY() int {
 	if m.renderTopBar() != "" {
 		y++
 	}
-	// Viewport
-	y += m.vp.Height
+	// Viewport — use actual rendered line count, not configured Height,
+	// because bubbletea's viewport may return fewer lines when content
+	// is shorter than the viewport window (it does not pad to Height).
+	vpView := m.vp.View()
+	y += len(strings.Split(vpView, "\n"))
 	// Suggestions
 	y += m.suggestionPaletteHeight()
 	return y

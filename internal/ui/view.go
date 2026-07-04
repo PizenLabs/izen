@@ -203,9 +203,10 @@ func (m *model) renderActiveWidget(width int) string {
 			vm.Purpose = fmt.Sprintf("Apply proposed code changes for %s", vm.Target.Name)
 		}
 
-		mr := &EnhancedMutationRenderer{Width: width}
+		mr := &EnhancedMutationRenderer{Width: width, ScrollOffset: m.proposalDiffOffset}
 		widgetParts = append(widgetParts, mr.Render(vm))
-		return strings.Join(widgetParts, "\n")
+		widget := strings.Join(widgetParts, "\n")
+		return widget
 	}
 
 	if m.agentRunning {

@@ -96,12 +96,11 @@ func (e *Engine) Checkpoint(message string) (string, error) {
 		return "", fmt.Errorf("add: %w", err)
 	}
 
-	out, err := e.git("commit", "--allow-empty", "-m", message)
-	if err != nil {
+	if _, err := e.git("commit", "--allow-empty", "-m", message); err != nil {
 		return "", fmt.Errorf("commit: %w", err)
 	}
 
-	return strings.TrimSpace(out), nil
+	return e.CurrentHash()
 }
 
 func (e *Engine) Undo() (string, error) {
@@ -133,6 +132,15 @@ func (e *Engine) AmendCommit(message string) error {
 
 func (e *Engine) ResetHard(ref string) error {
 	_, err := e.git("reset", "--hard", ref)
+	return err
+}
+
+func (e *Engine) CheckoutFile(paths ...string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	args := append([]string{"checkout", "HEAD", "--"}, paths...)
+	_, err := e.git(args...)
 	return err
 }
 

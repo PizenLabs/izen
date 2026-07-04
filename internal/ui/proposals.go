@@ -375,6 +375,7 @@ func (m *model) applySingleProposal() tea.Cmd {
 	m.push(roleSystem, acceptedLineStyle.Render(acceptedLine))
 
 	m.pendingProposals = m.pendingProposals[1:]
+	m.proposalDiffOffset = 0
 	if len(m.pendingProposals) == 0 {
 		m.state = StateChat
 		m.awaitingConfirmation = false
@@ -430,8 +431,12 @@ func (m *model) createBuildCheckpoint(fileCount int) {
 	if err != nil {
 		m.push(roleSystem, infoStyle.Render("checkpoint: "+err.Error()))
 	} else {
+		shortHash := cp.Hash
+		if len(shortHash) > 8 {
+			shortHash = shortHash[:8]
+		}
 		m.push(roleSystem, infoStyle.Render(
-			fmt.Sprintf("checkpoint: %s (%d files)", cp.Hash[:8], fileCount)))
+			fmt.Sprintf("checkpoint: %s (%d files)", shortHash, fileCount)))
 	}
 }
 
