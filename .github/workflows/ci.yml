@@ -68,7 +68,7 @@ jobs:
         run: govulncheck ./...
 
       - name: Upload Go coverage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-go
           path: coverage-go.out
@@ -136,7 +136,7 @@ jobs:
           test -f lcov.info
 
       - name: Upload Rust coverage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-rust
           path: lynx/lcov.info
