@@ -1,4 +1,5 @@
 version: 2
+
 updates:
   - package-ecosystem: "gomod"
     directory: "/"
@@ -15,7 +16,7 @@ updates:
       include: "scope"
 
   - package-ecosystem: "cargo"
-    directory: "lynx"
+    directory: "/lynx"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -34,6 +35,7 @@ updates:
       interval: "weekly"
       day: "monday"
       time: "09:00"
+    open-pull-requests-limit: 10
     labels:
       - "dependencies"
       - "github-actions"
