@@ -15,7 +15,63 @@ import (
 
 var diffBlockRegex = regexp.MustCompile("(?s)```diff\\n(.*?)```")
 
+// fileTagBlockRegex matches the structured FILE: tag format followed by a code block.
+// Format: FILE: <path>\n```<lang>\n<content>\n```
+var fileTagBlockRegex = regexp.MustCompile("(?mi)^FILE:\\s*(\\S+)\\s*\\n```[a-zA-Z]*\\n(.*?)```")
+
+// fallbackCodeBlockRegex catches any code block that might contain file content
+// when the model ignores the structured format. Used as last-resort fallback.
+var fallbackCodeBlockRegex = regexp.MustCompile("(?s)```([a-zA-Z0-9_+-]+)\\n(.*?)```")
+
 func extractBuildProposals(response string) []SemanticProposal {
+	var proposals []SemanticProposal
+
+	// PHASE 1: Extract FILE: tag blocks (structured format from strengthened prompt).
+	proposals = append(proposals, extractFileTagBlocks(response)...)
+
+	// PHASE 2: Original line-by-line parser for lang:path blocks.
+	proposals = append(proposals, extractLangPathBlocks(response)...)
+
+	// PHASE 3: Extract diff blocks.
+	proposals = append(proposals, extractDiffPatches(response)...)
+
+	// PHASE 4: Fallback — if no proposals found, scan for bare code blocks
+	// and try to infer file paths from the response context.
+	if len(proposals) == 0 {
+		proposals = append(proposals, extractFallbackBlocks(response)...)
+	}
+
+	return proposals
+}
+
+// extractFileTagBlocks parses the FILE: <path> ... ``` ... ``` structured format.
+func extractFileTagBlocks(response string) []SemanticProposal {
+	var proposals []SemanticProposal
+	matches := fileTagBlockRegex.FindAllStringSubmatch(response, -1)
+	for _, match := range matches {
+		if len(match) < 3 {
+			continue
+		}
+		rawPath := strings.TrimSpace(match[1])
+		body := strings.TrimSpace(match[2])
+		if rawPath == "" || body == "" {
+			continue
+		}
+		clean := filepath.Clean(rawPath)
+		if clean == "" || clean == "." {
+			continue
+		}
+		proposals = append(proposals, SemanticProposal{
+			ID:     fmt.Sprintf("build-%d", time.Now().UnixNano()),
+			Target: SemanticTarget{QualifiedName: clean},
+			Diff:   body,
+		})
+	}
+	return proposals
+}
+
+// extractLangPathBlocks parses ```lang:path blocks (original format).
+func extractLangPathBlocks(response string) []SemanticProposal {
 	var proposals []SemanticProposal
 	lines := strings.Split(response, "\n")
 	var current *SemanticProposal
@@ -86,6 +142,81 @@ func extractDiffPatches(response string) []SemanticProposal {
 		}
 	}
 	return proposals
+}
+
+// extractFallbackBlocks is the last-resort parser. When Qwen (or any model) ignores
+// the structured format and wraps content in bare ```plaintext or ```go blocks,
+// this function attempts to recover the file content by inferring the target path
+// from the nearest FILE:/file:/edit file/ filename mention in the preceding text.
+func extractFallbackBlocks(response string) []SemanticProposal {
+	var proposals []SemanticProposal
+	matches := fallbackCodeBlockRegex.FindAllStringSubmatchIndex(response, -1)
+	for _, loc := range matches {
+		if len(loc) < 4 {
+			continue
+		}
+		lang := response[loc[2]:loc[3]]
+		body := strings.TrimSpace(response[loc[4]:loc[5]])
+
+		// Skip diff blocks — already handled.
+		if lang == "diff" {
+			continue
+		}
+		if body == "" {
+			continue
+		}
+
+		// Search backward from the code block for a file path hint.
+		preBlock := strings.TrimSpace(response[:loc[0]])
+		filePath := findNearestFilePath(preBlock)
+		if filePath == "" {
+			continue
+		}
+
+		clean := filepath.Clean(filePath)
+		if clean == "" || clean == "." {
+			continue
+		}
+
+		proposals = append(proposals, SemanticProposal{
+			ID:     fmt.Sprintf("build-%d", time.Now().UnixNano()),
+			Target: SemanticTarget{QualifiedName: clean},
+			Diff:   body,
+		})
+	}
+	return proposals
+}
+
+// findNearestFilePath scans backward through preceding text to find a file path
+// mentioned via common patterns: FILE: path, file: path, edit file path, or
+// a bare filename on a line by itself.
+func findNearestFilePath(text string) string {
+	lines := strings.Split(text, "\n")
+	// Scan last 10 lines for a file path hint.
+	start := 0
+	if len(lines) > 10 {
+		start = len(lines) - 10
+	}
+	for i := len(lines) - 1; i >= start; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		lower := strings.ToLower(trimmed)
+
+		// FILE: path or file: path
+		if strings.HasPrefix(lower, "file:") {
+			raw := strings.TrimSpace(trimmed[5:])
+			if raw != "" {
+				return raw
+			}
+		}
+		// edit file path
+		if strings.HasPrefix(lower, "edit file") {
+			raw := strings.TrimSpace(trimmed[9:])
+			if raw != "" {
+				return raw
+			}
+		}
+	}
+	return ""
 }
 
 func parseUnifiedDiff(content string) (string, string) {
