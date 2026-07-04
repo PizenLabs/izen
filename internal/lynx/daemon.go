@@ -2,6 +2,7 @@ package lynx
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -54,7 +55,7 @@ func (p *Process) Start() error {
 	}
 
 	p.doneCh = make(chan struct{})
-	p.cmd = exec.Command(binPath, "--storage-path", storageDir, "mcp")
+	p.cmd = exec.CommandContext(context.Background(), binPath, "--storage-path", storageDir, "mcp")
 	p.cmd.Dir = p.root
 
 	stdin, err := p.cmd.StdinPipe()
@@ -93,7 +94,7 @@ func (p *Process) StderrLog() string {
 }
 
 func (p *Process) waitForExit() {
-	p.cmd.Wait()
+	_ = p.cmd.Wait()
 	close(p.doneCh)
 }
 
@@ -124,14 +125,14 @@ func (p *Process) Stop() error {
 	close(p.stopCh)
 
 	if p.stdin != nil {
-		p.stdin.Close()
+		_ = p.stdin.Close()
 	}
 
 	if p.doneCh != nil {
 		select {
 		case <-p.doneCh:
 		case <-time.After(5 * time.Second):
-			p.cmd.Process.Kill()
+			_ = p.cmd.Process.Kill()
 			<-p.doneCh
 		}
 	}
@@ -233,7 +234,7 @@ func (d *Daemon) Start() error {
 	d.client = NewClient(p)
 
 	if err := d.client.Initialize(); err != nil {
-		p.Stop()
+		_ = p.Stop()
 		return fmt.Errorf("lynx initialize: %w", err)
 	}
 

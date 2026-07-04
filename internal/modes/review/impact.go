@@ -42,7 +42,9 @@ func (ia *ImpactAnalyzer) Analyze(files []DiffFile) (*ImpactRadius, error) {
 	indirectFiles := ia.findIndirectFiles(radius.DirectFiles)
 	radius.IndirectFiles = indirectFiles
 
-	allFiles := append(radius.DirectFiles, radius.IndirectFiles...)
+	allFiles := make([]string, 0, len(radius.DirectFiles)+len(radius.IndirectFiles))
+	allFiles = append(allFiles, radius.DirectFiles...)
+	allFiles = append(allFiles, radius.IndirectFiles...)
 	radius.AffectedPkgs = ia.extractPackages(allFiles)
 
 	symbols := ia.extractAffectedSymbols(radius.DirectFiles)
@@ -93,7 +95,7 @@ func (ia *ImpactAnalyzer) findIndirectFiles(directFiles []string) []string {
 		}
 	}
 
-	var result []string
+	result := make([]string, 0, len(indirect))
 	for f := range indirect {
 		result = append(result, f)
 	}
@@ -161,8 +163,11 @@ func (ia *ImpactAnalyzer) walkDependents(file string, visited map[string]bool, d
 func (ia *ImpactAnalyzer) buildImportGraph(directFiles []string) map[string][]string {
 	graph := make(map[string][]string)
 
-	filepath.Walk(ia.root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+	_ = filepath.Walk(ia.root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
 			return nil
 		}
 		if !strings.HasSuffix(path, ".go") {
@@ -174,13 +179,13 @@ func (ia *ImpactAnalyzer) buildImportGraph(directFiles []string) map[string][]st
 
 		rel, err := filepath.Rel(ia.root, path)
 		if err != nil {
-			return nil
+			return err
 		}
 
 		fset := token.NewFileSet()
 		f, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
 		if err != nil {
-			return nil
+			return err
 		}
 
 		var imports []string
@@ -207,7 +212,7 @@ func (ia *ImpactAnalyzer) extractPackages(files []string) []string {
 		pkgs[pkg] = true
 	}
 
-	var result []string
+	result := make([]string, 0, len(pkgs))
 	for p := range pkgs {
 		result = append(result, p)
 	}
@@ -384,13 +389,13 @@ func unique(items []string) []string {
 func prettyPrint(result *ReviewResult) string {
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf("Branch: %s → %s\n", result.BaseBranch, result.Branch))
-	b.WriteString(fmt.Sprintf("Commit: %s\n", result.CommitHash))
+	fmt.Fprintf(&b, "Branch: %s → %s\n", result.BaseBranch, result.Branch)
+	fmt.Fprintf(&b, "Commit: %s\n", result.CommitHash)
 	b.WriteString("═══════════════════════════════════════\n\n")
 
-	b.WriteString(fmt.Sprintf("Review Score: %d/100\n", result.Score))
-	b.WriteString(fmt.Sprintf("Risk Score: %d/100\n", result.ImpactRadius.RiskScore))
-	b.WriteString(fmt.Sprintf("Duration: %s\n\n", result.Duration))
+	fmt.Fprintf(&b, "Review Score: %d/100\n", result.Score)
+	fmt.Fprintf(&b, "Risk Score: %d/100\n", result.ImpactRadius.RiskScore)
+	fmt.Fprintf(&b, "Duration: %s\n\n", result.Duration)
 
 	b.WriteString("Changed Files:\n")
 	for _, f := range result.FilesChanged {
@@ -403,15 +408,15 @@ func prettyPrint(result *ReviewResult) string {
 		case "renamed":
 			statusSym = "→"
 		}
-		b.WriteString(fmt.Sprintf("  %s %s (+%d/-%d)\n", statusSym, f.Path, f.Additions, f.Deletions))
+		fmt.Fprintf(&b, "  %s %s (+%d/-%d)\n", statusSym, f.Path, f.Additions, f.Deletions)
 	}
 	b.WriteString("\n")
 
 	if len(result.ImpactRadius.IndirectFiles) > 0 {
 		b.WriteString("Impact Radius:\n")
-		b.WriteString(fmt.Sprintf("  Direct: %d files\n", len(result.ImpactRadius.DirectFiles)))
-		b.WriteString(fmt.Sprintf("  Indirect: %d files\n", len(result.ImpactRadius.IndirectFiles)))
-		b.WriteString(fmt.Sprintf("  Packages: %s\n\n", strings.Join(result.ImpactRadius.AffectedPkgs, ", ")))
+		fmt.Fprintf(&b, "  Direct: %d files\n", len(result.ImpactRadius.DirectFiles))
+		fmt.Fprintf(&b, "  Indirect: %d files\n", len(result.ImpactRadius.IndirectFiles))
+		fmt.Fprintf(&b, "  Packages: %s\n\n", strings.Join(result.ImpactRadius.AffectedPkgs, ", "))
 	}
 
 	severityOrder := []RiskSeverity{RiskCritical, RiskHigh, RiskMedium, RiskLow, RiskInfo}
@@ -423,9 +428,9 @@ func prettyPrint(result *ReviewResult) string {
 			}
 		}
 		if len(sevFindings) > 0 {
-			b.WriteString(fmt.Sprintf("  [%s] (%d)\n", strings.ToUpper(string(sev)), len(sevFindings)))
+			fmt.Fprintf(&b, "  [%s] (%d)\n", strings.ToUpper(string(sev)), len(sevFindings))
 			for _, f := range sevFindings {
-				b.WriteString(fmt.Sprintf("    %s:%d — %s (%s)\n", f.File, f.Line, f.Description, f.RuleID))
+				fmt.Fprintf(&b, "    %s:%d — %s (%s)\n", f.File, f.Line, f.Description, f.RuleID)
 			}
 		}
 	}
@@ -434,12 +439,12 @@ func prettyPrint(result *ReviewResult) string {
 	if len(result.Recommendations) > 0 {
 		b.WriteString("Recommendations:\n")
 		for i, rec := range result.Recommendations {
-			b.WriteString(fmt.Sprintf("  %d. %s\n", i+1, rec))
+			fmt.Fprintf(&b, "  %d. %s\n", i+1, rec)
 		}
 		b.WriteString("\n")
 	}
 
-	b.WriteString(fmt.Sprintf("Summary: %s\n", result.Summary))
+	fmt.Fprintf(&b, "Summary: %s\n", result.Summary)
 
 	return b.String()
 }

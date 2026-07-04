@@ -409,7 +409,7 @@ func (m *model) loadHistory() {
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := sc.Text()
@@ -432,11 +432,11 @@ func (m *model) saveHistory() {
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if len(m.history) == 0 {
 		return
 	}
 	last := m.history[len(m.history)-1]
 	b, _ := json.Marshal(last)
-	fmt.Fprintf(f, "%s\n", b)
+	_, _ = fmt.Fprintf(f, "%s\n", b)
 }

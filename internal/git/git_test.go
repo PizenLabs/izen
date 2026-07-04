@@ -12,7 +12,7 @@ func setupTestRepo(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("mkdir temp: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 
 	run(t, dir, "git", "init")
 	run(t, dir, "git", "config", "user.email", "test@izen.dev")
@@ -41,7 +41,7 @@ func TestIsRepo(t *testing.T) {
 
 func TestNotRepo(t *testing.T) {
 	dir, _ := os.MkdirTemp("", "izen-nonrepo-*")
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	e := NewEngine(dir)
 	if e.IsRepo() {
 		t.Fatal("expected IsRepo to be false")

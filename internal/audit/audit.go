@@ -63,7 +63,7 @@ func (l *Logger) append(path string, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("audit open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := f.Write(data); err != nil {
 		return fmt.Errorf("audit write: %w", err)
 	}

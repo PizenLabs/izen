@@ -58,7 +58,7 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			result = o.result
 			engErr = o.err
 		case <-ctx.Done():
-			engErr = fmt.Errorf("investigation timed out after 60s: %v", ctx.Err())
+			engErr = fmt.Errorf("investigation timed out after 60s: %w", ctx.Err())
 		}
 
 		var recs []record
@@ -67,11 +67,11 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			recs = append(recs, record{role: roleError, text: "investigation error: " + engErr.Error()})
 		} else if result != nil {
 			var b strings.Builder
-			b.WriteString(fmt.Sprintf("Problem:    %s\n", result.Problem))
-			b.WriteString(fmt.Sprintf("Duration:   %s\n", result.Duration))
-			b.WriteString(fmt.Sprintf("Loops:      %d\n", result.Loops))
+			fmt.Fprintf(&b, "Problem:    %s\n", result.Problem)
+			fmt.Fprintf(&b, "Duration:   %s\n", result.Duration)
+			fmt.Fprintf(&b, "Loops:      %d\n", result.Loops)
 			if result.Resolved {
-				b.WriteString(fmt.Sprintf("Conclusion: %s\n", result.Conclusion))
+				fmt.Fprintf(&b, "Conclusion: %s\n", result.Conclusion)
 			} else {
 				b.WriteString("Status: Inconclusive\n")
 			}
@@ -86,7 +86,7 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 					case investigate.HypothesisRejected:
 						sym = "✗"
 					}
-					b.WriteString(fmt.Sprintf("  %s %s [%s] (%.0f%%)\n", sym, h.Theory, h.Status, h.Confidence*100))
+					fmt.Fprintf(&b, "  %s %s [%s] (%.0f%%)\n", sym, h.Theory, h.Status, h.Confidence*100)
 				}
 			}
 
@@ -97,12 +97,12 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 					if len(c) > 60 {
 						c = c[:60] + "…"
 					}
-					b.WriteString(fmt.Sprintf("  [%s] %s\n", ev.Source, c))
+					fmt.Fprintf(&b, "  [%s] %s\n", ev.Source, c)
 				}
 			}
 
 			if !result.Resolved && result.Error != "" {
-				b.WriteString(fmt.Sprintf("\nError: %s\n", result.Error))
+				fmt.Fprintf(&b, "\nError: %s\n", result.Error)
 			}
 
 			recs = append(recs, record{role: roleAI, text: b.String()})
@@ -122,13 +122,13 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 func buildInvestigationEscalation(content string, result *investigate.InvestigationResult, engErr error) string {
 	var escBuilder strings.Builder
 	escBuilder.WriteString("## LOCAL TELEMETRY DIAGNOSTICS\n\n")
-	escBuilder.WriteString(fmt.Sprintf("**Original User Query:** %s\n\n", content))
+	fmt.Fprintf(&escBuilder, "**Original User Query:** %s\n\n", content)
 
 	if result != nil {
-		escBuilder.WriteString(fmt.Sprintf("**Problem:** %s\n", result.Problem))
-		escBuilder.WriteString(fmt.Sprintf("**Duration:** %s\n", result.Duration))
-		escBuilder.WriteString(fmt.Sprintf("**Loops:** %d\n", result.Loops))
-		escBuilder.WriteString(fmt.Sprintf("**Resolved by engine:** %v\n\n", result.Resolved))
+		fmt.Fprintf(&escBuilder, "**Problem:** %s\n", result.Problem)
+		fmt.Fprintf(&escBuilder, "**Duration:** %s\n", result.Duration)
+		fmt.Fprintf(&escBuilder, "**Loops:** %d\n", result.Loops)
+		fmt.Fprintf(&escBuilder, "**Resolved by engine:** %v\n\n", result.Resolved)
 
 		if len(result.Hypotheses) > 0 {
 			escBuilder.WriteString("### Hypotheses Tested\n\n")
@@ -137,7 +137,7 @@ func buildInvestigationEscalation(content string, result *investigate.Investigat
 				if h.Status == investigate.HypothesisConfirmed {
 					statusSym = "✓"
 				}
-				escBuilder.WriteString(fmt.Sprintf("- **%s** — %s (%.0f%% confidence) %s\n", h.Theory, h.Status, h.Confidence*100, statusSym))
+				fmt.Fprintf(&escBuilder, "- **%s** — %s (%.0f%% confidence) %s\n", h.Theory, h.Status, h.Confidence*100, statusSym)
 			}
 			escBuilder.WriteString("\n")
 		}
@@ -145,24 +145,24 @@ func buildInvestigationEscalation(content string, result *investigate.Investigat
 		if len(result.Evidence) > 0 {
 			escBuilder.WriteString("### Evidence Collected\n\n")
 			for _, ev := range result.Evidence {
-				escBuilder.WriteString(fmt.Sprintf("- `[%s]` %s\n", ev.Source, ev.Content))
+				fmt.Fprintf(&escBuilder, "- `[%s]` %s\n", ev.Source, ev.Content)
 			}
 			escBuilder.WriteString("\n")
 		}
 
 		if result.Conclusion != "" {
-			escBuilder.WriteString(fmt.Sprintf("**Conclusion:** %s\n\n", result.Conclusion))
+			fmt.Fprintf(&escBuilder, "**Conclusion:** %s\n\n", result.Conclusion)
 		}
 
 		if result.Error != "" {
-			escBuilder.WriteString(fmt.Sprintf("**Engine Error:** %s\n\n", result.Error))
+			fmt.Fprintf(&escBuilder, "**Engine Error:** %s\n\n", result.Error)
 		}
 	} else {
 		escBuilder.WriteString("**Engine returned nil result**\n\n")
 	}
 
 	if engErr != nil {
-		escBuilder.WriteString(fmt.Sprintf("**Execution Error:** %s\n\n", engErr))
+		fmt.Fprintf(&escBuilder, "**Execution Error:** %s\n\n", engErr)
 	}
 
 	escBuilder.WriteString("---\n")
@@ -207,9 +207,9 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 			}
 
 			var b strings.Builder
-			b.WriteString(fmt.Sprintf("Review: %s → %s\n", result.BaseBranch, result.Branch))
-			b.WriteString(fmt.Sprintf("Commit: %s · Files Changed: %d · Duration: %s\n", result.CommitHash, len(result.FilesChanged), result.Duration))
-			b.WriteString(fmt.Sprintf("Score: %d/100 · Risk Score: %d/100\n", result.Score, result.ImpactRadius.RiskScore))
+			fmt.Fprintf(&b, "Review: %s → %s\n", result.BaseBranch, result.Branch)
+			fmt.Fprintf(&b, "Commit: %s · Files Changed: %d · Duration: %s\n", result.CommitHash, len(result.FilesChanged), result.Duration)
+			fmt.Fprintf(&b, "Score: %d/100 · Risk Score: %d/100\n", result.Score, result.ImpactRadius.RiskScore)
 
 			if len(result.FilesChanged) > 0 {
 				b.WriteString("\nFiles Changed:\n")
@@ -223,13 +223,13 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 					case "renamed":
 						sym = "→"
 					}
-					b.WriteString(fmt.Sprintf("  %s %s (+%d/-%d)\n", sym, f.Path, f.Additions, f.Deletions))
+					fmt.Fprintf(&b, "  %s %s (+%d/-%d)\n", sym, f.Path, f.Additions, f.Deletions)
 				}
 			}
 
 			if len(result.ImpactRadius.IndirectFiles) > 0 {
-				b.WriteString(fmt.Sprintf("\nImpact Radius:\n  Direct: %d · Indirect: %d · Affected Packages: %d\n",
-					len(result.ImpactRadius.DirectFiles), len(result.ImpactRadius.IndirectFiles), len(result.ImpactRadius.AffectedPkgs)))
+				fmt.Fprintf(&b, "\nImpact Radius:\n  Direct: %d · Indirect: %d · Affected Packages: %d\n",
+					len(result.ImpactRadius.DirectFiles), len(result.ImpactRadius.IndirectFiles), len(result.ImpactRadius.AffectedPkgs))
 			}
 
 			if len(result.RiskFindings) > 0 {
@@ -247,9 +247,9 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 					if len(findings) == 0 {
 						continue
 					}
-					b.WriteString(fmt.Sprintf("  [%s] %d findings:\n", strings.ToUpper(string(sev)), len(findings)))
+					fmt.Fprintf(&b, "  [%s] %d findings:\n", strings.ToUpper(string(sev)), len(findings))
 					for _, f := range findings {
-						b.WriteString(fmt.Sprintf("    • %s:%d — %s\n", f.File, f.Line, f.Description))
+						fmt.Fprintf(&b, "    • %s:%d — %s\n", f.File, f.Line, f.Description)
 					}
 				}
 			}
@@ -257,7 +257,7 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 			if len(result.Recommendations) > 0 {
 				b.WriteString("\nRecommendations:\n")
 				for i, rec := range result.Recommendations {
-					b.WriteString(fmt.Sprintf("  %d. %s\n", i+1, rec))
+					fmt.Fprintf(&b, "  %d. %s\n", i+1, rec)
 				}
 			}
 
@@ -268,7 +268,7 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 			return reviewResultMsg{
 				records:      recs,
 				sessionKey:   sessionKey,
-				saveReportFn: func() { review.SaveReport(savedResult, ".") },
+				saveReportFn: func() { _ = review.SaveReport(savedResult, ".") },
 			}
 		},
 	)
@@ -286,7 +286,7 @@ func (m *model) runUndoCmd() tea.Cmd {
 		return nil
 	}
 	m.sess.Checkpoints = checkpoints[:len(checkpoints)-1]
-	m.sess.Save()
+	_ = m.sess.Save()
 	m.push(roleStatus, fmt.Sprintf("undone: restored to checkpoint %s", lastID))
 	return nil
 }
@@ -350,7 +350,7 @@ func (m *model) runCommitCmdAgent() tea.Cmd {
 			checkpoints := m.sess.Checkpoints
 			if len(checkpoints) > 0 {
 				m.sess.Checkpoints = checkpoints[:len(checkpoints)-1]
-				m.sess.Save()
+				_ = m.sess.Save()
 			}
 			return commitGeneratedMsg{subject: msg.Subject, body: msg.Body, hash: hash}
 		},

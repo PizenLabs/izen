@@ -101,7 +101,7 @@ func filterFilesRecursive(prefix string) []string {
 	var results []string
 	_ = filepath.WalkDir(searchDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return err
 		}
 		if len(results) >= limit {
 			return filepath.SkipAll

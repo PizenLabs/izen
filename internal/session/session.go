@@ -248,6 +248,7 @@ func (s *Session) LogDir() string {
 }
 
 // WriteToGlobalLog appends a log entry to the global history log file.
+//
 // Deprecated: Use history.WriteToHistoryLog or audit package for dual-stream logging.
 func WriteToGlobalLog(pizenDir string, role, content string) error {
 	return WriteToHistoryLog(pizenDir, role, content)

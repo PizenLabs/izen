@@ -74,7 +74,7 @@ func (ps *ProximitySlicer) Extract(frame StackFrame) *ProximitySlice {
 			return nil
 		}
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	var allLines []string
 	scanner := bufio.NewScanner(file)
@@ -170,7 +170,7 @@ func findFile(root, target string) (string, error) {
 	var found string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			return err
 		}
 		if info.IsDir() {
 			return nil

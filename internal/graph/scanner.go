@@ -56,7 +56,7 @@ func Scan(cfg ScanConfig) (*ScanResult, error) {
 
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			return err
 		}
 
 		if info.IsDir() {
@@ -83,7 +83,7 @@ func Scan(cfg ScanConfig) (*ScanResult, error) {
 
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
-			return nil
+			return err
 		}
 
 		result.Files = append(result.Files, FileInfo{

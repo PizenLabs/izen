@@ -254,13 +254,13 @@ func FormatResultsAsSkeleton(results []lynx.SearchResult) string {
 		if r.Content == "" {
 			continue
 		}
-		b.WriteString(fmt.Sprintf("%s:%d\n", r.FilePath, r.StartLine))
+		fmt.Fprintf(&b, "%s:%d\n", r.FilePath, r.StartLine)
 		if r.SymbolName != "" {
-			b.WriteString(fmt.Sprintf("  %s\n", r.SymbolName))
+			fmt.Fprintf(&b, "  %s\n", r.SymbolName)
 		}
 		for _, line := range strings.Split(r.Content, "\n") {
 			if line != "" {
-				b.WriteString(fmt.Sprintf("  %s\n", line))
+				fmt.Fprintf(&b, "  %s\n", line)
 			}
 		}
 		b.WriteString("\n")

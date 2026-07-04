@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -207,7 +208,7 @@ func (g *JiraGateway) doRequest(method, path string, body interface{}) ([]byte, 
 		reqBody = strings.NewReader(string(data))
 	}
 
-	req, err := http.NewRequest(method, g.config.URL+path, reqBody)
+	req, err := http.NewRequestWithContext(context.Background(), method, g.config.URL+path, reqBody)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +221,7 @@ func (g *JiraGateway) doRequest(method, path string, body interface{}) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respData, err := io.ReadAll(resp.Body)
 	if err != nil {

@@ -121,7 +121,7 @@ func RunMainDashboard(cfg *config.Config, root string) {
 	sess, mgr, lc := bootCommon(root, cfg)
 
 	if lc != nil {
-		defer lc.Stop()
+		defer func() { _ = lc.Stop() }()
 	}
 
 	p := NewProgram(root, cfg, sess, mgr)
@@ -134,7 +134,7 @@ func RunRollbackEngine(cfg *config.Config, root string) {
 	fmt.Fprintf(os.Stderr, "izen: rollback engine stub — not yet implemented (root=%s)\n", root)
 
 	if lc != nil {
-		defer lc.Stop()
+		defer func() { _ = lc.Stop() }()
 	}
 
 	p := NewProgram(root, cfg, sess, mgr)

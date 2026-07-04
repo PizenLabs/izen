@@ -268,9 +268,9 @@ func FormatValidationError(v *ValidationResult) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("plan output schema violation: %d invalid line(s)\n", len(v.Invalid)))
+	fmt.Fprintf(&b, "plan output schema violation: %d invalid line(s)\n", len(v.Invalid))
 	for _, inv := range v.Invalid {
-		b.WriteString(fmt.Sprintf("  L%d: %s\n  └─ %s\n", inv.LineNumber, inv.Content, inv.Reason))
+		fmt.Fprintf(&b, "  L%d: %s\n  └─ %s\n", inv.LineNumber, inv.Content, inv.Reason)
 	}
 	b.WriteString("regeneration required — output must conform to the rigid schema")
 	return b.String()

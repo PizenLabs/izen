@@ -194,10 +194,10 @@ func (e *Engine) generateSummary(result *ReviewResult) {
 	var b strings.Builder
 
 	if e.target != "" {
-		b.WriteString(fmt.Sprintf("Auditing target: %s\n", e.target))
+		fmt.Fprintf(&b, "Auditing target: %s\n", e.target)
 	} else {
-		b.WriteString(fmt.Sprintf("Reviewing %d changed files in branch %s\n",
-			len(result.FilesChanged), result.Branch))
+		fmt.Fprintf(&b, "Reviewing %d changed files in branch %s\n",
+			len(result.FilesChanged), result.Branch)
 	}
 
 	totalAdditions := 0
@@ -206,13 +206,13 @@ func (e *Engine) generateSummary(result *ReviewResult) {
 		totalAdditions += f.Additions
 		totalDeletions += f.Deletions
 	}
-	b.WriteString(fmt.Sprintf("Changes: +%d/-%d lines\n", totalAdditions, totalDeletions))
+	fmt.Fprintf(&b, "Changes: +%d/-%d lines\n", totalAdditions, totalDeletions)
 
 	if len(result.ImpactRadius.IndirectFiles) > 0 {
-		b.WriteString(fmt.Sprintf("Impact radius: %d direct files, %d indirect files across %d packages\n",
+		fmt.Fprintf(&b, "Impact radius: %d direct files, %d indirect files across %d packages\n",
 			len(result.ImpactRadius.DirectFiles),
 			len(result.ImpactRadius.IndirectFiles),
-			len(result.ImpactRadius.AffectedPkgs)))
+			len(result.ImpactRadius.AffectedPkgs))
 	}
 
 	severityCounts := map[RiskSeverity]int{
@@ -226,14 +226,14 @@ func (e *Engine) generateSummary(result *ReviewResult) {
 		severityCounts[f.Severity]++
 	}
 
-	b.WriteString(fmt.Sprintf("Risk findings: %d critical, %d high, %d medium, %d low, %d info\n",
+	fmt.Fprintf(&b, "Risk findings: %d critical, %d high, %d medium, %d low, %d info\n",
 		severityCounts[RiskCritical],
 		severityCounts[RiskHigh],
 		severityCounts[RiskMedium],
 		severityCounts[RiskLow],
-		severityCounts[RiskInfo]))
+		severityCounts[RiskInfo])
 
-	b.WriteString(fmt.Sprintf("Risk score: %d/100\n", result.ImpactRadius.RiskScore))
+	fmt.Fprintf(&b, "Risk score: %d/100\n", result.ImpactRadius.RiskScore)
 
 	result.Summary = b.String()
 
@@ -335,17 +335,17 @@ func marshalReport(result *ReviewResult) []byte {
 	var b strings.Builder
 
 	b.WriteString("{\n")
-	b.WriteString(fmt.Sprintf("  \"branch\": %q,\n", result.Branch))
-	b.WriteString(fmt.Sprintf("  \"base_branch\": %q,\n", result.BaseBranch))
-	b.WriteString(fmt.Sprintf("  \"commit_hash\": %q,\n", result.CommitHash))
-	b.WriteString(fmt.Sprintf("  \"commits\": %d,\n", result.Commits))
-	b.WriteString(fmt.Sprintf("  \"score\": %d,\n", result.Score))
-	b.WriteString(fmt.Sprintf("  \"risk_score\": %d,\n", result.ImpactRadius.RiskScore))
-	b.WriteString(fmt.Sprintf("  \"files_changed\": %d,\n", len(result.FilesChanged)))
-	b.WriteString(fmt.Sprintf("  \"risk_findings\": %d,\n", len(result.RiskFindings)))
-	b.WriteString(fmt.Sprintf("  \"summary\": %q,\n", result.Summary))
-	b.WriteString(fmt.Sprintf("  \"duration\": %q,\n", result.Duration))
-	b.WriteString(fmt.Sprintf("  \"created_at\": %q\n", result.CreatedAt.Format(time.RFC3339)))
+	fmt.Fprintf(&b, "  \"branch\": %q,\n", result.Branch)
+	fmt.Fprintf(&b, "  \"base_branch\": %q,\n", result.BaseBranch)
+	fmt.Fprintf(&b, "  \"commit_hash\": %q,\n", result.CommitHash)
+	fmt.Fprintf(&b, "  \"commits\": %d,\n", result.Commits)
+	fmt.Fprintf(&b, "  \"score\": %d,\n", result.Score)
+	fmt.Fprintf(&b, "  \"risk_score\": %d,\n", result.ImpactRadius.RiskScore)
+	fmt.Fprintf(&b, "  \"files_changed\": %d,\n", len(result.FilesChanged))
+	fmt.Fprintf(&b, "  \"risk_findings\": %d,\n", len(result.RiskFindings))
+	fmt.Fprintf(&b, "  \"summary\": %q,\n", result.Summary)
+	fmt.Fprintf(&b, "  \"duration\": %q,\n", result.Duration)
+	fmt.Fprintf(&b, "  \"created_at\": %q\n", result.CreatedAt.Format(time.RFC3339))
 	b.WriteString("}\n")
 
 	return []byte(b.String())

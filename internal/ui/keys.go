@@ -37,7 +37,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.sess.SetMode(m.resolver.Current())
-			m.sess.Save()
+			_ = m.sess.Save()
 			return m, tea.Quit
 		}
 		// Wait for more ESC presses
@@ -54,7 +54,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.sess.SetMode(m.resolver.Current())
-		m.sess.Save()
+		_ = m.sess.Save()
 		return m, tea.Quit
 
 	// ── Enter: submit ─────────────────────────────────────────────────────────

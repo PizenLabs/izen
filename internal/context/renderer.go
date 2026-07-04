@@ -109,8 +109,8 @@ func (r *Renderer) renderFiles(b *strings.Builder, ctx *Context) {
 		r.renderFileSymbols(b, f)
 
 		if f.Lines > 0 {
-			b.WriteString(fmt.Sprintf("(%s, %d lines, %d symbols)\n\n",
-				filepath.Base(f.Path), f.Lines, len(f.Symbols)))
+			fmt.Fprintf(b, "(%s, %d lines, %d symbols)\n\n",
+				filepath.Base(f.Path), f.Lines, len(f.Symbols))
 		} else {
 			b.WriteString("\n")
 		}
@@ -131,7 +131,7 @@ func (r *Renderer) renderFileSymbols(b *strings.Builder, f FileSlice) {
 			b.WriteString(" ")
 			b.WriteString(sym.Signature)
 		}
-		b.WriteString(fmt.Sprintf(" [L%d]", sym.Line))
+		fmt.Fprintf(b, " [L%d]", sym.Line)
 		if sym.Exported {
 			b.WriteString(" (exported)")
 		}
@@ -168,7 +168,7 @@ func (r *Renderer) RenderCompact(ctx *Context) string {
 		b.WriteString(f.Path)
 		n := len(f.Symbols)
 		if n > 0 {
-			b.WriteString(fmt.Sprintf(" (%d syms)", n))
+			fmt.Fprintf(&b, " (%d syms)", n)
 		}
 		b.WriteString("\n")
 	}

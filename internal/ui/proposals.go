@@ -106,7 +106,7 @@ func buildSyntheticDiff(path, oldContent, newContent string) string {
 	b.WriteString("\n+++ b/")
 	b.WriteString(path)
 	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("@@ -1,%d +1,%d @@\n", len(oldLines), len(newLines)))
+	fmt.Fprintf(&b, "@@ -1,%d +1,%d @@\n", len(oldLines), len(newLines))
 
 	for _, line := range oldLines {
 		b.WriteString("-")

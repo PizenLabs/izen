@@ -586,8 +586,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				data = append(data, '\n')
 				auditPath := filepath.Join(".izen", "audit", "mutations.log")
 				if f, err := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600); err == nil {
-					f.Write(data)
-					f.Close()
+					_, _ = f.Write(data)
+					_ = f.Close()
 				}
 			}
 
@@ -805,7 +805,7 @@ func compileTaskListMarkdown(tasks *[]plan.Task) string {
 		} else if task.Status == "done" || task.IsDone {
 			glyph = "✓"
 		}
-		b.WriteString(fmt.Sprintf("%s **%s**: %s | %s\n\n", glyph, task.Type, task.Target, task.Description))
+		fmt.Fprintf(&b, "%s **%s**: %s | %s\n\n", glyph, task.Type, task.Target, task.Description)
 	}
 
 	return b.String()

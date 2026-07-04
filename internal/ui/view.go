@@ -159,14 +159,15 @@ func (m *model) renderPromptBox(width int) string {
 	}
 
 	var inner string
-	if m.agentRunning {
+	switch {
+	case m.agentRunning:
 		sp := m.renderFlowingSpinner()
 		label := lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render(m.agentLabel + "…")
 		inner = prefix + " " + sp + "  " + label
-	} else if m.streaming && m.responseBuffer.Len() == 0 {
+	case m.streaming && m.responseBuffer.Len() == 0:
 		sp := m.renderFlowingSpinner()
 		inner = prefix + " " + sp + "  " + infoStyle.Render("thinking…")
-	} else {
+	default:
 		// Use native m.ti.View() to delegate terminal hardware cursor coordination.
 		m.ti.Cursor.Style = lipgloss.NewStyle().Foreground(modeColor)
 		inner = prefix + " " + m.ti.View()
@@ -200,7 +201,7 @@ func (m *model) renderActiveWidget(width int) string {
 
 	if m.agentRunning {
 		var inner strings.Builder
-		inner.WriteString(fmt.Sprintf("● Running task: %s…\n", m.agentLabel))
+		fmt.Fprintf(&inner, "● Running task: %s…\n", m.agentLabel)
 		inner.WriteString("Execution in progress.")
 		return renderWidget("Progress", inner.String(), width, colorYellow)
 	}
@@ -306,13 +307,14 @@ func (m *model) renderFooter(width int) string {
 
 	var left, right string
 
-	if width < 50 {
+	switch {
+	case width < 50:
 		left = fmt.Sprintf("(%s)", branch)
 		right = safeStr
-	} else if width < 75 {
+	case width < 75:
 		left = fmt.Sprintf("workspace: %s (%s)", project, branch)
 		right = fmt.Sprintf("execution: %s", safeStr)
-	} else {
+	default:
 		provider := m.cfg.ActiveProviderName()
 		modelName := m.cfg.ActiveModelName()
 		left = fmt.Sprintf("workspace: %s (%s)   •   runtime: %s/%s", project, branch, provider, modelName)
@@ -388,13 +390,14 @@ func (m *model) renderStartupBanner(termWidth int) string {
 		" █  █ ",
 	}
 
-	rightCol := []string{
+	rightCol := make([]string, 0, 5+len(bannerModes))
+	rightCol = append(rightCol,
 		acS.Render(getGreeting()),
 		acS.Render("IZEN"),
 		txS.Render("engineering intelligence."),
 		txS.Render("human in control."),
 		"",
-	}
+	)
 	for _, mode := range bannerModes {
 		nameS := mnS.Render(mode.name)
 		descS := dmS.Render(mode.desc)
@@ -624,23 +627,24 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 				var prefixColor string
 				var text string
 
-				if strings.HasPrefix(item, "- [x]") || strings.HasPrefix(item, "[x]") || strings.HasPrefix(item, "✓") {
+				switch {
+				case strings.HasPrefix(item, "- [x]") || strings.HasPrefix(item, "[x]") || strings.HasPrefix(item, "✓"):
 					prefixChar = "✓ "
 					prefixColor = colorGreen
 					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [x]"), "[x]"), "✓"))
-				} else if strings.HasPrefix(item, "- [/]") || strings.HasPrefix(item, "[/]") || strings.HasPrefix(item, "●") {
+				case strings.HasPrefix(item, "- [/]") || strings.HasPrefix(item, "[/]") || strings.HasPrefix(item, "●"):
 					prefixChar = "● "
 					prefixColor = colorOrange
 					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [/]"), "[/]"), "●"))
-				} else if strings.HasPrefix(item, "- [ ]") || strings.HasPrefix(item, "[ ]") || strings.HasPrefix(item, "○") {
+				case strings.HasPrefix(item, "- [ ]") || strings.HasPrefix(item, "[ ]") || strings.HasPrefix(item, "○"):
 					prefixChar = "○ "
 					prefixColor = colorDimmed
 					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [ ]"), "[ ]"), "○"))
-				} else if strings.HasPrefix(item, "✗") {
+				case strings.HasPrefix(item, "✗"):
 					prefixChar = "✗ "
 					prefixColor = colorRed
 					text = strings.TrimSpace(strings.TrimPrefix(item, "✗"))
-				} else {
+				default:
 					prefixChar = "• "
 					prefixColor = colorText
 					text = item
@@ -752,7 +756,7 @@ func parseAIContent(content string) []contentBlock {
 	lines := strings.Split(content, "\n")
 
 	var currentBlock []string
-	var currentKind blockType = blockText
+	var currentKind = blockText
 
 	inCodeBlock := false
 	codeBlockLang := ""
@@ -783,11 +787,12 @@ func parseAIContent(content string) []contentBlock {
 				flush()
 				inCodeBlock = true
 				codeBlockLang = strings.TrimPrefix(trimmed, "```")
-				if strings.HasPrefix(codeBlockLang, "diff") {
+				switch {
+				case strings.HasPrefix(codeBlockLang, "diff"):
 					currentKind = blockDiff
-				} else if codeBlockLang == "bash" || codeBlockLang == "sh" {
+				case codeBlockLang == "bash" || codeBlockLang == "sh":
 					currentKind = blockCommand
-				} else {
+				default:
 					currentKind = blockText
 				}
 				currentBlock = append(currentBlock, line)

@@ -18,13 +18,13 @@ func (r *SymbolRenderer) Render(v SymbolCardViewModel) string {
 	if kind == "" {
 		kind = "Symbol"
 	}
-	b.WriteString(fmt.Sprintf("  Type:   %s\n", kind))
-	b.WriteString(fmt.Sprintf("  Symbol: %s\n", v.Name))
+	fmt.Fprintf(&b, "  Type:   %s\n", kind)
+	fmt.Fprintf(&b, "  Symbol: %s\n", v.Name)
 	if v.Module != "" {
-		b.WriteString(fmt.Sprintf("  Module: %s\n", v.Module))
+		fmt.Fprintf(&b, "  Module: %s\n", v.Module)
 	}
 	if v.Language != "" {
-		b.WriteString(fmt.Sprintf("  Lang:   %s\n", v.Language))
+		fmt.Fprintf(&b, "  Lang:   %s\n", v.Language)
 	}
 	return b.String()
 }
@@ -53,10 +53,10 @@ type ImpactRenderer struct {
 
 func (r *ImpactRenderer) Render(v ImpactCardViewModel) string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("  Direct:   %d file(s) modified\n", v.DirectCount))
-	b.WriteString(fmt.Sprintf("  Indirect: %d downstream caller(s) affected\n", v.IndirectCount))
+	fmt.Fprintf(&b, "  Direct:   %d file(s) modified\n", v.DirectCount)
+	fmt.Fprintf(&b, "  Indirect: %d downstream caller(s) affected\n", v.IndirectCount)
 	if v.RiskScore > 0 {
-		b.WriteString(fmt.Sprintf("  Score:    %d/100\n", v.RiskScore))
+		fmt.Fprintf(&b, "  Score:    %d/100\n", v.RiskScore)
 	}
 	if v.HasAPIChanges {
 		b.WriteString("  Scope:    PUBLIC API (Breaking Risk)\n")
@@ -160,7 +160,8 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 
 		if r.IsNewFile {
 			// NEW FILE: Single-column line numbers (right-aligned, fixed padding)
-			if strings.HasPrefix(line, "+") {
+			switch {
+			case strings.HasPrefix(line, "+"):
 				cleanLine := strings.TrimPrefix(line, "+")
 				wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
 
@@ -175,10 +176,10 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 					textStr := styleAddition.Width(contentWidth).Render(wl)
 					renderedLines = append(renderedLines, gutterStr+textStr)
 				}
-			} else if strings.HasPrefix(line, "-") {
+			case strings.HasPrefix(line, "-"):
 				// Skip deletions in new file mode (shouldn't happen, but safe)
 				continue
-			} else {
+			default:
 				// Context lines (rare in new files, but handle gracefully)
 				wrappedLines := wrapStringToWidth(line, contentWidth)
 				for i, wl := range wrappedLines {
@@ -195,7 +196,8 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 			}
 		} else {
 			// STANDARD DIFF: Dual-column line numbers (old | new)
-			if strings.HasPrefix(line, "-") {
+			switch {
+			case strings.HasPrefix(line, "-"):
 				cleanLine := strings.TrimPrefix(line, "-")
 				wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
 
@@ -210,7 +212,7 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 					textStr := styleDeletion.Width(contentWidth).Render(wl)
 					renderedLines = append(renderedLines, gutterStr+textStr)
 				}
-			} else if strings.HasPrefix(line, "+") {
+			case strings.HasPrefix(line, "+"):
 				cleanLine := strings.TrimPrefix(line, "+")
 				wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
 
@@ -225,7 +227,7 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 					textStr := styleAddition.Width(contentWidth).Render(wl)
 					renderedLines = append(renderedLines, gutterStr+textStr)
 				}
-			} else {
+			default:
 				wrappedLines := wrapStringToWidth(line, contentWidth)
 
 				for i, wl := range wrappedLines {

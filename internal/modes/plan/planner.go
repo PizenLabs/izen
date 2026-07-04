@@ -291,7 +291,7 @@ func (p *Planner) buildDirectoryMap(seen map[string]bool) string {
 
 	var b strings.Builder
 	b.WriteString("### DIRECTORY BOUNDARY MAP\n")
-	b.WriteString(fmt.Sprintf("PROJECT ROOT: %s\n", p.root))
+	fmt.Fprintf(&b, "PROJECT ROOT: %s\n", p.root)
 	b.WriteString("ABSOLUTE BOUNDARY: All paths are relative to project root.\n")
 	b.WriteString("No paths outside this tree may be referenced.\n\n")
 
@@ -301,12 +301,12 @@ func (p *Planner) buildDirectoryMap(seen map[string]bool) string {
 			files = files[:8]
 			files = append(files, "...")
 		}
-		b.WriteString(fmt.Sprintf("  %s/  (%d file(s))\n", d, len(dirs[d])))
+		fmt.Fprintf(&b, "  %s/  (%d file(s))\n", d, len(dirs[d]))
 		if d == "/" {
 			continue
 		}
 		for _, f := range files {
-			b.WriteString(fmt.Sprintf("    %s\n", f))
+			fmt.Fprintf(&b, "    %s\n", f)
 		}
 	}
 	return b.String()
@@ -320,12 +320,13 @@ func (p *Planner) renderAssembly(result *AssemblyResult) string {
 		b.WriteString("### MODIFIED FILES\n")
 		for _, e := range result.DirtyFiles {
 			label := "modified"
-			if e.Staging == "?" {
+			switch e.Staging {
+			case "?":
 				label = "untracked"
-			} else if e.Staging == "M" {
+			case "M":
 				label = "staged"
 			}
-			b.WriteString(fmt.Sprintf("  %s: %s\n", label, e.Path))
+			fmt.Fprintf(&b, "  %s: %s\n", label, e.Path)
 		}
 		b.WriteString("\n")
 	}
@@ -334,15 +335,15 @@ func (p *Planner) renderAssembly(result *AssemblyResult) string {
 	if len(result.SymbolFiles) > 0 {
 		b.WriteString("### RELEVANT SYMBOLS\n")
 		for _, sf := range result.SymbolFiles {
-			b.WriteString(fmt.Sprintf("  %s", sf.Path))
+			fmt.Fprintf(&b, "  %s", sf.Path)
 			if sf.Package != "" {
-				b.WriteString(fmt.Sprintf(" (pkg: %s)", sf.Package))
+				fmt.Fprintf(&b, " (pkg: %s)", sf.Package)
 			}
 			b.WriteString("\n")
 			for _, sym := range sf.Symbols {
-				b.WriteString(fmt.Sprintf("    %s %s", sym.Kind, sym.Name))
+				fmt.Fprintf(&b, "    %s %s", sym.Kind, sym.Name)
 				if sym.Signature != "" {
-					b.WriteString(fmt.Sprintf(" %s", sym.Signature))
+					fmt.Fprintf(&b, " %s", sym.Signature)
 				}
 				if sym.Exported {
 					b.WriteString(" (exported)")
@@ -361,7 +362,7 @@ func (p *Planner) renderAssembly(result *AssemblyResult) string {
 
 	// Section 4: User objective.
 	b.WriteString("### USER OBJECTIVE\n")
-	b.WriteString(fmt.Sprintf("%s\n", result.getObjective()))
+	fmt.Fprintf(&b, "%s\n", result.getObjective())
 
 	return b.String()
 }

@@ -60,7 +60,7 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 
 	if !v.Expanded {
 		// COLLAPSED: Render compact header + action buttons (always visible)
-		var lines []string
+		lines := make([]string, 0, 6)
 		lines = append(lines, border)
 		lines = append(lines, headerLine)
 
@@ -176,13 +176,13 @@ func wrapText(text string, maxWidth int) []string {
 	var currentLine strings.Builder
 
 	for _, word := range words {
-		if currentLine.Len() == 0 {
+		switch {
+		case currentLine.Len() == 0:
 			currentLine.WriteString(word)
-		} else if currentLine.Len()+1+len(word) <= maxWidth {
+		case currentLine.Len()+1+len(word) <= maxWidth:
 			currentLine.WriteString(" ")
 			currentLine.WriteString(word)
-		} else {
-			// Current line is full, start a new one
+		default:
 			lines = append(lines, currentLine.String())
 			currentLine.Reset()
 			currentLine.WriteString(word)

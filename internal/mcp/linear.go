@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -270,7 +271,7 @@ func (g *LinearGateway) doRequest(variables interface{}) ([]byte, error) {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", "https://api.linear.app/graphql", strings.NewReader(string(data)))
+	req, err := http.NewRequestWithContext(context.Background(), "POST", "https://api.linear.app/graphql", strings.NewReader(string(data)))
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +283,7 @@ func (g *LinearGateway) doRequest(variables interface{}) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respData, err := io.ReadAll(resp.Body)
 	if err != nil {

@@ -87,7 +87,7 @@ func InitGlobalState() error {
 	info, err := os.Stat(providersPath)
 	if err == nil {
 		if info.Mode().Perm() != 0600 {
-			os.Chmod(providersPath, 0600)
+			_ = os.Chmod(providersPath, 0600)
 		}
 	}
 

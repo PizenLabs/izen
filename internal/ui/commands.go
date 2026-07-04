@@ -3,6 +3,7 @@ package ui
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -151,8 +152,8 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 					if fileCtx.Len() > 0 {
 						fileCtx.WriteString("\n\n")
 					}
-					fileCtx.WriteString(fmt.Sprintf("File: %s\n```%s\n%s\n```",
-						ref, lang, strings.Join(lines, "\n")))
+					fmt.Fprintf(&fileCtx, "File: %s\n```%s\n%s\n```",
+						ref, lang, strings.Join(lines, "\n"))
 				}
 			}
 		}
@@ -167,7 +168,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			}
 			ext := filepath.Ext(ref)
 			lang := strings.TrimPrefix(ext, ".")
-			fileCtx.WriteString(fmt.Sprintf("File: %s\n```%s\n%s\n```", ref, lang, string(data)))
+			fmt.Fprintf(&fileCtx, "File: %s\n```%s\n%s\n```", ref, lang, string(data))
 		}
 	}
 
@@ -295,7 +296,7 @@ func (m *model) setMode(mode modes.Mode) {
 	}
 	m.startModeTransition(mode)
 	m.sess.SetMode(mode)
-	m.sess.Save()
+	_ = m.sess.Save()
 	modeColor := modeAccentColor(mode)
 	modeLabel := lipgloss.NewStyle().Foreground(modeColor).Render(
 		fmt.Sprintf("→ /%s — %s", mode, mode.Description()))
@@ -332,7 +333,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 	case cmd == "/quit":
 		m.sess.SetMode(m.resolver.Current())
-		m.sess.Save()
+		_ = m.sess.Save()
 		m.push(roleSystem, "goodbye.")
 		return tea.Quit
 
@@ -360,7 +361,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 				m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
 			}
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
-			m.sess.Save()
+			_ = m.sess.Save()
 			m.uiNotice = "Objective approved for outbound pipelines."
 			return nil
 		}
@@ -369,7 +370,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			obj := domain.NewObjective(objArg)
 			obj.CurrentStatus = domain.ObjectiveAnalyzing
 			m.sess.SetObjectiveState(obj)
-			m.sess.Save()
+			_ = m.sess.Save()
 			m.uiNotice = "Objective analysis started."
 			return m.analyzeObjectiveCmd(obj)
 		} else {
@@ -474,7 +475,7 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	}
 	targetTask.Status = "processing"
 	m.sess.StageTaskList(&tasks)
-	m.sess.Save()
+	_ = m.sess.Save()
 	m.push(roleStatus, fmt.Sprintf("executing step %d: %s — %s", targetTask.StepNum, targetTask.Type, targetTask.Target))
 
 	content := fmt.Sprintf("Execute step %d: %s\nTarget: %s\nDescription: %s",
@@ -495,7 +496,7 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 }
 
 func execShell(cmd string) (string, error) {
-	c := exec.Command("bash", "-c", cmd)
+	c := exec.CommandContext(context.Background(), "bash", "-c", cmd)
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr

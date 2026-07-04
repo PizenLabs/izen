@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -51,7 +52,6 @@ func main() {
 	// Step 4: Test non-streaming request
 	fmt.Println("[4/5] Testing NON-STREAMING request...")
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
 
 	resp, err := provider.Execute(ctx, ai.Request{
 		Model: ollamaCfg.DefaultModel,
@@ -71,12 +71,12 @@ func main() {
 		fmt.Println(resp.Content)
 		fmt.Println("       --------------------------------------------------")
 	}
+	cancel()
 	fmt.Println()
 
 	// Step 5: Test streaming request
 	fmt.Println("[5/5] Testing STREAMING request (SSE)...")
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel2()
 
 	stream, err := provider.ExecuteStream(ctx2, ai.Request{
 		Model: ollamaCfg.DefaultModel,
@@ -90,7 +90,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "ERROR: stream execution failed: %v\n", err)
 		os.Exit(1)
 	}
-	defer stream.Close()
+	defer cancel2()
+	defer func() { _ = stream.Close() }()
 
 	fmt.Println("       Raw SSE byte stream output:")
 	fmt.Println("       --------------------------------------------------")
@@ -116,9 +117,9 @@ func main() {
 	fmt.Println()
 
 	fmt.Println("=== Diagnostic Complete ===")
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) {
 		fmt.Printf("Result: PARTIAL FAILURE - %v\n", err)
-		os.Exit(1)
+		return
 	}
 	fmt.Println("Result: SUCCESS")
 }
