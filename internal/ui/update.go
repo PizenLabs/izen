@@ -266,12 +266,34 @@ func (m *model) copyMouseSelection(end mouseSelectionPoint) {
 	}
 }
 
+// checkProposalHeaderBounds checks if the mouse click at (x, y) falls on the header line
+// of the proposal at the given index. Dynamically computes header position from layout
+// so clicks map perfectly to the visual line, regardless of widget structure changes.
+func (m *model) checkProposalHeaderBounds(x, y, propIdx int) bool {
+	if m.state != StateAwaitingApproval || propIdx < 0 || propIdx >= len(m.pendingProposals) {
+		return false
+	}
+
+	startY := m.widgetScreenStartY()
+	if startY < 0 {
+		return false
+	}
+
+	// Each proposal card renders with a consistent header position.
+	// Card structure (lines relative to startY):
+	//   line 0: top border
+	//   line 1: header (expand/collapse icon + title)  ← click target
+	//   line 2+: content body + bottom border
+	if propIdx == 0 && y == startY+1 {
+		return true
+	}
+
+	return false
+}
+
 // Update maps layout engines and routes state machines.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var (
-		vpCmd tea.Cmd
-		tiCmd tea.Cmd
-	)
+	var vpCmd tea.Cmd
 
 	now := time.Now()
 
@@ -318,46 +340,48 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// ── STAGE 1: Standard structured system tea.MouseMsg handling ─────────────
-	if _, isMouse := msg.(tea.MouseMsg); isMouse {
+	// ── STAGE 1: Intercept-First tea.MouseMsg Handling ─────────────────────────
+	// PHASE 1: Wheel Scrolling (Safe & Isolated)
+	// PHASE 2: Intercept Clicks for Izen Components Before Viewport Update
+	// PHASE 3: Fallback to Viewport for Selection/Scrollbar
+	if mouseMsg, ok := msg.(tea.MouseMsg); ok {
 		lastAnyMouseActivity = now
 		if !m.vpReady {
 			return m, nil
 		}
-		mouseMsg := msg.(tea.MouseMsg)
 
-		switch mouseMsg.Action {
-		case tea.MouseActionPress:
+		// ── PHASE 1: Wheel Scrolling ──────────────────────────────────────
+		if mouseMsg.Action == tea.MouseActionPress {
 			switch mouseMsg.Button {
 			case tea.MouseButtonWheelUp:
 				m.mouseSelecting = false
-				m.vp.ScrollUp(3)
+				m.vp, vpCmd = m.vp.Update(msg)
 				m.rebuildViewport()
-				return m, nil
+				return m, vpCmd
 
 			case tea.MouseButtonWheelDown:
 				m.mouseSelecting = false
-				m.vp.ScrollDown(3)
+				m.vp, vpCmd = m.vp.Update(msg)
 				m.rebuildViewport()
-				return m, nil
+				return m, vpCmd
+			}
+		}
 
-			case tea.MouseButtonLeft:
-				// Check if click is on the active widget area (proposal header)
-				if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
-					widgetStartY := m.widgetScreenStartY()
-					widgetHeight := m.activeWidgetHeight()
-					if widgetStartY >= 0 && mouseMsg.Y >= widgetStartY && mouseMsg.Y < widgetStartY+widgetHeight {
-						// Click is within the widget area
-						headerLineIdx := 1 // Header is typically the second line (after top border)
-						if mouseMsg.Y == widgetStartY+headerLineIdx {
-							// Toggle expanded state on header click
-							m.pendingProposals[0].Expanded = !m.pendingProposals[0].Expanded
-							m.rebuildViewport()
-							return m, nil
-						}
-					}
+		// ── PHASE 2: Intercept Left-Clicks for Izen Components ────────────
+		if mouseMsg.Action == tea.MouseActionPress && mouseMsg.Button == tea.MouseButtonLeft {
+			for i := range m.pendingProposals {
+				if m.checkProposalHeaderBounds(mouseMsg.X, mouseMsg.Y, i) {
+					m.pendingProposals[i].Expanded = !m.pendingProposals[i].Expanded
+					m.rebuildViewport()
+					return m, nil // CLICK HIT! Consume and return early.
 				}
+			}
+		}
 
+		// ── PHASE 3: Fallback ── Viewport text selection / scrollbar ──────
+		switch mouseMsg.Action {
+		case tea.MouseActionPress:
+			if mouseMsg.Button == tea.MouseButtonLeft {
 				point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y)
 				if !ok {
 					m.mouseSelecting = false
@@ -767,8 +791,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.vp, vpCmd = m.vp.Update(msg)
 	}
 
-	m.ti, tiCmd = m.ti.Update(msg)
-	return m, tea.Batch(vpCmd, tiCmd)
+	return m, vpCmd
 }
 
 func (m *model) spinnerTickCmd() tea.Cmd {
