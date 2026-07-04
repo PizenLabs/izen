@@ -268,26 +268,6 @@ func (m *model) suggestionPaletteHeight() int {
 	return len(strings.Split(palette, "\n"))
 }
 
-// widgetScreenStartY calculates the Y coordinate on screen where the active widget area begins.
-func (m *model) widgetScreenStartY() int {
-	y := 0
-	// Top bar (if visible)
-	if m.sess != nil && m.sess.ObjectiveState != nil {
-		rawIntent := strings.TrimSpace(m.sess.ObjectiveState.RawIntent)
-		if rawIntent != "" || len(m.sess.ObjectiveState.Scope.Files) > 0 {
-			y++
-		}
-	}
-	// Viewport — use actual rendered line count, not configured Height,
-	// because bubbletea's viewport may return fewer lines when content
-	// is shorter than the viewport window (it does not pad to Height).
-	vpView := m.vp.View()
-	y += len(strings.Split(vpView, "\n"))
-	// Suggestions
-	y += m.suggestionPaletteHeight()
-	return y
-}
-
 // wrapStreamText wraps raw text lines dynamically during an active live stream.
 func wrapStreamText(text string, maxW int) []string {
 	if len(text) == 0 {

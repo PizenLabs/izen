@@ -124,12 +124,13 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 			if len(word) == 0 {
 				continue
 			}
-			if currentLine.Len() == 0 {
+			switch {
+			case currentLine.Len() == 0:
 				currentLine.WriteString(word)
-			} else if currentLine.Len()+1+len(word) <= maxW {
+			case currentLine.Len()+1+len(word) <= maxW:
 				currentLine.WriteString(" ")
 				currentLine.WriteString(word)
-			} else {
+			default:
 				chunks = append(chunks, currentLine.String())
 				currentLine.Reset()
 				currentLine.WriteString(word)

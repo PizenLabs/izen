@@ -149,7 +149,6 @@ var (
 	// Accepted green dot — single-line collapsed summary
 	acceptedDotStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen)).Render("●")
 	acceptedLineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
-	acceptedMutedSty  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 
 	// Shell execution proposal
 	shellWarningStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorOrange))
