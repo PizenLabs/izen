@@ -124,13 +124,12 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 			if len(word) == 0 {
 				continue
 			}
-			switch {
-			case currentLine.Len() == 0:
+			if currentLine.Len() == 0 {
 				currentLine.WriteString(word)
-			case currentLine.Len()+1+len(word) <= maxW:
+			} else if currentLine.Len()+1+len(word) <= maxW {
 				currentLine.WriteString(" ")
 				currentLine.WriteString(word)
-			default:
+			} else {
 				chunks = append(chunks, currentLine.String())
 				currentLine.Reset()
 				currentLine.WriteString(word)
@@ -271,8 +270,6 @@ type MutationRenderer struct {
 }
 
 func (r *MutationRenderer) Render(v MutationCardViewModel) string {
-	var lines []string
-
 	contentWidth := r.Width - 4
 	if contentWidth < 20 {
 		contentWidth = 20
@@ -284,6 +281,13 @@ func (r *MutationRenderer) Render(v MutationCardViewModel) string {
 		border = "─"
 	}
 
+	toggleLabel := "[▼ Expand]"
+	if v.Expanded {
+		toggleLabel = "[▲ Collapse]"
+	}
+	actionLine := "  [A] Accept  [L] Allow All  [R] Reject  [P] Toggle"
+
+	// Header with inline toggle: "Edit • filename [▼ Expand]"
 	header := "Edit"
 	if v.Target.Name != "" {
 		symbolName := v.Target.Name
@@ -301,62 +305,7 @@ func (r *MutationRenderer) Render(v MutationCardViewModel) string {
 	} else {
 		header += " • Unknown"
 	}
-
-	// Footer with expand/collapse toggle + actions
-	expandIcon := "❯"
-	if v.Expanded {
-		expandIcon = "▼"
-	}
-	footerLine := fmt.Sprintf("%s  [A] Accept  [L] Allow All  [R] Reject",
-		expandStyle.Render(expandIcon))
-
-	lines = append(lines, border)
-	lines = append(lines, header)
-
-	if !v.Expanded {
-		scope := "Internal"
-		if v.Impact.HasAPIChanges {
-			scope = "Public"
-		}
-		riskLevel := v.Risk.Level
-		if riskLevel == "" {
-			riskLevel = "UNKNOWN"
-		}
-		lines = append(lines, expandStyle.Render("  Scope "+scope+" | Risk "+riskLevel))
-		lines = append(lines, "")
-		lines = append(lines, footerLine)
-		lines = append(lines, "")
-		lines = append(lines, border)
-		return strings.Join(lines, "\n")
-	}
-
-	// EXPANDED
-	lines = append(lines, "")
-
-	if v.SemanticSummary != "" {
-		wrappedSummary := wrapText(v.SemanticSummary, contentWidth)
-		if len(wrappedSummary) > 2 {
-			wrappedSummary = wrappedSummary[:2]
-		}
-		for _, line := range wrappedSummary {
-			if len(line) > 0 {
-				lines = append(lines, line)
-			}
-		}
-		lines = append(lines, "")
-	}
-
-	if v.Diff.Content != "" {
-		dr := &DiffRenderer{Width: contentWidth, IsNewFile: v.IsNewFile}
-		diffRendered := dr.Render(v.Diff)
-		diffLines := strings.Split(diffRendered, "\n")
-		for _, line := range diffLines {
-			if len(line) > 0 {
-				lines = append(lines, line)
-			}
-		}
-		lines = append(lines, "")
-	}
+	headerLine := header + " " + toggleLabel
 
 	scope := "Internal"
 	if v.Impact.HasAPIChanges {
@@ -366,14 +315,60 @@ func (r *MutationRenderer) Render(v MutationCardViewModel) string {
 	if riskLevel == "" {
 		riskLevel = "UNKNOWN"
 	}
-	lines = append(lines, formatCompactField("Scope", scope, contentWidth))
-	lines = append(lines, formatCompactField("Risk", riskLevel, contentWidth))
+	metadataLine := expandStyle.Render("  Scope " + scope + " | Risk " + riskLevel)
+
+	if !v.Expanded {
+		// COLLAPSED: header + metadata + action keys
+		lines := make([]string, 0, 6)
+		lines = append(lines, border)
+		lines = append(lines, headerLine)
+		lines = append(lines, metadataLine)
+		lines = append(lines, "")
+		lines = append(lines, actionLine)
+		lines = append(lines, "")
+		lines = append(lines, border)
+		return strings.Join(lines, "\n")
+	}
+
+	// EXPANDED: header + metadata + bounded diff + action keys
+	lines := make([]string, 0, 20)
+	lines = append(lines, border)
+	lines = append(lines, headerLine)
+	lines = append(lines, metadataLine)
 	lines = append(lines, "")
 
-	// Sticky footer with toggle + actions
-	lines = append(lines, footerLine)
-	lines = append(lines, "")
+	// Bounded diff content — scrollable via ScrollOffset
+	if v.Diff.Content != "" {
+		dr := &DiffRenderer{Width: contentWidth, IsNewFile: v.IsNewFile}
+		diffRendered := dr.Render(v.Diff)
+		diffLines := strings.Split(diffRendered, "\n")
 
+		total := len(diffLines)
+		start := r.ScrollOffset
+		if start >= total {
+			start = 0
+		}
+		end := start + maxProposalDiffHeight
+		if end > total {
+			end = total
+		}
+
+		for _, line := range diffLines[start:end] {
+			if len(line) > 0 {
+				lines = append(lines, line)
+			}
+		}
+
+		if end < total || start > 0 {
+			scrollHint := "  " + expandStyle.Render("(scroll ↑↓)")
+			lines = append(lines, scrollHint)
+		}
+		lines = append(lines, "")
+	}
+
+	// Action keys
+	lines = append(lines, actionLine)
+	lines = append(lines, "")
 	lines = append(lines, border)
 	return strings.Join(lines, "\n")
 }

@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -26,7 +25,13 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 
 	expandStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 
-	// Header text — no expand/collapse toggle (moved to footer)
+	toggleLabel := "[▼ Expand]"
+	if v.Expanded {
+		toggleLabel = "[▲ Collapse]"
+	}
+	actionLine := "  [A] Accept  [L] Allow All  [R] Reject  [P] Toggle"
+
+	// Header with inline toggle: "Edit • filename [▼ Expand]"
 	headerText := "Edit"
 	if v.Target.Name != "" {
 		symbolName := v.Target.Name
@@ -44,71 +49,7 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 	} else {
 		headerText += " • Unknown"
 	}
-
-	// Footer line: expand/collapse toggle + action keybindings — always visible, anchored at bottom
-	expandIcon := "❯"
-	if v.Expanded {
-		expandIcon = "▼"
-	}
-	footerLine := fmt.Sprintf("%s  [A] Accept  [L] Allow All  [R] Reject",
-		expandStyle.Render(expandIcon))
-
-	if !v.Expanded {
-		// COLLAPSED: compact header + metadata + sticky footer
-		lines := make([]string, 0, 7)
-		lines = append(lines, border)
-		lines = append(lines, headerText)
-
-		scope := "Internal"
-		if v.Impact.HasAPIChanges {
-			scope = "Public"
-		}
-		riskLevel := v.Risk.Level
-		if riskLevel == "" {
-			riskLevel = "UNKNOWN"
-		}
-		metadata := fmt.Sprintf("Scope %s | Risk %s", scope, riskLevel)
-		lines = append(lines, expandStyle.Render("  "+metadata))
-
-		lines = append(lines, "") // spacing
-		lines = append(lines, footerLine)
-		lines = append(lines, "") // spacing before border
-		lines = append(lines, border)
-		return strings.Join(lines, "\n")
-	}
-
-	// EXPANDED: full diff view + sticky footer
-	var lines []string
-	lines = append(lines, border)
-	lines = append(lines, headerText)
-	lines = append(lines, "")
-
-	// Semantic Summary
-	if v.SemanticSummary != "" {
-		summaryLines := wrapText(v.SemanticSummary, contentWidth)
-		if len(summaryLines) > 2 {
-			summaryLines = summaryLines[:2]
-		}
-		for _, line := range summaryLines {
-			if len(line) > 0 {
-				lines = append(lines, "  "+line)
-			}
-		}
-		lines = append(lines, "")
-	}
-
-	// Diff content
-	if v.Diff.Content != "" {
-		dr := &DiffRenderer{Width: contentWidth, IsNewFile: v.IsNewFile}
-		diffRendered := dr.Render(v.Diff)
-		diffLines := strings.Split(diffRendered, "\n")
-		for _, line := range diffLines {
-			if len(line) > 0 {
-				lines = append(lines, line)
-			}
-		}
-		lines = append(lines, "")
-	}
+	headerLine := headerText + " " + toggleLabel
 
 	scope := "Internal"
 	if v.Impact.HasAPIChanges {
@@ -118,14 +59,122 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 	if riskLevel == "" {
 		riskLevel = "UNKNOWN"
 	}
-	lines = append(lines, formatCompactField("Scope", scope, contentWidth))
-	lines = append(lines, formatCompactField("Risk", riskLevel, contentWidth))
+	metadataLine := expandStyle.Render("  Scope " + scope + " | Risk " + riskLevel)
+
+	if !v.Expanded {
+		// COLLAPSED: header + metadata + action keys
+		lines := make([]string, 0, 6)
+		lines = append(lines, border)
+		lines = append(lines, headerLine)
+		lines = append(lines, metadataLine)
+		lines = append(lines, "")
+		lines = append(lines, actionLine)
+		lines = append(lines, "")
+		lines = append(lines, border)
+		return strings.Join(lines, "\n")
+	}
+
+	// EXPANDED: header + metadata + bounded diff + action keys
+	lines := make([]string, 0, 20)
+	lines = append(lines, border)
+	lines = append(lines, headerLine)
+	lines = append(lines, metadataLine)
 	lines = append(lines, "")
 
-	// Sticky footer with toggle + actions
-	lines = append(lines, footerLine)
-	lines = append(lines, "") // spacing before bottom border
+	// Bounded diff content — scrollable via proposalDiffOffset
+	if v.Diff.Content != "" {
+		dr := &DiffRenderer{Width: contentWidth, IsNewFile: v.IsNewFile}
+		diffRendered := dr.Render(v.Diff)
+		diffLines := strings.Split(diffRendered, "\n")
 
+		total := len(diffLines)
+		start := r.ScrollOffset
+		if start >= total {
+			start = 0
+		}
+		end := start + maxProposalDiffHeight
+		if end > total {
+			end = total
+		}
+
+		for _, line := range diffLines[start:end] {
+			if len(line) > 0 {
+				lines = append(lines, line)
+			}
+		}
+
+		if end == total && start == 0 && len(diffLines) > 0 {
+			// all lines fit — no indicator
+		} else if end < total || start > 0 {
+			scrollHint := "  " + expandStyle.Render("(scroll ↑↓)")
+			lines = append(lines, scrollHint)
+		}
+		lines = append(lines, "")
+	}
+
+	// Action keys
+	lines = append(lines, actionLine)
+	lines = append(lines, "")
 	lines = append(lines, border)
 	return strings.Join(lines, "\n")
+}
+// formatCompactField creates a compact field: "Label Value" (no extra padding)
+func formatCompactField(label, value string, maxWidth int) string {
+	if len(label)+1+len(value) > maxWidth {
+		if len(value) > maxWidth-3 {
+			value = value[:maxWidth-3]
+		}
+		availableForLabel := maxWidth - len(value) - 1
+		if availableForLabel > 0 && len(label) > availableForLabel {
+			label = label[:availableForLabel]
+		}
+	}
+	return label + " " + value
+}
+
+// wrapText wraps text to fit within maxWidth, respecting word boundaries.
+// Words longer than maxWidth are split across lines to prevent terminal wrapping.
+func wrapText(text string, maxWidth int) []string {
+	if maxWidth <= 0 {
+		return []string{text}
+	}
+
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return []string{""}
+	}
+
+	var lines []string
+	var currentLine strings.Builder
+
+	for _, word := range words {
+		for len(word) > maxWidth {
+			if currentLine.Len() > 0 {
+				lines = append(lines, currentLine.String())
+				currentLine.Reset()
+			}
+			lines = append(lines, word[:maxWidth])
+			word = word[maxWidth:]
+		}
+		if len(word) == 0 {
+			continue
+		}
+		switch {
+		case currentLine.Len() == 0:
+			currentLine.WriteString(word)
+		case currentLine.Len()+1+len(word) <= maxWidth:
+			currentLine.WriteString(" ")
+			currentLine.WriteString(word)
+		default:
+			lines = append(lines, currentLine.String())
+			currentLine.Reset()
+			currentLine.WriteString(word)
+		}
+	}
+
+	if currentLine.Len() > 0 {
+		lines = append(lines, currentLine.String())
+	}
+
+	return lines
 }
