@@ -2,24 +2,37 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches:
+      - main
+      - develop
+
   pull_request:
-    branches: [main, develop]
+    branches:
+      - main
+      - develop
 
 permissions:
   contents: read
 
+env:
+  GO_VERSION: stable
+
 jobs:
   go:
-    name: Go Tests & Lint
+    name: Go
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v6
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          go-version: stable
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
           cache: true
 
       - name: Show Go version
@@ -28,175 +41,139 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Verify modules
+        run: go mod verify
+
       - name: Run go vet
         run: go vet ./...
 
-      - uses: dominikh/staticcheck-action@v1.4.1
+      - name: Run staticcheck
+        uses: dominikh/staticcheck-action@v1.4.1
         with:
           version: latest
 
       - name: Run tests with coverage
         run: |
-          go test -race -count=1 \
+          go test \
+            -race \
+            -count=1 \
             -covermode=atomic \
             -coverprofile=coverage-go.out \
             ./...
 
-      - name: Run vulnerability check
+      - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
 
       - name: Run govulncheck
         run: govulncheck ./...
 
-      - name: Upload Go coverage artifact
+      - name: Upload Go coverage
         uses: actions/upload-artifact@v4
         with:
           name: coverage-go
           path: coverage-go.out
+          if-no-files-found: error
+          retention-days: 1
 
-
-  lynx:
-    name: Rust Tests & Lint
+  rust:
+    name: Rust
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     defaults:
       run:
         working-directory: lynx
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          components: clippy,rustfmt
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lynx
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
 
       - name: Show Rust version
         run: |
           rustc --version
           cargo --version
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: lynx
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
 
-      - name: Install tarpaulin
-        run: cargo install cargo-tarpaulin
+      - name: Generate coverage
+        run: cargo tarpaulin --workspace --locked --out Lcov --output-dir .
 
-      - name: Generate Rust coverage
-        run: cargo tarpaulin --out Lcov --output-dir .
+      - name: Verify coverage output
+        run: |
+          echo "Working directory:"
+          pwd
 
-      - name: Move coverage file
-        run: mv lynx/lcov.info lcov.info || true
+          echo
+          echo "Directory contents:"
+          ls -lah
 
-      - name: Upload Rust coverage artifact
+          echo
+          echo "Checking lcov.info..."
+          test -f lcov.info
+
+      - name: Upload Rust coverage
         uses: actions/upload-artifact@v4
         with:
           name: coverage-rust
-          path: lcov.info
-
-
-  coverage:
-    name: Codecov Upload
-    runs-on: ubuntu-latest
-    needs: [go, lynx]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Go coverage
-        uses: actions/download-artifact@v4
-        with:
-          name: coverage-go
-
-      - name: Download Rust coverage
-        uses: actions/download-artifact@v4
-        with:
-          name: coverage-rust
-
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          files: |
-            coverage-go.out
-            lcov.info
-          fail_ci_if_error: true
-
+          path: lynx/lcov.info
+          if-no-files-found: error
+          retention-days: 1
 
   build:
-    name: Build Binaries
+    name: Build
+    needs:
+      - go
+      - rust
+
     runs-on: ubuntu-latest
-    needs: [go, lynx]
+    timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v6
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          go-version: stable
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy,rustfmt
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: lynx
 
-      - name: Build
+      - name: Build project
         run: make build
 
       - name: Verify binary
         run: ./bin/izen --version
-
-
-  release:
-    name: Create Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
-
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: stable
-          cache: true
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy,rustfmt
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: lynx
-
-      - name: Build release binary
-        run: make build
-
-      - name: Generate checksums
-        run: |
-          cd bin
-          sha256sum izen > izen_SHA256SUMS.txt
-
-      - uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            bin/izen
-            bin/izen_SHA256SUMS.txt
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
