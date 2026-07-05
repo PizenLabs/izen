@@ -429,6 +429,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.ti.Width = msg.Width - 8
 
+		if m.streamParser != nil {
+			m.streamParser.SetWidth(msg.Width - 2)
+		}
+
 		vpH := m.viewportHeight()
 
 		if !m.vpReady {
@@ -447,7 +451,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		if m.streaming || m.agentRunning {
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
-			if m.vpReady {
+			if m.vpReady && (!m.streaming || len(m.streamStyledLines) == 0) {
 				m.rebuildViewport()
 			}
 		}
@@ -493,6 +497,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Force-reset streaming middleware flags to guarantee streamCmd can run
 		m.streamCh = nil
 		m.streaming = false
+		m.streamParser = nil
+		m.streamStyledLines = nil
 		m.push(roleSystem, "[System] Engine diagnostics collected. Escalating to LLM for analysis...")
 		return m, m.streamCmd(msg.escalationContent)
 
@@ -552,7 +558,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tokenMsg:
-		m.responseBuffer.WriteString(string(msg))
+		raw := string(msg)
+		m.responseBuffer.WriteString(raw)
+		if m.streamParser != nil {
+			if newLines := m.streamParser.ProcessChunk(raw); len(newLines) > 0 {
+				m.streamStyledLines = append(m.streamStyledLines, newLines...)
+			}
+		}
 		if m.vpReady {
 			m.rebuildViewport()
 		}
@@ -561,6 +573,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamDoneMsg:
 		m.streamCh = nil
 		m.streaming = false
+
+		if m.streamParser != nil {
+			if lastLine := m.streamParser.Flush(); lastLine != "" {
+				m.streamStyledLines = append(m.streamStyledLines, lastLine)
+			}
+			m.streamParser = nil
+		}
+
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
@@ -744,12 +764,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		m.streamStyledLines = nil
 		m.rebuildViewport()
 		return m, nil
 
 	case streamErrMsg:
 		m.streamCh = nil
 		m.streaming = false
+		m.streamParser = nil
+		m.streamStyledLines = nil
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)

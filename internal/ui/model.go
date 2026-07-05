@@ -160,12 +160,14 @@ type model struct {
 	height int
 
 	// Streaming
-	streamCh       chan tea.Msg
-	responseBuffer strings.Builder
-	streaming      bool
-	spinnerFrame   int
-	tokenInput     int
-	tokenOutput    int
+	streamCh          chan tea.Msg
+	responseBuffer    strings.Builder
+	streaming         bool
+	spinnerFrame      int
+	tokenInput        int
+	tokenOutput       int
+	streamParser      *IncrementalStreamParser
+	streamStyledLines []string
 
 	// Agent state
 	agentRunning bool
@@ -392,18 +394,12 @@ func (m *model) rebuildViewport() {
 	}
 
 	// Zone 4: Live streaming response
-	if m.streaming && m.responseBuffer.Len() > 0 {
+	if m.streaming && len(m.streamStyledLines) > 0 {
 		gutter := gutterAIStyle.Render("▌") + " "
-		availableWidth := m.width - 2
-		if availableWidth < 20 {
-			availableWidth = 20
-		}
-
-		wrappedStream := wrapStreamText(m.responseBuffer.String(), availableWidth)
-		for _, l := range wrappedStream {
+		for _, l := range m.streamStyledLines {
 			lines = append(lines, gutter+l)
 		}
-	} else if m.streaming {
+	} else if m.streaming && len(m.streamStyledLines) == 0 {
 		sp := m.renderFlowingSpinner()
 		lines = append(lines, gutterAIStyle.Render("▌")+" "+sp+"  "+infoStyle.Render("thinking…"))
 	}
