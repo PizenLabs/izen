@@ -160,12 +160,20 @@ type model struct {
 	height int
 
 	// Streaming
-	streamCh          chan tea.Msg
-	responseBuffer    strings.Builder
-	streaming         bool
-	spinnerFrame      int
-	tokenInput        int
-	tokenOutput       int
+	streamCh       chan tea.Msg
+	responseBuffer strings.Builder
+	streaming      bool
+	spinnerFrame   int
+
+	// Expanded metrics for status bar
+	IsCloudModel    bool
+	InputTokens     int
+	OutputTokens    int
+	TotalTokens     int
+	ContextLimit    int
+	AccumulatedCost float64
+	CheckpointID    string
+
 	streamParser      *IncrementalStreamParser
 	streamStyledLines []string
 
@@ -240,6 +248,9 @@ type model struct {
 
 	// AST/Code Graph trace for rendering the AI's thought route
 	currentTrace *ctxpkg.CodebaseTrace
+
+	// Tip of the Day
+	currentTip string
 
 	// Last apply error for the red error bar
 	lastApplyError string
@@ -347,6 +358,13 @@ func (m *model) rebuildViewport() {
 	if m.showBanner {
 		lines = append(lines, strings.Split(m.renderStartupBanner(m.width), "\n")...)
 		lines = append(lines, "")
+		// Tip of the Day — only when conversation is empty
+		if len(m.records) == 0 {
+			if tipLine := m.renderTip(m.width); tipLine != "" {
+				lines = append(lines, tipLine)
+				lines = append(lines, "")
+			}
+		}
 	}
 
 	// Zone 2: Chat history records
@@ -441,6 +459,14 @@ func (m *model) pushRecords(recs []record) {
 }
 
 var spinnerBaseStyle = lipgloss.NewStyle()
+
+// latestCheckpointID returns the most recent checkpoint ID from the session.
+func (m *model) latestCheckpointID() string {
+	if len(m.sess.Checkpoints) == 0 {
+		return ""
+	}
+	return m.sess.Checkpoints[len(m.sess.Checkpoints)-1]
+}
 
 // renderFlowingSpinner renders a single animated character with a smooth flowing
 // light effect: the color oscillates between dim and bright using a sine wave,

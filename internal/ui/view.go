@@ -142,87 +142,72 @@ func (m *model) renderPromptBox(width int) string {
 
 // ── Runtime Status ────────────────────────────────────────────────────────
 
+func formatTokens(n int) string {
+	if n >= 1000 {
+		return fmt.Sprintf("%.1fk", float64(n)/1000)
+	}
+	return strconv.Itoa(n)
+}
+
 func (m *model) renderRuntimeStatus(width int) string {
-	provider := m.cfg.ActiveProviderName()
-	isCloud := provider != "ollama" && provider != "local"
+	var b strings.Builder
 
-	var parts []string
-
-	// 1. Task (highest priority)
-	taskStr := "task: idle"
-	if m.agentRunning {
-		taskStr = yellowStyle.Render("task: " + m.agentLabel)
-	} else if m.streaming {
-		taskStr = cyanStyle.Render("task: streaming")
+	// State icon
+	if m.streaming || m.agentRunning {
+		idx := m.spinnerFrame % len(taskSpinnerFrames)
+		b.WriteString(cyanStyle.Render(taskSpinnerFrames[idx]))
+	} else {
+		b.WriteString(dimmedStyle.Render("●"))
 	}
-	parts = append(parts, taskStr)
+	b.WriteByte(' ')
 
-	// 2. Sandbox — bound to the current mode's write capability
-	mode := m.resolver.Current()
-	sandboxStr := dimmedStyle.Render("sandbox: read")
-	if mode.CanWrite() {
-		sandboxStr = orangeStyle.Render("sandbox: write")
+	// Model name (deeply dimmed)
+	b.WriteString(dimmedStyle.Render(m.cfg.ActiveModelName()))
+
+	// Separator
+	sep := dimmedStyle.Render(" │ ")
+	b.WriteString(sep)
+
+	// Auth mode
+	if m.resolver.Current().CanWrite() {
+		b.WriteString(orangeStyle.Render("[rw]"))
+	} else {
+		b.WriteString(dimmedStyle.Render("[ro]"))
 	}
-	parts = append(parts, sandboxStr)
+	b.WriteString(sep)
 
-	// Scale dynamic components based on screen width
-	if width >= 50 {
-		// 3. Model
-		modelName := m.cfg.ActiveModelName()
-		parts = append(parts, textStyle.Render("model: "+modelName))
-	}
-
-	if width >= 75 {
-		// 4. Tokens & Cost (Omit cost and % limit details for local models)
-		total := m.tokenInput + m.tokenOutput
-		var tokStr string
-		if isCloud {
-			const maxCtx = 32768
-			pct := float64(total) / float64(maxCtx) * 100
-			c := float64(m.tokenInput)*(3.0/1_000_000) + float64(m.tokenOutput)*(15.0/1_000_000)
-			costStr := fmt.Sprintf("$%.2f", c)
-			if m.currentTrace != nil && len(m.currentTrace.MatchedFiles) > 0 {
-				savedPct := 0.0
-				if m.currentTrace.CompressionRatio > 0 {
-					savedPct = (1.0 - m.currentTrace.CompressionRatio) * 100
-				}
-				tokStr = fmt.Sprintf("tokens: %d (%.0f%%) │ ctx optimized %.0f%% │ %s", total, pct, savedPct, costStr)
-			} else {
-				tokStr = fmt.Sprintf("tokens: %d (%.0f%%) │ cost: %s", total, pct, costStr)
-			}
-		} else {
-			tokStr = fmt.Sprintf("tokens: %d", total)
+	// Metrics engine
+	if m.IsCloudModel {
+		inStr := formatTokens(m.InputTokens)
+		outStr := formatTokens(m.OutputTokens)
+		usagePct := 0
+		if m.ContextLimit > 0 {
+			usagePct = int(float64(m.InputTokens+m.OutputTokens) / float64(m.ContextLimit) * 100)
 		}
-		parts = append(parts, mutedStyle.Render(tokStr))
+		b.WriteString(mutedStyle.Render("In: "))
+		b.WriteString(textStyle.Render(inStr))
+		b.WriteString(mutedStyle.Render(" • "))
+		b.WriteString(mutedStyle.Render("Out: "))
+		b.WriteString(textStyle.Render(outStr))
+		b.WriteString(mutedStyle.Render(fmt.Sprintf(" (%d%%)", usagePct)))
+		b.WriteString(sep)
+		b.WriteString(dimmedStyle.Render(fmt.Sprintf("$%.4f", m.AccumulatedCost)))
+	} else {
+		b.WriteString(textStyle.Render(strconv.Itoa(m.TotalTokens)))
+		b.WriteString(dimmedStyle.Render(" tkn"))
 	}
 
-	if width >= 100 {
-		// 5. Checkpoint
-		checkpointStr := "checkpoint: none"
-		if len(m.sess.Checkpoints) > 0 {
-			lastCP := m.sess.Checkpoints[len(m.sess.Checkpoints)-1]
-			if len(lastCP) > 8 {
-				checkpointStr = fmt.Sprintf("checkpoint: %s", lastCP[:8])
-			} else {
-				checkpointStr = fmt.Sprintf("checkpoint: %s", lastCP)
-			}
+	// Checkpoint (truncated to 7 chars, always shown with cp- prefix)
+	if cp := m.latestCheckpointID(); cp != "" {
+		cp = strings.TrimPrefix(cp, "cp-")
+		if len(cp) > 7 {
+			cp = cp[:7]
 		}
-		parts = append(parts, checkpointStr)
-	}
-	if m.uiNotice != "" && width >= 60 {
-		parts = append(parts, yellowStyle.Render("notice: "+m.uiNotice))
+		b.WriteString(sep)
+		b.WriteString(dimmedStyle.Render("cp-" + cp))
 	}
 
-	sep := runtimeSepStyle.Render("  │  ")
-	joined := strings.Join(parts, sep)
-
-	// Safety fallback check to prevent line wrap under extremely tight terminal splitting
-	if lipgloss.Width(joined) > width && len(parts) > 2 {
-		parts = parts[:2]
-		joined = strings.Join(parts, sep)
-	}
-
-	return joined
+	return b.String()
 }
 
 // ── Footer ────────────────────────────────────────────────────────────────
@@ -235,39 +220,12 @@ func (m *model) renderFooter(width int) string {
 		branch = "detached"
 	}
 
-	mode := m.resolver.Current()
-	safeStr := "safe"
-	if mode.CanShell() || mode.CanTest() {
-		safeStr = "sandboxed"
-	}
-	if mode.CanWrite() {
-		safeStr = "write"
-	}
-
-	var left, right string
-
-	switch {
-	case width < 50:
+	left := fmt.Sprintf("workspace: %s (%s)", project, branch)
+	if width < 50 {
 		left = fmt.Sprintf("(%s)", branch)
-		right = safeStr
-	case width < 75:
-		left = fmt.Sprintf("workspace: %s (%s)", project, branch)
-		right = fmt.Sprintf("execution: %s", safeStr)
-	default:
-		provider := m.cfg.ActiveProviderName()
-		modelName := m.cfg.ActiveModelName()
-		left = fmt.Sprintf("workspace: %s (%s)   •   runtime: %s/%s", project, branch, provider, modelName)
-		right = fmt.Sprintf("execution: %s", safeStr)
 	}
 
-	leftW := lipgloss.Width(left)
-	rightW := lipgloss.Width(right)
-	gap := width - leftW - rightW
-	if gap < 1 {
-		gap = 1
-	}
-
-	return footerDimStyle.Render(left + strings.Repeat(" ", gap) + right)
+	return footerDimStyle.Render(left)
 }
 
 // ── Startup banner ────────────────────────────────────────────────────────

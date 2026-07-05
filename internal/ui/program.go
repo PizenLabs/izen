@@ -56,6 +56,8 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		ti:            ti,
 		showBanner:    true,
 		animBuffer:    NewAnimBuffer(DefaultAnimationConfig()),
+		IsCloudModel:  cfg.ActiveProviderName() != "ollama",
+		ContextLimit:  128000,
 	}
 	m.resolver.Set(sess.Mode)
 	m.loadHistory()
