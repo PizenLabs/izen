@@ -184,8 +184,7 @@ var (
 			Bold(true)
 
 	// Footer / runtime status
-	footerDimStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	runtimeSepStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
+	footerDimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 
 	// Codebase trace
 	traceStyle = lipgloss.NewStyle().

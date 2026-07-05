@@ -26,6 +26,7 @@ import (
 // Init initializes background loop clock ticks for state rendering animations plus
 // the text input blink tick so the cursor animation runs natively.
 func (m *model) Init() tea.Cmd {
+	m.currentTip = randomTip()
 	return tea.Batch(m.spinnerTickCmd(), animTickCmd(), m.ti.Focus())
 }
 
@@ -607,8 +608,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
 			_ = m.sess.Save()
 		}
-		m.tokenInput += msg.tokenInput
-		m.tokenOutput += msg.tokenOutput
+		m.InputTokens += msg.tokenInput
+		m.OutputTokens += msg.tokenOutput
+		m.TotalTokens = m.InputTokens + m.OutputTokens
 		final := msg.content
 		if final == "" {
 			final = m.responseBuffer.String()
@@ -668,10 +670,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if delta >= 1000 {
 			deltaStr = fmt.Sprintf("%.1fk", float64(delta)/1000)
 		}
-		costStr := "$0.00"
-		if m.cfg.ActiveProviderName() != "ollama" {
-			c := float64(m.tokenInput)*(3.0/1_000_000) + float64(m.tokenOutput)*(15.0/1_000_000)
-			costStr = fmt.Sprintf("$%.4f", c)
+		m.IsCloudModel = m.cfg.ActiveProviderName() != "ollama"
+		costStr := "$0.0000"
+		if m.IsCloudModel {
+			turnCost := float64(msg.tokenInput)*(3.0/1_000_000) + float64(msg.tokenOutput)*(15.0/1_000_000)
+			m.AccumulatedCost += turnCost
+			costStr = fmt.Sprintf("$%.4f", turnCost)
 		}
 		m.push(roleStatus, fmt.Sprintf("done - +%s tokens (this turn)  •  %s", deltaStr, costStr))
 
