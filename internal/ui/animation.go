@@ -142,35 +142,3 @@ func (b *AnimBuffer) Reset() {
 	b.lineIdx = 0
 	b.charPos = 0
 }
-
-// ScrollThrottle is a minimal rate limiter for viewport rebuilds during rapid
-// scroll events. It ensures layout recalculations don't exceed ~60 fps.
-type ScrollThrottle struct {
-	last   time.Time
-	minGap time.Duration
-}
-
-func NewScrollThrottle() *ScrollThrottle {
-	return &ScrollThrottle{
-		minGap: 16 * time.Millisecond,
-	}
-}
-
-// Allow returns true if enough time has elapsed since the last allowed event.
-// Nil-safe: returns true for nil receiver so tests don't need to initialize it.
-func (st *ScrollThrottle) Allow() bool {
-	if st == nil {
-		return true
-	}
-	now := time.Now()
-	if now.Sub(st.last) < st.minGap {
-		return false
-	}
-	st.last = now
-	return true
-}
-
-// Force resets the throttle timer so the next Allow() returns true.
-func (st *ScrollThrottle) Force() {
-	st.last = time.Time{}
-}

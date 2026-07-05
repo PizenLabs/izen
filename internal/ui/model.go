@@ -170,8 +170,7 @@ type model struct {
 	streamStyledLines []string
 
 	// progressive character animation
-	animBuffer     *AnimBuffer
-	scrollThrottle *ScrollThrottle
+	animBuffer *AnimBuffer
 
 	// Agent state
 	agentRunning bool

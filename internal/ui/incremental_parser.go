@@ -1,6 +1,10 @@
 package ui
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/charmbracelet/x/ansi"
+)
 
 type LexerState int
 
@@ -56,20 +60,44 @@ func (p *IncrementalStreamParser) ProcessChunk(chunk string) []string {
 		return nil
 	}
 
-	result := make([]string, 0, len(lines))
+	result := make([]string, 0, len(lines)*2)
 	for _, line := range lines {
-		result = append(result, p.processLine(line))
+		processed := p.processLine(line)
+		result = append(result, strings.Split(p.wrapLine(processed), "\n")...)
 	}
 	return result
 }
 
-func (p *IncrementalStreamParser) Flush() string {
+func (p *IncrementalStreamParser) Flush() []string {
 	if p.lineBuf.Len() == 0 {
-		return ""
+		return nil
 	}
 	line := p.lineBuf.String()
 	p.lineBuf.Reset()
-	return p.processLine(line)
+	processed := p.processLine(line)
+	wrapped := p.wrapLine(processed)
+	if wrapped == "" {
+		return nil
+	}
+	return strings.Split(wrapped, "\n")
+}
+
+// wrapLine wraps an ANSI-styled line to the parser's configured width, preserving
+// ANSI escape sequences. Text lines are word-wrapped at space boundaries; code
+// lines are hard-wrapped to preserve indentation structure.
+func (p *IncrementalStreamParser) wrapLine(line string) string {
+	wrapAt := p.width - 2
+	if wrapAt < 10 {
+		wrapAt = 10
+	}
+	switch p.state {
+	case StateInCodeBlock:
+		return ansi.Hardwrap(line, wrapAt, true)
+	case StateInTable:
+		return line
+	default:
+		return ansi.Wordwrap(line, wrapAt, " ")
+	}
 }
 
 func (p *IncrementalStreamParser) processLine(line string) string {
