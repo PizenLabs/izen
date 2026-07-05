@@ -63,9 +63,7 @@ func (p *IncrementalStreamParser) ProcessChunk(chunk string) []string {
 	result := make([]string, 0, len(lines)*2)
 	for _, line := range lines {
 		processed := p.processLine(line)
-		for _, wl := range strings.Split(p.wrapLine(processed), "\n") {
-			result = append(result, wl)
-		}
+		result = append(result, strings.Split(p.wrapLine(processed), "\n")...)
 	}
 	return result
 }
