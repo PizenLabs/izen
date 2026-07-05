@@ -43,18 +43,20 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	execEng.SetPlanStore(planStore)
 
 	m := &model{
-		cfg:           cfg,
-		sess:          sess,
-		provider:      provider,
-		gitEng:        eng,
-		graphEng:      graphEng,
-		graph:         g,
-		resolver:      modes.NewResolver(),
-		attachedFiles: make([]string, 0),
-		execEng:       execEng,
-		planStore:     planStore,
-		ti:            ti,
-		showBanner:    true,
+		cfg:            cfg,
+		sess:           sess,
+		provider:       provider,
+		gitEng:         eng,
+		graphEng:       graphEng,
+		graph:          g,
+		resolver:       modes.NewResolver(),
+		attachedFiles:  make([]string, 0),
+		execEng:        execEng,
+		planStore:      planStore,
+		ti:             ti,
+		showBanner:     true,
+		animBuffer:     NewAnimBuffer(DefaultAnimationConfig()),
+		scrollThrottle: NewScrollThrottle(),
 	}
 	m.resolver.Set(sess.Mode)
 	m.loadHistory()

@@ -36,6 +36,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.spinnerFrame = 0
 	m.responseBuffer.Reset()
 	m.streamStyledLines = nil
+	m.animBuffer.Reset()
 	m.streamParser = NewIncrementalStreamParser(m.width - 2)
 	m.streamParser.Reset()
 	if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.HumanConfirmed {

@@ -169,6 +169,10 @@ type model struct {
 	streamParser      *IncrementalStreamParser
 	streamStyledLines []string
 
+	// progressive character animation
+	animBuffer     *AnimBuffer
+	scrollThrottle *ScrollThrottle
+
 	// Agent state
 	agentRunning bool
 	agentLabel   string
@@ -393,15 +397,21 @@ func (m *model) rebuildViewport() {
 		}
 	}
 
-	// Zone 4: Live streaming response
-	if m.streaming && len(m.streamStyledLines) > 0 {
-		gutter := gutterAIStyle.Render("▌") + " "
-		for _, l := range m.streamStyledLines {
-			lines = append(lines, gutter+l)
+	// Zone 4: Live streaming response (progressive animation)
+	if m.streaming {
+		var displayLines []string
+		if m.animBuffer != nil {
+			displayLines = m.animBuffer.VisibleLines()
 		}
-	} else if m.streaming && len(m.streamStyledLines) == 0 {
-		sp := m.renderFlowingSpinner()
-		lines = append(lines, gutterAIStyle.Render("▌")+" "+sp+"  "+infoStyle.Render("thinking…"))
+		if len(displayLines) > 0 {
+			gutter := gutterAIStyle.Render("▌") + " "
+			for _, l := range displayLines {
+				lines = append(lines, gutter+l)
+			}
+		} else {
+			sp := m.renderFlowingSpinner()
+			lines = append(lines, gutterAIStyle.Render("▌")+" "+sp+"  "+infoStyle.Render("thinking…"))
+		}
 	}
 
 	m.viewLines = lines
