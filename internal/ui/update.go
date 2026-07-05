@@ -456,18 +456,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.spinnerTickCmd()
 
 	case animTickMsg:
-		// Drive progressive character animation
+		// Drive progressive character animation.
+		// ALWAYS advance the buffer internal state even when frozen.
 		if m.streaming && m.animBuffer != nil && m.animBuffer.IsAnimating() {
 			if m.animBuffer.Tick() {
-				if m.vpReady {
-					m.rebuildViewport()
-					// Gently follow bottom during animation so new characters
-					// stay visible without jarring jumps.
-					if m.vp.AtBottom() {
-						m.vp.GotoBottom()
-					}
-				}
+				m.needsCatchUp = true
 			}
+		}
+
+		// Rebuild viewport ONLY when the user is at the absolute bottom.
+		// When scrolled up to read, the viewport becomes a static reader —
+		// zero processing cycles are spent on layout while the terminal
+		// repurposes all its bandwidth for instant hardware-accelerated scrolling.
+		if m.needsCatchUp && m.vp.AtBottom() && m.vpReady {
+			m.rebuildViewport()
+			m.vp.GotoBottom()
+			m.needsCatchUp = false
 		}
 		if m.lineAnimating {
 			m.lineAnimProgress += 25.0 / 150.0
