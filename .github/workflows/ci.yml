@@ -5,7 +5,6 @@ on:
     branches:
       - main
       - develop
-
   pull_request:
     branches:
       - main
@@ -24,36 +23,27 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Setup Go
-        uses: actions/setup-go@v6
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Show Go version
-        run: go version
+      - run: go version
 
-      - name: Download dependencies
-        run: go mod download
+      - run: go mod download
 
-      - name: Verify modules
-        run: go mod verify
+      - run: go mod verify
 
-      - name: Run go vet
-        run: go vet ./...
-
-      - name: Run staticcheck
-        uses: dominikh/staticcheck-action@v1.4.1
+      - uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          version: v2.5.0
+          args: --timeout=5m
 
-      - name: Run tests with coverage
-        run: |
+      - run: |
           go test \
             -race \
             -count=1 \
@@ -61,14 +51,11 @@ jobs:
             -coverprofile=coverage-go.out \
             ./...
 
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
 
-      - name: Run govulncheck
-        run: govulncheck ./...
+      - run: govulncheck ./...
 
-      - name: Upload Go coverage
-        uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage-go
           path: coverage-go.out
@@ -85,58 +72,37 @@ jobs:
         working-directory: lynx
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
 
-      - name: Restore Rust cache
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: lynx
 
-      - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2
         with:
           tool: cargo-tarpaulin
 
-      - name: Show Rust version
-        run: |
+      - run: |
           rustc --version
           cargo --version
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - run: cargo fmt --all -- --check
 
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Run tests
-        run: cargo test --workspace --all-targets --locked
+      - run: cargo test --workspace --all-targets --locked
 
-      - name: Generate coverage
-        run: cargo tarpaulin --workspace --locked --out Lcov --output-dir .
+      - run: cargo tarpaulin --workspace --locked --out Lcov --output-dir .
 
-      - name: Verify coverage output
-        run: |
-          echo "Working directory:"
-          pwd
+      - run: test -f lcov.info
 
-          echo
-          echo "Directory contents:"
-          ls -lah
-
-          echo
-          echo "Checking lcov.info..."
-          test -f lcov.info
-
-      - name: Upload Rust coverage
-        uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage-rust
           path: lynx/lcov.info
@@ -153,27 +119,21 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Setup Go
-        uses: actions/setup-go@v6
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Restore Rust cache
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: lynx
 
-      - name: Build project
-        run: make build
+      - run: make build
 
-      - name: Verify binary
-        run: ./bin/izen --version
+      - run: ./bin/izen --version
