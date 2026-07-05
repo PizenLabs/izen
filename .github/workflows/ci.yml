@@ -11,7 +11,7 @@ permissions:
 
 env:
   GO_VERSION: "1.24.6"
-  GOLANGCI_LINT_VERSION: "v1.64.8"
+  GOLANGCI_LINT_VERSION: "v2.12.2"
 
 jobs:
   go:
@@ -43,20 +43,26 @@ jobs:
       - run: go mod download
       - run: go mod verify
 
+      # -------------------------
+      # golangci-lint (stable + cached binary)
+      # -------------------------
       - name: Cache golangci-lint
         id: cache-lint
         uses: actions/cache@v4
         with:
-          path: |
-            ~/go/bin/golangci-lint
+          path: ~/go/bin/golangci-lint
           key: golangci-lint-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}
 
       - name: Install golangci-lint
         if: steps.cache-lint.outputs.cache-hit != 'true'
         run: |
+          set -e
           VERSION=${{ env.GOLANGCI_LINT_VERSION }}
+          ARCH=linux-amd64
+
           curl -L -o golangci-lint.tar.gz \
-            https://github.com/golangci/golangci-lint/releases/download/${VERSION}/golangci-lint-${VERSION#v}-linux-amd64.tar.gz
+            https://github.com/golangci/golangci-lint/releases/download/${VERSION}/golangci-lint-${VERSION#v}-${ARCH}.tar.gz
+
           tar -xzf golangci-lint.tar.gz
           mkdir -p ~/go/bin
           mv golangci-lint-*/golangci-lint ~/go/bin/
@@ -67,6 +73,9 @@ jobs:
       - name: Run golangci-lint
         run: golangci-lint run --timeout=5m
 
+      # -------------------------
+      # Tests
+      # -------------------------
       - run: |
           go test \
             -race \
@@ -75,9 +84,15 @@ jobs:
             -coverprofile=coverage-go.out \
             ./...
 
+      # -------------------------
+      # Security
+      # -------------------------
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - run: govulncheck ./...
 
+      # -------------------------
+      # Artifact
+      # -------------------------
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-go
