@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION: "1.24.6"
-  GOLANGCI_LINT_VERSION: "v1.64.8"
+  GO_VERSION: "1.26"
+  GOLANGCI_LINT_VERSION: "v2.12.2"
 
 jobs:
   go:
@@ -29,7 +29,7 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Cache Go build
+      - name: Cache Go modules
         uses: actions/cache@v4
         with:
           path: |
@@ -43,29 +43,11 @@ jobs:
       - run: go mod download
       - run: go mod verify
 
-      - name: Cache golangci-lint
-        id: cache-lint
-        uses: actions/cache@v4
+      - name: Setup golangci-lint
+        uses: golangci/golangci-lint-action@v7
         with:
-          path: |
-            ~/go/bin/golangci-lint
-          key: golangci-lint-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}
-
-      - name: Install golangci-lint
-        if: steps.cache-lint.outputs.cache-hit != 'true'
-        run: |
-          VERSION=${{ env.GOLANGCI_LINT_VERSION }}
-          curl -L -o golangci-lint.tar.gz \
-            https://github.com/golangci/golangci-lint/releases/download/${VERSION}/golangci-lint-${VERSION#v}-linux-amd64.tar.gz
-          tar -xzf golangci-lint.tar.gz
-          mkdir -p ~/go/bin
-          mv golangci-lint-*/golangci-lint ~/go/bin/
-
-      - name: Add golangci-lint to PATH
-        run: echo "$HOME/go/bin" >> $GITHUB_PATH
-
-      - name: Run golangci-lint
-        run: golangci-lint run --timeout=5m
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          args: --timeout=5m
 
       - run: |
           go test \
@@ -164,7 +146,6 @@ jobs:
           fetch-depth: 0
 
       - run: |
-          echo "===== GITHUB ====="
           echo "GITHUB_SHA=$GITHUB_SHA"
           git rev-parse HEAD
           git log --oneline -1
