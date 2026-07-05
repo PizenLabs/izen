@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION: "1.24.6"
+  GO_VERSION: "1.26"
   GOLANGCI_LINT_VERSION: "v2.12.2"
 
 jobs:
@@ -29,7 +29,7 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Cache Go build
+      - name: Cache Go modules
         uses: actions/cache@v4
         with:
           path: |
@@ -43,39 +43,12 @@ jobs:
       - run: go mod download
       - run: go mod verify
 
-      # -------------------------
-      # golangci-lint (stable + cached binary)
-      # -------------------------
-      - name: Cache golangci-lint
-        id: cache-lint
-        uses: actions/cache@v4
+      - name: Setup golangci-lint
+        uses: golangci/golangci-lint-action@v6
         with:
-          path: ~/go/bin/golangci-lint
-          key: golangci-lint-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          args: --timeout=5m
 
-      - name: Install golangci-lint
-        if: steps.cache-lint.outputs.cache-hit != 'true'
-        run: |
-          set -e
-          VERSION=${{ env.GOLANGCI_LINT_VERSION }}
-          ARCH=linux-amd64
-
-          curl -L -o golangci-lint.tar.gz \
-            https://github.com/golangci/golangci-lint/releases/download/${VERSION}/golangci-lint-${VERSION#v}-${ARCH}.tar.gz
-
-          tar -xzf golangci-lint.tar.gz
-          mkdir -p ~/go/bin
-          mv golangci-lint-*/golangci-lint ~/go/bin/
-
-      - name: Add golangci-lint to PATH
-        run: echo "$HOME/go/bin" >> $GITHUB_PATH
-
-      - name: Run golangci-lint
-        run: golangci-lint run --timeout=5m
-
-      # -------------------------
-      # Tests
-      # -------------------------
       - run: |
           go test \
             -race \
@@ -84,15 +57,9 @@ jobs:
             -coverprofile=coverage-go.out \
             ./...
 
-      # -------------------------
-      # Security
-      # -------------------------
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - run: govulncheck ./...
 
-      # -------------------------
-      # Artifact
-      # -------------------------
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-go
@@ -179,7 +146,6 @@ jobs:
           fetch-depth: 0
 
       - run: |
-          echo "===== GITHUB ====="
           echo "GITHUB_SHA=$GITHUB_SHA"
           git rev-parse HEAD
           git log --oneline -1

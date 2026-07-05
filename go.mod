@@ -1,6 +1,6 @@
 module github.com/PizenLabs/izen
 
-go 1.24.6
+go 1.26
 
 require (
 	github.com/atotto/clipboard v0.1.4
