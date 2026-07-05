@@ -2,47 +2,79 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
-      - develop
+    branches: [main, develop]
   pull_request:
-    branches:
-      - main
-      - develop
+    branches: [main, develop]
 
 permissions:
   contents: read
 
 env:
-  GO_VERSION: stable
+  GO_VERSION: "1.24.6"
+  GOLANGCI_LINT_VERSION: "v1.64.8"
 
 jobs:
   go:
-    name: Go
+    name: Go Test + Lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v6
+      # -------------------------
+      # Go setup
+      # -------------------------
+      - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
+      # -------------------------
+      # Go cache (extra boost)
+      # -------------------------
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+
       - run: go version
-
       - run: go mod download
-
       - run: go mod verify
 
-      - uses: golangci/golangci-lint-action@v8
+      # -------------------------
+      # golangci-lint cached install
+      # -------------------------
+      - name: Cache golangci-lint
+        id: cache-lint
+        uses: actions/cache@v4
         with:
-          version: latest
-          args: --timeout=5m
+          path: |
+            ~/go/bin/golangci-lint
+          key: golangci-lint-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}
 
+      - name: Install golangci-lint
+        if: steps.cache-lint.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+            | sh -s ${{ env.GOLANGCI_LINT_VERSION }}
+          mkdir -p ~/go/bin
+          mv ./bin/golangci-lint ~/go/bin/
+
+      - name: Add golangci-lint to PATH
+        run: echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Run golangci-lint
+        run: golangci-lint run --timeout=5m
+
+      # -------------------------
+      # Tests
+      # -------------------------
       - run: |
           go test \
             -race \
@@ -51,11 +83,16 @@ jobs:
             -coverprofile=coverage-go.out \
             ./...
 
+      # -------------------------
+      # Security scan
+      # -------------------------
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
-
       - run: govulncheck ./...
 
-      - uses: actions/upload-artifact@v7
+      # -------------------------
+      # Artifacts
+      # -------------------------
+      - uses: actions/upload-artifact@v4
         with:
           name: coverage-go
           path: coverage-go.out
@@ -63,7 +100,7 @@ jobs:
           retention-days: 1
 
   rust:
-    name: Rust
+    name: Rust Test + Lint
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -72,7 +109,7 @@ jobs:
         working-directory: lynx
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -80,7 +117,8 @@ jobs:
         with:
           components: rustfmt,clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: lynx
 
@@ -93,16 +131,13 @@ jobs:
           cargo --version
 
       - run: cargo fmt --all -- --check
-
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
       - run: cargo test --workspace --all-targets --locked
 
       - run: cargo tarpaulin --workspace --locked --out Lcov --output-dir .
-
       - run: test -f lcov.info
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v4
         with:
           name: coverage-rust
           path: lynx/lcov.info
@@ -110,20 +145,17 @@ jobs:
           retention-days: 1
 
   build:
-    name: Build
-    needs:
-      - go
-      - rust
-
+    name: Build Binary
+    needs: [go, rust]
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -135,5 +167,32 @@ jobs:
           workspaces: lynx
 
       - run: make build
-
       - run: ./bin/izen --version
+
+  debug:
+    name: Debug (optional)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - run: |
+          echo "===== GITHUB ====="
+          echo "SHA: $GITHUB_SHA"
+          git rev-parse HEAD
+          git log --oneline -1
+
+          echo
+          echo "===== STATUS ====="
+          git status
+
+          echo
+          echo "===== SEARCH ====="
+          grep -R "func wrapText" internal || true
+          grep -R "func formatCompactField" internal || true
+
+          echo
+          echo "===== UTILS ====="
+          sed -n '1,120p' internal/ui/utils.go
