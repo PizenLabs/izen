@@ -111,4 +111,3 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 	lines = append(lines, border)
 	return strings.Join(lines, "\n")
 }
-
