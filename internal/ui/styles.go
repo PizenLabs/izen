@@ -58,9 +58,6 @@ const (
 	colorGutterError  = "#f38ba8"
 	colorGutterStatus = "#585b70" // Dimmed status tracking gutter
 	colorGutterSystem = "#45475a"
-
-	// Top Bar
-	colorTopBarMetrics = "#a6adc8" // Subtext0
 )
 
 // lipglossColor is a convenience helper (init-time only, NOT for render path).
@@ -91,19 +88,6 @@ func interpolateColor(from, to lipgloss.Color, t float64) lipgloss.Color {
 		uint8(lerp(fg, tg, t)),
 		uint8(lerp(fb, tb, t)),
 	))
-}
-
-func animLineColor(m *model) lipgloss.Color {
-	if !m.lineAnimating {
-		return modeLineColor(m.resolver.Current())
-	}
-	neutral := lipgloss.Color(colorModeNeutral)
-	target := modeLineColor(m.lineAnimTargetMode)
-	t := m.lineAnimProgress
-	if t < 0.5 {
-		return interpolateColor(modeLineColor(m.resolver.Current()), neutral, t*2)
-	}
-	return interpolateColor(neutral, target, (t-0.5)*2)
 }
 
 func modeLineColor(mode modes.Mode) lipgloss.Color {
@@ -152,8 +136,6 @@ var (
 
 	// Shell execution proposal
 	shellWarningStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorOrange))
-	shellBorderStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	shellCmdStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Background(lipgloss.Color(colorOverlay))
 
 	// Gutter markers
 	gutterUserStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterUser))
@@ -190,15 +172,10 @@ var (
 	accentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 	redStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRed))
 	blueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
-	pinkStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorPink))
-	tealStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorTeal))
-	mauveStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))
 
 	// Bold + color
 	boldTextStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
 	boldAccentStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorAccent))
-	boldGreenStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreen))
-	boldRedStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
 
 	// Background + foreground (error bar)
 	redBgBoldStyle = lipgloss.NewStyle().
@@ -209,15 +186,6 @@ var (
 	// Footer / runtime status
 	footerDimStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 	runtimeSepStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
-
-	// Top bar (objective state)
-	topBarStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color(colorSurface)).
-			Foreground(lipgloss.Color(colorTopBarMetrics)).
-			Padding(0, 1)
-
-	// Shell execution proposal
-	shellDimBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 
 	// Codebase trace
 	traceStyle = lipgloss.NewStyle().
@@ -233,9 +201,6 @@ var (
 	// Widget box
 	widgetTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
 
-	// Enhanced mutation renderer
-	enhancedExpandStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-
 	// Semantic renderer diff styles
 	semanticDelStyle     = lipgloss.NewStyle().Background(lipgloss.Color("#3a1e24")).Foreground(lipgloss.Color("#f1707a"))
 	semanticAddStyle     = lipgloss.NewStyle().Background(lipgloss.Color("#18302b")).Foreground(lipgloss.Color("#6cd0a1"))
@@ -245,13 +210,6 @@ var (
 
 // Mode-accent style lookup (indexed by modes.Mode value).
 var (
-	modeAccentFgStyles = []lipgloss.Style{
-		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeAsk)),         // ModeAsk=0
-		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModePlan)),        // ModePlan=1
-		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeBuild)),       // ModeBuild=2
-		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeInvestigate)), // ModeInvestigate=3
-		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeReview)),      // ModeReview=4
-	}
 	modeBoldFgStyles = []lipgloss.Style{
 		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeAsk)),
 		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModePlan)),
