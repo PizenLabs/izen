@@ -24,17 +24,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      # -------------------------
-      # Go setup
-      # -------------------------
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      # -------------------------
-      # Go cache (extra boost)
-      # -------------------------
       - name: Cache Go build
         uses: actions/cache@v4
         with:
@@ -42,14 +36,13 @@ jobs:
             ~/.cache/go-build
             ~/go/pkg/mod
           key: go-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-
 
       - run: go version
       - run: go mod download
       - run: go mod verify
 
-      # -------------------------
-      # golangci-lint cached install
-      # -------------------------
       - name: Cache golangci-lint
         id: cache-lint
         uses: actions/cache@v4
@@ -61,10 +54,12 @@ jobs:
       - name: Install golangci-lint
         if: steps.cache-lint.outputs.cache-hit != 'true'
         run: |
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
-            | sh -s ${{ env.GOLANGCI_LINT_VERSION }}
+          VERSION=${{ env.GOLANGCI_LINT_VERSION }}
+          curl -L -o golangci-lint.tar.gz \
+            https://github.com/golangci/golangci-lint/releases/download/${VERSION}/golangci-lint-${VERSION#v}-linux-amd64.tar.gz
+          tar -xzf golangci-lint.tar.gz
           mkdir -p ~/go/bin
-          mv ./bin/golangci-lint ~/go/bin/
+          mv golangci-lint-*/golangci-lint ~/go/bin/
 
       - name: Add golangci-lint to PATH
         run: echo "$HOME/go/bin" >> $GITHUB_PATH
@@ -72,9 +67,6 @@ jobs:
       - name: Run golangci-lint
         run: golangci-lint run --timeout=5m
 
-      # -------------------------
-      # Tests
-      # -------------------------
       - run: |
           go test \
             -race \
@@ -83,15 +75,9 @@ jobs:
             -coverprofile=coverage-go.out \
             ./...
 
-      # -------------------------
-      # Security scan
-      # -------------------------
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - run: govulncheck ./...
 
-      # -------------------------
-      # Artifacts
-      # -------------------------
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-go
@@ -126,9 +112,8 @@ jobs:
         with:
           tool: cargo-tarpaulin
 
-      - run: |
-          rustc --version
-          cargo --version
+      - run: rustc --version
+      - run: cargo --version
 
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -170,7 +155,7 @@ jobs:
       - run: ./bin/izen --version
 
   debug:
-    name: Debug (optional)
+    name: Debug Checkout
     runs-on: ubuntu-latest
 
     steps:
@@ -180,7 +165,7 @@ jobs:
 
       - run: |
           echo "===== GITHUB ====="
-          echo "SHA: $GITHUB_SHA"
+          echo "GITHUB_SHA=$GITHUB_SHA"
           git rev-parse HEAD
           git log --oneline -1
 
