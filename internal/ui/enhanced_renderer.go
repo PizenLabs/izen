@@ -2,8 +2,6 @@ package ui
 
 import (
 	"strings"
-
-	"github.com/charmbracelet/lipgloss"
 )
 
 // Enhanced Mutation Renderer aligned with REVIEW_LAYOUT.md design principles
@@ -23,15 +21,12 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 		border = "─"
 	}
 
-	expandStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-
 	toggleLabel := "[▼ Expand]"
 	if v.Expanded {
 		toggleLabel = "[▲ Collapse]"
 	}
 	actionLine := "  [A] Accept  [L] Allow All  [R] Reject  [P] Toggle"
 
-	// Header with inline toggle: "Edit • filename [▼ Expand]"
 	headerText := "Edit"
 	if v.Target.Name != "" {
 		symbolName := v.Target.Name
@@ -59,7 +54,7 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 	if riskLevel == "" {
 		riskLevel = "UNKNOWN"
 	}
-	metadataLine := expandStyle.Render("  Scope " + scope + " | Risk " + riskLevel)
+	metadataLine := dimmedStyle.Render("  Scope " + scope + " | Risk " + riskLevel)
 
 	if !v.Expanded {
 		// COLLAPSED: header + metadata + action keys
@@ -103,10 +98,8 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 			}
 		}
 
-		if end == total && start == 0 && len(diffLines) > 0 {
-			// all lines fit — no indicator
-		} else if end < total || start > 0 {
-			scrollHint := "  " + expandStyle.Render("(scroll ↑↓)")
+		if end < total || start > 0 {
+			scrollHint := "  " + dimmedStyle.Render("(scroll ↑↓)")
 			lines = append(lines, scrollHint)
 		}
 		lines = append(lines, "")
@@ -118,3 +111,4 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 	lines = append(lines, border)
 	return strings.Join(lines, "\n")
 }
+

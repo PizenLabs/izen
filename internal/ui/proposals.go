@@ -358,7 +358,7 @@ func (m *model) applySingleProposal() tea.Cmd {
 		patch.Original = string(orig)
 	}
 	if err := m.execEng.Patches.Apply(patch); err != nil {
-		m.push(roleError, "apply failed: "+err.Error())
+		m.setApplyError("apply failed: " + err.Error())
 		return nil
 	}
 
@@ -401,7 +401,7 @@ func (m *model) applyAllProposals() tea.Cmd {
 			patch.Original = string(orig)
 		}
 		if err := m.execEng.Patches.Apply(patch); err != nil {
-			m.push(roleError, "apply failed: "+err.Error())
+			m.setApplyError("apply failed: " + err.Error())
 			continue
 		}
 		applied++
