@@ -252,6 +252,10 @@ type model struct {
 	// Tip of the Day
 	currentTip string
 
+	// Scroll freeze: when true, animTick must skip rebuildViewport until
+	// the user returns to the bottom of the viewport.
+	needsCatchUp bool
+
 	// Last apply error for the red error bar
 	lastApplyError string
 	applyErrorTime time.Time
@@ -415,14 +419,16 @@ func (m *model) rebuildViewport() {
 	}
 
 	// Zone 4: Live streaming response (progressive animation)
+	// Uses the AnimBuffer's pre-joined cached content to avoid ansi.Truncate
+	// on every frame — the cache is only invalidated when Tick() advances state.
 	if m.streaming {
-		var displayLines []string
+		var displayContent string
 		if m.animBuffer != nil {
-			displayLines = m.animBuffer.VisibleLines()
+			displayContent = m.animBuffer.JoinedContent()
 		}
-		if len(displayLines) > 0 {
+		if displayContent != "" {
 			gutter := gutterAIStyle.Render("▌") + " "
-			for _, l := range displayLines {
+			for _, l := range strings.Split(displayContent, "\n") {
 				lines = append(lines, gutter+l)
 			}
 		} else {

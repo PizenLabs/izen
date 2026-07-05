@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/x/ansi"
@@ -34,6 +35,9 @@ type AnimBuffer struct {
 	lineIdx  int      // index of line currently being revealed
 	charPos  int      // visible character position within the current line
 	revealed []string // fully revealed lines
+
+	cacheValid   bool   // cache recomputed after every state mutation
+	cachedJoined string // pre-joined VisibleLines result, safe for direct use
 }
 
 func NewAnimBuffer(cfg AnimationConfig) *AnimBuffer {
@@ -47,6 +51,7 @@ func NewAnimBuffer(cfg AnimationConfig) *AnimBuffer {
 // QueueLines adds pre-styled lines to the end of the animation queue.
 func (b *AnimBuffer) QueueLines(lines []string) {
 	b.pending = append(b.pending, lines...)
+	b.cacheValid = false
 }
 
 // Tick advances the character release position by CharsPerFrame and returns
@@ -88,7 +93,23 @@ func (b *AnimBuffer) Tick() bool {
 		}
 	}
 
+	if changed {
+		b.cacheValid = false
+	}
+
 	return changed
+}
+
+// JoinedContent returns the current visible content as a single pre-joined
+// string. The result is cached and recomputed only when the buffer state
+// changes, avoiding repeated ansi.Truncate calls on the render path.
+func (b *AnimBuffer) JoinedContent() string {
+	if !b.cacheValid {
+		visible := b.VisibleLines()
+		b.cachedJoined = strings.Join(visible, "\n")
+		b.cacheValid = true
+	}
+	return b.cachedJoined
 }
 
 // VisibleLines returns the current set of lines that should be displayed:
@@ -130,6 +151,7 @@ func (b *AnimBuffer) Flush() []string {
 		b.lineIdx++
 	}
 	b.charPos = 0
+	b.cacheValid = false
 	out := make([]string, len(b.revealed))
 	copy(out, b.revealed)
 	return out
@@ -141,4 +163,5 @@ func (b *AnimBuffer) Reset() {
 	b.revealed = b.revealed[:0]
 	b.lineIdx = 0
 	b.charPos = 0
+	b.cacheValid = false
 }
