@@ -23,9 +23,10 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 )
 
-// Init initializes background loop clock ticks for state rendering animations.
+// Init initializes background loop clock ticks for state rendering animations plus
+// the text input blink tick so the cursor animation runs natively.
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(m.spinnerTickCmd(), animTickCmd())
+	return tea.Batch(m.spinnerTickCmd(), animTickCmd(), m.ti.Focus())
 }
 
 // ── Mouse Leak Interception & Buffering ──────────────────────────────────────
@@ -94,18 +95,12 @@ func (m *model) dispatchMouseLeak(s string) {
 		}
 
 		switch button {
-		case 64, 96: // Fallback Wheel up sequence
+		case 64, 96:
 			m.mouseSelecting = false
 			m.vp.ScrollUp(3)
-			if m.scrollThrottle.Allow() {
-				m.rebuildViewport()
-			}
-		case 65, 97: // Fallback Wheel down sequence
+		case 65, 97:
 			m.mouseSelecting = false
 			m.vp.ScrollDown(3)
-			if m.scrollThrottle.Allow() {
-				m.rebuildViewport()
-			}
 		case 0, 4, 32, 36:
 			point, inside := m.viewportPoint(col-1, row-1)
 
@@ -314,9 +309,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			lastAnyMouseActivity = now
 			m.mouseSelecting = false
 			m.vp.ScrollUp(3)
-			if m.scrollThrottle.Allow() {
-				m.rebuildViewport()
-			}
 			return m, nil
 		}
 		if strings.Contains(rawStr, "[<65;") || strings.Contains(rawStr, "<65;") ||
@@ -324,9 +316,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			lastAnyMouseActivity = now
 			m.mouseSelecting = false
 			m.vp.ScrollDown(3)
-			if m.scrollThrottle.Allow() {
-				m.rebuildViewport()
-			}
 			return m, nil
 		}
 
@@ -369,12 +358,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					return m, nil
 				}
-				// Not expanded — scroll the main viewport.
+				// Not expanded — scroll the main viewport directly with zero delay.
 				m.mouseSelecting = false
 				m.vp, vpCmd = m.vp.Update(msg)
-				if m.scrollThrottle.Allow() {
-					m.rebuildViewport()
-				}
 				return m, vpCmd
 
 			// ── Left-Press: Begin viewport text selection (drag start) ────
@@ -489,7 +475,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.lineAnimating = false
 			}
 		}
-		return m, animTickCmd()
+		// Cursor pass-through: drive cursor blink on every animation frame
+		var tiCmd tea.Cmd
+		m.ti, tiCmd = m.ti.Update(msg)
+		return m, tea.Batch(animTickCmd(), tiCmd)
 
 	case agentStartMsg:
 		m.agentRunning = true
@@ -592,15 +581,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Do NOT call rebuildViewport here — the animTickMsg clock drives
 		// progressive character release at a controlled frame rate.
-		return m, m.readStream()
+		// Cursor pass-through: keep cursor blink alive during streaming
+		var tiCmd tea.Cmd
+		m.ti, tiCmd = m.ti.Update(msg)
+		return m, tea.Batch(m.readStream(), tiCmd)
 
 	case streamDoneMsg:
 		m.streamCh = nil
 		m.streaming = false
 
 		if m.streamParser != nil {
-			if lastLine := m.streamParser.Flush(); lastLine != "" {
-				m.animBuffer.QueueLines([]string{lastLine})
+			if lines := m.streamParser.Flush(); len(lines) > 0 {
+				m.animBuffer.QueueLines(lines)
 			}
 			m.streamParser = nil
 		}
@@ -884,7 +876,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.vp, vpCmd = m.vp.Update(msg)
 	}
 
-	return m, vpCmd
+	// ── STAGE 3: Text Input Pass-Through ──────────────────────────────────────
+	// Always route unhandled messages to the text input so its cursor blink
+	// tick and internal state stay alive — even when the viewport or animation
+	// subsystems own the frame cycle.
+	var tiCmd tea.Cmd
+	m.ti, tiCmd = m.ti.Update(msg)
+
+	return m, tea.Batch(vpCmd, tiCmd)
 }
 
 func (m *model) spinnerTickCmd() tea.Cmd {
