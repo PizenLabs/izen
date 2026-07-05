@@ -5,15 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/atotto/clipboard"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/x/ansi"
 
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/domain"
@@ -23,400 +18,23 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 )
 
-// Init initializes background loop clock ticks for state rendering animations plus
-// the text input blink tick so the cursor animation runs natively.
+// Init initializes the spinner tick and text input blink.
 func (m *model) Init() tea.Cmd {
 	m.currentTip = randomTip()
-	return tea.Batch(m.spinnerTickCmd(), animTickCmd(), m.ti.Focus())
+	return tea.Batch(m.spinnerTickCmd(), m.ti.Focus())
 }
 
-// ── Mouse Leak Interception & Buffering ──────────────────────────────────────
-
-var sgrMousePattern = regexp.MustCompile(`(?:\x1b)?\[<(\d+);(\d+);(\d+)([Mm])`)
-var mouseFragmentRegex = regexp.MustCompile(`\[<.*|\[+.*|<+.*|;+.*`)
-
-// Global timestamp tracker to trap split microsecond terminal driver leaks
-var lastAnyMouseActivity time.Time
-
-// parseSGRMouse decodes raw SGR mouse sequences into structured data components.
-func parseSGRMouse(s string) (button, col, row int, press, ok bool) {
-	s = strings.TrimPrefix(s, "\x1b")
-	if !strings.HasPrefix(s, "[<") {
-		return
-	}
-	if !strings.HasSuffix(s, "M") && !strings.HasSuffix(s, "m") {
-		return
-	}
-	press = strings.HasSuffix(s, "M")
-	payload := s[2 : len(s)-1]
-	parts := strings.Split(payload, ";")
-	if len(parts) != 3 {
-		return
-	}
-	var e1, e2, e3 error
-	button, e1 = strconv.Atoi(parts[0])
-	col, e2 = strconv.Atoi(parts[1])
-	row, e3 = strconv.Atoi(parts[2])
-	if e1 != nil || e2 != nil || e3 != nil {
-		return
-	}
-	ok = true
-	return
-}
-
-// isSGRMouseLeak detects if a raw key sequence contains mouse tracking signatures.
-func isSGRMouseLeak(s string) bool {
-	if strings.Contains(s, "[<") || strings.Contains(s, "\x1b[<") {
-		return true
-	}
-	if strings.HasPrefix(s, "\x1b[M") || strings.HasPrefix(s, "\x1b[m") {
-		return true
-	}
-	return false
-}
-
-// sgrMouseLeaks extracts valid mouse tracking sequence matches from text streams.
-func sgrMouseLeaks(s string) []string {
-	matches := sgrMousePattern.FindAllString(s, -1)
-	if len(matches) > 0 {
-		return matches
-	}
-	if isSGRMouseLeak(s) {
-		return []string{s}
-	}
-	return nil
-}
-
-// dispatchMouseLeak processes raw control sequences bypassed by terminal protocol overrides.
-func (m *model) dispatchMouseLeak(s string) {
-	for _, seq := range sgrMouseLeaks(s) {
-		button, col, row, press, ok := parseSGRMouse(seq)
-		if !ok {
-			continue
-		}
-
-		switch button {
-		case 64, 96:
-			m.mouseSelecting = false
-			m.vp.ScrollUp(3)
-		case 65, 97:
-			m.mouseSelecting = false
-			m.vp.ScrollDown(3)
-		case 0, 4, 32, 36:
-			point, inside := m.viewportPoint(col-1, row-1)
-
-			if press && (button == 0 || button == 4) {
-				if inside {
-					m.mouseSelecting = true
-					m.startMouseRow = point.row
-					m.startMouseCol = point.col
-					m.currentMouseRow = point.row
-					m.currentMouseCol = point.col
-				}
-				continue
-			}
-
-			if press && (button == 32 || button == 36) {
-				if m.mouseSelecting && inside {
-					m.currentMouseRow = point.row
-					m.currentMouseCol = point.col
-				}
-				continue
-			}
-
-			if !press {
-				if m.mouseSelecting {
-					m.mouseSelecting = false
-					end := mouseSelectionPoint{row: m.currentMouseRow, col: m.currentMouseCol}
-					if inside {
-						end = point
-					}
-					m.copyMouseSelection(end)
-				}
-			}
-		}
-	}
-}
-
-// mouseSelectionPoint represents a specific cell position in the buffer.
-type mouseSelectionPoint struct {
-	row int
-	col int
-}
-
-// viewportPoint translates viewport-relative screen positions into global buffer indices.
-func (m *model) viewportPoint(x, y int) (mouseSelectionPoint, bool) {
-	if !m.vpReady {
-		return mouseSelectionPoint{}, false
-	}
-
-	if y < 0 || y >= m.vp.Height {
-		return mouseSelectionPoint{}, false
-	}
-
-	if x < 0 {
-		x = 0
-	}
-	maxWidth := m.width
-	if maxWidth <= 0 {
-		maxWidth = m.vp.Width
-	}
-	if maxWidth > 0 && x >= maxWidth {
-		x = maxWidth - 1
-	}
-
-	return mouseSelectionPoint{row: m.vp.YOffset + y, col: x}, true
-}
-
-// selectedViewportText extracts and strips ANSI sequences from a bound grid coordinate region.
-func selectedViewportText(lines []string, start, end mouseSelectionPoint) string {
-	if len(lines) == 0 {
-		return ""
-	}
-
-	sRow, sCol := start.row, start.col
-	eRow, eCol := end.row, end.col
-
-	if sRow < 0 {
-		sRow = 0
-	}
-	if eRow < 0 {
-		eRow = 0
-	}
-	if sRow >= len(lines) {
-		sRow = len(lines) - 1
-	}
-	if eRow >= len(lines) {
-		eRow = len(lines) - 1
-	}
-
-	if sRow > eRow || (sRow == eRow && sCol > eCol) {
-		sRow, eRow = eRow, sRow
-		sCol, eCol = eCol, sCol
-	}
-
-	var selected strings.Builder
-	for row := sRow; row <= eRow; row++ {
-		if row >= len(lines) {
-			break
-		}
-		rawLine := ansi.Strip(lines[row])
-		line := []rune(rawLine)
-		lineLen := len(line)
-
-		if lineLen == 0 {
-			if row < eRow {
-				selected.WriteByte('\n')
-			}
-			continue
-		}
-
-		startCol := 0
-		if row == sRow {
-			startCol = sCol
-		}
-
-		endCol := lineLen
-		if row == eRow {
-			endCol = eCol + 1
-		}
-
-		if startCol < 0 {
-			startCol = 0
-		}
-		if startCol > lineLen {
-			startCol = lineLen
-		}
-		if endCol < 0 {
-			endCol = 0
-		}
-		if endCol > lineLen {
-			endCol = lineLen
-		}
-		if endCol < startCol {
-			endCol = startCol
-		}
-
-		chunk := string(line[startCol:endCol])
-		selected.WriteString(strings.TrimRight(chunk, " \t"))
-
-		if row < eRow {
-			selected.WriteByte('\n')
-		}
-	}
-
-	return strings.TrimSpace(selected.String())
-}
-
-// copyMouseSelection coordinates viewport context maps and writes matching text to clipboard.
-func (m *model) copyMouseSelection(end mouseSelectionPoint) {
-	lines := m.viewLines
-	if len(lines) == 0 {
-		content := m.vp.View()
-		lines = strings.Split(content, "\n")
-	}
-	if len(lines) == 0 {
-		return
-	}
-
-	startPoint := mouseSelectionPoint{row: m.startMouseRow, col: m.startMouseCol}
-	text := selectedViewportText(lines, startPoint, end)
-	if text != "" {
-		_ = clipboard.WriteAll(text)
-	}
-}
-
-// Update maps layout engines and routes state machines.
+// Update routes state machines and events.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── GLOBAL INTERCEPT: [P] Toggle Hotkey ──────────────────────────────────
-	// Must run before any focus check or text-input routing so the p/P key is
-	// NEVER written into the input box. This is a 100% keyboard-driven toggle
-	// that bypasses all mouse hitbox calculations.
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		if keyMsg.String() == "p" || keyMsg.String() == "P" {
 			if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
-				// Toggle the EXACT property that the renderer reads:
-				// view.go:ToMutationCardViewModelFromProposal → vm.Expanded → renderer.v.Expanded
 				m.pendingProposals[0].Expanded = !m.pendingProposals[0].Expanded
 				m.proposalDiffOffset = 0
-				m.rebuildViewport()
 				return m, nil
 			}
 		}
-	}
-
-	var vpCmd tea.Cmd
-
-	now := time.Now()
-
-	// ── STAGE 0: Absolute Time Shield & Broken Sequence Interception ──────────
-	if kmsg, ok := msg.(tea.KeyMsg); ok {
-		rawStr := kmsg.String()
-
-		// 1. Check if the keypress event falls within the active mouse tracking window
-		if now.Sub(lastAnyMouseActivity) < 150*time.Millisecond {
-			// Catch single or repeating control artifacts leaked at scrolling boundaries
-			if rawStr == "[" || rawStr == "<" || rawStr == ";" || rawStr == "\x1b" ||
-				strings.HasPrefix(rawStr, "m") || strings.HasPrefix(rawStr, "M") ||
-				strings.Contains(rawStr, "[") || strings.Contains(rawStr, "<") ||
-				mouseFragmentRegex.MatchString(rawStr) {
-				return m, nil // Swallow the ghost character completely
-			}
-		}
-
-		// 2. Instantly capture explicit inline bypass SGR mouse wheel sequences
-		if strings.Contains(rawStr, "[<64;") || strings.Contains(rawStr, "<64;") ||
-			strings.Contains(rawStr, "[<96;") || strings.Contains(rawStr, "<96;") {
-			lastAnyMouseActivity = now
-			m.mouseSelecting = false
-			m.vp.ScrollUp(3)
-			return m, nil
-		}
-		if strings.Contains(rawStr, "[<65;") || strings.Contains(rawStr, "<65;") ||
-			strings.Contains(rawStr, "[<97;") || strings.Contains(rawStr, "<97;") {
-			lastAnyMouseActivity = now
-			m.mouseSelecting = false
-			m.vp.ScrollDown(3)
-			return m, nil
-		}
-
-		// 3. Consume structural raw SGR mouse leaks natively
-		if isSGRMouseLeak(rawStr) {
-			lastAnyMouseActivity = now
-			if m.vpReady {
-				m.dispatchMouseLeak(rawStr)
-			}
-			return m, nil
-		}
-	}
-
-	// ── STAGE 1: Intercept-First tea.MouseMsg Handling ─────────────────────────
-	// PHASE 1: Wheel Scrolling (Safe & Isolated)
-	// PHASE 2: Intercept Clicks for Izen Components Before Viewport Update
-	// PHASE 3: Fallback to Viewport for Selection/Scrollbar
-	if mouseMsg, ok := msg.(tea.MouseMsg); ok {
-		lastAnyMouseActivity = now
-		if !m.vpReady {
-			return m, nil
-		}
-
-		// ── Strict Button-Gated Mouse Handling ───────────────────────────────
-		// Wheel events fire on Press for instant response. Left-click toggle
-		// is captured on Release to avoid conflicts with terminal drag/select
-		// initiation that heavily contests the Press event.
-		if mouseMsg.Action == tea.MouseActionPress {
-			switch mouseMsg.Button {
-
-			// ── Wheel: Zero-Delay Bounded Diff Scroll ─────────────────────
-			case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
-				if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 && m.pendingProposals[0].Expanded {
-					if mouseMsg.Button == tea.MouseButtonWheelUp {
-						if m.proposalDiffOffset > 0 {
-							m.proposalDiffOffset--
-						}
-					} else {
-						m.proposalDiffOffset++
-					}
-					return m, nil
-				}
-				// Not expanded — scroll the main viewport directly with zero delay.
-				m.mouseSelecting = false
-				m.vp, vpCmd = m.vp.Update(msg)
-				return m, vpCmd
-
-			// ── Left-Press: Begin viewport text selection (drag start) ────
-			case tea.MouseButtonLeft:
-				point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y)
-				if !ok {
-					m.mouseSelecting = false
-					return m, nil
-				}
-				m.mouseSelecting = true
-				m.startMouseRow = point.row
-				m.startMouseCol = point.col
-				m.currentMouseRow = point.row
-				m.currentMouseCol = point.col
-				return m, nil
-			}
-		}
-
-		// ── Left-Release: Selection Finalization ───────────────────────────
-		if mouseMsg.Action == tea.MouseActionRelease && mouseMsg.Button == tea.MouseButtonLeft {
-			if m.mouseSelecting {
-				m.mouseSelecting = false
-				end := mouseSelectionPoint{row: m.currentMouseRow, col: m.currentMouseCol}
-				if point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y); ok {
-					end = point
-				}
-				m.copyMouseSelection(end)
-			}
-			return m, nil
-		}
-
-		// ── Motion & Other Release (non-left buttons) ──────────────────────
-		switch mouseMsg.Action {
-		case tea.MouseActionMotion:
-			if m.mouseSelecting {
-				if point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y); ok {
-					m.currentMouseRow = point.row
-					m.currentMouseCol = point.col
-				}
-			}
-			return m, nil
-
-		case tea.MouseActionRelease:
-			if m.mouseSelecting {
-				m.mouseSelecting = false
-				end := mouseSelectionPoint{row: m.currentMouseRow, col: m.currentMouseCol}
-				if point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y); ok {
-					end = point
-				}
-				m.copyMouseSelection(end)
-			}
-			return m, nil
-		}
-
-		return m, nil
 	}
 
 	switch msg := msg.(type) {
@@ -430,77 +48,27 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamParser.SetWidth(msg.Width - 2)
 		}
 
-		vpH := m.viewportHeight()
-
-		if !m.vpReady {
-			m.vp = viewport.New(msg.Width, vpH)
-			m.vp.YPosition = 0
-			m.vpReady = true
-			m.showBanner = true
-			m.rebuildViewport()
-		} else {
-			m.vp.Width = msg.Width
-			m.vp.Height = vpH
-			m.rebuildViewport()
-		}
 		return m, nil
 
 	case tickMsg:
 		if m.streaming || m.agentRunning {
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
-			spinnerVisible := !m.streaming || m.animBuffer == nil || len(m.animBuffer.VisibleLines()) == 0
-			if m.vpReady && spinnerVisible {
-				m.rebuildViewport()
-			}
 		}
 		return m, m.spinnerTickCmd()
-
-	case animTickMsg:
-		// Drive progressive character animation.
-		// ALWAYS advance the buffer internal state even when frozen.
-		if m.streaming && m.animBuffer != nil && m.animBuffer.IsAnimating() {
-			if m.animBuffer.Tick() {
-				m.needsCatchUp = true
-			}
-		}
-
-		// Rebuild viewport ONLY when the user is at the absolute bottom.
-		// When scrolled up to read, the viewport becomes a static reader —
-		// zero processing cycles are spent on layout while the terminal
-		// repurposes all its bandwidth for instant hardware-accelerated scrolling.
-		if m.needsCatchUp && m.vp.AtBottom() && m.vpReady {
-			m.rebuildViewport()
-			m.vp.GotoBottom()
-			m.needsCatchUp = false
-		}
-		if m.lineAnimating {
-			m.lineAnimProgress += 25.0 / 150.0
-			if m.lineAnimProgress >= 1.0 {
-				m.lineAnimProgress = 1.0
-				m.lineAnimating = false
-			}
-		}
-		// Cursor pass-through: drive cursor blink on every animation frame
-		var tiCmd tea.Cmd
-		m.ti, tiCmd = m.ti.Update(msg)
-		return m, tea.Batch(animTickCmd(), tiCmd)
 
 	case agentStartMsg:
 		m.agentRunning = true
 		m.agentDone = false
 		m.agentLabel = msg.label
 		m.spinnerFrame = 0
-		if m.vpReady {
-			m.rebuildViewport()
-		}
 		return m, m.spinnerTickCmd()
 
 	case agentDoneMsg:
 		m.agentRunning = false
 		m.agentDone = true
 		m.agentLabel = msg.label
-		m.rebuildViewport()
-		return m, nil
+		flush := m.flushPendingRecords()
+		return m, flush
 
 	case investigateResultMsg:
 		m.agentRunning = false
@@ -516,17 +84,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamCh = nil
 		m.streaming = false
 		m.streamParser = nil
-		m.streamStyledLines = nil
-		m.animBuffer.Reset()
 		m.push(roleSystem, "[System] Engine diagnostics collected. Escalating to LLM for analysis...")
-		return m, m.streamCmd(msg.escalationContent)
+		flush := m.flushPendingRecords()
+		return m, tea.Batch(flush, m.streamCmd(msg.escalationContent))
 
 	case reviewResultMsg:
 		m.agentRunning = false
 		m.agentDone = true
 		if msg.err != nil {
 			m.push(roleError, "review error: "+msg.err.Error())
-			return m, nil
+			flush := m.flushPendingRecords()
+			return m, flush
 		}
 		m.pushRecords(msg.records)
 		if msg.sessionKey != "" {
@@ -535,14 +103,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.saveReportFn != nil {
 			msg.saveReportFn()
 		}
-		return m, nil
+		flush := m.flushPendingRecords()
+		return m, flush
 
 	case commitGeneratedMsg:
 		m.agentRunning = false
 		m.agentDone = true
 		if msg.err != nil {
 			m.push(roleError, "commit error: "+msg.err.Error())
-			return m, nil
+			flush := m.flushPendingRecords()
+			return m, flush
 		}
 		m.push(roleSystem, infoStyle.Render(fmt.Sprintf("commit: %s", msg.subject)))
 		if msg.body != "" {
@@ -551,7 +121,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.push(roleStatus, fmt.Sprintf("amended as %s", msg.hash))
-		return m, nil
+		flush := m.flushPendingRecords()
+		return m, flush
 
 	case objectiveAnalyzedMsg:
 		if msg.err != nil {
@@ -579,14 +150,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tokenMsg:
 		raw := string(msg)
 		m.responseBuffer.WriteString(raw)
+		m.currentStreamContent += raw
 		if m.streamParser != nil {
-			if newLines := m.streamParser.ProcessChunk(raw); len(newLines) > 0 {
-				m.animBuffer.QueueLines(newLines)
-			}
+			m.streamParser.ProcessChunk(raw)
 		}
-		// Do NOT call rebuildViewport here — the animTickMsg clock drives
-		// progressive character release at a controlled frame rate.
-		// Cursor pass-through: keep cursor blink alive during streaming
+		// Keep cursor blink alive during streaming
 		var tiCmd tea.Cmd
 		m.ti, tiCmd = m.ti.Update(msg)
 		return m, tea.Batch(m.readStream(), tiCmd)
@@ -596,16 +164,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streaming = false
 
 		if m.streamParser != nil {
-			if lines := m.streamParser.Flush(); len(lines) > 0 {
-				m.animBuffer.QueueLines(lines)
-			}
+			m.streamParser.Flush()
 			m.streamParser = nil
 		}
-
-		// Flush animation so the viewport shows the complete response
-		// before we move the content into the historical record.
-		m.animBuffer.Flush()
-		m.rebuildViewport()
 
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
@@ -615,16 +176,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.InputTokens += msg.tokenInput
 		m.OutputTokens += msg.tokenOutput
 		m.TotalTokens = m.InputTokens + m.OutputTokens
-		final := msg.content
+
+		// Use accumulated stream content as the canonical final text.
+		// This avoids any race between async printing and the View cycle.
+		final := m.currentStreamContent
+		if final == "" {
+			final = msg.content
+		}
 		if final == "" {
 			final = m.responseBuffer.String()
 		}
 		m.responseBuffer.Reset()
+		m.currentStreamContent = ""
 
-		m.records = append(m.records, record{role: roleAI, text: final})
+		// Flush the AI response to terminal scrollback via a SINGLE tea.Println.
+		aiRecord := record{role: roleAI, text: final}
+		m.records = append(m.records, aiRecord)
 
 		// SECTION 1: INTERCEPTING STREAM COMPLETION
-		// Use cached prompt text (captured before input buffer clearing)
 		promptText := m.currentPrompt
 		if promptText != "" {
 			// Memory Context Update: Store user and assistant messages in sliding window
@@ -684,7 +253,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleStatus, fmt.Sprintf("done - +%s tokens (this turn)  •  %s", deltaStr, costStr))
 
 		if m.resolver.Current() == modes.ModePlan {
-			// Validate output against the rigid block schema.
 			validation := plan.ValidatePlanOutput(final)
 			if !validation.Valid {
 				errMsg := plan.FormatValidationError(validation)
@@ -713,9 +281,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				rendered := renderer.Render(compileTaskListMarkdown(&tasks))
 				if rendered != "" {
 					m.records = append(m.records, record{role: roleAI, text: rendered})
-					if m.vpReady {
-						m.rebuildViewport()
-					}
 				}
 				m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
 			}
@@ -793,30 +358,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		m.streamStyledLines = nil
-		m.animBuffer.Reset()
-		m.rebuildViewport()
-		return m, nil
+		// Single atomic flush: AI response + all status records in one batch.
+		return m, m.flushPendingRecords()
 
 	case streamErrMsg:
 		m.streamCh = nil
 		m.streaming = false
 		m.streamParser = nil
-		m.streamStyledLines = nil
-		m.animBuffer.Reset()
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
 			_ = m.sess.Save()
 		}
 		m.push(roleError, "stream error: "+msg.err.Error())
-		return m, nil
+		flush := m.flushPendingRecords()
+		return m, flush
 
 	case traceUpdateMsg:
 		m.currentTrace = msg.trace
-		if m.vpReady {
-			m.rebuildViewport()
-		}
 		return m, nil
 
 	case config.ConfigChangeMsg:
@@ -827,8 +386,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		// In special states, route directly to handleKey to avoid
-		// processing text input or history navigation.
+		// In special states, route directly to handleKey.
 		if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec {
 			resModel, cmd := m.handleKey(msg)
 			return resModel, cmd
@@ -867,10 +425,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				return m, nil
-
-			case tea.KeyPgUp, tea.KeyPgDown:
-				m.vp, vpCmd = m.vp.Update(msg)
-				return m, vpCmd
 			}
 		}
 
@@ -878,20 +432,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return resModel, cmd
 	}
 
-	// ── STAGE 2: Viewport Update Deflection ───────────────────────────────────
-	// Block standard bubbletea viewport internal mapping from routing if mouse selection is in progress.
-	if !m.mouseSelecting {
-		m.vp, vpCmd = m.vp.Update(msg)
-	}
-
-	// ── STAGE 3: Text Input Pass-Through ──────────────────────────────────────
-	// Always route unhandled messages to the text input so its cursor blink
-	// tick and internal state stay alive — even when the viewport or animation
-	// subsystems own the frame cycle.
+	// ── Text Input Pass-Through ──────────────────────────────────────────────
 	var tiCmd tea.Cmd
 	m.ti, tiCmd = m.ti.Update(msg)
-
-	return m, tea.Batch(vpCmd, tiCmd)
+	return m, tiCmd
 }
 
 func (m *model) spinnerTickCmd() tea.Cmd {
@@ -911,10 +455,6 @@ func (m *model) spinnerTickCmd() tea.Cmd {
 	}
 
 	return tea.Tick(delay, func(t time.Time) tea.Msg { return tickMsg(t) })
-}
-
-func animTickCmd() tea.Cmd {
-	return tea.Tick(25*time.Millisecond, func(t time.Time) tea.Msg { return animTickMsg(t) })
 }
 
 func compileTaskListMarkdown(tasks *[]plan.Task) string {

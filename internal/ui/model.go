@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -68,7 +67,6 @@ type traceUpdateMsg struct {
 type streamErrMsg struct{ err error }
 
 type tickMsg time.Time
-type animTickMsg time.Time
 
 type investigateResultMsg struct {
 	records           []record
@@ -105,15 +103,6 @@ const (
 	version                   = "0.1.0"
 	maxInvestigateInvocations = 20
 
-	// Fixed heights of chrome elements (lines)
-	focusLineHeight  = 1 // top colored rule
-	promptBoxHeight  = 3 // border top + content + border bottom
-	statusBarHeight  = 1 // runtime status (task, sandbox, model, tokens)
-	guardrailHeight  = 1 // subtle border separating operational zone from infra metadata
-	footerLineHeight = 1 // workspace, branch, execution mode
-	errorBarHeight   = 1 // red error bar (auto-clears after 30s)
-	viewportPadding  = 1 // breathing room
-
 	maxProposalDiffHeight = 15 // max visible diff lines in expanded proposal widget
 )
 
@@ -147,11 +136,6 @@ type model struct {
 	ti    textinput.Model
 	input strings.Builder // kept in sync with ti for suggestions.go
 
-	// Viewport for scrollable conversation history
-	vp        viewport.Model
-	vpReady   bool
-	viewLines []string // rendered lines fed into viewport
-
 	// Banner visibility state
 	showBanner bool
 
@@ -160,10 +144,11 @@ type model struct {
 	height int
 
 	// Streaming
-	streamCh       chan tea.Msg
-	responseBuffer strings.Builder
-	streaming      bool
-	spinnerFrame   int
+	streamCh             chan tea.Msg
+	responseBuffer       strings.Builder
+	streaming            bool
+	spinnerFrame         int
+	currentStreamContent string // accumulated raw text during active LLM stream
 
 	// Expanded metrics for status bar
 	IsCloudModel    bool
@@ -174,11 +159,7 @@ type model struct {
 	AccumulatedCost float64
 	CheckpointID    string
 
-	streamParser      *IncrementalStreamParser
-	streamStyledLines []string
-
-	// progressive character animation
-	animBuffer *AnimBuffer
+	streamParser *IncrementalStreamParser
 
 	// Agent state
 	agentRunning bool
@@ -233,13 +214,6 @@ type model struct {
 	// Cached prompt text for logging (set on submit, cleared after stream completion)
 	currentPrompt string
 
-	// Copy
-	mouseSelecting  bool
-	startMouseCol   int
-	startMouseRow   int
-	currentMouseCol int
-	currentMouseRow int
-
 	// Focus objective UI notifications (non-chat)
 	uiNotice string
 
@@ -252,40 +226,12 @@ type model struct {
 	// Tip of the Day
 	currentTip string
 
-	// Scroll freeze: when true, animTick must skip rebuildViewport until
-	// the user returns to the bottom of the viewport.
-	needsCatchUp bool
-
 	// Last apply error for the red error bar
 	lastApplyError string
 	applyErrorTime time.Time
 }
 
-// ── Viewport helpers ──────────────────────────────────────────────────────────
-
-// viewportHeight calculates available lines for the conversation viewport.
-// The viewport is strictly bounded: terminal height minus the fixed chrome
-// elements below it. Computed from named constants (not magic numbers).
-func (m *model) viewportHeight() int {
-	// Fixed chrome: Focus line + Prompt box + Runtime status + Guardrail + Footer
-	chrome := focusLineHeight + promptBoxHeight + statusBarHeight + guardrailHeight + footerLineHeight
-	height := m.height - chrome
-
-	if m.lastApplyError != "" && time.Since(m.applyErrorTime) < 30*time.Second {
-		height -= errorBarHeight
-	}
-
-	if height < 5 {
-		height = 5
-	}
-	return height
-}
-
-// suggestionPaletteHeight returns 0 since the suggestion palette is now
-// rendered in the fixed footer zone and no longer affects viewport height.
-func (m *model) suggestionPaletteHeight() int {
-	return 0
-}
+// ── Rendering helpers ─────────────────────────────────────────────────────────
 
 // wrapStreamText wraps raw text lines dynamically during an active live stream.
 func wrapStreamText(text string, maxW int) []string {
@@ -322,146 +268,46 @@ func wrapStreamText(text string, maxW int) []string {
 	return chunks
 }
 
-// rebuildViewport re-renders all records into the viewport content.
-// setApplyError captures an apply error for the red error bar and also
-// pushes it to the conversation history.
+// setApplyError captures an apply error.
 func (m *model) setApplyError(text string) {
 	m.lastApplyError = text
 	m.applyErrorTime = time.Now()
 	m.push(roleError, text)
 }
 
-// renderErrorBar renders a red error bar if a recent apply error exists.
-// The bar auto-clears after 30 seconds or when a new user message is submitted.
-func (m *model) renderErrorBar(width int) string {
-	if m.lastApplyError == "" {
-		return ""
-	}
-	if time.Since(m.applyErrorTime) > 30*time.Second {
-		m.lastApplyError = ""
-		return ""
-	}
-	text := m.lastApplyError
-	if len(text) > width-6 {
-		text = text[:width-9] + "…"
-	}
-	return redBgBoldStyle.Padding(0, 1).Width(width).Render(" ✗ " + text)
-}
-
-func (m *model) rebuildViewport() {
-	if !m.vpReady {
-		return
-	}
-
-	m.vp.Height = m.viewportHeight()
-
-	followBottom := m.vp.AtBottom()
-	var lines []string
-
-	// Zone 1: Welcome banner (shown once on idle startup)
-	if m.showBanner {
-		lines = append(lines, strings.Split(m.renderStartupBanner(m.width), "\n")...)
-		lines = append(lines, "")
-		// Tip of the Day — only when conversation is empty
-		if len(m.records) == 0 {
-			if tipLine := m.renderTip(m.width); tipLine != "" {
-				lines = append(lines, tipLine)
-				lines = append(lines, "")
-			}
-		}
-	}
-
-	// Zone 2: Chat history records
-	traceInjected := false
-	lastUserIdx := -1
-	for i, rec := range m.records {
-		if rec.role == roleUser {
-			lastUserIdx = i
-		}
-	}
-
-	for i, rec := range m.records {
-		lines = append(lines, m.printRecord(rec))
-		if !traceInjected && i == lastUserIdx && m.currentTrace != nil && len(m.currentTrace.MatchedFiles) > 0 {
-			traceLine := m.renderCodebaseTrace(m.width)
-			if traceLine != "" {
-				lines = append(lines, traceLine)
-				traceInjected = true
-			}
-		}
-	}
-
-	if !traceInjected && m.currentTrace != nil && len(m.currentTrace.MatchedFiles) > 0 && lastUserIdx == -1 {
-		traceLine := m.renderCodebaseTrace(m.width)
-		if traceLine != "" {
-			lines = append(lines, traceLine)
-		}
-	}
-
-	// Zone 3: Proposal diff (when awaiting approval)
-	if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
-		prop := m.pendingProposals[0]
-		if prop.Diff != "" {
-			if prop.Expanded {
-				// Full diff view
-				dr := &DiffRenderer{Width: m.width - 2, IsNewFile: isNewFileCreation(prop.Diff)}
-				diffRendered := dr.Render(ToDiffCardViewModel(prop.Diff))
-				if diffRendered != "" {
-					lines = append(lines, "")
-					lines = append(lines, strings.Split(diffRendered, "\n")...)
-				}
-			} else {
-				// Collapsed view: single placeholder line
-				lines = append(lines, "")
-				lines = append(lines, "  [ Content Collapsed — Press [P] to Expand ]")
-			}
-		}
-	}
-
-	// Zone 4: Live streaming response (progressive animation)
-	// Uses the AnimBuffer's pre-joined cached content to avoid ansi.Truncate
-	// on every frame — the cache is only invalidated when Tick() advances state.
-	if m.streaming {
-		var displayContent string
-		if m.animBuffer != nil {
-			displayContent = m.animBuffer.JoinedContent()
-		}
-		if displayContent != "" {
-			gutter := gutterAIStyle.Render("▌") + " "
-			for _, l := range strings.Split(displayContent, "\n") {
-				lines = append(lines, gutter+l)
-			}
-		} else {
-			sp := m.renderFlowingSpinner()
-			lines = append(lines, gutterAIStyle.Render("▌")+" "+sp+"  "+infoStyle.Render("thinking…"))
-		}
-	}
-
-	m.viewLines = lines
-	m.vp.SetContent(strings.Join(lines, "\n"))
-
-	if followBottom {
-		m.vp.GotoBottom()
-	}
-}
-
 // ── Record helpers ─────────────────────────────────────────────────────────────
 
+// push appends a record. Records are flushed to the terminal's native
+// scrollback at explicit sync points (user submit, stream done, etc.).
 func (m *model) push(r role, text string) {
-	// Preserve complete original string to let printRecord's advanced layout algorithms resolve wrapping
-	rec := record{role: r, text: text}
-	m.records = append(m.records, rec)
-
-	if m.vpReady {
-		m.rebuildViewport()
-	}
+	m.records = append(m.records, record{role: r, text: text})
 }
 
+// pushRecords appends multiple records.
 func (m *model) pushRecords(recs []record) {
 	m.records = append(m.records, recs...)
-	if m.vpReady {
-		m.rebuildViewport()
+}
+
+// flushRecord returns a tea.Cmd that renders and flushes a record
+// via tea.Println into the terminal's native scrollback history.
+func (m *model) flushRecord(rec record) tea.Cmd {
+	rendered := strings.TrimRight(m.printRecord(rec), "\n")
+	if rendered == "" {
+		return nil
 	}
+	return tea.Println(rendered)
+}
+
+// flushPendingRecords returns a batch cmd that flushes all records.
+func (m *model) flushPendingRecords() tea.Cmd {
+	if len(m.records) == 0 {
+		return nil
+	}
+	var cmds []tea.Cmd
+	for _, rec := range m.records {
+		cmds = append(cmds, m.flushRecord(rec))
+	}
+	return tea.Batch(cmds...)
 }
 
 var spinnerBaseStyle = lipgloss.NewStyle()

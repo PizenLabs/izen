@@ -16,7 +16,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if len(m.pendingShellExec) == 0 {
 				m.state = StateChat
 			}
-			m.rebuildViewport()
 			return m, m.execShellCmd(block.Command)
 
 		case "r", "R":
@@ -25,14 +24,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.state = StateChat
 			}
 			m.push(roleSystem, infoStyle.Render("shell command skipped"))
-			m.rebuildViewport()
 			return m, nil
 
 		case "esc":
 			m.pendingShellExec = nil
 			m.state = StateChat
 			m.push(roleSystem, infoStyle.Render("shell execution cancelled"))
-			m.rebuildViewport()
 			return m, nil
 		}
 		return m, nil
@@ -52,7 +49,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.pendingProposals = nil
 			m.acceptAll = false
 			m.push(roleSystem, infoStyle.Render("changes rejected"))
-			m.rebuildViewport()
 			return m, nil
 		}
 		return m, nil
@@ -88,7 +84,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		_ = m.sess.Save()
 		return m, tea.Quit
 
-	// ── Enter: submit ─────────────────────────────────────────────────────────
+		// ── Enter: submit ─────────────────────────────────────────────────────────
 	case tea.KeyEnter:
 		line := m.ti.Value()
 
@@ -122,7 +118,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.showBanner = false
 			}
 
-			// Echo user line into viewport
+			// Flush user line to terminal scrollback
 			userLine := gutterUserStyle.Render("|") + " " +
 				labelUserStyle.Render("you") +
 				promptStyle.Render(" ⏵ ") +
@@ -136,10 +132,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 			m.ti.SetValue("")
 			m.syncInputFromTI()
-			m.rebuildViewport()
 
+			// Flush user message and handle input
 			cmd := m.handleInput(line)
-			return m, cmd
+			return m, tea.Batch(m.flushRecord(record{role: roleUser, text: userLine}), cmd)
 		}
 		m.ti.SetValue("")
 		m.syncInputFromTI()

@@ -3,7 +3,6 @@ package ui
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -28,131 +27,81 @@ type contentBlock struct {
 	raw  string
 }
 
-// View renders the entire multi-pane TUI architecture layout.
-// The layout is split into two zones separated by a vertical spacer:
-//   - Dynamic zone: viewport (scrollable chat history + proposal diffs)
-//   - Static footer zone: action line, suggestions, error bar, focus line,
-//     prompt box, runtime status, footer — pinned to the absolute bottom.
+// View returns only the dynamic UI state at the bottom of the screen.
+// Historical chat content is flushed directly to the terminal's native
+// scrollback via tea.Println — Bubble Tea only manages the live input zone.
+//
+// Layout (strictly):
+//
+//	[Optional Dynamic TIP]            (1 line, if visible)
+//	[Streaming Content Line]          (spinner + currentStreamContent, during stream)
+//	[Prompt Input Line]               (❯ <mode> ⟩ <input>)
+//	[Telemetry Status]                (<mode> ● <model> │ <tokens>)
 func (m *model) View() string {
-	if !m.vpReady {
-		return "initializing…"
-	}
-
 	width := m.width
 	if width < 40 {
 		width = 40
 	}
 
-	// ── Dynamic zone (scrollable) ────────────────────────────────────────
-	viewportView := m.vp.View()
-
-	// ── Static footer zone (flat strings.Builder — no nested layouts) ────
 	var b strings.Builder
 
-	if m.showSuggestions && len(m.suggestions) > 0 {
-		b.WriteString(m.renderSuggestions(width))
+	// Optional tip of the day (shown when conversation is empty)
+	tip := m.renderTip(width)
+	if tip != "" {
+		b.WriteString(tip)
 		b.WriteByte('\n')
 	}
 
-	if actionLine := m.renderActionLine(width); actionLine != "" {
-		b.WriteString(actionLine)
-		b.WriteByte('\n')
+	// Streaming content line: only visible while the LLM is actively streaming.
+	if m.streaming && len(m.currentStreamContent) > 0 {
+		sp := m.renderFlowingSpinner()
+		streamText := m.currentStreamContent
+		// Truncate to fit terminal width, leaving room for spinner + padding.
+		maxStreamW := width - 4
+		if maxStreamW < 20 {
+			maxStreamW = 20
+		}
+		lines := strings.Split(streamText, "\n")
+		// Show the last non-empty line of the stream for live feedback.
+		lastLine := ""
+		for i := len(lines) - 1; i >= 0; i-- {
+			if strings.TrimSpace(lines[i]) != "" {
+				lastLine = lines[i]
+				break
+			}
+		}
+		if lipgloss.Width(lastLine) > maxStreamW {
+			lastLine = lastLine[:maxStreamW-1] + "…"
+		}
+		b.WriteString(sp + " " + lastLine + "\n")
+	} else if m.streaming && m.responseBuffer.Len() == 0 {
+		// Stream started but no chunks yet — show thinking indicator.
+		sp := m.renderFlowingSpinner()
+		b.WriteString(sp + " " + infoStyle.Render("thinking…") + "\n")
 	}
 
-	if errorBar := m.renderErrorBar(width); errorBar != "" {
-		b.WriteString(errorBar)
-		b.WriteByte('\n')
-	}
+	// Prompt input line — clean 2-line layout (no border box).
+	mode := m.resolver.Current()
+	modeLabel := modeBoldFgStyles[mode].Render("❯ " + mode.String() + " ⟩")
+	b.WriteString(modeLabel + " " + m.ti.View() + "\n")
 
-	b.WriteString(m.renderFocusLine(width))
-	b.WriteByte('\n')
-	b.WriteString(m.renderPromptBox(width))
-	b.WriteByte('\n')
+	// Telemetry status line.
 	b.WriteString(m.renderRuntimeStatus(width))
 
-	// Infrastructure guardrail: subtle border separating operational zone
-	// from background safety metrics (sandbox, model, tokens).
-	b.WriteByte('\n')
-	b.WriteString(subtleStyle.Render(strings.Repeat("─", width)))
-	b.WriteByte('\n')
-
-	b.WriteString(m.renderFooter(width))
-
-	footerView := b.String()
-
-	// ── Vertical spacer: push footer to absolute terminal bottom ─────────
-	viewportH := len(strings.Split(viewportView, "\n"))
-	footerH := len(strings.Split(footerView, "\n"))
-	extraLinesNeeded := m.height - viewportH - footerH
-	if extraLinesNeeded > 0 {
-		return viewportView + strings.Repeat("\n", extraLinesNeeded) + footerView
-	}
-
-	return viewportView + "\n" + footerView
-}
-
-// renderActionLine renders a single-line keybinding hint for the active proposal,
-// shell execution, or running agent. Returns empty string when no action is pending.
-func (m *model) renderActionLine(width int) string {
-	switch {
-	case m.state == StateAwaitingShellExec && len(m.pendingShellExec) > 0:
-		return dimmedStyle.Render("[A] Execute  [R] Skip")
-	case m.state == StateAwaitingApproval && len(m.pendingProposals) > 0:
-		toggleHint := "[P] Expand"
-		if m.pendingProposals[0].Expanded {
-			toggleHint = "[P] Collapse"
-		}
-		return dimmedStyle.Render("[A] Accept  [L] Allow All  [R] Reject  " + toggleHint)
-	case m.agentRunning:
-		return dimmedStyle.Render("● Running task: " + m.agentLabel + "…")
-	default:
-		return ""
-	}
-}
-
-// ── Focus line ────────────────────────────────────────────────────────────
-
-func (m *model) renderFocusLine(width int) string {
-	style := modeFocusLineStyles[m.resolver.Current()]
-	return style.Render(strings.Repeat("─", width))
-}
-
-// ── Prompt box ────────────────────────────────────────────────────────────
-
-func (m *model) renderPromptBox(width int) string {
-	mode := m.resolver.Current()
-
-	prefix := modeBoldFgStyles[mode].Render(mode.String() + " ❯")
-
-	var inner string
-	switch {
-	case m.agentRunning:
-		sp := m.renderFlowingSpinner()
-		label := yellowStyle.Render(m.agentLabel + "…")
-		inner = prefix + " " + sp + "  " + label
-	case m.streaming && m.responseBuffer.Len() == 0:
-		sp := m.renderFlowingSpinner()
-		inner = prefix + " " + sp + "  " + infoStyle.Render("thinking…")
-	default:
-		inner = prefix + " " + m.ti.View()
-	}
-
-	return modePromptBorderStyles[mode].Width(width - 2).Render(inner)
+	return b.String()
 }
 
 // ── Runtime Status ────────────────────────────────────────────────────────
 
-func formatTokens(n int) string {
-	if n >= 1000 {
-		return fmt.Sprintf("%.1fk", float64(n)/1000)
-	}
-	return strconv.Itoa(n)
-}
-
 func (m *model) renderRuntimeStatus(width int) string {
 	var b strings.Builder
 
-	// State icon
+	// Mode prefix + state icon
+	mode := m.resolver.Current()
+	b.WriteString(modeBoldFgStyles[mode].Render(mode.String() + " ❯"))
+
+	b.WriteByte(' ')
+
 	if m.streaming || m.agentRunning {
 		idx := m.spinnerFrame % len(taskSpinnerFrames)
 		b.WriteString(cyanStyle.Render(taskSpinnerFrames[idx]))
@@ -161,43 +110,22 @@ func (m *model) renderRuntimeStatus(width int) string {
 	}
 	b.WriteByte(' ')
 
-	// Model name (deeply dimmed)
+	// Model name
 	b.WriteString(dimmedStyle.Render(m.cfg.ActiveModelName()))
 
 	// Separator
 	sep := dimmedStyle.Render(" │ ")
 	b.WriteString(sep)
 
-	// Auth mode
-	if m.resolver.Current().CanWrite() {
-		b.WriteString(orangeStyle.Render("[rw]"))
-	} else {
-		b.WriteString(dimmedStyle.Render("[ro]"))
-	}
-	b.WriteString(sep)
-
-	// Metrics engine
-	if m.IsCloudModel {
-		inStr := formatTokens(m.InputTokens)
-		outStr := formatTokens(m.OutputTokens)
-		usagePct := 0
-		if m.ContextLimit > 0 {
-			usagePct = int(float64(m.InputTokens+m.OutputTokens) / float64(m.ContextLimit) * 100)
-		}
-		b.WriteString(mutedStyle.Render("In: "))
-		b.WriteString(textStyle.Render(inStr))
-		b.WriteString(mutedStyle.Render(" • "))
-		b.WriteString(mutedStyle.Render("Out: "))
-		b.WriteString(textStyle.Render(outStr))
-		b.WriteString(mutedStyle.Render(fmt.Sprintf(" (%d%%)", usagePct)))
-		b.WriteString(sep)
-		b.WriteString(dimmedStyle.Render(fmt.Sprintf("$%.4f", m.AccumulatedCost)))
-	} else {
+	// Tokens
+	if m.TotalTokens > 0 {
 		b.WriteString(textStyle.Render(strconv.Itoa(m.TotalTokens)))
 		b.WriteString(dimmedStyle.Render(" tkn"))
+	} else {
+		b.WriteString(dimmedStyle.Render("0 tkn"))
 	}
 
-	// Checkpoint (truncated to 7 chars, always shown with cp- prefix)
+	// Checkpoint (truncated)
 	if cp := m.latestCheckpointID(); cp != "" {
 		cp = strings.TrimPrefix(cp, "cp-")
 		if len(cp) > 7 {
@@ -208,24 +136,6 @@ func (m *model) renderRuntimeStatus(width int) string {
 	}
 
 	return b.String()
-}
-
-// ── Footer ────────────────────────────────────────────────────────────────
-
-func (m *model) renderFooter(width int) string {
-	wd, _ := os.Getwd()
-	project := filepath.Base(wd)
-	branch, _ := m.gitEng.Branch()
-	if branch == "" {
-		branch = "detached"
-	}
-
-	left := fmt.Sprintf("workspace: %s (%s)", project, branch)
-	if width < 50 {
-		left = fmt.Sprintf("(%s)", branch)
-	}
-
-	return footerDimStyle.Render(left)
 }
 
 // ── Startup banner ────────────────────────────────────────────────────────
@@ -417,77 +327,6 @@ func (m *model) printRecord(rec record) string {
 }
 
 // ── AST Trace Renderer ────────────────────────────────────────────────────
-
-// renderCodebaseTrace renders the AI's cognitive execution trace as a clean,
-// industrial log line positioned above the AI response.
-func (m *model) renderCodebaseTrace(width int) string {
-	if m.currentTrace == nil {
-		return ""
-	}
-	t := m.currentTrace
-	if len(t.MatchedFiles) == 0 && len(t.ResolvedSymbols) == 0 {
-		return ""
-	}
-
-	// Build the primary trace line: file > symbol references
-	var parts []string
-	maxFiles := 3
-	if len(t.MatchedFiles) < maxFiles {
-		maxFiles = len(t.MatchedFiles)
-	}
-	for i := 0; i < maxFiles; i++ {
-		parts = append(parts, t.MatchedFiles[i])
-	}
-	if len(t.MatchedFiles) > maxFiles {
-		parts = append(parts, fmt.Sprintf("+%d more", len(t.MatchedFiles)-maxFiles))
-	}
-	fileStr := strings.Join(parts, ", ")
-
-	var symPart string
-	maxSyms := 3
-	if len(t.ResolvedSymbols) < maxSyms {
-		maxSyms = len(t.ResolvedSymbols)
-	}
-	if len(t.ResolvedSymbols) > 0 {
-		symNames := make([]string, maxSyms)
-		for i := 0; i < maxSyms; i++ {
-			symNames[i] = t.ResolvedSymbols[i]
-		}
-		symPart = strings.Join(symNames, ", ")
-		if len(t.ResolvedSymbols) > maxSyms {
-			symPart += fmt.Sprintf(" +%d", len(t.ResolvedSymbols)-maxSyms)
-		}
-	}
-
-	// Build the optimization percentage
-	var optStr string
-	if t.CompressionRatio > 0 {
-		pct := (1.0 - t.CompressionRatio) * 100
-		optStr = fmt.Sprintf(" | ctx optimized %.0f%%", pct)
-	} else if t.TotalTokensSaved > 0 {
-		optStr = fmt.Sprintf(" | saved ~%d tok", t.TotalTokensSaved)
-	}
-
-	// Compose the trace line
-	traceLine := "⚡ AST Slicing: " + fileStr
-	if symPart != "" {
-		traceLine += " > " + symPart
-	}
-	traceLine += optStr
-
-	availableWidth := width - 2
-	if availableWidth < 20 {
-		availableWidth = 20
-	}
-
-	// Wrap if necessary
-	trimmed := traceLine
-	if lipgloss.Width(trimmed) > availableWidth {
-		trimmed = trimmed[:availableWidth-1] + "…"
-	}
-
-	return " " + traceStyle.Render(trimmed)
-}
 
 // ── Widget Box & Semantic Renderers ───────────────────────────────────────
 

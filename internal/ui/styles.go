@@ -117,19 +117,6 @@ var (
 	infoStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 	errorStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
 
-	// Suggestion palette
-	paletteBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color(colorSubtle)).
-			Padding(0, 1)
-	paletteSectionStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMuted))
-	paletteSelectedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorAccent))
-	paletteItemStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	paletteCoreItemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	paletteHintStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	palettePathStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	paletteSelectedPath  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
-
 	// Accepted green dot — single-line collapsed summary
 	acceptedDotStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen)).Render("●")
 	acceptedLineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
@@ -165,7 +152,6 @@ var (
 	mutedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 	subtleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
 	textStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
-	yellowStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow))
 	cyanStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan))
 	orangeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange))
 	greenStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
@@ -176,20 +162,6 @@ var (
 	// Bold + color
 	boldTextStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
 	boldAccentStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorAccent))
-
-	// Background + foreground (error bar)
-	redBgBoldStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color(colorRed)).
-			Foreground(lipgloss.Color(colorBase)).
-			Bold(true)
-
-	// Footer / runtime status
-	footerDimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-
-	// Codebase trace
-	traceStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(colorMuted)).
-			Faint(true)
 
 	// Startup banner border
 	bannerBorderStyle = lipgloss.NewStyle().
@@ -215,20 +187,6 @@ var (
 		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeBuild)),
 		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeInvestigate)),
 		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeReview)),
-	}
-	modePromptBorderStyles = []lipgloss.Style{
-		lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(colorModeAsk)).Padding(0, 1),
-		lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(colorModePlan)).Padding(0, 1),
-		lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(colorModeBuild)).Padding(0, 1),
-		lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(colorModeInvestigate)).Padding(0, 1),
-		lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(colorModeReview)).Padding(0, 1),
-	}
-	modeFocusLineStyles = []lipgloss.Style{
-		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeAsk)),
-		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModePlan)),
-		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeBuild)),
-		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeInvestigate)),
-		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeReview)),
 	}
 )
 
@@ -278,18 +236,4 @@ func gutterFor(r role) string {
 	default:
 		return "  "
 	}
-}
-
-func cmdCategory(cmd string) string {
-	for _, c := range coreModes {
-		if c == cmd {
-			return "core"
-		}
-	}
-	for _, c := range globalCommands {
-		if c == cmd {
-			return "global"
-		}
-	}
-	return "utility"
 }
