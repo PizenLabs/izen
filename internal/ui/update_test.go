@@ -128,14 +128,13 @@ func TestViewportHeightShrinksWhenSuggestionsVisible(t *testing.T) {
 		suggestions:     []string{"internal/ui/view.go", "internal/ui/model.go"},
 	}
 	suggestionHeight := withSuggestions.suggestionPaletteHeight()
-	if suggestionHeight == 0 {
-		t.Fatal("expected suggestion palette to have visible height")
+	if suggestionHeight != 0 {
+		t.Fatalf("suggestion palette height should be 0 (in fixed footer), got %d", suggestionHeight)
 	}
 
 	got := withSuggestions.viewportHeight()
-	want := baseHeight - suggestionHeight
-	if got != want {
-		t.Fatalf("viewport height = %d, want %d (base=%d, suggestions=%d)", got, want, baseHeight, suggestionHeight)
+	if got != baseHeight {
+		t.Fatalf("viewport height = %d, want %d (suggestions should not affect viewport height)", got, baseHeight)
 	}
 }
 
@@ -157,13 +156,14 @@ func TestUpdateSuggestionsRebuildsViewportHeightImmediately(t *testing.T) {
 	if !m.showSuggestions {
 		t.Fatal("expected suggestions to be visible after slash input")
 	}
-	if m.vp.Height >= before {
-		t.Fatalf("expected viewport height to shrink immediately: before=%d after=%d", before, m.vp.Height)
+	// Suggestions are now in the fixed footer — viewport height must not change
+	if m.vp.Height != before {
+		t.Fatalf("expected viewport height to remain stable with suggestions in footer: before=%d after=%d", before, m.vp.Height)
 	}
 
 	m.dismissSuggestions()
 	if m.vp.Height != before {
-		t.Fatalf("expected viewport height to restore after dismiss: before=%d after=%d", before, m.vp.Height)
+		t.Fatalf("expected viewport height to remain stable after dismiss: before=%d after=%d", before, m.vp.Height)
 	}
 }
 

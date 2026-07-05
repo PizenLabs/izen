@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-
-	"github.com/PizenLabs/izen/internal/modes"
 )
 
 type blockType int
@@ -31,6 +29,10 @@ type contentBlock struct {
 }
 
 // View renders the entire multi-pane TUI architecture layout.
+// The layout is split into two zones separated by a vertical spacer:
+//   - Dynamic zone: viewport (scrollable chat history + proposal diffs)
+//   - Static footer zone: action line, suggestions, error bar, focus line,
+//     prompt box, runtime status, footer — pinned to the absolute bottom.
 func (m *model) View() string {
 	if !m.vpReady {
 		return "initializing…"
@@ -41,46 +43,71 @@ func (m *model) View() string {
 		width = 40
 	}
 
-	var sections []string
+	// ── Dynamic zone (scrollable) ────────────────────────────────────────
+	viewportView := m.vp.View()
 
-	// 1. Top Status Bar (objective + metrics — hidden when no state)
-	topBar := m.renderTopBar()
-	if topBar != "" {
-		sections = append(sections, topBar)
-	}
+	// ── Static footer zone (flat strings.Builder — no nested layouts) ────
+	var b strings.Builder
 
-	// 2. Conversation Timeline (Viewport)
-	sections = append(sections, m.vp.View())
-
-	// 3. Suggestion palette (Floats dynamically above the prompt input area)
 	if m.showSuggestions && len(m.suggestions) > 0 {
-		sections = append(sections, m.renderSuggestions(width))
+		b.WriteString(m.renderSuggestions(width))
+		b.WriteByte('\n')
 	}
 
-	// 4. Engineering Widgets (Active/pinned widget, e.g. active Proposal or Progress)
-	activeWidget := m.renderActiveWidget(width)
-	if activeWidget != "" {
-		sections = append(sections, activeWidget)
+	if actionLine := m.renderActionLine(width); actionLine != "" {
+		b.WriteString(actionLine)
+		b.WriteByte('\n')
 	}
 
-	// 4b. Error bar (red, above the focus line, auto-clears on next input)
 	if errorBar := m.renderErrorBar(width); errorBar != "" {
-		sections = append(sections, errorBar)
+		b.WriteString(errorBar)
+		b.WriteByte('\n')
 	}
 
-	// 5. Focus separator line
-	sections = append(sections, m.renderFocusLine(width))
+	b.WriteString(m.renderFocusLine(width))
+	b.WriteByte('\n')
+	b.WriteString(m.renderPromptBox(width))
+	b.WriteByte('\n')
+	b.WriteString(m.renderRuntimeStatus(width))
 
-	// 6. Input Prompt box area
-	sections = append(sections, m.renderPromptBox(width))
+	// Infrastructure guardrail: subtle border separating operational zone
+	// from background safety metrics (sandbox, model, tokens).
+	b.WriteByte('\n')
+	b.WriteString(subtleStyle.Render(strings.Repeat("─", width)))
+	b.WriteByte('\n')
 
-	// 7. Runtime Status
-	sections = append(sections, m.renderRuntimeStatus(width))
+	b.WriteString(m.renderFooter(width))
 
-	// 8. Footer
-	sections = append(sections, m.renderFooter(width))
+	footerView := b.String()
 
-	return strings.Join(sections, "\n")
+	// ── Vertical spacer: push footer to absolute terminal bottom ─────────
+	viewportH := len(strings.Split(viewportView, "\n"))
+	footerH := len(strings.Split(footerView, "\n"))
+	extraLinesNeeded := m.height - viewportH - footerH
+	if extraLinesNeeded > 0 {
+		return viewportView + strings.Repeat("\n", extraLinesNeeded) + footerView
+	}
+
+	return viewportView + "\n" + footerView
+}
+
+// renderActionLine renders a single-line keybinding hint for the active proposal,
+// shell execution, or running agent. Returns empty string when no action is pending.
+func (m *model) renderActionLine(width int) string {
+	switch {
+	case m.state == StateAwaitingShellExec && len(m.pendingShellExec) > 0:
+		return dimmedStyle.Render("[A] Execute  [R] Skip")
+	case m.state == StateAwaitingApproval && len(m.pendingProposals) > 0:
+		toggleHint := "[P] Expand"
+		if m.pendingProposals[0].Expanded {
+			toggleHint = "[P] Collapse"
+		}
+		return dimmedStyle.Render("[A] Accept  [L] Allow All  [R] Reject  " + toggleHint)
+	case m.agentRunning:
+		return dimmedStyle.Render("● Running task: " + m.agentLabel + "…")
+	default:
+		return ""
+	}
 }
 
 func (m *model) renderTopBar() string {
@@ -110,12 +137,7 @@ func (m *model) renderTopBar() string {
 
 	content := strings.Join(parts, "  •  ")
 	bar := " " + content + " "
-
-	return lipgloss.NewStyle().
-		Background(lipgloss.Color(colorSurface)).
-		Foreground(lipgloss.Color(colorTopBarMetrics)).
-		Padding(0, 1).
-		Render(bar)
+	return topBarStyle.Render(bar)
 }
 
 func truncateStr(s string, maxRunes int) string {
@@ -132,58 +154,31 @@ func truncateStr(s string, maxRunes int) string {
 // ── Focus line ────────────────────────────────────────────────────────────
 
 func (m *model) renderFocusLine(width int) string {
-	color := animLineColor(m)
-	return lipgloss.NewStyle().Foreground(color).Render(strings.Repeat("─", width))
+	style := modeFocusLineStyles[m.resolver.Current()]
+	return style.Render(strings.Repeat("─", width))
 }
 
 // ── Prompt box ────────────────────────────────────────────────────────────
 
 func (m *model) renderPromptBox(width int) string {
 	mode := m.resolver.Current()
-	modeColor := modeLineColor(mode)
-	prefixStyle := lipgloss.NewStyle().Bold(true).Foreground(modeColor)
 
-	var prefix string
-	if width < 50 {
-		short := "?"
-		switch mode {
-		case modes.ModeAsk:
-			short = "?"
-		case modes.ModePlan:
-			short = "p"
-		case modes.ModeBuild:
-			short = "b"
-		case modes.ModeInvestigate:
-			short = "i"
-		case modes.ModeReview:
-			short = "r"
-		}
-		prefix = prefixStyle.Render(short + " ❯")
-	} else {
-		prefix = prefixStyle.Render(mode.String() + " ❯")
-	}
+	prefix := modeBoldFgStyles[mode].Render(mode.String() + " ❯")
 
 	var inner string
 	switch {
 	case m.agentRunning:
 		sp := m.renderFlowingSpinner()
-		label := lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render(m.agentLabel + "…")
+		label := yellowStyle.Render(m.agentLabel + "…")
 		inner = prefix + " " + sp + "  " + label
 	case m.streaming && m.responseBuffer.Len() == 0:
 		sp := m.renderFlowingSpinner()
 		inner = prefix + " " + sp + "  " + infoStyle.Render("thinking…")
 	default:
-		// Use native m.ti.View() to delegate terminal hardware cursor coordination.
-		m.ti.Cursor.Style = lipgloss.NewStyle().Foreground(modeColor)
 		inner = prefix + " " + m.ti.View()
 	}
 
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(modeColor).
-		Padding(0, 1).
-		Width(width - 2).
-		Render(inner)
+	return modePromptBorderStyles[mode].Width(width - 2).Render(inner)
 }
 
 // ── Active Widget Area ────────────────────────────────────────────────────
@@ -251,8 +246,7 @@ func (m *model) renderShellExecProposal(width int) string {
 	}
 
 	// Surface2-colored border
-	borderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	border := borderStyle.Render(strings.Repeat("─", innerWidth))
+	border := shellDimBorderStyle.Render(strings.Repeat("─", innerWidth))
 
 	// Warning header
 	var b strings.Builder
@@ -288,17 +282,17 @@ func (m *model) renderRuntimeStatus(width int) string {
 	// 1. Task (highest priority)
 	taskStr := "task: idle"
 	if m.agentRunning {
-		taskStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render("task: " + m.agentLabel)
+		taskStr = yellowStyle.Render("task: " + m.agentLabel)
 	} else if m.streaming {
-		taskStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Render("task: streaming")
+		taskStr = cyanStyle.Render("task: streaming")
 	}
 	parts = append(parts, taskStr)
 
 	// 2. Sandbox — bound to the current mode's write capability
 	mode := m.resolver.Current()
-	sandboxStr := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus)).Render("sandbox: read")
+	sandboxStr := dimmedStyle.Render("sandbox: read")
 	if mode.CanWrite() {
-		sandboxStr = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange)).Render("sandbox: write")
+		sandboxStr = orangeStyle.Render("sandbox: write")
 	}
 	parts = append(parts, sandboxStr)
 
@@ -306,7 +300,7 @@ func (m *model) renderRuntimeStatus(width int) string {
 	if width >= 50 {
 		// 3. Model
 		modelName := m.cfg.ActiveModelName()
-		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Render("model: "+modelName))
+		parts = append(parts, textStyle.Render("model: "+modelName))
 	}
 
 	if width >= 75 {
@@ -314,11 +308,10 @@ func (m *model) renderRuntimeStatus(width int) string {
 		total := m.tokenInput + m.tokenOutput
 		var tokStr string
 		if isCloud {
-			maxCtx := 32768
+			const maxCtx = 32768
 			pct := float64(total) / float64(maxCtx) * 100
 			c := float64(m.tokenInput)*(3.0/1_000_000) + float64(m.tokenOutput)*(15.0/1_000_000)
 			costStr := fmt.Sprintf("$%.2f", c)
-			// Show AST optimization indicator when trace exists
 			if m.currentTrace != nil && len(m.currentTrace.MatchedFiles) > 0 {
 				savedPct := 0.0
 				if m.currentTrace.CompressionRatio > 0 {
@@ -331,7 +324,7 @@ func (m *model) renderRuntimeStatus(width int) string {
 		} else {
 			tokStr = fmt.Sprintf("tokens: %d", total)
 		}
-		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Render(tokStr))
+		parts = append(parts, mutedStyle.Render(tokStr))
 	}
 
 	if width >= 100 {
@@ -348,10 +341,10 @@ func (m *model) renderRuntimeStatus(width int) string {
 		parts = append(parts, checkpointStr)
 	}
 	if m.uiNotice != "" && width >= 60 {
-		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Render("notice: "+m.uiNotice))
+		parts = append(parts, yellowStyle.Render("notice: "+m.uiNotice))
 	}
 
-	sep := lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)).Render("  │  ")
+	sep := runtimeSepStyle.Render("  │  ")
 	joined := strings.Join(parts, sep)
 
 	// Safety fallback check to prevent line wrap under extremely tight terminal splitting
@@ -405,8 +398,7 @@ func (m *model) renderFooter(width int) string {
 		gap = 1
 	}
 
-	footerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	return footerStyle.Render(left + strings.Repeat(" ", gap) + right)
+	return footerDimStyle.Render(left + strings.Repeat(" ", gap) + right)
 }
 
 // ── Startup banner ────────────────────────────────────────────────────────
@@ -438,27 +430,14 @@ func getGreeting() string {
 }
 
 func (m *model) renderStartupBanner(termWidth int) string {
-	ac := lipgloss.Color(colorGreenBr)
-	dm := lipgloss.Color(colorMuted)
-	tx := lipgloss.Color(colorText)
-	sb := lipgloss.Color(colorSubtle)
-
-	acS := lipgloss.NewStyle().Foreground(ac).Bold(true)
-	dmS := lipgloss.NewStyle().Foreground(dm)
-	txS := lipgloss.NewStyle().Foreground(tx)
-	sbS := lipgloss.NewStyle().Foreground(sb)
-	mnS := lipgloss.NewStyle().Bold(true).Foreground(tx)
-
 	innerW := termWidth - 6
 	if innerW < 60 {
 		innerW = 60
 	}
 
-	// Grid system metric setup for geometric block alignments
 	const robotW = 6
 	const sep = "  "
 
-	// Normalized clean block bounds structure to eliminate shifting metrics
 	cleanRobotArt := []string{
 		"  ██  ",
 		" █  █ ",
@@ -469,15 +448,15 @@ func (m *model) renderStartupBanner(termWidth int) string {
 
 	rightCol := make([]string, 0, 5+len(bannerModes))
 	rightCol = append(rightCol,
-		acS.Render(getGreeting()),
-		acS.Render("IZEN"),
-		txS.Render("engineering intelligence."),
-		txS.Render("human in control."),
+		boldAccentStyle.Render(getGreeting()),
+		boldAccentStyle.Render("IZEN"),
+		textStyle.Render("engineering intelligence."),
+		textStyle.Render("human in control."),
 		"",
 	)
 	for _, mode := range bannerModes {
-		nameS := mnS.Render(mode.name)
-		descS := dmS.Render(mode.desc)
+		nameS := boldTextStyle.Render(mode.name)
+		descS := mutedStyle.Render(mode.desc)
 		padLen := max(1, 15-lipgloss.Width(nameS))
 		rightCol = append(rightCol, nameS+strings.Repeat(" ", padLen)+descS)
 	}
@@ -490,7 +469,7 @@ func (m *model) renderStartupBanner(termWidth int) string {
 	for i := 0; i < totalRows; i++ {
 		var robotPart string
 		if i < len(cleanRobotArt) {
-			robotPart = acS.Render(padRight(cleanRobotArt[i], robotW))
+			robotPart = boldAccentStyle.Render(padRight(cleanRobotArt[i], robotW))
 		} else {
 			robotPart = strings.Repeat(" ", robotW)
 		}
@@ -501,28 +480,23 @@ func (m *model) renderStartupBanner(termWidth int) string {
 		rows = append(rows, robotPart+sep+rightPart)
 	}
 
-	divider := sbS.Render(strings.Repeat("─", innerW-2))
+	divider := subtleStyle.Render(strings.Repeat("─", innerW-2))
 	provider := m.cfg.ActiveProviderName()
 	modelName := m.cfg.ActiveModelName()
 	metaParts := []string{
-		dmS.Render("v" + version),
-		dmS.Render(provider + " " + modelName),
+		mutedStyle.Render("v" + version),
+		mutedStyle.Render(provider + " " + modelName),
 	}
 	if branch, err := m.gitEng.Branch(); err == nil && branch != "" {
-		metaParts = append(metaParts, dmS.Render("git ("+branch+")"))
+		metaParts = append(metaParts, mutedStyle.Render("git ("+branch+")"))
 	}
-	metaSep := sbS.Render(" • ")
+	metaSep := subtleStyle.Render(" • ")
 	meta := strings.Join(metaParts, metaSep)
 
 	rows = append(rows, divider, meta)
 	body := strings.Join(rows, "\n")
 
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(colorSubtle)).
-		Padding(1, 2).
-		Width(termWidth - 2).
-		Render(body)
+	return bannerBorderStyle.Width(termWidth - 2).Render(body)
 }
 
 func padRight(s string, n int) string {
@@ -590,9 +564,8 @@ func (m *model) printRecord(rec record) string {
 	switch rec.role {
 	case roleUser:
 		styledLines := make([]string, len(wrappedLines))
-		style := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 		for i, line := range wrappedLines {
-			styledLines[i] = gutter + style.Render(line)
+			styledLines[i] = gutter + textStyle.Render(line)
 		}
 		return strings.Join(styledLines, "\n")
 	case roleError:
@@ -603,9 +576,8 @@ func (m *model) printRecord(rec record) string {
 		return strings.Join(styledLines, "\n")
 	case roleStatus:
 		styledLines := make([]string, len(wrappedLines))
-		style := lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus))
 		for i, line := range wrappedLines {
-			styledLines[i] = gutter + style.Render(line)
+			styledLines[i] = gutter + dimmedStyle.Render(line)
 		}
 		return strings.Join(styledLines, "\n")
 	default:
@@ -676,11 +648,6 @@ func (m *model) renderCodebaseTrace(width int) string {
 	}
 	traceLine += optStr
 
-	// Style: Catppuccin Mocha subtext0 (#bac2de) — muted, industrial
-	traceStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#6c7086")). // colorMuted
-		Faint(true)
-
 	availableWidth := width - 2
 	if availableWidth < 20 {
 		availableWidth = 20
@@ -705,14 +672,13 @@ func renderWidget(title string, content string, width int, accentHex string) str
 
 	var b strings.Builder
 
-	// Styles for the widget
-	borderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(accentHex))
-	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
+	borderLine := strings.Repeat("─", innerWidth)
 
 	// Top horizontal line
-	b.WriteString(borderStyle.Render(strings.Repeat("─", innerWidth)) + "\n")
+	b.WriteString(borderLine)
+	b.WriteByte('\n')
 
-	// Title line (without leading space)
+	// Title line
 	titleLine := title
 	titleLen := lipgloss.Width(titleLine)
 	if titleLen < innerWidth {
@@ -720,30 +686,31 @@ func renderWidget(title string, content string, width int, accentHex string) str
 	} else {
 		titleLine = titleLine[:innerWidth]
 	}
-	b.WriteString(titleStyle.Render(titleLine) + "\n")
+	b.WriteString(widgetTitleStyle.Render(titleLine))
+	b.WriteByte('\n')
 
 	// Separator horizontal line
-	b.WriteString(borderStyle.Render(strings.Repeat("─", innerWidth)) + "\n")
+	b.WriteString(borderLine)
+	b.WriteByte('\n')
 
 	// Content lines
 	lines := strings.Split(content, "\n")
 	for _, line := range lines {
 		if len(line) > 0 {
-			// We don't truncate or wrap the line; we leave it as is.
-			// If the line is shorter than innerWidth, we pad with spaces to the right.
 			visualLen := lipgloss.Width(line)
 			if visualLen < innerWidth {
 				line += strings.Repeat(" ", innerWidth-visualLen)
 			}
-			// If the line is longer, we leave it (might exceed the width, but we are not changing wrapping behavior)
-			b.WriteString(line + "\n")
+			b.WriteString(line)
+			b.WriteByte('\n')
 		} else {
-			b.WriteString("\n")
+			b.WriteByte('\n')
 		}
 	}
 
 	// Bottom horizontal line
-	b.WriteString(borderStyle.Render(strings.Repeat("─", innerWidth)) + "\n")
+	b.WriteString(borderLine)
+	b.WriteByte('\n')
 
 	return b.String()
 }
@@ -779,29 +746,29 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 				}
 				item := plTrim
 				var prefixChar string
-				var prefixColor string
+				var prefixStyle lipgloss.Style
 				var text string
 
 				switch {
 				case strings.HasPrefix(item, "- [x]") || strings.HasPrefix(item, "[x]") || strings.HasPrefix(item, "✓"):
 					prefixChar = "✓ "
-					prefixColor = colorGreen
+					prefixStyle = greenStyle
 					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [x]"), "[x]"), "✓"))
 				case strings.HasPrefix(item, "- [/]") || strings.HasPrefix(item, "[/]") || strings.HasPrefix(item, "●"):
 					prefixChar = "● "
-					prefixColor = colorOrange
+					prefixStyle = orangeStyle
 					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [/]"), "[/]"), "●"))
 				case strings.HasPrefix(item, "- [ ]") || strings.HasPrefix(item, "[ ]") || strings.HasPrefix(item, "○"):
 					prefixChar = "○ "
-					prefixColor = colorDimmed
+					prefixStyle = dimmedStyle
 					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [ ]"), "[ ]"), "○"))
 				case strings.HasPrefix(item, "✗"):
 					prefixChar = "✗ "
-					prefixColor = colorRed
+					prefixStyle = redStyle
 					text = strings.TrimSpace(strings.TrimPrefix(item, "✗"))
 				default:
 					prefixChar = "• "
-					prefixColor = colorText
+					prefixStyle = textStyle
 					text = item
 				}
 
@@ -812,12 +779,11 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 				}
 				wrappedText := wrapStreamText(text, wrapW)
 
-				prefixStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(prefixColor))
 				for idx, line := range wrappedText {
 					if idx == 0 {
 						contentLines = append(contentLines, prefixStyle.Render(prefixChar)+line)
 					} else {
-						contentLines = append(contentLines, "  "+line) // Indented wrap
+						contentLines = append(contentLines, "  "+line)
 					}
 				}
 			}
@@ -830,18 +796,18 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 
 			var details []string
 			if file != "" {
-				details = append(details, lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Render("File:   "+file))
+				details = append(details, accentStyle.Render("File:   "+file))
 			}
 			if symbol != "" {
-				details = append(details, lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue)).Render("Symbol: "+symbol))
+				details = append(details, blueStyle.Render("Symbol: "+symbol))
 			}
 			if linesRange != "" {
-				details = append(details, lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Render("Range:  "+linesRange))
+				details = append(details, mutedStyle.Render("Range:  "+linesRange))
 			}
 
 			var fullContent string
 			if len(details) > 0 {
-				fullContent = strings.Join(details, "\n") + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle)).Render(strings.Repeat("─", widgetInnerWidth)) + "\n" + diffRendered
+				fullContent = strings.Join(details, "\n") + "\n" + subtleStyle.Render(strings.Repeat("─", widgetInnerWidth)) + "\n" + diffRendered
 			} else {
 				fullContent = diffRendered
 			}
@@ -878,7 +844,6 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 
 			// Shell Execution Proposal container with warning header
 			var container strings.Builder
-			shellLineStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 
 			container.WriteString(shellWarningStyle.Render("> System: Shell Execution Required <"))
 			container.WriteString("\n")
@@ -886,11 +851,11 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 			cmdLines := strings.Split(cmdText, "\n")
 			for _, cl := range cmdLines {
 				container.WriteString("  ")
-				container.WriteString(shellLineStyle.Render("$ " + cl))
+				container.WriteString(textStyle.Render("$ " + cl))
 				container.WriteString("\n")
 			}
 			container.WriteString("\n")
-			container.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Render("[A] Run  [R] Skip"))
+			container.WriteString(mutedStyle.Render("[A] Run  [R] Skip"))
 			container.WriteString("\n")
 
 			rendered = renderWidget("Command", container.String(), availableWidth, colorDimmed)

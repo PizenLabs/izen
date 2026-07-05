@@ -63,7 +63,7 @@ const (
 	colorTopBarMetrics = "#a6adc8" // Subtext0
 )
 
-// lipglossColor is a convenience helper.
+// lipglossColor is a convenience helper (init-time only, NOT for render path).
 func lipglossColor(hex string) lipgloss.Style {
 	return lipgloss.NewStyle().Foreground(lipgloss.Color(hex))
 }
@@ -174,6 +174,134 @@ var (
 	diffCtxStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDiffCtxFg))
 	diffLineNumSty   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorLineNumFg))
 	diffLineNumHLSty = lipgloss.NewStyle().Foreground(lipgloss.Color(colorLineNumHL))
+)
+
+// ── Pre-Compiled Render-Path Styles (Zero NewStyle in View/rebuildViewport) ─────
+var (
+	// Foreground-only helpers
+	dimmedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	mutedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	subtleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
+	textStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+	yellowStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow))
+	cyanStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan))
+	orangeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange))
+	greenStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
+	accentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
+	redStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRed))
+	blueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
+	pinkStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorPink))
+	tealStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorTeal))
+	mauveStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))
+
+	// Bold + color
+	boldTextStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
+	boldAccentStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorAccent))
+	boldGreenStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreen))
+	boldRedStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
+
+	// Background + foreground (error bar)
+	redBgBoldStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color(colorRed)).
+			Foreground(lipgloss.Color(colorBase)).
+			Bold(true)
+
+	// Footer / runtime status
+	footerDimStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	runtimeSepStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
+
+	// Top bar (objective state)
+	topBarStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color(colorSurface)).
+			Foreground(lipgloss.Color(colorTopBarMetrics)).
+			Padding(0, 1)
+
+	// Shell execution proposal
+	shellDimBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+
+	// Codebase trace
+	traceStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(colorMuted)).
+			Faint(true)
+
+	// Startup banner border
+	bannerBorderStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color(colorSubtle)).
+				Padding(1, 2)
+
+	// Widget box
+	widgetTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
+
+	// Enhanced mutation renderer
+	enhancedExpandStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+
+	// Semantic renderer diff styles
+	semanticDelStyle     = lipgloss.NewStyle().Background(lipgloss.Color("#3a1e24")).Foreground(lipgloss.Color("#f1707a"))
+	semanticAddStyle     = lipgloss.NewStyle().Background(lipgloss.Color("#18302b")).Foreground(lipgloss.Color("#6cd0a1"))
+	semanticNormalStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+	semanticLineNumStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+)
+
+// Mode-accent style lookup (indexed by modes.Mode value).
+var (
+	modeAccentFgStyles = []lipgloss.Style{
+		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeAsk)),         // ModeAsk=0
+		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModePlan)),        // ModePlan=1
+		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeBuild)),       // ModeBuild=2
+		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeInvestigate)), // ModeInvestigate=3
+		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeReview)),      // ModeReview=4
+	}
+	modeBoldFgStyles = []lipgloss.Style{
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeAsk)),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModePlan)),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeBuild)),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeInvestigate)),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeReview)),
+	}
+	modePromptBorderStyles = []lipgloss.Style{
+		lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(colorModeAsk)).Padding(0, 1),
+		lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(colorModePlan)).Padding(0, 1),
+		lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(colorModeBuild)).Padding(0, 1),
+		lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(colorModeInvestigate)).Padding(0, 1),
+		lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(colorModeReview)).Padding(0, 1),
+	}
+	modeFocusLineStyles = []lipgloss.Style{
+		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeAsk)),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModePlan)),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeBuild)),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeInvestigate)),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(colorModeReview)),
+	}
+)
+
+// Pre-compiled Markdown renderer styles (render-path — zero NewStyle).
+var (
+	mdEmphasisStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Italic(true)
+	mdStrongStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
+	mdH1Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1"))
+	mdH2Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
+	mdH3Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa"))
+	mdH4Style         = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
+	mdCodeSpanStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af")).Background(lipgloss.Color("#1e1e2e"))
+	mdLinkStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Underline(true)
+	mdMutedStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
+	mdCodeContStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
+	mdAccentStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa"))
+	mdSepStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
+	mdImageMutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
+	mdHeaderBoldCell  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
+	mdCellStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
+	mdBulletStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
+
+	// Callout label styles per keyword
+	mdCalloutStyles = map[string]lipgloss.Style{
+		"IMPORTANT": lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f38ba8")),
+		"NOTE":      lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa")),
+		"TIP":       lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1")),
+		"WARNING":   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f9e2af")),
+		"CAUTION":   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#fab387")),
+	}
 )
 
 // ── Gutter / Label Helpers ────────────────────────────────────────────────────

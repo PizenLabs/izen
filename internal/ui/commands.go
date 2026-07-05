@@ -181,6 +181,17 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		}
 	}
 
+	// Inject semantic mapping rules for legal/text files to guide local SLMs
+	// that struggle with author/copyright targeting in LICENSE documents.
+	if fileCtx.Len() > 0 {
+		ctxStr := fileCtx.String()
+		lowerCtx := strings.ToLower(ctxStr)
+		if strings.Contains(lowerCtx, "license") || strings.Contains(lowerCtx, "readme") {
+			semanticRule := `[SEMANTIC MAPPING RULE]: In legal text/LICENSE documents, the "Author", "Holder", or "Organization" corresponds specifically to the string immediately following the "Copyright (c) <Year>" marker. You must strictly target your line mutation to THAT specific line. Do not alter any other paragraph.`
+			fileCtx.WriteString("\n\n" + semanticRule)
+		}
+	}
+
 	line = m.expandFileRefs(line)
 
 	content := strings.TrimSpace(line)

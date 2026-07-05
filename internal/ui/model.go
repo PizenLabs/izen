@@ -106,10 +106,13 @@ const (
 	maxInvestigateInvocations = 20
 
 	// Fixed heights of chrome elements (lines)
-	focusLineHeight = 1 // top colored rule
-	promptBoxHeight = 3 // border top + content + border bottom
-	statusBarHeight = 1
-	viewportPadding = 1 // breathing room
+	focusLineHeight  = 1 // top colored rule
+	promptBoxHeight  = 3 // border top + content + border bottom
+	statusBarHeight  = 1 // runtime status (task, sandbox, model, tokens)
+	guardrailHeight  = 1 // subtle border separating operational zone from infra metadata
+	footerLineHeight = 1 // workspace, branch, execution mode
+	errorBarHeight   = 1 // red error bar (auto-clears after 30s)
+	viewportPadding  = 1 // breathing room
 
 	maxProposalDiffHeight = 15 // max visible diff lines in expanded proposal widget
 )
@@ -241,43 +244,27 @@ type model struct {
 // ── Viewport helpers ──────────────────────────────────────────────────────────
 
 // viewportHeight calculates available lines for the conversation viewport.
+// The viewport is strictly bounded: terminal height minus the fixed chrome
+// elements below it. Computed from named constants (not magic numbers).
 func (m *model) viewportHeight() int {
-	// Base heights: Focus line (1) + Prompt Box (3) + Runtime Status (1) + Footer (1)
-	baseHeight := 1 + 3 + 1 + 1
+	// Fixed chrome: Focus line + Prompt box + Runtime status + Guardrail + Footer
+	chrome := focusLineHeight + promptBoxHeight + statusBarHeight + guardrailHeight + footerLineHeight
+	height := m.height - chrome
 
-	// Dynamic: top bar (0 or 1), widget, suggestions
-	topBarH := 0
-	if m.renderTopBar() != "" {
-		topBarH = 1
+	if m.lastApplyError != "" && time.Since(m.applyErrorTime) < 30*time.Second {
+		height -= errorBarHeight
 	}
-	widgetH := m.activeWidgetHeight()
-	suggestionH := m.suggestionPaletteHeight()
 
-	h := m.height - baseHeight - topBarH - widgetH - suggestionH - viewportPadding
-
-	// Safety guard: viewport must never collapse below 5 lines.
-	// When a proposal widget is active, this ensures the conversation
-	// history remains scrollable even on small terminals.
-	if h < 5 {
-		h = 5
+	if height < 5 {
+		height = 5
 	}
-	return h
+	return height
 }
 
-func (m *model) activeWidgetHeight() int {
-	widget := m.renderActiveWidget(m.width)
-	if widget == "" {
-		return 0
-	}
-	return len(strings.Split(widget, "\n"))
-}
-
+// suggestionPaletteHeight returns 0 since the suggestion palette is now
+// rendered in the fixed footer zone and no longer affects viewport height.
 func (m *model) suggestionPaletteHeight() int {
-	if !m.showSuggestions || len(m.suggestions) == 0 {
-		return 0
-	}
-	palette := m.renderSuggestions(m.width)
-	return len(strings.Split(palette, "\n"))
+	return 0
 }
 
 // wrapStreamText wraps raw text lines dynamically during an active live stream.
@@ -334,18 +321,11 @@ func (m *model) renderErrorBar(width int) string {
 		m.lastApplyError = ""
 		return ""
 	}
-	// Truncate to fit
 	text := m.lastApplyError
 	if len(text) > width-6 {
 		text = text[:width-9] + "…"
 	}
-	return lipgloss.NewStyle().
-		Background(lipgloss.Color(colorRed)).
-		Foreground(lipgloss.Color(colorBase)).
-		Bold(true).
-		Padding(0, 1).
-		Width(width).
-		Render(" ✗ " + text)
+	return redBgBoldStyle.Padding(0, 1).Width(width).Render(" ✗ " + text)
 }
 
 func (m *model) rebuildViewport() {
@@ -353,17 +333,18 @@ func (m *model) rebuildViewport() {
 		return
 	}
 
-	// Sync viewport height dynamically
 	m.vp.Height = m.viewportHeight()
 
 	followBottom := m.vp.AtBottom()
 	var lines []string
+
+	// Zone 1: Welcome banner (shown once on idle startup)
 	if m.showBanner {
 		lines = append(lines, strings.Split(m.renderStartupBanner(m.width), "\n")...)
 		lines = append(lines, "")
 	}
 
-	// Track whether we've injected the trace already
+	// Zone 2: Chat history records
 	traceInjected := false
 	lastUserIdx := -1
 	for i, rec := range m.records {
@@ -374,7 +355,6 @@ func (m *model) rebuildViewport() {
 
 	for i, rec := range m.records {
 		lines = append(lines, m.printRecord(rec))
-		// Inject trace right after the last user message, before AI response
 		if !traceInjected && i == lastUserIdx && m.currentTrace != nil && len(m.currentTrace.MatchedFiles) > 0 {
 			traceLine := m.renderCodebaseTrace(m.width)
 			if traceLine != "" {
@@ -384,7 +364,6 @@ func (m *model) rebuildViewport() {
 		}
 	}
 
-	// If no user records but trace exists, inject before streaming
 	if !traceInjected && m.currentTrace != nil && len(m.currentTrace.MatchedFiles) > 0 && lastUserIdx == -1 {
 		traceLine := m.renderCodebaseTrace(m.width)
 		if traceLine != "" {
@@ -392,7 +371,27 @@ func (m *model) rebuildViewport() {
 		}
 	}
 
-	// Live streaming: wrap incoming chunk buffer on-the-fly to enforce terminal boundary safety
+	// Zone 3: Proposal diff (when awaiting approval)
+	if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
+		prop := m.pendingProposals[0]
+		if prop.Diff != "" {
+			if prop.Expanded {
+				// Full diff view
+				dr := &DiffRenderer{Width: m.width - 2, IsNewFile: isNewFileCreation(prop.Diff)}
+				diffRendered := dr.Render(ToDiffCardViewModel(prop.Diff))
+				if diffRendered != "" {
+					lines = append(lines, "")
+					lines = append(lines, strings.Split(diffRendered, "\n")...)
+				}
+			} else {
+				// Collapsed view: single placeholder line
+				lines = append(lines, "")
+				lines = append(lines, "  [ Content Collapsed — Press [P] to Expand ]")
+			}
+		}
+	}
+
+	// Zone 4: Live streaming response
 	if m.streaming && m.responseBuffer.Len() > 0 {
 		gutter := gutterAIStyle.Render("▌") + " "
 		availableWidth := m.width - 2
@@ -436,6 +435,8 @@ func (m *model) pushRecords(recs []record) {
 	}
 }
 
+var spinnerBaseStyle = lipgloss.NewStyle()
+
 // renderFlowingSpinner renders a single animated character with a smooth flowing
 // light effect: the color oscillates between dim and bright using a sine wave,
 // creating the feeling of seamless movement.
@@ -446,13 +447,13 @@ func (m *model) renderFlowingSpinner() string {
 
 	phase := float64(m.spinnerFrame) * (2 * math.Pi / float64(n))
 	t := (math.Sin(phase) + 1) / 2
-	t = t * t * (3 - 2*t) // smoothstep for butter-smooth oscillation
+	t = t * t * (3 - 2*t)
 
 	from := lipgloss.Color(colorSubtle)
 	to := lipgloss.Color(colorText)
 	color := interpolateColor(from, to, t)
 
-	return lipgloss.NewStyle().Foreground(color).Render(frameStr)
+	return spinnerBaseStyle.Foreground(color).Render(frameStr)
 }
 
 // ── History persistence ───────────────────────────────────────────────────────

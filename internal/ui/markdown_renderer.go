@@ -3,7 +3,6 @@ package ui
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
@@ -118,10 +117,7 @@ func renderEmphasis(node *ast.Emphasis, source []byte) string {
 		return ""
 	}
 
-	return lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#89b4fa")).
-		Italic(true).
-		Render(textContent)
+	return mdEmphasisStyle.Render(textContent)
 }
 
 // renderStrong renders **bold** (Emphasis.Level == 2)
@@ -131,10 +127,7 @@ func renderStrong(node *ast.Emphasis, source []byte) string {
 		return ""
 	}
 
-	return lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#cdd6f4")).
-		Render(textContent)
+	return mdStrongStyle.Render(textContent)
 }
 
 // renderHeading renders a heading per ASK_RENDERING.md specification
@@ -147,35 +140,17 @@ func renderHeading(node *ast.Heading, width int, source []byte) string {
 	var styledText string
 	switch node.Level {
 	case 1:
-		// H1: largest emphasis, bold, accent color
-		styledText = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#a6e3a1")).
-			Render(headingText)
+		styledText = mdH1Style.Render(headingText)
 	case 2:
-		// H2: bold, primary text
-		styledText = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#cdd6f4")).
-			Render(headingText)
+		styledText = mdH2Style.Render(headingText)
 	case 3:
-		// H3: bold, slightly muted accent
-		styledText = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#89b4fa")).
-			Render(headingText)
+		styledText = mdH3Style.Render(headingText)
 	default:
-		// H4+: minimal emphasis
-		styledText = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#6c7086")).
-			Render(headingText)
+		styledText = mdH4Style.Render(headingText)
 	}
 
-	// Visual separator: matches heading text length per ASK_RENDERING.md
 	separator := strings.Repeat("─", len(headingText))
-	styledSeparator := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#6c7086")).
-		Render(separator)
+	styledSeparator := mdMutedStyle.Render(separator)
 
 	return styledText + "\n" + styledSeparator
 }
@@ -256,13 +231,9 @@ func renderListItem(node *ast.ListItem, width int, source []byte, ordered bool, 
 
 			var bullet string
 			if ordered {
-				bullet = lipgloss.NewStyle().
-					Foreground(lipgloss.Color("#6c7086")).
-					Render(mdIntToStr(index) + ". ")
+				bullet = mdBulletStyle.Render(mdIntToStr(index) + ". ")
 			} else {
-				bullet = lipgloss.NewStyle().
-					Foreground(lipgloss.Color("#6c7086")).
-					Render("• ")
+				bullet = mdBulletStyle.Render("• ")
 			}
 
 			for i, line := range wrapped {
@@ -356,12 +327,9 @@ func renderBlockquote(node *ast.Blockquote, width int, source []byte) string {
 	}
 
 	if meta, ok := calloutKeywords[firstWord]; ok {
-		// Render as semantic callout
 		rest := strings.TrimSpace(strings.TrimPrefix(quoteText, firstLine))
-		label := lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color(meta.color)).
-			Render(meta.icon + " " + firstWord)
+		labelStyle := mdCalloutStyles[firstWord]
+		label := labelStyle.Render(meta.icon + " " + firstWord)
 
 		var result strings.Builder
 		result.WriteString(label)
@@ -379,14 +347,13 @@ func renderBlockquote(node *ast.Blockquote, width int, source []byte) string {
 	}
 
 	// Standard blockquote: vertical accent line per ASK_RENDERING.md
-	accentStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa"))
 	var result strings.Builder
 	wrapped := wrapMText(quoteText, width-2)
 	for i, line := range wrapped {
 		if i > 0 {
 			result.WriteString("\n")
 		}
-		result.WriteString(accentStyle.Render("┃") + " " + line)
+		result.WriteString(mdAccentStyle.Render("┃") + " " + line)
 	}
 
 	return result.String()
@@ -427,20 +394,15 @@ func renderFencedCodeBlock(node *ast.FencedCodeBlock, width int, source []byte) 
 
 	// Optional language label (muted, no heavy border per ASK_RENDERING.md)
 	if lang != "" {
-		builder.WriteString(lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#6c7086")).
-			Render(lang))
+		builder.WriteString(mdMutedStyle.Render(lang))
 		builder.WriteString("\n")
 	}
 
-	// Code content (monochrome highlight; tree-sitter integration is future work)
 	for i, line := range codeLines {
 		if i > 0 {
 			builder.WriteString("\n")
 		}
-		builder.WriteString(lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#f9e2af")).
-			Render(line))
+		builder.WriteString(mdCodeContStyle.Render(line))
 	}
 
 	return builder.String()
@@ -448,10 +410,7 @@ func renderFencedCodeBlock(node *ast.FencedCodeBlock, width int, source []byte) 
 
 // renderCodeSpan renders inline code with subtle emphasis
 func renderCodeSpan(node *ast.CodeSpan, source []byte) string {
-	return lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#f9e2af")).
-		Background(lipgloss.Color("#1e1e2e")).
-		Render(string(node.Text(source)))
+	return mdCodeSpanStyle.Render(string(node.Text(source)))
 }
 
 // renderLink renders a link showing only link text (URL hidden per ASK_RENDERING.md)
@@ -461,10 +420,7 @@ func renderLink(node *ast.Link, source []byte) string {
 		return ""
 	}
 
-	return lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#89b4fa")).
-		Underline(true).
-		Render(textContent)
+	return mdLinkStyle.Render(textContent)
 }
 
 // renderImage renders an image as a placeholder (no binary rendering in terminal)
@@ -484,15 +440,12 @@ func renderImage(node *ast.Image, source []byte) string {
 		}
 	}
 
-	mutedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
-	return mutedStyle.Render(altText) + "\n" + mutedStyle.Render(filename)
+	return mdImageMutedStyle.Render(altText) + "\n" + mdImageMutedStyle.Render(filename)
 }
 
 // renderMHorizontalRule renders "---" as a full-width horizontal separator
 func renderMHorizontalRule(width int) string {
-	return lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#6c7086")).
-		Render(strings.Repeat("─", width))
+	return mdMutedStyle.Render(strings.Repeat("─", width))
 }
 
 // renderASTTable renders a GFM table from the goldmark extension AST node.
@@ -569,10 +522,6 @@ func renderASTTable(node *goldmarkext.Table, width int, source []byte) string {
 		}
 	}
 
-	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
-	cellStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
-	sepStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
-
 	for rowIdx, row := range rows {
 		// Header separator after header row
 		if rowIdx > 0 && rows[rowIdx-1].isHeader {
@@ -580,7 +529,7 @@ func renderASTTable(node *goldmarkext.Table, width int, source []byte) string {
 				if colIdx > 0 {
 					result.WriteString("  ")
 				}
-				result.WriteString(sepStyle.Render(strings.Repeat("─", colWidths[colIdx])))
+				result.WriteString(mdSepStyle.Render(strings.Repeat("─", colWidths[colIdx])))
 			}
 			result.WriteString("\n")
 		}
@@ -607,14 +556,14 @@ func renderASTTable(node *goldmarkext.Table, width int, source []byte) string {
 					extra = 0
 				}
 				padded = strings.Repeat(" ", extra) + content
-			default: // left or center → left-align
+			default:
 				padded = padMRight(content, colWidths[colIdx])
 			}
 
 			if row.isHeader {
-				result.WriteString(headerStyle.Render(padded))
+				result.WriteString(mdHeaderBoldCell.Render(padded))
 			} else {
-				result.WriteString(cellStyle.Render(padded))
+				result.WriteString(mdCellStyle.Render(padded))
 			}
 		}
 

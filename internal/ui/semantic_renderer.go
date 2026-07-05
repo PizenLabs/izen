@@ -3,8 +3,6 @@ package ui
 import (
 	"fmt"
 	"strings"
-
-	"github.com/charmbracelet/lipgloss"
 )
 
 // SymbolRenderer renders a presentation-ready symbol card.
@@ -80,10 +78,6 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 	lines := strings.Split(v.Content, "\n")
 	var renderedLines []string
 
-	styleDeletion := lipgloss.NewStyle().Background(lipgloss.Color("#3a1e24")).Foreground(lipgloss.Color("#f1707a"))
-	styleAddition := lipgloss.NewStyle().Background(lipgloss.Color("#18302b")).Foreground(lipgloss.Color("#6cd0a1"))
-	styleNormalText := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
-
 	contentWidth := r.Width - 14
 	if contentWidth < 20 {
 		contentWidth = 20
@@ -145,9 +139,6 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 	leftLineNum := 1
 	rightLineNum := 1
 
-	// Use Surface2 color (#585b70) for line number gutter — subtle and clean
-	lineNumStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-
 	for _, line := range lines {
 		if strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") {
 			continue
@@ -184,34 +175,32 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 				for i, wl := range wrappedLines {
 					var gutterStr string
 					if i == 0 {
-						gutterStr = lineNumStyle.Render(fmt.Sprintf("%2d │ ", rightLineNum))
+						gutterStr = semanticLineNumStyle.Render(fmt.Sprintf("%2d │ ", rightLineNum))
 						rightLineNum++
 					} else {
-						gutterStr = lineNumStyle.Render("   │ ")
+						gutterStr = semanticLineNumStyle.Render("   │ ")
 					}
-					textStr := styleAddition.Width(contentWidth).Render(wl)
+					textStr := semanticAddStyle.Width(contentWidth).Render(wl)
 					renderedLines = append(renderedLines, gutterStr+textStr)
 				}
 			case strings.HasPrefix(line, "-"):
-				// Skip deletions in new file mode (shouldn't happen, but safe)
 				continue
 			default:
-				// Context lines (rare in new files, but handle gracefully)
 				wrappedLines := wrapStringToWidth(line, contentWidth)
 				for i, wl := range wrappedLines {
 					var gutterStr string
 					if i == 0 {
-						gutterStr = lineNumStyle.Render(fmt.Sprintf("%2d │ ", rightLineNum))
+						gutterStr = semanticLineNumStyle.Render(fmt.Sprintf("%2d │ ", rightLineNum))
 						rightLineNum++
 					} else {
-						gutterStr = lineNumStyle.Render("   │ ")
+						gutterStr = semanticLineNumStyle.Render("   │ ")
 					}
-					textStr := styleNormalText.Width(contentWidth).Render(wl)
+					textStr := semanticNormalStyle.Width(contentWidth).Render(wl)
 					renderedLines = append(renderedLines, gutterStr+textStr)
 				}
 			}
 		} else {
-			// STANDARD DIFF: Dual-column line numbers (old | new)
+			// STANDARD DIFF
 			switch {
 			case strings.HasPrefix(line, "-"):
 				cleanLine := strings.TrimPrefix(line, "-")
@@ -225,7 +214,7 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 					} else {
 						gutterStr = diffLineNumSty.Render("           │   ")
 					}
-					textStr := styleDeletion.Width(contentWidth).Render(wl)
+					textStr := semanticDelStyle.Width(contentWidth).Render(wl)
 					renderedLines = append(renderedLines, gutterStr+textStr)
 				}
 			case strings.HasPrefix(line, "+"):
@@ -240,7 +229,7 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 					} else {
 						gutterStr = diffLineNumHLSty.Render("           │   ")
 					}
-					textStr := styleAddition.Width(contentWidth).Render(wl)
+					textStr := semanticAddStyle.Width(contentWidth).Render(wl)
 					renderedLines = append(renderedLines, gutterStr+textStr)
 				}
 			default:
@@ -255,7 +244,7 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 					} else {
 						gutterStr = diffLineNumSty.Render("           │   ")
 					}
-					textStr := styleNormalText.Width(contentWidth).Render(wl)
+					textStr := semanticNormalStyle.Width(contentWidth).Render(wl)
 					renderedLines = append(renderedLines, gutterStr+textStr)
 				}
 			}
@@ -276,7 +265,6 @@ func (r *MutationRenderer) Render(v MutationCardViewModel) string {
 		contentWidth = 20
 	}
 
-	expandStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 	border := strings.Repeat("─", contentWidth)
 	if len(border) == 0 {
 		border = "─"
@@ -316,7 +304,7 @@ func (r *MutationRenderer) Render(v MutationCardViewModel) string {
 	if riskLevel == "" {
 		riskLevel = "UNKNOWN"
 	}
-	metadataLine := expandStyle.Render("  Scope " + scope + " | Risk " + riskLevel)
+	metadataLine := dimmedStyle.Render("  Scope " + scope + " | Risk " + riskLevel)
 
 	if !v.Expanded {
 		// COLLAPSED: header + metadata + action keys
@@ -361,7 +349,7 @@ func (r *MutationRenderer) Render(v MutationCardViewModel) string {
 		}
 
 		if end < total || start > 0 {
-			scrollHint := "  " + expandStyle.Render("(scroll ↑↓)")
+			scrollHint := "  " + dimmedStyle.Render("(scroll ↑↓)")
 			lines = append(lines, scrollHint)
 		}
 		lines = append(lines, "")
