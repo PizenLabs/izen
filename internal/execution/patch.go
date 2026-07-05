@@ -227,20 +227,21 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	}
 
 	var final string
-	if strings.Contains(patch.Modified, "@@") {
+	switch {
+	case strings.Contains(patch.Modified, "@@"):
 		result, err := applyUnifiedPatch(patch.Original, patch.Modified)
 		if err != nil {
 			return fmt.Errorf("apply patch to %s: %w", patch.File, err)
 		}
 		final = result
-	} else if patch.Original != "" {
+	case patch.Original != "":
 		clean := SanitizeDiffContent(patch.Modified)
 		if isTruncated(patch.Original, clean) {
 			return fmt.Errorf("refusing to apply truncated content to %s (%.0f%% of original size)",
 				patch.File, float64(len(clean))/float64(len(patch.Original))*100)
 		}
 		final = clean
-	} else {
+	default:
 		final = SanitizeDiffContent(patch.Modified)
 	}
 
