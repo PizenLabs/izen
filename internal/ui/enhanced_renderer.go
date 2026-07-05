@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -9,30 +8,30 @@ import (
 
 // Enhanced Mutation Renderer aligned with REVIEW_LAYOUT.md design principles
 type EnhancedMutationRenderer struct {
-	Width int
+	Width        int
+	ScrollOffset int
 }
 
 func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
-	// Calculate content width (accounting for borders and padding)
-	contentWidth := r.Width - 4 // 2 for borders, 2 for padding
+	contentWidth := r.Width - 4
 	if contentWidth < 20 {
 		contentWidth = 20
 	}
 
-	// Top border - minimal visual noise
 	border := strings.Repeat("─", contentWidth)
 	if len(border) == 0 {
 		border = "─"
 	}
 
-	// Header line with expand/collapse indicator
-	statusIcon := "•" // pending
-	expandIcon := "❯" // collapsed by default
+	expandStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 
+	toggleLabel := "[▼ Expand]"
 	if v.Expanded {
-		expandIcon = "▼" // expanded
+		toggleLabel = "[▲ Collapse]"
 	}
+	actionLine := "  [A] Accept  [L] Allow All  [R] Reject  [P] Toggle"
 
+	// Header with inline toggle: "Edit • filename [▼ Expand]"
 	headerText := "Edit"
 	if v.Target.Name != "" {
 		symbolName := v.Target.Name
@@ -50,148 +49,72 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 	} else {
 		headerText += " • Unknown"
 	}
+	headerLine := headerText + " " + toggleLabel
 
-	// Style for the expand indicator
-	expandStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-
-	// Build the header line with status and expand indicators
-	headerLine := fmt.Sprintf("%s %s %s", statusStyle.Render(statusIcon), expandStyle.Render(expandIcon), headerText)
-
-	if !v.Expanded {
-		// COLLAPSED: Render compact header + action buttons (always visible)
-		lines := make([]string, 0, 6)
-		lines = append(lines, border)
-		lines = append(lines, headerLine)
-
-		// Add scope/risk info inline for compact view
-		scope := "Internal"
-		if v.Impact.HasAPIChanges {
-			scope = "Public"
-		}
-		riskLevel := v.Risk.Level
-		if riskLevel == "" {
-			riskLevel = "UNKNOWN"
-		}
-		metadata := fmt.Sprintf("Scope %s | Risk %s", scope, riskLevel)
-		lines = append(lines, expandStyle.Render("  "+metadata))
-
-		lines = append(lines, "") // Spacing before actions
-		lines = append(lines, "[A] Accept    [L] Allow All    [R] Reject")
-		lines = append(lines, border)
-		return strings.Join(lines, "\n")
-	}
-
-	// EXPANDED: Render full diff view
-	var lines []string
-	lines = append(lines, border)
-	lines = append(lines, headerLine)
-	lines = append(lines, "") // Empty line for spacing
-
-	// Semantic Summary - max 2 lines above diff
-	if v.SemanticSummary != "" {
-		summaryLines := wrapText(v.SemanticSummary, contentWidth)
-		if len(summaryLines) > 2 {
-			summaryLines = summaryLines[:2]
-		}
-		for _, line := range summaryLines {
-			if len(line) > 0 {
-				lines = append(lines, "  "+line) // Indent for visual separation
-			}
-		}
-		lines = append(lines, "") // Empty line after summary
-	}
-
-	// Diff - the evidence (takes most of the space)
-	if v.Diff.Content != "" {
-		dr := &DiffRenderer{Width: contentWidth, IsNewFile: v.IsNewFile}
-		diffRendered := dr.Render(v.Diff)
-
-		diffLines := strings.Split(diffRendered, "\n")
-		for _, line := range diffLines {
-			if len(line) > 0 {
-				lines = append(lines, line)
-			}
-		}
-		lines = append(lines, "") // Empty line after diff
-	}
-
-	// Scope - compact: "Scope Internal/Public"
 	scope := "Internal"
 	if v.Impact.HasAPIChanges {
 		scope = "Public"
 	}
-	lines = append(lines, formatCompactField("Scope", scope, contentWidth))
-
-	// Risk - compact: "Risk LOW"
 	riskLevel := v.Risk.Level
 	if riskLevel == "" {
 		riskLevel = "UNKNOWN"
 	}
-	lines = append(lines, formatCompactField("Risk", riskLevel, contentWidth))
+	metadataLine := expandStyle.Render("  Scope " + scope + " | Risk " + riskLevel)
 
-	// Checkpoint - compact: "Checkpoint cp-18312"
-	lines = append(lines, formatCompactField("Checkpoint", "cp-pending", contentWidth))
+	if !v.Expanded {
+		// COLLAPSED: header + metadata + action keys
+		lines := make([]string, 0, 6)
+		lines = append(lines, border)
+		lines = append(lines, headerLine)
+		lines = append(lines, metadataLine)
+		lines = append(lines, "")
+		lines = append(lines, actionLine)
+		lines = append(lines, "")
+		lines = append(lines, border)
+		return strings.Join(lines, "\n")
+	}
 
-	lines = append(lines, "") // Empty line before actions
-
-	// Decision Actions - always visible, sticky: "[A] Accept    [L] Allow All    [R] Reject"
-	lines = append(lines, "[A] Accept    [L] Allow All    [R] Reject")
-	lines = append(lines, "") // Empty line before bottom border
-
-	// Bottom border - minimal visual noise
+	// EXPANDED: header + metadata + bounded diff + action keys
+	lines := make([]string, 0, 20)
 	lines = append(lines, border)
+	lines = append(lines, headerLine)
+	lines = append(lines, metadataLine)
+	lines = append(lines, "")
 
+	// Bounded diff content — scrollable via proposalDiffOffset
+	if v.Diff.Content != "" {
+		dr := &DiffRenderer{Width: contentWidth, IsNewFile: v.IsNewFile}
+		diffRendered := dr.Render(v.Diff)
+		diffLines := strings.Split(diffRendered, "\n")
+
+		total := len(diffLines)
+		start := r.ScrollOffset
+		if start >= total {
+			start = 0
+		}
+		end := start + maxProposalDiffHeight
+		if end > total {
+			end = total
+		}
+
+		for _, line := range diffLines[start:end] {
+			if len(line) > 0 {
+				lines = append(lines, line)
+			}
+		}
+
+		if end == total && start == 0 && len(diffLines) > 0 {
+			// all lines fit — no indicator
+		} else if end < total || start > 0 {
+			scrollHint := "  " + expandStyle.Render("(scroll ↑↓)")
+			lines = append(lines, scrollHint)
+		}
+		lines = append(lines, "")
+	}
+
+	// Action keys
+	lines = append(lines, actionLine)
+	lines = append(lines, "")
+	lines = append(lines, border)
 	return strings.Join(lines, "\n")
-}
-
-// formatCompactField creates a compact field: "Label Value" (no extra padding)
-func formatCompactField(label, value string, maxWidth int) string {
-	// Truncate if too long
-	if len(label)+1+len(value) > maxWidth {
-		// Prioritize the value, truncate label if needed
-		if len(value) > maxWidth-3 { // Leave space for label and space
-			value = value[:maxWidth-3]
-		}
-		availableForLabel := maxWidth - len(value) - 1
-		if availableForLabel > 0 && len(label) > availableForLabel {
-			label = label[:availableForLabel]
-		}
-	}
-	return label + " " + value
-}
-
-// wrapText wraps text to fit within maxWidth, respecting word boundaries
-func wrapText(text string, maxWidth int) []string {
-	if maxWidth <= 0 {
-		return []string{text}
-	}
-
-	words := strings.Fields(text)
-	if len(words) == 0 {
-		return []string{""}
-	}
-
-	var lines []string
-	var currentLine strings.Builder
-
-	for _, word := range words {
-		switch {
-		case currentLine.Len() == 0:
-			currentLine.WriteString(word)
-		case currentLine.Len()+1+len(word) <= maxWidth:
-			currentLine.WriteString(" ")
-			currentLine.WriteString(word)
-		default:
-			lines = append(lines, currentLine.String())
-			currentLine.Reset()
-			currentLine.WriteString(word)
-		}
-	}
-
-	if currentLine.Len() > 0 {
-		lines = append(lines, currentLine.String())
-	}
-
-	return lines
 }

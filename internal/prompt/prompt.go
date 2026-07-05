@@ -59,7 +59,9 @@ Rules for file writes:
 - Your FIRST output token must be ` + "```diff" + ` or ` + "FILE:" + `.
 - If you need to change multiple files, output them sequentially — one block after another.
 - Never output markdown code blocks tagged ` + "```plaintext" + ` or ` + "```go" + ` without a preceding ` + "FILE:" + ` tag. Without the tag, the engine cannot route the content to disk.
-- WHEN IN DOUBT: Use diff format for ANY file that might already exist. The engine will reject full-content writes for existing source files.`
+- WHEN IN DOUBT: Use diff format for ANY file that might already exist. The engine will reject full-content writes for existing source files.
+
+CRITICAL: When modifying a file, you MUST output the COMPLETE content of every hunk from start to finish without omitting lines, or format your output strictly as a valid unified diff. NEVER truncate or stop generating halfway through. Every ` + "```diff" + ` block must contain the full patch hunks needed to make the change — partial hunks will be rejected and the original file will be preserved.`
 }
 
 func InvestigateSystemPrompt() string {

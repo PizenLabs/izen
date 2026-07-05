@@ -7,6 +7,37 @@ import (
 )
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// ── Awaiting shell execution approval ─────────────────────────────────────
+	if m.state == StateAwaitingShellExec {
+		switch msg.String() {
+		case "a", "A":
+			block := m.pendingShellExec[m.shellAwaitingIdx]
+			m.pendingShellExec = append(m.pendingShellExec[:m.shellAwaitingIdx], m.pendingShellExec[m.shellAwaitingIdx+1:]...)
+			if len(m.pendingShellExec) == 0 {
+				m.state = StateChat
+			}
+			m.rebuildViewport()
+			return m, m.execShellCmd(block.Command)
+
+		case "r", "R":
+			m.pendingShellExec = append(m.pendingShellExec[:m.shellAwaitingIdx], m.pendingShellExec[m.shellAwaitingIdx+1:]...)
+			if len(m.pendingShellExec) == 0 {
+				m.state = StateChat
+			}
+			m.push(roleSystem, infoStyle.Render("shell command skipped"))
+			m.rebuildViewport()
+			return m, nil
+
+		case "esc":
+			m.pendingShellExec = nil
+			m.state = StateChat
+			m.push(roleSystem, infoStyle.Render("shell execution cancelled"))
+			m.rebuildViewport()
+			return m, nil
+		}
+		return m, nil
+	}
+
 	// ── Awaiting approval ────────────────────────────────────────────────────
 	if m.state == StateAwaitingApproval {
 		switch msg.String() {

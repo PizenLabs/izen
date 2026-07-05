@@ -146,6 +146,15 @@ var (
 	palettePathStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 	paletteSelectedPath  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 
+	// Accepted green dot — single-line collapsed summary
+	acceptedDotStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen)).Render("●")
+	acceptedLineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
+
+	// Shell execution proposal
+	shellWarningStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorOrange))
+	shellBorderStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	shellCmdStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Background(lipgloss.Color(colorOverlay))
+
 	// Gutter markers
 	gutterUserStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterUser))
 	gutterAIStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterAI))

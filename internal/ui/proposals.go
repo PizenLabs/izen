@@ -359,22 +359,31 @@ func (m *model) applySingleProposal() tea.Cmd {
 	}
 	if err := m.execEng.Patches.Apply(patch); err != nil {
 		m.push(roleError, "apply failed: "+err.Error())
-	} else {
-		m.push(roleSystem, infoStyle.Render("applied: "+p.Target.QualifiedName))
+		return nil
 	}
+
+	// Track and emit collapsed single-line accepted summary
+	status := "modified"
+	if isNewFileCreation(p.Diff) {
+		status = "created"
+	}
+	m.acceptedProposals = append(m.acceptedProposals, acceptedProposal{
+		Target: p.Target.QualifiedName,
+		Status: status,
+	})
+	acceptedLine := fmt.Sprintf("%s Accepted • %s • %s", acceptedDotStyle, p.Target.QualifiedName, status)
+	m.push(roleSystem, acceptedLineStyle.Render(acceptedLine))
+
 	m.pendingProposals = m.pendingProposals[1:]
+	m.proposalDiffOffset = 0
 	if len(m.pendingProposals) == 0 {
 		m.state = StateChat
 		m.awaitingConfirmation = false
 		m.createBuildCheckpoint(1)
 	} else {
-		// Show numbered diff of next proposal
-		rendered := RenderNumberedDiff(p.Diff, m.width)
-		m.push(roleSystem, fmt.Sprintf("next: %s", m.pendingProposals[0].Target.QualifiedName))
-		for _, l := range strings.Split(rendered, "\n") {
-			m.push(roleSystem, l)
-		}
-		m.push(roleSystem, infoStyle.Render("  [1] Accept  [2] Allow All  [3] Reject"))
+		// Minimal next-proposal notification — no full diff bloat
+		m.push(roleSystem, infoStyle.Render("next: "+m.pendingProposals[0].Target.QualifiedName))
+		m.push(roleSystem, infoStyle.Render("  [A] Accept  [L] Allow All  [R] Reject"))
 	}
 	return nil
 }
@@ -393,10 +402,20 @@ func (m *model) applyAllProposals() tea.Cmd {
 		}
 		if err := m.execEng.Patches.Apply(patch); err != nil {
 			m.push(roleError, "apply failed: "+err.Error())
-		} else {
-			applied++
-			m.push(roleSystem, infoStyle.Render("applied: "+p.Target.QualifiedName))
+			continue
 		}
+		applied++
+
+		status := "modified"
+		if isNewFileCreation(p.Diff) {
+			status = "created"
+		}
+		m.acceptedProposals = append(m.acceptedProposals, acceptedProposal{
+			Target: p.Target.QualifiedName,
+			Status: status,
+		})
+		acceptedLine := fmt.Sprintf("%s Accepted • %s • %s", acceptedDotStyle, p.Target.QualifiedName, status)
+		m.push(roleSystem, acceptedLineStyle.Render(acceptedLine))
 	}
 	m.pendingProposals = nil
 	m.awaitingConfirmation = false
@@ -412,7 +431,56 @@ func (m *model) createBuildCheckpoint(fileCount int) {
 	if err != nil {
 		m.push(roleSystem, infoStyle.Render("checkpoint: "+err.Error()))
 	} else {
+		shortHash := cp.Hash
+		if len(shortHash) > 8 {
+			shortHash = shortHash[:8]
+		}
 		m.push(roleSystem, infoStyle.Render(
-			fmt.Sprintf("checkpoint: %s (%d files)", cp.Hash[:8], fileCount)))
+			fmt.Sprintf("checkpoint: %s (%d files)", shortHash, fileCount)))
+	}
+}
+
+// shellExecRegex matches bash/sh code blocks in AI responses.
+var shellExecRegex = regexp.MustCompile("(?s)```(?:bash|sh)\\n(.*?)```")
+
+// extractShellCommands scans a response for bash/sh code blocks and returns
+// them as pending shell execution proposals requiring explicit user approval.
+func extractShellCommands(response string) []shellExecBlock {
+	matches := shellExecRegex.FindAllStringSubmatch(response, -1)
+	var blocks []shellExecBlock
+	for _, m := range matches {
+		cmd := strings.TrimSpace(m[1])
+		if cmd == "" {
+			continue
+		}
+		desc := cmd
+		if idx := strings.Index(cmd, "\n"); idx >= 0 {
+			desc = cmd[:idx]
+		}
+		if len(desc) > 60 {
+			desc = desc[:60] + "..."
+		}
+		blocks = append(blocks, shellExecBlock{
+			Command:     cmd,
+			Description: desc,
+		})
+	}
+	return blocks
+}
+
+// execShellCmd executes a shell command and pushes output as records.
+func (m *model) execShellCmd(cmd string) tea.Cmd {
+	return func() tea.Msg {
+		m.push(roleSystem, fmt.Sprintf("$ %s", cmd))
+		out, err := execShell(cmd)
+		if err != nil {
+			m.push(roleError, "shell exec: "+err.Error())
+		}
+		if out != "" {
+			for _, line := range strings.Split(strings.TrimRight(out, "\r\n"), "\n") {
+				m.push(roleSystem, line)
+			}
+		}
+		return nil
 	}
 }

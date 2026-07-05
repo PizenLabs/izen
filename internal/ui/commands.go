@@ -539,6 +539,9 @@ func (m *model) resetObjectiveContextStacks() {
 	m.awaitingConfirmation = false
 	m.acceptAll = false
 	m.state = StateChat
+	m.acceptedProposals = nil
+	m.pendingShellExec = nil
+	m.shellAwaitingIdx = 0
 	m.sess.InvestigationID = ""
 	m.sess.ReviewID = ""
 	m.sess.ClearHistory()

@@ -44,6 +44,7 @@ type UIState uint8
 const (
 	StateChat UIState = iota
 	StateAwaitingApproval
+	StateAwaitingShellExec
 )
 
 type record struct {
@@ -104,6 +105,8 @@ const (
 	promptBoxHeight = 3 // border top + content + border bottom
 	statusBarHeight = 1
 	viewportPadding = 1 // breathing room
+
+	maxProposalDiffHeight = 15 // max visible diff lines in expanded proposal widget
 )
 
 var coreModes = []string{"/ask", "/plan", "/build", "/investigate", "/review"}
@@ -176,6 +179,13 @@ type model struct {
 	pendingProposals     []SemanticProposal
 	acceptAll            bool
 
+	// Accepted proposals (collapsed single-line summaries)
+	acceptedProposals []acceptedProposal
+
+	// Shell execution proposals awaiting approval
+	pendingShellExec []shellExecBlock
+	shellAwaitingIdx int
+
 	state UIState
 
 	execEng   *execution.Engine
@@ -211,6 +221,9 @@ type model struct {
 
 	// Focus objective UI notifications (non-chat)
 	uiNotice string
+
+	// Proposal widget diff scroll offset
+	proposalDiffOffset int
 }
 
 // ── Viewport helpers ──────────────────────────────────────────────────────────
@@ -253,25 +266,6 @@ func (m *model) suggestionPaletteHeight() int {
 	}
 	palette := m.renderSuggestions(m.width)
 	return len(strings.Split(palette, "\n"))
-}
-
-// widgetScreenStartY calculates the screen Y position where the active widget begins.
-// Returns -1 if no widget is currently rendered.
-func (m *model) widgetScreenStartY() int {
-	if m.state != StateAwaitingApproval || len(m.pendingProposals) == 0 {
-		return -1
-	}
-
-	y := 0
-	// Top Bar
-	if m.renderTopBar() != "" {
-		y++
-	}
-	// Viewport
-	y += m.vp.Height
-	// Suggestions
-	y += m.suggestionPaletteHeight()
-	return y
 }
 
 // wrapStreamText wraps raw text lines dynamically during an active live stream.

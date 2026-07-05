@@ -220,13 +220,135 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 
-	clean := SanitizeDiffContent(patch.Modified)
-	if err := os.WriteFile(fullPath, []byte(clean), 0644); err != nil {
+	if patch.Original == "" {
+		if data, err := os.ReadFile(fullPath); err == nil {
+			patch.Original = string(data)
+		}
+	}
+
+	var final string
+	switch {
+	case strings.Contains(patch.Modified, "@@"):
+		result, err := applyUnifiedPatch(patch.Original, patch.Modified)
+		if err != nil {
+			return fmt.Errorf("apply patch to %s: %w", patch.File, err)
+		}
+		final = result
+	case patch.Original != "":
+		clean := SanitizeDiffContent(patch.Modified)
+		if isTruncated(patch.Original, clean) {
+			return fmt.Errorf("refusing to apply truncated content to %s (%.0f%% of original size)",
+				patch.File, float64(len(clean))/float64(len(patch.Original))*100)
+		}
+		final = clean
+	default:
+		final = SanitizeDiffContent(patch.Modified)
+	}
+
+	if err := os.WriteFile(fullPath, []byte(final), 0644); err != nil {
 		return fmt.Errorf("write %s: %w", patch.File, err)
 	}
 
 	patch.Applied = true
 	return pm.store(patch)
+}
+
+type diffHunk struct {
+	oldBlock string
+	newBlock string
+}
+
+func parseDiffHunks(content string) []diffHunk {
+	lines := strings.Split(content, "\n")
+	var hunks []diffHunk
+	var oldLines, newLines []string
+	inHunk := false
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "@@") {
+			if inHunk && (len(oldLines) > 0 || len(newLines) > 0) {
+				hunks = append(hunks, diffHunk{
+					oldBlock: strings.Join(oldLines, "\n"),
+					newBlock: strings.Join(newLines, "\n"),
+				})
+				oldLines, newLines = nil, nil
+			}
+			inHunk = true
+			continue
+		}
+		if !inHunk {
+			continue
+		}
+		if line == "" {
+			oldLines = append(oldLines, "")
+			newLines = append(newLines, "")
+			continue
+		}
+		prefix := line[0]
+		switch prefix {
+		case ' ':
+			oldLines = append(oldLines, line[1:])
+			newLines = append(newLines, line[1:])
+		case '-':
+			oldLines = append(oldLines, line[1:])
+		case '+':
+			newLines = append(newLines, line[1:])
+		case '\\':
+			continue
+		}
+	}
+
+	if inHunk && (len(oldLines) > 0 || len(newLines) > 0) {
+		hunks = append(hunks, diffHunk{
+			oldBlock: strings.Join(oldLines, "\n"),
+			newBlock: strings.Join(newLines, "\n"),
+		})
+	}
+
+	return hunks
+}
+
+func applyUnifiedPatch(original, diff string) (string, error) {
+	hunks := parseDiffHunks(diff)
+	if len(hunks) == 0 {
+		return SanitizeDiffContent(diff), nil
+	}
+
+	current := original
+	for _, hunk := range hunks {
+		if hunk.oldBlock == "" && hunk.newBlock == "" {
+			continue
+		}
+		if hunk.oldBlock == "" {
+			if current == "" {
+				current = hunk.newBlock
+			} else {
+				current = hunk.newBlock + "\n" + current
+			}
+			continue
+		}
+
+		idx := strings.Index(current, hunk.oldBlock)
+		if idx < 0 {
+			excerpt := hunk.oldBlock
+			if len(excerpt) > 80 {
+				excerpt = excerpt[:80] + "..."
+			}
+			return "", fmt.Errorf("patch hunk does not match file content (could not find %q)", excerpt)
+		}
+		before := current[:idx]
+		after := current[idx+len(hunk.oldBlock):]
+		current = before + hunk.newBlock + after
+	}
+
+	return current, nil
+}
+
+func isTruncated(original, modified string) bool {
+	if original == "" {
+		return false
+	}
+	return len(modified) < len(original)*30/100
 }
 
 func (pm *PatchManager) Rollback(patchID string) error {

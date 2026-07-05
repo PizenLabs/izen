@@ -44,10 +44,26 @@ type SemanticMutation struct {
 
 // SemanticProposal encapsulates a proposed change before it becomes a mutation.
 type SemanticProposal struct {
-	ID       string
-	Target   SemanticTarget
-	Diff     string
-	Risk     SemanticRisk
-	Context  SemanticContext
-	Expanded bool // UI state: whether the diff is expanded or collapsed
+	ID            string
+	Target        SemanticTarget
+	Diff          string
+	Risk          SemanticRisk
+	Context       SemanticContext
+	Expanded      bool   // UI state: whether the diff is expanded or collapsed
+	Accepted      bool   // Whether this proposal has been accepted
+	AppliedStatus string // "created", "modified", "deleted"
+	ShellExec     bool   // Whether this is a shell execution proposal
+	ShellApproved bool   // Whether shell execution was explicitly approved
+}
+
+// acceptedProposal tracks a completed proposal for rendering the collapsed summary.
+type acceptedProposal struct {
+	Target string // file path
+	Status string // "created", "modified", "deleted"
+}
+
+// shellExecBlock holds a shell command pending user approval.
+type shellExecBlock struct {
+	Command     string
+	Description string
 }

@@ -266,33 +266,25 @@ func (m *model) copyMouseSelection(end mouseSelectionPoint) {
 	}
 }
 
-// checkProposalHeaderBounds checks if the mouse click at (x, y) falls on the header line
-// of the proposal at the given index. Dynamically computes header position from layout
-// so clicks map perfectly to the visual line, regardless of widget structure changes.
-func (m *model) checkProposalHeaderBounds(x, y, propIdx int) bool {
-	if m.state != StateAwaitingApproval || propIdx < 0 || propIdx >= len(m.pendingProposals) {
-		return false
-	}
-
-	startY := m.widgetScreenStartY()
-	if startY < 0 {
-		return false
-	}
-
-	// Each proposal card renders with a consistent header position.
-	// Card structure (lines relative to startY):
-	//   line 0: top border
-	//   line 1: header (expand/collapse icon + title)  ← click target
-	//   line 2+: content body + bottom border
-	if propIdx == 0 && y == startY+1 {
-		return true
-	}
-
-	return false
-}
-
 // Update maps layout engines and routes state machines.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// ── GLOBAL INTERCEPT: [P] Toggle Hotkey ──────────────────────────────────
+	// Must run before any focus check or text-input routing so the p/P key is
+	// NEVER written into the input box. This is a 100% keyboard-driven toggle
+	// that bypasses all mouse hitbox calculations.
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		if keyMsg.String() == "p" || keyMsg.String() == "P" {
+			if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
+				// Toggle the EXACT property that the renderer reads:
+				// view.go:ToMutationCardViewModelFromProposal → vm.Expanded → renderer.v.Expanded
+				m.pendingProposals[0].Expanded = !m.pendingProposals[0].Expanded
+				m.proposalDiffOffset = 0
+				m.rebuildViewport()
+				return m, nil
+			}
+		}
+	}
+
 	var vpCmd tea.Cmd
 
 	now := time.Now()
@@ -350,38 +342,33 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// ── PHASE 1: Wheel Scrolling ──────────────────────────────────────
+		// ── Strict Button-Gated Mouse Handling ───────────────────────────────
+		// Wheel events fire on Press for instant response. Left-click toggle
+		// is captured on Release to avoid conflicts with terminal drag/select
+		// initiation that heavily contests the Press event.
 		if mouseMsg.Action == tea.MouseActionPress {
 			switch mouseMsg.Button {
-			case tea.MouseButtonWheelUp:
-				m.mouseSelecting = false
-				m.vp, vpCmd = m.vp.Update(msg)
-				m.rebuildViewport()
-				return m, vpCmd
 
-			case tea.MouseButtonWheelDown:
-				m.mouseSelecting = false
-				m.vp, vpCmd = m.vp.Update(msg)
-				m.rebuildViewport()
-				return m, vpCmd
-			}
-		}
-
-		// ── PHASE 2: Intercept Left-Clicks for Izen Components ────────────
-		if mouseMsg.Action == tea.MouseActionPress && mouseMsg.Button == tea.MouseButtonLeft {
-			for i := range m.pendingProposals {
-				if m.checkProposalHeaderBounds(mouseMsg.X, mouseMsg.Y, i) {
-					m.pendingProposals[i].Expanded = !m.pendingProposals[i].Expanded
-					m.rebuildViewport()
-					return m, nil // CLICK HIT! Consume and return early.
+			// ── Wheel: Zero-Delay Bounded Diff Scroll ─────────────────────
+			case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
+				if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 && m.pendingProposals[0].Expanded {
+					if mouseMsg.Button == tea.MouseButtonWheelUp {
+						if m.proposalDiffOffset > 0 {
+							m.proposalDiffOffset--
+						}
+					} else {
+						m.proposalDiffOffset++
+					}
+					return m, nil
 				}
-			}
-		}
+				// Not expanded — scroll the main viewport.
+				m.mouseSelecting = false
+				m.vp, vpCmd = m.vp.Update(msg)
+				m.rebuildViewport()
+				return m, vpCmd
 
-		// ── PHASE 3: Fallback ── Viewport text selection / scrollbar ──────
-		switch mouseMsg.Action {
-		case tea.MouseActionPress:
-			if mouseMsg.Button == tea.MouseButtonLeft {
+			// ── Left-Press: Begin viewport text selection (drag start) ────
+			case tea.MouseButtonLeft:
 				point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y)
 				if !ok {
 					m.mouseSelecting = false
@@ -394,7 +381,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentMouseCol = point.col
 				return m, nil
 			}
+		}
 
+		// ── Left-Release: Selection Finalization ───────────────────────────
+		if mouseMsg.Action == tea.MouseActionRelease && mouseMsg.Button == tea.MouseButtonLeft {
+			if m.mouseSelecting {
+				m.mouseSelecting = false
+				end := mouseSelectionPoint{row: m.currentMouseRow, col: m.currentMouseCol}
+				if point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y); ok {
+					end = point
+				}
+				m.copyMouseSelection(end)
+			}
+			return m, nil
+		}
+
+		// ── Motion & Other Release (non-left buttons) ──────────────────────
+		switch mouseMsg.Action {
 		case tea.MouseActionMotion:
 			if m.mouseSelecting {
 				if point, ok := m.viewportPoint(mouseMsg.X, mouseMsg.Y); ok {
@@ -698,10 +701,19 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 						if err := m.execEng.Patches.Apply(patch); err != nil {
 							m.push(roleError, "apply failed: "+err.Error())
-						} else {
-							applied++
-							m.push(roleSystem, infoStyle.Render("applied: "+p.Target.QualifiedName))
+							continue
 						}
+						applied++
+						status := "modified"
+						if isNewFileCreation(p.Diff) {
+							status = "created"
+						}
+						m.acceptedProposals = append(m.acceptedProposals, acceptedProposal{
+							Target: p.Target.QualifiedName,
+							Status: status,
+						})
+						acceptedLine := fmt.Sprintf("%s Accepted • %s • %s", acceptedDotStyle, p.Target.QualifiedName, status)
+						m.push(roleSystem, acceptedLineStyle.Render(acceptedLine))
 					}
 					if applied > 0 {
 						m.createBuildCheckpoint(applied)
@@ -719,6 +731,19 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.sess.ClearTasks()
 		}
+
+		// Extract shell commands from the response for explicit approval
+		if m.state == StateChat && !m.awaitingConfirmation {
+			shellBlocks := extractShellCommands(final)
+			if len(shellBlocks) > 0 {
+				m.pendingShellExec = shellBlocks
+				m.shellAwaitingIdx = 0
+				m.state = StateAwaitingShellExec
+				m.push(roleSystem, shellWarningStyle.Render(
+					fmt.Sprintf("Shell Execution: %d command(s) pending approval", len(shellBlocks))))
+			}
+		}
+
 		m.rebuildViewport()
 		return m, nil
 
@@ -741,6 +766,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// In special states, route directly to handleKey to avoid
+		// processing text input or history navigation.
+		if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec {
+			resModel, cmd := m.handleKey(msg)
+			return resModel, cmd
+		}
+
 		if strings.TrimSpace(m.ti.Value()) == "/clear" && msg.String() == "enter" {
 			m.showBanner = true
 		} else if msg.String() == "enter" && strings.TrimSpace(m.ti.Value()) != "" {

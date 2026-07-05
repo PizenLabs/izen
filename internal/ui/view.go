@@ -184,19 +184,29 @@ func (m *model) renderPromptBox(width int) string {
 // ── Active Widget Area ────────────────────────────────────────────────────
 
 func (m *model) renderActiveWidget(width int) string {
-	if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
-		// Map domain proposal to presentation ViewModel
-		vm := ToMutationCardViewModelFromProposal(m.pendingProposals[0])
+	if m.state == StateAwaitingShellExec && len(m.pendingShellExec) > 0 {
+		return m.renderShellExecProposal(width)
+	}
 
+	if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
+		// Render accepted-proposal summary widget if there are any
+		acceptedSummary := m.renderAcceptedSummary(width)
+		var widgetParts []string
+		if acceptedSummary != "" {
+			widgetParts = append(widgetParts, acceptedSummary)
+		}
+
+		vm := ToMutationCardViewModelFromProposal(m.pendingProposals[0])
 		if len(m.pendingProposals) > 1 {
 			vm.Purpose = fmt.Sprintf("Apply proposed code changes for %s and %d other files", vm.Target.Name, len(m.pendingProposals)-1)
 		} else {
 			vm.Purpose = fmt.Sprintf("Apply proposed code changes for %s", vm.Target.Name)
 		}
 
-		// Delegate rendering entirely to the stateless component
-		mr := &EnhancedMutationRenderer{Width: width}
-		return mr.Render(vm)
+		mr := &EnhancedMutationRenderer{Width: width, ScrollOffset: m.proposalDiffOffset}
+		widgetParts = append(widgetParts, mr.Render(vm))
+		widget := strings.Join(widgetParts, "\n")
+		return widget
 	}
 
 	if m.agentRunning {
@@ -207,6 +217,59 @@ func (m *model) renderActiveWidget(width int) string {
 	}
 
 	return ""
+}
+
+// renderAcceptedSummary renders collapsed single-line summaries for accepted proposals.
+func (m *model) renderAcceptedSummary(width int) string {
+	if len(m.acceptedProposals) == 0 {
+		return ""
+	}
+	var lines []string
+	for _, ap := range m.acceptedProposals {
+		line := fmt.Sprintf("%s Accepted • %s • %s", acceptedDotStyle, ap.Target, ap.Status)
+		lines = append(lines, acceptedLineStyle.Render(line))
+	}
+	content := strings.Join(lines, "\n")
+	return renderWidget("Applied", content, width, colorGreen)
+}
+
+// renderShellExecProposal renders the Shell Execution Proposal component with
+// a distinct Surface2 border, warning header, and explicit actions.
+func (m *model) renderShellExecProposal(width int) string {
+	if len(m.pendingShellExec) == 0 {
+		return ""
+	}
+	block := m.pendingShellExec[m.shellAwaitingIdx]
+	innerWidth := width - 4
+	if innerWidth < 20 {
+		innerWidth = 20
+	}
+
+	// Surface2-colored border
+	borderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	border := borderStyle.Render(strings.Repeat("─", innerWidth))
+
+	// Warning header
+	var b strings.Builder
+	b.WriteString(shellBorderStyle.Render("> System: Shell Execution Required <"))
+	b.WriteString("\n")
+
+	// Command body
+	cmdLines := strings.Split(block.Command, "\n")
+	for _, cl := range cmdLines {
+		styled := shellCmdStyle.Render("  $ " + cl)
+		b.WriteString(styled)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+
+	// Actions
+	b.WriteString("[A] Execute  [R] Skip")
+	b.WriteString("\n")
+
+	content := b.String()
+
+	return border + "\n" + content + border
 }
 
 // ── Runtime Status ────────────────────────────────────────────────────────
@@ -715,17 +778,30 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 		case blockCommand:
 			cmdText := strings.TrimSpace(block.raw)
 			if strings.HasPrefix(cmdText, "```") {
-				lines := strings.Split(cmdText, "\n")
-				if len(lines) > 2 {
-					cmdText = strings.Join(lines[1:len(lines)-1], "\n")
+				cmdLines := strings.Split(cmdText, "\n")
+				if len(cmdLines) > 2 {
+					cmdText = strings.Join(cmdLines[1:len(cmdLines)-1], "\n")
 				}
 			}
-			lines := strings.Split(cmdText, "\n")
-			var wrappedLines []string
-			for _, line := range lines {
-				wrappedLines = append(wrappedLines, wrapStreamText(line, widgetInnerWidth)...)
+
+			// Shell Execution Proposal container with warning header
+			var container strings.Builder
+			shellLineStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+
+			container.WriteString(shellWarningStyle.Render("> System: Shell Execution Required <"))
+			container.WriteString("\n")
+
+			cmdLines := strings.Split(cmdText, "\n")
+			for _, cl := range cmdLines {
+				container.WriteString("  ")
+				container.WriteString(shellLineStyle.Render("$ " + cl))
+				container.WriteString("\n")
 			}
-			rendered = renderWidget("Command", strings.Join(wrappedLines, "\n"), availableWidth, colorModeBuild)
+			container.WriteString("\n")
+			container.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Render("[A] Run  [R] Skip"))
+			container.WriteString("\n")
+
+			rendered = renderWidget("Command", container.String(), availableWidth, colorDimmed)
 
 		default:
 			// Route plain/markdown text through the semantic MarkdownRenderer
