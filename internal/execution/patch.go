@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -256,6 +257,38 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 type diffHunk struct {
 	oldBlock string
 	newBlock string
+	oldStart int
+	oldCount int
+}
+
+func parseHunkHeader(line string) (oldStart, oldCount int) {
+	// Format: @@ -oldStart,oldCount +newStart,newCount @@ [optional context]
+	hunkRange := strings.TrimPrefix(line, "@@")
+	idx := strings.Index(hunkRange, "@@")
+	if idx >= 0 {
+		hunkRange = hunkRange[:idx]
+	}
+	hunkRange = strings.TrimSpace(hunkRange)
+	parts := strings.Fields(hunkRange)
+	if len(parts) < 1 {
+		return 1, 1
+	}
+	oldPart := strings.TrimPrefix(parts[0], "-")
+	commaIdx := strings.Index(oldPart, ",")
+	if commaIdx >= 0 {
+		oldStart, _ = strconv.Atoi(oldPart[:commaIdx])
+		oldCount, _ = strconv.Atoi(oldPart[commaIdx+1:])
+	} else {
+		oldStart, _ = strconv.Atoi(oldPart)
+		oldCount = 1
+	}
+	if oldStart < 1 {
+		oldStart = 1
+	}
+	if oldCount < 0 {
+		oldCount = 0
+	}
+	return
 }
 
 func parseDiffHunks(content string) []diffHunk {
@@ -263,6 +296,7 @@ func parseDiffHunks(content string) []diffHunk {
 	var hunks []diffHunk
 	var oldLines, newLines []string
 	inHunk := false
+	var lastOldStart, lastOldCount int
 
 	for _, line := range lines {
 		if strings.HasPrefix(line, "@@") {
@@ -270,10 +304,13 @@ func parseDiffHunks(content string) []diffHunk {
 				hunks = append(hunks, diffHunk{
 					oldBlock: strings.Join(oldLines, "\n"),
 					newBlock: strings.Join(newLines, "\n"),
+					oldStart: lastOldStart,
+					oldCount: lastOldCount,
 				})
 				oldLines, newLines = nil, nil
 			}
 			inHunk = true
+			lastOldStart, lastOldCount = parseHunkHeader(line)
 			continue
 		}
 		if !inHunk {
@@ -302,10 +339,44 @@ func parseDiffHunks(content string) []diffHunk {
 		hunks = append(hunks, diffHunk{
 			oldBlock: strings.Join(oldLines, "\n"),
 			newBlock: strings.Join(newLines, "\n"),
+			oldStart: lastOldStart,
+			oldCount: lastOldCount,
 		})
 	}
 
 	return hunks
+}
+
+// applyLineRangeFallback performs a line-range replacement using the hunk's
+// parsed line numbers (oldStart, oldCount) as an anchor when exact string
+// matching fails. It slices out lines oldStart → oldStart+oldCount from the
+// original and injects the newBlock lines at that position.
+func applyLineRangeFallback(original string, hunk diffHunk) (string, bool) {
+	if hunk.oldStart < 1 {
+		return original, false
+	}
+	lines := strings.Split(original, "\n")
+	// Convert to 0-indexed
+	start := hunk.oldStart - 1
+	if start > len(lines) {
+		start = len(lines)
+	}
+	end := start + hunk.oldCount
+	if end > len(lines) {
+		end = len(lines)
+	}
+	if start > end {
+		return original, false
+	}
+
+	newLines := strings.Split(hunk.newBlock, "\n")
+
+	result := make([]string, 0, len(lines)-hunk.oldCount+len(newLines))
+	result = append(result, lines[:start]...)
+	result = append(result, newLines...)
+	result = append(result, lines[end:]...)
+
+	return strings.Join(result, "\n"), true
 }
 
 func applyUnifiedPatch(original, diff string) (string, error) {
@@ -330,6 +401,11 @@ func applyUnifiedPatch(original, diff string) (string, error) {
 
 		idx := strings.Index(current, hunk.oldBlock)
 		if idx < 0 {
+			// Fallback: try line-range replacement using the @@ header line numbers.
+			if replaced, ok := applyLineRangeFallback(current, hunk); ok && replaced != current {
+				current = replaced
+				continue
+			}
 			excerpt := hunk.oldBlock
 			if len(excerpt) > 80 {
 				excerpt = excerpt[:80] + "..."

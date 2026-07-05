@@ -700,7 +700,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							patch.Original = string(orig)
 						}
 						if err := m.execEng.Patches.Apply(patch); err != nil {
-							m.push(roleError, "apply failed: "+err.Error())
+							m.setApplyError("apply failed: " + err.Error())
 							continue
 						}
 						applied++
@@ -756,6 +756,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			_ = m.sess.Save()
 		}
 		m.push(roleError, "stream error: "+msg.err.Error())
+		return m, nil
+
+	case traceUpdateMsg:
+		m.currentTrace = msg.trace
+		if m.vpReady {
+			m.rebuildViewport()
+		}
 		return m, nil
 
 	case config.ConfigChangeMsg:

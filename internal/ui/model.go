@@ -17,6 +17,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
+	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
@@ -58,6 +59,10 @@ type streamDoneMsg struct {
 	content     string
 	tokenInput  int
 	tokenOutput int
+}
+
+type traceUpdateMsg struct {
+	trace *ctxpkg.CodebaseTrace
 }
 
 type streamErrMsg struct{ err error }
@@ -224,6 +229,13 @@ type model struct {
 
 	// Proposal widget diff scroll offset
 	proposalDiffOffset int
+
+	// AST/Code Graph trace for rendering the AI's thought route
+	currentTrace *ctxpkg.CodebaseTrace
+
+	// Last apply error for the red error bar
+	lastApplyError string
+	applyErrorTime time.Time
 }
 
 // ── Viewport helpers ──────────────────────────────────────────────────────────
@@ -304,6 +316,38 @@ func wrapStreamText(text string, maxW int) []string {
 }
 
 // rebuildViewport re-renders all records into the viewport content.
+// setApplyError captures an apply error for the red error bar and also
+// pushes it to the conversation history.
+func (m *model) setApplyError(text string) {
+	m.lastApplyError = text
+	m.applyErrorTime = time.Now()
+	m.push(roleError, text)
+}
+
+// renderErrorBar renders a red error bar if a recent apply error exists.
+// The bar auto-clears after 30 seconds or when a new user message is submitted.
+func (m *model) renderErrorBar(width int) string {
+	if m.lastApplyError == "" {
+		return ""
+	}
+	if time.Since(m.applyErrorTime) > 30*time.Second {
+		m.lastApplyError = ""
+		return ""
+	}
+	// Truncate to fit
+	text := m.lastApplyError
+	if len(text) > width-6 {
+		text = text[:width-9] + "…"
+	}
+	return lipgloss.NewStyle().
+		Background(lipgloss.Color(colorRed)).
+		Foreground(lipgloss.Color(colorBase)).
+		Bold(true).
+		Padding(0, 1).
+		Width(width).
+		Render(" ✗ " + text)
+}
+
 func (m *model) rebuildViewport() {
 	if !m.vpReady {
 		return
@@ -318,8 +362,34 @@ func (m *model) rebuildViewport() {
 		lines = append(lines, strings.Split(m.renderStartupBanner(m.width), "\n")...)
 		lines = append(lines, "")
 	}
-	for _, rec := range m.records {
+
+	// Track whether we've injected the trace already
+	traceInjected := false
+	lastUserIdx := -1
+	for i, rec := range m.records {
+		if rec.role == roleUser {
+			lastUserIdx = i
+		}
+	}
+
+	for i, rec := range m.records {
 		lines = append(lines, m.printRecord(rec))
+		// Inject trace right after the last user message, before AI response
+		if !traceInjected && i == lastUserIdx && m.currentTrace != nil && len(m.currentTrace.MatchedFiles) > 0 {
+			traceLine := m.renderCodebaseTrace(m.width)
+			if traceLine != "" {
+				lines = append(lines, traceLine)
+				traceInjected = true
+			}
+		}
+	}
+
+	// If no user records but trace exists, inject before streaming
+	if !traceInjected && m.currentTrace != nil && len(m.currentTrace.MatchedFiles) > 0 && lastUserIdx == -1 {
+		traceLine := m.renderCodebaseTrace(m.width)
+		if traceLine != "" {
+			lines = append(lines, traceLine)
+		}
 	}
 
 	// Live streaming: wrap incoming chunk buffer on-the-fly to enforce terminal boundary safety

@@ -63,6 +63,11 @@ func (m *model) View() string {
 		sections = append(sections, activeWidget)
 	}
 
+	// 4b. Error bar (red, above the focus line, auto-clears on next input)
+	if errorBar := m.renderErrorBar(width); errorBar != "" {
+		sections = append(sections, errorBar)
+	}
+
 	// 5. Focus separator line
 	sections = append(sections, m.renderFocusLine(width))
 
@@ -313,7 +318,16 @@ func (m *model) renderRuntimeStatus(width int) string {
 			pct := float64(total) / float64(maxCtx) * 100
 			c := float64(m.tokenInput)*(3.0/1_000_000) + float64(m.tokenOutput)*(15.0/1_000_000)
 			costStr := fmt.Sprintf("$%.2f", c)
-			tokStr = fmt.Sprintf("tokens: %d (%.0f%%) │ cost: %s", total, pct, costStr)
+			// Show AST optimization indicator when trace exists
+			if m.currentTrace != nil && len(m.currentTrace.MatchedFiles) > 0 {
+				savedPct := 0.0
+				if m.currentTrace.CompressionRatio > 0 {
+					savedPct = (1.0 - m.currentTrace.CompressionRatio) * 100
+				}
+				tokStr = fmt.Sprintf("tokens: %d (%.0f%%) │ ctx optimized %.0f%% │ %s", total, pct, savedPct, costStr)
+			} else {
+				tokStr = fmt.Sprintf("tokens: %d (%.0f%%) │ cost: %s", total, pct, costStr)
+			}
 		} else {
 			tokStr = fmt.Sprintf("tokens: %d", total)
 		}
@@ -601,6 +615,84 @@ func (m *model) printRecord(rec record) string {
 		}
 		return strings.Join(styledLines, "\n")
 	}
+}
+
+// ── AST Trace Renderer ────────────────────────────────────────────────────
+
+// renderCodebaseTrace renders the AI's cognitive execution trace as a clean,
+// industrial log line positioned above the AI response.
+func (m *model) renderCodebaseTrace(width int) string {
+	if m.currentTrace == nil {
+		return ""
+	}
+	t := m.currentTrace
+	if len(t.MatchedFiles) == 0 && len(t.ResolvedSymbols) == 0 {
+		return ""
+	}
+
+	// Build the primary trace line: file > symbol references
+	var parts []string
+	maxFiles := 3
+	if len(t.MatchedFiles) < maxFiles {
+		maxFiles = len(t.MatchedFiles)
+	}
+	for i := 0; i < maxFiles; i++ {
+		parts = append(parts, t.MatchedFiles[i])
+	}
+	if len(t.MatchedFiles) > maxFiles {
+		parts = append(parts, fmt.Sprintf("+%d more", len(t.MatchedFiles)-maxFiles))
+	}
+	fileStr := strings.Join(parts, ", ")
+
+	var symPart string
+	maxSyms := 3
+	if len(t.ResolvedSymbols) < maxSyms {
+		maxSyms = len(t.ResolvedSymbols)
+	}
+	if len(t.ResolvedSymbols) > 0 {
+		symNames := make([]string, maxSyms)
+		for i := 0; i < maxSyms; i++ {
+			symNames[i] = t.ResolvedSymbols[i]
+		}
+		symPart = strings.Join(symNames, ", ")
+		if len(t.ResolvedSymbols) > maxSyms {
+			symPart += fmt.Sprintf(" +%d", len(t.ResolvedSymbols)-maxSyms)
+		}
+	}
+
+	// Build the optimization percentage
+	var optStr string
+	if t.CompressionRatio > 0 {
+		pct := (1.0 - t.CompressionRatio) * 100
+		optStr = fmt.Sprintf(" | ctx optimized %.0f%%", pct)
+	} else if t.TotalTokensSaved > 0 {
+		optStr = fmt.Sprintf(" | saved ~%d tok", t.TotalTokensSaved)
+	}
+
+	// Compose the trace line
+	traceLine := "⚡ AST Slicing: " + fileStr
+	if symPart != "" {
+		traceLine += " > " + symPart
+	}
+	traceLine += optStr
+
+	// Style: Catppuccin Mocha subtext0 (#bac2de) — muted, industrial
+	traceStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#6c7086")). // colorMuted
+		Faint(true)
+
+	availableWidth := width - 2
+	if availableWidth < 20 {
+		availableWidth = 20
+	}
+
+	// Wrap if necessary
+	trimmed := traceLine
+	if lipgloss.Width(trimmed) > availableWidth {
+		trimmed = trimmed[:availableWidth-1] + "…"
+	}
+
+	return " " + traceStyle.Render(trimmed)
 }
 
 // ── Widget Box & Semantic Renderers ───────────────────────────────────────

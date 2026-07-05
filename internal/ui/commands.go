@@ -42,6 +42,9 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
+	// Clear any stale error bar on new user input
+	m.lastApplyError = ""
+
 	// Rigid active guards to block spamming inputs during background processes
 	if m.streaming || m.agentRunning {
 		m.push(roleSystem, "[System] Input blocked: task execution active.")
@@ -100,6 +103,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 func (m *model) handleMessageContent(line string) tea.Cmd {
 	var fileCtx strings.Builder
 	var refFiles []string
+	var trace *ctxpkg.CodebaseTrace
 	for _, field := range strings.Fields(line) {
 		if !strings.HasPrefix(field, "@") {
 			continue
@@ -140,21 +144,26 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 					fileCtx.WriteString("\n")
 				}
 				fileCtx.WriteString(renderer.Render(depCtx))
-			} else {
-				data, err := os.ReadFile(ref)
-				if err == nil {
-					ext := filepath.Ext(ref)
-					lang := strings.TrimPrefix(ext, ".")
-					lines := strings.Split(string(data), "\n")
-					if len(lines) > 50 {
-						lines = lines[:50]
-					}
-					if fileCtx.Len() > 0 {
-						fileCtx.WriteString("\n\n")
-					}
-					fmt.Fprintf(&fileCtx, "File: %s\n```%s\n%s\n```",
-						ref, lang, strings.Join(lines, "\n"))
+				if depCtx.Trace != nil {
+					trace = depCtx.Trace
 				}
+			}
+			// Force sync: always include CURRENT file content read fresh from disk
+			// so the AI sees the exact byte content rather than relying on cached
+			// graph metadata alone.
+			data, err := os.ReadFile(ref)
+			if err == nil {
+				ext := filepath.Ext(ref)
+				lang := strings.TrimPrefix(ext, ".")
+				lines := strings.Split(string(data), "\n")
+				if len(lines) > 50 {
+					lines = lines[:50]
+				}
+				if fileCtx.Len() > 0 {
+					fileCtx.WriteString("\n\n")
+				}
+				fmt.Fprintf(&fileCtx, "## Current Content of: %s\n```%s\n%s\n```",
+					ref, lang, strings.Join(lines, "\n"))
 			}
 		}
 	} else if len(refFiles) > 0 {
@@ -243,7 +252,17 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			}
 		}
 
-		return m.streamCmd(assembly.RawContext)
+		planTrace := &ctxpkg.CodebaseTrace{}
+		for _, sf := range assembly.SymbolFiles {
+			planTrace.MatchedFiles = append(planTrace.MatchedFiles, sf.Path)
+			for _, sym := range sf.Symbols {
+				planTrace.ResolvedSymbols = append(planTrace.ResolvedSymbols, sym.Name)
+			}
+		}
+		return tea.Batch(
+			func() tea.Msg { return traceUpdateMsg{trace: planTrace} },
+			m.streamCmd(assembly.RawContext),
+		)
 	default:
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
@@ -260,10 +279,19 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 				if ctx != nil && len(ctx.Files) > 0 {
 					header := fmt.Sprintf("### LOCALIZED CONTEXT (%s)\n\n", result.Label)
 					content = header + ctxpkg.DefaultRenderer().Render(ctx) + "\n" + content
+					if ctx.Trace != nil {
+						trace = ctx.Trace
+					}
 				}
 			}
 		}
 
+		if trace != nil {
+			return tea.Batch(
+				func() tea.Msg { return traceUpdateMsg{trace: trace} },
+				m.streamCmd(content),
+			)
+		}
 		return m.streamCmd(content)
 	}
 }
@@ -492,7 +520,15 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 
 	m.responseBuffer.Reset()
 	m.execEng.SetStreamContextFiles(m.attachedFiles)
-	return m.streamCmd(content)
+
+	buildTrace := &ctxpkg.CodebaseTrace{
+		MatchedFiles:    []string{targetTask.Target},
+		ResolvedSymbols: []string{targetTask.Target},
+	}
+	return tea.Batch(
+		func() tea.Msg { return traceUpdateMsg{trace: buildTrace} },
+		m.streamCmd(content),
+	)
 }
 
 func execShell(cmd string) (string, error) {

@@ -18,21 +18,34 @@ type FileSlice struct {
 	Size    int64       `json:"size"`
 }
 
+// CodebaseTrace captures the AST/Graph resolution metadata produced during
+// context assembly so the TUI can render the AI's "thought route".
+type CodebaseTrace struct {
+	MatchedFiles     []string `json:"matched_files"`
+	ResolvedSymbols  []string `json:"resolved_symbols"`
+	TotalTokensSaved int      `json:"total_tokens_saved"`
+	CompressionRatio float64  `json:"compression_ratio"`
+}
+
 type Context struct {
-	Objective string      `json:"objective"`
-	Mode      string      `json:"mode"`
-	Files     []FileSlice `json:"files"`
-	Diff      string      `json:"diff,omitempty"`
-	Status    []string    `json:"status,omitempty"`
-	Errors    []string    `json:"errors,omitempty"`
-	Query     string      `json:"query,omitempty"`
+	Objective string         `json:"objective"`
+	Mode      string         `json:"mode"`
+	Files     []FileSlice    `json:"files"`
+	Diff      string         `json:"diff,omitempty"`
+	Status    []string       `json:"status,omitempty"`
+	Errors    []string       `json:"errors,omitempty"`
+	Query     string         `json:"query,omitempty"`
+	Trace     *CodebaseTrace `json:"trace,omitempty"`
 }
 
 type Stats struct {
-	FileCount   int `json:"file_count"`
-	SymbolCount int `json:"symbol_count"`
-	DiffLines   int `json:"diff_lines"`
-	PromptChars int `json:"prompt_chars"`
+	FileCount       int `json:"file_count"`
+	SymbolCount     int `json:"symbol_count"`
+	DiffLines       int `json:"diff_lines"`
+	PromptChars     int `json:"prompt_chars"`
+	TokensSaved     int `json:"tokens_saved"`
+	MatchedFiles    int `json:"matched_files"`
+	ResolvedSymbols int `json:"resolved_symbols"`
 }
 
 func (c *Context) Stats() Stats {
@@ -48,5 +61,51 @@ func (c *Context) Stats() Stats {
 			s.DiffLines++
 		}
 	}
+	if c.Trace != nil {
+		s.TokensSaved = c.Trace.TotalTokensSaved
+		s.MatchedFiles = len(c.Trace.MatchedFiles)
+		s.ResolvedSymbols = len(c.Trace.ResolvedSymbols)
+	}
 	return s
+}
+
+// BuildTrace populates the CodebaseTrace from the files already collected in
+// the context. It extracts matched file paths and resolved symbol names, then
+// estimates the token savings from compression (symbols only vs full source).
+func (c *Context) BuildTrace() {
+	if len(c.Files) == 0 {
+		return
+	}
+	trace := &CodebaseTrace{}
+	seen := make(map[string]bool)
+
+	var totalSymbolTokens int
+	var estimatedFullTokens int
+
+	for _, f := range c.Files {
+		if !seen[f.Path] {
+			seen[f.Path] = true
+			trace.MatchedFiles = append(trace.MatchedFiles, f.Path)
+		}
+		for _, sym := range f.Symbols {
+			key := sym.Name + ":" + sym.File
+			if !seen[key] {
+				seen[key] = true
+				trace.ResolvedSymbols = append(trace.ResolvedSymbols, sym.Name)
+			}
+		}
+		// Each symbol ref ≈ 4 tokens (name + kind + line). Full source ≈ lines/4 tokens.
+		totalSymbolTokens += len(f.Symbols) * 4
+		estimatedFullTokens += f.Lines / 4
+	}
+
+	if estimatedFullTokens > 0 {
+		trace.TotalTokensSaved = estimatedFullTokens - totalSymbolTokens
+		if trace.TotalTokensSaved < 0 {
+			trace.TotalTokensSaved = 0
+		}
+		trace.CompressionRatio = float64(totalSymbolTokens) / float64(estimatedFullTokens)
+	}
+
+	c.Trace = trace
 }

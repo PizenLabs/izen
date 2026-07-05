@@ -64,6 +64,8 @@ func (b *Builder) Build(req BuildRequest) *Context {
 		b.collectStatus(ctx)
 	}
 
+	ctx.BuildTrace()
+
 	return ctx
 }
 
@@ -331,5 +333,6 @@ func (b *Builder) BuildDependencySlice(symbol string) *Context {
 		}
 	}
 
+	ctx.BuildTrace()
 	return ctx
 }
