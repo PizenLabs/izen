@@ -2,23 +2,20 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
-      - develop
+    branches: [main, develop]
   pull_request:
-    branches:
-      - main
-      - develop
+    branches: [main, develop]
 
 permissions:
   contents: read
 
 env:
-  GO_VERSION: stable
+  GO_VERSION: "1.24.6"
+  GOLANGCI_LINT_VERSION: "v1.65.0"
 
 jobs:
   go:
-    name: Go
+    name: Go Test + Lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -27,20 +24,57 @@ jobs:
         with:
           fetch-depth: 0
 
+      # -------------------------
+      # Go setup
+      # -------------------------
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
+      # -------------------------
+      # Go cache (extra boost)
+      # -------------------------
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+
       - run: go version
       - run: go mod download
       - run: go mod verify
 
-      - uses: golangci/golangci-lint-action@v6
+      # -------------------------
+      # golangci-lint cached install
+      # -------------------------
+      - name: Cache golangci-lint
+        id: cache-lint
+        uses: actions/cache@v4
         with:
-          version: latest
-          args: --timeout=5m
+          path: |
+            ~/go/bin/golangci-lint
+          key: golangci-lint-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}
 
+      - name: Install golangci-lint
+        if: steps.cache-lint.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+            | sh -s ${{ env.GOLANGCI_LINT_VERSION }}
+          mkdir -p ~/go/bin
+          mv ./bin/golangci-lint ~/go/bin/
+
+      - name: Add golangci-lint to PATH
+        run: echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Run golangci-lint
+        run: golangci-lint run --timeout=5m
+
+      # -------------------------
+      # Tests
+      # -------------------------
       - run: |
           go test \
             -race \
@@ -49,9 +83,15 @@ jobs:
             -coverprofile=coverage-go.out \
             ./...
 
+      # -------------------------
+      # Security scan
+      # -------------------------
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - run: govulncheck ./...
 
+      # -------------------------
+      # Artifacts
+      # -------------------------
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-go
@@ -60,7 +100,7 @@ jobs:
           retention-days: 1
 
   rust:
-    name: Rust
+    name: Rust Test + Lint
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -77,7 +117,8 @@ jobs:
         with:
           components: rustfmt,clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: lynx
 
@@ -104,7 +145,7 @@ jobs:
           retention-days: 1
 
   build:
-    name: Build
+    name: Build Binary
     needs: [go, rust]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -129,7 +170,7 @@ jobs:
       - run: ./bin/izen --version
 
   debug:
-    name: Debug Checkout
+    name: Debug (optional)
     runs-on: ubuntu-latest
 
     steps:
@@ -139,7 +180,7 @@ jobs:
 
       - run: |
           echo "===== GITHUB ====="
-          echo "GITHUB_SHA=$GITHUB_SHA"
+          echo "SHA: $GITHUB_SHA"
           git rev-parse HEAD
           git log --oneline -1
 
