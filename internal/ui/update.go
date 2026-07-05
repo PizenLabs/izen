@@ -97,11 +97,15 @@ func (m *model) dispatchMouseLeak(s string) {
 		case 64, 96: // Fallback Wheel up sequence
 			m.mouseSelecting = false
 			m.vp.ScrollUp(3)
-			m.rebuildViewport()
+			if m.scrollThrottle.Allow() {
+				m.rebuildViewport()
+			}
 		case 65, 97: // Fallback Wheel down sequence
 			m.mouseSelecting = false
 			m.vp.ScrollDown(3)
-			m.rebuildViewport()
+			if m.scrollThrottle.Allow() {
+				m.rebuildViewport()
+			}
 		case 0, 4, 32, 36:
 			point, inside := m.viewportPoint(col-1, row-1)
 
@@ -310,7 +314,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			lastAnyMouseActivity = now
 			m.mouseSelecting = false
 			m.vp.ScrollUp(3)
-			m.rebuildViewport()
+			if m.scrollThrottle.Allow() {
+				m.rebuildViewport()
+			}
 			return m, nil
 		}
 		if strings.Contains(rawStr, "[<65;") || strings.Contains(rawStr, "<65;") ||
@@ -318,7 +324,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			lastAnyMouseActivity = now
 			m.mouseSelecting = false
 			m.vp.ScrollDown(3)
-			m.rebuildViewport()
+			if m.scrollThrottle.Allow() {
+				m.rebuildViewport()
+			}
 			return m, nil
 		}
 
@@ -364,7 +372,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Not expanded — scroll the main viewport.
 				m.mouseSelecting = false
 				m.vp, vpCmd = m.vp.Update(msg)
-				m.rebuildViewport()
+				if m.scrollThrottle.Allow() {
+					m.rebuildViewport()
+				}
 				return m, vpCmd
 
 			// ── Left-Press: Begin viewport text selection (drag start) ────
@@ -451,13 +461,27 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		if m.streaming || m.agentRunning {
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
-			if m.vpReady && (!m.streaming || len(m.streamStyledLines) == 0) {
+			spinnerVisible := !m.streaming || m.animBuffer == nil || len(m.animBuffer.VisibleLines()) == 0
+			if m.vpReady && spinnerVisible {
 				m.rebuildViewport()
 			}
 		}
 		return m, m.spinnerTickCmd()
 
 	case animTickMsg:
+		// Drive progressive character animation
+		if m.streaming && m.animBuffer != nil && m.animBuffer.IsAnimating() {
+			if m.animBuffer.Tick() {
+				if m.vpReady {
+					m.rebuildViewport()
+					// Gently follow bottom during animation so new characters
+					// stay visible without jarring jumps.
+					if m.vp.AtBottom() {
+						m.vp.GotoBottom()
+					}
+				}
+			}
+		}
 		if m.lineAnimating {
 			m.lineAnimProgress += 25.0 / 150.0
 			if m.lineAnimProgress >= 1.0 {
@@ -499,6 +523,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streaming = false
 		m.streamParser = nil
 		m.streamStyledLines = nil
+		m.animBuffer.Reset()
 		m.push(roleSystem, "[System] Engine diagnostics collected. Escalating to LLM for analysis...")
 		return m, m.streamCmd(msg.escalationContent)
 
@@ -562,12 +587,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.responseBuffer.WriteString(raw)
 		if m.streamParser != nil {
 			if newLines := m.streamParser.ProcessChunk(raw); len(newLines) > 0 {
-				m.streamStyledLines = append(m.streamStyledLines, newLines...)
+				m.animBuffer.QueueLines(newLines)
 			}
 		}
-		if m.vpReady {
-			m.rebuildViewport()
-		}
+		// Do NOT call rebuildViewport here — the animTickMsg clock drives
+		// progressive character release at a controlled frame rate.
 		return m, m.readStream()
 
 	case streamDoneMsg:
@@ -576,10 +600,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.streamParser != nil {
 			if lastLine := m.streamParser.Flush(); lastLine != "" {
-				m.streamStyledLines = append(m.streamStyledLines, lastLine)
+				m.animBuffer.QueueLines([]string{lastLine})
 			}
 			m.streamParser = nil
 		}
+
+		// Flush animation so the viewport shows the complete response
+		// before we move the content into the historical record.
+		m.animBuffer.Flush()
+		m.rebuildViewport()
 
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
@@ -765,6 +794,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.streamStyledLines = nil
+		m.animBuffer.Reset()
 		m.rebuildViewport()
 		return m, nil
 
@@ -773,6 +803,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streaming = false
 		m.streamParser = nil
 		m.streamStyledLines = nil
+		m.animBuffer.Reset()
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
