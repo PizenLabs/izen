@@ -33,7 +33,7 @@ jobs:
           cache: true
 
       # -------------------------
-      # Go cache (extra boost)
+      # Go cache
       # -------------------------
       - name: Cache Go build
         uses: actions/cache@v4
@@ -48,7 +48,7 @@ jobs:
       - run: go mod verify
 
       # -------------------------
-      # golangci-lint cached install
+      # golangci-lint (cached install - KEEP THIS VERSION)
       # -------------------------
       - name: Cache golangci-lint
         id: cache-lint
@@ -170,7 +170,7 @@ jobs:
       - run: ./bin/izen --version
 
   debug:
-    name: Debug (optional)
+    name: Debug Checkout
     runs-on: ubuntu-latest
 
     steps:
@@ -180,7 +180,7 @@ jobs:
 
       - run: |
           echo "===== GITHUB ====="
-          echo "SHA: $GITHUB_SHA"
+          echo "GITHUB_SHA=$GITHUB_SHA"
           git rev-parse HEAD
           git log --oneline -1
 
