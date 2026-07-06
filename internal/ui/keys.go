@@ -11,6 +11,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.state == StateAwaitingShellExec {
 		switch msg.String() {
 		case "a", "A":
+			if !m.resolver.Current().CanShell() {
+				m.pendingShellExec = nil
+				m.state = StateChat
+				m.push(roleSystem, infoStyle.Render("[System] Shell execution blocked by mode capabilities"))
+				return m, nil
+			}
 			block := m.pendingShellExec[m.shellAwaitingIdx]
 			m.pendingShellExec = append(m.pendingShellExec[:m.shellAwaitingIdx], m.pendingShellExec[m.shellAwaitingIdx+1:]...)
 			if len(m.pendingShellExec) == 0 {

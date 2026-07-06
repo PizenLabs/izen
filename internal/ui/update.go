@@ -394,11 +394,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == StateChat && !m.awaitingConfirmation {
 			shellBlocks := extractShellCommands(final)
 			if len(shellBlocks) > 0 {
-				m.pendingShellExec = shellBlocks
-				m.shellAwaitingIdx = 0
-				m.state = StateAwaitingShellExec
-				m.push(roleSystem, shellWarningStyle.Render(
-					fmt.Sprintf("Shell Execution: %d command(s) pending approval", len(shellBlocks))))
+				mode := m.resolver.Current()
+				if mode.CanShell() {
+					m.pendingShellExec = shellBlocks
+					m.shellAwaitingIdx = 0
+					m.state = StateAwaitingShellExec
+					m.push(roleSystem, shellWarningStyle.Render(
+						fmt.Sprintf("Shell Execution: %d command(s) pending approval", len(shellBlocks))))
+				} else {
+					msg := fmt.Sprintf("[System] Tool 'shell' rejected. Reason: Explicit boundary violation for '%s' mode.", mode)
+					m.push(roleSystem, msg)
+					m.sess.AddMessage("system", msg+" You are in a Read-Only execution environment and must stop requesting system mutations.", 3)
+				}
 			}
 		}
 

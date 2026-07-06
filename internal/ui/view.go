@@ -656,10 +656,15 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 				}
 			}
 
-			// Shell Execution Proposal container with warning header
+			// Shell Execution Proposal container
 			var container strings.Builder
 
-			container.WriteString(shellWarningStyle.Render("> System: Shell Execution Required <"))
+			mode := m.resolver.Current()
+			if mode.CanShell() {
+				container.WriteString(shellWarningStyle.Render("> System: Shell Execution Required <"))
+			} else {
+				container.WriteString(shellWarningStyle.Render("> System: Shell Execution Blocked by Mode <"))
+			}
 			container.WriteString("\n")
 
 			cmdLines := strings.Split(cmdText, "\n")
@@ -669,7 +674,11 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 				container.WriteString("\n")
 			}
 			container.WriteString("\n")
-			container.WriteString(mutedStyle.Render("[A] Run  [R] Skip"))
+			if mode.CanShell() {
+				container.WriteString(mutedStyle.Render("[A] Run  [R] Skip"))
+			} else {
+				container.WriteString(dimmedStyle.Render("[System] Tool 'shell' rejected. Read-Only environment. No action available."))
+			}
 			container.WriteString("\n")
 
 			rendered = renderWidget("Command", container.String(), availableWidth, colorDimmed)
