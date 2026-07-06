@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/modes"
 )
 
 func (m *model) dismissSuggestions() {
@@ -153,6 +155,10 @@ func (m *model) filterCommands(prefix string) []string {
 		}
 	}
 	for _, c := range utilityCommands[currentMode] {
+		// Strictly hide build-only commands unless in build mode.
+		if (c == "/undo" || c == "/commit" || c == "/checkpoint") && currentMode != modes.ModeBuild {
+			continue
+		}
 		if matches(c) {
 			result = append(result, c)
 		}

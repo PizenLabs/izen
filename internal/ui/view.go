@@ -69,6 +69,7 @@ func (m *model) renderStaticBottomControls() string {
 	s.WriteString(modeColor.Render("❯ "+mode.String()) + " ⟩ " + m.ti.View() + "\n")
 	s.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
 	s.WriteString(m.renderRuntimeStatus(width))
+	s.WriteString("\n")
 
 	return s.String()
 }
@@ -85,10 +86,65 @@ func (m *model) modeStyle(mode modes.Mode) lipgloss.Style {
 
 // ── Autocomplete Dropdown ──────────────────────────────────────────────────
 
+// ── Command section categories for autocomplete ───────────────────────
+
+type cmdCategory int
+
+const (
+	catPrimaryMode cmdCategory = iota
+	catSystemCommand
+	catModeContextual
+)
+
+type cmdSection struct {
+	title string
+	style lipgloss.Style
+	items []string
+}
+
+func (m *model) cmdCategoryFor(item string) cmdCategory {
+	for _, c := range coreModes {
+		if c == item {
+			return catPrimaryMode
+		}
+	}
+	for _, c := range globalCommands {
+		if c == item {
+			return catSystemCommand
+		}
+	}
+	return catModeContextual
+}
+
+func (m *model) buildCmdSections(items []string) []cmdSection {
+	var primary, sys, ctx []string
+	for _, it := range items {
+		switch m.cmdCategoryFor(it) {
+		case catPrimaryMode:
+			primary = append(primary, it)
+		case catSystemCommand:
+			sys = append(sys, it)
+		case catModeContextual:
+			ctx = append(ctx, it)
+		}
+	}
+	var sections []cmdSection
+	if len(primary) > 0 {
+		sections = append(sections, cmdSection{title: "PRIMARY MODES", style: accentStyle, items: primary})
+	}
+	if len(sys) > 0 {
+		sections = append(sections, cmdSection{title: "SYSTEM COMMANDS", style: subtleStyle, items: sys})
+	}
+	if len(ctx) > 0 {
+		sections = append(sections, cmdSection{title: "MODE CONTEXTUAL", style: mutedStyle, items: ctx})
+	}
+	return sections
+}
+
 // renderAutocompleteDropdown renders a compact border-box suggestion list
 // positioned directly above the top parallel line. For file selections (@),
 // it uses a two-column layout with filename on the left and directory on the
-// right. Command selections (/) are displayed in a simple single-column list.
+// right. Command selections (/) are displayed in categorized section blocks.
 func (m *model) renderAutocompleteDropdown(width int) string {
 	if len(m.autocompleteItems) == 0 || !m.autocompleteActive {
 		return ""
@@ -127,41 +183,55 @@ func (m *model) renderAutocompleteDropdown(width int) string {
 				icon = "▶ "
 			}
 
-			leftSide := icon + name
-			rightSide := dir + " "
+			// Left column: file name (high contrast)
+			leftSide := textStyle.Render(icon + name)
+			// Right column: parent directory (low contrast #6c7086)
+			rightSide := mutedStyle.Render(dir + " ")
 
-			paddingCount := width - lipgloss.Width(leftSide) - lipgloss.Width(rightSide) - 4
+			paddingCount := width - lipgloss.Width(icon+name) - lipgloss.Width(dir+" ") - 4
 			if paddingCount < 0 {
 				paddingCount = 0
 			}
-			rowString := leftSide + strings.Repeat(" ", paddingCount) + rightSide
 
 			if i == m.autocompleteIdx {
+				rowString := leftSide + strings.Repeat(" ", paddingCount) + rightSide
 				b.WriteString("│ " + highlightedBgStyle.Render(rowString) + " │\n")
 			} else {
-				b.WriteString("│ " + dimmedStyle.Render(rowString) + " │\n")
+				b.WriteString("│ " + leftSide + strings.Repeat(" ", paddingCount) + rightSide + " │\n")
 			}
 		}
 	} else {
-		// Simple single-column layout for commands
-		for i, item := range list {
-			display := item
-			lw := lipgloss.Width(display)
-			maxContent := width - 8
-			if maxContent < 10 {
-				maxContent = 10
+		sections := m.buildCmdSections(list)
+		itemIdx := 0
+		for _, sec := range sections {
+			// Section header
+			headerStr := "  " + sec.style.Render(sec.title)
+			hPad := width - lipgloss.Width(headerStr) - 4
+			if hPad < 0 {
+				hPad = 0
 			}
-			if lw > maxContent {
-				display = display[:maxContent-1] + "…"
-				lw = lipgloss.Width(display)
-			}
-			pad := strings.Repeat(" ", width-lw-6)
+			b.WriteString("│ " + headerStr + strings.Repeat(" ", hPad) + " │\n")
 
-			rowString := display + pad
-			if i == m.autocompleteIdx {
-				b.WriteString("│ " + highlightedBgStyle.Render("▶ "+rowString) + " │\n")
-			} else {
-				b.WriteString("│ " + dimmedStyle.Render("◽ "+rowString) + " │\n")
+			for _, item := range sec.items {
+				display := item
+				lw := lipgloss.Width(display)
+				maxContent := width - 8
+				if maxContent < 10 {
+					maxContent = 10
+				}
+				if lw > maxContent {
+					display = display[:maxContent-1] + "…"
+					lw = lipgloss.Width(display)
+				}
+				pad := strings.Repeat(" ", width-lw-6)
+
+				rowString := display + pad
+				if itemIdx == m.autocompleteIdx {
+					b.WriteString("│ " + highlightedBgStyle.Render("▶ "+rowString) + " │\n")
+				} else {
+					b.WriteString("│ " + dimmedStyle.Render("◽ "+rowString) + " │\n")
+				}
+				itemIdx++
 			}
 		}
 	}
@@ -223,6 +293,11 @@ func (m *model) renderRuntimeStatus(width int) string {
 		b.WriteString(dimmedStyle.Render("●"))
 	}
 	b.WriteByte(' ')
+
+	// AI INTERRUPT ENGINE: high-visibility indicator when streaming
+	if m.streaming {
+		b.WriteString(redStyle.Render("● [Ctrl+D] Interrupt AI "))
+	}
 
 	// Model name
 	b.WriteString(dimmedStyle.Render(m.cfg.ActiveModelName()))
