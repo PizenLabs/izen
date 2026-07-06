@@ -3,9 +3,49 @@ package ui
 import (
 	"strings"
 
+	"github.com/alecthomas/chroma/v2"
+	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/mattn/go-runewidth"
 )
+
+// ── Catppuccin Mocha ANSI true-color escape sequences ────────────────────
+var (
+	ansiReset    = "\x1b[0m"
+	ansiText     = "\x1b[38;2;205;214;244m" // #cdd6f4 Foreground
+	ansiKeyword  = "\x1b[38;2;203;166;247m" // #cba6f7 Mauve
+	ansiString   = "\x1b[38;2;166;227;161m" // #a6e3a1 Green
+	ansiComment  = "\x1b[38;2;108;112;134m" // #6c7086 Overlay 0
+	ansiNumber   = "\x1b[38;2;250;179;135m" // #fab387 Peach
+	ansiFunction = "\x1b[38;2;137;180;250m" // #89b4fa Blue
+)
+
+// tokenTypeColor maps a Chroma token type to its ANSI true-color sequence
+// using the Catppuccin Mocha palette. Handles partial/incomplete tokens
+// safely — unknown types default to the foreground text color.
+func tokenTypeColor(t chroma.TokenType) string {
+	switch {
+	case t >= chroma.Keyword && t <= chroma.KeywordType:
+		return ansiKeyword
+	case t >= chroma.NameFunction && t <= chroma.NameFunctionMagic:
+		return ansiFunction
+	case t >= chroma.String && t <= chroma.StringSymbol:
+		return ansiString
+	case t >= chroma.Comment && t <= chroma.CommentPreprocFile:
+		return ansiComment
+	case t >= chroma.LiteralNumber && t <= chroma.LiteralNumberOct:
+		return ansiNumber
+	case t == chroma.GenericDeleted:
+		return ansiKeyword
+	case t == chroma.GenericInserted || t == chroma.GenericEmph:
+		return ansiString
+	case t == chroma.GenericHeading || t == chroma.GenericStrong:
+		return ansiFunction
+	default:
+		return ansiText
+	}
+}
 
 // RenderDeterministicPipeline handles complete and partial/streaming blocks identically.
 // It uses strings.Split to guarantee a finite loop iteration count, preventing any
@@ -120,10 +160,10 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 	return applyInlineStyles(line)
 }
 
-// renderCodeBlock renders a fenced code block with optional language label and
-// diff highlighting. Uses the exact same styles as the historical code path.
-// Code lines are hard-wrapped to (width - 4) to prevent terminal overflow while
-// preserving indentation structure.
+// renderCodeBlock renders a fenced code block with Chroma syntax highlighting
+// and ANSI-safe inline wrapping. The pipeline is: tokenize → newline fragment →
+// rune-level wrap using visual character widths. Partial/incomplete code
+// streams (e.g. mid-keyword truncation) are handled gracefully without errors.
 func renderCodeBlock(language string, lines []string, width int) string {
 	if len(lines) == 0 {
 		return ""
@@ -131,7 +171,6 @@ func renderCodeBlock(language string, lines []string, width int) string {
 
 	var builder strings.Builder
 
-	// Code block content width — same safety margin as prose text
 	codeWidth := width - 4
 	if codeWidth < 10 {
 		codeWidth = 10
@@ -142,32 +181,78 @@ func renderCodeBlock(language string, lines []string, width int) string {
 		builder.WriteString("\n")
 	}
 
-	isDiff := strings.HasPrefix(language, "diff")
+	rawCode := strings.Join(lines, "\n")
 
-	for i, line := range lines {
-		// Hard-wrap long code lines at character level to preserve structure
-		wrappedLine := ansi.Hardwrap(line, codeWidth, true)
-		wrappedParts := strings.Split(wrappedLine, "\n")
+	// Resolve Chroma lexer — fallback to Fallback if language is unknown/unset
+	lexer := lexers.Get(language)
+	if lexer == nil {
+		lexer = lexers.Fallback
+	}
+	lexer = chroma.Coalesce(lexer)
 
-		for j, part := range wrappedParts {
-			if i > 0 || j > 0 {
+	iterator, err := lexer.Tokenise(nil, rawCode)
+	if err != nil {
+		// Fallback: plain rendering with no syntax highlighting
+		for i, line := range lines {
+			if i > 0 {
 				builder.WriteString("\n")
 			}
-
-			if isDiff {
-				trimmed := strings.TrimSpace(part)
-				switch {
-				case strings.HasPrefix(part, "+") && !strings.HasPrefix(part, "+++"):
-					builder.WriteString(diffAddBgStyle.Render(part))
-				case strings.HasPrefix(part, "-") && !strings.HasPrefix(part, "---"):
-					builder.WriteString(diffDelBgStyle.Render(part))
-				case strings.HasPrefix(trimmed, "@@"):
-					builder.WriteString(diffHunkStyle.Render(part))
-				default:
-					builder.WriteString(mdCodeContStyle.Render(part))
+			wrapped := ansi.Hardwrap(line, codeWidth, true)
+			parts := strings.Split(wrapped, "\n")
+			for j, part := range parts {
+				if j > 0 {
+					builder.WriteString("\n")
 				}
-			} else {
 				builder.WriteString(mdCodeContStyle.Render(part))
+			}
+		}
+		return builder.String()
+	}
+
+	tokens := iterator.Tokens()
+
+	// Single-pass token-to-line-engine: iterate tokens, split on newlines,
+	// and wrap using RuneWidth for visual width safety.
+	currentLineLen := 0
+
+	for _, token := range tokens {
+		ansiStart := tokenTypeColor(token.Type)
+		text := token.Value
+
+		// Chunk token values on literal newlines
+		fragments := strings.Split(text, "\n")
+		for fi, frag := range fragments {
+			if fi > 0 {
+				builder.WriteByte('\n')
+				currentLineLen = 0
+			}
+			if frag == "" {
+				continue
+			}
+
+			var chunk []rune
+			chunkLen := 0
+
+			for _, rn := range frag {
+				rw := runewidth.RuneWidth(rn)
+				if currentLineLen+rw > codeWidth && chunkLen > 0 {
+					builder.WriteString(ansiStart)
+					builder.WriteString(string(chunk))
+					builder.WriteString(ansiReset)
+					builder.WriteByte('\n')
+					currentLineLen = 0
+					chunk = nil
+					chunkLen = 0
+				}
+				chunk = append(chunk, rn)
+				chunkLen += rw
+				currentLineLen += rw
+			}
+
+			if chunkLen > 0 {
+				builder.WriteString(ansiStart)
+				builder.WriteString(string(chunk))
+				builder.WriteString(ansiReset)
 			}
 		}
 	}
