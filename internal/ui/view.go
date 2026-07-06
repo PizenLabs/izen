@@ -330,7 +330,7 @@ func (m *model) renderRuntimeStatus(width int) string {
 
 	// Streaming/agent spinner or idle bullet
 	if m.streaming || m.agentRunning {
-		b.WriteString(redDotStyle.Render("●"))
+		b.WriteString(redDotStyle.Render("⌘"))
 	} else {
 		b.WriteString(dimmedStyle.Render("●"))
 	}
@@ -338,7 +338,7 @@ func (m *model) renderRuntimeStatus(width int) string {
 
 	// AI INTERRUPT ENGINE: high-visibility indicator when streaming
 	if m.streaming {
-		b.WriteString(interruptLabelStyle.Render("[Ctrl+D] Interrupt AI"))
+		b.WriteString(interruptLabelStyle.Render("[Ctrl+D] interrupt "))
 	}
 
 	// Model name — dropped first when the pane is too narrow to fit it.

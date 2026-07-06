@@ -46,13 +46,17 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	var msgs []ai.Message
 	if history := m.sess.History; len(history) > 0 {
 		for _, msg := range history {
+			raw := msg.Content
+			// READS: Never pass viewport-rendered content — only session-persisted raw text.
 			msgs = append(msgs, ai.Message{
 				Role:    msg.Role,
-				Content: msg.Content,
+				Content: raw,
 			})
 		}
 	}
 
+	// ABSOLUTE GUARD: content MUST be raw input text, NOT m.Viewport.View() or any
+	// concatenation of rendered history + status bar + prompt prefix.
 	msgs = append(msgs, ai.Message{Role: "user", Content: content})
 
 	var systemPrompt string
@@ -71,6 +75,17 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	}
 	if m.resolver.Current() == modes.ModePlan {
 		systemPrompt = prompt.PlanSystemPrompt()
+	}
+
+	if systemPrompt == "" {
+		uname := m.cfg.Username
+		if uname == "" {
+			uname = m.userName
+		}
+		if uname == "" {
+			uname = "developer"
+		}
+		systemPrompt = strings.ReplaceAll(prompt.AskSystemPromptTemplate, "{{.Username}}", uname)
 	}
 
 	req := ai.Request{
