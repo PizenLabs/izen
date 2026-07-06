@@ -17,6 +17,7 @@ const (
 	colorGreen   = "#a6e3a1"
 	colorGreenBr = "#b9f0b4"
 	colorRed     = "#f38ba8"
+	colorMaroon  = "#eba0ac"
 	colorOrange  = "#fab387"
 	colorYellow  = "#f9e2af"
 	colorCyan    = "#89dceb"
@@ -155,6 +156,7 @@ var (
 	greenStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
 	accentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 	redStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRed))
+	maroonStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMaroon))
 	blueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
 
 	// Bold + color

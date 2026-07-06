@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"math/rand"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -296,7 +297,8 @@ func (m *model) renderRuntimeStatus(width int) string {
 
 	// AI INTERRUPT ENGINE: high-visibility indicator when streaming
 	if m.streaming {
-		b.WriteString(redStyle.Render("● [Ctrl+D] Interrupt AI "))
+		b.WriteString(redStyle.Render("● "))
+		b.WriteString(maroonStyle.Render("[Ctrl+D] Interrupt AI "))
 	}
 
 	// Model name
@@ -324,6 +326,14 @@ func (m *model) renderRuntimeStatus(width int) string {
 	}
 
 	return b.String()
+}
+
+var devTips = []string{
+	"Pro Tip: Press [Esc] three times quickly anywhere to cleanly safely quit IZEN.",
+	"Pro Tip: Use '@path' to attach files/folders. Multi-column layout automatically isolates parent package names.",
+	"Pro Tip: IZEN locks execution boundaries. /ask is strictly Read-Only, use /build to run shell mutations.",
+	"Pro Tip: Run !<command> to escape the prompt and execute short native shell actions synchronously.",
+	"Pro Tip: Toggle the global help dashboard overlay instantly by pressing [?] during idle input states.",
 }
 
 // ── Startup banner ────────────────────────────────────────────────────
@@ -419,7 +429,8 @@ func (m *model) renderStartupBanner(termWidth int) string {
 	metaSep := subtleStyle.Render(" • ")
 	meta := strings.Join(metaParts, metaSep)
 
-	rows = append(rows, divider, meta)
+	tip := mutedStyle.Render(devTips[rand.Intn(len(devTips))])
+	rows = append(rows, divider, meta, "", tip)
 	body := strings.Join(rows, "\n")
 
 	return bannerBorderStyle.Width(termWidth - 2).Render(body)

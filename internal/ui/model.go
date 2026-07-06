@@ -101,6 +101,10 @@ type objectiveAnalyzedMsg struct {
 	err       error
 }
 
+type archDoneMsg struct {
+	Content string
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const (

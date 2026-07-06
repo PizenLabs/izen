@@ -163,6 +163,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case archDoneMsg:
+		for _, line := range strings.Split(msg.Content, "\n") {
+			m.push(roleSystem, infoStyle.Render(line))
+		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, nil
+
 	case smoothStreamTickMsg:
 		if len(m.streamBuffer) > 0 {
 			// Emit word-aligned chunks for a natural reading rhythm.

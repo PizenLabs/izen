@@ -333,6 +333,7 @@ func (m *model) setMode(mode modes.Mode) {
 	if mode == m.resolver.Current() {
 		return
 	}
+	oldMode := m.resolver.Current()
 	m.startModeTransition(mode)
 	m.sess.SetMode(mode)
 	_ = m.sess.Save()
@@ -340,6 +341,9 @@ func (m *model) setMode(mode modes.Mode) {
 	modeLabel := lipgloss.NewStyle().Foreground(modeColor).Render(
 		fmt.Sprintf("→ /%s — %s", mode, mode.Description()))
 	m.push(roleSystem, modeLabel)
+	m.push(roleSystem, fmt.Sprintf("[System] Runtime boundary adjusted: /%s ──> /%s.", oldMode, mode))
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
 }
 
 func (m *model) handleCommand(cmd string) tea.Cmd {
@@ -464,12 +468,13 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case cmd == "/arch":
-		m.push(roleSystem, infoStyle.Render("scanning architecture..."))
-		arch := m.renderArch()
-		for _, line := range strings.Split(arch, "\n") {
-			m.push(roleSystem, infoStyle.Render(line))
+		m.showBanner = false
+		m.push(roleSystem, "[System] Reading Graph AST and mapping local repository...")
+		m.refreshViewportContent()
+		return func() tea.Msg {
+			graphText := m.renderArch()
+			return archDoneMsg{Content: graphText}
 		}
-		return nil
 	}
 
 	m.push(roleError, "unknown command: "+cmd)
