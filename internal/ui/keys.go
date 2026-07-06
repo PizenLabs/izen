@@ -7,13 +7,41 @@ import (
 )
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// ── StateProcessing: block all input during async mutations ──────────
+	if m.state == StateProcessing {
+		return m, nil
+	}
+
+	// ── Viewport navigation pass-through in locked states ───────────────
+	// Arrow keys, j/k, ctrl+u, ctrl+d must forward to viewport so the
+	// user can fluidly inspect long file diffs without scroll lockout.
+	if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec {
+		if m.Ready {
+			switch {
+			case msg.Type == tea.KeyUp || msg.Type == tea.KeyDown:
+				var vpCmd tea.Cmd
+				m.Viewport, vpCmd = m.Viewport.Update(msg)
+				return m, vpCmd
+			case msg.String() == "j" || msg.String() == "k":
+				var vpCmd tea.Cmd
+				m.Viewport, vpCmd = m.Viewport.Update(msg)
+				return m, vpCmd
+			case msg.Type == tea.KeyCtrlU || msg.Type == tea.KeyCtrlD:
+				var vpCmd tea.Cmd
+				m.Viewport, vpCmd = m.Viewport.Update(msg)
+				return m, vpCmd
+			}
+		}
+	}
+
 	// ── Awaiting shell execution approval ─────────────────────────────────────
 	if m.state == StateAwaitingShellExec {
-		switch msg.String() {
-		case "a", "A":
+		switch {
+		case msg.String() == "a" || msg.String() == "A":
 			if !m.resolver.Current().CanShell() {
 				m.pendingShellExec = nil
 				m.state = StateChat
+				m.recalcViewportHeight()
 				m.push(roleSystem, infoStyle.Render("[System] Shell execution blocked by mode capabilities"))
 				return m, nil
 			}
@@ -21,36 +49,41 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.pendingShellExec = append(m.pendingShellExec[:m.shellAwaitingIdx], m.pendingShellExec[m.shellAwaitingIdx+1:]...)
 			if len(m.pendingShellExec) == 0 {
 				m.state = StateChat
+				m.recalcViewportHeight()
 			}
 			return m, m.execShellCmd(block.Command)
 
-		case "r", "R":
+		case msg.String() == "r" || msg.String() == "R":
 			m.pendingShellExec = append(m.pendingShellExec[:m.shellAwaitingIdx], m.pendingShellExec[m.shellAwaitingIdx+1:]...)
 			if len(m.pendingShellExec) == 0 {
 				m.state = StateChat
+				m.recalcViewportHeight()
 			}
 			m.push(roleSystem, infoStyle.Render("shell command skipped"))
 			return m, nil
 
-		case "esc":
+		case msg.Type == tea.KeyEscape:
 			m.pendingShellExec = nil
 			m.state = StateChat
+			m.recalcViewportHeight()
 			m.push(roleSystem, infoStyle.Render("shell execution cancelled"))
 			return m, nil
 		}
 		return m, nil
 	}
 
-	// ── Awaiting approval ────────────────────────────────────────────────────
+	// ── Awaiting approval ──────────────────────────────────────────────────
 	if m.state == StateAwaitingApproval {
-		switch msg.String() {
-		case "a", "A":
+		switch {
+		case msg.String() == "a" || msg.String() == "A":
 			return m, m.applySingleProposal()
-		case "l", "L":
+		case msg.String() == "l" || msg.String() == "L":
 			m.acceptAll = true
 			return m, m.applyAllProposals()
-		case "r", "R", "esc":
+		case msg.String() == "r" || msg.String() == "R" || msg.Type == tea.KeyEscape:
+			m.ti.Focus()
 			m.state = StateChat
+			m.recalcViewportHeight()
 			m.awaitingConfirmation = false
 			m.pendingProposals = nil
 			m.acceptAll = false

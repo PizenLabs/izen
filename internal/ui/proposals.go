@@ -344,54 +344,19 @@ func parseUnifiedDiffHunks(content string) (string, string) {
 func (m *model) applySingleProposal() tea.Cmd {
 	if len(m.pendingProposals) == 0 {
 		m.state = StateChat
+		m.recalcViewportHeight()
 		m.awaitingConfirmation = false
 		return nil
 	}
 	p := m.pendingProposals[0]
-	patch := &execution.Patch{
-		ID:       p.ID,
-		File:     p.Target.QualifiedName,
-		Modified: p.Diff,
-	}
-	orig, err := os.ReadFile(p.Target.QualifiedName)
-	if err == nil {
-		patch.Original = string(orig)
-	}
-	if err := m.execEng.Patches.Apply(patch); err != nil {
-		m.setApplyError("apply failed: " + err.Error())
-		return nil
-	}
-
-	// Track and emit collapsed single-line accepted summary
-	status := "modified"
-	if isNewFileCreation(p.Diff) {
-		status = "created"
-	}
-	m.acceptedProposals = append(m.acceptedProposals, acceptedProposal{
-		Target: p.Target.QualifiedName,
-		Status: status,
-	})
-	acceptedLine := fmt.Sprintf("%s Accepted • %s • %s", acceptedDotStyle, p.Target.QualifiedName, status)
-	m.push(roleSystem, acceptedLineStyle.Render(acceptedLine))
-
-	m.pendingProposals = m.pendingProposals[1:]
-	m.proposalDiffOffset = 0
-	if len(m.pendingProposals) == 0 {
-		m.state = StateChat
-		m.awaitingConfirmation = false
-		m.createBuildCheckpoint(1)
-	} else {
-		// Minimal next-proposal notification — no full diff bloat
-		m.push(roleSystem, infoStyle.Render("next: "+m.pendingProposals[0].Target.QualifiedName))
-		modeColor := m.modeStyle(m.resolver.Current())
-		m.push(roleSystem, modeColor.Render("  [A] Accept  [L] Allow All  [R] Reject"))
-	}
-	return nil
+	m.state = StateProcessing
+	m.recalcViewportHeight()
+	return m.applyProposalCmd(p)
 }
 
-func (m *model) applyAllProposals() tea.Cmd {
-	applied := 0
-	for _, p := range m.pendingProposals {
+func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
+	eng := m.execEng
+	return func() tea.Msg {
 		patch := &execution.Patch{
 			ID:       p.ID,
 			File:     p.Target.QualifiedName,
@@ -401,30 +366,55 @@ func (m *model) applyAllProposals() tea.Cmd {
 		if err == nil {
 			patch.Original = string(orig)
 		}
-		if err := m.execEng.Patches.Apply(patch); err != nil {
-			m.setApplyError("apply failed: " + err.Error())
-			continue
+		if err := eng.Patches.Apply(patch); err != nil {
+			return mutationResultMsg{err: err, file: p.Target.QualifiedName}
 		}
-		applied++
-
 		status := "modified"
 		if isNewFileCreation(p.Diff) {
 			status = "created"
 		}
-		m.acceptedProposals = append(m.acceptedProposals, acceptedProposal{
-			Target: p.Target.QualifiedName,
-			Status: status,
-		})
-		acceptedLine := fmt.Sprintf("%s Accepted • %s • %s", acceptedDotStyle, p.Target.QualifiedName, status)
-		m.push(roleSystem, acceptedLineStyle.Render(acceptedLine))
+		return mutationResultMsg{
+			file:   p.Target.QualifiedName,
+			status: status,
+		}
 	}
-	m.pendingProposals = nil
-	m.awaitingConfirmation = false
-	m.state = StateChat
-	if applied > 0 {
-		m.createBuildCheckpoint(applied)
+}
+
+func (m *model) applyAllProposals() tea.Cmd {
+	m.state = StateProcessing
+	m.recalcViewportHeight()
+	m.acceptAll = true
+	return m.applyAllProposalsCmd()
+}
+
+func (m *model) applyAllProposalsCmd() tea.Cmd {
+	proposals := make([]SemanticProposal, len(m.pendingProposals))
+	copy(proposals, m.pendingProposals)
+	eng := m.execEng
+	return func() tea.Msg {
+		var results []mutationResultMsg
+		for _, p := range proposals {
+			patch := &execution.Patch{
+				ID:       p.ID,
+				File:     p.Target.QualifiedName,
+				Modified: p.Diff,
+			}
+			orig, err := os.ReadFile(p.Target.QualifiedName)
+			if err == nil {
+				patch.Original = string(orig)
+			}
+			if err := eng.Patches.Apply(patch); err != nil {
+				results = append(results, mutationResultMsg{err: err, file: p.Target.QualifiedName})
+				continue
+			}
+			status := "modified"
+			if isNewFileCreation(p.Diff) {
+				status = "created"
+			}
+			results = append(results, mutationResultMsg{file: p.Target.QualifiedName, status: status})
+		}
+		return applyAllResultMsg{results: results}
 	}
-	return nil
 }
 
 func (m *model) createBuildCheckpoint(fileCount int) {
@@ -472,16 +462,15 @@ func extractShellCommands(response string) []shellExecBlock {
 // execShellCmd executes a shell command and pushes output as records.
 func (m *model) execShellCmd(cmd string) tea.Cmd {
 	return func() tea.Msg {
-		m.push(roleSystem, fmt.Sprintf("$ %s", cmd))
 		out, err := execShell(cmd)
+		var lines []string
+		lines = append(lines, "$ "+cmd)
 		if err != nil {
-			m.push(roleError, "shell exec: "+err.Error())
+			lines = append(lines, "shell exec: "+err.Error())
 		}
 		if out != "" {
-			for _, line := range strings.Split(strings.TrimRight(out, "\r\n"), "\n") {
-				m.push(roleSystem, line)
-			}
+			lines = append(lines, strings.Split(strings.TrimRight(out, "\r\n"), "\n")...)
 		}
-		return nil
+		return shellOutputMsg{lines: lines}
 	}
 }

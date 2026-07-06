@@ -45,6 +45,8 @@ const (
 // View returns the full UI state.
 // The scrollable chat history is rendered inside the viewport; metadata bars,
 // the input line, and the status line are pinned to the bottom of the terminal.
+// Interactive proposal/processing blocks are rendered in a dedicated fixed dock
+// between the viewport and the bottom controls, fully isolated from the chat history.
 func (m *model) View() string {
 	if m.showHelpOverlay {
 		return m.renderHelpOverlay()
@@ -57,6 +59,10 @@ func (m *model) View() string {
 	var buf strings.Builder
 	buf.WriteString(m.Viewport.View())
 	buf.WriteString("\n")
+	if m.state == StateAwaitingApproval || m.state == StateProcessing {
+		buf.WriteString(m.renderProposalBlock())
+		buf.WriteString("\n")
+	}
 	buf.WriteString(m.renderStaticBottomControls())
 	return buf.String()
 }
@@ -85,6 +91,54 @@ func (m *model) renderStaticBottomControls() string {
 	s.WriteString("\n")
 
 	return s.String()
+}
+
+// renderProposalBlock renders the interactive proposal/processing dock
+// between the viewport and the input line, framed for clear isolation.
+func (m *model) renderProposalBlock() string {
+	width := m.width
+	if width < 40 {
+		width = 40
+	}
+
+	var b strings.Builder
+
+	// ── Dock frame top: labeled divider ───────────────────────────────────
+	label := " PROPOSAL DOCK "
+	fillLen := width - len(label)
+	if fillLen < 2 {
+		fillLen = 2
+	}
+	half := fillLen / 2
+	b.WriteString(accentStyle.Render(
+		strings.Repeat("╌", half) + label + strings.Repeat("╌", fillLen-half),
+	))
+	b.WriteString("\n")
+
+	switch m.state {
+	case StateAwaitingApproval:
+		if len(m.pendingProposals) == 0 {
+			return ""
+		}
+		p := m.pendingProposals[0]
+		vm := ToMutationCardViewModelFromProposal(p)
+		mr := &MutationRenderer{Width: width, ScrollOffset: m.proposalDiffOffset}
+		b.WriteString(mr.Render(vm))
+
+	case StateProcessing:
+		frame := SpinnerFrames[m.spinnerFrame%len(SpinnerFrames)]
+		sp := SpinnerStyle.Render(frame)
+		b.WriteString("  " + sp + " " + infoStyle.Render("Processing file mutations... Please wait."))
+		if len(m.pendingProposals) > 0 {
+			b.WriteString(" " + tracerStyle.Render(m.pendingProposals[0].Target.QualifiedName))
+		}
+		b.WriteString("\n")
+	}
+
+	// ── Dock frame bottom ─────────────────────────────────────────────────
+	b.WriteString(accentStyle.Render(strings.Repeat("╌", width)))
+
+	return b.String()
 }
 
 // modeStyle returns the appropriate lipgloss style for a mode.

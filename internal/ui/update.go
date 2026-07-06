@@ -13,7 +13,6 @@ import (
 
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/domain"
-	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
@@ -45,11 +44,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.ti.Width = msg.Width - 8
 
-		verticalMargin := 5
-		vpHeight := m.height - verticalMargin
-		if vpHeight < 1 {
-			vpHeight = 1
-		}
+		vpHeight := m.computeVpHeight()
 
 		if !m.Ready {
 			m.Viewport = viewport.New(msg.Width, vpHeight)
@@ -67,8 +62,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
-		if m.streaming || m.agentRunning {
-			m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
+		if m.streaming || m.agentRunning || m.state == StateProcessing {
+			m.spinnerFrame = (m.spinnerFrame + 1) % len(SpinnerFrames)
 		}
 		return m, m.spinnerTickCmd()
 
@@ -170,6 +165,87 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m, nil
+
+	case mutationResultMsg:
+		if msg.err != nil {
+			m.setApplyError("apply failed: " + msg.err.Error())
+		} else {
+			m.acceptedProposals = append(m.acceptedProposals, acceptedProposal{
+				Target: msg.file,
+				Status: msg.status,
+			})
+		}
+
+		if len(m.pendingProposals) > 0 {
+			m.pendingProposals = m.pendingProposals[1:]
+		}
+		m.proposalDiffOffset = 0
+
+		if len(m.pendingProposals) == 0 {
+			m.ti.Focus()
+			m.state = StateChat
+			m.recalcViewportHeight()
+			m.awaitingConfirmation = false
+			m.acceptAll = false
+			if msg.err == nil {
+				outcomeLine := fmt.Sprintf("%s %s • %s", successBannerStyle.Render("[✓]"), msg.file, msg.status)
+				m.push(roleSystem, outcomeLine)
+				m.createBuildCheckpoint(1)
+			} else {
+				m.push(roleSystem, failureBannerStyle.Render("[✗] "+msg.file+" — "+msg.err.Error()))
+			}
+		} else {
+			m.state = StateAwaitingApproval
+			m.recalcViewportHeight()
+		}
+
+		m.refreshViewportContent()
+		flush := m.flushPendingRecords()
+		return m, flush
+
+	case applyAllResultMsg:
+		applied := 0
+		failed := 0
+		for _, r := range msg.results {
+			if r.err != nil {
+				m.setApplyError("apply failed: " + r.err.Error())
+				failed++
+				continue
+			}
+			m.acceptedProposals = append(m.acceptedProposals, acceptedProposal{
+				Target: r.file,
+				Status: r.status,
+			})
+			applied++
+		}
+		m.pendingProposals = nil
+		m.awaitingConfirmation = false
+		m.acceptAll = false
+		m.ti.Focus()
+		m.state = StateChat
+		m.recalcViewportHeight()
+		switch {
+		case applied > 0 && failed == 0:
+			summary := fmt.Sprintf("%s %d file(s) mutated. Checkpoint created.", successBannerStyle.Render("[✓]"), applied)
+			m.push(roleSystem, summary)
+			m.createBuildCheckpoint(applied)
+		case applied > 0:
+			summary := fmt.Sprintf("%s %d mutated, %d failed.", warningBannerStyle.Render("[!]"), applied, failed)
+			m.push(roleSystem, summary)
+			m.createBuildCheckpoint(applied)
+		default:
+			m.push(roleSystem, failureBannerStyle.Render(fmt.Sprintf("[✗] %d mutation(s) failed.", failed)))
+		}
+		m.refreshViewportContent()
+		flush := m.flushPendingRecords()
+		return m, flush
+
+	case shellOutputMsg:
+		for _, line := range msg.lines {
+			m.push(roleSystem, line)
+		}
+		flush := m.flushPendingRecords()
+		return m, flush
 
 	case smoothStreamTickMsg:
 		if len(m.streamBuffer) > 0 {
@@ -376,47 +452,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if len(props) > 0 {
 				if m.acceptAll {
-					applied := 0
-					for _, p := range props {
-						patch := &execution.Patch{
-							ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
-							File:     p.Target.QualifiedName,
-							Modified: p.Diff,
-						}
-						orig, err := os.ReadFile(p.Target.QualifiedName)
-						if err == nil {
-							patch.Original = string(orig)
-						}
-						if err := m.execEng.Patches.Apply(patch); err != nil {
-							m.setApplyError("apply failed: " + err.Error())
-							continue
-						}
-						applied++
-						status := "modified"
-						if isNewFileCreation(p.Diff) {
-							status = "created"
-						}
-						m.acceptedProposals = append(m.acceptedProposals, acceptedProposal{
-							Target: p.Target.QualifiedName,
-							Status: status,
-						})
-						acceptedLine := fmt.Sprintf("%s Accepted • %s • %s", acceptedDotStyle, p.Target.QualifiedName, status)
-						m.push(roleSystem, acceptedLineStyle.Render(acceptedLine))
-					}
-					if applied > 0 {
-						m.createBuildCheckpoint(applied)
-					}
+					m.pendingProposals = props
+					m.state = StateProcessing
+					m.recalcViewportHeight()
+					m.ti.Blur()
+					return m, m.applyAllProposalsCmd()
 				} else {
 					m.pendingProposals = props
 					m.state = StateAwaitingApproval
+					m.recalcViewportHeight()
 					m.awaitingConfirmation = true
-					proposalMsg := "proposed changes:"
-					for _, p := range props {
-						proposalMsg += fmt.Sprintf("\n    • %s", p.Target.QualifiedName)
-					}
-					m.push(roleSystem, infoStyle.Render(proposalMsg))
-					modeColor := m.modeStyle(m.resolver.Current())
-					m.push(roleSystem, modeColor.Render("  [A] Accept  [L] Allow All  [R] Reject"))
+					m.ti.Blur()
 				}
 			}
 			m.sess.ClearTasks()
@@ -487,6 +533,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
+		// HARD GUARD: In destructive states (approval/exec/processing), mouse events are
+		// completely ignored — no viewport scrolling, no coordinate mapping.
+		// This eliminates any possibility of accidental mutation via click.
+		if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec || m.state == StateProcessing {
+			return m, nil
+		}
 		// Pure O(1) viewport YOffset shift. No refreshViewportContent, no
 		// re-rendering, no string mutation — the viewport internal buffer is
 		// already set and only its scroll origin moves.
@@ -509,7 +561,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// In special states, route directly to handleKey.
-		if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec {
+		if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec || m.state == StateProcessing {
 			resModel, cmd := m.handleKey(msg)
 			return resModel, cmd
 		}
@@ -619,22 +671,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) spinnerTickCmd() tea.Cmd {
-	frame := m.spinnerFrame % len(spinnerFrames)
-	frameStr := spinnerFrames[frame]
-
-	var delay time.Duration
-	switch frameStr {
-	case " ⊹ ":
-		delay = 40 * time.Millisecond
-	case " ⁕ ":
-		delay = 70 * time.Millisecond
-	case " ❃ ", " ❄ ", " ❆ ":
-		delay = 250 * time.Millisecond
-	default:
-		delay = 100 * time.Millisecond
-	}
-
-	return tea.Tick(delay, func(t time.Time) tea.Msg { return tickMsg(t) })
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func (m *model) smoothStreamTickCmd() tea.Cmd {

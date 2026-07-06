@@ -47,6 +47,7 @@ const (
 	StateChat UIState = iota
 	StateAwaitingApproval
 	StateAwaitingShellExec
+	StateProcessing
 )
 
 type record struct {
@@ -105,6 +106,22 @@ type archDoneMsg struct {
 	Content string
 }
 
+type mutationResultMsg struct {
+	err    error
+	file   string
+	status string
+}
+
+type applyAllResultMsg struct {
+	results []mutationResultMsg
+}
+
+type shellOutputMsg struct {
+	lines []string
+}
+
+var _ tea.Msg = shellOutputMsg{}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const (
@@ -129,12 +146,18 @@ var globalCommands = []string{"/help", "/?", "/mode", "/objective", "/drop", "/q
 // ── Elegant spinner frames ────────────────────────────────────────────────────
 var spinnerFrames = []string{" ⊹ ", " ⁕ ", " ⚙ ", " ❃ ", " ❄ ", " ❆ ", " ❃ ", " ⚙ ", " ⁕ ", " ⊹ "}
 
+// providerSwitchMsg signals a successful provider switch.
+type providerSwitchMsg struct {
+	name string
+}
+
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 type model struct {
 	cfg      *config.Config
 	sess     *session.Session
 	provider ai.Provider
+	mgr      *ai.Manager
 	resolver *modes.Resolver
 	gitEng   *git.Engine
 	graphEng *graph.Engine
@@ -436,6 +459,34 @@ func (m *model) refreshViewportContent() {
 	}
 
 	m.Viewport.SetContent(content.String())
+}
+
+// computeVpHeight returns the number of terminal rows available for the
+// scrollable viewport, subtracting the fixed bottom controls (5 lines) and any
+// visible proposal dock (which renders outside the viewport between history
+// and the input line). The proposal dock needs to be subtracted from the total
+// height budget so the rendered output fits without exceeding the terminal.
+func (m *model) computeVpHeight() int {
+	proposalLines := 0
+	if m.state == StateAwaitingApproval || m.state == StateProcessing {
+		proposalLines = 4 + maxProposalDiffHeight
+	}
+	const bottomLines = 5
+	available := m.height - bottomLines - proposalLines
+	if available < 1 {
+		return 1
+	}
+	return available
+}
+
+// recalcViewportHeight recomputes and applies the viewport height when the
+// proposal dock visibility changes (state transitions) so the layout always
+// fits the terminal without overflow.
+func (m *model) recalcViewportHeight() {
+	if !m.Ready {
+		return
+	}
+	m.Viewport.Height = m.computeVpHeight()
 }
 
 // renderFlowingSpinner renders a single animated character with a smooth flowing

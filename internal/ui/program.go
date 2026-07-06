@@ -62,6 +62,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		cfg:           cfg,
 		sess:          sess,
 		provider:      provider,
+		mgr:           mgr,
 		gitEng:        eng,
 		graphEng:      graphEng,
 		graph:         g,
@@ -91,13 +92,37 @@ func bootCommon(root string, cfg *config.Config) (*session.Session, *ai.Manager,
 	_ = audit.NewLogger(root)
 
 	mgr := ai.NewManager()
-	defaultProvider := cfg.ActiveProviderName()
-	provCfg, ok := cfg.AI.Providers[defaultProvider]
-	if ok {
-		p := providers.NewOllamaProvider(provCfg.BaseURL, provCfg.APIKey, provCfg.DefaultModel)
-		mgr.Register(defaultProvider, p)
-		mgr.SetDefault(defaultProvider)
+
+	if provCfg, ok := cfg.AI.Providers["ollama"]; ok {
+		mgr.Register("ollama", providers.NewOllamaProvider(provCfg.BaseURL, provCfg.APIKey, provCfg.DefaultModel))
 	}
+
+	if apiKey := os.Getenv("ANTHROPIC_API_KEY"); apiKey != "" {
+		model := "claude-sonnet-4-20250514"
+		if provCfg, ok := cfg.AI.Providers["anthropic"]; ok && provCfg.DefaultModel != "" {
+			model = provCfg.DefaultModel
+		}
+		mgr.Register("anthropic", providers.NewClaudeProvider(apiKey, model))
+	}
+
+	if apiKey := os.Getenv("OPENAI_API_KEY"); apiKey != "" {
+		model := "gpt-4o"
+		if provCfg, ok := cfg.AI.Providers["openai"]; ok && provCfg.DefaultModel != "" {
+			model = provCfg.DefaultModel
+		}
+		mgr.Register("openai", providers.NewOpenAIProvider(apiKey, model))
+	}
+
+	if apiKey := os.Getenv("GEMINI_API_KEY"); apiKey != "" {
+		model := "gemini-1.5-pro"
+		if provCfg, ok := cfg.AI.Providers["gemini"]; ok && provCfg.DefaultModel != "" {
+			model = provCfg.DefaultModel
+		}
+		mgr.Register("gemini", providers.NewGeminiProvider(apiKey, model))
+	}
+
+	defaultProvider := cfg.ActiveProviderName()
+	mgr.SetDefault(defaultProvider)
 
 	var lc *lynx.Controller
 	if cfg.Lynx.Enabled {

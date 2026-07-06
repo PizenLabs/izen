@@ -27,6 +27,7 @@ var validSystemCommands = map[string]struct{}{
 	"/?":          {},
 	"/quit":       {},
 	"/mode":       {},
+	"/provider":   {},
 	"/objective":  {},
 	"/clear":      {},
 	"/drop":       {},
@@ -366,9 +367,10 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /review      audit changes, detect risks"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
-		m.push(roleSystem, infoStyle.Render("  /help  /mode  /objective  /drop  /clear  /quit"))
+		m.push(roleSystem, infoStyle.Render("  /help  /mode  /provider  /objective  /drop  /clear  /quit"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch"))
 		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
+		m.push(roleSystem, infoStyle.Render("  /provider <name>  switch AI provider (ollama|anthropic|openai|gemini)"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, infoStyle.Render("  @<path>  reference a file in your message"))
@@ -390,6 +392,14 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			}
 		}
 		m.push(roleSystem, infoStyle.Render("usage: /mode <ask|plan|build|investigate|review>"))
+		return nil
+
+	case strings.HasPrefix(cmd, "/provider"):
+		parts := strings.Fields(cmd)
+		if len(parts) == 2 {
+			return m.switchProvider(parts[1])
+		}
+		m.listProviders()
 		return nil
 
 	case strings.HasPrefix(cmd, "/objective"):
@@ -592,6 +602,7 @@ func (m *model) resetObjectiveContextStacks() {
 	m.awaitingConfirmation = false
 	m.acceptAll = false
 	m.state = StateChat
+	m.recalcViewportHeight()
 	m.acceptedProposals = nil
 	m.pendingShellExec = nil
 	m.shellAwaitingIdx = 0
