@@ -268,10 +268,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		delta := msg.tokenInput + msg.tokenOutput
-		deltaStr := fmt.Sprintf("%d", delta)
-		if delta >= 1000 {
-			deltaStr = fmt.Sprintf("%.1fk", float64(delta)/1000)
-		}
 		m.IsCloudModel = m.cfg.ActiveProviderName() != "ollama"
 		costStr := "$0.0000"
 		if m.IsCloudModel {
@@ -279,12 +275,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.AccumulatedCost += turnCost
 			costStr = fmt.Sprintf("$%.4f", turnCost)
 		}
-		latencyStr := ""
+		latencySec := 0.0
 		if !m.streamStartTime.IsZero() {
-			latencyStr = fmt.Sprintf("  •  %.1fs", time.Since(m.streamStartTime).Seconds())
+			latencySec = time.Since(m.streamStartTime).Seconds()
 			m.streamStartTime = time.Time{}
 		}
-		m.push(roleStatus, fmt.Sprintf("done - +%s tokens (this turn)  •  %s%s", deltaStr, costStr, latencyStr))
+		m.push(roleStatus, mutedStyle.Render(
+			fmt.Sprintf("◽ done · +%d tokens (this turn) · %s · %.1fs", delta, costStr, latencySec)))
 
 		if m.resolver.Current() == modes.ModePlan {
 			validation := plan.ValidatePlanOutput(final)
@@ -394,8 +391,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Single atomic flush: AI response + all status records in one batch.
-		return m, m.flushPendingRecords()
+		// AI response and telemetry rendered exclusively through View().
+		// No tea.Println scrollback flush — prevents double-rendering in
+		// terminal scrollback vs Bubble Tea viewport.
+		return m, nil
 
 	case streamErrMsg:
 		m.streamCh = nil
