@@ -76,16 +76,24 @@ type usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+func (p *OllamaProvider) buildMessages(req ai.Request) []ollamaMessage {
+	msgs := make([]ollamaMessage, 0, len(req.Messages)+1)
+	if req.System != "" {
+		msgs = append(msgs, ollamaMessage{Role: "system", Content: req.System})
+	}
+	for _, m := range req.Messages {
+		msgs = append(msgs, ollamaMessage{Role: m.Role, Content: m.Content})
+	}
+	return msgs
+}
+
 func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
 	}
 
-	msgs := make([]ollamaMessage, len(req.Messages))
-	for i, m := range req.Messages {
-		msgs[i] = ollamaMessage{Role: m.Role, Content: m.Content}
-	}
+	msgs := p.buildMessages(req)
 
 	body := ollamaRequest{
 		Model:    model,
@@ -160,10 +168,7 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		model = req.Model
 	}
 
-	msgs := make([]ollamaMessage, len(req.Messages))
-	for i, m := range req.Messages {
-		msgs[i] = ollamaMessage{Role: m.Role, Content: m.Content}
-	}
+	msgs := p.buildMessages(req)
 
 	body := ollamaRequest{
 		Model:    model,

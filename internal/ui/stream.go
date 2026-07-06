@@ -55,23 +55,29 @@ func (m *model) streamCmd(content string) tea.Cmd {
 
 	msgs = append(msgs, ai.Message{Role: "user", Content: content})
 
+	var systemPrompt string
 	if m.resolver.Current() == modes.ModeAsk {
-		sys := prompt.AskSystemPrompt()
-		msgs = append([]ai.Message{{Role: "system", Content: sys}}, msgs...)
+		uname := m.cfg.Username
+		if uname == "" {
+			uname = m.userName
+		}
+		if uname == "" {
+			uname = "developer"
+		}
+		systemPrompt = prompt.AskSystemPrompt(uname)
 	}
 	if m.resolver.Current() == modes.ModeBuild {
-		sys := prompt.BuildSystemPrompt()
-		msgs = append([]ai.Message{{Role: "system", Content: sys}}, msgs...)
+		systemPrompt = prompt.BuildSystemPrompt()
 	}
 	if m.resolver.Current() == modes.ModePlan {
-		sys := prompt.PlanSystemPrompt()
-		msgs = append([]ai.Message{{Role: "system", Content: sys}}, msgs...)
+		systemPrompt = prompt.PlanSystemPrompt()
 	}
 
 	req := ai.Request{
 		Model:    m.cfg.ActiveModelName(),
 		Messages: msgs,
 		Stream:   true,
+		System:   systemPrompt,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

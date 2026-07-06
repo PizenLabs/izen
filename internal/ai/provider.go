@@ -15,6 +15,7 @@ type Request struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
 	Stream   bool      `json:"stream"`
+	System   string    `json:"-"` // Explicit system prompt (top-level for Anthropic, prepended for OpenAI-compatible)
 }
 
 type Response struct {

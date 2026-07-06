@@ -150,13 +150,11 @@ var (
 	mutedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 	subtleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
 	textStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
-	cyanStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan))
 	orangeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange))
 	yellowStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow))
 	greenStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
 	accentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 	redStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRed))
-	maroonStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMaroon))
 	blueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
 
 	// Bold + color
@@ -171,6 +169,11 @@ var (
 
 	// Widget box
 	widgetTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
+
+	// Catppuccin Mocha soft interrupt indicator
+	// Active dot: Mocha Red #f38ba8, label: Mocha Maroon #eba0ac blended with muted #6c7086
+	redDotStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRed))
+	interruptLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMaroon)).Faint(true)
 
 	// Semantic renderer diff styles
 	semanticAddStyle    = lipgloss.NewStyle().Background(lipgloss.Color("#18302b")).Foreground(lipgloss.Color("#6cd0a1"))

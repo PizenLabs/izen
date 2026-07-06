@@ -25,8 +25,6 @@ var allTips = []string{
 	"Use /commit to auto-generate a semantic commit message from staged changes.",
 }
 
-var taskSpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸"}
-
 func randomTip() string {
 	return allTips[rand.Intn(len(allTips))]
 }
