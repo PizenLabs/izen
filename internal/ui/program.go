@@ -42,6 +42,11 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	execEng := execution.NewEngine(root, cfg, sess)
 	execEng.SetPlanStore(planStore)
 
+	userName := os.Getenv("USER")
+	if userName == "" {
+		userName = "developer"
+	}
+
 	m := &model{
 		cfg:           cfg,
 		sess:          sess,
@@ -57,6 +62,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		showBanner:    true,
 		IsCloudModel:  cfg.ActiveProviderName() != "ollama",
 		ContextLimit:  128000,
+		userName:      userName,
 	}
 	m.resolver.Set(sess.Mode)
 	m.loadHistory()

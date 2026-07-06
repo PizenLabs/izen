@@ -2,12 +2,14 @@ package ui
 
 import (
 	"fmt"
-	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/PizenLabs/izen/internal/modes"
 )
 
 type blockType int
@@ -27,42 +29,43 @@ type contentBlock struct {
 	raw  string
 }
 
-// View returns only the dynamic UI state at the bottom of the screen.
-// Historical chat content is flushed directly to the terminal's native
-// scrollback via tea.Println — Bubble Tea only manages the live input zone.
-//
-// Layout (strictly):
-//
-//	[Optional Dynamic TIP]            (1 line, if visible)
-//	[Streaming Content Line]          (spinner + currentStreamContent, during stream)
-//	[Prompt Input Line]               (❯ <mode> ⟩ <input>)
-//	[Telemetry Status]                (<mode> ● <model> │ <tokens>)
+// View returns the full UI state, including chat history and the prompt sandwich.
+// Historical chat content is rendered directly into the view buffer.
+// Bubble Tea manages the entire screen via this returned string.
 func (m *model) View() string {
+	if m.showHelpOverlay {
+		return m.renderHelpOverlay()
+	}
+
 	width := m.width
 	if width < 40 {
 		width = 40
 	}
 
-	var b strings.Builder
+	var s strings.Builder
+	mode := m.resolver.Current()
+	modeColor := m.modeStyle(mode)
 
-	// Optional tip of the day (shown when conversation is empty)
-	tip := m.renderTip(width)
-	if tip != "" {
-		b.WriteString(tip)
-		b.WriteByte('\n')
+	// Render History
+	userHeaderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
+	userHeader := userHeaderStyle.Render("@" + m.userName + " ")
+	for _, rec := range m.records {
+		if rec.role == roleUser {
+			s.WriteString(userHeader + rec.text + "\n")
+		} else {
+			s.WriteString(rec.text + "\n")
+		}
 	}
 
-	// Streaming content line: only visible while the LLM is actively streaming.
-	if m.streaming && len(m.currentStreamContent) > 0 {
+	// ── Optional stream line (while LLM is streaming) ────────────────
+	if m.streaming {
 		sp := m.renderFlowingSpinner()
 		streamText := m.currentStreamContent
-		// Truncate to fit terminal width, leaving room for spinner + padding.
 		maxStreamW := width - 4
 		if maxStreamW < 20 {
 			maxStreamW = 20
 		}
 		lines := strings.Split(streamText, "\n")
-		// Show the last non-empty line of the stream for live feedback.
 		lastLine := ""
 		for i := len(lines) - 1; i >= 0; i-- {
 			if strings.TrimSpace(lines[i]) != "" {
@@ -73,35 +76,177 @@ func (m *model) View() string {
 		if lipgloss.Width(lastLine) > maxStreamW {
 			lastLine = lastLine[:maxStreamW-1] + "…"
 		}
-		b.WriteString(sp + " " + lastLine + "\n")
-	} else if m.streaming && m.responseBuffer.Len() == 0 {
-		// Stream started but no chunks yet — show thinking indicator.
-		sp := m.renderFlowingSpinner()
-		b.WriteString(sp + " " + infoStyle.Render("thinking…") + "\n")
+		if streamText == "" {
+			lastLine = infoStyle.Render("thinking…")
+		}
+		s.WriteString(sp + " " + lastLine + "\n")
 	}
 
-	// Prompt input line — clean 2-line layout (no border box).
-	mode := m.resolver.Current()
-	modeLabel := modeBoldFgStyles[mode].Render("❯ " + mode.String() + " ⟩")
-	b.WriteString(modeLabel + " " + m.ti.View() + "\n")
+	// ── Dynamic user identity header ────────────────────────────────
+	s.WriteString(userHeader + "\n")
 
-	// Telemetry status line.
-	b.WriteString(m.renderRuntimeStatus(width))
+	// Component A: Conditional autocomplete dropdown (above top line)
+	if m.autocompleteActive && len(m.autocompleteItems) > 0 {
+		s.WriteString(m.renderAutocompleteDropdown(width))
+	}
+
+	// Component B: Top parallel line — dynamically colored by active mode
+	s.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
+
+	// Component C: Active input line
+	s.WriteString(modeColor.Render("❯ "+mode.String()) + " ⟩ " + m.ti.View() + "\n")
+
+	// Component D: Bottom parallel line — dynamically colored by active mode
+	s.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
+
+	// Component E: Clean telemetry (no duplicated mode label)
+	s.WriteString(m.renderRuntimeStatus(width))
+
+	return s.String()
+}
+
+// modeStyle returns the appropriate lipgloss style for a mode.
+// Core engineering modes (ask, build, investigate, review) get their
+// unique thematic color. Secondary/utils modes get unified subtle styling.
+func (m *model) modeStyle(mode modes.Mode) lipgloss.Style {
+	if isCoreEngineeringMode(mode) {
+		return modeBoldFgStyles[mode]
+	}
+	return secondaryModeStyle
+}
+
+// ── Autocomplete Dropdown ──────────────────────────────────────────────────
+
+// renderAutocompleteDropdown renders a compact border-box suggestion list
+// positioned directly above the top parallel line. For file selections (@),
+// it uses a two-column layout with filename on the left and directory on the
+// right. Command selections (/) are displayed in a simple single-column list.
+func (m *model) renderAutocompleteDropdown(width int) string {
+	if len(m.autocompleteItems) == 0 || !m.autocompleteActive {
+		return ""
+	}
+	var b strings.Builder
+	innerW := width - 4
+	if innerW < 10 {
+		innerW = 10
+	}
+
+	// Top border
+	b.WriteString(subtleStyle.Render("┌"+strings.Repeat("─", innerW)+"┐") + "\n")
+
+	maxShow := 8
+	list := m.autocompleteItems
+	if len(list) > maxShow {
+		list = list[:maxShow]
+	}
+
+	if m.autocompleteType == "file" {
+		for i, item := range list {
+			name := filepath.Base(item)
+			dir := filepath.Dir(item)
+			if dir == "." {
+				dir = ""
+			}
+
+			var icon string
+			if i == m.autocompleteIdx {
+				icon = "  ▶ "
+			} else {
+				icon = "  ◽ "
+			}
+
+			leftSide := icon + name
+			rightSide := dir + " "
+
+			// Calculate padding to right-align the directory part
+			paddingCount := m.width - lipgloss.Width(leftSide) - lipgloss.Width(rightSide) - 6
+			if paddingCount < 0 {
+				paddingCount = 0
+			}
+			rowString := leftSide + strings.Repeat(" ", paddingCount) + rightSide
+
+			var styled string
+			if i == m.autocompleteIdx {
+				styled = accentStyle.Render(rowString)
+			} else {
+				styled = dimmedStyle.Render(rowString)
+			}
+
+			if i == m.autocompleteIdx {
+				b.WriteString("│ " + styled + " │\n")
+			} else {
+				b.WriteString("│  " + styled + " │\n")
+			}
+		}
+	} else {
+		// Simple single-column layout for commands
+		for i, item := range list {
+			display := item
+			lw := lipgloss.Width(display)
+			if lw > innerW-2 {
+				display = display[:innerW-4] + "…"
+				lw = lipgloss.Width(display)
+			}
+			pad := strings.Repeat(" ", innerW-lw)
+
+			if i == m.autocompleteIdx {
+				b.WriteString("│ " + accentStyle.Render("▶ "+display) + dimmedStyle.Render(pad) + " │\n")
+			} else {
+				b.WriteString("│  " + dimmedStyle.Render(display) + dimmedStyle.Render(pad) + " │\n")
+			}
+		}
+	}
+
+	// Bottom border
+	b.WriteString(subtleStyle.Render("└"+strings.Repeat("─", innerW)+"┘") + "\n")
 
 	return b.String()
 }
 
-// ── Runtime Status ────────────────────────────────────────────────────────
+// ── Help Overlay ───────────────────────────────────────────────────────────
 
+// renderHelpOverlay displays IZEN's philosophy, operational rules, and
+// keyboard shortcuts as a full-height overlay panel.
+func (m *model) renderHelpOverlay() string {
+	lines := []string{
+		"",
+		boldAccentStyle.Render("  ⚡ IZEN  "),
+		textStyle.Render("  engineering intelligence · human in control"),
+		"",
+		subtleStyle.Render("  ─── Modes ───"),
+		"  " + accentStyle.Render("/ask") + "         " + dimmedStyle.Render("explain, inspect, understand"),
+		"  " + orangeStyle.Render("/plan") + "        " + dimmedStyle.Render("break down, structure, design"),
+		"  " + blueStyle.Render("/build") + "       " + dimmedStyle.Render("implement, refactor, elevate"),
+		"  " + greenStyle.Render("/investigate") + "  " + dimmedStyle.Render("debug, trace, root-cause"),
+		"  " + yellowStyle.Render("/review") + "      " + dimmedStyle.Render("analyze, critique, improve"),
+		"",
+		subtleStyle.Render("  ─── Commands ───"),
+		"  " + dimmedStyle.Render("/help  /?  /mode  /objective  /clear  /drop  /undo"),
+		"  " + dimmedStyle.Render("/commit  /checkpoint  /arch  /quit"),
+		"  " + dimmedStyle.Render("!<cmd>          run a shell command"),
+		"  " + dimmedStyle.Render("@<path>         attach a file"),
+		"",
+		subtleStyle.Render("  ─── Shortcuts ───"),
+		"  " + dimmedStyle.Render("Esc (×3)        quit IZEN"),
+		"  " + dimmedStyle.Render("↑/↓             history navigation"),
+		"  " + dimmedStyle.Render("Tab/Enter       complete autocomplete"),
+		"  " + dimmedStyle.Render("?               toggle this help overlay"),
+		"",
+		mutedStyle.Render("  press " + boldTextStyle.Render("Esc") + " or " + boldTextStyle.Render("?") + " to close"),
+		"",
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// ── Runtime Status ────────────────────────────────────────────────────
+
+// renderRuntimeStatus renders a single telemetry line with zero duplication.
+// Format: ● <model> │ <tokens> tkn
 func (m *model) renderRuntimeStatus(width int) string {
 	var b strings.Builder
 
-	// Mode prefix + state icon
-	mode := m.resolver.Current()
-	b.WriteString(modeBoldFgStyles[mode].Render(mode.String() + " ❯"))
-
-	b.WriteByte(' ')
-
+	// Streaming/agent spinner or idle bullet
 	if m.streaming || m.agentRunning {
 		idx := m.spinnerFrame % len(taskSpinnerFrames)
 		b.WriteString(cyanStyle.Render(taskSpinnerFrames[idx]))
@@ -114,8 +259,7 @@ func (m *model) renderRuntimeStatus(width int) string {
 	b.WriteString(dimmedStyle.Render(m.cfg.ActiveModelName()))
 
 	// Separator
-	sep := dimmedStyle.Render(" │ ")
-	b.WriteString(sep)
+	b.WriteString(dimmedStyle.Render(" │ "))
 
 	// Tokens
 	if m.TotalTokens > 0 {
@@ -131,14 +275,14 @@ func (m *model) renderRuntimeStatus(width int) string {
 		if len(cp) > 7 {
 			cp = cp[:7]
 		}
-		b.WriteString(sep)
+		b.WriteString(dimmedStyle.Render(" │ "))
 		b.WriteString(dimmedStyle.Render("cp-" + cp))
 	}
 
 	return b.String()
 }
 
-// ── Startup banner ────────────────────────────────────────────────────────
+// ── Startup banner ────────────────────────────────────────────────────
 
 var bannerModes = []struct{ name, desc string }{
 	{"/ask", "explain, inspect, understand"},
@@ -148,10 +292,10 @@ var bannerModes = []struct{ name, desc string }{
 	{"/review", "analyze, critique, improve"},
 }
 
-func getGreeting() string {
-	userName := os.Getenv("USER")
+func (m *model) getGreeting() string {
+	userName := m.userName
 	if userName == "" {
-		userName = "User"
+		userName = "developer"
 	}
 	hour := time.Now().Hour()
 	switch {
@@ -185,10 +329,11 @@ func (m *model) renderStartupBanner(termWidth int) string {
 
 	rightCol := make([]string, 0, 5+len(bannerModes))
 	rightCol = append(rightCol,
-		boldAccentStyle.Render(getGreeting()),
+		boldAccentStyle.Render(m.getGreeting()),
 		boldAccentStyle.Render("IZEN"),
 		textStyle.Render("engineering intelligence."),
 		textStyle.Render("human in control."),
+		"",
 		"",
 	)
 	for _, mode := range bannerModes {
@@ -244,7 +389,7 @@ func padRight(s string, n int) string {
 	return s + strings.Repeat(" ", n-sw)
 }
 
-// ── Record renderer (for viewport content) ────────────────────────────────
+// ── Record renderer (for viewport content) ────────────────────
 
 func (m *model) printRecord(rec record) string {
 	gutter := gutterFor(rec.role)
@@ -302,7 +447,7 @@ func (m *model) printRecord(rec record) string {
 	case roleUser:
 		styledLines := make([]string, len(wrappedLines))
 		for i, line := range wrappedLines {
-			styledLines[i] = gutter + textStyle.Render(line)
+			styledLines[i] = userBgStyle.Render(" " + line)
 		}
 		return strings.Join(styledLines, "\n")
 	case roleError:
@@ -326,9 +471,9 @@ func (m *model) printRecord(rec record) string {
 	}
 }
 
-// ── AST Trace Renderer ────────────────────────────────────────────────────
+// ── AST Trace Renderer ────────────────────────────────────────────
 
-// ── Widget Box & Semantic Renderers ───────────────────────────────────────
+// ── Widget Box & Semantic Renderers ───────────────────────────────────
 
 func renderWidget(title string, content string, width int, accentHex string) string {
 	if width < 10 {

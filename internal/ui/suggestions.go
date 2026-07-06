@@ -12,6 +12,7 @@ func (m *model) dismissSuggestions() {
 	m.suggestionType = ""
 	m.suggestions = nil
 	m.suggestionIdx = 0
+	m.syncAutocompleteFromSuggestions()
 }
 
 func (m *model) updateSuggestions() {
@@ -28,6 +29,7 @@ func (m *model) updateSuggestions() {
 		if len(m.suggestions) == 1 && m.suggestions[0] == current {
 			m.showSuggestions = false
 		}
+		m.syncAutocompleteFromSuggestions()
 		return
 	}
 	atIdx := strings.LastIndex(current, "@")
@@ -41,16 +43,97 @@ func (m *model) updateSuggestions() {
 			if len(m.suggestions) == 1 && m.suggestions[0] == prefix {
 				m.showSuggestions = false
 			}
+			m.syncAutocompleteFromSuggestions()
 			return
 		}
 	}
 	m.dismissSuggestions()
 }
 
+// syncAutocompleteFromSuggestions bridges the old suggestion system to the new
+// Prompt Sandwich autocomplete state so the dropdown renderer can read from
+// autocompleteActive / autocompleteItems / autocompleteIdx directly.
+func (m *model) syncAutocompleteFromSuggestions() {
+	m.autocompleteActive = m.showSuggestions
+	m.autocompleteType = m.suggestionType
+	m.autocompleteItems = m.suggestions
+	m.autocompleteIdx = m.suggestionIdx
+}
+
+// dismissAutocomplete cleanly closes the dropdown and clears both state systems.
+func (m *model) dismissAutocomplete() {
+	m.autocompleteActive = false
+	m.autocompleteType = ""
+	m.autocompleteItems = nil
+	m.autocompleteIdx = 0
+	m.dismissSuggestions()
+}
+
+// navigateAutocomplete moves the dropdown highlight by dir (+1 or -1).
+func (m *model) navigateAutocomplete(dir int) {
+	if !m.autocompleteActive || len(m.autocompleteItems) == 0 {
+		return
+	}
+	total := len(m.autocompleteItems)
+	m.autocompleteIdx = (m.autocompleteIdx + dir) % total
+	if m.autocompleteIdx < 0 {
+		m.autocompleteIdx += total
+	}
+}
+
+// completeAutocomplete replaces the input buffer with the highlighted item,
+// appends a trailing space, advances the cursor to the end of the buffer,
+// then dismisses the dropdown.
+func (m *model) completeAutocomplete() {
+	if !m.autocompleteActive || len(m.autocompleteItems) == 0 {
+		return
+	}
+	sel := m.autocompleteItems[m.autocompleteIdx]
+	val := m.ti.Value()
+
+	switch m.autocompleteType {
+	case "file":
+		atIdx := strings.LastIndex(val, "@")
+		if atIdx >= 0 {
+			newVal := val[:atIdx] + sel + " "
+			m.ti.SetValue(newVal)
+			m.ti.CursorEnd()
+			m.pendingFileRefs = append(m.pendingFileRefs, sel)
+			m.attachedFiles = append(m.attachedFiles, sel)
+		}
+	case "command":
+		slashIdx := strings.LastIndex(val, "/")
+		if slashIdx >= 0 {
+			newVal := val[:slashIdx] + sel + " "
+			m.ti.SetValue(newVal)
+			m.ti.CursorEnd()
+		}
+	}
+
+	m.autocompleteActive = false
+	m.syncInputFromTI()
+}
+
+func fuzzyMatch(pattern, target string) bool {
+	pattern = strings.ToLower(pattern)
+	target = strings.ToLower(target)
+	pi := 0
+	for ti := 0; pi < len(pattern) && ti < len(target); ti++ {
+		if pattern[pi] == target[ti] {
+			pi++
+		}
+	}
+	return pi == len(pattern)
+}
+
 func (m *model) filterCommands(prefix string) []string {
 	var result []string
 	matches := func(cmd string) bool {
-		return prefix == "" || strings.HasPrefix(cmd, "/"+prefix)
+		if prefix == "" {
+			return true
+		}
+		cmdName := strings.TrimPrefix(cmd, "/")
+		return strings.HasPrefix(cmdName, prefix) || fuzzyMatch(prefix, cmdName)
 	}
 	currentMode := m.resolver.Current()
 	for _, c := range coreModes {
@@ -117,7 +200,7 @@ func filterFilesRecursive(prefix string) []string {
 
 		rel := strings.TrimPrefix(path, "./")
 
-		if prefix == "" || strings.HasPrefix(rel, prefix) || strings.Contains(strings.ToLower(rel), strings.ToLower(prefix)) {
+		if prefix == "" || strings.HasPrefix(rel, prefix) || strings.Contains(strings.ToLower(rel), strings.ToLower(prefix)) || fuzzyMatch(prefix, rel) {
 			results = append(results, rel)
 		}
 		return nil

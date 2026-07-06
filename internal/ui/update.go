@@ -147,17 +147,39 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case smoothStreamTickMsg:
+		if len(m.streamBuffer) > 0 {
+			emit := 2
+			if emit > len(m.streamBuffer) {
+				emit = len(m.streamBuffer)
+			}
+			m.currentStreamContent += m.streamBuffer[:emit]
+			m.streamBuffer = m.streamBuffer[emit:]
+		}
+		if len(m.streamBuffer) > 0 {
+			return m, m.smoothStreamTickCmd()
+		}
+		m.streamTickActive = false
+		return m, nil
+
 	case tokenMsg:
 		raw := string(msg)
 		m.responseBuffer.WriteString(raw)
-		m.currentStreamContent += raw
+		m.streamBuffer += raw
 		if m.streamParser != nil {
 			m.streamParser.ProcessChunk(raw)
+		}
+		var cmds []tea.Cmd
+		cmds = append(cmds, m.readStream())
+		if !m.streamTickActive {
+			m.streamTickActive = true
+			cmds = append(cmds, m.smoothStreamTickCmd())
 		}
 		// Keep cursor blink alive during streaming
 		var tiCmd tea.Cmd
 		m.ti, tiCmd = m.ti.Update(msg)
-		return m, tea.Batch(m.readStream(), tiCmd)
+		cmds = append(cmds, tiCmd)
+		return m, tea.Batch(cmds...)
 
 	case streamDoneMsg:
 		m.streamCh = nil
@@ -166,6 +188,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.streamParser != nil {
 			m.streamParser.Flush()
 			m.streamParser = nil
+		}
+
+		// Flush any remaining buffered stream content
+		if m.streamTickActive {
+			m.currentStreamContent += m.streamBuffer
+			m.streamBuffer = ""
+			m.streamTickActive = false
 		}
 
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
@@ -250,7 +279,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.AccumulatedCost += turnCost
 			costStr = fmt.Sprintf("$%.4f", turnCost)
 		}
-		m.push(roleStatus, fmt.Sprintf("done - +%s tokens (this turn)  •  %s", deltaStr, costStr))
+		latencyStr := ""
+		if !m.streamStartTime.IsZero() {
+			latencyStr = fmt.Sprintf("  •  %.1fs", time.Since(m.streamStartTime).Seconds())
+			m.streamStartTime = time.Time{}
+		}
+		m.push(roleStatus, fmt.Sprintf("done - +%s tokens (this turn)  •  %s%s", deltaStr, costStr, latencyStr))
 
 		if m.resolver.Current() == modes.ModePlan {
 			validation := plan.ValidatePlanOutput(final)
@@ -341,6 +375,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						proposalMsg += fmt.Sprintf("\n    • %s", p.Target.QualifiedName)
 					}
 					m.push(roleSystem, infoStyle.Render(proposalMsg))
+					modeColor := m.modeStyle(m.resolver.Current())
+					m.push(roleSystem, modeColor.Render("  [A] Accept  [L] Allow All  [R] Reject"))
 				}
 			}
 			m.sess.ClearTasks()
@@ -398,7 +434,45 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showBanner = false
 		}
 
-		if !m.showSuggestions && !m.streaming && !m.agentRunning {
+		// ── '?' help toggle (only when input buffer is empty) ────────────
+		if msg.String() == "?" && strings.TrimSpace(m.ti.Value()) == "" {
+			m.showHelpOverlay = !m.showHelpOverlay
+			return m, nil
+		}
+		if m.showHelpOverlay {
+			if msg.String() == "?" || msg.Type == tea.KeyEscape {
+				m.showHelpOverlay = false
+				return m, nil
+			}
+			// Block all other input while help is showing
+			return m, nil
+		}
+
+		// ── Autocomplete active: intercept navigation / dismissal ──────
+		if m.autocompleteActive && len(m.autocompleteItems) > 0 {
+			switch msg.Type {
+			case tea.KeyEscape:
+				m.dismissAutocomplete()
+				return m, nil
+			case tea.KeyUp:
+				m.navigateAutocomplete(-1)
+				return m, nil
+			case tea.KeyDown:
+				m.navigateAutocomplete(1)
+				return m, nil
+			case tea.KeyTab:
+				m.completeAutocomplete()
+				return m, nil
+			case tea.KeyEnter:
+				m.completeAutocomplete()
+				return m, nil
+			case tea.KeySpace:
+				m.dismissAutocomplete()
+				// fall through so space inserts into textinput
+			}
+		}
+
+		if !m.autocompleteActive && !m.streaming && !m.agentRunning {
 			switch msg.Type {
 			case tea.KeyUp:
 				if len(m.history) > 0 {
@@ -455,6 +529,12 @@ func (m *model) spinnerTickCmd() tea.Cmd {
 	}
 
 	return tea.Tick(delay, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func (m *model) smoothStreamTickCmd() tea.Cmd {
+	return tea.Tick(20*time.Millisecond, func(t time.Time) tea.Msg {
+		return smoothStreamTickMsg(t)
+	})
 }
 
 func compileTaskListMarkdown(tasks *[]plan.Task) string {

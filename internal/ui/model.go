@@ -68,6 +68,8 @@ type streamErrMsg struct{ err error }
 
 type tickMsg time.Time
 
+type smoothStreamTickMsg time.Time
+
 type investigateResultMsg struct {
 	records           []record
 	sessionKey        string
@@ -159,7 +161,10 @@ type model struct {
 	AccumulatedCost float64
 	CheckpointID    string
 
-	streamParser *IncrementalStreamParser
+	streamParser     *IncrementalStreamParser
+	streamBuffer     string // buffered tokens for smooth tick emission
+	streamTickActive bool   // whether smooth-stream tick is active
+	userName         string // dynamic system username (set at init)
 
 	// Agent state
 	agentRunning bool
@@ -171,6 +176,12 @@ type model struct {
 	suggestionType  string
 	suggestions     []string
 	suggestionIdx   int
+
+	// Autocomplete (Prompt Sandwich dropdown)
+	autocompleteActive bool
+	autocompleteType   string   // "file" or "command"
+	autocompleteItems  []string // filtered matching items
+	autocompleteIdx    int      // currently highlighted index
 
 	// File context
 	pendingFileRefs []string
@@ -226,9 +237,16 @@ type model struct {
 	// Tip of the Day
 	currentTip string
 
+	// Help overlay toggle
+	showHelpOverlay bool
+
 	// Last apply error for the red error bar
 	lastApplyError string
 	applyErrorTime time.Time
+
+	// Latency telemetry: marked when a turn is submitted, read back when the
+	// stream completes to compute this-turn latency for the status line.
+	streamStartTime time.Time
 }
 
 // ── Rendering helpers ─────────────────────────────────────────────────────────

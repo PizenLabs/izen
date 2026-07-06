@@ -113,7 +113,6 @@ func modeAccentColor(m modes.Mode) lipgloss.Color { return modeLineColor(m) }
 var (
 	outputStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 	labelBoldStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
-	promptStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorAccent))
 	infoStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 	errorStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
 
@@ -130,8 +129,6 @@ var (
 	gutterErrorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterError))
 	gutterStatusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterStatus))
 	gutterSysStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterSystem))
-
-	labelUserStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGutterUser))
 
 	// Code highlight
 	hlCodeBg = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Background(lipgloss.Color(colorOverlay))
@@ -154,6 +151,7 @@ var (
 	textStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 	cyanStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan))
 	orangeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange))
+	yellowStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow))
 	greenStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
 	accentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 	redStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRed))
@@ -188,7 +186,15 @@ var (
 		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeInvestigate)),
 		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeReview)),
 	}
+	// Secondary/utils mode style — unified subtle color for non-core modes.
+	secondaryModeStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMuted))
 )
+
+// isCoreEngineeringMode returns true for /ask, /build, /investigate, /review.
+func isCoreEngineeringMode(m modes.Mode) bool {
+	return m == modes.ModeAsk || m == modes.ModeBuild ||
+		m == modes.ModeInvestigate || m == modes.ModeReview
+}
 
 // Pre-compiled Markdown renderer styles (render-path — zero NewStyle).
 var (
@@ -218,6 +224,9 @@ var (
 		"CAUTION":   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#fab387")),
 	}
 )
+
+// User message background (clean shaded surface, no gutter pipes)
+var userBgStyle = lipgloss.NewStyle().Background(lipgloss.Color(colorSurface)).PaddingLeft(1)
 
 // ── Gutter / Label Helpers ────────────────────────────────────────────────────
 
