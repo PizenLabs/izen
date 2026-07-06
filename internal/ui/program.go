@@ -42,6 +42,11 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	execEng := execution.NewEngine(root, cfg, sess)
 	execEng.SetPlanStore(planStore)
 
+	userName := os.Getenv("USER")
+	if userName == "" {
+		userName = "developer"
+	}
+
 	m := &model{
 		cfg:           cfg,
 		sess:          sess,
@@ -55,20 +60,21 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		planStore:     planStore,
 		ti:            ti,
 		showBanner:    true,
-		animBuffer:    NewAnimBuffer(DefaultAnimationConfig()),
 		IsCloudModel:  cfg.ActiveProviderName() != "ollama",
 		ContextLimit:  128000,
+		userName:      userName,
 	}
 	m.resolver.Set(sess.Mode)
 	m.loadHistory()
 	m.historyIndex = len(m.history)
 
-	opts := []tea.ProgramOption{
-		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
-	}
+	// Print the static welcome header once on startup so the terminal's
+	// native scrollback captures it permanently.
+	fmt.Println()
+	fmt.Println(m.renderStartupBanner(120))
+	fmt.Println()
 
-	return tea.NewProgram(m, opts...)
+	return tea.NewProgram(m)
 }
 
 func bootCommon(root string, cfg *config.Config) (*session.Session, *ai.Manager, *lynx.Controller) {

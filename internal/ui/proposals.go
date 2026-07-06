@@ -383,7 +383,8 @@ func (m *model) applySingleProposal() tea.Cmd {
 	} else {
 		// Minimal next-proposal notification — no full diff bloat
 		m.push(roleSystem, infoStyle.Render("next: "+m.pendingProposals[0].Target.QualifiedName))
-		m.push(roleSystem, infoStyle.Render("  [A] Accept  [L] Allow All  [R] Reject"))
+		modeColor := m.modeStyle(m.resolver.Current())
+		m.push(roleSystem, modeColor.Render("  [A] Accept  [L] Allow All  [R] Reject"))
 	}
 	return nil
 }

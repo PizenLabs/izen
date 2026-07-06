@@ -8,21 +8,14 @@ import (
 )
 
 func (m *model) dismissSuggestions() {
-	prevHeight := m.suggestionPaletteHeight()
-
 	m.showSuggestions = false
 	m.suggestionType = ""
 	m.suggestions = nil
 	m.suggestionIdx = 0
-
-	if m.vpReady && prevHeight != m.suggestionPaletteHeight() {
-		m.rebuildViewport()
-	}
+	m.syncAutocompleteFromSuggestions()
 }
 
 func (m *model) updateSuggestions() {
-	prevHeight := m.suggestionPaletteHeight()
-
 	current := m.input.String()
 	if current == "" {
 		m.dismissSuggestions()
@@ -36,9 +29,7 @@ func (m *model) updateSuggestions() {
 		if len(m.suggestions) == 1 && m.suggestions[0] == current {
 			m.showSuggestions = false
 		}
-		if m.vpReady && prevHeight != m.suggestionPaletteHeight() {
-			m.rebuildViewport()
-		}
+		m.syncAutocompleteFromSuggestions()
 		return
 	}
 	atIdx := strings.LastIndex(current, "@")
@@ -52,19 +43,97 @@ func (m *model) updateSuggestions() {
 			if len(m.suggestions) == 1 && m.suggestions[0] == prefix {
 				m.showSuggestions = false
 			}
-			if m.vpReady && prevHeight != m.suggestionPaletteHeight() {
-				m.rebuildViewport()
-			}
+			m.syncAutocompleteFromSuggestions()
 			return
 		}
 	}
 	m.dismissSuggestions()
 }
 
+// syncAutocompleteFromSuggestions bridges the old suggestion system to the new
+// Prompt Sandwich autocomplete state so the dropdown renderer can read from
+// autocompleteActive / autocompleteItems / autocompleteIdx directly.
+func (m *model) syncAutocompleteFromSuggestions() {
+	m.autocompleteActive = m.showSuggestions
+	m.autocompleteType = m.suggestionType
+	m.autocompleteItems = m.suggestions
+	m.autocompleteIdx = m.suggestionIdx
+}
+
+// dismissAutocomplete cleanly closes the dropdown and clears both state systems.
+func (m *model) dismissAutocomplete() {
+	m.autocompleteActive = false
+	m.autocompleteType = ""
+	m.autocompleteItems = nil
+	m.autocompleteIdx = 0
+	m.dismissSuggestions()
+}
+
+// navigateAutocomplete moves the dropdown highlight by dir (+1 or -1).
+func (m *model) navigateAutocomplete(dir int) {
+	if !m.autocompleteActive || len(m.autocompleteItems) == 0 {
+		return
+	}
+	total := len(m.autocompleteItems)
+	m.autocompleteIdx = (m.autocompleteIdx + dir) % total
+	if m.autocompleteIdx < 0 {
+		m.autocompleteIdx += total
+	}
+}
+
+// completeAutocomplete replaces the input buffer with the highlighted item,
+// appends a trailing space, advances the cursor to the end of the buffer,
+// then dismisses the dropdown.
+func (m *model) completeAutocomplete() {
+	if !m.autocompleteActive || len(m.autocompleteItems) == 0 {
+		return
+	}
+	sel := m.autocompleteItems[m.autocompleteIdx]
+	val := m.ti.Value()
+
+	switch m.autocompleteType {
+	case "file":
+		atIdx := strings.LastIndex(val, "@")
+		if atIdx >= 0 {
+			newVal := val[:atIdx] + sel + " "
+			m.ti.SetValue(newVal)
+			m.ti.CursorEnd()
+			m.pendingFileRefs = append(m.pendingFileRefs, sel)
+			m.attachedFiles = append(m.attachedFiles, sel)
+		}
+	case "command":
+		slashIdx := strings.LastIndex(val, "/")
+		if slashIdx >= 0 {
+			newVal := val[:slashIdx] + sel + " "
+			m.ti.SetValue(newVal)
+			m.ti.CursorEnd()
+		}
+	}
+
+	m.autocompleteActive = false
+	m.syncInputFromTI()
+}
+
+func fuzzyMatch(pattern, target string) bool {
+	pattern = strings.ToLower(pattern)
+	target = strings.ToLower(target)
+	pi := 0
+	for ti := 0; pi < len(pattern) && ti < len(target); ti++ {
+		if pattern[pi] == target[ti] {
+			pi++
+		}
+	}
+	return pi == len(pattern)
+}
+
 func (m *model) filterCommands(prefix string) []string {
 	var result []string
 	matches := func(cmd string) bool {
-		return prefix == "" || strings.HasPrefix(cmd, "/"+prefix)
+		if prefix == "" {
+			return true
+		}
+		cmdName := strings.TrimPrefix(cmd, "/")
+		return strings.HasPrefix(cmdName, prefix) || fuzzyMatch(prefix, cmdName)
 	}
 	currentMode := m.resolver.Current()
 	for _, c := range coreModes {
@@ -131,7 +200,7 @@ func filterFilesRecursive(prefix string) []string {
 
 		rel := strings.TrimPrefix(path, "./")
 
-		if prefix == "" || strings.HasPrefix(rel, prefix) || strings.Contains(strings.ToLower(rel), strings.ToLower(prefix)) {
+		if prefix == "" || strings.HasPrefix(rel, prefix) || strings.Contains(strings.ToLower(rel), strings.ToLower(prefix)) || fuzzyMatch(prefix, rel) {
 			results = append(results, rel)
 		}
 		return nil
@@ -150,92 +219,4 @@ func filterFilesRecursive(prefix string) []string {
 		results = results[:limit]
 	}
 	return results
-}
-
-func (m *model) renderSuggestions(width int) string {
-	maxVisible := 6
-	items := m.suggestions
-	if len(items) > maxVisible {
-		items = items[:maxVisible]
-	}
-
-	var inner strings.Builder
-
-	if m.suggestionType == "@" {
-		maxBase := 0
-		for _, s := range items {
-			if n := len(filepath.Base(s)); n > maxBase {
-				maxBase = n
-			}
-		}
-		gap := 2
-		if maxBase < 10 {
-			maxBase = 10
-		}
-
-		inner.WriteString(paletteSectionStyle.Render("files"))
-		inner.WriteString("\n")
-		for i, s := range items {
-			base := filepath.Base(s)
-			dir := s
-			if filepath.Dir(s) == "." {
-				dir = ""
-			}
-			padded := base + strings.Repeat(" ", maxBase-len(base)+gap)
-
-			if i == m.suggestionIdx {
-				inner.WriteString(paletteSelectedStyle.Render("❯ " + padded))
-				if dir != "" {
-					inner.WriteString(paletteSelectedPath.Render(dir))
-				}
-			} else {
-				inner.WriteString(paletteItemStyle.Render("  " + padded))
-				if dir != "" {
-					inner.WriteString(palettePathStyle.Render(dir))
-				}
-			}
-			inner.WriteString("\n")
-		}
-	} else {
-		inner.WriteString(paletteSectionStyle.Render("commands"))
-		inner.WriteString("\n")
-
-		prevCat := ""
-		for i, s := range items {
-			cat := cmdCategory(s)
-			if cat != prevCat {
-				prevCat = cat
-				var label string
-				switch cat {
-				case "core":
-					label = "modes"
-				case "utility":
-					label = m.resolver.Current().String()
-				case "global":
-					label = "global"
-				}
-				inner.WriteString(paletteSectionStyle.Render("  " + label))
-				inner.WriteString("\n")
-			}
-
-			baseStyle := paletteItemStyle
-			if cat == "core" {
-				baseStyle = paletteCoreItemStyle
-			}
-			if i == m.suggestionIdx {
-				inner.WriteString(paletteSelectedStyle.Render(" ❯ " + s))
-			} else {
-				inner.WriteString(baseStyle.Render("   " + s))
-			}
-			inner.WriteString("\n")
-		}
-	}
-
-	inner.WriteString(paletteHintStyle.Render("tab · enter · esc"))
-
-	boxWidth := 48
-	if width < boxWidth+4 {
-		boxWidth = width - 4
-	}
-	return paletteBoxStyle.Width(boxWidth).Render(inner.String())
 }

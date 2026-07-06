@@ -2,8 +2,6 @@ package ui
 
 import (
 	"math/rand"
-
-	"github.com/charmbracelet/lipgloss"
 )
 
 var allTips = []string{
@@ -31,27 +29,4 @@ var taskSpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸"}
 
 func randomTip() string {
 	return allTips[rand.Intn(len(allTips))]
-}
-
-func (m *model) renderTip(width int) string {
-	if m.currentTip == "" {
-		return ""
-	}
-
-	header := dimmedStyle.Render("▐ ") + mutedStyle.Render("💡 TIP: ")
-	body := dimmedStyle.Render(m.currentTip)
-	line := header + body
-
-	avail := width - 2
-	if lipgloss.Width(line) > avail {
-		trunc := lipgloss.Width(header + body)
-		diff := trunc - avail + 1
-		bodyRunes := []rune(m.currentTip)
-		if len(bodyRunes) > diff {
-			body = dimmedStyle.Render(string(bodyRunes[:len(bodyRunes)-diff]) + "…")
-		}
-		line = header + body
-	}
-
-	return " " + line
 }

@@ -2,13 +2,14 @@ package ui
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/PizenLabs/izen/internal/modes"
 )
 
 type blockType int
@@ -28,14 +29,12 @@ type contentBlock struct {
 	raw  string
 }
 
-// View renders the entire multi-pane TUI architecture layout.
-// The layout is split into two zones separated by a vertical spacer:
-//   - Dynamic zone: viewport (scrollable chat history + proposal diffs)
-//   - Static footer zone: action line, suggestions, error bar, focus line,
-//     prompt box, runtime status, footer — pinned to the absolute bottom.
+// View returns the full UI state, including chat history and the prompt sandwich.
+// Historical chat content is rendered directly into the view buffer.
+// Bubble Tea manages the entire screen via this returned string.
 func (m *model) View() string {
-	if !m.vpReady {
-		return "initializing…"
+	if m.showHelpOverlay {
+		return m.renderHelpOverlay()
 	}
 
 	width := m.width
@@ -43,116 +42,211 @@ func (m *model) View() string {
 		width = 40
 	}
 
-	// ── Dynamic zone (scrollable) ────────────────────────────────────────
-	viewportView := m.vp.View()
+	var s strings.Builder
+	mode := m.resolver.Current()
+	modeColor := m.modeStyle(mode)
 
-	// ── Static footer zone (flat strings.Builder — no nested layouts) ────
-	var b strings.Builder
-
-	if m.showSuggestions && len(m.suggestions) > 0 {
-		b.WriteString(m.renderSuggestions(width))
-		b.WriteByte('\n')
+	// Render History
+	userHeaderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
+	userHeader := userHeaderStyle.Render("@" + m.userName + " ")
+	for _, rec := range m.records {
+		if rec.role == roleUser {
+			s.WriteString(userHeader + rec.text + "\n")
+		} else {
+			s.WriteString(rec.text + "\n")
+		}
 	}
 
-	if actionLine := m.renderActionLine(width); actionLine != "" {
-		b.WriteString(actionLine)
-		b.WriteByte('\n')
+	// ── Optional stream line (while LLM is streaming) ────────────────
+	if m.streaming {
+		sp := m.renderFlowingSpinner()
+		streamText := m.currentStreamContent
+		maxStreamW := width - 4
+		if maxStreamW < 20 {
+			maxStreamW = 20
+		}
+		lines := strings.Split(streamText, "\n")
+		lastLine := ""
+		for i := len(lines) - 1; i >= 0; i-- {
+			if strings.TrimSpace(lines[i]) != "" {
+				lastLine = lines[i]
+				break
+			}
+		}
+		if lipgloss.Width(lastLine) > maxStreamW {
+			lastLine = lastLine[:maxStreamW-1] + "…"
+		}
+		if streamText == "" {
+			lastLine = infoStyle.Render("thinking…")
+		}
+		s.WriteString(sp + " " + lastLine + "\n")
 	}
 
-	if errorBar := m.renderErrorBar(width); errorBar != "" {
-		b.WriteString(errorBar)
-		b.WriteByte('\n')
+	// ── Dynamic user identity header ────────────────────────────────
+	s.WriteString(userHeader + "\n")
+
+	// Component A: Conditional autocomplete dropdown (above top line)
+	if m.autocompleteActive && len(m.autocompleteItems) > 0 {
+		s.WriteString(m.renderAutocompleteDropdown(width))
 	}
 
-	b.WriteString(m.renderFocusLine(width))
-	b.WriteByte('\n')
-	b.WriteString(m.renderPromptBox(width))
-	b.WriteByte('\n')
-	b.WriteString(m.renderRuntimeStatus(width))
+	// Component B: Top parallel line — dynamically colored by active mode
+	s.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
 
-	// Infrastructure guardrail: subtle border separating operational zone
-	// from background safety metrics (sandbox, model, tokens).
-	b.WriteByte('\n')
-	b.WriteString(subtleStyle.Render(strings.Repeat("─", width)))
-	b.WriteByte('\n')
+	// Component C: Active input line
+	s.WriteString(modeColor.Render("❯ "+mode.String()) + " ⟩ " + m.ti.View() + "\n")
 
-	b.WriteString(m.renderFooter(width))
+	// Component D: Bottom parallel line — dynamically colored by active mode
+	s.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
 
-	footerView := b.String()
+	// Component E: Clean telemetry (no duplicated mode label)
+	s.WriteString(m.renderRuntimeStatus(width))
 
-	// ── Vertical spacer: push footer to absolute terminal bottom ─────────
-	viewportH := len(strings.Split(viewportView, "\n"))
-	footerH := len(strings.Split(footerView, "\n"))
-	extraLinesNeeded := m.height - viewportH - footerH
-	if extraLinesNeeded > 0 {
-		return viewportView + strings.Repeat("\n", extraLinesNeeded) + footerView
-	}
-
-	return viewportView + "\n" + footerView
+	return s.String()
 }
 
-// renderActionLine renders a single-line keybinding hint for the active proposal,
-// shell execution, or running agent. Returns empty string when no action is pending.
-func (m *model) renderActionLine(width int) string {
-	switch {
-	case m.state == StateAwaitingShellExec && len(m.pendingShellExec) > 0:
-		return dimmedStyle.Render("[A] Execute  [R] Skip")
-	case m.state == StateAwaitingApproval && len(m.pendingProposals) > 0:
-		toggleHint := "[P] Expand"
-		if m.pendingProposals[0].Expanded {
-			toggleHint = "[P] Collapse"
-		}
-		return dimmedStyle.Render("[A] Accept  [L] Allow All  [R] Reject  " + toggleHint)
-	case m.agentRunning:
-		return dimmedStyle.Render("● Running task: " + m.agentLabel + "…")
-	default:
+// modeStyle returns the appropriate lipgloss style for a mode.
+// Core engineering modes (ask, build, investigate, review) get their
+// unique thematic color. Secondary/utils modes get unified subtle styling.
+func (m *model) modeStyle(mode modes.Mode) lipgloss.Style {
+	if isCoreEngineeringMode(mode) {
+		return modeBoldFgStyles[mode]
+	}
+	return secondaryModeStyle
+}
+
+// ── Autocomplete Dropdown ──────────────────────────────────────────────────
+
+// renderAutocompleteDropdown renders a compact border-box suggestion list
+// positioned directly above the top parallel line. For file selections (@),
+// it uses a two-column layout with filename on the left and directory on the
+// right. Command selections (/) are displayed in a simple single-column list.
+func (m *model) renderAutocompleteDropdown(width int) string {
+	if len(m.autocompleteItems) == 0 || !m.autocompleteActive {
 		return ""
 	}
-}
-
-// ── Focus line ────────────────────────────────────────────────────────────
-
-func (m *model) renderFocusLine(width int) string {
-	style := modeFocusLineStyles[m.resolver.Current()]
-	return style.Render(strings.Repeat("─", width))
-}
-
-// ── Prompt box ────────────────────────────────────────────────────────────
-
-func (m *model) renderPromptBox(width int) string {
-	mode := m.resolver.Current()
-
-	prefix := modeBoldFgStyles[mode].Render(mode.String() + " ❯")
-
-	var inner string
-	switch {
-	case m.agentRunning:
-		sp := m.renderFlowingSpinner()
-		label := yellowStyle.Render(m.agentLabel + "…")
-		inner = prefix + " " + sp + "  " + label
-	case m.streaming && m.responseBuffer.Len() == 0:
-		sp := m.renderFlowingSpinner()
-		inner = prefix + " " + sp + "  " + infoStyle.Render("thinking…")
-	default:
-		inner = prefix + " " + m.ti.View()
+	var b strings.Builder
+	innerW := width - 4
+	if innerW < 10 {
+		innerW = 10
 	}
 
-	return modePromptBorderStyles[mode].Width(width - 2).Render(inner)
-}
+	// Top border
+	b.WriteString(subtleStyle.Render("┌"+strings.Repeat("─", innerW)+"┐") + "\n")
 
-// ── Runtime Status ────────────────────────────────────────────────────────
-
-func formatTokens(n int) string {
-	if n >= 1000 {
-		return fmt.Sprintf("%.1fk", float64(n)/1000)
+	maxShow := 8
+	list := m.autocompleteItems
+	if len(list) > maxShow {
+		list = list[:maxShow]
 	}
-	return strconv.Itoa(n)
+
+	if m.autocompleteType == "file" {
+		for i, item := range list {
+			name := filepath.Base(item)
+			dir := filepath.Dir(item)
+			if dir == "." {
+				dir = ""
+			}
+
+			var icon string
+			if i == m.autocompleteIdx {
+				icon = "  ▶ "
+			} else {
+				icon = "  ◽ "
+			}
+
+			leftSide := icon + name
+			rightSide := dir + " "
+
+			// Calculate padding to right-align the directory part
+			paddingCount := m.width - lipgloss.Width(leftSide) - lipgloss.Width(rightSide) - 6
+			if paddingCount < 0 {
+				paddingCount = 0
+			}
+			rowString := leftSide + strings.Repeat(" ", paddingCount) + rightSide
+
+			var styled string
+			if i == m.autocompleteIdx {
+				styled = accentStyle.Render(rowString)
+			} else {
+				styled = dimmedStyle.Render(rowString)
+			}
+
+			if i == m.autocompleteIdx {
+				b.WriteString("│ " + styled + " │\n")
+			} else {
+				b.WriteString("│  " + styled + " │\n")
+			}
+		}
+	} else {
+		// Simple single-column layout for commands
+		for i, item := range list {
+			display := item
+			lw := lipgloss.Width(display)
+			if lw > innerW-2 {
+				display = display[:innerW-4] + "…"
+				lw = lipgloss.Width(display)
+			}
+			pad := strings.Repeat(" ", innerW-lw)
+
+			if i == m.autocompleteIdx {
+				b.WriteString("│ " + accentStyle.Render("▶ "+display) + dimmedStyle.Render(pad) + " │\n")
+			} else {
+				b.WriteString("│  " + dimmedStyle.Render(display) + dimmedStyle.Render(pad) + " │\n")
+			}
+		}
+	}
+
+	// Bottom border
+	b.WriteString(subtleStyle.Render("└"+strings.Repeat("─", innerW)+"┘") + "\n")
+
+	return b.String()
 }
 
+// ── Help Overlay ───────────────────────────────────────────────────────────
+
+// renderHelpOverlay displays IZEN's philosophy, operational rules, and
+// keyboard shortcuts as a full-height overlay panel.
+func (m *model) renderHelpOverlay() string {
+	lines := []string{
+		"",
+		boldAccentStyle.Render("  ⚡ IZEN  "),
+		textStyle.Render("  engineering intelligence · human in control"),
+		"",
+		subtleStyle.Render("  ─── Modes ───"),
+		"  " + accentStyle.Render("/ask") + "         " + dimmedStyle.Render("explain, inspect, understand"),
+		"  " + orangeStyle.Render("/plan") + "        " + dimmedStyle.Render("break down, structure, design"),
+		"  " + blueStyle.Render("/build") + "       " + dimmedStyle.Render("implement, refactor, elevate"),
+		"  " + greenStyle.Render("/investigate") + "  " + dimmedStyle.Render("debug, trace, root-cause"),
+		"  " + yellowStyle.Render("/review") + "      " + dimmedStyle.Render("analyze, critique, improve"),
+		"",
+		subtleStyle.Render("  ─── Commands ───"),
+		"  " + dimmedStyle.Render("/help  /?  /mode  /objective  /clear  /drop  /undo"),
+		"  " + dimmedStyle.Render("/commit  /checkpoint  /arch  /quit"),
+		"  " + dimmedStyle.Render("!<cmd>          run a shell command"),
+		"  " + dimmedStyle.Render("@<path>         attach a file"),
+		"",
+		subtleStyle.Render("  ─── Shortcuts ───"),
+		"  " + dimmedStyle.Render("Esc (×3)        quit IZEN"),
+		"  " + dimmedStyle.Render("↑/↓             history navigation"),
+		"  " + dimmedStyle.Render("Tab/Enter       complete autocomplete"),
+		"  " + dimmedStyle.Render("?               toggle this help overlay"),
+		"",
+		mutedStyle.Render("  press " + boldTextStyle.Render("Esc") + " or " + boldTextStyle.Render("?") + " to close"),
+		"",
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// ── Runtime Status ────────────────────────────────────────────────────
+
+// renderRuntimeStatus renders a single telemetry line with zero duplication.
+// Format: ● <model> │ <tokens> tkn
 func (m *model) renderRuntimeStatus(width int) string {
 	var b strings.Builder
 
-	// State icon
+	// Streaming/agent spinner or idle bullet
 	if m.streaming || m.agentRunning {
 		idx := m.spinnerFrame % len(taskSpinnerFrames)
 		b.WriteString(cyanStyle.Render(taskSpinnerFrames[idx]))
@@ -161,74 +255,34 @@ func (m *model) renderRuntimeStatus(width int) string {
 	}
 	b.WriteByte(' ')
 
-	// Model name (deeply dimmed)
+	// Model name
 	b.WriteString(dimmedStyle.Render(m.cfg.ActiveModelName()))
 
 	// Separator
-	sep := dimmedStyle.Render(" │ ")
-	b.WriteString(sep)
+	b.WriteString(dimmedStyle.Render(" │ "))
 
-	// Auth mode
-	if m.resolver.Current().CanWrite() {
-		b.WriteString(orangeStyle.Render("[rw]"))
-	} else {
-		b.WriteString(dimmedStyle.Render("[ro]"))
-	}
-	b.WriteString(sep)
-
-	// Metrics engine
-	if m.IsCloudModel {
-		inStr := formatTokens(m.InputTokens)
-		outStr := formatTokens(m.OutputTokens)
-		usagePct := 0
-		if m.ContextLimit > 0 {
-			usagePct = int(float64(m.InputTokens+m.OutputTokens) / float64(m.ContextLimit) * 100)
-		}
-		b.WriteString(mutedStyle.Render("In: "))
-		b.WriteString(textStyle.Render(inStr))
-		b.WriteString(mutedStyle.Render(" • "))
-		b.WriteString(mutedStyle.Render("Out: "))
-		b.WriteString(textStyle.Render(outStr))
-		b.WriteString(mutedStyle.Render(fmt.Sprintf(" (%d%%)", usagePct)))
-		b.WriteString(sep)
-		b.WriteString(dimmedStyle.Render(fmt.Sprintf("$%.4f", m.AccumulatedCost)))
-	} else {
+	// Tokens
+	if m.TotalTokens > 0 {
 		b.WriteString(textStyle.Render(strconv.Itoa(m.TotalTokens)))
 		b.WriteString(dimmedStyle.Render(" tkn"))
+	} else {
+		b.WriteString(dimmedStyle.Render("0 tkn"))
 	}
 
-	// Checkpoint (truncated to 7 chars, always shown with cp- prefix)
+	// Checkpoint (truncated)
 	if cp := m.latestCheckpointID(); cp != "" {
 		cp = strings.TrimPrefix(cp, "cp-")
 		if len(cp) > 7 {
 			cp = cp[:7]
 		}
-		b.WriteString(sep)
+		b.WriteString(dimmedStyle.Render(" │ "))
 		b.WriteString(dimmedStyle.Render("cp-" + cp))
 	}
 
 	return b.String()
 }
 
-// ── Footer ────────────────────────────────────────────────────────────────
-
-func (m *model) renderFooter(width int) string {
-	wd, _ := os.Getwd()
-	project := filepath.Base(wd)
-	branch, _ := m.gitEng.Branch()
-	if branch == "" {
-		branch = "detached"
-	}
-
-	left := fmt.Sprintf("workspace: %s (%s)", project, branch)
-	if width < 50 {
-		left = fmt.Sprintf("(%s)", branch)
-	}
-
-	return footerDimStyle.Render(left)
-}
-
-// ── Startup banner ────────────────────────────────────────────────────────
+// ── Startup banner ────────────────────────────────────────────────────
 
 var bannerModes = []struct{ name, desc string }{
 	{"/ask", "explain, inspect, understand"},
@@ -238,10 +292,10 @@ var bannerModes = []struct{ name, desc string }{
 	{"/review", "analyze, critique, improve"},
 }
 
-func getGreeting() string {
-	userName := os.Getenv("USER")
+func (m *model) getGreeting() string {
+	userName := m.userName
 	if userName == "" {
-		userName = "User"
+		userName = "developer"
 	}
 	hour := time.Now().Hour()
 	switch {
@@ -275,10 +329,11 @@ func (m *model) renderStartupBanner(termWidth int) string {
 
 	rightCol := make([]string, 0, 5+len(bannerModes))
 	rightCol = append(rightCol,
-		boldAccentStyle.Render(getGreeting()),
+		boldAccentStyle.Render(m.getGreeting()),
 		boldAccentStyle.Render("IZEN"),
 		textStyle.Render("engineering intelligence."),
 		textStyle.Render("human in control."),
+		"",
 		"",
 	)
 	for _, mode := range bannerModes {
@@ -334,7 +389,7 @@ func padRight(s string, n int) string {
 	return s + strings.Repeat(" ", n-sw)
 }
 
-// ── Record renderer (for viewport content) ────────────────────────────────
+// ── Record renderer (for viewport content) ────────────────────
 
 func (m *model) printRecord(rec record) string {
 	gutter := gutterFor(rec.role)
@@ -392,7 +447,7 @@ func (m *model) printRecord(rec record) string {
 	case roleUser:
 		styledLines := make([]string, len(wrappedLines))
 		for i, line := range wrappedLines {
-			styledLines[i] = gutter + textStyle.Render(line)
+			styledLines[i] = userBgStyle.Render(" " + line)
 		}
 		return strings.Join(styledLines, "\n")
 	case roleError:
@@ -416,80 +471,9 @@ func (m *model) printRecord(rec record) string {
 	}
 }
 
-// ── AST Trace Renderer ────────────────────────────────────────────────────
+// ── AST Trace Renderer ────────────────────────────────────────────
 
-// renderCodebaseTrace renders the AI's cognitive execution trace as a clean,
-// industrial log line positioned above the AI response.
-func (m *model) renderCodebaseTrace(width int) string {
-	if m.currentTrace == nil {
-		return ""
-	}
-	t := m.currentTrace
-	if len(t.MatchedFiles) == 0 && len(t.ResolvedSymbols) == 0 {
-		return ""
-	}
-
-	// Build the primary trace line: file > symbol references
-	var parts []string
-	maxFiles := 3
-	if len(t.MatchedFiles) < maxFiles {
-		maxFiles = len(t.MatchedFiles)
-	}
-	for i := 0; i < maxFiles; i++ {
-		parts = append(parts, t.MatchedFiles[i])
-	}
-	if len(t.MatchedFiles) > maxFiles {
-		parts = append(parts, fmt.Sprintf("+%d more", len(t.MatchedFiles)-maxFiles))
-	}
-	fileStr := strings.Join(parts, ", ")
-
-	var symPart string
-	maxSyms := 3
-	if len(t.ResolvedSymbols) < maxSyms {
-		maxSyms = len(t.ResolvedSymbols)
-	}
-	if len(t.ResolvedSymbols) > 0 {
-		symNames := make([]string, maxSyms)
-		for i := 0; i < maxSyms; i++ {
-			symNames[i] = t.ResolvedSymbols[i]
-		}
-		symPart = strings.Join(symNames, ", ")
-		if len(t.ResolvedSymbols) > maxSyms {
-			symPart += fmt.Sprintf(" +%d", len(t.ResolvedSymbols)-maxSyms)
-		}
-	}
-
-	// Build the optimization percentage
-	var optStr string
-	if t.CompressionRatio > 0 {
-		pct := (1.0 - t.CompressionRatio) * 100
-		optStr = fmt.Sprintf(" | ctx optimized %.0f%%", pct)
-	} else if t.TotalTokensSaved > 0 {
-		optStr = fmt.Sprintf(" | saved ~%d tok", t.TotalTokensSaved)
-	}
-
-	// Compose the trace line
-	traceLine := "⚡ AST Slicing: " + fileStr
-	if symPart != "" {
-		traceLine += " > " + symPart
-	}
-	traceLine += optStr
-
-	availableWidth := width - 2
-	if availableWidth < 20 {
-		availableWidth = 20
-	}
-
-	// Wrap if necessary
-	trimmed := traceLine
-	if lipgloss.Width(trimmed) > availableWidth {
-		trimmed = trimmed[:availableWidth-1] + "…"
-	}
-
-	return " " + traceStyle.Render(trimmed)
-}
-
-// ── Widget Box & Semantic Renderers ───────────────────────────────────────
+// ── Widget Box & Semantic Renderers ───────────────────────────────────
 
 func renderWidget(title string, content string, width int, accentHex string) string {
 	if width < 10 {

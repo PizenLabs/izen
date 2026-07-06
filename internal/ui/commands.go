@@ -420,8 +420,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	case cmd == "/clear":
 		m.records = nil
 		m.showBanner = true
-		m.rebuildViewport()
-		return nil
+		return tea.Sequence(tea.ClearScreen, tea.Println("IZEN cleared."))
 
 	case cmd == "/drop":
 		m.attachedFiles = nil

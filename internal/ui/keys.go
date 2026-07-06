@@ -1,7 +1,7 @@
 package ui
 
 import (
-	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -16,7 +16,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if len(m.pendingShellExec) == 0 {
 				m.state = StateChat
 			}
-			m.rebuildViewport()
 			return m, m.execShellCmd(block.Command)
 
 		case "r", "R":
@@ -25,14 +24,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.state = StateChat
 			}
 			m.push(roleSystem, infoStyle.Render("shell command skipped"))
-			m.rebuildViewport()
 			return m, nil
 
 		case "esc":
 			m.pendingShellExec = nil
 			m.state = StateChat
 			m.push(roleSystem, infoStyle.Render("shell execution cancelled"))
-			m.rebuildViewport()
 			return m, nil
 		}
 		return m, nil
@@ -52,14 +49,17 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.pendingProposals = nil
 			m.acceptAll = false
 			m.push(roleSystem, infoStyle.Render("changes rejected"))
-			m.rebuildViewport()
 			return m, nil
 		}
 		return m, nil
 	}
 
-	// Handle Escape key requiring three presses to quit
+	// Handle Escape key requiring three presses to quit (unless help is showing)
 	if msg.Type == tea.KeyEscape {
+		if m.showHelpOverlay {
+			m.showHelpOverlay = false
+			return m, nil
+		}
 		m.escPressCount++
 		if m.escPressCount >= 3 {
 			m.escPressCount = 0
@@ -71,14 +71,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			_ = m.sess.Save()
 			return m, tea.Quit
 		}
-		// Wait for more ESC presses
 		return m, nil
 	}
-	// Reset escape counter on any other key
 	m.escPressCount = 0
 
 	switch msg.Type {
-	// ── Quit ─────────────────────────────────────────────────────────────────
 	case tea.KeyCtrlC:
 		if m.showSuggestions {
 			m.dismissSuggestions()
@@ -88,86 +85,38 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		_ = m.sess.Save()
 		return m, tea.Quit
 
-	// ── Enter: submit ─────────────────────────────────────────────────────────
+		// ── Enter: submit (only when autocomplete is NOT active) ───────────────
 	case tea.KeyEnter:
-		line := m.ti.Value()
-
-		if m.showSuggestions && len(m.suggestions) > 0 {
-			sel := m.suggestions[m.suggestionIdx]
-			if m.suggestionType == "@" {
-				raw := line
-				atIdx := strings.LastIndex(raw, "@")
-				if atIdx >= 0 {
-					line = raw[:atIdx] + sel
-				} else {
-					line = sel
-				}
-				m.pendingFileRefs = append(m.pendingFileRefs, sel)
-				m.attachedFiles = append(m.attachedFiles, sel)
-				m.dismissSuggestions()
-				m.ti.SetValue(line)
-				m.syncInputFromTI()
-				return m, nil
-			}
-			line = sel
-		}
+		userInput := m.ti.Value()
 		m.dismissSuggestions()
 
-		if line != "" {
-			// Cache prompt text for logging before clearing input
-			m.currentPrompt = line
-
-			// Banner: hide on first user message
+		if userInput != "" {
+			m.currentPrompt = userInput
 			if m.showBanner {
 				m.showBanner = false
 			}
+			m.ti.SetValue("")
+			m.ti.Reset()
+			m.syncInputFromTI()
 
-			// Echo user line into viewport
-			userLine := gutterUserStyle.Render("|") + " " +
-				labelUserStyle.Render("you") +
-				promptStyle.Render(" ⏵ ") +
-				outputStyle.Render(line)
-			m.records = append(m.records, record{role: roleUser, text: userLine})
-
-			// History
-			m.history = append(m.history, line)
+			m.history = append(m.history, userInput)
 			m.historyIndex = len(m.history)
 			m.saveHistory()
 
-			m.ti.SetValue("")
-			m.syncInputFromTI()
-			m.rebuildViewport()
+			userLine := userBgStyle.Render(userInput)
 
-			cmd := m.handleInput(line)
-			return m, cmd
+			m.streamStartTime = time.Now()
+			cmd := m.handleInput(userInput)
+			return m, tea.Batch(tea.Println(userLine), cmd)
 		}
 		m.ti.SetValue("")
+		m.ti.Reset()
 		m.syncInputFromTI()
 		return m, nil
 
-	// ── Tab: cycle suggestions ────────────────────────────────────────────────
-	case tea.KeyTab:
-		if m.showSuggestions && len(m.suggestions) > 0 {
-			m.suggestionIdx = (m.suggestionIdx + 1) % len(m.suggestions)
-		}
-		return m, nil
-
-	case tea.KeyShiftTab:
-		if m.showSuggestions && len(m.suggestions) > 0 {
-			m.suggestionIdx--
-			if m.suggestionIdx < 0 {
-				m.suggestionIdx = len(m.suggestions) - 1
-			}
-		}
-		return m, nil
-
-	// ── Up/Down: command history (when no suggestions) ────────────────────────
+		// ── History navigation (only when suggestions are NOT active) ─────────
 	case tea.KeyUp:
 		if m.showSuggestions && len(m.suggestions) > 0 {
-			m.suggestionIdx--
-			if m.suggestionIdx < 0 {
-				m.suggestionIdx = len(m.suggestions) - 1
-			}
 			return m, nil
 		}
 		if len(m.history) == 0 {
@@ -183,7 +132,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyDown:
 		if m.showSuggestions && len(m.suggestions) > 0 {
-			m.suggestionIdx = (m.suggestionIdx + 1) % len(m.suggestions)
 			return m, nil
 		}
 		if m.historyIndex < len(m.history)-1 {
@@ -197,12 +145,19 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.syncInputFromTI()
 		return m, nil
 
-	// ── All other keys → textinput ────────────────────────────────────────────
-	default:
+		// ── '/' and '@' → forward to text input AND trigger suggestions ──────────
+	case tea.KeyRunes:
 		var tiCmd tea.Cmd
 		m.ti, tiCmd = m.ti.Update(msg)
 		m.syncInputFromTI()
 		m.updateSuggestions()
+		return m, tiCmd
+
+		// ── Text-editing keys: forward directly to textinput, no swallowing ────
+	default:
+		var tiCmd tea.Cmd
+		m.ti, tiCmd = m.ti.Update(msg)
+		m.syncInputFromTI()
 		return m, tiCmd
 	}
 }
