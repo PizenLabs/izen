@@ -72,7 +72,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	m.loadHistory()
 	m.historyIndex = len(m.history)
 
-	return tea.NewProgram(m)
+	return tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 }
 
 func bootCommon(root string, cfg *config.Config) (*session.Session, *ai.Manager, *lynx.Controller) {

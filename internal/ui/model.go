@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -144,6 +145,11 @@ type model struct {
 	// Window dimensions
 	width  int
 	height int
+
+	// Viewport for scrollable chat history
+	Viewport           viewport.Model
+	Ready              bool
+	PreRenderedHistory string
 
 	// Streaming
 	streamCh             chan tea.Msg
@@ -299,11 +305,57 @@ func (m *model) setApplyError(text string) {
 // scrollback at explicit sync points (user submit, stream done, etc.).
 func (m *model) push(r role, text string) {
 	m.records = append(m.records, record{role: r, text: text})
+	m.cacheRecordToHistory(record{role: r, text: text})
+}
+
+// cacheRecordToHistory renders a single record and appends it to PreRenderedHistory.
+// During active streaming, the cache is frozen to avoid re-highlighting old history.
+// Uses the same rendering logic as the original View() inline loop to guarantee
+// identical output (user header, AI block rendering, raw styled text).
+func (m *model) cacheRecordToHistory(rec record) {
+	if m.streaming {
+		return
+	}
+	if m.width == 0 {
+		return
+	}
+	rendered := m.renderRecordForViewport(rec)
+	if rendered != "" {
+		m.PreRenderedHistory += rendered + "\n"
+	}
+}
+
+// renderRecordForViewport renders a single record exactly as the original View()
+// inline loop did — user records get the @username header with right-padding,
+// AI records go through renderAIResponseBlocks, and everything else is raw text.
+func (m *model) renderRecordForViewport(rec record) string {
+	width := m.width
+	if width < 40 {
+		width = 40
+	}
+
+	switch rec.role {
+	case roleUser:
+		userHeader := dimmedStyle.Render("@" + m.userName + "  ")
+		paddedText := " " + rec.text
+		padNeeded := width - lipgloss.Width(userHeader) - lipgloss.Width(paddedText) - 1
+		if padNeeded > 0 {
+			paddedText += strings.Repeat(" ", padNeeded)
+		}
+		return userHeader + userBgStyle.Render(paddedText)
+	case roleAI:
+		return m.renderAIResponseBlocks(rec.text, width)
+	default:
+		return rec.text
+	}
 }
 
 // pushRecords appends multiple records.
 func (m *model) pushRecords(recs []record) {
 	m.records = append(m.records, recs...)
+	for _, rec := range recs {
+		m.cacheRecordToHistory(rec)
+	}
 }
 
 // flushRecord returns a tea.Cmd that renders and flushes a record
@@ -336,6 +388,45 @@ func (m *model) latestCheckpointID() string {
 		return ""
 	}
 	return m.sess.Checkpoints[len(m.sess.Checkpoints)-1]
+}
+
+// refreshViewportContent rebuilds the viewport's internal content from
+// PreRenderedHistory (cached) plus any active streaming content.
+// During streaming the PreRenderedHistory cache is never rebuilt,
+// which avoids re-highlighting or re-wrapping old history on every tick.
+func (m *model) refreshViewportContent() {
+	if !m.Ready {
+		return
+	}
+
+	var content strings.Builder
+
+	if m.showBanner && len(m.records) == 0 {
+		content.WriteString(m.renderStartupBanner(m.width))
+		content.WriteString("\n")
+	}
+
+	if m.PreRenderedHistory != "" {
+		content.WriteString(m.PreRenderedHistory)
+	}
+
+	if m.streaming {
+		if m.currentStreamContent != "" {
+			rendered := m.renderStreamingContent(m.currentStreamContent, m.width)
+			if rendered != "" {
+				content.WriteString(rendered)
+				content.WriteString("\n")
+			}
+		}
+		sp := m.renderFlowingSpinner()
+		status := "streaming…"
+		if m.agentRunning {
+			status = m.agentLabel
+		}
+		content.WriteString(sp + " " + infoStyle.Render(status) + "\n")
+	}
+
+	m.Viewport.SetContent(content.String())
 }
 
 // renderFlowingSpinner renders a single animated character with a smooth flowing

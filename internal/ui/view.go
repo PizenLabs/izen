@@ -29,79 +29,45 @@ type contentBlock struct {
 	raw  string
 }
 
-// View returns the full UI state, including chat history and the prompt sandwich.
-// Historical chat content is rendered directly into the view buffer.
-// Bubble Tea manages the entire screen via this returned string.
+// View returns the full UI state.
+// The scrollable chat history is rendered inside the viewport; metadata bars,
+// the input line, and the status line are pinned to the bottom of the terminal.
 func (m *model) View() string {
 	if m.showHelpOverlay {
 		return m.renderHelpOverlay()
 	}
 
+	if !m.Ready {
+		return "Loading IZEN..."
+	}
+
+	var buf strings.Builder
+	buf.WriteString(m.Viewport.View())
+	buf.WriteString("\n")
+	buf.WriteString(m.renderStaticBottomControls())
+	return buf.String()
+}
+
+// renderStaticBottomControls renders the fixed bottom dashboard that must never
+// scroll away: autocomplete dropdown, mode lines, input line, and telemetry.
+func (m *model) renderStaticBottomControls() string {
 	width := m.width
 	if width < 40 {
 		width = 40
 	}
 
-	var s strings.Builder
 	mode := m.resolver.Current()
 	modeColor := m.modeStyle(mode)
 
-	// ── Startup banner (shown when no history exists yet) ──────────
-	if m.showBanner && len(m.records) == 0 {
-		s.WriteString(m.renderStartupBanner(width))
-		s.WriteString("\n")
-	}
+	var s strings.Builder
 
-	// ── Render History ─────────────────────────────────────────────
-	userHeader := dimmedStyle.Render("@" + m.userName + "  ")
-	for _, rec := range m.records {
-		switch rec.role {
-		case roleUser:
-			paddedText := " " + rec.text
-			padNeeded := width - lipgloss.Width(userHeader) - lipgloss.Width(paddedText) - 1
-			if padNeeded > 0 {
-				paddedText += strings.Repeat(" ", padNeeded)
-			}
-			s.WriteString(userHeader + userBgStyle.Render(paddedText) + "\n")
-		case roleAI:
-			rendered := m.renderAIResponseBlocks(rec.text, width)
-			if rendered != "" {
-				s.WriteString(rendered)
-				s.WriteString("\n")
-			}
-		default:
-			s.WriteString(rec.text + "\n")
-		}
-	}
-
-	// ── Streaming content — incrementally rendered, no pop-in ──────
-	if m.streaming {
-		if m.currentStreamContent != "" {
-			rendered := m.renderStreamingContent(m.currentStreamContent, width)
-			if rendered != "" {
-				s.WriteString(rendered)
-				s.WriteString("\n")
-			}
-		}
-		sp := m.renderFlowingSpinner()
-		s.WriteString(sp + " " + infoStyle.Render("streaming…") + "\n")
-	}
-
-	// Component A: Conditional autocomplete dropdown (above top line)
 	if m.autocompleteActive && len(m.autocompleteItems) > 0 {
 		s.WriteString(m.renderAutocompleteDropdown(width))
 	}
 
-	// Component B: Top parallel line — dynamically colored by active mode
 	s.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
-
-	// Component C: Active input line
 	s.WriteString(modeColor.Render("❯ "+mode.String()) + " ⟩ " + m.ti.View() + "\n")
-
-	// Component D: Bottom parallel line — dynamically colored by active mode
 	s.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
-
-	// Component E: Clean telemetry (no duplicated mode label)
 	s.WriteString(m.renderRuntimeStatus(width))
 
 	return s.String()
@@ -656,10 +622,15 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 				}
 			}
 
-			// Shell Execution Proposal container with warning header
+			// Shell Execution Proposal container
 			var container strings.Builder
 
-			container.WriteString(shellWarningStyle.Render("> System: Shell Execution Required <"))
+			mode := m.resolver.Current()
+			if mode.CanShell() {
+				container.WriteString(shellWarningStyle.Render("> System: Shell Execution Required <"))
+			} else {
+				container.WriteString(shellWarningStyle.Render("> System: Shell Execution Blocked by Mode <"))
+			}
 			container.WriteString("\n")
 
 			cmdLines := strings.Split(cmdText, "\n")
@@ -669,7 +640,11 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 				container.WriteString("\n")
 			}
 			container.WriteString("\n")
-			container.WriteString(mutedStyle.Render("[A] Run  [R] Skip"))
+			if mode.CanShell() {
+				container.WriteString(mutedStyle.Render("[A] Run  [R] Skip"))
+			} else {
+				container.WriteString(dimmedStyle.Render("[System] Tool 'shell' rejected. Read-Only environment. No action available."))
+			}
 			container.WriteString("\n")
 
 			rendered = renderWidget("Command", container.String(), availableWidth, colorDimmed)

@@ -419,7 +419,9 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 	case cmd == "/clear":
 		m.records = nil
+		m.PreRenderedHistory = ""
 		m.showBanner = true
+		m.refreshViewportContent()
 		return tea.Sequence(tea.ClearScreen, tea.Println("IZEN cleared."))
 
 	case cmd == "/drop":

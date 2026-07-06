@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/config"
@@ -44,10 +45,25 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.ti.Width = msg.Width - 8
 
+		verticalMargin := 5
+		vpHeight := m.height - verticalMargin
+		if vpHeight < 1 {
+			vpHeight = 1
+		}
+
+		if !m.Ready {
+			m.Viewport = viewport.New(msg.Width, vpHeight)
+			m.Ready = true
+		} else {
+			m.Viewport.Width = msg.Width
+			m.Viewport.Height = vpHeight
+		}
+
 		if m.streamParser != nil {
 			m.streamParser.SetWidth(msg.Width - 2)
 		}
 
+		m.refreshViewportContent()
 		return m, nil
 
 	case tickMsg:
@@ -76,7 +92,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+msg.err.Error())
 		}
-		m.records = append(m.records, msg.records...)
 		if msg.sessionKey != "" {
 			m.sess.SetInvestigationID(msg.sessionKey)
 		}
@@ -84,6 +99,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamCh = nil
 		m.streaming = false
 		m.streamParser = nil
+		m.pushRecords(msg.records)
 		m.push(roleSystem, "[System] Engine diagnostics collected. Escalating to LLM for analysis...")
 		flush := m.flushPendingRecords()
 		return m, tea.Batch(flush, m.streamCmd(msg.escalationContent))
@@ -167,6 +183,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.currentStreamContent += m.streamBuffer[:emit]
 			m.streamBuffer = m.streamBuffer[emit:]
 		}
+
+		// Refresh viewport with streaming content and follow the bottom.
+		if m.Ready {
+			m.refreshViewportContent()
+			if m.streaming {
+				m.Viewport.GotoBottom()
+			}
+		}
+
 		if len(m.streamBuffer) > 0 {
 			return m, m.smoothStreamTickCmd()
 		}
@@ -229,9 +254,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.responseBuffer.Reset()
 		m.currentStreamContent = ""
 
-		// Flush the AI response to terminal scrollback via a SINGLE tea.Println.
-		aiRecord := record{role: roleAI, text: final}
-		m.records = append(m.records, aiRecord)
+		// Append the completed turn to PreRenderedHistory and freeze state.
+		m.push(roleAI, final)
 
 		// SECTION 1: INTERCEPTING STREAM COMPLETION
 		promptText := m.currentPrompt
@@ -322,7 +346,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				renderer := NewMarkdownRenderer(width)
 				rendered := renderer.Render(compileTaskListMarkdown(&tasks))
 				if rendered != "" {
-					m.records = append(m.records, record{role: roleAI, text: rendered})
+					m.push(roleAI, rendered)
 				}
 				m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
 			}
@@ -394,17 +418,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == StateChat && !m.awaitingConfirmation {
 			shellBlocks := extractShellCommands(final)
 			if len(shellBlocks) > 0 {
-				m.pendingShellExec = shellBlocks
-				m.shellAwaitingIdx = 0
-				m.state = StateAwaitingShellExec
-				m.push(roleSystem, shellWarningStyle.Render(
-					fmt.Sprintf("Shell Execution: %d command(s) pending approval", len(shellBlocks))))
+				mode := m.resolver.Current()
+				if mode.CanShell() {
+					m.pendingShellExec = shellBlocks
+					m.shellAwaitingIdx = 0
+					m.state = StateAwaitingShellExec
+					m.push(roleSystem, shellWarningStyle.Render(
+						fmt.Sprintf("Shell Execution: %d command(s) pending approval", len(shellBlocks))))
+				} else {
+					msg := fmt.Sprintf("[System] Tool 'shell' rejected. Reason: Explicit boundary violation for '%s' mode.", mode)
+					m.push(roleSystem, msg)
+					m.sess.AddMessage("system", msg+" You are in a Read-Only execution environment and must stop requesting system mutations.", 3)
+				}
 			}
 		}
 
 		// AI response and telemetry rendered exclusively through View().
 		// No tea.Println scrollback flush — prevents double-rendering in
 		// terminal scrollback vs Bubble Tea viewport.
+
+		m.refreshViewportContent()
 		return m, nil
 
 	case streamErrMsg:
@@ -417,6 +450,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			_ = m.sess.Save()
 		}
 		m.push(roleError, "stream error: "+msg.err.Error())
+		m.refreshViewportContent()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -428,6 +462,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		newCfg, err := config.Load()
 		if err == nil {
 			m.cfg = newCfg
+		}
+		return m, nil
+
+	case tea.MouseMsg:
+		// Pure O(1) viewport YOffset shift. No refreshViewportContent, no
+		// re-rendering, no string mutation — the viewport internal buffer is
+		// already set and only its scroll origin moves.
+		if m.Ready {
+			var vpCmd tea.Cmd
+			m.Viewport, vpCmd = m.Viewport.Update(msg)
+			return m, vpCmd
 		}
 		return m, nil
 
@@ -512,8 +557,28 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// ── Viewport scroll keys ─────────────────────────────────────────────
+		if m.Ready {
+			switch msg.Type {
+			case tea.KeyPgUp, tea.KeyPgDown, tea.KeyHome, tea.KeyEnd:
+				m.Viewport, _ = m.Viewport.Update(msg)
+				return m, nil
+			}
+		}
+
 		resModel, cmd := m.handleKey(msg)
 		return resModel, cmd
+	}
+
+	// ── Viewport scroll keys (any state) ─────────────────────────────────────
+	if m.Ready {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			switch keyMsg.Type {
+			case tea.KeyPgUp, tea.KeyPgDown, tea.KeyHome, tea.KeyEnd:
+				m.Viewport, _ = m.Viewport.Update(keyMsg)
+				return m, nil
+			}
+		}
 	}
 
 	// ── Text Input Pass-Through ──────────────────────────────────────────────
