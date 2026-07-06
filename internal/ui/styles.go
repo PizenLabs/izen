@@ -117,10 +117,6 @@ var (
 	infoStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 	errorStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
 
-	// Accepted green dot — single-line collapsed summary
-	acceptedDotStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen)).Render("●")
-	acceptedLineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
-
 	// Shell execution proposal
 	shellWarningStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorOrange))
 
@@ -180,6 +176,22 @@ var (
 	semanticNormalStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 )
 
+// ── Hotkey Highlight Styles (Keyboard-Only Execution) ─────────────────────────
+var (
+	hotkeyStyle        = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMauve))
+	hotkeyHintStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	tracerStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	successBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreen))
+	failureBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
+	warningBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorYellow))
+)
+
+func renderHotkeyPromptWithToggle() string {
+	hk := hotkeyStyle.Render
+	hint := hotkeyHintStyle.Render
+	return hint("press (") + hk("A") + hint(") accept   (") + hk("L") + hint(") allow all   (") + hk("R") + hint(") reject   (") + hk("P") + hint(") toggle")
+}
+
 // Mode-accent style lookup (indexed by modes.Mode value).
 var (
 	modeBoldFgStyles = []lipgloss.Style{
@@ -230,6 +242,10 @@ var (
 
 // User message background (warm muted surface for distinct visual nesting)
 var userBgStyle = lipgloss.NewStyle().Background(lipgloss.Color(colorSurface)).PaddingLeft(1)
+
+// ── Interrupt Boundary Spinner ────────────────────────────────────────────
+var SpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+var SpinnerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))
 
 // ── Gutter / Label Helpers ────────────────────────────────────────────────────
 

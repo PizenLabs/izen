@@ -224,7 +224,7 @@ func (r *MutationRenderer) Render(v MutationCardViewModel) string {
 	if v.Expanded {
 		toggleLabel = "[▲ Collapse]"
 	}
-	actionLine := "  [A] Accept  [L] Allow All  [R] Reject  [P] Toggle"
+	actionLine := renderHotkeyPromptWithToggle()
 
 	// Header with inline toggle: "Edit • filename [▼ Expand]"
 	header := "Edit"
