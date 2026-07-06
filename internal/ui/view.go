@@ -46,12 +46,17 @@ func (m *model) View() string {
 	mode := m.resolver.Current()
 	modeColor := m.modeStyle(mode)
 
-	// Render History
-	userHeaderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
-	userHeader := userHeaderStyle.Render("@" + m.userName + " ")
+	// ── Startup banner (shown when no history exists yet) ──────────
+	if m.showBanner && len(m.records) == 0 {
+		s.WriteString(m.renderStartupBanner(width))
+		s.WriteString("\n")
+	}
+
+	// ── Render History ─────────────────────────────────────────────
+	userHeader := dimmedStyle.Render("@" + m.userName + "  ")
 	for _, rec := range m.records {
 		if rec.role == roleUser {
-			s.WriteString(userHeader + rec.text + "\n")
+			s.WriteString(userHeader + userBgStyle.Render(" "+rec.text) + "\n")
 		} else {
 			s.WriteString(rec.text + "\n")
 		}
@@ -81,9 +86,6 @@ func (m *model) View() string {
 		}
 		s.WriteString(sp + " " + lastLine + "\n")
 	}
-
-	// ── Dynamic user identity header ────────────────────────────────
-	s.WriteString(userHeader + "\n")
 
 	// Component A: Conditional autocomplete dropdown (above top line)
 	if m.autocompleteActive && len(m.autocompleteItems) > 0 {
@@ -126,13 +128,6 @@ func (m *model) renderAutocompleteDropdown(width int) string {
 		return ""
 	}
 	var b strings.Builder
-	innerW := width - 4
-	if innerW < 10 {
-		innerW = 10
-	}
-
-	// Top border
-	b.WriteString(subtleStyle.Render("┌"+strings.Repeat("─", innerW)+"┐") + "\n")
 
 	maxShow := 8
 	list := m.autocompleteItems
@@ -140,42 +135,45 @@ func (m *model) renderAutocompleteDropdown(width int) string {
 		list = list[:maxShow]
 	}
 
+	// Pre-compiled styles for the dropdown
+	highlightedBgStyle := lipgloss.NewStyle().
+		Background(lipgloss.Color(colorOverlay))
+
+	// Top border with title
+	title := "Context Selection"
+	titleSection := "── " + title + " ──"
+	topFiller := width - lipgloss.Width(titleSection) - 2
+	if topFiller < 0 {
+		topFiller = 0
+	}
+	b.WriteString(subtleStyle.Render("╭"+titleSection+strings.Repeat("─", topFiller)+"╮") + "\n")
+
 	if m.autocompleteType == "file" {
 		for i, item := range list {
 			name := filepath.Base(item)
 			dir := filepath.Dir(item)
 			if dir == "." {
-				dir = ""
+				dir = "./"
 			}
 
-			var icon string
+			icon := "◽ "
 			if i == m.autocompleteIdx {
-				icon = "  ▶ "
-			} else {
-				icon = "  ◽ "
+				icon = "▶ "
 			}
 
 			leftSide := icon + name
 			rightSide := dir + " "
 
-			// Calculate padding to right-align the directory part
-			paddingCount := m.width - lipgloss.Width(leftSide) - lipgloss.Width(rightSide) - 6
+			paddingCount := width - lipgloss.Width(leftSide) - lipgloss.Width(rightSide) - 4
 			if paddingCount < 0 {
 				paddingCount = 0
 			}
 			rowString := leftSide + strings.Repeat(" ", paddingCount) + rightSide
 
-			var styled string
 			if i == m.autocompleteIdx {
-				styled = accentStyle.Render(rowString)
+				b.WriteString("│ " + highlightedBgStyle.Render(rowString) + " │\n")
 			} else {
-				styled = dimmedStyle.Render(rowString)
-			}
-
-			if i == m.autocompleteIdx {
-				b.WriteString("│ " + styled + " │\n")
-			} else {
-				b.WriteString("│  " + styled + " │\n")
+				b.WriteString("│ " + dimmedStyle.Render(rowString) + " │\n")
 			}
 		}
 	} else {
@@ -183,22 +181,27 @@ func (m *model) renderAutocompleteDropdown(width int) string {
 		for i, item := range list {
 			display := item
 			lw := lipgloss.Width(display)
-			if lw > innerW-2 {
-				display = display[:innerW-4] + "…"
+			maxContent := width - 8
+			if maxContent < 10 {
+				maxContent = 10
+			}
+			if lw > maxContent {
+				display = display[:maxContent-1] + "…"
 				lw = lipgloss.Width(display)
 			}
-			pad := strings.Repeat(" ", innerW-lw)
+			pad := strings.Repeat(" ", width-lw-6)
 
+			rowString := display + pad
 			if i == m.autocompleteIdx {
-				b.WriteString("│ " + accentStyle.Render("▶ "+display) + dimmedStyle.Render(pad) + " │\n")
+				b.WriteString("│ " + highlightedBgStyle.Render("▶ "+rowString) + " │\n")
 			} else {
-				b.WriteString("│  " + dimmedStyle.Render(display) + dimmedStyle.Render(pad) + " │\n")
+				b.WriteString("│ " + dimmedStyle.Render("◽ "+rowString) + " │\n")
 			}
 		}
 	}
 
 	// Bottom border
-	b.WriteString(subtleStyle.Render("└"+strings.Repeat("─", innerW)+"┘") + "\n")
+	b.WriteString(subtleStyle.Render("╰"+strings.Repeat("─", width-2)+"╯") + "\n")
 
 	return b.String()
 }

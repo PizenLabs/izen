@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"os"
+	"os/user"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -43,6 +44,9 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	execEng.SetPlanStore(planStore)
 
 	userName := os.Getenv("USER")
+	if currentUser, err := user.Current(); err == nil && currentUser.Username != "" {
+		userName = currentUser.Username
+	}
 	if userName == "" {
 		userName = "developer"
 	}
@@ -67,12 +71,6 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	m.resolver.Set(sess.Mode)
 	m.loadHistory()
 	m.historyIndex = len(m.history)
-
-	// Print the static welcome header once on startup so the terminal's
-	// native scrollback captures it permanently.
-	fmt.Println()
-	fmt.Println(m.renderStartupBanner(120))
-	fmt.Println()
 
 	return tea.NewProgram(m)
 }

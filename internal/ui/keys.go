@@ -103,11 +103,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.historyIndex = len(m.history)
 			m.saveHistory()
 
-			userLine := userBgStyle.Render(userInput)
+			m.push(roleUser, userInput)
 
 			m.streamStartTime = time.Now()
 			cmd := m.handleInput(userInput)
-			return m, tea.Batch(tea.Println(userLine), cmd)
+			return m, cmd
 		}
 		m.ti.SetValue("")
 		m.ti.Reset()

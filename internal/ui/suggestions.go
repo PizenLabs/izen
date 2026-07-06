@@ -82,33 +82,44 @@ func (m *model) navigateAutocomplete(dir int) {
 }
 
 // completeAutocomplete replaces the input buffer with the highlighted item,
-// appends a trailing space, advances the cursor to the end of the buffer,
-// then dismisses the dropdown.
+// using cursor-aware backward scanning to find the trigger (@ or /).
+// For @-files: prepends @ to the selected path. For /-commands: uses the
+// selection as-is (already contains /). Preserves text after cursor.
 func (m *model) completeAutocomplete() {
 	if !m.autocompleteActive || len(m.autocompleteItems) == 0 {
 		return
 	}
 	sel := m.autocompleteItems[m.autocompleteIdx]
 	val := m.ti.Value()
+	cursorIdx := m.ti.Position()
 
-	switch m.autocompleteType {
-	case "file":
-		atIdx := strings.LastIndex(val, "@")
-		if atIdx >= 0 {
-			newVal := val[:atIdx] + sel + " "
-			m.ti.SetValue(newVal)
-			m.ti.CursorEnd()
-			m.pendingFileRefs = append(m.pendingFileRefs, sel)
-			m.attachedFiles = append(m.attachedFiles, sel)
-		}
-	case "command":
-		slashIdx := strings.LastIndex(val, "/")
-		if slashIdx >= 0 {
-			newVal := val[:slashIdx] + sel + " "
-			m.ti.SetValue(newVal)
-			m.ti.CursorEnd()
+	triggerIdx := -1
+	var activeTrigger byte
+	for i := cursorIdx - 1; i >= 0; i-- {
+		if val[i] == '@' || val[i] == '/' {
+			triggerIdx = i
+			activeTrigger = val[i]
+			break
 		}
 	}
+	if triggerIdx < 0 {
+		return
+	}
+
+	var selectedToken string
+	if activeTrigger == '@' {
+		selectedToken = "@" + sel
+		m.pendingFileRefs = append(m.pendingFileRefs, sel)
+		m.attachedFiles = append(m.attachedFiles, sel)
+	} else {
+		selectedToken = sel
+	}
+
+	beforeTrigger := val[:triggerIdx]
+	afterCursor := val[cursorIdx:]
+	newVal := beforeTrigger + selectedToken + " " + afterCursor
+	m.ti.SetValue(newVal)
+	m.ti.SetCursor(len(beforeTrigger + selectedToken + " "))
 
 	m.autocompleteActive = false
 	m.syncInputFromTI()
