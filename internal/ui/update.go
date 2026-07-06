@@ -149,9 +149,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case smoothStreamTickMsg:
 		if len(m.streamBuffer) > 0 {
-			emit := 2
-			if emit > len(m.streamBuffer) {
+			// Emit word-aligned chunks for a natural reading rhythm.
+			emit := 0
+			minChars := 3
+			for i, c := range m.streamBuffer {
+				if i >= minChars && (c == ' ' || c == '\n') {
+					emit = i + 1
+					break
+				}
+			}
+			if emit == 0 {
 				emit = len(m.streamBuffer)
+			}
+			if emit > 80 {
+				emit = 80
 			}
 			m.currentStreamContent += m.streamBuffer[:emit]
 			m.streamBuffer = m.streamBuffer[emit:]

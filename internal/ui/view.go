@@ -55,36 +55,36 @@ func (m *model) View() string {
 	// ── Render History ─────────────────────────────────────────────
 	userHeader := dimmedStyle.Render("@" + m.userName + "  ")
 	for _, rec := range m.records {
-		if rec.role == roleUser {
-			s.WriteString(userHeader + userBgStyle.Render(" "+rec.text) + "\n")
-		} else {
+		switch rec.role {
+		case roleUser:
+			paddedText := " " + rec.text
+			padNeeded := width - lipgloss.Width(userHeader) - lipgloss.Width(paddedText) - 1
+			if padNeeded > 0 {
+				paddedText += strings.Repeat(" ", padNeeded)
+			}
+			s.WriteString(userHeader + userBgStyle.Render(paddedText) + "\n")
+		case roleAI:
+			rendered := m.renderAIResponseBlocks(rec.text, width)
+			if rendered != "" {
+				s.WriteString(rendered)
+				s.WriteString("\n")
+			}
+		default:
 			s.WriteString(rec.text + "\n")
 		}
 	}
 
-	// ── Optional stream line (while LLM is streaming) ────────────────
+	// ── Streaming content — incrementally rendered, no pop-in ──────
 	if m.streaming {
-		sp := m.renderFlowingSpinner()
-		streamText := m.currentStreamContent
-		maxStreamW := width - 4
-		if maxStreamW < 20 {
-			maxStreamW = 20
-		}
-		lines := strings.Split(streamText, "\n")
-		lastLine := ""
-		for i := len(lines) - 1; i >= 0; i-- {
-			if strings.TrimSpace(lines[i]) != "" {
-				lastLine = lines[i]
-				break
+		if m.currentStreamContent != "" {
+			rendered := m.renderStreamingContent(m.currentStreamContent, width)
+			if rendered != "" {
+				s.WriteString(rendered)
+				s.WriteString("\n")
 			}
 		}
-		if lipgloss.Width(lastLine) > maxStreamW {
-			lastLine = lastLine[:maxStreamW-1] + "…"
-		}
-		if streamText == "" {
-			lastLine = infoStyle.Render("thinking…")
-		}
-		s.WriteString(sp + " " + lastLine + "\n")
+		sp := m.renderFlowingSpinner()
+		s.WriteString(sp + " " + infoStyle.Render("streaming…") + "\n")
 	}
 
 	// Component A: Conditional autocomplete dropdown (above top line)
@@ -675,13 +675,11 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 			rendered = renderWidget("Command", container.String(), availableWidth, colorDimmed)
 
 		default:
-			// Route plain/markdown text through the semantic MarkdownRenderer
-			// per ASK_RENDERING.md pipeline: LLM response → AST → semantic UI
-			mr := NewMarkdownRenderer(availableWidth)
-			mdRendered := mr.Render(block.raw)
-			if mdRendered != "" {
-				// Prefix each line with the AI gutter indicator
-				mdLines := strings.Split(strings.TrimRight(mdRendered, "\n"), "\n")
+			// UNIFIED PATH: deterministic pipeline — identical for streaming and history.
+			// Replaces the goldmark-based MarkdownRenderer to eliminate layout flicker.
+			blockRendered := RenderDeterministicPipeline(block.raw, availableWidth, false)
+			if blockRendered != "" {
+				mdLines := strings.Split(strings.TrimRight(blockRendered, "\n"), "\n")
 				var styledLines []string
 				for _, line := range mdLines {
 					styledLines = append(styledLines, gutter+line)

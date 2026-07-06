@@ -2,7 +2,10 @@ package ui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 // SymbolRenderer renders a presentation-ready symbol card.
@@ -65,9 +68,20 @@ func (r *ImpactRenderer) Render(v ImpactCardViewModel) string {
 }
 
 // DiffRenderer renders standard semantic/syntax-highlighted diff regions.
+// The new implementation produces a symmetrical single-line-number gutter
+// with full-width colored background tracks for additions and deletions.
 type DiffRenderer struct {
 	Width     int
 	IsNewFile bool // When true, render single-column line numbers (new file creation)
+}
+
+// padToWidth pads s to exactly n visual cells with trailing spaces.
+func padToWidth(s string, n int) string {
+	w := lipgloss.Width(s)
+	if w >= n {
+		return s
+	}
+	return s + strings.Repeat(" ", n-w)
 }
 
 func (r *DiffRenderer) Render(v DiffCardViewModel) string {
@@ -78,66 +92,13 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 	lines := strings.Split(v.Content, "\n")
 	var renderedLines []string
 
-	contentWidth := r.Width - 14
+	contentWidth := r.Width
 	if contentWidth < 20 {
 		contentWidth = 20
 	}
 
-	wrapStringToWidth := func(text string, maxW int) []string {
-		if len(text) == 0 {
-			return []string{""}
-		}
-		if maxW <= 0 {
-			return []string{text}
-		}
-		var chunks []string
-		words := strings.Fields(text)
-		if len(words) == 0 {
-			runes := []rune(text)
-			for i := 0; i < len(runes); i += maxW {
-				end := i + maxW
-				if end > len(runes) {
-					end = len(runes)
-				}
-				chunks = append(chunks, string(runes[i:end]))
-			}
-			return chunks
-		}
-
-		var currentLine strings.Builder
-		for _, word := range words {
-			// Split words longer than maxW to prevent terminal-level wrapping
-			for len(word) > maxW {
-				if currentLine.Len() > 0 {
-					chunks = append(chunks, currentLine.String())
-					currentLine.Reset()
-				}
-				chunks = append(chunks, word[:maxW])
-				word = word[maxW:]
-			}
-			if len(word) == 0 {
-				continue
-			}
-			switch {
-			case currentLine.Len() == 0:
-				currentLine.WriteString(word)
-			case currentLine.Len()+1+len(word) <= maxW:
-				currentLine.WriteString(" ")
-				currentLine.WriteString(word)
-			default:
-				chunks = append(chunks, currentLine.String())
-				currentLine.Reset()
-				currentLine.WriteString(word)
-			}
-		}
-		if currentLine.Len() > 0 {
-			chunks = append(chunks, currentLine.String())
-		}
-		return chunks
-	}
-
-	leftLineNum := 1
-	rightLineNum := 1
+	// Hunk line tracking
+	newLineNum := 1
 
 	for _, line := range lines {
 		if strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") {
@@ -145,108 +106,97 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 		}
 
 		if strings.HasPrefix(line, "@@") {
+			// Parse hunk header for new-file starting line number
 			parts := strings.Split(line, "@@")
-			symbolHeader := ""
+			if len(parts) >= 2 {
+				header := strings.TrimSpace(parts[1])
+				fields := strings.Fields(header)
+				if len(fields) >= 2 {
+					newRange := strings.TrimPrefix(fields[1], "+")
+					newParts := strings.Split(newRange, ",")
+					if len(newParts) >= 1 {
+						if start, err := strconv.Atoi(newParts[0]); err == nil {
+							newLineNum = start
+						}
+					}
+				}
+			}
+
+			// Render hunk header as metadata line
+			hunk := diffHunkStyle.Render(padToWidth(line, contentWidth))
+			renderedLines = append(renderedLines, hunk)
+
 			if len(parts) >= 3 {
-				symbolHeader = strings.TrimSpace(parts[2])
-			}
-
-			if symbolHeader != "" {
-				// Inject clear AST-aware symbol header representation
-				renderedLines = append(renderedLines, fmt.Sprintf("  ─── Change inside Symbol: %s ───", symbolHeader))
-			}
-
-			wrappedLines := wrapStringToWidth(line, contentWidth)
-			for _, wl := range wrappedLines {
-				gutterStr := diffHunkStyle.Render("  ---  --- │ ")
-				textStr := diffHunkStyle.Render(wl)
-				renderedLines = append(renderedLines, gutterStr+textStr)
+				sym := strings.TrimSpace(parts[2])
+				if sym != "" {
+					symLine := diffHunkStyle.Render(padToWidth("  ─── "+sym+" ───", contentWidth))
+					renderedLines = append(renderedLines, symLine)
+				}
 			}
 			continue
 		}
 
 		if r.IsNewFile {
-			// NEW FILE: Single-column line numbers (right-aligned, fixed padding)
 			switch {
 			case strings.HasPrefix(line, "+"):
-				cleanLine := strings.TrimPrefix(line, "+")
-				wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
-
-				for i, wl := range wrappedLines {
-					var gutterStr string
-					if i == 0 {
-						gutterStr = semanticLineNumStyle.Render(fmt.Sprintf("%2d │ ", rightLineNum))
-						rightLineNum++
-					} else {
-						gutterStr = semanticLineNumStyle.Render("   │ ")
-					}
-					textStr := semanticAddStyle.Width(contentWidth).Render(wl)
-					renderedLines = append(renderedLines, gutterStr+textStr)
+				clean := strings.TrimPrefix(line, "+")
+				gutter := diffLineNumHLSty.Render(fmt.Sprintf("%4d │ ", newLineNum))
+				newLineNum++
+				body := "+ " + clean
+				bodyW := contentWidth - lipgloss.Width(gutter)
+				if bodyW < 0 {
+					bodyW = 0
 				}
+				row := gutter + semanticAddStyle.Render(padToWidth(body, bodyW))
+				renderedLines = append(renderedLines, row)
 			case strings.HasPrefix(line, "-"):
 				continue
 			default:
-				wrappedLines := wrapStringToWidth(line, contentWidth)
-				for i, wl := range wrappedLines {
-					var gutterStr string
-					if i == 0 {
-						gutterStr = semanticLineNumStyle.Render(fmt.Sprintf("%2d │ ", rightLineNum))
-						rightLineNum++
-					} else {
-						gutterStr = semanticLineNumStyle.Render("   │ ")
-					}
-					textStr := semanticNormalStyle.Width(contentWidth).Render(wl)
-					renderedLines = append(renderedLines, gutterStr+textStr)
+				gutter := diffLineNumSty.Render(fmt.Sprintf("%4d │ ", newLineNum))
+				newLineNum++
+				bodyW := contentWidth - lipgloss.Width(gutter)
+				if bodyW < 0 {
+					bodyW = 0
 				}
+				row := gutter + semanticNormalStyle.Render(padToWidth("  "+line, bodyW))
+				renderedLines = append(renderedLines, row)
 			}
 		} else {
-			// STANDARD DIFF
+			// STANDARD DIFF — symmetrical single-line-number gutter
 			switch {
 			case strings.HasPrefix(line, "-"):
-				cleanLine := strings.TrimPrefix(line, "-")
-				wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
-
-				for i, wl := range wrappedLines {
-					var gutterStr string
-					if i == 0 {
-						gutterStr = diffLineNumSty.Render(fmt.Sprintf("  %3d      │ - ", leftLineNum))
-						leftLineNum++
-					} else {
-						gutterStr = diffLineNumSty.Render("           │   ")
-					}
-					textStr := semanticDelStyle.Width(contentWidth).Render(wl)
-					renderedLines = append(renderedLines, gutterStr+textStr)
+				clean := strings.TrimPrefix(line, "-")
+				gutter := diffLineNumSty.Render(fmt.Sprintf("%4d │ ", newLineNum))
+				body := "- " + clean
+				bodyW := contentWidth - lipgloss.Width(gutter)
+				if bodyW < 0 {
+					bodyW = 0
 				}
+				row := gutter + diffDelBgStyle.Render(padToWidth(body, bodyW))
+				renderedLines = append(renderedLines, row)
+
 			case strings.HasPrefix(line, "+"):
-				cleanLine := strings.TrimPrefix(line, "+")
-				wrappedLines := wrapStringToWidth(cleanLine, contentWidth)
-
-				for i, wl := range wrappedLines {
-					var gutterStr string
-					if i == 0 {
-						gutterStr = diffLineNumHLSty.Render(fmt.Sprintf("       %3d │ + ", rightLineNum))
-						rightLineNum++
-					} else {
-						gutterStr = diffLineNumHLSty.Render("           │   ")
-					}
-					textStr := semanticAddStyle.Width(contentWidth).Render(wl)
-					renderedLines = append(renderedLines, gutterStr+textStr)
+				clean := strings.TrimPrefix(line, "+")
+				gutter := diffLineNumHLSty.Render(fmt.Sprintf("%4d │ ", newLineNum))
+				newLineNum++
+				body := "+ " + clean
+				bodyW := contentWidth - lipgloss.Width(gutter)
+				if bodyW < 0 {
+					bodyW = 0
 				}
+				row := gutter + diffAddBgStyle.Render(padToWidth(body, bodyW))
+				renderedLines = append(renderedLines, row)
+
 			default:
-				wrappedLines := wrapStringToWidth(line, contentWidth)
-
-				for i, wl := range wrappedLines {
-					var gutterStr string
-					if i == 0 {
-						gutterStr = diffLineNumSty.Render(fmt.Sprintf("  %3d  %3d │   ", leftLineNum, rightLineNum))
-						leftLineNum++
-						rightLineNum++
-					} else {
-						gutterStr = diffLineNumSty.Render("           │   ")
-					}
-					textStr := semanticNormalStyle.Width(contentWidth).Render(wl)
-					renderedLines = append(renderedLines, gutterStr+textStr)
+				// Context line
+				gutter := diffLineNumSty.Render(fmt.Sprintf("%4d │ ", newLineNum))
+				newLineNum++
+				bodyW := contentWidth - lipgloss.Width(gutter)
+				if bodyW < 0 {
+					bodyW = 0
 				}
+				row := gutter + diffCtxStyle.Render(padToWidth("  "+line, bodyW))
+				renderedLines = append(renderedLines, row)
 			}
 		}
 	}

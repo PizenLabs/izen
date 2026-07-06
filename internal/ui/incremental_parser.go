@@ -282,6 +282,10 @@ func parseInlineSegments(line string) []inlineSegment {
 				i = end + 1
 				continue
 			}
+			// No closing backtick: emit as plain text and advance
+			segs = append(segs, inlineSegment{text: "`", style: segPlain})
+			i++
+			continue
 		}
 
 		if i+1 < n && runes[i] == '*' && runes[i+1] == '*' {
@@ -298,6 +302,10 @@ func parseInlineSegments(line string) []inlineSegment {
 				i = end + 2
 				continue
 			}
+			// No closing **: emit opening ** as plain text and advance
+			segs = append(segs, inlineSegment{text: "**", style: segPlain})
+			i += 2
+			continue
 		}
 
 		if runes[i] == '*' {
@@ -317,6 +325,10 @@ func parseInlineSegments(line string) []inlineSegment {
 				i = end + 1
 				continue
 			}
+			// No closing *: emit opening * as plain text and advance
+			segs = append(segs, inlineSegment{text: "*", style: segPlain})
+			i++
+			continue
 		}
 
 		// Accumulate plain text

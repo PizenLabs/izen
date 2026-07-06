@@ -171,10 +171,8 @@ var (
 	widgetTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
 
 	// Semantic renderer diff styles
-	semanticDelStyle     = lipgloss.NewStyle().Background(lipgloss.Color("#3a1e24")).Foreground(lipgloss.Color("#f1707a"))
-	semanticAddStyle     = lipgloss.NewStyle().Background(lipgloss.Color("#18302b")).Foreground(lipgloss.Color("#6cd0a1"))
-	semanticNormalStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
-	semanticLineNumStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	semanticAddStyle    = lipgloss.NewStyle().Background(lipgloss.Color("#18302b")).Foreground(lipgloss.Color("#6cd0a1"))
+	semanticNormalStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 )
 
 // Mode-accent style lookup (indexed by modes.Mode value).
@@ -225,7 +223,7 @@ var (
 	}
 )
 
-// User message background (clean shaded surface, no gutter pipes)
+// User message background (warm muted surface for distinct visual nesting)
 var userBgStyle = lipgloss.NewStyle().Background(lipgloss.Color(colorSurface)).PaddingLeft(1)
 
 // ── Gutter / Label Helpers ────────────────────────────────────────────────────
