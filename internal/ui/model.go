@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -98,6 +99,10 @@ type commitGeneratedMsg struct {
 type objectiveAnalyzedMsg struct {
 	objective *domain.Objective
 	err       error
+}
+
+type archDoneMsg struct {
+	Content string
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -253,6 +258,10 @@ type model struct {
 	// Latency telemetry: marked when a turn is submitted, read back when the
 	// stream completes to compute this-turn latency for the status line.
 	streamStartTime time.Time
+
+	// AI Interrupt Engine: cancel function for active stream, set by streamCmd.
+	streamCancel       context.CancelFunc
+	interruptRequested bool
 }
 
 // ── Rendering helpers ─────────────────────────────────────────────────────────

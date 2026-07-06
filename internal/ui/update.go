@@ -163,6 +163,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case archDoneMsg:
+		for _, line := range strings.Split(msg.Content, "\n") {
+			m.push(roleSystem, infoStyle.Render(line))
+		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, nil
+
 	case smoothStreamTickMsg:
 		if len(m.streamBuffer) > 0 {
 			// Emit word-aligned chunks for a natural reading rhythm.
@@ -444,6 +452,19 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamCh = nil
 		m.streaming = false
 		m.streamParser = nil
+
+		// User-initiated interrupt — suppress error noise, just clean up.
+		if m.interruptRequested {
+			m.interruptRequested = false
+			m.responseBuffer.Reset()
+			m.currentStreamContent = ""
+			m.streamBuffer = ""
+			m.streamTickActive = false
+			m.streamCancel = nil
+			m.refreshViewportContent()
+			return m, nil
+		}
+
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
@@ -477,6 +498,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// AI INTERRUPT ENGINE: Ctrl+D cancels an active LLM stream.
+		if m.streaming && msg.Type == tea.KeyCtrlD {
+			if m.streamCancel != nil {
+				m.streamCancel()
+			}
+			m.interruptRequested = true
+			m.push(roleSystem, "[System] Generation interrupted by user.")
+			return m, nil
+		}
+
 		// In special states, route directly to handleKey.
 		if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec {
 			resModel, cmd := m.handleKey(msg)

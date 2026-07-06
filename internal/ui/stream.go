@@ -74,10 +74,12 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		Stream:   true,
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	m.streamCancel = cancel
+
 	go func() {
 		defer close(m.streamCh)
-
-		ctx, cancel := context.WithCancel(context.Background())
+		defer func() { m.streamCancel = nil }()
 		defer cancel()
 
 		rawStream, err := m.provider.ExecuteStream(ctx, req)
