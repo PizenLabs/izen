@@ -23,7 +23,7 @@ import (
 )
 
 // NewProgram initializes the active model state context and instantiates the runner engine.
-func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.Manager) *tea.Program {
+func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.Manager, localCfg *config.LocalConfig) *tea.Program {
 	eng := git.NewEngine(root)
 
 	var provider ai.Provider
@@ -43,12 +43,19 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	execEng := execution.NewEngine(root, cfg, sess)
 	execEng.SetPlanStore(planStore)
 
-	userName := os.Getenv("USER")
-	if currentUser, err := user.Current(); err == nil && currentUser.Username != "" {
-		userName = currentUser.Username
-	}
-	if userName == "" {
-		userName = "developer"
+	userName := "developer"
+	if localCfg != nil && localCfg.Username != "" {
+		userName = localCfg.Username
+	} else {
+		u := os.Getenv("USER")
+		if u == "" {
+			if currentUser, err := user.Current(); err == nil && currentUser.Username != "" {
+				u = currentUser.Username
+			}
+		}
+		if u != "" {
+			userName = u
+		}
 	}
 
 	m := &model{
@@ -124,18 +131,18 @@ func runProgram(p *tea.Program) {
 	}
 }
 
-func RunMainDashboard(cfg *config.Config, root string) {
+func RunMainDashboard(cfg *config.Config, root string, localCfg *config.LocalConfig) {
 	sess, mgr, lc := bootCommon(root, cfg)
 
 	if lc != nil {
 		defer func() { _ = lc.Stop() }()
 	}
 
-	p := NewProgram(root, cfg, sess, mgr)
+	p := NewProgram(root, cfg, sess, mgr, localCfg)
 	runProgram(p)
 }
 
-func RunRollbackEngine(cfg *config.Config, root string) {
+func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalConfig) {
 	sess, mgr, lc := bootCommon(root, cfg)
 
 	fmt.Fprintf(os.Stderr, "izen: rollback engine stub — not yet implemented (root=%s)\n", root)
@@ -144,6 +151,6 @@ func RunRollbackEngine(cfg *config.Config, root string) {
 		defer func() { _ = lc.Stop() }()
 	}
 
-	p := NewProgram(root, cfg, sess, mgr)
+	p := NewProgram(root, cfg, sess, mgr, localCfg)
 	runProgram(p)
 }

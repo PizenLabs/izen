@@ -76,16 +76,66 @@ type usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// sanitizeContent strips ANSI escape sequences and TUI UI artifact patterns
+// that may have leaked into message content from viewport/rendering buffers.
+func sanitizeContent(s string) string {
+	// Strip ANSI escape sequences
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\x1b' {
+			for i++; i < len(s); i++ {
+				if s[i] >= '@' && s[i] <= '~' {
+					break
+				}
+			}
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	clean := b.String()
+
+	// Strip lines that are purely UI chrome (status bars, prompt prefixes, etc.)
+	lines := strings.Split(clean, "\n")
+	var kept []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			kept = append(kept, line)
+			continue
+		}
+		// Skip status bar line: ● modelname · N tkn
+		if strings.HasPrefix(trimmed, "●") && strings.Contains(trimmed, "·") && (strings.Contains(trimmed, "tkn") || strings.Contains(trimmed, "tok")) {
+			continue
+		}
+		// Skip prompt prefix lines: ❯ ask ⟩ or similar
+		if strings.HasPrefix(trimmed, "❯") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+func (p *OllamaProvider) buildMessages(req ai.Request) []ollamaMessage {
+	msgs := make([]ollamaMessage, 0, len(req.Messages)+1)
+	if req.System != "" {
+		msgs = append(msgs, ollamaMessage{Role: "system", Content: req.System})
+	}
+	for _, m := range req.Messages {
+		content := sanitizeContent(m.Content)
+		msgs = append(msgs, ollamaMessage{Role: m.Role, Content: content})
+	}
+	return msgs
+}
+
 func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
 	}
 
-	msgs := make([]ollamaMessage, len(req.Messages))
-	for i, m := range req.Messages {
-		msgs[i] = ollamaMessage{Role: m.Role, Content: m.Content}
-	}
+	msgs := p.buildMessages(req)
 
 	body := ollamaRequest{
 		Model:    model,
@@ -160,10 +210,7 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		model = req.Model
 	}
 
-	msgs := make([]ollamaMessage, len(req.Messages))
-	for i, m := range req.Messages {
-		msgs[i] = ollamaMessage{Role: m.Role, Content: m.Content}
-	}
+	msgs := p.buildMessages(req)
 
 	body := ollamaRequest{
 		Model:    model,

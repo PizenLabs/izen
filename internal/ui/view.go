@@ -30,6 +30,18 @@ type contentBlock struct {
 	raw  string
 }
 
+// ── Responsive layout thresholds ────────────────────────────────────────
+// IZEN is frequently run inside a split terminal pane (tmux/Ghostty splits
+// side by side with other panes), so these thresholds let the startup
+// banner, status line, and autocomplete dropdown rearrange their content
+// instead of overflowing or wrapping mid-render when width is limited.
+const (
+	wideBannerThreshold     = 76 // >= : side-by-side robot art + text banner
+	compactStatusThreshold  = 64 // <  : drop checkpoint id / git branch from status line & banner meta
+	minimalStatusThreshold  = 46 // <  : drop model name from status line, keep spinner + tokens only
+	dropdownTwoColThreshold = 56 // <  : collapse file autocomplete to a single column
+)
+
 // View returns the full UI state.
 // The scrollable chat history is rendered inside the viewport; metadata bars,
 // the input line, and the status line are pinned to the bottom of the terminal.
@@ -172,33 +184,63 @@ func (m *model) renderAutocompleteDropdown(width int) string {
 	b.WriteString(subtleStyle.Render("╭"+titleSection+strings.Repeat("─", topFiller)+"╮") + "\n")
 
 	if m.autocompleteType == "file" {
-		for i, item := range list {
-			name := filepath.Base(item)
-			dir := filepath.Dir(item)
-			if dir == "." {
-				dir = "./"
+		if width < dropdownTwoColThreshold {
+			// Narrow/split-pane fallback: the directory column has no room
+			// to breathe next to the filename, so collapse to a single
+			// column showing just the (possibly truncated) path.
+			for i, item := range list {
+				icon := "↪ "
+				if i == m.autocompleteIdx {
+					icon = "▶ "
+				}
+				display := icon + item
+				maxContent := width - 4
+				if maxContent < 6 {
+					maxContent = 6
+				}
+				if lipgloss.Width(display) > maxContent {
+					display = display[:maxContent-1] + "…"
+				}
+				pad := width - lipgloss.Width(display) - 4
+				if pad < 0 {
+					pad = 0
+				}
+				rowString := display + strings.Repeat(" ", pad)
+				if i == m.autocompleteIdx {
+					b.WriteString("│ " + highlightedBgStyle.Render(rowString) + " │\n")
+				} else {
+					b.WriteString("│ " + textStyle.Render(rowString) + " │\n")
+				}
 			}
+		} else {
+			for i, item := range list {
+				name := filepath.Base(item)
+				dir := filepath.Dir(item)
+				if dir == "." {
+					dir = "./"
+				}
 
-			icon := "◽ "
-			if i == m.autocompleteIdx {
-				icon = "▶ "
-			}
+				icon := "↪ "
+				if i == m.autocompleteIdx {
+					icon = "▶ "
+				}
 
-			// Left column: file name (high contrast)
-			leftSide := textStyle.Render(icon + name)
-			// Right column: parent directory (low contrast #6c7086)
-			rightSide := mutedStyle.Render(dir + " ")
+				// Left column: file name (high contrast)
+				leftSide := textStyle.Render(icon + name)
+				// Right column: parent directory (low contrast #6c7086)
+				rightSide := mutedStyle.Render(dir + " ")
 
-			paddingCount := width - lipgloss.Width(icon+name) - lipgloss.Width(dir+" ") - 4
-			if paddingCount < 0 {
-				paddingCount = 0
-			}
+				paddingCount := width - lipgloss.Width(icon+name) - lipgloss.Width(dir+" ") - 4
+				if paddingCount < 0 {
+					paddingCount = 0
+				}
 
-			if i == m.autocompleteIdx {
-				rowString := leftSide + strings.Repeat(" ", paddingCount) + rightSide
-				b.WriteString("│ " + highlightedBgStyle.Render(rowString) + " │\n")
-			} else {
-				b.WriteString("│ " + leftSide + strings.Repeat(" ", paddingCount) + rightSide + " │\n")
+				if i == m.autocompleteIdx {
+					rowString := leftSide + strings.Repeat(" ", paddingCount) + rightSide
+					b.WriteString("│ " + highlightedBgStyle.Render(rowString) + " │\n")
+				} else {
+					b.WriteString("│ " + leftSide + strings.Repeat(" ", paddingCount) + rightSide + " │\n")
+				}
 			}
 		}
 	} else {
@@ -230,7 +272,7 @@ func (m *model) renderAutocompleteDropdown(width int) string {
 				if itemIdx == m.autocompleteIdx {
 					b.WriteString("│ " + highlightedBgStyle.Render("▶ "+rowString) + " │\n")
 				} else {
-					b.WriteString("│ " + dimmedStyle.Render("◽ "+rowString) + " │\n")
+					b.WriteString("│ " + dimmedStyle.Render("↪ "+rowString) + " │\n")
 				}
 				itemIdx++
 			}
@@ -288,8 +330,7 @@ func (m *model) renderRuntimeStatus(width int) string {
 
 	// Streaming/agent spinner or idle bullet
 	if m.streaming || m.agentRunning {
-		idx := m.spinnerFrame % len(taskSpinnerFrames)
-		b.WriteString(cyanStyle.Render(taskSpinnerFrames[idx]))
+		b.WriteString(redDotStyle.Render("⌘"))
 	} else {
 		b.WriteString(dimmedStyle.Render("●"))
 	}
@@ -297,17 +338,16 @@ func (m *model) renderRuntimeStatus(width int) string {
 
 	// AI INTERRUPT ENGINE: high-visibility indicator when streaming
 	if m.streaming {
-		b.WriteString(redStyle.Render("● "))
-		b.WriteString(maroonStyle.Render("[Ctrl+D] Interrupt AI "))
+		b.WriteString(interruptLabelStyle.Render("[Ctrl+D] interrupt "))
 	}
 
-	// Model name
-	b.WriteString(dimmedStyle.Render(m.cfg.ActiveModelName()))
+	// Model name — dropped first when the pane is too narrow to fit it.
+	if width >= minimalStatusThreshold {
+		b.WriteString(dimmedStyle.Render(m.cfg.ActiveModelName()))
+		b.WriteString(dimmedStyle.Render(" · "))
+	}
 
-	// Separator
-	b.WriteString(dimmedStyle.Render(" │ "))
-
-	// Tokens
+	// Tokens — always shown; this is the minimum viable status line.
 	if m.TotalTokens > 0 {
 		b.WriteString(textStyle.Render(strconv.Itoa(m.TotalTokens)))
 		b.WriteString(dimmedStyle.Render(" tkn"))
@@ -315,14 +355,17 @@ func (m *model) renderRuntimeStatus(width int) string {
 		b.WriteString(dimmedStyle.Render("0 tkn"))
 	}
 
-	// Checkpoint (truncated)
-	if cp := m.latestCheckpointID(); cp != "" {
-		cp = strings.TrimPrefix(cp, "cp-")
-		if len(cp) > 7 {
-			cp = cp[:7]
+	// Checkpoint (truncated) — dropped next-to-last as panes narrow, since
+	// it's the least essential glance-able piece of runtime telemetry.
+	if width >= compactStatusThreshold {
+		if cp := m.latestCheckpointID(); cp != "" {
+			cp = strings.TrimPrefix(cp, "cp-")
+			if len(cp) > 7 {
+				cp = cp[:7]
+			}
+			b.WriteString(dimmedStyle.Render(" · "))
+			b.WriteString(dimmedStyle.Render("cp-" + cp))
 		}
-		b.WriteString(dimmedStyle.Render(" │ "))
-		b.WriteString(dimmedStyle.Render("cp-" + cp))
 	}
 
 	return b.String()
@@ -365,6 +408,10 @@ func (m *model) getGreeting() string {
 }
 
 func (m *model) renderStartupBanner(termWidth int) string {
+	if termWidth < wideBannerThreshold {
+		return m.renderStartupBannerCompact(termWidth)
+	}
+
 	innerW := termWidth - 6
 	if innerW < 60 {
 		innerW = 60
@@ -433,6 +480,54 @@ func (m *model) renderStartupBanner(termWidth int) string {
 	rows = append(rows, divider, meta, "", tip)
 	body := strings.Join(rows, "\n")
 
+	return bannerBorderStyle.Width(termWidth - 2).Render(body)
+}
+
+// renderStartupBannerCompact renders a single-column banner for narrow or
+// split terminal panes. The two-column robot-art layout used by
+// renderStartupBanner assumes a minimum width to stay readable; below
+// wideBannerThreshold it would either overflow the pane or force a wider
+// box than the pane actually has. This stacks the same content vertically
+// instead, scaled to the real (possibly very narrow) termWidth.
+func (m *model) renderStartupBannerCompact(termWidth int) string {
+	innerW := termWidth - 4
+	if innerW < 20 {
+		innerW = 20
+	}
+
+	initialCap := 5 + 2*len(bannerModes) + 2
+	rows := make([]string, 0, initialCap)
+	rows = append(rows,
+		boldAccentStyle.Render(m.getGreeting()),
+		boldAccentStyle.Render("IZEN"),
+		textStyle.Render("engineering intelligence."),
+		textStyle.Render("human in control."),
+		"",
+	)
+	for _, mode := range bannerModes {
+		rows = append(rows, boldTextStyle.Render(mode.name))
+		rows = append(rows, "  "+mutedStyle.Render(mode.desc))
+	}
+
+	divider := subtleStyle.Render(strings.Repeat("─", innerW))
+
+	// Meta line: version always shown; provider/model and git branch are
+	// dropped as the pane narrows further, same priority order as the
+	// runtime status line.
+	metaParts := []string{mutedStyle.Render("v" + version)}
+	if termWidth >= compactStatusThreshold {
+		provider := m.cfg.ActiveProviderName()
+		modelName := m.cfg.ActiveModelName()
+		metaParts = append(metaParts, mutedStyle.Render(provider+" "+modelName))
+		if branch, err := m.gitEng.Branch(); err == nil && branch != "" {
+			metaParts = append(metaParts, mutedStyle.Render("git ("+branch+")"))
+		}
+	}
+	meta := strings.Join(metaParts, subtleStyle.Render(" • "))
+
+	rows = append(rows, divider, meta)
+
+	body := strings.Join(rows, "\n")
 	return bannerBorderStyle.Width(termWidth - 2).Render(body)
 }
 

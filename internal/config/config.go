@@ -30,6 +30,7 @@ type Config struct {
 	Fallback  FallbackConfig  `yaml:"fallback"`
 	Lynx      LynxConfig      `yaml:"lynx"`
 	MCP       MCPConfig       `yaml:"mcp"`
+	Username  string          `yaml:"username"`
 }
 
 type ModelConfig struct {
