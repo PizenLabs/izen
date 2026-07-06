@@ -60,7 +60,7 @@ jobs:
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - run: govulncheck ./...
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage-go
           path: coverage-go.out
@@ -104,7 +104,7 @@ jobs:
       - run: cargo tarpaulin --workspace --locked --out Lcov --output-dir .
       - run: test -f lcov.info
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage-rust
           path: lynx/lcov.info
