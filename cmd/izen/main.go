@@ -1,11 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
-	"strings"
-	"time"
 
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/state"
@@ -91,53 +88,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := state.EnsureRuntimeBinaries(); err != nil {
-		fmt.Fprintf(os.Stderr, "izen: runtime binary error: %v\n", err)
-		os.Exit(1)
-	}
-
 	// ---- Local context boundary enforcement ----
 	root := targetDir
 
 	localCfg, _ := config.LoadLocalConfig(root)
-	if !state.HasLocalState(root) {
-		reader := bufio.NewReader(os.Stdin)
-		fmt.Print("Initialize Izen architecture for this repository? (y/n): ")
-		answer, _ := reader.ReadString('\n')
-		answer = strings.TrimSpace(strings.ToLower(answer))
-		if answer != "y" && answer != "yes" {
-			fmt.Println("Aborted. Run 'izen' again when ready.")
-			os.Exit(0)
-		}
-
-		if err := state.InitLocalState(root); err != nil {
-			fmt.Fprintf(os.Stderr, "izen: warning: local state init: %v\n", err)
-		}
-
-		defaultName := os.Getenv("USER")
-		if defaultName == "" {
-			defaultName = "developer"
-		}
-		fmt.Printf("What should I call you? (default: %s): ", defaultName)
-		nameAnswer, _ := reader.ReadString('\n')
-		nameAnswer = strings.TrimSpace(nameAnswer)
-		if nameAnswer == "" {
-			nameAnswer = defaultName
-		}
-
-		localCfg = &config.LocalConfig{Username: nameAnswer}
-		if err := config.SaveLocalConfig(root, localCfg); err != nil {
-			fmt.Fprintf(os.Stderr, "izen: warning: saving local config: %v\n", err)
-		}
-
-		fmt.Printf("✨ Welcome aboard, @%s! Configuration saved.\n", nameAnswer)
-		time.Sleep(500 * time.Millisecond)
-		fmt.Print("\033[H\033[2J")
-	} else {
-		if err := state.InitLocalState(root); err != nil {
-			fmt.Fprintf(os.Stderr, "izen: warning: local state init: %v\n", err)
-		}
-	}
 
 	if err := state.MigrateLegacyFiles(root); err != nil {
 		fmt.Fprintf(os.Stderr, "izen: migration warning: %v\n", err)

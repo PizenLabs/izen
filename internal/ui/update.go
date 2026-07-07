@@ -22,6 +22,9 @@ import (
 // Init initializes the spinner tick and text input blink.
 func (m *model) Init() tea.Cmd {
 	m.currentTip = randomTip()
+	if m.initStage != initNone && m.initStage != initComplete {
+		return m.spinnerTickCmd()
+	}
 	return tea.Batch(m.spinnerTickCmd(), m.ti.Focus())
 }
 
@@ -45,6 +48,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.Viewport.GotoBottom()
 				return m, nil
 			}
+		}
+	}
+
+	// ── INIT STAGE ROUTING: intercept all key messages during setup ─────
+	if m.initStage != initNone && m.initStage != initComplete {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			return m.handleInitKeyMsg(keyMsg)
+		}
+		if _, ok := msg.(tea.WindowSizeMsg); ok {
+			// Fall through to window resize below for init stage too
+		} else {
+			return m, nil
 		}
 	}
 
@@ -76,7 +91,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// IZEN SAFETY VALVE: force-clear stale review lock after 30s
 		if m.reviewRunning && time.Since(m.lastActionTime) > 30*time.Second {
 			m.reviewRunning = false
+			m.agentRunning = false
 			m.agentLabel = ""
+			m.agentDone = true
 			m.lastActionTime = time.Time{}
 			m.push(roleSystem, mutedStyle.Render("[safety] review action timed out — spinner force-cleared"))
 			m.refreshViewportContent()
@@ -111,9 +128,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case investigateResultMsg:
 		m.agentRunning = false
+		m.reviewRunning = false
 		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+msg.err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
 		}
 		if msg.sessionKey != "" {
 			m.sess.SetInvestigationID(msg.sessionKey)
@@ -124,14 +148,31 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamParser = nil
 		m.pushRecords(msg.records)
 		m.push(roleSystem, "[System] Engine diagnostics collected. Escalating to LLM for analysis...")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
 		return m, tea.Batch(flush, m.streamCmd(msg.escalationContent))
 
+	case graphBuiltMsg:
+		m.agentRunning = false
+		if msg.err == nil && msg.graph != nil {
+			m.graph = msg.graph
+		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		flush := m.flushPendingRecords()
+		return m, flush
+
 	case reviewResultMsg:
 		m.agentRunning = false
+		m.reviewRunning = false
 		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
 		if msg.err != nil {
 			m.push(roleError, "review error: "+msg.err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -142,6 +183,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.saveReportFn != nil {
 			msg.saveReportFn()
 		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
 		return m, flush
 

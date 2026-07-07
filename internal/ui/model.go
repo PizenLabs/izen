@@ -28,6 +28,18 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 )
 
+// ── Init stage types ──────────────────────────────────────────────────────────
+
+type initStage int
+
+const (
+	initNone initStage = iota
+	initConfirm
+	initIdentity
+	initProviderSelect
+	initComplete
+)
+
 // ── Message types ─────────────────────────────────────────────────────────────
 
 type role uint8
@@ -121,6 +133,21 @@ type shellOutputMsg struct {
 }
 
 var _ tea.Msg = shellOutputMsg{}
+
+type graphBuiltMsg struct {
+	graph *graph.Graph
+	err   error
+}
+
+func buildGraphCmd(eng *graph.Engine) tea.Cmd {
+	return func() tea.Msg {
+		g, _, err := eng.BuildOrLoad()
+		if err != nil {
+			return graphBuiltMsg{err: err}
+		}
+		return graphBuiltMsg{graph: g}
+	}
+}
 
 type testResultMsg struct {
 	output string
@@ -368,6 +395,23 @@ type model struct {
 
 	// Build verification flag: set after build mutation auto-test
 	buildVerifyPending bool
+
+	// Workspace root path for config/session persistence
+	workspaceRoot string
+
+	// Init/setup state machine
+	initStage          initStage
+	initConfirmDone    bool
+	initIdentityInput  textinput.Model
+	initProviderIdx    int
+	initProviderFilter string
+	initProviderItems  []string
+
+	// Read-only prefill defaults sourced from the global ~/.izen/config.yml.
+	// These seed the interactive onboarding form values so the user can
+	// simply press Enter to confirm; they never bypass onboarding.
+	initPrefillUsername string
+	initPrefillProvider string
 }
 
 // ── Rendering helpers ─────────────────────────────────────────────────────────

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -20,6 +21,7 @@ import (
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/session"
+	"github.com/PizenLabs/izen/internal/state"
 )
 
 // NewProgram initializes the active model state context and instantiates the runner engine.
@@ -32,7 +34,6 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	}
 
 	graphEng := graph.NewEngine(root)
-	g, _, _ := graphEng.BuildOrLoad()
 
 	ti := textinput.New()
 	ti.Prompt = ""
@@ -58,23 +59,86 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		}
 	}
 
+	// ── STRICT LOCAL-FIRST ONBOARDING DETECTOR ────────────────────────
+	// The init gate MUST be driven exclusively by the CURRENT local repo.
+	// A global ~/.izen/config.yml from a previous workspace is NEVER used to
+	// bypass onboarding for a brand-new repo — it is read only as a read-only
+	// source of pre-filled default form values (username + provider).
+	//
+	//   Branch 1 (Local Active): .izen/config.json exists locally
+	//       -> initStage = initComplete, enter workspace.
+	//   Branch 2 (Local Missing): .izen/config.json does NOT exist locally
+	//       -> initStage = initConfirm, trigger interactive TUI setup.
+	//       (regardless of whether a global ~/.izen/config.yml exists)
+	//
+	// localCfg is loaded from .izen/config.json but is an empty struct when the
+	// file is absent, so we verify disk presence directly to decide the gate.
+	localCfgPath := filepath.Join(root, ".izen", "config.json")
+	_, localCfgErr := os.Stat(localCfgPath)
+	localActive := localCfgErr == nil
+
+	// Read-only pre-population: global footprint used ONLY to seed form
+	// defaults — never to advance initStage past initConfirm.
+	var globalUsername string
+	var globalProvider string
+	if home, homeErr := os.UserHomeDir(); homeErr == nil && home != "" {
+		if g, gErr := config.Load(); gErr == nil {
+			if g.Username != "" {
+				globalUsername = g.Username
+			}
+			if g.AI.DefaultProvider != "" {
+				globalProvider = g.AI.DefaultProvider
+			}
+		}
+	}
+
+	initStage := initComplete
+	if !localActive {
+		// Even if a local .izen/config.json is missing but .izen/ dir state
+		// exists, recover into the completed state rather than re-onboarding.
+		if state.HasLocalState(root) {
+			localActive = true
+		}
+	}
+	if !localActive {
+		initStage = initConfirm // Local missing — halt at interactive TUI
+	}
+
+	// ── DEFERRED GRAPH LOAD ─────────────────────────────────────────────
+	// Graph cache must not be loaded before the onboarding detector runs,
+	// because BuildOrLoad creates .izen/graph/ and would cause a false
+	// positive in HasLocalState, bypassing the TUI onboarding flow.
+	var g *graph.Graph
+	if initStage == initComplete && state.HasLocalState(root) {
+		g, _, _ = graphEng.BuildOrLoad()
+	}
+	if g == nil {
+		g = graph.NewGraph(root)
+	}
+
 	m := &model{
-		cfg:           cfg,
-		sess:          sess,
-		provider:      provider,
-		mgr:           mgr,
-		gitEng:        eng,
-		graphEng:      graphEng,
-		graph:         g,
-		resolver:      modes.NewResolver(),
-		attachedFiles: make([]string, 0),
-		execEng:       execEng,
-		planStore:     planStore,
-		ti:            ti,
-		showBanner:    true,
-		IsCloudModel:  cfg.ActiveProviderName() != "ollama",
-		ContextLimit:  128000,
-		userName:      userName,
+		cfg:                 cfg,
+		sess:                sess,
+		provider:            provider,
+		mgr:                 mgr,
+		gitEng:              eng,
+		graphEng:            graphEng,
+		graph:               g,
+		resolver:            modes.NewResolver(),
+		attachedFiles:       make([]string, 0),
+		execEng:             execEng,
+		planStore:           planStore,
+		ti:                  ti,
+		showBanner:          true,
+		IsCloudModel:        cfg.ActiveProviderName() != "ollama",
+		ContextLimit:        128000,
+		userName:            userName,
+		workspaceRoot:       root,
+		initStage:           initStage,
+		initProviderIdx:     0,
+		initProviderFilter:  "",
+		initPrefillUsername: globalUsername,
+		initPrefillProvider: globalProvider,
 	}
 	m.resolver.Set(sess.Mode)
 	m.loadHistory()

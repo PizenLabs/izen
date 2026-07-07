@@ -57,6 +57,10 @@ const (
 // margin regardless of autocomplete toggling, state transitions, or proposal
 // expansion.
 func (m *model) View() string {
+	if m.initStage != initNone && m.initStage != initComplete {
+		return m.renderInitView()
+	}
+
 	if m.showHelpOverlay {
 		return m.renderHelpOverlay()
 	}
