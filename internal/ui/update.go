@@ -229,6 +229,101 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		flush := m.flushPendingRecords()
 		return m, tea.Batch(flush, m.streamCmd(msg.content))
 
+	case envResultMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		if msg.err != nil {
+			m.push(roleError, "env diagnostics error: "+msg.err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+		// Prepend env diagnostics to LastFailureLog for cumulative forensic data
+		if m.handoffCtx.LastFailureLog != "" {
+			m.handoffCtx.LastFailureLog = msg.content + "\n" + m.handoffCtx.LastFailureLog
+		} else {
+			m.handoffCtx.LastFailureLog = msg.content
+		}
+		m.push(roleSystem, msg.content)
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		flush := m.flushPendingRecords()
+		return m, flush
+
+	case traceResultMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		if msg.err != nil {
+			m.push(roleError, "trace execution error: "+msg.err.Error())
+		}
+
+		// Token optimization: truncate middle if output exceeds 4000 chars
+		output := msg.output
+		if len(output) > 4000 {
+			top := output[:2000]
+			bottom := output[len(output)-2000:]
+			output = top + "\n... [TRUNCATED " + strconv.Itoa(len(msg.output)-4000) + " bytes] ...\n" + bottom
+		}
+
+		if output != "" {
+			for _, line := range strings.Split(output, "\n") {
+				if line == "" {
+					continue
+				}
+				role := roleSystem
+				if strings.Contains(line, "FAIL") || strings.Contains(line, "error") || strings.Contains(line, "panic") || strings.Contains(line, "WARNING: DATA RACE") {
+					role = roleError
+				} else if strings.Contains(line, "PASS") || strings.Contains(line, "ok") {
+					role = roleStatus
+				}
+				m.push(role, line)
+			}
+		}
+
+		// Pipe execution log into handoff context for $diagnose
+		m.handoffCtx.LastFailureLog = msg.output
+		m.handoffCtx.TargetScope = msg.target
+
+		statusLine := fmt.Sprintf("trace: %d total, %d failed — target %q", msg.total, msg.failed, msg.target)
+		if msg.passed {
+			statusLine = greenStyle.Render("✓ trace passed (" + strconv.Itoa(msg.total) + ") — " + msg.target)
+		} else {
+			statusLine = redStyle.Render("✗ " + statusLine)
+		}
+		m.push(roleSystem, infoStyle.Render(statusLine))
+
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		flush := m.flushPendingRecords()
+		return m, flush
+
+	case diagnoseResultMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		if msg.err != nil {
+			m.push(roleError, "diagnosis error: "+msg.err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+		m.push(roleSystem, "[System] Running deep root cause analysis on qwen2.5-coder with forensic evidence...")
+		m.streamCh = nil
+		m.streaming = false
+		m.streamParser = nil
+		flush := m.flushPendingRecords()
+		return m, tea.Batch(flush, m.streamCmd(msg.content))
+
 	case objectiveAnalyzedMsg:
 		if msg.err != nil {
 			m.uiNotice = "Objective analysis failed: " + msg.err.Error()

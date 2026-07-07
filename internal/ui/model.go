@@ -135,6 +135,25 @@ type fixResultMsg struct {
 	err     error
 }
 
+type envResultMsg struct {
+	content string
+	err     error
+}
+
+type traceResultMsg struct {
+	output string
+	target string
+	passed bool
+	failed int
+	total  int
+	err    error
+}
+
+type diagnoseResultMsg struct {
+	content string
+	err     error
+}
+
 // ── Handoff Context ───────────────────────────────────────────────────────────
 
 // HandoffContext carries state across mode boundaries for the smart handoff

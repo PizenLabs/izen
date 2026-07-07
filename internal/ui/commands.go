@@ -413,6 +413,11 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  $test [path]  run tests (safety-gated for large repos)"))
 		m.push(roleSystem, infoStyle.Render("  $run  [path]  run go build (safety-gated for large repos)"))
 		m.push(roleSystem, infoStyle.Render("  $fix          auto-fix from last test/run failure output"))
+		m.push(roleSystem, infoStyle.Render(""))
+		m.push(roleSystem, labelBoldStyle.Render("investigate sub-commands ($)"))
+		m.push(roleSystem, infoStyle.Render("  $env            capture environment diagnostics"))
+		m.push(roleSystem, infoStyle.Render("  $trace <fn>     live execution trace with -race"))
+		m.push(roleSystem, infoStyle.Render("  $diagnose       root cause analysis from forensic data"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, infoStyle.Render("  @<path>  reference a file in your message"))
 		return nil
@@ -878,35 +883,69 @@ func (m *model) runFixCmd(target string) tea.Cmd {
 	)
 }
 
-// handleReviewDollar routes $run, $test, and $fix sub-commands.
+// handleReviewDollar routes $ sub-commands.
+// ModeReview: $test, $run, $fix
+// ModeInvestigate: $env, $trace, $diagnose
 // Sets reviewRunning synchronously so the view can render an immediate
 // spinner before the async agentStartMsg is processed.
 func (m *model) handleReviewDollar(line string) tea.Cmd {
 	action := strings.TrimSpace(line[1:])
+	mode := m.resolver.Current()
 
 	var cmd tea.Cmd
 
 	switch {
-	case action == "test" || strings.HasPrefix(action, "test "):
+	case mode == modes.ModeReview && (action == "test" || strings.HasPrefix(action, "test ")):
 		m.reviewRunning = true
 		m.lastActionTime = time.Now()
 		rest := strings.TrimSpace(strings.TrimPrefix(action, "test"))
 		cmd = m.runTestCmd(rest)
 
-	case action == "run" || strings.HasPrefix(action, "run "):
+	case mode == modes.ModeReview && (action == "run" || strings.HasPrefix(action, "run ")):
 		m.reviewRunning = true
 		m.lastActionTime = time.Now()
 		rest := strings.TrimSpace(strings.TrimPrefix(action, "run"))
 		cmd = m.runRunCmd(rest)
 
-	case action == "fix" || strings.HasPrefix(action, "fix "):
+	case mode == modes.ModeReview && (action == "fix" || strings.HasPrefix(action, "fix ")):
 		m.reviewRunning = true
 		m.lastActionTime = time.Now()
 		rest := strings.TrimSpace(strings.TrimPrefix(action, "fix"))
 		cmd = m.runFixCmd(rest)
 
+	case mode == modes.ModeInvestigate && action == "env":
+		m.reviewRunning = true
+		m.lastActionTime = time.Now()
+		cmd = m.runEnvCmd()
+
+	case mode == modes.ModeInvestigate && (strings.HasPrefix(action, "trace ") || action == "trace"):
+		m.reviewRunning = true
+		m.lastActionTime = time.Now()
+		rest := strings.TrimSpace(strings.TrimPrefix(action, "trace"))
+		if rest == "" {
+			m.push(roleError, "usage: $trace <TestFunctionName>")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+		cmd = m.runTraceCmd(rest)
+
+	case mode == modes.ModeInvestigate && action == "diagnose":
+		m.reviewRunning = true
+		m.lastActionTime = time.Now()
+		cmd = m.runDiagnoseCmd()
+
 	default:
-		m.push(roleError, fmt.Sprintf("unknown review action: $%s (use $run, $test, or $fix)", action))
+		switch mode {
+		case modes.ModeReview:
+			m.push(roleError, fmt.Sprintf("unknown review action: $%s (use $test, $run, or $fix)", action))
+		case modes.ModeInvestigate:
+			m.push(roleError, fmt.Sprintf("unknown investigate action: $%s (use $env, $trace, or $diagnose)", action))
+		default:
+			m.push(roleError, fmt.Sprintf("$ sub-commands not available in /%s mode", mode))
+		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
 		return nil
 	}
 
@@ -915,6 +954,158 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 		m.lastActionTime = time.Time{}
 	}
 	return cmd
+}
+
+// runEnvCmd captures Go version, git status, and key environment variables
+// into a structured [SYSTEM ENVIRONMENT DIAGNOSTICS] block.
+func (m *model) runEnvCmd() tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg {
+			return agentStartMsg{label: "env diagnostics"}
+		},
+		func() tea.Msg {
+			var b strings.Builder
+			b.WriteString("\n═══════════════════════════════════════════\n")
+			b.WriteString("  [SYSTEM ENVIRONMENT DIAGNOSTICS]\n")
+			b.WriteString("═══════════════════════════════════════════\n")
+
+			goVer, _ := execShell("go version")
+			goVer = strings.TrimSpace(goVer)
+			fmt.Fprintf(&b, "  Go Version : %s\n", goVer)
+
+			branch, branchErr := m.gitEng.Branch()
+			hash, hashErr := m.gitEng.CurrentHash()
+			if branchErr == nil {
+				fmt.Fprintf(&b, "  Git Branch : %s\n", branch)
+			}
+			if hashErr == nil {
+				fmt.Fprintf(&b, "  Git Commit : %s\n", hash)
+			}
+
+			statusOut, _ := execShell("git status --short")
+			if strings.TrimSpace(statusOut) != "" {
+				b.WriteString("  Git Dirt   :\n")
+				for _, line := range strings.Split(strings.TrimRight(statusOut, "\n"), "\n") {
+					line = strings.TrimSpace(line)
+					if line != "" {
+						fmt.Fprintf(&b, "    %s\n", line)
+					}
+				}
+			}
+
+			b.WriteString("  Environment :\n")
+			relevantVars := []string{"GOPATH", "GO111MODULE", "GOFLAGS", "GOROOT", "PATH", "SHELL", "TERM", "HOME"}
+			for _, name := range relevantVars {
+				if val, ok := os.LookupEnv(name); ok {
+					fmt.Fprintf(&b, "    %s=%s\n", name, val)
+				}
+			}
+
+			b.WriteString("═══════════════════════════════════════════\n")
+
+			return envResultMsg{content: b.String()}
+		},
+	)
+}
+
+// runTraceCmd dispatches a live go test -run=[target] -v -race execution
+// and captures full stdout/stderr including panic frames and data races.
+func (m *model) runTraceCmd(target string) tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg {
+			return agentStartMsg{label: "tracing: " + target}
+		},
+		func() tea.Msg {
+			runner := execExecutionRunner(".")
+			cmd := "go test -run=" + target + " -v -race 2>&1"
+			result, err := runner.Run(cmd)
+
+			output := ""
+			passed := true
+			failedCount := 0
+			totalCount := 0
+
+			if result != nil {
+				output = result.Stdout
+				if result.Stderr != "" {
+					if output != "" {
+						output += "\n"
+					}
+					output += result.Stderr
+				}
+				for _, line := range strings.Split(output, "\n") {
+					if strings.Contains(line, "--- FAIL:") {
+						failedCount++
+					}
+					if strings.Contains(line, "--- PASS:") {
+						totalCount++
+					}
+				}
+				totalCount += failedCount
+				if result.ExitCode != 0 || failedCount > 0 {
+					passed = false
+				}
+			}
+			if err != nil && output == "" {
+				output = err.Error()
+				passed = false
+			}
+
+			return traceResultMsg{
+				output: output,
+				target: target,
+				passed: passed,
+				failed: failedCount,
+				total:  totalCount,
+				err:    err,
+			}
+		},
+	)
+}
+
+// runDiagnoseCmd builds the RCA payload from accumulated forensic data
+// (LastFailureLog + $trace + $env) and dispatches it through streamCmd
+// with strict output schema constraints.
+func (m *model) runDiagnoseCmd() tea.Cmd {
+	content := m.buildDiagnoseContent()
+	if content == "" {
+		return tea.Batch(
+			func() tea.Msg {
+				m.push(roleError, "$diagnose: no forensic data available — run $env and $trace first")
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return agentDoneMsg{}
+			},
+		)
+	}
+	return tea.Batch(
+		func() tea.Msg {
+			return agentStartMsg{label: "rca analysis"}
+		},
+		func() tea.Msg {
+			return diagnoseResultMsg{content: content}
+		},
+	)
+}
+
+// buildDiagnoseContent assembles the LLM prompt from the handoff context.
+// Seeds strict RCA output schema and binds all collected forensic data.
+func (m *model) buildDiagnoseContent() string {
+	if m.handoffCtx.LastFailureLog == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("You are a Root Cause Analysis engine operating under strict Evidence-First principles.\n")
+	b.WriteString("You MUST NOT write casual conversation, ask clarifying questions, or provide generic advice.\n")
+	b.WriteString("You MUST adhere strictly to the following normalized Markdown schema in your response:\n\n")
+	b.WriteString("### 🚨 RUNTIME ROOT CAUSE ANALYSED\n")
+	b.WriteString("- **Issue Detected:** [Concise architectural description of the failure]\n")
+	b.WriteString("- **Runtime Evidence:** [Extracted log line, panic frame, or memory state culprit]\n")
+	b.WriteString("- **Proposed Resolution:** [Concrete steps to alter code architecture/mutations]\n\n")
+	b.WriteString("---\n\n")
+	b.WriteString("## FORENSIC DATA\n\n")
+	b.WriteString(m.handoffCtx.LastFailureLog)
+	return b.String()
 }
 
 func execShell(cmd string) (string, error) {
