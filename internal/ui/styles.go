@@ -167,8 +167,6 @@ var (
 	widgetTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
 
 	// Catppuccin Mocha soft interrupt indicator
-	// Active dot: Mocha Red #f38ba8, label: Mocha Maroon #eba0ac blended with muted #6c7086
-	redDotStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRed))
 	interruptLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMaroon)).Faint(true)
 
 	// Semantic renderer diff styles
@@ -244,7 +242,7 @@ var (
 var userBgStyle = lipgloss.NewStyle().Background(lipgloss.Color(colorSurface)).PaddingLeft(1)
 
 // ── Interrupt Boundary Spinner ────────────────────────────────────────────
-var SpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+var ProposalSpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 var SpinnerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))
 
 // ── Gutter / Label Helpers ────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ func (m *model) dismissSuggestions() {
 	m.suggestions = nil
 	m.suggestionIdx = 0
 	m.syncAutocompleteFromSuggestions()
+	m.recalcViewportHeight()
 }
 
 func (m *model) updateSuggestions() {
@@ -32,6 +33,9 @@ func (m *model) updateSuggestions() {
 			m.showSuggestions = false
 		}
 		m.syncAutocompleteFromSuggestions()
+		if m.autocompleteActive {
+			m.recalcViewportHeight()
+		}
 		return
 	}
 	atIdx := strings.LastIndex(current, "@")
@@ -46,6 +50,9 @@ func (m *model) updateSuggestions() {
 				m.showSuggestions = false
 			}
 			m.syncAutocompleteFromSuggestions()
+			if m.autocompleteActive {
+				m.recalcViewportHeight()
+			}
 			return
 		}
 	}
@@ -63,12 +70,14 @@ func (m *model) syncAutocompleteFromSuggestions() {
 }
 
 // dismissAutocomplete cleanly closes the dropdown and clears both state systems.
+// Restores viewport height that was reserved for the dropdown.
 func (m *model) dismissAutocomplete() {
 	m.autocompleteActive = false
 	m.autocompleteType = ""
 	m.autocompleteItems = nil
 	m.autocompleteIdx = 0
 	m.dismissSuggestions()
+	m.recalcViewportHeight()
 }
 
 // navigateAutocomplete moves the dropdown highlight by dir (+1 or -1).
@@ -125,6 +134,7 @@ func (m *model) completeAutocomplete() {
 
 	m.autocompleteActive = false
 	m.syncInputFromTI()
+	m.recalcViewportHeight()
 }
 
 func fuzzyMatch(pattern, target string) bool {
