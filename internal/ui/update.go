@@ -618,7 +618,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		delta := msg.tokenInput + msg.tokenOutput
 		m.IsCloudModel = m.cfg.ActiveProviderName() != "ollama"
-		costStr := "$0.0000"
+		costStr := "$free"
 		if m.IsCloudModel {
 			turnCost := float64(msg.tokenInput)*(3.0/1_000_000) + float64(msg.tokenOutput)*(15.0/1_000_000)
 			m.AccumulatedCost += turnCost
@@ -630,7 +630,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamStartTime = time.Time{}
 		}
 		m.push(roleStatus, mutedStyle.Render(
-			fmt.Sprintf("↳ done · +%d toks · %s · %.1fs", delta, costStr, latencySec)))
+			fmt.Sprintf("↳ done · +%d tok · %s · %.1fs", delta, costStr, latencySec)))
 
 		if m.resolver.Current() == modes.ModePlan {
 			validation := plan.ValidatePlanOutput(final)

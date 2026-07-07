@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -442,9 +443,9 @@ func (m *model) renderRuntimeStatus(width int) string {
 	// Tokens — always shown; this is the minimum viable status line.
 	if m.TotalTokens > 0 {
 		b.WriteString(textStyle.Render(strconv.Itoa(m.TotalTokens)))
-		b.WriteString(dimmedStyle.Render(" tkn"))
+		b.WriteString(dimmedStyle.Render(" tok"))
 	} else {
-		b.WriteString(dimmedStyle.Render("0 tkn"))
+		b.WriteString(dimmedStyle.Render("0 tok"))
 	}
 
 	// Checkpoint (truncated) — dropped next-to-last as panes narrow, since
@@ -541,13 +542,11 @@ func (m *model) renderStartupBanner(termWidth int) string {
 		" █  █ ",
 	}
 
-	rightCol := make([]string, 0, 5+len(bannerModes))
+	rightCol := make([]string, 0, 4+len(bannerModes))
 	rightCol = append(rightCol,
 		boldAccentStyle.Render(m.getGreeting()),
-		boldAccentStyle.Render("IZEN"),
 		textStyle.Render("engineering intelligence."),
 		textStyle.Render("human in control."),
-		"",
 		"",
 	)
 	for _, mode := range bannerModes {
@@ -580,20 +579,29 @@ func (m *model) renderStartupBanner(termWidth int) string {
 	provider := m.cfg.ActiveProviderName()
 	modelName := m.cfg.ActiveModelName()
 	metaParts := []string{
-		mutedStyle.Render("v" + version),
+		mutedStyle.Render(projectPathDisplay()),
 		mutedStyle.Render(provider + " " + modelName),
 	}
 	if branch, err := m.gitEng.Branch(); err == nil && branch != "" {
 		metaParts = append(metaParts, mutedStyle.Render("git ("+branch+")"))
 	}
-	metaSep := subtleStyle.Render(" • ")
+	metaSep := subtleStyle.Render(" · ")
 	meta := strings.Join(metaParts, metaSep)
 
 	tip := mutedStyle.Render(devTips[rand.Intn(len(devTips))])
 	rows = append(rows, divider, meta, "", tip)
 	body := strings.Join(rows, "\n")
 
-	return bannerBorderStyle.Width(termWidth - 2).Render(body)
+	box := bannerBorderStyle.BorderTop(false).Width(termWidth - 2).Render(body)
+	boxLines := strings.Split(box, "\n")
+	boxWidth := 0
+	if len(boxLines) > 0 {
+		boxWidth = lipgloss.Width(boxLines[0])
+	}
+	title := boldAccentStyle.Render("izen") + mutedStyle.Render(" v"+version)
+	titleBar := renderTitledTopBorder(boxWidth, title)
+
+	return titleBar + "\n" + box
 }
 
 // renderStartupBannerCompact renders a single-column banner for narrow or
@@ -608,11 +616,10 @@ func (m *model) renderStartupBannerCompact(termWidth int) string {
 		innerW = 20
 	}
 
-	initialCap := 5 + 2*len(bannerModes) + 2
+	initialCap := 4 + 2*len(bannerModes) + 2
 	rows := make([]string, 0, initialCap)
 	rows = append(rows,
 		boldAccentStyle.Render(m.getGreeting()),
-		boldAccentStyle.Render("IZEN"),
 		textStyle.Render("engineering intelligence."),
 		textStyle.Render("human in control."),
 		"",
@@ -624,10 +631,10 @@ func (m *model) renderStartupBannerCompact(termWidth int) string {
 
 	divider := subtleStyle.Render(strings.Repeat("─", innerW))
 
-	// Meta line: version always shown; provider/model and git branch are
-	// dropped as the pane narrows further, same priority order as the
+	// Meta line: project path always shown; provider/model and git branch
+	// are dropped as the pane narrows further, same priority order as the
 	// runtime status line.
-	metaParts := []string{mutedStyle.Render("v" + version)}
+	metaParts := []string{mutedStyle.Render(projectPathDisplay())}
 	if termWidth >= compactStatusThreshold {
 		provider := m.cfg.ActiveProviderName()
 		modelName := m.cfg.ActiveModelName()
@@ -636,12 +643,86 @@ func (m *model) renderStartupBannerCompact(termWidth int) string {
 			metaParts = append(metaParts, mutedStyle.Render("git ("+branch+")"))
 		}
 	}
-	meta := strings.Join(metaParts, subtleStyle.Render(" • "))
+	meta := strings.Join(metaParts, subtleStyle.Render(" · "))
 
 	rows = append(rows, divider, meta)
 
 	body := strings.Join(rows, "\n")
-	return bannerBorderStyle.Width(termWidth - 2).Render(body)
+	box := bannerBorderStyle.BorderTop(false).Width(termWidth - 2).Render(body)
+	boxLines := strings.Split(box, "\n")
+	boxWidth := 0
+	if len(boxLines) > 0 {
+		boxWidth = lipgloss.Width(boxLines[0])
+	}
+	title := boldAccentStyle.Render("izen") + mutedStyle.Render(" v"+version)
+	titleBar := renderTitledTopBorder(boxWidth, title)
+
+	return titleBar + "\n" + box
+}
+
+// renderTitledTopBorder builds a top-border line with a left-aligned label
+// embedded in it, safely adapting to extremely narrow screen splits without breaking.
+func renderTitledTopBorder(totalWidth int, label string) string {
+	border := bannerBorderStyle.GetBorderStyle()
+
+	fill := border.Top
+	if fill == "" {
+		fill = "─"
+	}
+	left := border.TopLeft
+	if left == "" {
+		left = fill
+	}
+	right := border.TopRight
+	if right == "" {
+		right = fill
+	}
+
+	borderColor := lipgloss.NewStyle().Foreground(bannerBorderStyle.GetBorderTopForeground())
+
+	padded := " " + label + " "
+	labelW := lipgloss.Width(padded)
+	innerW := totalWidth - lipgloss.Width(left) - lipgloss.Width(right)
+	if innerW < 0 {
+		innerW = 0
+	}
+	if labelW >= innerW {
+		return borderColor.Render(left + strings.Repeat(fill, innerW) + right)
+	}
+
+	// Dynamic safe left-alignment scaling
+	leftFillN := 4
+	if leftFillN+labelW > innerW {
+		leftFillN = innerW - labelW
+	}
+	if leftFillN < 0 {
+		leftFillN = 0
+	}
+	rightFillN := innerW - labelW - leftFillN
+
+	return borderColor.Render(left+strings.Repeat(fill, leftFillN)) +
+		padded +
+		borderColor.Render(strings.Repeat(fill, rightFillN)+right)
+}
+
+// projectPathDisplay returns the current working directory formatted for
+// the startup banner, abbreviating the user's home directory to "~" (e.g.
+// "~/notes") the same way the shell/prompt convention does. Falls back to
+// "." if the working directory can't be resolved.
+func projectPathDisplay() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if wd == home {
+			return "~"
+		}
+		if rel, err := filepath.Rel(home, wd); err == nil && !strings.HasPrefix(rel, "..") {
+			return "~" + string(filepath.Separator) + rel
+		}
+	}
+	return wd
 }
 
 func padRight(s string, n int) string {

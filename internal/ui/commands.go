@@ -77,6 +77,18 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.Viewport.GotoBottom()
 			return nil
 		}
+
+		// ── Shell Guard Rail: Security-aware command firewall ──
+		if blocked, _ := m.shellFirewall(shellCmd); blocked {
+			m.reviewRunning = false
+			m.agentRunning = false
+			m.agentLabel = ""
+			m.push(roleError, fmt.Sprintf("[SECURITY ALERT] Dangerous shell mutation blocked: Executing '%s' is strictly forbidden in this mode.", shellCmd))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+
 		m.push(roleSystem, "$ "+shellCmd)
 		out, err := execShell(shellCmd)
 		if err != nil {
@@ -358,6 +370,13 @@ func parseModeShorthand(line string) (modes.Mode, string, bool) {
 
 func (m *model) setMode(mode modes.Mode) {
 	m.investigateInvocationCount = 0 // Unconditional state clearance to avoid hard lockout bugs during testing
+
+	// ── Flush stale transient state on mode transition ──
+	m.reviewRunning = false
+	m.agentRunning = false
+	m.agentLabel = ""
+	m.lastActionTime = time.Time{}
+	m.buildVerifyPending = false
 
 	if mode == m.resolver.Current() {
 		return
@@ -1106,6 +1125,45 @@ func (m *model) buildDiagnoseContent() string {
 	b.WriteString("## FORENSIC DATA\n\n")
 	b.WriteString(m.handoffCtx.LastFailureLog)
 	return b.String()
+}
+
+// shellFirewall checks a shell command against the security guard rail.
+// Returns (blocked, violationMessage).
+// Global blacklist applies in all modes; /mode investigate has an additional
+// read-only allowlist that rejects anything outside inspection binaries.
+func (m *model) shellFirewall(cmd string) (bool, string) {
+	lower := strings.ToLower(strings.TrimSpace(cmd))
+	if lower == "" {
+		return false, ""
+	}
+
+	// ── Mode-specific allowlist: /mode investigate — read-only only ──
+	if m.resolver.Current() == modes.ModeInvestigate {
+		allowed := false
+		for _, prefix := range []string{"go test", "go version", "git status", "git diff", "dlv"} {
+			if strings.HasPrefix(lower, prefix) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return true, fmt.Sprintf(
+				"Dangerous shell mutation blocked: Executing '%s' is strictly forbidden in this mode.",
+				cmd)
+		}
+	}
+
+	// ── Global blacklist ──
+	blacklist := []string{"rm ", "sudo", "chmod", "chown", "mkfs", "dd ", "mv /*", "> /dev/gpi"}
+	for _, b := range blacklist {
+		if strings.Contains(lower, b) {
+			return true, fmt.Sprintf(
+				"Dangerous shell mutation blocked: Executing '%s' is strictly forbidden in this mode.",
+				cmd)
+		}
+	}
+
+	return false, ""
 }
 
 func execShell(cmd string) (string, error) {
