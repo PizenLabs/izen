@@ -26,12 +26,22 @@ func (m *model) Init() tea.Cmd {
 
 // Update routes state machines and events.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// ── HARD KEYBOARD INTERCEPT: Approval/Processing states bypass all sub-components ──
+	if m.state == StateAwaitingApproval || m.state == StateProcessing {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			return m.handleKey(keyMsg)
+		}
+	}
+
 	// ── GLOBAL INTERCEPT: [P] Toggle Hotkey ──────────────────────────────────
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		if keyMsg.String() == "p" || keyMsg.String() == "P" {
 			if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
 				m.pendingProposals[0].Expanded = !m.pendingProposals[0].Expanded
 				m.proposalDiffOffset = 0
+				m.recalcViewportHeight()
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
 				return m, nil
 			}
 		}
@@ -62,8 +72,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
-		if m.streaming || m.agentRunning || m.state == StateProcessing {
-			m.spinnerFrame = (m.spinnerFrame + 1) % len(SpinnerFrames)
+		if m.streaming || m.agentRunning || m.state == StateProcessing || m.state == StateAwaitingApproval {
+			m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
+			if m.streaming || m.agentRunning || m.state == StateProcessing {
+				m.refreshViewportContent()
+			}
+			return m, m.spinnerTickCmd()
 		}
 		return m, m.spinnerTickCmd()
 
@@ -197,6 +211,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.state = StateAwaitingApproval
 			m.recalcViewportHeight()
+			m.Viewport.Height = m.computeVpHeight()
+			m.refreshViewportContent()
 		}
 
 		m.refreshViewportContent()
@@ -244,6 +260,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, line := range msg.lines {
 			m.push(roleSystem, line)
 		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -268,15 +286,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamBuffer = m.streamBuffer[emit:]
 		}
 
-		// Refresh viewport with streaming content and follow the bottom.
+		// Refresh viewport with streaming content.
 		if m.Ready {
 			m.refreshViewportContent()
-			if m.streaming {
+			// Only auto-scroll to bottom if the user hasn't explicitly
+			// scrolled up — respects user-inspect position during streaming.
+			if m.streaming && !m.userIsScrollingUp {
 				m.Viewport.GotoBottom()
 			}
 		}
 
-		if len(m.streamBuffer) > 0 {
+		if len(m.streamBuffer) > 0 || m.streaming {
+			m.streamTickActive = true
 			return m, m.smoothStreamTickCmd()
 		}
 		m.streamTickActive = false
@@ -461,8 +482,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.pendingProposals = props
 					m.state = StateAwaitingApproval
 					m.recalcViewportHeight()
+					m.Viewport.Height = m.computeVpHeight()
 					m.awaitingConfirmation = true
 					m.ti.Blur()
+					m.refreshViewportContent()
 				}
 			}
 			m.sess.ClearTasks()
@@ -533,11 +556,21 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
-		// HARD GUARD: In destructive states (approval/exec/processing), mouse events are
+		// HARD GUARD: In destructive states (approval/exec), mouse events are
 		// completely ignored — no viewport scrolling, no coordinate mapping.
 		// This eliminates any possibility of accidental mutation via click.
-		if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec || m.state == StateProcessing {
+		// During processing, wheel events are allowed for scroll inspection.
+		if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec {
 			return m, nil
+		}
+		if m.state == StateProcessing && msg.Button != tea.MouseButtonWheelUp && msg.Button != tea.MouseButtonWheelDown {
+			return m, nil
+		}
+		// Track scroll-up (wheel up) to suppress auto-scroll during
+		// user-inspection. Scroll-down does NOT reset the flag — only
+		// SPACE or a new submission resets it.
+		if msg.Button == tea.MouseButtonWheelUp {
+			m.userIsScrollingUp = true
 		}
 		// Pure O(1) viewport YOffset shift. No refreshViewportContent, no
 		// re-rendering, no string mutation — the viewport internal buffer is
@@ -640,12 +673,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// ── Viewport scroll keys ─────────────────────────────────────────────
+		// ── Viewport scroll keys with scroll-lock tracking ──────────────────
 		if m.Ready {
 			switch msg.Type {
-			case tea.KeyPgUp, tea.KeyPgDown, tea.KeyHome, tea.KeyEnd:
+			case tea.KeyPgUp, tea.KeyHome:
+				m.Viewport, _ = m.Viewport.Update(msg)
+				m.userIsScrollingUp = true
+				return m, nil
+			case tea.KeyPgDown, tea.KeyEnd:
 				m.Viewport, _ = m.Viewport.Update(msg)
 				return m, nil
+			}
+		}
+
+		// ── SPACE snap-to-bottom (resets user scroll-lock) ─────────────────
+		if msg.Type == tea.KeySpace && !m.autocompleteActive {
+			m.userIsScrollingUp = false
+			if m.Ready {
+				m.Viewport.GotoBottom()
 			}
 		}
 
@@ -657,7 +702,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.Ready {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
 			switch keyMsg.Type {
-			case tea.KeyPgUp, tea.KeyPgDown, tea.KeyHome, tea.KeyEnd:
+			case tea.KeyPgUp, tea.KeyHome:
+				m.Viewport, _ = m.Viewport.Update(keyMsg)
+				m.userIsScrollingUp = true
+				return m, nil
+			case tea.KeyPgDown, tea.KeyEnd:
 				m.Viewport, _ = m.Viewport.Update(keyMsg)
 				return m, nil
 			}

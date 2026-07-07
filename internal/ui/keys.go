@@ -7,29 +7,55 @@ import (
 )
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// ── StateProcessing: block all input during async mutations ──────────
+	// ── StateProcessing: block input but allow viewport navigation ──────
 	if m.state == StateProcessing {
+		if m.Ready {
+			switch {
+			case msg.Type == tea.KeyUp || msg.String() == "k" || msg.Type == tea.KeyCtrlU:
+				m.userIsScrollingUp = true
+				var vpCmd tea.Cmd
+				m.Viewport, vpCmd = m.Viewport.Update(msg)
+				return m, vpCmd
+			case msg.Type == tea.KeyDown || msg.String() == "j" || msg.Type == tea.KeyCtrlD:
+				var vpCmd tea.Cmd
+				m.Viewport, vpCmd = m.Viewport.Update(msg)
+				return m, vpCmd
+			case msg.Type == tea.KeyPgUp || msg.Type == tea.KeyHome:
+				m.Viewport, _ = m.Viewport.Update(msg)
+				m.userIsScrollingUp = true
+				return m, nil
+			case msg.Type == tea.KeyPgDown || msg.Type == tea.KeyEnd:
+				m.Viewport, _ = m.Viewport.Update(msg)
+				return m, nil
+			case msg.Type == tea.KeySpace:
+				m.userIsScrollingUp = false
+				m.Viewport.GotoBottom()
+				return m, nil
+			}
+		}
 		return m, nil
 	}
 
 	// ── Viewport navigation pass-through in locked states ───────────────
 	// Arrow keys, j/k, ctrl+u, ctrl+d must forward to viewport so the
 	// user can fluidly inspect long file diffs without scroll lockout.
+	// Tracks scroll-up for user-scroll-lock to prevent auto-scroll jank.
 	if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec {
 		if m.Ready {
 			switch {
-			case msg.Type == tea.KeyUp || msg.Type == tea.KeyDown:
+			case msg.Type == tea.KeyUp || msg.String() == "k" || msg.Type == tea.KeyCtrlU:
+				m.userIsScrollingUp = true
 				var vpCmd tea.Cmd
 				m.Viewport, vpCmd = m.Viewport.Update(msg)
 				return m, vpCmd
-			case msg.String() == "j" || msg.String() == "k":
+			case msg.Type == tea.KeyDown || msg.String() == "j" || msg.Type == tea.KeyCtrlD:
 				var vpCmd tea.Cmd
 				m.Viewport, vpCmd = m.Viewport.Update(msg)
 				return m, vpCmd
-			case msg.Type == tea.KeyCtrlU || msg.Type == tea.KeyCtrlD:
-				var vpCmd tea.Cmd
-				m.Viewport, vpCmd = m.Viewport.Update(msg)
-				return m, vpCmd
+			case msg.Type == tea.KeySpace:
+				m.userIsScrollingUp = false
+				m.Viewport.GotoBottom()
+				return m, nil
 			}
 		}
 	}
@@ -80,6 +106,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case msg.String() == "l" || msg.String() == "L":
 			m.acceptAll = true
 			return m, m.applyAllProposals()
+		case msg.String() == "p" || msg.String() == "P":
+			if len(m.pendingProposals) > 0 {
+				m.pendingProposals[0].Expanded = !m.pendingProposals[0].Expanded
+				m.proposalDiffOffset = 0
+				m.recalcViewportHeight()
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+			}
+			return m, nil
 		case msg.String() == "r" || msg.String() == "R" || msg.Type == tea.KeyEscape:
 			m.ti.Focus()
 			m.state = StateChat
@@ -126,6 +161,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		// ── Enter: submit (only when autocomplete is NOT active) ───────────────
 	case tea.KeyEnter:
+		// New message submission resets user scroll-lock so auto-scroll
+		// resumes for the incoming response.
+		m.userIsScrollingUp = false
+
 		userInput := m.ti.Value()
 		m.dismissSuggestions()
 

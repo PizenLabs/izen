@@ -144,7 +144,7 @@ var utilityCommands = map[modes.Mode][]string{
 var globalCommands = []string{"/help", "/?", "/mode", "/objective", "/drop", "/quit", "/arch"}
 
 // ── Elegant spinner frames ────────────────────────────────────────────────────
-var spinnerFrames = []string{" ⊹ ", " ⁕ ", " ⚙ ", " ❃ ", " ❄ ", " ❆ ", " ❃ ", " ⚙ ", " ⁕ ", " ⊹ "}
+var flowingSpinnerFrames = []string{" ⊹ ", " ⁕ ", " ⚙ ", " ❃ ", " ❄ ", " ❆ ", " ❃ ", " ⚙ ", " ⁕ ", " ⊹ "}
 
 // providerSwitchMsg signals a successful provider switch.
 type providerSwitchMsg struct {
@@ -285,6 +285,10 @@ type model struct {
 	// AI Interrupt Engine: cancel function for active stream, set by streamCmd.
 	streamCancel       context.CancelFunc
 	interruptRequested bool
+
+	// Viewport scroll tracking: when the user scrolls up to inspect code,
+	// auto-scroll to bottom is suppressed until SPACE or a new message.
+	userIsScrollingUp bool
 }
 
 // ── Rendering helpers ─────────────────────────────────────────────────────────
@@ -461,22 +465,112 @@ func (m *model) refreshViewportContent() {
 	m.Viewport.SetContent(content.String())
 }
 
-// computeVpHeight returns the number of terminal rows available for the
-// scrollable viewport, subtracting the fixed bottom controls (5 lines) and any
-// visible proposal dock (which renders outside the viewport between history
-// and the input line). The proposal dock needs to be subtracted from the total
-// height budget so the rendered output fits without exceeding the terminal.
-func (m *model) computeVpHeight() int {
-	proposalLines := 0
-	if m.state == StateAwaitingApproval || m.state == StateProcessing {
-		proposalLines = 4 + maxProposalDiffHeight
+// countRenderedDiffLines returns how many lines DiffRenderer would output
+// for the given raw diff string, excluding pure metadata (---/+++).
+func countRenderedDiffLines(diff string) int {
+	if diff == "" {
+		return 0
 	}
-	const bottomLines = 5
-	available := m.height - bottomLines - proposalLines
-	if available < 1 {
+	lines := strings.Split(diff, "\n")
+	n := 0
+	for _, line := range lines {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "---") {
+			continue
+		}
+		if strings.HasPrefix(line, "+++") {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// getProposalDockCurrentHeight returns the exact line count of the rendered
+// proposal dock block (renderProposalBlock), computed dynamically from the
+// actual diff content so the viewport can reclaim every spare line.
+//
+//	StateProcessing:        3 lines (top divider + spinner + bottom divider)
+//	StateAwaitingApproval:
+//	  Collapsed:            9 lines (top divider + 7 card lines + bottom divider)
+//	  Expanded:             1 + card(4 + cappedDiff + blank + scrollHint + action + blank + border) + 1
+func (m *model) getProposalDockCurrentHeight() int {
+	switch m.state {
+	case StateProcessing:
+		return 3
+	case StateAwaitingApproval:
+		if len(m.pendingProposals) == 0 {
+			return 0
+		}
+		p := m.pendingProposals[0]
+		if !p.Expanded {
+			return 9 // 1 (top divider) + 7 (collapsed MutationRenderer) + 1 (bottom divider)
+		}
+		n := countRenderedDiffLines(p.Diff)
+		capped := n
+		if capped > maxProposalDiffHeight {
+			capped = maxProposalDiffHeight
+		}
+		scrollHint := 0
+		if n > maxProposalDiffHeight || m.proposalDiffOffset > 0 {
+			scrollHint = 1
+		}
+		// Expanded MutationRenderer: border + header + metadata + blank = 4
+		//                          + capped diff lines
+		//                          + blank after diff = 1
+		//                          + scroll hint (if needed) = 0/1
+		//                          + action line = 1
+		//                          + blank = 1
+		//                          + border = 1
+		cardLines := 4 + capped + 1 + scrollHint + 1 + 1 + 1
+		return 1 + cardLines + 1
+	}
+	return 0
+}
+
+// getAutocompleteHeight returns the exact number of terminal lines the
+// autocomplete dropdown occupies when rendered. This must be subtracted from
+// the viewport height to prevent the input line from being pushed upward.
+func (m *model) getAutocompleteHeight() int {
+	if !m.autocompleteActive || len(m.autocompleteItems) == 0 {
+		return 0
+	}
+	maxShow := 8
+	n := len(m.autocompleteItems)
+	if n > maxShow {
+		n = maxShow
+	}
+	return n + 2 // items + top border + bottom border
+}
+
+// computeVpHeight returns the number of terminal rows available for the
+// scrollable viewport. Matches the View() JoinVertical layout — zero gaps:
+//
+//	Status line (renderRuntimeStatus)             → 1 line
+//	Separator below input + input + top separator → 3 lines
+//	Autocomplete dropdown (inputView)              → dynamic (getAutocompleteHeight)
+//	Proposal dock (renderProposalBlock)            → dynamic (getProposalDockCurrentHeight)
+//	m.Viewport.View()                             → remaining height (vpHeight)
+//
+// The viewport always sits at the top, consuming 100% of remaining space.
+// The input line and status bar are rigidly pinned to the terminal bottom edge
+// with zero floating margin between them.
+func (m *model) computeVpHeight() int {
+	const inputHeight = 3 // separator above + input line + separator below
+	const statusLineHeight = 1
+
+	vpHeight := m.height - inputHeight - statusLineHeight
+	vpHeight -= m.getAutocompleteHeight()
+	if m.state == StateAwaitingApproval || m.state == StateProcessing {
+		vpHeight -= m.getProposalDockCurrentHeight()
+	}
+	if vpHeight < 1 {
 		return 1
 	}
-	return available
+	return vpHeight
 }
 
 // recalcViewportHeight recomputes and applies the viewport height when the
@@ -493,9 +587,9 @@ func (m *model) recalcViewportHeight() {
 // light effect: the color oscillates between dim and bright using a sine wave,
 // creating the feeling of seamless movement.
 func (m *model) renderFlowingSpinner() string {
-	n := len(spinnerFrames)
+	n := len(flowingSpinnerFrames)
 	idx := m.spinnerFrame % n
-	frameStr := spinnerFrames[idx]
+	frameStr := flowingSpinnerFrames[idx]
 
 	phase := float64(m.spinnerFrame) * (2 * math.Pi / float64(n))
 	t := (math.Sin(phase) + 1) / 2

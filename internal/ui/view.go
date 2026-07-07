@@ -43,10 +43,18 @@ const (
 )
 
 // View returns the full UI state.
-// The scrollable chat history is rendered inside the viewport; metadata bars,
-// the input line, and the status line are pinned to the bottom of the terminal.
-// Interactive proposal/processing blocks are rendered in a dedicated fixed dock
-// between the viewport and the bottom controls, fully isolated from the chat history.
+// Uses lipgloss.JoinVertical for a rigid bottom-up box model with zero gaps:
+//
+//  1. m.Viewport.View()           ── top, consumes all remaining space
+//  2. proposalDockView            ── middle (approval/processing states only)
+//  3. inputView                   ── autocomplete + separators + input prompt
+//  4. statusBarView               ── runtime telemetry, rigidly pinned to bottom
+//
+// The viewport height is computed inline from the actual rendered heights of
+// the input and status bar blocks via lipgloss.Height(), guaranteeing that the
+// input prompt and status bar never leave the bottom frame with zero floating
+// margin regardless of autocomplete toggling, state transitions, or proposal
+// expansion.
 func (m *model) View() string {
 	if m.showHelpOverlay {
 		return m.renderHelpOverlay()
@@ -56,41 +64,54 @@ func (m *model) View() string {
 		return "Loading IZEN..."
 	}
 
-	var buf strings.Builder
-	buf.WriteString(m.Viewport.View())
-	buf.WriteString("\n")
-	if m.state == StateAwaitingApproval || m.state == StateProcessing {
-		buf.WriteString(m.renderProposalBlock())
-		buf.WriteString("\n")
-	}
-	buf.WriteString(m.renderStaticBottomControls())
-	return buf.String()
-}
-
-// renderStaticBottomControls renders the fixed bottom dashboard that must never
-// scroll away: autocomplete dropdown, mode lines, input line, and telemetry.
-func (m *model) renderStaticBottomControls() string {
 	width := m.width
 	if width < 40 {
 		width = 40
 	}
 
+	// ── Build input view (autocomplete + separator + input prompt + separator) ──
 	mode := m.resolver.Current()
 	modeColor := m.modeStyle(mode)
 
-	var s strings.Builder
-
+	var inputView strings.Builder
 	if m.autocompleteActive && len(m.autocompleteItems) > 0 {
-		s.WriteString(m.renderAutocompleteDropdown(width))
+		inputView.WriteString(m.renderAutocompleteDropdown(width))
+	}
+	inputView.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
+	inputView.WriteString(modeColor.Render("❯ "+mode.String()) + " ⟩ " + m.ti.View() + "\n")
+	inputView.WriteString(modeColor.Render(strings.Repeat("─", width)))
+
+	// ── Build status bar (always visible, rigidly pinned to terminal bottom edge) ──
+	statusBarView := m.renderRuntimeStatus(width)
+
+	// ── Build proposal dock (conditional) ──
+	var proposalDockView string
+	if m.state == StateAwaitingApproval || m.state == StateProcessing {
+		proposalDockView = m.renderProposalBlock()
 	}
 
-	s.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
-	s.WriteString(modeColor.Render("❯ "+mode.String()) + " ⟩ " + m.ti.View() + "\n")
-	s.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
-	s.WriteString(m.renderRuntimeStatus(width))
-	s.WriteString("\n")
+	// ── Compute exact heights using lipgloss — no manual constants, no gaps ──
+	inputHeight := lipgloss.Height(inputView.String())
+	statusHeight := lipgloss.Height(statusBarView)
+	proposalHeight := lipgloss.Height(proposalDockView)
 
-	return s.String()
+	m.Viewport.Height = m.height - inputHeight - statusHeight - proposalHeight
+	if m.Viewport.Height < 1 {
+		m.Viewport.Height = 1
+	}
+
+	// ── Assemble final layout with JoinVertical — zero gaps between all elements ──
+	// lipgloss.JoinVertical inserts exactly one \n between each element, which
+	// acts as a line terminator (not a blank gap). Each element's internal line
+	// terminators are preserved — no extraneous newlines are added.
+	var parts []string
+	parts = append(parts, m.Viewport.View())
+	if proposalHeight > 0 {
+		parts = append(parts, proposalDockView)
+	}
+	parts = append(parts, inputView.String())
+	parts = append(parts, statusBarView)
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
 // renderProposalBlock renders the interactive proposal/processing dock
@@ -126,7 +147,7 @@ func (m *model) renderProposalBlock() string {
 		b.WriteString(mr.Render(vm))
 
 	case StateProcessing:
-		frame := SpinnerFrames[m.spinnerFrame%len(SpinnerFrames)]
+		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
 		sp := SpinnerStyle.Render(frame)
 		b.WriteString("  " + sp + " " + infoStyle.Render("Processing file mutations... Please wait."))
 		if len(m.pendingProposals) > 0 {
@@ -382,9 +403,11 @@ func (m *model) renderHelpOverlay() string {
 func (m *model) renderRuntimeStatus(width int) string {
 	var b strings.Builder
 
-	// Streaming/agent spinner or idle bullet
-	if m.streaming || m.agentRunning {
-		b.WriteString(redDotStyle.Render("⌘"))
+	// Animated spinner during active states (streaming, agent, processing)
+	// Read frame directly from model state at draw-time — zero buffering.
+	if m.streaming || m.agentRunning || m.state == StateProcessing {
+		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
+		b.WriteString(SpinnerStyle.Render(frame))
 	} else {
 		b.WriteString(dimmedStyle.Render("●"))
 	}

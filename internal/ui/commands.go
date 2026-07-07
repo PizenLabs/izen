@@ -49,6 +49,8 @@ func (m *model) handleInput(line string) tea.Cmd {
 	// Rigid active guards to block spamming inputs during background processes
 	if m.streaming || m.agentRunning {
 		m.push(roleSystem, "[System] Input blocked: task execution active.")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
 		return nil
 	}
 
@@ -56,11 +58,15 @@ func (m *model) handleInput(line string) tea.Cmd {
 		shellCmd := strings.TrimSpace(line[1:])
 		if shellCmd == "" {
 			m.push(roleSystem, "usage: !<shell command>")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
 			return nil
 		}
 		currentMode := m.resolver.Current()
 		if !currentMode.CanShell() {
 			m.push(roleError, fmt.Sprintf("shell execution blocked in /%s mode (no CapShell)", currentMode))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
 			return nil
 		}
 		m.push(roleSystem, "$ "+shellCmd)
@@ -72,6 +78,8 @@ func (m *model) handleInput(line string) tea.Cmd {
 		for scanner.Scan() {
 			m.push(roleSystem, scanner.Text())
 		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
 		return nil
 	}
 
@@ -214,6 +222,8 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		if m.investigateInvocationCount >= maxInvestigateInvocations {
 			m.push(roleError, fmt.Sprintf("max investigate invocations (%d) reached", maxInvestigateInvocations))
 			m.push(roleSystem, infoStyle.Render("start a new session with /objective <desc> or restart"))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
 			return nil
 		}
 		m.investigateInvocationCount++
@@ -354,6 +364,8 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	}
 	if _, ok := validSystemCommands[name[0]]; !ok {
 		m.push(roleError, "unknown command: "+cmd)
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
 		return nil
 	}
 
@@ -488,6 +500,8 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	}
 
 	m.push(roleError, "unknown command: "+cmd)
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
 	return nil
 }
 
