@@ -182,6 +182,13 @@ var (
 	successBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreen))
 	failureBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
 	warningBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorYellow))
+
+	// Warning box style for safety gate
+	warningStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color(colorOrange)).
+			Foreground(lipgloss.Color(colorYellow)).
+			Padding(0, 1)
 )
 
 func renderHotkeyPromptWithToggle() string {

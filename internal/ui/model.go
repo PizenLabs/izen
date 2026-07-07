@@ -88,7 +88,7 @@ type reviewResultMsg struct {
 }
 
 type agentStartMsg struct{ label string }
-type agentDoneMsg struct{ label string }
+type agentDoneMsg struct{}
 
 type commitGeneratedMsg struct {
 	subject string
@@ -121,6 +121,39 @@ type shellOutputMsg struct {
 }
 
 var _ tea.Msg = shellOutputMsg{}
+
+type testResultMsg struct {
+	output string
+	passed bool
+	failed int
+	total  int
+	err    error
+}
+
+type fixResultMsg struct {
+	content string
+	err     error
+}
+
+// ── Handoff Context ───────────────────────────────────────────────────────────
+
+// HandoffContext carries state across mode boundaries for the smart handoff
+// pipeline. Every terminal state primes the context for the next mode.
+type HandoffContext struct {
+	LastFailureLog string   // Compile errors, test stack traces, or panic traces
+	ProposedFix    string   // Populated by investigate/plan (markdown/diff format)
+	TargetScope    string   // Target directory or file currently in focus
+	PendingTodos   []string // TODO strings passed down to /mode plan
+}
+
+// actionChip represents a selectable action rendered at the bottom boundary
+// of the TUI. Hotkey activation executes the associated command.
+type actionChip struct {
+	key    string // Hotkey letter (A, B, C, etc.)
+	label  string // Display label (e.g. "Investigate Root Cause")
+	action string // Command to execute (e.g. "/mode investigate")
+	query  string // Optional seed content passed with the command
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -289,6 +322,33 @@ type model struct {
 	// Viewport scroll tracking: when the user scrolls up to inspect code,
 	// auto-scroll to bottom is suppressed until SPACE or a new message.
 	userIsScrollingUp bool
+
+	// Test/run output storage for /fix consumption
+	lastTestOutput string
+	lastTestFailed bool
+	lastTestTarget string
+
+	// Safety gate confirmation state
+	pendingTestConfirm bool
+	pendingTestTarget  string
+
+	// Review action spinner: set synchronously on $run/$test/$fix dispatch
+	// so the view can immediately render a spinner without waiting for the
+	// async agentStartMsg to be processed.
+	reviewRunning bool
+
+	// Safety valve: timestamp of the last review action dispatch. If
+	// reviewRunning stays true longer than the timeout threshold, the
+	// tick loop force-clears it to prevent ghost spinner lock.
+	lastActionTime time.Time
+
+	// Handoff pipeline: inter-mode state transfer
+	handoffCtx  HandoffContext
+	activeChips []actionChip
+	showChips   bool
+
+	// Build verification flag: set after build mutation auto-test
+	buildVerifyPending bool
 }
 
 // ── Rendering helpers ─────────────────────────────────────────────────────────
@@ -460,6 +520,9 @@ func (m *model) refreshViewportContent() {
 			status = m.agentLabel
 		}
 		content.WriteString(sp + " " + infoStyle.Render(status) + "\n")
+	} else if m.reviewRunning || m.agentRunning {
+		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
+		content.WriteString(SpinnerStyle.Render(frame) + " " + infoStyle.Render(m.agentLabel) + "\n")
 	}
 
 	m.Viewport.SetContent(content.String())

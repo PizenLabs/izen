@@ -78,8 +78,20 @@ func (m *model) View() string {
 		inputView.WriteString(m.renderAutocompleteDropdown(width))
 	}
 	inputView.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
-	inputView.WriteString(modeColor.Render("❯ "+mode.String()) + " ⟩ " + m.ti.View() + "\n")
+	promptLabel := modeColor.Render("❯ " + mode.String())
+	if m.reviewRunning || m.agentRunning {
+		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
+		promptLabel += " " + SpinnerStyle.Render(frame)
+	}
+	inputView.WriteString(promptLabel + " ⟩ " + m.ti.View() + "\n")
 	inputView.WriteString(modeColor.Render(strings.Repeat("─", width)))
+
+	// ── Action Chips (dynamic bottom-boundary elicitations) ─────────────
+	var chipsView string
+	if m.showChips && len(m.activeChips) > 0 {
+		chipsView = m.renderActionChips(width)
+	}
+	chipsHeight := lipgloss.Height(chipsView)
 
 	// ── Build status bar (always visible, rigidly pinned to terminal bottom edge) ──
 	statusBarView := m.renderRuntimeStatus(width)
@@ -95,7 +107,7 @@ func (m *model) View() string {
 	statusHeight := lipgloss.Height(statusBarView)
 	proposalHeight := lipgloss.Height(proposalDockView)
 
-	m.Viewport.Height = m.height - inputHeight - statusHeight - proposalHeight
+	m.Viewport.Height = m.height - inputHeight - statusHeight - proposalHeight - chipsHeight
 	if m.Viewport.Height < 1 {
 		m.Viewport.Height = 1
 	}
@@ -110,6 +122,9 @@ func (m *model) View() string {
 		parts = append(parts, proposalDockView)
 	}
 	parts = append(parts, inputView.String())
+	if chipsHeight > 0 {
+		parts = append(parts, chipsView)
+	}
 	parts = append(parts, statusBarView)
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
@@ -454,6 +469,27 @@ var devTips = []string{
 	"Pro Tip: IZEN locks execution boundaries. /ask is strictly Read-Only, use /build to run shell mutations.",
 	"Pro Tip: Run !<command> to escape the prompt and execute short native shell actions synchronously.",
 	"Pro Tip: Toggle the global help dashboard overlay instantly by pressing [?] during idle input states.",
+}
+
+// renderActionChips renders the dynamic action chip bar at the bottom
+// boundary of the TUI. Each chip is a hotkey + label pair that triggers a
+// handoff pipeline transition or terminal action.
+func (m *model) renderActionChips(width int) string {
+	if !m.showChips || len(m.activeChips) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, chip := range m.activeChips {
+		hotkey := hotkeyStyle.Render("[" + strings.ToUpper(chip.key) + "]")
+		label := textStyle.Render(chip.label)
+		actionHint := mutedStyle.Render(chip.action)
+		pad := width - lipgloss.Width(hotkey+" "+label+" "+actionHint) - 2
+		if pad < 0 {
+			pad = 0
+		}
+		b.WriteString("  " + hotkey + " " + label + " " + strings.Repeat(" ", pad) + actionHint + "\n")
+	}
+	return textStyle.Render(b.String())
 }
 
 // ── Startup banner ────────────────────────────────────────────────────

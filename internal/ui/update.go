@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,9 +73,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
-		if m.streaming || m.agentRunning || m.state == StateProcessing || m.state == StateAwaitingApproval {
+		// IZEN SAFETY VALVE: force-clear stale review lock after 30s
+		if m.reviewRunning && time.Since(m.lastActionTime) > 30*time.Second {
+			m.reviewRunning = false
+			m.agentLabel = ""
+			m.lastActionTime = time.Time{}
+			m.push(roleSystem, mutedStyle.Render("[safety] review action timed out — spinner force-cleared"))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+		}
+		if m.streaming || m.agentRunning || m.reviewRunning || m.state == StateProcessing || m.state == StateAwaitingApproval {
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
-			if m.streaming || m.agentRunning || m.state == StateProcessing {
+			if m.streaming || m.agentRunning || m.reviewRunning || m.state == StateProcessing {
 				m.refreshViewportContent()
 			}
 			return m, m.spinnerTickCmd()
@@ -90,8 +100,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentDoneMsg:
 		m.agentRunning = false
+		m.reviewRunning = false
 		m.agentDone = true
-		m.agentLabel = msg.label
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -131,23 +145,89 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		flush := m.flushPendingRecords()
 		return m, flush
 
-	case commitGeneratedMsg:
+	case testResultMsg:
 		m.agentRunning = false
+		m.reviewRunning = false
 		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.lastTestOutput = msg.output
+		m.lastTestFailed = !msg.passed
+		m.lastTestTarget = ""
 		if msg.err != nil {
-			m.push(roleError, "commit error: "+msg.err.Error())
+			m.push(roleError, "test execution error: "+msg.err.Error())
+		}
+		if msg.output != "" {
+			for _, line := range strings.Split(msg.output, "\n") {
+				if line == "" {
+					continue
+				}
+				role := roleSystem
+				if strings.Contains(line, "FAIL") || strings.Contains(line, "error") {
+					role = roleError
+				} else if strings.Contains(line, "PASS") || strings.Contains(line, "ok") {
+					role = roleStatus
+				}
+				m.push(role, line)
+			}
+		}
+		statusLine := fmt.Sprintf("tests: %d total, %d failed", msg.total, msg.failed)
+		if msg.passed {
+			statusLine = greenStyle.Render("✓ all tests passed (" + strconv.Itoa(msg.total) + ")")
+		} else {
+			statusLine = redStyle.Render("✗ " + statusLine)
+		}
+		m.push(roleSystem, infoStyle.Render(statusLine))
+
+		// ── Handoff: Capture failure context for mode pipeline ────────────
+		if !msg.passed && msg.output != "" {
+			m.handoffCtx.LastFailureLog = msg.output
+			m.handoffCtx.TargetScope = m.lastTestTarget
+			m.updateActionChips()
+		}
+
+		// ── Build verification: post-mutation test auto-result ───────────
+		if m.buildVerifyPending {
+			m.buildVerifyPending = false
+			if msg.passed {
+				m.activeChips = []actionChip{
+					{key: "d", label: "Commit Safe Baseline", action: "/commit"},
+				}
+			} else {
+				m.activeChips = []actionChip{
+					{key: "r", label: "Rollback Workspace", action: "/undo"},
+				}
+			}
+			m.showChips = true
+			if m.resolver.Current() == modes.ModeBuild {
+				m.push(roleSystem, "[System] Build verification complete. Use action chips to commit or rollback.")
+			}
+		}
+
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		flush := m.flushPendingRecords()
+		return m, flush
+
+	case fixResultMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		if msg.err != nil {
+			m.push(roleError, "fix error: "+msg.err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
-		m.push(roleSystem, infoStyle.Render(fmt.Sprintf("commit: %s", msg.subject)))
-		if msg.body != "" {
-			for _, l := range strings.Split(msg.body, "\n") {
-				m.push(roleSystem, infoStyle.Render(l))
-			}
-		}
-		m.push(roleStatus, fmt.Sprintf("amended as %s", msg.hash))
+		m.push(roleSystem, "[System] Analyzing failure context and generating fix...")
+		m.streamCh = nil
+		m.streaming = false
+		m.streamParser = nil
 		flush := m.flushPendingRecords()
-		return m, flush
+		return m, tea.Batch(flush, m.streamCmd(msg.content))
 
 	case objectiveAnalyzedMsg:
 		if msg.err != nil {
@@ -205,6 +285,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				outcomeLine := fmt.Sprintf("%s %s • %s", successBannerStyle.Render("[✓]"), msg.file, msg.status)
 				m.push(roleSystem, outcomeLine)
 				m.createBuildCheckpoint(1)
+				// Handoff: unbuffered build verification test
+				if m.resolver.Current() == modes.ModeBuild {
+					m.buildVerifyPending = true
+					m.refreshViewportContent()
+					m.push(roleSystem, "[System] Running build verification test...")
+					flush := m.flushPendingRecords()
+					return m, tea.Batch(flush, m.runTestEngine("./..."))
+				}
 			} else {
 				m.push(roleSystem, failureBannerStyle.Render("[✗] "+msg.file+" — "+msg.err.Error()))
 			}
@@ -240,20 +328,34 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ti.Focus()
 		m.state = StateChat
 		m.recalcViewportHeight()
+		var testCmd tea.Cmd
 		switch {
 		case applied > 0 && failed == 0:
 			summary := fmt.Sprintf("%s %d file(s) mutated. Checkpoint created.", successBannerStyle.Render("[✓]"), applied)
 			m.push(roleSystem, summary)
 			m.createBuildCheckpoint(applied)
+			if m.resolver.Current() == modes.ModeBuild {
+				m.buildVerifyPending = true
+				m.push(roleSystem, "[System] Running build verification test...")
+				testCmd = m.runTestEngine("./...")
+			}
 		case applied > 0:
 			summary := fmt.Sprintf("%s %d mutated, %d failed.", warningBannerStyle.Render("[!]"), applied, failed)
 			m.push(roleSystem, summary)
 			m.createBuildCheckpoint(applied)
+			if m.resolver.Current() == modes.ModeBuild {
+				m.buildVerifyPending = true
+				m.push(roleSystem, "[System] Running build verification test...")
+				testCmd = m.runTestEngine("./...")
+			}
 		default:
 			m.push(roleSystem, failureBannerStyle.Render(fmt.Sprintf("[✗] %d mutation(s) failed.", failed)))
 		}
 		m.refreshViewportContent()
 		flush := m.flushPendingRecords()
+		if testCmd != nil {
+			return m, tea.Batch(flush, testCmd)
+		}
 		return m, flush
 
 	case shellOutputMsg:
@@ -361,6 +463,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Append the completed turn to PreRenderedHistory and freeze state.
 		m.push(roleAI, final)
+
+		// ── Handoff: Capture ProposedFix from investigate mode ──────────
+		if m.resolver.Current() == modes.ModeInvestigate && final != "" {
+			m.handoffCtx.ProposedFix = final
+			m.updateActionChips()
+		}
+
+		// ── Handoff: Capture PendingTodos from plan mode ────────────────
+		if m.resolver.Current() == modes.ModePlan && final != "" {
+			m.handoffCtx.PendingTodos = extractTodosFromPlan(final)
+			m.updateActionChips()
+		}
 
 		// SECTION 1: INTERCEPTING STREAM COMPLETION
 		promptText := m.currentPrompt
@@ -591,6 +705,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.interruptRequested = true
 			m.push(roleSystem, "[System] Generation interrupted by user.")
 			return m, nil
+		}
+
+		// ── Action Chip Hotkeys (only when chips are visible and idle) ───
+		if m.showChips && !m.streaming && !m.agentRunning && m.state == StateChat {
+			switch msg.String() {
+			case "a", "A":
+				return m, m.handleChipActivation("a")
+			case "b", "B":
+				return m, m.handleChipActivation("b")
+			case "c", "C":
+				return m, m.handleChipActivation("c")
+			case "d", "D":
+				return m, m.handleChipActivation("d")
+			case "r", "R":
+				return m, m.handleChipActivation("r")
+			}
 		}
 
 		// In special states, route directly to handleKey.
