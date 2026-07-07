@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -18,12 +20,13 @@ import (
 	"github.com/PizenLabs/izen/internal/domain"
 	objengine "github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
 var validSystemCommands = map[string]struct{}{
-	"/help":       {}, // true,
+	"/help":       {},
 	"/?":          {},
 	"/quit":       {},
 	"/mode":       {},
@@ -54,6 +57,11 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
+	// Safety gate confirmation: pending test/run confirmation for large repos
+	if m.pendingTestConfirm {
+		return m.handleReviewTestConfirm(line)
+	}
+
 	if strings.HasPrefix(line, "!") {
 		shellCmd := strings.TrimSpace(line[1:])
 		if shellCmd == "" {
@@ -69,6 +77,18 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.Viewport.GotoBottom()
 			return nil
 		}
+
+		// ── Shell Guard Rail: Security-aware command firewall ──
+		if blocked, _ := m.shellFirewall(shellCmd); blocked {
+			m.reviewRunning = false
+			m.agentRunning = false
+			m.agentLabel = ""
+			m.push(roleError, fmt.Sprintf("[SECURITY ALERT] Dangerous shell mutation blocked: Executing '%s' is strictly forbidden in this mode.", shellCmd))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+
 		m.push(roleSystem, "$ "+shellCmd)
 		out, err := execShell(shellCmd)
 		if err != nil {
@@ -81,6 +101,15 @@ func (m *model) handleInput(line string) tea.Cmd {
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return nil
+	}
+
+	// $ sub-command prefix — executes review actions with immediate
+	// viewport flush so the user never sees stale / frozen output.
+	if strings.HasPrefix(line, "$") {
+		cmd := m.handleReviewDollar(line)
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return cmd
 	}
 
 	if mode, content, ok := parseModeShorthand(line); ok {
@@ -229,8 +258,9 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		m.investigateInvocationCount++
 		return m.runInvestigateCmd(content)
 	case modes.ModeReview:
-		target := ""
 		trimmed := strings.TrimSpace(content)
+
+		target := ""
 		if strings.HasPrefix(strings.ToLower(trimmed), "check ") {
 			target = strings.TrimSpace(trimmed[6:])
 		}
@@ -341,6 +371,13 @@ func parseModeShorthand(line string) (modes.Mode, string, bool) {
 func (m *model) setMode(mode modes.Mode) {
 	m.investigateInvocationCount = 0 // Unconditional state clearance to avoid hard lockout bugs during testing
 
+	// ── Flush stale transient state on mode transition ──
+	m.reviewRunning = false
+	m.agentRunning = false
+	m.agentLabel = ""
+	m.lastActionTime = time.Time{}
+	m.buildVerifyPending = false
+
 	if mode == m.resolver.Current() {
 		return
 	}
@@ -353,6 +390,12 @@ func (m *model) setMode(mode modes.Mode) {
 		fmt.Sprintf("→ /%s — %s", mode, mode.Description()))
 	m.push(roleSystem, modeLabel)
 	m.push(roleSystem, fmt.Sprintf("[System] Runtime boundary adjusted: /%s ──> /%s.", oldMode, mode))
+
+	// Handoff context injection primes the target mode with state from the
+	// previous mode's terminal event.
+	m.injectHandoffContext(mode)
+	m.updateActionChips()
+
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
 }
@@ -384,6 +427,16 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
 		m.push(roleSystem, infoStyle.Render("  /provider <name>  switch AI provider (ollama|anthropic|openai|gemini)"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
+		m.push(roleSystem, "")
+		m.push(roleSystem, labelBoldStyle.Render("review sub-commands ($)"))
+		m.push(roleSystem, infoStyle.Render("  $test [path]  run tests (safety-gated for large repos)"))
+		m.push(roleSystem, infoStyle.Render("  $run  [path]  run go build (safety-gated for large repos)"))
+		m.push(roleSystem, infoStyle.Render("  $fix          auto-fix from last test/run failure output"))
+		m.push(roleSystem, infoStyle.Render(""))
+		m.push(roleSystem, labelBoldStyle.Render("investigate sub-commands ($)"))
+		m.push(roleSystem, infoStyle.Render("  $env            capture environment diagnostics"))
+		m.push(roleSystem, infoStyle.Render("  $trace <fn>     live execution trace with -race"))
+		m.push(roleSystem, infoStyle.Render("  $diagnose       root cause analysis from forensic data"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, infoStyle.Render("  @<path>  reference a file in your message"))
 		return nil
@@ -497,6 +550,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			graphText := m.renderArch()
 			return archDoneMsg{Content: graphText}
 		}
+
 	}
 
 	m.push(roleError, "unknown command: "+cmd)
@@ -572,6 +626,546 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	)
 }
 
+func (m *model) handleReviewTestConfirm(line string) tea.Cmd {
+	m.pendingTestConfirm = false
+	target := strings.TrimSpace(line)
+	if target == "" || target == "y" || target == "yes" {
+		return m.runTestEngine("./...")
+	}
+	return m.runTestEngine(target)
+}
+
+// countGoFiles walks the repository root and counts .go source files,
+// excluding vendor/, .izen/, node_modules/, and other generated directories.
+func countGoFiles(root string) int {
+	count := 0
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			base := info.Name()
+			if base == "vendor" || base == ".izen" || base == "node_modules" ||
+				base == ".git" || strings.HasPrefix(base, ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(info.Name(), ".go") {
+			count++
+		}
+		return nil
+	})
+	return count
+}
+
+func (m *model) runTestCmd(target string) tea.Cmd {
+	if target == "" {
+		goFileCount := countGoFiles(".")
+		if goFileCount >= 50 {
+			warning := fmt.Sprintf(
+				"[!] WARNING: Repository contains %d Go source files.\n"+
+					"    Running global ./... will scan the entire project.\n"+
+					"    Estimated token weight: ~%dk tokens.\n\n"+
+					"    Press Enter to confirm global execution, or type a specific\n"+
+					"    target path (e.g. ./pkg/foo, ./internal/bar/...).",
+				goFileCount, goFileCount*8,
+			)
+			m.push(roleSystem, warningStyle.Render(warning))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			m.pendingTestConfirm = true
+			m.pendingTestTarget = "./..."
+			return nil
+		}
+		return tea.Batch(
+			func() tea.Msg { return agentStartMsg{label: "testing"} },
+			m.runTestEngine("./..."),
+		)
+	}
+	return tea.Batch(
+		func() tea.Msg { return agentStartMsg{label: "testing"} },
+		m.runTestEngine(target),
+	)
+}
+
+func (m *model) runRunCmd(target string) tea.Cmd {
+	if target == "" {
+		goFileCount := countGoFiles(".")
+		if goFileCount >= 50 {
+			warning := fmt.Sprintf(
+				"[!] WARNING: Repository contains %d Go source files.\n"+
+					"    Running global ./... will scan the entire project.\n"+
+					"    Estimated token weight: ~%dk tokens.\n\n"+
+					"    Press Enter to confirm global execution, or type a specific\n"+
+					"    target path (e.g. ./pkg/foo, ./internal/bar/...).",
+				goFileCount, goFileCount*8,
+			)
+			m.push(roleSystem, warningStyle.Render(warning))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			m.pendingTestConfirm = true
+			m.pendingTestTarget = "./..."
+			return nil
+		}
+		return tea.Batch(
+			func() tea.Msg { return agentStartMsg{label: "building"} },
+			m.runBuildEngine("./..."),
+		)
+	}
+	return tea.Batch(
+		func() tea.Msg { return agentStartMsg{label: "building"} },
+		m.runBuildEngine(target),
+	)
+}
+
+func (m *model) runTestEngine(target string) tea.Cmd {
+	return func() tea.Msg {
+		runner := execExecutionRunner(".")
+		cmd := "go test -v " + target
+		result, err := runner.Run(cmd)
+		output := ""
+		passed := true
+		failedCount := 0
+		totalCount := 0
+
+		if result != nil {
+			output = result.Stdout
+			if result.Stderr != "" {
+				if output != "" {
+					output += "\n"
+				}
+				output += result.Stderr
+			}
+			// Count pass/fail lines
+			for _, line := range strings.Split(output, "\n") {
+				if strings.Contains(line, "--- FAIL:") {
+					failedCount++
+				}
+				if strings.Contains(line, "--- PASS:") {
+					totalCount++
+				}
+			}
+			totalCount += failedCount
+			if result.ExitCode != 0 || failedCount > 0 {
+				passed = false
+			}
+		}
+		if err != nil && output == "" {
+			output = err.Error()
+			passed = false
+		}
+
+		return testResultMsg{
+			output: output,
+			passed: passed,
+			failed: failedCount,
+			total:  totalCount,
+			err:    err,
+		}
+	}
+}
+
+func (m *model) runBuildEngine(target string) tea.Cmd {
+	return func() tea.Msg {
+		runner := execExecutionRunner(".")
+		cmd := "go build " + target
+		result, err := runner.Run(cmd)
+		output := ""
+		passed := true
+
+		if result != nil {
+			output = result.Stdout
+			if result.Stderr != "" {
+				if output != "" {
+					output += "\n"
+				}
+				output += result.Stderr
+			}
+			if result.ExitCode != 0 {
+				passed = false
+			}
+		}
+		if err != nil && output == "" {
+			output = err.Error()
+			passed = false
+		}
+
+		// Count errors in output
+		failedCount := 0
+		for _, line := range strings.Split(output, "\n") {
+			if strings.Contains(line, ".go:") && (strings.Contains(line, "error") || strings.Contains(line, "cannot")) {
+				failedCount++
+			}
+		}
+
+		return testResultMsg{
+			output: output,
+			passed: passed,
+			failed: failedCount,
+			total:  0,
+			err:    err,
+		}
+	}
+}
+
+func execExecutionRunner(root string) *executionRunner {
+	return &executionRunner{root: root}
+}
+
+type executionRunner struct {
+	root string
+}
+
+func (r *executionRunner) Run(command string) (*executionRunResult, error) {
+	c := exec.CommandContext(context.Background(), "bash", "-c", command)
+	c.Dir = r.root
+	var stdout, stderr bytes.Buffer
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+	err := c.Run()
+	result := &executionRunResult{
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+		ExitCode: 0,
+	}
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			result.ExitCode = exitErr.ExitCode()
+		}
+	}
+	return result, err
+}
+
+type executionRunResult struct {
+	Stdout   string
+	Stderr   string
+	ExitCode int
+}
+
+func (m *model) runFixCmd(target string) tea.Cmd {
+	if m.lastTestOutput == "" {
+		m.push(roleError, "no previous test/run output available — run $test or $run first")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+
+	return tea.Batch(
+		func() tea.Msg {
+			return agentStartMsg{label: "fixing"}
+		},
+		func() tea.Msg {
+			output := m.lastTestOutput
+			frames := investigate.ParseStackFrames(output)
+
+			var fixCtx strings.Builder
+			fixCtx.WriteString("## FAILURE LOG\n\n```\n")
+			fixCtx.WriteString(output)
+			fixCtx.WriteString("\n```\n\n")
+
+			if len(frames) > 0 {
+				fixCtx.WriteString("## STACK TRACE → SOURCE PROXIMITY\n\n")
+				slicer := investigate.NewProximitySlicer(".", 10)
+				seen := make(map[string]bool)
+				for _, frame := range frames {
+					key := fmt.Sprintf("%s:%d", frame.File, frame.Line)
+					if seen[key] {
+						continue
+					}
+					seen[key] = true
+					slice := slicer.Extract(frame)
+					if slice != nil {
+						fmt.Fprintf(&fixCtx, "### %s:%d\n\n", slice.File, slice.Line)
+						fixCtx.WriteString("```go\n")
+						for _, cline := range slice.Context {
+							fixCtx.WriteString(cline)
+							fixCtx.WriteString("\n")
+						}
+						fixCtx.WriteString("```\n\n")
+					}
+				}
+			}
+
+			if m.lastTestTarget != "" {
+				fmt.Fprintf(&fixCtx, "**Target:** `%s`\n\n", m.lastTestTarget)
+			}
+
+			fixCtx.WriteString("## INSTRUCTION\n")
+			fixCtx.WriteString("Analyze the test failure(s) above. Identify the root cause in the source code ")
+			fixCtx.WriteString("and provide the corrected implementation. Output the minimal fix as a unified diff ")
+			fixCtx.WriteString("or complete file replacement.\n")
+
+			return fixResultMsg{content: fixCtx.String()}
+		},
+	)
+}
+
+// handleReviewDollar routes $ sub-commands.
+// ModeReview: $test, $run, $fix
+// ModeInvestigate: $env, $trace, $diagnose
+// Sets reviewRunning synchronously so the view can render an immediate
+// spinner before the async agentStartMsg is processed.
+func (m *model) handleReviewDollar(line string) tea.Cmd {
+	action := strings.TrimSpace(line[1:])
+	mode := m.resolver.Current()
+
+	var cmd tea.Cmd
+
+	switch {
+	case mode == modes.ModeReview && (action == "test" || strings.HasPrefix(action, "test ")):
+		m.reviewRunning = true
+		m.lastActionTime = time.Now()
+		rest := strings.TrimSpace(strings.TrimPrefix(action, "test"))
+		cmd = m.runTestCmd(rest)
+
+	case mode == modes.ModeReview && (action == "run" || strings.HasPrefix(action, "run ")):
+		m.reviewRunning = true
+		m.lastActionTime = time.Now()
+		rest := strings.TrimSpace(strings.TrimPrefix(action, "run"))
+		cmd = m.runRunCmd(rest)
+
+	case mode == modes.ModeReview && (action == "fix" || strings.HasPrefix(action, "fix ")):
+		m.reviewRunning = true
+		m.lastActionTime = time.Now()
+		rest := strings.TrimSpace(strings.TrimPrefix(action, "fix"))
+		cmd = m.runFixCmd(rest)
+
+	case mode == modes.ModeInvestigate && action == "env":
+		m.reviewRunning = true
+		m.lastActionTime = time.Now()
+		cmd = m.runEnvCmd()
+
+	case mode == modes.ModeInvestigate && (strings.HasPrefix(action, "trace ") || action == "trace"):
+		m.reviewRunning = true
+		m.lastActionTime = time.Now()
+		rest := strings.TrimSpace(strings.TrimPrefix(action, "trace"))
+		if rest == "" {
+			m.push(roleError, "usage: $trace <TestFunctionName>")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+		cmd = m.runTraceCmd(rest)
+
+	case mode == modes.ModeInvestigate && action == "diagnose":
+		m.reviewRunning = true
+		m.lastActionTime = time.Now()
+		cmd = m.runDiagnoseCmd()
+
+	default:
+		switch mode {
+		case modes.ModeReview:
+			m.push(roleError, fmt.Sprintf("unknown review action: $%s (use $test, $run, or $fix)", action))
+		case modes.ModeInvestigate:
+			m.push(roleError, fmt.Sprintf("unknown investigate action: $%s (use $env, $trace, or $diagnose)", action))
+		default:
+			m.push(roleError, fmt.Sprintf("$ sub-commands not available in /%s mode", mode))
+		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+
+	if cmd == nil {
+		m.reviewRunning = false
+		m.lastActionTime = time.Time{}
+	}
+	return cmd
+}
+
+// runEnvCmd captures Go version, git status, and key environment variables
+// into a structured [SYSTEM ENVIRONMENT DIAGNOSTICS] block.
+func (m *model) runEnvCmd() tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg {
+			return agentStartMsg{label: "env diagnostics"}
+		},
+		func() tea.Msg {
+			var b strings.Builder
+			b.WriteString("\n═══════════════════════════════════════════\n")
+			b.WriteString("  [SYSTEM ENVIRONMENT DIAGNOSTICS]\n")
+			b.WriteString("═══════════════════════════════════════════\n")
+
+			goVer, _ := execShell("go version")
+			goVer = strings.TrimSpace(goVer)
+			fmt.Fprintf(&b, "  Go Version : %s\n", goVer)
+
+			branch, branchErr := m.gitEng.Branch()
+			hash, hashErr := m.gitEng.CurrentHash()
+			if branchErr == nil {
+				fmt.Fprintf(&b, "  Git Branch : %s\n", branch)
+			}
+			if hashErr == nil {
+				fmt.Fprintf(&b, "  Git Commit : %s\n", hash)
+			}
+
+			statusOut, _ := execShell("git status --short")
+			if strings.TrimSpace(statusOut) != "" {
+				b.WriteString("  Git Dirt   :\n")
+				for _, line := range strings.Split(strings.TrimRight(statusOut, "\n"), "\n") {
+					line = strings.TrimSpace(line)
+					if line != "" {
+						fmt.Fprintf(&b, "    %s\n", line)
+					}
+				}
+			}
+
+			b.WriteString("  Environment :\n")
+			relevantVars := []string{"GOPATH", "GO111MODULE", "GOFLAGS", "GOROOT", "PATH", "SHELL", "TERM", "HOME"}
+			for _, name := range relevantVars {
+				if val, ok := os.LookupEnv(name); ok {
+					fmt.Fprintf(&b, "    %s=%s\n", name, val)
+				}
+			}
+
+			b.WriteString("═══════════════════════════════════════════\n")
+
+			return envResultMsg{content: b.String()}
+		},
+	)
+}
+
+// runTraceCmd dispatches a live go test -run=[target] -v -race execution
+// and captures full stdout/stderr including panic frames and data races.
+func (m *model) runTraceCmd(target string) tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg {
+			return agentStartMsg{label: "tracing: " + target}
+		},
+		func() tea.Msg {
+			runner := execExecutionRunner(".")
+			cmd := "go test -run=" + target + " -v -race 2>&1"
+			result, err := runner.Run(cmd)
+
+			output := ""
+			passed := true
+			failedCount := 0
+			totalCount := 0
+
+			if result != nil {
+				output = result.Stdout
+				if result.Stderr != "" {
+					if output != "" {
+						output += "\n"
+					}
+					output += result.Stderr
+				}
+				for _, line := range strings.Split(output, "\n") {
+					if strings.Contains(line, "--- FAIL:") {
+						failedCount++
+					}
+					if strings.Contains(line, "--- PASS:") {
+						totalCount++
+					}
+				}
+				totalCount += failedCount
+				if result.ExitCode != 0 || failedCount > 0 {
+					passed = false
+				}
+			}
+			if err != nil && output == "" {
+				output = err.Error()
+				passed = false
+			}
+
+			return traceResultMsg{
+				output: output,
+				target: target,
+				passed: passed,
+				failed: failedCount,
+				total:  totalCount,
+				err:    err,
+			}
+		},
+	)
+}
+
+// runDiagnoseCmd builds the RCA payload from accumulated forensic data
+// (LastFailureLog + $trace + $env) and dispatches it through streamCmd
+// with strict output schema constraints.
+func (m *model) runDiagnoseCmd() tea.Cmd {
+	content := m.buildDiagnoseContent()
+	if content == "" {
+		return tea.Batch(
+			func() tea.Msg {
+				m.push(roleError, "$diagnose: no forensic data available — run $env and $trace first")
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return agentDoneMsg{}
+			},
+		)
+	}
+	return tea.Batch(
+		func() tea.Msg {
+			return agentStartMsg{label: "rca analysis"}
+		},
+		func() tea.Msg {
+			return diagnoseResultMsg{content: content}
+		},
+	)
+}
+
+// buildDiagnoseContent assembles the LLM prompt from the handoff context.
+// Seeds strict RCA output schema and binds all collected forensic data.
+func (m *model) buildDiagnoseContent() string {
+	if m.handoffCtx.LastFailureLog == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("You are a Root Cause Analysis engine operating under strict Evidence-First principles.\n")
+	b.WriteString("You MUST NOT write casual conversation, ask clarifying questions, or provide generic advice.\n")
+	b.WriteString("You MUST adhere strictly to the following normalized Markdown schema in your response:\n\n")
+	b.WriteString("### 🚨 RUNTIME ROOT CAUSE ANALYSED\n")
+	b.WriteString("- **Issue Detected:** [Concise architectural description of the failure]\n")
+	b.WriteString("- **Runtime Evidence:** [Extracted log line, panic frame, or memory state culprit]\n")
+	b.WriteString("- **Proposed Resolution:** [Concrete steps to alter code architecture/mutations]\n\n")
+	b.WriteString("---\n\n")
+	b.WriteString("## FORENSIC DATA\n\n")
+	b.WriteString(m.handoffCtx.LastFailureLog)
+	return b.String()
+}
+
+// shellFirewall checks a shell command against the security guard rail.
+// Returns (blocked, violationMessage).
+// Global blacklist applies in all modes; /mode investigate has an additional
+// read-only allowlist that rejects anything outside inspection binaries.
+func (m *model) shellFirewall(cmd string) (bool, string) {
+	lower := strings.ToLower(strings.TrimSpace(cmd))
+	if lower == "" {
+		return false, ""
+	}
+
+	// ── Mode-specific allowlist: /mode investigate — read-only only ──
+	if m.resolver.Current() == modes.ModeInvestigate {
+		allowed := false
+		for _, prefix := range []string{"go test", "go version", "git status", "git diff", "dlv"} {
+			if strings.HasPrefix(lower, prefix) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return true, fmt.Sprintf(
+				"Dangerous shell mutation blocked: Executing '%s' is strictly forbidden in this mode.",
+				cmd)
+		}
+	}
+
+	// ── Global blacklist ──
+	blacklist := []string{"rm ", "sudo", "chmod", "chown", "mkfs", "dd ", "mv /*", "> /dev/gpi"}
+	for _, b := range blacklist {
+		if strings.Contains(lower, b) {
+			return true, fmt.Sprintf(
+				"Dangerous shell mutation blocked: Executing '%s' is strictly forbidden in this mode.",
+				cmd)
+		}
+	}
+
+	return false, ""
+}
+
 func execShell(cmd string) (string, error) {
 	c := exec.CommandContext(context.Background(), "bash", "-c", cmd)
 	var stdout, stderr bytes.Buffer
@@ -612,6 +1206,10 @@ func (m *model) resetObjectiveContextStacks() {
 	m.pendingFileRefs = nil
 	m.attachedFiles = nil
 	m.investigateInvocationCount = 0
+	m.pendingTestConfirm = false
+	m.pendingTestTarget = ""
+	m.lastTestOutput = ""
+	m.lastTestFailed = false
 	m.pendingProposals = nil
 	m.awaitingConfirmation = false
 	m.acceptAll = false
@@ -625,4 +1223,163 @@ func (m *model) resetObjectiveContextStacks() {
 	m.sess.ClearHistory()
 	m.sess.ClearTasks()
 	_ = m.sess.Save()
+}
+
+// ── Handoff Pipeline ───────────────────────────────────────────────────────────
+
+// updateActionChips evaluates the current handoff context and mode to
+// dynamically populate the active action chips at the UI bottom boundary.
+func (m *model) updateActionChips() {
+	m.activeChips = nil
+	m.showChips = false
+
+	mode := m.resolver.Current()
+	switch mode {
+	case modes.ModeReview:
+		if m.handoffCtx.LastFailureLog != "" {
+			m.activeChips = append(m.activeChips, actionChip{
+				key:    "a",
+				label:  "Investigate Root Cause",
+				action: "/mode investigate",
+				query:  "Investigate root cause of the following failure:\n\n" + m.handoffCtx.LastFailureLog,
+			})
+			m.showChips = true
+		}
+
+	case modes.ModeInvestigate:
+		if m.handoffCtx.ProposedFix != "" {
+			m.activeChips = append(m.activeChips, actionChip{
+				key:    "b",
+				label:  "Formulate Execution Plan",
+				action: "/mode plan",
+				query:  "Formulate an execution plan for the proposed fix:\n\n" + m.handoffCtx.ProposedFix,
+			})
+			m.showChips = true
+		}
+
+	case modes.ModePlan:
+		if len(m.handoffCtx.PendingTodos) > 0 {
+			var todoBlock strings.Builder
+			todoBlock.WriteString("Execute the planned changes with these TODO items:\n")
+			for _, t := range m.handoffCtx.PendingTodos {
+				fmt.Fprintf(&todoBlock, "  - %s\n", t)
+			}
+			m.activeChips = append(m.activeChips, actionChip{
+				key:    "c",
+				label:  "Execute & Verify Patch",
+				action: "/mode build",
+				query:  todoBlock.String(),
+			})
+			m.showChips = true
+		}
+
+	case modes.ModeBuild:
+		// Post-build commit/rollback chips are set dynamically in update.go
+		// based on test verification results.
+	}
+}
+
+// injectHandoffContext primes the target mode with contextual state from the
+// previous mode. Called during setMode when a handoff context is available.
+func (m *model) injectHandoffContext(mode modes.Mode) {
+	switch mode {
+	case modes.ModeInvestigate:
+		if m.handoffCtx.LastFailureLog != "" {
+			m.push(roleSystem, "[System] Handoff context successfully injected into target mode.")
+		}
+
+	case modes.ModePlan:
+		if m.handoffCtx.ProposedFix != "" {
+			if len(m.handoffCtx.PendingTodos) == 0 {
+				m.handoffCtx.PendingTodos = parseProposedFixIntoTodos(m.handoffCtx.ProposedFix)
+			}
+			m.push(roleSystem, fmt.Sprintf(
+				"[System] Handoff context successfully injected into target mode: %d pending TODO(s) from investigation.",
+				len(m.handoffCtx.PendingTodos)))
+		}
+
+	case modes.ModeBuild:
+		if len(m.handoffCtx.PendingTodos) > 0 || m.handoffCtx.ProposedFix != "" {
+			m.createBuildCheckpoint(0)
+			m.push(roleSystem, "[System] Handoff context successfully injected into target mode. Pre-build checkpoint created.")
+		}
+	}
+}
+
+// handleChipActivation routes a hotkey press to the matching action chip.
+// Returns the tea.Cmd to execute, or nil if no chip matched.
+func (m *model) handleChipActivation(key string) tea.Cmd {
+	for _, chip := range m.activeChips {
+		if !strings.EqualFold(chip.key, key) {
+			continue
+		}
+		m.push(roleUser, chip.action)
+		m.push(roleSystem, fmt.Sprintf("[System] Action Chip activated: %s.", chip.label))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+
+		// Mode transition chips: /mode <name>
+		parts := strings.Fields(chip.action)
+		if len(parts) >= 2 && parts[0] == "/mode" {
+			mode, ok := modes.Parse(parts[1])
+			if ok {
+				m.setMode(mode)
+				if chip.query != "" {
+					return m.handleMessageContent(chip.query)
+				}
+			}
+			return nil
+		}
+
+		// Direct command chips: /commit, /undo, etc.
+		return m.handleCommand(chip.action)
+	}
+	return nil
+}
+
+// parseProposedFixIntoTodos converts a proposed fix (markdown/diff) into a
+// checklist of concrete TODO strings for the plan mode dashboard.
+func parseProposedFixIntoTodos(fix string) []string {
+	lines := strings.Split(fix, "\n")
+	var todos []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "- [ ]") || strings.HasPrefix(trimmed, "- [x]") {
+			todos = append(todos, strings.TrimSpace(trimmed[5:]))
+		} else if strings.HasPrefix(trimmed, "✓ ") || strings.HasPrefix(trimmed, "○ ") || strings.HasPrefix(trimmed, "● ") {
+			todos = append(todos, strings.TrimSpace(trimmed[2:]))
+		}
+	}
+	if len(todos) == 0 {
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed != "" {
+				todos = append(todos, trimmed)
+			}
+		}
+	}
+	if len(todos) > 20 {
+		todos = todos[:20]
+	}
+	return todos
+}
+
+// extractTodosFromPlan extracts TODO items from a plan-mode LLM response.
+func extractTodosFromPlan(content string) []string {
+	tasks := plan.ParseMarkdownToTasks(content)
+	if len(tasks) > 0 {
+		todos := make([]string, 0, len(tasks))
+		for _, t := range tasks {
+			label := t.Type + ": " + t.Target
+			if t.Description != "" {
+				label += " — " + t.Description
+			}
+			todos = append(todos, label)
+		}
+		return todos
+	}
+	return parseProposedFixIntoTodos(content)
 }

@@ -24,6 +24,21 @@ func (m *model) updateSuggestions() {
 		m.dismissSuggestions()
 		return
 	}
+	if strings.HasPrefix(current, "$") {
+		m.showSuggestions = true
+		m.suggestionType = "$"
+		m.suggestions = m.filterDollarCommands(current[1:])
+		m.suggestionIdx = 0
+		if len(m.suggestions) == 1 && "$"+m.suggestions[0] == current {
+			m.showSuggestions = false
+		}
+		m.syncAutocompleteFromSuggestions()
+		if m.autocompleteActive {
+			m.recalcViewportHeight()
+		}
+		return
+	}
+
 	if strings.HasPrefix(current, "/") {
 		m.showSuggestions = true
 		m.suggestionType = "/"
@@ -107,7 +122,7 @@ func (m *model) completeAutocomplete() {
 	triggerIdx := -1
 	var activeTrigger byte
 	for i := cursorIdx - 1; i >= 0; i-- {
-		if val[i] == '@' || val[i] == '/' {
+		if val[i] == '@' || val[i] == '/' || val[i] == '$' {
 			triggerIdx = i
 			activeTrigger = val[i]
 			break
@@ -118,11 +133,14 @@ func (m *model) completeAutocomplete() {
 	}
 
 	var selectedToken string
-	if activeTrigger == '@' {
+	switch activeTrigger {
+	case '@':
 		selectedToken = "@" + sel
 		m.pendingFileRefs = append(m.pendingFileRefs, sel)
 		m.attachedFiles = append(m.attachedFiles, sel)
-	} else {
+	case '$':
+		selectedToken = "$" + sel
+	default:
 		selectedToken = sel
 	}
 
@@ -175,6 +193,29 @@ func (m *model) filterCommands(prefix string) []string {
 	}
 	for _, c := range globalCommands {
 		if matches(c) {
+			result = append(result, c)
+		}
+	}
+	return result
+}
+
+func (m *model) filterDollarCommands(prefix string) []string {
+	mode := m.resolver.Current()
+	var candidates []string
+	switch mode {
+	case modes.ModeReview:
+		candidates = []string{"test", "run", "fix"}
+	case modes.ModeInvestigate:
+		candidates = []string{"env", "trace", "diagnose"}
+	default:
+		return nil
+	}
+	if prefix == "" {
+		return candidates
+	}
+	var result []string
+	for _, c := range candidates {
+		if strings.HasPrefix(c, prefix) {
 			result = append(result, c)
 		}
 	}

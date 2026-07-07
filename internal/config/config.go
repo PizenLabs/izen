@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
-
-	"github.com/PizenLabs/izen/internal/state"
 )
 
 type AIProviderConfig struct {
@@ -116,10 +114,6 @@ func legacyConfigPath() string {
 }
 
 func Load() (*Config, error) {
-	if err := state.InitGlobalState(); err != nil {
-		fmt.Fprintf(os.Stderr, "izen: warning: global state init: %v\n", err)
-	}
-
 	path := configPath()
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -153,7 +147,7 @@ func Load() (*Config, error) {
 func Default() *Config {
 	return &Config{
 		AI: AIConfig{
-			DefaultProvider:  "anthropic",
+			DefaultProvider:  "ollama",
 			FallbackProvider: "openai",
 			Providers: map[string]AIProviderConfig{
 				"ollama": {
@@ -164,8 +158,8 @@ func Default() *Config {
 			},
 		},
 		Models: ModelConfig{
-			Default:  "claude-sonnet-4-20250514",
-			Provider: "anthropic",
+			Default:  "qwen2.5-coder:7b",
+			Provider: "ollama",
 		},
 		Execution: ExecutionConfig{
 			Sandbox: true,
