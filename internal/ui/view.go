@@ -162,6 +162,13 @@ func (m *model) renderProposalBlock() string {
 			return ""
 		}
 		p := m.pendingProposals[0]
+		// If the proposal's diff is empty, show a placeholder instead
+		// of rendering an empty card that would cause layout glitches.
+		if p.Diff == "" {
+			b.WriteString("  " + infoStyle.Render("Waiting for proposal payload..."))
+			b.WriteString("\n")
+			break
+		}
 		vm := ToMutationCardViewModelFromProposal(p)
 		mr := &MutationRenderer{Width: width, ScrollOffset: m.proposalDiffOffset}
 		b.WriteString(mr.Render(vm))

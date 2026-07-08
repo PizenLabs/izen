@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,18 @@ func (m *model) Init() tea.Cmd {
 
 // Update routes state machines and events.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// ── GLOBAL PANIC RECOVERY ──────────────────────────────────────────
+	// Any panic inside the update loop is caught here, the full stack trace
+	// is written to stderr for debugging, and the program exits cleanly.
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			fmt.Fprintf(os.Stderr, "\nIZEN PANIC: %v\nStack:\n%s\n", r, buf[:n])
+			os.Exit(1)
+		}
+	}()
+
 	// ── HARD KEYBOARD INTERCEPT: Approval/Processing states bypass all sub-components ──
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
@@ -565,6 +578,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamDoneMsg:
 		m.streamCh = nil
 		m.streaming = false
+		m.streamCancel = nil
 
 		if m.streamParser != nil {
 			m.streamParser.Flush()
@@ -773,6 +787,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamCh = nil
 		m.streaming = false
 		m.streamParser = nil
+		m.streamCancel = nil
 
 		// User-initiated interrupt — suppress error noise, just clean up.
 		if m.interruptRequested {
@@ -840,6 +855,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.streamCancel != nil {
 				m.streamCancel()
 			}
+			m.streamCancel = nil
 			m.interruptRequested = true
 			m.push(roleSystem, "[System] Generation interrupted by user.")
 			return m, nil

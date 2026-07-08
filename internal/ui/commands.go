@@ -243,7 +243,10 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		if compressed != "" && compressed != content {
 			content = retrieval.FormatCompressedFrame(compressed) + "\n\n" + content
 		}
-		go retrieval.BuildGlobalCompressor(m.graph, m.sess.ObjectiveIntent())
+		// Capture snapshot for background goroutine to avoid data race
+		// on m.graph when the main loop assigns a new graph.
+		g := m.graph
+		go retrieval.BuildGlobalCompressor(g, m.sess.ObjectiveIntent())
 	}
 
 	switch m.resolver.Current() {
@@ -287,7 +290,8 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			lc := retrieval.GetLynxController()
 			if lc != nil {
 				compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.ObjectiveIntent())
-				go retrieval.BuildGlobalCompressor(m.graph, m.sess.ObjectiveIntent())
+				g := m.graph
+				go retrieval.BuildGlobalCompressor(g, m.sess.ObjectiveIntent())
 				results, err := lc.SearchRaw(query)
 				if err == nil && len(results) > 0 {
 					compressed := compressor.CompressResults(results)
@@ -610,7 +614,8 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 		if compressed != "" && compressed != content {
 			content = retrieval.FormatCompressedFrame(compressed) + "\n\n" + content
 		}
-		go retrieval.BuildGlobalCompressor(m.graph, m.sess.ObjectiveIntent())
+		g := m.graph
+		go retrieval.BuildGlobalCompressor(g, m.sess.ObjectiveIntent())
 	}
 
 	m.responseBuffer.Reset()

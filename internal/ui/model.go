@@ -632,7 +632,7 @@ func (m *model) getProposalDockCurrentHeight() int {
 			return 0
 		}
 		p := m.pendingProposals[0]
-		if !p.Expanded {
+		if !p.Expanded || p.Diff == "" {
 			return 9 // 1 (top divider) + 7 (collapsed MutationRenderer) + 1 (bottom divider)
 		}
 		n := countRenderedDiffLines(p.Diff)
