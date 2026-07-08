@@ -238,7 +238,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else {
 				m.activeChips = []actionChip{
-					{key: "r", label: "Rollback Workspace", action: "/undo"},
+					{key: "alt+r", label: "Rollback Workspace", action: "/undo"},
 				}
 			}
 			m.showChips = true
@@ -856,8 +856,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.handleChipActivation("c")
 			case "d", "D":
 				return m, m.handleChipActivation("d")
-			case "r", "R":
-				return m, m.handleChipActivation("r")
+			case "alt+r":
+				return m, m.handleChipActivation("alt+r")
 			}
 		}
 

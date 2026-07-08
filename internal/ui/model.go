@@ -693,6 +693,9 @@ func (m *model) computeVpHeight() int {
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
 		vpHeight -= m.getProposalDockCurrentHeight()
 	}
+	if m.showChips && len(m.activeChips) > 0 {
+		vpHeight -= len(m.activeChips)
+	}
 	if vpHeight < 1 {
 		return 1
 	}

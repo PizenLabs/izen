@@ -11,7 +11,7 @@ type EnhancedMutationRenderer struct {
 }
 
 func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
-	contentWidth := r.Width - 4
+	contentWidth := r.Width
 	if contentWidth < 20 {
 		contentWidth = 20
 	}
@@ -25,7 +25,7 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 	if v.Expanded {
 		toggleLabel = "[▲ Collapse]"
 	}
-	actionLine := renderHotkeyPromptWithToggle()
+	actionLine := renderHotkeyPromptWithToggle(contentWidth)
 
 	headerText := "Edit"
 	if v.Target.Name != "" {
