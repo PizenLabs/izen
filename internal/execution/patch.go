@@ -202,6 +202,9 @@ func (pm *PatchManager) Capture(file string) (*Patch, error) {
 }
 
 func (pm *PatchManager) Apply(patch *Patch) error {
+	if patch == nil {
+		return fmt.Errorf("patch execution aborted: target data or file path descriptor is uninstantiated (0x0)")
+	}
 	if patch.File == "" {
 		return fmt.Errorf("patch has empty file path")
 	}
@@ -352,6 +355,9 @@ func parseDiffHunks(content string) []diffHunk {
 // matching fails. It slices out lines oldStart → oldStart+oldCount from the
 // original and injects the newBlock lines at that position.
 func applyLineRangeFallback(original string, hunk diffHunk) (string, bool) {
+	if original == "" {
+		return original, false
+	}
 	if hunk.oldStart < 1 {
 		return original, false
 	}
@@ -380,6 +386,9 @@ func applyLineRangeFallback(original string, hunk diffHunk) (string, bool) {
 }
 
 func applyUnifiedPatch(original, diff string) (string, error) {
+	if diff == "" {
+		return original, nil
+	}
 	hunks := parseDiffHunks(diff)
 	if len(hunks) == 0 {
 		return SanitizeDiffContent(diff), nil

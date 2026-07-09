@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,18 @@ func (m *model) Init() tea.Cmd {
 
 // Update routes state machines and events.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// ── GLOBAL PANIC RECOVERY ──────────────────────────────────────────
+	// Any panic inside the update loop is caught here, the full stack trace
+	// is written to stderr for debugging, and the program exits cleanly.
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			fmt.Fprintf(os.Stderr, "\nIZEN PANIC: %v\nStack:\n%s\n", r, buf[:n])
+			os.Exit(1)
+		}
+	}()
+
 	// ── HARD KEYBOARD INTERCEPT: Approval/Processing states bypass all sub-components ──
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
@@ -37,9 +50,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// ── GLOBAL INTERCEPT: [P] Toggle Hotkey ──────────────────────────────────
+	// ── GLOBAL INTERCEPT: [Alt+P] Toggle Hotkey ────────────────────────────
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
-		if keyMsg.String() == "p" || keyMsg.String() == "P" {
+		if keyMsg.String() == "alt+p" {
 			if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
 				m.pendingProposals[0].Expanded = !m.pendingProposals[0].Expanded
 				m.proposalDiffOffset = 0
@@ -89,7 +102,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		// IZEN SAFETY VALVE: force-clear stale review lock after 30s
-		if m.reviewRunning && time.Since(m.lastActionTime) > 30*time.Second {
+		// Uses absolute wall-clock comparison (time.Now().Sub) to ensure
+		// the timeout cannot be starved or deferred by sequential message
+		// stream timing anomalies.
+		if m.reviewRunning && !m.lastActionTime.IsZero() && time.Since(m.lastActionTime) > 30*time.Second {
 			m.reviewRunning = false
 			m.agentRunning = false
 			m.agentLabel = ""
@@ -113,7 +129,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = false
 		m.agentLabel = msg.label
 		m.spinnerFrame = 0
-		return m, m.spinnerTickCmd()
+		return m, nil
 
 	case agentDoneMsg:
 		m.agentRunning = false
@@ -234,11 +250,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.buildVerifyPending = false
 			if msg.passed {
 				m.activeChips = []actionChip{
-					{key: "d", label: "Commit Safe Baseline", action: "/commit"},
+					{key: "alt+d", label: "Commit Safe Baseline", action: "/commit"},
 				}
 			} else {
 				m.activeChips = []actionChip{
-					{key: "r", label: "Rollback Workspace", action: "/undo"},
+					{key: "alt+r", label: "Rollback Workspace", action: "/undo"},
 				}
 			}
 			m.showChips = true
@@ -360,6 +376,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
+		// ── FAIL-SAFE: Investigate mode diagnostic is read-only stream ──
+		// The diagnostic content is piped through the LLM stream for analysis
+		// output. No patches or mutations are ever applied here.
 		m.push(roleSystem, "[System] Running deep root cause analysis on qwen2.5-coder with forensic evidence...")
 		m.streamCh = nil
 		m.streaming = false
@@ -565,6 +584,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamDoneMsg:
 		m.streamCh = nil
 		m.streaming = false
+		m.streamCancel = nil
 
 		if m.streamParser != nil {
 			m.streamParser.Flush()
@@ -606,6 +626,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.resolver.Current() == modes.ModeInvestigate && final != "" {
 			m.handoffCtx.ProposedFix = final
 			m.updateActionChips()
+		}
+
+		// ── Auto-transition: investigate → build on mutation detection ──
+		// When a read-only analysis ($diagnose, $test) in investigate mode
+		// concludes with a concrete mutation proposal (code blocks with
+		// language annotations), automatically transition to /build and
+		// initiate the fix pipeline. This eliminates the manual handoff step.
+		if m.resolver.Current() == modes.ModeInvestigate && m.handoffCtx.ProposedFix != "" {
+			if containsMutationIntention(m.handoffCtx.ProposedFix) {
+				m.push(roleSystem, infoStyle.Render("[System] Analysis complete — file mutation detected. Auto-transitioning to /build mode for execution..."))
+				m.setMode(modes.ModeBuild)
+				m.lastTestOutput = m.handoffCtx.ProposedFix
+				flush := m.flushPendingRecords()
+				m.refreshViewportContent()
+				return m, tea.Batch(flush, m.runFixCmd(""))
+			}
 		}
 
 		// ── Handoff: Capture PendingTodos from plan mode ────────────────
@@ -773,6 +809,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamCh = nil
 		m.streaming = false
 		m.streamParser = nil
+		m.streamCancel = nil
 
 		// User-initiated interrupt — suppress error noise, just clean up.
 		if m.interruptRequested {
@@ -840,24 +877,27 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.streamCancel != nil {
 				m.streamCancel()
 			}
+			m.streamCancel = nil
 			m.interruptRequested = true
 			m.push(roleSystem, "[System] Generation interrupted by user.")
 			return m, nil
 		}
 
-		// ── Action Chip Hotkeys (only when chips are visible and idle) ───
+		// ── Action Chip Hotkeys (alt+ modifier only) ─────────────────────
+		// Single-character hotkeys are strictly banned to prevent key
+		// collisions with normal prompt input (e.g., typing in /plan).
 		if m.showChips && !m.streaming && !m.agentRunning && m.state == StateChat {
 			switch msg.String() {
-			case "a", "A":
-				return m, m.handleChipActivation("a")
-			case "b", "B":
-				return m, m.handleChipActivation("b")
-			case "c", "C":
-				return m, m.handleChipActivation("c")
-			case "d", "D":
-				return m, m.handleChipActivation("d")
-			case "r", "R":
-				return m, m.handleChipActivation("r")
+			case "alt+a":
+				return m, m.handleChipActivation("alt+a")
+			case "alt+b":
+				return m, m.handleChipActivation("alt+b")
+			case "alt+c":
+				return m, m.handleChipActivation("alt+c")
+			case "alt+d":
+				return m, m.handleChipActivation("alt+d")
+			case "alt+r":
+				return m, m.handleChipActivation("alt+r")
 			}
 		}
 
@@ -995,6 +1035,25 @@ func (m *model) smoothStreamTickCmd() tea.Cmd {
 	return tea.Tick(20*time.Millisecond, func(t time.Time) tea.Msg {
 		return smoothStreamTickMsg(t)
 	})
+}
+
+// containsMutationIntention detects whether an LLM analysis output from
+// investigate mode proposes concrete file mutations. Uses language-annotated
+// code blocks as the heuristic — when the agent outputs code blocks with known
+// language identifiers (go, diff, python, etc.), it indicates a patch proposal.
+func containsMutationIntention(content string) bool {
+	lower := strings.ToLower(content)
+	mutationLanguages := []string{
+		"```go", "```diff", "```patch", "```python", "```typescript",
+		"```javascript", "```java", "```rust", "```c", "```cpp", "```c++",
+		"```rs", "```ts", "```js", "```py",
+	}
+	for _, lang := range mutationLanguages {
+		if strings.Contains(lower, lang) {
+			return true
+		}
+	}
+	return false
 }
 
 func compileTaskListMarkdown(tasks *[]plan.Task) string {

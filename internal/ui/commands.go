@@ -103,9 +103,11 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
-	// $ sub-command prefix — executes review actions with immediate
-	// viewport flush so the user never sees stale / frozen output.
+	// $ sub-command prefix — delegates to handleReviewDollar for routing.
 	if strings.HasPrefix(line, "$") {
+		// ANTI-DEADLOCK: unconditionally sanitize stale execution flags
+		// before spawning any background task. Prevents ghost spinner lock
+		// when sequential $ commands are issued without a clean reset.
 		cmd := m.handleReviewDollar(line)
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -243,7 +245,10 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		if compressed != "" && compressed != content {
 			content = retrieval.FormatCompressedFrame(compressed) + "\n\n" + content
 		}
-		go retrieval.BuildGlobalCompressor(m.graph, m.sess.ObjectiveIntent())
+		// Capture snapshot for background goroutine to avoid data race
+		// on m.graph when the main loop assigns a new graph.
+		g := m.graph
+		go retrieval.BuildGlobalCompressor(g, m.sess.ObjectiveIntent())
 	}
 
 	switch m.resolver.Current() {
@@ -287,7 +292,8 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			lc := retrieval.GetLynxController()
 			if lc != nil {
 				compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.ObjectiveIntent())
-				go retrieval.BuildGlobalCompressor(m.graph, m.sess.ObjectiveIntent())
+				g := m.graph
+				go retrieval.BuildGlobalCompressor(g, m.sess.ObjectiveIntent())
 				results, err := lc.SearchRaw(query)
 				if err == nil && len(results) > 0 {
 					compressed := compressor.CompressResults(results)
@@ -371,11 +377,13 @@ func parseModeShorthand(line string) (modes.Mode, string, bool) {
 func (m *model) setMode(mode modes.Mode) {
 	m.investigateInvocationCount = 0 // Unconditional state clearance to avoid hard lockout bugs during testing
 
-	// ── Flush stale transient state on mode transition ──
-	m.reviewRunning = false
-	m.agentRunning = false
-	m.agentLabel = ""
-	m.lastActionTime = time.Time{}
+	// ── ABSOLUTE STALE GOROUTINE RELEASE ON MODE ENTRY ────────────────
+	// Before any mode transition, cancel all in-flight background contexts,
+	// drain stream buffers, and reset spinner state. This prevents stale
+	// tickMsg loops and structural goroutines from a previous mode (e.g.,
+	// $test from /review) from corrupting the single-source model state
+	// of the new mode — the root cause of spinner frame mutation bugs.
+	m.cancelStaleAgentOps()
 	m.buildVerifyPending = false
 
 	if mode == m.resolver.Current() {
@@ -610,7 +618,8 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 		if compressed != "" && compressed != content {
 			content = retrieval.FormatCompressedFrame(compressed) + "\n\n" + content
 		}
-		go retrieval.BuildGlobalCompressor(m.graph, m.sess.ObjectiveIntent())
+		g := m.graph
+		go retrieval.BuildGlobalCompressor(g, m.sess.ObjectiveIntent())
 	}
 
 	m.responseBuffer.Reset()
@@ -845,6 +854,15 @@ type executionRunResult struct {
 }
 
 func (m *model) runFixCmd(target string) tea.Cmd {
+	// ── FAIL-SAFE: Belt-and-suspenders write-capability guard ────────────
+	if !m.resolver.Current().CanWrite() && !m.resolver.Current().CanPatch() {
+		m.cancelStaleAgentOps()
+		m.push(roleSystem, mutedStyle.Render("[System] Action rejected: Write access required. Please switch to '/build' mode to execute patches."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+
 	if m.lastTestOutput == "" {
 		m.push(roleError, "no previous test/run output available — run $test or $run first")
 		m.refreshViewportContent()
@@ -902,6 +920,31 @@ func (m *model) runFixCmd(target string) tea.Cmd {
 	)
 }
 
+// ── Workflow lifecycle: context cancellation for stale goroutine release ──
+// cancelStaleAgentOps cancels any in-flight background context and resets
+// all agent/spinner state to prevent stale tickMsg loops, goroutine leaks,
+// and spinner frame corruption across mode transitions and $sub-command
+// re-entry. MUST be called before spawning any new execution loop.
+func (m *model) cancelStaleAgentOps() {
+	m.reviewRunning = false
+	m.agentRunning = false
+	m.agentDone = false
+	m.agentLabel = ""
+	m.lastActionTime = time.Time{}
+	m.spinnerFrame = 0
+
+	if m.streamCancel != nil {
+		m.streamCancel()
+		m.streamCancel = nil
+	}
+	m.streamCh = nil
+	m.streaming = false
+	m.streamTickActive = false
+	m.streamBuffer = ""
+	m.currentStreamContent = ""
+	m.interruptRequested = false
+}
+
 // handleReviewDollar routes $ sub-commands.
 // ModeReview: $test, $run, $fix
 // ModeInvestigate: $env, $trace, $diagnose
@@ -910,6 +953,49 @@ func (m *model) runFixCmd(target string) tea.Cmd {
 func (m *model) handleReviewDollar(line string) tea.Cmd {
 	action := strings.TrimSpace(line[1:])
 	mode := m.resolver.Current()
+
+	// ── INTELLIGENT AUTO-TRANSITION: $fix from /review → /build ─────────
+	// When $fix is invoked inside /review, the system detects that Write/Patch
+	// capabilities are required and seamlessly transitions to /build mode,
+	// carrying the failure context forward for autonomous fix execution.
+	if mode == modes.ModeReview && (action == "fix" || strings.HasPrefix(action, "fix ")) {
+		if m.lastTestOutput == "" {
+			m.cancelStaleAgentOps()
+			m.push(roleError, "no previous test/run output available — run $test or $run first")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+		m.push(roleSystem, infoStyle.Render("[System] Auto-transitioning to /build mode for fix execution..."))
+		m.setMode(modes.ModeBuild)
+		rest := strings.TrimSpace(strings.TrimPrefix(action, "fix"))
+		return m.runFixCmd(rest)
+	}
+
+	// ── $diagnose in /investigate — runs analysis; auto-transition to /build
+	// happens from streamDoneMsg when mutation is detected in the output.
+	if mode == modes.ModeInvestigate && (action == "diagnose" || strings.HasPrefix(action, "diagnose ")) {
+		m.cancelStaleAgentOps()
+		m.reviewRunning = true
+		m.lastActionTime = time.Now()
+		return m.runDiagnoseCmd()
+	}
+
+	// ── $test in /investigate — full Test=Yes privilege. Let run read-only.
+	if mode == modes.ModeInvestigate && (action == "test" || strings.HasPrefix(action, "test ")) {
+		m.cancelStaleAgentOps()
+		m.reviewRunning = true
+		m.lastActionTime = time.Now()
+		rest := strings.TrimSpace(strings.TrimPrefix(action, "test"))
+		return m.runTestCmd(rest)
+	}
+
+	// ── ABSOLUTE STALE GOROUTINE RELEASE (ANTI-CORRUPTION) ───────────────
+	// Before spawning ANY new execution loop, kill/drain/cancel all previous
+	// background agents. This prevents stale tickMsg loops and structural
+	// goroutines from the previous $test/$run from corrupting the single-source
+	// model state — which causes the custom star spinner to mutate into defaults.
+	m.cancelStaleAgentOps()
 
 	var cmd tea.Cmd
 
@@ -925,12 +1011,6 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 		m.lastActionTime = time.Now()
 		rest := strings.TrimSpace(strings.TrimPrefix(action, "run"))
 		cmd = m.runRunCmd(rest)
-
-	case mode == modes.ModeReview && (action == "fix" || strings.HasPrefix(action, "fix ")):
-		m.reviewRunning = true
-		m.lastActionTime = time.Now()
-		rest := strings.TrimSpace(strings.TrimPrefix(action, "fix"))
-		cmd = m.runFixCmd(rest)
 
 	case mode == modes.ModeInvestigate && action == "env":
 		m.reviewRunning = true
@@ -949,17 +1029,12 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 		}
 		cmd = m.runTraceCmd(rest)
 
-	case mode == modes.ModeInvestigate && action == "diagnose":
-		m.reviewRunning = true
-		m.lastActionTime = time.Now()
-		cmd = m.runDiagnoseCmd()
-
 	default:
 		switch mode {
 		case modes.ModeReview:
 			m.push(roleError, fmt.Sprintf("unknown review action: $%s (use $test, $run, or $fix)", action))
 		case modes.ModeInvestigate:
-			m.push(roleError, fmt.Sprintf("unknown investigate action: $%s (use $env, $trace, or $diagnose)", action))
+			m.push(roleError, fmt.Sprintf("unknown investigate action: $%s (use $env, $trace, $test, or $diagnose)", action))
 		default:
 			m.push(roleError, fmt.Sprintf("$ sub-commands not available in /%s mode", mode))
 		}
@@ -1229,6 +1304,8 @@ func (m *model) resetObjectiveContextStacks() {
 
 // updateActionChips evaluates the current handoff context and mode to
 // dynamically populate the active action chips at the UI bottom boundary.
+// NOTE: All chip keys use alt+ modifier to avoid key collisions with
+// normal text input (see MODIFIER-BASED INPUT SAFETY).
 func (m *model) updateActionChips() {
 	m.activeChips = nil
 	m.showChips = false
@@ -1238,7 +1315,7 @@ func (m *model) updateActionChips() {
 	case modes.ModeReview:
 		if m.handoffCtx.LastFailureLog != "" {
 			m.activeChips = append(m.activeChips, actionChip{
-				key:    "a",
+				key:    "alt+a",
 				label:  "Investigate Root Cause",
 				action: "/mode investigate",
 				query:  "Investigate root cause of the following failure:\n\n" + m.handoffCtx.LastFailureLog,
@@ -1249,7 +1326,7 @@ func (m *model) updateActionChips() {
 	case modes.ModeInvestigate:
 		if m.handoffCtx.ProposedFix != "" {
 			m.activeChips = append(m.activeChips, actionChip{
-				key:    "b",
+				key:    "alt+b",
 				label:  "Formulate Execution Plan",
 				action: "/mode plan",
 				query:  "Formulate an execution plan for the proposed fix:\n\n" + m.handoffCtx.ProposedFix,
@@ -1260,12 +1337,12 @@ func (m *model) updateActionChips() {
 	case modes.ModePlan:
 		if len(m.handoffCtx.PendingTodos) > 0 {
 			var todoBlock strings.Builder
-			todoBlock.WriteString("Execute the planned changes with these TODO items:\n")
+			todoBlock.WriteString("Execute the planned changes with these TODOs:\n")
 			for _, t := range m.handoffCtx.PendingTodos {
 				fmt.Fprintf(&todoBlock, "  - %s\n", t)
 			}
 			m.activeChips = append(m.activeChips, actionChip{
-				key:    "c",
+				key:    "alt+c",
 				label:  "Execute & Verify Patch",
 				action: "/mode build",
 				query:  todoBlock.String(),

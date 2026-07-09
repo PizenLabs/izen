@@ -98,14 +98,18 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.streamCancel = cancel
 
+	// Capture the channel reference locally so the goroutine never reads
+	// m.streamCh after Update() clears it to nil. Without this, the
+	// deferred close(m.streamCh) would panic with "close of nil channel".
+	streamCh := m.streamCh
+
 	go func() {
-		defer close(m.streamCh)
-		defer func() { m.streamCancel = nil }()
+		defer close(streamCh)
 		defer cancel()
 
 		rawStream, err := m.provider.ExecuteStream(ctx, req)
 		if err != nil {
-			m.streamCh <- streamErrMsg{err: err}
+			streamCh <- streamErrMsg{err: err}
 			return
 		}
 		defer func() { _ = rawStream.Close() }()
@@ -119,7 +123,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			if n > 0 {
 				chunk := string(buf[:n])
 				full.WriteString(chunk)
-				m.streamCh <- tokenMsg(chunk)
+				streamCh <- tokenMsg(chunk)
 			}
 			if err == io.EOF {
 				if sr, ok := rawStream.(*providers.StreamResult); ok {
@@ -134,21 +138,26 @@ func (m *model) streamCmd(content string) tea.Cmd {
 					tokenInput:  tokIn,
 					tokenOutput: tokOut,
 				}
-				m.streamCh <- msg
+				streamCh <- msg
 				return
 			}
 			if err != nil {
-				m.streamCh <- streamErrMsg{err: err}
+				streamCh <- streamErrMsg{err: err}
 				return
 			}
 		}
 	}()
 
-	return tea.Batch(m.readStream(), m.spinnerTickCmd())
+	return tea.Batch(m.readStream())
 }
 
 func (m *model) readStream() tea.Cmd {
 	return func() tea.Msg {
+		// Defensive: if the channel is nil (already cleaned up), return
+		// immediately instead of blocking forever.
+		if m.streamCh == nil {
+			return nil
+		}
 		msg, ok := <-m.streamCh
 		if !ok {
 			return nil

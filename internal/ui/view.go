@@ -85,8 +85,7 @@ func (m *model) View() string {
 	inputView.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
 	promptLabel := modeColor.Render("❯ " + mode.String())
 	if m.reviewRunning || m.agentRunning {
-		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
-		promptLabel += " " + SpinnerStyle.Render(frame)
+		promptLabel += " " + m.renderFlowingSpinner()
 	}
 	inputView.WriteString(promptLabel + " ⟩ " + m.ti.View() + "\n")
 	inputView.WriteString(modeColor.Render(strings.Repeat("─", width)))
@@ -162,6 +161,13 @@ func (m *model) renderProposalBlock() string {
 			return ""
 		}
 		p := m.pendingProposals[0]
+		// If the proposal's diff is empty, show a placeholder instead
+		// of rendering an empty card that would cause layout glitches.
+		if p.Diff == "" {
+			b.WriteString("  " + infoStyle.Render("Waiting for proposal payload..."))
+			b.WriteString("\n")
+			break
+		}
 		vm := ToMutationCardViewModelFromProposal(p)
 		mr := &MutationRenderer{Width: width, ScrollOffset: m.proposalDiffOffset}
 		b.WriteString(mr.Render(vm))
@@ -423,11 +429,11 @@ func (m *model) renderHelpOverlay() string {
 func (m *model) renderRuntimeStatus(width int) string {
 	var b strings.Builder
 
-	// Animated spinner during active states (streaming, agent, processing)
-	// Read frame directly from model state at draw-time — zero buffering.
+	// Status bar uses a clean braille/rectangular spinner to maintain layout
+	// symmetry. The custom star glyphs are strictly reserved for the chat
+	// prompt label — they never appear in the status bar.
 	if m.streaming || m.agentRunning || m.state == StateProcessing {
-		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
-		b.WriteString(SpinnerStyle.Render(frame))
+		b.WriteString(m.renderRectSpinner())
 	} else {
 		b.WriteString(dimmedStyle.Render("●"))
 	}
@@ -479,13 +485,21 @@ var devTips = []string{
 // renderActionChips renders the dynamic action chip bar at the bottom
 // boundary of the TUI. Each chip is a hotkey + label pair that triggers a
 // handoff pipeline transition or terminal action.
+// NOTE: Chip keys use alt+ modifier — single-letter hotkeys are banned
+// to prevent key collisions with normal prompt input.
 func (m *model) renderActionChips(width int) string {
 	if !m.showChips || len(m.activeChips) == 0 {
 		return ""
 	}
+	displayKey := func(key string) string {
+		if len(key) > 4 && key[:4] == "alt+" {
+			return "Alt+" + strings.ToUpper(key[4:])
+		}
+		return strings.ToUpper(key)
+	}
 	var b strings.Builder
 	for _, chip := range m.activeChips {
-		hotkey := hotkeyStyle.Render("[" + strings.ToUpper(chip.key) + "]")
+		hotkey := hotkeyStyle.Render("[" + displayKey(chip.key) + "]")
 		label := textStyle.Render(chip.label)
 		actionHint := mutedStyle.Render(chip.action)
 		pad := width - lipgloss.Width(hotkey+" "+label+" "+actionHint) - 2
@@ -1020,7 +1034,7 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 			}
 			container.WriteString("\n")
 			if mode.CanShell() {
-				container.WriteString(mutedStyle.Render("[A] Run  [R] Skip"))
+				container.WriteString(mutedStyle.Render("[Alt+A] Run  [Alt+R] Skip"))
 			} else {
 				container.WriteString(dimmedStyle.Render("[System] Tool 'shell' rejected. Read-Only environment. No action available."))
 			}

@@ -194,8 +194,11 @@ type HandoffContext struct {
 
 // actionChip represents a selectable action rendered at the bottom boundary
 // of the TUI. Hotkey activation executes the associated command.
+// IMPORTANT: All chip keys MUST use "alt+<key>" format to prevent key
+// collisions with normal text input in the prompt chat. Single-letter
+// hotkey bindings are strictly banned.
 type actionChip struct {
-	key    string // Hotkey letter (A, B, C, etc.)
+	key    string // Hotkey specifier (e.g. "alt+a", "alt+b") — NO single-letter keys
 	label  string // Display label (e.g. "Investigate Root Cause")
 	action string // Command to execute (e.g. "/mode investigate")
 	query  string // Optional seed content passed with the command
@@ -222,8 +225,12 @@ var utilityCommands = map[modes.Mode][]string{
 
 var globalCommands = []string{"/help", "/?", "/mode", "/objective", "/drop", "/quit", "/arch"}
 
-// ── Elegant spinner frames ────────────────────────────────────────────────────
-var flowingSpinnerFrames = []string{" ⊹ ", " ⁕ ", " ⚙ ", " ❃ ", " ❄ ", " ❆ ", " ❃ ", " ⚙ ", " ⁕ ", " ⊹ "}
+// ── IZEN Star-Shape Spinner Frames ─────────────────────────────────────────
+// Custom star/asterisk frames designed to be preserved across all rendering
+// paths. NEVER overridden by ProposalSpinnerFrames (braille) or any default
+// rectangular spinner. The anti-corruption architecture guarantees that only
+// flowingSpinnerFrames is used in all View and refreshViewportContent paths.
+var flowingSpinnerFrames = []string{" ✦ ", " ★ ", " ⚙ ", " ❋ ", " ❄ ", " ❆ ", " ❋ ", " ⚙ ", " ★ ", " ✦ "}
 
 // providerSwitchMsg signals a successful provider switch.
 type providerSwitchMsg struct {
@@ -584,8 +591,8 @@ func (m *model) refreshViewportContent() {
 		}
 		content.WriteString(sp + " " + infoStyle.Render(status) + "\n")
 	} else if m.reviewRunning || m.agentRunning {
-		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
-		content.WriteString(SpinnerStyle.Render(frame) + " " + infoStyle.Render(m.agentLabel) + "\n")
+		sp := m.renderFlowingSpinner()
+		content.WriteString(sp + " " + infoStyle.Render(m.agentLabel) + "\n")
 	}
 
 	m.Viewport.SetContent(content.String())
@@ -632,7 +639,7 @@ func (m *model) getProposalDockCurrentHeight() int {
 			return 0
 		}
 		p := m.pendingProposals[0]
-		if !p.Expanded {
+		if !p.Expanded || p.Diff == "" {
 			return 9 // 1 (top divider) + 7 (collapsed MutationRenderer) + 1 (bottom divider)
 		}
 		n := countRenderedDiffLines(p.Diff)
@@ -693,6 +700,9 @@ func (m *model) computeVpHeight() int {
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
 		vpHeight -= m.getProposalDockCurrentHeight()
 	}
+	if m.showChips && len(m.activeChips) > 0 {
+		vpHeight -= len(m.activeChips)
+	}
 	if vpHeight < 1 {
 		return 1
 	}
@@ -726,6 +736,15 @@ func (m *model) renderFlowingSpinner() string {
 	color := interpolateColor(from, to, t)
 
 	return spinnerBaseStyle.Foreground(color).Render(frameStr)
+}
+
+// renderRectSpinner renders a clean braille/rectangular spinner frame.
+// Used exclusively in the status bar to maintain layout symmetry — star
+// glyphs are reserved for the chat prompt label.
+func (m *model) renderRectSpinner() string {
+	n := len(ProposalSpinnerFrames)
+	idx := m.spinnerFrame % n
+	return SpinnerStyle.Render(ProposalSpinnerFrames[idx])
 }
 
 // ── History persistence ───────────────────────────────────────────────────────

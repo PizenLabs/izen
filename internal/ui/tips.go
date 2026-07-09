@@ -21,7 +21,7 @@ var allTips = []string{
 	"The ctx optimized metric shows how much context was saved by AST pruning.",
 	"Use /drop to remove attached files from the current session context.",
 	"Run /help or /? at any time to see all available commands.",
-	"Press [A] to accept individual build proposals or [L] to accept all at once.",
+	"Press [Alt+A] to accept individual build proposals or [Alt+L] to accept all at once.",
 	"Use /commit to auto-generate a semantic commit message from staged changes.",
 }
 

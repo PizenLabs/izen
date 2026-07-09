@@ -60,10 +60,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// ── Awaiting shell execution approval ─────────────────────────────────────
+	// ── Awaiting shell execution approval (alt+ modifier only) ──────────────
 	if m.state == StateAwaitingShellExec {
 		switch {
-		case msg.String() == "a" || msg.String() == "A":
+		case msg.String() == "alt+a":
 			if !m.resolver.Current().CanShell() {
 				m.pendingShellExec = nil
 				m.state = StateChat
@@ -79,7 +79,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, m.execShellCmd(block.Command)
 
-		case msg.String() == "r" || msg.String() == "R":
+		case msg.String() == "alt+r":
 			m.pendingShellExec = append(m.pendingShellExec[:m.shellAwaitingIdx], m.pendingShellExec[m.shellAwaitingIdx+1:]...)
 			if len(m.pendingShellExec) == 0 {
 				m.state = StateChat
@@ -98,15 +98,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// ── Awaiting approval ──────────────────────────────────────────────────
+	// ── Awaiting approval (alt+ modifier only) ──────────────────────────────
 	if m.state == StateAwaitingApproval {
 		switch {
-		case msg.String() == "a" || msg.String() == "A":
+		case msg.String() == "alt+a":
 			return m, m.applySingleProposal()
-		case msg.String() == "l" || msg.String() == "L":
+		case msg.String() == "alt+l":
 			m.acceptAll = true
 			return m, m.applyAllProposals()
-		case msg.String() == "p" || msg.String() == "P":
+		case msg.String() == "alt+p":
 			if len(m.pendingProposals) > 0 {
 				m.pendingProposals[0].Expanded = !m.pendingProposals[0].Expanded
 				m.proposalDiffOffset = 0
@@ -115,7 +115,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.Viewport.GotoBottom()
 			}
 			return m, nil
-		case msg.String() == "r" || msg.String() == "R" || msg.Type == tea.KeyEscape:
+		case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
 			m.ti.Focus()
 			m.state = StateChat
 			m.recalcViewportHeight()

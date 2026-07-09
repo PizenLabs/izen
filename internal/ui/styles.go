@@ -191,10 +191,26 @@ var (
 			Padding(0, 1)
 )
 
-func renderHotkeyPromptWithToggle() string {
+func renderHotkeyPromptWithToggle(width int) string {
 	hk := hotkeyStyle.Render
 	hint := hotkeyHintStyle.Render
-	return hint("press (") + hk("A") + hint(") accept   (") + hk("L") + hint(") allow all   (") + hk("R") + hint(") reject   (") + hk("P") + hint(") toggle")
+	text := hint("Press ") + hk("Alt+A") + hint(" to accept   ") +
+		hk("Alt+L") + hint(" to allow all   ") +
+		hk("Alt+R") + hint(" to reject   ") +
+		hk("Alt+P") + hint(" to toggle   ") +
+		hk("j/k") + hint(" to navigate")
+	if lipgloss.Width(text) > width {
+		text = hint("Press ") + hk("Alt+A") + hint(" acc  ") +
+			hk("Alt+L") + hint(" all  ") +
+			hk("Alt+R") + hint(" rej  ") +
+			hk("Alt+P") + hint(" tog  ") +
+			hk("j/k") + hint(" nav")
+		if lipgloss.Width(text) > width {
+			text = hint(" ") + hk("Alt+A/L/R/P") + hint(" act  ") +
+				hk("j/k") + hint(" nav")
+		}
+	}
+	return text
 }
 
 // Mode-accent style lookup (indexed by modes.Mode value).
