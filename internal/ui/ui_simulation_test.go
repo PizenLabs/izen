@@ -133,14 +133,14 @@ func TestStreamDoneMsgTransitionsToStateAwaitingApproval(t *testing.T) {
 func TestKeyAToAcceptProposal(t *testing.T) {
 	m := newTestModel()
 
-	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}, Alt: true})
 	m2 := newModel.(*model)
 
 	if m2.state != StateProcessing {
-		t.Errorf("after 'a': state = %v, want StateProcessing", m2.state)
+		t.Errorf("after 'alt+a': state = %v, want StateProcessing", m2.state)
 	}
 	if cmd == nil {
-		t.Fatal("after 'a': cmd is nil — applySingleProposal not triggered")
+		t.Fatal("after 'alt+a': cmd is nil — applySingleProposal not triggered")
 	}
 }
 
@@ -150,12 +150,12 @@ func TestKeyPToggleProposal(t *testing.T) {
 	m := newTestModel()
 	m.pendingProposals[0].Expanded = false
 
-	// Press 'p' in StateAwaitingApproval
-	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	// Press Alt+P in StateAwaitingApproval
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}, Alt: true})
 	m2 := newModel.(*model)
 
 	if !m2.pendingProposals[0].Expanded {
-		t.Error("'p' did NOT toggle Expanded — handleKey StateAwaitingApproval block missing p/P case")
+		t.Error("'alt+p' did NOT toggle Expanded — handleKey StateAwaitingApproval block missing alt+p case")
 	}
 	_ = cmd
 }
@@ -165,14 +165,14 @@ func TestKeyPToggleProposal(t *testing.T) {
 func TestKeyRRejectsProposal(t *testing.T) {
 	m := newTestModel()
 
-	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}, Alt: true})
 	m2 := newModel.(*model)
 
 	if m2.state != StateChat {
-		t.Errorf("after 'r': state = %v, want StateChat", m2.state)
+		t.Errorf("after 'alt+r': state = %v, want StateChat", m2.state)
 	}
 	if len(m2.pendingProposals) != 0 {
-		t.Errorf("after 'r': %d pending proposals remain, want 0", len(m2.pendingProposals))
+		t.Errorf("after 'alt+r': %d pending proposals remain, want 0", len(m2.pendingProposals))
 	}
 	if !m2.ti.Focused() {
 		t.Error("textinput should be focused after rejection back to Chat")

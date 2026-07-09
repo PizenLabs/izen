@@ -486,13 +486,21 @@ var devTips = []string{
 // renderActionChips renders the dynamic action chip bar at the bottom
 // boundary of the TUI. Each chip is a hotkey + label pair that triggers a
 // handoff pipeline transition or terminal action.
+// NOTE: Chip keys use alt+ modifier — single-letter hotkeys are banned
+// to prevent key collisions with normal prompt input.
 func (m *model) renderActionChips(width int) string {
 	if !m.showChips || len(m.activeChips) == 0 {
 		return ""
 	}
+	displayKey := func(key string) string {
+		if len(key) > 4 && key[:4] == "alt+" {
+			return "Alt+" + strings.ToUpper(key[4:])
+		}
+		return strings.ToUpper(key)
+	}
 	var b strings.Builder
 	for _, chip := range m.activeChips {
-		hotkey := hotkeyStyle.Render("[" + strings.ToUpper(chip.key) + "]")
+		hotkey := hotkeyStyle.Render("[" + displayKey(chip.key) + "]")
 		label := textStyle.Render(chip.label)
 		actionHint := mutedStyle.Render(chip.action)
 		pad := width - lipgloss.Width(hotkey+" "+label+" "+actionHint) - 2
@@ -1027,7 +1035,7 @@ func (m *model) renderAIResponseBlocks(content string, width int) string {
 			}
 			container.WriteString("\n")
 			if mode.CanShell() {
-				container.WriteString(mutedStyle.Render("[A] Run  [R] Skip"))
+				container.WriteString(mutedStyle.Render("[Alt+A] Run  [Alt+R] Skip"))
 			} else {
 				container.WriteString(dimmedStyle.Render("[System] Tool 'shell' rejected. Read-Only environment. No action available."))
 			}

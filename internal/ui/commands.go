@@ -105,7 +105,15 @@ func (m *model) handleInput(line string) tea.Cmd {
 
 	// $ sub-command prefix — executes review actions with immediate
 	// viewport flush so the user never sees stale / frozen output.
+	// ANTI-DEADLOCK: unconditionally sanitize stale execution flags
+	// before spawning any background task. Prevents ghost spinner lock
+	// when sequential $ commands are issued without a clean reset.
 	if strings.HasPrefix(line, "$") {
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentLabel = ""
+		m.agentDone = false
+		m.lastActionTime = time.Time{}
 		cmd := m.handleReviewDollar(line)
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -1234,6 +1242,8 @@ func (m *model) resetObjectiveContextStacks() {
 
 // updateActionChips evaluates the current handoff context and mode to
 // dynamically populate the active action chips at the UI bottom boundary.
+// NOTE: All chip keys use alt+ modifier to avoid key collisions with
+// normal text input (see MODIFIER-BASED INPUT SAFETY).
 func (m *model) updateActionChips() {
 	m.activeChips = nil
 	m.showChips = false
@@ -1243,7 +1253,7 @@ func (m *model) updateActionChips() {
 	case modes.ModeReview:
 		if m.handoffCtx.LastFailureLog != "" {
 			m.activeChips = append(m.activeChips, actionChip{
-				key:    "a",
+				key:    "alt+a",
 				label:  "Investigate Root Cause",
 				action: "/mode investigate",
 				query:  "Investigate root cause of the following failure:\n\n" + m.handoffCtx.LastFailureLog,
@@ -1254,7 +1264,7 @@ func (m *model) updateActionChips() {
 	case modes.ModeInvestigate:
 		if m.handoffCtx.ProposedFix != "" {
 			m.activeChips = append(m.activeChips, actionChip{
-				key:    "b",
+				key:    "alt+b",
 				label:  "Formulate Execution Plan",
 				action: "/mode plan",
 				query:  "Formulate an execution plan for the proposed fix:\n\n" + m.handoffCtx.ProposedFix,
@@ -1265,12 +1275,12 @@ func (m *model) updateActionChips() {
 	case modes.ModePlan:
 		if len(m.handoffCtx.PendingTodos) > 0 {
 			var todoBlock strings.Builder
-			todoBlock.WriteString("Execute the planned changes with these TODO items:\n")
+			todoBlock.WriteString("Execute the planned changes with these TODOs:\n")
 			for _, t := range m.handoffCtx.PendingTodos {
 				fmt.Fprintf(&todoBlock, "  - %s\n", t)
 			}
 			m.activeChips = append(m.activeChips, actionChip{
-				key:    "c",
+				key:    "alt+c",
 				label:  "Execute & Verify Patch",
 				action: "/mode build",
 				query:  todoBlock.String(),

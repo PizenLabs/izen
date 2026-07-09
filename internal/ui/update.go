@@ -50,9 +50,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// ── GLOBAL INTERCEPT: [P] Toggle Hotkey ──────────────────────────────────
+	// ── GLOBAL INTERCEPT: [Alt+P] Toggle Hotkey ────────────────────────────
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
-		if keyMsg.String() == "p" || keyMsg.String() == "P" {
+		if keyMsg.String() == "alt+p" {
 			if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
 				m.pendingProposals[0].Expanded = !m.pendingProposals[0].Expanded
 				m.proposalDiffOffset = 0
@@ -102,7 +102,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		// IZEN SAFETY VALVE: force-clear stale review lock after 30s
-		if m.reviewRunning && time.Since(m.lastActionTime) > 30*time.Second {
+		// Uses absolute wall-clock comparison (time.Now().Sub) to ensure
+		// the timeout cannot be starved or deferred by sequential message
+		// stream timing anomalies.
+		if m.reviewRunning && !m.lastActionTime.IsZero() && time.Since(m.lastActionTime) > 30*time.Second {
 			m.reviewRunning = false
 			m.agentRunning = false
 			m.agentLabel = ""
@@ -126,7 +129,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = false
 		m.agentLabel = msg.label
 		m.spinnerFrame = 0
-		return m, m.spinnerTickCmd()
+		return m, nil
 
 	case agentDoneMsg:
 		m.agentRunning = false
@@ -247,7 +250,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.buildVerifyPending = false
 			if msg.passed {
 				m.activeChips = []actionChip{
-					{key: "d", label: "Commit Safe Baseline", action: "/commit"},
+					{key: "alt+d", label: "Commit Safe Baseline", action: "/commit"},
 				}
 			} else {
 				m.activeChips = []actionChip{
@@ -861,17 +864,19 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// ── Action Chip Hotkeys (only when chips are visible and idle) ───
+		// ── Action Chip Hotkeys (alt+ modifier only) ─────────────────────
+		// Single-character hotkeys are strictly banned to prevent key
+		// collisions with normal prompt input (e.g., typing in /plan).
 		if m.showChips && !m.streaming && !m.agentRunning && m.state == StateChat {
 			switch msg.String() {
-			case "a", "A":
-				return m, m.handleChipActivation("a")
-			case "b", "B":
-				return m, m.handleChipActivation("b")
-			case "c", "C":
-				return m, m.handleChipActivation("c")
-			case "d", "D":
-				return m, m.handleChipActivation("d")
+			case "alt+a":
+				return m, m.handleChipActivation("alt+a")
+			case "alt+b":
+				return m, m.handleChipActivation("alt+b")
+			case "alt+c":
+				return m, m.handleChipActivation("alt+c")
+			case "alt+d":
+				return m, m.handleChipActivation("alt+d")
 			case "alt+r":
 				return m, m.handleChipActivation("alt+r")
 			}

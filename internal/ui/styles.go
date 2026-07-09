@@ -194,19 +194,19 @@ var (
 func renderHotkeyPromptWithToggle(width int) string {
 	hk := hotkeyStyle.Render
 	hint := hotkeyHintStyle.Render
-	text := hint("Press ") + hk("A") + hint(" to accept   ") +
-		hk("L") + hint(" to allow all   ") +
-		hk("R") + hint(" to reject   ") +
-		hk("P") + hint(" to toggle   ") +
+	text := hint("Press ") + hk("Alt+A") + hint(" to accept   ") +
+		hk("Alt+L") + hint(" to allow all   ") +
+		hk("Alt+R") + hint(" to reject   ") +
+		hk("Alt+P") + hint(" to toggle   ") +
 		hk("j/k") + hint(" to navigate")
 	if lipgloss.Width(text) > width {
-		text = hint("Press ") + hk("A") + hint(" acc  ") +
-			hk("L") + hint(" all  ") +
-			hk("R") + hint(" rej  ") +
-			hk("P") + hint(" tog  ") +
+		text = hint("Press ") + hk("Alt+A") + hint(" acc  ") +
+			hk("Alt+L") + hint(" all  ") +
+			hk("Alt+R") + hint(" rej  ") +
+			hk("Alt+P") + hint(" tog  ") +
 			hk("j/k") + hint(" nav")
 		if lipgloss.Width(text) > width {
-			text = hint(" ") + hk("A/L/R/P") + hint(" act  ") +
+			text = hint(" ") + hk("Alt+A/L/R/P") + hint(" act  ") +
 				hk("j/k") + hint(" nav")
 		}
 	}

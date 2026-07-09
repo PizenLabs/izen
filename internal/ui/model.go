@@ -194,8 +194,11 @@ type HandoffContext struct {
 
 // actionChip represents a selectable action rendered at the bottom boundary
 // of the TUI. Hotkey activation executes the associated command.
+// IMPORTANT: All chip keys MUST use "alt+<key>" format to prevent key
+// collisions with normal text input in the prompt chat. Single-letter
+// hotkey bindings are strictly banned.
 type actionChip struct {
-	key    string // Hotkey letter (A, B, C, etc.)
+	key    string // Hotkey specifier (e.g. "alt+a", "alt+b") — NO single-letter keys
 	label  string // Display label (e.g. "Investigate Root Cause")
 	action string // Command to execute (e.g. "/mode investigate")
 	query  string // Optional seed content passed with the command

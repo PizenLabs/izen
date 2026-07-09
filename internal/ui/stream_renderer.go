@@ -405,7 +405,7 @@ func (m *model) renderStreamingContent(content string, width int) string {
 				container.WriteString("\n")
 			}
 			container.WriteString("\n")
-			container.WriteString(mutedStyle.Render("[A] Run  [R] Skip"))
+			container.WriteString(mutedStyle.Render("[Alt+A] Run  [Alt+R] Skip"))
 			container.WriteString("\n")
 
 			rendered = renderWidget("Command", container.String(), availableWidth, colorDimmed)
