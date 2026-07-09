@@ -225,8 +225,12 @@ var utilityCommands = map[modes.Mode][]string{
 
 var globalCommands = []string{"/help", "/?", "/mode", "/objective", "/drop", "/quit", "/arch"}
 
-// ── Elegant spinner frames ────────────────────────────────────────────────────
-var flowingSpinnerFrames = []string{" ⊹ ", " ⁕ ", " ⚙ ", " ❃ ", " ❄ ", " ❆ ", " ❃ ", " ⚙ ", " ⁕ ", " ⊹ "}
+// ── IZEN Star-Shape Spinner Frames ─────────────────────────────────────────
+// Custom star/asterisk frames designed to be preserved across all rendering
+// paths. NEVER overridden by ProposalSpinnerFrames (braille) or any default
+// rectangular spinner. The anti-corruption architecture guarantees that only
+// flowingSpinnerFrames is used in all View and refreshViewportContent paths.
+var flowingSpinnerFrames = []string{" ✦ ", " ★ ", " ⚙ ", " ❋ ", " ❄ ", " ❆ ", " ❋ ", " ⚙ ", " ★ ", " ✦ "}
 
 // providerSwitchMsg signals a successful provider switch.
 type providerSwitchMsg struct {
@@ -587,8 +591,8 @@ func (m *model) refreshViewportContent() {
 		}
 		content.WriteString(sp + " " + infoStyle.Render(status) + "\n")
 	} else if m.reviewRunning || m.agentRunning {
-		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
-		content.WriteString(SpinnerStyle.Render(frame) + " " + infoStyle.Render(m.agentLabel) + "\n")
+		sp := m.renderFlowingSpinner()
+		content.WriteString(sp + " " + infoStyle.Render(m.agentLabel) + "\n")
 	}
 
 	m.Viewport.SetContent(content.String())
@@ -732,6 +736,15 @@ func (m *model) renderFlowingSpinner() string {
 	color := interpolateColor(from, to, t)
 
 	return spinnerBaseStyle.Foreground(color).Render(frameStr)
+}
+
+// renderRectSpinner renders a clean braille/rectangular spinner frame.
+// Used exclusively in the status bar to maintain layout symmetry — star
+// glyphs are reserved for the chat prompt label.
+func (m *model) renderRectSpinner() string {
+	n := len(ProposalSpinnerFrames)
+	idx := m.spinnerFrame % n
+	return SpinnerStyle.Render(ProposalSpinnerFrames[idx])
 }
 
 // ── History persistence ───────────────────────────────────────────────────────

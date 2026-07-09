@@ -85,8 +85,7 @@ func (m *model) View() string {
 	inputView.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
 	promptLabel := modeColor.Render("❯ " + mode.String())
 	if m.reviewRunning || m.agentRunning {
-		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
-		promptLabel += " " + SpinnerStyle.Render(frame)
+		promptLabel += " " + m.renderFlowingSpinner()
 	}
 	inputView.WriteString(promptLabel + " ⟩ " + m.ti.View() + "\n")
 	inputView.WriteString(modeColor.Render(strings.Repeat("─", width)))
@@ -430,11 +429,11 @@ func (m *model) renderHelpOverlay() string {
 func (m *model) renderRuntimeStatus(width int) string {
 	var b strings.Builder
 
-	// Animated spinner during active states (streaming, agent, processing)
-	// Read frame directly from model state at draw-time — zero buffering.
+	// Status bar uses a clean braille/rectangular spinner to maintain layout
+	// symmetry. The custom star glyphs are strictly reserved for the chat
+	// prompt label — they never appear in the status bar.
 	if m.streaming || m.agentRunning || m.state == StateProcessing {
-		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
-		b.WriteString(SpinnerStyle.Render(frame))
+		b.WriteString(m.renderRectSpinner())
 	} else {
 		b.WriteString(dimmedStyle.Render("●"))
 	}

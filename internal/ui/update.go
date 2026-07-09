@@ -376,6 +376,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
+		// ── FAIL-SAFE: Investigate mode diagnostic is read-only stream ──
+		// The diagnostic content is piped through the LLM stream for analysis
+		// output. No patches or mutations are ever applied here.
 		m.push(roleSystem, "[System] Running deep root cause analysis on qwen2.5-coder with forensic evidence...")
 		m.streamCh = nil
 		m.streaming = false
@@ -623,6 +626,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.resolver.Current() == modes.ModeInvestigate && final != "" {
 			m.handoffCtx.ProposedFix = final
 			m.updateActionChips()
+		}
+
+		// ── Auto-transition: investigate → build on mutation detection ──
+		// When a read-only analysis ($diagnose, $test) in investigate mode
+		// concludes with a concrete mutation proposal (code blocks with
+		// language annotations), automatically transition to /build and
+		// initiate the fix pipeline. This eliminates the manual handoff step.
+		if m.resolver.Current() == modes.ModeInvestigate && m.handoffCtx.ProposedFix != "" {
+			if containsMutationIntention(m.handoffCtx.ProposedFix) {
+				m.push(roleSystem, infoStyle.Render("[System] Analysis complete — file mutation detected. Auto-transitioning to /build mode for execution..."))
+				m.setMode(modes.ModeBuild)
+				m.lastTestOutput = m.handoffCtx.ProposedFix
+				flush := m.flushPendingRecords()
+				m.refreshViewportContent()
+				return m, tea.Batch(flush, m.runFixCmd(""))
+			}
 		}
 
 		// ── Handoff: Capture PendingTodos from plan mode ────────────────
@@ -1016,6 +1035,25 @@ func (m *model) smoothStreamTickCmd() tea.Cmd {
 	return tea.Tick(20*time.Millisecond, func(t time.Time) tea.Msg {
 		return smoothStreamTickMsg(t)
 	})
+}
+
+// containsMutationIntention detects whether an LLM analysis output from
+// investigate mode proposes concrete file mutations. Uses language-annotated
+// code blocks as the heuristic — when the agent outputs code blocks with known
+// language identifiers (go, diff, python, etc.), it indicates a patch proposal.
+func containsMutationIntention(content string) bool {
+	lower := strings.ToLower(content)
+	mutationLanguages := []string{
+		"```go", "```diff", "```patch", "```python", "```typescript",
+		"```javascript", "```java", "```rust", "```c", "```cpp", "```c++",
+		"```rs", "```ts", "```js", "```py",
+	}
+	for _, lang := range mutationLanguages {
+		if strings.Contains(lower, lang) {
+			return true
+		}
+	}
+	return false
 }
 
 func compileTaskListMarkdown(tasks *[]plan.Task) string {
