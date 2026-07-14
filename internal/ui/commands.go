@@ -21,6 +21,7 @@ import (
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/domain"
 	objengine "github.com/PizenLabs/izen/internal/engine"
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -733,7 +734,12 @@ func (m *model) runRunCmd(target string) tea.Cmd {
 }
 
 func (m *model) runTestEngine(target string) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		defer func() {
+			if r := recover(); r != nil {
+				msg = TaskFinishedMsg{}
+			}
+		}()
 		runner := execExecutionRunner(".")
 		cmd := "go test -v " + target
 		result, err := runner.Run(cmd)
@@ -780,7 +786,12 @@ func (m *model) runTestEngine(target string) tea.Cmd {
 }
 
 func (m *model) runBuildEngine(target string) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		defer func() {
+			if r := recover(); r != nil {
+				msg = TaskFinishedMsg{}
+			}
+		}()
 		runner := execExecutionRunner(".")
 		cmd := "go build " + target
 		result, err := runner.Run(cmd)
@@ -826,6 +837,8 @@ func (r *executionRunner) Run(command string) (*executionRunResult, error) {
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr
+	execution.TrackProcess(c)
+	defer execution.UntrackProcess(c)
 	err := c.Run()
 	result := &executionRunResult{
 		Stdout:   stdout.String(),
@@ -925,7 +938,12 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 	if !showAll && m.sess != nil {
 		ctxID = m.sess.ContextID
 	}
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		defer func() {
+			if r := recover(); r != nil {
+				msg = TaskFinishedMsg{}
+			}
+		}()
 		logPath := filepath.Join(".izen", "audit", "mutations.log")
 		data, err := os.ReadFile(logPath)
 		if err != nil {
@@ -1098,7 +1116,12 @@ func (m *model) runLogCmd(traceData string) tea.Cmd {
 	// Capture raw shell output from the execution runner
 	return tea.Batch(
 		func() tea.Msg { return agentStartMsg{label: "$log trace analysis"} },
-		func() tea.Msg {
+		func() (msg tea.Msg) {
+			defer func() {
+				if r := recover(); r != nil {
+					msg = TaskFinishedMsg{}
+				}
+			}()
 			runner := execExecutionRunner(".")
 			var output string
 			if traceData != "" {
@@ -1519,6 +1542,8 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 		m.lastActionTime = time.Now()
 		rest := strings.TrimSpace(strings.TrimPrefix(action, "trace"))
 		if rest == "" {
+			m.reviewRunning = false
+			m.lastActionTime = time.Time{}
 			m.push(roleError, "usage: $trace <TestFunctionName>")
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
@@ -1554,7 +1579,12 @@ func (m *model) runEnvCmd() tea.Cmd {
 		func() tea.Msg {
 			return agentStartMsg{label: "env diagnostics"}
 		},
-		func() tea.Msg {
+		func() (msg tea.Msg) {
+			defer func() {
+				if r := recover(); r != nil {
+					msg = TaskFinishedMsg{}
+				}
+			}()
 			var b strings.Builder
 			b.WriteString("\n═══════════════════════════════════════════\n")
 			b.WriteString("  [SYSTEM ENVIRONMENT DIAGNOSTICS]\n")
@@ -1606,7 +1636,12 @@ func (m *model) runTraceCmd(target string) tea.Cmd {
 		func() tea.Msg {
 			return agentStartMsg{label: "tracing: " + target}
 		},
-		func() tea.Msg {
+		func() (msg tea.Msg) {
+			defer func() {
+				if r := recover(); r != nil {
+					msg = TaskFinishedMsg{}
+				}
+			}()
 			runner := execExecutionRunner(".")
 			cmd := "go test -run=" + target + " -v -race 2>&1"
 			result, err := runner.Run(cmd)
@@ -1661,7 +1696,12 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 	content := m.buildDiagnoseContent()
 	if content == "" {
 		return tea.Batch(
-			func() tea.Msg {
+			func() (msg tea.Msg) {
+				defer func() {
+					if r := recover(); r != nil {
+						msg = TaskFinishedMsg{}
+					}
+				}()
 				m.push(roleError, "$diagnose: no forensic data available — run $env and $trace first")
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
@@ -1673,7 +1713,12 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 		func() tea.Msg {
 			return agentStartMsg{label: "rca analysis"}
 		},
-		func() tea.Msg {
+		func() (msg tea.Msg) {
+			defer func() {
+				if r := recover(); r != nil {
+					msg = TaskFinishedMsg{}
+				}
+			}()
 			return diagnoseResultMsg{content: content}
 		},
 	)

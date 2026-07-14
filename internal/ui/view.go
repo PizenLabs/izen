@@ -468,7 +468,7 @@ func (m *model) renderRuntimeStatus(width int) string {
 
 	// AI INTERRUPT ENGINE: high-visibility indicator when streaming
 	if m.streaming {
-		b.WriteString(interruptLabelStyle.Render("[Ctrl+D] interrupt "))
+		b.WriteString(interruptLabelStyle.Render("⏹ Ctrl+C to interrupt "))
 	}
 
 	// Agent label — shown immediately after the spinner, before model name

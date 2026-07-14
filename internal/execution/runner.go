@@ -47,6 +47,17 @@ func unregisterProcess(cmd *exec.Cmd) {
 	}
 }
 
+// TrackProcess registers an exec.Cmd in the global orphan-kill list so that
+// KillAllOrphans can terminate it. Callers should defer UntrackProcess.
+func TrackProcess(cmd *exec.Cmd) {
+	registerProcess(cmd, "")
+}
+
+// UntrackProcess removes a previously registered exec.Cmd from the global list.
+func UntrackProcess(cmd *exec.Cmd) {
+	unregisterProcess(cmd)
+}
+
 func KillOrphanedByContext(ctxID string) {
 	procMu.Lock()
 	defer procMu.Unlock()
