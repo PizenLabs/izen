@@ -125,16 +125,20 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 		return mdMutedStyle.Render(strings.Repeat("─", width))
 
 	case strings.HasPrefix(line, "#### "):
-		return mdH4Style.Render(strings.TrimSpace(line[4:]))
+		// H4: dimmed — supporting info, metadata-like
+		return mdH4Style.Render(strings.TrimSpace(line[5:]))
 
 	case strings.HasPrefix(line, "### "):
-		return mdH3Style.Render(strings.TrimSpace(line[4:]))
+		// H3: blue — section subheadings
+		return "\n" + mdH3Style.Render("▸ "+strings.TrimSpace(line[4:]))
 
 	case strings.HasPrefix(line, "## "):
-		return mdH2Style.Render(strings.TrimSpace(line[3:]))
+		// H2: bold text — major section heading
+		return "\n" + mdH2Style.Render(strings.TrimSpace(line[3:]))
 
 	case strings.HasPrefix(line, "# "):
-		return mdH1Style.Render(strings.TrimSpace(line[2:]))
+		// H1: bold accent green — document title level
+		return "\n" + mdH1Style.Render(strings.TrimSpace(line[2:]))
 	}
 
 	if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
@@ -154,7 +158,7 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 	}
 	if strings.HasPrefix(trimmed, "- [x]") {
 		content := strings.TrimSpace(trimmed[5:])
-		return greenStyle.Render("✓ ") + applyInlineStyles(content)
+		return greenStyle.Render("● ") + applyInlineStyles(content)
 	}
 
 	return applyInlineStyles(line)
@@ -171,15 +175,22 @@ func renderCodeBlock(language string, lines []string, width int) string {
 
 	var builder strings.Builder
 
-	codeWidth := width - 4
+	codeWidth := width - 6
 	if codeWidth < 10 {
 		codeWidth = 10
 	}
 
-	if language != "" {
-		builder.WriteString(mdMutedStyle.Render(language))
-		builder.WriteString("\n")
+	// Language header line with monochrome icon
+	langLabel := language
+	if langLabel == "" {
+		langLabel = "code"
 	}
+	headerPad := width - lipgloss.Width("  "+langLabel) - 2
+	if headerPad < 0 {
+		headerPad = 0
+	}
+	builder.WriteString(dimmedStyle.Render("│ ") + dimmedStyle.Render(langLabel))
+	builder.WriteString("\n")
 
 	rawCode := strings.Join(lines, "\n")
 
@@ -192,16 +203,17 @@ func renderCodeBlock(language string, lines []string, width int) string {
 
 	iterator, err := lexer.Tokenise(nil, rawCode)
 	if err != nil {
-		// Fallback: plain rendering with no syntax highlighting
+		// Fallback: plain rendering with left-anchor gutter
 		for i, line := range lines {
 			if i > 0 {
 				builder.WriteString("\n")
 			}
+			builder.WriteString(dimmedStyle.Render("│ "))
 			wrapped := ansi.Hardwrap(line, codeWidth, true)
 			parts := strings.Split(wrapped, "\n")
 			for j, part := range parts {
 				if j > 0 {
-					builder.WriteString("\n")
+					builder.WriteString("\n" + dimmedStyle.Render("│ "))
 				}
 				builder.WriteString(mdCodeContStyle.Render(part))
 			}
@@ -211,9 +223,9 @@ func renderCodeBlock(language string, lines []string, width int) string {
 
 	tokens := iterator.Tokens()
 
-	// Single-pass token-to-line-engine: iterate tokens, split on newlines,
-	// and wrap using RuneWidth for visual width safety.
+	// Single-pass token-to-line-engine with left-anchor gutter on every line
 	currentLineLen := 0
+	firstOnLine := true
 
 	for _, token := range tokens {
 		ansiStart := tokenTypeColor(token.Type)
@@ -225,9 +237,16 @@ func renderCodeBlock(language string, lines []string, width int) string {
 			if fi > 0 {
 				builder.WriteByte('\n')
 				currentLineLen = 0
+				firstOnLine = true
 			}
 			if frag == "" {
 				continue
+			}
+
+			// Emit gutter anchor at the start of each new line
+			if firstOnLine {
+				builder.WriteString(dimmedStyle.Render("│ "))
+				firstOnLine = false
 			}
 
 			var chunk []rune
@@ -240,6 +259,7 @@ func renderCodeBlock(language string, lines []string, width int) string {
 					builder.WriteString(string(chunk))
 					builder.WriteString(ansiReset)
 					builder.WriteByte('\n')
+					builder.WriteString(dimmedStyle.Render("│ "))
 					currentLineLen = 0
 					chunk = nil
 					chunkLen = 0
@@ -257,6 +277,7 @@ func renderCodeBlock(language string, lines []string, width int) string {
 		}
 	}
 
+	_ = headerPad
 	return builder.String()
 }
 
@@ -281,7 +302,7 @@ func (m *model) renderStreamingContent(content string, width int) string {
 		widgetInnerWidth = 18
 	}
 
-	gutter := gutterAIStyle.Render("▌") + " "
+	gutter := gutterAIStyle.Render("│") + " "
 
 	for _, block := range blocks {
 		var rendered string
@@ -304,7 +325,7 @@ func (m *model) renderStreamingContent(content string, width int) string {
 
 				switch {
 				case strings.HasPrefix(item, "- [x]") || strings.HasPrefix(item, "[x]") || strings.HasPrefix(item, "✓"):
-					prefixChar = "✓ "
+					prefixChar = "● "
 					prefixStyle = greenStyle
 					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [x]"), "[x]"), "✓"))
 				case strings.HasPrefix(item, "- [/]") || strings.HasPrefix(item, "[/]") || strings.HasPrefix(item, "●"):
@@ -316,7 +337,7 @@ func (m *model) renderStreamingContent(content string, width int) string {
 					prefixStyle = dimmedStyle
 					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [ ]"), "[ ]"), "○"))
 				case strings.HasPrefix(item, "✗"):
-					prefixChar = "✗ "
+					prefixChar = "• "
 					prefixStyle = redStyle
 					text = strings.TrimSpace(strings.TrimPrefix(item, "✗"))
 				default:
@@ -359,7 +380,7 @@ func (m *model) renderStreamingContent(content string, width int) string {
 
 			var fullContent string
 			if len(details) > 0 {
-				fullContent = strings.Join(details, "\n") + "\n" + subtleStyle.Render(strings.Repeat("─", widgetInnerWidth)) + "\n" + diffRendered
+				fullContent = strings.Join(details, "\n") + "\n\n" + diffRendered
 			} else {
 				fullContent = diffRendered
 			}
@@ -395,23 +416,28 @@ func (m *model) renderStreamingContent(content string, width int) string {
 			}
 
 			var container strings.Builder
-			container.WriteString(shellWarningStyle.Render("> System: Shell Execution Required <"))
-			container.WriteString("\n")
-
 			cmdLines := strings.Split(cmdText, "\n")
 			for _, cl := range cmdLines {
+				cl = strings.TrimRight(cl, " \r")
+				if cl == "" {
+					container.WriteString("\n")
+					continue
+				}
+				// Indented with a semantic shell prompt marker (orange =
+				// execution) so commands stand out from surrounding prose.
 				container.WriteString("  ")
-				container.WriteString(textStyle.Render("$ " + cl))
-				container.WriteString("\n")
+				container.WriteString(orangeStyle.Render("$"))
+				container.WriteString(" " + textStyle.Render(cl) + "\n")
 			}
 			container.WriteString("\n")
-			container.WriteString(mutedStyle.Render("[Alt+A] Run  [Alt+R] Skip"))
-			container.WriteString("\n")
+			container.WriteString("  " + boldTextStyle.Render(Icon.Action+" Run") + " " + dimmedStyle.Render("[Alt+A]") +
+				"   " + boldTextStyle.Render(Icon.Action+" Skip") + " " + dimmedStyle.Render("[Alt+R]") + "\n")
 
-			rendered = renderWidget("Command", container.String(), availableWidth, colorDimmed)
+			rendered = renderWidget("Command", container.String(), availableWidth, colorModePlan)
 
 		default:
-			// UNIFIED PATH: deterministic pipeline — identical for streaming and history
+			// UNIFIED PATH: deterministic pipeline — identical for streaming and history.
+			// Replaces the goldmark-based MarkdownRenderer to eliminate layout flicker.
 			blockRendered := RenderDeterministicPipeline(block.raw, availableWidth, true)
 			if blockRendered != "" {
 				mdLines := strings.Split(strings.TrimRight(blockRendered, "\n"), "\n")
@@ -428,5 +454,5 @@ func (m *model) renderStreamingContent(content string, width int) string {
 		}
 	}
 
-	return strings.Join(renderedBlocks, "\n\n")
+	return strings.Join(renderedBlocks, vspace(Spacing.Section))
 }

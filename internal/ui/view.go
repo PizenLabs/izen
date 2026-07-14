@@ -84,11 +84,13 @@ func (m *model) View() string {
 		width = 40
 	}
 
-	// ── Build input view (autocomplete + separator + input prompt + separator) ──
-	// STRICT RULE: The prompt label must remain static / structural.
-	// It MUST NOT swallow m.renderFlowingSpinner() or any dynamic spinner.
-	// Spinners for background tasks ($fix, $run, $log, $test, /commit) are
-	// rendered exclusively in the status bar — never in the chat input zone.
+	// ── Build input view ───────────────────────────────────────────────
+	// Reading flow (top → bottom):
+	//   upper separator  ── region boundary above the prompt
+	//   action chips     ── interaction affordances (optional)
+	//   prompt line      ── the natural start of the next interaction
+	//   lower separator  ── region boundary below the prompt
+	//   metadata line    ── runtime telemetry (lowest visual priority)
 	mode := m.resolver.Current()
 	modeColor := m.modeStyle(mode)
 
@@ -96,19 +98,24 @@ func (m *model) View() string {
 	if m.autocompleteActive && len(m.autocompleteItems) > 0 {
 		inputView.WriteString(m.renderAutocompleteDropdown(width))
 	}
-	inputView.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
-	promptLabel := modeColor.Render("❯ " + mode.String())
-	inputView.WriteString(promptLabel + " ⟩ " + m.ti.View() + "\n")
-	inputView.WriteString(modeColor.Render(strings.Repeat("─", width)))
 
-	// ── Action Chips (dynamic bottom-boundary elicitations) ─────────────
-	var chipsView string
-	if m.showChips && len(m.activeChips) > 0 {
-		chipsView = m.renderActionChips(width)
+	// Upper separator: major region boundary above the prompt.
+	inputView.WriteString(rule(width, modeColor) + "\n")
+
+	// Action chips sit just above the prompt as interaction affordances.
+	if chipsView := m.renderActionChips(width); lipgloss.Height(chipsView) > 0 {
+		inputView.WriteString(chipsView)
 	}
-	chipsHeight := lipgloss.Height(chipsView)
 
-	// ── Build status bar (always visible, rigidly pinned to terminal bottom edge) ──
+	// The prompt itself — sits naturally between the two separators and
+	// immediately follows the rendered document above it.
+	promptLabel := modeColor.Render(Icon.Command + " " + mode.String())
+	inputView.WriteString(promptLabel + " " + m.ti.View() + "\n")
+
+	// Lower separator: closes the prompt region; metadata follows below it.
+	inputView.WriteString(rule(width, modeColor) + "\n")
+
+	// ── Build status bar (runtime metadata, lowest visual priority) ──
 	statusBarView := m.renderRuntimeStatus(width)
 
 	// ── Build proposal dock (conditional) ──
@@ -122,24 +129,18 @@ func (m *model) View() string {
 	statusHeight := lipgloss.Height(statusBarView)
 	proposalHeight := lipgloss.Height(proposalDockView)
 
-	m.Viewport.Height = m.height - inputHeight - statusHeight - proposalHeight - chipsHeight
+	m.Viewport.Height = m.height - inputHeight - statusHeight - proposalHeight
 	if m.Viewport.Height < 1 {
 		m.Viewport.Height = 1
 	}
 
-	// ── Assemble final layout with JoinVertical — zero gaps between all elements ──
-	// lipgloss.JoinVertical inserts exactly one \n between each element, which
-	// acts as a line terminator (not a blank gap). Each element's internal line
-	// terminators are preserved — no extraneous newlines are added.
+	// ── Assemble final layout with JoinVertical ──
 	var parts []string
 	parts = append(parts, m.Viewport.View())
 	if proposalHeight > 0 {
 		parts = append(parts, proposalDockView)
 	}
 	parts = append(parts, inputView.String())
-	if chipsHeight > 0 {
-		parts = append(parts, chipsView)
-	}
 	parts = append(parts, statusBarView)
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
@@ -154,29 +155,14 @@ func (m *model) renderProposalBlock() string {
 
 	var b strings.Builder
 
-	// ── Dock frame top: labeled divider ───────────────────────────────────
-	label := " PROPOSAL DOCK "
-	fillLen := width - len(label)
-	if fillLen < 2 {
-		fillLen = 2
-	}
-	half := fillLen / 2
-	b.WriteString(accentStyle.Render(
-		strings.Repeat("╌", half) + label + strings.Repeat("╌", fillLen-half),
-	))
-	b.WriteString("\n")
-
 	switch m.state {
 	case StateAwaitingApproval:
 		if len(m.pendingProposals) == 0 {
 			return ""
 		}
 		p := m.pendingProposals[0]
-		// If the proposal's diff is empty, show a placeholder instead
-		// of rendering an empty card that would cause layout glitches.
 		if p.Diff == "" {
-			b.WriteString("  " + infoStyle.Render("Waiting for proposal payload..."))
-			b.WriteString("\n")
+			b.WriteString("  " + infoStyle.Render("Waiting for proposal payload...\n"))
 			break
 		}
 		vm := ToMutationCardViewModelFromProposal(p)
@@ -192,9 +178,6 @@ func (m *model) renderProposalBlock() string {
 		}
 		b.WriteString("\n")
 	}
-
-	// ── Dock frame bottom ─────────────────────────────────────────────────
-	b.WriteString(accentStyle.Render(strings.Repeat("╌", width)))
 
 	return b.String()
 }
@@ -404,7 +387,7 @@ func (m *model) renderAutocompleteDropdown(width int) string {
 func (m *model) renderHelpOverlay() string {
 	lines := []string{
 		"",
-		boldAccentStyle.Render("  ⚡ IZEN  "),
+		boldAccentStyle.Render("  " + Icon.Spark + " IZEN  "),
 		textStyle.Render("  engineering intelligence · human in control"),
 		"",
 		subtleStyle.Render("  ─── Modes ───"),
@@ -453,12 +436,18 @@ func (m *model) renderHelpOverlay() string {
 // The two spinners occupy separate rendering layers and are triggered by
 // orthogonal state flags: m.streaming (view) vs. m.agentRunning/reviewRunning
 // (status bar). They cannot be collapsed or swapped.
+// renderRuntimeStatus renders the runtime metadata line — the lowest visual
+// priority element on screen. Format:
+//
+//	[spinner] model · context · tokens · cost · checkpoint
+//
+// Every segment uses a muted/dimmed style so the line never competes with the
+// primary document content. Segments drop in priority order as the pane narrows.
 func (m *model) renderRuntimeStatus(width int) string {
 	var b strings.Builder
 
 	// ── Loading Spinner (rect/braille): background execution indicator ──
 	// Active during streaming, background tasks, or mutation processing.
-	// Always positioned before the model name in the status line.
 	if m.streaming || m.agentRunning || m.reviewRunning || m.state == StateProcessing {
 		b.WriteString(m.renderRectSpinner())
 	} else {
@@ -477,32 +466,48 @@ func (m *model) renderRuntimeStatus(width int) string {
 		b.WriteByte(' ')
 	}
 
+	// Metadata segments: model · context · tokens · cost · checkpoint
+	var meta []string
+
 	// Model name — dropped first when the pane is too narrow to fit it.
 	if width >= minimalStatusThreshold {
-		b.WriteString(dimmedStyle.Render(m.cfg.ActiveModelName()))
-		b.WriteString(dimmedStyle.Render(" · "))
+		meta = append(meta, dimmedStyle.Render(m.cfg.ActiveModelName()))
+	}
+
+	// Active context ID — conveys workspace continuity without shouting.
+	if m.sess != nil && m.sess.ContextID != "" {
+		ctx := m.sess.ContextID
+		if len(ctx) > 9 {
+			ctx = ctx[:9]
+		}
+		meta = append(meta, mutedStyle.Render(Icon.Context+" "+ctx))
 	}
 
 	// Tokens — always shown; this is the minimum viable status line.
 	if m.TotalTokens > 0 {
-		b.WriteString(textStyle.Render(strconv.Itoa(m.TotalTokens)))
-		b.WriteString(dimmedStyle.Render(" tok"))
+		meta = append(meta, dimmedStyle.Render(strconv.Itoa(m.TotalTokens)+" tok"))
 	} else {
-		b.WriteString(dimmedStyle.Render("0 tok"))
+		meta = append(meta, dimmedStyle.Render("0 tok"))
 	}
 
-	// Checkpoint (truncated) — dropped next-to-last as panes narrow, since
-	// it's the least essential glance-able piece of runtime telemetry.
+	// Accumulated cost — dropped before checkpoint as panes narrow.
+	if m.AccumulatedCost > 0 {
+		meta = append(meta, dimmedStyle.Render(fmt.Sprintf("$%.3f", m.AccumulatedCost)))
+	}
+
+	// Checkpoint (truncated) — the least essential glance-able telemetry.
 	if width >= compactStatusThreshold {
 		if cp := m.latestCheckpointID(); cp != "" {
 			cp = strings.TrimPrefix(cp, "cp-")
 			if len(cp) > 7 {
 				cp = cp[:7]
 			}
-			b.WriteString(dimmedStyle.Render(" · "))
-			b.WriteString(dimmedStyle.Render("cp-" + cp))
+			meta = append(meta, dimmedStyle.Render("cp-"+cp))
 		}
 	}
+
+	sep := dimmedStyle.Render(" · ")
+	b.WriteString(strings.Join(meta, sep))
 
 	return b.String()
 }
@@ -711,6 +716,34 @@ func (m *model) renderStartupBannerCompact(termWidth int) string {
 	return titleBar + "\n" + box
 }
 
+// projectPathDisplay returns the current working directory formatted for
+// the startup banner, abbreviating the user's home directory to "~" (e.g.
+// "~/notes") the same way the shell/prompt convention does. Falls back to
+// "." if the working directory can't be resolved.
+func projectPathDisplay() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if wd == home {
+			return "~"
+		}
+		if rel, err := filepath.Rel(home, wd); err == nil && !strings.HasPrefix(rel, "..") {
+			return "~" + string(filepath.Separator) + rel
+		}
+	}
+	return wd
+}
+
+func padRight(s string, n int) string {
+	sw := len(s)
+	if sw >= n {
+		return s
+	}
+	return s + strings.Repeat(" ", n-sw)
+}
+
 // renderTitledTopBorder builds a top-border line with a left-aligned label
 // embedded in it, safely adapting to extremely narrow screen splits without breaking.
 func renderTitledTopBorder(totalWidth int, label string) string {
@@ -754,34 +787,6 @@ func renderTitledTopBorder(totalWidth int, label string) string {
 	return borderColor.Render(left+strings.Repeat(fill, leftFillN)) +
 		padded +
 		borderColor.Render(strings.Repeat(fill, rightFillN)+right)
-}
-
-// projectPathDisplay returns the current working directory formatted for
-// the startup banner, abbreviating the user's home directory to "~" (e.g.
-// "~/notes") the same way the shell/prompt convention does. Falls back to
-// "." if the working directory can't be resolved.
-func projectPathDisplay() string {
-	wd, err := os.Getwd()
-	if err != nil {
-		return "."
-	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		if wd == home {
-			return "~"
-		}
-		if rel, err := filepath.Rel(home, wd); err == nil && !strings.HasPrefix(rel, "..") {
-			return "~" + string(filepath.Separator) + rel
-		}
-	}
-	return wd
-}
-
-func padRight(s string, n int) string {
-	sw := len(s)
-	if sw >= n {
-		return s
-	}
-	return s + strings.Repeat(" ", n-sw)
 }
 
 // ── Record renderer (for viewport content) ────────────────────
@@ -870,231 +875,66 @@ func (m *model) printRecord(rec record) string {
 
 // ── Widget Box & Semantic Renderers ───────────────────────────────────
 
-func renderWidget(title string, content string, width int, accentHex string) string {
-	if width < 10 {
-		width = 10
+// widgetIcon returns a monochrome glyph for semantic widget headings.
+// Icons are chosen to improve scanability — one glyph per domain concept.
+func widgetIcon(title string) string {
+	switch strings.ToLower(title) {
+	case "plan":
+		return Icon.Plan + " "
+	case "edit", "diff":
+		return Icon.Edit + " "
+	case "command":
+		return Icon.Command + " "
+	case "evidence":
+		return Icon.Evidence + " "
+	case "risk analysis", "risk":
+		return Icon.Risk + " "
+	case "table":
+		return Icon.Table + " "
+	case "summary":
+		return Icon.Summary + " "
+	default:
+		return Icon.Summary + " "
 	}
-	innerWidth := width // We are using the full width (no vertical borders)
+}
 
+func renderWidget(title string, content string, width int, accentHex string) string {
 	var b strings.Builder
 
-	borderLine := strings.Repeat("─", innerWidth)
-
-	// Top horizontal line
-	b.WriteString(borderLine)
-	b.WriteByte('\n')
-
-	// Title line
-	titleLine := title
-	titleLen := lipgloss.Width(titleLine)
-	if titleLen < innerWidth {
-		titleLine += strings.Repeat(" ", innerWidth-titleLen)
-	} else {
-		titleLine = titleLine[:innerWidth]
+	// Title as LEVEL 2 heading with semantic icon
+	icon := widgetIcon(title)
+	var titleColor lipgloss.Style
+	switch accentHex {
+	case colorModeAsk:
+		titleColor = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeAsk))
+	case colorModePlan:
+		titleColor = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModePlan))
+	case colorModeBuild:
+		titleColor = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeBuild))
+	case colorModeInvestigate:
+		titleColor = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeInvestigate))
+	case colorModeReview:
+		titleColor = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorModeReview))
+	default:
+		titleColor = boldTextStyle
 	}
-	b.WriteString(widgetTitleStyle.Render(titleLine))
+	b.WriteString(titleColor.Render(icon + title))
 	b.WriteByte('\n')
 
-	// Separator horizontal line
-	b.WriteString(borderLine)
-	b.WriteByte('\n')
-
-	// Content lines
-	lines := strings.Split(content, "\n")
+	// Content lines with left-side anchors
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
 	for _, line := range lines {
-		if len(line) > 0 {
-			visualLen := lipgloss.Width(line)
-			if visualLen < innerWidth {
-				line += strings.Repeat(" ", innerWidth-visualLen)
-			}
-			b.WriteString(line)
-			b.WriteByte('\n')
-		} else {
-			b.WriteByte('\n')
-		}
+		lineTrimmed := strings.TrimRight(line, " \r")
+		b.WriteString(subtleStyle.Render("│ "))
+		b.WriteString(lineTrimmed)
+		b.WriteByte('\n')
 	}
-
-	// Bottom horizontal line
-	b.WriteString(borderLine)
-	b.WriteByte('\n')
 
 	return b.String()
 }
 
 func (m *model) renderAIResponseBlocks(content string, width int) string {
-	blocks := parseAIContent(content)
-	var renderedBlocks []string
-
-	availableWidth := width - 2
-	if availableWidth < 20 {
-		availableWidth = 20
-	}
-	widgetInnerWidth := availableWidth - 2
-	if widgetInnerWidth < 18 {
-		widgetInnerWidth = 18
-	}
-
-	gutter := gutterAIStyle.Render("▌") + " "
-
-	for _, block := range blocks {
-		var rendered string
-		switch block.kind {
-		case blockPlan:
-			planLines := strings.Split(block.raw, "\n")
-			var contentLines []string
-			for _, pl := range planLines {
-				plTrim := strings.TrimSpace(pl)
-				if plTrim == "" {
-					continue
-				}
-				if strings.HasPrefix(strings.ToLower(plTrim), "plan") || strings.HasPrefix(plTrim, "#") {
-					continue
-				}
-				item := plTrim
-				var prefixChar string
-				var prefixStyle lipgloss.Style
-				var text string
-
-				switch {
-				case strings.HasPrefix(item, "- [x]") || strings.HasPrefix(item, "[x]") || strings.HasPrefix(item, "✓"):
-					prefixChar = "✓ "
-					prefixStyle = greenStyle
-					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [x]"), "[x]"), "✓"))
-				case strings.HasPrefix(item, "- [/]") || strings.HasPrefix(item, "[/]") || strings.HasPrefix(item, "●"):
-					prefixChar = "● "
-					prefixStyle = orangeStyle
-					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [/]"), "[/]"), "●"))
-				case strings.HasPrefix(item, "- [ ]") || strings.HasPrefix(item, "[ ]") || strings.HasPrefix(item, "○"):
-					prefixChar = "○ "
-					prefixStyle = dimmedStyle
-					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [ ]"), "[ ]"), "○"))
-				case strings.HasPrefix(item, "✗"):
-					prefixChar = "✗ "
-					prefixStyle = redStyle
-					text = strings.TrimSpace(strings.TrimPrefix(item, "✗"))
-				default:
-					prefixChar = "• "
-					prefixStyle = textStyle
-					text = item
-				}
-
-				// Wrap plan item text to inner width leaving room for list bullet
-				wrapW := widgetInnerWidth - 2
-				if wrapW < 10 {
-					wrapW = 10
-				}
-				wrappedText := wrapStreamText(text, wrapW)
-
-				for idx, line := range wrappedText {
-					if idx == 0 {
-						contentLines = append(contentLines, prefixStyle.Render(prefixChar)+line)
-					} else {
-						contentLines = append(contentLines, "  "+line)
-					}
-				}
-			}
-			rendered = renderWidget("Plan", strings.Join(contentLines, "\n"), availableWidth, colorModePlan)
-
-		case blockDiff:
-			file, symbol, linesRange, cleanDiff := parseDiffMetadata(block.raw)
-			dr := &DiffRenderer{Width: availableWidth}
-			diffRendered := dr.Render(ToDiffCardViewModel(cleanDiff))
-
-			var details []string
-			if file != "" {
-				details = append(details, accentStyle.Render("File:   "+file))
-			}
-			if symbol != "" {
-				details = append(details, blueStyle.Render("Symbol: "+symbol))
-			}
-			if linesRange != "" {
-				details = append(details, mutedStyle.Render("Range:  "+linesRange))
-			}
-
-			var fullContent string
-			if len(details) > 0 {
-				fullContent = strings.Join(details, "\n") + "\n" + subtleStyle.Render(strings.Repeat("─", widgetInnerWidth)) + "\n" + diffRendered
-			} else {
-				fullContent = diffRendered
-			}
-			rendered = renderWidget("Edit", fullContent, availableWidth, colorModeBuild)
-
-		case blockTable:
-			tableContent := renderTable(block.raw, widgetInnerWidth)
-			rendered = renderWidget("Table", tableContent, availableWidth, colorAccent)
-
-		case blockEvidence:
-			lines := strings.Split(block.raw, "\n")
-			var wrappedLines []string
-			for _, line := range lines {
-				wrappedLines = append(wrappedLines, wrapStreamText(line, widgetInnerWidth)...)
-			}
-			rendered = renderWidget("Evidence", strings.Join(wrappedLines, "\n"), availableWidth, colorModeInvestigate)
-
-		case blockRisk:
-			lines := strings.Split(block.raw, "\n")
-			var wrappedLines []string
-			for _, line := range lines {
-				wrappedLines = append(wrappedLines, wrapStreamText(line, widgetInnerWidth)...)
-			}
-			rendered = renderWidget("Risk Analysis", strings.Join(wrappedLines, "\n"), availableWidth, colorModeReview)
-
-		case blockCommand:
-			cmdText := strings.TrimSpace(block.raw)
-			if strings.HasPrefix(cmdText, "```") {
-				cmdLines := strings.Split(cmdText, "\n")
-				if len(cmdLines) > 2 {
-					cmdText = strings.Join(cmdLines[1:len(cmdLines)-1], "\n")
-				}
-			}
-
-			// Shell Execution Proposal container
-			var container strings.Builder
-
-			mode := m.resolver.Current()
-			if mode.CanShell() {
-				container.WriteString(shellWarningStyle.Render("> System: Shell Execution Required <"))
-			} else {
-				container.WriteString(shellWarningStyle.Render("> System: Shell Execution Blocked by Mode <"))
-			}
-			container.WriteString("\n")
-
-			cmdLines := strings.Split(cmdText, "\n")
-			for _, cl := range cmdLines {
-				container.WriteString("  ")
-				container.WriteString(textStyle.Render("$ " + cl))
-				container.WriteString("\n")
-			}
-			container.WriteString("\n")
-			if mode.CanShell() {
-				container.WriteString(mutedStyle.Render("[Alt+A] Run  [Alt+R] Skip"))
-			} else {
-				container.WriteString(dimmedStyle.Render("[System] Tool 'shell' rejected. Read-Only environment. No action available."))
-			}
-			container.WriteString("\n")
-
-			rendered = renderWidget("Command", container.String(), availableWidth, colorDimmed)
-
-		default:
-			// UNIFIED PATH: deterministic pipeline — identical for streaming and history.
-			// Replaces the goldmark-based MarkdownRenderer to eliminate layout flicker.
-			blockRendered := RenderDeterministicPipeline(block.raw, availableWidth, false)
-			if blockRendered != "" {
-				mdLines := strings.Split(strings.TrimRight(blockRendered, "\n"), "\n")
-				var styledLines []string
-				for _, line := range mdLines {
-					styledLines = append(styledLines, gutter+line)
-				}
-				rendered = strings.Join(styledLines, "\n")
-			}
-		}
-
-		if rendered != "" {
-			renderedBlocks = append(renderedBlocks, rendered)
-		}
-	}
-
-	return strings.Join(renderedBlocks, "\n\n")
+	return m.renderStreamingContent(content, width)
 }
 
 func parseAIContent(content string) []contentBlock {

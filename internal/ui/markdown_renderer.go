@@ -278,13 +278,14 @@ type calloutMeta struct {
 	color string
 }
 
-// calloutKeywords maps recognized callout keywords to their semantic display metadata
+// calloutKeywords maps recognized callout keywords to their semantic display metadata.
+// Icons are quiet monochrome glyphs (no emoji) from the shared Icon tokens.
 var calloutKeywords = map[string]calloutMeta{
-	"IMPORTANT": {"❗", "#f38ba8"},
-	"NOTE":      {"ℹ", "#89b4fa"},
-	"TIP":       {"💡", "#a6e3a1"},
-	"WARNING":   {"⚠", "#f9e2af"},
-	"CAUTION":   {"🔥", "#fab387"},
+	"IMPORTANT": {Icon.Risk, "#f38ba8"},
+	"NOTE":      {Icon.Info, "#89b4fa"},
+	"TIP":       {Icon.Spark, "#a6e3a1"},
+	"WARNING":   {Icon.Warning, "#f9e2af"},
+	"CAUTION":   {"■", "#fab387"},
 }
 
 // renderBlockquote renders a blockquote with callout detection.

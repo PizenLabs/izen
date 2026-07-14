@@ -61,7 +61,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 
 	// Rigid active guards to block spamming inputs during background processes
 	if m.streaming || m.agentRunning {
-		m.push(roleSystem, "[System] Input blocked: task execution active.")
+		m.push(roleSystem, "Input blocked: task active.")
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return nil
@@ -399,7 +399,6 @@ func (m *model) setMode(mode modes.Mode) {
 	if mode == m.resolver.Current() {
 		return
 	}
-	oldMode := m.resolver.Current()
 	m.startModeTransition(mode)
 	m.sess.SetMode(mode)
 	_ = m.sess.Save()
@@ -407,7 +406,7 @@ func (m *model) setMode(mode modes.Mode) {
 	modeLabel := lipgloss.NewStyle().Foreground(modeColor).Render(
 		fmt.Sprintf("→ /%s — %s", mode, mode.Description()))
 	m.push(roleSystem, modeLabel)
-	m.push(roleSystem, fmt.Sprintf("[System] Runtime boundary adjusted: /%s ──> /%s.", oldMode, mode))
+	m.push(roleSystem, fmt.Sprintf("Switched to /%s", mode))
 
 	// Handoff context injection primes the target mode with state from the
 	// previous mode's terminal event.
@@ -564,7 +563,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 	case cmd == "/arch":
 		m.showBanner = false
-		m.push(roleSystem, "[System] Reading Graph AST and mapping local repository...")
+		m.push(roleSystem, "Mapping codebase...")
 		m.refreshViewportContent()
 		return func() tea.Msg {
 			graphText := m.renderArch()
@@ -894,7 +893,7 @@ func (m *model) runFixCmd(target string) tea.Cmd {
 	// ── FAIL-SAFE: Belt-and-suspenders write-capability guard ────────────
 	if !m.resolver.Current().CanWrite() && !m.resolver.Current().CanPatch() {
 		m.cancelStaleAgentOps()
-		m.push(roleSystem, mutedStyle.Render("[System] Action rejected: Write access required. Please switch to '/build' mode to execute patches."))
+		m.push(roleSystem, mutedStyle.Render("Write access required. Switch to /build."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return nil
@@ -977,7 +976,7 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 		logPath := filepath.Join(".izen", "audit", "mutations.log")
 		data, err := os.ReadFile(logPath)
 		if err != nil {
-			m.push(roleStatus, "[System] No mutation log found.")
+			m.push(roleStatus, "No mutations found.")
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return agentDoneMsg{}
@@ -1096,9 +1095,9 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 		}
 
 		if len(formatted) == 0 {
-			msg := "[System] $log: No entries"
+			msg := "No log entries."
 			if ctxID != "" {
-				msg += " for context " + ctxID
+				msg += " Context: " + ctxID
 			}
 			m.push(roleStatus, msg)
 			m.refreshViewportContent()
@@ -1170,7 +1169,7 @@ func (m *model) runLogCmd(traceData string) tea.Cmd {
 				}
 			}
 
-			m.push(roleSystem, "[System] $log: Executing under-the-hood trace capture...")
+			m.push(roleSystem, "Tracing execution...")
 
 			// Extract stack frames for ledger registration
 			frames := investigate.ParseStackFrames(output)
@@ -1244,7 +1243,7 @@ func (m *model) handleLogInput(msg logInputMsg) tea.Cmd {
 		return m.flushPendingRecords()
 	}
 
-	m.push(roleSystem, "[System] $log: Pipeline Step 1/3 — Silent failure analysis...")
+	m.push(roleSystem, "Step 1/3: Analyzing failure...")
 	m.streamCh = nil
 	m.streaming = false
 	m.streamParser = nil
@@ -1266,7 +1265,7 @@ func (m *model) handleInvestigateComplete(msg investigateCompleteMsg) tea.Cmd {
 		return m.flushPendingRecords()
 	}
 
-	m.push(roleSystem, infoStyle.Render("[System] Pipeline Step 2/3 — Formulating fix blueprint..."))
+	m.push(roleSystem, infoStyle.Render("Step 2/3: Generating blueprint..."))
 	m.streamCh = nil
 	m.streaming = false
 	m.streamParser = nil
@@ -1290,7 +1289,7 @@ func (m *model) handleBlueprintReady(msg blueprintReadyMsg) tea.Cmd {
 		return m.flushPendingRecords()
 	}
 
-	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("[System] Pipeline Step 3/3 — Blueprint ready [%s]. Jumping to /build for execution...", msg.ledgerID)))
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Blueprint ready [%s]. Switched to /build.", msg.ledgerID)))
 
 	// ── Explicit UI mode transition to /build ──────────────────────────
 	// The exact millisecond the patch blueprint is finalized, we transition.
@@ -1424,7 +1423,7 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 	// $fix requires write access which /review mode explicitly denies.
 	if mode == modes.ModeReview && (action == "fix" || strings.HasPrefix(action, "fix ")) {
 		m.cancelStaleAgentOps()
-		m.push(roleSystem, mutedStyle.Render("[System] Action rejected: Write access required. Please switch to '/build' mode to execute patches."))
+		m.push(roleSystem, mutedStyle.Render("Write access required. Switch to /build."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return nil
@@ -2008,7 +2007,7 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 	switch mode {
 	case modes.ModeInvestigate:
 		if m.handoffCtx.LastFailurePayload != "" {
-			m.push(roleSystem, "[System] Handoff context successfully injected into target mode.")
+			m.push(roleSystem, "Handoff context injected.")
 		}
 
 	case modes.ModePlan:
@@ -2017,14 +2016,14 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 				m.handoffCtx.PendingTodos = parseProposedFixIntoTodos(m.handoffCtx.ProposedFix)
 			}
 			m.push(roleSystem, fmt.Sprintf(
-				"[System] Handoff context successfully injected into target mode: %d pending TODO(s) from investigation.",
+				"Handoff context injected: %d pending TODO(s).",
 				len(m.handoffCtx.PendingTodos)))
 		}
 
 	case modes.ModeBuild:
 		if len(m.handoffCtx.PendingTodos) > 0 || m.handoffCtx.ProposedFix != "" {
 			m.createBuildCheckpoint(0)
-			m.push(roleSystem, "[System] Handoff context successfully injected into target mode. Pre-build checkpoint created.")
+			m.push(roleSystem, "Handoff context injected. Checkpoint created.")
 		}
 	}
 }
@@ -2037,7 +2036,7 @@ func (m *model) handleChipActivation(key string) tea.Cmd {
 			continue
 		}
 		m.push(roleUser, chip.action)
-		m.push(roleSystem, fmt.Sprintf("[System] Action Chip activated: %s.", chip.label))
+		m.push(roleSystem, fmt.Sprintf("Activated: %s", chip.label))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 

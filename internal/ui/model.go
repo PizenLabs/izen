@@ -411,11 +411,6 @@ var utilityCommands = map[modes.Mode][]string{
 
 var globalCommands = []string{"/help", "/?", "/mode", "/objective", "/drop", "/quit", "/arch"}
 
-// ── IZEN Star-Shape Spinner Frames ─────────────────────────────────────────
-// Custom star/asterisk frames designed to be preserved across all rendering
-// paths. NEVER overridden by ProposalSpinnerFrames (braille) or any default
-// rectangular spinner. The anti-corruption architecture guarantees that only
-// flowingSpinnerFrames is used in all View and refreshViewportContent paths.
 var flowingSpinnerFrames = []string{" ✦ ", " ★ ", " ⚙ ", " ❋ ", " ❄ ", " ❆ ", " ❋ ", " ⚙ ", " ★ ", " ✦ "}
 
 // providerSwitchMsg signals a successful provider switch.
@@ -788,6 +783,10 @@ func (m *model) refreshViewportContent() {
 		content.WriteString(ctxHeader)
 	}
 
+	if !m.showBanner || len(m.records) > 0 {
+		content.WriteString(m.renderWorkspaceHeader())
+	}
+
 	if m.PreRenderedHistory != "" {
 		content.WriteString(m.PreRenderedHistory)
 	}
@@ -800,10 +799,6 @@ func (m *model) refreshViewportContent() {
 				content.WriteString("\n")
 			}
 		}
-		// ── Streaming Spinner (star/flowing glyph) ─────────────────────
-		// Rendered ONLY inside the viewport during active token streaming,
-		// appended beneath the streamed content block. The loading spinner
-		// (rect/braille dots) lives exclusively in the status bar.
 		sp := m.renderFlowingSpinner()
 		status := "streaming…"
 		if m.agentRunning {
@@ -850,14 +845,14 @@ func countRenderedDiffLines(diff string) int {
 func (m *model) getProposalDockCurrentHeight() int {
 	switch m.state {
 	case StateProcessing:
-		return 3
+		return 1
 	case StateAwaitingApproval:
 		if len(m.pendingProposals) == 0 {
 			return 0
 		}
 		p := m.pendingProposals[0]
 		if !p.Expanded || p.Diff == "" {
-			return 9 // 1 (top divider) + 7 (collapsed MutationRenderer) + 1 (bottom divider)
+			return 6
 		}
 		n := countRenderedDiffLines(p.Diff)
 		capped := n
@@ -868,15 +863,7 @@ func (m *model) getProposalDockCurrentHeight() int {
 		if n > maxProposalDiffHeight || m.proposalDiffOffset > 0 {
 			scrollHint = 1
 		}
-		// Expanded MutationRenderer: border + header + metadata + blank = 4
-		//                          + capped diff lines
-		//                          + blank after diff = 1
-		//                          + scroll hint (if needed) = 0/1
-		//                          + action line = 1
-		//                          + blank = 1
-		//                          + border = 1
-		cardLines := 4 + capped + 1 + scrollHint + 1 + 1 + 1
-		return 1 + cardLines + 1
+		return 7 + capped + scrollHint
 	}
 	return 0
 }
@@ -962,6 +949,37 @@ func (m *model) renderRectSpinner() string {
 	n := len(ProposalSpinnerFrames)
 	idx := m.spinnerFrame % n
 	return SpinnerStyle.Render(ProposalSpinnerFrames[idx])
+}
+
+func (m *model) renderWorkspaceHeader() string {
+	mode := m.resolver.Current()
+	modeName := strings.ToUpper(mode.String())
+
+	// Semantic color per mode (Level 1 in visual hierarchy)
+	var modeAccentStr string
+	switch mode {
+	case modes.ModeAsk:
+		modeAccentStr = colorModeAsk
+	case modes.ModePlan:
+		modeAccentStr = colorModePlan
+	case modes.ModeBuild:
+		modeAccentStr = colorModeBuild
+	case modes.ModeInvestigate:
+		modeAccentStr = colorModeInvestigate
+	case modes.ModeReview:
+		modeAccentStr = colorModeReview
+	default:
+		modeAccentStr = colorMuted
+	}
+	modeNameStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(modeAccentStr))
+
+	var b strings.Builder
+	b.WriteString("\n")
+	b.WriteString("  ")
+	b.WriteString(modeNameStyle.Render("● " + modeName))
+	b.WriteString("  " + dimmedStyle.Render(mode.Description()))
+	b.WriteString("\n\n")
+	return b.String()
 }
 
 // ── History persistence ───────────────────────────────────────────────────────
