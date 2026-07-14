@@ -85,6 +85,10 @@ func (m *model) View() string {
 	}
 
 	// ── Build input view (autocomplete + separator + input prompt + separator) ──
+	// STRICT RULE: The prompt label must remain static / structural.
+	// It MUST NOT swallow m.renderFlowingSpinner() or any dynamic spinner.
+	// Spinners for background tasks ($fix, $run, $log, $test, /commit) are
+	// rendered exclusively in the status bar — never in the chat input zone.
 	mode := m.resolver.Current()
 	modeColor := m.modeStyle(mode)
 
@@ -94,9 +98,6 @@ func (m *model) View() string {
 	}
 	inputView.WriteString(modeColor.Render(strings.Repeat("─", width)) + "\n")
 	promptLabel := modeColor.Render("❯ " + mode.String())
-	if m.reviewRunning || m.agentRunning {
-		promptLabel += " " + m.renderFlowingSpinner()
-	}
 	inputView.WriteString(promptLabel + " ⟩ " + m.ti.View() + "\n")
 	inputView.WriteString(modeColor.Render(strings.Repeat("─", width)))
 
@@ -436,13 +437,29 @@ func (m *model) renderHelpOverlay() string {
 
 // renderRuntimeStatus renders a single telemetry line with zero duplication.
 // Format: ● <model> │ <tokens> tkn
+//
+// DUAL-SPINNER ARCHITECTURE:
+//
+//	A. Loading Spinner (rect/braille dots) — shown strictly in the footer
+//	   status bar, immediately preceding the active LLM model name, during
+//	   ANY active background execution (/commit, $test, $fix, $run, $log,
+//	   streaming, or mutation processing). This spinner type is the
+//	   rectangular braille matrix (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏).
+//
+//	B. Streaming Spinner (star/flowing glyph) — rendered ONLY inside the
+//	   viewport content (chat history) during active token streaming, and
+//	   NEVER in the status bar or input prompt line.
+//
+// The two spinners occupy separate rendering layers and are triggered by
+// orthogonal state flags: m.streaming (view) vs. m.agentRunning/reviewRunning
+// (status bar). They cannot be collapsed or swapped.
 func (m *model) renderRuntimeStatus(width int) string {
 	var b strings.Builder
 
-	// Status bar uses a clean braille/rectangular spinner to maintain layout
-	// symmetry. The custom star glyphs are strictly reserved for the chat
-	// prompt label — they never appear in the status bar.
-	if m.streaming || m.agentRunning || m.state == StateProcessing {
+	// ── Loading Spinner (rect/braille): background execution indicator ──
+	// Active during streaming, background tasks, or mutation processing.
+	// Always positioned before the model name in the status line.
+	if m.streaming || m.agentRunning || m.reviewRunning || m.state == StateProcessing {
 		b.WriteString(m.renderRectSpinner())
 	} else {
 		b.WriteString(dimmedStyle.Render("●"))
@@ -452,6 +469,12 @@ func (m *model) renderRuntimeStatus(width int) string {
 	// AI INTERRUPT ENGINE: high-visibility indicator when streaming
 	if m.streaming {
 		b.WriteString(interruptLabelStyle.Render("[Ctrl+D] interrupt "))
+	}
+
+	// Agent label — shown immediately after the spinner, before model name
+	if m.agentRunning || m.reviewRunning {
+		b.WriteString(infoStyle.Render(m.agentLabel))
+		b.WriteByte(' ')
 	}
 
 	// Model name — dropped first when the pane is too narrow to fit it.

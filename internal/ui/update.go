@@ -111,6 +111,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.agentLabel = ""
 			m.agentDone = true
 			m.lastActionTime = time.Time{}
+			m.sanitizeInputPrompt()
 			m.push(roleSystem, mutedStyle.Render("[safety] review action timed out — spinner force-cleared"))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
@@ -147,6 +148,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
@@ -158,6 +160,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+msg.err.Error())
 			m.refreshViewportContent()
@@ -181,6 +184,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case graphBuiltMsg:
 		m.agentRunning = false
+		m.sanitizeInputPrompt()
 		if msg.err == nil && msg.graph != nil {
 			m.graph = msg.graph
 		}
@@ -195,6 +199,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "review error: "+msg.err.Error())
 			m.refreshViewportContent()
@@ -220,6 +225,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		m.lastTestOutput = msg.output
 		m.lastTestFailed = !msg.passed
 		m.lastTestTarget = ""
@@ -280,6 +286,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case logInputMsg:
 		m.agentRunning = false
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.reviewRunning = false
 			m.agentDone = true
@@ -300,6 +307,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.pipelineRunning = false
 			m.push(roleError, "silent analysis error: "+msg.err.Error())
@@ -317,6 +325,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.pipelineRunning = false
 			m.push(roleError, "blueprint error: "+msg.err.Error())
@@ -333,6 +342,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "fix error: "+msg.err.Error())
 			m.refreshViewportContent()
@@ -353,6 +363,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "env diagnostics error: "+msg.err.Error())
 			m.refreshViewportContent()
@@ -378,6 +389,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "trace execution error: "+msg.err.Error())
 		}
@@ -428,6 +440,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "diagnosis error: "+msg.err.Error())
 			m.refreshViewportContent()
@@ -452,6 +465,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
 		m.pipelineRunning = false
+		m.sanitizeInputPrompt()
 
 		if msg.err != nil {
 			m.push(roleError, "commit error: "+msg.err.Error())

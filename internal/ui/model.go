@@ -648,6 +648,14 @@ func wrapStreamText(text string, maxW int) []string {
 	return chunks
 }
 
+// sanitizeInputPrompt forces the text input prompt back to a clean baseline,
+// ensuring no orphaned spinner sequences or dynamic artifacts remain embedded
+// after any background task termination ($fix, $run, $log, $test, /commit).
+// Called defensively by every task-termination message handler in update.go.
+func (m *model) sanitizeInputPrompt() {
+	m.ti.Prompt = ""
+}
+
 // setApplyError captures an apply error.
 func (m *model) setApplyError(text string) {
 	m.lastApplyError = text
@@ -779,15 +787,16 @@ func (m *model) refreshViewportContent() {
 				content.WriteString("\n")
 			}
 		}
+		// ── Streaming Spinner (star/flowing glyph) ─────────────────────
+		// Rendered ONLY inside the viewport during active token streaming,
+		// appended beneath the streamed content block. The loading spinner
+		// (rect/braille dots) lives exclusively in the status bar.
 		sp := m.renderFlowingSpinner()
 		status := "streaming…"
 		if m.agentRunning {
 			status = m.agentLabel
 		}
 		content.WriteString(sp + " " + infoStyle.Render(status) + "\n")
-	} else if m.reviewRunning || m.agentRunning {
-		sp := m.renderFlowingSpinner()
-		content.WriteString(sp + " " + infoStyle.Render(m.agentLabel) + "\n")
 	}
 
 	m.Viewport.SetContent(content.String())
