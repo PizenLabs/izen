@@ -182,6 +182,15 @@ type testResultMsg struct {
 	err    error
 }
 
+// buildResultMsg is the result from a $run build execution.
+// Separated from testResultMsg so its feedback renders a clean
+// system metric block instead of the test component's template.
+type buildResultMsg struct {
+	output   string
+	exitCode int
+	err      error
+}
+
 type fixResultMsg struct {
 	content string
 	err     error

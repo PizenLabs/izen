@@ -13,6 +13,43 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
+// stripLogTokens removes internal bookkeeping patterns from a log preview
+// string so they never leak into the TUI viewport. Patterns stripped:
+//   - ISO date prefixes: [2026-07-14... or 2026-07-14...
+//   - context=<hex-id>  metadata tags
+//   - file=<path>, patch=<path> remnants
+//   - Other raw key=value tokens that don't add user-facing value.
+func stripLogTokens(s string) string {
+	var tokens []string
+	for _, tok := range strings.Fields(s) {
+		// Drop bare ISO dates and [ISO date] brackets
+		if len(tok) >= 11 && tok[0] == '[' && (tok[1] == '2' || tok[1] == '1') && tok[5] == '-' && tok[8] == '-' {
+			continue
+		}
+		if len(tok) >= 10 && (tok[0] == '2' || tok[0] == '1') && tok[4] == '-' && tok[7] == '-' {
+			continue
+		}
+		// Drop context=<id> (lowercase only — JSON keys)
+		if strings.HasPrefix(tok, "context=") {
+			continue
+		}
+		// Drop file=<path> remnants
+		if strings.HasPrefix(tok, "file=") {
+			continue
+		}
+		// Drop patch=<path> remnants
+		if strings.HasPrefix(tok, "patch=") {
+			continue
+		}
+		// Drop mode= and role= (already displayed in the structured label)
+		if strings.HasPrefix(tok, "mode=") || strings.HasPrefix(tok, "role=") {
+			continue
+		}
+		tokens = append(tokens, tok)
+	}
+	return strings.Join(tokens, " ")
+}
+
 func (m *model) expandFileRefs(line string) string {
 	fields := strings.Fields(line)
 	changed := false

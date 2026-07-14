@@ -284,6 +284,36 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		flush := m.flushPendingRecords()
 		return m, flush
 
+	case buildResultMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
+		m.lastTestOutput = msg.output
+		m.lastTestFailed = msg.exitCode != 0
+		if msg.err != nil {
+			m.push(roleError, "build execution error: "+msg.err.Error())
+		}
+		if msg.output != "" {
+			for _, line := range strings.Split(msg.output, "\n") {
+				if line == "" {
+					continue
+				}
+				m.push(roleSystem, line)
+			}
+		}
+		if msg.exitCode == 0 {
+			m.push(roleSystem, infoStyle.Render("[System] Execution Successful (Exit Code 0)"))
+		} else {
+			m.push(roleSystem, infoStyle.Render(fmt.Sprintf("[System] Execution Failed (Exit Code %d)", msg.exitCode)))
+		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		flush := m.flushPendingRecords()
+		return m, flush
+
 	case logInputMsg:
 		m.agentRunning = false
 		m.sanitizeInputPrompt()

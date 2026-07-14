@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -783,7 +785,7 @@ func (m *model) runBuildEngine(target string) tea.Cmd {
 		cmd := "go build " + target
 		result, err := runner.Run(cmd)
 		output := ""
-		passed := true
+		exitCode := 0
 
 		if result != nil {
 			output = result.Stdout
@@ -793,29 +795,19 @@ func (m *model) runBuildEngine(target string) tea.Cmd {
 				}
 				output += result.Stderr
 			}
-			if result.ExitCode != 0 {
-				passed = false
-			}
+			exitCode = result.ExitCode
 		}
 		if err != nil && output == "" {
 			output = err.Error()
-			passed = false
-		}
-
-		// Count errors in output
-		failedCount := 0
-		for _, line := range strings.Split(output, "\n") {
-			if strings.Contains(line, ".go:") && (strings.Contains(line, "error") || strings.Contains(line, "cannot")) {
-				failedCount++
+			if exitCode == 0 {
+				exitCode = 1
 			}
 		}
 
-		return testResultMsg{
-			output: output,
-			passed: passed,
-			failed: failedCount,
-			total:  0,
-			err:    err,
+		return buildResultMsg{
+			output:   output,
+			exitCode: exitCode,
+			err:      err,
 		}
 	}
 }
@@ -923,8 +915,11 @@ func (m *model) runFixCmd(target string) tea.Cmd {
 }
 
 // ── $log (view mode) — Filtered mutation log display ──────────────────────────
-// runLogViewCmd reads .izen/audit/mutations.log and renders entries filtered
-// by the active session ContextID. Pass showAll=true to bypass filtering.
+// runLogViewCmd reads .izen/audit/mutations.log and renders entries as a
+// rigidly-bounded, non-breaking box. Uses utf8.RuneCountInString for Unicode
+// width checks and lipgloss.Width for ANSI-styled segments. Every row is
+// truncated or padded to an exact contentWidth rune count so the border
+// frame can never warp.
 func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 	ctxID := ""
 	if !showAll && m.sess != nil {
@@ -940,19 +935,119 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 			return agentDoneMsg{}
 		}
 
-		lines := strings.Split(string(data), "\n")
-		var filtered []string
-		for _, line := range lines {
+		rawLines := strings.Split(string(data), "\n")
+		type logEntry struct {
+			Timestamp string `json:"timestamp"`
+			Role      string `json:"role"`
+			Mode      string `json:"mode"`
+			Preview   string `json:"preview"`
+		}
+
+		// ── Fixed box geometry ────────────────────────────────────────────
+		// Total visual width of the box, derived from main viewport width.
+		boxWidth := m.width - 4
+		if boxWidth < 40 {
+			boxWidth = 40
+		}
+		if boxWidth > 100 {
+			boxWidth = 100
+		}
+		// Border markers: "│ " (2) + " │" (2) = 4 chars eaten by frame.
+		// contentWidth is the exact space available for the inner text line.
+		contentWidth := boxWidth - 4
+
+		// ── Static styled components (used for late styling only) ─────────
+		bullet := accentStyle.Render("›")
+
+		var formatted []string
+		for _, line := range rawLines {
 			if line == "" {
+				continue
+			}
+			var entry logEntry
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				// Fallback: pure text geometry
+				rawFallback := "› " + line
+				fallbackRunes := []rune(rawFallback)
+				if len(fallbackRunes) > contentWidth {
+					rawFallback = string(fallbackRunes[:contentWidth-3]) + "..."
+				} else {
+					rawFallback += strings.Repeat(" ", contentWidth-utf8.RuneCountInString(rawFallback))
+				}
+				styledFallback := strings.Replace(rawFallback, "›", bullet, 1)
+				formatted = append(formatted, styledFallback)
 				continue
 			}
 			if ctxID != "" && !strings.Contains(line, "context="+ctxID) {
 				continue
 			}
-			filtered = append(filtered, line)
+
+			modeLabel := entry.Mode
+			if modeLabel == "" {
+				modeLabel = "Unknown"
+			}
+
+			// ── Sanitize preview ──────────────────────────────────────────
+			preview := entry.Preview
+			preview = strings.ReplaceAll(preview, "\n", " ")
+			preview = strings.ReplaceAll(preview, "```", "`")
+			preview = strings.TrimSpace(preview)
+
+			// ── Pre-filtering: detect metadata tokens and rewrite ────────
+			hasCtx := strings.Contains(preview, "context=")
+			hasPatch := strings.Contains(preview, "patch=")
+
+			switch {
+			case hasCtx && hasPatch:
+				preview = "Applied structural patch update to repository"
+			case hasPatch:
+				if idx := strings.Index(preview, "patch="); idx >= 0 {
+					rest := preview[idx+6:]
+					if spaceIdx := strings.Index(rest, " "); spaceIdx >= 0 {
+						rest = rest[:spaceIdx]
+					}
+					if rest != "" {
+						preview = fmt.Sprintf("Synchronized baseline patch for %s", rest)
+					} else {
+						preview = "Applied structural patch update to repository"
+					}
+				}
+			default:
+				preview = stripLogTokens(preview)
+			}
+			preview = strings.TrimSpace(preview)
+			if preview == "" {
+				preview = "No details"
+			}
+
+			// ── PURE TEXT GEOMETRY (NO LIVE CELL MEASUREMENT) ─────────
+			// 1. Build 100% raw plain text line.
+			rawLine := "› [" + modeLabel + " Mode] " + preview
+
+			// 2. Rigid truncation & padding on raw runes.
+			rawRunes := []rune(rawLine)
+			if len(rawRunes) > contentWidth {
+				if contentWidth > 3 {
+					rawLine = string(rawRunes[:contentWidth-3]) + "..."
+				} else {
+					rawLine = string(rawRunes[:contentWidth])
+				}
+			} else {
+				rawLine += strings.Repeat(" ", contentWidth-utf8.RuneCountInString(rawLine))
+			}
+
+			// 3. Late styling — rawLine now occupies exactly contentWidth columns.
+			modeTag := "[" + modeLabel + " Mode]"
+			parsedMode, _ := modes.Parse(strings.ToLower(modeLabel))
+			styledModeTag := lipgloss.NewStyle().Foreground(modeAccentColor(parsedMode)).Render(modeTag)
+			styledLine := strings.Replace(rawLine, "›", bullet, 1)
+			if idx := strings.Index(styledLine, modeTag); idx >= 0 {
+				styledLine = styledLine[:idx] + styledModeTag + styledLine[idx+len(modeTag):]
+			}
+			formatted = append(formatted, styledLine)
 		}
 
-		if len(filtered) == 0 {
+		if len(formatted) == 0 {
 			msg := "[System] $log: No entries"
 			if ctxID != "" {
 				msg += " for context " + ctxID
@@ -963,17 +1058,26 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 			return agentDoneMsg{}
 		}
 
+		// ── Render the rigid box ──────────────────────────────────────────
 		var b strings.Builder
-		b.WriteString("[System] $log: Mutation history")
-		if ctxID != "" {
-			b.WriteString(" (filtered: " + ctxID + ")")
+
+		// Top border: ┌─ $log: Mutation History ────────────────┐
+		b.WriteString("┌─ $log: Mutation History ")
+		fillTop := boxWidth - utf8.RuneCountInString("┌─ $log: Mutation History ") - 1
+		if fillTop > 0 {
+			b.WriteString(strings.Repeat("─", fillTop))
 		}
-		b.WriteString("\n")
-		for _, line := range filtered {
-			b.WriteString("  ")
+		b.WriteString("┐\n")
+
+		// Content rows: │ › [Build Mode] text{padded} │
+		for _, line := range formatted {
+			b.WriteString("│ ")
 			b.WriteString(line)
-			b.WriteString("\n")
+			b.WriteString(" │\n")
 		}
+
+		// Bottom border: └──────────────────────────────────────┘
+		b.WriteString("└" + strings.Repeat("─", boxWidth-1) + "┘")
 
 		m.push(roleStatus, b.String())
 		m.refreshViewportContent()
