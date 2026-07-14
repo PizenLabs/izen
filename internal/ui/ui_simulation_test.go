@@ -31,6 +31,7 @@ func newTestModel() *model {
 		width:    100,
 		height:   40,
 		resolver: resolver,
+		ledger:   NewContextLedger(),
 		ti:       ti,
 		sess:     &session.Session{},
 		cfg: &config.Config{

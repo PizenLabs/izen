@@ -3,6 +3,7 @@ package execution
 import (
 	"bufio"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -10,16 +11,17 @@ import (
 )
 
 type TestResult struct {
-	Package  string        `json:"package"`
-	Passed   bool          `json:"passed"`
-	Total    int           `json:"total"`
-	PassedN  int           `json:"passed_n"`
-	FailedN  int           `json:"failed_n"`
-	Skipped  int           `json:"skipped"`
-	Output   string        `json:"output"`
-	Failed   []FailedTest  `json:"failed,omitempty"`
-	Cover    string        `json:"coverage,omitempty"`
-	Duration time.Duration `json:"duration"`
+	Package   string        `json:"package"`
+	ContextID string        `json:"context_id,omitempty"`
+	Passed    bool          `json:"passed"`
+	Total     int           `json:"total"`
+	PassedN   int           `json:"passed_n"`
+	FailedN   int           `json:"failed_n"`
+	Skipped   int           `json:"skipped"`
+	Output    string        `json:"output"`
+	Failed    []FailedTest  `json:"failed,omitempty"`
+	Cover     string        `json:"coverage,omitempty"`
+	Duration  time.Duration `json:"duration"`
 }
 
 type FailedTest struct {
@@ -28,11 +30,20 @@ type FailedTest struct {
 }
 
 type TestRunner struct {
-	root string
+	root      string
+	contextID string
 }
 
 func NewTestRunner(root string) *TestRunner {
 	return &TestRunner{root: root}
+}
+
+func (tr *TestRunner) SetContextID(id string) {
+	tr.contextID = id
+}
+
+func (tr *TestRunner) ActiveContextID() string {
+	return tr.contextID
 }
 
 func (tr *TestRunner) RunAll() (*TestResult, error) {
@@ -53,6 +64,7 @@ func (tr *TestRunner) RunFile(file string) (*TestResult, error) {
 
 func (tr *TestRunner) run(target string, cover bool) (*TestResult, error) {
 	runner := NewRunner(tr.root, false, false)
+	runner.SetContextID(tr.contextID)
 
 	args := []string{"go", "test"}
 	if cover {
@@ -65,7 +77,31 @@ func (tr *TestRunner) run(target string, cover bool) (*TestResult, error) {
 		return nil, err
 	}
 
-	return parseTestOutput(result.Stdout + "\n" + result.Stderr), nil
+	parsed := parseTestOutput(result.Stdout + "\n" + result.Stderr)
+	parsed.ContextID = tr.contextID
+
+	// Write test output to context-specific log file
+	if tr.contextID != "" {
+		_ = tr.writeTestRunLog(parsed)
+	}
+
+	return parsed, nil
+}
+
+// writeTestRunLog persists the full test output to .izen/history/test_runs/#ctx-<id>-r<seq>.log
+// for isolated diagnostics retrieval.
+func (tr *TestRunner) writeTestRunLog(result *TestResult) error {
+	logDir := filepath.Join(tr.root, ".izen", "history", "test_runs")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return err
+	}
+	logName := sanitizeCtxFileName(tr.contextID) + ".log"
+	logPath := filepath.Join(logDir, logName)
+	return os.WriteFile(logPath, []byte(result.Output), 0644)
+}
+
+func sanitizeCtxFileName(id string) string {
+	return strings.NewReplacer("#", "", "-", "_", "/", "_").Replace(id)
 }
 
 var (

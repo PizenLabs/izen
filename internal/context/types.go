@@ -28,14 +28,20 @@ type CodebaseTrace struct {
 }
 
 type Context struct {
-	Objective string         `json:"objective"`
-	Mode      string         `json:"mode"`
-	Files     []FileSlice    `json:"files"`
-	Diff      string         `json:"diff,omitempty"`
-	Status    []string       `json:"status,omitempty"`
-	Errors    []string       `json:"errors,omitempty"`
-	Query     string         `json:"query,omitempty"`
-	Trace     *CodebaseTrace `json:"trace,omitempty"`
+	Objective          string         `json:"objective"`
+	Mode               string         `json:"mode"`
+	ContextID          string         `json:"context_id,omitempty"`
+	RunNumber          int            `json:"run_number"`
+	CheckpointID       string         `json:"checkpoint_id,omitempty"`
+	CompilerPayload    string         `json:"compiler_payload,omitempty"`
+	SymbolAST          string         `json:"symbol_ast,omitempty"`
+	DiagnosticsSummary string         `json:"diagnostics_summary,omitempty"`
+	Files              []FileSlice    `json:"files"`
+	Diff               string         `json:"diff,omitempty"`
+	Status             []string       `json:"status,omitempty"`
+	Errors             []string       `json:"errors,omitempty"`
+	Query              string         `json:"query,omitempty"`
+	Trace              *CodebaseTrace `json:"trace,omitempty"`
 }
 
 type Stats struct {

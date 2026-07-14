@@ -160,9 +160,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 		// ── Enter: submit (only when autocomplete is NOT active) ───────────────
+		// STALE-VIEWPORT GUARD: Every submission path MUST call
+		// refreshViewportContent+GotoBottom before returning, guaranteeing
+		// the user's input appears immediately rather than waiting for the
+		// next UI tick. This prevents the "stale screen until next keypress"
+		// regression.
 	case tea.KeyEnter:
-		// New message submission resets user scroll-lock so auto-scroll
-		// resumes for the incoming response.
 		m.userIsScrollingUp = false
 
 		userInput := m.ti.Value()
@@ -185,11 +188,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 			m.streamStartTime = time.Now()
 			cmd := m.handleInput(userInput)
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
 			return m, cmd
 		}
 		m.ti.SetValue("")
 		m.ti.Reset()
 		m.syncInputFromTI()
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
 		return m, nil
 
 		// ── History navigation (only when suggestions are NOT active) ─────────

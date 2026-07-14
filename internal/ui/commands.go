@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -440,11 +442,13 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  $test [path]  run tests (safety-gated for large repos)"))
 		m.push(roleSystem, infoStyle.Render("  $run  [path]  run go build (safety-gated for large repos)"))
 		m.push(roleSystem, infoStyle.Render("  $fix          auto-fix from last test/run failure output"))
+		m.push(roleSystem, infoStyle.Render("  $log          evaluate shell trace & run implicit pipeline"))
 		m.push(roleSystem, infoStyle.Render(""))
 		m.push(roleSystem, labelBoldStyle.Render("investigate sub-commands ($)"))
 		m.push(roleSystem, infoStyle.Render("  $env            capture environment diagnostics"))
 		m.push(roleSystem, infoStyle.Render("  $trace <fn>     live execution trace with -race"))
 		m.push(roleSystem, infoStyle.Render("  $diagnose       root cause analysis from forensic data"))
+		m.push(roleSystem, infoStyle.Render("  $log            evaluate shell trace & run implicit pipeline"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, infoStyle.Render("  @<path>  reference a file in your message"))
 		return nil
@@ -781,7 +785,7 @@ func (m *model) runBuildEngine(target string) tea.Cmd {
 		cmd := "go build " + target
 		result, err := runner.Run(cmd)
 		output := ""
-		passed := true
+		exitCode := 0
 
 		if result != nil {
 			output = result.Stdout
@@ -791,29 +795,19 @@ func (m *model) runBuildEngine(target string) tea.Cmd {
 				}
 				output += result.Stderr
 			}
-			if result.ExitCode != 0 {
-				passed = false
-			}
+			exitCode = result.ExitCode
 		}
 		if err != nil && output == "" {
 			output = err.Error()
-			passed = false
-		}
-
-		// Count errors in output
-		failedCount := 0
-		for _, line := range strings.Split(output, "\n") {
-			if strings.Contains(line, ".go:") && (strings.Contains(line, "error") || strings.Contains(line, "cannot")) {
-				failedCount++
+			if exitCode == 0 {
+				exitCode = 1
 			}
 		}
 
-		return testResultMsg{
-			output: output,
-			passed: passed,
-			failed: failedCount,
-			total:  0,
-			err:    err,
+		return buildResultMsg{
+			output:   output,
+			exitCode: exitCode,
+			err:      err,
 		}
 	}
 }
@@ -920,12 +914,479 @@ func (m *model) runFixCmd(target string) tea.Cmd {
 	)
 }
 
+// ── $log (view mode) — Filtered mutation log display ──────────────────────────
+// runLogViewCmd reads .izen/audit/mutations.log and renders entries as a
+// rigidly-bounded, non-breaking box. Uses utf8.RuneCountInString for Unicode
+// width checks and lipgloss.Width for ANSI-styled segments. Every row is
+// truncated or padded to an exact contentWidth rune count so the border
+// frame can never warp.
+func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
+	ctxID := ""
+	if !showAll && m.sess != nil {
+		ctxID = m.sess.ContextID
+	}
+	return func() tea.Msg {
+		logPath := filepath.Join(".izen", "audit", "mutations.log")
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			m.push(roleStatus, "[System] No mutation log found.")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return agentDoneMsg{}
+		}
+
+		rawLines := strings.Split(string(data), "\n")
+		type logEntry struct {
+			Timestamp string `json:"timestamp"`
+			Role      string `json:"role"`
+			Mode      string `json:"mode"`
+			Preview   string `json:"preview"`
+		}
+
+		// ── Fixed box geometry ────────────────────────────────────────────
+		// Total visual width of the box, derived from main viewport width.
+		boxWidth := m.width - 4
+		if boxWidth < 40 {
+			boxWidth = 40
+		}
+		if boxWidth > 100 {
+			boxWidth = 100
+		}
+		// Border markers: "│ " (2) + " │" (2) = 4 chars eaten by frame.
+		// contentWidth is the exact space available for the inner text line.
+		contentWidth := boxWidth - 4
+
+		// ── Static styled components (used for late styling only) ─────────
+		bullet := accentStyle.Render("›")
+
+		var formatted []string
+		for _, line := range rawLines {
+			if line == "" {
+				continue
+			}
+			var entry logEntry
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				// Fallback: pure text geometry
+				rawFallback := "› " + line
+				fallbackRunes := []rune(rawFallback)
+				if len(fallbackRunes) > contentWidth {
+					rawFallback = string(fallbackRunes[:contentWidth-3]) + "..."
+				} else {
+					rawFallback += strings.Repeat(" ", contentWidth-utf8.RuneCountInString(rawFallback))
+				}
+				styledFallback := strings.Replace(rawFallback, "›", bullet, 1)
+				formatted = append(formatted, styledFallback)
+				continue
+			}
+			if ctxID != "" && !strings.Contains(line, "context="+ctxID) {
+				continue
+			}
+
+			modeLabel := entry.Mode
+			if modeLabel == "" {
+				modeLabel = "Unknown"
+			}
+
+			// ── Sanitize preview ──────────────────────────────────────────
+			preview := entry.Preview
+			preview = strings.ReplaceAll(preview, "\n", " ")
+			preview = strings.ReplaceAll(preview, "```", "`")
+			preview = strings.TrimSpace(preview)
+
+			// ── Pre-filtering: detect metadata tokens and rewrite ────────
+			hasCtx := strings.Contains(preview, "context=")
+			hasPatch := strings.Contains(preview, "patch=")
+
+			switch {
+			case hasCtx && hasPatch:
+				preview = "Applied structural patch update to repository"
+			case hasPatch:
+				if idx := strings.Index(preview, "patch="); idx >= 0 {
+					rest := preview[idx+6:]
+					if spaceIdx := strings.Index(rest, " "); spaceIdx >= 0 {
+						rest = rest[:spaceIdx]
+					}
+					if rest != "" {
+						preview = fmt.Sprintf("Synchronized baseline patch for %s", rest)
+					} else {
+						preview = "Applied structural patch update to repository"
+					}
+				}
+			default:
+				preview = stripLogTokens(preview)
+			}
+			preview = strings.TrimSpace(preview)
+			if preview == "" {
+				preview = "No details"
+			}
+
+			// ── PURE TEXT GEOMETRY (NO LIVE CELL MEASUREMENT) ─────────
+			// 1. Build 100% raw plain text line.
+			rawLine := "› [" + modeLabel + " Mode] " + preview
+
+			// 2. Rigid truncation & padding on raw runes.
+			rawRunes := []rune(rawLine)
+			if len(rawRunes) > contentWidth {
+				if contentWidth > 3 {
+					rawLine = string(rawRunes[:contentWidth-3]) + "..."
+				} else {
+					rawLine = string(rawRunes[:contentWidth])
+				}
+			} else {
+				rawLine += strings.Repeat(" ", contentWidth-utf8.RuneCountInString(rawLine))
+			}
+
+			// 3. Late styling — rawLine now occupies exactly contentWidth columns.
+			modeTag := "[" + modeLabel + " Mode]"
+			parsedMode, _ := modes.Parse(strings.ToLower(modeLabel))
+			styledModeTag := lipgloss.NewStyle().Foreground(modeAccentColor(parsedMode)).Render(modeTag)
+			styledLine := strings.Replace(rawLine, "›", bullet, 1)
+			if idx := strings.Index(styledLine, modeTag); idx >= 0 {
+				styledLine = styledLine[:idx] + styledModeTag + styledLine[idx+len(modeTag):]
+			}
+			formatted = append(formatted, styledLine)
+		}
+
+		if len(formatted) == 0 {
+			msg := "[System] $log: No entries"
+			if ctxID != "" {
+				msg += " for context " + ctxID
+			}
+			m.push(roleStatus, msg)
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return agentDoneMsg{}
+		}
+
+		// ── Render the rigid box ──────────────────────────────────────────
+		var b strings.Builder
+
+		// Top border: ┌─ $log: Mutation History ────────────────┐
+		b.WriteString("┌─ $log: Mutation History ")
+		fillTop := boxWidth - utf8.RuneCountInString("┌─ $log: Mutation History ") - 1
+		if fillTop > 0 {
+			b.WriteString(strings.Repeat("─", fillTop))
+		}
+		b.WriteString("┐\n")
+
+		// Content rows: │ › [Build Mode] text{padded} │
+		for _, line := range formatted {
+			b.WriteString("│ ")
+			b.WriteString(line)
+			b.WriteString(" │\n")
+		}
+
+		// Bottom border: └──────────────────────────────────────┘
+		b.WriteString("└" + strings.Repeat("─", boxWidth-1) + "┘")
+
+		m.push(roleStatus, b.String())
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return agentDoneMsg{}
+	}
+}
+
+// ── $log — Under-the-hood pipeline trigger ─────────────────────────────────────
+// runLogCmd receives a shell execution trace, evaluates crash signatures via the
+// ContextLedger, and triggers the implicit silent analysis pipeline
+// (investigate → plan → build) without visible mode bouncing.
+func (m *model) runLogCmd(traceData string) tea.Cmd {
+	m.cancelStaleAgentOps()
+	m.pipelineRunning = true
+	m.pipelineStep = "analyzing trace"
+
+	// Capture raw shell output from the execution runner
+	return tea.Batch(
+		func() tea.Msg { return agentStartMsg{label: "$log trace analysis"} },
+		func() tea.Msg {
+			runner := execExecutionRunner(".")
+			var output string
+			if traceData != "" {
+				out, err := runner.Run(traceData)
+				if err != nil {
+					return logInputMsg{err: err}
+				}
+				if out != nil {
+					output = out.Stdout
+					if out.Stderr != "" {
+						if output != "" {
+							output += "\n"
+						}
+						output += out.Stderr
+					}
+				}
+			}
+
+			m.push(roleSystem, "[System] $log: Executing under-the-hood trace capture...")
+
+			// Extract stack frames for ledger registration
+			frames := investigate.ParseStackFrames(output)
+			var files []string
+			for _, f := range frames {
+				files = append(files, f.File)
+			}
+			if len(files) > 50 {
+				files = files[:50]
+			}
+
+			// Register with ContextLedger
+			if m.ledger == nil {
+				m.ledger = NewContextLedger()
+			}
+			ledgerID := m.ledger.Record(files, output)
+
+			// Build analysis payload for Step 1 (silent investigation)
+			var analysis strings.Builder
+			analysis.WriteString("## [$log] UNDER-THE-HOOD TRACE ANALYSIS\n\n")
+			fmt.Fprintf(&analysis, "**Ledger ID:** `%s`\n\n", ledgerID)
+			analysis.WriteString("## RAW TRACE OUTPUT\n\n```\n")
+			analysis.WriteString(output)
+			analysis.WriteString("\n```\n\n")
+
+			if len(frames) > 0 {
+				analysis.WriteString("## STACK TRACE → SOURCE PROXIMITY\n\n")
+				slicer := investigate.NewProximitySlicer(".", 10)
+				seen := make(map[string]bool)
+				for _, frame := range frames {
+					key := fmt.Sprintf("%s:%d", frame.File, frame.Line)
+					if seen[key] {
+						continue
+					}
+					seen[key] = true
+					slice := slicer.Extract(frame)
+					if slice != nil {
+						fmt.Fprintf(&analysis, "### %s:%d\n\n```go\n", slice.File, slice.Line)
+						for _, cline := range slice.Context {
+							analysis.WriteString(cline)
+							analysis.WriteString("\n")
+						}
+						analysis.WriteString("```\n\n")
+					}
+				}
+			}
+
+			analysis.WriteString("## INSTRUCTION\n")
+			analysis.WriteString("Analyze the trace above. Identify the root cause. ")
+			analysis.WriteString("Output a structured diagnosis with the root cause, evidence, and proposed resolution.\n")
+
+			m.reviewRunning = true
+			m.lastActionTime = time.Now()
+			return logInputMsg{output: analysis.String()}
+		},
+	)
+}
+
+// ── $log → silent investigate step ──────────────────────────────────────────────
+// handleLogInput processes the capture trace and fires the silent investigation
+// step through streamCmd (read-only LLM analysis). No mode transition occurs.
+func (m *model) handleLogInput(msg logInputMsg) tea.Cmd {
+	m.pipelineStep = "analyzing failure"
+	if msg.err != nil {
+		m.pipelineRunning = false
+		m.reviewRunning = false
+		m.agentRunning = false
+		m.push(roleError, "$log: execution error: "+msg.err.Error())
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m.flushPendingRecords()
+	}
+
+	m.push(roleSystem, "[System] $log: Pipeline Step 1/3 — Silent failure analysis...")
+	m.streamCh = nil
+	m.streaming = false
+	m.streamParser = nil
+	flush := m.flushPendingRecords()
+	return tea.Batch(flush, m.streamCmd(msg.output))
+}
+
+// ── $fix implicit pipeline: investigate → plan → build (no UI bouncing) ──────
+// runImplicitFixPipeline executes the three-step silent analysis flow when $fix
+// is invoked from /review or globally. The UI does NOT flash between modes.
+func (m *model) runImplicitFixPipeline() tea.Cmd {
+	m.cancelStaleAgentOps()
+	m.pipelineRunning = true
+	m.pipelineStep = "analyzing failure"
+
+	if m.lastTestOutput == "" {
+		m.pipelineRunning = false
+		m.push(roleError, "no previous test/run output available — run $test or $run first")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+
+	return tea.Batch(
+		func() tea.Msg { return agentStartMsg{label: "fix pipeline: analyze"} },
+		func() tea.Msg {
+			output := m.lastTestOutput
+			frames := investigate.ParseStackFrames(output)
+
+			// Register with ContextLedger
+			if m.ledger == nil {
+				m.ledger = NewContextLedger()
+			}
+			var files []string
+			for _, f := range frames {
+				files = append(files, f.File)
+			}
+			if len(files) > 50 {
+				files = files[:50]
+			}
+			ledgerID := m.ledger.Record(files, output)
+			m.push(roleSystem, infoStyle.Render(fmt.Sprintf("[System] Pipeline registered as %s — running silent analysis.", ledgerID)))
+
+			var fixCtx strings.Builder
+			fmt.Fprintf(&fixCtx, "## FAILURE LOG [%s]\n\n```\n", ledgerID)
+			fixCtx.WriteString(output)
+			fixCtx.WriteString("\n```\n\n")
+
+			if len(frames) > 0 {
+				fixCtx.WriteString("## STACK TRACE → SOURCE PROXIMITY\n\n")
+				slicer := investigate.NewProximitySlicer(".", 10)
+				seen := make(map[string]bool)
+				for _, frame := range frames {
+					key := fmt.Sprintf("%s:%d", frame.File, frame.Line)
+					if seen[key] {
+						continue
+					}
+					seen[key] = true
+					slice := slicer.Extract(frame)
+					if slice != nil {
+						fmt.Fprintf(&fixCtx, "### %s:%d\n\n```go\n", slice.File, slice.Line)
+						for _, cline := range slice.Context {
+							fixCtx.WriteString(cline)
+							fixCtx.WriteString("\n")
+						}
+						fixCtx.WriteString("```\n\n")
+					}
+				}
+			}
+
+			if m.lastTestTarget != "" {
+				fmt.Fprintf(&fixCtx, "**Target:** `%s`\n\n", m.lastTestTarget)
+			}
+
+			fixCtx.WriteString("## PIPELINE INSTRUCTION — STEP 1 (SILENT ANALYSIS)\n")
+			fixCtx.WriteString("Analyze the test failure(s) above. Identify the root cause in the source code. ")
+			fixCtx.WriteString("Output a structured diagnosis with: root cause, evidence, and proposed resolution.\n")
+
+			m.reviewRunning = true
+			m.lastActionTime = time.Now()
+			return investigateCompleteMsg{analysis: fixCtx.String(), ledgerID: ledgerID}
+		},
+	)
+}
+
+// handleInvestigateComplete receives the silent analysis and pipes it into plan.
+// Step 2: silent blueprinting. No UI mode transition occurs.
+func (m *model) handleInvestigateComplete(msg investigateCompleteMsg) tea.Cmd {
+	m.pipelineStep = "blueprinting"
+	if msg.err != nil {
+		m.pipelineRunning = false
+		m.reviewRunning = false
+		m.agentRunning = false
+		m.push(roleError, "fix pipeline: analysis failed: "+msg.err.Error())
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m.flushPendingRecords()
+	}
+
+	m.push(roleSystem, infoStyle.Render("[System] Pipeline Step 2/3 — Formulating fix blueprint..."))
+	m.streamCh = nil
+	m.streaming = false
+	m.streamParser = nil
+	m.handoffCtx.ProposedFix = msg.analysis
+	flush := m.flushPendingRecords()
+	return tea.Batch(flush, m.streamCmd(msg.analysis))
+}
+
+// handleBlueprintReady receives the plan output and jumps to /build execution.
+// Step 3: Explicit execution jump to /build with the fully realized blueprint.
+func (m *model) handleBlueprintReady(msg blueprintReadyMsg) tea.Cmd {
+	m.pipelineRunning = false
+	m.pipelineStep = ""
+
+	if msg.err != nil {
+		m.reviewRunning = false
+		m.agentRunning = false
+		m.push(roleError, "fix pipeline: blueprint error: "+msg.err.Error())
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m.flushPendingRecords()
+	}
+
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("[System] Pipeline Step 3/3 — Blueprint ready [%s]. Jumping to /build for execution...", msg.ledgerID)))
+
+	// ── Explicit UI mode transition to /build ──────────────────────────
+	// The exact millisecond the patch blueprint is finalized, we transition.
+	m.setMode(modes.ModeBuild)
+	m.lastTestOutput = msg.blueprint
+
+	// Reset pipeline flag so the normal boring path finishes cleanly
+	m.pipelineRunning = false
+
+	m.streamCh = nil
+	m.streaming = false
+	m.streamParser = nil
+	flush := m.flushPendingRecords()
+
+	// Dispatch the fix command with our blueprint as the failure content
+	return tea.Batch(
+		flush,
+		func() tea.Msg {
+			frames := investigate.ParseStackFrames(msg.blueprint)
+			var fixCtx strings.Builder
+			fixCtx.WriteString("## FIX BLUEPRINT\n\n```\n")
+			fixCtx.WriteString(msg.blueprint)
+			fixCtx.WriteString("\n```\n\n")
+
+			if len(frames) > 0 {
+				fixCtx.WriteString("## STACK TRACE → SOURCE PROXIMITY\n\n")
+				slicer := investigate.NewProximitySlicer(".", 10)
+				seen := make(map[string]bool)
+				for _, frame := range frames {
+					key := fmt.Sprintf("%s:%d", frame.File, frame.Line)
+					if seen[key] {
+						continue
+					}
+					seen[key] = true
+					slice := slicer.Extract(frame)
+					if slice != nil {
+						fmt.Fprintf(&fixCtx, "### %s:%d\n\n```go\n", slice.File, slice.Line)
+						for _, cline := range slice.Context {
+							fixCtx.WriteString(cline)
+							fixCtx.WriteString("\n")
+						}
+						fixCtx.WriteString("```\n\n")
+					}
+				}
+			}
+
+			fixCtx.WriteString("## INSTRUCTION\n")
+			fixCtx.WriteString("Implement the fix blueprint above. Output the minimal fix as a unified diff ")
+			fixCtx.WriteString("or complete file replacement.\n")
+
+			return fixResultMsg{content: fixCtx.String()}
+		},
+	)
+}
+
 // ── Workflow lifecycle: context cancellation for stale goroutine release ──
 // cancelStaleAgentOps cancels any in-flight background context and resets
 // all agent/spinner state to prevent stale tickMsg loops, goroutine leaks,
 // and spinner frame corruption across mode transitions and $sub-command
 // re-entry. MUST be called before spawning any new execution loop.
+//
+// ContextLedger immunity: the ledger data block is preserved during child
+// suffix transitions, allowing a sibling sub-scope (#101-sub) to inherit
+// the parent state. On new root allocations (completely decoupled crashes),
+// the ledger is re-initialized via ResetForNewRoot.
 func (m *model) cancelStaleAgentOps() {
+	// Stash ContextLedger before clearing everything else
+	if m.ledger != nil {
+		m.ledgerStash = m.ledger.stashLedgerData()
+	}
+
 	m.reviewRunning = false
 	m.agentRunning = false
 	m.agentDone = false
@@ -943,16 +1404,46 @@ func (m *model) cancelStaleAgentOps() {
 	m.streamBuffer = ""
 	m.currentStreamContent = ""
 	m.interruptRequested = false
+
+	// Preserve pipeline state if active (implicit pipeline continues)
+	if m.pipelineRunning {
+		return
+	}
+
+	// Re-hydrate ledger from stash for new root allocations
+	if m.ledgerStash != nil {
+		if m.ledger == nil {
+			m.ledger = NewContextLedger()
+		}
+		m.ledger.restoreLedgerData(m.ledgerStash)
+		m.ledgerStash = nil
+	}
 }
 
 // handleReviewDollar routes $ sub-commands.
-// ModeReview: $test, $run, $fix
-// ModeInvestigate: $env, $trace, $diagnose
+// ModeReview: $test, $run, $fix, $log
+// ModeInvestigate: $env, $trace, $diagnose, $log
 // Sets reviewRunning synchronously so the view can render an immediate
 // spinner before the async agentStartMsg is processed.
 func (m *model) handleReviewDollar(line string) tea.Cmd {
 	action := strings.TrimSpace(line[1:])
 	mode := m.resolver.Current()
+
+	// ── $log — UNDER-THE-HOOD IMPLICIT PIPELINE ──────────────────────────
+	// $log evaluates a shell failure trace, fires the silent analysis pipeline
+	// (investigate → plan → build) without bouncing the UI between modes.
+	// The ContextLedger tracks issues silently via #number scoping.
+	//
+	// By default $log renders only telemetry and mutation logs matching the
+	// active #number context. Pass --all to show the full unfiltered history.
+	if action == "log" || strings.HasPrefix(action, "log ") {
+		rest := strings.TrimSpace(strings.TrimPrefix(action, "log"))
+		if rest == "" || rest == "--all" {
+			showAll := rest == "--all"
+			return m.runLogViewCmd(showAll)
+		}
+		return m.runLogCmd(rest)
+	}
 
 	// ── INTELLIGENT AUTO-TRANSITION: $fix from /review → /build ─────────
 	// When $fix is invoked inside /review, the system detects that Write/Patch
@@ -966,10 +1457,16 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 			m.Viewport.GotoBottom()
 			return nil
 		}
-		m.push(roleSystem, infoStyle.Render("[System] Auto-transitioning to /build mode for fix execution..."))
-		m.setMode(modes.ModeBuild)
-		rest := strings.TrimSpace(strings.TrimPrefix(action, "fix"))
-		return m.runFixCmd(rest)
+		if !m.resolver.Current().CanWrite() && !m.resolver.Current().CanPatch() {
+			m.cancelStaleAgentOps()
+			m.push(roleSystem, mutedStyle.Render("[System] Action rejected: Write access required. Please switch to '/build' mode to execute patches."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+		m.cancelStaleAgentOps()
+		m.push(roleSystem, infoStyle.Render("[System] Running under-the-hood pipeline: silent analysis → blueprint → build..."))
+		return m.runImplicitFixPipeline()
 	}
 
 	// ── $diagnose in /investigate — runs analysis; auto-transition to /build
@@ -991,7 +1488,7 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 	}
 
 	// ── ABSOLUTE STALE GOROUTINE RELEASE (ANTI-CORRUPTION) ───────────────
-	// Before spawning ANY new execution loop, kill/drain/cancel all previous
+	// Before spawning ANY new execution, kill/drain/cancel all previous
 	// background agents. This prevents stale tickMsg loops and structural
 	// goroutines from the previous $test/$run from corrupting the single-source
 	// model state — which causes the custom star spinner to mutate into defaults.
@@ -1006,7 +1503,7 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 		rest := strings.TrimSpace(strings.TrimPrefix(action, "test"))
 		cmd = m.runTestCmd(rest)
 
-	case mode == modes.ModeReview && (action == "run" || strings.HasPrefix(action, "run ")):
+	case mode == modes.ModeReview && (action == "run" || strings.HasPrefix(action, "run")):
 		m.reviewRunning = true
 		m.lastActionTime = time.Now()
 		rest := strings.TrimSpace(strings.TrimPrefix(action, "run"))
@@ -1032,9 +1529,9 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 	default:
 		switch mode {
 		case modes.ModeReview:
-			m.push(roleError, fmt.Sprintf("unknown review action: $%s (use $test, $run, or $fix)", action))
+			m.push(roleError, fmt.Sprintf("unknown review action: $%s (use $test, $run, $fix, or $log)", action))
 		case modes.ModeInvestigate:
-			m.push(roleError, fmt.Sprintf("unknown investigate action: $%s (use $env, $trace, $test, or $diagnose)", action))
+			m.push(roleError, fmt.Sprintf("unknown investigate action: $%s (use $env, $trace, $test, $diagnose, or $log)", action))
 		default:
 			m.push(roleError, fmt.Sprintf("$ sub-commands not available in /%s mode", mode))
 		}
@@ -1158,7 +1655,7 @@ func (m *model) runTraceCmd(target string) tea.Cmd {
 }
 
 // runDiagnoseCmd builds the RCA payload from accumulated forensic data
-// (LastFailureLog + $trace + $env) and dispatches it through streamCmd
+// (LastFailurePayload + $trace + $env) and dispatches it through streamCmd
 // with strict output schema constraints.
 func (m *model) runDiagnoseCmd() tea.Cmd {
 	content := m.buildDiagnoseContent()
@@ -1185,7 +1682,7 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 // buildDiagnoseContent assembles the LLM prompt from the handoff context.
 // Seeds strict RCA output schema and binds all collected forensic data.
 func (m *model) buildDiagnoseContent() string {
-	if m.handoffCtx.LastFailureLog == "" {
+	if m.handoffCtx.LastFailurePayload == "" {
 		return ""
 	}
 	var b strings.Builder
@@ -1198,7 +1695,7 @@ func (m *model) buildDiagnoseContent() string {
 	b.WriteString("- **Proposed Resolution:** [Concrete steps to alter code architecture/mutations]\n\n")
 	b.WriteString("---\n\n")
 	b.WriteString("## FORENSIC DATA\n\n")
-	b.WriteString(m.handoffCtx.LastFailureLog)
+	b.WriteString(m.handoffCtx.LastFailurePayload)
 	return b.String()
 }
 
@@ -1313,12 +1810,12 @@ func (m *model) updateActionChips() {
 	mode := m.resolver.Current()
 	switch mode {
 	case modes.ModeReview:
-		if m.handoffCtx.LastFailureLog != "" {
+		if m.handoffCtx.LastFailurePayload != "" {
 			m.activeChips = append(m.activeChips, actionChip{
 				key:    "alt+a",
 				label:  "Investigate Root Cause",
 				action: "/mode investigate",
-				query:  "Investigate root cause of the following failure:\n\n" + m.handoffCtx.LastFailureLog,
+				query:  "Investigate root cause of the following failure:\n\n" + m.handoffCtx.LastFailurePayload,
 			})
 			m.showChips = true
 		}
@@ -1361,7 +1858,7 @@ func (m *model) updateActionChips() {
 func (m *model) injectHandoffContext(mode modes.Mode) {
 	switch mode {
 	case modes.ModeInvestigate:
-		if m.handoffCtx.LastFailureLog != "" {
+		if m.handoffCtx.LastFailurePayload != "" {
 			m.push(roleSystem, "[System] Handoff context successfully injected into target mode.")
 		}
 

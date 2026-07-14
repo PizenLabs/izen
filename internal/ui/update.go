@@ -111,13 +111,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.agentLabel = ""
 			m.agentDone = true
 			m.lastActionTime = time.Time{}
+			m.sanitizeInputPrompt()
 			m.push(roleSystem, mutedStyle.Render("[safety] review action timed out — spinner force-cleared"))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 		}
-		if m.streaming || m.agentRunning || m.reviewRunning || m.state == StateProcessing || m.state == StateAwaitingApproval {
+
+		// SPINNER SANITY: if pipeline crashes mid-stream or a boundary
+		// refusal was triggered, drop spinnerFrame to 0 immediately so
+		// the braille spinner in the status bar shows no residual animation.
+		if m.spinnerFrame > 0 && !m.streaming && !m.agentRunning && !m.reviewRunning &&
+			m.state != StateProcessing && m.state != StateAwaitingApproval && !m.pipelineRunning {
+			m.spinnerFrame = 0
+		}
+
+		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning ||
+			m.state == StateProcessing || m.state == StateAwaitingApproval {
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
-			if m.streaming || m.agentRunning || m.reviewRunning || m.state == StateProcessing {
+			if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.state == StateProcessing {
 				m.refreshViewportContent()
 			}
 			return m, m.spinnerTickCmd()
@@ -137,6 +148,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
@@ -148,6 +160,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+msg.err.Error())
 			m.refreshViewportContent()
@@ -171,6 +184,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case graphBuiltMsg:
 		m.agentRunning = false
+		m.sanitizeInputPrompt()
 		if msg.err == nil && msg.graph != nil {
 			m.graph = msg.graph
 		}
@@ -185,6 +199,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "review error: "+msg.err.Error())
 			m.refreshViewportContent()
@@ -210,6 +225,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		m.lastTestOutput = msg.output
 		m.lastTestFailed = !msg.passed
 		m.lastTestTarget = ""
@@ -240,7 +256,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// ── Handoff: Capture failure context for mode pipeline ────────────
 		if !msg.passed && msg.output != "" {
-			m.handoffCtx.LastFailureLog = msg.output
+			m.handoffCtx.LastFailurePayload = msg.output
 			m.handoffCtx.TargetScope = m.lastTestTarget
 			m.updateActionChips()
 		}
@@ -268,12 +284,95 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		flush := m.flushPendingRecords()
 		return m, flush
 
+	case buildResultMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
+		m.lastTestOutput = msg.output
+		m.lastTestFailed = msg.exitCode != 0
+		if msg.err != nil {
+			m.push(roleError, "build execution error: "+msg.err.Error())
+		}
+		if msg.output != "" {
+			for _, line := range strings.Split(msg.output, "\n") {
+				if line == "" {
+					continue
+				}
+				m.push(roleSystem, line)
+			}
+		}
+		if msg.exitCode == 0 {
+			m.push(roleSystem, infoStyle.Render("[System] Execution Successful (Exit Code 0)"))
+		} else {
+			m.push(roleSystem, infoStyle.Render(fmt.Sprintf("[System] Execution Failed (Exit Code %d)", msg.exitCode)))
+		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		flush := m.flushPendingRecords()
+		return m, flush
+
+	case logInputMsg:
+		m.agentRunning = false
+		m.sanitizeInputPrompt()
+		if msg.err != nil {
+			m.reviewRunning = false
+			m.agentDone = true
+			m.agentLabel = ""
+			m.lastActionTime = time.Time{}
+			m.pipelineRunning = false
+			m.push(roleError, "$log: error: "+msg.err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+		return m, m.handleLogInput(msg)
+
+	case investigateCompleteMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
+		if msg.err != nil {
+			m.pipelineRunning = false
+			m.push(roleError, "silent analysis error: "+msg.err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+		m.push(roleSystem, infoStyle.Render(fmt.Sprintf("[System] Silent analysis complete [%s]. Proceeding to blueprint...", msg.ledgerID)))
+		return m, m.handleInvestigateComplete(msg)
+
+	case blueprintReadyMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
+		if msg.err != nil {
+			m.pipelineRunning = false
+			m.push(roleError, "blueprint error: "+msg.err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+		return m, m.handleBlueprintReady(msg)
+
 	case fixResultMsg:
 		m.agentRunning = false
 		m.reviewRunning = false
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "fix error: "+msg.err.Error())
 			m.refreshViewportContent()
@@ -294,6 +393,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "env diagnostics error: "+msg.err.Error())
 			m.refreshViewportContent()
@@ -301,11 +401,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
-		// Prepend env diagnostics to LastFailureLog for cumulative forensic data
-		if m.handoffCtx.LastFailureLog != "" {
-			m.handoffCtx.LastFailureLog = msg.content + "\n" + m.handoffCtx.LastFailureLog
+		// Prepend env diagnostics to LastFailurePayload for cumulative forensic data
+		if m.handoffCtx.LastFailurePayload != "" {
+			m.handoffCtx.LastFailurePayload = msg.content + "\n" + m.handoffCtx.LastFailurePayload
 		} else {
-			m.handoffCtx.LastFailureLog = msg.content
+			m.handoffCtx.LastFailurePayload = msg.content
 		}
 		m.push(roleSystem, msg.content)
 		m.refreshViewportContent()
@@ -319,6 +419,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "trace execution error: "+msg.err.Error())
 		}
@@ -347,7 +448,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Pipe execution log into handoff context for $diagnose
-		m.handoffCtx.LastFailureLog = msg.output
+		m.handoffCtx.LastFailurePayload = msg.output
 		m.handoffCtx.TargetScope = msg.target
 
 		statusLine := fmt.Sprintf("trace: %d total, %d failed — target %q", msg.total, msg.failed, msg.target)
@@ -369,6 +470,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "diagnosis error: "+msg.err.Error())
 			m.refreshViewportContent()
@@ -385,6 +487,28 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamParser = nil
 		flush := m.flushPendingRecords()
 		return m, tea.Batch(flush, m.streamCmd(msg.content))
+
+	case commitGeneratedMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.pipelineRunning = false
+		m.sanitizeInputPrompt()
+
+		if msg.err != nil {
+			m.push(roleError, "commit error: "+msg.err.Error())
+		} else {
+			result := fmt.Sprintf("Commit: %s · %s", msg.hash, msg.subject)
+			m.push(roleSystem, successBannerStyle.Render("[✓] "+result))
+		}
+
+		_ = m.sess.Save()
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		flush := m.flushPendingRecords()
+		return m, flush
 
 	case objectiveAnalyzedMsg:
 		if msg.err != nil {
@@ -621,6 +745,44 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Append the completed turn to PreRenderedHistory and freeze state.
 		m.push(roleAI, final)
+
+		// ── IMPLICIT PIPELINE INTERCEPT: pipe stream output to next step ──
+		if m.pipelineRunning {
+			if m.pipelineStep == "analyzing failure" || m.pipelineStep == "analyzing trace" {
+				// Step 1 complete → silently pipe analysis into plan blueprinting
+				m.pipelineStep = "blueprinting"
+				m.push(roleSystem, infoStyle.Render("[System] Pipeline Step 2/3 — Blueprint in progress..."))
+				m.handoffCtx.ProposedFix = final
+
+				var planCtx strings.Builder
+				planCtx.WriteString("## ANALYSIS OUTPUT\n\n")
+				planCtx.WriteString(final)
+				planCtx.WriteString("\n\n## INSTRUCTION\n")
+				planCtx.WriteString("Based on the analysis above, produce a precise execution plan with Markdown code ")
+				planCtx.WriteString("diff blocks or complete file replacements for each fix. Output the plan as a structured ")
+				planCtx.WriteString("task list with file targets and descriptions.\n")
+
+				flush := m.flushPendingRecords()
+				m.streamCh = nil
+				m.streaming = false
+				m.streamParser = nil
+				return m, tea.Batch(flush, m.streamCmd(planCtx.String()))
+			}
+
+			if m.pipelineStep == "blueprinting" && final != "" {
+				// Step 2 complete → blueprint is ready, jump to build execution
+				pipelineID := ""
+				if m.ledger != nil {
+					pipelineID = fmt.Sprintf("#%d", m.ledger.ActiveID)
+				}
+				m.pipelineRunning = false
+				m.push(roleSystem, infoStyle.Render(fmt.Sprintf("[System] Pipeline complete [%s]. Delegating to /build for execution...", pipelineID)))
+				flush := m.flushPendingRecords()
+				return m, tea.Batch(flush, func() tea.Msg {
+					return blueprintReadyMsg{blueprint: final, ledgerID: pipelineID}
+				})
+			}
+		}
 
 		// ── Handoff: Capture ProposedFix from investigate mode ──────────
 		if m.resolver.Current() == modes.ModeInvestigate && final != "" {

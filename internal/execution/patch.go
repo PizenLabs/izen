@@ -16,6 +16,7 @@ type Patch struct {
 	File      string    `json:"file"`
 	Original  string    `json:"original"`
 	Modified  string    `json:"modified"`
+	ContextID string    `json:"context_id,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	Applied   bool      `json:"applied"`
 }
@@ -168,8 +169,9 @@ func (pq *PatchQueue) Clear() {
 }
 
 type PatchManager struct {
-	root   string
-	patDir string
+	root      string
+	patDir    string
+	contextID string
 }
 
 func NewPatchManager(root string) *PatchManager {
@@ -177,6 +179,14 @@ func NewPatchManager(root string) *PatchManager {
 		root:   root,
 		patDir: filepath.Join(root, ".izen", "patches"),
 	}
+}
+
+func (pm *PatchManager) SetContextID(id string) {
+	pm.contextID = id
+}
+
+func (pm *PatchManager) ActiveContextID() string {
+	return pm.contextID
 }
 
 func (pm *PatchManager) Capture(file string) (*Patch, error) {
@@ -190,6 +200,7 @@ func (pm *PatchManager) Capture(file string) (*Patch, error) {
 		ID:        fmt.Sprintf("pat-%d", time.Now().UnixNano()),
 		File:      file,
 		Original:  string(data),
+		ContextID: pm.contextID,
 		CreatedAt: time.Now(),
 		Applied:   true,
 	}
@@ -199,6 +210,51 @@ func (pm *PatchManager) Capture(file string) (*Patch, error) {
 	}
 
 	return patch, nil
+}
+
+// createShadowBackup copies the current file to .izen/checkpoints/cp-<contextID>-backup/
+// before applying any mutation so the original state can be restored on compilation failure.
+func (pm *PatchManager) createShadowBackup(filePath string) error {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	backupDir := filepath.Join(pm.root, ".izen", "checkpoints", "cp-"+sanitizeCtxID(pm.contextID)+"-backup")
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		return err
+	}
+	backupPath := filepath.Join(backupDir, filepath.Base(filePath)+".orig")
+	return os.WriteFile(backupPath, data, 0644)
+}
+
+// appendMutationLog writes a mutation entry to .izen/audit/mutations.log with
+// the active #number as a metadata header for traceability.
+func (pm *PatchManager) appendMutationLog(file string, patchID string) error {
+	auditDir := filepath.Join(pm.root, ".izen", "audit")
+	if err := os.MkdirAll(auditDir, 0755); err != nil {
+		return err
+	}
+	logPath := filepath.Join(auditDir, "mutations.log")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	entry := fmt.Sprintf("[%s] context=%s file=%s patch=%s action=apply\n",
+		time.Now().UTC().Format(time.RFC3339),
+		pm.contextID,
+		file,
+		patchID,
+	)
+	_, err = f.WriteString(entry)
+	return err
+}
+
+func sanitizeCtxID(id string) string {
+	return strings.NewReplacer("#", "", "-", "_", "/", "_").Replace(id)
 }
 
 func (pm *PatchManager) Apply(patch *Patch) error {
@@ -230,6 +286,11 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		}
 	}
 
+	// Create shadow backup before mutation
+	if err := pm.createShadowBackup(fullPath); err != nil {
+		return fmt.Errorf("shadow backup %s: %w", patch.File, err)
+	}
+
 	var final string
 	switch {
 	case strings.Contains(patch.Modified, "@@"):
@@ -253,7 +314,13 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		return fmt.Errorf("write %s: %w", patch.File, err)
 	}
 
+	patch.ContextID = pm.contextID
 	patch.Applied = true
+
+	if err := pm.appendMutationLog(patch.File, patch.ID); err != nil {
+		return fmt.Errorf("patch applied but audit log failed: %w", err)
+	}
+
 	return pm.store(patch)
 }
 
