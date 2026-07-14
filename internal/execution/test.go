@@ -101,7 +101,7 @@ func (tr *TestRunner) writeTestRunLog(result *TestResult) error {
 }
 
 func sanitizeCtxFileName(id string) string {
-	return strings.NewReplacer("#", "", "-", "_", "/", "_").Replace(id)
+	return strings.NewReplacer("/", "_").Replace(id)
 }
 
 var (

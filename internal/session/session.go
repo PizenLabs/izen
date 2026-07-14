@@ -20,21 +20,22 @@ type Message struct {
 
 // Session represents a user session.
 type Session struct {
-	Objective       string            `json:"objective"`
-	ObjectiveState  *domain.Objective `json:"objective_state,omitempty"`
-	Mode            modes.Mode        `json:"mode"`
-	ContextID       string            `json:"context_id,omitempty"`
-	RunNumber       int               `json:"run_number"`
-	Assumptions     []string          `json:"assumptions,omitempty"`
-	Questions       []string          `json:"questions,omitempty"`
-	Checkpoints     []string          `json:"checkpoints,omitempty"`
-	InvestigationID string            `json:"investigation_id,omitempty"`
-	ReviewID        string            `json:"review_id,omitempty"`
-	CurrentTasks    []plan.Task       `json:"current_tasks,omitempty"`
-	CreatedAt       time.Time         `json:"created_at"`
-	UpdatedAt       time.Time         `json:"updated_at"`
-	History         []Message         `json:"history,omitempty"`
-	path            string
+	Objective          string            `json:"objective"`
+	ObjectiveState     *domain.Objective `json:"objective_state,omitempty"`
+	Mode               modes.Mode        `json:"mode"`
+	ContextID          string            `json:"context_id,omitempty"`
+	RunNumber          int               `json:"run_number"`
+	Assumptions        []string          `json:"assumptions,omitempty"`
+	Questions          []string          `json:"questions,omitempty"`
+	Checkpoints        []string          `json:"checkpoints,omitempty"`
+	InvestigationID    string            `json:"investigation_id,omitempty"`
+	ReviewID           string            `json:"review_id,omitempty"`
+	CurrentTasks       []plan.Task       `json:"current_tasks,omitempty"`
+	DiagnosticsSummary string            `json:"diagnostics_summary,omitempty"`
+	CreatedAt          time.Time         `json:"created_at"`
+	UpdatedAt          time.Time         `json:"updated_at"`
+	History            []Message         `json:"history,omitempty"`
+	path               string
 }
 
 // New creates a new session.
@@ -116,6 +117,27 @@ func (s *Session) Save() error {
 	return os.WriteFile(s.path, data, 0644)
 }
 
+// Reload re-reads the session state from disk, overwriting all in-memory
+// fields. Returns the underlying error if the file cannot be read or parsed.
+// The session path is preserved from the existing instance.
+func (s *Session) Reload() error {
+	path := s.path
+	if path == "" {
+		path = filepath.Join(".izen", "session.json")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var reloaded Session
+	if err := json.Unmarshal(data, &reloaded); err != nil {
+		return err
+	}
+	reloaded.path = path
+	*s = reloaded
+	return nil
+}
+
 // SetObjective sets the session objective.
 func (s *Session) SetObjective(obj string) {
 	s.Objective = obj
@@ -151,7 +173,9 @@ func (s *Session) ContextLabel() string {
 	return "no-context"
 }
 
-// TestRunLogPath returns the path for writing test run output for the active context.
+// TestRunLogPath returns the path for reading test run output for the active context.
+// The filename matches the pattern written by writeTestRunLog in internal/execution/test.go:
+// .izen/history/test_runs/#ctx-<ContextID>.log
 func (s *Session) TestRunLogPath() string {
 	return filepath.Join(".izen", "history", "test_runs", s.ContextLabel()+".log")
 }

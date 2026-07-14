@@ -334,3 +334,74 @@ func (s *sseReader) Close() error {
 	s.closed = true
 	return s.body.Close()
 }
+
+// ── Local SLM Bridge ──────────────────────────────────────────────────────────
+
+// DiagnoseSystemPrompt enforces strict single-line output from the local SLM so
+// the distilled diagnosis stays under 100 tokens with no markdown or fluff.
+const DiagnoseSystemPrompt = `You are a root cause analysis engine. Analyze the given error log and respond with a SINGLE concise sentence identifying the root cause. Do not exceed 100 tokens. Do not use markdown, bullet points, or conversational text. Output ONLY the one-sentence diagnosis.`
+
+type ollamaGenerateRequest struct {
+	Model   string `json:"model"`
+	Prompt  string `json:"prompt"`
+	System  string `json:"system,omitempty"`
+	Stream  bool   `json:"stream"`
+	Options *struct {
+		NumPredict int `json:"num_predict"`
+	} `json:"options,omitempty"`
+}
+
+type ollamaGenerateResponse struct {
+	Model    string `json:"model"`
+	Response string `json:"response"`
+	Done     bool   `json:"done"`
+	Context  []int  `json:"context,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+// Generate calls Ollama's native /api/generate endpoint with streaming disabled.
+// Returns the generated text or an error. Thread-safe via the underlying HTTP client.
+func (p *OllamaProvider) Generate(ctx context.Context, system, prompt string) (string, error) {
+	body := ollamaGenerateRequest{
+		Model:  p.model,
+		Prompt: prompt,
+		System: system,
+		Stream: false,
+		Options: &struct {
+			NumPredict int `json:"num_predict"`
+		}{NumPredict: 100},
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return "", fmt.Errorf("ollama generate: marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/api/generate", bytes.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("ollama generate: create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("ollama generate: connection failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("ollama generate: status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var genResp ollamaGenerateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&genResp); err != nil {
+		return "", fmt.Errorf("ollama generate: decode response: %w", err)
+	}
+
+	if genResp.Error != "" {
+		return "", fmt.Errorf("ollama generate: model error: %s", genResp.Error)
+	}
+
+	return genResp.Response, nil
+}

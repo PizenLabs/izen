@@ -995,6 +995,32 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		flush := m.flushPendingRecords()
 		return m, flush
 
+	case TaskFinishedMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.pipelineRunning = false
+		m.pipelineStep = ""
+		m.streaming = false
+		m.streamCh = nil
+		if m.streamCancel != nil {
+			m.streamCancel()
+			m.streamCancel = nil
+		}
+		m.streamBuffer = ""
+		m.currentStreamContent = ""
+		m.streamTickActive = false
+		m.interruptRequested = false
+		m.spinnerFrame = 0
+		m.ti.Focus()
+		m.sanitizeInputPrompt()
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		flush := m.flushPendingRecords()
+		return m, flush
+
 	case traceUpdateMsg:
 		m.currentTrace = msg.trace
 		return m, nil
@@ -1034,16 +1060,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		// AI INTERRUPT ENGINE: Ctrl+D cancels an active LLM stream.
-		if m.streaming && msg.Type == tea.KeyCtrlD {
-			if m.streamCancel != nil {
-				m.streamCancel()
-			}
-			m.streamCancel = nil
-			m.interruptRequested = true
-			m.push(roleSystem, "[System] Generation interrupted by user.")
-			return m, nil
-		}
 
 		// ── Action Chip Hotkeys (alt+ modifier only) ─────────────────────
 		// Single-character hotkeys are strictly banned to prevent key

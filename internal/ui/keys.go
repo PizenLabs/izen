@@ -4,6 +4,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/PizenLabs/izen/internal/execution"
 )
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -128,36 +130,51 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Handle Escape key requiring three presses to quit (unless help is showing)
 	if msg.Type == tea.KeyEscape {
 		if m.showHelpOverlay {
 			m.showHelpOverlay = false
 			return m, nil
 		}
-		m.escPressCount++
-		if m.escPressCount >= 3 {
-			m.escPressCount = 0
-			if m.showSuggestions {
-				m.dismissSuggestions()
-				return m, nil
-			}
+		if m.showSuggestions {
+			m.dismissSuggestions()
+			return m, nil
+		}
+		if m.streaming && m.streamCancel != nil {
+			m.streamCancel()
+			m.streamCancel = nil
+			m.interruptRequested = true
+			return m, func() tea.Msg { return TaskFinishedMsg{} }
+		}
+		m.ti.SetValue("")
+		m.ti.Reset()
+		m.syncInputFromTI()
+		return m, nil
+	}
+
+	switch msg.Type {
+	case tea.KeyCtrlD:
+		if m.ti.Value() == "" && !m.agentRunning && !m.streaming && !m.reviewRunning && !m.pipelineRunning {
+			execution.KillAllOrphans()
 			m.sess.SetMode(m.resolver.Current())
 			_ = m.sess.Save()
 			return m, tea.Quit
 		}
 		return m, nil
-	}
-	m.escPressCount = 0
 
-	switch msg.Type {
 	case tea.KeyCtrlC:
 		if m.showSuggestions {
 			m.dismissSuggestions()
 			return m, nil
 		}
-		m.sess.SetMode(m.resolver.Current())
-		_ = m.sess.Save()
-		return m, tea.Quit
+		if m.agentRunning || m.streaming || m.reviewRunning || m.pipelineRunning {
+			execution.KillAllOrphans()
+			m.push(roleSystem, infoStyle.Render("[System] Execution interrupted by Ctrl+C"))
+			return m, func() tea.Msg { return TaskFinishedMsg{} }
+		}
+		m.ti.SetValue("")
+		m.ti.Reset()
+		m.syncInputFromTI()
+		return m, nil
 
 		// ── Enter: submit (only when autocomplete is NOT active) ───────────────
 		// STALE-VIEWPORT GUARD: Every submission path MUST call

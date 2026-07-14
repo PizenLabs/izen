@@ -423,6 +423,13 @@ type providerSwitchMsg struct {
 	name string
 }
 
+// TaskFinishedMsg is a forced-termination signal that systematically unblocks
+// the input state by clearing all agent/stream/review flags. Dispatched via
+// defer at the end of every blocking execution command ($trace, $env, $test,
+// $run, $diagnose, $log) to guarantee cleanup even on panic or hang.
+// Also dispatched by the Ctrl+C hard-override handler.
+type TaskFinishedMsg struct{}
+
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 type model struct {
@@ -516,9 +523,6 @@ type model struct {
 	history      []string
 	historyIndex int
 	historyPath  string
-
-	// Escape key press counter for quit
-	escPressCount int
 
 	// Mode-line animation
 	lineAnimProgress   float64
