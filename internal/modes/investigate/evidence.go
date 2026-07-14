@@ -163,6 +163,7 @@ func isStackFrameLine(s string) bool {
 
 type Evidence struct {
 	ID         string         `json:"id"`
+	ContextID  string         `json:"context_id,omitempty"`
 	Source     EvidenceSource `json:"source"`
 	Content    string         `json:"content"`
 	File       string         `json:"file,omitempty"`
@@ -183,9 +184,14 @@ func NewEvidenceStore() *EvidenceStore {
 }
 
 func (es *EvidenceStore) Add(source EvidenceSource, content, file string, line int, confidence float64) *Evidence {
+	return es.AddWithContext("", source, content, file, line, confidence)
+}
+
+func (es *EvidenceStore) AddWithContext(ctxID string, source EvidenceSource, content, file string, line int, confidence float64) *Evidence {
 	es.nextID++
 	ev := &Evidence{
 		ID:         fmt.Sprintf("EV%d", es.nextID),
+		ContextID:  ctxID,
 		Source:     source,
 		Content:    content,
 		File:       file,
@@ -198,7 +204,7 @@ func (es *EvidenceStore) Add(source EvidenceSource, content, file string, line i
 }
 
 func (es *EvidenceStore) AddWithStrategy(source EvidenceSource, content, file string, line int, confidence float64, strategy string) *Evidence {
-	ev := es.Add(source, content, file, line, confidence)
+	ev := es.AddWithContext("", source, content, file, line, confidence)
 	ev.Strategy = strategy
 	return ev
 }

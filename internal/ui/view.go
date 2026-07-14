@@ -43,6 +43,16 @@ const (
 	dropdownTwoColThreshold = 56 // <  : collapse file autocomplete to a single column
 )
 
+// renderContextHeader renders a collapsible #number context header at the top
+// of the viewport when an active context ID is set.
+func (m *model) renderContextHeader() string {
+	if m.sess == nil || m.sess.ContextID == "" {
+		return ""
+	}
+	label := accentStyle.Render("▸ " + m.sess.ContextLabel())
+	return label + "\n"
+}
+
 // View returns the full UI state.
 // Uses lipgloss.JoinVertical for a rigid bottom-up box model with zero gaps:
 //

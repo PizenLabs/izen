@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 )
 
 type RunResult struct {
@@ -18,10 +20,54 @@ type RunResult struct {
 	Dir      string `json:"dir"`
 }
 
+type processEntry struct {
+	cmd       *exec.Cmd
+	contextID string
+}
+
+var (
+	procMu      sync.Mutex
+	procEntries []processEntry
+)
+
+func registerProcess(cmd *exec.Cmd, ctxID string) {
+	procMu.Lock()
+	defer procMu.Unlock()
+	procEntries = append(procEntries, processEntry{cmd: cmd, contextID: ctxID})
+}
+
+func unregisterProcess(cmd *exec.Cmd) {
+	procMu.Lock()
+	defer procMu.Unlock()
+	for i, e := range procEntries {
+		if e.cmd == cmd {
+			procEntries = append(procEntries[:i], procEntries[i+1:]...)
+			return
+		}
+	}
+}
+
+func KillOrphanedByContext(ctxID string) {
+	procMu.Lock()
+	defer procMu.Unlock()
+	var alive []processEntry
+	for _, e := range procEntries {
+		if e.contextID == ctxID {
+			if e.cmd != nil && e.cmd.Process != nil {
+				_ = e.cmd.Process.Signal(syscall.SIGKILL)
+			}
+			continue
+		}
+		alive = append(alive, e)
+	}
+	procEntries = alive
+}
+
 type Runner struct {
-	sandbox bool
-	confirm bool
-	root    string
+	sandbox     bool
+	confirm     bool
+	root        string
+	activeCtxID string
 }
 
 func NewRunner(root string, sandbox, confirm bool) *Runner {
@@ -30,6 +76,14 @@ func NewRunner(root string, sandbox, confirm bool) *Runner {
 		sandbox: sandbox,
 		confirm: confirm,
 	}
+}
+
+func (r *Runner) SetContextID(id string) {
+	r.activeCtxID = id
+}
+
+func (r *Runner) ActiveContextID() string {
+	return r.activeCtxID
 }
 
 func (r *Runner) Run(command string) (*RunResult, error) {
@@ -70,8 +124,10 @@ func (r *Runner) run(command, dir string) (*RunResult, error) {
 		}
 	}
 
-	cmd := exec.CommandContext(context.Background(), "sh", "-c", command)
+	ctx := context.Background()
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -82,18 +138,39 @@ func (r *Runner) run(command, dir string) (*RunResult, error) {
 		Dir:     dir,
 	}
 
+	registerProcess(cmd, r.activeCtxID)
+
 	if err := cmd.Run(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
 		} else {
+			unregisterProcess(cmd)
 			return result, err
 		}
 	}
 
+	unregisterProcess(cmd)
 	result.Stdout = strings.TrimSpace(stdout.String())
 	result.Stderr = strings.TrimSpace(stderr.String())
 	return result, nil
+}
+
+func (r *Runner) KillOrphans() {
+	if r.activeCtxID != "" {
+		KillOrphanedByContext(r.activeCtxID)
+	}
+}
+
+func KillAllOrphans() {
+	procMu.Lock()
+	defer procMu.Unlock()
+	for _, e := range procEntries {
+		if e.cmd != nil && e.cmd.Process != nil {
+			_ = e.cmd.Process.Signal(syscall.SIGKILL)
+		}
+	}
+	procEntries = nil
 }
 
 var dangerousPatterns = []string{

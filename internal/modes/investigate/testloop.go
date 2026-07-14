@@ -10,21 +10,23 @@ var ErrWriteForbidden = errors.New("investigate mode: write operations are forbi
 var ErrPatchForbidden = errors.New("investigate mode: patch generation is forbidden")
 
 type TestResultSummary struct {
-	Package string       `json:"package"`
-	Passed  bool         `json:"passed"`
-	Total   int          `json:"total"`
-	PassedN int          `json:"passed_n"`
-	FailedN int          `json:"failed_n"`
-	Skipped int          `json:"skipped"`
-	Failed  []string     `json:"failed,omitempty"`
-	Output  string       `json:"output,omitempty"`
-	Frames  []StackFrame `json:"frames,omitempty"`
+	Package   string       `json:"package"`
+	ContextID string       `json:"context_id,omitempty"`
+	Passed    bool         `json:"passed"`
+	Total     int          `json:"total"`
+	PassedN   int          `json:"passed_n"`
+	FailedN   int          `json:"failed_n"`
+	Skipped   int          `json:"skipped"`
+	Failed    []string     `json:"failed,omitempty"`
+	Output    string       `json:"output,omitempty"`
+	Frames    []StackFrame `json:"frames,omitempty"`
 }
 
 const hardLoopCeiling = 3
 
 type TestLoop struct {
 	maxIterations int
+	contextID     string
 }
 
 func NewTestLoop(maxIterations int) *TestLoop {
@@ -32,6 +34,10 @@ func NewTestLoop(maxIterations int) *TestLoop {
 		maxIterations = hardLoopCeiling
 	}
 	return &TestLoop{maxIterations: maxIterations}
+}
+
+func (tl *TestLoop) SetContextID(id string) {
+	tl.contextID = id
 }
 
 type TestExecutor interface {
@@ -63,6 +69,10 @@ func (tl *TestLoop) Run(exec TestExecutor, cfg testLoopConfig) (*TestResultSumma
 
 	if err != nil {
 		return result, fmt.Errorf("test execution: %w", err)
+	}
+
+	if result != nil && tl.contextID != "" {
+		result.ContextID = tl.contextID
 	}
 
 	return result, nil

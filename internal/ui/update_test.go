@@ -12,6 +12,7 @@ func TestUpdateSuggestionsRebuildsViewportHeightImmediately(t *testing.T) {
 		height:     40,
 		resolver:   modes.NewResolver(),
 		showBanner: false,
+		ledger:     NewContextLedger(),
 	}
 
 	m.input.WriteString("/")

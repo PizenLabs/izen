@@ -23,6 +23,8 @@ type Session struct {
 	Objective       string            `json:"objective"`
 	ObjectiveState  *domain.Objective `json:"objective_state,omitempty"`
 	Mode            modes.Mode        `json:"mode"`
+	ContextID       string            `json:"context_id,omitempty"`
+	RunNumber       int               `json:"run_number"`
 	Assumptions     []string          `json:"assumptions,omitempty"`
 	Questions       []string          `json:"questions,omitempty"`
 	Checkpoints     []string          `json:"checkpoints,omitempty"`
@@ -139,6 +141,19 @@ func (s *Session) ObjectiveIntent() string {
 // SetMode sets the session mode.
 func (s *Session) SetMode(m modes.Mode) {
 	s.Mode = m
+}
+
+// ContextLabel returns a concise human-readable label for the active context.
+func (s *Session) ContextLabel() string {
+	if s.ContextID != "" {
+		return s.ContextID
+	}
+	return "no-context"
+}
+
+// TestRunLogPath returns the path for writing test run output for the active context.
+func (s *Session) TestRunLogPath() string {
+	return filepath.Join(".izen", "history", "test_runs", s.ContextLabel()+".log")
 }
 
 // StageTaskList stores a markdown-parsed task list in the session and persists to disk.

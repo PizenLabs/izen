@@ -128,6 +128,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		attachedFiles:       make([]string, 0),
 		execEng:             execEng,
 		planStore:           planStore,
+		ledger:              NewContextLedger(),
 		ti:                  ti,
 		showBanner:          true,
 		IsCloudModel:        cfg.ActiveProviderName() != "ollama",

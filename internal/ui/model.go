@@ -118,6 +118,31 @@ type archDoneMsg struct {
 	Content string
 }
 
+// ── Implicit Pipeline Messages ─────────────────────────────────────────────────
+
+// logInputMsg is the payload for the $log sub-command. Carries a shell
+// execution trace output for silent investigate→plan→build routing.
+type logInputMsg struct {
+	output string // raw shell/execution output
+	err    error
+}
+
+// investigateCompleteMsg signals that the silent investigation step has
+// completed and produced a structured analysis payload for the plan step.
+type investigateCompleteMsg struct {
+	analysis string // parsed stack trace and diagnostic context
+	ledgerID string // the #number assigned by the ContextLedger
+	err      error
+}
+
+// blueprintReadyMsg signals that the plan step has completed and the
+// code patch blueprint is ready for explicit build execution.
+type blueprintReadyMsg struct {
+	blueprint string // assembled markdown diff/patch blueprint
+	ledgerID  string // the #number assigned by the ContextLedger
+	err       error
+}
+
 type mutationResultMsg struct {
 	err    error
 	file   string
@@ -181,15 +206,167 @@ type diagnoseResultMsg struct {
 	err     error
 }
 
+// ── Context Ledger ─────────────────────────────────────────────────────────────
+
+// IssueScope tracks a single failure context with a numeric ID and optional
+// child sub-scopes for overlapping crash signatures.
+type IssueScope struct {
+	ID         int      `json:"id"`
+	Suffix     string   `json:"suffix,omitempty"` // e.g. "sub" for overlapping crashes
+	Files      []string `json:"files,omitempty"`  // files referenced in the crash
+	StackTrace string   `json:"stack_trace,omitempty"`
+	Label      string   `json:"label,omitempty"` // human-readable label
+}
+
+// ActiveID returns the formatted ledger key (e.g. "#101" or "#101-sub").
+func (s *IssueScope) ActiveID() string {
+	if s.Suffix != "" {
+		return fmt.Sprintf("#%d-%s", s.ID, s.Suffix)
+	}
+	return fmt.Sprintf("#%d", s.ID)
+}
+
+// ContextLedger maintains silent issue tracking across failure sessions
+// without forcing UI view state mutations. It maps #number IDs to failure
+// scopes and handles suffix-based sub-scoping.
+type ContextLedger struct {
+	ActiveID     int                    `json:"active_id"`
+	Counter      int                    `json:"counter"`
+	Entries      map[string]*IssueScope `json:"entries"`
+	lastFiles    []string               // files from the most recent crash
+	lastStackSig string                 // fingerprint of the last stack trace
+}
+
+// NewContextLedger creates a fresh ledger starting at #100.
+func NewContextLedger() *ContextLedger {
+	return &ContextLedger{
+		ActiveID: 100,
+		Counter:  100,
+		Entries:  make(map[string]*IssueScope),
+	}
+}
+
+// Record registers a crash signature. If the files/stack overlap with the
+// previously recorded crash, a child sub-scope is used. Otherwise a new
+// root issue is minted. Returns the assigned ledger key.
+func (cl *ContextLedger) Record(files []string, stackTrace string) string {
+	stackSig := stackTraceFingerprint(stackTrace)
+
+	overlap := cl.filesOverlap(files)
+	sameStack := cl.lastStackSig != "" && cl.lastStackSig == stackSig
+
+	var scope *IssueScope
+	if overlap || sameStack {
+		if entry, ok := cl.Entries[fmt.Sprintf("#%d", cl.ActiveID)]; ok && entry != nil {
+			scope = &IssueScope{
+				ID:         cl.ActiveID,
+				Suffix:     "sub",
+				Files:      files,
+				StackTrace: stackTrace,
+			}
+			cl.Entries[scope.ActiveID()] = scope
+			cl.lastFiles = files
+			cl.lastStackSig = stackSig
+			return scope.ActiveID()
+		}
+	}
+	cl.Counter++
+	cl.ActiveID = cl.Counter
+	scope = &IssueScope{
+		ID:         cl.ActiveID,
+		Files:      files,
+		StackTrace: stackTrace,
+	}
+	cl.Entries[scope.ActiveID()] = scope
+
+	cl.lastFiles = files
+	cl.lastStackSig = stackSig
+	return scope.ActiveID()
+}
+
+// filesOverlap checks whether the new crash touches files from the last one.
+func (cl *ContextLedger) filesOverlap(files []string) bool {
+	lastSet := make(map[string]struct{}, len(cl.lastFiles))
+	for _, f := range cl.lastFiles {
+		lastSet[f] = struct{}{}
+	}
+	for _, f := range files {
+		if _, ok := lastSet[f]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// ResetForNewRoot clears sub-contexts and prepares for a new root scope.
+func (cl *ContextLedger) ResetForNewRoot() {
+	for key, scope := range cl.Entries {
+		if scope.Suffix != "" {
+			delete(cl.Entries, key)
+		}
+	}
+	cl.lastFiles = nil
+	cl.lastStackSig = ""
+}
+
+// stashLedgerData returns the current ledger entries for memo during
+// stale agent op cancellation.
+func (cl *ContextLedger) stashLedgerData() *ContextLedger {
+	if cl == nil {
+		return nil
+	}
+	cpy := &ContextLedger{
+		ActiveID:     cl.ActiveID,
+		Counter:      cl.Counter,
+		Entries:      make(map[string]*IssueScope, len(cl.Entries)),
+		lastFiles:    cl.lastFiles,
+		lastStackSig: cl.lastStackSig,
+	}
+	for k, v := range cl.Entries {
+		scope := *v
+		cpy.Entries[k] = &scope
+	}
+	return cpy
+}
+
+// restoreLedgerData restores the ledger from a stashed copy.
+func (cl *ContextLedger) restoreLedgerData(stashed *ContextLedger) {
+	if stashed == nil {
+		return
+	}
+	cl.ActiveID = stashed.ActiveID
+	cl.Counter = stashed.Counter
+	cl.Entries = stashed.Entries
+	cl.lastFiles = stashed.lastFiles
+	cl.lastStackSig = stashed.lastStackSig
+}
+
+// stackTraceFingerprint creates a simple hash of the stack trace for comparison.
+func stackTraceFingerprint(trace string) string {
+	lines := strings.SplitN(trace, "\n", 8)
+	if len(lines) > 6 {
+		lines = lines[:6]
+	}
+	var key strings.Builder
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l != "" {
+			key.WriteString(l)
+			key.WriteString("|")
+		}
+	}
+	return key.String()
+}
+
 // ── Handoff Context ───────────────────────────────────────────────────────────
 
 // HandoffContext carries state across mode boundaries for the smart handoff
 // pipeline. Every terminal state primes the context for the next mode.
 type HandoffContext struct {
-	LastFailureLog string   // Compile errors, test stack traces, or panic traces
-	ProposedFix    string   // Populated by investigate/plan (markdown/diff format)
-	TargetScope    string   // Target directory or file currently in focus
-	PendingTodos   []string // TODO strings passed down to /mode plan
+	LastFailurePayload string   // Compile errors, test stack traces, or panic traces
+	ProposedFix        string   // Populated by investigate/plan (markdown/diff format)
+	TargetScope        string   // Target directory or file currently in focus
+	PendingTodos       []string // TODO strings passed down to /mode plan
 }
 
 // actionChip represents a selectable action rendered at the bottom boundary
@@ -403,6 +580,19 @@ type model struct {
 	// Build verification flag: set after build mutation auto-test
 	buildVerifyPending bool
 
+	// Context Ledger: silent issue tracking across failure sessions
+	ledger *ContextLedger
+
+	// Implicit pipeline state: prevents UI view bouncing during silent
+	// investigate→plan→build flow.
+	pipelineRunning bool
+
+	// Stashed ledger data for preservation during cancelStaleAgentOps
+	ledgerStash *ContextLedger
+
+	// Label for the active pipeline step (used for spinner display only)
+	pipelineStep string
+
 	// Workspace root path for config/session persistence
 	workspaceRoot string
 
@@ -570,6 +760,11 @@ func (m *model) refreshViewportContent() {
 	if m.showBanner && len(m.records) == 0 {
 		content.WriteString(m.renderStartupBanner(m.width))
 		content.WriteString("\n")
+	}
+
+	ctxHeader := m.renderContextHeader()
+	if ctxHeader != "" {
+		content.WriteString(ctxHeader)
 	}
 
 	if m.PreRenderedHistory != "" {

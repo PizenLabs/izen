@@ -1,14 +1,26 @@
 package context
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
+)
+
+var (
+	ctxSeq    atomic.Int64
+	initSeqDo sync.Once
 )
 
 type Builder struct {
@@ -19,12 +31,51 @@ type Builder struct {
 }
 
 func NewBuilder(root string, g *graph.Graph, ge *git.Engine, sess *session.Session) *Builder {
+	initSeqOnce()
 	return &Builder{
 		root:    root,
 		graph:   g,
 		git:     ge,
 		session: sess,
 	}
+}
+
+func initSeqOnce() {
+	initSeqDo.Do(func() {
+		seq := loadSeqFromSession()
+		ctxSeq.Store(seq)
+	})
+}
+
+func loadSeqFromSession() int64 {
+	s, err := session.Load()
+	if err != nil || s == nil {
+		return 0
+	}
+	return int64(s.RunNumber)
+}
+
+func detectLang() string {
+	if _, err := os.Stat("go.mod"); err == nil {
+		return "go"
+	}
+	if _, err := os.Stat("Cargo.toml"); err == nil {
+		return "rs"
+	}
+	if _, err := os.Stat("package.json"); err == nil {
+		return "js"
+	}
+	return "unknown"
+}
+
+func compilerVersion() string {
+	return runtime.Version()
+}
+
+func GenerateContextID(lang string) string {
+	seq := ctxSeq.Add(1)
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	return fmt.Sprintf("#ctx-%s-%s-r%d", lang, ts, seq)
 }
 
 type BuildRequest struct {
@@ -38,10 +89,23 @@ type BuildRequest struct {
 }
 
 func (b *Builder) Build(req BuildRequest) *Context {
+	lang := detectLang()
+	ctxID := GenerateContextID(lang)
+	runNum := int(ctxSeq.Load())
+
 	ctx := &Context{
-		Objective: b.session.Objective,
-		Mode:      b.session.Mode.String(),
-		Query:     req.Query,
+		Objective:       b.session.Objective,
+		Mode:            b.session.Mode.String(),
+		Query:           req.Query,
+		ContextID:       ctxID,
+		RunNumber:       runNum,
+		CompilerPayload: compilerVersion(),
+	}
+
+	b.session.ContextID = ctxID
+	b.session.RunNumber = runNum
+	if err := b.session.Save(); err != nil {
+		ctx.Errors = append(ctx.Errors, fmt.Sprintf("session save: %v", err))
 	}
 
 	if req.MaxFiles == 0 {
