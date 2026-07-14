@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/PizenLabs/izen/internal/ai"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/domain"
 	objengine "github.com/PizenLabs/izen/internal/engine"
@@ -25,6 +27,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
@@ -42,6 +45,10 @@ var validSystemCommands = map[string]struct{}{
 	"/checkpoint": {},
 	"/arch":       {},
 }
+
+// ansiRe strips terminal ANSI escape color codes (e.g. \x1b[31m) that can
+// corrupt regex-based stack frame parsers in auto-trace.
+var ansiRe = regexp.MustCompile("\x1b\\[[0-9;]*[a-zA-Z]")
 
 func (m *model) handleInput(line string) tea.Cmd {
 	line = strings.TrimSpace(line)
@@ -447,7 +454,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render(""))
 		m.push(roleSystem, labelBoldStyle.Render("investigate sub-commands ($)"))
 		m.push(roleSystem, infoStyle.Render("  $env            capture environment diagnostics"))
-		m.push(roleSystem, infoStyle.Render("  $trace <fn>     live execution trace with -race"))
+		m.push(roleSystem, infoStyle.Render("  $trace [fn]     live execution trace with -race (auto from context log)"))
 		m.push(roleSystem, infoStyle.Render("  $diagnose       root cause analysis from forensic data"))
 		m.push(roleSystem, infoStyle.Render("  $log            evaluate shell trace & run implicit pipeline"))
 		m.push(roleSystem, "")
@@ -773,6 +780,29 @@ func (m *model) runTestEngine(target string) tea.Cmd {
 		if err != nil && output == "" {
 			output = err.Error()
 			passed = false
+		}
+
+		// ── Compile/Build failure detection ───────────────────────────────
+		// When `go test` encounters a build error (syntax, missing import, etc.)
+		// it exits non-zero with 0 tests run. Treat this as an active diagnostic
+		// event: generate a Context ID, persist the session, and write the log
+		// so $trace can find it.
+		isCompileFailure := result != nil && result.ExitCode != 0 && totalCount == 0 && failedCount == 0
+		if isCompileFailure && m.sess != nil {
+			ctxID := ctxpkg.GenerateContextID("go")
+			m.sess.ContextID = ctxID
+			m.sess.RunNumber++
+			_ = m.sess.Save()
+		}
+
+		// Persist test output to context log file for auto-trace ($trace without args)
+		if m.sess != nil && m.sess.ContextID != "" {
+			logPath := m.sess.TestRunLogPath()
+			if logDir := filepath.Dir(logPath); logDir != "" {
+				if mkErr := os.MkdirAll(logDir, 0755); mkErr == nil {
+					_ = os.WriteFile(logPath, []byte(output), 0644)
+				}
+			}
 		}
 
 		return testResultMsg{
@@ -1222,84 +1252,6 @@ func (m *model) handleLogInput(msg logInputMsg) tea.Cmd {
 	return tea.Batch(flush, m.streamCmd(msg.output))
 }
 
-// ── $fix implicit pipeline: investigate → plan → build (no UI bouncing) ──────
-// runImplicitFixPipeline executes the three-step silent analysis flow when $fix
-// is invoked from /review or globally. The UI does NOT flash between modes.
-func (m *model) runImplicitFixPipeline() tea.Cmd {
-	m.cancelStaleAgentOps()
-	m.pipelineRunning = true
-	m.pipelineStep = "analyzing failure"
-
-	if m.lastTestOutput == "" {
-		m.pipelineRunning = false
-		m.push(roleError, "no previous test/run output available — run $test or $run first")
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return nil
-	}
-
-	return tea.Batch(
-		func() tea.Msg { return agentStartMsg{label: "fix pipeline: analyze"} },
-		func() tea.Msg {
-			output := m.lastTestOutput
-			frames := investigate.ParseStackFrames(output)
-
-			// Register with ContextLedger
-			if m.ledger == nil {
-				m.ledger = NewContextLedger()
-			}
-			var files []string
-			for _, f := range frames {
-				files = append(files, f.File)
-			}
-			if len(files) > 50 {
-				files = files[:50]
-			}
-			ledgerID := m.ledger.Record(files, output)
-			m.push(roleSystem, infoStyle.Render(fmt.Sprintf("[System] Pipeline registered as %s — running silent analysis.", ledgerID)))
-
-			var fixCtx strings.Builder
-			fmt.Fprintf(&fixCtx, "## FAILURE LOG [%s]\n\n```\n", ledgerID)
-			fixCtx.WriteString(output)
-			fixCtx.WriteString("\n```\n\n")
-
-			if len(frames) > 0 {
-				fixCtx.WriteString("## STACK TRACE → SOURCE PROXIMITY\n\n")
-				slicer := investigate.NewProximitySlicer(".", 10)
-				seen := make(map[string]bool)
-				for _, frame := range frames {
-					key := fmt.Sprintf("%s:%d", frame.File, frame.Line)
-					if seen[key] {
-						continue
-					}
-					seen[key] = true
-					slice := slicer.Extract(frame)
-					if slice != nil {
-						fmt.Fprintf(&fixCtx, "### %s:%d\n\n```go\n", slice.File, slice.Line)
-						for _, cline := range slice.Context {
-							fixCtx.WriteString(cline)
-							fixCtx.WriteString("\n")
-						}
-						fixCtx.WriteString("```\n\n")
-					}
-				}
-			}
-
-			if m.lastTestTarget != "" {
-				fmt.Fprintf(&fixCtx, "**Target:** `%s`\n\n", m.lastTestTarget)
-			}
-
-			fixCtx.WriteString("## PIPELINE INSTRUCTION — STEP 1 (SILENT ANALYSIS)\n")
-			fixCtx.WriteString("Analyze the test failure(s) above. Identify the root cause in the source code. ")
-			fixCtx.WriteString("Output a structured diagnosis with: root cause, evidence, and proposed resolution.\n")
-
-			m.reviewRunning = true
-			m.lastActionTime = time.Now()
-			return investigateCompleteMsg{analysis: fixCtx.String(), ledgerID: ledgerID}
-		},
-	)
-}
-
 // handleInvestigateComplete receives the silent analysis and pipes it into plan.
 // Step 2: silent blueprinting. No UI mode transition occurs.
 func (m *model) handleInvestigateComplete(msg investigateCompleteMsg) tea.Cmd {
@@ -1468,28 +1420,23 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 		return m.runLogCmd(rest)
 	}
 
-	// ── INTELLIGENT AUTO-TRANSITION: $fix from /review → /build ─────────
-	// When $fix is invoked inside /review, the system detects that Write/Patch
-	// capabilities are required and seamlessly transitions to /build mode,
-	// carrying the failure context forward for autonomous fix execution.
+	// ── $fix BLOCKED IN /review (Post-Fix Verification — Read-Only) ─────
+	// $fix requires write access which /review mode explicitly denies.
 	if mode == modes.ModeReview && (action == "fix" || strings.HasPrefix(action, "fix ")) {
-		if m.lastTestOutput == "" {
-			m.cancelStaleAgentOps()
-			m.push(roleError, "no previous test/run output available — run $test or $run first")
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			return nil
-		}
-		if !m.resolver.Current().CanWrite() && !m.resolver.Current().CanPatch() {
-			m.cancelStaleAgentOps()
-			m.push(roleSystem, mutedStyle.Render("[System] Action rejected: Write access required. Please switch to '/build' mode to execute patches."))
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			return nil
-		}
 		m.cancelStaleAgentOps()
-		m.push(roleSystem, infoStyle.Render("[System] Running under-the-hood pipeline: silent analysis → blueprint → build..."))
-		return m.runImplicitFixPipeline()
+		m.push(roleSystem, mutedStyle.Render("[System] Action rejected: Write access required. Please switch to '/build' mode to execute patches."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+
+	// ── $fix BLOCKED IN /investigate (Read-Only Diagnostics) ────────────
+	if mode == modes.ModeInvestigate && (action == "fix" || strings.HasPrefix(action, "fix ")) {
+		m.cancelStaleAgentOps()
+		m.push(roleError, "unknown investigate action: $fix")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
 	}
 
 	// ── $diagnose in /investigate — runs analysis; auto-transition to /build
@@ -1541,22 +1488,68 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 		m.reviewRunning = true
 		m.lastActionTime = time.Now()
 		rest := strings.TrimSpace(strings.TrimPrefix(action, "trace"))
-		if rest == "" {
-			m.reviewRunning = false
-			m.lastActionTime = time.Time{}
-			m.push(roleError, "usage: $trace <TestFunctionName>")
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			return nil
+		isAutoTrace := rest == "" || strings.TrimSpace(rest) == ""
+		if isAutoTrace {
+			// Force disk reload: the ContextID may have been written by a
+			// previous engine run (e.g. $test) that the in-memory session
+			// hasn't picked up yet.
+			_ = m.sess.Reload()
+			if m.sess.ContextID == "" {
+				m.reviewRunning = false
+				m.lastActionTime = time.Time{}
+				m.push(roleError, "[System Error] No active Context ID found. Please run $test first to execute diagnostic verification and generate a context session.")
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return nil
+			}
+			logPath := m.sess.TestRunLogPath()
+			data, err := os.ReadFile(logPath)
+			if err != nil {
+				m.reviewRunning = false
+				m.lastActionTime = time.Time{}
+				m.push(roleError, fmt.Sprintf("[System Error] Failed to read log at %s: %v", logPath, err))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return nil
+			}
+			if len(data) == 0 {
+				m.reviewRunning = false
+				m.lastActionTime = time.Time{}
+				m.push(roleError, "[System Error] Log file located but 0 stack trace frames parsed. Raw log size: 0 bytes.")
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return nil
+			}
+			logStr := string(data)
+			frames := investigate.ParseStackFrames(logStr)
+			if len(frames) == 0 {
+				m.reviewRunning = false
+				m.lastActionTime = time.Time{}
+				m.push(roleError, fmt.Sprintf("[System Error] Log file located but 0 stack trace frames parsed. Raw log size: %d bytes.", len(data)))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return nil
+			}
+			logStr = ansiRe.ReplaceAllString(logStr, "")
+			cmd = m.runAutoTraceCmd(logStr)
+			break
 		}
 		cmd = m.runTraceCmd(rest)
+
+	case mode == modes.ModeBuild && (action == "fix" || strings.HasPrefix(action, "fix ")):
+		m.reviewRunning = true
+		m.lastActionTime = time.Now()
+		rest := strings.TrimSpace(strings.TrimPrefix(action, "fix"))
+		cmd = m.runFixCmd(rest)
 
 	default:
 		switch mode {
 		case modes.ModeReview:
-			m.push(roleError, fmt.Sprintf("unknown review action: $%s (use $test, $run, $fix, or $log)", action))
+			m.push(roleError, fmt.Sprintf("unknown review action: $%s (use $test, $run, or $log)", action))
 		case modes.ModeInvestigate:
 			m.push(roleError, fmt.Sprintf("unknown investigate action: $%s (use $env, $trace, $test, $diagnose, or $log)", action))
+		case modes.ModeBuild:
+			m.push(roleError, fmt.Sprintf("unknown build action: $%s (use $fix)", action))
 		default:
 			m.push(roleError, fmt.Sprintf("$ sub-commands not available in /%s mode", mode))
 		}
@@ -1689,29 +1682,12 @@ func (m *model) runTraceCmd(target string) tea.Cmd {
 	)
 }
 
-// runDiagnoseCmd builds the RCA payload from accumulated forensic data
-// (LastFailurePayload + $trace + $env) and dispatches it through streamCmd
-// with strict output schema constraints.
-func (m *model) runDiagnoseCmd() tea.Cmd {
-	content := m.buildDiagnoseContent()
-	if content == "" {
-		return tea.Batch(
-			func() (msg tea.Msg) {
-				defer func() {
-					if r := recover(); r != nil {
-						msg = TaskFinishedMsg{}
-					}
-				}()
-				m.push(roleError, "$diagnose: no forensic data available — run $env and $trace first")
-				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
-				return agentDoneMsg{}
-			},
-		)
-	}
+// runAutoTraceCmd parses a saved test log and renders the local Call Stack
+// trace using the graph AST proximity slicer, without re-running the test.
+func (m *model) runAutoTraceCmd(logData string) tea.Cmd {
 	return tea.Batch(
 		func() tea.Msg {
-			return agentStartMsg{label: "rca analysis"}
+			return agentStartMsg{label: "auto-trace from context log"}
 		},
 		func() (msg tea.Msg) {
 			defer func() {
@@ -1719,29 +1695,157 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 					msg = TaskFinishedMsg{}
 				}
 			}()
-			return diagnoseResultMsg{content: content}
+
+			frames := investigate.ParseStackFrames(logData)
+			failedCount := 0
+			totalCount := 0
+			for _, line := range strings.Split(logData, "\n") {
+				if strings.Contains(line, "--- FAIL:") {
+					failedCount++
+				}
+				if strings.Contains(line, "--- PASS:") {
+					totalCount++
+				}
+			}
+			totalCount += failedCount
+			passed := failedCount == 0
+
+			output := logData
+			callStackRendered := false
+			if len(frames) > 0 && m.graph != nil {
+				var b strings.Builder
+				b.WriteString("## CALL STACK TRACE (from saved context log)\n\n")
+				slicer := investigate.NewProximitySlicer(".", 10)
+				seen := make(map[string]bool)
+				for _, frame := range frames {
+					key := fmt.Sprintf("%s:%d", frame.File, frame.Line)
+					if seen[key] {
+						continue
+					}
+					seen[key] = true
+					slice := slicer.Extract(frame)
+					if slice != nil {
+						callStackRendered = true
+						fmt.Fprintf(&b, "### %s:%d\n\n```go\n", slice.File, slice.Line)
+						for _, cline := range slice.Context {
+							b.WriteString(cline)
+							b.WriteString("\n")
+						}
+						b.WriteString("```\n\n")
+					}
+				}
+				if callStackRendered {
+					output = b.String() + "---\n" + output
+				}
+			}
+			if !callStackRendered {
+				output = fmt.Sprintf("[System Error] Log file located but 0 stack trace frames parsed. Raw log size: %d bytes.\n---\n%s", len(logData), logData)
+			}
+
+			return traceResultMsg{
+				output: output,
+				target: "(auto-trace from context log)",
+				passed: passed,
+				failed: failedCount,
+				total:  totalCount,
+				err:    nil,
+			}
 		},
 	)
 }
 
-// buildDiagnoseContent assembles the LLM prompt from the handoff context.
-// Seeds strict RCA output schema and binds all collected forensic data.
-func (m *model) buildDiagnoseContent() string {
-	if m.handoffCtx.LastFailurePayload == "" {
-		return ""
-	}
-	var b strings.Builder
-	b.WriteString("You are a Root Cause Analysis engine operating under strict Evidence-First principles.\n")
-	b.WriteString("You MUST NOT write casual conversation, ask clarifying questions, or provide generic advice.\n")
-	b.WriteString("You MUST adhere strictly to the following normalized Markdown schema in your response:\n\n")
-	b.WriteString("### 🚨 RUNTIME ROOT CAUSE ANALYSED\n")
-	b.WriteString("- **Issue Detected:** [Concise architectural description of the failure]\n")
-	b.WriteString("- **Runtime Evidence:** [Extracted log line, panic frame, or memory state culprit]\n")
-	b.WriteString("- **Proposed Resolution:** [Concrete steps to alter code architecture/mutations]\n\n")
-	b.WriteString("---\n\n")
-	b.WriteString("## FORENSIC DATA\n\n")
-	b.WriteString(m.handoffCtx.LastFailurePayload)
-	return b.String()
+// runDiagnoseCmd reads the active context error log and runs it through the
+// local SLM bridge (Ollama /api/generate) for a distilled one-sentence root
+// cause diagnosis. The result is stored in the session and rendered on the TUI.
+func (m *model) runDiagnoseCmd() tea.Cmd {
+	m.reviewRunning = true
+	m.lastActionTime = time.Now()
+
+	return tea.Batch(
+		func() tea.Msg {
+			return agentStartMsg{label: "local slm diagnosis"}
+		},
+		func() (msg tea.Msg) {
+			defer func() {
+				if r := recover(); r != nil {
+					msg = TaskFinishedMsg{}
+				}
+			}()
+
+			// Sync session from disk, then check for an active context.
+			_ = m.sess.Reload()
+			if m.sess.ContextID == "" {
+				m.push(roleError, "[System Error] No active diagnostic context found. Run $test or $trace first.")
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return agentDoneMsg{}
+			}
+
+			// Read the error log for the active context.
+			logPath := m.sess.TestRunLogPath()
+			logData, err := os.ReadFile(logPath)
+			if err != nil {
+				m.push(roleError, fmt.Sprintf("[System Error] Failed to read error log at %s: %v", logPath, err))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return agentDoneMsg{}
+			}
+			if len(logData) == 0 {
+				m.push(roleError, "[System Error] Error log is empty — no diagnostic data to analyze.")
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return agentDoneMsg{}
+			}
+
+			// Use the SAME unified provider interface that /ask relies on
+			// (m.provider.Execute / ExecuteStream). Do NOT type-assert to a
+			// concrete *OllamaProvider — that assertion is what produced the
+			// false-positive "provider unreachable" error. Reusing the shared
+			// interface guarantees the exact provider configuration, model tag
+			// binding (m.cfg.ActiveModelName()), and base URL context that lets
+			// /ask execute successfully.
+			if m.provider == nil {
+				m.push(roleError, "[System Error] No AI provider is configured. Run /provider to select one.")
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return agentDoneMsg{}
+			}
+
+			// Run the diagnosis through the unified client router.
+			resp, err := m.provider.Execute(context.Background(), ai.Request{
+				Model: m.cfg.ActiveModelName(),
+				Messages: []ai.Message{
+					{Role: "user", Content: string(logData)},
+				},
+				Stream: false,
+				System: providers.DiagnoseSystemPrompt,
+			})
+			if err != nil {
+				m.push(roleError, fmt.Sprintf("[System Error] Diagnosis failed: %v", err))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return agentDoneMsg{}
+			}
+			diagnosis := ""
+			if resp != nil {
+				diagnosis = resp.Content
+			}
+
+			// Store in session and persist.
+			m.sess.DiagnosticsSummary = diagnosis
+			_ = m.sess.Save()
+
+			// Render the diagnosis on the TUI.
+			m.push(roleSystem, fmt.Sprintf("[Local SLM Diagnosis] %s", diagnosis))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+
+			// Also store in handoff context for downstream mode pipelines.
+			m.handoffCtx.LastFailurePayload = diagnosis
+
+			return agentDoneMsg{}
+		},
+	)
 }
 
 // shellFirewall checks a shell command against the security guard rail.
