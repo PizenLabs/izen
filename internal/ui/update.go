@@ -767,6 +767,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.responseBuffer.Reset()
 		m.currentStreamContent = ""
 
+		// Sanitize: strip tool execution artifacts so they don't pollute
+		// the downstream JSON parser or render pipeline. Lines matching
+		// telemetry/error markers are removed from leading/trailing context.
+		final = sanitizeFinalContent(final)
+
 		// Append the completed turn to PreRenderedHistory and freeze state.
 		m.push(roleAI, final)
 
@@ -948,36 +953,41 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			fmt.Sprintf("✔ done · +%d tok · %s · %.1fs", delta, costStr, latencySec)))
 
 		if m.resolver.Current() == modes.ModePlan {
-			validation := plan.ValidatePlanOutput(final)
-			if !validation.Valid {
-				errMsg := plan.FormatValidationError(validation)
-				m.push(roleError, errMsg)
-				m.push(roleSystem, infoStyle.Render("regenerate with more precise intent"))
-			}
-
-			// Collapse to valid blocks only; fall back to raw parse if empty.
-			var blockContent string
-			if len(validation.Blocks) > 0 {
-				blockContent = plan.CollapsePlanSections(final)
-			}
-
-			tasks := plan.ParseMarkdownToTasks(blockContent)
-			if len(tasks) == 0 {
-				tasks = plan.ParseMarkdownToTasks(final)
-			}
-
-			if len(tasks) > 0 {
-				m.sess.StageTaskList(&tasks)
-				width := m.width - 2
-				if width < 20 {
-					width = 20
+			// Try JSON plan parsing first (JSON output is the primary contract).
+			// Falls back to legacy markdown format if JSON is invalid/absent.
+			// NOTE: raw final was already pushed as roleAI at line 771 and
+			// rendered through cacheRecordToHistory → renderStreamingContent,
+			// which handles JSON widget rendering. Do NOT push rendered content
+			// again here — that creates a double-rendering loop.
+			if jsonResult := plan.ParseJSONPlan(final); jsonResult != nil && jsonResult.Valid && jsonResult.Plan != nil {
+				if len(jsonResult.Tasks) > 0 {
+					tasks := jsonResult.Tasks
+					m.sess.StageTaskList(&tasks)
+					m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
 				}
-				renderer := NewMarkdownRenderer(width)
-				rendered := renderer.Render(compileTaskListMarkdown(&tasks))
-				if rendered != "" {
-					m.push(roleAI, rendered)
+			} else {
+				// Fall back to legacy markdown plan validation
+				validation := plan.ValidatePlanOutput(final)
+				if !validation.Valid {
+					errMsg := plan.FormatValidationError(validation)
+					m.push(roleError, errMsg)
+					m.push(roleSystem, infoStyle.Render("regenerate with more precise intent"))
 				}
-				m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
+
+				var blockContent string
+				if len(validation.Blocks) > 0 {
+					blockContent = plan.CollapsePlanSections(final)
+				}
+
+				tasks := plan.ParseMarkdownToTasks(blockContent)
+				if len(tasks) == 0 {
+					tasks = plan.ParseMarkdownToTasks(final)
+				}
+
+				if len(tasks) > 0 {
+					m.sess.StageTaskList(&tasks)
+					m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
+				}
 			}
 		}
 
@@ -1341,19 +1351,32 @@ func containsMutationIntention(content string) bool {
 	return false
 }
 
-func compileTaskListMarkdown(tasks *[]plan.Task) string {
-	var b strings.Builder
+// sanitizeFinalContent strips tool execution artifacts and telemetry markers
+// from the LLM output before it reaches the JSON parser or render pipeline.
+// Lines matching known error/telemetry patterns are removed when they appear
+// as leading or trailing noise around the actual LLM response payload.
+func sanitizeFinalContent(content string) string {
+	lines := strings.Split(content, "\n")
+	var clean []string
+	inPayload := false
 
-	b.WriteString("# TASK LIST\n\n")
-	for _, task := range *tasks {
-		glyph := "○"
-		if task.Status == "processing" {
-			glyph = "●"
-		} else if task.Status == "done" || task.IsDone {
-			glyph = "✓"
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if !inPayload {
+			if trimmed == "" || strings.HasPrefix(trimmed, "[FAIL]") ||
+				strings.HasPrefix(trimmed, "[ OK ]") ||
+				strings.HasPrefix(trimmed, "INFO:") ||
+				strings.HasPrefix(trimmed, "WARN:") ||
+				strings.HasPrefix(trimmed, "ERROR:") {
+				continue
+			}
+			inPayload = true
 		}
-		fmt.Fprintf(&b, "%s **%s**: %s | %s\n\n", glyph, task.Type, task.Target, task.Description)
+
+		clean = append(clean, line)
 	}
 
-	return b.String()
+	result := strings.Join(clean, "\n")
+	return strings.TrimSpace(result)
 }

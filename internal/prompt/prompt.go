@@ -12,7 +12,13 @@ INSTRUCTIONS:
 - Do NOT attempt to fix the bug. Do NOT generate patches, diffs, or code changes.
 - Your output is handed directly to /plan mode for remediation.
 - Be decisive: if the evidence strongly supports a hypothesis (>70% confidence), conclude immediately.
-- If the evidence is weak after 3 iterations, emit the best hypothesis as a tentative conclusion.`
+- If the evidence is weak after 3 iterations, emit the best hypothesis as a tentative conclusion.
+
+NEGATIVE CONSTRAINTS (strictly forbidden outputs):
+- DO NOT generate any task checklists, JSON plan objects, execution blueprints, or numbered remediation steps.
+- DO NOT propose file mutation strategies (ATOMIC_REPLACE, DIFF_PATCH, etc.).
+- DO NOT output JSON objects with "atomic_tasks", "recovery_checklist", or "architectural_strategy" fields.
+- Your job ends at locating and describing the failure root cause. Any output that resembles an execution plan will violate the system boundary between /investigate and /plan.`
 }
 
 func ForMode(mode string) string {
