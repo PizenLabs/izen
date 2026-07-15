@@ -157,6 +157,18 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	m.loadHistory()
 	m.historyIndex = len(m.history)
 
+	// ── WIRE ACTIVITY LOGGERS ────────────────────────────────────────────
+	// The model's logActivity method is injected as the callback for every
+	// package that performs internal file system / search / binary actions.
+	// This guarantees every ReadFile, Grep/Search, and lx invocation is
+	// immediately visible in the chat viewport as a styled system line.
+	activityFn := func(format string, args ...interface{}) {
+		m.logActivity(format, args...)
+	}
+	retrieval.SetActivityLogger(activityFn)
+	lynx.SetActivityLogger(activityFn)
+	execution.SetActivityLogger(activityFn)
+
 	return tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 }
 

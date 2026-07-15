@@ -51,6 +51,7 @@ const (
 	roleError
 	roleCode
 	roleStatus
+	roleActivity
 )
 
 type UIState uint8
@@ -674,6 +675,26 @@ func (m *model) setApplyError(text string) {
 
 // ── Record helpers ─────────────────────────────────────────────────────────────
 
+// logActivity appends a system activity record and forces an immediate
+// viewport redraw so the user sees every internal tool invocation in
+// real time — even during streaming (bypasses the PreRenderedHistory
+// streaming freeze).
+func (m *model) logActivity(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	r := record{role: roleActivity, text: msg}
+	m.records = append(m.records, r)
+	if m.width > 0 {
+		rendered := m.renderRecordForViewport(r)
+		if rendered != "" {
+			m.PreRenderedHistory += rendered + "\n"
+		}
+	}
+	m.refreshViewportContent()
+	if m.Ready && !m.userIsScrollingUp {
+		m.Viewport.GotoBottom()
+	}
+}
+
 // push appends a record. Records are flushed to the terminal's native
 // scrollback at explicit sync points (user submit, stream done, etc.).
 func (m *model) push(r role, text string) {
@@ -718,6 +739,8 @@ func (m *model) renderRecordForViewport(rec record) string {
 		return userHeader + userBgStyle.Render(paddedText)
 	case roleAI:
 		return m.renderAIResponseBlocks(rec.text, width)
+	case roleActivity:
+		return m.styleActivityLine(rec.text)
 	default:
 		return rec.text
 	}

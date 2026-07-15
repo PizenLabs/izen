@@ -234,11 +234,18 @@ func (r *Retriever) executeTier(tier Tier, query Query) *ResultSet {
 }
 
 func (r *Retriever) executeLynxSearch(query Query) *ResultSet {
+	if globalActivityLog != nil {
+		globalActivityLog("[system] spawning engine: lx --search %q", query.Text)
+	}
+
 	rawResults, err := globalLynx.SearchRaw(query.Text)
 	if err == nil && globalCompressor != nil && len(rawResults) > 0 {
 		rawResults = globalCompressor.CompressResults(rawResults)
 	}
 	if err != nil {
+		if globalActivityLog != nil {
+			globalActivityLog("[FAIL] lx --search %q: %v", query.Text, err)
+		}
 		return &ResultSet{
 			Strategy:   "lynx.semantic",
 			Confidence: 0,
@@ -262,12 +269,24 @@ func (r *Retriever) executeLynxSearch(query Query) *ResultSet {
 	if !rs.Empty() {
 		rs.Confidence = ConfSemantic.Float64()
 	}
+
+	if globalActivityLog != nil && !rs.Empty() {
+		globalActivityLog("[ OK ] lx --search %q: %d results", query.Text, len(rs.Results))
+	}
+
 	return rs
 }
 
 func (r *Retriever) executeLynxResolve(query Query) *ResultSet {
+	if globalActivityLog != nil {
+		globalActivityLog("[system] spawning engine: lx --resolve %q", query.Symbol)
+	}
+
 	rawResults, err := globalLynx.ResolveSymbolRaw(query.Symbol)
 	if err != nil {
+		if globalActivityLog != nil {
+			globalActivityLog("[FAIL] lx --resolve %q: %v", query.Symbol, err)
+		}
 		return &ResultSet{
 			Strategy:   "lynx.resolve",
 			Confidence: 0,
@@ -290,6 +309,10 @@ func (r *Retriever) executeLynxResolve(query Query) *ResultSet {
 	}
 	if !rs.Empty() {
 		rs.Confidence = ConfFuzzy.Float64()
+	}
+
+	if globalActivityLog != nil && !rs.Empty() {
+		globalActivityLog("[ OK ] lx --resolve %q: %d results", query.Symbol, len(rs.Results))
 	}
 	return rs
 }

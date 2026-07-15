@@ -166,6 +166,14 @@ var (
 	// Semantic renderer diff styles
 	semanticAddStyle    = lipgloss.NewStyle().Background(lipgloss.Color("#18302b")).Foreground(lipgloss.Color("#6cd0a1"))
 	semanticNormalStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+
+	// System Activity Log Style — Catppuccin Mocha Dimmed.
+	// Highly muted faint gray so logs flow seamlessly without
+	// bloating the main chat aesthetic. [ OK ] and [ FAIL ] tags
+	// within the text are colorized separately in the view layer.
+	systemActivityStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(colorDimmed)).
+				Faint(true)
 )
 
 // ── Hotkey Highlight Styles (Keyboard-Only Execution) ─────────────────────────
@@ -276,6 +284,8 @@ func gutterFor(r role) string {
 		return gutterStatusStyle.Render("│") + " "
 	case roleSystem:
 		return gutterSysStyle.Render("│") + " "
+	case roleActivity:
+		return "  " // no gutter — activity logs are visually recessive
 	default:
 		return "  "
 	}

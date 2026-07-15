@@ -23,10 +23,21 @@ func NewFallbackChain(root string) *FallbackChain {
 func (fc *FallbackChain) Glob(pattern string) *ResultSet {
 	rs := &ResultSet{Strategy: "glob.file"}
 
+	if globalActivityLog != nil {
+		globalActivityLog("[system] glob: %s", pattern)
+	}
+
 	matches, err := filepath.Glob(filepath.Join(fc.root, pattern))
 	if err != nil {
 		rs.Error = err.Error()
+		if globalActivityLog != nil {
+			globalActivityLog("[FAIL] glob: %s: %v", pattern, err)
+		}
 		return rs
+	}
+
+	if globalActivityLog != nil {
+		globalActivityLog("[ OK ] glob: %s (%d matches)", pattern, len(matches))
 	}
 
 	for _, m := range matches {
@@ -51,6 +62,10 @@ func (fc *FallbackChain) Glob(pattern string) *ResultSet {
 func (fc *FallbackChain) Ripgrep(pattern string, filePattern string) *ResultSet {
 	rs := &ResultSet{Strategy: "rg.pattern"}
 
+	if globalActivityLog != nil {
+		globalActivityLog("[system] rg: %s", pattern)
+	}
+
 	args := []string{"--no-heading", "-n", pattern}
 	if filePattern != "" {
 		args = append(args, "-g", filePattern)
@@ -68,6 +83,9 @@ func (fc *FallbackChain) Ripgrep(pattern string, filePattern string) *ResultSet 
 			}
 		}
 		rs.Error = err.Error()
+		if globalActivityLog != nil {
+			globalActivityLog("[FAIL] rg: %s: %v", pattern, err)
+		}
 		return rs
 	}
 
@@ -95,6 +113,10 @@ func (fc *FallbackChain) Ripgrep(pattern string, filePattern string) *ResultSet 
 func (fc *FallbackChain) Grep(pattern string) *ResultSet {
 	rs := &ResultSet{Strategy: "grep.text"}
 
+	if globalActivityLog != nil {
+		globalActivityLog("[system] grep: %s", pattern)
+	}
+
 	cmd := exec.CommandContext(context.Background(), "grep", "-rn", pattern, fc.root)
 	cmd.Dir = fc.root
 
@@ -107,6 +129,9 @@ func (fc *FallbackChain) Grep(pattern string) *ResultSet {
 			}
 		}
 		rs.Error = err.Error()
+		if globalActivityLog != nil {
+			globalActivityLog("[FAIL] grep: %s: %v", pattern, err)
+		}
 		return rs
 	}
 
@@ -134,11 +159,22 @@ func (fc *FallbackChain) Grep(pattern string) *ResultSet {
 func (fc *FallbackChain) ReadFile(path string) *ResultSet {
 	rs := &ResultSet{Strategy: "read.file"}
 
+	if globalActivityLog != nil {
+		globalActivityLog("[system] read file: %s", path)
+	}
+
 	fullPath := filepath.Join(fc.root, path)
 	data, err := os.ReadFile(fullPath)
 	if err != nil {
 		rs.Error = err.Error()
+		if globalActivityLog != nil {
+			globalActivityLog("[FAIL] read file: %s: %v", path, err)
+		}
 		return rs
+	}
+
+	if globalActivityLog != nil {
+		globalActivityLog("[ OK ] read file: %s (%d bytes)", path, len(data))
 	}
 
 	rs.Add(Score(ConfText, Result{
@@ -156,6 +192,10 @@ func (fc *FallbackChain) ReadFile(path string) *ResultSet {
 
 func (fc *FallbackChain) ReadLines(path string, startLine, endLine int) *ResultSet {
 	rs := &ResultSet{Strategy: "read.file"}
+
+	if globalActivityLog != nil {
+		globalActivityLog("[system] read file: %s (lines %d-%d)", path, startLine, endLine)
+	}
 
 	fullPath := filepath.Join(fc.root, path)
 	file, err := os.Open(fullPath)

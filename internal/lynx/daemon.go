@@ -54,6 +54,10 @@ func (p *Process) Start() error {
 		return fmt.Errorf("mkdir .lynx: %w", err)
 	}
 
+	if globalActivityLog != nil {
+		globalActivityLog("[system] spawning engine: lx --storage-path %s mcp", storageDir)
+	}
+
 	p.doneCh = make(chan struct{})
 	p.cmd = exec.CommandContext(context.Background(), binPath, "--storage-path", storageDir, "mcp")
 	p.cmd.Dir = p.root
@@ -77,6 +81,9 @@ func (p *Process) Start() error {
 	p.stderr = stderr
 
 	if err := p.cmd.Start(); err != nil {
+		if globalActivityLog != nil {
+			globalActivityLog("[FAIL] lx daemon start: %v", err)
+		}
 		return fmt.Errorf("start lynx: %w", err)
 	}
 
@@ -85,6 +92,10 @@ func (p *Process) Start() error {
 
 	go p.captureStderr()
 	go p.waitForExit()
+
+	if globalActivityLog != nil {
+		globalActivityLog("[ OK ] lx daemon started (pid %d)", p.cmd.Process.Pid)
+	}
 
 	return nil
 }
@@ -249,9 +260,18 @@ func (d *Daemon) Stop() error {
 		return nil
 	}
 
+	if globalActivityLog != nil {
+		globalActivityLog("[system] stopping lx daemon")
+	}
+
 	err := d.process.Stop()
 	d.process = nil
 	d.client = nil
+
+	if globalActivityLog != nil && err == nil {
+		globalActivityLog("[ OK ] lx daemon stopped")
+	}
+
 	return err
 }
 
