@@ -172,13 +172,26 @@ type PatchManager struct {
 	root      string
 	patDir    string
 	contextID string
+	guardrail *MutationGuardrail
 }
 
 func NewPatchManager(root string) *PatchManager {
 	return &PatchManager{
-		root:   root,
-		patDir: filepath.Join(root, ".izen", "patches"),
+		root:      root,
+		patDir:    filepath.Join(root, ".izen", "patches"),
+		guardrail: NewMutationGuardrail(root),
 	}
+}
+
+// SetGuardrail attaches a MutationGuardrail used to halt infinite autofix
+// loops before a structural patch is committed. Passing nil disables it.
+func (pm *PatchManager) SetGuardrail(g *MutationGuardrail) {
+	pm.guardrail = g
+}
+
+// Guardrail returns the attached MutationGuardrail (may be nil).
+func (pm *PatchManager) Guardrail() *MutationGuardrail {
+	return pm.guardrail
 }
 
 func (pm *PatchManager) SetContextID(id string) {
@@ -282,6 +295,19 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 
 	if globalActivityLog != nil {
 		globalActivityLog("⚙ [system] applying structural patch to: %s ...", patch.File)
+	}
+
+	// Mutation guardrail: halt infinite autofix loops BEFORE any structural
+	// change is committed. This runs after pure validation but before the
+	// shadow backup / write, so a detected loop cannot cause further mutation.
+	if pm.guardrail != nil {
+		decision := pm.guardrail.Check(patch.File, pm.contextID)
+		if decision.Halt {
+			if globalActivityLog != nil {
+				globalActivityLog("%s", decision.Message())
+			}
+			return fmt.Errorf("%s", decision.Message())
+		}
 	}
 
 	if patch.Original == "" {
