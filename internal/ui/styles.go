@@ -163,9 +163,6 @@ var (
 				BorderForeground(lipgloss.Color(colorSubtle)).
 				Padding(1, 2)
 
-	// Widget box
-	widgetTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
-
 	// Catppuccin Mocha soft interrupt indicator
 	interruptLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMaroon)).Faint(true)
 
@@ -177,7 +174,6 @@ var (
 // ── Hotkey Highlight Styles (Keyboard-Only Execution) ─────────────────────────
 var (
 	hotkeyStyle        = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMauve))
-	hotkeyHintStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 	tracerStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 	successBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreen))
 	failureBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
@@ -192,22 +188,23 @@ var (
 )
 
 func renderHotkeyPromptWithToggle(width int) string {
-	hk := hotkeyStyle.Render
-	hint := hotkeyHintStyle.Render
-	text := hint("Press ") + hk("Alt+A") + hint(" to accept   ") +
-		hk("Alt+L") + hint(" to allow all   ") +
-		hk("Alt+R") + hint(" to reject   ") +
-		hk("Alt+P") + hint(" to toggle   ") +
-		hk("j/k") + hint(" to navigate")
+	action := boldTextStyle.Render
+	hk := dimmedStyle.Render
+
+	text := "› " + action("Accept") + " " + hk("Alt+A") + "  " +
+		action("Allow All") + " " + hk("Alt+L") + "  " +
+		action("Reject") + " " + hk("Alt+R") + "  " +
+		action("Toggle View") + " " + hk("Alt+P") + "  " +
+		action("Navigate") + " " + hk("j/k")
+
 	if lipgloss.Width(text) > width {
-		text = hint("Press ") + hk("Alt+A") + hint(" acc  ") +
-			hk("Alt+L") + hint(" all  ") +
-			hk("Alt+R") + hint(" rej  ") +
-			hk("Alt+P") + hint(" tog  ") +
-			hk("j/k") + hint(" nav")
+		text = "› " + action("Accept") + " " + hk("Alt+A") + "  " +
+			action("Allow") + " " + hk("Alt+L") + "  " +
+			action("Reject") + " " + hk("Alt+R") + "  " +
+			action("Toggle") + " " + hk("Alt+P") + "  " +
+			action("Nav") + " " + hk("j/k")
 		if lipgloss.Width(text) > width {
-			text = hint(" ") + hk("Alt+A/L/R/P") + hint(" act  ") +
-				hk("j/k") + hint(" nav")
+			text = "› " + action("Acc/Rej/Tog") + " " + hk("Alt+A/R/P")
 		}
 	}
 	return text
@@ -273,15 +270,15 @@ var SpinnerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))
 func gutterFor(r role) string {
 	switch r {
 	case roleUser:
-		return gutterUserStyle.Render("▌") + " "
+		return gutterUserStyle.Render("│") + " "
 	case roleAI:
-		return gutterAIStyle.Render("▌") + " "
+		return gutterAIStyle.Render("│") + " "
 	case roleError:
-		return gutterErrorStyle.Render("▌") + " "
+		return gutterErrorStyle.Render("│") + " "
 	case roleStatus:
-		return gutterStatusStyle.Render("▌") + " "
+		return gutterStatusStyle.Render("│") + " "
 	case roleSystem:
-		return gutterSysStyle.Render("╎") + " "
+		return gutterSysStyle.Render("│") + " "
 	default:
 		return "  "
 	}

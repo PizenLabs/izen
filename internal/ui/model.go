@@ -378,18 +378,6 @@ type HandoffContext struct {
 	PendingTodos       []string // TODO strings passed down to /mode plan
 }
 
-// actionChip represents a selectable action rendered at the bottom boundary
-// of the TUI. Hotkey activation executes the associated command.
-// IMPORTANT: All chip keys MUST use "alt+<key>" format to prevent key
-// collisions with normal text input in the prompt chat. Single-letter
-// hotkey bindings are strictly banned.
-type actionChip struct {
-	key    string // Hotkey specifier (e.g. "alt+a", "alt+b") — NO single-letter keys
-	label  string // Display label (e.g. "Investigate Root Cause")
-	action string // Command to execute (e.g. "/mode investigate")
-	query  string // Optional seed content passed with the command
-}
-
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const (
@@ -411,11 +399,6 @@ var utilityCommands = map[modes.Mode][]string{
 
 var globalCommands = []string{"/help", "/?", "/mode", "/objective", "/drop", "/quit", "/arch"}
 
-// ── IZEN Star-Shape Spinner Frames ─────────────────────────────────────────
-// Custom star/asterisk frames designed to be preserved across all rendering
-// paths. NEVER overridden by ProposalSpinnerFrames (braille) or any default
-// rectangular spinner. The anti-corruption architecture guarantees that only
-// flowingSpinnerFrames is used in all View and refreshViewportContent paths.
 var flowingSpinnerFrames = []string{" ✦ ", " ★ ", " ⚙ ", " ❋ ", " ❄ ", " ❆ ", " ❋ ", " ⚙ ", " ★ ", " ✦ "}
 
 // providerSwitchMsg signals a successful provider switch.
@@ -585,12 +568,21 @@ type model struct {
 	// tick loop force-clears it to prevent ghost spinner lock.
 	lastActionTime time.Time
 
-	// Handoff pipeline: inter-mode state transfer
-	handoffCtx  HandoffContext
-	activeChips []actionChip
-	showChips   bool
+	// Handoff pipeline: inter-mode state transfer (WORKFLOW STATE).
+	// This survives mode transitions and must never be cleared to hide UI.
+	handoffCtx HandoffContext
 
-	// Build verification flag: set after build mutation auto-test
+	// currentResult is the most recent workflow RESULT and the capabilities it
+	// exposes. It is DOMAIN state (the engine's current outcome) — NOT a UI
+	// flag. The renderer never reads it directly; it flows through
+	// BuildViewContext into ViewContext.Actions. It is cleared when a new
+	// workflow begins (mode entry / clear / new task), which bounds capability
+	// staleness to the current view without any presentation state mirroring
+	// the engine.
+	currentResult *Result
+
+	// Build verification flag: set after build mutation auto-test (in-flight
+	// workflow signal, not a render flag).
 	buildVerifyPending bool
 
 	// Context Ledger: silent issue tracking across failure sessions
@@ -608,6 +600,11 @@ type model struct {
 
 	// Workspace root path for config/session persistence
 	workspaceRoot string
+
+	// viewRegistry resolves the current mode to its ViewMode builder. It is
+	// injected at bootstrap (explicit, deterministic) and never mutated by
+	// the renderer — the UI stays mode-agnostic.
+	viewRegistry *Registry
 
 	// Init/setup state machine
 	initStage          initStage
@@ -788,6 +785,10 @@ func (m *model) refreshViewportContent() {
 		content.WriteString(ctxHeader)
 	}
 
+	if !m.showBanner || len(m.records) > 0 {
+		content.WriteString(m.renderWorkspaceHeader())
+	}
+
 	if m.PreRenderedHistory != "" {
 		content.WriteString(m.PreRenderedHistory)
 	}
@@ -800,10 +801,6 @@ func (m *model) refreshViewportContent() {
 				content.WriteString("\n")
 			}
 		}
-		// ── Streaming Spinner (star/flowing glyph) ─────────────────────
-		// Rendered ONLY inside the viewport during active token streaming,
-		// appended beneath the streamed content block. The loading spinner
-		// (rect/braille dots) lives exclusively in the status bar.
 		sp := m.renderFlowingSpinner()
 		status := "streaming…"
 		if m.agentRunning {
@@ -850,14 +847,14 @@ func countRenderedDiffLines(diff string) int {
 func (m *model) getProposalDockCurrentHeight() int {
 	switch m.state {
 	case StateProcessing:
-		return 3
+		return 1
 	case StateAwaitingApproval:
 		if len(m.pendingProposals) == 0 {
 			return 0
 		}
 		p := m.pendingProposals[0]
 		if !p.Expanded || p.Diff == "" {
-			return 9 // 1 (top divider) + 7 (collapsed MutationRenderer) + 1 (bottom divider)
+			return 6
 		}
 		n := countRenderedDiffLines(p.Diff)
 		capped := n
@@ -868,15 +865,7 @@ func (m *model) getProposalDockCurrentHeight() int {
 		if n > maxProposalDiffHeight || m.proposalDiffOffset > 0 {
 			scrollHint = 1
 		}
-		// Expanded MutationRenderer: border + header + metadata + blank = 4
-		//                          + capped diff lines
-		//                          + blank after diff = 1
-		//                          + scroll hint (if needed) = 0/1
-		//                          + action line = 1
-		//                          + blank = 1
-		//                          + border = 1
-		cardLines := 4 + capped + 1 + scrollHint + 1 + 1 + 1
-		return 1 + cardLines + 1
+		return 7 + capped + scrollHint
 	}
 	return 0
 }
@@ -917,9 +906,9 @@ func (m *model) computeVpHeight() int {
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
 		vpHeight -= m.getProposalDockCurrentHeight()
 	}
-	if m.showChips && len(m.activeChips) > 0 {
-		vpHeight -= len(m.activeChips)
-	}
+	// NOTE: capabilities render INLINE on the status bar line (see
+	// renderStatusBar), so they occupy the single statusLineHeight row above
+	// and never add extra rows.
 	if vpHeight < 1 {
 		return 1
 	}
@@ -962,6 +951,37 @@ func (m *model) renderRectSpinner() string {
 	n := len(ProposalSpinnerFrames)
 	idx := m.spinnerFrame % n
 	return SpinnerStyle.Render(ProposalSpinnerFrames[idx])
+}
+
+func (m *model) renderWorkspaceHeader() string {
+	mode := m.resolver.Current()
+	modeName := strings.ToUpper(mode.String())
+
+	// Semantic color per mode (Level 1 in visual hierarchy)
+	var modeAccentStr string
+	switch mode {
+	case modes.ModeAsk:
+		modeAccentStr = colorModeAsk
+	case modes.ModePlan:
+		modeAccentStr = colorModePlan
+	case modes.ModeBuild:
+		modeAccentStr = colorModeBuild
+	case modes.ModeInvestigate:
+		modeAccentStr = colorModeInvestigate
+	case modes.ModeReview:
+		modeAccentStr = colorModeReview
+	default:
+		modeAccentStr = colorMuted
+	}
+	modeNameStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(modeAccentStr))
+
+	var b strings.Builder
+	b.WriteString("\n")
+	b.WriteString("  ")
+	b.WriteString(modeNameStyle.Render("● " + modeName))
+	b.WriteString("  " + dimmedStyle.Render(mode.Description()))
+	b.WriteString("\n\n")
+	return b.String()
 }
 
 // ── History persistence ───────────────────────────────────────────────────────

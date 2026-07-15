@@ -176,7 +176,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streaming = false
 		m.streamParser = nil
 		m.pushRecords(msg.records)
-		m.push(roleSystem, "[System] Engine diagnostics collected. Escalating to LLM for analysis...")
+		m.push(roleSystem, "Diagnostics collected. Analyzing...")
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
@@ -258,24 +258,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !msg.passed && msg.output != "" {
 			m.handoffCtx.LastFailurePayload = msg.output
 			m.handoffCtx.TargetScope = m.lastTestTarget
-			m.updateActionChips()
+			// Expose the failure as a workflow result: the capability to
+			// investigate its root cause is now available for the current
+			// view. Cleared on mode entry, so it never persists as a stale
+			// chip. A passing run clears any prior failure result.
+			m.currentResult = failureResult(msg.output)
+		} else if msg.passed {
+			m.currentResult = nil
 		}
 
 		// ── Build verification: post-mutation test auto-result ───────────
 		if m.buildVerifyPending {
 			m.buildVerifyPending = false
-			if msg.passed {
-				m.activeChips = []actionChip{
-					{key: "alt+d", label: "Commit Safe Baseline", action: "/commit"},
-				}
-			} else {
-				m.activeChips = []actionChip{
-					{key: "alt+r", label: "Rollback Workspace", action: "/undo"},
-				}
-			}
-			m.showChips = true
+			// The verification outcome is a workflow result exposing a
+			// commit/rollback capability for the current view.
+			m.currentResult = buildVerifyResult(msg.passed)
 			if m.resolver.Current() == modes.ModeBuild {
-				m.push(roleSystem, "[System] Build verification complete. Use action chips to commit or rollback.")
+				m.push(roleSystem, "Build verification complete.")
 			}
 		}
 
@@ -305,9 +304,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if msg.exitCode == 0 {
-			m.push(roleSystem, infoStyle.Render("[System] Execution Successful (Exit Code 0)"))
+			m.push(roleSystem, infoStyle.Render("Execution successful."))
 		} else {
-			m.push(roleSystem, infoStyle.Render(fmt.Sprintf("[System] Execution Failed (Exit Code %d)", msg.exitCode)))
+			m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Execution failed (exit %d).", msg.exitCode)))
 		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -346,7 +345,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
-		m.push(roleSystem, infoStyle.Render(fmt.Sprintf("[System] Silent analysis complete [%s]. Proceeding to blueprint...", msg.ledgerID)))
+		m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Analysis complete [%s].", msg.ledgerID)))
 		return m, m.handleInvestigateComplete(msg)
 
 	case blueprintReadyMsg:
@@ -380,7 +379,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
-		m.push(roleSystem, "[System] Analyzing failure context and generating fix...")
+		m.push(roleSystem, "Analyzing failure...")
 		m.streamCh = nil
 		m.streaming = false
 		m.streamParser = nil
@@ -407,6 +406,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.handoffCtx.LastFailurePayload = msg.content
 		}
+		// env diagnostics carry a failure into the current view; expose it as
+		// a workflow result so the investigate capability is available now.
+		m.currentResult = failureResult(msg.content)
 		m.push(roleSystem, msg.content)
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -450,6 +452,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Pipe execution log into handoff context for $diagnose
 		m.handoffCtx.LastFailurePayload = msg.output
 		m.handoffCtx.TargetScope = msg.target
+		// A trace that produced output exposes a failure result whose
+		// investigate capability is available for the current view.
+		m.currentResult = failureResult(msg.output)
 
 		statusLine := fmt.Sprintf("trace: %d total, %d failed — target %q", msg.total, msg.failed, msg.target)
 		if msg.passed {
@@ -570,7 +575,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.resolver.Current() == modes.ModeBuild {
 					m.buildVerifyPending = true
 					m.refreshViewportContent()
-					m.push(roleSystem, "[System] Running build verification test...")
+					m.push(roleSystem, "Verifying build...")
 					flush := m.flushPendingRecords()
 					return m, tea.Batch(flush, m.runTestEngine("./..."))
 				}
@@ -617,7 +622,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.createBuildCheckpoint(applied)
 			if m.resolver.Current() == modes.ModeBuild {
 				m.buildVerifyPending = true
-				m.push(roleSystem, "[System] Running build verification test...")
+				m.push(roleSystem, "Verifying build...")
 				testCmd = m.runTestEngine("./...")
 			}
 		case applied > 0:
@@ -626,7 +631,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.createBuildCheckpoint(applied)
 			if m.resolver.Current() == modes.ModeBuild {
 				m.buildVerifyPending = true
-				m.push(roleSystem, "[System] Running build verification test...")
+				m.push(roleSystem, "Verifying build...")
 				testCmd = m.runTestEngine("./...")
 			}
 		default:
@@ -751,7 +756,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.pipelineStep == "analyzing failure" || m.pipelineStep == "analyzing trace" {
 				// Step 1 complete → silently pipe analysis into plan blueprinting
 				m.pipelineStep = "blueprinting"
-				m.push(roleSystem, infoStyle.Render("[System] Pipeline Step 2/3 — Blueprint in progress..."))
+				m.push(roleSystem, infoStyle.Render("Step 2/3: Generating blueprint..."))
 				m.handoffCtx.ProposedFix = final
 
 				var planCtx strings.Builder
@@ -776,7 +781,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					pipelineID = fmt.Sprintf("#%d", m.ledger.ActiveID)
 				}
 				m.pipelineRunning = false
-				m.push(roleSystem, infoStyle.Render(fmt.Sprintf("[System] Pipeline complete [%s]. Delegating to /build for execution...", pipelineID)))
+				m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Pipeline complete [%s]. Switched to /build.", pipelineID)))
 				flush := m.flushPendingRecords()
 				return m, tea.Batch(flush, func() tea.Msg {
 					return blueprintReadyMsg{blueprint: final, ledgerID: pipelineID}
@@ -785,9 +790,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// ── Handoff: Capture ProposedFix from investigate mode ──────────
+		// The "Formulate Execution Plan" capability is derived from
+		// handoffCtx.ProposedFix in BuildViewContext; no UI cache to refresh.
 		if m.resolver.Current() == modes.ModeInvestigate && final != "" {
 			m.handoffCtx.ProposedFix = final
-			m.updateActionChips()
 		}
 
 		// ── Auto-transition: investigate → build on mutation detection ──
@@ -797,7 +803,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// initiate the fix pipeline. This eliminates the manual handoff step.
 		if m.resolver.Current() == modes.ModeInvestigate && m.handoffCtx.ProposedFix != "" {
 			if containsMutationIntention(m.handoffCtx.ProposedFix) {
-				m.push(roleSystem, infoStyle.Render("[System] Analysis complete — file mutation detected. Auto-transitioning to /build mode for execution..."))
+				m.push(roleSystem, infoStyle.Render("File mutation detected. Switched to /build."))
 				m.setMode(modes.ModeBuild)
 				m.lastTestOutput = m.handoffCtx.ProposedFix
 				flush := m.flushPendingRecords()
@@ -807,9 +813,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// ── Handoff: Capture PendingTodos from plan mode ────────────────
+		// The "Execute & Verify Patch" capability is derived from
+		// handoffCtx.PendingTodos in BuildViewContext; no UI cache to refresh.
 		if m.resolver.Current() == modes.ModePlan && final != "" {
 			m.handoffCtx.PendingTodos = extractTodosFromPlan(final)
-			m.updateActionChips()
 		}
 
 		// SECTION 1: INTERCEPTING STREAM COMPLETION
@@ -870,8 +877,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			latencySec = time.Since(m.streamStartTime).Seconds()
 			m.streamStartTime = time.Time{}
 		}
-		m.push(roleStatus, mutedStyle.Render(
-			fmt.Sprintf("↳ done · +%d tok · %s · %.1fs", delta, costStr, latencySec)))
+		m.push(roleStatus, dimmedStyle.Render(
+			fmt.Sprintf("✔ done · +%d tok · %s · %.1fs", delta, costStr, latencySec)))
 
 		if m.resolver.Current() == modes.ModePlan {
 			validation := plan.ValidatePlanOutput(final)
@@ -951,9 +958,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.shellAwaitingIdx = 0
 					m.state = StateAwaitingShellExec
 					m.push(roleSystem, shellWarningStyle.Render(
-						fmt.Sprintf("Shell Execution: %d command(s) pending approval", len(shellBlocks))))
+						fmt.Sprintf("Shell execution: %d command(s) pending", len(shellBlocks))))
 				} else {
-					msg := fmt.Sprintf("[System] Tool 'shell' rejected. Reason: Explicit boundary violation for '%s' mode.", mode)
+					msg := fmt.Sprintf("Tool 'shell' rejected in /%s.", mode)
 					m.push(roleSystem, msg)
 					m.sess.AddMessage("system", msg+" You are in a Read-Only execution environment and must stop requesting system mutations.", 3)
 				}
@@ -1061,21 +1068,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 
-		// ── Action Chip Hotkeys (alt+ modifier only) ─────────────────────
+		// ── Capability Hotkeys (alt+ modifier only) ────────────────────
 		// Single-character hotkeys are strictly banned to prevent key
 		// collisions with normal prompt input (e.g., typing in /plan).
-		if m.showChips && !m.streaming && !m.agentRunning && m.state == StateChat {
-			switch msg.String() {
-			case "alt+a":
-				return m, m.handleChipActivation("alt+a")
-			case "alt+b":
-				return m, m.handleChipActivation("alt+b")
-			case "alt+c":
-				return m, m.handleChipActivation("alt+c")
-			case "alt+d":
-				return m, m.handleChipActivation("alt+d")
-			case "alt+r":
-				return m, m.handleChipActivation("alt+r")
+		// The active capabilities come from the workflow layer's render
+		// context; the renderer/update loop never decides which exist.
+		if !m.streaming && !m.agentRunning && m.state == StateChat {
+			key := msg.String()
+			for _, act := range m.BuildWorkspace().Actions {
+				if act.Enabled && strings.EqualFold(act.Shortcut, key) {
+					return m, m.handleChipActivation(act)
+				}
 			}
 		}
 

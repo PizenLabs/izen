@@ -23,11 +23,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	}
 	content = agents.InjectObjectiveContext(content, m.sess.ObjectiveState)
 	if m.streamCh != nil {
-		m.push(roleSystem, "[System] Stream blocked: an execution channel is currently active.")
+		m.push(roleSystem, "Stream blocked: task active.")
 		return nil
 	}
 	if m.provider == nil {
-		m.push(roleSystem, "[System] Stream blocked: no AI provider is configured.")
+		m.push(roleSystem, "Stream blocked: no provider.")
 		return nil
 	}
 

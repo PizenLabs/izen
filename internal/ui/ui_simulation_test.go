@@ -57,6 +57,15 @@ func newTestModel() *model {
 		awaitingConfirmation: true,
 		spinnerFrame:         0,
 		PreRenderedHistory:   "previous content\n",
+		viewRegistry: func() *Registry {
+			r := NewRegistry()
+			r.Register(modes.ModeAsk, askView{})
+			r.Register(modes.ModePlan, planView{})
+			r.Register(modes.ModeBuild, buildView{})
+			r.Register(modes.ModeInvestigate, investigateView{})
+			r.Register(modes.ModeReview, reviewView{})
+			return r
+		}(),
 	}
 }
 
@@ -208,21 +217,21 @@ func TestComputeVpHeightWithProposalBlock(t *testing.T) {
 	m := newTestModel()
 
 	// computeVpHeight uses the new zero-gap formula:
-	// height=40 - inputHeight(3) - statusLineHeight(1) - dockHeight(13) = 23
+	// height=40 - inputHeight(2) - statusLineHeight(1) - dockHeight(10) - bottomSep(1) = 26
 	vpHeight := m.computeVpHeight()
-	expectVp := 23
+	expectVp := 26
 	if vpHeight != expectVp {
 		t.Errorf("computeVpHeight = %d, want %d", vpHeight, expectVp)
 	}
 
 	// Render the proposal block and count lines
 	proposalBlock := m.renderProposalBlock()
-	proposalLines := len(strings.Split(proposalBlock, "\n"))
+	proposalLines := len(strings.Split(strings.TrimRight(proposalBlock, "\n"), "\n"))
 	t.Logf("Proposal block rendered %d lines (vpHeight=%d)", proposalLines, vpHeight)
 
 	// The View() output total should not exceed m.height
 	fullView := m.View()
-	viewLines := len(strings.Split(fullView, "\n"))
+	viewLines := len(strings.Split(strings.TrimRight(fullView, "\n"), "\n"))
 	if viewLines > m.height {
 		t.Errorf("View() output = %d lines, exceeds terminal height of %d — content clipped past boundary",
 			viewLines, m.height)

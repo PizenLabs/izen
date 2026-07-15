@@ -116,6 +116,17 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		g = graph.NewGraph(root)
 	}
 
+	// ── Explicit mode registry (deterministic bootstrap) ──────────────
+	// Modes are registered here, in one place, instead of via implicit
+	// init() self-registration. This makes wiring testable and lets external
+	// (plugin / MCP) modes register themselves without touching package state.
+	reg := NewRegistry()
+	reg.Register(modes.ModeAsk, askView{})
+	reg.Register(modes.ModePlan, planView{})
+	reg.Register(modes.ModeBuild, buildView{})
+	reg.Register(modes.ModeInvestigate, investigateView{})
+	reg.Register(modes.ModeReview, reviewView{})
+
 	m := &model{
 		cfg:                 cfg,
 		sess:                sess,
@@ -140,6 +151,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		initProviderFilter:  "",
 		initPrefillUsername: globalUsername,
 		initPrefillProvider: globalProvider,
+		viewRegistry:        reg,
 	}
 	m.resolver.Set(sess.Mode)
 	m.loadHistory()

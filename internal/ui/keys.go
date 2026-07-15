@@ -70,7 +70,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.pendingShellExec = nil
 				m.state = StateChat
 				m.recalcViewportHeight()
-				m.push(roleSystem, infoStyle.Render("[System] Shell execution blocked by mode capabilities"))
+				m.push(roleSystem, infoStyle.Render("Shell execution blocked."))
 				return m, nil
 			}
 			block := m.pendingShellExec[m.shellAwaitingIdx]
@@ -168,7 +168,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.agentRunning || m.streaming || m.reviewRunning || m.pipelineRunning {
 			execution.KillAllOrphans()
-			m.push(roleSystem, infoStyle.Render("[System] Execution interrupted by Ctrl+C"))
+			m.push(roleSystem, infoStyle.Render("Interrupted."))
 			return m, func() tea.Msg { return TaskFinishedMsg{} }
 		}
 		m.ti.SetValue("")
