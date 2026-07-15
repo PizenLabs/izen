@@ -386,6 +386,7 @@ func parseModeShorthand(line string) (modes.Mode, string, bool) {
 
 func (m *model) setMode(mode modes.Mode) {
 	m.investigateInvocationCount = 0 // Unconditional state clearance to avoid hard lockout bugs during testing
+	m.buildRecoveryCount = 0         // Reset auto-recovery counter on every mode transition
 
 	// ── ABSOLUTE STALE GOROUTINE RELEASE ON MODE ENTRY ────────────────
 	// Before any mode transition, cancel all in-flight background contexts,
@@ -955,9 +956,10 @@ func (m *model) runFixCmd(target string) tea.Cmd {
 			}
 
 			fixCtx.WriteString("## INSTRUCTION\n")
-			fixCtx.WriteString("Analyze the test failure(s) above. Identify the root cause in the source code ")
-			fixCtx.WriteString("and provide the corrected implementation. Output the minimal fix as a unified diff ")
-			fixCtx.WriteString("or complete file replacement.\n")
+			fixCtx.WriteString("This is build mode — Execution-Only. All diagnostic and architectural analysis was ")
+			fixCtx.WriteString("completed in previous stages. Implement the fix based on the failure log above. ")
+			fixCtx.WriteString("Output ONLY the minimal unified diff or complete file replacement. ")
+			fixCtx.WriteString("Do NOT analyze, explain, or restate the problem.\n")
 
 			return fixResultMsg{content: fixCtx.String()}
 		},
@@ -1297,6 +1299,16 @@ func (m *model) handleBlueprintReady(msg blueprintReadyMsg) tea.Cmd {
 		return m.flushPendingRecords()
 	}
 
+	// ── CLEAN CONTEXT FLUSH BEFORE AUTOPILOT RESUME ─────────────────────
+	// Explicitly flush stale diff layers and malformed state from prior
+	// failed runs so the fresh blueprint enters a pristine buffer.
+	m.lastTestOutput = ""
+	m.lastTestFailed = false
+	m.lastTestTarget = ""
+	m.handoffCtx.LastFailurePayload = ""
+	m.acceptedProposals = nil
+	m.pendingProposals = nil
+
 	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Blueprint ready [%s]. Switched to /build.", msg.ledgerID)))
 
 	// ── Explicit UI mode transition to /build ──────────────────────────
@@ -1345,8 +1357,9 @@ func (m *model) handleBlueprintReady(msg blueprintReadyMsg) tea.Cmd {
 			}
 
 			fixCtx.WriteString("## INSTRUCTION\n")
-			fixCtx.WriteString("Implement the fix blueprint above. Output the minimal fix as a unified diff ")
-			fixCtx.WriteString("or complete file replacement.\n")
+			fixCtx.WriteString("This is build mode — Execution-Only. Implement the fix blueprint above. ")
+			fixCtx.WriteString("Output ONLY the minimal unified diff or complete file replacement. ")
+			fixCtx.WriteString("Do NOT analyze, explain, or restate the problem.\n")
 
 			return fixResultMsg{content: fixCtx.String()}
 		},
@@ -1949,8 +1962,7 @@ func (m *model) resetObjectiveContextStacks() {
 	m.state = StateChat
 	m.recalcViewportHeight()
 	m.acceptedProposals = nil
-	m.pendingShellExec = nil
-	m.shellAwaitingIdx = 0
+	m.proposedShellCmd = ""
 	m.sess.InvestigationID = ""
 	m.sess.ReviewID = ""
 	m.sess.ClearHistory()

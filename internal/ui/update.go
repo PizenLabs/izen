@@ -270,8 +270,27 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// ── Build verification: post-mutation test auto-result ───────────
 		if m.buildVerifyPending {
 			m.buildVerifyPending = false
-			// The verification outcome is a workflow result exposing a
-			// commit/rollback capability for the current view.
+
+			// ── Automated error recovery loop ───────────────────────────
+			// When verification fails after a build patch, silently trigger
+			// a recovery cycle: re-read the file, re-generate a corrected
+			// AST block, and re-apply — without producing any UI chatter.
+			if !msg.passed && m.resolver.Current() == modes.ModeBuild &&
+				m.buildRecoveryCount < maxBuildRecoveryAttempts {
+				m.buildRecoveryCount++
+				m.acceptAll = true
+				m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
+					"⚙ [recovery %d/%d] auto-correcting compilation errors...",
+					m.buildRecoveryCount, maxBuildRecoveryAttempts)))
+				flush := m.flushPendingRecords()
+				return m, tea.Batch(flush, m.runFixCmd(""))
+			}
+
+			// If recovery exhausted or verification passed, expose the
+			// corresponding workflow result (commit / rollback).
+			if m.buildRecoveryCount >= maxBuildRecoveryAttempts {
+				m.acceptAll = false
+			}
 			m.currentResult = buildVerifyResult(msg.passed)
 			if m.resolver.Current() == modes.ModeBuild {
 				m.push(roleSystem, "Build verification complete.")
@@ -748,6 +767,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.responseBuffer.Reset()
 		m.currentStreamContent = ""
 
+		// Sanitize: strip tool execution artifacts so they don't pollute
+		// the downstream JSON parser or render pipeline. Lines matching
+		// telemetry/error markers are removed from leading/trailing context.
+		final = sanitizeFinalContent(final)
+
 		// Append the completed turn to PreRenderedHistory and freeze state.
 		m.push(roleAI, final)
 
@@ -801,8 +825,56 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// concludes with a concrete mutation proposal (code blocks with
 		// language annotations), automatically transition to /build and
 		// initiate the fix pipeline. This eliminates the manual handoff step.
+		//
+		// STRICT GUARD: If the last compilation state contains [build failed]
+		// or any AST/syntax errors, the agent is strictly prohibited from
+		// jumping directly to /build. Instead it must route to /plan for
+		// structured recovery (Sanitization → Package Isolation → Atomic Fixes).
 		if m.resolver.Current() == modes.ModeInvestigate && m.handoffCtx.ProposedFix != "" {
 			if containsMutationIntention(m.handoffCtx.ProposedFix) {
+				// ── Compile failure guard ────────────────────────────────
+				compileFailure := detectCompileFailure(m.handoffCtx.LastFailurePayload)
+				if !compileFailure && m.lastTestOutput != "" {
+					compileFailure = detectCompileFailure(m.lastTestOutput)
+				}
+
+				if compileFailure {
+					// ── FORCED ROUTING TO /plan ──────────────────────────
+					// Structural errors require a deliberate design phase
+					// before any patching is attempted.
+					m.push(roleSystem, warningBannerStyle.Render(
+						"[!] Compile failure detected — routing to /plan for structured recovery."))
+					m.push(roleSystem, infoStyle.Render(
+						"Recovery checklist: Sanitization → Package Isolation → Atomic Fixes."))
+					m.setMode(modes.ModePlan)
+
+					recoveryPrompt := "## STRUCTURED RECOVERY CHECKLIST\n\n" +
+						"The codebase has compilation errors. Create a structured recovery plan with:\n\n" +
+						"### 1. Sanitization\n" +
+						"- Identify and document all syntax/type errors in the compilation output\n" +
+						"- Do NOT propose blind patches — first understand the full scope of breakage\n\n" +
+						"### 2. Package Isolation\n" +
+						"- Group related errors by package/file\n" +
+						"- Determine dependency order for fixes\n\n" +
+						"### 3. Atomic Fixes\n" +
+						"- For each error, specify the minimal corrective change\n" +
+						"- Output each fix as a separate task with file target and description\n\n" +
+						"### Compilation Errors\n```\n" +
+						m.handoffCtx.LastFailurePayload +
+						"\n```\n" +
+						"### Root Cause Analysis\n" +
+						m.handoffCtx.ProposedFix
+
+					m.currentPrompt = recoveryPrompt
+					m.streamCh = nil
+					m.streaming = false
+					m.streamParser = nil
+					flush := m.flushPendingRecords()
+					m.refreshViewportContent()
+					return m, tea.Batch(flush, m.streamCmd(recoveryPrompt))
+				}
+
+				// No compile failure — safe to auto-transition to /build
 				m.push(roleSystem, infoStyle.Render("File mutation detected. Switched to /build."))
 				m.setMode(modes.ModeBuild)
 				m.lastTestOutput = m.handoffCtx.ProposedFix
@@ -881,36 +953,41 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			fmt.Sprintf("✔ done · +%d tok · %s · %.1fs", delta, costStr, latencySec)))
 
 		if m.resolver.Current() == modes.ModePlan {
-			validation := plan.ValidatePlanOutput(final)
-			if !validation.Valid {
-				errMsg := plan.FormatValidationError(validation)
-				m.push(roleError, errMsg)
-				m.push(roleSystem, infoStyle.Render("regenerate with more precise intent"))
-			}
-
-			// Collapse to valid blocks only; fall back to raw parse if empty.
-			var blockContent string
-			if len(validation.Blocks) > 0 {
-				blockContent = plan.CollapsePlanSections(final)
-			}
-
-			tasks := plan.ParseMarkdownToTasks(blockContent)
-			if len(tasks) == 0 {
-				tasks = plan.ParseMarkdownToTasks(final)
-			}
-
-			if len(tasks) > 0 {
-				m.sess.StageTaskList(&tasks)
-				width := m.width - 2
-				if width < 20 {
-					width = 20
+			// Try JSON plan parsing first (JSON output is the primary contract).
+			// Falls back to legacy markdown format if JSON is invalid/absent.
+			// NOTE: raw final was already pushed as roleAI at line 771 and
+			// rendered through cacheRecordToHistory → renderStreamingContent,
+			// which handles JSON widget rendering. Do NOT push rendered content
+			// again here — that creates a double-rendering loop.
+			if jsonResult := plan.ParseJSONPlan(final); jsonResult != nil && jsonResult.Valid && jsonResult.Plan != nil {
+				if len(jsonResult.Tasks) > 0 {
+					tasks := jsonResult.Tasks
+					m.sess.StageTaskList(&tasks)
+					m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
 				}
-				renderer := NewMarkdownRenderer(width)
-				rendered := renderer.Render(compileTaskListMarkdown(&tasks))
-				if rendered != "" {
-					m.push(roleAI, rendered)
+			} else {
+				// Fall back to legacy markdown plan validation
+				validation := plan.ValidatePlanOutput(final)
+				if !validation.Valid {
+					errMsg := plan.FormatValidationError(validation)
+					m.push(roleError, errMsg)
+					m.push(roleSystem, infoStyle.Render("regenerate with more precise intent"))
 				}
-				m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
+
+				var blockContent string
+				if len(validation.Blocks) > 0 {
+					blockContent = plan.CollapsePlanSections(final)
+				}
+
+				tasks := plan.ParseMarkdownToTasks(blockContent)
+				if len(tasks) == 0 {
+					tasks = plan.ParseMarkdownToTasks(final)
+				}
+
+				if len(tasks) > 0 {
+					m.sess.StageTaskList(&tasks)
+					m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
+				}
 			}
 		}
 
@@ -948,21 +1025,30 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sess.ClearTasks()
 		}
 
-		// Extract shell commands from the response for explicit approval
+		// EXTRACT SHELL COMMANDS → INJECT INTO INPUT BAR (Human-In-The-Loop)
+		// Under no circumstances does the TUI execute a shell command automatically.
+		// The agent-proposed command is injected into the text input bar, where the
+		// user must explicitly review and press Enter to execute.
 		if m.state == StateChat && !m.awaitingConfirmation {
-			shellBlocks := extractShellCommands(final)
-			if len(shellBlocks) > 0 {
+			shellCmds := extractShellCommands(final)
+			if len(shellCmds) > 0 {
 				mode := m.resolver.Current()
-				if mode.CanShell() {
-					m.pendingShellExec = shellBlocks
-					m.shellAwaitingIdx = 0
-					m.state = StateAwaitingShellExec
-					m.push(roleSystem, shellWarningStyle.Render(
-						fmt.Sprintf("Shell execution: %d command(s) pending", len(shellBlocks))))
-				} else {
+				if !mode.CanShell() {
 					msg := fmt.Sprintf("Tool 'shell' rejected in /%s.", mode)
 					m.push(roleSystem, msg)
 					m.sess.AddMessage("system", msg+" You are in a Read-Only execution environment and must stop requesting system mutations.", 3)
+				} else {
+					cmd := shellCmds[0]
+					if blocked, _ := m.shellFirewall(cmd); blocked {
+						m.push(roleError, "[SECURITY] Proposed shell command blocked by firewall.")
+					} else {
+						m.ti.SetValue(cmd)
+						m.ti.CursorEnd()
+						m.syncInputFromTI()
+						m.proposedShellCmd = cmd
+						m.push(roleSystem, infoStyle.Render(
+							"Command injected into input bar. Review and press Enter to execute, Esc to cancel."))
+					}
 				}
 			}
 		}
@@ -1044,7 +1130,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// completely ignored — no viewport scrolling, no coordinate mapping.
 		// This eliminates any possibility of accidental mutation via click.
 		// During processing, wheel events are allowed for scroll inspection.
-		if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec {
+		if m.state == StateAwaitingApproval {
 			return m, nil
 		}
 		if m.state == StateProcessing && msg.Button != tea.MouseButtonWheelUp && msg.Button != tea.MouseButtonWheelDown {
@@ -1083,7 +1169,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// In special states, route directly to handleKey.
-		if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec || m.state == StateProcessing {
+		if m.state == StateAwaitingApproval || m.state == StateProcessing {
 			resModel, cmd := m.handleKey(msg)
 			return resModel, cmd
 		}
@@ -1222,6 +1308,34 @@ func (m *model) smoothStreamTickCmd() tea.Cmd {
 // investigate mode proposes concrete file mutations. Uses language-annotated
 // code blocks as the heuristic — when the agent outputs code blocks with known
 // language identifiers (go, diff, python, etc.), it indicates a patch proposal.
+// detectCompileFailure scans the given output for build/compile failure
+// signatures. Returns true when the codebase is in a non-compilable state
+// that requires structural recovery before any patch can be applied.
+func detectCompileFailure(output string) bool {
+	if output == "" {
+		return false
+	}
+	lower := strings.ToLower(output)
+	indicators := []string{
+		"[build failed]",
+		"syntax error",
+		"compilation error",
+		"expected declaration",
+		"non-declaration statement outside function body",
+		"expected ';'",
+		"cannot find package",
+		"undefined:",
+		"not enough arguments",
+		"too many errors",
+	}
+	for _, ind := range indicators {
+		if strings.Contains(lower, ind) {
+			return true
+		}
+	}
+	return false
+}
+
 func containsMutationIntention(content string) bool {
 	lower := strings.ToLower(content)
 	mutationLanguages := []string{
@@ -1237,19 +1351,32 @@ func containsMutationIntention(content string) bool {
 	return false
 }
 
-func compileTaskListMarkdown(tasks *[]plan.Task) string {
-	var b strings.Builder
+// sanitizeFinalContent strips tool execution artifacts and telemetry markers
+// from the LLM output before it reaches the JSON parser or render pipeline.
+// Lines matching known error/telemetry patterns are removed when they appear
+// as leading or trailing noise around the actual LLM response payload.
+func sanitizeFinalContent(content string) string {
+	lines := strings.Split(content, "\n")
+	var clean []string
+	inPayload := false
 
-	b.WriteString("# TASK LIST\n\n")
-	for _, task := range *tasks {
-		glyph := "○"
-		if task.Status == "processing" {
-			glyph = "●"
-		} else if task.Status == "done" || task.IsDone {
-			glyph = "✓"
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if !inPayload {
+			if trimmed == "" || strings.HasPrefix(trimmed, "[FAIL]") ||
+				strings.HasPrefix(trimmed, "[ OK ]") ||
+				strings.HasPrefix(trimmed, "INFO:") ||
+				strings.HasPrefix(trimmed, "WARN:") ||
+				strings.HasPrefix(trimmed, "ERROR:") {
+				continue
+			}
+			inPayload = true
 		}
-		fmt.Fprintf(&b, "%s **%s**: %s | %s\n\n", glyph, task.Type, task.Target, task.Description)
+
+		clean = append(clean, line)
 	}
 
-	return b.String()
+	result := strings.Join(clean, "\n")
+	return strings.TrimSpace(result)
 }

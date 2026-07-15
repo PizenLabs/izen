@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/alecthomas/chroma/v2"
@@ -8,6 +9,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
+
+	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
 // ── Catppuccin Mocha ANSI true-color escape sequences ────────────────────
@@ -436,6 +439,13 @@ func (m *model) renderStreamingContent(content string, width int) string {
 			rendered = renderWidget("Command", container.String(), availableWidth, colorModePlan)
 
 		default:
+			// INTERCEPT: if in plan mode, try JSON plan parsing first.
+			// Suppresses raw JSON and renders a clean architectural task widget.
+			if jsonResult := plan.ParseJSONPlan(block.raw); jsonResult != nil && jsonResult.Valid && jsonResult.Plan != nil {
+				rendered = renderJSONPlanWidget(jsonResult.Plan, availableWidth)
+				break
+			}
+
 			// UNIFIED PATH: deterministic pipeline — identical for streaming and history.
 			// Replaces the goldmark-based MarkdownRenderer to eliminate layout flicker.
 			blockRendered := RenderDeterministicPipeline(block.raw, availableWidth, true)
@@ -455,4 +465,68 @@ func (m *model) renderStreamingContent(content string, width int) string {
 	}
 
 	return strings.Join(renderedBlocks, vspace(Spacing.Section))
+}
+
+// renderJSONPlanWidget renders a validated PlanOutput as a clean TUI widget.
+// Used when the LLM returns a valid JSON plan contract instead of markdown.
+func renderJSONPlanWidget(planOutput *plan.PlanOutput, width int) string {
+	if planOutput == nil {
+		return ""
+	}
+
+	contentWidth := width - 4
+	if contentWidth < 20 {
+		contentWidth = 20
+	}
+
+	var b strings.Builder
+
+	b.WriteString(orangeStyle.Render("STRATEGY: "))
+	b.WriteString(textStyle.Render(planOutput.ArchitecturalStrategy))
+	b.WriteString("\n")
+
+	b.WriteString(dimmedStyle.Render(strings.Repeat("─", contentWidth)))
+	b.WriteString("\n")
+
+	b.WriteString(boldTextStyle.Render("PENDING TASKS:"))
+	b.WriteString("\n\n")
+
+	for _, task := range planOutput.AtomicTasks {
+		fmt.Fprintf(&b, "%s %s %s\n",
+			dimmedStyle.Render("[ ]"),
+			orangeStyle.Render(fmt.Sprintf("TASK #%d:", task.TaskID)),
+			textStyle.Render(task.File),
+		)
+
+		indent := "    "
+		fmt.Fprintf(&b, "%s%s %s\n",
+			indent,
+			dimmedStyle.Render("↳ Strategy:"),
+			orangeStyle.Render(task.Strategy),
+		)
+
+		descW := contentWidth - lipgloss.Width(indent+"↳ Strategy: ") + 2
+		if descW < 10 {
+			descW = 10
+		}
+		descLines := wrapStreamText(task.Description, descW)
+		for i, dl := range descLines {
+			if i == 0 {
+				fmt.Fprintf(&b, "%s%s %s\n",
+					indent,
+					dimmedStyle.Render("↳ Description:"),
+					dimmedStyle.Render(dl),
+				)
+			} else {
+				fmt.Fprintf(&b, "%s%s %s\n",
+					indent,
+					strings.Repeat(" ", lipgloss.Width(dimmedStyle.Render("↳ Description:"))-lipgloss.Width(indent)),
+					dimmedStyle.Render(dl),
+				)
+			}
+		}
+		b.WriteString("\n")
+	}
+
+	return renderWidget("Plan", strings.TrimSuffix(b.String(), "\n"), width, colorModePlan)
 }

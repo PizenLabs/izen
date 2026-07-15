@@ -367,3 +367,247 @@ func TestBudgetExceededError(t *testing.T) {
 		t.Fatal("expected '/drop' in action hint")
 	}
 }
+
+func TestParseJSONPlan_Valid(t *testing.T) {
+	input := `{
+  "context_anchor": {
+    "source": "user-request",
+    "target_packages": ["internal/parser", "tui/viewport"]
+  },
+  "architectural_strategy": "Isolate the parser logic to prevent streaming leakage",
+  "atomic_tasks": [
+    {
+      "task_id": 1,
+      "file": "internal/parser/stream.go",
+      "strategy": "ATOMIC_REPLACE",
+      "description": "Rewrite stream parser"
+    },
+    {
+      "task_id": 2,
+      "file": "internal/parser/types.go",
+      "strategy": "DIFF_PATCH",
+      "description": "Add new stream types"
+    }
+  ]
+}`
+	result := ParseJSONPlan(input)
+	if !result.Valid {
+		t.Fatalf("expected valid JSON plan, got error: %s", result.Error)
+	}
+	if result.Plan == nil {
+		t.Fatal("expected non-nil PlanOutput")
+	}
+	if result.Plan.ArchitecturalStrategy != "Isolate the parser logic to prevent streaming leakage" {
+		t.Fatalf("unexpected strategy: %s", result.Plan.ArchitecturalStrategy)
+	}
+	if len(result.Tasks) != 2 {
+		t.Fatalf("expected 2 tasks, got %d", len(result.Tasks))
+	}
+	if result.Tasks[0].Target != "internal/parser/stream.go" {
+		t.Fatalf("expected target internal/parser/stream.go, got %s", result.Tasks[0].Target)
+	}
+	if result.Tasks[0].Type != "FILE_MUTATE" {
+		t.Fatalf("expected FILE_MUTATE type, got %s", result.Tasks[0].Type)
+	}
+	if result.Tasks[1].Target != "internal/parser/types.go" {
+		t.Fatalf("expected second target internal/parser/types.go, got %s", result.Tasks[1].Target)
+	}
+}
+
+func TestParseJSONPlan_InvalidJSON(t *testing.T) {
+	input := `{invalid json}`
+	result := ParseJSONPlan(input)
+	if result.Valid {
+		t.Fatal("expected invalid for malformed JSON")
+	}
+	if !strings.Contains(result.Error, "JSON parse error") {
+		t.Fatalf("expected JSON parse error, got: %s", result.Error)
+	}
+}
+
+func TestParseJSONPlan_EmptyTasks(t *testing.T) {
+	input := `{
+  "context_anchor": {
+    "source": "test",
+    "target_packages": []
+  },
+  "architectural_strategy": "test",
+  "atomic_tasks": []
+}`
+	result := ParseJSONPlan(input)
+	if result.Valid {
+		t.Fatal("expected invalid for empty atomic_tasks")
+	}
+	if !strings.Contains(result.Error, "at least one") {
+		t.Fatalf("expected 'at least one' error, got: %s", result.Error)
+	}
+}
+
+func TestParseJSONPlan_MissingStrategy(t *testing.T) {
+	input := `{
+  "context_anchor": {
+    "source": "test",
+    "target_packages": []
+  },
+  "architectural_strategy": "",
+  "atomic_tasks": [
+    {
+      "task_id": 1,
+      "file": "test.go",
+      "strategy": "ATOMIC_REPLACE",
+      "description": "test"
+    }
+  ]
+}`
+	result := ParseJSONPlan(input)
+	if result.Valid {
+		t.Fatal("expected invalid for empty architectural_strategy")
+	}
+}
+
+func TestParseJSONPlan_CodeFences(t *testing.T) {
+	input := "```json\n{\n  \"context_anchor\": {\n    \"source\": \"user\",\n    \"target_packages\": [\"pkg\"]\n  },\n  \"architectural_strategy\": \"test strategy\",\n  \"atomic_tasks\": [\n    {\n      \"task_id\": 1,\n      \"file\": \"main.go\",\n      \"strategy\": \"ATOMIC_REPLACE\",\n      \"description\": \"replace main\"\n    }\n  ]\n}\n```"
+	result := ParseJSONPlan(input)
+	if !result.Valid {
+		t.Fatalf("expected valid despite code fences, got: %s", result.Error)
+	}
+	if len(result.Tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(result.Tasks))
+	}
+}
+
+func TestParseJSONPlan_UnknownStrategy(t *testing.T) {
+	input := `{
+  "context_anchor": {
+    "source": "test",
+    "target_packages": []
+  },
+  "architectural_strategy": "test",
+  "atomic_tasks": [
+    {
+      "task_id": 1,
+      "file": "test.go",
+      "strategy": "SHELL_EXEC",
+      "description": "run test"
+    }
+  ]
+}`
+	result := ParseJSONPlan(input)
+	if !result.Valid {
+		t.Fatalf("expected valid for SHELL_EXEC strategy, got: %s", result.Error)
+	}
+	if result.Tasks[0].Type != "SHELL_EXEC" {
+		t.Fatalf("expected SHELL_EXEC type, got %s", result.Tasks[0].Type)
+	}
+}
+
+func TestParseJSONPlan_MissingDescription(t *testing.T) {
+	input := `{
+  "context_anchor": {
+    "source": "test",
+    "target_packages": []
+  },
+  "architectural_strategy": "test",
+  "atomic_tasks": [
+    {
+      "task_id": 1,
+      "file": "test.go",
+      "strategy": "ATOMIC_REPLACE",
+      "description": ""
+    }
+  ]
+}`
+	result := ParseJSONPlan(input)
+	if !result.Valid {
+		t.Fatalf("expected valid with empty description, got: %s", result.Error)
+	}
+	if !strings.Contains(result.Tasks[0].Description, "ATOMIC_REPLACE") {
+		t.Fatalf("expected fallback description, got: %s", result.Tasks[0].Description)
+	}
+}
+
+func TestParseJSONPlan_StripCodeFences(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"```json\n{\"a\":1}\n```", "{\"a\":1}"},
+		{"```\n{\"a\":1}\n```", "{\"a\":1}"},
+		{"{\"a\":1}", "{\"a\":1}"},
+	}
+	for _, tt := range tests {
+		got := stripCodeFences(tt.input)
+		if got != tt.want {
+			t.Errorf("stripCodeFences(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestMapStrategyToType(t *testing.T) {
+	tests := []struct {
+		strategy string
+		want     string
+	}{
+		{"ATOMIC_REPLACE", "FILE_MUTATE"},
+		{"DIFF_PATCH", "FILE_MUTATE"},
+		{"SHELL_EXEC", "SHELL_EXEC"},
+		{"GIT_ACTION", "GIT_ACTION"},
+		{"unknown", "FILE_MUTATE"},
+		{"", "FILE_MUTATE"},
+	}
+	for _, tt := range tests {
+		got := mapStrategyToType(tt.strategy)
+		if got != tt.want {
+			t.Errorf("mapStrategyToType(%q) = %q, want %q", tt.strategy, got, tt.want)
+		}
+	}
+}
+
+func TestSchemaJSONInstruction(t *testing.T) {
+	inst := SchemaJSONInstruction()
+	if !strings.Contains(inst, "context_anchor") {
+		t.Fatal("expected context_anchor in JSON schema instruction")
+	}
+	if !strings.Contains(inst, "ATOMIC_REPLACE") {
+		t.Fatal("expected ATOMIC_REPLACE in JSON schema instruction")
+	}
+	if !strings.Contains(inst, "atomic_tasks") {
+		t.Fatal("expected atomic_tasks in JSON schema instruction")
+	}
+}
+
+func TestParsePlanContent_JSONPreferred(t *testing.T) {
+	input := `{"context_anchor":{"source":"user","target_packages":["pkg"]},"architectural_strategy":"test","atomic_tasks":[{"task_id":1,"file":"a.go","strategy":"ATOMIC_REPLACE","description":"test"}]}`
+	tasks := parsePlanContent(input)
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task from JSON, got %d", len(tasks))
+	}
+	if tasks[0].Target != "a.go" {
+		t.Fatalf("expected target a.go, got %s", tasks[0].Target)
+	}
+}
+
+func TestParsePlanContent_MarkdownFallback(t *testing.T) {
+	input := "- [ ] FILE_MUTATE: fallback.go | fallback test"
+	tasks := parsePlanContent(input)
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task from markdown fallback, got %d", len(tasks))
+	}
+	if tasks[0].Target != "fallback.go" {
+		t.Fatalf("expected target fallback.go, got %s", tasks[0].Target)
+	}
+}
+
+func TestParsePlanContent_Empty(t *testing.T) {
+	tasks := parsePlanContent("")
+	if tasks != nil {
+		t.Fatal("expected nil for empty content")
+	}
+}
+
+func TestPlanSchemaError(t *testing.T) {
+	err := &PlanSchemaError{Message: "test violation"}
+	if !strings.Contains(err.Error(), "schema violation") {
+		t.Fatalf("expected 'schema violation' in error, got: %s", err.Error())
+	}
+}

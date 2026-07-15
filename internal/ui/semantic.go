@@ -61,9 +61,3 @@ type acceptedProposal struct {
 	Target string // file path
 	Status string // "created", "modified", "deleted"
 }
-
-// shellExecBlock holds a shell command pending user approval.
-type shellExecBlock struct {
-	Command     string
-	Description string
-}

@@ -815,6 +815,27 @@ func renderTitledTopBorder(totalWidth int, label string) string {
 		borderColor.Render(strings.Repeat(fill, rightFillN)+right)
 }
 
+// styleActivityLine renders a system activity log line with mixed
+// styles: base text in muted faint-gray, [ OK ] and [FAIL] status
+// tags highlighted in pastel green/red for immediate scanability.
+func (m *model) styleActivityLine(line string) string {
+	okTag := "[ OK ]"
+	failTag := "[FAIL]"
+	if idx := strings.Index(line, okTag); idx >= 0 {
+		pre := systemActivityStyle.Render(line[:idx])
+		tag := greenStyle.Render(okTag)
+		suf := systemActivityStyle.Render(line[idx+len(okTag):])
+		return pre + tag + suf
+	}
+	if idx := strings.Index(line, failTag); idx >= 0 {
+		pre := systemActivityStyle.Render(line[:idx])
+		tag := redStyle.Render(failTag)
+		suf := systemActivityStyle.Render(line[idx+len(failTag):])
+		return pre + tag + suf
+	}
+	return systemActivityStyle.Render(line)
+}
+
 // ── Record renderer (for viewport content) ────────────────────
 
 func (m *model) printRecord(rec record) string {
@@ -880,6 +901,12 @@ func (m *model) printRecord(rec record) string {
 		styledLines := make([]string, len(wrappedLines))
 		for i, line := range wrappedLines {
 			styledLines[i] = gutter + errorStyle.Render(line)
+		}
+		return strings.Join(styledLines, "\n")
+	case roleActivity:
+		styledLines := make([]string, len(wrappedLines))
+		for i, line := range wrappedLines {
+			styledLines[i] = m.styleActivityLine(line)
 		}
 		return strings.Join(styledLines, "\n")
 	case roleStatus:

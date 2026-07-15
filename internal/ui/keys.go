@@ -42,7 +42,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Arrow keys, j/k, ctrl+u, ctrl+d must forward to viewport so the
 	// user can fluidly inspect long file diffs without scroll lockout.
 	// Tracks scroll-up for user-scroll-lock to prevent auto-scroll jank.
-	if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec {
+	if m.state == StateAwaitingApproval {
 		if m.Ready {
 			switch {
 			case msg.Type == tea.KeyUp || msg.String() == "k" || msg.Type == tea.KeyCtrlU:
@@ -60,44 +60,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
-	}
-
-	// ── Awaiting shell execution approval (alt+ modifier only) ──────────────
-	if m.state == StateAwaitingShellExec {
-		switch {
-		case msg.String() == "alt+a":
-			if !m.resolver.Current().CanShell() {
-				m.pendingShellExec = nil
-				m.state = StateChat
-				m.recalcViewportHeight()
-				m.push(roleSystem, infoStyle.Render("Shell execution blocked."))
-				return m, nil
-			}
-			block := m.pendingShellExec[m.shellAwaitingIdx]
-			m.pendingShellExec = append(m.pendingShellExec[:m.shellAwaitingIdx], m.pendingShellExec[m.shellAwaitingIdx+1:]...)
-			if len(m.pendingShellExec) == 0 {
-				m.state = StateChat
-				m.recalcViewportHeight()
-			}
-			return m, m.execShellCmd(block.Command)
-
-		case msg.String() == "alt+r":
-			m.pendingShellExec = append(m.pendingShellExec[:m.shellAwaitingIdx], m.pendingShellExec[m.shellAwaitingIdx+1:]...)
-			if len(m.pendingShellExec) == 0 {
-				m.state = StateChat
-				m.recalcViewportHeight()
-			}
-			m.push(roleSystem, infoStyle.Render("shell command skipped"))
-			return m, nil
-
-		case msg.Type == tea.KeyEscape:
-			m.pendingShellExec = nil
-			m.state = StateChat
-			m.recalcViewportHeight()
-			m.push(roleSystem, infoStyle.Render("shell execution cancelled"))
-			return m, nil
-		}
-		return m, nil
 	}
 
 	// ── Awaiting approval (alt+ modifier only) ──────────────────────────────
@@ -145,6 +107,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.interruptRequested = true
 			return m, func() tea.Msg { return TaskFinishedMsg{} }
 		}
+		if m.proposedShellCmd != "" {
+			m.proposedShellCmd = ""
+			m.push(roleSystem, infoStyle.Render("Command cancelled."))
+		}
 		m.ti.SetValue("")
 		m.ti.Reset()
 		m.syncInputFromTI()
@@ -182,11 +148,30 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// the user's input appears immediately rather than waiting for the
 		// next UI tick. This prevents the "stale screen until next keypress"
 		// regression.
+		//
+		// HUMAN-IN-THE-LOOP CHECKPOINT: If the agent proposed a shell command
+		// (proposedShellCmd is set), the command was injected into the input bar
+		// for review. Pressing Enter executes it as a shell command rather than
+		// sending it to the LLM. The system remains deterministic, fully visible,
+		// and safe from unintended execution.
 	case tea.KeyEnter:
 		m.userIsScrollingUp = false
 
 		userInput := m.ti.Value()
 		m.dismissSuggestions()
+
+		// ── Proposed shell command checkpoint ──────────────────────────────
+		if m.proposedShellCmd != "" {
+			cmd := m.proposedShellCmd
+			m.proposedShellCmd = ""
+			m.ti.SetValue("")
+			m.ti.Reset()
+			m.syncInputFromTI()
+			m.push(roleUser, "$ "+cmd)
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m, m.execShellCmd(cmd)
+		}
 
 		if userInput != "" {
 			m.currentPrompt = userInput
@@ -221,6 +206,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.showSuggestions && len(m.suggestions) > 0 {
 			return m, nil
 		}
+		m.proposedShellCmd = ""
 		if len(m.history) == 0 {
 			return m, nil
 		}
@@ -236,6 +222,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.showSuggestions && len(m.suggestions) > 0 {
 			return m, nil
 		}
+		m.proposedShellCmd = ""
 		if m.historyIndex < len(m.history)-1 {
 			m.historyIndex++
 			m.ti.SetValue(m.history[m.historyIndex])

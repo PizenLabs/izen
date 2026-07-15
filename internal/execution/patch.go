@@ -280,6 +280,10 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 
+	if globalActivityLog != nil {
+		globalActivityLog("⚙ [system] applying structural patch to: %s ...", patch.File)
+	}
+
 	if patch.Original == "" {
 		if data, err := os.ReadFile(fullPath); err == nil {
 			patch.Original = string(data)
@@ -288,6 +292,9 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 
 	// Create shadow backup before mutation
 	if err := pm.createShadowBackup(fullPath); err != nil {
+		if globalActivityLog != nil {
+			globalActivityLog("[FAIL] patch rejected on %s: shadow backup failed: %v", patch.File, err)
+		}
 		return fmt.Errorf("shadow backup %s: %w", patch.File, err)
 	}
 
@@ -296,14 +303,21 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	case strings.Contains(patch.Modified, "@@"):
 		result, err := applyUnifiedPatch(patch.Original, patch.Modified)
 		if err != nil {
+			if globalActivityLog != nil {
+				globalActivityLog("[FAIL] patch rejected on %s: %v", patch.File, err)
+			}
 			return fmt.Errorf("apply patch to %s: %w", patch.File, err)
 		}
 		final = result
 	case patch.Original != "":
 		clean := SanitizeDiffContent(patch.Modified)
 		if isTruncated(patch.Original, clean) {
-			return fmt.Errorf("refusing to apply truncated content to %s (%.0f%% of original size)",
+			errMsg := fmt.Sprintf("refusing to apply truncated content to %s (%.0f%% of original size)",
 				patch.File, float64(len(clean))/float64(len(patch.Original))*100)
+			if globalActivityLog != nil {
+				globalActivityLog("[FAIL] patch rejected on %s: %s", patch.File, errMsg)
+			}
+			return fmt.Errorf("%s", errMsg)
 		}
 		final = clean
 	default:
@@ -311,7 +325,29 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	}
 
 	if err := os.WriteFile(fullPath, []byte(final), 0644); err != nil {
+		if globalActivityLog != nil {
+			globalActivityLog("[FAIL] patch rejected on %s: write failed: %v", patch.File, err)
+		}
 		return fmt.Errorf("write %s: %w", patch.File, err)
+	}
+
+	origLines := 0
+	if patch.Original != "" {
+		origLines = len(strings.Split(patch.Original, "\n"))
+	}
+	finalLines := len(strings.Split(final, "\n"))
+	linesDelta := finalLines - origLines
+	detail := fmt.Sprintf("%d lines", finalLines)
+	if linesDelta != 0 {
+		sign := "+"
+		if linesDelta < 0 {
+			sign = ""
+		}
+		detail = fmt.Sprintf("%d lines (%s%d)", finalLines, sign, linesDelta)
+	}
+
+	if globalActivityLog != nil {
+		globalActivityLog("[ OK ] patched %s (%s)", patch.File, detail)
 	}
 
 	patch.ContextID = pm.contextID

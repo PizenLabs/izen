@@ -69,7 +69,14 @@ func (c *Controller) SearchRaw(query string) ([]SearchResult, error) {
 			return nil, err
 		}
 	}
-	return c.Daemon.Search(query)
+	if globalActivityLog != nil {
+		globalActivityLog("[system] lx search: %q", query)
+	}
+	results, err := c.Daemon.Search(query)
+	if err != nil && globalActivityLog != nil {
+		globalActivityLog("[FAIL] lx search: %q: %v", query, err)
+	}
+	return results, err
 }
 
 func (c *Controller) ResolveSymbolRaw(name string) ([]SearchResult, error) {
@@ -78,7 +85,14 @@ func (c *Controller) ResolveSymbolRaw(name string) ([]SearchResult, error) {
 			return nil, err
 		}
 	}
-	return c.Daemon.ResolveSymbol(name)
+	if globalActivityLog != nil {
+		globalActivityLog("[system] lx resolve: %q", name)
+	}
+	results, err := c.Daemon.ResolveSymbol(name)
+	if err != nil && globalActivityLog != nil {
+		globalActivityLog("[FAIL] lx resolve: %q: %v", name, err)
+	}
+	return results, err
 }
 
 func (c *Controller) FindRelatedRaw(file string, line int) ([]SearchResult, error) {
@@ -87,7 +101,14 @@ func (c *Controller) FindRelatedRaw(file string, line int) ([]SearchResult, erro
 			return nil, err
 		}
 	}
-	return c.Daemon.FindRelated(file, line)
+	if globalActivityLog != nil {
+		globalActivityLog("[system] lx find-related: %s:%d", file, line)
+	}
+	results, err := c.Daemon.FindRelated(file, line)
+	if err != nil && globalActivityLog != nil {
+		globalActivityLog("[FAIL] lx find-related: %s:%d: %v", file, line, err)
+	}
+	return results, err
 }
 
 func LynxCacheDir(root string) string {
