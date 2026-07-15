@@ -435,28 +435,18 @@ func (m *model) createBuildCheckpoint(fileCount int) {
 var shellExecRegex = regexp.MustCompile("(?s)```(?:bash|sh)\\n(.*?)```")
 
 // extractShellCommands scans a response for bash/sh code blocks and returns
-// them as pending shell execution proposals requiring explicit user approval.
-func extractShellCommands(response string) []shellExecBlock {
+// the command strings for explicit human-in-the-loop confirmation.
+func extractShellCommands(response string) []string {
 	matches := shellExecRegex.FindAllStringSubmatch(response, -1)
-	var blocks []shellExecBlock
+	var cmds []string
 	for _, m := range matches {
 		cmd := strings.TrimSpace(m[1])
 		if cmd == "" {
 			continue
 		}
-		desc := cmd
-		if idx := strings.Index(cmd, "\n"); idx >= 0 {
-			desc = cmd[:idx]
-		}
-		if len(desc) > 60 {
-			desc = desc[:60] + "..."
-		}
-		blocks = append(blocks, shellExecBlock{
-			Command:     cmd,
-			Description: desc,
-		})
+		cmds = append(cmds, cmd)
 	}
-	return blocks
+	return cmds
 }
 
 // execShellCmd executes a shell command and pushes output as records.

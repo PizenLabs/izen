@@ -1949,8 +1949,7 @@ func (m *model) resetObjectiveContextStacks() {
 	m.state = StateChat
 	m.recalcViewportHeight()
 	m.acceptedProposals = nil
-	m.pendingShellExec = nil
-	m.shellAwaitingIdx = 0
+	m.proposedShellCmd = ""
 	m.sess.InvestigationID = ""
 	m.sess.ReviewID = ""
 	m.sess.ClearHistory()

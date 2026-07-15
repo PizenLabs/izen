@@ -58,7 +58,6 @@ type UIState uint8
 const (
 	StateChat UIState = iota
 	StateAwaitingApproval
-	StateAwaitingShellExec
 	StateProcessing
 )
 
@@ -491,9 +490,9 @@ type model struct {
 	// Accepted proposals (collapsed single-line summaries)
 	acceptedProposals []acceptedProposal
 
-	// Shell execution proposals awaiting approval
-	pendingShellExec []shellExecBlock
-	shellAwaitingIdx int
+	// Shell command proposed by agent, injected into the input bar.
+	// The command only executes when the user presses Enter.
+	proposedShellCmd string
 
 	state UIState
 

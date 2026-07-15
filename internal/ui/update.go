@@ -948,21 +948,30 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sess.ClearTasks()
 		}
 
-		// Extract shell commands from the response for explicit approval
+		// EXTRACT SHELL COMMANDS → INJECT INTO INPUT BAR (Human-In-The-Loop)
+		// Under no circumstances does the TUI execute a shell command automatically.
+		// The agent-proposed command is injected into the text input bar, where the
+		// user must explicitly review and press Enter to execute.
 		if m.state == StateChat && !m.awaitingConfirmation {
-			shellBlocks := extractShellCommands(final)
-			if len(shellBlocks) > 0 {
+			shellCmds := extractShellCommands(final)
+			if len(shellCmds) > 0 {
 				mode := m.resolver.Current()
-				if mode.CanShell() {
-					m.pendingShellExec = shellBlocks
-					m.shellAwaitingIdx = 0
-					m.state = StateAwaitingShellExec
-					m.push(roleSystem, shellWarningStyle.Render(
-						fmt.Sprintf("Shell execution: %d command(s) pending", len(shellBlocks))))
-				} else {
+				if !mode.CanShell() {
 					msg := fmt.Sprintf("Tool 'shell' rejected in /%s.", mode)
 					m.push(roleSystem, msg)
 					m.sess.AddMessage("system", msg+" You are in a Read-Only execution environment and must stop requesting system mutations.", 3)
+				} else {
+					cmd := shellCmds[0]
+					if blocked, _ := m.shellFirewall(cmd); blocked {
+						m.push(roleError, "[SECURITY] Proposed shell command blocked by firewall.")
+					} else {
+						m.ti.SetValue(cmd)
+						m.ti.CursorEnd()
+						m.syncInputFromTI()
+						m.proposedShellCmd = cmd
+						m.push(roleSystem, infoStyle.Render(
+							"Command injected into input bar. Review and press Enter to execute, Esc to cancel."))
+					}
 				}
 			}
 		}
@@ -1044,7 +1053,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// completely ignored — no viewport scrolling, no coordinate mapping.
 		// This eliminates any possibility of accidental mutation via click.
 		// During processing, wheel events are allowed for scroll inspection.
-		if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec {
+		if m.state == StateAwaitingApproval {
 			return m, nil
 		}
 		if m.state == StateProcessing && msg.Button != tea.MouseButtonWheelUp && msg.Button != tea.MouseButtonWheelDown {
@@ -1083,7 +1092,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// In special states, route directly to handleKey.
-		if m.state == StateAwaitingApproval || m.state == StateAwaitingShellExec || m.state == StateProcessing {
+		if m.state == StateAwaitingApproval || m.state == StateProcessing {
 			resModel, cmd := m.handleKey(msg)
 			return resModel, cmd
 		}

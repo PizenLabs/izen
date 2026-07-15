@@ -117,9 +117,6 @@ var (
 	infoStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 	errorStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
 
-	// Shell execution proposal
-	shellWarningStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorOrange))
-
 	// Gutter markers
 	gutterUserStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterUser))
 	gutterAIStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGutterAI))
