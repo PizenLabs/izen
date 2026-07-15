@@ -378,18 +378,6 @@ type HandoffContext struct {
 	PendingTodos       []string // TODO strings passed down to /mode plan
 }
 
-// actionChip represents a selectable action rendered at the bottom boundary
-// of the TUI. Hotkey activation executes the associated command.
-// IMPORTANT: All chip keys MUST use "alt+<key>" format to prevent key
-// collisions with normal text input in the prompt chat. Single-letter
-// hotkey bindings are strictly banned.
-type actionChip struct {
-	key    string // Hotkey specifier (e.g. "alt+a", "alt+b") — NO single-letter keys
-	label  string // Display label (e.g. "Investigate Root Cause")
-	action string // Command to execute (e.g. "/mode investigate")
-	query  string // Optional seed content passed with the command
-}
-
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const (
@@ -580,12 +568,21 @@ type model struct {
 	// tick loop force-clears it to prevent ghost spinner lock.
 	lastActionTime time.Time
 
-	// Handoff pipeline: inter-mode state transfer
-	handoffCtx  HandoffContext
-	activeChips []actionChip
-	showChips   bool
+	// Handoff pipeline: inter-mode state transfer (WORKFLOW STATE).
+	// This survives mode transitions and must never be cleared to hide UI.
+	handoffCtx HandoffContext
 
-	// Build verification flag: set after build mutation auto-test
+	// currentResult is the most recent workflow RESULT and the capabilities it
+	// exposes. It is DOMAIN state (the engine's current outcome) — NOT a UI
+	// flag. The renderer never reads it directly; it flows through
+	// BuildViewContext into ViewContext.Actions. It is cleared when a new
+	// workflow begins (mode entry / clear / new task), which bounds capability
+	// staleness to the current view without any presentation state mirroring
+	// the engine.
+	currentResult *Result
+
+	// Build verification flag: set after build mutation auto-test (in-flight
+	// workflow signal, not a render flag).
 	buildVerifyPending bool
 
 	// Context Ledger: silent issue tracking across failure sessions
@@ -603,6 +600,11 @@ type model struct {
 
 	// Workspace root path for config/session persistence
 	workspaceRoot string
+
+	// viewRegistry resolves the current mode to its ViewMode builder. It is
+	// injected at bootstrap (explicit, deterministic) and never mutated by
+	// the renderer — the UI stays mode-agnostic.
+	viewRegistry *Registry
 
 	// Init/setup state machine
 	initStage          initStage
@@ -904,9 +906,9 @@ func (m *model) computeVpHeight() int {
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
 		vpHeight -= m.getProposalDockCurrentHeight()
 	}
-	if m.showChips && len(m.activeChips) > 0 {
-		vpHeight -= len(m.activeChips)
-	}
+	// NOTE: capabilities render INLINE on the status bar line (see
+	// renderStatusBar), so they occupy the single statusLineHeight row above
+	// and never add extra rows.
 	if vpHeight < 1 {
 		return 1
 	}

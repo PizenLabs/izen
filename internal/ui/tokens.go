@@ -131,9 +131,9 @@ var Icon = struct {
 	Plan:     "▤", // ▤
 	Edit:     "✎", // ✎
 	Table:    "⊞", // ⊞
-	Summary:  "›", // ›
+	Summary:  "»", // »
 	Risk:     "◆", // ◆
-	Context:  "❰", // ❰
+	Context:  "⊚", // ⊚
 	Chevron:  "▸", // ▸
 	Bullet:   "•", // •
 	Check:    "●", // ●

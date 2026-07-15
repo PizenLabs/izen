@@ -57,6 +57,15 @@ func newTestModel() *model {
 		awaitingConfirmation: true,
 		spinnerFrame:         0,
 		PreRenderedHistory:   "previous content\n",
+		viewRegistry: func() *Registry {
+			r := NewRegistry()
+			r.Register(modes.ModeAsk, askView{})
+			r.Register(modes.ModePlan, planView{})
+			r.Register(modes.ModeBuild, buildView{})
+			r.Register(modes.ModeInvestigate, investigateView{})
+			r.Register(modes.ModeReview, reviewView{})
+			return r
+		}(),
 	}
 }
 

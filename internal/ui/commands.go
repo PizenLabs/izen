@@ -400,6 +400,12 @@ func (m *model) setMode(mode modes.Mode) {
 		return
 	}
 	m.startModeTransition(mode)
+	// ── Reset view-scoped workflow result on mode entry ────────────────
+	// Entering a new mode starts a fresh workflow: the previous result's
+	// capabilities (failure to investigate, build-verify commit/rollback) are
+	// no longer relevant to the current view. handoffCtx is intentionally left
+	// intact for genuine cross-mode handoffs.
+	m.currentResult = nil
 	m.sess.SetMode(mode)
 	_ = m.sess.Save()
 	modeColor := modeAccentColor(mode)
@@ -411,7 +417,6 @@ func (m *model) setMode(mode modes.Mode) {
 	// Handoff context injection primes the target mode with state from the
 	// previous mode's terminal event.
 	m.injectHandoffContext(mode)
-	m.updateActionChips()
 
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
@@ -519,6 +524,9 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.records = nil
 		m.PreRenderedHistory = ""
 		m.showBanner = true
+		// /clear wipes the conversation view; clear the current workflow
+		// result's capabilities too (leave handoffCtx intact for handoffs).
+		m.currentResult = nil
 		m.refreshViewportContent()
 		return tea.Sequence(tea.ClearScreen, tea.Println("IZEN cleared."))
 
@@ -1841,6 +1849,11 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 
 			// Also store in handoff context for downstream mode pipelines.
 			m.handoffCtx.LastFailurePayload = diagnosis
+			// The diagnosis is a failure produced by the current workflow:
+			// expose a capability to investigate its root cause via the
+			// current result (cleared on mode entry, so it never persists
+			// as a stale chip).
+			m.currentResult = failureResult(diagnosis)
 
 			return agentDoneMsg{}
 		},
@@ -1947,60 +1960,6 @@ func (m *model) resetObjectiveContextStacks() {
 
 // ── Handoff Pipeline ───────────────────────────────────────────────────────────
 
-// updateActionChips evaluates the current handoff context and mode to
-// dynamically populate the active action chips at the UI bottom boundary.
-// NOTE: All chip keys use alt+ modifier to avoid key collisions with
-// normal text input (see MODIFIER-BASED INPUT SAFETY).
-func (m *model) updateActionChips() {
-	m.activeChips = nil
-	m.showChips = false
-
-	mode := m.resolver.Current()
-	switch mode {
-	case modes.ModeReview:
-		if m.handoffCtx.LastFailurePayload != "" {
-			m.activeChips = append(m.activeChips, actionChip{
-				key:    "alt+a",
-				label:  "Investigate Root Cause",
-				action: "/mode investigate",
-				query:  "Investigate root cause of the following failure:\n\n" + m.handoffCtx.LastFailurePayload,
-			})
-			m.showChips = true
-		}
-
-	case modes.ModeInvestigate:
-		if m.handoffCtx.ProposedFix != "" {
-			m.activeChips = append(m.activeChips, actionChip{
-				key:    "alt+b",
-				label:  "Formulate Execution Plan",
-				action: "/mode plan",
-				query:  "Formulate an execution plan for the proposed fix:\n\n" + m.handoffCtx.ProposedFix,
-			})
-			m.showChips = true
-		}
-
-	case modes.ModePlan:
-		if len(m.handoffCtx.PendingTodos) > 0 {
-			var todoBlock strings.Builder
-			todoBlock.WriteString("Execute the planned changes with these TODOs:\n")
-			for _, t := range m.handoffCtx.PendingTodos {
-				fmt.Fprintf(&todoBlock, "  - %s\n", t)
-			}
-			m.activeChips = append(m.activeChips, actionChip{
-				key:    "alt+c",
-				label:  "Execute & Verify Patch",
-				action: "/mode build",
-				query:  todoBlock.String(),
-			})
-			m.showChips = true
-		}
-
-	case modes.ModeBuild:
-		// Post-build commit/rollback chips are set dynamically in update.go
-		// based on test verification results.
-	}
-}
-
 // injectHandoffContext primes the target mode with contextual state from the
 // previous mode. Called during setMode when a handoff context is available.
 func (m *model) injectHandoffContext(mode modes.Mode) {
@@ -2028,35 +1987,37 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 	}
 }
 
-// handleChipActivation routes a hotkey press to the matching action chip.
-// Returns the tea.Cmd to execute, or nil if no chip matched.
-func (m *model) handleChipActivation(key string) tea.Cmd {
-	for _, chip := range m.activeChips {
-		if !strings.EqualFold(chip.key, key) {
-			continue
-		}
-		m.push(roleUser, chip.action)
-		m.push(roleSystem, fmt.Sprintf("Activated: %s", chip.label))
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-
-		// Mode transition chips: /mode <name>
-		parts := strings.Fields(chip.action)
-		if len(parts) >= 2 && parts[0] == "/mode" {
-			mode, ok := modes.Parse(parts[1])
-			if ok {
-				m.setMode(mode)
-				if chip.query != "" {
-					return m.handleMessageContent(chip.query)
-				}
-			}
-			return nil
-		}
-
-		// Direct command chips: /commit, /undo, etc.
-		return m.handleCommand(chip.action)
+// handleChipActivation routes a hotkey press to the matching capability and
+// executes it. The action is a pure capability produced by the workflow layer
+// (see BuildViewContext); the renderer never decides activation. The consumed
+// capability's result is cleared because the action has been taken.
+func (m *model) handleChipActivation(action Action) tea.Cmd {
+	if !action.Enabled {
+		return nil
 	}
-	return nil
+	m.push(roleUser, action.Command)
+	m.push(roleSystem, fmt.Sprintf("Activated: %s", action.Label))
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
+
+	// Consuming a result capability ends the current result's relevance.
+	m.currentResult = nil
+
+	// Mode transition capabilities: /mode <name>
+	parts := strings.Fields(action.Command)
+	if len(parts) >= 2 && parts[0] == "/mode" {
+		mode, ok := modes.Parse(parts[1])
+		if ok {
+			m.setMode(mode)
+			if action.Query != "" {
+				return m.handleMessageContent(action.Query)
+			}
+		}
+		return nil
+	}
+
+	// Direct command capabilities: /commit, /undo, etc.
+	return m.handleCommand(action.Command)
 }
 
 // parseProposedFixIntoTodos converts a proposed fix (markdown/diff) into a

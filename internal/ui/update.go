@@ -258,22 +258,21 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !msg.passed && msg.output != "" {
 			m.handoffCtx.LastFailurePayload = msg.output
 			m.handoffCtx.TargetScope = m.lastTestTarget
-			m.updateActionChips()
+			// Expose the failure as a workflow result: the capability to
+			// investigate its root cause is now available for the current
+			// view. Cleared on mode entry, so it never persists as a stale
+			// chip. A passing run clears any prior failure result.
+			m.currentResult = failureResult(msg.output)
+		} else if msg.passed {
+			m.currentResult = nil
 		}
 
 		// ── Build verification: post-mutation test auto-result ───────────
 		if m.buildVerifyPending {
 			m.buildVerifyPending = false
-			if msg.passed {
-				m.activeChips = []actionChip{
-					{key: "alt+d", label: "Commit Safe Baseline", action: "/commit"},
-				}
-			} else {
-				m.activeChips = []actionChip{
-					{key: "alt+r", label: "Rollback Workspace", action: "/undo"},
-				}
-			}
-			m.showChips = true
+			// The verification outcome is a workflow result exposing a
+			// commit/rollback capability for the current view.
+			m.currentResult = buildVerifyResult(msg.passed)
 			if m.resolver.Current() == modes.ModeBuild {
 				m.push(roleSystem, "Build verification complete.")
 			}
@@ -407,6 +406,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.handoffCtx.LastFailurePayload = msg.content
 		}
+		// env diagnostics carry a failure into the current view; expose it as
+		// a workflow result so the investigate capability is available now.
+		m.currentResult = failureResult(msg.content)
 		m.push(roleSystem, msg.content)
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -450,6 +452,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Pipe execution log into handoff context for $diagnose
 		m.handoffCtx.LastFailurePayload = msg.output
 		m.handoffCtx.TargetScope = msg.target
+		// A trace that produced output exposes a failure result whose
+		// investigate capability is available for the current view.
+		m.currentResult = failureResult(msg.output)
 
 		statusLine := fmt.Sprintf("trace: %d total, %d failed — target %q", msg.total, msg.failed, msg.target)
 		if msg.passed {
@@ -785,9 +790,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// ── Handoff: Capture ProposedFix from investigate mode ──────────
+		// The "Formulate Execution Plan" capability is derived from
+		// handoffCtx.ProposedFix in BuildViewContext; no UI cache to refresh.
 		if m.resolver.Current() == modes.ModeInvestigate && final != "" {
 			m.handoffCtx.ProposedFix = final
-			m.updateActionChips()
 		}
 
 		// ── Auto-transition: investigate → build on mutation detection ──
@@ -807,9 +813,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// ── Handoff: Capture PendingTodos from plan mode ────────────────
+		// The "Execute & Verify Patch" capability is derived from
+		// handoffCtx.PendingTodos in BuildViewContext; no UI cache to refresh.
 		if m.resolver.Current() == modes.ModePlan && final != "" {
 			m.handoffCtx.PendingTodos = extractTodosFromPlan(final)
-			m.updateActionChips()
 		}
 
 		// SECTION 1: INTERCEPTING STREAM COMPLETION
@@ -871,7 +878,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamStartTime = time.Time{}
 		}
 		m.push(roleStatus, dimmedStyle.Render(
-			fmt.Sprintf("done · +%d tok · %s · %.1fs", delta, costStr, latencySec)))
+			fmt.Sprintf("✔ done · +%d tok · %s · %.1fs", delta, costStr, latencySec)))
 
 		if m.resolver.Current() == modes.ModePlan {
 			validation := plan.ValidatePlanOutput(final)
@@ -1061,21 +1068,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 
-		// ── Action Chip Hotkeys (alt+ modifier only) ─────────────────────
+		// ── Capability Hotkeys (alt+ modifier only) ────────────────────
 		// Single-character hotkeys are strictly banned to prevent key
 		// collisions with normal prompt input (e.g., typing in /plan).
-		if m.showChips && !m.streaming && !m.agentRunning && m.state == StateChat {
-			switch msg.String() {
-			case "alt+a":
-				return m, m.handleChipActivation("alt+a")
-			case "alt+b":
-				return m, m.handleChipActivation("alt+b")
-			case "alt+c":
-				return m, m.handleChipActivation("alt+c")
-			case "alt+d":
-				return m, m.handleChipActivation("alt+d")
-			case "alt+r":
-				return m, m.handleChipActivation("alt+r")
+		// The active capabilities come from the workflow layer's render
+		// context; the renderer/update loop never decides which exist.
+		if !m.streaming && !m.agentRunning && m.state == StateChat {
+			key := msg.String()
+			for _, act := range m.BuildWorkspace().Actions {
+				if act.Enabled && strings.EqualFold(act.Shortcut, key) {
+					return m, m.handleChipActivation(act)
+				}
 			}
 		}
 

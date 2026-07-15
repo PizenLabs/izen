@@ -53,80 +53,70 @@ func (m *model) renderContextHeader() string {
 	return label + "\n"
 }
 
-// View returns the full UI state.
-// Uses lipgloss.JoinVertical for a rigid bottom-up box model with zero gaps:
-//
-//  1. m.Viewport.View()           ── top, consumes all remaining space
-//  2. proposalDockView            ── middle (approval/processing states only)
-//  3. inputView                   ── autocomplete + separators + input prompt
-//  4. statusBarView               ── runtime telemetry, rigidly pinned to bottom
-//
-// The viewport height is computed inline from the actual rendered heights of
-// the input and status bar blocks via lipgloss.Height(), guaranteeing that the
-// input prompt and status bar never leave the bottom frame with zero floating
-// margin regardless of autocomplete toggling, state transitions, or proposal
-// expansion.
+// View is the renderer entry point. It is a pure projection: it obtains the
+// current Workspace from the workflow layer and renders it. The renderer knows
+// nothing about modes, banners, prompts, footers, or action logic — only how
+// to project a Workspace onto the terminal.
 func (m *model) View() string {
-	if m.initStage != initNone && m.initStage != initComplete {
-		return m.renderInitView()
-	}
+	return renderWorkspace(m.BuildWorkspace())
+}
 
-	if m.showHelpOverlay {
-		return m.renderHelpOverlay()
+// renderWorkspace is the ONLY rendering primitive. It projects a Workspace
+// onto the terminal with no awareness of mode, workflow, or UI logic.
+func renderWorkspace(ws Workspace) string {
+	if ws.Overlay != "" {
+		return ws.Overlay
 	}
-
-	if !m.Ready {
-		return "Loading IZEN..."
+	var parts []string
+	parts = append(parts, ws.Viewport)
+	if ws.ProposalDock != "" {
+		parts = append(parts, ws.ProposalDock)
 	}
+	if ws.Input != "" {
+		parts = append(parts, ws.Input)
+	}
+	if ws.Footer != "" {
+		parts = append(parts, ws.Footer)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
 
+// assembleScreen builds the Workspace's screen regions from the supplied
+// capabilities. This is workflow/screen-assembly logic that belongs to the
+// model layer, NOT the renderer: it computes region heights, sizes the
+// viewport, and precomposes the input and footer regions. The renderer later
+// projects the resulting Workspace without re-deriving any of this.
+func (m *model) assembleScreen(actions []Action) Workspace {
 	width := m.width
 	if width < 40 {
 		width = 40
 	}
 
-	// ── Build input view ───────────────────────────────────────────────
-	// Reading flow (top → bottom):
-	//   upper separator  ── region boundary above the prompt
-	//   action chips     ── interaction affordances (optional)
-	//   prompt line      ── the natural start of the next interaction
-	//   lower separator  ── region boundary below the prompt
-	//   metadata line    ── runtime telemetry (lowest visual priority)
 	mode := m.resolver.Current()
 	modeColor := m.modeStyle(mode)
 
+	// ── Input region: autocomplete + separators + prompt ──
 	var inputView strings.Builder
 	if m.autocompleteActive && len(m.autocompleteItems) > 0 {
 		inputView.WriteString(m.renderAutocompleteDropdown(width))
 	}
-
-	// Upper separator: major region boundary above the prompt.
 	inputView.WriteString(rule(width, modeColor) + "\n")
-
-	// Action chips sit just above the prompt as interaction affordances.
-	if chipsView := m.renderActionChips(width); lipgloss.Height(chipsView) > 0 {
-		inputView.WriteString(chipsView)
-	}
-
-	// The prompt itself — sits naturally between the two separators and
-	// immediately follows the rendered document above it.
-	promptLabel := modeColor.Render(Icon.Command + " " + mode.String())
+	promptLabel := modeColor.Render(mode.String() + " " + Icon.Command)
 	inputView.WriteString(promptLabel + " " + m.ti.View() + "\n")
+	inputView.WriteString(rule(width, modeColor))
 
-	// Lower separator: closes the prompt region; metadata follows below it.
-	inputView.WriteString(rule(width, modeColor) + "\n")
+	// ── Footer: status bar (telemetry with capabilities inlined) ──
+	footerView := m.renderStatusBar(width, actions)
 
-	// ── Build status bar (runtime metadata, lowest visual priority) ──
-	statusBarView := m.renderRuntimeStatus(width)
-
-	// ── Build proposal dock (conditional) ──
+	// ── Proposal dock (conditional) ──
 	var proposalDockView string
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
 		proposalDockView = m.renderProposalBlock()
 	}
 
-	// ── Compute exact heights using lipgloss — no manual constants, no gaps ──
+	// ── Size the viewport to fill the remaining space (no manual constants) ──
 	inputHeight := lipgloss.Height(inputView.String())
-	statusHeight := lipgloss.Height(statusBarView)
+	statusHeight := lipgloss.Height(footerView)
 	proposalHeight := lipgloss.Height(proposalDockView)
 
 	m.Viewport.Height = m.height - inputHeight - statusHeight - proposalHeight
@@ -134,15 +124,13 @@ func (m *model) View() string {
 		m.Viewport.Height = 1
 	}
 
-	// ── Assemble final layout with JoinVertical ──
-	var parts []string
-	parts = append(parts, m.Viewport.View())
-	if proposalHeight > 0 {
-		parts = append(parts, proposalDockView)
+	return Workspace{
+		Viewport:     m.Viewport.View(),
+		ProposalDock: proposalDockView,
+		Input:        inputView.String(),
+		Footer:       footerView,
+		Actions:      actions,
 	}
-	parts = append(parts, inputView.String())
-	parts = append(parts, statusBarView)
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
 // renderProposalBlock renders the interactive proposal/processing dock
@@ -457,7 +445,7 @@ func (m *model) renderRuntimeStatus(width int) string {
 
 	// AI INTERRUPT ENGINE: high-visibility indicator when streaming
 	if m.streaming {
-		b.WriteString(interruptLabelStyle.Render("⏹ Ctrl+C to interrupt "))
+		b.WriteString(interruptLabelStyle.Render("⏹ Ctrl+C interrupt "))
 	}
 
 	// Agent label — shown immediately after the spinner, before model name
@@ -520,33 +508,71 @@ var devTips = []string{
 	"Pro Tip: Toggle the global help dashboard overlay instantly by pressing [?] during idle input states.",
 }
 
-// renderActionChips renders the dynamic action chip bar at the bottom
-// boundary of the TUI. Each chip is a hotkey + label pair that triggers a
-// handoff pipeline transition or terminal action.
-// NOTE: Chip keys use alt+ modifier — single-letter hotkeys are banned
-// to prevent key collisions with normal prompt input.
-func (m *model) renderActionChips(width int) string {
-	if !m.showChips || len(m.activeChips) == 0 {
-		return ""
+// renderStatusBar renders the runtime telemetry line — the lowest visual
+// priority element, pinned to the bottom. When capabilities are exposed by the
+// current workflow context, they are rendered INLINE on the same line,
+// right-aligned, so the bar never grows an extra row and the prompt above
+// stays perfectly still. The renderer never decides which capabilities exist;
+// it only projects the slice handed to it by the workflow layer.
+//
+// Layout (capability active):
+//
+//	qwen2.5-coder · 9 tok · cp-1784040                     ⌥A Investigate Root Cause
+//
+// Layout (no capability):
+//
+//	qwen2.5-coder · 9 tok · cp-1784040
+func (m *model) renderStatusBar(width int, actions []Action) string {
+	chip := renderActions(actions)
+	if chip == "" {
+		return m.renderRuntimeStatus(width)
 	}
+	// Reserve the chip's width on the right and let the status line shrink its
+	// own segments to fit the remaining budget, so the two never collide.
+	gap := 2
+	chipW := lipgloss.Width(chip)
+	statusBudget := width - chipW - gap
+	if statusBudget < 0 {
+		statusBudget = 0
+	}
+	status := m.renderRuntimeStatus(statusBudget)
+	// Right-align the chip with at least `gap` spaces of breathing room.
+	pad := width - lipgloss.Width(status) - chipW
+	if pad < gap {
+		pad = gap
+	}
+	return status + strings.Repeat(" ", pad) + chip
+}
+
+// renderActions renders the currently available capabilities as inline,
+// right-aligned tokens: a hotkey + label pair. It is a pure projection of the
+// Action slice — it inspects no mode, no handoff state, and no engine flag.
+// Returns "" when no capability is available.
+// NOTE: Capability hotkeys use alt+ modifier — single-letter hotkeys are banned
+// to prevent key collisions with normal prompt input.
+func renderActions(actions []Action) string {
 	displayKey := func(key string) string {
+		// Render the alt/option modifier as the ⌥ glyph (e.g. "alt+c" → "⌥C").
 		if len(key) > 4 && key[:4] == "alt+" {
-			return "Alt+" + strings.ToUpper(key[4:])
+			return "⌥" + strings.ToUpper(key[4:])
 		}
 		return strings.ToUpper(key)
 	}
 	var b strings.Builder
-	for _, chip := range m.activeChips {
-		hotkey := hotkeyStyle.Render("[" + displayKey(chip.key) + "]")
-		label := textStyle.Render(chip.label)
-		actionHint := mutedStyle.Render(chip.action)
-		pad := width - lipgloss.Width(hotkey+" "+label+" "+actionHint) - 2
-		if pad < 0 {
-			pad = 0
+	for _, act := range actions {
+		if !act.Enabled {
+			continue
 		}
-		b.WriteString("  " + hotkey + " " + label + " " + strings.Repeat(" ", pad) + actionHint + "\n")
+		hotkey := hotkeyStyle.Render(displayKey(act.Shortcut))
+		label := textStyle.Render(act.Label)
+		if b.Len() > 0 {
+			b.WriteString("  ")
+		}
+		// Inline chip shows the hotkey + label only; the command itself is
+		// executed on activation and need not be displayed.
+		b.WriteString(hotkey + " " + label)
 	}
-	return textStyle.Render(b.String())
+	return b.String()
 }
 
 // ── Startup banner ────────────────────────────────────────────────────
