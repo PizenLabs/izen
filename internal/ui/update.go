@@ -270,8 +270,27 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// ── Build verification: post-mutation test auto-result ───────────
 		if m.buildVerifyPending {
 			m.buildVerifyPending = false
-			// The verification outcome is a workflow result exposing a
-			// commit/rollback capability for the current view.
+
+			// ── Automated error recovery loop ───────────────────────────
+			// When verification fails after a build patch, silently trigger
+			// a recovery cycle: re-read the file, re-generate a corrected
+			// AST block, and re-apply — without producing any UI chatter.
+			if !msg.passed && m.resolver.Current() == modes.ModeBuild &&
+				m.buildRecoveryCount < maxBuildRecoveryAttempts {
+				m.buildRecoveryCount++
+				m.acceptAll = true
+				m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
+					"⚙ [recovery %d/%d] auto-correcting compilation errors...",
+					m.buildRecoveryCount, maxBuildRecoveryAttempts)))
+				flush := m.flushPendingRecords()
+				return m, tea.Batch(flush, m.runFixCmd(""))
+			}
+
+			// If recovery exhausted or verification passed, expose the
+			// corresponding workflow result (commit / rollback).
+			if m.buildRecoveryCount >= maxBuildRecoveryAttempts {
+				m.acceptAll = false
+			}
 			m.currentResult = buildVerifyResult(msg.passed)
 			if m.resolver.Current() == modes.ModeBuild {
 				m.push(roleSystem, "Build verification complete.")
@@ -801,8 +820,56 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// concludes with a concrete mutation proposal (code blocks with
 		// language annotations), automatically transition to /build and
 		// initiate the fix pipeline. This eliminates the manual handoff step.
+		//
+		// STRICT GUARD: If the last compilation state contains [build failed]
+		// or any AST/syntax errors, the agent is strictly prohibited from
+		// jumping directly to /build. Instead it must route to /plan for
+		// structured recovery (Sanitization → Package Isolation → Atomic Fixes).
 		if m.resolver.Current() == modes.ModeInvestigate && m.handoffCtx.ProposedFix != "" {
 			if containsMutationIntention(m.handoffCtx.ProposedFix) {
+				// ── Compile failure guard ────────────────────────────────
+				compileFailure := detectCompileFailure(m.handoffCtx.LastFailurePayload)
+				if !compileFailure && m.lastTestOutput != "" {
+					compileFailure = detectCompileFailure(m.lastTestOutput)
+				}
+
+				if compileFailure {
+					// ── FORCED ROUTING TO /plan ──────────────────────────
+					// Structural errors require a deliberate design phase
+					// before any patching is attempted.
+					m.push(roleSystem, warningBannerStyle.Render(
+						"[!] Compile failure detected — routing to /plan for structured recovery."))
+					m.push(roleSystem, infoStyle.Render(
+						"Recovery checklist: Sanitization → Package Isolation → Atomic Fixes."))
+					m.setMode(modes.ModePlan)
+
+					recoveryPrompt := "## STRUCTURED RECOVERY CHECKLIST\n\n" +
+						"The codebase has compilation errors. Create a structured recovery plan with:\n\n" +
+						"### 1. Sanitization\n" +
+						"- Identify and document all syntax/type errors in the compilation output\n" +
+						"- Do NOT propose blind patches — first understand the full scope of breakage\n\n" +
+						"### 2. Package Isolation\n" +
+						"- Group related errors by package/file\n" +
+						"- Determine dependency order for fixes\n\n" +
+						"### 3. Atomic Fixes\n" +
+						"- For each error, specify the minimal corrective change\n" +
+						"- Output each fix as a separate task with file target and description\n\n" +
+						"### Compilation Errors\n```\n" +
+						m.handoffCtx.LastFailurePayload +
+						"\n```\n" +
+						"### Root Cause Analysis\n" +
+						m.handoffCtx.ProposedFix
+
+					m.currentPrompt = recoveryPrompt
+					m.streamCh = nil
+					m.streaming = false
+					m.streamParser = nil
+					flush := m.flushPendingRecords()
+					m.refreshViewportContent()
+					return m, tea.Batch(flush, m.streamCmd(recoveryPrompt))
+				}
+
+				// No compile failure — safe to auto-transition to /build
 				m.push(roleSystem, infoStyle.Render("File mutation detected. Switched to /build."))
 				m.setMode(modes.ModeBuild)
 				m.lastTestOutput = m.handoffCtx.ProposedFix
@@ -1231,6 +1298,34 @@ func (m *model) smoothStreamTickCmd() tea.Cmd {
 // investigate mode proposes concrete file mutations. Uses language-annotated
 // code blocks as the heuristic — when the agent outputs code blocks with known
 // language identifiers (go, diff, python, etc.), it indicates a patch proposal.
+// detectCompileFailure scans the given output for build/compile failure
+// signatures. Returns true when the codebase is in a non-compilable state
+// that requires structural recovery before any patch can be applied.
+func detectCompileFailure(output string) bool {
+	if output == "" {
+		return false
+	}
+	lower := strings.ToLower(output)
+	indicators := []string{
+		"[build failed]",
+		"syntax error",
+		"compilation error",
+		"expected declaration",
+		"non-declaration statement outside function body",
+		"expected ';'",
+		"cannot find package",
+		"undefined:",
+		"not enough arguments",
+		"too many errors",
+	}
+	for _, ind := range indicators {
+		if strings.Contains(lower, ind) {
+			return true
+		}
+	}
+	return false
+}
+
 func containsMutationIntention(content string) bool {
 	lower := strings.ToLower(content)
 	mutationLanguages := []string{

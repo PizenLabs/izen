@@ -383,6 +383,7 @@ type HandoffContext struct {
 const (
 	version                   = "0.1.0"
 	maxInvestigateInvocations = 20
+	maxBuildRecoveryAttempts  = 3
 
 	maxProposalDiffHeight = 15 // max visible diff lines in expanded proposal widget
 )
@@ -584,6 +585,10 @@ type model struct {
 	// Build verification flag: set after build mutation auto-test (in-flight
 	// workflow signal, not a render flag).
 	buildVerifyPending bool
+
+	// Build auto-recovery counter: tracks retry attempts after persistent
+	// build failure during verification. Reset on mode entry and clear.
+	buildRecoveryCount int
 
 	// Context Ledger: silent issue tracking across failure sessions
 	ledger *ContextLedger
