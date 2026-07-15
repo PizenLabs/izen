@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
@@ -386,6 +387,22 @@ const (
 	maxBuildRecoveryAttempts  = 3
 
 	maxProposalDiffHeight = 15 // max visible diff lines in expanded proposal widget
+
+	// Vi-mode states
+	ViNormal = 0
+	ViVisual = 1
+
+	viGGTimeout    = 500 * time.Millisecond
+	viTripleEscMax = 800 * time.Millisecond
+
+	// Inline markers for cursor/selection injection in raw text.
+	// These are zero-width sentinel sequences that we insert into raw
+	// record text before the rendering pipeline, then detect and replace
+	// with styled lipgloss output after rendering.
+	cursorOpen  = "\x00CURSOR\x00"
+	cursorClose = "\x00/ CURSOR\x00"
+	selOpen     = "\x00SEL\x00"
+	selClose    = "\x00/SEL\x00"
 )
 
 var coreModes = []string{"/ask", "/plan", "/build", "/investigate", "/review"}
@@ -550,6 +567,26 @@ type model struct {
 	// auto-scroll to bottom is suppressed until SPACE or a new message.
 	userIsScrollingUp bool
 
+	// Vi-mode navigation state
+	inViMode        bool      // viewport navigation mode active
+	viModeState     int       // ViNormal (0) or ViVisual (1)
+	cursorLine      int       // index into m.records for cursor (logical row)
+	cursorCol       int       // rune offset within the active record's text (logical col)
+	visualStartLine int       // anchor record index for visual block selection
+	visualStartCol  int       // anchor rune offset for character-level visual selection
+	viTopLine       int       // top visible record line index (viewport scroll anchor)
+	viForceTop      bool      // gg: snap viewport YOffset to absolute top
+	viForceBottom   bool      // G: snap viewport YOffset to absolute bottom
+	searchQuery     string    // active search query buffer
+	searchActive    bool      // user is typing a search query
+	viSearchResults []int     // line numbers matching the search
+	viSearchIdx     int       // current position in search results
+	viPendingPrefix string    // for multi-key sequences (gg, etc.)
+	escCount        int       // consecutive escape presses
+	lastEscTime     time.Time // timestamp of last escape press
+	viCmdMode       bool      // typing a : or / command in vi-mode
+	viCmdBuf        string    // buffered vi command text
+
 	// Test/run output storage for /fix consumption
 	lastTestOutput string
 	lastTestFailed bool
@@ -685,7 +722,7 @@ func (m *model) setApplyError(text string) {
 // real time — even during streaming (bypasses the PreRenderedHistory
 // streaming freeze).
 func (m *model) logActivity(format string, args ...interface{}) {
-	msg := fmt.Sprintf(format, args...)
+	msg := sanitizeIngressANSI(fmt.Sprintf(format, args...))
 	r := record{role: roleActivity, text: msg}
 	m.records = append(m.records, r)
 	if m.width > 0 {
@@ -703,8 +740,93 @@ func (m *model) logActivity(format string, args ...interface{}) {
 // push appends a record. Records are flushed to the terminal's native
 // scrollback at explicit sync points (user submit, stream done, etc.).
 func (m *model) push(r role, text string) {
+	text = sanitizeIngressANSI(text)
 	m.records = append(m.records, record{role: r, text: text})
 	m.cacheRecordToHistory(record{role: r, text: text})
+}
+
+// sanitizeIngressANSI is the ingress filter for external stream ingestion.
+// External processes (go test, build runners, shells) sometimes emit SGR
+// bytes whose leading ESC (\x1b) was stripped before the line reached the
+// buffer, e.g. "[38;2;108;112;134m". Rendered verbatim these print as raw
+// garbage on the TUI viewport and corrupt vi-mode column alignment. We drop
+// only the orphaned sequences — any SGR still prefixed with \x1b is valid
+// ANSI and is preserved verbatim, so intentional styling (lipgloss output)
+// survives untouched.
+func sanitizeIngressANSI(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+
+	runes := []rune(s)
+	n := len(runes)
+	i := 0
+	for i < n {
+		// Copy any valid escape sequence (\x1b[ ... <final byte>) verbatim.
+		if runes[i] == '\x1b' {
+			if i+1 < n && runes[i+1] == '[' {
+				b.WriteRune('\x1b')
+				i++
+				b.WriteRune('[')
+				i++
+				// CSI/SGR parameter + intermediate bytes are all < 'A'; the
+				// final byte (e.g. 'm', 'J', 'K') lies in 'A'..'~'.
+				for i < n && (runes[i] < 'A' || runes[i] > '~') {
+					b.WriteRune(runes[i])
+					i++
+				}
+				if i < n {
+					b.WriteRune(runes[i])
+					i++
+				}
+			} else {
+				// Non-CSI escape (e.g. OSC intro \x1b]); keep the ESC and let
+				// the following bytes be re-scanned for orphaned SGR.
+				b.WriteRune('\x1b')
+				i++
+			}
+			continue
+		}
+
+		// Outside an escape: an orphaned SGR looks like "[\d+(;\d+)*m" with no
+		// preceding ESC. Detect and skip it.
+		if runes[i] == '[' && matchOrphanSGR(runes, i) >= 0 {
+			i = matchOrphanSGR(runes, i) + 1
+			continue
+		}
+
+		b.WriteRune(runes[i])
+		i++
+	}
+	return b.String()
+}
+
+// matchOrphanSGR returns the index of the closing 'm' of an orphaned SGR
+// sequence beginning at runes[start]=='[', or -1 when it does not match the
+// pattern \[\d+(?:;\d+)*m (i.e. it is part of ordinary text such as "[3m]").
+func matchOrphanSGR(runes []rune, start int) int {
+	j := start + 1
+	if j >= len(runes) || runes[j] < '0' || runes[j] > '9' {
+		return -1
+	}
+	j++ // first numeric block
+	for j < len(runes) && runes[j] >= '0' && runes[j] <= '9' {
+		j++
+	}
+	for j < len(runes) && runes[j] == ';' {
+		k := j + 1
+		if k < len(runes) && runes[k] >= '0' && runes[k] <= '9' {
+			j = k + 1
+			for j < len(runes) && runes[j] >= '0' && runes[j] <= '9' {
+				j++
+			}
+		} else {
+			break
+		}
+	}
+	if j < len(runes) && runes[j] == 'm' {
+		return j
+	}
+	return -1
 }
 
 // cacheRecordToHistory renders a single record and appends it to PreRenderedHistory.
@@ -753,8 +875,9 @@ func (m *model) renderRecordForViewport(rec record) string {
 
 // pushRecords appends multiple records.
 func (m *model) pushRecords(recs []record) {
-	m.records = append(m.records, recs...)
 	for _, rec := range recs {
+		rec.text = sanitizeIngressANSI(rec.text)
+		m.records = append(m.records, rec)
 		m.cacheRecordToHistory(rec)
 	}
 }
@@ -795,6 +918,8 @@ func (m *model) latestCheckpointID() string {
 // PreRenderedHistory (cached) plus any active streaming content.
 // During streaming the PreRenderedHistory cache is never rebuilt,
 // which avoids re-highlighting or re-wrapping old history on every tick.
+// When in Vi-mode, records are rendered directly with cursor/selection
+// highlighting instead of using the cached PreRenderedHistory.
 func (m *model) refreshViewportContent() {
 	if !m.Ready {
 		return
@@ -816,7 +941,9 @@ func (m *model) refreshViewportContent() {
 		content.WriteString(m.renderWorkspaceHeader())
 	}
 
-	if m.PreRenderedHistory != "" {
+	if m.inViMode {
+		content.WriteString(m.renderRecordsWithCursor())
+	} else if m.PreRenderedHistory != "" {
 		content.WriteString(m.PreRenderedHistory)
 	}
 
@@ -837,6 +964,224 @@ func (m *model) refreshViewportContent() {
 	}
 
 	m.Viewport.SetContent(content.String())
+}
+
+// renderRecordsWithCursor renders all chat records with vi-mode cursor and
+// visual selection highlighting applied inline. Highlighting is performed on
+// the already-rendered ANSI output via injectStyleRange, which locates the
+// target printable character(s) without slicing raw text — so ANSI escape
+// sequences are never cut and style bytes never leak to the screen.
+func (m *model) renderRecordsWithCursor() string {
+	if len(m.records) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+
+	// Normalize visual selection coordinates (top-left → bottom-right)
+	selStartLine, selEndLine := 0, -1
+	selStartCol, selEndCol := 0, 0
+	if m.viModeState == ViVisual {
+		if m.visualStartLine < m.cursorLine ||
+			(m.visualStartLine == m.cursorLine && m.visualStartCol <= m.cursorCol) {
+			selStartLine, selEndLine = m.visualStartLine, m.cursorLine
+			selStartCol, selEndCol = m.visualStartCol, m.cursorCol
+		} else {
+			selStartLine, selEndLine = m.cursorLine, m.visualStartLine
+			selStartCol, selEndCol = m.cursorCol, m.visualStartCol
+		}
+	}
+
+	for i, rec := range m.records {
+		rendered := m.renderRecordForViewport(rec)
+		if rendered == "" {
+			continue
+		}
+
+		// Normal mode: highlight the single cursor character inline.
+		if i == m.cursorLine && m.viModeState == ViNormal {
+			rendered = injectStyleRange(rendered, m.cursorCol, m.cursorCol, viCursorStyle)
+		}
+
+		// Visual mode: highlight the character range on each selected line.
+		if m.viModeState == ViVisual && i >= selStartLine && i <= selEndLine {
+			lineLen := m.lineRuneLen(i)
+			if lineLen > 0 {
+				sCol, eCol := 0, lineLen-1
+				if i == selStartLine {
+					sCol = clampCol(selStartCol, lineLen)
+				}
+				if i == selEndLine {
+					eCol = clampCol(selEndCol, lineLen)
+				}
+				if eCol < sCol {
+					eCol = sCol
+				}
+				rendered = injectStyleRange(rendered, sCol, eCol, viSelectionBgStyle)
+			}
+		}
+
+		b.WriteString(rendered)
+		if i < len(m.records)-1 {
+			b.WriteString("\n")
+		}
+	}
+
+	return b.String()
+}
+
+// clampCol constrains a 0-based printable column to [0, lineLen-1].
+func clampCol(c, lineLen int) int {
+	if c < 0 {
+		return 0
+	}
+	if c > lineLen-1 {
+		return lineLen - 1
+	}
+	return c
+}
+
+// tokenKind distinguishes printable text from atomic ANSI escape sequences.
+type tokenKind int
+
+const (
+	tokenText tokenKind = iota // Raw, printable characters
+	tokenANSI                  // Full, unbroken ANSI escape sequence (e.g. "\x1b[32m")
+)
+
+// lineToken is a single atom of a styled line: either a run of printable text
+// or one complete, unbroken ANSI escape sequence. Keeping ANSI sequences as
+// indivisible tokens makes it physically impossible to split one and drop its
+// leading ESC, which is the root cause of raw SGR leaks during hjkl navigation.
+type lineToken struct {
+	Kind  tokenKind
+	Value string
+}
+
+// tokenizeLine parses a styled line into alternating Text/ANSI tokens. Every
+// complete escape sequence (from \x1b to its final byte) becomes one TokenANSI;
+// everything else is grouped into TokenText runs. The byte content of each
+// token is preserved verbatim and in original order.
+func tokenizeLine(s string) []lineToken {
+	var tokens []lineToken
+	runes := []rune(s)
+	n := len(runes)
+	i := 0
+
+	var cur strings.Builder
+	flushText := func() {
+		if cur.Len() > 0 {
+			tokens = append(tokens, lineToken{Kind: tokenText, Value: cur.String()})
+			cur.Reset()
+		}
+	}
+
+	for i < n {
+		if runes[i] == '\x1b' {
+			flushText()
+			start := i
+			i++
+			if i < n && runes[i] == '[' {
+				i++
+				// CSI parameter/intermediate bytes are all < 'A'; the final
+				// byte (e.g. 'm', 'J', 'K') lies in 'A'..'~'.
+				for i < n && (runes[i] < 'A' || runes[i] > '~') {
+					i++
+				}
+				if i < n {
+					i++ // consume the final byte
+				}
+			}
+			tokens = append(tokens, lineToken{Kind: tokenANSI, Value: string(runes[start:i])})
+			continue
+		}
+		cur.WriteRune(runes[i])
+		i++
+	}
+	flushText()
+
+	return tokens
+}
+
+// injectStyleRange wraps the printable characters at columns [startCol, endCol]
+// (both inclusive, 0-based) of an already-rendered ANSI string with the given
+// lipgloss style. The line is first tokenized into atomic Text/ANSI tokens.
+// Printable characters are counted only across TokenText tokens, and the style
+// injection happens by splitting the single TokenText that contains the target
+// column(s) — TokenANSI tokens are never sliced, so escape sequences stay
+// whole and no \x1b is ever dropped. After the highlighted segment the active
+// style (most recent TokenANSI) is re-emitted so the surrounding coloring
+// continues seamlessly onto the remaining characters.
+func injectStyleRange(s string, startCol, endCol int, style lipgloss.Style) string {
+	if startCol < 0 || endCol < startCol {
+		return s
+	}
+
+	tokens := tokenizeLine(s)
+
+	var out strings.Builder
+	var lastAnsi strings.Builder // most recent TokenANSI (active surrounding style)
+	printable := 0
+
+	for _, tok := range tokens {
+		if tok.Kind == tokenANSI {
+			out.WriteString(tok.Value)
+			lastAnsi.Reset()
+			lastAnsi.WriteString(tok.Value)
+			continue
+		}
+
+		// TokenText: only this kind contributes printable characters.
+		tRunes := []rune(tok.Value)
+		tLen := len(tRunes)
+
+		// No overlap with [startCol, endCol]: emit verbatim.
+		if endCol < printable || startCol > printable+tLen-1 {
+			out.WriteString(tok.Value)
+			printable += tLen
+			continue
+		}
+
+		// Overlap: split this text token at the relative offset(s).
+		from := 0
+		if startCol > printable {
+			from = startCol - printable
+		}
+		to := tLen - 1
+		if endCol < printable+tLen-1 {
+			to = endCol - printable
+		}
+
+		out.WriteString(string(tRunes[:from]))
+		out.WriteString(style.Render(string(tRunes[from : to+1])))
+		// Restore the surrounding style so following text keeps its color.
+		out.WriteString(lastAnsi.String())
+		out.WriteString(string(tRunes[to+1:]))
+
+		printable += tLen
+	}
+
+	return out.String()
+}
+
+// renderedLineCount returns the approximate number of terminal lines a record
+// occupies when rendered through renderRecordForViewport.
+func (m *model) renderedLineCount(rec record) int {
+	rendered := m.renderRecordForViewport(rec)
+	if rendered == "" {
+		return 0
+	}
+	return strings.Count(rendered, "\n") + 1
+}
+
+// lineRuneLen returns the number of printable runes in a record's text.
+// It strips ANSI escape sequences first so cursor positioning and column
+// clamping operate on the visible (plain) characters, never on style bytes.
+func (m *model) lineRuneLen(lineIdx int) int {
+	if lineIdx < 0 || lineIdx >= len(m.records) {
+		return 0
+	}
+	return len([]rune(ansi.Strip(m.records[lineIdx].text)))
 }
 
 // countRenderedDiffLines returns how many lines DiffRenderer would output

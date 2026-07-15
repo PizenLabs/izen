@@ -266,6 +266,21 @@ var (
 // User message background (warm muted surface for distinct visual nesting)
 var userBgStyle = lipgloss.NewStyle().Background(lipgloss.Color(colorSurface)).PaddingLeft(1)
 
+// Vi-mode styles
+var (
+	// viCursorStyle: inverted block cursor — mauve background with dark text
+	viCursorStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color(colorMauve)).
+			Foreground(lipgloss.Color(colorBase)).
+			Bold(true)
+	// viSelectionBgStyle: selection background uses a dark mauve-tinted overlay.
+	// Foreground is NOT forced so the underlying styled text color shines through.
+	viSelectionBgStyle = lipgloss.NewStyle().Background(lipgloss.Color("#2a2240"))
+	viStatusStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve)).Bold(true)
+	viCmdStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))
+	viBorderStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))
+)
+
 // ── Interrupt Boundary Spinner ────────────────────────────────────────────
 var ProposalSpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 var SpinnerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))

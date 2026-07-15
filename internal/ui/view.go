@@ -95,15 +95,30 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 	mode := m.resolver.Current()
 	modeColor := m.modeStyle(mode)
 
+	// ── Vi-mode override: use mauve border and status bar ──
+	borderColor := modeColor
+	if m.inViMode {
+		borderColor = viBorderStyle
+	}
+
 	// ── Input region: autocomplete + separators + prompt ──
 	var inputView strings.Builder
 	if m.autocompleteActive && len(m.autocompleteItems) > 0 {
 		inputView.WriteString(m.renderAutocompleteDropdown(width))
 	}
-	inputView.WriteString(rule(width, modeColor) + "\n")
-	promptLabel := modeColor.Render(mode.String() + " " + Icon.Command)
-	inputView.WriteString(promptLabel + " " + m.ti.View() + "\n")
-	inputView.WriteString(rule(width, modeColor))
+	inputView.WriteString(rule(width, borderColor) + "\n")
+
+	switch {
+	case m.inViMode && m.viCmdMode:
+		promptLabel := viCmdStyle.Render(m.viCmdBuf)
+		inputView.WriteString(promptLabel + "\n")
+	case m.inViMode:
+		inputView.WriteString(viStatusStyle.Render("-- "+m.viModeLabel()+" --") + "\n")
+	default:
+		promptLabel := modeColor.Render(mode.String() + " " + Icon.Command)
+		inputView.WriteString(promptLabel + " " + m.ti.View() + "\n")
+	}
+	inputView.WriteString(rule(width, borderColor))
 
 	// ── Footer: status bar (telemetry with capabilities inlined) ──
 	footerView := m.renderStatusBar(width, actions)
@@ -130,6 +145,20 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 		Input:        inputView.String(),
 		Footer:       footerView,
 		Actions:      actions,
+	}
+}
+
+// viModeLabel returns the current Vi-mode label for the status bar.
+func (m *model) viModeLabel() string {
+	switch {
+	case m.viCmdMode && strings.HasPrefix(m.viCmdBuf, "/"):
+		return "SEARCH"
+	case m.viCmdMode && strings.HasPrefix(m.viCmdBuf, ":"):
+		return "COMMAND"
+	case m.viModeState == ViVisual:
+		return "VI VISUAL"
+	default:
+		return "VI NORMAL"
 	}
 }
 
@@ -392,10 +421,25 @@ func (m *model) renderHelpOverlay() string {
 		"  " + dimmedStyle.Render("@<path>         attach a file"),
 		"",
 		subtleStyle.Render("  ─── Shortcuts ───"),
-		"  " + dimmedStyle.Render("Esc (×3)        quit IZEN"),
+		"  " + dimmedStyle.Render("Esc (×3)        toggle vi-navigation mode"),
+		"  " + dimmedStyle.Render("Esc (×3)        quit IZEN (normal mode)"),
 		"  " + dimmedStyle.Render("↑/↓             history navigation"),
 		"  " + dimmedStyle.Render("Tab/Enter       complete autocomplete"),
 		"  " + dimmedStyle.Render("?               toggle this help overlay"),
+		"",
+		subtleStyle.Render("  ─── Vi Navigation Mode (Esc×3) ───"),
+		"  " + dimmedStyle.Render("j/k             cursor down/up (line-wise)"),
+		"  " + dimmedStyle.Render("h/l             cursor left/right (character-wise)"),
+		"  " + dimmedStyle.Render("0/$             jump to line start/end"),
+		"  " + dimmedStyle.Render("Ctrl+D/U        page down/up (½ window)"),
+		"  " + dimmedStyle.Render("gg              go to first message"),
+		"  " + dimmedStyle.Render("G               go to last message"),
+		"  " + dimmedStyle.Render("/<query> Enter  search forward"),
+		"  " + dimmedStyle.Render("n/N             next/previous search result"),
+		"  " + dimmedStyle.Render("v               toggle visual selection (char-level)"),
+		"  " + dimmedStyle.Render("y               yank (copy) selected text"),
+		"  " + dimmedStyle.Render("i               exit vi mode (return to input)"),
+		"  " + dimmedStyle.Render(":q Enter        exit vi mode"),
 		"",
 		mutedStyle.Render("  press " + boldTextStyle.Render("Esc") + " or " + boldTextStyle.Render("?") + " to close"),
 		"",

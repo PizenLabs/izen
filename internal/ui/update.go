@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -62,6 +63,32 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
+	}
+
+	// ── Triple-Escape detection: 3 consecutive esc presses enter vi-mode ─
+	if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.Type == tea.KeyEsc {
+		now := time.Now()
+		if now.Sub(m.lastEscTime) > viTripleEscMax {
+			m.escCount = 1
+		} else {
+			m.escCount++
+		}
+		m.lastEscTime = now
+		if m.escCount >= 3 {
+			m.escCount = 0
+			m.lastEscTime = time.Time{}
+			if !m.inViMode && m.state == StateChat && !m.streaming && !m.agentRunning {
+				m.enterViMode()
+				return m, nil
+			}
+		}
+	} else if _, ok := msg.(tea.KeyMsg); ok {
+		m.escCount = 0
+	}
+
+	// ── VI-MODE INTERCEPT: route all key events to the vi-mode handler ──
+	if keyMsg, ok := msg.(tea.KeyMsg); ok && m.inViMode {
+		return m.handleViModeKey(keyMsg)
 	}
 
 	// ── INIT STAGE ROUTING: intercept all key messages during setup ─────
@@ -1349,6 +1376,523 @@ func containsMutationIntention(content string) bool {
 		}
 	}
 	return false
+}
+
+// ── Vi-mode lifecycle ─────────────────────────────────────────────────────────
+
+// enterViMode transitions the UI into navigation mode: blurs the text input,
+// initializes cursor at the last record, resets selection state, and refreshes
+// the viewport with cursor highlighting.
+func (m *model) enterViMode() {
+	m.inViMode = true
+	m.viModeState = ViNormal
+	m.cursorLine = max(0, len(m.records)-1)
+	m.cursorCol = 0
+	m.visualStartLine = 0
+	m.visualStartCol = 0
+	vpHeight := m.computeVpHeight()
+	m.viTopLine = max(0, len(m.records)-vpHeight)
+	if m.viTopLine > m.cursorLine {
+		m.viTopLine = m.cursorLine
+	}
+	m.viSearchResults = nil
+	m.viSearchIdx = -1
+	m.viPendingPrefix = ""
+	m.viCmdMode = false
+	m.viCmdBuf = ""
+	m.ti.Blur()
+	m.refreshViewportContent()
+}
+
+// exitViMode returns the UI to normal interactive mode: clears selection,
+// refocuses the text input, and resets all vi-mode state.
+func (m *model) exitViMode() {
+	m.inViMode = false
+	m.viModeState = ViNormal
+	m.cursorLine = 0
+	m.cursorCol = 0
+	m.visualStartLine = 0
+	m.visualStartCol = 0
+	m.viTopLine = 0
+	m.viSearchResults = nil
+	m.viSearchIdx = -1
+	m.viPendingPrefix = ""
+	m.viCmdMode = false
+	m.viCmdBuf = ""
+	m.searchActive = false
+	m.searchQuery = ""
+	m.ti.Focus()
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
+}
+
+// ── Vi-mode key handler ───────────────────────────────────────────────────────
+
+// handleViModeKey routes all keyboard events during vi-mode. It implements a
+// state machine that handles motion (j/k/gg/G/Ctrl+d/Ctrl+u), search (/),
+// visual selection (v), yank (y), command-line entry (:), and exit (i).
+func (m *model) handleViModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// ── Command-line mode (:q, /search) ──────────────────────────────────
+	if m.viCmdMode {
+		return m.handleViCmdInput(msg)
+	}
+
+	// ── Pending prefix: handle multi-key sequences like gg ─────────────
+	if m.viPendingPrefix != "" {
+		prefix := m.viPendingPrefix
+		m.viPendingPrefix = ""
+		if prefix == "g" && (msg.String() == "g" || (msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && msg.Runes[0] == 'g')) {
+			// Jump to absolute top: reset logical coords and instantly snap
+			// the viewport offset to the very first physical line.
+			m.cursorLine = 0
+			m.cursorCol = 0
+			m.viTopLine = 0
+			m.viForceTop = true
+			m.viSearchIdx = -1
+			m.syncViewportToCursor()
+			return m, nil
+		}
+	}
+
+	// ── Single-key vi-mode actions ──────────────────────────────────────
+	switch msg.String() {
+	// ── Exit / return to normal input ──
+	case "i":
+		m.exitViMode()
+		return m, nil
+
+	// ── 2D Motions ──
+	case "h":
+		if m.cursorCol > 0 {
+			m.cursorCol--
+		}
+		m.syncViewportToCursor()
+		return m, nil
+
+	case "l":
+		lineLen := m.lineRuneLen(m.cursorLine)
+		if m.cursorCol < lineLen-1 {
+			m.cursorCol++
+		}
+		m.syncViewportToCursor()
+		return m, nil
+
+	case "j":
+		if m.cursorLine < len(m.records)-1 {
+			m.cursorLine++
+			// Horizontal safe-guard: clamp cursorCol to new line length
+			if m.cursorCol > m.lineRuneLen(m.cursorLine) {
+				m.cursorCol = max(0, m.lineRuneLen(m.cursorLine)-1)
+			}
+			m.viSearchIdx = -1
+			m.syncViewportToCursor()
+		}
+		return m, nil
+
+	case "k":
+		if m.cursorLine > 0 {
+			m.cursorLine--
+			// Horizontal safe-guard: clamp cursorCol to new line length
+			if m.cursorCol > m.lineRuneLen(m.cursorLine) {
+				m.cursorCol = max(0, m.lineRuneLen(m.cursorLine)-1)
+			}
+			m.viSearchIdx = -1
+			m.syncViewportToCursor()
+		}
+		return m, nil
+
+	// ── Line-boundary motions ──
+	case "0":
+		m.cursorCol = 0
+		m.syncViewportToCursor()
+		return m, nil
+
+	case "$":
+		m.cursorCol = max(0, m.lineRuneLen(m.cursorLine)-1)
+		m.syncViewportToCursor()
+		return m, nil
+
+	// ── Page motions ──
+	case "ctrl+d":
+		pageSize := m.computeVpHeight() / 2
+		if pageSize < 1 {
+			pageSize = 1
+		}
+		m.cursorLine = min(m.cursorLine+pageSize, max(0, len(m.records)-1))
+		m.cursorCol = min(m.cursorCol, m.lineRuneLen(m.cursorLine))
+		m.viSearchIdx = -1
+		m.syncViewportToCursor()
+		return m, nil
+
+	case "ctrl+u":
+		pageSize := m.computeVpHeight() / 2
+		if pageSize < 1 {
+			pageSize = 1
+		}
+		m.cursorLine = max(m.cursorLine-pageSize, 0)
+		m.cursorCol = min(m.cursorCol, m.lineRuneLen(m.cursorLine))
+		m.viSearchIdx = -1
+		m.syncViewportToCursor()
+		return m, nil
+
+	// ── Jump to bottom ──
+	case "G":
+		totalLines := len(m.records)
+		if totalLines == 0 {
+			return m, nil
+		}
+		// Move logical cursor to the last line.
+		m.cursorLine = totalLines - 1
+		// Clamp the column to the printable length of the last line (ANSI-safe).
+		m.cursorCol = min(m.cursorCol, m.lineRuneLen(m.cursorLine))
+		// Anchor the viewport so the last physical line sits at the very
+		// bottom of the visible screen (handled physically in syncViewportToCursor).
+		m.viTopLine = m.cursorLine
+		m.viForceBottom = true
+		m.viSearchIdx = -1
+		m.syncViewportToCursor()
+		return m, nil
+
+	// ── Prefix for multi-key sequences ──
+	case "g":
+		if len(m.records) > 0 {
+			m.viPendingPrefix = "g"
+		}
+		return m, nil
+
+	// ── Search ──
+	case "/":
+		m.viCmdMode = true
+		m.viCmdBuf = "/"
+		m.searchActive = true
+		m.searchQuery = ""
+		return m, nil
+
+	case "n":
+		if len(m.viSearchResults) > 0 && m.viSearchIdx >= 0 {
+			m.viSearchIdx = (m.viSearchIdx + 1) % len(m.viSearchResults)
+			m.cursorLine = m.viSearchResults[m.viSearchIdx]
+			m.cursorCol = 0
+			m.syncViewportToCursor()
+		}
+		return m, nil
+
+	case "N":
+		if len(m.viSearchResults) > 0 && m.viSearchIdx >= 0 {
+			m.viSearchIdx--
+			if m.viSearchIdx < 0 {
+				m.viSearchIdx = len(m.viSearchResults) - 1
+			}
+			m.cursorLine = m.viSearchResults[m.viSearchIdx]
+			m.cursorCol = 0
+			m.syncViewportToCursor()
+		}
+		return m, nil
+
+	// ── Visual selection (character-level) ──
+	case "v":
+		if m.viModeState == ViVisual {
+			m.viModeState = ViNormal
+			m.visualStartLine = 0
+			m.visualStartCol = 0
+		} else {
+			m.viModeState = ViVisual
+			m.visualStartLine = m.cursorLine
+			m.visualStartCol = m.cursorCol
+		}
+		m.refreshViewportContent()
+		return m, nil
+
+	// ── Yank (copy selected text to clipboard) ──
+	case "y":
+		if m.viModeState == ViVisual {
+			m.yankSelection()
+			m.viModeState = ViNormal
+			m.visualStartLine = 0
+			m.visualStartCol = 0
+		}
+		m.refreshViewportContent()
+		return m, nil
+
+	// ── Command-line entry ──
+	case ":":
+		m.viCmdMode = true
+		m.viCmdBuf = ":"
+		return m, nil
+
+	// ── Scrolling with arrow keys / pgup/pgdn in viewport ──
+	case "up", "ctrl+y":
+		var vpCmd tea.Cmd
+		if m.Ready {
+			m.Viewport, vpCmd = m.Viewport.Update(tea.KeyMsg{Type: tea.KeyUp})
+			m.userIsScrollingUp = true
+		}
+		return m, vpCmd
+
+	case "down", "ctrl+e":
+		var vpCmd tea.Cmd
+		if m.Ready {
+			m.Viewport, vpCmd = m.Viewport.Update(tea.KeyMsg{Type: tea.KeyDown})
+		}
+		return m, vpCmd
+
+	// ── Space: snap viewport to cursor ──
+	case " ":
+		m.syncViewportToCursor()
+		return m, nil
+	}
+
+	// ── Handle key type-based fallthrough ──
+	return m, nil
+}
+
+// handleViCmdInput processes input within vi command-line mode (: or /).
+// The first character of viCmdBuf determines the mode:
+//   - ":"  → vim command (q to exit, etc.)
+//   - "/"  → forward search
+func (m *model) handleViCmdInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		cmd := strings.TrimSpace(m.viCmdBuf)
+		m.viCmdMode = false
+
+		if strings.HasPrefix(cmd, ":") {
+			sub := strings.TrimSpace(cmd[1:])
+			switch sub {
+			case "q", "q!", "quit", "wq", "x":
+				m.exitViMode()
+			}
+			return m, nil
+		}
+
+		if strings.HasPrefix(cmd, "/") {
+			query := cmd[1:]
+			m.searchActive = false
+			m.searchQuery = query
+			m.performSearch(query, false)
+			return m, nil
+		}
+
+		return m, nil
+
+	case tea.KeyEscape:
+		m.viCmdMode = false
+		m.searchActive = false
+		m.searchQuery = ""
+		m.viCmdBuf = ""
+		return m, nil
+
+	case tea.KeyBackspace, tea.KeyDelete:
+		if len(m.viCmdBuf) > 0 {
+			m.viCmdBuf = m.viCmdBuf[:len(m.viCmdBuf)-1]
+		}
+		return m, nil
+
+	case tea.KeyRunes:
+		m.viCmdBuf += string(msg.Runes)
+		return m, nil
+
+	default:
+		return m, nil
+	}
+}
+
+// performSearch scans m.records forward from cursorLine looking for a
+// case-insensitive substring match. If reverse is true, scans backward.
+func (m *model) performSearch(query string, reverse bool) {
+	m.viSearchResults = nil
+	m.viSearchIdx = -1
+
+	if query == "" || len(m.records) == 0 {
+		return
+	}
+
+	lowerQuery := strings.ToLower(query)
+	start := m.cursorLine
+	n := len(m.records)
+
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		text := m.records[idx].text
+		if strings.Contains(strings.ToLower(text), lowerQuery) {
+			m.viSearchResults = append(m.viSearchResults, idx)
+		}
+	}
+
+	if len(m.viSearchResults) > 0 {
+		m.viSearchIdx = 0
+		m.cursorLine = m.viSearchResults[0]
+		m.syncViewportToCursor()
+	}
+}
+
+// yankSelection copies the character-level visual selection to the system
+// clipboard. It extracts rune-precise slices from the underlying text records
+// (not from rendered view strings) to avoid any buffer truncation or multi-byte
+// UTF-8 splitting.
+func (m *model) yankSelection() {
+	sLine, sCol := m.visualStartLine, m.visualStartCol
+	eLine, eCol := m.cursorLine, m.cursorCol
+
+	// Normalize: ensure start ≤ end in (line, col) tuple space
+	if sLine > eLine || (sLine == eLine && sCol > eCol) {
+		sLine, eLine = eLine, sLine
+		sCol, eCol = eCol, sCol
+	}
+
+	var buf strings.Builder
+	if sLine == eLine {
+		// Single shared line: slice between sCol and eCol (inclusive of eCol)
+		runes := []rune(m.records[sLine].text)
+		endCol := eCol + 1
+		if endCol > len(runes) {
+			endCol = len(runes)
+		}
+		if sCol < endCol {
+			buf.WriteString(string(runes[sCol:endCol]))
+		}
+	} else {
+		for i := sLine; i <= eLine && i < len(m.records); i++ {
+			runes := []rune(m.records[i].text)
+			switch i {
+			case sLine:
+				// First line of multi-line: from sCol to end (inclusive)
+				if sCol < len(runes) {
+					buf.WriteString(string(runes[sCol:]))
+				}
+			case eLine:
+				// Last line of multi-line: from start to eCol (inclusive)
+				endCol := eCol + 1
+				if endCol > len(runes) {
+					endCol = len(runes)
+				}
+				if endCol > 0 {
+					buf.WriteString(string(runes[:endCol]))
+				}
+			default:
+				// Fully enclosed line: entire text
+				buf.WriteString(m.records[i].text)
+			}
+
+			if i < eLine {
+				buf.WriteString("\n")
+			}
+		}
+	}
+
+	text := buf.String()
+	if text == "" {
+		return
+	}
+	if err := clipboard.WriteAll(text); err != nil {
+		m.push(roleSystem, mutedStyle.Render("clipboard error: "+err.Error()))
+		m.refreshViewportContent()
+	}
+}
+
+// syncViewportToCursor scrolls the viewport to bring the cursor line into
+// view using viTopLine as the logical scroll anchor. Four constraints:
+//  1. Vertical: if cursorLine < viTopLine, scroll viTopLine up to cursorLine.
+//  2. Height: if cursorLine >= viTopLine+vpHeight, scroll viTopLine down.
+//  3. Horizontal: cursorCol is clamped to the destination line length.
+//
+// syncViewportToCursor scrolls the viewport to bring the cursor line into
+// view using viTopLine as the logical scroll anchor. Because chat records wrap
+// into multiple physical terminal lines, all offset math is performed in
+// PHYSICAL line space (cumulative rendered line counts) rather than raw record
+// indexes, so wrapped lines never desync the viewport. Four constraints:
+//  1. Vertical: if the cursor's physical row is above the viewport, scroll up.
+//  2. Height: if the cursor's physical row is below the viewport, scroll down.
+//  3. Horizontal: cursorCol is clamped to the printable length of the line.
+//  4. TUI Sync: YOffset is computed from viTopLine via cumulative physical line
+//     counts, and explicit gg/G anchors override with a definitive offset.
+func (m *model) syncViewportToCursor() {
+	if len(m.records) == 0 {
+		return
+	}
+
+	vpHeight := m.computeVpHeight()
+	if vpHeight < 1 {
+		vpHeight = 1
+	}
+
+	// Horizontal safe-guard: ensure cursorCol is within the printable length
+	// of the cursor line (ANSI-safe — operates on stripped text).
+	lineLen := m.lineRuneLen(m.cursorLine)
+	if m.cursorCol > lineLen {
+		m.cursorCol = max(0, lineLen-1)
+	}
+
+	// Build cumulative physical (wrapped) line offsets across all records.
+	n := len(m.records)
+	phys := make([]int, n+1)
+	for i := 0; i < n; i++ {
+		phys[i+1] = phys[i] + m.renderedLineCount(m.records[i])
+	}
+	totalPhys := phys[n]
+
+	// Convert the logical viTopLine anchor into a physical YOffset baseline.
+	if m.viTopLine < 0 {
+		m.viTopLine = 0
+	}
+	if m.viTopLine >= n {
+		m.viTopLine = n - 1
+	}
+	yOffset := phys[m.viTopLine]
+
+	// Physical row range occupied by the cursor line (it may wrap).
+	cursorStart := phys[m.cursorLine]
+	cursorEnd := phys[m.cursorLine+1] - 1
+
+	// Keep the cursor visible: scroll within the physical coordinate space.
+	if cursorEnd >= yOffset+vpHeight {
+		yOffset = cursorEnd - vpHeight + 1
+		m.viTopLine = m.logicalLineAtPhysical(phys, yOffset)
+	}
+	if cursorStart < yOffset {
+		yOffset = cursorStart
+		m.viTopLine = m.cursorLine
+	}
+
+	// Explicit anchoring requested by gg / G — overrides the window logic with
+	// a definitive physical offset.
+	if m.viForceTop {
+		yOffset = 0
+		m.viTopLine = 0
+		m.viForceTop = false
+	}
+	if m.viForceBottom {
+		yOffset = max(0, totalPhys-vpHeight)
+		m.viTopLine = m.logicalLineAtPhysical(phys, yOffset)
+		m.viForceBottom = false
+	}
+
+	// Clamp YOffset so the viewport never overscrolls.
+	maxOffset := max(0, totalPhys-vpHeight)
+	if yOffset < 0 {
+		yOffset = 0
+	}
+	if yOffset > maxOffset {
+		yOffset = maxOffset
+	}
+
+	m.refreshViewportContent()
+
+	// Sync Bubble Tea viewport YOffset using cumulative physical line counts.
+	if m.Ready {
+		m.Viewport.YOffset = yOffset
+	}
+}
+
+// logicalLineAtPhysical returns the logical record index whose physical line
+// range contains the given physical row offset.
+func (m *model) logicalLineAtPhysical(phys []int, yOffset int) int {
+	for i := 0; i < len(phys)-1; i++ {
+		if yOffset < phys[i+1] {
+			return i
+		}
+	}
+	return max(0, len(phys)-2)
 }
 
 // sanitizeFinalContent strips tool execution artifacts and telemetry markers
