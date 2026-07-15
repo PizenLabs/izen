@@ -107,7 +107,7 @@ func renderAST(node ast.Node, width int, source []byte) string {
 
 // renderText extracts text from a text node
 func renderText(node *ast.Text, source []byte) string {
-	return string(node.Text(source))
+	return string(node.Value(source))
 }
 
 // renderEmphasis renders *italic* (Emphasis.Level == 1)
@@ -162,7 +162,7 @@ func renderInlineContent(node ast.Node, source []byte) string {
 	for c := node.FirstChild(); c != nil; c = c.NextSibling() {
 		switch c := c.(type) {
 		case *ast.Text:
-			result.Write(c.Text(source))
+			result.Write(c.Value(source))
 			if c.HardLineBreak() || c.SoftLineBreak() {
 				result.WriteString("\n")
 			}
@@ -296,7 +296,7 @@ func renderBlockquote(node *ast.Blockquote, width int, source []byte) string {
 	for c := node.FirstChild(); c != nil; c = c.NextSibling() {
 		switch c := c.(type) {
 		case *ast.Text:
-			rawParts = append(rawParts, string(c.Text(source)))
+			rawParts = append(rawParts, string(c.Value(source)))
 		case *ast.Paragraph:
 			rawParts = append(rawParts, renderInlineContent(c, source))
 		default:
@@ -411,7 +411,7 @@ func renderFencedCodeBlock(node *ast.FencedCodeBlock, width int, source []byte) 
 
 // renderCodeSpan renders inline code with subtle emphasis
 func renderCodeSpan(node *ast.CodeSpan, source []byte) string {
-	return mdCodeSpanStyle.Render(string(node.Text(source)))
+	return mdCodeSpanStyle.Render(renderInlineContent(node, source))
 }
 
 // renderLink renders a link showing only link text (URL hidden per ASK_RENDERING.md)
