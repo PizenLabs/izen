@@ -2,6 +2,7 @@ package plan
 
 import (
 	"context"
+	"strings"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/prompt"
@@ -11,7 +12,7 @@ import (
 type ProviderFunc func(ctx context.Context, req ai.Request) (*ai.Response, error)
 
 // Engine is the core interface for the plan module, coordinating between data store,
-// parser, and AI provider to process plans stored in markdown format.
+// parser, and AI provider to process plans.
 type Engine struct {
 	store    *PlanStore
 	parser   func(string) []Task
@@ -19,12 +20,28 @@ type Engine struct {
 }
 
 // NewEngine creates a new Engine instance with the provided components.
+// Default parser is ParseJSONPlan — falls back to ParseMarkdownToTasks for legacy plans.
 func NewEngine(store *PlanStore) *Engine {
 	return &Engine{
 		store:    store,
-		parser:   ParseMarkdownToTasks,
+		parser:   parsePlanContent,
 		provider: nil,
 	}
+}
+
+// parsePlanContent tries JSON first, falls back to markdown task format.
+func parsePlanContent(content string) []Task {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil
+	}
+
+	result := ParseJSONPlan(content)
+	if result.Valid {
+		return result.Tasks
+	}
+
+	return ParseMarkdownToTasks(content)
 }
 
 // SetProvider configures the AI provider for this engine using the structured signature.
@@ -34,13 +51,13 @@ func (e *Engine) SetProvider(provider ProviderFunc) {
 	}
 }
 
-// ProcessPlan generates an execution plan by keeping system instructions and user objectives strictly isolated.
+// ProcessPlan generates an execution plan by dispatching to the AI provider
+// with strict JSON output enforcement.
 func (e *Engine) ProcessPlan(ctx context.Context, modelName string, objective string, contextStr string) error {
 	if e == nil || e.provider == nil {
 		return nil
 	}
 
-	// Build properly segmented system vs user message frames
 	req := ai.Request{
 		Model: modelName,
 		Messages: []ai.Message{
@@ -53,7 +70,7 @@ func (e *Engine) ProcessPlan(ctx context.Context, modelName string, objective st
 				Content: prompt.BuildPlanPrompt(objective, contextStr),
 			},
 		},
-		Stream: false, // Switch to true if wiring into ExecuteStream / ui.Stream
+		Stream: false,
 	}
 
 	resp, err := e.provider(ctx, req)
@@ -64,9 +81,18 @@ func (e *Engine) ProcessPlan(ctx context.Context, modelName string, objective st
 	return e.store.SaveRawMarkdown("plan", resp.Content)
 }
 
-// Parse parses markdown content into tasks using the engine's parser.
-func (e *Engine) Parse(mdContent string) []Task {
-	return e.parser(mdContent)
+// Parse parses plan content (JSON or markdown) into tasks.
+func (e *Engine) Parse(content string) []Task {
+	return e.parser(content)
+}
+
+// ParseJSON parses JSON plan content specifically.
+func (e *Engine) ParseJSON(content string) (*PlanOutput, error) {
+	result := ParseJSONPlan(content)
+	if !result.Valid {
+		return nil, &PlanSchemaError{Message: result.Error}
+	}
+	return result.Plan, nil
 }
 
 // Store returns the underlying PlanStore for direct access.
@@ -77,4 +103,13 @@ func (e *Engine) Store() *PlanStore {
 // TickTask marks the N-th task as complete in the current plan file.
 func (e *Engine) TickTask(stepNum int) error {
 	return e.store.TickTaskHoanThanh(stepNum)
+}
+
+// PlanSchemaError indicates a plan output schema violation.
+type PlanSchemaError struct {
+	Message string
+}
+
+func (e *PlanSchemaError) Error() string {
+	return "plan output schema violation: " + e.Message
 }

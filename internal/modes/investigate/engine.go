@@ -13,6 +13,8 @@ type Engine struct {
 	Evidence   *EvidenceStore
 	Slicer     *ProximitySlicer
 	TestLoop   *TestLoop
+	Isolator   *TargetIsolator
+	Ledger     *ContextLedger
 
 	Problem   string
 	root      string
@@ -61,6 +63,8 @@ func NewEngine(root, problem string, retriever Retriever, executor TestExecutor)
 		Evidence:   NewEvidenceStore(),
 		Slicer:     NewProximitySlicer(root, 10),
 		TestLoop:   NewTestLoop(3),
+		Isolator:   NewTargetIsolator(root),
+		Ledger:     NewContextLedger(),
 		Problem:    problem,
 		root:       root,
 		startedAt:  time.Now(),
@@ -322,7 +326,26 @@ func (e *Engine) stateNarrow() error {
 		}
 	}
 
+	// Target isolation: pinpoint exact file boundary and AST node.
+	allEvidence := e.Evidence.All()
+	frames := e.parseStackFramesFromEvidence()
+	isolated := e.Isolator.IsolateFromEvidence(allEvidence, frames)
+	for _, t := range isolated {
+		e.Ledger.AddTarget(t)
+		e.Evidence.AddWithStrategy(EvSourceRead, fmt.Sprintf("%s (%s) at %s:%d", t.Node, t.Kind, t.File, t.Line),
+			t.File, t.Line, 0.8, "isolator.node")
+	}
+
 	return e.State.Transition(StateHypothesize)
+}
+
+func (e *Engine) parseStackFramesFromEvidence() []StackFrame {
+	stackEvidence := e.Evidence.BySource(EvSourceStack)
+	var allLines string
+	for _, ev := range stackEvidence {
+		allLines += ev.Content + "\n"
+	}
+	return ParseStackFrames(allLines)
 }
 
 func (e *Engine) stateVerify() error {
@@ -355,8 +378,23 @@ func (e *Engine) statePropose() error {
 	if result != nil {
 		e.Result.Conclusion = result.Theory
 		e.Result.Resolved = true
+		e.Ledger.Problem = e.Problem
+		e.Ledger.SetConclusion(result.Theory, true)
+		e.Ledger.Source = "investigate"
+	} else {
+		e.Ledger.Problem = e.Problem
+		e.Ledger.SetConclusion("investigation exhausted — no hypothesis confirmed", false)
 	}
 	return e.State.Transition(StateDone)
+}
+
+func (e *Engine) FormatLedgerForPlan() string {
+	e.Ledger.Problem = e.Problem
+	e.Ledger.Source = "investigate"
+	if e.Result != nil {
+		e.Ledger.SetConclusion(e.Result.Conclusion, e.Result.Resolved)
+	}
+	return e.Ledger.FormatForPlan()
 }
 
 func (e *Engine) extractSymbolsFromProblem() []string {

@@ -861,3 +861,208 @@ func TestExtractErrorOutputRunResultNilError(t *testing.T) {
 		t.Fatalf("expected empty, got %q", output)
 	}
 }
+
+func TestNewContextLedger(t *testing.T) {
+	cl := NewContextLedger()
+	if cl == nil {
+		t.Fatal("expected non-nil context ledger")
+	}
+	if cl.Source != "investigate" {
+		t.Fatalf("expected source 'investigate', got %q", cl.Source)
+	}
+	if len(cl.Targets) != 0 {
+		t.Fatalf("expected 0 targets, got %d", len(cl.Targets))
+	}
+}
+
+func TestContextLedgerAddTarget(t *testing.T) {
+	cl := NewContextLedger()
+	cl.AddTarget(Target{File: "test.go", Line: 42, Node: "TestFunc", Kind: "function"})
+	if len(cl.Targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(cl.Targets))
+	}
+	if cl.Targets[0].File != "test.go" {
+		t.Fatalf("expected test.go, got %s", cl.Targets[0].File)
+	}
+	if cl.Targets[0].Node != "TestFunc" {
+		t.Fatalf("expected TestFunc, got %s", cl.Targets[0].Node)
+	}
+}
+
+func TestContextLedgerSetConclusion(t *testing.T) {
+	cl := NewContextLedger()
+	cl.SetConclusion("bug in parser", true)
+	if cl.Conclusion != "bug in parser" {
+		t.Fatalf("expected 'bug in parser', got %q", cl.Conclusion)
+	}
+	if !cl.Resolved {
+		t.Fatal("expected resolved=true")
+	}
+}
+
+func TestContextLedgerFormatForPlan(t *testing.T) {
+	cl := NewContextLedger()
+	cl.Problem = "test failure"
+	cl.AddTarget(Target{File: "test.go", Line: 10, Node: "TestFunc", Kind: "function"})
+	cl.SetConclusion("fixed", true)
+
+	output := cl.FormatForPlan()
+	if !strings.Contains(output, "CONTEXT LEDGER") {
+		t.Fatal("expected CONTEXT LEDGER header")
+	}
+	if !strings.Contains(output, "test failure") {
+		t.Fatal("expected 'test failure' in output")
+	}
+	if !strings.Contains(output, "TestFunc") {
+		t.Fatal("expected TestFunc in output")
+	}
+	if !strings.Contains(output, "ACTION REQUIRED") {
+		t.Fatal("expected ACTION REQUIRED section")
+	}
+	if !strings.Contains(output, "/plan") {
+		t.Fatal("expected handoff to /plan")
+	}
+}
+
+func TestContextLedgerFormatForPlanNoTargets(t *testing.T) {
+	cl := NewContextLedger()
+	cl.Problem = "no targets found"
+	output := cl.FormatForPlan()
+	if !strings.Contains(output, "no targets") {
+		t.Fatalf("expected problem in output, got: %.80s", output)
+	}
+}
+
+func TestContextLedgerTargetPackages(t *testing.T) {
+	cl := NewContextLedger()
+	cl.AddTarget(Target{File: "internal/parser/stream.go", Line: 1})
+	cl.AddTarget(Target{File: "internal/parser/types.go", Line: 1})
+	cl.AddTarget(Target{File: "cmd/main.go", Line: 1})
+
+	pkgs := cl.TargetPackages()
+	if len(pkgs) == 0 {
+		t.Fatal("expected at least 1 package")
+	}
+	hasParser := false
+	for _, p := range pkgs {
+		if p == "internal/parser" {
+			hasParser = true
+		}
+	}
+	if !hasParser {
+		t.Fatalf("expected internal/parser in packages, got %v", pkgs)
+	}
+}
+
+func TestNewTargetIsolator(t *testing.T) {
+	ti := NewTargetIsolator(".")
+	if ti == nil {
+		t.Fatal("expected non-nil TargetIsolator")
+	}
+	if ti.root != "." {
+		t.Fatalf("expected root '.', got %q", ti.root)
+	}
+}
+
+func TestTargetIsolatorLocateNode(t *testing.T) {
+	ti := NewTargetIsolator(".")
+	node, kind := ti.locateNode("non_existent_file.go", 1)
+	if node == "" {
+		t.Fatal("expected at least file name fallback")
+	}
+	if kind != "file" {
+		t.Fatalf("expected kind 'file', got %q", kind)
+	}
+}
+
+func TestTargetIsolatorIsolateFromEvidence(t *testing.T) {
+	ti := NewTargetIsolator(".")
+	evidence := []Evidence{
+		{File: "target_test_tmp.go", Line: 5, Content: "test evidence", Source: EvSourceStack},
+	}
+	frames := []StackFrame{
+		{File: "target_test_other.go", Line: 10},
+	}
+
+	targets := ti.IsolateFromEvidence(evidence, frames)
+	if len(targets) == 0 {
+		t.Log("no targets isolated (expected with non-existent files)")
+	}
+}
+
+func TestTargetIsolatorReadSnippet(t *testing.T) {
+	ti := NewTargetIsolator(".")
+	snippet := ti.readSnippet("non_existent.go", 5)
+	if snippet != "" {
+		t.Fatal("expected empty snippet for non-existent file")
+	}
+}
+
+func TestContextLedgerEmptyTargetPackages(t *testing.T) {
+	cl := NewContextLedger()
+	pkgs := cl.TargetPackages()
+	if len(pkgs) != 0 {
+		t.Fatalf("expected 0 packages, got %d", len(pkgs))
+	}
+}
+
+func TestTargetStruct(t *testing.T) {
+	target := Target{
+		File:    "test.go",
+		Line:    42,
+		Node:    "TestFunction",
+		Kind:    "function",
+		Snippet: "func TestFunction()",
+	}
+	if target.File != "test.go" {
+		t.Fatal("file mismatch")
+	}
+	if target.Line != 42 {
+		t.Fatal("line mismatch")
+	}
+	if target.Node != "TestFunction" {
+		t.Fatal("node mismatch")
+	}
+}
+
+func TestEngineInitializationWithIsolator(t *testing.T) {
+	eng := NewEngine(".", "test problem", nil, nil)
+	if eng.Isolator == nil {
+		t.Fatal("expected non-nil Isolator")
+	}
+	if eng.Ledger == nil {
+		t.Fatal("expected non-nil Ledger")
+	}
+	if eng.Ledger.Source != "investigate" {
+		t.Fatalf("expected source 'investigate', got %q", eng.Ledger.Source)
+	}
+}
+
+func TestEngineFormatLedgerForPlan(t *testing.T) {
+	eng := NewEngine(".", "test failure in parser", nil, nil)
+	eng.Ledger.AddTarget(Target{File: "parser.go", Line: 42, Node: "Parse", Kind: "function"})
+	eng.Ledger.SetConclusion("nil pointer in Parse", true)
+
+	output := eng.FormatLedgerForPlan()
+	if !strings.Contains(output, "test failure in parser") {
+		t.Fatal("expected problem in ledger output")
+	}
+	if !strings.Contains(output, "Parse") {
+		t.Fatal("expected Parse function in ledger output")
+	}
+	if !strings.Contains(output, "/plan") {
+		t.Fatal("expected /plan handoff in ledger output")
+	}
+}
+
+func TestAbs(t *testing.T) {
+	if abs(5) != 5 {
+		t.Fatal("abs(5) != 5")
+	}
+	if abs(-5) != 5 {
+		t.Fatal("abs(-5) != 5")
+	}
+	if abs(0) != 0 {
+		t.Fatal("abs(0) != 0")
+	}
+}
