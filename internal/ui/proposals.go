@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -356,11 +357,24 @@ func (m *model) applySingleProposal() tea.Cmd {
 
 func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 	eng := m.execEng
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// Never let a panic in patch application crash the TUI. Recover, log
+		// the trace internally, and surface a user-friendly status-bar error.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from patch panic in applyProposalCmd (file=%s): %v", p.Target.QualifiedName, r)
+				msg = mutationResultMsg{
+					err:  fmt.Errorf("failed to apply patch safely to %s: proposal expired or context changed", p.Target.QualifiedName),
+					file: p.Target.QualifiedName,
+				}
+			}
+		}()
+
 		patch := &execution.Patch{
 			ID:       p.ID,
 			File:     p.Target.QualifiedName,
 			Modified: p.Diff,
+			TaskID:   m.currentBuildTaskID,
 		}
 		orig, err := os.ReadFile(p.Target.QualifiedName)
 		if err == nil {
@@ -391,13 +405,26 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 	proposals := make([]SemanticProposal, len(m.pendingProposals))
 	copy(proposals, m.pendingProposals)
 	eng := m.execEng
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
 		var results []mutationResultMsg
+		// Never let a panic in patch application crash the TUI. Recover, log
+		// the trace internally, and surface a user-friendly status-bar error
+		// for any proposal that was in flight when the panic occurred.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from patch panic in applyAllProposalsCmd: %v", r)
+				results = append(results, mutationResultMsg{
+					err: fmt.Errorf("failed to apply patch safely — proposal expired or context changed"),
+				})
+				msg = applyAllResultMsg{results: results}
+			}
+		}()
 		for _, p := range proposals {
 			patch := &execution.Patch{
 				ID:       p.ID,
 				File:     p.Target.QualifiedName,
 				Modified: p.Diff,
+				TaskID:   m.currentBuildTaskID,
 			}
 			orig, err := os.ReadFile(p.Target.QualifiedName)
 			if err == nil {

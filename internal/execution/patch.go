@@ -9,6 +9,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	izenctx "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/modes/build"
 )
 
 type Patch struct {
@@ -19,12 +22,16 @@ type Patch struct {
 	ContextID string    `json:"context_id,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	Applied   bool      `json:"applied"`
+	// TaskID links this patch to a /plan ledger task. When > 0 the patch
+	// manager marks the task Completed and renders the build summary.
+	TaskID int `json:"task_id,omitempty"`
 }
 
 type StagedPatch struct {
 	File    string
 	Content string
 	RawDiff string
+	TaskID  int
 }
 
 type PatchQueue struct {
@@ -113,6 +120,7 @@ func (pq *PatchQueue) ApplyNext() error {
 		ID:       fmt.Sprintf("staged-%d", time.Now().UnixNano()),
 		File:     p.File,
 		Modified: p.Content,
+		TaskID:   p.TaskID,
 	}
 	orig, err := os.ReadFile(fullPath)
 	if err == nil {
@@ -146,6 +154,7 @@ func (pq *PatchQueue) ApplyAll() (int, error) {
 			ID:       fmt.Sprintf("staged-%d", time.Now().UnixNano()),
 			File:     p.File,
 			Modified: p.Content,
+			TaskID:   p.TaskID,
 		}
 		orig, err := os.ReadFile(filepath.Join(pq.root, p.File))
 		if err == nil {
@@ -172,17 +181,38 @@ type PatchManager struct {
 	root      string
 	patDir    string
 	contextID string
+	guardrail *MutationGuardrail
+	ledger    *izenctx.TaskLedger
 }
 
 func NewPatchManager(root string) *PatchManager {
 	return &PatchManager{
-		root:   root,
-		patDir: filepath.Join(root, ".izen", "patches"),
+		root:      root,
+		patDir:    filepath.Join(root, ".izen", "patches"),
+		guardrail: NewMutationGuardrail(root),
 	}
+}
+
+// SetGuardrail attaches a MutationGuardrail used to halt infinite autofix
+// loops before a structural patch is committed. Passing nil disables it.
+func (pm *PatchManager) SetGuardrail(g *MutationGuardrail) {
+	pm.guardrail = g
+}
+
+// Guardrail returns the attached MutationGuardrail (may be nil).
+func (pm *PatchManager) Guardrail() *MutationGuardrail {
+	return pm.guardrail
 }
 
 func (pm *PatchManager) SetContextID(id string) {
 	pm.contextID = id
+}
+
+// SetLedger attaches the shared /plan task ledger. When a committed patch
+// carries a TaskID, the manager marks that task Completed and renders the build
+// mutation summary via the activity log.
+func (pm *PatchManager) SetLedger(l *izenctx.TaskLedger) {
+	pm.ledger = l
 }
 
 func (pm *PatchManager) ActiveContextID() string {
@@ -284,6 +314,19 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		globalActivityLog("⚙ [system] applying structural patch to: %s ...", patch.File)
 	}
 
+	// Mutation guardrail: halt infinite autofix loops BEFORE any structural
+	// change is committed. This runs after pure validation but before the
+	// shadow backup / write, so a detected loop cannot cause further mutation.
+	if pm.guardrail != nil {
+		decision := pm.guardrail.Check(patch.File, pm.contextID)
+		if decision.Halt {
+			if globalActivityLog != nil {
+				globalActivityLog("%s", decision.Message())
+			}
+			return fmt.Errorf("%s", decision.Message())
+		}
+	}
+
 	if patch.Original == "" {
 		if data, err := os.ReadFile(fullPath); err == nil {
 			patch.Original = string(data)
@@ -357,7 +400,45 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		return fmt.Errorf("patch applied but audit log failed: %w", err)
 	}
 
+	pm.recordLedgerAndSummarize(patch)
+
 	return pm.store(patch)
+}
+
+// recordLedgerAndSummarize bridges a successful patch commit to the /plan task
+// ledger: when the patch carries a plan task id it marks that task Completed and
+// pipes the concise build mutation summary to the activity log. It is a no-op
+// for ad-hoc mutations (TaskID == 0), keeping non-plan paths quiet.
+func (pm *PatchManager) recordLedgerAndSummarize(patch *Patch) {
+	if pm.ledger == nil || patch.TaskID <= 0 {
+		return
+	}
+
+	pm.ledger.MarkCompleted(patch.TaskID)
+
+	summary := build.ExecutionSummary{
+		Success:   true,
+		Mutations: []build.MutationRecord{{File: patch.File, Strategy: patchStrategy(patch)}},
+		ContextID: pm.contextID,
+	}
+	if pm.guardrail != nil {
+		d := pm.guardrail.Check(patch.File, pm.contextID)
+		summary.GuardrailPass = !d.Halt
+		summary.GuardrailCount = d.Count
+		summary.GuardrailLimit = d.Limit
+	}
+
+	if globalActivityLog != nil {
+		globalActivityLog("%s", build.RenderExecutionSummary(summary))
+	}
+}
+
+// patchStrategy resolves the plan strategy label recorded in the summary.
+func patchStrategy(patch *Patch) string {
+	if strings.Contains(patch.Modified, "@@") {
+		return "DIFF_PATCH"
+	}
+	return "ATOMIC_REPLACE"
 }
 
 type diffHunk struct {
@@ -457,6 +538,13 @@ func parseDiffHunks(content string) []diffHunk {
 // parsed line numbers (oldStart, oldCount) as an anchor when exact string
 // matching fails. It slices out lines oldStart → oldStart+oldCount from the
 // original and injects the newBlock lines at that position.
+//
+// This function is written to be panic-proof: every slice index is validated
+// and clamped before it is ever used, so a malformed patch, a wildly
+// out-of-range line number, or a file that has changed under our feet can
+// never trigger a Go "index out of range" panic. When the requested range
+// cannot be safely applied it returns (original, false) and lets the caller
+// surface a descriptive error instead of crashing.
 func applyLineRangeFallback(original string, hunk diffHunk) (string, bool) {
 	if original == "" {
 		return original, false
@@ -464,28 +552,109 @@ func applyLineRangeFallback(original string, hunk diffHunk) (string, bool) {
 	if hunk.oldStart < 1 {
 		return original, false
 	}
+
 	lines := strings.Split(original, "\n")
-	// Convert to 0-indexed
-	start := hunk.oldStart - 1
-	if start > len(lines) {
-		start = len(lines)
-	}
-	end := start + hunk.oldCount
-	if end > len(lines) {
-		end = len(lines)
-	}
-	if start > end {
+	if len(lines) == 0 {
 		return original, false
 	}
 
-	newLines := strings.Split(hunk.newBlock, "\n")
+	// The old block is the content we expect to replace. If there is no
+	// context to anchor on we cannot safely verify a match, so refuse rather
+	// than blindly overwriting lines.
+	oldLines := strings.Split(hunk.oldBlock, "\n")
+	if len(oldLines) == 0 || (len(oldLines) == 1 && oldLines[0] == "") {
+		return original, false
+	}
+	numOld := len(oldLines)
+	if numOld > len(lines) {
+		return original, false
+	}
 
-	result := make([]string, 0, len(lines)-hunk.oldCount+len(newLines))
+	// Convert the hunk's 1-indexed start to a 0-indexed target index and
+	// strictly validate it against the file bounds before any slicing.
+	targetIndex := hunk.oldStart - 1
+	if targetIndex < 0 {
+		targetIndex = 0
+	}
+	if targetIndex >= len(lines) {
+		// The hunk points outside the file; the surrounding context has
+		// clearly changed, so bail out safely rather than indexing OOB.
+		return original, false
+	}
+
+	// Prefer the reported line number, but tolerate small drift by anchoring
+	// on the first non-empty context line within a bounded window. The window
+	// is clamped to [0, len(lines)-1] so the scan can never index OOB.
+	start := targetIndex
+	if anchor, ok := findContextAnchor(lines, hunk.oldBlock, targetIndex, 5); ok {
+		start = anchor
+	}
+	if start < 0 || start+numOld > len(lines) {
+		return original, false
+	}
+
+	// Verify the original content actually exists at the candidate location.
+	// If it does not, the file has changed underneath us and we MUST NOT apply
+	// a destructive replacement — return safely instead of corrupting the file.
+	for i := 0; i < numOld; i++ {
+		if lines[start+i] != oldLines[i] {
+			return original, false
+		}
+	}
+
+	result := make([]string, 0, len(lines)-numOld+len(strings.Split(hunk.newBlock, "\n")))
 	result = append(result, lines[:start]...)
-	result = append(result, newLines...)
-	result = append(result, lines[end:]...)
+	result = append(result, strings.Split(hunk.newBlock, "\n")...)
+	result = append(result, lines[start+numOld:]...)
 
 	return strings.Join(result, "\n"), true
+}
+
+// findContextAnchor scans a window of [-offset, +offset] lines around
+// center for the first non-empty line of oldBlock. Both bounds are clamped to
+// [0, len(lines)-1] so the scan can never index out of range. It returns the
+// matched index and true, or (-1, false) when no match is found.
+func findContextAnchor(lines []string, oldBlock string, center, offset int) (int, bool) {
+	if len(lines) == 0 {
+		return -1, false
+	}
+	needle := firstNonEmptyLine(oldBlock)
+	if needle == "" {
+		return -1, false
+	}
+
+	lo := center - offset
+	if lo < 0 {
+		lo = 0
+	}
+	hi := center + offset
+	if hi > len(lines)-1 {
+		hi = len(lines) - 1
+	}
+	if lo > hi {
+		return -1, false
+	}
+
+	for i := lo; i <= hi; i++ {
+		if i < 0 || i >= len(lines) {
+			continue
+		}
+		if lines[i] == needle {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// firstNonEmptyLine returns the first non-empty line of a block, or "" if the
+// block has no usable context.
+func firstNonEmptyLine(block string) string {
+	for _, l := range strings.Split(block, "\n") {
+		if l != "" {
+			return l
+		}
+	}
+	return ""
 }
 
 func applyUnifiedPatch(original, diff string) (string, error) {
@@ -522,7 +691,7 @@ func applyUnifiedPatch(original, diff string) (string, error) {
 			if len(excerpt) > 80 {
 				excerpt = excerpt[:80] + "..."
 			}
-			return "", fmt.Errorf("patch hunk does not match file content (could not find %q)", excerpt)
+			return "", fmt.Errorf("patch hunk does not match file content — target code context may have changed; patch cannot be safely applied (could not find %q)", excerpt)
 		}
 		before := current[:idx]
 		after := current[idx+len(hunk.oldBlock):]

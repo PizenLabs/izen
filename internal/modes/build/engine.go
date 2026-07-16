@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+
+	izenctx "github.com/PizenLabs/izen/internal/context"
 )
 
 type BuildRecoveryState int
@@ -19,6 +22,15 @@ type Engine struct {
 	recoveryState BuildRecoveryState
 	files         map[string]int
 	maxRecovery   int
+
+	// ledger bridges /build execution to the /plan checklist state.
+	ledger *izenctx.TaskLedger
+	// contextID scopes mutations for the guardrail audit log.
+	contextID string
+
+	mu          sync.Mutex
+	applied     int
+	lastSummary string
 }
 
 func NewEngine() *Engine {
