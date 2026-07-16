@@ -1,11 +1,83 @@
 package execution
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/PizenLabs/izen/internal/context"
 )
+
+func TestPatchManagerLedgerBridge(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "izen-patch-ledger-*")
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	pm := NewPatchManager(dir)
+	ledger := context.NewTaskLedger()
+	pm.SetLedger(ledger)
+	pm.SetContextID("#ctx-go-1-r1")
+
+	var summaryLog string
+	SetActivityLogger(func(format string, args ...interface{}) {
+		summaryLog += fmt.Sprintf(format, args...)
+	})
+	defer SetActivityLogger(nil)
+
+	testFile := filepath.Join("subdir", "test.txt")
+	fullPath := filepath.Join(dir, testFile)
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(fullPath, []byte("original"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := pm.Apply(&Patch{
+		ID:       "p1",
+		File:     testFile,
+		Modified: "modified content",
+		TaskID:   3,
+	}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if !ledger.IsCompleted(3) {
+		t.Fatal("expected task 3 to be Completed in the shared ledger")
+	}
+	if ledger.IsCompleted(99) {
+		t.Fatal("unrelated task must remain pending")
+	}
+	if !strings.Contains(summaryLog, "BUILD MUTATION SUMMARY") {
+		t.Fatalf("expected execution summary in activity log, got: %q", summaryLog)
+	}
+	if !strings.Contains(summaryLog, "**Files Mutated:** `subdir/test.txt` (strategy: ATOMIC_REPLACE)") {
+		t.Fatalf("expected mutated file in summary, got: %q", summaryLog)
+	}
+}
+
+func TestPatchManagerLedgerNoOpWithoutTaskID(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "izen-patch-ledger-noop-*")
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	pm := NewPatchManager(dir)
+	ledger := context.NewTaskLedger()
+	pm.SetLedger(ledger)
+
+	testFile := "f.txt"
+	fullPath := filepath.Join(dir, testFile)
+	if err := os.WriteFile(fullPath, []byte("original"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := pm.Apply(&Patch{ID: "p2", File: testFile, Modified: "new"}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if ledger.IsCompleted(0) {
+		t.Fatal("TaskID 0 must not mark the ledger")
+	}
+}
 
 func TestRunnerBasic(t *testing.T) {
 	r := NewRunner(".", false, false)

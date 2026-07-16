@@ -374,6 +374,7 @@ func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 			ID:       p.ID,
 			File:     p.Target.QualifiedName,
 			Modified: p.Diff,
+			TaskID:   m.currentBuildTaskID,
 		}
 		orig, err := os.ReadFile(p.Target.QualifiedName)
 		if err == nil {
@@ -423,6 +424,7 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 				ID:       p.ID,
 				File:     p.Target.QualifiedName,
 				Modified: p.Diff,
+				TaskID:   m.currentBuildTaskID,
 			}
 			orig, err := os.ReadFile(p.Target.QualifiedName)
 			if err == nil {

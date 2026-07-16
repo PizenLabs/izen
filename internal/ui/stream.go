@@ -11,6 +11,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
 )
@@ -44,9 +45,19 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	}
 
 	var msgs []ai.Message
+	// Context isolation for /build: never replay a prior /plan JSON ledger back
+	// to the model. When it sees its own plan contract in history, weaker models
+	// re-print the plan instead of executing the active task. The staged task
+	// list (passed as the current user turn) is the single source of truth.
+	buildMode := m.resolver.Current() == modes.ModeBuild
 	if history := m.sess.History; len(history) > 0 {
 		for _, msg := range history {
 			raw := msg.Content
+			if buildMode && msg.Role == "assistant" {
+				if r := plan.ParseJSONPlan(raw); r != nil && r.Valid && r.Plan != nil {
+					continue
+				}
+			}
 			// READS: Never pass viewport-rendered content — only session-persisted raw text.
 			msgs = append(msgs, ai.Message{
 				Role:    msg.Role,

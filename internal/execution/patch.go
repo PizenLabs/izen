@@ -9,6 +9,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	izenctx "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/modes/build"
 )
 
 type Patch struct {
@@ -19,12 +22,16 @@ type Patch struct {
 	ContextID string    `json:"context_id,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	Applied   bool      `json:"applied"`
+	// TaskID links this patch to a /plan ledger task. When > 0 the patch
+	// manager marks the task Completed and renders the build summary.
+	TaskID int `json:"task_id,omitempty"`
 }
 
 type StagedPatch struct {
 	File    string
 	Content string
 	RawDiff string
+	TaskID  int
 }
 
 type PatchQueue struct {
@@ -113,6 +120,7 @@ func (pq *PatchQueue) ApplyNext() error {
 		ID:       fmt.Sprintf("staged-%d", time.Now().UnixNano()),
 		File:     p.File,
 		Modified: p.Content,
+		TaskID:   p.TaskID,
 	}
 	orig, err := os.ReadFile(fullPath)
 	if err == nil {
@@ -146,6 +154,7 @@ func (pq *PatchQueue) ApplyAll() (int, error) {
 			ID:       fmt.Sprintf("staged-%d", time.Now().UnixNano()),
 			File:     p.File,
 			Modified: p.Content,
+			TaskID:   p.TaskID,
 		}
 		orig, err := os.ReadFile(filepath.Join(pq.root, p.File))
 		if err == nil {
@@ -173,6 +182,7 @@ type PatchManager struct {
 	patDir    string
 	contextID string
 	guardrail *MutationGuardrail
+	ledger    *izenctx.TaskLedger
 }
 
 func NewPatchManager(root string) *PatchManager {
@@ -196,6 +206,13 @@ func (pm *PatchManager) Guardrail() *MutationGuardrail {
 
 func (pm *PatchManager) SetContextID(id string) {
 	pm.contextID = id
+}
+
+// SetLedger attaches the shared /plan task ledger. When a committed patch
+// carries a TaskID, the manager marks that task Completed and renders the build
+// mutation summary via the activity log.
+func (pm *PatchManager) SetLedger(l *izenctx.TaskLedger) {
+	pm.ledger = l
 }
 
 func (pm *PatchManager) ActiveContextID() string {
@@ -383,7 +400,45 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		return fmt.Errorf("patch applied but audit log failed: %w", err)
 	}
 
+	pm.recordLedgerAndSummarize(patch)
+
 	return pm.store(patch)
+}
+
+// recordLedgerAndSummarize bridges a successful patch commit to the /plan task
+// ledger: when the patch carries a plan task id it marks that task Completed and
+// pipes the concise build mutation summary to the activity log. It is a no-op
+// for ad-hoc mutations (TaskID == 0), keeping non-plan paths quiet.
+func (pm *PatchManager) recordLedgerAndSummarize(patch *Patch) {
+	if pm.ledger == nil || patch.TaskID <= 0 {
+		return
+	}
+
+	pm.ledger.MarkCompleted(patch.TaskID)
+
+	summary := build.ExecutionSummary{
+		Success:   true,
+		Mutations: []build.MutationRecord{{File: patch.File, Strategy: patchStrategy(patch)}},
+		ContextID: pm.contextID,
+	}
+	if pm.guardrail != nil {
+		d := pm.guardrail.Check(patch.File, pm.contextID)
+		summary.GuardrailPass = !d.Halt
+		summary.GuardrailCount = d.Count
+		summary.GuardrailLimit = d.Limit
+	}
+
+	if globalActivityLog != nil {
+		globalActivityLog("%s", build.RenderExecutionSummary(summary))
+	}
+}
+
+// patchStrategy resolves the plan strategy label recorded in the summary.
+func patchStrategy(patch *Patch) string {
+	if strings.Contains(patch.Modified, "@@") {
+		return "DIFF_PATCH"
+	}
+	return "ATOMIC_REPLACE"
 }
 
 type diffHunk struct {

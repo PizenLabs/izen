@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 
+	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
@@ -439,10 +440,20 @@ func (m *model) renderStreamingContent(content string, width int) string {
 			rendered = renderWidget("Command", container.String(), availableWidth, colorModePlan)
 
 		default:
-			// INTERCEPT: if in plan mode, try JSON plan parsing first.
-			// Suppresses raw JSON and renders a clean architectural task widget.
+			// INTERCEPT: suppress raw JSON plans by rendering a clean widget —
+			// but ONLY outside /build mode. In /build the plan phase is over, so
+			// a JSON plan here is a contract violation (the model designed
+			// instead of executing). Rendering it as a legit-looking Plan widget
+			// would mask the failure, so surface an explicit error instead.
 			if jsonResult := plan.ParseJSONPlan(block.raw); jsonResult != nil && jsonResult.Valid && jsonResult.Plan != nil {
-				rendered = renderJSONPlanWidget(jsonResult.Plan, availableWidth)
+				if m.resolver.Current() == modes.ModeBuild {
+					rendered = renderWidget("Execution Error",
+						textStyle.Render("Model returned a /plan JSON contract instead of a code patch. "+
+							"The plan phase is complete — re-run the task or refine the instruction to force patch output."),
+						availableWidth, colorModeReview)
+					break
+				}
+				rendered = renderJSONPlanWidget(jsonResult.Plan, m.planStatusSource(), availableWidth)
 				break
 			}
 
@@ -467,9 +478,23 @@ func (m *model) renderStreamingContent(content string, width int) string {
 	return strings.Join(renderedBlocks, vspace(Spacing.Section))
 }
 
+// planStatusSource exposes the live /plan task ledger as a plan.TaskStatusSource
+// for the checklist renderer. It returns a genuine nil interface (not a typed
+// nil *TaskLedger) when no ledger is attached, so callers can safely nil-check
+// without risking a nil-pointer panic inside IsCompleted.
+func (m *model) planStatusSource() plan.TaskStatusSource {
+	if m.buildLedger == nil {
+		return nil
+	}
+	return m.buildLedger
+}
+
 // renderJSONPlanWidget renders a validated PlanOutput as a clean TUI widget.
 // Used when the LLM returns a valid JSON plan contract instead of markdown.
-func renderJSONPlanWidget(planOutput *plan.PlanOutput, width int) string {
+// When src is non-nil each task's checkbox reflects its ledger state: tasks
+// committed by /build (keyed on AtomicTask.TaskID) render as checked [✓] with
+// strike-through text; pending tasks keep the open [ ] state.
+func renderJSONPlanWidget(planOutput *plan.PlanOutput, src plan.TaskStatusSource, width int) string {
 	if planOutput == nil {
 		return ""
 	}
@@ -488,14 +513,40 @@ func renderJSONPlanWidget(planOutput *plan.PlanOutput, width int) string {
 	b.WriteString(dimmedStyle.Render(strings.Repeat("─", contentWidth)))
 	b.WriteString("\n")
 
-	b.WriteString(boldTextStyle.Render("PENDING TASKS:"))
-	b.WriteString("\n\n")
+	// Count committed tasks so the header reflects live ledger progress.
+	completed := 0
+	for _, task := range planOutput.AtomicTasks {
+		if src != nil && src.IsCompleted(task.TaskID) {
+			completed++
+		}
+	}
+	if completed > 0 {
+		fmt.Fprintf(&b, "%s\n\n", boldTextStyle.Render(
+			fmt.Sprintf("TASKS (%d/%d completed):", completed, len(planOutput.AtomicTasks))))
+	} else {
+		b.WriteString(boldTextStyle.Render("PENDING TASKS:"))
+		b.WriteString("\n\n")
+	}
+
+	strikeStyle := textStyle.Strikethrough(true)
+	strikeDimStyle := dimmedStyle.Strikethrough(true)
 
 	for _, task := range planOutput.AtomicTasks {
+		done := src != nil && src.IsCompleted(task.TaskID)
+
+		checkbox := dimmedStyle.Render("[ ]")
+		labelStyle := orangeStyle
+		fileStyle := textStyle
+		if done {
+			checkbox = greenStyle.Render("[✓]")
+			labelStyle = greenStyle
+			fileStyle = strikeStyle
+		}
+
 		fmt.Fprintf(&b, "%s %s %s\n",
-			dimmedStyle.Render("[ ]"),
-			orangeStyle.Render(fmt.Sprintf("TASK #%d:", task.TaskID)),
-			textStyle.Render(task.File),
+			checkbox,
+			labelStyle.Render(fmt.Sprintf("TASK #%d:", task.TaskID)),
+			fileStyle.Render(task.File),
 		)
 
 		indent := "    "
@@ -509,19 +560,23 @@ func renderJSONPlanWidget(planOutput *plan.PlanOutput, width int) string {
 		if descW < 10 {
 			descW = 10
 		}
+		descStyle := dimmedStyle
+		if done {
+			descStyle = strikeDimStyle
+		}
 		descLines := wrapStreamText(task.Description, descW)
 		for i, dl := range descLines {
 			if i == 0 {
 				fmt.Fprintf(&b, "%s%s %s\n",
 					indent,
 					dimmedStyle.Render("↳ Description:"),
-					dimmedStyle.Render(dl),
+					descStyle.Render(dl),
 				)
 			} else {
 				fmt.Fprintf(&b, "%s%s %s\n",
 					indent,
 					strings.Repeat(" ", lipgloss.Width(dimmedStyle.Render("↳ Description:"))-lipgloss.Width(indent)),
-					dimmedStyle.Render(dl),
+					descStyle.Render(dl),
 				)
 			}
 		}

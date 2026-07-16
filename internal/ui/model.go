@@ -518,6 +518,14 @@ type model struct {
 	execEng   *execution.Engine
 	planStore *plan.PlanStore
 
+	// buildLedger is the live /plan task state bridge shared with the execution
+	// engine. It is created lazily and survives across builds within a session.
+	buildLedger *ctxpkg.TaskLedger
+	// currentBuildTaskID is the plan task id being executed by the active
+	// /build run; it is threaded into every committed patch so the ledger can
+	// be marked Completed.
+	currentBuildTaskID int
+
 	investigateInvocationCount int
 
 	// Command history

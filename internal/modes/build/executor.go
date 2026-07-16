@@ -14,6 +14,13 @@ type FileMutation struct {
 	File    string
 	Content string
 	Mode    MutationMode
+
+	// TaskID links this patch to a /plan ledger task. A value > 0 causes the
+	// build engine to mark the task Completed in the shared ledger on commit.
+	TaskID int
+	// Strategy is the plan strategy label (e.g. ATOMIC_REPLACE) recorded in the
+	// execution summary. Falls back to ATOMIC_REPLACE when empty.
+	Strategy string
 }
 
 type MutationMode int
@@ -44,10 +51,27 @@ func (ex *Executor) ApplyMutation(ctx context.Context, mut FileMutation) error {
 	}
 
 	if mut.Mode == ModeFullRewrite {
-		return os.WriteFile(absPath, []byte(mut.Content), 0644)
+		if err := os.WriteFile(absPath, []byte(mut.Content), 0644); err != nil {
+			return err
+		}
+		ex.engine.RecordPatch(mut.TaskID, mut.File, mutationStrategy(mut))
+		return nil
 	}
 
-	return os.WriteFile(absPath, []byte(mut.Content), 0644)
+	if err := os.WriteFile(absPath, []byte(mut.Content), 0644); err != nil {
+		return err
+	}
+	ex.engine.RecordPatch(mut.TaskID, mut.File, mutationStrategy(mut))
+	return nil
+}
+
+// mutationStrategy resolves the strategy label recorded in the execution
+// summary, defaulting to ATOMIC_REPLACE when unset.
+func mutationStrategy(mut FileMutation) string {
+	if mut.Strategy != "" {
+		return mut.Strategy
+	}
+	return "ATOMIC_REPLACE"
 }
 
 func (ex *Executor) VerifyCompilation(ctx context.Context, packages ...string) (bool, string, error) {

@@ -629,7 +629,11 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	_ = m.sess.Save()
 	m.push(roleStatus, fmt.Sprintf("executing step %d: %s — %s", targetTask.StepNum, targetTask.Type, targetTask.Target))
 
-	content := fmt.Sprintf("Execute step %d: %s\nTarget: %s\nDescription: %s",
+	content := fmt.Sprintf(
+		"EXECUTION MODE — implement ONLY this task and output the code patch directly "+
+			"(unified diff or FILE: block). Do NOT output JSON, do NOT restate the plan, "+
+			"do NOT list other tasks.\n\n"+
+			"Step %d: %s\nTarget: %s\nDescription: %s",
 		targetTask.StepNum, targetTask.Type, targetTask.Target, targetTask.Description)
 
 	if m.graph != nil {
@@ -644,6 +648,15 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 
 	m.responseBuffer.Reset()
 	m.execEng.SetStreamContextFiles(m.attachedFiles)
+
+	// Bridge the live /plan task ledger into the execution engine: the patch
+	// manager marks task Completed and renders the build summary on commit.
+	if m.buildLedger == nil {
+		m.buildLedger = ctxpkg.NewTaskLedger()
+	}
+	m.currentBuildTaskID = targetTask.StepNum
+	m.execEng.Patches.SetLedger(m.buildLedger)
+	m.execEng.Patches.SetContextID(m.sess.ContextID)
 
 	buildTrace := &ctxpkg.CodebaseTrace{
 		MatchedFiles:    []string{targetTask.Target},
