@@ -183,6 +183,10 @@ type PatchManager struct {
 	contextID string
 	guardrail *MutationGuardrail
 	ledger    *izenctx.TaskLedger
+	// verifier is the deterministic verification gate. It is invoked after
+	// every patch write to ensure structural integrity before allowing a
+	// task to transition to TaskCompleted.
+	verifier *Verifier
 }
 
 func NewPatchManager(root string) *PatchManager {
@@ -191,6 +195,19 @@ func NewPatchManager(root string) *PatchManager {
 		patDir:    filepath.Join(root, ".izen", "patches"),
 		guardrail: NewMutationGuardrail(root),
 	}
+}
+
+// SetVerifier attaches the deterministic verification gate. When set, the
+// patch manager runs verifier.RunAll() after every write and refuses to mark
+// the task as completed if verification fails — enforcing the Zero Syntax
+// Leakage guarantee.
+func (pm *PatchManager) SetVerifier(v *Verifier) {
+	pm.verifier = v
+}
+
+// Verifier returns the attached Verifier (may be nil).
+func (pm *PatchManager) Verifier() *Verifier {
+	return pm.verifier
 }
 
 // SetGuardrail attaches a MutationGuardrail used to halt infinite autofix
@@ -262,6 +279,85 @@ func (pm *PatchManager) createShadowBackup(filePath string) error {
 
 // appendMutationLog writes a mutation entry to .izen/audit/mutations.log with
 // the active #number as a metadata header for traceability.
+// firstLine returns the first non-empty line of s, or the full string trimmed.
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if idx := strings.Index(s, "\n"); idx >= 0 {
+		return s[:idx]
+	}
+	return s
+}
+
+// SplitAndFilterPatches splits a raw LLM diff output that may contain hunks
+// for multiple files and returns only the hunks relevant to targetFile.
+// This handles the case where the model hallucinates multi-file diffs in a
+// single code block, causing "patch hunk does not match file content" errors.
+//
+// It works by scanning for "--- a/<file>" headers (standard unified diff format)
+// and partitioning the output into per-file blocks. Only blocks targeting
+// targetFile are kept. If no multi-file headers are detected, the original
+// content is returned unchanged.
+func SplitAndFilterPatches(rawDiff string, targetFile string) string {
+	if rawDiff == "" {
+		return rawDiff
+	}
+
+	lines := strings.Split(rawDiff, "\n")
+
+	var headerIndices []int
+	for i, line := range lines {
+		if strings.HasPrefix(line, "--- a/") {
+			headerIndices = append(headerIndices, i)
+		}
+	}
+
+	if len(headerIndices) <= 1 {
+		return rawDiff
+	}
+
+	var resultParts []string
+	targetBase := filepath.Base(targetFile)
+
+	for i, hdrIdx := range headerIndices {
+		var blockEnd int
+		if i+1 < len(headerIndices) {
+			blockEnd = headerIndices[i+1]
+		} else {
+			blockEnd = len(lines)
+		}
+
+		headerLine := lines[hdrIdx]
+		filePath := strings.TrimSpace(strings.TrimPrefix(headerLine, "--- a/"))
+		fileBase := filepath.Base(filePath)
+
+		if filePath == targetFile || fileBase == targetBase || strings.HasSuffix(targetFile, filePath) {
+			resultParts = append(resultParts, strings.Join(lines[hdrIdx:blockEnd], "\n"))
+		}
+	}
+
+	if len(resultParts) == 0 {
+		return rawDiff
+	}
+
+	return strings.Join(resultParts, "\n")
+}
+
+// restoreFromShadowBackup restores a file from its shadow backup checkpoint.
+// It is used by the verification gate to roll back a patch when compilation
+// fails, ensuring the disk state is never left in a broken state.
+func (pm *PatchManager) restoreFromShadowBackup(fullPath string) error {
+	backupDir := filepath.Join(pm.root, ".izen", "checkpoints", "cp-"+sanitizeCtxID(pm.contextID)+"-backup")
+	backupPath := filepath.Join(backupDir, filepath.Base(fullPath)+".orig")
+	data, err := os.ReadFile(backupPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read shadow backup: %w", err)
+	}
+	return os.WriteFile(fullPath, data, 0644)
+}
+
 func (pm *PatchManager) appendMutationLog(file string, patchID string) error {
 	auditDir := filepath.Join(pm.root, ".izen", "audit")
 	if err := os.MkdirAll(auditDir, 0755); err != nil {
@@ -341,10 +437,21 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		return fmt.Errorf("shadow backup %s: %w", patch.File, err)
 	}
 
+	// SanitizeLLMResponse: strip hallucinated metadata (FILE: lines, [target]
+	// markers, stray code fences) that local models inject inside code blocks
+	// before the content enters the diff parser or file write path.
+	patch.Modified = SanitizeLLMResponse(patch.Modified)
+
+	// SplitAndFilterPatches: strip hunks targeting other files from the raw
+	// LLM diff output before passing it to the patching engine. This handles
+	// multi-file context bleeding where the model hallucinates hunks for
+	// unrelated files within a single code block.
+	diffInput := SplitAndFilterPatches(patch.Modified, patch.File)
+
 	var final string
 	switch {
-	case strings.Contains(patch.Modified, "@@"):
-		result, err := applyUnifiedPatch(patch.Original, patch.Modified)
+	case strings.Contains(diffInput, "@@"):
+		result, err := applyUnifiedPatch(patch.Original, diffInput)
 		if err != nil {
 			if globalActivityLog != nil {
 				globalActivityLog("[FAIL] patch rejected on %s: %v", patch.File, err)
@@ -353,7 +460,7 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		}
 		final = result
 	case patch.Original != "":
-		clean := SanitizeDiffContent(patch.Modified)
+		clean := SanitizeDiffContent(diffInput)
 		if isTruncated(patch.Original, clean) {
 			errMsg := fmt.Sprintf("refusing to apply truncated content to %s (%.0f%% of original size)",
 				patch.File, float64(len(clean))/float64(len(patch.Original))*100)
@@ -364,7 +471,7 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		}
 		final = clean
 	default:
-		final = SanitizeDiffContent(patch.Modified)
+		final = SanitizeDiffContent(diffInput)
 	}
 
 	if err := os.WriteFile(fullPath, []byte(final), 0644); err != nil {
@@ -372,6 +479,55 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 			globalActivityLog("[FAIL] patch rejected on %s: write failed: %v", patch.File, err)
 		}
 		return fmt.Errorf("write %s: %w", patch.File, err)
+	}
+
+	// ── Deterministic Verification Gate ──────────────────────────────────
+	// Immediately after a code patch is hot-applied to the workspace disk,
+	// trigger the low-overhead local compiler check. If a fundamental syntax
+	// degradation occurs (e.g., missing '}' block wrapper, undefined basic
+	// packages like "fmt"), intercept the state pipeline.
+	//
+	// Block the task from updating to Success in the Ledger, extract the
+	// specific faulty lines, and route a pinpointed, high-velocity micro-patch
+	// back to fix the syntax typo natively at the execution layer.
+	//
+	// This is the core of the Micro-Fix Loop Architecture.
+	if pm.verifier != nil {
+		report := pm.verifier.RunAll()
+		if !report.Passed {
+			// Verification failed — extract syntax errors for micro-fix loop.
+			var syntaxErrors []string
+			for _, res := range report.Results {
+				if !res.Passed && !res.Step.Optional {
+					syntaxErrors = append(syntaxErrors, fmt.Sprintf("%s: %s", res.Step.Name, firstLine(res.Output)))
+				}
+			}
+
+			// Roll back: restore original from shadow backup.
+			if err := pm.restoreFromShadowBackup(fullPath); err != nil {
+				if globalActivityLog != nil {
+					globalActivityLog("[FAIL] patch write-back failed on %s: %v", patch.File, err)
+				}
+			}
+
+			if globalActivityLog != nil {
+				for _, se := range syntaxErrors {
+					globalActivityLog("[VERIFY] syntax degradation in %s: %s", patch.File, se)
+				}
+				globalActivityLog("[FAIL] patch rejected on %s: verification gate blocked — micro-fix required", patch.File)
+			}
+
+			errMsg := fmt.Sprintf("verification gate blocked patch on %s (syntax degradation detected)",
+				patch.File)
+			if len(syntaxErrors) > 0 {
+				errMsg += ": " + syntaxErrors[0]
+			}
+			return fmt.Errorf("%s", errMsg)
+		}
+
+		if globalActivityLog != nil {
+			globalActivityLog("[VERIFY] verification gate passed for %s", patch.File)
+		}
 	}
 
 	origLines := 0
@@ -657,6 +813,85 @@ func firstNonEmptyLine(block string) string {
 	return ""
 }
 
+// fuzzyMatchHunk attempts to locate a hunk's oldBlock within current using a
+// sliding window centered on the reported line number with ±3 line tolerance.
+// For each candidate position it compares line-by-line and picks the one with
+// the highest match count. The replacement is applied if at least one line
+// matches. This mitigates delta drifting caused by AST skeleton pruning.
+func fuzzyMatchHunk(current string, hunk diffHunk) (string, bool) {
+	if current == "" || hunk.oldBlock == "" {
+		return "", false
+	}
+
+	lines := strings.Split(current, "\n")
+	oldLines := strings.Split(hunk.oldBlock, "\n")
+	newLines := strings.Split(hunk.newBlock, "\n")
+
+	// Strip trailing empty strings from all line slices to avoid false
+	// positives where trailing newlines match across unrelated content.
+	for len(oldLines) > 0 && oldLines[len(oldLines)-1] == "" {
+		oldLines = oldLines[:len(oldLines)-1]
+	}
+	for len(newLines) > 0 && newLines[len(newLines)-1] == "" {
+		newLines = newLines[:len(newLines)-1]
+	}
+	for len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+
+	if len(oldLines) == 0 || len(lines) == 0 {
+		return "", false
+	}
+	if len(oldLines) > len(lines) {
+		return "", false
+	}
+
+	tolerance := 3
+	if hunk.oldStart < 1 {
+		hunk.oldStart = 1
+	}
+	targetIndex := hunk.oldStart - 1
+
+	lo := targetIndex - tolerance
+	if lo < 0 {
+		lo = 0
+	}
+	hi := targetIndex + tolerance
+	if hi > len(lines)-len(oldLines) {
+		hi = len(lines) - len(oldLines)
+	}
+	if lo > hi {
+		return "", false
+	}
+
+	bestPos := -1
+	bestScore := 0
+
+	for pos := lo; pos <= hi; pos++ {
+		score := 0
+		for i := 0; i < len(oldLines); i++ {
+			if lines[pos+i] == oldLines[i] {
+				score++
+			}
+		}
+		if score > bestScore {
+			bestScore = score
+			bestPos = pos
+		}
+	}
+
+	if bestScore == 0 {
+		return "", false
+	}
+
+	result := make([]string, 0, len(lines)-len(oldLines)+len(newLines))
+	result = append(result, lines[:bestPos]...)
+	result = append(result, newLines...)
+	result = append(result, lines[bestPos+len(oldLines):]...)
+
+	return strings.Join(result, "\n"), true
+}
+
 func applyUnifiedPatch(original, diff string) (string, error) {
 	if diff == "" {
 		return original, nil
@@ -682,8 +917,13 @@ func applyUnifiedPatch(original, diff string) (string, error) {
 
 		idx := strings.Index(current, hunk.oldBlock)
 		if idx < 0 {
-			// Fallback: try line-range replacement using the @@ header line numbers.
+			// Fallback 1: line-range replacement using the @@ header line numbers.
 			if replaced, ok := applyLineRangeFallback(current, hunk); ok && replaced != current {
+				current = replaced
+				continue
+			}
+			// Fallback 2: fuzzy sliding window with ±3 line tolerance.
+			if replaced, ok := fuzzyMatchHunk(current, hunk); ok && replaced != current {
 				current = replaced
 				continue
 			}
@@ -773,6 +1013,9 @@ func (pm *PatchManager) Remove(id string) error {
 }
 
 func SanitizeDiffContent(content string) string {
+	// Pre-clean hallucinated metadata before processing the diff format.
+	content = SanitizeLLMResponse(content)
+
 	lines := strings.Split(content, "\n")
 	isDiff := false
 

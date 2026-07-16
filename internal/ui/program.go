@@ -113,7 +113,11 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		}
 	}
 	if !localActive {
-		initStage = initConfirm // Local missing — halt at interactive TUI
+		if eng.IsRepo() {
+			initStage = initIdentity
+		} else {
+			initStage = initGitCheck
+		}
 	}
 
 	// ── DEFERRED GRAPH LOAD ─────────────────────────────────────────────
@@ -166,6 +170,18 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		initPrefillProvider: globalProvider,
 		viewRegistry:        reg,
 	}
+	if initStage == initIdentity {
+		m.initIdentityInput = textinput.New()
+		m.initIdentityInput.Prompt = ""
+		m.initIdentityInput.CharLimit = 64
+		m.initIdentityInput.Placeholder = "username"
+		if globalUsername != "" {
+			m.userName = globalUsername
+		}
+		m.initIdentityInput.SetValue(m.userName)
+		m.initIdentityInput.Focus()
+	}
+
 	m.resolver.Set(sess.Mode)
 	m.loadHistory()
 	m.historyIndex = len(m.history)

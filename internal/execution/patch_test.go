@@ -1,6 +1,9 @@
 package execution
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestApplyLineRangeFallbackNeverPanics(t *testing.T) {
 	cases := []struct {
@@ -61,10 +64,74 @@ func TestApplyUnifiedPatchMalformedNeverPanics(t *testing.T) {
 	}
 }
 
+func TestSplitAndFilterPatches(t *testing.T) {
+	t.Run("no headers returns original", func(t *testing.T) {
+		input := "@@ -1,3 +1,3 @@\n context\n-old\n+new\n"
+		got := SplitAndFilterPatches(input, "file.go")
+		if got != input {
+			t.Fatalf("expected unchanged input, got %q", got)
+		}
+	})
+
+	t.Run("single file header returns original", func(t *testing.T) {
+		input := "--- a/file.go\n+++ b/file.go\n@@ -1,3 +1,3 @@\n context\n-old\n+new\n"
+		got := SplitAndFilterPatches(input, "file.go")
+		if got != input {
+			t.Fatalf("expected unchanged input, got %q", got)
+		}
+	})
+
+	t.Run("filters to matching file", func(t *testing.T) {
+		input := "--- a/other.go\n+++ b/other.go\n@@ -1,1 +1,1 @@\n-other\n+other2\n--- a/target.go\n+++ b/target.go\n@@ -5,1 +5,1 @@\n-foo\n+bar\n"
+		got := SplitAndFilterPatches(input, "target.go")
+		if !strings.Contains(got, "target.go") {
+			t.Fatalf("expected result to contain target.go, got %q", got)
+		}
+		if strings.Contains(got, "other.go") {
+			t.Fatalf("expected result NOT to contain other.go, got %q", got)
+		}
+		if !strings.Contains(got, "foo") {
+			t.Fatalf("expected result to contain target hunk content, got %q", got)
+		}
+	})
+
+	t.Run("falls back to original when no match found", func(t *testing.T) {
+		input := "--- a/other.go\n+++ b/other.go\n@@ -1,1 +1,1 @@\n-other\n+other2\n"
+		got := SplitAndFilterPatches(input, "target.go")
+		if got != input {
+			t.Fatalf("expected fallback to original, got %q", got)
+		}
+	})
+
+	t.Run("empty input returns empty", func(t *testing.T) {
+		got := SplitAndFilterPatches("", "file.go")
+		if got != "" {
+			t.Fatalf("expected empty, got %q", got)
+		}
+	})
+}
+
+func TestFuzzyMatchHunkHandlesDriftedContext(t *testing.T) {
+	// Simulate AST skeleton drift: line offsets shifted by 1, one line changed
+	original := "package main\n\nfunc main() {\n\tprintln(\"old\")\n\tprintln(\"extra\")\n}\n"
+	diff := "@@ -3,1 +3,1 @@\n func main() {\n-\tprintln(\"old\")\n+\tprintln(\"new\")\n}\n"
+	result, err := applyUnifiedPatch(original, diff)
+	if err != nil {
+		t.Fatalf("expected fuzzy match to succeed on drifted context, got error: %v", err)
+	}
+	if !strings.Contains(result, "println(\"new\")") {
+		t.Fatalf("expected result to contain new content, got: %q", result)
+	}
+	if !strings.Contains(result, "println(\"extra\")") {
+		t.Fatalf("expected result to preserve extra lines, got: %q", result)
+	}
+}
+
 func TestApplyUnifiedPatchExpiredContextReturnsError(t *testing.T) {
 	diff := "@@ -3,1 +3,1 @@\n func main() {\n-\tprintln(\"old\")\n+\tprintln(\"new\")\n}\n"
-	// Mutate the original so the hunk no longer matches anywhere.
-	changed := "package main\n\nfunc main() {\n\tprintln(\"different\")\n}\n"
+	// Use a completely different function signature and body so no line from
+	// the oldBlock exists in the current file — even fuzzy matching must fail.
+	changed := "package main\n\nfunc completely_unrelated() {\n\tx := 42\n}\n"
 	_, err := applyUnifiedPatch(changed, diff)
 	if err == nil {
 		t.Fatal("expected an error when target context has changed, got nil")

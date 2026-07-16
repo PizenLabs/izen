@@ -16,9 +16,14 @@ type Target struct {
 	Snippet string `json:"snippet"`
 }
 
+// ContextLedger bridges investigation findings to downstream modes (/plan).
+// The ledger MUST NOT generate or mutate task definitions — it only records
+// root cause targets, evidence, and a conclusion. Atomic task synthesis is
+// exclusively owned by /plan/planner.go.
 type ContextLedger struct {
 	Source     string     `json:"source"`
 	Problem    string     `json:"problem"`
+	RootCause  string     `json:"root_cause,omitempty"`
 	Targets    []Target   `json:"targets"`
 	Evidence   []Evidence `json:"evidence,omitempty"`
 	Conclusion string     `json:"conclusion,omitempty"`
@@ -30,6 +35,13 @@ func NewContextLedger() *ContextLedger {
 		Source:  "investigate",
 		Targets: []Target{},
 	}
+}
+
+// SetRootCause stores the isolated root cause description.
+// This is the ONLY structural mutation /investigate performs —
+// atomic task generation is strictly forbidden in this mode.
+func (cl *ContextLedger) SetRootCause(cause string) {
+	cl.RootCause = cause
 }
 
 var funcOrTypePattern = regexp.MustCompile(`(?:^|\n)\s*(func\s+\w+|type\s+\w+\s+(?:struct|interface))\s*[{(]?`)
@@ -186,33 +198,35 @@ func (cl *ContextLedger) SetConclusion(conclusion string, resolved bool) {
 
 func (cl *ContextLedger) FormatForPlan() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "### CONTEXT LEDGER (from /investigate)\n")
+	fmt.Fprintf(&b, "### INVESTIGATION LEDGER (Root Cause Only — No Tasks)\n")
 	fmt.Fprintf(&b, "Source: %s\n", cl.Source)
-	fmt.Fprintf(&b, "Problem: %s\n\n", cl.Problem)
+	fmt.Fprintf(&b, "Problem: %s\n", cl.Problem)
+
+	if cl.RootCause != "" {
+		fmt.Fprintf(&b, "\n### ROOT CAUSE\n%s\n", cl.RootCause)
+	}
 
 	if len(cl.Targets) > 0 {
-		fmt.Fprintf(&b, "### ISOLATED TARGETS\n")
+		fmt.Fprintf(&b, "\n### AFFECTED SYMBOLS (Root Cause Evidence Only)\n")
 		for _, t := range cl.Targets {
-			fmt.Fprintf(&b, "  File: %s\n", t.File)
+			fmt.Fprintf(&b, "  File: %s", t.File)
 			if t.Line > 0 {
-				fmt.Fprintf(&b, "  Line: %d\n", t.Line)
+				fmt.Fprintf(&b, ":%d", t.Line)
 			}
 			if t.Node != "" {
-				fmt.Fprintf(&b, "  Node: %s (%s)\n", t.Node, t.Kind)
-			}
-			if t.Snippet != "" {
-				fmt.Fprintf(&b, "  Snippet:\n%s\n", t.Snippet)
+				fmt.Fprintf(&b, " %s (%s)", t.Node, t.Kind)
 			}
 			fmt.Fprintf(&b, "\n")
 		}
 	}
 
 	if cl.Conclusion != "" {
-		fmt.Fprintf(&b, "### CONCLUSION\n%s\n", cl.Conclusion)
+		fmt.Fprintf(&b, "\n### CONCLUSION\n%s\n", cl.Conclusion)
 	}
 
-	fmt.Fprintf(&b, "### ACTION REQUIRED\n")
-	fmt.Fprintf(&b, "Hand off to /plan for remediation. Do NOT fix in /investigate.\n")
+	fmt.Fprintf(&b, "\n### BOUNDARY ENFORCEMENT\n")
+	fmt.Fprintf(&b, "/investigate produced only root cause and evidence above.\n")
+	fmt.Fprintf(&b, "Atomic task synthesis is delegated exclusively to /plan.\n")
 
 	return b.String()
 }

@@ -42,6 +42,10 @@ type Context struct {
 	Errors             []string       `json:"errors,omitempty"`
 	Query              string         `json:"query,omitempty"`
 	Trace              *CodebaseTrace `json:"trace,omitempty"`
+	// TaskStatusSnapshot is a windowed view of task states injected by the
+	// sliding-window renderer. It is set externally by the build loop and
+	// carries only the active (non-terminal) task metadata.
+	TaskStatusSnapshot map[int]string `json:"task_status_snapshot,omitempty"`
 }
 
 type Stats struct {

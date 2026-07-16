@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/config"
@@ -90,6 +91,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// ── Silent global ~/.izen/ initialization ─────────────────────────────
+	// On the very first run of izen on a machine, ensure ~/.izen/ exists with
+	// default global config. This is SILENT — the user is never prompted or
+	// interrupted for global setup.
+	homeDir, homeErr := os.UserHomeDir()
+	if homeErr == nil {
+		globalCfgPath := filepath.Join(homeDir, ".izen", "config.yml")
+		if _, statErr := os.Stat(globalCfgPath); os.IsNotExist(statErr) {
+			_ = state.InitGlobalState()
+			_ = config.Save(cfg)
+		}
+	}
+
 	// ---- Local context boundary enforcement ----
 	root := targetDir
 
@@ -105,12 +119,23 @@ func main() {
 		cfg.Username = localCfg.Username
 	}
 
-	// ---- Project type detection ----
+	// ── Gate: local config missing → force-launch TUI init flow ───────────
+	// When .izen/config.json does NOT exist, the user MUST go through the
+	// interactive init flow. We NEVER write silent defaults for the local
+	// scope. Skip project detection and all other busywork.
+	if _, err := os.Stat(filepath.Join(root, ".izen", "config.json")); os.IsNotExist(err) {
+		ui.RunMainDashboard(cfg, root, localCfg)
+		return
+	}
+
+	// ---- Project type detection (local config exists) ----
 	detection := project.Detect(root)
 	if detection.Primary != nil {
 		primaryLang := detection.Primary.Name
 		conf := detection.Confidence
-		updateLocalConfig(root, localCfg, detection)
+		if _, err := os.Stat(root + "/.izen"); err == nil {
+			updateLocalConfig(root, localCfg, detection)
+		}
 		fmt.Fprintf(os.Stderr, "izen: detected project type: %s (confidence: %.0f%%)\n", primaryLang, conf*100)
 		if len(detection.Secondary) > 0 {
 			fmt.Fprintf(os.Stderr, "izen: secondary languages:")
