@@ -38,8 +38,24 @@ type ModelConfig struct {
 }
 
 type ExecutionConfig struct {
-	Sandbox bool `yaml:"sandbox"`
-	Confirm bool `yaml:"confirm"`
+	Sandbox      bool               `yaml:"sandbox"`
+	Confirm      bool               `yaml:"confirm"`
+	Policy       PolicyConfig       `yaml:"policy"`
+	Verification VerificationConfig `yaml:"verification"`
+	SandboxMode  string             `yaml:"sandbox_mode"`
+}
+
+type PolicyConfig struct {
+	StrictMode  bool     `yaml:"strict_mode"`
+	DeniedCaps  []string `yaml:"denied_capabilities"`
+	AllowedCaps []string `yaml:"allowed_capabilities,omitempty"`
+}
+
+type VerificationConfig struct {
+	Enabled     bool     `yaml:"enabled"`
+	Steps       []string `yaml:"steps,omitempty"`
+	FailOnWarn  bool     `yaml:"fail_on_warning"`
+	MaxDuration string   `yaml:"max_duration,omitempty"`
 }
 
 type FallbackConfig struct {
@@ -162,8 +178,16 @@ func Default() *Config {
 			Provider: "ollama",
 		},
 		Execution: ExecutionConfig{
-			Sandbox: true,
-			Confirm: true,
+			Sandbox:     true,
+			Confirm:     true,
+			SandboxMode: "policy",
+			Policy: PolicyConfig{
+				StrictMode: true,
+			},
+			Verification: VerificationConfig{
+				Enabled: true,
+				Steps:   []string{"go fmt", "go vet", "go test"},
+			},
 		},
 		Fallback: FallbackConfig{
 			Enabled: true,

@@ -74,19 +74,40 @@ func KillOrphanedByContext(ctxID string) {
 	procEntries = alive
 }
 
+type SandboxMode int
+
+const (
+	SandboxDisabled SandboxMode = iota
+	SandboxAll
+	SandboxPolicy
+	SandboxHighRisk
+)
+
 type Runner struct {
-	sandbox     bool
-	confirm     bool
-	root        string
-	activeCtxID string
+	sandbox        bool
+	confirm        bool
+	root           string
+	activeCtxID    string
+	sandboxMode    SandboxMode
+	riskClassifier *RiskClassifier
 }
 
 func NewRunner(root string, sandbox, confirm bool) *Runner {
 	return &Runner{
-		root:    root,
-		sandbox: sandbox,
-		confirm: confirm,
+		root:           root,
+		sandbox:        sandbox,
+		confirm:        confirm,
+		sandboxMode:    SandboxPolicy,
+		riskClassifier: NewRiskClassifier(),
 	}
+}
+
+func (r *Runner) SetSandboxMode(mode SandboxMode) {
+	r.sandboxMode = mode
+}
+
+func (r *Runner) SetRiskClassifier(rc *RiskClassifier) {
+	r.riskClassifier = rc
 }
 
 func (r *Runner) SetContextID(id string) {
@@ -117,10 +138,33 @@ func (r *Runner) SandboxCheck(command string) error {
 	if !r.sandbox {
 		return nil
 	}
-	if isDangerous(command) {
-		return fmt.Errorf("dangerous command blocked by sandbox: %s", command)
+
+	switch r.sandboxMode {
+	case SandboxAll:
+		return fmt.Errorf("sandbox: all command execution blocked by policy")
+	case SandboxDisabled:
+		return nil
+	case SandboxHighRisk:
+		if isDangerous(command) {
+			return fmt.Errorf("sandbox: dangerous command blocked: %s", command)
+		}
+		return nil
+	case SandboxPolicy:
+		fallthrough
+	default:
+		if isDangerous(command) {
+			return fmt.Errorf("sandbox: dangerous command blocked by policy: %s", command)
+		}
+
+		if r.riskClassifier != nil {
+			risk := r.riskClassifier.ClassifyCommand(command)
+			if risk.Level >= RiskHigh {
+				return fmt.Errorf("sandbox: high-risk command blocked (%s): %s", risk.Label, command)
+			}
+		}
+
+		return nil
 	}
-	return nil
 }
 
 func (r *Runner) run(command, dir string) (*RunResult, error) {

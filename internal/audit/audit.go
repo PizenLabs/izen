@@ -5,25 +5,55 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/state"
 )
 
+type OperationDecision string
+
+const (
+	DecisionApproved OperationDecision = "approved"
+	DecisionRejected OperationDecision = "rejected"
+	DecisionPending  OperationDecision = "pending"
+)
+
 type MutationEntry struct {
-	Timestamp string `json:"timestamp"`
-	File      string `json:"file"`
-	Action    string `json:"action"`
-	PatchID   string `json:"patch_id,omitempty"`
-	Content   string `json:"content,omitempty"`
+	Timestamp          string            `json:"timestamp"`
+	File               string            `json:"file"`
+	Action             string            `json:"action"`
+	PatchID            string            `json:"patch_id,omitempty"`
+	Content            string            `json:"content,omitempty"`
+	Capability         string            `json:"capability,omitempty"`
+	RiskLevel          string            `json:"risk_level,omitempty"`
+	Decision           OperationDecision `json:"decision,omitempty"`
+	VerificationPassed *bool             `json:"verification_passed,omitempty"`
+	ContextID          string            `json:"context_id,omitempty"`
 }
 
 type ShellEntry struct {
-	Timestamp  string `json:"timestamp"`
-	Command    string `json:"command"`
-	ExitCode   int    `json:"exit_code"`
-	WorkingDir string `json:"working_dir"`
-	StdoutPref string `json:"stdout_preview,omitempty"`
+	Timestamp  string            `json:"timestamp"`
+	Command    string            `json:"command"`
+	ExitCode   int               `json:"exit_code"`
+	WorkingDir string            `json:"working_dir"`
+	StdoutPref string            `json:"stdout_preview,omitempty"`
+	Capability string            `json:"capability,omitempty"`
+	RiskLevel  string            `json:"risk_level,omitempty"`
+	Decision   OperationDecision `json:"decision,omitempty"`
+}
+
+type PipelineEntry struct {
+	Timestamp          string            `json:"timestamp"`
+	Stage              string            `json:"stage"`
+	Status             string            `json:"status"`
+	Capability         string            `json:"capability,omitempty"`
+	RiskLevel          string            `json:"risk_level,omitempty"`
+	Decision           OperationDecision `json:"decision,omitempty"`
+	VerificationPassed *bool             `json:"verification_passed,omitempty"`
+	Detail             string            `json:"detail,omitempty"`
+	Duration           string            `json:"duration,omitempty"`
+	ContextID          string            `json:"context_id,omitempty"`
 }
 
 type Logger struct {
@@ -40,7 +70,6 @@ func (l *Logger) LogMutation(entry MutationEntry) error {
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
 	return l.append(state.LocalPath(l.root, state.AuditDir, state.MutationsLogFile), data)
 }
 
@@ -50,8 +79,16 @@ func (l *Logger) LogShell(entry ShellEntry) error {
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
 	return l.append(state.LocalPath(l.root, state.AuditDir, state.ShellLogFile), data)
+}
+
+func (l *Logger) LogPipeline(entry PipelineEntry) error {
+	entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	return l.append(state.LocalPath(l.root, state.AuditDir, "pipeline.log"), data)
 }
 
 func (l *Logger) append(path string, data []byte) error {
@@ -76,6 +113,52 @@ func (l *Logger) ReadMutations() ([]MutationEntry, error) {
 
 func (l *Logger) ReadShell() ([]ShellEntry, error) {
 	return readEntries[ShellEntry](state.LocalPath(l.root, state.AuditDir, state.ShellLogFile))
+}
+
+func (l *Logger) ReadPipeline() ([]PipelineEntry, error) {
+	return readEntries[PipelineEntry](state.LocalPath(l.root, state.AuditDir, "pipeline.log"))
+}
+
+func (l *Logger) ReadRecent(limit int) string {
+	entries, err := l.ReadPipeline()
+	if err != nil || len(entries) == 0 {
+		return "no audit entries"
+	}
+
+	start := len(entries) - limit
+	if start < 0 {
+		start = 0
+	}
+
+	var b strings.Builder
+	entries = entries[start:]
+	for _, e := range entries {
+		ts := e.Timestamp
+		if len(ts) > 16 {
+			ts = ts[11:19]
+		}
+		fmt.Fprintf(&b, "%s  ", ts)
+
+		fmt.Fprintf(&b, "Stage: %s  Status: %s", e.Stage, e.Status)
+		if e.Capability != "" {
+			fmt.Fprintf(&b, "  Capability: %s", e.Capability)
+		}
+		if e.RiskLevel != "" {
+			fmt.Fprintf(&b, "  Risk: %s", e.RiskLevel)
+		}
+		if e.Decision != "" {
+			fmt.Fprintf(&b, "  Decision: %s", e.Decision)
+		}
+		if e.VerificationPassed != nil {
+			v := "Passed"
+			if !*e.VerificationPassed {
+				v = "Failed"
+			}
+			fmt.Fprintf(&b, "  Verification: %s", v)
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func readEntries[T any](path string) ([]T, error) {
