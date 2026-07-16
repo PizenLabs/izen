@@ -498,10 +498,15 @@ func (m *model) renderRuntimeStatus(width int) string {
 		b.WriteByte(' ')
 	}
 
-	// Metadata segments: model · context · tokens · cost · checkpoint
+	// Metadata segments: lang · model · context · tokens · cost · checkpoint
 	var meta []string
 
-	// Model name — dropped first when the pane is too narrow to fit it.
+	// Detected project language badge — dropped first when the pane is too narrow.
+	if width >= minimalStatusThreshold && m.detection.Primary != nil {
+		meta = append(meta, langBadgeStyle.Render(m.detection.Primary.Name))
+	}
+
+	// Model name — dropped after language when the pane is too narrow.
 	if width >= minimalStatusThreshold {
 		meta = append(meta, dimmedStyle.Render(m.cfg.ActiveModelName()))
 	}
@@ -706,8 +711,11 @@ func (m *model) renderStartupBanner(termWidth int) string {
 	modelName := m.cfg.ActiveModelName()
 	metaParts := []string{
 		mutedStyle.Render(projectPathDisplay()),
-		mutedStyle.Render(provider + " " + modelName),
 	}
+	if m.detection.Primary != nil {
+		metaParts = append(metaParts, langBadgeStyle.Render(m.detection.Primary.Name))
+	}
+	metaParts = append(metaParts, mutedStyle.Render(provider+" "+modelName))
 	if branch, err := m.gitEng.Branch(); err == nil && branch != "" {
 		metaParts = append(metaParts, mutedStyle.Render("git ("+branch+")"))
 	}
@@ -761,6 +769,9 @@ func (m *model) renderStartupBannerCompact(termWidth int) string {
 	// are dropped as the pane narrows further, same priority order as the
 	// runtime status line.
 	metaParts := []string{mutedStyle.Render(projectPathDisplay())}
+	if m.detection.Primary != nil {
+		metaParts = append(metaParts, langBadgeStyle.Render(m.detection.Primary.Name))
+	}
 	if termWidth >= compactStatusThreshold {
 		provider := m.cfg.ActiveProviderName()
 		modelName := m.cfg.ActiveModelName()

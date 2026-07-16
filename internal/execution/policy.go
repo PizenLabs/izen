@@ -15,15 +15,16 @@ const (
 	CapGitCommit      Capability = "git.commit"
 	CapGitStatus      Capability = "git.status"
 	CapGitDiff        Capability = "git.diff"
-	CapGoBuild        Capability = "go.build"
-	CapGoTest         Capability = "go.test"
-	CapGoFmt          Capability = "go.fmt"
-	CapGoVet          Capability = "go.vet"
-	CapGoLint         Capability = "go.lint"
-	CapGoVulncheck    Capability = "go.vulncheck"
-	CapShellExecute   Capability = "shell.execute"
-	CapPatchApply     Capability = "patch.apply"
-	CapCheckpoint     Capability = "checkpoint"
+
+	CapBuild        Capability = "build"
+	CapTest         Capability = "test"
+	CapFmt          Capability = "fmt"
+	CapLint         Capability = "lint"
+	CapVet          Capability = "vet"
+	CapVulncheck    Capability = "vulncheck"
+	CapShellExecute Capability = "shell.execute"
+	CapPatchApply   Capability = "patch.apply"
+	CapCheckpoint   Capability = "checkpoint"
 
 	CapFilesystemHome   Capability = "filesystem.home"
 	CapFilesystemSystem Capability = "filesystem.system"
@@ -46,12 +47,12 @@ var capabilityModeMap = map[Capability]modes.Capability{
 	CapGitCommit:      modes.CapCheckpoint,
 	CapGitStatus:      modes.CapRead,
 	CapGitDiff:        modes.CapRead,
-	CapGoBuild:        modes.CapShell,
-	CapGoTest:         modes.CapTest,
-	CapGoFmt:          modes.CapShell,
-	CapGoVet:          modes.CapShell,
-	CapGoLint:         modes.CapShell,
-	CapGoVulncheck:    modes.CapShell,
+	CapBuild:          modes.CapShell,
+	CapTest:           modes.CapTest,
+	CapFmt:            modes.CapShell,
+	CapLint:           modes.CapShell,
+	CapVet:            modes.CapShell,
+	CapVulncheck:      modes.CapShell,
 	CapShellExecute:   modes.CapShell,
 	CapPatchApply:     modes.CapPatch,
 	CapCheckpoint:     modes.CapCheckpoint,

@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/ui"
 )
@@ -103,10 +105,42 @@ func main() {
 		cfg.Username = localCfg.Username
 	}
 
+	// ---- Project type detection ----
+	detection := project.Detect(root)
+	if detection.Primary != nil {
+		primaryLang := detection.Primary.Name
+		conf := detection.Confidence
+		updateLocalConfig(root, localCfg, detection)
+		fmt.Fprintf(os.Stderr, "izen: detected project type: %s (confidence: %.0f%%)\n", primaryLang, conf*100)
+		if len(detection.Secondary) > 0 {
+			fmt.Fprintf(os.Stderr, "izen: secondary languages:")
+			for _, s := range detection.Secondary {
+				fmt.Fprintf(os.Stderr, " %s", s.Def.Name)
+			}
+			fmt.Fprintln(os.Stderr)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "izen: warning: could not detect project type (no recognized files)\n")
+	}
+
 	// ---- Phase 3: TUI boot routing ----
 	if isRollbackMode {
-		ui.RunRollbackEngine(cfg, root, localCfg)
+		ui.RunRollbackEngine(cfg, root, localCfg, detection)
 	} else {
-		ui.RunMainDashboard(cfg, root, localCfg)
+		ui.RunMainDashboard(cfg, root, localCfg, detection)
 	}
+}
+
+func updateLocalConfig(root string, localCfg *config.LocalConfig, det project.Detection) {
+	if localCfg == nil {
+		localCfg = &config.LocalConfig{}
+	}
+	if det.Primary != nil {
+		localCfg.DetectedLang = string(det.Primary.ID)
+	}
+	if len(det.Frameworks) > 0 {
+		localCfg.DetectedFw = string(det.Frameworks[0].Def.ID)
+	}
+	localCfg.LastDetected = time.Now().Format(time.RFC3339)
+	_ = config.SaveLocalConfig(root, localCfg)
 }

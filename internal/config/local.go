@@ -8,7 +8,11 @@ import (
 )
 
 type LocalConfig struct {
-	Username string `json:"username"`
+	Username     string `json:"username"`
+	DetectedLang string `json:"detected_lang,omitempty"`
+	DetectedFw   string `json:"detected_framework,omitempty"`
+	ProjectName  string `json:"project_name,omitempty"`
+	LastDetected string `json:"last_detected,omitempty"`
 }
 
 func localConfigPath(root string) string {

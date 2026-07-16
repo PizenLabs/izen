@@ -3,6 +3,7 @@ package execution
 import (
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/git"
+	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
@@ -18,6 +19,7 @@ type Engine struct {
 	StreamMon   *StreamMonitor
 	PlanStore   *plan.PlanStore
 	root        string
+	langID      language.ID
 
 	Policy   *PolicyEngine
 	Risk     *RiskClassifier
@@ -26,7 +28,7 @@ type Engine struct {
 	Pipeline *PipelineRunner
 }
 
-func NewEngine(root string, cfg *config.Config, sess *session.Session) *Engine {
+func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ...language.ID) *Engine {
 	r := NewRunner(root, cfg.Execution.Sandbox, cfg.Execution.Confirm)
 	t := NewTestRunner(root)
 	p := NewPatchManager(root)
@@ -39,7 +41,16 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session) *Engine {
 		return 0
 	})
 	rc := NewRiskClassifier()
-	v := NewVerifier(root)
+
+	var v *Verifier
+	var activeLangID language.ID
+	if len(langID) > 0 && langID[0] != "" {
+		activeLangID = langID[0]
+		v = NewLanguageVerifier(root, activeLangID)
+	} else {
+		v = NewVerifier(root)
+	}
+
 	d := NewDiffAnalyzer()
 
 	e := &Engine{
@@ -49,6 +60,7 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session) *Engine {
 		Checkpoints: c,
 		Git:         git.NewEngine(root),
 		root:        root,
+		langID:      activeLangID,
 		Policy:      pe,
 		Risk:        rc,
 		Verifier:    v,
@@ -75,6 +87,15 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session) *Engine {
 	}
 
 	return e
+}
+
+func (e *Engine) SetLanguage(langID language.ID) {
+	e.langID = langID
+	e.Verifier.SetLanguage(langID)
+}
+
+func (e *Engine) Language() language.ID {
+	return e.langID
 }
 
 func configureVerifier(v *Verifier, vc config.VerificationConfig) {

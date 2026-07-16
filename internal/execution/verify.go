@@ -3,6 +3,8 @@ package execution
 import (
 	"fmt"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/language"
 )
 
 type VerificationStep struct {
@@ -24,8 +26,9 @@ type VerificationReport struct {
 }
 
 type Verifier struct {
-	root  string
-	steps []VerificationStep
+	root   string
+	steps  []VerificationStep
+	langID language.ID
 }
 
 var defaultVerificationSteps = []VerificationStep{
@@ -43,14 +46,63 @@ func NewVerifier(root string) *Verifier {
 	}
 }
 
+func NewLanguageVerifier(root string, langID language.ID) *Verifier {
+	v := &Verifier{
+		root:   root,
+		langID: langID,
+	}
+	v.steps = stepsForLanguage(langID)
+	return v
+}
+
+func stepsForLanguage(langID language.ID) []VerificationStep {
+	def, ok := language.Global().Lookup(langID)
+	if !ok {
+		result := make([]VerificationStep, len(defaultVerificationSteps))
+		copy(result, defaultVerificationSteps)
+		return result
+	}
+
+	v := def.Verification
+	var steps []VerificationStep
+
+	for _, cmd := range v.Fmt {
+		steps = append(steps, VerificationStep{Name: fmt.Sprintf("fmt (%s)", cmd), Command: cmd, Optional: true})
+	}
+	for _, cmd := range v.Lint {
+		steps = append(steps, VerificationStep{Name: fmt.Sprintf("lint (%s)", cmd), Command: cmd, Optional: true})
+	}
+	for _, cmd := range v.Vet {
+		steps = append(steps, VerificationStep{Name: fmt.Sprintf("vet (%s)", cmd), Command: cmd, Optional: false})
+	}
+	for _, cmd := range v.Build {
+		steps = append(steps, VerificationStep{Name: fmt.Sprintf("build (%s)", cmd), Command: cmd, Optional: false})
+	}
+	for _, cmd := range v.Test {
+		steps = append(steps, VerificationStep{Name: fmt.Sprintf("test (%s)", cmd), Command: cmd, Optional: false})
+	}
+
+	if len(steps) == 0 {
+		result := make([]VerificationStep, len(defaultVerificationSteps))
+		copy(result, defaultVerificationSteps)
+		return result
+	}
+
+	return steps
+}
+
+func (v *Verifier) SetLanguage(langID language.ID) {
+	v.langID = langID
+	v.steps = stepsForLanguage(langID)
+}
+
 func (v *Verifier) SetCustomSteps(steps []VerificationStep) {
 	v.steps = steps
 }
 
 func (v *Verifier) RunAll() VerificationReport {
 	if len(v.steps) == 0 {
-		v.steps = make([]VerificationStep, len(defaultVerificationSteps))
-		copy(v.steps, defaultVerificationSteps)
+		v.steps = stepsForLanguage(v.langID)
 	}
 
 	var report VerificationReport

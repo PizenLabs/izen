@@ -26,6 +26,7 @@ import (
 	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -549,6 +550,9 @@ type model struct {
 
 	// Proposal widget diff scroll offset
 	proposalDiffOffset int
+
+	// Project type detection
+	detection project.Detection
 
 	// AST/Code Graph trace for rendering the AI's thought route
 	currentTrace *ctxpkg.CodebaseTrace

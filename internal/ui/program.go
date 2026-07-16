@@ -15,9 +15,11 @@ import (
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/lynx"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/session"
@@ -25,7 +27,11 @@ import (
 )
 
 // NewProgram initializes the active model state context and instantiates the runner engine.
-func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.Manager, localCfg *config.LocalConfig) *tea.Program {
+func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.Manager, localCfg *config.LocalConfig, det ...project.Detection) *tea.Program {
+	detection := project.Detection{}
+	if len(det) > 0 {
+		detection = det[0]
+	}
 	eng := git.NewEngine(root)
 
 	var provider ai.Provider
@@ -41,7 +47,13 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	ti.Focus()
 
 	planStore := plan.NewPlanStore()
-	execEng := execution.NewEngine(root, cfg, sess)
+
+	var detectedLang language.ID
+	if detection.Primary != nil {
+		detectedLang = detection.Primary.ID
+	}
+
+	execEng := execution.NewEngine(root, cfg, sess, detectedLang)
 	execEng.SetPlanStore(planStore)
 
 	userName := "developer"
@@ -146,6 +158,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		ContextLimit:        128000,
 		userName:            userName,
 		workspaceRoot:       root,
+		detection:           detection,
 		initStage:           initStage,
 		initProviderIdx:     0,
 		initProviderFilter:  "",
@@ -245,18 +258,23 @@ func runProgram(p *tea.Program) {
 	}
 }
 
-func RunMainDashboard(cfg *config.Config, root string, localCfg *config.LocalConfig) {
+func RunMainDashboard(cfg *config.Config, root string, localCfg *config.LocalConfig, det ...project.Detection) {
 	sess, mgr, lc := bootCommon(root, cfg)
 
 	if lc != nil {
 		defer func() { _ = lc.Stop() }()
 	}
 
-	p := NewProgram(root, cfg, sess, mgr, localCfg)
+	detection := project.Detection{}
+	if len(det) > 0 {
+		detection = det[0]
+	}
+
+	p := NewProgram(root, cfg, sess, mgr, localCfg, detection)
 	runProgram(p)
 }
 
-func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalConfig) {
+func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalConfig, det ...project.Detection) {
 	sess, mgr, lc := bootCommon(root, cfg)
 
 	fmt.Fprintf(os.Stderr, "izen: rollback engine stub — not yet implemented (root=%s)\n", root)
@@ -265,6 +283,11 @@ func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalCo
 		defer func() { _ = lc.Stop() }()
 	}
 
-	p := NewProgram(root, cfg, sess, mgr, localCfg)
+	detection := project.Detection{}
+	if len(det) > 0 {
+		detection = det[0]
+	}
+
+	p := NewProgram(root, cfg, sess, mgr, localCfg, detection)
 	runProgram(p)
 }
