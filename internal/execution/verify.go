@@ -27,6 +27,27 @@ import (
 // triples used by the micro-fix loop to pinpoint exact failure coordinates.
 var SyntaxErrorRe = regexp.MustCompile(`^([^:]+\.\w+):(\d+):\s*(.+)$`)
 
+// hallucinatedPrefixes are line prefixes injected by local LLMs inside code
+// blocks that must be stripped before the content reaches the patch engine.
+var hallucinatedPrefixes = []string{
+	"FILE:",
+	"file:",
+	"[target]",
+	"[Target]",
+	"[/target]",
+	"[/Target]",
+	"```diff",
+	"```go",
+	"```rust",
+	"```python",
+	"```typescript",
+	"```javascript",
+}
+
+// hallucinatedRe matches stray markdown artifact patterns that local models
+// hallucinate as standalone lines within code blocks.
+var hallucinatedRe = regexp.MustCompile(`(?i)^\s*\[/?(code|file|source|block|end|diff)\]\s*$`)
+
 // SyntaxError is a parsed compiler syntax error with structured position info.
 type SyntaxError struct {
 	File    string `json:"file"`
@@ -76,6 +97,46 @@ func BuildMicroFixPrompt(file string, errors []SyntaxError) string {
 	b.WriteString("\nOutput ONLY the corrected file content. No explanations. No markdown fences.\n")
 	b.WriteString("Preserve all surrounding code exactly. Fix only the reported syntax issues.\n")
 	return b.String()
+}
+
+// SanitizeLLMResponse cleans hallucinated metadata artifacts from raw LLM
+// responses before they enter the patch engine. Local models commonly inject
+// structural decorators like "FILE: path/to/file" or "[target]" inside code
+// blocks, which would otherwise corrupt the file content or unified diff.
+//
+// This function strips:
+//   - Lines starting with FILE: (case-sensitive, common local LLM decoration)
+//   - Standalone [target] / [/target] markers
+//   - Stray code-fence lines (```diff, ```go, etc.) that leak inside blocks
+//   - Lines matching [/?(code|file|source|block|end|diff)] markers
+func SanitizeLLMResponse(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	lines := strings.Split(raw, "\n")
+	var result []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			result = append(result, line)
+			continue
+		}
+		skip := false
+		for _, prefix := range hallucinatedPrefixes {
+			if strings.HasPrefix(trimmed, prefix) {
+				skip = true
+				break
+			}
+		}
+		if !skip && hallucinatedRe.MatchString(trimmed) {
+			skip = true
+		}
+		if skip {
+			continue
+		}
+		result = append(result, line)
+	}
+	return strings.Join(result, "\n")
 }
 
 // FirstPassingSteps runs only the syntax-critical verification steps (fmt, vet,
