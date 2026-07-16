@@ -160,6 +160,13 @@ var (
 				BorderForeground(lipgloss.Color(colorSubtle)).
 				Padding(1, 2)
 
+	// Language badge for detected project type
+	langBadgeStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(colorTeal)).
+			Background(lipgloss.Color(colorSurface)).
+			Padding(0, 1).
+			Bold(true)
+
 	// Catppuccin Mocha soft interrupt indicator
 	interruptLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMaroon)).Faint(true)
 
