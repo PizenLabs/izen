@@ -94,11 +94,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── INIT STAGE ROUTING: intercept all key messages during setup ─────
 	if m.initStage != initNone && m.initStage != initComplete {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			// Defensive blur: no focused textinput should consume keys
+			// during any init stage. Each sub-handler re-focuses as needed.
+			m.ti.Blur()
 			return m.handleInitKeyMsg(keyMsg)
 		}
-		if _, ok := msg.(tea.WindowSizeMsg); ok {
-			// Fall through to window resize below for init stage too
-		} else {
+		// Allow tickMsg to pass through so the spinner continues animating
+		// during init stages.
+		if _, ok := msg.(tickMsg); ok {
+			return m, m.spinnerTickCmd()
+		}
+		// Allow async result messages to reach their handlers in the main
+		// type switch below. Without this, gitInitResultMsg gets swallowed
+		// and the init stage never advances after pressing 'Y'.
+		switch msg.(type) {
+		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg:
+			// fall through to main type switch
+		default:
 			return m, nil
 		}
 	}
@@ -1151,6 +1163,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cfg = newCfg
 		}
 		return m, nil
+
+	case gitInitResultMsg:
+		if msg.err != nil {
+			m.initGitInitErr = msg.err.Error()
+		} else if m.initStage == initGitCheck {
+			m.initGitInitDone = true
+			m.advancePastGitCheck()
+		}
+		return m, m.spinnerTickCmd()
 
 	case tea.MouseMsg:
 		// HARD GUARD: In destructive states (approval/exec), mouse events are

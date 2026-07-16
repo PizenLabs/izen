@@ -9,11 +9,14 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/state"
 )
 
 func (m *model) handleInitKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.initStage {
+	case initGitCheck:
+		return m.handleInitGitCheck(msg)
 	case initConfirm:
 		return m.handleInitConfirm(msg)
 	case initIdentity:
@@ -24,7 +27,48 @@ func (m *model) handleInitKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *model) handleInitGitCheck(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Defensive blur: prevent any focused textinput (m.ti) from swallowing
+	// key events during the git check stage.
+	m.ti.Blur()
+
+	switch msg.String() {
+	case "y", "Y", "enter":
+		m.initGitInitDone = false
+		m.initGitInitErr = ""
+		return m, m.runGitInit()
+	case "n", "N", "esc":
+		m.initGitInitDone = true
+		m.advancePastGitCheck()
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m *model) advancePastGitCheck() {
+	m.ti.Blur()
+	m.initStage = initIdentity
+	m.initIdentityInput = textinput.New()
+	m.initIdentityInput.Prompt = ""
+	m.initIdentityInput.CharLimit = 64
+	m.initIdentityInput.Placeholder = "username"
+	if m.initPrefillUsername != "" {
+		m.userName = m.initPrefillUsername
+	}
+	m.initIdentityInput.SetValue(m.userName)
+	m.initIdentityInput.Focus()
+}
+
+func (m *model) runGitInit() tea.Cmd {
+	return func() tea.Msg {
+		err := git.InitRepo(m.workspaceRoot)
+		return gitInitResultMsg{err: err}
+	}
+}
+
 func (m *model) handleInitConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	m.ti.Blur()
+
 	switch msg.String() {
 	case "y", "Y", "enter":
 		m.initConfirmDone = true
@@ -49,6 +93,8 @@ func (m *model) handleInitConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleInitIdentity(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	m.ti.Blur()
+
 	switch msg.Type {
 	case tea.KeyEnter:
 		val := strings.TrimSpace(m.initIdentityInput.Value())
@@ -81,6 +127,8 @@ func (m *model) handleInitIdentity(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleInitProviderSelect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	m.ti.Blur()
+
 	switch msg.Type {
 	case tea.KeyEnter:
 		if m.initProviderIdx >= 0 && m.initProviderIdx < len(m.filteredProviders()) {

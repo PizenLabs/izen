@@ -14,6 +14,7 @@ var (
 	initTextStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 	initCyanStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorCyan))
 	initGreenStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreen))
+	initRedStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
 	initSubStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
 )
 
@@ -31,6 +32,8 @@ func (m *model) renderInitView() string {
 
 	// ── Stage-specific content ──
 	switch m.initStage {
+	case initGitCheck:
+		b.WriteString(m.renderInitGitCheck(width))
 	case initConfirm:
 		b.WriteString(m.renderInitConfirm(width))
 	case initIdentity:
@@ -86,6 +89,30 @@ func (m *model) renderInitBanner(width int) string {
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+}
+
+func (m *model) renderInitGitCheck(width int) string {
+	var b strings.Builder
+
+	b.WriteString("\n")
+	b.WriteString(initSubStyle.Render(strings.Repeat("─", width)) + "\n")
+	b.WriteString("\n")
+	b.WriteString(initTextStyle.Render("Workspace setup"))
+	b.WriteString("\n")
+	b.WriteString(initDimmedStyle.Render("No Git repository detected. IZEN can initialize one for you."))
+	b.WriteString("\n\n")
+
+	if m.initGitInitErr != "" {
+		b.WriteString(initTextStyle.Render("  " + initRedStyle.Render("!") + " " + m.initGitInitErr))
+		b.WriteString("\n\n")
+	}
+
+	choice := "  " + initGreenStyle.Render("●") + initTextStyle.Render(" Initialize git") + "    " + initDimmedStyle.Render("○ Skip")
+	b.WriteString(choice)
+	b.WriteString("\n")
+	b.WriteString(initDimmedStyle.Render("  (press ") + initCyanStyle.Render("Y") + initDimmedStyle.Render(" to init with 'main' branch, ") + initCyanStyle.Render("N") + initDimmedStyle.Render(" to skip)"))
+
+	return b.String()
 }
 
 func (m *model) renderInitConfirm(width int) string {
@@ -166,6 +193,8 @@ func (m *model) renderInitProviderSelect(width int) string {
 func (m *model) renderInitHelp(width int) string {
 	var hint string
 	switch m.initStage {
+	case initGitCheck:
+		hint = "Y: init git • N: skip"
 	case initConfirm:
 		hint = "Y: confirm • N: skip"
 	case initIdentity:

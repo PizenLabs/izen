@@ -36,6 +36,7 @@ type initStage int
 
 const (
 	initNone initStage = iota
+	initGitCheck
 	initConfirm
 	initIdentity
 	initProviderSelect
@@ -82,6 +83,8 @@ type traceUpdateMsg struct {
 }
 
 type streamErrMsg struct{ err error }
+
+type gitInitResultMsg struct{ err error }
 
 type tickMsg time.Time
 
@@ -663,6 +666,8 @@ type model struct {
 	// Init/setup state machine
 	initStage          initStage
 	initConfirmDone    bool
+	initGitInitDone    bool
+	initGitInitErr     string
 	initIdentityInput  textinput.Model
 	initProviderIdx    int
 	initProviderFilter string
