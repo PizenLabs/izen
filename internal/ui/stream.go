@@ -70,34 +70,14 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// concatenation of rendered history + status bar + prompt prefix.
 	msgs = append(msgs, ai.Message{Role: "user", Content: content})
 
-	var systemPrompt string
-	if m.resolver.Current() == modes.ModeAsk {
-		uname := m.cfg.Username
-		if uname == "" {
-			uname = m.userName
-		}
-		if uname == "" {
-			uname = "developer"
-		}
-		systemPrompt = prompt.AskSystemPrompt(uname)
+	uname := m.cfg.Username
+	if uname == "" {
+		uname = m.userName
 	}
-	if m.resolver.Current() == modes.ModeBuild {
-		systemPrompt = prompt.BuildSystemPrompt()
+	if uname == "" {
+		uname = "developer"
 	}
-	if m.resolver.Current() == modes.ModePlan {
-		systemPrompt = prompt.PlanSystemPrompt()
-	}
-
-	if systemPrompt == "" {
-		uname := m.cfg.Username
-		if uname == "" {
-			uname = m.userName
-		}
-		if uname == "" {
-			uname = "developer"
-		}
-		systemPrompt = strings.ReplaceAll(prompt.AskSystemPromptTemplate, "{{.Username}}", uname)
-	}
+	systemPrompt := prompt.ForModeWithUser(m.resolver.Current().String(), uname)
 
 	req := ai.Request{
 		Model:    m.cfg.ActiveModelName(),
