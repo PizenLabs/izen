@@ -907,8 +907,8 @@ func TestContextLedgerFormatForPlan(t *testing.T) {
 	cl.SetConclusion("fixed", true)
 
 	output := cl.FormatForPlan()
-	if !strings.Contains(output, "CONTEXT LEDGER") {
-		t.Fatal("expected CONTEXT LEDGER header")
+	if !strings.Contains(output, "INVESTIGATION LEDGER") {
+		t.Fatal("expected INVESTIGATION LEDGER header")
 	}
 	if !strings.Contains(output, "test failure") {
 		t.Fatal("expected 'test failure' in output")
@@ -916,8 +916,8 @@ func TestContextLedgerFormatForPlan(t *testing.T) {
 	if !strings.Contains(output, "TestFunc") {
 		t.Fatal("expected TestFunc in output")
 	}
-	if !strings.Contains(output, "ACTION REQUIRED") {
-		t.Fatal("expected ACTION REQUIRED section")
+	if !strings.Contains(output, "BOUNDARY ENFORCEMENT") {
+		t.Fatal("expected BOUNDARY ENFORCEMENT section")
 	}
 	if !strings.Contains(output, "/plan") {
 		t.Fatal("expected handoff to /plan")

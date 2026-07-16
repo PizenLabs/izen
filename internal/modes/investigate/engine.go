@@ -27,6 +27,7 @@ type Engine struct {
 
 type InvestigationResult struct {
 	Problem    string           `json:"problem"`
+	RootCause  string           `json:"root_cause,omitempty"`
 	Resolved   bool             `json:"resolved"`
 	Conclusion string           `json:"conclusion"`
 	Hypotheses []Hypothesis     `json:"hypotheses"`
@@ -375,23 +376,53 @@ func (e *Engine) stateVerify() error {
 
 func (e *Engine) statePropose() error {
 	result := e.Hypotheses.Best()
+	e.Ledger.Problem = e.Problem
+	e.Ledger.Source = "investigate"
+
 	if result != nil {
 		e.Result.Conclusion = result.Theory
 		e.Result.Resolved = true
-		e.Ledger.Problem = e.Problem
+		e.Result.RootCause = deriveRootCause(e.Result)
+		e.Ledger.SetRootCause(e.Result.RootCause)
 		e.Ledger.SetConclusion(result.Theory, true)
-		e.Ledger.Source = "investigate"
 	} else {
-		e.Ledger.Problem = e.Problem
+		e.Result.RootCause = "no root cause identified — investigation exhausted"
+		e.Ledger.SetRootCause(e.Result.RootCause)
 		e.Ledger.SetConclusion("investigation exhausted — no hypothesis confirmed", false)
 	}
 	return e.State.Transition(StateDone)
+}
+
+// deriveRootCause extracts a root cause description from the investigation result.
+// It synthesizes evidence and targets into a concise root cause statement.
+// This is the ONLY structural mutation /investigate performs — atomic task
+// generation is strictly forbidden and is exclusively owned by /plan.
+func deriveRootCause(r *InvestigationResult) string {
+	if r == nil {
+		return ""
+	}
+	var cause string
+	if r.Conclusion != "" {
+		cause = r.Conclusion
+	}
+	if len(r.Proximity) > 0 {
+		p := r.Proximity[0]
+		if cause != "" {
+			cause += " "
+		}
+		cause += fmt.Sprintf("(located at %s:%d)", p.File, p.Line)
+	}
+	if cause == "" {
+		cause = "unable to determine root cause"
+	}
+	return cause
 }
 
 func (e *Engine) FormatLedgerForPlan() string {
 	e.Ledger.Problem = e.Problem
 	e.Ledger.Source = "investigate"
 	if e.Result != nil {
+		e.Ledger.SetRootCause(e.Result.RootCause)
 		e.Ledger.SetConclusion(e.Result.Conclusion, e.Result.Resolved)
 	}
 	return e.Ledger.FormatForPlan()

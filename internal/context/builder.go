@@ -23,11 +23,18 @@ var (
 	initSeqDo sync.Once
 )
 
+// ── Builder ──────────────────────────────────────────────────────────────────
+// The Builder assembles context objects for LLM consumption. It implements the
+// sliding-window scope constraint: when a TaskLedger is attached, context
+// assembly limits file collection to only the active task's scope, preventing
+// context window inflation from unrelated or future tasks.
+
 type Builder struct {
 	graph   *graph.Graph
 	git     *git.Engine
 	session *session.Session
 	root    string
+	ledger  *TaskLedger
 }
 
 func NewBuilder(root string, g *graph.Graph, ge *git.Engine, sess *session.Session) *Builder {
@@ -38,6 +45,13 @@ func NewBuilder(root string, g *graph.Graph, ge *git.Engine, sess *session.Sessi
 		git:     ge,
 		session: sess,
 	}
+}
+
+// SetLedger attaches the sliding-window task ledger for scope limiting.
+// When set, the builder restricts file collection to the active task's scope,
+// preventing context window inflation from unrelated or future tasks.
+func (b *Builder) SetLedger(l *TaskLedger) {
+	b.ledger = l
 }
 
 func initSeqOnce() {
@@ -126,6 +140,18 @@ func (b *Builder) Build(req BuildRequest) *Context {
 	if b.git != nil && req.IncludeDiff && b.git.IsRepo() {
 		b.collectDiff(ctx)
 		b.collectStatus(ctx)
+	}
+
+	// Inject sliding-window task status snapshot.
+	// Even if the ledger holds dozens of tasks, only the active window
+	// (first pending task) is injected into the context.
+	if b.ledger != nil {
+		window := b.ledger.ActiveWindow()
+		snapshot := make(map[int]string, len(window))
+		for _, id := range window {
+			snapshot[id] = b.ledger.Status(id).String()
+		}
+		ctx.TaskStatusSnapshot = snapshot
 	}
 
 	ctx.BuildTrace()

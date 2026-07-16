@@ -183,6 +183,10 @@ type PatchManager struct {
 	contextID string
 	guardrail *MutationGuardrail
 	ledger    *izenctx.TaskLedger
+	// verifier is the deterministic verification gate. It is invoked after
+	// every patch write to ensure structural integrity before allowing a
+	// task to transition to TaskCompleted.
+	verifier *Verifier
 }
 
 func NewPatchManager(root string) *PatchManager {
@@ -191,6 +195,19 @@ func NewPatchManager(root string) *PatchManager {
 		patDir:    filepath.Join(root, ".izen", "patches"),
 		guardrail: NewMutationGuardrail(root),
 	}
+}
+
+// SetVerifier attaches the deterministic verification gate. When set, the
+// patch manager runs verifier.RunAll() after every write and refuses to mark
+// the task as completed if verification fails — enforcing the Zero Syntax
+// Leakage guarantee.
+func (pm *PatchManager) SetVerifier(v *Verifier) {
+	pm.verifier = v
+}
+
+// Verifier returns the attached Verifier (may be nil).
+func (pm *PatchManager) Verifier() *Verifier {
+	return pm.verifier
 }
 
 // SetGuardrail attaches a MutationGuardrail used to halt infinite autofix
@@ -262,6 +279,31 @@ func (pm *PatchManager) createShadowBackup(filePath string) error {
 
 // appendMutationLog writes a mutation entry to .izen/audit/mutations.log with
 // the active #number as a metadata header for traceability.
+// firstLine returns the first non-empty line of s, or the full string trimmed.
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if idx := strings.Index(s, "\n"); idx >= 0 {
+		return s[:idx]
+	}
+	return s
+}
+
+// restoreFromShadowBackup restores a file from its shadow backup checkpoint.
+// It is used by the verification gate to roll back a patch when compilation
+// fails, ensuring the disk state is never left in a broken state.
+func (pm *PatchManager) restoreFromShadowBackup(fullPath string) error {
+	backupDir := filepath.Join(pm.root, ".izen", "checkpoints", "cp-"+sanitizeCtxID(pm.contextID)+"-backup")
+	backupPath := filepath.Join(backupDir, filepath.Base(fullPath)+".orig")
+	data, err := os.ReadFile(backupPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read shadow backup: %w", err)
+	}
+	return os.WriteFile(fullPath, data, 0644)
+}
+
 func (pm *PatchManager) appendMutationLog(file string, patchID string) error {
 	auditDir := filepath.Join(pm.root, ".izen", "audit")
 	if err := os.MkdirAll(auditDir, 0755); err != nil {
@@ -372,6 +414,55 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 			globalActivityLog("[FAIL] patch rejected on %s: write failed: %v", patch.File, err)
 		}
 		return fmt.Errorf("write %s: %w", patch.File, err)
+	}
+
+	// ── Deterministic Verification Gate ──────────────────────────────────
+	// Immediately after a code patch is hot-applied to the workspace disk,
+	// trigger the low-overhead local compiler check. If a fundamental syntax
+	// degradation occurs (e.g., missing '}' block wrapper, undefined basic
+	// packages like "fmt"), intercept the state pipeline.
+	//
+	// Block the task from updating to Success in the Ledger, extract the
+	// specific faulty lines, and route a pinpointed, high-velocity micro-patch
+	// back to fix the syntax typo natively at the execution layer.
+	//
+	// This is the core of the Micro-Fix Loop Architecture.
+	if pm.verifier != nil {
+		report := pm.verifier.RunAll()
+		if !report.Passed {
+			// Verification failed — extract syntax errors for micro-fix loop.
+			var syntaxErrors []string
+			for _, res := range report.Results {
+				if !res.Passed && !res.Step.Optional {
+					syntaxErrors = append(syntaxErrors, fmt.Sprintf("%s: %s", res.Step.Name, firstLine(res.Output)))
+				}
+			}
+
+			// Roll back: restore original from shadow backup.
+			if err := pm.restoreFromShadowBackup(fullPath); err != nil {
+				if globalActivityLog != nil {
+					globalActivityLog("[FAIL] patch write-back failed on %s: %v", patch.File, err)
+				}
+			}
+
+			if globalActivityLog != nil {
+				for _, se := range syntaxErrors {
+					globalActivityLog("[VERIFY] syntax degradation in %s: %s", patch.File, se)
+				}
+				globalActivityLog("[FAIL] patch rejected on %s: verification gate blocked — micro-fix required", patch.File)
+			}
+
+			errMsg := fmt.Sprintf("verification gate blocked patch on %s (syntax degradation detected)",
+				patch.File)
+			if len(syntaxErrors) > 0 {
+				errMsg += ": " + syntaxErrors[0]
+			}
+			return fmt.Errorf("%s", errMsg)
+		}
+
+		if globalActivityLog != nil {
+			globalActivityLog("[VERIFY] verification gate passed for %s", patch.File)
+		}
 	}
 
 	origLines := 0

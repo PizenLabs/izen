@@ -89,6 +89,24 @@ func (c *Client) ResolveSymbol(name string) ([]SearchResult, error) {
 	return results, nil
 }
 
+// Resolve takes a source file path and line number and returns the symbol
+// definition at that position. This is the primary entry point for the log
+// deduplication pipeline to pipe root-cause error coordinates into symbol-aware
+// context assembly — the topological error sorter in retrieval/compression.go
+// extracts file:line pairs, and this method resolves them to AST symbols.
+func (c *Client) Resolve(file string, line int) ([]SearchResult, error) {
+	params := map[string]interface{}{"file": file, "line": line}
+	data, err := c.call("lynx_resolve_symbol", params)
+	if err != nil {
+		return nil, err
+	}
+	var results []SearchResult
+	if err := json.Unmarshal(data, &results); err != nil {
+		return nil, fmt.Errorf("lynx resolve decode: %w", err)
+	}
+	return results, nil
+}
+
 func (c *Client) FindRelated(file string, line int) ([]SearchResult, error) {
 	params := map[string]interface{}{"file": file, "line": line}
 	data, err := c.call("lynx_find_related", params)
