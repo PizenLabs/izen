@@ -101,9 +101,10 @@ func TestSpinnerTickInStateChat(t *testing.T) {
 	if m2.spinnerFrame != initialFrame {
 		t.Errorf("spinnerFrame advanced in StateChat: %d → %d", initialFrame, m2.spinnerFrame)
 	}
-	// But the tick chain must continue (for when state changes)
-	if cmd == nil {
-		t.Fatal("tickMsg in StateChat returned nil cmd — chain broken")
+	// The tick chain should stop when idle to prevent CPU spinning.
+	// State changes are driven by other messages, not tickMsg.
+	if cmd != nil {
+		t.Fatal("tickMsg in idle StateChat should return nil cmd — tick loop stops when idle")
 	}
 }
 

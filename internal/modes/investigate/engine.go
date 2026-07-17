@@ -437,6 +437,16 @@ func (e *Engine) stateNarrow() error {
 			t.File, t.Line, 0.8, "isolator.node")
 	}
 
+	// TASK 1 (build-freeze fix): even on a dependency/compilation short-circuit,
+	// resolve exact file:line:col coordinates directly from the raw diagnostic
+	// output so the ledger never ends up empty. Written synchronously here,
+	// before the engine finishes.
+	for _, ev := range e.Evidence.All() {
+		for _, t := range ParseCompilerTargets(ev.Content) {
+			e.Ledger.AddTarget(t)
+		}
+	}
+
 	// If compilation blocker is detected and there's also environment evidence,
 	// short-circuit the loop — don't go back to Hypothesize, go to Propose.
 	if e.Evidence.HasCategory(ErrCatCompilation) && e.Evidence.HasCategory(ErrCatEnvironment) {

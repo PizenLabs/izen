@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -194,6 +195,50 @@ func (cl *ContextLedger) AddTarget(t Target) {
 func (cl *ContextLedger) SetConclusion(conclusion string, resolved bool) {
 	cl.Conclusion = conclusion
 	cl.Resolved = resolved
+}
+
+// compilerLogPathRe matches Go/Rust/TypeScript compiler diagnostics of the form
+// "cmd/api/main.go:7:5" (file:line:col) and extracts the offending file
+// coordinates. This powers TASK 1 of the build-freeze fix: even when a
+// dependency/compilation error short-circuits the agent, we still resolve the
+// exact file:line targets from the raw logs instead of exiting empty-handed.
+var compilerLogPathRe = regexp.MustCompile(`([^\s:]+\.(?:go|rs|ts|tsx|js|jsx|py|java|cpp|c|cc|h)):(\d+):(\d+)`)
+
+// ParseCompilerTargets extracts file:line:col coordinates directly from raw
+// compiler/test output and returns them as investigate Targets. It is a pure,
+// read-only operation — no file I/O, no mutations. Any file that cannot be
+// localized falls back to the raw path with line 0 so the coordinate is still
+// captured for downstream /plan consumption.
+func ParseCompilerTargets(output string) []Target {
+	var targets []Target
+	seen := make(map[string]bool)
+	for _, m := range compilerLogPathRe.FindAllStringSubmatch(output, -1) {
+		file := m[1]
+		// Normalize compiler-style "./path" prefixes to a project-root relative
+		// path so downstream /plan task targeting matches the repo layout.
+		file = strings.TrimPrefix(file, "./")
+		file = strings.TrimPrefix(file, "/")
+		line, _ := strconv.Atoi(m[2])
+		col, _ := strconv.Atoi(m[3])
+		key := fmt.Sprintf("%s:%d:%d", file, line, col)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		node, kind := "", "file"
+		// Best-effort AST node localization without mutating workspace state.
+		if ti := NewTargetIsolator(""); file != "" {
+			node, kind = ti.locateNode(file, line)
+		}
+		targets = append(targets, Target{
+			File:    file,
+			Line:    line,
+			Node:    node,
+			Kind:    kind,
+			Snippet: "",
+		})
+	}
+	return targets
 }
 
 func (cl *ContextLedger) FormatForPlan() string {

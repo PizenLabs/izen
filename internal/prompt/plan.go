@@ -96,6 +96,17 @@ that fix those specific issues. If data is insufficient, create at minimum 1-2
 investigative tasks (FILE_MUTATE with strategy ATOMIC_REPLACE) targeting the most
 likely root-cause files.
 
+### NO-TARGET COMPILATION-ERROR FALLBACK (MANDATORY)
+If the ledger has NO resolved TargetFile but the Diagnostics/INVESTIGATION LEDGER
+above contains raw compiler, dependency, or "no required module provides package"
+errors, you MUST STILL generate a structured task list — do NOT emit a generic
+greeting such as "How can I help you with Go?". Specifically:
+- For missing-module / dependency errors, emit a SHELL_EXEC task running the exact
+  "go get <module>" (or equivalent) command required to resolve the dependency.
+- For syntax/compilation errors, emit FILE_MUTATE tasks that fix the offending file
+  referenced in the diagnostic, plus a SHELL_EXEC "go build ./..." verification task.
+- Never respond with only conversational text; always return at least one atomic_task.
+
 Output ONLY valid JSON. No markdown, no code fences, no explanatory text.`, problem, ledgerContent)
 }
 

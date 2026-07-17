@@ -25,12 +25,12 @@ import (
 	"github.com/PizenLabs/izen/internal/domain"
 	objengine "github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/execution"
-	"github.com/PizenLabs/izen/internal/lynx"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/internal/session"
 )
 
 var validSystemCommands = map[string]struct{}{
@@ -150,6 +150,15 @@ func (m *model) handleInput(line string) tea.Cmd {
 		}
 	}
 
+	// ── SYNCHRONOUS STATE COMMIT (1-TURN LATENCY FIX) ────────────────
+	// Persist the freshly captured user input to the session history and disk
+	// BEFORE launching the LLM stream. This guarantees the in-memory + on-disk
+	// state leads the API dispatch (Write-After-Read ordering): the model never
+	// receives a turn that is one query behind because the current input is
+	// committed first, not retrofitted at stream completion.
+	m.sess.AddMessage("user", line, 5)
+	_ = m.sess.Save()
+
 	return m.handleMessageContent(line)
 }
 
@@ -208,7 +217,12 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			if err == nil {
 				ext := filepath.Ext(ref)
 				lang := strings.TrimPrefix(ext, ".")
-				lines := strings.Split(string(data), "\n")
+				// REFORM B: Anti-prompt injection — strip legacy comments/TODOs
+				// from source code before feeding to LLM. This prevents stale
+				// developer notes in the codebase from hijacking the agent's
+				// attention away from the actual task.
+				sanitized := ctxpkg.SanitizeSourceForLLM(string(data), lang)
+				lines := strings.Split(sanitized, "\n")
 				if len(lines) > 50 {
 					lines = lines[:50]
 				}
@@ -230,7 +244,9 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			}
 			ext := filepath.Ext(ref)
 			lang := strings.TrimPrefix(ext, ".")
-			fmt.Fprintf(&fileCtx, "File: %s\n```%s\n%s\n```", ref, lang, string(data))
+			// REFORM B: Sanitize source to remove prompt-injection comments
+			sanitized := ctxpkg.SanitizeSourceForLLM(string(data), lang)
+			fmt.Fprintf(&fileCtx, "File: %s\n```%s\n%s\n```", ref, lang, sanitized)
 		}
 	}
 
@@ -362,50 +378,15 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			return nil
 		}
 
-		if m.graph != nil && assembly.EstimateTokens < plan.TokenBudgetForModel(modelName)-1000 {
-			// ARCHITECTURAL BOUNDARY: never search the raw ledger/log text.
-			// Extract only clean structural terms (symbols, paths, error
-			// constants). If extraction yields nothing, the search is
-			// safely skipped by design — no blind [FAIL] bombardment.
-			searchInput := content
-			if m.sess.ObjectiveIntent() != "" {
-				searchInput = m.sess.ObjectiveIntent() + " " + content
-			}
-			terms := retrieval.ExtractSearchTerms(searchInput)
-			lc := retrieval.GetLynxController()
-			if lc != nil && len(terms) > 0 {
-				compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.ObjectiveIntent())
-				g := m.graph
-				go retrieval.BuildGlobalCompressor(g, m.sess.ObjectiveIntent())
-				searchCtx, searchCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer searchCancel()
-				var (
-					results   []lynx.SearchResult
-					searchErr error
-				)
-				searchDone := make(chan struct{}, 1)
-				go func() {
-					results, searchErr = retrieval.SearchWithExtraction(lc, searchInput)
-					close(searchDone)
-				}()
-				select {
-				case <-searchDone:
-					if searchErr == nil && len(terms) > 0 && len(results) > 0 {
-						compressed := compressor.CompressResults(results)
-						skeleton := retrieval.FormatResultsAsSkeleton(compressed)
-						if skeleton != "" {
-							augmented := assembly.RawContext + "\n\n" + retrieval.FormatPlanFrame(skeleton)
-							augmentedTokens := plan.EstimateTokens(augmented)
-							if plan.CheckTokenBudget(modelName, augmentedTokens) == nil {
-								assembly.RawContext = augmented
-								assembly.EstimateTokens = augmentedTokens
-							}
-						}
-					}
-				case <-searchCtx.Done():
-				}
-			}
-		}
+		// ── MODE BOUNDARY LAW: /plan performs NO heavy semantic scanning ──
+		// /plan is a pure, deterministic translator of structured diagnostic
+		// data into atomic human tasks. It must NEVER trigger an automatic
+		// `lx search` or any semantic text-retrieval mechanism — that duty
+		// belongs exclusively to /investigate. The structural plan assembly
+		// (graph symbols / attached files) is sufficient; any remote search
+		// would both hang the viewport and leak /investigate's cognitive role.
+		// Intentionally left as a no-op: do NOT re-add retrieval.SearchWithExtraction here.
+		_ = content
 
 		planTrace := &ctxpkg.CodebaseTrace{}
 		for _, sf := range assembly.SymbolFiles {
@@ -419,6 +400,18 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.streamCmd(assembly.RawContext),
 		)
 	default:
+		// ── /build mode boundary: strict structural-only execution ─────────
+		// /build is a deterministic executor. It runs EXCLUSIVELY on the atomic
+		// structural tasks staged by /plan (m.handoffCtx.PendingTodos and
+		// m.sess.CurrentTasks). It must never process the stale conversational
+		// log carried in raw input buffers or unstructured message history —
+		// doing so re-injects past test failures / greetings into the build
+		// engine (the zombie-data / stale-context bug). When no tasks are
+		// staged, block immediately instead of contaminating the executor.
+		if m.resolver.Current() == modes.ModeBuild {
+			return m.runBuildCmd(content)
+		}
+
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
 
@@ -456,13 +449,15 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 // Tea event loop. The result is delivered asynchronously as a planResultMsg,
 // which the Update() loop handles to stage tasks and clear streaming state.
 func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, handoff HandoffContext) tea.Cmd {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	// Register cancel so it can be invoked on mode transition/Ctrl+C
+	m.registerBackgroundCancel(cancel)
+
 	return func() tea.Msg {
 		if m.planEngine == nil {
+			cancel()
 			return planResultMsg{Err: fmt.Errorf("plan engine not configured"), Handoff: handoff}
 		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		defer cancel()
 
 		type outcome struct {
 			tasks []plan.Task
@@ -477,6 +472,7 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 
 		select {
 		case o := <-outCh:
+			cancel()
 			return planResultMsg{Tasks: o.tasks, Err: o.err, Handoff: handoff}
 		case <-ctx.Done():
 			return planResultMsg{Err: fmt.Errorf("plan synthesis timed out after 120s: %w", ctx.Err()), Handoff: handoff}
@@ -531,6 +527,14 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 		m.planApproved = true
 	}
 
+	// ── HANDOFF SANITIZER (BUG 3): clear ALL transient raw-string state on
+	// every mode transition so the target mode can never inherit stale
+	// conversational context (past test failures, user greetings, abandoned
+	// ledger text) from a previous phase. Structured typed payloads
+	// (handoffCtx.PendingTodos / sess.CurrentTasks) survive this purge by
+	// design — they are the authoritative /plan → /build contract.
+	m.CleanContextTransitions(mode)
+
 	// ── ABSOLUTE STALE GOROUTINE RELEASE ON MODE ENTRY ────────────────
 	// Before any mode transition, cancel all in-flight background contexts,
 	// drain stream buffers, and reset spinner state. This prevents stale
@@ -557,6 +561,23 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 		fmt.Sprintf("→ /%s — %s", mode, mode.Description()))
 	m.push(roleSystem, modeLabel)
 	m.push(roleSystem, fmt.Sprintf("Switched to /%s", mode))
+
+	// ── SYNCHRONOUS LEDGER RELOAD (1-TURN LATENCY FIX) ────────────────
+	// CleanContextTransitions above purged transient in-memory handoff buffers
+	// (m.handoffLedgerContent, etc.). Before dispatching the target mode's LLM
+	// call we MUST synchronously reload the freshly written .izen/context_ledger.json
+	// into memory so the new mode reads from the authoritative structured SSOT,
+	// not the now-cleared transient state. This is the load-and-inject step of
+	// the blocking handoff: write → clean → reload → inject → dispatch.
+	m.reloadContextLedger()
+
+	// ── PRIME TRANSIENT HANDOFF FROM RELOADED LEDGER ──────────────────
+	// Re-populate the transient in-memory handoff (handoffLedgerContent /
+	// handoffCtx) from the freshly reloaded authoritative ledger. This is what
+	// the structural /plan and /build engines actually consume; without it the
+	// handoff would be empty after CleanContextTransitions cleared it, and the
+	// target mode would boot with a generic greeting.
+	m.primeHandoffFromLedger(mode)
 
 	// Handoff context injection primes the target mode with state from the
 	// previous mode's terminal event.
@@ -588,6 +609,11 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
 	switch mode {
 	case modes.ModePlan:
+		// m.handoffLedgerContent is primed from the reloaded authoritative
+		// session.ContextLedger by primeHandoffFromLedger (called in setMode
+		// after CleanContextTransitions). It carries the /investigate forensic
+		// diagnostics/targets, so /plan boots directly into structured task
+		// synthesis instead of a generic greeting.
 		if m.handoffLedgerContent != "" {
 			return m.handoffLedgerContent
 		}
@@ -624,6 +650,63 @@ func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
 		return b.String()
 	}
 	return ""
+}
+
+// buildStrictHandoffPayload creates a minimal, focused context for the /build
+// task execution. It contains ONLY:
+// 1. The exact target file path(s) for the current task
+// 2. The exact staged task description
+// 3. The raw relevant symbol definition/context from the codebase
+// This prevents cognitive drift by stripping all conversational history,
+// raw chat logs, and unrelated codebase files.
+func (m *model) buildStrictHandoffPayload() string {
+	tasks := m.sess.CurrentTasks
+	if len(tasks) == 0 && len(m.handoffCtx.PendingTodos) == 0 {
+		return ""
+	}
+
+	var targetTask *plan.Task
+	if len(tasks) > 0 {
+		for i, t := range tasks {
+			if t.Status == "idle" || t.Status == "processing" {
+				targetTask = &tasks[i]
+				break
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("## BUILD TASK EXECUTION\n\n")
+
+	if targetTask != nil {
+		b.WriteString("### TARGET\n")
+		b.WriteString(targetTask.Target + "\n\n")
+		b.WriteString("### TASK\n")
+		b.WriteString(targetTask.Description + "\n\n")
+	}
+
+	// Include only the relevant symbol context for the target file
+	if targetTask != nil && m.graph != nil {
+		fn := m.graph.LookupFile(targetTask.Target)
+		if fn != nil {
+			b.WriteString("### SYMBOL CONTEXT\n")
+			b.WriteString("```go\n")
+			// Include just the symbol signatures, not full source
+			for _, sym := range fn.Symbols {
+				if sym.Exported || strings.Contains(strings.ToLower(sym.Name), strings.ToLower(targetTask.Target)) {
+					b.WriteString(sym.Signature)
+					b.WriteString("\n")
+				}
+			}
+			b.WriteString("```\n\n")
+		}
+	}
+
+	b.WriteString("### INSTRUCTION\n")
+	b.WriteString("Implement ONLY this task. Output unified diff or FILE: block directly.\n")
+	b.WriteString("Do NOT restate the plan, do NOT list other tasks, do NOT output JSON.\n")
+
+	return b.String()
 }
 
 func (m *model) handleCommand(cmd string) tea.Cmd {
@@ -797,6 +880,121 @@ func (m *model) startModeTransition(target modes.Mode) {
 	m.resolver.Set(target)
 }
 
+// CleanContextTransitions is the single handoff sanitizer invoked on every mode
+// transition. It explicitly clears all transient raw-string state so a new mode
+// never inherits stale conversational context from a previous phase:
+//   - handoffLedgerContent: raw Context-Ledger output (superseded by structured tasks)
+//   - rawInputBuffer / input builder: unstructured message history
+//   - transient raw string variables (lastTestOutput, currentPrompt, responseBuffer)
+//
+// Structured, typed payloads (handoffCtx.PendingTodos, sess.CurrentTasks) are
+// intentionally preserved — they are the authoritative inter-mode contract that
+// /plan → /build relies on, and clearing them would break the pipeline.
+func (m *model) CleanContextTransitions(targetMode modes.Mode) {
+	// REFORM C: Aggressively zero out ALL unstructured raw text buffers
+	// during mode transitions. Only structured, verified task slices traverse
+	// the boundaries.
+
+	// ── SERIALIZE STRUCTURED LEDGER TO DISK (SINGLE SOURCE OF TRUTH) ──
+	// Compile a fresh ContextLedger for the incoming mode and persist it to
+	// .izen/context_ledger.json. This is an absolute overwrite: the previous
+	// ledger is replaced, so no stale prompts, build logs, or chat history can
+	// leak across the boundary. The same ledger is mirrored into the session
+	// record and persisted to .izen/session.json for full durability.
+	ledger := session.NewContextLedger(targetMode)
+	if m.sess != nil {
+		ledger.TargetFile = m.sess.ContextLabel()
+		ledger.Tasks = nil
+		for _, t := range m.sess.CurrentTasks {
+			ledger.Tasks = append(ledger.Tasks, plan.AtomicTask{
+				TaskID:      t.StepNum,
+				File:        t.Target,
+				Strategy:    t.Type,
+				Description: t.Description,
+			})
+		}
+		if err := ledger.Save(); err == nil {
+			m.sess.SetContextLedger(ledger)
+		}
+	}
+
+	// ── INVALIDATE MEMORY CACHE: zero out every raw response buffer,
+	// streaming string array, and historical message slice so the target mode
+	// can never inherit ghost output or stale topic references.
+	m.handoffLedgerContent = ""
+	m.input.Reset()
+	m.ti.SetValue("")
+	m.ti.Reset()
+	m.syncInputFromTI()
+	m.currentPrompt = ""
+	m.responseBuffer.Reset()
+	m.streamBuffer = ""
+	m.currentStreamContent = ""
+	m.lastTestOutput = ""
+	m.lastTestFailed = false
+	m.lastTestTarget = ""
+	m.handoffCtx.ProposedFix = ""
+	m.handoffCtx.LastFailurePayload = ""
+	m.handoffCtx.TargetScope = ""
+}
+
+// runBuildCmd is the /build mode execution entry. It strictly blocks when no
+// atomic structural tasks are staged (the zombie-data guard) and otherwise
+// executes EXCLUSIVELY on the structured items, ignoring any unstructured
+// message history or stale conversational buffers.
+func (m *model) runBuildCmd(content string) tea.Cmd {
+	hasStagedTasks := len(m.sess.CurrentTasks) > 0
+	hasPendingTodos := len(m.handoffCtx.PendingTodos) > 0
+	hasLedgerTasks := m.sess != nil && m.sess.ContextLedger != nil && len(m.sess.ContextLedger.Tasks) > 0
+
+	// ── ZERO-TASK VALIDATION (build-freeze fix, TASK 3.1) ──────────────
+	// Deterministic guard: if there is nothing to execute, halt immediately,
+	// set state to idle, and print a clean notification. Never enter any
+	// execution loop — this prevents the empty-queue deadlock / spinner freeze
+	// that occurred when /plan produced no tasks.
+	if !hasStagedTasks && !hasPendingTodos && !hasLedgerTasks {
+		m.push(roleError, "[BUILD HALTED] No active tasks found. Please formulate a plan in /plan first.")
+		m.agentRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.streaming = false
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+
+	// Sanitize any leftover unstructured content — /build operates purely on
+	// the structural task ledger, never on free-form conversational input.
+	_ = content
+	m.responseBuffer.Reset()
+	m.execEng.SetStreamContextFiles(m.attachedFiles)
+
+	if m.buildLedger == nil {
+		m.buildLedger = ctxpkg.NewTaskLedger()
+	}
+
+	// Materialize PendingTodos into typed tasks if no staged tasks exist yet.
+	if !hasStagedTasks && hasPendingTodos {
+		var tasks []plan.Task
+		for i, t := range m.handoffCtx.PendingTodos {
+			tasks = append(tasks, plan.Task{
+				StepNum:     i + 1,
+				Type:        "task",
+				Target:      "workspace",
+				Description: t,
+				Status:      "idle",
+			})
+		}
+		if len(tasks) > 0 {
+			m.sess.StageTaskList(&tasks)
+			_ = m.sess.Save()
+		}
+	}
+
+	// Execute the first idle staged task.
+	return m.handleBuildRun(0)
+}
+
 func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	tasks := m.sess.CurrentTasks
 	if len(tasks) == 0 {
@@ -926,11 +1124,13 @@ func (m *model) runTestCmd(target string) tea.Cmd {
 		return tea.Batch(
 			func() tea.Msg { return agentStartMsg{label: "testing"} },
 			m.runTestEngine("./..."),
+			m.spinnerTickCmd(),
 		)
 	}
 	return tea.Batch(
 		func() tea.Msg { return agentStartMsg{label: "testing"} },
 		m.runTestEngine(target),
+		m.spinnerTickCmd(),
 	)
 }
 
@@ -956,11 +1156,13 @@ func (m *model) runRunCmd(target string) tea.Cmd {
 		return tea.Batch(
 			func() tea.Msg { return agentStartMsg{label: "building"} },
 			m.runBuildEngine("./..."),
+			m.spinnerTickCmd(),
 		)
 	}
 	return tea.Batch(
 		func() tea.Msg { return agentStartMsg{label: "building"} },
 		m.runBuildEngine(target),
+		m.spinnerTickCmd(),
 	)
 }
 
@@ -1135,6 +1337,7 @@ func (m *model) runFixCmd(target string) tea.Cmd {
 		func() tea.Msg {
 			return agentStartMsg{label: "fixing"}
 		},
+		m.spinnerTickCmd(),
 		func() tea.Msg {
 			output := m.lastTestOutput
 			frames := investigate.ParseStackFrames(output)
@@ -1556,6 +1759,9 @@ func (m *model) cancelStaleAgentOps() {
 		m.ledgerStash = m.ledger.stashLedgerData()
 	}
 
+	// Cancel ALL registered background contexts (ghost loop prevention)
+	m.cancelAllBackgroundContexts()
+
 	m.reviewRunning = false
 	m.agentRunning = false
 	m.agentDone = false
@@ -1587,6 +1793,23 @@ func (m *model) cancelStaleAgentOps() {
 		m.ledger.restoreLedgerData(m.ledgerStash)
 		m.ledgerStash = nil
 	}
+}
+
+// registerBackgroundCancel registers a cancel function for a background
+// context so it can be cancelled on mode transitions or Ctrl+C.
+func (m *model) registerBackgroundCancel(cancel context.CancelFunc) {
+	if cancel != nil {
+		m.backgroundCancels = append(m.backgroundCancels, cancel)
+	}
+}
+
+// cancelAllBackgroundContexts cancels all registered background contexts
+// and clears the registry. Used to prevent ghost loops on mode transitions.
+func (m *model) cancelAllBackgroundContexts() {
+	for _, cancel := range m.backgroundCancels {
+		cancel()
+	}
+	m.backgroundCancels = nil
 }
 
 // handleReviewDollar routes $ sub-commands.
@@ -2241,6 +2464,10 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 		}
 		// Purge stale conversational handoff so the build buffer stays clean.
 		m.handoffCtx.ProposedFix = ""
+
+		// REFORM A: Build strict minimal context for the active task.
+		// This is injected as the initial prompt for the build execution.
+		m.handoffCtx.LastFailurePayload = m.buildStrictHandoffPayload()
 	}
 }
 

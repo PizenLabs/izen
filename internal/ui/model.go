@@ -589,6 +589,11 @@ type model struct {
 	streamCancel       context.CancelFunc
 	interruptRequested bool
 
+	// Background context registry: tracks all in-flight background contexts
+	// so they can be cancelled on mode transitions or Ctrl+C.
+	// Each entry is a cancel function returned by context.WithCancel.
+	backgroundCancels []context.CancelFunc
+
 	// Viewport scroll tracking: when the user scrolls up to inspect code,
 	// auto-scroll to bottom is suppressed until SPACE or a new message.
 	userIsScrollingUp bool
@@ -631,6 +636,14 @@ type model struct {
 	// reviewRunning stays true longer than the timeout threshold, the
 	// tick loop force-clears it to prevent ghost spinner lock.
 	lastActionTime time.Time
+
+	// lastAgentActivity is the wall-clock timestamp of the most recent
+	// background-agent activity (agent start, progress tick, or result
+	// receipt). The tickMsg leak detector uses it to distinguish a genuine
+	// long-term hang from a legitimate in-flight worker: UI execution flags
+	// (m.streaming / m.agentRunning) are only force-cleared once activity has
+	// been idle for at least 15 seconds, preventing premature spinner freezes.
+	lastAgentActivity time.Time
 
 	// Handoff pipeline: inter-mode state transfer (WORKFLOW STATE).
 	// This survives mode transitions and must never be cleared to hide UI.

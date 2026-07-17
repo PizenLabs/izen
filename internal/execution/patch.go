@@ -365,6 +365,44 @@ func (pm *PatchManager) restoreFromShadowBackup(fullPath string) error {
 	return os.WriteFile(fullPath, data, 0644)
 }
 
+// QuickSave creates a shadow backup of all currently tracked files in the
+// transaction. This is called BEFORE any build mutation to ensure a clean
+// rollback point exists. Returns the list of files that were backed up.
+func (pm *PatchManager) QuickSave(files []string) ([]string, error) {
+	var backedUp []string
+	for _, file := range files {
+		fullPath := filepath.Join(pm.root, file)
+		if err := pm.createShadowBackup(fullPath); err != nil {
+			return backedUp, fmt.Errorf("quick save %s: %w", file, err)
+		}
+		backedUp = append(backedUp, file)
+	}
+	return backedUp, nil
+}
+
+// QuickLoad restores all files from their shadow backups. This is called
+// on ANY compilation failure to ensure the workspace is never left in a
+// broken state. Returns the list of files that were restored.
+func (pm *PatchManager) QuickLoad(files []string) ([]string, error) {
+	var restored []string
+	for _, file := range files {
+		fullPath := filepath.Join(pm.root, file)
+		if err := pm.restoreFromShadowBackup(fullPath); err != nil {
+			return restored, fmt.Errorf("quick load %s: %w", file, err)
+		}
+		restored = append(restored, file)
+	}
+	return restored, nil
+}
+
+// HasShadowBackup checks if a shadow backup exists for the given file.
+func (pm *PatchManager) HasShadowBackup(file string) bool {
+	backupDir := filepath.Join(pm.root, ".izen", "checkpoints", "cp-"+sanitizeCtxID(pm.contextID)+"-backup")
+	backupPath := filepath.Join(backupDir, filepath.Base(file)+".orig")
+	_, err := os.Stat(backupPath)
+	return err == nil
+}
+
 func (pm *PatchManager) appendMutationLog(file string, patchID string) error {
 	auditDir := filepath.Join(pm.root, ".izen", "audit")
 	if err := os.MkdirAll(auditDir, 0755); err != nil {

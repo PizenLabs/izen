@@ -168,32 +168,55 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// DETERMINISTIC RECONCILE: a frozen spinner (frame still advancing,
 		// animation requested below) with no owning producer is a leaked
 		// state. Force-clear it so the UI can never lock on "✦ streaming…".
-		// We only reconcile when the agent flag is set but there is NO live
-		// stream channel driving it AND no deferred orchestration result is
-		// expected (planPending) — this safely catches a deadlocked /build
-		// handoff while never wiping the spinner of a legitimate /plan worker
-		// that owns the flags until its terminal planResultMsg arrives.
+		//
+		// IDLE-GATE FIX: the leak detector must NOT wipe m.streaming /
+		// m.agentRunning on the first ticks before a background worker has had
+		// a chance to write a process update. We only reconcile when the agent
+		// flag is set but there is NO live stream channel driving it AND no
+		// deferred orchestration result is expected (planPending) AND the last
+		// recorded agent activity has been idle for at least 15 seconds — this
+		// safely catches a genuine long-term hang (e.g. a deadlocked /build
+		// handoff) while never freezing the spinner of a legitimate /plan or
+		// /investigate worker that owns the flags until its terminal result
+		// message arrives.
+		const agentHangTimeout = 15 * time.Second
 		if m.agentRunning && m.streamCh == nil && !m.planPending && m.state == StateChat &&
 			!m.reviewRunning && !m.pipelineRunning &&
-			m.state != StateProcessing && m.state != StateAwaitingApproval {
+			m.state != StateProcessing && m.state != StateAwaitingApproval &&
+			!m.lastAgentActivity.IsZero() && time.Since(m.lastAgentActivity) > agentHangTimeout {
 			m.reconcileSpinner()
 		}
 
-		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning ||
-			m.state == StateProcessing || m.state == StateAwaitingApproval {
+		// ── UNIFIED TICK PATTERN ───────────────────────────────────────────
+		// The render loop is driven purely by lightweight boolean flags.
+		// While any background operation is in flight we advance the spinner
+		// frame, repaint the viewport from its live buffers, and re-dispatch
+		// the next tick. When idle we return nil and the loop stops — no
+		// custom tick-source ownership, no locks, no deadlock.
+		hasActiveWork := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning ||
+			m.state == StateProcessing || m.state == StateAwaitingApproval
+		if hasActiveWork {
+			// Keep the activity heartbeat fresh while any execution indicator
+			// is live. The idle-gate in the reconcile block above relies on
+			// this to avoid prematurely force-clearing a healthy spinner.
+			m.lastAgentActivity = time.Now()
+			// 1. Physically advance the spinner frame.
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
+			// 2. Repaint the viewport from the live stream/agent buffers.
 			if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.state == StateProcessing {
 				m.refreshViewportContent()
 			}
+			// 3. Re-dispatch the tick to keep the render loop alive.
 			return m, m.spinnerTickCmd()
 		}
-		return m, m.spinnerTickCmd()
+		return m, nil
 
 	case agentStartMsg:
 		m.agentRunning = true
 		m.agentDone = false
 		m.agentLabel = msg.label
 		m.spinnerFrame = 0
+		m.lastAgentActivity = time.Now()
 		return m, nil
 
 	case agentDoneMsg:
@@ -209,6 +232,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, flush
 
 	case investigateResultMsg:
+		m.lastAgentActivity = time.Now()
 		m.agentRunning = false
 		m.reviewRunning = false
 		m.agentDone = true
@@ -217,6 +241,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+msg.err.Error())
+			// PERSISTENT NAVIGATION CHIPS (BUG 1): even on failure the user
+			// must never be left on a dead viewport. Surface Re-investigate
+			// so the diagnostic loop can be retried.
+			m.currentResult = investigateResultActions()
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
@@ -233,6 +261,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Store the raw Context-Ledger data before anything else — this is
 		// the authoritative source for handoff, not the LLM's transient output.
 		m.handoffLedgerContent = ctxpkg.SanitizeLedger(msg.ledgerContent)
+
+		// BRIDGE: project read-only forensic findings into the canonical
+		// session.ContextLedger (handoff SSOT) for downstream /plan consumption.
+		m.bridgeInvestigationToLedger(m.handoffLedgerContent, msg.err)
 
 		// Populate the handoff context so the /investigate workspace renders
 		// its interactive Action Chip ("Formulate Execution Plan" → /plan).
@@ -259,6 +291,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.push(roleSystem, "Investigation complete — no structured findings to report.")
 		}
 		m.push(roleStatus, "Investigation complete. Context-Ledger ready for /plan handoff.")
+		// PERSISTENT NAVIGATION CHIPS (BUG 1): always populate the navigation
+		// controls so the user is never left with a dead viewport after a fast
+		// (cached) transition. "📋 Plan Solution" submits /plan against the
+		// structured diagnostic payload; "🔄 Re-investigate" re-runs /investigate.
+		m.currentResult = investigateResultActions()
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
@@ -299,6 +336,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.sess.StageTaskList(&msg.Tasks)
+		// BRIDGE: mirror the structured /plan queue into the canonical
+		// session.ContextLedger as []AtomicTask — the SSOT /build consumes.
+		m.bridgePlanToLedger(msg.Tasks)
 		m.handoffCtx.PendingTodos = make([]string, len(msg.Tasks))
 		for i, t := range msg.Tasks {
 			m.handoffCtx.PendingTodos[i] = t.Type + ": " + t.Target + " — " + t.Description
@@ -433,6 +473,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.acceptAll = false
 			}
 			m.currentResult = buildVerifyResult(msg.passed)
+
+			// ── FAIL-FAST MACHINE: mirror outcome into the canonical
+			// session.ContextLedger. On a hard failure (recovery exhausted or
+			// missing-module halt) the active task is marked Failed and the
+			// queue is frozen — no subsequent task is advanced, leaving the
+			// workspace in its broken state for developer inspection.
+			m.bridgeBuildResultToLedger(m.currentBuildTaskID, msg.passed, msg.output)
+			if !msg.passed && m.resolver.Current() == modes.ModeBuild {
+				if m.buildRecoveryCount >= maxBuildRecoveryAttempts || hasMissingModuleError(msg.output) {
+					m.push(roleError, fmt.Sprintf(
+						"[BUILD HALTED] Step %d failed verification. Queue frozen — %d/%d task(s) complete. Inspect and fix, then re-run /build.",
+						m.currentBuildTaskID, m.countCompletedLedgerTasks(), len(m.sess.CurrentTasks)))
+				} else if m.buildRecoveryCount < maxBuildRecoveryAttempts {
+					// Soft failure within recovery budget: ledger still marks
+					// the attempt, but the auto-recovery cycle continues.
+					m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
+						"Step %d verification failed — entering auto-recovery (attempt %d/%d).",
+						m.currentBuildTaskID, m.buildRecoveryCount, maxBuildRecoveryAttempts)))
+				}
+			}
 			if m.resolver.Current() == modes.ModeBuild {
 				m.push(roleSystem, "Build verification complete.")
 			}
@@ -848,6 +908,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamTickActive = true
 			return m, m.smoothStreamTickCmd()
 		}
+		// Streaming complete
 		m.streamTickActive = false
 		return m, nil
 
@@ -1062,8 +1123,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// SECTION 1: INTERCEPTING STREAM COMPLETION
 		promptText := m.currentPrompt
 		if promptText != "" {
-			// Memory Context Update: Store user and assistant messages in sliding window
-			m.sess.AddMessage("user", promptText, 5)
+			// Memory Context Update: Store the assistant reply in the sliding
+			// window. The user message was already committed synchronously at
+			// submit time (handleInput) to guarantee the model's context window
+			// leads the API dispatch — so we append ONLY the assistant turn here
+			// to avoid duplicating the user turn.
 			m.sess.AddMessage("assistant", final, 5)
 
 			// Securely commit session.json to disk

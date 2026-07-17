@@ -20,12 +20,17 @@ func (m *model) runInvestigateCmd(content string) tea.Cmd {
 		func() tea.Msg {
 			return agentStartMsg{label: "investigating"}
 		},
+		m.spinnerTickCmd(),
 		m.runInvestigateAsyncCmd(content),
 	)
 }
 
 func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 	currentMode := m.resolver.Current()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// Register cancel so it can be invoked on mode transition/Ctrl+C
+	m.registerBackgroundCancel(cancel)
 
 	return func() tea.Msg {
 		if !currentMode.CanShell() {
@@ -34,9 +39,6 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 		if currentMode.CanWrite() {
 			return investigateResultMsg{err: fmt.Errorf("investigate mode: write capability detected — violating capability contract")}
 		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
 
 		type outcome struct {
 			result        *investigate.InvestigationResult
@@ -64,6 +66,9 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 		case <-ctx.Done():
 			engErr = fmt.Errorf("investigation timed out after 60s: %w", ctx.Err())
 		}
+
+		// Unregister cancel since we're done
+		cancel()
 
 		var recs []record
 

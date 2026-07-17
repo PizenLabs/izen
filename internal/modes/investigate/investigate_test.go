@@ -862,6 +862,32 @@ func TestExtractErrorOutputRunResultNilError(t *testing.T) {
 	}
 }
 
+func TestParseCompilerTargets(t *testing.T) {
+	out := `# github.com/foo/bar/cmd/api
+./cmd/api/main.go:7:5: undefined: Something
+internal/parser/stream.go:42:10: expected ';'`
+	targets := ParseCompilerTargets(out)
+	if len(targets) == 0 {
+		t.Fatal("expected compiler targets to be extracted from diagnostic logs")
+	}
+	byFile := make(map[string]Target)
+	for _, tgt := range targets {
+		byFile[tgt.File] = tgt
+	}
+	if tgt, ok := byFile["cmd/api/main.go"]; !ok {
+		t.Fatalf("expected cmd/api/main.go target, got %v", byFile)
+	} else if tgt.Line != 7 || tgt.Kind == "" {
+		t.Fatalf("expected line 7 and resolved node, got line=%d kind=%q", tgt.Line, tgt.Kind)
+	}
+	if _, ok := byFile["internal/parser/stream.go"]; !ok {
+		t.Fatal("expected internal/parser/stream.go target")
+	}
+	// No coordinates → no false positives on plain text.
+	if len(ParseCompilerTargets("just some random text with no paths")) != 0 {
+		t.Fatal("expected no targets from non-diagnostic text")
+	}
+}
+
 func TestNewContextLedger(t *testing.T) {
 	cl := NewContextLedger()
 	if cl == nil {
