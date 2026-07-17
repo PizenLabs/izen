@@ -2548,33 +2548,111 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 
 // parseProposedFixIntoTodos converts a proposed fix (markdown/diff) into a
 // checklist of concrete TODO strings for the plan mode dashboard.
+// maxPendingTodos caps how many pending TODO items a handoff payload may yield.
+// A well-formed investigation produces a handful of targeted items; anything
+// beyond this is a symptom of noise leaking through, so we clamp hard.
+const maxPendingTodos = 5
+
+// parseProposedFixIntoTodos extracts genuine, actionable task items from a
+// handoff payload and returns them deduplicated and clamped to maxPendingTodos.
+//
+// The payload is NOT a task list — it is the structured investigation forensics
+// blob (FormatForPlan output + [PKT-N] analytical packets: raw diagnostics,
+// code-fence blocks, section headers, compiler output). The previous
+// implementation had a catch-all fallback that promoted EVERY non-empty line to
+// a "TODO" when no checkbox markers were present, so a single handoff spawned
+// ~18 junk TODOs made of ``` fences, "### RAW DIAGNOSTICS" headers, "[PKT-N]"
+// lines, and raw shell prints. Those flooded the /plan prompt and stalled
+// synthesis.
+//
+// This version enforces a strict data boundary: it only accepts lines that are
+// explicitly marked as tasks (checkbox / bullet-status glyphs), and even then
+// rejects anything that is recognizably log or layout noise. If the payload
+// carries no explicit task markers it yields ZERO todos — the forensics still
+// travel to /plan via handoffLedgerContent, and /plan owns task synthesis.
 func parseProposedFixIntoTodos(fix string) []string {
 	lines := strings.Split(fix, "\n")
 	var todos []string
+	seen := make(map[string]bool)
+
+	add := func(item string) {
+		item = strings.TrimSpace(item)
+		if item == "" || isHandoffNoiseLine(item) {
+			return
+		}
+		key := strings.ToLower(item)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		todos = append(todos, item)
+	}
+
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
 			continue
 		}
-		if strings.HasPrefix(trimmed, "- [ ]") || strings.HasPrefix(trimmed, "- [x]") {
-			todos = append(todos, strings.TrimSpace(trimmed[5:]))
-		} else if strings.HasPrefix(trimmed, "✓ ") || strings.HasPrefix(trimmed, "○ ") || strings.HasPrefix(trimmed, "● ") {
-			todos = append(todos, strings.TrimSpace(trimmed[2:]))
+		switch {
+		case strings.HasPrefix(trimmed, "- [ ]"), strings.HasPrefix(trimmed, "- [x]"):
+			add(trimmed[5:])
+		case strings.HasPrefix(trimmed, "✓ "), strings.HasPrefix(trimmed, "○ "), strings.HasPrefix(trimmed, "● "):
+			add(trimmed[len("✓ "):])
 		}
 	}
-	if len(todos) == 0 {
-		for _, line := range lines {
-			trimmed := strings.TrimSpace(line)
-			if trimmed != "" {
-				todos = append(todos, trimmed)
-			}
-		}
-	}
-	if len(todos) > 20 {
-		todos = todos[:20]
+
+	if len(todos) > maxPendingTodos {
+		todos = todos[:maxPendingTodos]
 	}
 	return todos
 }
+
+// isHandoffNoiseLine reports whether a line is investigation log/layout noise
+// rather than an actionable task. It rejects markdown section headers, code
+// fences, analytical-packet framing ([PKT-N], "Total packets:"), verbatim
+// compiler/shell coordinates and download chatter, and other raw diagnostic
+// residue that must never become a pending TODO.
+func isHandoffNoiseLine(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return true
+	}
+	// Markdown headers and code fences are pure layout.
+	if strings.HasPrefix(t, "#") || strings.HasPrefix(t, "```") || t == "`" {
+		return true
+	}
+	// Analytical-packet framing emitted by FormatPacketsForPlan.
+	if strings.HasPrefix(t, "[PKT-") ||
+		strings.HasPrefix(t, "Total packets:") ||
+		strings.HasPrefix(t, "kind=") ||
+		strings.HasPrefix(t, "node=") ||
+		strings.HasPrefix(t, "snippet:") {
+		return true
+	}
+	// FormatForPlan structural labels / boundary markers.
+	lower := strings.ToLower(t)
+	for _, p := range []string{
+		"source:", "problem:", "target file:", "diagnostics error log:",
+		"raw diagnostics", "boundary enforcement", "affected symbols",
+		"investigation ledger", "investigation handoff",
+	} {
+		if strings.HasPrefix(lower, p) || lower == p {
+			return true
+		}
+	}
+	// Raw compiler/shell residue: "go: downloading ...", "no required module ...",
+	// and file:line:col coordinates carrying no imperative verb.
+	if strings.HasPrefix(lower, "go: ") ||
+		strings.HasPrefix(lower, "no required module") ||
+		compilerCoordRe.MatchString(t) {
+		return true
+	}
+	return false
+}
+
+// compilerCoordRe matches a bare "path/file.ext:line:col" compiler coordinate at
+// the start of a line — raw diagnostic residue, never an actionable task.
+var compilerCoordRe = regexp.MustCompile(`^[^\s:]+\.\w+:\d+:\d+`)
 
 // extractTodosFromPlan extracts TODO items from a plan-mode LLM response.
 func extractTodosFromPlan(content string) []string {

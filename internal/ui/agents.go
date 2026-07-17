@@ -52,7 +52,7 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 		go func() {
 			retriever := investigate.NewRetrieverAdapter(retrieval.NewRetriever(".", m.graph))
 			executor := investigate.NewShellTestExecutor(".")
-			eng := investigate.NewEngine(".", content, retriever, executor)
+			eng := investigate.NewEngineWithAI(".", content, retriever, executor, m.provider, m.cfg.ActiveModelName())
 			result, err := eng.RunContext(ctx)
 			ledgerContent := eng.FormatLedgerForPlan()
 			outCh <- outcome{result: result, err: err, ledgerForPlan: ledgerContent, engLedger: eng.Ledger}

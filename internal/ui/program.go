@@ -18,6 +18,7 @@ import (
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/lynx"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/providers"
@@ -202,6 +203,21 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	retrieval.SetActivityLogger(activityFn)
 	lynx.SetActivityLogger(activityFn)
 	execution.SetActivityLogger(activityFn)
+
+	// ── REDIRECT /investigate ENGINE LOG SINKS ───────────────────────────
+	// The investigate orchestrator has two package-level activity sinks:
+	// forensicLog (defaults to log.Printf → stderr) and dispatchLog (defaults
+	// to fmt.Printf → stdout). Left at their defaults they write RAW TEXT to
+	// the terminal while Bubble Tea owns the alt-screen, corrupting the
+	// rendered frame — broken ──── separators, misaligned viewport height, and
+	// a re-drawn prompt that appears "doubled" as the raw bytes shove the real
+	// frame. Route both through the same activityFn used for every other engine
+	// package so orchestrator progress surfaces as styled viewport lines
+	// instead of frame-corrupting raw output. The engine already dispatches a
+	// single terminal investigateResultMsg on completion; these sinks are pure
+	// progress telemetry.
+	investigate.SetForensicLog(activityFn)
+	investigate.SetDispatchLog(activityFn)
 
 	return tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 }

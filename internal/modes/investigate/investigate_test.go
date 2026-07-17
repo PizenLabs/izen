@@ -3,11 +3,14 @@ package investigate
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
@@ -432,28 +435,6 @@ func TestExtractErrorOutput(t *testing.T) {
 	}
 }
 
-func TestIsLikelySymbol(t *testing.T) {
-	tests := []struct {
-		input string
-		want  bool
-	}{
-		{"NewEngine", true},
-		{"config.Load", true},
-		{"internal/graph", true},
-		{"foo", false},
-		{"bar", false},
-		{"", false},
-		{"A", false},
-	}
-
-	for _, tt := range tests {
-		got := isLikelySymbol(tt.input)
-		if got != tt.want {
-			t.Errorf("isLikelySymbol(%q) = %v, want %v", tt.input, got, tt.want)
-		}
-	}
-}
-
 func TestNarrowIteration(t *testing.T) {
 	tl := NewTestLoop(3)
 
@@ -632,7 +613,7 @@ func TestEngineRunWithMocks(t *testing.T) {
 		Total:   1,
 		FailedN: 1,
 		Failed:  []string{"TestEngine"},
-		Output:  "--- FAIL: TestEngine\n    engine_test.go:25: assertion failed\nFAIL",
+		Output:  "./cmd/api/main.go:7:5: undefined: MissingHandler\nFAIL",
 	}
 
 	eng := NewEngine(".", "test failure", ret, exec)
@@ -661,7 +642,7 @@ func TestEngineStateTransitions(t *testing.T) {
 		t.Fatal("expected initial state Observe")
 	}
 
-	err := eng.stateObserve()
+	err := eng.stateObserve(context.Background())
 	if err != nil {
 		t.Fatalf("stateObserve: %v", err)
 	}
@@ -689,7 +670,7 @@ func TestEngineStateTransitions(t *testing.T) {
 func TestEngineFullLifecycle(t *testing.T) {
 	eng := NewEngine(".", "investigation test", nil, nil)
 
-	err := eng.stateObserve()
+	err := eng.stateObserve(context.Background())
 	if err != nil {
 		t.Fatalf("Observe: %v", err)
 	}
@@ -721,34 +702,61 @@ func TestEngineFullLifecycle(t *testing.T) {
 	}
 }
 
-func TestExtractSymbolsFromProblem(t *testing.T) {
-	eng := NewEngine(".", "Engine token leak in GraphBuilder.Build", nil, nil)
-	symbols := eng.extractSymbolsFromProblem()
+// TestStateSearchIsLegacyFree verifies the brute-force raw-token LX loops have
+// been removed: stateSearch performs ZERO retriever calls and simply advances
+// the state machine. Forensics happen exclusively via dispatchForensics.
+func TestStateSearchIsLegacyFree(t *testing.T) {
+	calls := 0
+	spy := &spyRetriever{onCall: func() { calls++ }}
+	eng := NewEngine(".", "Investigate cause failure: 0.640s [GIN-debug] RUN PASS", spy, nil)
+	_ = eng.State.Transition(StateHypothesize)
+	_ = eng.State.Transition(StateSearch)
 
-	found := false
-	for _, s := range symbols {
-		if s == "GraphBuilder" || s == "Engine" {
-			found = true
-		}
+	if err := eng.stateSearch(); err != nil {
+		t.Fatalf("stateSearch: %v", err)
 	}
-	if !found {
-		t.Fatalf("expected CamelCase symbols in extraction, got %v", symbols)
+	if calls != 0 {
+		t.Fatalf("legacy stateSearch spawned %d LX calls — brute-force loop still alive", calls)
+	}
+	if eng.State.Current() != StateGather {
+		t.Fatalf("expected transition to Gather, got %s", eng.State.Current())
 	}
 }
 
-func TestExtractTextTerms(t *testing.T) {
-	eng := NewEngine(".", "the build is failing with a nil pointer in the engine", nil, nil)
-	terms := eng.extractTextTermsFromProblem()
+// spyRetriever counts how many times any LX method is invoked.
+type spyRetriever struct {
+	onCall func()
+}
 
-	if len(terms) == 0 {
-		t.Fatal("expected extracted terms")
+func (s *spyRetriever) SearchSymbol(name string) ([]SearchResult, error) {
+	if s.onCall != nil {
+		s.onCall()
 	}
-
-	for _, term := range terms {
-		if len(term) <= 3 {
-			t.Fatalf("expected terms longer than 3 chars, got %q", term)
-		}
+	return nil, nil
+}
+func (s *spyRetriever) SearchText(text string) ([]SearchResult, error) {
+	if s.onCall != nil {
+		s.onCall()
 	}
+	return nil, nil
+}
+func (s *spyRetriever) SearchFile(path string) ([]SearchResult, error) {
+	if s.onCall != nil {
+		s.onCall()
+	}
+	return nil, nil
+}
+func (s *spyRetriever) SearchPackage(pkg string) ([]SearchResult, error) {
+	if s.onCall != nil {
+		s.onCall()
+	}
+	return nil, nil
+}
+func (s *spyRetriever) ReadTarget(path string, lines int) ([]SearchResult, error) {
+	if s.onCall != nil {
+		s.onCall()
+	}
+	return nil, nil
 }
 
 func TestProximitySlicerExtractAll(t *testing.T) {
@@ -828,7 +836,7 @@ func TestEngineWithRetriever(t *testing.T) {
 
 	eng := NewEngine(".", "NewEngine is failing", ret, exec)
 
-	err := eng.stateObserve()
+	err := eng.stateObserve(context.Background())
 	if err != nil {
 		t.Fatalf("Observe: %v", err)
 	}
@@ -854,7 +862,7 @@ func TestEngineStateDone(t *testing.T) {
 	eng := NewEngine(".", "test", nil, nil)
 	_ = eng.State.Transition(StateDone)
 
-	err := eng.executeCurrentState()
+	err := eng.executeCurrentState(context.Background())
 	if err != nil {
 		t.Fatalf("executeCurrentState in Done: %v", err)
 	}
@@ -1261,7 +1269,7 @@ could not start mysql container: rootless Docker not found, failed to create Doc
 	}
 
 	eng := NewEngine(".", "test multi-failure diagnosis", nil, exec)
-	err := eng.stateObserve()
+	err := eng.stateObserve(context.Background())
 	if err != nil {
 		t.Fatalf("Observe: %v", err)
 	}
@@ -1301,7 +1309,7 @@ func TestEngineEvaluateShortCircuitsCompilationBlocker(t *testing.T) {
 
 	eng := NewEngine(".", "build failure", nil, exec)
 
-	_ = eng.stateObserve()
+	_ = eng.stateObserve(context.Background())
 	_ = eng.stateHypothesize()
 
 	_ = eng.State.Transition(StateSearch)
@@ -1330,7 +1338,7 @@ func TestEngineBlockerHypothesisIsCreatedInStateHypothesize(t *testing.T) {
 	}
 
 	eng := NewEngine(".", "missing module", nil, exec)
-	_ = eng.stateObserve()
+	_ = eng.stateObserve(context.Background())
 	_ = eng.stateHypothesize()
 
 	blockers := eng.Hypotheses.Blockers()
@@ -1380,7 +1388,7 @@ func TestShortCircuitEvaluateToProposeNoPanic(t *testing.T) {
 	}
 
 	eng := NewEngine(".", "build failure", nil, exec)
-	_ = eng.stateObserve()
+	_ = eng.stateObserve(context.Background())
 	_ = eng.stateHypothesize()
 	_ = eng.State.Transition(StateSearch)
 	_ = eng.stateSearch()
@@ -1572,5 +1580,196 @@ func TestShellTestExecutorFastCommand(t *testing.T) {
 	}
 	if summary.Output == "" {
 		t.Fatal("expected command output in summary")
+	}
+}
+
+// TestHeuristicClassify verifies the offline dispatcher routes known failure
+// signatures to the correct native tool without any LLM call.
+func TestHeuristicClassify(t *testing.T) {
+	cases := []struct {
+		log  string
+		want Tool
+	}{
+		{"panic: runtime error: invalid memory address", ToolTrace},
+		{"--- FAIL: TestFoo", ToolTrace},
+		{"exec: \"docker\": executable file not found in $PATH", ToolEnv},
+		{"command not found: go", ToolEnv},
+		{"undefined: SomeSymbol", ToolLX},
+		{"cannot find package \"internal/foo\"", ToolLX},
+		{"some unrelated log line about business logic", ToolDiagnose},
+	}
+	for _, c := range cases {
+		got := heuristicClassify(c.log)
+		if got.Tool != c.want {
+			t.Errorf("heuristicClassify(%q) = %s, want %s", c.log, got.Tool, c.want)
+		}
+	}
+}
+
+// TestNextFallback verifies the strict fallback chain always terminates at
+// $diagnose and never revisits an already-failed tool.
+func TestNextFallback(t *testing.T) {
+	if nextFallback(ToolLX) != ToolDiagnose {
+		t.Fatal("lx should fall back straight to diagnose")
+	}
+	if nextFallback(ToolTrace) != ToolDiagnose {
+		t.Fatal("trace should fall back to diagnose")
+	}
+	if nextFallback(ToolEnv) != ToolDiagnose {
+		t.Fatal("env should fall back to diagnose")
+	}
+	if nextFallback(ToolDiagnose) != "" {
+		t.Fatal("diagnose is terminal — must return empty")
+	}
+}
+
+// TestDispatchStrategyNoProvider falls back to heuristics when no LLM provider
+// is configured, keeping the engine offline and within budget.
+func TestDispatchStrategyNoProvider(t *testing.T) {
+	s := DispatchStrategy(context.Background(), nil, "", "panic: nil pointer dereference")
+	if s.Tool != ToolTrace {
+		t.Fatalf("expected offline heuristic to pick trace, got %s", s.Tool)
+	}
+}
+
+// TestDispatchForensicsCapsActions verifies the engine never exceeds the
+// MaxActionsPerRun ceiling during orchestrated dispatch, even when every tool
+// fails (forcing the full fallback chain).
+func TestDispatchForensicsCapsActions(t *testing.T) {
+	// A retriever that always errors simulates the lx RPC -32603 failure path.
+	failRetriever := &failRetriever{}
+	eng := NewEngineWithAI(".", "undefined: MissingThing", failRetriever, nil, nil, "")
+	// Force the diagnostics path through lx so the whole chain runs.
+	eng.Ledger.SetDiagnostics("undefined: MissingThing")
+
+	var actions int
+	orig := dispatchLog
+	dispatchLog = func(format string, args ...interface{}) {
+		if strings.Contains(fmt.Sprintf(format, args...), "action ") {
+			actions++
+		}
+	}
+	defer func() { dispatchLog = orig }()
+
+	eng.dispatchForensics(context.Background())
+
+	if actions > MaxActionsPerRun {
+		t.Fatalf("dispatched %d actions, exceeds ceiling %d", actions, MaxActionsPerRun)
+	}
+	// The chain must terminate cleanly at diagnose, not panic or loop.
+	if len(eng.Ledger.Targets) == 0 {
+		t.Fatal("expected at least one ingested target from the diagnose fallback")
+	}
+}
+
+// failRetriever is a Retriever stub that always returns an error, used to
+// exercise the strict-fallback path.
+type failRetriever struct{}
+
+func (f *failRetriever) SearchSymbol(name string) ([]SearchResult, error) {
+	return nil, fmt.Errorf("rpc error -32603: syntax error")
+}
+func (f *failRetriever) SearchText(text string) ([]SearchResult, error) {
+	return nil, fmt.Errorf("rpc error -32603: syntax error")
+}
+func (f *failRetriever) SearchFile(path string) ([]SearchResult, error) {
+	return nil, fmt.Errorf("rpc error -32603: syntax error")
+}
+func (f *failRetriever) SearchPackage(pkg string) ([]SearchResult, error) {
+	return nil, fmt.Errorf("rpc error -32603: syntax error")
+}
+func (f *failRetriever) ReadTarget(path string, lines int) ([]SearchResult, error) {
+	return nil, fmt.Errorf("rpc error -32603: syntax error")
+}
+
+// hangProvider is an ai.Provider whose Execute blocks forever (until ctx is
+// cancelled), simulating a stalled LLM daemon. It is used to prove the dispatch
+// budget forces /investigate to return to the prompt instead of hanging.
+type hangProvider struct{}
+
+func (h *hangProvider) Name() string { return "hang" }
+
+func (h *hangProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (h *hangProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+	return nil, ctx.Err()
+}
+
+// TestDispatchForensicsRespectsBudget verifies that even when the LLM provider
+// hangs indefinitely, dispatchForensics returns within DispatchBudget and never
+// blocks the caller (the UI goroutine) — directly guarding the "stuck spinning
+// spinner" regression.
+func TestDispatchForensicsRespectsBudget(t *testing.T) {
+	// Route to diagnose so the (hanging) provider is actually invoked.
+	eng := NewEngineWithAI(".", "some generic failure with no clear signature", newMockRetriever(), nil, &hangProvider{}, "test-model")
+	eng.Ledger.SetDiagnostics("some generic failure with no clear signature")
+
+	start := time.Now()
+	eng.dispatchForensics(context.Background())
+	elapsed := time.Since(start)
+
+	if elapsed > DispatchBudget+2*time.Second {
+		t.Fatalf("dispatchForensics hung for %s — exceeds budget %s", elapsed, DispatchBudget)
+	}
+}
+
+// TestSinksNeverWriteRawToStdio is the regression guard for the TUI layout
+// corruption: when the UI redirects the engine's log sinks (as NewProgram does
+// via SetForensicLog/SetDispatchLog), the orchestrator MUST emit its progress
+// through the sink and write ZERO bytes to os.Stdout / os.Stderr. Any raw byte
+// on real stdio while Bubble Tea owns the alt-screen corrupts the rendered
+// frame (broken ──── separators, misaligned viewport, "doubled" prompt).
+func TestSinksNeverWriteRawToStdio(t *testing.T) {
+	// Redirect both sinks into an in-memory buffer, exactly like NewProgram
+	// wires them into the UI activity logger.
+	var captured strings.Builder
+	sink := func(format string, args ...interface{}) {
+		fmt.Fprintf(&captured, format, args...)
+	}
+	origForensic := forensicLog
+	origDispatch := dispatchLog
+	SetForensicLog(sink)
+	SetDispatchLog(sink)
+	defer func() {
+		forensicLog = origForensic
+		dispatchLog = origDispatch
+	}()
+
+	// Capture the real process stdout/stderr for the duration of the run.
+	origStdout, origStderr := os.Stdout, os.Stderr
+	rOut, wOut, _ := os.Pipe()
+	rErr, wErr, _ := os.Pipe()
+	os.Stdout, os.Stderr = wOut, wErr
+
+	// Drain the pipes concurrently so writes never block.
+	outCh := make(chan string, 1)
+	errCh := make(chan string, 1)
+	go func() { b, _ := io.ReadAll(rOut); outCh <- string(b) }()
+	go func() { b, _ := io.ReadAll(rErr); errCh <- string(b) }()
+
+	eng := NewEngineWithAI(".", "undefined: MissingThing", &failRetriever{}, nil, nil, "")
+	eng.Ledger.SetDiagnostics("undefined: MissingThing")
+	eng.dispatchForensics(context.Background())
+
+	// Restore stdio and collect anything that leaked.
+	_ = wOut.Close()
+	_ = wErr.Close()
+	os.Stdout, os.Stderr = origStdout, origStderr
+	stdoutLeak := <-outCh
+	stderrLeak := <-errCh
+
+	if stdoutLeak != "" {
+		t.Errorf("orchestrator leaked raw bytes to stdout (corrupts TUI frame): %q", stdoutLeak)
+	}
+	if stderrLeak != "" {
+		t.Errorf("orchestrator leaked raw bytes to stderr (corrupts TUI frame): %q", stderrLeak)
+	}
+	// Sanity: the redirected sink must actually have received the telemetry,
+	// proving the log went somewhere structured rather than being lost.
+	if captured.Len() == 0 {
+		t.Fatal("redirected sink received no orchestrator telemetry — wiring is broken")
 	}
 }

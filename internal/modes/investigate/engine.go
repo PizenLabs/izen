@@ -6,6 +6,8 @@ import (
 	"log"
 	"strings"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/ai"
 )
 
 // forensicLog is the activity sink for /investigate. It defaults to the
@@ -43,6 +45,9 @@ type Engine struct {
 	// the mandatory forensic probe so its deadline is inherited (and so the
 	// context-aware executor call satisfies static analysis).
 	runCtx context.Context
+
+	provider ai.Provider
+	model    string
 
 	retriever Retriever
 	executor  TestExecutor
@@ -92,9 +97,20 @@ func NewEngine(root, problem string, retriever Retriever, executor TestExecutor)
 		Problem:    problem,
 		root:       root,
 		startedAt:  time.Now(),
+		runCtx:     context.Background(),
 		retriever:  retriever,
 		executor:   executor,
 	}
+}
+
+// NewEngineWithAI constructs an investigate engine wired to the AI orchestrator.
+// The provider/model power the dispatch classifier and the $diagnose fallback.
+// When provider is nil the engine falls back to offline heuristic routing.
+func NewEngineWithAI(root, problem string, retriever Retriever, executor TestExecutor, provider ai.Provider, model string) *Engine {
+	eng := NewEngine(root, problem, retriever, executor)
+	eng.provider = provider
+	eng.model = model
+	return eng
 }
 
 func (e *Engine) Run() (*InvestigationResult, error) {
@@ -122,7 +138,7 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 		default:
 		}
 
-		if err := e.executeCurrentState(); err != nil {
+		if err := e.executeCurrentState(ctx); err != nil {
 			result.Error = err.Error()
 			break
 		}
@@ -175,10 +191,10 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 	return result, nil
 }
 
-func (e *Engine) executeCurrentState() error {
+func (e *Engine) executeCurrentState(ctx context.Context) error {
 	switch e.State.Current() {
 	case StateObserve:
-		return e.stateObserve()
+		return e.stateObserve(ctx)
 	case StateHypothesize:
 		return e.stateHypothesize()
 	case StateSearch:
@@ -230,7 +246,7 @@ func (e *Engine) forceProbe(ctx context.Context) {
 	}
 }
 
-func (e *Engine) stateObserve() error {
+func (e *Engine) stateObserve(ctx context.Context) error {
 	observed := fmt.Sprintf("Observing problem: %s", e.Problem)
 	e.Evidence.Add(EvSourceUser, observed, "", 0, 0.2)
 
@@ -262,7 +278,91 @@ func (e *Engine) stateObserve() error {
 		}
 	}
 
+	// ── AI ORCHESTRATOR DISPATCH ───────────────────────────────────────
+	// Replace blind token spamming with a single, focused tool chain derived
+	// from the failure signature. Strict fallback guarantees ≤3 actions and
+	// always terminates at $diagnose rather than retrying broken tokens.
+	e.dispatchForensics(ctx)
+
 	return e.State.Transition(StateHypothesize)
+}
+
+// dispatchForensics runs the AI-orchestrated forensic chain. It classifies the
+// failure log, runs the chosen tool, then — on any hard failure — instantly
+// aborts that path and falls back along the strict chain (lx→trace→env→diagnose).
+// The entire chain is capped at MaxActionsPerRun to honor the 2-5s budget and
+// the "never spam more than 3 actions" contract.
+func (e *Engine) dispatchForensics(ctx context.Context) {
+	e.forensicsRan = true
+
+	diagnostics := e.Ledger.Diagnostics
+	if diagnostics == "" {
+		diagnostics = e.Problem
+	}
+
+	dctx, dcancel := boundedDispatchCtx(ctx)
+	defer dcancel()
+
+	strategy := DispatchStrategy(dctx, e.provider, e.model, diagnostics)
+	dispatchLog("[orchestrator] strategy=%s target=%q rationale=%q",
+		strategy.Tool, strategy.Target, strategy.Rationale)
+
+	runner := NewToolRunner(e.root, e.provider, e.model, e.retriever, diagnostics)
+
+	actions := 0
+	current := strategy.Tool
+	target := strategy.Target
+
+	// If the orchestrator returned no explicit target, try to recover one from
+	// a concrete file:line coordinate already present in the diagnostics (e.g.
+	// a compiler error "cmd/api/main.go:7:5"). This never spawns LX — it only
+	// reuses coordinates the diagnostics already contain.
+	if target == "" {
+		if ct := ParseCompilerTargets(diagnostics); len(ct) > 0 {
+			target = ct[0].File
+		}
+	}
+
+	for current != "" && actions < MaxActionsPerRun {
+		actions++
+		dispatchLog("[orchestrator] action %d/%d -> %s (target=%q)",
+			actions, MaxActionsPerRun, current, target)
+
+		res := runner.Run(dctx, current, target)
+		if res.Ok {
+			e.ingestToolResult(res)
+			// The chosen tool succeeded — the chain is complete.
+			return
+		}
+
+		// Strict fallback: drop this path, never retry the broken token.
+		forensicLog("[orchestrator] %s failed — strict fallback (silent)", current)
+		current = nextFallback(current)
+	}
+
+	// If we exhausted the chain without a success, still surface whatever the
+	// diagnose fallback produced (it always returns Ok=true with raw evidence).
+	if current == ToolDiagnose {
+		res := runner.Run(dctx, ToolDiagnose, target)
+		e.ingestToolResult(res)
+	}
+}
+
+// ingestToolResult digests a tool result into the ledger, preserving the full
+// payload as monotonic [PKT-N] packets for /plan consumption.
+func (e *Engine) ingestToolResult(res ToolResult) {
+	for _, ev := range res.Evidence {
+		e.Evidence.Add(ev.Source, ev.Content, ev.File, ev.Line, ev.Confidence)
+	}
+	if res.Content != "" {
+		e.Ledger.SetDiagnostics(res.Content)
+	}
+	e.Ledger.AddTarget(Target{
+		File:    res.Target,
+		Node:    string(res.Tool),
+		Kind:    "tool",
+		Snippet: res.Content,
+	})
 }
 
 func (e *Engine) stateHypothesize() error {
@@ -343,59 +443,22 @@ func (e *Engine) buildHypothesesByCategory(evidence []Evidence) map[HypothesisCa
 }
 
 func (e *Engine) stateSearch() error {
-	if e.retriever == nil {
-		return e.State.Transition(StateGather)
-	}
-
-	e.forensicsRan = true
-
-	symbols := e.extractSymbolsFromProblem()
-	for _, sym := range symbols {
-		if sym == "" {
-			continue
-		}
-		results, err := e.retriever.SearchSymbol(sym)
-		if err == nil {
-			for _, r := range results {
-				e.Evidence.AddWithStrategy(EvSourceGraph, r.Content,
-					r.File, r.Line, r.Confidence, r.Strategy)
-			}
-		}
-	}
-
-	texts := e.extractTextTermsFromProblem()
-	for _, txt := range texts {
-		if txt == "" {
-			continue
-		}
-		results, err := e.retriever.SearchText(txt)
-		if err == nil {
-			for _, r := range results {
-				e.Evidence.AddWithStrategy(EvSourceRipgrep, r.Content,
-					r.File, r.Line, r.Confidence, r.Strategy)
-			}
-		}
-	}
-
-	stackEvidence := e.Evidence.BySource(EvSourceStack)
-	for _, ev := range stackEvidence {
-		if ev.File != "" && ev.Line > 0 {
-			results, err := e.retriever.ReadTarget(ev.File, 30)
-			if err == nil {
-				for _, r := range results {
-					e.Evidence.AddWithStrategy(EvSourceRead, r.Content,
-						r.File, r.Line, r.Confidence, r.Strategy)
-				}
-			}
-		}
-	}
-
+	// Forensics are performed EXCLUSIVELY by the AI/heuristic dispatcher in
+	// stateObserve (dispatchForensics). This state is intentionally a no-op:
+	// the legacy raw-token lx --search/--resolve loops have been removed so the
+	// engine never spawns LX for arbitrary log filler (e.g. "Investigate",
+	// "cause", "failure:").
 	return e.State.Transition(StateGather)
 }
 
 func (e *Engine) stateGather() error {
-	evidence := e.Evidence.All()
-	_ = evidence
+	// e.Result is normally allocated in RunContext before the state loop, but
+	// stateGather may be reached via direct state transitions (or a custom
+	// entry point) where it is still nil. Lazily initialize it here so we never
+	// dereference a nil *InvestigationResult when appending proximity slices.
+	if e.Result == nil {
+		e.Result = &InvestigationResult{Problem: e.Problem}
+	}
 
 	stackEvidence := e.Evidence.BySource(EvSourceStack)
 	for _, ev := range stackEvidence {
@@ -467,47 +530,12 @@ func (e *Engine) stateEvaluate() error {
 }
 
 func (e *Engine) stateNarrow() error {
-	failedTests := e.Evidence.BySource(EvSourceTest)
-	stackFrames := e.Evidence.BySource(EvSourceStack)
+	// NOTE: no LX brute-force loop here. Forensics are performed exclusively by
+	// the AI/heuristic dispatcher (stateObserve -> dispatchForensics). This
+	// state only refines already-gathered evidence into precise targets.
 
-	var targets []string
-	for _, ev := range failedTests {
-		if ev.File != "" {
-			targets = append(targets, ev.File)
-		}
-	}
-	for _, ev := range stackFrames {
-		if ev.File != "" {
-			targets = append(targets, ev.File)
-		}
-	}
-
-	// For compilation-only evidence (no stack frames or test files),
-	// extract file references from the error output
-	if len(targets) == 0 {
-		compEv := e.Evidence.ByCategory(ErrCatCompilation)
-		for _, ev := range compEv {
-			file := extractFileFromCompilationError(ev.Content)
-			if file != "" {
-				targets = append(targets, file)
-			}
-		}
-	}
-
-	if len(targets) > 0 && e.retriever != nil {
-		e.forensicsRan = true
-		for _, target := range unique(targets) {
-			results, err := e.retriever.SearchText(target)
-			if err == nil {
-				for _, r := range results {
-					e.Evidence.AddWithStrategy(EvSourceRipgrep, r.Content,
-						r.File, r.Line, r.Confidence, r.Strategy)
-				}
-			}
-		}
-	}
-
-	// Target isolation: pinpoint exact file boundary and AST node.
+	// Target isolation: pinpoint exact file boundary and AST node from the
+	// evidence collected by the orchestrator.
 	allEvidence := e.Evidence.All()
 	frames := e.parseStackFramesFromEvidence()
 	isolated := e.Isolator.IsolateFromEvidence(allEvidence, frames)
@@ -517,10 +545,8 @@ func (e *Engine) stateNarrow() error {
 			t.File, t.Line, 0.8, "isolator.node")
 	}
 
-	// TASK 1 (build-freeze fix): even on a dependency/compilation short-circuit,
-	// resolve exact file:line:col coordinates directly from the raw diagnostic
-	// output so the ledger never ends up empty. Written synchronously here,
-	// before the engine finishes.
+	// Resolve exact file:line:col coordinates directly from the raw diagnostic
+	// output so the ledger never ends up empty. Reads only, no LX spawn.
 	for _, ev := range e.Evidence.All() {
 		for _, t := range ParseCompilerTargets(ev.Content) {
 			e.Ledger.AddTarget(t)
@@ -528,7 +554,7 @@ func (e *Engine) stateNarrow() error {
 	}
 
 	// If compilation blocker is detected and there's also environment evidence,
-	// short-circuit the loop — don't go back to Hypothesize, go to Propose.
+	// short-circuit — go straight to Propose.
 	if e.Evidence.HasCategory(ErrCatCompilation) && e.Evidence.HasCategory(ErrCatEnvironment) {
 		return e.State.Transition(StatePropose)
 	}
@@ -675,52 +701,6 @@ func (e *Engine) FormatLedgerForPlan() string {
 		e.Ledger.SetConclusion(e.Result.Conclusion, e.Result.Resolved)
 	}
 	return e.Ledger.FormatForPlan()
-}
-
-func (e *Engine) extractSymbolsFromProblem() []string {
-	var symbols []string
-	words := strings.Fields(e.Problem)
-	for _, w := range words {
-		w = strings.TrimSpace(w)
-		if w == "" {
-			continue
-		}
-		if isLikelySymbol(w) {
-			symbols = append(symbols, w)
-		}
-	}
-	return symbols
-}
-
-func (e *Engine) extractTextTermsFromProblem() []string {
-	var terms []string
-	words := strings.Fields(e.Problem)
-	for _, w := range words {
-		w = strings.TrimSpace(w)
-		if w == "" {
-			continue
-		}
-		if len(w) > 3 {
-			terms = append(terms, w)
-		}
-	}
-	return terms
-}
-
-func isLikelySymbol(s string) bool {
-	if len(s) < 2 {
-		return false
-	}
-	if strings.Contains(s, ".") || strings.Contains(s, "/") {
-		return true
-	}
-	upper := 0
-	for _, c := range s {
-		if c >= 'A' && c <= 'Z' {
-			upper++
-		}
-	}
-	return upper > 0
 }
 
 func summarizeEvidence(evidence []Evidence) string {
