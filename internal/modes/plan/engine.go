@@ -2,6 +2,7 @@ package plan
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/ai"
@@ -49,6 +50,59 @@ func (e *Engine) SetProvider(provider ProviderFunc) {
 	if e != nil {
 		e.provider = provider
 	}
+}
+
+// ProcessFromLedger generates an execution plan directly from investigation
+// ledger data using enforced structured output (JSON mode). Returns parsed
+// Task structs, bypassing the conversational text-streaming path entirely.
+func (e *Engine) ProcessFromLedger(ctx context.Context, ledgerContent string, problem string, modelName string) ([]Task, error) {
+	if e == nil || e.provider == nil {
+		return nil, fmt.Errorf("plan engine: provider not set")
+	}
+
+	req := ai.Request{
+		Model: modelName,
+		Messages: []ai.Message{
+			{
+				Role:    "system",
+				Content: SchemaJSONInstruction(),
+			},
+			{
+				Role:    "user",
+				Content: prompt.BuildPlanJSONPrompt(problem, ledgerContent),
+			},
+		},
+		Stream: false,
+		ResponseFormat: &ai.ResponseFormat{
+			Type: "json_object",
+		},
+	}
+
+	resp, err := e.provider(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("plan engine: provider call failed: %w", err)
+	}
+
+	if resp == nil || resp.Content == "" {
+		return nil, fmt.Errorf("plan engine: empty response from provider")
+	}
+
+	// Persist raw plan output to disk.
+	_ = e.store.SaveRawMarkdown("plan", resp.Content)
+
+	// Parse structured JSON output into tasks.
+	jsonResult := ParseJSONPlan(resp.Content)
+	if jsonResult.Valid && len(jsonResult.Tasks) > 0 {
+		return jsonResult.Tasks, nil
+	}
+
+	// Fallback: if JSON parsing failed, try markdown task extraction.
+	tasks := ParseMarkdownToTasks(resp.Content)
+	if len(tasks) > 0 {
+		return tasks, nil
+	}
+
+	return nil, fmt.Errorf("plan engine: no valid tasks found in provider response (JSON parse error: %s)", jsonResult.Error)
 }
 
 // ProcessPlan generates an execution plan by dispatching to the AI provider

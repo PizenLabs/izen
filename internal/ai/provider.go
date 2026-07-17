@@ -11,11 +11,16 @@ type Message struct {
 	Content string `json:"content"`
 }
 
+type ResponseFormat struct {
+	Type string `json:"type"` // "json_object" or "text"
+}
+
 type Request struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
-	System   string    `json:"-"` // Explicit system prompt (top-level for Anthropic, prepended for OpenAI-compatible)
+	Model          string          `json:"model"`
+	Messages       []Message       `json:"messages"`
+	Stream         bool            `json:"stream"`
+	System         string          `json:"-"` // Explicit system prompt (top-level for Anthropic, prepended for OpenAI-compatible)
+	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
 }
 
 type Response struct {

@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/config"
+	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -164,6 +165,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.spinnerFrame = 0
 		}
 
+		// DETERMINISTIC RECONCILE: a frozen spinner (frame still advancing,
+		// animation requested below) with no owning producer is a leaked
+		// state. Force-clear it so the UI can never lock on "✦ streaming…".
+		// We only reconcile when the agent flag is set but there is NO live
+		// stream channel driving it AND no deferred orchestration result is
+		// expected (planPending) — this safely catches a deadlocked /build
+		// handoff while never wiping the spinner of a legitimate /plan worker
+		// that owns the flags until its terminal planResultMsg arrives.
+		if m.agentRunning && m.streamCh == nil && !m.planPending && m.state == StateChat &&
+			!m.reviewRunning && !m.pipelineRunning &&
+			m.state != StateProcessing && m.state != StateAwaitingApproval {
+			m.reconcileSpinner()
+		}
+
 		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning ||
 			m.state == StateProcessing || m.state == StateAwaitingApproval {
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
@@ -215,14 +230,87 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streaming = false
 		m.streamParser = nil
 		m.pushRecords(msg.records)
-		m.push(roleSystem, "Diagnostics collected. Analyzing...")
 		// Store the raw Context-Ledger data before anything else — this is
 		// the authoritative source for handoff, not the LLM's transient output.
-		m.handoffLedgerContent = msg.ledgerContent
+		m.handoffLedgerContent = ctxpkg.SanitizeLedger(msg.ledgerContent)
+
+		// Populate the handoff context so the /investigate workspace renders
+		// its interactive Action Chip ("Formulate Execution Plan" → /plan).
+		// Without this the terminal shows the completion notice but no buttons,
+		// stranding the user into manually typing /plan.
+		if m.handoffLedgerContent != "" {
+			m.handoffCtx.ProposedFix = m.handoffLedgerContent
+		}
+
+		// SYSTEM BOUNDARY: when the engine already produced a resolved ledger,
+		// its structured data IS the output. Re-streaming the escalation as
+		// free-form chat leaks conversational fluff to the viewport, so we
+		// suppress it and surface only the bounded "ready for /plan" notice
+		// plus the Action Chip.
+		if m.handoffLedgerContent == "" && msg.escalationContent != "" {
+			m.push(roleSystem, "Diagnostics collected. Analyzing...")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, tea.Batch(flush, m.streamCmd(msg.escalationContent))
+		}
+
+		if len(msg.records) == 0 {
+			m.push(roleSystem, "Investigation complete — no structured findings to report.")
+		}
+		m.push(roleStatus, "Investigation complete. Context-Ledger ready for /plan handoff.")
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
-		return m, tea.Batch(flush, m.streamCmd(msg.escalationContent))
+		return m, flush
+
+	case planResultMsg:
+		// Terminal handler for the asynchronous PlanEngine synthesis. Only here
+		// do we stage tasks and clear streaming state — never while the LLM call
+		// is in flight (that would re-block the event loop).
+		m.planPending = false
+
+		// ALWAYS clear the transient loading flags first so the spinner can
+		// never freeze, regardless of which branch below we take.
+		m.reconcileSpinner()
+
+		if msg.Err != nil {
+			m.push(roleError, fmt.Sprintf("Failed to synthesize plan from ledger: %v", msg.Err))
+			// Retain a baseline Action Chip so the user is never left with a
+			// dead viewport and no buttons — they can re-investigate the failure.
+			m.currentResult = failureResult(m.handoffLedgerContent)
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+
+		if len(msg.Tasks) == 0 {
+			// Deterministic fallback: a handoff that yields zero constructive
+			// tasks must immediately clear the view-model flags rather than
+			// leave the UI frozen on the spinner. We still surface a baseline
+			// Action Chip (Investigate Root Cause) so the terminal stays alive.
+			m.push(roleError, "plan synthesis produced zero tasks — investigation data may be insufficient")
+			m.currentResult = failureResult(m.handoffLedgerContent)
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+
+		m.sess.StageTaskList(&msg.Tasks)
+		m.handoffCtx.PendingTodos = make([]string, len(msg.Tasks))
+		for i, t := range msg.Tasks {
+			m.handoffCtx.PendingTodos[i] = t.Type + ": " + t.Target + " — " + t.Description
+		}
+		m.push(roleStatus, fmt.Sprintf("Plan staged: %d task(s). Use /build to execute.", len(msg.Tasks)))
+		if m.buildLedger == nil {
+			m.buildLedger = ctxpkg.NewTaskLedger()
+		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		flush := m.flushPendingRecords()
+		return m, flush
 
 	case graphBuiltMsg:
 		m.agentRunning = false

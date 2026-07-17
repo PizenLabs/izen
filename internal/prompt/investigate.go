@@ -34,5 +34,15 @@ Structure each finding as:
   Evidence:    the file, line, AST node, or log that proves it
   Confidence:  qualified level of certainty
   Possible Next Steps: where /plan should look next
-- Dump the exact failure snapshot into the context-ledger. Your output is handed directly to /plan for remediation.`
+- Dump the exact failure snapshot into the context-ledger. Your output is handed directly to /plan for remediation.
+
+SYSTEM BOUNDARY — ZERO CHATTER
+- If you are in parsing/analysis mode, you MUST populate the data ledger
+  structures and output ZERO conversational text to the viewport.
+- You MUST NOT append polite follow-ups, questions, or conversational tail
+  (e.g. "could you please elaborate…", "let me know if…"). Such text is a
+  hard violation of the investigation boundary and is discarded by the runtime.
+- The structured Context-Ledger is the single source of truth for handoff.
+  Your free-form output is supplementary only and is suppressed whenever a
+  resolved ledger exists.`
 }

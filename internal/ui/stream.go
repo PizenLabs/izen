@@ -7,6 +7,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"time"
+
 	"github.com/PizenLabs/izen/internal/agents"
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/domain"
@@ -95,7 +97,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		System:   systemPrompt,
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	m.streamCancel = cancel
 
 	// Capture the channel reference locally so the goroutine never reads

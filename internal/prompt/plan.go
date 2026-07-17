@@ -70,6 +70,35 @@ STRICT OUTPUT REQUIREMENT
 7. NEVER use standard bullet points (lines starting with "- " or "* ") unless they are formatted exactly as "- [ ] TYPE: Target | Rationale". Any loose bullet points will crash the parser.`
 }
 
+// BuildPlanJSONPrompt builds a JSON-mode user prompt for ProcessFromLedger.
+// Unlike BuildPlanPrompt (which targets markdown checklist output), this prompt
+// is consistent with the json_object ResponseFormat and SchemaJSONInstruction,
+// instructing the model to produce a valid PlanOutput JSON object.
+func BuildPlanJSONPrompt(problem string, ledgerContent string) string {
+	return fmt.Sprintf(`Generate an execution plan from the investigation data below.
+
+### PROBLEM
+%s
+
+### INVESTIGATION LEDGER
+%s
+
+### OUTPUT REQUIREMENTS
+You MUST output ONLY a JSON object matching the schema provided in the system prompt.
+- context_anchor.source must be "investigate-ledger"
+- atomic_tasks must contain at least one actionable task derived from the evidence
+- Each task must reference a specific file path relative to project root
+- strategy must be one of: ATOMIC_REPLACE, DIFF_PATCH, SHELL_EXEC, GIT_ACTION
+- task_id values must be sequential starting at 1
+
+If the investigation data contains compilation errors or test failures, create tasks
+that fix those specific issues. If data is insufficient, create at minimum 1-2
+investigative tasks (FILE_MUTATE with strategy ATOMIC_REPLACE) targeting the most
+likely root-cause files.
+
+Output ONLY valid JSON. No markdown, no code fences, no explanatory text.`, problem, ledgerContent)
+}
+
 // BuildPlanPrompt builds the user-facing context message for plan generation.
 func BuildPlanPrompt(objective string, contextStr string) string {
 	if contextStr == "" {

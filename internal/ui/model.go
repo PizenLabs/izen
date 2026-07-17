@@ -105,6 +105,15 @@ type reviewResultMsg struct {
 	err          error
 }
 
+// planResultMsg carries the outcome of the asynchronous PlanEngine ledger
+// synthesis. It is dispatched from a background tea.Cmd (runPlanEngineCmd) so
+// the synchronous LLM call never blocks the Bubble Tea event loop.
+type planResultMsg struct {
+	Tasks   []plan.Task
+	Err     error
+	Handoff HandoffContext // echoed back so the handler can populate PendingTodos
+}
+
 type agentStartMsg struct{ label string }
 type agentDoneMsg struct{}
 
@@ -520,8 +529,9 @@ type model struct {
 
 	state UIState
 
-	execEng   *execution.Engine
-	planStore *plan.PlanStore
+	execEng    *execution.Engine
+	planStore  *plan.PlanStore
+	planEngine *plan.Engine // structural plan engine wired for ledger-driven execution
 
 	// buildLedger is the live /plan task state bridge shared with the execution
 	// engine. It is created lazily and survives across builds within a session.
@@ -660,6 +670,14 @@ type model struct {
 	// to /build without re-entering /plan. Set true on successful plan→build
 	// transition. Reset to false when entering /plan or /investigate.
 	planApproved bool
+
+	// planPending marks that an asynchronous PlanEngine ledger synthesis is
+	// in flight (set when the /plan handoff spawns runPlanEngineCmd, cleared
+	// when planResultMsg arrives). It is the definitive signal that the
+	// spinner is legitimately owned by a live orchestration worker, so the
+	// tickMsg leak-detector must NOT wipe the loading flags until the
+	// terminal planResultMsg is delivered.
+	planPending bool
 
 	// Context Ledger: silent issue tracking across failure sessions
 	ledger *ContextLedger
@@ -930,6 +948,51 @@ func (m *model) flushRecord(rec record) tea.Cmd {
 }
 
 // flushPendingRecords returns a batch cmd that flushes all records.
+// resetStreamingState forcibly clears every background-execution flag that
+// drives the "⚙ streaming…" prompt indicator and the runtime-status spinner.
+// Call this when a background engine path terminates (the async planResultMsg
+// handler) so a prior stream/agent session can never leak its spinner into a
+// subsequent idle view. It mirrors the teardown performed by streamDoneMsg.
+func (m *model) resetStreamingState() {
+	m.streaming = false
+	m.streamCh = nil
+	m.streamCancel = nil
+	m.streamTickActive = false
+	m.agentRunning = false
+	m.agentLabel = ""
+	m.spinnerFrame = 0
+	if m.streamParser != nil {
+		m.streamParser = nil
+	}
+}
+
+// reconcileSpinner is the single deterministic reset point that ties the
+// Bubble Tea spinner lifecycle to command resolution. It is called whenever an
+// async producer (plan result, investigate result, ledger handoff) resolves or
+// yields zero constructive tasks, guaranteeing the transient loading flags are
+// cleared immediately so the UI can never freeze on "✦ streaming…".
+//
+// IMPORTANT: this method ONLY clears transient loading flags. It must NEVER
+// touch persistent view state — m.state (UIState), m.currentResult (which
+// drives Action Chip rendering), m.handoffCtx, m.pendingProposals, or component
+// visibility — otherwise it would wipe the user's actionable buttons or corrupt
+// the active layout when a background command resolves.
+func (m *model) reconcileSpinner() {
+	m.streaming = false
+	m.streamCh = nil
+	m.streamCancel = nil
+	m.streamTickActive = false
+	m.agentRunning = false
+	m.agentLabel = ""
+	m.agentDone = true
+	m.reviewRunning = false
+	m.pipelineRunning = false
+	m.spinnerFrame = 0
+	if m.streamParser != nil {
+		m.streamParser = nil
+	}
+}
+
 func (m *model) flushPendingRecords() tea.Cmd {
 	if len(m.records) == 0 {
 		return nil

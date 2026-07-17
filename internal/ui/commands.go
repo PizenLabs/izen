@@ -25,6 +25,7 @@ import (
 	"github.com/PizenLabs/izen/internal/domain"
 	objengine "github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/lynx"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -286,6 +287,71 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
 
+		// ── STRUCTURAL ENGINE PATH (Handoff from /investigate) ──────────
+		// When the Context-Ledger or a proposed fix is present, bypass the
+		// conversational streaming path entirely. Call the PlanEngine with
+		// structured JSON output enforcement, then stage the parsed tasks
+		// directly into the session.
+		ledgerContent := ctxpkg.SanitizeLedger(m.handoffLedgerContent)
+		proposedFix := m.handoffCtx.ProposedFix
+		handoffSource := ledgerContent
+		if handoffSource == "" {
+			handoffSource = proposedFix
+		}
+		if handoffSource != "" {
+			if m.planEngine == nil {
+				m.handoffLedgerContent = ""
+				m.handoffCtx.ProposedFix = ""
+				m.handoffCtx.PendingTodos = nil
+				m.push(roleError, "plan engine not configured")
+				m.resetStreamingState()
+				m.refreshViewportContent()
+				return m.flushPendingRecords()
+			}
+
+			problem := m.handoffCtx.LastFailurePayload
+			if problem == "" {
+				problem = m.sess.ObjectiveIntent()
+			}
+			if problem == "" {
+				problem = "Investigation results require structured execution plan"
+			}
+
+			// Reset handoff triggers so the async result cannot re-enter this
+			// path. The synthesized tasks are applied in planResultMsg handler.
+			m.handoffLedgerContent = ""
+			m.handoffCtx.ProposedFix = ""
+			m.handoffCtx.PendingTodos = nil
+
+			// Keep the UI alive: show a live spinner while the (potentially
+			// slow) LLM call runs in a background goroutine. This MUST NOT
+			// block the Bubble Tea event loop — ProcessFromLedger executes
+			// inside runPlanEngineCmd, not here.
+			m.streaming = true
+			m.spinnerFrame = 0
+			m.agentRunning = true
+			m.agentLabel = "synthesizing plan"
+			m.planPending = true
+			m.push(roleSystem, infoStyle.Render("Synthesizing structured execution plan from investigation data..."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+
+			// Start the spinner tick loop so the indicator animates and the
+			// viewport keeps repainting while the async LLM call is in flight.
+			// The loop self-terminates once m.streaming is cleared by the
+			// planResultMsg handler (smoothStreamTickMsg re-schedules only
+			// while m.streaming stays true).
+			return tea.Batch(
+				m.flushPendingRecords(),
+				m.smoothStreamTickCmd(),
+				m.runPlanEngineCmd(handoffSource, problem, m.cfg.ActiveModelName(), m.handoffCtx),
+			)
+		}
+
+		// ── CONVERSATIONAL STREAMING PATH (Manual /plan usage) ──────────
+		// Only reached when no investigation handoff exists (no handoffLedgerContent
+		// and no ProposedFix). The structural engine path above always terminates
+		// with either staged tasks or an explicit diagnostic — never falls through.
 		cb := ctxpkg.NewBuilder(".", m.graph, m.gitEng, m.sess)
 		assembly := cb.BuildPlanAssembly(content, m.attachedFiles)
 
@@ -297,27 +363,46 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		}
 
 		if m.graph != nil && assembly.EstimateTokens < plan.TokenBudgetForModel(modelName)-1000 {
-			query := content
+			// ARCHITECTURAL BOUNDARY: never search the raw ledger/log text.
+			// Extract only clean structural terms (symbols, paths, error
+			// constants). If extraction yields nothing, the search is
+			// safely skipped by design — no blind [FAIL] bombardment.
+			searchInput := content
 			if m.sess.ObjectiveIntent() != "" {
-				query = m.sess.ObjectiveIntent() + " " + query
+				searchInput = m.sess.ObjectiveIntent() + " " + content
 			}
+			terms := retrieval.ExtractSearchTerms(searchInput)
 			lc := retrieval.GetLynxController()
-			if lc != nil {
+			if lc != nil && len(terms) > 0 {
 				compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.ObjectiveIntent())
 				g := m.graph
 				go retrieval.BuildGlobalCompressor(g, m.sess.ObjectiveIntent())
-				results, err := lc.SearchRaw(query)
-				if err == nil && len(results) > 0 {
-					compressed := compressor.CompressResults(results)
-					skeleton := retrieval.FormatResultsAsSkeleton(compressed)
-					if skeleton != "" {
-						augmented := assembly.RawContext + "\n\n" + retrieval.FormatPlanFrame(skeleton)
-						augmentedTokens := plan.EstimateTokens(augmented)
-						if plan.CheckTokenBudget(modelName, augmentedTokens) == nil {
-							assembly.RawContext = augmented
-							assembly.EstimateTokens = augmentedTokens
+				searchCtx, searchCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer searchCancel()
+				var (
+					results   []lynx.SearchResult
+					searchErr error
+				)
+				searchDone := make(chan struct{}, 1)
+				go func() {
+					results, searchErr = retrieval.SearchWithExtraction(lc, searchInput)
+					close(searchDone)
+				}()
+				select {
+				case <-searchDone:
+					if searchErr == nil && len(terms) > 0 && len(results) > 0 {
+						compressed := compressor.CompressResults(results)
+						skeleton := retrieval.FormatResultsAsSkeleton(compressed)
+						if skeleton != "" {
+							augmented := assembly.RawContext + "\n\n" + retrieval.FormatPlanFrame(skeleton)
+							augmentedTokens := plan.EstimateTokens(augmented)
+							if plan.CheckTokenBudget(modelName, augmentedTokens) == nil {
+								assembly.RawContext = augmented
+								assembly.EstimateTokens = augmentedTokens
+							}
 						}
 					}
+				case <-searchCtx.Done():
 				}
 			}
 		}
@@ -363,6 +448,39 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			)
 		}
 		return m.streamCmd(content)
+	}
+}
+
+// runPlanEngineCmd executes the (potentially slow) PlanEngine ledger synthesis
+// in a background goroutine so the synchronous LLM call never blocks the Bubble
+// Tea event loop. The result is delivered asynchronously as a planResultMsg,
+// which the Update() loop handles to stage tasks and clear streaming state.
+func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, handoff HandoffContext) tea.Cmd {
+	return func() tea.Msg {
+		if m.planEngine == nil {
+			return planResultMsg{Err: fmt.Errorf("plan engine not configured"), Handoff: handoff}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+
+		type outcome struct {
+			tasks []plan.Task
+			err   error
+		}
+		outCh := make(chan outcome, 1)
+
+		go func() {
+			tasks, err := m.planEngine.ProcessFromLedger(ctx, handoffSource, problem, modelName)
+			outCh <- outcome{tasks: tasks, err: err}
+		}()
+
+		select {
+		case o := <-outCh:
+			return planResultMsg{Tasks: o.tasks, Err: o.err, Handoff: handoff}
+		case <-ctx.Done():
+			return planResultMsg{Err: fmt.Errorf("plan synthesis timed out after 120s: %w", ctx.Err()), Handoff: handoff}
+		}
 	}
 }
 
@@ -462,46 +580,48 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	return nil
 }
 
-// buildHandoffTriggerContent constructs the execution query for auto-triggering
-// /plan or /build mode when handoff context from a previous mode exists.
-// Returns empty string when no handoff data is available for the given mode,
-// preventing any open-ended conversational fallback.
+// buildHandoffTriggerContent returns a non-empty string when handoff data exists
+// for the given mode, triggering immediate structural execution. For /plan mode
+// the handoff is handled internally by the structural engine — the return value
+// is the raw handoff text that feeds into the engine path. For /build mode the
+// pending todos are formatted as a structured execution prompt.
 func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
 	switch mode {
 	case modes.ModePlan:
-		switch {
-		case m.handoffLedgerContent != "":
-			return "## HANDOFF PLAN EXECUTION\n\n" +
-				"Synthesize the execution plan based on the investigation ledger below.\n" +
-				"Output a structured task list with file targets, step numbers, and descriptions.\n" +
-				"Do NOT ask for clarification — execute the plan synthesis immediately.\n\n" +
-				m.handoffLedgerContent
-		case m.handoffCtx.ProposedFix != "":
-			return "## HANDOFF PLAN EXECUTION\n\n" +
-				"Formulate an execution plan for the proposed fix:\n\n" +
-				m.handoffCtx.ProposedFix
-		case m.handoffCtx.LastFailurePayload != "":
-			return "## HANDOFF PLAN EXECUTION\n\n" +
-				"Analyze the following failure and produce a structured recovery plan:\n\n" +
-				m.handoffCtx.LastFailurePayload
+		if m.handoffLedgerContent != "" {
+			return m.handoffLedgerContent
+		}
+		if m.handoffCtx.ProposedFix != "" {
+			return m.handoffCtx.ProposedFix
+		}
+		if m.handoffCtx.LastFailurePayload != "" {
+			return m.handoffCtx.LastFailurePayload
 		}
 	case modes.ModeBuild:
-		switch {
-		case len(m.handoffCtx.PendingTodos) > 0:
-			var b strings.Builder
-			b.WriteString("## HANDOFF BUILD EXECUTION\n\n")
-			b.WriteString("Execute the following planned tasks and output code patches directly.\n")
-			b.WriteString("Do NOT restate the plan or ask for approval — produce the mutations now.\n\n")
+		// /build STRICTLY consumes the atomic structural tasks produced by the
+		// /plan phase (m.handoffCtx.PendingTodos and m.sess.CurrentTasks). It
+		// must NEVER fall back to the raw conversational ProposedFix blob —
+		// that would re-inject stale $test / chat text into the build
+		// workspace. If no atomic tasks exist, return "" so setMode enters a
+		// clean idle state instead of contaminating the buffer.
+		hasStagedTasks := len(m.sess.CurrentTasks) > 0
+		if len(m.handoffCtx.PendingTodos) == 0 && !hasStagedTasks {
+			return ""
+		}
+		var b strings.Builder
+		b.WriteString("## HANDOFF BUILD EXECUTION\n\n")
+		b.WriteString("Execute the following planned tasks and output code patches directly.\n")
+		b.WriteString("Do NOT restate the plan or ask for approval — produce the mutations now.\n\n")
+		if len(m.handoffCtx.PendingTodos) > 0 {
 			for i, todo := range m.handoffCtx.PendingTodos {
 				fmt.Fprintf(&b, "Task %d: %s\n", i+1, todo)
 			}
-			return b.String()
-		case m.handoffCtx.ProposedFix != "":
-			return "## HANDOFF BUILD EXECUTION\n\n" +
-				"Execute the proposed fix below and output the code patches.\n" +
-				"Do NOT restate the plan or ask for approval — produce the mutations now.\n\n" +
-				m.handoffCtx.ProposedFix
+		} else if hasStagedTasks {
+			for i, t := range m.sess.CurrentTasks {
+				fmt.Fprintf(&b, "Task %d: %s — %s — %s\n", i+1, t.Type, t.Target, t.Description)
+			}
 		}
+		return b.String()
 	}
 	return ""
 }
@@ -2079,6 +2199,12 @@ func CleanHandoffPayload(payload string) string {
 	return strings.TrimSpace(builder.String())
 }
 
+// ExtractSearchTerms (from the retrieval package) is the authoritative query
+// sanitizer for code search. It replaces the previous inline sanitizeSearchQuery
+// because it performs structural term extraction (symbols/paths/error
+// constants) rather than only stripping control characters — raw log strings
+// are now safely skipped instead of fired verbatim at the search engine.
+
 // injectHandoffContext primes the target mode with contextual state from the
 // previous mode. Called during setMode when a handoff context is available.
 func (m *model) injectHandoffContext(mode modes.Mode) {
@@ -2104,11 +2230,17 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 		}
 
 	case modes.ModeBuild:
-		if len(m.handoffCtx.PendingTodos) > 0 || m.handoffCtx.ProposedFix != "" {
-			m.handoffCtx.ProposedFix = config.SanitizeForSession(m.handoffCtx.ProposedFix)
+		// /build consumes ONLY the atomic structural tasks (PendingTodos /
+		// staged tasks) produced by /plan. The raw ProposedFix chat blob from
+		// an earlier phase is purged here so it can never re-inject stale
+		// conversational text into the build workspace. We keep a checkpoint
+		// for reversibility regardless.
+		if len(m.handoffCtx.PendingTodos) > 0 || len(m.sess.CurrentTasks) > 0 {
 			m.createBuildCheckpoint(0)
 			m.push(roleSystem, "Handoff context injected. Checkpoint created.")
 		}
+		// Purge stale conversational handoff so the build buffer stays clean.
+		m.handoffCtx.ProposedFix = ""
 	}
 }
 

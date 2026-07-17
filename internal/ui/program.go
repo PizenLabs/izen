@@ -47,6 +47,10 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	ti.Focus()
 
 	planStore := plan.NewPlanStore()
+	planEng := plan.NewEngine(planStore)
+	if provider != nil {
+		planEng.SetProvider(provider.Execute)
+	}
 
 	var detectedLang language.ID
 	if detection.Primary != nil {
@@ -155,6 +159,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		attachedFiles:       make([]string, 0),
 		execEng:             execEng,
 		planStore:           planStore,
+		planEngine:          planEng,
 		ledger:              NewContextLedger(),
 		ti:                  ti,
 		showBanner:          true,
