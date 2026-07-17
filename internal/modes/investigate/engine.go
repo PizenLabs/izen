@@ -115,6 +115,20 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 		result.Conclusion = "investigation exhausted — no hypothesis could be confirmed"
 	}
 
+	// Merge: preserve fields set by statePropose (RootCause, Proximity, etc.)
+	// that the local result variable does not carry.
+	if e.Result != nil {
+		if e.Result.RootCause != "" {
+			result.RootCause = e.Result.RootCause
+		}
+		if len(e.Result.Proximity) > 0 {
+			result.Proximity = e.Result.Proximity
+		}
+		if e.Result.Conclusion != "" && result.Conclusion == "" {
+			result.Conclusion = e.Result.Conclusion
+		}
+	}
+
 	e.Result = result
 	return result, nil
 }
@@ -177,30 +191,78 @@ func (e *Engine) stateObserve() error {
 func (e *Engine) stateHypothesize() error {
 	evidence := e.Evidence.All()
 
-	var hypothesisText string
-	switch {
-	case len(evidence) == 0:
-		hypothesisText = "No initial evidence found. Need to gather more information."
-	case e.State.IterationCount() == 0:
-		hypothesisText = fmt.Sprintf("Based on %d pieces of evidence, the issue may be related to: %s",
-			len(evidence), summarizeEvidence(evidence))
-	default:
-		best := e.Hypotheses.Best()
-		if best != nil && best.Status == HypothesisRejected {
-			hypothesisText = fmt.Sprintf("Previous hypothesis rejected. New theory: %s",
-				summarizeEvidence(evidence))
-		} else {
-			hypothesisText = fmt.Sprintf("Refining hypothesis. Evidence count: %d. %s",
-				len(evidence), summarizeEvidence(evidence))
+	if len(evidence) == 0 {
+		h := e.Hypotheses.AddWithCategory("No initial evidence found. Need to gather more information.", HypCatGeneral)
+		_ = h
+		return e.State.Transition(StateSearch)
+	}
+
+	catHypotheses := e.buildHypothesesByCategory(evidence)
+
+	if len(catHypotheses) == 0 {
+		h := e.Hypotheses.Add(summarizeEvidence(evidence))
+		for _, ev := range evidence {
+			e.Hypotheses.LinkEvidence(h.ID, ev.ID)
 		}
 	}
 
-	h := e.Hypotheses.Add(hypothesisText)
+	return e.State.Transition(StateSearch)
+}
+
+func (e *Engine) buildHypothesesByCategory(evidence []Evidence) map[HypothesisCategory]*Hypothesis {
+	byCat := make(map[ErrorCategory][]Evidence)
 	for _, ev := range evidence {
-		e.Hypotheses.LinkEvidence(h.ID, ev.ID)
+		for _, c := range ev.Categories {
+			byCat[c] = append(byCat[c], ev)
+		}
 	}
 
-	return e.State.Transition(StateSearch)
+	created := make(map[HypothesisCategory]*Hypothesis)
+
+	if compEv, ok := byCat[ErrCatCompilation]; ok && len(compEv) > 0 {
+		text := fmt.Sprintf("BLOCKER: Compilation/dependency error detected — %s",
+			summarizeEvidence(compEv))
+		h := e.Hypotheses.AddWithCategory(text, HypCatBlockerCompilation)
+		for _, ev := range compEv {
+			e.Hypotheses.LinkEvidence(h.ID, ev.ID)
+		}
+		created[HypCatBlockerCompilation] = h
+	}
+
+	if envEv, ok := byCat[ErrCatEnvironment]; ok && len(envEv) > 0 {
+		text := fmt.Sprintf("Environment setup issue detected — %s",
+			summarizeEvidence(envEv))
+		h := e.Hypotheses.AddWithCategory(text, HypCatEnvironment)
+		for _, ev := range envEv {
+			e.Hypotheses.LinkEvidence(h.ID, ev.ID)
+		}
+		created[HypCatEnvironment] = h
+	}
+
+	if testEv, ok := byCat[ErrCatTestFailure]; ok && len(testEv) > 0 {
+		if _, hasBlocker := byCat[ErrCatCompilation]; !hasBlocker {
+			text := fmt.Sprintf("Source code test failure detected — %s",
+				summarizeEvidence(testEv))
+			h := e.Hypotheses.AddWithCategory(text, HypCatSourceCode)
+			for _, ev := range testEv {
+				e.Hypotheses.LinkEvidence(h.ID, ev.ID)
+			}
+			created[HypCatSourceCode] = h
+		}
+	}
+
+	if len(byCat) == 1 {
+		if _, onlyUnknown := byCat[ErrCatUnknown]; onlyUnknown {
+			text := summarizeEvidence(evidence)
+			h := e.Hypotheses.AddWithCategory(text, HypCatGeneral)
+			for _, ev := range evidence {
+				e.Hypotheses.LinkEvidence(h.ID, ev.ID)
+			}
+			created[HypCatGeneral] = h
+		}
+	}
+
+	return created
 }
 
 func (e *Engine) stateSearch() error {
@@ -270,6 +332,32 @@ func (e *Engine) stateGather() error {
 }
 
 func (e *Engine) stateEvaluate() error {
+	blockers := e.Hypotheses.Blockers()
+	if len(blockers) > 0 {
+		activeBlockers := 0
+		for _, b := range blockers {
+			if b.Status == HypothesisActive || b.Status == HypothesisPending {
+				e.Hypotheses.UpdateConfidence(b.ID, 1.0)
+				e.Hypotheses.UpdateStatus(b.ID, HypothesisConfirmed)
+				activeBlockers++
+			}
+		}
+		if activeBlockers > 0 {
+			return e.State.Transition(StatePropose)
+		}
+	}
+
+	envHyps := e.Hypotheses.ByCategory(HypCatEnvironment)
+	if len(envHyps) > 0 {
+		for _, hyp := range envHyps {
+			if hyp.Status == HypothesisActive {
+				e.Hypotheses.UpdateConfidence(hyp.ID, 0.8)
+				e.Hypotheses.UpdateStatus(hyp.ID, HypothesisConfirmed)
+			}
+		}
+		return e.State.Transition(StateVerify)
+	}
+
 	highConf := e.Evidence.HighConfidence(0.7)
 	activeHyp := e.Hypotheses.Active()
 
@@ -315,6 +403,18 @@ func (e *Engine) stateNarrow() error {
 		}
 	}
 
+	// For compilation-only evidence (no stack frames or test files),
+	// extract file references from the error output
+	if len(targets) == 0 {
+		compEv := e.Evidence.ByCategory(ErrCatCompilation)
+		for _, ev := range compEv {
+			file := extractFileFromCompilationError(ev.Content)
+			if file != "" {
+				targets = append(targets, file)
+			}
+		}
+	}
+
 	if len(targets) > 0 && e.retriever != nil {
 		for _, target := range unique(targets) {
 			results, err := e.retriever.SearchText(target)
@@ -337,7 +437,32 @@ func (e *Engine) stateNarrow() error {
 			t.File, t.Line, 0.8, "isolator.node")
 	}
 
+	// If compilation blocker is detected and there's also environment evidence,
+	// short-circuit the loop — don't go back to Hypothesize, go to Propose.
+	if e.Evidence.HasCategory(ErrCatCompilation) && e.Evidence.HasCategory(ErrCatEnvironment) {
+		return e.State.Transition(StatePropose)
+	}
+
 	return e.State.Transition(StateHypothesize)
+}
+
+func extractFileFromCompilationError(content string) string {
+	idx := strings.Index(content, ".go:")
+	if idx < 0 {
+		return ""
+	}
+	start := idx
+	for start > 0 && content[start] != ' ' && content[start] != '\n' && content[start] != '\t' {
+		start--
+	}
+	if content[start] == ' ' || content[start] == '\n' || content[start] == '\t' {
+		start++
+	}
+	end := idx + 4
+	for end < len(content) && content[end] >= '0' && content[end] <= '9' {
+		end++
+	}
+	return content[start:end]
 }
 
 func (e *Engine) parseStackFramesFromEvidence() []StackFrame {
@@ -375,6 +500,10 @@ func (e *Engine) stateVerify() error {
 }
 
 func (e *Engine) statePropose() error {
+	if e.Result == nil {
+		e.Result = &InvestigationResult{Problem: e.Problem}
+	}
+
 	result := e.Hypotheses.Best()
 	e.Ledger.Problem = e.Problem
 	e.Ledger.Source = "investigate"
@@ -385,10 +514,24 @@ func (e *Engine) statePropose() error {
 		e.Result.RootCause = deriveRootCause(e.Result)
 		e.Ledger.SetRootCause(e.Result.RootCause)
 		e.Ledger.SetConclusion(result.Theory, true)
+
+		confirmed := e.Hypotheses.Confirmed()
+		if len(confirmed) > 1 {
+			parts := make([]string, 0, len(confirmed))
+			for _, h := range confirmed {
+				parts = append(parts, h.Theory)
+			}
+			e.Result.Conclusion = strings.Join(parts, "; ")
+			e.Result.RootCause = deriveRootCause(e.Result)
+			e.Ledger.SetRootCause(e.Result.RootCause)
+			e.Ledger.SetConclusion(e.Result.Conclusion, true)
+		}
 	} else {
 		e.Result.RootCause = "no root cause identified — investigation exhausted"
+		e.Result.Conclusion = "investigation exhausted — no hypothesis confirmed"
+		e.Result.Resolved = false
 		e.Ledger.SetRootCause(e.Result.RootCause)
-		e.Ledger.SetConclusion("investigation exhausted — no hypothesis confirmed", false)
+		e.Ledger.SetConclusion(e.Result.Conclusion, false)
 	}
 	return e.State.Transition(StateDone)
 }
@@ -401,16 +544,32 @@ func deriveRootCause(r *InvestigationResult) string {
 	if r == nil {
 		return ""
 	}
-	var cause string
-	if r.Conclusion != "" {
-		cause = r.Conclusion
-	}
-	if len(r.Proximity) > 0 {
-		p := r.Proximity[0]
-		if cause != "" {
-			cause += " "
+
+	var blockerCause string
+	var otherCauses []string
+	for _, h := range r.Hypotheses {
+		if h.Status == HypothesisConfirmed && h.IsBlocker {
+			blockerCause = h.Theory
+		} else if h.Status == HypothesisConfirmed {
+			otherCauses = append(otherCauses, h.Theory)
 		}
-		cause += fmt.Sprintf("(located at %s:%d)", p.File, p.Line)
+	}
+
+	var cause string
+	switch {
+	case blockerCause != "" && len(otherCauses) > 0:
+		cause = fmt.Sprintf("BLOCKER: %s; additionally: %s", blockerCause, strings.Join(otherCauses, "; "))
+	case blockerCause != "":
+		cause = blockerCause
+	case r.Conclusion != "":
+		cause = r.Conclusion
+	case len(otherCauses) > 0:
+		cause = strings.Join(otherCauses, "; ")
+	}
+
+	if cause != "" && len(r.Proximity) > 0 {
+		p := r.Proximity[0]
+		cause += fmt.Sprintf(" (located at %s:%d)", p.File, p.Line)
 	}
 	if cause == "" {
 		cause = "unable to determine root cause"

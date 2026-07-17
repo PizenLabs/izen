@@ -21,6 +21,59 @@ const (
 	EvSourceExecution EvidenceSource = "execution"
 )
 
+type ErrorCategory string
+
+const (
+	ErrCatCompilation ErrorCategory = "compilation"
+	ErrCatEnvironment ErrorCategory = "environment"
+	ErrCatTestFailure ErrorCategory = "test_failure"
+	ErrCatUnknown     ErrorCategory = "unknown"
+)
+
+func ClassifyLogOutput(content string) []ErrorCategory {
+	cats := make(map[ErrorCategory]bool)
+
+	lower := strings.ToLower(content)
+	if strings.Contains(lower, "no required module provides package") ||
+		strings.Contains(lower, "cannot find package") ||
+		strings.Contains(lower, "undefined:") ||
+		strings.Contains(lower, "go.mod") ||
+		strings.Contains(lower, "no required module") ||
+		strings.Contains(lower, "missing dependency") ||
+		strings.Contains(lower, "package is not in") {
+		cats[ErrCatCompilation] = true
+	}
+
+	if strings.Contains(lower, "rootless docker not found") ||
+		strings.Contains(lower, "docker daemon") ||
+		strings.Contains(lower, "failed to create docker provider") ||
+		strings.Contains(lower, "could not start") ||
+		strings.Contains(lower, "container runtime") ||
+		strings.Contains(lower, "connection refused") ||
+		strings.Contains(lower, "no such host") ||
+		strings.Contains(lower, "testcontainers") {
+		cats[ErrCatEnvironment] = true
+	}
+
+	if strings.Contains(lower, "--- fail") ||
+		strings.Contains(lower, "panic:") ||
+		strings.Contains(lower, "assertion failed") ||
+		strings.Contains(lower, "test failed") ||
+		strings.Contains(lower, "fail") {
+		cats[ErrCatTestFailure] = true
+	}
+
+	if len(cats) == 0 {
+		cats[ErrCatUnknown] = true
+	}
+
+	result := make([]ErrorCategory, 0, len(cats))
+	for c := range cats {
+		result = append(result, c)
+	}
+	return result
+}
+
 const (
 	maxLogInputBytes = 256 * 1024 // 256KB ceiling before truncation
 	maxStackFrames   = 30         // max frames to keep after pre-processing
@@ -162,16 +215,17 @@ func isStackFrameLine(s string) bool {
 }
 
 type Evidence struct {
-	ID         string         `json:"id"`
-	ContextID  string         `json:"context_id,omitempty"`
-	Source     EvidenceSource `json:"source"`
-	Content    string         `json:"content"`
-	File       string         `json:"file,omitempty"`
-	Line       int            `json:"line,omitempty"`
-	Confidence float64        `json:"confidence"`
-	Strategy   string         `json:"strategy,omitempty"`
-	CreatedAt  time.Time      `json:"created_at"`
-	Label      string         `json:"label,omitempty"`
+	ID         string          `json:"id"`
+	ContextID  string          `json:"context_id,omitempty"`
+	Source     EvidenceSource  `json:"source"`
+	Content    string          `json:"content"`
+	File       string          `json:"file,omitempty"`
+	Line       int             `json:"line,omitempty"`
+	Confidence float64         `json:"confidence"`
+	Strategy   string          `json:"strategy,omitempty"`
+	CreatedAt  time.Time       `json:"created_at"`
+	Label      string          `json:"label,omitempty"`
+	Categories []ErrorCategory `json:"categories,omitempty"`
 }
 
 type EvidenceStore struct {
@@ -198,6 +252,7 @@ func (es *EvidenceStore) AddWithContext(ctxID string, source EvidenceSource, con
 		Line:       line,
 		Confidence: confidence,
 		CreatedAt:  time.Now(),
+		Categories: ClassifyLogOutput(content),
 	}
 	es.evidence = append(es.evidence, *ev)
 	return &es.evidence[len(es.evidence)-1]
@@ -232,6 +287,19 @@ func (es *EvidenceStore) BySource(source EvidenceSource) []Evidence {
 	return filtered
 }
 
+func (es *EvidenceStore) ByCategory(cat ErrorCategory) []Evidence {
+	var filtered []Evidence
+	for _, ev := range es.evidence {
+		for _, c := range ev.Categories {
+			if c == cat {
+				filtered = append(filtered, ev)
+				break
+			}
+		}
+	}
+	return filtered
+}
+
 func (es *EvidenceStore) ByFile(file string) []Evidence {
 	var filtered []Evidence
 	for _, ev := range es.evidence {
@@ -250,6 +318,27 @@ func (es *EvidenceStore) HighConfidence(threshold float64) []Evidence {
 		}
 	}
 	return filtered
+}
+
+func (es *EvidenceStore) HasCategory(cat ErrorCategory) bool {
+	for _, ev := range es.evidence {
+		for _, c := range ev.Categories {
+			if c == cat {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (es *EvidenceStore) ByAnyCategory() map[ErrorCategory][]Evidence {
+	classified := make(map[ErrorCategory][]Evidence)
+	for _, ev := range es.evidence {
+		for _, c := range ev.Categories {
+			classified[c] = append(classified[c], ev)
+		}
+	}
+	return classified
 }
 
 func (es *EvidenceStore) Count() int {

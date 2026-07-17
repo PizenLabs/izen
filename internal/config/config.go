@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -117,6 +119,29 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("provider %q has no base_url configured", provider)
 	}
 	return nil
+}
+
+// SanitizeUsername removes any @ prefix and trims whitespace so the
+// username is clean for LLM display and prompt injection.
+func SanitizeUsername(rawName string) string {
+	cleaned := strings.TrimSpace(rawName)
+	cleaned = strings.TrimPrefix(cleaned, "@")
+	if cleaned == "" {
+		return "Developer"
+	}
+	return cleaned
+}
+
+// SanitizeForSession strips @username mentions from text to prevent legacy
+// identity references (e.g. @Jaky) from leaking into active session state.
+// It also removes any "Handoff context injected" marker contamination.
+func SanitizeForSession(text string) string {
+	result := text
+	atMentionRe := regexp.MustCompile(`@\w[\w.-]*`)
+	result = atMentionRe.ReplaceAllString(result, "[redacted]")
+	result = strings.ReplaceAll(result, "Handoff context injected.", "")
+	result = strings.TrimSpace(result)
+	return result
 }
 
 func configPath() string {

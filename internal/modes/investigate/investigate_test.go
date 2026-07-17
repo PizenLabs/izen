@@ -1055,6 +1055,371 @@ func TestEngineFormatLedgerForPlan(t *testing.T) {
 	}
 }
 
+func TestClassifyLogOutputCompilation(t *testing.T) {
+	cats := ClassifyLogOutput("cmd/api/main.go:7:5: no required module provides package github.com/docker/docker/client")
+	if len(cats) == 0 {
+		t.Fatal("expected at least 1 category")
+	}
+	hasComp := false
+	for _, c := range cats {
+		if c == ErrCatCompilation {
+			hasComp = true
+		}
+	}
+	if !hasComp {
+		t.Fatal("expected compilation error category")
+	}
+}
+
+func TestClassifyLogOutputEnvironment(t *testing.T) {
+	cats := ClassifyLogOutput("could not start mysql container: rootless Docker not found, failed to create Docker provider")
+	if len(cats) == 0 {
+		t.Fatal("expected at least 1 category")
+	}
+	hasEnv := false
+	for _, c := range cats {
+		if c == ErrCatEnvironment {
+			hasEnv = true
+		}
+	}
+	if !hasEnv {
+		t.Fatal("expected environment error category")
+	}
+}
+
+func TestClassifyLogOutputMultiFailure(t *testing.T) {
+	output := `cmd/api/main.go:7:5: no required module provides package github.com/docker/docker/client
+could not start mysql container: rootless Docker not found, failed to create Docker provider
+--- FAIL: TestDatabaseConnect`
+
+	cats := ClassifyLogOutput(output)
+	hasComp := false
+	hasEnv := false
+	hasTest := false
+	for _, c := range cats {
+		switch c {
+		case ErrCatCompilation:
+			hasComp = true
+		case ErrCatEnvironment:
+			hasEnv = true
+		case ErrCatTestFailure:
+			hasTest = true
+		}
+	}
+	if !hasComp {
+		t.Fatal("expected compilation error category in multi-failure")
+	}
+	if !hasEnv {
+		t.Fatal("expected environment error category in multi-failure")
+	}
+	if !hasTest {
+		t.Fatal("expected test failure category in multi-failure")
+	}
+}
+
+func TestClassifyLogOutputUnknown(t *testing.T) {
+	cats := ClassifyLogOutput("some random informational message")
+	if len(cats) != 1 || cats[0] != ErrCatUnknown {
+		t.Fatalf("expected unknown category, got %v", cats)
+	}
+}
+
+func TestHypothesisAddWithCategory(t *testing.T) {
+	hm := NewHypothesisManager()
+
+	h := hm.AddWithCategory("missing docker client dependency", HypCatBlockerCompilation)
+	if h.Category != HypCatBlockerCompilation {
+		t.Fatalf("expected blocker compilation category, got %s", h.Category)
+	}
+	if !h.IsBlocker {
+		t.Fatal("expected IsBlocker = true")
+	}
+	if h.Confidence != 1.0 {
+		t.Fatalf("expected confidence 1.0 for blocker, got %f", h.Confidence)
+	}
+
+	h2 := hm.AddWithCategory("Docker daemon not running", HypCatEnvironment)
+	if h2.Category != HypCatEnvironment {
+		t.Fatalf("expected environment category, got %s", h2.Category)
+	}
+	if h2.IsBlocker {
+		t.Fatal("expected IsBlocker = false for environment")
+	}
+	if h2.Confidence != 0.5 {
+		t.Fatalf("expected default confidence 0.5, got %f", h2.Confidence)
+	}
+
+	h3 := hm.Add("general theory")
+	if h3.Category != HypCatGeneral {
+		t.Fatalf("expected general category, got %s", h3.Category)
+	}
+}
+
+func TestHypothesisManagerByCategory(t *testing.T) {
+	hm := NewHypothesisManager()
+	hm.AddWithCategory("compilation error", HypCatBlockerCompilation)
+	hm.AddWithCategory("Docker missing", HypCatEnvironment)
+	hm.AddWithCategory("test failure", HypCatSourceCode)
+	hm.Add("general")
+
+	blockers := hm.ByCategory(HypCatBlockerCompilation)
+	if len(blockers) != 1 {
+		t.Fatalf("expected 1 blocker, got %d", len(blockers))
+	}
+
+	env := hm.ByCategory(HypCatEnvironment)
+	if len(env) != 1 {
+		t.Fatalf("expected 1 env hypothesis, got %d", len(env))
+	}
+
+	allBlockers := hm.Blockers()
+	if len(allBlockers) != 1 {
+		t.Fatalf("expected 1 blocker from Blockers(), got %d", len(allBlockers))
+	}
+}
+
+func TestEvidenceStoreByCategory(t *testing.T) {
+	es := NewEvidenceStore()
+
+	es.Add(EvSourceTest, "no required module provides package foo", "main.go", 7, 0.8)
+	es.Add(EvSourceTest, "rootless Docker not found", "", 0, 0.6)
+	es.Add(EvSourceTest, "some normal log message", "", 0, 0.3)
+
+	compEv := es.ByCategory(ErrCatCompilation)
+	if len(compEv) != 1 {
+		t.Fatalf("expected 1 compilation evidence, got %d", len(compEv))
+	}
+
+	envEv := es.ByCategory(ErrCatEnvironment)
+	if len(envEv) != 1 {
+		t.Fatalf("expected 1 environment evidence, got %d", len(envEv))
+	}
+
+	if !es.HasCategory(ErrCatCompilation) {
+		t.Fatal("expected HasCategory(ErrCatCompilation) = true")
+	}
+	if !es.HasCategory(ErrCatEnvironment) {
+		t.Fatal("expected HasCategory(ErrCatEnvironment) = true")
+	}
+}
+
+func TestEvidenceStoreByAnyCategory(t *testing.T) {
+	es := NewEvidenceStore()
+	es.Add(EvSourceTest, "no required module provides package foo", "main.go", 7, 0.8)
+	es.Add(EvSourceTest, "rootless Docker not found", "", 0, 0.6)
+
+	byCat := es.ByAnyCategory()
+	if len(byCat) < 2 {
+		t.Fatalf("expected at least 2 categories, got %d", len(byCat))
+	}
+}
+
+func TestEngineMultiFailureHypotheses(t *testing.T) {
+	multiOutput := `cmd/api/main.go:7:5: no required module provides package github.com/docker/docker/client
+could not start mysql container: rootless Docker not found, failed to create Docker provider
+--- FAIL: TestDatabaseConnect`
+
+	exec := newMockExecutor()
+	exec.allResult = &TestResultSummary{
+		Package: ".",
+		Passed:  false,
+		Total:   3,
+		FailedN: 2,
+		Failed:  []string{"TestDatabaseConnect"},
+		Output:  multiOutput,
+	}
+
+	eng := NewEngine(".", "test multi-failure diagnosis", nil, exec)
+	err := eng.stateObserve()
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+
+	err = eng.stateHypothesize()
+	if err != nil {
+		t.Fatalf("Hypothesize: %v", err)
+	}
+
+	blockers := eng.Hypotheses.Blockers()
+	if len(blockers) == 0 {
+		t.Fatal("expected at least 1 blocker hypothesis for compilation error")
+	}
+
+	envHyps := eng.Hypotheses.ByCategory(HypCatEnvironment)
+	if len(envHyps) == 0 {
+		t.Fatal("expected at least 1 environment hypothesis")
+	}
+
+	for _, b := range blockers {
+		if b.Confidence != 1.0 {
+			t.Fatalf("expected blocker confidence 1.0, got %f", b.Confidence)
+		}
+	}
+}
+
+func TestEngineEvaluateShortCircuitsCompilationBlocker(t *testing.T) {
+	exec := newMockExecutor()
+	exec.allResult = &TestResultSummary{
+		Package: ".",
+		Passed:  false,
+		Total:   1,
+		FailedN: 1,
+		Failed:  []string{"TestBuild"},
+		Output:  "no required module provides package github.com/docker/docker/client",
+	}
+
+	eng := NewEngine(".", "build failure", nil, exec)
+
+	_ = eng.stateObserve()
+	_ = eng.stateHypothesize()
+
+	_ = eng.State.Transition(StateSearch)
+	_ = eng.stateSearch()
+	_ = eng.State.Transition(StateGather)
+	_ = eng.stateGather()
+
+	err := eng.stateEvaluate()
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+
+	if eng.State.Current() != StateVerify && eng.State.Current() != StatePropose && eng.State.Current() != StateDone {
+		t.Fatalf("expected blocker to short-circuit, got state %s", eng.State.Current())
+	}
+}
+
+func TestEngineBlockerHypothesisIsCreatedInStateHypothesize(t *testing.T) {
+	exec := newMockExecutor()
+	exec.allResult = &TestResultSummary{
+		Package: ".",
+		Passed:  false,
+		FailedN: 1,
+		Failed:  []string{"TestBuild"},
+		Output:  "cmd/api/main.go:7:5: no required module provides package github.com/docker/docker/client",
+	}
+
+	eng := NewEngine(".", "missing module", nil, exec)
+	_ = eng.stateObserve()
+	_ = eng.stateHypothesize()
+
+	blockers := eng.Hypotheses.Blockers()
+	if len(blockers) == 0 {
+		t.Fatal("expected a blocker hypothesis for compilation error")
+	}
+
+	best := eng.Hypotheses.Best()
+	if best == nil || !best.IsBlocker {
+		t.Fatal("expected best hypothesis to be the blocker")
+	}
+	if best.Confidence != 1.0 {
+		t.Fatalf("expected blocker confidence 1.0, got %f", best.Confidence)
+	}
+}
+
+func TestStateProposeNilResultGuard(t *testing.T) {
+	eng := NewEngine(".", "test problem", nil, nil)
+	_ = eng.State.Transition(StateHypothesize)
+	_ = eng.State.Transition(StateSearch)
+	_ = eng.State.Transition(StateGather)
+	_ = eng.State.Transition(StateEvaluate)
+	_ = eng.State.Transition(StateVerify)
+	_ = eng.State.Transition(StatePropose)
+
+	err := eng.statePropose()
+	if err != nil {
+		t.Fatalf("statePropose on nil e.Result should not error: %v", err)
+	}
+	if eng.Result == nil {
+		t.Fatal("expected e.Result to be initialized after statePropose")
+	}
+	if !eng.State.IsTerminal() {
+		t.Fatal("expected terminal state after propose")
+	}
+}
+
+func TestShortCircuitEvaluateToProposeNoPanic(t *testing.T) {
+	exec := newMockExecutor()
+	exec.allResult = &TestResultSummary{
+		Package: ".",
+		Passed:  false,
+		Total:   1,
+		FailedN: 1,
+		Failed:  []string{"TestBuild"},
+		Output:  "no required module provides package github.com/docker/docker/client",
+	}
+
+	eng := NewEngine(".", "build failure", nil, exec)
+	_ = eng.stateObserve()
+	_ = eng.stateHypothesize()
+	_ = eng.State.Transition(StateSearch)
+	_ = eng.stateSearch()
+	_ = eng.State.Transition(StateGather)
+	_ = eng.stateGather()
+	err := eng.stateEvaluate()
+	if err != nil {
+		t.Fatalf("stateEvaluate: %v", err)
+	}
+
+	_current := eng.State.Current()
+	if _current != StatePropose {
+		t.Fatalf("expected StatePropose from short-circuit, got %s", _current)
+	}
+
+	err = eng.statePropose()
+	if err != nil {
+		t.Fatalf("statePropose should not panic on short-circuit: %v", err)
+	}
+	if eng.Result == nil {
+		t.Fatal("expected Result to be initialized")
+	}
+	if !eng.Result.Resolved {
+		t.Fatal("expected blocker to be resolved")
+	}
+}
+
+func TestShortCircuitFullRunContextNoPanic(t *testing.T) {
+	exec := newMockExecutor()
+	exec.allResult = &TestResultSummary{
+		Package: ".",
+		Passed:  false,
+		Total:   1,
+		FailedN: 1,
+		Failed:  []string{"TestBuild"},
+		Output:  "no required module provides package github.com/docker/docker/client\ncould not start mysql container: rootless Docker not found",
+	}
+
+	eng := NewEngine(".", "multi-failure build", nil, exec)
+	result, err := eng.Run()
+	if err != nil {
+		t.Fatalf("Run should not panic on short-circuit: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if !result.Resolved {
+		t.Fatal("expected blocker to be resolved")
+	}
+	if result.Loops < 1 || result.Loops > 3 {
+		t.Logf("short-circuit completed in %d loops (acceptable range: 1-3)", result.Loops)
+	}
+	if result.Duration == "" {
+		t.Fatal("expected non-empty duration")
+	}
+}
+
+func TestExtractFileFromCompilationError(t *testing.T) {
+	input := "cmd/api/main.go:7:5: no required module provides package foo"
+	file := extractFileFromCompilationError(input)
+	if file != "cmd/api/main.go:7" {
+		t.Fatalf("expected 'cmd/api/main.go:7', got %q", file)
+	}
+
+	empty := extractFileFromCompilationError("some random text")
+	if empty != "" {
+		t.Fatalf("expected empty, got %q", empty)
+	}
+}
+
 func TestAbs(t *testing.T) {
 	if abs(5) != 5 {
 		t.Fatal("abs(5) != 5")

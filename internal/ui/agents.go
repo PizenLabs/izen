@@ -39,24 +39,28 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 		defer cancel()
 
 		type outcome struct {
-			result *investigate.InvestigationResult
-			err    error
+			result        *investigate.InvestigationResult
+			err           error
+			ledgerForPlan string
 		}
 		outCh := make(chan outcome, 1)
 
 		go func() {
 			eng := investigate.NewEngine(".", content, nil, nil)
 			result, err := eng.RunContext(ctx)
-			outCh <- outcome{result: result, err: err}
+			ledgerContent := eng.FormatLedgerForPlan()
+			outCh <- outcome{result: result, err: err, ledgerForPlan: ledgerContent}
 		}()
 
 		var result *investigate.InvestigationResult
 		var engErr error
+		var ledgerForPlan string
 
 		select {
 		case o := <-outCh:
 			result = o.result
 			engErr = o.err
+			ledgerForPlan = o.ledgerForPlan
 		case <-ctx.Done():
 			engErr = fmt.Errorf("investigation timed out after 60s: %w", ctx.Err())
 		}
@@ -115,6 +119,7 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			sessionKey:        content,
 			err:               engErr,
 			escalationContent: esc,
+			ledgerContent:     ledgerForPlan,
 		}
 	}
 }

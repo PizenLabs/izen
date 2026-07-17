@@ -74,10 +74,19 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	if uname == "" {
 		uname = m.userName
 	}
-	if uname == "" {
-		uname = "developer"
-	}
 	systemPrompt := prompt.ForModeWithUser(m.resolver.Current().String(), uname)
+
+	// Inject identity context directly into the messages array so it lands
+	// near the user's current turn in the model's context window. This is
+	// critical for smaller models (e.g. Qwen 2.5 7B) that poorly attend to
+	// the system prompt but follow instructions embedded in the chat flow.
+	if identityLine := prompt.IdentityStatement(uname); identityLine != "" {
+		identityMsg := ai.Message{Role: "system", Content: identityLine}
+		// Insert right before the current user message
+		beforeUser := msgs[:len(msgs)-1]
+		rest := msgs[len(msgs)-1:]
+		msgs = append(append(beforeUser, identityMsg), rest...)
+	}
 
 	req := ai.Request{
 		Model:    m.cfg.ActiveModelName(),

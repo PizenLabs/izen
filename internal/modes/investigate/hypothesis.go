@@ -14,6 +14,15 @@ const (
 	HypothesisPending
 )
 
+type HypothesisCategory string
+
+const (
+	HypCatBlockerCompilation HypothesisCategory = "blocker_compilation"
+	HypCatEnvironment        HypothesisCategory = "environment"
+	HypCatSourceCode         HypothesisCategory = "source_code"
+	HypCatGeneral            HypothesisCategory = "general"
+)
+
 func (s HypothesisStatus) String() string {
 	switch s {
 	case HypothesisActive:
@@ -30,14 +39,16 @@ func (s HypothesisStatus) String() string {
 }
 
 type Hypothesis struct {
-	ID          string           `json:"id"`
-	Theory      string           `json:"theory"`
-	Status      HypothesisStatus `json:"status"`
-	Confidence  float64          `json:"confidence"`
-	EvidenceIDs []string         `json:"evidence_ids,omitempty"`
-	CreatedAt   time.Time        `json:"created_at"`
-	UpdatedAt   time.Time        `json:"updated_at"`
-	Tags        []string         `json:"tags,omitempty"`
+	ID          string             `json:"id"`
+	Theory      string             `json:"theory"`
+	Status      HypothesisStatus   `json:"status"`
+	Confidence  float64            `json:"confidence"`
+	Category    HypothesisCategory `json:"category"`
+	IsBlocker   bool               `json:"is_blocker"`
+	EvidenceIDs []string           `json:"evidence_ids,omitempty"`
+	CreatedAt   time.Time          `json:"created_at"`
+	UpdatedAt   time.Time          `json:"updated_at"`
+	Tags        []string           `json:"tags,omitempty"`
 }
 
 type HypothesisManager struct {
@@ -50,14 +61,24 @@ func NewHypothesisManager() *HypothesisManager {
 }
 
 func (hm *HypothesisManager) Add(theory string) *Hypothesis {
+	return hm.AddWithCategory(theory, HypCatGeneral)
+}
+
+func (hm *HypothesisManager) AddWithCategory(theory string, cat HypothesisCategory) *Hypothesis {
 	hm.nextID++
+	isBlocker := cat == HypCatBlockerCompilation
 	h := &Hypothesis{
 		ID:         fmt.Sprintf("H%d", hm.nextID),
 		Theory:     theory,
 		Status:     HypothesisActive,
 		Confidence: 0.5,
+		Category:   cat,
+		IsBlocker:  isBlocker,
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
+	}
+	if isBlocker {
+		h.Confidence = 1.0
 	}
 	hm.hypotheses = append(hm.hypotheses, *h)
 	return &hm.hypotheses[len(hm.hypotheses)-1]
@@ -118,6 +139,26 @@ func (hm *HypothesisManager) LinkEvidence(hypID, evID string) {
 		h.EvidenceIDs = append(h.EvidenceIDs, evID)
 		h.UpdatedAt = time.Now()
 	}
+}
+
+func (hm *HypothesisManager) ByCategory(cat HypothesisCategory) []Hypothesis {
+	var filtered []Hypothesis
+	for _, h := range hm.hypotheses {
+		if h.Category == cat {
+			filtered = append(filtered, h)
+		}
+	}
+	return filtered
+}
+
+func (hm *HypothesisManager) Blockers() []Hypothesis {
+	var blockers []Hypothesis
+	for _, h := range hm.hypotheses {
+		if h.IsBlocker || h.Category == HypCatBlockerCompilation {
+			blockers = append(blockers, h)
+		}
+	}
+	return blockers
 }
 
 func (hm *HypothesisManager) Count() int {

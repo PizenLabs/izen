@@ -216,6 +216,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamParser = nil
 		m.pushRecords(msg.records)
 		m.push(roleSystem, "Diagnostics collected. Analyzing...")
+		// Store the raw Context-Ledger data before anything else — this is
+		// the authoritative source for handoff, not the LLM's transient output.
+		m.handoffLedgerContent = msg.ledgerContent
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
@@ -314,15 +317,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// When verification fails after a build patch, silently trigger
 			// a recovery cycle: re-read the file, re-generate a corrected
 			// AST block, and re-apply — without producing any UI chatter.
+			//
+			// RULE B: If the failure is caused by missing Go modules (e.g.,
+			// "no required module provides package" or "to add it: go get"),
+			// halt the recovery loop immediately. Do NOT waste recovery
+			// attempts on import hallucinations — the .go imports are valid,
+			// the dependency just needs to be fetched.
 			if !msg.passed && m.resolver.Current() == modes.ModeBuild &&
 				m.buildRecoveryCount < maxBuildRecoveryAttempts {
-				m.buildRecoveryCount++
-				m.acceptAll = true
-				m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
-					"⚙ [recovery %d/%d] auto-correcting compilation errors...",
-					m.buildRecoveryCount, maxBuildRecoveryAttempts)))
-				flush := m.flushPendingRecords()
-				return m, tea.Batch(flush, m.runFixCmd(""))
+				if hasMissingModuleError(msg.output) {
+					m.acceptAll = false
+					m.push(roleError, "[BUILD HALTED] Build failed due to missing Go module dependency. Auto-recovery cannot fix import paths. Run 'go get <package>' manually, then retry.")
+				} else {
+					m.buildRecoveryCount++
+					m.acceptAll = true
+					m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
+						"⚙ [recovery %d/%d] auto-correcting compilation errors...",
+						m.buildRecoveryCount, maxBuildRecoveryAttempts)))
+					flush := m.flushPendingRecords()
+					return m, tea.Batch(flush, m.runFixCmd(""))
+				}
 			}
 
 			// If recovery exhausted or verification passed, expose the
@@ -838,13 +852,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			if m.pipelineStep == "blueprinting" && final != "" {
-				// Step 2 complete → blueprint is ready, jump to build execution
+				// Step 2 complete → blueprint is ready, but auto-build is blocked
 				pipelineID := ""
 				if m.ledger != nil {
 					pipelineID = fmt.Sprintf("#%d", m.ledger.ActiveID)
 				}
-				m.pipelineRunning = false
-				m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Pipeline complete [%s]. Switched to /build.", pipelineID)))
+				m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Pipeline complete [%s].", pipelineID)))
 				flush := m.flushPendingRecords()
 				return m, tea.Batch(flush, func() tea.Msg {
 					return blueprintReadyMsg{blueprint: final, ledgerID: pipelineID}
@@ -855,8 +868,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// ── Handoff: Capture ProposedFix from investigate mode ──────────
 		// The "Formulate Execution Plan" capability is derived from
 		// handoffCtx.ProposedFix in BuildViewContext; no UI cache to refresh.
+		//
+		// DATA HIERARCHY (Context-Ledger > Transaction Cache):
+		// 1. handoffLedgerContent (structured Context-Ledger from the
+		//    investigate engine's FormatLedgerForPlan) — authoritative SSOT.
+		// 2. LastFailurePayload (raw compilation errors / test output).
+		// 3. LLM output (final) — transient Transaction Cache, used only
+		//    as a last resort when all structured sources are empty.
+		// This prevents context poisoning where /plan receives a generic
+		// greeting instead of actual engineering diagnostics.
 		if m.resolver.Current() == modes.ModeInvestigate && final != "" {
-			m.handoffCtx.ProposedFix = final
+			switch {
+			case m.handoffLedgerContent != "":
+				m.handoffCtx.ProposedFix = m.handoffLedgerContent
+			case m.handoffCtx.LastFailurePayload != "" && IsGenericGreeting(final):
+				m.handoffCtx.ProposedFix = m.handoffCtx.LastFailurePayload
+			default:
+				m.handoffCtx.ProposedFix = final
+			}
 		}
 
 		// ── Auto-transition: investigate → build on mutation detection ──
@@ -881,6 +910,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// ── FORCED ROUTING TO /plan ──────────────────────────
 					// Structural errors require a deliberate design phase
 					// before any patching is attempted.
+					// Save handoff data and clear auto-trigger sources so
+					// setMode does NOT double-fire the plan engine.
+					savedLastFailure := m.handoffCtx.LastFailurePayload
+					savedProposedFix := m.handoffCtx.ProposedFix
+					m.handoffCtx.ProposedFix = ""
+					m.handoffCtx.LastFailurePayload = ""
+					m.handoffLedgerContent = ""
+
 					m.push(roleSystem, warningBannerStyle.Render(
 						"[!] Compile failure detected — routing to /plan for structured recovery."))
 					m.push(roleSystem, infoStyle.Render(
@@ -899,10 +936,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						"- For each error, specify the minimal corrective change\n" +
 						"- Output each fix as a separate task with file target and description\n\n" +
 						"### Compilation Errors\n```\n" +
-						m.handoffCtx.LastFailurePayload +
+						savedLastFailure +
 						"\n```\n" +
 						"### Root Cause Analysis\n" +
-						m.handoffCtx.ProposedFix
+						CleanHandoffPayload(savedProposedFix)
 
 					m.currentPrompt = recoveryPrompt
 					m.streamCh = nil
@@ -913,13 +950,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Batch(flush, m.streamCmd(recoveryPrompt))
 				}
 
-				// No compile failure — safe to auto-transition to /build
-				m.push(roleSystem, infoStyle.Render("File mutation detected. Switched to /build."))
-				m.setMode(modes.ModeBuild)
-				m.lastTestOutput = m.handoffCtx.ProposedFix
+				// ── HANDOFF DATA PRESERVATION ───────────────────────────
+				// ProposedFix is intentionally kept intact so the Action Chip
+				// remains available for the user to manually trigger the
+				// investigate → plan transition via the workspace. The user
+				// has full agency to click the chip or type /plan manually;
+				// the auto-trigger in setMode will handle the execution.
+				m.push(roleSystem, infoStyle.Render(
+					"Mutation proposals detected. Use the capability chip or /plan to formulate an execution plan."))
 				flush := m.flushPendingRecords()
 				m.refreshViewportContent()
-				return m, tea.Batch(flush, m.runFixCmd(""))
+				return m, flush
 			}
 		}
 
@@ -1377,6 +1418,29 @@ func detectCompileFailure(output string) bool {
 		"undefined:",
 		"not enough arguments",
 		"too many errors",
+	}
+	for _, ind := range indicators {
+		if strings.Contains(lower, ind) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasMissingModuleError detects Go missing-dependency errors in build/test
+// output. When a build fails because a module is not in go.sum/go.mod, the
+// compiler prints "no required module provides package" or hints "to add it:
+// go get". These errors cannot be fixed by editing .go files — they require
+// running go get <package>. Returns true if any such pattern is found.
+func hasMissingModuleError(output string) bool {
+	if output == "" {
+		return false
+	}
+	lower := strings.ToLower(output)
+	indicators := []string{
+		"no required module provides package",
+		"to add it: go get",
+		"missing go.sum entry for module",
 	}
 	for _, ind := range indicators {
 		if strings.Contains(lower, ind) {

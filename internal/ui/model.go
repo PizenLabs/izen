@@ -95,6 +95,7 @@ type investigateResultMsg struct {
 	sessionKey        string
 	err               error
 	escalationContent string // when Resolved=false, pipe investigation data to LLM for analysis
+	ledgerContent     string // FormatLedgerForPlan() — structured Context-Ledger data, the SSOT for handoff
 }
 
 type reviewResultMsg struct {
@@ -625,6 +626,12 @@ type model struct {
 	// This survives mode transitions and must never be cleared to hide UI.
 	handoffCtx HandoffContext
 
+	// handoffLedgerContent stores the raw Context-Ledger output from the
+	// investigate engine (FormatLedgerForPlan). It is the authoritative
+	// Single Source of Truth for mode-to-mode handoffs — preferred over
+	// the transient LLM output text (Transaction Cache).
+	handoffLedgerContent string
+
 	// currentResult is the most recent workflow RESULT and the capabilities it
 	// exposes. It is DOMAIN state (the engine's current outcome) — NOT a UI
 	// flag. The renderer never reads it directly; it flows through
@@ -641,6 +648,18 @@ type model struct {
 	// Build auto-recovery counter: tracks retry attempts after persistent
 	// build failure during verification. Reset on mode entry and clear.
 	buildRecoveryCount int
+
+	// modeChangeAuthorized is set true ONLY when the user explicitly types a
+	// mode-switch command (/build, /plan, /mode build). Auto-transitions from
+	// the execution pipeline or investigate→build detection are blocked unless
+	// this flag is true. Reset to false after every setMode call.
+	modeChangeAuthorized bool
+
+	// planApproved tracks whether the current plan has been generated and
+	// approved by the user. Once true, the engine permits direct transition
+	// to /build without re-entering /plan. Set true on successful plan→build
+	// transition. Reset to false when entering /plan or /investigate.
+	planApproved bool
 
 	// Context Ledger: silent issue tracking across failure sessions
 	ledger *ContextLedger
@@ -874,7 +893,8 @@ func (m *model) renderRecordForViewport(rec record) string {
 
 	switch rec.role {
 	case roleUser:
-		userHeader := dimmedStyle.Render("@" + m.userName + "  ")
+		displayName := config.SanitizeUsername(m.userName)
+		userHeader := dimmedStyle.Render("@" + displayName + "  ")
 		paddedText := " " + rec.text
 		padNeeded := width - lipgloss.Width(userHeader) - lipgloss.Width(paddedText) - 1
 		if padNeeded > 0 {

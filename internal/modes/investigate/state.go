@@ -133,7 +133,7 @@ func (sm *StateMachine) canTransition(to State) bool {
 	case StateGather:
 		return to == StateEvaluate
 	case StateEvaluate:
-		return to == StateNarrow || to == StateVerify || to == StateHypothesize
+		return to == StateNarrow || to == StateVerify || to == StateHypothesize || to == StatePropose
 	case StateNarrow:
 		return to == StateHypothesize || to == StateSearch
 	case StateVerify:

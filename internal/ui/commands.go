@@ -20,6 +20,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/domain"
 	objengine "github.com/PizenLabs/izen/internal/engine"
@@ -125,11 +126,12 @@ func (m *model) handleInput(line string) tea.Cmd {
 	}
 
 	if mode, content, ok := parseModeShorthand(line); ok {
-		m.setMode(mode)
-		if content == "" {
-			return nil
+		m.modeChangeAuthorized = true
+		if content != "" {
+			m.setMode(mode)
+			return m.handleMessageContent(content)
 		}
-		return m.handleMessageContent(content)
+		return m.setMode(mode)
 	}
 
 	if strings.HasPrefix(line, "/") {
@@ -384,9 +386,32 @@ func parseModeShorthand(line string) (modes.Mode, string, bool) {
 	return modes.ModeAsk, "", false
 }
 
-func (m *model) setMode(mode modes.Mode) {
+func (m *model) setMode(mode modes.Mode) tea.Cmd {
+	// ── RULE A: STRICT MODE TRANSITION GATEKEEPER ──────────────────────
+	// Auto-transitions to /build from non-build modes are blocked unless
+	// the user explicitly authorized the switch by typing a mode command
+	// OR the plan has already been approved in this execution cycle.
+	if !m.modeChangeAuthorized && !m.planApproved && mode == modes.ModeBuild && m.resolver.Current() != modes.ModeBuild {
+		m.push(roleError, "State Transition Blocked: File modifications are only allowed inside /build mode after /plan approval. Please run /plan first, then use /build.")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+	m.modeChangeAuthorized = false
+
 	m.investigateInvocationCount = 0 // Unconditional state clearance to avoid hard lockout bugs during testing
 	m.buildRecoveryCount = 0         // Reset auto-recovery counter on every mode transition
+
+	// ── Plan-Approved Lifecycle ────────────────────────────────────────
+	// Entering /plan or /investigate starts a new cycle — reset approval.
+	if mode == modes.ModePlan || mode == modes.ModeInvestigate {
+		m.planApproved = false
+	}
+	// Transitioning from /plan to /build marks the plan as approved so
+	// the orchestrator never re-enters /plan for the same execution cycle.
+	if mode == modes.ModeBuild && m.resolver.Current() == modes.ModePlan {
+		m.planApproved = true
+	}
 
 	// ── ABSOLUTE STALE GOROUTINE RELEASE ON MODE ENTRY ────────────────
 	// Before any mode transition, cancel all in-flight background contexts,
@@ -398,7 +423,7 @@ func (m *model) setMode(mode modes.Mode) {
 	m.buildVerifyPending = false
 
 	if mode == m.resolver.Current() {
-		return
+		return nil
 	}
 	m.startModeTransition(mode)
 	// ── Reset view-scoped workflow result on mode entry ────────────────
@@ -419,8 +444,66 @@ func (m *model) setMode(mode modes.Mode) {
 	// previous mode's terminal event.
 	m.injectHandoffContext(mode)
 
+	// ── AUTO-TRIGGER ENFORCEMENT ───────────────────────────────────────
+	// If handoff context was injected for /plan or /build, immediately
+	// trigger the mode's execution engine instead of waiting for user input.
+	// This prevents mode stagnation where the LLM receives handoff data as
+	// passive chat history but produces open-ended chatbot responses.
+	if !m.streaming && !m.agentRunning && !m.pipelineRunning {
+		if handoffContent := m.buildHandoffTriggerContent(mode); handoffContent != "" {
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m.handleMessageContent(handoffContent)
+		}
+	}
+
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
+	return nil
+}
+
+// buildHandoffTriggerContent constructs the execution query for auto-triggering
+// /plan or /build mode when handoff context from a previous mode exists.
+// Returns empty string when no handoff data is available for the given mode,
+// preventing any open-ended conversational fallback.
+func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
+	switch mode {
+	case modes.ModePlan:
+		switch {
+		case m.handoffLedgerContent != "":
+			return "## HANDOFF PLAN EXECUTION\n\n" +
+				"Synthesize the execution plan based on the investigation ledger below.\n" +
+				"Output a structured task list with file targets, step numbers, and descriptions.\n" +
+				"Do NOT ask for clarification — execute the plan synthesis immediately.\n\n" +
+				m.handoffLedgerContent
+		case m.handoffCtx.ProposedFix != "":
+			return "## HANDOFF PLAN EXECUTION\n\n" +
+				"Formulate an execution plan for the proposed fix:\n\n" +
+				m.handoffCtx.ProposedFix
+		case m.handoffCtx.LastFailurePayload != "":
+			return "## HANDOFF PLAN EXECUTION\n\n" +
+				"Analyze the following failure and produce a structured recovery plan:\n\n" +
+				m.handoffCtx.LastFailurePayload
+		}
+	case modes.ModeBuild:
+		switch {
+		case len(m.handoffCtx.PendingTodos) > 0:
+			var b strings.Builder
+			b.WriteString("## HANDOFF BUILD EXECUTION\n\n")
+			b.WriteString("Execute the following planned tasks and output code patches directly.\n")
+			b.WriteString("Do NOT restate the plan or ask for approval — produce the mutations now.\n\n")
+			for i, todo := range m.handoffCtx.PendingTodos {
+				fmt.Fprintf(&b, "Task %d: %s\n", i+1, todo)
+			}
+			return b.String()
+		case m.handoffCtx.ProposedFix != "":
+			return "## HANDOFF BUILD EXECUTION\n\n" +
+				"Execute the proposed fix below and output the code patches.\n" +
+				"Do NOT restate the plan or ask for approval — produce the mutations now.\n\n" +
+				m.handoffCtx.ProposedFix
+		}
+	}
+	return ""
 }
 
 func (m *model) handleCommand(cmd string) tea.Cmd {
@@ -477,8 +560,8 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		if len(parts) == 2 {
 			mode, ok := modes.Parse(parts[1])
 			if ok {
-				m.setMode(mode)
-				return nil
+				m.modeChangeAuthorized = true
+				return m.setMode(mode)
 			}
 		}
 		m.push(roleSystem, infoStyle.Render("usage: /mode <ask|plan|build|investigate|review>"))
@@ -1322,61 +1405,19 @@ func (m *model) handleBlueprintReady(msg blueprintReadyMsg) tea.Cmd {
 	m.acceptedProposals = nil
 	m.pendingProposals = nil
 
-	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Blueprint ready [%s]. Switched to /build.", msg.ledgerID)))
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Blueprint ready [%s].", msg.ledgerID)))
 
-	// ── Explicit UI mode transition to /build ──────────────────────────
-	// The exact millisecond the patch blueprint is finalized, we transition.
-	m.setMode(modes.ModeBuild)
-	m.lastTestOutput = msg.blueprint
-
-	// Reset pipeline flag so the normal boring path finishes cleanly
+	// ── RULE A: BLOCKED AUTO-TRANSITION TO /build ──────────────────────
+	// The pipeline blueprint is ready, but auto-transitioning to /build
+	// is blocked. The user must explicitly switch to /build.
+	m.push(roleError, "State Transition Blocked: File modifications are only allowed inside /build mode after /plan approval. Please run /plan first, then use /build.")
+	m.handoffCtx.ProposedFix = msg.blueprint
 	m.pipelineRunning = false
-
 	m.streamCh = nil
 	m.streaming = false
 	m.streamParser = nil
 	flush := m.flushPendingRecords()
-
-	// Dispatch the fix command with our blueprint as the failure content
-	return tea.Batch(
-		flush,
-		func() tea.Msg {
-			frames := investigate.ParseStackFrames(msg.blueprint)
-			var fixCtx strings.Builder
-			fixCtx.WriteString("## FIX BLUEPRINT\n\n```\n")
-			fixCtx.WriteString(msg.blueprint)
-			fixCtx.WriteString("\n```\n\n")
-
-			if len(frames) > 0 {
-				fixCtx.WriteString("## STACK TRACE → SOURCE PROXIMITY\n\n")
-				slicer := investigate.NewProximitySlicer(".", 10)
-				seen := make(map[string]bool)
-				for _, frame := range frames {
-					key := fmt.Sprintf("%s:%d", frame.File, frame.Line)
-					if seen[key] {
-						continue
-					}
-					seen[key] = true
-					slice := slicer.Extract(frame)
-					if slice != nil {
-						fmt.Fprintf(&fixCtx, "### %s:%d\n\n```go\n", slice.File, slice.Line)
-						for _, cline := range slice.Context {
-							fixCtx.WriteString(cline)
-							fixCtx.WriteString("\n")
-						}
-						fixCtx.WriteString("```\n\n")
-					}
-				}
-			}
-
-			fixCtx.WriteString("## INSTRUCTION\n")
-			fixCtx.WriteString("This is build mode — Execution-Only. Implement the fix blueprint above. ")
-			fixCtx.WriteString("Output ONLY the minimal unified diff or complete file replacement. ")
-			fixCtx.WriteString("Do NOT analyze, explain, or restate the problem.\n")
-
-			return fixResultMsg{content: fixCtx.String()}
-		},
-	)
+	return flush
 }
 
 // ── Workflow lifecycle: context cancellation for stale goroutine release ──
@@ -1985,17 +2026,75 @@ func (m *model) resetObjectiveContextStacks() {
 
 // ── Handoff Pipeline ───────────────────────────────────────────────────────────
 
+// ── Greeting-Detection Guards ──────────────────────────────────────────────────
+
+var genericGreetingPatterns = []string{
+	"I am IZEN",
+	"How can I assist you",
+	"What are things like for you today",
+	"Hello!",
+	"Hi there",
+}
+
+// IsGenericGreeting detects whether a string is a generic fallback greeting
+// rather than substantive engineering analysis output.
+func IsGenericGreeting(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 20 {
+		return false
+	}
+	lower := strings.ToLower(s)
+	for _, p := range genericGreetingPatterns {
+		if strings.Contains(lower, strings.ToLower(p)) {
+			return true
+		}
+	}
+	return false
+}
+
+// CleanHandoffPayload strips generic greeting content from handoff payloads,
+// retaining only substantive engineering content (error logs, diagnostics, etc.).
+// If the entire payload is a greeting with no engineering content, returns "".
+func CleanHandoffPayload(payload string) string {
+	if !IsGenericGreeting(payload) {
+		return payload
+	}
+	var builder strings.Builder
+	for _, line := range strings.Split(payload, "\n") {
+		trimmed := strings.TrimSpace(line)
+		isGreeting := false
+		for _, p := range genericGreetingPatterns {
+			if strings.Contains(strings.ToLower(trimmed), strings.ToLower(p)) {
+				isGreeting = true
+				break
+			}
+		}
+		if !isGreeting {
+			if builder.Len() > 0 {
+				builder.WriteString("\n")
+			}
+			builder.WriteString(line)
+		}
+	}
+	return strings.TrimSpace(builder.String())
+}
+
 // injectHandoffContext primes the target mode with contextual state from the
 // previous mode. Called during setMode when a handoff context is available.
 func (m *model) injectHandoffContext(mode modes.Mode) {
 	switch mode {
 	case modes.ModeInvestigate:
 		if m.handoffCtx.LastFailurePayload != "" {
+			sanitized := config.SanitizeForSession(m.handoffCtx.LastFailurePayload)
+			m.handoffCtx.LastFailurePayload = sanitized
 			m.push(roleSystem, "Handoff context injected.")
 		}
 
 	case modes.ModePlan:
 		if m.handoffCtx.ProposedFix != "" {
+			cleaned := CleanHandoffPayload(m.handoffCtx.ProposedFix)
+			sanitized := config.SanitizeForSession(cleaned)
+			m.handoffCtx.ProposedFix = sanitized
 			if len(m.handoffCtx.PendingTodos) == 0 {
 				m.handoffCtx.PendingTodos = parseProposedFixIntoTodos(m.handoffCtx.ProposedFix)
 			}
@@ -2006,6 +2105,7 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 
 	case modes.ModeBuild:
 		if len(m.handoffCtx.PendingTodos) > 0 || m.handoffCtx.ProposedFix != "" {
+			m.handoffCtx.ProposedFix = config.SanitizeForSession(m.handoffCtx.ProposedFix)
 			m.createBuildCheckpoint(0)
 			m.push(roleSystem, "Handoff context injected. Checkpoint created.")
 		}
@@ -2033,10 +2133,18 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 	if len(parts) >= 2 && parts[0] == "/mode" {
 		mode, ok := modes.Parse(parts[1])
 		if ok {
-			m.setMode(mode)
+			m.modeChangeAuthorized = true
 			if action.Query != "" {
+				// Suppress setMode auto-trigger — the explicit Query takes precedence.
+				// Clear handoff sources so setMode does not start a redundant stream.
+				// Handoff data is already captured in action.Query from workspace
+				// build time — the Query is the canonical payload.
+				m.handoffCtx.ProposedFix = ""
+				m.handoffLedgerContent = ""
+				m.setMode(mode)
 				return m.handleMessageContent(action.Query)
 			}
+			return m.setMode(mode)
 		}
 		return nil
 	}
