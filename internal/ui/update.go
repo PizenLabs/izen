@@ -262,6 +262,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the authoritative source for handoff, not the LLM's transient output.
 		m.handoffLedgerContent = ctxpkg.SanitizeLedger(msg.ledgerContent)
 
+		// Capture the structured forensic ledger so bridgeInvestigationToLedger
+		// can inject its findings as sequential, ID-addressed packets into the
+		// canonical session.ContextLedger.
+		m.lastInvestigateLedger = msg.investigateLedger
+
 		// BRIDGE: project read-only forensic findings into the canonical
 		// session.ContextLedger (handoff SSOT) for downstream /plan consumption.
 		m.bridgeInvestigationToLedger(m.handoffLedgerContent, msg.err)
@@ -913,6 +918,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tokenMsg:
+		// LOCK-FREE CONSUMER: this per-token handler MUST NOT acquire any
+		// ContextLedger / TaskLedger mutex. It only appends to local buffers
+		// and schedules the next read. The ledger is committed once, at EOF,
+		// by the streamDoneMsg handler below. Holding a ledger lock here would
+		// serialize the stream against the renderer and reproduce the
+		// 108-token freeze.
 		raw := string(msg)
 		m.responseBuffer.WriteString(raw)
 		m.streamBuffer += raw
@@ -1291,6 +1302,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// No tea.Println scrollback flush — prevents double-rendering in
 		// terminal scrollback vs Bubble Tea viewport.
 
+		// Clear planPending flag to prevent spinner lock on plan mode completion.
+		m.planPending = false
+
 		m.refreshViewportContent()
 		return m, nil
 
@@ -1299,6 +1313,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streaming = false
 		m.streamParser = nil
 		m.streamCancel = nil
+		m.planPending = false
 
 		// User-initiated interrupt — suppress error noise, just clean up.
 		if m.interruptRequested {
@@ -1332,6 +1347,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pipelineStep = ""
 		m.streaming = false
 		m.streamCh = nil
+		m.planPending = false
 		if m.streamCancel != nil {
 			m.streamCancel()
 			m.streamCancel = nil

@@ -34,6 +34,20 @@ func (m *model) bridgeInvestigationToLedger(ledgerContent string, engErr error) 
 		ledger.Diagnostics = strings.Join(diag, "\n")
 	}
 
+	// Inject the forensic findings as sequential, ID-addressed packets so the
+	// next mode (/plan) can process each item deterministically and the
+	// Developer retains addressable state across the transition. The findings
+	// arrive via the investigate engine's structured ledger, projected through
+	// ToPackets; InjectPacket assigns the monotonic PacketIDs.
+	if m.lastInvestigateLedger != nil {
+		for _, p := range m.lastInvestigateLedger.ToPackets() {
+			ledger.InjectPacket(p)
+		}
+		if m.lastInvestigateLedger.Diagnostics != "" {
+			ledger.Diagnostics = m.lastInvestigateLedger.Diagnostics
+		}
+	}
+
 	m.sess.SetContextLedger(ledger)
 }
 
@@ -174,6 +188,13 @@ func (m *model) primeHandoffFromLedger(mode modes.Mode) {
 		}
 		fmt.Fprintf(&b, "- Diagnostics Error Log:\n```\n%s\n```\n", l.Diagnostics)
 		m.handoffLedgerContent = b.String()
+	}
+
+	// Surface the sequential, ID-addressed analytical packets so the /plan
+	// engine processes each one deterministically by its PacketID. The packets
+	// preserve the full forensic signal — no blind truncation across modes.
+	if packets := l.FormatPacketsForPlan(); packets != "" {
+		m.handoffLedgerContent += "\n\n" + packets + "\n"
 	}
 
 	// Mirror into the legacy handoff context so injectHandoffContext and the

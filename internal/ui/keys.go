@@ -132,8 +132,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.dismissSuggestions()
 			return m, nil
 		}
-		if m.agentRunning || m.streaming || m.reviewRunning || m.pipelineRunning {
+		if m.agentRunning || m.streaming || m.reviewRunning || m.pipelineRunning || m.planPending {
 			execution.KillAllOrphans()
+			m.cancelAllBackgroundContexts()
 			m.push(roleSystem, infoStyle.Render("Interrupted."))
 			return m, func() tea.Msg { return TaskFinishedMsg{} }
 		}

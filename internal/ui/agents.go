@@ -13,6 +13,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/review"
 	"github.com/PizenLabs/izen/internal/prompt"
+	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
 func (m *model) runInvestigateCmd(content string) tea.Cmd {
@@ -44,25 +45,30 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			result        *investigate.InvestigationResult
 			err           error
 			ledgerForPlan string
+			engLedger     *investigate.ContextLedger
 		}
 		outCh := make(chan outcome, 1)
 
 		go func() {
-			eng := investigate.NewEngine(".", content, nil, nil)
+			retriever := investigate.NewRetrieverAdapter(retrieval.NewRetriever(".", m.graph))
+			executor := investigate.NewShellTestExecutor(".")
+			eng := investigate.NewEngine(".", content, retriever, executor)
 			result, err := eng.RunContext(ctx)
 			ledgerContent := eng.FormatLedgerForPlan()
-			outCh <- outcome{result: result, err: err, ledgerForPlan: ledgerContent}
+			outCh <- outcome{result: result, err: err, ledgerForPlan: ledgerContent, engLedger: eng.Ledger}
 		}()
 
 		var result *investigate.InvestigationResult
 		var engErr error
 		var ledgerForPlan string
+		var engLedger *investigate.ContextLedger
 
 		select {
 		case o := <-outCh:
 			result = o.result
 			engErr = o.err
 			ledgerForPlan = o.ledgerForPlan
+			engLedger = o.engLedger
 		case <-ctx.Done():
 			engErr = fmt.Errorf("investigation timed out after 60s: %w", ctx.Err())
 		}
@@ -125,6 +131,7 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			err:               engErr,
 			escalationContent: esc,
 			ledgerContent:     ledgerForPlan,
+			investigateLedger: engLedger,
 		}
 	}
 }

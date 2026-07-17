@@ -152,6 +152,16 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// deferred close(m.streamCh) would panic with "close of nil channel".
 	streamCh := m.streamCh
 
+	// STREAM CONSUMER CONTRACT (deadlock-free):
+	// This producer goroutine is the ONLY place that reads from the LLM stream.
+	// It MUST NOT acquire any ContextLedger / TaskLedger mutex while waiting for
+	// the next token: it merely reads a chunk, appends to a local `full`
+	// builder, and dispatches an immutable tokenMsg to the UI channel. All
+	// ledger state is committed ONCE, at io.EOF, by the streamDoneMsg handler
+	// on the main Bubble Tea goroutine — never per-token. Holding a ledger lock
+	// here would serialize the token loop against the TUI renderer and freeze
+	// the stream (the historical 108-token stall). The producer only touches
+	// the channel, the local buffer, and the captured `streamCh`/`cancel`.
 	go func() {
 		defer close(streamCh)
 		defer cancel()

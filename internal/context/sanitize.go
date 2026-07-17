@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/session"
 )
 
 // ── Ledger Handoff Sanitizer ──────────────────────────────────────────────────
@@ -22,73 +23,70 @@ import (
 // specific error or path.
 
 var (
-	ansiRE          = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
-	stackFrameRE    = regexp.MustCompile(`^\s*(?:[a-zA-Z0-9_./\-]+\.(?:go|rs|js|ts|py):\d+|[a-zA-Z0-9_./\-]+\([^)]*\)|\t[a-zA-Z0-9_.\*/]+\.[a-zA-Z0-9_]+)`)
-	runtimeLogRE    = regexp.MustCompile(`(?im)^\s*(?:time=|level=|container (?:id|setup)|rootless|docker[d]? (?:daemon|engine)|pulling image|downloading|extracting layer|golang\.org)|pulling image|^\s*goroutine \d+ \[`)
-	dupBlankLineRE  = regexp.MustCompile(`\n{3,}`)
-	keyValueNoiseRE = regexp.MustCompile(`(?im)^\s*(?:(?:trace|debug|info|warn|verbose)\s*[:=].*)$`)
+	ansiRE         = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+	dupBlankLineRE = regexp.MustCompile(`\n{3,}`)
 )
 
 // SanitizeLedger returns a slimmed, de-duplicated version of the raw ledger
-// handoff content. It never hardcodes specific errors; it applies structural
-// noise reduction only. Empty / already-clean input passes through unchanged.
+// handoff content. It applies ONLY structural noise reduction:
+//   - strip ANSI escapes (display artifacts, never signal)
+//   - collapse 3+ blank lines to a single blank line
+//
+// It deliberately does NOT drop per-line content. The previous implementation
+// stripped runtime/container log lines and collapsed stack frames, which
+// destroyed structured diagnostic signal (e.g. the offending dependency in a
+// "no required module provides package" error, or "rootless docker not found"
+// environment blockers) and broke state continuity between modes. Per the Izen
+// Lifecycle Philosophy, the operational data structure must be preserved — only
+// display noise is removed. Empty / already-clean input passes through unchanged.
 func SanitizeLedger(raw string) string {
 	if strings.TrimSpace(raw) == "" {
 		return raw
 	}
 
-	// 1. Strip ANSI escapes.
+	// 1. Strip ANSI escapes (display artifacts, never signal).
 	clean := ansiRE.ReplaceAllString(raw, "")
 
-	// 2. Drop per-line noise: log-level chatter and verbose runtime/container
-	//    setup lines that carry no failure signal. Whole lines are removed.
-	clean = keyValueNoiseRE.ReplaceAllString(clean, "")
-	clean = dropMatchingLines(clean, runtimeLogRE)
-
-	// 3. Collapse repeated stack frames. Stack traces repeat the same frames
-	//    across panic/retry boundaries; keep each unique frame once, preserving
-	//    first-seen order so the actionable tail survives.
-	clean = collapseStackFrames(clean)
-
-	// 4. Normalize whitespace: collapse 3+ blank lines, trim trailing space.
+	// 2. Normalize whitespace only — preserve every diagnostic line. Collapse
+	//    3+ blank lines to a single blank line so the payload stays compact
+	//    without losing structural content.
 	clean = dupBlankLineRE.ReplaceAllString(clean, "\n\n")
 	clean = strings.TrimSpace(clean)
 
 	return clean
 }
 
-// dropMatchingLines removes any line that matches re entirely, collapsing the
-// resulting gap so the output stays compact.
-func dropMatchingLines(s string, re *regexp.Regexp) string {
-	var b strings.Builder
-	for _, line := range strings.Split(s, "\n") {
-		if re.MatchString(line) {
-			continue
-		}
-		b.WriteString(line)
-		b.WriteByte('\n')
+// SanitizeLedgerPreserve is the canonical sanitizer for the typed handoff
+// ledger (session.ContextLedger). Unlike the legacy line-dropping approach, it
+// PRESERVES the operational data structure — every injected packet, its
+// sequential PacketID, its payload, and the raw diagnostics — so that state is
+// not lost across the mode transition. It only strips ANSI display artifacts
+// from string payloads and normalizes whitespace. The Developer retains full,
+// deterministic control of the structured handoff.
+func SanitizeLedgerPreserve(l *session.ContextLedger) *session.ContextLedger {
+	if l == nil {
+		return nil
 	}
-	return b.String()
+	out := *l
+	out.Diagnostics = stripANSI(out.Diagnostics)
+	if out.Packets != nil {
+		pkts := make([]session.LedgerPacket, len(out.Packets))
+		for i, p := range out.Packets {
+			p.Payload = stripANSI(p.Payload)
+			pkts[i] = p
+		}
+		out.Packets = pkts
+	}
+	return &out
 }
 
-// collapseStackFrames removes duplicate stack-frame lines while preserving the
-// first occurrence (which keeps the most relevant call path). Non-frame lines
-// are passed through verbatim.
-func collapseStackFrames(s string) string {
-	var b strings.Builder
-	seen := make(map[string]struct{})
-	for _, line := range strings.Split(s, "\n") {
-		if stackFrameRE.MatchString(line) {
-			key := strings.TrimSpace(line)
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-		}
-		b.WriteString(line)
-		b.WriteByte('\n')
+func stripANSI(s string) string {
+	if s == "" {
+		return s
 	}
-	return b.String()
+	clean := ansiRE.ReplaceAllString(s, "")
+	clean = dupBlankLineRE.ReplaceAllString(clean, "\n\n")
+	return strings.TrimSpace(clean)
 }
 
 // ── Build Handoff Sanitizer (Plan → Build) ────────────────────────────────────

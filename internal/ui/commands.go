@@ -314,6 +314,17 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		if handoffSource == "" {
 			handoffSource = proposedFix
 		}
+
+		// SAFETY GUARD: If ContextLedger has diagnostics but handoffSource is empty,
+		// this indicates a data flow regression. Log a warning instead of proceeding
+		// with an empty query to the LLM.
+		if handoffSource == "" && m.sess.ContextLedger != nil && m.sess.ContextLedger.Diagnostics != "" {
+			m.push(roleError, "[SYSTEM ERROR] Context ledger has diagnostics but handoff source is empty after sanitization. Data flow regression detected.")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+
 		if handoffSource != "" {
 			if m.planEngine == nil {
 				m.handoffLedgerContent = ""
@@ -370,6 +381,16 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		// with either staged tasks or an explicit diagnostic — never falls through.
 		cb := ctxpkg.NewBuilder(".", m.graph, m.gitEng, m.sess)
 		assembly := cb.BuildPlanAssembly(content, m.attachedFiles)
+
+		// SAFETY GUARD: Prevent empty prompt to LLM. If the ContextLedger has
+		// diagnostics loaded but the generated prompt is empty, this indicates
+		// a data flow regression that must be surfaced immediately.
+		if assembly.RawContext == "" && m.sess.ContextLedger != nil && m.sess.ContextLedger.Diagnostics != "" {
+			m.push(roleError, "[SYSTEM ERROR] Context ledger has diagnostics but generated prompt is empty. This indicates a data flow regression.")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
 
 		modelName := m.cfg.ActiveModelName()
 		if budgetErr := plan.CheckTokenBudget(modelName, assembly.EstimateTokens); budgetErr != nil {
@@ -901,9 +922,22 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 	// ledger is replaced, so no stale prompts, build logs, or chat history can
 	// leak across the boundary. The same ledger is mirrored into the session
 	// record and persisted to .izen/session.json for full durability.
+	//
+	// CRITICAL: Preserve Diagnostics from investigation when transitioning to /plan.
+	// The investigation findings must survive the mode transition so the plan engine
+	// receives the forensic context needed for structured analysis.
+	prevDiagnostics := ""
+	if m.sess != nil && m.sess.ContextLedger != nil {
+		prevDiagnostics = m.sess.ContextLedger.Diagnostics
+	}
+
 	ledger := session.NewContextLedger(targetMode)
 	if m.sess != nil {
 		ledger.TargetFile = m.sess.ContextLabel()
+		// Preserve investigation diagnostics for /plan mode
+		if targetMode == modes.ModePlan && prevDiagnostics != "" {
+			ledger.Diagnostics = prevDiagnostics
+		}
 		ledger.Tasks = nil
 		for _, t := range m.sess.CurrentTasks {
 			ledger.Tasks = append(ledger.Tasks, plan.AtomicTask{

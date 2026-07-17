@@ -23,15 +23,25 @@ func TestSanitizeLedger(t *testing.T) {
 	if strings.Contains(out, "\x1b[") {
 		t.Fatalf("ANSI not stripped: %q", out)
 	}
-	if strings.Contains(out, "time=12:00:00") || strings.Contains(out, "pulling image") {
-		t.Fatalf("runtime log noise not stripped: %q", out)
+	// Diagnostic signal must be PRESERVED — not dropped — to keep state
+	// continuity between modes.
+	if !strings.Contains(out, "time=12:00:00") {
+		t.Fatalf("runtime log line dropped (signal lost): %q", out)
 	}
-	// Repeated stack frames collapsed to a single occurrence.
-	if n := strings.Count(out, "cmd/api/main.go:42"); n != 1 {
-		t.Fatalf("expected duplicated stack frame collapsed to 1, got %d: %q", n, out)
+	if !strings.Contains(out, "rootless docker not found") {
+		t.Fatalf("environment blocker dropped (signal lost): %q", out)
 	}
 	if !strings.Contains(out, "github.com/docker/docker/client") {
 		t.Fatalf("signal dependency dropped: %q", out)
+	}
+	// Stack frames are preserved (no longer collapsed) so the full call path
+	// reaches the next mode.
+	if n := strings.Count(out, "cmd/api/main.go:42"); n != 3 {
+		t.Fatalf("expected all 3 stack frames preserved, got %d: %q", n, out)
+	}
+	// 3+ blank lines collapsed to a single blank line.
+	if strings.Contains(out, "\n\n\n") {
+		t.Fatalf("excess blank lines not collapsed: %q", out)
 	}
 }
 

@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/session"
 )
 
 type Target struct {
@@ -306,4 +308,69 @@ func abs(n int) int {
 		return -n
 	}
 	return n
+}
+
+// ToPackets projects the forensic findings of this investigate ledger into the
+// canonical session.LedgerPacket type so they can be injected — sequentially and
+// ID-addressed — into the session.ContextLedger handoff. Each finding becomes
+// its own packet: the problem, every isolated target coordinate, high-signal
+// evidence, and the final conclusion. The full payload is preserved verbatim;
+// the caller (bridgeInvestigationToLedger) assigns the sequential PacketIDs.
+func (cl *ContextLedger) ToPackets() []session.LedgerPacket {
+	var pkts []session.LedgerPacket
+
+	if cl.Problem != "" {
+		pkts = append(pkts, session.LedgerPacket{
+			Kind:    "problem",
+			Title:   "Investigation problem statement",
+			Payload: cl.Problem,
+		})
+	}
+
+	for _, t := range cl.Targets {
+		var b strings.Builder
+		fmt.Fprintf(&b, "node=%s kind=%s", t.Node, t.Kind)
+		if t.Snippet != "" {
+			fmt.Fprintf(&b, "\nsnippet:\n%s", t.Snippet)
+		}
+		pkts = append(pkts, session.LedgerPacket{
+			Kind:    "target",
+			Title:   "Isolated code coordinate",
+			Payload: b.String(),
+			File:    t.File,
+			Line:    t.Line,
+		})
+	}
+
+	for _, ev := range cl.Evidence {
+		if ev.Content == "" {
+			continue
+		}
+		pkts = append(pkts, session.LedgerPacket{
+			Kind:       "evidence",
+			Title:      fmt.Sprintf("Evidence [%s]", ev.Source),
+			Payload:    ev.Content,
+			File:       ev.File,
+			Line:       ev.Line,
+			Confidence: ev.Confidence,
+		})
+	}
+
+	if cl.RootCause != "" {
+		pkts = append(pkts, session.LedgerPacket{
+			Kind:    "root_cause",
+			Title:   "Derived root cause",
+			Payload: cl.RootCause,
+		})
+	}
+
+	if cl.Conclusion != "" {
+		pkts = append(pkts, session.LedgerPacket{
+			Kind:    "conclusion",
+			Title:   "Investigation conclusion",
+			Payload: cl.Conclusion,
+		})
+	}
+
+	return pkts
 }

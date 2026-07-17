@@ -3,9 +3,22 @@ package investigate
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 )
+
+// forensicLog is the activity sink for /investigate. It defaults to the
+// standard logger so forensic execution is always observable; the UI can
+// redirect it via SetForensicLog to surface it in the session activity stream.
+var forensicLog = log.Printf
+
+// SetForensicLog overrides the forensic activity sink.
+func SetForensicLog(fn func(format string, args ...interface{})) {
+	if fn != nil {
+		forensicLog = fn
+	}
+}
 
 type Engine struct {
 	State      *StateMachine
@@ -20,6 +33,16 @@ type Engine struct {
 	root      string
 	startedAt time.Time
 	Result    *InvestigationResult
+
+	// forensicsRan records whether the engine actually invoked the diagnostic
+	// toolchain (test executor and/or retriever searches) during this run. It
+	// is the guard against the short-circuit that produced 0s durations.
+	forensicsRan bool
+
+	// runCtx is the parent context for this investigation run, threaded into
+	// the mandatory forensic probe so its deadline is inherited (and so the
+	// context-aware executor call satisfies static analysis).
+	runCtx context.Context
 
 	retriever Retriever
 	executor  TestExecutor
@@ -75,10 +98,13 @@ func NewEngine(root, problem string, retriever Retriever, executor TestExecutor)
 }
 
 func (e *Engine) Run() (*InvestigationResult, error) {
-	return e.RunContext(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	return e.RunContext(ctx)
 }
 
 func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
+	e.runCtx = ctx
 	result := &InvestigationResult{
 		Problem: e.Problem,
 	}
@@ -129,6 +155,22 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 		}
 	}
 
+	// MANDATORY FORENSIC EVIDENCE: /investigate MUST have actually executed the
+	// diagnostic toolchain (LX/graph search and/or the test shell) before it is
+	// allowed to declare completion. If neither tool ran, force a diagnostic
+	// shell probe of the project so the engine never short-circuits with a 0s
+	// "no findings" result. This guarantees the developer-visible duration is
+	// real and that tool usage is on the record.
+	if !e.forensicsExecuted() {
+		forensicLog("[forensic] no diagnostic toolchain executed — forcing probe")
+		e.forceProbe(ctx)
+		result.Duration = time.Since(e.startedAt).Round(time.Millisecond).String()
+	}
+
+	// MANDATORY TIMING LOG: prove the forensic pass actually did work.
+	forensicLog("Forensic analysis executed in %s (%d evidence, %d loops)",
+		result.Duration, len(result.Evidence), result.Loops)
+
 	e.Result = result
 	return result, nil
 }
@@ -158,11 +200,42 @@ func (e *Engine) executeCurrentState() error {
 	}
 }
 
+// forensicsExecuted reports whether this run actually invoked the diagnostic
+// toolchain (test executor or any retriever search) rather than merely reasoning
+// over the initial problem statement.
+func (e *Engine) forensicsExecuted() bool {
+	return e.forensicsRan
+}
+
+// forceProbe performs a guaranteed diagnostic shell invocation (go test) so the
+// engine can never declare "Investigation complete" in 0s with no tool usage.
+// It is the last-resort forensic path when both the retriever and the primary
+// executor were unavailable during the state machine.
+func (e *Engine) forceProbe(ctx context.Context) {
+	probe := NewShellTestExecutor(e.root)
+	summary, err := probe.RunAllTestsContext(ctx)
+	if err == nil && summary != nil {
+		e.forensicsRan = true
+		if summary.Output != "" {
+			e.Ledger.SetDiagnostics(summary.Output)
+		}
+		output := BoundedLogPreprocessor(summary.Output)
+		summary.Output = output
+		e.Evidence.Add(EvSourceTest, output, summary.Package, 0, 0.5)
+		if !summary.Passed {
+			e.Evidence.Add(EvSourceTest,
+				fmt.Sprintf("Failed tests: %s", strings.Join(summary.Failed, ", ")),
+				summary.Package, 0, 0.7)
+		}
+	}
+}
+
 func (e *Engine) stateObserve() error {
 	observed := fmt.Sprintf("Observing problem: %s", e.Problem)
 	e.Evidence.Add(EvSourceUser, observed, "", 0, 0.2)
 
 	if e.executor != nil {
+		e.forensicsRan = true
 		summary, _ := e.TestLoop.Run(e.executor, testLoopConfig{Strategy: "all"})
 		if summary != nil {
 			rawOutput := summary.Output
@@ -273,6 +346,8 @@ func (e *Engine) stateSearch() error {
 	if e.retriever == nil {
 		return e.State.Transition(StateGather)
 	}
+
+	e.forensicsRan = true
 
 	symbols := e.extractSymbolsFromProblem()
 	for _, sym := range symbols {
@@ -420,6 +495,7 @@ func (e *Engine) stateNarrow() error {
 	}
 
 	if len(targets) > 0 && e.retriever != nil {
+		e.forensicsRan = true
 		for _, target := range unique(targets) {
 			results, err := e.retriever.SearchText(target)
 			if err == nil {

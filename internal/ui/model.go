@@ -25,6 +25,7 @@ import (
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/session"
@@ -84,6 +85,10 @@ type traceUpdateMsg struct {
 
 type streamErrMsg struct{ err error }
 
+type PlanStreamingFinishedMsg struct {
+	Success bool
+}
+
 type gitInitResultMsg struct{ err error }
 
 type tickMsg time.Time
@@ -96,6 +101,7 @@ type investigateResultMsg struct {
 	err               error
 	escalationContent string // when Resolved=false, pipe investigation data to LLM for analysis
 	ledgerContent     string // FormatLedgerForPlan() — structured Context-Ledger data, the SSOT for handoff
+	investigateLedger *investigate.ContextLedger
 }
 
 type reviewResultMsg struct {
@@ -655,6 +661,12 @@ type model struct {
 	// the transient LLM output text (Transaction Cache).
 	handoffLedgerContent string
 
+	// lastInvestigateLedger holds the structured forensic findings produced by
+	// the most recent /investigate run. bridgeInvestigationToLedger projects it
+	// into the canonical session.ContextLedger as sequential, ID-addressed
+	// packets, preserving state across the mode transition.
+	lastInvestigateLedger *investigate.ContextLedger
+
 	// currentResult is the most recent workflow RESULT and the capabilities it
 	// exposes. It is DOMAIN state (the engine's current outcome) — NOT a UI
 	// flag. The renderer never reads it directly; it flows through
@@ -973,6 +985,7 @@ func (m *model) resetStreamingState() {
 	m.streamTickActive = false
 	m.agentRunning = false
 	m.agentLabel = ""
+	m.planPending = false
 	m.spinnerFrame = 0
 	if m.streamParser != nil {
 		m.streamParser = nil
@@ -1000,6 +1013,7 @@ func (m *model) reconcileSpinner() {
 	m.agentDone = true
 	m.reviewRunning = false
 	m.pipelineRunning = false
+	m.planPending = false
 	m.spinnerFrame = 0
 	if m.streamParser != nil {
 		m.streamParser = nil

@@ -98,6 +98,14 @@ stack traces, or missing dependency messages, you MUST:
 3. For syntax/compilation errors, create FILE_MUTATE tasks for the offending files
 4. Do NOT rely on the processed ROOT CAUSE or CONCLUSION sections above for task generation—use the raw diagnostics.
 
+### PROCESS BY PACKET ID (MANDATORY)
+The ledger above contains ANALYTICAL PACKETS addressed as [PKT-1], [PKT-2], ... each with a kind
+(problem / target / evidence / root_cause / conclusion). You MUST traverse these packets in strict
+sequential order and derive at least one atomic task from each non-diagnostic packet (target, root_cause).
+Do NOT invent packet IDs, and do NOT skip packets. Reference the originating PacketID in each task's
+description so the Developer can trace every task back to its forensic source. This is a deterministic
+ledger-processing pass — not a conversational reply.
+
 ### OUTPUT REQUIREMENTS
 You MUST output ONLY a JSON object matching the schema provided in the system prompt.
 - context_anchor.source must be "investigate-ledger"
