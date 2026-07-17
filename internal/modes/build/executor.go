@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/engine"
 )
 
 type FileMutation struct {
@@ -33,6 +35,7 @@ const (
 type Executor struct {
 	root   string
 	engine *Engine
+	tx     *engine.Transaction
 }
 
 func NewExecutor(root string, engine *Engine) *Executor {
@@ -42,12 +45,22 @@ func NewExecutor(root string, engine *Engine) *Executor {
 	}
 }
 
+func (ex *Executor) SetTransaction(tx *engine.Transaction) {
+	ex.tx = tx
+}
+
 func (ex *Executor) ApplyMutation(ctx context.Context, mut FileMutation) error {
 	absPath := filepath.Join(ex.root, mut.File)
 	dir := filepath.Dir(absPath)
 
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create directory %s: %w", dir, err)
+	}
+
+	if ex.tx != nil {
+		if err := ex.tx.Record(absPath); err != nil {
+			return fmt.Errorf("transaction record %s: %w", mut.File, err)
+		}
 	}
 
 	if mut.Mode == ModeFullRewrite {

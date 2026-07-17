@@ -11,6 +11,7 @@ import (
 	"time"
 
 	izenctx "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/modes/build"
 )
 
@@ -187,6 +188,8 @@ type PatchManager struct {
 	// every patch write to ensure structural integrity before allowing a
 	// task to transition to TaskCompleted.
 	verifier *Verifier
+
+	tx *engine.Transaction
 }
 
 func NewPatchManager(root string) *PatchManager {
@@ -201,6 +204,10 @@ func NewPatchManager(root string) *PatchManager {
 // patch manager runs verifier.RunAll() after every write and refuses to mark
 // the task as completed if verification fails — enforcing the Zero Syntax
 // Leakage guarantee.
+func (pm *PatchManager) SetTransaction(tx *engine.Transaction) {
+	pm.tx = tx
+}
+
 func (pm *PatchManager) SetVerifier(v *Verifier) {
 	pm.verifier = v
 }
@@ -426,6 +433,16 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	if patch.Original == "" {
 		if data, err := os.ReadFile(fullPath); err == nil {
 			patch.Original = string(data)
+		}
+	}
+
+	// Record file in transaction for rollback capability
+	if pm.tx != nil {
+		if err := pm.tx.Record(fullPath); err != nil {
+			if globalActivityLog != nil {
+				globalActivityLog("[FAIL] patch rejected on %s: transaction record failed: %v", patch.File, err)
+			}
+			return fmt.Errorf("transaction record %s: %w", patch.File, err)
 		}
 	}
 
