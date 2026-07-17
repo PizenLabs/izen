@@ -161,11 +161,19 @@ func (m *model) primeHandoffFromLedger(mode modes.Mode) {
 			fmt.Fprintf(&b, "- %s: %s — %s\n", t.Strategy, t.File, t.Description)
 		}
 		if l.Diagnostics != "" {
-			fmt.Fprintf(&b, "\nDiagnostics:\n%s\n", l.Diagnostics)
+			fmt.Fprintf(&b, "\n### INJECTED INVESTIGATION FORENSICS\n")
+			fmt.Fprintf(&b, "- Target File: %s\n", l.TargetFile)
+			fmt.Fprintf(&b, "- Diagnostics Error Log:\n```\n%s\n```\n", l.Diagnostics)
 		}
 		m.handoffLedgerContent = b.String()
 	} else if l.Diagnostics != "" && l.Diagnostics != "unknown" {
-		m.handoffLedgerContent = l.Diagnostics
+		var b strings.Builder
+		b.WriteString("### INJECTED INVESTIGATION FORENSICS\n")
+		if l.TargetFile != "" {
+			fmt.Fprintf(&b, "- Target File: %s\n", l.TargetFile)
+		}
+		fmt.Fprintf(&b, "- Diagnostics Error Log:\n```\n%s\n```\n", l.Diagnostics)
+		m.handoffLedgerContent = b.String()
 	}
 
 	// Mirror into the legacy handoff context so injectHandoffContext and the

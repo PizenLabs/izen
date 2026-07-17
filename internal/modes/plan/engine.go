@@ -39,10 +39,19 @@ func parsePlanContent(content string) []Task {
 
 	result := ParseJSONPlan(content)
 	if result.Valid {
+		// Validate tasks for placeholder paths
+		if err := ValidateAllTasks(result.Tasks); err != nil {
+			return nil
+		}
 		return result.Tasks
 	}
 
-	return ParseMarkdownToTasks(content)
+	tasks := ParseMarkdownToTasks(content)
+	// Validate tasks for placeholder paths
+	if err := ValidateAllTasks(tasks); err != nil {
+		return nil
+	}
+	return tasks
 }
 
 // SetProvider configures the AI provider for this engine using the structured signature.
@@ -93,12 +102,20 @@ func (e *Engine) ProcessFromLedger(ctx context.Context, ledgerContent string, pr
 	// Parse structured JSON output into tasks.
 	jsonResult := ParseJSONPlan(resp.Content)
 	if jsonResult.Valid && len(jsonResult.Tasks) > 0 {
+		// Validate tasks for placeholder paths
+		if err := ValidateAllTasks(jsonResult.Tasks); err != nil {
+			return nil, err
+		}
 		return jsonResult.Tasks, nil
 	}
 
 	// Fallback: if JSON parsing failed, try markdown task extraction.
 	tasks := ParseMarkdownToTasks(resp.Content)
 	if len(tasks) > 0 {
+		// Validate tasks for placeholder paths
+		if err := ValidateAllTasks(tasks); err != nil {
+			return nil, err
+		}
 		return tasks, nil
 	}
 

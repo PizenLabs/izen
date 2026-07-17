@@ -611,3 +611,81 @@ func TestPlanSchemaError(t *testing.T) {
 		t.Fatalf("expected 'schema violation' in error, got: %s", err.Error())
 	}
 }
+
+func TestValidateTaskTarget_ValidPath(t *testing.T) {
+	tests := []struct {
+		target   string
+		taskType string
+	}{
+		{"cmd/main.go", "FILE_MUTATE"},
+		{"internal/parser/stream.go", "FILE_MUTATE"},
+		{"go build ./...", "SHELL_EXEC"},
+		{"go get github.com/docker/docker/client", "SHELL_EXEC"},
+		{"pkg/config/loader.go", "FILE_MUTATE"},
+	}
+	for _, tt := range tests {
+		isValid, isPlaceholder := ValidateTaskTarget(tt.target, tt.taskType)
+		if !isValid {
+			t.Errorf("expected valid target %q, got isValid=%v, isPlaceholder=%v", tt.target, isValid, isPlaceholder)
+		}
+		if isPlaceholder {
+			t.Errorf("expected non-placeholder target %q", tt.target)
+		}
+	}
+}
+
+func TestValidateTaskTarget_PlaceholderPaths(t *testing.T) {
+	tests := []struct {
+		name     string
+		target   string
+		taskType string
+	}{
+		{"relative_path", "relative/path/to/file.go", "FILE_MUTATE"},
+		{"file_go", "file.go", "FILE_MUTATE"},
+		{"file_test_go", "file_test.go", "FILE_MUTATE"},
+		{"path_to", "path/to/file.go", "FILE_MUTATE"},
+		{"placeholder_angle", "<path>", "FILE_MUTATE"},
+		{"placeholder_file", "<file>", "FILE_MUTATE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isValid, isPlaceholder := ValidateTaskTarget(tt.target, tt.taskType)
+			if isValid {
+				t.Errorf("expected invalid placeholder target %q", tt.target)
+			}
+			if !isPlaceholder {
+				t.Errorf("expected placeholder detection for %q", tt.target)
+			}
+		})
+	}
+}
+
+func TestValidateTask_EmptyTarget(t *testing.T) {
+	task := Task{StepNum: 1, Type: "FILE_MUTATE", Target: "", Description: "test"}
+	err := ValidateTask(task)
+	if err == nil {
+		t.Fatal("expected error for empty target")
+	}
+}
+
+func TestValidateAllTasks_MixedValidInvalid(t *testing.T) {
+	tasks := []Task{
+		{StepNum: 1, Type: "FILE_MUTATE", Target: "valid.go", Description: "valid task"},
+		{StepNum: 2, Type: "FILE_MUTATE", Target: "relative/path/to/file.go", Description: "placeholder task"},
+	}
+	err := ValidateAllTasks(tasks)
+	if err == nil {
+		t.Fatal("expected error for placeholder in task list")
+	}
+}
+
+func TestValidateAllTasks_AllValid(t *testing.T) {
+	tasks := []Task{
+		{StepNum: 1, Type: "FILE_MUTATE", Target: "valid.go", Description: "valid task"},
+		{StepNum: 2, Type: "SHELL_EXEC", Target: "go build ./...", Description: "valid shell"},
+	}
+	err := ValidateAllTasks(tasks)
+	if err != nil {
+		t.Fatalf("expected no error for valid tasks, got: %v", err)
+	}
+}

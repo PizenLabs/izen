@@ -28,9 +28,16 @@ FORBIDDEN
 STRICT ENGINEERING PERSONA
 - You are an automated software engineering architect inside the /plan runtime phase.
 - Do NOT engage in casual greetings or ask open-ended questions.
-- Do NOT output friendly conversational filler such as "How can I assist you today?", "Hello!", or "What are things like for you today?".
 - Immediately analyze the injected error log or diagnostic evidence and produce a concrete, step-by-step file mutation plan.
 - Never fall back to generic support chatbot behavior.
+
+CRITICAL: DIAGNOSTICS-BOUND TASK GENERATION (MANDATORY)
+- You MUST strictly look at the "Diagnostics" field inside the injected ledger.
+- DO NOT invent placeholder paths like 'relative/path/to/file.go' or 'file_test.go'.
+- If the Diagnostics state a missing go module (e.g., 'github.com/docker/docker/client'), your first atomic task MUST be a SHELL_EXEC running 'go get github.com/docker/docker/client'.
+- If the Diagnostics log shows a container runtime error ('rootless Docker not found'), target environmental workarounds or document the system block instead of forcing empty 'go fmt' tasks.
+- If the path is not explicitly found in the Diagnostics or AST logs, treat the task scope purely at the root directory level (e.g., target 'go.mod' or target the root command).
+- Generating generic instructions instead of mapping out the concrete error from the ContextLedger is an absolute architectural failure.
 
 CONTEXT HANDOFF
 - When a context-ledger from /investigate is provided, treat it as raw diagnostic evidence — not a pre-formed plan.
@@ -66,7 +73,7 @@ STRICT OUTPUT REQUIREMENT
 3. TYPE must be one of: FILE_MUTATE, SHELL_EXEC, GIT_ACTION.
 4. Target is a relative file path (FILE_MUTATE/GIT_ACTION) or an exact shell command (SHELL_EXEC). Never use absolute paths.
 5. Rationale is a short "why". Break complex plans into small, distinct, verifiable atomic steps.
-6. BANNED: SHELL_EXEC tasks for dependency/environment fetching (e.g. "go get", "npm install"). Present these as a prerequisite sentence in the Architectural Strategy section instead.
+6. For missing dependencies, use SHELL_EXEC: go get <package> as the FIRST task.
 7. NEVER use standard bullet points (lines starting with "- " or "* ") unless they are formatted exactly as "- [ ] TYPE: Target | Rationale". Any loose bullet points will crash the parser.`
 }
 
@@ -83,6 +90,14 @@ func BuildPlanJSONPrompt(problem string, ledgerContent string) string {
 ### INVESTIGATION LEDGER
 %s
 
+### RAW DIAGNOSTICS PRIORITY (MANDATORY)
+If the RAW DIAGNOSTICS section above contains compiler errors (e.g., "no required module provides package"), 
+stack traces, or missing dependency messages, you MUST:
+1. Extract the exact file:line:col coordinates from the raw error output
+2. For missing module errors, your FIRST atomic task MUST be: SHELL_EXEC: go get <missing-module>
+3. For syntax/compilation errors, create FILE_MUTATE tasks for the offending files
+4. Do NOT rely on the processed ROOT CAUSE or CONCLUSION sections above for task generation—use the raw diagnostics.
+
 ### OUTPUT REQUIREMENTS
 You MUST output ONLY a JSON object matching the schema provided in the system prompt.
 - context_anchor.source must be "investigate-ledger"
@@ -91,10 +106,13 @@ You MUST output ONLY a JSON object matching the schema provided in the system pr
 - strategy must be one of: ATOMIC_REPLACE, DIFF_PATCH, SHELL_EXEC, GIT_ACTION
 - task_id values must be sequential starting at 1
 
-If the investigation data contains compilation errors or test failures, create tasks
-that fix those specific issues. If data is insufficient, create at minimum 1-2
-investigative tasks (FILE_MUTATE with strategy ATOMIC_REPLACE) targeting the most
-likely root-cause files.
+CRITICAL: DIAGNOSTICS-BOUND TASK GENERATION (MANDATORY)
+- You MUST strictly look at the "Diagnostics" field in the investigation ledger.
+- DO NOT invent placeholder paths like 'relative/path/to/file.go' or 'file_test.go'.
+- If the Diagnostics state a missing go module (e.g., 'github.com/docker/docker/client'), your first atomic task MUST be a SHELL_EXEC running 'go get github.com/docker/docker/client'.
+- If the Diagnostics log shows a container runtime error ('rootless Docker not found'), target environmental workarounds or document the system block.
+- If the path is not explicitly found in the Diagnostics or AST logs, treat the task scope purely at the root directory level (e.g., target 'go.mod' or target the root command).
+- Generating generic instructions instead of mapping out the concrete error from the ContextLedger is an absolute architectural failure.
 
 ### NO-TARGET COMPILATION-ERROR FALLBACK (MANDATORY)
 If the ledger has NO resolved TargetFile but the Diagnostics/INVESTIGATION LEDGER
@@ -132,6 +150,14 @@ Do NOT output friendly conversational filler such as "How can I assist you today
 Immediately analyze the objective and produce a concrete, step-by-step file mutation
 plan. Never fall back to generic support chatbot behavior.
 
+### RAW DIAGNOSTICS PRIORITY (MANDATORY)
+If the context above contains RAW DIAGNOSTICS (compiler errors, stack traces,
+missing packages), you MUST:
+1. Extract exact file:line:col coordinates from the raw error output
+2. For missing module errors, your FIRST task MUST be: SHELL_EXEC: go get <module>
+3. For compilation errors, create FILE_MUTATE tasks for the offending files
+4. Do NOT rely on processed conclusions—use the raw diagnostics for task generation
+
 Begin the output now:`, objective)
 	}
 
@@ -139,6 +165,14 @@ Begin the output now:`, objective)
 
 ### USER OBJECTIVE
 %s
+
+### RAW DIAGNOSTICS PRIORITY (MANDATORY)
+If the context above contains RAW DIAGNOSTICS (compiler errors, stack traces,
+missing packages), you MUST:
+1. Extract exact file:line:col coordinates from the raw error output
+2. For missing module errors, your FIRST task MUST be: SHELL_EXEC: go get <module>
+3. For compilation errors, create FILE_MUTATE tasks for the offending files
+4. Do NOT rely on processed conclusions—use the raw diagnostics for task generation
 
 ### OUTPUT ENFORCEMENT (STRICT)
 The CONTEXT LEDGER above contains raw diagnostic evidence. Transform it into an execution plan.

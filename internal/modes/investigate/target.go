@@ -22,13 +22,14 @@ type Target struct {
 // root cause targets, evidence, and a conclusion. Atomic task synthesis is
 // exclusively owned by /plan/planner.go.
 type ContextLedger struct {
-	Source     string     `json:"source"`
-	Problem    string     `json:"problem"`
-	RootCause  string     `json:"root_cause,omitempty"`
-	Targets    []Target   `json:"targets"`
-	Evidence   []Evidence `json:"evidence,omitempty"`
-	Conclusion string     `json:"conclusion,omitempty"`
-	Resolved   bool       `json:"resolved"`
+	Source      string     `json:"source"`
+	Problem     string     `json:"problem"`
+	RootCause   string     `json:"root_cause,omitempty"`
+	Targets     []Target   `json:"targets"`
+	Evidence    []Evidence `json:"evidence,omitempty"`
+	Conclusion  string     `json:"conclusion,omitempty"`
+	Resolved    bool       `json:"resolved"`
+	Diagnostics string     `json:"diagnostics,omitempty"`
 }
 
 func NewContextLedger() *ContextLedger {
@@ -192,6 +193,10 @@ func (cl *ContextLedger) AddTarget(t Target) {
 	cl.Targets = append(cl.Targets, t)
 }
 
+func (cl *ContextLedger) SetDiagnostics(raw string) {
+	cl.Diagnostics = raw
+}
+
 func (cl *ContextLedger) SetConclusion(conclusion string, resolved bool) {
 	cl.Conclusion = conclusion
 	cl.Resolved = resolved
@@ -246,6 +251,11 @@ func (cl *ContextLedger) FormatForPlan() string {
 	fmt.Fprintf(&b, "### INVESTIGATION LEDGER (Root Cause Only — No Tasks)\n")
 	fmt.Fprintf(&b, "Source: %s\n", cl.Source)
 	fmt.Fprintf(&b, "Problem: %s\n", cl.Problem)
+
+	if cl.Diagnostics != "" {
+		fmt.Fprintf(&b, "\n### RAW DIAGNOSTICS\n")
+		fmt.Fprintf(&b, "```\n%s\n```\n", cl.Diagnostics)
+	}
 
 	if cl.RootCause != "" {
 		fmt.Fprintf(&b, "\n### ROOT CAUSE\n%s\n", cl.RootCause)

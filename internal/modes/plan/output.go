@@ -299,6 +299,72 @@ func IsValidTaskLine(line string) bool {
 	return planBlockRegex.MatchString(normalized)
 }
 
+// PlaceholderPathPatterns contains literal strings that indicate placeholder paths.
+var PlaceholderPathPatterns = []string{
+	"relative/path/",
+	"file.go",
+	"file_test.go",
+	"path/to/",
+	"<path>",
+	"<file>",
+	"your-file.go",
+	"example.go",
+	"test.go",
+	"somefile.go",
+}
+
+// ValidateTaskTarget checks if a task target is valid or a placeholder.
+// Returns (isValid, isPlaceholder) where:
+// - isValid: true if the target is a valid, non-placeholder path
+// - isPlaceholder: true if the target contains placeholder patterns
+func ValidateTaskTarget(target string, taskType string) (isValid bool, isPlaceholder bool) {
+	if target == "" {
+		return false, false
+	}
+
+	// Shell commands are valid if they're not empty
+	if taskType == "SHELL_EXEC" {
+		return len(strings.TrimSpace(target)) > 0, false
+	}
+
+	// Check for placeholder patterns
+	lowerTarget := strings.ToLower(target)
+	for _, pattern := range PlaceholderPathPatterns {
+		if strings.Contains(lowerTarget, strings.ToLower(pattern)) {
+			return false, true
+		}
+	}
+
+	return true, false
+}
+
+// ValidateTask validates a task for placeholder paths and other issues.
+// Returns an error if the task contains invalid placeholder paths.
+func ValidateTask(t Task) error {
+	isValid, isPlaceholder := ValidateTaskTarget(t.Target, t.Type)
+
+	if isPlaceholder {
+		return fmt.Errorf("[BUILD ABORTED] Detected invalid placeholder paths in the execution plan. Task %d target '%s' contains placeholder pattern. Please re-run /plan", t.StepNum, t.Target)
+	}
+
+	if !isValid {
+		return fmt.Errorf("[BUILD ABORTED] Task %d has invalid or empty target: '%s'", t.StepNum, t.Target)
+	}
+
+	return nil
+}
+
+// ValidateAllTasks validates all tasks in a slice and returns the first error found.
+// Returns nil if all tasks are valid.
+func ValidateAllTasks(tasks []Task) error {
+	for _, t := range tasks {
+		if err := ValidateTask(t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 const SchemaTemplate = `- [ ] FILE_MUTATE: path/to/file.go | describe the change
 - [ ] SHELL_EXEC: go build ./... | reason for running this command
 - [ ] GIT_ACTION: commit -m "message" | why this commit is needed`

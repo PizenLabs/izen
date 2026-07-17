@@ -165,6 +165,10 @@ func (e *Engine) stateObserve() error {
 	if e.executor != nil {
 		summary, _ := e.TestLoop.Run(e.executor, testLoopConfig{Strategy: "all"})
 		if summary != nil {
+			rawOutput := summary.Output
+			if rawOutput != "" {
+				e.Ledger.SetDiagnostics(rawOutput)
+			}
 			output := BoundedLogPreprocessor(summary.Output)
 			summary.Output = output
 			e.Evidence.Add(EvSourceTest, output, summary.Package, 0, 0.5)
