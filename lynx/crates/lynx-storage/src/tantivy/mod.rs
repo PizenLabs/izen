@@ -8,6 +8,24 @@ use tantivy::schema::TantivyDocument;
 use tantivy::schema::{IndexRecordOption, Term, Value};
 use tantivy::{doc, query::QueryParser, DocAddress, Index, IndexWriter, ReloadPolicy};
 
+fn sanitize_query(query: &str) -> String {
+    query
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .chars()
+        .flat_map(|c| match c {
+            '\\' => vec!['\\', '\\'],
+            '"' => vec!['\\', '"'],
+            '+' | '-' | '!' | '(' | ')' | ':' | '^' | '[' | ']'
+            | '{' | '}' | '~' | '*' | '?' | '|' | '&' => {
+                vec!['\\', c]
+            }
+            c if c.is_control() => vec![],
+            c => vec![c],
+        })
+        .collect()
+}
+
 pub struct TantivyStorage {
     chunk_index: Index,
     symbol_index: Index,
@@ -110,7 +128,7 @@ impl TantivyStorage {
             &self.chunk_index,
             vec![self.chunk_schema.content, self.chunk_schema.symbols],
         );
-        let query = query_parser.parse_query(query_str)?;
+        let query = query_parser.parse_query(&sanitize_query(query_str))?;
         let top_docs: Vec<(f32, DocAddress)> =
             searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
 
@@ -167,7 +185,7 @@ impl TantivyStorage {
             &self.symbol_index,
             vec![self.symbol_schema.symbol_name, self.symbol_schema.symbol_id],
         );
-        let query = query_parser.parse_query(query_str)?;
+        let query = query_parser.parse_query(&sanitize_query(query_str))?;
         let top_docs: Vec<(f32, DocAddress)> =
             searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
 

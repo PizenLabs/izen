@@ -1078,13 +1078,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.sess.AddMessage("system", msg+" You are in a Read-Only execution environment and must stop requesting system mutations.", 3)
 				} else {
 					cmd := shellCmds[0]
-					if blocked, _ := m.shellFirewall(cmd); blocked {
+					if sanitized, rejected, reason := sanitizeShellCmd(cmd); rejected {
+						m.push(roleError, "[AUTO-FILL BLOCKED] Shell command not loaded: "+reason)
+					} else if blocked, _ := m.shellFirewall(sanitized); blocked {
 						m.push(roleError, "[SECURITY] Proposed shell command blocked by firewall.")
 					} else {
-						m.ti.SetValue(cmd)
+						m.ti.SetValue(sanitized)
 						m.ti.CursorEnd()
 						m.syncInputFromTI()
-						m.proposedShellCmd = cmd
+						m.proposedShellCmd = sanitized
 						m.push(roleSystem, infoStyle.Render(
 							"Command injected into input bar. Review and press Enter to execute, Esc to cancel."))
 					}
