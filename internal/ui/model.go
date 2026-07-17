@@ -95,6 +95,16 @@ type tickMsg time.Time
 
 type smoothStreamTickMsg time.Time
 
+// planSlowNoticeMsg fires once, planSlowNoticeDelay after /plan synthesis
+// starts. If synthesis is still pending when it arrives, a viewport-safe
+// warning is surfaced (never a raw terminal print) so the user learns the
+// local model may be unresponsive before the 120s hard timeout.
+type planSlowNoticeMsg struct{ startedAt time.Time }
+
+// planSlowNoticeDelay is how long /plan synthesis may run before the soft
+// "provider may be unresponsive" notice is shown.
+const planSlowNoticeDelay = 10 * time.Second
+
 type investigateResultMsg struct {
 	records           []record
 	sessionKey        string
@@ -480,10 +490,15 @@ type model struct {
 	PreRenderedHistory string
 
 	// Streaming
-	streamCh             chan tea.Msg
-	responseBuffer       strings.Builder
-	streaming            bool
-	spinnerFrame         int
+	streamCh       chan tea.Msg
+	responseBuffer strings.Builder
+	streaming      bool
+	spinnerFrame   int
+	// lastSpinnerAdvance throttles spinner-frame advancement inside the 20ms
+	// smoothStreamTickMsg loop to a ~100ms cadence, so the braille animation
+	// stays visually consistent with the 100ms tickMsg loop while token
+	// rendering keeps its 20ms pacing. Zero value means "advance immediately".
+	lastSpinnerAdvance   time.Time
 	currentStreamContent string // accumulated raw text during active LLM stream
 
 	// Expanded metrics for status bar
@@ -703,6 +718,13 @@ type model struct {
 	// tickMsg leak-detector must NOT wipe the loading flags until the
 	// terminal planResultMsg is delivered.
 	planPending bool
+
+	// planStartedAt records when the current /plan synthesis began. It backs
+	// the soft-timeout notice (planSlowNoticeMsg): if synthesis is still in
+	// flight after planSlowNoticeDelay, a single viewport-safe warning is
+	// surfaced so the user knows the local model may be unresponsive — well
+	// before the 120s hard context timeout fires.
+	planStartedAt time.Time
 
 	// Context Ledger: silent issue tracking across failure sessions
 	ledger *ContextLedger
@@ -987,6 +1009,7 @@ func (m *model) resetStreamingState() {
 	m.agentLabel = ""
 	m.planPending = false
 	m.spinnerFrame = 0
+	m.lastSpinnerAdvance = time.Time{}
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
@@ -1015,6 +1038,7 @@ func (m *model) reconcileSpinner() {
 	m.pipelineRunning = false
 	m.planPending = false
 	m.spinnerFrame = 0
+	m.lastSpinnerAdvance = time.Time{}
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}

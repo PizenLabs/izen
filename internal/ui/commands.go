@@ -356,21 +356,34 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			// inside runPlanEngineCmd, not here.
 			m.streaming = true
 			m.spinnerFrame = 0
+			m.lastSpinnerAdvance = time.Time{}
 			m.agentRunning = true
 			m.agentLabel = "synthesizing plan"
 			m.planPending = true
+			m.planStartedAt = time.Now()
 			m.push(roleSystem, infoStyle.Render("Synthesizing structured execution plan from investigation data..."))
+			// FAST-TRACK NOTICE: when there are zero pre-parsed TODOs the
+			// synthesis runs purely on the forensic ledger. Surface an implicit
+			// hint so the user understands the engine is working (not hung) and
+			// that a first-token guard will bail fast if the local model is
+			// unresponsive.
+			if len(m.handoffCtx.PendingTodos) == 0 {
+				m.push(roleSystem, mutedStyle.Render(
+					"0 pending TODOs — synthesizing from forensic ledger. If your local model is stuck, this aborts within ~8s instead of hanging."))
+			}
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 
-			// Start the spinner tick loop so the indicator animates and the
-			// viewport keeps repainting while the async LLM call is in flight.
-			// The loop self-terminates once m.streaming is cleared by the
-			// planResultMsg handler (smoothStreamTickMsg re-schedules only
-			// while m.streaming stays true).
+			// Start the smooth tick loop. It repaints the viewport AND (since
+			// the frozen-spinner fix) physically advances m.spinnerFrame while
+			// m.agentRunning/m.streaming stay set, so the braille indicator
+			// animates even though plan synthesis emits a single terminal
+			// planResultMsg rather than a token stream. The loop self-terminates
+			// once the planResultMsg handler clears the flags.
 			return tea.Batch(
 				m.flushPendingRecords(),
 				m.smoothStreamTickCmd(),
+				m.planSlowNoticeCmd(),
 				m.runPlanEngineCmd(handoffSource, problem, m.cfg.ActiveModelName(), m.handoffCtx),
 			)
 		}
@@ -390,6 +403,29 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return nil
+		}
+
+		// ── EMPTY-HANDOFF GUARD (mirror of /build's zero-task guard) ────────
+		// Reaching here means the structural engine path was skipped because
+		// there was NO handoff ledger content and NO proposed fix. If there is
+		// ALSO no diagnostics in the ledger and the conversational assembly is
+		// empty and the user typed no objective, then there is genuinely
+		// nothing to synthesize a plan from. Previously this fell through to
+		// streamCmd("") which returns nil silently — the spinner never starts,
+		// but the user is left at the prompt with zero feedback, which reads
+		// exactly like the reported "hang". Surface a clean, actionable notice
+		// and return control to the prompt instead of firing an empty request.
+		//
+		// NOTE: we intentionally do NOT gate on PendingTodos count. Zero
+		// pending TODOs is the HEALTHY state for a /investigate → /plan handoff
+		// (the forensic ledger, not pre-parsed TODOs, drives synthesis), so
+		// blocking on that would break every valid handoff.
+		if m.planHasNothingToSynthesize(assembly.RawContext, content) {
+			m.push(roleSystem, infoStyle.Render("No context packets found in ledger. Run /investigate or $test first, then /plan to synthesize an execution plan."))
+			m.reconcileSpinner()
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m.flushPendingRecords()
 		}
 
 		modelName := m.cfg.ActiveModelName()
@@ -465,18 +501,55 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 	}
 }
 
+// planFirstTokenTimeout bounds how long the LLM provider may take to return its
+// FIRST chunk of plan synthesis. A local model that is OOM/stalling will hang
+// the connection indefinitely; this guard aborts fast so the UI never freezes
+// for the full 120s hard budget waiting on a dead provider socket.
+const planFirstTokenTimeout = 8 * time.Second
+
 // runPlanEngineCmd executes the (potentially slow) PlanEngine ledger synthesis
 // in a background goroutine so the synchronous LLM call never blocks the Bubble
 // Tea event loop. The result is delivered asynchronously as a planResultMsg,
 // which the Update() loop handles to stage tasks and clear streaming state.
+//
+// HARDENING: two layered deadlines protect the live terminal.
+//  1. firstTokenCtx (8s) — the provider MUST return its first response byte
+//     within this window. If the local model is stuck/OOM or the socket stalls,
+//     we abort immediately instead of freezing the prompt for the full budget.
+//  2. ctx (120s) — overall synthesis budget for a slow-but-alive model.
+
+// debugLogPlan writes plan-synthesis trace lines to .izen/debug/plan.log
+// instead of os.Stderr. Bubble Tea owns the terminal exclusively while
+// tea.WithAltScreen() is active — any direct stdout/stderr write from a
+// background goroutine races the renderer's own ANSI redraw sequences on the
+// same TTY and corrupts the visible frame (cursor jumps, dropped redraws,
+// an apparently "frozen" screen even though Update() is still running fine
+// underneath). This mirrors debugLogPayload in stream.go so plan-synthesis
+// tracing stays diagnostic without ever touching the live terminal.
+func debugLogPlan(line string) {
+	dir := filepath.Join(".izen", "debug")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	entry := time.Now().Format(time.RFC3339Nano) + " " + line + "\n"
+	f, err := os.OpenFile(filepath.Join(dir, "plan.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	_, _ = f.WriteString(entry)
+}
+
 func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, handoff HandoffContext) tea.Cmd {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	// Register cancel so it can be invoked on mode transition/Ctrl+C
 	m.registerBackgroundCancel(cancel)
 
 	return func() tea.Msg {
+		debugLogPlan("runPlanEngineCmd entered; model=" + modelName)
 		if m.planEngine == nil {
 			cancel()
+			debugLogPlan("plan engine not configured — aborting")
 			return planResultMsg{Err: fmt.Errorf("plan engine not configured"), Handoff: handoff}
 		}
 
@@ -486,8 +559,18 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		}
 		outCh := make(chan outcome, 1)
 
+		// ── 8s FIRST-TOKEN GUARD ──────────────────────────────────────────
+		// The provider call (a single non-streaming HTTP round-trip inside
+		// ProcessFromLedger) inherits this short deadline first. If it does not
+		// return within planFirstTokenTimeout, the goroutine is cancelled and we
+		// surface a clear, actionable terminal error instead of freezing.
+		ftCtx, ftCancel := context.WithTimeout(ctx, planFirstTokenTimeout)
+		defer ftCancel()
+
 		go func() {
-			tasks, err := m.planEngine.ProcessFromLedger(ctx, handoffSource, problem, modelName)
+			debugLogPlan("Preparing LLM payload (ledger bytes=" + fmt.Sprint(len(handoffSource)) + ")")
+			tasks, err := m.planEngine.ProcessFromLedger(ftCtx, handoffSource, problem, modelName)
+			debugLogPlan("Provider returned; err=" + fmt.Sprint(err))
 			outCh <- outcome{tasks: tasks, err: err}
 		}()
 
@@ -495,10 +578,47 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		case o := <-outCh:
 			cancel()
 			return planResultMsg{Tasks: o.tasks, Err: o.err, Handoff: handoff}
+		case <-ftCtx.Done():
+			// First-token deadline missed: the provider is unresponsive.
+			cancel()
+			debugLogPlan("FIRST-TOKEN TIMEOUT after " + planFirstTokenTimeout.String() + " — provider unresponsive")
+			return planResultMsg{
+				Err:     fmt.Errorf("[error] LLM Provider timeout: no response within %s. Check if your local model is stuck/OOM, or that Ollama is running and the model (%s) is loaded", planFirstTokenTimeout, modelName),
+				Handoff: handoff,
+			}
 		case <-ctx.Done():
+			debugLogPlan("hard 120s timeout — aborting")
 			return planResultMsg{Err: fmt.Errorf("plan synthesis timed out after 120s: %w", ctx.Err()), Handoff: handoff}
 		}
 	}
+}
+
+// planHasNothingToSynthesize reports whether a /plan invocation has genuinely
+// no material to work from: no handoff ledger content, no proposed fix, no
+// ledger diagnostics or analytical packets, an empty conversational assembly,
+// AND no user-typed objective. In that state the previous code fell through to
+// streamCmd("") which returns nil silently, leaving the user at the prompt with
+// no feedback (indistinguishable from a hang). The caller uses this to surface
+// an actionable notice instead.
+//
+// It deliberately ignores PendingTodos count: zero pending TODOs is the healthy
+// state for a /investigate → /plan handoff (the forensic ledger drives
+// synthesis, not pre-parsed TODOs), so gating on it would break valid handoffs.
+func (m *model) planHasNothingToSynthesize(rawContext, content string) bool {
+	if strings.TrimSpace(rawContext) != "" || strings.TrimSpace(content) != "" {
+		return false
+	}
+	if strings.TrimSpace(m.handoffLedgerContent) != "" ||
+		strings.TrimSpace(m.handoffCtx.ProposedFix) != "" {
+		return false
+	}
+	if m.sess != nil && m.sess.ContextLedger != nil {
+		l := m.sess.ContextLedger
+		if strings.TrimSpace(l.Diagnostics) != "" || len(l.Packets) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func parseModeShorthand(line string) (modes.Mode, string, bool) {
@@ -604,16 +724,40 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	// previous mode's terminal event.
 	m.injectHandoffContext(mode)
 
-	// ── AUTO-TRIGGER ENFORCEMENT ───────────────────────────────────────
+	// ── AUTO-TRIGGER ENFORCEMENT (FULLY ASYNC) ──────────────────────────
 	// If handoff context was injected for /plan or /build, immediately
 	// trigger the mode's execution engine instead of waiting for user input.
 	// This prevents mode stagnation where the LLM receives handoff data as
 	// passive chat history but produces open-ended chatbot responses.
+	//
+	// CRITICAL: the dispatch MUST NOT run synchronously inside Update(). The
+	// previous implementation called m.handleMessageContent(...) directly here,
+	// which performed heavy, blocking work (ledger payload assembly, prompt
+	// construction, engine call) on the Bubble Tea event-loop thread. That
+	// froze the very first frame and made the UI unresponsive to Ctrl+C until
+	// the work finished. Now the ENTIRE handoff→engine pipeline is wrapped in
+	// the returned tea.Cmd's background goroutine closure, so Update() returns
+	// instantly and the spinner is free to animate from millisecond zero.
 	if !m.streaming && !m.agentRunning && !m.pipelineRunning {
-		if handoffContent := m.buildHandoffTriggerContent(mode); handoffContent != "" {
+		if m.buildHandoffTriggerContent(mode) != "" {
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
-			return m.handleMessageContent(handoffContent)
+			return tea.Batch(
+				m.smoothStreamTickCmd(),
+				func() tea.Msg {
+					// Everything below runs in the cmd-runner goroutine,
+					// never on the Bubble Tea event loop.
+					content := m.buildHandoffTriggerContent(mode)
+					if content == "" {
+						return nil
+					}
+					cmd := m.handleMessageContent(content)
+					if cmd == nil {
+						return nil
+					}
+					return cmd()
+				},
+			)
 		}
 	}
 

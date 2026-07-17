@@ -311,6 +311,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// do we stage tasks and clear streaming state — never while the LLM call
 		// is in flight (that would re-block the event loop).
 		m.planPending = false
+		m.planStartedAt = time.Time{}
 
 		// ALWAYS clear the transient loading flags first so the spinner can
 		// never freeze, regardless of which branch below we take.
@@ -879,6 +880,38 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, flush
 
 	case smoothStreamTickMsg:
+		// ── PHYSICALLY ADVANCE THE SPINNER FRAME ───────────────────────────
+		// This 20ms smooth-tick loop drives token-stream rendering, but it is
+		// ALSO the only tick loop dispatched for background ops that produce no
+		// token stream — notably /plan synthesis (runPlanEngineCmd returns one
+		// terminal planResultMsg, never tokens). Previously this handler shifted
+		// the (empty) stream buffer but never touched m.spinnerFrame, so the
+		// braille spinner (rendered as ProposalSpinnerFrames[spinnerFrame]) was
+		// physically frozen on frame 0 (⠋) for the entire synthesis — the
+		// classic "the spinner is stuck, the UI looks dead" report. Only the
+		// 100ms tickMsg handler advanced the frame, and that loop is never
+		// started for /plan. Advance the frame here too whenever a background
+		// producer owns the flags, so the indicator animates regardless of
+		// which tick loop is live. Throttled to ~100ms cadence so the animation
+		// speed matches the tickMsg loop and 20ms token pacing stays smooth.
+		// Keep the tick loop ALIVE for the entire duration of any background
+		// op — including /plan synthesis, where m.streaming stays false and the
+		// only other thing driving the event loop is the pending planResultMsg
+		// from the background goroutine. If that goroutine hangs (unresponsive
+		// local model), a dead tick loop starves the whole event loop: no
+		// re-renders, no Ctrl+C responsiveness, no slow-notice — the UI appears
+		// frozen. So the loop must keep self-scheduling whenever a background
+		// producer still owns the flags.
+		backgroundActive := m.streaming || m.agentRunning || m.reviewRunning ||
+			m.pipelineRunning || m.planPending
+		if backgroundActive {
+			m.lastAgentActivity = time.Now()
+			if time.Since(m.lastSpinnerAdvance) >= 100*time.Millisecond {
+				m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
+				m.lastSpinnerAdvance = time.Now()
+			}
+		}
+
 		if len(m.streamBuffer) > 0 {
 			// Emit word-aligned chunks for a natural reading rhythm.
 			emit := 0
@@ -909,12 +942,36 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		if len(m.streamBuffer) > 0 || m.streaming {
+		// Re-schedule the tick loop as long as ANY background producer owns
+		// the flags. During /plan synthesis m.streaming is false and the stream
+		// buffer is empty, so gating only on those would let the loop die and
+		// starve the event loop (frozen UI). m.planPending / m.agentRunning are
+		// the authoritative "a background op is still in flight" signals.
+		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.planPending {
 			m.streamTickActive = true
 			return m, m.smoothStreamTickCmd()
 		}
 		// Streaming complete
 		m.streamTickActive = false
+		return m, nil
+
+	case planSlowNoticeMsg:
+		// One-shot soft-timeout probe for /plan synthesis. Only act if THIS
+		// synthesis is still pending (guard against a stale probe from a prior
+		// run and against a synthesis that already resolved). This is purely
+		// informational — it never cancels the 120s hard-timeout work, and it
+		// is surfaced through the viewport (m.push), never a raw terminal print
+		// that would corrupt the alt-screen frame.
+		if m.planPending && msg.startedAt.Equal(m.planStartedAt) {
+			m.push(roleSystem, mutedStyle.Render(fmt.Sprintf(
+				"[timeout] LLM provider still synthesizing after %s — the local model may be unresponsive; check your model status. Ctrl+C to cancel.",
+				planSlowNoticeDelay)))
+			m.refreshViewportContent()
+			if !m.userIsScrollingUp {
+				m.Viewport.GotoBottom()
+			}
+			return m, m.flushPendingRecords()
+		}
 		return m, nil
 
 	case tokenMsg:
@@ -1560,6 +1617,18 @@ func (m *model) spinnerTickCmd() tea.Cmd {
 func (m *model) smoothStreamTickCmd() tea.Cmd {
 	return tea.Tick(20*time.Millisecond, func(t time.Time) tea.Msg {
 		return smoothStreamTickMsg(t)
+	})
+}
+
+// planSlowNoticeCmd schedules a one-shot soft-timeout probe for /plan synthesis.
+// It captures the synthesis start time so the handler can verify the notice
+// still applies to the CURRENT synthesis (a stale probe from a prior run is
+// ignored). It never cancels or shortens the real work — it only surfaces a
+// viewport-safe warning if the local model is slow to respond.
+func (m *model) planSlowNoticeCmd() tea.Cmd {
+	started := m.planStartedAt
+	return tea.Tick(planSlowNoticeDelay, func(time.Time) tea.Msg {
+		return planSlowNoticeMsg{startedAt: started}
 	})
 }
 
