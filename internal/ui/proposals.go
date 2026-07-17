@@ -476,6 +476,30 @@ func extractShellCommands(response string) []string {
 	return cmds
 }
 
+// sanitizeShellCmd guards the TUI input bar against auto-loading commands
+// that are dangerously long or contain diff formatting (e.g., unified diff
+// paste). Returns (cleaned, rejected, reason).
+var diffHeaderRegex = regexp.MustCompile(`(?m)^(?:---\s+\S+|\+\+\+\s+\S+|@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s*@@)`)
+
+func sanitizeShellCmd(cmd string) (string, bool, string) {
+	trimmed := strings.TrimSpace(cmd)
+	if trimmed == "" {
+		return cmd, true, "empty command"
+	}
+
+	const maxLen = 500
+	if len(trimmed) > maxLen {
+		return cmd, true, fmt.Sprintf(
+			"command exceeds %d character limit (%d chars)", maxLen, len(trimmed))
+	}
+
+	if diffHeaderRegex.MatchString(trimmed) {
+		return cmd, true, "command contains unified diff headers (---/+++/@@)"
+	}
+
+	return cmd, false, ""
+}
+
 // execShellCmd executes a shell command and pushes output as records.
 func (m *model) execShellCmd(cmd string) tea.Cmd {
 	return func() tea.Msg {
