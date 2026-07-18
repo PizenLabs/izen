@@ -28,6 +28,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/session"
@@ -51,6 +52,21 @@ var validSystemCommands = map[string]struct{}{
 // ansiRe strips terminal ANSI escape color codes (e.g. \x1b[31m) that can
 // corrupt regex-based stack frame parsers in auto-trace.
 var ansiRe = regexp.MustCompile("\x1b\\[[0-9;]*[a-zA-Z]")
+
+// inputANSIRe strips ALL escape sequences from the interactive text-input
+// buffer, including SGR mouse-tracking reports (\x1b[<0;26;37M / \x1b[<...m)
+// and trailing coordinate remnants. Bubble Tea parses genuine mouse events
+// into tea.MouseMsg before they reach the textinput, so under normal operation
+// nothing leaks — but a defensive strip here guarantees no raw terminal escape
+// can ever pollute the editable command buffer (e.g. during /build shell
+// execution context switches where raw-mode state could briefly differ).
+var inputANSIRe = regexp.MustCompile(`\x1b\[[<?][0-9;]*[a-zA-Z]`)
+
+// sanitizeInputBuffer strips ANSI / mouse-tracking escape sequences from a
+// string so it is safe to store in the prompt's text buffer.
+func sanitizeInputBuffer(s string) string {
+	return inputANSIRe.ReplaceAllString(s, "")
+}
 
 func (m *model) handleInput(line string) tea.Cmd {
 	line = strings.TrimSpace(line)
@@ -507,6 +523,13 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 // for the full 120s hard budget waiting on a dead provider socket.
 const planFirstTokenTimeout = 8 * time.Second
 
+// planLocalMaxLatency bounds how long a LOCAL (non-streaming) model may take to
+// return a full completion. Unlike cloud providers, Ollama's /chat/completions
+// is non-streaming: the "first token" is the entire prefill+generation latency,
+// which a 7B model commonly exceeds. We therefore allow a realistic local budget
+// while still keeping the 120s hard cap as the overall ceiling.
+const planLocalMaxLatency = 90 * time.Second
+
 // runPlanEngineCmd executes the (potentially slow) PlanEngine ledger synthesis
 // in a background goroutine so the synchronous LLM call never blocks the Bubble
 // Tea event loop. The result is delivered asynchronously as a planResultMsg,
@@ -547,6 +570,61 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 
 	return func() tea.Msg {
 		debugLogPlan("runPlanEngineCmd entered; model=" + modelName)
+
+		// ── ADAPTIVE LEDGER TRUNCATION (local SLM guard) ────────────────
+		// Local 7B-class models (qwen2.5-coder:7b, llama3, etc.) choke on the
+		// full forensic ledger — verbose compilation stack traces and dependency
+		// logs blow the context window and the first token never arrives within
+		// the 8s guard, freezing the terminal. For those models we aggressively
+		// compress the ledger to a hard ceiling so only the core error line and
+		// confirmed hypothesis status survive.
+		ledgerToSend := handoffSource
+		useFastTrack := false
+		localModel := plan.IsLocalModel(modelName)
+		if localModel {
+			if len(handoffSource) > plan.MaxLedgerChars {
+				truncated := plan.TruncateLedger(handoffSource, plan.MaxLedgerChars)
+				debugLogPlan("ADAPTIVE TRUNCATION: ledger " +
+					fmt.Sprint(len(handoffSource)) + "→" + fmt.Sprint(len(truncated)) +
+					" chars for local model " + modelName)
+				ledgerToSend = truncated
+			}
+
+			// ── "0 TODO" FAST-TRACK SHORT-CIRCUIT ──────────────────────────
+			// When there are no explicit code TODOs AND the ledger only contains
+			// compilation/dependency blockers (resolvable via environment setup,
+			// not a deep architectural plan), skip the heavy full-plan loop and
+			// dispatch a minimal 3-line shell resolution prompt instead.
+			//
+			// CRITICAL: Extract the investigation conclusion BEFORE discarding the
+			// full ledger context. The conclusion carries the resolved diagnosis
+			// (e.g. "use github.com/moby/moby/client") which must be injected into
+			// the fast-track prompt so the model does NOT re-derive a stale or
+			// incorrect fix from raw error text alone.
+			if len(handoff.PendingTodos) == 0 && plan.IsCompilationOrDependencyError(ledgerToSend) {
+				coreErr := plan.CoreErrorLine(ledgerToSend)
+				conclusion := plan.ExtractConclusionFromLedger(handoffSource)
+				ledgerToSend = plan.FastTrackPrompt(coreErr, conclusion)
+				problem = coreErr
+				useFastTrack = true
+				debugLogPlan("FAST-TRACK SHORT-CIRCUIT: 0 TODOs + compile/dep blocker → minimal prompt")
+			}
+		}
+
+		// ── CLOUD PROVIDER FAST-TRACK (dependency/compilation blocker) ─────────
+		// For cloud providers, we also use the fast-track path when there are
+		// no explicit TODOs AND the ledger contains compilation/dependency errors.
+		// This ensures SHELL_EXEC tasks are generated with high confidence for
+		// dependency fixes, regardless of model type.
+		if !useFastTrack && len(handoff.PendingTodos) == 0 && plan.IsCompilationOrDependencyError(ledgerToSend) {
+			coreErr := plan.CoreErrorLine(ledgerToSend)
+			conclusion := plan.ExtractConclusionFromLedger(handoffSource)
+			ledgerToSend = plan.FastTrackPrompt(coreErr, conclusion)
+			problem = coreErr
+			useFastTrack = true
+			debugLogPlan("CLOUD FAST-TRACK: 0 TODOs + compile/dep blocker → shell resolution prompt")
+		}
+
 		if m.planEngine == nil {
 			cancel()
 			debugLogPlan("plan engine not configured — aborting")
@@ -559,17 +637,32 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		}
 		outCh := make(chan outcome, 1)
 
-		// ── 8s FIRST-TOKEN GUARD ──────────────────────────────────────────
-		// The provider call (a single non-streaming HTTP round-trip inside
-		// ProcessFromLedger) inherits this short deadline first. If it does not
-		// return within planFirstTokenTimeout, the goroutine is cancelled and we
-		// surface a clear, actionable terminal error instead of freezing.
-		ftCtx, ftCancel := context.WithTimeout(ctx, planFirstTokenTimeout)
+		// ── FIRST-TOKEN / COMPLETION GUARD ───────────────────────────────
+		// The provider call (a single NON-STREAMING HTTP round-trip inside
+		// ProcessFromLedger) inherits this deadline. For cloud providers the
+		// round-trip returns the first token quickly, so the tight 8s guard is
+		// appropriate. Local Ollama calls are non-streaming: "first token" == the
+		// entire prefill+generation latency, which a 7B model easily exceeds. For
+		// local models we therefore use a realistic budget (the 120s hard cap
+		// still applies as the overall ctx), and only fall back to the cloud
+		// prompt if the model is genuinely unresponsive.
+		ftBudget := planFirstTokenTimeout
+		if localModel {
+			ftBudget = planLocalMaxLatency
+		}
+		ftCtx, ftCancel := context.WithTimeout(ctx, ftBudget)
 		defer ftCancel()
 
 		go func() {
-			debugLogPlan("Preparing LLM payload (ledger bytes=" + fmt.Sprint(len(handoffSource)) + ")")
-			tasks, err := m.planEngine.ProcessFromLedger(ftCtx, handoffSource, problem, modelName)
+			debugLogPlan("Preparing LLM payload (ledger bytes=" + fmt.Sprint(len(ledgerToSend)) +
+				"; fastTrack=" + fmt.Sprint(useFastTrack) + ")")
+			var tasks []plan.Task
+			var err error
+			if useFastTrack {
+				tasks, err = m.planEngine.ProcessFromLedgerFastTrack(ftCtx, ledgerToSend, modelName)
+			} else {
+				tasks, err = m.planEngine.ProcessFromLedger(ftCtx, ledgerToSend, problem, modelName)
+			}
 			debugLogPlan("Provider returned; err=" + fmt.Sprint(err))
 			outCh <- outcome{tasks: tasks, err: err}
 		}()
@@ -582,6 +675,15 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 			// First-token deadline missed: the provider is unresponsive.
 			cancel()
 			debugLogPlan("FIRST-TOKEN TIMEOUT after " + planFirstTokenTimeout.String() + " — provider unresponsive")
+			// For local models, degrade gracefully: instead of a hard failure
+			// that strands the user, surface a fallback action they can take
+			// directly from the interactive prompt.
+			if localModel {
+				return planResultMsg{
+					Err:     fmt.Errorf("[error] Local model (%s) produced no response within %s. The forensic ledger was already minimized and a fast-track shell plan was attempted — this points to an unloaded/OOM model. Ensure Ollama has the model loaded, or run `/provider <cloud>` to offload planning to a cloud model", modelName, planLocalMaxLatency),
+					Handoff: handoff,
+				}
+			}
 			return planResultMsg{
 				Err:     fmt.Errorf("[error] LLM Provider timeout: no response within %s. Check if your local model is stuck/OOM, or that Ollama is running and the model (%s) is loaded", planFirstTokenTimeout, modelName),
 				Handoff: handoff,
@@ -1173,6 +1275,123 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 	return m.handleBuildRun(0)
 }
 
+// runBuildShellExec executes a SHELL_EXEC build task directly via the OS shell
+// and reports the result — it never dispatches the command to the LLM. After a
+// run the task is marked terminal and the next idle task is advanced, preserving
+// /build's execute-only contract.
+func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		runner := execExecutionRunner(".")
+		result, err := runner.Run(task.Target)
+		output := ""
+		exitCode := 0
+		if result != nil {
+			output = result.Stdout
+			if result.Stderr != "" {
+				if output != "" {
+					output += "\n"
+				}
+				output += result.Stderr
+			}
+			exitCode = result.ExitCode
+		}
+		if err != nil && output == "" {
+			output = err.Error()
+			if exitCode == 0 {
+				exitCode = 1
+			}
+		}
+
+		// Mark the task terminal in the live session ledger so the queue
+		// advances and the developer sees progress.
+		tasks := m.sess.CurrentTasks
+		for i := range tasks {
+			if tasks[i].StepNum == task.StepNum {
+				if exitCode == 0 {
+					tasks[i].Status = "completed"
+				} else {
+					tasks[i].Status = "failed"
+				}
+				break
+			}
+		}
+		m.sess.StageTaskList(&tasks)
+		_ = m.sess.Save()
+		return buildResultMsg{output: output, exitCode: exitCode, err: err}
+	}
+}
+
+// runBuildPatchExec executes a FILE_MUTATE / GIT_ACTION build task by generating
+// the patch via the LLM (one non-streaming call) and applying it through the
+// execution engine's PatchManager — never via the conversational streamCmd.
+// This is what makes /build actually mutate the workspace instead of chatting.
+func (m *model) runBuildPatchExec(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		if m.provider == nil {
+			return buildResultMsg{err: fmt.Errorf("build execution error: no provider configured")}
+		}
+
+		// Build a focused, non-chat patch-generation prompt and call the LLM
+		// once (non-streaming) so we get a deterministic diff/FILE block back.
+		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		system := prompt.BuildContract()
+		req := ai.Request{
+			Model:    m.cfg.ActiveModelName(),
+			System:   system,
+			Stream:   false,
+			Messages: []ai.Message{{Role: "user", Content: handoff}},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		resp, err := m.provider.Execute(ctx, req)
+		if err != nil {
+			return buildResultMsg{err: fmt.Errorf("patch generation failed: %w", err)}
+		}
+		if resp == nil || strings.TrimSpace(resp.Content) == "" {
+			return buildResultMsg{err: fmt.Errorf("patch generation returned empty output")}
+		}
+
+		// Feed the LLM output to the execution engine as a concrete patch and
+		// apply it. PatchManager.Apply handles unified diffs, FILE: blocks and
+		// full rewrites, with shadow backups + mutation guardrails.
+		orig := ""
+		if data, rerr := os.ReadFile(task.Target); rerr == nil {
+			orig = string(data)
+		}
+		patch := &execution.Patch{
+			ID:        fmt.Sprintf("build-%d", task.StepNum),
+			File:      task.Target,
+			Original:  orig,
+			Modified:  resp.Content,
+			TaskID:    task.StepNum,
+			ContextID: m.sess.ContextID,
+		}
+		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
+			return buildResultMsg{
+				output:   resp.Content,
+				exitCode: 1,
+				err:      fmt.Errorf("patch apply failed: %w", applyErr),
+			}
+		}
+
+		// Mark the task terminal in the live session ledger.
+		tasks := m.sess.CurrentTasks
+		for i := range tasks {
+			if tasks[i].StepNum == task.StepNum {
+				tasks[i].Status = "completed"
+				break
+			}
+		}
+		m.sess.StageTaskList(&tasks)
+		_ = m.sess.Save()
+		return buildResultMsg{
+			output:   fmt.Sprintf("Applied patch to %s", task.Target),
+			exitCode: 0,
+		}
+	}
+}
+
 func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	tasks := m.sess.CurrentTasks
 	if len(tasks) == 0 {
@@ -1236,6 +1455,25 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	m.currentBuildTaskID = targetTask.StepNum
 	m.execEng.Patches.SetLedger(m.buildLedger)
 	m.execEng.Patches.SetContextID(m.sess.ContextID)
+
+	// ── SHELL_EXEC: run the command directly, do NOT chat ───────────────
+	// A SHELL_EXEC task is a concrete shell command (e.g. `go get <pkg>` /
+	// `go mod tidy`). /build MUST execute it via the OS shell and report the
+	// output — dispatching it to the LLM would produce a chat reply instead of
+	// actually running the command, breaking the build's execute-only contract.
+	if targetTask.Type == "SHELL_EXEC" {
+		return m.runBuildShellExec(targetTask)
+	}
+
+	// ── FILE_MUTATE / GIT_ACTION: generate + APPLY a real patch ──────────
+	// These tasks mutate the workspace. /build MUST produce the change and
+	// apply it through the execution engine (PatchManager), NOT stream a chat
+	// reply. Routing them through the conversational streamCmd made the model
+	// "greet" the user instead of executing — a violation of /build's sole
+	// mandate (execute, never chat).
+	if targetTask.Type == "FILE_MUTATE" || targetTask.Type == "GIT_ACTION" {
+		return m.runBuildPatchExec(targetTask)
+	}
 
 	buildTrace := &ctxpkg.CodebaseTrace{
 		MatchedFiles:    []string{targetTask.Target},

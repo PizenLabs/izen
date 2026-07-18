@@ -447,7 +447,7 @@ var utilityCommands = map[modes.Mode][]string{
 
 var globalCommands = []string{"/help", "/?", "/mode", "/objective", "/drop", "/quit", "/arch"}
 
-var flowingSpinnerFrames = []string{" ✦ ", " ★ ", " ⚙ ", " ❋ ", " ❄ ", " ❆ ", " ❋ ", " ⚙ ", " ★ ", " ✦ "}
+var flowingSpinnerFrames = []string{" ✦ ", " ✧ ", " ⚙ ", " ❋ ", " ❄ ", " ✱ ", " ❋ ", " ⚙ ", " ✧ ", " ✦ "}
 
 // providerSwitchMsg signals a successful provider switch.
 type providerSwitchMsg struct {

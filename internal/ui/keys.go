@@ -254,5 +254,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *model) syncInputFromTI() {
 	m.input.Reset()
-	m.input.WriteString(m.ti.Value())
+	// Defensive strip: never let raw ANSI / mouse-tracking escape sequences
+	// (e.g. \x1b[<0;26;37M) into the editable command buffer. Under normal
+	// operation Bubble Tea parses mouse into tea.MouseMsg before it reaches the
+	// textinput, but this guarantees the buffer stays clean regardless of
+	// terminal raw-mode state during /build shell execution.
+	m.input.WriteString(sanitizeInputBuffer(m.ti.Value()))
 }

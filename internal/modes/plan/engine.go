@@ -64,27 +64,67 @@ func (e *Engine) SetProvider(provider ProviderFunc) {
 // ProcessFromLedger generates an execution plan directly from investigation
 // ledger data using enforced structured output (JSON mode). Returns parsed
 // Task structs, bypassing the conversational text-streaming path entirely.
+//
+// When fastTrack is true (used for local 7B models on a 0-TODO + compile/dep
+// blocker), the heavy JSON-schema instruction and full forensic ledger prompt
+// are replaced with a minimal shell-resolution prompt so the model can produce
+// its first token within a tight local budget instead of choking on context.
 func (e *Engine) ProcessFromLedger(ctx context.Context, ledgerContent string, problem string, modelName string) ([]Task, error) {
+	return e.processFromLedger(ctx, ledgerContent, problem, modelName, false)
+}
+
+// ProcessFromLedgerFastTrack is the lightweight variant used for local SLMs that
+// hit a 0-TODO + dependency/compilation blocker. It skips the JSON-schema system
+// prompt and the full forensic ledger prompt in favour of a minimal resolution
+// prompt, keeping the prompt tiny enough for a 7B model to answer quickly.
+func (e *Engine) ProcessFromLedgerFastTrack(ctx context.Context, promptText string, modelName string) ([]Task, error) {
+	return e.processFromLedger(ctx, "", "", modelName, true, promptText)
+}
+
+func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, problem string, modelName string, fastTrack bool, fastPrompt ...string) ([]Task, error) {
 	if e == nil || e.provider == nil {
 		return nil, fmt.Errorf("plan engine: provider not set")
 	}
 
-	req := ai.Request{
-		Model: modelName,
-		Messages: []ai.Message{
-			{
-				Role:    "system",
-				Content: SchemaJSONInstruction(),
+	var req ai.Request
+	if fastTrack && len(fastPrompt) > 0 {
+		req = ai.Request{
+			Model: modelName,
+			Messages: []ai.Message{
+				{
+					Role:    "system",
+					Content: prompt.PlanSystemPrompt(),
+				},
+				{
+					Role:    "user",
+					Content: fastPrompt[0],
+				},
 			},
-			{
-				Role:    "user",
-				Content: prompt.BuildPlanJSONPrompt(problem, ledgerContent),
+			Stream: false,
+		}
+	} else {
+		// Extract the investigation conclusion so it can be injected as a
+		// high-priority override signal. The conclusion carries the resolved
+		// diagnosis (e.g. corrected dependency paths) that must take precedence
+		// over raw error text when synthesising shell tasks.
+		conclusion := ExtractConclusionFromLedger(ledgerContent)
+		req = ai.Request{
+			Model: modelName,
+			Messages: []ai.Message{
+				{
+					Role:    "system",
+					Content: prompt.PlanSystemPrompt() + "\n\n" + SchemaJSONInstruction(),
+				},
+				{
+					Role:    "user",
+					Content: prompt.BuildPlanJSONPrompt(problem, ledgerContent, conclusion),
+				},
 			},
-		},
-		Stream: false,
-		ResponseFormat: &ai.ResponseFormat{
-			Type: "json_object",
-		},
+			Stream: false,
+			ResponseFormat: &ai.ResponseFormat{
+				Type: "json_object",
+			},
+		}
 	}
 
 	resp, err := e.provider(ctx, req)
@@ -99,27 +139,118 @@ func (e *Engine) ProcessFromLedger(ctx context.Context, ledgerContent string, pr
 	// Persist raw plan output to disk.
 	_ = e.store.SaveRawMarkdown("plan", resp.Content)
 
+	if fastTrack && len(fastPrompt) > 0 {
+		// Fast-track: the model returns a minimal markdown shell checklist. A
+		// local 7B model may still emit the occasional placeholder/non-shell
+		// task; rather than hard-aborting the whole plan, we keep only the valid
+		// SHELL_EXEC tasks (placeholder FILE_MUTATE lines are dropped). If nothing
+		// usable survives, we surface a clear fallback instead of a build abort.
+		raw := ParseMarkdownToTasks(resp.Content)
+		clean := make([]Task, 0, len(raw))
+		for _, t := range raw {
+			if t.Type == "SHELL_EXEC" && strings.TrimSpace(t.Target) != "" {
+				clean = append(clean, t)
+			}
+		}
+		if len(clean) == 0 {
+			return nil, fmt.Errorf("plan engine: fast-track produced no runnable shell tasks (model returned: %s)", truncateForLog(resp.Content))
+		}
+		return clean, nil
+	}
+
 	// Parse structured JSON output into tasks.
 	jsonResult := ParseJSONPlan(resp.Content)
 	if jsonResult.Valid && len(jsonResult.Tasks) > 0 {
-		// Validate tasks for placeholder paths
+		// Local 7B SLMs frequently emit tasks with empty targets under context
+		// pressure. Rather than hard-aborting the whole plan, filter out invalid
+		// tasks and keep only the runnable ones — identical to the fast-track
+		// resilience pattern below. If nothing valid survives, fall through to
+		// the compile/dep fallback or error path.
 		if err := ValidateAllTasks(jsonResult.Tasks); err != nil {
-			return nil, err
+			clean := filterValidTasks(jsonResult.Tasks)
+			if len(clean) > 0 {
+				return clean, nil
+			}
+		} else {
+			return jsonResult.Tasks, nil
 		}
-		return jsonResult.Tasks, nil
 	}
 
 	// Fallback: if JSON parsing failed, try markdown task extraction.
 	tasks := ParseMarkdownToTasks(resp.Content)
 	if len(tasks) > 0 {
-		// Validate tasks for placeholder paths
 		if err := ValidateAllTasks(tasks); err != nil {
-			return nil, err
+			clean := filterValidTasks(tasks)
+			if len(clean) > 0 {
+				return clean, nil
+			}
+		} else {
+			return tasks, nil
 		}
-		return tasks, nil
 	}
 
-	return nil, fmt.Errorf("plan engine: no valid tasks found in provider response (JSON parse error: %s)", jsonResult.Error)
+	// ── COMPILE/DEP FALLBACK (local-model JSON failure) ───────────────
+	// A local 7B model frequently returns mixed/markdown content instead of
+	// strict JSON, so the structured parse above fails. When the problem
+	// payload itself is a compile/dependency error, retry ONCE with the
+	// minimal fast-track shell prompt rather than hard-aborting — this is the
+	// path that reliably yields a runnable SHELL_EXEC task on small models.
+	//
+	// Cross-reference the investigation conclusion from the full ledger so
+	// the fast-track prompt carries the corrected diagnosis (not just raw
+	// error text that may cause the model to re-derive a stale fix).
+	//
+	// Check BOTH problem parameter AND ledgerContent for compilation/dependency
+	// errors — the problem param may be empty or generic (e.g. "Investigation
+	// results require structured execution plan") while the ledger contains
+	// the actual error message from test/build output.
+	compileErr := IsCompilationOrDependencyError(problem) || IsCompilationOrDependencyError(ledgerContent)
+	if compileErr {
+		coreErr := CoreErrorLine(problem)
+		if coreErr == "" {
+			coreErr = CoreErrorLine(ledgerContent)
+		}
+		conclusion := ExtractConclusionFromLedger(ledgerContent)
+		retry, retryErr := e.ProcessFromLedgerFastTrack(ctx, FastTrackPrompt(coreErr, conclusion), modelName)
+		if retryErr != nil {
+			return nil, retryErr
+		}
+		if len(retry) > 0 {
+			return retry, nil
+		}
+		// If the retry also failed, surface the original model output for context.
+		return nil, fmt.Errorf("plan engine: no valid tasks found (provider returned non-JSON: %s)", truncateForLog(resp.Content))
+	}
+
+	jsonErr := jsonResult.Error
+	if jsonErr == "" {
+		jsonErr = fmt.Sprintf("empty error field (provider response: %s)", truncateForLog(resp.Content))
+	}
+	return nil, fmt.Errorf("plan engine: no valid tasks found in provider response (JSON parse error: %s)", jsonErr)
+}
+
+// filterValidTasks filters a task slice to only tasks with valid, non-empty
+// targets. Invalid tasks are dropped silently — identical resilience pattern
+// used by the fast-track path — so a local 7B model with one bad task does
+// not abort the entire plan. Returns the original slice if all tasks are valid.
+func filterValidTasks(tasks []Task) []Task {
+	clean := make([]Task, 0, len(tasks))
+	for _, t := range tasks {
+		isValid, _ := ValidateTaskTarget(t.Target, t.Type)
+		if isValid {
+			clean = append(clean, t)
+		}
+	}
+	return clean
+}
+
+// truncateForLog caps a model response excerpt so error messages stay readable.
+func truncateForLog(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 200 {
+		return s[:200] + "..."
+	}
+	return s
 }
 
 // ProcessPlan generates an execution plan by dispatching to the AI provider

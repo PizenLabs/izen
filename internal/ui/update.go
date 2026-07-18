@@ -350,6 +350,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.handoffCtx.PendingTodos[i] = t.Type + ": " + t.Target + " — " + t.Description
 		}
 		m.push(roleStatus, fmt.Sprintf("Plan staged: %d task(s). Use /build to execute.", len(msg.Tasks)))
+		// Render the staged task list into the viewport so the developer can
+		// see exactly what /build will execute.
+		var tb strings.Builder
+		tb.WriteString("## STAGED EXECUTION PLAN\n")
+		for i, t := range msg.Tasks {
+			fmt.Fprintf(&tb, "%d. [%s] %s — %s\n", i+1, t.Type, t.Target, t.Description)
+		}
+		m.push(roleStatus, tb.String())
 		if m.buildLedger == nil {
 			m.buildLedger = ctxpkg.NewTaskLedger()
 		}
@@ -534,9 +542,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Execution failed (exit %d).", msg.exitCode)))
 		}
+
+		// After a SHELL_EXEC step finishes, advance to the next idle task so the
+		// build queue makes progress automatically. The handler that dispatched
+		// the SHELL_EXEC (runBuildShellExec) already marked this task terminal.
+		hasNext := false
+		for _, t := range m.sess.CurrentTasks {
+			if t.Status == "idle" || t.Status == "processing" {
+				hasNext = true
+				break
+			}
+		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
+		if hasNext && m.resolver.Current() == modes.ModeBuild {
+			return m, tea.Batch(flush, m.handleBuildRun(0))
+		}
 		return m, flush
 
 	case logInputMsg:
