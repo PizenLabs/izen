@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/config"
+	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -164,21 +165,58 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.spinnerFrame = 0
 		}
 
-		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning ||
-			m.state == StateProcessing || m.state == StateAwaitingApproval {
+		// DETERMINISTIC RECONCILE: a frozen spinner (frame still advancing,
+		// animation requested below) with no owning producer is a leaked
+		// state. Force-clear it so the UI can never lock on "✦ streaming…".
+		//
+		// IDLE-GATE FIX: the leak detector must NOT wipe m.streaming /
+		// m.agentRunning on the first ticks before a background worker has had
+		// a chance to write a process update. We only reconcile when the agent
+		// flag is set but there is NO live stream channel driving it AND no
+		// deferred orchestration result is expected (planPending) AND the last
+		// recorded agent activity has been idle for at least 15 seconds — this
+		// safely catches a genuine long-term hang (e.g. a deadlocked /build
+		// handoff) while never freezing the spinner of a legitimate /plan or
+		// /investigate worker that owns the flags until its terminal result
+		// message arrives.
+		const agentHangTimeout = 15 * time.Second
+		if m.agentRunning && m.streamCh == nil && !m.planPending && m.state == StateChat &&
+			!m.reviewRunning && !m.pipelineRunning &&
+			m.state != StateProcessing && m.state != StateAwaitingApproval &&
+			!m.lastAgentActivity.IsZero() && time.Since(m.lastAgentActivity) > agentHangTimeout {
+			m.reconcileSpinner()
+		}
+
+		// ── UNIFIED TICK PATTERN ───────────────────────────────────────────
+		// The render loop is driven purely by lightweight boolean flags.
+		// While any background operation is in flight we advance the spinner
+		// frame, repaint the viewport from its live buffers, and re-dispatch
+		// the next tick. When idle we return nil and the loop stops — no
+		// custom tick-source ownership, no locks, no deadlock.
+		hasActiveWork := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning ||
+			m.state == StateProcessing || m.state == StateAwaitingApproval
+		if hasActiveWork {
+			// Keep the activity heartbeat fresh while any execution indicator
+			// is live. The idle-gate in the reconcile block above relies on
+			// this to avoid prematurely force-clearing a healthy spinner.
+			m.lastAgentActivity = time.Now()
+			// 1. Physically advance the spinner frame.
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
+			// 2. Repaint the viewport from the live stream/agent buffers.
 			if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.state == StateProcessing {
 				m.refreshViewportContent()
 			}
+			// 3. Re-dispatch the tick to keep the render loop alive.
 			return m, m.spinnerTickCmd()
 		}
-		return m, m.spinnerTickCmd()
+		return m, nil
 
 	case agentStartMsg:
 		m.agentRunning = true
 		m.agentDone = false
 		m.agentLabel = msg.label
 		m.spinnerFrame = 0
+		m.lastAgentActivity = time.Now()
 		return m, nil
 
 	case agentDoneMsg:
@@ -194,6 +232,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, flush
 
 	case investigateResultMsg:
+		m.lastAgentActivity = time.Now()
 		m.agentRunning = false
 		m.reviewRunning = false
 		m.agentDone = true
@@ -202,6 +241,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+msg.err.Error())
+			// PERSISTENT NAVIGATION CHIPS (BUG 1): even on failure the user
+			// must never be left on a dead viewport. Surface Re-investigate
+			// so the diagnostic loop can be retried.
+			m.currentResult = investigateResultActions()
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
@@ -215,11 +258,113 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streaming = false
 		m.streamParser = nil
 		m.pushRecords(msg.records)
-		m.push(roleSystem, "Diagnostics collected. Analyzing...")
+		// Store the raw Context-Ledger data before anything else — this is
+		// the authoritative source for handoff, not the LLM's transient output.
+		m.handoffLedgerContent = ctxpkg.SanitizeLedger(msg.ledgerContent)
+
+		// Capture the structured forensic ledger so bridgeInvestigationToLedger
+		// can inject its findings as sequential, ID-addressed packets into the
+		// canonical session.ContextLedger.
+		m.lastInvestigateLedger = msg.investigateLedger
+
+		// BRIDGE: project read-only forensic findings into the canonical
+		// session.ContextLedger (handoff SSOT) for downstream /plan consumption.
+		m.bridgeInvestigationToLedger(m.handoffLedgerContent, msg.err)
+
+		// Populate the handoff context so the /investigate workspace renders
+		// its interactive Action Chip ("Formulate Execution Plan" → /plan).
+		// Without this the terminal shows the completion notice but no buttons,
+		// stranding the user into manually typing /plan.
+		if m.handoffLedgerContent != "" {
+			m.handoffCtx.ProposedFix = m.handoffLedgerContent
+		}
+
+		// SYSTEM BOUNDARY: when the engine already produced a resolved ledger,
+		// its structured data IS the output. Re-streaming the escalation as
+		// free-form chat leaks conversational fluff to the viewport, so we
+		// suppress it and surface only the bounded "ready for /plan" notice
+		// plus the Action Chip.
+		if m.handoffLedgerContent == "" && msg.escalationContent != "" {
+			m.push(roleSystem, "Diagnostics collected. Analyzing...")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, tea.Batch(flush, m.streamCmd(msg.escalationContent))
+		}
+
+		if len(msg.records) == 0 {
+			m.push(roleSystem, "Investigation complete — no structured findings to report.")
+		}
+		m.push(roleStatus, "Investigation complete. Context-Ledger ready for /plan handoff.")
+		// PERSISTENT NAVIGATION CHIPS (BUG 1): always populate the navigation
+		// controls so the user is never left with a dead viewport after a fast
+		// (cached) transition. "📋 Plan Solution" submits /plan against the
+		// structured diagnostic payload; "🔄 Re-investigate" re-runs /investigate.
+		m.currentResult = investigateResultActions()
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
-		return m, tea.Batch(flush, m.streamCmd(msg.escalationContent))
+		return m, flush
+
+	case planResultMsg:
+		// Terminal handler for the asynchronous PlanEngine synthesis. Only here
+		// do we stage tasks and clear streaming state — never while the LLM call
+		// is in flight (that would re-block the event loop).
+		m.planPending = false
+		m.planStartedAt = time.Time{}
+
+		// ALWAYS clear the transient loading flags first so the spinner can
+		// never freeze, regardless of which branch below we take.
+		m.reconcileSpinner()
+
+		if msg.Err != nil {
+			m.push(roleError, fmt.Sprintf("Failed to synthesize plan from ledger: %v", msg.Err))
+			// Retain a baseline Action Chip so the user is never left with a
+			// dead viewport and no buttons — they can re-investigate the failure.
+			m.currentResult = failureResult(m.handoffLedgerContent)
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+
+		if len(msg.Tasks) == 0 {
+			// Deterministic fallback: a handoff that yields zero constructive
+			// tasks must immediately clear the view-model flags rather than
+			// leave the UI frozen on the spinner. We still surface a baseline
+			// Action Chip (Investigate Root Cause) so the terminal stays alive.
+			m.push(roleError, "plan synthesis produced zero tasks — investigation data may be insufficient")
+			m.currentResult = failureResult(m.handoffLedgerContent)
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+
+		m.sess.StageTaskList(&msg.Tasks)
+		// BRIDGE: mirror the structured /plan queue into the canonical
+		// session.ContextLedger as []AtomicTask — the SSOT /build consumes.
+		m.bridgePlanToLedger(msg.Tasks)
+		m.handoffCtx.PendingTodos = make([]string, len(msg.Tasks))
+		for i, t := range msg.Tasks {
+			m.handoffCtx.PendingTodos[i] = t.Type + ": " + t.Target + " — " + t.Description
+		}
+		m.push(roleStatus, fmt.Sprintf("Plan staged: %d task(s). Use /build to execute.", len(msg.Tasks)))
+		// Render the staged task list into the viewport so the developer can
+		// see exactly what /build will execute.
+		var tb strings.Builder
+		tb.WriteString("## STAGED EXECUTION PLAN\n")
+		for i, t := range msg.Tasks {
+			fmt.Fprintf(&tb, "%d. [%s] %s — %s\n", i+1, t.Type, t.Target, t.Description)
+		}
+		m.push(roleStatus, tb.String())
+		if m.buildLedger == nil {
+			m.buildLedger = ctxpkg.NewTaskLedger()
+		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		flush := m.flushPendingRecords()
+		return m, flush
 
 	case graphBuiltMsg:
 		m.agentRunning = false
@@ -314,15 +459,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// When verification fails after a build patch, silently trigger
 			// a recovery cycle: re-read the file, re-generate a corrected
 			// AST block, and re-apply — without producing any UI chatter.
+			//
+			// RULE B: If the failure is caused by missing Go modules (e.g.,
+			// "no required module provides package" or "to add it: go get"),
+			// halt the recovery loop immediately. Do NOT waste recovery
+			// attempts on import hallucinations — the .go imports are valid,
+			// the dependency just needs to be fetched.
 			if !msg.passed && m.resolver.Current() == modes.ModeBuild &&
 				m.buildRecoveryCount < maxBuildRecoveryAttempts {
-				m.buildRecoveryCount++
-				m.acceptAll = true
-				m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
-					"⚙ [recovery %d/%d] auto-correcting compilation errors...",
-					m.buildRecoveryCount, maxBuildRecoveryAttempts)))
-				flush := m.flushPendingRecords()
-				return m, tea.Batch(flush, m.runFixCmd(""))
+				if hasMissingModuleError(msg.output) {
+					m.acceptAll = false
+					m.push(roleError, "[BUILD HALTED] Build failed due to missing Go module dependency. Auto-recovery cannot fix import paths. Run 'go get <package>' manually, then retry.")
+				} else {
+					m.buildRecoveryCount++
+					m.acceptAll = true
+					m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
+						"⚙ [recovery %d/%d] auto-correcting compilation errors...",
+						m.buildRecoveryCount, maxBuildRecoveryAttempts)))
+					flush := m.flushPendingRecords()
+					return m, tea.Batch(flush, m.runFixCmd(""))
+				}
 			}
 
 			// If recovery exhausted or verification passed, expose the
@@ -331,6 +487,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.acceptAll = false
 			}
 			m.currentResult = buildVerifyResult(msg.passed)
+
+			// ── FAIL-FAST MACHINE: mirror outcome into the canonical
+			// session.ContextLedger. On a hard failure (recovery exhausted or
+			// missing-module halt) the active task is marked Failed and the
+			// queue is frozen — no subsequent task is advanced, leaving the
+			// workspace in its broken state for developer inspection.
+			m.bridgeBuildResultToLedger(m.currentBuildTaskID, msg.passed, msg.output)
+			if !msg.passed && m.resolver.Current() == modes.ModeBuild {
+				if m.buildRecoveryCount >= maxBuildRecoveryAttempts || hasMissingModuleError(msg.output) {
+					m.push(roleError, fmt.Sprintf(
+						"[BUILD HALTED] Step %d failed verification. Queue frozen — %d/%d task(s) complete. Inspect and fix, then re-run /build.",
+						m.currentBuildTaskID, m.countCompletedLedgerTasks(), len(m.sess.CurrentTasks)))
+				} else if m.buildRecoveryCount < maxBuildRecoveryAttempts {
+					// Soft failure within recovery budget: ledger still marks
+					// the attempt, but the auto-recovery cycle continues.
+					m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
+						"Step %d verification failed — entering auto-recovery (attempt %d/%d).",
+						m.currentBuildTaskID, m.buildRecoveryCount, maxBuildRecoveryAttempts)))
+				}
+			}
 			if m.resolver.Current() == modes.ModeBuild {
 				m.push(roleSystem, "Build verification complete.")
 			}
@@ -366,9 +542,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Execution failed (exit %d).", msg.exitCode)))
 		}
+
+		// After a SHELL_EXEC step finishes, advance to the next idle task so the
+		// build queue makes progress automatically. The handler that dispatched
+		// the SHELL_EXEC (runBuildShellExec) already marked this task terminal.
+		hasNext := false
+		for _, t := range m.sess.CurrentTasks {
+			if t.Status == "idle" || t.Status == "processing" {
+				hasNext = true
+				break
+			}
+		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
+		if hasNext && m.resolver.Current() == modes.ModeBuild {
+			return m, tea.Batch(flush, m.handleBuildRun(0))
+		}
 		return m, flush
 
 	case logInputMsg:
@@ -712,6 +902,38 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, flush
 
 	case smoothStreamTickMsg:
+		// ── PHYSICALLY ADVANCE THE SPINNER FRAME ───────────────────────────
+		// This 20ms smooth-tick loop drives token-stream rendering, but it is
+		// ALSO the only tick loop dispatched for background ops that produce no
+		// token stream — notably /plan synthesis (runPlanEngineCmd returns one
+		// terminal planResultMsg, never tokens). Previously this handler shifted
+		// the (empty) stream buffer but never touched m.spinnerFrame, so the
+		// braille spinner (rendered as ProposalSpinnerFrames[spinnerFrame]) was
+		// physically frozen on frame 0 (⠋) for the entire synthesis — the
+		// classic "the spinner is stuck, the UI looks dead" report. Only the
+		// 100ms tickMsg handler advanced the frame, and that loop is never
+		// started for /plan. Advance the frame here too whenever a background
+		// producer owns the flags, so the indicator animates regardless of
+		// which tick loop is live. Throttled to ~100ms cadence so the animation
+		// speed matches the tickMsg loop and 20ms token pacing stays smooth.
+		// Keep the tick loop ALIVE for the entire duration of any background
+		// op — including /plan synthesis, where m.streaming stays false and the
+		// only other thing driving the event loop is the pending planResultMsg
+		// from the background goroutine. If that goroutine hangs (unresponsive
+		// local model), a dead tick loop starves the whole event loop: no
+		// re-renders, no Ctrl+C responsiveness, no slow-notice — the UI appears
+		// frozen. So the loop must keep self-scheduling whenever a background
+		// producer still owns the flags.
+		backgroundActive := m.streaming || m.agentRunning || m.reviewRunning ||
+			m.pipelineRunning || m.planPending
+		if backgroundActive {
+			m.lastAgentActivity = time.Now()
+			if time.Since(m.lastSpinnerAdvance) >= 100*time.Millisecond {
+				m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
+				m.lastSpinnerAdvance = time.Now()
+			}
+		}
+
 		if len(m.streamBuffer) > 0 {
 			// Emit word-aligned chunks for a natural reading rhythm.
 			emit := 0
@@ -742,14 +964,45 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		if len(m.streamBuffer) > 0 || m.streaming {
+		// Re-schedule the tick loop as long as ANY background producer owns
+		// the flags. During /plan synthesis m.streaming is false and the stream
+		// buffer is empty, so gating only on those would let the loop die and
+		// starve the event loop (frozen UI). m.planPending / m.agentRunning are
+		// the authoritative "a background op is still in flight" signals.
+		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.planPending {
 			m.streamTickActive = true
 			return m, m.smoothStreamTickCmd()
 		}
+		// Streaming complete
 		m.streamTickActive = false
 		return m, nil
 
+	case planSlowNoticeMsg:
+		// One-shot soft-timeout probe for /plan synthesis. Only act if THIS
+		// synthesis is still pending (guard against a stale probe from a prior
+		// run and against a synthesis that already resolved). This is purely
+		// informational — it never cancels the 120s hard-timeout work, and it
+		// is surfaced through the viewport (m.push), never a raw terminal print
+		// that would corrupt the alt-screen frame.
+		if m.planPending && msg.startedAt.Equal(m.planStartedAt) {
+			m.push(roleSystem, mutedStyle.Render(fmt.Sprintf(
+				"[timeout] LLM provider still synthesizing after %s — the local model may be unresponsive; check your model status. Ctrl+C to cancel.",
+				planSlowNoticeDelay)))
+			m.refreshViewportContent()
+			if !m.userIsScrollingUp {
+				m.Viewport.GotoBottom()
+			}
+			return m, m.flushPendingRecords()
+		}
+		return m, nil
+
 	case tokenMsg:
+		// LOCK-FREE CONSUMER: this per-token handler MUST NOT acquire any
+		// ContextLedger / TaskLedger mutex. It only appends to local buffers
+		// and schedules the next read. The ledger is committed once, at EOF,
+		// by the streamDoneMsg handler below. Holding a ledger lock here would
+		// serialize the stream against the renderer and reproduce the
+		// 108-token freeze.
 		raw := string(msg)
 		m.responseBuffer.WriteString(raw)
 		m.streamBuffer += raw
@@ -838,13 +1091,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			if m.pipelineStep == "blueprinting" && final != "" {
-				// Step 2 complete → blueprint is ready, jump to build execution
+				// Step 2 complete → blueprint is ready, but auto-build is blocked
 				pipelineID := ""
 				if m.ledger != nil {
 					pipelineID = fmt.Sprintf("#%d", m.ledger.ActiveID)
 				}
-				m.pipelineRunning = false
-				m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Pipeline complete [%s]. Switched to /build.", pipelineID)))
+				m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Pipeline complete [%s].", pipelineID)))
 				flush := m.flushPendingRecords()
 				return m, tea.Batch(flush, func() tea.Msg {
 					return blueprintReadyMsg{blueprint: final, ledgerID: pipelineID}
@@ -855,8 +1107,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// ── Handoff: Capture ProposedFix from investigate mode ──────────
 		// The "Formulate Execution Plan" capability is derived from
 		// handoffCtx.ProposedFix in BuildViewContext; no UI cache to refresh.
+		//
+		// DATA HIERARCHY (Context-Ledger > Transaction Cache):
+		// 1. handoffLedgerContent (structured Context-Ledger from the
+		//    investigate engine's FormatLedgerForPlan) — authoritative SSOT.
+		// 2. LastFailurePayload (raw compilation errors / test output).
+		// 3. LLM output (final) — transient Transaction Cache, used only
+		//    as a last resort when all structured sources are empty.
+		// This prevents context poisoning where /plan receives a generic
+		// greeting instead of actual engineering diagnostics.
 		if m.resolver.Current() == modes.ModeInvestigate && final != "" {
-			m.handoffCtx.ProposedFix = final
+			switch {
+			case m.handoffLedgerContent != "":
+				m.handoffCtx.ProposedFix = m.handoffLedgerContent
+			case m.handoffCtx.LastFailurePayload != "" && IsGenericGreeting(final):
+				m.handoffCtx.ProposedFix = m.handoffCtx.LastFailurePayload
+			default:
+				m.handoffCtx.ProposedFix = final
+			}
 		}
 
 		// ── Auto-transition: investigate → build on mutation detection ──
@@ -881,6 +1149,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// ── FORCED ROUTING TO /plan ──────────────────────────
 					// Structural errors require a deliberate design phase
 					// before any patching is attempted.
+					// Save handoff data and clear auto-trigger sources so
+					// setMode does NOT double-fire the plan engine.
+					savedLastFailure := m.handoffCtx.LastFailurePayload
+					savedProposedFix := m.handoffCtx.ProposedFix
+					m.handoffCtx.ProposedFix = ""
+					m.handoffCtx.LastFailurePayload = ""
+					m.handoffLedgerContent = ""
+
 					m.push(roleSystem, warningBannerStyle.Render(
 						"[!] Compile failure detected — routing to /plan for structured recovery."))
 					m.push(roleSystem, infoStyle.Render(
@@ -899,10 +1175,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						"- For each error, specify the minimal corrective change\n" +
 						"- Output each fix as a separate task with file target and description\n\n" +
 						"### Compilation Errors\n```\n" +
-						m.handoffCtx.LastFailurePayload +
+						savedLastFailure +
 						"\n```\n" +
 						"### Root Cause Analysis\n" +
-						m.handoffCtx.ProposedFix
+						CleanHandoffPayload(savedProposedFix)
 
 					m.currentPrompt = recoveryPrompt
 					m.streamCh = nil
@@ -913,13 +1189,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Batch(flush, m.streamCmd(recoveryPrompt))
 				}
 
-				// No compile failure — safe to auto-transition to /build
-				m.push(roleSystem, infoStyle.Render("File mutation detected. Switched to /build."))
-				m.setMode(modes.ModeBuild)
-				m.lastTestOutput = m.handoffCtx.ProposedFix
+				// ── HANDOFF DATA PRESERVATION ───────────────────────────
+				// ProposedFix is intentionally kept intact so the Action Chip
+				// remains available for the user to manually trigger the
+				// investigate → plan transition via the workspace. The user
+				// has full agency to click the chip or type /plan manually;
+				// the auto-trigger in setMode will handle the execution.
+				m.push(roleSystem, infoStyle.Render(
+					"Mutation proposals detected. Use the capability chip or /plan to formulate an execution plan."))
 				flush := m.flushPendingRecords()
 				m.refreshViewportContent()
-				return m, tea.Batch(flush, m.runFixCmd(""))
+				return m, flush
 			}
 		}
 
@@ -933,8 +1213,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// SECTION 1: INTERCEPTING STREAM COMPLETION
 		promptText := m.currentPrompt
 		if promptText != "" {
-			// Memory Context Update: Store user and assistant messages in sliding window
-			m.sess.AddMessage("user", promptText, 5)
+			// Memory Context Update: Store the assistant reply in the sliding
+			// window. The user message was already committed synchronously at
+			// submit time (handleInput) to guarantee the model's context window
+			// leads the API dispatch — so we append ONLY the assistant turn here
+			// to avoid duplicating the user turn.
 			m.sess.AddMessage("assistant", final, 5)
 
 			// Securely commit session.json to disk
@@ -1098,6 +1381,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// No tea.Println scrollback flush — prevents double-rendering in
 		// terminal scrollback vs Bubble Tea viewport.
 
+		// Clear planPending flag to prevent spinner lock on plan mode completion.
+		m.planPending = false
+
 		m.refreshViewportContent()
 		return m, nil
 
@@ -1106,6 +1392,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streaming = false
 		m.streamParser = nil
 		m.streamCancel = nil
+		m.planPending = false
 
 		// User-initiated interrupt — suppress error noise, just clean up.
 		if m.interruptRequested {
@@ -1139,6 +1426,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pipelineStep = ""
 		m.streaming = false
 		m.streamCh = nil
+		m.planPending = false
 		if m.streamCancel != nil {
 			m.streamCancel()
 			m.streamCancel = nil
@@ -1354,6 +1642,18 @@ func (m *model) smoothStreamTickCmd() tea.Cmd {
 	})
 }
 
+// planSlowNoticeCmd schedules a one-shot soft-timeout probe for /plan synthesis.
+// It captures the synthesis start time so the handler can verify the notice
+// still applies to the CURRENT synthesis (a stale probe from a prior run is
+// ignored). It never cancels or shortens the real work — it only surfaces a
+// viewport-safe warning if the local model is slow to respond.
+func (m *model) planSlowNoticeCmd() tea.Cmd {
+	started := m.planStartedAt
+	return tea.Tick(planSlowNoticeDelay, func(time.Time) tea.Msg {
+		return planSlowNoticeMsg{startedAt: started}
+	})
+}
+
 // containsMutationIntention detects whether an LLM analysis output from
 // investigate mode proposes concrete file mutations. Uses language-annotated
 // code blocks as the heuristic — when the agent outputs code blocks with known
@@ -1377,6 +1677,29 @@ func detectCompileFailure(output string) bool {
 		"undefined:",
 		"not enough arguments",
 		"too many errors",
+	}
+	for _, ind := range indicators {
+		if strings.Contains(lower, ind) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasMissingModuleError detects Go missing-dependency errors in build/test
+// output. When a build fails because a module is not in go.sum/go.mod, the
+// compiler prints "no required module provides package" or hints "to add it:
+// go get". These errors cannot be fixed by editing .go files — they require
+// running go get <package>. Returns true if any such pattern is found.
+func hasMissingModuleError(output string) bool {
+	if output == "" {
+		return false
+	}
+	lower := strings.ToLower(output)
+	indicators := []string{
+		"no required module provides package",
+		"to add it: go get",
+		"missing go.sum entry for module",
 	}
 	for _, ind := range indicators {
 		if strings.Contains(lower, ind) {

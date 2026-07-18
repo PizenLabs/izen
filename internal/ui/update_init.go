@@ -97,7 +97,7 @@ func (m *model) handleInitIdentity(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.Type {
 	case tea.KeyEnter:
-		val := strings.TrimSpace(m.initIdentityInput.Value())
+		val := config.SanitizeUsername(m.initIdentityInput.Value())
 		if val != "" {
 			m.userName = val
 		}

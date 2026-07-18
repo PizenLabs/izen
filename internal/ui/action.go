@@ -64,6 +64,34 @@ func buildVerifyResult(passed bool) *Result {
 	}}}
 }
 
+// investigateResultActions builds the persistent navigation controls exposed
+// when an /investigate run completes. Both chips are always present so the user
+// is never stranded on a dead viewport: "📋 Plan Solution" submits /plan against
+// the structured diagnostic payload passed from /investigate, and
+// "🔄 Re-investigate" re-runs /investigate. Per the mode-boundary law, /plan is
+// a pure deterministic translation of the diagnostic data — it performs no
+// semantic scanning of its own.
+func investigateResultActions() *Result {
+	return &Result{Actions: []Action{
+		{
+			ID:       "plan-solution",
+			Label:    "📋 Plan Solution",
+			Shortcut: "alt+p",
+			Command:  "/mode plan",
+			Enabled:  true,
+			Priority: 100,
+		},
+		{
+			ID:       "re-investigate",
+			Label:    "🔄 Re-investigate",
+			Shortcut: "alt+i",
+			Command:  "/mode investigate",
+			Enabled:  true,
+			Priority: 90,
+		},
+	}}
+}
+
 // currentResultActions returns the capabilities exposed by the current workflow
 // result. Returns nil when no result is active for the current view.
 func (m *model) currentResultActions() []Action {

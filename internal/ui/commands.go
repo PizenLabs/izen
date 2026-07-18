@@ -20,6 +20,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/domain"
 	objengine "github.com/PizenLabs/izen/internal/engine"
@@ -27,8 +28,10 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/internal/session"
 )
 
 var validSystemCommands = map[string]struct{}{
@@ -49,6 +52,21 @@ var validSystemCommands = map[string]struct{}{
 // ansiRe strips terminal ANSI escape color codes (e.g. \x1b[31m) that can
 // corrupt regex-based stack frame parsers in auto-trace.
 var ansiRe = regexp.MustCompile("\x1b\\[[0-9;]*[a-zA-Z]")
+
+// inputANSIRe strips ALL escape sequences from the interactive text-input
+// buffer, including SGR mouse-tracking reports (\x1b[<0;26;37M / \x1b[<...m)
+// and trailing coordinate remnants. Bubble Tea parses genuine mouse events
+// into tea.MouseMsg before they reach the textinput, so under normal operation
+// nothing leaks — but a defensive strip here guarantees no raw terminal escape
+// can ever pollute the editable command buffer (e.g. during /build shell
+// execution context switches where raw-mode state could briefly differ).
+var inputANSIRe = regexp.MustCompile(`\x1b\[[<?][0-9;]*[a-zA-Z]`)
+
+// sanitizeInputBuffer strips ANSI / mouse-tracking escape sequences from a
+// string so it is safe to store in the prompt's text buffer.
+func sanitizeInputBuffer(s string) string {
+	return inputANSIRe.ReplaceAllString(s, "")
+}
 
 func (m *model) handleInput(line string) tea.Cmd {
 	line = strings.TrimSpace(line)
@@ -125,11 +143,12 @@ func (m *model) handleInput(line string) tea.Cmd {
 	}
 
 	if mode, content, ok := parseModeShorthand(line); ok {
-		m.setMode(mode)
-		if content == "" {
-			return nil
+		m.modeChangeAuthorized = true
+		if content != "" {
+			m.setMode(mode)
+			return m.handleMessageContent(content)
 		}
-		return m.handleMessageContent(content)
+		return m.setMode(mode)
 	}
 
 	if strings.HasPrefix(line, "/") {
@@ -146,6 +165,15 @@ func (m *model) handleInput(line string) tea.Cmd {
 			return m.handleBuildRun(stepNum)
 		}
 	}
+
+	// ── SYNCHRONOUS STATE COMMIT (1-TURN LATENCY FIX) ────────────────
+	// Persist the freshly captured user input to the session history and disk
+	// BEFORE launching the LLM stream. This guarantees the in-memory + on-disk
+	// state leads the API dispatch (Write-After-Read ordering): the model never
+	// receives a turn that is one query behind because the current input is
+	// committed first, not retrofitted at stream completion.
+	m.sess.AddMessage("user", line, 5)
+	_ = m.sess.Save()
 
 	return m.handleMessageContent(line)
 }
@@ -205,7 +233,12 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			if err == nil {
 				ext := filepath.Ext(ref)
 				lang := strings.TrimPrefix(ext, ".")
-				lines := strings.Split(string(data), "\n")
+				// REFORM B: Anti-prompt injection — strip legacy comments/TODOs
+				// from source code before feeding to LLM. This prevents stale
+				// developer notes in the codebase from hijacking the agent's
+				// attention away from the actual task.
+				sanitized := ctxpkg.SanitizeSourceForLLM(string(data), lang)
+				lines := strings.Split(sanitized, "\n")
 				if len(lines) > 50 {
 					lines = lines[:50]
 				}
@@ -227,7 +260,9 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			}
 			ext := filepath.Ext(ref)
 			lang := strings.TrimPrefix(ext, ".")
-			fmt.Fprintf(&fileCtx, "File: %s\n```%s\n%s\n```", ref, lang, string(data))
+			// REFORM B: Sanitize source to remove prompt-injection comments
+			sanitized := ctxpkg.SanitizeSourceForLLM(string(data), lang)
+			fmt.Fprintf(&fileCtx, "File: %s\n```%s\n%s\n```", ref, lang, sanitized)
 		}
 	}
 
@@ -284,8 +319,130 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
 
+		// ── STRUCTURAL ENGINE PATH (Handoff from /investigate) ──────────
+		// When the Context-Ledger or a proposed fix is present, bypass the
+		// conversational streaming path entirely. Call the PlanEngine with
+		// structured JSON output enforcement, then stage the parsed tasks
+		// directly into the session.
+		ledgerContent := ctxpkg.SanitizeLedger(m.handoffLedgerContent)
+		proposedFix := m.handoffCtx.ProposedFix
+		handoffSource := ledgerContent
+		if handoffSource == "" {
+			handoffSource = proposedFix
+		}
+
+		// SAFETY GUARD: If ContextLedger has diagnostics but handoffSource is empty,
+		// this indicates a data flow regression. Log a warning instead of proceeding
+		// with an empty query to the LLM.
+		if handoffSource == "" && m.sess.ContextLedger != nil && m.sess.ContextLedger.Diagnostics != "" {
+			m.push(roleError, "[SYSTEM ERROR] Context ledger has diagnostics but handoff source is empty after sanitization. Data flow regression detected.")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+
+		if handoffSource != "" {
+			if m.planEngine == nil {
+				m.handoffLedgerContent = ""
+				m.handoffCtx.ProposedFix = ""
+				m.handoffCtx.PendingTodos = nil
+				m.push(roleError, "plan engine not configured")
+				m.resetStreamingState()
+				m.refreshViewportContent()
+				return m.flushPendingRecords()
+			}
+
+			problem := m.handoffCtx.LastFailurePayload
+			if problem == "" {
+				problem = m.sess.ObjectiveIntent()
+			}
+			if problem == "" {
+				problem = "Investigation results require structured execution plan"
+			}
+
+			// Reset handoff triggers so the async result cannot re-enter this
+			// path. The synthesized tasks are applied in planResultMsg handler.
+			m.handoffLedgerContent = ""
+			m.handoffCtx.ProposedFix = ""
+			m.handoffCtx.PendingTodos = nil
+
+			// Keep the UI alive: show a live spinner while the (potentially
+			// slow) LLM call runs in a background goroutine. This MUST NOT
+			// block the Bubble Tea event loop — ProcessFromLedger executes
+			// inside runPlanEngineCmd, not here.
+			m.streaming = true
+			m.spinnerFrame = 0
+			m.lastSpinnerAdvance = time.Time{}
+			m.agentRunning = true
+			m.agentLabel = "synthesizing plan"
+			m.planPending = true
+			m.planStartedAt = time.Now()
+			m.push(roleSystem, infoStyle.Render("Synthesizing structured execution plan from investigation data..."))
+			// FAST-TRACK NOTICE: when there are zero pre-parsed TODOs the
+			// synthesis runs purely on the forensic ledger. Surface an implicit
+			// hint so the user understands the engine is working (not hung) and
+			// that a first-token guard will bail fast if the local model is
+			// unresponsive.
+			if len(m.handoffCtx.PendingTodos) == 0 {
+				m.push(roleSystem, mutedStyle.Render(
+					"0 pending TODOs — synthesizing from forensic ledger. If your local model is stuck, this aborts within ~8s instead of hanging."))
+			}
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+
+			// Start the smooth tick loop. It repaints the viewport AND (since
+			// the frozen-spinner fix) physically advances m.spinnerFrame while
+			// m.agentRunning/m.streaming stay set, so the braille indicator
+			// animates even though plan synthesis emits a single terminal
+			// planResultMsg rather than a token stream. The loop self-terminates
+			// once the planResultMsg handler clears the flags.
+			return tea.Batch(
+				m.flushPendingRecords(),
+				m.smoothStreamTickCmd(),
+				m.planSlowNoticeCmd(),
+				m.runPlanEngineCmd(handoffSource, problem, m.cfg.ActiveModelName(), m.handoffCtx),
+			)
+		}
+
+		// ── CONVERSATIONAL STREAMING PATH (Manual /plan usage) ──────────
+		// Only reached when no investigation handoff exists (no handoffLedgerContent
+		// and no ProposedFix). The structural engine path above always terminates
+		// with either staged tasks or an explicit diagnostic — never falls through.
 		cb := ctxpkg.NewBuilder(".", m.graph, m.gitEng, m.sess)
 		assembly := cb.BuildPlanAssembly(content, m.attachedFiles)
+
+		// SAFETY GUARD: Prevent empty prompt to LLM. If the ContextLedger has
+		// diagnostics loaded but the generated prompt is empty, this indicates
+		// a data flow regression that must be surfaced immediately.
+		if assembly.RawContext == "" && m.sess.ContextLedger != nil && m.sess.ContextLedger.Diagnostics != "" {
+			m.push(roleError, "[SYSTEM ERROR] Context ledger has diagnostics but generated prompt is empty. This indicates a data flow regression.")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+
+		// ── EMPTY-HANDOFF GUARD (mirror of /build's zero-task guard) ────────
+		// Reaching here means the structural engine path was skipped because
+		// there was NO handoff ledger content and NO proposed fix. If there is
+		// ALSO no diagnostics in the ledger and the conversational assembly is
+		// empty and the user typed no objective, then there is genuinely
+		// nothing to synthesize a plan from. Previously this fell through to
+		// streamCmd("") which returns nil silently — the spinner never starts,
+		// but the user is left at the prompt with zero feedback, which reads
+		// exactly like the reported "hang". Surface a clean, actionable notice
+		// and return control to the prompt instead of firing an empty request.
+		//
+		// NOTE: we intentionally do NOT gate on PendingTodos count. Zero
+		// pending TODOs is the HEALTHY state for a /investigate → /plan handoff
+		// (the forensic ledger, not pre-parsed TODOs, drives synthesis), so
+		// blocking on that would break every valid handoff.
+		if m.planHasNothingToSynthesize(assembly.RawContext, content) {
+			m.push(roleSystem, infoStyle.Render("No context packets found in ledger. Run /investigate or $test first, then /plan to synthesize an execution plan."))
+			m.reconcileSpinner()
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m.flushPendingRecords()
+		}
 
 		modelName := m.cfg.ActiveModelName()
 		if budgetErr := plan.CheckTokenBudget(modelName, assembly.EstimateTokens); budgetErr != nil {
@@ -294,31 +451,15 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			return nil
 		}
 
-		if m.graph != nil && assembly.EstimateTokens < plan.TokenBudgetForModel(modelName)-1000 {
-			query := content
-			if m.sess.ObjectiveIntent() != "" {
-				query = m.sess.ObjectiveIntent() + " " + query
-			}
-			lc := retrieval.GetLynxController()
-			if lc != nil {
-				compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.ObjectiveIntent())
-				g := m.graph
-				go retrieval.BuildGlobalCompressor(g, m.sess.ObjectiveIntent())
-				results, err := lc.SearchRaw(query)
-				if err == nil && len(results) > 0 {
-					compressed := compressor.CompressResults(results)
-					skeleton := retrieval.FormatResultsAsSkeleton(compressed)
-					if skeleton != "" {
-						augmented := assembly.RawContext + "\n\n" + retrieval.FormatPlanFrame(skeleton)
-						augmentedTokens := plan.EstimateTokens(augmented)
-						if plan.CheckTokenBudget(modelName, augmentedTokens) == nil {
-							assembly.RawContext = augmented
-							assembly.EstimateTokens = augmentedTokens
-						}
-					}
-				}
-			}
-		}
+		// ── MODE BOUNDARY LAW: /plan performs NO heavy semantic scanning ──
+		// /plan is a pure, deterministic translator of structured diagnostic
+		// data into atomic human tasks. It must NEVER trigger an automatic
+		// `lx search` or any semantic text-retrieval mechanism — that duty
+		// belongs exclusively to /investigate. The structural plan assembly
+		// (graph symbols / attached files) is sufficient; any remote search
+		// would both hang the viewport and leak /investigate's cognitive role.
+		// Intentionally left as a no-op: do NOT re-add retrieval.SearchWithExtraction here.
+		_ = content
 
 		planTrace := &ctxpkg.CodebaseTrace{}
 		for _, sf := range assembly.SymbolFiles {
@@ -332,6 +473,18 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.streamCmd(assembly.RawContext),
 		)
 	default:
+		// ── /build mode boundary: strict structural-only execution ─────────
+		// /build is a deterministic executor. It runs EXCLUSIVELY on the atomic
+		// structural tasks staged by /plan (m.handoffCtx.PendingTodos and
+		// m.sess.CurrentTasks). It must never process the stale conversational
+		// log carried in raw input buffers or unstructured message history —
+		// doing so re-injects past test failures / greetings into the build
+		// engine (the zombie-data / stale-context bug). When no tasks are
+		// staged, block immediately instead of contaminating the executor.
+		if m.resolver.Current() == modes.ModeBuild {
+			return m.runBuildCmd(content)
+		}
+
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
 
@@ -364,6 +517,212 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 	}
 }
 
+// planFirstTokenTimeout bounds how long the LLM provider may take to return its
+// FIRST chunk of plan synthesis. A local model that is OOM/stalling will hang
+// the connection indefinitely; this guard aborts fast so the UI never freezes
+// for the full 120s hard budget waiting on a dead provider socket.
+const planFirstTokenTimeout = 8 * time.Second
+
+// planLocalMaxLatency bounds how long a LOCAL (non-streaming) model may take to
+// return a full completion. Unlike cloud providers, Ollama's /chat/completions
+// is non-streaming: the "first token" is the entire prefill+generation latency,
+// which a 7B model commonly exceeds. We therefore allow a realistic local budget
+// while still keeping the 120s hard cap as the overall ceiling.
+const planLocalMaxLatency = 90 * time.Second
+
+// runPlanEngineCmd executes the (potentially slow) PlanEngine ledger synthesis
+// in a background goroutine so the synchronous LLM call never blocks the Bubble
+// Tea event loop. The result is delivered asynchronously as a planResultMsg,
+// which the Update() loop handles to stage tasks and clear streaming state.
+//
+// HARDENING: two layered deadlines protect the live terminal.
+//  1. firstTokenCtx (8s) — the provider MUST return its first response byte
+//     within this window. If the local model is stuck/OOM or the socket stalls,
+//     we abort immediately instead of freezing the prompt for the full budget.
+//  2. ctx (120s) — overall synthesis budget for a slow-but-alive model.
+
+// debugLogPlan writes plan-synthesis trace lines to .izen/debug/plan.log
+// instead of os.Stderr. Bubble Tea owns the terminal exclusively while
+// tea.WithAltScreen() is active — any direct stdout/stderr write from a
+// background goroutine races the renderer's own ANSI redraw sequences on the
+// same TTY and corrupts the visible frame (cursor jumps, dropped redraws,
+// an apparently "frozen" screen even though Update() is still running fine
+// underneath). This mirrors debugLogPayload in stream.go so plan-synthesis
+// tracing stays diagnostic without ever touching the live terminal.
+func debugLogPlan(line string) {
+	dir := filepath.Join(".izen", "debug")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	entry := time.Now().Format(time.RFC3339Nano) + " " + line + "\n"
+	f, err := os.OpenFile(filepath.Join(dir, "plan.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	_, _ = f.WriteString(entry)
+}
+
+func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, handoff HandoffContext) tea.Cmd {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	// Register cancel so it can be invoked on mode transition/Ctrl+C
+	m.registerBackgroundCancel(cancel)
+
+	return func() tea.Msg {
+		debugLogPlan("runPlanEngineCmd entered; model=" + modelName)
+
+		// ── ADAPTIVE LEDGER TRUNCATION (local SLM guard) ────────────────
+		// Local 7B-class models (qwen2.5-coder:7b, llama3, etc.) choke on the
+		// full forensic ledger — verbose compilation stack traces and dependency
+		// logs blow the context window and the first token never arrives within
+		// the 8s guard, freezing the terminal. For those models we aggressively
+		// compress the ledger to a hard ceiling so only the core error line and
+		// confirmed hypothesis status survive.
+		ledgerToSend := handoffSource
+		useFastTrack := false
+		localModel := plan.IsLocalModel(modelName)
+		if localModel {
+			if len(handoffSource) > plan.MaxLedgerChars {
+				truncated := plan.TruncateLedger(handoffSource, plan.MaxLedgerChars)
+				debugLogPlan("ADAPTIVE TRUNCATION: ledger " +
+					fmt.Sprint(len(handoffSource)) + "→" + fmt.Sprint(len(truncated)) +
+					" chars for local model " + modelName)
+				ledgerToSend = truncated
+			}
+
+			// ── "0 TODO" FAST-TRACK SHORT-CIRCUIT ──────────────────────────
+			// When there are no explicit code TODOs AND the ledger only contains
+			// compilation/dependency blockers (resolvable via environment setup,
+			// not a deep architectural plan), skip the heavy full-plan loop and
+			// dispatch a minimal 3-line shell resolution prompt instead.
+			//
+			// CRITICAL: Extract the investigation conclusion BEFORE discarding the
+			// full ledger context. The conclusion carries the resolved diagnosis
+			// (e.g. "use github.com/moby/moby/client") which must be injected into
+			// the fast-track prompt so the model does NOT re-derive a stale or
+			// incorrect fix from raw error text alone.
+			if len(handoff.PendingTodos) == 0 && plan.IsCompilationOrDependencyError(ledgerToSend) {
+				coreErr := plan.CoreErrorLine(ledgerToSend)
+				conclusion := plan.ExtractConclusionFromLedger(handoffSource)
+				ledgerToSend = plan.FastTrackPrompt(coreErr, conclusion)
+				problem = coreErr
+				useFastTrack = true
+				debugLogPlan("FAST-TRACK SHORT-CIRCUIT: 0 TODOs + compile/dep blocker → minimal prompt")
+			}
+		}
+
+		// ── CLOUD PROVIDER FAST-TRACK (dependency/compilation blocker) ─────────
+		// For cloud providers, we also use the fast-track path when there are
+		// no explicit TODOs AND the ledger contains compilation/dependency errors.
+		// This ensures SHELL_EXEC tasks are generated with high confidence for
+		// dependency fixes, regardless of model type.
+		if !useFastTrack && len(handoff.PendingTodos) == 0 && plan.IsCompilationOrDependencyError(ledgerToSend) {
+			coreErr := plan.CoreErrorLine(ledgerToSend)
+			conclusion := plan.ExtractConclusionFromLedger(handoffSource)
+			ledgerToSend = plan.FastTrackPrompt(coreErr, conclusion)
+			problem = coreErr
+			useFastTrack = true
+			debugLogPlan("CLOUD FAST-TRACK: 0 TODOs + compile/dep blocker → shell resolution prompt")
+		}
+
+		if m.planEngine == nil {
+			cancel()
+			debugLogPlan("plan engine not configured — aborting")
+			return planResultMsg{Err: fmt.Errorf("plan engine not configured"), Handoff: handoff}
+		}
+
+		type outcome struct {
+			tasks []plan.Task
+			err   error
+		}
+		outCh := make(chan outcome, 1)
+
+		// ── FIRST-TOKEN / COMPLETION GUARD ───────────────────────────────
+		// The provider call (a single NON-STREAMING HTTP round-trip inside
+		// ProcessFromLedger) inherits this deadline. For cloud providers the
+		// round-trip returns the first token quickly, so the tight 8s guard is
+		// appropriate. Local Ollama calls are non-streaming: "first token" == the
+		// entire prefill+generation latency, which a 7B model easily exceeds. For
+		// local models we therefore use a realistic budget (the 120s hard cap
+		// still applies as the overall ctx), and only fall back to the cloud
+		// prompt if the model is genuinely unresponsive.
+		ftBudget := planFirstTokenTimeout
+		if localModel {
+			ftBudget = planLocalMaxLatency
+		}
+		ftCtx, ftCancel := context.WithTimeout(ctx, ftBudget)
+		defer ftCancel()
+
+		go func() {
+			debugLogPlan("Preparing LLM payload (ledger bytes=" + fmt.Sprint(len(ledgerToSend)) +
+				"; fastTrack=" + fmt.Sprint(useFastTrack) + ")")
+			var tasks []plan.Task
+			var err error
+			if useFastTrack {
+				tasks, err = m.planEngine.ProcessFromLedgerFastTrack(ftCtx, ledgerToSend, modelName)
+			} else {
+				tasks, err = m.planEngine.ProcessFromLedger(ftCtx, ledgerToSend, problem, modelName)
+			}
+			debugLogPlan("Provider returned; err=" + fmt.Sprint(err))
+			outCh <- outcome{tasks: tasks, err: err}
+		}()
+
+		select {
+		case o := <-outCh:
+			cancel()
+			return planResultMsg{Tasks: o.tasks, Err: o.err, Handoff: handoff}
+		case <-ftCtx.Done():
+			// First-token deadline missed: the provider is unresponsive.
+			cancel()
+			debugLogPlan("FIRST-TOKEN TIMEOUT after " + planFirstTokenTimeout.String() + " — provider unresponsive")
+			// For local models, degrade gracefully: instead of a hard failure
+			// that strands the user, surface a fallback action they can take
+			// directly from the interactive prompt.
+			if localModel {
+				return planResultMsg{
+					Err:     fmt.Errorf("[error] Local model (%s) produced no response within %s. The forensic ledger was already minimized and a fast-track shell plan was attempted — this points to an unloaded/OOM model. Ensure Ollama has the model loaded, or run `/provider <cloud>` to offload planning to a cloud model", modelName, planLocalMaxLatency),
+					Handoff: handoff,
+				}
+			}
+			return planResultMsg{
+				Err:     fmt.Errorf("[error] LLM Provider timeout: no response within %s. Check if your local model is stuck/OOM, or that Ollama is running and the model (%s) is loaded", planFirstTokenTimeout, modelName),
+				Handoff: handoff,
+			}
+		case <-ctx.Done():
+			debugLogPlan("hard 120s timeout — aborting")
+			return planResultMsg{Err: fmt.Errorf("plan synthesis timed out after 120s: %w", ctx.Err()), Handoff: handoff}
+		}
+	}
+}
+
+// planHasNothingToSynthesize reports whether a /plan invocation has genuinely
+// no material to work from: no handoff ledger content, no proposed fix, no
+// ledger diagnostics or analytical packets, an empty conversational assembly,
+// AND no user-typed objective. In that state the previous code fell through to
+// streamCmd("") which returns nil silently, leaving the user at the prompt with
+// no feedback (indistinguishable from a hang). The caller uses this to surface
+// an actionable notice instead.
+//
+// It deliberately ignores PendingTodos count: zero pending TODOs is the healthy
+// state for a /investigate → /plan handoff (the forensic ledger drives
+// synthesis, not pre-parsed TODOs), so gating on it would break valid handoffs.
+func (m *model) planHasNothingToSynthesize(rawContext, content string) bool {
+	if strings.TrimSpace(rawContext) != "" || strings.TrimSpace(content) != "" {
+		return false
+	}
+	if strings.TrimSpace(m.handoffLedgerContent) != "" ||
+		strings.TrimSpace(m.handoffCtx.ProposedFix) != "" {
+		return false
+	}
+	if m.sess != nil && m.sess.ContextLedger != nil {
+		l := m.sess.ContextLedger
+		if strings.TrimSpace(l.Diagnostics) != "" || len(l.Packets) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func parseModeShorthand(line string) (modes.Mode, string, bool) {
 	lower := strings.ToLower(strings.TrimSpace(line))
 	for _, mode := range []modes.Mode{
@@ -384,9 +743,40 @@ func parseModeShorthand(line string) (modes.Mode, string, bool) {
 	return modes.ModeAsk, "", false
 }
 
-func (m *model) setMode(mode modes.Mode) {
+func (m *model) setMode(mode modes.Mode) tea.Cmd {
+	// ── RULE A: STRICT MODE TRANSITION GATEKEEPER ──────────────────────
+	// Auto-transitions to /build from non-build modes are blocked unless
+	// the user explicitly authorized the switch by typing a mode command
+	// OR the plan has already been approved in this execution cycle.
+	if !m.modeChangeAuthorized && !m.planApproved && mode == modes.ModeBuild && m.resolver.Current() != modes.ModeBuild {
+		m.push(roleError, "State Transition Blocked: File modifications are only allowed inside /build mode after /plan approval. Please run /plan first, then use /build.")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+	m.modeChangeAuthorized = false
+
 	m.investigateInvocationCount = 0 // Unconditional state clearance to avoid hard lockout bugs during testing
 	m.buildRecoveryCount = 0         // Reset auto-recovery counter on every mode transition
+
+	// ── Plan-Approved Lifecycle ────────────────────────────────────────
+	// Entering /plan or /investigate starts a new cycle — reset approval.
+	if mode == modes.ModePlan || mode == modes.ModeInvestigate {
+		m.planApproved = false
+	}
+	// Transitioning from /plan to /build marks the plan as approved so
+	// the orchestrator never re-enters /plan for the same execution cycle.
+	if mode == modes.ModeBuild && m.resolver.Current() == modes.ModePlan {
+		m.planApproved = true
+	}
+
+	// ── HANDOFF SANITIZER (BUG 3): clear ALL transient raw-string state on
+	// every mode transition so the target mode can never inherit stale
+	// conversational context (past test failures, user greetings, abandoned
+	// ledger text) from a previous phase. Structured typed payloads
+	// (handoffCtx.PendingTodos / sess.CurrentTasks) survive this purge by
+	// design — they are the authoritative /plan → /build contract.
+	m.CleanContextTransitions(mode)
 
 	// ── ABSOLUTE STALE GOROUTINE RELEASE ON MODE ENTRY ────────────────
 	// Before any mode transition, cancel all in-flight background contexts,
@@ -398,7 +788,7 @@ func (m *model) setMode(mode modes.Mode) {
 	m.buildVerifyPending = false
 
 	if mode == m.resolver.Current() {
-		return
+		return nil
 	}
 	m.startModeTransition(mode)
 	// ── Reset view-scoped workflow result on mode entry ────────────────
@@ -415,12 +805,175 @@ func (m *model) setMode(mode modes.Mode) {
 	m.push(roleSystem, modeLabel)
 	m.push(roleSystem, fmt.Sprintf("Switched to /%s", mode))
 
+	// ── SYNCHRONOUS LEDGER RELOAD (1-TURN LATENCY FIX) ────────────────
+	// CleanContextTransitions above purged transient in-memory handoff buffers
+	// (m.handoffLedgerContent, etc.). Before dispatching the target mode's LLM
+	// call we MUST synchronously reload the freshly written .izen/context_ledger.json
+	// into memory so the new mode reads from the authoritative structured SSOT,
+	// not the now-cleared transient state. This is the load-and-inject step of
+	// the blocking handoff: write → clean → reload → inject → dispatch.
+	m.reloadContextLedger()
+
+	// ── PRIME TRANSIENT HANDOFF FROM RELOADED LEDGER ──────────────────
+	// Re-populate the transient in-memory handoff (handoffLedgerContent /
+	// handoffCtx) from the freshly reloaded authoritative ledger. This is what
+	// the structural /plan and /build engines actually consume; without it the
+	// handoff would be empty after CleanContextTransitions cleared it, and the
+	// target mode would boot with a generic greeting.
+	m.primeHandoffFromLedger(mode)
+
 	// Handoff context injection primes the target mode with state from the
 	// previous mode's terminal event.
 	m.injectHandoffContext(mode)
 
+	// ── AUTO-TRIGGER ENFORCEMENT (FULLY ASYNC) ──────────────────────────
+	// If handoff context was injected for /plan or /build, immediately
+	// trigger the mode's execution engine instead of waiting for user input.
+	// This prevents mode stagnation where the LLM receives handoff data as
+	// passive chat history but produces open-ended chatbot responses.
+	//
+	// CRITICAL: the dispatch MUST NOT run synchronously inside Update(). The
+	// previous implementation called m.handleMessageContent(...) directly here,
+	// which performed heavy, blocking work (ledger payload assembly, prompt
+	// construction, engine call) on the Bubble Tea event-loop thread. That
+	// froze the very first frame and made the UI unresponsive to Ctrl+C until
+	// the work finished. Now the ENTIRE handoff→engine pipeline is wrapped in
+	// the returned tea.Cmd's background goroutine closure, so Update() returns
+	// instantly and the spinner is free to animate from millisecond zero.
+	if !m.streaming && !m.agentRunning && !m.pipelineRunning {
+		if m.buildHandoffTriggerContent(mode) != "" {
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return tea.Batch(
+				m.smoothStreamTickCmd(),
+				func() tea.Msg {
+					// Everything below runs in the cmd-runner goroutine,
+					// never on the Bubble Tea event loop.
+					content := m.buildHandoffTriggerContent(mode)
+					if content == "" {
+						return nil
+					}
+					cmd := m.handleMessageContent(content)
+					if cmd == nil {
+						return nil
+					}
+					return cmd()
+				},
+			)
+		}
+	}
+
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
+	return nil
+}
+
+// buildHandoffTriggerContent returns a non-empty string when handoff data exists
+// for the given mode, triggering immediate structural execution. For /plan mode
+// the handoff is handled internally by the structural engine — the return value
+// is the raw handoff text that feeds into the engine path. For /build mode the
+// pending todos are formatted as a structured execution prompt.
+func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
+	switch mode {
+	case modes.ModePlan:
+		// m.handoffLedgerContent is primed from the reloaded authoritative
+		// session.ContextLedger by primeHandoffFromLedger (called in setMode
+		// after CleanContextTransitions). It carries the /investigate forensic
+		// diagnostics/targets, so /plan boots directly into structured task
+		// synthesis instead of a generic greeting.
+		if m.handoffLedgerContent != "" {
+			return m.handoffLedgerContent
+		}
+		if m.handoffCtx.ProposedFix != "" {
+			return m.handoffCtx.ProposedFix
+		}
+		if m.handoffCtx.LastFailurePayload != "" {
+			return m.handoffCtx.LastFailurePayload
+		}
+	case modes.ModeBuild:
+		// /build STRICTLY consumes the atomic structural tasks produced by the
+		// /plan phase (m.handoffCtx.PendingTodos and m.sess.CurrentTasks). It
+		// must NEVER fall back to the raw conversational ProposedFix blob —
+		// that would re-inject stale $test / chat text into the build
+		// workspace. If no atomic tasks exist, return "" so setMode enters a
+		// clean idle state instead of contaminating the buffer.
+		hasStagedTasks := len(m.sess.CurrentTasks) > 0
+		if len(m.handoffCtx.PendingTodos) == 0 && !hasStagedTasks {
+			return ""
+		}
+		var b strings.Builder
+		b.WriteString("## HANDOFF BUILD EXECUTION\n\n")
+		b.WriteString("Execute the following planned tasks and output code patches directly.\n")
+		b.WriteString("Do NOT restate the plan or ask for approval — produce the mutations now.\n\n")
+		if len(m.handoffCtx.PendingTodos) > 0 {
+			for i, todo := range m.handoffCtx.PendingTodos {
+				fmt.Fprintf(&b, "Task %d: %s\n", i+1, todo)
+			}
+		} else if hasStagedTasks {
+			for i, t := range m.sess.CurrentTasks {
+				fmt.Fprintf(&b, "Task %d: %s — %s — %s\n", i+1, t.Type, t.Target, t.Description)
+			}
+		}
+		return b.String()
+	}
+	return ""
+}
+
+// buildStrictHandoffPayload creates a minimal, focused context for the /build
+// task execution. It contains ONLY:
+// 1. The exact target file path(s) for the current task
+// 2. The exact staged task description
+// 3. The raw relevant symbol definition/context from the codebase
+// This prevents cognitive drift by stripping all conversational history,
+// raw chat logs, and unrelated codebase files.
+func (m *model) buildStrictHandoffPayload() string {
+	tasks := m.sess.CurrentTasks
+	if len(tasks) == 0 && len(m.handoffCtx.PendingTodos) == 0 {
+		return ""
+	}
+
+	var targetTask *plan.Task
+	if len(tasks) > 0 {
+		for i, t := range tasks {
+			if t.Status == "idle" || t.Status == "processing" {
+				targetTask = &tasks[i]
+				break
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("## BUILD TASK EXECUTION\n\n")
+
+	if targetTask != nil {
+		b.WriteString("### TARGET\n")
+		b.WriteString(targetTask.Target + "\n\n")
+		b.WriteString("### TASK\n")
+		b.WriteString(targetTask.Description + "\n\n")
+	}
+
+	// Include only the relevant symbol context for the target file
+	if targetTask != nil && m.graph != nil {
+		fn := m.graph.LookupFile(targetTask.Target)
+		if fn != nil {
+			b.WriteString("### SYMBOL CONTEXT\n")
+			b.WriteString("```go\n")
+			// Include just the symbol signatures, not full source
+			for _, sym := range fn.Symbols {
+				if sym.Exported || strings.Contains(strings.ToLower(sym.Name), strings.ToLower(targetTask.Target)) {
+					b.WriteString(sym.Signature)
+					b.WriteString("\n")
+				}
+			}
+			b.WriteString("```\n\n")
+		}
+	}
+
+	b.WriteString("### INSTRUCTION\n")
+	b.WriteString("Implement ONLY this task. Output unified diff or FILE: block directly.\n")
+	b.WriteString("Do NOT restate the plan, do NOT list other tasks, do NOT output JSON.\n")
+
+	return b.String()
 }
 
 func (m *model) handleCommand(cmd string) tea.Cmd {
@@ -477,8 +1030,8 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		if len(parts) == 2 {
 			mode, ok := modes.Parse(parts[1])
 			if ok {
-				m.setMode(mode)
-				return nil
+				m.modeChangeAuthorized = true
+				return m.setMode(mode)
 			}
 		}
 		m.push(roleSystem, infoStyle.Render("usage: /mode <ask|plan|build|investigate|review>"))
@@ -594,6 +1147,251 @@ func (m *model) startModeTransition(target modes.Mode) {
 	m.resolver.Set(target)
 }
 
+// CleanContextTransitions is the single handoff sanitizer invoked on every mode
+// transition. It explicitly clears all transient raw-string state so a new mode
+// never inherits stale conversational context from a previous phase:
+//   - handoffLedgerContent: raw Context-Ledger output (superseded by structured tasks)
+//   - rawInputBuffer / input builder: unstructured message history
+//   - transient raw string variables (lastTestOutput, currentPrompt, responseBuffer)
+//
+// Structured, typed payloads (handoffCtx.PendingTodos, sess.CurrentTasks) are
+// intentionally preserved — they are the authoritative inter-mode contract that
+// /plan → /build relies on, and clearing them would break the pipeline.
+func (m *model) CleanContextTransitions(targetMode modes.Mode) {
+	// REFORM C: Aggressively zero out ALL unstructured raw text buffers
+	// during mode transitions. Only structured, verified task slices traverse
+	// the boundaries.
+
+	// ── SERIALIZE STRUCTURED LEDGER TO DISK (SINGLE SOURCE OF TRUTH) ──
+	// Compile a fresh ContextLedger for the incoming mode and persist it to
+	// .izen/context_ledger.json. This is an absolute overwrite: the previous
+	// ledger is replaced, so no stale prompts, build logs, or chat history can
+	// leak across the boundary. The same ledger is mirrored into the session
+	// record and persisted to .izen/session.json for full durability.
+	//
+	// CRITICAL: Preserve Diagnostics from investigation when transitioning to /plan.
+	// The investigation findings must survive the mode transition so the plan engine
+	// receives the forensic context needed for structured analysis.
+	prevDiagnostics := ""
+	if m.sess != nil && m.sess.ContextLedger != nil {
+		prevDiagnostics = m.sess.ContextLedger.Diagnostics
+	}
+
+	ledger := session.NewContextLedger(targetMode)
+	if m.sess != nil {
+		ledger.TargetFile = m.sess.ContextLabel()
+		// Preserve investigation diagnostics for /plan mode
+		if targetMode == modes.ModePlan && prevDiagnostics != "" {
+			ledger.Diagnostics = prevDiagnostics
+		}
+		ledger.Tasks = nil
+		for _, t := range m.sess.CurrentTasks {
+			ledger.Tasks = append(ledger.Tasks, plan.AtomicTask{
+				TaskID:      t.StepNum,
+				File:        t.Target,
+				Strategy:    t.Type,
+				Description: t.Description,
+			})
+		}
+		if err := ledger.Save(); err == nil {
+			m.sess.SetContextLedger(ledger)
+		}
+	}
+
+	// ── INVALIDATE MEMORY CACHE: zero out every raw response buffer,
+	// streaming string array, and historical message slice so the target mode
+	// can never inherit ghost output or stale topic references.
+	m.handoffLedgerContent = ""
+	m.input.Reset()
+	m.ti.SetValue("")
+	m.ti.Reset()
+	m.syncInputFromTI()
+	m.currentPrompt = ""
+	m.responseBuffer.Reset()
+	m.streamBuffer = ""
+	m.currentStreamContent = ""
+	m.lastTestOutput = ""
+	m.lastTestFailed = false
+	m.lastTestTarget = ""
+	m.handoffCtx.ProposedFix = ""
+	m.handoffCtx.LastFailurePayload = ""
+	m.handoffCtx.TargetScope = ""
+}
+
+// runBuildCmd is the /build mode execution entry. It strictly blocks when no
+// atomic structural tasks are staged (the zombie-data guard) and otherwise
+// executes EXCLUSIVELY on the structured items, ignoring any unstructured
+// message history or stale conversational buffers.
+func (m *model) runBuildCmd(content string) tea.Cmd {
+	hasStagedTasks := len(m.sess.CurrentTasks) > 0
+	hasPendingTodos := len(m.handoffCtx.PendingTodos) > 0
+	hasLedgerTasks := m.sess != nil && m.sess.ContextLedger != nil && len(m.sess.ContextLedger.Tasks) > 0
+
+	// ── ZERO-TASK VALIDATION (build-freeze fix, TASK 3.1) ──────────────
+	// Deterministic guard: if there is nothing to execute, halt immediately,
+	// set state to idle, and print a clean notification. Never enter any
+	// execution loop — this prevents the empty-queue deadlock / spinner freeze
+	// that occurred when /plan produced no tasks.
+	if !hasStagedTasks && !hasPendingTodos && !hasLedgerTasks {
+		m.push(roleError, "[BUILD HALTED] No active tasks found. Please formulate a plan in /plan first.")
+		m.agentRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.streaming = false
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+
+	// Sanitize any leftover unstructured content — /build operates purely on
+	// the structural task ledger, never on free-form conversational input.
+	_ = content
+	m.responseBuffer.Reset()
+	m.execEng.SetStreamContextFiles(m.attachedFiles)
+
+	if m.buildLedger == nil {
+		m.buildLedger = ctxpkg.NewTaskLedger()
+	}
+
+	// Materialize PendingTodos into typed tasks if no staged tasks exist yet.
+	if !hasStagedTasks && hasPendingTodos {
+		var tasks []plan.Task
+		for i, t := range m.handoffCtx.PendingTodos {
+			tasks = append(tasks, plan.Task{
+				StepNum:     i + 1,
+				Type:        "task",
+				Target:      "workspace",
+				Description: t,
+				Status:      "idle",
+			})
+		}
+		if len(tasks) > 0 {
+			m.sess.StageTaskList(&tasks)
+			_ = m.sess.Save()
+		}
+	}
+
+	// Execute the first idle staged task.
+	return m.handleBuildRun(0)
+}
+
+// runBuildShellExec executes a SHELL_EXEC build task directly via the OS shell
+// and reports the result — it never dispatches the command to the LLM. After a
+// run the task is marked terminal and the next idle task is advanced, preserving
+// /build's execute-only contract.
+func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		runner := execExecutionRunner(".")
+		result, err := runner.Run(task.Target)
+		output := ""
+		exitCode := 0
+		if result != nil {
+			output = result.Stdout
+			if result.Stderr != "" {
+				if output != "" {
+					output += "\n"
+				}
+				output += result.Stderr
+			}
+			exitCode = result.ExitCode
+		}
+		if err != nil && output == "" {
+			output = err.Error()
+			if exitCode == 0 {
+				exitCode = 1
+			}
+		}
+
+		// Mark the task terminal in the live session ledger so the queue
+		// advances and the developer sees progress.
+		tasks := m.sess.CurrentTasks
+		for i := range tasks {
+			if tasks[i].StepNum == task.StepNum {
+				if exitCode == 0 {
+					tasks[i].Status = "completed"
+				} else {
+					tasks[i].Status = "failed"
+				}
+				break
+			}
+		}
+		m.sess.StageTaskList(&tasks)
+		_ = m.sess.Save()
+		return buildResultMsg{output: output, exitCode: exitCode, err: err}
+	}
+}
+
+// runBuildPatchExec executes a FILE_MUTATE / GIT_ACTION build task by generating
+// the patch via the LLM (one non-streaming call) and applying it through the
+// execution engine's PatchManager — never via the conversational streamCmd.
+// This is what makes /build actually mutate the workspace instead of chatting.
+func (m *model) runBuildPatchExec(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		if m.provider == nil {
+			return buildResultMsg{err: fmt.Errorf("build execution error: no provider configured")}
+		}
+
+		// Build a focused, non-chat patch-generation prompt and call the LLM
+		// once (non-streaming) so we get a deterministic diff/FILE block back.
+		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		system := prompt.BuildContract()
+		req := ai.Request{
+			Model:    m.cfg.ActiveModelName(),
+			System:   system,
+			Stream:   false,
+			Messages: []ai.Message{{Role: "user", Content: handoff}},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		resp, err := m.provider.Execute(ctx, req)
+		if err != nil {
+			return buildResultMsg{err: fmt.Errorf("patch generation failed: %w", err)}
+		}
+		if resp == nil || strings.TrimSpace(resp.Content) == "" {
+			return buildResultMsg{err: fmt.Errorf("patch generation returned empty output")}
+		}
+
+		// Feed the LLM output to the execution engine as a concrete patch and
+		// apply it. PatchManager.Apply handles unified diffs, FILE: blocks and
+		// full rewrites, with shadow backups + mutation guardrails.
+		orig := ""
+		if data, rerr := os.ReadFile(task.Target); rerr == nil {
+			orig = string(data)
+		}
+		patch := &execution.Patch{
+			ID:        fmt.Sprintf("build-%d", task.StepNum),
+			File:      task.Target,
+			Original:  orig,
+			Modified:  resp.Content,
+			TaskID:    task.StepNum,
+			ContextID: m.sess.ContextID,
+		}
+		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
+			return buildResultMsg{
+				output:   resp.Content,
+				exitCode: 1,
+				err:      fmt.Errorf("patch apply failed: %w", applyErr),
+			}
+		}
+
+		// Mark the task terminal in the live session ledger.
+		tasks := m.sess.CurrentTasks
+		for i := range tasks {
+			if tasks[i].StepNum == task.StepNum {
+				tasks[i].Status = "completed"
+				break
+			}
+		}
+		m.sess.StageTaskList(&tasks)
+		_ = m.sess.Save()
+		return buildResultMsg{
+			output:   fmt.Sprintf("Applied patch to %s", task.Target),
+			exitCode: 0,
+		}
+	}
+}
+
 func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	tasks := m.sess.CurrentTasks
 	if len(tasks) == 0 {
@@ -657,6 +1455,25 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	m.currentBuildTaskID = targetTask.StepNum
 	m.execEng.Patches.SetLedger(m.buildLedger)
 	m.execEng.Patches.SetContextID(m.sess.ContextID)
+
+	// ── SHELL_EXEC: run the command directly, do NOT chat ───────────────
+	// A SHELL_EXEC task is a concrete shell command (e.g. `go get <pkg>` /
+	// `go mod tidy`). /build MUST execute it via the OS shell and report the
+	// output — dispatching it to the LLM would produce a chat reply instead of
+	// actually running the command, breaking the build's execute-only contract.
+	if targetTask.Type == "SHELL_EXEC" {
+		return m.runBuildShellExec(targetTask)
+	}
+
+	// ── FILE_MUTATE / GIT_ACTION: generate + APPLY a real patch ──────────
+	// These tasks mutate the workspace. /build MUST produce the change and
+	// apply it through the execution engine (PatchManager), NOT stream a chat
+	// reply. Routing them through the conversational streamCmd made the model
+	// "greet" the user instead of executing — a violation of /build's sole
+	// mandate (execute, never chat).
+	if targetTask.Type == "FILE_MUTATE" || targetTask.Type == "GIT_ACTION" {
+		return m.runBuildPatchExec(targetTask)
+	}
 
 	buildTrace := &ctxpkg.CodebaseTrace{
 		MatchedFiles:    []string{targetTask.Target},
@@ -723,11 +1540,13 @@ func (m *model) runTestCmd(target string) tea.Cmd {
 		return tea.Batch(
 			func() tea.Msg { return agentStartMsg{label: "testing"} },
 			m.runTestEngine("./..."),
+			m.spinnerTickCmd(),
 		)
 	}
 	return tea.Batch(
 		func() tea.Msg { return agentStartMsg{label: "testing"} },
 		m.runTestEngine(target),
+		m.spinnerTickCmd(),
 	)
 }
 
@@ -753,11 +1572,13 @@ func (m *model) runRunCmd(target string) tea.Cmd {
 		return tea.Batch(
 			func() tea.Msg { return agentStartMsg{label: "building"} },
 			m.runBuildEngine("./..."),
+			m.spinnerTickCmd(),
 		)
 	}
 	return tea.Batch(
 		func() tea.Msg { return agentStartMsg{label: "building"} },
 		m.runBuildEngine(target),
+		m.spinnerTickCmd(),
 	)
 }
 
@@ -932,6 +1753,7 @@ func (m *model) runFixCmd(target string) tea.Cmd {
 		func() tea.Msg {
 			return agentStartMsg{label: "fixing"}
 		},
+		m.spinnerTickCmd(),
 		func() tea.Msg {
 			output := m.lastTestOutput
 			frames := investigate.ParseStackFrames(output)
@@ -1322,61 +2144,19 @@ func (m *model) handleBlueprintReady(msg blueprintReadyMsg) tea.Cmd {
 	m.acceptedProposals = nil
 	m.pendingProposals = nil
 
-	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Blueprint ready [%s]. Switched to /build.", msg.ledgerID)))
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Blueprint ready [%s].", msg.ledgerID)))
 
-	// ── Explicit UI mode transition to /build ──────────────────────────
-	// The exact millisecond the patch blueprint is finalized, we transition.
-	m.setMode(modes.ModeBuild)
-	m.lastTestOutput = msg.blueprint
-
-	// Reset pipeline flag so the normal boring path finishes cleanly
+	// ── RULE A: BLOCKED AUTO-TRANSITION TO /build ──────────────────────
+	// The pipeline blueprint is ready, but auto-transitioning to /build
+	// is blocked. The user must explicitly switch to /build.
+	m.push(roleError, "State Transition Blocked: File modifications are only allowed inside /build mode after /plan approval. Please run /plan first, then use /build.")
+	m.handoffCtx.ProposedFix = msg.blueprint
 	m.pipelineRunning = false
-
 	m.streamCh = nil
 	m.streaming = false
 	m.streamParser = nil
 	flush := m.flushPendingRecords()
-
-	// Dispatch the fix command with our blueprint as the failure content
-	return tea.Batch(
-		flush,
-		func() tea.Msg {
-			frames := investigate.ParseStackFrames(msg.blueprint)
-			var fixCtx strings.Builder
-			fixCtx.WriteString("## FIX BLUEPRINT\n\n```\n")
-			fixCtx.WriteString(msg.blueprint)
-			fixCtx.WriteString("\n```\n\n")
-
-			if len(frames) > 0 {
-				fixCtx.WriteString("## STACK TRACE → SOURCE PROXIMITY\n\n")
-				slicer := investigate.NewProximitySlicer(".", 10)
-				seen := make(map[string]bool)
-				for _, frame := range frames {
-					key := fmt.Sprintf("%s:%d", frame.File, frame.Line)
-					if seen[key] {
-						continue
-					}
-					seen[key] = true
-					slice := slicer.Extract(frame)
-					if slice != nil {
-						fmt.Fprintf(&fixCtx, "### %s:%d\n\n```go\n", slice.File, slice.Line)
-						for _, cline := range slice.Context {
-							fixCtx.WriteString(cline)
-							fixCtx.WriteString("\n")
-						}
-						fixCtx.WriteString("```\n\n")
-					}
-				}
-			}
-
-			fixCtx.WriteString("## INSTRUCTION\n")
-			fixCtx.WriteString("This is build mode — Execution-Only. Implement the fix blueprint above. ")
-			fixCtx.WriteString("Output ONLY the minimal unified diff or complete file replacement. ")
-			fixCtx.WriteString("Do NOT analyze, explain, or restate the problem.\n")
-
-			return fixResultMsg{content: fixCtx.String()}
-		},
-	)
+	return flush
 }
 
 // ── Workflow lifecycle: context cancellation for stale goroutine release ──
@@ -1394,6 +2174,9 @@ func (m *model) cancelStaleAgentOps() {
 	if m.ledger != nil {
 		m.ledgerStash = m.ledger.stashLedgerData()
 	}
+
+	// Cancel ALL registered background contexts (ghost loop prevention)
+	m.cancelAllBackgroundContexts()
 
 	m.reviewRunning = false
 	m.agentRunning = false
@@ -1426,6 +2209,23 @@ func (m *model) cancelStaleAgentOps() {
 		m.ledger.restoreLedgerData(m.ledgerStash)
 		m.ledgerStash = nil
 	}
+}
+
+// registerBackgroundCancel registers a cancel function for a background
+// context so it can be cancelled on mode transitions or Ctrl+C.
+func (m *model) registerBackgroundCancel(cancel context.CancelFunc) {
+	if cancel != nil {
+		m.backgroundCancels = append(m.backgroundCancels, cancel)
+	}
+}
+
+// cancelAllBackgroundContexts cancels all registered background contexts
+// and clears the registry. Used to prevent ghost loops on mode transitions.
+func (m *model) cancelAllBackgroundContexts() {
+	for _, cancel := range m.backgroundCancels {
+		cancel()
+	}
+	m.backgroundCancels = nil
 }
 
 // handleReviewDollar routes $ sub-commands.
@@ -1985,17 +2785,81 @@ func (m *model) resetObjectiveContextStacks() {
 
 // ── Handoff Pipeline ───────────────────────────────────────────────────────────
 
+// ── Greeting-Detection Guards ──────────────────────────────────────────────────
+
+var genericGreetingPatterns = []string{
+	"I am IZEN",
+	"How can I assist you",
+	"What are things like for you today",
+	"Hello!",
+	"Hi there",
+}
+
+// IsGenericGreeting detects whether a string is a generic fallback greeting
+// rather than substantive engineering analysis output.
+func IsGenericGreeting(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 20 {
+		return false
+	}
+	lower := strings.ToLower(s)
+	for _, p := range genericGreetingPatterns {
+		if strings.Contains(lower, strings.ToLower(p)) {
+			return true
+		}
+	}
+	return false
+}
+
+// CleanHandoffPayload strips generic greeting content from handoff payloads,
+// retaining only substantive engineering content (error logs, diagnostics, etc.).
+// If the entire payload is a greeting with no engineering content, returns "".
+func CleanHandoffPayload(payload string) string {
+	if !IsGenericGreeting(payload) {
+		return payload
+	}
+	var builder strings.Builder
+	for _, line := range strings.Split(payload, "\n") {
+		trimmed := strings.TrimSpace(line)
+		isGreeting := false
+		for _, p := range genericGreetingPatterns {
+			if strings.Contains(strings.ToLower(trimmed), strings.ToLower(p)) {
+				isGreeting = true
+				break
+			}
+		}
+		if !isGreeting {
+			if builder.Len() > 0 {
+				builder.WriteString("\n")
+			}
+			builder.WriteString(line)
+		}
+	}
+	return strings.TrimSpace(builder.String())
+}
+
+// ExtractSearchTerms (from the retrieval package) is the authoritative query
+// sanitizer for code search. It replaces the previous inline sanitizeSearchQuery
+// because it performs structural term extraction (symbols/paths/error
+// constants) rather than only stripping control characters — raw log strings
+// are now safely skipped instead of fired verbatim at the search engine.
+
 // injectHandoffContext primes the target mode with contextual state from the
 // previous mode. Called during setMode when a handoff context is available.
 func (m *model) injectHandoffContext(mode modes.Mode) {
 	switch mode {
 	case modes.ModeInvestigate:
 		if m.handoffCtx.LastFailurePayload != "" {
+			sanitized := config.SanitizeForSession(m.handoffCtx.LastFailurePayload)
+			m.handoffCtx.LastFailurePayload = sanitized
 			m.push(roleSystem, "Handoff context injected.")
 		}
 
 	case modes.ModePlan:
 		if m.handoffCtx.ProposedFix != "" {
+			cleaned := CleanHandoffPayload(m.handoffCtx.ProposedFix)
+			sanitized := config.SanitizeForSession(cleaned)
+			m.handoffCtx.ProposedFix = sanitized
 			if len(m.handoffCtx.PendingTodos) == 0 {
 				m.handoffCtx.PendingTodos = parseProposedFixIntoTodos(m.handoffCtx.ProposedFix)
 			}
@@ -2005,10 +2869,21 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 		}
 
 	case modes.ModeBuild:
-		if len(m.handoffCtx.PendingTodos) > 0 || m.handoffCtx.ProposedFix != "" {
+		// /build consumes ONLY the atomic structural tasks (PendingTodos /
+		// staged tasks) produced by /plan. The raw ProposedFix chat blob from
+		// an earlier phase is purged here so it can never re-inject stale
+		// conversational text into the build workspace. We keep a checkpoint
+		// for reversibility regardless.
+		if len(m.handoffCtx.PendingTodos) > 0 || len(m.sess.CurrentTasks) > 0 {
 			m.createBuildCheckpoint(0)
 			m.push(roleSystem, "Handoff context injected. Checkpoint created.")
 		}
+		// Purge stale conversational handoff so the build buffer stays clean.
+		m.handoffCtx.ProposedFix = ""
+
+		// REFORM A: Build strict minimal context for the active task.
+		// This is injected as the initial prompt for the build execution.
+		m.handoffCtx.LastFailurePayload = m.buildStrictHandoffPayload()
 	}
 }
 
@@ -2033,10 +2908,18 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 	if len(parts) >= 2 && parts[0] == "/mode" {
 		mode, ok := modes.Parse(parts[1])
 		if ok {
-			m.setMode(mode)
+			m.modeChangeAuthorized = true
 			if action.Query != "" {
+				// Suppress setMode auto-trigger — the explicit Query takes precedence.
+				// Clear handoff sources so setMode does not start a redundant stream.
+				// Handoff data is already captured in action.Query from workspace
+				// build time — the Query is the canonical payload.
+				m.handoffCtx.ProposedFix = ""
+				m.handoffLedgerContent = ""
+				m.setMode(mode)
 				return m.handleMessageContent(action.Query)
 			}
+			return m.setMode(mode)
 		}
 		return nil
 	}
@@ -2047,33 +2930,111 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 
 // parseProposedFixIntoTodos converts a proposed fix (markdown/diff) into a
 // checklist of concrete TODO strings for the plan mode dashboard.
+// maxPendingTodos caps how many pending TODO items a handoff payload may yield.
+// A well-formed investigation produces a handful of targeted items; anything
+// beyond this is a symptom of noise leaking through, so we clamp hard.
+const maxPendingTodos = 5
+
+// parseProposedFixIntoTodos extracts genuine, actionable task items from a
+// handoff payload and returns them deduplicated and clamped to maxPendingTodos.
+//
+// The payload is NOT a task list — it is the structured investigation forensics
+// blob (FormatForPlan output + [PKT-N] analytical packets: raw diagnostics,
+// code-fence blocks, section headers, compiler output). The previous
+// implementation had a catch-all fallback that promoted EVERY non-empty line to
+// a "TODO" when no checkbox markers were present, so a single handoff spawned
+// ~18 junk TODOs made of ``` fences, "### RAW DIAGNOSTICS" headers, "[PKT-N]"
+// lines, and raw shell prints. Those flooded the /plan prompt and stalled
+// synthesis.
+//
+// This version enforces a strict data boundary: it only accepts lines that are
+// explicitly marked as tasks (checkbox / bullet-status glyphs), and even then
+// rejects anything that is recognizably log or layout noise. If the payload
+// carries no explicit task markers it yields ZERO todos — the forensics still
+// travel to /plan via handoffLedgerContent, and /plan owns task synthesis.
 func parseProposedFixIntoTodos(fix string) []string {
 	lines := strings.Split(fix, "\n")
 	var todos []string
+	seen := make(map[string]bool)
+
+	add := func(item string) {
+		item = strings.TrimSpace(item)
+		if item == "" || isHandoffNoiseLine(item) {
+			return
+		}
+		key := strings.ToLower(item)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		todos = append(todos, item)
+	}
+
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
 			continue
 		}
-		if strings.HasPrefix(trimmed, "- [ ]") || strings.HasPrefix(trimmed, "- [x]") {
-			todos = append(todos, strings.TrimSpace(trimmed[5:]))
-		} else if strings.HasPrefix(trimmed, "✓ ") || strings.HasPrefix(trimmed, "○ ") || strings.HasPrefix(trimmed, "● ") {
-			todos = append(todos, strings.TrimSpace(trimmed[2:]))
+		switch {
+		case strings.HasPrefix(trimmed, "- [ ]"), strings.HasPrefix(trimmed, "- [x]"):
+			add(trimmed[5:])
+		case strings.HasPrefix(trimmed, "✓ "), strings.HasPrefix(trimmed, "○ "), strings.HasPrefix(trimmed, "● "):
+			add(trimmed[len("✓ "):])
 		}
 	}
-	if len(todos) == 0 {
-		for _, line := range lines {
-			trimmed := strings.TrimSpace(line)
-			if trimmed != "" {
-				todos = append(todos, trimmed)
-			}
-		}
-	}
-	if len(todos) > 20 {
-		todos = todos[:20]
+
+	if len(todos) > maxPendingTodos {
+		todos = todos[:maxPendingTodos]
 	}
 	return todos
 }
+
+// isHandoffNoiseLine reports whether a line is investigation log/layout noise
+// rather than an actionable task. It rejects markdown section headers, code
+// fences, analytical-packet framing ([PKT-N], "Total packets:"), verbatim
+// compiler/shell coordinates and download chatter, and other raw diagnostic
+// residue that must never become a pending TODO.
+func isHandoffNoiseLine(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return true
+	}
+	// Markdown headers and code fences are pure layout.
+	if strings.HasPrefix(t, "#") || strings.HasPrefix(t, "```") || t == "`" {
+		return true
+	}
+	// Analytical-packet framing emitted by FormatPacketsForPlan.
+	if strings.HasPrefix(t, "[PKT-") ||
+		strings.HasPrefix(t, "Total packets:") ||
+		strings.HasPrefix(t, "kind=") ||
+		strings.HasPrefix(t, "node=") ||
+		strings.HasPrefix(t, "snippet:") {
+		return true
+	}
+	// FormatForPlan structural labels / boundary markers.
+	lower := strings.ToLower(t)
+	for _, p := range []string{
+		"source:", "problem:", "target file:", "diagnostics error log:",
+		"raw diagnostics", "boundary enforcement", "affected symbols",
+		"investigation ledger", "investigation handoff",
+	} {
+		if strings.HasPrefix(lower, p) || lower == p {
+			return true
+		}
+	}
+	// Raw compiler/shell residue: "go: downloading ...", "no required module ...",
+	// and file:line:col coordinates carrying no imperative verb.
+	if strings.HasPrefix(lower, "go: ") ||
+		strings.HasPrefix(lower, "no required module") ||
+		compilerCoordRe.MatchString(t) {
+		return true
+	}
+	return false
+}
+
+// compilerCoordRe matches a bare "path/file.ext:line:col" compiler coordinate at
+// the start of a line — raw diagnostic residue, never an actionable task.
+var compilerCoordRe = regexp.MustCompile(`^[^\s:]+\.\w+:\d+:\d+`)
 
 // extractTodosFromPlan extracts TODO items from a plan-mode LLM response.
 func extractTodosFromPlan(content string) []string {

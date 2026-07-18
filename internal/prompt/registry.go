@@ -3,6 +3,8 @@ package prompt
 import (
 	"fmt"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/config"
 )
 
 // RuntimeFacts are facts supplied externally by the runtime (e.g. the engineer
@@ -21,11 +23,11 @@ type RuntimeFacts struct {
 // is duplicated because each lives in exactly one place.
 func Compose(modeContract string, facts RuntimeFacts) string {
 	var b strings.Builder
-	username := facts.Username
+	username := config.SanitizeUsername(facts.Username)
 	if username == "" {
-		username = "developer"
+		username = "Developer"
 	}
-	fmt.Fprintf(&b, "The engineer you are collaborating with is '@%s'. This is a hard, invariant fact for the entire session — you MUST remember it and NEVER say you do not know their name, never ask them to tell you their name, and never claim the name was not provided. When asked who they are, answer '@%s' directly.\n\n", username, username)
+	fmt.Fprintf(&b, "You are IZEN. The human engineer you are collaborating with is named '%s'. This is a hard, invariant fact for the entire session — you MUST remember it and NEVER say you do not know their name, never ask them to tell you their name, and never claim the name was not provided. When asked about the user's identity, answer that they are '%s'.", username, username)
 	b.WriteString(CommonContract())
 	b.WriteString("\n\n")
 	b.WriteString(modeContract)
@@ -35,7 +37,7 @@ func Compose(modeContract string, facts RuntimeFacts) string {
 // AskSystemPrompt returns the composed system prompt for ask mode.
 func AskSystemPrompt(username string) string {
 	if username == "" {
-		username = "developer"
+		username = "Developer"
 	}
 	return Compose(AskContract(), RuntimeFacts{Username: username})
 }
@@ -57,7 +59,7 @@ func InvestigateSystemPrompt() string {
 
 // ForMode returns the composed system prompt for the named mode.
 func ForMode(mode string) string {
-	return ForModeWithUser(mode, "developer")
+	return ForModeWithUser(mode, "Developer")
 }
 
 // ForModeWithUser returns the composed system prompt for the named mode,
@@ -86,4 +88,17 @@ func BuildMessage(mode, userContent string) string {
 		return userContent
 	}
 	return fmt.Sprintf("System: %s\n\nUser: %s", sys, userContent)
+}
+
+// IdentityStatement returns a short, standalone identity fact for injection
+// directly into the message array on every LLM turn. This is separate from
+// the system prompt so it lands near the user's current message in the
+// model's context window — critical for smaller models that poorly attend
+// to the system prompt.
+func IdentityStatement(username string) string {
+	name := config.SanitizeUsername(username)
+	if name == "" {
+		return ""
+	}
+	return fmt.Sprintf("Remember: you are IZEN. The human talking to you is named '%s'. Never refer to yourself as %s. Always address the human as %s.", name, name, name)
 }

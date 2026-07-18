@@ -13,6 +13,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/review"
 	"github.com/PizenLabs/izen/internal/prompt"
+	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
 func (m *model) runInvestigateCmd(content string) tea.Cmd {
@@ -20,12 +21,17 @@ func (m *model) runInvestigateCmd(content string) tea.Cmd {
 		func() tea.Msg {
 			return agentStartMsg{label: "investigating"}
 		},
+		m.spinnerTickCmd(),
 		m.runInvestigateAsyncCmd(content),
 	)
 }
 
 func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 	currentMode := m.resolver.Current()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// Register cancel so it can be invoked on mode transition/Ctrl+C
+	m.registerBackgroundCancel(cancel)
 
 	return func() tea.Msg {
 		if !currentMode.CanShell() {
@@ -35,31 +41,40 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			return investigateResultMsg{err: fmt.Errorf("investigate mode: write capability detected — violating capability contract")}
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-
 		type outcome struct {
-			result *investigate.InvestigationResult
-			err    error
+			result        *investigate.InvestigationResult
+			err           error
+			ledgerForPlan string
+			engLedger     *investigate.ContextLedger
 		}
 		outCh := make(chan outcome, 1)
 
 		go func() {
-			eng := investigate.NewEngine(".", content, nil, nil)
+			retriever := investigate.NewRetrieverAdapter(retrieval.NewRetriever(".", m.graph))
+			executor := investigate.NewShellTestExecutor(".")
+			eng := investigate.NewEngineWithAI(".", content, retriever, executor, m.provider, m.cfg.ActiveModelName())
 			result, err := eng.RunContext(ctx)
-			outCh <- outcome{result: result, err: err}
+			ledgerContent := eng.FormatLedgerForPlan()
+			outCh <- outcome{result: result, err: err, ledgerForPlan: ledgerContent, engLedger: eng.Ledger}
 		}()
 
 		var result *investigate.InvestigationResult
 		var engErr error
+		var ledgerForPlan string
+		var engLedger *investigate.ContextLedger
 
 		select {
 		case o := <-outCh:
 			result = o.result
 			engErr = o.err
+			ledgerForPlan = o.ledgerForPlan
+			engLedger = o.engLedger
 		case <-ctx.Done():
 			engErr = fmt.Errorf("investigation timed out after 60s: %w", ctx.Err())
 		}
+
+		// Unregister cancel since we're done
+		cancel()
 
 		var recs []record
 
@@ -115,6 +130,8 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			sessionKey:        content,
 			err:               engErr,
 			escalationContent: esc,
+			ledgerContent:     ledgerForPlan,
+			investigateLedger: engLedger,
 		}
 	}
 }

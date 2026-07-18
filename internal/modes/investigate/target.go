@@ -5,7 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/session"
 )
 
 type Target struct {
@@ -21,13 +24,14 @@ type Target struct {
 // root cause targets, evidence, and a conclusion. Atomic task synthesis is
 // exclusively owned by /plan/planner.go.
 type ContextLedger struct {
-	Source     string     `json:"source"`
-	Problem    string     `json:"problem"`
-	RootCause  string     `json:"root_cause,omitempty"`
-	Targets    []Target   `json:"targets"`
-	Evidence   []Evidence `json:"evidence,omitempty"`
-	Conclusion string     `json:"conclusion,omitempty"`
-	Resolved   bool       `json:"resolved"`
+	Source      string     `json:"source"`
+	Problem     string     `json:"problem"`
+	RootCause   string     `json:"root_cause,omitempty"`
+	Targets     []Target   `json:"targets"`
+	Evidence    []Evidence `json:"evidence,omitempty"`
+	Conclusion  string     `json:"conclusion,omitempty"`
+	Resolved    bool       `json:"resolved"`
+	Diagnostics string     `json:"diagnostics,omitempty"`
 }
 
 func NewContextLedger() *ContextLedger {
@@ -191,9 +195,57 @@ func (cl *ContextLedger) AddTarget(t Target) {
 	cl.Targets = append(cl.Targets, t)
 }
 
+func (cl *ContextLedger) SetDiagnostics(raw string) {
+	cl.Diagnostics = raw
+}
+
 func (cl *ContextLedger) SetConclusion(conclusion string, resolved bool) {
 	cl.Conclusion = conclusion
 	cl.Resolved = resolved
+}
+
+// compilerLogPathRe matches Go/Rust/TypeScript compiler diagnostics of the form
+// "cmd/api/main.go:7:5" (file:line:col) and extracts the offending file
+// coordinates. This powers TASK 1 of the build-freeze fix: even when a
+// dependency/compilation error short-circuits the agent, we still resolve the
+// exact file:line targets from the raw logs instead of exiting empty-handed.
+var compilerLogPathRe = regexp.MustCompile(`([^\s:]+\.(?:go|rs|ts|tsx|js|jsx|py|java|cpp|c|cc|h)):(\d+):(\d+)`)
+
+// ParseCompilerTargets extracts file:line:col coordinates directly from raw
+// compiler/test output and returns them as investigate Targets. It is a pure,
+// read-only operation — no file I/O, no mutations. Any file that cannot be
+// localized falls back to the raw path with line 0 so the coordinate is still
+// captured for downstream /plan consumption.
+func ParseCompilerTargets(output string) []Target {
+	var targets []Target
+	seen := make(map[string]bool)
+	for _, m := range compilerLogPathRe.FindAllStringSubmatch(output, -1) {
+		file := m[1]
+		// Normalize compiler-style "./path" prefixes to a project-root relative
+		// path so downstream /plan task targeting matches the repo layout.
+		file = strings.TrimPrefix(file, "./")
+		file = strings.TrimPrefix(file, "/")
+		line, _ := strconv.Atoi(m[2])
+		col, _ := strconv.Atoi(m[3])
+		key := fmt.Sprintf("%s:%d:%d", file, line, col)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		node, kind := "", "file"
+		// Best-effort AST node localization without mutating workspace state.
+		if ti := NewTargetIsolator(""); file != "" {
+			node, kind = ti.locateNode(file, line)
+		}
+		targets = append(targets, Target{
+			File:    file,
+			Line:    line,
+			Node:    node,
+			Kind:    kind,
+			Snippet: "",
+		})
+	}
+	return targets
 }
 
 func (cl *ContextLedger) FormatForPlan() string {
@@ -201,6 +253,11 @@ func (cl *ContextLedger) FormatForPlan() string {
 	fmt.Fprintf(&b, "### INVESTIGATION LEDGER (Root Cause Only — No Tasks)\n")
 	fmt.Fprintf(&b, "Source: %s\n", cl.Source)
 	fmt.Fprintf(&b, "Problem: %s\n", cl.Problem)
+
+	if cl.Diagnostics != "" {
+		fmt.Fprintf(&b, "\n### RAW DIAGNOSTICS\n")
+		fmt.Fprintf(&b, "```\n%s\n```\n", cl.Diagnostics)
+	}
 
 	if cl.RootCause != "" {
 		fmt.Fprintf(&b, "\n### ROOT CAUSE\n%s\n", cl.RootCause)
@@ -251,4 +308,69 @@ func abs(n int) int {
 		return -n
 	}
 	return n
+}
+
+// ToPackets projects the forensic findings of this investigate ledger into the
+// canonical session.LedgerPacket type so they can be injected — sequentially and
+// ID-addressed — into the session.ContextLedger handoff. Each finding becomes
+// its own packet: the problem, every isolated target coordinate, high-signal
+// evidence, and the final conclusion. The full payload is preserved verbatim;
+// the caller (bridgeInvestigationToLedger) assigns the sequential PacketIDs.
+func (cl *ContextLedger) ToPackets() []session.LedgerPacket {
+	var pkts []session.LedgerPacket
+
+	if cl.Problem != "" {
+		pkts = append(pkts, session.LedgerPacket{
+			Kind:    "problem",
+			Title:   "Investigation problem statement",
+			Payload: cl.Problem,
+		})
+	}
+
+	for _, t := range cl.Targets {
+		var b strings.Builder
+		fmt.Fprintf(&b, "node=%s kind=%s", t.Node, t.Kind)
+		if t.Snippet != "" {
+			fmt.Fprintf(&b, "\nsnippet:\n%s", t.Snippet)
+		}
+		pkts = append(pkts, session.LedgerPacket{
+			Kind:    "target",
+			Title:   "Isolated code coordinate",
+			Payload: b.String(),
+			File:    t.File,
+			Line:    t.Line,
+		})
+	}
+
+	for _, ev := range cl.Evidence {
+		if ev.Content == "" {
+			continue
+		}
+		pkts = append(pkts, session.LedgerPacket{
+			Kind:       "evidence",
+			Title:      fmt.Sprintf("Evidence [%s]", ev.Source),
+			Payload:    ev.Content,
+			File:       ev.File,
+			Line:       ev.Line,
+			Confidence: ev.Confidence,
+		})
+	}
+
+	if cl.RootCause != "" {
+		pkts = append(pkts, session.LedgerPacket{
+			Kind:    "root_cause",
+			Title:   "Derived root cause",
+			Payload: cl.RootCause,
+		})
+	}
+
+	if cl.Conclusion != "" {
+		pkts = append(pkts, session.LedgerPacket{
+			Kind:    "conclusion",
+			Title:   "Investigation conclusion",
+			Payload: cl.Conclusion,
+		})
+	}
+
+	return pkts
 }

@@ -2,6 +2,7 @@ package execution
 
 import (
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/modes"
@@ -26,6 +27,8 @@ type Engine struct {
 	Verifier *Verifier
 	Diff     *DiffAnalyzer
 	Pipeline *PipelineRunner
+
+	Tx *engine.Transaction
 }
 
 func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ...language.ID) *Engine {
@@ -53,6 +56,8 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ..
 
 	d := NewDiffAnalyzer()
 
+	tx := engine.NewTransaction()
+
 	e := &Engine{
 		Runner:      r,
 		Test:        t,
@@ -61,11 +66,13 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ..
 		Git:         git.NewEngine(root),
 		root:        root,
 		langID:      activeLangID,
+		Tx:          tx,
 		Policy:      pe,
 		Risk:        rc,
 		Verifier:    v,
 		Diff:        d,
 	}
+	p.SetTransaction(tx)
 	e.PatchQueue = NewPatchQueue(root, e.Patches)
 	e.StreamMon = NewStreamMonitor(e.PatchQueue)
 	e.Pipeline = NewPipelineRunner(e)
@@ -158,4 +165,28 @@ func (e *Engine) StepCompleted(stepNum int) error {
 
 func (e *Engine) SetPlanStore(ps *plan.PlanStore) {
 	e.PlanStore = ps
+}
+
+func (e *Engine) BeginTransaction() {
+	tx := engine.NewTransaction()
+	e.Tx = tx
+	e.Patches.SetTransaction(tx)
+}
+
+func (e *Engine) CommitTransaction() {
+	if e.Tx == nil {
+		return
+	}
+	e.Tx.Commit()
+}
+
+func (e *Engine) RollbackTransaction() []error {
+	if e.Tx == nil {
+		return nil
+	}
+	errs := e.Tx.Rollback()
+	tx := engine.NewTransaction()
+	e.Tx = tx
+	e.Patches.SetTransaction(tx)
+	return errs
 }

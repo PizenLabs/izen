@@ -144,6 +144,16 @@ func (pr *PipelineRunner) ExecuteBuild(staged []StagedPatch) PipelineResult {
 	pr.logPipeline("verification", s4, "")
 
 	if !passed {
+		// Rollback transaction: restore all modified files to original state
+		if errs := pr.engine.RollbackTransaction(); len(errs) > 0 {
+			if globalActivityLog != nil {
+				for _, e := range errs {
+					globalActivityLog("[ROLLBACK] transaction rollback error: %v", e)
+				}
+			}
+		} else if globalActivityLog != nil {
+			globalActivityLog("[ROLLBACK] transaction rolled back — workspace restored to pristine state")
+		}
 		return pr.finalize(start, stages, passed, riskLevel, "verification failed, changes blocked")
 	}
 
@@ -167,6 +177,12 @@ func (pr *PipelineRunner) ExecuteBuild(staged []StagedPatch) PipelineResult {
 		record(s5, "skipped", "no audit logger configured")
 	}
 	pr.logPipeline("audit", s5, "")
+
+	// Transaction committed: all mutations are final
+	pr.engine.CommitTransaction()
+	if globalActivityLog != nil {
+		globalActivityLog("[COMMIT] transaction committed — all mutations finalized")
+	}
 
 	return pr.finalize(start, stages, passed, riskLevel, "")
 }

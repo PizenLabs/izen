@@ -42,6 +42,7 @@ type ollamaRequest struct {
 	Model    string          `json:"model"`
 	Messages []ollamaMessage `json:"messages"`
 	Stream   bool            `json:"stream"`
+	Format   string          `json:"format,omitempty"` // "json" for structured output
 }
 
 type ollamaResponse struct {
@@ -141,6 +142,9 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		Model:    model,
 		Messages: msgs,
 		Stream:   false,
+	}
+	if req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object" {
+		body.Format = "json"
 	}
 
 	payload, err := json.Marshal(body)

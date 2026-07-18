@@ -25,6 +25,7 @@ import (
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/session"
@@ -84,17 +85,33 @@ type traceUpdateMsg struct {
 
 type streamErrMsg struct{ err error }
 
+type PlanStreamingFinishedMsg struct {
+	Success bool
+}
+
 type gitInitResultMsg struct{ err error }
 
 type tickMsg time.Time
 
 type smoothStreamTickMsg time.Time
 
+// planSlowNoticeMsg fires once, planSlowNoticeDelay after /plan synthesis
+// starts. If synthesis is still pending when it arrives, a viewport-safe
+// warning is surfaced (never a raw terminal print) so the user learns the
+// local model may be unresponsive before the 120s hard timeout.
+type planSlowNoticeMsg struct{ startedAt time.Time }
+
+// planSlowNoticeDelay is how long /plan synthesis may run before the soft
+// "provider may be unresponsive" notice is shown.
+const planSlowNoticeDelay = 10 * time.Second
+
 type investigateResultMsg struct {
 	records           []record
 	sessionKey        string
 	err               error
 	escalationContent string // when Resolved=false, pipe investigation data to LLM for analysis
+	ledgerContent     string // FormatLedgerForPlan() — structured Context-Ledger data, the SSOT for handoff
+	investigateLedger *investigate.ContextLedger
 }
 
 type reviewResultMsg struct {
@@ -102,6 +119,15 @@ type reviewResultMsg struct {
 	sessionKey   string
 	saveReportFn func()
 	err          error
+}
+
+// planResultMsg carries the outcome of the asynchronous PlanEngine ledger
+// synthesis. It is dispatched from a background tea.Cmd (runPlanEngineCmd) so
+// the synchronous LLM call never blocks the Bubble Tea event loop.
+type planResultMsg struct {
+	Tasks   []plan.Task
+	Err     error
+	Handoff HandoffContext // echoed back so the handler can populate PendingTodos
 }
 
 type agentStartMsg struct{ label string }
@@ -421,7 +447,7 @@ var utilityCommands = map[modes.Mode][]string{
 
 var globalCommands = []string{"/help", "/?", "/mode", "/objective", "/drop", "/quit", "/arch"}
 
-var flowingSpinnerFrames = []string{" ✦ ", " ★ ", " ⚙ ", " ❋ ", " ❄ ", " ❆ ", " ❋ ", " ⚙ ", " ★ ", " ✦ "}
+var flowingSpinnerFrames = []string{" ✦ ", " ✧ ", " ⚙ ", " ❋ ", " ❄ ", " ✱ ", " ❋ ", " ⚙ ", " ✧ ", " ✦ "}
 
 // providerSwitchMsg signals a successful provider switch.
 type providerSwitchMsg struct {
@@ -464,10 +490,15 @@ type model struct {
 	PreRenderedHistory string
 
 	// Streaming
-	streamCh             chan tea.Msg
-	responseBuffer       strings.Builder
-	streaming            bool
-	spinnerFrame         int
+	streamCh       chan tea.Msg
+	responseBuffer strings.Builder
+	streaming      bool
+	spinnerFrame   int
+	// lastSpinnerAdvance throttles spinner-frame advancement inside the 20ms
+	// smoothStreamTickMsg loop to a ~100ms cadence, so the braille animation
+	// stays visually consistent with the 100ms tickMsg loop while token
+	// rendering keeps its 20ms pacing. Zero value means "advance immediately".
+	lastSpinnerAdvance   time.Time
 	currentStreamContent string // accumulated raw text during active LLM stream
 
 	// Expanded metrics for status bar
@@ -519,8 +550,9 @@ type model struct {
 
 	state UIState
 
-	execEng   *execution.Engine
-	planStore *plan.PlanStore
+	execEng    *execution.Engine
+	planStore  *plan.PlanStore
+	planEngine *plan.Engine // structural plan engine wired for ledger-driven execution
 
 	// buildLedger is the live /plan task state bridge shared with the execution
 	// engine. It is created lazily and survives across builds within a session.
@@ -578,6 +610,11 @@ type model struct {
 	streamCancel       context.CancelFunc
 	interruptRequested bool
 
+	// Background context registry: tracks all in-flight background contexts
+	// so they can be cancelled on mode transitions or Ctrl+C.
+	// Each entry is a cancel function returned by context.WithCancel.
+	backgroundCancels []context.CancelFunc
+
 	// Viewport scroll tracking: when the user scrolls up to inspect code,
 	// auto-scroll to bottom is suppressed until SPACE or a new message.
 	userIsScrollingUp bool
@@ -621,9 +658,29 @@ type model struct {
 	// tick loop force-clears it to prevent ghost spinner lock.
 	lastActionTime time.Time
 
+	// lastAgentActivity is the wall-clock timestamp of the most recent
+	// background-agent activity (agent start, progress tick, or result
+	// receipt). The tickMsg leak detector uses it to distinguish a genuine
+	// long-term hang from a legitimate in-flight worker: UI execution flags
+	// (m.streaming / m.agentRunning) are only force-cleared once activity has
+	// been idle for at least 15 seconds, preventing premature spinner freezes.
+	lastAgentActivity time.Time
+
 	// Handoff pipeline: inter-mode state transfer (WORKFLOW STATE).
 	// This survives mode transitions and must never be cleared to hide UI.
 	handoffCtx HandoffContext
+
+	// handoffLedgerContent stores the raw Context-Ledger output from the
+	// investigate engine (FormatLedgerForPlan). It is the authoritative
+	// Single Source of Truth for mode-to-mode handoffs — preferred over
+	// the transient LLM output text (Transaction Cache).
+	handoffLedgerContent string
+
+	// lastInvestigateLedger holds the structured forensic findings produced by
+	// the most recent /investigate run. bridgeInvestigationToLedger projects it
+	// into the canonical session.ContextLedger as sequential, ID-addressed
+	// packets, preserving state across the mode transition.
+	lastInvestigateLedger *investigate.ContextLedger
 
 	// currentResult is the most recent workflow RESULT and the capabilities it
 	// exposes. It is DOMAIN state (the engine's current outcome) — NOT a UI
@@ -641,6 +698,33 @@ type model struct {
 	// Build auto-recovery counter: tracks retry attempts after persistent
 	// build failure during verification. Reset on mode entry and clear.
 	buildRecoveryCount int
+
+	// modeChangeAuthorized is set true ONLY when the user explicitly types a
+	// mode-switch command (/build, /plan, /mode build). Auto-transitions from
+	// the execution pipeline or investigate→build detection are blocked unless
+	// this flag is true. Reset to false after every setMode call.
+	modeChangeAuthorized bool
+
+	// planApproved tracks whether the current plan has been generated and
+	// approved by the user. Once true, the engine permits direct transition
+	// to /build without re-entering /plan. Set true on successful plan→build
+	// transition. Reset to false when entering /plan or /investigate.
+	planApproved bool
+
+	// planPending marks that an asynchronous PlanEngine ledger synthesis is
+	// in flight (set when the /plan handoff spawns runPlanEngineCmd, cleared
+	// when planResultMsg arrives). It is the definitive signal that the
+	// spinner is legitimately owned by a live orchestration worker, so the
+	// tickMsg leak-detector must NOT wipe the loading flags until the
+	// terminal planResultMsg is delivered.
+	planPending bool
+
+	// planStartedAt records when the current /plan synthesis began. It backs
+	// the soft-timeout notice (planSlowNoticeMsg): if synthesis is still in
+	// flight after planSlowNoticeDelay, a single viewport-safe warning is
+	// surfaced so the user knows the local model may be unresponsive — well
+	// before the 120s hard context timeout fires.
+	planStartedAt time.Time
 
 	// Context Ledger: silent issue tracking across failure sessions
 	ledger *ContextLedger
@@ -874,7 +958,8 @@ func (m *model) renderRecordForViewport(rec record) string {
 
 	switch rec.role {
 	case roleUser:
-		userHeader := dimmedStyle.Render("@" + m.userName + "  ")
+		displayName := config.SanitizeUsername(m.userName)
+		userHeader := dimmedStyle.Render("@" + displayName + "  ")
 		paddedText := " " + rec.text
 		padNeeded := width - lipgloss.Width(userHeader) - lipgloss.Width(paddedText) - 1
 		if padNeeded > 0 {
@@ -910,6 +995,55 @@ func (m *model) flushRecord(rec record) tea.Cmd {
 }
 
 // flushPendingRecords returns a batch cmd that flushes all records.
+// resetStreamingState forcibly clears every background-execution flag that
+// drives the "⚙ streaming…" prompt indicator and the runtime-status spinner.
+// Call this when a background engine path terminates (the async planResultMsg
+// handler) so a prior stream/agent session can never leak its spinner into a
+// subsequent idle view. It mirrors the teardown performed by streamDoneMsg.
+func (m *model) resetStreamingState() {
+	m.streaming = false
+	m.streamCh = nil
+	m.streamCancel = nil
+	m.streamTickActive = false
+	m.agentRunning = false
+	m.agentLabel = ""
+	m.planPending = false
+	m.spinnerFrame = 0
+	m.lastSpinnerAdvance = time.Time{}
+	if m.streamParser != nil {
+		m.streamParser = nil
+	}
+}
+
+// reconcileSpinner is the single deterministic reset point that ties the
+// Bubble Tea spinner lifecycle to command resolution. It is called whenever an
+// async producer (plan result, investigate result, ledger handoff) resolves or
+// yields zero constructive tasks, guaranteeing the transient loading flags are
+// cleared immediately so the UI can never freeze on "✦ streaming…".
+//
+// IMPORTANT: this method ONLY clears transient loading flags. It must NEVER
+// touch persistent view state — m.state (UIState), m.currentResult (which
+// drives Action Chip rendering), m.handoffCtx, m.pendingProposals, or component
+// visibility — otherwise it would wipe the user's actionable buttons or corrupt
+// the active layout when a background command resolves.
+func (m *model) reconcileSpinner() {
+	m.streaming = false
+	m.streamCh = nil
+	m.streamCancel = nil
+	m.streamTickActive = false
+	m.agentRunning = false
+	m.agentLabel = ""
+	m.agentDone = true
+	m.reviewRunning = false
+	m.pipelineRunning = false
+	m.planPending = false
+	m.spinnerFrame = 0
+	m.lastSpinnerAdvance = time.Time{}
+	if m.streamParser != nil {
+		m.streamParser = nil
+	}
+}
+
 func (m *model) flushPendingRecords() tea.Cmd {
 	if len(m.records) == 0 {
 		return nil

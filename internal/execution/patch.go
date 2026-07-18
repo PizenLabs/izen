@@ -11,6 +11,7 @@ import (
 	"time"
 
 	izenctx "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/modes/build"
 )
 
@@ -187,6 +188,8 @@ type PatchManager struct {
 	// every patch write to ensure structural integrity before allowing a
 	// task to transition to TaskCompleted.
 	verifier *Verifier
+
+	tx *engine.Transaction
 }
 
 func NewPatchManager(root string) *PatchManager {
@@ -201,6 +204,10 @@ func NewPatchManager(root string) *PatchManager {
 // patch manager runs verifier.RunAll() after every write and refuses to mark
 // the task as completed if verification fails — enforcing the Zero Syntax
 // Leakage guarantee.
+func (pm *PatchManager) SetTransaction(tx *engine.Transaction) {
+	pm.tx = tx
+}
+
 func (pm *PatchManager) SetVerifier(v *Verifier) {
 	pm.verifier = v
 }
@@ -358,6 +365,44 @@ func (pm *PatchManager) restoreFromShadowBackup(fullPath string) error {
 	return os.WriteFile(fullPath, data, 0644)
 }
 
+// QuickSave creates a shadow backup of all currently tracked files in the
+// transaction. This is called BEFORE any build mutation to ensure a clean
+// rollback point exists. Returns the list of files that were backed up.
+func (pm *PatchManager) QuickSave(files []string) ([]string, error) {
+	var backedUp []string
+	for _, file := range files {
+		fullPath := filepath.Join(pm.root, file)
+		if err := pm.createShadowBackup(fullPath); err != nil {
+			return backedUp, fmt.Errorf("quick save %s: %w", file, err)
+		}
+		backedUp = append(backedUp, file)
+	}
+	return backedUp, nil
+}
+
+// QuickLoad restores all files from their shadow backups. This is called
+// on ANY compilation failure to ensure the workspace is never left in a
+// broken state. Returns the list of files that were restored.
+func (pm *PatchManager) QuickLoad(files []string) ([]string, error) {
+	var restored []string
+	for _, file := range files {
+		fullPath := filepath.Join(pm.root, file)
+		if err := pm.restoreFromShadowBackup(fullPath); err != nil {
+			return restored, fmt.Errorf("quick load %s: %w", file, err)
+		}
+		restored = append(restored, file)
+	}
+	return restored, nil
+}
+
+// HasShadowBackup checks if a shadow backup exists for the given file.
+func (pm *PatchManager) HasShadowBackup(file string) bool {
+	backupDir := filepath.Join(pm.root, ".izen", "checkpoints", "cp-"+sanitizeCtxID(pm.contextID)+"-backup")
+	backupPath := filepath.Join(backupDir, filepath.Base(file)+".orig")
+	_, err := os.Stat(backupPath)
+	return err == nil
+}
+
 func (pm *PatchManager) appendMutationLog(file string, patchID string) error {
 	auditDir := filepath.Join(pm.root, ".izen", "audit")
 	if err := os.MkdirAll(auditDir, 0755); err != nil {
@@ -426,6 +471,16 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	if patch.Original == "" {
 		if data, err := os.ReadFile(fullPath); err == nil {
 			patch.Original = string(data)
+		}
+	}
+
+	// Record file in transaction for rollback capability
+	if pm.tx != nil {
+		if err := pm.tx.Record(fullPath); err != nil {
+			if globalActivityLog != nil {
+				globalActivityLog("[FAIL] patch rejected on %s: transaction record failed: %v", patch.File, err)
+			}
+			return fmt.Errorf("transaction record %s: %w", patch.File, err)
 		}
 	}
 

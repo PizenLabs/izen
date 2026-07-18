@@ -2,8 +2,12 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -15,6 +19,43 @@ import (
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
 )
+
+// debugLogPayload writes the exact outgoing LLM payload to
+// .izen/debug/payload.log so we can prove what the model actually receives on
+// each /ask turn. This is purely diagnostic — it appends one JSON line per
+// streamCmd invocation and never affects the runtime path.
+func debugLogPayload(content string, msgs []ai.Message) {
+	dir := filepath.Join(".izen", "debug")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	// Capture only the final user message and the last 4 history turns to
+	// keep the log compact and focused on ordering/duplication evidence.
+	last := msgs
+	if len(last) > 4 {
+		last = last[len(last)-4:]
+	}
+	entry := struct {
+		Time      string       `json:"time"`
+		FinalUser string       `json:"final_user_content"`
+		Window    []ai.Message `json:"last_messages"`
+	}{
+		Time:      time.Now().Format(time.RFC3339Nano),
+		FinalUser: content,
+		Window:    last,
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	data = append(data, '\n')
+	f, err := os.OpenFile(filepath.Join(dir, "payload.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	_, _ = f.Write(data)
+}
 
 func (m *model) streamCmd(content string) tea.Cmd {
 	// Guard against empty content or unintended/stray submissions
@@ -36,6 +77,12 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streaming = true
 	m.spinnerFrame = 0
 	m.responseBuffer.Reset()
+	// ── TRANSIENT BUFFER RESET (1-TURN LATENCY FIX) ───────────────────
+	// Explicitly clear all accumulated raw-string buffers before launching the
+	// stream so the rendering pipeline cannot leak or re-send leftover bytes
+	// from the previous turn (the ghost-output / stale-context bug).
+	m.streamBuffer = ""
+	m.currentStreamContent = ""
 	m.streamParser = NewIncrementalStreamParser(m.width - 2)
 	m.streamParser.Reset()
 	if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.HumanConfirmed {
@@ -74,10 +121,21 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	if uname == "" {
 		uname = m.userName
 	}
-	if uname == "" {
-		uname = "developer"
-	}
 	systemPrompt := prompt.ForModeWithUser(m.resolver.Current().String(), uname)
+
+	// Inject identity context directly into the messages array so it lands
+	// near the user's current turn in the model's context window. This is
+	// critical for smaller models (e.g. Qwen 2.5 7B) that poorly attend to
+	// the system prompt but follow instructions embedded in the chat flow.
+	if identityLine := prompt.IdentityStatement(uname); identityLine != "" {
+		identityMsg := ai.Message{Role: "system", Content: identityLine}
+		// Insert right before the current user message
+		beforeUser := msgs[:len(msgs)-1]
+		rest := msgs[len(msgs)-1:]
+		msgs = append(append(beforeUser, identityMsg), rest...)
+	}
+
+	debugLogPayload(content, msgs)
 
 	req := ai.Request{
 		Model:    m.cfg.ActiveModelName(),
@@ -86,7 +144,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		System:   systemPrompt,
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	m.streamCancel = cancel
 
 	// Capture the channel reference locally so the goroutine never reads
@@ -94,6 +152,16 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// deferred close(m.streamCh) would panic with "close of nil channel".
 	streamCh := m.streamCh
 
+	// STREAM CONSUMER CONTRACT (deadlock-free):
+	// This producer goroutine is the ONLY place that reads from the LLM stream.
+	// It MUST NOT acquire any ContextLedger / TaskLedger mutex while waiting for
+	// the next token: it merely reads a chunk, appends to a local `full`
+	// builder, and dispatches an immutable tokenMsg to the UI channel. All
+	// ledger state is committed ONCE, at io.EOF, by the streamDoneMsg handler
+	// on the main Bubble Tea goroutine — never per-token. Holding a ledger lock
+	// here would serialize the token loop against the TUI renderer and freeze
+	// the stream (the historical 108-token stall). The producer only touches
+	// the channel, the local buffer, and the captured `streamCh`/`cancel`.
 	go func() {
 		defer close(streamCh)
 		defer cancel()
@@ -139,7 +207,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		}
 	}()
 
-	return tea.Batch(m.readStream())
+	return tea.Batch(m.readStream(), m.spinnerTickCmd())
 }
 
 func (m *model) readStream() tea.Cmd {

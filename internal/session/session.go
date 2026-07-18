@@ -35,7 +35,11 @@ type Session struct {
 	CreatedAt          time.Time         `json:"created_at"`
 	UpdatedAt          time.Time         `json:"updated_at"`
 	History            []Message         `json:"history,omitempty"`
-	path               string
+	// ContextLedger is the serialized handoff state, mirrored from the
+	// on-disk .izen/context_ledger.json so the session record remains the
+	// single durable source of truth across mode transitions.
+	ContextLedger *ContextLedger `json:"context_ledger,omitempty"`
+	path          string
 }
 
 // New creates a new session.
@@ -138,7 +142,12 @@ func (s *Session) Reload() error {
 	return nil
 }
 
-// SetObjective sets the session objective.
+// SetContextLedger mirrors the given ledger into the session record and persists
+// it to disk alongside the session state.
+func (s *Session) SetContextLedger(l *ContextLedger) {
+	s.ContextLedger = l
+	_ = s.Save()
+}
 func (s *Session) SetObjective(obj string) {
 	s.Objective = obj
 	s.ObjectiveState = domain.NewObjective(obj)

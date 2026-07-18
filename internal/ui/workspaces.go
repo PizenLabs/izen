@@ -39,6 +39,11 @@ func (planView) BuildWorkspace(m *model) Workspace {
 			Enabled:  true,
 			Priority: 100,
 		})
+	} else if len(m.currentResultActions()) > 0 {
+		// Fallback: when no plan was staged (zero tasks / error), surface the
+		// baseline Action Chips from the current workflow result so the user
+		// is never left with a dead viewport and no buttons.
+		actions = append(actions, m.currentResultActions()...)
 	}
 	ws := m.assembleScreen(actions)
 	ws.Header = "plan · break down, structure, design"
