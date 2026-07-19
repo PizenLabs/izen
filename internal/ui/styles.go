@@ -183,6 +183,29 @@ var (
 				Faint(true)
 )
 
+// ── Permission Box Styles (Build Approval Gate) ────────────────────────────────
+var (
+	// permissionBoxStyle wraps the entire permission-required dialog in a
+	// distinctive red/orange bordered box so the user instantly recognises
+	// an interactive security checkpoint.
+	permissionBoxStyle = lipgloss.NewStyle().
+				Border(lipgloss.DoubleBorder()).
+				BorderForeground(lipgloss.Color(colorOrange)).
+				Padding(0, 1).
+				Width(60)
+	permissionTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color(colorYellow))
+	permissionTargetStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(colorText)).
+				PaddingLeft(2)
+	permissionKeyStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color(colorMauve))
+	permissionDescStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(colorMuted))
+)
+
 // ── Hotkey Highlight Styles (Keyboard-Only Execution) ─────────────────────────
 var (
 	hotkeyStyle        = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMauve))

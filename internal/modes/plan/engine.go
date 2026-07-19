@@ -30,7 +30,9 @@ func NewEngine(store *PlanStore) *Engine {
 	}
 }
 
-// parsePlanContent enforces strict JSON schema. Markdown-only output is rejected.
+// parsePlanContent enforces strict JSON schema with recovery.
+// Phase 3: If JSON parsing fails, it attempts auto-repair via autoCloseJSON
+// and retries before giving up. Markdown-only output is rejected.
 func parsePlanContent(content string) []Task {
 	content = strings.TrimSpace(content)
 	if content == "" {
@@ -39,11 +41,22 @@ func parsePlanContent(content string) []Task {
 
 	result := ParseJSONPlan(content)
 	if result.Valid {
-		// Validate tasks for placeholder paths
 		if err := ValidateAllTasks(result.Tasks); err != nil {
 			return nil
 		}
 		return result.Tasks
+	}
+
+	// Phase 3: Attempt auto-repair of truncated JSON before giving up.
+	repaired := autoCloseJSON(content)
+	if repaired != content {
+		result = ParseJSONPlan(repaired)
+		if result.Valid {
+			if err := ValidateAllTasks(result.Tasks); err != nil {
+				return nil
+			}
+			return result.Tasks
+		}
 	}
 
 	return nil
@@ -171,27 +184,19 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		}
 	}
 
-	// ── STRICT SCHEMA ENFORCEMENT: NO MARKDOWN FALLBACK ───────────────
-	// The /plan mode MUST consume ONLY the verified JSON structure mapped
-	// by the schema. If the handoff payload is unparsed or corrupted, do
-	// NOT let the local LLM hallucinate ambient tasks via markdown
-	// extraction. Force the controller to surface the structural error.
+	// ── PHASE 3: JSON RECOVERY — SELF-CORRECT, DO NOT LOOP BACK ────
+	// Instead of forcing the user back to /investigate (which creates a
+	// redundant 2-turn loop), attempt self-correction strategies in order:
+	//   1. Auto-repair truncated JSON (autoCloseJSON already applied in schema.go)
+	//   2. Retry with truncated context (smaller prompt for 7B models)
+	//   3. Fall back to last valid ledger state with minimal shell prompt
+	//   4. Only if all recovery fails, return a structured error (no /investigate redirect)
 
-	// ── COMPILE/DEP FALLBACK (local-model JSON failure) ───────────────
-	// A local 7B model frequently returns mixed/markdown content instead of
-	// strict JSON, so the structured parse above fails. When the problem
-	// payload itself is a compile/dependency error, retry ONCE with the
-	// minimal fast-track shell prompt rather than hard-aborting — this is the
-	// path that reliably yields a runnable SHELL_EXEC task on small models.
-	//
-	// Cross-reference the investigation conclusion from the full ledger so
-	// the fast-track prompt carries the corrected diagnosis (not just raw
-	// error text that may cause the model to re-derive a stale fix).
-	//
-	// Check BOTH problem parameter AND ledgerContent for compilation/dependency
-	// errors — the problem param may be empty or generic (e.g. "Investigation
-	// results require structured execution plan") while the ledger contains
-	// the actual error message from test/build output.
+	// Strategy 1: Auto-repair was already attempted in ParseJSONPlan/sanitizeJSONContent.
+	// If we reach here it failed — proceed to Strategy 2.
+
+	// Strategy 2: Retry with a minimal prompt, stripping the full ledger context.
+	// This works around context drift on 7B models by reducing token pressure.
 	compileErr := IsCompilationOrDependencyError(problem) || IsCompilationOrDependencyError(ledgerContent)
 	if compileErr {
 		coreErr := CoreErrorLine(problem)
@@ -200,25 +205,44 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		}
 		conclusion := ExtractConclusionFromLedger(ledgerContent)
 		retry, retryErr := e.ProcessFromLedgerFastTrack(ctx, FastTrackPrompt(coreErr, conclusion), modelName)
-		if retryErr != nil {
-			return nil, retryErr
-		}
-		if len(retry) > 0 {
+		if retryErr == nil && len(retry) > 0 {
 			return retry, nil
 		}
-		// If the retry also failed, surface the original model output for context.
-		return nil, fmt.Errorf("plan engine: no valid tasks found (provider returned non-JSON: %s). "+
-			"Re-run /investigate to regenerate the diagnostic payload as strict JSON", truncateForLog(resp.Content))
+	}
+
+	// Strategy 3: Fall back to a SHELL_EXEC recovery task from the conclusion
+	// WITHOUT asking the model to generate JSON — extract directly from the ledger.
+	if compileErr {
+		conclusion := ExtractConclusionFromLedger(ledgerContent)
+		if dep := dependencyFromConclusion(conclusion); dep != "" {
+			recovery := Task{
+				StepNum:     1,
+				IsDone:      false,
+				Status:      "idle",
+				Type:        "SHELL_EXEC",
+				Target:      "go get " + dep,
+				Description: "Install missing dependency (recovered from ledger conclusion)",
+			}
+			return []Task{recovery}, nil
+		}
+		// Fallback to go mod tidy as the safest generic recovery
+		recovery := Task{
+			StepNum:     1,
+			IsDone:      false,
+			Status:      "idle",
+			Type:        "SHELL_EXEC",
+			Target:      "go mod tidy",
+			Description: "Resolve dependency blocker via module tooling",
+		}
+		return []Task{recovery}, nil
 	}
 
 	jsonErr := jsonResult.Error
 	if jsonErr == "" {
 		jsonErr = fmt.Sprintf("empty error field (provider response: %s)", truncateForLog(resp.Content))
 	}
-	return nil, fmt.Errorf("plan engine: no valid tasks found in provider response (%s). "+
-		"The model returned content that is not valid JSON. "+
-		"Run /investigate again to ensure the diagnostic payload is serialized as raw JSON. "+
-		"First 200 chars of response: %s", jsonErr, truncateForLog(resp.Content))
+	return nil, fmt.Errorf("plan engine: JSON parse failed after recovery attempts (%s). "+
+		"Response preview: %s", jsonErr, truncateForLog(resp.Content))
 }
 
 // filterValidTasks filters a task slice to only tasks with valid, non-empty

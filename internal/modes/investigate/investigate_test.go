@@ -946,20 +946,14 @@ func TestContextLedgerFormatForPlan(t *testing.T) {
 	cl.SetConclusion("fixed", true)
 
 	output := cl.FormatForPlan()
-	if !strings.Contains(output, "INVESTIGATION LEDGER") {
-		t.Fatal("expected INVESTIGATION LEDGER header")
-	}
 	if !strings.Contains(output, "test failure") {
 		t.Fatal("expected 'test failure' in output")
 	}
 	if !strings.Contains(output, "TestFunc") {
 		t.Fatal("expected TestFunc in output")
 	}
-	if !strings.Contains(output, "BOUNDARY ENFORCEMENT") {
-		t.Fatal("expected BOUNDARY ENFORCEMENT section")
-	}
-	if !strings.Contains(output, "/plan") {
-		t.Fatal("expected handoff to /plan")
+	if !strings.Contains(output, "fixed") {
+		t.Fatal("expected conclusion in output")
 	}
 }
 
@@ -1089,8 +1083,8 @@ func TestEngineFormatLedgerForPlan(t *testing.T) {
 	if !strings.Contains(output, "Parse") {
 		t.Fatal("expected Parse function in ledger output")
 	}
-	if !strings.Contains(output, "/plan") {
-		t.Fatal("expected /plan handoff in ledger output")
+	if !strings.Contains(output, "nil pointer") {
+		t.Fatal("expected conclusion in ledger output")
 	}
 }
 

@@ -649,6 +649,16 @@ type model struct {
 	pendingTestConfirm bool
 	pendingTestTarget  string
 
+	// Build approval gate: when a SHELL_EXEC task is queued, the system
+	// requires explicit user confirmation before any command reaches the OS
+	// shell. pendingBuildTask holds the task awaiting y/n input.
+	pendingBuildApproval bool
+	pendingBuildTask     *plan.Task
+	// pendingBuildAllowAlways, when set from the permission box "Allow Always"
+	// option, skips the approval gate for subsequent SHELL_EXEC tasks for the
+	// remainder of the session. Reset on mode transitions or /clear.
+	pendingBuildAllowAlways bool
+
 	// Review action spinner: set synchronously on $run/$test/$fix dispatch
 	// so the view can immediately render a spinner without waiting for the
 	// async agentStartMsg to be processed.

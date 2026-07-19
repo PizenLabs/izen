@@ -3,6 +3,7 @@ package plan
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 )
 
@@ -40,6 +41,14 @@ func ParseJSONPlan(content string) *JSONPlanValidationResult {
 		rawPreview := content
 		if len(rawPreview) > 120 {
 			rawPreview = rawPreview[:120]
+		}
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "unexpected end") || strings.Contains(errMsg, "unterminated") {
+			log.Printf("[TOKEN LIMIT REACHED] JSON response truncated — model hit token ceiling. Increase max_tokens/num_predict. Error: %v", err)
+			return &JSONPlanValidationResult{
+				Valid: false,
+				Error: fmt.Sprintf("[TOKEN LIMIT REACHED] JSON response truncated — the model stopped generating before completing the JSON structure. Increase max_tokens/num_predict in the provider config. Parse error: %v (content preview: %q)", err, rawPreview),
+			}
 		}
 		return &JSONPlanValidationResult{
 			Valid: false,
@@ -123,9 +132,13 @@ func mapStrategyToType(strategy string) string {
 //   - /* */ block comments
 //   - Leading/trailing non-JSON text before the first { or after the last }
 //   - Trailing // comments on JSON lines
+//   - Truncated JSON structures (missing closing brackets) via autoCloseJSON
+//   - Partial string values (unterminated quotes at end of content)
+//   - Missing commas between JSON elements
 //
-// This is the critical sanitization gate that prevents LLM-generated
-// structural noise from crashing the /plan parser.
+// Phase 3: This is the critical sanitization gate that prevents LLM-generated
+// structural noise from crashing the /plan parser. It must be resilient enough
+// that a local 7B model's truncated output still produces a valid JSON plan.
 func sanitizeJSONContent(content string) string {
 	content = strings.TrimSpace(content)
 
@@ -223,6 +236,11 @@ func sanitizeJSONContent(content string) string {
 		content = extractJSONObject(content)
 	}
 
+	// 4. Auto-close truncated JSON structures (missing closing brackets).
+	// This recovers from premature cut-off where the model hit its token
+	// limit mid-JSON, appending } and ] in the correct nesting order.
+	content = autoCloseJSON(content)
+
 	return content
 }
 
@@ -297,6 +315,107 @@ func extractJSONObject(content string) string {
 		}
 	}
 	return content
+}
+
+// autoCloseJSON attempts to recover truncated JSON by:
+//  1. Closing unterminated string values (trailing open quotes).
+//  2. Appending missing closing brackets (} and ]) in correct nesting order.
+//  3. Closing the JSON structure even when cut mid-value.
+//
+// This handles the case where the LLM stopped generating before completing
+// the JSON structure due to hitting max_tokens/num_predict limits.
+// Phase 3: Enhanced recovery for local 7B models that frequently truncate.
+func autoCloseJSON(content string) string {
+	if content == "" {
+		return content
+	}
+
+	// Step 1: Close unterminated string at end of content.
+	// If the content ends inside a string value (odd number of unescaped quotes),
+	// append a closing quote.
+	content = closeUnterminatedString(content)
+
+	depth := 0
+	inStr := false
+	esc := false
+	var stack []byte
+	lastBracket := byte(0)
+	for i := 0; i < len(content); i++ {
+		ch := content[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if ch == '\\' {
+			esc = true
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		switch ch {
+		case '{':
+			depth++
+			stack = append(stack, '}')
+			lastBracket = '{'
+		case '[':
+			depth++
+			stack = append(stack, ']')
+			lastBracket = '['
+		case '}':
+			depth--
+			if len(stack) > 0 && stack[len(stack)-1] == '}' {
+				stack = stack[:len(stack)-1]
+			}
+		case ']':
+			depth--
+			if len(stack) > 0 && stack[len(stack)-1] == ']' {
+				stack = stack[:len(stack)-1]
+			}
+		}
+	}
+
+	if depth > 0 && len(stack) > 0 {
+		_ = lastBracket
+		var b strings.Builder
+		b.WriteString(content)
+		for i := len(stack) - 1; i >= 0; i-- {
+			b.WriteByte(stack[i])
+		}
+		return b.String()
+	}
+	return content
+}
+
+// closeUnterminatedString detects and closes an open string at the end of content.
+func closeUnterminatedString(s string) string {
+	if s == "" {
+		return s
+	}
+	inStr := false
+	esc := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if ch == '\\' {
+			esc = true
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+		}
+	}
+	if inStr {
+		return s + "\""
+	}
+	return s
 }
 
 func SchemaJSONInstruction() string {

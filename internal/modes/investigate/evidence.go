@@ -40,7 +40,8 @@ func ClassifyLogOutput(content string) []ErrorCategory {
 		strings.Contains(lower, "go.mod") ||
 		strings.Contains(lower, "no required module") ||
 		strings.Contains(lower, "missing dependency") ||
-		strings.Contains(lower, "package is not in") {
+		strings.Contains(lower, "package is not in") ||
+		strings.Contains(lower, "module declares its path as") {
 		cats[ErrCatCompilation] = true
 	}
 

@@ -174,6 +174,35 @@ func (m *model) renderProposalBlock() string {
 
 	switch m.state {
 	case StateAwaitingApproval:
+		// ── Build Approval Permission Box (SHELL_EXEC gate) ─────────────
+		if m.pendingBuildApproval && m.pendingBuildTask != nil {
+			task := m.pendingBuildTask
+			boxWidth := width - 4
+			if boxWidth < 40 {
+				boxWidth = 40
+			}
+			// Build the box content line by line
+			var content strings.Builder
+			title := permissionTitleStyle.Render("▲ PERMISSION REQUIRED")
+			action := permissionDescStyle.Render("Action:") + " " + boldTextStyle.Render("SHELL_EXEC")
+			target := permissionTargetStyle.Render(task.Target)
+			desc := permissionDescStyle.Render(fmt.Sprintf("Reason: %s", task.Description))
+			sep := strings.Repeat("─", boxWidth-4)
+			keys := fmt.Sprintf("%s  %s  %s",
+				permissionKeyStyle.Render("[y] Allow Once"),
+				permissionKeyStyle.Render("[a] Allow Always"),
+				permissionKeyStyle.Render("[n] Reject"),
+			)
+			content.WriteString(title + "\n")
+			content.WriteString(action + "\n\n")
+			content.WriteString(target + "\n")
+			content.WriteString(desc + "\n")
+			content.WriteString(" " + sep + "\n")
+			content.WriteString(keys + "\n")
+			b.WriteString(permissionBoxStyle.Render(content.String()))
+			break
+		}
+
 		if len(m.pendingProposals) == 0 {
 			return ""
 		}

@@ -1587,13 +1587,33 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	m.execEng.Patches.SetLedger(m.buildLedger)
 	m.execEng.Patches.SetContextID(m.sess.ContextID)
 
-	// ── SHELL_EXEC: run the command directly, do NOT chat ───────────────
-	// A SHELL_EXEC task is a concrete shell command (e.g. `go get <pkg>` /
-	// `go mod tidy`). /build MUST execute it via the OS shell and report the
-	// output — dispatching it to the LLM would produce a chat reply instead of
-	// actually running the command, breaking the build's execute-only contract.
+	// ── SHELL_EXEC: INTERACTIVE APPROVAL GATE ──────────────────────────
+	// CRITICAL SECURITY CONSTRAINT: Every SHELL_EXEC command requires
+	// explicit human approval before it reaches the OS shell. A dedicated
+	// visual "Permission Required" box is rendered in the proposal dock,
+	// with single-character key bindings:
+	//   [y] Allow Once    [a] Allow Always    [n] Reject
+	// If the user previously selected "Allow Always" (m.pendingBuildAllowAlways),
+	// the gate is bypassed for the remainder of the session.
 	if targetTask.Type == "SHELL_EXEC" {
-		return m.runBuildShellExec(targetTask)
+		// ── Allow Always bypass ────────────────────────────────────────
+		if m.pendingBuildAllowAlways {
+			return tea.Batch(
+				func() tea.Msg { return agentStartMsg{label: "shell exec"} },
+				m.runBuildShellExec(targetTask),
+				m.spinnerTickCmd(),
+			)
+		}
+
+		// Render the visual permission box via the proposal dock (view layer).
+		m.pendingBuildApproval = true
+		m.pendingBuildTask = targetTask
+		m.state = StateAwaitingApproval
+		m.ti.Blur()
+		m.recalcViewportHeight()
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
 	}
 
 	// ── FILE_MUTATE / GIT_ACTION: generate + APPLY a real patch ──────────
@@ -1603,7 +1623,11 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// "greet" the user instead of executing — a violation of /build's sole
 	// mandate (execute, never chat).
 	if targetTask.Type == "FILE_MUTATE" || targetTask.Type == "GIT_ACTION" {
-		return m.runBuildPatchExec(targetTask)
+		return tea.Batch(
+			func() tea.Msg { return agentStartMsg{label: "patching"} },
+			m.runBuildPatchExec(targetTask),
+			m.spinnerTickCmd(),
+		)
 	}
 
 	buildTrace := &ctxpkg.CodebaseTrace{
@@ -2912,6 +2936,9 @@ func (m *model) resetObjectiveContextStacks() {
 	m.investigateInvocationCount = 0
 	m.pendingTestConfirm = false
 	m.pendingTestTarget = ""
+	m.pendingBuildApproval = false
+	m.pendingBuildTask = nil
+	m.pendingBuildAllowAlways = false
 	m.lastTestOutput = ""
 	m.lastTestFailed = false
 	m.pendingProposals = nil

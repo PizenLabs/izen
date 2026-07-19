@@ -43,62 +43,83 @@ func osPackageManager(os string) string {
 }
 
 // PlanContract defines the behavioral contract for /plan mode.
+// Phase 2 (Lightweight Execution Mapper): /plan is a deterministic transformer.
+// It does NOT re-analyze root cause. It reads the compact Forensic Ledger JSON
+// from /investigate and maps it directly to structural atomic_tasks and the
+// architectural_strategy. No conversational filler, no re-investigation.
 func PlanContract() string {
-	return `MODE: /plan — Transform investigation evidence into an ordered execution plan.
+	return `MODE: /plan — Deterministic Execution Mapper
 
 ROLE
-- Act as a deterministic transformer inside the IZEN runtime.
-- Convert the /investigate JSON ledger into isolated, actionable, verifiable tasks.
-- Produce no conversational filler, greetings, or explanations outside the requested output.
+- You are a deterministic transformer, not an analyst.
+- Read the pre-compiled Forensic Ledger from /investigate.
+- Map the root_cause and targets DIRECTLY to atomic_tasks.
+- Do NOT re-analyze, re-investigate, or question the ledger.
+
+PROTOCOL
+1. Read the Forensic Ledger below (compact JSON from /investigate).
+2. Map root_cause → Task 1 (always the dependency/code fix).
+3. Map targets → FILE_MUTATE tasks at exact {file, line} coordinates.
+4. End with a verification task when applicable.
+5. Output ONLY the JSON schema — zero explanation, zero commentary.
+
+SINGLE-TASK MANDATE (7B TRUNCATION PREVENTION)
+If the root_cause is a missing Go package (e.g. "no required module provides package"),
+emit EXACTLY ONE task: SHELL_EXEC with go get <exact_package_path>.
+No FILE_MUTATE, no GIT_ACTION, no brew/docker/environment tasks.
+Total JSON MUST stay under 300 tokens.
+
+ANTI-HALLUCINATION (LOCAL 7B MODELS)
+- If the ledger says "missing module X", Task 1 IS "go get X".
+- Do NOT add brew install go, brew install docker, or any OS-level setup.
+- Never propose installing Go, Docker, or compilers — they already run.
+- Keep tasks strictly at the code/dependency boundary.
 
 RULES
-- Tasks MUST be atomic, independently verifiable, and ordered by dependency.
-- If a missing dependency is the root cause, Task 1 MUST be SHELL_EXEC with the exact module installation command.
-- Source-code defects MUST target the exact relative file path and, when known, the relevant symbol or line range.
-- Plans MUST end with an appropriate verification task when verification is supported by the evidence.`
+- Tasks MUST be atomic, independently verifiable, ordered by dependency.
+- Missing dependency → Task 1 MUST be SHELL_EXEC with the exact install command.
+- FILE_MUTATE tasks MUST target the exact relative file path and line.
+- End with a verification task when supported by the evidence.
+- Tool constraint: use native Go tooling FIRST (` + "`go get`" + `, ` + "`go mod tidy`" + `, ` + "`go install`" + `).
+  Never default to system-level binaries (` + "`brew install`" + `, ` + "`docker`" + `).` +
+		"\n"
 }
 
 // BuildPlanJSONPrompt builds the strict JSON prompt consumed by the TUI parser.
+// Phase 2: Lightweight — reads the compact ledger, maps to tasks, no re-analysis.
 func BuildPlanJSONPrompt(problem, ledgerContent, conclusion string) string {
 	conclusionBlock := ""
 	if conclusion != "" {
 		conclusionBlock = fmt.Sprintf(`
-AUTHORITATIVE CONCLUSION
-Prefer the following investigation conclusion over stale or contradictory raw-log evidence:
-
+CONCLUSION FROM LEDGER (authoritative — do not override)
 %s
 
-CRITICAL: If this conclusion indicates a missing dependency, the plan MUST begin with a SHELL_EXEC task to install the required package.`, conclusion)
+CRITICAL: Map this conclusion directly to a SHELL_EXEC task if dependency-related.`, conclusion)
 	}
 
-	return fmt.Sprintf(`You are the IZEN Plan Transformer. Convert the investigation evidence below into a valid JSON object matching the schema defined by the IZEN runtime.
+	return fmt.Sprintf(`You are the IZEN Plan Mapper. Read the /investigate Forensic Ledger below and produce a JSON plan.
 
-HOST ENVIRONMENT CONSTRAINT
-%s
+HOST: %s
 
-INPUT
-PROBLEM:
-%s
+INPUT:
+PROBLEM: %s
+FORENSIC LEDGER:
+%s%s
 
-INVESTIGATION LEDGER:
-%s
-%s
+DIRECTIVES:
+- Map root_cause → Task 1 (SHELL_EXEC for dep issues, FILE_MUTATE for code bugs).
+- If root_cause is a missing Go module, emit EXACTLY: {"task_id":1,"strategy":"SHELL_EXEC","target":"go get <pkg>","description":"install missing dependency"}.
+- Do NOT add brew, docker, or environment setup tasks.
+- Total JSON under 300 tokens.
 
-TASK RULES
-- Every “atomic_tasks” item MUST have non-empty “task_id”, “strategy”, “target”, and “rationale”.
-- SHELL_EXEC: “target” MUST contain the complete exact shell command to execute.
-- ATOMIC_REPLACE or DIFF_PATCH: “target” MUST contain the relative file path from the project root.
-- If a missing dependency is the root cause, Task 1 MUST be SHELL_EXEC with the exact 'go get <package>' command.
-- Order tasks by dependency: prerequisites, mutations, then verification.
-- Include a verification task when supported by the evidence.
-
-CRITICAL: OUTPUT MUST BE RAW JSON ONLY.
-- Do NOT wrap the JSON in Markdown code fences (triple-backtick blocks).
-- Do NOT include // line comments or /* */ block comments anywhere.
-- Do NOT include any introductory text, explanations, or conversational filler.
-- The first non-whitespace character MUST be '{'.
-- The last non-whitespace character MUST be '}'.
-- VIOLATING THESE RULES WILL CRASH THE IZEN PLAN PARSER AND WASTE TOKENS.`,
+OUTPUT — raw JSON only, no fences, no comments:
+{
+  "context_anchor": {"source": "investigate-ledger", "target_packages": ["pkg"]},
+  "architectural_strategy": "single sentence",
+  "atomic_tasks": [
+    {"task_id": 1, "file": "relative/path", "strategy": "SHELL_EXEC", "description": "why"}
+  ]
+}`,
 		EnvironmentContext(),
 		problem,
 		ledgerContent,
@@ -107,6 +128,7 @@ CRITICAL: OUTPUT MUST BE RAW JSON ONLY.
 }
 
 // BuildPlanPrompt builds the compact Markdown prompt for user-facing terminal output.
+// Phase 2: Stripped down — the LLM returns data, UI handles rendering.
 func BuildPlanPrompt(objective, contextStr string) string {
 	return fmt.Sprintf(`%s
 
@@ -115,20 +137,15 @@ func BuildPlanPrompt(objective, contextStr string) string {
 USER OBJECTIVE
 %s
 
-OUTPUT FORMAT
-Output exactly this Markdown structure and stop after the final checklist item. Do not wrap in markdown code blocks:
+OUTPUT — raw task blocks only, no prose:
+- [ ] SHELL_EXEC: <exact_command> | <rationale>
+- [ ] FILE_MUTATE: <relative_path> | <description>
+- [ ] SHELL_EXEC: <verification> | verify
 
-# ⏭  EXECUTION PLAN
-
-### ⛑ Architectural Strategy
-[2–3 sentences describing the implementation strategy.]
-
----
-
-### ✱ Atomic TODO Tasks
-- [ ] SHELL_EXEC: <exact_command> | <Short clear rationale>
-- [ ] FILE_MUTATE: <relative_path> | <Actionable description of changes>
-- [ ] SHELL_EXEC: <verification_command> | Verify the complete system patch`,
+RULES:
+- If a missing Go dependency is the root cause, output EXACTLY ONE SHELL_EXEC task.
+- No brew, docker, or OS-level environment tasks.
+- Keep the plan strictly at the code/dependency boundary.`,
 		contextStr,
 		EnvironmentContext(),
 		objective,

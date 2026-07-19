@@ -72,6 +72,7 @@ var compilationErrorMarkers = []string{
 	"package ",
 	"go mod",
 	"module provides package",
+	"module declares its path as",
 	"failed to load",
 	"compilation failed",
 	"compile error",

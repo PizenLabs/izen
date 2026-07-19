@@ -272,42 +272,60 @@ func ParseCompilerTargets(output string) []Target {
 
 func (cl *ContextLedger) FormatForPlan() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "### INVESTIGATION LEDGER (Root Cause Only — No Tasks)\n")
-	fmt.Fprintf(&b, "Source: %s\n", cl.Source)
-	fmt.Fprintf(&b, "Problem: %s\n", cl.Problem)
 
-	if cl.Diagnostics != "" {
-		cleanDiag := stripANSI(cl.Diagnostics)
+	b.WriteString(cl.Problem)
+	b.WriteByte('\n')
+
+	cleanDiag := cl.Diagnostics
+	if cleanDiag != "" {
+		cleanDiag = stripANSI(cleanDiag)
 		cleanDiag = collapseBlankLines(cleanDiag)
-		fmt.Fprintf(&b, "\n### RAW DIAGNOSTICS\n")
-		fmt.Fprintf(&b, "```\n%s\n```\n", cleanDiag)
 	}
 
 	if cl.RootCause != "" {
-		fmt.Fprintf(&b, "\n### ROOT CAUSE\n%s\n", cl.RootCause)
+		b.WriteString("ROOT: ")
+		b.WriteString(cl.RootCause)
+		b.WriteByte('\n')
 	}
 
 	if len(cl.Targets) > 0 {
-		fmt.Fprintf(&b, "\n### AFFECTED SYMBOLS (Root Cause Evidence Only)\n")
 		for _, t := range cl.Targets {
-			fmt.Fprintf(&b, "  File: %s", t.File)
+			b.WriteString("TGT: ")
+			b.WriteString(t.File)
 			if t.Line > 0 {
 				fmt.Fprintf(&b, ":%d", t.Line)
 			}
 			if t.Node != "" {
-				fmt.Fprintf(&b, " %s (%s)", t.Node, t.Kind)
+				b.WriteByte(' ')
+				b.WriteString(t.Node)
+				b.WriteByte(' ')
+				b.WriteByte('(')
+				b.WriteString(t.Kind)
+				b.WriteByte(')')
 			}
-			fmt.Fprintf(&b, "\n")
+			b.WriteByte('\n')
+		}
+	}
+
+	if cleanDiag != "" {
+		diagLines := strings.Split(cleanDiag, "\n")
+		maxLines := 15
+		if len(diagLines) > maxLines {
+			diagLines = diagLines[:maxLines]
+			diagLines = append(diagLines, "...")
+		}
+		for _, dl := range diagLines {
+			b.WriteString("D: ")
+			b.WriteString(dl)
+			b.WriteByte('\n')
 		}
 	}
 
 	if cl.Conclusion != "" {
-		fmt.Fprintf(&b, "\n### CONCLUSION\n%s\n", cl.Conclusion)
+		b.WriteString("DONE: ")
+		b.WriteString(cl.Conclusion)
+		b.WriteByte('\n')
 	}
-
-	fmt.Fprintf(&b, "\n### BOUNDARY ENFORCEMENT\n")
-	fmt.Fprintf(&b, "/investigate produced only root cause and evidence above.\n")
-	fmt.Fprintf(&b, "Atomic task synthesis is delegated exclusively to /plan.\n")
 
 	return b.String()
 }
@@ -346,21 +364,25 @@ func (cl *ContextLedger) ToPackets() []session.LedgerPacket {
 	if cl.Problem != "" {
 		pkts = append(pkts, session.LedgerPacket{
 			Kind:    "problem",
-			Title:   "Investigation problem statement",
 			Payload: cl.Problem,
 		})
 	}
 
 	for _, t := range cl.Targets {
-		var b strings.Builder
-		fmt.Fprintf(&b, "node=%s kind=%s", t.Node, t.Kind)
+		payload := t.Node
+		if payload == "" {
+			payload = t.File
+		}
 		if t.Snippet != "" {
-			fmt.Fprintf(&b, "\nsnippet:\n%s", t.Snippet)
+			lines := strings.Split(t.Snippet, "\n")
+			if len(lines) > 5 {
+				lines = lines[:5]
+			}
+			payload += "\n" + strings.Join(lines, "\n")
 		}
 		pkts = append(pkts, session.LedgerPacket{
 			Kind:    "target",
-			Title:   "Isolated code coordinate",
-			Payload: b.String(),
+			Payload: payload,
 			File:    t.File,
 			Line:    t.Line,
 		})
@@ -370,10 +392,13 @@ func (cl *ContextLedger) ToPackets() []session.LedgerPacket {
 		if ev.Content == "" {
 			continue
 		}
+		content := ev.Content
+		if len(content) > 500 {
+			content = content[:500]
+		}
 		pkts = append(pkts, session.LedgerPacket{
 			Kind:       "evidence",
-			Title:      fmt.Sprintf("Evidence [%s]", ev.Source),
-			Payload:    ev.Content,
+			Payload:    content,
 			File:       ev.File,
 			Line:       ev.Line,
 			Confidence: ev.Confidence,
@@ -383,7 +408,6 @@ func (cl *ContextLedger) ToPackets() []session.LedgerPacket {
 	if cl.RootCause != "" {
 		pkts = append(pkts, session.LedgerPacket{
 			Kind:    "root_cause",
-			Title:   "Derived root cause",
 			Payload: cl.RootCause,
 		})
 	}
@@ -391,7 +415,6 @@ func (cl *ContextLedger) ToPackets() []session.LedgerPacket {
 	if cl.Conclusion != "" {
 		pkts = append(pkts, session.LedgerPacket{
 			Kind:    "conclusion",
-			Title:   "Investigation conclusion",
 			Payload: cl.Conclusion,
 		})
 	}

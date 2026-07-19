@@ -63,8 +63,78 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// ── Awaiting approval (alt+ modifier only) ──────────────────────────────
+	// ── Awaiting approval ────────────────────────────────────────────
 	if m.state == StateAwaitingApproval {
+		// ── Build approval (SHELL_EXEC permission box) ──────────────
+		if m.pendingBuildApproval && m.pendingBuildTask != nil {
+			task := m.pendingBuildTask
+			switch {
+			case msg.String() == "y" || msg.String() == "Y" || msg.String() == "alt+a":
+				// ── Allow Once ────────────────────────────────────
+				m.pendingBuildApproval = false
+				m.pendingBuildTask = nil
+				m.state = StateChat
+				m.recalcViewportHeight()
+				m.ti.Focus()
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				m.push(roleSystem, infoStyle.Render("  ✓ Approved — executing shell command..."))
+				return m, tea.Batch(
+					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
+					m.runBuildShellExec(task),
+					m.spinnerTickCmd(),
+				)
+
+			case msg.String() == "a" || msg.String() == "A":
+				// ── Allow Always (session-wide bypass) ────────────
+				m.pendingBuildAllowAlways = true
+				m.pendingBuildApproval = false
+				m.pendingBuildTask = nil
+				m.state = StateChat
+				m.recalcViewportHeight()
+				m.ti.Focus()
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				m.push(roleSystem, infoStyle.Render(
+					"  ✓ Approved (always) — executing shell command..."))
+				return m, tea.Batch(
+					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
+					m.runBuildShellExec(task),
+					m.spinnerTickCmd(),
+				)
+
+			case msg.String() == "n" || msg.String() == "N" ||
+				msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
+				// ── Reject ─────────────────────────────────────────
+				m.pendingBuildApproval = false
+				m.pendingBuildTask = nil
+				m.state = StateChat
+				m.recalcViewportHeight()
+				m.ti.Focus()
+				if m.sess != nil {
+					tasks := m.sess.CurrentTasks
+					for i := range tasks {
+						if tasks[i].StepNum == task.StepNum {
+							tasks[i].Status = "stalled"
+							break
+						}
+					}
+					m.sess.StageTaskList(&tasks)
+					_ = m.sess.Save()
+				}
+				m.push(roleSystem, infoStyle.Render(
+					"  ✗ Rejected — shell execution aborted."))
+				m.push(roleError, fmt.Sprintf(
+					"[SECURITY] Aborting unauthorized shell execution: %s",
+					task.Target))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, nil
+			}
+			return m, nil
+		}
+
+		// ── File-mutation proposal approval ─────────────────────────
 		switch {
 		case msg.String() == "alt+a":
 			return m, m.applySingleProposal()
@@ -131,6 +201,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.proposedShellCmd = ""
 			m.push(roleSystem, infoStyle.Render("Command cancelled."))
 		}
+		// Build approval is now handled inside StateAwaitingApproval in the
+		// block above. The escape key there stalls the task and returns to chat.
 		m.ti.SetValue("")
 		m.ti.Reset()
 		m.syncInputFromTI()

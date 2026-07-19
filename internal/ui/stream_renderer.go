@@ -364,6 +364,9 @@ func (m *model) renderStreamingContent(content string, width int) string {
 					}
 				}
 			}
+			// Phase 4: Always render plan blocks through the widget layout engine.
+			// The LLM returns raw task data; the UI applies the │ borders, ◉
+			// markers, and color blocks deterministically via renderWidget.
 			rendered = renderWidget("Plan", strings.Join(contentLines, "\n"), availableWidth, colorModePlan)
 
 		case blockDiff:
@@ -454,6 +457,25 @@ func (m *model) renderStreamingContent(content string, width int) string {
 					break
 				}
 				rendered = renderJSONPlanWidget(jsonResult.Plan, m.planStatusSource(), availableWidth)
+				break
+			}
+
+			// Phase 4: In /plan mode, force ALL content through the plan widget
+			// layout engine (│ borders, ◉ markers, color blocks) so the LLM's
+			// raw text is always wrapped in the deterministic UI frame.
+			if m.resolver.Current() == modes.ModePlan {
+				lines := strings.Split(block.raw, "\n")
+				var cleanLines []string
+				for _, l := range lines {
+					t := strings.TrimSpace(l)
+					if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "---") {
+						continue
+					}
+					cleanLines = append(cleanLines, t)
+				}
+				if len(cleanLines) > 0 {
+					rendered = renderWidget("Plan", strings.Join(cleanLines, "\n"), availableWidth, colorModePlan)
+				}
 				break
 			}
 

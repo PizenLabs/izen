@@ -136,6 +136,8 @@ func parseStrategy(raw string) (Strategy, bool) {
 func heuristicClassify(log string) Strategy {
 	l := strings.ToLower(log)
 	switch {
+	case strings.Contains(l, "module declares its path as"):
+		return Strategy{Tool: ToolLX, Rationale: "module path mismatch — use the declared path from the error"}
 	case strings.Contains(l, "docker"),
 		strings.Contains(l, "command not found"),
 		strings.Contains(l, "no such file or directory"),
