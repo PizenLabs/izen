@@ -192,9 +192,27 @@ func (r *ToolRunner) runDiagnose(ctx context.Context, target string) ToolResult 
 // runLX routes a targeted symbol/file/package lookup through the LX retriever.
 // Unlike env/trace, a hard error here (e.g. RPC -32603) sets Ok=false so the
 // engine aborts this path and falls back to the next tool.
+//
+// TARGET TYPE GATE: a missing dependency is frequently reported as a remote
+// import path (e.g. "github.com/docker/docker/client"). Treating such a string
+// as a local workspace file makes the retriever attempt to open a physical file
+// that does not exist, producing a fatal "no such file or directory" error and
+// corrupting the Context-Ledger. When the target is identified as a remote
+// package, local file operations are EXPLICITLY FORBIDDEN and the orbiter
+// routes straight to an environment/packages remediation blueprint instead.
 func (r *ToolRunner) runLX(ctx context.Context, target string) ToolResult {
 	if r.retriever == nil || target == "" {
 		return ToolResult{Tool: ToolLX, Target: target, Ok: false}
+	}
+
+	// Step 1 — Target Type Validation Gate.
+	// Remote package import paths must never reach the local file reader.
+	if isRemotePackageTarget(target) {
+		// Step 2 — Route to Environment/Shell strategy directly, bypassing the
+		// local file inspection step entirely. The blocker is recorded cleanly
+		// into the forensic context without pushing any invalid file-descriptor
+		// operations onto the ledger.
+		return r.runPackageRemediation(ctx, target)
 	}
 
 	var evidence []Evidence
@@ -279,4 +297,133 @@ func normalizePathTarget(tok string) string {
 	tok = strings.TrimPrefix(tok, "./")
 	tok = strings.TrimPrefix(tok, "../")
 	return tok
+}
+
+// remotePackagePrefixes enumerate the well-known module/package hosts whose
+// import paths must NEVER be treated as local workspace files.
+var remotePackagePrefixes = []string{
+	"github.com/",
+	"golang.org/",
+	"gopkg.in/",
+	"google.golang.org/",
+	"k8s.io/",
+	"sigs.k8s.io/",
+	"go.opentelemetry.io/",
+	"google.golang.com/",
+}
+
+// isRemotePackageTarget reports whether a token denotes a remote package import
+// path rather than a concrete file or symbol inside the workspace. Such tokens
+// are dependency coordinates — they have no on-disk representation the LX
+// retriever can open, so any local file-read attempt is forbidden.
+//
+// A token is treated as a remote package when it:
+//   - starts with a known module host prefix, OR
+//   - looks like a dotted module path (e.g. "example.com/foo/bar") that is NOT
+//     a relative path (no leading "./" or "../") and carries no file extension.
+func isRemotePackageTarget(tok string) bool {
+	t := strings.TrimSpace(tok)
+	if t == "" {
+		return false
+	}
+	for _, p := range remotePackagePrefixes {
+		if strings.HasPrefix(t, p) {
+			return true
+		}
+	}
+
+	// Reject explicit local/relative anchors — these are workspace files.
+	if strings.HasPrefix(t, "./") || strings.HasPrefix(t, "../") || strings.HasPrefix(t, "/") {
+		return false
+	}
+
+	// A remote package path contains a slash and a dotted host segment and no
+	// file extension (no "." after the last slash component).
+	if !strings.Contains(t, "/") {
+		return false
+	}
+	if hasFileExtension(t) {
+		return false
+	}
+	// Require a dotted host (e.g. "example.com/...") to avoid classifying bare
+	// relative workspace paths like "internal/foo" as remote packages.
+	firstSeg := t
+	if i := strings.Index(t, "/"); i >= 0 {
+		firstSeg = t[:i]
+	}
+	return strings.Contains(firstSeg, ".")
+}
+
+// hasFileExtension reports whether the last path segment carries a recognizable
+// source-file extension, which marks the token as a local file rather than a
+// remote package coordinate.
+func hasFileExtension(tok string) bool {
+	base := tok
+	if i := strings.LastIndex(tok, "/"); i >= 0 {
+		base = tok[i+1:]
+	}
+	switch {
+	case strings.HasSuffix(base, ".go"),
+		strings.HasSuffix(base, ".py"),
+		strings.HasSuffix(base, ".js"),
+		strings.HasSuffix(base, ".ts"),
+		strings.HasSuffix(base, ".java"),
+		strings.HasSuffix(base, ".rb"),
+		strings.HasSuffix(base, ".rs"),
+		strings.HasSuffix(base, ".c"),
+		strings.HasSuffix(base, ".h"),
+		strings.HasSuffix(base, ".cpp"),
+		strings.HasSuffix(base, ".md"),
+		strings.HasSuffix(base, ".json"),
+		strings.HasSuffix(base, ".yaml"),
+		strings.HasSuffix(base, ".yml"),
+		strings.HasSuffix(base, ".toml"),
+		strings.HasSuffix(base, ".mod"),
+		strings.HasSuffix(base, ".sum"):
+		return true
+	}
+	return false
+}
+
+// runPackageRemediation handles a remote dependency blocker by routing directly
+// to an environment/shell remediation blueprint instead of touching the local
+// file reader. It stages a package-management task (go mod tidy / go get) in the
+// forensic context and records the vector cleanly — no invalid file descriptor
+// operations are pushed to the ledger.
+func (r *ToolRunner) runPackageRemediation(ctx context.Context, target string) ToolResult {
+	ectx, cancel := context.WithTimeout(ctx, traceTimeout)
+	defer cancel()
+
+	pkg := strings.TrimSpace(target)
+
+	// Stage the remediation command in the workspace root. We DO NOT execute a
+	// non-interactive `go get` that mutates go.mod silently; `go mod tidy`
+	// validates that the dependency graph resolves and surfaces the missing
+	// package as actionable diagnostics.
+	cmd := fmt.Sprintf("go mod tidy 2>&1; echo '---'; go list -m %s 2>&1 || true", pkg)
+	out, err := shell(ectx, r.root, cmd)
+	if out == "" && err != nil {
+		out = err.Error()
+	}
+
+	content := fmt.Sprintf("## REMOTE DEPENDENCY BLOCKER (lx bypassed): %s\n"+
+		"Local file inspection is forbidden for remote import paths. "+
+		"Staging environment remediation blueprint (go mod tidy / go get):\n%s",
+		pkg, out)
+
+	return ToolResult{
+		Tool:    ToolLX,
+		Target:  pkg,
+		Content: content,
+		Ok:      true,
+		Evidence: []Evidence{
+			{
+				Source:     EvSourceExecution,
+				Content:    content,
+				File:       "",
+				Line:       0,
+				Confidence: 0.7,
+			},
+		},
+	}
 }

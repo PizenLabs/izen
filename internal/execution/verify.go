@@ -109,10 +109,50 @@ func BuildMicroFixPrompt(file string, errors []SyntaxError) string {
 //   - Standalone [target] / [/target] markers
 //   - Stray code-fence lines (```diff, ```go, etc.) that leak inside blocks
 //   - Lines matching [/?(code|file|source|block|end|diff)] markers
+//
+// fencePrefixRe matches a markdown code-fence opening line, with or without an
+// attached language identifier (e.g. "```", "```go", "```mit text"). It is
+// anchored to the START of the string only so it correctly detects a leading
+// fence even when the rest of the file follows on subsequent lines.
+var fencePrefixRe = regexp.MustCompile("^\\s*`{3}[a-zA-Z0-9._-]*\\s*")
+
+// stripMarkdownFences removes a single wrapping markdown code block from a raw
+// LLM response. Local models frequently return file contents wrapped in
+// "```lang ... ```"; writing that verbatim injects literal triple backticks into
+// the file and corrupts its syntax. We strip a leading opening fence (with any
+// optional language identifier) and a trailing closing fence, returning the
+// core content. The function is a no-op for already-clean (unwrapped) input — it
+// returns it unchanged so legitimate trailing newlines are preserved.
+func stripMarkdownFences(content string) string {
+	stripped := false
+
+	// Strip a leading opening fence (``` or ```go, etc.).
+	if fencePrefixRe.MatchString(content) {
+		if idx := strings.Index(content, "\n"); idx != -1 {
+			content = content[idx+1:]
+			stripped = true
+		}
+	}
+
+	// Strip a trailing closing fence.
+	if strings.HasSuffix(content, "```") {
+		content = strings.TrimSuffix(content, "```")
+		stripped = true
+	}
+
+	if !stripped {
+		return content
+	}
+	return strings.TrimSpace(content)
+}
+
 func SanitizeLLMResponse(raw string) string {
 	if raw == "" {
 		return raw
 	}
+	// Strip a whole response that the model wrapped in a single markdown code
+	// block (e.g. "```mit ... ```") before any interior-line cleaning.
+	raw = stripMarkdownFences(raw)
 	lines := strings.Split(raw, "\n")
 	var result []string
 	for _, line := range lines {

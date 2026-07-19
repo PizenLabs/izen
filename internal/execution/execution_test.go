@@ -400,6 +400,51 @@ func TestSanitizeDiffContentEmptyInput(t *testing.T) {
 		t.Fatalf("SanitizeDiffContent(empty): expected empty, got %q", got)
 	}
 }
+
+// TestSanitizeLLMResponseWrappedFence is the regression guard for the hotfix
+// markdown-fence bug: when the local model returns the entire file wrapped in a
+// single code block (e.g. "```mit ... ```"), the literal triple backticks must
+// NOT be written into the file.
+func TestSanitizeLLMResponseWrappedFence(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "mit license fence",
+			input: "```mit\nMIT License\n\nCopyright (c) 2024\n```",
+			want:  "MIT License\n\nCopyright (c) 2024",
+		},
+		{
+			name:  "go fence",
+			input: "```go\npackage main\n\nfunc main() {}\n```",
+			want:  "package main\n\nfunc main() {}",
+		},
+		{
+			name:  "bare fence",
+			input: "```\nhello world\n```",
+			want:  "hello world",
+		},
+		{
+			name:  "no fence passthrough",
+			input: "MIT License\n\nCopyright (c) 2024",
+			want:  "MIT License\n\nCopyright (c) 2024",
+		},
+		{
+			name:  "clean code preserves trailing newline",
+			input: "package main\n\nfunc main() {}\n",
+			want:  "package main\n\nfunc main() {}\n",
+		},
+	}
+	for _, c := range cases {
+		got := SanitizeLLMResponse(c.input)
+		if got != c.want {
+			t.Errorf("%s: SanitizeLLMResponse =\n %q\nwant\n %q", c.name, got, c.want)
+		}
+	}
+}
+
 func TestPatchLoadNotFound(t *testing.T) {
 	dir, _ := os.MkdirTemp("", "izen-patch-load-*")
 	defer func() { _ = os.RemoveAll(dir) }()

@@ -21,6 +21,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/command"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/domain"
@@ -175,6 +176,18 @@ func (m *model) handleInput(line string) tea.Cmd {
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return nil
+	}
+
+	// ── Composite fast-query routing: /review $test ───────────────────
+	// MUST be evaluated at the very top of the evaluation tree, strictly
+	// before parseModeShorthand (which would otherwise match the "/review "
+	// prefix and route this to a plain static /review, silently bypassing the
+	// dynamic-test-then-review composite shortcut).
+	if command.IsReviewTestComposite(line) {
+		m.push(roleSystem, accentStyle.Render("⚡ [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m.runReviewTestComposite()
 	}
 
 	// $ sub-command prefix — delegates to handleReviewDollar for routing.
@@ -1079,6 +1092,18 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	if len(name) == 0 {
 		return nil
 	}
+
+	// ── Composite fast-query: /review $test ─────────────────────────────
+	// Intercept the composite shortcut before any other routing. It runs the
+	// dynamic test suite, injects the telemetry into the forensic ledger, then
+	// triggers the risk analysis engine with both git diff AND test reports.
+	if command.IsReviewTestComposite(cmd) {
+		m.push(roleSystem, accentStyle.Render("⚡ [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m.runReviewTestComposite()
+	}
+
 	if _, ok := validSystemCommands[name[0]]; !ok {
 		m.push(roleError, "unknown command: "+cmd)
 		m.refreshViewportContent()
@@ -1506,7 +1531,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 // buffer.
 func (m *model) hotfixProgressCmd() tea.Cmd {
 	lines := []string{
-		"  🔄 Intercepted structural breakdown. Refining context (Attempt 1/2)...",
+		"  ↺ Intercepted structural breakdown. Refining context (Attempt 1/2)...",
 		"  ⚙ Compiling unified diff schema...",
 	}
 	var cmds = make([]tea.Cmd, 0, len(lines))
@@ -1518,6 +1543,25 @@ func (m *model) hotfixProgressCmd() tea.Cmd {
 		}))
 	}
 	return tea.Batch(cmds...)
+}
+
+// sanitizeFileOutput cleans generated file content produced by the local model
+// before it is written to disk. It trims leading/trailing whitespace and strips
+// a single wrapping code block: an opening fence ("```", "```go", "```mit",
+// etc.) and a closing "```". Without this, literal triple backticks are written
+// into the file, corrupting its syntax.
+func sanitizeFileOutput(content string) string {
+	content = strings.TrimSpace(content)
+	// Check for markdown block prefix.
+	if strings.HasPrefix(content, "```") {
+		// Find the end of the opening fence line.
+		if idx := strings.Index(content, "\n"); idx != -1 {
+			content = content[idx+1:]
+		}
+	}
+	// Check for markdown block suffix.
+	content = strings.TrimSuffix(content, "```")
+	return strings.TrimSpace(content)
 }
 
 // resolveHotfixTarget extracts the concrete destination file path for a $hot
@@ -1607,6 +1651,13 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			return hotfixProposalMsg{Err: fmt.Errorf("patch generation returned empty output")}
 		}
 
+		// ── STEP 1/2: Content Cleanse — strip markdown code fences the local
+		// model wraps around the generated file (e.g. "```mit ... ```"). Writing
+		// the raw text verbatim injects literal triple backticks into the
+		// document and corrupts its syntax, so we sanitize BEFORE the diff is
+		// computed and the patch is staged for disk write.
+		cleaned := sanitizeFileOutput(resp.Content)
+
 		// Snapshot the original file content so the diff + rollback are exact.
 		orig := ""
 		if data, rerr := os.ReadFile(task.Target); rerr == nil {
@@ -1614,13 +1665,13 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		}
 
 		// Compute a unified diff for display (green additions / red removals).
-		diff := computeUnifiedDiff(task.Target, orig, resp.Content)
+		diff := computeUnifiedDiff(task.Target, orig, cleaned)
 
 		patch := &execution.Patch{
 			ID:        fmt.Sprintf("hotfix-%d", task.StepNum),
 			File:      task.Target,
 			Original:  orig,
-			Modified:  resp.Content,
+			Modified:  cleaned,
 			TaskID:    task.StepNum,
 			ContextID: m.sess.ContextID,
 		}

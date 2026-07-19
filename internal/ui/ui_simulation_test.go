@@ -238,3 +238,46 @@ func TestComputeVpHeightWithProposalBlock(t *testing.T) {
 			viewLines, m.height)
 	}
 }
+
+// TestSanitizeFileOutputFences is the regression guard for the $hot markdown
+// fence bug: the file content cleanse must strip a wrapping code block (with or
+// without a language identifier) so literal triple backticks never reach disk.
+func TestSanitizeFileOutputFences(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "mit fence",
+			input: "```mit\nMIT License\n\nCopyright (c) 2024\n```",
+			want:  "MIT License\n\nCopyright (c) 2024",
+		},
+		{
+			name:  "go fence",
+			input: "```go\npackage main\n\nfunc main() {}\n```",
+			want:  "package main\n\nfunc main() {}",
+		},
+		{
+			name:  "bare fence",
+			input: "```\nhello\n```",
+			want:  "hello",
+		},
+		{
+			name:  "no fence passthrough",
+			input: "MIT License\n\nCopyright (c) 2024",
+			want:  "MIT License\n\nCopyright (c) 2024",
+		},
+		{
+			name:  "surrounding whitespace trimmed",
+			input: "\n\n```text\npayload\n```\n\n",
+			want:  "payload",
+		},
+	}
+	for _, c := range cases {
+		got := sanitizeFileOutput(c.input)
+		if got != c.want {
+			t.Errorf("%s: sanitizeFileOutput =\n %q\nwant\n %q", c.name, got, c.want)
+		}
+	}
+}
