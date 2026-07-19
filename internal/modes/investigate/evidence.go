@@ -81,14 +81,162 @@ const (
 	maxOutputLines   = 500        // total output lines cap
 )
 
+// ── Compiler Diagnostic Patterns ──────────────────────────────────────────────
+// These patterns identify lines in a Go build/test output that carry actionable
+// diagnostic signal: error locations (file:line:col), error messages, and
+// explicit mitigation directives. Lines NOT matching any signal pattern are
+// considered ambient noise (container logs, download progress, etc.) and are
+// aggressively pruned when compiler diagnostics are detected.
+
+var compilerSignalPrefixes = []string{
+	"# ", // Go build package header
+	"no required module",
+	"cannot find package",
+	"package is not in",
+	"missing dependency",
+	"to add it:",
+	"suggestion:",
+	"did you mean?",
+	"undefined:",
+	"go: finding",
+	"go: downloading",
+	"go: extracting",
+}
+
+func isCompilerSignalLine(s string) bool {
+	if isGoErrorLocation(s) {
+		return true
+	}
+	lower := strings.ToLower(s)
+	for _, p := range compilerSignalPrefixes {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	// Go build error continuations: lines starting with whitespace that
+	// follow a compiler signal (carried over in the two-pass scan).
+	return false
+}
+
+// isGoErrorLocation matches Go compiler error tokens of the form
+// "file.go:line:col:" or "file.go:line:" — the canonical Go error locus.
+func isGoErrorLocation(s string) bool {
+	// Match: <path>/<file>.go:<digits>[:<digits>]:
+	// e.g. "cmd/api/main.go:7:2:" or "./foo.go:42:"
+	idx := strings.Index(s, ".go:")
+	if idx < 0 {
+		return false
+	}
+	// After ".go:" there must be at least one digit (line number).
+	after := s[idx+4:]
+	if len(after) == 0 || after[0] < '0' || after[0] > '9' {
+		return false
+	}
+	// Digit run for line number.
+	colStart := 1
+	for colStart < len(after) && after[colStart] >= '0' && after[colStart] <= '9' {
+		colStart++
+	}
+	// After the line number, expect ':' or ' ' or end-of-string (for col number or message).
+	if colStart < len(after) && after[colStart] == ':' {
+		return true
+	}
+	return true
+}
+
+// extractCompilerDiagnostics performs aggressive signal-only extraction when Go
+// compiler diagnostics are detected. It keeps ONLY:
+//   - Error location tokens (file:line:col)
+//   - Compiler error messages (undefined:, cannot use, etc.)
+//   - Mitigation directives (to add it:, suggestion:, did you mean?)
+//   - Package header markers (# pkg/path)
+//
+// ALL ambient noise (container runtime setup, Docker logs, download progress,
+// environment checks) is stripped. This reduces the context footprint to the
+// minimal token set the local model needs for high-speed plan synthesis.
+func extractCompilerDiagnostics(raw string) string {
+	lines := strings.Split(raw, "\n")
+	signalLines := make(map[int]string)
+
+	// Pass 1: identify signal lines and their 1-line lookahead context.
+	for i, line := range lines {
+		trimmed := strings.TrimRightFunc(line, unicode.IsSpace)
+		clean := stripANSICodes(trimmed)
+		if clean == "" {
+			continue
+		}
+		if isCompilerSignalLine(clean) || isGoErrorLocation(clean) {
+			signalLines[i] = clean
+			continue
+		}
+		// Check the lower-cased clean version for known signal substrings.
+		lower := strings.ToLower(clean)
+		for _, p := range compilerSignalPrefixes {
+			if strings.Contains(lower, p) {
+				signalLines[i] = clean
+				break
+			}
+		}
+	}
+
+	if len(signalLines) == 0 {
+		return raw
+	}
+
+	// Pass 2: collect signals in order, with 1-line lookahead context for
+	// multi-line error descriptions (e.g. "to add it: go get ..." may be on
+	// the next line after the file:line:col token).
+	var out []string
+	maxIdx := len(lines) - 1
+	for i := 0; i <= maxIdx; i++ {
+		if _, ok := signalLines[i]; ok {
+			out = append(out, signalLines[i])
+			// Include the NEXT line if it exists and carries continuation.
+			if i+1 <= maxIdx {
+				nextClean := stripANSICodes(strings.TrimRightFunc(lines[i+1], unicode.IsSpace))
+				if nextClean != "" && !isNoiseLine(nextClean) {
+					if _, nextIsSignal := signalLines[i+1]; !nextIsSignal {
+						out = append(out, nextClean)
+						i++ // skip on next iteration
+					}
+				}
+			}
+		}
+	}
+
+	condensed := strings.Join(out, "\n")
+	condensed = strings.TrimSpace(condensed)
+	if condensed == "" {
+		return raw
+	}
+	return condensed
+}
+
 // BoundedLogPreprocessor intercepts raw terminal/CI failure output and
 // extracts only the diagnostic signal — stack traces, error messages, and
 // test failure markers — while stripping high-volume noise (ANSI codes,
 // build cache logs, repetitive progress bars, Go module downloads, etc.).
 // Returns a token-safe condensed payload.
+//
+// When Go compiler diagnostics are detected, the preprocessor switches to
+// aggressive signal-only mode: it extracts only error location tokens
+// (file:line:col), error messages, and mitigation directives, stripping ALL
+// ambient environment/container setup logs.
 func BoundedLogPreprocessor(raw string) string {
 	if len(raw) > maxLogInputBytes {
 		raw = raw[:maxLogInputBytes]
+	}
+
+	// ── COMPILER-DIAGNOSTIC-FAST-PATH ──────────────────────────────────
+	// If the raw output contains Go compiler diagnostics, switch to
+	// aggressive signal-only extraction. This strips ambient noise
+	// (container logs, Docker setup, download progress) that bloats the
+	// context window and causes local LLM timeouts in /plan synthesis.
+	if hasCompilerDiagnostics(raw) {
+		result := extractCompilerDiagnostics(raw)
+		if result != raw && strings.TrimSpace(result) != "" {
+			return result
+		}
 	}
 
 	lines := strings.Split(raw, "\n")
@@ -150,6 +298,30 @@ func BoundedLogPreprocessor(raw string) string {
 		return raw
 	}
 	return condensed
+}
+
+// hasCompilerDiagnostics checks whether the raw output contains any Go
+// compiler diagnostic patterns that trigger aggressive signal-only extraction.
+func hasCompilerDiagnostics(raw string) bool {
+	lower := strings.ToLower(raw)
+	// Core Go compiler patterns that signal actionable compile errors.
+	return strings.Contains(lower, "no required module provides package") ||
+		strings.Contains(lower, "cannot find package") ||
+		strings.Contains(lower, "undefined:") ||
+		strings.Contains(lower, "to add it:") ||
+		(strings.Contains(lower, "compile") && (containsGoErrorLocation(raw) || strings.Contains(lower, "go build")))
+}
+
+// containsGoErrorLocation returns true if the string contains at least one
+// Go error location token (<file>.go:<line>).
+func containsGoErrorLocation(s string) bool {
+	lines := strings.Split(s, "\n")
+	for _, line := range lines {
+		if isGoErrorLocation(line) {
+			return true
+		}
+	}
+	return false
 }
 
 func stripANSICodes(s string) string {

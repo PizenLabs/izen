@@ -1101,9 +1101,12 @@ func (m *model) flushPendingRecords() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// cleanShutdownCmd performs a full session teardown: kills orphan processes,
-// purges the session cache, removes dirty compilation logs, and resets all
-// ledger states so the next startup begins sterile. Wraps tea.Quit.
+// cleanShutdownCmd performs a graceful session teardown: kills orphan
+// processes, purges in-memory session state, and preserves the persistent
+// .izen metadata directory for future sessions. The .izen directory is NEVER
+// deleted — it is permanent and persists across application lifecycles.
+// Only transient session files (session.json, context_ledger.json) are cleared
+// to give a clean slate on next startup.
 func (m *model) cleanShutdownCmd() tea.Cmd {
 	return func() tea.Msg {
 		execution.KillAllOrphans()

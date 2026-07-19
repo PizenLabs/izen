@@ -8,21 +8,22 @@ import (
 )
 
 const (
-	LocalDir         = ".izen"
-	RuntimeMetaFile  = "runtime.meta"
-	SessionFile      = "session.json"
-	GraphDir         = "graph"
-	GraphCacheFile   = "ast.db"
-	SymbolsDBFile    = "symbols.db"
-	DirtyOverlayFile = "dirty.overlay"
-	HistoryDir       = "history"
-	InputLogFile     = "input.log"
-	EventsLogFile    = "events.log"
-	AuditDir         = "audit"
-	MutationsLogFile = "mutations.log"
-	ShellLogFile     = "shell.log"
-	CheckpointsDir   = "checkpoints"
-	PatchesDir       = "patches"
+	LocalDir          = ".izen"
+	RuntimeMetaFile   = "runtime.meta"
+	SessionFile       = "session.json"
+	GraphDir          = "graph"
+	GraphCacheFile    = "ast.db"
+	SymbolsDBFile     = "symbols.db"
+	DirtyOverlayFile  = "dirty.overlay"
+	HistoryDir        = "history"
+	InputLogFile      = "input.log"
+	EventsLogFile     = "events.log"
+	AuditDir          = "audit"
+	MutationsLogFile  = "mutations.log"
+	ShellLogFile      = "shell.log"
+	CheckpointsDir    = "checkpoints"
+	PatchesDir        = "patches"
+	ContextLedgerFile = "context_ledger.json"
 )
 
 type RuntimeMeta struct {
@@ -109,14 +110,18 @@ func CheckVersion(root string, currentLxVersion string) error {
 	return nil
 }
 
-// CleanupLocalState removes the local .izen directory entirely, ensuring a
-// completely sterile workspace on the next startup. Called on explicit /quit.
+// CleanupLocalState preserves the .izen directory structure but clears
+// volatile runtime data. The .izen metadata directory is PERMANENT and
+// persistent across application lifecycles — it must never be deleted.
+// Only transient session files (session.json, context_ledger.json) are
+// removed to give a clean slate while keeping graph caches, checkpoints,
+// and configuration intact.
 func CleanupLocalState(root string) error {
-	localDir := filepath.Join(root, LocalDir)
-	if _, err := os.Stat(localDir); os.IsNotExist(err) {
-		return nil
-	}
-	return os.RemoveAll(localDir)
+	sessionPath := filepath.Join(root, LocalDir, SessionFile)
+	_ = os.Remove(sessionPath)
+	ledgerPath := filepath.Join(root, LocalDir, ContextLedgerFile)
+	_ = os.Remove(ledgerPath)
+	return nil
 }
 
 func MigrateLegacyFiles(root string) error {

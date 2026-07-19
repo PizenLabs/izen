@@ -827,6 +827,17 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	m.currentResult = nil
 	m.sess.SetMode(mode)
 	_ = m.sess.Save()
+
+	// ── VIRTUAL SNAPSHOT STAGING ───────────────────────────────────────
+	// On every mode switch that may involve file mutations, begin a fresh
+	// virtual transaction. This snapshots the current workspace state so that
+	// if the user rejects a proposal or a build fails, all disk mutations can
+	// be instantly rolled back to this point. The transaction is committed
+	// only on explicit user approval (Alt+A / Alt+L).
+	if m.execEng != nil && (mode == modes.ModeBuild || mode == modes.ModeInvestigate || mode == modes.ModePlan || mode == modes.ModeReview) {
+		m.execEng.BeginTransaction()
+	}
+
 	modeColor := modeAccentColor(mode)
 	modeLabel := lipgloss.NewStyle().Foreground(modeColor).Render(
 		fmt.Sprintf("→ /%s — %s", mode, mode.Description()))
@@ -1242,6 +1253,17 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 	m.handoffCtx.ProposedFix = ""
 	m.handoffCtx.LastFailurePayload = ""
 	m.handoffCtx.TargetScope = ""
+
+	// ── PROMPT BUFFER BLEEDING FIX ─────────────────────────────────────
+	// Clear the LLM dialog history on every mode transition so no stale
+	// conversational context (previous greetings, abandoned analyses, failed
+	// task history) leaks into the new mode's context window. Each mode starts
+	// with a clean prompt buffer — the ContextLedger is the SINGLE source of
+	// truth for cross-mode handoff.
+	if m.sess != nil {
+		m.sess.ClearHistory()
+		_ = m.sess.Save()
+	}
 }
 
 // runBuildCmd is the /build mode execution entry. It strictly blocks when no
@@ -1269,11 +1291,30 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 		return nil
 	}
 
+	// ── VIRTUAL SNAPSHOT STAGING ───────────────────────────────────────
+	// Begin a fresh transaction for this build execution to snapshot the
+	// workspace. If the build fails or the user rejects proposals, all
+	// mutations can be rolled back instantly.
+	if m.execEng != nil {
+		m.execEng.BeginTransaction()
+	}
+
+	// ── PROMPT BUFFER BLEEDING FIX ─────────────────────────────────────
+	// Clear the LLM dialog buffer at the start of every build invocation so
+	// no stale context from previous build runs or failed tasks can leak into
+	// the new execution window. Each build starts with a clean prompt scope.
+	if m.sess != nil {
+		m.sess.ClearHistory()
+		_ = m.sess.Save()
+	}
+
 	// Sanitize any leftover unstructured content — /build operates purely on
 	// the structural task ledger, never on free-form conversational input.
 	_ = content
 	m.responseBuffer.Reset()
-	m.execEng.SetStreamContextFiles(m.attachedFiles)
+	if m.execEng != nil {
+		m.execEng.SetStreamContextFiles(m.attachedFiles)
+	}
 
 	if m.buildLedger == nil {
 		m.buildLedger = ctxpkg.NewTaskLedger()

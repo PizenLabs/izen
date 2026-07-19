@@ -27,20 +27,106 @@ var (
 	dupBlankLineRE = regexp.MustCompile(`\n{3,}`)
 )
 
-// SanitizeLedger returns a slimmed, de-duplicated version of the raw ledger
-// handoff content. It applies ONLY structural noise reduction:
-//   - strip ANSI escapes (display artifacts, never signal)
-//   - collapse 3+ blank lines to a single blank line
-//   - strip loose markdown code fences (```) that are NOT inside diagnostic blocks
-//   - strip // line comments and /* */ block comments that may leak from LLM output
+// ── Compiler diagnostic signal patterns (mirrors investigate/evidence.go) ──────
+var compilerSignalPrefixes = []string{
+	"no required module",
+	"cannot find package",
+	"package is not in",
+	"missing dependency",
+	"to add it:",
+	"suggestion:",
+	"did you mean?",
+	"undefined:",
+}
+
+func hasGoErrorLocation(s string) bool {
+	idx := strings.Index(s, ".go:")
+	if idx < 0 {
+		return false
+	}
+	after := s[idx+4:]
+	if len(after) > 0 && after[0] >= '0' && after[0] <= '9' {
+		return true
+	}
+	return false
+}
+
+func isCompilerLedgerLine(s string) bool {
+	if hasGoErrorLocation(s) {
+		return true
+	}
+	lower := strings.ToLower(s)
+	for _, p := range compilerSignalPrefixes {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractCompilerLedger performs aggressive signal-only extraction when Go
+// compiler diagnostics are detected in the ledger handoff. It keeps ONLY:
+//   - Error location tokens (file:line:col)
+//   - Compiler error messages (undefined:, cannot use, etc.)
+//   - Mitigation directives (to add it:, suggestion:, did you mean?)
+//   - Package header markers
 //
-// It deliberately does NOT drop per-line content. The previous implementation
-// stripped runtime/container log lines and collapsed stack frames, which
-// destroyed structured diagnostic signal (e.g. the offending dependency in a
-// "no required module provides package" error, or "rootless docker not found"
-// environment blockers) and broke state continuity between modes. Per the Izen
-// Lifecycle Philosophy, the operational data structure must be preserved — only
-// display noise is removed. Empty / already-clean input passes through unchanged.
+// ALL other lines (container setup, environment checks, download progress)
+// are stripped to reduce context footprint for local LLM plan synthesis.
+func extractCompilerLedger(raw string) string {
+	lines := strings.Split(raw, "\n")
+	var out []string
+	maxIdx := len(lines) - 1
+
+	for i := 0; i <= maxIdx; i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" {
+			continue
+		}
+		if isCompilerLedgerLine(trimmed) {
+			out = append(out, trimmed)
+			continue
+		}
+		// Include the NEXT line if it carries mitigation continuation.
+		if i+1 <= maxIdx {
+			nextTrimmed := strings.TrimSpace(lines[i+1])
+			if nextTrimmed != "" && isCompilerLedgerLine(nextTrimmed) {
+				out = append(out, nextTrimmed)
+				i++
+			}
+		}
+	}
+
+	condensed := strings.Join(out, "\n")
+	condensed = strings.TrimSpace(condensed)
+	if condensed == "" {
+		return raw
+	}
+	return condensed
+}
+
+// hasCompilerDiagnostics checks if the raw string contains Go compiler
+// diagnostic patterns that trigger aggressive signal-only extraction.
+func hasCompilerDiagnostics(raw string) bool {
+	lower := strings.ToLower(raw)
+	return strings.Contains(lower, "no required module provides package") ||
+		strings.Contains(lower, "cannot find package") ||
+		strings.Contains(lower, "undefined:") ||
+		strings.Contains(lower, "to add it:")
+}
+
+// SanitizeLedger returns a slimmed, de-duplicated version of the raw ledger
+// handoff content.
+//
+// When Go compiler diagnostics are detected in the content, the sanitizer
+// switches to AGGRESSIVE signal-only mode: it extracts ONLY error location
+// tokens (file:line:col), error messages, and mitigation directives, stripping
+// ALL ambient environment/container setup logs. This prevents context window
+// bloat that causes local LLM timeouts during /plan synthesis.
+//
+// When no compiler diagnostics are present, it applies structural noise
+// reduction only (ANSI strip, comment strip, whitespace normalize) — preserving
+// every diagnostic line per the Izen Lifecycle Philosophy.
 func SanitizeLedger(raw string) string {
 	if strings.TrimSpace(raw) == "" {
 		return raw
@@ -54,7 +140,19 @@ func SanitizeLedger(raw string) string {
 	//    — they are LLM-generated structural contamination.
 	clean = stripJSONContamination(clean)
 
-	// 3. Normalize whitespace only — preserve every diagnostic line. Collapse
+	// 3. COMPILER-DIAGNOSTIC-FAST-PATH: if the content carries Go compiler
+	//    diagnostic patterns, switch to aggressive signal-only extraction.
+	//    This strips ambient noise (container logs, Docker setup, download
+	//    progress) that bloats the context window for local model plan
+	//    synthesis.
+	if hasCompilerDiagnostics(clean) {
+		result := extractCompilerLedger(clean)
+		if result != clean && strings.TrimSpace(result) != "" {
+			return result
+		}
+	}
+
+	// 4. Normalize whitespace — preserve every diagnostic line. Collapse
 	//    3+ blank lines to a single blank line so the payload stays compact
 	//    without losing structural content.
 	clean = dupBlankLineRE.ReplaceAllString(clean, "\n\n")

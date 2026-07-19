@@ -567,6 +567,27 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// /build invocations see them blocked rather than silently
 		// advancing into corrupted state.
 		if msg.exitCode != 0 {
+			// ── ROLLBACK ON FAILURE ─────────────────────────────────
+			// Any disk mutations performed during this build execution
+			// are rolled back so the workspace is never left in a broken
+			// state. The transaction is then reset for the next attempt.
+			if m.execEng != nil {
+				if errs := m.execEng.RollbackTransaction(); len(errs) > 0 {
+					for _, err := range errs {
+						m.push(roleError, fmt.Sprintf("build rollback error: %v", err))
+					}
+				}
+			}
+
+			// ── CLEAR DIALOG BUFFER ON TASK FAILURE ────────────────
+			// Wipe the LLM conversation history so the next diagnostic
+			// or restart prompt starts with a clean context scope, never
+			// appending to stale failed-task history.
+			if m.sess != nil {
+				m.sess.ClearHistory()
+				_ = m.sess.Save()
+			}
+
 			tasks := m.sess.CurrentTasks
 			changed := false
 			for i := range tasks {
@@ -860,6 +881,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.awaitingConfirmation = false
 			m.acceptAll = false
 			if msg.err == nil {
+				// ── COMMIT TRANSACTION ─────────────────────────────────
+				// All mutations approved and applied — clear the snapshot
+				// so the workspace is no longer pinned to the rollback point.
+				if m.execEng != nil {
+					m.execEng.CommitTransaction()
+				}
+
 				outcomeLine := fmt.Sprintf("%s %s • %s", successBannerStyle.Render("[✓]"), msg.file, msg.status)
 				m.push(roleSystem, outcomeLine)
 				m.createBuildCheckpoint(1)
@@ -909,6 +937,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var testCmd tea.Cmd
 		switch {
 		case applied > 0 && failed == 0:
+			// ── COMMIT TRANSACTION ─────────────────────────────────
+			// All mutations approved and applied — clear the snapshot.
+			if m.execEng != nil {
+				m.execEng.CommitTransaction()
+			}
+
 			summary := fmt.Sprintf("%s %d file(s) mutated. Checkpoint created.", successBannerStyle.Render("[✓]"), applied)
 			m.push(roleSystem, summary)
 			m.createBuildCheckpoint(applied)
@@ -1343,6 +1377,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.push(roleError, errMsg)
 				m.push(roleSystem, infoStyle.Render("regenerate with more precise intent or use /plan again"))
 				m.sess.ClearTasks()
+
+				// ── PROMPT BUFFER BLEEDING FIX ────────────────────────
+				// Clear the dialog buffer on plan rejection so the next
+				// /plan attempt receives zero stale context from the
+				// failed previous attempt. Each plan generation is an
+				// independent lifecycle event.
+				m.sess.ClearHistory()
+				_ = m.sess.Save()
 			}
 		}
 

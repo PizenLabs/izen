@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -80,6 +81,25 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
+			// ── VIRTUAL SNAPSHOT ROLLBACK ────────────────────────────
+			// On user rejection, restore ALL files to the state captured
+			// at the last transaction boundary (mode entry / build start).
+			// This guarantees no mutation persists without explicit approval.
+			if m.execEng != nil {
+				if errs := m.execEng.RollbackTransaction(); len(errs) > 0 {
+					for _, err := range errs {
+						m.push(roleError, fmt.Sprintf("rollback error: %v", err))
+					}
+				}
+			}
+			// Clear dialog history so the next user prompt starts with a
+			// clean context scope — no stale plan output or previous
+			// proposals bleed into future turns.
+			if m.sess != nil {
+				m.sess.ClearHistory()
+				_ = m.sess.Save()
+			}
+
 			m.ti.Focus()
 			m.state = StateChat
 			m.recalcViewportHeight()

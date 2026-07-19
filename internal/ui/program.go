@@ -314,7 +314,20 @@ func RunMainDashboard(cfg *config.Config, root string, localCfg *config.LocalCon
 func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalConfig, det ...project.Detection) {
 	sess, mgr, lc := bootCommon(root, cfg)
 
-	fmt.Fprintf(os.Stderr, "izen: rollback engine stub — not yet implemented (root=%s)\n", root)
+	// ── VIRTUAL SNAPSHOT ROLLBACK ────────────────────────────────────────
+	// Create an execution engine and rollback any in-flight patches. This
+	// is the standalone rollback entry point invoked when the user explicitly
+	// requests a workspace rollback via the CLI.
+	fmt.Fprintf(os.Stderr, "izen: running rollback engine for %s...\n", root)
+	execEng := execution.NewEngine(root, cfg, sess)
+	errs := execEng.RollbackTransaction()
+	if len(errs) > 0 {
+		for _, err := range errs {
+			fmt.Fprintf(os.Stderr, "izen: rollback error: %v\n", err)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "izen: rollback complete — workspace restored to last snapshot.\n")
+	}
 
 	if lc != nil {
 		defer func() { _ = lc.Stop() }()
