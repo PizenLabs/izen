@@ -399,6 +399,24 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.Viewport.GotoBottom()
 			return nil
 		}
+		// Graceful handoff guard: if the ContextLedger's ask_handoff payload
+		// was cleared (e.g. by /clear) and no other handoff context exists,
+		// prompt for input rather than running the engine with stale or empty
+		// content. This prevents silent degradation on the local model.
+		trimmed := strings.TrimSpace(content)
+		hasHandoff := m.handoffLedgerContent != "" ||
+			m.handoffCtx.LastFailurePayload != "" ||
+			m.handoffCtx.ProposedFix != ""
+		if !hasHandoff && m.sess != nil && m.sess.ContextLedger != nil {
+			l := m.sess.ContextLedger
+			hasHandoff = l.Diagnostics != "" || len(l.Packets) > 0
+		}
+		if !hasHandoff && (trimmed == "" || len(trimmed) < 15) {
+			m.push(roleSystem, infoStyle.Render("No handoff context in ledger. Describe what to investigate (e.g. a test failure, error log, or crash report):"))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
 		m.investigateInvocationCount++
 		return m.runInvestigateCmd(content)
 	case modes.ModeReview:
@@ -1233,21 +1251,77 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.records = nil
 		m.PreRenderedHistory = ""
 		m.showBanner = true
-		// /clear wipes the conversation view; clear the current workflow
-		// result's capabilities too (leave handoffCtx intact for handoffs).
 		m.currentResult = nil
-		m.refreshViewportContent()
-		return tea.Sequence(tea.ClearScreen, tea.Println("IZEN cleared."))
+		m.currentPrompt = ""
+		m.responseBuffer.Reset()
+		m.streamBuffer = ""
+		m.currentStreamContent = ""
+		m.streaming = false
 
-	case cmd == "/drop":
+		// Purge ContextLedger (ask_handoff_payload, investigation findings,
+		// pending execution tasks, and all analytical packets).
+		if m.sess != nil {
+			m.sess.ContextLedger = nil
+			m.sess.InvestigationID = ""
+			m.sess.ReviewID = ""
+			m.sess.ClearHistory()
+			m.sess.ClearTasks()
+			_ = m.sess.Save()
+		}
+
+		// Clear handoff pipeline state.
+		m.handoffCtx = HandoffContext{}
+		m.handoffLedgerContent = ""
+		m.lastInvestigateLedger = nil
+
+		// Clear forensic / test telemetry caches.
+		m.lastTestOutput = ""
+		m.lastTestFailed = false
+		m.lastTestTarget = ""
+		m.pendingFileRefs = nil
+
+		// Reset build and proposal gates.
+		m.buildRecoveryCount = 0
+		m.buildVerifyPending = false
+		m.pendingBuildApproval = false
+		m.pendingBuildTask = nil
+		m.pendingBuildAllowAlways = false
+		m.pendingProposals = nil
+		m.acceptedProposals = nil
+		m.awaitingConfirmation = false
+		m.acceptAll = false
+		m.pendingHotfixTask = nil
+		m.currentBuildTaskID = 0
+		m.pendingTestConfirm = false
+		m.pendingTestTarget = ""
+		m.investigateInvocationCount = 0
+
+		// Zero out cumulative token counters.
+		m.InputTokens = 0
+		m.OutputTokens = 0
+		m.TotalTokens = 0
+		m.ContextLimit = 0
+		m.AccumulatedCost = 0
+
+		m.refreshViewportContent()
+		return tea.Sequence(
+			tea.ClearScreen,
+			tea.Println("✕ [IZEN Memory] Context ledger and pending tasks successfully purged. Workspace reset."),
+		)
+
+	case cmd == "/drop" || cmd == "/drop all":
 		m.attachedFiles = nil
-		m.push(roleSystem, infoStyle.Render("context cleared"))
+		m.pendingFileRefs = nil
+		m.push(roleSystem, infoStyle.Render("all context files detached"))
 		return nil
 
 	case strings.HasPrefix(cmd, "/drop "):
-		target := filepath.Clean(strings.TrimSpace(strings.TrimPrefix(cmd, "/drop")))
+		raw := strings.TrimSpace(strings.TrimPrefix(cmd, "/drop"))
+		// Strip optional @ prefix for @file syntax
+		raw = strings.TrimPrefix(raw, "@")
+		target := filepath.Clean(raw)
 		if target == "" || target == "." {
-			m.push(roleSystem, infoStyle.Render("usage: /drop <path>"))
+			m.push(roleSystem, infoStyle.Render("usage: /drop [@file|all]"))
 			return nil
 		}
 		filtered := make([]string, 0, len(m.attachedFiles))
@@ -1257,14 +1331,14 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			}
 		}
 		if len(filtered) == len(m.attachedFiles) {
-			m.push(roleSystem, infoStyle.Render("not attached: "+target))
+			m.push(roleSystem, infoStyle.Render("not attached: " + raw))
 			return nil
 		}
 		m.attachedFiles = filtered
 		if len(m.attachedFiles) == 0 {
-			m.push(roleSystem, infoStyle.Render("context cleared"))
+			m.push(roleSystem, infoStyle.Render("all context files detached"))
 		} else {
-			m.push(roleSystem, infoStyle.Render("dropped: "+target))
+			m.push(roleSystem, infoStyle.Render("detached: " + raw))
 		}
 		return nil
 
