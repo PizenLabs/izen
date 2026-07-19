@@ -10,14 +10,13 @@ use tantivy::{doc, query::QueryParser, DocAddress, Index, IndexWriter, ReloadPol
 
 fn sanitize_query(query: &str) -> String {
     query
-        .replace('\r', " ")
-        .replace('\n', " ")
+        .replace(['\r', '\n'], " ")
         .chars()
         .flat_map(|c| match c {
             '\\' => vec!['\\', '\\'],
             '"' => vec!['\\', '"'],
-            '+' | '-' | '!' | '(' | ')' | ':' | '^' | '[' | ']'
-            | '{' | '}' | '~' | '*' | '?' | '|' | '&' => {
+            '+' | '-' | '!' | '(' | ')' | ':' | '^' | '[' | ']' | '{' | '}' | '~' | '*' | '?'
+            | '|' | '&' => {
                 vec!['\\', c]
             }
             c if c.is_control() => vec![],
