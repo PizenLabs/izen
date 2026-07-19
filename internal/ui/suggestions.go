@@ -208,7 +208,7 @@ func (m *model) filterDollarCommands(prefix string) []string {
 	case modes.ModeInvestigate:
 		candidates = []string{"env", "trace", "diagnose", "log"}
 	case modes.ModeBuild:
-		candidates = []string{"fix", "fix --apply"}
+		candidates = []string{"fix", "fix --apply", "hot"}
 	default:
 		return nil
 	}

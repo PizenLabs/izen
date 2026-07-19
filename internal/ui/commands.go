@@ -69,6 +69,51 @@ func sanitizeInputBuffer(s string) string {
 	return inputANSIRe.ReplaceAllString(s, "")
 }
 
+// stashedPlanPath is the deterministic cache file path where the active /build
+// plan is serialized before a $hot hotfix execution. The Go engine restores
+// from this file after the hotfix completes — the LLM never sees the stash,
+// preventing 7B context drift across urgent interventions.
+const stashedPlanPath = ".izen/stashed_plan.json"
+
+// stashPlan serializes the current /build task queue to a static cache file so
+// it can be restored deterministically after a $hot hotfix completes. Returns
+// nil if there are no tasks to stash (no-op).
+func (m *model) stashPlan() error {
+	tasks := m.sess.CurrentTasks
+	if len(tasks) == 0 {
+		return nil
+	}
+	data, err := json.MarshalIndent(tasks, "", "  ")
+	if err != nil {
+		return fmt.Errorf("serialize plan: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(stashedPlanPath), 0755); err != nil {
+		return fmt.Errorf("create .izen: %w", err)
+	}
+	return os.WriteFile(stashedPlanPath, data, 0644)
+}
+
+// restorePlan reads the stashed plan from the deterministic cache file and
+// re-hydrates the active /build execution queue. The cache file is deleted
+// after a successful read. Returns nil, nil if no stash exists.
+func (m *model) restorePlan() ([]plan.Task, error) {
+	data, err := os.ReadFile(stashedPlanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read stashed plan: %w", err)
+	}
+	var tasks []plan.Task
+	if err := json.Unmarshal(data, &tasks); err != nil {
+		return nil, fmt.Errorf("parse stashed plan: %w", err)
+	}
+	// Delete the stash file immediately after successful read so the LLM
+	// never sees it — the restoration is purely a Go-level operation.
+	_ = os.Remove(stashedPlanPath)
+	return tasks, nil
+}
+
 func (m *model) handleInput(line string) tea.Cmd {
 	line = strings.TrimSpace(line)
 	if line == "" {
@@ -164,6 +209,20 @@ func (m *model) handleInput(line string) tea.Cmd {
 				stepNum, _ = strconv.Atoi(fields[1])
 			}
 			return m.handleBuildRun(stepNum)
+		}
+
+		// DEFAULT FEEDBACK: amend a failed/stalled task without stashing.
+		// If the last task was rejected or failed, the user's text is routed
+		// as an amendment (appended to the task description) and the task is
+		// reset to "idle" for re-execution. This replaces the old behavior of
+		// stubbornly re-running the exact same failed command.
+		//
+		// If no task is failed/stalled, execution falls through to normal chat.
+		if failedStep := m.findFailedBuildTask(); failedStep > 0 {
+			m.push(roleStatus, fmt.Sprintf("Amending task %d with feedback: %s", failedStep, line))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m.amendBuildTask(failedStep, line)
 		}
 	}
 
@@ -1340,6 +1399,100 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 
 	// Execute the first idle staged task.
 	return m.handleBuildRun(0)
+}
+
+// handleHotfixCmd implements the $hot urgent hotfix workflow in /build mode.
+//
+// Flow:
+//  1. Stash the current build task queue to .izen/stashed_plan.json (if non-empty).
+//  2. Clear the active queue.
+//  3. Synthesize a single ad-hoc FILE_MUTATE task with the user's prompt.
+//  4. Execute it immediately via handleBuildRun.
+//
+// After the hotfix task completes (success or failure), the buildResultMsg
+// handler in update.go restores the stashed plan deterministically in Go —
+// the LLM never sees the original plan state, preventing 7B context drift.
+func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		m.push(roleError, "usage: $hot <hotfix prompt> — e.g. $hot add a MIT LICENSE file")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+
+	// Guard: must be in /build mode.
+	if m.resolver.Current() != modes.ModeBuild {
+		m.push(roleError, "$hot is only available in /build mode")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+
+	// Stage 1: Stash the current plan if tasks exist.
+	hasTasks := len(m.sess.CurrentTasks) > 0
+	if hasTasks {
+		if err := m.stashPlan(); err != nil {
+			m.push(roleError, fmt.Sprintf("[HOTFIX] Failed to stash current plan: %v", err))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+	}
+
+	// Stage 2: Clear the active execution queue.
+	m.sess.ClearTasks()
+
+	// Stage 3: Set the hotfix flag so buildResultMsg knows to restore.
+	m.hotfixActive = true
+
+	// Stage 4: Create a single ad-hoc FILE_MUTATE task.
+	m.push(roleStatus, fmt.Sprintf("[HOTFIX] Urgent hotfix: %s", prompt))
+
+	hotfixTask := plan.Task{
+		StepNum:     0,
+		Status:      "idle",
+		Type:        "FILE_MUTATE",
+		Target:      "workspace",
+		Description: prompt,
+	}
+	tasks := []plan.Task{hotfixTask}
+	m.sess.StageTaskList(&tasks)
+	_ = m.sess.Save()
+
+	// Stage 5: Execute immediately. The buildResultMsg handler will restore
+	// the stashed plan when this hotfix task completes.
+	return m.handleBuildRun(0)
+}
+
+// findFailedBuildTask returns the step number of the first task in the build
+// queue whose status is "failed" or "stalled". Returns 0 if no such task exists.
+func (m *model) findFailedBuildTask() int {
+	for _, t := range m.sess.CurrentTasks {
+		if t.Status == "failed" || t.Status == "stalled" {
+			return t.StepNum
+		}
+	}
+	return 0
+}
+
+// amendBuildTask resets a failed/stalled task to "idle", appends the user's
+// feedback to its description, saves the updated task list, and re-executes
+// the task with the amendment as additional context. This replaces the old
+// behavior of stubbornly re-running the exact same failed command with no
+// opportunity for the user to provide corrective input.
+func (m *model) amendBuildTask(stepNum int, feedback string) tea.Cmd {
+	tasks := m.sess.CurrentTasks
+	for i := range tasks {
+		if tasks[i].StepNum == stepNum {
+			tasks[i].Status = "idle"
+			tasks[i].Description = tasks[i].Description + " | AMENDMENT: " + feedback
+			break
+		}
+	}
+	m.sess.StageTaskList(&tasks)
+	_ = m.sess.Save()
+	return m.handleBuildRun(stepNum)
 }
 
 // runBuildShellExec executes a SHELL_EXEC build task directly via the OS shell
@@ -2530,6 +2683,11 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 		rest := strings.TrimSpace(strings.TrimPrefix(action, "fix"))
 		cmd = m.runFixCmd(rest)
 
+	case mode == modes.ModeBuild && (strings.HasPrefix(action, "hot ") || action == "hot"):
+		rest := strings.TrimSpace(strings.TrimPrefix(action, "hot"))
+		// handleHotfixCmd handles its own state and returns an appropriate cmd.
+		cmd = m.handleHotfixCmd(rest)
+
 	default:
 		switch mode {
 		case modes.ModeReview:
@@ -2537,7 +2695,7 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 		case modes.ModeInvestigate:
 			m.push(roleError, fmt.Sprintf("unknown investigate action: $%s (use $env, $trace, $test, $diagnose, or $log)", action))
 		case modes.ModeBuild:
-			m.push(roleError, fmt.Sprintf("unknown build action: $%s (use $fix)", action))
+			m.push(roleError, fmt.Sprintf("unknown build action: $%s (use $fix or $hot <prompt>)", action))
 		default:
 			m.push(roleError, fmt.Sprintf("$ sub-commands not available in /%s mode", mode))
 		}

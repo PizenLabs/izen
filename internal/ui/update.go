@@ -560,6 +560,47 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Execution failed (exit %d).", msg.exitCode)))
 		}
 
+		// ── $hot HOTFIX: restore stashed plan AFTER hotfix ────────────
+		// The hotfix lifecycle is fully contained here:
+		//   1. Rollback any hotfix mutations on failure.
+		//   2. Restore the stashed plan deterministically (Go-level, no LLM).
+		//   3. Mark the pipeline PAUSED — no auto-advance, no stalled-marking.
+		//   4. Return early, cutting off all fall-through execution paths.
+		//
+		// This prevents the restored plan's pending tasks from being mistaken
+		// as the active pipeline's next steps (which would trigger automatic
+		// re-execution of previously rejected SHELL_EXEC tasks).
+		if m.hotfixActive {
+			// Rollback on failure (no-op if no transaction was started).
+			if msg.exitCode != 0 && m.execEng != nil {
+				if errs := m.execEng.RollbackTransaction(); len(errs) > 0 {
+					for _, err := range errs {
+						m.push(roleError, fmt.Sprintf("build rollback error: %v", err))
+					}
+				}
+			}
+
+			// Restore the stashed plan deterministically.
+			if stashedTasks, err := m.restorePlan(); err == nil {
+				if len(stashedTasks) > 0 {
+					m.sess.StageTaskList(&stashedTasks)
+					_ = m.sess.Save()
+				}
+			} else {
+				m.push(roleError, fmt.Sprintf("[HOTFIX] Failed to restore stashed plan: %v", err))
+			}
+			m.hotfixActive = false
+
+			// Pipeline is PAUSED — the restored plan is frozen until the
+			// user explicitly types "run" or provides feedback.
+			m.push(roleSystem, infoStyle.Render("[HOTFIX] Stashed plan restored successfully. Pipeline PAUSED."))
+
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+
 		// ── FIX 2: Freeze state machine on task failure ───────────────
 		// If a step fails, the overall plan status must be STALLED. It is
 		// strictly forbidden to advance the internal task index pointer.
@@ -611,6 +652,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// After a SHELL_EXEC step finishes successfully, advance to the
 		// next idle task so the build queue makes progress automatically.
+		// When a $hot hotfix succeeds, the RESTORED plan is checked for
+		// remaining work — the original execution flow resumes seamlessly.
 		hasNext := false
 		for _, t := range m.sess.CurrentTasks {
 			if t.Status == "idle" || t.Status == "processing" {

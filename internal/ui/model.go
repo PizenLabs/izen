@@ -710,6 +710,11 @@ type model struct {
 	// build failure during verification. Reset on mode entry and clear.
 	buildRecoveryCount int
 
+	// hotfixActive tracks whether we are executing a $hot urgent hotfix task.
+	// When true, the build result handler will restore the stashed plan from
+	// .izen/stashed_plan.json after the hotfix completes.
+	hotfixActive bool
+
 	// modeChangeAuthorized is set true ONLY when the user explicitly types a
 	// mode-switch command (/build, /plan, /mode build). Auto-transitions from
 	// the execution pipeline or investigate→build detection are blocked unless
