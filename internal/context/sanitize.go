@@ -31,6 +31,8 @@ var (
 // handoff content. It applies ONLY structural noise reduction:
 //   - strip ANSI escapes (display artifacts, never signal)
 //   - collapse 3+ blank lines to a single blank line
+//   - strip loose markdown code fences (```) that are NOT inside diagnostic blocks
+//   - strip // line comments and /* */ block comments that may leak from LLM output
 //
 // It deliberately does NOT drop per-line content. The previous implementation
 // stripped runtime/container log lines and collapsed stack frames, which
@@ -47,13 +49,84 @@ func SanitizeLedger(raw string) string {
 	// 1. Strip ANSI escapes (display artifacts, never signal).
 	clean := ansiRE.ReplaceAllString(raw, "")
 
-	// 2. Normalize whitespace only — preserve every diagnostic line. Collapse
+	// 2. Strip stray markdown code fences and // comments that could corrupt
+	//    downstream JSON parsing in /plan. These are not valid diagnostic signal
+	//    — they are LLM-generated structural contamination.
+	clean = stripJSONContamination(clean)
+
+	// 3. Normalize whitespace only — preserve every diagnostic line. Collapse
 	//    3+ blank lines to a single blank line so the payload stays compact
 	//    without losing structural content.
 	clean = dupBlankLineRE.ReplaceAllString(clean, "\n\n")
 	clean = strings.TrimSpace(clean)
 
 	return clean
+}
+
+// stripJSONContamination removes common LLM-generated text artifacts that
+// would break JSON parsing downstream: markdown code fences, // line comments,
+// and /* */ block comments.
+func stripJSONContamination(s string) string {
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	inBlockComment := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Strip stray markdown code fence lines.
+		if trimmed == "```" || trimmed == "```json" || trimmed == "```json\n" ||
+			strings.HasPrefix(trimmed, "```") && len(trimmed) <= 10 {
+			continue
+		}
+
+		// Strip // comment-only lines.
+		if strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+
+		// Track /* */ block comments spanning multiple lines.
+		if strings.Contains(trimmed, "/*") {
+			if strings.Contains(trimmed, "*/") {
+				before := ""
+				after := ""
+				ci := strings.Index(trimmed, "/*")
+				if ci > 0 {
+					before = strings.TrimSpace(trimmed[:ci])
+				}
+				ciEnd := strings.LastIndex(trimmed, "*/")
+				if ciEnd+2 < len(trimmed) {
+					after = strings.TrimSpace(trimmed[ciEnd+2:])
+				}
+				trimmed = strings.TrimSpace(before + " " + after)
+				if trimmed == "" {
+					continue
+				}
+				out = append(out, trimmed)
+				continue
+			}
+			// Block comment starts — keep any text before /*.
+			ci := strings.Index(trimmed, "/*")
+			if ci > 0 {
+				out = append(out, strings.TrimSpace(trimmed[:ci]))
+			}
+			inBlockComment = true
+			continue
+		}
+		if inBlockComment {
+			if strings.Contains(trimmed, "*/") {
+				ci := strings.LastIndex(trimmed, "*/")
+				after := strings.TrimSpace(trimmed[ci+2:])
+				if after != "" {
+					out = append(out, after)
+				}
+				inBlockComment = false
+			}
+			continue
+		}
+
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
 
 // SanitizeLedgerPreserve is the canonical sanitizer for the typed handoff

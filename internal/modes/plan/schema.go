@@ -32,14 +32,18 @@ type JSONPlanValidationResult struct {
 }
 
 func ParseJSONPlan(content string) *JSONPlanValidationResult {
-	content = stripCodeFences(content)
+	content = sanitizeJSONContent(content)
 	content = strings.TrimSpace(content)
 
 	var plan PlanOutput
 	if err := json.Unmarshal([]byte(content), &plan); err != nil {
+		rawPreview := content
+		if len(rawPreview) > 120 {
+			rawPreview = rawPreview[:120]
+		}
 		return &JSONPlanValidationResult{
 			Valid: false,
-			Error: fmt.Sprintf("JSON parse error: %v", err),
+			Error: fmt.Sprintf("JSON parse error: %v (content preview: %q)", err, rawPreview),
 		}
 	}
 
@@ -112,7 +116,38 @@ func mapStrategyToType(strategy string) string {
 	}
 }
 
-func stripCodeFences(content string) string {
+// sanitizeJSONContent strips everything that is not valid JSON from an LLM
+// response before passing it to json.Unmarshal. It handles:
+//   - Markdown code fences (```json, ```)
+//   - // line comments before, after, or within the JSON structure
+//   - /* */ block comments
+//   - Leading/trailing non-JSON text before the first { or after the last }
+//   - Trailing // comments on JSON lines
+//
+// This is the critical sanitization gate that prevents LLM-generated
+// structural noise from crashing the /plan parser.
+func sanitizeJSONContent(content string) string {
+	content = strings.TrimSpace(content)
+
+	// 1. Strip markdown code fences (handle nested fences too).
+	for strings.HasPrefix(content, "```") {
+		firstNewline := strings.Index(content, "\n")
+		if firstNewline != -1 {
+			content = content[firstNewline+1:]
+		} else {
+			break
+		}
+		content = strings.TrimSpace(content)
+	}
+	for strings.HasSuffix(content, "```") {
+		lastBackticks := strings.LastIndex(content, "```")
+		if lastBackticks != -1 {
+			content = strings.TrimSpace(content[:lastBackticks])
+		} else {
+			break
+		}
+	}
+	// Repeat once more for nested fences (e.g., ```json ``` ```).
 	content = strings.TrimSpace(content)
 	if strings.HasPrefix(content, "```") {
 		firstNewline := strings.Index(content, "\n")
@@ -120,30 +155,152 @@ func stripCodeFences(content string) string {
 			content = content[firstNewline+1:]
 		}
 	}
+	content = strings.TrimSpace(content)
 	if strings.HasSuffix(content, "```") {
 		lastBackticks := strings.LastIndex(content, "```")
 		if lastBackticks != -1 {
-			content = content[:lastBackticks]
+			content = strings.TrimSpace(content[:lastBackticks])
 		}
 	}
 	content = strings.TrimSpace(content)
-	if strings.HasPrefix(content, "```") {
-		firstNewline := strings.Index(content, "\n")
-		if firstNewline != -1 {
-			content = content[firstNewline+1:]
+
+	// 2. Strip leading // line comments (each line starting with // before {).
+	lines := strings.Split(content, "\n")
+	cleaned := make([]string, 0, len(lines))
+	inBlockComment := false
+	foundJSON := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Track /* */ block comments.
+		if idxOpen := strings.Index(trimmed, "/*"); idxOpen >= 0 {
+			inBlockComment = true
+			// If the block comment ends on the same line, strip just the comment.
+			if idxClose := strings.LastIndex(trimmed, "*/"); idxClose >= idxOpen+2 {
+				before := strings.TrimSpace(trimmed[:idxOpen])
+				after := strings.TrimSpace(trimmed[idxClose+2:])
+				trimmed = strings.TrimSpace(before + " " + after)
+				inBlockComment = false
+			} else {
+				// Block comment started — skip the /* portion.
+				trimmed = strings.TrimSpace(trimmed[:idxOpen])
+			}
+		}
+		if inBlockComment {
+			if idxClose := strings.LastIndex(trimmed, "*/"); idxClose >= 0 {
+				trimmed = strings.TrimSpace(trimmed[idxClose+2:])
+				inBlockComment = false
+			} else {
+				continue
+			}
+		}
+
+		// Once we've seen a JSON structural character, keep everything (except
+		// inline // comments within JSON string values).
+		if !foundJSON {
+			if trimmed == "" || strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+				foundJSON = true
+			}
+		}
+
+		// Strip trailing // comments on JSON lines (but be careful not to
+		// strip // inside string values).
+		if foundJSON && strings.Contains(trimmed, "//") {
+			trimmed = stripTrailingComment(trimmed)
+		}
+
+		cleaned = append(cleaned, trimmed)
+	}
+	content = strings.Join(cleaned, "\n")
+	content = strings.TrimSpace(content)
+
+	// 3. If content still has no JSON prefix, do a last-resort scan for the
+	// first { or [ and grab everything through the matching closing bracket.
+	if !strings.HasPrefix(content, "{") && !strings.HasPrefix(content, "[") {
+		content = extractJSONObject(content)
+	}
+
+	return content
+}
+
+// stripTrailingComment removes a trailing // comment from a JSON line while
+// preserving // that appears inside a quoted JSON string value.
+func stripTrailingComment(line string) string {
+	inString := false
+	escaped := false
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inString = !inString
+			continue
+		}
+		if !inString && ch == '/' && i+1 < len(line) && line[i+1] == '/' {
+			return strings.TrimSpace(line[:i])
 		}
 	}
-	if strings.HasSuffix(content, "```") {
-		lastBackticks := strings.LastIndex(content, "```")
-		if lastBackticks != -1 {
-			content = content[:lastBackticks]
+	return line
+}
+
+// extractJSONObject scans content for the first { or [ and returns the
+// balanced JSON substring through the matching closing bracket.
+func extractJSONObject(content string) string {
+	content = strings.TrimSpace(content)
+	start := strings.Index(content, "{")
+	if start == -1 {
+		start = strings.Index(content, "[")
+	}
+	if start == -1 {
+		return content
+	}
+	content = content[start:]
+
+	depth := 0
+	inStr := false
+	esc := false
+	for i := 0; i < len(content); i++ {
+		ch := content[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if ch == '\\' {
+			esc = true
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		if ch == '{' || ch == '[' {
+			depth++
+			continue
+		}
+		if ch == '}' || ch == ']' {
+			depth--
+			if depth == 0 {
+				return content[:i+1]
+			}
 		}
 	}
-	return strings.TrimSpace(content)
+	return content
 }
 
 func SchemaJSONInstruction() string {
-	return `You MUST output ONLY a single JSON object with this EXACT schema:
+	return `You MUST output ONLY a single raw JSON object — NO markdown fences, NO // comments, NO extra text — with this EXACT schema:
 
 {
   "context_anchor": {
@@ -162,7 +319,7 @@ func SchemaJSONInstruction() string {
 }
 
 RULES:
-1. Output ONLY the JSON object. No introductory text, no markdown, no code fences.
+1. Output ONLY the JSON object. No introductory text, no markdown, no code fences, no // comments.
 2. context_anchor.source must identify where this plan originated.
 3. context_anchor.target_packages lists all packages affected.
 4. architectural_strategy is a single concise sentence.

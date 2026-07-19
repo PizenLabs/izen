@@ -207,14 +207,18 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			return retry, nil
 		}
 		// If the retry also failed, surface the original model output for context.
-		return nil, fmt.Errorf("plan engine: no valid tasks found (provider returned non-JSON: %s)", truncateForLog(resp.Content))
+		return nil, fmt.Errorf("plan engine: no valid tasks found (provider returned non-JSON: %s). "+
+			"Re-run /investigate to regenerate the diagnostic payload as strict JSON", truncateForLog(resp.Content))
 	}
 
 	jsonErr := jsonResult.Error
 	if jsonErr == "" {
 		jsonErr = fmt.Sprintf("empty error field (provider response: %s)", truncateForLog(resp.Content))
 	}
-	return nil, fmt.Errorf("plan engine: no valid tasks found in provider response (JSON parse error: %s)", jsonErr)
+	return nil, fmt.Errorf("plan engine: no valid tasks found in provider response (%s). "+
+		"The model returned content that is not valid JSON. "+
+		"Run /investigate again to ensure the diagnostic payload is serialized as raw JSON. "+
+		"First 200 chars of response: %s", jsonErr, truncateForLog(resp.Content))
 }
 
 // filterValidTasks filters a task slice to only tasks with valid, non-empty

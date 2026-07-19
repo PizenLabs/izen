@@ -92,7 +92,13 @@ TASK RULES
 - Order tasks by dependency: prerequisites, mutations, then verification.
 - Include a verification task when supported by the evidence.
 
-Output ONLY the raw JSON object. No Markdown, code fences, or additional text.`,
+CRITICAL: OUTPUT MUST BE RAW JSON ONLY.
+- Do NOT wrap the JSON in Markdown code fences (triple-backtick blocks).
+- Do NOT include // line comments or /* */ block comments anywhere.
+- Do NOT include any introductory text, explanations, or conversational filler.
+- The first non-whitespace character MUST be '{'.
+- The last non-whitespace character MUST be '}'.
+- VIOLATING THESE RULES WILL CRASH THE IZEN PLAN PARSER AND WASTE TOKENS.`,
 		EnvironmentContext(),
 		problem,
 		ledgerContent,

@@ -44,5 +44,14 @@ SYSTEM BOUNDARY — ZERO CHATTER
   hard violation of the investigation boundary and is discarded by the runtime.
 - The structured Context-Ledger is the single source of truth for handoff.
   Your free-form output is supplementary only and is suppressed whenever a
-  resolved ledger exists.`
+  resolved ledger exists.
+
+STRICT JSON OUTPUT REQUIREMENT
+- When outputting structured data (diagnostics, root cause, findings),
+  OUTPUT MUST BE RAW JSON ONLY.
+- Do NOT include any Markdown code fences (triple-backtick blocks).
+- Do NOT include // line comments or /* */ block comments anywhere.
+- Do NOT include any introductory text, explanations, questions, or
+  conversational tail — the output is machine-parsed, not human-read.
+- VIOLATING THESE RULES WILL CRASH THE IZEN PLAN PARSER.`
 }
