@@ -65,6 +65,65 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// ── Awaiting approval ────────────────────────────────────────────
 	if m.state == StateAwaitingApproval {
+		// ── $hot HOTFIX APPROVAL GATE (Bug Fix 2) ──────────────────
+		// The hotfix patch was generated but NOT applied. The developer must
+		// explicitly authorize (y) or reject (n). On approval the patch is
+		// written to disk and the stashed plan restored; on rejection the
+		// hotfix aborts cleanly to PAUSED with zero disk mutation.
+		if m.pendingHotfixTask != nil && m.pendingHotfixPatch != nil {
+			switch {
+			case msg.String() == "y" || msg.String() == "Y":
+				task := m.pendingHotfixTask
+				patch := m.pendingHotfixPatch
+				m.pendingHotfixTask = nil
+				m.pendingHotfixPatch = nil
+				m.pendingProposals = nil
+				m.state = StateChat
+				m.ti.Focus()
+				m.recalcViewportHeight()
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				m.push(roleSystem, infoStyle.Render(
+					fmt.Sprintf("  ✓ Approved — applying hotfix patch to %s...", patch.File)))
+
+				// Apply the pre-generated patch through the execution engine
+				// (shadow backups + mutation guardrails). The buildResultMsg
+				// handler then restores the stashed plan and PAUSEs the pipeline.
+				return m, tea.Batch(
+					func() tea.Msg { return agentStartMsg{label: "hotfix apply"} },
+					m.applyHotfixPatch(task, patch),
+					m.spinnerTickCmd(),
+				)
+
+			case msg.String() == "n" || msg.String() == "N" ||
+				msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
+				// ── REJECT: abort cleanly, touch no files ──────────
+				rejectedPath := m.pendingHotfixTask.Target
+				m.pendingHotfixTask = nil
+				m.pendingHotfixPatch = nil
+				m.pendingProposals = nil
+				m.state = StateChat
+				m.ti.Focus()
+				m.recalcViewportHeight()
+				m.push(roleSystem, infoStyle.Render(
+					"  ✗ Rejected — hotfix aborted. No files were modified."))
+				m.push(roleError, fmt.Sprintf(
+					"[HOTFIX] Developer rejected patch to %s.",
+					rejectedPath))
+
+				// Restore the stashed plan so the pipeline returns to PAUSED.
+				m.hotfixActive = false
+				if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
+					m.sess.StageTaskList(&stashedTasks)
+					_ = m.sess.Save()
+				}
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, nil
+			}
+			return m, nil
+		}
+
 		// ── Build approval (SHELL_EXEC permission box) ──────────────
 		if m.pendingBuildApproval && m.pendingBuildTask != nil {
 			task := m.pendingBuildTask

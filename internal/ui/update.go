@@ -219,6 +219,19 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastAgentActivity = time.Now()
 		return m, nil
 
+	case hotfixProgressMsg:
+		// Stream a $hot lifecycle log line to the terminal so the developer
+		// sees active progress while the LLM generates the patch. Only accept
+		// lines while the hotfix is still generating (the proposal/error
+		// message clears these flags), preventing stale trailing logs from
+		// polluting the approval view.
+		if m.agentRunning && m.agentLabel == "hotfix" {
+			m.push(roleActivity, msg.Line)
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+		}
+		return m, nil
+
 	case agentDoneMsg:
 		m.agentRunning = false
 		m.reviewRunning = false
@@ -516,6 +529,71 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
 		return m, flush
+
+	case hotfixProposalMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
+
+		// ── HOTFIX PROPOSAL FAILURE ───────────────────────────────────
+		// Patch generation failed: surface the error, abort the hotfix, and
+		// restore the stashed plan so the pipeline returns to PAUSED cleanly.
+		if msg.Err != nil {
+			m.push(roleError, "[HOTFIX] Patch generation failed: "+msg.Err.Error())
+			m.hotfixActive = false
+			if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
+				m.sess.StageTaskList(&stashedTasks)
+				_ = m.sess.Save()
+			}
+			m.push(roleSystem, infoStyle.Render("[HOTFIX] Pipeline PAUSED. No files were modified."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m, m.flushPendingRecords()
+		}
+
+		// ── CRITICAL: freeze and request authorization (Bug Fix 2) ─────
+		// Store the synthesized patch + rendered diff proposal. Enter the
+		// StateAwaitingApproval approval gate so the developer can inspect the
+		// code diff and explicitly approve (y) or reject (n) BEFORE any change
+		// is written to disk.
+		m.pendingHotfixTask = msg.Task
+		m.pendingHotfixPatch = msg.Patch
+
+		// Render the diff through the standard proposal dock (MutationRenderer),
+		// exactly like a normal /build file-mutation proposal.
+		target := msg.Task.Target
+		proposal := SemanticProposal{
+			ID:   msg.Patch.ID,
+			Diff: msg.Diff,
+			Target: SemanticTarget{
+				QualifiedName: target,
+				Module:        filepath.Dir(target),
+				Language:      langFromPath(target),
+			},
+			Expanded: true,
+		}
+		m.pendingProposals = []SemanticProposal{proposal}
+
+		// ── CLEAN TRANSITION TO PROPOSAL VIEW (Feature) ──────────────
+		// Emit the final lifecycle log then swap the pane into the
+		// MutationRenderer diff view. The spinner/transient progress lines are
+		// superseded by the explicit approval prompt below.
+		m.push(roleActivity, "  ⚙ Compiling unified diff schema...")
+
+		m.state = StateAwaitingApproval
+		m.ti.Blur()
+		m.recalcViewportHeight()
+
+		m.push(roleStatus, fmt.Sprintf(
+			"[HOTFIX APPROVAL] Proposed patch to %s", target))
+		m.push(roleSystem, infoStyle.Render(
+			"Review the code diff below. Apply this patch? (y/n): "))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, nil
 
 	case buildResultMsg:
 		m.agentRunning = false

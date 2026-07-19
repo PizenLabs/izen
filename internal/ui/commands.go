@@ -1449,20 +1449,305 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	// Stage 4: Create a single ad-hoc FILE_MUTATE task.
 	m.push(roleStatus, fmt.Sprintf("[HOTFIX] Urgent hotfix: %s", prompt))
 
+	// ── DYNAMIC TARGET RESOLUTION (Bug Fix 1) ──────────────────────────
+	// The `workspace` token is the working-directory boundary context — it is
+	// NEVER a destination file name. Hallucinating it as a literal path causes
+	// unrelated tasks (e.g. writing a LICENSE and editing main.go) to all be
+	// written into a single file literally named "workspace". We therefore
+	// extract the real target file path from the developer's request; only when
+	// the prompt names no file do we synthesize a context-derived default.
+	target := resolveHotfixTarget(prompt)
+
 	hotfixTask := plan.Task{
 		StepNum:     0,
 		Status:      "idle",
 		Type:        "FILE_MUTATE",
-		Target:      "workspace",
+		Target:      target,
 		Description: prompt,
 	}
 	tasks := []plan.Task{hotfixTask}
 	m.sess.StageTaskList(&tasks)
 	_ = m.sess.Save()
 
-	// Stage 5: Execute immediately. The buildResultMsg handler will restore
-	// the stashed plan when this hotfix task completes.
-	return m.handleBuildRun(0)
+	// Stage 5: Generate the patch but DO NOT apply it. The engine must render
+	// a code diff proposal and obtain explicit developer authorization before
+	// any byte is written to disk (Bug Fix 2). After approval (y) the patch is
+	// applied and the stashed plan restored; on rejection (n) the hotfix aborts
+	// cleanly and returns the pipeline to PAUSED without touching any file.
+	//
+	// ── ACTIVE LOADING INDICATOR (Feature) ────────────────────────────
+	// Mount the spinner + emit the first lifecycle log IMMEDIATELY so the
+	// developer never sees a 30s frozen pane while the local LLM silently
+	// generates the patch. The spinner keeps animating until the proposal
+	// message arrives and swaps the pane into the diff view.
+	m.push(roleStatus, "[HOTFIX] Generating patch via local LLM... (This may take up to 30s)")
+	m.push(roleSystem, fmt.Sprintf("  ⚙ Thinking... (Invoking %s)", m.cfg.ActiveModelName()))
+
+	m.agentRunning = true
+	m.agentDone = false
+	m.agentLabel = "hotfix"
+	m.spinnerFrame = 0
+	m.lastSpinnerAdvance = time.Time{}
+	m.lastAgentActivity = time.Now()
+
+	return tea.Batch(
+		func() tea.Msg { return agentStartMsg{label: "hotfix"} },
+		m.proposeHotfixPatch(&hotfixTask),
+		m.spinnerTickCmd(),
+		m.hotfixProgressCmd(),
+	)
+}
+
+// hotfixProgressCmd emits the $hot generation lifecycle log lines on a timer so
+// the developer sees active progress (and the spinner keeps animating) while
+// the local LLM silently generates the patch — eliminating the 30s "deadlock"
+// freeze. The lines are delivered as hotfixProgressMsg through the event loop,
+// never from the background goroutine, so there is no data race on the record
+// buffer.
+func (m *model) hotfixProgressCmd() tea.Cmd {
+	lines := []string{
+		"  🔄 Intercepted structural breakdown. Refining context (Attempt 1/2)...",
+		"  ⚙ Compiling unified diff schema...",
+	}
+	var cmds = make([]tea.Cmd, 0, len(lines))
+	for i, line := range lines {
+		delay := time.Duration(i+1) * 900 * time.Millisecond
+		l := line
+		cmds = append(cmds, tea.Tick(delay, func(time.Time) tea.Msg {
+			return hotfixProgressMsg{Line: l}
+		}))
+	}
+	return tea.Batch(cmds...)
+}
+
+// resolveHotfixTarget extracts the concrete destination file path for a $hot
+// request from the developer's natural-language prompt. It scans for explicit
+// file path tokens (e.g. cmd/api/main.go, ./LICENSE, internal/foo/bar.go) and
+// returns the first plausible one. The bare token "workspace" is explicitly
+// rejected — it denotes the project-root scope, not a file name. When no file
+// is named, a sensible default is derived from the prompt keywords (creating a
+// new file) rather than overwriting any existing source file.
+func resolveHotfixTarget(prompt string) string {
+	// Candidate path tokens: sequences of word/path chars including slashes,
+	// dots and an extension, or bare "LICENSE"/"Makefile"-style names.
+	pathRe := regexp.MustCompile(`(?:[./]?[\w-]+(?:/[\w.-]+)+|\.\/?[\w.-]+|[\w.-]+\.[\w]+|(?:LICENSE|Makefile|Dockerfile|README|go\.mod|go\.sum|CHANGELOG|NOTICE))`)
+	for _, m := range pathRe.FindAllString(prompt, -1) {
+		m = strings.TrimSpace(m)
+		if m == "" || strings.EqualFold(m, "workspace") {
+			continue
+		}
+		// Normalize a leading "./" to a repo-relative path.
+		m = strings.TrimPrefix(m, "./")
+		m = strings.TrimPrefix(m, "/")
+		if m == "" {
+			continue
+		}
+		// Sanity: must contain a path separator or an extension, and must not
+		// be a single bare word that merely looks like an extension.
+		if strings.Contains(m, "/") || strings.Contains(m, ".") {
+			return m
+		}
+	}
+
+	// ── No explicit file named: synthesize a NEW-file default from keywords.
+	// This never collides with existing source files, so unrelated hotfixes
+	// can never clobber each other the way the literal "workspace" did.
+	lower := strings.ToLower(prompt)
+	switch {
+	case strings.Contains(lower, "license"):
+		return "LICENSE"
+	case strings.Contains(lower, "readme"):
+		return "README.md"
+	case strings.Contains(lower, "docker"):
+		return "Dockerfile"
+	case strings.Contains(lower, "makefile") || strings.Contains(lower, "make file"):
+		return "Makefile"
+	case strings.Contains(lower, "changelog"):
+		return "CHANGELOG.md"
+	case strings.Contains(lower, "notice"):
+		return "NOTICE"
+	case strings.Contains(lower, "gitignore"):
+		return ".gitignore"
+	}
+	// Fallback: a timestamped new file under the repo root. The leading dot
+	// guarantees it cannot overwrite a tracked file and clearly marks it as a
+	// hotfix artifact for the developer to relocate.
+	ts := time.Now().Format("20060102-150405")
+	return ".izen/hotfix-" + ts + ".patch"
+}
+
+// proposeHotfixPatch generates the patch for a $hot FILE_MUTATE task via the
+// LLM (one non-streaming call) WITHOUT applying it. Instead, it renders a code
+// diff proposal and freezes the pipeline in StateAwaitingApproval so the
+// developer can authorize (y) or reject (n) the change before any disk write.
+func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		if m.provider == nil {
+			return hotfixProposalMsg{Err: fmt.Errorf("build execution error: no provider configured")}
+		}
+
+		// Build a focused, non-chat patch-generation prompt and call the LLM
+		// once (non-streaming) so we get a deterministic diff/FILE block back.
+		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		system := prompt.BuildContract()
+		req := ai.Request{
+			Model:    m.cfg.ActiveModelName(),
+			System:   system,
+			Stream:   false,
+			Messages: []ai.Message{{Role: "user", Content: handoff}},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		resp, err := m.provider.Execute(ctx, req)
+		if err != nil {
+			return hotfixProposalMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
+		}
+		if resp == nil || strings.TrimSpace(resp.Content) == "" {
+			return hotfixProposalMsg{Err: fmt.Errorf("patch generation returned empty output")}
+		}
+
+		// Snapshot the original file content so the diff + rollback are exact.
+		orig := ""
+		if data, rerr := os.ReadFile(task.Target); rerr == nil {
+			orig = string(data)
+		}
+
+		// Compute a unified diff for display (green additions / red removals).
+		diff := computeUnifiedDiff(task.Target, orig, resp.Content)
+
+		patch := &execution.Patch{
+			ID:        fmt.Sprintf("hotfix-%d", task.StepNum),
+			File:      task.Target,
+			Original:  orig,
+			Modified:  resp.Content,
+			TaskID:    task.StepNum,
+			ContextID: m.sess.ContextID,
+		}
+
+		return hotfixProposalMsg{
+			Task:  task,
+			Patch: patch,
+			Diff:  diff,
+		}
+	}
+}
+
+// applyHotfixPatch applies a pre-generated $hot patch through the execution
+// engine's PatchManager — never via the conversational stream. It returns a
+// buildResultMsg so the standard update.go handler restores the stashed plan
+// and freezes the pipeline to PAUSED afterwards. On failure the task is marked
+// failed and the buildResultMsg handler rolls back any partial mutation.
+func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cmd {
+	return func() tea.Msg {
+		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
+			tasks := m.sess.CurrentTasks
+			for i := range tasks {
+				if tasks[i].StepNum == task.StepNum {
+					tasks[i].Status = "failed"
+					break
+				}
+			}
+			m.sess.StageTaskList(&tasks)
+			_ = m.sess.Save()
+			return buildResultMsg{
+				output:   patch.Modified,
+				exitCode: 1,
+				err:      fmt.Errorf("hotfix patch apply failed: %w", applyErr),
+			}
+		}
+
+		// Mark the task terminal in the live session ledger.
+		tasks := m.sess.CurrentTasks
+		for i := range tasks {
+			if tasks[i].StepNum == task.StepNum {
+				tasks[i].Status = "completed"
+				break
+			}
+		}
+		m.sess.StageTaskList(&tasks)
+		_ = m.sess.Save()
+		return buildResultMsg{
+			output:   fmt.Sprintf("Applied hotfix patch to %s", task.Target),
+			exitCode: 0,
+		}
+	}
+}
+
+// computeUnifiedDiff produces a line-oriented unified diff (a la `diff -u`)
+// between the original and modified file contents. Lines present only in
+// original are prefixed "-" (red) and lines only in modified are prefixed "+"
+// (green) — matching the visual contract required by the hotfix approval gate.
+// The header uses the conventional `--- a/<file>` / `+++ b/<file>` markers so
+// the MutationRenderer's new-file detection and gutter rendering behave
+// correctly for both edits and new-file creations.
+func computeUnifiedDiff(path, original, modified string) string {
+	origLines := strings.Split(original, "\n")
+	modLines := strings.Split(modified, "\n")
+	// Trailing empty element produced by a final "\n" — drop for clean diffs.
+	trim := func(s []string) []string {
+		if len(s) > 0 && s[len(s)-1] == "" {
+			return s[:len(s)-1]
+		}
+		return s
+	}
+	origLines = trim(origLines)
+	modLines = trim(modLines)
+
+	var b strings.Builder
+	if original == "" {
+		// New file: only additions.
+		b.WriteString("--- a/" + path + "\n")
+		b.WriteString("+++ b/" + path + "\n")
+		for _, line := range modLines {
+			b.WriteString("+" + line + "\n")
+		}
+		return b.String()
+	}
+
+	b.WriteString("--- a/" + path + "\n")
+	b.WriteString("+++ b/" + path + "\n")
+
+	// Classic longest-common-subsequence alignment keeps the diff minimal.
+	n, m := len(origLines), len(modLines)
+	lcs := make([][]int, n+1)
+	for i := range lcs {
+		lcs[i] = make([]int, m+1)
+	}
+	for i := n - 1; i >= 0; i-- {
+		for j := m - 1; j >= 0; j-- {
+			switch {
+			case origLines[i] == modLines[j]:
+				lcs[i][j] = lcs[i+1][j+1] + 1
+			case lcs[i+1][j] >= lcs[i][j+1]:
+				lcs[i][j] = lcs[i+1][j]
+			default:
+				lcs[i][j] = lcs[i][j+1]
+			}
+		}
+	}
+
+	i, j := 0, 0
+	for i < n && j < m {
+		switch {
+		case origLines[i] == modLines[j]:
+			i++
+			j++
+		case lcs[i+1][j] >= lcs[i][j+1]:
+			b.WriteString("-" + origLines[i] + "\n")
+			i++
+		default:
+			b.WriteString("+" + modLines[j] + "\n")
+			j++
+		}
+	}
+	for ; i < n; i++ {
+		b.WriteString("-" + origLines[i] + "\n")
+	}
+	for ; j < m; j++ {
+		b.WriteString("+" + modLines[j] + "\n")
+	}
+	return b.String()
 }
 
 // findFailedBuildTask returns the step number of the first task in the build

@@ -57,10 +57,19 @@ const MaxLedgerChars = 4000
 
 // compilationErrorMarkers identify ledger content that can be resolved purely
 // through environment/dependency setup rather than a deep architectural plan.
+// The list is deliberately broad and includes truncated prefixes so that
+// partially-clipped terminal output (e.g. "no required modul…") still trips the
+// detector instead of forcing a manual /investigate re-run.
 var compilationErrorMarkers = []string{
 	"no required module",
 	"no required module provides package",
+	// Fuzzy/truncated prefixes — the UI may slice the ledger mid-word, so we
+	// match the surviving fragment rather than the full phrase.
+	"no required modul",
 	"no required mod",
+	"missing Go module",
+	"missing module",
+	"finding module for package",
 	"cannot find module",
 	"missing go.sum entry",
 	"go: go.mod",
@@ -230,12 +239,75 @@ func CoreErrorLine(ledger string) string {
 // IsCompilationOrDependencyError reports whether the ledger contains only
 // compilation / dependency / environment errors that can be resolved via
 // module/setup commands rather than a deep architectural plan.
+// goFileDependencyRe matches a compiler coordinate (e.g. `main.go:7:5:`) whose
+// message begins with a dependency/import error fragment. This catches both the
+// full phrase and the truncated "no required modul…" variant that the UI may
+// have clipped from the ledger.
+var goFileDependencyRe = regexp.MustCompile(`[^\s:]+\.go:\d+:\d+:\s*no required`)
+
+// goFileParseRe matches any *.go compiler coordinate that is followed by a
+// parsing or import failure indicator, signalling a module/environment
+// discrepancy rather than a pure source-logic bug.
+var goFileParseRe = regexp.MustCompile(`[^\s:]+\.go:\d+:\d+:`)
+
+// parseErrorIndicators are the secondary signals that, when paired with a *.go
+// coordinate, imply a module/import resolution failure.
+var parseErrorIndicators = []string{
+	"no required",
+	"could not import",
+	"missing module",
+	"cannot find module",
+	"undefined:",
+	"import",
+	"package ",
+	"build failed",
+	"compilation failed",
+}
+
+// hasGoFileParseError reports whether the content contains a *.go compile
+// coordinate paired with a parsing/import error indicator — i.e. evidence of a
+// raw source-file compile failure that implies a module/environment issue.
+func hasGoFileParseError(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return false
+	}
+	for _, line := range strings.Split(trimmed, "\n") {
+		if goFileParseRe.MatchString(line) && containsAny(line, parseErrorIndicators) {
+			return true
+		}
+	}
+	return false
+}
+
+// content describes a build/dependency blocker that can be resolved via module
+// tooling (go mod tidy / go get) rather than a deep architectural plan.
+//
+// Detection is intentionally fuzzy: it accepts strict phrases, truncated
+// prefixes, the `*.go:N:M: no required` coordinate regex, and any *.go compile
+// coordinate combined with a parsing/import error indicator, so partially
+// clipped terminal output still trips the detector.
 func IsCompilationOrDependencyError(ledger string) bool {
 	trimmed := strings.TrimSpace(ledger)
 	if trimmed == "" {
 		return false
 	}
-	return containsAny(trimmed, compilationErrorMarkers)
+	if containsAny(trimmed, compilationErrorMarkers) {
+		return true
+	}
+	// Coordinate form: `main.go:7:5: no required module provides package ...`
+	if goFileDependencyRe.MatchString(trimmed) {
+		return true
+	}
+	// Any *.go coordinate paired with an import/parse indicator.
+	if goFileParseRe.MatchString(trimmed) {
+		for _, line := range strings.Split(trimmed, "\n") {
+			if goFileParseRe.MatchString(line) && containsAny(line, parseErrorIndicators) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ExtractConclusionFromLedger scans a formatted ledger string (as produced by

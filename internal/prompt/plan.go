@@ -63,6 +63,16 @@ PROTOCOL
 4. End with a verification task when applicable.
 5. Output ONLY the JSON schema — zero explanation, zero commentary.
 
+	GO DEPENDENCY FACTORY TEMPLATE (STRICT)
+For missing Go package/module errors ("no required module provides package"):
+  PERMITTED: SHELL_EXEC with EXACTLY: go get <exact_package_path>
+  FORBIDDEN in command string:
+    - File names: go.mod, go.sum
+    - Relative paths: any path/to/file.go or ./path/ patterns
+    - Generalized text: prose, descriptions, or natural language
+    - brew, docker, apt, or any OS-level command
+  The command MUST be a single, runnable shell invocation — not a file path.
+
 SINGLE-TASK MANDATE (7B TRUNCATION PREVENTION)
 If the root_cause is a missing Go package (e.g. "no required module provides package"),
 emit EXACTLY ONE task: SHELL_EXEC with go get <exact_package_path>.
@@ -74,6 +84,9 @@ ANTI-HALLUCINATION (LOCAL 7B MODELS)
 - Do NOT add brew install go, brew install docker, or any OS-level setup.
 - Never propose installing Go, Docker, or compilers — they already run.
 - Keep tasks strictly at the code/dependency boundary.
+- CRITICAL: the SHELL_EXEC target must be a real command (e.g. "go get github.com/foo/bar"),
+  NOT a file path or placeholder text. Commands like "relative/path/to/go.mod",
+  "./go.mod", or bare "go.mod" as the target are INVALID and will be rejected.
 
 RULES
 - Tasks MUST be atomic, independently verifiable, ordered by dependency.
@@ -94,7 +107,8 @@ func BuildPlanJSONPrompt(problem, ledgerContent, conclusion string) string {
 CONCLUSION FROM LEDGER (authoritative — do not override)
 %s
 
-CRITICAL: Map this conclusion directly to a SHELL_EXEC task if dependency-related.`, conclusion)
+CRITICAL: Map this conclusion directly to a SHELL_EXEC task if dependency-related.
+The SHELL_EXEC target MUST be a valid command (e.g. "go get <pkg>"), not a file path or placeholder.`, conclusion)
 	}
 
 	return fmt.Sprintf(`You are the IZEN Plan Mapper. Read the /investigate Forensic Ledger below and produce a JSON plan.
@@ -109,6 +123,8 @@ FORENSIC LEDGER:
 DIRECTIVES:
 - Map root_cause → Task 1 (SHELL_EXEC for dep issues, FILE_MUTATE for code bugs).
 - If root_cause is a missing Go module, emit EXACTLY: {"task_id":1,"strategy":"SHELL_EXEC","target":"go get <pkg>","description":"install missing dependency"}.
+- FORBIDDEN as SHELL_EXEC target: file paths (go.mod, go.sum, ./relative/path), generalized text, or prose.
+  The target field MUST be a runnable shell command starting with a binary name.
 - Do NOT add brew, docker, or environment setup tasks.
 - Total JSON under 300 tokens.
 
@@ -144,6 +160,8 @@ OUTPUT — raw task blocks only, no prose:
 
 RULES:
 - If a missing Go dependency is the root cause, output EXACTLY ONE SHELL_EXEC task.
+- The SHELL_EXEC command MUST be a runnable invocation (e.g. "go get <pkg>"), NOT a file path.
+- FORBIDDEN as SHELL_EXEC target: "go.mod", "go.sum", relative paths, or any text that is not a valid command.
 - No brew, docker, or OS-level environment tasks.
 - Keep the plan strictly at the code/dependency boundary.`,
 		contextStr,
