@@ -134,6 +134,16 @@ type planResultMsg struct {
 type agentStartMsg struct{ label string }
 type agentDoneMsg struct{}
 
+// promptHandoffMsg carries the result of a $prompt synthesis in /ask mode.
+// The content field holds the full markdown of the IZEN INTELLIGENT PROMPT
+// HANDOFF PACK. The actions slice carries the FollowUp navigation chip data
+// to be rendered as an interactive Action component at the terminal footer.
+type promptHandoffMsg struct {
+	content string
+	actions []Action
+	err     error
+}
+
 type commitGeneratedMsg struct {
 	subject string
 	body    string

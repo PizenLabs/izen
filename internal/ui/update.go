@@ -799,6 +799,37 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.handleBlueprintReady(msg)
 
+	case promptHandoffMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
+		if msg.err != nil {
+			m.push(roleError, "prompt handoff error: "+msg.err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+		m.push(roleAI, msg.content)
+		// Expose the FollowUp action chip as an interactive component at the
+		// terminal footer, not as raw text in the markdown body.
+		if len(msg.actions) > 0 {
+			m.currentResult = &Result{Actions: msg.actions}
+		}
+		// Persist the handoff pack into the session.ContextLedger so it
+		// survives CleanContextTransitions and is available to /investigate
+		// (and downstream modes) as structured diagnostic context.
+		if msg.content != "" {
+			m.bridgeAskHandoffToLedger(msg.content)
+		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		flush := m.flushPendingRecords()
+		return m, flush
+
 	case fixResultMsg:
 		m.agentRunning = false
 		m.reviewRunning = false

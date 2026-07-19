@@ -14,7 +14,7 @@ import (
 type askView struct{}
 
 func (askView) BuildWorkspace(m *model) Workspace {
-	ws := m.assembleScreen(nil)
+	ws := m.assembleScreen(m.currentResultActions())
 	ws.Header = "ask · explain, inspect, understand"
 	return ws
 }

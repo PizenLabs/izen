@@ -190,6 +190,27 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return m.runReviewTestComposite()
 	}
 
+	// ── $prompt in /ask — STATELESS SENIOR ARCHITECT REFINER ────────────
+	// Evaluated BEFORE the generic $ handler to guarantee complete decoupling
+	// from the normal chat streaming path. Takes a raw text summary from the
+	// developer ($prompt <raw_idea>) and passes it directly to the
+	// Strict Senior Architect persona — no session history aggregation, no
+	// JSON wrapping. MUST never touch handleMessageContent or streamCmd.
+	if m.resolver.Current() == modes.ModeAsk && (line == "$prompt" || strings.HasPrefix(line, "$prompt ")) {
+		m.cancelStaleAgentOps()
+		if line == "$prompt" {
+			m.push(roleError, "[Usage] $prompt <your raw architectural idea or description>")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+		rawInput := strings.TrimSpace(line[8:])
+		m.push(roleSystem, infoStyle.Render("Refining architectural idea through Senior Architect analysis..."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m.runAskPromptHandoffCmd(rawInput)
+	}
+
 	// $ sub-command prefix — delegates to handleReviewDollar for routing.
 	if strings.HasPrefix(line, "$") {
 		// ANTI-DEADLOCK: unconditionally sanitize stale execution flags
@@ -581,6 +602,16 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
+
+		// ── ISOLATION BARRIER: Normal /ask chat vs $prompt handoff ────────
+		// If the user is typing a normal chat message in /ask mode, clear any
+		// residual action chip from a previous $prompt turn so it does not
+		// render alongside the stream response. The lightweight streaming path
+		// uses AskContract() — never AskPromptHandoffContract() — ensuring
+		// zero system-prompt contamination between the two workflows.
+		if m.resolver.Current() == modes.ModeAsk {
+			m.currentResult = nil
+		}
 
 		if m.resolver.Current() == modes.ModeAsk && len(refFiles) == 0 {
 			result := retrieval.RouteAsk(line, m.gitEng)
@@ -1127,6 +1158,9 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /provider <name>  switch AI provider (ollama|anthropic|openai|gemini)"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
+		m.push(roleSystem, labelBoldStyle.Render("ask sub-commands ($)"))
+		m.push(roleSystem, infoStyle.Render("  $prompt <idea>  refine architectural idea via Senior Architect analysis"))
+		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("review sub-commands ($)"))
 		m.push(roleSystem, infoStyle.Render("  $test [path]  run tests (safety-gated for large repos)"))
 		m.push(roleSystem, infoStyle.Render("  $run  [path]  run go build (safety-gated for large repos)"))
@@ -1301,8 +1335,10 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 	ledger := session.NewContextLedger(targetMode)
 	if m.sess != nil {
 		ledger.TargetFile = m.sess.ContextLabel()
-		// Preserve investigation diagnostics for /plan mode
-		if targetMode == modes.ModePlan && prevDiagnostics != "" {
+		// Preserve investigation diagnostics and ask handoff payloads for
+		// /plan and /investigate modes so the forensic engine can extract
+		// its baseline context without manual copy-pasting.
+		if prevDiagnostics != "" && (targetMode == modes.ModePlan || targetMode == modes.ModeInvestigate) {
 			ledger.Diagnostics = prevDiagnostics
 		}
 		ledger.Tasks = nil
@@ -3331,6 +3367,80 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 			m.currentResult = failureResult(diagnosis)
 
 			return agentDoneMsg{}
+		},
+	)
+}
+
+// runAskPromptHandoffCmd passes the user's raw architectural idea directly to
+// the Strict Senior Architect persona for refinement, pruning, and tradeoff
+// analysis. No session history aggregation — the raw input IS the payload.
+//
+// ISOLATION CONTRACT — This function is called STRICTLY from handleInput when
+// the user types "$prompt <raw_idea>" in /ask mode. It uses its own system
+// prompt (AskPromptHandoffSystemPrompt) and a non-streaming provider call that
+// NEVER touches the normal chat session history (no AddMessage, no sess.Save).
+// Normal chat continues to use AskContract() via the streamCmd path with zero
+// contamination.
+func (m *model) runAskPromptHandoffCmd(rawInput string) tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg {
+			return agentStartMsg{label: "refining architectural idea"}
+		},
+		m.spinnerTickCmd(),
+		func() tea.Msg {
+			if m.provider == nil {
+				m.push(roleError, "[System Error] No AI provider is configured. Run /provider to select one.")
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return agentDoneMsg{}
+			}
+
+			uname := m.cfg.Username
+			if uname == "" {
+				uname = m.userName
+			}
+			systemPrompt := prompt.AskPromptHandoffSystemPrompt(uname)
+
+			req := ai.Request{
+				Model: m.cfg.ActiveModelName(),
+				Messages: []ai.Message{
+					{Role: "user", Content: rawInput},
+				},
+				Stream: false,
+				System: systemPrompt,
+			}
+
+			resp, err := m.provider.Execute(context.Background(), req)
+			if err != nil {
+				return promptHandoffMsg{err: fmt.Errorf("prompt synthesis failed: %w", err)}
+			}
+
+			var content string
+			if resp != nil {
+				content = strings.TrimSpace(resp.Content)
+			}
+
+			if content == "" {
+				return promptHandoffMsg{err: fmt.Errorf("prompt synthesis returned empty response")}
+			}
+
+			// The FollowUp action chip is delivered via the promptHandoffMsg.actions
+			// field and rendered as an interactive terminal component by the
+			// promptHandoffMsg handler in update.go — never embedded in the
+			// markdown body.
+			followUpAction := []Action{
+				{
+					ID:       "ask-prompt-handoff-investigate",
+					Label:    "Forward to /investigate for deep-dive forensic analysis",
+					Shortcut: "alt+f",
+					Command:  "/mode investigate",
+					Query:    content,
+					Enabled:  true,
+					Priority: 100,
+				},
+			}
+
+			return promptHandoffMsg{content: content, actions: followUpAction}
 		},
 	)
 }

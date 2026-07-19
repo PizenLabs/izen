@@ -203,6 +203,8 @@ func (m *model) filterDollarCommands(prefix string) []string {
 	mode := m.resolver.Current()
 	var candidates []string
 	switch mode {
+	case modes.ModeAsk:
+		candidates = []string{"prompt"}
 	case modes.ModeReview:
 		candidates = []string{"test", "run", "log"}
 	case modes.ModeInvestigate:

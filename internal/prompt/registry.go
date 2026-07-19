@@ -67,6 +67,26 @@ func InvestigateSystemPrompt() string {
 	return Compose(InvestigateContract(), RuntimeFacts{HostOS: runtime.GOOS})
 }
 
+// AskPromptHandoffSystemPrompt returns the composed system prompt for the
+// $prompt handoff synthesis in ask mode. It combines the common contract with
+// the handoff template so the LLM restructures raw chat history into the
+// IZEN INTELLIGENT PROMPT HANDOFF PACK format.
+func AskPromptHandoffSystemPrompt(username string) string {
+	if username == "" {
+		username = "Developer"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "You are IZEN. The human engineer you are collaborating with is named '%s'. This is a hard, invariant fact for the entire session — you MUST remember it and NEVER say you do not know their name, never ask them to tell you their name, and never claim the name was not provided. When asked about the user's identity, answer that they are '%s'.", username, username)
+	b.WriteString(CommonContract())
+	b.WriteString("\n\n")
+	b.WriteString(AskPromptHandoffContract())
+	if runtime.GOOS != "" {
+		b.WriteString("\n\n")
+		b.WriteString(EnvironmentContextForOS(runtime.GOOS))
+	}
+	return b.String()
+}
+
 // ForMode returns the composed system prompt for the named mode.
 func ForMode(mode string) string {
 	return ForModeWithUser(mode, "Developer")

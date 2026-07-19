@@ -443,21 +443,23 @@ func (m *model) renderStreamingContent(content string, width int) string {
 			rendered = renderWidget("Command", container.String(), availableWidth, colorModePlan)
 
 		default:
-			// INTERCEPT: suppress raw JSON plans by rendering a clean widget —
-			// but ONLY outside /build mode. In /build the plan phase is over, so
-			// a JSON plan here is a contract violation (the model designed
-			// instead of executing). Rendering it as a legit-looking Plan widget
-			// would mask the failure, so surface an explicit error instead.
-			if jsonResult := plan.ParseJSONPlan(block.raw); jsonResult != nil && jsonResult.Valid && jsonResult.Plan != nil {
-				if m.resolver.Current() == modes.ModeBuild {
-					rendered = renderWidget("Execution Error",
-						textStyle.Render("Model returned a /plan JSON contract instead of a code patch. "+
-							"The plan phase is complete — re-run the task or refine the instruction to force patch output."),
-						availableWidth, colorModeReview)
+			// INTERCEPT: JSON plan widget — ONLY for /plan and /build modes where
+			// the model is instructed to output structured JSON. For /ask, /review,
+			// and /investigate this MUST be skipped entirely to prevent accidental
+			// JSON parsing of plain Markdown content (which can trigger terminal-
+			// corrupting stderr log spam from ParseJSONPlan's token-limit guard).
+			if m.resolver.Current() == modes.ModePlan || m.resolver.Current() == modes.ModeBuild {
+				if jsonResult := plan.ParseJSONPlan(block.raw); jsonResult != nil && jsonResult.Valid && jsonResult.Plan != nil {
+					if m.resolver.Current() == modes.ModeBuild {
+						rendered = renderWidget("Execution Error",
+							textStyle.Render("Model returned a /plan JSON contract instead of a code patch. "+
+								"The plan phase is complete — re-run the task or refine the instruction to force patch output."),
+							availableWidth, colorModeReview)
+						break
+					}
+					rendered = renderJSONPlanWidget(jsonResult.Plan, m.planStatusSource(), availableWidth)
 					break
 				}
-				rendered = renderJSONPlanWidget(jsonResult.Plan, m.planStatusSource(), availableWidth)
-				break
 			}
 
 			// Phase 4: In /plan mode, force ALL content through the plan widget
