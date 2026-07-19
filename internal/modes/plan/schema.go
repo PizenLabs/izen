@@ -57,6 +57,15 @@ func ParseJSONPlan(content string) *JSONPlanValidationResult {
 		}
 	}
 
+	for _, task := range plan.AtomicTasks {
+		if IsDocumentationTarget(task.File, "FILE_MUTATE") {
+			return &JSONPlanValidationResult{
+				Valid: false,
+				Error: "documentation targets (README.md, docs, etc.) are prohibited; use SHELL_EXEC or go.mod mutation for dependency fixes instead",
+			}
+		}
+	}
+
 	tasks := convertAtomicTasks(plan.AtomicTasks)
 	return &JSONPlanValidationResult{
 		Plan:  &plan,
@@ -161,6 +170,12 @@ RULES:
 6. strategy must be one of: ATOMIC_REPLACE, DIFF_PATCH, SHELL_EXEC, GIT_ACTION.
 7. file paths must be relative to project root.
 8. task_id values must be sequential integers starting at 1.
-9. NO shell execution commands in the plan itself. Only file mutations and git actions.
-10. If a file has severe syntax/AST errors, strategy MUST be "ATOMIC_REPLACE" (complete file override).`
+ 9. SHELL_EXEC is REQUIRED (not forbidden) when the investigation root cause is a
+    compilation or dependency error: emit an exact command such as
+    "go get <package>" or "go mod tidy". NEVER patch documentation files
+    (README.md, docs/, CHANGELOG, etc.) to work around build failures — resolve
+    the dependency via SHELL_EXEC or mutate go.mod instead.
+ 10. If a file has severe syntax/AST errors, strategy MUST be "ATOMIC_REPLACE" (complete file override).
+ 11. Documentation files (README.md, *.md docs, LICENSE, CONTRIBUTING.md, SECURITY.md,
+     CODE_OF_CONDUCT.md) are PROHIBITED targets under every strategy.`
 }

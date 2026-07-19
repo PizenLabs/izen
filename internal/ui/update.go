@@ -526,6 +526,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sanitizeInputPrompt()
 		m.lastTestOutput = msg.output
 		m.lastTestFailed = msg.exitCode != 0
+
+		// ── FIX 1: Flush prompt buffer on task failure ────────────────
+		// Wipe the volatile user input cache so the next keystroke or
+		// command is parsed as a brand-new clean request, rather than
+		// appending to the failed context. This prevents the prompt buffer
+		// from getting stuck on historical commands.
+		if msg.exitCode != 0 {
+			m.ti.SetValue("")
+			m.syncInputFromTI()
+			m.input.Reset()
+			m.currentPrompt = ""
+			m.responseBuffer.Reset()
+			m.currentStreamContent = ""
+			m.streamBuffer = ""
+			m.historyIndex = -1
+		}
+
 		if msg.err != nil {
 			m.push(roleError, "build execution error: "+msg.err.Error())
 		}
@@ -543,9 +560,36 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Execution failed (exit %d).", msg.exitCode)))
 		}
 
-		// After a SHELL_EXEC step finishes, advance to the next idle task so the
-		// build queue makes progress automatically. The handler that dispatched
-		// the SHELL_EXEC (runBuildShellExec) already marked this task terminal.
+		// ── FIX 2: Freeze state machine on task failure ───────────────
+		// If a step fails, the overall plan status must be STALLED. It is
+		// strictly forbidden to advance the internal task index pointer.
+		// All remaining idle tasks are marked "stalled" so subsequent
+		// /build invocations see them blocked rather than silently
+		// advancing into corrupted state.
+		if msg.exitCode != 0 {
+			tasks := m.sess.CurrentTasks
+			changed := false
+			for i := range tasks {
+				if tasks[i].Status == "idle" {
+					tasks[i].Status = "stalled"
+					changed = true
+				}
+			}
+			if changed {
+				m.sess.StageTaskList(&tasks)
+				_ = m.sess.Save()
+			}
+			m.push(roleError, fmt.Sprintf(
+				"[BUILD HALTED] Step %d failed. Queue frozen — remaining tasks marked stalled. Use /investigate or /plan to re-generate a valid ledger.",
+				m.currentBuildTaskID))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+
+		// After a SHELL_EXEC step finishes successfully, advance to the
+		// next idle task so the build queue makes progress automatically.
 		hasNext := false
 		for _, t := range m.sess.CurrentTasks {
 			if t.Status == "idle" || t.Status == "processing" {
@@ -1275,8 +1319,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			fmt.Sprintf("✔ done · +%d tok · %s · %.1fs", delta, costStr, latencySec)))
 
 		if m.resolver.Current() == modes.ModePlan {
-			// Try JSON plan parsing first (JSON output is the primary contract).
-			// Falls back to legacy markdown format if JSON is invalid/absent.
+			// ── STRICT JSON SCHEMA ENFORCEMENT ───────────────────────
+			// The /plan mode MUST consume ONLY the verified JSON structure
+			// mapped by the schema (prompt/plan.go). If the handoff payload
+			// is unparsed or corrupted, do NOT let the local LLM hallucinate
+			// ambient tasks via markdown fallback. Force the controller to
+			// surface the structural error and reject the output.
 			// NOTE: raw final was already pushed as roleAI at line 771 and
 			// rendered through cacheRecordToHistory → renderStreamingContent,
 			// which handles JSON widget rendering. Do NOT push rendered content
@@ -1288,28 +1336,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
 				}
 			} else {
-				// Fall back to legacy markdown plan validation
-				validation := plan.ValidatePlanOutput(final)
-				if !validation.Valid {
-					errMsg := plan.FormatValidationError(validation)
-					m.push(roleError, errMsg)
-					m.push(roleSystem, infoStyle.Render("regenerate with more precise intent"))
+				errMsg := "plan rejected: output does not conform to JSON schema"
+				if jsonResult != nil && jsonResult.Error != "" {
+					errMsg = "plan rejected: " + jsonResult.Error
 				}
-
-				var blockContent string
-				if len(validation.Blocks) > 0 {
-					blockContent = plan.CollapsePlanSections(final)
-				}
-
-				tasks := plan.ParseMarkdownToTasks(blockContent)
-				if len(tasks) == 0 {
-					tasks = plan.ParseMarkdownToTasks(final)
-				}
-
-				if len(tasks) > 0 {
-					m.sess.StageTaskList(&tasks)
-					m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
-				}
+				m.push(roleError, errMsg)
+				m.push(roleSystem, infoStyle.Render("regenerate with more precise intent or use /plan again"))
+				m.sess.ClearTasks()
 			}
 		}
 

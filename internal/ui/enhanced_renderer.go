@@ -60,7 +60,7 @@ func (r *EnhancedMutationRenderer) Render(v MutationCardViewModel) string {
 	// Bounded diff content — scrollable via proposalDiffOffset
 	if v.Expanded {
 		if v.Diff.Content != "" {
-			dr := &DiffRenderer{Width: contentWidth - 4, IsNewFile: v.IsNewFile}
+			dr := &DiffRenderer{Width: contentWidth - 4, IsNewFile: v.IsNewFile, Language: langFromPath(v.Target.Name)}
 			diffRendered := dr.Render(v.Diff)
 			diffLines := strings.Split(diffRendered, "\n")
 

@@ -368,7 +368,7 @@ func (m *model) renderStreamingContent(content string, width int) string {
 
 		case blockDiff:
 			file, symbol, linesRange, cleanDiff := parseDiffMetadata(block.raw)
-			dr := &DiffRenderer{Width: availableWidth}
+			dr := &DiffRenderer{Width: availableWidth, Language: langFromPath(file)}
 			diffRendered := dr.Render(ToDiffCardViewModel(cleanDiff))
 
 			var details []string

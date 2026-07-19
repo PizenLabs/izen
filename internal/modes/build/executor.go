@@ -63,6 +63,20 @@ func (ex *Executor) ApplyMutation(ctx context.Context, mut FileMutation) error {
 		}
 	}
 
+	// Check if this is a file mutation to README.md - prohibit and require explicit SHELL_EXEC
+	if strings.Contains(mut.File, "README.md") {
+		return fmt.Errorf("README.md modifications prohibited; use SHELL_EXEC for dependency fixes instead")
+	}
+
+	// Guardrail: every build mutation MUST be explicitly validated by a human
+	// operator via the Proposal system. Reject any mutation that has not been
+	// queued and approved — this enforces the fail-closed Human-in-the-Loop
+	// contract. The UI routes approved proposals to this executor; unvetted
+	// mutations are never applied to disk.
+	if !ex.engine.IsApprovedByFile(mut.File, mut.TaskID) {
+		return fmt.Errorf("human validation required for %s: mutation must be approved via Proposal UI before execution", mut.File)
+	}
+
 	if mut.Mode == ModeFullRewrite {
 		if err := os.WriteFile(absPath, []byte(mut.Content), 0644); err != nil {
 			return err

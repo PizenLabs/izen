@@ -39,7 +39,6 @@ func Detect(root string) Detection {
 			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".izen" {
 				continue
 			}
-			continue
 		}
 
 		if def, ok := reg.FromIndicatorFile(name); ok {

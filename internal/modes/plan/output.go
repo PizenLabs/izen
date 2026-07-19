@@ -313,6 +313,54 @@ var PlaceholderPathPatterns = []string{
 	"somefile.go",
 }
 
+// DocumentationFilePatterns lists file-name substrings that identify
+// documentation/non-source artifacts. The /plan engine MUST NEVER emit a task
+// that mutates these — compilation/dependency failures are resolved via go.mod
+// edits or SHELL_EXEC dependency commands, never by editing docs.
+var DocumentationFilePatterns = []string{
+	"readme.md",
+	"readme",
+	"docs/",
+	"doc/",
+	"changelog.md",
+	"changelog",
+	"contributing.md",
+	"license",
+	"code_of_conduct.md",
+	"security.md",
+	".md",
+}
+
+// IsDocumentationTarget reports whether a task target (file path or shell
+// command) resolves to a documentation/non-source artifact. For shell commands
+// (SHELL_EXEC) it inspects whether the command writes to such a file; for file
+// targets it matches against DocumentationFilePatterns. This is the primary
+// anti-escape gate that prevents the local model from "fixing" compile/dep
+// failures by silently patching README.md or other docs.
+func IsDocumentationTarget(target string, taskType string) bool {
+	if taskType == "SHELL_EXEC" {
+		// Only block shell commands that explicitly write to doc files
+		// (e.g. redirection into README.md). Plain build/dep commands are fine.
+		lower := strings.ToLower(target)
+		for _, p := range DocumentationFilePatterns {
+			if p == ".md" || p == "docs/" || p == "doc/" {
+				continue // too broad for command inspection
+			}
+			if strings.Contains(lower, "> "+p) || strings.Contains(lower, ">> "+p) {
+				return true
+			}
+		}
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(target))
+	for _, p := range DocumentationFilePatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidateTaskTarget checks if a task target is valid or a placeholder.
 // Returns (isValid, isPlaceholder) where:
 // - isValid: true if the target is a valid, non-placeholder path

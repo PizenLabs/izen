@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -331,9 +332,30 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			handoffSource = proposedFix
 		}
 
-		// SAFETY GUARD: If ContextLedger has diagnostics but handoffSource is empty,
-		// this indicates a data flow regression. Log a warning instead of proceeding
-		// with an empty query to the LLM.
+		// ── ANTI-WIPEOUT FALLBACK ───────────────────────────────────────
+		// The live handoff (handoffLedgerContent / ProposedFix) can be empty
+		// after a plan rejection or an environmental correction (e.g. the user
+		// clarifies "this is macOS, not Linux"). That MUST NOT discard the
+		// authoritative root-cause diagnostics held in the session ContextLedger.
+		// When the live handoff is empty but the ledger still carries the
+		// diagnostic payload, repopulate handoffSource from the ledger so the
+		// compilation/dependency error survives the mode transition instead of
+		// crashing the engine with a false "data flow regression".
+		if handoffSource == "" && m.sess.ContextLedger != nil {
+			l := m.sess.ContextLedger
+			if l.Diagnostics != "" {
+				handoffSource = ctxpkg.SanitizeLedger(l.Diagnostics)
+			}
+			if handoffSource == "" {
+				if packets := l.FormatPacketsForPlan(); packets != "" {
+					handoffSource = packets
+				}
+			}
+		}
+
+		// SAFETY GUARD: only fires when there is genuinely no material to
+		// synthesize from — not when a plan was rejected/corrected and the
+		// diagnostics simply live in the ContextLedger (handled above).
 		if handoffSource == "" && m.sess.ContextLedger != nil && m.sess.ContextLedger.Diagnostics != "" {
 			m.push(roleError, "[SYSTEM ERROR] Context ledger has diagnostics but handoff source is empty after sanitization. Data flow regression detected.")
 			m.refreshViewportContent()
@@ -571,25 +593,31 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 	return func() tea.Msg {
 		debugLogPlan("runPlanEngineCmd entered; model=" + modelName)
 
-		// ── ADAPTIVE LEDGER TRUNCATION (local SLM guard) ────────────────
-		// Local 7B-class models (qwen2.5-coder:7b, llama3, etc.) choke on the
-		// full forensic ledger — verbose compilation stack traces and dependency
-		// logs blow the context window and the first token never arrives within
-		// the 8s guard, freezing the terminal. For those models we aggressively
-		// compress the ledger to a hard ceiling so only the core error line and
-		// confirmed hypothesis status survive.
+		// ── STRICT LEDGER TRUNCATION (every /investigate → /plan handoff) ──
+		// The handoff ledger carries sanitized trace blocks only — verbose
+		// compilation stack traces and dependency logs over-inflate the prompt
+		// and overload the model (local 7B especially). IZEN therefore always
+		// compresses the ledger to a hard ceiling at this boundary; local SLMs
+		// get the tight ~4k-char ceiling (budget.ModelTokenBudget), cloud models
+		// a more generous one. Only the core error line + confirmed hypothesis
+		// status survive, preventing local-model overload and token bloat.
 		ledgerToSend := handoffSource
 		useFastTrack := false
 		localModel := plan.IsLocalModel(modelName)
-		if localModel {
-			if len(handoffSource) > plan.MaxLedgerChars {
-				truncated := plan.TruncateLedger(handoffSource, plan.MaxLedgerChars)
-				debugLogPlan("ADAPTIVE TRUNCATION: ledger " +
-					fmt.Sprint(len(handoffSource)) + "→" + fmt.Sprint(len(truncated)) +
-					" chars for local model " + modelName)
-				ledgerToSend = truncated
-			}
+		truncateCeiling := plan.MaxLedgerChars
+		if !localModel {
+			// Cloud models can absorb more, but we still cap the handoff hard.
+			truncateCeiling = plan.MaxLedgerChars * 4
+		}
+		if len(handoffSource) > truncateCeiling {
+			truncated := plan.TruncateLedger(handoffSource, truncateCeiling)
+			debugLogPlan("LEDGER TRUNCATION: ledger " +
+				fmt.Sprint(len(handoffSource)) + "→" + fmt.Sprint(len(truncated)) +
+				" chars (model=" + modelName + ")")
+			ledgerToSend = truncated
+		}
 
+		if localModel {
 			// ── "0 TODO" FAST-TRACK SHORT-CIRCUIT ──────────────────────────
 			// When there are no explicit code TODOs AND the ledger only contains
 			// compilation/dependency blockers (resolvable via environment setup,
@@ -1020,10 +1048,8 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case cmd == "/quit":
-		m.sess.SetMode(m.resolver.Current())
-		_ = m.sess.Save()
 		m.push(roleSystem, "goodbye.")
-		return tea.Quit
+		return m.cleanShutdownCmd()
 
 	case strings.HasPrefix(cmd, "/mode"):
 		parts := strings.Fields(cmd)
@@ -1279,9 +1305,52 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 // and reports the result — it never dispatches the command to the LLM. After a
 // run the task is marked terminal and the next idle task is advanced, preserving
 // /build's execute-only contract.
+//
+// HARD GATE: commands containing "sudo" or other OS-escalation keywords are
+// intercepted immediately and returned as a blocked buildResultMsg instead of
+// being executed. The user must copy the command and run it manually outside
+// IZEN. This is the absolute last line of defense against silent root escalation.
 func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 	return func() tea.Msg {
+		// ── SUDO / PRIVILEGE ESCALATION INTERCEPT ──────────────────────
+		lower := strings.ToLower(strings.TrimSpace(task.Target))
+		if strings.Contains(lower, "sudo") {
+			return buildResultMsg{
+				output:   "",
+				exitCode: -1,
+				err: fmt.Errorf(
+					"[SUDO BLOCKED] SHELL_EXEC task requires sudo: %s; "+
+						"IZEN never runs sudo automatically. Copy the command above and "+
+						"run it manually in your terminal outside IZEN, then re-run /build",
+					task.Target),
+			}
+		}
+		// ── OS-FENCE on Darwin: block Linux-only package manager commands ──
+		if runtime.GOOS == "darwin" {
+			linuxPatterns := []string{"apt-get", "apt ", "dpkg", "yum ", "dnf "}
+			for _, pat := range linuxPatterns {
+				if strings.Contains(lower, pat) {
+					return buildResultMsg{
+						output:   "",
+						exitCode: -1,
+						err: fmt.Errorf(
+							"[OS MISMATCH] SHELL_EXEC task uses %q which is a Linux package manager; "+
+								"this host is macOS; use Homebrew (`brew`) or `go install` instead",
+							strings.TrimSpace(pat)),
+					}
+				}
+			}
+		}
+		// ── Sandbox check before execution ──────────────────────────────
 		runner := execExecutionRunner(".")
+		if blocked, reason := m.shellFirewall(task.Target); blocked {
+			return buildResultMsg{
+				output:   "",
+				exitCode: -1,
+				err:      fmt.Errorf("[BLOCKED BY FIREWALL] %s", reason),
+			}
+		}
+
 		result, err := runner.Run(task.Target)
 		output := ""
 		exitCode := 0
@@ -1368,6 +1437,15 @@ func (m *model) runBuildPatchExec(task *plan.Task) tea.Cmd {
 			ContextID: m.sess.ContextID,
 		}
 		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
+			tasks := m.sess.CurrentTasks
+			for i := range tasks {
+				if tasks[i].StepNum == task.StepNum {
+					tasks[i].Status = "failed"
+					break
+				}
+			}
+			m.sess.StageTaskList(&tasks)
+			_ = m.sess.Save()
 			return buildResultMsg{
 				output:   resp.Content,
 				exitCode: 1,
@@ -1410,6 +1488,10 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 			m.push(roleStatus, fmt.Sprintf("task %d not found", stepNum))
 			return nil
 		}
+		if targetTask.Status == "stalled" || targetTask.Status == "failed" {
+			m.push(roleError, fmt.Sprintf("[BUILD HALTED] Task %d is %s. Use /investigate or /plan to re-generate a valid ledger.", stepNum, targetTask.Status))
+			return nil
+		}
 	} else {
 		for i, t := range tasks {
 			if t.Status == "idle" {
@@ -1419,6 +1501,14 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 		}
 	}
 	if targetTask == nil {
+		// Check if any tasks are stalled (failed build), if so give a
+		// better diagnostic than the generic "all tasks already completed".
+		for _, t := range tasks {
+			if t.Status == "stalled" {
+				m.push(roleError, "[BUILD HALTED] A previous step failed. Remaining tasks are stalled. Use /investigate or /plan to re-generate a valid ledger.")
+				return nil
+			}
+		}
 		m.push(roleStatus, "all tasks already completed")
 		return nil
 	}
@@ -2712,10 +2802,24 @@ func (m *model) shellFirewall(cmd string) (bool, string) {
 		}
 	}
 
-	// ── Global blacklist ──
-	blacklist := []string{"rm ", "sudo", "chmod", "chown", "mkfs", "dd ", "mv /*", "> /dev/gpi"}
+	// ── Global blacklist (SECURITY CRITICAL) ──
+	// Every blacklisted token is a hard block: the command cannot be executed
+	// through any code path — not via !cmd, not via proposedShellCmd, not via
+	// SHELL_EXEC, not via any AI-generated script. This is the last line of
+	// defense against silent privilege escalation.
+	blacklist := []string{
+		"rm ", "sudo", "chmod", "chown", "mkfs", "dd ",
+		"mv /*", "> /dev/gpi",
+		"apt-get", "apt ", "dpkg", "yum ", "dnf ",
+	}
 	for _, b := range blacklist {
 		if strings.Contains(lower, b) {
+			violation := b
+			if violation == "sudo" {
+				return true, fmt.Sprintf(
+					"[SUDO BLOCKED] '%s' requires root privileges. IZEN never runs sudo automatically. "+
+						"To execute this command, copy it and run it manually in your terminal outside IZEN.", cmd)
+			}
 			return true, fmt.Sprintf(
 				"Dangerous shell mutation blocked: Executing '%s' is strictly forbidden in this mode.",
 				cmd)

@@ -587,14 +587,11 @@ func TestParsePlanContent_JSONPreferred(t *testing.T) {
 	}
 }
 
-func TestParsePlanContent_MarkdownFallback(t *testing.T) {
+func TestParsePlanContent_RejectsMarkdown(t *testing.T) {
 	input := "- [ ] FILE_MUTATE: fallback.go | fallback test"
 	tasks := parsePlanContent(input)
-	if len(tasks) != 1 {
-		t.Fatalf("expected 1 task from markdown fallback, got %d", len(tasks))
-	}
-	if tasks[0].Target != "fallback.go" {
-		t.Fatalf("expected target fallback.go, got %s", tasks[0].Target)
+	if tasks != nil {
+		t.Fatal("expected nil for markdown-only input (strict JSON enforcement)")
 	}
 }
 

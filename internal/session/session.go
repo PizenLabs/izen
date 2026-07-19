@@ -295,6 +295,53 @@ func (s *Session) LogDir() string {
 	return filepath.Dir(path)
 }
 
+// Purge resets the session to a completely sterile state: clears all in-memory
+// fields, removes the on-disk session.json, context_ledger.json, plan files,
+// and wipes dirty compilation logs from history/test_runs/. This guarantees
+// that the next startup begins with zero residual state from a previous run.
+func (s *Session) Purge() {
+	s.Objective = ""
+	s.ObjectiveState = nil
+	s.Mode = modes.ModeAsk
+	s.ContextID = ""
+	s.RunNumber = 0
+	s.Assumptions = nil
+	s.Questions = nil
+	s.Checkpoints = nil
+	s.InvestigationID = ""
+	s.ReviewID = ""
+	s.CurrentTasks = nil
+	s.DiagnosticsSummary = ""
+	s.History = nil
+	s.ContextLedger = nil
+
+	// Remove on-disk session file.
+	_ = os.Remove(filepath.Join(".izen", "session.json"))
+	// Remove context ledger.
+	_ = os.Remove(filepath.Join(".izen", "context_ledger.json"))
+	// Remove all plan files.
+	plansDir := filepath.Join(".izen", "plans")
+	if entries, err := os.ReadDir(plansDir); err == nil {
+		for _, e := range entries {
+			_ = os.RemoveAll(filepath.Join(plansDir, e.Name()))
+		}
+	}
+	// Wipe dirty compilation logs (test runs and history).
+	testRunsDir := filepath.Join(".izen", "history", "test_runs")
+	if entries, err := os.ReadDir(testRunsDir); err == nil {
+		for _, e := range entries {
+			_ = os.RemoveAll(filepath.Join(testRunsDir, e.Name()))
+		}
+	}
+	// Reset transaction / patch caches.
+	patchesDir := filepath.Join(".izen", "patches")
+	if entries, err := os.ReadDir(patchesDir); err == nil {
+		for _, e := range entries {
+			_ = os.RemoveAll(filepath.Join(patchesDir, e.Name()))
+		}
+	}
+}
+
 // WriteToGlobalLog appends a log entry to the global history log file.
 //
 // Deprecated: Use history.WriteToHistoryLog or audit package for dual-stream logging.

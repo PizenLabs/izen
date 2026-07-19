@@ -109,6 +109,16 @@ func CheckVersion(root string, currentLxVersion string) error {
 	return nil
 }
 
+// CleanupLocalState removes the local .izen directory entirely, ensuring a
+// completely sterile workspace on the next startup. Called on explicit /quit.
+func CleanupLocalState(root string) error {
+	localDir := filepath.Join(root, LocalDir)
+	if _, err := os.Stat(localDir); os.IsNotExist(err) {
+		return nil
+	}
+	return os.RemoveAll(localDir)
+}
+
 func MigrateLegacyFiles(root string) error {
 	oldCache := filepath.Join(root, LocalDir, "graph.cache.v1")
 	newCache := LocalPath(root, GraphDir, GraphCacheFile)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -70,6 +71,7 @@ func (r *ToolRunner) runEnv(ctx context.Context, target string) ToolResult {
 	b.WriteString("  [SYSTEM ENVIRONMENT DIAGNOSTICS]\n")
 	b.WriteString("═══════════════════════════════════════════\n")
 
+	fmt.Fprintf(&b, "  Host OS    : %s / %s\n", runtime.GOOS, runtime.GOARCH)
 	if v, err := shell(ectx, r.root, "go version"); err == nil {
 		b.WriteString("  Go Version : " + strings.TrimSpace(v) + "\n")
 	}

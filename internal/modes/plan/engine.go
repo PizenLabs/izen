@@ -30,7 +30,7 @@ func NewEngine(store *PlanStore) *Engine {
 	}
 }
 
-// parsePlanContent tries JSON first, falls back to markdown task format.
+// parsePlanContent enforces strict JSON schema. Markdown-only output is rejected.
 func parsePlanContent(content string) []Task {
 	content = strings.TrimSpace(content)
 	if content == "" {
@@ -46,12 +46,7 @@ func parsePlanContent(content string) []Task {
 		return result.Tasks
 	}
 
-	tasks := ParseMarkdownToTasks(content)
-	// Validate tasks for placeholder paths
-	if err := ValidateAllTasks(tasks); err != nil {
-		return nil
-	}
-	return tasks
+	return nil
 }
 
 // SetProvider configures the AI provider for this engine using the structured signature.
@@ -169,25 +164,18 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		if err := ValidateAllTasks(jsonResult.Tasks); err != nil {
 			clean := filterValidTasks(jsonResult.Tasks)
 			if len(clean) > 0 {
-				return clean, nil
+				return ForceShellExecOnCompileError(clean, problem, ledgerContent), nil
 			}
 		} else {
-			return jsonResult.Tasks, nil
+			return ForceShellExecOnCompileError(jsonResult.Tasks, problem, ledgerContent), nil
 		}
 	}
 
-	// Fallback: if JSON parsing failed, try markdown task extraction.
-	tasks := ParseMarkdownToTasks(resp.Content)
-	if len(tasks) > 0 {
-		if err := ValidateAllTasks(tasks); err != nil {
-			clean := filterValidTasks(tasks)
-			if len(clean) > 0 {
-				return clean, nil
-			}
-		} else {
-			return tasks, nil
-		}
-	}
+	// ── STRICT SCHEMA ENFORCEMENT: NO MARKDOWN FALLBACK ───────────────
+	// The /plan mode MUST consume ONLY the verified JSON structure mapped
+	// by the schema. If the handoff payload is unparsed or corrupted, do
+	// NOT let the local LLM hallucinate ambient tasks via markdown
+	// extraction. Force the controller to surface the structural error.
 
 	// ── COMPILE/DEP FALLBACK (local-model JSON failure) ───────────────
 	// A local 7B model frequently returns mixed/markdown content instead of
@@ -242,6 +230,67 @@ func filterValidTasks(tasks []Task) []Task {
 		}
 	}
 	return clean
+}
+
+// ForceShellExecOnCompileError enforces the IZEN /plan anti-escape law for
+// compilation or dependency failures: when the root cause is a build/dep error,
+// the plan MUST resolve it through go.mod / SHELL_EXEC (e.g. `go get`,
+// `go mod tidy`) — NEVER by patching documentation or unrelated source files.
+//
+// If the synthesized tasks already contain a SHELL_EXEC task, they are returned
+// unchanged (the model complied). Otherwise a deterministic SHELL_EXEC recovery
+// task is prepended so the build engine always has a runnable shell step to
+// clear the blocker instead of stalling or escaping into README.md.
+func ForceShellExecOnCompileError(tasks []Task, problem, ledgerContent string) []Task {
+	if len(tasks) == 0 {
+		return tasks
+	}
+	if !IsCompilationOrDependencyError(problem) && !IsCompilationOrDependencyError(ledgerContent) {
+		return tasks
+	}
+	for _, t := range tasks {
+		if t.Type == "SHELL_EXEC" && strings.TrimSpace(t.Target) != "" {
+			return tasks
+		}
+	}
+
+	// No shell task present → prepend a deterministic dependency-resolution
+	// SHELL_EXEC. Prefer the corrected dependency path from the investigation
+	// conclusion when available; otherwise fall back to `go mod tidy`.
+	cmd := "go mod tidy"
+	if conclusion := ExtractConclusionFromLedger(ledgerContent); conclusion != "" {
+		if dep := dependencyFromConclusion(conclusion); dep != "" {
+			cmd = "go get " + dep
+		}
+	}
+	recovery := Task{
+		StepNum:     0,
+		IsDone:      false,
+		Status:      "idle",
+		Type:        "SHELL_EXEC",
+		Target:      cmd,
+		Description: "Resolve compilation/dependency blocker via module tooling (forced by /plan anti-escape law)",
+	}
+	out := make([]Task, 0, len(tasks)+1)
+	out = append(out, recovery)
+	out = append(out, tasks...)
+	for i := range out {
+		out[i].StepNum = i + 1
+	}
+	return out
+}
+
+// dependencyFromConclusion extracts a plausible module path from an
+// investigation conclusion string (e.g. "use github.com/moby/moby/client").
+// It returns the first token that looks like a Go module path; empty otherwise.
+func dependencyFromConclusion(conclusion string) string {
+	for _, tok := range strings.Fields(conclusion) {
+		t := strings.TrimRight(strings.TrimLeft(tok, "\"'"), "\"'.,")
+		if strings.Contains(t, ".") && (strings.Contains(t, "/") || strings.HasPrefix(t, "github.com") || strings.HasPrefix(t, "golang.org")) {
+			return t
+		}
+	}
+	return ""
 }
 
 // truncateForLog caps a model response excerpt so error messages stay readable.

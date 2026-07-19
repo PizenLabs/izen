@@ -29,6 +29,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/session"
+	"github.com/PizenLabs/izen/internal/state"
 )
 
 // ── Init stage types ──────────────────────────────────────────────────────────
@@ -889,10 +890,18 @@ func sanitizeIngressANSI(s string) string {
 		}
 
 		// Outside an escape: an orphaned SGR looks like "[\d+(;\d+)*m" with no
-		// preceding ESC. Detect and skip it.
-		if runes[i] == '[' && matchOrphanSGR(runes, i) >= 0 {
-			i = matchOrphanSGR(runes, i) + 1
-			continue
+		// preceding ESC. Also catch orphaned DEC private-mode mouse tracking
+		// sequences like "[<0;26;37M" that are left when the leading \x1b was
+		// stripped in an earlier text-pass. Detect and skip both.
+		if runes[i] == '[' {
+			if idx := matchOrphanSGR(runes, i); idx >= 0 {
+				i = idx + 1
+				continue
+			}
+			if idx := matchOrphanMouse(runes, i); idx >= 0 {
+				i = idx + 1
+				continue
+			}
 		}
 
 		b.WriteRune(runes[i])
@@ -925,6 +934,43 @@ func matchOrphanSGR(runes []rune, start int) int {
 		}
 	}
 	if j < len(runes) && runes[j] == 'm' {
+		return j
+	}
+	return -1
+}
+
+// matchOrphanMouse returns the index of the closing letter of an orphaned
+// DEC private-mode mouse tracking sequence beginning at runes[start]=='['
+// followed by '<' (e.g. "[<0;26;37M" / "[<0;26;37m"). These lack the leading
+// ESC byte because a previous text-input handling pass stripped the \x1b but
+// left the CSI payload behind, causing raw garbage like ";26;37M[<0;26;37m"
+// to leak into the viewport. Returns -1 when no match.
+func matchOrphanMouse(runes []rune, start int) int {
+	j := start + 1
+	if j >= len(runes) || runes[j] != '<' {
+		return -1
+	}
+	j++
+	if j >= len(runes) || runes[j] < '0' || runes[j] > '9' {
+		return -1
+	}
+	j++
+	for j < len(runes) && runes[j] >= '0' && runes[j] <= '9' {
+		j++
+	}
+	for j < len(runes) && runes[j] == ';' {
+		k := j + 1
+		if k < len(runes) && runes[k] >= '0' && runes[k] <= '9' {
+			j = k + 1
+			for j < len(runes) && runes[j] >= '0' && runes[j] <= '9' {
+				j++
+			}
+		} else {
+			break
+		}
+	}
+	// Final byte: 'M' (DEC private mode press/release) or 'm' (SGR variant)
+	if j < len(runes) && (runes[j] == 'M' || runes[j] == 'm') {
 		return j
 	}
 	return -1
@@ -1053,6 +1099,23 @@ func (m *model) flushPendingRecords() tea.Cmd {
 		cmds = append(cmds, m.flushRecord(rec))
 	}
 	return tea.Batch(cmds...)
+}
+
+// cleanShutdownCmd performs a full session teardown: kills orphan processes,
+// purges the session cache, removes dirty compilation logs, and resets all
+// ledger states so the next startup begins sterile. Wraps tea.Quit.
+func (m *model) cleanShutdownCmd() tea.Cmd {
+	return func() tea.Msg {
+		execution.KillAllOrphans()
+		if m.sess != nil {
+			m.sess.SetMode(m.resolver.Current())
+			m.sess.Purge()
+		}
+		if m.workspaceRoot != "" {
+			_ = state.CleanupLocalState(m.workspaceRoot)
+		}
+		return tea.Quit()
+	}
 }
 
 var spinnerBaseStyle = lipgloss.NewStyle()

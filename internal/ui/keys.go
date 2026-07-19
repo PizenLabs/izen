@@ -120,10 +120,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlD:
 		if m.ti.Value() == "" && !m.agentRunning && !m.streaming && !m.reviewRunning && !m.pipelineRunning {
-			execution.KillAllOrphans()
-			m.sess.SetMode(m.resolver.Current())
-			_ = m.sess.Save()
-			return m, tea.Quit
+			return m, m.cleanShutdownCmd()
 		}
 		return m, nil
 

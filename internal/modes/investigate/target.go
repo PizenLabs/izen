@@ -11,6 +11,28 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 )
 
+// stripANSI removes ANSI escape sequences from a string.
+// These are display artifacts that add no semantic value and bloat tokens.
+func stripANSI(s string) string {
+	if s == "" {
+		return s
+	}
+	ansiRE := regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+	clean := ansiRE.ReplaceAllString(s, "")
+	clean = regexp.MustCompile(`\n{3,}`).ReplaceAllString(clean, "\n\n")
+	return strings.TrimSpace(clean)
+}
+
+// collapseBlankLines reduces multiple consecutive blank lines to at most two.
+// This preserves structural readability while eliminating token bloat from
+// excessive whitespace that carries no semantic meaning.
+func collapseBlankLines(s string) string {
+	if s == "" {
+		return s
+	}
+	return regexp.MustCompile(`\n{3,}`).ReplaceAllString(s, "\n\n")
+}
+
 type Target struct {
 	File    string `json:"file"`
 	Line    int    `json:"line"`
@@ -255,8 +277,10 @@ func (cl *ContextLedger) FormatForPlan() string {
 	fmt.Fprintf(&b, "Problem: %s\n", cl.Problem)
 
 	if cl.Diagnostics != "" {
+		cleanDiag := stripANSI(cl.Diagnostics)
+		cleanDiag = collapseBlankLines(cleanDiag)
 		fmt.Fprintf(&b, "\n### RAW DIAGNOSTICS\n")
-		fmt.Fprintf(&b, "```\n%s\n```\n", cl.Diagnostics)
+		fmt.Fprintf(&b, "```\n%s\n```\n", cleanDiag)
 	}
 
 	if cl.RootCause != "" {

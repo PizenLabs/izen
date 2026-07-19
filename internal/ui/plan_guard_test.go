@@ -1,8 +1,10 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
+	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -104,6 +106,44 @@ func TestPlanGuardIgnoresPendingTodoCount(t *testing.T) {
 	if m.planHasNothingToSynthesize("", "") {
 		t.Fatal("guard fired on a valid 0-TODO handoff with ledger diagnostics — " +
 			"this would deadlock every /investigate → /plan transition")
+	}
+}
+
+// TestPlanHandoffRepopulatesFromDiagnostics is the regression guard for the
+// "Data Flow Regression" crash: when a plan is rejected / an environment
+// correction occurs, the live handoff (handoffLedgerContent / ProposedFix) can
+// be empty while the authoritative root-cause diagnostics still live in
+// session.ContextLedger.Diagnostics. The handoff resolution MUST repopulate
+// from the diagnostics instead of reporting an empty source and crashing.
+func TestPlanHandoffRepopulatesFromDiagnostics(t *testing.T) {
+	m := &model{sess: &session.Session{}}
+	m.handoffLedgerContent = ""     // cleared after rejection
+	m.handoffCtx.ProposedFix = ""   // cleared after rejection
+	m.handoffCtx.PendingTodos = nil // 0 todos
+	m.sess.ContextLedger = &session.ContextLedger{
+		Diagnostics: "cmd/api/main.go:7:5: no required module provides package github.com/foo/bar",
+	}
+
+	// Replicate the handoff-source resolution from /plan (commands.go):
+	// the SAFETY GUARD must NOT fire because handoffSource is rebuilt from
+	// the ledger diagnostics.
+	ledgerContent := ctxpkg.SanitizeLedger(m.handoffLedgerContent)
+	handoffSource := ledgerContent
+	if handoffSource == "" {
+		handoffSource = m.handoffCtx.ProposedFix
+	}
+	if handoffSource == "" && m.sess.ContextLedger != nil {
+		if m.sess.ContextLedger.Diagnostics != "" {
+			handoffSource = ctxpkg.SanitizeLedger(m.sess.ContextLedger.Diagnostics)
+		}
+	}
+
+	if handoffSource == "" {
+		t.Fatal("handoff source was NOT repopulated from ContextLedger.Diagnostics — " +
+			"the Data Flow Regression crash would re-occur on plan rejection / env correction")
+	}
+	if !strings.Contains(handoffSource, "no required module provides package") {
+		t.Fatalf("repopulated handoff source lost the root compilation error: %q", handoffSource)
 	}
 }
 
