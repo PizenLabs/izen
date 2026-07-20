@@ -174,6 +174,35 @@ func (m *model) renderProposalBlock() string {
 
 	switch m.state {
 	case StateAwaitingApproval:
+		// ── Build Approval Permission Box (SHELL_EXEC gate) ─────────────
+		if m.pendingBuildApproval && m.pendingBuildTask != nil {
+			task := m.pendingBuildTask
+			boxWidth := width - 4
+			if boxWidth < 40 {
+				boxWidth = 40
+			}
+			// Build the box content line by line
+			var content strings.Builder
+			title := permissionTitleStyle.Render("▲ PERMISSION REQUIRED")
+			action := permissionDescStyle.Render("Action:") + " " + boldTextStyle.Render("SHELL_EXEC")
+			target := permissionTargetStyle.Render(task.Target)
+			desc := permissionDescStyle.Render(fmt.Sprintf("Reason: %s", task.Description))
+			sep := strings.Repeat("─", boxWidth-4)
+			keys := fmt.Sprintf("%s  %s  %s",
+				permissionKeyStyle.Render("[y] Allow Once"),
+				permissionKeyStyle.Render("[a] Allow Always"),
+				permissionKeyStyle.Render("[n] Reject"),
+			)
+			content.WriteString(title + "\n")
+			content.WriteString(action + "\n\n")
+			content.WriteString(target + "\n")
+			content.WriteString(desc + "\n")
+			content.WriteString(" " + sep + "\n")
+			content.WriteString(keys + "\n")
+			b.WriteString(permissionBoxStyle.Render(content.String()))
+			break
+		}
+
 		if len(m.pendingProposals) == 0 {
 			return ""
 		}
@@ -311,7 +340,12 @@ func (m *model) renderAutocompleteDropdown(width int) string {
 					maxContent = 6
 				}
 				if lipgloss.Width(display) > maxContent {
-					display = display[:maxContent-1] + "…"
+					runes := []rune(display)
+					if len(runes) > maxContent-1 {
+						display = string(runes[:maxContent-1]) + "…"
+					} else {
+						display = display[:maxContent-1] + "…"
+					}
 				}
 				pad := width - lipgloss.Width(display) - 4
 				if pad < 0 {
@@ -375,7 +409,12 @@ func (m *model) renderAutocompleteDropdown(width int) string {
 					maxContent = 10
 				}
 				if lw > maxContent {
-					display = display[:maxContent-1] + "…"
+					runes := []rune(display)
+					if len(runes) > maxContent-1 {
+						display = string(runes[:maxContent-1]) + "…"
+					} else {
+						display = display[:maxContent-1] + "…"
+					}
 					lw = lipgloss.Width(display)
 				}
 				pad := strings.Repeat(" ", width-lw-6)
@@ -514,8 +553,9 @@ func (m *model) renderRuntimeStatus(width int) string {
 	// Active context ID — conveys workspace continuity without shouting.
 	if m.sess != nil && m.sess.ContextID != "" {
 		ctx := m.sess.ContextID
-		if len(ctx) > 9 {
-			ctx = ctx[:9]
+		runes := []rune(ctx)
+		if len(runes) > 9 {
+			ctx = string(runes[:9])
 		}
 		meta = append(meta, mutedStyle.Render(Icon.Context+" "+ctx))
 	}
@@ -536,8 +576,9 @@ func (m *model) renderRuntimeStatus(width int) string {
 	if width >= compactStatusThreshold {
 		if cp := m.latestCheckpointID(); cp != "" {
 			cp = strings.TrimPrefix(cp, "cp-")
-			if len(cp) > 7 {
-				cp = cp[:7]
+			runes := []rune(cp)
+			if len(runes) > 7 {
+				cp = string(runes[:7])
 			}
 			meta = append(meta, dimmedStyle.Render("cp-"+cp))
 		}
@@ -926,7 +967,8 @@ func (m *model) printRecord(rec record) string {
 
 		var currentLine strings.Builder
 		for _, word := range words {
-			if currentLine.Len()+1+len(word) > maxW {
+			wordWidth := lipgloss.Width(word)
+			if currentLine.Len()+1+wordWidth > maxW {
 				chunks = append(chunks, currentLine.String())
 				currentLine.Reset()
 				currentLine.WriteString(word)

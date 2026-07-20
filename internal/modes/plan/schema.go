@@ -3,13 +3,22 @@ package plan
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 )
 
+type StrategicOverview struct {
+	RootCoreFactor     string `json:"root_core_factor"`
+	ImpactDomain       string `json:"impact_domain"`
+	RiskEvaluation     string `json:"risk_evaluation"`
+	VerificationVector string `json:"verification_vector"`
+}
+
 type PlanOutput struct {
-	ContextAnchor         ContextAnchor `json:"context_anchor"`
-	ArchitecturalStrategy string        `json:"architectural_strategy"`
-	AtomicTasks           []AtomicTask  `json:"atomic_tasks"`
+	ContextAnchor         ContextAnchor     `json:"context_anchor"`
+	ArchitecturalStrategy string            `json:"architectural_strategy"`
+	StrategicOverview     StrategicOverview `json:"strategic_overview,omitempty"`
+	AtomicTasks           []AtomicTask      `json:"atomic_tasks"`
 }
 
 type ContextAnchor struct {
@@ -22,6 +31,8 @@ type AtomicTask struct {
 	File        string `json:"file"`
 	Strategy    string `json:"strategy"`
 	Description string `json:"description"`
+	Rationale   string `json:"rationale,omitempty"`
+	Solution    string `json:"solution,omitempty"`
 }
 
 type JSONPlanValidationResult struct {
@@ -32,14 +43,27 @@ type JSONPlanValidationResult struct {
 }
 
 func ParseJSONPlan(content string) *JSONPlanValidationResult {
-	content = stripCodeFences(content)
+	content = sanitizeJSONContent(content)
 	content = strings.TrimSpace(content)
 
 	var plan PlanOutput
 	if err := json.Unmarshal([]byte(content), &plan); err != nil {
+		rawPreview := content
+		runes := []rune(rawPreview)
+		if len(runes) > 120 {
+			rawPreview = string(runes[:120])
+		}
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "unexpected end") || strings.Contains(errMsg, "unterminated") {
+			log.Printf("[TOKEN LIMIT REACHED] JSON response truncated — model hit token ceiling. Increase max_tokens/num_predict. Error: %v", err)
+			return &JSONPlanValidationResult{
+				Valid: false,
+				Error: fmt.Sprintf("[TOKEN LIMIT REACHED] JSON response truncated — the model stopped generating before completing the JSON structure. Increase max_tokens/num_predict in the provider config. Parse error: %v (content preview: %q)", err, rawPreview),
+			}
+		}
 		return &JSONPlanValidationResult{
 			Valid: false,
-			Error: fmt.Sprintf("JSON parse error: %v", err),
+			Error: fmt.Sprintf("JSON parse error: %v (content preview: %q)", err, rawPreview),
 		}
 	}
 
@@ -54,6 +78,15 @@ func ParseJSONPlan(content string) *JSONPlanValidationResult {
 		return &JSONPlanValidationResult{
 			Valid: false,
 			Error: "plan must contain architectural_strategy",
+		}
+	}
+
+	for _, task := range plan.AtomicTasks {
+		if IsDocumentationTarget(task.File, "FILE_MUTATE") {
+			return &JSONPlanValidationResult{
+				Valid: false,
+				Error: "documentation targets (README.md, docs, etc.) are prohibited; use SHELL_EXEC or go.mod mutation for dependency fixes instead",
+			}
 		}
 	}
 
@@ -78,6 +111,10 @@ func convertAtomicTasks(atomic []AtomicTask) []Task {
 		if desc == "" {
 			desc = fmt.Sprintf("%s: %s", strategy, a.File)
 		}
+		rationale := a.Rationale
+		if rationale == "" && desc != "" {
+			rationale = desc
+		}
 		tasks = append(tasks, Task{
 			StepNum:     i + 1,
 			IsDone:      false,
@@ -85,6 +122,8 @@ func convertAtomicTasks(atomic []AtomicTask) []Task {
 			Type:        taskType,
 			Target:      target,
 			Description: desc,
+			Rationale:   rationale,
+			Solution:    a.Solution,
 		})
 	}
 	return tasks
@@ -103,7 +142,42 @@ func mapStrategyToType(strategy string) string {
 	}
 }
 
-func stripCodeFences(content string) string {
+// sanitizeJSONContent strips everything that is not valid JSON from an LLM
+// response before passing it to json.Unmarshal. It handles:
+//   - Markdown code fences (```json, ```)
+//   - // line comments before, after, or within the JSON structure
+//   - /* */ block comments
+//   - Leading/trailing non-JSON text before the first { or after the last }
+//   - Trailing // comments on JSON lines
+//   - Truncated JSON structures (missing closing brackets) via autoCloseJSON
+//   - Partial string values (unterminated quotes at end of content)
+//   - Missing commas between JSON elements
+//
+// Phase 3: This is the critical sanitization gate that prevents LLM-generated
+// structural noise from crashing the /plan parser. It must be resilient enough
+// that a local 7B model's truncated output still produces a valid JSON plan.
+func sanitizeJSONContent(content string) string {
+	content = strings.TrimSpace(content)
+
+	// 1. Strip markdown code fences (handle nested fences too).
+	for strings.HasPrefix(content, "```") {
+		firstNewline := strings.Index(content, "\n")
+		if firstNewline != -1 {
+			content = content[firstNewline+1:]
+		} else {
+			break
+		}
+		content = strings.TrimSpace(content)
+	}
+	for strings.HasSuffix(content, "```") {
+		lastBackticks := strings.LastIndex(content, "```")
+		if lastBackticks != -1 {
+			content = strings.TrimSpace(content[:lastBackticks])
+		} else {
+			break
+		}
+	}
+	// Repeat once more for nested fences (e.g., ```json ``` ```).
 	content = strings.TrimSpace(content)
 	if strings.HasPrefix(content, "```") {
 		firstNewline := strings.Index(content, "\n")
@@ -111,30 +185,258 @@ func stripCodeFences(content string) string {
 			content = content[firstNewline+1:]
 		}
 	}
+	content = strings.TrimSpace(content)
 	if strings.HasSuffix(content, "```") {
 		lastBackticks := strings.LastIndex(content, "```")
 		if lastBackticks != -1 {
-			content = content[:lastBackticks]
+			content = strings.TrimSpace(content[:lastBackticks])
 		}
 	}
 	content = strings.TrimSpace(content)
-	if strings.HasPrefix(content, "```") {
-		firstNewline := strings.Index(content, "\n")
-		if firstNewline != -1 {
-			content = content[firstNewline+1:]
+
+	// 2. Strip leading // line comments (each line starting with // before {).
+	lines := strings.Split(content, "\n")
+	cleaned := make([]string, 0, len(lines))
+	inBlockComment := false
+	foundJSON := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Track /* */ block comments.
+		if idxOpen := strings.Index(trimmed, "/*"); idxOpen >= 0 {
+			inBlockComment = true
+			// If the block comment ends on the same line, strip just the comment.
+			if idxClose := strings.LastIndex(trimmed, "*/"); idxClose >= idxOpen+2 {
+				before := strings.TrimSpace(trimmed[:idxOpen])
+				after := strings.TrimSpace(trimmed[idxClose+2:])
+				trimmed = strings.TrimSpace(before + " " + after)
+				inBlockComment = false
+			} else {
+				// Block comment started — skip the /* portion.
+				trimmed = strings.TrimSpace(trimmed[:idxOpen])
+			}
+		}
+		if inBlockComment {
+			if idxClose := strings.LastIndex(trimmed, "*/"); idxClose >= 0 {
+				trimmed = strings.TrimSpace(trimmed[idxClose+2:])
+				inBlockComment = false
+			} else {
+				continue
+			}
+		}
+
+		// Once we've seen a JSON structural character, keep everything (except
+		// inline // comments within JSON string values).
+		if !foundJSON {
+			if trimmed == "" || strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+				foundJSON = true
+			}
+		}
+
+		// Strip trailing // comments on JSON lines (but be careful not to
+		// strip // inside string values).
+		if foundJSON && strings.Contains(trimmed, "//") {
+			trimmed = stripTrailingComment(trimmed)
+		}
+
+		cleaned = append(cleaned, trimmed)
+	}
+	content = strings.Join(cleaned, "\n")
+	content = strings.TrimSpace(content)
+
+	// 3. If content still has no JSON prefix, do a last-resort scan for the
+	// first { or [ and grab everything through the matching closing bracket.
+	if !strings.HasPrefix(content, "{") && !strings.HasPrefix(content, "[") {
+		content = extractJSONObject(content)
+	}
+
+	// 4. Auto-close truncated JSON structures (missing closing brackets).
+	// This recovers from premature cut-off where the model hit its token
+	// limit mid-JSON, appending } and ] in the correct nesting order.
+	content = autoCloseJSON(content)
+
+	return content
+}
+
+// stripTrailingComment removes a trailing // comment from a JSON line while
+// preserving // that appears inside a quoted JSON string value.
+func stripTrailingComment(line string) string {
+	inString := false
+	escaped := false
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inString = !inString
+			continue
+		}
+		if !inString && ch == '/' && i+1 < len(line) && line[i+1] == '/' {
+			return strings.TrimSpace(line[:i])
 		}
 	}
-	if strings.HasSuffix(content, "```") {
-		lastBackticks := strings.LastIndex(content, "```")
-		if lastBackticks != -1 {
-			content = content[:lastBackticks]
+	return line
+}
+
+// extractJSONObject scans content for the first { or [ and returns the
+// balanced JSON substring through the matching closing bracket.
+func extractJSONObject(content string) string {
+	content = strings.TrimSpace(content)
+	start := strings.Index(content, "{")
+	if start == -1 {
+		start = strings.Index(content, "[")
+	}
+	if start == -1 {
+		return content
+	}
+	content = content[start:]
+
+	depth := 0
+	inStr := false
+	esc := false
+	for i := 0; i < len(content); i++ {
+		ch := content[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if ch == '\\' {
+			esc = true
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		if ch == '{' || ch == '[' {
+			depth++
+			continue
+		}
+		if ch == '}' || ch == ']' {
+			depth--
+			if depth == 0 {
+				return content[:i+1]
+			}
 		}
 	}
-	return strings.TrimSpace(content)
+	return content
+}
+
+// autoCloseJSON attempts to recover truncated JSON by:
+//  1. Closing unterminated string values (trailing open quotes).
+//  2. Appending missing closing brackets (} and ]) in correct nesting order.
+//  3. Closing the JSON structure even when cut mid-value.
+//
+// This handles the case where the LLM stopped generating before completing
+// the JSON structure due to hitting max_tokens/num_predict limits.
+// Phase 3: Enhanced recovery for local 7B models that frequently truncate.
+func autoCloseJSON(content string) string {
+	if content == "" {
+		return content
+	}
+
+	// Step 1: Close unterminated string at end of content.
+	// If the content ends inside a string value (odd number of unescaped quotes),
+	// append a closing quote.
+	content = closeUnterminatedString(content)
+
+	depth := 0
+	inStr := false
+	esc := false
+	var stack []byte
+	lastBracket := byte(0)
+	for i := 0; i < len(content); i++ {
+		ch := content[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if ch == '\\' {
+			esc = true
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		switch ch {
+		case '{':
+			depth++
+			stack = append(stack, '}')
+			lastBracket = '{'
+		case '[':
+			depth++
+			stack = append(stack, ']')
+			lastBracket = '['
+		case '}':
+			depth--
+			if len(stack) > 0 && stack[len(stack)-1] == '}' {
+				stack = stack[:len(stack)-1]
+			}
+		case ']':
+			depth--
+			if len(stack) > 0 && stack[len(stack)-1] == ']' {
+				stack = stack[:len(stack)-1]
+			}
+		}
+	}
+
+	if depth > 0 && len(stack) > 0 {
+		_ = lastBracket
+		var b strings.Builder
+		b.WriteString(content)
+		for i := len(stack) - 1; i >= 0; i-- {
+			b.WriteByte(stack[i])
+		}
+		return b.String()
+	}
+	return content
+}
+
+// closeUnterminatedString detects and closes an open string at the end of content.
+func closeUnterminatedString(s string) string {
+	if s == "" {
+		return s
+	}
+	inStr := false
+	esc := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if ch == '\\' {
+			esc = true
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+		}
+	}
+	if inStr {
+		return s + "\""
+	}
+	return s
 }
 
 func SchemaJSONInstruction() string {
-	return `You MUST output ONLY a single JSON object with this EXACT schema:
+	return `You MUST output ONLY a single raw JSON object — NO markdown fences, NO // comments, NO extra text — with this EXACT schema:
 
 {
   "context_anchor": {
@@ -142,25 +444,42 @@ func SchemaJSONInstruction() string {
     "target_packages": ["package1", "package2"]
   },
   "architectural_strategy": "One-sentence summary of the architectural approach",
+  "strategic_overview": {
+    "root_core_factor": "Brief sentence identifying the fundamental root cause driving this plan",
+    "impact_domain": "Architectural layer or subsystem affected",
+    "risk_evaluation": "Risk classification: Critical / High / Medium / Low",
+    "verification_vector": "How correctness will be verified (build, test, lint, etc.)"
+  },
   "atomic_tasks": [
     {
       "task_id": 1,
-      "file": "relative/path/to/file.go",
+      "file": "relative/path/to/file.go or shell command",
       "strategy": "ATOMIC_REPLACE",
-      "description": "What to do and why"
+      "description": "Brief title of the task",
+      "rationale": "Why this task is necessary — the architectural or technical reason",
+      "solution": "What the expected end state looks like after this task completes"
     }
   ]
 }
 
 RULES:
-1. Output ONLY the JSON object. No introductory text, no markdown, no code fences.
+1. Output ONLY the JSON object. No introductory text, no markdown, no code fences, no // comments.
 2. context_anchor.source must identify where this plan originated.
 3. context_anchor.target_packages lists all packages affected.
 4. architectural_strategy is a single concise sentence.
-5. atomic_tasks must have at least one entry. Each entry must have all four fields.
-6. strategy must be one of: ATOMIC_REPLACE, DIFF_PATCH, SHELL_EXEC, GIT_ACTION.
-7. file paths must be relative to project root.
-8. task_id values must be sequential integers starting at 1.
-9. NO shell execution commands in the plan itself. Only file mutations and git actions.
-10. If a file has severe syntax/AST errors, strategy MUST be "ATOMIC_REPLACE" (complete file override).`
+5. strategic_overview.root_core_factor is a brief sentence identifying the fundamental root cause.
+6. strategic_overview provides the architectural impact domain, risk classification, and verification strategy.
+7. atomic_tasks must have at least one entry. Each entry must have all fields.
+8. strategy must be one of: ATOMIC_REPLACE, DIFF_PATCH, SHELL_EXEC, GIT_ACTION.
+9. file paths must be relative to project root.
+10. task_id values must be sequential integers starting at 1.
+11. SHELL_EXEC is REQUIRED (not forbidden) when the investigation root cause is a
+    compilation or dependency error: emit an exact command such as
+    "go get <package>" or "go mod tidy". NEVER patch documentation files
+    (README.md, docs/, CHANGELOG, etc.) to work around build failures — resolve
+    the dependency via SHELL_EXEC or mutate go.mod instead.
+12. If a file has severe syntax/AST errors, strategy MUST be "ATOMIC_REPLACE" (complete file override).
+13. Documentation files (README.md, *.md docs, LICENSE, CONTRIBUTING.md, SECURITY.md,
+    CODE_OF_CONDUCT.md) are PROHIBITED targets under every strategy.
+14. For every atomic_task, provide both rationale (the technical reason) and solution (expected end state).`
 }

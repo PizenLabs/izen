@@ -29,6 +29,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/session"
+	"github.com/PizenLabs/izen/internal/state"
 )
 
 // ── Init stage types ──────────────────────────────────────────────────────────
@@ -133,6 +134,16 @@ type planResultMsg struct {
 type agentStartMsg struct{ label string }
 type agentDoneMsg struct{}
 
+// promptHandoffMsg carries the result of a $prompt synthesis in /ask mode.
+// The content field holds the full markdown of the IZEN INTELLIGENT PROMPT
+// HANDOFF PACK. The actions slice carries the FollowUp navigation chip data
+// to be rendered as an interactive Action component at the terminal footer.
+type promptHandoffMsg struct {
+	content string
+	actions []Action
+	err     error
+}
+
 type commitGeneratedMsg struct {
 	subject string
 	body    string
@@ -220,6 +231,24 @@ type buildResultMsg struct {
 	output   string
 	exitCode int
 	err      error
+}
+
+// hotfixProposalMsg carries the LLM-generated patch for a $hot hotfix back to
+// the Update loop. The engine does NOT apply it — it freezes the pipeline in
+// StateAwaitingApproval and renders a diff proposal for explicit authorization.
+type hotfixProposalMsg struct {
+	Task  *plan.Task
+	Patch *execution.Patch
+	Diff  string
+	Err   error
+}
+
+// hotfixProgressMsg streams a lifecycle log line to the terminal while the
+// $hot patch is being generated in the background. It is delivered through the
+// Bubble Tea event loop (never from the background goroutine) so the spinner
+// stays alive and the developer sees active progress instead of a frozen pane.
+type hotfixProgressMsg struct {
+	Line string
 }
 
 type fixResultMsg struct {
@@ -648,6 +677,26 @@ type model struct {
 	pendingTestConfirm bool
 	pendingTestTarget  string
 
+	// Build approval gate: when a SHELL_EXEC task is queued, the system
+	// requires explicit user confirmation before any command reaches the OS
+	// shell. pendingBuildTask holds the task awaiting y/n input.
+	pendingBuildApproval bool
+	pendingBuildTask     *plan.Task
+	// pendingBuildAllowAlways, when set from the permission box "Allow Always"
+	// option, skips the approval gate for subsequent SHELL_EXEC tasks for the
+	// remainder of the session. Reset on mode transitions or /clear.
+	pendingBuildAllowAlways bool
+
+	// Hotfix approval gate: $hot MUST NOT apply structural patches to disk
+	// silently. After the model synthesizes the patch, the engine freezes in
+	// StateAwaitingApproval and renders the code diff proposal. The developer
+	// authorizes (y) or rejects (n) before any byte touches the workspace.
+	// pendingHotfixTask is the synthesized FILE_MUTATE task awaiting y/n.
+	pendingHotfixTask *plan.Task
+	// pendingHotfixPatch holds the generated patch awaiting approval so the
+	// apply step does not need to re-invoke the LLM on confirmation.
+	pendingHotfixPatch *execution.Patch
+
 	// Review action spinner: set synchronously on $run/$test/$fix dispatch
 	// so the view can immediately render a spinner without waiting for the
 	// async agentStartMsg to be processed.
@@ -698,6 +747,11 @@ type model struct {
 	// Build auto-recovery counter: tracks retry attempts after persistent
 	// build failure during verification. Reset on mode entry and clear.
 	buildRecoveryCount int
+
+	// hotfixActive tracks whether we are executing a $hot urgent hotfix task.
+	// When true, the build result handler will restore the stashed plan from
+	// .izen/stashed_plan.json after the hotfix completes.
+	hotfixActive bool
 
 	// modeChangeAuthorized is set true ONLY when the user explicitly types a
 	// mode-switch command (/build, /plan, /mode build). Auto-transitions from
@@ -783,7 +837,8 @@ func wrapStreamText(text string, maxW int) []string {
 
 		var currentLine strings.Builder
 		for _, word := range words {
-			if currentLine.Len()+1+len(word) > maxW {
+			wordWidth := lipgloss.Width(word)
+			if currentLine.Len()+1+wordWidth > maxW {
 				chunks = append(chunks, currentLine.String())
 				currentLine.Reset()
 				currentLine.WriteString(word)
@@ -889,10 +944,18 @@ func sanitizeIngressANSI(s string) string {
 		}
 
 		// Outside an escape: an orphaned SGR looks like "[\d+(;\d+)*m" with no
-		// preceding ESC. Detect and skip it.
-		if runes[i] == '[' && matchOrphanSGR(runes, i) >= 0 {
-			i = matchOrphanSGR(runes, i) + 1
-			continue
+		// preceding ESC. Also catch orphaned DEC private-mode mouse tracking
+		// sequences like "[<0;26;37M" that are left when the leading \x1b was
+		// stripped in an earlier text-pass. Detect and skip both.
+		if runes[i] == '[' {
+			if idx := matchOrphanSGR(runes, i); idx >= 0 {
+				i = idx + 1
+				continue
+			}
+			if idx := matchOrphanMouse(runes, i); idx >= 0 {
+				i = idx + 1
+				continue
+			}
 		}
 
 		b.WriteRune(runes[i])
@@ -925,6 +988,43 @@ func matchOrphanSGR(runes []rune, start int) int {
 		}
 	}
 	if j < len(runes) && runes[j] == 'm' {
+		return j
+	}
+	return -1
+}
+
+// matchOrphanMouse returns the index of the closing letter of an orphaned
+// DEC private-mode mouse tracking sequence beginning at runes[start]=='['
+// followed by '<' (e.g. "[<0;26;37M" / "[<0;26;37m"). These lack the leading
+// ESC byte because a previous text-input handling pass stripped the \x1b but
+// left the CSI payload behind, causing raw garbage like ";26;37M[<0;26;37m"
+// to leak into the viewport. Returns -1 when no match.
+func matchOrphanMouse(runes []rune, start int) int {
+	j := start + 1
+	if j >= len(runes) || runes[j] != '<' {
+		return -1
+	}
+	j++
+	if j >= len(runes) || runes[j] < '0' || runes[j] > '9' {
+		return -1
+	}
+	j++
+	for j < len(runes) && runes[j] >= '0' && runes[j] <= '9' {
+		j++
+	}
+	for j < len(runes) && runes[j] == ';' {
+		k := j + 1
+		if k < len(runes) && runes[k] >= '0' && runes[k] <= '9' {
+			j = k + 1
+			for j < len(runes) && runes[j] >= '0' && runes[j] <= '9' {
+				j++
+			}
+		} else {
+			break
+		}
+	}
+	// Final byte: 'M' (DEC private mode press/release) or 'm' (SGR variant)
+	if j < len(runes) && (runes[j] == 'M' || runes[j] == 'm') {
 		return j
 	}
 	return -1
@@ -1053,6 +1153,26 @@ func (m *model) flushPendingRecords() tea.Cmd {
 		cmds = append(cmds, m.flushRecord(rec))
 	}
 	return tea.Batch(cmds...)
+}
+
+// cleanShutdownCmd performs a graceful session teardown: kills orphan
+// processes, purges in-memory session state, and preserves the persistent
+// .izen metadata directory for future sessions. The .izen directory is NEVER
+// deleted — it is permanent and persists across application lifecycles.
+// Only transient session files (session.json, context_ledger.json) are cleared
+// to give a clean slate on next startup.
+func (m *model) cleanShutdownCmd() tea.Cmd {
+	return func() tea.Msg {
+		execution.KillAllOrphans()
+		if m.sess != nil {
+			m.sess.SetMode(m.resolver.Current())
+			m.sess.Purge()
+		}
+		if m.workspaceRoot != "" {
+			_ = state.CleanupLocalState(m.workspaceRoot)
+		}
+		return tea.Quit()
+	}
 }
 
 var spinnerBaseStyle = lipgloss.NewStyle()

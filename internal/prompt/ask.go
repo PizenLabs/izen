@@ -2,6 +2,43 @@ package prompt
 
 import "fmt"
 
+// AskPromptHandoffContract returns the IZEN INTELLIGENT PROMPT HANDOFF PACK
+// template. It instructs the LLM to act as a Strict Senior Architect that
+// evaluates, prunes, and refines the user's raw architectural idea into
+// five structured sections — no session history aggregation, no JSON wrapping.
+func AskPromptHandoffContract() string {
+	return `=========================================
+🚀 IZEN INTELLIGENT PROMPT HANDOFF PACK
+=========================================
+
+You are acting as a Strict Senior DevOps / Systems Architect. Your task is to evaluate the user's raw architectural idea (provided below), prune ambiguities, eliminate conversational noise, and restructure it into exactly 5 sections using standard markdown dividers (##, *, [ ]). Act with the rigor of a senior engineer reviewing a junior teammate's design draft — be precise, critical, and constructive.
+
+Output EXACTLY this structure with no preamble, no explanation, and no trailing commentary:
+
+## 1. CONTEXT & ROLE
+- Target Role: [e.g., Senior DevOps / Database Architect / Go Core Expert]
+- System Context: [Brief, refined summary of the project state and target scope from the user's raw text]
+
+## 2. PROBLEM STATEMENT
+- Core Idea: [Precise technical description of the core issue or feature — stripped of ambiguity]
+- Symptoms / Motivation: [What the user originally described, rephrased as concrete technical signals]
+
+## 3. EXPECTATION
+- [ ] Concrete Objective 1 (Physical output deliverables, target files to modify)
+- [ ] Concrete Objective 2 (Acceptance criteria, performance constraints, or test definitions)
+
+## 4. SMART ANALYSIS & TRADEOFFS
+- Proposed Solution: [The architectural approach chosen for the fix/feature]
+- Pros: [Benefits of this implementation]
+- Cons & Tradeoffs: [The cost paid, e.g., context token inflation, backward compatibility risks, performance overhead]
+
+## 5. FORENSIC HANDOFF VECTOR
+- Diagnostic Targets: [List of specific source files, functions, or directories to deep-dive inspect]
+- Command Target: [Target test or run commands required to fetch real-world runtime logs]
+
+Now refine the following raw user input:`
+}
+
 // AskContract returns the operational contract for ask mode.
 //
 // Purpose: increase understanding.

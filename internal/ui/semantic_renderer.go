@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/alecthomas/chroma/v2"
+	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -72,7 +74,108 @@ func (r *ImpactRenderer) Render(v ImpactCardViewModel) string {
 // with full-width colored background tracks for additions and deletions.
 type DiffRenderer struct {
 	Width     int
-	IsNewFile bool // When true, render single-column line numbers (new file creation)
+	IsNewFile bool   // When true, render single-column line numbers (new file creation)
+	Language  string // Optional: language hint for Chroma syntax highlighting (e.g. "go", "python")
+}
+
+// diffSyntaxHighlight applies Chroma token-based coloring to a single line of
+// source code using the Catppuccin Mocha ANSI palette. It returns a styled
+// lipgloss string with keywords, strings, comments, and function names colored
+// distinctly so the developer can verify syntax correctness at a glance.
+// Falls back to the default style when the lexer or tokeniser fails.
+func (r *DiffRenderer) diffSyntaxHighlight(line string) string {
+	if r.Language == "" {
+		return line
+	}
+	lexer := lexers.Get(r.Language)
+	if lexer == nil {
+		lexer = lexers.Fallback
+	}
+	lexer = chroma.Coalesce(lexer)
+	it, err := lexer.Tokenise(nil, line)
+	if err != nil || it == nil {
+		return line
+	}
+	var b strings.Builder
+	for _, tok := range it.Tokens() {
+		switch {
+		case tok.Type >= chroma.Keyword && tok.Type <= chroma.KeywordType:
+			b.WriteString(ansiKeyword)
+			b.WriteString(tok.Value)
+			b.WriteString(ansiReset)
+		case tok.Type >= chroma.NameFunction && tok.Type <= chroma.NameFunctionMagic:
+			b.WriteString(ansiFunction)
+			b.WriteString(tok.Value)
+			b.WriteString(ansiReset)
+		case tok.Type >= chroma.String && tok.Type <= chroma.StringSymbol:
+			b.WriteString(ansiString)
+			b.WriteString(tok.Value)
+			b.WriteString(ansiReset)
+		case tok.Type >= chroma.Comment && tok.Type <= chroma.CommentPreprocFile:
+			b.WriteString(ansiComment)
+			b.WriteString(tok.Value)
+			b.WriteString(ansiReset)
+		case tok.Type >= chroma.LiteralNumber && tok.Type <= chroma.LiteralNumberOct:
+			b.WriteString(ansiNumber)
+			b.WriteString(tok.Value)
+			b.WriteString(ansiReset)
+		default:
+			b.WriteString(tok.Value)
+		}
+	}
+	return b.String()
+}
+
+// langFromPath returns the Chroma-compatible language label for a file path
+// by mapping the file extension (e.g. ".go" → "go", ".py" → "python"). Returns
+// "" when the extension is unknown, which disables Chroma-based highlighting.
+func langFromPath(path string) string {
+	switch {
+	case strings.HasSuffix(path, ".go"):
+		return "go"
+	case strings.HasSuffix(path, ".py"):
+		return "python"
+	case strings.HasSuffix(path, ".rs"):
+		return "rust"
+	case strings.HasSuffix(path, ".ts") || strings.HasSuffix(path, ".tsx"):
+		return "typescript"
+	case strings.HasSuffix(path, ".js") || strings.HasSuffix(path, ".jsx"):
+		return "javascript"
+	case strings.HasSuffix(path, ".java"):
+		return "java"
+	case strings.HasSuffix(path, ".kt") || strings.HasSuffix(path, ".kts"):
+		return "kotlin"
+	case strings.HasSuffix(path, ".swift"):
+		return "swift"
+	case strings.HasSuffix(path, ".rb"):
+		return "ruby"
+	case strings.HasSuffix(path, ".php"):
+		return "php"
+	case strings.HasSuffix(path, ".cs"):
+		return "csharp"
+	case strings.HasSuffix(path, ".c") || strings.HasSuffix(path, ".h"):
+		return "c"
+	case strings.HasSuffix(path, ".cpp") || strings.HasSuffix(path, ".hpp") || strings.HasSuffix(path, ".cc"):
+		return "cpp"
+	case strings.HasSuffix(path, ".css"):
+		return "css"
+	case strings.HasSuffix(path, ".html") || strings.HasSuffix(path, ".htm"):
+		return "html"
+	case strings.HasSuffix(path, ".json"):
+		return "json"
+	case strings.HasSuffix(path, ".yaml") || strings.HasSuffix(path, ".yml"):
+		return "yaml"
+	case strings.HasSuffix(path, ".toml"):
+		return "toml"
+	case strings.HasSuffix(path, ".sql"):
+		return "sql"
+	case strings.HasSuffix(path, ".sh") || strings.HasSuffix(path, ".bash"):
+		return "bash"
+	case strings.HasSuffix(path, ".md"):
+		return "markdown"
+	default:
+		return ""
+	}
 }
 
 // padToWidth pads s to exactly n visual cells with trailing spaces.
@@ -142,7 +245,8 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 				clean := strings.TrimPrefix(line, "+")
 				gutter := diffLineNumHLSty.Render(fmt.Sprintf("%4d │ ", newLineNum))
 				newLineNum++
-				body := "+ " + clean
+				highlighted := r.diffSyntaxHighlight(clean)
+				body := "+ " + highlighted
 				bodyW := contentWidth - lipgloss.Width(gutter)
 				if bodyW < 0 {
 					bodyW = 0
@@ -154,20 +258,22 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 			default:
 				gutter := diffLineNumSty.Render(fmt.Sprintf("%4d │ ", newLineNum))
 				newLineNum++
+				highlighted := r.diffSyntaxHighlight(line)
 				bodyW := contentWidth - lipgloss.Width(gutter)
 				if bodyW < 0 {
 					bodyW = 0
 				}
-				row := gutter + semanticNormalStyle.Render(padToWidth("  "+line, bodyW))
+				row := gutter + semanticNormalStyle.Render(padToWidth("  "+highlighted, bodyW))
 				renderedLines = append(renderedLines, row)
 			}
 		} else {
-			// STANDARD DIFF — symmetrical single-line-number gutter
+			// STANDARD DIFF — symmetrical single-line-number gutter with syntax highlighting
 			switch {
 			case strings.HasPrefix(line, "-"):
 				clean := strings.TrimPrefix(line, "-")
+				highlighted := r.diffSyntaxHighlight(clean)
 				gutter := diffLineNumSty.Render(fmt.Sprintf("%4d │ ", newLineNum))
-				body := "- " + clean
+				body := "- " + highlighted
 				bodyW := contentWidth - lipgloss.Width(gutter)
 				if bodyW < 0 {
 					bodyW = 0
@@ -177,9 +283,10 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 
 			case strings.HasPrefix(line, "+"):
 				clean := strings.TrimPrefix(line, "+")
+				highlighted := r.diffSyntaxHighlight(clean)
 				gutter := diffLineNumHLSty.Render(fmt.Sprintf("%4d │ ", newLineNum))
 				newLineNum++
-				body := "+ " + clean
+				body := "+ " + highlighted
 				bodyW := contentWidth - lipgloss.Width(gutter)
 				if bodyW < 0 {
 					bodyW = 0
@@ -188,14 +295,15 @@ func (r *DiffRenderer) Render(v DiffCardViewModel) string {
 				renderedLines = append(renderedLines, row)
 
 			default:
-				// Context line
+				// Context line with Chroma syntax highlighting
+				highlighted := r.diffSyntaxHighlight(line)
 				gutter := diffLineNumSty.Render(fmt.Sprintf("%4d │ ", newLineNum))
 				newLineNum++
 				bodyW := contentWidth - lipgloss.Width(gutter)
 				if bodyW < 0 {
 					bodyW = 0
 				}
-				row := gutter + diffCtxStyle.Render(padToWidth("  "+line, bodyW))
+				row := gutter + diffCtxStyle.Render(padToWidth("  "+highlighted, bodyW))
 				renderedLines = append(renderedLines, row)
 			}
 		}
@@ -258,7 +366,7 @@ func (r *MutationRenderer) Render(v MutationCardViewModel) string {
 
 	if v.Expanded {
 		if v.Diff.Content != "" {
-			dr := &DiffRenderer{Width: contentWidth - 4, IsNewFile: v.IsNewFile}
+			dr := &DiffRenderer{Width: contentWidth - 4, IsNewFile: v.IsNewFile, Language: langFromPath(v.Target.Name)}
 			diffRendered := dr.Render(v.Diff)
 			diffLines := strings.Split(diffRendered, "\n")
 

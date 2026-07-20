@@ -127,6 +127,28 @@ func TestIsCompilationOrDependencyError(t *testing.T) {
 	}
 }
 
+func TestIsCompilationOrDependencyErrorTruncated(t *testing.T) {
+	// Bug regression: truncated ledger output (UI layout limits) must still
+	// trip the detector instead of forcing a manual /investigate re-run.
+	truncatedCases := []string{
+		"no required modul",                                   // clipped "module"
+		"missing Go module github.com/foo/bar",                // new fuzzy phrase
+		"finding module for package github.com/foo/bar",       // new fuzzy phrase
+		"main.go:7:5: no required",                            // coordinate + clipped phrase
+		"cmd/api/main.go:12:3: could not import github.com/x", // *.go coord + import error
+	}
+	for _, c := range truncatedCases {
+		if !IsCompilationOrDependencyError(c) {
+			t.Fatalf("expected truncated/fuzzy dep error to be detected: %q", c)
+		}
+	}
+	// Coordinate without an import/parse indicator must NOT match as a
+	// dependency error (it would be a logic bug, not a module discrepancy).
+	if IsCompilationOrDependencyError("cmd/api/main.go:12:3: x := 5") {
+		t.Fatal("expected plain source line to NOT be a dependency error")
+	}
+}
+
 func TestFastTrackPrompt(t *testing.T) {
 	p := FastTrackPrompt("cmd/api/main.go:7:5: no required module provides package github.com/foo/bar", "")
 	if !strings.Contains(p, "0 explicit code TODOs") {

@@ -12,19 +12,20 @@ import (
 
 // ── Catppuccin Mocha Palette (Optimized Visual Hierarchy) ─────────────────────
 const (
-	colorText    = "#cdd6f4" // Dominant foreground text
-	colorAccent  = "#a6e3a1" // High-fidelity mint green
-	colorGreen   = "#a6e3a1"
-	colorGreenBr = "#b9f0b4"
-	colorRed     = "#f38ba8"
-	colorMaroon  = "#eba0ac"
-	colorOrange  = "#fab387"
-	colorYellow  = "#f9e2af"
-	colorCyan    = "#89dceb"
-	colorTeal    = "#94e2d5"
-	colorPink    = "#f5c2e7"
-	colorBlue    = "#89b4fa"
-	colorMauve   = "#cba6f7"
+	colorText     = "#cdd6f4" // Dominant foreground text
+	colorAccent   = "#a6e3a1" // High-fidelity mint green
+	colorGreen    = "#a6e3a1"
+	colorGreenBr  = "#b9f0b4"
+	colorRed      = "#f38ba8"
+	colorMaroon   = "#eba0ac"
+	colorOrange   = "#fab387"
+	colorYellow   = "#f9e2af"
+	colorCyan     = "#89dceb"
+	colorTeal     = "#94e2d5"
+	colorPink     = "#f5c2e7"
+	colorBlue     = "#89b4fa"
+	colorMauve    = "#cba6f7"
+	colorSapphire = "#74c7ec"
 
 	colorSurface = "#1e1e2e"
 	colorOverlay = "#313244"
@@ -151,8 +152,10 @@ var (
 	blueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
 
 	// Bold + color
-	boldTextStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
-	boldAccentStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorAccent))
+	boldTextStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
+	boldAccentStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorAccent))
+	boldSapphireStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorSapphire))
+	boldMauveStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMauve))
 
 	// Startup banner border
 	bannerBorderStyle = lipgloss.NewStyle().
@@ -181,6 +184,29 @@ var (
 	systemActivityStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color(colorDimmed)).
 				Faint(true)
+)
+
+// ── Permission Box Styles (Build Approval Gate) ────────────────────────────────
+var (
+	// permissionBoxStyle wraps the entire permission-required dialog in a
+	// distinctive red/orange bordered box so the user instantly recognises
+	// an interactive security checkpoint.
+	permissionBoxStyle = lipgloss.NewStyle().
+				Border(lipgloss.DoubleBorder()).
+				BorderForeground(lipgloss.Color(colorOrange)).
+				Padding(0, 1).
+				Width(60)
+	permissionTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color(colorYellow))
+	permissionTargetStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(colorText)).
+				PaddingLeft(2)
+	permissionKeyStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color(colorMauve))
+	permissionDescStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(colorMuted))
 )
 
 // ── Hotkey Highlight Styles (Keyboard-Only Execution) ─────────────────────────
@@ -235,30 +261,30 @@ var (
 	secondaryModeStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMuted))
 )
 
-// isCoreEngineeringMode returns true for /ask, /build, /investigate, /review.
+// isCoreEngineeringMode returns true for /ask, /plan, /build, /investigate, /review.
 func isCoreEngineeringMode(m modes.Mode) bool {
-	return m == modes.ModeAsk || m == modes.ModeBuild ||
+	return m == modes.ModeAsk || m == modes.ModePlan || m == modes.ModeBuild ||
 		m == modes.ModeInvestigate || m == modes.ModeReview
 }
 
 // Pre-compiled Markdown renderer styles (render-path — zero NewStyle).
 var (
-	mdEmphasisStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Italic(true)
+	mdEmphasisStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7")).Italic(true)
 	mdStrongStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
-	mdH1Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1"))
-	mdH2Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
+	mdH1Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7"))
+	mdH2Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa"))
 	mdH3Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa"))
 	mdH4Style         = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 	mdCodeSpanStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af")).Background(lipgloss.Color("#1e1e2e"))
 	mdLinkStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Underline(true)
 	mdMutedStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 	mdCodeContStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
-	mdAccentStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa"))
-	mdSepStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
+	mdAccentStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7"))
+	mdSepStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
 	mdImageMutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 	mdHeaderBoldCell  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
 	mdCellStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
-	mdBulletStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
+	mdBulletStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
 
 	// Callout label styles per keyword
 	mdCalloutStyles = map[string]lipgloss.Style{

@@ -9,11 +9,14 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/command"
+	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/commit"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/review"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/internal/session"
 )
 
 func (m *model) runInvestigateCmd(content string) tea.Cmd {
@@ -186,6 +189,151 @@ func buildInvestigationEscalation(content string, result *investigate.Investigat
 	escBuilder.WriteString("Analyze the diagnostic telemetry above in context of the original user query. ")
 	escBuilder.WriteString("Provide a definitive resolution streamed back to the terminal.\n")
 	return escBuilder.String()
+}
+
+// runReviewTestComposite implements the /review $test composite fast-query:
+// it runs the dynamic test suite, injects the telemetry into the forensic
+// ledger context, then triggers the risk analysis engine with both the git
+// diff AND the test reports. Returns a tea.Cmd so the synchronous pipeline
+// never blocks the Bubble Tea event loop.
+func (m *model) runReviewTestComposite() tea.Cmd {
+	return tea.Sequence(
+		func() tea.Msg {
+			return agentStartMsg{label: "review+test"}
+		},
+		func() tea.Msg {
+			res := command.HandleReviewTestComposite(
+				&reviewTestExecutor{m: m},
+				&reviewLedgerInjector{m: m},
+				&reviewRunner{m: m},
+			)
+
+			recs := []record{}
+
+			statusLine := "✓ all tests passed"
+			if !res.TestPassed {
+				statusLine = "✗ tests failed — see telemetry below"
+			}
+			recs = append(recs, record{role: roleSystem, text: statusLine})
+			if res.TestReport != "" {
+				for _, line := range strings.Split(res.TestReport, "\n") {
+					if line == "" {
+						continue
+					}
+					role := roleSystem
+					if strings.Contains(line, "FAIL") || strings.Contains(line, "error") {
+						role = roleError
+					} else if strings.Contains(line, "PASS") || strings.Contains(line, "ok") {
+						role = roleStatus
+					}
+					recs = append(recs, record{role: role, text: line})
+				}
+			}
+
+			if res.Err != nil {
+				return reviewResultMsg{err: res.Err}
+			}
+
+			// Telemetry has been injected into the forensic ledger; surface a
+			// minimal confirmation line so the pipeline trace is visible.
+			recs = append(recs, record{role: roleSystem, text: "[IZEN] Test telemetry injected into forensic ledger."})
+
+			if res.Review != "" {
+				recs = append(recs, record{role: roleAI, text: res.Review})
+			}
+			return reviewResultMsg{records: recs}
+		},
+	)
+}
+
+// reviewTestExecutor runs the dynamic test suite for the composite pipeline.
+type reviewTestExecutor struct {
+	m *model
+}
+
+func (e *reviewTestExecutor) RunDynamicTests() (bool, string, error) {
+	runner := execExecutionRunner(".")
+	result, err := runner.Run("go test -v ./...")
+	if err != nil && result == nil {
+		return false, err.Error(), err
+	}
+	output := ""
+	passed := true
+	if result != nil {
+		output = result.Stdout
+		if result.Stderr != "" {
+			if output != "" {
+				output += "\n"
+			}
+			output += result.Stderr
+		}
+		if result.ExitCode != 0 {
+			passed = false
+		}
+	}
+	e.m.lastTestOutput = output
+	e.m.lastTestFailed = !passed
+	return passed, output, nil
+}
+
+// reviewLedgerInjector feeds test telemetry into the forensic ledger context.
+type reviewLedgerInjector struct {
+	m *model
+}
+
+func (i *reviewLedgerInjector) InjectTestTelemetry(passed bool, telemetry string) error {
+	ledger := i.m.sess.ContextLedger
+	if ledger == nil {
+		ledger = session.NewContextLedger(modes.ModeReview)
+	}
+	status := "passed"
+	if !passed {
+		status = "failed"
+	}
+	ledger.InjectPacket(session.LedgerPacket{
+		Kind:    "test_telemetry",
+		Title:   "dynamic test suite report",
+		Payload: fmt.Sprintf("test suite: %s\n\n%s", status, telemetry),
+	})
+	i.m.sess.SetContextLedger(ledger)
+	return nil
+}
+
+// reviewRunner triggers the comprehensive review engine (git diff + ledger).
+type reviewRunner struct {
+	m *model
+}
+
+func (r *reviewRunner) RunComprehensiveReview() (string, error) {
+	if cur := r.m.resolver.Current(); cur.CanWrite() || cur.CanShell() || cur.CanPatch() {
+		return "", fmt.Errorf("review mode: write/shell/patch capability detected — review must be 100%% read-only")
+	}
+	eng := review.NewEngine(".", nil, nil)
+	result, err := eng.Run()
+	if err != nil {
+		return "", err
+	}
+	if result.Error != "" {
+		return result.Error, nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "│ Review: %s → %s\n", result.BaseBranch, result.Branch)
+	fmt.Fprintf(&b, "│ Commit: %s · Files Changed: %d · Duration: %s\n", result.CommitHash, len(result.FilesChanged), result.Duration)
+	fmt.Fprintf(&b, "│ Score: %d/100 · Risk Score: %d/100\n", result.Score, result.ImpactRadius.RiskScore)
+	if len(result.RiskFindings) > 0 {
+		b.WriteString("│\n│ Risk Findings:\n")
+		for _, f := range result.RiskFindings {
+			fmt.Fprintf(&b, "│   [%s] %s:%d — %s\n", strings.ToUpper(string(f.Severity)), f.File, f.Line, f.Description)
+		}
+	}
+	if len(result.Recommendations) > 0 {
+		b.WriteString("│\n│ Recommendations:\n")
+		for i, rec := range result.Recommendations {
+			fmt.Fprintf(&b, "│   %d. %s\n", i+1, rec)
+		}
+	}
+	_ = review.SaveReport(result, ".")
+	return b.String(), nil
 }
 
 func (m *model) runReviewCmd(target string) tea.Cmd {

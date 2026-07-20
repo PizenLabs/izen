@@ -241,6 +241,17 @@ var dangerousPatterns = []string{
 	"chmod 0",
 	"chown -R",
 	"git push --force",
+	// ── ABSOLUTE HUMAN-IN-THE-LOOP GATE: every sudo invocation requires
+	// explicit user confirmation and is banned from silent background execution.
+	"sudo",
+	// ── OS-FENCE: commands that are hallmarks of a non-macOS environment
+	// (apt-get, apt, dpkg, yum, dnf) are blocked when running on Darwin so the
+	// engine cannot generate incorrect platform commands.
+	"apt-get",
+	"apt ",
+	"dpkg",
+	"yum ",
+	"dnf ",
 }
 
 func isDangerous(command string) bool {

@@ -14,15 +14,15 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
-// ── Catppuccin Mocha ANSI true-color escape sequences ────────────────────
+// ── Catppuccin Mocha ANSI true-color escape sequences (subdued) ─────────
 var (
 	ansiReset    = "\x1b[0m"
 	ansiText     = "\x1b[38;2;205;214;244m" // #cdd6f4 Foreground
-	ansiKeyword  = "\x1b[38;2;203;166;247m" // #cba6f7 Mauve
-	ansiString   = "\x1b[38;2;166;227;161m" // #a6e3a1 Green
-	ansiComment  = "\x1b[38;2;108;112;134m" // #6c7086 Overlay 0
-	ansiNumber   = "\x1b[38;2;250;179;135m" // #fab387 Peach
-	ansiFunction = "\x1b[38;2;137;180;250m" // #89b4fa Blue
+	ansiKeyword  = "\x1b[38;2;203;166;247m" // #cba6f7 Muted lavender
+	ansiString   = "\x1b[38;2;166;227;161m" // #a6e3a1 Soft green
+	ansiComment  = "\x1b[38;2;108;112;134m" // #6c7086 Muted gray
+	ansiNumber   = "\x1b[38;2;250;179;135m" // #fab387 Soft amber
+	ansiFunction = "\x1b[38;2;137;180;250m" // #89b4fa Muted blue
 )
 
 // tokenTypeColor maps a Chroma token type to its ANSI true-color sequence
@@ -41,7 +41,7 @@ func tokenTypeColor(t chroma.TokenType) string {
 	case t >= chroma.LiteralNumber && t <= chroma.LiteralNumberOct:
 		return ansiNumber
 	case t == chroma.GenericDeleted:
-		return ansiKeyword
+		return ansiText
 	case t == chroma.GenericInserted || t == chroma.GenericEmph:
 		return ansiString
 	case t == chroma.GenericHeading || t == chroma.GenericStrong:
@@ -158,11 +158,11 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 
 	if strings.HasPrefix(trimmed, "- [ ]") {
 		content := strings.TrimSpace(trimmed[5:])
-		return dimmedStyle.Render("○ ") + applyInlineStyles(content)
+		return dimmedStyle.Render(Icon.Pending+" ") + applyInlineStyles(content)
 	}
 	if strings.HasPrefix(trimmed, "- [x]") {
 		content := strings.TrimSpace(trimmed[5:])
-		return greenStyle.Render("● ") + applyInlineStyles(content)
+		return greenStyle.Render(Icon.Done+" ") + applyInlineStyles(content)
 	}
 
 	return applyInlineStyles(line)
@@ -327,27 +327,52 @@ func (m *model) renderStreamingContent(content string, width int) string {
 				var prefixStyle lipgloss.Style
 				var text string
 
+				// Detect operational status icons for structured task lines
 				switch {
-				case strings.HasPrefix(item, "- [x]") || strings.HasPrefix(item, "[x]") || strings.HasPrefix(item, "✓"):
-					prefixChar = "● "
-					prefixStyle = greenStyle
-					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [x]"), "[x]"), "✓"))
-				case strings.HasPrefix(item, "- [/]") || strings.HasPrefix(item, "[/]") || strings.HasPrefix(item, "●"):
-					prefixChar = "● "
+				case strings.Contains(item, "SHELL_EXEC"):
+					prefixChar = Icon.ShellExec + " "
 					prefixStyle = orangeStyle
-					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [/]"), "[/]"), "●"))
-				case strings.HasPrefix(item, "- [ ]") || strings.HasPrefix(item, "[ ]") || strings.HasPrefix(item, "○"):
-					prefixChar = "○ "
-					prefixStyle = dimmedStyle
-					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [ ]"), "[ ]"), "○"))
-				case strings.HasPrefix(item, "✗"):
-					prefixChar = "• "
-					prefixStyle = redStyle
-					text = strings.TrimSpace(strings.TrimPrefix(item, "✗"))
+				case strings.Contains(item, "FILE_MUTATE"), strings.Contains(item, "DIFF_PATCH"), strings.Contains(item, "ATOMIC_REPLACE"):
+					prefixChar = Icon.SrcPatch + " "
+					prefixStyle = blueStyle
+				case strings.Contains(item, "GIT_ACTION"):
+					prefixChar = Icon.ShellExec + " "
+					prefixStyle = orangeStyle
 				default:
-					prefixChar = "• "
-					prefixStyle = textStyle
-					text = item
+					switch {
+					case strings.HasPrefix(item, "- [x]") || strings.HasPrefix(item, "[x]") || strings.HasPrefix(item, "✓"):
+						prefixChar = Icon.Done + " "
+						prefixStyle = greenStyle
+						text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [x]"), "[x]"), "✓"))
+					case strings.HasPrefix(item, "- [/]") || strings.HasPrefix(item, "[/]") || strings.HasPrefix(item, "●"):
+						prefixChar = Icon.ShellExec + " "
+						prefixStyle = orangeStyle
+						text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [/]"), "[/]"), "●"))
+					case strings.HasPrefix(item, "- [ ]") || strings.HasPrefix(item, "[ ]") || strings.HasPrefix(item, "○"):
+						prefixChar = Icon.Pending + " "
+						prefixStyle = dimmedStyle
+						text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [ ]"), "[ ]"), "○"))
+					case strings.HasPrefix(item, "✗"):
+						prefixChar = Icon.Cross + " "
+						prefixStyle = redStyle
+						text = strings.TrimSpace(strings.TrimPrefix(item, "✗"))
+					default:
+						prefixChar = Icon.Pending + " "
+						prefixStyle = textStyle
+						text = item
+					}
+				}
+
+				stripTypePrefix := func(s string) string {
+					for _, p := range []string{"SHELL_EXEC:", "FILE_MUTATE:", "GIT_ACTION:", "DIFF_PATCH:", "ATOMIC_REPLACE:"} {
+						if idx := strings.Index(s, p); idx >= 0 {
+							return strings.TrimSpace(s[idx+len(p):])
+						}
+					}
+					return s
+				}
+				if prefixChar == Icon.ShellExec+" " || prefixChar == Icon.SrcPatch+" " {
+					text = stripTypePrefix(item)
 				}
 
 				wrapW := widgetInnerWidth - 2
@@ -364,11 +389,14 @@ func (m *model) renderStreamingContent(content string, width int) string {
 					}
 				}
 			}
+			// Phase 4: Always render plan blocks through the widget layout engine.
+			// The LLM returns raw task data; the UI applies the │ borders, operational
+			// status icons, and color blocks deterministically via renderWidget.
 			rendered = renderWidget("Plan", strings.Join(contentLines, "\n"), availableWidth, colorModePlan)
 
 		case blockDiff:
 			file, symbol, linesRange, cleanDiff := parseDiffMetadata(block.raw)
-			dr := &DiffRenderer{Width: availableWidth}
+			dr := &DiffRenderer{Width: availableWidth, Language: langFromPath(file)}
 			diffRendered := dr.Render(ToDiffCardViewModel(cleanDiff))
 
 			var details []string
@@ -440,20 +468,41 @@ func (m *model) renderStreamingContent(content string, width int) string {
 			rendered = renderWidget("Command", container.String(), availableWidth, colorModePlan)
 
 		default:
-			// INTERCEPT: suppress raw JSON plans by rendering a clean widget —
-			// but ONLY outside /build mode. In /build the plan phase is over, so
-			// a JSON plan here is a contract violation (the model designed
-			// instead of executing). Rendering it as a legit-looking Plan widget
-			// would mask the failure, so surface an explicit error instead.
-			if jsonResult := plan.ParseJSONPlan(block.raw); jsonResult != nil && jsonResult.Valid && jsonResult.Plan != nil {
-				if m.resolver.Current() == modes.ModeBuild {
-					rendered = renderWidget("Execution Error",
-						textStyle.Render("Model returned a /plan JSON contract instead of a code patch. "+
-							"The plan phase is complete — re-run the task or refine the instruction to force patch output."),
-						availableWidth, colorModeReview)
+			// INTERCEPT: JSON plan widget — ONLY for /plan and /build modes where
+			// the model is instructed to output structured JSON. For /ask, /review,
+			// and /investigate this MUST be skipped entirely to prevent accidental
+			// JSON parsing of plain Markdown content (which can trigger terminal-
+			// corrupting stderr log spam from ParseJSONPlan's token-limit guard).
+			if m.resolver.Current() == modes.ModePlan || m.resolver.Current() == modes.ModeBuild {
+				if jsonResult := plan.ParseJSONPlan(block.raw); jsonResult != nil && jsonResult.Valid && jsonResult.Plan != nil {
+					if m.resolver.Current() == modes.ModeBuild {
+						rendered = renderWidget("Execution Error",
+							textStyle.Render("Model returned a /plan JSON contract instead of a code patch. "+
+								"The plan phase is complete — re-run the task or refine the instruction to force patch output."),
+							availableWidth, colorModeReview)
+						break
+					}
+					rendered = renderJSONPlanWidget(jsonResult.Plan, m.planStatusSource(), availableWidth)
 					break
 				}
-				rendered = renderJSONPlanWidget(jsonResult.Plan, m.planStatusSource(), availableWidth)
+			}
+
+			// Phase 4: In /plan mode, force ALL content through the plan widget
+			// layout engine (│ borders, ◉ markers, color blocks) so the LLM's
+			// raw text is always wrapped in the deterministic UI frame.
+			if m.resolver.Current() == modes.ModePlan {
+				lines := strings.Split(block.raw, "\n")
+				var cleanLines []string
+				for _, l := range lines {
+					t := strings.TrimSpace(l)
+					if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "---") {
+						continue
+					}
+					cleanLines = append(cleanLines, t)
+				}
+				if len(cleanLines) > 0 {
+					rendered = renderWidget("Plan", strings.Join(cleanLines, "\n"), availableWidth, colorModePlan)
+				}
 				break
 			}
 
@@ -489,6 +538,37 @@ func (m *model) planStatusSource() plan.TaskStatusSource {
 	return m.buildLedger
 }
 
+// planTrackIcon maps a Task to its track classification (ENV_DEPS, CODE_MOD, VERIFY)
+// and returns the icon+track label for the enriched plan display.
+// SHELL_EXEC dependency commands → 📦 [ENV_DEPS]
+// FILE_MUTATE/DIFF_PATCH/ATOMIC_REPLACE → 📝 [CODE_MOD]
+// Verification commands (go test, go build, etc.) → 🧪 [VERIFY]
+func planTrackIcon(t plan.Task) (string, string) {
+	icon, label := enrichedTrack(t.Type, t.Target)
+	return icon, label
+}
+
+// enrichedTrack maps a strategy+target pair to the enriched track classification.
+// Used by both planTrackIcon (Task) and renderJSONPlanWidget (AtomicTask).
+func enrichedTrack(strategy, target string) (string, string) {
+	upper := strings.ToUpper(strategy)
+	lower := strings.ToLower(strings.TrimSpace(target))
+	switch upper {
+	case "SHELL_EXEC", "GIT_ACTION":
+		if strings.HasPrefix(lower, "go test") || strings.HasPrefix(lower, "go build") ||
+			strings.HasPrefix(lower, "npm test") || strings.HasPrefix(lower, "cargo test") ||
+			strings.HasPrefix(lower, "pytest") || strings.Contains(lower, "verify") ||
+			strings.Contains(lower, "./...") {
+			return Icon.Verify, "VERIFY"
+		}
+		return Icon.EnvDeps, "ENV_DEPS"
+	case "FILE_MUTATE", "DIFF_PATCH", "ATOMIC_REPLACE":
+		return Icon.CodeMod, "CODE_MOD"
+	default:
+		return Icon.EnvDeps, "ENV_DEPS"
+	}
+}
+
 // renderJSONPlanWidget renders a validated PlanOutput as a clean TUI widget.
 // Used when the LLM returns a valid JSON plan contract instead of markdown.
 // When src is non-nil each task's checkbox reflects its ledger state: tasks
@@ -506,11 +586,44 @@ func renderJSONPlanWidget(planOutput *plan.PlanOutput, src plan.TaskStatusSource
 
 	var b strings.Builder
 
-	b.WriteString(orangeStyle.Render("STRATEGY: "))
-	b.WriteString(textStyle.Render(planOutput.ArchitecturalStrategy))
+	// ── Strategic Architectural Blueprint ──────────────────────────────
+	b.WriteString(boldSapphireStyle.Render(Icon.Blueprint + " STRATEGIC ARCHITECTURAL BLUEPRINT"))
 	b.WriteString("\n")
 
-	b.WriteString(dimmedStyle.Render(strings.Repeat("─", contentWidth)))
+	overview := planOutput.StrategicOverview
+	if overview.RootCoreFactor != "" {
+		b.WriteString(textStyle.Render(overview.RootCoreFactor))
+		b.WriteString("\n")
+	}
+	if overview.ImpactDomain != "" {
+		fmt.Fprintf(&b, "  %s %s\n",
+			dimmedStyle.Render(Icon.Chevron+" Impact Domain:"),
+			textStyle.Render(overview.ImpactDomain),
+		)
+	}
+	if overview.RiskEvaluation != "" {
+		riskStyle := dimmedStyle
+		riskText := overview.RiskEvaluation
+		riskLower := strings.ToLower(riskText)
+		if strings.Contains(riskLower, "critical") || strings.Contains(riskLower, "high") {
+			riskStyle = redStyle
+		}
+		fmt.Fprintf(&b, "  %s %s\n",
+			dimmedStyle.Render(Icon.Chevron+" Risk Evaluation:"),
+			riskStyle.Render(riskText),
+		)
+	}
+	if overview.VerificationVector != "" {
+		fmt.Fprintf(&b, "  %s %s\n",
+			dimmedStyle.Render(Icon.Chevron+" Verification Vector:"),
+			textStyle.Render(overview.VerificationVector),
+		)
+	}
+
+	b.WriteString("\n")
+
+	// ── Staged Execution Timeline ──────────────────────────────────────
+	b.WriteString(boldMauveStyle.Render(Icon.Timeline + " STAGED EXECUTION TIMELINE"))
 	b.WriteString("\n")
 
 	// Count committed tasks so the header reflects live ledger progress.
@@ -522,64 +635,89 @@ func renderJSONPlanWidget(planOutput *plan.PlanOutput, src plan.TaskStatusSource
 	}
 	if completed > 0 {
 		fmt.Fprintf(&b, "%s\n\n", boldTextStyle.Render(
-			fmt.Sprintf("TASKS (%d/%d completed):", completed, len(planOutput.AtomicTasks))))
+			fmt.Sprintf("(%d/%d tasks completed)", completed, len(planOutput.AtomicTasks))))
 	} else {
-		b.WriteString(boldTextStyle.Render("PENDING TASKS:"))
-		b.WriteString("\n\n")
+		b.WriteString("\n")
 	}
 
-	strikeStyle := textStyle.Strikethrough(true)
 	strikeDimStyle := dimmedStyle.Strikethrough(true)
 
 	for _, task := range planOutput.AtomicTasks {
 		done := src != nil && src.IsCompleted(task.TaskID)
 
-		checkbox := dimmedStyle.Render("[ ]")
-		labelStyle := orangeStyle
-		fileStyle := textStyle
+		var trackIcon, trackLabel string
 		if done {
-			checkbox = greenStyle.Render("[✓]")
-			labelStyle = greenStyle
-			fileStyle = strikeStyle
+			trackIcon = Icon.Done
+			trackLabel = "DONE"
+		} else {
+			trackIcon, trackLabel = enrichedTrack(task.Strategy, task.File)
 		}
 
-		fmt.Fprintf(&b, "%s %s %s\n",
-			checkbox,
-			labelStyle.Render(fmt.Sprintf("TASK #%d:", task.TaskID)),
-			fileStyle.Render(task.File),
-		)
-
-		indent := "    "
-		fmt.Fprintf(&b, "%s%s %s\n",
-			indent,
-			dimmedStyle.Render("↳ Strategy:"),
-			orangeStyle.Render(task.Strategy),
-		)
-
-		descW := contentWidth - lipgloss.Width(indent+"↳ Strategy: ") + 2
-		if descW < 10 {
-			descW = 10
+		iconStyle := greenStyle
+		if !done {
+			switch trackLabel {
+			case "ENV_DEPS":
+				iconStyle = orangeStyle
+			case "CODE_MOD":
+				iconStyle = blueStyle
+			case "VERIFY":
+				iconStyle = greenStyle
+			default:
+				iconStyle = dimmedStyle
+			}
 		}
+
 		descStyle := dimmedStyle
 		if done {
 			descStyle = strikeDimStyle
 		}
-		descLines := wrapStreamText(task.Description, descW)
-		for i, dl := range descLines {
-			if i == 0 {
-				fmt.Fprintf(&b, "%s%s %s\n",
-					indent,
-					dimmedStyle.Render("↳ Description:"),
-					descStyle.Render(dl),
-				)
-			} else {
-				fmt.Fprintf(&b, "%s%s %s\n",
-					indent,
-					strings.Repeat(" ", lipgloss.Width(dimmedStyle.Render("↳ Description:"))-lipgloss.Width(indent)),
-					descStyle.Render(dl),
-				)
+
+		tagStyle := dimmedStyle
+		if !done {
+			switch trackLabel {
+			case "ENV_DEPS":
+				tagStyle = orangeStyle
+			case "CODE_MOD":
+				tagStyle = blueStyle
+			case "VERIFY":
+				tagStyle = greenStyle
 			}
 		}
+
+		fmt.Fprintf(&b, "%s %s %s\n",
+			iconStyle.Render(trackIcon),
+			tagStyle.Render("["+trackLabel+"]"),
+			textStyle.Render(task.File),
+		)
+
+		// Rationale line
+		rationale := task.Rationale
+		if rationale == "" {
+			rationale = task.Description
+		}
+		if rationale != "" {
+			descW := contentWidth - 6
+			if descW < 10 {
+				descW = 10
+			}
+			ratLines := wrapStreamText(rationale, descW)
+			for _, rl := range ratLines {
+				fmt.Fprintf(&b, "  %s %s\n", dimmedStyle.Render(Icon.Chevron+" Rationale:"), descStyle.Render(rl))
+			}
+		}
+
+		// Solution line
+		if task.Solution != "" {
+			descW := contentWidth - 6
+			if descW < 10 {
+				descW = 10
+			}
+			solLines := wrapStreamText(task.Solution, descW)
+			for _, sl := range solLines {
+				fmt.Fprintf(&b, "  %s %s\n", dimmedStyle.Render(Icon.Chevron+" Expected Solution:"), descStyle.Render(sl))
+			}
+		}
+
 		b.WriteString("\n")
 	}
 

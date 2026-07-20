@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -62,8 +63,137 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// ── Awaiting approval (alt+ modifier only) ──────────────────────────────
+	// ── Awaiting approval ────────────────────────────────────────────
 	if m.state == StateAwaitingApproval {
+		// ── $hot HOTFIX APPROVAL GATE (Bug Fix 2) ──────────────────
+		// The hotfix patch was generated but NOT applied. The developer must
+		// explicitly authorize (y) or reject (n). On approval the patch is
+		// written to disk and the stashed plan restored; on rejection the
+		// hotfix aborts cleanly to PAUSED with zero disk mutation.
+		if m.pendingHotfixTask != nil && m.pendingHotfixPatch != nil {
+			switch {
+			case msg.String() == "y" || msg.String() == "Y":
+				task := m.pendingHotfixTask
+				patch := m.pendingHotfixPatch
+				m.pendingHotfixTask = nil
+				m.pendingHotfixPatch = nil
+				m.pendingProposals = nil
+				m.state = StateChat
+				m.ti.Focus()
+				m.recalcViewportHeight()
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				m.push(roleSystem, infoStyle.Render(
+					fmt.Sprintf("  ✓ Approved — applying hotfix patch to %s...", patch.File)))
+
+				// Apply the pre-generated patch through the execution engine
+				// (shadow backups + mutation guardrails). The buildResultMsg
+				// handler then restores the stashed plan and PAUSEs the pipeline.
+				return m, tea.Batch(
+					func() tea.Msg { return agentStartMsg{label: "hotfix apply"} },
+					m.applyHotfixPatch(task, patch),
+					m.spinnerTickCmd(),
+				)
+
+			case msg.String() == "n" || msg.String() == "N" ||
+				msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
+				// ── REJECT: abort cleanly, touch no files ──────────
+				rejectedPath := m.pendingHotfixTask.Target
+				m.pendingHotfixTask = nil
+				m.pendingHotfixPatch = nil
+				m.pendingProposals = nil
+				m.state = StateChat
+				m.ti.Focus()
+				m.recalcViewportHeight()
+				m.push(roleSystem, infoStyle.Render(
+					"  ✗ Rejected — hotfix aborted. No files were modified."))
+				m.push(roleError, fmt.Sprintf(
+					"[HOTFIX] Developer rejected patch to %s.",
+					rejectedPath))
+
+				// Restore the stashed plan so the pipeline returns to PAUSED.
+				m.hotfixActive = false
+				if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
+					m.sess.StageTaskList(&stashedTasks)
+					_ = m.sess.Save()
+				}
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, nil
+			}
+			return m, nil
+		}
+
+		// ── Build approval (SHELL_EXEC permission box) ──────────────
+		if m.pendingBuildApproval && m.pendingBuildTask != nil {
+			task := m.pendingBuildTask
+			switch {
+			case msg.String() == "y" || msg.String() == "Y" || msg.String() == "alt+a":
+				// ── Allow Once ────────────────────────────────────
+				m.pendingBuildApproval = false
+				m.pendingBuildTask = nil
+				m.state = StateChat
+				m.recalcViewportHeight()
+				m.ti.Focus()
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				m.push(roleSystem, infoStyle.Render("  ✓ Approved — executing shell command..."))
+				return m, tea.Batch(
+					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
+					m.runBuildShellExec(task),
+					m.spinnerTickCmd(),
+				)
+
+			case msg.String() == "a" || msg.String() == "A":
+				// ── Allow Always (session-wide bypass) ────────────
+				m.pendingBuildAllowAlways = true
+				m.pendingBuildApproval = false
+				m.pendingBuildTask = nil
+				m.state = StateChat
+				m.recalcViewportHeight()
+				m.ti.Focus()
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				m.push(roleSystem, infoStyle.Render(
+					"  ✓ Approved (always) — executing shell command..."))
+				return m, tea.Batch(
+					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
+					m.runBuildShellExec(task),
+					m.spinnerTickCmd(),
+				)
+
+			case msg.String() == "n" || msg.String() == "N" ||
+				msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
+				// ── Reject ─────────────────────────────────────────
+				m.pendingBuildApproval = false
+				m.pendingBuildTask = nil
+				m.state = StateChat
+				m.recalcViewportHeight()
+				m.ti.Focus()
+				if m.sess != nil {
+					tasks := m.sess.CurrentTasks
+					for i := range tasks {
+						if tasks[i].StepNum == task.StepNum {
+							tasks[i].Status = "stalled"
+							break
+						}
+					}
+					m.sess.StageTaskList(&tasks)
+					_ = m.sess.Save()
+				}
+				m.push(roleSystem, infoStyle.Render(
+					"  ✗ Rejected — shell execution aborted."))
+				m.push(roleError, fmt.Sprintf(
+					"[SECURITY] Aborting unauthorized shell execution: %s",
+					task.Target))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, nil
+			}
+			return m, nil
+		}
+
+		// ── File-mutation proposal approval ─────────────────────────
 		switch {
 		case msg.String() == "alt+a":
 			return m, m.applySingleProposal()
@@ -80,6 +210,25 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
+			// ── VIRTUAL SNAPSHOT ROLLBACK ────────────────────────────
+			// On user rejection, restore ALL files to the state captured
+			// at the last transaction boundary (mode entry / build start).
+			// This guarantees no mutation persists without explicit approval.
+			if m.execEng != nil {
+				if errs := m.execEng.RollbackTransaction(); len(errs) > 0 {
+					for _, err := range errs {
+						m.push(roleError, fmt.Sprintf("rollback error: %v", err))
+					}
+				}
+			}
+			// Clear dialog history so the next user prompt starts with a
+			// clean context scope — no stale plan output or previous
+			// proposals bleed into future turns.
+			if m.sess != nil {
+				m.sess.ClearHistory()
+				_ = m.sess.Save()
+			}
+
 			m.ti.Focus()
 			m.state = StateChat
 			m.recalcViewportHeight()
@@ -111,6 +260,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.proposedShellCmd = ""
 			m.push(roleSystem, infoStyle.Render("Command cancelled."))
 		}
+		// Build approval is now handled inside StateAwaitingApproval in the
+		// block above. The escape key there stalls the task and returns to chat.
 		m.ti.SetValue("")
 		m.ti.Reset()
 		m.syncInputFromTI()
@@ -120,10 +271,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlD:
 		if m.ti.Value() == "" && !m.agentRunning && !m.streaming && !m.reviewRunning && !m.pipelineRunning {
-			execution.KillAllOrphans()
-			m.sess.SetMode(m.resolver.Current())
-			_ = m.sess.Save()
-			return m, tea.Quit
+			return m, m.cleanShutdownCmd()
 		}
 		return m, nil
 

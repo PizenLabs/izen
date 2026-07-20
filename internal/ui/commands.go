@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/command"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/domain"
@@ -66,6 +68,51 @@ var inputANSIRe = regexp.MustCompile(`\x1b\[[<?][0-9;]*[a-zA-Z]`)
 // string so it is safe to store in the prompt's text buffer.
 func sanitizeInputBuffer(s string) string {
 	return inputANSIRe.ReplaceAllString(s, "")
+}
+
+// stashedPlanPath is the deterministic cache file path where the active /build
+// plan is serialized before a $hot hotfix execution. The Go engine restores
+// from this file after the hotfix completes — the LLM never sees the stash,
+// preventing 7B context drift across urgent interventions.
+const stashedPlanPath = ".izen/stashed_plan.json"
+
+// stashPlan serializes the current /build task queue to a static cache file so
+// it can be restored deterministically after a $hot hotfix completes. Returns
+// nil if there are no tasks to stash (no-op).
+func (m *model) stashPlan() error {
+	tasks := m.sess.CurrentTasks
+	if len(tasks) == 0 {
+		return nil
+	}
+	data, err := json.MarshalIndent(tasks, "", "  ")
+	if err != nil {
+		return fmt.Errorf("serialize plan: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(stashedPlanPath), 0755); err != nil {
+		return fmt.Errorf("create .izen: %w", err)
+	}
+	return os.WriteFile(stashedPlanPath, data, 0644)
+}
+
+// restorePlan reads the stashed plan from the deterministic cache file and
+// re-hydrates the active /build execution queue. The cache file is deleted
+// after a successful read. Returns nil, nil if no stash exists.
+func (m *model) restorePlan() ([]plan.Task, error) {
+	data, err := os.ReadFile(stashedPlanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read stashed plan: %w", err)
+	}
+	var tasks []plan.Task
+	if err := json.Unmarshal(data, &tasks); err != nil {
+		return nil, fmt.Errorf("parse stashed plan: %w", err)
+	}
+	// Delete the stash file immediately after successful read so the LLM
+	// never sees it — the restoration is purely a Go-level operation.
+	_ = os.Remove(stashedPlanPath)
+	return tasks, nil
 }
 
 func (m *model) handleInput(line string) tea.Cmd {
@@ -131,6 +178,39 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
+	// ── Composite fast-query routing: /review $test ───────────────────
+	// MUST be evaluated at the very top of the evaluation tree, strictly
+	// before parseModeShorthand (which would otherwise match the "/review "
+	// prefix and route this to a plain static /review, silently bypassing the
+	// dynamic-test-then-review composite shortcut).
+	if command.IsReviewTestComposite(line) {
+		m.push(roleSystem, accentStyle.Render("⚡ [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m.runReviewTestComposite()
+	}
+
+	// ── $prompt in /ask — STATELESS SENIOR ARCHITECT REFINER ────────────
+	// Evaluated BEFORE the generic $ handler to guarantee complete decoupling
+	// from the normal chat streaming path. Takes a raw text summary from the
+	// developer ($prompt <raw_idea>) and passes it directly to the
+	// Strict Senior Architect persona — no session history aggregation, no
+	// JSON wrapping. MUST never touch handleMessageContent or streamCmd.
+	if m.resolver.Current() == modes.ModeAsk && (line == "$prompt" || strings.HasPrefix(line, "$prompt ")) {
+		m.cancelStaleAgentOps()
+		if line == "$prompt" {
+			m.push(roleError, "[Usage] $prompt <your raw architectural idea or description>")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+		rawInput := strings.TrimSpace(line[8:])
+		m.push(roleSystem, infoStyle.Render("Refining architectural idea through Senior Architect analysis..."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m.runAskPromptHandoffCmd(rawInput)
+	}
+
 	// $ sub-command prefix — delegates to handleReviewDollar for routing.
 	if strings.HasPrefix(line, "$") {
 		// ANTI-DEADLOCK: unconditionally sanitize stale execution flags
@@ -163,6 +243,20 @@ func (m *model) handleInput(line string) tea.Cmd {
 				stepNum, _ = strconv.Atoi(fields[1])
 			}
 			return m.handleBuildRun(stepNum)
+		}
+
+		// DEFAULT FEEDBACK: amend a failed/stalled task without stashing.
+		// If the last task was rejected or failed, the user's text is routed
+		// as an amendment (appended to the task description) and the task is
+		// reset to "idle" for re-execution. This replaces the old behavior of
+		// stubbornly re-running the exact same failed command.
+		//
+		// If no task is failed/stalled, execution falls through to normal chat.
+		if failedStep := m.findFailedBuildTask(); failedStep > 0 {
+			m.push(roleStatus, fmt.Sprintf("Amending task %d with feedback: %s", failedStep, line))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m.amendBuildTask(failedStep, line)
 		}
 	}
 
@@ -305,6 +399,24 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.Viewport.GotoBottom()
 			return nil
 		}
+		// Graceful handoff guard: if the ContextLedger's ask_handoff payload
+		// was cleared (e.g. by /clear) and no other handoff context exists,
+		// prompt for input rather than running the engine with stale or empty
+		// content. This prevents silent degradation on the local model.
+		trimmed := strings.TrimSpace(content)
+		hasHandoff := m.handoffLedgerContent != "" ||
+			m.handoffCtx.LastFailurePayload != "" ||
+			m.handoffCtx.ProposedFix != ""
+		if !hasHandoff && m.sess != nil && m.sess.ContextLedger != nil {
+			l := m.sess.ContextLedger
+			hasHandoff = l.Diagnostics != "" || len(l.Packets) > 0
+		}
+		if !hasHandoff && (trimmed == "" || len(trimmed) < 15) {
+			m.push(roleSystem, infoStyle.Render("No handoff context in ledger. Describe what to investigate (e.g. a test failure, error log, or crash report):"))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
 		m.investigateInvocationCount++
 		return m.runInvestigateCmd(content)
 	case modes.ModeReview:
@@ -331,9 +443,30 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			handoffSource = proposedFix
 		}
 
-		// SAFETY GUARD: If ContextLedger has diagnostics but handoffSource is empty,
-		// this indicates a data flow regression. Log a warning instead of proceeding
-		// with an empty query to the LLM.
+		// ── ANTI-WIPEOUT FALLBACK ───────────────────────────────────────
+		// The live handoff (handoffLedgerContent / ProposedFix) can be empty
+		// after a plan rejection or an environmental correction (e.g. the user
+		// clarifies "this is macOS, not Linux"). That MUST NOT discard the
+		// authoritative root-cause diagnostics held in the session ContextLedger.
+		// When the live handoff is empty but the ledger still carries the
+		// diagnostic payload, repopulate handoffSource from the ledger so the
+		// compilation/dependency error survives the mode transition instead of
+		// crashing the engine with a false "data flow regression".
+		if handoffSource == "" && m.sess.ContextLedger != nil {
+			l := m.sess.ContextLedger
+			if l.Diagnostics != "" {
+				handoffSource = ctxpkg.SanitizeLedger(l.Diagnostics)
+			}
+			if handoffSource == "" {
+				if packets := l.FormatPacketsForPlan(); packets != "" {
+					handoffSource = packets
+				}
+			}
+		}
+
+		// SAFETY GUARD: only fires when there is genuinely no material to
+		// synthesize from — not when a plan was rejected/corrected and the
+		// diagnostics simply live in the ContextLedger (handled above).
 		if handoffSource == "" && m.sess.ContextLedger != nil && m.sess.ContextLedger.Diagnostics != "" {
 			m.push(roleError, "[SYSTEM ERROR] Context ledger has diagnostics but handoff source is empty after sanitization. Data flow regression detected.")
 			m.refreshViewportContent()
@@ -488,6 +621,16 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		m.responseBuffer.Reset()
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
 
+		// ── ISOLATION BARRIER: Normal /ask chat vs $prompt handoff ────────
+		// If the user is typing a normal chat message in /ask mode, clear any
+		// residual action chip from a previous $prompt turn so it does not
+		// render alongside the stream response. The lightweight streaming path
+		// uses AskContract() — never AskPromptHandoffContract() — ensuring
+		// zero system-prompt contamination between the two workflows.
+		if m.resolver.Current() == modes.ModeAsk {
+			m.currentResult = nil
+		}
+
 		if m.resolver.Current() == modes.ModeAsk && len(refFiles) == 0 {
 			result := retrieval.RouteAsk(line, m.gitEng)
 			if len(result.Targets) > 0 && m.graph != nil {
@@ -571,25 +714,31 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 	return func() tea.Msg {
 		debugLogPlan("runPlanEngineCmd entered; model=" + modelName)
 
-		// ── ADAPTIVE LEDGER TRUNCATION (local SLM guard) ────────────────
-		// Local 7B-class models (qwen2.5-coder:7b, llama3, etc.) choke on the
-		// full forensic ledger — verbose compilation stack traces and dependency
-		// logs blow the context window and the first token never arrives within
-		// the 8s guard, freezing the terminal. For those models we aggressively
-		// compress the ledger to a hard ceiling so only the core error line and
-		// confirmed hypothesis status survive.
+		// ── STRICT LEDGER TRUNCATION (every /investigate → /plan handoff) ──
+		// The handoff ledger carries sanitized trace blocks only — verbose
+		// compilation stack traces and dependency logs over-inflate the prompt
+		// and overload the model (local 7B especially). IZEN therefore always
+		// compresses the ledger to a hard ceiling at this boundary; local SLMs
+		// get the tight ~4k-char ceiling (budget.ModelTokenBudget), cloud models
+		// a more generous one. Only the core error line + confirmed hypothesis
+		// status survive, preventing local-model overload and token bloat.
 		ledgerToSend := handoffSource
 		useFastTrack := false
 		localModel := plan.IsLocalModel(modelName)
-		if localModel {
-			if len(handoffSource) > plan.MaxLedgerChars {
-				truncated := plan.TruncateLedger(handoffSource, plan.MaxLedgerChars)
-				debugLogPlan("ADAPTIVE TRUNCATION: ledger " +
-					fmt.Sprint(len(handoffSource)) + "→" + fmt.Sprint(len(truncated)) +
-					" chars for local model " + modelName)
-				ledgerToSend = truncated
-			}
+		truncateCeiling := plan.MaxLedgerChars
+		if !localModel {
+			// Cloud models can absorb more, but we still cap the handoff hard.
+			truncateCeiling = plan.MaxLedgerChars * 4
+		}
+		if len(handoffSource) > truncateCeiling {
+			truncated := plan.TruncateLedger(handoffSource, truncateCeiling)
+			debugLogPlan("LEDGER TRUNCATION: ledger " +
+				fmt.Sprint(len(handoffSource)) + "→" + fmt.Sprint(len(truncated)) +
+				" chars (model=" + modelName + ")")
+			ledgerToSend = truncated
+		}
 
+		if localModel {
 			// ── "0 TODO" FAST-TRACK SHORT-CIRCUIT ──────────────────────────
 			// When there are no explicit code TODOs AND the ledger only contains
 			// compilation/dependency blockers (resolvable via environment setup,
@@ -799,6 +948,17 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	m.currentResult = nil
 	m.sess.SetMode(mode)
 	_ = m.sess.Save()
+
+	// ── VIRTUAL SNAPSHOT STAGING ───────────────────────────────────────
+	// On every mode switch that may involve file mutations, begin a fresh
+	// virtual transaction. This snapshots the current workspace state so that
+	// if the user rejects a proposal or a build fails, all disk mutations can
+	// be instantly rolled back to this point. The transaction is committed
+	// only on explicit user approval (Alt+A / Alt+L).
+	if m.execEng != nil && (mode == modes.ModeBuild || mode == modes.ModeInvestigate || mode == modes.ModePlan || mode == modes.ModeReview) {
+		m.execEng.BeginTransaction()
+	}
+
 	modeColor := modeAccentColor(mode)
 	modeLabel := lipgloss.NewStyle().Foreground(modeColor).Render(
 		fmt.Sprintf("→ /%s — %s", mode, mode.Description()))
@@ -981,6 +1141,18 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	if len(name) == 0 {
 		return nil
 	}
+
+	// ── Composite fast-query: /review $test ─────────────────────────────
+	// Intercept the composite shortcut before any other routing. It runs the
+	// dynamic test suite, injects the telemetry into the forensic ledger, then
+	// triggers the risk analysis engine with both git diff AND test reports.
+	if command.IsReviewTestComposite(cmd) {
+		m.push(roleSystem, accentStyle.Render("⚡ [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m.runReviewTestComposite()
+	}
+
 	if _, ok := validSystemCommands[name[0]]; !ok {
 		m.push(roleError, "unknown command: "+cmd)
 		m.refreshViewportContent()
@@ -1004,6 +1176,9 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /provider <name>  switch AI provider (ollama|anthropic|openai|gemini)"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
+		m.push(roleSystem, labelBoldStyle.Render("ask sub-commands ($)"))
+		m.push(roleSystem, infoStyle.Render("  $prompt <idea>  refine architectural idea via Senior Architect analysis"))
+		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("review sub-commands ($)"))
 		m.push(roleSystem, infoStyle.Render("  $test [path]  run tests (safety-gated for large repos)"))
 		m.push(roleSystem, infoStyle.Render("  $run  [path]  run go build (safety-gated for large repos)"))
@@ -1020,10 +1195,8 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case cmd == "/quit":
-		m.sess.SetMode(m.resolver.Current())
-		_ = m.sess.Save()
 		m.push(roleSystem, "goodbye.")
-		return tea.Quit
+		return m.cleanShutdownCmd()
 
 	case strings.HasPrefix(cmd, "/mode"):
 		parts := strings.Fields(cmd)
@@ -1078,21 +1251,77 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.records = nil
 		m.PreRenderedHistory = ""
 		m.showBanner = true
-		// /clear wipes the conversation view; clear the current workflow
-		// result's capabilities too (leave handoffCtx intact for handoffs).
 		m.currentResult = nil
-		m.refreshViewportContent()
-		return tea.Sequence(tea.ClearScreen, tea.Println("IZEN cleared."))
+		m.currentPrompt = ""
+		m.responseBuffer.Reset()
+		m.streamBuffer = ""
+		m.currentStreamContent = ""
+		m.streaming = false
 
-	case cmd == "/drop":
+		// Purge ContextLedger (ask_handoff_payload, investigation findings,
+		// pending execution tasks, and all analytical packets).
+		if m.sess != nil {
+			m.sess.ContextLedger = nil
+			m.sess.InvestigationID = ""
+			m.sess.ReviewID = ""
+			m.sess.ClearHistory()
+			m.sess.ClearTasks()
+			_ = m.sess.Save()
+		}
+
+		// Clear handoff pipeline state.
+		m.handoffCtx = HandoffContext{}
+		m.handoffLedgerContent = ""
+		m.lastInvestigateLedger = nil
+
+		// Clear forensic / test telemetry caches.
+		m.lastTestOutput = ""
+		m.lastTestFailed = false
+		m.lastTestTarget = ""
+		m.pendingFileRefs = nil
+
+		// Reset build and proposal gates.
+		m.buildRecoveryCount = 0
+		m.buildVerifyPending = false
+		m.pendingBuildApproval = false
+		m.pendingBuildTask = nil
+		m.pendingBuildAllowAlways = false
+		m.pendingProposals = nil
+		m.acceptedProposals = nil
+		m.awaitingConfirmation = false
+		m.acceptAll = false
+		m.pendingHotfixTask = nil
+		m.currentBuildTaskID = 0
+		m.pendingTestConfirm = false
+		m.pendingTestTarget = ""
+		m.investigateInvocationCount = 0
+
+		// Zero out cumulative token counters.
+		m.InputTokens = 0
+		m.OutputTokens = 0
+		m.TotalTokens = 0
+		m.ContextLimit = 0
+		m.AccumulatedCost = 0
+
+		m.refreshViewportContent()
+		return tea.Sequence(
+			tea.ClearScreen,
+			tea.Println("✕ [IZEN Memory] Context ledger and pending tasks successfully purged. Workspace reset."),
+		)
+
+	case cmd == "/drop" || cmd == "/drop all":
 		m.attachedFiles = nil
-		m.push(roleSystem, infoStyle.Render("context cleared"))
+		m.pendingFileRefs = nil
+		m.push(roleSystem, infoStyle.Render("all context files detached"))
 		return nil
 
 	case strings.HasPrefix(cmd, "/drop "):
-		target := filepath.Clean(strings.TrimSpace(strings.TrimPrefix(cmd, "/drop")))
+		raw := strings.TrimSpace(strings.TrimPrefix(cmd, "/drop"))
+		// Strip optional @ prefix for @file syntax
+		raw = strings.TrimPrefix(raw, "@")
+		target := filepath.Clean(raw)
 		if target == "" || target == "." {
-			m.push(roleSystem, infoStyle.Render("usage: /drop <path>"))
+			m.push(roleSystem, infoStyle.Render("usage: /drop [@file|all]"))
 			return nil
 		}
 		filtered := make([]string, 0, len(m.attachedFiles))
@@ -1102,14 +1331,14 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			}
 		}
 		if len(filtered) == len(m.attachedFiles) {
-			m.push(roleSystem, infoStyle.Render("not attached: "+target))
+			m.push(roleSystem, infoStyle.Render("not attached: "+raw))
 			return nil
 		}
 		m.attachedFiles = filtered
 		if len(m.attachedFiles) == 0 {
-			m.push(roleSystem, infoStyle.Render("context cleared"))
+			m.push(roleSystem, infoStyle.Render("all context files detached"))
 		} else {
-			m.push(roleSystem, infoStyle.Render("dropped: "+target))
+			m.push(roleSystem, infoStyle.Render("detached: "+raw))
 		}
 		return nil
 
@@ -1180,8 +1409,10 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 	ledger := session.NewContextLedger(targetMode)
 	if m.sess != nil {
 		ledger.TargetFile = m.sess.ContextLabel()
-		// Preserve investigation diagnostics for /plan mode
-		if targetMode == modes.ModePlan && prevDiagnostics != "" {
+		// Preserve investigation diagnostics and ask handoff payloads for
+		// /plan and /investigate modes so the forensic engine can extract
+		// its baseline context without manual copy-pasting.
+		if prevDiagnostics != "" && (targetMode == modes.ModePlan || targetMode == modes.ModeInvestigate) {
 			ledger.Diagnostics = prevDiagnostics
 		}
 		ledger.Tasks = nil
@@ -1216,6 +1447,17 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 	m.handoffCtx.ProposedFix = ""
 	m.handoffCtx.LastFailurePayload = ""
 	m.handoffCtx.TargetScope = ""
+
+	// ── PROMPT BUFFER BLEEDING FIX ─────────────────────────────────────
+	// Clear the LLM dialog history on every mode transition so no stale
+	// conversational context (previous greetings, abandoned analyses, failed
+	// task history) leaks into the new mode's context window. Each mode starts
+	// with a clean prompt buffer — the ContextLedger is the SINGLE source of
+	// truth for cross-mode handoff.
+	if m.sess != nil {
+		m.sess.ClearHistory()
+		_ = m.sess.Save()
+	}
 }
 
 // runBuildCmd is the /build mode execution entry. It strictly blocks when no
@@ -1243,11 +1485,30 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 		return nil
 	}
 
+	// ── VIRTUAL SNAPSHOT STAGING ───────────────────────────────────────
+	// Begin a fresh transaction for this build execution to snapshot the
+	// workspace. If the build fails or the user rejects proposals, all
+	// mutations can be rolled back instantly.
+	if m.execEng != nil {
+		m.execEng.BeginTransaction()
+	}
+
+	// ── PROMPT BUFFER BLEEDING FIX ─────────────────────────────────────
+	// Clear the LLM dialog buffer at the start of every build invocation so
+	// no stale context from previous build runs or failed tasks can leak into
+	// the new execution window. Each build starts with a clean prompt scope.
+	if m.sess != nil {
+		m.sess.ClearHistory()
+		_ = m.sess.Save()
+	}
+
 	// Sanitize any leftover unstructured content — /build operates purely on
 	// the structural task ledger, never on free-form conversational input.
 	_ = content
 	m.responseBuffer.Reset()
-	m.execEng.SetStreamContextFiles(m.attachedFiles)
+	if m.execEng != nil {
+		m.execEng.SetStreamContextFiles(m.attachedFiles)
+	}
 
 	if m.buildLedger == nil {
 		m.buildLedger = ctxpkg.NewTaskLedger()
@@ -1275,13 +1536,461 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 	return m.handleBuildRun(0)
 }
 
+// handleHotfixCmd implements the $hot urgent hotfix workflow in /build mode.
+//
+// Flow:
+//  1. Stash the current build task queue to .izen/stashed_plan.json (if non-empty).
+//  2. Clear the active queue.
+//  3. Synthesize a single ad-hoc FILE_MUTATE task with the user's prompt.
+//  4. Execute it immediately via handleBuildRun.
+//
+// After the hotfix task completes (success or failure), the buildResultMsg
+// handler in update.go restores the stashed plan deterministically in Go —
+// the LLM never sees the original plan state, preventing 7B context drift.
+func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		m.push(roleError, "usage: $hot <hotfix prompt> — e.g. $hot add a MIT LICENSE file")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+
+	// Guard: must be in /build mode.
+	if m.resolver.Current() != modes.ModeBuild {
+		m.push(roleError, "$hot is only available in /build mode")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+
+	// Stage 1: Stash the current plan if tasks exist.
+	hasTasks := len(m.sess.CurrentTasks) > 0
+	if hasTasks {
+		if err := m.stashPlan(); err != nil {
+			m.push(roleError, fmt.Sprintf("[HOTFIX] Failed to stash current plan: %v", err))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+	}
+
+	// Stage 2: Clear the active execution queue.
+	m.sess.ClearTasks()
+
+	// Stage 3: Set the hotfix flag so buildResultMsg knows to restore.
+	m.hotfixActive = true
+
+	// Stage 4: Create a single ad-hoc FILE_MUTATE task.
+	m.push(roleStatus, fmt.Sprintf("[HOTFIX] Urgent hotfix: %s", prompt))
+
+	// ── DYNAMIC TARGET RESOLUTION (Bug Fix 1) ──────────────────────────
+	// The `workspace` token is the working-directory boundary context — it is
+	// NEVER a destination file name. Hallucinating it as a literal path causes
+	// unrelated tasks (e.g. writing a LICENSE and editing main.go) to all be
+	// written into a single file literally named "workspace". We therefore
+	// extract the real target file path from the developer's request; only when
+	// the prompt names no file do we synthesize a context-derived default.
+	target := resolveHotfixTarget(prompt)
+
+	hotfixTask := plan.Task{
+		StepNum:     0,
+		Status:      "idle",
+		Type:        "FILE_MUTATE",
+		Target:      target,
+		Description: prompt,
+	}
+	tasks := []plan.Task{hotfixTask}
+	m.sess.StageTaskList(&tasks)
+	_ = m.sess.Save()
+
+	// Stage 5: Generate the patch but DO NOT apply it. The engine must render
+	// a code diff proposal and obtain explicit developer authorization before
+	// any byte is written to disk (Bug Fix 2). After approval (y) the patch is
+	// applied and the stashed plan restored; on rejection (n) the hotfix aborts
+	// cleanly and returns the pipeline to PAUSED without touching any file.
+	//
+	// ── ACTIVE LOADING INDICATOR (Feature) ────────────────────────────
+	// Mount the spinner + emit the first lifecycle log IMMEDIATELY so the
+	// developer never sees a 30s frozen pane while the local LLM silently
+	// generates the patch. The spinner keeps animating until the proposal
+	// message arrives and swaps the pane into the diff view.
+	m.push(roleStatus, "[HOTFIX] Generating patch via local LLM... (This may take up to 30s)")
+	m.push(roleSystem, fmt.Sprintf("  ⚙ Thinking... (Invoking %s)", m.cfg.ActiveModelName()))
+
+	m.agentRunning = true
+	m.agentDone = false
+	m.agentLabel = "hotfix"
+	m.spinnerFrame = 0
+	m.lastSpinnerAdvance = time.Time{}
+	m.lastAgentActivity = time.Now()
+
+	return tea.Batch(
+		func() tea.Msg { return agentStartMsg{label: "hotfix"} },
+		m.proposeHotfixPatch(&hotfixTask),
+		m.spinnerTickCmd(),
+		m.hotfixProgressCmd(),
+	)
+}
+
+// hotfixProgressCmd emits the $hot generation lifecycle log lines on a timer so
+// the developer sees active progress (and the spinner keeps animating) while
+// the local LLM silently generates the patch — eliminating the 30s "deadlock"
+// freeze. The lines are delivered as hotfixProgressMsg through the event loop,
+// never from the background goroutine, so there is no data race on the record
+// buffer.
+func (m *model) hotfixProgressCmd() tea.Cmd {
+	lines := []string{
+		"  ↺ Intercepted structural breakdown. Refining context (Attempt 1/2)...",
+		"  ⚙ Compiling unified diff schema...",
+	}
+	var cmds = make([]tea.Cmd, 0, len(lines))
+	for i, line := range lines {
+		delay := time.Duration(i+1) * 900 * time.Millisecond
+		l := line
+		cmds = append(cmds, tea.Tick(delay, func(time.Time) tea.Msg {
+			return hotfixProgressMsg{Line: l}
+		}))
+	}
+	return tea.Batch(cmds...)
+}
+
+// sanitizeFileOutput cleans generated file content produced by the local model
+// before it is written to disk. It trims leading/trailing whitespace and strips
+// a single wrapping code block: an opening fence ("```", "```go", "```mit",
+// etc.) and a closing "```". Without this, literal triple backticks are written
+// into the file, corrupting its syntax.
+func sanitizeFileOutput(content string) string {
+	content = strings.TrimSpace(content)
+	// Check for markdown block prefix.
+	if strings.HasPrefix(content, "```") {
+		// Find the end of the opening fence line.
+		if idx := strings.Index(content, "\n"); idx != -1 {
+			content = content[idx+1:]
+		}
+	}
+	// Check for markdown block suffix.
+	content = strings.TrimSuffix(content, "```")
+	return strings.TrimSpace(content)
+}
+
+// resolveHotfixTarget extracts the concrete destination file path for a $hot
+// request from the developer's natural-language prompt. It scans for explicit
+// file path tokens (e.g. cmd/api/main.go, ./LICENSE, internal/foo/bar.go) and
+// returns the first plausible one. The bare token "workspace" is explicitly
+// rejected — it denotes the project-root scope, not a file name. When no file
+// is named, a sensible default is derived from the prompt keywords (creating a
+// new file) rather than overwriting any existing source file.
+func resolveHotfixTarget(prompt string) string {
+	// Candidate path tokens: sequences of word/path chars including slashes,
+	// dots and an extension, or bare "LICENSE"/"Makefile"-style names.
+	pathRe := regexp.MustCompile(`(?:[./]?[\w-]+(?:/[\w.-]+)+|\.\/?[\w.-]+|[\w.-]+\.[\w]+|(?:LICENSE|Makefile|Dockerfile|README|go\.mod|go\.sum|CHANGELOG|NOTICE))`)
+	for _, m := range pathRe.FindAllString(prompt, -1) {
+		m = strings.TrimSpace(m)
+		if m == "" || strings.EqualFold(m, "workspace") {
+			continue
+		}
+		// Normalize a leading "./" to a repo-relative path.
+		m = strings.TrimPrefix(m, "./")
+		m = strings.TrimPrefix(m, "/")
+		if m == "" {
+			continue
+		}
+		// Sanity: must contain a path separator or an extension, and must not
+		// be a single bare word that merely looks like an extension.
+		if strings.Contains(m, "/") || strings.Contains(m, ".") {
+			return m
+		}
+	}
+
+	// ── No explicit file named: synthesize a NEW-file default from keywords.
+	// This never collides with existing source files, so unrelated hotfixes
+	// can never clobber each other the way the literal "workspace" did.
+	lower := strings.ToLower(prompt)
+	switch {
+	case strings.Contains(lower, "license"):
+		return "LICENSE"
+	case strings.Contains(lower, "readme"):
+		return "README.md"
+	case strings.Contains(lower, "docker"):
+		return "Dockerfile"
+	case strings.Contains(lower, "makefile") || strings.Contains(lower, "make file"):
+		return "Makefile"
+	case strings.Contains(lower, "changelog"):
+		return "CHANGELOG.md"
+	case strings.Contains(lower, "notice"):
+		return "NOTICE"
+	case strings.Contains(lower, "gitignore"):
+		return ".gitignore"
+	}
+	// Fallback: a timestamped new file under the repo root. The leading dot
+	// guarantees it cannot overwrite a tracked file and clearly marks it as a
+	// hotfix artifact for the developer to relocate.
+	ts := time.Now().Format("20060102-150405")
+	return ".izen/hotfix-" + ts + ".patch"
+}
+
+// proposeHotfixPatch generates the patch for a $hot FILE_MUTATE task via the
+// LLM (one non-streaming call) WITHOUT applying it. Instead, it renders a code
+// diff proposal and freezes the pipeline in StateAwaitingApproval so the
+// developer can authorize (y) or reject (n) the change before any disk write.
+func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		if m.provider == nil {
+			return hotfixProposalMsg{Err: fmt.Errorf("build execution error: no provider configured")}
+		}
+
+		// Build a focused, non-chat patch-generation prompt and call the LLM
+		// once (non-streaming) so we get a deterministic diff/FILE block back.
+		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		system := prompt.BuildContract()
+		req := ai.Request{
+			Model:    m.cfg.ActiveModelName(),
+			System:   system,
+			Stream:   false,
+			Messages: []ai.Message{{Role: "user", Content: handoff}},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		resp, err := m.provider.Execute(ctx, req)
+		if err != nil {
+			return hotfixProposalMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
+		}
+		if resp == nil || strings.TrimSpace(resp.Content) == "" {
+			return hotfixProposalMsg{Err: fmt.Errorf("patch generation returned empty output")}
+		}
+
+		// ── STEP 1/2: Content Cleanse — strip markdown code fences the local
+		// model wraps around the generated file (e.g. "```mit ... ```"). Writing
+		// the raw text verbatim injects literal triple backticks into the
+		// document and corrupts its syntax, so we sanitize BEFORE the diff is
+		// computed and the patch is staged for disk write.
+		cleaned := sanitizeFileOutput(resp.Content)
+
+		// Snapshot the original file content so the diff + rollback are exact.
+		orig := ""
+		if data, rerr := os.ReadFile(task.Target); rerr == nil {
+			orig = string(data)
+		}
+
+		// Compute a unified diff for display (green additions / red removals).
+		diff := computeUnifiedDiff(task.Target, orig, cleaned)
+
+		patch := &execution.Patch{
+			ID:        fmt.Sprintf("hotfix-%d", task.StepNum),
+			File:      task.Target,
+			Original:  orig,
+			Modified:  cleaned,
+			TaskID:    task.StepNum,
+			ContextID: m.sess.ContextID,
+		}
+
+		return hotfixProposalMsg{
+			Task:  task,
+			Patch: patch,
+			Diff:  diff,
+		}
+	}
+}
+
+// applyHotfixPatch applies a pre-generated $hot patch through the execution
+// engine's PatchManager — never via the conversational stream. It returns a
+// buildResultMsg so the standard update.go handler restores the stashed plan
+// and freezes the pipeline to PAUSED afterwards. On failure the task is marked
+// failed and the buildResultMsg handler rolls back any partial mutation.
+func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cmd {
+	return func() tea.Msg {
+		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
+			tasks := m.sess.CurrentTasks
+			for i := range tasks {
+				if tasks[i].StepNum == task.StepNum {
+					tasks[i].Status = "failed"
+					break
+				}
+			}
+			m.sess.StageTaskList(&tasks)
+			_ = m.sess.Save()
+			return buildResultMsg{
+				output:   patch.Modified,
+				exitCode: 1,
+				err:      fmt.Errorf("hotfix patch apply failed: %w", applyErr),
+			}
+		}
+
+		// Mark the task terminal in the live session ledger.
+		tasks := m.sess.CurrentTasks
+		for i := range tasks {
+			if tasks[i].StepNum == task.StepNum {
+				tasks[i].Status = "completed"
+				break
+			}
+		}
+		m.sess.StageTaskList(&tasks)
+		_ = m.sess.Save()
+		return buildResultMsg{
+			output:   fmt.Sprintf("Applied hotfix patch to %s", task.Target),
+			exitCode: 0,
+		}
+	}
+}
+
+// computeUnifiedDiff produces a line-oriented unified diff (a la `diff -u`)
+// between the original and modified file contents. Lines present only in
+// original are prefixed "-" (red) and lines only in modified are prefixed "+"
+// (green) — matching the visual contract required by the hotfix approval gate.
+// The header uses the conventional `--- a/<file>` / `+++ b/<file>` markers so
+// the MutationRenderer's new-file detection and gutter rendering behave
+// correctly for both edits and new-file creations.
+func computeUnifiedDiff(path, original, modified string) string {
+	origLines := strings.Split(original, "\n")
+	modLines := strings.Split(modified, "\n")
+	// Trailing empty element produced by a final "\n" — drop for clean diffs.
+	trim := func(s []string) []string {
+		if len(s) > 0 && s[len(s)-1] == "" {
+			return s[:len(s)-1]
+		}
+		return s
+	}
+	origLines = trim(origLines)
+	modLines = trim(modLines)
+
+	var b strings.Builder
+	if original == "" {
+		// New file: only additions.
+		b.WriteString("--- a/" + path + "\n")
+		b.WriteString("+++ b/" + path + "\n")
+		for _, line := range modLines {
+			b.WriteString("+" + line + "\n")
+		}
+		return b.String()
+	}
+
+	b.WriteString("--- a/" + path + "\n")
+	b.WriteString("+++ b/" + path + "\n")
+
+	// Classic longest-common-subsequence alignment keeps the diff minimal.
+	n, m := len(origLines), len(modLines)
+	lcs := make([][]int, n+1)
+	for i := range lcs {
+		lcs[i] = make([]int, m+1)
+	}
+	for i := n - 1; i >= 0; i-- {
+		for j := m - 1; j >= 0; j-- {
+			switch {
+			case origLines[i] == modLines[j]:
+				lcs[i][j] = lcs[i+1][j+1] + 1
+			case lcs[i+1][j] >= lcs[i][j+1]:
+				lcs[i][j] = lcs[i+1][j]
+			default:
+				lcs[i][j] = lcs[i][j+1]
+			}
+		}
+	}
+
+	i, j := 0, 0
+	for i < n && j < m {
+		switch {
+		case origLines[i] == modLines[j]:
+			i++
+			j++
+		case lcs[i+1][j] >= lcs[i][j+1]:
+			b.WriteString("-" + origLines[i] + "\n")
+			i++
+		default:
+			b.WriteString("+" + modLines[j] + "\n")
+			j++
+		}
+	}
+	for ; i < n; i++ {
+		b.WriteString("-" + origLines[i] + "\n")
+	}
+	for ; j < m; j++ {
+		b.WriteString("+" + modLines[j] + "\n")
+	}
+	return b.String()
+}
+
+// findFailedBuildTask returns the step number of the first task in the build
+// queue whose status is "failed" or "stalled". Returns 0 if no such task exists.
+func (m *model) findFailedBuildTask() int {
+	for _, t := range m.sess.CurrentTasks {
+		if t.Status == "failed" || t.Status == "stalled" {
+			return t.StepNum
+		}
+	}
+	return 0
+}
+
+// amendBuildTask resets a failed/stalled task to "idle", appends the user's
+// feedback to its description, saves the updated task list, and re-executes
+// the task with the amendment as additional context. This replaces the old
+// behavior of stubbornly re-running the exact same failed command with no
+// opportunity for the user to provide corrective input.
+func (m *model) amendBuildTask(stepNum int, feedback string) tea.Cmd {
+	tasks := m.sess.CurrentTasks
+	for i := range tasks {
+		if tasks[i].StepNum == stepNum {
+			tasks[i].Status = "idle"
+			tasks[i].Description = tasks[i].Description + " | AMENDMENT: " + feedback
+			break
+		}
+	}
+	m.sess.StageTaskList(&tasks)
+	_ = m.sess.Save()
+	return m.handleBuildRun(stepNum)
+}
+
 // runBuildShellExec executes a SHELL_EXEC build task directly via the OS shell
 // and reports the result — it never dispatches the command to the LLM. After a
 // run the task is marked terminal and the next idle task is advanced, preserving
 // /build's execute-only contract.
+//
+// HARD GATE: commands containing "sudo" or other OS-escalation keywords are
+// intercepted immediately and returned as a blocked buildResultMsg instead of
+// being executed. The user must copy the command and run it manually outside
+// IZEN. This is the absolute last line of defense against silent root escalation.
 func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 	return func() tea.Msg {
+		// ── SUDO / PRIVILEGE ESCALATION INTERCEPT ──────────────────────
+		lower := strings.ToLower(strings.TrimSpace(task.Target))
+		if strings.Contains(lower, "sudo") {
+			return buildResultMsg{
+				output:   "",
+				exitCode: -1,
+				err: fmt.Errorf(
+					"[SUDO BLOCKED] SHELL_EXEC task requires sudo: %s; "+
+						"IZEN never runs sudo automatically. Copy the command above and "+
+						"run it manually in your terminal outside IZEN, then re-run /build",
+					task.Target),
+			}
+		}
+		// ── OS-FENCE on Darwin: block Linux-only package manager commands ──
+		if runtime.GOOS == "darwin" {
+			linuxPatterns := []string{"apt-get", "apt ", "dpkg", "yum ", "dnf "}
+			for _, pat := range linuxPatterns {
+				if strings.Contains(lower, pat) {
+					return buildResultMsg{
+						output:   "",
+						exitCode: -1,
+						err: fmt.Errorf(
+							"[OS MISMATCH] SHELL_EXEC task uses %q which is a Linux package manager; "+
+								"this host is macOS; use Homebrew (`brew`) or `go install` instead",
+							strings.TrimSpace(pat)),
+					}
+				}
+			}
+		}
+		// ── Sandbox check before execution ──────────────────────────────
 		runner := execExecutionRunner(".")
+		if blocked, reason := m.shellFirewall(task.Target); blocked {
+			return buildResultMsg{
+				output:   "",
+				exitCode: -1,
+				err:      fmt.Errorf("[BLOCKED BY FIREWALL] %s", reason),
+			}
+		}
+
 		result, err := runner.Run(task.Target)
 		output := ""
 		exitCode := 0
@@ -1368,6 +2077,15 @@ func (m *model) runBuildPatchExec(task *plan.Task) tea.Cmd {
 			ContextID: m.sess.ContextID,
 		}
 		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
+			tasks := m.sess.CurrentTasks
+			for i := range tasks {
+				if tasks[i].StepNum == task.StepNum {
+					tasks[i].Status = "failed"
+					break
+				}
+			}
+			m.sess.StageTaskList(&tasks)
+			_ = m.sess.Save()
 			return buildResultMsg{
 				output:   resp.Content,
 				exitCode: 1,
@@ -1410,6 +2128,10 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 			m.push(roleStatus, fmt.Sprintf("task %d not found", stepNum))
 			return nil
 		}
+		if targetTask.Status == "stalled" || targetTask.Status == "failed" {
+			m.push(roleError, fmt.Sprintf("[BUILD HALTED] Task %d is %s. Use /investigate or /plan to re-generate a valid ledger.", stepNum, targetTask.Status))
+			return nil
+		}
 	} else {
 		for i, t := range tasks {
 			if t.Status == "idle" {
@@ -1419,6 +2141,14 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 		}
 	}
 	if targetTask == nil {
+		// Check if any tasks are stalled (failed build), if so give a
+		// better diagnostic than the generic "all tasks already completed".
+		for _, t := range tasks {
+			if t.Status == "stalled" {
+				m.push(roleError, "[BUILD HALTED] A previous step failed. Remaining tasks are stalled. Use /investigate or /plan to re-generate a valid ledger.")
+				return nil
+			}
+		}
 		m.push(roleStatus, "all tasks already completed")
 		return nil
 	}
@@ -1456,13 +2186,33 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	m.execEng.Patches.SetLedger(m.buildLedger)
 	m.execEng.Patches.SetContextID(m.sess.ContextID)
 
-	// ── SHELL_EXEC: run the command directly, do NOT chat ───────────────
-	// A SHELL_EXEC task is a concrete shell command (e.g. `go get <pkg>` /
-	// `go mod tidy`). /build MUST execute it via the OS shell and report the
-	// output — dispatching it to the LLM would produce a chat reply instead of
-	// actually running the command, breaking the build's execute-only contract.
+	// ── SHELL_EXEC: INTERACTIVE APPROVAL GATE ──────────────────────────
+	// CRITICAL SECURITY CONSTRAINT: Every SHELL_EXEC command requires
+	// explicit human approval before it reaches the OS shell. A dedicated
+	// visual "Permission Required" box is rendered in the proposal dock,
+	// with single-character key bindings:
+	//   [y] Allow Once    [a] Allow Always    [n] Reject
+	// If the user previously selected "Allow Always" (m.pendingBuildAllowAlways),
+	// the gate is bypassed for the remainder of the session.
 	if targetTask.Type == "SHELL_EXEC" {
-		return m.runBuildShellExec(targetTask)
+		// ── Allow Always bypass ────────────────────────────────────────
+		if m.pendingBuildAllowAlways {
+			return tea.Batch(
+				func() tea.Msg { return agentStartMsg{label: "shell exec"} },
+				m.runBuildShellExec(targetTask),
+				m.spinnerTickCmd(),
+			)
+		}
+
+		// Render the visual permission box via the proposal dock (view layer).
+		m.pendingBuildApproval = true
+		m.pendingBuildTask = targetTask
+		m.state = StateAwaitingApproval
+		m.ti.Blur()
+		m.recalcViewportHeight()
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
 	}
 
 	// ── FILE_MUTATE / GIT_ACTION: generate + APPLY a real patch ──────────
@@ -1472,7 +2222,11 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// "greet" the user instead of executing — a violation of /build's sole
 	// mandate (execute, never chat).
 	if targetTask.Type == "FILE_MUTATE" || targetTask.Type == "GIT_ACTION" {
-		return m.runBuildPatchExec(targetTask)
+		return tea.Batch(
+			func() tea.Msg { return agentStartMsg{label: "patching"} },
+			m.runBuildPatchExec(targetTask),
+			m.spinnerTickCmd(),
+		)
 	}
 
 	buildTrace := &ctxpkg.CodebaseTrace{
@@ -2375,6 +3129,11 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 		rest := strings.TrimSpace(strings.TrimPrefix(action, "fix"))
 		cmd = m.runFixCmd(rest)
 
+	case mode == modes.ModeBuild && (strings.HasPrefix(action, "hot ") || action == "hot"):
+		rest := strings.TrimSpace(strings.TrimPrefix(action, "hot"))
+		// handleHotfixCmd handles its own state and returns an appropriate cmd.
+		cmd = m.handleHotfixCmd(rest)
+
 	default:
 		switch mode {
 		case modes.ModeReview:
@@ -2382,7 +3141,7 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 		case modes.ModeInvestigate:
 			m.push(roleError, fmt.Sprintf("unknown investigate action: $%s (use $env, $trace, $test, $diagnose, or $log)", action))
 		case modes.ModeBuild:
-			m.push(roleError, fmt.Sprintf("unknown build action: $%s (use $fix)", action))
+			m.push(roleError, fmt.Sprintf("unknown build action: $%s (use $fix or $hot <prompt>)", action))
 		default:
 			m.push(roleError, fmt.Sprintf("$ sub-commands not available in /%s mode", mode))
 		}
@@ -2686,6 +3445,80 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 	)
 }
 
+// runAskPromptHandoffCmd passes the user's raw architectural idea directly to
+// the Strict Senior Architect persona for refinement, pruning, and tradeoff
+// analysis. No session history aggregation — the raw input IS the payload.
+//
+// ISOLATION CONTRACT — This function is called STRICTLY from handleInput when
+// the user types "$prompt <raw_idea>" in /ask mode. It uses its own system
+// prompt (AskPromptHandoffSystemPrompt) and a non-streaming provider call that
+// NEVER touches the normal chat session history (no AddMessage, no sess.Save).
+// Normal chat continues to use AskContract() via the streamCmd path with zero
+// contamination.
+func (m *model) runAskPromptHandoffCmd(rawInput string) tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg {
+			return agentStartMsg{label: "refining architectural idea"}
+		},
+		m.spinnerTickCmd(),
+		func() tea.Msg {
+			if m.provider == nil {
+				m.push(roleError, "[System Error] No AI provider is configured. Run /provider to select one.")
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return agentDoneMsg{}
+			}
+
+			uname := m.cfg.Username
+			if uname == "" {
+				uname = m.userName
+			}
+			systemPrompt := prompt.AskPromptHandoffSystemPrompt(uname)
+
+			req := ai.Request{
+				Model: m.cfg.ActiveModelName(),
+				Messages: []ai.Message{
+					{Role: "user", Content: rawInput},
+				},
+				Stream: false,
+				System: systemPrompt,
+			}
+
+			resp, err := m.provider.Execute(context.Background(), req)
+			if err != nil {
+				return promptHandoffMsg{err: fmt.Errorf("prompt synthesis failed: %w", err)}
+			}
+
+			var content string
+			if resp != nil {
+				content = strings.TrimSpace(resp.Content)
+			}
+
+			if content == "" {
+				return promptHandoffMsg{err: fmt.Errorf("prompt synthesis returned empty response")}
+			}
+
+			// The FollowUp action chip is delivered via the promptHandoffMsg.actions
+			// field and rendered as an interactive terminal component by the
+			// promptHandoffMsg handler in update.go — never embedded in the
+			// markdown body.
+			followUpAction := []Action{
+				{
+					ID:       "ask-prompt-handoff-investigate",
+					Label:    "Forward to /investigate for deep-dive forensic analysis",
+					Shortcut: "alt+f",
+					Command:  "/mode investigate",
+					Query:    content,
+					Enabled:  true,
+					Priority: 100,
+				},
+			}
+
+			return promptHandoffMsg{content: content, actions: followUpAction}
+		},
+	)
+}
+
 // shellFirewall checks a shell command against the security guard rail.
 // Returns (blocked, violationMessage).
 // Global blacklist applies in all modes; /mode investigate has an additional
@@ -2712,10 +3545,24 @@ func (m *model) shellFirewall(cmd string) (bool, string) {
 		}
 	}
 
-	// ── Global blacklist ──
-	blacklist := []string{"rm ", "sudo", "chmod", "chown", "mkfs", "dd ", "mv /*", "> /dev/gpi"}
+	// ── Global blacklist (SECURITY CRITICAL) ──
+	// Every blacklisted token is a hard block: the command cannot be executed
+	// through any code path — not via !cmd, not via proposedShellCmd, not via
+	// SHELL_EXEC, not via any AI-generated script. This is the last line of
+	// defense against silent privilege escalation.
+	blacklist := []string{
+		"rm ", "sudo", "chmod", "chown", "mkfs", "dd ",
+		"mv /*", "> /dev/gpi",
+		"apt-get", "apt ", "dpkg", "yum ", "dnf ",
+	}
 	for _, b := range blacklist {
 		if strings.Contains(lower, b) {
+			violation := b
+			if violation == "sudo" {
+				return true, fmt.Sprintf(
+					"[SUDO BLOCKED] '%s' requires root privileges. IZEN never runs sudo automatically. "+
+						"To execute this command, copy it and run it manually in your terminal outside IZEN.", cmd)
+			}
 			return true, fmt.Sprintf(
 				"Dangerous shell mutation blocked: Executing '%s' is strictly forbidden in this mode.",
 				cmd)
@@ -2767,6 +3614,9 @@ func (m *model) resetObjectiveContextStacks() {
 	m.investigateInvocationCount = 0
 	m.pendingTestConfirm = false
 	m.pendingTestTarget = ""
+	m.pendingBuildApproval = false
+	m.pendingBuildTask = nil
+	m.pendingBuildAllowAlways = false
 	m.lastTestOutput = ""
 	m.lastTestFailed = false
 	m.pendingProposals = nil

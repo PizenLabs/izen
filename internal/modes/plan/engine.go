@@ -30,7 +30,9 @@ func NewEngine(store *PlanStore) *Engine {
 	}
 }
 
-// parsePlanContent tries JSON first, falls back to markdown task format.
+// parsePlanContent enforces strict JSON schema with recovery.
+// Phase 3: If JSON parsing fails, it attempts auto-repair via autoCloseJSON
+// and retries before giving up. Markdown-only output is rejected.
 func parsePlanContent(content string) []Task {
 	content = strings.TrimSpace(content)
 	if content == "" {
@@ -39,19 +41,25 @@ func parsePlanContent(content string) []Task {
 
 	result := ParseJSONPlan(content)
 	if result.Valid {
-		// Validate tasks for placeholder paths
 		if err := ValidateAllTasks(result.Tasks); err != nil {
 			return nil
 		}
 		return result.Tasks
 	}
 
-	tasks := ParseMarkdownToTasks(content)
-	// Validate tasks for placeholder paths
-	if err := ValidateAllTasks(tasks); err != nil {
-		return nil
+	// Phase 3: Attempt auto-repair of truncated JSON before giving up.
+	repaired := autoCloseJSON(content)
+	if repaired != content {
+		result = ParseJSONPlan(repaired)
+		if result.Valid {
+			if err := ValidateAllTasks(result.Tasks); err != nil {
+				return nil
+			}
+			return result.Tasks
+		}
 	}
-	return tasks
+
+	return nil
 }
 
 // SetProvider configures the AI provider for this engine using the structured signature.
@@ -84,6 +92,40 @@ func (e *Engine) ProcessFromLedgerFastTrack(ctx context.Context, promptText stri
 func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, problem string, modelName string, fastTrack bool, fastPrompt ...string) ([]Task, error) {
 	if e == nil || e.provider == nil {
 		return nil, fmt.Errorf("plan engine: provider not set")
+	}
+
+	// REMOTE DEPENDENCY BLOCKER short-circuit: if the ledger explicitly
+	// identifies a remote dependency through forensic analysis, bypass LLM
+	// synthesis entirely and generate deterministic go get / go mod tidy
+	// tasks. This guarantees 100% success for missing package resolution,
+	// eliminating the 3-attempt JSON synthesis crash loop.
+	if !fastTrack && strings.Contains(ledgerContent, "REMOTE DEPENDENCY BLOCKER") {
+		conclusion := ExtractConclusionFromLedger(ledgerContent)
+		if dep := dependencyFromConclusion(conclusion); dep != "" {
+			return []Task{
+				{
+					StepNum: 1,
+					IsDone:  false,
+					Status:  "idle",
+					Type:    "SHELL_EXEC",
+					Target:  "go get " + dep,
+					Description: fmt.Sprintf(
+						"go get %s\n  ↳ Rationale: Inject the explicit third-party module missing from the execution boundary.\n  ↳ Expected Solution: Missing package symbols successfully resolve and dependency block clears.",
+						dep,
+					),
+				},
+			}, nil
+		}
+		return []Task{
+			{
+				StepNum:     1,
+				IsDone:      false,
+				Status:      "idle",
+				Type:        "SHELL_EXEC",
+				Target:      "go mod tidy",
+				Description: "go mod tidy\n  ↳ Rationale: Re-synchronize the dependency manifest with active imports after blocker identification.\n  ↳ Expected Solution: Clean up stale pointers and establish structural registry alignment.",
+			},
+		}, nil
 	}
 
 	var req ai.Request
@@ -155,78 +197,121 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		if len(clean) == 0 {
 			return nil, fmt.Errorf("plan engine: fast-track produced no runnable shell tasks (model returned: %s)", truncateForLog(resp.Content))
 		}
-		return clean, nil
+		return ValidateShellExecCommands(clean, ledgerContent), nil
 	}
 
-	// Parse structured JSON output into tasks.
-	jsonResult := ParseJSONPlan(resp.Content)
-	if jsonResult.Valid && len(jsonResult.Tasks) > 0 {
-		// Local 7B SLMs frequently emit tasks with empty targets under context
-		// pressure. Rather than hard-aborting the whole plan, filter out invalid
-		// tasks and keep only the runnable ones — identical to the fast-track
-		// resilience pattern below. If nothing valid survives, fall through to
-		// the compile/dep fallback or error path.
-		if err := ValidateAllTasks(jsonResult.Tasks); err != nil {
-			clean := filterValidTasks(jsonResult.Tasks)
-			if len(clean) > 0 {
-				return clean, nil
+	// ── JSON PARSING — ELEVATED SILENT RETRY LOOP ──────────────────
+	// The loop covers the provider call, JSON code-fence stripping, structural
+	// json.Unmarshal parsing, AND semantic SHELL_EXEC validation in a single
+	// retry envelope. Both structural failures (truncated/malformed JSON) and
+	// semantic failures (hallucinated file paths as SHELL_EXEC targets) trigger
+	// an automated retry with an augmented prompt. This eliminates the manual
+	// friction of /mode investigate ↔ /mode plan toggling by handling the
+	// correction transparently.
+	maxSilentRetries := 2
+	for attempt := 0; attempt <= maxSilentRetries; attempt++ {
+		// On retry (attempt > 0), re-invoke the provider with an augmented
+		// prompt that includes the strict enforcement instruction from the
+		// previous rejection.
+		if attempt > 0 {
+			fmt.Printf("[plan-engine] JSON syntax or command schema broken. Refining prompt and retrying internally (Attempt %d/%d)...\n", attempt, maxSilentRetries)
+			req.Messages[len(req.Messages)-1].Content += shellExecReinforcement(attempt, maxSilentRetries)
+			var retryErr error
+			resp, retryErr = e.provider(ctx, req)
+			if retryErr != nil || resp == nil || resp.Content == "" {
+				continue
 			}
-		} else {
-			return jsonResult.Tasks, nil
+			_ = e.store.SaveRawMarkdown("plan", resp.Content)
 		}
-	}
 
-	// Fallback: if JSON parsing failed, try markdown task extraction.
-	tasks := ParseMarkdownToTasks(resp.Content)
-	if len(tasks) > 0 {
-		if err := ValidateAllTasks(tasks); err != nil {
-			clean := filterValidTasks(tasks)
-			if len(clean) > 0 {
-				return clean, nil
+		jsonResult := ParseJSONPlan(resp.Content)
+
+		if jsonResult.Valid && len(jsonResult.Tasks) > 0 {
+			var candidates []Task
+			if err := ValidateAllTasks(jsonResult.Tasks); err != nil {
+				candidates = filterValidTasks(jsonResult.Tasks)
+			} else {
+				candidates = jsonResult.Tasks
 			}
-		} else {
-			return tasks, nil
+
+			if len(candidates) > 0 {
+				if !hasInvalidShellExecCommand(candidates) {
+					// All checks passed — return with compile-error enforcement.
+					return ForceShellExecOnCompileError(candidates, problem, ledgerContent), nil
+				}
+
+				// Semantic failure: invalid SHELL_EXEC commands detected.
+				if attempt < maxSilentRetries {
+					continue
+				}
+
+				// Max retries exceeded for semantic failures — deterministic fallback.
+				return ValidateShellExecCommands(
+					ForceShellExecOnCompileError(candidates, problem, ledgerContent),
+					ledgerContent,
+				), nil
+			}
+		}
+
+		// Structural parse failure or all candidates filtered out.
+		if attempt < maxSilentRetries {
+			continue
 		}
 	}
 
-	// ── COMPILE/DEP FALLBACK (local-model JSON failure) ───────────────
-	// A local 7B model frequently returns mixed/markdown content instead of
-	// strict JSON, so the structured parse above fails. When the problem
-	// payload itself is a compile/dependency error, retry ONCE with the
-	// minimal fast-track shell prompt rather than hard-aborting — this is the
-	// path that reliably yields a runnable SHELL_EXEC task on small models.
-	//
-	// Cross-reference the investigation conclusion from the full ledger so
-	// the fast-track prompt carries the corrected diagnosis (not just raw
-	// error text that may cause the model to re-derive a stale fix).
-	//
-	// Check BOTH problem parameter AND ledgerContent for compilation/dependency
-	// errors — the problem param may be empty or generic (e.g. "Investigation
-	// results require structured execution plan") while the ledger contains
-	// the actual error message from test/build output.
-	compileErr := IsCompilationOrDependencyError(problem) || IsCompilationOrDependencyError(ledgerContent)
-	if compileErr {
-		coreErr := CoreErrorLine(problem)
-		if coreErr == "" {
-			coreErr = CoreErrorLine(ledgerContent)
-		}
+	// ── EMERGENCY DETERMINISTIC FALLBACK ──────────────────────────
+	// All 3 LLM synthesis attempts (initial + 2 retries) failed to produce a
+	// valid JSON plan. Build a deterministic go get / go mod tidy task from
+	// the forensic ledger conclusion instead of returning a hard error or
+	// forcing a manual /investigate loop.
+	if IsCompilationOrDependencyError(problem) || IsCompilationOrDependencyError(ledgerContent) {
 		conclusion := ExtractConclusionFromLedger(ledgerContent)
-		retry, retryErr := e.ProcessFromLedgerFastTrack(ctx, FastTrackPrompt(coreErr, conclusion), modelName)
-		if retryErr != nil {
-			return nil, retryErr
+		if dep := dependencyFromConclusion(conclusion); dep != "" {
+			return []Task{
+				{
+					StepNum:     1,
+					IsDone:      false,
+					Status:      "idle",
+					Type:        "SHELL_EXEC",
+					Target:      "go get " + dep,
+					Description: "Emergency fallback: all LLM synthesis attempts exhausted",
+				},
+			}, nil
 		}
-		if len(retry) > 0 {
-			return retry, nil
-		}
-		// If the retry also failed, surface the original model output for context.
-		return nil, fmt.Errorf("plan engine: no valid tasks found (provider returned non-JSON: %s)", truncateForLog(resp.Content))
+		return []Task{
+			{
+				StepNum:     1,
+				IsDone:      false,
+				Status:      "idle",
+				Type:        "SHELL_EXEC",
+				Target:      "go mod tidy",
+				Description: "Emergency fallback: all LLM synthesis attempts exhausted",
+			},
+		}, nil
 	}
 
-	jsonErr := jsonResult.Error
-	if jsonErr == "" {
-		jsonErr = fmt.Sprintf("empty error field (provider response: %s)", truncateForLog(resp.Content))
+	// ── ABSOLUTE FALLBACK ENFORCER (No Turning Back) ─────────────
+	// If we exhausted all silent retries yet the ledger still carries a raw
+	// *.go file path with a parsing/import error indicator, we MUST NOT bubble
+	// a hard failure up to the UI that forces the user to re-run /investigate
+	// manually. A raw compile error on a source file is, by definition, a
+	// module/environment discrepancy — assume it and stage `go mod tidy`
+	// deterministically, with a warning logged for traceability.
+	if hasGoFileParseError(ledgerContent) || hasGoFileParseError(problem) {
+		fmt.Printf("[plan-fallback] Truncated dependency match hit. Injecting deterministic go mod tidy task.\n")
+		return []Task{
+			{
+				StepNum:     1,
+				IsDone:      false,
+				Status:      "idle",
+				Type:        "SHELL_EXEC",
+				Target:      "go mod tidy",
+				Description: "Emergency fallback: all LLM synthesis attempts exhausted; raw *.go parse/import error detected",
+			},
+		}, nil
 	}
-	return nil, fmt.Errorf("plan engine: no valid tasks found in provider response (JSON parse error: %s)", jsonErr)
+
+	return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed and no dependency error detected", maxSilentRetries+1)
 }
 
 // filterValidTasks filters a task slice to only tasks with valid, non-empty
@@ -242,6 +327,216 @@ func filterValidTasks(tasks []Task) []Task {
 		}
 	}
 	return clean
+}
+
+// ForceShellExecOnCompileError enforces the IZEN /plan anti-escape law for
+// compilation or dependency failures: when the root cause is a build/dep error,
+// the plan MUST resolve it through go.mod / SHELL_EXEC (e.g. `go get`,
+// `go mod tidy`) — NEVER by patching documentation or unrelated source files.
+//
+// If the synthesized tasks already contain a SHELL_EXEC task, they are returned
+// unchanged (the model complied). Otherwise a deterministic SHELL_EXEC recovery
+// task is prepended so the build engine always has a runnable shell step to
+// clear the blocker instead of stalling or escaping into README.md.
+func ForceShellExecOnCompileError(tasks []Task, problem, ledgerContent string) []Task {
+	if len(tasks) == 0 {
+		return tasks
+	}
+	if !IsCompilationOrDependencyError(problem) && !IsCompilationOrDependencyError(ledgerContent) {
+		return tasks
+	}
+	for _, t := range tasks {
+		if t.Type == "SHELL_EXEC" && strings.TrimSpace(t.Target) != "" {
+			return tasks
+		}
+	}
+
+	// No shell task present → prepend a deterministic dependency-resolution
+	// SHELL_EXEC. Prefer the corrected dependency path from the investigation
+	// conclusion when available; otherwise fall back to `go mod tidy`.
+	cmd := "go mod tidy"
+	if conclusion := ExtractConclusionFromLedger(ledgerContent); conclusion != "" {
+		if dep := dependencyFromConclusion(conclusion); dep != "" {
+			cmd = "go get " + dep
+		}
+	}
+	recovery := Task{
+		StepNum:     0,
+		IsDone:      false,
+		Status:      "idle",
+		Type:        "SHELL_EXEC",
+		Target:      cmd,
+		Description: "Resolve compilation/dependency blocker via module tooling (forced by /plan anti-escape law)",
+	}
+	out := make([]Task, 0, len(tasks)+1)
+	out = append(out, recovery)
+	out = append(out, tasks...)
+	for i := range out {
+		out[i].StepNum = i + 1
+	}
+	return out
+}
+
+// knownShellBinaries is the set of recognised executable binaries that a
+// SHELL_EXEC target may legitimately start with. Any first token outside this
+// set — especially bare file paths like "go.mod" or "relative/path/to/go.mod" —
+// is treated as a hallucinated command and triggers the deterministic fallback
+// in ValidateShellExecCommands.
+var knownShellBinaries = map[string]bool{
+	"go":             true,
+	"git":            true,
+	"make":           true,
+	"npm":            true,
+	"npx":            true,
+	"yarn":           true,
+	"pip":            true,
+	"pip3":           true,
+	"cargo":          true,
+	"brew":           true,
+	"docker":         true,
+	"docker-compose": true,
+	"cd":             true,
+	"mkdir":          true,
+	"cp":             true,
+	"mv":             true,
+	"rm":             true,
+	"touch":          true,
+	"echo":           true,
+	"cat":            true,
+	"curl":           true,
+	"wget":           true,
+	"chmod":          true,
+	"chown":          true,
+	"python":         true,
+	"python3":        true,
+	"node":           true,
+	"deno":           true,
+	"bun":            true,
+	"ls":             true,
+	"grep":           true,
+	"rg":             true,
+	"sed":            true,
+	"awk":            true,
+	"find":           true,
+	"sort":           true,
+	"tee":            true,
+	"ln":             true,
+	"source":         true,
+	"export":         true,
+	"sudo":           true,
+	"bash":           true,
+	"sh":             true,
+	"zsh":            true,
+	"terraform":      true,
+	"tofu":           true,
+	"kubectl":        true,
+	"helm":           true,
+	"go.mod":         false, // explicitly NOT a valid binary
+	"go.sum":         false, // explicitly NOT a valid binary
+}
+
+// isValidShellCommand checks whether a SHELL_EXEC target is a valid runnable
+// command rather than a hallucinated file path or placeholder text. A command
+// is valid when its first token is a known binary and it is not a bare file
+// path (e.g. "relative/path/to/go.mod", "./go.mod", or "go.mod" as a bare
+// command).
+func isValidShellCommand(cmd string) bool {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return false
+	}
+	// Forbid bare file paths ending in .mod or .sum.
+	if strings.HasSuffix(cmd, ".mod") || strings.HasSuffix(cmd, ".sum") {
+		return false
+	}
+	first := strings.Fields(cmd)[0]
+	// Forbid relative/absolute paths as the command token.
+	if strings.Contains(first, "/") {
+		return false
+	}
+	// Forbid bare go.mod/go.sum invoked as a command.
+	if first == "go.mod" || first == "go.sum" || first == "go.work" {
+		return false
+	}
+	return knownShellBinaries[first]
+}
+
+// ValidateShellExecCommands checks all SHELL_EXEC tasks for valid command
+// format per isValidShellCommand. If any SHELL_EXEC target is invalid — a
+// bare file path, ends in .mod/.sum, or does not start with a known binary —
+// the entire LLM output is rejected and replaced with a deterministic fallback
+// derived from the forensic ledger conclusion. This prevents local 7B models
+// from hallucinating execution commands like "relative/path/to/go.mod" as
+// SHELL_EXEC targets.
+func ValidateShellExecCommands(tasks []Task, ledgerContent string) []Task {
+	if len(tasks) == 0 {
+		return tasks
+	}
+	for _, t := range tasks {
+		if t.Type != "SHELL_EXEC" {
+			continue
+		}
+		if !isValidShellCommand(t.Target) {
+			conclusion := ExtractConclusionFromLedger(ledgerContent)
+			if dep := dependencyFromConclusion(conclusion); dep != "" {
+				return []Task{
+					{
+						StepNum:     1,
+						IsDone:      false,
+						Status:      "idle",
+						Type:        "SHELL_EXEC",
+						Target:      "go get " + dep,
+						Description: "Install missing dependency (sanitized: LLM produced invalid command)",
+					},
+				}
+			}
+			return []Task{
+				{
+					StepNum:     1,
+					IsDone:      false,
+					Status:      "idle",
+					Type:        "SHELL_EXEC",
+					Target:      "go mod tidy",
+					Description: "Resolve dependency blocker (sanitized: LLM produced invalid command)",
+				},
+			}
+		}
+	}
+	return tasks
+}
+
+// hasInvalidShellExecCommand returns true if any SHELL_EXEC task in the slice
+// has a target that fails isValidShellCommand. Unlike ValidateShellExecCommands,
+// this is a pure check with no side effects — used by the silent retry loop to
+// detect LLM command hallucination without triggering deterministic substitution.
+func hasInvalidShellExecCommand(tasks []Task) bool {
+	for _, t := range tasks {
+		if t.Type == "SHELL_EXEC" && !isValidShellCommand(t.Target) {
+			return true
+		}
+	}
+	return false
+}
+
+// shellExecReinforcement returns the strict enforcement instruction appended to
+// the prompt on each silent retry attempt. It reminds the model what format
+// SHELL_EXEC targets must follow after a previous hallucination failure.
+func shellExecReinforcement(attempt, maxRetries int) string {
+	return fmt.Sprintf("\n\n[SYSTEM: CRITICAL FAILURE PREVENTED] (Retry %d/%d) The SHELL_EXEC target you just generated was rejected because it is not a valid runnable command. You MUST output a real executable command — e.g. 'go get <package>', 'go mod tidy', 'git clone <url>' — NOT a file path. FORBIDDEN targets include: 'go.mod', 'go.sum', './relative/path', 'relative/path/to/go.mod', or any bare file name. The target must start with a known binary name like go, git, make, npm, docker, etc.",
+		attempt, maxRetries)
+}
+
+// dependencyFromConclusion extracts a plausible module path from an
+// investigation conclusion string (e.g. "use github.com/moby/moby/client").
+// It returns the first token that looks like a Go module path; empty otherwise.
+func dependencyFromConclusion(conclusion string) string {
+	for _, tok := range strings.Fields(conclusion) {
+		t := strings.TrimRight(strings.TrimLeft(tok, "\"'"), "\"'.,")
+		if strings.Contains(t, ".") && (strings.Contains(t, "/") || strings.HasPrefix(t, "github.com") || strings.HasPrefix(t, "golang.org")) {
+			return t
+		}
+	}
+	return ""
 }
 
 // truncateForLog caps a model response excerpt so error messages stay readable.

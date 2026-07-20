@@ -2,6 +2,7 @@ package prompt
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/config"
@@ -15,6 +16,11 @@ import (
 type RuntimeFacts struct {
 	// Username is the collaborating engineer's identity. Empty falls back to "developer".
 	Username string
+	// HostOS is the host operating system (runtime.GOOS) the agent runs on.
+	// When populated it anchors command generation to the real environment so
+	// the model does not hallucinate OS-specific commands (e.g. `apt-get` on
+	// macOS). Empty means "unknown" — the constraint is omitted.
+	HostOS string
 }
 
 // Compose assembles the full system prompt for a mode from the constitutional
@@ -31,6 +37,10 @@ func Compose(modeContract string, facts RuntimeFacts) string {
 	b.WriteString(CommonContract())
 	b.WriteString("\n\n")
 	b.WriteString(modeContract)
+	if facts.HostOS != "" {
+		b.WriteString("\n\n")
+		b.WriteString(EnvironmentContextForOS(facts.HostOS))
+	}
 	return b.String()
 }
 
@@ -39,22 +49,42 @@ func AskSystemPrompt(username string) string {
 	if username == "" {
 		username = "Developer"
 	}
-	return Compose(AskContract(), RuntimeFacts{Username: username})
+	return Compose(AskContract(), RuntimeFacts{Username: username, HostOS: runtime.GOOS})
 }
 
 // BuildSystemPrompt returns the composed system prompt for build mode.
 func BuildSystemPrompt() string {
-	return Compose(BuildContract(), RuntimeFacts{})
+	return Compose(BuildContract(), RuntimeFacts{HostOS: runtime.GOOS})
 }
 
 // PlanSystemPrompt returns the composed system prompt for plan mode.
 func PlanSystemPrompt() string {
-	return Compose(PlanContract(), RuntimeFacts{})
+	return Compose(PlanContract(), RuntimeFacts{HostOS: runtime.GOOS})
 }
 
 // InvestigateSystemPrompt returns the composed system prompt for investigate mode.
 func InvestigateSystemPrompt() string {
-	return Compose(InvestigateContract(), RuntimeFacts{})
+	return Compose(InvestigateContract(), RuntimeFacts{HostOS: runtime.GOOS})
+}
+
+// AskPromptHandoffSystemPrompt returns the composed system prompt for the
+// $prompt handoff synthesis in ask mode. It combines the common contract with
+// the handoff template so the LLM restructures raw chat history into the
+// IZEN INTELLIGENT PROMPT HANDOFF PACK format.
+func AskPromptHandoffSystemPrompt(username string) string {
+	if username == "" {
+		username = "Developer"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "You are IZEN. The human engineer you are collaborating with is named '%s'. This is a hard, invariant fact for the entire session — you MUST remember it and NEVER say you do not know their name, never ask them to tell you their name, and never claim the name was not provided. When asked about the user's identity, answer that they are '%s'.", username, username)
+	b.WriteString(CommonContract())
+	b.WriteString("\n\n")
+	b.WriteString(AskPromptHandoffContract())
+	if runtime.GOOS != "" {
+		b.WriteString("\n\n")
+		b.WriteString(EnvironmentContextForOS(runtime.GOOS))
+	}
+	return b.String()
 }
 
 // ForMode returns the composed system prompt for the named mode.
@@ -75,7 +105,7 @@ func ForModeWithUser(mode, username string) string {
 	case "investigate":
 		return InvestigateSystemPrompt()
 	case "review":
-		return Compose(ReviewContract(), RuntimeFacts{Username: username})
+		return Compose(ReviewContract(), RuntimeFacts{Username: username, HostOS: runtime.GOOS})
 	default:
 		return ""
 	}

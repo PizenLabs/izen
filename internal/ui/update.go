@@ -219,6 +219,19 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastAgentActivity = time.Now()
 		return m, nil
 
+	case hotfixProgressMsg:
+		// Stream a $hot lifecycle log line to the terminal so the developer
+		// sees active progress while the LLM generates the patch. Only accept
+		// lines while the hotfix is still generating (the proposal/error
+		// message clears these flags), preventing stale trailing logs from
+		// polluting the approval view.
+		if m.agentRunning && m.agentLabel == "hotfix" {
+			m.push(roleActivity, msg.Line)
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+		}
+		return m, nil
+
 	case agentDoneMsg:
 		m.agentRunning = false
 		m.reviewRunning = false
@@ -347,15 +360,33 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.bridgePlanToLedger(msg.Tasks)
 		m.handoffCtx.PendingTodos = make([]string, len(msg.Tasks))
 		for i, t := range msg.Tasks {
-			m.handoffCtx.PendingTodos[i] = t.Type + ": " + t.Target + " — " + t.Description
+			icon := Icon.ShellExec
+			if t.Type == "FILE_MUTATE" || t.Type == "DIFF_PATCH" || t.Type == "ATOMIC_REPLACE" {
+				icon = Icon.SrcPatch
+			}
+			m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
 		}
 		m.push(roleStatus, fmt.Sprintf("Plan staged: %d task(s). Use /build to execute.", len(msg.Tasks)))
 		// Render the staged task list into the viewport so the developer can
-		// see exactly what /build will execute.
+		// see exactly what /build will execute — Principal Engineer format.
 		var tb strings.Builder
-		tb.WriteString("## STAGED EXECUTION PLAN\n")
-		for i, t := range msg.Tasks {
-			fmt.Fprintf(&tb, "%d. [%s] %s — %s\n", i+1, t.Type, t.Target, t.Description)
+		tb.WriteString(boldSapphireStyle.Render(Icon.Blueprint+" STRATEGIC ARCHITECTURAL BLUEPRINT") + "\n")
+		tb.WriteString("  ▸ Impact Domain      : Execution Layer — Dependency Resolution\n")
+		tb.WriteString("  ▸ Risk Evaluation    : Low — Scoped dependency resolution\n")
+		tb.WriteString("  ▸ Verification Vector: Build + Test pipeline\n")
+		tb.WriteString("\n")
+		tb.WriteString(boldMauveStyle.Render(Icon.Timeline+" STAGED EXECUTION TIMELINE") + "\n")
+		for _, t := range msg.Tasks {
+			icon, track := planTrackIcon(t)
+			fmt.Fprintf(&tb, "%s [%s] %s\n", icon, track, t.Target)
+			if t.Rationale != "" {
+				fmt.Fprintf(&tb, "  ↳ Rationale: %s\n", t.Rationale)
+			}
+			if t.Solution != "" {
+				fmt.Fprintf(&tb, "  ↳ Expected Solution: %s\n", t.Solution)
+			} else if t.Description != "" && t.Rationale == "" {
+				fmt.Fprintf(&tb, "  ↳ Rationale: %s\n", t.Description)
+			}
 		}
 		m.push(roleStatus, tb.String())
 		if m.buildLedger == nil {
@@ -517,6 +548,71 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		flush := m.flushPendingRecords()
 		return m, flush
 
+	case hotfixProposalMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
+
+		// ── HOTFIX PROPOSAL FAILURE ───────────────────────────────────
+		// Patch generation failed: surface the error, abort the hotfix, and
+		// restore the stashed plan so the pipeline returns to PAUSED cleanly.
+		if msg.Err != nil {
+			m.push(roleError, "[HOTFIX] Patch generation failed: "+msg.Err.Error())
+			m.hotfixActive = false
+			if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
+				m.sess.StageTaskList(&stashedTasks)
+				_ = m.sess.Save()
+			}
+			m.push(roleSystem, infoStyle.Render("[HOTFIX] Pipeline PAUSED. No files were modified."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m, m.flushPendingRecords()
+		}
+
+		// ── CRITICAL: freeze and request authorization (Bug Fix 2) ─────
+		// Store the synthesized patch + rendered diff proposal. Enter the
+		// StateAwaitingApproval approval gate so the developer can inspect the
+		// code diff and explicitly approve (y) or reject (n) BEFORE any change
+		// is written to disk.
+		m.pendingHotfixTask = msg.Task
+		m.pendingHotfixPatch = msg.Patch
+
+		// Render the diff through the standard proposal dock (MutationRenderer),
+		// exactly like a normal /build file-mutation proposal.
+		target := msg.Task.Target
+		proposal := SemanticProposal{
+			ID:   msg.Patch.ID,
+			Diff: msg.Diff,
+			Target: SemanticTarget{
+				QualifiedName: target,
+				Module:        filepath.Dir(target),
+				Language:      langFromPath(target),
+			},
+			Expanded: true,
+		}
+		m.pendingProposals = []SemanticProposal{proposal}
+
+		// ── CLEAN TRANSITION TO PROPOSAL VIEW (Feature) ──────────────
+		// Emit the final lifecycle log then swap the pane into the
+		// MutationRenderer diff view. The spinner/transient progress lines are
+		// superseded by the explicit approval prompt below.
+		m.push(roleActivity, "  ⚙ Compiling unified diff schema...")
+
+		m.state = StateAwaitingApproval
+		m.ti.Blur()
+		m.recalcViewportHeight()
+
+		m.push(roleStatus, fmt.Sprintf(
+			"[HOTFIX APPROVAL] Proposed patch to %s", target))
+		m.push(roleSystem, infoStyle.Render(
+			"Review the code diff below. Apply this patch? (y/n): "))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, nil
+
 	case buildResultMsg:
 		m.agentRunning = false
 		m.reviewRunning = false
@@ -526,6 +622,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sanitizeInputPrompt()
 		m.lastTestOutput = msg.output
 		m.lastTestFailed = msg.exitCode != 0
+
+		// ── FIX 1: Flush prompt buffer on task failure ────────────────
+		// Wipe the volatile user input cache so the next keystroke or
+		// command is parsed as a brand-new clean request, rather than
+		// appending to the failed context. This prevents the prompt buffer
+		// from getting stuck on historical commands.
+		if msg.exitCode != 0 {
+			m.ti.SetValue("")
+			m.syncInputFromTI()
+			m.input.Reset()
+			m.currentPrompt = ""
+			m.responseBuffer.Reset()
+			m.currentStreamContent = ""
+			m.streamBuffer = ""
+			m.historyIndex = -1
+		}
+
 		if msg.err != nil {
 			m.push(roleError, "build execution error: "+msg.err.Error())
 		}
@@ -543,9 +656,100 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.push(roleSystem, infoStyle.Render(fmt.Sprintf("Execution failed (exit %d).", msg.exitCode)))
 		}
 
-		// After a SHELL_EXEC step finishes, advance to the next idle task so the
-		// build queue makes progress automatically. The handler that dispatched
-		// the SHELL_EXEC (runBuildShellExec) already marked this task terminal.
+		// ── $hot HOTFIX: restore stashed plan AFTER hotfix ────────────
+		// The hotfix lifecycle is fully contained here:
+		//   1. Rollback any hotfix mutations on failure.
+		//   2. Restore the stashed plan deterministically (Go-level, no LLM).
+		//   3. Mark the pipeline PAUSED — no auto-advance, no stalled-marking.
+		//   4. Return early, cutting off all fall-through execution paths.
+		//
+		// This prevents the restored plan's pending tasks from being mistaken
+		// as the active pipeline's next steps (which would trigger automatic
+		// re-execution of previously rejected SHELL_EXEC tasks).
+		if m.hotfixActive {
+			// Rollback on failure (no-op if no transaction was started).
+			if msg.exitCode != 0 && m.execEng != nil {
+				if errs := m.execEng.RollbackTransaction(); len(errs) > 0 {
+					for _, err := range errs {
+						m.push(roleError, fmt.Sprintf("build rollback error: %v", err))
+					}
+				}
+			}
+
+			// Restore the stashed plan deterministically.
+			if stashedTasks, err := m.restorePlan(); err == nil {
+				if len(stashedTasks) > 0 {
+					m.sess.StageTaskList(&stashedTasks)
+					_ = m.sess.Save()
+				}
+			} else {
+				m.push(roleError, fmt.Sprintf("[HOTFIX] Failed to restore stashed plan: %v", err))
+			}
+			m.hotfixActive = false
+
+			// Pipeline is PAUSED — the restored plan is frozen until the
+			// user explicitly types "run" or provides feedback.
+			m.push(roleSystem, infoStyle.Render("[HOTFIX] Stashed plan restored successfully. Pipeline PAUSED."))
+
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+
+		// ── FIX 2: Freeze state machine on task failure ───────────────
+		// If a step fails, the overall plan status must be STALLED. It is
+		// strictly forbidden to advance the internal task index pointer.
+		// All remaining idle tasks are marked "stalled" so subsequent
+		// /build invocations see them blocked rather than silently
+		// advancing into corrupted state.
+		if msg.exitCode != 0 {
+			// ── ROLLBACK ON FAILURE ─────────────────────────────────
+			// Any disk mutations performed during this build execution
+			// are rolled back so the workspace is never left in a broken
+			// state. The transaction is then reset for the next attempt.
+			if m.execEng != nil {
+				if errs := m.execEng.RollbackTransaction(); len(errs) > 0 {
+					for _, err := range errs {
+						m.push(roleError, fmt.Sprintf("build rollback error: %v", err))
+					}
+				}
+			}
+
+			// ── CLEAR DIALOG BUFFER ON TASK FAILURE ────────────────
+			// Wipe the LLM conversation history so the next diagnostic
+			// or restart prompt starts with a clean context scope, never
+			// appending to stale failed-task history.
+			if m.sess != nil {
+				m.sess.ClearHistory()
+				_ = m.sess.Save()
+			}
+
+			tasks := m.sess.CurrentTasks
+			changed := false
+			for i := range tasks {
+				if tasks[i].Status == "idle" {
+					tasks[i].Status = "stalled"
+					changed = true
+				}
+			}
+			if changed {
+				m.sess.StageTaskList(&tasks)
+				_ = m.sess.Save()
+			}
+			m.push(roleError, fmt.Sprintf(
+				"[BUILD HALTED] Step %d failed. Queue frozen — remaining tasks marked stalled. Use /investigate or /plan to re-generate a valid ledger.",
+				m.currentBuildTaskID))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+
+		// After a SHELL_EXEC step finishes successfully, advance to the
+		// next idle task so the build queue makes progress automatically.
+		// When a $hot hotfix succeeds, the RESTORED plan is checked for
+		// remaining work — the original execution flow resumes seamlessly.
 		hasNext := false
 		for _, t := range m.sess.CurrentTasks {
 			if t.Status == "idle" || t.Status == "processing" {
@@ -613,6 +817,37 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.handleBlueprintReady(msg)
 
+	case promptHandoffMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
+		if msg.err != nil {
+			m.push(roleError, "prompt handoff error: "+msg.err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+		m.push(roleAI, msg.content)
+		// Expose the FollowUp action chip as an interactive component at the
+		// terminal footer, not as raw text in the markdown body.
+		if len(msg.actions) > 0 {
+			m.currentResult = &Result{Actions: msg.actions}
+		}
+		// Persist the handoff pack into the session.ContextLedger so it
+		// survives CleanContextTransitions and is available to /investigate
+		// (and downstream modes) as structured diagnostic context.
+		if msg.content != "" {
+			m.bridgeAskHandoffToLedger(msg.content)
+		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		flush := m.flushPendingRecords()
+		return m, flush
+
 	case fixResultMsg:
 		m.agentRunning = false
 		m.reviewRunning = false
@@ -676,10 +911,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Token optimization: truncate middle if output exceeds 4000 chars
 		output := msg.output
-		if len(output) > 4000 {
-			top := output[:2000]
-			bottom := output[len(output)-2000:]
-			output = top + "\n... [TRUNCATED " + strconv.Itoa(len(msg.output)-4000) + " bytes] ...\n" + bottom
+		runes := []rune(output)
+		if len(runes) > 4000 {
+			top := string(runes[:2000])
+			bottom := string(runes[len(runes)-2000:])
+			output = top + "\n... [TRUNCATED " + strconv.Itoa(len(runes)-4000) + " runes] ...\n" + bottom
 		}
 
 		if output != "" {
@@ -816,6 +1052,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.awaitingConfirmation = false
 			m.acceptAll = false
 			if msg.err == nil {
+				// ── COMMIT TRANSACTION ─────────────────────────────────
+				// All mutations approved and applied — clear the snapshot
+				// so the workspace is no longer pinned to the rollback point.
+				if m.execEng != nil {
+					m.execEng.CommitTransaction()
+				}
+
 				outcomeLine := fmt.Sprintf("%s %s • %s", successBannerStyle.Render("[✓]"), msg.file, msg.status)
 				m.push(roleSystem, outcomeLine)
 				m.createBuildCheckpoint(1)
@@ -865,6 +1108,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var testCmd tea.Cmd
 		switch {
 		case applied > 0 && failed == 0:
+			// ── COMMIT TRANSACTION ─────────────────────────────────
+			// All mutations approved and applied — clear the snapshot.
+			if m.execEng != nil {
+				m.execEng.CommitTransaction()
+			}
+
 			summary := fmt.Sprintf("%s %d file(s) mutated. Checkpoint created.", successBannerStyle.Render("[✓]"), applied)
 			m.push(roleSystem, summary)
 			m.createBuildCheckpoint(applied)
@@ -1275,8 +1524,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			fmt.Sprintf("✔ done · +%d tok · %s · %.1fs", delta, costStr, latencySec)))
 
 		if m.resolver.Current() == modes.ModePlan {
-			// Try JSON plan parsing first (JSON output is the primary contract).
-			// Falls back to legacy markdown format if JSON is invalid/absent.
+			// ── STRICT JSON SCHEMA ENFORCEMENT ───────────────────────
+			// The /plan mode MUST consume ONLY the verified JSON structure
+			// mapped by the schema (prompt/plan.go). If the handoff payload
+			// is unparsed or corrupted, do NOT let the local LLM hallucinate
+			// ambient tasks via markdown fallback. Force the controller to
+			// surface the structural error and reject the output.
 			// NOTE: raw final was already pushed as roleAI at line 771 and
 			// rendered through cacheRecordToHistory → renderStreamingContent,
 			// which handles JSON widget rendering. Do NOT push rendered content
@@ -1288,28 +1541,21 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
 				}
 			} else {
-				// Fall back to legacy markdown plan validation
-				validation := plan.ValidatePlanOutput(final)
-				if !validation.Valid {
-					errMsg := plan.FormatValidationError(validation)
-					m.push(roleError, errMsg)
-					m.push(roleSystem, infoStyle.Render("regenerate with more precise intent"))
+				errMsg := "plan rejected: output does not conform to JSON schema"
+				if jsonResult != nil && jsonResult.Error != "" {
+					errMsg = "plan rejected: " + jsonResult.Error
 				}
+				m.push(roleError, errMsg)
+				m.push(roleSystem, infoStyle.Render("regenerate with more precise intent or use /plan again"))
+				m.sess.ClearTasks()
 
-				var blockContent string
-				if len(validation.Blocks) > 0 {
-					blockContent = plan.CollapsePlanSections(final)
-				}
-
-				tasks := plan.ParseMarkdownToTasks(blockContent)
-				if len(tasks) == 0 {
-					tasks = plan.ParseMarkdownToTasks(final)
-				}
-
-				if len(tasks) > 0 {
-					m.sess.StageTaskList(&tasks)
-					m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
-				}
+				// ── PROMPT BUFFER BLEEDING FIX ────────────────────────
+				// Clear the dialog buffer on plan rejection so the next
+				// /plan attempt receives zero stale context from the
+				// failed previous attempt. Each plan generation is an
+				// independent lifecycle event.
+				m.sess.ClearHistory()
+				_ = m.sess.Save()
 			}
 		}
 

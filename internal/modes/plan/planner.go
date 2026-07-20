@@ -20,6 +20,8 @@ type Task struct {
 	Type        string `json:"type"`        // "FILE_MUTATE", "SHELL_EXEC", "GIT_ACTION"
 	Target      string `json:"target"`      // File path or exact CLI command
 	Description string `json:"description"` // Explanation of why this step exists
+	Rationale   string `json:"rationale,omitempty"`
+	Solution    string `json:"solution,omitempty"`
 }
 
 // ParseMarkdownToTasks converts markdown content into structured Task objects.
@@ -53,6 +55,17 @@ func ParseMarkdownToTasks(mdContent string) []Task {
 			targetParts := strings.SplitN(rest, "|", 2)
 			target := strings.TrimSpace(targetParts[0])
 			desc := strings.TrimSpace(targetParts[1])
+
+			// Anti-escape guard: IZEN MUST NOT mutate documentation
+			// (README.md, etc.) to work around compilation or dependency
+			// failures. The /plan engine must target go.mod or emit a
+			// SHELL_EXEC task instead. Drop any task whose target resolves to
+			// a documentation file so the model cannot silently fall back to
+			// doc edits under context pressure (this is the failure mode the
+			// local 7B model exhibits on compile/dep blockers).
+			if IsDocumentationTarget(target, typeStr) {
+				continue
+			}
 
 			isDone := false
 			status := "idle"

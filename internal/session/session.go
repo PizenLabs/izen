@@ -295,6 +295,28 @@ func (s *Session) LogDir() string {
 	return filepath.Dir(path)
 }
 
+// Purge resets the session to a completely sterile in-memory state: clears
+// all fields so the next startup begins with zero residual session state.
+// The on-disk .izen metadata directory is PRESERVED — it must never be
+// deleted. Only transient files (session.json, context_ledger.json) are
+// cleared by CleanupLocalState on shutdown if needed.
+func (s *Session) Purge() {
+	s.Objective = ""
+	s.ObjectiveState = nil
+	s.Mode = modes.ModeAsk
+	s.ContextID = ""
+	s.RunNumber = 0
+	s.Assumptions = nil
+	s.Questions = nil
+	s.Checkpoints = nil
+	s.InvestigationID = ""
+	s.ReviewID = ""
+	s.CurrentTasks = nil
+	s.DiagnosticsSummary = ""
+	s.History = nil
+	s.ContextLedger = nil
+}
+
 // WriteToGlobalLog appends a log entry to the global history log file.
 //
 // Deprecated: Use history.WriteToHistoryLog or audit package for dual-stream logging.

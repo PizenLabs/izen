@@ -91,55 +91,73 @@ var Border = struct {
 // Icon holds quiet, monochrome Unicode/Nerd-Font glyphs (no emoji). Icons
 // help users scan content faster and stay visually consistent across modes.
 var Icon = struct {
-	Command  string
-	File     string
-	Diff     string
-	Task     string
-	Warning  string
-	Review   string
-	Execute  string
-	Evidence string
-	Action   string
-	Success  string
-	Error    string
-	Info     string
-	Plan     string
-	Edit     string
-	Table    string
-	Summary  string
-	Risk     string
-	Context  string
-	Chevron  string
-	Bullet   string
-	Check    string
-	Cross    string
-	Pending  string
-	Spark    string
+	Command   string
+	File      string
+	Diff      string
+	Task      string
+	Warning   string
+	Review    string
+	Execute   string
+	Evidence  string
+	Action    string
+	Success   string
+	Error     string
+	Info      string
+	Plan      string
+	Edit      string
+	Table     string
+	Summary   string
+	Risk      string
+	Context   string
+	Chevron   string
+	Bullet    string
+	Check     string
+	Cross     string
+	Pending   string
+	Spark     string
+	ShellExec string
+	Config    string
+	SrcPatch  string
+	Done      string
+	Blueprint string
+	Timeline  string
+	EnvDeps   string
+	CodeMod   string
+	Verify    string
 }{
-	Command:  "❯", // ❯
-	File:     "▦", // ▦
-	Diff:     "⇄", // ⇄
-	Task:     "✓", // ✓
-	Warning:  "▲", // ▲
-	Review:   "◎", // ◎
-	Execute:  "▶", // ▶
-	Evidence: "◉", // ◉
-	Action:   "❖", // ❖
-	Success:  "✔", // ✔
-	Error:    "✘", // ✘
-	Info:     "ℹ", // ℹ
-	Plan:     "▤", // ▤
-	Edit:     "✎", // ✎
-	Table:    "⊞", // ⊞
-	Summary:  "»", // »
-	Risk:     "◆", // ◆
-	Context:  "⊚", // ⊚
-	Chevron:  "▸", // ▸
-	Bullet:   "•", // •
-	Check:    "●", // ●
-	Cross:    "✗", // ✗
-	Pending:  "◌", // ◌
-	Spark:    "✦", // ✦
+	Command:   "❯",
+	File:      "▦",
+	Diff:      "⇄",
+	Task:      "✓",
+	Warning:   "▲",
+	Review:    "◎",
+	Execute:   "▶",
+	Evidence:  "◉",
+	Action:    "❖",
+	Success:   "✔",
+	Error:     "✘",
+	Info:      "ℹ",
+	Plan:      "▤",
+	Edit:      "✎",
+	Table:     "⊞",
+	Summary:   "»",
+	Risk:      "◆",
+	Context:   "⊚",
+	Chevron:   "▸",
+	Bullet:    "•",
+	Check:     "●",
+	Cross:     "✗",
+	Pending:   "◌",
+	Spark:     "✦",
+	ShellExec: "▶",
+	Config:    "⚙",
+	SrcPatch:  "⚙",
+	Done:      "✔",
+	Blueprint: "\U000F0313",
+	Timeline:  "\U000F0316",
+	EnvDeps:   "\U000F03D7",
+	CodeMod:   "\U000F061E",
+	Verify:    "\U000F0668",
 }
 
 // rule returns a full-width horizontal separator rendered in the given style.

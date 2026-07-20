@@ -39,10 +39,14 @@ type ollamaMessage struct {
 }
 
 type ollamaRequest struct {
-	Model    string          `json:"model"`
-	Messages []ollamaMessage `json:"messages"`
-	Stream   bool            `json:"stream"`
-	Format   string          `json:"format,omitempty"` // "json" for structured output
+	Model     string          `json:"model"`
+	Messages  []ollamaMessage `json:"messages"`
+	Stream    bool            `json:"stream"`
+	Format    string          `json:"format,omitempty"` // "json" for structured output
+	MaxTokens *int            `json:"max_tokens,omitempty"`
+	Options   *struct {
+		NumPredict int `json:"num_predict"`
+	} `json:"options,omitempty"`
 }
 
 type ollamaResponse struct {
@@ -138,10 +142,15 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	msgs := p.buildMessages(req)
 
+	maxTokens := 4096
 	body := ollamaRequest{
-		Model:    model,
-		Messages: msgs,
-		Stream:   false,
+		Model:     model,
+		Messages:  msgs,
+		Stream:    false,
+		MaxTokens: &maxTokens,
+		Options: &struct {
+			NumPredict int `json:"num_predict"`
+		}{NumPredict: 4096},
 	}
 	if req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object" {
 		body.Format = "json"
@@ -216,10 +225,15 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 
 	msgs := p.buildMessages(req)
 
+	maxTokens := 4096
 	body := ollamaRequest{
-		Model:    model,
-		Messages: msgs,
-		Stream:   true,
+		Model:     model,
+		Messages:  msgs,
+		Stream:    true,
+		MaxTokens: &maxTokens,
+		Options: &struct {
+			NumPredict int `json:"num_predict"`
+		}{NumPredict: 4096},
 	}
 
 	payload, err := json.Marshal(body)

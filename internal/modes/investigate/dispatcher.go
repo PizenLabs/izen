@@ -85,13 +85,14 @@ const dispatchSystemPrompt = `You are the routing brain for the /investigate for
 Given a raw test/compile failure log, decide the SINGLE best first diagnostic tool.
 
 Rules:
-- Output ONLY a JSON object, no prose, no markdown.
+- Output ONLY a raw JSON object. No markdown fences, no // comments, no extra text.
 - Schema: {"tool": "<env|trace|diagnose|lx>", "target": "<symbol/file/test name or empty>", "rationale": "<one short phrase>"}
 - Pick "env" for Docker/environment/tooling/version blockers or missing binaries.
 - Pick "trace" for panics, nil-pointer derefs, deep regressions, data races, stack traces.
 - Pick "lx" ONLY when a specific missing symbol, package, or file is clearly named.
 - Pick "diagnose" only as a generic fallback when nothing else fits.
-- Set "target" only when the log names a concrete entity (e.g. "cmd/api/main.go", "internal/database", "Foo.Bar", "TestX").`
+- Set "target" only when the log names a concrete entity (e.g. "cmd/api/main.go", "internal/database", "Foo.Bar", "TestX").
+- CRITICAL: The first non-whitespace character MUST be '{'. Do NOT output // comments or markdown fences.`
 
 func llmClassify(ctx context.Context, provider ai.Provider, model, log string) (Strategy, bool) {
 	resp, err := provider.Execute(ctx, ai.Request{
@@ -135,6 +136,8 @@ func parseStrategy(raw string) (Strategy, bool) {
 func heuristicClassify(log string) Strategy {
 	l := strings.ToLower(log)
 	switch {
+	case strings.Contains(l, "module declares its path as"):
+		return Strategy{Tool: ToolLX, Rationale: "module path mismatch — use the declared path from the error"}
 	case strings.Contains(l, "docker"),
 		strings.Contains(l, "command not found"),
 		strings.Contains(l, "no such file or directory"),

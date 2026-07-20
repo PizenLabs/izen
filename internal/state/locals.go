@@ -8,21 +8,22 @@ import (
 )
 
 const (
-	LocalDir         = ".izen"
-	RuntimeMetaFile  = "runtime.meta"
-	SessionFile      = "session.json"
-	GraphDir         = "graph"
-	GraphCacheFile   = "ast.db"
-	SymbolsDBFile    = "symbols.db"
-	DirtyOverlayFile = "dirty.overlay"
-	HistoryDir       = "history"
-	InputLogFile     = "input.log"
-	EventsLogFile    = "events.log"
-	AuditDir         = "audit"
-	MutationsLogFile = "mutations.log"
-	ShellLogFile     = "shell.log"
-	CheckpointsDir   = "checkpoints"
-	PatchesDir       = "patches"
+	LocalDir          = ".izen"
+	RuntimeMetaFile   = "runtime.meta"
+	SessionFile       = "session.json"
+	GraphDir          = "graph"
+	GraphCacheFile    = "ast.db"
+	SymbolsDBFile     = "symbols.db"
+	DirtyOverlayFile  = "dirty.overlay"
+	HistoryDir        = "history"
+	InputLogFile      = "input.log"
+	EventsLogFile     = "events.log"
+	AuditDir          = "audit"
+	MutationsLogFile  = "mutations.log"
+	ShellLogFile      = "shell.log"
+	CheckpointsDir    = "checkpoints"
+	PatchesDir        = "patches"
+	ContextLedgerFile = "context_ledger.json"
 )
 
 type RuntimeMeta struct {
@@ -106,6 +107,20 @@ func CheckVersion(root string, currentLxVersion string) error {
 		fmt.Fprintf(os.Stderr, "izen: version mismatch — runtime.meta lx_version=%s, current=%s (degraded state)\n", meta.LxVersion, currentLxVersion)
 		fmt.Fprintf(os.Stderr, "izen: suggest: remove %s and restart to rebuild\n", LocalPath(root, RuntimeMetaFile))
 	}
+	return nil
+}
+
+// CleanupLocalState preserves the .izen directory structure but clears
+// volatile runtime data. The .izen metadata directory is PERMANENT and
+// persistent across application lifecycles — it must never be deleted.
+// Only transient session files (session.json, context_ledger.json) are
+// removed to give a clean slate while keeping graph caches, checkpoints,
+// and configuration intact.
+func CleanupLocalState(root string) error {
+	sessionPath := filepath.Join(root, LocalDir, SessionFile)
+	_ = os.Remove(sessionPath)
+	ledgerPath := filepath.Join(root, LocalDir, ContextLedgerFile)
+	_ = os.Remove(ledgerPath)
 	return nil
 }
 

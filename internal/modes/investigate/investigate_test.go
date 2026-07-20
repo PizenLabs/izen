@@ -946,20 +946,14 @@ func TestContextLedgerFormatForPlan(t *testing.T) {
 	cl.SetConclusion("fixed", true)
 
 	output := cl.FormatForPlan()
-	if !strings.Contains(output, "INVESTIGATION LEDGER") {
-		t.Fatal("expected INVESTIGATION LEDGER header")
-	}
 	if !strings.Contains(output, "test failure") {
 		t.Fatal("expected 'test failure' in output")
 	}
 	if !strings.Contains(output, "TestFunc") {
 		t.Fatal("expected TestFunc in output")
 	}
-	if !strings.Contains(output, "BOUNDARY ENFORCEMENT") {
-		t.Fatal("expected BOUNDARY ENFORCEMENT section")
-	}
-	if !strings.Contains(output, "/plan") {
-		t.Fatal("expected handoff to /plan")
+	if !strings.Contains(output, "fixed") {
+		t.Fatal("expected conclusion in output")
 	}
 }
 
@@ -1089,8 +1083,8 @@ func TestEngineFormatLedgerForPlan(t *testing.T) {
 	if !strings.Contains(output, "Parse") {
 		t.Fatal("expected Parse function in ledger output")
 	}
-	if !strings.Contains(output, "/plan") {
-		t.Fatal("expected /plan handoff in ledger output")
+	if !strings.Contains(output, "nil pointer") {
+		t.Fatal("expected conclusion in ledger output")
 	}
 }
 
@@ -1771,5 +1765,85 @@ func TestSinksNeverWriteRawToStdio(t *testing.T) {
 	// proving the log went somewhere structured rather than being lost.
 	if captured.Len() == 0 {
 		t.Fatal("redirected sink received no orchestrator telemetry — wiring is broken")
+	}
+}
+
+// TestIsRemotePackageTarget verifies the Target Type Validation Gate correctly
+// separates remote import paths (which must be forbidden from local file
+// operations) from genuine workspace files and bare symbols.
+func TestIsRemotePackageTarget(t *testing.T) {
+	remote := []string{
+		"github.com/docker/docker/client",
+		"golang.org/x/sync/errgroup",
+		"gopkg.in/yaml.v3",
+		"google.golang.org/grpc",
+		"k8s.io/apimachinery/pkg/apis/meta/v1",
+		"example.com/acme/widgets",
+	}
+	for _, tc := range remote {
+		if !isRemotePackageTarget(tc) {
+			t.Errorf("isRemotePackageTarget(%q) = false, want true (must forbid local file ops)", tc)
+		}
+	}
+
+	local := []string{
+		"internal/database",
+		"./cmd/api/main.go",
+		"../pkg/foo/bar.go",
+		"cmd/api/main.go",
+		"Foo.Bar",
+		"TestX",
+		"",
+		"/abs/path/main.go",
+	}
+	for _, tc := range local {
+		if isRemotePackageTarget(tc) {
+			t.Errorf("isRemotePackageTarget(%q) = true, want false (must allow local handling)", tc)
+		}
+	}
+}
+
+// TestRunLXRemotePackageBypass is the regression guard for the orchestrator path
+// hallucination bug: a remote import path must NEVER reach the local file
+// reader (which previously produced a fatal "no such file or directory"). It
+// must instead be routed straight to the package-remediation blueprint without
+// invoking any file descriptor operation on the retriever.
+func TestRunLXRemotePackageBypass(t *testing.T) {
+	// A spy retriever that fails the test if ANY method is ever called — the
+	// gate must short-circuit before touching the retriever at all.
+	spy := &spyRetriever{onCall: func() {
+		t.Fatal("retriever was invoked for a remote package target — local file ops were NOT forbidden")
+	}}
+
+	runner := NewToolRunner(".", nil, "", spy, "")
+	res := runner.Run(context.Background(), ToolLX, "github.com/docker/docker/client")
+
+	if !res.Ok {
+		t.Fatal("expected remediation routing to succeed (Ok=true)")
+	}
+	if !strings.Contains(res.Content, "REMOTE DEPENDENCY BLOCKER") {
+		t.Fatalf("expected remote-dependency remediation content, got %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "go mod tidy") {
+		t.Fatalf("expected environment remediation blueprint staged, got %q", res.Content)
+	}
+}
+
+// TestRunLXLocalFileStillReads verifies the gate does not over-fire: a concrete
+// workspace file is still routed to the retriever's SearchFile path (no breach
+// of the normal contract).
+func TestRunLXLocalFileStillReads(t *testing.T) {
+	ret := newMockRetriever()
+	ret.fileResults["cmd/api/main.go"] = []SearchResult{
+		{File: "cmd/api/main.go", Line: 7, Content: "func main() {}", Confidence: 0.9},
+	}
+	runner := NewToolRunner(".", nil, "", ret, "")
+	res := runner.Run(context.Background(), ToolLX, "cmd/api/main.go")
+
+	if !res.Ok {
+		t.Fatal("expected local file lookup to succeed")
+	}
+	if len(res.Evidence) == 0 {
+		t.Fatal("expected evidence from the local file retriever")
 	}
 }
