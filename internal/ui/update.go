@@ -360,9 +360,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.bridgePlanToLedger(msg.Tasks)
 		m.handoffCtx.PendingTodos = make([]string, len(msg.Tasks))
 		for i, t := range msg.Tasks {
-			icon := "▶"
+			icon := Icon.ShellExec
 			if t.Type == "FILE_MUTATE" || t.Type == "DIFF_PATCH" || t.Type == "ATOMIC_REPLACE" {
-				icon = "⚙"
+				icon = Icon.SrcPatch
 			}
 			m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
 		}
@@ -370,21 +370,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Render the staged task list into the viewport so the developer can
 		// see exactly what /build will execute — Principal Engineer format.
 		var tb strings.Builder
-		tb.WriteString("## STRATEGIC ARCHITECTURAL BLUEPRINT\n")
-		tb.WriteString("  ▸ Impact Domain: Execution Layer — Dependency Resolution\n")
-		tb.WriteString("  ▸ Risk Evaluation: Low — Scoped dependency resolution\n")
+		tb.WriteString(boldSapphireStyle.Render(Icon.Blueprint+" STRATEGIC ARCHITECTURAL BLUEPRINT") + "\n")
+		tb.WriteString("  ▸ Impact Domain      : Execution Layer — Dependency Resolution\n")
+		tb.WriteString("  ▸ Risk Evaluation    : Low — Scoped dependency resolution\n")
 		tb.WriteString("  ▸ Verification Vector: Build + Test pipeline\n")
 		tb.WriteString("\n")
-		tb.WriteString("## STAGED EXECUTION TIMELINE\n")
+		tb.WriteString(boldMauveStyle.Render(Icon.Timeline+" STAGED EXECUTION TIMELINE") + "\n")
 		for _, t := range msg.Tasks {
-			icon := "▶"
-			switch t.Type {
-			case "SHELL_EXEC", "GIT_ACTION":
-				icon = "▶"
-			case "FILE_MUTATE", "DIFF_PATCH", "ATOMIC_REPLACE":
-				icon = "⚙"
+			icon, track := planTrackIcon(t)
+			fmt.Fprintf(&tb, "%s [%s] %s\n", icon, track, t.Target)
+			if t.Rationale != "" {
+				fmt.Fprintf(&tb, "  ↳ Rationale: %s\n", t.Rationale)
 			}
-			fmt.Fprintf(&tb, "%s [%s] %s — %s\n", icon, t.Type, t.Target, t.Description)
+			if t.Solution != "" {
+				fmt.Fprintf(&tb, "  ↳ Expected Solution: %s\n", t.Solution)
+			} else if t.Description != "" && t.Rationale == "" {
+				fmt.Fprintf(&tb, "  ↳ Rationale: %s\n", t.Description)
+			}
 		}
 		m.push(roleStatus, tb.String())
 		if m.buildLedger == nil {

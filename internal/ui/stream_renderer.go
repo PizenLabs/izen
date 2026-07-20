@@ -538,15 +538,34 @@ func (m *model) planStatusSource() plan.TaskStatusSource {
 	return m.buildLedger
 }
 
-// taskIcon returns the operational status icon for a given strategy type.
-func taskIcon(strategy string) (string, lipgloss.Style) {
-	switch strings.ToUpper(strategy) {
-	case "SHELL_EXEC":
-		return Icon.ShellExec, orangeStyle
-	case "GIT_ACTION":
-		return Icon.ShellExec, orangeStyle
+// planTrackIcon maps a Task to its track classification (ENV_DEPS, CODE_MOD, VERIFY)
+// and returns the icon+track label for the enriched plan display.
+// SHELL_EXEC dependency commands → 📦 [ENV_DEPS]
+// FILE_MUTATE/DIFF_PATCH/ATOMIC_REPLACE → 📝 [CODE_MOD]
+// Verification commands (go test, go build, etc.) → 🧪 [VERIFY]
+func planTrackIcon(t plan.Task) (string, string) {
+	icon, label := enrichedTrack(t.Type, t.Target)
+	return icon, label
+}
+
+// enrichedTrack maps a strategy+target pair to the enriched track classification.
+// Used by both planTrackIcon (Task) and renderJSONPlanWidget (AtomicTask).
+func enrichedTrack(strategy, target string) (string, string) {
+	upper := strings.ToUpper(strategy)
+	lower := strings.ToLower(strings.TrimSpace(target))
+	switch upper {
+	case "SHELL_EXEC", "GIT_ACTION":
+		if strings.HasPrefix(lower, "go test") || strings.HasPrefix(lower, "go build") ||
+			strings.HasPrefix(lower, "npm test") || strings.HasPrefix(lower, "cargo test") ||
+			strings.HasPrefix(lower, "pytest") || strings.Contains(lower, "verify") ||
+			strings.Contains(lower, "./...") {
+			return Icon.Verify, "VERIFY"
+		}
+		return Icon.EnvDeps, "ENV_DEPS"
+	case "FILE_MUTATE", "DIFF_PATCH", "ATOMIC_REPLACE":
+		return Icon.CodeMod, "CODE_MOD"
 	default:
-		return Icon.SrcPatch, blueStyle
+		return Icon.EnvDeps, "ENV_DEPS"
 	}
 }
 
@@ -568,10 +587,14 @@ func renderJSONPlanWidget(planOutput *plan.PlanOutput, src plan.TaskStatusSource
 	var b strings.Builder
 
 	// ── Strategic Architectural Blueprint ──────────────────────────────
-	b.WriteString(mdH1Style.Render("STRATEGIC ARCHITECTURAL BLUEPRINT"))
+	b.WriteString(boldSapphireStyle.Render(Icon.Blueprint + " STRATEGIC ARCHITECTURAL BLUEPRINT"))
 	b.WriteString("\n")
 
 	overview := planOutput.StrategicOverview
+	if overview.RootCoreFactor != "" {
+		b.WriteString(textStyle.Render(overview.RootCoreFactor))
+		b.WriteString("\n")
+	}
 	if overview.ImpactDomain != "" {
 		fmt.Fprintf(&b, "  %s %s\n",
 			dimmedStyle.Render(Icon.Chevron+" Impact Domain:"),
@@ -600,7 +623,7 @@ func renderJSONPlanWidget(planOutput *plan.PlanOutput, src plan.TaskStatusSource
 	b.WriteString("\n")
 
 	// ── Staged Execution Timeline ──────────────────────────────────────
-	b.WriteString(mdH1Style.Render("STAGED EXECUTION TIMELINE"))
+	b.WriteString(boldMauveStyle.Render(Icon.Timeline + " STAGED EXECUTION TIMELINE"))
 	b.WriteString("\n")
 
 	// Count committed tasks so the header reflects live ledger progress.
@@ -622,55 +645,77 @@ func renderJSONPlanWidget(planOutput *plan.PlanOutput, src plan.TaskStatusSource
 	for _, task := range planOutput.AtomicTasks {
 		done := src != nil && src.IsCompleted(task.TaskID)
 
-		icon, iconStyle := taskIcon(task.Strategy)
-		descStyle := dimmedStyle
-
+		var trackIcon, trackLabel string
 		if done {
-			icon = Icon.Done
-			iconStyle = greenStyle
+			trackIcon = Icon.Done
+			trackLabel = "DONE"
+		} else {
+			trackIcon, trackLabel = enrichedTrack(task.Strategy, task.File)
+		}
+
+		iconStyle := greenStyle
+		if !done {
+			switch trackLabel {
+			case "ENV_DEPS":
+				iconStyle = orangeStyle
+			case "CODE_MOD":
+				iconStyle = blueStyle
+			case "VERIFY":
+				iconStyle = greenStyle
+			default:
+				iconStyle = dimmedStyle
+			}
+		}
+
+		descStyle := dimmedStyle
+		if done {
 			descStyle = strikeDimStyle
 		}
 
-		strategyTag := strings.ToUpper(task.Strategy)
 		tagStyle := dimmedStyle
-		switch strategyTag {
-		case "SHELL_EXEC":
-			tagStyle = orangeStyle
-		case "FILE_MUTATE", "ATOMIC_REPLACE", "DIFF_PATCH":
-			tagStyle = blueStyle
-		case "GIT_ACTION":
-			tagStyle = mutedStyle
+		if !done {
+			switch trackLabel {
+			case "ENV_DEPS":
+				tagStyle = orangeStyle
+			case "CODE_MOD":
+				tagStyle = blueStyle
+			case "VERIFY":
+				tagStyle = greenStyle
+			}
 		}
 
-		taskLabel := task.Description
-		if taskLabel == "" {
-			taskLabel = fmt.Sprintf("%s: %s", task.Strategy, task.File)
-		}
-
-		fmt.Fprintf(&b, "%s %s %s %s\n",
-			iconStyle.Render(icon),
-			tagStyle.Render("["+strategyTag+"]"),
+		fmt.Fprintf(&b, "%s %s %s\n",
+			iconStyle.Render(trackIcon),
+			tagStyle.Render("["+trackLabel+"]"),
 			textStyle.Render(task.File),
-			dimmedStyle.Render("—"),
-			// descStyle.Render wrapped below
 		)
 
-		// Description on the following line, indented
-		descW := contentWidth - 6
-		if descW < 10 {
-			descW = 10
+		// Rationale line
+		rationale := task.Rationale
+		if rationale == "" {
+			rationale = task.Description
 		}
-		descLines := wrapStreamText(taskLabel, descW)
-		for _, dl := range descLines {
-			fmt.Fprintf(&b, "  %s\n", descStyle.Render(dl))
+		if rationale != "" {
+			descW := contentWidth - 6
+			if descW < 10 {
+				descW = 10
+			}
+			ratLines := wrapStreamText(rationale, descW)
+			for _, rl := range ratLines {
+				fmt.Fprintf(&b, "  %s %s\n", dimmedStyle.Render(Icon.Chevron+" Rationale:"), descStyle.Render(rl))
+			}
 		}
 
-		// Strategy hint on a third line if non-trivial
-		if task.Strategy != "" && !strings.HasPrefix(taskLabel, task.Strategy) {
-			fmt.Fprintf(&b, "  %s %s\n",
-				dimmedStyle.Render(Icon.Chevron),
-				dimmedStyle.Render(task.Strategy),
-			)
+		// Solution line
+		if task.Solution != "" {
+			descW := contentWidth - 6
+			if descW < 10 {
+				descW = 10
+			}
+			solLines := wrapStreamText(task.Solution, descW)
+			for _, sl := range solLines {
+				fmt.Fprintf(&b, "  %s %s\n", dimmedStyle.Render(Icon.Chevron+" Expected Solution:"), descStyle.Render(sl))
+			}
 		}
 
 		b.WriteString("\n")

@@ -649,6 +649,8 @@ func (e *Engine) statePropose() error {
 		e.Ledger.SetRootCause(e.Result.RootCause)
 		e.Ledger.SetConclusion(e.Result.Conclusion, false)
 	}
+
+	e.injectDependencyBlocker()
 	return e.State.Transition(StateDone)
 }
 
@@ -701,6 +703,50 @@ func (e *Engine) FormatLedgerForPlan() string {
 		e.Ledger.SetConclusion(e.Result.Conclusion, e.Result.Resolved)
 	}
 	return e.Ledger.FormatForPlan()
+}
+
+// extractPackageName extracts the Go module/package path from a Go compilation
+// error of the form "no required module provides package <PKG>".
+// Returns the fully-qualified package path or empty string.
+func extractPackageName(rawError string) string {
+	needle := "no required module provides package "
+	idx := strings.Index(rawError, needle)
+	if idx < 0 {
+		return ""
+	}
+	rest := rawError[idx+len(needle):]
+	end := strings.IndexAny(rest, " \t\n\r:")
+	if end < 0 {
+		end = len(rest)
+	}
+	return strings.TrimSpace(rest[:end])
+}
+
+// injectDependencyBlocker scans the raw diagnostics for Go dependency errors
+// and injects the exact package path into the conclusion if missing. This
+// guarantees /plan receives an actionable REMOTE DEPENDENCY BLOCKER token
+// instead of a vague hypothesis that causes JSON synthesis failures.
+func (e *Engine) injectDependencyBlocker() {
+	raw := e.Ledger.Diagnostics
+	if raw == "" {
+		return
+	}
+	if !strings.Contains(raw, "no required module provides package") {
+		return
+	}
+	if strings.Contains(e.Ledger.Conclusion, "REMOTE DEPENDENCY BLOCKER") {
+		return
+	}
+	pkg := extractPackageName(raw)
+	if pkg == "" {
+		return
+	}
+	blocker := fmt.Sprintf("BLOCKER: Compilation/dependency error detected. ## REMOTE DEPENDENCY BLOCKER (auto-extracted): %s", pkg)
+	if e.Ledger.Conclusion != "" {
+		e.Ledger.Conclusion += "\n" + blocker
+	} else {
+		e.Ledger.Conclusion = blocker
+	}
 }
 
 func summarizeEvidence(evidence []Evidence) string {

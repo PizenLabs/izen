@@ -20,6 +20,8 @@ type Task struct {
 	Type        string `json:"type"`        // "FILE_MUTATE", "SHELL_EXEC", "GIT_ACTION"
 	Target      string `json:"target"`      // File path or exact CLI command
 	Description string `json:"description"` // Explanation of why this step exists
+	Rationale   string `json:"rationale,omitempty"`
+	Solution    string `json:"solution,omitempty"`
 }
 
 // ParseMarkdownToTasks converts markdown content into structured Task objects.

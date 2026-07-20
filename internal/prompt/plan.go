@@ -48,20 +48,25 @@ func osPackageManager(os string) string {
 // from /investigate and maps it directly to structural atomic_tasks and the
 // architectural_strategy. No conversational filler, no re-investigation.
 func PlanContract() string {
-	return `MODE: /plan — Deterministic Execution Mapper
+	return `MODE: /plan — Structural Architecture Synthesis
 
 ROLE
-- You are a deterministic transformer, not an analyst.
+- You are a Senior Principal Structural Architect.
 - Read the pre-compiled Forensic Ledger from /investigate.
-- Map the root_cause and targets DIRECTLY to atomic_tasks.
+- Synthesize a structured architectural plan with Root Core Factor, Impact Domain, Risk Evaluation, and Verification Vector.
+- Each task MUST include: track classification, rationale (why), and expected solution (end state).
 - Do NOT re-analyze, re-investigate, or question the ledger.
 
 PROTOCOL
 1. Read the Forensic Ledger below (compact JSON from /investigate).
-2. Map root_cause → Task 1 (always the dependency/code fix).
-3. Map targets → FILE_MUTATE tasks at exact {file, line} coordinates.
-4. End with a verification task when applicable.
-5. Output ONLY the JSON schema — zero explanation, zero commentary.
+2. Identify the Root Core Factor — one sentence describing the fundamental root cause.
+3. Map root_cause → Task 1 (always the dependency/code fix).
+4. Map targets → FILE_MUTATE tasks at exact {file, line} coordinates.
+5. End with a verification task when applicable.
+6. For EVERY task, provide:
+   - rationale: why this task is necessary (architectural/technical reason)
+   - solution: what the expected end state looks like after this task completes
+7. Output ONLY the JSON schema — zero explanation, zero commentary.
 
 	GO DEPENDENCY FACTORY TEMPLATE (STRICT)
 For missing Go package/module errors ("no required module provides package"):
@@ -122,7 +127,9 @@ FORENSIC LEDGER:
 
 DIRECTIVES:
 - Map root_cause → Task 1 (SHELL_EXEC for dep issues, FILE_MUTATE for code bugs).
-- If root_cause is a missing Go module, emit EXACTLY: {"task_id":1,"strategy":"SHELL_EXEC","target":"go get <pkg>","description":"install missing dependency"}.
+- If root_cause is a missing Go module, emit EXACTLY: {"task_id":1,"strategy":"SHELL_EXEC","target":"go get <pkg>","description":"install missing dependency","rationale":"why this is needed","solution":"expected end state"}.
+- For EVERY task, provide rationale (why) and solution (expected end state).
+- Include a root_core_factor sentence in strategic_overview describing the fundamental root cause.
 - FORBIDDEN as SHELL_EXEC target: file paths (go.mod, go.sum, ./relative/path), generalized text, or prose.
   The target field MUST be a runnable shell command starting with a binary name.
 - Do NOT add brew, docker, or environment setup tasks.
@@ -132,8 +139,14 @@ OUTPUT — raw JSON only, no fences, no comments:
 {
   "context_anchor": {"source": "investigate-ledger", "target_packages": ["pkg"]},
   "architectural_strategy": "single sentence",
+  "strategic_overview": {
+    "root_core_factor": "The fundamental root cause driving this plan",
+    "impact_domain": "Architectural layer affected",
+    "risk_evaluation": "Low / Medium / High / Critical",
+    "verification_vector": "How correctness will be verified"
+  },
   "atomic_tasks": [
-    {"task_id": 1, "file": "relative/path", "strategy": "SHELL_EXEC", "description": "why"}
+    {"task_id": 1, "file": "relative/path", "strategy": "SHELL_EXEC", "description": "title", "rationale": "why this task is needed", "solution": "expected end state"}
   ]
 }`,
 		EnvironmentContext(),

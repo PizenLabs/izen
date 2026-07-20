@@ -119,35 +119,45 @@ var Icon = struct {
 	Config    string
 	SrcPatch  string
 	Done      string
+	Blueprint string
+	Timeline  string
+	EnvDeps   string
+	CodeMod   string
+	Verify    string
 }{
-	Command:   "❯", // ❯
-	File:      "▦", // ▦
-	Diff:      "⇄", // ⇄
-	Task:      "✓", // ✓
-	Warning:   "▲", // ▲
-	Review:    "◎", // ◎
-	Execute:   "▶", // ▶
-	Evidence:  "◉", // ◉
-	Action:    "❖", // ❖
-	Success:   "✔", // ✔
-	Error:     "✘", // ✘
-	Info:      "ℹ", // ℹ
-	Plan:      "▤", // ▤
-	Edit:      "✎", // ✎
-	Table:     "⊞", // ⊞
-	Summary:   "»", // »
-	Risk:      "◆", // ◆
-	Context:   "⊚", // ⊚
-	Chevron:   "▸", // ▸
-	Bullet:    "•", // •
-	Check:     "●", // ●
-	Cross:     "✗", // ✗
-	Pending:   "◌", // ◌
-	Spark:     "✦", // ✦
-	ShellExec: "▶", // ▶ — shell execution
-	Config:    "⚙", // ⚙ — configuration / source modification
-	SrcPatch:  "⚙", // ⚙ — source modification
-	Done:      "✔", // ✔ — task completed
+	Command:   "❯",
+	File:      "▦",
+	Diff:      "⇄",
+	Task:      "✓",
+	Warning:   "▲",
+	Review:    "◎",
+	Execute:   "▶",
+	Evidence:  "◉",
+	Action:    "❖",
+	Success:   "✔",
+	Error:     "✘",
+	Info:      "ℹ",
+	Plan:      "▤",
+	Edit:      "✎",
+	Table:     "⊞",
+	Summary:   "»",
+	Risk:      "◆",
+	Context:   "⊚",
+	Chevron:   "▸",
+	Bullet:    "•",
+	Check:     "●",
+	Cross:     "✗",
+	Pending:   "◌",
+	Spark:     "✦",
+	ShellExec: "▶",
+	Config:    "⚙",
+	SrcPatch:  "⚙",
+	Done:      "✔",
+	Blueprint: "\U000F0313",
+	Timeline:  "\U000F0316",
+	EnvDeps:   "\U000F03D7",
+	CodeMod:   "\U000F061E",
+	Verify:    "\U000F0668",
 }
 
 // rule returns a full-width horizontal separator rendered in the given style.

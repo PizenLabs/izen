@@ -8,6 +8,7 @@ import (
 )
 
 type StrategicOverview struct {
+	RootCoreFactor     string `json:"root_core_factor"`
 	ImpactDomain       string `json:"impact_domain"`
 	RiskEvaluation     string `json:"risk_evaluation"`
 	VerificationVector string `json:"verification_vector"`
@@ -30,6 +31,8 @@ type AtomicTask struct {
 	File        string `json:"file"`
 	Strategy    string `json:"strategy"`
 	Description string `json:"description"`
+	Rationale   string `json:"rationale,omitempty"`
+	Solution    string `json:"solution,omitempty"`
 }
 
 type JSONPlanValidationResult struct {
@@ -108,6 +111,10 @@ func convertAtomicTasks(atomic []AtomicTask) []Task {
 		if desc == "" {
 			desc = fmt.Sprintf("%s: %s", strategy, a.File)
 		}
+		rationale := a.Rationale
+		if rationale == "" && desc != "" {
+			rationale = desc
+		}
 		tasks = append(tasks, Task{
 			StepNum:     i + 1,
 			IsDone:      false,
@@ -115,6 +122,8 @@ func convertAtomicTasks(atomic []AtomicTask) []Task {
 			Type:        taskType,
 			Target:      target,
 			Description: desc,
+			Rationale:   rationale,
+			Solution:    a.Solution,
 		})
 	}
 	return tasks
@@ -436,6 +445,7 @@ func SchemaJSONInstruction() string {
   },
   "architectural_strategy": "One-sentence summary of the architectural approach",
   "strategic_overview": {
+    "root_core_factor": "Brief sentence identifying the fundamental root cause driving this plan",
     "impact_domain": "Architectural layer or subsystem affected",
     "risk_evaluation": "Risk classification: Critical / High / Medium / Low",
     "verification_vector": "How correctness will be verified (build, test, lint, etc.)"
@@ -443,9 +453,11 @@ func SchemaJSONInstruction() string {
   "atomic_tasks": [
     {
       "task_id": 1,
-      "file": "relative/path/to/file.go",
+      "file": "relative/path/to/file.go or shell command",
       "strategy": "ATOMIC_REPLACE",
-      "description": "What to do and why"
+      "description": "Brief title of the task",
+      "rationale": "Why this task is necessary — the architectural or technical reason",
+      "solution": "What the expected end state looks like after this task completes"
     }
   ]
 }
@@ -455,17 +467,19 @@ RULES:
 2. context_anchor.source must identify where this plan originated.
 3. context_anchor.target_packages lists all packages affected.
 4. architectural_strategy is a single concise sentence.
-5. strategic_overview provides the architectural impact domain, risk classification, and verification strategy.
-6. atomic_tasks must have at least one entry. Each entry must have all four fields.
-7. strategy must be one of: ATOMIC_REPLACE, DIFF_PATCH, SHELL_EXEC, GIT_ACTION.
-8. file paths must be relative to project root.
-9. task_id values must be sequential integers starting at 1.
-10. SHELL_EXEC is REQUIRED (not forbidden) when the investigation root cause is a
+5. strategic_overview.root_core_factor is a brief sentence identifying the fundamental root cause.
+6. strategic_overview provides the architectural impact domain, risk classification, and verification strategy.
+7. atomic_tasks must have at least one entry. Each entry must have all fields.
+8. strategy must be one of: ATOMIC_REPLACE, DIFF_PATCH, SHELL_EXEC, GIT_ACTION.
+9. file paths must be relative to project root.
+10. task_id values must be sequential integers starting at 1.
+11. SHELL_EXEC is REQUIRED (not forbidden) when the investigation root cause is a
     compilation or dependency error: emit an exact command such as
     "go get <package>" or "go mod tidy". NEVER patch documentation files
     (README.md, docs/, CHANGELOG, etc.) to work around build failures — resolve
     the dependency via SHELL_EXEC or mutate go.mod instead.
-11. If a file has severe syntax/AST errors, strategy MUST be "ATOMIC_REPLACE" (complete file override).
-12. Documentation files (README.md, *.md docs, LICENSE, CONTRIBUTING.md, SECURITY.md,
-    CODE_OF_CONDUCT.md) are PROHIBITED targets under every strategy.`
+12. If a file has severe syntax/AST errors, strategy MUST be "ATOMIC_REPLACE" (complete file override).
+13. Documentation files (README.md, *.md docs, LICENSE, CONTRIBUTING.md, SECURITY.md,
+    CODE_OF_CONDUCT.md) are PROHIBITED targets under every strategy.
+14. For every atomic_task, provide both rationale (the technical reason) and solution (expected end state).`
 }

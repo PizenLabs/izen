@@ -12,19 +12,20 @@ import (
 
 // ── Catppuccin Mocha Palette (Optimized Visual Hierarchy) ─────────────────────
 const (
-	colorText    = "#cdd6f4" // Dominant foreground text
-	colorAccent  = "#a6e3a1" // High-fidelity mint green
-	colorGreen   = "#a6e3a1"
-	colorGreenBr = "#b9f0b4"
-	colorRed     = "#f38ba8"
-	colorMaroon  = "#eba0ac"
-	colorOrange  = "#fab387"
-	colorYellow  = "#f9e2af"
-	colorCyan    = "#89dceb"
-	colorTeal    = "#94e2d5"
-	colorPink    = "#f5c2e7"
-	colorBlue    = "#89b4fa"
-	colorMauve   = "#cba6f7"
+	colorText     = "#cdd6f4" // Dominant foreground text
+	colorAccent   = "#a6e3a1" // High-fidelity mint green
+	colorGreen    = "#a6e3a1"
+	colorGreenBr  = "#b9f0b4"
+	colorRed      = "#f38ba8"
+	colorMaroon   = "#eba0ac"
+	colorOrange   = "#fab387"
+	colorYellow   = "#f9e2af"
+	colorCyan     = "#89dceb"
+	colorTeal     = "#94e2d5"
+	colorPink     = "#f5c2e7"
+	colorBlue     = "#89b4fa"
+	colorMauve    = "#cba6f7"
+	colorSapphire = "#74c7ec"
 
 	colorSurface = "#1e1e2e"
 	colorOverlay = "#313244"
@@ -151,8 +152,10 @@ var (
 	blueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
 
 	// Bold + color
-	boldTextStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
-	boldAccentStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorAccent))
+	boldTextStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
+	boldAccentStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorAccent))
+	boldSapphireStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorSapphire))
+	boldMauveStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMauve))
 
 	// Startup banner border
 	bannerBorderStyle = lipgloss.NewStyle().
@@ -258,9 +261,9 @@ var (
 	secondaryModeStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMuted))
 )
 
-// isCoreEngineeringMode returns true for /ask, /build, /investigate, /review.
+// isCoreEngineeringMode returns true for /ask, /plan, /build, /investigate, /review.
 func isCoreEngineeringMode(m modes.Mode) bool {
-	return m == modes.ModeAsk || m == modes.ModeBuild ||
+	return m == modes.ModeAsk || m == modes.ModePlan || m == modes.ModeBuild ||
 		m == modes.ModeInvestigate || m == modes.ModeReview
 }
 
