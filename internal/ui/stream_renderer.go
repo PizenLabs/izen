@@ -14,15 +14,15 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
-// ── Catppuccin Mocha ANSI true-color escape sequences ────────────────────
+// ── Catppuccin Mocha ANSI true-color escape sequences (subdued) ─────────
 var (
 	ansiReset    = "\x1b[0m"
 	ansiText     = "\x1b[38;2;205;214;244m" // #cdd6f4 Foreground
-	ansiKeyword  = "\x1b[38;2;203;166;247m" // #cba6f7 Mauve
-	ansiString   = "\x1b[38;2;166;227;161m" // #a6e3a1 Green
-	ansiComment  = "\x1b[38;2;108;112;134m" // #6c7086 Overlay 0
-	ansiNumber   = "\x1b[38;2;250;179;135m" // #fab387 Peach
-	ansiFunction = "\x1b[38;2;137;180;250m" // #89b4fa Blue
+	ansiKeyword  = "\x1b[38;2;203;166;247m" // #cba6f7 Muted lavender
+	ansiString   = "\x1b[38;2;166;227;161m" // #a6e3a1 Soft green
+	ansiComment  = "\x1b[38;2;108;112;134m" // #6c7086 Muted gray
+	ansiNumber   = "\x1b[38;2;250;179;135m" // #fab387 Soft amber
+	ansiFunction = "\x1b[38;2;137;180;250m" // #89b4fa Muted blue
 )
 
 // tokenTypeColor maps a Chroma token type to its ANSI true-color sequence
@@ -41,7 +41,7 @@ func tokenTypeColor(t chroma.TokenType) string {
 	case t >= chroma.LiteralNumber && t <= chroma.LiteralNumberOct:
 		return ansiNumber
 	case t == chroma.GenericDeleted:
-		return ansiKeyword
+		return ansiText
 	case t == chroma.GenericInserted || t == chroma.GenericEmph:
 		return ansiString
 	case t == chroma.GenericHeading || t == chroma.GenericStrong:
@@ -158,11 +158,11 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 
 	if strings.HasPrefix(trimmed, "- [ ]") {
 		content := strings.TrimSpace(trimmed[5:])
-		return dimmedStyle.Render("○ ") + applyInlineStyles(content)
+		return dimmedStyle.Render(Icon.Pending+" ") + applyInlineStyles(content)
 	}
 	if strings.HasPrefix(trimmed, "- [x]") {
 		content := strings.TrimSpace(trimmed[5:])
-		return greenStyle.Render("● ") + applyInlineStyles(content)
+		return greenStyle.Render(Icon.Done+" ") + applyInlineStyles(content)
 	}
 
 	return applyInlineStyles(line)
@@ -327,27 +327,52 @@ func (m *model) renderStreamingContent(content string, width int) string {
 				var prefixStyle lipgloss.Style
 				var text string
 
+				// Detect operational status icons for structured task lines
 				switch {
-				case strings.HasPrefix(item, "- [x]") || strings.HasPrefix(item, "[x]") || strings.HasPrefix(item, "✓"):
-					prefixChar = "● "
-					prefixStyle = greenStyle
-					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [x]"), "[x]"), "✓"))
-				case strings.HasPrefix(item, "- [/]") || strings.HasPrefix(item, "[/]") || strings.HasPrefix(item, "●"):
-					prefixChar = "● "
+				case strings.Contains(item, "SHELL_EXEC"):
+					prefixChar = Icon.ShellExec + " "
 					prefixStyle = orangeStyle
-					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [/]"), "[/]"), "●"))
-				case strings.HasPrefix(item, "- [ ]") || strings.HasPrefix(item, "[ ]") || strings.HasPrefix(item, "○"):
-					prefixChar = "○ "
-					prefixStyle = dimmedStyle
-					text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [ ]"), "[ ]"), "○"))
-				case strings.HasPrefix(item, "✗"):
-					prefixChar = "• "
-					prefixStyle = redStyle
-					text = strings.TrimSpace(strings.TrimPrefix(item, "✗"))
+				case strings.Contains(item, "FILE_MUTATE"), strings.Contains(item, "DIFF_PATCH"), strings.Contains(item, "ATOMIC_REPLACE"):
+					prefixChar = Icon.SrcPatch + " "
+					prefixStyle = blueStyle
+				case strings.Contains(item, "GIT_ACTION"):
+					prefixChar = Icon.ShellExec + " "
+					prefixStyle = orangeStyle
 				default:
-					prefixChar = "• "
-					prefixStyle = textStyle
-					text = item
+					switch {
+					case strings.HasPrefix(item, "- [x]") || strings.HasPrefix(item, "[x]") || strings.HasPrefix(item, "✓"):
+						prefixChar = Icon.Done + " "
+						prefixStyle = greenStyle
+						text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [x]"), "[x]"), "✓"))
+					case strings.HasPrefix(item, "- [/]") || strings.HasPrefix(item, "[/]") || strings.HasPrefix(item, "●"):
+						prefixChar = Icon.ShellExec + " "
+						prefixStyle = orangeStyle
+						text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [/]"), "[/]"), "●"))
+					case strings.HasPrefix(item, "- [ ]") || strings.HasPrefix(item, "[ ]") || strings.HasPrefix(item, "○"):
+						prefixChar = Icon.Pending + " "
+						prefixStyle = dimmedStyle
+						text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(item, "- [ ]"), "[ ]"), "○"))
+					case strings.HasPrefix(item, "✗"):
+						prefixChar = Icon.Cross + " "
+						prefixStyle = redStyle
+						text = strings.TrimSpace(strings.TrimPrefix(item, "✗"))
+					default:
+						prefixChar = Icon.Pending + " "
+						prefixStyle = textStyle
+						text = item
+					}
+				}
+
+				stripTypePrefix := func(s string) string {
+					for _, p := range []string{"SHELL_EXEC:", "FILE_MUTATE:", "GIT_ACTION:", "DIFF_PATCH:", "ATOMIC_REPLACE:"} {
+						if idx := strings.Index(s, p); idx >= 0 {
+							return strings.TrimSpace(s[idx+len(p):])
+						}
+					}
+					return s
+				}
+				if prefixChar == Icon.ShellExec+" " || prefixChar == Icon.SrcPatch+" " {
+					text = stripTypePrefix(item)
 				}
 
 				wrapW := widgetInnerWidth - 2
@@ -365,8 +390,8 @@ func (m *model) renderStreamingContent(content string, width int) string {
 				}
 			}
 			// Phase 4: Always render plan blocks through the widget layout engine.
-			// The LLM returns raw task data; the UI applies the │ borders, ◉
-			// markers, and color blocks deterministically via renderWidget.
+			// The LLM returns raw task data; the UI applies the │ borders, operational
+			// status icons, and color blocks deterministically via renderWidget.
 			rendered = renderWidget("Plan", strings.Join(contentLines, "\n"), availableWidth, colorModePlan)
 
 		case blockDiff:
@@ -513,6 +538,18 @@ func (m *model) planStatusSource() plan.TaskStatusSource {
 	return m.buildLedger
 }
 
+// taskIcon returns the operational status icon for a given strategy type.
+func taskIcon(strategy string) (string, lipgloss.Style) {
+	switch strings.ToUpper(strategy) {
+	case "SHELL_EXEC":
+		return Icon.ShellExec, orangeStyle
+	case "GIT_ACTION":
+		return Icon.ShellExec, orangeStyle
+	default:
+		return Icon.SrcPatch, blueStyle
+	}
+}
+
 // renderJSONPlanWidget renders a validated PlanOutput as a clean TUI widget.
 // Used when the LLM returns a valid JSON plan contract instead of markdown.
 // When src is non-nil each task's checkbox reflects its ledger state: tasks
@@ -530,11 +567,40 @@ func renderJSONPlanWidget(planOutput *plan.PlanOutput, src plan.TaskStatusSource
 
 	var b strings.Builder
 
-	b.WriteString(orangeStyle.Render("STRATEGY: "))
-	b.WriteString(textStyle.Render(planOutput.ArchitecturalStrategy))
+	// ── Strategic Architectural Blueprint ──────────────────────────────
+	b.WriteString(mdH1Style.Render("STRATEGIC ARCHITECTURAL BLUEPRINT"))
 	b.WriteString("\n")
 
-	b.WriteString(dimmedStyle.Render(strings.Repeat("─", contentWidth)))
+	overview := planOutput.StrategicOverview
+	if overview.ImpactDomain != "" {
+		fmt.Fprintf(&b, "  %s %s\n",
+			dimmedStyle.Render(Icon.Chevron+" Impact Domain:"),
+			textStyle.Render(overview.ImpactDomain),
+		)
+	}
+	if overview.RiskEvaluation != "" {
+		riskStyle := dimmedStyle
+		riskText := overview.RiskEvaluation
+		riskLower := strings.ToLower(riskText)
+		if strings.Contains(riskLower, "critical") || strings.Contains(riskLower, "high") {
+			riskStyle = redStyle
+		}
+		fmt.Fprintf(&b, "  %s %s\n",
+			dimmedStyle.Render(Icon.Chevron+" Risk Evaluation:"),
+			riskStyle.Render(riskText),
+		)
+	}
+	if overview.VerificationVector != "" {
+		fmt.Fprintf(&b, "  %s %s\n",
+			dimmedStyle.Render(Icon.Chevron+" Verification Vector:"),
+			textStyle.Render(overview.VerificationVector),
+		)
+	}
+
+	b.WriteString("\n")
+
+	// ── Staged Execution Timeline ──────────────────────────────────────
+	b.WriteString(mdH1Style.Render("STAGED EXECUTION TIMELINE"))
 	b.WriteString("\n")
 
 	// Count committed tasks so the header reflects live ledger progress.
@@ -546,64 +612,67 @@ func renderJSONPlanWidget(planOutput *plan.PlanOutput, src plan.TaskStatusSource
 	}
 	if completed > 0 {
 		fmt.Fprintf(&b, "%s\n\n", boldTextStyle.Render(
-			fmt.Sprintf("TASKS (%d/%d completed):", completed, len(planOutput.AtomicTasks))))
+			fmt.Sprintf("(%d/%d tasks completed)", completed, len(planOutput.AtomicTasks))))
 	} else {
-		b.WriteString(boldTextStyle.Render("PENDING TASKS:"))
-		b.WriteString("\n\n")
+		b.WriteString("\n")
 	}
 
-	strikeStyle := textStyle.Strikethrough(true)
 	strikeDimStyle := dimmedStyle.Strikethrough(true)
 
 	for _, task := range planOutput.AtomicTasks {
 		done := src != nil && src.IsCompleted(task.TaskID)
 
-		checkbox := dimmedStyle.Render("[ ]")
-		labelStyle := orangeStyle
-		fileStyle := textStyle
+		icon, iconStyle := taskIcon(task.Strategy)
+		descStyle := dimmedStyle
+
 		if done {
-			checkbox = greenStyle.Render("[✓]")
-			labelStyle = greenStyle
-			fileStyle = strikeStyle
+			icon = Icon.Done
+			iconStyle = greenStyle
+			descStyle = strikeDimStyle
 		}
 
-		fmt.Fprintf(&b, "%s %s %s\n",
-			checkbox,
-			labelStyle.Render(fmt.Sprintf("TASK #%d:", task.TaskID)),
-			fileStyle.Render(task.File),
+		strategyTag := strings.ToUpper(task.Strategy)
+		tagStyle := dimmedStyle
+		switch strategyTag {
+		case "SHELL_EXEC":
+			tagStyle = orangeStyle
+		case "FILE_MUTATE", "ATOMIC_REPLACE", "DIFF_PATCH":
+			tagStyle = blueStyle
+		case "GIT_ACTION":
+			tagStyle = mutedStyle
+		}
+
+		taskLabel := task.Description
+		if taskLabel == "" {
+			taskLabel = fmt.Sprintf("%s: %s", task.Strategy, task.File)
+		}
+
+		fmt.Fprintf(&b, "%s %s %s %s\n",
+			iconStyle.Render(icon),
+			tagStyle.Render("["+strategyTag+"]"),
+			textStyle.Render(task.File),
+			dimmedStyle.Render("—"),
+			// descStyle.Render wrapped below
 		)
 
-		indent := "    "
-		fmt.Fprintf(&b, "%s%s %s\n",
-			indent,
-			dimmedStyle.Render("↳ Strategy:"),
-			orangeStyle.Render(task.Strategy),
-		)
-
-		descW := contentWidth - lipgloss.Width(indent+"↳ Strategy: ") + 2
+		// Description on the following line, indented
+		descW := contentWidth - 6
 		if descW < 10 {
 			descW = 10
 		}
-		descStyle := dimmedStyle
-		if done {
-			descStyle = strikeDimStyle
+		descLines := wrapStreamText(taskLabel, descW)
+		for _, dl := range descLines {
+			fmt.Fprintf(&b, "  %s\n", descStyle.Render(dl))
 		}
-		descLines := wrapStreamText(task.Description, descW)
-		for i, dl := range descLines {
-			if i == 0 {
-				fmt.Fprintf(&b, "%s%s %s\n",
-					indent,
-					dimmedStyle.Render("↳ Description:"),
-					descStyle.Render(dl),
-				)
-			} else {
-				fmt.Fprintf(&b, "%s%s %s\n",
-					indent,
-					strings.Repeat(" ", lipgloss.Width(dimmedStyle.Render("↳ Description:"))-lipgloss.Width(indent)),
-					descStyle.Render(dl),
-				)
-			}
+
+		// Strategy hint on a third line if non-trivial
+		if task.Strategy != "" && !strings.HasPrefix(taskLabel, task.Strategy) {
+			fmt.Fprintf(&b, "  %s %s\n",
+				dimmedStyle.Render(Icon.Chevron),
+				dimmedStyle.Render(task.Strategy),
+			)
 		}
+
 		b.WriteString("\n")
 	}
 

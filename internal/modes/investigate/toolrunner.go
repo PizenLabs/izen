@@ -96,7 +96,7 @@ func (r *ToolRunner) runEnv(ctx context.Context, target string) ToolResult {
 			fmt.Fprintf(&b, "    %s=%s\n", name, val)
 		}
 	}
-	b.WriteString("═══════════════════════════════════════════\n")
+	b.WriteString("════════════════\n")
 
 	content := b.String()
 	return ToolResult{

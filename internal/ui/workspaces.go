@@ -26,9 +26,9 @@ func (planView) BuildWorkspace(m *model) Workspace {
 	var actions []Action
 	if len(m.handoffCtx.PendingTodos) > 0 {
 		var todoBlock strings.Builder
-		todoBlock.WriteString("Execute the planned changes with these TODOs:\n")
+		todoBlock.WriteString("Execute the planned staged execution timeline:\n")
 		for _, t := range m.handoffCtx.PendingTodos {
-			fmt.Fprintf(&todoBlock, "  - %s\n", t)
+			fmt.Fprintf(&todoBlock, "  %s\n", t)
 		}
 		actions = append(actions, Action{
 			ID:       "execute-patch",
@@ -46,7 +46,7 @@ func (planView) BuildWorkspace(m *model) Workspace {
 		actions = append(actions, m.currentResultActions()...)
 	}
 	ws := m.assembleScreen(actions)
-	ws.Header = "plan · break down, structure, design"
+	ws.Header = "plan · architecture, migrations, refactors — strategic blueprint"
 	return ws
 }
 

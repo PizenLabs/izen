@@ -7,10 +7,17 @@ import (
 	"strings"
 )
 
+type StrategicOverview struct {
+	ImpactDomain       string `json:"impact_domain"`
+	RiskEvaluation     string `json:"risk_evaluation"`
+	VerificationVector string `json:"verification_vector"`
+}
+
 type PlanOutput struct {
-	ContextAnchor         ContextAnchor `json:"context_anchor"`
-	ArchitecturalStrategy string        `json:"architectural_strategy"`
-	AtomicTasks           []AtomicTask  `json:"atomic_tasks"`
+	ContextAnchor         ContextAnchor     `json:"context_anchor"`
+	ArchitecturalStrategy string            `json:"architectural_strategy"`
+	StrategicOverview     StrategicOverview `json:"strategic_overview,omitempty"`
+	AtomicTasks           []AtomicTask      `json:"atomic_tasks"`
 }
 
 type ContextAnchor struct {
@@ -39,8 +46,9 @@ func ParseJSONPlan(content string) *JSONPlanValidationResult {
 	var plan PlanOutput
 	if err := json.Unmarshal([]byte(content), &plan); err != nil {
 		rawPreview := content
-		if len(rawPreview) > 120 {
-			rawPreview = rawPreview[:120]
+		runes := []rune(rawPreview)
+		if len(runes) > 120 {
+			rawPreview = string(runes[:120])
 		}
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "unexpected end") || strings.Contains(errMsg, "unterminated") {
@@ -427,6 +435,11 @@ func SchemaJSONInstruction() string {
     "target_packages": ["package1", "package2"]
   },
   "architectural_strategy": "One-sentence summary of the architectural approach",
+  "strategic_overview": {
+    "impact_domain": "Architectural layer or subsystem affected",
+    "risk_evaluation": "Risk classification: Critical / High / Medium / Low",
+    "verification_vector": "How correctness will be verified (build, test, lint, etc.)"
+  },
   "atomic_tasks": [
     {
       "task_id": 1,
@@ -442,16 +455,17 @@ RULES:
 2. context_anchor.source must identify where this plan originated.
 3. context_anchor.target_packages lists all packages affected.
 4. architectural_strategy is a single concise sentence.
-5. atomic_tasks must have at least one entry. Each entry must have all four fields.
-6. strategy must be one of: ATOMIC_REPLACE, DIFF_PATCH, SHELL_EXEC, GIT_ACTION.
-7. file paths must be relative to project root.
-8. task_id values must be sequential integers starting at 1.
- 9. SHELL_EXEC is REQUIRED (not forbidden) when the investigation root cause is a
+5. strategic_overview provides the architectural impact domain, risk classification, and verification strategy.
+6. atomic_tasks must have at least one entry. Each entry must have all four fields.
+7. strategy must be one of: ATOMIC_REPLACE, DIFF_PATCH, SHELL_EXEC, GIT_ACTION.
+8. file paths must be relative to project root.
+9. task_id values must be sequential integers starting at 1.
+10. SHELL_EXEC is REQUIRED (not forbidden) when the investigation root cause is a
     compilation or dependency error: emit an exact command such as
     "go get <package>" or "go mod tidy". NEVER patch documentation files
     (README.md, docs/, CHANGELOG, etc.) to work around build failures — resolve
     the dependency via SHELL_EXEC or mutate go.mod instead.
- 10. If a file has severe syntax/AST errors, strategy MUST be "ATOMIC_REPLACE" (complete file override).
- 11. Documentation files (README.md, *.md docs, LICENSE, CONTRIBUTING.md, SECURITY.md,
-     CODE_OF_CONDUCT.md) are PROHIBITED targets under every strategy.`
+11. If a file has severe syntax/AST errors, strategy MUST be "ATOMIC_REPLACE" (complete file override).
+12. Documentation files (README.md, *.md docs, LICENSE, CONTRIBUTING.md, SECURITY.md,
+    CODE_OF_CONDUCT.md) are PROHIBITED targets under every strategy.`
 }

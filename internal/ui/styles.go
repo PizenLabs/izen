@@ -266,22 +266,22 @@ func isCoreEngineeringMode(m modes.Mode) bool {
 
 // Pre-compiled Markdown renderer styles (render-path — zero NewStyle).
 var (
-	mdEmphasisStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Italic(true)
+	mdEmphasisStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7")).Italic(true)
 	mdStrongStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
-	mdH1Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1"))
-	mdH2Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
+	mdH1Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7"))
+	mdH2Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa"))
 	mdH3Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa"))
 	mdH4Style         = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 	mdCodeSpanStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af")).Background(lipgloss.Color("#1e1e2e"))
 	mdLinkStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Underline(true)
 	mdMutedStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 	mdCodeContStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
-	mdAccentStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa"))
-	mdSepStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
+	mdAccentStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7"))
+	mdSepStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
 	mdImageMutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 	mdHeaderBoldCell  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
 	mdCellStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
-	mdBulletStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
+	mdBulletStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
 
 	// Callout label styles per keyword
 	mdCalloutStyles = map[string]lipgloss.Style{

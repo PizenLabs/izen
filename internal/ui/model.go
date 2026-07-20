@@ -837,7 +837,8 @@ func wrapStreamText(text string, maxW int) []string {
 
 		var currentLine strings.Builder
 		for _, word := range words {
-			if currentLine.Len()+1+len(word) > maxW {
+			wordWidth := lipgloss.Width(word)
+			if currentLine.Len()+1+wordWidth > maxW {
 				chunks = append(chunks, currentLine.String())
 				currentLine.Reset()
 				currentLine.WriteString(word)

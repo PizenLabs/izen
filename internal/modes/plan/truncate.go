@@ -196,8 +196,9 @@ func TruncateLedger(ledger string, maxChars int) string {
 	}
 
 	result := strings.Join(kept, "\n")
-	if len(result) > maxChars {
-		result = result[:maxChars]
+	runes := []rune(result)
+	if len(runes) > maxChars {
+		result = string(runes[:maxChars])
 	}
 	return result
 }

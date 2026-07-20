@@ -1331,14 +1331,14 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			}
 		}
 		if len(filtered) == len(m.attachedFiles) {
-			m.push(roleSystem, infoStyle.Render("not attached: " + raw))
+			m.push(roleSystem, infoStyle.Render("not attached: "+raw))
 			return nil
 		}
 		m.attachedFiles = filtered
 		if len(m.attachedFiles) == 0 {
 			m.push(roleSystem, infoStyle.Render("all context files detached"))
 		} else {
-			m.push(roleSystem, infoStyle.Render("detached: " + raw))
+			m.push(roleSystem, infoStyle.Render("detached: "+raw))
 		}
 		return nil
 

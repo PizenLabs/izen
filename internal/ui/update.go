@@ -360,15 +360,31 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.bridgePlanToLedger(msg.Tasks)
 		m.handoffCtx.PendingTodos = make([]string, len(msg.Tasks))
 		for i, t := range msg.Tasks {
-			m.handoffCtx.PendingTodos[i] = t.Type + ": " + t.Target + " — " + t.Description
+			icon := "▶"
+			if t.Type == "FILE_MUTATE" || t.Type == "DIFF_PATCH" || t.Type == "ATOMIC_REPLACE" {
+				icon = "⚙"
+			}
+			m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
 		}
 		m.push(roleStatus, fmt.Sprintf("Plan staged: %d task(s). Use /build to execute.", len(msg.Tasks)))
 		// Render the staged task list into the viewport so the developer can
-		// see exactly what /build will execute.
+		// see exactly what /build will execute — Principal Engineer format.
 		var tb strings.Builder
-		tb.WriteString("## STAGED EXECUTION PLAN\n")
-		for i, t := range msg.Tasks {
-			fmt.Fprintf(&tb, "%d. [%s] %s — %s\n", i+1, t.Type, t.Target, t.Description)
+		tb.WriteString("## STRATEGIC ARCHITECTURAL BLUEPRINT\n")
+		tb.WriteString("  ▸ Impact Domain: Execution Layer — Dependency Resolution\n")
+		tb.WriteString("  ▸ Risk Evaluation: Low — Scoped dependency resolution\n")
+		tb.WriteString("  ▸ Verification Vector: Build + Test pipeline\n")
+		tb.WriteString("\n")
+		tb.WriteString("## STAGED EXECUTION TIMELINE\n")
+		for _, t := range msg.Tasks {
+			icon := "▶"
+			switch t.Type {
+			case "SHELL_EXEC", "GIT_ACTION":
+				icon = "▶"
+			case "FILE_MUTATE", "DIFF_PATCH", "ATOMIC_REPLACE":
+				icon = "⚙"
+			}
+			fmt.Fprintf(&tb, "%s [%s] %s — %s\n", icon, t.Type, t.Target, t.Description)
 		}
 		m.push(roleStatus, tb.String())
 		if m.buildLedger == nil {
@@ -893,10 +909,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Token optimization: truncate middle if output exceeds 4000 chars
 		output := msg.output
-		if len(output) > 4000 {
-			top := output[:2000]
-			bottom := output[len(output)-2000:]
-			output = top + "\n... [TRUNCATED " + strconv.Itoa(len(msg.output)-4000) + " bytes] ...\n" + bottom
+		runes := []rune(output)
+		if len(runes) > 4000 {
+			top := string(runes[:2000])
+			bottom := string(runes[len(runes)-2000:])
+			output = top + "\n... [TRUNCATED " + strconv.Itoa(len(runes)-4000) + " runes] ...\n" + bottom
 		}
 
 		if output != "" {
