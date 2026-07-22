@@ -1667,14 +1667,18 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	// Stage 4: Create a single ad-hoc FILE_MUTATE task.
 	m.push(roleStatus, fmt.Sprintf("[HOTFIX] Urgent hotfix: %s", prompt))
 
-	// ── DYNAMIC TARGET RESOLUTION (Bug Fix 1) ──────────────────────────
-	// The `workspace` token is the working-directory boundary context — it is
-	// NEVER a destination file name. Hallucinating it as a literal path causes
-	// unrelated tasks (e.g. writing a LICENSE and editing main.go) to all be
-	// written into a single file literally named "workspace". We therefore
-	// extract the real target file path from the developer's request; only when
-	// the prompt names no file do we synthesize a context-derived default.
+	// ── DYNAMIC TARGET RESOLUTION ─────────────────────────────────────
+	// Extract the real target file path from the developer's request.
+	// If no file can be resolved, error out early rather than targeting a
+	// metadata file inside .izen/ (which would trigger self-patching).
 	target := resolveHotfixTarget(prompt)
+	if target == "" {
+		m.push(roleError, "Could not determine target file. Use @filename — e.g. $hot change year 2023 to 2026 @LICENSE")
+		m.hotfixActive = false
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
 
 	hotfixTask := plan.Task{
 		StepNum:     0,
@@ -1759,12 +1763,20 @@ func sanitizeFileOutput(content string) string {
 
 // resolveHotfixTarget extracts the concrete destination file path for a $hot
 // request from the developer's natural-language prompt. It scans for explicit
-// file path tokens (e.g. cmd/api/main.go, ./LICENSE, internal/foo/bar.go) and
+// file path tokens (e.g. cmd/api/main.go, ./LICENSE, @internal/foo/bar.go) and
 // returns the first plausible one. The bare token "workspace" is explicitly
 // rejected — it denotes the project-root scope, not a file name. When no file
-// is named, a sensible default is derived from the prompt keywords (creating a
-// new file) rather than overwriting any existing source file.
+// is named, a sensible default is derived from the prompt keywords for
+// well-known files. Returns "" when no target can be resolved (caller must
+// handle the error).
+//
+// Guardrails:
+//   - Paths inside .izen/ are blocked (metadata directory, not a patch target).
+//   - .patch files are blocked (cannot self-patch hotfix artifacts).
 func resolveHotfixTarget(prompt string) string {
+	// Strip @ prefix so @LICENSE, @cmd/api/main.go resolve correctly.
+	prompt = strings.ReplaceAll(prompt, "@", "")
+
 	// Candidate path tokens: sequences of word/path chars including slashes,
 	// dots and an extension, or bare "LICENSE"/"Makefile"-style names.
 	pathRe := regexp.MustCompile(`(?:[./]?[\w-]+(?:/[\w.-]+)+|\.\/?[\w.-]+|[\w.-]+\.[\w]+|(?:LICENSE|Makefile|Dockerfile|README|go\.mod|go\.sum|CHANGELOG|NOTICE))`)
@@ -1779,6 +1791,11 @@ func resolveHotfixTarget(prompt string) string {
 		if m == "" {
 			continue
 		}
+		// Block self-patching: reject .izen/ paths and .patch files.
+		if strings.HasPrefix(m, ".izen/") || strings.Contains(m, "/.izen/") ||
+			strings.HasSuffix(m, ".patch") {
+			continue
+		}
 		// Sanity: must contain a path separator or an extension, and must not
 		// be a single bare word that merely looks like an extension.
 		if strings.Contains(m, "/") || strings.Contains(m, ".") {
@@ -1786,9 +1803,7 @@ func resolveHotfixTarget(prompt string) string {
 		}
 	}
 
-	// ── No explicit file named: synthesize a NEW-file default from keywords.
-	// This never collides with existing source files, so unrelated hotfixes
-	// can never clobber each other the way the literal "workspace" did.
+	// ── No explicit file named: synthesize a target from keywords.
 	lower := strings.ToLower(prompt)
 	switch {
 	case strings.Contains(lower, "license"):
@@ -1806,11 +1821,8 @@ func resolveHotfixTarget(prompt string) string {
 	case strings.Contains(lower, "gitignore"):
 		return ".gitignore"
 	}
-	// Fallback: a timestamped new file under the repo root. The leading dot
-	// guarantees it cannot overwrite a tracked file and clearly marks it as a
-	// hotfix artifact for the developer to relocate.
-	ts := time.Now().Format("20060102-150405")
-	return ".izen/hotfix-" + ts + ".patch"
+	// No target could be resolved — caller must handle the error.
+	return ""
 }
 
 // proposeHotfixPatch generates the patch for a $hot FILE_MUTATE task via the
@@ -1823,9 +1835,26 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			return hotfixProposalMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
 
-		// Build a focused, non-chat patch-generation prompt and call the LLM
-		// once (non-streaming) so we get a deterministic diff/FILE block back.
+		// ── CRITICAL: Read existing file content BEFORE calling the LLM ──
+		// Without the original content in the prompt, local LLMs hallucinate
+		// a full-file rewrite that silently deletes all existing content.
+		// The original is read here (pre-LLM) for prompt context AND below
+		// (post-LLM) for diff computation — single read, dual use.
+		var orig string
+		if data, rerr := os.ReadFile(task.Target); rerr == nil {
+			orig = string(data)
+		}
+
+		// Build a focused, non-chat patch-generation prompt with full file
+		// context so the LLM produces precise SEARCH/REPLACE blocks or
+		// unified diffs rather than a destructive full-file replacement.
 		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		if orig != "" {
+			handoff += "\n\n### TARGET_FILE_CONTENT\n```\n" + orig + "\n```\n"
+			handoff += "\nModify the above file content to fulfill the task. "
+			handoff += "Output a SEARCH/REPLACE block (`<<<<<<< SEARCH`) or a unified diff. "
+			handoff += "Do NOT output a full FILE: block — the file already exists."
+		}
 		system := prompt.BuildContract()
 		req := ai.Request{
 			Model:    m.cfg.ActiveModelName(),
@@ -1850,12 +1879,6 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		// document and corrupts its syntax, so we sanitize BEFORE the diff is
 		// computed and the patch is staged for disk write.
 		cleaned := sanitizeFileOutput(resp.Content)
-
-		// Snapshot the original file content so the diff + rollback are exact.
-		orig := ""
-		if data, rerr := os.ReadFile(task.Target); rerr == nil {
-			orig = string(data)
-		}
 
 		// Compute a unified diff for display (green additions / red removals).
 		diff := computeUnifiedDiff(task.Target, orig, cleaned)

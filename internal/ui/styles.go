@@ -229,9 +229,9 @@ func renderHotkeyPromptWithToggle(width int) string {
 	action := boldTextStyle.Render
 	hk := dimmedStyle.Render
 
-	text := "› " + action("Accept") + " " + hk("Alt+A / y / Enter") + "  " +
+	text := "› " + action("Accept") + " " + hk("Alt+A / Enter") + "  " +
 		action("Allow All") + " " + hk("Alt+L") + "  " +
-		action("Reject") + " " + hk("Alt+R / n / Esc") + "  " +
+		action("Reject") + " " + hk("Alt+R / Esc") + "  " +
 		action("Toggle") + " " + hk("Alt+P") + "  " +
 		action("Nav") + " " + hk("j/k")
 

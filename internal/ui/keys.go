@@ -67,14 +67,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.state == StateAwaitingApproval {
 		// ── $hot HOTFIX APPROVAL GATE ─────────────────────────────
 		// The hotfix patch was generated but NOT applied. The developer must
-		// explicitly authorize (Alt+A / y / Enter) or reject (Alt+R / n / Esc).
+		// explicitly authorize (Alt+A / Enter) or reject (Alt+R / Esc).
 		// On approval the patch is written to disk and the stashed plan
 		// restored; on rejection the hotfix aborts cleanly to PAUSED with
 		// zero disk mutation.
 		if m.pendingHotfixTask != nil && m.pendingHotfixPatch != nil {
 			switch {
-			case msg.String() == "y" || msg.String() == "Y" ||
-				msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
+			case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
 				task := m.pendingHotfixTask
 				patch := m.pendingHotfixPatch
 				m.pendingHotfixTask = nil
@@ -97,8 +96,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.spinnerTickCmd(),
 				)
 
-			case msg.String() == "n" || msg.String() == "N" ||
-				msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
+			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
 				// ── REJECT: abort cleanly, touch no files ──────────
 				rejectedPath := m.pendingHotfixTask.Target
 				m.pendingHotfixTask = nil
@@ -130,7 +128,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.pendingBuildApproval && m.pendingBuildTask != nil {
 			task := m.pendingBuildTask
 			switch {
-			case msg.String() == "y" || msg.String() == "Y" || msg.String() == "alt+a":
+			case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
 				// ── Allow Once ────────────────────────────────────
 				m.pendingBuildApproval = false
 				m.pendingBuildTask = nil
@@ -146,7 +144,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.spinnerTickCmd(),
 				)
 
-			case msg.String() == "a" || msg.String() == "A" || msg.String() == "alt+l":
+			case msg.String() == "alt+l":
 				// ── Allow Always (session-wide bypass) ────────────
 				m.pendingBuildAllowAlways = true
 				m.pendingBuildApproval = false
@@ -164,8 +162,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.spinnerTickCmd(),
 				)
 
-			case msg.String() == "n" || msg.String() == "N" ||
-				msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
+			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
 				// ── Reject ─────────────────────────────────────────
 				m.pendingBuildApproval = false
 				m.pendingBuildTask = nil
@@ -197,14 +194,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		// ── File-mutation proposal approval ─────────────────────────
 		// Unified keybindings:
-		//   Accept:  Alt+A / y / Enter
+		//   Accept:  Alt+A / Enter
 		//   Allow All:   Alt+L
-		//   Reject:  Alt+R / n / Esc
+		//   Reject:  Alt+R / Esc
 		//   Toggle:  Alt+P
 		//   Navigate:    j/k / Up/Down
 		switch {
-		case msg.String() == "alt+a" || msg.String() == "y" || msg.String() == "Y" ||
-			msg.Type == tea.KeyEnter:
+		case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
 			return m, m.applySingleProposal()
 		case msg.String() == "alt+l":
 			m.acceptAll = true
@@ -218,8 +214,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.Viewport.GotoBottom()
 			}
 			return m, nil
-		case msg.String() == "alt+r" || msg.String() == "n" || msg.String() == "N" ||
-			msg.Type == tea.KeyEscape:
+		case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
 			// ── VIRTUAL SNAPSHOT ROLLBACK ────────────────────────────
 			// On user rejection, restore ALL files to the state captured
 			// at the last transaction boundary (mode entry / build start).
