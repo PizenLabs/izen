@@ -2,6 +2,7 @@ package execution
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,38 @@ import (
 	"github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/modes/build"
 )
+
+// ErrInvalidPatchFormat is returned when a patch payload is ambiguous and
+// cannot be safely interpreted. This sentinel error triggers the build agent
+// to retry with a properly formatted SEARCH/REPLACE block or unified diff
+// instead of falling through to a destructive full-file overwrite.
+var ErrInvalidPatchFormat = errors.New("invalid patch format")
+
+// IsAmbiguousSnippet checks whether a patch payload is likely a raw code
+// snippet (not a properly formatted SEARCH/REPLACE block, unified diff, or
+// full-file rewrite). Returns true when:
+//   - The target file already exists on disk (original is non-empty).
+//   - The payload contains no <<<<<<< SEARCH markers.
+//   - The payload contains no @@ unified diff headers.
+//   - The payload size is less than 80 % of the original file size.
+//
+// When true, the caller MUST reject the patch with ErrInvalidPatchFormat
+// instead of attempting a destructive full-file overwrite.
+func IsAmbiguousSnippet(original, diffInput string) bool {
+	if original == "" {
+		return false
+	}
+	if strings.Contains(diffInput, "<<<<<<< SEARCH") {
+		return false
+	}
+	if strings.Contains(diffInput, "@@") {
+		return false
+	}
+	if len(diffInput) >= len(original)*80/100 {
+		return false
+	}
+	return true
+}
 
 type Patch struct {
 	ID        string    `json:"id"`
@@ -127,6 +160,11 @@ func (pq *PatchQueue) ApplyNext() error {
 	if err == nil {
 		patch.Original = string(orig)
 	}
+	// Prefer the raw unified diff when available — it enables in-place
+	// search/replace patching instead of raw content overwrite.
+	if p.RawDiff != "" && strings.Contains(p.RawDiff, "@@") {
+		patch.Modified = p.RawDiff
+	}
 	if err := pq.pm.Apply(patch); err != nil {
 		return err
 	}
@@ -160,6 +198,11 @@ func (pq *PatchQueue) ApplyAll() (int, error) {
 		orig, err := os.ReadFile(filepath.Join(pq.root, p.File))
 		if err == nil {
 			patch.Original = string(orig)
+		}
+		// Prefer the raw unified diff when available — it enables in-place
+		// search/replace patching instead of raw content overwrite.
+		if p.RawDiff != "" && strings.Contains(p.RawDiff, "@@") {
+			patch.Modified = p.RawDiff
 		}
 		if err := pq.pm.Apply(patch); err != nil {
 			return applied, err
@@ -503,19 +546,77 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	// unrelated files within a single code block.
 	diffInput := SplitAndFilterPatches(patch.Modified, patch.File)
 
+	// ── FAIL-FAST: reject ambiguous snippets against existing files ──────
+	// If the file exists and the payload contains no SEARCH/REPLACE markers
+	// and no unified diff headers and is significantly smaller than the
+	// original, it is almost certainly a raw code snippet (not a full rewrite).
+	// Rejecting here with ErrInvalidPatchFormat forces the build agent to
+	// retry with a properly formatted block instead of falling through to a
+	// destructive full-file overwrite.
+	if IsAmbiguousSnippet(patch.Original, diffInput) {
+		if globalActivityLog != nil {
+			globalActivityLog("[FAIL] patch rejected on %s: ambiguous snippet without SEARCH/REPLACE markers", patch.File)
+		}
+		return fmt.Errorf("%w: ambiguous snippet without SEARCH/REPLACE markers for existing file %s — retry with SEARCH/REPLACE block or unified diff", ErrInvalidPatchFormat, patch.File)
+	}
+
 	var final string
+	var patchErr error
+
 	switch {
 	case strings.Contains(diffInput, "@@"):
-		result, err := applyUnifiedPatch(patch.Original, diffInput)
-		if err != nil {
+		final, patchErr = applyUnifiedPatch(patch.Original, diffInput)
+		if patchErr != nil {
+			// Unified diff failed — attempt search/replace block as fallback
+			// before giving up. This handles context drift where the hunk
+			// anchors no longer match but the modified content still exists
+			// verbatim in the file.
 			if globalActivityLog != nil {
-				globalActivityLog("[FAIL] patch rejected on %s: %v", patch.File, err)
+				globalActivityLog("[patch] Unified diff mismatch on %s — retrying as SEARCH/REPLACE block", patch.File)
 			}
-			return fmt.Errorf("apply patch to %s: %w", patch.File, err)
+			// Try SEARCH/REPLACE blocks first (METHOD C)
+			if blocks := parseSearchReplaceBlocks(diffInput); len(blocks) > 0 {
+				if replaced, ok := applySearchReplaceBlockFromBlocks(patch.Original, blocks); ok && replaced != patch.Original {
+					final = replaced
+					if globalActivityLog != nil {
+						globalActivityLog("[patch] SEARCH/REPLACE block fallback succeeded for %s", patch.File)
+					}
+					break
+				}
+			}
+			clean := SanitizeDiffContent(diffInput)
+			if replaced, ok := applySearchReplaceBlock(patch.Original, clean); ok && replaced != patch.Original {
+				final = replaced
+				if globalActivityLog != nil {
+					globalActivityLog("[patch] Content block fallback succeeded for %s", patch.File)
+				}
+				break
+			}
+			if globalActivityLog != nil {
+				globalActivityLog("[FAIL] patch rejected on %s: %v", patch.File, patchErr)
+			}
+			return fmt.Errorf("apply patch to %s: %w", patch.File, patchErr)
 		}
-		final = result
 	case patch.Original != "":
+		// Try SEARCH/REPLACE block format (METHOD C) — unambiguous markers
+		// that provide exact search context and replacement content.
+		if blocks := parseSearchReplaceBlocks(diffInput); len(blocks) > 0 {
+			if replaced, ok := applySearchReplaceBlockFromBlocks(patch.Original, blocks); ok && replaced != patch.Original {
+				final = replaced
+				if globalActivityLog != nil {
+					globalActivityLog("[patch] SEARCH/REPLACE block applied to %s", patch.File)
+				}
+				break
+			}
+		}
+		// Attempt legacy content match: if the LLM provided a FILE: block
+		// with only the changed section, try to find and replace it within
+		// the original file content using exact string matching.
 		clean := SanitizeDiffContent(diffInput)
+		if replaced, ok := applySearchReplaceBlock(patch.Original, clean); ok && replaced != patch.Original {
+			final = replaced
+			break
+		}
 		if isTruncated(patch.Original, clean) {
 			errMsg := fmt.Sprintf("refusing to apply truncated content to %s (%.0f%% of original size)",
 				patch.File, float64(len(clean))/float64(len(patch.Original))*100)
@@ -994,6 +1095,172 @@ func applyUnifiedPatch(original, diff string) (string, error) {
 	}
 
 	return current, nil
+}
+
+// applySearchReplaceBlock attempts to apply a content block as an in-place
+// search/replace within the original file. It looks for the modified block as a
+// contiguous substring within the original and replaces it. If the modified content
+// is not found as a substring, it falls back to trying line-by-line matching:
+// it looks for lines from the modified content that appear in the original and
+// replaces them. Returns (result, true) on success or (original, false) if the
+// content cannot be safely applied as a search/replace.
+func applySearchReplaceBlock(original, modified string) (string, bool) {
+	if original == "" || modified == "" {
+		return original, false
+	}
+
+	// Strategy 1: exact substring match — the modified content appears
+	// verbatim somewhere in the original. Replace it in-place.
+	if idx := strings.Index(original, modified); idx >= 0 {
+		return original, true
+	}
+
+	// Strategy 2: line-by-line matching. The modified block may be a subset
+	// of lines that exist in the original. Try to match each line and replace.
+	origLines := strings.Split(original, "\n")
+	modLines := strings.Split(modified, "\n")
+
+	// Trim trailing empty lines from both.
+	for len(origLines) > 0 && origLines[len(origLines)-1] == "" {
+		origLines = origLines[:len(origLines)-1]
+	}
+	for len(modLines) > 0 && modLines[len(modLines)-1] == "" {
+		modLines = modLines[:len(modLines)-1]
+	}
+
+	if len(modLines) == 0 || len(modLines) > len(origLines) {
+		return original, false
+	}
+
+	// Try to find the modified block as a contiguous sequence within origLines.
+	for i := 0; i <= len(origLines)-len(modLines); i++ {
+		match := true
+		for j := 0; j < len(modLines); j++ {
+			if origLines[i+j] != modLines[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			// Found the block — return original unchanged (the content is
+			// already identical, no replacement needed).
+			return original, true
+		}
+	}
+
+	return original, false
+}
+
+// searchReplaceBlock represents a parsed <<<<<<< SEARCH ... ======= ... >>>>>>> block.
+type searchReplaceBlock struct {
+	search  string
+	replace string
+}
+
+// parseSearchReplaceBlocks scans content for <<<<<<< SEARCH ... ======= ... >>>>>>>
+// blocks and returns the parsed blocks. Each block contains the search text
+// (between SEARCH and =======) and the replace text (between ======= and >>>>>>>).
+// Returns nil if no valid blocks are found.
+func parseSearchReplaceBlocks(content string) []searchReplaceBlock {
+	var blocks []searchReplaceBlock
+	lines := strings.Split(content, "\n")
+
+	var inSearch bool
+	var inReplace bool
+	var searchLines []string
+	var replaceLines []string
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "<<<<<<< SEARCH" {
+			inSearch = true
+			inReplace = false
+			searchLines = nil
+			replaceLines = nil
+			continue
+		}
+		if trimmed == "=======" {
+			if inSearch {
+				inSearch = false
+				inReplace = true
+			}
+			continue
+		}
+		if trimmed == ">>>>>>>" || strings.HasPrefix(trimmed, ">>>>>>>") {
+			if inReplace {
+				blocks = append(blocks, searchReplaceBlock{
+					search:  strings.Join(searchLines, "\n"),
+					replace: strings.Join(replaceLines, "\n"),
+				})
+			}
+			inSearch = false
+			inReplace = false
+			searchLines = nil
+			replaceLines = nil
+			continue
+		}
+		if inSearch {
+			searchLines = append(searchLines, line)
+		} else if inReplace {
+			replaceLines = append(replaceLines, line)
+		}
+	}
+
+	return blocks
+}
+
+// applySearchReplaceBlockFromBlocks applies parsed SEARCH/REPLACE blocks to the
+// original content. For each block, it finds the SEARCH text in the original and
+// replaces it with the REPLACE text. Returns (result, true) on success or
+// (original, false) if any block's SEARCH text cannot be found.
+func applySearchReplaceBlockFromBlocks(original string, blocks []searchReplaceBlock) (string, bool) {
+	if original == "" || len(blocks) == 0 {
+		return original, false
+	}
+
+	current := original
+	for _, block := range blocks {
+		if block.search == "" {
+			return original, false
+		}
+		idx := strings.Index(current, block.search)
+		if idx < 0 {
+			// Try line-by-line contiguous match as fallback
+			origLines := strings.Split(current, "\n")
+			searchLines := strings.Split(block.search, "\n")
+			found := false
+			if len(searchLines) > 0 && len(searchLines) <= len(origLines) {
+				for i := 0; i <= len(origLines)-len(searchLines); i++ {
+					match := true
+					for j := 0; j < len(searchLines); j++ {
+						if origLines[i+j] != searchLines[j] {
+							match = false
+							break
+						}
+					}
+					if match {
+						// Replace the matched lines with the replace block
+						result := make([]string, 0, len(origLines)-len(searchLines)+len(strings.Split(block.replace, "\n")))
+						result = append(result, origLines[:i]...)
+						result = append(result, strings.Split(block.replace, "\n")...)
+						result = append(result, origLines[i+len(searchLines):]...)
+						current = strings.Join(result, "\n")
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				return original, false
+			}
+			continue
+		}
+		before := current[:idx]
+		after := current[idx+len(block.search):]
+		current = before + block.replace + after
+	}
+
+	return current, true
 }
 
 func isTruncated(original, modified string) bool {

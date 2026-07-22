@@ -1,5 +1,7 @@
 package ui
 
+import "github.com/PizenLabs/izen/internal/execution"
+
 // SemanticTarget identifies the code entity being acted upon (e.g., function, struct).
 type SemanticTarget struct {
 	QualifiedName string // e.g., "internal/ui/view.go:renderPromptBox"
@@ -49,11 +51,12 @@ type SemanticProposal struct {
 	Diff          string
 	Risk          SemanticRisk
 	Context       SemanticContext
-	Expanded      bool   // UI state: whether the diff is expanded or collapsed
-	Accepted      bool   // Whether this proposal has been accepted
-	AppliedStatus string // "created", "modified", "deleted"
-	ShellExec     bool   // Whether this is a shell execution proposal
-	ShellApproved bool   // Whether shell execution was explicitly approved
+	Expanded      bool             // UI state: whether the diff is expanded or collapsed
+	Accepted      bool             // Whether this proposal has been accepted
+	AppliedStatus string           // "created", "modified", "deleted"
+	ShellExec     bool             // Whether this is a shell execution proposal
+	ShellApproved bool             // Whether shell execution was explicitly approved
+	Patch         *execution.Patch // full patch content for exact application (avoiding display-diff format mismatch)
 }
 
 // acceptedProposal tracks a completed proposal for rendering the collapsed summary.

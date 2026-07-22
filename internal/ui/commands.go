@@ -1922,55 +1922,81 @@ func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
 // it returns a buildProposalReadyMsg so the update loop can extract proposals
 // and freeze the pipeline in StateAwaitingProposal for human approval before
 // any disk write occurs.
+//
+// Auto-retry: if the LLM returns an ambiguous snippet (no SEARCH/REPLACE markers,
+// no diff headers) for an existing file, the function re-prompts the LLM with the
+// rejection error up to 2 times before giving up. This prevents the human from
+// seeing a bad patch and avoids a pointless fail cycle.
 func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 	return func() tea.Msg {
 		if m.provider == nil {
 			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
 
-		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		baseHandoff := ctxpkg.SanitizeBuildHandoff(task, "")
 		system := prompt.BuildContract()
-		req := ai.Request{
-			Model:    m.cfg.ActiveModelName(),
-			System:   system,
-			Stream:   false,
-			Messages: []ai.Message{{Role: "user", Content: handoff}},
+		maxRetries := 2
+		handoff := baseHandoff
+
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			req := ai.Request{
+				Model:    m.cfg.ActiveModelName(),
+				System:   system,
+				Stream:   false,
+				Messages: []ai.Message{{Role: "user", Content: handoff}},
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			resp, err := m.provider.Execute(ctx, req)
+			cancel()
+			if err != nil {
+				return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
+			}
+			if resp == nil || strings.TrimSpace(resp.Content) == "" {
+				return buildProposalReadyMsg{Err: fmt.Errorf("patch generation returned empty output")}
+			}
+
+			cleaned := sanitizeFileOutput(resp.Content)
+
+			orig := ""
+			if data, rerr := os.ReadFile(task.Target); rerr == nil {
+				orig = string(data)
+			}
+
+			// Validate patch format BEFORE presenting to human.
+			// If the snippet is ambiguous (no SEARCH/REPLACE markers, no diff
+			// headers, significantly smaller than the original), reject early
+			// and retry with explicit SEARCH/REPLACE formatting instructions.
+			if execution.IsAmbiguousSnippet(orig, cleaned) {
+				if attempt < maxRetries {
+					handoff = fmt.Sprintf(
+						"Your proposed patch for %s was rejected due to invalid format: Ambiguous snippet without SEARCH/REPLACE markers. Re-send the modification using strict <<<<<<< SEARCH ... ======= ... >>>>>>> blocks.\n\nOriginal task:\n%s",
+						task.Target, baseHandoff)
+					continue
+				}
+				return buildProposalReadyMsg{Err: fmt.Errorf("%w: ambiguous snippet without SEARCH/REPLACE markers for existing file %s — retry with SEARCH/REPLACE block or unified diff", execution.ErrInvalidPatchFormat, task.Target)}
+			}
+
+			diff := computeUnifiedDiff(task.Target, orig, cleaned)
+
+			patch := &execution.Patch{
+				ID:        fmt.Sprintf("build-%d", task.StepNum),
+				File:      task.Target,
+				Original:  orig,
+				Modified:  cleaned,
+				TaskID:    task.StepNum,
+				ContextID: m.sess.ContextID,
+			}
+
+			return buildProposalReadyMsg{
+				Task:   task,
+				Patch:  patch,
+				Diff:   diff,
+				Output: resp.Content,
+			}
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		defer cancel()
-		resp, err := m.provider.Execute(ctx, req)
-		if err != nil {
-			return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
-		}
-		if resp == nil || strings.TrimSpace(resp.Content) == "" {
-			return buildProposalReadyMsg{Err: fmt.Errorf("patch generation returned empty output")}
-		}
-
-		cleaned := sanitizeFileOutput(resp.Content)
-
-		orig := ""
-		if data, rerr := os.ReadFile(task.Target); rerr == nil {
-			orig = string(data)
-		}
-
-		diff := computeUnifiedDiff(task.Target, orig, cleaned)
-
-		patch := &execution.Patch{
-			ID:        fmt.Sprintf("build-%d", task.StepNum),
-			File:      task.Target,
-			Original:  orig,
-			Modified:  cleaned,
-			TaskID:    task.StepNum,
-			ContextID: m.sess.ContextID,
-		}
-
-		return buildProposalReadyMsg{
-			Task:   task,
-			Patch:  patch,
-			Diff:   diff,
-			Output: resp.Content,
-		}
+		return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed after %d retries: ambiguous snippet format", maxRetries)}
 	}
 }
 

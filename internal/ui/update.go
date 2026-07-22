@@ -579,6 +579,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		props := extractBuildProposals(msg.Output)
 		if len(props) == 0 {
 			// Fallback: use the pre-computed diff and patch directly.
+			// Store the full Patch so applyProposalCmd can use the exact
+			// Modified content instead of the display Diff (which may lack
+			// @@ hunk headers and trigger ErrInvalidPatchFormat).
 			target := msg.Task.Target
 			proposal := SemanticProposal{
 				ID:   msg.Patch.ID,
@@ -589,6 +592,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					Language:      langFromPath(target),
 				},
 				Expanded: true,
+				Patch:    msg.Patch,
 			}
 			props = []SemanticProposal{proposal}
 		}

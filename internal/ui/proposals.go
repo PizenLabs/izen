@@ -370,10 +370,17 @@ func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 			}
 		}()
 
+		// Use the stored Patch.Modified when available (preserves full file
+		// content or SEARCH/REPLACE blocks for exact application), falling
+		// back to the display Diff for backward compatibility.
+		modified := p.Diff
+		if p.Patch != nil && p.Patch.Modified != "" {
+			modified = p.Patch.Modified
+		}
 		patch := &execution.Patch{
 			ID:       p.ID,
 			File:     p.Target.QualifiedName,
-			Modified: p.Diff,
+			Modified: modified,
 			TaskID:   m.currentBuildTaskID,
 		}
 		orig, err := os.ReadFile(p.Target.QualifiedName)
@@ -420,10 +427,17 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 			}
 		}()
 		for _, p := range proposals {
+			// Use the stored Patch.Modified when available (preserves full
+			// file content or SEARCH/REPLACE blocks for exact application),
+			// falling back to the display Diff for backward compatibility.
+			modified := p.Diff
+			if p.Patch != nil && p.Patch.Modified != "" {
+				modified = p.Patch.Modified
+			}
 			patch := &execution.Patch{
 				ID:       p.ID,
 				File:     p.Target.QualifiedName,
-				Modified: p.Diff,
+				Modified: modified,
 				TaskID:   m.currentBuildTaskID,
 			}
 			orig, err := os.ReadFile(p.Target.QualifiedName)
