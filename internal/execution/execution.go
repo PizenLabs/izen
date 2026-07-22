@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"github.com/PizenLabs/izen/internal/checkpoint"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/git"
@@ -15,6 +16,7 @@ type Engine struct {
 	Test        *TestRunner
 	Patches     *PatchManager
 	Checkpoints *CheckpointManager
+	ShadowCP    *checkpoint.Engine
 	Git         *git.Engine
 	PatchQueue  *PatchQueue
 	StreamMon   *StreamMonitor
@@ -36,6 +38,7 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ..
 	t := NewTestRunner(root)
 	p := NewPatchManager(root)
 	c := NewCheckpointManager(root, sess)
+	sc := checkpoint.NewEngine(root)
 
 	pe := NewPolicyEngine(func() modes.Capability {
 		if sess != nil {
@@ -63,6 +66,7 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ..
 		Test:        t,
 		Patches:     p,
 		Checkpoints: c,
+		ShadowCP:    sc,
 		Git:         git.NewEngine(root),
 		root:        root,
 		langID:      activeLangID,

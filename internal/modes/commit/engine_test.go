@@ -1,6 +1,10 @@
 package commit
 
 import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -187,5 +191,65 @@ func TestCleanRawLLMOutput_WithFence(t *testing.T) {
 	}
 	if lines[0] != "feat(license): add license" {
 		t.Errorf("first line should be stripped subject, got %q", lines[0])
+	}
+}
+
+func gitExec(t *testing.T, dir, name string, args ...string) string {
+	t.Helper()
+	cmd := exec.CommandContext(context.Background(), "git", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestStageAllBeforeDiff_IncludesUntrackedFile(t *testing.T) {
+	dir := t.TempDir()
+
+	gitExec(t, dir, "git init", "init")
+	gitExec(t, dir, "git config user.email", "config", "user.email", "test@izen.dev")
+	gitExec(t, dir, "git config user.name", "config", "user.name", "Izen Test")
+	gitExec(t, dir, "git commit", "commit", "--allow-empty", "-m", "initial")
+
+	if err := os.WriteFile(filepath.Join(dir, "LICENSE"), []byte("MIT License\n"), 0644); err != nil {
+		t.Fatalf("write LICENSE: %v", err)
+	}
+
+	addCmd := exec.CommandContext(context.Background(), "git", "add", "-A")
+	addCmd.Dir = dir
+	if out, err := addCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add -A: %v\n%s", err, out)
+	}
+
+	diffCmd := exec.CommandContext(context.Background(), "sh", "-c", "git diff --cached -w -U3 | head -n 180")
+	diffCmd.Dir = dir
+	diffOut, _ := diffCmd.Output()
+	diffStr := strings.TrimSpace(string(diffOut))
+
+	if diffStr == "" {
+		t.Fatal("expected non-empty staged diff after StageAll() with untracked file")
+	}
+	if !strings.Contains(diffStr, "LICENSE") {
+		t.Errorf("staged diff should contain LICENSE, got: %s", diffStr)
+	}
+
+	statusCmd := exec.CommandContext(context.Background(), "git", "status", "--porcelain")
+	statusCmd.Dir = dir
+	statusOut, _ := statusCmd.Output()
+	statusStr := strings.TrimSpace(string(statusOut))
+	if statusStr == "" {
+		t.Fatal("expected non-empty status after stage")
+	}
+
+	prompt := BuildPrompt(diffStr)
+	if !strings.Contains(prompt, diffStr) {
+		t.Errorf("BuildPrompt should contain diff")
+	}
+
+	msg := ParseGeneratedMessage("feat(license): add MIT license file\n\n- include MIT license text")
+	if !strings.Contains(msg.Subject, "license") {
+		t.Errorf("subject should mention license, got %q", msg.Subject)
 	}
 }

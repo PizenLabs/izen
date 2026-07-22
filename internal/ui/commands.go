@@ -1412,6 +1412,12 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return m.runUndoCmd()
 
 	case cmd == "/commit":
+		if m.resolver.Current() != modes.ModeBuild {
+			m.push(roleError, "commit error: /commit is only available in /build mode")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
 		return m.runCommitCmdAgent()
 
 	case cmd == "/checkpoint":
