@@ -3,12 +3,9 @@ package commit
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 	"unicode"
 )
 
@@ -30,9 +27,8 @@ type CommitMessage struct {
 	Body    string
 }
 
-// GetStagedDiff extracts the staged git changes up to 180 lines, matching the reference script.
+// GetStagedDiff extracts the staged git changes up to 180 lines.
 func GetStagedDiff() (string, string, error) {
-	// Check status porcelain
 	statusCmd := exec.CommandContext(context.Background(), "git", "status", "--porcelain")
 	statusOut, err := statusCmd.Output()
 	if err != nil {
@@ -43,8 +39,31 @@ func GetStagedDiff() (string, string, error) {
 		return "", "", nil
 	}
 
-	// Fetch unified cached diff context
 	diffCmd := exec.CommandContext(context.Background(), "sh", "-c", "git diff --cached -w -U3 | head -n 180")
+	diffOut, _ := diffCmd.Output()
+	diffStr := strings.TrimSpace(string(diffOut))
+
+	if diffStr == "" {
+		diffStr = statusStr
+	}
+
+	return diffStr, statusStr, nil
+}
+
+// GetWorkingDiff extracts the unstaged working tree diff up to 180 lines.
+// Used as fallback when no changes are staged.
+func GetWorkingDiff() (string, string, error) {
+	statusCmd := exec.CommandContext(context.Background(), "git", "status", "--porcelain")
+	statusOut, err := statusCmd.Output()
+	if err != nil {
+		return "", "", err
+	}
+	statusStr := strings.TrimSpace(string(statusOut))
+	if statusStr == "" {
+		return "", "", nil
+	}
+
+	diffCmd := exec.CommandContext(context.Background(), "sh", "-c", "git diff -w -U3 | head -n 180")
 	diffOut, _ := diffCmd.Output()
 	diffStr := strings.TrimSpace(string(diffOut))
 
@@ -214,16 +233,9 @@ func CleanRawLLMOutput(raw string) []string {
 	return strings.Split(cleaned, "\n")
 }
 
-// ExecuteCommit flushes the final structured text using a temporary manifest file descriptor.
+// ExecuteCommit runs git commit -m with header and body as separate -m flags.
+// Uses two -m arguments to avoid escaping issues with multi-line messages.
 func ExecuteCommit(msg CommitMessage) error {
-	finalMessage := fmt.Sprintf("%s\n\n%s\n", msg.Subject, msg.Body)
-	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("izen-commit-%d.txt", time.Now().UnixNano()))
-
-	if err := os.WriteFile(tmpFile, []byte(finalMessage), 0644); err != nil {
-		return err
-	}
-	defer func() { _ = os.Remove(tmpFile) }()
-
-	cmd := exec.CommandContext(context.Background(), "git", "commit", "-F", tmpFile)
+	cmd := exec.CommandContext(context.Background(), "git", "commit", "-m", msg.Subject, "-m", msg.Body)
 	return cmd.Run()
 }

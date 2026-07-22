@@ -463,15 +463,26 @@ func (m *model) runCommitCmdAgent() tea.Cmd {
 			return agentStartMsg{label: "generating commit message"}
 		},
 		func() tea.Msg {
-			diff, err := m.gitEng.LastCommitDiff()
+			diff, err := m.gitEng.DiffCached()
 			if err != nil {
-				return commitGeneratedMsg{err: fmt.Errorf("failed to get diff: %w", err)}
-			}
-			if strings.TrimSpace(diff) == "" {
-				return commitGeneratedMsg{err: fmt.Errorf("no changes in last commit — nothing to amend")}
+				return commitGeneratedMsg{err: fmt.Errorf("failed to get staged diff: %w", err)}
 			}
 
-			payload := fmt.Sprintf("Generate a conventional commit message for these staged changes:\n\n%s", diff)
+			hasStaged := strings.TrimSpace(diff) != ""
+			if !hasStaged {
+				diff, err = m.gitEng.Diff()
+				if err != nil {
+					return commitGeneratedMsg{err: fmt.Errorf("failed to get working diff: %w", err)}
+				}
+				if strings.TrimSpace(diff) == "" {
+					return commitGeneratedMsg{err: fmt.Errorf("no changes to commit")}
+				}
+				if err := m.gitEng.StageAll(); err != nil {
+					return commitGeneratedMsg{err: fmt.Errorf("failed to stage changes: %w", err)}
+				}
+			}
+
+			payload := commit.BuildPrompt(diff)
 			sys := prompt.CommitSystemPrompt()
 			msgs := []ai.Message{
 				{Role: "system", Content: sys},
@@ -487,37 +498,12 @@ func (m *model) runCommitCmdAgent() tea.Cmd {
 				return commitGeneratedMsg{err: fmt.Errorf("LLM call failed: %w", err)}
 			}
 
-			raw := resp.Content
-			lines := commit.CleanRawLLMOutput(raw)
-			var subject, body string
-			for i, line := range lines {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-				if i == 0 {
-					subject = commit.SanitizeSubject(line)
-				} else {
-					body += line + "\n"
-				}
+			msg := commit.ParseGeneratedMessage(resp.Content)
+			if err := m.gitEng.Commit(msg.Subject, msg.Body); err != nil {
+				return commitGeneratedMsg{err: fmt.Errorf("commit failed: %w", err)}
 			}
-			if subject == "" {
-				subject = "chore(repo): update repository state"
-			}
-			bodyLines := strings.Split(strings.TrimSpace(body), "\n")
-			body = commit.SanitizeBody(bodyLines)
-			msg := commit.CommitMessage{Subject: subject, Body: body}
-			finalMessage := fmt.Sprintf("%s\n\n%s\n", msg.Subject, msg.Body)
 
-			if err := m.gitEng.AmendCommit(finalMessage); err != nil {
-				return commitGeneratedMsg{err: fmt.Errorf("amend failed: %w", err)}
-			}
 			hash, _ := m.gitEng.CurrentHash()
-			checkpoints := m.sess.Checkpoints
-			if len(checkpoints) > 0 {
-				m.sess.Checkpoints = checkpoints[:len(checkpoints)-1]
-				_ = m.sess.Save()
-			}
 			return commitGeneratedMsg{subject: msg.Subject, body: msg.Body, hash: hash}
 		},
 	)
