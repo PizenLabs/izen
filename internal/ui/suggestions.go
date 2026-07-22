@@ -177,6 +177,18 @@ func (m *model) filterCommands(prefix string) []string {
 		return strings.HasPrefix(cmdName, prefix) || fuzzyMatch(prefix, cmdName)
 	}
 	currentMode := m.resolver.Current()
+
+	// Sub-command expansion: if the user has typed "undo " (with space) in
+	// build mode, show sub-commands like "undo session" and "undo --all".
+	if subCmds := expandSubCommands(prefix, currentMode); subCmds != nil {
+		for _, sc := range subCmds {
+			if fuzzyMatch(lastToken(prefix), sc) {
+				result = append(result, "/"+prefix+sc)
+			}
+		}
+		return result
+	}
+
 	for _, c := range coreModes {
 		if matches(c) {
 			result = append(result, c)
@@ -197,6 +209,31 @@ func (m *model) filterCommands(prefix string) []string {
 		}
 	}
 	return result
+}
+
+// undoSubCommands are the available sub-command flags for /undo.
+var undoSubCommands = []string{"session", "--all", "--session"}
+
+// expandSubCommands checks whether the prefix matches a known command that
+// has sub-command completions. Returns the sub-command candidates, or nil
+// if no expansion applies. Sub-commands are only available in build mode
+// to prevent accidental misuse in read-only modes.
+func expandSubCommands(prefix string, mode modes.Mode) []string {
+	if mode != modes.ModeBuild {
+		return nil
+	}
+	if !strings.HasPrefix(prefix, "undo ") {
+		return nil
+	}
+	return undoSubCommands
+}
+
+// lastToken returns the last space-delimited token in s.
+func lastToken(s string) string {
+	if idx := strings.LastIndex(s, " "); idx >= 0 {
+		return s[idx+1:]
+	}
+	return s
 }
 
 func (m *model) filterDollarCommands(prefix string) []string {

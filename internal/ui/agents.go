@@ -462,24 +462,18 @@ func (m *model) runCommitCmdAgent() tea.Cmd {
 		func() tea.Msg {
 			return agentStartMsg{label: "generating commit message"}
 		},
+		m.spinnerTickCmd(),
 		func() tea.Msg {
+			if err := m.gitEng.StageAll(); err != nil {
+				return commitGeneratedMsg{err: fmt.Errorf("failed to stage changes: %w", err)}
+			}
+
 			diff, err := m.gitEng.DiffCached()
 			if err != nil {
 				return commitGeneratedMsg{err: fmt.Errorf("failed to get staged diff: %w", err)}
 			}
-
-			hasStaged := strings.TrimSpace(diff) != ""
-			if !hasStaged {
-				diff, err = m.gitEng.Diff()
-				if err != nil {
-					return commitGeneratedMsg{err: fmt.Errorf("failed to get working diff: %w", err)}
-				}
-				if strings.TrimSpace(diff) == "" {
-					return commitGeneratedMsg{err: fmt.Errorf("no changes to commit")}
-				}
-				if err := m.gitEng.StageAll(); err != nil {
-					return commitGeneratedMsg{err: fmt.Errorf("failed to stage changes: %w", err)}
-				}
+			if strings.TrimSpace(diff) == "" {
+				return commitGeneratedMsg{err: fmt.Errorf("no changes to commit")}
 			}
 
 			payload := commit.BuildPrompt(diff)

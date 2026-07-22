@@ -68,17 +68,20 @@ func (pr *PipelineRunner) ExecuteBuild(staged []StagedPatch) PipelineResult {
 		return pr.finalize(start, stages, passed, 0, "")
 	}
 
-	// Stage 2: Git Snapshot
-	s2 := stage("Git Snapshot")
-	if pr.engine.Git != nil && pr.engine.Git.IsRepo() {
-		hash, err := pr.engine.Git.Checkpoint("pre-execution-snapshot")
-		if err != nil {
-			record(s2, "warning", fmt.Sprintf("snapshot attempted but non-fatal: %v", err))
-		} else {
-			record(s2, "passed", fmt.Sprintf("snapshot at %s", strings.TrimSpace(hash)))
-		}
-	} else {
+	// Stage 2: Shadow Checkpoint (zero git history pollution)
+	s2 := stage("Shadow Checkpoint")
+	switch {
+	case pr.engine.ShadowCP == nil:
+		record(s2, "skipped", "shadow checkpoint engine not initialized")
+	case pr.engine.Git == nil || !pr.engine.Git.IsRepo():
 		record(s2, "skipped", "not a git repository")
+	default:
+		cp, err := pr.engine.ShadowCP.CreatePreExecSnapshot("pre-execution-snapshot")
+		if err != nil {
+			record(s2, "warning", fmt.Sprintf("shadow checkpoint attempted but non-fatal: %v", err))
+		} else {
+			record(s2, "passed", fmt.Sprintf("checkpoint %s (tree %s)", cp.ID, cp.TreeHash[:8]))
+		}
 	}
 	pr.logPipeline("snapshot", s2, "")
 

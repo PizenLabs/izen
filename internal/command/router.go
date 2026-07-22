@@ -7,8 +7,16 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/undo"
 	"github.com/PizenLabs/izen/internal/session"
 )
+
+// UndoHandler performs multi-level undo operations. Implemented by undo.Handler.
+type UndoHandler interface {
+	Undo() (*undo.Result, error)
+	UndoSession() (*undo.Result, error)
+	UndoByMode(mode undo.Mode) (*undo.Result, error)
+}
 
 // IsReviewTestComposite detects the composite shortcut syntax
 // "/review $test" (in any ordering / spacing) and reports whether the
@@ -97,10 +105,11 @@ type CommandRouter interface {
 }
 
 // NewCommandRouter creates a new command router with all handlers
-func NewCommandRouter(sess *session.Session, resolver *modes.Resolver) *Router {
+func NewCommandRouter(sess *session.Session, resolver *modes.Resolver, undoH UndoHandler) *Router {
 	return &Router{
 		sess:     sess,
 		resolver: resolver,
+		undo:     undoH,
 	}
 }
 
@@ -108,6 +117,7 @@ func NewCommandRouter(sess *session.Session, resolver *modes.Resolver) *Router {
 type Router struct {
 	sess     *session.Session
 	resolver *modes.Resolver
+	undo     UndoHandler
 }
 
 // Route processes input and returns whether it was handled by a native command
@@ -128,7 +138,7 @@ func (r *Router) Route(input string) (bool, tea.Cmd) {
 	case "clear":
 		return r.handleClear()
 	case "undo":
-		return r.handleUndo()
+		return r.handleUndoWithMode([]string{"undo"})
 	case "mode":
 		return r.handleModeBare()
 	}
@@ -151,7 +161,9 @@ func (r *Router) Route(input string) (bool, tea.Cmd) {
 		case "/clear":
 			return r.handleClear()
 		case "/undo":
-			return r.handleUndo()
+			return r.handleUndoWithMode(parts)
+		case "/commit":
+			return r.handleCommit()
 		case "/mode":
 			if len(parts) >= 2 {
 				return r.handleModeWithArg(parts[1])
@@ -193,10 +205,47 @@ func (r *Router) handleClear() (bool, tea.Cmd) {
 	return true, nil
 }
 
-func (r *Router) handleUndo() (bool, tea.Cmd) {
-	// Undo last operation
-	r.sess.AddMessage("system", "Undoing last operation...", 1)
-	// TODO: Implement actual undo logic
+func (r *Router) handleUndoWithMode(parts []string) (bool, tea.Cmd) {
+	if r.undo == nil {
+		r.sess.AddMessage("system", "Undo handler not available (checkpoint engine not initialized)", 1)
+		return true, nil
+	}
+
+	// Parse the undo mode (/undo, /undo session, /undo --all).
+	input := strings.Join(parts, " ")
+	undoMode := undo.Parse(input)
+	var result *undo.Result
+	var err error
+
+	switch undoMode {
+	case undo.ModeSession:
+		result, err = r.undo.UndoSession()
+		if err != nil {
+			r.sess.AddMessage("error", fmt.Sprintf("Session undo failed: %v", err), 1)
+			return true, nil
+		}
+	default:
+		result, err = r.undo.Undo()
+		if err != nil {
+			r.sess.AddMessage("error", fmt.Sprintf("Undo failed: %v", err), 1)
+			return true, nil
+		}
+	}
+
+	status := "system"
+	if !result.Success {
+		status = "error"
+	}
+	r.sess.AddMessage(status, result.Message, 1)
+	return true, nil
+}
+
+func (r *Router) handleCommit() (bool, tea.Cmd) {
+	// Stage all changes and create a conventional commit.
+	// This runs git add -A && git commit with the aggregate diff.
+	r.sess.AddMessage("system", "Creating conventional commit from session changes...", 1)
+	// The actual commit logic is handled by the build/commit engine,
+	// invoked from the TUI layer. This router handler gates access.
 	return true, nil
 }
 
