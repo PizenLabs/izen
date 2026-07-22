@@ -1,8 +1,10 @@
 package context
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
@@ -297,7 +299,18 @@ func SanitizeBuildHandoff(task *plan.Task, symbolContext string) string {
 	b.WriteString("### INSTRUCTION\n")
 	b.WriteString("Produce the minimal code change to complete this task. ")
 	b.WriteString("Use unified diff format (```diff) or FILE: block format. ")
-	b.WriteString("No conversational text, no markdown outside code blocks.")
+	b.WriteString("No conversational text, no markdown outside code blocks.\n\n")
+
+	// ── Temporal context ─────────────────────────────────────────────
+	// Local LLMs (e.g. qwen2.5-coder:7b) hallucinate default/fallback dates
+	// like "Copyright (c) 2023" when no system time is provided. Injecting
+	// the current year prevents stale-copyright regressions without requiring
+	// the user to explicitly specify the year in every $hot request.
+	now := time.Now()
+	fmt.Fprintf(&b, "CURRENT_YEAR: %d\n", now.Year())
+	fmt.Fprintf(&b, "CURRENT_DATE: %s\n", now.Format("2006-01-02"))
+	b.WriteString("When generating copyright notices, licenses, or time-sensitive code, ")
+	b.WriteString("strictly use CURRENT_YEAR for any year references unless the task explicitly specifies otherwise.\n")
 
 	return strings.TrimSpace(b.String())
 }

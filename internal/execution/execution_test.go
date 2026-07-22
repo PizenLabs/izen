@@ -71,7 +71,11 @@ func TestPatchManagerLedgerNoOpWithoutTaskID(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	if err := pm.Apply(&Patch{ID: "p2", File: testFile, Modified: "new"}); err != nil {
+	if err := pm.Apply(&Patch{
+		ID:       "p2",
+		File:     testFile,
+		Modified: "<<<<<<< SEARCH\noriginal\n=======\nreplacement\n>>>>>>>",
+	}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if ledger.IsCompleted(0) {

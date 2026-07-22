@@ -114,3 +114,87 @@ func TestForceShellExecOnCompileError_NonCompile(t *testing.T) {
 		t.Fatalf("expected 1 task unchanged for non-compile error, got %d", len(out))
 	}
 }
+
+func TestFilterUndefinedSymbolShellExec_DropsShellExec(t *testing.T) {
+	ledger := "cmd/api/main.go:24:2: undefined: Log"
+	tasks := []Task{
+		{StepNum: 1, Type: "SHELL_EXEC", Target: "go mod tidy", Description: "tidy"},
+		{StepNum: 2, Type: "FILE_MUTATE", Target: "cmd/api/main.go", Description: "fix"},
+	}
+	out := FilterUndefinedSymbolShellExec(tasks, ledger)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 task (SHELL_EXEC dropped), got %d", len(out))
+	}
+	if out[0].Type != "FILE_MUTATE" {
+		t.Fatalf("expected remaining task to be FILE_MUTATE, got %s", out[0].Type)
+	}
+	if out[0].Target != "cmd/api/main.go" {
+		t.Fatalf("expected target cmd/api/main.go, got %s", out[0].Target)
+	}
+}
+
+func TestFilterUndefinedSymbolShellExec_DropsGitAction(t *testing.T) {
+	ledger := "cmd/api/main.go:24:2: undefined: Log"
+	tasks := []Task{
+		{StepNum: 1, Type: "GIT_ACTION", Target: "commit -m fix", Description: "commit"},
+		{StepNum: 2, Type: "FILE_MUTATE", Target: "cmd/api/main.go", Description: "fix"},
+	}
+	out := FilterUndefinedSymbolShellExec(tasks, ledger)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 task (GIT_ACTION dropped), got %d", len(out))
+	}
+	if out[0].Type != "FILE_MUTATE" {
+		t.Fatalf("expected remaining task to be FILE_MUTATE, got %s", out[0].Type)
+	}
+}
+
+func TestFilterUndefinedSymbolShellExec_PreservesHardcoded(t *testing.T) {
+	ledger := "cmd/api/main.go:24:2: undefined: Log"
+	tasks := []Task{
+		{StepNum: 1, Type: "SHELL_EXEC", Target: "go mod tidy", Description: "tidy", IsHardcoded: true},
+		{StepNum: 2, Type: "FILE_MUTATE", Target: "cmd/api/main.go", Description: "fix"},
+	}
+	out := FilterUndefinedSymbolShellExec(tasks, ledger)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 tasks (hardcoded preserved), got %d", len(out))
+	}
+	if out[0].Type != "SHELL_EXEC" {
+		t.Fatalf("expected hardcoded SHELL_EXEC preserved, got %s", out[0].Type)
+	}
+}
+
+func TestFilterUndefinedSymbolShellExec_NoUndefinedSymbol(t *testing.T) {
+	ledger := "no required module provides package github.com/foo/bar"
+	tasks := []Task{
+		{StepNum: 1, Type: "SHELL_EXEC", Target: "go get github.com/foo/bar", Description: "get"},
+		{StepNum: 2, Type: "FILE_MUTATE", Target: "main.go", Description: "fix"},
+	}
+	out := FilterUndefinedSymbolShellExec(tasks, ledger)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 tasks unchanged (no undefined symbol), got %d", len(out))
+	}
+}
+
+func TestFilterUndefinedSymbolShellExec_AllShellExec(t *testing.T) {
+	ledger := "cmd/api/main.go:24:2: undefined: Log"
+	tasks := []Task{
+		{StepNum: 1, Type: "SHELL_EXEC", Target: "go mod tidy", Description: "tidy"},
+		{StepNum: 2, Type: "SHELL_EXEC", Target: "go get github.com/foo/bar", Description: "get"},
+	}
+	out := FilterUndefinedSymbolShellExec(tasks, ledger)
+	if len(out) != 0 {
+		t.Fatalf("expected 0 tasks (all SHELL_EXEC dropped), got %d", len(out))
+	}
+}
+
+func TestFilterUndefinedSymbolShellExec_EmptyInput(t *testing.T) {
+	if out := FilterUndefinedSymbolShellExec(nil, ""); out != nil {
+		t.Fatalf("expected nil for nil input, got %d", len(out))
+	}
+	if out := FilterUndefinedSymbolShellExec(nil, "cmd/api/main.go:24:2: undefined: Log"); out != nil {
+		t.Fatalf("expected nil for nil tasks, got %d", len(out))
+	}
+	if out := FilterUndefinedSymbolShellExec([]Task{}, ""); len(out) != 0 {
+		t.Fatalf("expected empty for empty input, got %d", len(out))
+	}
+}

@@ -70,17 +70,20 @@ PROTOCOL
 
 	GO DEPENDENCY FACTORY TEMPLATE (STRICT)
 For missing Go package/module errors ("no required module provides package"):
-  PERMITTED: SHELL_EXEC with EXACTLY: go get <exact_package_path>
+  CRITICAL: Extract the EXACT package path from the ledger conclusion (e.g., go get github.com/docker/docker/client). NEVER output literal angle brackets like <exact_package_path>.
+  PERMITTED: SHELL_EXEC with the actual package path from the ledger.
   FORBIDDEN in command string:
     - File names: go.mod, go.sum
     - Relative paths: any path/to/file.go or ./path/ patterns
     - Generalized text: prose, descriptions, or natural language
     - brew, docker, apt, or any OS-level command
+    - Angle-bracket placeholders like <package> or <exact_package_path>
   The command MUST be a single, runnable shell invocation — not a file path.
 
 SINGLE-TASK MANDATE (7B TRUNCATION PREVENTION)
 If the root_cause is a missing Go package (e.g. "no required module provides package"),
-emit EXACTLY ONE task: SHELL_EXEC with go get <exact_package_path>.
+emit EXACTLY ONE task: SHELL_EXEC with go get <THE_EXACT_PACKAGE_FROM_THE_LEDGER>.
+YOU MUST substitute the real package path — do NOT output literal angle-bracket text.
 No FILE_MUTATE, no GIT_ACTION, no brew/docker/environment tasks.
 Total JSON MUST stay under 300 tokens.
 
@@ -113,7 +116,7 @@ CONCLUSION FROM LEDGER (authoritative — do not override)
 %s
 
 CRITICAL: Map this conclusion directly to a SHELL_EXEC task if dependency-related.
-The SHELL_EXEC target MUST be a valid command (e.g. "go get <pkg>"), not a file path or placeholder.`, conclusion)
+The SHELL_EXEC target MUST be a valid command with the ACTUAL package path from the ledger (e.g., "go get github.com/docker/docker/client"), not a file path or angle-bracket placeholder.`, conclusion)
 	}
 
 	return fmt.Sprintf(`You are the IZEN Plan Mapper. Read the /investigate Forensic Ledger below and produce a JSON plan.
@@ -127,7 +130,7 @@ FORENSIC LEDGER:
 
 DIRECTIVES:
 - Map root_cause → Task 1 (SHELL_EXEC for dep issues, FILE_MUTATE for code bugs).
-- If root_cause is a missing Go module, emit EXACTLY: {"task_id":1,"strategy":"SHELL_EXEC","target":"go get <pkg>","description":"install missing dependency","rationale":"why this is needed","solution":"expected end state"}.
+- If root_cause is a missing Go module, emit EXACTLY: {"task_id":1,"strategy":"SHELL_EXEC","target":"go get <THE_ACTUAL_PACKAGE>","description":"install missing dependency","rationale":"why this is needed","solution":"expected end state"}. Substitute the real package path — NEVER output literal angle brackets.
 - For EVERY task, provide rationale (why) and solution (expected end state).
 - Include a root_core_factor sentence in strategic_overview describing the fundamental root cause.
 - FORBIDDEN as SHELL_EXEC target: file paths (go.mod, go.sum, ./relative/path), generalized text, or prose.
@@ -173,7 +176,7 @@ OUTPUT — raw task blocks only, no prose:
 
 RULES:
 - If a missing Go dependency is the root cause, output EXACTLY ONE SHELL_EXEC task.
-- The SHELL_EXEC command MUST be a runnable invocation (e.g. "go get <pkg>"), NOT a file path.
+- The SHELL_EXEC command MUST be a runnable invocation with the ACTUAL package path (e.g. "go get github.com/docker/docker/client"), NOT a file path or angle-bracket placeholder.
 - FORBIDDEN as SHELL_EXEC target: "go.mod", "go.sum", relative paths, or any text that is not a valid command.
 - No brew, docker, or OS-level environment tasks.
 - Keep the plan strictly at the code/dependency boundary.`,

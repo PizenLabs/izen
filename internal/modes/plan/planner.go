@@ -22,6 +22,7 @@ type Task struct {
 	Description string `json:"description"` // Explanation of why this step exists
 	Rationale   string `json:"rationale,omitempty"`
 	Solution    string `json:"solution,omitempty"`
+	IsHardcoded bool   `json:"is_hardcoded,omitempty"` // If true, bypass LLM sanitization/validation
 }
 
 // ParseMarkdownToTasks converts markdown content into structured Task objects.

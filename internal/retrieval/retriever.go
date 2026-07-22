@@ -127,6 +127,30 @@ func (q Query) String() string {
 	return strings.Join(parts, " ")
 }
 
+// confidenceThresholdReached returns true when the result set's BM25 relevance
+// is sufficient to stop tier progression. This provides proper score gating:
+//
+//   - Graph exact (Confidence >= 1.0): always trust, stop tiers
+//   - BM25 Score >= 0.7: high confidence, stop tiers
+//   - BM25 Score < 0.3 (or zero): continue to fallback tiers
+func confidenceThresholdReached(rs *ResultSet) bool {
+	if rs == nil || rs.Empty() {
+		return false
+	}
+	if rs.Confidence >= ConfExact.Float64() {
+		return true
+	}
+	best := rs.Best()
+	if best == nil {
+		return false
+	}
+	effScore := best.Score
+	if effScore == 0 {
+		effScore = best.Confidence
+	}
+	return effScore >= 0.7
+}
+
 func (r *Retriever) Retrieve(query Query) *ResultSet {
 	start := time.Now()
 
@@ -136,6 +160,9 @@ func (r *Retriever) Retrieve(query Query) *ResultSet {
 	for _, tier := range r.tiers {
 		rs := r.executeTier(tier, query)
 		if rs == nil || rs.Empty() {
+			if rs != nil && rs.Error != "" && globalActivityLog != nil {
+				globalActivityLog("[lx] tier %s error: %s", tier, rs.Error)
+			}
 			continue
 		}
 
@@ -143,8 +170,19 @@ func (r *Retriever) Retrieve(query Query) *ResultSet {
 		usedTiers = append(usedTiers, string(tier))
 		result.Strategy = strings.Join(usedTiers, " → ")
 
-		if rs.Confidence >= ConfExact.Float64() {
+		if confidenceThresholdReached(rs) {
+			best := rs.Best()
+			if best != nil && globalActivityLog != nil {
+				effScore := best.Score
+				if effScore == 0 {
+					effScore = best.Confidence
+				}
+				globalActivityLog("[retrieval] tier %s confidence %.3f >= 0.7 — stopping tier progression", tier, effScore)
+			}
 			break
+		}
+		if globalActivityLog != nil {
+			globalActivityLog("[retrieval] tier %s confidence below 0.7 — continuing to next tier", tier)
 		}
 	}
 
@@ -257,21 +295,34 @@ func (r *Retriever) executeLynxSearch(query Query) *ResultSet {
 		Strategy:   "lynx.semantic",
 		Confidence: ConfSemantic.Float64(),
 	}
+	maxScore := 0.0
 	for _, rr := range rawResults {
-		rs.Add(Score(ConfSemantic, Result{
+		score := rr.Score
+		if score > maxScore {
+			maxScore = score
+		}
+		rs.Add(Result{
 			File:       rr.FilePath,
 			Line:       rr.StartLine,
 			Content:    rr.Content,
 			Strategy:   "lynx.semantic",
 			SymbolName: rr.SymbolName,
-		}))
+			Score:      score,
+			Confidence: score,
+		})
 	}
 	if !rs.Empty() {
-		rs.Confidence = ConfSemantic.Float64()
+		rs.Confidence = maxScore
 	}
 
-	if globalActivityLog != nil && !rs.Empty() {
-		globalActivityLog("[ OK ] lx --search %q: %d results", query.Text, len(rs.Results))
+	if globalActivityLog != nil {
+		if !rs.Empty() {
+			globalActivityLog("[ OK ] lx --search %q: %d results (max BM25=%.3f)", query.Text, len(rs.Results), maxScore)
+		}
+		// Contract invariant: log low-relevance scores explicitly.
+		if rs.Empty() || maxScore < 0.3 {
+			globalActivityLog("[lx] low relevance score (%.3f) for query %q", maxScore, query.Text)
+		}
 	}
 
 	return rs
@@ -298,22 +349,36 @@ func (r *Retriever) executeLynxResolve(query Query) *ResultSet {
 		Strategy:   "lynx.resolve",
 		Confidence: ConfFuzzy.Float64(),
 	}
+	maxScore := 0.0
 	for _, rr := range rawResults {
-		rs.Add(Score(ConfFuzzy, Result{
+		score := rr.Score
+		if score > maxScore {
+			maxScore = score
+		}
+		rs.Add(Result{
 			File:       rr.FilePath,
 			Line:       rr.StartLine,
 			Strategy:   "lynx.resolve",
 			SymbolName: query.Symbol,
 			Content:    rr.Content,
-		}))
+			Score:      score,
+			Confidence: score,
+		})
 	}
 	if !rs.Empty() {
-		rs.Confidence = ConfFuzzy.Float64()
+		rs.Confidence = maxScore
 	}
 
-	if globalActivityLog != nil && !rs.Empty() {
-		globalActivityLog("[ OK ] lx --resolve %q: %d results", query.Symbol, len(rs.Results))
+	if globalActivityLog != nil {
+		if !rs.Empty() {
+			globalActivityLog("[ OK ] lx --resolve %q: %d results (max BM25=%.3f)", query.Symbol, len(rs.Results), maxScore)
+		}
+		// Contract invariant: log low-relevance scores explicitly.
+		if rs.Empty() || maxScore < 0.3 {
+			globalActivityLog("[lx] low relevance score (%.3f) for resolve %q", maxScore, query.Symbol)
+		}
 	}
+
 	return rs
 }
 

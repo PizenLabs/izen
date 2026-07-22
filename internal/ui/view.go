@@ -189,9 +189,9 @@ func (m *model) renderProposalBlock() string {
 			desc := permissionDescStyle.Render(fmt.Sprintf("Reason: %s", task.Description))
 			sep := strings.Repeat("─", boxWidth-4)
 			keys := fmt.Sprintf("%s  %s  %s",
-				permissionKeyStyle.Render("[y] Allow Once"),
-				permissionKeyStyle.Render("[a] Allow Always"),
-				permissionKeyStyle.Render("[n] Reject"),
+				permissionKeyStyle.Render("Alt+A / Enter  Allow Once"),
+				permissionKeyStyle.Render("Alt+L  Allow Always"),
+				permissionKeyStyle.Render("Alt+R / Esc  Reject"),
 			)
 			content.WriteString(title + "\n")
 			content.WriteString(action + "\n\n")
@@ -344,7 +344,7 @@ func (m *model) renderAutocompleteDropdown(width int) string {
 					if len(runes) > maxContent-1 {
 						display = string(runes[:maxContent-1]) + "…"
 					} else {
-						display = display[:maxContent-1] + "…"
+						display = string(runes) + "…"
 					}
 				}
 				pad := width - lipgloss.Width(display) - 4
@@ -413,7 +413,7 @@ func (m *model) renderAutocompleteDropdown(width int) string {
 					if len(runes) > maxContent-1 {
 						display = string(runes[:maxContent-1]) + "…"
 					} else {
-						display = display[:maxContent-1] + "…"
+						display = string(runes) + "…"
 					}
 					lw = lipgloss.Width(display)
 				}

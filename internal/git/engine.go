@@ -130,6 +130,18 @@ func (e *Engine) AmendCommit(message string) error {
 	return err
 }
 
+// Commit creates a new commit with the given subject and body using two -m flags.
+func (e *Engine) Commit(subject, body string) error {
+	_, err := e.git("commit", "-m", subject, "-m", body)
+	return err
+}
+
+// StageAll stages all changes (git add -A).
+func (e *Engine) StageAll() error {
+	_, err := e.git("add", "-A")
+	return err
+}
+
 func (e *Engine) ResetHard(ref string) error {
 	_, err := e.git("reset", "--hard", ref)
 	return err

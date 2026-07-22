@@ -12,6 +12,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/providers"
+	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
 // ToolResult is the structured output of a single forensic tool run. The engine
@@ -223,13 +224,22 @@ func (r *ToolRunner) runLX(ctx context.Context, target string) ToolResult {
 	case isFilePathTarget(target):
 		{
 			path := normalizePathTarget(target)
+			// Extract any embedded line number from compiler error coordinates
+			// (e.g., "cmd/api/main.go:24" → line=24) for targeted reads.
+			_, targetLine := retrieval.SplitTargetPath(target)
 			results, err := r.retriever.SearchFile(path)
 			if err != nil {
 				runErr = err
 				break
 			}
 			collected = append(collected, results...)
-			readResults, rerr := r.retriever.ReadTarget(path, 30)
+			// Use a generous read window centered around the target line when
+			// available, otherwise default to 30 lines from the start.
+			readAhead := 30
+			if targetLine > 0 {
+				readAhead = targetLine + 10
+			}
+			readResults, rerr := r.retriever.ReadTarget(path, readAhead)
 			if rerr == nil {
 				collected = append(collected, readResults...)
 			}
@@ -251,16 +261,31 @@ func (r *ToolRunner) runLX(ctx context.Context, target string) ToolResult {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## LX lookup: %s\n", target)
 	for _, res := range collected {
-		evidence = append(evidence, Evidence{
-			Source:     EvSourceGraph,
-			Content:    res.Content,
-			File:       res.File,
-			Line:       res.Line,
-			Confidence: res.Confidence,
-		})
-		fmt.Fprintf(&b, "  %s:%d %s\n", res.File, res.Line, res.Content)
+		effScore := res.Score
+		if effScore == 0 {
+			effScore = res.Confidence
+		}
+		// Score gate: only include evidence with BM25 >= 0.3.
+		// Low-relevance LX results (< 0.3) are logged at the retriever layer
+		// but excluded from evidence to prevent hallucinated context injection.
+		// They are still included in the diagnostic text builder.
+		if effScore >= 0.3 {
+			evidence = append(evidence, Evidence{
+				Source:     EvSourceGraph,
+				Content:    res.Content,
+				File:       res.File,
+				Line:       res.Line,
+				Confidence: effScore,
+			})
+		}
+		fmt.Fprintf(&b, "  %s:%d [score=%.3f] %s\n", res.File, res.Line, effScore, res.Content)
 	}
 	if len(collected) == 0 {
+		forensicLog("[lx] zero results for target %q — strict fallback to deterministic search (AST/Grep)", target)
+		return ToolResult{Tool: ToolLX, Target: target, Ok: false}
+	}
+	if len(evidence) == 0 {
+		forensicLog("[lx] all %d result(s) had BM25 < 0.3 for target %q — strict fallback to deterministic search (AST/Grep)", len(collected), target)
 		return ToolResult{Tool: ToolLX, Target: target, Ok: false}
 	}
 	return ToolResult{Tool: ToolLX, Target: target, Content: b.String(), Ok: true, Evidence: evidence}
@@ -290,12 +315,17 @@ func isFilePathTarget(tok string) bool {
 	return false
 }
 
-// normalizePathTarget strips shell/CLI prefixes so a path maps cleanly onto
-// the repository layout consumed by the retriever.
+// normalizePathTarget strips shell/CLI prefixes and :line:col compiler error
+// suffixes so a path maps cleanly onto the repository layout consumed by the
+// retriever. For example, "cmd/api/main.go:24:2" becomes "cmd/api/main.go".
 func normalizePathTarget(tok string) string {
 	tok = strings.Trim(tok, ".,;:()[]{}")
 	tok = strings.TrimPrefix(tok, "./")
 	tok = strings.TrimPrefix(tok, "../")
+	// Strip :line:col suffix that may come from compiler error coordinates.
+	if clean, _ := retrieval.SplitTargetPath(tok); clean != "" {
+		tok = clean
+	}
 	return tok
 }
 
@@ -387,19 +417,113 @@ func hasFileExtension(tok string) bool {
 
 // runPackageRemediation handles a remote dependency blocker by routing directly
 // to an environment/shell remediation blueprint instead of touching the local
-// file reader. It stages a package-management task (go mod tidy / go get) in the
-// forensic context and records the vector cleanly — no invalid file descriptor
-// operations are pushed to the ledger.
+// file reader. When a canonical import path mismatch is detected in the
+// diagnostics, it first attempts lx coordinate resolution to find exact
+// file:line locations for targeted FILE_EDIT tasks before falling back to
+// the shell remediation blueprint (go mod tidy / go get).
 func (r *ToolRunner) runPackageRemediation(ctx context.Context, target string) ToolResult {
+	pkg := strings.TrimSpace(target)
+
+	// ── LX coordinate handshake for canonical import mismatches ──────────
+	// Parse the raw diagnostics for a canonical import path mismatch
+	// ("module declares its path as: X but was required as: Y"). When found,
+	// use lx to resolve the exact source locations that need edits, recording
+	// them as high-confidence evidence instead of silently routing to go mod tidy.
+	if r.diagnostics != "" {
+		mismatch := retrieval.ParseCanonicalMismatch(r.diagnostics)
+		if mismatch != nil && mismatch.OldPath != "" && mismatch.NewPath != "" {
+			resolver := retrieval.NewLXCoordinateResolver()
+			if resolver != nil {
+				//nolint:contextcheck // lynx controller API predates context propagation
+				refs, err := resolver.ResolveCanonicalMismatch(mismatch)
+				if err == nil && len(refs) > 0 {
+					var b strings.Builder
+					fmt.Fprintf(&b, "## CANONICAL IMPORT MISMATCH (lx resolved)\n")
+					fmt.Fprintf(&b, "Fix: replace %q → %q\n", mismatch.OldPath, mismatch.NewPath)
+					fmt.Fprintf(&b, "Locations (lx coordinates):\n")
+					for _, ref := range refs {
+						fmt.Fprintf(&b, "  %s:%d-%d", ref.File, ref.StartLine, ref.EndLine)
+						if ref.SymbolName != "" {
+							fmt.Fprintf(&b, " (%s)", ref.SymbolName)
+						}
+						b.WriteString("\n")
+					}
+					b.WriteString("Strategy: FILE_EDIT at coordinates + SHELL_EXEC go mod tidy\n")
+
+					content := b.String()
+					return ToolResult{
+						Tool:    ToolLX,
+						Target:  pkg,
+						Content: content,
+						Ok:      true,
+						Evidence: []Evidence{
+							{
+								Source:     EvSourceGraph,
+								Content:    content,
+								File:       refs[0].File,
+								Line:       refs[0].StartLine,
+								Confidence: 0.9,
+							},
+						},
+					}
+				}
+			}
+		}
+	}
+
+	// ── LX coordinate handshake for undefined symbols ────────────────────
+	// Parse the raw diagnostics for a Go undefined symbol error
+	// ("file.go:line:col: undefined: Symbol"). When found, use lx to resolve
+	// the symbol definition and the error context, recording high-confidence
+	// evidence for FILE_EDIT planning instead of routing straight to go mod tidy.
+	if r.diagnostics != "" {
+		undef := retrieval.ParseUndefinedSymbol(r.diagnostics)
+		if undef != nil && undef.Symbol != "" {
+			resolver := retrieval.NewLXCoordinateResolver()
+			if resolver != nil {
+				//nolint:contextcheck // lynx controller API predates context propagation
+				refs, err := resolver.ResolveUndefinedSymbol(undef)
+				if err == nil && len(refs) > 0 {
+					var b strings.Builder
+					b.WriteString("## UNDEFINED SYMBOL (lx resolved)\n")
+					fmt.Fprintf(&b, "Symbol: %s at %s:%d\n", undef.Symbol, undef.File, undef.Line)
+					fmt.Fprintf(&b, "Definition locations:\n")
+					for _, ref := range refs {
+						fmt.Fprintf(&b, "  %s:%d-%d", ref.File, ref.StartLine, ref.EndLine)
+						if ref.SymbolName != "" {
+							fmt.Fprintf(&b, " (%s)", ref.SymbolName)
+						}
+						b.WriteString("\n")
+					}
+					b.WriteString("Strategy: FILE_EDIT at error coordinate + SHELL_EXEC go test ./...\n")
+
+					content := b.String()
+					return ToolResult{
+						Tool:    ToolLX,
+						Target:  pkg,
+						Content: content,
+						Ok:      true,
+						Evidence: []Evidence{
+							{
+								Source:     EvSourceGraph,
+								Content:    content,
+								File:       refs[0].File,
+								Line:       refs[0].StartLine,
+								Confidence: 0.9,
+							},
+						},
+					}
+				}
+			}
+		}
+	}
+
+	// ── Fallback: shell remediation blueprint ───────────────────────────
+	// No canonical mismatch found or lx resolution failed. Fall through to
+	// the original package remediation logic (go mod tidy / go get).
 	ectx, cancel := context.WithTimeout(ctx, traceTimeout)
 	defer cancel()
 
-	pkg := strings.TrimSpace(target)
-
-	// Stage the remediation command in the workspace root. We DO NOT execute a
-	// non-interactive `go get` that mutates go.mod silently; `go mod tidy`
-	// validates that the dependency graph resolves and surfaces the missing
-	// package as actionable diagnostics.
 	cmd := fmt.Sprintf("go mod tidy 2>&1; echo '---'; go list -m %s 2>&1 || true", pkg)
 	out, err := shell(ectx, r.root, cmd)
 	if out == "" && err != nil {

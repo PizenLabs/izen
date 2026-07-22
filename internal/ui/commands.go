@@ -738,6 +738,72 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 			ledgerToSend = truncated
 		}
 
+		// ── DETERMINISTIC STDLIB TYPO INTERCEPTOR ────────────────────────────
+		// Before dispatching to the LLM for planning, check if the ledger
+		// contains a simple stdlib case typo (e.g. undefined: Log, Fmt, Os).
+		// These are handled deterministically without calling the LLM, bypassing
+		// both the fast-track and the full plan synthesis paths. This prevents
+		// the LLM from generating over-engineered plans (e.g. creating
+		// pkg/util/logs/log.go) for a trivial stdlib case fix.
+		//
+		// HARD REQUIREMENT: on ANY undefined: Symbol match, emit exactly 1
+		// FILE_MUTATE task — NEVER fall through to LLM synthesis (which would
+		// hallucinate SHELL_EXEC go mod tidy for what is a simple stdlib typo).
+		// SHELL_EXEC tasks are banned for undefined symbol errors unless a
+		// go.mod/go.sum missing file error is explicitly present.
+		debugLogPlan("STDLIB INTERCEPTOR: scanning ledger for undefined symbols")
+		if undef := retrieval.ParseUndefinedSymbol(ledgerToSend); undef != nil && undef.Symbol != "" {
+			debugLogPlan("STDLIB INTERCEPTOR: matched undefined: " + undef.Symbol +
+				" at " + undef.File + ":" + fmt.Sprint(undef.Line))
+			if pkgName, importPath, matched := retrieval.CheckStdlibCaseCorrection(undef.Symbol); matched {
+				debugLogPlan("STDLIB INTERCEPTOR: stdlib case-correction fired: " +
+					undef.Symbol + " → " + pkgName)
+				cancel()
+				sanitizedTarget, pathErr := retrieval.SanitizeTargetPath(undef.File)
+				if pathErr != nil {
+					debugLogPlan("STDLIB INTERCEPTOR: path not found — " + pathErr.Error())
+					return planResultMsg{
+						Tasks: []plan.Task{
+							{
+								StepNum:     1,
+								IsDone:      false,
+								Status:      "idle",
+								Type:        "SHELL_EXEC",
+								Target:      "go test ./...",
+								Description: "Stdlib case-correction blocked: target file not found. Re-run build for diagnostics.",
+								Rationale:   "File referenced by compiler does not exist on disk; may need a fresh build.",
+								Solution:    "Run go test ./... to regenerate compiler diagnostics.",
+								IsHardcoded: true,
+							},
+						},
+						Handoff: handoff,
+					}
+				}
+				desc := fmt.Sprintf("Fix %q at %s:%d: replace %q with %q and add import %q",
+					undef.Symbol, sanitizedTarget, undef.Line, undef.Symbol, pkgName, importPath)
+				return planResultMsg{
+					Tasks: []plan.Task{
+						{
+							StepNum:     1,
+							IsDone:      false,
+							Status:      "idle",
+							Type:        "FILE_MUTATE",
+							Target:      sanitizedTarget,
+							Description: desc,
+							Rationale:   fmt.Sprintf("Fix standard library package casing/import (change %q to %q).", undef.Symbol, pkgName),
+							Solution:    fmt.Sprintf("STDLIB:%s:%s:%s", undef.Symbol, pkgName, importPath),
+							IsHardcoded: true,
+						},
+					},
+					Handoff: handoff,
+				}
+			}
+			debugLogPlan("STDLIB INTERCEPTOR: undefined symbol " + undef.Symbol +
+				" not a stdlib typo; falling through to LLM synthesis")
+		} else {
+			debugLogPlan("STDLIB INTERCEPTOR: no undefined symbol match")
+		}
+
 		if localModel {
 			// ── "0 TODO" FAST-TRACK SHORT-CIRCUIT ──────────────────────────
 			// When there are no explicit code TODOs AND the ledger only contains
@@ -1398,12 +1464,20 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 	// leak across the boundary. The same ledger is mirrored into the session
 	// record and persisted to .izen/session.json for full durability.
 	//
-	// CRITICAL: Preserve Diagnostics from investigation when transitioning to /plan.
-	// The investigation findings must survive the mode transition so the plan engine
-	// receives the forensic context needed for structured analysis.
+	// CRITICAL: Preserve Diagnostics AND Packets from investigation when
+	// transitioning to /plan. The investigation findings must survive the mode
+	// transition so the plan engine receives the forensic context needed for
+	// structured analysis. The Packets carry the ID-addressed analytical units
+	// (targets, evidence, root cause) that the plan engine's pre-processors
+	// (canonical mismatch, undefined symbol) scan deterministically.
 	prevDiagnostics := ""
+	var prevPackets []session.LedgerPacket
 	if m.sess != nil && m.sess.ContextLedger != nil {
 		prevDiagnostics = m.sess.ContextLedger.Diagnostics
+		if len(m.sess.ContextLedger.Packets) > 0 {
+			prevPackets = make([]session.LedgerPacket, len(m.sess.ContextLedger.Packets))
+			copy(prevPackets, m.sess.ContextLedger.Packets)
+		}
 	}
 
 	ledger := session.NewContextLedger(targetMode)
@@ -1414,6 +1488,15 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 		// its baseline context without manual copy-pasting.
 		if prevDiagnostics != "" && (targetMode == modes.ModePlan || targetMode == modes.ModeInvestigate) {
 			ledger.Diagnostics = prevDiagnostics
+		}
+		// Re-inject the sequential, ID-addressed analytical packets from the
+		// previous ledger. These carry the forensic findings (targets, evidence,
+		// root cause, conclusion) that the downstream mode reads via
+		// FormatPacketsForPlan. InjectPacket assigns monotonic IDs starting from
+		// the new ledger's existing (empty) packet index, ensuring every packet
+		// survives the transition with its full payload intact.
+		for _, p := range prevPackets {
+			ledger.InjectPacket(p)
 		}
 		ledger.Tasks = nil
 		for _, t := range m.sess.CurrentTasks {
@@ -1584,14 +1667,18 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	// Stage 4: Create a single ad-hoc FILE_MUTATE task.
 	m.push(roleStatus, fmt.Sprintf("[HOTFIX] Urgent hotfix: %s", prompt))
 
-	// ── DYNAMIC TARGET RESOLUTION (Bug Fix 1) ──────────────────────────
-	// The `workspace` token is the working-directory boundary context — it is
-	// NEVER a destination file name. Hallucinating it as a literal path causes
-	// unrelated tasks (e.g. writing a LICENSE and editing main.go) to all be
-	// written into a single file literally named "workspace". We therefore
-	// extract the real target file path from the developer's request; only when
-	// the prompt names no file do we synthesize a context-derived default.
+	// ── DYNAMIC TARGET RESOLUTION ─────────────────────────────────────
+	// Extract the real target file path from the developer's request.
+	// If no file can be resolved, error out early rather than targeting a
+	// metadata file inside .izen/ (which would trigger self-patching).
 	target := resolveHotfixTarget(prompt)
+	if target == "" {
+		m.push(roleError, "Could not determine target file. Use @filename — e.g. $hot change year 2023 to 2026 @LICENSE")
+		m.hotfixActive = false
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
 
 	hotfixTask := plan.Task{
 		StepNum:     0,
@@ -1676,12 +1763,20 @@ func sanitizeFileOutput(content string) string {
 
 // resolveHotfixTarget extracts the concrete destination file path for a $hot
 // request from the developer's natural-language prompt. It scans for explicit
-// file path tokens (e.g. cmd/api/main.go, ./LICENSE, internal/foo/bar.go) and
+// file path tokens (e.g. cmd/api/main.go, ./LICENSE, @internal/foo/bar.go) and
 // returns the first plausible one. The bare token "workspace" is explicitly
 // rejected — it denotes the project-root scope, not a file name. When no file
-// is named, a sensible default is derived from the prompt keywords (creating a
-// new file) rather than overwriting any existing source file.
+// is named, a sensible default is derived from the prompt keywords for
+// well-known files. Returns "" when no target can be resolved (caller must
+// handle the error).
+//
+// Guardrails:
+//   - Paths inside .izen/ are blocked (metadata directory, not a patch target).
+//   - .patch files are blocked (cannot self-patch hotfix artifacts).
 func resolveHotfixTarget(prompt string) string {
+	// Strip @ prefix so @LICENSE, @cmd/api/main.go resolve correctly.
+	prompt = strings.ReplaceAll(prompt, "@", "")
+
 	// Candidate path tokens: sequences of word/path chars including slashes,
 	// dots and an extension, or bare "LICENSE"/"Makefile"-style names.
 	pathRe := regexp.MustCompile(`(?:[./]?[\w-]+(?:/[\w.-]+)+|\.\/?[\w.-]+|[\w.-]+\.[\w]+|(?:LICENSE|Makefile|Dockerfile|README|go\.mod|go\.sum|CHANGELOG|NOTICE))`)
@@ -1696,6 +1791,11 @@ func resolveHotfixTarget(prompt string) string {
 		if m == "" {
 			continue
 		}
+		// Block self-patching: reject .izen/ paths and .patch files.
+		if strings.HasPrefix(m, ".izen/") || strings.Contains(m, "/.izen/") ||
+			strings.HasSuffix(m, ".patch") {
+			continue
+		}
 		// Sanity: must contain a path separator or an extension, and must not
 		// be a single bare word that merely looks like an extension.
 		if strings.Contains(m, "/") || strings.Contains(m, ".") {
@@ -1703,9 +1803,7 @@ func resolveHotfixTarget(prompt string) string {
 		}
 	}
 
-	// ── No explicit file named: synthesize a NEW-file default from keywords.
-	// This never collides with existing source files, so unrelated hotfixes
-	// can never clobber each other the way the literal "workspace" did.
+	// ── No explicit file named: synthesize a target from keywords.
 	lower := strings.ToLower(prompt)
 	switch {
 	case strings.Contains(lower, "license"):
@@ -1723,11 +1821,8 @@ func resolveHotfixTarget(prompt string) string {
 	case strings.Contains(lower, "gitignore"):
 		return ".gitignore"
 	}
-	// Fallback: a timestamped new file under the repo root. The leading dot
-	// guarantees it cannot overwrite a tracked file and clearly marks it as a
-	// hotfix artifact for the developer to relocate.
-	ts := time.Now().Format("20060102-150405")
-	return ".izen/hotfix-" + ts + ".patch"
+	// No target could be resolved — caller must handle the error.
+	return ""
 }
 
 // proposeHotfixPatch generates the patch for a $hot FILE_MUTATE task via the
@@ -1740,9 +1835,26 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			return hotfixProposalMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
 
-		// Build a focused, non-chat patch-generation prompt and call the LLM
-		// once (non-streaming) so we get a deterministic diff/FILE block back.
+		// ── CRITICAL: Read existing file content BEFORE calling the LLM ──
+		// Without the original content in the prompt, local LLMs hallucinate
+		// a full-file rewrite that silently deletes all existing content.
+		// The original is read here (pre-LLM) for prompt context AND below
+		// (post-LLM) for diff computation — single read, dual use.
+		var orig string
+		if data, rerr := os.ReadFile(task.Target); rerr == nil {
+			orig = string(data)
+		}
+
+		// Build a focused, non-chat patch-generation prompt with full file
+		// context so the LLM produces precise SEARCH/REPLACE blocks or
+		// unified diffs rather than a destructive full-file replacement.
 		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		if orig != "" {
+			handoff += "\n\n### TARGET_FILE_CONTENT\n```\n" + orig + "\n```\n"
+			handoff += "\nModify the above file content to fulfill the task. "
+			handoff += "Output a SEARCH/REPLACE block (`<<<<<<< SEARCH`) or a unified diff. "
+			handoff += "Do NOT output a full FILE: block — the file already exists."
+		}
 		system := prompt.BuildContract()
 		req := ai.Request{
 			Model:    m.cfg.ActiveModelName(),
@@ -1768,12 +1880,6 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		// computed and the patch is staged for disk write.
 		cleaned := sanitizeFileOutput(resp.Content)
 
-		// Snapshot the original file content so the diff + rollback are exact.
-		orig := ""
-		if data, rerr := os.ReadFile(task.Target); rerr == nil {
-			orig = string(data)
-		}
-
 		// Compute a unified diff for display (green additions / red removals).
 		diff := computeUnifiedDiff(task.Target, orig, cleaned)
 
@@ -1791,6 +1897,129 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			Patch: patch,
 			Diff:  diff,
 		}
+	}
+}
+
+// proposeStdlibBuildPatch generates a patch for a hardcoded stdlib case-correction
+// FILE_MUTATE task WITHOUT calling the LLM. It reads the actual file from disk,
+// applies the deterministic symbol case + import fix, computes the unified diff,
+// and returns a buildProposalReadyMsg for human approval — identical UX to the
+// LLM-based patch flow but with zero model cost and no placeholder-code risk.
+func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		// Extract fix parameters from Solution: "STDLIB:symbol:pkgName:importPath"
+		parts := strings.SplitN(task.Solution, ":", 4)
+		if len(parts) != 4 || parts[0] != "STDLIB" {
+			return buildProposalReadyMsg{Err: fmt.Errorf("invalid stdlib fix solution format: %q", task.Solution)}
+		}
+		symbol, pkgName, importPath := parts[1], parts[2], parts[3]
+
+		// Read actual file and compute deterministic fix.
+		orig, modified, err := retrieval.ApplyStdlibCaseFix(task.Target, symbol, pkgName, importPath)
+		if err != nil {
+			return buildProposalReadyMsg{Err: fmt.Errorf("stdlib fix failed for %s: %w", task.Target, err)}
+		}
+
+		diff := computeUnifiedDiff(task.Target, orig, modified)
+
+		patch := &execution.Patch{
+			ID:        fmt.Sprintf("stdlib-%d", task.StepNum),
+			File:      task.Target,
+			Original:  orig,
+			Modified:  modified,
+			TaskID:    task.StepNum,
+			ContextID: m.sess.ContextID,
+		}
+
+		return buildProposalReadyMsg{
+			Task:   task,
+			Patch:  patch,
+			Diff:   diff,
+			Output: fmt.Sprintf("Applied stdlib case-correction: %q -> %q + import %q in %s", symbol, pkgName, importPath, task.Target),
+		}
+	}
+}
+
+// proposeBuildPatch generates a patch for a regular FILE_MUTATE / GIT_ACTION
+// build task via the LLM (one non-streaming call) WITHOUT applying it. Instead
+// it returns a buildProposalReadyMsg so the update loop can extract proposals
+// and freeze the pipeline in StateAwaitingProposal for human approval before
+// any disk write occurs.
+//
+// Auto-retry: if the LLM returns an ambiguous snippet (no SEARCH/REPLACE markers,
+// no diff headers) for an existing file, the function re-prompts the LLM with the
+// rejection error up to 2 times before giving up. This prevents the human from
+// seeing a bad patch and avoids a pointless fail cycle.
+func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		if m.provider == nil {
+			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
+		}
+
+		baseHandoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		system := prompt.BuildContract()
+		maxRetries := 2
+		handoff := baseHandoff
+
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			req := ai.Request{
+				Model:    m.cfg.ActiveModelName(),
+				System:   system,
+				Stream:   false,
+				Messages: []ai.Message{{Role: "user", Content: handoff}},
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			resp, err := m.provider.Execute(ctx, req)
+			cancel()
+			if err != nil {
+				return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
+			}
+			if resp == nil || strings.TrimSpace(resp.Content) == "" {
+				return buildProposalReadyMsg{Err: fmt.Errorf("patch generation returned empty output")}
+			}
+
+			cleaned := sanitizeFileOutput(resp.Content)
+
+			orig := ""
+			if data, rerr := os.ReadFile(task.Target); rerr == nil {
+				orig = string(data)
+			}
+
+			// Validate patch format BEFORE presenting to human.
+			// If the snippet is ambiguous (no SEARCH/REPLACE markers, no diff
+			// headers, significantly smaller than the original), reject early
+			// and retry with explicit SEARCH/REPLACE formatting instructions.
+			if execution.IsAmbiguousSnippet(orig, cleaned) {
+				if attempt < maxRetries {
+					handoff = fmt.Sprintf(
+						"Your proposed patch for %s was rejected due to invalid format: Ambiguous snippet without SEARCH/REPLACE markers. Re-send the modification using strict <<<<<<< SEARCH ... ======= ... >>>>>>> blocks.\n\nOriginal task:\n%s",
+						task.Target, baseHandoff)
+					continue
+				}
+				return buildProposalReadyMsg{Err: fmt.Errorf("%w: ambiguous snippet without SEARCH/REPLACE markers for existing file %s — retry with SEARCH/REPLACE block or unified diff", execution.ErrInvalidPatchFormat, task.Target)}
+			}
+
+			diff := computeUnifiedDiff(task.Target, orig, cleaned)
+
+			patch := &execution.Patch{
+				ID:        fmt.Sprintf("build-%d", task.StepNum),
+				File:      task.Target,
+				Original:  orig,
+				Modified:  cleaned,
+				TaskID:    task.StepNum,
+				ContextID: m.sess.ContextID,
+			}
+
+			return buildProposalReadyMsg{
+				Task:   task,
+				Patch:  patch,
+				Diff:   diff,
+				Output: resp.Content,
+			}
+		}
+
+		return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed after %d retries: ambiguous snippet format", maxRetries)}
 	}
 }
 
@@ -2030,86 +2259,6 @@ func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 	}
 }
 
-// runBuildPatchExec executes a FILE_MUTATE / GIT_ACTION build task by generating
-// the patch via the LLM (one non-streaming call) and applying it through the
-// execution engine's PatchManager — never via the conversational streamCmd.
-// This is what makes /build actually mutate the workspace instead of chatting.
-func (m *model) runBuildPatchExec(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
-		if m.provider == nil {
-			return buildResultMsg{err: fmt.Errorf("build execution error: no provider configured")}
-		}
-
-		// Build a focused, non-chat patch-generation prompt and call the LLM
-		// once (non-streaming) so we get a deterministic diff/FILE block back.
-		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
-		system := prompt.BuildContract()
-		req := ai.Request{
-			Model:    m.cfg.ActiveModelName(),
-			System:   system,
-			Stream:   false,
-			Messages: []ai.Message{{Role: "user", Content: handoff}},
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		defer cancel()
-		resp, err := m.provider.Execute(ctx, req)
-		if err != nil {
-			return buildResultMsg{err: fmt.Errorf("patch generation failed: %w", err)}
-		}
-		if resp == nil || strings.TrimSpace(resp.Content) == "" {
-			return buildResultMsg{err: fmt.Errorf("patch generation returned empty output")}
-		}
-
-		// Feed the LLM output to the execution engine as a concrete patch and
-		// apply it. PatchManager.Apply handles unified diffs, FILE: blocks and
-		// full rewrites, with shadow backups + mutation guardrails.
-		orig := ""
-		if data, rerr := os.ReadFile(task.Target); rerr == nil {
-			orig = string(data)
-		}
-		patch := &execution.Patch{
-			ID:        fmt.Sprintf("build-%d", task.StepNum),
-			File:      task.Target,
-			Original:  orig,
-			Modified:  resp.Content,
-			TaskID:    task.StepNum,
-			ContextID: m.sess.ContextID,
-		}
-		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
-			tasks := m.sess.CurrentTasks
-			for i := range tasks {
-				if tasks[i].StepNum == task.StepNum {
-					tasks[i].Status = "failed"
-					break
-				}
-			}
-			m.sess.StageTaskList(&tasks)
-			_ = m.sess.Save()
-			return buildResultMsg{
-				output:   resp.Content,
-				exitCode: 1,
-				err:      fmt.Errorf("patch apply failed: %w", applyErr),
-			}
-		}
-
-		// Mark the task terminal in the live session ledger.
-		tasks := m.sess.CurrentTasks
-		for i := range tasks {
-			if tasks[i].StepNum == task.StepNum {
-				tasks[i].Status = "completed"
-				break
-			}
-		}
-		m.sess.StageTaskList(&tasks)
-		_ = m.sess.Save()
-		return buildResultMsg{
-			output:   fmt.Sprintf("Applied patch to %s", task.Target),
-			exitCode: 0,
-		}
-	}
-}
-
 func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	tasks := m.sess.CurrentTasks
 	if len(tasks) == 0 {
@@ -2215,16 +2364,30 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 		return nil
 	}
 
-	// ── FILE_MUTATE / GIT_ACTION: generate + APPLY a real patch ──────────
-	// These tasks mutate the workspace. /build MUST produce the change and
-	// apply it through the execution engine (PatchManager), NOT stream a chat
-	// reply. Routing them through the conversational streamCmd made the model
-	// "greet" the user instead of executing — a violation of /build's sole
-	// mandate (execute, never chat).
+	// ── FILE_MUTATE / GIT_ACTION: generate a patch for human approval ────
+	// These tasks mutate the workspace. /build MUST NOT apply any mutation
+	// without explicit human sign-off. The patch is generated by the LLM in a
+	// non-streaming call and returned as buildProposalReadyMsg, which freezes
+	// the pipeline in StateAwaitingApproval and renders a unified diff for
+	// explicit authorization (Alt+A / Alt+L / Alt+R).
 	if targetTask.Type == "FILE_MUTATE" || targetTask.Type == "GIT_ACTION" {
+		// ── DETERMINISTIC STDLIB FIX (no LLM) ──────────────────────────
+		// Hardcoded stdlib case-correction tasks carry fix parameters in
+		// the Solution field ("STDLIB:symbol:pkgName:importPath"). Apply
+		// the fix directly by reading the actual file and computing the
+		// targeted replacement — bypassing the LLM entirely. This prevents
+		// the model from generating placeholder code ("// existing code")
+		// and ensures the file is mutated in-place at the correct location.
+		if targetTask.IsHardcoded && strings.HasPrefix(targetTask.Solution, "STDLIB:") {
+			return tea.Batch(
+				func() tea.Msg { return agentStartMsg{label: "stdlib patch"} },
+				m.proposeStdlibBuildPatch(targetTask),
+				m.spinnerTickCmd(),
+			)
+		}
 		return tea.Batch(
 			func() tea.Msg { return agentStartMsg{label: "patching"} },
-			m.runBuildPatchExec(targetTask),
+			m.proposeBuildPatch(targetTask),
 			m.spinnerTickCmd(),
 		)
 	}
@@ -2544,11 +2707,20 @@ func (m *model) runFixCmd(target string) tea.Cmd {
 				fmt.Fprintf(&fixCtx, "**Target:** `%s`\n\n", m.lastTestTarget)
 			}
 
-			fixCtx.WriteString("## INSTRUCTION\n")
-			fixCtx.WriteString("This is build mode — Execution-Only. All diagnostic and architectural analysis was ")
-			fixCtx.WriteString("completed in previous stages. Implement the fix based on the failure log above. ")
-			fixCtx.WriteString("Output ONLY the minimal unified diff or complete file replacement. ")
-			fixCtx.WriteString("Do NOT analyze, explain, or restate the problem.\n")
+			fixCtx.WriteString("## INSTRUCTION — AUTO-RECOVERY MODE\n")
+			fixCtx.WriteString("MODE: AUTO-RECOVERY — execute a targeted fix.\n\n")
+			fixCtx.WriteString("PURPOSE:\n")
+			fixCtx.WriteString("- Apply the minimal code change to fix the compilation error below.\n")
+			fixCtx.WriteString("- Output ONLY compilable code. No analysis, no explanations.\n\n")
+			fixCtx.WriteString("FORBIDDEN:\n")
+			fixCtx.WriteString("- Do NOT output conversational text of any kind.\n")
+			fixCtx.WriteString("- Do NOT greet, summarize, or restate the problem.\n")
+			fixCtx.WriteString("- The first output token MUST be ```diff or FILE:. ZERO exceptions.\n\n")
+			fixCtx.WriteString("OUTPUT FORMAT:\n")
+			fixCtx.WriteString("- Unified diff (```diff ... ```) for existing files.\n")
+			fixCtx.WriteString("- FILE: block for new files or full rewrites.\n")
+			fixCtx.WriteString("- No markdown outside code blocks.\n")
+			fixCtx.WriteString("- No conversational setup, no sign-off.\n")
 
 			return fixResultMsg{content: fixCtx.String()}
 		},

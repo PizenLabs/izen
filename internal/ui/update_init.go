@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -160,7 +161,8 @@ func (m *model) handleInitProviderSelect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.ti.Focus()
 	case tea.KeyBackspace, tea.KeyDelete:
 		if len(m.initProviderFilter) > 0 {
-			m.initProviderFilter = m.initProviderFilter[:len(m.initProviderFilter)-1]
+			_, size := utf8.DecodeLastRuneInString(m.initProviderFilter)
+			m.initProviderFilter = m.initProviderFilter[:len(m.initProviderFilter)-size]
 			m.initProviderIdx = 0
 		}
 		return m, nil

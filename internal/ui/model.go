@@ -233,6 +233,19 @@ type buildResultMsg struct {
 	err      error
 }
 
+// buildProposalReadyMsg carries the LLM-generated patch for a regular
+// FILE_MUTATE/GIT_ACTION build task back to the Update loop. The engine does
+// NOT apply the patch — it freezes the pipeline in StateAwaitingApproval and
+// renders a diff proposal for explicit human authorization before any disk
+// write occurs.
+type buildProposalReadyMsg struct {
+	Task   *plan.Task
+	Patch  *execution.Patch
+	Diff   string
+	Output string // raw LLM response text for proposal extraction
+	Err    error
+}
+
 // hotfixProposalMsg carries the LLM-generated patch for a $hot hotfix back to
 // the Update loop. The engine does NOT apply it — it freezes the pipeline in
 // StateAwaitingApproval and renders a diff proposal for explicit authorization.

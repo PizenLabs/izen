@@ -10,7 +10,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -236,6 +238,180 @@ func TestComputeVpHeightWithProposalBlock(t *testing.T) {
 	if viewLines > m.height {
 		t.Errorf("View() output = %d lines, exceeds terminal height of %d — content clipped past boundary",
 			viewLines, m.height)
+	}
+}
+
+// ── Test 8-11: Alt-modifier enforcement — raw y/n/a must be NO-OP ──────
+//
+// These tests verify the unified Alt-modifier-only keybinding policy:
+// bare y/Y/a/A/n/N key presses MUST be silently ignored (return nil cmd,
+// no state transitions) across all approval gates.
+//
+// Rationale: single-character y/n/a clashed with Alt+ shortcuts in Tmux/
+// Ghostty and could accidentally catch buffer-leaked stdin during shell
+// execution, bypassing safety guardrails.
+// See https://github.com/PizenLabs/izen/issues/... for design discussion.
+
+func TestKeyYIsNoOpInProposalMode(t *testing.T) {
+	m := newTestModel()
+	m.state = StateAwaitingApproval
+	m.awaitingConfirmation = true
+	m.pendingProposals[0].Expanded = true
+
+	// Press raw 'y' (no Alt modifier) while proposals are pending
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m2 := newModel.(*model)
+
+	if m2.state != StateAwaitingApproval {
+		t.Errorf("raw 'y' changed state to %v, want StateAwaitingApproval (NO-OP)", m2.state)
+	}
+	if len(m2.pendingProposals) == 0 {
+		t.Error("raw 'y' cleared pendingProposals — should be NO-OP")
+	}
+	if cmd != nil {
+		t.Errorf("raw 'y' returned non-nil cmd — must be NO-OP (got %T)", cmd)
+	}
+}
+
+func TestKeyNIsNoOpInProposalMode(t *testing.T) {
+	m := newTestModel()
+	m.state = StateAwaitingApproval
+	m.awaitingConfirmation = true
+	m.pendingProposals[0].Expanded = true
+
+	// Press raw 'n' (no Alt modifier) while proposals are pending
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m2 := newModel.(*model)
+
+	if m2.state != StateAwaitingApproval {
+		t.Errorf("raw 'n' changed state to %v, want StateAwaitingApproval (NO-OP)", m2.state)
+	}
+	if len(m2.pendingProposals) == 0 {
+		t.Error("raw 'n' cleared pendingProposals — should be NO-OP")
+	}
+	if cmd != nil {
+		t.Errorf("raw 'n' returned non-nil cmd — must be NO-OP (got %T)", cmd)
+	}
+}
+
+func TestKeyYIsNoOpInBuildApproval(t *testing.T) {
+	m := newTestModel()
+	m.pendingProposals = nil
+	m.state = StateAwaitingApproval
+	m.pendingBuildApproval = true
+	m.pendingBuildTask = &plan.Task{StepNum: 1, Type: "SHELL_EXEC", Target: "go vet ./..."}
+
+	// Press raw 'y' (no Alt modifier) during SHELL_EXEC approval
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m2 := newModel.(*model)
+
+	if !m2.pendingBuildApproval {
+		t.Error("raw 'y' cleared pendingBuildApproval — should be NO-OP")
+	}
+	if m2.state != StateAwaitingApproval {
+		t.Errorf("raw 'y' changed state to %v, want StateAwaitingApproval (NO-OP)", m2.state)
+	}
+	if cmd != nil {
+		t.Errorf("raw 'y' returned non-nil cmd — must be NO-OP (got %T)", cmd)
+	}
+}
+
+func TestKeyNIsNoOpInBuildApproval(t *testing.T) {
+	m := newTestModel()
+	m.pendingProposals = nil
+	m.state = StateAwaitingApproval
+	m.pendingBuildApproval = true
+	m.pendingBuildTask = &plan.Task{StepNum: 1, Type: "SHELL_EXEC", Target: "go vet ./..."}
+
+	// Press raw 'n' (no Alt modifier) during SHELL_EXEC approval
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m2 := newModel.(*model)
+
+	if !m2.pendingBuildApproval {
+		t.Error("raw 'n' cleared pendingBuildApproval — should be NO-OP")
+	}
+	if m2.state != StateAwaitingApproval {
+		t.Errorf("raw 'n' changed state to %v, want StateAwaitingApproval (NO-OP)", m2.state)
+	}
+	if cmd != nil {
+		t.Errorf("raw 'n' returned non-nil cmd — must be NO-OP (got %T)", cmd)
+	}
+}
+
+func TestKeyAIsNoOpInBuildApproval(t *testing.T) {
+	m := newTestModel()
+	m.pendingProposals = nil
+	m.state = StateAwaitingApproval
+	m.pendingBuildApproval = true
+	m.pendingBuildTask = &plan.Task{StepNum: 1, Type: "SHELL_EXEC", Target: "go vet ./..."}
+
+	// Press raw 'a' (no Alt modifier, used to mean "Allow Always") during SHELL_EXEC approval
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m2 := newModel.(*model)
+
+	if m2.pendingBuildAllowAlways {
+		t.Error("raw 'a' set pendingBuildAllowAlways — should be NO-OP")
+	}
+	if !m2.pendingBuildApproval {
+		t.Error("raw 'a' cleared pendingBuildApproval — should be NO-OP")
+	}
+	if cmd != nil {
+		t.Errorf("raw 'a' returned non-nil cmd — must be NO-OP (got %T)", cmd)
+	}
+}
+
+func TestKeyAIsNoOpInHotfixApproval(t *testing.T) {
+	m := newTestModel()
+	m.pendingProposals = nil
+	m.state = StateAwaitingApproval
+	m.pendingHotfixTask = &plan.Task{StepNum: 1, Type: "FILE", Target: "fix.go"}
+	m.pendingHotfixPatch = &execution.Patch{File: "fix.go"}
+
+	// Press raw 'a' (no Alt modifier) during hotfix approval
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m2 := newModel.(*model)
+
+	if m2.pendingHotfixTask == nil {
+		t.Error("raw 'a' cleared pendingHotfixTask — should be NO-OP")
+	}
+	if m2.state != StateAwaitingApproval {
+		t.Errorf("raw 'a' changed state to %v, want StateAwaitingApproval (NO-OP)", m2.state)
+	}
+	if cmd != nil {
+		t.Errorf("raw 'a' returned non-nil cmd — must be NO-OP (got %T)", cmd)
+	}
+}
+
+func TestAltAStillWorksInProposalMode(t *testing.T) {
+	m := newTestModel()
+
+	// Press Alt+A — must still accept and transition to StateProcessing
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}, Alt: true})
+	m2 := newModel.(*model)
+
+	if m2.state != StateProcessing {
+		t.Errorf("Alt+A: state = %v, want StateProcessing", m2.state)
+	}
+	if cmd == nil {
+		t.Fatal("Alt+A: cmd is nil — applySingleProposal not triggered")
+	}
+}
+
+func TestAltRStillWorksInProposalMode(t *testing.T) {
+	m := newTestModel()
+
+	// Press Alt+R — must still reject and return to chat
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}, Alt: true})
+	m2 := newModel.(*model)
+
+	if m2.state != StateChat {
+		t.Errorf("Alt+R: state = %v, want StateChat", m2.state)
+	}
+	if len(m2.pendingProposals) != 0 {
+		t.Errorf("Alt+R: %d pending proposals remain, want 0", len(m2.pendingProposals))
+	}
+	if !m2.ti.Focused() {
+		t.Error("Alt+R: textinput should be focused after rejection")
 	}
 }
 
