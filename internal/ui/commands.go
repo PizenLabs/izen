@@ -1464,12 +1464,20 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 	// leak across the boundary. The same ledger is mirrored into the session
 	// record and persisted to .izen/session.json for full durability.
 	//
-	// CRITICAL: Preserve Diagnostics from investigation when transitioning to /plan.
-	// The investigation findings must survive the mode transition so the plan engine
-	// receives the forensic context needed for structured analysis.
+	// CRITICAL: Preserve Diagnostics AND Packets from investigation when
+	// transitioning to /plan. The investigation findings must survive the mode
+	// transition so the plan engine receives the forensic context needed for
+	// structured analysis. The Packets carry the ID-addressed analytical units
+	// (targets, evidence, root cause) that the plan engine's pre-processors
+	// (canonical mismatch, undefined symbol) scan deterministically.
 	prevDiagnostics := ""
+	var prevPackets []session.LedgerPacket
 	if m.sess != nil && m.sess.ContextLedger != nil {
 		prevDiagnostics = m.sess.ContextLedger.Diagnostics
+		if len(m.sess.ContextLedger.Packets) > 0 {
+			prevPackets = make([]session.LedgerPacket, len(m.sess.ContextLedger.Packets))
+			copy(prevPackets, m.sess.ContextLedger.Packets)
+		}
 	}
 
 	ledger := session.NewContextLedger(targetMode)
@@ -1480,6 +1488,15 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 		// its baseline context without manual copy-pasting.
 		if prevDiagnostics != "" && (targetMode == modes.ModePlan || targetMode == modes.ModeInvestigate) {
 			ledger.Diagnostics = prevDiagnostics
+		}
+		// Re-inject the sequential, ID-addressed analytical packets from the
+		// previous ledger. These carry the forensic findings (targets, evidence,
+		// root cause, conclusion) that the downstream mode reads via
+		// FormatPacketsForPlan. InjectPacket assigns monotonic IDs starting from
+		// the new ledger's existing (empty) packet index, ensuring every packet
+		// survives the transition with its full payload intact.
+		for _, p := range prevPackets {
+			ledger.InjectPacket(p)
 		}
 		ledger.Tasks = nil
 		for _, t := range m.sess.CurrentTasks {

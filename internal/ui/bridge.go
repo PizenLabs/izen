@@ -39,12 +39,15 @@ func (m *model) bridgeInvestigationToLedger(ledgerContent string, engErr error) 
 	// Developer retains addressable state across the transition. The findings
 	// arrive via the investigate engine's structured ledger, projected through
 	// ToPackets; InjectPacket assigns the monotonic PacketIDs.
+	//
+	// IMPORTANT: The formatted ledgerContent (FormatForPlan output) is set as
+	// the primary Diagnostics field above. The raw engine diagnostics are
+	// captured in the root_cause and diagnostic packets but MUST NOT overwrite
+	// the formatted primary content, which carries the full structured analysis
+	// (problem, targets, root cause, conclusion) that /plan consumes.
 	if m.lastInvestigateLedger != nil {
 		for _, p := range m.lastInvestigateLedger.ToPackets() {
 			ledger.InjectPacket(p)
-		}
-		if m.lastInvestigateLedger.Diagnostics != "" {
-			ledger.Diagnostics = m.lastInvestigateLedger.Diagnostics
 		}
 	}
 

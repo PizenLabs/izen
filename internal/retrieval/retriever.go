@@ -127,6 +127,30 @@ func (q Query) String() string {
 	return strings.Join(parts, " ")
 }
 
+// confidenceThresholdReached returns true when the result set's BM25 relevance
+// is sufficient to stop tier progression. This provides proper score gating:
+//
+//   - Graph exact (Confidence >= 1.0): always trust, stop tiers
+//   - BM25 Score >= 0.7: high confidence, stop tiers
+//   - BM25 Score < 0.3 (or zero): continue to fallback tiers
+func confidenceThresholdReached(rs *ResultSet) bool {
+	if rs == nil || rs.Empty() {
+		return false
+	}
+	if rs.Confidence >= ConfExact.Float64() {
+		return true
+	}
+	best := rs.Best()
+	if best == nil {
+		return false
+	}
+	effScore := best.Score
+	if effScore == 0 {
+		effScore = best.Confidence
+	}
+	return effScore >= 0.7
+}
+
 func (r *Retriever) Retrieve(query Query) *ResultSet {
 	start := time.Now()
 
@@ -136,6 +160,9 @@ func (r *Retriever) Retrieve(query Query) *ResultSet {
 	for _, tier := range r.tiers {
 		rs := r.executeTier(tier, query)
 		if rs == nil || rs.Empty() {
+			if rs != nil && rs.Error != "" && globalActivityLog != nil {
+				globalActivityLog("[lx] tier %s error: %s", tier, rs.Error)
+			}
 			continue
 		}
 
@@ -143,8 +170,19 @@ func (r *Retriever) Retrieve(query Query) *ResultSet {
 		usedTiers = append(usedTiers, string(tier))
 		result.Strategy = strings.Join(usedTiers, " → ")
 
-		if rs.Confidence >= ConfExact.Float64() {
+		if confidenceThresholdReached(rs) {
+			best := rs.Best()
+			if best != nil && globalActivityLog != nil {
+				effScore := best.Score
+				if effScore == 0 {
+					effScore = best.Confidence
+				}
+				globalActivityLog("[retrieval] tier %s confidence %.3f >= 0.7 — stopping tier progression", tier, effScore)
+			}
 			break
+		}
+		if globalActivityLog != nil {
+			globalActivityLog("[retrieval] tier %s confidence below 0.7 — continuing to next tier", tier)
 		}
 	}
 

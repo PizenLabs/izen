@@ -152,79 +152,58 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		}
 	}
 
-	// ── UNDEFINED SYMBOL (stdlib case correction / lx coordinate handshake)
+	// ── UNDEFINED SYMBOL (instant fast-path, zero LLM/lx) ─────────
 	//
 	// Phase 1 — Standard Library Case-Sensitivity Check
-	// When the symbol is a capitalized version of a stdlib package name
-	// (e.g., "Log" → "log"), generate a deterministic FILE_EDIT to fix the
-	// case and add the import. This requires no lx daemon and no LLM call.
-	// The target path is sanitized (stripped of :line:col suffixes) and
-	// verified to exist before being assigned to the task.
+	// If the symbol is a capitalized stdlib package name (e.g., "Log" → "log"),
+	// generate a deterministic FILE_EDIT with STDLIB solution format.
 	//
-	// HARDENING: SHELL_EXEC tasks are NEVER generated for undefined symbol
-	// errors — they would trigger a hallucinated go mod tidy that the Build
-	// security guardrails would block, creating a false error loop.
+	// Phase 2 — Deterministic fallback (zero external calls)
+	// For non-stdlib or unresolvable symbol errors, construct a FILE_MUTATE
+	// task directly from the error coordinates. No lx daemon, no LLM — the
+	// error file/line/symbol already carries the exact fix location.
 	//
-	// Phase 2 — lx coordinate handshake
-	// When no stdlib match is found, use lx resolve/related to locate the
-	// symbol definition and the error context. Generate FILE_EDIT at the
-	// error location only (no SHELL_EXEC).
+	// CRITICAL: Both paths complete in < 1ms. The LLM synthesis retry loop
+	// and lx daemon handshake are NEVER reached for undefined symbol errors.
 	if !fastTrack && HasUndefinedSymbolError(ledgerContent) {
 		undef := retrieval.ParseUndefinedSymbol(ledgerContent)
 		if undef != nil && undef.Symbol != "" {
-			// Phase 1: Check standard library case-sensitivity correction.
-			if pkgName, importPath, matched := retrieval.CheckStdlibCaseCorrection(undef.Symbol); matched {
-				sanitizedTarget, err := retrieval.SanitizeTargetPath(undef.File)
-				if err != nil {
-					// File not found — skip stdlib interceptor, fall through to LLM.
-					// No error return needed; the LLM will handle diagnostics.
-				} else {
-					desc := fmt.Sprintf("Fix %q at %s:%d: replace %q with %q and add import %q",
-						undef.Symbol, sanitizedTarget, undef.Line, undef.Symbol, pkgName, importPath)
-					tasks := []Task{
-						{
-							StepNum:     1,
-							IsDone:      false,
-							Status:      "idle",
-							Type:        "FILE_MUTATE",
-							Target:      sanitizedTarget,
-							Description: desc,
-							Rationale:   fmt.Sprintf("Undefined symbol %q is a capitalized stdlib package name — correct to %q.", undef.Symbol, pkgName),
-							Solution:    fmt.Sprintf("STDLIB:%s:%s:%s", undef.Symbol, pkgName, importPath),
-							IsHardcoded: true,
-						},
-					}
-					return tasks, nil
-				}
+			sanitizedTarget, _ := retrieval.SanitizeTargetPath(undef.File)
+			if sanitizedTarget == "" {
+				sanitizedTarget = undef.File
 			}
 
-			// Phase 2: lx coordinate handshake for non-stdlib undefined symbols.
-			resolver := retrieval.NewLXCoordinateResolver()
-			if resolver != nil {
-				//nolint:contextcheck // lynx controller API predates context propagation
-				refs, err := resolver.ResolveUndefinedSymbol(undef)
-				if err == nil && len(refs) > 0 {
-					// Sanitize the target path before creating tasks.
-					lxTarget, sanitizeErr := retrieval.SanitizeTargetPath(undef.File)
-					if sanitizeErr != nil {
-						lxTarget = undef.File
-					}
-					tasks := []Task{
-						{
-							StepNum:     1,
-							IsDone:      false,
-							Status:      "idle",
-							Type:        "FILE_MUTATE",
-							Target:      lxTarget,
-							Description: fmt.Sprintf("Fix undefined symbol %q at %s:%d", undef.Symbol, lxTarget, undef.Line),
-							Rationale:   fmt.Sprintf("Undefined symbol %q resolved by lx — symbol defined at %s:%d", undef.Symbol, refs[0].File, refs[0].StartLine),
-							Solution:    fmt.Sprintf("Added import/corrected symbol %q in %s", undef.Symbol, lxTarget),
-							IsHardcoded: true,
-						},
-					}
-					return tasks, nil
-				}
+			// Phase 1: Standard library case-sensitivity correction.
+			if pkgName, importPath, matched := retrieval.CheckStdlibCaseCorrection(undef.Symbol); matched {
+				return []Task{
+					{
+						StepNum:     1,
+						IsDone:      false,
+						Status:      "idle",
+						Type:        "FILE_MUTATE",
+						Target:      sanitizedTarget,
+						Description: fmt.Sprintf("Fix %q at %s:%d: replace %q with %q and add import %q", undef.Symbol, sanitizedTarget, undef.Line, undef.Symbol, pkgName, importPath),
+						Rationale:   fmt.Sprintf("Undefined symbol %q is a capitalized stdlib package name — correct to %q.", undef.Symbol, pkgName),
+						Solution:    fmt.Sprintf("STDLIB:%s:%s:%s", undef.Symbol, pkgName, importPath),
+						IsHardcoded: true,
+					},
+				}, nil
 			}
+
+			// Phase 2: Deterministic fallback — no lx, no LLM.
+			return []Task{
+				{
+					StepNum:     1,
+					IsDone:      false,
+					Status:      "idle",
+					Type:        "FILE_MUTATE",
+					Target:      sanitizedTarget,
+					Description: fmt.Sprintf("Fix undefined symbol %q at %s:%d", undef.Symbol, sanitizedTarget, undef.Line),
+					Rationale:   fmt.Sprintf("Undefined symbol %q at %s:%d — requires import or definition", undef.Symbol, sanitizedTarget, undef.Line),
+					Solution:    fmt.Sprintf("Fix undefined symbol %q in %s", undef.Symbol, sanitizedTarget),
+					IsHardcoded: true,
+				},
+			}, nil
 		}
 	}
 
@@ -316,6 +295,16 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		}
 	}
 
+	// UNDEFINED SYMBOL GUARDRAIL: When the ledger contains an undefined symbol
+	// error, explicitly instruct the LLM to generate ONLY file modification tasks.
+	// Shell execution commands like go mod tidy are NEVER valid for code typos.
+	if !fastTrack && HasUndefinedSymbolError(ledgerContent) {
+		req.Messages[len(req.Messages)-1].Content += `
+
+[SYSTEM: UNDEFINED SYMBOL ERROR — CODE FIX ONLY]
+The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DEPS or shell execution tasks like go mod tidy. Generate ONLY a FILE_MUTATE / CODE_MOD task targeting the source file containing the error. No SHELL_EXEC, no environment setup, no dependency installation.`
+	}
+
 	resp, err := e.provider(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("plan engine: provider call failed: %w", err)
@@ -392,6 +381,11 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			// pkg/util/logs/log.go) for a trivial stdlib case fix.
 			candidates = FilterUnsolicitedPkgFiles(candidates, ledgerContent)
 
+			// Strip SHELL_EXEC/GIT_ACTION tasks when the error is an undefined
+			// symbol. The LLM may hallucinate go mod tidy for what is actually
+			// a code typo — this ensures only FILE_MUTATE tasks survive.
+			candidates = FilterUndefinedSymbolShellExec(candidates, ledgerContent)
+
 			if len(candidates) > 0 {
 				if !hasInvalidShellExecCommand(candidates) {
 					// All checks passed — return with compile-error enforcement.
@@ -417,11 +411,14 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		}
 	}
 
-	// ── EMERGENCY DETERMINISTIC FALLBACK ──────────────────────────
+	// ── EMERGENCY FALLBACK ────────────────────────────────────────
 	// All 3 LLM synthesis attempts (initial + 2 retries) failed to produce a
-	// valid JSON plan. Build a deterministic go get / go mod tidy task from
-	// the forensic ledger conclusion instead of returning a hard error or
-	// forcing a manual /investigate loop.
+	// valid JSON plan. Try to extract a dependency from the conclusion for a
+	// go get task; if no dependency is found, return a hard error instead of
+	// hallucinating shell commands like go mod tidy.
+	if HasUndefinedSymbolError(ledgerContent) {
+		return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed for undefined symbol error — could not determine correct code fix", maxSilentRetries+1)
+	}
 	if IsCompilationOrDependencyError(problem) || IsCompilationOrDependencyError(ledgerContent) {
 		conclusion := ExtractConclusionFromLedger(ledgerContent)
 		if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
@@ -437,39 +434,12 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 				},
 			}, nil
 		}
-		return []Task{
-			{
-				StepNum:     1,
-				IsDone:      false,
-				Status:      "idle",
-				Type:        "SHELL_EXEC",
-				Target:      "go mod tidy",
-				Description: "Emergency fallback: all LLM synthesis attempts exhausted",
-				IsHardcoded: true,
-			},
-		}, nil
+		return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed — no valid shell command could be derived", maxSilentRetries+1)
 	}
 
-	// ── ABSOLUTE FALLBACK ENFORCER (No Turning Back) ─────────────
-	// If we exhausted all silent retries yet the ledger still carries a raw
-	// *.go file path with a parsing/import error indicator, we MUST NOT bubble
-	// a hard failure up to the UI that forces the user to re-run /investigate
-	// manually. A raw compile error on a source file is, by definition, a
-	// module/environment discrepancy — assume it and stage `go mod tidy`
-	// deterministically, with a warning logged for traceability.
+	// ── ABSOLUTE FALLBACK ────────────────────────────────────────
 	if hasGoFileParseError(ledgerContent) || hasGoFileParseError(problem) {
-		fmt.Printf("[plan-fallback] Truncated dependency match hit. Injecting deterministic go mod tidy task.\n")
-		return []Task{
-			{
-				StepNum:     1,
-				IsDone:      false,
-				Status:      "idle",
-				Type:        "SHELL_EXEC",
-				Target:      "go mod tidy",
-				Description: "Emergency fallback: all LLM synthesis attempts exhausted; raw *.go parse/import error detected",
-				IsHardcoded: true,
-			},
-		}, nil
+		return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts exhausted for compile error — no valid tasks could be synthesized", maxSilentRetries+1)
 	}
 
 	return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed and no dependency error detected", maxSilentRetries+1)
@@ -598,6 +568,37 @@ func FilterUnsolicitedPkgFiles(tasks []Task, ledgerContent string) []Task {
 		if !rejected {
 			filtered = append(filtered, t)
 		}
+	}
+	return filtered
+}
+
+// FilterUndefinedSymbolShellExec removes SHELL_EXEC and GIT_ACTION tasks
+// when the primary error is an undefined symbol. The LLM may hallucinate
+// go mod tidy for code typos; this filter ensures only FILE_MUTATE tasks
+// survive. Hardcoded tasks (from lx resolution) are preserved.
+// Returns the original slice unchanged if no undefined symbol error is detected
+// or if no tasks need filtering. If all non-hardcoded tasks are removed,
+// returns empty slice so the retry loop can re-prompt the LLM.
+func FilterUndefinedSymbolShellExec(tasks []Task, ledgerContent string) []Task {
+	if len(tasks) == 0 || ledgerContent == "" {
+		return tasks
+	}
+	if !HasUndefinedSymbolError(ledgerContent) {
+		return tasks
+	}
+	filtered := make([]Task, 0, len(tasks))
+	for _, t := range tasks {
+		if t.IsHardcoded {
+			filtered = append(filtered, t)
+			continue
+		}
+		if t.Type == "SHELL_EXEC" || t.Type == "GIT_ACTION" {
+			continue
+		}
+		filtered = append(filtered, t)
+	}
+	if len(filtered) == 0 && len(tasks) > 0 {
+		return filtered
 	}
 	return filtered
 }

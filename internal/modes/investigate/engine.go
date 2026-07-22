@@ -374,8 +374,15 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 		}
 
 		// Strict fallback: drop this path, never retry the broken token.
-		forensicLog("[orchestrator] %s failed — strict fallback (silent)", current)
-		current = nextFallback(current)
+		// Log explicitly which tool failed and which fallback is next so the
+		// operator sees the chain (violates "silent" — principle 2: Explicit Over Implicit).
+		next := nextFallback(current)
+		if next != "" {
+			forensicLog("[orchestrator] %s failed → falling back to %s", current, next)
+		} else {
+			forensicLog("[orchestrator] %s failed → chain exhausted (terminal)", current)
+		}
+		current = next
 	}
 
 	// If we exhausted the chain without a success, still surface whatever the
@@ -408,10 +415,12 @@ func (e *Engine) logToolOutcome(tool Tool, res ToolResult) {
 			forensicLog("[orchestrator] %s succeeded (evidence=%d, max_BM25=%.3f)",
 				tool, len(res.Evidence), maxScore)
 			if maxScore < 0.3 {
-				forensicLog("[lx] low relevance score (%.3f) for target %q", maxScore, res.Target)
+				forensicLog("[lx] BM25=%.3f BELOW THRESHOLD (0.3) for target %q — context may be insufficient for /plan synthesis", maxScore, res.Target)
+			} else {
+				forensicLog("[lx] BM25=%.3f >= 0.3 for target %q — passing structured context to /plan", maxScore, res.Target)
 			}
 		} else {
-			forensicLog("[orchestrator] %s succeeded (evidence=%d)",
+			forensicLog("[orchestrator] %s succeeded (evidence=%d, BM25=0)",
 				tool, len(res.Evidence))
 		}
 	} else {

@@ -565,6 +565,47 @@ func TestQueryOrdering(t *testing.T) {
 	}
 }
 
+func TestConfidenceThreshold_GraphExactStopsTiers(t *testing.T) {
+	rs := &ResultSet{Confidence: ConfExact.Float64()}
+	rs.Add(Result{File: "a.go", Confidence: 1.0, Score: 0, Strategy: "graph.exact"})
+	if !confidenceThresholdReached(rs) {
+		t.Error("graph exact confidence should stop tiers")
+	}
+}
+
+func TestConfidenceThreshold_LXHighScoreStopsTiers(t *testing.T) {
+	rs := &ResultSet{Confidence: 0.85}
+	rs.Add(Result{File: "a.go", Confidence: 0.85, Score: 0.85, Strategy: "lynx.semantic"})
+	if !confidenceThresholdReached(rs) {
+		t.Error("LX BM25 score 0.85 should stop tiers")
+	}
+}
+
+func TestConfidenceThreshold_LXLowScoreContinuesTiers(t *testing.T) {
+	rs := &ResultSet{Confidence: 0.25}
+	rs.Add(Result{File: "a.go", Confidence: 0.25, Score: 0.25, Strategy: "lynx.semantic"})
+	if confidenceThresholdReached(rs) {
+		t.Error("LX BM25 score 0.25 should NOT stop tiers")
+	}
+}
+
+func TestConfidenceThreshold_LXBarelyAboveThreshold(t *testing.T) {
+	rs := &ResultSet{Confidence: 0.69}
+	rs.Add(Result{File: "a.go", Confidence: 0.69, Score: 0.69, Strategy: "lynx.semantic"})
+	if confidenceThresholdReached(rs) {
+		t.Error("LX BM25 score 0.69 (< 0.7 threshold) should NOT stop tiers")
+	}
+}
+
+func TestConfidenceThreshold_EmptyNil(t *testing.T) {
+	if confidenceThresholdReached(nil) {
+		t.Error("nil result set should not stop tiers")
+	}
+	if confidenceThresholdReached(&ResultSet{}) {
+		t.Error("empty result set should not stop tiers")
+	}
+}
+
 func TestSanitizeTargetPath_StripsLineCol(t *testing.T) {
 	// Use the current file as a known-good target (always exists).
 	self := "retrieval_test.go"

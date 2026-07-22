@@ -261,16 +261,31 @@ func (r *ToolRunner) runLX(ctx context.Context, target string) ToolResult {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## LX lookup: %s\n", target)
 	for _, res := range collected {
-		evidence = append(evidence, Evidence{
-			Source:     EvSourceGraph,
-			Content:    res.Content,
-			File:       res.File,
-			Line:       res.Line,
-			Confidence: res.Confidence,
-		})
-		fmt.Fprintf(&b, "  %s:%d %s\n", res.File, res.Line, res.Content)
+		effScore := res.Score
+		if effScore == 0 {
+			effScore = res.Confidence
+		}
+		// Score gate: only include evidence with BM25 >= 0.3.
+		// Low-relevance LX results (< 0.3) are logged at the retriever layer
+		// but excluded from evidence to prevent hallucinated context injection.
+		// They are still included in the diagnostic text builder.
+		if effScore >= 0.3 {
+			evidence = append(evidence, Evidence{
+				Source:     EvSourceGraph,
+				Content:    res.Content,
+				File:       res.File,
+				Line:       res.Line,
+				Confidence: effScore,
+			})
+		}
+		fmt.Fprintf(&b, "  %s:%d [score=%.3f] %s\n", res.File, res.Line, effScore, res.Content)
 	}
 	if len(collected) == 0 {
+		forensicLog("[lx] zero results for target %q — strict fallback to deterministic search (AST/Grep)", target)
+		return ToolResult{Tool: ToolLX, Target: target, Ok: false}
+	}
+	if len(evidence) == 0 {
+		forensicLog("[lx] all %d result(s) had BM25 < 0.3 for target %q — strict fallback to deterministic search (AST/Grep)", len(collected), target)
 		return ToolResult{Tool: ToolLX, Target: target, Ok: false}
 	}
 	return ToolResult{Tool: ToolLX, Target: target, Content: b.String(), Ok: true, Evidence: evidence}

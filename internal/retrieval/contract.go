@@ -79,6 +79,7 @@ func (r LxResult) ToLegacyResult() Result {
 		Column:     r.Column,
 		Content:    r.Content,
 		Confidence: confidence,
+		Score:      r.Score,
 		Strategy:   r.Strategy,
 		SymbolName: r.SymbolName,
 		SymbolKind: r.SymbolKind,
