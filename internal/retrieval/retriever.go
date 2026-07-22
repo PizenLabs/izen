@@ -257,21 +257,34 @@ func (r *Retriever) executeLynxSearch(query Query) *ResultSet {
 		Strategy:   "lynx.semantic",
 		Confidence: ConfSemantic.Float64(),
 	}
+	maxScore := 0.0
 	for _, rr := range rawResults {
-		rs.Add(Score(ConfSemantic, Result{
+		score := rr.Score
+		if score > maxScore {
+			maxScore = score
+		}
+		rs.Add(Result{
 			File:       rr.FilePath,
 			Line:       rr.StartLine,
 			Content:    rr.Content,
 			Strategy:   "lynx.semantic",
 			SymbolName: rr.SymbolName,
-		}))
+			Score:      score,
+			Confidence: score,
+		})
 	}
 	if !rs.Empty() {
-		rs.Confidence = ConfSemantic.Float64()
+		rs.Confidence = maxScore
 	}
 
-	if globalActivityLog != nil && !rs.Empty() {
-		globalActivityLog("[ OK ] lx --search %q: %d results", query.Text, len(rs.Results))
+	if globalActivityLog != nil {
+		if !rs.Empty() {
+			globalActivityLog("[ OK ] lx --search %q: %d results (max BM25=%.3f)", query.Text, len(rs.Results), maxScore)
+		}
+		// Contract invariant: log low-relevance scores explicitly.
+		if rs.Empty() || maxScore < 0.3 {
+			globalActivityLog("[lx] low relevance score (%.3f) for query %q", maxScore, query.Text)
+		}
 	}
 
 	return rs
@@ -298,22 +311,36 @@ func (r *Retriever) executeLynxResolve(query Query) *ResultSet {
 		Strategy:   "lynx.resolve",
 		Confidence: ConfFuzzy.Float64(),
 	}
+	maxScore := 0.0
 	for _, rr := range rawResults {
-		rs.Add(Score(ConfFuzzy, Result{
+		score := rr.Score
+		if score > maxScore {
+			maxScore = score
+		}
+		rs.Add(Result{
 			File:       rr.FilePath,
 			Line:       rr.StartLine,
 			Strategy:   "lynx.resolve",
 			SymbolName: query.Symbol,
 			Content:    rr.Content,
-		}))
+			Score:      score,
+			Confidence: score,
+		})
 	}
 	if !rs.Empty() {
-		rs.Confidence = ConfFuzzy.Float64()
+		rs.Confidence = maxScore
 	}
 
-	if globalActivityLog != nil && !rs.Empty() {
-		globalActivityLog("[ OK ] lx --resolve %q: %d results", query.Symbol, len(rs.Results))
+	if globalActivityLog != nil {
+		if !rs.Empty() {
+			globalActivityLog("[ OK ] lx --resolve %q: %d results (max BM25=%.3f)", query.Symbol, len(rs.Results), maxScore)
+		}
+		// Contract invariant: log low-relevance scores explicitly.
+		if rs.Empty() || maxScore < 0.3 {
+			globalActivityLog("[lx] low relevance score (%.3f) for resolve %q", maxScore, query.Symbol)
+		}
 	}
+
 	return rs
 }
 

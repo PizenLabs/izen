@@ -50,6 +50,7 @@ func adaptResultSet(rs *retrieval.ResultSet) []SearchResult {
 			Strategy:   r.Strategy,
 			SymbolName: r.SymbolName,
 			SymbolKind: r.SymbolKind,
+			Score:      r.Score,
 		})
 	}
 	return out

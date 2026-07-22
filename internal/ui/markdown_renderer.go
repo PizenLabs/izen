@@ -2,6 +2,7 @@ package ui
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
@@ -149,7 +150,7 @@ func renderHeading(node *ast.Heading, width int, source []byte) string {
 		styledText = mdH4Style.Render(headingText)
 	}
 
-	separator := strings.Repeat("─", len(headingText))
+	separator := strings.Repeat("─", utf8.RuneCountInString(headingText))
 	styledSeparator := mdMutedStyle.Render(separator)
 
 	return styledText + "\n" + styledSeparator
@@ -510,8 +511,9 @@ func renderASTTable(node *goldmarkext.Table, width int, source []byte) string {
 				continue
 			}
 			content := cellText(cell)
-			if len(content) > colWidths[colIdx] {
-				colWidths[colIdx] = len(content)
+			cw := utf8.RuneCountInString(content)
+			if cw > colWidths[colIdx] {
+				colWidths[colIdx] = cw
 			}
 		}
 	}
@@ -552,7 +554,7 @@ func renderASTTable(node *goldmarkext.Table, width int, source []byte) string {
 			var padded string
 			switch align {
 			case goldmarkext.AlignRight:
-				extra := colWidths[colIdx] - len(content)
+				extra := colWidths[colIdx] - utf8.RuneCountInString(content)
 				if extra < 0 {
 					extra = 0
 				}
@@ -604,7 +606,7 @@ func wrapMText(text string, width int) []string {
 			switch {
 			case currentLine.Len() == 0:
 				currentLine.WriteString(word)
-			case currentLine.Len()+1+len(word) <= width:
+			case currentLine.Len()+1+utf8.RuneCountInString(word) <= width:
 				currentLine.WriteString(" ")
 				currentLine.WriteString(word)
 			default:
@@ -623,8 +625,9 @@ func wrapMText(text string, width int) []string {
 
 // padMRight pads string s on the right with spaces to the given width
 func padMRight(s string, width int) string {
-	if len(s) >= width {
+	rw := utf8.RuneCountInString(s)
+	if rw >= width {
 		return s
 	}
-	return s + strings.Repeat(" ", width-len(s))
+	return s + strings.Repeat(" ", width-rw)
 }

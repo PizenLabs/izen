@@ -175,7 +175,24 @@ func (l *ContextLedger) Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(l.path, data, 0644)
+
+	// Open with O_SYNC so each write is flushed to disk synchronously,
+	// preventing a race where a consumer (e.g. /plan) reads a partially
+	// flushed ledger and falls back to stale/stale-state behaviour.
+	f, err := os.OpenFile(l.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|os.O_SYNC, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	// Belt-and-suspenders: force the OS buffer to disk before returning.
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // Invalidate erases all handoff state by overwriting the ledger with a fresh

@@ -697,3 +697,36 @@ func TestValidateAllTasks_AllValid(t *testing.T) {
 		t.Fatalf("expected no error for valid tasks, got: %v", err)
 	}
 }
+
+func TestDependencyFromConclusion_InlineSemicolonMarkdownLink(t *testing.T) {
+	// Bug repro: blocker appended inline behind a semicolon and wrapped in a
+	// markdown link (visually clipped package path before it).
+	conclusion := "cmd/api/main.go:7:2: no required module provides package g...; ## REMOTE DEPENDENCY BLOCKER (lx bypassed): [github.com/docker/docker/client](https://github.com/docker/docker/client)"
+	dep := dependencyFromConclusion(conclusion)
+	if dep != "github.com/docker/docker/client" {
+		t.Fatalf("expected github.com/docker/docker/client, got %q", dep)
+	}
+}
+
+func TestDependencyFromConclusion_PlainInline(t *testing.T) {
+	conclusion := "blocker detected; ## REMOTE DEPENDENCY BLOCKER (lx bypassed): github.com/moby/moby/client\nrest of line"
+	dep := dependencyFromConclusion(conclusion)
+	if dep != "github.com/moby/moby/client" {
+		t.Fatalf("expected github.com/moby/moby/client, got %q", dep)
+	}
+}
+
+func TestDependencyFromConclusion_ClippedFallsBackToURL(t *testing.T) {
+	// Clipped fragment inside the link must be recovered from the URL.
+	conclusion := "## REMOTE DEPENDENCY BLOCKER (lx bypassed): [g...](https://github.com/docker/docker/client)"
+	dep := dependencyFromConclusion(conclusion)
+	if dep != "github.com/docker/docker/client" {
+		t.Fatalf("expected github.com/docker/docker/client, got %q", dep)
+	}
+}
+
+func TestDependencyFromConclusion_NoBlocker(t *testing.T) {
+	if dep := dependencyFromConclusion("nothing here"); dep != "" {
+		t.Fatalf("expected empty, got %q", dep)
+	}
+}

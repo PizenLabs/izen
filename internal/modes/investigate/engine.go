@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
 // forensicLog is the activity sink for /investigate. It defaults to the
@@ -83,6 +84,9 @@ type SearchResult struct {
 	Strategy   string  `json:"strategy"`
 	SymbolName string  `json:"symbol_name,omitempty"`
 	SymbolKind string  `json:"symbol_kind,omitempty"`
+	// Score is the raw BM25 relevance score from the LX Rust daemon.
+	// Populated only for LX-tier results; zero for other tiers.
+	Score float64 `json:"score,omitempty"`
 }
 
 func NewEngine(root, problem string, retriever Retriever, executor TestExecutor) *Engine {
@@ -121,6 +125,15 @@ func (e *Engine) Run() (*InvestigationResult, error) {
 
 func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 	e.runCtx = ctx
+
+	// Wipe stale conclusion caches from any prior (possibly broken) run so the
+	// plan handoff can never inherit leftover REMOTE DEPENDENCY BLOCKER tokens
+	// or other ghost state from a previous cycle.
+	e.Ledger.Conclusion = ""
+	if e.Result != nil {
+		e.Result.Conclusion = ""
+	}
+
 	result := &InvestigationResult{
 		Problem: e.Problem,
 	}
@@ -170,6 +183,15 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 			result.Conclusion = e.Result.Conclusion
 		}
 	}
+
+	// Inject the REMOTE DEPENDENCY BLOCKER token into every conclusion layer
+	// that FormatLedgerForPlan or downstream serializers may read. Each call
+	// scans raw e.Ledger.Diagnostics directly rather than relying on the
+	// high-level conclusion strings being already populated — this guarantees
+	// the blocker is inserted on the very first investigation pass.
+	injectDependencyBlocker(e, &e.Ledger.Conclusion)
+	injectDependencyBlocker(e, &e.Result.Conclusion)
+	injectDependencyBlocker(e, &result.Conclusion)
 
 	// MANDATORY FORENSIC EVIDENCE: /investigate MUST have actually executed the
 	// diagnostic toolchain (LX/graph search and/or the test shell) before it is
@@ -303,9 +325,12 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 	dctx, dcancel := boundedDispatchCtx(ctx)
 	defer dcancel()
 
+	// DispatchStrategy selects the tool but its Rationale field is NOT logged —
+	// it is a pre-decision classification label, not a verified fact.
+	// Actual outcomes are logged after execution below.
 	strategy := DispatchStrategy(dctx, e.provider, e.model, diagnostics)
-	dispatchLog("[orchestrator] strategy=%s target=%q rationale=%q",
-		strategy.Tool, strategy.Target, strategy.Rationale)
+	dispatchLog("[orchestrator] classify -> tool=%s target=%q",
+		strategy.Tool, strategy.Target)
 
 	runner := NewToolRunner(e.root, e.provider, e.model, e.retriever, diagnostics)
 
@@ -323,6 +348,15 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 		}
 	}
 
+	// Sanitize the target: strip any :line:col suffix from compiler error
+	// coordinates (e.g., "cmd/api/main.go:24" → "cmd/api/main.go") so the
+	// tool runner never attempts to open a file whose name includes ":24".
+	if target != "" {
+		if clean, _ := retrieval.SplitTargetPath(target); clean != "" {
+			target = clean
+		}
+	}
+
 	for current != "" && actions < MaxActionsPerRun {
 		actions++
 		dispatchLog("[orchestrator] action %d/%d -> %s (target=%q)",
@@ -331,6 +365,10 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 		res := runner.Run(dctx, current, target)
 		if res.Ok {
 			e.ingestToolResult(res)
+			// Log actual outcome based on tool + evidence.
+			// This is the ONLY place where outcome facts are recorded — no
+			// pre-decision rationales leak into the log.
+			e.logToolOutcome(current, res)
 			// The chosen tool succeeded — the chain is complete.
 			return
 		}
@@ -345,6 +383,40 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 	if current == ToolDiagnose {
 		res := runner.Run(dctx, ToolDiagnose, target)
 		e.ingestToolResult(res)
+		e.logToolOutcome(current, res)
+	}
+}
+
+// logToolOutcome logs the factual outcome of a forensic tool execution.
+// It uses deterministic fields from the ToolResult and Evidence — never
+// pre-decision rationales or hardcoded guesswork strings.
+func (e *Engine) logToolOutcome(tool Tool, res ToolResult) {
+	if !res.Ok {
+		forensicLog("[orchestrator] %s returned no results", tool)
+		return
+	}
+
+	// Extract BM25 scores from evidence for LX tool outcomes.
+	if tool == ToolLX {
+		maxScore := 0.0
+		for _, ev := range res.Evidence {
+			if ev.Confidence > maxScore {
+				maxScore = ev.Confidence
+			}
+		}
+		if maxScore > 0 {
+			forensicLog("[orchestrator] %s succeeded (evidence=%d, max_BM25=%.3f)",
+				tool, len(res.Evidence), maxScore)
+			if maxScore < 0.3 {
+				forensicLog("[lx] low relevance score (%.3f) for target %q", maxScore, res.Target)
+			}
+		} else {
+			forensicLog("[orchestrator] %s succeeded (evidence=%d)",
+				tool, len(res.Evidence))
+		}
+	} else {
+		forensicLog("[orchestrator] %s succeeded (evidence=%d)",
+			tool, len(res.Evidence))
 	}
 }
 
@@ -650,7 +722,6 @@ func (e *Engine) statePropose() error {
 		e.Ledger.SetConclusion(e.Result.Conclusion, false)
 	}
 
-	e.injectDependencyBlocker()
 	return e.State.Transition(StateDone)
 }
 
@@ -708,44 +779,58 @@ func (e *Engine) FormatLedgerForPlan() string {
 // extractPackageName extracts the Go module/package path from a Go compilation
 // error of the form "no required module provides package <PKG>".
 // Returns the fully-qualified package path or empty string.
+//
+// It also trims trailing characters like colons, commas, and semicolons that
+// may appear after the package path in compiler output.
 func extractPackageName(rawError string) string {
 	needle := "no required module provides package "
 	idx := strings.Index(rawError, needle)
 	if idx < 0 {
+		needle = "cannot find module providing package "
+		idx = strings.Index(rawError, needle)
+	}
+	if idx < 0 {
 		return ""
 	}
 	rest := rawError[idx+len(needle):]
-	end := strings.IndexAny(rest, " \t\n\r:")
+	end := strings.IndexAny(rest, " \t\n\r")
 	if end < 0 {
 		end = len(rest)
 	}
-	return strings.TrimSpace(rest[:end])
+	pkg := rest[:end]
+	// Trim common trailing punctuation (colon, comma, semicolon) that some
+	// Go compiler versions or build tools append after the package path.
+	pkg = strings.TrimRight(pkg, ":;,.")
+	return strings.TrimSpace(pkg)
 }
 
 // injectDependencyBlocker scans the raw diagnostics for Go dependency errors
-// and injects the exact package path into the conclusion if missing. This
-// guarantees /plan receives an actionable REMOTE DEPENDENCY BLOCKER token
-// instead of a vague hypothesis that causes JSON synthesis failures.
-func (e *Engine) injectDependencyBlocker() {
+// and injects the exact package path directly into the target conclusion pointer
+// using the canonical "lx bypassed" token format that /plan recognises.
+// It scans e.Ledger.Diagnostics directly (the raw compiler/test output) rather
+// than depending on high-level conclusion strings being already populated, so
+// the REMOTE DEPENDENCY BLOCKER token is guaranteed on the very first pass.
+func injectDependencyBlocker(e *Engine, targetConclusion *string) {
 	raw := e.Ledger.Diagnostics
 	if raw == "" {
 		return
 	}
-	if !strings.Contains(raw, "no required module provides package") {
+	if !strings.Contains(raw, "no required module provides package") &&
+		!strings.Contains(raw, "cannot find module providing package") {
 		return
 	}
-	if strings.Contains(e.Ledger.Conclusion, "REMOTE DEPENDENCY BLOCKER") {
+	if strings.Contains(*targetConclusion, "REMOTE DEPENDENCY BLOCKER") {
 		return
 	}
 	pkg := extractPackageName(raw)
 	if pkg == "" {
 		return
 	}
-	blocker := fmt.Sprintf("BLOCKER: Compilation/dependency error detected. ## REMOTE DEPENDENCY BLOCKER (auto-extracted): %s", pkg)
-	if e.Ledger.Conclusion != "" {
-		e.Ledger.Conclusion += "\n" + blocker
+	blocker := fmt.Sprintf("## REMOTE DEPENDENCY BLOCKER (lx bypassed): %s", pkg)
+	if *targetConclusion != "" {
+		*targetConclusion += "\n" + blocker
 	} else {
-		e.Ledger.Conclusion = blocker
+		*targetConclusion = blocker
 	}
 }
 

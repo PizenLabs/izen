@@ -3,10 +3,12 @@ package plan
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/prompt"
+	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
 // ProviderFunc defines a structured function signature matching the ai.Request format.
@@ -94,6 +96,138 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		return nil, fmt.Errorf("plan engine: provider not set")
 	}
 
+	// ── CANONICAL IMPORT MISMATCH (lx coordinate handshake) ──────────────
+	// When the ledger contains a canonical import path mismatch error
+	// ("module declares its path as: X but was required as: Y"), use the lx
+	// daemon to resolve the exact file:line coordinates where the old path
+	// appears. Then generate deterministic FILE_EDIT tasks at those coordinates
+	// followed by SHELL_EXEC go mod tidy — replacing the SHELL_EXEC-only
+	// short-circuit that previously bypassed precision file editing.
+	//
+	// This implements the "Lynx Coordinate Handshake" architectural spec:
+	//   Step 1: Parse diagnostic output for canonical mismatch.
+	//   Step 2: Leverage lx related/resolve for precision discovery (no full
+	//           file loading into LLM context).
+	//   Step 3: Minimal context ledger population (under 100 tokens).
+	//   Step 4: Atomic execution blueprint (FILE_EDIT + SHELL_EXEC).
+	if !fastTrack && HasCanonicalImportMismatch(ledgerContent) {
+		mismatch := retrieval.ParseCanonicalMismatch(ledgerContent)
+		if mismatch != nil && mismatch.OldPath != "" && mismatch.NewPath != "" {
+			resolver := retrieval.NewLXCoordinateResolver()
+			if resolver != nil {
+				//nolint:contextcheck // lynx controller API predates context propagation
+				refs, err := resolver.ResolveCanonicalMismatch(mismatch)
+				if err == nil && len(refs) > 0 {
+					tasks := make([]Task, 0, len(refs)+2)
+					for i, ref := range refs {
+						desc := fmt.Sprintf("Replace import path %q with %q at %s:%d",
+							mismatch.OldPath, mismatch.NewPath, ref.File, ref.StartLine)
+						tasks = append(tasks, Task{
+							StepNum:     i + 1,
+							IsDone:      false,
+							Status:      "idle",
+							Type:        "FILE_MUTATE",
+							Target:      ref.File,
+							Description: desc,
+							Rationale:   fmt.Sprintf("Canonical import mismatch resolved by lx at %s:%d-%d", ref.File, ref.StartLine, ref.EndLine),
+							Solution:    fmt.Sprintf("Replaced %q with %q in %s", mismatch.OldPath, mismatch.NewPath, ref.File),
+							IsHardcoded: true,
+						})
+					}
+					tidyStep := len(refs) + 1
+					tasks = append(tasks, Task{
+						StepNum:     tidyStep,
+						IsDone:      false,
+						Status:      "idle",
+						Type:        "SHELL_EXEC",
+						Target:      "go mod tidy",
+						Description: "Re-synchronize the dependency manifest after canonical import fix.",
+						Rationale:   "Clean up stale go.mod/go.sum entries after import path correction.",
+						Solution:    "Dependency manifest re-synchronized.",
+						IsHardcoded: true,
+					})
+					return tasks, nil
+				}
+			}
+		}
+	}
+
+	// ── UNDEFINED SYMBOL (stdlib case correction / lx coordinate handshake)
+	//
+	// Phase 1 — Standard Library Case-Sensitivity Check
+	// When the symbol is a capitalized version of a stdlib package name
+	// (e.g., "Log" → "log"), generate a deterministic FILE_EDIT to fix the
+	// case and add the import. This requires no lx daemon and no LLM call.
+	// The target path is sanitized (stripped of :line:col suffixes) and
+	// verified to exist before being assigned to the task.
+	//
+	// HARDENING: SHELL_EXEC tasks are NEVER generated for undefined symbol
+	// errors — they would trigger a hallucinated go mod tidy that the Build
+	// security guardrails would block, creating a false error loop.
+	//
+	// Phase 2 — lx coordinate handshake
+	// When no stdlib match is found, use lx resolve/related to locate the
+	// symbol definition and the error context. Generate FILE_EDIT at the
+	// error location only (no SHELL_EXEC).
+	if !fastTrack && HasUndefinedSymbolError(ledgerContent) {
+		undef := retrieval.ParseUndefinedSymbol(ledgerContent)
+		if undef != nil && undef.Symbol != "" {
+			// Phase 1: Check standard library case-sensitivity correction.
+			if pkgName, importPath, matched := retrieval.CheckStdlibCaseCorrection(undef.Symbol); matched {
+				sanitizedTarget, err := retrieval.SanitizeTargetPath(undef.File)
+				if err != nil {
+					// File not found — skip stdlib interceptor, fall through to LLM.
+					// No error return needed; the LLM will handle diagnostics.
+				} else {
+					desc := fmt.Sprintf("Fix %q at %s:%d: replace %q with %q and add import %q",
+						undef.Symbol, sanitizedTarget, undef.Line, undef.Symbol, pkgName, importPath)
+					tasks := []Task{
+						{
+							StepNum:     1,
+							IsDone:      false,
+							Status:      "idle",
+							Type:        "FILE_MUTATE",
+							Target:      sanitizedTarget,
+							Description: desc,
+							Rationale:   fmt.Sprintf("Undefined symbol %q is a capitalized stdlib package name — correct to %q.", undef.Symbol, pkgName),
+							Solution:    fmt.Sprintf("STDLIB:%s:%s:%s", undef.Symbol, pkgName, importPath),
+							IsHardcoded: true,
+						},
+					}
+					return tasks, nil
+				}
+			}
+
+			// Phase 2: lx coordinate handshake for non-stdlib undefined symbols.
+			resolver := retrieval.NewLXCoordinateResolver()
+			if resolver != nil {
+				//nolint:contextcheck // lynx controller API predates context propagation
+				refs, err := resolver.ResolveUndefinedSymbol(undef)
+				if err == nil && len(refs) > 0 {
+					// Sanitize the target path before creating tasks.
+					lxTarget, sanitizeErr := retrieval.SanitizeTargetPath(undef.File)
+					if sanitizeErr != nil {
+						lxTarget = undef.File
+					}
+					tasks := []Task{
+						{
+							StepNum:     1,
+							IsDone:      false,
+							Status:      "idle",
+							Type:        "FILE_MUTATE",
+							Target:      lxTarget,
+							Description: fmt.Sprintf("Fix undefined symbol %q at %s:%d", undef.Symbol, lxTarget, undef.Line),
+							Rationale:   fmt.Sprintf("Undefined symbol %q resolved by lx — symbol defined at %s:%d", undef.Symbol, refs[0].File, refs[0].StartLine),
+							Solution:    fmt.Sprintf("Added import/corrected symbol %q in %s", undef.Symbol, lxTarget),
+							IsHardcoded: true,
+						},
+					}
+					return tasks, nil
+				}
+			}
+		}
+	}
+
 	// REMOTE DEPENDENCY BLOCKER short-circuit: if the ledger explicitly
 	// identifies a remote dependency through forensic analysis, bypass LLM
 	// synthesis entirely and generate deterministic go get / go mod tidy
@@ -101,20 +235,30 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	// eliminating the 3-attempt JSON synthesis crash loop.
 	if !fastTrack && strings.Contains(ledgerContent, "REMOTE DEPENDENCY BLOCKER") {
 		conclusion := ExtractConclusionFromLedger(ledgerContent)
-		if dep := dependencyFromConclusion(conclusion); dep != "" {
-			return []Task{
-				{
-					StepNum: 1,
-					IsDone:  false,
-					Status:  "idle",
-					Type:    "SHELL_EXEC",
-					Target:  "go get " + dep,
-					Description: fmt.Sprintf(
-						"go get %s\n  ↳ Rationale: Inject the explicit third-party module missing from the execution boundary.\n  ↳ Expected Solution: Missing package symbols successfully resolve and dependency block clears.",
-						dep,
-					),
-				},
-			}, nil
+		if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
+			taskGet := Task{
+				StepNum:     1,
+				IsDone:      false,
+				Status:      "idle",
+				Type:        "SHELL_EXEC",
+				Target:      fmt.Sprintf("go get %s", dep),
+				Description: fmt.Sprintf("Install missing dependency %s to resolve compiler/import blocker.", dep),
+				Rationale:   fmt.Sprintf("Inject the explicit third-party module %s missing from the execution boundary.", dep),
+				Solution:    fmt.Sprintf("Missing package %s successfully resolves and dependency block clears.", dep),
+				IsHardcoded: true,
+			}
+			taskTidy := Task{
+				StepNum:     2,
+				IsDone:      false,
+				Status:      "idle",
+				Type:        "SHELL_EXEC",
+				Target:      "go mod tidy",
+				Description: "Re-synchronize the dependency manifest with active imports after blocker identification.",
+				Rationale:   "Re-synchronize the dependency manifest with active imports after blocker identification.",
+				Solution:    "Clean up stale pointers and establish structural registry alignment.",
+				IsHardcoded: true,
+			}
+			return []Task{taskGet, taskTidy}, nil
 		}
 		return []Task{
 			{
@@ -123,7 +267,10 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 				Status:      "idle",
 				Type:        "SHELL_EXEC",
 				Target:      "go mod tidy",
-				Description: "go mod tidy\n  ↳ Rationale: Re-synchronize the dependency manifest with active imports after blocker identification.\n  ↳ Expected Solution: Clean up stale pointers and establish structural registry alignment.",
+				Description: "Re-synchronize the dependency manifest with active imports after blocker identification.",
+				Rationale:   "Re-synchronize the dependency manifest with active imports after blocker identification.",
+				Solution:    "Clean up stale pointers and establish structural registry alignment.",
+				IsHardcoded: true,
 			},
 		}, nil
 	}
@@ -234,6 +381,17 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 				candidates = jsonResult.Tasks
 			}
 
+			// Align FILE_MUTATE targets with actual compiler error file paths
+			// from the ledger. This prevents the LLM from hallucinating targets
+			// like "syntax/main.go" when the real error is in "cmd/api/main.go".
+			candidates = AlignFileTargetWithErrors(candidates, ledgerContent)
+
+			// Filter out unsolicited new-file creation in pkg/ or internal/
+			// when resolving single-file undefined symbol errors. This prevents
+			// the LLM from generating over-engineered plans (e.g. creating
+			// pkg/util/logs/log.go) for a trivial stdlib case fix.
+			candidates = FilterUnsolicitedPkgFiles(candidates, ledgerContent)
+
 			if len(candidates) > 0 {
 				if !hasInvalidShellExecCommand(candidates) {
 					// All checks passed — return with compile-error enforcement.
@@ -266,15 +424,16 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	// forcing a manual /investigate loop.
 	if IsCompilationOrDependencyError(problem) || IsCompilationOrDependencyError(ledgerContent) {
 		conclusion := ExtractConclusionFromLedger(ledgerContent)
-		if dep := dependencyFromConclusion(conclusion); dep != "" {
+		if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
 			return []Task{
 				{
 					StepNum:     1,
 					IsDone:      false,
 					Status:      "idle",
 					Type:        "SHELL_EXEC",
-					Target:      "go get " + dep,
-					Description: "Emergency fallback: all LLM synthesis attempts exhausted",
+					Target:      fmt.Sprintf("go get %s", dep),
+					Description: fmt.Sprintf("Emergency fallback: install missing dependency %s", dep),
+					IsHardcoded: true,
 				},
 			}, nil
 		}
@@ -286,6 +445,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 				Type:        "SHELL_EXEC",
 				Target:      "go mod tidy",
 				Description: "Emergency fallback: all LLM synthesis attempts exhausted",
+				IsHardcoded: true,
 			},
 		}, nil
 	}
@@ -307,11 +467,139 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 				Type:        "SHELL_EXEC",
 				Target:      "go mod tidy",
 				Description: "Emergency fallback: all LLM synthesis attempts exhausted; raw *.go parse/import error detected",
+				IsHardcoded: true,
 			},
 		}, nil
 	}
 
 	return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed and no dependency error detected", maxSilentRetries+1)
+}
+
+// compilerErrorFileRe extracts the exact file path from a Go compiler error
+// line of the form "path/file.go:line:col: message". The captured group is
+// the file path before the first colon-number sequence.
+var compilerErrorFileRe = regexp.MustCompile(`([^\s:]+\.(go|ts|js|py|rs)):\d+:\d+:`)
+
+// AlignFileTargetWithErrors validates and corrects FILE_MUTATE task targets
+// against actual compiler error file paths extracted from the ledger content.
+// If a non-hardcoded FILE_MUTATE target does not match any file path found in
+// the compiler errors (e.g. the LLM hallucinated "syntax/main.go" instead of
+// "cmd/api/main.go"), it is replaced with the correct path from the first
+// matching compiler error. Hardcoded tasks (from lx resolution) are left
+// unchanged since their targets are deterministic.
+func AlignFileTargetWithErrors(tasks []Task, ledgerContent string) []Task {
+	if len(tasks) == 0 || ledgerContent == "" {
+		return tasks
+	}
+	errorFiles := parseCompilerErrorFiles(ledgerContent)
+	if len(errorFiles) == 0 {
+		return tasks
+	}
+	for i, t := range tasks {
+		if t.Type != "FILE_MUTATE" && t.Type != "FILE_EDIT" {
+			continue
+		}
+		if t.IsHardcoded {
+			continue
+		}
+		if !matchesAnyErrorFile(t.Target, errorFiles) {
+			tasks[i].Target = errorFiles[0]
+			tasks[i].Rationale = fmt.Sprintf("Target aligned to compiler error file: %s", errorFiles[0])
+		}
+	}
+	return tasks
+}
+
+// parseCompilerErrorFiles extracts unique file paths from Go compiler error
+// lines in the given content. It matches lines like "cmd/api/main.go:9:2:
+// undefined: x" using compilerErrorFileRe and returns the deduplicated list
+// of file paths in occurrence order.
+func parseCompilerErrorFiles(content string) []string {
+	dedup := make(map[string]bool)
+	var files []string
+	for _, line := range strings.Split(content, "\n") {
+		m := compilerErrorFileRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		f := m[1]
+		if !dedup[f] {
+			dedup[f] = true
+			files = append(files, f)
+		}
+	}
+	return files
+}
+
+// matchesAnyErrorFile reports whether the given target path matches any of the
+// compiler error file paths. Comparison is done with filepath.Clean to handle
+// variations like "./cmd/api/main.go" vs "cmd/api/main.go".
+func matchesAnyErrorFile(target string, errorFiles []string) bool {
+	for _, ef := range errorFiles {
+		if target == ef {
+			return true
+		}
+	}
+	return false
+}
+
+// unsolicitedPkgPrefixes are path prefixes that indicate new helper/wrapper
+// file creation. When resolving a single-file undefined symbol error, any
+// LLM-generated task targeting these prefixes is considered unsolicited
+// and rejected.
+var unsolicitedPkgPrefixes = []string{
+	"pkg/",
+	"internal/",
+}
+
+// FilterUnsolicitedPkgFiles filters out LLM-generated tasks that attempt to
+// create new files in pkg/ or internal/ when resolving a single undefined
+// symbol error in a simple target file. This prevents the LLM from generating
+// over-engineered plans (e.g. creating pkg/util/logs/log.go) for trivial
+// stdlib case fixes. Hardcoded tasks are preserved.
+func FilterUnsolicitedPkgFiles(tasks []Task, ledgerContent string) []Task {
+	if len(tasks) == 0 || ledgerContent == "" {
+		return tasks
+	}
+	// Only apply this filter when the ledger contains a single-file undefined
+	// symbol error (which should be resolved with a simple fixed, not a new
+	// package).
+	if !HasUndefinedSymbolError(ledgerContent) {
+		return tasks
+	}
+	// Determine the error file path.
+	undef := retrieval.ParseUndefinedSymbol(ledgerContent)
+	if undef == nil || undef.File == "" {
+		return tasks
+	}
+	filtered := make([]Task, 0, len(tasks))
+	for _, t := range tasks {
+		if t.IsHardcoded {
+			filtered = append(filtered, t)
+			continue
+		}
+		if t.Type != "FILE_MUTATE" && t.Type != "FILE_EDIT" {
+			filtered = append(filtered, t)
+			continue
+		}
+		// Allow tasks targeting the actual error file.
+		if t.Target == undef.File {
+			filtered = append(filtered, t)
+			continue
+		}
+		// Reject tasks targeting pkg/ or internal/ prefixes.
+		rejected := false
+		for _, prefix := range unsolicitedPkgPrefixes {
+			if strings.HasPrefix(t.Target, prefix) {
+				rejected = true
+				break
+			}
+		}
+		if !rejected {
+			filtered = append(filtered, t)
+		}
+	}
+	return filtered
 }
 
 // filterValidTasks filters a task slice to only tasks with valid, non-empty
@@ -334,6 +622,12 @@ func filterValidTasks(tasks []Task) []Task {
 // the plan MUST resolve it through go.mod / SHELL_EXEC (e.g. `go get`,
 // `go mod tidy`) — NEVER by patching documentation or unrelated source files.
 //
+// HARDENING: SHELL_EXEC tasks are REJECTED when the primary blocker is an
+// undefined symbol error (e.g. undefined: Log), because the LLM routinely
+// hallucinates go mod tidy for what is actually a stdlib case typo. The
+// exception is when a go.mod/go.sum missing file error is explicitly present,
+// indicating a real dependency issue rather than a code typo.
+//
 // If the synthesized tasks already contain a SHELL_EXEC task, they are returned
 // unchanged (the model complied). Otherwise a deterministic SHELL_EXEC recovery
 // task is prepended so the build engine always has a runnable shell step to
@@ -343,6 +637,10 @@ func ForceShellExecOnCompileError(tasks []Task, problem, ledgerContent string) [
 		return tasks
 	}
 	if !IsCompilationOrDependencyError(problem) && !IsCompilationOrDependencyError(ledgerContent) {
+		return tasks
+	}
+	// Ban SHELL_EXEC for undefined symbol errors unless go.mod/go.sum missing.
+	if HasUndefinedSymbolError(ledgerContent) && !hasGoModMissingError(ledgerContent) {
 		return tasks
 	}
 	for _, t := range tasks {
@@ -356,8 +654,8 @@ func ForceShellExecOnCompileError(tasks []Task, problem, ledgerContent string) [
 	// conclusion when available; otherwise fall back to `go mod tidy`.
 	cmd := "go mod tidy"
 	if conclusion := ExtractConclusionFromLedger(ledgerContent); conclusion != "" {
-		if dep := dependencyFromConclusion(conclusion); dep != "" {
-			cmd = "go get " + dep
+		if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
+			cmd = fmt.Sprintf("go get %s", dep)
 		}
 	}
 	recovery := Task{
@@ -375,6 +673,15 @@ func ForceShellExecOnCompileError(tasks []Task, problem, ledgerContent string) [
 		out[i].StepNum = i + 1
 	}
 	return out
+}
+
+// hasGoModMissingError reports whether the content indicates a missing go.mod
+// or go.sum file error. This is the exception to the SHELL_EXEC ban for
+// undefined symbol errors: when go.mod is genuinely missing, a shell task
+// like `go mod tidy` is appropriate.
+func hasGoModMissingError(content string) bool {
+	lower := strings.ToLower(content)
+	return strings.Contains(lower, "go.mod") || strings.Contains(lower, "go.sum")
 }
 
 // knownShellBinaries is the set of recognised executable binaries that a
@@ -476,17 +783,20 @@ func ValidateShellExecCommands(tasks []Task, ledgerContent string) []Task {
 		if t.Type != "SHELL_EXEC" {
 			continue
 		}
+		if t.IsHardcoded {
+			continue
+		}
 		if !isValidShellCommand(t.Target) {
 			conclusion := ExtractConclusionFromLedger(ledgerContent)
-			if dep := dependencyFromConclusion(conclusion); dep != "" {
+			if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
 				return []Task{
 					{
 						StepNum:     1,
 						IsDone:      false,
 						Status:      "idle",
 						Type:        "SHELL_EXEC",
-						Target:      "go get " + dep,
-						Description: "Install missing dependency (sanitized: LLM produced invalid command)",
+						Target:      fmt.Sprintf("go get %s", dep),
+						Description: fmt.Sprintf("Install missing dependency %s (sanitized: LLM produced invalid command)", dep),
 					},
 				}
 			}
@@ -511,7 +821,7 @@ func ValidateShellExecCommands(tasks []Task, ledgerContent string) []Task {
 // detect LLM command hallucination without triggering deterministic substitution.
 func hasInvalidShellExecCommand(tasks []Task) bool {
 	for _, t := range tasks {
-		if t.Type == "SHELL_EXEC" && !isValidShellCommand(t.Target) {
+		if t.Type == "SHELL_EXEC" && !t.IsHardcoded && !isValidShellCommand(t.Target) {
 			return true
 		}
 	}
@@ -526,24 +836,163 @@ func shellExecReinforcement(attempt, maxRetries int) string {
 		attempt, maxRetries)
 }
 
+// isPlaceholderToken reports whether s is a raw template placeholder
+// (e.g. "<exact_package_path>", "<pkg>", "<module_path>", "<package>")
+// that must never be used as a real command target. The heuristic is any
+// string containing angle-bracket-delimited content — these are LLM prompt
+// template markers, not actual package paths.
+func isPlaceholderToken(s string) bool {
+	s = strings.TrimSpace(s)
+	return strings.Contains(s, "<") && strings.Contains(s, ">")
+}
+
 // dependencyFromConclusion extracts a plausible module path from an
 // investigation conclusion string (e.g. "use github.com/moby/moby/client").
 // It returns the first token that looks like a Go module path; empty otherwise.
+//
+// The REMOTE DEPENDENCY BLOCKER token may be appended inline behind a semicolon
+// (e.g. "...; ## REMOTE DEPENDENCY BLOCKER (lx bypassed): [pkg](url)") rather
+// than on its own line, so this function performs a GLOBAL substring scan and
+// robustly isolates the trailing package identifier regardless of inline
+// semicolon / space / newline noise or markdown-link wrapping.
 func dependencyFromConclusion(conclusion string) string {
+	// Parse the explicit package trailing the REMOTE DEPENDENCY BLOCKER token.
+	// This guarantees we apply the real package the forensic analysis recorded
+	// (e.g. github.com/docker/docker/client) instead of heuristic-matching an
+	// unrelated token in the conclusion text.
+	const token = "## REMOTE DEPENDENCY BLOCKER (lx bypassed): "
+	if idx := strings.Index(conclusion, token); idx >= 0 {
+		rest := conclusion[idx+len(token):]
+		// The package may be on the same inline line behind a semicolon, or
+		// wrapped in a markdown link [pkg](url). Isolate the first candidate
+		// package token, stripping inline formatting noise aggressively.
+		if pkg := extractPackageFromBlockerTail(rest); pkg != "" {
+			return pkg
+		}
+	}
+
+	// Fallback: heuristic scan for a well-formed package path.
 	for _, tok := range strings.Fields(conclusion) {
 		t := strings.TrimRight(strings.TrimLeft(tok, "\"'"), "\"'.,")
-		if strings.Contains(t, ".") && (strings.Contains(t, "/") || strings.HasPrefix(t, "github.com") || strings.HasPrefix(t, "golang.org")) {
+		if isWellFormedModulePath(t) {
 			return t
 		}
 	}
 	return ""
 }
 
+// extractPackageFromBlockerTail isolates the dependency package path from the
+// tail string that follows the REMOTE DEPENDENCY BLOCKER token. It handles:
+//   - inline semicolon-separated noise ("...; pkg")
+//   - markdown link wrapping ("[pkg](url)")
+//   - trailing punctuation / parentheses
+//   - visually-clipped fragments (e.g. "g...") by falling back to the clean
+//     namespace embedded inside a markdown link or the first well-formed path.
+func extractPackageFromBlockerTail(rest string) string {
+	// Split on any inline separator so a leading "..." fragment (before a
+	// semicolon) does not poison the extraction.
+	for _, seg := range strings.FieldsFunc(rest, func(r rune) bool {
+		return r == ';' || r == '\n' || r == '\r' || r == '\t'
+	}) {
+		seg = strings.TrimSpace(seg)
+		if seg == "" {
+			continue
+		}
+		// Unwrap a markdown link: [pkg](url) → pkg. Also tolerate a bare
+		// markdown link with no following url.
+		if pkg := unwrapMarkdownLink(seg); pkg != "" {
+			if isWellFormedModulePath(pkg) {
+				return pkg
+			}
+			// Clipped fragment inside the link (e.g. "g...") — keep scanning
+			// for a clean namespace elsewhere in the segment.
+		}
+		// Plain token: strip trailing punctuation and parentheses.
+		candidate := strings.TrimRight(seg, ".,;:)]}")
+		candidate = strings.TrimLeft(candidate, "([")
+		if isWellFormedModulePath(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// unwrapMarkdownLink extracts the link text from a markdown link of the form
+// [text](url). If the segment is not a markdown link it returns empty string.
+func unwrapMarkdownLink(seg string) string {
+	seg = strings.TrimSpace(seg)
+	open := strings.Index(seg, "[")
+	if open < 0 {
+		return ""
+	}
+	closeB := strings.Index(seg[open:], "]")
+	if closeB < 0 {
+		return ""
+	}
+	text := seg[open+1 : open+closeB]
+	// Defensive: if the link text itself is a clipped fragment (e.g. "g...")
+	// but a full URL follows, recover the namespace from the URL host+path.
+	if isClippedFragment(text) {
+		if urlStart := strings.Index(seg[open+closeB:], "("); urlStart >= 0 {
+			urlEnd := strings.Index(seg[open+closeB+urlStart:], ")")
+			if urlEnd >= 0 {
+				url := seg[open+closeB+urlStart+1 : open+closeB+urlStart+urlEnd]
+				if cleaned := modulePathFromURL(url); cleaned != "" {
+					return cleaned
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(text)
+}
+
+// modulePathFromURL recovers a Go module path from a repository URL such as
+// https://github.com/docker/docker/client → github.com/docker/docker/client.
+func modulePathFromURL(url string) string {
+	url = strings.TrimSpace(url)
+	url = strings.TrimPrefix(url, "https://")
+	url = strings.TrimPrefix(url, "http://")
+	url = strings.TrimSuffix(url, "/")
+	if url == "" {
+		return ""
+	}
+	return url
+}
+
+// isClippedFragment reports whether a token is a visually-clipped package
+// fragment (e.g. "g...", "github.com/do...") rather than a usable module path.
+func isClippedFragment(tok string) bool {
+	if strings.Contains(tok, "...") {
+		return true
+	}
+	// A path that ends mid-segment with no final element is also clipped.
+	if strings.HasSuffix(tok, "/") {
+		return true
+	}
+	return false
+}
+
+// isWellFormedModulePath reports whether tok looks like a usable Go module path:
+// it must contain a dot (domain) and either a slash or a known module host
+// prefix. Clipped fragments are explicitly rejected so the caller can fall back.
+func isWellFormedModulePath(tok string) bool {
+	tok = strings.TrimSpace(tok)
+	if tok == "" || isClippedFragment(tok) {
+		return false
+	}
+	return strings.Contains(tok, ".") &&
+		(strings.Contains(tok, "/") ||
+			strings.HasPrefix(tok, "github.com") ||
+			strings.HasPrefix(tok, "golang.org"))
+}
+
 // truncateForLog caps a model response excerpt so error messages stay readable.
+// Uses rune-aware slicing to avoid splitting multi-byte UTF-8 characters.
 func truncateForLog(s string) string {
 	s = strings.TrimSpace(s)
-	if len(s) > 200 {
-		return s[:200] + "..."
+	runes := []rune(s)
+	if len(runes) > 200 {
+		return string(runes[:200]) + "..."
 	}
 	return s
 }

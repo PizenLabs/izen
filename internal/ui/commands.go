@@ -738,6 +738,72 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 			ledgerToSend = truncated
 		}
 
+		// ── DETERMINISTIC STDLIB TYPO INTERCEPTOR ────────────────────────────
+		// Before dispatching to the LLM for planning, check if the ledger
+		// contains a simple stdlib case typo (e.g. undefined: Log, Fmt, Os).
+		// These are handled deterministically without calling the LLM, bypassing
+		// both the fast-track and the full plan synthesis paths. This prevents
+		// the LLM from generating over-engineered plans (e.g. creating
+		// pkg/util/logs/log.go) for a trivial stdlib case fix.
+		//
+		// HARD REQUIREMENT: on ANY undefined: Symbol match, emit exactly 1
+		// FILE_MUTATE task — NEVER fall through to LLM synthesis (which would
+		// hallucinate SHELL_EXEC go mod tidy for what is a simple stdlib typo).
+		// SHELL_EXEC tasks are banned for undefined symbol errors unless a
+		// go.mod/go.sum missing file error is explicitly present.
+		debugLogPlan("STDLIB INTERCEPTOR: scanning ledger for undefined symbols")
+		if undef := retrieval.ParseUndefinedSymbol(ledgerToSend); undef != nil && undef.Symbol != "" {
+			debugLogPlan("STDLIB INTERCEPTOR: matched undefined: " + undef.Symbol +
+				" at " + undef.File + ":" + fmt.Sprint(undef.Line))
+			if pkgName, importPath, matched := retrieval.CheckStdlibCaseCorrection(undef.Symbol); matched {
+				debugLogPlan("STDLIB INTERCEPTOR: stdlib case-correction fired: " +
+					undef.Symbol + " → " + pkgName)
+				cancel()
+				sanitizedTarget, pathErr := retrieval.SanitizeTargetPath(undef.File)
+				if pathErr != nil {
+					debugLogPlan("STDLIB INTERCEPTOR: path not found — " + pathErr.Error())
+					return planResultMsg{
+						Tasks: []plan.Task{
+							{
+								StepNum:     1,
+								IsDone:      false,
+								Status:      "idle",
+								Type:        "SHELL_EXEC",
+								Target:      "go test ./...",
+								Description: "Stdlib case-correction blocked: target file not found. Re-run build for diagnostics.",
+								Rationale:   "File referenced by compiler does not exist on disk; may need a fresh build.",
+								Solution:    "Run go test ./... to regenerate compiler diagnostics.",
+								IsHardcoded: true,
+							},
+						},
+						Handoff: handoff,
+					}
+				}
+				desc := fmt.Sprintf("Fix %q at %s:%d: replace %q with %q and add import %q",
+					undef.Symbol, sanitizedTarget, undef.Line, undef.Symbol, pkgName, importPath)
+				return planResultMsg{
+					Tasks: []plan.Task{
+						{
+							StepNum:     1,
+							IsDone:      false,
+							Status:      "idle",
+							Type:        "FILE_MUTATE",
+							Target:      sanitizedTarget,
+							Description: desc,
+							Rationale:   fmt.Sprintf("Fix standard library package casing/import (change %q to %q).", undef.Symbol, pkgName),
+							Solution:    fmt.Sprintf("STDLIB:%s:%s:%s", undef.Symbol, pkgName, importPath),
+							IsHardcoded: true,
+						},
+					},
+					Handoff: handoff,
+				}
+			}
+			debugLogPlan("STDLIB INTERCEPTOR: undefined symbol " + undef.Symbol +
+				" not a stdlib typo; falling through to LLM synthesis")
+		} else {
+			debugLogPlan("STDLIB INTERCEPTOR: no undefined symbol match")
+		}
+
 		if localModel {
 			// ── "0 TODO" FAST-TRACK SHORT-CIRCUIT ──────────────────────────
 			// When there are no explicit code TODOs AND the ledger only contains
@@ -1794,6 +1860,103 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 	}
 }
 
+// proposeStdlibBuildPatch generates a patch for a hardcoded stdlib case-correction
+// FILE_MUTATE task WITHOUT calling the LLM. It reads the actual file from disk,
+// applies the deterministic symbol case + import fix, computes the unified diff,
+// and returns a buildProposalReadyMsg for human approval — identical UX to the
+// LLM-based patch flow but with zero model cost and no placeholder-code risk.
+func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		// Extract fix parameters from Solution: "STDLIB:symbol:pkgName:importPath"
+		parts := strings.SplitN(task.Solution, ":", 4)
+		if len(parts) != 4 || parts[0] != "STDLIB" {
+			return buildProposalReadyMsg{Err: fmt.Errorf("invalid stdlib fix solution format: %q", task.Solution)}
+		}
+		symbol, pkgName, importPath := parts[1], parts[2], parts[3]
+
+		// Read actual file and compute deterministic fix.
+		orig, modified, err := retrieval.ApplyStdlibCaseFix(task.Target, symbol, pkgName, importPath)
+		if err != nil {
+			return buildProposalReadyMsg{Err: fmt.Errorf("stdlib fix failed for %s: %w", task.Target, err)}
+		}
+
+		diff := computeUnifiedDiff(task.Target, orig, modified)
+
+		patch := &execution.Patch{
+			ID:        fmt.Sprintf("stdlib-%d", task.StepNum),
+			File:      task.Target,
+			Original:  orig,
+			Modified:  modified,
+			TaskID:    task.StepNum,
+			ContextID: m.sess.ContextID,
+		}
+
+		return buildProposalReadyMsg{
+			Task:   task,
+			Patch:  patch,
+			Diff:   diff,
+			Output: fmt.Sprintf("Applied stdlib case-correction: %q -> %q + import %q in %s", symbol, pkgName, importPath, task.Target),
+		}
+	}
+}
+
+// proposeBuildPatch generates a patch for a regular FILE_MUTATE / GIT_ACTION
+// build task via the LLM (one non-streaming call) WITHOUT applying it. Instead
+// it returns a buildProposalReadyMsg so the update loop can extract proposals
+// and freeze the pipeline in StateAwaitingProposal for human approval before
+// any disk write occurs.
+func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		if m.provider == nil {
+			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
+		}
+
+		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		system := prompt.BuildContract()
+		req := ai.Request{
+			Model:    m.cfg.ActiveModelName(),
+			System:   system,
+			Stream:   false,
+			Messages: []ai.Message{{Role: "user", Content: handoff}},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		resp, err := m.provider.Execute(ctx, req)
+		if err != nil {
+			return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
+		}
+		if resp == nil || strings.TrimSpace(resp.Content) == "" {
+			return buildProposalReadyMsg{Err: fmt.Errorf("patch generation returned empty output")}
+		}
+
+		cleaned := sanitizeFileOutput(resp.Content)
+
+		orig := ""
+		if data, rerr := os.ReadFile(task.Target); rerr == nil {
+			orig = string(data)
+		}
+
+		diff := computeUnifiedDiff(task.Target, orig, cleaned)
+
+		patch := &execution.Patch{
+			ID:        fmt.Sprintf("build-%d", task.StepNum),
+			File:      task.Target,
+			Original:  orig,
+			Modified:  cleaned,
+			TaskID:    task.StepNum,
+			ContextID: m.sess.ContextID,
+		}
+
+		return buildProposalReadyMsg{
+			Task:   task,
+			Patch:  patch,
+			Diff:   diff,
+			Output: resp.Content,
+		}
+	}
+}
+
 // applyHotfixPatch applies a pre-generated $hot patch through the execution
 // engine's PatchManager — never via the conversational stream. It returns a
 // buildResultMsg so the standard update.go handler restores the stashed plan
@@ -2030,86 +2193,6 @@ func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 	}
 }
 
-// runBuildPatchExec executes a FILE_MUTATE / GIT_ACTION build task by generating
-// the patch via the LLM (one non-streaming call) and applying it through the
-// execution engine's PatchManager — never via the conversational streamCmd.
-// This is what makes /build actually mutate the workspace instead of chatting.
-func (m *model) runBuildPatchExec(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
-		if m.provider == nil {
-			return buildResultMsg{err: fmt.Errorf("build execution error: no provider configured")}
-		}
-
-		// Build a focused, non-chat patch-generation prompt and call the LLM
-		// once (non-streaming) so we get a deterministic diff/FILE block back.
-		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
-		system := prompt.BuildContract()
-		req := ai.Request{
-			Model:    m.cfg.ActiveModelName(),
-			System:   system,
-			Stream:   false,
-			Messages: []ai.Message{{Role: "user", Content: handoff}},
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		defer cancel()
-		resp, err := m.provider.Execute(ctx, req)
-		if err != nil {
-			return buildResultMsg{err: fmt.Errorf("patch generation failed: %w", err)}
-		}
-		if resp == nil || strings.TrimSpace(resp.Content) == "" {
-			return buildResultMsg{err: fmt.Errorf("patch generation returned empty output")}
-		}
-
-		// Feed the LLM output to the execution engine as a concrete patch and
-		// apply it. PatchManager.Apply handles unified diffs, FILE: blocks and
-		// full rewrites, with shadow backups + mutation guardrails.
-		orig := ""
-		if data, rerr := os.ReadFile(task.Target); rerr == nil {
-			orig = string(data)
-		}
-		patch := &execution.Patch{
-			ID:        fmt.Sprintf("build-%d", task.StepNum),
-			File:      task.Target,
-			Original:  orig,
-			Modified:  resp.Content,
-			TaskID:    task.StepNum,
-			ContextID: m.sess.ContextID,
-		}
-		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
-			tasks := m.sess.CurrentTasks
-			for i := range tasks {
-				if tasks[i].StepNum == task.StepNum {
-					tasks[i].Status = "failed"
-					break
-				}
-			}
-			m.sess.StageTaskList(&tasks)
-			_ = m.sess.Save()
-			return buildResultMsg{
-				output:   resp.Content,
-				exitCode: 1,
-				err:      fmt.Errorf("patch apply failed: %w", applyErr),
-			}
-		}
-
-		// Mark the task terminal in the live session ledger.
-		tasks := m.sess.CurrentTasks
-		for i := range tasks {
-			if tasks[i].StepNum == task.StepNum {
-				tasks[i].Status = "completed"
-				break
-			}
-		}
-		m.sess.StageTaskList(&tasks)
-		_ = m.sess.Save()
-		return buildResultMsg{
-			output:   fmt.Sprintf("Applied patch to %s", task.Target),
-			exitCode: 0,
-		}
-	}
-}
-
 func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	tasks := m.sess.CurrentTasks
 	if len(tasks) == 0 {
@@ -2215,16 +2298,30 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 		return nil
 	}
 
-	// ── FILE_MUTATE / GIT_ACTION: generate + APPLY a real patch ──────────
-	// These tasks mutate the workspace. /build MUST produce the change and
-	// apply it through the execution engine (PatchManager), NOT stream a chat
-	// reply. Routing them through the conversational streamCmd made the model
-	// "greet" the user instead of executing — a violation of /build's sole
-	// mandate (execute, never chat).
+	// ── FILE_MUTATE / GIT_ACTION: generate a patch for human approval ────
+	// These tasks mutate the workspace. /build MUST NOT apply any mutation
+	// without explicit human sign-off. The patch is generated by the LLM in a
+	// non-streaming call and returned as buildProposalReadyMsg, which freezes
+	// the pipeline in StateAwaitingApproval and renders a unified diff for
+	// explicit authorization (Alt+A / Alt+L / Alt+R).
 	if targetTask.Type == "FILE_MUTATE" || targetTask.Type == "GIT_ACTION" {
+		// ── DETERMINISTIC STDLIB FIX (no LLM) ──────────────────────────
+		// Hardcoded stdlib case-correction tasks carry fix parameters in
+		// the Solution field ("STDLIB:symbol:pkgName:importPath"). Apply
+		// the fix directly by reading the actual file and computing the
+		// targeted replacement — bypassing the LLM entirely. This prevents
+		// the model from generating placeholder code ("// existing code")
+		// and ensures the file is mutated in-place at the correct location.
+		if targetTask.IsHardcoded && strings.HasPrefix(targetTask.Solution, "STDLIB:") {
+			return tea.Batch(
+				func() tea.Msg { return agentStartMsg{label: "stdlib patch"} },
+				m.proposeStdlibBuildPatch(targetTask),
+				m.spinnerTickCmd(),
+			)
+		}
 		return tea.Batch(
 			func() tea.Msg { return agentStartMsg{label: "patching"} },
-			m.runBuildPatchExec(targetTask),
+			m.proposeBuildPatch(targetTask),
 			m.spinnerTickCmd(),
 		)
 	}
@@ -2544,11 +2641,20 @@ func (m *model) runFixCmd(target string) tea.Cmd {
 				fmt.Fprintf(&fixCtx, "**Target:** `%s`\n\n", m.lastTestTarget)
 			}
 
-			fixCtx.WriteString("## INSTRUCTION\n")
-			fixCtx.WriteString("This is build mode — Execution-Only. All diagnostic and architectural analysis was ")
-			fixCtx.WriteString("completed in previous stages. Implement the fix based on the failure log above. ")
-			fixCtx.WriteString("Output ONLY the minimal unified diff or complete file replacement. ")
-			fixCtx.WriteString("Do NOT analyze, explain, or restate the problem.\n")
+			fixCtx.WriteString("## INSTRUCTION — AUTO-RECOVERY MODE\n")
+			fixCtx.WriteString("MODE: AUTO-RECOVERY — execute a targeted fix.\n\n")
+			fixCtx.WriteString("PURPOSE:\n")
+			fixCtx.WriteString("- Apply the minimal code change to fix the compilation error below.\n")
+			fixCtx.WriteString("- Output ONLY compilable code. No analysis, no explanations.\n\n")
+			fixCtx.WriteString("FORBIDDEN:\n")
+			fixCtx.WriteString("- Do NOT output conversational text of any kind.\n")
+			fixCtx.WriteString("- Do NOT greet, summarize, or restate the problem.\n")
+			fixCtx.WriteString("- The first output token MUST be ```diff or FILE:. ZERO exceptions.\n\n")
+			fixCtx.WriteString("OUTPUT FORMAT:\n")
+			fixCtx.WriteString("- Unified diff (```diff ... ```) for existing files.\n")
+			fixCtx.WriteString("- FILE: block for new files or full rewrites.\n")
+			fixCtx.WriteString("- No markdown outside code blocks.\n")
+			fixCtx.WriteString("- No conversational setup, no sign-off.\n")
 
 			return fixResultMsg{content: fixCtx.String()}
 		},

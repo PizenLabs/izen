@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -22,12 +23,13 @@ const (
 	ToolLX       Tool = "lx"       // targeted symbol/package/file lookup
 )
 
-// Strategy is the AI dispatcher's routing decision: which tool to run first,
-// the optional target (symbol, file, test name), and a one-line rationale.
+// Strategy is the AI dispatcher's routing decision: which tool to run first
+// and the optional target (symbol, file, test name).
+// NOTE: Rationale is NOT stored here. Post-execution outcomes are logged
+// separately by dispatchForensics using actual ToolResult evidence.
 type Strategy struct {
-	Tool      Tool   `json:"tool"`
-	Target    string `json:"target,omitempty"`
-	Rationale string `json:"rationale,omitempty"`
+	Tool   Tool   `json:"tool"`
+	Target string `json:"target,omitempty"`
 }
 
 // MaxActionsPerRun is the hard ceiling on forensic tool invocations per
@@ -61,6 +63,12 @@ func boundedDispatchCtx(parent context.Context) (context.Context, context.Cancel
 // and return a single, focused execution strategy. The model is instructed to
 // pick EXACTLY one primary tool so the engine never fans out blindly.
 //
+// HIGH-PRIORITY RULE: If the log contains a Go module dependency error
+// ("no required module provides package" or "cannot find module providing package")
+// the strategy is FORCED to "lx" and the target is set to the extracted package
+// path. This prevents generic environment noise (e.g. Docker container errors)
+// from overriding an explicit missing Go module.
+//
 // If provider is nil or the model returns an unusable payload, the dispatcher
 // falls back to heuristic signature classification (offline, instant) so the
 // engine always has a valid plan within the 2-5s budget.
@@ -70,6 +78,16 @@ func DispatchStrategy(parent context.Context, provider ai.Provider, model string
 	if parent == nil {
 		parent = context.Background()
 	}
+
+	// HIGH-PRIORITY: Go module dependency errors force lx immediately,
+	// regardless of any other noise in the log (Docker, toolchain, etc.).
+	if pkg := extractAnyPackageName(failureLog); pkg != "" {
+		return Strategy{
+			Tool:   ToolLX,
+			Target: pkg,
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(parent, 4*time.Second)
 	defer cancel()
 
@@ -86,7 +104,7 @@ Given a raw test/compile failure log, decide the SINGLE best first diagnostic to
 
 Rules:
 - Output ONLY a raw JSON object. No markdown fences, no // comments, no extra text.
-- Schema: {"tool": "<env|trace|diagnose|lx>", "target": "<symbol/file/test name or empty>", "rationale": "<one short phrase>"}
+- Schema: {"tool": "<env|trace|diagnose|lx>", "target": "<symbol/file/test name or empty>"}
 - Pick "env" for Docker/environment/tooling/version blockers or missing binaries.
 - Pick "trace" for panics, nil-pointer derefs, deep regressions, data races, stack traces.
 - Pick "lx" ONLY when a specific missing symbol, package, or file is clearly named.
@@ -130,14 +148,111 @@ func parseStrategy(raw string) (Strategy, bool) {
 	}
 }
 
+// extractAnyPackageName scans the log for Go module dependency error patterns
+// and returns the extracted package path, or empty string if none found.
+// It handles:
+//   - "no required module provides package"
+//   - "cannot find module providing package"
+//   - "module declares its path as: NEW but was required as: OLD" → returns OLD
+func extractAnyPackageName(log string) string {
+	// Canonical import mismatch: extract the "was required as" path (the old/incorrect one).
+	if strings.Contains(log, "module declares its path as") {
+		old := extractOldPathFromCanonicalMismatch(log)
+		if old != "" {
+			return old
+		}
+	}
+
+	// Undefined symbol: return file:line coordinate for lx related
+	// instead of a bare identifier. Do NOT pass bare symbol names to
+	// lx resolve — always route through the file:line coordinate for
+	// AST context extraction.
+	if strings.Contains(log, "undefined:") {
+		if coord := extractUndefinedCoordinate(log); coord != "" {
+			return coord
+		}
+	}
+
+	if pkg := extractPackageName(log); pkg != "" {
+		return pkg
+	}
+	needle := "cannot find module providing package "
+	idx := strings.Index(log, needle)
+	if idx < 0 {
+		return ""
+	}
+	rest := log[idx+len(needle):]
+	end := strings.IndexAny(rest, " \t\n\r")
+	if end < 0 {
+		end = len(rest)
+	}
+	pkg := rest[:end]
+	pkg = strings.TrimRight(pkg, ":;,.")
+	return strings.TrimSpace(pkg)
+}
+
+// extractOldPathFromCanonicalMismatch extracts the old/incorrect import path
+// from a "module declares its path as: NEW but was required as: OLD" error.
+func extractOldPathFromCanonicalMismatch(log string) string {
+	// Try the condensed single-line form first.
+	re := regexp.MustCompile(
+		`module declares its path as:\s*["']?([^\s"']+)["']?\s*` +
+			`but was required as:\s*["']?([^\s"']+)["']?`)
+	if m := re.FindStringSubmatch(log); m != nil {
+		return strings.TrimRight(m[2], ":;,.")
+	}
+
+	// Multi-line form: find "but was required as: <path>" on any line.
+	idx := strings.Index(log, "but was required as:")
+	if idx < 0 {
+		return ""
+	}
+	rest := log[idx+len("but was required as:"):]
+	rest = strings.TrimSpace(rest)
+	rest = strings.Trim(rest, `"'`)
+	end := strings.IndexAny(rest, " \t\n\r")
+	if end < 0 {
+		end = len(rest)
+	}
+	return strings.TrimRight(rest[:end], ":;,.")
+}
+
+// extractUndefinedCoordinate extracts the file:line coordinate from a
+// "file.go:line:col: undefined: Symbol" compiler error. Returns "file:line"
+// (e.g., "cmd/api/main.go:24") so the lx tool can invoke lx related for
+// AST context extraction instead of resolving the bare symbol name.
+func extractUndefinedCoordinate(log string) string {
+	re := regexp.MustCompile(`([^:\s]+\.go):(\d+)(?::(\d+))?:\s*undefined:`)
+	m := re.FindStringSubmatch(log)
+	if m == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s:%s", m[1], m[2])
+}
+
 // heuristicClassify is the offline fallback. It scans the failure log for
 // well-known signatures and maps them to the canonical tool without any
 // network round-trip. It never returns an invalid tool.
+//
+// HIGH-PRIORITY: Go module dependency errors ("no required module provides
+// package", "cannot find module providing package") are checked FIRST so
+// that generic environment noise (Docker, toolchain) cannot override an
+// explicit missing-dependency signal.
 func heuristicClassify(log string) Strategy {
 	l := strings.ToLower(log)
 	switch {
-	case strings.Contains(l, "module declares its path as"):
-		return Strategy{Tool: ToolLX, Rationale: "module path mismatch — use the declared path from the error"}
+	// HIGH-PRIORITY: Go module / dependency errors force lx immediately.
+	case strings.Contains(l, "no required module provides package"),
+		strings.Contains(l, "cannot find module providing package"),
+		strings.Contains(l, "cannot find package"),
+		strings.Contains(l, "module declares its path as"),
+		strings.Contains(l, "missing dependency"),
+		strings.Contains(l, "package is not in"):
+		pkg := extractAnyPackageName(l)
+		return Strategy{
+			Tool:   ToolLX,
+			Target: pkg,
+		}
 	case strings.Contains(l, "docker"),
 		strings.Contains(l, "command not found"),
 		strings.Contains(l, "no such file or directory"),
@@ -145,7 +260,7 @@ func heuristicClassify(log string) Strategy {
 		strings.Contains(l, "version") && strings.Contains(l, "go"),
 		strings.Contains(l, "GOPATH"),
 		strings.Contains(l, "toolchain"):
-		return Strategy{Tool: ToolEnv, Rationale: "environment/tooling blocker signature"}
+		return Strategy{Tool: ToolEnv}
 	case strings.Contains(l, "panic:"),
 		strings.Contains(l, "nil pointer"),
 		strings.Contains(l, "nil map"),
@@ -153,15 +268,14 @@ func heuristicClassify(log string) Strategy {
 		strings.Contains(l, "goroutine"),
 		strings.Contains(l, "--- fail:"),
 		strings.Contains(l, "fail:"):
-		return Strategy{Tool: ToolTrace, Rationale: "panic/regression/failure signature"}
+		return Strategy{Tool: ToolTrace}
 	case strings.Contains(l, "undefined:"),
-		strings.Contains(l, "cannot find package"),
 		strings.Contains(l, "undeclared name"),
 		strings.Contains(l, "missing symbol"),
 		strings.Contains(l, "no symbol"):
-		return Strategy{Tool: ToolLX, Rationale: "missing symbol/package signature"}
+		return Strategy{Tool: ToolLX}
 	default:
-		return Strategy{Tool: ToolDiagnose, Rationale: "generic fallback"}
+		return Strategy{Tool: ToolDiagnose}
 	}
 }
 

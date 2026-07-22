@@ -229,11 +229,11 @@ func renderHotkeyPromptWithToggle(width int) string {
 	action := boldTextStyle.Render
 	hk := dimmedStyle.Render
 
-	text := "› " + action("Accept") + " " + hk("Alt+A") + "  " +
+	text := "› " + action("Accept") + " " + hk("Alt+A / y / Enter") + "  " +
 		action("Allow All") + " " + hk("Alt+L") + "  " +
-		action("Reject") + " " + hk("Alt+R") + "  " +
-		action("Toggle View") + " " + hk("Alt+P") + "  " +
-		action("Navigate") + " " + hk("j/k")
+		action("Reject") + " " + hk("Alt+R / n / Esc") + "  " +
+		action("Toggle") + " " + hk("Alt+P") + "  " +
+		action("Nav") + " " + hk("j/k")
 
 	if lipgloss.Width(text) > width {
 		text = "› " + action("Accept") + " " + hk("Alt+A") + "  " +
@@ -242,7 +242,8 @@ func renderHotkeyPromptWithToggle(width int) string {
 			action("Toggle") + " " + hk("Alt+P") + "  " +
 			action("Nav") + " " + hk("j/k")
 		if lipgloss.Width(text) > width {
-			text = "› " + action("Acc/Rej/Tog") + " " + hk("Alt+A/R/P")
+			text = "› " + action("Acc/Rej") + " " + hk("Alt+A/R") + "  " +
+				action("All") + " " + hk("Alt+L")
 		}
 	}
 	return text

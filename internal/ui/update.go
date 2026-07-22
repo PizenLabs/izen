@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -18,6 +19,7 @@ import (
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/build"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
 )
@@ -548,6 +550,62 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		flush := m.flushPendingRecords()
 		return m, flush
 
+	case buildProposalReadyMsg:
+		m.agentRunning = false
+		m.reviewRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
+
+		// ── BUILD PROPOSAL FAILURE ───────────────────────────────────
+		if msg.Err != nil {
+			m.push(roleError, "patch generation failed: "+msg.Err.Error())
+			tasks := m.sess.CurrentTasks
+			for i := range tasks {
+				if msg.Task != nil && tasks[i].StepNum == msg.Task.StepNum {
+					tasks[i].Status = "failed"
+					break
+				}
+			}
+			m.sess.StageTaskList(&tasks)
+			_ = m.sess.Save()
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m, m.flushPendingRecords()
+		}
+
+		// ── Extract proposals from LLM output ───────────────────────
+		props := extractBuildProposals(msg.Output)
+		if len(props) == 0 {
+			// Fallback: use the pre-computed diff and patch directly.
+			target := msg.Task.Target
+			proposal := SemanticProposal{
+				ID:   msg.Patch.ID,
+				Diff: msg.Diff,
+				Target: SemanticTarget{
+					QualifiedName: target,
+					Module:        filepath.Dir(target),
+					Language:      langFromPath(target),
+				},
+				Expanded: true,
+			}
+			props = []SemanticProposal{proposal}
+		}
+		m.pendingProposals = props
+
+		// ── FREEZE FOR HUMAN APPROVAL ───────────────────────────────
+		m.state = StateAwaitingApproval
+		m.awaitingConfirmation = true
+		m.ti.Blur()
+		m.recalcViewportHeight()
+		m.Viewport.Height = m.computeVpHeight()
+		m.push(roleStatus, fmt.Sprintf(
+			"Proposed patch to %s", msg.Task.Target))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, nil
+
 	case hotfixProposalMsg:
 		m.agentRunning = false
 		m.reviewRunning = false
@@ -572,11 +630,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.flushPendingRecords()
 		}
 
-		// ── CRITICAL: freeze and request authorization (Bug Fix 2) ─────
+		// ── FREEZE AND REQUEST AUTHORIZATION ─────────────────────────
 		// Store the synthesized patch + rendered diff proposal. Enter the
 		// StateAwaitingApproval approval gate so the developer can inspect the
-		// code diff and explicitly approve (y) or reject (n) BEFORE any change
-		// is written to disk.
+		// code diff and explicitly approve (Alt+A) or reject (Alt+R) BEFORE
+		// any change is written to disk.
 		m.pendingHotfixTask = msg.Task
 		m.pendingHotfixPatch = msg.Patch
 
@@ -595,10 +653,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.pendingProposals = []SemanticProposal{proposal}
 
-		// ── CLEAN TRANSITION TO PROPOSAL VIEW (Feature) ──────────────
-		// Emit the final lifecycle log then swap the pane into the
-		// MutationRenderer diff view. The spinner/transient progress lines are
-		// superseded by the explicit approval prompt below.
+		// ── CLEAN TRANSITION TO PROPOSAL VIEW ────────────────────────
 		m.push(roleActivity, "  ⚙ Compiling unified diff schema...")
 
 		m.state = StateAwaitingApproval
@@ -608,7 +663,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.push(roleStatus, fmt.Sprintf(
 			"[HOTFIX APPROVAL] Proposed patch to %s", target))
 		m.push(roleSystem, infoStyle.Render(
-			"Review the code diff below. Apply this patch? (y/n): "))
+			"Review the code diff below. Use Alt+A to accept, Alt+R to reject."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m, nil
@@ -1046,6 +1101,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.proposalDiffOffset = 0
 
 		if len(m.pendingProposals) == 0 {
+			// ── MARK BUILD TASK COMPLETED / FAILED ─────────────────────
+			// When the proposal flow originates from handleBuildRun
+			// (non-streaming FILE_MUTATE/GIT_ACTION), update the task
+			// status so the queue advances to the next idle task.
+			if m.currentBuildTaskID > 0 && m.sess != nil {
+				tasks := m.sess.CurrentTasks
+				for i := range tasks {
+					if tasks[i].StepNum == m.currentBuildTaskID {
+						if msg.err != nil {
+							tasks[i].Status = "failed"
+						} else {
+							tasks[i].Status = "completed"
+						}
+						break
+					}
+				}
+				m.sess.StageTaskList(&tasks)
+				_ = m.sess.Save()
+			}
+
 			m.ti.Focus()
 			m.state = StateChat
 			m.recalcViewportHeight()
@@ -1062,8 +1137,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				outcomeLine := fmt.Sprintf("%s %s • %s", successBannerStyle.Render("[✓]"), msg.file, msg.status)
 				m.push(roleSystem, outcomeLine)
 				m.createBuildCheckpoint(1)
-				// Handoff: unbuffered build verification test
+				// ── ADVANCE BUILD QUEUE ────────────────────────────────
+				// After a FILE_MUTATE/GIT_ACTION task completes, check for
+				// the next idle task and execute it.
 				if m.resolver.Current() == modes.ModeBuild {
+					hasNext := false
+					for _, t := range m.sess.CurrentTasks {
+						if t.Status == "idle" || t.Status == "processing" {
+							hasNext = true
+							break
+						}
+					}
+					if hasNext {
+						m.refreshViewportContent()
+						flush := m.flushPendingRecords()
+						return m, tea.Batch(flush, m.handleBuildRun(0))
+					}
+					// All tasks done — run verification test.
 					m.buildVerifyPending = true
 					m.refreshViewportContent()
 					m.push(roleSystem, "Verifying build...")
@@ -1198,6 +1288,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if emit > 80 {
 				emit = 80
+				// Walk back to the start of the current UTF-8 rune to avoid
+				// splitting a multi-byte character.
+				for emit > 0 && !utf8.RuneStart(m.streamBuffer[emit]) {
+					emit--
+				}
 			}
 			m.currentStreamContent += m.streamBuffer[:emit]
 			m.streamBuffer = m.streamBuffer[emit:]
@@ -1560,8 +1655,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.resolver.Current() == modes.ModeBuild && m.state != StateAwaitingApproval {
-			props := extractBuildProposals(final)
-			diffProps := extractDiffPatches(final)
+			// Strip conversational preamble before patch extraction so that
+			// system boilerplate like "Understood. I will follow..." never blocks
+			// patch application during auto-recovery.
+			clean := build.StripNonPatchProse(final)
+			props := extractBuildProposals(clean)
+			diffProps := extractDiffPatches(clean)
 			if len(diffProps) > 0 {
 				existing := make(map[string]bool)
 				for _, p := range props {
@@ -2276,7 +2375,8 @@ func (m *model) handleViCmdInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyBackspace, tea.KeyDelete:
 		if len(m.viCmdBuf) > 0 {
-			m.viCmdBuf = m.viCmdBuf[:len(m.viCmdBuf)-1]
+			_, size := utf8.DecodeLastRuneInString(m.viCmdBuf)
+			m.viCmdBuf = m.viCmdBuf[:len(m.viCmdBuf)-size]
 		}
 		return m, nil
 

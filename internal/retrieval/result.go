@@ -9,6 +9,10 @@ type Result struct {
 	Strategy   string  `json:"strategy"`
 	SymbolName string  `json:"symbol_name,omitempty"`
 	SymbolKind string  `json:"symbol_kind,omitempty"`
+	// Score carries the raw BM25 relevance score from the LX Rust daemon.
+	// When non-zero, this is the authoritative relevance signal.
+	// Confidence is a derived label; Score is the raw value from the daemon.
+	Score float64 `json:"score,omitempty"`
 }
 
 type ResultSet struct {

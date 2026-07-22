@@ -159,6 +159,11 @@ func (fc *FallbackChain) Grep(pattern string) *ResultSet {
 func (fc *FallbackChain) ReadFile(path string) *ResultSet {
 	rs := &ResultSet{Strategy: "read.file"}
 
+	// Strip any :line:col suffix from compiler error targets before opening.
+	if clean, _ := SplitTargetPath(path); clean != "" {
+		path = clean
+	}
+
 	if globalActivityLog != nil {
 		globalActivityLog("[system] read file: %s", path)
 	}
@@ -192,6 +197,11 @@ func (fc *FallbackChain) ReadFile(path string) *ResultSet {
 
 func (fc *FallbackChain) ReadLines(path string, startLine, endLine int) *ResultSet {
 	rs := &ResultSet{Strategy: "read.file"}
+
+	// Strip any :line:col suffix from compiler error targets before opening.
+	if clean, _ := SplitTargetPath(path); clean != "" {
+		path = clean
+	}
 
 	if globalActivityLog != nil {
 		globalActivityLog("[system] read file: %s (lines %d-%d)", path, startLine, endLine)

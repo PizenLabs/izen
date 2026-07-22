@@ -30,7 +30,7 @@ type ExecutionSummary struct {
 // and when to display it, keeping /build quiet and lightning-fast mid-run.
 func RenderExecutionSummary(s ExecutionSummary) string {
 	var b strings.Builder
-	b.WriteString("**🚀 BUILD MUTATION SUMMARY**\n")
+	b.WriteString("**⛟  BUILD MUTATION SUMMARY**\n")
 
 	status := "SUCCESS"
 	if !s.Success {

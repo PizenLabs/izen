@@ -3,7 +3,19 @@ package plan
 import (
 	"regexp"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/retrieval"
 )
+
+// ansiTrimRE matches ANSI escape sequences used in terminal output.
+var ansiTrimRE = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
+// stripANSI removes terminal control sequences from a string, including
+// ANSI escape codes, carriage returns, and other non-printable artifacts.
+func stripANSI(s string) string {
+	s = strings.ReplaceAll(s, "\r", "")
+	return ansiTrimRE.ReplaceAllString(s, "")
+}
 
 // localModelPrefixes lists model name prefixes that identify local/on-device
 // SLMs (Ollama, llama.cpp, etc.). Local 7B-class models choke on large forensic
@@ -216,6 +228,28 @@ func isHighValueLine(line string) bool {
 	return coordinateRe.MatchString(line)
 }
 
+// HasCanonicalImportMismatch reports whether the ledger content contains a Go
+// canonical import path mismatch error — "module declares its path as: X but was
+// required as: Y". When detected, the resolution strategy MUST include FILE_EDIT
+// tasks at lx-resolved coordinates rather than resorting to SHELL_EXEC only.
+func HasCanonicalImportMismatch(ledger string) bool {
+	if ledger == "" {
+		return false
+	}
+	return retrieval.HasCanonicalMismatch(ledger)
+}
+
+// HasUndefinedSymbolError reports whether the ledger content contains a Go
+// "undefined: <Symbol>" compiler error. When detected with valid lx coordinates,
+// a deterministic FILE_EDIT plan is generated to correct the symbol at the
+// error location, bypassing LLM JSON plan synthesis.
+func HasUndefinedSymbolError(ledger string) bool {
+	if ledger == "" {
+		return false
+	}
+	return retrieval.HasUndefinedSymbol(ledger)
+}
+
 // CoreErrorLine extracts the single most diagnostic line from a raw ledger —
 // the first line that carries an error coordinate or a module/dependency
 // message. Falls back to the first non-empty line when no marker matches.
@@ -341,6 +375,37 @@ func ExtractConclusionFromLedger(ledger string) string {
 	}
 	if len(payloadLines) > 0 {
 		return strings.Join(payloadLines, " ")
+	}
+
+	// Fallback: parse the conclusion from FormatForPlan's DONE: line.
+	// This handles the case where injectDependencyBlocker stores the blocker
+	// in e.Ledger.Conclusion (output as DONE:) rather than as a packet.
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "DONE: ") {
+			var parts []string
+			parts = append(parts, stripANSI(strings.TrimPrefix(trimmed, "DONE: ")))
+			// Collect continuation lines not starting with known FormatForPlan prefixes.
+			for j := i + 1; j < len(lines); j++ {
+				next := strings.TrimSpace(lines[j])
+				cleanNext := stripANSI(next)
+				// RULE 1: visual box-drawing separator → skip but keep scanning
+				if strings.Contains(cleanNext, "══") || strings.Contains(cleanNext, "──") || strings.Contains(cleanNext, "│") {
+					continue
+				}
+
+				// RULE 2: only break on guaranteed FormatForPlan markers
+				if strings.HasPrefix(cleanNext, "D:") || strings.HasPrefix(cleanNext, "ROOT:") || strings.HasPrefix(cleanNext, "TGT:") {
+					break
+				}
+
+				// RULE 3: capture blocker tokens or non-metadata lines
+				if strings.Contains(cleanNext, "REMOTE DEPENDENCY BLOCKER") || !strings.HasPrefix(cleanNext, "[") {
+					parts = append(parts, cleanNext)
+				}
+			}
+			return strings.Join(parts, " ")
+		}
 	}
 	return ""
 }

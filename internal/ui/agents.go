@@ -112,8 +112,9 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 				b.WriteString("\nEvidence:\n")
 				for _, ev := range result.Evidence {
 					c := ev.Content
-					if len(c) > 60 {
-						c = c[:60] + "…"
+					runes := []rune(c)
+					if len(runes) > 60 {
+						c = string(runes[:60]) + "…"
 					}
 					fmt.Fprintf(&b, "  [%s] %s\n", ev.Source, c)
 				}
