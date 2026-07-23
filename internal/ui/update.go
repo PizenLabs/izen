@@ -349,12 +349,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(msg.records) == 0 {
 			m.push(roleSystem, "Investigation complete — no structured findings to report.")
 		}
-		m.push(roleStatus, "Investigation complete. Context-Ledger ready for /plan handoff.")
-		// PERSISTENT NAVIGATION CHIPS (BUG 1): always populate the navigation
-		// controls so the user is never left with a dead viewport after a fast
-		// (cached) transition. "📋 Plan Solution" submits /plan against the
-		// structured diagnostic payload; "🔄 Re-investigate" re-runs /investigate.
-		m.currentResult = investigateResultActions()
+		m.push(roleStatus, "Investigation complete. Auto-transitioning to /plan for execution synthesis...")
+
+		// ── AUTO-HANDOFF: /investigate -> /plan ────────────────────────────
+		// Once investigation completes with a valid Context Ledger, automatically
+		// transition to /plan to synthesize the structured execution timeline.
+		// The plan will be rendered for user review (Approve, Edit, Add/Remove,
+		// Reject) — automatic execution without human approval is strictly forbidden.
+		m.handoffCtx.ProposedFix = m.handoffLedgerContent
+		if m.handoffLedgerContent != "" {
+			m.modeChangeAuthorized = true
+			m.setMode(modes.ModePlan)
+		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
@@ -407,26 +413,32 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
 		}
-		m.push(roleStatus, fmt.Sprintf("Plan staged: %d task(s). Use /build to execute.", len(msg.Tasks)))
+		m.push(roleStatus, fmt.Sprintf("Plan staged: %d task(s). Approve (Alt+P) or Reject (Alt+R).", len(msg.Tasks)))
 		// Render the staged task list into the viewport so the developer can
 		// see exactly what /build will execute — Principal Engineer format.
+		// Use [ ] checkbox markers for each pending task to create an
+		// interactive todo checklist look in the TUI.
+		// Also expose the plan approval action chips — the user must explicitly
+		// approve the plan before /build execution begins.
+		m.currentResult = planApprovalActions()
 		var tb strings.Builder
 		tb.WriteString(boldSapphireStyle.Render(Icon.Blueprint+" STRATEGIC ARCHITECTURAL BLUEPRINT") + "\n")
 		tb.WriteString("  ▸ Impact Domain      : Execution Layer — Dependency Resolution\n")
 		tb.WriteString("  ▸ Risk Evaluation    : Low — Scoped dependency resolution\n")
 		tb.WriteString("  ▸ Verification Vector: Build + Test pipeline\n")
 		tb.WriteString("\n")
-		tb.WriteString(boldMauveStyle.Render(Icon.Timeline+" STAGED EXECUTION TIMELINE") + "\n")
+		tb.WriteString(boldMauveStyle.Render(Icon.Timeline+" TODO CHECKLIST") + "\n")
 		for _, t := range msg.Tasks {
 			icon, track := planTrackIcon(t)
-			fmt.Fprintf(&tb, "%s [%s] %s\n", icon, track, t.Target)
-			if t.Rationale != "" {
-				fmt.Fprintf(&tb, "  ↳ Rationale: %s\n", t.Rationale)
+			fmt.Fprintf(&tb, "[ ] %s [%s] %s\n", icon, track, t.Target)
+			if t.Description != "" {
+				fmt.Fprintf(&tb, "      %s\n", t.Description)
+			}
+			if t.Rationale != "" && t.Rationale != t.Description {
+				fmt.Fprintf(&tb, "      %s\n", t.Rationale)
 			}
 			if t.Solution != "" {
-				fmt.Fprintf(&tb, "  ↳ Expected Solution: %s\n", t.Solution)
-			} else if t.Description != "" && t.Rationale == "" {
-				fmt.Fprintf(&tb, "  ↳ Rationale: %s\n", t.Description)
+				fmt.Fprintf(&tb, "      %s\n", t.Solution)
 			}
 		}
 		m.push(roleStatus, tb.String())
@@ -614,6 +626,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.resolver.Current() == modes.ModeBuild {
 				m.push(roleSystem, "Build verification complete.")
+
+				// ── AUTO-HANDOFF: /build → /review ──────────────────────────
+				// All build tasks completed successfully and verification tests
+				// passed. Transition to /review for a full architectural review
+				// of the changes. This enforces the automated handoff chain:
+				// /investigate → /plan → approval → /build → /review.
+				if msg.passed {
+					m.modeChangeAuthorized = true
+					m.setMode(modes.ModeReview)
+				}
 			}
 		}
 
@@ -893,6 +915,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		flush := m.flushPendingRecords()
 		if hasNext && m.resolver.Current() == modes.ModeBuild {
 			return m, tea.Batch(flush, m.handleBuildRun(0))
+		}
+		// ── AUTO-HANDOFF: /build → /review ──────────────────────────────
+		// All SHELL_EXEC steps completed successfully and no more tasks
+		// remain. Transition to /review for a full architectural review.
+		if !hasNext && m.resolver.Current() == modes.ModeBuild {
+			m.modeChangeAuthorized = true
+			m.setMode(modes.ModeReview)
 		}
 		return m, flush
 

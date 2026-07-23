@@ -25,10 +25,12 @@ type planView struct{}
 func (planView) BuildWorkspace(m *model) Workspace {
 	var actions []Action
 	if len(m.handoffCtx.PendingTodos) > 0 {
+		// Render a visible TODO checklist with checkbox markers so the user
+		// can see exactly what will be executed before approving.
 		var todoBlock strings.Builder
-		todoBlock.WriteString("Execute the planned staged execution timeline:\n")
+		todoBlock.WriteString("Planned staged execution timeline:\n")
 		for _, t := range m.handoffCtx.PendingTodos {
-			fmt.Fprintf(&todoBlock, "  %s\n", t)
+			fmt.Fprintf(&todoBlock, "  [ ] %s\n", t)
 		}
 		actions = append(actions, Action{
 			ID:       "execute-patch",
@@ -39,10 +41,15 @@ func (planView) BuildWorkspace(m *model) Workspace {
 			Enabled:  true,
 			Priority: 100,
 		})
+	}
+	// Always show the plan approval (Approve/Reject) actions when tasks are
+	// staged, so the user can approve or reject from the workspace view.
+	if len(m.handoffCtx.PendingTodos) > 0 {
+		approveReject := planApprovalActions()
+		if approveReject != nil {
+			actions = append(actions, approveReject.Actions...)
+		}
 	} else if len(m.currentResultActions()) > 0 {
-		// Fallback: when no plan was staged (zero tasks / error), surface the
-		// baseline Action Chips from the current workflow result so the user
-		// is never left with a dead viewport and no buttons.
 		actions = append(actions, m.currentResultActions()...)
 	}
 	ws := m.assembleScreen(actions)

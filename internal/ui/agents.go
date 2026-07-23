@@ -57,6 +57,10 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			retriever := investigate.NewRetrieverAdapter(retrieval.NewRetriever(".", m.graph))
 			executor := investigate.NewShellTestExecutor(".")
 			eng := investigate.NewEngineWithAI(".", content, retriever, executor, m.provider, m.cfg.ActiveModelName())
+			// Classify intent from the investigation content to enforce ENV_DEPS guard.
+			// Feature/UnitTest/Refactor intents skip external dependency search and
+			// Docker checks — only Bug/Regression intents get full forensic treatment.
+			eng.Intent = investigate.ClassifyIntent(content)
 			result, err := eng.RunContext(ctx)
 			ledgerContent := eng.FormatLedgerForPlan()
 			outCh <- outcome{result: result, err: err, ledgerForPlan: ledgerContent, engLedger: eng.Ledger}
@@ -488,7 +492,48 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 	)
 }
 
-func (m *model) runUndoCmd() tea.Cmd {
+func (m *model) runUndoCmd(raw string) tea.Cmd {
+	parts := strings.Fields(raw)
+	hasAll := false
+	hasSession := false
+	for _, p := range parts[1:] {
+		switch strings.ToLower(p) {
+		case "--all", "all":
+			hasAll = true
+		case "--session", "session":
+			hasSession = true
+		}
+	}
+
+	if hasAll || hasSession {
+		if hasAll {
+			if m.gitEng == nil {
+				m.push(roleError, "git engine not available")
+				return nil
+			}
+			if err := m.gitEng.CheckoutFile("."); err != nil {
+				m.push(roleError, "undo --all failed: "+err.Error())
+				return nil
+			}
+			m.push(roleStatus, "✓ Reverted all working directory changes")
+			return nil
+		}
+		// --session: restore session-start checkpoint
+		if m.execEng == nil || m.execEng.ShadowCP == nil {
+			m.push(roleError, "session engine not available")
+			return nil
+		}
+		if err := m.execEng.ShadowCP.RestoreSessionStart(); err != nil {
+			m.push(roleError, "undo --session failed: "+err.Error())
+			return nil
+		}
+		m.sess.Checkpoints = nil
+		_ = m.sess.Save()
+		m.push(roleStatus, "✓ Reverted all working directory changes")
+		return nil
+	}
+
+	// Default: single-step undo
 	checkpoints := m.sess.Checkpoints
 	if len(checkpoints) == 0 {
 		m.push(roleError, "no checkpoints to undo")

@@ -92,6 +92,31 @@ func investigateResultActions() *Result {
 	}}
 }
 
+// planApprovalActions builds the persistent navigation controls exposed when
+// /plan synthesis completes. The user must explicitly approve or reject
+// the plan before any execution occurs. This enforces human-in-the-loop approval
+// for the staged execution timeline.
+func planApprovalActions() *Result {
+	return &Result{Actions: []Action{
+		{
+			ID:       "approve-plan",
+			Label:    "✓ Approve Plan",
+			Shortcut: "alt+p",
+			Command:  "/build",
+			Enabled:  true,
+			Priority: 100,
+		},
+		{
+			ID:       "reject-plan",
+			Label:    "✗ Reject & Back",
+			Shortcut: "alt+r",
+			Command:  "/ask",
+			Enabled:  true,
+			Priority: 90,
+		},
+	}}
+}
+
 // currentResultActions returns the capabilities exposed by the current workflow
 // result. Returns nil when no result is active for the current view.
 func (m *model) currentResultActions() []Action {

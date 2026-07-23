@@ -39,6 +39,9 @@ func IsAmbiguousSnippet(original, diffInput string) bool {
 	if strings.Contains(diffInput, "<<<<<<< SEARCH") {
 		return false
 	}
+	if strings.Contains(diffInput, "<<<<<<< FILE_CREATE") {
+		return false
+	}
 	if strings.Contains(diffInput, "@@") {
 		return false
 	}
@@ -539,6 +542,54 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	// markers, stray code fences) that local models inject inside code blocks
 	// before the content enters the diff parser or file write path.
 	patch.Modified = SanitizeLLMResponse(patch.Modified)
+
+	// ── FILE_CREATE PROTOCOL: extract file path and pure content from
+	// <<<<<<< FILE_CREATE: path ... >>>>>>> END_FILE blocks. This MUST run
+	// before SplitAndFilterPatches and the main diff/SEARCH/REPLACE flow so
+	// new files are written directly without hunk matching against nonexistent
+	// originals. When a FILE_CREATE block is detected, patch.File is updated
+	// to the canonical path from the block header and patch.Modified is
+	// replaced with the content only (markers stripped).
+	if fileCreateBlocks := parseFileCreateBlocks(patch.Modified); len(fileCreateBlocks) > 0 {
+		block := fileCreateBlocks[0]
+		patch.File = block.FilePath
+		patch.Modified = block.Content
+		// Recompute fullPath with the updated file path so the shadow backup,
+		// write, and verification all target the correct location.
+		cleaned = filepath.Clean(patch.File)
+		if cleaned == "." || cleaned == "/" || strings.Contains(cleaned, "..") {
+			return fmt.Errorf("invalid FILE_CREATE path: %s", patch.File)
+		}
+		fullPath = filepath.Join(pm.root, cleaned)
+		dir = filepath.Dir(fullPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", dir, err)
+		}
+		patch.Original = ""
+		if pm.tx != nil {
+			if err := pm.tx.Record(fullPath); err != nil {
+				return fmt.Errorf("transaction record %s: %w", patch.File, err)
+			}
+		}
+		if err := pm.createShadowBackup(fullPath); err != nil {
+			return fmt.Errorf("shadow backup %s: %w", patch.File, err)
+		}
+		// Write the new file directly — skip diff/SEARCH/REPLACE flow.
+		if err := os.WriteFile(fullPath, []byte(patch.Modified), 0644); err != nil {
+			return fmt.Errorf("write %s: %w", patch.File, err)
+		}
+		if globalActivityLog != nil {
+			lineCount := len(strings.Split(patch.Modified, "\n"))
+			globalActivityLog("[ OK ] created file %s (%d lines) via FILE_CREATE", patch.File, lineCount)
+		}
+		patch.ContextID = pm.contextID
+		patch.Applied = true
+		if err := pm.appendMutationLog(patch.File, patch.ID); err != nil {
+			return fmt.Errorf("patch applied but audit log failed: %w", err)
+		}
+		pm.recordLedgerAndSummarize(patch)
+		return pm.store(patch)
+	}
 
 	// SplitAndFilterPatches: strip hunks targeting other files from the raw
 	// LLM diff output before passing it to the patching engine. This handles
@@ -1149,6 +1200,55 @@ func applySearchReplaceBlock(original, modified string) (string, bool) {
 	}
 
 	return original, false
+}
+
+// fileCreateBlock represents a parsed <<<<<<< FILE_CREATE: path ... >>>>>>> END_FILE block.
+type fileCreateBlock struct {
+	FilePath string
+	Content  string
+}
+
+// parseFileCreateBlocks scans content for <<<<<<< FILE_CREATE: path ... >>>>>>> END_FILE
+// blocks and returns the parsed blocks. Each block contains the file path from the
+// header line and the content between the header and END_FILE terminator.
+// Returns nil if no valid blocks are found.
+func parseFileCreateBlocks(content string) []fileCreateBlock {
+	var blocks []fileCreateBlock
+	lines := strings.Split(content, "\n")
+
+	var inBlock bool
+	var filePath string
+	var contentLines []string
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "<<<<<<< FILE_CREATE:") || strings.HasPrefix(trimmed, "<<<<<<< FILE_CREATE ") {
+			inBlock = true
+			contentLines = nil
+			// Extract file path after "FILE_CREATE:" or "FILE_CREATE "
+			pathPart := strings.TrimPrefix(trimmed, "<<<<<<< FILE_CREATE:")
+			if pathPart == trimmed {
+				pathPart = strings.TrimPrefix(trimmed, "<<<<<<< FILE_CREATE ")
+			}
+			filePath = strings.TrimSpace(pathPart)
+			continue
+		}
+		if inBlock && (trimmed == ">>>>>>> END_FILE" || strings.HasPrefix(trimmed, ">>>>>>> END_FILE")) {
+			blocks = append(blocks, fileCreateBlock{
+				FilePath: filePath,
+				Content:  strings.Join(contentLines, "\n"),
+			})
+			inBlock = false
+			filePath = ""
+			contentLines = nil
+			continue
+		}
+		if inBlock {
+			contentLines = append(contentLines, line)
+		}
+	}
+
+	return blocks
 }
 
 // searchReplaceBlock represents a parsed <<<<<<< SEARCH ... ======= ... >>>>>>> block.

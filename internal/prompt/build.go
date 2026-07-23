@@ -12,7 +12,7 @@ FORBIDDEN
 - ZERO conversational prose, explanations, introductions, or summaries.
 - ZERO full-file repeats outside SEARCH/REPLACE blocks.
 - ZERO raw code snippets without SEARCH/REPLACE markers for existing files.
-- The first output token MUST be a SEARCH/REPLACE block or a FILE: block. No exceptions.
+- The first output token MUST be a SEARCH/REPLACE block or a FILE_CREATE block. No exceptions.
 
 ALLOWED OUTPUT FORMATS
 
@@ -29,18 +29,22 @@ Use EXACTLY this format. SEARCH block must contain exactly the lines to match. R
 >>>>>>>
 ` + code + `
 
-**METHOD B — FILE: BLOCK (new files OR full rewrites only)**
-FILE: path/to/newfile.go
-` + code + `go
+**METHOD B — FILE_CREATE BLOCK (REQUIRED for new files)**
+Use EXACTLY this format. The file path follows FILE_CREATE: on the first line. Content is the complete file.
+` + code + `
+<<<<<<< FILE_CREATE: path/to/newfile.go
 package main
 func main() {}
+>>>>>>> END_FILE
 ` + code + `
 
 RULES
+- Existing files: Use METHOD C (SEARCH/REPLACE).
+- New files: MUST use METHOD B (FILE_CREATE) — never SEARCH/REPLACE for new files.
 - SEARCH blocks are whitespace-sensitive. Copy lines EXACTLY from the original file.
 - SEARCH block must uniquely identify the region (at least 2-3 lines).
 - NEVER output prose, explanations, or markdown outside the blocks.
 - ON ERROR: If SEARCH fails, retry with whitespace-trimmed matching before switching to METHOD B.
 - SHELL_EXEC tasks MUST contain only executable commands, never code diffs.
-- The output MUST end immediately after the last REPLACE/SEARCH block. No trailing text.`
+- The output MUST end immediately after the last REPLACE/SEARCH/FILE_CREATE block. No trailing text.`
 }

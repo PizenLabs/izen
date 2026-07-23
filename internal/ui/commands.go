@@ -192,13 +192,13 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return m.runReviewTestComposite()
 	}
 
-	// ── $prompt in /ask — STATELESS SENIOR ARCHITECT REFINER ────────────
-	// Evaluated BEFORE the generic $ handler to guarantee complete decoupling
-	// from the normal chat streaming path. Takes a raw text summary from the
-	// developer ($prompt <raw_idea>) and passes it directly to the
-	// Strict Senior Architect persona — no session history aggregation, no
-	// JSON wrapping. MUST never touch handleMessageContent or streamCmd.
-	if m.resolver.Current() == modes.ModeAsk && (line == "$prompt" || strings.HasPrefix(line, "$prompt ")) {
+	// ── $prompt — GLOBAL MODE-GUARD ROUTER TO /ask ───────────────────────
+	// $prompt is a global routing entry point, not an execution mode. From
+	// ANY active mode it transitions cleanly to /ask, injecting the query as
+	// /ask input for structured Forensic Context Ledger generation. It MUST
+	// NEVER execute /build, /review, /plan, or /investigate logic inside the
+	// originating mode — the only allowed action is the transition to /ask.
+	if line == "$prompt" || strings.HasPrefix(line, "$prompt ") {
 		m.cancelStaleAgentOps()
 		if line == "$prompt" {
 			m.push(roleError, "[Usage] $prompt <your raw architectural idea or description>")
@@ -207,6 +207,26 @@ func (m *model) handleInput(line string) tea.Cmd {
 			return nil
 		}
 		rawInput := strings.TrimSpace(line[8:])
+
+		currentMode := m.resolver.Current()
+		if currentMode != modes.ModeAsk {
+			// Mode Guard Enforced: request state transition to /ask, then
+			// queue the $prompt synthesis directly via runAskPromptHandoffCmd.
+			// This preserves the Senior Architect system template
+			// (AskPromptHandoffContract) — we MUST NOT re-enter handleInput
+			// because the raw input no longer carries the $prompt prefix and
+			// would be routed to the normal AskContract() streaming path,
+			// producing conversational noise instead of the structured
+			// 5-point Forensic Context Ledger.
+			m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
+				"$prompt from /%s — transitioning to /ask for structured analysis...", currentMode)))
+			m.modeChangeAuthorized = true
+			cmd := m.setMode(modes.ModeAsk)
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return tea.Batch(cmd, m.runAskPromptHandoffCmd(rawInput))
+		}
+
 		m.push(roleSystem, infoStyle.Render("Refining architectural idea through Senior Architect analysis..."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -988,11 +1008,11 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	if mode == modes.ModePlan || mode == modes.ModeInvestigate {
 		m.planApproved = false
 	}
-	// Transitioning from /plan to /build marks the plan as approved so
-	// the orchestrator never re-enters /plan for the same execution cycle.
-	if mode == modes.ModeBuild && m.resolver.Current() == modes.ModePlan {
-		m.planApproved = true
-	}
+	// HUMAN-IN-THE-LOOP: plan approval is now managed explicitly via
+	// planApprovalActions (Approve/Reject chips). The m.planApproved flag
+	// is set only when the user explicitly approves the plan through the
+	// action chip handler. The old auto-approve-on-transition behavior is
+	// removed — every /plan → /build transition now requires human sign-off.
 
 	// ── HANDOFF SANITIZER (BUG 3): clear ALL transient raw-string state on
 	// every mode transition so the target mode can never inherit stale
@@ -1428,8 +1448,8 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		}
 		return nil
 
-	case cmd == "/undo":
-		return m.runUndoCmd()
+	case strings.HasPrefix(cmd, "/undo"):
+		return m.runUndoCmd(cmd)
 
 	case cmd == "/commit":
 		if m.resolver.Current() != modes.ModeBuild {
@@ -1624,14 +1644,25 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 	}
 
 	// Materialize PendingTodos into typed tasks if no staged tasks exist yet.
+	// Parse the formatted string "[TYPE] target — description" back into
+	// structured Task fields so the build dispatcher routes to the correct
+	// execution path (FILE_MUTATE/SHELL_EXEC) instead of the generic streaming
+	// path that produces conversational prose.
 	if !hasStagedTasks && hasPendingTodos {
 		var tasks []plan.Task
 		for i, t := range m.handoffCtx.PendingTodos {
+			taskType, taskTarget, taskDesc := parsePendingTodo(t)
+			if taskType == "" {
+				taskType = "task"
+			}
+			if taskTarget == "" {
+				taskTarget = "workspace"
+			}
 			tasks = append(tasks, plan.Task{
 				StepNum:     i + 1,
-				Type:        "task",
-				Target:      "workspace",
-				Description: t,
+				Type:        taskType,
+				Target:      taskTarget,
+				Description: taskDesc,
 				Status:      "idle",
 			})
 		}
@@ -1643,6 +1674,41 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 
 	// Execute the first idle staged task.
 	return m.handleBuildRun(0)
+}
+
+// parsePendingTodo extracts the task type, target, and description from a
+// PendingTodos string formatted as:
+//
+//	<icon> [<TYPE>] <target> — <description>
+//
+// The icon prefix is stripped; the type is extracted from the first bracket
+// pair; the target is the text between the closing bracket and the em-dash;
+// the description is everything after the em-dash. Returns empty strings for
+// any component that cannot be parsed, so the caller can apply defaults.
+func parsePendingTodo(todo string) (taskType, taskTarget, taskDesc string) {
+	// Strip leading icon (non-space characters before the first space)
+	trimmed := strings.TrimSpace(todo)
+	if idx := strings.Index(trimmed, " "); idx > 0 {
+		trimmed = strings.TrimSpace(trimmed[idx+1:])
+	}
+
+	// Extract [TYPE]
+	if open := strings.Index(trimmed, "["); open >= 0 {
+		if close := strings.Index(trimmed[open:], "]"); close > 0 {
+			taskType = strings.TrimSpace(trimmed[open+1 : open+close])
+			trimmed = strings.TrimSpace(trimmed[open+close+1:])
+		}
+	}
+
+	// Split on " — " to separate target from description
+	if idx := strings.Index(trimmed, " — "); idx >= 0 {
+		taskTarget = strings.TrimSpace(trimmed[:idx])
+		taskDesc = strings.TrimSpace(trimmed[idx+3:])
+	} else {
+		taskTarget = trimmed
+	}
+
+	return
 }
 
 // handleHotfixCmd implements the $hot urgent hotfix workflow in /build mode.
@@ -4010,6 +4076,48 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 			return m.setMode(mode)
 		}
 		return nil
+	}
+
+	// Mode-switch command chips: /investigate, /plan, /build, /ask, /review
+	// These are NOT in validSystemCommands — they must be routed as mode
+	// transitions instead of falling through to handleCommand.
+	if mode, content, ok := parseModeShorthand(action.Command); ok {
+		m.modeChangeAuthorized = true
+
+		// ── PLAN APPROVAL GATE ─────────────────────────────────────────
+		// When the user explicitly approves the plan via the action chip,
+		// set planApproved = true so the /build handoff engine fires.
+		// Without this explicit approval, /build remains blocked.
+		if action.ID == "approve-plan" {
+			m.planApproved = true
+			m.push(roleSystem, infoStyle.Render("✓ Plan approved. Transitioning to /build for execution..."))
+		}
+
+		// ── PLAN REJECTION ─────────────────────────────────────────────
+		// When the user rejects the plan, clear all handoff context including
+		// staged tasks so no stale plan data leaks into the next cycle.
+		if action.ID == "reject-plan" {
+			m.push(roleSystem, infoStyle.Render("✗ Plan rejected. Clearing staged tasks..."))
+			m.handoffCtx = HandoffContext{}
+			m.handoffLedgerContent = ""
+			if m.sess != nil {
+				m.sess.ClearTasks()
+				m.sess.ContextLedger = nil
+				_ = m.sess.Save()
+			}
+		}
+
+		m.handoffCtx.ProposedFix = ""
+		m.handoffLedgerContent = ""
+		m.currentResult = nil
+		cmd := m.setMode(mode)
+		if action.Query != "" {
+			return m.handleMessageContent(action.Query)
+		}
+		if content != "" {
+			return m.handleMessageContent(content)
+		}
+		return cmd
 	}
 
 	// Direct command capabilities: /commit, /undo, etc.
