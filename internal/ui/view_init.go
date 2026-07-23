@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -181,6 +182,12 @@ func (m *model) renderInitProviderSelect(width int) string {
 		status := ""
 		if item == activeProvider {
 			status = initMutedStyle.Render(" (active)")
+		}
+		envVar := envVarForProvider(item)
+		if envVar != "" && os.Getenv(envVar) != "" {
+			if status == "" {
+				status = initGreenStyle.Render(" ✓")
+			}
 		}
 		line := fmt.Sprintf("  %s %s%s", style.Render(glyph), initTextStyle.Render(item), status)
 		b.WriteString(line)

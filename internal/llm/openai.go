@@ -70,9 +70,15 @@ type openAIDelta struct {
 }
 
 type openAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens     int                  `json:"prompt_tokens"`
+	CompletionTokens int                  `json:"completion_tokens"`
+	TotalTokens      int                  `json:"total_tokens"`
+	Cost             float64              `json:"cost,omitempty"`
+	PromptDetails    *openAIPromptDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+type openAIPromptDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 func (c *OpenAIClient) Name() string {
@@ -157,13 +163,38 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 	}
 	content = SanitizeOutput(content)
 
-	tokenIn, tokenOut := 0, 0
+	tokenIn, tokenOut, cacheRead := 0, 0, 0
+	var cost float64
 	if openaiResp.Usage != nil {
 		tokenIn = openaiResp.Usage.PromptTokens
 		tokenOut = openaiResp.Usage.CompletionTokens
+		cost = openaiResp.Usage.Cost
+		if openaiResp.Usage.PromptDetails != nil {
+			cacheRead = openaiResp.Usage.PromptDetails.CachedTokens
+		}
 	}
 
-	return LLMResponse{Content: content, TokenInput: tokenIn, TokenOutput: tokenOut}, nil
+	llmResp := LLMResponse{
+		Content:         content,
+		TokenInput:      tokenIn,
+		TokenOutput:     tokenOut,
+		CacheReadTokens: cacheRead,
+	}
+
+	if strings.Contains(c.baseURL, "openrouter") {
+		modelID := c.resolveModel(req.Model)
+		usage := CalculateCost(modelID, UsageReport{
+			InputTokens:  tokenIn,
+			OutputTokens: tokenOut,
+		})
+		llmResp.TotalCostUSD = usage.TotalCostUSD
+		if cost > 0 {
+			llmResp.TotalCostUSD = cost
+		}
+		llmResp.TotalCostUSD = EnforceFreeModelOverride(modelID, llmResp.TotalCostUSD)
+	}
+
+	return llmResp, nil
 }
 
 func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, handler StreamHandler) (LLMResponse, error) {
@@ -204,7 +235,8 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	}
 
 	var full strings.Builder
-	tokenIn, tokenOut := 0, 0
+	tokenIn, tokenOut, cacheRead := 0, 0, 0
+	var cost float64
 	reader := newOpenAIStreamReader(resp.Body)
 
 	for {
@@ -220,6 +252,10 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		if chunk.Usage != nil {
 			tokenIn = chunk.Usage.PromptTokens
 			tokenOut = chunk.Usage.CompletionTokens
+			cost = chunk.Usage.Cost
+			if chunk.Usage.PromptDetails != nil {
+				cacheRead = chunk.Usage.PromptDetails.CachedTokens
+			}
 		}
 
 		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil && chunk.Choices[0].Delta.Content != "" {
@@ -234,11 +270,27 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		}
 	}
 
-	return LLMResponse{
-		Content:     SanitizeOutput(full.String()),
-		TokenInput:  tokenIn,
-		TokenOutput: tokenOut,
-	}, nil
+	llmResp := LLMResponse{
+		Content:         SanitizeOutput(full.String()),
+		TokenInput:      tokenIn,
+		TokenOutput:     tokenOut,
+		CacheReadTokens: cacheRead,
+	}
+
+	if strings.Contains(c.baseURL, "openrouter") {
+		modelID := c.resolveModel(req.Model)
+		usage := CalculateCost(modelID, UsageReport{
+			InputTokens:  tokenIn,
+			OutputTokens: tokenOut,
+		})
+		llmResp.TotalCostUSD = usage.TotalCostUSD
+		if cost > 0 {
+			llmResp.TotalCostUSD = cost
+		}
+		llmResp.TotalCostUSD = EnforceFreeModelOverride(modelID, llmResp.TotalCostUSD)
+	}
+
+	return llmResp, nil
 }
 
 type openAIStreamReader struct {

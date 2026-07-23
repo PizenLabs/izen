@@ -7,6 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/llm"
 )
 
 var validProviders = map[string]string{
@@ -18,35 +19,68 @@ var validProviders = map[string]string{
 	"groq":       "GROQ_API_KEY",
 }
 
-func (m *model) listProviders() {
-	m.push(roleSystem, labelBoldStyle.Render("available providers"))
+func (m *model) runUsageCmd() tea.Cmd {
+	// ── Current Context ─────────────────────────────────────────────
+	m.push(roleSystem, labelBoldStyle.Render(" usage inspector"))
+	m.push(roleSystem, "")
 
-	defaultName := m.cfg.ActiveProviderName()
-	currentName := ""
-	if m.provider != nil {
-		currentName = m.provider.Name()
+	providerName := m.cfg.ActiveProviderName()
+	modelName := m.cfg.ActiveModelName()
+	maxTokens := m.cfg.AI.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = m.cfg.Models.MaxTokens
 	}
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Provider     %s", providerName)))
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Model        %s", modelName)))
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Max Tokens   %d", maxTokens)))
+	m.push(roleSystem, "")
 
+	// ── Last Request Breakdown ──────────────────────────────────────
+	m.push(roleSystem, labelBoldStyle.Render(" last request"))
+	inputTok := m.InputTokens
+	outputTok := m.OutputTokens
+	totalTok := m.TotalTokens
+	if totalTok == 0 {
+		totalTok = inputTok + outputTok
+	}
+	isCloud := providerName != "ollama"
+	turnCost := 0.0
+	if isCloud && totalTok > 0 {
+		turnCost = float64(inputTok)*(3.0/1_000_000) + float64(outputTok)*(15.0/1_000_000)
+	}
+	turnCost = llm.EnforceFreeModelOverride(modelName, turnCost)
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Input Tokens      %d", inputTok)))
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Output Tokens     %d", outputTok)))
+	m.push(roleSystem, infoStyle.Render("  Cache Read        — (not tracked)"))
+	m.push(roleSystem, infoStyle.Render("  Cache Write       — (not tracked)"))
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Total Tokens      %d", totalTok)))
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Total Cost        %s", llm.FormatCost(turnCost))))
+	sessionCost := llm.EnforceFreeModelOverride(modelName, m.AccumulatedCost)
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Session Cost      %s", llm.FormatCost(sessionCost))))
+	m.push(roleSystem, "")
+
+	// ── Configured Providers Status ─────────────────────────────────
+	m.push(roleSystem, labelBoldStyle.Render(" provider status"))
 	for name, envVar := range validProviders {
 		available := m.isProviderAvailable(name, envVar)
-		status := "[✗]"
+		status := "[×]"
+		detail := fmt.Sprintf("missing %s", envVar)
 		if available {
 			status = "[✓]"
+			detail = "configured"
 		}
 		marker := ""
-		if name == defaultName {
-			marker = " (default)"
-		}
-		if name == currentName {
+		if name == providerName {
 			marker = " (active)"
 		}
-		envStatus := "env: " + envVar
-		if available {
-			envStatus = "env: set"
-		}
-		m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  %s %s — %s%s", status, name, envStatus, marker)))
+		m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  %s %s — %s%s", status, name, detail, marker)))
 	}
-	m.push(roleSystem, infoStyle.Render("  usage: /provider <name>"))
+	m.push(roleSystem, "")
+	m.push(roleSystem, mutedStyle.Render("  Provider switching is automatic via /model."))
+
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
+	return nil
 }
 
 func (m *model) isProviderAvailable(name, envVar string) bool {
@@ -59,7 +93,7 @@ func (m *model) isProviderAvailable(name, envVar string) bool {
 
 func (m *model) switchProvider(name string) tea.Cmd {
 	if name == "" {
-		m.push(roleSystem, infoStyle.Render("usage: /provider <ollama|anthropic|openai|gemini|openrouter|groq>"))
+		m.push(roleSystem, infoStyle.Render("usage: /provider <name>"))
 		return nil
 	}
 

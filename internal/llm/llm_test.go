@@ -108,11 +108,11 @@ func TestProviderAdapter(t *testing.T) {
 	ctx := context.Background()
 
 	adapter := NewProviderAdapter("test",
-		func(ctx context.Context, model, system string, msgs []Message, maxTokens int, temp float64) (string, int, int, error) {
-			return "hello", 10, 5, nil
+		func(ctx context.Context, model, system string, msgs []Message, maxTokens int, temp float64) (string, int, int, int, int, error) {
+			return "hello", 10, 5, 0, 0, nil
 		},
-		func(ctx context.Context, model, system string, msgs []Message, maxTokens int, temp float64, handler StreamHandler) (int, int, error) {
-			return 10, 5, nil
+		func(ctx context.Context, model, system string, msgs []Message, maxTokens int, temp float64, handler StreamHandler) (int, int, int, int, error) {
+			return 10, 5, 0, 0, nil
 		},
 	)
 
@@ -132,8 +132,8 @@ func TestProviderAdapter(t *testing.T) {
 	}
 
 	adapterErr := NewProviderAdapter("err",
-		func(ctx context.Context, model, system string, msgs []Message, maxTokens int, temp float64) (string, int, int, error) {
-			return "", 0, 0, errors.New("test error")
+		func(ctx context.Context, model, system string, msgs []Message, maxTokens int, temp float64) (string, int, int, int, int, error) {
+			return "", 0, 0, 0, 0, errors.New("test error")
 		}, nil,
 	)
 	_, err = adapterErr.GenerateResponse(ctx, PromptRequest{})
@@ -228,8 +228,8 @@ func TestTokenEstimationFallback(t *testing.T) {
 	ollama := NewOllamaClient("http://localhost:11434/v1", "ollama", "qwen2.5-coder:7b")
 
 	adapter := NewProviderAdapter("test-ollama",
-		func(ctx context.Context, model, system string, msgs []Message, maxTokens int, temp float64) (string, int, int, error) {
-			return text, 0, 0, nil
+		func(ctx context.Context, model, system string, msgs []Message, maxTokens int, temp float64) (string, int, int, int, int, error) {
+			return text, 0, 0, 0, 0, nil
 		},
 		nil,
 	)
@@ -295,10 +295,10 @@ func TestOpenAIResolveModel(t *testing.T) {
 func TestStreamHandlerPassthrough(t *testing.T) {
 	adapter := NewProviderAdapter("passthrough",
 		nil,
-		func(ctx context.Context, model, system string, msgs []Message, maxTokens int, temp float64, handler StreamHandler) (int, int, error) {
+		func(ctx context.Context, model, system string, msgs []Message, maxTokens int, temp float64, handler StreamHandler) (int, int, int, int, error) {
 			_ = handler("hello ")
 			_ = handler("world")
-			return 10, 5, nil
+			return 10, 5, 0, 0, nil
 		},
 	)
 

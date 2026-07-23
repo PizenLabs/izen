@@ -18,6 +18,7 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/domain"
+	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/build"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -1671,12 +1672,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		delta := msg.tokenInput + msg.tokenOutput
 		m.IsCloudModel = m.cfg.ActiveProviderName() != "ollama"
-		costStr := "$free"
+		turnCost := 0.0
 		if m.IsCloudModel {
-			turnCost := float64(msg.tokenInput)*(3.0/1_000_000) + float64(msg.tokenOutput)*(15.0/1_000_000)
-			m.AccumulatedCost += turnCost
-			costStr = fmt.Sprintf("$%.4f", turnCost)
+			turnCost = float64(msg.tokenInput)*(3.0/1_000_000) + float64(msg.tokenOutput)*(15.0/1_000_000)
 		}
+		turnCost = llm.EnforceFreeModelOverride(m.cfg.ActiveModelName(), turnCost)
+		if turnCost > 0 {
+			m.AccumulatedCost += turnCost
+		}
+		costStr := llm.FormatCost(turnCost)
 		latencySec := 0.0
 		if !m.streamStartTime.IsZero() {
 			latencySec = time.Since(m.streamStartTime).Seconds()
@@ -2028,11 +2032,31 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sessionModel = msg.model.ID
 		m.cfg.Models.SessionModel = msg.model.ID
 		m.IsCloudModel = msg.model.Provider != "ollama"
+
+		modelProvider := msg.model.Provider
+		currentProvider := ""
+		if m.provider != nil {
+			currentProvider = m.provider.Name()
+		}
+
+		var cmds []tea.Cmd
+		if modelProvider != "" && modelProvider != currentProvider {
+			envVar, known := validProviders[modelProvider]
+			switch {
+			case known && m.isProviderAvailable(modelProvider, envVar):
+				cmds = append(cmds, m.switchProvider(modelProvider))
+			case modelProvider == "ollama":
+				cmds = append(cmds, m.switchProvider(modelProvider))
+			default:
+				m.push(roleError, fmt.Sprintf("[✗] Provider %q not configured — model set but provider unchanged", modelProvider))
+			}
+		}
+
 		m.ti.Focus()
 		m.push(roleSystem, accentStyle.Render(fmt.Sprintf("✓ Model set to %s [%s]", msg.model.Name, msg.model.Provider)))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
-		return m, nil
+		return m, tea.Batch(cmds...)
 	}
 
 	// ── Viewport scroll keys (any state) ─────────────────────────────────────

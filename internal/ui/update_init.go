@@ -3,6 +3,7 @@ package ui
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -213,7 +214,39 @@ func (m *model) buildProviderList() []string {
 			unique = append(unique, n)
 		}
 	}
+	// Sort: providers with env vars set first, then ollama, then the rest
+	sort.SliceStable(unique, func(i, j int) bool {
+		envI := envVarForProvider(unique[i]) != "" && os.Getenv(envVarForProvider(unique[i])) != ""
+		envJ := envVarForProvider(unique[j]) != "" && os.Getenv(envVarForProvider(unique[j])) != ""
+		if envI != envJ {
+			return envI
+		}
+		if unique[i] == "ollama" {
+			return false
+		}
+		if unique[j] == "ollama" {
+			return true
+		}
+		return unique[i] < unique[j]
+	})
 	return unique
+}
+
+func envVarForProvider(provider string) string {
+	switch provider {
+	case "anthropic":
+		return "ANTHROPIC_API_KEY"
+	case "openai":
+		return "OPENAI_API_KEY"
+	case "gemini":
+		return "GEMINI_API_KEY"
+	case "openrouter":
+		return "OPENROUTER_API_KEY"
+	case "groq":
+		return "GROQ_API_KEY"
+	default:
+		return ""
+	}
 }
 
 func mapContains(slice []string, target string) bool {

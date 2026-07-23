@@ -115,7 +115,12 @@ func (c *OllamaClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		tokenOut = len(text) / 4
 	}
 
-	return LLMResponse{Content: text, TokenInput: tokenIn, TokenOutput: tokenOut}, nil
+	return LLMResponse{
+		Content:      text,
+		TokenInput:   tokenIn,
+		TokenOutput:  tokenOut,
+		TotalCostUSD: 0,
+	}, nil
 }
 
 func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, handler StreamHandler) (LLMResponse, error) {
@@ -198,8 +203,9 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	}
 
 	return LLMResponse{
-		Content:     SanitizeOutput(full.String()),
-		TokenInput:  tokenIn,
-		TokenOutput: tokenOut,
+		Content:      SanitizeOutput(full.String()),
+		TokenInput:   tokenIn,
+		TokenOutput:  tokenOut,
+		TotalCostUSD: 0,
 	}, nil
 }

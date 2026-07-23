@@ -22,9 +22,13 @@ type Message struct {
 }
 
 type LLMResponse struct {
-	Content     string
-	TokenInput  int
-	TokenOutput int
+	Content          string
+	TokenInput       int
+	TokenOutput      int
+	CacheWriteTokens int
+	CacheReadTokens  int
+	TotalCostUSD     float64
+	DurationMs       int64
 }
 
 type StreamHandler func(chunk string) error
@@ -39,11 +43,11 @@ var _ LLMProvider = (*ProviderAdapter)(nil)
 
 type ProviderAdapter struct {
 	name    string
-	execute func(ctx context.Context, model string, system string, messages []Message, maxTokens int, temperature float64) (string, int, int, error)
-	stream  func(ctx context.Context, model string, system string, messages []Message, maxTokens int, temperature float64, handler StreamHandler) (int, int, error)
+	execute func(ctx context.Context, model string, system string, messages []Message, maxTokens int, temperature float64) (string, int, int, int, int, error)
+	stream  func(ctx context.Context, model string, system string, messages []Message, maxTokens int, temperature float64, handler StreamHandler) (int, int, int, int, error)
 }
 
-func NewProviderAdapter(name string, execute func(ctx context.Context, model string, system string, messages []Message, maxTokens int, temperature float64) (string, int, int, error), stream func(ctx context.Context, model string, system string, messages []Message, maxTokens int, temperature float64, handler StreamHandler) (int, int, error)) *ProviderAdapter {
+func NewProviderAdapter(name string, execute func(ctx context.Context, model string, system string, messages []Message, maxTokens int, temperature float64) (string, int, int, int, int, error), stream func(ctx context.Context, model string, system string, messages []Message, maxTokens int, temperature float64, handler StreamHandler) (int, int, int, int, error)) *ProviderAdapter {
 	return &ProviderAdapter{name: name, execute: execute, stream: stream}
 }
 
@@ -53,20 +57,31 @@ func (a *ProviderAdapter) GenerateResponse(ctx context.Context, req PromptReques
 	if a.execute == nil {
 		return LLMResponse{}, nil
 	}
-	content, tokenIn, tokenOut, err := a.execute(ctx, req.Model, req.System, req.Messages, req.MaxTokens, req.Temperature)
+	content, tokenIn, tokenOut, cacheWrite, cacheRead, err := a.execute(ctx, req.Model, req.System, req.Messages, req.MaxTokens, req.Temperature)
 	if err != nil {
 		return LLMResponse{}, err
 	}
-	return LLMResponse{Content: content, TokenInput: tokenIn, TokenOutput: tokenOut}, nil
+	return LLMResponse{
+		Content:          content,
+		TokenInput:       tokenIn,
+		TokenOutput:      tokenOut,
+		CacheWriteTokens: cacheWrite,
+		CacheReadTokens:  cacheRead,
+	}, nil
 }
 
 func (a *ProviderAdapter) StreamResponse(ctx context.Context, req PromptRequest, handler StreamHandler) (LLMResponse, error) {
 	if a.stream == nil {
 		return LLMResponse{}, nil
 	}
-	tokenIn, tokenOut, err := a.stream(ctx, req.Model, req.System, req.Messages, req.MaxTokens, req.Temperature, handler)
+	tokenIn, tokenOut, cacheWrite, cacheRead, err := a.stream(ctx, req.Model, req.System, req.Messages, req.MaxTokens, req.Temperature, handler)
 	if err != nil {
 		return LLMResponse{}, err
 	}
-	return LLMResponse{TokenInput: tokenIn, TokenOutput: tokenOut}, nil
+	return LLMResponse{
+		TokenInput:       tokenIn,
+		TokenOutput:      tokenOut,
+		CacheWriteTokens: cacheWrite,
+		CacheReadTokens:  cacheRead,
+	}, nil
 }
