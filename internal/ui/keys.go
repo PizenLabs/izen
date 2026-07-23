@@ -10,6 +10,16 @@ import (
 )
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// ── GLOBAL: Alt+O toggles reasoning block visibility ────────────
+	if msg.String() == "alt+o" {
+		m.showReasoning = !m.showReasoning
+		m.refreshViewportContent()
+		if m.Ready && !m.userIsScrollingUp {
+			m.Viewport.GotoBottom()
+		}
+		return m, nil
+	}
+
 	// ── StateProcessing: block input but allow viewport navigation ──────
 	if m.state == StateProcessing {
 		if m.Ready {

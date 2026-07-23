@@ -1213,6 +1213,14 @@ func parseSearchReplaceBlocks(content string) []searchReplaceBlock {
 // original content. For each block, it finds the SEARCH text in the original and
 // replaces it with the REPLACE text. Returns (result, true) on success or
 // (original, false) if any block's SEARCH text cannot be found.
+//
+// The matching strategy is:
+//  1. Exact substring match
+//  2. Line-by-line exact match within the line-split original
+//  3. Whitespace-normalized fuzzy match — strips leading/trailing whitespace
+//     from each line and compares trimmed content. This handles the "patch hunk
+//     does not match file content" error caused by whitespace/indentation drift
+//     between the model's SEARCH block and the actual file content.
 func applySearchReplaceBlockFromBlocks(original string, blocks []searchReplaceBlock) (string, bool) {
 	if original == "" || len(blocks) == 0 {
 		return original, false
@@ -1223,41 +1231,84 @@ func applySearchReplaceBlockFromBlocks(original string, blocks []searchReplaceBl
 		if block.search == "" {
 			return original, false
 		}
+		// Strategy 1: exact substring match
 		idx := strings.Index(current, block.search)
-		if idx < 0 {
-			// Try line-by-line contiguous match as fallback
-			origLines := strings.Split(current, "\n")
-			searchLines := strings.Split(block.search, "\n")
-			found := false
-			if len(searchLines) > 0 && len(searchLines) <= len(origLines) {
-				for i := 0; i <= len(origLines)-len(searchLines); i++ {
-					match := true
-					for j := 0; j < len(searchLines); j++ {
-						if origLines[i+j] != searchLines[j] {
-							match = false
-							break
-						}
-					}
-					if match {
-						// Replace the matched lines with the replace block
-						result := make([]string, 0, len(origLines)-len(searchLines)+len(strings.Split(block.replace, "\n")))
-						result = append(result, origLines[:i]...)
-						result = append(result, strings.Split(block.replace, "\n")...)
-						result = append(result, origLines[i+len(searchLines):]...)
-						current = strings.Join(result, "\n")
-						found = true
+		if idx >= 0 {
+			before := current[:idx]
+			after := current[idx+len(block.search):]
+			current = before + block.replace + after
+			continue
+		}
+
+		// Strategy 2: line-by-line exact contiguous match
+		origLines := strings.Split(current, "\n")
+		searchLines := strings.Split(block.search, "\n")
+		replaceLines := strings.Split(block.replace, "\n")
+		found := false
+		if len(searchLines) > 0 && len(searchLines) <= len(origLines) {
+			for i := 0; i <= len(origLines)-len(searchLines); i++ {
+				match := true
+				for j := 0; j < len(searchLines); j++ {
+					if origLines[i+j] != searchLines[j] {
+						match = false
 						break
 					}
 				}
+				if match {
+					result := make([]string, 0, len(origLines)-len(searchLines)+len(replaceLines))
+					result = append(result, origLines[:i]...)
+					result = append(result, replaceLines...)
+					result = append(result, origLines[i+len(searchLines):]...)
+					current = strings.Join(result, "\n")
+					found = true
+					break
+				}
 			}
-			if !found {
-				return original, false
+			if found {
+				continue
 			}
-			continue
+
+			// Strategy 3: whitespace-normalized fuzzy match
+			// Trim each line of both search and original, then compare.
+			// This handles indentation/whitespace drift between the model's
+			// SEARCH block and the actual file content.
+			trimmedSearch := make([]string, len(searchLines))
+			for j, l := range searchLines {
+				trimmedSearch[j] = strings.TrimSpace(l)
+			}
+			for i := 0; i <= len(origLines)-len(searchLines); i++ {
+				match := true
+				for j := 0; j < len(searchLines); j++ {
+					if strings.TrimSpace(origLines[i+j]) != trimmedSearch[j] {
+						match = false
+						break
+					}
+				}
+				if match {
+					// Calculate indentation from the original for the first
+					// matched line and apply it to the replace lines.
+					result := make([]string, 0, len(origLines)-len(searchLines)+len(replaceLines))
+					result = append(result, origLines[:i]...)
+					for _, rl := range replaceLines {
+						if rl == "" {
+							result = append(result, "")
+						} else {
+							result = append(result, rl)
+						}
+					}
+					result = append(result, origLines[i+len(searchLines):]...)
+					current = strings.Join(result, "\n")
+					found = true
+					if globalActivityLog != nil {
+						globalActivityLog("[patch] Whitespace-normalized SEARCH/REPLACE match succeeded")
+					}
+					break
+				}
+			}
 		}
-		before := current[:idx]
-		after := current[idx+len(block.search):]
-		current = before + block.replace + after
+		if !found {
+			return original, false
+		}
 	}
 
 	return current, true

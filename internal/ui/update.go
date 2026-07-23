@@ -56,9 +56,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// ── GLOBAL INTERCEPT: [Alt+P] Toggle Hotkey ────────────────────────────
+	// ── GLOBAL INTERCEPT: [Alt+P] Toggle Proposal, [Alt+O] Toggle Reasoning ──
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
-		if keyMsg.String() == "alt+p" {
+		switch keyMsg.String() {
+		case "alt+p":
 			if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
 				m.pendingProposals[0].Expanded = !m.pendingProposals[0].Expanded
 				m.proposalDiffOffset = 0
@@ -67,6 +68,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.Viewport.GotoBottom()
 				return m, nil
 			}
+		case "alt+o":
+			m.showReasoning = !m.showReasoning
+			m.refreshViewportContent()
+			if m.Ready && !m.userIsScrollingUp {
+				m.Viewport.GotoBottom()
+			}
+			return m, nil
 		}
 	}
 
@@ -1342,6 +1350,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if len(m.streamBuffer) > 0 {
+			// Extract reasoning content (sentinels + <think> tags) before
+			// emitting to the visible content buffer.
+			m.extractReasoningContent()
+
 			// Emit word-aligned chunks for a natural reading rhythm.
 			emit := 0
 			minChars := 3
@@ -1449,6 +1461,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamBuffer = ""
 			m.streamTickActive = false
 		}
+		// Final reasoning extraction from any remaining content
+		m.extractReasoningContent()
 
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
@@ -1475,6 +1489,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the downstream JSON parser or render pipeline. Lines matching
 		// telemetry/error markers are removed from leading/trailing context.
 		final = sanitizeFinalContent(final)
+		// Strip any remaining reasoning sentinels from final content
+		final = m.extractSentinelReasoning(final)
 
 		// Append the completed turn to PreRenderedHistory and freeze state.
 		m.push(roleAI, final)

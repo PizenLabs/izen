@@ -163,6 +163,113 @@ func (m *model) viModeLabel() string {
 	}
 }
 
+// renderReasoningBlock renders the collapsible reasoning block during streaming.
+// When reasoning content is available, it shows:
+//
+//	Collapsed (m.showReasoning == false):
+//	  ⚙ Thinking... [Alt+O to expand reasoning]
+//
+//	Expanded (m.showReasoning == true):
+//	  ┌─ Reasoning ──────────────────────────┐
+//	  │ <reasoning content>                   │
+//	  └───────────────────────────────────────┘
+func (m *model) renderReasoningBlock(width int) string {
+	if m.reasoningBuffer.Len() == 0 {
+		return ""
+	}
+
+	reasoningText := m.reasoningBuffer.String()
+	if !m.showReasoning {
+		// Collapsed: single-line spinner hint
+		sp := m.renderFlowingSpinner()
+		hint := sp + " " + dimmedStyle.Render("Thinking... ") + mutedStyle.Render("[Alt+O to expand]")
+		return hint
+	}
+
+	// Expanded: render full reasoning content in a dimmed block
+	if width < 40 {
+		width = 40
+	}
+
+	var b strings.Builder
+
+	// Top border with title
+	title := "Reasoning"
+	topFiller := width - lipgloss.Width(title) - 6
+	if topFiller < 0 {
+		topFiller = 0
+	}
+	b.WriteString(dimmedStyle.Render("┌─ "+title+" "+strings.Repeat("─", topFiller)+"┐") + "\n")
+
+	// Reasoning content lines — dimmed and wrapped
+	lines := strings.Split(reasoningText, "\n")
+	for _, line := range lines {
+		line = strings.TrimRight(line, " \r")
+		if line == "" {
+			b.WriteString(dimmedStyle.Render("│ ") + " " + dimmedStyle.Render("  │") + "\n")
+			continue
+		}
+		// Word-wrap to available width
+		avail := width - 4
+		if avail < 10 {
+			avail = 10
+		}
+		wrapped := wrapString(line, avail)
+		for _, wl := range wrapped {
+			padded := wl + strings.Repeat(" ", avail-lipgloss.Width(wl))
+			b.WriteString(dimmedStyle.Render("│ ") + mutedStyle.Render(padded) + dimmedStyle.Render(" │") + "\n")
+		}
+	}
+
+	// Bottom border
+	bottomFiller := width - 4
+	if bottomFiller < 0 {
+		bottomFiller = 0
+	}
+	b.WriteString(dimmedStyle.Render("└" + strings.Repeat("─", bottomFiller) + "┘"))
+
+	return b.String()
+}
+
+// wrapString wraps text to a given width, splitting at word boundaries.
+func wrapString(text string, width int) []string {
+	if len(text) == 0 || width < 1 {
+		return []string{text}
+	}
+	var result []string
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		// No whitespace — hard wrap
+		runes := []rune(text)
+		for i := 0; i < len(runes); i += width {
+			end := i + width
+			if end > len(runes) {
+				end = len(runes)
+			}
+			result = append(result, string(runes[i:end]))
+		}
+		return result
+	}
+	var line strings.Builder
+	for _, word := range words {
+		wordW := lipgloss.Width(word)
+		if line.Len() > 0 && line.Len()+1+wordW > width {
+			result = append(result, line.String())
+			line.Reset()
+			line.WriteString(word)
+		} else {
+			if line.Len() > 0 {
+				line.WriteString(" ")
+			}
+			line.WriteString(word)
+		}
+	}
+	if line.Len() > 0 {
+		result = append(result, line.String())
+	}
+	return result
+}
+
 // renderProposalBlock renders the interactive proposal/processing dock
 // between the viewport and the input line, framed for clear isolation.
 func (m *model) renderProposalBlock() string {
