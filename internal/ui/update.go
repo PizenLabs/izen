@@ -2028,11 +2028,31 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sessionModel = msg.model.ID
 		m.cfg.Models.SessionModel = msg.model.ID
 		m.IsCloudModel = msg.model.Provider != "ollama"
+
+		modelProvider := msg.model.Provider
+		currentProvider := ""
+		if m.provider != nil {
+			currentProvider = m.provider.Name()
+		}
+
+		var cmds []tea.Cmd
+		if modelProvider != "" && modelProvider != currentProvider {
+			envVar, known := validProviders[modelProvider]
+			switch {
+			case known && m.isProviderAvailable(modelProvider, envVar):
+				cmds = append(cmds, m.switchProvider(modelProvider))
+			case modelProvider == "ollama":
+				cmds = append(cmds, m.switchProvider(modelProvider))
+			default:
+				m.push(roleError, fmt.Sprintf("[✗] Provider %q not configured — model set but provider unchanged", modelProvider))
+			}
+		}
+
 		m.ti.Focus()
 		m.push(roleSystem, accentStyle.Render(fmt.Sprintf("✓ Model set to %s [%s]", msg.model.Name, msg.model.Provider)))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
-		return m, nil
+		return m, tea.Batch(cmds...)
 	}
 
 	// ── Viewport scroll keys (any state) ─────────────────────────────────────

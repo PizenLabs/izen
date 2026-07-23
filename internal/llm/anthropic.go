@@ -58,8 +58,10 @@ type anthropicResp struct {
 }
 
 type anthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens       int `json:"input_tokens"`
+	OutputTokens      int `json:"output_tokens"`
+	CacheCreateTokens int `json:"cache_creation_input_tokens"`
+	CacheReadTokens   int `json:"cache_read_input_tokens"`
 }
 
 type anthropicStreamEvent struct {
@@ -161,13 +163,21 @@ func (c *AnthropicClient) GenerateResponse(ctx context.Context, req PromptReques
 	}
 	content = SanitizeOutput(content)
 
-	tokenIn, tokenOut := 0, 0
+	tokenIn, tokenOut, cacheWrite, cacheRead := 0, 0, 0, 0
 	if claudeResp.Usage != nil {
 		tokenIn = claudeResp.Usage.InputTokens
 		tokenOut = claudeResp.Usage.OutputTokens
+		cacheWrite = claudeResp.Usage.CacheCreateTokens
+		cacheRead = claudeResp.Usage.CacheReadTokens
 	}
 
-	return LLMResponse{Content: content, TokenInput: tokenIn, TokenOutput: tokenOut}, nil
+	return LLMResponse{
+		Content:          content,
+		TokenInput:       tokenIn,
+		TokenOutput:      tokenOut,
+		CacheWriteTokens: cacheWrite,
+		CacheReadTokens:  cacheRead,
+	}, nil
 }
 
 func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest, handler StreamHandler) (LLMResponse, error) {
@@ -213,7 +223,7 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 		return LLMResponse{}, fmt.Errorf("anthropic: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	tokenIn, tokenOut := 0, 0
+	tokenIn, tokenOut, cacheWrite, cacheRead := 0, 0, 0, 0
 	var full strings.Builder
 	reader := newAnthropicStreamReader(resp.Body)
 
@@ -231,6 +241,8 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 		case "message_start":
 			if event.Usage != nil {
 				tokenIn = event.Usage.InputTokens
+				cacheWrite = event.Usage.CacheCreateTokens
+				cacheRead = event.Usage.CacheReadTokens
 			}
 		case "content_block_delta":
 			if event.Delta != nil && event.Delta.Text != "" {
@@ -249,17 +261,21 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 		case "message_stop":
 			_ = resp.Body.Close()
 			return LLMResponse{
-				Content:     SanitizeOutput(full.String()),
-				TokenInput:  tokenIn,
-				TokenOutput: tokenOut,
+				Content:          SanitizeOutput(full.String()),
+				TokenInput:       tokenIn,
+				TokenOutput:      tokenOut,
+				CacheWriteTokens: cacheWrite,
+				CacheReadTokens:  cacheRead,
 			}, nil
 		}
 	}
 
 	return LLMResponse{
-		Content:     SanitizeOutput(full.String()),
-		TokenInput:  tokenIn,
-		TokenOutput: tokenOut,
+		Content:          SanitizeOutput(full.String()),
+		TokenInput:       tokenIn,
+		TokenOutput:      tokenOut,
+		CacheWriteTokens: cacheWrite,
+		CacheReadTokens:  cacheRead,
 	}, nil
 }
 

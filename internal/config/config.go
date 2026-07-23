@@ -37,6 +37,7 @@ type AIProviderConfig struct {
 type AIConfig struct {
 	DefaultProvider  string                      `yaml:"default_provider"`
 	FallbackProvider string                      `yaml:"fallback_provider"`
+	MaxTokens        int                         `yaml:"max_tokens"`
 	Providers        map[string]AIProviderConfig `yaml:"providers"`
 }
 
@@ -51,11 +52,18 @@ type Config struct {
 }
 
 type ModelConfig struct {
-	Default      string            `yaml:"default"`
-	Fast         string            `yaml:"fast"`
-	Provider     string            `yaml:"provider"`
-	SessionModel string            `yaml:"-"` // runtime session override, never persisted
-	ModeDefaults map[string]string `yaml:"mode_defaults,omitempty"`
+	Default      string              `yaml:"default"`
+	Fast         string              `yaml:"fast"`
+	Provider     string              `yaml:"provider"`
+	MaxTokens    int                 `yaml:"max_tokens"`
+	SessionModel string              `yaml:"-"` // runtime session override, never persisted
+	ModeDefaults map[string]string   `yaml:"mode_defaults,omitempty"`
+	Modes        map[string]ModeSpec `yaml:"modes,omitempty"`
+}
+
+type ModeSpec struct {
+	Provider string `yaml:"provider" json:"provider"`
+	Model    string `yaml:"model" json:"model"`
 }
 
 type ExecutionConfig struct {
@@ -238,6 +246,7 @@ func Default() *Config {
 		AI: AIConfig{
 			DefaultProvider:  "ollama",
 			FallbackProvider: "openai",
+			MaxTokens:        4096,
 			Providers: map[string]AIProviderConfig{
 				"ollama": {
 					BaseURL:      "http://localhost:11434/v1",
@@ -267,8 +276,16 @@ func Default() *Config {
 			},
 		},
 		Models: ModelConfig{
-			Default:  "qwen2.5-coder:7b",
-			Provider: "ollama",
+			Default:   "qwen2.5-coder:7b",
+			Provider:  "ollama",
+			MaxTokens: 4096,
+			Modes: map[string]ModeSpec{
+				"ask":         {Provider: "", Model: ""},
+				"plan":        {Provider: "", Model: ""},
+				"build":       {Provider: "", Model: ""},
+				"review":      {Provider: "", Model: ""},
+				"investigate": {Provider: "", Model: ""},
+			},
 		},
 		Execution: ExecutionConfig{
 			Sandbox:     true,
