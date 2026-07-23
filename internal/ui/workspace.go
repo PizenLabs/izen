@@ -1,6 +1,10 @@
 package ui
 
 import (
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+
 	"github.com/PizenLabs/izen/internal/modes"
 )
 
@@ -77,12 +81,145 @@ func (r *Registry) For(mode modes.Mode) (ViewMode, bool) {
 // it resolves UI lifecycle overlays (init / help / loading) and otherwise
 // delegates to the registered ViewMode for the current mode. The renderer
 // never sees mode, banner, prompt, footer, or action logic.
+// renderModelPickerModal renders the model picker as a compact, centered
+// floating dialog over the normal workspace background.
+func (m *model) renderModelPickerModal() string {
+	// Build the normal workspace content first (background).
+	var normalWS Workspace
+	if m.Ready && m.viewRegistry != nil {
+		if v, ok := m.viewRegistry.For(m.resolver.Current()); ok {
+			normalWS = v.BuildWorkspace(m)
+		}
+	}
+	var parts []string
+	if normalWS.Viewport != "" {
+		parts = append(parts, normalWS.Viewport)
+	}
+	if normalWS.ProposalDock != "" {
+		parts = append(parts, normalWS.ProposalDock)
+	}
+	if normalWS.Input != "" {
+		parts = append(parts, normalWS.Input)
+	}
+	if normalWS.Footer != "" {
+		parts = append(parts, normalWS.Footer)
+	}
+	normalContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	// Set compact dimensions on the model picker so it renders at modal size.
+	m.modelPicker.SetSize(68, 18)
+	mpView := m.modelPicker.View()
+
+	// Outer modal box. No hardcoded Height/MaxHeight here on purpose: mpView
+	// (renderList in model_picker.go) is a fixed height by construction —
+	// modelListLineBudget always pads its row list out to the same number
+	// of lines — so this box naturally renders at a constant size on every
+	// frame without needing cross-file height arithmetic kept in sync by
+	// hand. Hardcoding a Height here previously caused the bottom border
+	// to get silently clipped whenever the true content height drifted
+	// even by a line.
+	modalBox := lipgloss.NewStyle().
+		Width(70).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(colorBlue)).
+		Padding(0, 1).
+		Render(mpView)
+
+	// Use lipgloss.Place for mathematically exact centering on a full-screen
+	// canvas, then blend with the workspace background via overlayOn.
+	centered := lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modalBox)
+	return overlayOn(normalContent, centered, m.width, m.height)
+}
+
+// overlayOn renders bg as a full-screen string with fg centered on top.
+// ANSI codes from both strings are preserved via line-level composition.
+// ANSI reset codes are inserted at segment boundaries to prevent background
+// styling from bleeding into the foreground overlay area.
+func overlayOn(bg, fg string, w, h int) string {
+	bgLines := strings.Split(bg, "\n")
+	fgLines := strings.Split(fg, "\n")
+
+	fgH := len(fgLines)
+	fgW := 0
+	for _, l := range fgLines {
+		if lw := lipgloss.Width(l); lw > fgW {
+			fgW = lw
+		}
+	}
+	if fgW > w {
+		fgW = w
+	}
+	if fgH > h {
+		fgH = h
+	}
+
+	sy := max(0, (h-fgH)/2)
+	sx := max(0, (w-fgW)/2)
+
+	totalH := max(h, len(bgLines))
+
+	const ansiReset = "\033[0m"
+
+	result := make([]string, totalH)
+	for i := 0; i < totalH; i++ {
+		var bgLine string
+		if i < len(bgLines) {
+			bgLine = bgLines[i]
+		}
+		if bw := lipgloss.Width(bgLine); bw < w {
+			bgLine += strings.Repeat(" ", w-bw)
+		}
+
+		fi := i - sy
+		if fi >= 0 && fi < fgH {
+			fl := fgLines[fi]
+			if fw := lipgloss.Width(fl); fw < fgW {
+				fl += strings.Repeat(" ", fgW-fw)
+			}
+
+			left, midRight := splitVis(bgLine, sx)
+			_, right := splitVis(midRight, fgW)
+
+			result[i] = left + ansiReset + fl + ansiReset + right
+		} else {
+			result[i] = bgLine
+		}
+	}
+	return strings.Join(result, "\n")
+}
+
+// splitVis splits s at the specified visible-character position,
+// preserving ANSI codes in both halves.
+func splitVis(s string, visLen int) (string, string) {
+	if visLen <= 0 {
+		return "", s
+	}
+	var left, right strings.Builder
+	visW := 0
+	for _, r := range s {
+		rw := lipgloss.Width(string(r))
+		if visW < visLen {
+			left.WriteRune(r)
+		} else {
+			right.WriteRune(r)
+		}
+		visW += rw
+	}
+	if visW < visLen {
+		left.WriteString(strings.Repeat(" ", visLen-visW))
+	}
+	return left.String(), right.String()
+}
+
 func (m *model) BuildWorkspace() Workspace {
 	if m.initStage != initNone && m.initStage != initComplete {
 		return Workspace{Overlay: m.renderInitView()}
 	}
 	if m.showHelpOverlay {
 		return Workspace{Overlay: m.renderHelpOverlay()}
+	}
+	if m.showModelPicker && m.modelPicker != nil {
+		return Workspace{Overlay: m.renderModelPickerModal()}
 	}
 	if !m.Ready {
 		return Workspace{Overlay: "Loading IZEN..."}

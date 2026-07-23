@@ -489,7 +489,7 @@ var utilityCommands = map[modes.Mode][]string{
 	modes.ModeReview:      {"/clear"},
 }
 
-var globalCommands = []string{"/help", "/?", "/mode", "/objective", "/drop", "/quit", "/arch"}
+var globalCommands = []string{"/help", "/?", "/model", "/objective", "/drop", "/quit", "/arch"}
 
 var flowingSpinnerFrames = []string{" ✦ ", " ✧ ", " ⚙ ", " ❋ ", " ❄ ", " ✱ ", " ❋ ", " ⚙ ", " ✧ ", " ✦ "}
 
@@ -836,6 +836,11 @@ type model struct {
 	// simply press Enter to confirm; they never bypass onboarding.
 	initPrefillUsername string
 	initPrefillProvider string
+
+	// Model Picker Modal
+	showModelPicker bool
+	modelPicker     *ModelPickerModal
+	sessionModel    string // user-selected model override via /model
 }
 
 // ── Rendering helpers ─────────────────────────────────────────────────────────

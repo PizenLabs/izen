@@ -41,8 +41,8 @@ var validSystemCommands = map[string]struct{}{
 	"/help":       {},
 	"/?":          {},
 	"/quit":       {},
-	"/mode":       {},
 	"/provider":   {},
+	"/model":      {},
 	"/objective":  {},
 	"/clear":      {},
 	"/drop":       {},
@@ -1244,10 +1244,11 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /review      audit changes, detect risks"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
-		m.push(roleSystem, infoStyle.Render("  /help  /mode  /provider  /objective  /drop  /clear  /quit"))
+		m.push(roleSystem, infoStyle.Render("  /help  /model  /provider  /objective  /drop  /clear  /quit"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch"))
 		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
-		m.push(roleSystem, infoStyle.Render("  /provider <name>  switch AI provider (ollama|anthropic|openai|gemini)"))
+		m.push(roleSystem, infoStyle.Render("  /provider <name>  switch AI provider (ollama|anthropic|openai|gemini|openrouter|groq)"))
+		m.push(roleSystem, infoStyle.Render("  /model           interactive model picker (fuzzy search)"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("ask sub-commands ($)"))
@@ -1272,18 +1273,6 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, "goodbye.")
 		return m.cleanShutdownCmd()
 
-	case strings.HasPrefix(cmd, "/mode"):
-		parts := strings.Fields(cmd)
-		if len(parts) == 2 {
-			mode, ok := modes.Parse(parts[1])
-			if ok {
-				m.modeChangeAuthorized = true
-				return m.setMode(mode)
-			}
-		}
-		m.push(roleSystem, infoStyle.Render("usage: /mode <ask|plan|build|investigate|review>"))
-		return nil
-
 	case strings.HasPrefix(cmd, "/provider"):
 		parts := strings.Fields(cmd)
 		if len(parts) == 2 {
@@ -1291,6 +1280,21 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		}
 		m.listProviders()
 		return nil
+
+	case cmd == "/model":
+		m.showModelPicker = true
+		m.modelPicker = NewModelPickerModal()
+		m.modelPicker.SetSize(m.width, m.height)
+
+		providers := make(map[string]string)
+		for name, prov := range m.cfg.AI.Providers {
+			providers[name] = prov.APIKey
+		}
+		if len(providers) == 0 {
+			providers["ollama"] = ""
+		}
+
+		return m.modelPicker.LoadModels(providers)
 
 	case strings.HasPrefix(cmd, "/objective"):
 		objArg := strings.TrimSpace(strings.TrimPrefix(cmd, "/objective"))

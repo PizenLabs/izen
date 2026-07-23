@@ -11,6 +11,23 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+var envVarPattern = regexp.MustCompile(`\$\{([^}]+)\}`)
+
+// ValidProviderNames returns the set of known AI provider names.
+var ValidProviderNames = map[string]bool{
+	"ollama":     true,
+	"anthropic":  true,
+	"openai":     true,
+	"openrouter": true,
+	"gemini":     true,
+	"groq":       true,
+}
+
+// ValidateProviderName checks if name is a known provider
+func ValidateProviderName(name string) bool {
+	return ValidProviderNames[name]
+}
+
 type AIProviderConfig struct {
 	BaseURL      string `yaml:"base_url"`
 	APIKey       string `yaml:"api_key"`
@@ -34,9 +51,11 @@ type Config struct {
 }
 
 type ModelConfig struct {
-	Default  string `yaml:"default"`
-	Fast     string `yaml:"fast"`
-	Provider string `yaml:"provider"`
+	Default      string            `yaml:"default"`
+	Fast         string            `yaml:"fast"`
+	Provider     string            `yaml:"provider"`
+	SessionModel string            `yaml:"-"` // runtime session override, never persisted
+	ModeDefaults map[string]string `yaml:"mode_defaults,omitempty"`
 }
 
 type ExecutionConfig struct {
@@ -95,6 +114,9 @@ func (c *Config) ActiveProviderName() string {
 }
 
 func (c *Config) ActiveModelName() string {
+	if c.Models.SessionModel != "" {
+		return c.Models.SessionModel
+	}
 	provider := c.ActiveProviderName()
 	if provCfg, ok := c.AI.Providers[provider]; ok && provCfg.DefaultModel != "" {
 		return provCfg.DefaultModel
@@ -144,6 +166,30 @@ func SanitizeForSession(text string) string {
 	return result
 }
 
+func ExpandEnvVar(val string) string {
+	return envVarPattern.ReplaceAllStringFunc(val, func(match string) string {
+		name := match[2 : len(match)-1]
+		defaultVal := ""
+		if idx := strings.Index(name, ":-"); idx >= 0 {
+			defaultVal = name[idx+2:]
+			name = name[:idx]
+		}
+		if env := os.Getenv(name); env != "" {
+			return env
+		}
+		return defaultVal
+	})
+}
+
+func (c *AIConfig) ExpandEnvVars() {
+	for name, prov := range c.Providers {
+		prov.APIKey = ExpandEnvVar(prov.APIKey)
+		prov.BaseURL = ExpandEnvVar(prov.BaseURL)
+		prov.DefaultModel = ExpandEnvVar(prov.DefaultModel)
+		c.Providers[name] = prov
+	}
+}
+
 func configPath() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".izen", "config.yml")
@@ -182,6 +228,8 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	cfg.AI.ExpandEnvVars()
+
 	return &cfg, nil
 }
 
@@ -195,6 +243,26 @@ func Default() *Config {
 					BaseURL:      "http://localhost:11434/v1",
 					APIKey:       "ollama",
 					DefaultModel: "qwen2.5-coder:7b",
+				},
+				"anthropic": {
+					BaseURL:      "https://api.anthropic.com/v1",
+					APIKey:       "${ANTHROPIC_API_KEY}",
+					DefaultModel: "claude-sonnet-4-20250514",
+				},
+				"openai": {
+					BaseURL:      "https://api.openai.com/v1",
+					APIKey:       "${OPENAI_API_KEY}",
+					DefaultModel: "gpt-4o",
+				},
+				"openrouter": {
+					BaseURL:      "https://openrouter.ai/api/v1",
+					APIKey:       "${OPENROUTER_API_KEY}",
+					DefaultModel: "anthropic/claude-3.5-sonnet",
+				},
+				"groq": {
+					BaseURL:      "https://api.groq.com/openai/v1",
+					APIKey:       "${GROQ_API_KEY}",
+					DefaultModel: "llama-3.3-70b-versatile",
 				},
 			},
 		},
