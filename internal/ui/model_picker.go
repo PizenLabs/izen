@@ -20,6 +20,20 @@ const (
 	mpErr
 )
 
+// modelListLineBudget is the fixed number of lines the scrollable model
+// list body occupies, regardless of how many provider headers/separators
+// land inside the visible window. Keeping this constant — and keeping the
+// list windowed/padded in terms of *rendered rows* rather than filtered
+// items — is what makes renderList()'s total output height perfectly
+// constant across every render (cursor movement, filtering, refresh).
+//
+// Because mpView's height never changes, the outer modal box in
+// workspace.go (renderModelPickerModal) simply auto-sizes around it
+// instead of hardcoding its own Height/MaxHeight — removing the need to
+// keep any cross-file height arithmetic in sync. Change this number
+// freely; it only affects how many rows are visible at once.
+const modelListLineBudget = 7
+
 type ModelPickerModal struct {
 	ti       textinput.Model
 	state    modelPickerState
@@ -31,6 +45,8 @@ type ModelPickerModal struct {
 	width    int
 	height   int
 	registry *llm.ModelRegistry
+
+	scrollOffset int // row-based offset into buildRows(), NOT an item index
 }
 
 type modelPickerLoadedMsg struct {
@@ -123,12 +139,14 @@ func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
 			if mp.cursor > 0 {
 				mp.cursor--
 			}
+			mp.clampScrollOffset()
 			return mp, nil
 
 		case tea.KeyDown:
 			if mp.cursor < len(mp.filtered)-1 {
 				mp.cursor++
 			}
+			mp.clampScrollOffset()
 			return mp, nil
 
 		case tea.KeyEnter:
@@ -163,7 +181,96 @@ func (mp *ModelPickerModal) SetSize(w, h int) {
 	mp.ti.Width = w - 12
 }
 
+// ── Row model ────────────────────────────────────────────────────────────
+//
+// The list body is windowed and padded in terms of *rendered lines*, not
+// filtered items. A provider boundary produces a blank separator row plus
+// a header row in addition to the item rows — all of those now count
+// against the same fixed modelListLineBudget, so the body height (and
+// therefore the modal's outer border) never changes as the cursor moves.
+
+type mpRowKind int
+
+const (
+	mpRowHeader mpRowKind = iota
+	mpRowBlank
+	mpRowItem
+)
+
+type mpRow struct {
+	kind      mpRowKind
+	provider  string // valid for mpRowHeader
+	itemIndex int    // valid for mpRowItem; index into mp.filtered
+}
+
+func (mp *ModelPickerModal) buildRows() []mpRow {
+	rows := make([]mpRow, 0, len(mp.filtered)+4)
+	var prevProvider string
+	for i, m := range mp.filtered {
+		if m.Provider != prevProvider {
+			if prevProvider != "" {
+				rows = append(rows, mpRow{kind: mpRowBlank})
+			}
+			rows = append(rows, mpRow{kind: mpRowHeader, provider: m.Provider})
+			prevProvider = m.Provider
+		}
+		rows = append(rows, mpRow{kind: mpRowItem, itemIndex: i})
+	}
+	return rows
+}
+
+func rowIndexForItem(rows []mpRow, itemIndex int) int {
+	for i, r := range rows {
+		if r.kind == mpRowItem && r.itemIndex == itemIndex {
+			return i
+		}
+	}
+	return 0
+}
+
+func (mp *ModelPickerModal) clampScrollOffset() {
+	if len(mp.filtered) == 0 {
+		mp.scrollOffset = 0
+		return
+	}
+	if mp.cursor >= len(mp.filtered) {
+		mp.cursor = len(mp.filtered) - 1
+	}
+	if mp.cursor < 0 {
+		mp.cursor = 0
+	}
+
+	rows := mp.buildRows()
+	total := len(rows)
+	if total == 0 {
+		mp.scrollOffset = 0
+		return
+	}
+
+	cursorRow := rowIndexForItem(rows, mp.cursor)
+
+	// Keep the cursor's row inside the visible window.
+	if cursorRow < mp.scrollOffset {
+		mp.scrollOffset = cursorRow
+	} else if cursorRow >= mp.scrollOffset+modelListLineBudget {
+		mp.scrollOffset = cursorRow - modelListLineBudget + 1
+	}
+
+	maxOffset := total - modelListLineBudget
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if mp.scrollOffset > maxOffset {
+		mp.scrollOffset = maxOffset
+	}
+	if mp.scrollOffset < 0 {
+		mp.scrollOffset = 0
+	}
+}
+
 func (mp *ModelPickerModal) applyFilter() {
+	mp.scrollOffset = 0
+	mp.cursor = 0
 	query := mp.ti.Value()
 	if query == "" {
 		mp.filtered = mp.models
@@ -217,16 +324,6 @@ func (mp *ModelPickerModal) renderError() string {
 }
 
 func (mp *ModelPickerModal) renderList() string {
-	// Reserve lines for: title(1), textinput(1), count(1), footer(2).
-	const reservedLines = 5
-	maxH := mp.height - reservedLines
-	if maxH > 12 {
-		maxH = 12
-	}
-	if maxH < 3 {
-		maxH = 3
-	}
-
 	var b strings.Builder
 
 	// ── Header ─────────────────────────────────────────────────────────
@@ -251,25 +348,34 @@ func (mp *ModelPickerModal) renderList() string {
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Faint(true).Render("Ctrl+R refresh"))
 	b.WriteString("\n\n")
 
-	// ── Scrollable model list ───────────────────────────────────────────
-	var prevProvider string
-	displayed := 0
-	for i, m := range mp.filtered {
-		if displayed >= maxH {
-			b.WriteString(mutedStyle.Render(fmt.Sprintf(" … %d more", len(mp.filtered)-maxH)))
-			break
-		}
+	// ── Fixed-height, row-based scrolling list ──────────────────────────
+	rows := mp.buildRows()
+	total := len(rows)
 
-		if m.Provider != prevProvider {
-			if prevProvider != "" {
-				b.WriteString("\n")
-			}
+	if mp.scrollOffset > total {
+		mp.scrollOffset = total
+	}
+	if mp.scrollOffset < 0 {
+		mp.scrollOffset = 0
+	}
+	end := mp.scrollOffset + modelListLineBudget
+	if end > total {
+		end = total
+	}
+	window := rows[mp.scrollOffset:end]
+
+	for _, row := range window {
+		switch row.kind {
+		case mpRowBlank:
+			b.WriteString("\n")
+
+		case mpRowHeader:
 			providerStyle := lipgloss.NewStyle().
 				Bold(true).
 				Foreground(lipgloss.Color(colorSapphire))
-			header := " " + strings.ToUpper(m.Provider)
+			header := " " + strings.ToUpper(row.provider)
 
-			authLabel := providerAuthStatus(m.Provider)
+			authLabel := providerAuthStatus(row.provider)
 			if authLabel != "" {
 				if strings.Contains(authLabel, "✓") {
 					header += "  " + greenStyle.Render(authLabel)
@@ -279,22 +385,26 @@ func (mp *ModelPickerModal) renderList() string {
 			}
 			b.WriteString(providerStyle.Render(header))
 			b.WriteString("\n")
-			prevProvider = m.Provider
-		}
 
-		cursor := "  "
-		itemStyle := dimmedStyle
-		if i == mp.cursor {
-			cursor = "▸ "
-			itemStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color(colorAccent)).
-				Bold(true)
+		case mpRowItem:
+			m := mp.filtered[row.itemIndex]
+			cursor := "  "
+			itemStyle := dimmedStyle
+			if row.itemIndex == mp.cursor {
+				cursor = "▸ "
+				itemStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color(colorAccent)).
+					Bold(true)
+			}
+			fmt.Fprintf(&b, "%s%s", cursor, itemStyle.Render(m.ID))
+			b.WriteString("\n")
 		}
+	}
 
-		line := fmt.Sprintf("%s%s", cursor, itemStyle.Render(m.ID))
-		b.WriteString(line)
+	// Pad blank lines so the body — and therefore the whole modal — never
+	// changes height, no matter how many header/blank rows were in view.
+	for i := len(window); i < modelListLineBudget; i++ {
 		b.WriteString("\n")
-		displayed++
 	}
 
 	// ── Footer ──────────────────────────────────────────────────────────

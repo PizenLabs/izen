@@ -110,13 +110,19 @@ func (m *model) renderModelPickerModal() string {
 	m.modelPicker.SetSize(68, 18)
 	mpView := m.modelPicker.View()
 
-	// Outer modal box with solid background to mask any bleed-through from
-	// the workspace content behind it.
+	// Outer modal box. No hardcoded Height/MaxHeight here on purpose: mpView
+	// (renderList in model_picker.go) is a fixed height by construction —
+	// modelListLineBudget always pads its row list out to the same number
+	// of lines — so this box naturally renders at a constant size on every
+	// frame without needing cross-file height arithmetic kept in sync by
+	// hand. Hardcoding a Height here previously caused the bottom border
+	// to get silently clipped whenever the true content height drifted
+	// even by a line.
 	modalBox := lipgloss.NewStyle().
-		Width(68).
+		Width(70).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(colorBlue)).
-		Padding(1).
+		Padding(0, 1).
 		Render(mpView)
 
 	// Use lipgloss.Place for mathematically exact centering on a full-screen
