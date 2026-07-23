@@ -17,7 +17,6 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/prompt"
-	"github.com/PizenLabs/izen/internal/providers"
 )
 
 // debugLogPayload writes the exact outgoing LLM payload to
@@ -185,8 +184,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 				streamCh <- tokenMsg(chunk)
 			}
 			if err == io.EOF {
-				if sr, ok := rawStream.(*providers.StreamResult); ok {
-					tokIn, tokOut = sr.Usage()
+				type usageProvider interface {
+					Usage() (input, output int)
+				}
+				if up, ok := rawStream.(usageProvider); ok {
+					tokIn, tokOut = up.Usage()
 				}
 				if tokIn == 0 && tokOut == 0 {
 					tokIn = len(content) / 4

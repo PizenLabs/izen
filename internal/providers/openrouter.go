@@ -110,9 +110,10 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 	msgs := p.buildMessages(req)
 
 	body := openrouterRequest{
-		Model:    model,
-		Messages: msgs,
-		Stream:   true,
+		Model:         model,
+		Messages:      msgs,
+		Stream:        true,
+		StreamOptions: &streamOptions{IncludeUsage: true},
 	}
 
 	payload, err := json.Marshal(body)
@@ -161,9 +162,10 @@ type openrouterMessage struct {
 }
 
 type openrouterRequest struct {
-	Model    string              `json:"model"`
-	Messages []openrouterMessage `json:"messages"`
-	Stream   bool                `json:"stream"`
+	Model         string              `json:"model"`
+	Messages      []openrouterMessage `json:"messages"`
+	Stream        bool                `json:"stream"`
+	StreamOptions *streamOptions      `json:"stream_options,omitempty"`
 }
 
 type openrouterResponse struct {
@@ -253,12 +255,12 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 			continue
 		}
 
-		if len(chunk.Choices) == 0 {
-			continue
-		}
-
 		if chunk.Usage != nil {
 			s.finalUsage = chunk.Usage
+		}
+
+		if len(chunk.Choices) == 0 {
+			continue
 		}
 
 		if chunk.Choices[0].Delta != nil && chunk.Choices[0].Delta.Content != "" {

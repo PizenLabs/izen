@@ -37,9 +37,10 @@ type openaiMessage struct {
 }
 
 type openaiRequest struct {
-	Model    string          `json:"model"`
-	Messages []openaiMessage `json:"messages"`
-	Stream   bool            `json:"stream"`
+	Model         string          `json:"model"`
+	Messages      []openaiMessage `json:"messages"`
+	Stream        bool            `json:"stream"`
+	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
 }
 
 type openaiResponse struct {
@@ -61,6 +62,10 @@ type openaiChoice struct {
 type openaiDelta struct {
 	Role    string `json:"role,omitempty"`
 	Content string `json:"content,omitempty"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type openaiUsage struct {
@@ -155,9 +160,10 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	msgs := p.buildMessages(req)
 
 	body := openaiRequest{
-		Model:    model,
-		Messages: msgs,
-		Stream:   true,
+		Model:         model,
+		Messages:      msgs,
+		Stream:        true,
+		StreamOptions: &streamOptions{IncludeUsage: true},
 	}
 
 	payload, err := json.Marshal(body)
@@ -243,12 +249,12 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 			continue
 		}
 
-		if len(chunk.Choices) == 0 {
-			continue
-		}
-
 		if chunk.Usage != nil {
 			s.finalUsage = chunk.Usage
+		}
+
+		if len(chunk.Choices) == 0 {
+			continue
 		}
 
 		if chunk.Choices[0].Delta != nil && chunk.Choices[0].Delta.Content != "" {

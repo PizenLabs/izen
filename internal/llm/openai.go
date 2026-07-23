@@ -35,12 +35,17 @@ type openAIMessage struct {
 	Content string `json:"content"`
 }
 
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type openAIReq struct {
-	Model       string          `json:"model"`
-	Messages    []openAIMessage `json:"messages"`
-	Stream      bool            `json:"stream"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Temperature float64         `json:"temperature,omitempty"`
+	Model         string          `json:"model"`
+	Messages      []openAIMessage `json:"messages"`
+	Stream        bool            `json:"stream"`
+	MaxTokens     int             `json:"max_tokens,omitempty"`
+	Temperature   float64         `json:"temperature,omitempty"`
+	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
 }
 
 type openAIResp struct {
@@ -199,11 +204,12 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 
 func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, handler StreamHandler) (LLMResponse, error) {
 	body := openAIReq{
-		Model:       c.resolveModel(req.Model),
-		Messages:    c.buildMessages(req),
-		Stream:      true,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
+		Model:         c.resolveModel(req.Model),
+		Messages:      c.buildMessages(req),
+		Stream:        true,
+		MaxTokens:     req.MaxTokens,
+		Temperature:   req.Temperature,
+		StreamOptions: &streamOptions{IncludeUsage: true},
 	}
 	if body.MaxTokens <= 0 {
 		body.MaxTokens = 4096
