@@ -1,6 +1,10 @@
 package llm
 
-import "math"
+import (
+	"fmt"
+	"math"
+	"strings"
+)
 
 type UsageReport struct {
 	InputTokens      int     `json:"input_tokens"`
@@ -16,6 +20,11 @@ func CalculateCost(modelID string, usage UsageReport) UsageReport {
 	usage.TotalTokens = usage.InputTokens + usage.OutputTokens + usage.CacheWriteTokens + usage.CacheReadTokens
 
 	if modelID == "" {
+		return usage
+	}
+
+	if strings.HasSuffix(strings.ToLower(modelID), ":free") {
+		usage.TotalCostUSD = 0.0
 		return usage
 	}
 
@@ -52,6 +61,27 @@ func extractProvider(modelID string) (string, string) {
 		return meta.ID, meta.Provider
 	}
 	return modelID, ""
+}
+
+func EnforceFreeModelOverride(modelID string, totalCostUSD float64) float64 {
+	if modelID == "" {
+		return totalCostUSD
+	}
+	if strings.HasSuffix(strings.ToLower(modelID), ":free") {
+		return 0.0
+	}
+	_, provider := extractProvider(modelID)
+	if provider == "ollama" {
+		return 0.0
+	}
+	return totalCostUSD
+}
+
+func FormatCost(costUSD float64) string {
+	if costUSD == 0.0 {
+		return "$free"
+	}
+	return fmt.Sprintf("$%.4f", costUSD)
 }
 
 func roundTo(v float64, decimals int) float64 {

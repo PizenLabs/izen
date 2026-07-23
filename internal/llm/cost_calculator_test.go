@@ -124,6 +124,64 @@ func TestCalculateCostEmptyModelID(t *testing.T) {
 	}
 }
 
+func TestCalculateCostOpenRouterFreeSuffix(t *testing.T) {
+	usage := UsageReport{
+		InputTokens:  50000,
+		OutputTokens: 25000,
+	}
+	result := CalculateCost("openai/gpt-oss-20b:free", usage)
+	if result.TotalCostUSD != 0.0 {
+		t.Errorf("OpenRouter :free model TotalCostUSD = %f, want 0.0", result.TotalCostUSD)
+	}
+	if result.TotalTokens != 75000 {
+		t.Errorf("TotalTokens = %d, want 75000", result.TotalTokens)
+	}
+}
+
+func TestCalculateCostOpenRouterFreeSuffixUpperCase(t *testing.T) {
+	usage := UsageReport{
+		InputTokens:  1000,
+		OutputTokens: 500,
+	}
+	result := CalculateCost("cohere/north-mini-code:Free", usage)
+	if result.TotalCostUSD != 0.0 {
+		t.Errorf("OpenRouter :Free (mixed case) model TotalCostUSD = %f, want 0.0", result.TotalCostUSD)
+	}
+}
+
+func TestEnforceFreeModelOverrideFreeSuffix(t *testing.T) {
+	result := EnforceFreeModelOverride("openai/gpt-oss-20b:free", 0.0002)
+	if result != 0.0 {
+		t.Errorf("EnforceFreeModelOverride(:free) = %f, want 0.0", result)
+	}
+}
+
+func TestEnforceFreeModelOverrideFreeSuffixUpperCase(t *testing.T) {
+	result := EnforceFreeModelOverride("cohere/north-mini-code:Free", 0.0006)
+	if result != 0.0 {
+		t.Errorf("EnforceFreeModelOverride(:Free) = %f, want 0.0", result)
+	}
+}
+
+func TestEnforceFreeModelOverrideNonFree(t *testing.T) {
+	result := EnforceFreeModelOverride("openai/gpt-4o", 0.0105)
+	if result != 0.0105 {
+		t.Errorf("EnforceFreeModelOverride(non-free) = %f, want 0.0105", result)
+	}
+}
+
+func TestFormatCostZero(t *testing.T) {
+	if s := FormatCost(0.0); s != "$free" {
+		t.Errorf("FormatCost(0.0) = %q, want %q", s, "$free")
+	}
+}
+
+func TestFormatCostNonZero(t *testing.T) {
+	if s := FormatCost(0.0105); s != "$0.0105" {
+		t.Errorf("FormatCost(0.0105) = %q, want %q", s, "$0.0105")
+	}
+}
+
 func TestCalculateCostOpenRouterDynamic(t *testing.T) {
 	usage := UsageReport{
 		InputTokens:  1000,

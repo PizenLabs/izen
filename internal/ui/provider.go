@@ -7,6 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/llm"
 )
 
 var validProviders = map[string]string{
@@ -43,21 +44,19 @@ func (m *model) runUsageCmd() tea.Cmd {
 		totalTok = inputTok + outputTok
 	}
 	isCloud := providerName != "ollama"
-	costStr := "$0.0000"
-	var turnCost float64
+	turnCost := 0.0
 	if isCloud && totalTok > 0 {
 		turnCost = float64(inputTok)*(3.0/1_000_000) + float64(outputTok)*(15.0/1_000_000)
-		costStr = fmt.Sprintf("$%.4f", turnCost)
 	}
+	turnCost = llm.EnforceFreeModelOverride(modelName, turnCost)
 	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Input Tokens      %d", inputTok)))
 	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Output Tokens     %d", outputTok)))
 	m.push(roleSystem, infoStyle.Render("  Cache Read        — (not tracked)"))
 	m.push(roleSystem, infoStyle.Render("  Cache Write       — (not tracked)"))
 	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Total Tokens      %d", totalTok)))
-	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Total Cost        %s", costStr)))
-	if m.AccumulatedCost > 0 {
-		m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Session Cost      $%.4f", m.AccumulatedCost)))
-	}
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Total Cost        %s", llm.FormatCost(turnCost))))
+	sessionCost := llm.EnforceFreeModelOverride(modelName, m.AccumulatedCost)
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Session Cost      %s", llm.FormatCost(sessionCost))))
 	m.push(roleSystem, "")
 
 	// ── Configured Providers Status ─────────────────────────────────

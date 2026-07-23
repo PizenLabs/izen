@@ -11,6 +11,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
 )
 
@@ -572,9 +573,8 @@ func (m *model) renderRuntimeStatus(width int) string {
 	}
 
 	// Accumulated cost — dropped before checkpoint as panes narrow.
-	if m.AccumulatedCost > 0 {
-		meta = append(meta, dimmedStyle.Render(fmt.Sprintf("$%.3f", m.AccumulatedCost)))
-	}
+	costDisplay := llm.EnforceFreeModelOverride(m.cfg.ActiveModelName(), m.AccumulatedCost)
+	meta = append(meta, dimmedStyle.Render(llm.FormatCost(costDisplay)))
 
 	// Checkpoint (truncated) — the least essential glance-able telemetry.
 	if width >= compactStatusThreshold {

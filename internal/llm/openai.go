@@ -182,7 +182,8 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 	}
 
 	if strings.Contains(c.baseURL, "openrouter") {
-		usage := CalculateCost(c.resolveModel(req.Model), UsageReport{
+		modelID := c.resolveModel(req.Model)
+		usage := CalculateCost(modelID, UsageReport{
 			InputTokens:  tokenIn,
 			OutputTokens: tokenOut,
 		})
@@ -190,6 +191,7 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		if cost > 0 {
 			llmResp.TotalCostUSD = cost
 		}
+		llmResp.TotalCostUSD = EnforceFreeModelOverride(modelID, llmResp.TotalCostUSD)
 	}
 
 	return llmResp, nil
@@ -276,7 +278,8 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	}
 
 	if strings.Contains(c.baseURL, "openrouter") {
-		usage := CalculateCost(c.resolveModel(req.Model), UsageReport{
+		modelID := c.resolveModel(req.Model)
+		usage := CalculateCost(modelID, UsageReport{
 			InputTokens:  tokenIn,
 			OutputTokens: tokenOut,
 		})
@@ -284,6 +287,7 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		if cost > 0 {
 			llmResp.TotalCostUSD = cost
 		}
+		llmResp.TotalCostUSD = EnforceFreeModelOverride(modelID, llmResp.TotalCostUSD)
 	}
 
 	return llmResp, nil

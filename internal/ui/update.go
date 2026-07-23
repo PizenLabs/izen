@@ -18,6 +18,7 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/domain"
+	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/build"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -1671,12 +1672,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		delta := msg.tokenInput + msg.tokenOutput
 		m.IsCloudModel = m.cfg.ActiveProviderName() != "ollama"
-		costStr := "$free"
+		turnCost := 0.0
 		if m.IsCloudModel {
-			turnCost := float64(msg.tokenInput)*(3.0/1_000_000) + float64(msg.tokenOutput)*(15.0/1_000_000)
-			m.AccumulatedCost += turnCost
-			costStr = fmt.Sprintf("$%.4f", turnCost)
+			turnCost = float64(msg.tokenInput)*(3.0/1_000_000) + float64(msg.tokenOutput)*(15.0/1_000_000)
 		}
+		turnCost = llm.EnforceFreeModelOverride(m.cfg.ActiveModelName(), turnCost)
+		if turnCost > 0 {
+			m.AccumulatedCost += turnCost
+		}
+		costStr := llm.FormatCost(turnCost)
 		latencySec := 0.0
 		if !m.streamStartTime.IsZero() {
 			latencySec = time.Since(m.streamStartTime).Seconds()
