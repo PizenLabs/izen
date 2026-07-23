@@ -232,32 +232,28 @@ func bootCommon(root string, cfg *config.Config) (*session.Session, *ai.Manager,
 
 	mgr := ai.NewManager()
 
-	if provCfg, ok := cfg.AI.Providers["ollama"]; ok {
+	if provCfg, ok := cfg.AI.Providers["ollama"]; ok && provCfg.APIKey != "" {
 		mgr.Register("ollama", providers.NewOllamaProvider(provCfg.BaseURL, provCfg.APIKey, provCfg.DefaultModel))
 	}
 
-	if apiKey := os.Getenv("ANTHROPIC_API_KEY"); apiKey != "" {
-		model := "claude-sonnet-4-20250514"
-		if provCfg, ok := cfg.AI.Providers["anthropic"]; ok && provCfg.DefaultModel != "" {
-			model = provCfg.DefaultModel
-		}
-		mgr.Register("anthropic", providers.NewClaudeProvider(apiKey, model))
+	if provCfg, ok := cfg.AI.Providers["openrouter"]; ok && provCfg.APIKey != "" {
+		mgr.Register("openrouter", providers.NewOpenRouterProvider(provCfg.APIKey, provCfg.DefaultModel, provCfg.BaseURL))
 	}
 
-	if apiKey := os.Getenv("OPENAI_API_KEY"); apiKey != "" {
-		model := "gpt-4o"
-		if provCfg, ok := cfg.AI.Providers["openai"]; ok && provCfg.DefaultModel != "" {
-			model = provCfg.DefaultModel
-		}
-		mgr.Register("openai", providers.NewOpenAIProvider(apiKey, model))
+	if provCfg, ok := cfg.AI.Providers["openai"]; ok && provCfg.APIKey != "" {
+		mgr.Register("openai", providers.NewOpenAIProvider(provCfg.APIKey, provCfg.DefaultModel))
 	}
 
-	if apiKey := os.Getenv("GEMINI_API_KEY"); apiKey != "" {
-		model := "gemini-1.5-pro"
-		if provCfg, ok := cfg.AI.Providers["gemini"]; ok && provCfg.DefaultModel != "" {
-			model = provCfg.DefaultModel
-		}
-		mgr.Register("gemini", providers.NewGeminiProvider(apiKey, model))
+	if provCfg, ok := cfg.AI.Providers["anthropic"]; ok && provCfg.APIKey != "" {
+		mgr.Register("anthropic", providers.NewClaudeProvider(provCfg.APIKey, provCfg.DefaultModel))
+	}
+
+	if provCfg, ok := cfg.AI.Providers["gemini"]; ok && provCfg.APIKey != "" {
+		mgr.Register("gemini", providers.NewGeminiProvider(provCfg.APIKey, provCfg.DefaultModel))
+	}
+
+	if provCfg, ok := cfg.AI.Providers["groq"]; ok && provCfg.APIKey != "" {
+		mgr.Register("groq", providers.NewGroqProvider(provCfg.APIKey, provCfg.DefaultModel, provCfg.BaseURL))
 	}
 
 	defaultProvider := cfg.ActiveProviderName()
