@@ -10,10 +10,12 @@ import (
 )
 
 var validProviders = map[string]string{
-	"ollama":    "OLLAMA_BASE_URL",
-	"anthropic": "ANTHROPIC_API_KEY",
-	"openai":    "OPENAI_API_KEY",
-	"gemini":    "GEMINI_API_KEY",
+	"ollama":     "OLLAMA_BASE_URL",
+	"anthropic":  "ANTHROPIC_API_KEY",
+	"openai":     "OPENAI_API_KEY",
+	"gemini":     "GEMINI_API_KEY",
+	"openrouter": "OPENROUTER_API_KEY",
+	"groq":       "GROQ_API_KEY",
 }
 
 func (m *model) listProviders() {
@@ -57,14 +59,14 @@ func (m *model) isProviderAvailable(name, envVar string) bool {
 
 func (m *model) switchProvider(name string) tea.Cmd {
 	if name == "" {
-		m.push(roleSystem, infoStyle.Render("usage: /provider <ollama|anthropic|openai|gemini>"))
+		m.push(roleSystem, infoStyle.Render("usage: /provider <ollama|anthropic|openai|gemini|openrouter|groq>"))
 		return nil
 	}
 
 	envVar, ok := validProviders[name]
 	if !ok {
 		m.push(roleError, fmt.Sprintf("unknown provider: %s", name))
-		m.push(roleSystem, infoStyle.Render("valid providers: ollama, anthropic, openai, gemini"))
+		m.push(roleSystem, infoStyle.Render("valid providers: ollama, anthropic, openai, gemini, openrouter, groq"))
 		return nil
 	}
 
@@ -116,6 +118,12 @@ func GetActiveProviderFromEnv() string {
 	}
 	if os.Getenv("GEMINI_API_KEY") != "" {
 		return "gemini"
+	}
+	if os.Getenv("OPENROUTER_API_KEY") != "" {
+		return "openrouter"
+	}
+	if os.Getenv("GROQ_API_KEY") != "" {
+		return "groq"
 	}
 	return "ollama"
 }

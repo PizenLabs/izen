@@ -142,8 +142,6 @@ func (r *Router) Route(input string) (bool, tea.Cmd) {
 		return r.handleClear()
 	case "undo":
 		return r.handleUndoWithMode([]string{"undo"})
-	case "mode":
-		return r.handleModeBare()
 	}
 
 	// Handle slash commands that should bypass LLM
@@ -167,11 +165,6 @@ func (r *Router) Route(input string) (bool, tea.Cmd) {
 			return r.handleUndoWithMode(parts)
 		case "/commit":
 			return r.handleCommit()
-		case "/mode":
-			if len(parts) >= 2 {
-				return r.handleModeWithArg(parts[1])
-			}
-			return r.handleModeBare()
 		}
 	}
 
@@ -249,25 +242,5 @@ func (r *Router) handleCommit() (bool, tea.Cmd) {
 	r.sess.AddMessage("system", "Creating conventional commit from session changes...", 1)
 	// The actual commit logic is handled by the build/commit engine,
 	// invoked from the TUI layer. This router handler gates access.
-	return true, nil
-}
-
-func (r *Router) handleModeBare() (bool, tea.Cmd) {
-	// Show current mode or help
-	current := r.resolver.Current()
-	r.sess.AddMessage("system", fmt.Sprintf("Current mode: %s", current), 1)
-	return true, nil
-}
-
-func (r *Router) handleModeWithArg(modeStr string) (bool, tea.Cmd) {
-	// Set mode to specified value
-	mode, ok := modes.Parse(modeStr)
-	if !ok {
-		r.sess.AddMessage("error", fmt.Sprintf("Invalid mode: %s", modeStr), 1)
-		return true, nil
-	}
-	r.sess.SetMode(mode)
-	_ = r.sess.Save()
-	r.sess.AddMessage("system", fmt.Sprintf("Switched to %s mode", mode), 1)
 	return true, nil
 }

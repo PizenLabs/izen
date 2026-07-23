@@ -95,6 +95,27 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleViModeKey(keyMsg)
 	}
 
+	// ── MODEL PICKER ROUTING: intercept key events during model selection ──
+	if m.showModelPicker && m.modelPicker != nil {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			if keyMsg.Type == tea.KeyEscape {
+				m.showModelPicker = false
+				m.modelPicker = nil
+				m.ti.Focus()
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.modelPicker, cmd = m.modelPicker.Update(msg)
+			// Check if a model was selected (modelSelectedMsg is returned as cmd)
+			return m, cmd
+		}
+		switch msg.(type) {
+		case modelPickerLoadedMsg, modelPickerRefreshMsg, modelSelectedMsg, tea.WindowSizeMsg:
+		default:
+			return m, nil
+		}
+	}
+
 	// ── INIT STAGE ROUTING: intercept all key messages during setup ─────
 	if m.initStage != initNone && m.initStage != initComplete {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
@@ -125,6 +146,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.ti.Width = msg.Width - 8
+
+		if m.showModelPicker && m.modelPicker != nil {
+			m.modelPicker.SetSize(msg.Width, msg.Height)
+		}
 
 		vpHeight := m.computeVpHeight()
 
@@ -1992,6 +2017,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		resModel, cmd := m.handleKey(msg)
 		return resModel, cmd
+
+	case modelSelectedMsg:
+		m.showModelPicker = false
+		m.modelPicker = nil
+		m.sessionModel = msg.model.ID
+		m.cfg.Models.SessionModel = msg.model.ID
+		m.IsCloudModel = msg.model.Provider != "ollama"
+		m.ti.Focus()
+		m.push(roleSystem, accentStyle.Render(fmt.Sprintf("✓ Model set to %s [%s]", msg.model.Name, msg.model.Provider)))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, nil
 	}
 
 	// ── Viewport scroll keys (any state) ─────────────────────────────────────

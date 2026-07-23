@@ -454,7 +454,7 @@ func (m *model) renderHelpOverlay() string {
 		"  " + yellowStyle.Render("/review") + "      " + dimmedStyle.Render("analyze, critique, improve"),
 		"",
 		subtleStyle.Render("  ─── Commands ───"),
-		"  " + dimmedStyle.Render("/help  /?  /mode  /objective  /clear  /drop  /undo"),
+		"  " + dimmedStyle.Render("/help  /?  /objective  /clear  /drop  /undo"),
 		"  " + dimmedStyle.Render("/commit  /checkpoint  /arch  /quit"),
 		"  " + dimmedStyle.Render("!<cmd>          run a shell command"),
 		"  " + dimmedStyle.Render("@<path>         attach a file"),
@@ -547,7 +547,11 @@ func (m *model) renderRuntimeStatus(width int) string {
 
 	// Model name — dropped after language when the pane is too narrow.
 	if width >= minimalStatusThreshold {
-		meta = append(meta, dimmedStyle.Render(m.cfg.ActiveModelName()))
+		modelName := m.getActiveModelName()
+		if m.sessionModel != "" {
+			modelName = accentStyle.Render("✓") + " " + modelName
+		}
+		meta = append(meta, dimmedStyle.Render(modelName))
 	}
 
 	// Active context ID — conveys workspace continuity without shouting.
@@ -749,14 +753,18 @@ func (m *model) renderStartupBanner(termWidth int) string {
 
 	divider := subtleStyle.Render(strings.Repeat("─", innerW-2))
 	provider := m.cfg.ActiveProviderName()
-	modelName := m.cfg.ActiveModelName()
+	modelName := m.getActiveModelName()
 	metaParts := []string{
 		mutedStyle.Render(projectPathDisplay()),
 	}
 	if m.detection.Primary != nil {
 		metaParts = append(metaParts, langBadgeStyle.Render(m.detection.Primary.Name))
 	}
-	metaParts = append(metaParts, mutedStyle.Render(provider+" "+modelName))
+	modelLabel := provider + " " + modelName
+	if m.sessionModel != "" {
+		modelLabel = accentStyle.Render("✓") + " " + modelLabel
+	}
+	metaParts = append(metaParts, mutedStyle.Render(modelLabel))
 	if branch, err := m.gitEng.Branch(); err == nil && branch != "" {
 		metaParts = append(metaParts, mutedStyle.Render("git ("+branch+")"))
 	}
@@ -815,8 +823,12 @@ func (m *model) renderStartupBannerCompact(termWidth int) string {
 	}
 	if termWidth >= compactStatusThreshold {
 		provider := m.cfg.ActiveProviderName()
-		modelName := m.cfg.ActiveModelName()
-		metaParts = append(metaParts, mutedStyle.Render(provider+" "+modelName))
+		modelName := m.getActiveModelName()
+		modelLabel := provider + " " + modelName
+		if m.sessionModel != "" {
+			modelLabel = accentStyle.Render("✓") + " " + modelLabel
+		}
+		metaParts = append(metaParts, mutedStyle.Render(modelLabel))
 		if branch, err := m.gitEng.Branch(); err == nil && branch != "" {
 			metaParts = append(metaParts, mutedStyle.Render("git ("+branch+")"))
 		}

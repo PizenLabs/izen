@@ -84,6 +84,9 @@ func (m *model) BuildWorkspace() Workspace {
 	if m.showHelpOverlay {
 		return Workspace{Overlay: m.renderHelpOverlay()}
 	}
+	if m.showModelPicker && m.modelPicker != nil {
+		return Workspace{Overlay: m.modelPicker.View()}
+	}
 	if !m.Ready {
 		return Workspace{Overlay: "Loading IZEN..."}
 	}

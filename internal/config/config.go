@@ -13,6 +13,21 @@ import (
 
 var envVarPattern = regexp.MustCompile(`\$\{([^}]+)\}`)
 
+// ValidProviderNames returns the set of known AI provider names.
+var ValidProviderNames = map[string]bool{
+	"ollama":     true,
+	"anthropic":  true,
+	"openai":     true,
+	"openrouter": true,
+	"gemini":     true,
+	"groq":       true,
+}
+
+// ValidateProviderName checks if name is a known provider
+func ValidateProviderName(name string) bool {
+	return ValidProviderNames[name]
+}
+
 type AIProviderConfig struct {
 	BaseURL      string `yaml:"base_url"`
 	APIKey       string `yaml:"api_key"`
@@ -36,9 +51,11 @@ type Config struct {
 }
 
 type ModelConfig struct {
-	Default  string `yaml:"default"`
-	Fast     string `yaml:"fast"`
-	Provider string `yaml:"provider"`
+	Default      string            `yaml:"default"`
+	Fast         string            `yaml:"fast"`
+	Provider     string            `yaml:"provider"`
+	SessionModel string            `yaml:"-"` // runtime session override, never persisted
+	ModeDefaults map[string]string `yaml:"mode_defaults,omitempty"`
 }
 
 type ExecutionConfig struct {
@@ -97,6 +114,9 @@ func (c *Config) ActiveProviderName() string {
 }
 
 func (c *Config) ActiveModelName() string {
+	if c.Models.SessionModel != "" {
+		return c.Models.SessionModel
+	}
 	provider := c.ActiveProviderName()
 	if provCfg, ok := c.AI.Providers[provider]; ok && provCfg.DefaultModel != "" {
 		return provCfg.DefaultModel

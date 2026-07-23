@@ -12,7 +12,7 @@ var allTips = []string{
 	"Use /review to get a structured analysis of your code before committing.",
 	"In Tmux, use Ctrl+b [ to enter scroll mode and browse output history.",
 	"In Neovim, use K on a symbol to jump to its documentation.",
-	"Use /mode ask to switch to Q&A mode without sandbox restrictions.",
+	"Use /ask to switch to Q&A mode without sandbox restrictions.",
 	"The sandbox indicator shows RO (read-only) in ask/plan modes and RW (read-write) in build mode.",
 	"Use /objective to define high-level goals that persist across sessions.",
 	"Use /undo to revert the last build operation.",

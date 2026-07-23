@@ -229,6 +229,13 @@ func (m *model) getActiveProviderName() string {
 	return m.cfg.ActiveProviderName()
 }
 
+func (m *model) getActiveModelName() string {
+	if m.sessionModel != "" {
+		return m.sessionModel
+	}
+	return m.cfg.ActiveModelName()
+}
+
 // saveInitState persists the identity and local workspace state when the
 // TUI onboarding flow completes, preventing stale init loops on restart.
 func (m *model) saveInitState() {

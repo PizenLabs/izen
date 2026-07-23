@@ -264,3 +264,78 @@ func TestExpandEnvVarNestedBraces(t *testing.T) {
 		t.Errorf("got %q, want %q", result, "prefix-default-val-suffix")
 	}
 }
+
+func TestValidateProviderName(t *testing.T) {
+	valid := []string{"ollama", "anthropic", "openai", "openrouter", "gemini", "groq"}
+	for _, name := range valid {
+		if !ValidateProviderName(name) {
+			t.Errorf("ValidateProviderName(%q) = false, want true", name)
+		}
+	}
+
+	if ValidateProviderName("unknown") {
+		t.Errorf("ValidateProviderName(%q) = true, want false", "unknown")
+	}
+	if ValidateProviderName("claude") {
+		t.Errorf("ValidateProviderName(%q) = true, want false", "claude")
+	}
+}
+
+func TestValidateProviderNameOpenRouter(t *testing.T) {
+	if !ValidateProviderName("openrouter") {
+		t.Errorf("ValidateProviderName(\"openrouter\") = false, want true — openrouter must be accepted")
+	}
+}
+
+func TestResolveCredentialsEnvVar(t *testing.T) {
+	setEnv(t, "ANTHROPIC_API_KEY", "sk-test-resolve")
+	defer unsetEnv(t, "ANTHROPIC_API_KEY")
+
+	key := ResolveCredentials("anthropic", "fallback-key")
+	if key != "sk-test-resolve" {
+		t.Errorf("ResolveCredentials = %q, want %q (env var should take priority)", key, "sk-test-resolve")
+	}
+}
+
+func TestResolveCredentialsFallback(t *testing.T) {
+	key := ResolveCredentials("unknown-provider", "config-fallback-key")
+	if key != "config-fallback-key" {
+		t.Errorf("ResolveCredentials = %q, want %q (should fall back to config key)", key, "config-fallback-key")
+	}
+}
+
+func TestHasCredentialsOpenRouter(t *testing.T) {
+	setEnv(t, "OPENROUTER_API_KEY", "sk-or-test")
+	defer unsetEnv(t, "OPENROUTER_API_KEY")
+
+	if !HasCredentials("openrouter") {
+		t.Errorf("HasCredentials(\"openrouter\") = false, want true after setting OPENROUTER_API_KEY")
+	}
+}
+
+func TestHasCredentialsOpenRouterUnset(t *testing.T) {
+	unsetEnv(t, "OPENROUTER_API_KEY")
+
+	if HasCredentials("openrouter") {
+		t.Errorf("HasCredentials(\"openrouter\") = true, want false when no env/creds configured")
+	}
+}
+
+func TestCredentialSourceEnv(t *testing.T) {
+	setEnv(t, "OPENAI_API_KEY", "sk-oi-test")
+	defer unsetEnv(t, "OPENAI_API_KEY")
+
+	source := CredentialSource("openai")
+	if source != "env" {
+		t.Errorf("CredentialSource(\"openai\") = %q, want %q", source, "env")
+	}
+}
+
+func TestCredentialSourceNone(t *testing.T) {
+	unsetEnv(t, "GEMINI_API_KEY")
+
+	source := CredentialSource("gemini")
+	if source != "" {
+		t.Errorf("CredentialSource(\"gemini\") = %q, want %q", source, "")
+	}
+}
