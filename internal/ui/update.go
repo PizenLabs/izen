@@ -106,11 +106,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			var cmd tea.Cmd
 			m.modelPicker, cmd = m.modelPicker.Update(msg)
-			// Check if a model was selected (modelSelectedMsg is returned as cmd)
 			return m, cmd
 		}
-		switch msg.(type) {
-		case modelPickerLoadedMsg, modelPickerRefreshMsg, modelSelectedMsg, tea.WindowSizeMsg:
+		switch msg := msg.(type) {
+		case modelPickerLoadedMsg, modelPickerRefreshMsg:
+			var cmd tea.Cmd
+			m.modelPicker, cmd = m.modelPicker.Update(msg)
+			return m, cmd
+		case modelSelectedMsg, tea.WindowSizeMsg:
+			// fall through to main switch
 		default:
 			return m, nil
 		}

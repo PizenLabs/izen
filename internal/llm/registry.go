@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -67,7 +69,18 @@ func (r *ModelRegistry) Refresh(providers map[string]string) ([]ModelInfo, error
 		}(name, apiKey)
 	}
 
-	wg.Wait()
+	// Wait for all fetches with a 3-second overall timeout so the model
+	// picker never hangs on unreachable remote providers. Goroutines that
+	// complete after the timeout are discarded.
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+	}
 	close(errCh)
 
 	var firstErr error
@@ -175,31 +188,130 @@ type ollamaTagsResponse struct {
 }
 
 func fetchOllamaModels(client *http.Client) ([]ModelInfo, error) {
+	// Step 1: try HTTP API with a fast 3-second timeout.
+	shortClient := &http.Client{Timeout: 3 * time.Second}
 	req, err := http.NewRequestWithContext(context.Background(), "GET", "http://localhost:11434/api/tags", nil)
-	if err != nil {
-		return nil, fmt.Errorf("ollama request: %w", err)
+	if err == nil {
+		resp, err := shortClient.Do(req)
+		if err == nil {
+			defer func() { _ = resp.Body.Close() }()
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr == nil {
+				var result ollamaTagsResponse
+				if json.Unmarshal(body, &result) == nil {
+					models := make([]ModelInfo, 0, len(result.Models))
+					for _, m := range result.Models {
+						models = append(models, ModelInfo{
+							ID:       m.Name,
+							Name:     m.Name,
+							Provider: "ollama",
+						})
+					}
+					return models, nil
+				}
+			}
+		}
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("ollama not reachable: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	// Step 2 (fallback): ollama list CLI.
+	return fetchOllamaModelsCLI()
+}
+
+func fetchOllamaModelsCLI() ([]ModelInfo, error) {
+	ollamaPath, err := resolveOllamaBinary()
 	if err != nil {
-		return nil, err
+		// Neither PATH nor common locations contain ollama.
+		// Return a fallback list so the model picker is never empty.
+		return ollamaFallbackModels(), nil
 	}
 
-	var result ollamaTagsResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, ollamaPath, "list")
+	output, err := cmd.Output()
+	if err != nil {
+		return ollamaFallbackModels(), nil
 	}
 
-	models := make([]ModelInfo, 0, len(result.Models))
-	for _, m := range result.Models {
+	models, err := parseOllamaListOutput(string(output))
+	if err != nil || len(models) == 0 {
+		return ollamaFallbackModels(), nil
+	}
+	return models, nil
+}
+
+// resolveOllamaBinary finds the ollama binary, searching common installation
+// paths when the system PATH is insufficient (e.g., minimal PATH from TUI launch).
+func resolveOllamaBinary() (string, error) {
+	// Step 1: try exec.LookPath (checks $PATH).
+	if p, err := exec.LookPath("ollama"); err == nil {
+		return p, nil
+	}
+
+	// Step 2: check common installation locations.
+	candidates := []string{
+		"/usr/local/bin/ollama",
+		"/opt/homebrew/bin/ollama",
+	}
+	if home, err := getUserHomeDir(); err == nil {
+		candidates = append(candidates, home+"/.ollama/bin/ollama")
+	}
+
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c, nil
+		}
+	}
+
+	return "", fmt.Errorf("ollama binary not found")
+}
+
+func getUserHomeDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return home, nil
+}
+
+// ollamaFallbackModels returns a minimal list of common Ollama models so
+// the model picker is never empty when detection fails.
+func ollamaFallbackModels() []ModelInfo {
+	return []ModelInfo{
+		{ID: "qwen2.5-coder:7b", Name: "qwen2.5-coder:7b", Provider: "ollama"},
+		{ID: "llama3.2:3b", Name: "llama3.2:3b", Provider: "ollama"},
+		{ID: "llama3.1:8b", Name: "llama3.1:8b", Provider: "ollama"},
+		{ID: "mistral:7b", Name: "mistral:7b", Provider: "ollama"},
+	}
+}
+
+// parseOllamaListOutput parses the tabular output from `ollama list`.
+// Expected format (header + rows):
+//
+//	NAME                    ID                   SIZE      MODIFIED
+//	qwen2.5-coder:7b        3a8f7c0e1b2c        4.1 GB    2 days ago
+//	llama3.2:3b             a1b2c3d4e5f6        2.0 GB    5 days ago
+func parseOllamaListOutput(output string) ([]ModelInfo, error) {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) < 2 {
+		return []ModelInfo{}, nil
+	}
+
+	var models []ModelInfo
+	for _, line := range lines[1:] {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		name := fields[0]
 		models = append(models, ModelInfo{
-			ID:       m.Name,
-			Name:     m.Name,
+			ID:       name,
+			Name:     name,
 			Provider: "ollama",
 		})
 	}

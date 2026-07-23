@@ -311,6 +311,73 @@ func TestModelRegistryInvalidateCache(t *testing.T) {
 	reg.mu.RUnlock()
 }
 
+func TestParseOllamaListOutput(t *testing.T) {
+	output := `NAME                    ID                   SIZE      MODIFIED
+qwen2.5-coder:7b        3a8f7c0e1b2c        4.1 GB    2 days ago
+llama3.2:3b             a1b2c3d4e5f6        2.0 GB    5 days ago
+mistral:7b              9b8c7d6e5f4a        4.1 GB    7 days ago
+`
+	models, err := parseOllamaListOutput(output)
+	if err != nil {
+		t.Fatalf("parseOllamaListOutput() error = %v", err)
+	}
+	if len(models) != 3 {
+		t.Fatalf("expected 3 models, got %d", len(models))
+	}
+	expected := []string{"qwen2.5-coder:7b", "llama3.2:3b", "mistral:7b"}
+	for i, m := range models {
+		if m.ID != expected[i] {
+			t.Errorf("models[%d].ID = %q, want %q", i, m.ID, expected[i])
+		}
+		if m.Name != expected[i] {
+			t.Errorf("models[%d].Name = %q", i, m.Name)
+		}
+		if m.Provider != "ollama" {
+			t.Errorf("models[%d].Provider = %q, want ollama", i, m.Provider)
+		}
+	}
+}
+
+func TestParseOllamaListOutputEmpty(t *testing.T) {
+	output := `NAME                    ID                   SIZE      MODIFIED
+`
+	models, err := parseOllamaListOutput(output)
+	if err != nil {
+		t.Fatalf("parseOllamaListOutput() error = %v", err)
+	}
+	if len(models) != 0 {
+		t.Errorf("expected 0 models, got %d", len(models))
+	}
+}
+
+func TestParseOllamaListOutputBlankLines(t *testing.T) {
+	output := `NAME                    ID                   SIZE      MODIFIED
+
+qwen2.5-coder:7b        3a8f7c0e1b2c        4.1 GB    2 days ago
+
+`
+	models, err := parseOllamaListOutput(output)
+	if err != nil {
+		t.Fatalf("parseOllamaListOutput() error = %v", err)
+	}
+	if len(models) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(models))
+	}
+	if models[0].ID != "qwen2.5-coder:7b" {
+		t.Errorf("models[0].ID = %q", models[0].ID)
+	}
+}
+
+func TestParseOllamaListOutputEmptyString(t *testing.T) {
+	models, err := parseOllamaListOutput("")
+	if err != nil {
+		t.Fatalf("parseOllamaListOutput() error = %v", err)
+	}
+	if len(models) != 0 {
+		t.Errorf("expected 0 models, got %d", len(models))
+	}
+}
+
 func fetchOpenRouterModelsCustom(client *http.Client, apiKey, baseURL string) ([]ModelInfo, error) {
 	req, err := http.NewRequestWithContext(context.Background(), "GET", baseURL, nil)
 	if err != nil {

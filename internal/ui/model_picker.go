@@ -217,36 +217,41 @@ func (mp *ModelPickerModal) renderError() string {
 }
 
 func (mp *ModelPickerModal) renderList() string {
-	maxH := mp.height - 8
-	if maxH > 30 {
-		maxH = 30
+	// Reserve lines for: title(1), textinput(1), count(1), footer(2).
+	const reservedLines = 5
+	maxH := mp.height - reservedLines
+	if maxH > 12 {
+		maxH = 12
 	}
-	if maxH < 5 {
-		maxH = 5
+	if maxH < 3 {
+		maxH = 3
 	}
 
 	var b strings.Builder
 
+	// ── Header ─────────────────────────────────────────────────────────
 	title := lipgloss.NewStyle().
 		Bold(true).
 		Foreground(lipgloss.Color(colorMauve)).
 		Render(" Model Picker ")
 	b.WriteString(title)
-	b.WriteString("\n\n")
+	b.WriteString("\n")
 
+	// ── Search bar ──────────────────────────────────────────────────────
 	b.WriteString(mp.ti.View())
 	b.WriteString("\n")
 
+	// Count + refresh hint on one line
 	if mp.ti.Value() != "" {
-		b.WriteString(mutedStyle.Render(fmt.Sprintf(" %d matches\n", len(mp.filtered))))
+		b.WriteString(mutedStyle.Render(fmt.Sprintf(" %d matches", len(mp.filtered))))
 	} else {
-		b.WriteString(mutedStyle.Render(fmt.Sprintf(" %d models available  ", len(mp.models))))
+		b.WriteString(mutedStyle.Render(fmt.Sprintf(" %d models", len(mp.models))))
 	}
-
-	ctrlRStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Faint(true)
-	b.WriteString(ctrlRStyle.Render(" Ctrl+R refresh  "))
+	b.WriteString("  ")
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Faint(true).Render("Ctrl+R refresh"))
 	b.WriteString("\n\n")
 
+	// ── Scrollable model list ───────────────────────────────────────────
 	var prevProvider string
 	displayed := 0
 	for i, m := range mp.filtered {
@@ -291,6 +296,10 @@ func (mp *ModelPickerModal) renderList() string {
 		b.WriteString("\n")
 		displayed++
 	}
+
+	// ── Footer ──────────────────────────────────────────────────────────
+	footer := mutedStyle.Render("↑↓ navigate  ↵ select  Esc close")
+	b.WriteString(footer)
 
 	borderColor := lipgloss.Color(colorMauve)
 	content := b.String()
