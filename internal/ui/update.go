@@ -21,6 +21,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/build"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -431,6 +432,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.saveReportFn != nil {
 			msg.saveReportFn()
 		}
+		m.currentReviewLedger = msg.ledger
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
@@ -470,6 +472,38 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			statusLine = redStyle.Render("✗ " + statusLine)
 		}
 		m.push(roleSystem, infoStyle.Render(statusLine))
+
+		// ── Attach test evidence to active review ledger ──────────────
+		if m.currentReviewLedger != nil && m.resolver.Current() == modes.ModeReview {
+			evStatus := riview.EvStatusPassed
+			evConfidence := riview.ConfVerified
+			if !msg.passed || msg.failed > 0 {
+				evStatus = riview.EvStatusFailed
+				evConfidence = riview.ConfMedium
+			}
+			m.currentReviewLedger.AddEvidence(
+				"V-001",
+				riview.EvTypeExistingTest,
+				evStatus,
+				evConfidence,
+				"",
+				msg.output,
+			)
+			if m.currentReviewLedger != nil {
+				hasFailed := false
+				for _, e := range m.currentReviewLedger.Evidences {
+					if e.Status == riview.EvStatusFailed || e.Status == riview.EvStatusPanicked {
+						hasFailed = true
+						break
+					}
+				}
+				if !hasFailed && msg.passed {
+					m.currentReviewLedger.SetStatus(riview.StatusVerified)
+				} else if !msg.passed {
+					m.currentReviewLedger.SetStatus(riview.StatusConditional)
+				}
+			}
+		}
 
 		// ── Handoff: Capture failure context for mode pipeline ────────────
 		if !msg.passed && msg.output != "" {

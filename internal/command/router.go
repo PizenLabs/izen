@@ -8,6 +8,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/undo"
+	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -57,7 +58,7 @@ type LedgerInjector interface {
 type ReviewRunner interface {
 	// RunComprehensiveReview triggers the risk analysis engine with the git
 	// diff AND the test telemetry already present in the ledger.
-	RunComprehensiveReview() (summary string, err error)
+	RunComprehensiveReview() (summary string, ledger *riview.ReviewLedger, err error)
 }
 
 // ReviewTestCompositeResult carries the outcome of the composite pipeline so
@@ -66,6 +67,7 @@ type ReviewTestCompositeResult struct {
 	TestPassed bool
 	TestReport string
 	Review     string
+	Ledger     *riview.ReviewLedger
 	Err        error
 }
 
@@ -89,12 +91,13 @@ func HandleReviewTestComposite(tests TestExecutor, ledger LedgerInjector, review
 		return res
 	}
 
-	summary, err := review.RunComprehensiveReview()
+	summary, reviewLedger, err := review.RunComprehensiveReview()
 	if err != nil {
 		res.Err = fmt.Errorf("comprehensive review failed: %w", err)
 		return res
 	}
 	res.Review = summary
+	res.Ledger = reviewLedger
 
 	return res
 }

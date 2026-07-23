@@ -77,6 +77,8 @@ func (sm *StateMachine) canTransition(to State) bool {
 	case StateImpactRadius:
 		return to == StateRiskAudit || to == StateAnalyzeDiff
 	case StateRiskAudit:
+		return to == StateVerify || to == StateImpactRadius
+	case StateVerify:
 		return to == StateReport || to == StateImpactRadius
 	case StateReport:
 		return to == StateDone || to == StateAnalyzeDiff

@@ -33,6 +33,7 @@ import (
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -227,6 +228,13 @@ func (m *model) handleInput(line string) tea.Cmd {
 		if content != "" {
 			m.setMode(mode)
 			return m.handleMessageContent(content)
+		}
+		if mode == modes.ModeReview {
+			m.setMode(mode)
+			m.push(roleSystem, infoStyle.Render("Running review pipeline..."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m.runReviewCmd("")
 		}
 		return m.setMode(mode)
 	}
@@ -2904,6 +2912,13 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 		b.WriteString("└" + strings.Repeat("─", boxWidth-1) + "┘")
 
 		m.push(roleStatus, b.String())
+
+		// ── Append review provenance box if an active ledger exists ──
+		if m.currentReviewLedger != nil {
+			pr := riview.NewProvenanceRenderer(m.currentReviewLedger, boxWidth)
+			m.push(roleStatus, pr.Render())
+		}
+
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return agentDoneMsg{}
