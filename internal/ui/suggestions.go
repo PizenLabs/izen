@@ -24,38 +24,22 @@ func (m *model) updateSuggestions() {
 		m.dismissSuggestions()
 		return
 	}
-	if strings.HasPrefix(current, "$") {
-		m.showSuggestions = true
-		m.suggestionType = "$"
-		m.suggestions = m.filterDollarCommands(current[1:])
-		m.suggestionIdx = 0
-		if len(m.suggestions) == 1 && "$"+m.suggestions[0] == current {
-			m.showSuggestions = false
-		}
-		m.syncAutocompleteFromSuggestions()
-		if m.autocompleteActive {
-			m.recalcViewportHeight()
-		}
-		return
+
+	cursorIdx := m.ti.Position()
+	if cursorIdx > len(current) {
+		cursorIdx = len(current)
 	}
 
-	if strings.HasPrefix(current, "/") {
-		m.showSuggestions = true
-		m.suggestionType = "/"
-		m.suggestions = m.filterCommands(current[1:])
-		m.suggestionIdx = 0
-		if len(m.suggestions) == 1 && m.suggestions[0] == current {
-			m.showSuggestions = false
+	// Scan backward from cursor for @ trigger — works at any cursor position.
+	atIdx := -1
+	for i := cursorIdx - 1; i >= 0; i-- {
+		if current[i] == '@' {
+			atIdx = i
+			break
 		}
-		m.syncAutocompleteFromSuggestions()
-		if m.autocompleteActive {
-			m.recalcViewportHeight()
-		}
-		return
 	}
-	atIdx := strings.LastIndex(current, "@")
 	if atIdx >= 0 {
-		prefix := current[atIdx+1:]
+		prefix := current[atIdx+1 : cursorIdx]
 		if !strings.Contains(prefix, " ") {
 			m.showSuggestions = true
 			m.suggestionType = "@"
@@ -71,6 +55,39 @@ func (m *model) updateSuggestions() {
 			return
 		}
 	}
+
+	// $ at start of input only.
+	if strings.HasPrefix(current, "$") {
+		m.showSuggestions = true
+		m.suggestionType = "$"
+		m.suggestions = m.filterDollarCommands(current[1:])
+		m.suggestionIdx = 0
+		if len(m.suggestions) == 1 && "$"+m.suggestions[0] == current {
+			m.showSuggestions = false
+		}
+		m.syncAutocompleteFromSuggestions()
+		if m.autocompleteActive {
+			m.recalcViewportHeight()
+		}
+		return
+	}
+
+	// / at start of input only.
+	if strings.HasPrefix(current, "/") {
+		m.showSuggestions = true
+		m.suggestionType = "/"
+		m.suggestions = m.filterCommands(current[1:])
+		m.suggestionIdx = 0
+		if len(m.suggestions) == 1 && m.suggestions[0] == current {
+			m.showSuggestions = false
+		}
+		m.syncAutocompleteFromSuggestions()
+		if m.autocompleteActive {
+			m.recalcViewportHeight()
+		}
+		return
+	}
+
 	m.dismissSuggestions()
 }
 

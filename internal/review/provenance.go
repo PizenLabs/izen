@@ -3,6 +3,8 @@ package review
 import (
 	"fmt"
 	"strings"
+
+	"github.com/mattn/go-runewidth"
 )
 
 type ProvenanceRenderer struct {
@@ -121,9 +123,9 @@ func (pr *ProvenanceRenderer) RenderCompact() string {
 
 func (pr *ProvenanceRenderer) writeTopBorder(b *strings.Builder, label string) {
 	boxWidth := pr.Width
-	b.WriteString("┌─")
-	b.WriteString(label)
-	fill := boxWidth - len([]rune("┌─"+label)) - 1
+	prefix := "┌─" + label
+	b.WriteString(prefix)
+	fill := boxWidth - runewidth.StringWidth(prefix) - 1
 	if fill > 0 {
 		b.WriteString(strings.Repeat("─", fill))
 	}
@@ -131,7 +133,7 @@ func (pr *ProvenanceRenderer) writeTopBorder(b *strings.Builder, label string) {
 }
 
 func (pr *ProvenanceRenderer) writeBottomBorder(b *strings.Builder) {
-	b.WriteString("└" + strings.Repeat("─", pr.Width-1) + "┘")
+	b.WriteString("└" + strings.Repeat("─", pr.Width-2) + "┘")
 }
 
 func (pr *ProvenanceRenderer) writeSep(b *strings.Builder, contentWidth int) {
@@ -141,15 +143,39 @@ func (pr *ProvenanceRenderer) writeSep(b *strings.Builder, contentWidth int) {
 }
 
 func (pr *ProvenanceRenderer) writeRow(b *strings.Builder, text string, contentWidth int) {
-	runes := []rune(text)
-	if len(runes) > contentWidth {
+	textWidth := runewidth.StringWidth(text)
+	if textWidth > contentWidth {
 		if contentWidth > 3 {
-			text = string(runes[:contentWidth-3]) + "..."
+			var trimmed strings.Builder
+			w := 0
+			for _, r := range text {
+				rw := runewidth.RuneWidth(r)
+				if w+rw > contentWidth-3 {
+					break
+				}
+				trimmed.WriteRune(r)
+				w += rw
+			}
+			trimmed.WriteString("...")
+			text = trimmed.String()
 		} else {
-			text = string(runes[:contentWidth])
+			var trimmed strings.Builder
+			w := 0
+			for _, r := range text {
+				rw := runewidth.RuneWidth(r)
+				if w+rw > contentWidth {
+					break
+				}
+				trimmed.WriteRune(r)
+				w += rw
+			}
+			text = trimmed.String()
 		}
 	} else {
-		text += strings.Repeat(" ", contentWidth-len(runes))
+		pad := contentWidth - textWidth
+		if pad > 0 {
+			text += strings.Repeat(" ", pad)
+		}
 	}
 	b.WriteString("│ ")
 	b.WriteString(text)
