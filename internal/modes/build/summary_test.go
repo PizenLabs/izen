@@ -18,7 +18,7 @@ func TestRenderExecutionSummarySuccess(t *testing.T) {
 	}
 	out := RenderExecutionSummary(s)
 
-	if !strings.Contains(out, "**🚀 BUILD MUTATION SUMMARY**") {
+	if !strings.Contains(out, "**⛟  BUILD MUTATION SUMMARY**") {
 		t.Fatalf("missing header:\n%s", out)
 	}
 	if !strings.Contains(out, "- **Status:** SUCCESS") {

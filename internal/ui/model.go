@@ -28,6 +28,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/project"
+	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
 )
@@ -119,6 +120,7 @@ type reviewResultMsg struct {
 	records      []record
 	sessionKey   string
 	saveReportFn func()
+	ledger       *riview.ReviewLedger
 	err          error
 }
 
@@ -709,6 +711,11 @@ type model struct {
 	// pendingHotfixPatch holds the generated patch awaiting approval so the
 	// apply step does not need to re-invoke the LLM on confirmation.
 	pendingHotfixPatch *execution.Patch
+
+	// Active review ledger from the last /review pipeline run. Carries the
+	// C-R-H-V-E evidence chain for /review provenance and $log display. Stored
+	// here so $test and $log can attach evidence and render provenance traces.
+	currentReviewLedger *riview.ReviewLedger
 
 	// Review action spinner: set synchronously on $run/$test/$fix dispatch
 	// so the view can immediately render a spinner without waiting for the

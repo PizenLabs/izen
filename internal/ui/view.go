@@ -1183,6 +1183,13 @@ func parseAIContent(content string) []contentBlock {
 			continue
 		}
 
+		if currentKind == blockRisk || currentKind == blockEvidence {
+			if trimmed == "" || strings.HasPrefix(line, "  ") || strings.HasPrefix(line, "\t") {
+				currentBlock = append(currentBlock, line)
+				continue
+			}
+		}
+
 		if currentKind != blockText {
 			flush()
 		}

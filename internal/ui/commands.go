@@ -15,10 +15,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/command"
@@ -33,6 +33,7 @@ import (
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -227,6 +228,13 @@ func (m *model) handleInput(line string) tea.Cmd {
 		if content != "" {
 			m.setMode(mode)
 			return m.handleMessageContent(content)
+		}
+		if mode == modes.ModeReview {
+			m.setMode(mode)
+			m.push(roleSystem, infoStyle.Render("Running review pipeline..."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m.runReviewCmd("")
 		}
 		return m.setMode(mode)
 	}
@@ -2792,11 +2800,22 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 			if err := json.Unmarshal([]byte(line), &entry); err != nil {
 				// Fallback: pure text geometry
 				rawFallback := "› " + line
-				fallbackRunes := []rune(rawFallback)
-				if len(fallbackRunes) > contentWidth {
-					rawFallback = string(fallbackRunes[:contentWidth-3]) + "..."
+				fbWidth := runewidth.StringWidth(rawFallback)
+				if fbWidth > contentWidth {
+					var trimmed strings.Builder
+					w := 0
+					for _, r := range rawFallback {
+						rw := runewidth.RuneWidth(r)
+						if w+rw > contentWidth-3 {
+							break
+						}
+						trimmed.WriteRune(r)
+						w += rw
+					}
+					trimmed.WriteString("...")
+					rawFallback = trimmed.String()
 				} else {
-					rawFallback += strings.Repeat(" ", contentWidth-utf8.RuneCountInString(rawFallback))
+					rawFallback += strings.Repeat(" ", contentWidth-fbWidth)
 				}
 				styledFallback := strings.Replace(rawFallback, "›", bullet, 1)
 				formatted = append(formatted, styledFallback)
@@ -2848,16 +2867,37 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 			// 1. Build 100% raw plain text line.
 			rawLine := "› [" + modeLabel + " Mode] " + preview
 
-			// 2. Rigid truncation & padding on raw runes.
-			rawRunes := []rune(rawLine)
-			if len(rawRunes) > contentWidth {
+			// 2. Rigid truncation & padding using visual cell width.
+			lineWidth := runewidth.StringWidth(rawLine)
+			if lineWidth > contentWidth {
 				if contentWidth > 3 {
-					rawLine = string(rawRunes[:contentWidth-3]) + "..."
+					var trimmed strings.Builder
+					w := 0
+					for _, r := range rawLine {
+						rw := runewidth.RuneWidth(r)
+						if w+rw > contentWidth-3 {
+							break
+						}
+						trimmed.WriteRune(r)
+						w += rw
+					}
+					trimmed.WriteString("...")
+					rawLine = trimmed.String()
 				} else {
-					rawLine = string(rawRunes[:contentWidth])
+					var trimmed strings.Builder
+					w := 0
+					for _, r := range rawLine {
+						rw := runewidth.RuneWidth(r)
+						if w+rw > contentWidth {
+							break
+						}
+						trimmed.WriteRune(r)
+						w += rw
+					}
+					rawLine = trimmed.String()
 				}
 			} else {
-				rawLine += strings.Repeat(" ", contentWidth-utf8.RuneCountInString(rawLine))
+				rawLine += strings.Repeat(" ", contentWidth-lineWidth)
 			}
 
 			// 3. Late styling — rawLine now occupies exactly contentWidth columns.
@@ -2886,8 +2926,9 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 		var b strings.Builder
 
 		// Top border: ┌─ $log: Mutation History ────────────────┐
-		b.WriteString("┌─ $log: Mutation History ")
-		fillTop := boxWidth - utf8.RuneCountInString("┌─ $log: Mutation History ") - 1
+		topPrefix := "┌─ $log: Mutation History "
+		b.WriteString(topPrefix)
+		fillTop := boxWidth - runewidth.StringWidth(topPrefix) - 1
 		if fillTop > 0 {
 			b.WriteString(strings.Repeat("─", fillTop))
 		}
@@ -2901,9 +2942,16 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 		}
 
 		// Bottom border: └──────────────────────────────────────┘
-		b.WriteString("└" + strings.Repeat("─", boxWidth-1) + "┘")
+		b.WriteString("└" + strings.Repeat("─", boxWidth-2) + "┘")
 
 		m.push(roleStatus, b.String())
+
+		// ── Append review provenance box if an active ledger exists ──
+		if m.currentReviewLedger != nil {
+			pr := riview.NewProvenanceRenderer(m.currentReviewLedger, boxWidth)
+			m.push(roleStatus, pr.Render())
+		}
+
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return agentDoneMsg{}

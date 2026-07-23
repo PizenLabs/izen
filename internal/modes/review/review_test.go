@@ -2,12 +2,15 @@ package review
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
+	riview "github.com/PizenLabs/izen/internal/review"
 )
 
 func TestStateMachineInitialState(t *testing.T) {
@@ -26,7 +29,8 @@ func TestStateMachineValidTransitions(t *testing.T) {
 		{StateCollect, StateAnalyzeDiff},
 		{StateAnalyzeDiff, StateImpactRadius},
 		{StateImpactRadius, StateRiskAudit},
-		{StateRiskAudit, StateReport},
+		{StateRiskAudit, StateVerify},
+		{StateVerify, StateReport},
 		{StateReport, StateDone},
 	}
 
@@ -44,7 +48,7 @@ func TestStateMachineValidTransitions(t *testing.T) {
 func TestStateMachineInvalidTransitions(t *testing.T) {
 	sm := NewStateMachine(DefaultStateConfig())
 
-	invalid := []State{StateImpactRadius, StateRiskAudit, StateReport}
+	invalid := []State{StateImpactRadius, StateRiskAudit, StateVerify, StateReport}
 	for _, st := range invalid {
 		if err := sm.Transition(st); err == nil {
 			t.Fatalf("expected error for Collect->%s transition", st)
@@ -57,6 +61,7 @@ func TestStateMachineDoneHasNoTransitions(t *testing.T) {
 	_ = sm.Transition(StateAnalyzeDiff)
 	_ = sm.Transition(StateImpactRadius)
 	_ = sm.Transition(StateRiskAudit)
+	_ = sm.Transition(StateVerify)
 	_ = sm.Transition(StateReport)
 	_ = sm.Transition(StateDone)
 
@@ -70,6 +75,7 @@ func TestStateMachineLoopBack(t *testing.T) {
 	_ = sm.Transition(StateAnalyzeDiff)
 	_ = sm.Transition(StateImpactRadius)
 	_ = sm.Transition(StateRiskAudit)
+	_ = sm.Transition(StateVerify)
 	_ = sm.Transition(StateReport)
 
 	if err := sm.Transition(StateAnalyzeDiff); err != nil {
@@ -86,6 +92,7 @@ func TestStateMachineShouldStop(t *testing.T) {
 	_ = sm.Transition(StateAnalyzeDiff)
 	_ = sm.Transition(StateImpactRadius)
 	_ = sm.Transition(StateRiskAudit)
+	_ = sm.Transition(StateVerify)
 	_ = sm.Transition(StateReport)
 	_ = sm.Transition(StateDone)
 
@@ -100,6 +107,7 @@ func TestStateMachineMaxIterations(t *testing.T) {
 		_ = sm.Transition(StateAnalyzeDiff)
 		_ = sm.Transition(StateImpactRadius)
 		_ = sm.Transition(StateRiskAudit)
+		_ = sm.Transition(StateVerify)
 		_ = sm.Transition(StateReport)
 	}
 
@@ -147,6 +155,7 @@ func TestStateString(t *testing.T) {
 		{StateAnalyzeDiff, "analyze_diff"},
 		{StateImpactRadius, "impact_radius"},
 		{StateRiskAudit, "risk_audit"},
+		{StateVerify, "verify"},
 		{StateReport, "report"},
 		{StateDone, "done"},
 		{State(99), "unknown"},
@@ -1311,5 +1320,166 @@ func TestSearchResultDefaults(t *testing.T) {
 	}
 	if sr.Strategy != "" {
 		t.Errorf("expected empty Strategy, got %s", sr.Strategy)
+	}
+}
+
+// ─── Integration Tests ──────────────────────────────────────────────────
+
+func sh(t *testing.T, dir, name string, args ...string) {
+	t.Helper()
+	ctx := t.Context()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s %v: %s", name, args, string(out))
+	}
+}
+
+func gitCommit(t *testing.T, dir, msg string) {
+	t.Helper()
+	ge := git.NewEngine(dir)
+	if _, err := ge.Checkpoint(msg); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+}
+
+func TestEngineProvenanceLedgerWithFindings(t *testing.T) {
+	dir := t.TempDir()
+
+	sh(t, dir, "git", "init")
+	sh(t, dir, "git", "config", "user.email", "test@izen.dev")
+	sh(t, dir, "git", "config", "user.name", "Izen Test")
+
+	initial := `package main
+
+func Hello() string {
+	return "hello"
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(initial), 0644); err != nil {
+		t.Fatalf("write initial: %v", err)
+	}
+
+	gitCommit(t, dir, "initial")
+
+	modified := `package main
+
+import "fmt"
+
+func Hello() string {
+	secret := "sk-abcdef123456"
+	fmt.Println("debug")
+	panic("oops")
+	return "hello"
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(modified), 0644); err != nil {
+		t.Fatalf("write modified: %v", err)
+	}
+
+	e := NewEngine(dir, &mockRetriever{}, nil)
+	result, err := e.Run()
+	if err != nil {
+		t.Fatalf("Engine.Run: %v", err)
+	}
+	if result.Error != "" {
+		t.Fatalf("Engine error: %s", result.Error)
+	}
+
+	if result.Ledger == nil {
+		t.Fatal("expected non-nil Ledger in ReviewResult after StateVerify")
+	}
+
+	ledger := result.Ledger
+	t.Logf("ledger: %d changes, %d risks, %d hypotheses, %d verifications, %d evidences, status=%s",
+		len(ledger.Changes), len(ledger.Risks), len(ledger.Hypotheses), len(ledger.Verifications), len(ledger.Evidences), ledger.Status)
+	for _, r := range ledger.Risks {
+		t.Logf("  risk: %s category=%s file=%s desc=%s", r.ID, r.Category, r.File, r.Desc)
+	}
+	for _, e := range ledger.Evidences {
+		t.Logf("  evidence: %s status=%s confidence=%s", e.ID, e.Status, e.Confidence)
+	}
+	_ = result
+
+	if len(ledger.Changes) == 0 {
+		t.Error("expected at least one Change record (C-001)")
+	}
+	if len(ledger.Changes) > 0 && !strings.HasPrefix(ledger.Changes[0].ID, "C-") {
+		t.Errorf("expected Change ID starting with C-, got %s", ledger.Changes[0].ID)
+	}
+
+	if len(ledger.Risks) == 0 {
+		t.Error("expected at least one Risk record (R-001)")
+	}
+	if len(ledger.Risks) > 0 && !strings.HasPrefix(ledger.Risks[0].ID, "R-") {
+		t.Errorf("expected Risk ID starting with R-, got %s", ledger.Risks[0].ID)
+	}
+
+	if len(ledger.Hypotheses) == 0 {
+		t.Error("expected at least one Hypothesis record (H-001)")
+	}
+	if len(ledger.Verifications) == 0 {
+		t.Error("expected at least one Verification record (V-001)")
+	}
+	if len(ledger.Evidences) == 0 {
+		t.Error("expected at least one Evidence record (E-001)")
+	}
+
+	riskCategories := make(map[string]bool)
+	for _, r := range ledger.Risks {
+		riskCategories[r.Category] = true
+	}
+	if !riskCategories["Deterministic"] {
+		t.Error("expected at least one Deterministic risk classification (secret/panic)")
+	}
+
+	if ledger.Status != riview.StatusConditional && ledger.Status != riview.StatusVerified {
+		t.Errorf("expected StatusConditional or StatusVerified, got %s", ledger.Status)
+	}
+}
+
+func TestProvenanceRendererIntegration(t *testing.T) {
+	l := riview.NewReviewLedger("integ-test")
+	l.AddChange("cmd/api/main.go", "removed signal stop call", "dev")
+	l.AddRisk("Behavioral", "cmd/api/main.go", 42, "Repeated interrupt may no longer force shutdown")
+	l.AddRisk("Deterministic", "cmd/api/main.go", 10, "panic call detected")
+	l.AddHypothesis("R-001", "Second interrupt may no longer force shutdown", "SIGINT twice should force-exit within 1s")
+	l.AddVerification("H-001", "Signal lifecycle verification")
+	l.AddEvidence("V-001", riview.EvTypeExistingTest, riview.EvStatusPassed, riview.ConfVerified, "", "")
+	l.AddEvidence("V-001", riview.EvTypeEphemeralTest, riview.EvStatusPassed, riview.ConfHigh, "", "")
+	l.SetStatus(riview.StatusConditional)
+
+	pr := riview.NewProvenanceRenderer(l, 80)
+	output := pr.Render()
+
+	if !strings.Contains(output, "Review Ledger") {
+		t.Error("expected 'Review Ledger' in provenance output")
+	}
+	if !strings.Contains(output, "C-001") {
+		t.Error("expected C-001 in provenance output")
+	}
+	if !strings.Contains(output, "R-001") {
+		t.Error("expected R-001 in provenance output")
+	}
+	if !strings.Contains(output, "R-002") {
+		t.Error("expected R-002 in provenance output")
+	}
+	if !strings.Contains(output, "H-001") {
+		t.Error("expected H-001 in provenance output")
+	}
+	if !strings.Contains(output, "V-001") {
+		t.Error("expected V-001 in provenance output")
+	}
+	if !strings.Contains(output, "E-001") {
+		t.Error("expected E-001 in provenance output")
+	}
+	if !strings.Contains(output, "E-002") {
+		t.Error("expected E-002 in provenance output")
+	}
+	if !strings.Contains(output, "Review Status: Conditional") {
+		t.Error("expected 'Review Status: Conditional' in provenance output")
+	}
+	if !strings.Contains(output, "┌─") || !strings.Contains(output, "│") || !strings.Contains(output, "└") {
+		t.Error("expected box-drawing characters in provenance output")
 	}
 }

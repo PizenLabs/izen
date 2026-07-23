@@ -16,6 +16,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/review"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -242,9 +243,49 @@ func (m *model) runReviewTestComposite() tea.Cmd {
 			if res.Review != "" {
 				recs = append(recs, record{role: roleAI, text: res.Review})
 			}
-			return reviewResultMsg{records: recs}
+
+			if res.Ledger != nil {
+				testSummary := "Manual $test execution"
+				if res.TestPassed {
+					testName := extractTestName(res.TestReport)
+					if testName != "" {
+						testSummary += " passed: " + testName
+					} else {
+						testSummary += " passed"
+					}
+				} else {
+					testSummary += " completed (see results below)"
+				}
+				evStatus := riview.EvStatusPassed
+				if !res.TestPassed {
+					evStatus = riview.EvStatusFailed
+				}
+				ev := res.Ledger.AddEvidence("", riview.EvTypeExistingTest, evStatus, riview.ConfVerified, "", testSummary)
+				recs = append(recs, record{role: roleSystem, text: fmt.Sprintf("[+] Appended Evidence %s [Existing Test]: %s", ev.ID, string(evStatus))})
+			}
+
+			return reviewResultMsg{records: recs, ledger: res.Ledger}
 		},
 	)
+}
+
+// extractTestName extracts the first test function name from go test -v output.
+func extractTestName(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "=== RUN") {
+			parts := strings.SplitN(line, " ", 4)
+			if len(parts) >= 3 {
+				return strings.TrimSpace(parts[2])
+			}
+		}
+		if strings.Contains(line, "PASS:") {
+			parts := strings.Split(line, "PASS:")
+			if len(parts) > 1 {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	return ""
 }
 
 // reviewTestExecutor runs the dynamic test suite for the composite pipeline.
@@ -305,17 +346,17 @@ type reviewRunner struct {
 	m *model
 }
 
-func (r *reviewRunner) RunComprehensiveReview() (string, error) {
+func (r *reviewRunner) RunComprehensiveReview() (string, *riview.ReviewLedger, error) {
 	if cur := r.m.resolver.Current(); cur.CanWrite() || cur.CanShell() || cur.CanPatch() {
-		return "", fmt.Errorf("review mode: write/shell/patch capability detected — review must be 100%% read-only")
+		return "", nil, fmt.Errorf("review mode: write/shell/patch capability detected — review must be 100%% read-only")
 	}
 	eng := review.NewEngine(".", nil, nil)
 	result, err := eng.Run()
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if result.Error != "" {
-		return result.Error, nil
+		return result.Error, nil, nil
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "│ Review: %s → %s\n", result.BaseBranch, result.Branch)
@@ -334,7 +375,7 @@ func (r *reviewRunner) RunComprehensiveReview() (string, error) {
 		}
 	}
 	_ = review.SaveReport(result, ".")
-	return b.String(), nil
+	return b.String(), result.Ledger, nil
 }
 
 func (m *model) runReviewCmd(target string) tea.Cmd {
@@ -342,6 +383,7 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 		func() tea.Msg {
 			return agentStartMsg{label: "reviewing"}
 		},
+		m.spinnerTickCmd(),
 		func() tea.Msg {
 			currentMode := m.resolver.Current()
 			if currentMode.CanWrite() {
@@ -429,11 +471,17 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 
 			recs = append(recs, record{role: roleAI, text: b.String()})
 
+			if result.Ledger != nil {
+				pr := riview.NewProvenanceRenderer(result.Ledger, 80)
+				recs = append(recs, record{role: roleSystem, text: pr.Render()})
+			}
+
 			sessionKey := result.Branch + "@" + result.CommitHash
 			savedResult := result
 			return reviewResultMsg{
 				records:      recs,
 				sessionKey:   sessionKey,
+				ledger:       result.Ledger,
 				saveReportFn: func() { _ = review.SaveReport(savedResult, ".") },
 			}
 		},
