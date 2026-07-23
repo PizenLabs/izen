@@ -41,6 +41,7 @@ var validSystemCommands = map[string]struct{}{
 	"/help":       {},
 	"/?":          {},
 	"/quit":       {},
+	"/usage":      {},
 	"/provider":   {},
 	"/model":      {},
 	"/objective":  {},
@@ -1244,10 +1245,10 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /review      audit changes, detect risks"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
-		m.push(roleSystem, infoStyle.Render("  /help  /model  /provider  /objective  /drop  /clear  /quit"))
+		m.push(roleSystem, infoStyle.Render("  /help  /usage  /model  /objective  /drop  /clear  /quit"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch"))
 		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
-		m.push(roleSystem, infoStyle.Render("  /provider <name>  switch AI provider (ollama|anthropic|openai|gemini|openrouter|groq)"))
+		m.push(roleSystem, infoStyle.Render("  /usage           inspect token usage and provider status"))
 		m.push(roleSystem, infoStyle.Render("  /model           interactive model picker (fuzzy search)"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
@@ -1273,13 +1274,20 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, "goodbye.")
 		return m.cleanShutdownCmd()
 
+	case cmd == "/usage":
+		return m.runUsageCmd()
+
 	case strings.HasPrefix(cmd, "/provider"):
 		parts := strings.Fields(cmd)
-		if len(parts) == 2 {
+		if len(parts) >= 2 {
+			// Still allow provider switching via /provider for backwards
+			// compatibility, but show a deprecation hint.
+			m.push(roleSystem, mutedStyle.Render("💡 Tip: Use /model to pick models across any provider. Provider switching happens automatically."))
 			return m.switchProvider(parts[1])
 		}
-		m.listProviders()
-		return nil
+		// Bare /provider: redirect to /usage
+		m.push(roleSystem, mutedStyle.Render("💡 Tip: Provider switching is automatic! Use /model to pick any model, or /usage to inspect provider API keys."))
+		return m.runUsageCmd()
 
 	case cmd == "/model":
 		m.showModelPicker = true
@@ -3627,7 +3635,7 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 			// binding (m.cfg.ActiveModelName()), and base URL context that lets
 			// /ask execute successfully.
 			if m.provider == nil {
-				m.push(roleError, "[System Error] No AI provider is configured. Run /provider to select one.")
+				m.push(roleError, "[System Error] No AI provider is configured. Run /model to select one.")
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
 				return agentDoneMsg{}
@@ -3693,7 +3701,7 @@ func (m *model) runAskPromptHandoffCmd(rawInput string) tea.Cmd {
 		m.spinnerTickCmd(),
 		func() tea.Msg {
 			if m.provider == nil {
-				m.push(roleError, "[System Error] No AI provider is configured. Run /provider to select one.")
+				m.push(roleError, "[System Error] No AI provider is configured. Run /model to select one.")
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
 				return agentDoneMsg{}
