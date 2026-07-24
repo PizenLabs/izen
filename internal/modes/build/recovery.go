@@ -1,6 +1,10 @@
 package build
 
-import "strings"
+import (
+	"strings"
+
+	"regexp"
+)
 
 // StrictRecoverySystemPrompt returns a strict system prompt for the auto-recovery
 // loop that prohibits conversational intros/outros and requires the LLM response
@@ -61,4 +65,60 @@ func StripNonPatchProse(response string) string {
 	}
 
 	return strings.TrimSpace(response[earliest:])
+}
+
+// conversationalPatterns are regex patterns indicating the LLM output is
+// conversational prose rather than executable code patches.
+var conversationalPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)^(understood|okay|ok|got it|i will|let me|here's|here is|the goal|the task|i'll|i will now|i understand|of course|certainly|absolutely|sure thing|yes,|no,)`),
+	regexp.MustCompile(`(?i)(what is the goal|what should i|what would you|how can i|tell me what|please provide|i need you to|your goal|the objective is|you asked me to)`),
+	regexp.MustCompile(`(?i)^(hello|hi|hey|greetings|welcome)`),
+	regexp.MustCompile(`(?i)(let's start|let me begin|first,|firstly,|the first step)`),
+	regexp.MustCompile(`(?i)(to implement|to fix|to resolve|to address|in order to|the purpose of)`),
+}
+
+// IsConversationalOutput reports whether the LLM response is purely
+// conversational prose with no valid code patch markers. A conversational
+// output lacks SEARCH/REPLACE, FILE_CREATE, and diff markers, and its
+// content matches conversational greeting/rhetoric patterns.
+func IsConversationalOutput(response string) bool {
+	trimmed := strings.TrimSpace(response)
+	if trimmed == "" {
+		return false
+	}
+
+	// Check for valid patch markers first — if any exist, the output is
+	// at least partially actionable regardless of conversational preamble.
+	patchMarkers := []string{
+		"<<<<<<< SEARCH",
+		"<<<<<<< FILE_CREATE:",
+		"FILE_CREATE:",
+		"SEARCH",
+		"=======",
+		">>>>>>>",
+		"--- a/",
+		"+++ b/",
+		"```diff",
+	}
+	for _, m := range patchMarkers {
+		if strings.Contains(trimmed, m) {
+			return false
+		}
+	}
+	// Check if the output has any markdown code fence (```), which indicates
+	// code content even without the above markers.
+	if strings.Contains(trimmed, "```") {
+		return false
+	}
+	// Score conversational patterns: if ≥2 patterns match, it's conversational.
+	score := 0
+	for _, pat := range conversationalPatterns {
+		if pat.MatchString(trimmed) {
+			score++
+			if score >= 2 {
+				return true
+			}
+		}
+	}
+	return false
 }

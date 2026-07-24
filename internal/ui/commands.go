@@ -1181,6 +1181,57 @@ func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
 // 3. The raw relevant symbol definition/context from the codebase
 // This prevents cognitive drift by stripping all conversational history,
 // raw chat logs, and unrelated codebase files.
+// retryBuildWithStrictDirective re-executes the current build task with a
+// maximally strict instruction that prohibits any conversational output.
+// The LLM is told to output ONLY SEARCH/REPLACE or FILE_CREATE blocks with
+// zero preamble, zero explanation, zero greeting.
+func (m *model) retryBuildWithStrictDirective() tea.Cmd {
+	tasks := m.sess.CurrentTasks
+	if len(tasks) == 0 {
+		return nil
+	}
+	// Find the current processing/failed task.
+	var targetTask *plan.Task
+	for i, t := range tasks {
+		if t.Status == "processing" || t.Status == "failed" || t.Status == "idle" {
+			targetTask = &tasks[i]
+			break
+		}
+	}
+	if targetTask == nil {
+		return nil
+	}
+	strictContent := fmt.Sprintf(
+		"## STRICT BUILD DIRECTIVE — ZERO CONVERSATIONAL TEXT\n\n"+
+			"YOU ARE A CODE GENERATION TOOL. DO NOT OUTPUT ANY TEXT THAT IS NOT A CODE PATCH.\n\n"+
+			"REQUIRED OUTPUT FORMAT (FIRST TOKEN MUST MATCH):\n"+
+			"- For existing files: ```go:path/to/file.go\n  <<<<<<< SEARCH\n  ...\n  =======\n  ...\n  >>>>>>>\n  ```\n"+
+			"- For new files: ```\n  <<<<<<< FILE_CREATE: path/to/newfile.go\n  ...\n  >>>>>>> END_FILE\n  ```\n\n"+
+			"FORBIDDEN OUTPUT:\n"+
+			"- Greetings, acknowledgments, summaries, explanations\n"+
+			"- Questions, clarifications, suggestions\n"+
+			"- Markdown that is not SEARCH/REPLACE or FILE_CREATE\n"+
+			"- JSON, YAML, or any structured data format\n\n"+
+			"TASK:\n"+
+			"Step %d: %s\nTarget: %s\nDescription: %s\n\n"+
+			"OUTPUT YOUR PATCH NOW:",
+		targetTask.StepNum, targetTask.Type, targetTask.Target, targetTask.Description)
+	m.push(roleSystem, "Conversational output detected. Re-triggering build with strict directive...")
+	m.sess.ClearHistory()
+	_ = m.sess.Save()
+	m.responseBuffer.Reset()
+	m.streamBuffer = ""
+	m.currentStreamContent = ""
+	return m.streamCmd(strictContent)
+}
+
+// buildStrictHandoffPayload creates a minimal, focused context for the /build
+// task execution. It contains ONLY:
+// 1. The exact target file path(s) for the current task
+// 2. The exact staged task description
+// 3. The raw relevant symbol definition/context from the codebase
+// This prevents cognitive drift by stripping all conversational history,
+// raw chat logs, and unrelated codebase files.
 func (m *model) buildStrictHandoffPayload() string {
 	tasks := m.sess.CurrentTasks
 	if len(tasks) == 0 && len(m.handoffCtx.PendingTodos) == 0 {
@@ -2399,9 +2450,12 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	m.push(roleStatus, fmt.Sprintf("executing step %d: %s — %s", targetTask.StepNum, targetTask.Type, targetTask.Target))
 
 	content := fmt.Sprintf(
-		"EXECUTION MODE — implement ONLY this task and output the code patch directly "+
-			"(unified diff or FILE: block). Do NOT output JSON, do NOT restate the plan, "+
-			"do NOT list other tasks.\n\n"+
+		"EXECUTION MODE — implement ONLY this task. "+
+			"ZERO conversational text, ZERO explanations, ZERO greetings, ZERO summaries.\n"+
+			"YOUR FIRST OUTPUT TOKEN MUST BE A SEARCH/REPLACE BLOCK (for existing files) "+
+			"OR A FILE_CREATE BLOCK (for new files).\n"+
+			"Do NOT output JSON, do NOT restate the plan, do NOT list other tasks.\n"+
+			"Do NOT ask questions, do NOT ask for clarification, do NOT acknowledge.\n\n"+
 			"Step %d: %s\nTarget: %s\nDescription: %s",
 		targetTask.StepNum, targetTask.Type, targetTask.Target, targetTask.Description)
 

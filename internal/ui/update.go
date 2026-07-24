@@ -357,14 +357,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// The plan will be rendered for user review (Approve, Edit, Add/Remove,
 		// Reject) — automatic execution without human approval is strictly forbidden.
 		m.handoffCtx.ProposedFix = m.handoffLedgerContent
+		var cmds []tea.Cmd
 		if m.handoffLedgerContent != "" {
 			m.modeChangeAuthorized = true
-			m.setMode(modes.ModePlan)
+			cmds = append(cmds, m.setMode(modes.ModePlan))
 		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
-		flush := m.flushPendingRecords()
-		return m, flush
+		cmds = append(cmds, m.flushPendingRecords())
+		return m, tea.Batch(cmds...)
 
 	case planResultMsg:
 		// Terminal handler for the asynchronous PlanEngine synthesis. Only here
@@ -1749,7 +1750,42 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(jsonResult.Tasks) > 0 {
 					tasks := jsonResult.Tasks
 					m.sess.StageTaskList(&tasks)
-					m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
+					// Populate PendingTodos from JSON tasks so the plan view
+					// renders the interactive TODO checklist and the /build
+					// auto-trigger picks up the task payload.
+					if len(m.handoffCtx.PendingTodos) == 0 {
+						m.handoffCtx.PendingTodos = make([]string, len(tasks))
+						for i, t := range tasks {
+							icon := Icon.ShellExec
+							if t.Type == "FILE_MUTATE" || t.Type == "DIFF_PATCH" || t.Type == "ATOMIC_REPLACE" {
+								icon = Icon.SrcPatch
+							}
+							m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
+						}
+					}
+					m.currentResult = planApprovalActions()
+					var tb strings.Builder
+					tb.WriteString(boldSapphireStyle.Render(Icon.Blueprint+" STRATEGIC ARCHITECTURAL BLUEPRINT") + "\n")
+					tb.WriteString("  \u25b8 Impact Domain      : Execution Layer — Dependency Resolution\n")
+					tb.WriteString("  \u25b8 Risk Evaluation    : Low — Scoped dependency resolution\n")
+					tb.WriteString("  \u25b8 Verification Vector: Build + Test pipeline\n")
+					tb.WriteString("\n")
+					tb.WriteString(boldMauveStyle.Render(Icon.Timeline+" TODO CHECKLIST") + "\n")
+					for _, t := range jsonResult.Tasks {
+						icon, track := planTrackIcon(t)
+						fmt.Fprintf(&tb, "[ ] %s [%s] %s\n", icon, track, t.Target)
+						if t.Description != "" {
+							fmt.Fprintf(&tb, "      %s\n", t.Description)
+						}
+						if t.Rationale != "" && t.Rationale != t.Description {
+							fmt.Fprintf(&tb, "      %s\n", t.Rationale)
+						}
+						if t.Solution != "" {
+							fmt.Fprintf(&tb, "      %s\n", t.Solution)
+						}
+					}
+					m.push(roleStatus, tb.String())
+					m.push(roleStatus, "Plan staged. Approve or reject with the action bar below.")
 				}
 			} else {
 				errMsg := "plan rejected: output does not conform to JSON schema"
@@ -1767,6 +1803,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// independent lifecycle event.
 				m.sess.ClearHistory()
 				_ = m.sess.Save()
+			}
+			// Ensure the plan view shows approval actions even when the
+			// PlanEngine path (planResultMsg) was bypassed.
+			if m.currentResult == nil && len(m.handoffCtx.PendingTodos) > 0 {
+				m.currentResult = planApprovalActions()
 			}
 		}
 
@@ -1803,6 +1844,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.awaitingConfirmation = true
 					m.ti.Blur()
 					m.refreshViewportContent()
+				}
+			} else {
+				// ── ZERO-TOLERANCE CONVERSATIONAL GUARD ─────────────
+				// If the build LLM produced zero SEARCH/REPLACE or FILE_CREATE
+				// blocks, it output conversational prose instead of code patches.
+				// This is a hard violation of the build contract. Surface the error
+				// and request a re-generation with strict tool-only directive.
+				conversational := build.IsConversationalOutput(final)
+				if conversational {
+					regen := m.retryBuildWithStrictDirective()
+					if regen != nil {
+						return m, regen
+					}
+					m.push(roleError, "[BUILD GUARD] LLM output contained only conversational text — no SEARCH/REPLACE or FILE_CREATE blocks. Re-run /build with a stricter task description.")
 				}
 			}
 			m.sess.ClearTasks()

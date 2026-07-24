@@ -1,10 +1,5 @@
 package ui
 
-import (
-	"fmt"
-	"strings"
-)
-
 // The builders below are registered explicitly into a Registry at application
 // bootstrap (see program.go). No init()-based self-registration: wiring is
 // deterministic and lives in one place.
@@ -25,30 +20,30 @@ type planView struct{}
 func (planView) BuildWorkspace(m *model) Workspace {
 	var actions []Action
 	if len(m.handoffCtx.PendingTodos) > 0 {
-		// Render a visible TODO checklist with checkbox markers so the user
-		// can see exactly what will be executed before approving.
-		var todoBlock strings.Builder
-		todoBlock.WriteString("Planned staged execution timeline:\n")
-		for _, t := range m.handoffCtx.PendingTodos {
-			fmt.Fprintf(&todoBlock, "  [ ] %s\n", t)
-		}
 		actions = append(actions, Action{
-			ID:       "execute-patch",
-			Label:    "Execute & Verify Patch",
-			Shortcut: "alt+c",
+			ID:       "approve-plan",
+			Label:    "✓ Approve & Run /build",
+			Shortcut: "alt+p",
 			Command:  "/build",
-			Query:    todoBlock.String(),
 			Enabled:  true,
 			Priority: 100,
 		})
-	}
-	// Always show the plan approval (Approve/Reject) actions when tasks are
-	// staged, so the user can approve or reject from the workspace view.
-	if len(m.handoffCtx.PendingTodos) > 0 {
-		approveReject := planApprovalActions()
-		if approveReject != nil {
-			actions = append(actions, approveReject.Actions...)
-		}
+		actions = append(actions, Action{
+			ID:       "reject-plan",
+			Label:    "✗ Reject & Back",
+			Shortcut: "alt+r",
+			Command:  "/ask",
+			Enabled:  true,
+			Priority: 90,
+		})
+		actions = append(actions, Action{
+			ID:       "execute-patch",
+			Label:    "> Execute & Verify Patch",
+			Shortcut: "alt+c",
+			Command:  "/build",
+			Enabled:  true,
+			Priority: 80,
+		})
 	} else if len(m.currentResultActions()) > 0 {
 		actions = append(actions, m.currentResultActions()...)
 	}
