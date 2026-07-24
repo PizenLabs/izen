@@ -117,6 +117,32 @@ func planApprovalActions() *Result {
 	}}
 }
 
+// fastTrackPlanActions builds the navigation controls exposed when a fast-track
+// plan is auto-approved. Unlike planApprovalActions (which offers an explicit
+// approve gate), fast-track plans are pre-approved — the user may execute the
+// build immediately or reset the plan. These actions are set on m.currentResult
+// so they surface in ANY mode (including /ask) when a fast-track plan is staged.
+func fastTrackPlanActions() *Result {
+	return &Result{Actions: []Action{
+		{
+			ID:       "execute-build",
+			Label:    "▶ Execute Build",
+			Shortcut: "alt+b",
+			Command:  "/build",
+			Enabled:  true,
+			Priority: 100,
+		},
+		{
+			ID:       "reject-plan",
+			Label:    "✗ Reset & Clear",
+			Shortcut: "alt+r",
+			Command:  "/ask",
+			Enabled:  true,
+			Priority: 90,
+		},
+	}}
+}
+
 // currentResultActions returns the capabilities exposed by the current workflow
 // result. Returns nil when no result is active for the current view.
 func (m *model) currentResultActions() []Action {

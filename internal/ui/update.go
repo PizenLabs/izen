@@ -414,14 +414,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
 		}
-		m.push(roleStatus, fmt.Sprintf("Plan staged: %d task(s). Approve (Alt+P) or Reject (Alt+R).", len(msg.Tasks)))
+		if msg.IsFastTrack {
+			m.planApproved = true
+			m.push(roleStatus, accentStyle.Render(fmt.Sprintf("[Fast-Track] Plan auto-approved: %d task(s). Type /build to execute.", len(msg.Tasks))))
+		} else {
+			m.push(roleStatus, fmt.Sprintf("Plan staged: %d task(s). Approve (Alt+P) or Reject (Alt+R).", len(msg.Tasks)))
+		}
 		// Render the staged task list into the viewport so the developer can
 		// see exactly what /build will execute — Principal Engineer format.
 		// Use [ ] checkbox markers for each pending task to create an
 		// interactive todo checklist look in the TUI.
 		// Also expose the plan approval action chips — the user must explicitly
 		// approve the plan before /build execution begins.
-		m.currentResult = planApprovalActions()
+		// Fast-track plans are auto-approved — show execute-build + reset actions
+		// so action chips are visible from ANY mode (including /ask).
+		// Non-fast-track plans show the explicit approval gate.
+		if msg.IsFastTrack {
+			m.currentResult = fastTrackPlanActions()
+		} else {
+			m.currentResult = planApprovalActions()
+		}
 		var tb strings.Builder
 		tb.WriteString(boldSapphireStyle.Render(Icon.Blueprint+" STRATEGIC ARCHITECTURAL BLUEPRINT") + "\n")
 		tb.WriteString("  ▸ Impact Domain      : Execution Layer — Dependency Resolution\n")

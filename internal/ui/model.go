@@ -128,9 +128,10 @@ type reviewResultMsg struct {
 // synthesis. It is dispatched from a background tea.Cmd (runPlanEngineCmd) so
 // the synchronous LLM call never blocks the Bubble Tea event loop.
 type planResultMsg struct {
-	Tasks   []plan.Task
-	Err     error
-	Handoff HandoffContext // echoed back so the handler can populate PendingTodos
+	Tasks       []plan.Task
+	Err         error
+	Handoff     HandoffContext // echoed back so the handler can populate PendingTodos
+	IsFastTrack bool           // if true, auto-approve plan — bypass approval gate
 }
 
 type agentStartMsg struct{ label string }

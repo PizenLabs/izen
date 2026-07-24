@@ -27,6 +27,7 @@ import (
 	"github.com/PizenLabs/izen/internal/domain"
 	objengine "github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/gateway"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -207,6 +208,25 @@ func (m *model) handleInput(line string) tea.Cmd {
 			return nil
 		}
 		rawInput := strings.TrimSpace(line[8:])
+
+		// ── INTENT PRE-GUARD: Fast-track direct file mutations ──────────
+		// Inspect the raw input before dispatching to the Senior Architect
+		// pipeline. If the user is requesting a simple single-file mutation
+		// on a non-code file (e.g. $prompt rename author in @LICENSE),
+		// classify it and route directly to /build as a FILE_MUTATE task
+		// with zero LLM involvement — no forensic analysis, no go test.
+		if target, isDirect := gateway.ClassifyDirectMutation(rawInput); isDirect {
+			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected. Bypassing architect analysis."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			tasks := command.GenerateFallbackPlan(target)
+			return func() tea.Msg {
+				return planResultMsg{
+					Tasks:       tasks,
+					IsFastTrack: true,
+				}
+			}
+		}
 
 		currentMode := m.resolver.Current()
 		if currentMode != modes.ModeAsk {
@@ -2099,7 +2119,26 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
 
+		// ── CRITICAL: Read the target file BEFORE the LLM call ──────────
+		// Without the actual file content in the prompt, the LLM hallucinates
+		// the original content (e.g. "Copyright (c) 2023 Jay") and generates
+		// a unified diff that can never match the file on disk, producing:
+		//   "patch hunk does not match file content".
+		//
+		// The original is read once here and included in both the initial
+		// handoff and any retry handoff so the LLM always sees real content.
+		var orig string
+		if data, rerr := os.ReadFile(task.Target); rerr == nil {
+			orig = string(data)
+		}
+
 		baseHandoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		if orig != "" {
+			baseHandoff += "\n\n### TARGET_FILE_CONTENT\n```\n" + orig + "\n```\n"
+			baseHandoff += "\nModify the above file content to fulfill the task. "
+			baseHandoff += "Output a SEARCH/REPLACE block (`<<<<<<< SEARCH`) or a unified diff. "
+			baseHandoff += "Do NOT output a full FILE: block — the file already exists."
+		}
 		system := prompt.BuildContract()
 		maxRetries := 2
 		handoff := baseHandoff
@@ -2124,15 +2163,12 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 
 			cleaned := sanitizeFileOutput(resp.Content)
 
-			orig := ""
-			if data, rerr := os.ReadFile(task.Target); rerr == nil {
-				orig = string(data)
-			}
-
 			// Validate patch format BEFORE presenting to human.
 			// If the snippet is ambiguous (no SEARCH/REPLACE markers, no diff
 			// headers, significantly smaller than the original), reject early
 			// and retry with explicit SEARCH/REPLACE formatting instructions.
+			// The retry prompt also includes the actual file content so the
+			// LLM can generate a correct patch.
 			if execution.IsAmbiguousSnippet(orig, cleaned) {
 				if attempt < maxRetries {
 					handoff = fmt.Sprintf(
