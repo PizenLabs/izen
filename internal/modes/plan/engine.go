@@ -268,7 +268,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 					Content: fastPrompt[0],
 				},
 			},
-			Stream: false,
+			Stream:    false,
+			MaxTokens: 500,
 		}
 	} else {
 		// Extract the investigation conclusion so it can be injected as a

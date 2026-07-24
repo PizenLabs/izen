@@ -37,11 +37,12 @@ type claudeMessage struct {
 }
 
 type claudeRequest struct {
-	Model     string          `json:"model"`
-	Messages  []claudeMessage `json:"messages"`
-	MaxTokens int             `json:"max_tokens"`
-	Stream    bool            `json:"stream"`
-	System    string          `json:"system,omitempty"`
+	Model         string          `json:"model"`
+	Messages      []claudeMessage `json:"messages"`
+	MaxTokens     int             `json:"max_tokens"`
+	Stream        bool            `json:"stream"`
+	System        string          `json:"system,omitempty"`
+	StopSequences []string        `json:"stop_sequences,omitempty"`
 }
 
 type claudeResponse struct {
@@ -92,12 +93,17 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	msgs := p.buildMessages(req)
 
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 4096
+	}
 	body := claudeRequest{
-		Model:     model,
-		Messages:  msgs,
-		MaxTokens: 4096,
-		Stream:    false,
-		System:    req.System,
+		Model:         model,
+		Messages:      msgs,
+		MaxTokens:     maxTokens,
+		Stream:        false,
+		System:        req.System,
+		StopSequences: req.Stop,
 	}
 
 	payload, err := json.Marshal(body)
@@ -158,12 +164,17 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 
 	msgs := p.buildMessages(req)
 
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 4096
+	}
 	body := claudeRequest{
-		Model:     model,
-		Messages:  msgs,
-		MaxTokens: 4096,
-		Stream:    true,
-		System:    req.System,
+		Model:         model,
+		Messages:      msgs,
+		MaxTokens:     maxTokens,
+		Stream:        true,
+		System:        req.System,
+		StopSequences: req.Stop,
 	}
 
 	payload, err := json.Marshal(body)

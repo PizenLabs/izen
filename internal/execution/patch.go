@@ -626,8 +626,8 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 				globalActivityLog("[patch] Unified diff mismatch on %s — retrying as SEARCH/REPLACE block", patch.File)
 			}
 			// Try SEARCH/REPLACE blocks first (METHOD C)
-			if blocks := parseSearchReplaceBlocks(diffInput); len(blocks) > 0 {
-				if replaced, ok := applySearchReplaceBlockFromBlocks(patch.Original, blocks); ok && replaced != patch.Original {
+			if blocks := ParseSearchReplaceBlocks(diffInput); len(blocks) > 0 {
+				if replaced, ok := ApplySearchReplaceBlocks(patch.Original, blocks); ok && replaced != patch.Original {
 					final = replaced
 					if globalActivityLog != nil {
 						globalActivityLog("[patch] SEARCH/REPLACE block fallback succeeded for %s", patch.File)
@@ -651,8 +651,8 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	case patch.Original != "":
 		// Try SEARCH/REPLACE block format (METHOD C) — unambiguous markers
 		// that provide exact search context and replacement content.
-		if blocks := parseSearchReplaceBlocks(diffInput); len(blocks) > 0 {
-			if replaced, ok := applySearchReplaceBlockFromBlocks(patch.Original, blocks); ok && replaced != patch.Original {
+		if blocks := ParseSearchReplaceBlocks(diffInput); len(blocks) > 0 {
+			if replaced, ok := ApplySearchReplaceBlocks(patch.Original, blocks); ok && replaced != patch.Original {
 				final = replaced
 				if globalActivityLog != nil {
 					globalActivityLog("[patch] SEARCH/REPLACE block applied to %s", patch.File)
@@ -1252,17 +1252,63 @@ func parseFileCreateBlocks(content string) []fileCreateBlock {
 	return blocks
 }
 
+// ResolveModifiedContent takes the original file content and the raw LLM output
+// (which may be a SEARCH/REPLACE block, unified diff, or full file content) and
+// returns the actual modified content. This is used for computing accurate
+// display diffs — the PatchManager.Apply path has its own resolution logic.
+func ResolveModifiedContent(original, rawLLMOutput string) string {
+	input := strings.TrimSpace(rawLLMOutput)
+	if input == "" {
+		return input
+	}
+
+	// Strip outer markdown code fences if present.
+	if strings.HasPrefix(input, "```") {
+		if idx := strings.Index(input, "\n"); idx != -1 {
+			input = input[idx+1:]
+		}
+	}
+	input = strings.TrimSuffix(input, "```")
+	input = strings.TrimSpace(input)
+
+	if original == "" {
+		return input
+	}
+
+	// Strategy 1: SEARCH/REPLACE blocks
+	if strings.Contains(input, "<<<<<<< SEARCH") {
+		if blocks := ParseSearchReplaceBlocks(input); len(blocks) > 0 {
+			if modified, ok := ApplySearchReplaceBlocks(original, blocks); ok && modified != original {
+				return modified
+			}
+		}
+		// If SEARCH/REPLACE blocks are present but don't match, return original
+		// unchanged rather than passing through raw markers.
+		return original
+	}
+
+	// Strategy 2: Unified diff with @@ hunk headers
+	if strings.Contains(input, "@@") {
+		if modified, err := applyUnifiedPatch(original, input); err == nil && modified != original {
+			return modified
+		}
+	}
+
+	// Strategy 3: Treated as full file content
+	return input
+}
+
 // searchReplaceBlock represents a parsed <<<<<<< SEARCH ... ======= ... >>>>>>> block.
 type searchReplaceBlock struct {
 	search  string
 	replace string
 }
 
-// parseSearchReplaceBlocks scans content for <<<<<<< SEARCH ... ======= ... >>>>>>>
+// ParseSearchReplaceBlocks scans content for <<<<<<< SEARCH ... ======= ... >>>>>>>
 // blocks and returns the parsed blocks. Each block contains the search text
 // (between SEARCH and =======) and the replace text (between ======= and >>>>>>>).
 // Returns nil if no valid blocks are found.
-func parseSearchReplaceBlocks(content string) []searchReplaceBlock {
+func ParseSearchReplaceBlocks(content string) []searchReplaceBlock {
 	var blocks []searchReplaceBlock
 	lines := strings.Split(content, "\n")
 
@@ -1310,7 +1356,7 @@ func parseSearchReplaceBlocks(content string) []searchReplaceBlock {
 	return blocks
 }
 
-// applySearchReplaceBlockFromBlocks applies parsed SEARCH/REPLACE blocks to the
+// ApplySearchReplaceBlocks applies parsed SEARCH/REPLACE blocks to the
 // original content. For each block, it finds the SEARCH text in the original and
 // replaces it with the REPLACE text. Returns (result, true) on success or
 // (original, false) if any block's SEARCH text cannot be found.
@@ -1322,7 +1368,7 @@ func parseSearchReplaceBlocks(content string) []searchReplaceBlock {
 //     from each line and compares trimmed content. This handles the "patch hunk
 //     does not match file content" error caused by whitespace/indentation drift
 //     between the model's SEARCH block and the actual file content.
-func applySearchReplaceBlockFromBlocks(original string, blocks []searchReplaceBlock) (string, bool) {
+func ApplySearchReplaceBlocks(original string, blocks []searchReplaceBlock) (string, bool) {
 	if original == "" || len(blocks) == 0 {
 		return original, false
 	}

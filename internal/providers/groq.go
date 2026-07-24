@@ -45,9 +45,11 @@ func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respons
 	msgs := p.buildMessages(req)
 
 	body := groqRequest{
-		Model:    model,
-		Messages: msgs,
-		Stream:   false,
+		Model:     model,
+		Messages:  msgs,
+		MaxTokens: req.MaxTokens,
+		Stop:      req.Stop,
+		Stream:    false,
 	}
 
 	payload, err := json.Marshal(body)
@@ -110,9 +112,11 @@ func (p *GroqProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.Re
 	msgs := p.buildMessages(req)
 
 	body := groqRequest{
-		Model:    model,
-		Messages: msgs,
-		Stream:   true,
+		Model:     model,
+		Messages:  msgs,
+		MaxTokens: req.MaxTokens,
+		Stop:      req.Stop,
+		Stream:    true,
 	}
 
 	payload, err := json.Marshal(body)
@@ -161,9 +165,11 @@ type groqMessage struct {
 }
 
 type groqRequest struct {
-	Model    string        `json:"model"`
-	Messages []groqMessage `json:"messages"`
-	Stream   bool          `json:"stream"`
+	Model     string        `json:"model"`
+	Messages  []groqMessage `json:"messages"`
+	MaxTokens int           `json:"max_tokens,omitempty"`
+	Stop      []string      `json:"stop,omitempty"`
+	Stream    bool          `json:"stream"`
 }
 
 type groqResponse struct {

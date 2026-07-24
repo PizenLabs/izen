@@ -114,11 +114,15 @@ func (p *GeminiProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	msgs := p.buildMessages(req)
 
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 4096
+	}
 	body := geminiRequest{
 		Contents: msgs,
 		Stream:   false,
 		GenerationConfig: &geminiGenerationConfig{
-			MaxOutputTokens: 4096,
+			MaxOutputTokens: maxTokens,
 		},
 	}
 
@@ -184,11 +188,15 @@ func (p *GeminiProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 
 	msgs := p.buildMessages(req)
 
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 4096
+	}
 	body := geminiRequest{
 		Contents: msgs,
 		Stream:   true,
 		GenerationConfig: &geminiGenerationConfig{
-			MaxOutputTokens: 4096,
+			MaxOutputTokens: maxTokens,
 		},
 	}
 

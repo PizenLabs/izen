@@ -142,7 +142,10 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	msgs := p.buildMessages(req)
 
-	maxTokens := 4096
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 4096
+	}
 	body := ollamaRequest{
 		Model:     model,
 		Messages:  msgs,
@@ -150,7 +153,7 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		MaxTokens: &maxTokens,
 		Options: &struct {
 			NumPredict int `json:"num_predict"`
-		}{NumPredict: 4096},
+		}{NumPredict: maxTokens},
 	}
 	if req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object" {
 		body.Format = "json"
@@ -225,7 +228,10 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 
 	msgs := p.buildMessages(req)
 
-	maxTokens := 4096
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 4096
+	}
 	body := ollamaRequest{
 		Model:     model,
 		Messages:  msgs,
@@ -233,7 +239,7 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		MaxTokens: &maxTokens,
 		Options: &struct {
 			NumPredict int `json:"num_predict"`
-		}{NumPredict: 4096},
+		}{NumPredict: maxTokens},
 	}
 
 	payload, err := json.Marshal(body)
@@ -246,11 +252,10 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		return nil, fmt.Errorf("ollama: create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Cache-Control", "no-cache")
 	if p.apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 	}
+	httpReq.Header.Set("Accept", "text/event-stream")
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {

@@ -20,6 +20,8 @@ type Request struct {
 	Messages       []Message       `json:"messages"`
 	Stream         bool            `json:"stream"`
 	System         string          `json:"-"` // Explicit system prompt (top-level for Anthropic, prepended for OpenAI-compatible)
+	MaxTokens      int             `json:"-"` // 0 = use provider default
+	Stop           []string        `json:"-"` // Optional stop sequences (e.g. [">>>>>>>"])
 	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
 }
 

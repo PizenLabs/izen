@@ -1963,7 +1963,7 @@ func resolveHotfixTarget(prompt string) string {
 		// Sanity: must contain a path separator or an extension, and must not
 		// be a single bare word that merely looks like an extension.
 		if strings.Contains(m, "/") || strings.Contains(m, ".") {
-			return m
+			return gateway.CanonicalizeFileName(m)
 		}
 	}
 
@@ -2018,13 +2018,16 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			handoff += "\nModify the above file content to fulfill the task. "
 			handoff += "Output a SEARCH/REPLACE block (`<<<<<<< SEARCH`) or a unified diff. "
 			handoff += "Do NOT output a full FILE: block — the file already exists."
+			handoff += "\n\nSTRICT: Output ONLY the minimal SEARCH/REPLACE block needed. DO NOT rewrite the entire file. DO NOT include explanations or markdown prose."
 		}
 		system := prompt.BuildContract()
 		req := ai.Request{
-			Model:    m.cfg.ActiveModelName(),
-			System:   system,
-			Stream:   false,
-			Messages: []ai.Message{{Role: "user", Content: handoff}},
+			Model:     m.cfg.ActiveModelName(),
+			System:    system,
+			Stream:    false,
+			MaxTokens: 500,
+			Stop:      []string{">>>>>>>"},
+			Messages:  []ai.Message{{Role: "user", Content: handoff}},
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -2043,9 +2046,10 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		// document and corrupts its syntax, so we sanitize BEFORE the diff is
 		// computed and the patch is staged for disk write.
 		cleaned := sanitizeFileOutput(resp.Content)
+		resolved := execution.ResolveModifiedContent(orig, resp.Content)
 
 		// Compute a unified diff for display (green additions / red removals).
-		diff := computeUnifiedDiff(task.Target, orig, cleaned)
+		diff := computeUnifiedDiff(task.Target, orig, resolved)
 
 		patch := &execution.Patch{
 			ID:        fmt.Sprintf("hotfix-%d", task.StepNum),
@@ -2139,6 +2143,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			baseHandoff += "\nModify the above file content to fulfill the task. "
 			baseHandoff += "Output a SEARCH/REPLACE block (`<<<<<<< SEARCH`) or a unified diff. "
 			baseHandoff += "Do NOT output a full FILE: block — the file already exists."
+			baseHandoff += "\n\nSTRICT: Output ONLY the minimal SEARCH/REPLACE block needed. DO NOT rewrite the entire file. DO NOT include explanations or markdown prose."
 		}
 		system := prompt.BuildContract()
 		maxRetries := 2
@@ -2146,10 +2151,12 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 
 		for attempt := 0; attempt <= maxRetries; attempt++ {
 			req := ai.Request{
-				Model:    m.cfg.ActiveModelName(),
-				System:   system,
-				Stream:   false,
-				Messages: []ai.Message{{Role: "user", Content: handoff}},
+				Model:     m.cfg.ActiveModelName(),
+				System:    system,
+				Stream:    false,
+				MaxTokens: 500,
+				Stop:      []string{">>>>>>>", "```\n\n"},
+				Messages:  []ai.Message{{Role: "user", Content: handoff}},
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -2163,6 +2170,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			}
 
 			cleaned := sanitizeFileOutput(resp.Content)
+			resolved := execution.ResolveModifiedContent(orig, resp.Content)
 
 			// Validate patch format BEFORE presenting to human.
 			// If the snippet is ambiguous (no SEARCH/REPLACE markers, no diff
@@ -2180,7 +2188,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				return buildProposalReadyMsg{Err: fmt.Errorf("%w: ambiguous snippet without SEARCH/REPLACE markers for existing file %s — retry with SEARCH/REPLACE block or unified diff", execution.ErrInvalidPatchFormat, task.Target)}
 			}
 
-			diff := computeUnifiedDiff(task.Target, orig, cleaned)
+			diff := computeUnifiedDiff(task.Target, orig, resolved)
 
 			patch := &execution.Patch{
 				ID:        fmt.Sprintf("build-%d", task.StepNum),

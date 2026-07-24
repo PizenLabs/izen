@@ -469,7 +469,7 @@ func TestFirstNonEmptyLine(t *testing.T) {
 func TestParseSearchReplaceBlocks(t *testing.T) {
 	t.Run("single block", func(t *testing.T) {
 		input := "<<<<<<< SEARCH\nline1\nline2\n=======\nline1\nline2_modified\n>>>>>>>"
-		blocks := parseSearchReplaceBlocks(input)
+		blocks := ParseSearchReplaceBlocks(input)
 		if len(blocks) != 1 {
 			t.Fatalf("expected 1 block, got %d", len(blocks))
 		}
@@ -483,7 +483,7 @@ func TestParseSearchReplaceBlocks(t *testing.T) {
 
 	t.Run("multiple blocks", func(t *testing.T) {
 		input := "<<<<<<< SEARCH\nold1\n=======\nnew1\n>>>>>>>\nsome stuff\n<<<<<<< SEARCH\nold2\n=======\nnew2\n>>>>>>>"
-		blocks := parseSearchReplaceBlocks(input)
+		blocks := ParseSearchReplaceBlocks(input)
 		if len(blocks) != 2 {
 			t.Fatalf("expected 2 blocks, got %d", len(blocks))
 		}
@@ -496,7 +496,7 @@ func TestParseSearchReplaceBlocks(t *testing.T) {
 	})
 
 	t.Run("no blocks returns nil", func(t *testing.T) {
-		blocks := parseSearchReplaceBlocks("just some random content\nno markers here")
+		blocks := ParseSearchReplaceBlocks("just some random content\nno markers here")
 		if len(blocks) != 0 {
 			t.Fatalf("expected 0 blocks, got %d", len(blocks))
 		}
@@ -504,7 +504,7 @@ func TestParseSearchReplaceBlocks(t *testing.T) {
 
 	t.Run("malformed block missing replace", func(t *testing.T) {
 		input := "<<<<<<< SEARCH\nold\n=======\n>>>>>>>"
-		blocks := parseSearchReplaceBlocks(input)
+		blocks := ParseSearchReplaceBlocks(input)
 		if len(blocks) != 1 {
 			t.Fatalf("expected 1 block, got %d", len(blocks))
 		}
@@ -514,7 +514,7 @@ func TestParseSearchReplaceBlocks(t *testing.T) {
 	})
 
 	t.Run("empty content", func(t *testing.T) {
-		blocks := parseSearchReplaceBlocks("")
+		blocks := ParseSearchReplaceBlocks("")
 		if len(blocks) != 0 {
 			t.Fatalf("expected 0 blocks, got %d", len(blocks))
 		}
@@ -528,7 +528,7 @@ func TestApplySearchReplaceBlockFromBlocks(t *testing.T) {
 			search:  "\tprintln(\"hello\")",
 			replace: "\tprintln(\"world\")",
 		}}
-		result, ok := applySearchReplaceBlockFromBlocks(original, blocks)
+		result, ok := ApplySearchReplaceBlocks(original, blocks)
 		if !ok {
 			t.Fatal("expected successful replacement")
 		}
@@ -546,7 +546,7 @@ func TestApplySearchReplaceBlockFromBlocks(t *testing.T) {
 			{search: "line1\n", replace: "changed1\n"},
 			{search: "line3\n", replace: "changed3\n"},
 		}
-		result, ok := applySearchReplaceBlockFromBlocks(original, blocks)
+		result, ok := ApplySearchReplaceBlocks(original, blocks)
 		if !ok {
 			t.Fatal("expected successful replacement")
 		}
@@ -564,21 +564,21 @@ func TestApplySearchReplaceBlockFromBlocks(t *testing.T) {
 	t.Run("search not found returns false", func(t *testing.T) {
 		original := "package main\n"
 		blocks := []searchReplaceBlock{{search: "nonexistent", replace: "replacement"}}
-		_, ok := applySearchReplaceBlockFromBlocks(original, blocks)
+		_, ok := ApplySearchReplaceBlocks(original, blocks)
 		if ok {
 			t.Fatal("expected false when search not found")
 		}
 	})
 
 	t.Run("empty original returns false", func(t *testing.T) {
-		_, ok := applySearchReplaceBlockFromBlocks("", []searchReplaceBlock{{search: "x", replace: "y"}})
+		_, ok := ApplySearchReplaceBlocks("", []searchReplaceBlock{{search: "x", replace: "y"}})
 		if ok {
 			t.Fatal("expected false for empty original")
 		}
 	})
 
 	t.Run("empty blocks returns false", func(t *testing.T) {
-		_, ok := applySearchReplaceBlockFromBlocks("original", nil)
+		_, ok := ApplySearchReplaceBlocks("original", nil)
 		if ok {
 			t.Fatal("expected false for nil blocks")
 		}

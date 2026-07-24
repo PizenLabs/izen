@@ -96,6 +96,56 @@ var directMutationBareFiles = []string{
 	"changelog", "changelog.md",
 }
 
+// knownConventions maps lowercased filenames to their canonical (correct-case)
+// form. All lookups should be done with the lowercased key; the value
+// preserves the conventional casing (e.g. "LICENSE", "README.md").
+var knownConventions = map[string]string{
+	"license":         "LICENSE",
+	"licence":         "LICENSE",
+	"readme":          "README.md",
+	"readme.md":       "README.md",
+	"dockerfile":      "Dockerfile",
+	"makefile":        "Makefile",
+	"env":             ".env",
+	".env":            ".env",
+	"env.example":     ".env.example",
+	".env.example":    ".env.example",
+	"gitignore":       ".gitignore",
+	".gitignore":      ".gitignore",
+	"dockerignore":    ".dockerignore",
+	".dockerignore":   ".dockerignore",
+	"contributing":    "CONTRIBUTING.md",
+	"contributing.md": "CONTRIBUTING.md",
+	"changelog":       "CHANGELOG.md",
+	"changelog.md":    "CHANGELOG.md",
+}
+
+// CanonicalizeFileName maps a file path returned by the LLM to its
+// conventional-cased form. It checks each path segment against known
+// conventions (e.g. "license" → "LICENSE", "readme" → "README.md").
+// Non-convention paths are returned unchanged.
+func CanonicalizeFileName(path string) string {
+	if path == "" {
+		return path
+	}
+	// Try the full path first (handles ".env", ".gitignore", etc.)
+	lower := strings.ToLower(path)
+	if canon, ok := knownConventions[lower]; ok {
+		return canon
+	}
+	// Check bare filename (last segment)
+	base := filepath.Base(path)
+	baseLower := strings.ToLower(base)
+	if canon, ok := knownConventions[baseLower]; ok {
+		dir := filepath.Dir(path)
+		if dir == "." || dir == "" {
+			return canon
+		}
+		return filepath.Join(dir, canon)
+	}
+	return path
+}
+
 // ClassifyDirectMutation inspects user input to determine whether it is a
 // simple single-file text mutation that should bypass the Senior Architect
 // pipeline and route directly to the /build engine as a FILE_MUTATE task.
