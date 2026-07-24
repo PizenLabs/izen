@@ -212,6 +212,13 @@ func splitVis(s string, visLen int) (string, string) {
 }
 
 func (m *model) BuildWorkspace() Workspace {
+	// FIRST-RUN DISK GATE: authoritative .izen/ existence check supersedes
+	// any in-memory initStage value. This prevents stale/incorrect state
+	// (e.g., initNone zero value, initComplete from auto-create bypass)
+	// from rendering the workspace before the user completes onboarding.
+	if !m.isProjectInitialized() {
+		return Workspace{Overlay: m.renderInitView()}
+	}
 	if m.initStage != initNone && m.initStage != initComplete {
 		return Workspace{Overlay: m.renderInitView()}
 	}

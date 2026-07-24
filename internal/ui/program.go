@@ -118,11 +118,11 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		}
 	}
 	if !localActive {
-		if eng.IsRepo() {
-			initStage = initIdentity
-		} else {
-			initStage = initGitCheck
-		}
+		// Always start at the welcome screen (initNone) when .izen/ does not
+		// exist. The welcome screen handles git detection and routes to the
+		// correct sub-stage (initGitCheck, initIdentity) when the user presses
+		// Enter. This ensures the onboarding flow is never bypassed.
+		initStage = initNone
 	}
 
 	// ── DEFERRED GRAPH LOAD ─────────────────────────────────────────────

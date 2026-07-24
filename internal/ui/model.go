@@ -846,6 +846,25 @@ type model struct {
 	sessionModel    string // user-selected model override via /model
 }
 
+// isProjectInitialized checks whether .izen/ exists AND contains a valid
+// config.json on disk. This is the AUTHORITATIVE first-run gate used by
+// BuildWorkspace to decide whether to render the onboarding overlay or the
+// normal mode workspace. It supersedes any in-memory initStage value.
+func (m *model) isProjectInitialized() bool {
+	if m.workspaceRoot == "" {
+		return false
+	}
+	izenDir := filepath.Join(m.workspaceRoot, ".izen")
+	if _, err := os.Stat(izenDir); os.IsNotExist(err) {
+		return false
+	}
+	cfgPath := filepath.Join(m.workspaceRoot, ".izen", "config.json")
+	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		return false
+	}
+	return true
+}
+
 // ── Rendering helpers ─────────────────────────────────────────────────────────
 
 // wrapStreamText wraps raw text lines dynamically during an active live stream.

@@ -39,6 +39,8 @@ type openaiMessage struct {
 type openaiRequest struct {
 	Model         string          `json:"model"`
 	Messages      []openaiMessage `json:"messages"`
+	MaxTokens     int             `json:"max_tokens,omitempty"`
+	Stop          []string        `json:"stop,omitempty"`
 	Stream        bool            `json:"stream"`
 	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
 }
@@ -95,9 +97,11 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	msgs := p.buildMessages(req)
 
 	body := openaiRequest{
-		Model:    model,
-		Messages: msgs,
-		Stream:   false,
+		Model:     model,
+		Messages:  msgs,
+		MaxTokens: req.MaxTokens,
+		Stop:      req.Stop,
+		Stream:    false,
 	}
 
 	payload, err := json.Marshal(body)
@@ -162,6 +166,8 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	body := openaiRequest{
 		Model:         model,
 		Messages:      msgs,
+		MaxTokens:     req.MaxTokens,
+		Stop:          req.Stop,
 		Stream:        true,
 		StreamOptions: &streamOptions{IncludeUsage: true},
 	}

@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -492,6 +494,29 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 	)
 }
 
+// initSessionStartCheckpoint creates the session-start shadow checkpoint
+// to enable /undo --session even across CLI restarts. If a session-start
+// checkpoint already exists, it is overwritten with the current state.
+func (m *model) initSessionStartCheckpoint() tea.Msg {
+	if m.execEng == nil || m.execEng.ShadowCP == nil {
+		return nil
+	}
+	// FIRST-RUN GATE: never create checkpoints (or the .izen/ directory) when
+	// .izen/ does not yet exist on disk. This prevents the session-start
+	// snapshot from spuriously creating .izen/checkpoints/ which would cause
+	// HasLocalState to return true and bypass the TUI onboarding flow.
+	if m.workspaceRoot != "" {
+		if _, err := os.Stat(filepath.Join(m.workspaceRoot, ".izen")); os.IsNotExist(err) {
+			return nil
+		}
+	}
+	_, err := m.execEng.ShadowCP.CreateSessionStartSnapshot()
+	if err != nil {
+		return nil
+	}
+	return nil
+}
+
 func (m *model) runUndoCmd(raw string) tea.Cmd {
 	parts := strings.Fields(raw)
 	hasAll := false
@@ -550,48 +575,119 @@ func (m *model) runUndoCmd(raw string) tea.Cmd {
 	return nil
 }
 
-func (m *model) runCommitCmdAgent() tea.Cmd {
+func (m *model) runCommitCmdAgent(userMsg string) tea.Cmd {
 	return tea.Sequence(
 		func() tea.Msg {
-			return agentStartMsg{label: "generating commit message"}
+			label := "generating commit message"
+			if userMsg != "" {
+				label = "committing"
+			}
+			return agentStartMsg{label: label}
 		},
 		m.spinnerTickCmd(),
 		func() tea.Msg {
+			// ── CONSECUTIVE BUILD CHECKPOINT DETECTION ─────────
+			// Scan git log for consecutive "izen build:" commits at HEAD.
+			// These are temporary checkpoints created during /build and should
+			// be squashed into a single semantic commit.
+			// CRITICAL: Clamp HEAD~N so it never exceeds the repo's total
+			// commit count. When all commits are build checkpoints, diff
+			// against the empty tree (no parent commit exists).
+			const emptyTreeHash = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+			buildCount := m.gitEng.CountConsecutiveBuildCheckpoints()
+			var squashRef string
+			useEmptyTree := false
+			totalCommits := 0
+
+			if buildCount > 0 {
+				totalCommits, _ = m.gitEng.TotalCommits()
+				if totalCommits > 0 && buildCount >= totalCommits {
+					useEmptyTree = true
+					if totalCommits > 1 {
+						squashRef = fmt.Sprintf("HEAD~%d", totalCommits-1)
+					}
+				} else {
+					squashRef = fmt.Sprintf("HEAD~%d", buildCount)
+				}
+			}
+
+			// ── STAGE ALL CHANGES ──────────────────────────────
 			if err := m.gitEng.StageAll(); err != nil {
 				return commitGeneratedMsg{err: fmt.Errorf("failed to stage changes: %w", err)}
 			}
 
-			diff, err := m.gitEng.DiffCached()
+			// ── GET DIFF ───────────────────────────────────────
+			var diff string
+			var err error
+			switch {
+			case useEmptyTree:
+				diff, err = m.gitEng.DiffRange(emptyTreeHash, "HEAD")
+			case squashRef != "":
+				diff, err = m.gitEng.DiffRange(squashRef, "HEAD")
+			default:
+				diff, err = m.gitEng.DiffCached()
+			}
 			if err != nil {
-				return commitGeneratedMsg{err: fmt.Errorf("failed to get staged diff: %w", err)}
+				return commitGeneratedMsg{err: fmt.Errorf("failed to get diff: %w", err)}
 			}
 			if strings.TrimSpace(diff) == "" {
 				return commitGeneratedMsg{err: fmt.Errorf("no changes to commit")}
 			}
 
-			payload := commit.BuildPrompt(diff)
-			sys := prompt.CommitSystemPrompt()
-			msgs := []ai.Message{
-				{Role: "system", Content: sys},
-				{Role: "user", Content: payload},
-			}
-			req := ai.Request{
-				Model:    m.cfg.ActiveModelName(),
-				Messages: msgs,
-				Stream:   false,
-			}
-			resp, err := m.provider.Execute(context.Background(), req)
-			if err != nil {
-				return commitGeneratedMsg{err: fmt.Errorf("LLM call failed: %w", err)}
+			// ── SQUASH BUILD CHECKPOINTS ──────────────────────
+			if squashRef != "" {
+				if err := m.gitEng.ResetSoft(squashRef); err != nil {
+					return commitGeneratedMsg{err: fmt.Errorf("squash failed: %w", err)}
+				}
+				if err := m.gitEng.StageAll(); err != nil {
+					return commitGeneratedMsg{err: fmt.Errorf("re-stage after squash failed: %w", err)}
+				}
 			}
 
-			msg := commit.ParseGeneratedMessage(resp.Content)
-			if err := m.gitEng.Commit(msg.Subject, msg.Body); err != nil {
-				return commitGeneratedMsg{err: fmt.Errorf("commit failed: %w", err)}
+			// ── GENERATE COMMIT MESSAGE ───────────────────────
+			var subject, body string
+			if userMsg != "" {
+				subject = userMsg
+			} else {
+				payload := commit.BuildPrompt(diff)
+				sys := prompt.CommitSystemPrompt()
+				msgs := []ai.Message{
+					{Role: "system", Content: sys},
+					{Role: "user", Content: payload},
+				}
+				req := ai.Request{
+					Model:    m.cfg.ActiveModelName(),
+					Messages: msgs,
+					Stream:   false,
+				}
+				resp, err := m.provider.Execute(context.Background(), req)
+				if err != nil {
+					return commitGeneratedMsg{err: fmt.Errorf("LLM call failed: %w", err)}
+				}
+				parsed := commit.ParseGeneratedMessage(resp.Content)
+				subject = parsed.Subject
+				body = parsed.Body
+			}
+
+			// When the sole commit is a build checkpoint (no parent to
+			// squash against), amend it instead of creating a new commit.
+			if useEmptyTree && totalCommits == 1 {
+				msg := subject
+				if body != "" {
+					msg = subject + "\n\n" + body
+				}
+				if err := m.gitEng.AmendCommit(msg); err != nil {
+					return commitGeneratedMsg{err: fmt.Errorf("amend failed: %w", err)}
+				}
+			} else {
+				if err := m.gitEng.Commit(subject, body); err != nil {
+					return commitGeneratedMsg{err: fmt.Errorf("commit failed: %w", err)}
+				}
 			}
 
 			hash, _ := m.gitEng.CurrentHash()
-			return commitGeneratedMsg{subject: msg.Subject, body: msg.Body, hash: hash}
+			return commitGeneratedMsg{subject: subject, body: body, hash: hash}
 		},
 	)
 }

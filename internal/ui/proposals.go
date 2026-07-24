@@ -12,7 +12,18 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/gateway"
 )
+
+// searchReplaceBlockRe matches SEARCH/REPLACE blocks that the LLM may emit
+// directly (without ``` fences). Each block has the form:
+//
+//	<<<<<<< SEARCH
+//	<original lines>
+//	=======
+//	<replacement lines>
+//	>>>>>>>
+var searchReplaceBlockRe = regexp.MustCompile(`(?s)<<<<<<< SEARCH\n(.*?)=======\n(.*?)>>>>>>>`)
 
 var diffBlockRegex = regexp.MustCompile("(?s)```diff\\n(.*?)```")
 
@@ -35,6 +46,11 @@ func extractBuildProposals(response string) []SemanticProposal {
 
 	// PHASE 3: Extract diff blocks.
 	proposals = append(proposals, extractDiffPatches(response)...)
+
+	// PHASE 3b: Extract SEARCH/REPLACE blocks and convert to unified diff
+	// for proper red/green rendering. Must run after diff patches so explicit
+	// ```diff blocks take priority.
+	proposals = append(proposals, extractSearchReplaceProposals(response)...)
 
 	// PHASE 4: Fallback — if no proposals found, scan for bare code blocks
 	// and try to infer file paths from the response context.
@@ -65,6 +81,7 @@ func extractFileTagBlocks(response string) []SemanticProposal {
 		if clean == "" || clean == "." {
 			continue
 		}
+		clean = gateway.CanonicalizeFileName(clean)
 
 		diff := body
 		// Safety net: if the file already exists on disk, the model should have
@@ -159,7 +176,7 @@ func extractLangPathBlocks(response string) []SemanticProposal {
 					current.Expanded = true
 					clean := filepath.Clean(current.Target.QualifiedName)
 					if clean != "" && clean != "." {
-						current.Target.QualifiedName = clean
+						current.Target.QualifiedName = gateway.CanonicalizeFileName(clean)
 						proposals = append(proposals, *current)
 					}
 				}
@@ -189,12 +206,62 @@ func extractDiffPatches(response string) []SemanticProposal {
 			if clean != "" && clean != "." {
 				proposals = append(proposals, SemanticProposal{
 					ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
-					Target:   SemanticTarget{QualifiedName: clean},
+					Target:   SemanticTarget{QualifiedName: gateway.CanonicalizeFileName(clean)},
 					Diff:     body,
 					Expanded: true,
 				})
 			}
 		}
+	}
+	return proposals
+}
+
+// extractSearchReplaceProposals scans for <<<<<<< SEARCH / ======= / >>>>>>>
+// blocks that the LLM may emit directly without ``` fences. For each block, it
+// infers the target file path from preceding context, reads the original file
+// from disk, applies the SEARCH/REPLACE to compute the modified content, and
+// builds a unified diff for proper red/green rendering.
+func extractSearchReplaceProposals(response string) []SemanticProposal {
+	if !strings.Contains(response, "<<<<<<< SEARCH") {
+		return nil
+	}
+	var proposals []SemanticProposal
+	matches := searchReplaceBlockRe.FindAllStringSubmatch(response, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	for _, m := range matches {
+		searchText := strings.TrimSpace(m[1])
+		replaceText := strings.TrimSpace(m[2])
+		if searchText == "" && replaceText == "" {
+			continue
+		}
+		filePath := findNearestFilePath(response)
+		if filePath == "" {
+			continue
+		}
+		clean := filepath.Clean(filePath)
+		if clean == "" || clean == "." {
+			continue
+		}
+		clean = gateway.CanonicalizeFileName(clean)
+		origBytes, err := os.ReadFile(clean)
+		if err != nil {
+			continue
+		}
+		orig := string(origBytes)
+		blocks := execution.ParseSearchReplaceBlocks(response)
+		modified, ok := execution.ApplySearchReplaceBlocks(orig, blocks)
+		if !ok || modified == orig {
+			continue
+		}
+		diff := buildSyntheticDiff(clean, orig, modified)
+		proposals = append(proposals, SemanticProposal{
+			ID:       fmt.Sprintf("build-sr-%d", time.Now().UnixNano()),
+			Target:   SemanticTarget{QualifiedName: clean},
+			Diff:     diff,
+			Expanded: true,
+		})
 	}
 	return proposals
 }
@@ -232,6 +299,7 @@ func extractFallbackBlocks(response string) []SemanticProposal {
 		if clean == "" || clean == "." {
 			continue
 		}
+		clean = gateway.CanonicalizeFileName(clean)
 
 		diff := body
 		// Safety net: if the file already exists on disk, convert to synthetic diff
@@ -462,7 +530,7 @@ func (m *model) createBuildCheckpoint(fileCount int) {
 	cp, err := m.execEng.Checkpoints.Create(fmt.Sprintf("izen build: %d file(s)", fileCount))
 	if err != nil {
 		m.push(roleSystem, infoStyle.Render("checkpoint: "+err.Error()))
-	} else {
+	} else if cp != nil {
 		shortHash := cp.Hash
 		if len(shortHash) > 8 {
 			shortHash = shortHash[:8]

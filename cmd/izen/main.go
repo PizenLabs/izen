@@ -12,15 +12,6 @@ import (
 	"github.com/PizenLabs/izen/internal/ui"
 )
 
-var providerEnvVars = map[string]string{
-	"ollama":     "", // local, always available
-	"anthropic":  "ANTHROPIC_API_KEY",
-	"openai":     "OPENAI_API_KEY",
-	"gemini":     "GEMINI_API_KEY",
-	"openrouter": "OPENROUTER_API_KEY",
-	"groq":       "GROQ_API_KEY",
-}
-
 var Version = "0.1.0"
 
 func printMinimalistHelp() {
@@ -128,19 +119,15 @@ func main() {
 		cfg.Username = localCfg.Username
 	}
 
-	// ── Gate: local config missing → check env vars first ─────────────────
-	// When .izen/config.json does NOT exist we check if any provider API keys
-	// are already set in the environment. If so, we auto-create the local
-	// config and skip the interactive TUI init flow entirely.
+	// ── Gate: missing local config → launch TUI onboarding ─────────────────
+	// NEVER write .izen/ or .izen/config.json to disk from main.go before the
+	// TUI program runs. If .izen/config.json doesn't exist, launch the TUI
+	// directly into the interactive onboarding flow. The TUI handles env var
+	// detection, git init, identity setup, and provider selection — and only
+	// writes .izen/config.json when the user confirms the setup wizard.
 	if _, err := os.Stat(filepath.Join(root, ".izen", "config.json")); os.IsNotExist(err) {
-		detectedProvider := detectProviderFromEnv(cfg)
-		if detectedProvider != "" {
-			autoCreateLocalConfig(root, cfg, detectedProvider)
-			fmt.Fprintf(os.Stderr, "izen: auto-configured %s from environment\n", detectedProvider)
-		} else {
-			ui.RunMainDashboard(cfg, root, localCfg)
-			return
-		}
+		ui.RunMainDashboard(cfg, root, localCfg)
+		return
 	}
 
 	// ---- Project type detection (local config exists) ----
@@ -168,41 +155,6 @@ func main() {
 		ui.RunRollbackEngine(cfg, root, localCfg, detection)
 	} else {
 		ui.RunMainDashboard(cfg, root, localCfg, detection)
-	}
-}
-
-// detectProviderFromEnv checks the runtime environment for known provider
-// API key env vars and returns the first detected provider name. Returns ""
-// when no cloud provider keys are found (Ollama is always available).
-func detectProviderFromEnv(cfg *config.Config) string {
-	for name, envVar := range providerEnvVars {
-		if name == "ollama" {
-			continue
-		}
-		if envVar == "" {
-			continue
-		}
-		if os.Getenv(envVar) != "" {
-			if _, ok := cfg.AI.Providers[name]; ok {
-				return name
-			}
-		}
-	}
-	// When no cloud key is set, check if the default is ollama (always available).
-	if cfg.ActiveProviderName() == "ollama" || cfg.AI.DefaultProvider == "ollama" {
-		return "ollama"
-	}
-	return ""
-}
-
-// autoCreateLocalConfig writes a minimal .izen/config.json so the interactive
-// TUI init flow is skipped on next launch.
-func autoCreateLocalConfig(root string, cfg *config.Config, provider string) {
-	_ = state.InitLocalState(root)
-	_ = config.SaveLocalConfig(root, &config.LocalConfig{Username: cfg.Username})
-	sessPath := filepath.Join(root, ".izen", "session.json")
-	if _, err := os.Stat(sessPath); os.IsNotExist(err) {
-		_ = os.WriteFile(sessPath, []byte("{}"), 0644)
 	}
 }
 

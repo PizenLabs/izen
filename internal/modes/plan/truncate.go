@@ -448,6 +448,7 @@ func FastTrackPrompt(coreError, conclusion string) string {
 		"RULES: use ONLY the SHELL_EXEC task type. NEVER emit FILE_MUTATE tasks. " +
 		"NEVER use placeholder paths like 'relative/path/to/file.go' or " +
 		"'file_test.go'. The SHELL_EXEC target must be a real, runnable command " +
-		"(e.g. 'go get github.com/foo/bar' or 'go mod tidy')."
+		"(e.g. 'go get github.com/foo/bar' or 'go mod tidy').\n" +
+		"STRICT: Output ONLY the checklist. NO explanations. NO markdown prose. NO code fences."
 	return prompt
 }
