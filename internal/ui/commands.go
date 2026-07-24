@@ -36,6 +36,7 @@ import (
 	"github.com/PizenLabs/izen/internal/retrieval"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
+	"github.com/PizenLabs/izen/internal/templates"
 )
 
 var validSystemCommands = map[string]struct{}{
@@ -2211,6 +2212,154 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 	}
 }
 
+// proposeTrivialCreatePatch generates a trivial template file (LICENSE,
+// .gitignore, .env) locally using Go string templates — zero cloud tokens.
+// It bypasses the LLM entirely and returns a buildProposalReadyMsg with the
+// generated content and a unified diff against any existing file content.
+func (m *model) proposeTrivialCreatePatch(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		var orig string
+		if data, rerr := os.ReadFile(task.Target); rerr == nil {
+			orig = string(data)
+		}
+
+		description := task.Description
+		content := generateTrivialContent(task.Target, description)
+
+		cleaned := execution.SanitizeLLMResponse(content)
+		diff := computeUnifiedDiff(task.Target, orig, cleaned)
+
+		patch := &execution.Patch{
+			ID:        fmt.Sprintf("template-%d", task.StepNum),
+			File:      task.Target,
+			Original:  orig,
+			Modified:  cleaned,
+			TaskID:    task.StepNum,
+			ContextID: m.sess.ContextID,
+		}
+
+		return buildProposalReadyMsg{
+			Task:   task,
+			Patch:  patch,
+			Diff:   diff,
+			Output: cleaned,
+		}
+	}
+}
+
+// generateTrivialContent generates the file content for a trivial template
+// file (LICENSE, .gitignore, .env) from the user's description string.
+// Returns empty string if the target is not recognized.
+func generateTrivialContent(target, description string) string {
+	base := strings.ToLower(target)
+	base = strings.TrimSuffix(base, ".md")
+
+	switch base {
+	case "license", "licence":
+		licenseType := detectLicenseType(description)
+		content, ok := templates.RenderLicense(licenseType, description)
+		if !ok {
+			return ""
+		}
+		return content
+	case ".gitignore", "gitignore":
+		return generateGitignore()
+	case ".env", "env", ".env.example", "env.example":
+		return generateEnv()
+	default:
+		return ""
+	}
+}
+
+func detectLicenseType(description string) string {
+	lower := strings.ToLower(description)
+	switch {
+	case strings.Contains(lower, "apache"):
+		return "apache-2.0"
+	case strings.Contains(lower, "gpl"):
+		return "gpl-3.0"
+	case strings.Contains(lower, "bsd"):
+		return "bsd-3-clause"
+	default:
+		return "mit"
+	}
+}
+
+// generateGitignore returns a basic Go .gitignore template.
+func generateGitignore() string {
+	return `# Dependencies
+vendor/
+
+# Build output
+bin/
+dist/
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go
+*.test
+*.out
+*.prof
+*.test.exe
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+`
+}
+
+// generateEnv returns a basic .env template.
+func generateEnv() string {
+	return `# Application
+APP_ENV=development
+APP_DEBUG=true
+APP_PORT=8080
+
+# Database
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=myapp
+DB_USER=user
+DB_PASSWORD=
+
+# API Keys (fill in your own)
+API_KEY=
+SECRET_KEY=
+`
+}
+
+func isYear(s string) bool {
+	if len(s) != 4 {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	n := 0
+	for _, c := range s {
+		n = n*10 + int(c-'0')
+	}
+	return n >= 1900 && n <= 2099
+}
+
 // applyHotfixPatch applies a pre-generated $hot patch through the execution
 // engine's PatchManager — never via the conversational stream. It returns a
 // buildResultMsg so the standard update.go handler restores the stashed plan
@@ -2562,6 +2711,18 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// the pipeline in StateAwaitingApproval and renders a unified diff for
 	// explicit authorization (Alt+A / Alt+L / Alt+R).
 	if targetTask.Type == "FILE_MUTATE" || targetTask.Type == "GIT_ACTION" {
+		// ── TRIVIAL TEMPLATE CREATE (local generation, 0 cloud tokens) ─
+		// If the task targets a trivial template file (LICENSE, .gitignore,
+		// .env), generate it locally using Go string templates. This bypasses
+		// the LLM entirely — zero HTTP calls, zero cloud tokens consumed.
+		if targetTask.IsHardcoded && gateway.IsTrivialCreateTarget(targetTask.Target) {
+			return tea.Batch(
+				func() tea.Msg { return agentStartMsg{label: "template"} },
+				m.proposeTrivialCreatePatch(targetTask),
+				m.spinnerTickCmd(),
+			)
+		}
+
 		// ── DETERMINISTIC STDLIB FIX (no LLM) ──────────────────────────
 		// Hardcoded stdlib case-correction tasks carry fix parameters in
 		// the Solution field ("STDLIB:symbol:pkgName:importPath"). Apply

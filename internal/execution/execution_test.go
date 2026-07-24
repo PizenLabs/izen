@@ -480,3 +480,45 @@ func TestRunnerDir(t *testing.T) {
 		t.Fatalf("expected '/tmp', got %q", result.Stdout)
 	}
 }
+
+func TestSanitizeLLMResponseBoldFileCreate(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "bold FILE_CREATE header stripped",
+			input: "**FILE_CREATE: LICENSE**\nMIT License\n\nCopyright (c) 2026\n```",
+			want:  "MIT License\n\nCopyright (c) 2026",
+		},
+		{
+			name:  "bold FILE_CREATE with fence",
+			input: "**FILE_CREATE: LICENSE**\n```mit\nMIT License\n\nCopyright (c) 2026\n```",
+			want:  "MIT License\n\nCopyright (c) 2026",
+		},
+		{
+			name:  "bold FILE_CREATE no colon",
+			input: "**FILE_CREATE** .gitignore\n```\n*.log\n```",
+			want:  "*.log",
+		},
+		{
+			name:  "double bold FILE_CREATE",
+			input: "**FILE_CREATE: .env**\n```env\nPORT=8080\n```",
+			want:  "PORT=8080",
+		},
+		{
+			name:  "no hallucination passthrough",
+			input: "MIT License\n\nCopyright (c) 2026",
+			want:  "MIT License\n\nCopyright (c) 2026",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := SanitizeLLMResponse(c.input)
+			if got != c.want {
+				t.Errorf("SanitizeLLMResponse =\n %q\nwant\n %q", got, c.want)
+			}
+		})
+	}
+}
