@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -178,6 +179,19 @@ func (e *Engine) CountConsecutiveBuildCheckpoints() int {
 		}
 	}
 	return count
+}
+
+// TotalCommits returns the total number of commits reachable from HEAD.
+func (e *Engine) TotalCommits() (int, error) {
+	out, err := e.git("rev-list", "--count", "HEAD")
+	if err != nil {
+		return 0, err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return 0, nil
+	}
+	return strconv.Atoi(out)
 }
 
 // StageAll stages all changes (git add -A).

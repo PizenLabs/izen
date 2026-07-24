@@ -1233,7 +1233,8 @@ func parseFileCreateBlocks(content string) []fileCreateBlock {
 			filePath = strings.TrimSpace(pathPart)
 			continue
 		}
-		if inBlock && (trimmed == ">>>>>>> END_FILE" || strings.HasPrefix(trimmed, ">>>>>>> END_FILE")) {
+		if inBlock && (trimmed == ">>>>>>> END_FILE" || strings.HasPrefix(trimmed, ">>>>>>> END_FILE") ||
+			trimmed == "======= END_FILE" || strings.HasPrefix(trimmed, "======= END_FILE")) {
 			blocks = append(blocks, fileCreateBlock{
 				FilePath: filePath,
 				Content:  strings.Join(contentLines, "\n"),

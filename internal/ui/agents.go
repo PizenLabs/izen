@@ -590,10 +590,26 @@ func (m *model) runCommitCmdAgent(userMsg string) tea.Cmd {
 			// Scan git log for consecutive "izen build:" commits at HEAD.
 			// These are temporary checkpoints created during /build and should
 			// be squashed into a single semantic commit.
+			// CRITICAL: Clamp HEAD~N so it never exceeds the repo's total
+			// commit count. When all commits are build checkpoints, diff
+			// against the empty tree (no parent commit exists).
+			const emptyTreeHash = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
 			buildCount := m.gitEng.CountConsecutiveBuildCheckpoints()
 			var squashRef string
+			useEmptyTree := false
+			totalCommits := 0
+
 			if buildCount > 0 {
-				squashRef = fmt.Sprintf("HEAD~%d", buildCount)
+				totalCommits, _ = m.gitEng.TotalCommits()
+				if totalCommits > 0 && buildCount >= totalCommits {
+					useEmptyTree = true
+					if totalCommits > 1 {
+						squashRef = fmt.Sprintf("HEAD~%d", totalCommits-1)
+					}
+				} else {
+					squashRef = fmt.Sprintf("HEAD~%d", buildCount)
+				}
 			}
 
 			// ── STAGE ALL CHANGES ──────────────────────────────
@@ -604,9 +620,12 @@ func (m *model) runCommitCmdAgent(userMsg string) tea.Cmd {
 			// ── GET DIFF ───────────────────────────────────────
 			var diff string
 			var err error
-			if squashRef != "" {
+			switch {
+			case useEmptyTree:
+				diff, err = m.gitEng.DiffRange(emptyTreeHash, "HEAD")
+			case squashRef != "":
 				diff, err = m.gitEng.DiffRange(squashRef, "HEAD")
-			} else {
+			default:
 				diff, err = m.gitEng.DiffCached()
 			}
 			if err != nil {
@@ -651,8 +670,20 @@ func (m *model) runCommitCmdAgent(userMsg string) tea.Cmd {
 				body = parsed.Body
 			}
 
-			if err := m.gitEng.Commit(subject, body); err != nil {
-				return commitGeneratedMsg{err: fmt.Errorf("commit failed: %w", err)}
+			// When the sole commit is a build checkpoint (no parent to
+			// squash against), amend it instead of creating a new commit.
+			if useEmptyTree && totalCommits == 1 {
+				msg := subject
+				if body != "" {
+					msg = subject + "\n\n" + body
+				}
+				if err := m.gitEng.AmendCommit(msg); err != nil {
+					return commitGeneratedMsg{err: fmt.Errorf("amend failed: %w", err)}
+				}
+			} else {
+				if err := m.gitEng.Commit(subject, body); err != nil {
+					return commitGeneratedMsg{err: fmt.Errorf("commit failed: %w", err)}
+				}
 			}
 
 			hash, _ := m.gitEng.CurrentHash()

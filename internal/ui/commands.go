@@ -4117,11 +4117,9 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 		// /build consumes ONLY the atomic structural tasks (PendingTodos /
 		// staged tasks) produced by /plan. The raw ProposedFix chat blob from
 		// an earlier phase is purged here so it can never re-inject stale
-		// conversational text into the build workspace. We keep a checkpoint
-		// for reversibility regardless.
+		// conversational text into the build workspace.
 		if len(m.handoffCtx.PendingTodos) > 0 || len(m.sess.CurrentTasks) > 0 {
-			m.createBuildCheckpoint(0)
-			m.push(roleSystem, "Handoff context injected. Checkpoint created.")
+			m.push(roleSystem, "Handoff context injected.")
 		}
 		// Purge stale conversational handoff so the build buffer stays clean.
 		m.handoffCtx.ProposedFix = ""
