@@ -37,6 +37,10 @@ type Engine struct {
 	startedAt time.Time
 	Result    *InvestigationResult
 
+	// Intent classifies the investigation request (bug/regression vs feature/test/refactor).
+	// Controls whether environment/dependency resolution tools are allowed.
+	Intent Intent
+
 	// forensicsRan records whether the engine actually invoked the diagnostic
 	// toolchain (test executor and/or retriever searches) during this run. It
 	// is the guard against the short-circuit that produced 0s durations.
@@ -328,7 +332,7 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 	// DispatchStrategy selects the tool but its Rationale field is NOT logged —
 	// it is a pre-decision classification label, not a verified fact.
 	// Actual outcomes are logged after execution below.
-	strategy := DispatchStrategy(dctx, e.provider, e.model, diagnostics)
+	strategy := DispatchStrategy(dctx, e.provider, e.model, diagnostics, e.Intent)
 	dispatchLog("[orchestrator] classify -> tool=%s target=%q",
 		strategy.Tool, strategy.Target)
 

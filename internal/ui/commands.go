@@ -27,6 +27,7 @@ import (
 	"github.com/PizenLabs/izen/internal/domain"
 	objengine "github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/gateway"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -192,13 +193,13 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return m.runReviewTestComposite()
 	}
 
-	// ── $prompt in /ask — STATELESS SENIOR ARCHITECT REFINER ────────────
-	// Evaluated BEFORE the generic $ handler to guarantee complete decoupling
-	// from the normal chat streaming path. Takes a raw text summary from the
-	// developer ($prompt <raw_idea>) and passes it directly to the
-	// Strict Senior Architect persona — no session history aggregation, no
-	// JSON wrapping. MUST never touch handleMessageContent or streamCmd.
-	if m.resolver.Current() == modes.ModeAsk && (line == "$prompt" || strings.HasPrefix(line, "$prompt ")) {
+	// ── $prompt — GLOBAL MODE-GUARD ROUTER TO /ask ───────────────────────
+	// $prompt is a global routing entry point, not an execution mode. From
+	// ANY active mode it transitions cleanly to /ask, injecting the query as
+	// /ask input for structured Forensic Context Ledger generation. It MUST
+	// NEVER execute /build, /review, /plan, or /investigate logic inside the
+	// originating mode — the only allowed action is the transition to /ask.
+	if line == "$prompt" || strings.HasPrefix(line, "$prompt ") {
 		m.cancelStaleAgentOps()
 		if line == "$prompt" {
 			m.push(roleError, "[Usage] $prompt <your raw architectural idea or description>")
@@ -207,6 +208,45 @@ func (m *model) handleInput(line string) tea.Cmd {
 			return nil
 		}
 		rawInput := strings.TrimSpace(line[8:])
+
+		// ── INTENT PRE-GUARD: Fast-track direct file mutations ──────────
+		// Inspect the raw input before dispatching to the Senior Architect
+		// pipeline. If the user is requesting a simple single-file mutation
+		// on a non-code file (e.g. $prompt rename author in @LICENSE),
+		// classify it and route directly to /build as a FILE_MUTATE task
+		// with zero LLM involvement — no forensic analysis, no go test.
+		if target, isDirect := gateway.ClassifyDirectMutation(rawInput); isDirect {
+			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected. Bypassing architect analysis."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			tasks := command.GenerateFallbackPlan(target)
+			return func() tea.Msg {
+				return planResultMsg{
+					Tasks:       tasks,
+					IsFastTrack: true,
+				}
+			}
+		}
+
+		currentMode := m.resolver.Current()
+		if currentMode != modes.ModeAsk {
+			// Mode Guard Enforced: request state transition to /ask, then
+			// queue the $prompt synthesis directly via runAskPromptHandoffCmd.
+			// This preserves the Senior Architect system template
+			// (AskPromptHandoffContract) — we MUST NOT re-enter handleInput
+			// because the raw input no longer carries the $prompt prefix and
+			// would be routed to the normal AskContract() streaming path,
+			// producing conversational noise instead of the structured
+			// 5-point Forensic Context Ledger.
+			m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
+				"$prompt from /%s — transitioning to /ask for structured analysis...", currentMode)))
+			m.modeChangeAuthorized = true
+			cmd := m.setMode(modes.ModeAsk)
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return tea.Batch(cmd, m.runAskPromptHandoffCmd(rawInput))
+		}
+
 		m.push(roleSystem, infoStyle.Render("Refining architectural idea through Senior Architect analysis..."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -988,11 +1028,11 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	if mode == modes.ModePlan || mode == modes.ModeInvestigate {
 		m.planApproved = false
 	}
-	// Transitioning from /plan to /build marks the plan as approved so
-	// the orchestrator never re-enters /plan for the same execution cycle.
-	if mode == modes.ModeBuild && m.resolver.Current() == modes.ModePlan {
-		m.planApproved = true
-	}
+	// HUMAN-IN-THE-LOOP: plan approval is now managed explicitly via
+	// planApprovalActions (Approve/Reject chips). The m.planApproved flag
+	// is set only when the user explicitly approves the plan through the
+	// action chip handler. The old auto-approve-on-transition behavior is
+	// removed — every /plan → /build transition now requires human sign-off.
 
 	// ── HANDOFF SANITIZER (BUG 3): clear ALL transient raw-string state on
 	// every mode transition so the target mode can never inherit stale
@@ -1152,6 +1192,57 @@ func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
 		return b.String()
 	}
 	return ""
+}
+
+// buildStrictHandoffPayload creates a minimal, focused context for the /build
+// task execution. It contains ONLY:
+// 1. The exact target file path(s) for the current task
+// 2. The exact staged task description
+// 3. The raw relevant symbol definition/context from the codebase
+// This prevents cognitive drift by stripping all conversational history,
+// raw chat logs, and unrelated codebase files.
+// retryBuildWithStrictDirective re-executes the current build task with a
+// maximally strict instruction that prohibits any conversational output.
+// The LLM is told to output ONLY SEARCH/REPLACE or FILE_CREATE blocks with
+// zero preamble, zero explanation, zero greeting.
+func (m *model) retryBuildWithStrictDirective() tea.Cmd {
+	tasks := m.sess.CurrentTasks
+	if len(tasks) == 0 {
+		return nil
+	}
+	// Find the current processing/failed task.
+	var targetTask *plan.Task
+	for i, t := range tasks {
+		if t.Status == "processing" || t.Status == "failed" || t.Status == "idle" {
+			targetTask = &tasks[i]
+			break
+		}
+	}
+	if targetTask == nil {
+		return nil
+	}
+	strictContent := fmt.Sprintf(
+		"## STRICT BUILD DIRECTIVE — ZERO CONVERSATIONAL TEXT\n\n"+
+			"YOU ARE A CODE GENERATION TOOL. DO NOT OUTPUT ANY TEXT THAT IS NOT A CODE PATCH.\n\n"+
+			"REQUIRED OUTPUT FORMAT (FIRST TOKEN MUST MATCH):\n"+
+			"- For existing files: ```go:path/to/file.go\n  <<<<<<< SEARCH\n  ...\n  =======\n  ...\n  >>>>>>>\n  ```\n"+
+			"- For new files: ```\n  <<<<<<< FILE_CREATE: path/to/newfile.go\n  ...\n  >>>>>>> END_FILE\n  ```\n\n"+
+			"FORBIDDEN OUTPUT:\n"+
+			"- Greetings, acknowledgments, summaries, explanations\n"+
+			"- Questions, clarifications, suggestions\n"+
+			"- Markdown that is not SEARCH/REPLACE or FILE_CREATE\n"+
+			"- JSON, YAML, or any structured data format\n\n"+
+			"TASK:\n"+
+			"Step %d: %s\nTarget: %s\nDescription: %s\n\n"+
+			"OUTPUT YOUR PATCH NOW:",
+		targetTask.StepNum, targetTask.Type, targetTask.Target, targetTask.Description)
+	m.push(roleSystem, "Conversational output detected. Re-triggering build with strict directive...")
+	m.sess.ClearHistory()
+	_ = m.sess.Save()
+	m.responseBuffer.Reset()
+	m.streamBuffer = ""
+	m.currentStreamContent = ""
+	return m.streamCmd(strictContent)
 }
 
 // buildStrictHandoffPayload creates a minimal, focused context for the /build
@@ -1428,8 +1519,8 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		}
 		return nil
 
-	case cmd == "/undo":
-		return m.runUndoCmd()
+	case strings.HasPrefix(cmd, "/undo"):
+		return m.runUndoCmd(cmd)
 
 	case cmd == "/commit":
 		if m.resolver.Current() != modes.ModeBuild {
@@ -1624,14 +1715,25 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 	}
 
 	// Materialize PendingTodos into typed tasks if no staged tasks exist yet.
+	// Parse the formatted string "[TYPE] target — description" back into
+	// structured Task fields so the build dispatcher routes to the correct
+	// execution path (FILE_MUTATE/SHELL_EXEC) instead of the generic streaming
+	// path that produces conversational prose.
 	if !hasStagedTasks && hasPendingTodos {
 		var tasks []plan.Task
 		for i, t := range m.handoffCtx.PendingTodos {
+			taskType, taskTarget, taskDesc := parsePendingTodo(t)
+			if taskType == "" {
+				taskType = "task"
+			}
+			if taskTarget == "" {
+				taskTarget = "workspace"
+			}
 			tasks = append(tasks, plan.Task{
 				StepNum:     i + 1,
-				Type:        "task",
-				Target:      "workspace",
-				Description: t,
+				Type:        taskType,
+				Target:      taskTarget,
+				Description: taskDesc,
 				Status:      "idle",
 			})
 		}
@@ -1643,6 +1745,41 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 
 	// Execute the first idle staged task.
 	return m.handleBuildRun(0)
+}
+
+// parsePendingTodo extracts the task type, target, and description from a
+// PendingTodos string formatted as:
+//
+//	<icon> [<TYPE>] <target> — <description>
+//
+// The icon prefix is stripped; the type is extracted from the first bracket
+// pair; the target is the text between the closing bracket and the em-dash;
+// the description is everything after the em-dash. Returns empty strings for
+// any component that cannot be parsed, so the caller can apply defaults.
+func parsePendingTodo(todo string) (taskType, taskTarget, taskDesc string) {
+	// Strip leading icon (non-space characters before the first space)
+	trimmed := strings.TrimSpace(todo)
+	if idx := strings.Index(trimmed, " "); idx > 0 {
+		trimmed = strings.TrimSpace(trimmed[idx+1:])
+	}
+
+	// Extract [TYPE]
+	if open := strings.Index(trimmed, "["); open >= 0 {
+		if close := strings.Index(trimmed[open:], "]"); close > 0 {
+			taskType = strings.TrimSpace(trimmed[open+1 : open+close])
+			trimmed = strings.TrimSpace(trimmed[open+close+1:])
+		}
+	}
+
+	// Split on " — " to separate target from description
+	if idx := strings.Index(trimmed, " — "); idx >= 0 {
+		taskTarget = strings.TrimSpace(trimmed[:idx])
+		taskDesc = strings.TrimSpace(trimmed[idx+3:])
+	} else {
+		taskTarget = trimmed
+	}
+
+	return
 }
 
 // handleHotfixCmd implements the $hot urgent hotfix workflow in /build mode.
@@ -1982,7 +2119,26 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
 
+		// ── CRITICAL: Read the target file BEFORE the LLM call ──────────
+		// Without the actual file content in the prompt, the LLM hallucinates
+		// the original content (e.g. "Copyright (c) 2023 Jay") and generates
+		// a unified diff that can never match the file on disk, producing:
+		//   "patch hunk does not match file content".
+		//
+		// The original is read once here and included in both the initial
+		// handoff and any retry handoff so the LLM always sees real content.
+		var orig string
+		if data, rerr := os.ReadFile(task.Target); rerr == nil {
+			orig = string(data)
+		}
+
 		baseHandoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		if orig != "" {
+			baseHandoff += "\n\n### TARGET_FILE_CONTENT\n```\n" + orig + "\n```\n"
+			baseHandoff += "\nModify the above file content to fulfill the task. "
+			baseHandoff += "Output a SEARCH/REPLACE block (`<<<<<<< SEARCH`) or a unified diff. "
+			baseHandoff += "Do NOT output a full FILE: block — the file already exists."
+		}
 		system := prompt.BuildContract()
 		maxRetries := 2
 		handoff := baseHandoff
@@ -2007,15 +2163,12 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 
 			cleaned := sanitizeFileOutput(resp.Content)
 
-			orig := ""
-			if data, rerr := os.ReadFile(task.Target); rerr == nil {
-				orig = string(data)
-			}
-
 			// Validate patch format BEFORE presenting to human.
 			// If the snippet is ambiguous (no SEARCH/REPLACE markers, no diff
 			// headers, significantly smaller than the original), reject early
 			// and retry with explicit SEARCH/REPLACE formatting instructions.
+			// The retry prompt also includes the actual file content so the
+			// LLM can generate a correct patch.
 			if execution.IsAmbiguousSnippet(orig, cleaned) {
 				if attempt < maxRetries {
 					handoff = fmt.Sprintf(
@@ -2333,9 +2486,12 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	m.push(roleStatus, fmt.Sprintf("executing step %d: %s — %s", targetTask.StepNum, targetTask.Type, targetTask.Target))
 
 	content := fmt.Sprintf(
-		"EXECUTION MODE — implement ONLY this task and output the code patch directly "+
-			"(unified diff or FILE: block). Do NOT output JSON, do NOT restate the plan, "+
-			"do NOT list other tasks.\n\n"+
+		"EXECUTION MODE — implement ONLY this task. "+
+			"ZERO conversational text, ZERO explanations, ZERO greetings, ZERO summaries.\n"+
+			"YOUR FIRST OUTPUT TOKEN MUST BE A SEARCH/REPLACE BLOCK (for existing files) "+
+			"OR A FILE_CREATE BLOCK (for new files).\n"+
+			"Do NOT output JSON, do NOT restate the plan, do NOT list other tasks.\n"+
+			"Do NOT ask questions, do NOT ask for clarification, do NOT acknowledge.\n\n"+
 			"Step %d: %s\nTarget: %s\nDescription: %s",
 		targetTask.StepNum, targetTask.Type, targetTask.Target, targetTask.Description)
 
@@ -4010,6 +4166,48 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 			return m.setMode(mode)
 		}
 		return nil
+	}
+
+	// Mode-switch command chips: /investigate, /plan, /build, /ask, /review
+	// These are NOT in validSystemCommands — they must be routed as mode
+	// transitions instead of falling through to handleCommand.
+	if mode, content, ok := parseModeShorthand(action.Command); ok {
+		m.modeChangeAuthorized = true
+
+		// ── PLAN APPROVAL GATE ─────────────────────────────────────────
+		// When the user explicitly approves the plan via the action chip,
+		// set planApproved = true so the /build handoff engine fires.
+		// Without this explicit approval, /build remains blocked.
+		if action.ID == "approve-plan" {
+			m.planApproved = true
+			m.push(roleSystem, infoStyle.Render("✓ Plan approved. Transitioning to /build for execution..."))
+		}
+
+		// ── PLAN REJECTION ─────────────────────────────────────────────
+		// When the user rejects the plan, clear all handoff context including
+		// staged tasks so no stale plan data leaks into the next cycle.
+		if action.ID == "reject-plan" {
+			m.push(roleSystem, infoStyle.Render("✗ Plan rejected. Clearing staged tasks..."))
+			m.handoffCtx = HandoffContext{}
+			m.handoffLedgerContent = ""
+			if m.sess != nil {
+				m.sess.ClearTasks()
+				m.sess.ContextLedger = nil
+				_ = m.sess.Save()
+			}
+		}
+
+		m.handoffCtx.ProposedFix = ""
+		m.handoffLedgerContent = ""
+		m.currentResult = nil
+		cmd := m.setMode(mode)
+		if action.Query != "" {
+			return m.handleMessageContent(action.Query)
+		}
+		if content != "" {
+			return m.handleMessageContent(content)
+		}
+		return cmd
 	}
 
 	// Direct command capabilities: /commit, /undo, etc.

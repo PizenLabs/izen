@@ -56,9 +56,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// ── GLOBAL INTERCEPT: [Alt+P] Toggle Hotkey ────────────────────────────
+	// ── GLOBAL INTERCEPT: [Alt+P] Toggle Proposal, [Alt+O] Toggle Reasoning ──
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
-		if keyMsg.String() == "alt+p" {
+		switch keyMsg.String() {
+		case "alt+p":
 			if m.state == StateAwaitingApproval && len(m.pendingProposals) > 0 {
 				m.pendingProposals[0].Expanded = !m.pendingProposals[0].Expanded
 				m.proposalDiffOffset = 0
@@ -67,6 +68,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.Viewport.GotoBottom()
 				return m, nil
 			}
+		case "alt+o":
+			m.showReasoning = !m.showReasoning
+			m.refreshViewportContent()
+			if m.Ready && !m.userIsScrollingUp {
+				m.Viewport.GotoBottom()
+			}
+			return m, nil
 		}
 	}
 
@@ -341,16 +349,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(msg.records) == 0 {
 			m.push(roleSystem, "Investigation complete — no structured findings to report.")
 		}
-		m.push(roleStatus, "Investigation complete. Context-Ledger ready for /plan handoff.")
-		// PERSISTENT NAVIGATION CHIPS (BUG 1): always populate the navigation
-		// controls so the user is never left with a dead viewport after a fast
-		// (cached) transition. "📋 Plan Solution" submits /plan against the
-		// structured diagnostic payload; "🔄 Re-investigate" re-runs /investigate.
-		m.currentResult = investigateResultActions()
+		m.push(roleStatus, "Investigation complete. Auto-transitioning to /plan for execution synthesis...")
+
+		// ── AUTO-HANDOFF: /investigate -> /plan ────────────────────────────
+		// Once investigation completes with a valid Context Ledger, automatically
+		// transition to /plan to synthesize the structured execution timeline.
+		// The plan will be rendered for user review (Approve, Edit, Add/Remove,
+		// Reject) — automatic execution without human approval is strictly forbidden.
+		m.handoffCtx.ProposedFix = m.handoffLedgerContent
+		var cmds []tea.Cmd
+		if m.handoffLedgerContent != "" {
+			m.modeChangeAuthorized = true
+			cmds = append(cmds, m.setMode(modes.ModePlan))
+		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
-		flush := m.flushPendingRecords()
-		return m, flush
+		cmds = append(cmds, m.flushPendingRecords())
+		return m, tea.Batch(cmds...)
 
 	case planResultMsg:
 		// Terminal handler for the asynchronous PlanEngine synthesis. Only here
@@ -399,26 +414,44 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
 		}
-		m.push(roleStatus, fmt.Sprintf("Plan staged: %d task(s). Use /build to execute.", len(msg.Tasks)))
+		if msg.IsFastTrack {
+			m.planApproved = true
+			m.push(roleStatus, accentStyle.Render(fmt.Sprintf("[Fast-Track] Plan auto-approved: %d task(s). Type /build to execute.", len(msg.Tasks))))
+		} else {
+			m.push(roleStatus, fmt.Sprintf("Plan staged: %d task(s). Approve (Alt+P) or Reject (Alt+R).", len(msg.Tasks)))
+		}
 		// Render the staged task list into the viewport so the developer can
 		// see exactly what /build will execute — Principal Engineer format.
+		// Use [ ] checkbox markers for each pending task to create an
+		// interactive todo checklist look in the TUI.
+		// Also expose the plan approval action chips — the user must explicitly
+		// approve the plan before /build execution begins.
+		// Fast-track plans are auto-approved — show execute-build + reset actions
+		// so action chips are visible from ANY mode (including /ask).
+		// Non-fast-track plans show the explicit approval gate.
+		if msg.IsFastTrack {
+			m.currentResult = fastTrackPlanActions()
+		} else {
+			m.currentResult = planApprovalActions()
+		}
 		var tb strings.Builder
 		tb.WriteString(boldSapphireStyle.Render(Icon.Blueprint+" STRATEGIC ARCHITECTURAL BLUEPRINT") + "\n")
 		tb.WriteString("  ▸ Impact Domain      : Execution Layer — Dependency Resolution\n")
 		tb.WriteString("  ▸ Risk Evaluation    : Low — Scoped dependency resolution\n")
 		tb.WriteString("  ▸ Verification Vector: Build + Test pipeline\n")
 		tb.WriteString("\n")
-		tb.WriteString(boldMauveStyle.Render(Icon.Timeline+" STAGED EXECUTION TIMELINE") + "\n")
+		tb.WriteString(boldMauveStyle.Render(Icon.Timeline+" TODO CHECKLIST") + "\n")
 		for _, t := range msg.Tasks {
 			icon, track := planTrackIcon(t)
-			fmt.Fprintf(&tb, "%s [%s] %s\n", icon, track, t.Target)
-			if t.Rationale != "" {
-				fmt.Fprintf(&tb, "  ↳ Rationale: %s\n", t.Rationale)
+			fmt.Fprintf(&tb, "[ ] %s [%s] %s\n", icon, track, t.Target)
+			if t.Description != "" {
+				fmt.Fprintf(&tb, "      %s\n", t.Description)
+			}
+			if t.Rationale != "" && t.Rationale != t.Description {
+				fmt.Fprintf(&tb, "      %s\n", t.Rationale)
 			}
 			if t.Solution != "" {
-				fmt.Fprintf(&tb, "  ↳ Expected Solution: %s\n", t.Solution)
-			} else if t.Description != "" && t.Rationale == "" {
-				fmt.Fprintf(&tb, "  ↳ Rationale: %s\n", t.Description)
+				fmt.Fprintf(&tb, "      %s\n", t.Solution)
 			}
 		}
 		m.push(roleStatus, tb.String())
@@ -606,6 +639,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.resolver.Current() == modes.ModeBuild {
 				m.push(roleSystem, "Build verification complete.")
+
+				// ── AUTO-HANDOFF: /build → /review ──────────────────────────
+				// All build tasks completed successfully and verification tests
+				// passed. Transition to /review for a full architectural review
+				// of the changes. This enforces the automated handoff chain:
+				// /investigate → /plan → approval → /build → /review.
+				if msg.passed {
+					m.modeChangeAuthorized = true
+					m.setMode(modes.ModeReview)
+				}
 			}
 		}
 
@@ -885,6 +928,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		flush := m.flushPendingRecords()
 		if hasNext && m.resolver.Current() == modes.ModeBuild {
 			return m, tea.Batch(flush, m.handleBuildRun(0))
+		}
+		// ── AUTO-HANDOFF: /build → /review ──────────────────────────────
+		// All SHELL_EXEC steps completed successfully and no more tasks
+		// remain. Transition to /review for a full architectural review.
+		if !hasNext && m.resolver.Current() == modes.ModeBuild {
+			m.modeChangeAuthorized = true
+			m.setMode(modes.ModeReview)
 		}
 		return m, flush
 
@@ -1342,6 +1392,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if len(m.streamBuffer) > 0 {
+			// Extract reasoning content (sentinels + <think> tags) before
+			// emitting to the visible content buffer.
+			m.extractReasoningContent()
+
 			// Emit word-aligned chunks for a natural reading rhythm.
 			emit := 0
 			minChars := 3
@@ -1449,6 +1503,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamBuffer = ""
 			m.streamTickActive = false
 		}
+		// Final reasoning extraction from any remaining content
+		m.extractReasoningContent()
 
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
@@ -1475,6 +1531,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the downstream JSON parser or render pipeline. Lines matching
 		// telemetry/error markers are removed from leading/trailing context.
 		final = sanitizeFinalContent(final)
+		// Strip any remaining reasoning sentinels from final content
+		final = m.extractSentinelReasoning(final)
 
 		// Append the completed turn to PreRenderedHistory and freeze state.
 		m.push(roleAI, final)
@@ -1704,7 +1762,42 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(jsonResult.Tasks) > 0 {
 					tasks := jsonResult.Tasks
 					m.sess.StageTaskList(&tasks)
-					m.push(roleStatus, "System status: Plan staged. Use /build to execute changes.")
+					// Populate PendingTodos from JSON tasks so the plan view
+					// renders the interactive TODO checklist and the /build
+					// auto-trigger picks up the task payload.
+					if len(m.handoffCtx.PendingTodos) == 0 {
+						m.handoffCtx.PendingTodos = make([]string, len(tasks))
+						for i, t := range tasks {
+							icon := Icon.ShellExec
+							if t.Type == "FILE_MUTATE" || t.Type == "DIFF_PATCH" || t.Type == "ATOMIC_REPLACE" {
+								icon = Icon.SrcPatch
+							}
+							m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
+						}
+					}
+					m.currentResult = planApprovalActions()
+					var tb strings.Builder
+					tb.WriteString(boldSapphireStyle.Render(Icon.Blueprint+" STRATEGIC ARCHITECTURAL BLUEPRINT") + "\n")
+					tb.WriteString("  \u25b8 Impact Domain      : Execution Layer — Dependency Resolution\n")
+					tb.WriteString("  \u25b8 Risk Evaluation    : Low — Scoped dependency resolution\n")
+					tb.WriteString("  \u25b8 Verification Vector: Build + Test pipeline\n")
+					tb.WriteString("\n")
+					tb.WriteString(boldMauveStyle.Render(Icon.Timeline+" TODO CHECKLIST") + "\n")
+					for _, t := range jsonResult.Tasks {
+						icon, track := planTrackIcon(t)
+						fmt.Fprintf(&tb, "[ ] %s [%s] %s\n", icon, track, t.Target)
+						if t.Description != "" {
+							fmt.Fprintf(&tb, "      %s\n", t.Description)
+						}
+						if t.Rationale != "" && t.Rationale != t.Description {
+							fmt.Fprintf(&tb, "      %s\n", t.Rationale)
+						}
+						if t.Solution != "" {
+							fmt.Fprintf(&tb, "      %s\n", t.Solution)
+						}
+					}
+					m.push(roleStatus, tb.String())
+					m.push(roleStatus, "Plan staged. Approve or reject with the action bar below.")
 				}
 			} else {
 				errMsg := "plan rejected: output does not conform to JSON schema"
@@ -1722,6 +1815,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// independent lifecycle event.
 				m.sess.ClearHistory()
 				_ = m.sess.Save()
+			}
+			// Ensure the plan view shows approval actions even when the
+			// PlanEngine path (planResultMsg) was bypassed.
+			if m.currentResult == nil && len(m.handoffCtx.PendingTodos) > 0 {
+				m.currentResult = planApprovalActions()
 			}
 		}
 
@@ -1758,6 +1856,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.awaitingConfirmation = true
 					m.ti.Blur()
 					m.refreshViewportContent()
+				}
+			} else {
+				// ── ZERO-TOLERANCE CONVERSATIONAL GUARD ─────────────
+				// If the build LLM produced zero SEARCH/REPLACE or FILE_CREATE
+				// blocks, it output conversational prose instead of code patches.
+				// This is a hard violation of the build contract. Surface the error
+				// and request a re-generation with strict tool-only directive.
+				conversational := build.IsConversationalOutput(final)
+				if conversational {
+					regen := m.retryBuildWithStrictDirective()
+					if regen != nil {
+						return m, regen
+					}
+					m.push(roleError, "[BUILD GUARD] LLM output contained only conversational text — no SEARCH/REPLACE or FILE_CREATE blocks. Re-run /build with a stricter task description.")
 				}
 			}
 			m.sess.ClearTasks()

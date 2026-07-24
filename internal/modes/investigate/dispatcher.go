@@ -74,9 +74,17 @@ func boundedDispatchCtx(parent context.Context) (context.Context, context.Cancel
 // engine always has a valid plan within the 2-5s budget.
 //
 //nolint:contextcheck // we deliberately derive a bounded timeout from the caller's context.
-func DispatchStrategy(parent context.Context, provider ai.Provider, model string, failureLog string) Strategy {
+func DispatchStrategy(parent context.Context, provider ai.Provider, model string, failureLog string, intent Intent) Strategy {
 	if parent == nil {
 		parent = context.Background()
+	}
+
+	// STRICT ENV_DEPS GUARD: Feature/UnitTest/Refactor intents skip all external
+	// dependency and environment searches. Route directly to Diagnose which only
+	// analyzes the existing context without spawning go get or Docker checks.
+	if !intent.IsEnvDepsAllowed() {
+		dispatchLog("[orchestrator] intent=%s — ENV_DEPS guard active; routing to diagnose-only", intent)
+		return Strategy{Tool: ToolDiagnose, Target: ""}
 	}
 
 	// HIGH-PRIORITY: Go module dependency errors force lx immediately,
@@ -289,6 +297,75 @@ var fallbackOrder = map[Tool][]Tool{
 	ToolTrace:    {ToolDiagnose},
 	ToolEnv:      {ToolDiagnose},
 	ToolDiagnose: {},
+}
+
+// Intent represents the high-level classification of an investigation request.
+type Intent int
+
+const (
+	IntentBugRegression Intent = iota
+	IntentFeatureUnitTest
+	IntentRefactor
+)
+
+// String returns a human-readable label for the intent.
+func (i Intent) String() string {
+	switch i {
+	case IntentBugRegression:
+		return "bug/regression"
+	case IntentFeatureUnitTest:
+		return "feature/unit-test"
+	case IntentRefactor:
+		return "refactor"
+	default:
+		return "unknown"
+	}
+}
+
+// IsEnvDepsAllowed returns true only when the intent requires full forensic
+// evidence gathering including external dependency resolution. Feature/test/refactor
+// intents MUST NOT search for external missing packages or invent Docker requirements.
+func (i Intent) IsEnvDepsAllowed() bool {
+	return i == IntentBugRegression
+}
+
+// ClassifyIntent analyzes the incoming context text and determines the
+// investigation intent. It uses keyword heuristics to distinguish between
+// Bug/Regression (full forensic) and Feature/UnitTest/Refactor (code
+// implementation intent — skip external dependency search).
+func ClassifyIntent(contextText string) Intent {
+	lower := strings.ToLower(contextText)
+
+	// Feature / Unit Test creation patterns
+	featurePatterns := []string{
+		"write test", "unit test", "test case", "test suite",
+		"coverage", "implement feature", "new feature",
+		"add function", "create function", "implement",
+		"add method", "create method", "write code",
+		"generate code", "implement interface",
+		"implement struct", "stub", "mock",
+		"test file", "test function", "_test.go",
+	}
+	for _, p := range featurePatterns {
+		if strings.Contains(lower, p) {
+			return IntentFeatureUnitTest
+		}
+	}
+
+	// Refactor patterns
+	refactorPatterns := []string{
+		"refactor", "restructure", "reorganize",
+		"rename", "move", "extract",
+		"simplify", "clean up", "modernize",
+	}
+	for _, p := range refactorPatterns {
+		if strings.Contains(lower, p) {
+			return IntentRefactor
+		}
+	}
+
+	// Default to bug/regression for errors, crashes, failures
+	return IntentBugRegression
 }
 
 // nextFallback returns the next tool to try after a failure, or "" if the

@@ -13,6 +13,11 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 )
 
+// ReasoningSentinel is a zero-width marker embedded in the stream output to
+// distinguish reasoning content from message content. The UI layer detects
+// these markers and routes reasoning into a separate collapsible buffer.
+const ReasoningSentinel = "\x00RSNG\x00"
+
 type OpenRouterProvider struct {
 	apiKey  string
 	model   string
@@ -190,8 +195,9 @@ type openrouterMsg struct {
 }
 
 type openrouterDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type openrouterUsage struct {
@@ -263,9 +269,19 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 			continue
 		}
 
-		if chunk.Choices[0].Delta != nil && chunk.Choices[0].Delta.Content != "" {
-			n := copy(p, chunk.Choices[0].Delta.Content)
-			return n, nil
+		if chunk.Choices[0].Delta != nil {
+			delta := chunk.Choices[0].Delta
+			// Reasoning content: emit wrapped in sentinel so the UI can
+			// separate it from the message content buffer.
+			if delta.ReasoningContent != "" {
+				reasoning := ReasoningSentinel + delta.ReasoningContent + ReasoningSentinel
+				n := copy(p, reasoning)
+				return n, nil
+			}
+			if delta.Content != "" {
+				n := copy(p, delta.Content)
+				return n, nil
+			}
 		}
 
 		if chunk.Choices[0].FinishReason != "" {

@@ -128,9 +128,10 @@ type reviewResultMsg struct {
 // synthesis. It is dispatched from a background tea.Cmd (runPlanEngineCmd) so
 // the synchronous LLM call never blocks the Bubble Tea event loop.
 type planResultMsg struct {
-	Tasks   []plan.Task
-	Err     error
-	Handoff HandoffContext // echoed back so the handler can populate PendingTodos
+	Tasks       []plan.Task
+	Err         error
+	Handoff     HandoffContext // echoed back so the handler can populate PendingTodos
+	IsFastTrack bool           // if true, auto-approve plan — bypass approval gate
 }
 
 type agentStartMsg struct{ label string }
@@ -534,10 +535,12 @@ type model struct {
 	PreRenderedHistory string
 
 	// Streaming
-	streamCh       chan tea.Msg
-	responseBuffer strings.Builder
-	streaming      bool
-	spinnerFrame   int
+	streamCh        chan tea.Msg
+	responseBuffer  strings.Builder
+	reasoningBuffer strings.Builder
+	showReasoning   bool
+	streaming       bool
+	spinnerFrame    int
 	// lastSpinnerAdvance throttles spinner-frame advancement inside the 20ms
 	// smoothStreamTickMsg loop to a ~100ms cadence, so the braille animation
 	// stays visually consistent with the 100ms tickMsg loop while token
@@ -1135,6 +1138,7 @@ func (m *model) resetStreamingState() {
 	m.planPending = false
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
+	m.reasoningBuffer.Reset()
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
@@ -1164,9 +1168,82 @@ func (m *model) reconcileSpinner() {
 	m.planPending = false
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
+	m.reasoningBuffer.Reset()
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
+}
+
+// extractReasoningContent scans raw stream text for reasoning sentinels
+// (inserted by providers that surface delta.reasoning_content via SSE) and
+// for inline <think>...</think> tags (emitted by models that output reasoning
+// directly in the message content). It separates reasoning into the dedicated
+// reasoningBuffer and strips it from the visible content buffer.
+//
+// Reasoning sentinels use zero-width markers: \x00RSNG\x00...reasoning...\x00RSNG\x00
+func (m *model) extractReasoningContent() {
+	// 1. Extract provider-level reasoning sentinels from streamBuffer.
+	m.streamBuffer = m.extractSentinelReasoning(m.streamBuffer)
+	// 2. Extract inline <think> tags from the already-rendered content.
+	m.currentStreamContent = m.extractThinkTags(m.currentStreamContent)
+}
+
+// extractSentinelReasoning scans raw for reasoning sentinel markers
+// (\x00RSNG\x00...\x00RSNG\x00) and moves the enclosed content into
+// the reasoningBuffer. Returns the cleaned text with markers removed.
+func (m *model) extractSentinelReasoning(raw string) string {
+	const sentinel = "\x00RSNG\x00"
+	if !strings.Contains(raw, sentinel) {
+		return raw
+	}
+	var clean strings.Builder
+	remaining := raw
+	for {
+		start := strings.Index(remaining, sentinel)
+		if start < 0 {
+			clean.WriteString(remaining)
+			break
+		}
+		clean.WriteString(remaining[:start])
+		rest := remaining[start+len(sentinel):]
+		end := strings.Index(rest, sentinel)
+		if end < 0 {
+			clean.WriteString(rest)
+			break
+		}
+		m.reasoningBuffer.WriteString(rest[:end])
+		remaining = rest[end+len(sentinel):]
+	}
+	return clean.String()
+}
+
+// extractThinkTags scans text for <think>...</think> tags and moves the
+// enclosed content into the reasoningBuffer. Returns the cleaned text
+// with <think> tags stripped.
+func (m *model) extractThinkTags(text string) string {
+	if !strings.Contains(text, "<think>") {
+		return text
+	}
+	var clean strings.Builder
+	remaining := text
+	for {
+		start := strings.Index(remaining, "<think>")
+		if start < 0 {
+			clean.WriteString(remaining)
+			break
+		}
+		clean.WriteString(remaining[:start])
+		rest := remaining[start+len("<think>"):]
+		end := strings.Index(rest, "</think>")
+		if end < 0 {
+			// No closing tag yet — keep remaining in content for now
+			clean.WriteString(remaining[start:])
+			break
+		}
+		m.reasoningBuffer.WriteString(rest[:end])
+		remaining = rest[end+len("</think>"):]
+	}
+	return clean.String()
 }
 
 func (m *model) flushPendingRecords() tea.Cmd {
@@ -1251,6 +1328,14 @@ func (m *model) refreshViewportContent() {
 				content.WriteString("\n")
 			}
 		}
+
+		// ── Collapsible reasoning block ──────────────────────────────
+		reasoningBlock := m.renderReasoningBlock(m.width)
+		if reasoningBlock != "" {
+			content.WriteString(reasoningBlock)
+			content.WriteString("\n")
+		}
+
 		sp := m.renderFlowingSpinner()
 		status := "streaming…"
 		if m.agentRunning {

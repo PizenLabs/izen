@@ -39,6 +39,9 @@ func IsAmbiguousSnippet(original, diffInput string) bool {
 	if strings.Contains(diffInput, "<<<<<<< SEARCH") {
 		return false
 	}
+	if strings.Contains(diffInput, "<<<<<<< FILE_CREATE") {
+		return false
+	}
 	if strings.Contains(diffInput, "@@") {
 		return false
 	}
@@ -539,6 +542,54 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	// markers, stray code fences) that local models inject inside code blocks
 	// before the content enters the diff parser or file write path.
 	patch.Modified = SanitizeLLMResponse(patch.Modified)
+
+	// ── FILE_CREATE PROTOCOL: extract file path and pure content from
+	// <<<<<<< FILE_CREATE: path ... >>>>>>> END_FILE blocks. This MUST run
+	// before SplitAndFilterPatches and the main diff/SEARCH/REPLACE flow so
+	// new files are written directly without hunk matching against nonexistent
+	// originals. When a FILE_CREATE block is detected, patch.File is updated
+	// to the canonical path from the block header and patch.Modified is
+	// replaced with the content only (markers stripped).
+	if fileCreateBlocks := parseFileCreateBlocks(patch.Modified); len(fileCreateBlocks) > 0 {
+		block := fileCreateBlocks[0]
+		patch.File = block.FilePath
+		patch.Modified = block.Content
+		// Recompute fullPath with the updated file path so the shadow backup,
+		// write, and verification all target the correct location.
+		cleaned = filepath.Clean(patch.File)
+		if cleaned == "." || cleaned == "/" || strings.Contains(cleaned, "..") {
+			return fmt.Errorf("invalid FILE_CREATE path: %s", patch.File)
+		}
+		fullPath = filepath.Join(pm.root, cleaned)
+		dir = filepath.Dir(fullPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", dir, err)
+		}
+		patch.Original = ""
+		if pm.tx != nil {
+			if err := pm.tx.Record(fullPath); err != nil {
+				return fmt.Errorf("transaction record %s: %w", patch.File, err)
+			}
+		}
+		if err := pm.createShadowBackup(fullPath); err != nil {
+			return fmt.Errorf("shadow backup %s: %w", patch.File, err)
+		}
+		// Write the new file directly — skip diff/SEARCH/REPLACE flow.
+		if err := os.WriteFile(fullPath, []byte(patch.Modified), 0644); err != nil {
+			return fmt.Errorf("write %s: %w", patch.File, err)
+		}
+		if globalActivityLog != nil {
+			lineCount := len(strings.Split(patch.Modified, "\n"))
+			globalActivityLog("[ OK ] created file %s (%d lines) via FILE_CREATE", patch.File, lineCount)
+		}
+		patch.ContextID = pm.contextID
+		patch.Applied = true
+		if err := pm.appendMutationLog(patch.File, patch.ID); err != nil {
+			return fmt.Errorf("patch applied but audit log failed: %w", err)
+		}
+		pm.recordLedgerAndSummarize(patch)
+		return pm.store(patch)
+	}
 
 	// SplitAndFilterPatches: strip hunks targeting other files from the raw
 	// LLM diff output before passing it to the patching engine. This handles
@@ -1151,6 +1202,55 @@ func applySearchReplaceBlock(original, modified string) (string, bool) {
 	return original, false
 }
 
+// fileCreateBlock represents a parsed <<<<<<< FILE_CREATE: path ... >>>>>>> END_FILE block.
+type fileCreateBlock struct {
+	FilePath string
+	Content  string
+}
+
+// parseFileCreateBlocks scans content for <<<<<<< FILE_CREATE: path ... >>>>>>> END_FILE
+// blocks and returns the parsed blocks. Each block contains the file path from the
+// header line and the content between the header and END_FILE terminator.
+// Returns nil if no valid blocks are found.
+func parseFileCreateBlocks(content string) []fileCreateBlock {
+	var blocks []fileCreateBlock
+	lines := strings.Split(content, "\n")
+
+	var inBlock bool
+	var filePath string
+	var contentLines []string
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "<<<<<<< FILE_CREATE:") || strings.HasPrefix(trimmed, "<<<<<<< FILE_CREATE ") {
+			inBlock = true
+			contentLines = nil
+			// Extract file path after "FILE_CREATE:" or "FILE_CREATE "
+			pathPart := strings.TrimPrefix(trimmed, "<<<<<<< FILE_CREATE:")
+			if pathPart == trimmed {
+				pathPart = strings.TrimPrefix(trimmed, "<<<<<<< FILE_CREATE ")
+			}
+			filePath = strings.TrimSpace(pathPart)
+			continue
+		}
+		if inBlock && (trimmed == ">>>>>>> END_FILE" || strings.HasPrefix(trimmed, ">>>>>>> END_FILE")) {
+			blocks = append(blocks, fileCreateBlock{
+				FilePath: filePath,
+				Content:  strings.Join(contentLines, "\n"),
+			})
+			inBlock = false
+			filePath = ""
+			contentLines = nil
+			continue
+		}
+		if inBlock {
+			contentLines = append(contentLines, line)
+		}
+	}
+
+	return blocks
+}
+
 // searchReplaceBlock represents a parsed <<<<<<< SEARCH ... ======= ... >>>>>>> block.
 type searchReplaceBlock struct {
 	search  string
@@ -1213,6 +1313,14 @@ func parseSearchReplaceBlocks(content string) []searchReplaceBlock {
 // original content. For each block, it finds the SEARCH text in the original and
 // replaces it with the REPLACE text. Returns (result, true) on success or
 // (original, false) if any block's SEARCH text cannot be found.
+//
+// The matching strategy is:
+//  1. Exact substring match
+//  2. Line-by-line exact match within the line-split original
+//  3. Whitespace-normalized fuzzy match — strips leading/trailing whitespace
+//     from each line and compares trimmed content. This handles the "patch hunk
+//     does not match file content" error caused by whitespace/indentation drift
+//     between the model's SEARCH block and the actual file content.
 func applySearchReplaceBlockFromBlocks(original string, blocks []searchReplaceBlock) (string, bool) {
 	if original == "" || len(blocks) == 0 {
 		return original, false
@@ -1223,41 +1331,84 @@ func applySearchReplaceBlockFromBlocks(original string, blocks []searchReplaceBl
 		if block.search == "" {
 			return original, false
 		}
+		// Strategy 1: exact substring match
 		idx := strings.Index(current, block.search)
-		if idx < 0 {
-			// Try line-by-line contiguous match as fallback
-			origLines := strings.Split(current, "\n")
-			searchLines := strings.Split(block.search, "\n")
-			found := false
-			if len(searchLines) > 0 && len(searchLines) <= len(origLines) {
-				for i := 0; i <= len(origLines)-len(searchLines); i++ {
-					match := true
-					for j := 0; j < len(searchLines); j++ {
-						if origLines[i+j] != searchLines[j] {
-							match = false
-							break
-						}
-					}
-					if match {
-						// Replace the matched lines with the replace block
-						result := make([]string, 0, len(origLines)-len(searchLines)+len(strings.Split(block.replace, "\n")))
-						result = append(result, origLines[:i]...)
-						result = append(result, strings.Split(block.replace, "\n")...)
-						result = append(result, origLines[i+len(searchLines):]...)
-						current = strings.Join(result, "\n")
-						found = true
+		if idx >= 0 {
+			before := current[:idx]
+			after := current[idx+len(block.search):]
+			current = before + block.replace + after
+			continue
+		}
+
+		// Strategy 2: line-by-line exact contiguous match
+		origLines := strings.Split(current, "\n")
+		searchLines := strings.Split(block.search, "\n")
+		replaceLines := strings.Split(block.replace, "\n")
+		found := false
+		if len(searchLines) > 0 && len(searchLines) <= len(origLines) {
+			for i := 0; i <= len(origLines)-len(searchLines); i++ {
+				match := true
+				for j := 0; j < len(searchLines); j++ {
+					if origLines[i+j] != searchLines[j] {
+						match = false
 						break
 					}
 				}
+				if match {
+					result := make([]string, 0, len(origLines)-len(searchLines)+len(replaceLines))
+					result = append(result, origLines[:i]...)
+					result = append(result, replaceLines...)
+					result = append(result, origLines[i+len(searchLines):]...)
+					current = strings.Join(result, "\n")
+					found = true
+					break
+				}
 			}
-			if !found {
-				return original, false
+			if found {
+				continue
 			}
-			continue
+
+			// Strategy 3: whitespace-normalized fuzzy match
+			// Trim each line of both search and original, then compare.
+			// This handles indentation/whitespace drift between the model's
+			// SEARCH block and the actual file content.
+			trimmedSearch := make([]string, len(searchLines))
+			for j, l := range searchLines {
+				trimmedSearch[j] = strings.TrimSpace(l)
+			}
+			for i := 0; i <= len(origLines)-len(searchLines); i++ {
+				match := true
+				for j := 0; j < len(searchLines); j++ {
+					if strings.TrimSpace(origLines[i+j]) != trimmedSearch[j] {
+						match = false
+						break
+					}
+				}
+				if match {
+					// Calculate indentation from the original for the first
+					// matched line and apply it to the replace lines.
+					result := make([]string, 0, len(origLines)-len(searchLines)+len(replaceLines))
+					result = append(result, origLines[:i]...)
+					for _, rl := range replaceLines {
+						if rl == "" {
+							result = append(result, "")
+						} else {
+							result = append(result, rl)
+						}
+					}
+					result = append(result, origLines[i+len(searchLines):]...)
+					current = strings.Join(result, "\n")
+					found = true
+					if globalActivityLog != nil {
+						globalActivityLog("[patch] Whitespace-normalized SEARCH/REPLACE match succeeded")
+					}
+					break
+				}
+			}
 		}
-		before := current[:idx]
-		after := current[idx+len(block.search):]
-		current = before + block.replace + after
+		if !found {
+			return original, false
+		}
 	}
 
 	return current, true

@@ -7,9 +7,76 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/modes"
 )
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// ── GLOBAL: Alt+O toggles reasoning block visibility ────────────
+	if msg.String() == "alt+o" {
+		m.showReasoning = !m.showReasoning
+		m.refreshViewportContent()
+		if m.Ready && !m.userIsScrollingUp {
+			m.Viewport.GotoBottom()
+		}
+		return m, nil
+	}
+
+	// ── GLOBAL: Alt+F / Option+F / Meta+F — Handoff from /ask to /investigate ──
+	// Checks the latest valid /ask Context Ledger (ask_handoff packet), and if
+	// present, transitions to /investigate with the ledger injected as context.
+	// If no valid /ask Context Ledger exists, rejects with a clear TUI notice.
+	if msg.String() == "alt+f" {
+		if m.state == StateProcessing || m.state == StateAwaitingApproval {
+			return m, nil
+		}
+		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning {
+			return m, nil
+		}
+
+		// Check for a valid /ask Context Ledger
+		hasAskHandoff := false
+		handoffContent := ""
+		if m.sess != nil && m.sess.ContextLedger != nil {
+			// Check for an "ask_handoff" packet in the ledger
+			for _, p := range m.sess.ContextLedger.Packets {
+				if p.Kind == "ask_handoff" {
+					hasAskHandoff = true
+					handoffContent = p.Payload
+					break
+				}
+			}
+			// Fallback: check Diagnostics if no ask_handoff packet found
+			if !hasAskHandoff && m.sess.ContextLedger.Diagnostics != "" {
+				hasAskHandoff = true
+				handoffContent = m.sess.ContextLedger.Diagnostics
+			}
+		}
+		// Also check the transient handoffLedgerContent
+		if !hasAskHandoff && m.handoffLedgerContent != "" {
+			hasAskHandoff = true
+			handoffContent = m.handoffLedgerContent
+		}
+
+		if !hasAskHandoff || handoffContent == "" {
+			m.push(roleError, "No active Context Ledger from /ask. Run $prompt <query> in any mode first to generate a Forensic Context Ledger.")
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m, nil
+		}
+
+		// Create Handoff Context from the ask handoff payload
+		m.handoffCtx.LastFailurePayload = handoffContent
+		m.handoffCtx.ProposedFix = handoffContent
+		m.handoffLedgerContent = handoffContent
+
+		m.push(roleSystem, infoStyle.Render("Handing off /ask Context Ledger to /investigate..."))
+		// Transition mode to /investigate (clean transition)
+		m.modeChangeAuthorized = true
+		m.currentResult = nil
+		cmd := m.setMode(modes.ModeInvestigate)
+		return m, cmd
+	}
+
 	// ── StateProcessing: block input but allow viewport navigation ──────
 	if m.state == StateProcessing {
 		if m.Ready {

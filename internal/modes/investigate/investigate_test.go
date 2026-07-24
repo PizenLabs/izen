@@ -1620,7 +1620,7 @@ func TestNextFallback(t *testing.T) {
 // TestDispatchStrategyNoProvider falls back to heuristics when no LLM provider
 // is configured, keeping the engine offline and within budget.
 func TestDispatchStrategyNoProvider(t *testing.T) {
-	s := DispatchStrategy(context.Background(), nil, "", "panic: nil pointer dereference")
+	s := DispatchStrategy(context.Background(), nil, "", "panic: nil pointer dereference", 0)
 	if s.Tool != ToolTrace {
 		t.Fatalf("expected offline heuristic to pick trace, got %s", s.Tool)
 	}
