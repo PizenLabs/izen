@@ -2218,20 +2218,22 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 // generated content and a unified diff against any existing file content.
 func (m *model) proposeTrivialCreatePatch(task *plan.Task) tea.Cmd {
 	return func() tea.Msg {
+		canonicalTarget := gateway.CanonicalizeFileName(task.Target)
+		task.Target = canonicalTarget
 		var orig string
-		if data, rerr := os.ReadFile(task.Target); rerr == nil {
+		if data, rerr := os.ReadFile(canonicalTarget); rerr == nil {
 			orig = string(data)
 		}
 
 		description := task.Description
-		content := generateTrivialContent(task.Target, description)
+		content := generateTrivialContent(canonicalTarget, description)
 
 		cleaned := execution.SanitizeLLMResponse(content)
-		diff := computeUnifiedDiff(task.Target, orig, cleaned)
+		diff := computeUnifiedDiff(canonicalTarget, orig, cleaned)
 
 		patch := &execution.Patch{
 			ID:        fmt.Sprintf("template-%d", task.StepNum),
-			File:      task.Target,
+			File:      canonicalTarget,
 			Original:  orig,
 			Modified:  cleaned,
 			TaskID:    task.StepNum,

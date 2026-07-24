@@ -108,6 +108,29 @@ func TestIsYear(t *testing.T) {
 	}
 }
 
+func TestGenerateTrivialContentCanonical(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+		desc   string
+	}{
+		{"lowercase license", "license", "create license"},
+		{"uppercase LICENSE", "LICENSE", "create LICENSE"},
+		{"lowercase gitignore", "gitignore", "create gitignore"},
+		{"uppercase .GITIGNORE", ".GITIGNORE", "create .gitignore"},
+		{"lowercase env", "env", "create env"},
+		{"uppercase .ENV", ".ENV", "create .env"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := generateTrivialContent(tc.target, tc.desc)
+			if got == "" {
+				t.Errorf("expected non-empty content for target %q", tc.target)
+			}
+		})
+	}
+}
+
 func TestRenderLicenseFallback(t *testing.T) {
 	_, ok := templates.RenderLicense("unknown-xyz", "some description")
 	if ok {
