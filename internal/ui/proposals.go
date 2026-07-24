@@ -462,7 +462,7 @@ func (m *model) createBuildCheckpoint(fileCount int) {
 	cp, err := m.execEng.Checkpoints.Create(fmt.Sprintf("izen build: %d file(s)", fileCount))
 	if err != nil {
 		m.push(roleSystem, infoStyle.Render("checkpoint: "+err.Error()))
-	} else {
+	} else if cp != nil {
 		shortHash := cp.Hash
 		if len(shortHash) > 8 {
 			shortHash = shortHash[:8]

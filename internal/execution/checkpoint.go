@@ -38,6 +38,10 @@ func (cm *CheckpointManager) Create(message string) (*Checkpoint, error) {
 		return nil, fmt.Errorf("not a git repository — cannot create checkpoint")
 	}
 
+	if !cm.git.HasChanges() {
+		return nil, nil
+	}
+
 	hash, err := cm.git.Checkpoint(message)
 	if err != nil {
 		return nil, fmt.Errorf("checkpoint failed: %w", err)

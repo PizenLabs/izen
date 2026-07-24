@@ -492,6 +492,20 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 	)
 }
 
+// initSessionStartCheckpoint creates the session-start shadow checkpoint
+// to enable /undo --session even across CLI restarts. If a session-start
+// checkpoint already exists, it is overwritten with the current state.
+func (m *model) initSessionStartCheckpoint() tea.Msg {
+	if m.execEng == nil || m.execEng.ShadowCP == nil {
+		return nil
+	}
+	_, err := m.execEng.ShadowCP.CreateSessionStartSnapshot()
+	if err != nil {
+		return nil
+	}
+	return nil
+}
+
 func (m *model) runUndoCmd(raw string) tea.Cmd {
 	parts := strings.Fields(raw)
 	hasAll := false
@@ -550,48 +564,88 @@ func (m *model) runUndoCmd(raw string) tea.Cmd {
 	return nil
 }
 
-func (m *model) runCommitCmdAgent() tea.Cmd {
+func (m *model) runCommitCmdAgent(userMsg string) tea.Cmd {
 	return tea.Sequence(
 		func() tea.Msg {
-			return agentStartMsg{label: "generating commit message"}
+			label := "generating commit message"
+			if userMsg != "" {
+				label = "committing"
+			}
+			return agentStartMsg{label: label}
 		},
 		m.spinnerTickCmd(),
 		func() tea.Msg {
+			// ── CONSECUTIVE BUILD CHECKPOINT DETECTION ─────────
+			// Scan git log for consecutive "izen build:" commits at HEAD.
+			// These are temporary checkpoints created during /build and should
+			// be squashed into a single semantic commit.
+			buildCount := m.gitEng.CountConsecutiveBuildCheckpoints()
+			var squashRef string
+			if buildCount > 0 {
+				squashRef = fmt.Sprintf("HEAD~%d", buildCount)
+			}
+
+			// ── STAGE ALL CHANGES ──────────────────────────────
 			if err := m.gitEng.StageAll(); err != nil {
 				return commitGeneratedMsg{err: fmt.Errorf("failed to stage changes: %w", err)}
 			}
 
-			diff, err := m.gitEng.DiffCached()
+			// ── GET DIFF ───────────────────────────────────────
+			var diff string
+			var err error
+			if squashRef != "" {
+				diff, err = m.gitEng.DiffRange(squashRef, "HEAD")
+			} else {
+				diff, err = m.gitEng.DiffCached()
+			}
 			if err != nil {
-				return commitGeneratedMsg{err: fmt.Errorf("failed to get staged diff: %w", err)}
+				return commitGeneratedMsg{err: fmt.Errorf("failed to get diff: %w", err)}
 			}
 			if strings.TrimSpace(diff) == "" {
 				return commitGeneratedMsg{err: fmt.Errorf("no changes to commit")}
 			}
 
-			payload := commit.BuildPrompt(diff)
-			sys := prompt.CommitSystemPrompt()
-			msgs := []ai.Message{
-				{Role: "system", Content: sys},
-				{Role: "user", Content: payload},
-			}
-			req := ai.Request{
-				Model:    m.cfg.ActiveModelName(),
-				Messages: msgs,
-				Stream:   false,
-			}
-			resp, err := m.provider.Execute(context.Background(), req)
-			if err != nil {
-				return commitGeneratedMsg{err: fmt.Errorf("LLM call failed: %w", err)}
+			// ── SQUASH BUILD CHECKPOINTS ──────────────────────
+			if squashRef != "" {
+				if err := m.gitEng.ResetSoft(squashRef); err != nil {
+					return commitGeneratedMsg{err: fmt.Errorf("squash failed: %w", err)}
+				}
+				if err := m.gitEng.StageAll(); err != nil {
+					return commitGeneratedMsg{err: fmt.Errorf("re-stage after squash failed: %w", err)}
+				}
 			}
 
-			msg := commit.ParseGeneratedMessage(resp.Content)
-			if err := m.gitEng.Commit(msg.Subject, msg.Body); err != nil {
+			// ── GENERATE COMMIT MESSAGE ───────────────────────
+			var subject, body string
+			if userMsg != "" {
+				subject = userMsg
+			} else {
+				payload := commit.BuildPrompt(diff)
+				sys := prompt.CommitSystemPrompt()
+				msgs := []ai.Message{
+					{Role: "system", Content: sys},
+					{Role: "user", Content: payload},
+				}
+				req := ai.Request{
+					Model:    m.cfg.ActiveModelName(),
+					Messages: msgs,
+					Stream:   false,
+				}
+				resp, err := m.provider.Execute(context.Background(), req)
+				if err != nil {
+					return commitGeneratedMsg{err: fmt.Errorf("LLM call failed: %w", err)}
+				}
+				parsed := commit.ParseGeneratedMessage(resp.Content)
+				subject = parsed.Subject
+				body = parsed.Body
+			}
+
+			if err := m.gitEng.Commit(subject, body); err != nil {
 				return commitGeneratedMsg{err: fmt.Errorf("commit failed: %w", err)}
 			}
 
 			hash, _ := m.gitEng.CurrentHash()
-			return commitGeneratedMsg{subject: msg.Subject, body: msg.Body, hash: hash}
+			return commitGeneratedMsg{subject: subject, body: body, hash: hash}
 		},
 	)
 }

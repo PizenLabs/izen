@@ -32,7 +32,11 @@ func (m *model) Init() tea.Cmd {
 	if m.initStage != initNone && m.initStage != initComplete {
 		return m.spinnerTickCmd()
 	}
-	return tea.Batch(m.spinnerTickCmd(), m.ti.Focus())
+	return tea.Batch(
+		m.spinnerTickCmd(),
+		m.ti.Focus(),
+		m.initSessionStartCheckpoint,
+	)
 }
 
 // Update routes state machines and events.

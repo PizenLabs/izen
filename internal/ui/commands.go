@@ -1522,14 +1522,15 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	case strings.HasPrefix(cmd, "/undo"):
 		return m.runUndoCmd(cmd)
 
-	case cmd == "/commit":
+	case cmd == "/commit", strings.HasPrefix(cmd, "/commit "):
 		if m.resolver.Current() != modes.ModeBuild {
 			m.push(roleError, "commit error: /commit is only available in /build mode")
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return nil
 		}
-		return m.runCommitCmdAgent()
+		msg := strings.TrimSpace(strings.TrimPrefix(cmd, "/commit"))
+		return m.runCommitCmdAgent(msg)
 
 	case cmd == "/checkpoint":
 		m.push(roleSystem, infoStyle.Render("/checkpoint not yet implemented"))

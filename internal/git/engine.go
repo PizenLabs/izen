@@ -136,6 +136,50 @@ func (e *Engine) Commit(subject, body string) error {
 	return err
 }
 
+// RecentMessages returns the commit message subjects (full line) for the last n commits.
+func (e *Engine) RecentMessages(n int) ([]string, error) {
+	format := "%s"
+	out, err := e.git("log", fmt.Sprintf("-%d", n), fmt.Sprintf("--format=%s", format))
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		return nil, nil
+	}
+	return lines, nil
+}
+
+// DiffRange returns the diff between two refs (e.g. "HEAD~3" and "HEAD").
+func (e *Engine) DiffRange(from, to string) (string, error) {
+	return e.git("diff", "--no-color", from+".."+to)
+}
+
+// ResetSoft performs a soft reset to the given ref, preserving working tree and index.
+func (e *Engine) ResetSoft(ref string) error {
+	_, err := e.git("reset", "--soft", ref)
+	return err
+}
+
+// CountConsecutiveBuildCheckpoints returns the number of consecutive commits
+// at HEAD whose message starts with "izen build:".
+func (e *Engine) CountConsecutiveBuildCheckpoints() int {
+	const prefix = "izen build:"
+	msgs, err := e.RecentMessages(50)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, m := range msgs {
+		if strings.HasPrefix(m, prefix) {
+			count++
+		} else {
+			break
+		}
+	}
+	return count
+}
+
 // StageAll stages all changes (git add -A).
 func (e *Engine) StageAll() error {
 	_, err := e.git("add", "-A")
