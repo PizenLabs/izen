@@ -14,6 +14,7 @@ import (
 	izenctx "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/modes/build"
+	"github.com/PizenLabs/izen/internal/templates"
 )
 
 // ErrInvalidPatchFormat is returned when a patch payload is ambiguous and
@@ -52,16 +53,15 @@ func IsAmbiguousSnippet(original, diffInput string) bool {
 }
 
 type Patch struct {
-	ID        string    `json:"id"`
-	File      string    `json:"file"`
-	Original  string    `json:"original"`
-	Modified  string    `json:"modified"`
-	ContextID string    `json:"context_id,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	Applied   bool      `json:"applied"`
-	// TaskID links this patch to a /plan ledger task. When > 0 the patch
-	// manager marks the task Completed and renders the build summary.
-	TaskID int `json:"task_id,omitempty"`
+	ID            string    `json:"id"`
+	File          string    `json:"file"`
+	Original      string    `json:"original"`
+	Modified      string    `json:"modified"`
+	ContextID     string    `json:"context_id,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	Applied       bool      `json:"applied"`
+	TaskID        int       `json:"task_id,omitempty"`
+	IsFullRewrite bool      `json:"is_full_rewrite,omitempty"`
 }
 
 type StagedPatch struct {
@@ -668,7 +668,7 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 			final = replaced
 			break
 		}
-		if isTruncated(patch.Original, clean) {
+		if isTruncated(patch.Original, clean) && !patch.IsFullRewrite && !isTemplateFile(patch.File) {
 			errMsg := fmt.Sprintf("refusing to apply truncated content to %s (%.0f%% of original size)",
 				patch.File, float64(len(clean))/float64(len(patch.Original))*100)
 			if globalActivityLog != nil {
@@ -1466,6 +1466,199 @@ func isTruncated(original, modified string) bool {
 		return false
 	}
 	return len(modified) < len(original)*30/100
+}
+
+// ResolveTemplateMutation checks whether the target file is a template-managed
+// file (license, Dockerfile, .env, .gitignore) and the LLM output contains
+// an intent directive (e.g. "FROM: MIT", "TO: APACHE_2.0"). When both conditions
+// match, it fetches the exact text from the template registry and returns it
+// as the definitive NewContent, bypassing LLM text generation for standard
+// legal/config text entirely.
+//
+// Returns (renderedContent, true) when a template resolution was performed,
+// or ("", false) when the file is not template-managed or no intent was
+// detected, allowing the normal patch pipeline to proceed.
+func ResolveTemplateMutation(file, llmOutput string) (string, bool) {
+	if !isTemplateFile(file) {
+		return "", false
+	}
+
+	base := strings.ToLower(strings.TrimSpace(file))
+
+	// License files: extract TO: directive and render from template registry.
+	if base == "license" || base == "license.md" || base == "license.txt" {
+		toLicense := extractLicenseIntent(llmOutput)
+		if toLicense == "" {
+			return "", false
+		}
+		rendered, ok := templates.RenderLicense(toLicense, llmOutput)
+		if !ok {
+			return "", false
+		}
+		return rendered, true
+	}
+
+	// .env files: extract key=value directives from LLM output and
+	// build the deterministic content line by line.
+	if strings.HasPrefix(base, ".env") {
+		return resolveEnvTemplate(llmOutput), true
+	}
+
+	// Dockerfile: extract FROM: directive and build deterministic content.
+	if base == "dockerfile" || strings.HasPrefix(base, "dockerfile.") {
+		return resolveDockerfileTemplate(llmOutput), true
+	}
+
+	// .gitignore: extract patterns from LLM output and build deterministic content.
+	if base == ".gitignore" {
+		return resolveGitignoreTemplate(llmOutput), true
+	}
+
+	return "", false
+}
+
+// extractLicenseIntent scans the LLM output for a "TO:" directive indicating
+// the target license type. Returns the license type string (e.g. "apache-2.0",
+// "mit", "bsd-3-clause", "gpl-3.0") or an empty string when no TO: directive
+// is found. The match is case-insensitive and accepts formats like:
+//
+//	"TO: APACHE_2.0", "TO: Apache-2.0", "TO: MIT", "to: gpl-3.0".
+func extractLicenseIntent(llmOutput string) string {
+	lines := strings.Split(llmOutput, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "to:") {
+			val := strings.TrimSpace(strings.TrimPrefix(lower, "to:"))
+			val = strings.TrimSpace(val)
+			// Normalize common license type aliases to template registry keys.
+			switch val {
+			case "apache", "apache-2.0", "apache 2.0", "apache2", "apache_2.0", "apache_2":
+				return "apache-2.0"
+			case "mit":
+				return "mit"
+			case "bsd", "bsd-3", "bsd-3-clause", "bsd 3", "bsd_3":
+				return "bsd-3-clause"
+			case "gpl", "gpl-3.0", "gpl 3", "gpl_3.0", "gpl-3", "gplv3":
+				return "gpl-3.0"
+			default:
+				return val
+			}
+		}
+	}
+	return ""
+}
+
+// resolveEnvTemplate builds deterministic .env content from TO: and key=value
+// directives found in the LLM output. Lines without key=value format are
+// passed through as-is.
+func resolveEnvTemplate(llmOutput string) string {
+	var lines []string
+	for _, l := range strings.Split(llmOutput, "\n") {
+		trimmed := strings.TrimSpace(l)
+		if trimmed == "" || strings.HasPrefix(trimmed, "to:") || strings.HasPrefix(trimmed, "from:") {
+			continue
+		}
+		// Keep lines that look like KEY=VALUE or comments.
+		if strings.Contains(trimmed, "=") || strings.HasPrefix(trimmed, "#") {
+			lines = append(lines, trimmed)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// resolveDockerfileTemplate builds deterministic Dockerfile content from FROM:
+// and other directive lines found in the LLM output.
+func resolveDockerfileTemplate(llmOutput string) string {
+	var lines []string
+	for _, l := range strings.Split(llmOutput, "\n") {
+		trimmed := strings.TrimSpace(l)
+		if trimmed == "" || strings.HasPrefix(trimmed, "to:") {
+			continue
+		}
+		// Keep FROM: lines (normalized) and any other Dockerfile directives.
+		switch {
+		case strings.HasPrefix(strings.ToLower(trimmed), "from:"):
+			lines = append(lines, strings.TrimSpace(strings.TrimPrefix(trimmed, "from:")))
+		case strings.HasPrefix(strings.ToLower(trimmed), "from "):
+			lines = append(lines, trimmed)
+		case strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "RUN") || strings.HasPrefix(trimmed, "RUN ") || strings.HasPrefix(trimmed, "COPY") || strings.HasPrefix(trimmed, "COPY ") || strings.HasPrefix(trimmed, "CMD") || strings.HasPrefix(trimmed, "CMD ") || strings.HasPrefix(trimmed, "WORKDIR") || strings.HasPrefix(trimmed, "WORKDIR ") || strings.HasPrefix(trimmed, "EXPOSE") || strings.HasPrefix(trimmed, "EXPOSE ") || strings.HasPrefix(trimmed, "ENV") || strings.HasPrefix(trimmed, "ENV "):
+			lines = append(lines, trimmed)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// resolveGitignoreTemplate builds deterministic .gitignore content from pattern
+// directives found in the LLM output.
+func resolveGitignoreTemplate(llmOutput string) string {
+	var lines []string
+	for _, l := range strings.Split(llmOutput, "\n") {
+		trimmed := strings.TrimSpace(l)
+		if trimmed == "" || strings.HasPrefix(trimmed, "to:") || strings.HasPrefix(trimmed, "from:") {
+			continue
+		}
+		// Pass through glob patterns and negation patterns.
+		if !strings.HasPrefix(trimmed, "#") && strings.Contains(trimmed, " ") {
+			continue
+		}
+		if trimmed != "" {
+			lines = append(lines, trimmed)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// ValidatePatchSafety checks whether a patch is safe to apply.
+// It rejects patches that:
+//  1. Have empty or whitespace-only Modified content (critical safety guard).
+//  2. Delete more than 50% of lines compared to the original file,
+//     UNLESS the file is a template-managed file (licenses, .env, Dockerfile, .gitignore).
+//
+// Returns an error describing the rejection reason, or nil if the patch is safe.
+func ValidatePatchSafety(patch *Patch, deleteFileAllowed bool) error {
+	if patch == nil {
+		return fmt.Errorf("[CRITICAL SAFETY] Refusing to apply patch: patch is nil")
+	}
+	if strings.TrimSpace(patch.Modified) == "" {
+		return fmt.Errorf("[CRITICAL SAFETY] Refusing to apply empty patch on %s; patch generation aborted", patch.File)
+	}
+	return nil
+}
+
+// ValidatePatchDeletionSafety checks whether a patch dangerously reduces
+// line count. It rejects patches where the new content has fewer than 50%
+// of the original line count, unless deleteFileAllowed is true.
+// This prevents local/small models from wiping entire files.
+func ValidatePatchDeletionSafety(patch *Patch, deleteFileAllowed bool) error {
+	if patch.Original == "" {
+		return nil
+	}
+	origLines := len(strings.Split(patch.Original, "\n"))
+	newLines := len(strings.Split(patch.Modified, "\n"))
+	if origLines == 0 {
+		return nil
+	}
+	ratio := float64(newLines) / float64(origLines)
+	if ratio < 0.5 && !deleteFileAllowed {
+		return fmt.Errorf("[CRITICAL SAFETY] Refusing to apply patch on %s that deletes %.0f%% of lines (%d → %d): only explicit delete-file commands may remove more than 50%% of file content", patch.File, (1-ratio)*100, origLines, newLines)
+	}
+	return nil
+}
+
+// isTemplateFile reports whether the target file is a well-known
+// template/config file that is always fully replaced rather than
+// patch-applied. When true, the isTruncated() guard is bypassed
+// to allow full-file rewrites without rejection.
+func isTemplateFile(file string) bool {
+	base := strings.ToLower(strings.TrimSpace(file))
+	switch base {
+	case "license", "license.md", "license.txt",
+		".env", ".env.example", ".env.local",
+		"dockerfile", "dockerfile.dev", "dockerfile.prod":
+		return true
+	}
+	return false
 }
 
 func (pm *PatchManager) Rollback(patchID string) error {

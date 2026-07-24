@@ -32,7 +32,7 @@ func EnvironmentContextForOS(os string) string {
 func osPackageManager(os string) string {
 	switch os {
 	case "darwin":
-		return "Homebrew (`brew`) — and Go modules via `go get`/`go mod tidy`"
+		return "Go modules via `go get`/`go mod tidy` / platform binary tooling"
 	case "linux":
 		return "the distro package manager (`apt`/`apt-get`, `dnf`, or `yum`) or `go install`"
 	case "windows":
@@ -108,7 +108,55 @@ RULES
 
 // BuildPlanJSONPrompt builds the strict JSON prompt consumed by the TUI parser.
 // Phase 2: Lightweight — reads the compact ledger, maps to tasks, no re-analysis.
-func BuildPlanJSONPrompt(problem, ledgerContent, conclusion string) string {
+// When isDirectMutation is true, skips EnvironmentContext() and PlanContract
+// injection — the prompt is constrained to raw JSON with max_tokens: 150.
+func BuildPlanJSONPrompt(problem, ledgerContent, conclusion string, isDirectMutation bool) string {
+	if isDirectMutation {
+		conclusionBlock := ""
+		if conclusion != "" {
+			conclusionBlock = fmt.Sprintf(`
+CONCLUSION FROM LEDGER (authoritative — do not override)
+%s
+
+CRITICAL: Map this conclusion directly to a SHELL_EXEC task if dependency-related.
+The SHELL_EXEC target MUST be a valid command with the ACTUAL package path from the ledger (e.g., "go get github.com/docker/docker/client"), not a file path or angle-bracket placeholder.`, conclusion)
+		}
+
+		return fmt.Sprintf(`You are the IZEN Plan Mapper. Read the /investigate Forensic Ledger below and produce a JSON plan.
+
+INPUT:
+PROBLEM: %s
+FORENSIC LEDGER:
+%s%s
+
+DIRECTIVES:
+- Map root_cause → Task 1 (SHELL_EXEC for dep issues, FILE_MUTATE for code bugs).
+- If root_cause is a missing Go module, emit EXACTLY: {"task_id":1,"strategy":"SHELL_EXEC","target":"go get <THE_ACTUAL_PACKAGE>","description":"install missing dependency","rationale":"why this is needed","solution":"expected end state"}. Substitute the real package path — NEVER output literal angle brackets.
+- FORBIDDEN as SHELL_EXEC target: file paths (go.mod, go.sum, ./relative/path), generalized text, or prose.
+  The target field MUST be a runnable shell command starting with a binary name.
+- Do NOT add brew, docker, or environment setup tasks.
+- Total JSON under 150 tokens.
+
+OUTPUT — raw JSON only, no fences, no comments:
+{
+  "context_anchor": {"source": "investigate-ledger", "target_packages": ["pkg"]},
+  "architectural_strategy": "single sentence",
+  "strategic_overview": {
+    "root_core_factor": "The fundamental root cause driving this plan",
+    "impact_domain": "Architectural layer affected",
+    "risk_evaluation": "Low / Medium / High / Critical",
+    "verification_vector": "How correctness will be verified"
+  },
+  "atomic_tasks": [
+    {"task_id": 1, "file": "relative/path", "strategy": "SHELL_EXEC", "description": "title", "rationale": "why this task is needed", "solution": "expected end state"}
+  ]
+}`,
+			problem,
+			ledgerContent,
+			conclusionBlock,
+		)
+	}
+
 	conclusionBlock := ""
 	if conclusion != "" {
 		conclusionBlock = fmt.Sprintf(`
@@ -161,7 +209,31 @@ OUTPUT — raw JSON only, no fences, no comments:
 
 // BuildPlanPrompt builds the compact Markdown prompt for user-facing terminal output.
 // Phase 2: Stripped down — the LLM returns data, UI handles rendering.
-func BuildPlanPrompt(objective, contextStr string) string {
+// When isDirectMutation is true, skips EnvironmentContext() and constrains
+// output to raw task blocks only with max_tokens: 150.
+func BuildPlanPrompt(objective, contextStr string, isDirectMutation bool) string {
+	if isDirectMutation {
+		return fmt.Sprintf(`%s
+
+USER OBJECTIVE
+%s
+
+OUTPUT — raw task blocks only, no prose:
+- [ ] SHELL_EXEC: <exact_command> | <rationale>
+- [ ] FILE_MUTATE: <relative_path> | <description>
+- [ ] SHELL_EXEC: <verification> | verify
+
+RULES:
+- If a missing Go dependency is the root cause, output EXACTLY ONE SHELL_EXEC task.
+- The SHELL_EXEC command MUST be a runnable invocation with the ACTUAL package path (e.g. "go get github.com/docker/docker/client"), NOT a file path or angle-bracket placeholder.
+- FORBIDDEN as SHELL_EXEC target: "go.mod", "go.sum", relative paths, or any text that is not a valid command.
+- Keep the plan strictly at the code/dependency boundary.
+- Total output under 150 tokens.`,
+			contextStr,
+			objective,
+		)
+	}
+
 	return fmt.Sprintf(`%s
 
 %s
@@ -184,4 +256,16 @@ RULES:
 		EnvironmentContext(),
 		objective,
 	)
+}
+
+// PlanDirectMutationSystemPrompt returns a zero-prose system prompt for
+// direct file mutations (e.g. refactor LICENSE, change config). Unlike
+// PlanSystemPrompt, it omits all analysis sections (no CONTEXT & ROLE, no
+// FORENSIC HANDOFF VECTOR) and instructs the model to output ONLY the
+// direct task item for execution.
+func PlanDirectMutationSystemPrompt() string {
+	return "STRICT RULE: Direct file mutation detected.\n" +
+		"Do NOT output analysis sections (no CONTEXT & ROLE, no FORENSIC HANDOFF).\n" +
+		"Output ONLY the direct task item for execution.\n" +
+		"No preamble, no summary, no verification steps unless explicitly needed."
 }

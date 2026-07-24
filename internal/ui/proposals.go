@@ -446,10 +446,11 @@ func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 			modified = p.Patch.Modified
 		}
 		patch := &execution.Patch{
-			ID:       p.ID,
-			File:     p.Target.QualifiedName,
-			Modified: modified,
-			TaskID:   m.currentBuildTaskID,
+			ID:            p.ID,
+			File:          p.Target.QualifiedName,
+			Modified:      modified,
+			TaskID:        m.currentBuildTaskID,
+			IsFullRewrite: p.Patch != nil && p.Patch.IsFullRewrite,
 		}
 		orig, err := os.ReadFile(p.Target.QualifiedName)
 		if err == nil {
@@ -503,10 +504,11 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 				modified = p.Patch.Modified
 			}
 			patch := &execution.Patch{
-				ID:       p.ID,
-				File:     p.Target.QualifiedName,
-				Modified: modified,
-				TaskID:   m.currentBuildTaskID,
+				ID:            p.ID,
+				File:          p.Target.QualifiedName,
+				Modified:      modified,
+				TaskID:        m.currentBuildTaskID,
+				IsFullRewrite: p.Patch != nil && p.Patch.IsFullRewrite,
 			}
 			orig, err := os.ReadFile(p.Target.QualifiedName)
 			if err == nil {

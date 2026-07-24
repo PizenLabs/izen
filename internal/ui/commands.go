@@ -210,6 +210,29 @@ func (m *model) handleInput(line string) tea.Cmd {
 		}
 		rawInput := strings.TrimSpace(line[8:])
 
+		// ── COMPRESSOR FAST-TRACK ──────────────────────────
+		// Check the prompt compressor first. If it signals a direct
+		// mutation (BypassInvest=true) with a target file, skip ALL
+		// Architect prompts, skip /investigate mode routing entirely,
+		// and route directly to BUILD with a staged FILE_MUTATE task.
+		if compressed := gateway.CompressPrompt(rawInput); compressed != nil && compressed.BypassInvest && compressed.Target != "" {
+			target := command.FallbackPlanTarget{
+				File:        compressed.Target,
+				Description: rawInput,
+				TaskType:    "FILE_MUTATE",
+			}
+			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected by compressor. Bypassing architect analysis."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			tasks := command.GenerateFallbackPlan(target)
+			return func() tea.Msg {
+				return planResultMsg{
+					Tasks:       tasks,
+					IsFastTrack: true,
+				}
+			}
+		}
+
 		// ── INTENT PRE-GUARD: Fast-track direct file mutations ──────────
 		// Inspect the raw input before dispatching to the Senior Architect
 		// pipeline. If the user is requesting a simple single-file mutation
@@ -1341,7 +1364,8 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch"))
 		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
 		m.push(roleSystem, infoStyle.Render("  /usage           inspect token usage and provider status"))
-		m.push(roleSystem, infoStyle.Render("  /model           interactive model picker (fuzzy search)"))
+		m.push(roleSystem, infoStyle.Render("  /model        interactive model picker (fuzzy search)"))
+		m.push(roleSystem, infoStyle.Render("  /model <name> switch active model directly (e.g. /model claude-3-5-sonnet)"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("ask sub-commands ($)"))
@@ -1395,6 +1419,14 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		}
 
 		return m.modelPicker.LoadModels(providers)
+
+	case strings.HasPrefix(cmd, "/model "):
+		modelArg := strings.TrimSpace(strings.TrimPrefix(cmd, "/model"))
+		if modelArg == "" {
+			m.push(roleSystem, infoStyle.Render("usage: /model <model_name>  — switch active model directly"))
+			return nil
+		}
+		return m.switchModelDirect(modelArg)
 
 	case strings.HasPrefix(cmd, "/objective"):
 		objArg := strings.TrimSpace(strings.TrimPrefix(cmd, "/objective"))
@@ -1552,6 +1584,96 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
 	return nil
+}
+
+// switchModelDirect handles /model <model_name> for direct, non-interactive
+// model switching. It resolves the model name against the configured providers
+// and sets it as the session-level override (m.sessionModel).
+func (m *model) switchModelDirect(modelName string) tea.Cmd {
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" {
+		m.push(roleSystem, infoStyle.Render("usage: /model <model_name>  — switch active model directly"))
+		return nil
+	}
+
+	// Check model tier configuration for active_override or tier-default resolution.
+	// If the model name matches an active_override in any tier, use that tier's
+	// provider association for routing.
+	resolvedProvider := ""
+	if m.cfg.Models.Tiers != nil {
+		for _, tc := range m.cfg.Models.Tiers {
+			if tc.ActiveOverride == modelName || tc.Model == modelName {
+				if tc.Provider != "" {
+					resolvedProvider = tc.Provider
+				}
+				break
+			}
+		}
+	}
+
+	// Set the session model override immediately so the status bar reflects
+	// the change before the provider switch completes.
+	m.sessionModel = modelName
+	m.cfg.Models.SessionModel = modelName
+
+	// Determine the provider for this model. If we couldn't resolve it from
+	// tier config, try to infer from the model name format.
+	if resolvedProvider == "" {
+		resolvedProvider = m.inferProviderFromModel(modelName)
+	}
+
+	// If the provider changed, switch providers.
+	if resolvedProvider != "" {
+		currentProvider := ""
+		if m.provider != nil {
+			currentProvider = m.provider.Name()
+		}
+		if resolvedProvider != currentProvider {
+			// Validate the provider exists in config.
+			if _, ok := m.cfg.AI.Providers[resolvedProvider]; ok || resolvedProvider == "ollama" {
+				m.push(roleSystem, infoStyle.Render(fmt.Sprintf("switching to provider %q for model %q...", resolvedProvider, modelName)))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return tea.Batch(
+					m.switchProvider(resolvedProvider),
+					func() tea.Msg {
+						return providerSwitchMsg{name: resolvedProvider}
+					},
+				)
+			}
+		}
+	}
+
+	m.ti.Focus()
+	m.push(roleSystem, accentStyle.Render(fmt.Sprintf("✓ Model set to %s", modelName)))
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
+	return nil
+}
+
+// inferProviderFromModel tries to infer the provider from the model name format.
+// Model names with "/" are treated as openrouter-style (provider/model).
+// Ollama models (e.g. qwen2.5-coder:7b, llama3:8b) default to ollama.
+func (m *model) inferProviderFromModel(modelName string) string {
+	if strings.Contains(modelName, "/") {
+		return "openrouter"
+	}
+	// Check if the model name looks like an Ollama model (contains ":" version tag)
+	// or is a known local model pattern. Default to ollama for non-cloud models.
+	if strings.Contains(modelName, ":") {
+		return "ollama"
+	}
+	// For bare model names without version tags, check if it's a known cloud model.
+	cloudModels := map[string]bool{
+		"gpt-4o": true, "gpt-4": true, "gpt-4-turbo": true, "gpt-3.5-turbo": true,
+		"claude-sonnet-4-20250514": true, "claude-3-5-sonnet": true, "claude-3-opus": true,
+		"llama-3.3-70b-versatile": true, "llama3": true, "llama3.1": true, "llama3.2": true,
+		"mistral": true, "mixtral": true,
+	}
+	if cloudModels[modelName] {
+		return "openai"
+	}
+	return "ollama"
 }
 
 func (m *model) startModeTransition(target modes.Mode) {
@@ -2053,12 +2175,13 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		diff := computeUnifiedDiff(task.Target, orig, resolved)
 
 		patch := &execution.Patch{
-			ID:        fmt.Sprintf("hotfix-%d", task.StepNum),
-			File:      task.Target,
-			Original:  orig,
-			Modified:  cleaned,
-			TaskID:    task.StepNum,
-			ContextID: m.sess.ContextID,
+			ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+			File:          task.Target,
+			Original:      orig,
+			Modified:      cleaned,
+			TaskID:        task.StepNum,
+			ContextID:     m.sess.ContextID,
+			IsFullRewrite: true,
 		}
 
 		return hotfixProposalMsg{
@@ -2092,12 +2215,13 @@ func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
 		diff := computeUnifiedDiff(task.Target, orig, modified)
 
 		patch := &execution.Patch{
-			ID:        fmt.Sprintf("stdlib-%d", task.StepNum),
-			File:      task.Target,
-			Original:  orig,
-			Modified:  modified,
-			TaskID:    task.StepNum,
-			ContextID: m.sess.ContextID,
+			ID:            fmt.Sprintf("stdlib-%d", task.StepNum),
+			File:          task.Target,
+			Original:      orig,
+			Modified:      modified,
+			TaskID:        task.StepNum,
+			ContextID:     m.sess.ContextID,
+			IsFullRewrite: true,
 		}
 
 		return buildProposalReadyMsg{
@@ -2192,12 +2316,13 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			diff := computeUnifiedDiff(task.Target, orig, resolved)
 
 			patch := &execution.Patch{
-				ID:        fmt.Sprintf("build-%d", task.StepNum),
-				File:      task.Target,
-				Original:  orig,
-				Modified:  cleaned,
-				TaskID:    task.StepNum,
-				ContextID: m.sess.ContextID,
+				ID:            fmt.Sprintf("build-%d", task.StepNum),
+				File:          task.Target,
+				Original:      orig,
+				Modified:      cleaned,
+				TaskID:        task.StepNum,
+				ContextID:     m.sess.ContextID,
+				IsFullRewrite: task.IsHardcoded,
 			}
 
 			return buildProposalReadyMsg{
@@ -2232,12 +2357,13 @@ func (m *model) proposeTrivialCreatePatch(task *plan.Task) tea.Cmd {
 		diff := computeUnifiedDiff(canonicalTarget, orig, cleaned)
 
 		patch := &execution.Patch{
-			ID:        fmt.Sprintf("template-%d", task.StepNum),
-			File:      canonicalTarget,
-			Original:  orig,
-			Modified:  cleaned,
-			TaskID:    task.StepNum,
-			ContextID: m.sess.ContextID,
+			ID:            fmt.Sprintf("template-%d", task.StepNum),
+			File:          canonicalTarget,
+			Original:      orig,
+			Modified:      cleaned,
+			TaskID:        task.StepNum,
+			ContextID:     m.sess.ContextID,
+			IsFullRewrite: true,
 		}
 
 		return buildProposalReadyMsg{
