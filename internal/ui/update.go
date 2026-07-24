@@ -134,7 +134,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// ── INIT STAGE ROUTING: intercept all key messages during setup ─────
-	if m.initStage != initNone && m.initStage != initComplete {
+	initActive := m.initStage != initNone && m.initStage != initComplete
+	if !initActive && !m.isProjectInitialized() {
+		// Belt-and-suspenders: project is not initialized on disk. This can
+		// happen when initStage is initNone (zero value) — intercept keys
+		// to prevent the workspace from processing them before onboarding.
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			m.ti.Blur()
+			return m.handleInitKeyMsg(keyMsg)
+		}
+		// Non-key messages always pass through to the main switch.
+	}
+	if initActive {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
 			// Defensive blur: no focused textinput should consume keys
 			// during any init stage. Each sub-handler re-focuses as needed.
@@ -1987,10 +1998,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case gitInitResultMsg:
-		if msg.err != nil {
+		switch {
+		case msg.err != nil:
 			m.initGitInitErr = msg.err.Error()
-		} else if m.initStage == initGitCheck {
+		case m.initStage == initGitCheck:
 			m.initGitInitDone = true
+			m.advancePastGitCheck()
+		case m.initStage == initNone:
+			// Git was initialized from the first-run welcome screen (initNone).
+			// Advance directly to identity setup, skipping the confirm step.
 			m.advancePastGitCheck()
 		}
 		return m, m.spinnerTickCmd()

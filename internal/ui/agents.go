@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -498,6 +500,15 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 func (m *model) initSessionStartCheckpoint() tea.Msg {
 	if m.execEng == nil || m.execEng.ShadowCP == nil {
 		return nil
+	}
+	// FIRST-RUN GATE: never create checkpoints (or the .izen/ directory) when
+	// .izen/ does not yet exist on disk. This prevents the session-start
+	// snapshot from spuriously creating .izen/checkpoints/ which would cause
+	// HasLocalState to return true and bypass the TUI onboarding flow.
+	if m.workspaceRoot != "" {
+		if _, err := os.Stat(filepath.Join(m.workspaceRoot, ".izen")); os.IsNotExist(err) {
+			return nil
+		}
 	}
 	_, err := m.execEng.ShadowCP.CreateSessionStartSnapshot()
 	if err != nil {

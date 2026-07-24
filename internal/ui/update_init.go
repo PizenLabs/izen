@@ -25,6 +25,42 @@ func (m *model) handleInitKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleInitIdentity(msg)
 	case initProviderSelect:
 		return m.handleInitProviderSelect(msg)
+	case initNone:
+		return m.handleInitNone(msg)
+	}
+	return m, nil
+}
+
+func (m *model) handleInitNone(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	m.ti.Blur()
+
+	switch {
+	case msg.String() == "g" || msg.String() == "G":
+		// Git init requested from the welcome screen
+		m.initGitInitDone = false
+		m.initGitInitErr = ""
+		return m, m.runGitInit()
+	case msg.Type == tea.KeyEnter:
+		// Advance to the correct first-run stage based on git status
+		gitPath := filepath.Join(m.workspaceRoot, ".git")
+		if _, err := os.Stat(gitPath); os.IsNotExist(err) {
+			m.initStage = initGitCheck
+		} else {
+			m.initStage = initIdentity
+			m.initIdentityInput = textinput.New()
+			m.initIdentityInput.Prompt = ""
+			m.initIdentityInput.CharLimit = 64
+			m.initIdentityInput.Placeholder = "username"
+			if m.initPrefillUsername != "" {
+				m.userName = m.initPrefillUsername
+			}
+			m.initIdentityInput.SetValue(m.userName)
+			m.initIdentityInput.Focus()
+		}
+		return m, nil
+	case msg.Type == tea.KeyEscape:
+		m.initStage = initComplete
+		return m, m.ti.Focus()
 	}
 	return m, nil
 }
@@ -107,12 +143,17 @@ func (m *model) handleInitIdentity(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.initStage = initProviderSelect
 		m.initProviderIdx = 0
 		m.initProviderItems = m.buildProviderList()
-		// Pre-select the provider from the global profile when available.
+		// Providers with env vars are sorted first by buildProviderList.
+		// Priority: 1) global profile prefill WITH env var, 2) any env var,
+		// 3) first in list (ollama or default).
 		if m.initPrefillProvider != "" {
-			for i, name := range m.initProviderItems {
-				if name == m.initPrefillProvider {
-					m.initProviderIdx = i
-					break
+			envVar := envVarForProvider(m.initPrefillProvider)
+			if envVar != "" && os.Getenv(envVar) != "" {
+				for i, name := range m.initProviderItems {
+					if name == m.initPrefillProvider {
+						m.initProviderIdx = i
+						break
+					}
 				}
 			}
 		}

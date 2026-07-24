@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -41,6 +42,11 @@ func (m *model) renderInitView() string {
 		b.WriteString(m.renderInitIdentity(width))
 	case initProviderSelect:
 		b.WriteString(m.renderInitProviderSelect(width))
+	case initNone:
+		// Belt-and-suspenders: if isProjectInitialized returned false but
+		// initStage was left at the zero value, show a meaningful welcome
+		// screen with git detection instead of a blank/empty UI.
+		b.WriteString(m.renderInitFirstRun(width))
 	}
 
 	b.WriteString("\n")
@@ -165,12 +171,24 @@ func (m *model) renderInitProviderSelect(width int) string {
 	b.WriteString(initDimmedStyle.Render("Choose your default AI provider. Type to filter the list."))
 	b.WriteString("\n\n")
 
+	// ── Env var detection banner ──────────────────────────────────────
+	// Show a green banner when the currently selected provider has an API
+	// key set in the environment. This replaces manual key entry — the
+	// user just presses Enter to confirm.
+	items := m.filteredProviders()
+	if len(items) > m.initProviderIdx && m.initProviderIdx >= 0 {
+		selected := items[m.initProviderIdx]
+		if envVar := envVarForProvider(selected); envVar != "" && os.Getenv(envVar) != "" {
+			b.WriteString(initGreenStyle.Render("  ● " + envVar + " detected from environment. Ready!"))
+			b.WriteString("\n\n")
+		}
+	}
+
 	if m.initProviderFilter != "" {
 		b.WriteString(initMutedStyle.Render("  filter: ") + initTextStyle.Render(m.initProviderFilter))
 		b.WriteString("\n\n")
 	}
 
-	items := m.filteredProviders()
 	activeProvider := m.getActiveProviderName()
 	for i, item := range items {
 		glyph := "○"
@@ -197,6 +215,37 @@ func (m *model) renderInitProviderSelect(width int) string {
 	return b.String()
 }
 
+func (m *model) renderInitFirstRun(width int) string {
+	var b strings.Builder
+	gitPath := filepath.Join(m.workspaceRoot, ".git")
+	_, gitMissing := os.Stat(gitPath)
+	gitExists := gitMissing == nil
+
+	b.WriteString("\n")
+	b.WriteString(initSubStyle.Render(strings.Repeat("─", width)) + "\n")
+	b.WriteString("\n")
+	b.WriteString(initTextStyle.Render("Welcome to IZEN — engineering intelligence at your terminal."))
+	b.WriteString("\n")
+	b.WriteString(initDimmedStyle.Render("This quick setup configures your workspace identity and AI provider."))
+	b.WriteString("\n\n")
+
+	if gitExists {
+		b.WriteString(initGreenStyle.Render("  ●") + initTextStyle.Render(" Git repository detected"))
+	} else {
+		b.WriteString(initRedStyle.Render("  ○") + initTextStyle.Render(" No Git repository found"))
+		b.WriteString("\n")
+		b.WriteString(initDimmedStyle.Render("  (press ") + initCyanStyle.Render("G") + initDimmedStyle.Render(" to initialize git on the 'main' branch)"))
+	}
+	b.WriteString("\n\n")
+
+	choice := "  " + initGreenStyle.Render("●") + initTextStyle.Render(" Begin setup") + "    " + initDimmedStyle.Render("○ Skip")
+	b.WriteString(choice)
+	b.WriteString("\n")
+	b.WriteString(initDimmedStyle.Render("  (press ") + initCyanStyle.Render("Enter") + initDimmedStyle.Render(" to begin setup)"))
+
+	return b.String()
+}
+
 func (m *model) renderInitHelp(width int) string {
 	var hint string
 	switch m.initStage {
@@ -208,6 +257,8 @@ func (m *model) renderInitHelp(width int) string {
 		hint = "Enter: confirm • Esc: skip"
 	case initProviderSelect:
 		hint = "↑/↓ to select • Enter: confirm • Type: to search"
+	case initNone:
+		hint = "Enter: begin setup • G: init git • Esc: skip"
 	}
 	return initMutedStyle.Render(hint)
 }
