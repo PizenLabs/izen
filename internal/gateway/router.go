@@ -42,6 +42,12 @@ var directMutationVerbs = []string{
 	"lowercase",
 	"uppercase",
 	"fix",
+	"create",
+	"generate",
+	"make",
+	"write",
+	"touch",
+	"init",
 }
 
 // diagnosticPatterns are regex patterns that signal a bug-hunting or diagnostic

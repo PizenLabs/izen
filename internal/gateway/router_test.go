@@ -14,7 +14,28 @@ func TestClassifyDirectMutation(t *testing.T) {
 	}{
 		// ── $prompt prefix tests ──────────────────────────────────────
 		{
-			name:          "$prompt rename author in @LICENSE",
+			name:          "$prompt create MIT LICENSE",
+			input:         "$prompt i want to create the MIT LICENSE with author named 'Maha JR' and the years 2026",
+			wantFastTrack: true,
+			wantFile:      "license",
+			wantTaskType:  "FILE_MUTATE",
+		},
+		{
+			name:          "$prompt generate @LICENSE",
+			input:         "$prompt generate @LICENSE with Apache 2.0",
+			wantFastTrack: true,
+			wantFile:      "LICENSE",
+			wantTaskType:  "FILE_MUTATE",
+		},
+		{
+			name:          "$prompt write README.md",
+			input:         "$prompt write README.md with project description",
+			wantFastTrack: true,
+			wantFile:      "readme.md",
+			wantTaskType:  "FILE_MUTATE",
+		},
+		{
+			name:          "rename author in @LICENSE",
 			input:         "$prompt rename author in @LICENSE file into 'Jay JR'",
 			wantFastTrack: true,
 			wantFile:      "LICENSE",
@@ -286,6 +307,12 @@ func TestClassifyDirectMutation_VerbDetection(t *testing.T) {
 		"format",
 		"correct",
 		"capitalize",
+		"create",
+		"generate",
+		"make",
+		"write",
+		"touch",
+		"init",
 	}
 
 	for _, v := range verbs {
