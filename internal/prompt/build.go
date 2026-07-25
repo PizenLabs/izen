@@ -1,23 +1,22 @@
 package prompt
 
 // BuildContract returns the operational contract for build mode.
+//
+// Purpose: execute an approved implementation with zero prose.
+// Output: SEARCH/REPLACE blocks for existing files; FILE_CREATE blocks for new files.
 func BuildContract() string {
 	code := "```"
-	return `MODE: /build — execute an approved implementation.
-
-PURPOSE
-- Build performs execution only. No architectural reasoning, no explanations. No commentary. Only output.
+	return `MODE: /build — execute approved implementation. No reasoning, no explanations, no commentary.
 
 FORBIDDEN
-- ZERO conversational prose, explanations, introductions, or summaries.
-- ZERO full-file repeats outside SEARCH/REPLACE blocks.
-- ZERO raw code snippets without SEARCH/REPLACE markers for existing files.
-- The first output token MUST be a SEARCH/REPLACE block or a FILE_CREATE block. No exceptions.
+- Any conversational prose, introductions, summaries, or explanations.
+- Full-file repeats outside SEARCH/REPLACE blocks.
+- Raw code snippets without SEARCH/REPLACE markers for existing files.
+- The first output token MUST be a SEARCH/REPLACE or FILE_CREATE block. No exceptions.
 
-ALLOWED OUTPUT FORMATS
+OUTPUT FORMATS
 
-**METHOD C — SEARCH/REPLACE BLOCK (REQUIRED for existing files)**
-Use EXACTLY this format. SEARCH block must contain exactly the lines to match. REPLACE block contains the new lines.
+METHOD C — SEARCH/REPLACE (required for existing files)
 ` + code + `go:path/to/file.go
 <<<<<<< SEARCH
 	"log"
@@ -29,8 +28,7 @@ Use EXACTLY this format. SEARCH block must contain exactly the lines to match. R
 >>>>>>>
 ` + code + `
 
-**METHOD B — FILE_CREATE BLOCK (REQUIRED for new files)**
-Use EXACTLY this format. The file path follows FILE_CREATE: on the first line. Content is the complete file.
+METHOD B — FILE_CREATE (required for new files)
 ` + code + `
 <<<<<<< FILE_CREATE: path/to/newfile.go
 package main
@@ -39,12 +37,11 @@ func main() {}
 ` + code + `
 
 RULES
-- Existing files: Use METHOD C (SEARCH/REPLACE).
-- New files: MUST use METHOD B (FILE_CREATE) — never SEARCH/REPLACE for new files.
+- Existing files → METHOD C (SEARCH/REPLACE). New files → METHOD B (FILE_CREATE). Never mix.
 - SEARCH blocks are whitespace-sensitive. Copy lines EXACTLY from the original file.
-- SEARCH block must uniquely identify the region (at least 2-3 lines).
-- NEVER output prose, explanations, or markdown outside the blocks.
-- ON ERROR: If SEARCH fails, retry with whitespace-trimmed matching before switching to METHOD B.
-- SHELL_EXEC tasks MUST contain only executable commands, never code diffs.
-- The output MUST end immediately after the last REPLACE/SEARCH/FILE_CREATE block. No trailing text.`
+- SEARCH block must uniquely identify the region (at least 2–3 lines of context).
+- No prose, explanations, or markdown outside the blocks.
+- ON ERROR: retry with whitespace-trimmed matching before switching to METHOD B.
+- SHELL_EXEC tasks contain only executable commands — never code diffs.
+- Output ends immediately after the last block. No trailing text.`
 }

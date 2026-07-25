@@ -730,3 +730,63 @@ func TestDependencyFromConclusion_NoBlocker(t *testing.T) {
 		t.Fatalf("expected empty, got %q", dep)
 	}
 }
+
+func TestDetectDirectMutation_RefactorLicenseMITtoApache(t *testing.T) {
+	task := detectDirectMutation("refactor MIT LICENSE to APACHE 2.0 LICENSE @LICENSE", "")
+	if task == nil {
+		t.Fatal("detectDirectMutation returned nil for refactor MIT LICENSE to APACHE")
+	}
+	if task.Type != "FILE_MUTATE" {
+		t.Errorf("Type = %q, want FILE_MUTATE", task.Type)
+	}
+	if task.Target != "LICENSE" {
+		t.Errorf("Target = %q, want LICENSE", task.Target)
+	}
+	if !task.IsHardcoded {
+		t.Error("IsHardcoded = false, want true")
+	}
+	if task.Rationale == "" {
+		t.Error("Rationale should not be empty")
+	}
+}
+
+func TestDetectDirectMutation_ChangeLicense(t *testing.T) {
+	task := detectDirectMutation("change license from MIT to Apache 2.0 in LICENSE file", "")
+	if task == nil {
+		t.Fatal("detectDirectMutation returned nil for change license prompt")
+	}
+	if task.Target != "LICENSE" {
+		t.Errorf("Target = %q, want LICENSE", task.Target)
+	}
+	if task.Rationale == "" {
+		t.Error("Rationale should not be empty")
+	}
+}
+
+func TestDetectDirectMutation_NoVerb(t *testing.T) {
+	task := detectDirectMutation("the LICENSE file is MIT format", "")
+	if task != nil {
+		t.Error("detectDirectMutation should return nil for non-mutation prompt")
+	}
+}
+
+func TestDetectDirectMutation_NoFile(t *testing.T) {
+	// No file reference (license, readme, etc.) — should not fast-track.
+	task := detectDirectMutation("refactor MIT to Apache", "")
+	if task != nil {
+		t.Error("detectDirectMutation should return nil when no file target is detected")
+	}
+}
+
+func TestDetectDirectMutation_ConvertGPLtoMIT(t *testing.T) {
+	task := detectDirectMutation("convert GPL license to MIT license", "")
+	if task == nil {
+		t.Fatal("detectDirectMutation returned nil for convert GPL to MIT")
+	}
+	if task.Target != "LICENSE" {
+		t.Errorf("Target = %q, want LICENSE", task.Target)
+	}
+	if task.Rationale == "" {
+		t.Error("Rationale should not be empty")
+	}
+}

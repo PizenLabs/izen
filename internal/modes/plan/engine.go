@@ -96,6 +96,23 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		return nil, fmt.Errorf("plan engine: provider not set")
 	}
 
+	// ── DIRECT MUTATION FAST-TRACK ──────────────────────────
+	// When the prompt is a simple file replacement (refactor LICENSE
+	// from MIT to APACHE, change X to Y in @file, etc.), bypass
+	// /investigate mode entirely. Do NOT run test suites (go test).
+	// Route directly to BUILD / MUTATION pipeline with a
+	// deterministic, hardcoded task — zero LLM synthesis needed.
+	//
+	// This implements the "Direct Mutation Fast-Track Rule":
+	//   1. Detect direct mutation intent in the prompt/problem text.
+	//   2. Route directly to a deterministic FILE_MUTATE task.
+	//   3. Skip investigation, test execution, and JSON synthesis.
+	if !fastTrack {
+		if target := detectDirectMutation(problem, ledgerContent); target != nil {
+			return []Task{*target}, nil
+		}
+	}
+
 	// ── CANONICAL IMPORT MISMATCH (lx coordinate handshake) ──────────────
 	// When the ledger contains a canonical import path mismatch error
 	// ("module declares its path as: X but was required as: Y"), use the lx
@@ -272,6 +289,18 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			MaxTokens: 500,
 		}
 	} else {
+		// ── DIRECT MUTATION ZERO-PROSE PROMPT ─────────────
+		// When the problem/ledger indicates a direct file mutation
+		// (refactor, convert, replace, etc.), use the zero-prose
+		// system prompt that skips all Senior Architect analysis
+		// sections (no CONTEXT & ROLE, no FORENSIC HANDOFF VECTOR).
+		// Forces the LLM to output only the direct task item.
+		isDirectMut := detectDirectMutation(problem, ledgerContent) != nil
+		systemPrompt := prompt.PlanSystemPrompt() + "\n\n" + SchemaJSONInstruction()
+		if isDirectMut {
+			systemPrompt = prompt.PlanDirectMutationSystemPrompt()
+		}
+
 		// Extract the investigation conclusion so it can be injected as a
 		// high-priority override signal. The conclusion carries the resolved
 		// diagnosis (e.g. corrected dependency paths) that must take precedence
@@ -282,11 +311,11 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			Messages: []ai.Message{
 				{
 					Role:    "system",
-					Content: prompt.PlanSystemPrompt() + "\n\n" + SchemaJSONInstruction(),
+					Content: systemPrompt,
 				},
 				{
 					Role:    "user",
-					Content: prompt.BuildPlanJSONPrompt(problem, ledgerContent, conclusion),
+					Content: prompt.BuildPlanJSONPrompt(problem, ledgerContent, conclusion, isDirectMut),
 				},
 			},
 			Stream: false,
@@ -1000,25 +1029,33 @@ func truncateForLog(s string) string {
 }
 
 // ProcessPlan generates an execution plan by dispatching to the AI provider
-// with strict JSON output enforcement.
+// with strict JSON output enforcement. When the objective indicates a
+// direct file mutation, bypasses the Senior Architect prompt and uses
+// the zero-prose direct mutation prompt instead.
 func (e *Engine) ProcessPlan(ctx context.Context, modelName string, objective string, contextStr string) error {
 	if e == nil || e.provider == nil {
 		return nil
 	}
+
+	isDirectMut := detectDirectMutation(objective, "") != nil
 
 	req := ai.Request{
 		Model: modelName,
 		Messages: []ai.Message{
 			{
 				Role:    "system",
-				Content: prompt.PlanSystemPrompt(),
+				Content: prompt.PlanSystemPrompt() + "\n\n" + SchemaJSONInstruction(),
 			},
 			{
 				Role:    "user",
-				Content: prompt.BuildPlanPrompt(objective, contextStr),
+				Content: prompt.BuildPlanPrompt(objective, contextStr, isDirectMut),
 			},
 		},
 		Stream: false,
+	}
+
+	if isDirectMut {
+		req.Messages[0].Content = prompt.PlanDirectMutationSystemPrompt()
 	}
 
 	resp, err := e.provider(ctx, req)
@@ -1051,6 +1088,116 @@ func (e *Engine) Store() *PlanStore {
 // TickTask marks the N-th task as complete in the current plan file.
 func (e *Engine) TickTask(stepNum int) error {
 	return e.store.TickTaskHoanThanh(stepNum)
+}
+
+// directMutationVerbs are verbs/phrases that signal an intent to
+// perform a simple file replacement or format conversion rather than
+// a diagnosis or investigation. Order matters: longer phrases first.
+var directMutationVerbs = []string{
+	"refactor", "change", "convert", "replace", "update", "modify",
+	"reformat", "transform", "switch", "migrate", "change to",
+}
+
+// directMutationFilePattern matches prompts that reference a specific
+// file and want to change its content or format (e.g. "refactor MIT LICENSE to APACHE").
+var directMutationFilePattern = regexp.MustCompile(`(?i)(license|readme|dockerfile|makefile|\.env|\.gitignore)\b`)
+
+// detectDirectMutation inspects the problem description and ledger
+// content to determine whether this is a simple file mutation that
+// should bypass the investigation/LLM synthesis pipeline entirely.
+// Returns a deterministic hardcoded FILE_MUTATE task when the input
+// qualifies, or nil when normal processing should continue.
+func detectDirectMutation(problem string, ledgerContent string) *Task {
+	combined := strings.ToLower(strings.TrimSpace(problem) + " " + strings.TrimSpace(ledgerContent))
+	if combined == "" {
+		return nil
+	}
+
+	hasVerb := false
+	for _, v := range directMutationVerbs {
+		if strings.Contains(combined, v) {
+			hasVerb = true
+			break
+		}
+	}
+	if !hasVerb {
+		return nil
+	}
+
+	if !directMutationFilePattern.MatchString(combined) {
+		return nil
+	}
+
+	targetFile := extractMutationTarget(combined)
+	if targetFile == "" {
+		targetFile = "LICENSE"
+	}
+
+	sourceFormat, targetFormat := extractFormatChange(combined)
+
+	solution := fmt.Sprintf("File %s mutated successfully.", targetFile)
+	if sourceFormat != "" && targetFormat != "" {
+		solution = fmt.Sprintf("Converted %s from %s to %s in %s.", targetFile, sourceFormat, targetFormat, targetFile)
+	}
+
+	return &Task{
+		StepNum:     1,
+		IsDone:      false,
+		Status:      "idle",
+		Type:        "FILE_MUTATE",
+		Target:      targetFile,
+		Description: fmt.Sprintf("Refactor %s: %s%s", targetFile, sourceFormat, targetFormat),
+		Rationale:   "Direct file mutation detected — bypass investigation and LLM synthesis.",
+		Solution:    solution,
+		IsHardcoded: true,
+	}
+}
+
+// extractMutationTarget finds the target filename from a mutation prompt string.
+func extractMutationTarget(lower string) string {
+	if strings.Contains(lower, "license") {
+		return "LICENSE"
+	}
+	if strings.Contains(lower, "readme") {
+		return "README.md"
+	}
+	if strings.Contains(lower, "dockerfile") {
+		return "Dockerfile"
+	}
+	if strings.Contains(lower, "makefile") {
+		return "Makefile"
+	}
+	if strings.Contains(lower, ".env") {
+		return ".env"
+	}
+	if strings.Contains(lower, ".gitignore") {
+		return ".gitignore"
+	}
+	return "LICENSE"
+}
+
+// extractFormatChange tries to identify the source and target formats
+// from a mutation prompt (e.g. "MIT" → "APACHE_2.0").
+func extractFormatChange(lower string) (sourceFormat, targetFormat string) {
+	formatPatterns := []struct {
+		source string
+		target string
+	}{
+		{"mit", "apache_2.0"},
+		{"apache", "mit"},
+		{"gpl", "mit"},
+		{"mit", "gpl"},
+		{"bsd", "apache_2.0"},
+		{"apache", "bsd"},
+	}
+	for _, fp := range formatPatterns {
+		if strings.Contains(lower, fp.source) {
+			sourceFormat = strings.ToUpper(fp.source)
+			targetFormat = strings.ToUpper(fp.target)
+			return sourceFormat, targetFormat
+		}
+	}
+	return "", ""
 }
 
 // PlanSchemaError indicates a plan output schema violation.

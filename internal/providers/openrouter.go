@@ -50,11 +50,12 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	msgs := p.buildMessages(req)
 
 	body := openrouterRequest{
-		Model:     model,
-		Messages:  msgs,
-		MaxTokens: req.MaxTokens,
-		Stop:      req.Stop,
-		Stream:    false,
+		Model:       model,
+		Messages:    msgs,
+		MaxTokens:   req.MaxTokens,
+		Temperature: req.Temperature,
+		Stop:        req.Stop,
+		Stream:      false,
 	}
 
 	payload, err := json.Marshal(body)
@@ -120,6 +121,7 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		Model:         model,
 		Messages:      msgs,
 		MaxTokens:     req.MaxTokens,
+		Temperature:   req.Temperature,
 		Stop:          req.Stop,
 		Stream:        true,
 		StreamOptions: &streamOptions{IncludeUsage: true},
@@ -174,6 +176,7 @@ type openrouterRequest struct {
 	Model         string              `json:"model"`
 	Messages      []openrouterMessage `json:"messages"`
 	MaxTokens     int                 `json:"max_tokens,omitempty"`
+	Temperature   float64             `json:"temperature,omitempty"`
 	Stop          []string            `json:"stop,omitempty"`
 	Stream        bool                `json:"stream"`
 	StreamOptions *streamOptions      `json:"stream_options,omitempty"`

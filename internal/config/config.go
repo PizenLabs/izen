@@ -52,13 +52,66 @@ type Config struct {
 }
 
 type ModelConfig struct {
-	Default      string              `yaml:"default"`
-	Fast         string              `yaml:"fast"`
-	Provider     string              `yaml:"provider"`
-	MaxTokens    int                 `yaml:"max_tokens"`
-	SessionModel string              `yaml:"-"` // runtime session override, never persisted
-	ModeDefaults map[string]string   `yaml:"mode_defaults,omitempty"`
-	Modes        map[string]ModeSpec `yaml:"modes,omitempty"`
+	Default      string                      `yaml:"default"`
+	Fast         string                      `yaml:"fast"`
+	Provider     string                      `yaml:"provider"`
+	MaxTokens    int                         `yaml:"max_tokens"`
+	SessionModel string                      `yaml:"-"` // runtime session override, never persisted
+	ModeDefaults map[string]string           `yaml:"mode_defaults,omitempty"`
+	Modes        map[string]ModeSpec         `yaml:"modes,omitempty"`
+	Tiers        map[string]IntentTierConfig `yaml:"tiers,omitempty"`
+}
+
+type IntentTierConfig struct {
+	Provider       string `yaml:"provider,omitempty"`
+	Model          string `yaml:"model,omitempty"`
+	ActiveOverride string `yaml:"active_override,omitempty"`
+}
+
+// ResolveTierModel returns the effective model for the given intent tier.
+// It first checks for an active_override (set via /model), then falls back
+// to the tier's model, then to the global ModelConfig.Default.
+func (c *Config) ResolveTierModel(tier string) string {
+	if c.Models.Tiers != nil {
+		if tc, ok := c.Models.Tiers[tier]; ok {
+			if tc.ActiveOverride != "" {
+				return tc.ActiveOverride
+			}
+			if tc.Model != "" {
+				return tc.Model
+			}
+		}
+	}
+	return c.ActiveModelName()
+}
+
+// SetTierOverride sets the active_override for the given intent tier,
+// persisting the model selection as the session-level override.
+func (c *Config) SetTierOverride(tier, modelName string) {
+	if c.Models.Tiers == nil {
+		c.Models.Tiers = make(map[string]IntentTierConfig)
+	}
+	tc := c.Models.Tiers[tier]
+	tc.ActiveOverride = modelName
+	c.Models.Tiers[tier] = tc
+	c.Models.SessionModel = modelName
+}
+
+// ActiveTierForFile returns the intent tier for a given file path based
+// on its extension and purpose. License files, Dockerfiles, and dotfiles
+// are classified as high_intent since they carry legal/operational weight.
+func (c *Config) ActiveTierForFile(file string) string {
+	base := strings.ToLower(strings.TrimSpace(file))
+	switch {
+	case base == "license" || base == "license.md" || base == "license.txt" ||
+		strings.HasPrefix(base, ".env") || base == "dockerfile" ||
+		strings.HasPrefix(base, "dockerfile."):
+		return "high_intent"
+	case strings.HasSuffix(base, ".md") || strings.HasSuffix(base, ".txt"):
+		return "medium_intent"
+	default:
+		return "low_intent"
+	}
 }
 
 type ModeSpec struct {
@@ -285,6 +338,20 @@ func Default() *Config {
 				"build":       {Provider: "", Model: ""},
 				"review":      {Provider: "", Model: ""},
 				"investigate": {Provider: "", Model: ""},
+			},
+			Tiers: map[string]IntentTierConfig{
+				"low_intent": {
+					Provider: "ollama",
+					Model:    "qwen2.5-coder:7b",
+				},
+				"medium_intent": {
+					Provider: "ollama",
+					Model:    "qwen2.5-coder:7b",
+				},
+				"high_intent": {
+					Provider: "ollama",
+					Model:    "qwen2.5-coder:7b",
+				},
 			},
 		},
 		Execution: ExecutionConfig{

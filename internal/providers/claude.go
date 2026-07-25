@@ -40,6 +40,7 @@ type claudeRequest struct {
 	Model         string          `json:"model"`
 	Messages      []claudeMessage `json:"messages"`
 	MaxTokens     int             `json:"max_tokens"`
+	Temperature   float64         `json:"temperature,omitempty"`
 	Stream        bool            `json:"stream"`
 	System        string          `json:"system,omitempty"`
 	StopSequences []string        `json:"stop_sequences,omitempty"`
@@ -101,6 +102,7 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		Model:         model,
 		Messages:      msgs,
 		MaxTokens:     maxTokens,
+		Temperature:   req.Temperature,
 		Stream:        false,
 		System:        req.System,
 		StopSequences: req.Stop,
@@ -172,6 +174,7 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		Model:         model,
 		Messages:      msgs,
 		MaxTokens:     maxTokens,
+		Temperature:   req.Temperature,
 		Stream:        true,
 		System:        req.System,
 		StopSequences: req.Stop,

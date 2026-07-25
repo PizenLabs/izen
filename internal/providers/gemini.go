@@ -52,7 +52,8 @@ type geminiSystemInstruction struct {
 }
 
 type geminiGenerationConfig struct {
-	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
+	MaxOutputTokens int     `json:"maxOutputTokens,omitempty"`
+	Temperature     float64 `json:"temperature,omitempty"`
 }
 
 type geminiResponse struct {
@@ -123,6 +124,7 @@ func (p *GeminiProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		Stream:   false,
 		GenerationConfig: &geminiGenerationConfig{
 			MaxOutputTokens: maxTokens,
+			Temperature:     req.Temperature,
 		},
 	}
 
@@ -197,6 +199,7 @@ func (p *GeminiProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		Stream:   true,
 		GenerationConfig: &geminiGenerationConfig{
 			MaxOutputTokens: maxTokens,
+			Temperature:     req.Temperature,
 		},
 	}
 

@@ -32,6 +32,9 @@ var SyntaxErrorRe = regexp.MustCompile(`^([^:]+\.\w+):(\d+):\s*(.+)$`)
 var hallucinatedPrefixes = []string{
 	"FILE:",
 	"file:",
+	"**FILE_CREATE:",
+	"**FILE_CREATE ",
+	"**FILE_CREATE**",
 	"[target]",
 	"[Target]",
 	"[/target]",
@@ -42,11 +45,12 @@ var hallucinatedPrefixes = []string{
 	"```python",
 	"```typescript",
 	"```javascript",
+	"```",
 }
 
 // hallucinatedRe matches stray markdown artifact patterns that local models
 // hallucinate as standalone lines within code blocks.
-var hallucinatedRe = regexp.MustCompile(`(?i)^\s*\[/?(code|file|source|block|end|diff)\]\s*$`)
+var hallucinatedRe = regexp.MustCompile(`(?i)^\s*(\*\*FILE_CREATE:?[^*]*\*\*|\[/?(code|file|source|block|end|diff)\])\s*$`)
 
 // SyntaxError is a parsed compiler syntax error with structured position info.
 type SyntaxError struct {

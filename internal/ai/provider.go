@@ -22,6 +22,7 @@ type Request struct {
 	System         string          `json:"-"` // Explicit system prompt (top-level for Anthropic, prepended for OpenAI-compatible)
 	MaxTokens      int             `json:"-"` // 0 = use provider default
 	Stop           []string        `json:"-"` // Optional stop sequences (e.g. [">>>>>>>"])
+	Temperature    float64         `json:"-"` // 0 = use provider default
 	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
 }
 

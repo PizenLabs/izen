@@ -45,7 +45,8 @@ type ollamaRequest struct {
 	Format    string          `json:"format,omitempty"` // "json" for structured output
 	MaxTokens *int            `json:"max_tokens,omitempty"`
 	Options   *struct {
-		NumPredict int `json:"num_predict"`
+		NumPredict  int     `json:"num_predict"`
+		Temperature float64 `json:"temperature,omitempty"`
 	} `json:"options,omitempty"`
 }
 
@@ -152,8 +153,9 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		Stream:    false,
 		MaxTokens: &maxTokens,
 		Options: &struct {
-			NumPredict int `json:"num_predict"`
-		}{NumPredict: maxTokens},
+			NumPredict  int     `json:"num_predict"`
+			Temperature float64 `json:"temperature,omitempty"`
+		}{NumPredict: maxTokens, Temperature: req.Temperature},
 	}
 	if req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object" {
 		body.Format = "json"
@@ -238,8 +240,9 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		Stream:    true,
 		MaxTokens: &maxTokens,
 		Options: &struct {
-			NumPredict int `json:"num_predict"`
-		}{NumPredict: maxTokens},
+			NumPredict  int     `json:"num_predict"`
+			Temperature float64 `json:"temperature,omitempty"`
+		}{NumPredict: maxTokens, Temperature: req.Temperature},
 	}
 
 	payload, err := json.Marshal(body)

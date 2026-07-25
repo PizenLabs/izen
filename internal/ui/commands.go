@@ -36,6 +36,7 @@ import (
 	"github.com/PizenLabs/izen/internal/retrieval"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
+	"github.com/PizenLabs/izen/internal/templates"
 )
 
 var validSystemCommands = map[string]struct{}{
@@ -208,6 +209,29 @@ func (m *model) handleInput(line string) tea.Cmd {
 			return nil
 		}
 		rawInput := strings.TrimSpace(line[8:])
+
+		// ── COMPRESSOR FAST-TRACK ──────────────────────────
+		// Check the prompt compressor first. If it signals a direct
+		// mutation (BypassInvest=true) with a target file, skip ALL
+		// Architect prompts, skip /investigate mode routing entirely,
+		// and route directly to BUILD with a staged FILE_MUTATE task.
+		if compressed := gateway.CompressPrompt(rawInput); compressed != nil && compressed.BypassInvest && compressed.Target != "" {
+			target := command.FallbackPlanTarget{
+				File:        compressed.Target,
+				Description: rawInput,
+				TaskType:    "FILE_MUTATE",
+			}
+			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected by compressor. Bypassing architect analysis."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			tasks := command.GenerateFallbackPlan(target)
+			return func() tea.Msg {
+				return planResultMsg{
+					Tasks:       tasks,
+					IsFastTrack: true,
+				}
+			}
+		}
 
 		// ── INTENT PRE-GUARD: Fast-track direct file mutations ──────────
 		// Inspect the raw input before dispatching to the Senior Architect
@@ -1340,7 +1364,8 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch"))
 		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
 		m.push(roleSystem, infoStyle.Render("  /usage           inspect token usage and provider status"))
-		m.push(roleSystem, infoStyle.Render("  /model           interactive model picker (fuzzy search)"))
+		m.push(roleSystem, infoStyle.Render("  /model        interactive model picker (fuzzy search)"))
+		m.push(roleSystem, infoStyle.Render("  /model <name> switch active model directly (e.g. /model claude-3-5-sonnet)"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("ask sub-commands ($)"))
@@ -1394,6 +1419,14 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		}
 
 		return m.modelPicker.LoadModels(providers)
+
+	case strings.HasPrefix(cmd, "/model "):
+		modelArg := strings.TrimSpace(strings.TrimPrefix(cmd, "/model"))
+		if modelArg == "" {
+			m.push(roleSystem, infoStyle.Render("usage: /model <model_name>  — switch active model directly"))
+			return nil
+		}
+		return m.switchModelDirect(modelArg)
 
 	case strings.HasPrefix(cmd, "/objective"):
 		objArg := strings.TrimSpace(strings.TrimPrefix(cmd, "/objective"))
@@ -1551,6 +1584,96 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
 	return nil
+}
+
+// switchModelDirect handles /model <model_name> for direct, non-interactive
+// model switching. It resolves the model name against the configured providers
+// and sets it as the session-level override (m.sessionModel).
+func (m *model) switchModelDirect(modelName string) tea.Cmd {
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" {
+		m.push(roleSystem, infoStyle.Render("usage: /model <model_name>  — switch active model directly"))
+		return nil
+	}
+
+	// Check model tier configuration for active_override or tier-default resolution.
+	// If the model name matches an active_override in any tier, use that tier's
+	// provider association for routing.
+	resolvedProvider := ""
+	if m.cfg.Models.Tiers != nil {
+		for _, tc := range m.cfg.Models.Tiers {
+			if tc.ActiveOverride == modelName || tc.Model == modelName {
+				if tc.Provider != "" {
+					resolvedProvider = tc.Provider
+				}
+				break
+			}
+		}
+	}
+
+	// Set the session model override immediately so the status bar reflects
+	// the change before the provider switch completes.
+	m.sessionModel = modelName
+	m.cfg.Models.SessionModel = modelName
+
+	// Determine the provider for this model. If we couldn't resolve it from
+	// tier config, try to infer from the model name format.
+	if resolvedProvider == "" {
+		resolvedProvider = m.inferProviderFromModel(modelName)
+	}
+
+	// If the provider changed, switch providers.
+	if resolvedProvider != "" {
+		currentProvider := ""
+		if m.provider != nil {
+			currentProvider = m.provider.Name()
+		}
+		if resolvedProvider != currentProvider {
+			// Validate the provider exists in config.
+			if _, ok := m.cfg.AI.Providers[resolvedProvider]; ok || resolvedProvider == "ollama" {
+				m.push(roleSystem, infoStyle.Render(fmt.Sprintf("switching to provider %q for model %q...", resolvedProvider, modelName)))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return tea.Batch(
+					m.switchProvider(resolvedProvider),
+					func() tea.Msg {
+						return providerSwitchMsg{name: resolvedProvider}
+					},
+				)
+			}
+		}
+	}
+
+	m.ti.Focus()
+	m.push(roleSystem, accentStyle.Render(fmt.Sprintf("✓ Model set to %s", modelName)))
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
+	return nil
+}
+
+// inferProviderFromModel tries to infer the provider from the model name format.
+// Model names with "/" are treated as openrouter-style (provider/model).
+// Ollama models (e.g. qwen2.5-coder:7b, llama3:8b) default to ollama.
+func (m *model) inferProviderFromModel(modelName string) string {
+	if strings.Contains(modelName, "/") {
+		return "openrouter"
+	}
+	// Check if the model name looks like an Ollama model (contains ":" version tag)
+	// or is a known local model pattern. Default to ollama for non-cloud models.
+	if strings.Contains(modelName, ":") {
+		return "ollama"
+	}
+	// For bare model names without version tags, check if it's a known cloud model.
+	cloudModels := map[string]bool{
+		"gpt-4o": true, "gpt-4": true, "gpt-4-turbo": true, "gpt-3.5-turbo": true,
+		"claude-sonnet-4-20250514": true, "claude-3-5-sonnet": true, "claude-3-opus": true,
+		"llama-3.3-70b-versatile": true, "llama3": true, "llama3.1": true, "llama3.2": true,
+		"mistral": true, "mixtral": true,
+	}
+	if cloudModels[modelName] {
+		return "openai"
+	}
+	return "ollama"
 }
 
 func (m *model) startModeTransition(target modes.Mode) {
@@ -2052,12 +2175,13 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		diff := computeUnifiedDiff(task.Target, orig, resolved)
 
 		patch := &execution.Patch{
-			ID:        fmt.Sprintf("hotfix-%d", task.StepNum),
-			File:      task.Target,
-			Original:  orig,
-			Modified:  cleaned,
-			TaskID:    task.StepNum,
-			ContextID: m.sess.ContextID,
+			ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+			File:          task.Target,
+			Original:      orig,
+			Modified:      cleaned,
+			TaskID:        task.StepNum,
+			ContextID:     m.sess.ContextID,
+			IsFullRewrite: true,
 		}
 
 		return hotfixProposalMsg{
@@ -2091,12 +2215,13 @@ func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
 		diff := computeUnifiedDiff(task.Target, orig, modified)
 
 		patch := &execution.Patch{
-			ID:        fmt.Sprintf("stdlib-%d", task.StepNum),
-			File:      task.Target,
-			Original:  orig,
-			Modified:  modified,
-			TaskID:    task.StepNum,
-			ContextID: m.sess.ContextID,
+			ID:            fmt.Sprintf("stdlib-%d", task.StepNum),
+			File:          task.Target,
+			Original:      orig,
+			Modified:      modified,
+			TaskID:        task.StepNum,
+			ContextID:     m.sess.ContextID,
+			IsFullRewrite: true,
 		}
 
 		return buildProposalReadyMsg{
@@ -2191,12 +2316,13 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			diff := computeUnifiedDiff(task.Target, orig, resolved)
 
 			patch := &execution.Patch{
-				ID:        fmt.Sprintf("build-%d", task.StepNum),
-				File:      task.Target,
-				Original:  orig,
-				Modified:  cleaned,
-				TaskID:    task.StepNum,
-				ContextID: m.sess.ContextID,
+				ID:            fmt.Sprintf("build-%d", task.StepNum),
+				File:          task.Target,
+				Original:      orig,
+				Modified:      cleaned,
+				TaskID:        task.StepNum,
+				ContextID:     m.sess.ContextID,
+				IsFullRewrite: task.IsHardcoded,
 			}
 
 			return buildProposalReadyMsg{
@@ -2211,11 +2337,308 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 	}
 }
 
-// applyHotfixPatch applies a pre-generated $hot patch through the execution
-// engine's PatchManager — never via the conversational stream. It returns a
-// buildResultMsg so the standard update.go handler restores the stashed plan
-// and freezes the pipeline to PAUSED afterwards. On failure the task is marked
-// failed and the buildResultMsg handler rolls back any partial mutation.
+// proposeTrivialCreatePatch generates a trivial template file (LICENSE,
+// .gitignore, .env) locally using Go string templates — zero cloud tokens.
+// It bypasses the LLM entirely and returns a buildProposalReadyMsg with the
+// generated content and a unified diff against any existing file content.
+func (m *model) proposeTrivialCreatePatch(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		canonicalTarget := gateway.CanonicalizeFileName(task.Target)
+		task.Target = canonicalTarget
+		var orig string
+		if data, rerr := os.ReadFile(canonicalTarget); rerr == nil {
+			orig = string(data)
+		}
+
+		description := task.Description
+		content := generateTrivialContent(canonicalTarget, description)
+
+		cleaned := execution.SanitizeLLMResponse(content)
+		diff := computeUnifiedDiff(canonicalTarget, orig, cleaned)
+
+		patch := &execution.Patch{
+			ID:            fmt.Sprintf("template-%d", task.StepNum),
+			File:          canonicalTarget,
+			Original:      orig,
+			Modified:      cleaned,
+			TaskID:        task.StepNum,
+			ContextID:     m.sess.ContextID,
+			IsFullRewrite: true,
+		}
+
+		return buildProposalReadyMsg{
+			Task:   task,
+			Patch:  patch,
+			Diff:   diff,
+			Output: cleaned,
+		}
+	}
+}
+
+// generateTrivialContent generates the file content for a trivial template
+// file (LICENSE, .gitignore, .env) from the user's description string.
+// Returns empty string if the target is not recognized.
+func generateTrivialContent(target, description string) string {
+	base := strings.ToLower(target)
+	base = strings.TrimSuffix(base, ".md")
+
+	switch base {
+	case "license", "licence":
+		licenseType := detectLicenseType(description)
+		content, ok := templates.RenderLicense(licenseType, description)
+		if !ok {
+			return ""
+		}
+		return content
+	case ".gitignore", "gitignore":
+		return generateGitignore()
+	case ".env", "env", ".env.example", "env.example":
+		return generateEnv()
+	default:
+		return ""
+	}
+}
+
+func detectLicenseType(description string) string {
+	lower := strings.ToLower(description)
+	switch {
+	case strings.Contains(lower, "apache"):
+		return "apache-2.0"
+	case strings.Contains(lower, "gpl"):
+		return "gpl-3.0"
+	case strings.Contains(lower, "bsd"):
+		return "bsd-3-clause"
+	default:
+		return "mit"
+	}
+}
+
+// generateGitignore returns a basic Go .gitignore template.
+func generateGitignore() string {
+	return `# Dependencies
+vendor/
+
+# Build output
+bin/
+dist/
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go
+*.test
+*.out
+*.prof
+*.test.exe
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+`
+}
+
+// generateEnv returns a basic .env template.
+func generateEnv() string {
+	return `# Application
+APP_ENV=development
+APP_DEBUG=true
+APP_PORT=8080
+
+# Database
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=myapp
+DB_USER=user
+DB_PASSWORD=
+
+# API Keys (fill in your own)
+API_KEY=
+SECRET_KEY=
+`
+}
+
+func isYear(s string) bool {
+	if len(s) != 4 {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	n := 0
+	for _, c := range s {
+		n = n*10 + int(c-'0')
+	}
+	return n >= 1900 && n <= 2099
+}
+
+var customizationDirectivePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(?:author|by|copyright|holder|organization)\b`),
+	regexp.MustCompile(`\b(19[0-9][0-9]|20[0-9][0-9])\b`),
+	regexp.MustCompile(`['"][^'"]+['"]`),
+	regexp.MustCompile(`(?i)\brefactor|convert|replace|change|update|modify\b`),
+}
+
+func hasCustomizationDirectives(description string) bool {
+	if description == "" {
+		return false
+	}
+	lower := strings.ToLower(description)
+	for _, pat := range customizationDirectivePatterns {
+		if pat.MatchString(lower) {
+			return true
+		}
+	}
+	return false
+}
+
+// proposeHybridTemplatePatch generates a patch for a trivial template file
+// (LICENSE, .gitignore, .env) by resolving the reference template text and
+// injecting it into the LLM context as a reference, instructing the model to
+// apply the user's specific modifications. This consumes LLM tokens but allows
+// the model to handle author names, year overrides, and other customizations
+// that the static Go template renderer cannot support.
+//
+// If the reference text cannot be resolved (unexpected target) the function
+// falls through to generateTrivialContent — the static template renderer.
+func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		if m.provider == nil {
+			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
+		}
+
+		canonicalTarget := gateway.CanonicalizeFileName(task.Target)
+		task.Target = canonicalTarget
+
+		var orig string
+		if data, rerr := os.ReadFile(canonicalTarget); rerr == nil {
+			orig = string(data)
+		}
+
+		referenceText := resolveReferenceTemplate(canonicalTarget, task.Description)
+		if referenceText == "" {
+			content := generateTrivialContent(canonicalTarget, task.Description)
+			cleaned := execution.SanitizeLLMResponse(content)
+			diff := computeUnifiedDiff(canonicalTarget, orig, cleaned)
+			return buildProposalReadyMsg{
+				Task: task,
+				Patch: &execution.Patch{
+					ID:            fmt.Sprintf("hybrid-%d", task.StepNum),
+					File:          canonicalTarget,
+					Original:      orig,
+					Modified:      cleaned,
+					TaskID:        task.StepNum,
+					ContextID:     m.sess.ContextID,
+					IsFullRewrite: true,
+				},
+				Diff:   diff,
+				Output: cleaned,
+			}
+		}
+
+		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		handoff += "\n\n### REFERENCE TEMPLATE\n"
+		handoff += "Below is the base template text. Apply the user's specific modifications "
+		handoff += "(e.g., author name, year, or content changes) to this text and output "
+		handoff += "the final updated content as a FILE_CREATE block.\n\n"
+		handoff += "```\n" + referenceText + "\n```\n"
+		if orig != "" {
+			handoff += "\n### EXISTING FILE CONTENT\n```\n" + orig + "\n```\n"
+			handoff += "\nThe file already exists. Overwrite it with the modified template content."
+		}
+		handoff += "\n\n### USER REQUEST\n" + task.Description
+		handoff += "\n\nOutput a <<<<<<< FILE_CREATE: " + canonicalTarget + " block with the final content."
+
+		system := prompt.BuildContract()
+
+		req := ai.Request{
+			Model:     m.cfg.ActiveModelName(),
+			System:    system,
+			Stream:    false,
+			MaxTokens: 2000,
+			Messages:  []ai.Message{{Role: "user", Content: handoff}},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		resp, err := m.provider.Execute(ctx, req)
+		cancel()
+		if err != nil {
+			return buildProposalReadyMsg{Err: fmt.Errorf("hybrid template patch failed: %w", err)}
+		}
+		if resp == nil || strings.TrimSpace(resp.Content) == "" {
+			return buildProposalReadyMsg{Err: fmt.Errorf("hybrid template patch returned empty output")}
+		}
+
+		cleaned := sanitizeFileOutput(resp.Content)
+		resolved := execution.ResolveModifiedContent(orig, resp.Content)
+		if resolved == "" {
+			resolved = cleaned
+		}
+
+		diff := computeUnifiedDiff(canonicalTarget, orig, resolved)
+		patch := &execution.Patch{
+			ID:            fmt.Sprintf("hybrid-%d", task.StepNum),
+			File:          canonicalTarget,
+			Original:      orig,
+			Modified:      cleaned,
+			TaskID:        task.StepNum,
+			ContextID:     m.sess.ContextID,
+			IsFullRewrite: true,
+		}
+
+		return buildProposalReadyMsg{
+			Task:   task,
+			Patch:  patch,
+			Diff:   diff,
+			Output: resp.Content,
+		}
+	}
+}
+
+// resolveReferenceTemplate resolves the reference template text for a given
+// trivial template target. For LICENSE files it reads from the embedded license
+// registry; for .gitignore / .env it returns the base generated content.
+// Returns "" when the target is not a trivial template file.
+func resolveReferenceTemplate(target, description string) string {
+	base := strings.ToLower(target)
+	base = strings.TrimSuffix(base, ".md")
+
+	switch base {
+	case "license", "licence":
+		licenseType := detectLicenseType(description)
+		if licenseType == "" {
+			licenseType = "mit"
+		}
+		text, ok := templates.ReadLicenseTemplate(licenseType)
+		if ok {
+			return text
+		}
+		return ""
+	case ".gitignore", "gitignore":
+		return generateGitignore()
+	case ".env", "env", ".env.example", "env.example":
+		return generateEnv()
+	default:
+		return ""
+	}
+}
+
 func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cmd {
 	return func() tea.Msg {
 		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
@@ -2562,6 +2985,27 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// the pipeline in StateAwaitingApproval and renders a unified diff for
 	// explicit authorization (Alt+A / Alt+L / Alt+R).
 	if targetTask.Type == "FILE_MUTATE" || targetTask.Type == "GIT_ACTION" {
+		// ── TRIVIAL TEMPLATE CREATE (local generation, 0 cloud tokens) ─
+		// If the task targets a trivial template file (LICENSE, .gitignore,
+		// .env) AND the description contains no customization directives
+		// (author name, year, refactor, etc.), generate it locally using
+		// Go string templates. This bypasses the LLM entirely — zero HTTP
+		// calls, zero cloud tokens consumed.
+		if targetTask.IsHardcoded && gateway.IsTrivialCreateTarget(targetTask.Target) {
+			if hasCustomizationDirectives(targetTask.Description) {
+				return tea.Batch(
+					func() tea.Msg { return agentStartMsg{label: "hybrid template"} },
+					m.proposeHybridTemplatePatch(targetTask),
+					m.spinnerTickCmd(),
+				)
+			}
+			return tea.Batch(
+				func() tea.Msg { return agentStartMsg{label: "template"} },
+				m.proposeTrivialCreatePatch(targetTask),
+				m.spinnerTickCmd(),
+			)
+		}
+
 		// ── DETERMINISTIC STDLIB FIX (no LLM) ──────────────────────────
 		// Hardcoded stdlib case-correction tasks carry fix parameters in
 		// the Solution field ("STDLIB:symbol:pkgName:importPath"). Apply
