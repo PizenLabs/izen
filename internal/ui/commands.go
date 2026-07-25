@@ -2488,11 +2488,157 @@ func isYear(s string) bool {
 	return n >= 1900 && n <= 2099
 }
 
-// applyHotfixPatch applies a pre-generated $hot patch through the execution
-// engine's PatchManager — never via the conversational stream. It returns a
-// buildResultMsg so the standard update.go handler restores the stashed plan
-// and freezes the pipeline to PAUSED afterwards. On failure the task is marked
-// failed and the buildResultMsg handler rolls back any partial mutation.
+var customizationDirectivePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(?:author|by|copyright|holder|organization)\b`),
+	regexp.MustCompile(`\b(19[0-9][0-9]|20[0-9][0-9])\b`),
+	regexp.MustCompile(`['"][^'"]+['"]`),
+	regexp.MustCompile(`(?i)\brefactor|convert|replace|change|update|modify\b`),
+}
+
+func hasCustomizationDirectives(description string) bool {
+	if description == "" {
+		return false
+	}
+	lower := strings.ToLower(description)
+	for _, pat := range customizationDirectivePatterns {
+		if pat.MatchString(lower) {
+			return true
+		}
+	}
+	return false
+}
+
+// proposeHybridTemplatePatch generates a patch for a trivial template file
+// (LICENSE, .gitignore, .env) by resolving the reference template text and
+// injecting it into the LLM context as a reference, instructing the model to
+// apply the user's specific modifications. This consumes LLM tokens but allows
+// the model to handle author names, year overrides, and other customizations
+// that the static Go template renderer cannot support.
+//
+// If the reference text cannot be resolved (unexpected target) the function
+// falls through to generateTrivialContent — the static template renderer.
+func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
+	return func() tea.Msg {
+		if m.provider == nil {
+			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
+		}
+
+		canonicalTarget := gateway.CanonicalizeFileName(task.Target)
+		task.Target = canonicalTarget
+
+		var orig string
+		if data, rerr := os.ReadFile(canonicalTarget); rerr == nil {
+			orig = string(data)
+		}
+
+		referenceText := resolveReferenceTemplate(canonicalTarget, task.Description)
+		if referenceText == "" {
+			content := generateTrivialContent(canonicalTarget, task.Description)
+			cleaned := execution.SanitizeLLMResponse(content)
+			diff := computeUnifiedDiff(canonicalTarget, orig, cleaned)
+			return buildProposalReadyMsg{
+				Task: task,
+				Patch: &execution.Patch{
+					ID:            fmt.Sprintf("hybrid-%d", task.StepNum),
+					File:          canonicalTarget,
+					Original:      orig,
+					Modified:      cleaned,
+					TaskID:        task.StepNum,
+					ContextID:     m.sess.ContextID,
+					IsFullRewrite: true,
+				},
+				Diff:   diff,
+				Output: cleaned,
+			}
+		}
+
+		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		handoff += "\n\n### REFERENCE TEMPLATE\n"
+		handoff += "Below is the base template text. Apply the user's specific modifications "
+		handoff += "(e.g., author name, year, or content changes) to this text and output "
+		handoff += "the final updated content as a FILE_CREATE block.\n\n"
+		handoff += "```\n" + referenceText + "\n```\n"
+		if orig != "" {
+			handoff += "\n### EXISTING FILE CONTENT\n```\n" + orig + "\n```\n"
+			handoff += "\nThe file already exists. Overwrite it with the modified template content."
+		}
+		handoff += "\n\n### USER REQUEST\n" + task.Description
+		handoff += "\n\nOutput a <<<<<<< FILE_CREATE: " + canonicalTarget + " block with the final content."
+
+		system := prompt.BuildContract()
+
+		req := ai.Request{
+			Model:     m.cfg.ActiveModelName(),
+			System:    system,
+			Stream:    false,
+			MaxTokens: 2000,
+			Messages:  []ai.Message{{Role: "user", Content: handoff}},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		resp, err := m.provider.Execute(ctx, req)
+		cancel()
+		if err != nil {
+			return buildProposalReadyMsg{Err: fmt.Errorf("hybrid template patch failed: %w", err)}
+		}
+		if resp == nil || strings.TrimSpace(resp.Content) == "" {
+			return buildProposalReadyMsg{Err: fmt.Errorf("hybrid template patch returned empty output")}
+		}
+
+		cleaned := sanitizeFileOutput(resp.Content)
+		resolved := execution.ResolveModifiedContent(orig, resp.Content)
+		if resolved == "" {
+			resolved = cleaned
+		}
+
+		diff := computeUnifiedDiff(canonicalTarget, orig, resolved)
+		patch := &execution.Patch{
+			ID:            fmt.Sprintf("hybrid-%d", task.StepNum),
+			File:          canonicalTarget,
+			Original:      orig,
+			Modified:      cleaned,
+			TaskID:        task.StepNum,
+			ContextID:     m.sess.ContextID,
+			IsFullRewrite: true,
+		}
+
+		return buildProposalReadyMsg{
+			Task:   task,
+			Patch:  patch,
+			Diff:   diff,
+			Output: resp.Content,
+		}
+	}
+}
+
+// resolveReferenceTemplate resolves the reference template text for a given
+// trivial template target. For LICENSE files it reads from the embedded license
+// registry; for .gitignore / .env it returns the base generated content.
+// Returns "" when the target is not a trivial template file.
+func resolveReferenceTemplate(target, description string) string {
+	base := strings.ToLower(target)
+	base = strings.TrimSuffix(base, ".md")
+
+	switch base {
+	case "license", "licence":
+		licenseType := detectLicenseType(description)
+		if licenseType == "" {
+			licenseType = "mit"
+		}
+		text, ok := templates.ReadLicenseTemplate(licenseType)
+		if ok {
+			return text
+		}
+		return ""
+	case ".gitignore", "gitignore":
+		return generateGitignore()
+	case ".env", "env", ".env.example", "env.example":
+		return generateEnv()
+	default:
+		return ""
+	}
+}
+
 func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cmd {
 	return func() tea.Msg {
 		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
@@ -2841,9 +2987,18 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	if targetTask.Type == "FILE_MUTATE" || targetTask.Type == "GIT_ACTION" {
 		// ── TRIVIAL TEMPLATE CREATE (local generation, 0 cloud tokens) ─
 		// If the task targets a trivial template file (LICENSE, .gitignore,
-		// .env), generate it locally using Go string templates. This bypasses
-		// the LLM entirely — zero HTTP calls, zero cloud tokens consumed.
+		// .env) AND the description contains no customization directives
+		// (author name, year, refactor, etc.), generate it locally using
+		// Go string templates. This bypasses the LLM entirely — zero HTTP
+		// calls, zero cloud tokens consumed.
 		if targetTask.IsHardcoded && gateway.IsTrivialCreateTarget(targetTask.Target) {
+			if hasCustomizationDirectives(targetTask.Description) {
+				return tea.Batch(
+					func() tea.Msg { return agentStartMsg{label: "hybrid template"} },
+					m.proposeHybridTemplatePatch(targetTask),
+					m.spinnerTickCmd(),
+				)
+			}
 			return tea.Batch(
 				func() tea.Msg { return agentStartMsg{label: "template"} },
 				m.proposeTrivialCreatePatch(targetTask),

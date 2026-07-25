@@ -29,13 +29,16 @@ func init() {
 
 func licenseKey(filename string) string {
 	s := strings.TrimSuffix(filename, ".tpl")
-	s = strings.ReplaceAll(s, "-", " ")
-	s = strings.ToLower(s)
-	return s
+	return registryKey(s)
+}
+
+func registryKey(name string) string {
+	s := strings.ReplaceAll(name, "-", " ")
+	return strings.ToLower(strings.TrimSpace(s))
 }
 
 func RenderLicense(licenseType, prompt string) (string, bool) {
-	key := strings.ToLower(strings.TrimSpace(licenseType))
+	key := registryKey(licenseType)
 	tmpl, ok := registry[key]
 	if !ok {
 		return "", false
@@ -46,4 +49,18 @@ func RenderLicense(licenseType, prompt string) (string, bool) {
 		return "", false
 	}
 	return buf.String(), true
+}
+
+func ReadLicenseTemplate(licenseType string) (string, bool) {
+	key := registryKey(licenseType)
+	_, ok := registry[key]
+	if !ok {
+		return "", false
+	}
+	licenseName := strings.ReplaceAll(key, " ", "-") + ".tpl"
+	data, err := embedFS.ReadFile("licenses/" + licenseName)
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
 }
