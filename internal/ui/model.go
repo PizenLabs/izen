@@ -844,6 +844,9 @@ type model struct {
 	showModelPicker bool
 	modelPicker     *ModelPickerModal
 	sessionModel    string // user-selected model override via /model
+
+	// Foldable execution logs
+	logStore *LogStore
 }
 
 // isProjectInitialized checks whether .izen/ exists AND contains a valid
@@ -1337,6 +1340,21 @@ func (m *model) refreshViewportContent() {
 		content.WriteString(m.renderRecordsWithCursor())
 	} else if m.PreRenderedHistory != "" {
 		content.WriteString(m.PreRenderedHistory)
+	}
+
+	// ── Foldable execution log entries ─────────────────────────────
+	if m.logStore != nil {
+		entries := m.logStore.Entries()
+		if len(entries) > 0 {
+			content.WriteString("\n")
+			content.WriteString(dimmedStyle.Render("── Execution Log ──"))
+			content.WriteString("\n")
+			for _, entry := range entries {
+				rendered := RenderEntry(entry, m.width)
+				content.WriteString(rendered)
+				content.WriteString("\n")
+			}
+		}
 	}
 
 	if m.streaming {

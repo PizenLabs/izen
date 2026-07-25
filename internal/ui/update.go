@@ -1270,6 +1270,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				outcomeLine := fmt.Sprintf("%s %s • %s", successBannerStyle.Render("[✓]"), msg.file, msg.status)
 				m.push(roleSystem, outcomeLine)
 				m.createBuildCheckpoint(1)
+
+				// Log foldable entry for the file mutation.
+				m.logStore.Add(LogEdit, msg.file, true, msg.status)
 				// ── ADVANCE BUILD QUEUE ────────────────────────────────
 				// After a FILE_MUTATE/GIT_ACTION task completes, check for
 				// the next idle task and execute it.
@@ -1295,6 +1298,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else {
 				m.push(roleSystem, failureBannerStyle.Render("[✗] "+msg.file+" — "+msg.err.Error()))
+				m.logStore.Add(LogEdit, msg.file, false, msg.err.Error())
 			}
 		} else {
 			m.state = StateAwaitingApproval
@@ -1313,6 +1317,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, r := range msg.results {
 			if r.err != nil {
 				m.setApplyError("apply failed: " + r.err.Error())
+				m.logStore.Add(LogEdit, r.file, false, r.err.Error())
 				failed++
 				continue
 			}
@@ -1320,6 +1325,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Target: r.file,
 				Status: r.status,
 			})
+			m.logStore.Add(LogEdit, r.file, true, r.status)
 			applied++
 		}
 		m.pendingProposals = nil
@@ -2165,6 +2171,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cfg.Models.SessionModel = msg.model.ID
 		m.IsCloudModel = msg.model.Provider != "ollama"
 
+		// Apply effort/intent level to the config tiers.
+		effort := msg.effort
+		tierKey := effort.ConfigTier()
+		m.cfg.SetTierOverride(tierKey, msg.model.ID)
+
 		modelProvider := msg.model.Provider
 		currentProvider := ""
 		if m.provider != nil {
@@ -2185,7 +2196,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.ti.Focus()
+		effortLabel := msg.effort.Description()
 		m.push(roleSystem, accentStyle.Render(fmt.Sprintf("✓ Model set to %s [%s]", msg.model.Name, msg.model.Provider)))
+		m.push(roleSystem, mutedStyle.Render(fmt.Sprintf("  Effort: %s (%s)", msg.effort, effortLabel)))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m, tea.Batch(cmds...)

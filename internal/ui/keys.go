@@ -21,6 +21,22 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// ── GLOBAL: Ctrl+O toggles the most recent foldable log entry ──
+	if msg.Type == tea.KeyCtrlO {
+		if m.logStore != nil {
+			entries := m.logStore.Entries()
+			if len(entries) > 0 {
+				last := entries[len(entries)-1]
+				m.logStore.Toggle(last.ID)
+				m.refreshViewportContent()
+				if m.Ready && !m.userIsScrollingUp {
+					m.Viewport.GotoBottom()
+				}
+			}
+		}
+		return m, nil
+	}
+
 	// ── GLOBAL: Alt+F / Option+F / Meta+F — Handoff from /ask to /investigate ──
 	// Checks the latest valid /ask Context Ledger (ask_handoff packet), and if
 	// present, transitions to /investigate with the ledger injected as context.

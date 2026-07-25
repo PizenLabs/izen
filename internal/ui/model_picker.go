@@ -12,6 +12,56 @@ import (
 	"github.com/PizenLabs/izen/internal/llm"
 )
 
+// EffortLevel represents the intent/effort slider value.
+type EffortLevel int
+
+const (
+	EffortLow EffortLevel = iota
+	EffortMedium
+	EffortHigh
+)
+
+func (e EffortLevel) String() string {
+	switch e {
+	case EffortLow:
+		return "low"
+	case EffortMedium:
+		return "medium"
+	case EffortHigh:
+		return "high"
+	default:
+		return "low"
+	}
+}
+
+// Description returns a human-readable description of the effort level.
+func (e EffortLevel) Description() string {
+	switch e {
+	case EffortLow:
+		return "Fast-Track / Direct Mutation"
+	case EffortMedium:
+		return "Hybrid Mutation + Local Templates"
+	case EffortHigh:
+		return "Full Senior Architect Mode"
+	default:
+		return "Fast-Track / Direct Mutation"
+	}
+}
+
+// ConfigTier maps effort level to the config tier key.
+func (e EffortLevel) ConfigTier() string {
+	switch e {
+	case EffortLow:
+		return "low_intent"
+	case EffortMedium:
+		return "medium_intent"
+	case EffortHigh:
+		return "high_intent"
+	default:
+		return "low_intent"
+	}
+}
+
 type modelPickerState int
 
 const (
@@ -46,7 +96,21 @@ type ModelPickerModal struct {
 	height   int
 	registry *llm.ModelRegistry
 
+	effortIdx    int // 0=low, 1=medium, 2=high
 	scrollOffset int // row-based offset into buildRows(), NOT an item index
+}
+
+func (mp *ModelPickerModal) CurrentEffort() EffortLevel {
+	switch mp.effortIdx {
+	case 0:
+		return EffortLow
+	case 1:
+		return EffortMedium
+	case 2:
+		return EffortHigh
+	default:
+		return EffortLow
+	}
 }
 
 type modelPickerLoadedMsg struct {
@@ -101,7 +165,8 @@ func (mp *ModelPickerModal) RefreshModels(providers map[string]string) tea.Cmd {
 }
 
 type modelSelectedMsg struct {
-	model llm.ModelInfo
+	model  llm.ModelInfo
+	effort EffortLevel
 }
 
 func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
@@ -149,11 +214,24 @@ func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
 			mp.clampScrollOffset()
 			return mp, nil
 
+		case tea.KeyLeft:
+			if mp.effortIdx > 0 {
+				mp.effortIdx--
+			}
+			return mp, nil
+
+		case tea.KeyRight:
+			if mp.effortIdx < 2 {
+				mp.effortIdx++
+			}
+			return mp, nil
+
 		case tea.KeyEnter:
 			if mp.cursor >= 0 && mp.cursor < len(mp.filtered) {
 				selected := mp.filtered[mp.cursor]
+				effort := mp.CurrentEffort()
 				return mp, func() tea.Msg {
-					return modelSelectedMsg{model: selected}
+					return modelSelectedMsg{model: selected, effort: effort}
 				}
 			}
 			return mp, nil
@@ -346,7 +424,12 @@ func (mp *ModelPickerModal) renderList() string {
 	}
 	b.WriteString("  ")
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Faint(true).Render("Ctrl+R refresh"))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
+
+	// ── Effort / Intent Slider ───────────────────────────────────────────
+	effortRow := mp.renderEffortSlider()
+	b.WriteString(effortRow)
+	b.WriteString("\n")
 
 	// ── Fixed-height, row-based scrolling list ──────────────────────────
 	rows := mp.buildRows()
@@ -408,7 +491,7 @@ func (mp *ModelPickerModal) renderList() string {
 	}
 
 	// ── Footer ──────────────────────────────────────────────────────────
-	footer := mutedStyle.Render("↑↓ navigate  ↵ select  Esc close")
+	footer := mutedStyle.Render("↑↓ navigate  ↵ select  ←→ effort  Esc close")
 	b.WriteString(footer)
 
 	borderColor := lipgloss.Color(colorMauve)
@@ -420,6 +503,53 @@ func (mp *ModelPickerModal) renderList() string {
 		BorderForeground(borderColor).
 		Padding(1, 2).
 		Render(content)
+}
+
+// renderEffortSlider renders the interactive effort/intent slider.
+// Visual layout: low ───○─── medium ────── high
+func (mp *ModelPickerModal) renderEffortSlider() string {
+	levels := []struct {
+		label string
+		desc  string
+	}{
+		{"low", "Fast-Track"},
+		{"medium", "Hybrid"},
+		{"high", "Senior Arch"},
+	}
+
+	trackLen := 6
+	var b strings.Builder
+
+	// Description line
+	effort := mp.CurrentEffort()
+	desc := dimmedStyle.Render(effort.Description())
+	b.WriteString("  " + mutedStyle.Render("Effort:") + " " + desc + "\n")
+
+	// Slider track
+	b.WriteString("  ")
+	for i, lvl := range levels {
+		if i == mp.effortIdx {
+			b.WriteString(greenStyle.Render(lvl.label))
+		} else {
+			b.WriteString(dimmedStyle.Render(lvl.label))
+		}
+		if i < len(levels)-1 {
+			b.WriteString(" ")
+			for j := 0; j < trackLen; j++ {
+				switch {
+				case i == mp.effortIdx && j == 0:
+					b.WriteString(greenStyle.Render("●"))
+				case i < mp.effortIdx && j == trackLen-1:
+					b.WriteString(greenStyle.Render("●"))
+				default:
+					b.WriteString(dimmedStyle.Render("─"))
+				}
+			}
+			b.WriteString(" ")
+		}
+	}
+
+	return b.String()
 }
 
 func providerAuthStatus(provider string) string {

@@ -48,6 +48,7 @@ func newTestModel() *model {
 		state:      StateAwaitingApproval,
 		Ready:      true,
 		Viewport:   vp,
+		logStore:   NewLogStore(),
 		pendingProposals: []SemanticProposal{
 			{
 				ID:       "test-1",
