@@ -8,39 +8,54 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 )
 
-// RuntimeFacts are facts supplied externally by the runtime (e.g. the engineer
-// identity). The registry never contains engineering philosophy or mode logic;
-// its only responsibility is composition:
+// RuntimeFacts are externally supplied facts about the runtime environment.
+// The registry's only responsibility is composition:
 //
-//	Common Contract + Mode Contract + Runtime Facts
+//	Identity Header + Common Contract + Mode Contract + Environment Context
 type RuntimeFacts struct {
-	// Username is the collaborating engineer's identity. Empty falls back to "developer".
+	// Username is the collaborating engineer's identity. Empty falls back to "Developer".
 	Username string
-	// HostOS is the host operating system (runtime.GOOS) the agent runs on.
-	// When populated it anchors command generation to the real environment so
-	// the model does not hallucinate OS-specific commands (e.g. `apt-get` on
-	// macOS). Empty means "unknown" — the constraint is omitted.
+	// HostOS is the host operating system (runtime.GOOS). When set, anchors
+	// command generation to the real environment so the model never hallucinate
+	// OS-specific commands (e.g. `apt-get` on macOS). Empty → constraint omitted.
 	HostOS string
 }
 
-// Compose assembles the full system prompt for a mode from the constitutional
-// common contract plus the mode's operational contract plus externally supplied
-// runtime facts. The common and mode contracts are concatenated; no philosophy
-// is duplicated because each lives in exactly one place.
+// identityHeader returns the single, canonical engineer-identity statement.
+// Called once per Compose invocation — never duplicated in individual contracts.
+func identityHeader(username string) string {
+	return fmt.Sprintf(
+		"You are IZEN. The engineer collaborating with you is '%s'. "+
+			"This is an invariant fact for the entire session: "+
+			"NEVER say you don't know their name, ask them for it, or claim it wasn't provided. "+
+			"When asked, identify them as '%s'.\n\n",
+		username, username,
+	)
+}
+
+// Compose assembles the full system prompt:
+//
+//	Identity Header → Common Contract → Mode Contract → Environment Context (optional)
+//
+// Each section lives in exactly one place; nothing is duplicated.
 func Compose(modeContract string, facts RuntimeFacts) string {
 	var b strings.Builder
+
 	username := config.SanitizeUsername(facts.Username)
 	if username == "" {
 		username = "Developer"
 	}
-	fmt.Fprintf(&b, "You are IZEN. The human engineer you are collaborating with is named '%s'. This is a hard, invariant fact for the entire session — you MUST remember it and NEVER say you do not know their name, never ask them to tell you their name, and never claim the name was not provided. When asked about the user's identity, answer that they are '%s'.", username, username)
+
+	b.WriteString(identityHeader(username))
 	b.WriteString(CommonContract())
 	b.WriteString("\n\n")
 	b.WriteString(modeContract)
+
 	if facts.HostOS != "" {
 		b.WriteString("\n\n")
 		b.WriteString(EnvironmentContextForOS(facts.HostOS))
 	}
+
 	return b.String()
 }
 
@@ -68,26 +83,16 @@ func InvestigateSystemPrompt() string {
 }
 
 // AskPromptHandoffSystemPrompt returns the composed system prompt for the
-// $prompt handoff synthesis in ask mode. It combines the common contract with
-// the handoff template so the LLM restructures raw chat history into the
-// IZEN INTELLIGENT PROMPT HANDOFF PACK format.
+// $prompt handoff synthesis in ask mode. Composes via the standard pipeline
+// (no manual identity duplication).
 func AskPromptHandoffSystemPrompt(username string) string {
 	if username == "" {
 		username = "Developer"
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "You are IZEN. The human engineer you are collaborating with is named '%s'. This is a hard, invariant fact for the entire session — you MUST remember it and NEVER say you do not know their name, never ask them to tell you their name, and never claim the name was not provided. When asked about the user's identity, answer that they are '%s'.", username, username)
-	b.WriteString(CommonContract())
-	b.WriteString("\n\n")
-	b.WriteString(AskPromptHandoffContract())
-	if runtime.GOOS != "" {
-		b.WriteString("\n\n")
-		b.WriteString(EnvironmentContextForOS(runtime.GOOS))
-	}
-	return b.String()
+	return Compose(AskPromptHandoffContract(), RuntimeFacts{Username: username, HostOS: runtime.GOOS})
 }
 
-// ForMode returns the composed system prompt for the named mode.
+// ForMode returns the composed system prompt for the named mode with default identity.
 func ForMode(mode string) string {
 	return ForModeWithUser(mode, "Developer")
 }
@@ -111,24 +116,17 @@ func ForModeWithUser(mode, username string) string {
 	}
 }
 
-// BuildMessage composes a system prompt and a user message into a single string.
-func BuildMessage(mode, userContent string) string {
-	sys := ForMode(mode)
-	if sys == "" {
-		return userContent
-	}
-	return fmt.Sprintf("System: %s\n\nUser: %s", sys, userContent)
-}
-
-// IdentityStatement returns a short, standalone identity fact for injection
-// directly into the message array on every LLM turn. This is separate from
-// the system prompt so it lands near the user's current message in the
-// model's context window — critical for smaller models that poorly attend
-// to the system prompt.
+// IdentityStatement returns a compact identity fact for injection into the
+// message array on every LLM turn. This lands near the user's current message
+// in the context window — useful for smaller models that poorly attend to the
+// system prompt. Returns empty string when username is blank.
 func IdentityStatement(username string) string {
 	name := config.SanitizeUsername(username)
 	if name == "" {
 		return ""
 	}
-	return fmt.Sprintf("Remember: you are IZEN. The human talking to you is named '%s'. Never refer to yourself as %s. Always address the human as %s.", name, name, name)
+	return fmt.Sprintf(
+		"[IZEN] You are IZEN. The human talking to you is '%s'. Address them as '%s'.",
+		name, name,
+	)
 }

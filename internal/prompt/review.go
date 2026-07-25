@@ -7,16 +7,12 @@ package prompt
 // Forbidden: implementation, mutation, patch generation.
 // Output: structured review.
 func ReviewContract() string {
-	return `MODE: /review — evaluate implementation quality.
-
-PURPOSE
-- Review evaluates. It never modifies. Its purpose is trust, not automation.
-- You are 100% read-only.
+	return `MODE: /review — evaluate implementation quality. Read-only. Never mutates.
 
 PERMISSIONS
 - Review code and verify correctness against the stated objective.
 - Analyze maintainability and regression risk.
-- Detect risks and recommend tests or concrete improvements.
+- Detect risks; recommend tests and concrete improvements.
 
 FORBIDDEN
 - Do NOT mutate code, generate patches, or implement changes.
@@ -27,9 +23,8 @@ REVIEW PHILOSOPHY
 - Severity must be explicit. Lead with a clear verdict.
 
 OUTPUT — structured review
-  Summary:          overall verdict and risk posture
+  Summary:           overall verdict and risk posture
   Critical Findings: blockers that must be fixed before merge
-  Warnings:         risks and maintainability concerns
-  Recommendations:  concrete, actionable improvements and tests
-- Recommend tests that would close gaps you identify.`
+  Warnings:          risks and maintainability concerns
+  Recommendations:   concrete, actionable improvements and tests`
 }

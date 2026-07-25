@@ -5,30 +5,28 @@ import (
 	"runtime"
 )
 
-// EnvironmentContext returns a compact, authoritative statement of the host
-// runtime environment (using the actual runtime.GOOS/GOARCH). Injecting this
-// into the /plan (and /build) prompts anchors the model to the ACTUAL
-// operating system so it does not hallucinate platform-specific commands for
-// the wrong OS (e.g. `apt-get`/`sudo` on a macOS host where `brew`/`go install`
-// are correct).
+// EnvironmentContext returns a compact, authoritative host runtime statement
+// using the actual runtime.GOOS/GOARCH. Injecting this anchors the model to
+// the ACTUAL operating system so it never hallucinate OS-specific commands
+// (e.g. `apt-get` on a macOS host where `brew`/`go install` are correct).
 func EnvironmentContext() string {
 	return EnvironmentContextForOS(runtime.GOOS)
 }
 
-// EnvironmentContextForOS is the OS-parameterised variant used by the central
-// prompt composer (registry.Compose), which receives the host OS from the
-// runtime and threads it into every mode's system prompt.
+// EnvironmentContextForOS is the OS-parameterised variant used by Compose,
+// which receives the host OS from the runtime and threads it into every mode.
 func EnvironmentContextForOS(os string) string {
 	arch := runtime.GOARCH
 	manager := osPackageManager(os)
-	return fmt.Sprintf("HOST ENVIRONMENT CONSTRAINT — you are executing on %s/%s. "+
-		"Generate commands ONLY for this OS. Preferred package/tooling command for this OS: %s. "+
-		"NEVER emit commands for another OS (e.g. do not use `apt-get`/`apt`/`yum`/`dnf` on %s).",
-		os, arch, manager, os)
+	return fmt.Sprintf(
+		"HOST ENVIRONMENT: %s/%s. Generate commands ONLY for this OS. "+
+			"Preferred tooling: %s. "+
+			"NEVER emit commands for another OS (e.g. no `apt-get`/`apt`/`yum`/`dnf` on %s).",
+		os, arch, manager, os,
+	)
 }
 
-// osPackageManager maps a host OS to its correct package/dependency tooling,
-// so the plan engine proposes the right command for the actual environment.
+// osPackageManager maps a host OS to its correct package/dependency tooling.
 func osPackageManager(os string) string {
 	switch os {
 	case "darwin":
@@ -43,85 +41,92 @@ func osPackageManager(os string) string {
 }
 
 // PlanContract defines the behavioral contract for /plan mode.
-// Phase 2 (Lightweight Execution Mapper): /plan is a deterministic transformer.
-// It does NOT re-analyze root cause. It reads the compact Forensic Ledger JSON
-// from /investigate and maps it directly to structural atomic_tasks and the
-// architectural_strategy. No conversational filler, no re-investigation.
+// Phase 2 (Lightweight Execution Mapper): reads the compact Forensic Ledger
+// from /investigate and maps it directly to structural atomic_tasks. No
+// re-analysis, no conversational filler.
 func PlanContract() string {
 	return `MODE: /plan — Structural Architecture Synthesis
 
-ROLE
-- You are a Senior Principal Structural Architect.
+ROLE: Senior Principal Structural Architect.
 - Read the pre-compiled Forensic Ledger from /investigate.
-- Synthesize a structured architectural plan with Root Core Factor, Impact Domain, Risk Evaluation, and Verification Vector.
-- Each task MUST include: track classification, rationale (why), and expected solution (end state).
+- Synthesize a structured plan: Root Core Factor, Impact Domain, Risk Evaluation, Verification Vector.
+- Every task MUST include: track classification, rationale (why), expected solution (end state).
 - Do NOT re-analyze, re-investigate, or question the ledger.
 
 PROTOCOL
-1. Read the Forensic Ledger below (compact JSON from /investigate).
-2. Identify the Root Core Factor — one sentence describing the fundamental root cause.
+1. Read the Forensic Ledger (compact JSON from /investigate).
+2. Identify the Root Core Factor — one sentence stating the fundamental root cause.
 3. Map root_cause → Task 1 (always the dependency/code fix).
 4. Map targets → FILE_MUTATE tasks at exact {file, line} coordinates.
 5. End with a verification task when applicable.
-6. For EVERY task, provide:
-   - rationale: why this task is necessary (architectural/technical reason)
-   - solution: what the expected end state looks like after this task completes
+6. For EVERY task provide: rationale (why this task is necessary) and solution (expected end state).
 7. Output ONLY the JSON schema — zero explanation, zero commentary.
 
-	GO DEPENDENCY FACTORY TEMPLATE (STRICT)
+GO DEPENDENCY RULE (STRICT)
 For missing Go package/module errors ("no required module provides package"):
-  CRITICAL: Extract the EXACT package path from the ledger conclusion (e.g., go get github.com/docker/docker/client). NEVER output literal angle brackets like <exact_package_path>.
-  PERMITTED: SHELL_EXEC with the actual package path from the ledger.
-  FORBIDDEN in command string:
-    - File names: go.mod, go.sum
-    - Relative paths: any path/to/file.go or ./path/ patterns
-    - Generalized text: prose, descriptions, or natural language
-    - brew, docker, apt, or any OS-level command
-    - Angle-bracket placeholders like <package> or <exact_package_path>
-  The command MUST be a single, runnable shell invocation — not a file path.
+- Extract the EXACT package path from the ledger conclusion.
+- Emit EXACTLY ONE SHELL_EXEC task: "go get <real_package_path>".
+- Total JSON MUST stay under 300 tokens.
+- FORBIDDEN in command string: file names (go.mod, go.sum), relative paths, prose, brew/docker/apt, angle-bracket placeholders.
 
-SINGLE-TASK MANDATE (7B TRUNCATION PREVENTION)
-If the root_cause is a missing Go package (e.g. "no required module provides package"),
-emit EXACTLY ONE task: SHELL_EXEC with go get <THE_EXACT_PACKAGE_FROM_THE_LEDGER>.
-YOU MUST substitute the real package path — do NOT output literal angle-bracket text.
-No FILE_MUTATE, no GIT_ACTION, no brew/docker/environment tasks.
-Total JSON MUST stay under 300 tokens.
-
-ANTI-HALLUCINATION (LOCAL 7B MODELS)
-- If the ledger says "missing module X", Task 1 IS "go get X".
-- Do NOT add brew install go, brew install docker, or any OS-level setup.
+ANTI-HALLUCINATION
+- Missing module X → Task 1 IS "go get X". No brew, no docker, no OS-level setup.
 - Never propose installing Go, Docker, or compilers — they already run.
-- Keep tasks strictly at the code/dependency boundary.
-- CRITICAL: the SHELL_EXEC target must be a real command (e.g. "go get github.com/foo/bar"),
-  NOT a file path or placeholder text. Commands like "relative/path/to/go.mod",
-  "./go.mod", or bare "go.mod" as the target are INVALID and will be rejected.
+- SHELL_EXEC target MUST be a real runnable command (e.g. "go get github.com/foo/bar"), NOT a file path or placeholder.
 
 RULES
 - Tasks MUST be atomic, independently verifiable, ordered by dependency.
 - Missing dependency → Task 1 MUST be SHELL_EXEC with the exact install command.
 - FILE_MUTATE tasks MUST target the exact relative file path and line.
-- End with a verification task when supported by the evidence.
-- Tool constraint: use native Go tooling FIRST (` + "`go get`" + `, ` + "`go mod tidy`" + `, ` + "`go install`" + `).
-  Never default to system-level binaries (` + "`brew install`" + `, ` + "`docker`" + `).` +
-		"\n"
+- Use native Go tooling first (` + "`go get`" + `, ` + "`go mod tidy`" + `, ` + "`go install`" + `). Never default to ` + "`brew install`" + ` or ` + "`docker`" + `.`
 }
 
-// BuildPlanJSONPrompt builds the strict JSON prompt consumed by the TUI parser.
-// Phase 2: Lightweight — reads the compact ledger, maps to tasks, no re-analysis.
-// When isDirectMutation is true, skips EnvironmentContext() and PlanContract
-// injection — the prompt is constrained to raw JSON with max_tokens: 150.
-func BuildPlanJSONPrompt(problem, ledgerContent, conclusion string, isDirectMutation bool) string {
-	if isDirectMutation {
-		conclusionBlock := ""
-		if conclusion != "" {
-			conclusionBlock = fmt.Sprintf(`
+// planDirectives are the shared DIRECTIVES rules for BuildPlanJSONPrompt.
+// Extracted to eliminate copy-paste between the isDirectMutation branches.
+const planDirectives = `DIRECTIVES
+- Map root_cause → Task 1: SHELL_EXEC for dep issues, FILE_MUTATE for code bugs.
+- Go missing module → emit EXACTLY ONE task: {"task_id":1,"strategy":"SHELL_EXEC","target":"go get <real_package>","description":"install missing dependency","rationale":"<why>","solution":"<end state>"}. Use the ACTUAL package path — never literal angle brackets.
+- FORBIDDEN as SHELL_EXEC target: file paths (go.mod, go.sum, ./relative/path), prose, or any non-runnable text.
+- Do NOT add brew, docker, or environment setup tasks.`
+
+// conclusionBlock formats the authoritative ledger conclusion block, or
+// returns an empty string when conclusion is empty.
+func conclusionBlock(conclusion string) string {
+	if conclusion == "" {
+		return ""
+	}
+	return fmt.Sprintf(`
 CONCLUSION FROM LEDGER (authoritative — do not override)
 %s
 
 CRITICAL: Map this conclusion directly to a SHELL_EXEC task if dependency-related.
-The SHELL_EXEC target MUST be a valid command with the ACTUAL package path from the ledger (e.g., "go get github.com/docker/docker/client"), not a file path or angle-bracket placeholder.`, conclusion)
-		}
+The SHELL_EXEC target MUST be a valid command with the ACTUAL package path (e.g. "go get github.com/docker/docker/client"), not a file path or placeholder.`,
+		conclusion)
+}
 
+// planJSONSchema is the canonical output schema for BuildPlanJSONPrompt.
+const planJSONSchema = `{
+  "context_anchor": {"source": "investigate-ledger", "target_packages": ["pkg"]},
+  "architectural_strategy": "single sentence",
+  "strategic_overview": {
+    "root_core_factor": "fundamental root cause",
+    "impact_domain": "architectural layer affected",
+    "risk_evaluation": "Low | Medium | High | Critical",
+    "verification_vector": "how correctness will be verified"
+  },
+  "atomic_tasks": [
+    {"task_id": 1, "file": "relative/path", "strategy": "SHELL_EXEC", "description": "title", "rationale": "why this task is needed", "solution": "expected end state"}
+  ]
+}`
+
+// BuildPlanJSONPrompt builds the strict JSON prompt consumed by the TUI parser.
+// Phase 2: Lightweight — reads the compact ledger, maps to tasks, no re-analysis.
+// When isDirectMutation is true, omits EnvironmentContext and constrains output
+// to max_tokens: 150.
+func BuildPlanJSONPrompt(problem, ledgerContent, conclusion string, isDirectMutation bool) string {
+	cb := conclusionBlock(conclusion)
+
+	if isDirectMutation {
 		return fmt.Sprintf(`You are the IZEN Plan Mapper. Read the /investigate Forensic Ledger below and produce a JSON plan.
 
 INPUT:
@@ -129,42 +134,15 @@ PROBLEM: %s
 FORENSIC LEDGER:
 %s%s
 
-DIRECTIVES:
-- Map root_cause → Task 1 (SHELL_EXEC for dep issues, FILE_MUTATE for code bugs).
-- If root_cause is a missing Go module, emit EXACTLY: {"task_id":1,"strategy":"SHELL_EXEC","target":"go get <THE_ACTUAL_PACKAGE>","description":"install missing dependency","rationale":"why this is needed","solution":"expected end state"}. Substitute the real package path — NEVER output literal angle brackets.
-- FORBIDDEN as SHELL_EXEC target: file paths (go.mod, go.sum, ./relative/path), generalized text, or prose.
-  The target field MUST be a runnable shell command starting with a binary name.
-- Do NOT add brew, docker, or environment setup tasks.
+%s
 - Total JSON under 150 tokens.
 
 OUTPUT — raw JSON only, no fences, no comments:
-{
-  "context_anchor": {"source": "investigate-ledger", "target_packages": ["pkg"]},
-  "architectural_strategy": "single sentence",
-  "strategic_overview": {
-    "root_core_factor": "The fundamental root cause driving this plan",
-    "impact_domain": "Architectural layer affected",
-    "risk_evaluation": "Low / Medium / High / Critical",
-    "verification_vector": "How correctness will be verified"
-  },
-  "atomic_tasks": [
-    {"task_id": 1, "file": "relative/path", "strategy": "SHELL_EXEC", "description": "title", "rationale": "why this task is needed", "solution": "expected end state"}
-  ]
-}`,
-			problem,
-			ledgerContent,
-			conclusionBlock,
+%s`,
+			problem, ledgerContent, cb,
+			planDirectives,
+			planJSONSchema,
 		)
-	}
-
-	conclusionBlock := ""
-	if conclusion != "" {
-		conclusionBlock = fmt.Sprintf(`
-CONCLUSION FROM LEDGER (authoritative — do not override)
-%s
-
-CRITICAL: Map this conclusion directly to a SHELL_EXEC task if dependency-related.
-The SHELL_EXEC target MUST be a valid command with the ACTUAL package path from the ledger (e.g., "go get github.com/docker/docker/client"), not a file path or angle-bracket placeholder.`, conclusion)
 	}
 
 	return fmt.Sprintf(`You are the IZEN Plan Mapper. Read the /investigate Forensic Ledger below and produce a JSON plan.
@@ -176,41 +154,34 @@ PROBLEM: %s
 FORENSIC LEDGER:
 %s%s
 
-DIRECTIVES:
-- Map root_cause → Task 1 (SHELL_EXEC for dep issues, FILE_MUTATE for code bugs).
-- If root_cause is a missing Go module, emit EXACTLY: {"task_id":1,"strategy":"SHELL_EXEC","target":"go get <THE_ACTUAL_PACKAGE>","description":"install missing dependency","rationale":"why this is needed","solution":"expected end state"}. Substitute the real package path — NEVER output literal angle brackets.
-- For EVERY task, provide rationale (why) and solution (expected end state).
-- Include a root_core_factor sentence in strategic_overview describing the fundamental root cause.
-- FORBIDDEN as SHELL_EXEC target: file paths (go.mod, go.sum, ./relative/path), generalized text, or prose.
-  The target field MUST be a runnable shell command starting with a binary name.
-- Do NOT add brew, docker, or environment setup tasks.
+%s
+- For EVERY task provide rationale (why) and solution (expected end state).
+- Include root_core_factor in strategic_overview describing the fundamental root cause.
 - Total JSON under 300 tokens.
 
 OUTPUT — raw JSON only, no fences, no comments:
-{
-  "context_anchor": {"source": "investigate-ledger", "target_packages": ["pkg"]},
-  "architectural_strategy": "single sentence",
-  "strategic_overview": {
-    "root_core_factor": "The fundamental root cause driving this plan",
-    "impact_domain": "Architectural layer affected",
-    "risk_evaluation": "Low / Medium / High / Critical",
-    "verification_vector": "How correctness will be verified"
-  },
-  "atomic_tasks": [
-    {"task_id": 1, "file": "relative/path", "strategy": "SHELL_EXEC", "description": "title", "rationale": "why this task is needed", "solution": "expected end state"}
-  ]
-}`,
+%s`,
 		EnvironmentContext(),
-		problem,
-		ledgerContent,
-		conclusionBlock,
+		problem, ledgerContent, cb,
+		planDirectives,
+		planJSONSchema,
 	)
 }
 
+// planTaskBlocks is the shared output format for BuildPlanPrompt.
+const planTaskBlocks = `OUTPUT — raw task blocks only, no prose:
+- [ ] SHELL_EXEC: <exact_command> | <rationale>
+- [ ] FILE_MUTATE: <relative_path> | <description>
+- [ ] SHELL_EXEC: <verification> | verify
+
+RULES
+- Missing Go dependency → output EXACTLY ONE SHELL_EXEC task with the ACTUAL package path (e.g. "go get github.com/docker/docker/client"). NOT a file path or placeholder.
+- FORBIDDEN as SHELL_EXEC target: "go.mod", "go.sum", relative paths, or any non-command text.
+- No brew, docker, or OS-level environment tasks. Stay at the code/dependency boundary.`
+
 // BuildPlanPrompt builds the compact Markdown prompt for user-facing terminal output.
 // Phase 2: Stripped down — the LLM returns data, UI handles rendering.
-// When isDirectMutation is true, skips EnvironmentContext() and constrains
-// output to raw task blocks only with max_tokens: 150.
+// When isDirectMutation is true, constrains output to raw task blocks only.
 func BuildPlanPrompt(objective, contextStr string, isDirectMutation bool) string {
 	if isDirectMutation {
 		return fmt.Sprintf(`%s
@@ -218,19 +189,9 @@ func BuildPlanPrompt(objective, contextStr string, isDirectMutation bool) string
 USER OBJECTIVE
 %s
 
-OUTPUT — raw task blocks only, no prose:
-- [ ] SHELL_EXEC: <exact_command> | <rationale>
-- [ ] FILE_MUTATE: <relative_path> | <description>
-- [ ] SHELL_EXEC: <verification> | verify
-
-RULES:
-- If a missing Go dependency is the root cause, output EXACTLY ONE SHELL_EXEC task.
-- The SHELL_EXEC command MUST be a runnable invocation with the ACTUAL package path (e.g. "go get github.com/docker/docker/client"), NOT a file path or angle-bracket placeholder.
-- FORBIDDEN as SHELL_EXEC target: "go.mod", "go.sum", relative paths, or any text that is not a valid command.
-- Keep the plan strictly at the code/dependency boundary.
+%s
 - Total output under 150 tokens.`,
-			contextStr,
-			objective,
+			contextStr, objective, planTaskBlocks,
 		)
 	}
 
@@ -241,31 +202,20 @@ RULES:
 USER OBJECTIVE
 %s
 
-OUTPUT — raw task blocks only, no prose:
-- [ ] SHELL_EXEC: <exact_command> | <rationale>
-- [ ] FILE_MUTATE: <relative_path> | <description>
-- [ ] SHELL_EXEC: <verification> | verify
-
-RULES:
-- If a missing Go dependency is the root cause, output EXACTLY ONE SHELL_EXEC task.
-- The SHELL_EXEC command MUST be a runnable invocation with the ACTUAL package path (e.g. "go get github.com/docker/docker/client"), NOT a file path or angle-bracket placeholder.
-- FORBIDDEN as SHELL_EXEC target: "go.mod", "go.sum", relative paths, or any text that is not a valid command.
-- No brew, docker, or OS-level environment tasks.
-- Keep the plan strictly at the code/dependency boundary.`,
+%s`,
 		contextStr,
 		EnvironmentContext(),
 		objective,
+		planTaskBlocks,
 	)
 }
 
 // PlanDirectMutationSystemPrompt returns a zero-prose system prompt for
 // direct file mutations (e.g. refactor LICENSE, change config). Unlike
-// PlanSystemPrompt, it omits all analysis sections (no CONTEXT & ROLE, no
-// FORENSIC HANDOFF VECTOR) and instructs the model to output ONLY the
-// direct task item for execution.
+// PlanSystemPrompt, it omits all analysis sections and instructs the model
+// to output ONLY the direct task item for execution.
 func PlanDirectMutationSystemPrompt() string {
 	return "STRICT RULE: Direct file mutation detected.\n" +
-		"Do NOT output analysis sections (no CONTEXT & ROLE, no FORENSIC HANDOFF).\n" +
 		"Output ONLY the direct task item for execution.\n" +
-		"No preamble, no summary, no verification steps unless explicitly needed."
+		"No CONTEXT & ROLE, no FORENSIC HANDOFF, no preamble, no summary."
 }
