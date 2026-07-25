@@ -289,14 +289,18 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			MaxTokens: 500,
 		}
 	} else {
-		// ── DIRECT MUTATION ZERO-PROSE PROMPT ─────────────
+		// ── COMPLEXITY-CONDITIONAL SYSTEM PROMPT ──────────
+		// Assess heuristic complexity from the problem text. LOW and MEDIUM
+		// complexity tasks (standard code changes, config edits, unit tests)
+		// receive the compact 3-bullet checklist prompt — no verbose Senior
+		// Architect analysis. HIGH complexity or explicit high-intent flags
+		// get the full prose treatment.
 		// When the problem/ledger indicates a direct file mutation
 		// (refactor, convert, replace, etc.), use the zero-prose
-		// system prompt that skips all Senior Architect analysis
-		// sections (no CONTEXT & ROLE, no FORENSIC HANDOFF VECTOR).
-		// Forces the LLM to output only the direct task item.
+		// system prompt that skips all analysis entirely.
 		isDirectMut := detectDirectMutation(problem, ledgerContent) != nil
-		systemPrompt := prompt.PlanSystemPrompt() + "\n\n" + SchemaJSONInstruction()
+		hasHighFlag := strings.Contains(problem, "--high") || strings.Contains(problem, "/intent high")
+		systemPrompt := prompt.SelectPlanSystemPrompt(problem, hasHighFlag) + "\n\n" + SchemaJSONInstruction()
 		if isDirectMut {
 			systemPrompt = prompt.PlanDirectMutationSystemPrompt()
 		}
@@ -1038,13 +1042,14 @@ func (e *Engine) ProcessPlan(ctx context.Context, modelName string, objective st
 	}
 
 	isDirectMut := detectDirectMutation(objective, "") != nil
+	hasHighFlag := strings.Contains(objective, "--high") || strings.Contains(objective, "/intent high")
 
 	req := ai.Request{
 		Model: modelName,
 		Messages: []ai.Message{
 			{
 				Role:    "system",
-				Content: prompt.PlanSystemPrompt() + "\n\n" + SchemaJSONInstruction(),
+				Content: prompt.SelectPlanSystemPrompt(objective, hasHighFlag) + "\n\n" + SchemaJSONInstruction(),
 			},
 			{
 				Role:    "user",

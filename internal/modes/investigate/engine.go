@@ -142,6 +142,34 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 		Problem: e.Problem,
 	}
 
+	// ── DEADLOCK PREVENTION: NON-BUG INTENT SHORT-CIRCUIT ──────────────
+	// /investigate is STRICTLY read-only for bug diagnostics. When the
+	// intent is FeatureUnitTest, Refactor, or any code creation/mutation
+	// (detected by mutation verbs in the problem text), exit immediately
+	// with a handoff signal instead of looping through the forensic state
+	// machine. This prevents the infamous "investigate deadlock" where the
+	// engine keeps looping over test output for a task that requires writing
+	// code, not diagnosing bugs.
+	//
+	// The short-circuit produces:
+	//   - No forensic evidence (no test execution, no LX lookups)
+	//   - A clear conclusion: "code mutation intent detected — hand off to build"
+	//   - Resolved=false so the caller knows investigation was not the right mode
+	if e.mustShortCircuitToBuild() {
+		forensicLog("[deadlock-guard] non-bug intent detected — short-circuiting /investigate → /build handoff")
+		result.Resolved = false
+		result.Conclusion = "code mutation intent detected — hand off to build"
+		result.RootCause = ""
+		result.Loops = 0
+		result.Duration = time.Since(e.startedAt).Round(time.Millisecond).String()
+		e.Ledger.Conclusion = result.Conclusion
+		e.Ledger.SetRootCause("")
+		// Override diagnostics with a clear signal to the plan/build handoff.
+		e.Ledger.SetDiagnostics(result.Conclusion)
+		e.Result = result
+		return result, nil
+	}
+
 	for !e.State.ShouldStop() {
 		select {
 		case <-ctx.Done():
@@ -736,6 +764,41 @@ func (e *Engine) statePropose() error {
 	}
 
 	return e.State.Transition(StateDone)
+}
+
+// mutationIntentKeywords are phrases that clearly indicate the user wants to
+// create or modify code — not diagnose a bug. When detected in the problem text,
+// the investigate engine short-circuits to avoid the deadlock loop.
+var mutationIntentKeywords = []string{
+	"write test", "unit test", "test case", "test suite",
+	"add test", "create test", "implement test",
+	"add feature", "new feature", "implement feature",
+	"write code", "generate code", "stub", "mock",
+	"implement", "refactor", "restructure", "reorganize",
+	"add function", "create function", "add method", "create method",
+	"write function",
+}
+
+// mustShortCircuitToBuild returns true when the investigation should exit
+// immediately and hand off to /build instead of running the forensic state
+// machine. This prevents the "investigate deadlock" on code creation intents.
+//
+// Detection rules:
+//  1. Explicit intent set to FeatureUnitTest or Refactor → short-circuit.
+//  2. Problem text contains mutation intent keywords → short-circuit.
+//  3. Any $hot prefix → short-circuit (already handled at gateway, but
+//     double-check here as a safety net).
+func (e *Engine) mustShortCircuitToBuild() bool {
+	if !e.Intent.IsEnvDepsAllowed() {
+		return true
+	}
+	lower := strings.ToLower(e.Problem)
+	for _, kw := range mutationIntentKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return strings.HasPrefix(strings.TrimSpace(e.Problem), "$hot")
 }
 
 // deriveRootCause extracts a root cause description from the investigation result.

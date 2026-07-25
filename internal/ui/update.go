@@ -364,18 +364,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(msg.records) == 0 {
 			m.push(roleSystem, "Investigation complete — no structured findings to report.")
 		}
-		m.push(roleStatus, "Investigation complete. Auto-transitioning to /plan for execution synthesis...")
 
-		// ── AUTO-HANDOFF: /investigate -> /plan ────────────────────────────
-		// Once investigation completes with a valid Context Ledger, automatically
-		// transition to /plan to synthesize the structured execution timeline.
-		// The plan will be rendered for user review (Approve, Edit, Add/Remove,
-		// Reject) — automatic execution without human approval is strictly forbidden.
-		m.handoffCtx.ProposedFix = m.handoffLedgerContent
+		// ── AUTO-HANDOFF: /investigate -> /build (mutation) or /plan (diagnostic) ──
+		// When the investigate engine short-circuited with a code mutation intent
+		// ("code mutation intent detected — hand off to build"), route directly to
+		// /build to skip the plan synthesis step entirely. For bug diagnostics,
+		// route to /plan as normal.
 		var cmds []tea.Cmd
-		if m.handoffLedgerContent != "" {
+		if strings.Contains(m.handoffLedgerContent, "code mutation intent detected") {
+			m.push(roleStatus, "Code mutation intent — routing directly to /build, bypassing /plan")
 			m.modeChangeAuthorized = true
-			cmds = append(cmds, m.setMode(modes.ModePlan))
+			cmds = append(cmds, m.setMode(modes.ModeBuild))
+		} else {
+			m.push(roleStatus, "Investigation complete. Auto-transitioning to /plan for execution synthesis...")
+			m.handoffCtx.ProposedFix = m.handoffLedgerContent
+			if m.handoffLedgerContent != "" {
+				m.modeChangeAuthorized = true
+				cmds = append(cmds, m.setMode(modes.ModePlan))
+			}
 		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()

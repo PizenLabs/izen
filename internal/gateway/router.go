@@ -8,6 +8,9 @@ import (
 	"github.com/PizenLabs/izen/internal/command"
 )
 
+// hotPrefixPattern matches the $hot fast-track prefix optionally followed by a modifier.
+var hotPrefixPattern = regexp.MustCompile(`^\$hot(?:\s|$)`)
+
 // commandPrefixPattern matches known router/CLI prefixes like $prompt, /plan, etc.
 var commandPrefixPattern = regexp.MustCompile(`^(?:\$prompt\s+|\$ask\s+|/plan\s+|/build\s+)?`)
 
@@ -274,6 +277,78 @@ func extractBareFilenames(msg string) []string {
 	}
 
 	return files
+}
+
+// IsHotTrack reports whether the input carries the $hot fast-track prefix.
+// $hot bypasses ALL plan generation, diagnostic loops, and Senior Architect
+// analysis, routing directly to the /build engine for instant execution.
+func IsHotTrack(input string) bool {
+	return hotPrefixPattern.MatchString(strings.TrimSpace(input))
+}
+
+// HasHighIntentFlag reports whether the input explicitly requests high-intent
+// analysis via --high or /intent high.
+func HasHighIntentFlag(input string) bool {
+	lower := strings.ToLower(input)
+	return strings.Contains(lower, "--high") || strings.Contains(lower, "/intent high")
+}
+
+// ClassifyIntentMode determines whether a non-diagnostic user request should
+// route through /investigate (bug diagnostics) or go directly to /build
+// (code creation/mutation). Returns "build" for mutation intents, "investigate"
+// for bug diagnostics, and "plan" for architectural work.
+//
+// Rules:
+//   - Diagnostic patterns (why, what caused, investigate, crash, bug) → investigate
+//   - Mutation verbs + file refs (write test, add feature, refactor @file) → build
+//   - Architectural keywords (migrate, redesign, architecture) → plan
+//   - $hot prefix → build (bypass all)
+func ClassifyIntentMode(input string) string {
+	if IsHotTrack(input) {
+		return "build"
+	}
+	lower := strings.ToLower(input)
+
+	// Diagnostic patterns → investigate.
+	for _, p := range diagnosticPatterns {
+		if p.MatchString(lower) {
+			return "investigate"
+		}
+	}
+
+	if hasDiagnosticIntent(input) {
+		return "investigate"
+	}
+
+	// Architectural keywords → plan.
+	architecturalPatterns := []string{
+		"architecture", "migrate", "redesign", "restructure",
+		"cross-cutting", "schema change", "database migration",
+	}
+	for _, p := range architecturalPatterns {
+		if strings.Contains(lower, p) {
+			return "plan"
+		}
+	}
+
+	// Mutation intent + file ref → build.
+	if hasDirectMutationVerb(input) {
+		files := extractFileRefs(input)
+		if len(files) > 0 || strings.Contains(lower, "write") ||
+			strings.Contains(lower, "create") || strings.Contains(lower, "generate") ||
+			strings.Contains(lower, "add ") || strings.Contains(lower, "implement") {
+			return "build"
+		}
+	}
+
+	// Default: let the mode resolver decide.
+	return ""
+}
+
+// StripHotPrefix removes the $hot prefix from the input, returning the clean
+// command string. If no $hot prefix is found, returns the input unchanged.
+func StripHotPrefix(input string) string {
+	return hotPrefixPattern.ReplaceAllString(input, "")
 }
 
 // isDirectMutationTarget reports whether the given filename is a
