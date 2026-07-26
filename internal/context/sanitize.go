@@ -298,8 +298,12 @@ func SanitizeBuildHandoff(task *plan.Task, symbolContext string) string {
 
 	b.WriteString("### INSTRUCTION\n")
 	b.WriteString("Produce the minimal code change to complete this task. ")
-	b.WriteString("Use unified diff format (```diff) or FILE: block format. ")
-	b.WriteString("No conversational text, no markdown outside code blocks.\n\n")
+	b.WriteString("Output a unified diff with --- a/ and +++ b/ headers and @@ hunk markers, ")
+	b.WriteString("or a SEARCH/REPLACE block (<<<<<<< SEARCH ... ======= ... >>>>>>>). ")
+	b.WriteString("Output ONLY the diff or search/replace block. ")
+	b.WriteString("No conversational text, no markdown outside code blocks, no explanations, no greetings. ")
+	b.WriteString("Do NOT wrap the diff in markdown code fences unless diff headers are already present. ")
+	b.WriteString("Return ONLY the raw diff or search/replace block.\n\n")
 
 	// ── Temporal context ─────────────────────────────────────────────
 	// Local LLMs (e.g. qwen2.5-coder:7b) hallucinate default/fallback dates

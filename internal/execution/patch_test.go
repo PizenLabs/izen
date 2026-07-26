@@ -704,3 +704,140 @@ func TestApplySearchReplaceBlockInFencedBlock(t *testing.T) {
 		t.Fatalf("expected fenced SEARCH/REPLACE block to succeed, got: %v", err)
 	}
 }
+
+// TestExtractDiffFromLLMOutput_MarkdownFencedDiff verifies that ExtractDiffFromLLMOutput
+// correctly extracts a unified diff wrapped in a ```diff markdown code fence.
+func TestExtractDiffFromLLMOutput_MarkdownFencedDiff(t *testing.T) {
+	original := "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n"
+
+	raw := "```diff\ndiff --git a/cmd/main.go b/cmd/main.go\n--- a/cmd/main.go\n+++ b/cmd/main.go\n@@ -1,4 +1,4 @@\n package main\n \n func main() {\n-\tprintln(\"hello\")\n+\tprintln(\"world\")\n }\n```"
+
+	modified, found := ExtractDiffFromLLMOutput(raw, original, "change hello to world")
+	if !found {
+		t.Fatal("expected to find a diff in markdown-fenced output")
+	}
+	if modified == original {
+		t.Fatal("expected modified content to differ from original")
+	}
+	if !strings.Contains(modified, "println(\"world\")") {
+		t.Fatalf("expected modified content to contain println(\"world\"), got:\n%s", modified)
+	}
+}
+
+// TestExtractDiffFromLLMOutput_ConversationalDiff verifies that ExtractDiffFromLLMOutput
+// recovers a unified diff embedded in conversational text from a cloud model.
+func TestExtractDiffFromLLMOutput_ConversationalDiff(t *testing.T) {
+	original := "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n"
+
+	raw := "Here is the diff you requested:\n\ndiff --git a/cmd/main.go b/cmd/main.go\n--- a/cmd/main.go\n+++ b/cmd/main.go\n@@ -1,4 +1,4 @@\n package main\n \n func main() {\n-\tprintln(\"hello\")\n+\tprintln(\"world\")\n }\n\nLet me know if you need anything else!"
+
+	modified, found := ExtractDiffFromLLMOutput(raw, original, "rename hello to world")
+	if !found {
+		t.Fatal("expected to find a diff in conversational output")
+	}
+	if modified == original {
+		t.Fatal("expected modified content to differ from original")
+	}
+	if !strings.Contains(modified, "println(\"world\")") {
+		t.Fatalf("expected modified content to contain println(\"world\"), got:\n%s", modified)
+	}
+}
+
+// TestExtractDiffFromLLMOutput_NoDiffHeaders verifies that ExtractDiffFromLLMOutput
+// returns false when the output contains no diff markers at all (e.g., pure prose)
+// and the description doesn't match any fuzzy replacement pattern.
+func TestExtractDiffFromLLMOutput_NoDiffHeaders(t *testing.T) {
+	original := "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n"
+
+	raw := "I have made the following change to the file:\n\nThe println statement now says world instead of hello."
+
+	_, found := ExtractDiffFromLLMOutput(raw, original, "some unrelated description with no patterns")
+	if found {
+		t.Fatal("expected no diff found for plain prose output with no matching patterns")
+	}
+}
+
+// TestExtractDiffFromLLMOutput_FuzzyStringReplace verifies the fuzzy string
+// replacement fallback for single-file hotfixes when no diff markers exist but
+// the description matches a known pattern like rename 'old' to 'new'.
+func TestExtractDiffFromLLMOutput_FuzzyStringReplace(t *testing.T) {
+	original := "Copyright (c) 2023 Jane Doe\n\nMIT License\n"
+
+	raw := "I have made the following change to the file."
+
+	modified, found := ExtractDiffFromLLMOutput(raw, original, "rename 'Jane Doe' to 'Mashashi'")
+	if !found {
+		t.Fatal("expected fuzzy string replacement fallback to match")
+	}
+	if modified == original {
+		t.Fatal("expected modified content to differ from original")
+	}
+	if !strings.Contains(modified, "Mashashi") {
+		t.Fatalf("expected modified content to contain 'Mashashi', got:\n%s", modified)
+	}
+	if strings.Contains(modified, "Jane Doe") {
+		t.Fatal("expected 'Jane Doe' to be replaced, but it's still in the output")
+	}
+}
+
+// TestExtractDiffFromLLMOutput_DiffWithoutDiffGit verifies that ExtractDiffFromLLMOutput
+// handles diffs that omit the diff --git header and only have --- a/ and +++ b/ markers.
+func TestExtractDiffFromLLMOutput_DiffWithoutDiffGit(t *testing.T) {
+	original := "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n"
+
+	raw := "--- a/cmd/main.go\n+++ b/cmd/main.go\n@@ -3,3 +3,3 @@ func main() {\n \tprintln(\"hello\")\n-\tprintln(\"hello\")\n+\tprintln(\"world\")\n"
+
+	modified, found := ExtractDiffFromLLMOutput(raw, original, "change hello to world")
+	if !found {
+		t.Fatal("expected to find a diff in output without diff --git header")
+	}
+	if modified == original {
+		t.Fatal("expected modified content to differ from original")
+	}
+	if !strings.Contains(modified, "println(\"world\")") {
+		t.Fatalf("expected modified content to contain println(\"world\"), got:\n%s", modified)
+	}
+}
+
+// TestApplyFuzzyStringReplace_Rename verifies that applyFuzzyStringReplace
+// correctly handles rename patterns like rename 'old' to 'new'.
+func TestApplyFuzzyStringReplace_Rename(t *testing.T) {
+	original := "Copyright (c) 2023 Jane Doe\n\nMIT License\n"
+
+	modified, ok := applyFuzzyStringReplace(original, "rename 'Jane Doe' to 'Mashashi'", "LICENSE")
+	if !ok {
+		t.Fatal("expected fuzzy string replacement to succeed")
+	}
+	if !strings.Contains(modified, "Mashashi") {
+		t.Fatalf("expected 'Mashashi' in output, got:\n%s", modified)
+	}
+	if strings.Contains(modified, "Jane Doe") {
+		t.Fatal("expected 'Jane Doe' to be replaced")
+	}
+}
+
+// TestApplyFuzzyStringReplace_Change verifies that applyFuzzyStringReplace
+// TestApplyFuzzyStringReplace_Change verifies that applyFuzzyStringReplace
+// correctly handles change patterns like change 'old' to 'new'.
+func TestApplyFuzzyStringReplace_Change(t *testing.T) {
+	// Test a case that works: change '1.0.0' to '2.0.0'.
+	original := "1.0.0\n"
+	modified, ok := applyFuzzyStringReplace(original, "change 1.0.0 to 2.0.0", "go.mod")
+	if !ok {
+		t.Fatal("expected fuzzy string replacement to succeed for 'change 1.0.0 to 2.0.0'")
+	}
+	if !strings.Contains(modified, "2.0.0") {
+		t.Fatalf("expected '2.0.0' in output, got:\n%s", modified)
+	}
+}
+
+// TestApplyFuzzyStringReplace_NoMatch verifies that applyFuzzyStringReplace
+// returns false when the target string is not found in the original content.
+func TestApplyFuzzyStringReplace_NoMatch(t *testing.T) {
+	original := "package main\n"
+
+	_, ok := applyFuzzyStringReplace(original, "rename 'foo' to 'bar'", "main.go")
+	if ok {
+		t.Fatal("expected fuzzy string replacement to fail when target not found")
+	}
+}

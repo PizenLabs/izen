@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -1817,6 +1818,458 @@ func SanitizeDiffContent(content string) string {
 	return strings.TrimRight(strings.Join(result, "\n"), "\n")
 }
 
+// ── Cloud Model Diff Extraction ──────────────────────────────
+//
+// Cloud models (OpenRouter / Cohere) frequently wrap diff output in
+// conversational text, markdown code fences (```diff ... ```), or
+// non-standard headers (omitting diff --git and @@ hunk markers).
+// ExtractDiffFromLLMOutput robustly recovers the unified diff block
+// from these variants and returns the extracted + sanitized diff content.
+// If the content is not a diff at all (e.g., pure prose or a SEARCH/REPLACE
+// block), it returns the original content unchanged.
+
+var (
+	// diffHeaderRe matches unified diff headers that may appear inside
+	// conversational text or markdown code blocks from cloud models
+	// (OpenRouter, Cohere). Covers both "diff --git a/... b/..." and
+	// the simpler "--- a/ ... +++ b/" forms used by models that omit
+	// the diff --git line.
+	diffHeaderRe = regexp.MustCompile(`(?m)^(?:diff --git a/\S+ b/\S+|--- a/.*)$`)
+
+	// singleLineDiffRe matches a minimal diff with only --- / +++ headers
+	// and no diff --git line.
+	singleLineDiffRe = regexp.MustCompile(`(?m)^--- a/.*`)
+
+	// fenceDiffRe matches markdown code fence lines with the diff language tag.
+	fenceDiffRe = regexp.MustCompile("^\\s*`{3}\\s*diff\\s*$")
+)
+
+// hasDiffHeaders reports whether the content contains unified diff
+// structural markers (diff --git, --- a/, +++ b/, or @@ hunk headers).
+func hasDiffHeaders(s string) bool {
+	return diffHeaderRe.MatchString(s) || singleLineDiffRe.MatchString(s) || strings.Contains(s, "@@")
+}
+
+// stripDiffFences removes a wrapping ```diff ... ``` code block from
+// raw LLM output. Returns the extracted diff content with the fences
+// stripped. If the content does not start with a ```diff fence, it
+// returns the content unchanged (after trimming).
+func stripDiffFences(content string) string {
+	lines := strings.Split(content, "\n")
+	if len(lines) == 0 {
+		return content
+	}
+
+	// Find the opening ```diff or ``` fence.
+	openIdx := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "```diff" || trimmed == "```" || fenceDiffRe.MatchString(line) {
+			openIdx = i
+			break
+		}
+		// Stop searching after the first non-empty, non-fence line
+		// to avoid matching a closing fence inside the content.
+		if trimmed != "" && !strings.HasPrefix(trimmed, "```") {
+			break
+		}
+	}
+	if openIdx < 0 {
+		return content
+	}
+
+	// Find the closing ``` fence after the opening.
+	closeIdx := -1
+	for i := openIdx + 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "```" {
+			closeIdx = i
+			break
+		}
+	}
+	if closeIdx < 0 {
+		// No closing fence found — return content after the opening fence.
+		return strings.TrimSpace(strings.Join(lines[openIdx+1:], "\n"))
+	}
+
+	// Extract content between fences.
+	extracted := strings.Join(lines[openIdx+1:closeIdx], "\n")
+	return strings.TrimSpace(extracted)
+}
+
+// extractDiffBlock scans the content for a unified diff block and
+// returns the diff lines. It handles:
+//   - ```diff ... ``` fenced blocks
+//   - diff --git a/... b/... headers with --- a/ +++ b/ following
+//   - Bare --- a/ / +++ b/ markers (no diff --git header)
+//   - Conversational text wrapping (model says "Here is the diff:" before/after)
+func extractDiffBlock(content string) string {
+	lines := strings.Split(content, "\n")
+	var diffLines []string
+	inDiff := false
+	diffStarted := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Detect the start of a diff block.
+		if !diffStarted {
+			if strings.HasPrefix(trimmed, "diff --git ") ||
+				strings.HasPrefix(trimmed, "--- a/") ||
+				strings.HasPrefix(trimmed, "+++ b/") ||
+				strings.HasPrefix(trimmed, "@@") ||
+				strings.HasPrefix(trimmed, "```diff") ||
+				fenceDiffRe.MatchString(line) {
+				diffStarted = true
+				inDiff = true
+				// Skip opening markdown fences - they are not diff content.
+				if strings.HasPrefix(trimmed, "```") {
+					continue
+				}
+				diffLines = append(diffLines, line)
+				continue
+			}
+			// Also check for "diff --git" that might be preceded by text
+			// (model says "The diff is:" or similar).
+			if strings.Contains(trimmed, "diff --git ") {
+				diffStarted = true
+				inDiff = true
+				rest := strings.TrimPrefix(trimmed, strings.TrimPrefix(trimmed, "diff --git "))
+				diffLines = append(diffLines, "diff --git "+rest)
+				continue
+			}
+			continue
+		}
+
+		// We are inside a diff block.
+		if inDiff && trimmed == "" && len(diffLines) > 0 {
+			// Allow blank lines within diff hunk context
+			// (between hunks or after the last hunk).
+			diffLines = append(diffLines, line)
+			continue
+		}
+
+		if inDiff && strings.HasPrefix(trimmed, "```") {
+			inDiff = false
+			continue
+		}
+
+		if inDiff {
+			diffLines = append(diffLines, line)
+		}
+	}
+
+	if len(diffLines) == 0 {
+		return ""
+	}
+	return strings.Join(diffLines, "\n")
+}
+
+// applyFuzzyStringReplace attempts a single-file hotfix by finding
+// the target string (from the hotfix description) in the original
+// file and generating a valid modified content. This fallback is
+// used when strict diff parsing fails entirely.
+//
+// When targetFile is provided, the function performs context-aware
+// matching: it scans the original content for lines relevant to
+// the hotfix (e.g., lines containing "Copyright" or author names)
+// and substitutes the target value within those lines.
+func applyFuzzyStringReplace(origContent, description, targetFile string) (string, bool) {
+	if origContent == "" || description == "" {
+		return "", false
+	}
+
+	// Context-aware replacement for file-specific hotfixes.
+	if targetFile != "" {
+		if modified, ok := applyContextAwareFuzzyReplace(origContent, description, targetFile); ok {
+			return modified, true
+		}
+	}
+
+	// Try to find a rename/change/replace/swap instruction.
+	// "rename 'old' to 'new'" or 'rename "old" to "new"'
+	renamePatterns := []struct {
+		re      *regexp.Regexp
+		extract func([]string) (string, string)
+	}{
+		{
+			regexp.MustCompile(`(?i)rename\s+['"]([^'"]+)['"]\s+to\s+['"]([^'"]+)['"]`),
+			func(m []string) (string, string) { return m[1], m[2] },
+		},
+		{
+			regexp.MustCompile(`(?i)rename\s+(\S+)\s+to\s+['"]?(\S+)['"]?`),
+			func(m []string) (string, string) { return m[1], m[2] },
+		},
+		{
+			// "rename X in Y to 'new'" — skip the "in Y" middle part
+			regexp.MustCompile(`(?i)rename\s+(\S+)\s+in\s+\S+\s+to\s+['"]?([^'"\s]+)['"]?`),
+			func(m []string) (string, string) { return m[1], m[2] },
+		},
+		{
+			regexp.MustCompile(`(?i)(?:change|replace|swap)\s+['"]([^'"]+)['"]\s+(?:to|with|for)\s+['"]([^'"]+)['"]`),
+			func(m []string) (string, string) { return m[1], m[2] },
+		},
+		{
+			regexp.MustCompile(`(?i)(?:change|replace)\s+(\S+)\s+(?:to|with|for)\s+['"]?(\S+)['"]?`),
+			func(m []string) (string, string) { return m[1], m[2] },
+		},
+	}
+
+	for _, pat := range renamePatterns {
+		matches := pat.re.FindStringSubmatch(description)
+		if len(matches) < 3 {
+			continue
+		}
+		oldStr, newStr := pat.extract(matches)
+		if oldStr == "" {
+			continue
+		}
+
+		// Find the old string in the original content.
+		idx := strings.Index(origContent, oldStr)
+		if idx < 0 {
+			continue
+		}
+
+		// Build the modified content.
+		modified := origContent[:idx] + newStr + origContent[idx+len(oldStr):]
+
+		return modified, true
+	}
+
+	return "", false
+}
+
+// applyContextAwareFuzzyReplace handles hotfix descriptions that
+// target a specific file and require context-aware replacement.
+// For example, "rename author in @LICENSE to 'Mashashi'" should
+// find lines in the LICENSE file containing "Copyright" or author
+// names and replace the author value within those lines.
+func applyContextAwareFuzzyReplace(origContent, description, targetFile string) (string, bool) {
+	// Extract the replacement value from the description.
+	// Patterns: "rename X to 'new'", "rename X to new",
+	// "change X to 'new'", "replace X with 'new", etc.
+	valuePatterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)to\s+['"]([^'"]+)['"]$`),
+		regexp.MustCompile(`(?i)to\s+(\S+)$`),
+		regexp.MustCompile(`(?i)with\s+['"]([^'"]+)['"]$`),
+		regexp.MustCompile(`(?i)with\s+(\S+)$`),
+	}
+
+	var newValue string
+	for _, pat := range valuePatterns {
+		matches := pat.FindStringSubmatch(description)
+		if len(matches) >= 2 && matches[1] != "" {
+			newValue = matches[1]
+			break
+		}
+	}
+	if newValue == "" {
+		return "", false
+	}
+
+	// Look for contextually relevant lines (copyright/author lines).
+	contextPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)copyright`),
+		regexp.MustCompile(`(?i)author`),
+	}
+
+	lines := strings.Split(origContent, "\n")
+	modified := false
+	var result []string
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		isContextLine := false
+		for _, ctxPat := range contextPatterns {
+			if ctxPat.MatchString(trimmed) {
+				isContextLine = true
+				break
+			}
+		}
+
+		if isContextLine {
+			// Try to extract the old value from the context line.
+			oldValue := extractOldValueFromContextLine(line)
+			if oldValue != "" {
+				newLine := strings.Replace(line, oldValue, newValue, 1)
+				if newLine != line {
+					result = append(result, newLine)
+					modified = true
+					continue
+				}
+			}
+			// Fallback: try a simple word substitution.
+			newLine := substituteLastNameToken(line, newValue)
+			if newLine != line {
+				result = append(result, newLine)
+				modified = true
+				continue
+			}
+		}
+
+		result = append(result, line)
+	}
+
+	if !modified {
+		return "", false
+	}
+	return strings.Join(result, "\n"), true
+}
+
+// extractOldValueFromContextLine tries to extract the old author
+// or copyright holder name from a context line by looking for
+// patterns like "Copyright (c) YEAR OLD_NAME" or "Author: OLD_NAME".
+func extractOldValueFromContextLine(line string) string {
+	copyrightRe := regexp.MustCompile(`(?i)copyright\s*(?:\([^)]*\))?\s*\d{4}\s+(.+)`)
+	matches := copyrightRe.FindStringSubmatch(strings.TrimSpace(line))
+	if len(matches) >= 2 {
+		return strings.TrimSpace(matches[1])
+	}
+
+	copyrightRe2 := regexp.MustCompile(`(?i)copyright\s+\d{4}\s+(.+)`)
+	matches = copyrightRe2.FindStringSubmatch(strings.TrimSpace(line))
+	if len(matches) >= 2 {
+		return strings.TrimSpace(matches[1])
+	}
+
+	return ""
+}
+
+// substituteLastNameToken replaces the last "name-like" token in a
+// line with the new value. This handles cases where the context line
+// has a copyright notice like "Copyright (c) 2023 OldName Author"
+// and we want to replace "OldName" with the new author name.
+func substituteLastNameToken(line, newValue string) string {
+	trimmed := strings.TrimSpace(line)
+	words := strings.Fields(trimmed)
+	if len(words) == 0 {
+		return line
+	}
+
+	for i := len(words) - 1; i >= 0; i-- {
+		word := words[i]
+		clean := strings.Trim(word, "(),.\"':;")
+		if len(clean) < 2 {
+			continue
+		}
+		if isYear(clean) {
+			continue
+		}
+		if strings.EqualFold(clean, "copyright") || strings.EqualFold(clean, "all") ||
+			strings.EqualFold(clean, "rights") || strings.EqualFold(clean, "reserved") ||
+			strings.EqualFold(clean, "author") || strings.EqualFold(clean, "by") {
+			continue
+		}
+		origWord := words[i]
+		newWord := strings.Replace(origWord, clean, newValue, 1)
+		words[i] = newWord
+		return strings.Join(words, " ")
+	}
+
+	return line
+}
+
+// isYear reports whether a string is a 4-digit year (1900-2099).
+func isYear(s string) bool {
+	if len(s) != 4 {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	n := 0
+	for _, c := range s {
+		n = n*10 + int(c-'0')
+	}
+	return n >= 1900 && n <= 2099
+}
+
+// ExtractDiffFromLLMOutput extracts unified diff content from raw LLM
+// output, handling markdown code fences (```diff), conversational
+// wrapping, missing structural markers, and SEARCH/REPLACE blocks.
+// It also falls back to fuzzy string replacement for single-file hotfixes.
+//
+// Returns the extracted (or resolved) modified content and a boolean
+// indicating whether a diff, SEARCH/REPLACE block, or fuzzy replacement
+// was found and extracted.
+func ExtractDiffFromLLMOutput(rawLLMOutput, originalContent, description string) (string, bool) {
+	if rawLLMOutput == "" {
+		return "", false
+	}
+
+	// Phase 1: Strip markdown code fences first (handles ```diff ... ```).
+	fenced := stripDiffFences(rawLLMOutput)
+	if fenced != rawLLMOutput && hasDiffHeaders(fenced) {
+		// We had a fenced diff block — try to apply it.
+		if originalContent != "" {
+			if modified, err := applyUnifiedPatch(originalContent, fenced); err == nil && modified != originalContent {
+				return modified, true
+			}
+		}
+		return fenced, true
+	}
+
+	// Phase 1b: Also try fenced content that looks like SEARCH/REPLACE blocks
+	// even if it doesn't have diff headers (some models wrap ``` blocks around
+	// <<<<<<< SEARCH content).
+	if fenced != rawLLMOutput && strings.Contains(fenced, "<<<<<<< SEARCH") {
+		if originalContent != "" {
+			if modified, ok := tryApplySearchReplace(originalContent, fenced); ok && modified != originalContent {
+				return modified, true
+			}
+		}
+		return fenced, true
+	}
+
+	// Phase 2: Scan for diff headers in the raw output (handles
+	// conversational text wrapping the diff).
+	if hasDiffHeaders(rawLLMOutput) {
+		diffBlock := extractDiffBlock(rawLLMOutput)
+		if diffBlock != "" && originalContent != "" {
+			if modified, err := applyUnifiedPatch(originalContent, diffBlock); err == nil && modified != originalContent {
+				return modified, true
+			}
+		}
+		if diffBlock != "" {
+			return diffBlock, true
+		}
+	}
+
+	// Phase 2b: Scan for SEARCH/REPLACE blocks in raw output (handles
+	// cloud models that output <<<<<<< SEARCH blocks without diff headers).
+	if strings.Contains(rawLLMOutput, "<<<<<<< SEARCH") && originalContent != "" {
+		if modified, ok := tryApplySearchReplace(originalContent, rawLLMOutput); ok && modified != originalContent {
+			return modified, true
+		}
+	}
+
+	// Phase 3: Fuzzy string replacement fallback for single-file hotfixes.
+	if originalContent != "" && description != "" {
+		if modified, ok := applyFuzzyStringReplace(originalContent, description, ""); ok {
+			return modified, true
+		}
+	}
+
+	return rawLLMOutput, false
+}
+
+// tryApplySearchReplace attempts to parse SEARCH/REPLACE blocks from content
+// and apply them to the original content. Returns the modified content and
+// true if successful, or the original content and false if no valid blocks
+// were found or applied.
+func tryApplySearchReplace(original, content string) (string, bool) {
+	blocks := ParseSearchReplaceBlocks(content)
+	if len(blocks) == 0 {
+		return original, false
+	}
+	modified, ok := ApplySearchReplaceBlocks(original, blocks)
+	if ok && modified != original {
+		return modified, true
+	}
+	return original, false
+}
 func (pm *PatchManager) store(patch *Patch) error {
 	if err := os.MkdirAll(pm.patDir, 0755); err != nil {
 		return err
