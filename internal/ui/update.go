@@ -175,9 +175,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.ti.Width = msg.Width - 8
 
-		if m.showModelPicker && m.modelPicker != nil {
-			m.modelPicker.SetSize(msg.Width, msg.Height)
-		}
+		// NOTE: the model picker's own size is NOT set here. It's derived
+		// from m.width/m.height (just updated above) by
+		// modelPickerDialogSize() and applied in renderModelPickerModal()
+		// on every render — that's what lets it track resizes precisely
+		// and shrink to fit a narrow tmux/terminal split instead of
+		// overflowing it. A SetSize call here used to pass the *full*
+		// terminal size (not the dialog's actual on-screen size) and was
+		// immediately superseded by renderModelPickerModal's own call on
+		// the next View() anyway, so it did nothing but mislead.
 
 		vpHeight := m.computeVpHeight()
 

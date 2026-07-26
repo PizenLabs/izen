@@ -81,6 +81,56 @@ func (r *Registry) For(mode modes.Mode) (ViewMode, bool) {
 // it resolves UI lifecycle overlays (init / help / loading) and otherwise
 // delegates to the registered ViewMode for the current mode. The renderer
 // never sees mode, banner, prompt, footer, or action logic.
+// modelPickerPreferredWidth/Height are the "comfortable" dialog size used
+// whenever the terminal (or tmux/split pane) has room for it.
+const modelPickerPreferredWidth = 68
+const modelPickerPreferredHeight = 18
+
+// modelPickerEdgeMargin is the minimum gap kept between the modal's own
+// border and the raw edge of the terminal/pane, so the border never sits
+// flush against (or past) the boundary.
+const modelPickerEdgeMargin = 2
+
+// modelPickerDialogSize computes the size to hand to ModelPickerModal.SetSize
+// for the *current* terminal dimensions (m.width/m.height, kept up to date by
+// the tea.WindowSizeMsg handler in update.go).
+//
+// This used to be hardcoded as SetSize(68, 18) here, unconditionally, on
+// every single render. That's what caused the modal to get its border
+// sliced off in a narrow tmux/terminal split: no matter how small the pane
+// actually was, this call re-stamped the picker's width/height back to a
+// fixed 68x18 immediately before every View(), overwriting whatever
+// correct, pane-aware size had just been computed. The picker's own
+// internal resizing logic (ModelPickerModal.listRowBudget, etc.) never got
+// a chance to run, because it was never told the real size in the first
+// place.
+//
+// Now the preferred 68x18 is only used when it actually fits; otherwise we
+// shrink to the available space, floored at the picker's own
+// modelPickerMinWidth/modelPickerMinHeight so the two never disagree.
+func (m *model) modelPickerDialogSize() (int, int) {
+	w := modelPickerPreferredWidth
+	h := modelPickerPreferredHeight
+
+	if m.width > 0 {
+		if maxW := m.width - modelPickerEdgeMargin; maxW < w {
+			w = maxW
+		}
+	}
+	if m.height > 0 {
+		if maxH := m.height - modelPickerEdgeMargin; maxH < h {
+			h = maxH
+		}
+	}
+	if w < modelPickerMinWidth {
+		w = modelPickerMinWidth
+	}
+	if h < modelPickerMinHeight {
+		h = modelPickerMinHeight
+	}
+	return w, h
+}
+
 // renderModelPickerModal renders the model picker as a compact, centered
 // floating dialog over the normal workspace background.
 func (m *model) renderModelPickerModal() string {
@@ -106,20 +156,27 @@ func (m *model) renderModelPickerModal() string {
 	}
 	normalContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
 
-	// Set compact dimensions on the model picker so it renders at modal size.
-	m.modelPicker.SetSize(68, 18)
+	// Size the model picker to fit the *actual* terminal/pane, shrinking
+	// below the preferred 68x18 when there isn't room for it (see
+	// modelPickerDialogSize for why this must not be a hardcoded call).
+	dialogW, dialogH := m.modelPickerDialogSize()
+	m.modelPicker.SetSize(dialogW, dialogH)
 	mpView := m.modelPicker.View()
 
 	// Outer modal box. No hardcoded Height/MaxHeight here on purpose: mpView
-	// (renderList in model_picker.go) is a fixed height by construction —
-	// modelListLineBudget always pads its row list out to the same number
-	// of lines — so this box naturally renders at a constant size on every
-	// frame without needing cross-file height arithmetic kept in sync by
-	// hand. Hardcoding a Height here previously caused the bottom border
-	// to get silently clipped whenever the true content height drifted
-	// even by a line.
+	// (renderList in model_picker.go) is a fixed height for any given
+	// dialogH — ModelPickerModal.listRowBudget always pads its row list out
+	// to the same number of lines for that size — so this box naturally
+	// renders at a constant size for the current terminal without needing
+	// cross-file height arithmetic kept in sync by hand. Hardcoding a
+	// Height here previously caused the bottom border to get silently
+	// clipped whenever the true content height drifted even by a line.
+	//
+	// Width follows dialogW (+2 to match the picker's own inner
+	// border/padding math) instead of a fixed 70, so the outer box shrinks
+	// in step with the picker itself rather than overflowing the pane.
 	modalBox := lipgloss.NewStyle().
-		Width(70).
+		Width(dialogW+2).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(colorBlue)).
 		Padding(0, 1).
