@@ -175,6 +175,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		initPrefillUsername: globalUsername,
 		initPrefillProvider: globalProvider,
 		viewRegistry:        reg,
+		logStore:            NewLogStore(),
 	}
 	if initStage == initIdentity {
 		m.initIdentityInput = textinput.New()

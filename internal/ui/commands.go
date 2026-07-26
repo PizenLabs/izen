@@ -451,6 +451,15 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		content = fileCtx.String() + "\n\n" + content
 	}
 
+	// ── $hot FAST-TRACK ─────────────────────────────────────────────────
+	// Any message starting with $hot bypasses ALL plan generation and
+	// diagnostic loops, routing directly to the /build engine for instant
+	// execution. Also strip the $hot prefix before passing to build.
+	if strings.HasPrefix(strings.TrimSpace(content), "$hot") {
+		hotContent := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(content), "$hot"))
+		return m.runBuildCmd(hotContent)
+	}
+
 	if m.resolver.Current() == modes.ModeBuild && m.graph != nil {
 		compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.ObjectiveIntent())
 		compressed := compressor.CompressLines(content)
@@ -463,7 +472,20 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		go retrieval.BuildGlobalCompressor(g, m.sess.ObjectiveIntent())
 	}
 
-	switch m.resolver.Current() {
+	// ── INTENT-BASED MODE OVERRIDE ──────────────────────────────────────
+	// When the current mode is investigate but the user intent involves code
+	// creation/mutation (not bug diagnostics), override to /build directly.
+	// This prevents the investigate deadlock where the engine loops over
+	// forensic evidence for a task that requires writing code.
+	currentMode := m.resolver.Current()
+	if currentMode == modes.ModeInvestigate && len(refFiles) > 0 {
+		if hasMutationIntent(content) {
+			m.push(roleStatus, "Code mutation intent detected — routing directly to /build, bypassing /investigate")
+			return m.runBuildCmd(content)
+		}
+	}
+
+	switch currentMode {
 	case modes.ModeInvestigate:
 		if m.investigateInvocationCount >= maxInvestigateInvocations {
 			m.push(roleError, fmt.Sprintf("max investigate invocations (%d) reached", maxInvestigateInvocations))
@@ -4772,6 +4794,39 @@ func isHandoffNoiseLine(s string) bool {
 // compilerCoordRe matches a bare "path/file.ext:line:col" compiler coordinate at
 // the start of a line — raw diagnostic residue, never an actionable task.
 var compilerCoordRe = regexp.MustCompile(`^[^\s:]+\.\w+:\d+:\d+`)
+
+// hasMutationIntent reports whether the given content clearly describes a code
+// creation or mutation task (as opposed to a bug diagnosis or investigation).
+// Used to override /investigate mode routing and prevent the deadlock loop.
+func hasMutationIntent(content string) bool {
+	lower := strings.ToLower(content)
+	mutationSignals := []string{
+		"write", "create", "generate", "implement",
+		"add ", "make ", "build ", "develop",
+		"update ", "modify ", "change ", "refactor ",
+		"fix ", "correct ", "edit ",
+		"test", "spec", "stub", "mock",
+	}
+	diagnosticSignals := []string{
+		"why is", "why does", "what caused", "investigate",
+		"is broken", "is crashing", "is failing",
+		"stack trace", "backtrace", "root cause",
+		"crash", "panic", "bug",
+	}
+	// If diagnostic signals are present, this is NOT a mutation.
+	for _, s := range diagnosticSignals {
+		if strings.Contains(lower, s) {
+			return false
+		}
+	}
+	// Check for mutation signals.
+	for _, s := range mutationSignals {
+		if strings.Contains(lower, s) {
+			return true
+		}
+	}
+	return false
+}
 
 // extractTodosFromPlan extracts TODO items from a plan-mode LLM response.
 func extractTodosFromPlan(content string) []string {

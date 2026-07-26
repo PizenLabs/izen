@@ -175,9 +175,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.ti.Width = msg.Width - 8
 
-		if m.showModelPicker && m.modelPicker != nil {
-			m.modelPicker.SetSize(msg.Width, msg.Height)
-		}
+		// NOTE: the model picker's own size is NOT set here. It's derived
+		// from m.width/m.height (just updated above) by
+		// modelPickerDialogSize() and applied in renderModelPickerModal()
+		// on every render — that's what lets it track resizes precisely
+		// and shrink to fit a narrow tmux/terminal split instead of
+		// overflowing it. A SetSize call here used to pass the *full*
+		// terminal size (not the dialog's actual on-screen size) and was
+		// immediately superseded by renderModelPickerModal's own call on
+		// the next View() anyway, so it did nothing but mislead.
 
 		vpHeight := m.computeVpHeight()
 
@@ -364,18 +370,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(msg.records) == 0 {
 			m.push(roleSystem, "Investigation complete — no structured findings to report.")
 		}
-		m.push(roleStatus, "Investigation complete. Auto-transitioning to /plan for execution synthesis...")
 
-		// ── AUTO-HANDOFF: /investigate -> /plan ────────────────────────────
-		// Once investigation completes with a valid Context Ledger, automatically
-		// transition to /plan to synthesize the structured execution timeline.
-		// The plan will be rendered for user review (Approve, Edit, Add/Remove,
-		// Reject) — automatic execution without human approval is strictly forbidden.
-		m.handoffCtx.ProposedFix = m.handoffLedgerContent
+		// ── AUTO-HANDOFF: /investigate -> /build (mutation) or /plan (diagnostic) ──
+		// When the investigate engine short-circuited with a code mutation intent
+		// ("code mutation intent detected — hand off to build"), route directly to
+		// /build to skip the plan synthesis step entirely. For bug diagnostics,
+		// route to /plan as normal.
 		var cmds []tea.Cmd
-		if m.handoffLedgerContent != "" {
+		if strings.Contains(m.handoffLedgerContent, "code mutation intent detected") {
+			m.push(roleStatus, "Code mutation intent — routing directly to /build, bypassing /plan")
 			m.modeChangeAuthorized = true
-			cmds = append(cmds, m.setMode(modes.ModePlan))
+			cmds = append(cmds, m.setMode(modes.ModeBuild))
+		} else {
+			m.push(roleStatus, "Investigation complete. Auto-transitioning to /plan for execution synthesis...")
+			m.handoffCtx.ProposedFix = m.handoffLedgerContent
+			if m.handoffLedgerContent != "" {
+				m.modeChangeAuthorized = true
+				cmds = append(cmds, m.setMode(modes.ModePlan))
+			}
 		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -1270,6 +1282,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				outcomeLine := fmt.Sprintf("%s %s • %s", successBannerStyle.Render("[✓]"), msg.file, msg.status)
 				m.push(roleSystem, outcomeLine)
 				m.createBuildCheckpoint(1)
+
+				// Log foldable entry for the file mutation.
+				m.logStore.Add(LogEdit, msg.file, true, msg.status)
 				// ── ADVANCE BUILD QUEUE ────────────────────────────────
 				// After a FILE_MUTATE/GIT_ACTION task completes, check for
 				// the next idle task and execute it.
@@ -1295,6 +1310,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else {
 				m.push(roleSystem, failureBannerStyle.Render("[✗] "+msg.file+" — "+msg.err.Error()))
+				m.logStore.Add(LogEdit, msg.file, false, msg.err.Error())
 			}
 		} else {
 			m.state = StateAwaitingApproval
@@ -1313,6 +1329,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, r := range msg.results {
 			if r.err != nil {
 				m.setApplyError("apply failed: " + r.err.Error())
+				m.logStore.Add(LogEdit, r.file, false, r.err.Error())
 				failed++
 				continue
 			}
@@ -1320,6 +1337,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Target: r.file,
 				Status: r.status,
 			})
+			m.logStore.Add(LogEdit, r.file, true, r.status)
 			applied++
 		}
 		m.pendingProposals = nil
@@ -2165,6 +2183,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cfg.Models.SessionModel = msg.model.ID
 		m.IsCloudModel = msg.model.Provider != "ollama"
 
+		// Apply effort/intent level to the config tiers.
+		effort := msg.effort
+		tierKey := effort.ConfigTier()
+		m.cfg.SetTierOverride(tierKey, msg.model.ID)
+
 		modelProvider := msg.model.Provider
 		currentProvider := ""
 		if m.provider != nil {
@@ -2185,7 +2208,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.ti.Focus()
+		effortLabel := msg.effort.Description()
 		m.push(roleSystem, accentStyle.Render(fmt.Sprintf("✓ Model set to %s [%s]", msg.model.Name, msg.model.Provider)))
+		m.push(roleSystem, mutedStyle.Render(fmt.Sprintf("  Effort: %s (%s)", msg.effort, effortLabel)))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m, tea.Batch(cmds...)

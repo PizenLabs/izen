@@ -12,6 +12,73 @@ import (
 	"github.com/PizenLabs/izen/internal/llm"
 )
 
+// EffortLevel represents the intent/effort slider value.
+type EffortLevel int
+
+const (
+	EffortLow EffortLevel = iota
+	EffortMedium
+	EffortHigh
+)
+
+func (e EffortLevel) String() string {
+	switch e {
+	case EffortLow:
+		return "low"
+	case EffortMedium:
+		return "medium"
+	case EffortHigh:
+		return "high"
+	default:
+		return "low"
+	}
+}
+
+// Description returns a human-readable description of the effort level.
+func (e EffortLevel) Description() string {
+	switch e {
+	case EffortLow:
+		return "Fast-Track / Direct Mutation"
+	case EffortMedium:
+		return "Hybrid Mutation + Local Templates"
+	case EffortHigh:
+		return "Full Senior Architect Mode"
+	default:
+		return "Fast-Track / Direct Mutation"
+	}
+}
+
+// ConfigTier maps effort level to the config tier key.
+func (e EffortLevel) ConfigTier() string {
+	switch e {
+	case EffortLow:
+		return "low_intent"
+	case EffortMedium:
+		return "medium_intent"
+	case EffortHigh:
+		return "high_intent"
+	default:
+		return "low_intent"
+	}
+}
+
+// Style returns the pre-compiled render-path style for this effort level:
+// low is green (fast/low-risk), medium is yellow (moderate), high is red
+// (heaviest/highest-risk mode) — reusing the shared Catppuccin styles from
+// styles.go rather than declaring new ones.
+func (e EffortLevel) Style() lipgloss.Style {
+	switch e {
+	case EffortLow:
+		return greenStyle
+	case EffortMedium:
+		return yellowStyle
+	case EffortHigh:
+		return redStyle
+	default:
+		return greenStyle
+	}
+}
+
 type modelPickerState int
 
 const (
@@ -20,19 +87,41 @@ const (
 	mpErr
 )
 
-// modelListLineBudget is the fixed number of lines the scrollable model
-// list body occupies, regardless of how many provider headers/separators
-// land inside the visible window. Keeping this constant — and keeping the
-// list windowed/padded in terms of *rendered rows* rather than filtered
-// items — is what makes renderList()'s total output height perfectly
-// constant across every render (cursor movement, filtering, refresh).
+// modelListLineBudget is the *default* number of lines the scrollable
+// model list body occupies when no terminal size is known yet (i.e.
+// before the first SetSize call). Once SetSize has run, the real budget
+// is computed per-render by listRowBudget(), which shrinks or grows the
+// list to fit the space actually available — this is what keeps the
+// modal from being clipped when the user is running Izen in a narrow
+// tmux/terminal split pane.
 //
-// Because mpView's height never changes, the outer modal box in
-// workspace.go (renderModelPickerModal) simply auto-sizes around it
-// instead of hardcoding its own Height/MaxHeight — removing the need to
-// keep any cross-file height arithmetic in sync. Change this number
-// freely; it only affects how many rows are visible at once.
+// Regardless of which value is in play, the list stays windowed/padded
+// in terms of *rendered rows* rather than filtered items, so renderList()'s
+// total output height is still perfectly constant for any given terminal
+// size (cursor movement, filtering, refresh never change it) — only a
+// resize event changes it. That's what lets the outer modal box in
+// workspace.go (renderModelPickerModal) auto-size around it instead of
+// hardcoding its own Height/MaxHeight.
 const modelListLineBudget = 7
+
+// modelListMinRows is the smallest the scrollable list body is ever
+// allowed to shrink to, even in a very short split pane. Below this the
+// picker stops being usable, so we'd rather show a cramped-but-functional
+// list than one that's silently cut off.
+const modelListMinRows = 3
+
+// modelPickerChromeLines is the number of fixed, non-list-body lines
+// renderList() always emits: title + blank, search input, count/refresh
+// line + blank, effort description + effort track + blank, the gap before
+// the footer, and the footer itself — plus the outer border (2) and
+// Padding(1, 3) (2). Kept in sync with renderList(); see the comment
+// there if either changes.
+const modelPickerChromeLines = 8 + 2 + 2 + 2
+
+// modelPickerMinWidth/Height are floors applied in SetSize so a very
+// aggressively split pane doesn't hand us a zero or negative size.
+const modelPickerMinWidth = 28
+const modelPickerMinHeight = modelPickerChromeLines + modelListMinRows
 
 type ModelPickerModal struct {
 	ti       textinput.Model
@@ -46,7 +135,21 @@ type ModelPickerModal struct {
 	height   int
 	registry *llm.ModelRegistry
 
+	effortIdx    int // 0=low, 1=medium, 2=high
 	scrollOffset int // row-based offset into buildRows(), NOT an item index
+}
+
+func (mp *ModelPickerModal) CurrentEffort() EffortLevel {
+	switch mp.effortIdx {
+	case 0:
+		return EffortLow
+	case 1:
+		return EffortMedium
+	case 2:
+		return EffortHigh
+	default:
+		return EffortLow
+	}
 }
 
 type modelPickerLoadedMsg struct {
@@ -101,7 +204,8 @@ func (mp *ModelPickerModal) RefreshModels(providers map[string]string) tea.Cmd {
 }
 
 type modelSelectedMsg struct {
-	model llm.ModelInfo
+	model  llm.ModelInfo
+	effort EffortLevel
 }
 
 func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
@@ -149,11 +253,24 @@ func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
 			mp.clampScrollOffset()
 			return mp, nil
 
+		case tea.KeyLeft:
+			if mp.effortIdx > 0 {
+				mp.effortIdx--
+			}
+			return mp, nil
+
+		case tea.KeyRight:
+			if mp.effortIdx < 2 {
+				mp.effortIdx++
+			}
+			return mp, nil
+
 		case tea.KeyEnter:
 			if mp.cursor >= 0 && mp.cursor < len(mp.filtered) {
 				selected := mp.filtered[mp.cursor]
+				effort := mp.CurrentEffort()
 				return mp, func() tea.Msg {
-					return modelSelectedMsg{model: selected}
+					return modelSelectedMsg{model: selected, effort: effort}
 				}
 			}
 			return mp, nil
@@ -176,9 +293,41 @@ func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
 }
 
 func (mp *ModelPickerModal) SetSize(w, h int) {
+	if w < modelPickerMinWidth {
+		w = modelPickerMinWidth
+	}
+	if h < modelPickerMinHeight {
+		h = modelPickerMinHeight
+	}
 	mp.width = w
 	mp.height = h
-	mp.ti.Width = w - 12
+
+	tiWidth := w - 12
+	if tiWidth < 10 {
+		tiWidth = 10
+	}
+	mp.ti.Width = tiWidth
+
+	// Re-clamp the current scroll position: shrinking the pane can put
+	// the previous offset past the new (smaller) row budget.
+	mp.clampScrollOffset()
+}
+
+// listRowBudget returns how many rows the scrollable list body should
+// render this frame. It's derived from the last known terminal size
+// (via SetSize) minus the fixed chrome around it, floored at
+// modelListMinRows so the list never fully disappears in a tiny pane,
+// and falls back to the static modelListLineBudget default before the
+// first SetSize call has happened (e.g. mid-startup).
+func (mp *ModelPickerModal) listRowBudget() int {
+	if mp.height <= 0 {
+		return modelListLineBudget
+	}
+	budget := mp.height - modelPickerChromeLines
+	if budget < modelListMinRows {
+		budget = modelListMinRows
+	}
+	return budget
 }
 
 // ── Row model ────────────────────────────────────────────────────────────
@@ -248,15 +397,16 @@ func (mp *ModelPickerModal) clampScrollOffset() {
 	}
 
 	cursorRow := rowIndexForItem(rows, mp.cursor)
+	budget := mp.listRowBudget()
 
 	// Keep the cursor's row inside the visible window.
 	if cursorRow < mp.scrollOffset {
 		mp.scrollOffset = cursorRow
-	} else if cursorRow >= mp.scrollOffset+modelListLineBudget {
-		mp.scrollOffset = cursorRow - modelListLineBudget + 1
+	} else if cursorRow >= mp.scrollOffset+budget {
+		mp.scrollOffset = cursorRow - budget + 1
 	}
 
-	maxOffset := total - modelListLineBudget
+	maxOffset := total - budget
 	if maxOffset < 0 {
 		maxOffset = 0
 	}
@@ -332,7 +482,7 @@ func (mp *ModelPickerModal) renderList() string {
 		Foreground(lipgloss.Color(colorMauve)).
 		Render(" Model Picker ")
 	b.WriteString(title)
-	b.WriteString("\n")
+	b.WriteString("\n\n")
 
 	// ── Search bar ──────────────────────────────────────────────────────
 	b.WriteString(mp.ti.View())
@@ -348,7 +498,16 @@ func (mp *ModelPickerModal) renderList() string {
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Faint(true).Render("Ctrl+R refresh"))
 	b.WriteString("\n\n")
 
-	// ── Fixed-height, row-based scrolling list ──────────────────────────
+	// ── Effort / Intent Slider ───────────────────────────────────────────
+	effortRow := mp.renderEffortSlider()
+	b.WriteString(effortRow)
+	b.WriteString("\n\n")
+
+	// ── Resizable, row-based scrolling list ─────────────────────────────
+	// budget is recomputed from the last known terminal size (see
+	// listRowBudget) rather than a hardcoded constant, so a narrow/short
+	// tmux split pane shrinks the list instead of clipping the modal.
+	budget := mp.listRowBudget()
 	rows := mp.buildRows()
 	total := len(rows)
 
@@ -358,7 +517,7 @@ func (mp *ModelPickerModal) renderList() string {
 	if mp.scrollOffset < 0 {
 		mp.scrollOffset = 0
 	}
-	end := mp.scrollOffset + modelListLineBudget
+	end := mp.scrollOffset + budget
 	if end > total {
 		end = total
 	}
@@ -396,19 +555,26 @@ func (mp *ModelPickerModal) renderList() string {
 					Foreground(lipgloss.Color(colorAccent)).
 					Bold(true)
 			}
-			fmt.Fprintf(&b, "%s%s", cursor, itemStyle.Render(m.ID))
+			// Truncate long model IDs in narrow panes instead of letting
+			// them wrap and blow out the fixed row budget.
+			maxIDWidth := mp.width - 12
+			id := truncateWithEllipsis(m.ID, maxIDWidth)
+			fmt.Fprintf(&b, "%s%s", cursor, itemStyle.Render(id))
 			b.WriteString("\n")
 		}
 	}
 
 	// Pad blank lines so the body — and therefore the whole modal — never
-	// changes height, no matter how many header/blank rows were in view.
-	for i := len(window); i < modelListLineBudget; i++ {
+	// changes height for a given terminal size, no matter how many
+	// header/blank rows were in view. (It *does* change across a resize,
+	// since budget itself is resize-driven — that's the point.)
+	for i := len(window); i < budget; i++ {
 		b.WriteString("\n")
 	}
+	b.WriteString("\n")
 
 	// ── Footer ──────────────────────────────────────────────────────────
-	footer := mutedStyle.Render("↑↓ navigate  ↵ select  Esc close")
+	footer := mutedStyle.Render("↑↓ navigate  ↵ select  ←→ effort  Esc close")
 	b.WriteString(footer)
 
 	borderColor := lipgloss.Color(colorMauve)
@@ -418,8 +584,75 @@ func (mp *ModelPickerModal) renderList() string {
 		Width(mp.width-4).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(borderColor).
-		Padding(1, 2).
+		Padding(1, 3).
 		Render(content)
+}
+
+// renderEffortSlider renders the interactive effort/intent slider.
+// Visual layout: low ───○─── medium ────── high
+func (mp *ModelPickerModal) renderEffortSlider() string {
+	levels := []struct {
+		label string
+		desc  string
+	}{
+		{"low", "Fast-Track"},
+		{"medium", "Hybrid"},
+		{"high", "Senior Arch"},
+	}
+
+	trackLen := 6
+	var b strings.Builder
+
+	// Description line — tinted to match the selected level, so the
+	// color reads as "how heavy is this effort" at a glance.
+	effort := mp.CurrentEffort()
+	levelStyle := effort.Style()
+	desc := levelStyle.Render(effort.Description())
+	b.WriteString("  " + mutedStyle.Render("Effort:") + " " + desc + "\n")
+
+	// Slider track
+	b.WriteString("  ")
+	for i, lvl := range levels {
+		if i == mp.effortIdx {
+			b.WriteString(levelStyle.Bold(true).Render(lvl.label))
+		} else {
+			b.WriteString(dimmedStyle.Render(lvl.label))
+		}
+		if i < len(levels)-1 {
+			b.WriteString(" ")
+			for j := 0; j < trackLen; j++ {
+				switch {
+				case i == mp.effortIdx && j == 0:
+					b.WriteString(levelStyle.Render("●"))
+				case i < mp.effortIdx && j == trackLen-1:
+					b.WriteString(levelStyle.Render("●"))
+				default:
+					b.WriteString(dimmedStyle.Render("─"))
+				}
+			}
+			b.WriteString(" ")
+		}
+	}
+
+	return b.String()
+}
+
+// truncateWithEllipsis shortens s to fit within max runes, replacing the
+// tail with "…" when it doesn't fit. Operates on the raw (unstyled)
+// string, so callers should truncate before applying lipgloss styling.
+// A non-positive max is treated as "no room" and returns "".
+func truncateWithEllipsis(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	if max == 1 {
+		return "…"
+	}
+	return string(runes[:max-1]) + "…"
 }
 
 func providerAuthStatus(provider string) string {

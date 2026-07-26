@@ -3,6 +3,7 @@ package prompt
 import (
 	"fmt"
 	"runtime"
+	"strings"
 )
 
 // EnvironmentContext returns a compact, authoritative host runtime statement
@@ -40,10 +41,74 @@ func osPackageManager(os string) string {
 	}
 }
 
-// PlanContract defines the behavioral contract for /plan mode.
-// Phase 2 (Lightweight Execution Mapper): reads the compact Forensic Ledger
-// from /investigate and maps it directly to structural atomic_tasks. No
-// re-analysis, no conversational filler.
+// ComplexityThreshold defines the boundary between compact and verbose plan prose.
+// Tasks scoring > HighComplexityThreshold receive the full Senior Architect treatment.
+const (
+	LowComplexityThreshold    = 4
+	MediumComplexityThreshold = 7
+	HighComplexityThreshold   = 8
+)
+
+// ComplexityScore rates a planning task from 1 (trivial) to 10 (architectural).
+type ComplexityScore int
+
+const (
+	ComplexityTrivial       ComplexityScore = 1
+	ComplexitySimple        ComplexityScore = 3
+	ComplexityModerate      ComplexityScore = 5
+	ComplexityComplex       ComplexityScore = 7
+	ComplexityArchitectural ComplexityScore = 9
+)
+
+// IsHighComplexity returns true when the score exceeds the threshold or the
+// user explicitly requested a high-intent analysis via --high or /intent high.
+func IsHighComplexity(score ComplexityScore, hasHighFlag bool) bool {
+	if hasHighFlag {
+		return true
+	}
+	return score > HighComplexityThreshold
+}
+
+// AssessComplexity assigns a heuristic complexity score based on task keywords.
+// Scoring:
+//
+//	1-3: simple config/doc edits (LICENSE, README, formatting)
+//	4-6: moderate code changes (add tests, small refactors, single-file edits)
+//	7-8: multi-file refactors, API changes
+//	9-10: architectural changes, cross-cutting concerns, migrations
+func AssessComplexity(objective string) ComplexityScore {
+	lower := strings.ToLower(objective)
+
+	highComplexityKeywords := []string{
+		"migration", "architect", "redesign", "restructure",
+		"cross-cutting", "concurrency", "distributed",
+		"database", "schema", "api design", "protocol",
+		"security", "authentication", "authorization",
+		"pipeline", "event-driven", "message queue",
+	}
+	lowComplexityKeywords := []string{
+		"license", "readme", "typo", "comment", "format",
+		"rename", "spelling", "grammar", "whitespace",
+		"capitalize", "config", "version bump",
+	}
+
+	for _, kw := range highComplexityKeywords {
+		if strings.Contains(lower, kw) {
+			return ComplexityComplex
+		}
+	}
+	for _, kw := range lowComplexityKeywords {
+		if strings.Contains(lower, kw) {
+			return ComplexitySimple
+		}
+	}
+
+	return ComplexityModerate
+}
+
+// PlanContract returns the verbose Senior Principal Structural Architect contract.
+// Used ONLY when the task complexity exceeds HighComplexityThreshold or the user
+// explicitly opted into high-intent analysis.
 func PlanContract() string {
 	return `MODE: /plan — Structural Architecture Synthesis
 
@@ -79,6 +144,41 @@ RULES
 - Missing dependency → Task 1 MUST be SHELL_EXEC with the exact install command.
 - FILE_MUTATE tasks MUST target the exact relative file path and line.
 - Use native Go tooling first (` + "`go get`" + `, ` + "`go mod tidy`" + `, ` + "`go install`" + `). Never default to ` + "`brew install`" + ` or ` + "`docker`" + `.`
+}
+
+// CompactPlanContract returns a stripped-down 3-bullet checklist contract for
+// LOW and MEDIUM complexity tasks. Omits ROLE, protocol details, and verbose
+// analysis instructions. Used when IsHighComplexity is false.
+func CompactPlanContract() string {
+	return `MODE: /plan — Quick Task Checklist
+
+ROLE: Execution Mapper. Map the objective to a compact task list.
+
+PROTOCOL
+- Read the objective. Identify the file(s) to modify.
+- Output a 3-bullet checklist: (1) prep/setup, (2) the change itself, (3) verification.
+- Every SHELL_EXEC must be a real runnable command.
+- Output ONLY raw task blocks. No preamble, no analysis, no commentary.
+
+OUTPUT FORMAT:
+- [ ] SHELL_EXEC: <command> | <rationale>
+- [ ] FILE_MUTATE: <relative_path> | <description>
+- [ ] SHELL_EXEC: <verification> | verify
+
+RULES
+- Missing Go dependency → SHELL_EXEC: go get <real_package> | install missing dependency.
+- FORBIDDEN: "go.mod", "go.sum", relative paths as shell target.
+- No brew, docker, or OS-level tasks. Stay at the code/dependency boundary.`
+}
+
+// SelectPlanContract returns the appropriate plan contract based on complexity.
+// High-complexity tasks or explicit high-intent requests get the full Senior
+// Architect prose; everything else gets the compact 3-bullet checklist.
+func SelectPlanContract(objective string, complexity ComplexityScore, hasHighFlag bool) string {
+	if IsHighComplexity(complexity, hasHighFlag) {
+		return PlanContract()
+	}
+	return CompactPlanContract()
 }
 
 // planDirectives are the shared DIRECTIVES rules for BuildPlanJSONPrompt.

@@ -69,6 +69,10 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen")
+	httpReq.Header.Set("X-Title", "izen")
+	httpReq.Header.Set("X-Description", "AI amplifies human judgment. Humans remain in control.")
+	httpReq.Header.Set("X-Categories", "cli-agent")
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
@@ -139,6 +143,10 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen")
+	httpReq.Header.Set("X-Title", "izen")
+	httpReq.Header.Set("X-Description", "AI amplifies human judgment. Humans remain in control.")
+	httpReq.Header.Set("X-Categories", "cli-agent")
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
