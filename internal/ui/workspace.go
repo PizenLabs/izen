@@ -25,21 +25,26 @@ type Section struct {
 // by the renderer:
 //   - Overlay:      full-screen replacement (init / help / loading). Non-empty
 //     => the renderer shows only this.
+//   - Header:       fixed top region — WorkflowState + CapabilitySet + Artifact info.
+//     Derived from RuntimeContext + WorkflowStateMachine; never stored/cached.
 //   - Viewport:     main scrollable content (height-sized by the assembler).
 //   - ProposalDock: optional mutation/processing dock ("" = none).
 //   - Input:        autocomplete + separators + prompt region (precomposed).
-//   - Footer:       status bar (telemetry with capabilities inlined).
+//   - StatusBar:    telemetry line (mode + elapsed + action hints), between
+//     Input and the fixed Footer.
+//   - Footer:       fixed bottom region — Budget counters + notifications.
+//     Derived from RuntimeContext; never stored/cached.
 //   - Actions:      capabilities exposed by the current workflow.
-//   - Header:       mode-owned header line.
 //   - Sections:     mode-owned content sections.
 type Workspace struct {
 	Overlay      string
+	Header       string
 	Viewport     string
 	ProposalDock string
 	Input        string
+	StatusBar    string
 	Footer       string
 	Actions      []Action
-	Header       string
 	Sections     []Section
 }
 
@@ -303,9 +308,7 @@ func (m *model) BuildWorkspace() Workspace {
 type askView struct{}
 
 func (askView) BuildWorkspace(m *model) Workspace {
-	ws := m.assembleScreen(m.currentResultActions())
-	ws.Header = "ask · explain, inspect, understand"
-	return ws
+	return m.assembleScreen(m.currentResultActions())
 }
 
 // ── /plan ──────────────────────────────────────────────────────────────────
@@ -360,18 +363,14 @@ func (planView) BuildWorkspace(m *model) Workspace {
 	} else if len(m.currentResultActions()) > 0 {
 		actions = append(actions, m.currentResultActions()...)
 	}
-	ws := m.assembleScreen(actions)
-	ws.Header = "plan · architecture, migrations, refactors — strategic blueprint"
-	return ws
+	return m.assembleScreen(actions)
 }
 
 // ── /build ─────────────────────────────────────────────────────────────────
 type buildView struct{}
 
 func (buildView) BuildWorkspace(m *model) Workspace {
-	ws := m.assembleScreen(m.currentResultActions())
-	ws.Header = "build · implement, refactor, elevate"
-	return ws
+	return m.assembleScreen(m.currentResultActions())
 }
 
 // ── /investigate ───────────────────────────────────────────────────────────
@@ -390,16 +389,12 @@ func (investigateView) BuildWorkspace(m *model) Workspace {
 			Priority: 100,
 		})
 	}
-	ws := m.assembleScreen(actions)
-	ws.Header = "investigate · debug, trace, root-cause"
-	return ws
+	return m.assembleScreen(actions)
 }
 
 // ── /review ────────────────────────────────────────────────────────────────
 type reviewView struct{}
 
 func (reviewView) BuildWorkspace(m *model) Workspace {
-	ws := m.assembleScreen(m.currentResultActions())
-	ws.Header = "review · analyze, critique, improve"
-	return ws
+	return m.assembleScreen(m.currentResultActions())
 }
