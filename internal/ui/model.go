@@ -20,6 +20,9 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/core/authorization"
+	"github.com/PizenLabs/izen/internal/core/budget"
+	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/core/runtime"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
@@ -628,6 +631,12 @@ type model struct {
 
 	// Cached prompt text for logging (set on submit, cleared after stream completion)
 	currentPrompt string
+
+	// Authorization engine for build/patch execution
+	authEngine     *authorization.AuthorizationEngine
+	mutationBudget *budget.MutationBudget
+	microBudget    *budget.MicroBudget
+	caps           *capability.CapabilitySet
 
 	// Focus objective UI notifications (non-chat)
 	uiNotice string
@@ -1813,6 +1822,36 @@ func (m *model) loadHistory() {
 			m.history = append(m.history, s)
 		}
 	}
+}
+
+// authorizeBuildExecution creates a MutationAuthorization token through the
+// AuthorizationEngine and sets it on the execution engine so that subsequent
+// PatchManager.Apply() and Runner.Run() calls succeed.
+//
+// For fast-track micro-plans (IsWithinMicroBudget), authorization is granted
+// automatically without requiring human approval.
+func (m *model) authorizeBuildExecution(targetFiles []string, humanApproved bool) error {
+	if m.authEngine == nil {
+		return nil
+	}
+	isMicroPlan := false
+	if m.microBudget != nil {
+		delta := budget.BudgetDelta{Files: len(targetFiles), DiffLines: 100, Tokens: 2000, Attempts: 1}
+		isMicroPlan = m.microBudget.IsWithinMicroBudget(delta, false)
+	}
+	auth, err := m.authEngine.AuthorizeBuild(
+		targetFiles,
+		m.caps,
+		m.mutationBudget,
+		m.microBudget,
+		isMicroPlan,
+		humanApproved,
+	)
+	if err != nil {
+		return fmt.Errorf("build authorization: %w", err)
+	}
+	m.execEng.SetAuthorization(auth)
+	return nil
 }
 
 func (m *model) saveHistory() {

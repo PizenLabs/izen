@@ -14,6 +14,7 @@ import (
 	"github.com/PizenLabs/izen/internal/audit"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/core/artifact"
+	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/core/runtime"
@@ -178,10 +179,24 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	runtimeCtx := runtime.New(artStore, caps, bgt)
 	workflowSM := workflow.NewWorkflowStateMachine()
 
+	// ── AUTHORIZATION ENGINE ───────────────────────────────────────────────
+	// Production AuthorizationEngine wired with a no-op source hash verifier
+	// and a checkpoint checker that inspects .izen/checkpoints/ on disk.
+	// The getState closure reads the current workflow state from the SM.
+	authEngine := authorization.NewProductionAuthorizationEngine(root, func() workflow.WorkflowState {
+		return workflowSM.State()
+	})
+	mb := budget.DefaultMicroBudget()
+	microBudget := &mb
+
 	m := &model{
 		cfg:                 cfg,
 		runtimeCtx:          runtimeCtx,
 		workflowSM:          workflowSM,
+		authEngine:          authEngine,
+		mutationBudget:      bgt,
+		microBudget:         microBudget,
+		caps:                caps,
 		sess:                sess,
 		provider:            provider,
 		mgr:                 mgr,

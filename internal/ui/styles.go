@@ -233,14 +233,14 @@ func renderHotkeyPromptWithToggle(width int) string {
 		action("Allow All") + " " + hk("Alt+L") + "  " +
 		action("Reject") + " " + hk("Alt+R / Esc") + "  " +
 		action("Toggle") + " " + hk("Alt+P") + "  " +
-		action("Nav") + " " + hk("j/k")
+		action("Scroll") + " " + hk("↑/↓")
 
 	if lipgloss.Width(text) > width {
 		text = "› " + action("Accept") + " " + hk("Alt+A") + "  " +
 			action("Allow") + " " + hk("Alt+L") + "  " +
 			action("Reject") + " " + hk("Alt+R") + "  " +
 			action("Toggle") + " " + hk("Alt+P") + "  " +
-			action("Nav") + " " + hk("j/k")
+			action("Scroll") + " " + hk("↑/↓")
 		if lipgloss.Width(text) > width {
 			text = "› " + action("Acc/Rej") + " " + hk("Alt+A/R") + "  " +
 				action("All") + " " + hk("Alt+L")

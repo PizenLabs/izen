@@ -17,6 +17,8 @@ import (
 
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/core/classifier"
+	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
@@ -834,6 +836,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if msg.err != nil {
 			m.push(roleError, "build execution error: "+msg.err.Error())
+			_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
+				FailureClass: classifier.FailureUnknownClass,
+			})
 		}
 		if msg.output != "" {
 			for _, line := range strings.Split(msg.output, "\n") {
@@ -933,6 +938,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.push(roleError, fmt.Sprintf(
 				"[BUILD HALTED] Step %d failed. Queue frozen — remaining tasks marked stalled. Use /investigate or /plan to re-generate a valid ledger.",
 				m.currentBuildTaskID))
+			_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
+				FailureClass: classifier.FailureCodeClass,
+			})
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
@@ -956,11 +964,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if hasNext && m.resolver.Current() == modes.ModeBuild {
 			return m, tea.Batch(flush, m.handleBuildRun(0))
 		}
-		// ── AUTO-HANDOFF: /build → /review ──────────────────────────────
+		// ── AUTO-HANDOFF: /build → /review ──────────────────────
 		// All SHELL_EXEC steps completed successfully and no more tasks
 		// remain. Transition to /review for a full architectural review.
 		if !hasNext && m.resolver.Current() == modes.ModeBuild {
 			m.modeChangeAuthorized = true
+			_ = m.workflowSM.SendEvent(workflow.EventReview, workflow.TransitionContext{})
 			m.setMode(modes.ModeReview)
 		}
 		return m, flush

@@ -36,6 +36,9 @@ var hallucinatedPrefixes = []string{
 	"**FILE_CREATE:",
 	"**FILE_CREATE ",
 	"**FILE_CREATE**",
+	"<<<<<<< FILE_CREATE:",
+	"<<<<<<< FILE_CREATE ",
+	">>>>>>> END_FILE",
 	"[target]",
 	"[Target]",
 	"[/target]",
@@ -51,7 +54,7 @@ var hallucinatedPrefixes = []string{
 
 // hallucinatedRe matches stray markdown artifact patterns that local models
 // hallucinate as standalone lines within code blocks.
-var hallucinatedRe = regexp.MustCompile(`(?i)^\s*(\*\*FILE_CREATE:?[^*]*\*\*|\[/?(code|file|source|block|end|diff)\])\s*$`)
+var hallucinatedRe = regexp.MustCompile(`(?i)^\s*(\*\*FILE_CREATE:?[^*]*\*\*|<<<<<<< FILE_CREATE:?.*|\[/?(code|file|source|block|end|diff)\])\s*$`)
 
 // SyntaxError is a parsed compiler syntax error with structured position info.
 type SyntaxError struct {

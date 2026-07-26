@@ -456,6 +456,12 @@ func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 		if err == nil {
 			patch.Original = string(orig)
 		}
+		if err := m.transitionToBuilding(); err != nil {
+			return mutationResultMsg{err: fmt.Errorf("workflow transition: %w", err), file: p.Target.QualifiedName}
+		}
+		if err := m.authorizeBuildExecution([]string{p.Target.QualifiedName}, true); err != nil {
+			return mutationResultMsg{err: err, file: p.Target.QualifiedName}
+		}
 		if err := eng.Patches.Apply(patch); err != nil {
 			return mutationResultMsg{err: err, file: p.Target.QualifiedName}
 		}
@@ -513,6 +519,14 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 			orig, err := os.ReadFile(p.Target.QualifiedName)
 			if err == nil {
 				patch.Original = string(orig)
+			}
+			if err := m.transitionToBuilding(); err != nil {
+				results = append(results, mutationResultMsg{err: fmt.Errorf("workflow transition: %w", err), file: p.Target.QualifiedName})
+				continue
+			}
+			if err := m.authorizeBuildExecution([]string{p.Target.QualifiedName}, true); err != nil {
+				results = append(results, mutationResultMsg{err: err, file: p.Target.QualifiedName})
+				continue
 			}
 			if err := eng.Patches.Apply(patch); err != nil {
 				results = append(results, mutationResultMsg{err: err, file: p.Target.QualifiedName})
