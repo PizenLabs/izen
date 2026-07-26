@@ -2040,7 +2040,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	// developer never sees a 30s frozen pane while the local LLM silently
 	// generates the patch. The spinner keeps animating until the proposal
 	// message arrives and swaps the pane into the diff view.
-	m.push(roleStatus, "[HOTFIX] Generating patch via local LLM... (This may take up to 30s)")
+	m.push(roleStatus, "[HOTFIX] Generating patch (local short-circuit for simple modifications)...")
 	m.push(roleSystem, fmt.Sprintf("  ⚙ Thinking... (Invoking %s)", m.cfg.ActiveModelName()))
 
 	m.agentRunning = true
@@ -2066,7 +2066,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 // buffer.
 func (m *model) hotfixProgressCmd() tea.Cmd {
 	lines := []string{
-		"  ↺ Intercepted structural breakdown. Refining context (Attempt 1/2)...",
+		"  ↺ Attempting local resolution for hotfix...",
 		"  ⚙ Compiling unified diff schema...",
 	}
 	var cmds = make([]tea.Cmd, 0, len(lines))
@@ -2168,27 +2168,53 @@ func resolveHotfixTarget(prompt string) string {
 // diff proposal and freezes the pipeline in StateAwaitingApproval so the
 // developer can authorize (y) or reject (n) the change before any disk write.
 //
-// Cloud-model robustness: when the active provider is a cloud model
-// (OpenRouter / Cohere / etc.), the function uses ExtractDiffFromLLMOutput
-// to recover unified diff blocks from conversational markdown, and falls
-// back to fuzzy string replacement when strict parsing fails. On structural
-// breakdown (attempt 1), a warning is emitted and the prompt is corrected
-// with an explicit diff format demonstration to prevent token burn on
-// repetitive empty retries.
+// Zero-token short-circuit (Path A): if the target file is explicitly referenced
+// (e.g. @LICENSE) and the action is a simple text modification (rename/change/
+// update/replace a string), execution.ApplyContextAwareFuzzyReplace is attempted locally
+// first. On success the patch is returned immediately without any LLM call.
+//
+// Early abort (Path B): when the active provider is a cloud model, the raw
+// LLM response is checked for diff markers (---, diff, <<<<<<<) before
+// attempting expensive extraction. If the response lacks diff markers, the
+// function aborts immediately and falls back to local fuzzy replacement or
+// exits cleanly — ensuring a single $hot command never triggers multiple LLM
+// API calls.
 func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 	return func() tea.Msg {
-		if m.provider == nil {
-			return hotfixProposalMsg{Err: fmt.Errorf("build execution error: no provider configured")}
-		}
-
-		// ── CRITICAL: Read existing file content BEFORE calling the LLM ──
-		// Without the original content in the prompt, local LLMs hallucinate
-		// a full-file rewrite that silently deletes all existing content.
-		// The original is read here (pre-LLM) for prompt context AND below
-		// (post-LLM) for diff computation — single read, dual use.
+		// ── Read existing file content ──────────────────────────
+		// Without the original content, local fuzzy replacement and
+		// LLM-based diff computation both produce incorrect results.
 		var orig string
 		if data, rerr := os.ReadFile(task.Target); rerr == nil {
 			orig = string(data)
+		}
+
+		// ── PATH A: Deterministic Local Short-Circuit (0 Tokens) ──
+		// If the target file is explicitly referenced with @ syntax
+		// and the action is a simple text modification, attempt local
+		// resolution first. On success, bypass the LLM entirely.
+		if orig != "" && isHotfixLocalCandidate(task.Description, task.Target) {
+			if modified, ok := execution.ApplyContextAwareFuzzyReplace(orig, task.Description, task.Target); ok {
+				diffContent := computeUnifiedDiff(task.Target, orig, modified)
+				patch := &execution.Patch{
+					ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+					File:          task.Target,
+					Original:      orig,
+					Modified:      modified,
+					TaskID:        task.StepNum,
+					ContextID:     m.sess.ContextID,
+					IsFullRewrite: true,
+				}
+				return hotfixProposalMsg{
+					Task:  task,
+					Patch: patch,
+					Diff:  diffContent,
+				}
+			}
+		}
+
+		if m.provider == nil {
+			return hotfixProposalMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
 
 		// Build a focused, non-chat patch-generation prompt with full file
@@ -2205,139 +2231,225 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		system := prompt.BuildContract()
 
 		// Detect cloud providers (OpenRouter, Cohere, etc.) so we can
-		// apply stricter extraction and warn on structural breakdown.
+		// apply stricter extraction and abort early on unparseable output.
 		cloudCfg := gateway.ClassifyCloudProvider(m.cfg.ActiveProviderName())
 		isCloud := cloudCfg.CloudProvider != ""
 
-		maxRetries := 2
-		handoffStr := handoff
-
-		for attempt := 0; attempt <= maxRetries; attempt++ {
-			req := ai.Request{
-				Model:     m.cfg.ActiveModelName(),
-				System:    system,
-				Stream:    false,
-				MaxTokens: 500,
-				Stop:      []string{">>>>>>>"},
-				Messages:  []ai.Message{{Role: "user", Content: handoffStr}},
-			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-			resp, err := m.provider.Execute(ctx, req)
-			cancel()
-			if err != nil {
-				return hotfixProposalMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
-			}
-			if resp == nil || strings.TrimSpace(resp.Content) == "" {
-				// On attempt 1 with a cloud model, warn about empty
-				// output to help the developer understand token burn risk.
-				if attempt == 0 && isCloud {
-					m.push(roleSystem, fmt.Sprintf(
-						warningStyle.Render("[HOTFIX WARNING] %s returned empty output on attempt %d. "+
-							"The model may be wrapping the diff in markdown or conversational text. "+
-							"Retrying with explicit diff format instructions."),
-						m.cfg.ActiveModelName(), attempt+1))
-				}
-				if attempt < maxRetries {
-					// Inject a correction demonstrating the expected output format.
-					// On retry attempt 2 for cloud models, switch to SEARCH/REPLACE
-					// format to accommodate smaller models like cohere/north-mini-code:free.
-					if attempt == 1 && isCloud {
-						handoffStr = fmt.Sprintf(
-							"%s\n\nCORRECTION: Your previous response was empty or unparseable. Please use SEARCH/REPLACE block format for the patch:\n\n<<<<<<< SEARCH\n<old exact code from the file>\n=======\n<new replacement code>\n>>>>>>>\n\nReturn ONLY that block. No text before or after.",
-							handoff)
-					} else {
-						handoffStr = fmt.Sprintf(
-							"%s\n\nCORRECTION: Your previous response was empty or unparseable. The expected output is a raw unified diff block like:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n line1\n-line-old\n+line-new\n\nReturn ONLY that diff. No text before or after.",
-							handoff, task.Target, task.Target)
-					}
-					continue
-				}
-				return hotfixProposalMsg{Err: fmt.Errorf("patch generation returned empty output")}
-			}
-
-			rawContent := resp.Content
-			var resolved string
-			var diffContent string
-
-			// ── Step 1: Try robust diff extraction for cloud models ──
-			// ExtractDiffFromLLMOutput handles:
-			//   - Markdown code fences (```diff ... ```)
-			//   - Conversational text wrapping ("Here is the diff: ...")
-			//   - Missing diff --git headers (--- a/ ... +++ b/ only)
-			//   - Fuzzy string replacement fallback for single-file hotfixes
-			if orig != "" {
-				resolved, diffFound := execution.ExtractDiffFromLLMOutput(rawContent, orig, task.Description)
-				if diffFound {
-					// We successfully extracted/resolved the diff content.
-					// Compute the display diff using the resolved content.
-					diffContent = computeUnifiedDiff(task.Target, orig, resolved)
-				} else {
-					// No diff structure found — try conventional resolution.
-					resolved = execution.ResolveModifiedContent(orig, rawContent)
-					if resolved == orig && orig != "" {
-						// Structural breakdown: the model failed to produce a parseable diff.
-						// On attempt 1, warn and retry with explicit format demonstration.
-						if attempt == 0 && isCloud {
-							m.push(roleSystem, fmt.Sprintf(
-								warningStyle.Render("[HOTFIX WARNING] %s failed structural breakdown on attempt %d. "+
-									"The output contained no diff markers (--- a/, +++ b/, @@, <<<<<<< SEARCH). "+
-									"Retrying with explicit diff format demonstration."),
-								m.cfg.ActiveModelName(), attempt+1))
-						}
-						if attempt < maxRetries {
-							// Inject a correction that explicitly demonstrates the expected diff format.
-							// On retry attempt 2 for cloud models, switch to SEARCH/REPLACE
-							// format to accommodate smaller models like cohere/north-mini-code:free.
-							if attempt == 1 && isCloud {
-								handoffStr = fmt.Sprintf(
-									"%s\n\nCORRECTION: Your previous patch was rejected because it lacked valid diff markers. "+
-										"Please use SEARCH/REPLACE format (simpler for this model):\n\n<<<<<<< SEARCH\n<old exact code from the file>\n=======\n<new replacement code>\n>>>>>>>\n\nReturn ONLY that block. No text before or after.",
-									handoff)
-							} else {
-								handoffStr = fmt.Sprintf(
-									"%s\n\nCORRECTION: Your previous patch was rejected because it lacked valid diff markers. "+
-										"The expected format for a unified diff is:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n existing context line\n-old-line\n+new-line\n\n"+
-										"Or use SEARCH/REPLACE markers:\n<<<<<<< SEARCH\n<old code>\n=======\n<new code>\n>>>>>>>\n\n"+
-										"Return ONLY one of these formats. No conversational text. No explanations.",
-									handoff, task.Target, task.Target)
-							}
-							continue
-						}
-						return hotfixProposalMsg{Err: fmt.Errorf("patch generation: no valid diff or search/replace block found in LLM output for %s after %d attempts", task.Target, attempt+1)}
-					}
-					// resolved != orig, meaning the conventional parser found the diff
-					diffContent = computeUnifiedDiff(task.Target, orig, resolved)
-				}
-			} else {
-				// No original content available — use the raw LLM output as-is
-				// and compute a diff (which will show all lines as additions for a new file).
-				resolved = rawContent
-				diffContent = computeUnifiedDiff(task.Target, orig, resolved)
-			}
-
-			// ── STEP 2/2: Content Cleanse — strip markdown code fences ──
-			cleaned := sanitizeFileOutput(rawContent)
-
-			patch := &execution.Patch{
-				ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
-				File:          task.Target,
-				Original:      orig,
-				Modified:      cleaned,
-				TaskID:        task.StepNum,
-				ContextID:     m.sess.ContextID,
-				IsFullRewrite: true,
-			}
-
-			return hotfixProposalMsg{
-				Task:  task,
-				Patch: patch,
-				Diff:  diffContent,
-			}
+		// ── Single-attempt LLM call (no retry loop) ──────────────
+		// $hot is a fast-track command: one attempt, then immediate
+		// fallback to local resolution. This prevents wasteful token
+		// burn on retry loops that almost always produce the same failure.
+		req := ai.Request{
+			Model:     m.cfg.ActiveModelName(),
+			System:    system,
+			Stream:    false,
+			MaxTokens: 500,
+			Stop:      []string{">>>>>>>"},
+			Messages:  []ai.Message{{Role: "user", Content: handoff}},
 		}
 
-		return hotfixProposalMsg{Err: fmt.Errorf("patch generation failed after %d retries", maxRetries)}
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		resp, err := m.provider.Execute(ctx, req)
+		cancel()
+		if err != nil {
+			// LLM call failed — try local fuzzy fallback immediately.
+			if orig != "" {
+				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
+					diffContent := computeUnifiedDiff(task.Target, orig, modified)
+					patch := &execution.Patch{
+						ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+						File:          task.Target,
+						Original:      orig,
+						Modified:      modified,
+						TaskID:        task.StepNum,
+						ContextID:     m.sess.ContextID,
+						IsFullRewrite: true,
+					}
+					return hotfixProposalMsg{
+						Task:  task,
+						Patch: patch,
+						Diff:  diffContent,
+					}
+				}
+			}
+			return hotfixProposalMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
+		}
+		if resp == nil || strings.TrimSpace(resp.Content) == "" {
+			// Empty output from cloud model — abort immediately, do not retry.
+			if isCloud {
+				m.push(roleSystem, infoStyle.Render("[HOTFIX] Cloud model returned empty output. Aborting LLM attempt, trying local fallback..."))
+			}
+			// Try local fuzzy fallback.
+			if orig != "" {
+				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
+					diffContent := computeUnifiedDiff(task.Target, orig, modified)
+					patch := &execution.Patch{
+						ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+						File:          task.Target,
+						Original:      orig,
+						Modified:      modified,
+						TaskID:        task.StepNum,
+						ContextID:     m.sess.ContextID,
+						IsFullRewrite: true,
+					}
+					return hotfixProposalMsg{
+						Task:  task,
+						Patch: patch,
+						Diff:  diffContent,
+					}
+				}
+			}
+			return hotfixProposalMsg{Err: fmt.Errorf("patch generation returned empty output")}
+		}
+
+		rawContent := resp.Content
+
+		// ── Early abort for cloud providers ──
+		// If the raw output does not start with a diff marker, the model
+		// is likely wrapping the diff in conversational text or producing
+		// an unparseable response. For cloud models on a fast-track $hot
+		// command, we abort immediately (no retry) and fall back to local
+		// fuzzy replacement.
+		if isCloud && !hasDiffMarkerPrefix(rawContent) {
+			m.push(roleSystem, infoStyle.Render("[HOTFIX] Cloud model output lacks diff markers. Aborting early, trying local fallback..."))
+			if orig != "" {
+				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
+					diffContent := computeUnifiedDiff(task.Target, orig, modified)
+					patch := &execution.Patch{
+						ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+						File:          task.Target,
+						Original:      orig,
+						Modified:      modified,
+						TaskID:        task.StepNum,
+						ContextID:     m.sess.ContextID,
+						IsFullRewrite: true,
+					}
+					return hotfixProposalMsg{
+						Task:  task,
+						Patch: patch,
+						Diff:  diffContent,
+					}
+				}
+			}
+			return hotfixProposalMsg{Err: fmt.Errorf("patch generation: cloud model produced output without diff markers and local fallback also failed for %s", task.Target)}
+		}
+
+		var resolved string
+		var diffContent string
+
+		// ── Step 1: Try robust diff extraction ──
+		// ExtractDiffFromLLMOutput handles:
+		//   - Markdown code fences (```diff ... ```)
+		//   - Conversational text wrapping ("Here is the diff: ...")
+		//   - Missing diff --git headers (--- a/ ... +++ b/ only)
+		//   - Fuzzy string replacement fallback for single-file hotfixes
+		if orig != "" {
+			resolved, diffFound := execution.ExtractDiffFromLLMOutput(rawContent, orig, task.Description)
+			if diffFound {
+				diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+			} else {
+				// No diff structure found — try conventional resolution.
+				resolved = execution.ResolveModifiedContent(orig, rawContent)
+				if resolved == orig && orig != "" {
+					// Structural breakdown: the model failed to produce a parseable diff.
+					// For cloud providers, abort immediately (no retry).
+					if isCloud {
+						m.push(roleSystem, infoStyle.Render("[HOTFIX] Cloud model structural breakdown. Trying local fallback..."))
+						if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
+							diffContent = computeUnifiedDiff(task.Target, orig, modified)
+							patch := &execution.Patch{
+								ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+								File:          task.Target,
+								Original:      orig,
+								Modified:      modified,
+								TaskID:        task.StepNum,
+								ContextID:     m.sess.ContextID,
+								IsFullRewrite: true,
+							}
+							return hotfixProposalMsg{
+								Task:  task,
+								Patch: patch,
+								Diff:  diffContent,
+							}
+						}
+						return hotfixProposalMsg{Err: fmt.Errorf("patch generation: cloud model returned unparseable output and local fallback also failed for %s", task.Target)}
+					}
+					return hotfixProposalMsg{Err: fmt.Errorf("patch generation: no valid diff or search/replace block found in LLM output for %s", task.Target)}
+				}
+				// resolved != orig, meaning the conventional parser found the diff
+				diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+			}
+		} else {
+			// No original content available — use the raw LLM output as-is
+			// and compute a diff (which will show all lines as additions for a new file).
+			resolved = rawContent
+			diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+		}
+
+		// ── STEP 2/2: Content Cleanse — strip markdown code fences ──
+		cleaned := sanitizeFileOutput(rawContent)
+
+		patch := &execution.Patch{
+			ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+			File:          task.Target,
+			Original:      orig,
+			Modified:      cleaned,
+			TaskID:        task.StepNum,
+			ContextID:     m.sess.ContextID,
+			IsFullRewrite: true,
+		}
+
+		return hotfixProposalMsg{
+			Task:  task,
+			Patch: patch,
+			Diff:  diffContent,
+		}
 	}
+}
+
+// isHotfixLocalCandidate checks whether a $hot task qualifies for
+// zero-token local resolution: the target file must be explicitly
+// referenced with @ syntax (e.g. @LICENSE) and the description
+// must contain a simple-text-modification verb (rename, change,
+// update, replace, fix, etc.).
+func isHotfixLocalCandidate(description, target string) bool {
+	if target == "" || description == "" {
+		return false
+	}
+	// Require an explicit @file reference so we never apply a
+	// local heuristic to an ambiguous prompt. Match @basename
+	// (e.g. @LICENSE) and also @path/target for explicit paths.
+	targetBase := filepath.Base(target)
+	hasExplicitRef := strings.Contains(description, "@"+targetBase) ||
+		strings.Contains(description, "@"+target)
+	if !hasExplicitRef {
+		return false
+	}
+	lower := strings.ToLower(description)
+	simpleMutationSignals := []string{
+		"rename", "change", "update", "replace", "with ", "to ",
+		"fix typo", "fix spelling", "fix grammar",
+		"capitalize", "lowercase", "uppercase",
+		"bump version", "remove ", "delete ", "strip ",
+	}
+	for _, sig := range simpleMutationSignals {
+		if strings.Contains(lower, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasDiffMarkerPrefix reports whether the raw LLM output starts
+// with a recognizable diff marker (--- a/, diff, <<<<<<< SEARCH)
+// after trimming leading whitespace. Used as an early-abort guard
+// for cloud providers so that responses clearly lacking diff
+// structure are not subjected to expensive extraction logic.
+func hasDiffMarkerPrefix(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	return strings.HasPrefix(trimmed, "---") ||
+		strings.HasPrefix(trimmed, "diff") ||
+		strings.HasPrefix(trimmed, "<<<<<<<")
 }
 
 // proposeStdlibBuildPatch generates a patch for a hardcoded stdlib case-correction

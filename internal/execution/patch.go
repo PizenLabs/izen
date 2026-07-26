@@ -1964,7 +1964,7 @@ func extractDiffBlock(content string) string {
 	return strings.Join(diffLines, "\n")
 }
 
-// applyFuzzyStringReplace attempts a single-file hotfix by finding
+// ApplyFuzzyStringReplace attempts a single-file hotfix by finding
 // the target string (from the hotfix description) in the original
 // file and generating a valid modified content. This fallback is
 // used when strict diff parsing fails entirely.
@@ -1973,16 +1973,20 @@ func extractDiffBlock(content string) string {
 // matching: it scans the original content for lines relevant to
 // the hotfix (e.g., lines containing "Copyright" or author names)
 // and substitutes the target value within those lines.
-func applyFuzzyStringReplace(origContent, description, targetFile string) (string, bool) {
+func ApplyFuzzyStringReplace(origContent, description, targetFile string) (string, bool) {
 	if origContent == "" || description == "" {
 		return "", false
 	}
 
 	// Context-aware replacement for file-specific hotfixes.
+	// If this fails, do NOT fall through to generic string
+	// replacement — that could modify arbitrary lines that
+	// do not match copyright/author anchor keywords.
 	if targetFile != "" {
-		if modified, ok := applyContextAwareFuzzyReplace(origContent, description, targetFile); ok {
+		if modified, ok := ApplyContextAwareFuzzyReplace(origContent, description, targetFile); ok {
 			return modified, true
 		}
+		return "", false
 	}
 
 	// Try to find a rename/change/replace/swap instruction.
@@ -2039,12 +2043,17 @@ func applyFuzzyStringReplace(origContent, description, targetFile string) (strin
 	return "", false
 }
 
-// applyContextAwareFuzzyReplace handles hotfix descriptions that
+// ApplyContextAwareFuzzyReplace handles hotfix descriptions that
 // target a specific file and require context-aware replacement.
-// For example, "rename author in @LICENSE to 'Mashashi'" should
-// find lines in the LICENSE file containing "Copyright" or author
-// names and replace the author value within those lines.
-func applyContextAwareFuzzyReplace(origContent, description, targetFile string) (string, bool) {
+// It strictly restricts substitutions to lines that explicitly match
+// copyright/author anchor patterns (e.g. "Copyright (c) YEAR Name",
+// "Author: Name", "@author Name").
+// Only the author/holder name portion is replaced; all structural
+// text (Copyright, (c), year, etc.) is left completely intact.
+// If no matching anchor line is found, returns ("", false) so the
+// caller can safely fall back or report that the target could not
+// be anchored.
+func ApplyContextAwareFuzzyReplace(origContent, description, targetFile string) (string, bool) {
 	// Extract the replacement value from the description.
 	// Patterns: "rename X to 'new'", "rename X to new",
 	// "change X to 'new'", "replace X with 'new", etc.
@@ -2067,10 +2076,18 @@ func applyContextAwareFuzzyReplace(origContent, description, targetFile string) 
 		return "", false
 	}
 
-	// Look for contextually relevant lines (copyright/author lines).
-	contextPatterns := []*regexp.Regexp{
+	// Strict anchor-line patterns: only lines that are unambiguously
+	// copyright or author attribution lines are targeted.
+	// Pattern 1: Lines containing "Copyright" (case-insensitive).
+	// Pattern 2: Lines starting with "Author:" or "@author".
+	// Do not match any other lines — no fallback on body text.
+	anchorPatterns := []*regexp.Regexp{
+		// Lines containing "Copyright" (case-insensitive).
 		regexp.MustCompile(`(?i)copyright`),
-		regexp.MustCompile(`(?i)author`),
+		// Lines starting with "Author:" or "Authors:" (case-insensitive).
+		regexp.MustCompile(`(?i)^[\s]*author[s]?\s*[:<]\s+`),
+		// Lines starting with "@author" (case-insensitive).
+		regexp.MustCompile(`(?i)^[\s]*@author\b`),
 	}
 
 	lines := strings.Split(origContent, "\n")
@@ -2079,34 +2096,36 @@ func applyContextAwareFuzzyReplace(origContent, description, targetFile string) 
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		isContextLine := false
-		for _, ctxPat := range contextPatterns {
-			if ctxPat.MatchString(trimmed) {
-				isContextLine = true
+		if trimmed == "" {
+			result = append(result, line)
+			continue
+		}
+
+		anchorIdx := -1
+		for i, pat := range anchorPatterns {
+			if pat.MatchString(trimmed) {
+				anchorIdx = i
 				break
 			}
 		}
-
-		if isContextLine {
-			// Try to extract the old value from the context line.
-			oldValue := extractOldValueFromContextLine(line)
-			if oldValue != "" {
-				newLine := strings.Replace(line, oldValue, newValue, 1)
-				if newLine != line {
-					result = append(result, newLine)
-					modified = true
-					continue
-				}
-			}
-			// Fallback: try a simple word substitution.
-			newLine := substituteLastNameToken(line, newValue)
-			if newLine != line {
-				result = append(result, newLine)
-				modified = true
-				continue
-			}
+		if anchorIdx < 0 {
+			// Not a copyright/author anchor line — skip entirely.
+			result = append(result, line)
+			continue
 		}
 
+		// Try to extract and replace the author/holder name
+		// from this anchor line using a precise substitution.
+		newLine, didReplace := preciseAuthorReplace(line, newValue, anchorIdx)
+		if didReplace && newLine != line {
+			result = append(result, newLine)
+			modified = true
+			continue
+		}
+
+		// If precise replacement could not find an author name
+		// to swap, leave the line untouched (do not fall back
+		// to arbitrary token substitution).
 		result = append(result, line)
 	}
 
@@ -2116,74 +2135,46 @@ func applyContextAwareFuzzyReplace(origContent, description, targetFile string) 
 	return strings.Join(result, "\n"), true
 }
 
-// extractOldValueFromContextLine tries to extract the old author
-// or copyright holder name from a context line by looking for
-// patterns like "Copyright (c) YEAR OLD_NAME" or "Author: OLD_NAME".
-func extractOldValueFromContextLine(line string) string {
-	copyrightRe := regexp.MustCompile(`(?i)copyright\s*(?:\([^)]*\))?\s*\d{4}\s+(.+)`)
-	matches := copyrightRe.FindStringSubmatch(strings.TrimSpace(line))
-	if len(matches) >= 2 {
-		return strings.TrimSpace(matches[1])
-	}
-
-	copyrightRe2 := regexp.MustCompile(`(?i)copyright\s+\d{4}\s+(.+)`)
-	matches = copyrightRe2.FindStringSubmatch(strings.TrimSpace(line))
-	if len(matches) >= 2 {
-		return strings.TrimSpace(matches[1])
-	}
-
-	return ""
-}
-
-// substituteLastNameToken replaces the last "name-like" token in a
-// line with the new value. This handles cases where the context line
-// has a copyright notice like "Copyright (c) 2023 OldName Author"
-// and we want to replace "OldName" with the new author name.
-func substituteLastNameToken(line, newValue string) string {
+// preciseAuthorReplace substitutes the author/holder name in an
+// anchor line. It handles three canonical formats and only touches
+// the name portion, leaving all structural text intact.
+//
+// anchorIdx identifies which pattern matched, driving the
+// extraction strategy:
+//   - 0: "Copyright (c) YEAR NAME" or "Copyright YEAR NAME" — replace NAME only
+//   - 1: "Author: NAME" or "Authors: NAME" — replace NAME only
+//   - 2: "@author NAME" — replace NAME only
+func preciseAuthorReplace(line string, newValue string, anchorIdx int) (string, bool) {
 	trimmed := strings.TrimSpace(line)
-	words := strings.Fields(trimmed)
-	if len(words) == 0 {
-		return line
-	}
+	var matches []string
 
-	for i := len(words) - 1; i >= 0; i-- {
-		word := words[i]
-		clean := strings.Trim(word, "(),.\"':;")
-		if len(clean) < 2 {
-			continue
+	switch anchorIdx {
+	case 0:
+		// "Copyright (c) YEAR NAME" — replace the name after the year.
+		re0 := regexp.MustCompile(`(?i)^([\s]*copyright\s*(?:\([^)]*\))?\s*\d{4}\s+)(\S.*)`)
+		matches = re0.FindStringSubmatch(trimmed)
+		if len(matches) < 3 || matches[2] == "" {
+			return line, false
 		}
-		if isYear(clean) {
-			continue
+		return matches[1] + newValue, true
+	case 1:
+		// "Author: NAME" or "Authors: NAME" — replace after the prefix.
+		re1 := regexp.MustCompile(`(?i)^([\s]*author[s]?\s*[:<]\s+)(\S.*)`)
+		matches = re1.FindStringSubmatch(trimmed)
+		if len(matches) < 3 || matches[2] == "" {
+			return line, false
 		}
-		if strings.EqualFold(clean, "copyright") || strings.EqualFold(clean, "all") ||
-			strings.EqualFold(clean, "rights") || strings.EqualFold(clean, "reserved") ||
-			strings.EqualFold(clean, "author") || strings.EqualFold(clean, "by") {
-			continue
+		return matches[1] + newValue, true
+	case 2:
+		// "@author NAME" — replace after @author.
+		re2 := regexp.MustCompile(`(?i)^([\s]*@author\b\s+)(\S.*)`)
+		matches = re2.FindStringSubmatch(trimmed)
+		if len(matches) < 3 || matches[2] == "" {
+			return line, false
 		}
-		origWord := words[i]
-		newWord := strings.Replace(origWord, clean, newValue, 1)
-		words[i] = newWord
-		return strings.Join(words, " ")
+		return matches[1] + newValue, true
 	}
-
-	return line
-}
-
-// isYear reports whether a string is a 4-digit year (1900-2099).
-func isYear(s string) bool {
-	if len(s) != 4 {
-		return false
-	}
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	n := 0
-	for _, c := range s {
-		n = n*10 + int(c-'0')
-	}
-	return n >= 1900 && n <= 2099
+	return line, false
 }
 
 // ExtractDiffFromLLMOutput extracts unified diff content from raw LLM
@@ -2247,7 +2238,7 @@ func ExtractDiffFromLLMOutput(rawLLMOutput, originalContent, description string)
 
 	// Phase 3: Fuzzy string replacement fallback for single-file hotfixes.
 	if originalContent != "" && description != "" {
-		if modified, ok := applyFuzzyStringReplace(originalContent, description, ""); ok {
+		if modified, ok := ApplyFuzzyStringReplace(originalContent, description, ""); ok {
 			return modified, true
 		}
 	}
