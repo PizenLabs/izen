@@ -2388,14 +2388,13 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 	}
 }
 
-// proposeTrivialCreatePatch generates a trivial template file (LICENSE,
-// .gitignore, .env) locally using Go string templates — zero cloud tokens.
-// It bypasses the LLM entirely and returns a buildProposalReadyMsg with the
-// generated content and a unified diff against any existing file content.
-func (m *model) proposeTrivialCreatePatch(task *plan.Task) tea.Cmd {
+// applyTrivialTemplate bypasses the approval gate entirely for known
+// static templates (LICENSE, .gitignore, .env). It generates the content
+// deterministically from Go templates, applies it immediately, and returns
+// a buildResultMsg — completing in < 50ms with zero LLM calls.
+func (m *model) applyTrivialTemplate(task *plan.Task) tea.Cmd {
 	return func() tea.Msg {
 		canonicalTarget := gateway.CanonicalizeFileName(task.Target)
-		task.Target = canonicalTarget
 		var orig string
 		if data, rerr := os.ReadFile(canonicalTarget); rerr == nil {
 			orig = string(data)
@@ -2403,9 +2402,7 @@ func (m *model) proposeTrivialCreatePatch(task *plan.Task) tea.Cmd {
 
 		description := task.Description
 		content := generateTrivialContent(canonicalTarget, description)
-
 		cleaned := execution.SanitizeLLMResponse(content)
-		diff := computeUnifiedDiff(canonicalTarget, orig, cleaned)
 
 		patch := &execution.Patch{
 			ID:            fmt.Sprintf("template-%d", task.StepNum),
@@ -2417,11 +2414,26 @@ func (m *model) proposeTrivialCreatePatch(task *plan.Task) tea.Cmd {
 			IsFullRewrite: true,
 		}
 
-		return buildProposalReadyMsg{
-			Task:   task,
-			Patch:  patch,
-			Diff:   diff,
-			Output: cleaned,
+		if orig == cleaned {
+			return buildResultMsg{
+				output:   fmt.Sprintf("File %s is already up to date (trivial template).", canonicalTarget),
+				exitCode: 0,
+			}
+		}
+
+		if m.execEng != nil && m.execEng.Patches != nil {
+			if err := m.execEng.Patches.Apply(patch); err != nil {
+				return buildResultMsg{
+					output:   "",
+					exitCode: 1,
+					err:      fmt.Errorf("trivial template apply failed: %w", err),
+				}
+			}
+		}
+
+		return buildResultMsg{
+			output:   fmt.Sprintf("Created %s from template (%d lines).", canonicalTarget, len(strings.Split(cleaned, "\n"))),
+			exitCode: 0,
 		}
 	}
 }
@@ -3082,8 +3094,7 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 			}
 			return tea.Batch(
 				func() tea.Msg { return agentStartMsg{label: "template"} },
-				m.proposeTrivialCreatePatch(targetTask),
-				m.spinnerTickCmd(),
+				m.applyTrivialTemplate(targetTask),
 			)
 		}
 
