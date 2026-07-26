@@ -10,6 +10,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"github.com/PizenLabs/izen/internal/core/authorization"
+	"github.com/PizenLabs/izen/internal/core/budget"
 )
 
 type RunResult struct {
@@ -90,6 +93,8 @@ type Runner struct {
 	activeCtxID    string
 	sandboxMode    SandboxMode
 	riskClassifier *RiskClassifier
+	auth           *authorization.MutationAuthorization
+	budget         *budget.MutationBudget
 }
 
 func NewRunner(root string, sandbox, confirm bool) *Runner {
@@ -100,6 +105,22 @@ func NewRunner(root string, sandbox, confirm bool) *Runner {
 		sandboxMode:    SandboxPolicy,
 		riskClassifier: NewRiskClassifier(),
 	}
+}
+
+func (r *Runner) SetAuthorization(auth *authorization.MutationAuthorization) {
+	r.auth = auth
+}
+
+func (r *Runner) Authorization() *authorization.MutationAuthorization {
+	return r.auth
+}
+
+func (r *Runner) SetBudget(b *budget.MutationBudget) {
+	r.budget = b
+}
+
+func (r *Runner) Budget() *budget.MutationBudget {
+	return r.budget
 }
 
 func (r *Runner) SetSandboxMode(mode SandboxMode) {
@@ -116,15 +137,6 @@ func (r *Runner) SetContextID(id string) {
 
 func (r *Runner) ActiveContextID() string {
 	return r.activeCtxID
-}
-
-func (r *Runner) Run(command string) (*RunResult, error) {
-	return r.run(command, r.root)
-}
-
-func (r *Runner) RunInDir(command, dir string) (*RunResult, error) {
-	fullDir := filepath.Join(r.root, dir)
-	return r.run(command, fullDir)
 }
 
 func (r *Runner) RequiresConfirm(command string) bool {
@@ -168,6 +180,15 @@ func (r *Runner) SandboxCheck(command string) error {
 }
 
 func (r *Runner) run(command, dir string) (*RunResult, error) {
+	if err := checkAuthorization(r.auth); err != nil {
+		return &RunResult{
+			Command:  command,
+			Dir:      dir,
+			ExitCode: -1,
+			Stderr:   err.Error(),
+		}, err
+	}
+
 	if r.sandbox {
 		if err := r.SandboxCheck(command); err != nil {
 			return &RunResult{
@@ -208,7 +229,37 @@ func (r *Runner) run(command, dir string) (*RunResult, error) {
 	unregisterProcess(cmd)
 	result.Stdout = strings.TrimSpace(stdout.String())
 	result.Stderr = strings.TrimSpace(stderr.String())
+
+	if r.budget != nil {
+		_ = r.budget.Consume(budget.BudgetDelta{ShellCmds: 1})
+	}
+
+	markAuthConsumed(r.auth)
 	return result, nil
+}
+
+func (r *Runner) Run(command string) (*RunResult, error) {
+	if err := checkAuthorization(r.auth); err != nil {
+		return &RunResult{
+			Command:  command,
+			ExitCode: -1,
+			Stderr:   err.Error(),
+		}, err
+	}
+	return r.run(command, r.root)
+}
+
+func (r *Runner) RunInDir(command, dir string) (*RunResult, error) {
+	if err := checkAuthorization(r.auth); err != nil {
+		return &RunResult{
+			Command:  command,
+			Dir:      dir,
+			ExitCode: -1,
+			Stderr:   err.Error(),
+		}, err
+	}
+	fullDir := filepath.Join(r.root, dir)
+	return r.run(command, fullDir)
 }
 
 func (r *Runner) KillOrphans() {

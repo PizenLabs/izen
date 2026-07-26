@@ -606,6 +606,7 @@ func TestAmbiguousSnippetFailsAtParsing(t *testing.T) {
 
 	pm := NewPatchManager(t.TempDir())
 	pm.SetGuardrail(nil)
+	pm.SetAuthorization(testAuth())
 
 	err := pm.Apply(patch)
 	if err == nil {
@@ -672,6 +673,7 @@ func TestApplySearchReplaceBlockIntegration(t *testing.T) {
 
 	pm := NewPatchManager(t.TempDir())
 	pm.SetGuardrail(nil)
+	pm.SetAuthorization(testAuth())
 
 	err := pm.Apply(patch)
 	if err != nil {
@@ -695,6 +697,7 @@ func TestApplySearchReplaceBlockInFencedBlock(t *testing.T) {
 
 	pm := NewPatchManager(t.TempDir())
 	pm.SetGuardrail(nil)
+	pm.SetAuthorization(testAuth())
 
 	err := pm.Apply(patch)
 	if err != nil {

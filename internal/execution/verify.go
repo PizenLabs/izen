@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/language"
 )
 
@@ -215,6 +216,15 @@ type Verifier struct {
 	root   string
 	steps  []VerificationStep
 	langID language.ID
+	auth   *authorization.MutationAuthorization
+}
+
+func (v *Verifier) SetAuthorization(auth *authorization.MutationAuthorization) {
+	v.auth = auth
+}
+
+func (v *Verifier) Authorization() *authorization.MutationAuthorization {
+	return v.auth
 }
 
 var defaultVerificationSteps = []VerificationStep{
@@ -345,6 +355,9 @@ func (v *Verifier) RunAll() VerificationReport {
 
 func (v *Verifier) runStep(step VerificationStep) VerificationResult {
 	runner := NewRunner(v.root, false, false)
+	if v.auth != nil {
+		runner.SetAuthorization(v.auth)
+	}
 
 	rawResult, err := runner.Run(step.Command)
 

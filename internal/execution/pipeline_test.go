@@ -5,10 +5,19 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/modes"
 )
+
+func testAuth() *authorization.MutationAuthorization {
+	return &authorization.MutationAuthorization{
+		ID:        authorization.NewAuthorizationID(),
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+	}
+}
 
 func TestPolicyEngineAllowsKnownCapability(t *testing.T) {
 	pe := NewPolicyEngine(func() modes.Capability {
@@ -234,6 +243,7 @@ func TestVerifierDefaultSteps(t *testing.T) {
 
 func TestVerifierCustomSteps(t *testing.T) {
 	v := NewVerifier(".")
+	v.SetAuthorization(testAuth())
 	custom := []VerificationStep{
 		{Name: "echo", Command: "echo hello", Optional: false},
 	}
@@ -269,6 +279,7 @@ func TestVerifierCustomStepsFailure(t *testing.T) {
 
 func TestVerifierOptionalFailure(t *testing.T) {
 	v := NewVerifier(".")
+	v.SetAuthorization(testAuth())
 	custom := []VerificationStep{
 		{Name: "optional-fail", Command: "exit 1", Optional: true},
 		{Name: "pass", Command: "echo ok", Optional: false},
@@ -289,6 +300,7 @@ func TestPipelineExecuteBuild(t *testing.T) {
 	pe := NewPolicyEngine(func() modes.Capability { return modes.CapRead | modes.CapWrite | modes.CapShell | modes.CapTest })
 	rc := NewRiskClassifier()
 	v := NewVerifier(dir)
+	v.SetAuthorization(testAuth())
 	d := NewDiffAnalyzer()
 
 	engine := &Engine{
@@ -301,6 +313,7 @@ func TestPipelineExecuteBuild(t *testing.T) {
 		root:     dir,
 		Patches:  NewPatchManager(dir),
 	}
+	engine.SetAuthorization(testAuth())
 	engine.Pipeline = NewPipelineRunner(engine)
 
 	patches := []StagedPatch{

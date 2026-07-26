@@ -178,6 +178,7 @@ func TestApplyHaltOnMutationLoop(t *testing.T) {
 	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	pm := NewPatchManager(dir)
+	pm.SetAuthorization(testAuth())
 	pm.SetContextID("#42")
 
 	g := NewMutationGuardrail(dir)
@@ -231,6 +232,7 @@ func TestApplyGuardrailDisabled(t *testing.T) {
 	dir := t.TempDir()
 	pm := NewPatchManager(dir)
 	pm.SetGuardrail(nil)
+	pm.SetAuthorization(testAuth())
 
 	file := "routes.go"
 	fullPath := filepath.Join(dir, file)

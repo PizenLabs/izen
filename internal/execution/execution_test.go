@@ -15,6 +15,7 @@ func TestPatchManagerLedgerBridge(t *testing.T) {
 	defer func() { _ = os.RemoveAll(dir) }()
 
 	pm := NewPatchManager(dir)
+	pm.SetAuthorization(testAuth())
 	ledger := context.NewTaskLedger()
 	pm.SetLedger(ledger)
 	pm.SetContextID("#ctx-go-1-r1")
@@ -62,6 +63,7 @@ func TestPatchManagerLedgerNoOpWithoutTaskID(t *testing.T) {
 	defer func() { _ = os.RemoveAll(dir) }()
 
 	pm := NewPatchManager(dir)
+	pm.SetAuthorization(testAuth())
 	ledger := context.NewTaskLedger()
 	pm.SetLedger(ledger)
 
@@ -85,6 +87,7 @@ func TestPatchManagerLedgerNoOpWithoutTaskID(t *testing.T) {
 
 func TestRunnerBasic(t *testing.T) {
 	r := NewRunner(".", false, false)
+	r.SetAuthorization(testAuth())
 	result, err := r.Run("echo hello")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -99,6 +102,7 @@ func TestRunnerBasic(t *testing.T) {
 
 func TestRunnerExitCode(t *testing.T) {
 	r := NewRunner(".", false, false)
+	r.SetAuthorization(testAuth())
 	result, err := r.Run("exit 42")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -110,6 +114,7 @@ func TestRunnerExitCode(t *testing.T) {
 
 func TestRunnerSandboxBlocksDangerous(t *testing.T) {
 	r := NewRunner(".", true, false)
+	r.SetAuthorization(testAuth())
 	_, err := r.Run("rm -rf /")
 	if err == nil {
 		t.Fatal("expected sandbox to block dangerous command")
@@ -118,6 +123,7 @@ func TestRunnerSandboxBlocksDangerous(t *testing.T) {
 
 func TestRunnerSandboxAllowsSafe(t *testing.T) {
 	r := NewRunner(".", true, false)
+	r.SetAuthorization(testAuth())
 	result, err := r.Run("echo safe")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -151,6 +157,7 @@ func TestIsDangerous(t *testing.T) {
 
 func TestRunnerStderr(t *testing.T) {
 	r := NewRunner(".", false, false)
+	r.SetAuthorization(testAuth())
 	result, err := r.Run("echo error >&2")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -169,6 +176,7 @@ func TestRunInDir(t *testing.T) {
 	}
 
 	r := NewRunner(dir, false, false)
+	r.SetAuthorization(testAuth())
 	result, err := r.RunInDir("cat marker.txt", ".")
 	if err != nil {
 		t.Fatalf("RunInDir: %v", err)
@@ -245,6 +253,7 @@ func TestPatchManager(t *testing.T) {
 	defer func() { _ = os.RemoveAll(tmpDir(t, dir)) }()
 
 	pm := NewPatchManager(dir)
+	pm.SetAuthorization(testAuth())
 
 	testFile := filepath.Join("subdir", "test.txt")
 	fullPath := filepath.Join(dir, testFile)
@@ -462,6 +471,7 @@ func TestPatchLoadNotFound(t *testing.T) {
 
 func TestRunnerCommand(t *testing.T) {
 	r := NewRunner(".", false, false)
+	r.SetAuthorization(testAuth())
 	result, err := r.Run("printf 'line1\nline2'")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -472,7 +482,9 @@ func TestRunnerCommand(t *testing.T) {
 }
 
 func TestRunnerDir(t *testing.T) {
-	result, err := (&Runner{}).run("pwd", "/tmp")
+	r := &Runner{}
+	r.SetAuthorization(testAuth())
+	result, err := r.run("pwd", "/tmp")
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
