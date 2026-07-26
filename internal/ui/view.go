@@ -64,22 +64,35 @@ func (m *model) View() string {
 
 // renderWorkspace is the ONLY rendering primitive. It projects a Workspace
 // onto the terminal with no awareness of mode, workflow, or UI logic.
+// The screen is partitioned into three vertical regions:
+//   - Fixed top region: Header (WorkflowState + CapabilitySet)
+//   - Scrollable middle region: Viewport + ProposalDock + Input + StatusBar
+//   - Fixed bottom region: Footer (Budget + notifications)
 func renderWorkspace(ws Workspace) string {
 	if ws.Overlay != "" {
 		return ws.Overlay
 	}
-	var parts []string
-	parts = append(parts, ws.Viewport)
+
+	// Build the scrollable content body (viewport + proposal + input + status).
+	var bodyParts []string
+	if ws.Viewport != "" {
+		bodyParts = append(bodyParts, ws.Viewport)
+	}
 	if ws.ProposalDock != "" {
-		parts = append(parts, ws.ProposalDock)
+		bodyParts = append(bodyParts, ws.ProposalDock)
 	}
 	if ws.Input != "" {
-		parts = append(parts, ws.Input)
+		bodyParts = append(bodyParts, ws.Input)
 	}
-	if ws.Footer != "" {
-		parts = append(parts, ws.Footer)
+	if ws.StatusBar != "" {
+		bodyParts = append(bodyParts, ws.StatusBar)
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+	body := lipgloss.JoinVertical(lipgloss.Left, bodyParts...)
+
+	// Partition into fixed header / scrollable body / fixed footer.
+	// If either fixed region is empty, the layout falls back to a simple
+	// vertical join so the caller sees no structural change.
+	return Partition(body, ws.Header, ws.Footer)
 }
 
 // assembleScreen builds the Workspace's screen regions from the supplied
@@ -87,6 +100,9 @@ func renderWorkspace(ws Workspace) string {
 // model layer, NOT the renderer: it computes region heights, sizes the
 // viewport, and precomposes the input and footer regions. The renderer later
 // projects the resulting Workspace without re-deriving any of this.
+//
+// Fixed Header and Fixed Footer are derived from RuntimeContext and
+// WorkflowStateMachine — the model never caches these values independently.
 func (m *model) assembleScreen(actions []Action) Workspace {
 	width := m.width
 	if width < 40 {
@@ -101,6 +117,14 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 	if m.inViMode {
 		borderColor = viBorderStyle
 	}
+
+	// ── Fixed Header: WorkflowState + CapabilitySet + Artifact info ──
+	headerView := renderFixedHeader(m.runtimeCtx, m.workflowSM, m.sess, width, mode)
+	headerLines := strings.Count(headerView, "\n") + 1
+
+	// ── Fixed Footer: Budget counters + notifications ──
+	footerView := renderFixedFooter(m.runtimeCtx, m.uiNotice, width)
+	footerLines := strings.Count(footerView, "\n") + 1
 
 	// ── Input region: autocomplete + separators + prompt ──
 	var inputView strings.Builder
@@ -120,30 +144,33 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 		inputView.WriteString(promptLabel + " " + m.ti.View() + "\n")
 	}
 	inputView.WriteString(rule(width, borderColor))
+	inputLines := strings.Count(inputView.String(), "\n") + 1
 
-	// ── Footer: status bar (telemetry with capabilities inlined) ──
-	footerView := m.renderStatusBar(width, actions)
+	// ── Status bar (telemetry with capabilities inlined) — below Input, above Footer ──
+	statusBarView := m.renderStatusBar(width, actions)
+	statusBarLines := strings.Count(statusBarView, "\n") + 1
 
-	// ── Proposal dock (conditional) ──
+	// ── Proposal dock (conditional) — floats above Input ──
 	var proposalDockView string
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
 		proposalDockView = m.renderProposalBlock()
 	}
+	proposalLines := strings.Count(proposalDockView, "\n")
 
-	// ── Size the viewport to fill the remaining space (no manual constants) ──
-	inputHeight := lipgloss.Height(inputView.String())
-	statusHeight := lipgloss.Height(footerView)
-	proposalHeight := lipgloss.Height(proposalDockView)
-
-	m.Viewport.Height = m.height - inputHeight - statusHeight - proposalHeight
-	if m.Viewport.Height < 1 {
-		m.Viewport.Height = 1
+	// ── Size the viewport to fill remaining space between fixed regions ──
+	totalFixed := headerLines + inputLines + statusBarLines + footerLines
+	vpHeight := m.height - totalFixed - proposalLines
+	if vpHeight < 1 {
+		vpHeight = 1
 	}
+	m.Viewport.Height = vpHeight
 
 	return Workspace{
+		Header:       headerView,
 		Viewport:     m.Viewport.View(),
 		ProposalDock: proposalDockView,
 		Input:        inputView.String(),
+		StatusBar:    statusBarView,
 		Footer:       footerView,
 		Actions:      actions,
 	}

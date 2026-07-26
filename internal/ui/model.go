@@ -20,6 +20,8 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/core/runtime"
+	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
@@ -823,6 +825,13 @@ type model struct {
 	// injected at bootstrap (explicit, deterministic) and never mutated by
 	// the renderer — the UI stays mode-agnostic.
 	viewRegistry *Registry
+
+	// Control Plane references: injected at bootstrap, never mutated by the UI.
+	// The UI reads these directly to derive WorkflowState, CapabilitySet flags,
+	// MutationBudget counters, and Artifact lifecycle states — it MUST NOT
+	// store or cache its own copies of workflow states or capability flags.
+	runtimeCtx *runtime.RuntimeContext
+	workflowSM *workflow.WorkflowStateMachine
 
 	// Init/setup state machine
 	initStage          initStage

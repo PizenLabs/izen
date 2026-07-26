@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -12,6 +13,11 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/audit"
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/core/artifact"
+	"github.com/PizenLabs/izen/internal/core/budget"
+	"github.com/PizenLabs/izen/internal/core/capability"
+	"github.com/PizenLabs/izen/internal/core/runtime"
+	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
@@ -148,8 +154,34 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	reg.Register(modes.ModeInvestigate, investigateView{})
 	reg.Register(modes.ModeReview, reviewView{})
 
+	// ── CONTROL PLANE: RuntimeContext + WorkflowStateMachine ──────────────
+	// These are the single source of truth for capability flags, budget
+	// counters, artifact lifecycle states, and workflow state. The UI reads
+	// them directly and MUST NOT cache or duplicate these values.
+	caps := capability.NewCapabilitySet()
+	caps.Grant(capability.CapabilityRead)
+	caps.Grant(capability.CapabilityWrite)
+	caps.Grant(capability.CapabilityExecute)
+	caps.Grant(capability.CapabilityTest)
+	caps.Grant(capability.CapabilityPatch)
+	caps.Grant(capability.CapabilityCheckpoint)
+	caps.Grant(capability.CapabilityRollback)
+	artStore := artifact.NewStore(root)
+	bgt := budget.NewBudget(
+		100,            // max files
+		5000,           // max diff lines
+		1_000_000,      // max tokens
+		10,             // max attempts
+		30*time.Second, // max duration per step
+		5,              // max concurrent commands
+	)
+	runtimeCtx := runtime.New(artStore, caps, bgt)
+	workflowSM := workflow.NewWorkflowStateMachine()
+
 	m := &model{
 		cfg:                 cfg,
+		runtimeCtx:          runtimeCtx,
+		workflowSM:          workflowSM,
 		sess:                sess,
 		provider:            provider,
 		mgr:                 mgr,

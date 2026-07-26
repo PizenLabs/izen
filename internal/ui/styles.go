@@ -268,6 +268,69 @@ func isCoreEngineeringMode(m modes.Mode) bool {
 		m == modes.ModeInvestigate || m == modes.ModeReview
 }
 
+// ── Header / Footer / Approval / Distinction Styles ───────────────────────
+var (
+	// Header
+	HeaderWorkflowStateStyle = lipgloss.NewStyle().
+					Bold(true).
+					Foreground(lipgloss.Color(colorMauve))
+	HeaderArtifactIDStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(colorCyan))
+	HeaderLifecycleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color(colorYellow))
+	HeaderCapEnabled = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(colorGreen)).
+				Padding(0, 1)
+	HeaderCapDisabled = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(colorDimmed)).
+				Padding(0, 1)
+	HeaderLabel = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(colorMuted))
+	HeaderBorder = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder()).
+			BorderTop(false).
+			BorderLeft(false).
+			BorderRight(false).
+			BorderForeground(lipgloss.Color(colorSubtle))
+
+	// Footer
+	FooterBudgetLabel = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(colorMuted))
+	FooterBudgetValue = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color(colorText))
+	FooterBudgetExhausted = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color(colorRed))
+	FooterNotification = lipgloss.NewStyle().
+				Foreground(lipgloss.Color(colorOrange))
+	FooterBorder = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder()).
+			BorderBottom(false).
+			BorderLeft(false).
+			BorderRight(false).
+			BorderForeground(lipgloss.Color(colorSubtle))
+
+	// Approval prompt styles
+	ApprovalBox     = lipgloss.NewStyle().Border(lipgloss.DoubleBorder()).BorderForeground(lipgloss.Color(colorOrange)).Padding(0, 1)
+	ApprovalTitle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorYellow))
+	ApprovalLabel   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	ApprovalValue   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+	ApprovalFile    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan))
+	ApprovalCap     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen)).Bold(true)
+	ApprovalBudget  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))
+	ApprovalKey     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMauve))
+	ApprovalWarning = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
+	ApprovalInfo    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+
+	// Distinction styles
+	DistinctionConfirmed  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen)).Bold(true)
+	DistinctionHypothesis = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Italic(true)
+	DistinctionUnknown    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRed)).Bold(true)
+	DistinctionErrorClass = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMaroon)).Bold(true)
+)
+
 // Pre-compiled Markdown renderer styles (render-path — zero NewStyle).
 var (
 	mdEmphasisStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7")).Italic(true)
