@@ -137,3 +137,91 @@ func TestRenderLicenseFallback(t *testing.T) {
 		t.Error("expected false for unknown license type")
 	}
 }
+
+func TestSynthesizeBuildTodosFromMutation_StaticWebsite(t *testing.T) {
+	content := "i want to create a static website with html css and js"
+	todos := synthesizeBuildTodosFromMutation(content)
+	if len(todos) != 3 {
+		t.Fatalf("expected 3 todos, got %d", len(todos))
+	}
+	for _, todo := range todos {
+		if !strings.Contains(todo, "[FILE_MUTATE]") {
+			t.Errorf("expected FILE_MUTATE in todo, got: %s", todo)
+		}
+	}
+	if !strings.Contains(todos[0], "index.html") {
+		t.Errorf("expected first todo to reference index.html, got: %s", todos[0])
+	}
+	if !strings.Contains(todos[1], "styles.css") {
+		t.Errorf("expected second todo to reference styles.css, got: %s", todos[1])
+	}
+	if !strings.Contains(todos[2], "script.js") {
+		t.Errorf("expected third todo to reference script.js, got: %s", todos[2])
+	}
+}
+
+func TestSynthesizeBuildTodosFromMutation_GenericFallback(t *testing.T) {
+	content := "refactor the authentication module"
+	todos := synthesizeBuildTodosFromMutation(content)
+	if len(todos) != 1 {
+		t.Fatalf("expected 1 todo, got %d", len(todos))
+	}
+	if !strings.Contains(todos[0], "[FILE_MUTATE]") {
+		t.Errorf("expected FILE_MUTATE in todo, got: %s", todos[0])
+	}
+	if !strings.Contains(todos[0], "refactor the authentication module") {
+		t.Errorf("expected todo to contain original intent, got: %s", todos[0])
+	}
+}
+
+func TestSynthesizeBuildTodosFromMutation_Empty(t *testing.T) {
+	todos := synthesizeBuildTodosFromMutation("")
+	if todos != nil {
+		t.Errorf("expected nil for empty content, got %v", todos)
+	}
+	todos = synthesizeBuildTodosFromMutation("   ")
+	if todos != nil {
+		t.Errorf("expected nil for whitespace-only content, got %v", todos)
+	}
+}
+
+func TestBuildMutationHandoffPayload(t *testing.T) {
+	todos := []string{
+		"\uf05c [FILE_MUTATE] index.html — Create main HTML page",
+		"\uf05c [FILE_MUTATE] styles.css — Create responsive stylesheet",
+	}
+	payload := buildMutationHandoffPayload(todos)
+	if payload == "" {
+		t.Fatal("expected non-empty payload")
+	}
+	if !strings.Contains(payload, "MUTATION HANDOFF") {
+		t.Errorf("payload missing MUTATION HANDOFF header")
+	}
+	if !strings.Contains(payload, "BEGIN EXECUTION NOW") {
+		t.Errorf("payload missing execution directive")
+	}
+	if strings.Contains(payload, "[FILE_MUTATE]") {
+		t.Errorf("payload should strip icon prefixes from todo display")
+	}
+	if strings.Contains(payload, "\uf05c") {
+		t.Errorf("payload should not contain raw icon characters")
+	}
+	// Verify task numbering.
+	if !strings.Contains(payload, "Task 1:") {
+		t.Errorf("payload missing Task 1")
+	}
+	if !strings.Contains(payload, "Task 2:") {
+		t.Errorf("payload missing Task 2")
+	}
+}
+
+func TestBuildMutationHandoffPayload_Empty(t *testing.T) {
+	payload := buildMutationHandoffPayload(nil)
+	if payload != "" {
+		t.Errorf("expected empty payload for nil todos, got %q", payload)
+	}
+	payload = buildMutationHandoffPayload([]string{})
+	if payload != "" {
+		t.Errorf("expected empty payload for empty todos, got %q", payload)
+	}
+}

@@ -375,3 +375,83 @@ func isDirectMutationTarget(name string) bool {
 
 	return false
 }
+
+// ExtractDirectMutationTargets extracts all filenames mentioned in a
+// direct mutation prompt. It handles comma-separated file lists
+// (e.g. "index.html, styles.css, script.js") as well as bare filenames.
+// Returns an empty slice when no target files can be found.
+func ExtractDirectMutationTargets(input string) []string {
+	raw := strings.TrimSpace(input)
+	if raw == "" {
+		return nil
+	}
+
+	msg := commandPrefixPattern.ReplaceAllString(raw, "")
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return nil
+	}
+
+	// First try @ref-style file references.
+	fileRefs := extractFileRefs(msg)
+	for i, f := range fileRefs {
+		fileRefs[i] = strings.TrimRight(f, `,;`)
+	}
+	if len(fileRefs) > 0 {
+		return fileRefs
+	}
+
+	// Include common web/JS extensions for bare filename detection
+	// in comma-separated lists, since .js/.ts are standard front-end targets.
+	allExts := append([]string{".js", ".ts", ".jsx", ".tsx"}, directMutationFileExts...)
+
+	seen := make(map[string]bool)
+	var targets []string
+
+	parts := strings.Split(msg, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		// Check each word in the segment for filenames.
+		fields := strings.Fields(part)
+		for _, f := range fields {
+			clean := strings.Trim(f, `.,;:'"!?()`)
+			if clean == "" || seen[clean] {
+				continue
+			}
+			ext := filepath.Ext(clean)
+			isExt := false
+			for _, de := range allExts {
+				if ext == de {
+					isExt = true
+					break
+				}
+			}
+			if isExt {
+				seen[clean] = true
+				targets = append(targets, clean)
+				break
+			}
+			base := filepath.Base(clean)
+			baseLower := strings.ToLower(base)
+			for _, bf := range directMutationBareFiles {
+				if baseLower == bf {
+					canon := knownConventions[baseLower]
+					if canon == "" {
+						canon = base
+					}
+					if !seen[canon] {
+						seen[canon] = true
+						targets = append(targets, canon)
+					}
+					break
+				}
+			}
+		}
+	}
+
+	return targets
+}

@@ -217,14 +217,36 @@ func (m *model) handleInput(line string) tea.Cmd {
 		// Architect prompts, skip /investigate mode routing entirely,
 		// and route directly to BUILD with a staged FILE_MUTATE task.
 		if compressed := gateway.CompressPrompt(rawInput); compressed != nil && compressed.BypassInvest && compressed.Target != "" {
+			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected by compressor. Bypassing architect analysis."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			targets := gateway.ExtractDirectMutationTargets(rawInput)
+			if len(targets) > 1 {
+				var tasks []plan.Task
+				for i, f := range targets {
+					tasks = append(tasks, plan.Task{
+						StepNum:     i + 1,
+						IsDone:      false,
+						Status:      "idle",
+						Type:        "FILE_MUTATE",
+						Target:      f,
+						Description: rawInput,
+						Rationale:   fmt.Sprintf("Fast-Track multi-file decomposition: target %d of %d", i+1, len(targets)),
+						IsHardcoded: true,
+					})
+				}
+				return func() tea.Msg {
+					return planResultMsg{
+						Tasks:       tasks,
+						IsFastTrack: true,
+					}
+				}
+			}
 			target := command.FallbackPlanTarget{
 				File:        compressed.Target,
 				Description: rawInput,
 				TaskType:    "FILE_MUTATE",
 			}
-			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected by compressor. Bypassing architect analysis."))
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
 			tasks := command.GenerateFallbackPlan(target)
 			return func() tea.Msg {
 				return planResultMsg{
@@ -244,6 +266,30 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected. Bypassing architect analysis."))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
+			// Multi-file decomposition: when the prompt lists multiple
+			// files (comma-separated), create distinct TODO items for each.
+			multiTargets := gateway.ExtractDirectMutationTargets(rawInput)
+			if len(multiTargets) > 1 {
+				var tasks []plan.Task
+				for i, f := range multiTargets {
+					tasks = append(tasks, plan.Task{
+						StepNum:     i + 1,
+						IsDone:      false,
+						Status:      "idle",
+						Type:        "FILE_MUTATE",
+						Target:      f,
+						Description: rawInput,
+						Rationale:   fmt.Sprintf("Fast-Track multi-file decomposition: target %d of %d", i+1, len(multiTargets)),
+						IsHardcoded: true,
+					})
+				}
+				return func() tea.Msg {
+					return planResultMsg{
+						Tasks:       tasks,
+						IsFastTrack: true,
+					}
+				}
+			}
 			tasks := command.GenerateFallbackPlan(target)
 			return func() tea.Msg {
 				return planResultMsg{
@@ -301,6 +347,19 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return m.runReviewCmd("")
+		}
+		// ── AUTO-TRIGGER /build EXECUTION ──────────────────────
+		// When /build is invoked while already in /build mode and
+		// a Fast-Track plan or pending TODO checklist exists,
+		// immediately trigger execution instead of returning nil
+		// (which leaves the UI frozen in an idle state).
+		if mode == modes.ModeBuild {
+			hasStagedTasks := len(m.sess.CurrentTasks) > 0
+			hasPendingTodos := len(m.handoffCtx.PendingTodos) > 0
+			hasLedgerTasks := m.sess != nil && m.sess.ContextLedger != nil && len(m.sess.ContextLedger.Tasks) > 0
+			if hasStagedTasks || hasPendingTodos || hasLedgerTasks {
+				return m.runBuildCmd("")
+			}
 		}
 		return m.setMode(mode)
 	}
@@ -1190,6 +1249,31 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	return nil
 }
 
+// buildMutationHandoffPayload creates an active mutation prompt from
+// synthesized pending todos. This is used when the deadlock-guard or
+// short-circuit logic routes from /investigate directly to /build,
+// ensuring the Execution Engine receives a mutation prompt instead of
+// a generic greeting. The payload contains only the task descriptions,
+// stripped of any conversational framing.
+func buildMutationHandoffPayload(todos []string) string {
+	if len(todos) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## MUTATION HANDOFF — AUTO-TRIGGERED FROM INVESTIGATION\n\n")
+	b.WriteString("Execute the following mutation tasks immediately. Do NOT ask for approval or restate the plan.\n\n")
+	for i, todo := range todos {
+		// Strip the icon prefix for cleaner task display.
+		clean := strings.TrimSpace(todo)
+		if idx := strings.Index(clean, "] "); idx > 0 {
+			clean = strings.TrimSpace(clean[idx+2:])
+		}
+		fmt.Fprintf(&b, "Task %d: %s\n", i+1, clean)
+	}
+	b.WriteString("\nBEGIN EXECUTION NOW.")
+	return b.String()
+}
+
 // buildHandoffTriggerContent returns a non-empty string when handoff data exists
 // for the given mode, triggering immediate structural execution. For /plan mode
 // the handoff is handled internally by the structural engine — the return value
@@ -1221,7 +1305,17 @@ func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
 		// clean idle state instead of contaminating the buffer.
 		hasStagedTasks := len(m.sess.CurrentTasks) > 0
 		if len(m.handoffCtx.PendingTodos) == 0 && !hasStagedTasks {
-			return ""
+			// DEADLOCK-GUARD FALLBACK: when the investigate engine
+			// short-circuited with mutation intent and no structured
+			// tasks were synthesized, create one from the handoff ledger.
+			// This prevents the frozen state where /build enters idle
+			// after auto-routing from /investigate.
+			if strings.Contains(m.handoffLedgerContent, "code mutation intent detected") {
+				m.handoffCtx.PendingTodos = synthesizeBuildTodosFromMutation(m.handoffLedgerContent)
+			}
+			if len(m.handoffCtx.PendingTodos) == 0 {
+				return ""
+			}
 		}
 		var b strings.Builder
 		b.WriteString("## HANDOFF BUILD EXECUTION\n\n")
@@ -4956,9 +5050,17 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 		// Purge stale conversational handoff so the build buffer stays clean.
 		m.handoffCtx.ProposedFix = ""
 
-		// REFORM A: Build strict minimal context for the active task.
-		// This is injected as the initial prompt for the build execution.
-		m.handoffCtx.LastFailurePayload = m.buildStrictHandoffPayload()
+		// DEADLOCK-GUARD: when the investigate engine short-circuited
+		// with mutation intent, synthesize an execution context from the
+		// pending todos so the build engine receives an active mutation
+		// prompt instead of a generic greeting.
+		if len(m.handoffCtx.PendingTodos) > 0 {
+			m.handoffCtx.LastFailurePayload = buildMutationHandoffPayload(m.handoffCtx.PendingTodos)
+		} else {
+			// REFORM A: Build strict minimal context for the active task.
+			// This is injected as the initial prompt for the build execution.
+			m.handoffCtx.LastFailurePayload = m.buildStrictHandoffPayload()
+		}
 	}
 }
 
