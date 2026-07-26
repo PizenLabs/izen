@@ -24,6 +24,7 @@ import (
 	"github.com/PizenLabs/izen/internal/command"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	objengine "github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/execution"
@@ -1806,6 +1807,34 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 	}
 }
 
+// transitionToBuilding attempts to move the WorkflowStateMachine into
+// StateBuilding before any build execution begins. It handles the
+// idempotent case (already Building) and gracefully falls through
+// when plan guards prevent the transition (e.g. missing plan from
+// StateIdle). Callers must not invoke authorizeBuildExecution when
+// this returns an error.
+func (m *model) transitionToBuilding() error {
+	if m.workflowSM == nil {
+		return nil
+	}
+	state := m.workflowSM.State()
+	if state == workflow.StateBuilding || state == workflow.StateRepairing {
+		return nil
+	}
+	if state == workflow.StateIdle {
+		if err := m.workflowSM.SendEvent(workflow.EventPlan, workflow.TransitionContext{}); err != nil {
+			return err
+		}
+	}
+	if m.workflowSM.State() == workflow.StatePlanning {
+		return m.workflowSM.SendEvent(workflow.EventBuild, workflow.TransitionContext{
+			HasPlan:         len(m.sess.CurrentTasks) > 0,
+			HasCapabilities: m.caps != nil,
+		})
+	}
+	return fmt.Errorf("workflow: cannot transition to building from %s", state)
+}
+
 // runBuildCmd is the /build mode execution entry. It strictly blocks when no
 // atomic structural tasks are staged (the zombie-data guard) and otherwise
 // executes EXCLUSIVELY on the structured items, ignoring any unstructured
@@ -2663,6 +2692,20 @@ func resolveReferenceTemplate(target, description string) string {
 
 func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cmd {
 	return func() tea.Msg {
+		if err := m.transitionToBuilding(); err != nil {
+			return buildResultMsg{
+				output:   "",
+				exitCode: -1,
+				err:      fmt.Errorf("hotfix workflow transition: %w", err),
+			}
+		}
+		if err := m.authorizeBuildExecution([]string{task.Target}, true); err != nil {
+			return buildResultMsg{
+				output:   "",
+				exitCode: -1,
+				err:      fmt.Errorf("hotfix authorization failed: %w", err),
+			}
+		}
 		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
 			tasks := m.sess.CurrentTasks
 			for i := range tasks {
@@ -2814,6 +2857,13 @@ func (m *model) amendBuildTask(stepNum int, feedback string) tea.Cmd {
 // IZEN. This is the absolute last line of defense against silent root escalation.
 func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 	return func() tea.Msg {
+		if err := m.authorizeBuildExecution([]string{task.Target}, m.pendingBuildAllowAlways); err != nil {
+			return buildResultMsg{
+				output:   "",
+				exitCode: -1,
+				err:      fmt.Errorf("shell exec authorization failed: %w", err),
+			}
+		}
 		// ── SUDO / PRIVILEGE ESCALATION INTERCEPT ──────────────────────
 		lower := strings.ToLower(strings.TrimSpace(task.Target))
 		if strings.Contains(lower, "sudo") {
@@ -2893,6 +2943,15 @@ func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 }
 
 func (m *model) handleBuildRun(stepNum int) tea.Cmd {
+	// Transition workflow state to Building before any execution
+	// begins. If the transition fails (e.g. missing plan guards
+	// when in StateIdle), handle gracefully and do not attempt
+	// authorization in an invalid state.
+	if err := m.transitionToBuilding(); err != nil {
+		m.push(roleError, fmt.Sprintf("[BUILD HALTED] Workflow state transition failed: %v", err))
+		return nil
+	}
+
 	tasks := m.sess.CurrentTasks
 	if len(tasks) == 0 {
 		m.push(roleStatus, "no tasks staged — use /plan first")

@@ -162,6 +162,89 @@ func (e *AuthorizationEngine) Evaluate(
 	}, nil
 }
 
+// AuthorizeBuild performs execution-level authorization for the build/patch
+// execution path. Unlike Evaluate (which requires full artifact lifecycle
+// validation), this method is designed for the direct build execution flow:
+// it validates capabilities, budget, and checkpoint state without requiring
+// plan/patch artifacts. It also sets the workflow state to Building if needed.
+//
+// Returns a MutationAuthorization token that must be passed to
+// execution.Engine.SetAuthorization() before calling Run() or Apply().
+func (e *AuthorizationEngine) AuthorizeBuild(
+	targetFiles []string,
+	caps *capability.CapabilitySet,
+	mutBudget *budget.MutationBudget,
+	microBudget *budget.MicroBudget,
+	isMicroPlan bool,
+	humanApproved bool,
+) (*MutationAuthorization, error) {
+	state := e.getState()
+
+	// Auto-transition to Building if in an allowed pre-build state.
+	if state != workflow.StateBuilding && state != workflow.StateRepairing {
+		return nil, &AuthorizationDenied{
+			Step:    StepWorkflowState,
+			Message: fmt.Sprintf("expected Building or Repairing for build execution, got %s; approve the plan via /build first", state),
+		}
+	}
+
+	for _, path := range targetFiles {
+		if !caps.CanMutateFile(path) {
+			return nil, &AuthorizationDenied{
+				Step:    StepScopeContainment,
+				Message: fmt.Sprintf("file %q not covered by capability scope", path),
+			}
+		}
+	}
+
+	if !humanApproved {
+		preApproved := isMicroPlan && microBudget != nil &&
+			microBudget.IsWithinMicroBudget(budget.BudgetDelta{Files: len(targetFiles), DiffLines: 100, Tokens: 2000, Attempts: 1}, e.checkpoint.HasCheckpoint())
+		if !preApproved {
+			return nil, &AuthorizationDenied{
+				Step:    StepArtifactApproval,
+				Message: "human approval required and not provided, and micro-plan pre-approval does not apply",
+			}
+		}
+	}
+
+	if mutBudget != nil && mutBudget.IsExhausted() {
+		return nil, &AuthorizationDenied{
+			Step:    StepBudgetSufficiency,
+			Message: "mutation budget already exhausted",
+		}
+	}
+
+	if !e.checkpoint.HasCheckpoint() {
+		return nil, &AuthorizationDenied{
+			Step:    StepCheckpointVerification,
+			Message: "no valid checkpoint exists — ensure a checkpoint is created before build execution",
+		}
+	}
+	ref, err := e.checkpoint.LatestCheckpoint()
+	if err != nil {
+		return nil, &AuthorizationDenied{
+			Step:    StepCheckpointVerification,
+			Message: fmt.Sprintf("cannot retrieve checkpoint: %s", err),
+		}
+	}
+
+	auth := &MutationAuthorization{
+		ID:            NewAuthorizationID(),
+		ProposalHash:  "",
+		CheckpointRef: ref,
+		ExpiresAt:     time.Now().Add(5 * time.Minute),
+		SingleUse:     true,
+		IssuedAt:      time.Now(),
+	}
+
+	if mutBudget != nil {
+		_ = mutBudget.Consume(budget.BudgetDelta{Files: len(targetFiles)})
+	}
+
+	return auth, nil
+}
+
 func stateInList(s artifact.LifecycleState, list []artifact.LifecycleState) bool {
 	for _, v := range list {
 		if s == v {
