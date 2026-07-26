@@ -458,3 +458,172 @@ func TestSanitizeFileOutputFences(t *testing.T) {
 		}
 	}
 }
+
+// ── Arrow key proposal diff scrolling ──────────────────────────
+// When an expanded proposal diff is active in StateAwaitingApproval,
+// arrow keys (↑/↓) and page keys (PgUp/PgDn) must scroll the inner
+// proposal diff via proposalDiffOffset. j/k must NOT affect the
+// diff offset — they pass through to the main workspace viewport.
+
+func TestArrowUpScrollsProposalDiff(t *testing.T) {
+	m := newTestModel()
+	m.pendingProposals[0].Expanded = true
+	m.proposalDiffOffset = 5
+
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m2 := newModel.(*model)
+
+	if m2.proposalDiffOffset != 4 {
+		t.Errorf("arrow Up: proposalDiffOffset = %d, want 4", m2.proposalDiffOffset)
+	}
+}
+
+func TestArrowDownScrollsProposalDiff(t *testing.T) {
+	m := newTestModel()
+	m.pendingProposals[0].Expanded = true
+	// Use a diff long enough to allow scrolling (maxProposalDiffHeight=15)
+	m.pendingProposals[0].Diff = "--- a/test.go\n+++ b/test.go\n@@ -1 +1 @@\n" +
+		strings.Repeat("-line\n", 20) +
+		strings.Repeat("+line\n", 20)
+	m.proposalDiffOffset = 0
+
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m2 := newModel.(*model)
+
+	if m2.proposalDiffOffset != 1 {
+		t.Errorf("arrow Down: proposalDiffOffset = %d, want 1", m2.proposalDiffOffset)
+	}
+}
+
+func TestArrowUpDoesNotExceedZero(t *testing.T) {
+	m := newTestModel()
+	m.pendingProposals[0].Expanded = true
+	m.proposalDiffOffset = 0
+
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m2 := newModel.(*model)
+
+	if m2.proposalDiffOffset != 0 {
+		t.Errorf("arrow Up at offset 0: proposalDiffOffset = %d, want 0", m2.proposalDiffOffset)
+	}
+}
+
+func TestArrowDownDoesNotExceedMax(t *testing.T) {
+	m := newTestModel()
+	m.pendingProposals[0].Expanded = true
+	// The test diff has 4 non-header lines, maxProposalDiffHeight=15, so maxOffset=0
+	m.proposalDiffOffset = 0
+
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m2 := newModel.(*model)
+
+	if m2.proposalDiffOffset != 0 {
+		t.Errorf("arrow Down at max offset: proposalDiffOffset = %d, want 0", m2.proposalDiffOffset)
+	}
+}
+
+func TestPageUpScrollsProposalDiff(t *testing.T) {
+	m := newTestModel()
+	m.pendingProposals[0].Expanded = true
+	m.proposalDiffOffset = 10
+
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	m2 := newModel.(*model)
+
+	if m2.proposalDiffOffset != 0 {
+		t.Errorf("PgUp: proposalDiffOffset = %d, want 0", m2.proposalDiffOffset)
+	}
+}
+
+func TestPageDownScrollsProposalDiff(t *testing.T) {
+	m := newTestModel()
+	m.pendingProposals[0].Expanded = true
+	m.proposalDiffOffset = 0
+
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	m2 := newModel.(*model)
+
+	// maxProposalDiffHeight=15, test diff has 4 lines, maxOffset=0
+	if m2.proposalDiffOffset != 0 {
+		t.Errorf("PgDown at max offset: proposalDiffOffset = %d, want 0", m2.proposalDiffOffset)
+	}
+}
+
+func TestJKDoesNotScrollProposalDiff(t *testing.T) {
+	m := newTestModel()
+	m.pendingProposals[0].Expanded = true
+	m.proposalDiffOffset = 5
+
+	// Press j — should not change proposalDiffOffset
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m2 := newModel.(*model)
+
+	if m2.proposalDiffOffset != 5 {
+		t.Errorf("j key changed proposalDiffOffset from 5 to %d, should remain 5", m2.proposalDiffOffset)
+	}
+
+	// Press k — should not change proposalDiffOffset
+	newModel, _ = m2.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	m3 := newModel.(*model)
+
+	if m3.proposalDiffOffset != 5 {
+		t.Errorf("k key changed proposalDiffOffset from 5 to %d, should remain 5", m3.proposalDiffOffset)
+	}
+}
+
+func TestArrowKeysFallThroughToViewportWhenCollapsed(t *testing.T) {
+	m := newTestModel()
+	// Proposal is collapsed — arrow keys should pass through to viewport
+	m.pendingProposals[0].Expanded = false
+
+	// Arrow Up should not change proposalDiffOffset (no expanded diff)
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m2 := newModel.(*model)
+
+	if m2.proposalDiffOffset != 0 {
+		t.Errorf("arrow Up on collapsed proposal changed proposalDiffOffset to %d, want 0", m2.proposalDiffOffset)
+	}
+}
+
+func TestArrowKeysFallThroughToViewportWhenNoDiff(t *testing.T) {
+	m := newTestModel()
+	m.pendingProposals[0].Expanded = true
+	m.pendingProposals[0].Diff = ""
+
+	// Arrow Down should pass through to viewport when there is no diff content
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m2 := newModel.(*model)
+
+	if m2.proposalDiffOffset != 0 {
+		t.Errorf("arrow Down with no diff changed proposalDiffOffset to %d, want 0", m2.proposalDiffOffset)
+	}
+}
+
+// ── Key hint verification ────────────────────────────────────────
+
+func TestRenderHotkeyPromptUsesScrollNotNav(t *testing.T) {
+	// The hotkey prompt at the bottom of the proposal card should
+	// say "Scroll ↑/↓" not "Nav j/k".
+	prompt := renderHotkeyPromptWithToggle(120)
+	if strings.Contains(prompt, "j/k") {
+		t.Errorf("hotkey prompt contains j/k key hint: %q", prompt)
+	}
+	if !strings.Contains(prompt, "↑/↓") {
+		t.Errorf("hotkey prompt missing ↑/↓ scroll hint: %q", prompt)
+	}
+	// "Nav" should be replaced with "Scroll"
+	if strings.Contains(prompt, "Nav") {
+		t.Errorf("hotkey prompt still uses 'Nav' label: %q", prompt)
+	}
+	if !strings.Contains(prompt, "Scroll") {
+		t.Errorf("hotkey prompt missing 'Scroll' label: %q", prompt)
+	}
+}
+
+func TestRenderHotkeyPromptNarrowWidth(t *testing.T) {
+	// Even at narrow width, j/k must not appear in the prompt.
+	prompt := renderHotkeyPromptWithToggle(40)
+	if strings.Contains(prompt, "j/k") {
+		t.Errorf("narrow hotkey prompt contains j/k key hint: %q", prompt)
+	}
+}

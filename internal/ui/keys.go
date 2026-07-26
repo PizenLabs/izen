@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -123,18 +124,20 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// ── Viewport navigation pass-through in locked states ───────────────
-	// Arrow keys, j/k, ctrl+u, ctrl+d must forward to viewport so the
-	// user can fluidly inspect long file diffs without scroll lockout.
-	// Tracks scroll-up for user-scroll-lock to prevent auto-scroll jank.
+	// j/k and ctrl+u/ctrl+d forward to the main workspace viewport so
+	// the user can fluidly inspect the log/context history behind the
+	// approval/proposal modal. Arrow keys are reserved for proposal
+	// diff scrolling (see block below). Tracks scroll-up to prevent
+	// auto-scroll jank when the user inspects log history.
 	if m.state == StateAwaitingApproval {
 		if m.Ready {
 			switch {
-			case msg.Type == tea.KeyUp || msg.String() == "k" || msg.Type == tea.KeyCtrlU:
+			case msg.String() == "k" || msg.Type == tea.KeyCtrlU:
 				m.userIsScrollingUp = true
 				var vpCmd tea.Cmd
 				m.Viewport, vpCmd = m.Viewport.Update(msg)
 				return m, vpCmd
-			case msg.Type == tea.KeyDown || msg.String() == "j" || msg.Type == tea.KeyCtrlD:
+			case msg.String() == "j" || msg.Type == tea.KeyCtrlD:
 				var vpCmd tea.Cmd
 				m.Viewport, vpCmd = m.Viewport.Update(msg)
 				return m, vpCmd
@@ -146,8 +149,73 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// ── Proposal diff scroll (inner view) ─────────────
+	// Arrow keys and page keys scroll the proposal diff content
+	// inside the proposal dock when an expanded diff is available.
+	// When no expanded diff is active, arrow keys fall through to
+	// the viewport for collapsed proposals and build approval prompts.
+	// j/k are reserved for the main workspace viewport.
+	if m.state == StateAwaitingApproval && m.Ready {
+		if len(m.pendingProposals) > 0 {
+			p := m.pendingProposals[0]
+			if p.Expanded && p.Diff != "" {
+				diffLines := strings.Split(p.Diff, "\n")
+				totalDiff := 0
+				for _, l := range diffLines {
+					if l == "" {
+						continue
+					}
+					if strings.HasPrefix(l, "---") || strings.HasPrefix(l, "+++") {
+						continue
+					}
+					totalDiff++
+				}
+				maxOffset := totalDiff - maxProposalDiffHeight
+				if maxOffset < 0 {
+					maxOffset = 0
+				}
+
+				switch msg.Type {
+				case tea.KeyUp:
+					if m.proposalDiffOffset > 0 {
+						m.proposalDiffOffset--
+					}
+					return m, nil
+				case tea.KeyDown:
+					if m.proposalDiffOffset < maxOffset {
+						m.proposalDiffOffset++
+					}
+					return m, nil
+				case tea.KeyPgUp:
+					m.proposalDiffOffset = max(0, m.proposalDiffOffset-maxProposalDiffHeight)
+					return m, nil
+				case tea.KeyPgDown:
+					m.proposalDiffOffset = min(maxOffset, m.proposalDiffOffset+maxProposalDiffHeight)
+					return m, nil
+				}
+			}
+		}
+	}
+
 	// ── Awaiting approval ────────────────────────────────────────────
 	if m.state == StateAwaitingApproval {
+		// ── Arrow-key fallback: scroll the main viewport when
+		// there is no expanded proposal diff to inspect. This
+		// keeps navigation functional for collapsed proposals and
+		// build approval prompts where the diff scroll block
+		// above does not intercept. ──────────────────────────
+		// ── Arrow-key fallback: scroll the main viewport when
+		// there is no expanded proposal diff to inspect. This
+		// keeps navigation functional for collapsed proposals and
+		// build approval prompts where the diff scroll block
+		// above does not intercept. ──────────────────────────
+		if msg.Type == tea.KeyUp || msg.Type == tea.KeyDown ||
+			msg.Type == tea.KeyPgUp || msg.Type == tea.KeyPgDown {
+			var vpCmd tea.Cmd
+			m.Viewport, vpCmd = m.Viewport.Update(msg)
+			return m, vpCmd
+		}
+
 		// ── $hot HOTFIX APPROVAL GATE ─────────────────────────────
 		// The hotfix patch was generated but NOT applied. The developer must
 		// explicitly authorize (Alt+A / Enter) or reject (Alt+R / Esc).
@@ -281,7 +349,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		//   Allow All:   Alt+L
 		//   Reject:  Alt+R / Esc
 		//   Toggle:  Alt+P
-		//   Navigate:    j/k / Up/Down
+		//   Scroll diff: ↑/↓/PageUp/PageDn
+		//   Accept: Alt+A / Enter, Allow All: Alt+L, Reject: Alt+R / Esc
+		//   Toggle: Alt+P
 		switch {
 		case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
 			return m, m.applySingleProposal()
