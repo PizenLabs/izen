@@ -3,6 +3,8 @@ package execution
 import (
 	"github.com/PizenLabs/izen/internal/checkpoint"
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/core/authorization"
+	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/language"
@@ -158,6 +160,19 @@ func (e *Engine) SetStreamContextFiles(files []string) {
 func (e *Engine) FlushStream() {
 	e.StreamMon.Flush()
 	e.StreamMon.Reset()
+}
+
+func (e *Engine) SetAuthorization(auth *authorization.MutationAuthorization) {
+	e.Runner.SetAuthorization(auth)
+	e.Patches.SetAuthorization(auth)
+	if e.Verifier != nil {
+		e.Verifier.SetAuthorization(auth)
+	}
+}
+
+func (e *Engine) SetBudget(b *budget.MutationBudget) {
+	e.Runner.SetBudget(b)
+	e.Patches.SetBudget(b)
 }
 
 func (e *Engine) StepCompleted(stepNum int) error {

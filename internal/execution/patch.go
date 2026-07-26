@@ -12,6 +12,8 @@ import (
 	"time"
 
 	izenctx "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/core/authorization"
+	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/modes/build"
 	"github.com/PizenLabs/izen/internal/templates"
@@ -136,6 +138,9 @@ func (pq *PatchQueue) Stage(file, content, rawDiff string) {
 func (pq *PatchQueue) ApplyNext() error {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
+	if err := checkAuthorization(pq.pm.auth); err != nil {
+		return err
+	}
 	if len(pq.patches) == 0 {
 		return fmt.Errorf("no staged patches")
 	}
@@ -181,6 +186,9 @@ func (pq *PatchQueue) ApplyNext() error {
 func (pq *PatchQueue) ApplyAll() (int, error) {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
+	if err := checkAuthorization(pq.pm.auth); err != nil {
+		return 0, err
+	}
 	applied := 0
 	for _, p := range pq.patches {
 		if p.File == "" {
@@ -235,6 +243,9 @@ type PatchManager struct {
 	// task to transition to TaskCompleted.
 	verifier *Verifier
 
+	auth   *authorization.MutationAuthorization
+	budget *budget.MutationBudget
+
 	tx *engine.Transaction
 }
 
@@ -276,6 +287,22 @@ func (pm *PatchManager) Guardrail() *MutationGuardrail {
 
 func (pm *PatchManager) SetContextID(id string) {
 	pm.contextID = id
+}
+
+func (pm *PatchManager) SetAuthorization(auth *authorization.MutationAuthorization) {
+	pm.auth = auth
+}
+
+func (pm *PatchManager) Authorization() *authorization.MutationAuthorization {
+	return pm.auth
+}
+
+func (pm *PatchManager) SetBudget(b *budget.MutationBudget) {
+	pm.budget = b
+}
+
+func (pm *PatchManager) Budget() *budget.MutationBudget {
+	return pm.budget
 }
 
 // SetLedger attaches the shared /plan task ledger. When a committed patch
@@ -475,6 +502,12 @@ func sanitizeCtxID(id string) string {
 }
 
 func (pm *PatchManager) Apply(patch *Patch) error {
+	if err := checkAuthorization(pm.auth); err != nil {
+		if globalActivityLog != nil {
+			globalActivityLog("[FAIL] patch rejected on %s: %v", patch.File, err)
+		}
+		return err
+	}
 	if patch == nil {
 		return fmt.Errorf("patch execution aborted: target data or file path descriptor is uninstantiated (0x0)")
 	}
@@ -750,6 +783,22 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 			sign = ""
 		}
 		detail = fmt.Sprintf("%d lines (%s%d)", finalLines, sign, linesDelta)
+	}
+
+	if pm.budget != nil {
+		linesDelta := 0
+		if patch.Original != "" {
+			origLines := len(strings.Split(patch.Original, "\n"))
+			finalLines := len(strings.Split(final, "\n"))
+			linesDelta = finalLines - origLines
+		}
+		if linesDelta < 0 {
+			linesDelta = 0
+		}
+		_ = pm.budget.Consume(budget.BudgetDelta{
+			Files:     1,
+			DiffLines: linesDelta,
+		})
 	}
 
 	if globalActivityLog != nil {

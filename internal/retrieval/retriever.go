@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/core/artifact"
 	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/lynx"
 )
@@ -65,10 +66,12 @@ func (t Tier) Order() int {
 }
 
 type Retriever struct {
-	root     string
-	graph    *GraphLookup
-	fallback *FallbackChain
-	tiers    []Tier
+	root           string
+	graph          *GraphLookup
+	fallback       *FallbackChain
+	tiers          []Tier
+	store          *artifact.Store
+	tokenEstimator *TokenWeightEstimator
 }
 
 type RetrieverOption func(*Retriever)
@@ -79,11 +82,22 @@ func WithTiers(tiers ...Tier) RetrieverOption {
 	}
 }
 
+func WithEvidenceStore(s *artifact.Store) RetrieverOption {
+	return func(r *Retriever) {
+		r.store = s
+	}
+}
+
+func isFallbackTier(t Tier) bool {
+	return t == TierGlob || t == TierRipgrep || t == TierGrep || t == TierRead
+}
+
 func NewRetriever(root string, g *graph.Graph, opts ...RetrieverOption) *Retriever {
 	r := &Retriever{
-		root:     root,
-		graph:    NewGraphLookup(g, root),
-		fallback: NewFallbackChain(root),
+		root:           root,
+		graph:          NewGraphLookup(g, root),
+		fallback:       NewFallbackChain(root),
+		tokenEstimator: NewTokenWeightEstimator(),
 		tiers: []Tier{
 			TierGraph,
 			TierLynx,
@@ -236,19 +250,31 @@ func (r *Retriever) executeTier(tier Tier, query Query) *ResultSet {
 		if pattern == "" {
 			return nil
 		}
-		return r.fallback.Glob(pattern)
+		rs := r.fallback.Glob(pattern)
+		if r.store != nil && !rs.Empty() {
+			_, _ = RecordFallbackEvidence(r.store, "glob", pattern, rs)
+		}
+		return rs
 
 	case TierRipgrep:
 		if r.fallback == nil || query.Text == "" {
 			return nil
 		}
-		return r.fallback.Ripgrep(query.Text, query.FilePattern)
+		rs := r.fallback.Ripgrep(query.Text, query.FilePattern)
+		if r.store != nil && !rs.Empty() {
+			_, _ = RecordFallbackEvidence(r.store, "rg", query.Text, rs)
+		}
+		return rs
 
 	case TierGrep:
 		if r.fallback == nil || query.Text == "" {
 			return nil
 		}
-		return r.fallback.Grep(query.Text)
+		rs := r.fallback.Grep(query.Text)
+		if r.store != nil && !rs.Empty() {
+			_, _ = RecordFallbackEvidence(r.store, "grep", query.Text, rs)
+		}
+		return rs
 
 	case TierRead:
 		if r.fallback == nil {
