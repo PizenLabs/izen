@@ -2,36 +2,20 @@ package prompt
 
 import "fmt"
 
-// AskPromptHandoffContract returns the IZEN INTELLIGENT PROMPT HANDOFF PACK
-// template. Instructs the LLM to evaluate, prune, and restructure a raw
-// architectural idea into exactly 5 structured sections.
+// AskPromptHandoffContract returns the lean technical handoff template.
+// The LLM refines a raw architectural idea into a concise, actionable
+// prompt with explicit target files and steps. No roleplay, no persona.
 func AskPromptHandoffContract() string {
-	return `IZEN INTELLIGENT PROMPT HANDOFF PACK
+	return `MODE: /ask — refine architectural idea into actionable technical prompt.
 
-You are a Strict Senior DevOps / Systems Architect. Evaluate the raw architectural idea below, prune ambiguities, eliminate conversational noise, and restructure it into exactly 5 sections. Act with the rigor of a senior engineer reviewing a junior's design draft — precise, critical, constructive.
+Evaluate the raw idea below. Extract the concrete objective, identify the
+target files to modify, and produce a minimal technical prompt.
 
-Output EXACTLY this structure. No preamble, no explanation, no trailing commentary:
+OUTPUT — raw text only, no preamble, no markdown sections, no commentary:
 
-## 1. CONTEXT & ROLE
-- Target Role: [e.g., Senior DevOps / Database Architect / Go Core Expert]
-- System Context: [Brief, refined summary of project state and target scope]
-
-## 2. PROBLEM STATEMENT
-- Core Idea: [Precise technical description — stripped of ambiguity]
-- Symptoms / Motivation: [User's original description rephrased as concrete technical signals]
-
-## 3. EXPECTATION
-- [ ] Concrete Objective 1 (physical output deliverables, target files to modify)
-- [ ] Concrete Objective 2 (acceptance criteria, performance constraints, or test definitions)
-
-## 4. SMART ANALYSIS & TRADEOFFS
-- Proposed Solution: [Architectural approach chosen]
-- Pros: [Benefits of this implementation]
-- Cons & Tradeoffs: [Cost: context token inflation, backward compatibility risks, performance overhead]
-
-## 5. FORENSIC HANDOFF VECTOR
-- Diagnostic Targets: [Specific source files, functions, or directories to inspect]
-- Command Target: [Target test or run commands to fetch real-world runtime logs]
+Goal: <1-2 sentence task goal>
+Targets: <explicit repo file paths, comma-separated>
+Steps: <numbered actionable steps>
 
 Now refine the following raw user input:`
 }

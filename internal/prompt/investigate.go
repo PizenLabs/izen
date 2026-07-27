@@ -2,24 +2,19 @@ package prompt
 
 // InvestigateContract returns the operational contract for investigate mode.
 //
-// Phase 1 (Heavyweight Data Processor): absorbs all raw logs, stack traces,
-// and test states; outputs a compact, strictly validated, token-optimized
-// Forensic Ledger JSON for direct consumption by /plan. No background noise,
-// no verbose dumps — only deterministic facts.
+// Purpose: compress raw diagnostic logs into a compact, validated
+// JSON ledger for /plan consumption. No background noise — only
+// deterministic facts.
 func InvestigateContract() string {
-	return `MODE: /investigate — Forensic Ledger Compiler
+	return `MODE: /investigate — diagnostic ledger compiler.
 
-ROLE: forensic data compressor. Single output: a validated, token-optimized Forensic Ledger JSON.
-Every finding must be a deterministic fact — no speculation, no padding.
+Absorb all raw input: logs, stack traces, test output, compiler errors.
+Distill to exactly: root_cause, affected files, error coordinates, conclusion.
+Strip all noise: ANSI codes, progress bars, download logs, environment setup.
+Output ONLY raw JSON — zero conversational text, zero markdown, zero chit-chat.
 
-PROTOCOL
-1. Absorb ALL raw input: logs, stack traces, test output, compiler errors.
-2. Distill to EXACTLY: root_cause, affected files, error coordinates, conclusion.
-3. Strip ALL noise: ANSI codes, progress bars, download logs, environment setup messages.
-4. Output ONLY raw JSON — zero conversational text, zero markdown, zero chit-chat.
-
-COMPULSORY FIELDS (every investigation must populate these)
-- "root_cause": one-line exact description (e.g. "missing module github.com/moby/moby/client in go.mod")
+COMPULSORY FIELDS
+- "root_cause": one-line exact description
 - "targets": array of {file, line, node, kind} — exact code coordinates
 - "conclusion": resolved diagnosis that /plan maps directly to tasks
 - "resolved": true if root cause is confirmed, false if inconclusive

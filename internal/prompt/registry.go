@@ -78,7 +78,7 @@ func PlanSystemPrompt() string {
 }
 
 // CompactPlanSystemPrompt returns the compact 3-bullet checklist prompt for
-// LOW and MEDIUM complexity tasks. Omits verbose Senior Architect prose.
+// LOW and MEDIUM complexity tasks. Omits verbose plan prose.
 func CompactPlanSystemPrompt() string {
 	return Compose(CompactPlanContract(), RuntimeFacts{HostOS: runtime.GOOS})
 }
@@ -86,7 +86,7 @@ func CompactPlanSystemPrompt() string {
 // SelectPlanSystemPrompt returns the appropriate plan system prompt based on
 // the task objective's heuristic complexity and the presence of an explicit
 // high-intent flag. High-complexity tasks (>8/10) or explicit --high flags
-// get the full Senior Architect treatment; everything else gets the compact
+// get the full plan contract; everything else gets the compact
 // 3-bullet checklist format.
 func SelectPlanSystemPrompt(objective string, hasHighFlag bool) string {
 	complexity := AssessComplexity(objective)

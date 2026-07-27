@@ -40,6 +40,7 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/templates"
 	verification "github.com/PizenLabs/izen/internal/verification"
+	"github.com/PizenLabs/izen/internal/workspace"
 )
 
 var validSystemCommands = map[string]struct{}{
@@ -259,7 +260,6 @@ func (m *model) handleInput(line string) tea.Cmd {
 		}
 
 		// ── INTENT PRE-GUARD: Fast-track direct file mutations ──────────
-		// Inspect the raw input before dispatching to the Senior Architect
 		// pipeline. If the user is requesting a simple single-file mutation
 		// on a non-code file (e.g. $prompt rename author in @LICENSE),
 		// classify it and route directly to /build as a FILE_MUTATE task
@@ -305,12 +305,11 @@ func (m *model) handleInput(line string) tea.Cmd {
 		if currentMode != modes.ModeAsk {
 			// Mode Guard Enforced: request state transition to /ask, then
 			// queue the $prompt synthesis directly via runAskPromptHandoffCmd.
-			// This preserves the Senior Architect system template
-			// (AskPromptHandoffContract) — we MUST NOT re-enter handleInput
+			// This preserves the lean ask handoff prompt — we MUST NOT re-enter handleInput
 			// because the raw input no longer carries the $prompt prefix and
 			// would be routed to the normal AskContract() streaming path,
 			// producing conversational noise instead of the structured
-			// 5-point Forensic Context Ledger.
+			// handoff prompt.
 			m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
 				"$prompt from /%s — transitioning to /ask for structured analysis...", currentMode)))
 			m.modeChangeAuthorized = true
@@ -320,7 +319,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 			return tea.Batch(cmd, m.runAskPromptHandoffCmd(rawInput))
 		}
 
-		m.push(roleSystem, infoStyle.Render("Refining architectural idea through Senior Architect analysis..."))
+		m.push(roleSystem, infoStyle.Render("Refining prompt through ask handoff..."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m.runAskPromptHandoffCmd(rawInput)
@@ -1505,7 +1504,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("ask sub-commands ($)"))
-		m.push(roleSystem, infoStyle.Render("  $prompt <idea>  refine architectural idea via Senior Architect analysis"))
+		m.push(roleSystem, infoStyle.Render("  $prompt <idea>  refine architectural idea into actionable prompt"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("review sub-commands ($)"))
 		m.push(roleSystem, infoStyle.Render("  $test [path]  run tests (safety-gated for large repos)"))
@@ -2015,7 +2014,10 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 				taskType = "task"
 			}
 			if taskTarget == "" {
-				taskTarget = "workspace"
+				taskTarget = m.resolvePendingTodoTarget(t)
+			}
+			if taskTarget == "" {
+				continue
 			}
 			tasks = append(tasks, plan.Task{
 				StepNum:     i + 1,
@@ -2659,6 +2661,17 @@ func sanitizeFileOutput(content string) string {
 	// Check for markdown block suffix.
 	content = strings.TrimSuffix(content, "```")
 	return strings.TrimSpace(content)
+}
+
+// resolvePendingTodoTarget uses deterministic workspace file matching
+// to resolve a pending TODO's target path. Never returns "workspace"
+// or an empty string — callers must handle the empty case.
+func (m *model) resolvePendingTodoTarget(todo string) string {
+	if m.workspaceRoot == "" {
+		return ""
+	}
+	resolver := workspace.NewTargetFileResolver(m.workspaceRoot)
+	return resolver.Resolve(todo)
 }
 
 // resolveHotfixTarget extracts the concrete destination file path for a $hot
@@ -5288,8 +5301,8 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 }
 
 // runAskPromptHandoffCmd passes the user's raw architectural idea directly to
-// the Strict Senior Architect persona for refinement, pruning, and tradeoff
-// analysis. No session history aggregation — the raw input IS the payload.
+// the ask handoff for refinement. No session history aggregation — the raw
+// input IS the payload.
 //
 // ISOLATION CONTRACT — This function is called STRICTLY from handleInput when
 // the user types "$prompt <raw_idea>" in /ask mode. It uses its own system

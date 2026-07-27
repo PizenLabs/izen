@@ -1,6 +1,8 @@
 package command
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/modes"
@@ -78,5 +80,35 @@ func TestRouteDirectModeCommandsAreTUIOnly(t *testing.T) {
 				t.Errorf("Route(%q) = (true, _), want (false, nil) — mode switch cmds are TUI-only", cmd)
 			}
 		})
+	}
+}
+
+func TestResolveTargetFile_WorkspaceRejected(t *testing.T) {
+	root := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(root, "templates"), 0755)
+	_ = os.WriteFile(filepath.Join(root, "templates", "layout.tmpl"), []byte("test"), 0644)
+
+	// "workspace" is explicitly rejected even when it appears in the prompt.
+	result := ResolveTargetFile(root, "move workspace navigation to header")
+	if result == "workspace" {
+		t.Error("ResolveTargetFile returned 'workspace' — must be rejected")
+	}
+}
+
+func TestResolveTargetFile_ExplicitPath(t *testing.T) {
+	root := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(root, "templates"), 0755)
+	_ = os.WriteFile(filepath.Join(root, "templates", "layout.tmpl"), []byte("test"), 0644)
+
+	result := ResolveTargetFile(root, "modify templates/layout.tmpl")
+	if result != "templates/layout.tmpl" {
+		t.Errorf("expected templates/layout.tmpl, got %q", result)
+	}
+}
+
+func TestResolveTargetFile_EmptyRoot(t *testing.T) {
+	result := ResolveTargetFile("", "move navigation")
+	if result != "" {
+		t.Errorf("expected empty result for empty root, got %q", result)
 	}
 }

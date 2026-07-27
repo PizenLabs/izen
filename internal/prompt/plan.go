@@ -42,7 +42,7 @@ func osPackageManager(os string) string {
 }
 
 // ComplexityThreshold defines the boundary between compact and verbose plan prose.
-// Tasks scoring > HighComplexityThreshold receive the full Senior Architect treatment.
+// Tasks scoring > HighComplexityThreshold receive the full plan contract.
 const (
 	LowComplexityThreshold    = 4
 	MediumComplexityThreshold = 7
@@ -106,59 +106,37 @@ func AssessComplexity(objective string) ComplexityScore {
 	return ComplexityModerate
 }
 
-// PlanContract returns the verbose Senior Principal Structural Architect contract.
-// Used ONLY when the task complexity exceeds HighComplexityThreshold or the user
-// explicitly opted into high-intent analysis.
+// PlanContract returns the technical plan contract for
+// HIGH complexity tasks. Used when IsHighComplexity is true.
 func PlanContract() string {
-	return `MODE: /plan — Structural Architecture Synthesis
+	return `MODE: /plan — structured task plan.
 
-ROLE: Senior Principal Structural Architect.
-- Read the pre-compiled Forensic Ledger from /investigate.
-- Synthesize a structured plan: Root Core Factor, Impact Domain, Risk Evaluation, Verification Vector.
-- Every task MUST include: track classification, rationale (why), expected solution (end state).
-- Do NOT re-analyze, re-investigate, or question the ledger.
+Read the investigation ledger below and produce a JSON task plan.
 
-PROTOCOL
-1. Read the Forensic Ledger (compact JSON from /investigate).
-2. Identify the Root Core Factor — one sentence stating the fundamental root cause.
-3. Map root_cause → Task 1 (always the dependency/code fix).
-4. Map targets → FILE_MUTATE tasks at exact {file, line} coordinates.
-5. End with a verification task when applicable.
-6. For EVERY task provide: rationale (why this task is necessary) and solution (expected end state).
-7. Output ONLY the JSON schema — zero explanation, zero commentary.
+Output ONLY raw JSON, no fences, no comments.
 
-GO DEPENDENCY RULE (STRICT)
-For missing Go package/module errors ("no required module provides package"):
-- Extract the EXACT package path from the ledger conclusion.
-- Emit EXACTLY ONE SHELL_EXEC task: "go get <real_package_path>".
-- Total JSON MUST stay under 300 tokens.
-- FORBIDDEN in command string: file names (go.mod, go.sum), relative paths, prose, brew/docker/apt, angle-bracket placeholders.
-
-ANTI-HALLUCINATION
-- Missing module X → Task 1 IS "go get X". No brew, no docker, no OS-level setup.
-- Never propose installing Go, Docker, or compilers — they already run.
-- SHELL_EXEC target MUST be a real runnable command (e.g. "go get github.com/foo/bar"), NOT a file path or placeholder.
-
-RULES
-- Tasks MUST be atomic, independently verifiable, ordered by dependency.
-- Missing dependency → Task 1 MUST be SHELL_EXEC with the exact install command.
-- FILE_MUTATE tasks MUST target the exact relative file path and line.
-- Use native Go tooling first (` + "`go get`" + `, ` + "`go mod tidy`" + `, ` + "`go install`" + `). Never default to ` + "`brew install`" + ` or ` + "`docker`" + `.` + TokenThriftyConstraint
+SCHEMA:
+{
+  "tasks": [
+    {"id": 1, "type": "SHELL_EXEC|FILE_MUTATE", "target": "<exact file path or command>", "description": "<what and why>", "rationale": "<why this step>"}
+  ]
 }
 
-// CompactPlanContract returns a stripped-down 3-bullet checklist contract for
-// LOW and MEDIUM complexity tasks. Omits ROLE, protocol details, and verbose
-// analysis instructions. Used when IsHighComplexity is false.
+RULES
+- Tasks MUST be atomic and ordered by dependency.
+- SHELL_EXEC target MUST be a real runnable command (e.g. "go get github.com/foo/bar"), NOT a file path.
+- Missing Go dependency → SHELL_EXEC task with the actual package path.
+- FORBIDDEN as SHELL_EXEC target: file paths (go.mod, go.sum, relative paths), prose, placeholders.
+- No brew, docker, or OS-level setup tasks.
+- Total JSON under 300 tokens.` + TokenThriftyConstraint
+}
+
+// CompactPlanContract returns a lean 3-bullet checklist contract for
+// LOW and MEDIUM complexity tasks. Omits role and verbose analysis.
 func CompactPlanContract() string {
-	return `MODE: /plan — Quick Task Checklist
+	return `MODE: /plan — compact task checklist.
 
-ROLE: Execution Mapper. Map the objective to a compact task list.
-
-PROTOCOL
-- Read the objective. Identify the file(s) to modify.
-- Output a 3-bullet checklist: (1) prep/setup, (2) the change itself, (3) verification.
-- Every SHELL_EXEC must be a real runnable command.
-- Output ONLY raw task blocks. No preamble, no analysis, no commentary.
+Map the objective to minimal tasks. Output ONLY raw task blocks.
 
 OUTPUT FORMAT:
 - [ ] SHELL_EXEC: <command> | <rationale>
@@ -172,8 +150,8 @@ RULES
 }
 
 // SelectPlanContract returns the appropriate plan contract based on complexity.
-// High-complexity tasks or explicit high-intent requests get the full Senior
-// Architect prose; everything else gets the compact 3-bullet checklist.
+// High-complexity tasks or explicit high-intent requests get the full
+// plan contract; everything else gets the compact checklist.
 func SelectPlanContract(objective string, complexity ComplexityScore, hasHighFlag bool) string {
 	if IsHighComplexity(complexity, hasHighFlag) {
 		return PlanContract()
@@ -227,11 +205,11 @@ func BuildPlanJSONPrompt(problem, ledgerContent, conclusion string, isDirectMuta
 	cb := conclusionBlock(conclusion)
 
 	if isDirectMutation {
-		return fmt.Sprintf(`You are the IZEN Plan Mapper. Read the /investigate Forensic Ledger below and produce a JSON plan.
+		return fmt.Sprintf(`You are the IZEN Plan Mapper. Read the investigation ledger below and produce a JSON plan.
 
 INPUT:
 PROBLEM: %s
-FORENSIC LEDGER:
+LEDGER:
 %s%s
 
 %s
@@ -245,13 +223,13 @@ OUTPUT — raw JSON only, no fences, no comments:
 		)
 	}
 
-	return fmt.Sprintf(`You are the IZEN Plan Mapper. Read the /investigate Forensic Ledger below and produce a JSON plan.
+	return fmt.Sprintf(`You are the IZEN Plan Mapper. Read the investigation ledger below and produce a JSON plan.
 
 HOST: %s
 
 INPUT:
 PROBLEM: %s
-FORENSIC LEDGER:
+LEDGER:
 %s%s
 
 %s
@@ -317,6 +295,6 @@ USER OBJECTIVE
 func PlanDirectMutationSystemPrompt() string {
 	return "STRICT RULE: Direct file mutation detected.\n" +
 		"Output ONLY the direct task item for execution.\n" +
-		"No CONTEXT & ROLE, no FORENSIC HANDOFF, no preamble, no summary." +
+		"No preamble, no summary." +
 		"\n" + strings.TrimSpace(TokenThriftyConstraint)
 }
