@@ -73,20 +73,21 @@ func TestProposeBuildPatch_RetriesOnAmbiguousSnippet(t *testing.T) {
 		_ = result
 	})
 
-	t.Run("retries on ambiguous snippet then succeeds", func(t *testing.T) {
+	t.Run("retries on ambiguous snippet then falls back to full rewrite for small file", func(t *testing.T) {
 		mock := &mockProvider{
 			responses: []*ai.Response{
 				// First call: ambiguous snippet (no markers, small)
 				{Content: smallSnippet},
-				// Second call: valid SEARCH/REPLACE patch
-				{Content: validPatch},
+				// Second call: still no diff markers, but now we use new-file
+				// strategy for small files (<200 lines), which accepts raw content.
+				{Content: "package main\n\nfunc main() {}\n"},
 			},
 		}
 		m := testModelWithProvider(mock)
 
 		dir := t.TempDir()
 		filePath := dir + "/main.go"
-		// Write the large file to disk so IsAmbiguousSnippet detects the mismatch
+		// Write the file to disk so StrategyForOriginal returns EXISTING
 		if err := writeFile(filePath, largeOriginalContent); err != nil {
 			t.Fatal(err)
 		}
@@ -103,14 +104,23 @@ func TestProposeBuildPatch_RetriesOnAmbiguousSnippet(t *testing.T) {
 			t.Fatalf("expected buildProposalReadyMsg, got %T", msg)
 		}
 		if result.Err != nil {
-			t.Fatalf("expected retry to succeed, got error: %v", result.Err)
+			t.Fatalf("expected retry to succeed with fallback, got error: %v", result.Err)
 		}
+		// Call 1: existing_file strategy fails -> retry
+		// Call 2: new_file strategy (full rewrite) succeeds
 		if mock.callCount != 2 {
-			t.Fatalf("expected 2 LLM calls (1 initial + 1 retry), got %d", mock.callCount)
+			t.Fatalf("expected 2 LLM calls (1 initial + 1 retry fallback), got %d", mock.callCount)
 		}
 	})
 
-	t.Run("fails after exhausting retries", func(t *testing.T) {
+	t.Run("retries existing large file and fails on ambiguous snippet", func(t *testing.T) {
+		// Use a large file (>200 lines) so the ambiguous snippet fallback
+		// does NOT trigger the new_file strategy.
+		var largeContent string
+		for i := 0; i < 210; i++ {
+			largeContent += fmt.Sprintf("line %d\n", i)
+		}
+
 		mock := &mockProvider{
 			responses: []*ai.Response{
 				{Content: smallSnippet},
@@ -122,7 +132,7 @@ func TestProposeBuildPatch_RetriesOnAmbiguousSnippet(t *testing.T) {
 
 		dir := t.TempDir()
 		filePath := dir + "/main.go"
-		if err := writeFile(filePath, largeOriginalContent); err != nil {
+		if err := writeFile(filePath, largeContent); err != nil {
 			t.Fatal(err)
 		}
 

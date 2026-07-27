@@ -2312,33 +2312,38 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		}
 
 		// Build a focused, non-chat patch-generation prompt with full file
-		// context so the LLM produces precise SEARCH/REPLACE blocks or
-		// unified diffs rather than a destructive full-file replacement.
+		// context using the appropriate strategy for the file state.
+		strategy := execution.StrategyForOriginal(orig)
 		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
-		if orig != "" {
+		switch strategy {
+		case execution.STRATEGY_NEW_FILE:
+			handoff += "\n\nThis is a NEW file that does not exist yet. "
+			handoff += "Output the complete file content inside a markdown code block "
+			handoff += "with the appropriate language tag (e.g. ```css, ```javascript, ```html, ```python, ```go). "
+			handoff += "Do NOT use FILE_CREATE markers, SEARCH/REPLACE, or diffs."
+		default:
 			handoff += "\n\n### TARGET_FILE_CONTENT\n```\n" + orig + "\n```\n"
 			handoff += "\nModify the above file content to fulfill the task. "
 			handoff += "Output a unified diff (--- a/ ... +++ b/ ...) or a SEARCH/REPLACE block (<<<<<<< SEARCH). "
-			handoff += "Do NOT output a full FILE: block — the file already exists."
-			handoff += "\n\nSTRICT: Return ONLY the raw diff or SEARCH/REPLACE block. No explanations, no markdown backticks, no conversational text."
+			handoff += "Do NOT rewrite the entire file. "
+			handoff += "Return ONLY the SEARCH/REPLACE block or unified diff."
 		}
-		system := prompt.BuildContract()
+		system := prompt.StrategyContract(strategy.SystemPromptKey())
 
-		// Detect cloud providers (OpenRouter, Cohere, etc.) so we can
-		// apply stricter extraction and abort early on unparseable output.
 		cloudCfg := gateway.ClassifyCloudProvider(m.cfg.ActiveProviderName())
 		isCloud := cloudCfg.CloudProvider != ""
 
-		// ── Single-attempt LLM call (no retry loop) ──────────────
-		// $hot is a fast-track command: one attempt, then immediate
-		// fallback to local resolution. This prevents wasteful token
-		// burn on retry loops that almost always produce the same failure.
+		stop := []string{">>>>>>>"}
+		if strategy == execution.STRATEGY_NEW_FILE {
+			stop = []string{"```\n\n"}
+		}
+
 		req := ai.Request{
 			Model:     m.cfg.ActiveModelName(),
 			System:    system,
 			Stream:    false,
 			MaxTokens: 500,
-			Stop:      []string{">>>>>>>"},
+			Stop:      stop,
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
 		}
 
@@ -2346,7 +2351,6 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		resp, err := m.provider.Execute(ctx, req)
 		cancel()
 		if err != nil {
-			// LLM call failed — try local fuzzy fallback immediately.
 			if orig != "" {
 				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
 					diffContent := computeUnifiedDiff(task.Target, orig, modified)
@@ -2369,11 +2373,9 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			return hotfixProposalMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
 		}
 		if resp == nil || strings.TrimSpace(resp.Content) == "" {
-			// Empty output from cloud model — abort immediately, do not retry.
 			if isCloud {
 				m.push(roleSystem, infoStyle.Render("[HOTFIX] Cloud model returned empty output. Aborting LLM attempt, trying local fallback..."))
 			}
-			// Try local fuzzy fallback.
 			if orig != "" {
 				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
 					diffContent := computeUnifiedDiff(task.Target, orig, modified)
@@ -2398,13 +2400,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 
 		rawContent := resp.Content
 
-		// ── Early abort for cloud providers ──
-		// If the raw output does not start with a diff marker, the model
-		// is likely wrapping the diff in conversational text or producing
-		// an unparseable response. For cloud models on a fast-track $hot
-		// command, we abort immediately (no retry) and fall back to local
-		// fuzzy replacement.
-		if isCloud && !hasDiffMarkerPrefix(rawContent) {
+		if isCloud && !hasDiffMarkerPrefix(rawContent) && orig != "" {
 			m.push(roleSystem, infoStyle.Render("[HOTFIX] Cloud model output lacks diff markers. Aborting early, trying local fallback..."))
 			if orig != "" {
 				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
@@ -2431,22 +2427,24 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		var resolved string
 		var diffContent string
 
-		// ── Step 1: Try robust diff extraction ──
-		// ExtractDiffFromLLMOutput handles:
-		//   - Markdown code fences (```diff ... ```)
-		//   - Conversational text wrapping ("Here is the diff: ...")
-		//   - Missing diff --git headers (--- a/ ... +++ b/ only)
-		//   - Fuzzy string replacement fallback for single-file hotfixes
-		if orig != "" {
+		switch strategy {
+		case execution.STRATEGY_NEW_FILE:
+			if extracted, ok := execution.ExtractRawCodeBlock(rawContent); ok {
+				resolved = execution.SanitizeRawCodeBlock(extracted)
+			} else if extracted, ok := execution.ExtractCodeBlockContent(rawContent); ok {
+				resolved = execution.SanitizeRawCodeBlock(extracted)
+			} else {
+				resolved = execution.SanitizeRawCodeBlock(rawContent)
+			}
+			diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+
+		default:
 			resolved, diffFound := execution.ExtractDiffFromLLMOutput(rawContent, orig, task.Description)
 			if diffFound {
 				diffContent = computeUnifiedDiff(task.Target, orig, resolved)
 			} else {
-				// No diff structure found — try conventional resolution.
 				resolved = execution.ResolveModifiedContent(orig, rawContent)
 				if resolved == orig && orig != "" {
-					// Structural breakdown: the model failed to produce a parseable diff.
-					// For cloud providers, abort immediately (no retry).
 					if isCloud {
 						m.push(roleSystem, infoStyle.Render("[HOTFIX] Cloud model structural breakdown. Trying local fallback..."))
 						if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
@@ -2470,17 +2468,10 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 					}
 					return hotfixProposalMsg{Err: fmt.Errorf("patch generation: no valid diff or search/replace block found in LLM output for %s", task.Target)}
 				}
-				// resolved != orig, meaning the conventional parser found the diff
 				diffContent = computeUnifiedDiff(task.Target, orig, resolved)
 			}
-		} else {
-			// No original content available — use the raw LLM output as-is
-			// and compute a diff (which will show all lines as additions for a new file).
-			resolved = rawContent
-			diffContent = computeUnifiedDiff(task.Target, orig, resolved)
 		}
 
-		// ── STEP 2/2: Content Cleanse — strip markdown code fences ──
 		cleaned := sanitizeFileOutput(rawContent)
 
 		patch := &execution.Patch{
@@ -2490,7 +2481,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			Modified:      cleaned,
 			TaskID:        task.StepNum,
 			ContextID:     m.sess.ContextID,
-			IsFullRewrite: true,
+			IsFullRewrite: strategy == execution.STRATEGY_NEW_FILE,
 		}
 
 		return hotfixProposalMsg{
@@ -2611,31 +2602,33 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
 
-		// ── CRITICAL: Read the target file BEFORE the LLM call ──────────
-		// Without the actual file content in the prompt, the LLM hallucinates
-		// the original content (e.g. "Copyright (c) 2023 Jay") and generates
-		// a unified diff that can never match the file on disk, producing:
-		//   "patch hunk does not match file content".
-		//
-		// The original is read once here and included in both the initial
-		// handoff and any retry handoff so the LLM always sees real content.
 		var orig string
 		if data, rerr := os.ReadFile(task.Target); rerr == nil {
 			orig = string(data)
 		}
 
+		// ── Determine strategy based on file state ─────────────────────
+		strategy := execution.StrategyForOriginal(orig)
 		baseHandoff := ctxpkg.SanitizeBuildHandoff(task, "")
-		if orig != "" {
+
+		switch strategy {
+		case execution.STRATEGY_NEW_FILE:
+			baseHandoff += "\n\nThis is a NEW file that does not exist yet. "
+			baseHandoff += "Output the complete file content inside a markdown code block "
+			baseHandoff += "with the appropriate language tag (e.g. ```css, ```javascript, ```html, ```python, ```go). "
+			baseHandoff += "Do NOT use FILE_CREATE markers, SEARCH/REPLACE blocks, or unified diffs."
+			baseHandoff += "Generate ONLY the content that belongs in this file.\n"
+		default:
 			baseHandoff += "\n\n### TARGET_FILE_CONTENT\n```\n" + orig + "\n```\n"
 			baseHandoff += "\nModify the above file content to fulfill the task. "
 			baseHandoff += "Output a unified diff (--- a/ ... +++ b/ ...) or a SEARCH/REPLACE block (<<<<<<< SEARCH). "
-			baseHandoff += "Do NOT output a full FILE: block — the file already exists."
-			baseHandoff += "\n\nSTRICT: Output ONLY the minimal SEARCH/REPLACE block needed. DO NOT rewrite the entire file. DO NOT include explanations or markdown prose."
+			baseHandoff += "Do NOT rewrite the entire file. "
+			baseHandoff += "Return ONLY the SEARCH/REPLACE block or unified diff. No explanatory text."
 		}
-		system := prompt.BuildContract()
 
-		// Detect cloud providers (OpenRouter, Cohere, etc.) so we can
-		// apply stricter extraction and warn on structural breakdown.
+		// Select system prompt based on strategy.
+		system := prompt.StrategyContract(strategy.SystemPromptKey())
+
 		cloudCfg := gateway.ClassifyCloudProvider(m.cfg.ActiveProviderName())
 		isCloud := cloudCfg.CloudProvider != ""
 
@@ -2643,12 +2636,25 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 		handoff := baseHandoff
 
 		for attempt := 0; attempt <= maxRetries; attempt++ {
+			// On retry for existing small files, switch to new-file strategy
+			// (full content overwrite) to avoid repeated diff failures.
+			currentStrategy := strategy
+			if attempt > 0 && orig != "" && execution.IsSmallFile(orig) {
+				currentStrategy = execution.STRATEGY_NEW_FILE
+				handoff = baseHandoff + "\n\nCORRECTION: Previous patch attempts failed. Output the COMPLETE new file content inside a single markdown code block. Do NOT use SEARCH/REPLACE or diff format."
+				system = prompt.StrategyContract("new_file")
+			}
+
+			stop := []string{">>>>>>>", "```\n\n"}
+			if currentStrategy == execution.STRATEGY_NEW_FILE {
+				stop = []string{"```\n\n"}
+			}
 			req := ai.Request{
 				Model:     m.cfg.ActiveModelName(),
 				System:    system,
 				Stream:    false,
 				MaxTokens: 500,
-				Stop:      []string{">>>>>>>", "```\n\n"},
+				Stop:      stop,
 				Messages:  []ai.Message{{Role: "user", Content: handoff}},
 			}
 
@@ -2659,18 +2665,14 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
 			}
 			if resp == nil || strings.TrimSpace(resp.Content) == "" {
-				// On attempt 1 with a cloud model, warn about empty
-				// output to help the developer understand token burn risk.
 				if attempt == 0 && isCloud {
 					m.push(roleSystem, fmt.Sprintf(
 						warningStyle.Render("[BUILD WARNING] %s returned empty output on attempt %d. "+
 							"The model may be wrapping the diff in markdown or conversational text. "+
-							"Retrying with explicit diff format instructions."),
+							"Retrying with explicit format instructions."),
 						m.cfg.ActiveModelName(), attempt+1))
 				}
 				if attempt < maxRetries {
-					// Inject a correction demonstrating the exact expected diff format
-					// to reduce token burn from repetitive formatting failures.
 					handoff = fmt.Sprintf(
 						"%s\n\nCORRECTION: Your previous response was empty or unparseable. The expected output is a raw unified diff block like:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n line1\n-line-old\n+line-new\n\nReturn ONLY that diff. No text before or after.",
 						baseHandoff, task.Target, task.Target)
@@ -2683,24 +2685,27 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			var resolved string
 			var diffContent string
 
-			// ── Step 1: Try robust diff extraction for cloud models ──
-			// ExtractDiffFromLLMOutput handles:
-			//   - Markdown code fences (```diff ... ```)
-			//   - Conversational text wrapping ("Here is the diff: ...")
-			//   - Missing diff --git headers (--- a/ ... +++ b/ only)
-			//   - Fuzzy string replacement fallback for single-file hotfixes
-			if orig != "" {
+			switch currentStrategy {
+			case execution.STRATEGY_NEW_FILE:
+				// New file: extract from the outermost markdown code block.
+				// Use defensive nested fence stripping for models that double-wrap.
+				if extracted, ok := execution.ExtractRawCodeBlock(rawContent); ok {
+					resolved = execution.SanitizeRawCodeBlock(extracted)
+				} else if extracted, ok := execution.ExtractCodeBlockContent(rawContent); ok {
+					resolved = execution.SanitizeRawCodeBlock(extracted)
+				} else {
+					resolved = execution.SanitizeRawCodeBlock(rawContent)
+				}
+				diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+
+			default:
+				// Existing file: try robust diff extraction.
 				resolved, diffFound := execution.ExtractDiffFromLLMOutput(rawContent, orig, task.Description)
 				if diffFound {
-					// We successfully extracted/resolved the diff content.
-					// Compute the display diff using the resolved content.
 					diffContent = computeUnifiedDiff(task.Target, orig, resolved)
 				} else {
-					// No diff structure found — try conventional resolution.
 					resolved = execution.ResolveModifiedContent(orig, rawContent)
 					if resolved == orig && orig != "" {
-						// Structural breakdown: the model failed to produce a parseable diff.
-						// On attempt 1 with a cloud model, warn and retry with explicit format demonstration.
 						if attempt == 0 && isCloud {
 							m.push(roleSystem, fmt.Sprintf(
 								warningStyle.Render("[BUILD WARNING] %s failed structural breakdown on attempt %d. "+
@@ -2709,8 +2714,6 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 								m.cfg.ActiveModelName(), attempt+1))
 						}
 						if attempt < maxRetries {
-							// Inject a correction that explicitly demonstrates the expected diff format
-							// to prevent token burn on repetitive formatting failures.
 							handoff = fmt.Sprintf(
 								"%s\n\nCORRECTION: Your previous patch was rejected because it lacked valid diff markers. "+
 									"The expected format for a unified diff is:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n existing context line\n-old-line\n+new-line\n\n"+
@@ -2721,41 +2724,30 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 						}
 						return buildProposalReadyMsg{Err: fmt.Errorf("patch generation: no valid diff or search/replace block found in LLM output for %s after %d attempts", task.Target, attempt+1)}
 					}
-					// resolved != orig, meaning the conventional parser found the diff
 					diffContent = computeUnifiedDiff(task.Target, orig, resolved)
 				}
-			} else {
-				// No original content available — use the raw LLM output as-is
-				// and compute a diff (which will show all lines as additions for a new file).
-				resolved = rawContent
-				diffContent = computeUnifiedDiff(task.Target, orig, resolved)
-			}
 
-			// Validate patch format BEFORE presenting to human.
-			// If the snippet is ambiguous (no SEARCH/REPLACE markers, no diff
-			// headers, significantly smaller than the original), reject early
-			// and retry with explicit SEARCH/REPLACE formatting instructions.
-			// The retry prompt also includes the actual file content so the
-			// LLM can generate a correct patch.
-			cleaned := sanitizeFileOutput(rawContent)
-			if execution.IsAmbiguousSnippet(orig, cleaned) {
-				if attempt < maxRetries {
-					handoff = fmt.Sprintf(
-						"Your proposed patch for %s was rejected due to invalid format: Ambiguous snippet without SEARCH/REPLACE markers. Re-send the modification using strict <<<<<<< SEARCH ... ======= ... >>>>>>> blocks.\n\nOriginal task:\n%s",
-						task.Target, baseHandoff)
-					continue
+				// Validate patch format for existing files.
+				cleaned := sanitizeFileOutput(rawContent)
+				if execution.IsAmbiguousSnippet(orig, cleaned) {
+					if attempt < maxRetries {
+						handoff = fmt.Sprintf(
+							"Your proposed patch for %s was rejected due to invalid format: Ambiguous snippet without SEARCH/REPLACE markers. Re-send the modification using strict <<<<<<< SEARCH ... ======= ... >>>>>>> blocks.\n\nOriginal task:\n%s",
+							task.Target, baseHandoff)
+						continue
+					}
+					return buildProposalReadyMsg{Err: fmt.Errorf("%w: ambiguous snippet without SEARCH/REPLACE markers for existing file %s — retry with SEARCH/REPLACE block or unified diff", execution.ErrInvalidPatchFormat, task.Target)}
 				}
-				return buildProposalReadyMsg{Err: fmt.Errorf("%w: ambiguous snippet without SEARCH/REPLACE markers for existing file %s — retry with SEARCH/REPLACE block or unified diff", execution.ErrInvalidPatchFormat, task.Target)}
 			}
 
 			patch := &execution.Patch{
 				ID:            fmt.Sprintf("build-%d", task.StepNum),
 				File:          task.Target,
 				Original:      orig,
-				Modified:      cleaned,
+				Modified:      resolved,
 				TaskID:        task.StepNum,
 				ContextID:     m.sess.ContextID,
-				IsFullRewrite: task.IsHardcoded,
+				IsFullRewrite: currentStrategy == execution.STRATEGY_NEW_FILE,
 			}
 
 			return buildProposalReadyMsg{
@@ -2766,7 +2758,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			}
 		}
 
-		return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed after %d retries: ambiguous snippet format", maxRetries)}
+		return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed after %d retries", maxRetries)}
 	}
 }
 
@@ -3010,7 +3002,7 @@ func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
 		handoff += "\n\n### USER REQUEST\n" + task.Description
 		handoff += "\n\nOutput a <<<<<<< FILE_CREATE: " + canonicalTarget + " block with the final content."
 
-		system := prompt.BuildContract()
+		system := prompt.ExistingFileContract()
 
 		req := ai.Request{
 			Model:     m.cfg.ActiveModelName(),

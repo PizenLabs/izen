@@ -1348,6 +1348,56 @@ func ResolveModifiedContent(original, rawLLMOutput string) string {
 	return input
 }
 
+// ExtractCodeBlockContent extracts content from the first markdown code block
+// found in the output. This handles the case where small cloud models output
+// raw file content inside ```<lang> ... ``` fences instead of using the
+// FILE_CREATE protocol. The function scans for the first ``` fence, extracts
+// everything between it and the closing ```, and ignores any conversational
+// text before or after the block. Returns the extracted content and true if a
+// code block was found and extracted.
+func ExtractCodeBlockContent(raw string) (string, bool) {
+	input := strings.TrimSpace(raw)
+	if input == "" {
+		return "", false
+	}
+
+	lines := strings.Split(input, "\n")
+	openIdx := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			openIdx = i
+			break
+		}
+	}
+	if openIdx < 0 {
+		return "", false
+	}
+
+	// Find the closing fence after the opening.
+	closeIdx := -1
+	for i := openIdx + 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "```" {
+			closeIdx = i
+			break
+		}
+	}
+
+	var content string
+	if closeIdx < 0 {
+		// No closing fence — take everything after the opening fence line.
+		content = strings.Join(lines[openIdx+1:], "\n")
+	} else {
+		content = strings.Join(lines[openIdx+1:closeIdx], "\n")
+	}
+
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return "", false
+	}
+	return content, true
+}
+
 // searchReplaceBlock represents a parsed <<<<<<< SEARCH ... ======= ... >>>>>>> block.
 type searchReplaceBlock struct {
 	search  string
@@ -2261,6 +2311,93 @@ func tryApplySearchReplace(original, content string) (string, bool) {
 	}
 	return original, false
 }
+
+// ExtractRawCodeBlock extracts the raw content from a markdown code block,
+// handling nested and malformed fences commonly produced by small models
+// (e.g. qwen2.5-coder:7b which wraps ```diff inside ``` inside ```).
+//
+// The function applies three extraction passes:
+//  1. Strip outermost fences (``` ... ```)
+//  2. Strip second-layer fences if the content starts with another ``` fence
+//  3. Strip inline ```diff and ```go prefixes that leak inside block content
+//
+// Returns the extracted content and true if a fence was found and stripped,
+// or the original content and false if no fence was detected.
+func ExtractRawCodeBlock(raw string) (string, bool) {
+	input := strings.TrimSpace(raw)
+	if input == "" {
+		return "", false
+	}
+
+	stripped := false
+
+	// Pass 1: Strip outermost ``` fence
+	if strings.HasPrefix(input, "```") {
+		idx := strings.Index(input, "\n")
+		if idx != -1 {
+			input = strings.TrimSpace(input[idx+1:])
+			stripped = true
+		}
+	}
+	if strings.HasSuffix(input, "```") {
+		input = strings.TrimSpace(strings.TrimSuffix(input, "```"))
+		stripped = true
+	}
+
+	// Pass 2: If the remaining content starts with another ``` fence,
+	// it means the model double-wrapped the code block.
+	if strings.HasPrefix(input, "```") {
+		idx := strings.Index(input, "\n")
+		if idx != -1 {
+			input = strings.TrimSpace(input[idx+1:])
+		}
+	}
+	if strings.HasSuffix(input, "```") {
+		input = strings.TrimSpace(strings.TrimSuffix(input, "```"))
+	}
+
+	// Pass 3: Strip inline ```diff, ```go, ```css etc. prefixes that
+	// models sometimes inject mid-content (leaked language tags).
+	lines := strings.Split(input, "\n")
+	var cleaned []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") && len(trimmed) <= 12 {
+			continue
+		}
+		cleaned = append(cleaned, line)
+	}
+	if len(cleaned) < len(lines) {
+		input = strings.TrimSpace(strings.Join(cleaned, "\n"))
+		stripped = true
+	}
+
+	if !stripped {
+		return raw, false
+	}
+	return input, true
+}
+
+// SanitizeRawCodeBlock applies automatic sanitization to raw code blocks
+// before they are passed to the patch applicator. It strips:
+//   - Leading/trailing blank lines
+//   - Stray markdown fence lines leaked inside content
+//   - FILE: or [target] metadata lines
+func SanitizeRawCodeBlock(content string) string {
+	content = SanitizeLLMResponse(content)
+	content = strings.TrimSpace(content)
+	lines := strings.Split(content, "\n")
+	var result []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "```" || trimmed == "``" || trimmed == "`" {
+			continue
+		}
+		result = append(result, line)
+	}
+	return strings.TrimSpace(strings.Join(result, "\n"))
+}
+
 func (pm *PatchManager) store(patch *Patch) error {
 	if err := os.MkdirAll(pm.patDir, 0755); err != nil {
 		return err
