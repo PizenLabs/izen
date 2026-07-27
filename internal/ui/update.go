@@ -449,6 +449,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
 		}
 		if msg.IsFastTrack {
+			// Auto-create a build checkpoint BEFORE presenting the plan so that
+			// the Checkpoint Verification Guardrail allows patch execution without
+			// throwing "no valid checkpoint exists".
+			if m.execEng != nil {
+				_, _ = m.execEng.Checkpoints.Create(fmt.Sprintf("izen fast-track: %d task(s)", len(msg.Tasks)))
+			}
 			m.planApproved = true
 			m.push(roleStatus, accentStyle.Render(fmt.Sprintf("[Fast-Track] Plan auto-approved: %d task(s). Type /build to execute.", len(msg.Tasks))))
 		} else {
