@@ -2012,6 +2012,20 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 		}
 	}
 
+	// ── EARLY BUDGET SCALING ────────────────────────────────────────────
+	// Before executing the first step, ScaleBudget to the exact number of
+	// staged plan tasks so MaxMutations > 0 and IsMultiStepPlan() returns true.
+	// This converts each step's authorization from single-use (consuming the
+	// budget per step) to multi-step (non-single-use, budget consumed only
+	// once). Without this, Step 1 exhausts the mutation budget and Steps 2..N
+	// all fail with "mutation budget already exhausted".
+	if m.mutationBudget != nil {
+		n := len(m.sess.CurrentTasks)
+		if n > 0 {
+			m.mutationBudget.ScaleBudget(n)
+		}
+	}
+
 	// Execute the first idle staged task.
 	return m.handleBuildRun(0)
 }
@@ -2345,6 +2359,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			MaxTokens: 2048,
 			Stop:      stop,
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
+			Tools:     ai.FileMutationTools(),
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -2372,6 +2387,29 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			}
 			return hotfixProposalMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
 		}
+
+		// ── NATIVE TOOL CALLING PATH ──────────────────────────────
+		// When the LLM responds with tool_calls (finish_reason: tool_calls),
+		// extract path and content directly from tool argument JSON and write
+		// files to disk immediately — bypassing all markdown codeblock parsing,
+		// regex string extraction, and the approval gate.
+		if len(resp.ToolCalls) > 0 {
+			results, dispatchErr := execution.DispatchToolCalls(resp.ToolCalls, ".")
+			if dispatchErr != nil {
+				return hotfixProposalMsg{Err: fmt.Errorf("tool call execution: %w", dispatchErr)}
+			}
+			if results.HasContent() {
+				// Write files via hotfix path: return result message that
+				// the buildResultMsg update handler will pick up and restore
+				// the stashed hotfix plan.
+				return buildResultMsg{
+					output:   results.Summary(),
+					exitCode: 0,
+				}
+			}
+		}
+
+		// ── FALLBACK: No tool calls — use existing markdown extraction ──
 		if resp == nil || strings.TrimSpace(resp.Content) == "" {
 			if isCloud {
 				m.push(roleSystem, infoStyle.Render("[HOTFIX] Cloud model returned empty output. Aborting LLM attempt, trying local fallback..."))
@@ -2656,6 +2694,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				MaxTokens: 2048,
 				Stop:      stop,
 				Messages:  []ai.Message{{Role: "user", Content: handoff}},
+				Tools:     ai.FileMutationTools(),
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -2664,6 +2703,33 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			if err != nil {
 				return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
 			}
+
+			// ── NATIVE TOOL CALLING PATH (bypasses markdown parsing + approval gate) ──
+			if len(resp.ToolCalls) > 0 {
+				results, dispatchErr := execution.DispatchToolCalls(resp.ToolCalls, ".")
+				if dispatchErr != nil {
+					return buildProposalReadyMsg{Err: fmt.Errorf("tool call execution: %w", dispatchErr)}
+				}
+				if results.HasContent() {
+					// Mark the build task completed so the queue advances.
+					if m.sess != nil {
+						tasks := m.sess.CurrentTasks
+						for i := range tasks {
+							if tasks[i].StepNum == task.StepNum {
+								tasks[i].Status = "completed"
+								break
+							}
+						}
+						m.sess.StageTaskList(&tasks)
+						_ = m.sess.Save()
+					}
+					return buildResultMsg{
+						output:   results.Summary(),
+						exitCode: 0,
+					}
+				}
+			}
+
 			if resp == nil || strings.TrimSpace(resp.Content) == "" {
 				if attempt == 0 && isCloud {
 					m.push(roleSystem, fmt.Sprintf(

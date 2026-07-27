@@ -80,6 +80,17 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 		Stream:      false,
 	}
 
+	if len(req.Tools) > 0 {
+		rawTools := make([]json.RawMessage, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			data, err := json.Marshal(t)
+			if err == nil {
+				rawTools = append(rawTools, data)
+			}
+		}
+		body.Tools = rawTools
+	}
+
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("openrouter: marshal: %w", err)
@@ -121,8 +132,21 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	}
 
 	content := ""
+	var toolCalls []ai.ToolCall
 	if openaiResp.Choices[0].Message != nil {
 		content = openaiResp.Choices[0].Message.Content
+		if openaiResp.Choices[0].FinishReason == "tool_calls" && len(openaiResp.Choices[0].Message.ToolCalls) > 0 {
+			for _, tc := range openaiResp.Choices[0].Message.ToolCalls {
+				toolCalls = append(toolCalls, ai.ToolCall{
+					ID:   tc.ID,
+					Type: tc.Type,
+					Function: ai.ToolCallFunction{
+						Name:      tc.Function.Name,
+						Arguments: tc.Function.Arguments,
+					},
+				})
+			}
+		}
 	}
 
 	tokenIn := 0
@@ -136,6 +160,7 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 		Content:     content,
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
+		ToolCalls:   toolCalls,
 	}, nil
 }
 
@@ -224,6 +249,7 @@ type openrouterRequest struct {
 	Stop          []string            `json:"stop,omitempty"`
 	Stream        bool                `json:"stream"`
 	StreamOptions *streamOptions      `json:"stream_options,omitempty"`
+	Tools         []json.RawMessage   `json:"tools,omitempty"`
 }
 
 type openrouterResponse struct {
@@ -243,8 +269,20 @@ type openrouterChoice struct {
 }
 
 type openrouterMsg struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string               `json:"role"`
+	Content   string               `json:"content"`
+	ToolCalls []openrouterToolCall `json:"tool_calls,omitempty"`
+}
+
+type openrouterToolCall struct {
+	ID       string                 `json:"id"`
+	Type     string                 `json:"type"`
+	Function openrouterToolCallFunc `json:"function"`
+}
+
+type openrouterToolCallFunc struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type openrouterDelta struct {
