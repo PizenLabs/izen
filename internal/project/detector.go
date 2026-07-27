@@ -17,6 +17,43 @@ type Detection struct {
 	Confidence   float64             `json:"confidence"`
 }
 
+// ProjectContext provides a safe, never-nil context for the active
+// project workspace. When project detection fails (empty or
+// unrecognized directories), a fallback context with Name "generic"
+// and Type "unknown" is returned so the UI always has valid data to
+// render.
+type ProjectContext struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+// FallbackProjectContext returns a safe default ProjectContext for
+// directories where no project type could be detected.
+func FallbackProjectContext() *ProjectContext {
+	return &ProjectContext{
+		Name: "generic",
+		Type: "unknown",
+	}
+}
+
+// RepoConfig holds minimal repository metadata used by the UI
+// status bar and rendering paths. Never nil after model creation.
+type RepoConfig struct {
+	Root          string `json:"root"`
+	IsGitRepo     bool   `json:"is_git_repo"`
+	DefaultBranch string `json:"default_branch"`
+}
+
+// FallbackRepoConfig returns a safe default RepoConfig for
+// directories where git metadata is unavailable.
+func FallbackRepoConfig(root string) *RepoConfig {
+	return &RepoConfig{
+		Root:          root,
+		IsGitRepo:     false,
+		DefaultBranch: "main",
+	}
+}
+
 type fileEvidence struct {
 	def     *language.Def
 	matched string

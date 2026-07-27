@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -78,6 +79,13 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.spinnerFrame = 0
 	m.responseBuffer.Reset()
 	m.reasoningBuffer.Reset()
+	m.pendingReasoningFragment = ""
+	if m.thinkingPanel != nil {
+		m.thinkingPanel.Reset()
+	}
+	if m.liveCodePreview != nil {
+		m.liveCodePreview.Reset()
+	}
 	// ── TRANSIENT BUFFER RESET (1-TURN LATENCY FIX) ───────────────────
 	// Explicitly clear all accumulated raw-string buffers before launching the
 	// stream so the rendering pipeline cannot leak or re-send leftover bytes
@@ -168,6 +176,14 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// the stream (the historical 108-token stall). The producer only touches
 	// the channel, the local buffer, and the captured `streamCh`/`cancel`.
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				select {
+				case streamCh <- streamErrMsg{err: fmt.Errorf("stream panic: %v", r)}:
+				default:
+				}
+			}
+		}()
 		defer close(streamCh)
 		defer cancel()
 

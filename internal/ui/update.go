@@ -21,6 +21,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/classifier"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/build"
@@ -44,16 +45,19 @@ func (m *model) Init() tea.Cmd {
 }
 
 // Update routes state machines and events.
-func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// ── GLOBAL PANIC RECOVERY ──────────────────────────────────────────
+func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
+	// ── GLOBAL PANIC RECOVERY ──────────────────────────────────
 	// Any panic inside the update loop is caught here, the full stack trace
-	// is written to stderr for debugging, and the program exits cleanly.
+	// is written to stderr for debugging, and the model is preserved so
+	// the UI remains responsive instead of cascading into a second crash
+	// when bubbletea calls View() on the nil model returned by the broken
+	// update dispatch.
 	defer func() {
 		if r := recover(); r != nil {
 			buf := make([]byte, 4096)
 			n := runtime.Stack(buf, false)
 			fmt.Fprintf(os.Stderr, "\nIZEN PANIC: %v\nStack:\n%s\n", r, buf[:n])
-			os.Exit(1)
+			model = m
 		}
 	}()
 
@@ -483,9 +487,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		tb.WriteString("  ▸ Verification Vector: Build + Test pipeline\n")
 		tb.WriteString("\n")
 		tb.WriteString(boldMauveStyle.Render(Icon.Timeline+" TODO CHECKLIST") + "\n")
+		totalTasks := len(msg.Tasks)
 		for _, t := range msg.Tasks {
 			icon, track := planTrackIcon(t)
-			fmt.Fprintf(&tb, "[ ] %s [%s] %s\n", icon, track, t.Target)
+			fmt.Fprintf(&tb, "[ ] %s [%s] #%d %s  [Target %d/%d]\n", icon, track, t.StepNum, t.Target, t.StepNum, totalTasks)
 			if t.Description != "" {
 				fmt.Fprintf(&tb, "      %s\n", t.Description)
 			}
@@ -705,6 +710,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agentDone = true
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
+		m.pipelineRunning = false
+		m.streaming = false
 		m.sanitizeInputPrompt()
 
 		// ── BUILD PROPOSAL FAILURE ───────────────────────────────────
@@ -726,7 +733,68 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// ── Extract proposals from LLM output ───────────────────────
 		props := extractBuildProposals(msg.Output)
+		if len(props) == 0 && len(msg.Patches) > 0 {
+			// Fast-track path: create proposals from pre-buffered
+			// native tool call patches (write_file / apply_patch).
+			allCalls := m.toolCallBuffer.All()
+			callByPath := make(map[string]execution.BufferedToolCall)
+			for _, c := range allCalls {
+				callByPath[c.Path] = c
+			}
+			for _, p := range msg.Patches {
+				call, ok := callByPath[p.File]
+				if !ok {
+					continue
+				}
+				proposal := SemanticProposal{
+					ID:   p.ID,
+					Diff: call.Diff,
+					Target: SemanticTarget{
+						QualifiedName: p.File,
+						Module:        filepath.Dir(p.File),
+						Language:      langFromPath(p.File),
+					},
+					Expanded: true,
+					Patch:    p,
+				}
+				props = append(props, proposal)
+			}
+		}
 		if len(props) == 0 {
+			// NOTE: msg.Task and msg.Patch are *pointers* that are only
+			// populated by the single-task producers of buildProposalReadyMsg
+			// (see the constructions in commands.go around runBuildTask /
+			// hybrid template patching). The fast-track streaming producer
+			// (the goroutine started from cmdFastTrackBuild) only ever sets
+			// Patches/Output — it has no single driving Task, because it can
+			// touch many files via native tool calls in one turn.
+			//
+			// This branch used to dereference msg.Task.Target and
+			// msg.Patch.ID unconditionally. Whenever the fast-track path
+			// produced neither native tool calls (so msg.Patches stayed
+			// empty above) nor a plain-text proposal that extractBuildProposals
+			// could parse, both msg.Task and msg.Patch were nil here and this
+			// panicked with a nil pointer dereference — freezing the whole
+			// TUI, since Update()'s recover() preserves the model but drops
+			// the in-flight command, so nothing ever re-reads the stream
+			// channel again. Fail soft instead: tell the user nothing could
+			// be extracted, and let them retry or fall back to /plan.
+			if msg.Task == nil || msg.Patch == nil {
+				// Fast-track builds (msg.Task==nil && msg.Patch==nil) that
+				// produced zero patches (e.g. provider without TCLL/RSNG
+				// sentinels — no OpenRouter) get no usable output. Fall back
+				// to per-task execution so the user can still build.
+				if msg.Task == nil && msg.Patch == nil && len(msg.Patches) == 0 && len(m.sess.CurrentTasks) > 0 {
+					m.push(roleStatus, "Fast-track produced no patches — switching to per-task execution.")
+					m.refreshViewportContent()
+					m.Viewport.GotoBottom()
+					return m, m.handleBuildRun(0)
+				}
+				m.push(roleError, "No patch proposal could be extracted from the model's response — nothing to apply. Try rephrasing the request, or use /plan for a structured retry.")
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, m.flushPendingRecords()
+			}
 			// Fallback: use the pre-computed diff and patch directly.
 			// Store the full Patch so applyProposalCmd can use the exact
 			// Modified content instead of the display Diff (which may lack
@@ -753,8 +821,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ti.Blur()
 		m.recalcViewportHeight()
 		m.Viewport.Height = m.computeVpHeight()
-		m.push(roleStatus, fmt.Sprintf(
-			"Proposed patch to %s", msg.Task.Target))
+
+		// Human-readable status line. msg.Task is nil for the fast-track
+		// multi-file path, so don't assume it's populated — fall back to
+		// the single extracted proposal's target, or a file count.
+		statusTarget := "the proposed change"
+		switch {
+		case msg.Task != nil:
+			statusTarget = msg.Task.Target
+		case len(props) == 1:
+			statusTarget = props[0].Target.QualifiedName
+		case len(props) > 1:
+			statusTarget = fmt.Sprintf("%d files", len(props))
+		}
+		m.push(roleStatus, fmt.Sprintf("Proposed patch to %s", statusTarget))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m, nil
@@ -1586,8 +1666,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the downstream JSON parser or render pipeline. Lines matching
 		// telemetry/error markers are removed from leading/trailing context.
 		final = sanitizeFinalContent(final)
-		// Strip any remaining reasoning sentinels from final content
-		final = m.extractSentinelReasoning(final)
+		// Strip any remaining reasoning sentinels from final content.
+		var finalReasoning string
+		final, finalReasoning = m.extractSentinelReasoning(final)
+		if finalReasoning != "" {
+			m.reasoningBuffer.WriteString(finalReasoning)
+			if m.thinkingPanel != nil {
+				m.thinkingPanel.Append(finalReasoning)
+			}
+		}
+		// The stream is genuinely done now — nothing more will ever close
+		// an opening sentinel that's still pending. Surface it rather than
+		// leaving it stranded (or, as before the fix, leaking it into the
+		// next turn's content).
+		m.flushPendingReasoningFragment()
 
 		// Append the completed turn to PreRenderedHistory and freeze state.
 		m.push(roleAI, final)
@@ -2002,6 +2094,47 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.push(roleError, "stream error: "+msg.err.Error())
 		}
 		m.refreshViewportContent()
+		flush := m.flushPendingRecords()
+		return m, flush
+
+	case thinkingStreamMsg:
+		// Real-time reasoning token dispatch to the TUI Thinking Panel.
+		// Updates from token #1 — no waiting for the full response.
+		if m.thinkingPanel != nil {
+			m.thinkingPanel.Append(msg.Content)
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+		}
+		return m, m.readStream()
+
+	case livePreviewChunkMsg:
+		// Stream content or tool call arguments directly into the
+		// LiveCodePreview for real-time code preview during fast-track builds.
+		if m.liveCodePreview != nil && msg.Content != "" {
+			label := "live_stream"
+			if msg.IsTool {
+				label = "live_tool"
+			}
+			m.liveCodePreview.AddOrUpdate(label, msg.Content, msg.IsTool)
+		}
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, m.readStream()
+
+	case buildFailedMsg:
+		// Guaranteed cleanup from stream defer: spinner stops, pipeline resets.
+		m.streamCh = nil
+		m.streaming = false
+		m.streamCancel = nil
+		m.pipelineRunning = false
+		m.agentRunning = false
+		m.agentDone = true
+		m.agentLabel = ""
+		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
+		m.push(roleError, "fast-track build failed: "+msg.Err.Error())
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
 		return m, flush
 

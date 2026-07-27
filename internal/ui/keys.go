@@ -14,7 +14,10 @@ import (
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// ── GLOBAL: Alt+O toggles reasoning block visibility ────────────
 	if msg.String() == "alt+o" {
-		m.showReasoning = !m.showReasoning
+		if m.thinkingPanel != nil {
+			m.thinkingPanel.Toggle()
+		}
+		m.showReasoning = m.thinkingPanel != nil && m.thinkingPanel.Expanded()
 		m.refreshViewportContent()
 		if m.Ready && !m.userIsScrollingUp {
 			m.Viewport.GotoBottom()
@@ -199,11 +202,26 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// ── Awaiting approval ────────────────────────────────────────────
 	if m.state == StateAwaitingApproval {
-		// ── Arrow-key fallback: scroll the main viewport when
-		// there is no expanded proposal diff to inspect. This
-		// keeps navigation functional for collapsed proposals and
-		// build approval prompts where the diff scroll block
-		// above does not intercept. ──────────────────────────
+		// ── Effort Selector (←/→) ────────────────────────────────────
+		if msg.Type == tea.KeyLeft {
+			if m.currentEffort > EffortAuto {
+				m.currentEffort--
+			}
+			m.recalcViewportHeight()
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m, nil
+		}
+		if msg.Type == tea.KeyRight {
+			if m.currentEffort < EffortHigh {
+				m.currentEffort++
+			}
+			m.recalcViewportHeight()
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m, nil
+		}
+
 		// ── Arrow-key fallback: scroll the main viewport when
 		// there is no expanded proposal diff to inspect. This
 		// keeps navigation functional for collapsed proposals and
@@ -238,9 +256,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.push(roleSystem, infoStyle.Render(
 					fmt.Sprintf("  ✓ Approved — applying hotfix patch to %s...", patch.File)))
 
-				// Apply the pre-generated patch through the execution engine
-				// (shadow backups + mutation guardrails). The buildResultMsg
-				// handler then restores the stashed plan and PAUSEs the pipeline.
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "hotfix apply"} },
 					m.applyHotfixPatch(task, patch),
@@ -248,7 +263,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				)
 
 			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
-				// ── REJECT: abort cleanly, touch no files ──────────
 				rejectedPath := m.pendingHotfixTask.Target
 				m.pendingHotfixTask = nil
 				m.pendingHotfixPatch = nil
@@ -262,7 +276,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					"[HOTFIX] Developer rejected patch to %s.",
 					rejectedPath))
 
-				// Restore the stashed plan so the pipeline returns to PAUSED.
 				m.hotfixActive = false
 				if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
 					m.sess.StageTaskList(&stashedTasks)
@@ -280,7 +293,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			task := m.pendingBuildTask
 			switch {
 			case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
-				// ── Allow Once ────────────────────────────────────
 				m.pendingBuildApproval = false
 				m.pendingBuildTask = nil
 				m.state = StateChat
@@ -296,7 +308,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				)
 
 			case msg.String() == "alt+l":
-				// ── Allow Always (session-wide bypass) ────────────
 				m.pendingBuildAllowAlways = true
 				m.pendingBuildApproval = false
 				m.pendingBuildTask = nil
@@ -314,7 +325,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				)
 
 			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
-				// ── Reject ─────────────────────────────────────────
 				m.pendingBuildApproval = false
 				m.pendingBuildTask = nil
 				m.state = StateChat
@@ -343,15 +353,33 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// ── Native Tool Call Buffer Approval ──────────────────────────
+		if m.toolCallBuffer != nil && m.toolCallBuffer.HasPending() {
+			switch {
+			case msg.String() == "a":
+				// Accept single call — apply approved calls to disk
+				return m, m.applyToolCallBuffer()
+			case msg.String() == "l":
+				// Allow all — approve all and apply
+				m.toolCallBuffer.ApproveAll()
+				return m, m.applyToolCallBuffer()
+			case msg.String() == "r" || msg.Type == tea.KeyEscape:
+				// Reject — discard buffer
+				m.toolCallBuffer.Reject()
+				m.state = StateChat
+				m.recalcViewportHeight()
+				m.push(roleSystem, infoStyle.Render("tool calls rejected"))
+				return m, nil
+			case msg.String() == "e":
+				// Cycle effort level
+				m.cycleEffort()
+				m.refreshViewportContent()
+				return m, nil
+			}
+			return m, nil
+		}
+
 		// ── File-mutation proposal approval ─────────────────────────
-		// Unified keybindings:
-		//   Accept:  Alt+A / Enter
-		//   Allow All:   Alt+L
-		//   Reject:  Alt+R / Esc
-		//   Toggle:  Alt+P
-		//   Scroll diff: ↑/↓/PageUp/PageDn
-		//   Accept: Alt+A / Enter, Allow All: Alt+L, Reject: Alt+R / Esc
-		//   Toggle: Alt+P
 		switch {
 		case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
 			return m, m.applySingleProposal()
@@ -368,10 +396,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
-			// ── VIRTUAL SNAPSHOT ROLLBACK ────────────────────────────
-			// On user rejection, restore ALL files to the state captured
-			// at the last transaction boundary (mode entry / build start).
-			// This guarantees no mutation persists without explicit approval.
 			if m.execEng != nil {
 				if errs := m.execEng.RollbackTransaction(); len(errs) > 0 {
 					for _, err := range errs {
@@ -379,17 +403,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
-			// Clear dialog history so the next user prompt starts with a
-			// clean context scope — no stale plan output or previous
-			// proposals bleed into future turns.
 			if m.sess != nil {
 				m.sess.ClearHistory()
 				_ = m.sess.Save()
 			}
 
-			// ── STALL THE REJECTED BUILD TASK ──────────────────────────
-			// Mark the current build task as stalled so the queue does not
-			// advance. The user must use /investigate or /plan before retrying.
 			if m.currentBuildTaskID > 0 && m.sess != nil {
 				tasks := m.sess.CurrentTasks
 				for i := range tasks {

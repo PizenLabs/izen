@@ -86,6 +86,12 @@ func (ls *LogStore) Toggle(id int) bool {
 	return false
 }
 
+// Clear removes all log entries.
+func (ls *LogStore) Clear() {
+	ls.entries = nil
+	ls.nextID = 1
+}
+
 // Entries returns all log entries.
 func (ls *LogStore) Entries() []LogEntry {
 	return ls.entries

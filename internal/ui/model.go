@@ -247,11 +247,35 @@ type buildResultMsg struct {
 // renders a diff proposal for explicit human authorization before any disk
 // write occurs.
 type buildProposalReadyMsg struct {
-	Task   *plan.Task
-	Patch  *execution.Patch
-	Diff   string
-	Output string // raw LLM response text for proposal extraction
-	Err    error
+	Task    *plan.Task
+	Patch   *execution.Patch
+	Patches []*execution.Patch
+	Diff    string
+	Output  string // raw LLM response text for proposal extraction
+	Err     error
+}
+
+// thinkingStreamMsg carries a reasoning token chunk from the SSE stream
+// to the TUI Thinking Panel for real-time display during fast-track builds.
+type thinkingStreamMsg struct {
+	Content string
+}
+
+// livePreviewChunkMsg carries a code content or tool call chunk from the
+// SSE stream to the LiveCodePreview for real-time display during fast-track
+// builds.
+type livePreviewChunkMsg struct {
+	Content      string // raw content or tool call JSON
+	IsTool       bool   // true if this chunk is a tool call delta
+	IsDone       bool   // true if this is the final content chunk before stream end
+	FinishReason string // "stop", "length", "tool_calls", etc.
+}
+
+// buildFailedMsg signals that the fast-track build stream failed
+// (e.g. stream error, truncation, or provider failure). It guarantees
+// the spinner is cleaned up and the pipeline is reset.
+type buildFailedMsg struct {
+	Err error
 }
 
 // hotfixProposalMsg carries the LLM-generated patch for a $hot hotfix back to
@@ -545,7 +569,14 @@ type model struct {
 	reasoningBuffer strings.Builder
 	showReasoning   bool
 	streaming       bool
-	spinnerFrame    int
+	// pendingReasoningFragment holds an opened-but-not-yet-closed
+	// \x00RSNG\x00 reasoning block carried over between extraction passes.
+	// Without this, a sentinel pair split across two ticks (or a truncated
+	// SSE chunk) leaked its still-streaming reasoning text straight into
+	// the visible answer instead of staying buffered until the closing
+	// marker arrives. See extractSentinelReasoning.
+	pendingReasoningFragment string
+	spinnerFrame             int
 	// lastSpinnerAdvance throttles spinner-frame advancement inside the 20ms
 	// smoothStreamTickMsg loop to a ~100ms cadence, so the braille animation
 	// stays visually consistent with the 100ms tickMsg loop while token
@@ -646,6 +677,16 @@ type model struct {
 
 	// Project type detection
 	detection project.Detection
+
+	// Project context — never nil after model creation.
+	// Falls back to generic/unknown when project detection finds
+	// no recognized files (e.g. empty or unrecognized directories).
+	projectContext *project.ProjectContext
+
+	// Repository config — never nil after model creation.
+	// Holds minimal metadata (root path, git status, default branch)
+	// used by the status bar and rendering paths.
+	repoConfig *project.RepoConfig
 
 	// AST/Code Graph trace for rendering the AI's thought route
 	currentTrace *ctxpkg.CodebaseTrace
@@ -865,6 +906,18 @@ type model struct {
 
 	// Foldable execution logs
 	logStore *LogStore
+
+	// Native Tool Call Buffer for in-memory tool call interception
+	toolCallBuffer *execution.ToolCallBuffer
+
+	// Realtime thinking/reasoning panel
+	thinkingPanel *ThinkingPanel
+
+	// Live code preview for streaming tool call arguments
+	liveCodePreview *LiveCodePreview
+
+	// Current effort level for generation
+	currentEffort EffortLevel
 }
 
 // isProjectInitialized checks whether .izen/ exists AND contains a valid
@@ -884,6 +937,47 @@ func (m *model) isProjectInitialized() bool {
 		return false
 	}
 	return true
+}
+
+// applyToolCallBuffer applies approved tool calls to disk and flushes the buffer.
+func (m *model) applyToolCallBuffer() tea.Cmd {
+	return func() tea.Msg {
+		if m.toolCallBuffer == nil {
+			return mutationResultMsg{err: fmt.Errorf("no tool call buffer")}
+		}
+		results, err := m.toolCallBuffer.ApplyApproved()
+		if err != nil {
+			return mutationResultMsg{err: err}
+		}
+		m.toolCallBuffer.Reset()
+		return applyAllResultMsg{
+			results: func() []mutationResultMsg {
+				msgs := make([]mutationResultMsg, 0, len(results.Results))
+				for _, r := range results.Results {
+					status := "modified"
+					if r.IsNew {
+						status = "created"
+					}
+					msgs = append(msgs, mutationResultMsg{file: r.File, status: status})
+				}
+				return msgs
+			}(),
+		}
+	}
+}
+
+// cycleEffort cycles the effort level through Auto → Low → Medium → High.
+func (m *model) cycleEffort() {
+	switch m.currentEffort {
+	case EffortAuto:
+		m.currentEffort = EffortLow
+	case EffortLow:
+		m.currentEffort = EffortMedium
+	case EffortMedium:
+		m.currentEffort = EffortHigh
+	case EffortHigh:
+		m.currentEffort = EffortAuto
+	}
 }
 
 // ── Rendering helpers ─────────────────────────────────────────────────────────
@@ -1179,6 +1273,7 @@ func (m *model) resetStreamingState() {
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 	m.reasoningBuffer.Reset()
+	m.pendingReasoningFragment = ""
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
@@ -1209,6 +1304,7 @@ func (m *model) reconcileSpinner() {
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 	m.reasoningBuffer.Reset()
+	m.pendingReasoningFragment = ""
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
@@ -1216,45 +1312,132 @@ func (m *model) reconcileSpinner() {
 
 // extractReasoningContent scans raw stream text for reasoning sentinels
 // (inserted by providers that surface delta.reasoning_content via SSE) and
-// for inline <think>...</think> tags (emitted by models that output reasoning
+// for inline  thinking... response tags (emitted by models that output reasoning
 // directly in the message content). It separates reasoning into the dedicated
-// reasoningBuffer and strips it from the visible content buffer.
+// reasoningBuffer and thinkingPanel, stripping it from the visible content buffer.
 //
 // Reasoning sentinels use zero-width markers: \x00RSNG\x00...reasoning...\x00RSNG\x00
+//
+// NOTE: this used to run two independent scans over the same buffer — one
+// (extractSentinelReasoningContent) to read reasoning text for the
+// thinkingPanel, and another (extractSentinelReasoning) to strip it and feed
+// reasoningBuffer. Because they scanned separately, an opening sentinel with
+// no closer yet (the common case: the closer just hasn't streamed in yet)
+// caused the stripping pass to give up and write the raw, still-open
+// reasoning fragment straight into the visible answer, while the read-only
+// pass correctly found nothing to show yet — so reasoning text would appear
+// in the response instead of the Thinking Panel. Both concerns are now
+// handled by a single pass (extractSentinelReasoning) that never emits an
+// unmatched fragment as visible text; it holds it in
+// m.pendingReasoningFragment until the closer arrives.
 func (m *model) extractReasoningContent() {
 	// 1. Extract provider-level reasoning sentinels from streamBuffer.
-	m.streamBuffer = m.extractSentinelReasoning(m.streamBuffer)
-	// 2. Extract inline <think> tags from the already-rendered content.
+	clean, extracted := m.extractSentinelReasoning(m.streamBuffer)
+	m.streamBuffer = clean
+	if extracted != "" {
+		m.reasoningBuffer.WriteString(extracted)
+		if m.thinkingPanel != nil {
+			m.thinkingPanel.Append(extracted)
+		}
+	}
+	// 2. Extract inline  thinking tags from the already-rendered content.
+	thinkContent := m.extractThinkTagsContent(m.currentStreamContent)
+	if thinkContent != "" && m.thinkingPanel != nil {
+		m.thinkingPanel.Append(thinkContent)
+	}
 	m.currentStreamContent = m.extractThinkTags(m.currentStreamContent)
 }
 
 // extractSentinelReasoning scans raw for reasoning sentinel markers
-// (\x00RSNG\x00...\x00RSNG\x00) and moves the enclosed content into
-// the reasoningBuffer. Returns the cleaned text with markers removed.
-func (m *model) extractSentinelReasoning(raw string) string {
+// (\x00RSNG\x00...\x00RSNG\x00). It returns the cleaned visible text (with
+// completed reasoning blocks removed) and the reasoning text pulled from
+// those completed blocks.
+//
+// Any pending fragment left over from a previous call (an opening sentinel
+// whose closer hadn't arrived yet) is prepended before scanning. If, after
+// scanning, an opening sentinel still has no matching closer, it is NOT
+// flushed into the visible text — it's stashed back into
+// m.pendingReasoningFragment for the next call. This is what prevents
+// partially-streamed reasoning (or a reasoning chunk split across ticks by
+// the earlier SSE-reader truncation bug) from leaking into the answer.
+func (m *model) extractSentinelReasoning(raw string) (clean string, reasoning string) {
 	const sentinel = "\x00RSNG\x00"
-	if !strings.Contains(raw, sentinel) {
-		return raw
+	if m.pendingReasoningFragment != "" {
+		raw = m.pendingReasoningFragment + raw
+		m.pendingReasoningFragment = ""
 	}
-	var clean strings.Builder
+	if !strings.Contains(raw, sentinel) {
+		return raw, ""
+	}
+	var cleanBuf, reasonBuf strings.Builder
 	remaining := raw
 	for {
 		start := strings.Index(remaining, sentinel)
 		if start < 0 {
-			clean.WriteString(remaining)
+			cleanBuf.WriteString(remaining)
 			break
 		}
-		clean.WriteString(remaining[:start])
+		cleanBuf.WriteString(remaining[:start])
 		rest := remaining[start+len(sentinel):]
 		end := strings.Index(rest, sentinel)
 		if end < 0 {
-			clean.WriteString(rest)
+			// Incomplete pair — hold it back instead of dumping the
+			// in-flight reasoning text into visible content.
+			m.pendingReasoningFragment = sentinel + rest
 			break
 		}
-		m.reasoningBuffer.WriteString(rest[:end])
+		reasonBuf.WriteString(rest[:end])
 		remaining = rest[end+len(sentinel):]
 	}
-	return clean.String()
+	return cleanBuf.String(), reasonBuf.String()
+}
+
+// flushPendingReasoningFragment is called once, at stream end, when nothing
+// more is coming. If a reasoning block was left open (its closing sentinel
+// never arrived — e.g. the provider truncated the stream), the fragment
+// would otherwise sit in m.pendingReasoningFragment forever. Rather than
+// silently dropping it or leaking the raw sentinel bytes into the answer,
+// surface the leftover text as reasoning content (stripped of the marker).
+func (m *model) flushPendingReasoningFragment() {
+	if m.pendingReasoningFragment == "" {
+		return
+	}
+	const sentinel = "\x00RSNG\x00"
+	leftover := strings.TrimPrefix(m.pendingReasoningFragment, sentinel)
+	m.pendingReasoningFragment = ""
+	if leftover == "" {
+		return
+	}
+	m.reasoningBuffer.WriteString(leftover)
+	if m.thinkingPanel != nil {
+		m.thinkingPanel.Append(leftover)
+	}
+}
+
+// extractThinkTagsContent extracts reasoning content from think tags
+// and returns it without modifying the original text.
+func (m *model) extractThinkTagsContent(text string) string {
+	const thinkOpen = "\x3cthink\x3e"
+	const thinkClose = "\x3c/think\x3e"
+	if !strings.Contains(text, thinkOpen) {
+		return ""
+	}
+	var reasoning strings.Builder
+	remaining := text
+	for {
+		start := strings.Index(remaining, thinkOpen)
+		if start < 0 {
+			break
+		}
+		rest := remaining[start+len(thinkOpen):]
+		end := strings.Index(rest, thinkClose)
+		if end < 0 {
+			break
+		}
+		reasoning.WriteString(rest[:end])
+		remaining = rest[end+len(thinkClose):]
+	}
+	return reasoning.String()
 }
 
 // extractThinkTags scans text for <think>...</think> tags and moves the

@@ -25,6 +25,11 @@ var ErrOpenRouterAuth = errors.New("openrouter: authorization failed (HTTP 401):
 // these markers and routes reasoning into a separate collapsible buffer.
 const ReasoningSentinel = "\x00RSNG\x00"
 
+// ToolCallSentinel is a zero-width marker embedded in the stream output to
+// distinguish tool call delta JSON from message content. The UI layer detects
+// these markers and routes them into the ToolCallBuffer for live code preview.
+const ToolCallSentinel = "\x00TCLL\x00"
+
 type OpenRouterProvider struct {
 	apiKey  string
 	model   string
@@ -286,9 +291,19 @@ type openrouterToolCallFunc struct {
 }
 
 type openrouterDelta struct {
-	Role             string `json:"role,omitempty"`
-	Content          string `json:"content,omitempty"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Role             string                `json:"role,omitempty"`
+	Content          string                `json:"content,omitempty"`
+	ReasoningContent string                `json:"reasoning_content,omitempty"`
+	ToolCalls        []openrouterToolDelta `json:"tool_calls,omitempty"`
+}
+
+type openrouterToolDelta struct {
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function,omitempty"`
 }
 
 type openrouterUsage struct {
@@ -314,9 +329,32 @@ type openrouterSSEReader struct {
 	reader     *bufio.Reader
 	closed     bool
 	finalUsage *openrouterUsage
+
+	// pending holds bytes produced by a parsed SSE event that did not fit
+	// into the caller's buffer on a previous Read() call. Read() must never
+	// silently drop bytes just because len(p) was smaller than one logical
+	// unit (a sentinel-wrapped reasoning/content/tool-call chunk) — doing so
+	// previously truncated large reasoning bursts and tool-call argument
+	// JSON mid-stream, dropping the closing sentinel along with the tail of
+	// the data. That desynced the sentinel parser downstream (an opened-but-
+	// never-closed \x00RSNG\x00 block), which caused partially-streamed
+	// reasoning text to leak into the visible answer instead of staying in
+	// the Thinking Panel. Buffering the remainder here and draining it on
+	// the next Read() call restores normal io.Reader semantics regardless
+	// of the caller's buffer size.
+	pending []byte
 }
 
 func (s *openrouterSSEReader) Read(p []byte) (int, error) {
+	// Drain any bytes left over from a previous parsed event before doing
+	// any new work. This is what makes Read() safe to call with any buffer
+	// size without losing data.
+	if len(s.pending) > 0 {
+		n := copy(p, s.pending)
+		s.pending = s.pending[n:]
+		return n, nil
+	}
+
 	if s.closed {
 		return 0, io.EOF
 	}
@@ -363,15 +401,51 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 		if chunk.Choices[0].Delta != nil {
 			delta := chunk.Choices[0].Delta
 			// Reasoning content: emit wrapped in sentinel so the UI can
-			// separate it from the message content buffer.
+			// separate it from the message content buffer. Any bytes that
+			// don't fit in p are held in s.pending and drained on the next
+			// Read() call — never dropped, and never split without keeping
+			// the remainder for delivery (see s.pending doc comment).
 			if delta.ReasoningContent != "" {
-				reasoning := ReasoningSentinel + delta.ReasoningContent + ReasoningSentinel
+				reasoning := []byte(ReasoningSentinel + delta.ReasoningContent + ReasoningSentinel)
 				n := copy(p, reasoning)
+				if n < len(reasoning) {
+					s.pending = reasoning[n:]
+				}
 				return n, nil
 			}
 			if delta.Content != "" {
-				n := copy(p, delta.Content)
+				content := []byte(delta.Content)
+				n := copy(p, content)
+				if n < len(content) {
+					s.pending = content[n:]
+				}
 				return n, nil
+			}
+			if len(delta.ToolCalls) > 0 {
+				// Concatenate all tool-call deltas for this event into one
+				// pending buffer rather than returning after the first
+				// truncated chunk and silently discarding the rest — a
+				// dropped tail here corrupts the tool-call JSON and causes
+				// the downstream json.Unmarshal in the consumer to fail
+				// silently, losing the whole tool call (and, with it, any
+				// file mutation it carried).
+				var all []byte
+				for _, tc := range delta.ToolCalls {
+					tcData, err := json.Marshal(tc)
+					if err != nil {
+						continue
+					}
+					all = append(all, ToolCallSentinel...)
+					all = append(all, tcData...)
+					all = append(all, ToolCallSentinel...)
+				}
+				if len(all) > 0 {
+					n := copy(p, all)
+					if n < len(all) {
+						s.pending = all[n:]
+					}
+					return n, nil
+				}
 			}
 		}
 
