@@ -29,6 +29,7 @@ import (
 	"github.com/PizenLabs/izen/internal/providers"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
+	verification "github.com/PizenLabs/izen/internal/verification"
 )
 
 // Init initializes the spinner tick and text input blink.
@@ -642,11 +643,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// halt the recovery loop immediately. Do NOT waste recovery
 			// attempts on import hallucinations — the .go imports are valid,
 			// the dependency just needs to be fetched.
+			//
+			// RULE C: If the failure is an environment/setup error (e.g.,
+			// missing go.mod, "pattern ./... does not contain main module"),
+			// halt the recovery loop immediately. These are not code defects
+			// and cannot be fixed by auto-recovery — they require manual
+			// project setup before verification can succeed.
 			if !msg.passed && m.resolver.Current() == modes.ModeBuild &&
 				m.buildRecoveryCount < maxBuildRecoveryAttempts {
-				if hasMissingModuleError(msg.output) {
+				if hasMissingModuleError(msg.output) || verification.IsEnvironmentSetupError(msg.output) {
 					m.acceptAll = false
-					m.push(roleError, "[BUILD HALTED] Build failed due to missing Go module dependency. Auto-recovery cannot fix import paths. Run 'go get <package>' manually, then retry.")
+					m.push(roleError, "[BUILD HALTED] Build failed due to a Go environment setup error. Auto-recovery cannot fix missing go.mod or non-Go project verification. Run 'go mod init' or configure a Go module first, then retry.")
 				} else {
 					m.buildRecoveryCount++
 					m.acceptAll = true
@@ -666,13 +673,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.currentResult = buildVerifyResult(msg.passed)
 
 			// ── FAIL-FAST MACHINE: mirror outcome into the canonical
-			// session.ContextLedger. On a hard failure (recovery exhausted or
-			// missing-module halt) the active task is marked Failed and the
-			// queue is frozen — no subsequent task is advanced, leaving the
-			// workspace in its broken state for developer inspection.
+			// session.ContextLedger. On a hard failure (recovery exhausted,
+			// missing-module halt, or environment setup error) the active
+			// task is marked Failed and the queue is frozen — no subsequent
+			// task is advanced, leaving the workspace in its broken state
+			// for developer inspection.
 			m.bridgeBuildResultToLedger(m.currentBuildTaskID, msg.passed, msg.output)
 			if !msg.passed && m.resolver.Current() == modes.ModeBuild {
-				if m.buildRecoveryCount >= maxBuildRecoveryAttempts || hasMissingModuleError(msg.output) {
+				if m.buildRecoveryCount >= maxBuildRecoveryAttempts || hasMissingModuleError(msg.output) || verification.IsEnvironmentSetupError(msg.output) {
 					m.push(roleError, fmt.Sprintf(
 						"[BUILD HALTED] Step %d failed verification. Queue frozen — %d/%d task(s) complete. Inspect and fix, then re-run /build.",
 						m.currentBuildTaskID, m.countCompletedLedgerTasks(), len(m.sess.CurrentTasks)))

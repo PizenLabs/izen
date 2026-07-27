@@ -39,6 +39,7 @@ import (
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/templates"
+	verification "github.com/PizenLabs/izen/internal/verification"
 )
 
 var validSystemCommands = map[string]struct{}{
@@ -4119,6 +4120,15 @@ func (m *model) runTestEngine(target string) tea.Cmd {
 				msg = TaskFinishedMsg{}
 			}
 		}()
+		if !verification.IsGoProject(m.workspaceRoot) {
+			return testResultMsg{
+				output: verification.FormatSkipMessage("HTML/JS/CSS"),
+				passed: true,
+				failed: 0,
+				total:  0,
+				err:    nil,
+			}
+		}
 		runner := execExecutionRunner(".")
 		cmd := "go test -v " + target
 		result, err := runner.Run(cmd)
@@ -4194,6 +4204,13 @@ func (m *model) runBuildEngine(target string) tea.Cmd {
 				msg = TaskFinishedMsg{}
 			}
 		}()
+		if !verification.IsGoProject(m.workspaceRoot) {
+			return buildResultMsg{
+				output:   verification.FormatSkipMessage("HTML/JS/CSS"),
+				exitCode: 0,
+				err:      nil,
+			}
+		}
 		runner := execExecutionRunner(".")
 		cmd := "go build " + target
 		result, err := runner.Run(cmd)
