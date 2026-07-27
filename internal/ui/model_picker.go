@@ -16,13 +16,16 @@ import (
 type EffortLevel int
 
 const (
-	EffortLow EffortLevel = iota
+	EffortAuto EffortLevel = iota
+	EffortLow
 	EffortMedium
 	EffortHigh
 )
 
 func (e EffortLevel) String() string {
 	switch e {
+	case EffortAuto:
+		return "auto"
 	case EffortLow:
 		return "low"
 	case EffortMedium:
@@ -30,13 +33,15 @@ func (e EffortLevel) String() string {
 	case EffortHigh:
 		return "high"
 	default:
-		return "low"
+		return "auto"
 	}
 }
 
 // Description returns a human-readable description of the effort level.
 func (e EffortLevel) Description() string {
 	switch e {
+	case EffortAuto:
+		return "Auto / Let model decide"
 	case EffortLow:
 		return "Fast-Track / Direct Mutation"
 	case EffortMedium:
@@ -44,13 +49,15 @@ func (e EffortLevel) Description() string {
 	case EffortHigh:
 		return "Full Senior Architect Mode"
 	default:
-		return "Fast-Track / Direct Mutation"
+		return "Auto / Let model decide"
 	}
 }
 
 // ConfigTier maps effort level to the config tier key.
 func (e EffortLevel) ConfigTier() string {
 	switch e {
+	case EffortAuto:
+		return "auto_intent"
 	case EffortLow:
 		return "low_intent"
 	case EffortMedium:
@@ -58,7 +65,7 @@ func (e EffortLevel) ConfigTier() string {
 	case EffortHigh:
 		return "high_intent"
 	default:
-		return "low_intent"
+		return "auto_intent"
 	}
 }
 
@@ -68,6 +75,8 @@ func (e EffortLevel) ConfigTier() string {
 // styles.go rather than declaring new ones.
 func (e EffortLevel) Style() lipgloss.Style {
 	switch e {
+	case EffortAuto:
+		return infoStyle
 	case EffortLow:
 		return greenStyle
 	case EffortMedium:
@@ -75,7 +84,7 @@ func (e EffortLevel) Style() lipgloss.Style {
 	case EffortHigh:
 		return redStyle
 	default:
-		return greenStyle
+		return infoStyle
 	}
 }
 
@@ -135,20 +144,22 @@ type ModelPickerModal struct {
 	height   int
 	registry *llm.ModelRegistry
 
-	effortIdx    int // 0=low, 1=medium, 2=high
+	effortIdx    int // 0=auto, 1=low, 2=medium, 3=high
 	scrollOffset int // row-based offset into buildRows(), NOT an item index
 }
 
 func (mp *ModelPickerModal) CurrentEffort() EffortLevel {
 	switch mp.effortIdx {
 	case 0:
-		return EffortLow
+		return EffortAuto
 	case 1:
-		return EffortMedium
+		return EffortLow
 	case 2:
+		return EffortMedium
+	case 3:
 		return EffortHigh
 	default:
-		return EffortLow
+		return EffortAuto
 	}
 }
 
@@ -260,7 +271,7 @@ func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
 			return mp, nil
 
 		case tea.KeyRight:
-			if mp.effortIdx < 2 {
+			if mp.effortIdx < 3 {
 				mp.effortIdx++
 			}
 			return mp, nil
@@ -589,18 +600,19 @@ func (mp *ModelPickerModal) renderList() string {
 }
 
 // renderEffortSlider renders the interactive effort/intent slider.
-// Visual layout: low ───○─── medium ────── high
+// Visual layout: auto ───○─── low ────── medium ────── high
 func (mp *ModelPickerModal) renderEffortSlider() string {
 	levels := []struct {
 		label string
 		desc  string
 	}{
+		{"auto", "Let model decide"},
 		{"low", "Fast-Track"},
 		{"medium", "Hybrid"},
 		{"high", "Senior Arch"},
 	}
 
-	trackLen := 6
+	trackLen := 4
 	var b strings.Builder
 
 	// Description line — tinted to match the selected level, so the

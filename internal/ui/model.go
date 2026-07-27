@@ -865,6 +865,18 @@ type model struct {
 
 	// Foldable execution logs
 	logStore *LogStore
+
+	// Native Tool Call Buffer for in-memory tool call interception
+	toolCallBuffer *execution.ToolCallBuffer
+
+	// Realtime thinking/reasoning panel
+	thinkingPanel *ThinkingPanel
+
+	// Live code preview for streaming tool call arguments
+	liveCodePreview *LiveCodePreview
+
+	// Current effort level for generation
+	currentEffort EffortLevel
 }
 
 // isProjectInitialized checks whether .izen/ exists AND contains a valid
@@ -884,6 +896,47 @@ func (m *model) isProjectInitialized() bool {
 		return false
 	}
 	return true
+}
+
+// applyToolCallBuffer applies approved tool calls to disk and flushes the buffer.
+func (m *model) applyToolCallBuffer() tea.Cmd {
+	return func() tea.Msg {
+		if m.toolCallBuffer == nil {
+			return mutationResultMsg{err: fmt.Errorf("no tool call buffer")}
+		}
+		results, err := m.toolCallBuffer.ApplyApproved()
+		if err != nil {
+			return mutationResultMsg{err: err}
+		}
+		m.toolCallBuffer.Reset()
+		return applyAllResultMsg{
+			results: func() []mutationResultMsg {
+				msgs := make([]mutationResultMsg, 0, len(results.Results))
+				for _, r := range results.Results {
+					status := "modified"
+					if r.IsNew {
+						status = "created"
+					}
+					msgs = append(msgs, mutationResultMsg{file: r.File, status: status})
+				}
+				return msgs
+			}(),
+		}
+	}
+}
+
+// cycleEffort cycles the effort level through Auto → Low → Medium → High.
+func (m *model) cycleEffort() {
+	switch m.currentEffort {
+	case EffortAuto:
+		m.currentEffort = EffortLow
+	case EffortLow:
+		m.currentEffort = EffortMedium
+	case EffortMedium:
+		m.currentEffort = EffortHigh
+	case EffortHigh:
+		m.currentEffort = EffortAuto
+	}
 }
 
 // ── Rendering helpers ─────────────────────────────────────────────────────────
@@ -1216,15 +1269,23 @@ func (m *model) reconcileSpinner() {
 
 // extractReasoningContent scans raw stream text for reasoning sentinels
 // (inserted by providers that surface delta.reasoning_content via SSE) and
-// for inline <think>...</think> tags (emitted by models that output reasoning
+// for inline  thinking... response tags (emitted by models that output reasoning
 // directly in the message content). It separates reasoning into the dedicated
-// reasoningBuffer and strips it from the visible content buffer.
+// reasoningBuffer and thinkingPanel, stripping it from the visible content buffer.
 //
 // Reasoning sentinels use zero-width markers: \x00RSNG\x00...reasoning...\x00RSNG\x00
 func (m *model) extractReasoningContent() {
 	// 1. Extract provider-level reasoning sentinels from streamBuffer.
+	extracted := m.extractSentinelReasoningContent(m.streamBuffer)
+	if extracted != "" && m.thinkingPanel != nil {
+		m.thinkingPanel.Append(extracted)
+	}
 	m.streamBuffer = m.extractSentinelReasoning(m.streamBuffer)
-	// 2. Extract inline <think> tags from the already-rendered content.
+	// 2. Extract inline  thinking tags from the already-rendered content.
+	thinkContent := m.extractThinkTagsContent(m.currentStreamContent)
+	if thinkContent != "" && m.thinkingPanel != nil {
+		m.thinkingPanel.Append(thinkContent)
+	}
 	m.currentStreamContent = m.extractThinkTags(m.currentStreamContent)
 }
 
@@ -1255,6 +1316,57 @@ func (m *model) extractSentinelReasoning(raw string) string {
 		remaining = rest[end+len(sentinel):]
 	}
 	return clean.String()
+}
+
+// extractSentinelReasoningContent extracts reasoning content from sentinel
+// markers and returns it without modifying the original.
+func (m *model) extractSentinelReasoningContent(raw string) string {
+	const sentinel = "\x00RSNG\x00"
+	if !strings.Contains(raw, sentinel) {
+		return ""
+	}
+	var reasoning strings.Builder
+	remaining := raw
+	for {
+		start := strings.Index(remaining, sentinel)
+		if start < 0 {
+			break
+		}
+		rest := remaining[start+len(sentinel):]
+		end := strings.Index(rest, sentinel)
+		if end < 0 {
+			break
+		}
+		reasoning.WriteString(rest[:end])
+		remaining = rest[end+len(sentinel):]
+	}
+	return reasoning.String()
+}
+
+// extractThinkTagsContent extracts reasoning content from think tags
+// and returns it without modifying the original text.
+func (m *model) extractThinkTagsContent(text string) string {
+	const thinkOpen = "\x3cthink\x3e"
+	const thinkClose = "\x3c/think\x3e"
+	if !strings.Contains(text, thinkOpen) {
+		return ""
+	}
+	var reasoning strings.Builder
+	remaining := text
+	for {
+		start := strings.Index(remaining, thinkOpen)
+		if start < 0 {
+			break
+		}
+		rest := remaining[start+len(thinkOpen):]
+		end := strings.Index(rest, thinkClose)
+		if end < 0 {
+			break
+		}
+		reasoning.WriteString(rest[:end])
+		remaining = rest[end+len(thinkClose):]
+	}
+	return reasoning.String()
 }
 
 // extractThinkTags scans text for <think>...</think> tags and moves the

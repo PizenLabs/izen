@@ -1157,6 +1157,23 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	m.cancelStaleAgentOps()
 	m.buildVerifyPending = false
 
+	// ── CLEAN STATE: flush tool call buffer, thinking panel, live preview ──
+	if m.toolCallBuffer != nil {
+		m.toolCallBuffer.Reset()
+	}
+	if m.thinkingPanel != nil {
+		m.thinkingPanel.Reset()
+	}
+	if m.liveCodePreview != nil {
+		m.liveCodePreview.Reset()
+	}
+	// Clear stale error messages and execution log buffers
+	m.lastApplyError = ""
+	m.applyErrorTime = time.Time{}
+	if m.logStore != nil {
+		m.logStore.Clear()
+	}
+
 	if mode == m.resolver.Current() {
 		return nil
 	}
@@ -2388,24 +2405,22 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			return hotfixProposalMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
 		}
 
-		// ── NATIVE TOOL CALLING PATH ──────────────────────────────
-		// When the LLM responds with tool_calls (finish_reason: tool_calls),
-		// extract path and content directly from tool argument JSON and write
-		// files to disk immediately — bypassing all markdown codeblock parsing,
-		// regex string extraction, and the approval gate.
+		// ── NATIVE TOOL CALLING PATH (BUFFERED, REQUIRES APPROVAL) ──
+		// Tool calls are now intercepted in memory and presented for human
+		// approval before any disk mutation occurs.
 		if len(resp.ToolCalls) > 0 {
-			results, dispatchErr := execution.DispatchToolCalls(resp.ToolCalls, ".")
-			if dispatchErr != nil {
-				return hotfixProposalMsg{Err: fmt.Errorf("tool call execution: %w", dispatchErr)}
+			if err := m.toolCallBuffer.BufferAll(resp.ToolCalls); err != nil {
+				return hotfixProposalMsg{Err: fmt.Errorf("tool call buffer: %w", err)}
 			}
-			if results.HasContent() {
-				// Write files via hotfix path: return result message that
-				// the buildResultMsg update handler will pick up and restore
-				// the stashed hotfix plan.
-				return buildResultMsg{
-					output:   results.Summary(),
-					exitCode: 0,
-				}
+			// Feed live preview for each buffered call
+			for _, tc := range m.toolCallBuffer.All() {
+				m.liveCodePreview.AddOrUpdate(tc.Path, tc.Modified, tc.IsNew)
+			}
+			// Don't apply yet — stay in hotfix flow with pending buffer
+			// The main handler will transition to StateAwaitingApproval
+			// This is a hot fix path, so we trigger the approval gate
+			return hotfixProposalMsg{
+				Err: fmt.Errorf("tool calls buffered for approval"),
 			}
 		}
 
@@ -2704,29 +2719,20 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
 			}
 
-			// ── NATIVE TOOL CALLING PATH (bypasses markdown parsing + approval gate) ──
+			// ── NATIVE TOOL CALLING PATH (BUFFERED, REQUIRES APPROVAL) ──
+			// Tool calls are intercepted in memory and presented as Diffs
+			// for human authorization. Disk mutation only occurs on approval.
 			if len(resp.ToolCalls) > 0 {
-				results, dispatchErr := execution.DispatchToolCalls(resp.ToolCalls, ".")
-				if dispatchErr != nil {
-					return buildProposalReadyMsg{Err: fmt.Errorf("tool call execution: %w", dispatchErr)}
+				if err := m.toolCallBuffer.BufferAll(resp.ToolCalls); err != nil {
+					return buildProposalReadyMsg{Err: fmt.Errorf("tool call buffer: %w", err)}
 				}
-				if results.HasContent() {
-					// Mark the build task completed so the queue advances.
-					if m.sess != nil {
-						tasks := m.sess.CurrentTasks
-						for i := range tasks {
-							if tasks[i].StepNum == task.StepNum {
-								tasks[i].Status = "completed"
-								break
-							}
-						}
-						m.sess.StageTaskList(&tasks)
-						_ = m.sess.Save()
-					}
-					return buildResultMsg{
-						output:   results.Summary(),
-						exitCode: 0,
-					}
+				// Feed live preview for each buffered call
+				for _, tc := range m.toolCallBuffer.All() {
+					m.liveCodePreview.AddOrUpdate(tc.Path, tc.Modified, tc.IsNew)
+				}
+				// Return a special message indicating we're awaiting approval
+				return buildProposalReadyMsg{
+					Err: fmt.Errorf("tool calls buffered for approval"),
 				}
 			}
 

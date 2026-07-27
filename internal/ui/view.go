@@ -191,71 +191,17 @@ func (m *model) viModeLabel() string {
 }
 
 // renderReasoningBlock renders the collapsible reasoning block during streaming.
-// When reasoning content is available, it shows:
-//
-//	Collapsed (m.showReasoning == false):
-//	  ⚙ Thinking... [Alt+O to expand reasoning]
-//
-//	Expanded (m.showReasoning == true):
-//	  ┌─ Reasoning ──────────────────────────┐
-//	  │ <reasoning content>                   │
-//	  └───────────────────────────────────────┘
+// Uses the ThinkingPanel for expanded/collapsed rendering.
 func (m *model) renderReasoningBlock(width int) string {
-	if m.reasoningBuffer.Len() == 0 {
+	if m.thinkingPanel == nil {
+		return ""
+	}
+	if m.thinkingPanel.Len() == 0 {
 		return ""
 	}
 
-	reasoningText := m.reasoningBuffer.String()
-	if !m.showReasoning {
-		// Collapsed: single-line spinner hint
-		sp := m.renderFlowingSpinner()
-		hint := sp + " " + dimmedStyle.Render("Thinking... ") + mutedStyle.Render("[Alt+O to expand]")
-		return hint
-	}
-
-	// Expanded: render full reasoning content in a dimmed block
-	if width < 40 {
-		width = 40
-	}
-
-	var b strings.Builder
-
-	// Top border with title
-	title := "Reasoning"
-	topFiller := width - lipgloss.Width(title) - 6
-	if topFiller < 0 {
-		topFiller = 0
-	}
-	b.WriteString(dimmedStyle.Render("┌─ "+title+" "+strings.Repeat("─", topFiller)+"┐") + "\n")
-
-	// Reasoning content lines — dimmed and wrapped
-	lines := strings.Split(reasoningText, "\n")
-	for _, line := range lines {
-		line = strings.TrimRight(line, " \r")
-		if line == "" {
-			b.WriteString(dimmedStyle.Render("│ ") + " " + dimmedStyle.Render("  │") + "\n")
-			continue
-		}
-		// Word-wrap to available width
-		avail := width - 4
-		if avail < 10 {
-			avail = 10
-		}
-		wrapped := wrapString(line, avail)
-		for _, wl := range wrapped {
-			padded := wl + strings.Repeat(" ", avail-lipgloss.Width(wl))
-			b.WriteString(dimmedStyle.Render("│ ") + mutedStyle.Render(padded) + dimmedStyle.Render(" │") + "\n")
-		}
-	}
-
-	// Bottom border
-	bottomFiller := width - 4
-	if bottomFiller < 0 {
-		bottomFiller = 0
-	}
-	b.WriteString(dimmedStyle.Render("└" + strings.Repeat("─", bottomFiller) + "┘"))
-
-	return b.String()
+	sp := m.renderFlowingSpinner()
+	return m.thinkingPanel.Render(width, sp)
 }
 
 // wrapString wraps text to a given width, splitting at word boundaries.
@@ -316,7 +262,6 @@ func (m *model) renderProposalBlock() string {
 			if boxWidth < 40 {
 				boxWidth = 40
 			}
-			// Build the box content line by line
 			var content strings.Builder
 			title := permissionTitleStyle.Render("▲ PERMISSION REQUIRED")
 			action := permissionDescStyle.Render("Action:") + " " + boldTextStyle.Render("SHELL_EXEC")
@@ -338,8 +283,17 @@ func (m *model) renderProposalBlock() string {
 			break
 		}
 
+		// ── Effort Selector ─────────────────────────────────────────────
+		b.WriteString(m.renderEffortSelector(width))
+
+		// ── Tool File Mutation Approval ─────────────────────────────────
+		if m.toolCallBuffer != nil && m.toolCallBuffer.HasPending() {
+			b.WriteString(m.renderToolCallApprovalBlock(width))
+			break
+		}
+
 		if len(m.pendingProposals) == 0 {
-			return ""
+			return b.String()
 		}
 		p := m.pendingProposals[0]
 		if p.Diff == "" {
@@ -359,6 +313,103 @@ func (m *model) renderProposalBlock() string {
 		}
 		b.WriteString("\n")
 	}
+
+	return b.String()
+}
+
+// renderEffortSelector renders the interactive effort level selector widget.
+func (m *model) renderEffortSelector(width int) string {
+	var b strings.Builder
+
+	effort := m.currentEffort
+	levelStyle := effort.Style()
+	desc := levelStyle.Render(effort.Description())
+
+	b.WriteString("\n")
+	b.WriteString("  " + boldTextStyle.Render(EffortSelectorLabel) + " ")
+	b.WriteString(desc)
+	b.WriteString("\n")
+
+	labels := []string{"AUTO", "LOW", "MEDIUM", "HIGH"}
+	effortValues := []EffortLevel{EffortAuto, EffortLow, EffortMedium, EffortHigh}
+
+	b.WriteString("  ")
+	for i, label := range labels {
+		if i > 0 {
+			b.WriteString(" ")
+			b.WriteString(dimmedStyle.Render("│"))
+			b.WriteString(" ")
+		}
+		if effortValues[i] == effort {
+			b.WriteString(levelStyle.Bold(true).Render("[" + label + "]"))
+		} else {
+			b.WriteString(dimmedStyle.Render(label))
+		}
+	}
+	b.WriteString("\n")
+	b.WriteString("  " + mutedStyle.Render(EffortSelectorHint) + "\n")
+
+	return b.String()
+}
+
+// renderToolCallApprovalBlock renders the approval controls for buffered tool calls.
+func (m *model) renderToolCallApprovalBlock(width int) string {
+	pending := m.toolCallBuffer.Pending()
+	if len(pending) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	boxWidth := width - 4
+	if boxWidth < 40 {
+		boxWidth = 40
+	}
+
+	title := permissionTitleStyle.Render("▲ CODE MUTATION REQUIRES APPROVAL")
+	b.WriteString(title + "\n")
+
+	// List each pending tool call
+	for i, tc := range pending {
+		icon := "✏"
+		if tc.IsNew {
+			icon = "✨"
+		}
+		fmt.Fprintf(&b, "  %s %s\n", icon, tc.Path)
+		if tc.Diff != "" {
+			diffLines := strings.Split(tc.Diff, "\n")
+			displayLines := diffLines
+			if len(displayLines) > 8 {
+				displayLines = displayLines[:8]
+			}
+			for _, dl := range displayLines {
+				switch {
+				case strings.HasPrefix(dl, "+") && !strings.HasPrefix(dl, "+++"):
+					b.WriteString(greenStyle.Render("  "+dl) + "\n")
+				case strings.HasPrefix(dl, "-") && !strings.HasPrefix(dl, "---"):
+					b.WriteString(redStyle.Render("  "+dl) + "\n")
+				default:
+					b.WriteString(dimmedStyle.Render("  "+dl) + "\n")
+				}
+			}
+			if len(diffLines) > 8 {
+				b.WriteString(mutedStyle.Render(fmt.Sprintf("  ... %d more lines\n", len(diffLines)-8)))
+			}
+		}
+		if i < len(pending)-1 {
+			b.WriteString("\n")
+		}
+	}
+
+	// Key bindings
+	sep := strings.Repeat("─", boxWidth-4)
+	b.WriteString(" " + sep + "\n")
+	keys := fmt.Sprintf("%s  %s  %s  %s",
+		permissionKeyStyle.Render("[A] "+ApprovalAccept),
+		permissionKeyStyle.Render("[L] "+ApprovalAllowAll),
+		permissionKeyStyle.Render("[R] "+ApprovalReject),
+		permissionKeyStyle.Render("[E] "+ApprovalEditEffort),
+	)
+	b.WriteString(keys + "\n")
 
 	return b.String()
 }

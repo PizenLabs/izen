@@ -78,6 +78,12 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.spinnerFrame = 0
 	m.responseBuffer.Reset()
 	m.reasoningBuffer.Reset()
+	if m.thinkingPanel != nil {
+		m.thinkingPanel.Reset()
+	}
+	if m.liveCodePreview != nil {
+		m.liveCodePreview.Reset()
+	}
 	// ── TRANSIENT BUFFER RESET (1-TURN LATENCY FIX) ───────────────────
 	// Explicitly clear all accumulated raw-string buffers before launching the
 	// stream so the rendering pipeline cannot leak or re-send leftover bytes

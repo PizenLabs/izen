@@ -226,6 +226,10 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		initPrefillProvider: globalProvider,
 		viewRegistry:        reg,
 		logStore:            NewLogStore(),
+		toolCallBuffer:      execution.NewToolCallBuffer(root),
+		thinkingPanel:       NewThinkingPanel(),
+		liveCodePreview:     NewLiveCodePreview(),
+		currentEffort:       EffortAuto,
 	}
 	if initStage == initIdentity {
 		m.initIdentityInput = textinput.New()
