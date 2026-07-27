@@ -143,7 +143,7 @@ RULES
 - Tasks MUST be atomic, independently verifiable, ordered by dependency.
 - Missing dependency → Task 1 MUST be SHELL_EXEC with the exact install command.
 - FILE_MUTATE tasks MUST target the exact relative file path and line.
-- Use native Go tooling first (` + "`go get`" + `, ` + "`go mod tidy`" + `, ` + "`go install`" + `). Never default to ` + "`brew install`" + ` or ` + "`docker`" + `.`
+- Use native Go tooling first (` + "`go get`" + `, ` + "`go mod tidy`" + `, ` + "`go install`" + `). Never default to ` + "`brew install`" + ` or ` + "`docker`" + `.` + TokenThriftyConstraint
 }
 
 // CompactPlanContract returns a stripped-down 3-bullet checklist contract for
@@ -168,7 +168,7 @@ OUTPUT FORMAT:
 RULES
 - Missing Go dependency → SHELL_EXEC: go get <real_package> | install missing dependency.
 - FORBIDDEN: "go.mod", "go.sum", relative paths as shell target.
-- No brew, docker, or OS-level tasks. Stay at the code/dependency boundary.`
+- No brew, docker, or OS-level tasks. Stay at the code/dependency boundary.` + TokenThriftyConstraint
 }
 
 // SelectPlanContract returns the appropriate plan contract based on complexity.
@@ -317,5 +317,6 @@ USER OBJECTIVE
 func PlanDirectMutationSystemPrompt() string {
 	return "STRICT RULE: Direct file mutation detected.\n" +
 		"Output ONLY the direct task item for execution.\n" +
-		"No CONTEXT & ROLE, no FORENSIC HANDOFF, no preamble, no summary."
+		"No CONTEXT & ROLE, no FORENSIC HANDOFF, no preamble, no summary." +
+		"\n" + strings.TrimSpace(TokenThriftyConstraint)
 }

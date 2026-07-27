@@ -28,6 +28,7 @@ type BudgetDelta struct {
 	Tokens    int
 	Attempts  int
 	ShellCmds int
+	Mutations int
 }
 
 // MutationBudget tracks resource consumption for a mutation operation and
@@ -39,12 +40,14 @@ type MutationBudget struct {
 	MaxAttempts      int
 	MaxExecutionTime time.Duration
 	MaxShellCommands int
+	MaxMutations     int
 
 	currentFiles     int
 	currentDiffLines int
 	currentTokens    int
 	currentAttempts  int
 	currentShellCmds int
+	currentMutations int
 	startTime        time.Time
 	exhausted        bool
 }
@@ -60,6 +63,7 @@ func NewBudget(maxFiles, maxDiffLines, maxTokens, maxAttempts int,
 		MaxAttempts:      maxAttempts,
 		MaxExecutionTime: maxExecTime,
 		MaxShellCommands: maxShellCmds,
+		MaxMutations:     0,
 		startTime:        time.Now(),
 	}
 }
@@ -74,6 +78,22 @@ func DefaultBudget() *MutationBudget {
 		5*time.Minute, // MaxExecutionTime
 		20,            // MaxShellCommands
 	)
+}
+
+// IsMultiStepPlan reports whether the budget has been scaled for a multi-step
+// plan (MaxMutations > 0). When true, the authorization token should allow
+// sequential steps without being consumed as single-use.
+func (b *MutationBudget) IsMultiStepPlan() bool {
+	return b != nil && b.MaxMutations > 0
+}
+
+// ScaleBudget adjusts MaxMutations to match the total number of plan tasks.
+// This allows multi-step plans to proceed sequentially without exhausting
+// the budget after a single task.
+func (b *MutationBudget) ScaleBudget(taskCount int) {
+	if b != nil && taskCount > 0 {
+		b.MaxMutations = taskCount
+	}
 }
 
 // Consume attempts to apply the given delta. If any counter would exceed its
@@ -100,6 +120,9 @@ func (b *MutationBudget) Consume(delta BudgetDelta) error {
 	if err := b.consumeShellCmds(delta.ShellCmds); err != nil {
 		return err
 	}
+	if err := b.consumeMutations(delta.Mutations); err != nil {
+		return err
+	}
 
 	if b.MaxExecutionTime > 0 && time.Since(b.startTime) > b.MaxExecutionTime {
 		b.exhausted = true
@@ -110,6 +133,22 @@ func (b *MutationBudget) Consume(delta BudgetDelta) error {
 		}
 	}
 
+	return nil
+}
+
+func (b *MutationBudget) consumeMutations(n int) error {
+	if n <= 0 || b.MaxMutations <= 0 {
+		return nil
+	}
+	next := b.currentMutations + n
+	if next > b.MaxMutations {
+		b.exhausted = true
+		return &BudgetExhaustedError{Field: "mutations", Limit: int64(b.MaxMutations), Current: int64(b.currentMutations)}
+	}
+	b.currentMutations = next
+	if b.currentMutations >= b.MaxMutations {
+		b.exhausted = true
+	}
 	return nil
 }
 
@@ -257,6 +296,18 @@ func (b *MutationBudget) RemainingShellCommands() int {
 	return r
 }
 
+// RemainingMutations returns the remaining mutation budget (0 if unlimited).
+func (b *MutationBudget) RemainingMutations() int {
+	if b.MaxMutations <= 0 {
+		return 0
+	}
+	r := b.MaxMutations - b.currentMutations
+	if r < 0 {
+		return 0
+	}
+	return r
+}
+
 // RemainingTime returns the remaining execution time budget.
 func (b *MutationBudget) RemainingTime() time.Duration {
 	if b.MaxExecutionTime <= 0 {
@@ -276,6 +327,7 @@ func (b *MutationBudget) Reset() {
 	b.currentTokens = 0
 	b.currentAttempts = 0
 	b.currentShellCmds = 0
+	b.currentMutations = 0
 	b.startTime = time.Now()
 	b.exhausted = false
 }

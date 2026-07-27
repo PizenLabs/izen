@@ -16,20 +16,22 @@ type ResponseFormat struct {
 }
 
 type Request struct {
-	Model          string          `json:"model"`
-	Messages       []Message       `json:"messages"`
-	Stream         bool            `json:"stream"`
-	System         string          `json:"-"` // Explicit system prompt (top-level for Anthropic, prepended for OpenAI-compatible)
-	MaxTokens      int             `json:"-"` // 0 = use provider default
-	Stop           []string        `json:"-"` // Optional stop sequences (e.g. [">>>>>>>"])
-	Temperature    float64         `json:"-"` // 0 = use provider default
-	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
+	Model          string           `json:"model"`
+	Messages       []Message        `json:"messages"`
+	Stream         bool             `json:"stream"`
+	System         string           `json:"-"` // Explicit system prompt (top-level for Anthropic, prepended for OpenAI-compatible)
+	MaxTokens      int              `json:"-"` // 0 = use provider default
+	Stop           []string         `json:"-"` // Optional stop sequences (e.g. [">>>>>>>"])
+	Temperature    float64          `json:"-"` // 0 = use provider default
+	ResponseFormat *ResponseFormat  `json:"response_format,omitempty"`
+	Tools          []ToolDefinition `json:"-"` // Native LLM function calling tool definitions
 }
 
 type Response struct {
-	Content     string `json:"content"`
-	TokenInput  int    `json:"token_input"`
-	TokenOutput int    `json:"token_output"`
+	Content     string     `json:"content"`
+	TokenInput  int        `json:"token_input"`
+	TokenOutput int        `json:"token_output"`
+	ToolCalls   []ToolCall `json:"tool_calls,omitempty"` // Native LLM function calls from tool_calls finish_reason
 }
 
 type Provider interface {

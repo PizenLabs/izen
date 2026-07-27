@@ -286,7 +286,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 				},
 			},
 			Stream:    false,
-			MaxTokens: 500,
+			MaxTokens: 2048,
 		}
 	} else {
 		// ── COMPLEXITY-CONDITIONAL SYSTEM PROMPT ──────────

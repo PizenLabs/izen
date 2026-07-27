@@ -217,14 +217,36 @@ func (m *model) handleInput(line string) tea.Cmd {
 		// Architect prompts, skip /investigate mode routing entirely,
 		// and route directly to BUILD with a staged FILE_MUTATE task.
 		if compressed := gateway.CompressPrompt(rawInput); compressed != nil && compressed.BypassInvest && compressed.Target != "" {
+			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected by compressor. Bypassing architect analysis."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			targets := gateway.ExtractDirectMutationTargets(rawInput)
+			if len(targets) > 1 {
+				var tasks []plan.Task
+				for i, f := range targets {
+					tasks = append(tasks, plan.Task{
+						StepNum:     i + 1,
+						IsDone:      false,
+						Status:      "idle",
+						Type:        "FILE_MUTATE",
+						Target:      f,
+						Description: rawInput,
+						Rationale:   fmt.Sprintf("Fast-Track multi-file decomposition: target %d of %d", i+1, len(targets)),
+						IsHardcoded: true,
+					})
+				}
+				return func() tea.Msg {
+					return planResultMsg{
+						Tasks:       tasks,
+						IsFastTrack: true,
+					}
+				}
+			}
 			target := command.FallbackPlanTarget{
 				File:        compressed.Target,
 				Description: rawInput,
 				TaskType:    "FILE_MUTATE",
 			}
-			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected by compressor. Bypassing architect analysis."))
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
 			tasks := command.GenerateFallbackPlan(target)
 			return func() tea.Msg {
 				return planResultMsg{
@@ -244,6 +266,30 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected. Bypassing architect analysis."))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
+			// Multi-file decomposition: when the prompt lists multiple
+			// files (comma-separated), create distinct TODO items for each.
+			multiTargets := gateway.ExtractDirectMutationTargets(rawInput)
+			if len(multiTargets) > 1 {
+				var tasks []plan.Task
+				for i, f := range multiTargets {
+					tasks = append(tasks, plan.Task{
+						StepNum:     i + 1,
+						IsDone:      false,
+						Status:      "idle",
+						Type:        "FILE_MUTATE",
+						Target:      f,
+						Description: rawInput,
+						Rationale:   fmt.Sprintf("Fast-Track multi-file decomposition: target %d of %d", i+1, len(multiTargets)),
+						IsHardcoded: true,
+					})
+				}
+				return func() tea.Msg {
+					return planResultMsg{
+						Tasks:       tasks,
+						IsFastTrack: true,
+					}
+				}
+			}
 			tasks := command.GenerateFallbackPlan(target)
 			return func() tea.Msg {
 				return planResultMsg{
@@ -301,6 +347,19 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return m.runReviewCmd("")
+		}
+		// ── AUTO-TRIGGER /build EXECUTION ──────────────────────
+		// When /build is invoked while already in /build mode and
+		// a Fast-Track plan or pending TODO checklist exists,
+		// immediately trigger execution instead of returning nil
+		// (which leaves the UI frozen in an idle state).
+		if mode == modes.ModeBuild {
+			hasStagedTasks := len(m.sess.CurrentTasks) > 0
+			hasPendingTodos := len(m.handoffCtx.PendingTodos) > 0
+			hasLedgerTasks := m.sess != nil && m.sess.ContextLedger != nil && len(m.sess.ContextLedger.Tasks) > 0
+			if hasStagedTasks || hasPendingTodos || hasLedgerTasks {
+				return m.runBuildCmd("")
+			}
 		}
 		return m.setMode(mode)
 	}
@@ -1190,6 +1249,31 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	return nil
 }
 
+// buildMutationHandoffPayload creates an active mutation prompt from
+// synthesized pending todos. This is used when the deadlock-guard or
+// short-circuit logic routes from /investigate directly to /build,
+// ensuring the Execution Engine receives a mutation prompt instead of
+// a generic greeting. The payload contains only the task descriptions,
+// stripped of any conversational framing.
+func buildMutationHandoffPayload(todos []string) string {
+	if len(todos) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## MUTATION HANDOFF — AUTO-TRIGGERED FROM INVESTIGATION\n\n")
+	b.WriteString("Execute the following mutation tasks immediately. Do NOT ask for approval or restate the plan.\n\n")
+	for i, todo := range todos {
+		// Strip the icon prefix for cleaner task display.
+		clean := strings.TrimSpace(todo)
+		if idx := strings.Index(clean, "] "); idx > 0 {
+			clean = strings.TrimSpace(clean[idx+2:])
+		}
+		fmt.Fprintf(&b, "Task %d: %s\n", i+1, clean)
+	}
+	b.WriteString("\nBEGIN EXECUTION NOW.")
+	return b.String()
+}
+
 // buildHandoffTriggerContent returns a non-empty string when handoff data exists
 // for the given mode, triggering immediate structural execution. For /plan mode
 // the handoff is handled internally by the structural engine — the return value
@@ -1221,7 +1305,17 @@ func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
 		// clean idle state instead of contaminating the buffer.
 		hasStagedTasks := len(m.sess.CurrentTasks) > 0
 		if len(m.handoffCtx.PendingTodos) == 0 && !hasStagedTasks {
-			return ""
+			// DEADLOCK-GUARD FALLBACK: when the investigate engine
+			// short-circuited with mutation intent and no structured
+			// tasks were synthesized, create one from the handoff ledger.
+			// This prevents the frozen state where /build enters idle
+			// after auto-routing from /investigate.
+			if strings.Contains(m.handoffLedgerContent, "code mutation intent detected") {
+				m.handoffCtx.PendingTodos = synthesizeBuildTodosFromMutation(m.handoffLedgerContent)
+			}
+			if len(m.handoffCtx.PendingTodos) == 0 {
+				return ""
+			}
 		}
 		var b strings.Builder
 		b.WriteString("## HANDOFF BUILD EXECUTION\n\n")
@@ -1918,6 +2012,20 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 		}
 	}
 
+	// ── EARLY BUDGET SCALING ────────────────────────────────────────────
+	// Before executing the first step, ScaleBudget to the exact number of
+	// staged plan tasks so MaxMutations > 0 and IsMultiStepPlan() returns true.
+	// This converts each step's authorization from single-use (consuming the
+	// budget per step) to multi-step (non-single-use, budget consumed only
+	// once). Without this, Step 1 exhausts the mutation budget and Steps 2..N
+	// all fail with "mutation budget already exhausted".
+	if m.mutationBudget != nil {
+		n := len(m.sess.CurrentTasks)
+		if n > 0 {
+			m.mutationBudget.ScaleBudget(n)
+		}
+	}
+
 	// Execute the first idle staged task.
 	return m.handleBuildRun(0)
 }
@@ -2040,7 +2148,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	// developer never sees a 30s frozen pane while the local LLM silently
 	// generates the patch. The spinner keeps animating until the proposal
 	// message arrives and swaps the pane into the diff view.
-	m.push(roleStatus, "[HOTFIX] Generating patch via local LLM... (This may take up to 30s)")
+	m.push(roleStatus, "[HOTFIX] Generating patch (local short-circuit for simple modifications)...")
 	m.push(roleSystem, fmt.Sprintf("  ⚙ Thinking... (Invoking %s)", m.cfg.ActiveModelName()))
 
 	m.agentRunning = true
@@ -2066,7 +2174,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 // buffer.
 func (m *model) hotfixProgressCmd() tea.Cmd {
 	lines := []string{
-		"  ↺ Intercepted structural breakdown. Refining context (Attempt 1/2)...",
+		"  ↺ Attempting local resolution for hotfix...",
 		"  ⚙ Compiling unified diff schema...",
 	}
 	var cmds = make([]tea.Cmd, 0, len(lines))
@@ -2167,63 +2275,242 @@ func resolveHotfixTarget(prompt string) string {
 // LLM (one non-streaming call) WITHOUT applying it. Instead, it renders a code
 // diff proposal and freezes the pipeline in StateAwaitingApproval so the
 // developer can authorize (y) or reject (n) the change before any disk write.
+//
+// Zero-token short-circuit (Path A): if the target file is explicitly referenced
+// (e.g. @LICENSE) and the action is a simple text modification (rename/change/
+// update/replace a string), execution.ApplyContextAwareFuzzyReplace is attempted locally
+// first. On success the patch is returned immediately without any LLM call.
+//
+// Early abort (Path B): when the active provider is a cloud model, the raw
+// LLM response is checked for diff markers (---, diff, <<<<<<<) before
+// attempting expensive extraction. If the response lacks diff markers, the
+// function aborts immediately and falls back to local fuzzy replacement or
+// exits cleanly — ensuring a single $hot command never triggers multiple LLM
+// API calls.
 func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 	return func() tea.Msg {
-		if m.provider == nil {
-			return hotfixProposalMsg{Err: fmt.Errorf("build execution error: no provider configured")}
-		}
-
-		// ── CRITICAL: Read existing file content BEFORE calling the LLM ──
-		// Without the original content in the prompt, local LLMs hallucinate
-		// a full-file rewrite that silently deletes all existing content.
-		// The original is read here (pre-LLM) for prompt context AND below
-		// (post-LLM) for diff computation — single read, dual use.
+		// ── Read existing file content ──────────────────────────
+		// Without the original content, local fuzzy replacement and
+		// LLM-based diff computation both produce incorrect results.
 		var orig string
 		if data, rerr := os.ReadFile(task.Target); rerr == nil {
 			orig = string(data)
 		}
 
+		// ── PATH A: Deterministic Local Short-Circuit (0 Tokens) ──
+		// If the target file is explicitly referenced with @ syntax
+		// and the action is a simple text modification, attempt local
+		// resolution first. On success, bypass the LLM entirely.
+		if orig != "" && isHotfixLocalCandidate(task.Description, task.Target) {
+			if modified, ok := execution.ApplyContextAwareFuzzyReplace(orig, task.Description, task.Target); ok {
+				diffContent := computeUnifiedDiff(task.Target, orig, modified)
+				patch := &execution.Patch{
+					ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+					File:          task.Target,
+					Original:      orig,
+					Modified:      modified,
+					TaskID:        task.StepNum,
+					ContextID:     m.sess.ContextID,
+					IsFullRewrite: true,
+				}
+				return hotfixProposalMsg{
+					Task:  task,
+					Patch: patch,
+					Diff:  diffContent,
+				}
+			}
+		}
+
+		if m.provider == nil {
+			return hotfixProposalMsg{Err: fmt.Errorf("build execution error: no provider configured")}
+		}
+
 		// Build a focused, non-chat patch-generation prompt with full file
-		// context so the LLM produces precise SEARCH/REPLACE blocks or
-		// unified diffs rather than a destructive full-file replacement.
+		// context using the appropriate strategy for the file state.
+		strategy := execution.StrategyForOriginal(orig)
 		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
-		if orig != "" {
+		switch strategy {
+		case execution.STRATEGY_NEW_FILE:
+			handoff += "\n\nThis is a NEW file that does not exist yet. "
+			handoff += "Output the complete file content inside a markdown code block "
+			handoff += "with the appropriate language tag (e.g. ```css, ```javascript, ```html, ```python, ```go). "
+			handoff += "Do NOT use FILE_CREATE markers, SEARCH/REPLACE, or diffs."
+		default:
 			handoff += "\n\n### TARGET_FILE_CONTENT\n```\n" + orig + "\n```\n"
 			handoff += "\nModify the above file content to fulfill the task. "
-			handoff += "Output a SEARCH/REPLACE block (`<<<<<<< SEARCH`) or a unified diff. "
-			handoff += "Do NOT output a full FILE: block — the file already exists."
-			handoff += "\n\nSTRICT: Output ONLY the minimal SEARCH/REPLACE block needed. DO NOT rewrite the entire file. DO NOT include explanations or markdown prose."
+			handoff += "Output a unified diff (--- a/ ... +++ b/ ...) or a SEARCH/REPLACE block (<<<<<<< SEARCH). "
+			handoff += "Do NOT rewrite the entire file. "
+			handoff += "Return ONLY the SEARCH/REPLACE block or unified diff."
 		}
-		system := prompt.BuildContract()
+		system := prompt.StrategyContract(strategy.SystemPromptKey())
+
+		cloudCfg := gateway.ClassifyCloudProvider(m.cfg.ActiveProviderName())
+		isCloud := cloudCfg.CloudProvider != ""
+
+		stop := []string{">>>>>>>"}
+		if strategy == execution.STRATEGY_NEW_FILE {
+			stop = []string{"```\n\n"}
+		}
+
 		req := ai.Request{
 			Model:     m.cfg.ActiveModelName(),
 			System:    system,
 			Stream:    false,
-			MaxTokens: 500,
-			Stop:      []string{">>>>>>>"},
+			MaxTokens: 2048,
+			Stop:      stop,
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
+			Tools:     ai.FileMutationTools(),
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		defer cancel()
 		resp, err := m.provider.Execute(ctx, req)
+		cancel()
 		if err != nil {
+			if orig != "" {
+				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
+					diffContent := computeUnifiedDiff(task.Target, orig, modified)
+					patch := &execution.Patch{
+						ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+						File:          task.Target,
+						Original:      orig,
+						Modified:      modified,
+						TaskID:        task.StepNum,
+						ContextID:     m.sess.ContextID,
+						IsFullRewrite: true,
+					}
+					return hotfixProposalMsg{
+						Task:  task,
+						Patch: patch,
+						Diff:  diffContent,
+					}
+				}
+			}
 			return hotfixProposalMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
 		}
+
+		// ── NATIVE TOOL CALLING PATH ──────────────────────────────
+		// When the LLM responds with tool_calls (finish_reason: tool_calls),
+		// extract path and content directly from tool argument JSON and write
+		// files to disk immediately — bypassing all markdown codeblock parsing,
+		// regex string extraction, and the approval gate.
+		if len(resp.ToolCalls) > 0 {
+			results, dispatchErr := execution.DispatchToolCalls(resp.ToolCalls, ".")
+			if dispatchErr != nil {
+				return hotfixProposalMsg{Err: fmt.Errorf("tool call execution: %w", dispatchErr)}
+			}
+			if results.HasContent() {
+				// Write files via hotfix path: return result message that
+				// the buildResultMsg update handler will pick up and restore
+				// the stashed hotfix plan.
+				return buildResultMsg{
+					output:   results.Summary(),
+					exitCode: 0,
+				}
+			}
+		}
+
+		// ── FALLBACK: No tool calls — use existing markdown extraction ──
 		if resp == nil || strings.TrimSpace(resp.Content) == "" {
+			if isCloud {
+				m.push(roleSystem, infoStyle.Render("[HOTFIX] Cloud model returned empty output. Aborting LLM attempt, trying local fallback..."))
+			}
+			if orig != "" {
+				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
+					diffContent := computeUnifiedDiff(task.Target, orig, modified)
+					patch := &execution.Patch{
+						ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+						File:          task.Target,
+						Original:      orig,
+						Modified:      modified,
+						TaskID:        task.StepNum,
+						ContextID:     m.sess.ContextID,
+						IsFullRewrite: true,
+					}
+					return hotfixProposalMsg{
+						Task:  task,
+						Patch: patch,
+						Diff:  diffContent,
+					}
+				}
+			}
 			return hotfixProposalMsg{Err: fmt.Errorf("patch generation returned empty output")}
 		}
 
-		// ── STEP 1/2: Content Cleanse — strip markdown code fences the local
-		// model wraps around the generated file (e.g. "```mit ... ```"). Writing
-		// the raw text verbatim injects literal triple backticks into the
-		// document and corrupts its syntax, so we sanitize BEFORE the diff is
-		// computed and the patch is staged for disk write.
-		cleaned := sanitizeFileOutput(resp.Content)
-		resolved := execution.ResolveModifiedContent(orig, resp.Content)
+		rawContent := resp.Content
 
-		// Compute a unified diff for display (green additions / red removals).
-		diff := computeUnifiedDiff(task.Target, orig, resolved)
+		if isCloud && !hasDiffMarkerPrefix(rawContent) && orig != "" {
+			m.push(roleSystem, infoStyle.Render("[HOTFIX] Cloud model output lacks diff markers. Aborting early, trying local fallback..."))
+			if orig != "" {
+				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
+					diffContent := computeUnifiedDiff(task.Target, orig, modified)
+					patch := &execution.Patch{
+						ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+						File:          task.Target,
+						Original:      orig,
+						Modified:      modified,
+						TaskID:        task.StepNum,
+						ContextID:     m.sess.ContextID,
+						IsFullRewrite: true,
+					}
+					return hotfixProposalMsg{
+						Task:  task,
+						Patch: patch,
+						Diff:  diffContent,
+					}
+				}
+			}
+			return hotfixProposalMsg{Err: fmt.Errorf("patch generation: cloud model produced output without diff markers and local fallback also failed for %s", task.Target)}
+		}
+
+		var resolved string
+		var diffContent string
+
+		switch strategy {
+		case execution.STRATEGY_NEW_FILE:
+			if extracted, ok := execution.ExtractRawCodeBlock(rawContent); ok {
+				resolved = execution.SanitizeRawCodeBlock(extracted)
+			} else if extracted, ok := execution.ExtractCodeBlockContent(rawContent); ok {
+				resolved = execution.SanitizeRawCodeBlock(extracted)
+			} else {
+				resolved = execution.SanitizeRawCodeBlock(rawContent)
+			}
+			diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+
+		default:
+			resolved, diffFound := execution.ExtractDiffFromLLMOutput(rawContent, orig, task.Description)
+			if diffFound {
+				diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+			} else {
+				resolved = execution.ResolveModifiedContent(orig, rawContent)
+				if resolved == orig && orig != "" {
+					if isCloud {
+						m.push(roleSystem, infoStyle.Render("[HOTFIX] Cloud model structural breakdown. Trying local fallback..."))
+						if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
+							diffContent = computeUnifiedDiff(task.Target, orig, modified)
+							patch := &execution.Patch{
+								ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+								File:          task.Target,
+								Original:      orig,
+								Modified:      modified,
+								TaskID:        task.StepNum,
+								ContextID:     m.sess.ContextID,
+								IsFullRewrite: true,
+							}
+							return hotfixProposalMsg{
+								Task:  task,
+								Patch: patch,
+								Diff:  diffContent,
+							}
+						}
+						return hotfixProposalMsg{Err: fmt.Errorf("patch generation: cloud model returned unparseable output and local fallback also failed for %s", task.Target)}
+					}
+					return hotfixProposalMsg{Err: fmt.Errorf("patch generation: no valid diff or search/replace block found in LLM output for %s", task.Target)}
+				}
+				diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+			}
+		}
+
+		cleaned := sanitizeFileOutput(rawContent)
 
 		patch := &execution.Patch{
 			ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
@@ -2232,15 +2519,60 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			Modified:      cleaned,
 			TaskID:        task.StepNum,
 			ContextID:     m.sess.ContextID,
-			IsFullRewrite: true,
+			IsFullRewrite: strategy == execution.STRATEGY_NEW_FILE,
 		}
 
 		return hotfixProposalMsg{
 			Task:  task,
 			Patch: patch,
-			Diff:  diff,
+			Diff:  diffContent,
 		}
 	}
+}
+
+// isHotfixLocalCandidate checks whether a $hot task qualifies for
+// zero-token local resolution: the target file must be explicitly
+// referenced with @ syntax (e.g. @LICENSE) and the description
+// must contain a simple-text-modification verb (rename, change,
+// update, replace, fix, etc.).
+func isHotfixLocalCandidate(description, target string) bool {
+	if target == "" || description == "" {
+		return false
+	}
+	// Require an explicit @file reference so we never apply a
+	// local heuristic to an ambiguous prompt. Match @basename
+	// (e.g. @LICENSE) and also @path/target for explicit paths.
+	targetBase := filepath.Base(target)
+	hasExplicitRef := strings.Contains(description, "@"+targetBase) ||
+		strings.Contains(description, "@"+target)
+	if !hasExplicitRef {
+		return false
+	}
+	lower := strings.ToLower(description)
+	simpleMutationSignals := []string{
+		"rename", "change", "update", "replace", "with ", "to ",
+		"fix typo", "fix spelling", "fix grammar",
+		"capitalize", "lowercase", "uppercase",
+		"bump version", "remove ", "delete ", "strip ",
+	}
+	for _, sig := range simpleMutationSignals {
+		if strings.Contains(lower, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasDiffMarkerPrefix reports whether the raw LLM output starts
+// with a recognizable diff marker (--- a/, diff, <<<<<<< SEARCH)
+// after trimming leading whitespace. Used as an early-abort guard
+// for cloud providers so that responses clearly lacking diff
+// structure are not subjected to expensive extraction logic.
+func hasDiffMarkerPrefix(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	return strings.HasPrefix(trimmed, "---") ||
+		strings.HasPrefix(trimmed, "diff") ||
+		strings.HasPrefix(trimmed, "<<<<<<<")
 }
 
 // proposeStdlibBuildPatch generates a patch for a hardcoded stdlib case-correction
@@ -2294,45 +2626,75 @@ func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
 // no diff headers) for an existing file, the function re-prompts the LLM with the
 // rejection error up to 2 times before giving up. This prevents the human from
 // seeing a bad patch and avoids a pointless fail cycle.
+//
+// Cloud-model robustness: when the active provider is a cloud model
+// (OpenRouter / Cohere / etc.), the function uses ExtractDiffFromLLMOutput
+// to recover unified diff blocks from conversational markdown, and falls
+// back to fuzzy string replacement when strict parsing fails. On structural
+// breakdown (attempt 1), a warning is emitted and the prompt is corrected
+// with an explicit diff format demonstration to prevent token burn on
+// repetitive empty retries.
 func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 	return func() tea.Msg {
 		if m.provider == nil {
 			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
 
-		// ── CRITICAL: Read the target file BEFORE the LLM call ──────────
-		// Without the actual file content in the prompt, the LLM hallucinates
-		// the original content (e.g. "Copyright (c) 2023 Jay") and generates
-		// a unified diff that can never match the file on disk, producing:
-		//   "patch hunk does not match file content".
-		//
-		// The original is read once here and included in both the initial
-		// handoff and any retry handoff so the LLM always sees real content.
 		var orig string
 		if data, rerr := os.ReadFile(task.Target); rerr == nil {
 			orig = string(data)
 		}
 
+		// ── Determine strategy based on file state ─────────────────────
+		strategy := execution.StrategyForOriginal(orig)
 		baseHandoff := ctxpkg.SanitizeBuildHandoff(task, "")
-		if orig != "" {
+
+		switch strategy {
+		case execution.STRATEGY_NEW_FILE:
+			baseHandoff += "\n\nThis is a NEW file that does not exist yet. "
+			baseHandoff += "Output the complete file content inside a markdown code block "
+			baseHandoff += "with the appropriate language tag (e.g. ```css, ```javascript, ```html, ```python, ```go). "
+			baseHandoff += "Do NOT use FILE_CREATE markers, SEARCH/REPLACE blocks, or unified diffs."
+			baseHandoff += "Generate ONLY the content that belongs in this file.\n"
+		default:
 			baseHandoff += "\n\n### TARGET_FILE_CONTENT\n```\n" + orig + "\n```\n"
 			baseHandoff += "\nModify the above file content to fulfill the task. "
-			baseHandoff += "Output a SEARCH/REPLACE block (`<<<<<<< SEARCH`) or a unified diff. "
-			baseHandoff += "Do NOT output a full FILE: block — the file already exists."
-			baseHandoff += "\n\nSTRICT: Output ONLY the minimal SEARCH/REPLACE block needed. DO NOT rewrite the entire file. DO NOT include explanations or markdown prose."
+			baseHandoff += "Output a unified diff (--- a/ ... +++ b/ ...) or a SEARCH/REPLACE block (<<<<<<< SEARCH). "
+			baseHandoff += "Do NOT rewrite the entire file. "
+			baseHandoff += "Return ONLY the SEARCH/REPLACE block or unified diff. No explanatory text."
 		}
-		system := prompt.BuildContract()
+
+		// Select system prompt based on strategy.
+		system := prompt.StrategyContract(strategy.SystemPromptKey())
+
+		cloudCfg := gateway.ClassifyCloudProvider(m.cfg.ActiveProviderName())
+		isCloud := cloudCfg.CloudProvider != ""
+
 		maxRetries := 2
 		handoff := baseHandoff
 
 		for attempt := 0; attempt <= maxRetries; attempt++ {
+			// On retry for existing small files, switch to new-file strategy
+			// (full content overwrite) to avoid repeated diff failures.
+			currentStrategy := strategy
+			if attempt > 0 && orig != "" && execution.IsSmallFile(orig) {
+				currentStrategy = execution.STRATEGY_NEW_FILE
+				handoff = baseHandoff + "\n\nCORRECTION: Previous patch attempts failed. Output the COMPLETE new file content inside a single markdown code block. Do NOT use SEARCH/REPLACE or diff format."
+				system = prompt.StrategyContract("new_file")
+			}
+
+			stop := []string{">>>>>>>", "```\n\n"}
+			if currentStrategy == execution.STRATEGY_NEW_FILE {
+				stop = []string{"```\n\n"}
+			}
 			req := ai.Request{
 				Model:     m.cfg.ActiveModelName(),
 				System:    system,
 				Stream:    false,
-				MaxTokens: 500,
-				Stop:      []string{">>>>>>>", "```\n\n"},
+				MaxTokens: 2048,
+				Stop:      stop,
 				Messages:  []ai.Message{{Role: "user", Content: handoff}},
+				Tools:     ai.FileMutationTools(),
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -2341,50 +2703,128 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			if err != nil {
 				return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
 			}
+
+			// ── NATIVE TOOL CALLING PATH (bypasses markdown parsing + approval gate) ──
+			if len(resp.ToolCalls) > 0 {
+				results, dispatchErr := execution.DispatchToolCalls(resp.ToolCalls, ".")
+				if dispatchErr != nil {
+					return buildProposalReadyMsg{Err: fmt.Errorf("tool call execution: %w", dispatchErr)}
+				}
+				if results.HasContent() {
+					// Mark the build task completed so the queue advances.
+					if m.sess != nil {
+						tasks := m.sess.CurrentTasks
+						for i := range tasks {
+							if tasks[i].StepNum == task.StepNum {
+								tasks[i].Status = "completed"
+								break
+							}
+						}
+						m.sess.StageTaskList(&tasks)
+						_ = m.sess.Save()
+					}
+					return buildResultMsg{
+						output:   results.Summary(),
+						exitCode: 0,
+					}
+				}
+			}
+
 			if resp == nil || strings.TrimSpace(resp.Content) == "" {
+				if attempt == 0 && isCloud {
+					m.push(roleSystem, fmt.Sprintf(
+						warningStyle.Render("[BUILD WARNING] %s returned empty output on attempt %d. "+
+							"The model may be wrapping the diff in markdown or conversational text. "+
+							"Retrying with explicit format instructions."),
+						m.cfg.ActiveModelName(), attempt+1))
+				}
+				if attempt < maxRetries {
+					handoff = fmt.Sprintf(
+						"%s\n\nCORRECTION: Your previous response was empty or unparseable. The expected output is a raw unified diff block like:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n line1\n-line-old\n+line-new\n\nReturn ONLY that diff. No text before or after.",
+						baseHandoff, task.Target, task.Target)
+					continue
+				}
 				return buildProposalReadyMsg{Err: fmt.Errorf("patch generation returned empty output")}
 			}
 
-			cleaned := sanitizeFileOutput(resp.Content)
-			resolved := execution.ResolveModifiedContent(orig, resp.Content)
+			rawContent := resp.Content
+			var resolved string
+			var diffContent string
 
-			// Validate patch format BEFORE presenting to human.
-			// If the snippet is ambiguous (no SEARCH/REPLACE markers, no diff
-			// headers, significantly smaller than the original), reject early
-			// and retry with explicit SEARCH/REPLACE formatting instructions.
-			// The retry prompt also includes the actual file content so the
-			// LLM can generate a correct patch.
-			if execution.IsAmbiguousSnippet(orig, cleaned) {
-				if attempt < maxRetries {
-					handoff = fmt.Sprintf(
-						"Your proposed patch for %s was rejected due to invalid format: Ambiguous snippet without SEARCH/REPLACE markers. Re-send the modification using strict <<<<<<< SEARCH ... ======= ... >>>>>>> blocks.\n\nOriginal task:\n%s",
-						task.Target, baseHandoff)
-					continue
+			switch currentStrategy {
+			case execution.STRATEGY_NEW_FILE:
+				// New file: extract from the outermost markdown code block.
+				// Use defensive nested fence stripping for models that double-wrap.
+				if extracted, ok := execution.ExtractRawCodeBlock(rawContent); ok {
+					resolved = execution.SanitizeRawCodeBlock(extracted)
+				} else if extracted, ok := execution.ExtractCodeBlockContent(rawContent); ok {
+					resolved = execution.SanitizeRawCodeBlock(extracted)
+				} else {
+					resolved = execution.SanitizeRawCodeBlock(rawContent)
 				}
-				return buildProposalReadyMsg{Err: fmt.Errorf("%w: ambiguous snippet without SEARCH/REPLACE markers for existing file %s — retry with SEARCH/REPLACE block or unified diff", execution.ErrInvalidPatchFormat, task.Target)}
-			}
+				diffContent = computeUnifiedDiff(task.Target, orig, resolved)
 
-			diff := computeUnifiedDiff(task.Target, orig, resolved)
+			default:
+				// Existing file: try robust diff extraction.
+				resolved, diffFound := execution.ExtractDiffFromLLMOutput(rawContent, orig, task.Description)
+				if diffFound {
+					diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+				} else {
+					resolved = execution.ResolveModifiedContent(orig, rawContent)
+					if resolved == orig && orig != "" {
+						if attempt == 0 && isCloud {
+							m.push(roleSystem, fmt.Sprintf(
+								warningStyle.Render("[BUILD WARNING] %s failed structural breakdown on attempt %d. "+
+									"The output contained no diff markers (--- a/, +++ b/, @@, <<<<<<< SEARCH). "+
+									"Retrying with explicit diff format demonstration."),
+								m.cfg.ActiveModelName(), attempt+1))
+						}
+						if attempt < maxRetries {
+							handoff = fmt.Sprintf(
+								"%s\n\nCORRECTION: Your previous patch was rejected because it lacked valid diff markers. "+
+									"The expected format for a unified diff is:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n existing context line\n-old-line\n+new-line\n\n"+
+									"Or use SEARCH/REPLACE markers:\n<<<<<<< SEARCH\n<old code>\n=======\n<new code>\n>>>>>>>\n\n"+
+									"Return ONLY one of these formats. No conversational text. No explanations.",
+								baseHandoff, task.Target, task.Target)
+							continue
+						}
+						return buildProposalReadyMsg{Err: fmt.Errorf("patch generation: no valid diff or search/replace block found in LLM output for %s after %d attempts", task.Target, attempt+1)}
+					}
+					diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+				}
+
+				// Validate patch format for existing files.
+				cleaned := sanitizeFileOutput(rawContent)
+				if execution.IsAmbiguousSnippet(orig, cleaned) {
+					if attempt < maxRetries {
+						handoff = fmt.Sprintf(
+							"Your proposed patch for %s was rejected due to invalid format: Ambiguous snippet without SEARCH/REPLACE markers. Re-send the modification using strict <<<<<<< SEARCH ... ======= ... >>>>>>> blocks.\n\nOriginal task:\n%s",
+							task.Target, baseHandoff)
+						continue
+					}
+					return buildProposalReadyMsg{Err: fmt.Errorf("%w: ambiguous snippet without SEARCH/REPLACE markers for existing file %s — retry with SEARCH/REPLACE block or unified diff", execution.ErrInvalidPatchFormat, task.Target)}
+				}
+			}
 
 			patch := &execution.Patch{
 				ID:            fmt.Sprintf("build-%d", task.StepNum),
 				File:          task.Target,
 				Original:      orig,
-				Modified:      cleaned,
+				Modified:      resolved,
 				TaskID:        task.StepNum,
 				ContextID:     m.sess.ContextID,
-				IsFullRewrite: task.IsHardcoded,
+				IsFullRewrite: currentStrategy == execution.STRATEGY_NEW_FILE,
 			}
 
 			return buildProposalReadyMsg{
 				Task:   task,
 				Patch:  patch,
-				Diff:   diff,
-				Output: resp.Content,
+				Diff:   diffContent,
+				Output: rawContent,
 			}
 		}
 
-		return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed after %d retries: ambiguous snippet format", maxRetries)}
+		return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed after %d retries", maxRetries)}
 	}
 }
 
@@ -2628,13 +3068,13 @@ func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
 		handoff += "\n\n### USER REQUEST\n" + task.Description
 		handoff += "\n\nOutput a <<<<<<< FILE_CREATE: " + canonicalTarget + " block with the final content."
 
-		system := prompt.BuildContract()
+		system := prompt.ExistingFileContract()
 
 		req := ai.Request{
 			Model:     m.cfg.ActiveModelName(),
 			System:    system,
 			Stream:    false,
-			MaxTokens: 2000,
+			MaxTokens: 2048,
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
 		}
 
@@ -4668,9 +5108,17 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 		// Purge stale conversational handoff so the build buffer stays clean.
 		m.handoffCtx.ProposedFix = ""
 
-		// REFORM A: Build strict minimal context for the active task.
-		// This is injected as the initial prompt for the build execution.
-		m.handoffCtx.LastFailurePayload = m.buildStrictHandoffPayload()
+		// DEADLOCK-GUARD: when the investigate engine short-circuited
+		// with mutation intent, synthesize an execution context from the
+		// pending todos so the build engine receives an active mutation
+		// prompt instead of a generic greeting.
+		if len(m.handoffCtx.PendingTodos) > 0 {
+			m.handoffCtx.LastFailurePayload = buildMutationHandoffPayload(m.handoffCtx.PendingTodos)
+		} else {
+			// REFORM A: Build strict minimal context for the active task.
+			// This is injected as the initial prompt for the build execution.
+			m.handoffCtx.LastFailurePayload = m.buildStrictHandoffPayload()
+		}
 	}
 }
 

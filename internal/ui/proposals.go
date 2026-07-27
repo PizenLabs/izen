@@ -459,6 +459,9 @@ func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 		if err := m.transitionToBuilding(); err != nil {
 			return mutationResultMsg{err: fmt.Errorf("workflow transition: %w", err), file: p.Target.QualifiedName}
 		}
+		if m.execEng != nil && len(m.execEng.Checkpoints.List()) == 0 {
+			_, _ = m.execEng.Checkpoints.Create("izen build: on-the-fly checkpoint fallback")
+		}
 		if err := m.authorizeBuildExecution([]string{p.Target.QualifiedName}, true); err != nil {
 			return mutationResultMsg{err: err, file: p.Target.QualifiedName}
 		}
@@ -523,6 +526,9 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 			if err := m.transitionToBuilding(); err != nil {
 				results = append(results, mutationResultMsg{err: fmt.Errorf("workflow transition: %w", err), file: p.Target.QualifiedName})
 				continue
+			}
+			if m.execEng != nil && len(m.execEng.Checkpoints.List()) == 0 {
+				_, _ = m.execEng.Checkpoints.Create("izen build: on-the-fly checkpoint fallback")
 			}
 			if err := m.authorizeBuildExecution([]string{p.Target.QualifiedName}, true); err != nil {
 				results = append(results, mutationResultMsg{err: err, file: p.Target.QualifiedName})

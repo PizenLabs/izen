@@ -2,6 +2,7 @@ package ui
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/build"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/providers"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 )
@@ -376,12 +378,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// ── AUTO-HANDOFF: /investigate -> /build (mutation) or /plan (diagnostic) ──
 		// When the investigate engine short-circuited with a code mutation intent
 		// ("code mutation intent detected — hand off to build"), route directly to
-		// /build to skip the plan synthesis step entirely. For bug diagnostics,
+		// /build to skip the plan synthesis step entirely. Synthesize build tasks
+		// from the investigation session key (original intent) so the build engine
+		// receives a structured mutation prompt instead of freezing. For bug diagnostics,
 		// route to /plan as normal.
 		var cmds []tea.Cmd
 		if strings.Contains(m.handoffLedgerContent, "code mutation intent detected") {
 			m.push(roleStatus, "Code mutation intent — routing directly to /build, bypassing /plan")
 			m.modeChangeAuthorized = true
+			// Synthesize pending todos from the investigation content so the
+			// build auto-trigger in setMode finds work to do immediately.
+			m.handoffCtx.PendingTodos = synthesizeBuildTodosFromMutation(msg.sessionKey)
 			cmds = append(cmds, m.setMode(modes.ModeBuild))
 		} else {
 			m.push(roleStatus, "Investigation complete. Auto-transitioning to /plan for execution synthesis...")
@@ -444,6 +451,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
 		}
 		if msg.IsFastTrack {
+			// Auto-create a build checkpoint BEFORE presenting the plan so that
+			// the Checkpoint Verification Guardrail allows patch execution without
+			// throwing "no valid checkpoint exists".
+			if m.execEng != nil {
+				_, _ = m.execEng.Checkpoints.Create(fmt.Sprintf("izen fast-track: %d task(s)", len(msg.Tasks)))
+			}
 			m.planApproved = true
 			m.push(roleStatus, accentStyle.Render(fmt.Sprintf("[Fast-Track] Plan auto-approved: %d task(s). Type /build to execute.", len(msg.Tasks))))
 		} else {
@@ -1981,7 +1994,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
 			_ = m.sess.Save()
 		}
-		m.push(roleError, "stream error: "+msg.err.Error())
+		if errors.Is(msg.err, providers.ErrOpenRouterAuth) {
+			m.push(roleError, errorStyle.Render("✗ OpenRouter Authorization Failed"))
+			m.push(roleSystem, infoStyle.Render("Invalid or missing OPENROUTER_API_KEY. Please check your environment variables or run:"))
+			m.push(roleSystem, infoStyle.Render("  export OPENROUTER_API_KEY=<your_key>"))
+		} else {
+			m.push(roleError, "stream error: "+msg.err.Error())
+		}
 		m.refreshViewportContent()
 		flush := m.flushPendingRecords()
 		return m, flush
@@ -2884,4 +2903,31 @@ func sanitizeFinalContent(content string) string {
 
 	result := strings.Join(clean, "\n")
 	return strings.TrimSpace(result)
+}
+
+// synthesizeBuildTodosFromMutation creates pending todo strings from the
+// original investigation content when the deadlock-guard short-circuits
+// from /investigate to /build. Each todo is a FILE_MUTATE task that
+// the build engine can execute immediately without a separate /plan step.
+// Returns nil when the content is empty or does not contain mutation intent.
+func synthesizeBuildTodosFromMutation(content string) []string {
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	lower := strings.ToLower(content)
+	var todos []string
+
+	// Detect static website creation requests and create the standard
+	// trio of files (HTML, CSS, JS).
+	if strings.Contains(lower, "static website") ||
+		strings.Contains(lower, "html") && strings.Contains(lower, "css") && strings.Contains(lower, "js") {
+		todos = append(todos, "\uf05c [FILE_MUTATE] index.html — Create main HTML page with semantic structure, meta tags, and linked CSS/JS")
+		todos = append(todos, "\uf05c [FILE_MUTATE] styles.css — Create responsive stylesheet with modern CSS layout and styling")
+		todos = append(todos, "\uf05c [FILE_MUTATE] script.js — Create JavaScript file for interactive functionality")
+		return todos
+	}
+
+	// Generic fallback: single FILE_MUTATE task captures the full mutation intent.
+	todos = append(todos, "\uf05c [FILE_MUTATE] workspace — Create or modify files as described: "+strings.TrimSpace(content))
+	return todos
 }

@@ -109,7 +109,7 @@ func Squeeze(req *ai.Request, tier ComplexityTier) error {
 		req.Temperature = 0.0
 
 	case TierComplexBuild:
-		req.MaxTokens = 1500
+		req.MaxTokens = 2048
 		req.Stop = []string{"```\n\n"}
 	}
 

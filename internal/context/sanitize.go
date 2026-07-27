@@ -2,13 +2,32 @@ package context
 
 import (
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
 )
+
+// LanguageFromExtension returns the human-readable language name for a given
+// file extension (e.g. ".css" → "CSS", ".js" → "JavaScript"). Returns empty
+// string when the extension is not recognized.
+func LanguageFromExtension(target string) string {
+	ext := strings.ToLower(filepath.Ext(target))
+	if ext == "" {
+		return ""
+	}
+	reg := language.Global()
+	d, ok := reg.FromExtension(ext)
+	if !ok {
+		// Fallback: derive from extension after stripping the dot
+		return strings.ToUpper(ext[1:])
+	}
+	return d.Name
+}
 
 // ── Ledger Handoff Sanitizer ──────────────────────────────────────────────────
 //
@@ -283,6 +302,20 @@ func SanitizeBuildHandoff(task *plan.Task, symbolContext string) string {
 	b.WriteString("Execute ONLY the following task. Output unified diff or FILE: block.\n")
 	b.WriteString("Do NOT restate the plan, do NOT explain, do NOT list other tasks.\n\n")
 
+	b.WriteString("### TARGET FILE\n")
+	b.WriteString(task.Target + "\n")
+	lang := LanguageFromExtension(task.Target)
+	if lang != "" {
+		b.WriteString("### EXPECTED LANGUAGE\n")
+		b.WriteString(lang + "\n")
+	}
+	b.WriteString("### STRICT RULE\n")
+	fmt.Fprintf(&b, "Generate ONLY content appropriate for %s. ", task.Target)
+	if lang != "" {
+		fmt.Fprintf(&b, "Do NOT output HTML boilerplate if the target is %s or another language. ", lang)
+	}
+	b.WriteString("Do NOT wrap in HTML if the target is CSS or JavaScript.\n\n")
+
 	b.WriteString("### TASK\n")
 	b.WriteString(task.Type + ": " + task.Target)
 	if task.Description != "" {
@@ -298,8 +331,14 @@ func SanitizeBuildHandoff(task *plan.Task, symbolContext string) string {
 
 	b.WriteString("### INSTRUCTION\n")
 	b.WriteString("Produce the minimal code change to complete this task. ")
-	b.WriteString("Use unified diff format (```diff) or FILE: block format. ")
-	b.WriteString("No conversational text, no markdown outside code blocks.\n\n")
+	b.WriteString("Output a unified diff with --- a/ and +++ b/ headers and @@ hunk markers, ")
+	b.WriteString("or a SEARCH/REPLACE block (<<<<<<< SEARCH ... ======= ... >>>>>>>). ")
+	b.WriteString("For NEW files (that do not exist yet), output a FILE_CREATE block or raw file content ")
+	b.WriteString("inside a markdown code block with the appropriate language tag (e.g. ```css, ```javascript, ```html). ")
+	b.WriteString("Output ONLY the diff, search/replace block, or code block. ")
+	b.WriteString("No conversational text, no markdown outside code blocks, no explanations, no greetings. ")
+	b.WriteString("Do NOT wrap the diff in markdown code fences unless diff headers are already present. ")
+	b.WriteString("Return ONLY the raw diff, search/replace block, or code block.\n\n")
 
 	// ── Temporal context ─────────────────────────────────────────────
 	// Local LLMs (e.g. qwen2.5-coder:7b) hallucinate default/fallback dates

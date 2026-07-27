@@ -1,31 +1,82 @@
-package prompt
+package execution
 
-// BuildContract returns the combined operational contract for build mode.
-//
-// Deprecated: Use NewFileContract or ExistingFileContract for strategy-specific
-// prompts. This function is retained for backward compatibility.
-func BuildContract() string {
-	return ExistingFileContract()
+import (
+	"os"
+	"strings"
+)
+
+type FileMutationStrategy int
+
+const (
+	STRATEGY_NEW_FILE FileMutationStrategy = iota
+	STRATEGY_EXISTING_FILE
+)
+
+func (s FileMutationStrategy) String() string {
+	switch s {
+	case STRATEGY_NEW_FILE:
+		return "STRATEGY_NEW_FILE"
+	case STRATEGY_EXISTING_FILE:
+		return "STRATEGY_EXISTING_FILE"
+	default:
+		return "STRATEGY_UNKNOWN"
+	}
 }
 
-// NewFileContract returns the system prompt for generating a brand-new file.
-// The LLM is instructed to output RAW FULL FILE CONTENT inside a single
-// markdown code block, NOT SEARCH/REPLACE blocks or unified diffs.
-// TokenThriftyConstraint is appended to all build/plan system prompts to enforce
-// completion token efficiency and eliminate conversational filler.
-const TokenThriftyConstraint = `
-STRICT RULE: Output ONLY valid code within markdown codeblocks. ZERO conversational filler, ZERO intros/outros, ZERO explanations.
-Write minimal, clean, modern code to optimize completion token efficiency.`
+func StrategyForFile(target string) FileMutationStrategy {
+	if data, err := os.ReadFile(target); err != nil || len(strings.TrimSpace(string(data))) == 0 {
+		return STRATEGY_NEW_FILE
+	}
+	return STRATEGY_EXISTING_FILE
+}
 
-func NewFileContract() string {
-	cb := "```"
+func StrategyForOriginal(original string) FileMutationStrategy {
+	if strings.TrimSpace(original) == "" {
+		return STRATEGY_NEW_FILE
+	}
+	return STRATEGY_EXISTING_FILE
+}
+
+func (s FileMutationStrategy) SystemPromptKey() string {
+	switch s {
+	case STRATEGY_NEW_FILE:
+		return "new_file"
+	case STRATEGY_EXISTING_FILE:
+		return "existing_file"
+	default:
+		return "existing_file"
+	}
+}
+
+func IsSmallFile(original string) bool {
+	return len(strings.Split(original, "\n")) < 200
+}
+
+func StrategyWithFallback(original, diffInput string) FileMutationStrategy {
+	base := StrategyForOriginal(original)
+	if base == STRATEGY_EXISTING_FILE && IsSmallFile(original) {
+		if diffInput != "" && !strings.Contains(diffInput, "<<<<<<< SEARCH") && !strings.Contains(diffInput, "@@") {
+			return STRATEGY_NEW_FILE
+		}
+	}
+	return base
+}
+
+func StrategyOverrideOnFailure(original string, attempt int) FileMutationStrategy {
+	if attempt > 0 && IsSmallFile(original) {
+		return STRATEGY_NEW_FILE
+	}
+	return StrategyForOriginal(original)
+}
+
+func NewFileGenerationSystemPrompt() string {
 	return `MODE: FILE_CREATE — generate a new file from scratch.
 
 Generate ONLY the raw file content for the requested file.
 Output the complete file content inside a SINGLE markdown code block.
 Use the appropriate language tag on the opening fence (e.g. ` + "```" + `css, ` + "```" + `javascript, ` + "```" + `html, ` + "```" + `python, ` + "```" + `go).
 
-RULES
+RULES:
 - Output the ENTIRE file content. Do not omit any code.
 - Do NOT use SEARCH/REPLACE blocks (<<<<<<< SEARCH) — the file does not exist yet.
 - Do NOT use unified diff format (--- a/ +++ b/) — the file does not exist yet.
@@ -36,58 +87,53 @@ RULES
 - The last token MUST be the closing ` + "```" + ` fence.
 
 OUTPUT FORMAT:
-` + cb + `css
+` + "```" + `css
 body { margin: 0; }
-` + cb + TokenThriftyConstraint
+` + "```" + `
+`
 }
 
-// ExistingFileContract returns the system prompt for modifying an existing file.
-// The LLM is instructed to output SEARCH/REPLACE blocks or unified diffs.
-func ExistingFileContract() string {
-	code := "```"
+func ExistingFileMutationSystemPrompt() string {
+	bt := "```"
 	return `MODE: PATCH — modify an existing file with precision.
 
 Output ONLY the minimal change needed using one of these formats:
 
 METHOD C — SEARCH/REPLACE (preferred):
-` + code + `go:path/to/file.go
+` + bt + `go:path/to/file.go
 <<<<<<< SEARCH
 old code
 =======
 new code
 >>>>>>>
-` + code + `
+` + bt + `
 
 METHOD D — Unified Diff (alternative):
-` + code + `diff
+` + bt + `diff
 --- a/path/to/file.go
 +++ b/path/to/file.go
 @@ -1,3 +1,4 @@
  existing
 -old
 +new
-` + code + `
+` + bt + `
 
-RULES
+RULES:
 - Existing files -> SEARCH/REPLACE or unified diff only. Never rewrite the entire file.
 - SEARCH blocks must match EXACTLY (whitespace-sensitive).
 - Include at least 2-3 lines of context in SEARCH blocks.
 - Do NOT output full file content — only the changed region.
 - No conversational text, explanations, or markdown outside the block.
-- Output ends immediately after the last block.` + TokenThriftyConstraint
+- Output ends immediately after the last block.`
 }
 
-// ExistingFileSmallFallbackContract returns the system prompt for rewriting a
-// small existing file entirely. Used as a fallback when SEARCH/REPLACE or
-// unified diff application fails for files under 200 lines.
-func ExistingFileSmallFallbackContract() string {
-	cb := "```"
+func ExistingFileSmallFallbackSystemPrompt() string {
 	return `MODE: FILE_REWRITE — rewrite a small existing file.
 
 Output the COMPLETE new file content inside a SINGLE markdown code block.
 Use the appropriate language tag on the opening fence.
 
-RULES
+RULES:
 - Output the ENTIRE file content. Do not omit any code.
 - Do NOT use SEARCH/REPLACE blocks.
 - Do NOT use unified diff format.
@@ -96,24 +142,10 @@ RULES
 - The last token MUST be the closing ` + "```" + ` fence.
 
 OUTPUT FORMAT:
-` + cb + `go
+` + "```" + `go
 package main
 
 func main() {}
-` + cb + TokenThriftyConstraint
-}
-
-// StrategyContract returns the appropriate system prompt for the given
-// strategy. This is the canonical dispatch point for strategy-aware prompts.
-func StrategyContract(strategy string) string {
-	switch strategy {
-	case "new_file":
-		return NewFileContract()
-	case "existing_file":
-		return ExistingFileContract()
-	case "small_fallback":
-		return ExistingFileSmallFallbackContract()
-	default:
-		return ExistingFileContract()
-	}
+` + "```" + `
+`
 }

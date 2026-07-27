@@ -13,6 +13,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/audit"
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/control"
 	"github.com/PizenLabs/izen/internal/core/artifact"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
@@ -178,6 +179,8 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	)
 	runtimeCtx := runtime.New(artStore, caps, bgt)
 	workflowSM := workflow.NewWorkflowStateMachine()
+	wcc := control.NewWorkflowCheckpointManager(execEng.Checkpoints, root)
+	workflowSM.WithCheckpointCoordinator(workflow.NewCheckpointCoordinator(wcc))
 
 	// ── AUTHORIZATION ENGINE ───────────────────────────────────────────────
 	// Production AuthorizationEngine wired with a no-op source hash verifier
