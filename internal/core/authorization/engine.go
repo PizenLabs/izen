@@ -131,10 +131,13 @@ func (e *AuthorizationEngine) Evaluate(
 			Message: "mutation budget already exhausted",
 		}
 	}
-	if err := b.Consume(proposal.EstimatedDelta); err != nil {
-		return nil, &AuthorizationDenied{
-			Step:    StepBudgetSufficiency,
-			Message: err.Error(),
+	if !b.IsMultiStepPlan() {
+		// Single-step plan: consume budget delta immediately.
+		if err := b.Consume(proposal.EstimatedDelta); err != nil {
+			return nil, &AuthorizationDenied{
+				Step:    StepBudgetSufficiency,
+				Message: err.Error(),
+			}
 		}
 	}
 
@@ -152,12 +155,17 @@ func (e *AuthorizationEngine) Evaluate(
 		}
 	}
 
+	// Multi-step plans get non-single-use authorization so steps 1..N
+	// can all pass through the guardrail. The budget's mutation counter
+	// enforces the actual cap — no risk of runaway execution.
+	singleUse := !b.IsMultiStepPlan()
+
 	return &MutationAuthorization{
 		ID:            NewAuthorizationID(),
 		ProposalHash:  proposal.Hash(),
 		CheckpointRef: ref,
 		ExpiresAt:     time.Now().Add(5 * time.Minute),
-		SingleUse:     true,
+		SingleUse:     singleUse,
 		IssuedAt:      time.Now(),
 	}, nil
 }
@@ -229,16 +237,19 @@ func (e *AuthorizationEngine) AuthorizeBuild(
 		}
 	}
 
+	// Multi-step plans get non-single-use authorization.
+	singleUse := !mutBudget.IsMultiStepPlan()
+
 	auth := &MutationAuthorization{
 		ID:            NewAuthorizationID(),
 		ProposalHash:  "",
 		CheckpointRef: ref,
 		ExpiresAt:     time.Now().Add(5 * time.Minute),
-		SingleUse:     true,
+		SingleUse:     singleUse,
 		IssuedAt:      time.Now(),
 	}
 
-	if mutBudget != nil {
+	if mutBudget != nil && !mutBudget.IsMultiStepPlan() {
 		_ = mutBudget.Consume(budget.BudgetDelta{Files: len(targetFiles)})
 	}
 

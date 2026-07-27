@@ -2,6 +2,7 @@ package ui
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/build"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/providers"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 )
@@ -1992,7 +1994,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
 			_ = m.sess.Save()
 		}
-		m.push(roleError, "stream error: "+msg.err.Error())
+		if errors.Is(msg.err, providers.ErrOpenRouterAuth) {
+			m.push(roleError, errorStyle.Render("✗ OpenRouter Authorization Failed"))
+			m.push(roleSystem, infoStyle.Render("Invalid or missing OPENROUTER_API_KEY. Please check your environment variables or run:"))
+			m.push(roleSystem, infoStyle.Render("  export OPENROUTER_API_KEY=<your_key>"))
+		} else {
+			m.push(roleError, "stream error: "+msg.err.Error())
+		}
 		m.refreshViewportContent()
 		flush := m.flushPendingRecords()
 		return m, flush

@@ -2342,7 +2342,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			Model:     m.cfg.ActiveModelName(),
 			System:    system,
 			Stream:    false,
-			MaxTokens: 500,
+			MaxTokens: 2048,
 			Stop:      stop,
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
 		}
@@ -2653,7 +2653,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				Model:     m.cfg.ActiveModelName(),
 				System:    system,
 				Stream:    false,
-				MaxTokens: 500,
+				MaxTokens: 2048,
 				Stop:      stop,
 				Messages:  []ai.Message{{Role: "user", Content: handoff}},
 			}
@@ -3008,7 +3008,7 @@ func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
 			Model:     m.cfg.ActiveModelName(),
 			System:    system,
 			Stream:    false,
-			MaxTokens: 2000,
+			MaxTokens: 2048,
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
 		}
 

@@ -608,6 +608,10 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		if err := pm.createShadowBackup(fullPath); err != nil {
 			return fmt.Errorf("shadow backup %s: %w", patch.File, err)
 		}
+		// Truncation guardrail: reject truncated LLM output before writing.
+		if reason := IsTruncatedOutput(patch.Modified); reason != "" {
+			return fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
+		}
 		// Write the new file directly — skip diff/SEARCH/REPLACE flow.
 		if err := os.WriteFile(fullPath, []byte(patch.Modified), 0644); err != nil {
 			return fmt.Errorf("write %s: %w", patch.File, err)
@@ -713,6 +717,12 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		final = clean
 	default:
 		final = SanitizeDiffContent(diffInput)
+		// Truncation guardrail: reject truncated LLM output before writing
+		// a new file. Only fires for new file creation (patch.Original is empty)
+		// where the LLM produced the full file content directly.
+		if reason := IsTruncatedOutput(final); reason != "" {
+			return fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
+		}
 	}
 
 	if err := os.WriteFile(fullPath, []byte(final), 0644); err != nil {
@@ -1566,6 +1576,74 @@ func isTruncated(original, modified string) bool {
 		return false
 	}
 	return len(modified) < len(original)*30/100
+}
+
+// ErrTruncatedOutput is returned when LLM output is detected as truncated
+// (unclosed markdown fences, fragmentary content) to prevent writing
+// corrupted files to disk. Callers should fall back or retry.
+var ErrTruncatedOutput = errors.New("truncated LLM output: refusing to write corrupted file")
+
+// IsTruncatedOutput checks if the LLM response content was truncated and
+// would produce a corrupted file if written to disk. Returns the detected
+// truncation reason or "" when the output appears complete.
+//
+// Checks performed:
+//   - Unclosed opening markdown code fence (``` without closing ```)
+//   - Fragmentary content (< 3 lines for new file creation)
+//   - Content that ends with an incomplete opening fence (no trailing ```)
+func IsTruncatedOutput(content string) string {
+	if content == "" {
+		return "empty content"
+	}
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return "whitespace-only content"
+	}
+
+	lines := strings.Split(content, "\n")
+	openFence := -1
+	closeFence := -1
+	for i, line := range lines {
+		// Match opening fence: optional whitespace followed by ``` with optional language tag
+		if strings.HasPrefix(strings.TrimSpace(line), "```") && openFence == -1 {
+			openFence = i
+		} else if strings.TrimSpace(line) == "```" && openFence != -1 {
+			closeFence = i
+		}
+	}
+
+	// Unclosed markdown code fence — the most common truncation signal.
+	if openFence != -1 && closeFence == -1 {
+		return "unclosed markdown code block"
+	}
+
+	// Multiple opening fences without matching closing fences (partial output).
+	if openFence != -1 && closeFence != -1 {
+		// Check for a second opening fence after the first close (nested truncation)
+		for j := closeFence + 1; j < len(lines); j++ {
+			if strings.HasPrefix(strings.TrimSpace(lines[j]), "```") {
+				// Check if this second block is also closed
+				secondClosed := false
+				for k := j + 1; k < len(lines); k++ {
+					if strings.TrimSpace(lines[k]) == "```" {
+						secondClosed = true
+						break
+					}
+				}
+				if !secondClosed {
+					return "unclosed second markdown code block"
+				}
+				break
+			}
+		}
+	}
+
+	// Content suspiciously short for a new file creation.
+	if len(lines) < 3 {
+		return "fragmentary content (less than 3 lines)"
+	}
+
+	return ""
 }
 
 // ResolveTemplateMutation checks whether the target file is a template-managed

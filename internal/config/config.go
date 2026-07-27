@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,46 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// LoadDotEnv reads key=value pairs from the given .env file path (if it exists)
+// and sets them via os.Setenv. Returns the number of variables loaded.
+func LoadDotEnv(path string) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = f.Close() }()
+
+	count := 0
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.TrimSpace(line[eq+1:])
+		if key == "" {
+			continue
+		}
+		// Strip surrounding quotes if present
+		if len(val) >= 2 {
+			if (val[0] == '"' && val[len(val)-1] == '"') ||
+				(val[0] == '\'' && val[len(val)-1] == '\'') {
+				val = val[1 : len(val)-1]
+			}
+		}
+		if os.Getenv(key) == "" {
+			_ = os.Setenv(key, val)
+			count++
+		}
+	}
+	return count
+}
 
 var envVarPattern = regexp.MustCompile(`\$\{([^}]+)\}`)
 
@@ -242,6 +283,19 @@ func ExpandEnvVar(val string) string {
 	})
 }
 
+// loadEnv attempts to load .env files from the working directory and
+// ~/.config/izen/.env on startup. Existing environment variables take
+// precedence (dotenv values are only set when the env var is empty).
+func loadEnv() {
+	cwd, _ := os.Getwd()
+	if cwd != "" {
+		LoadDotEnv(filepath.Join(cwd, ".env"))
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		LoadDotEnv(filepath.Join(home, ".config", "izen", ".env"))
+	}
+}
+
 func (c *AIConfig) ExpandEnvVars() {
 	for name, prov := range c.Providers {
 		prov.APIKey = ExpandEnvVar(prov.APIKey)
@@ -262,6 +316,8 @@ func legacyConfigPath() string {
 }
 
 func Load() (*Config, error) {
+	loadEnv()
+
 	path := configPath()
 	data, err := os.ReadFile(path)
 	if err != nil {

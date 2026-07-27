@@ -11,7 +11,14 @@ func BuildContract() string {
 // NewFileContract returns the system prompt for generating a brand-new file.
 // The LLM is instructed to output RAW FULL FILE CONTENT inside a single
 // markdown code block, NOT SEARCH/REPLACE blocks or unified diffs.
+// TokenThriftyConstraint is appended to all build/plan system prompts to enforce
+// completion token efficiency and eliminate conversational filler.
+const TokenThriftyConstraint = `
+STRICT RULE: Output ONLY valid code within markdown codeblocks. ZERO conversational filler, ZERO intros/outros, ZERO explanations.
+Write minimal, clean, modern code to optimize completion token efficiency.`
+
 func NewFileContract() string {
+	cb := "```"
 	return `MODE: FILE_CREATE — generate a new file from scratch.
 
 Generate ONLY the raw file content for the requested file.
@@ -29,10 +36,9 @@ RULES
 - The last token MUST be the closing ` + "```" + ` fence.
 
 OUTPUT FORMAT:
-` + "```" + `css
+` + cb + `css
 body { margin: 0; }
-` + "```" + `
-`
+` + cb + TokenThriftyConstraint
 }
 
 // ExistingFileContract returns the system prompt for modifying an existing file.
@@ -68,13 +74,14 @@ RULES
 - Include at least 2-3 lines of context in SEARCH blocks.
 - Do NOT output full file content — only the changed region.
 - No conversational text, explanations, or markdown outside the block.
-- Output ends immediately after the last block.`
+- Output ends immediately after the last block.` + TokenThriftyConstraint
 }
 
 // ExistingFileSmallFallbackContract returns the system prompt for rewriting a
 // small existing file entirely. Used as a fallback when SEARCH/REPLACE or
 // unified diff application fails for files under 200 lines.
 func ExistingFileSmallFallbackContract() string {
+	cb := "```"
 	return `MODE: FILE_REWRITE — rewrite a small existing file.
 
 Output the COMPLETE new file content inside a SINGLE markdown code block.
@@ -89,12 +96,11 @@ RULES
 - The last token MUST be the closing ` + "```" + ` fence.
 
 OUTPUT FORMAT:
-` + "```" + `go
+` + cb + `go
 package main
 
 func main() {}
-` + "```" + `
-`
+` + cb + TokenThriftyConstraint
 }
 
 // StrategyContract returns the appropriate system prompt for the given

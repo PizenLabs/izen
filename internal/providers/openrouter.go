@@ -5,13 +5,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/ai"
 )
+
+// ErrOpenRouterAuth is returned when OpenRouter authentication fails (HTTP 401
+// or missing API key). The UI layer detects this sentinel error via errors.Is
+// and displays a clear actionable banner instead of a raw HTTP status message.
+var ErrOpenRouterAuth = errors.New("openrouter: authorization failed (HTTP 401): invalid or missing OPENROUTER_API_KEY — check your environment variables or run: export OPENROUTER_API_KEY=<your_key>")
 
 // ReasoningSentinel is a zero-width marker embedded in the stream output to
 // distinguish reasoning content from message content. The UI layer detects
@@ -41,10 +48,25 @@ func (p *OpenRouterProvider) Name() string {
 	return "openrouter"
 }
 
+// resolveAPIKey returns the effective API key for a request. It checks the
+// OPENROUTER_API_KEY environment variable first (picking up runtime .env
+// changes), then falls back to the compile-time key from the provider config.
+func (p *OpenRouterProvider) resolveAPIKey() string {
+	if envKey := os.Getenv("OPENROUTER_API_KEY"); envKey != "" {
+		return envKey
+	}
+	return p.apiKey
+}
+
 func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
+	}
+
+	key := p.resolveAPIKey()
+	if key == "" {
+		return nil, fmt.Errorf("%w: api key is empty — set OPENROUTER_API_KEY or configure api_key in provider config", ErrOpenRouterAuth)
 	}
 
 	msgs := p.buildMessages(req)
@@ -68,7 +90,7 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 		return nil, fmt.Errorf("openrouter: new request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+key)
 	httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen")
 	httpReq.Header.Set("X-Title", "izen")
 	httpReq.Header.Set("X-Description", "AI amplifies human judgment. Humans remain in control.")
@@ -80,6 +102,10 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusUnauthorized {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%w: server returned 401: %s", ErrOpenRouterAuth, strings.TrimSpace(string(respBody)))
+	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("openrouter: status %d: %s", resp.StatusCode, string(respBody))
@@ -119,6 +145,11 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		model = req.Model
 	}
 
+	key := p.resolveAPIKey()
+	if key == "" {
+		return nil, fmt.Errorf("%w: api key is empty — set OPENROUTER_API_KEY or configure api_key in provider config", ErrOpenRouterAuth)
+	}
+
 	msgs := p.buildMessages(req)
 
 	body := openrouterRequest{
@@ -141,7 +172,7 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		return nil, fmt.Errorf("openrouter: new request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+key)
 	httpReq.Header.Set("Accept", "text/event-stream")
 	httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen")
 	httpReq.Header.Set("X-Title", "izen")
@@ -153,6 +184,11 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		return nil, fmt.Errorf("openrouter: do: %w", err)
 	}
 
+	if resp.StatusCode == http.StatusUnauthorized {
+		_ = resp.Body.Close()
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%w: server returned 401: %s", ErrOpenRouterAuth, strings.TrimSpace(string(respBody)))
+	}
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
