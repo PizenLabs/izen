@@ -25,6 +25,11 @@ var ErrOpenRouterAuth = errors.New("openrouter: authorization failed (HTTP 401):
 // these markers and routes reasoning into a separate collapsible buffer.
 const ReasoningSentinel = "\x00RSNG\x00"
 
+// ToolCallSentinel is a zero-width marker embedded in the stream output to
+// distinguish tool call delta JSON from message content. The UI layer detects
+// these markers and routes them into the ToolCallBuffer for live code preview.
+const ToolCallSentinel = "\x00TCLL\x00"
+
 type OpenRouterProvider struct {
 	apiKey  string
 	model   string
@@ -286,9 +291,19 @@ type openrouterToolCallFunc struct {
 }
 
 type openrouterDelta struct {
-	Role             string `json:"role,omitempty"`
-	Content          string `json:"content,omitempty"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Role             string                `json:"role,omitempty"`
+	Content          string                `json:"content,omitempty"`
+	ReasoningContent string                `json:"reasoning_content,omitempty"`
+	ToolCalls        []openrouterToolDelta `json:"tool_calls,omitempty"`
+}
+
+type openrouterToolDelta struct {
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function,omitempty"`
 }
 
 type openrouterUsage struct {
@@ -372,6 +387,19 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 			if delta.Content != "" {
 				n := copy(p, delta.Content)
 				return n, nil
+			}
+			if len(delta.ToolCalls) > 0 {
+				for _, tc := range delta.ToolCalls {
+					tcData, err := json.Marshal(tc)
+					if err != nil {
+						continue
+					}
+					toolCallChunk := ToolCallSentinel + string(tcData) + ToolCallSentinel
+					n := copy(p, toolCallChunk)
+					if n < len(toolCallChunk) {
+						return n, nil
+					}
+				}
 			}
 		}
 

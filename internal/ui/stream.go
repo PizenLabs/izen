@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -174,6 +175,14 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// the stream (the historical 108-token stall). The producer only touches
 	// the channel, the local buffer, and the captured `streamCh`/`cancel`.
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				select {
+				case streamCh <- streamErrMsg{err: fmt.Errorf("stream panic: %v", r)}:
+				default:
+				}
+			}
+		}()
 		defer close(streamCh)
 		defer cancel()
 

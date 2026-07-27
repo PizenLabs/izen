@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -219,6 +220,8 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		userName:            userName,
 		workspaceRoot:       root,
 		detection:           detection,
+		projectContext:      projectContextFor(detection),
+		repoConfig:          repoConfigFor(root),
 		initStage:           initStage,
 		initProviderIdx:     0,
 		initProviderFilter:  "",
@@ -391,4 +394,39 @@ func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalCo
 
 	p := NewProgram(root, cfg, sess, mgr, localCfg, detection)
 	runProgram(p)
+}
+
+// projectContextFor returns a safe ProjectContext from project detection.
+// When detection finds no recognized files (Primary is nil), it returns
+// a fallback context with Name "generic" and Type "unknown" so the UI
+// always has valid data to render.
+func projectContextFor(detection project.Detection) *project.ProjectContext {
+	if detection.Primary != nil {
+		return &project.ProjectContext{
+			Name: detection.Primary.Name,
+			Type: string(detection.Primary.Category),
+		}
+	}
+	return project.FallbackProjectContext()
+}
+
+// repoConfigFor returns a safe RepoConfig for the given root directory.
+// It checks git status and provides defaults when git metadata is missing.
+func repoConfigFor(root string) *project.RepoConfig {
+	isGitRepo := false
+	defaultBranch := "main"
+	if _, err := os.Stat(filepath.Join(root, ".git")); err == nil {
+		isGitRepo = true
+		if head, err := os.ReadFile(filepath.Join(root, ".git", "HEAD")); err == nil {
+			branch := strings.TrimSpace(string(head))
+			if strings.HasPrefix(branch, "ref: refs/heads/") {
+				defaultBranch = strings.TrimPrefix(branch, "ref: refs/heads/")
+			}
+		}
+	}
+	return &project.RepoConfig{
+		Root:          root,
+		IsGitRepo:     isGitRepo,
+		DefaultBranch: defaultBranch,
+	}
 }

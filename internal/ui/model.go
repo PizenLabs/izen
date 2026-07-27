@@ -247,11 +247,35 @@ type buildResultMsg struct {
 // renders a diff proposal for explicit human authorization before any disk
 // write occurs.
 type buildProposalReadyMsg struct {
-	Task   *plan.Task
-	Patch  *execution.Patch
-	Diff   string
-	Output string // raw LLM response text for proposal extraction
-	Err    error
+	Task    *plan.Task
+	Patch   *execution.Patch
+	Patches []*execution.Patch
+	Diff    string
+	Output  string // raw LLM response text for proposal extraction
+	Err     error
+}
+
+// thinkingStreamMsg carries a reasoning token chunk from the SSE stream
+// to the TUI Thinking Panel for real-time display during fast-track builds.
+type thinkingStreamMsg struct {
+	Content string
+}
+
+// livePreviewChunkMsg carries a code content or tool call chunk from the
+// SSE stream to the LiveCodePreview for real-time display during fast-track
+// builds.
+type livePreviewChunkMsg struct {
+	Content      string // raw content or tool call JSON
+	IsTool       bool   // true if this chunk is a tool call delta
+	IsDone       bool   // true if this is the final content chunk before stream end
+	FinishReason string // "stop", "length", "tool_calls", etc.
+}
+
+// buildFailedMsg signals that the fast-track build stream failed
+// (e.g. stream error, truncation, or provider failure). It guarantees
+// the spinner is cleaned up and the pipeline is reset.
+type buildFailedMsg struct {
+	Err error
 }
 
 // hotfixProposalMsg carries the LLM-generated patch for a $hot hotfix back to
@@ -646,6 +670,16 @@ type model struct {
 
 	// Project type detection
 	detection project.Detection
+
+	// Project context — never nil after model creation.
+	// Falls back to generic/unknown when project detection finds
+	// no recognized files (e.g. empty or unrecognized directories).
+	projectContext *project.ProjectContext
+
+	// Repository config — never nil after model creation.
+	// Holds minimal metadata (root path, git status, default branch)
+	// used by the status bar and rendering paths.
+	repoConfig *project.RepoConfig
 
 	// AST/Code Graph trace for rendering the AI's thought route
 	currentTrace *ctxpkg.CodebaseTrace

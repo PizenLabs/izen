@@ -727,8 +727,8 @@ func (m *model) renderRuntimeStatus(width int) string {
 	var meta []string
 
 	// Detected project language badge — dropped first when the pane is too narrow.
-	if width >= minimalStatusThreshold && m.detection.Primary != nil {
-		meta = append(meta, langBadgeStyle.Render(m.detection.Primary.Name))
+	if width >= minimalStatusThreshold && m.projectContext != nil {
+		meta = append(meta, langBadgeStyle.Render(m.projectContext.Name))
 	}
 
 	// Model name — dropped after language when the pane is too narrow.
@@ -942,8 +942,8 @@ func (m *model) renderStartupBanner(termWidth int) string {
 	metaParts := []string{
 		mutedStyle.Render(projectPathDisplay()),
 	}
-	if m.detection.Primary != nil {
-		metaParts = append(metaParts, langBadgeStyle.Render(m.detection.Primary.Name))
+	if m.projectContext != nil {
+		metaParts = append(metaParts, langBadgeStyle.Render(m.projectContext.Name))
 	}
 	modelLabel := provider + " " + modelName
 	if m.sessionModel != "" {
@@ -1003,8 +1003,8 @@ func (m *model) renderStartupBannerCompact(termWidth int) string {
 	// are dropped as the pane narrows further, same priority order as the
 	// runtime status line.
 	metaParts := []string{mutedStyle.Render(projectPathDisplay())}
-	if m.detection.Primary != nil {
-		metaParts = append(metaParts, langBadgeStyle.Render(m.detection.Primary.Name))
+	if m.projectContext != nil {
+		metaParts = append(metaParts, langBadgeStyle.Render(m.projectContext.Name))
 	}
 	if termWidth >= compactStatusThreshold {
 		provider := m.cfg.ActiveProviderName()

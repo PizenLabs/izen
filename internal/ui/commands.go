@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2044,7 +2045,402 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 	}
 
 	// Execute the first idle staged task.
+	// ── FAST-TRACK EXECUTION BYPASS ──────────────────────────────
+	// When multiple FILE_MUTATE tasks target different files, bypass
+	// the legacy per-task iteration loop (handleBuildRun) which
+	// processes tasks one at a time with SEARCH/REPLACE diff parsing.
+	// Instead, combine all plan goals into a SINGLE unified prompt
+	// request with native write_file / apply_patch tools and dispatch
+	// it directly to the Native Agentic Tool Loop (ToolCallBuffer).
+	// This eliminates "executing step N: FILE_MUTATE" noise and
+	// gives the LLM full context of all file mutations in one pass.
+	if m.isFastTrackEligible() {
+		return m.performFastTrackBuildCmd()
+	}
 	return m.handleBuildRun(0)
+}
+
+// isFastTrackEligible returns true when there are at least 2 staged
+// tasks that are idle/processing and all of them are FILE_MUTATE or
+// GIT_ACTION targets, indicating a multi-file generation prompt that
+// benefits from unified native-tool execution rather than legacy
+// per-task SEARCH/REPLACE iteration.
+func (m *model) isFastTrackEligible() bool {
+	tasks := m.sess.CurrentTasks
+	eligible := 0
+	for _, t := range tasks {
+		if t.Status != "idle" && t.Status != "processing" {
+			continue
+		}
+		if t.Type != "FILE_MUTATE" && t.Type != "GIT_ACTION" {
+			return false
+		}
+		eligible++
+	}
+	return eligible >= 2
+}
+
+// performFastTrackBuildCmd executes all staged FILE_MUTATE/GIT_ACTION tasks
+// in a single unified agentic session, bypassing the legacy per-task
+// iteration loop. It dispatches native write_file / apply_patch tool calls
+// to the LLM, buffers all responses into ToolCallBuffer, and triggers
+// buildProposalReadyMsg to display the interactive Human Approval Screen.
+// The API call is executed asynchronously without freezing the UI.
+func (m *model) performFastTrackBuildCmd() tea.Cmd {
+	tasks := m.sess.CurrentTasks
+	if len(tasks) == 0 {
+		m.push(roleStatus, "no tasks staged — use /plan first")
+		return nil
+	}
+	if m.toolCallBuffer == nil {
+		return m.runBuildFastTrack()
+	}
+	m.streaming = true
+	m.spinnerFrame = 0
+	m.lastSpinnerAdvance = time.Time{}
+	m.agentRunning = true
+	m.agentLabel = "building"
+	m.agentDone = false
+	m.pipelineRunning = true
+	m.push(roleStatus, "BUILDING...")
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
+	return tea.Batch(m.smoothStreamTickCmd(), m.runBuildFastTrack())
+}
+
+// runBuildFastTrack executes all staged FILE_MUTATE tasks in a single
+// unified agentic session, bypassing the legacy per-task iteration loop.
+// It combines plan goals into one prompt, dispatches native write_file /
+// apply_patch tool calls to the LLM, buffers all responses into
+// ToolCallBuffer, and presents all diffs for human approval at once.
+// Reasoning tokens (<thought>) and live tool call arguments stream into
+// the TUI Thinking Panel and Live Code Preview during execution.
+func (m *model) runBuildFastTrack() tea.Cmd {
+	tasks := m.sess.CurrentTasks
+	if len(tasks) == 0 {
+		m.push(roleStatus, "no tasks staged — use /plan first")
+		return nil
+	}
+
+	// Transition workflow state to Building.
+	if err := m.transitionToBuilding(); err != nil {
+		m.push(roleError, fmt.Sprintf("[BUILD HALTED] Workflow state transition failed: %v", err))
+		return nil
+	}
+
+	// Virtual snapshot staging.
+	if m.execEng != nil {
+		m.execEng.BeginTransaction()
+	}
+
+	// Clear the LLM dialog buffer at the start of every build invocation.
+	if m.sess != nil {
+		m.sess.ClearHistory()
+		_ = m.sess.Save()
+	}
+
+	m.responseBuffer.Reset()
+	if m.execEng != nil {
+		m.execEng.SetStreamContextFiles(m.attachedFiles)
+	}
+
+	// ── Clear previous state ──────────────────────────────────────
+	if m.buildLedger == nil {
+		m.buildLedger = ctxpkg.NewTaskLedger()
+	}
+	if m.toolCallBuffer != nil {
+		m.toolCallBuffer.Reset()
+	}
+	if m.thinkingPanel != nil {
+		m.thinkingPanel.Reset()
+	}
+	if m.liveCodePreview != nil {
+		m.liveCodePreview.Reset()
+	}
+
+	// ── EARLY BUDGET SCALING ──────────────────────────────────────
+	if m.mutationBudget != nil {
+		n := len(tasks)
+		if n > 0 {
+			m.mutationBudget.ScaleBudget(n)
+		}
+	}
+
+	// Bridge the live /plan task ledger into the execution engine.
+	m.execEng.Patches.SetLedger(m.buildLedger)
+	m.execEng.Patches.SetContextID(m.sess.ContextID)
+
+	// ── Build unified prompt from all task goals ──────────────────
+	// Combine plan goals into a SINGLE unified prompt that instructs
+	// the LLM to use native write_file / apply_patch tools for ALL
+	// file mutations at once. This bypasses the legacy per-task
+	// SEARCH/REPLACE diff parsing entirely.
+	var goals []string
+	for i, t := range tasks {
+		goals = append(goals, fmt.Sprintf("Task %d [%s]\nTarget file: %s\nDescription: %s", i+1, t.Type, t.Target, t.Description))
+	}
+	m.currentBuildTaskID = 0 // unified session, no single task tracking
+
+	unifiedPrompt := "Execute ALL of the following file operations in a single unified session.\n\n"
+	unifiedPrompt += "Use native write_file (for new files) and apply_patch (for existing files) tools ONLY.\n"
+	unifiedPrompt += "Do NOT output SEARCH/REPLACE blocks, unified diffs, or markdown code blocks.\n"
+	unifiedPrompt += "Do NOT include any conversational text, explanations, or summaries.\n"
+	unifiedPrompt += "Output ONLY native tool calls.\n\n"
+	unifiedPrompt += "## File Operations\n\n"
+	unifiedPrompt += strings.Join(goals, "\n\n---\n\n")
+
+	// ── Build context for each target file ────────────────────────
+	// Include current file contents for existing targets so the LLM
+	// can produce correct apply_patch operations in a single pass.
+	var fileContext strings.Builder
+	seen := make(map[string]bool)
+	for _, t := range tasks {
+		if seen[t.Target] {
+			continue
+		}
+		seen[t.Target] = true
+		if data, err := os.ReadFile(t.Target); err == nil {
+			ext := filepath.Ext(t.Target)
+			lang := strings.TrimPrefix(ext, ".")
+			if lang == "" {
+				lang = "text"
+			}
+			fmt.Fprintf(&fileContext, "## Current Content of: %s\n```%s\n%s\n```\n\n", t.Target, lang, string(data))
+		} else {
+			fmt.Fprintf(&fileContext, "## Target File: %s (does not yet exist)\n\n", t.Target)
+		}
+	}
+
+	fullPrompt := fileContext.String() + "\n" + unifiedPrompt
+
+	// ── Build system and request ──────────────────────────────────
+	uname := m.cfg.Username
+	if uname == "" {
+		uname = m.userName
+	}
+	systemPrompt := prompt.ForModeWithUser(m.resolver.Current().String(), uname)
+	if identityLine := prompt.IdentityStatement(uname); identityLine != "" {
+		// Inject identity before the user message
+		fullPrompt = identityLine + "\n\n" + fullPrompt
+	}
+
+	// Construct messages without repeating the plan JSON ledger
+	// to prevent 7B context drift from the model re-printing its own plan.
+	var msgs []ai.Message
+	if history := m.sess.History; len(history) > 0 {
+		for _, msg := range history {
+			raw := msg.Content
+			if r := plan.ParseJSONPlan(raw); r != nil && r.Valid && r.Plan != nil {
+				continue
+			}
+			msgs = append(msgs, ai.Message{Role: msg.Role, Content: raw})
+		}
+	}
+	msgs = append(msgs, ai.Message{Role: "user", Content: fullPrompt})
+
+	req := ai.Request{
+		Model:     m.cfg.ActiveModelName(),
+		Messages:  msgs,
+		Stream:    true,
+		System:    systemPrompt,
+		MaxTokens: 8192,
+		Tools:     ai.FileMutationTools(),
+	}
+
+	// ── REAL-TIME SSE STREAMING ──────────────────────────────────────
+	// Open a streaming connection and dispatch tokens to the TUI as they
+	// arrive. The Thinking Panel updates from token #1 and the LiveCodePreview
+	// reflects tool call arguments as they stream in. A deferred guarantee
+	// ensures the spinner always stops and the pipeline resets, even on
+	// truncation (finish_reason == "length") or provider error.
+	m.streamCh = make(chan tea.Msg, 1024)
+	// Capture locally so the goroutine never sends on m.streamCh after
+	// Update() clears it to nil (prevents send-on-nil-channel panic).
+	streamCh := m.streamCh
+
+	go func() {
+		// Recover from any panic in the stream goroutine so a bad token
+		// chunk or streaming error never kills the Bubble Tea loop.
+		defer func() {
+			if r := recover(); r != nil {
+				select {
+				case streamCh <- buildFailedMsg{Err: fmt.Errorf("stream panic: %v", r)}:
+				default:
+				}
+			}
+		}()
+
+		defer func() {
+			m.pipelineRunning = false
+			m.agentRunning = false
+			m.streaming = false
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+
+		rawStream, err := m.provider.ExecuteStream(ctx, req)
+		if err != nil {
+			select {
+			case streamCh <- buildFailedMsg{Err: fmt.Errorf("fast-track stream failed: %w", err)}:
+			default:
+			}
+			return
+		}
+		defer func() { _ = rawStream.Close() }()
+
+		var fullContent strings.Builder
+		var reasoningBuf strings.Builder
+		var toolCalls []ai.ToolCall
+		var buf strings.Builder
+		readBuf := make([]byte, 4096)
+
+		sentinelRSNG := "\x00RSNG\x00"
+		sentinelTCLL := "\x00TCLL\x00"
+
+		for {
+			n, err := rawStream.Read(readBuf)
+			if n > 0 {
+				buf.WriteString(string(readBuf[:n]))
+			}
+
+			// ── Extract reasoning tokens (real-time) ──
+			for {
+				idx := strings.Index(buf.String(), sentinelRSNG)
+				if idx < 0 {
+					break
+				}
+				rest := buf.String()[idx+len(sentinelRSNG):]
+				endIdx := strings.Index(rest, sentinelRSNG)
+				if endIdx < 0 {
+					break
+				}
+				reasoningChunk := rest[:endIdx]
+				reasoningBuf.WriteString(reasoningChunk)
+				select {
+				case streamCh <- thinkingStreamMsg{Content: reasoningChunk}:
+				default:
+				}
+				// Remove processed content from buf
+				remaining := buf.String()[:idx] + rest[endIdx+len(sentinelRSNG):]
+				buf.Reset()
+				buf.WriteString(remaining)
+			}
+
+			// ── Extract tool call deltas (real-time) ──
+			for {
+				idx := strings.Index(buf.String(), sentinelTCLL)
+				if idx < 0 {
+					break
+				}
+				rest := buf.String()[idx+len(sentinelTCLL):]
+				endIdx := strings.Index(rest, sentinelTCLL)
+				if endIdx < 0 {
+					break
+				}
+				tcJSON := rest[:endIdx]
+				var tcDelta struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				}
+				if jsonErr := json.Unmarshal([]byte(tcJSON), &tcDelta); jsonErr == nil && tcDelta.ID != "" {
+					toolCalls = append(toolCalls, ai.ToolCall{
+						ID:   tcDelta.ID,
+						Type: tcDelta.Type,
+						Function: ai.ToolCallFunction{
+							Name:      tcDelta.Function.Name,
+							Arguments: tcDelta.Function.Arguments,
+						},
+					})
+					select {
+					case streamCh <- livePreviewChunkMsg{Content: tcJSON, IsTool: true}:
+					default:
+					}
+				}
+				remaining := buf.String()[:idx] + rest[endIdx+len(sentinelTCLL):]
+				buf.Reset()
+				buf.WriteString(remaining)
+			}
+
+			// ── Content: send to live preview as it arrives ──
+			if buf.Len() > 0 {
+				contentChunk := buf.String()
+				fullContent.WriteString(contentChunk)
+				select {
+				case streamCh <- livePreviewChunkMsg{Content: contentChunk}:
+				default:
+				}
+				buf.Reset()
+			}
+
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				select {
+				case streamCh <- streamErrMsg{err: err}:
+				default:
+				}
+				return
+			}
+		}
+
+		// ── FINAL DISPATCH (guaranteed by defer above) ──
+		// Parse whatever was accumulated into patches. Handle truncation
+		// (finish_reason == "length") gracefully by recovering partial
+		// tool calls from the ToolCallBuffer.
+		var patches []*execution.Patch
+		if len(toolCalls) > 0 {
+			if m.toolCallBuffer != nil {
+				if bufErr := m.toolCallBuffer.BufferAll(toolCalls); bufErr != nil {
+					select {
+					case streamCh <- buildFailedMsg{Err: fmt.Errorf("fast-track tool call buffer: %w", bufErr)}:
+					default:
+					}
+					return
+				}
+				for _, tc := range m.toolCallBuffer.All() {
+					if m.liveCodePreview != nil {
+						m.liveCodePreview.AddOrUpdate(tc.Path, tc.Modified, tc.IsNew)
+					}
+				}
+				for _, tc := range m.toolCallBuffer.All() {
+					patches = append(patches, &execution.Patch{
+						ID:            tc.ID,
+						File:          tc.Path,
+						Original:      tc.Original,
+						Modified:      tc.Modified,
+						TaskID:        m.currentBuildTaskID,
+						IsFullRewrite: tc.IsNew,
+					})
+				}
+			}
+		}
+
+		finalOutput := fullContent.String()
+		// Include buffered reasoning in the output for proposal extraction
+		if reasoningBuf.Len() > 0 {
+			if finalOutput != "" {
+				finalOutput = reasoningBuf.String() + "\n" + finalOutput
+			} else {
+				finalOutput = reasoningBuf.String()
+			}
+		}
+
+		select {
+		case streamCh <- buildProposalReadyMsg{
+			Patches: patches,
+			Output:  finalOutput,
+		}:
+		default:
+		}
+	}()
+
+	return tea.Batch(m.readStream(), m.smoothStreamTickCmd())
 }
 
 // parsePendingTodo extracts the task type, target, and description from a
@@ -2414,7 +2810,9 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			}
 			// Feed live preview for each buffered call
 			for _, tc := range m.toolCallBuffer.All() {
-				m.liveCodePreview.AddOrUpdate(tc.Path, tc.Modified, tc.IsNew)
+				if m.liveCodePreview != nil {
+					m.liveCodePreview.AddOrUpdate(tc.Path, tc.Modified, tc.IsNew)
+				}
 			}
 			// Don't apply yet — stay in hotfix flow with pending buffer
 			// The main handler will transition to StateAwaitingApproval
@@ -2728,7 +3126,9 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				}
 				// Feed live preview for each buffered call
 				for _, tc := range m.toolCallBuffer.All() {
-					m.liveCodePreview.AddOrUpdate(tc.Path, tc.Modified, tc.IsNew)
+					if m.liveCodePreview != nil {
+						m.liveCodePreview.AddOrUpdate(tc.Path, tc.Modified, tc.IsNew)
+					}
 				}
 				// Return a special message indicating we're awaiting approval
 				return buildProposalReadyMsg{
