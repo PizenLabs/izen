@@ -569,7 +569,14 @@ type model struct {
 	reasoningBuffer strings.Builder
 	showReasoning   bool
 	streaming       bool
-	spinnerFrame    int
+	// pendingReasoningFragment holds an opened-but-not-yet-closed
+	// \x00RSNG\x00 reasoning block carried over between extraction passes.
+	// Without this, a sentinel pair split across two ticks (or a truncated
+	// SSE chunk) leaked its still-streaming reasoning text straight into
+	// the visible answer instead of staying buffered until the closing
+	// marker arrives. See extractSentinelReasoning.
+	pendingReasoningFragment string
+	spinnerFrame             int
 	// lastSpinnerAdvance throttles spinner-frame advancement inside the 20ms
 	// smoothStreamTickMsg loop to a ~100ms cadence, so the braille animation
 	// stays visually consistent with the 100ms tickMsg loop while token
@@ -1266,6 +1273,7 @@ func (m *model) resetStreamingState() {
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 	m.reasoningBuffer.Reset()
+	m.pendingReasoningFragment = ""
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
@@ -1296,6 +1304,7 @@ func (m *model) reconcileSpinner() {
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 	m.reasoningBuffer.Reset()
+	m.pendingReasoningFragment = ""
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
@@ -1308,13 +1317,29 @@ func (m *model) reconcileSpinner() {
 // reasoningBuffer and thinkingPanel, stripping it from the visible content buffer.
 //
 // Reasoning sentinels use zero-width markers: \x00RSNG\x00...reasoning...\x00RSNG\x00
+//
+// NOTE: this used to run two independent scans over the same buffer — one
+// (extractSentinelReasoningContent) to read reasoning text for the
+// thinkingPanel, and another (extractSentinelReasoning) to strip it and feed
+// reasoningBuffer. Because they scanned separately, an opening sentinel with
+// no closer yet (the common case: the closer just hasn't streamed in yet)
+// caused the stripping pass to give up and write the raw, still-open
+// reasoning fragment straight into the visible answer, while the read-only
+// pass correctly found nothing to show yet — so reasoning text would appear
+// in the response instead of the Thinking Panel. Both concerns are now
+// handled by a single pass (extractSentinelReasoning) that never emits an
+// unmatched fragment as visible text; it holds it in
+// m.pendingReasoningFragment until the closer arrives.
 func (m *model) extractReasoningContent() {
 	// 1. Extract provider-level reasoning sentinels from streamBuffer.
-	extracted := m.extractSentinelReasoningContent(m.streamBuffer)
-	if extracted != "" && m.thinkingPanel != nil {
-		m.thinkingPanel.Append(extracted)
+	clean, extracted := m.extractSentinelReasoning(m.streamBuffer)
+	m.streamBuffer = clean
+	if extracted != "" {
+		m.reasoningBuffer.WriteString(extracted)
+		if m.thinkingPanel != nil {
+			m.thinkingPanel.Append(extracted)
+		}
 	}
-	m.streamBuffer = m.extractSentinelReasoning(m.streamBuffer)
 	// 2. Extract inline  thinking tags from the already-rendered content.
 	thinkContent := m.extractThinkTagsContent(m.currentStreamContent)
 	if thinkContent != "" && m.thinkingPanel != nil {
@@ -1324,57 +1349,69 @@ func (m *model) extractReasoningContent() {
 }
 
 // extractSentinelReasoning scans raw for reasoning sentinel markers
-// (\x00RSNG\x00...\x00RSNG\x00) and moves the enclosed content into
-// the reasoningBuffer. Returns the cleaned text with markers removed.
-func (m *model) extractSentinelReasoning(raw string) string {
+// (\x00RSNG\x00...\x00RSNG\x00). It returns the cleaned visible text (with
+// completed reasoning blocks removed) and the reasoning text pulled from
+// those completed blocks.
+//
+// Any pending fragment left over from a previous call (an opening sentinel
+// whose closer hadn't arrived yet) is prepended before scanning. If, after
+// scanning, an opening sentinel still has no matching closer, it is NOT
+// flushed into the visible text — it's stashed back into
+// m.pendingReasoningFragment for the next call. This is what prevents
+// partially-streamed reasoning (or a reasoning chunk split across ticks by
+// the earlier SSE-reader truncation bug) from leaking into the answer.
+func (m *model) extractSentinelReasoning(raw string) (clean string, reasoning string) {
 	const sentinel = "\x00RSNG\x00"
-	if !strings.Contains(raw, sentinel) {
-		return raw
+	if m.pendingReasoningFragment != "" {
+		raw = m.pendingReasoningFragment + raw
+		m.pendingReasoningFragment = ""
 	}
-	var clean strings.Builder
+	if !strings.Contains(raw, sentinel) {
+		return raw, ""
+	}
+	var cleanBuf, reasonBuf strings.Builder
 	remaining := raw
 	for {
 		start := strings.Index(remaining, sentinel)
 		if start < 0 {
-			clean.WriteString(remaining)
+			cleanBuf.WriteString(remaining)
 			break
 		}
-		clean.WriteString(remaining[:start])
+		cleanBuf.WriteString(remaining[:start])
 		rest := remaining[start+len(sentinel):]
 		end := strings.Index(rest, sentinel)
 		if end < 0 {
-			clean.WriteString(rest)
+			// Incomplete pair — hold it back instead of dumping the
+			// in-flight reasoning text into visible content.
+			m.pendingReasoningFragment = sentinel + rest
 			break
 		}
-		m.reasoningBuffer.WriteString(rest[:end])
+		reasonBuf.WriteString(rest[:end])
 		remaining = rest[end+len(sentinel):]
 	}
-	return clean.String()
+	return cleanBuf.String(), reasonBuf.String()
 }
 
-// extractSentinelReasoningContent extracts reasoning content from sentinel
-// markers and returns it without modifying the original.
-func (m *model) extractSentinelReasoningContent(raw string) string {
+// flushPendingReasoningFragment is called once, at stream end, when nothing
+// more is coming. If a reasoning block was left open (its closing sentinel
+// never arrived — e.g. the provider truncated the stream), the fragment
+// would otherwise sit in m.pendingReasoningFragment forever. Rather than
+// silently dropping it or leaking the raw sentinel bytes into the answer,
+// surface the leftover text as reasoning content (stripped of the marker).
+func (m *model) flushPendingReasoningFragment() {
+	if m.pendingReasoningFragment == "" {
+		return
+	}
 	const sentinel = "\x00RSNG\x00"
-	if !strings.Contains(raw, sentinel) {
-		return ""
+	leftover := strings.TrimPrefix(m.pendingReasoningFragment, sentinel)
+	m.pendingReasoningFragment = ""
+	if leftover == "" {
+		return
 	}
-	var reasoning strings.Builder
-	remaining := raw
-	for {
-		start := strings.Index(remaining, sentinel)
-		if start < 0 {
-			break
-		}
-		rest := remaining[start+len(sentinel):]
-		end := strings.Index(rest, sentinel)
-		if end < 0 {
-			break
-		}
-		reasoning.WriteString(rest[:end])
-		remaining = rest[end+len(sentinel):]
+	m.reasoningBuffer.WriteString(leftover)
+	if m.thinkingPanel != nil {
+		m.thinkingPanel.Append(leftover)
 	}
-	return reasoning.String()
 }
 
 // extractThinkTagsContent extracts reasoning content from think tags

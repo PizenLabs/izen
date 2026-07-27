@@ -79,6 +79,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.spinnerFrame = 0
 	m.responseBuffer.Reset()
 	m.reasoningBuffer.Reset()
+	m.pendingReasoningFragment = ""
 	if m.thinkingPanel != nil {
 		m.thinkingPanel.Reset()
 	}

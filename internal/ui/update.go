@@ -761,6 +761,40 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		}
 		if len(props) == 0 {
+			// NOTE: msg.Task and msg.Patch are *pointers* that are only
+			// populated by the single-task producers of buildProposalReadyMsg
+			// (see the constructions in commands.go around runBuildTask /
+			// hybrid template patching). The fast-track streaming producer
+			// (the goroutine started from cmdFastTrackBuild) only ever sets
+			// Patches/Output — it has no single driving Task, because it can
+			// touch many files via native tool calls in one turn.
+			//
+			// This branch used to dereference msg.Task.Target and
+			// msg.Patch.ID unconditionally. Whenever the fast-track path
+			// produced neither native tool calls (so msg.Patches stayed
+			// empty above) nor a plain-text proposal that extractBuildProposals
+			// could parse, both msg.Task and msg.Patch were nil here and this
+			// panicked with a nil pointer dereference — freezing the whole
+			// TUI, since Update()'s recover() preserves the model but drops
+			// the in-flight command, so nothing ever re-reads the stream
+			// channel again. Fail soft instead: tell the user nothing could
+			// be extracted, and let them retry or fall back to /plan.
+			if msg.Task == nil || msg.Patch == nil {
+				// Fast-track builds (msg.Task==nil && msg.Patch==nil) that
+				// produced zero patches (e.g. provider without TCLL/RSNG
+				// sentinels — no OpenRouter) get no usable output. Fall back
+				// to per-task execution so the user can still build.
+				if msg.Task == nil && msg.Patch == nil && len(msg.Patches) == 0 && len(m.sess.CurrentTasks) > 0 {
+					m.push(roleStatus, "Fast-track produced no patches — switching to per-task execution.")
+					m.refreshViewportContent()
+					m.Viewport.GotoBottom()
+					return m, m.handleBuildRun(0)
+				}
+				m.push(roleError, "No patch proposal could be extracted from the model's response — nothing to apply. Try rephrasing the request, or use /plan for a structured retry.")
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, m.flushPendingRecords()
+			}
 			// Fallback: use the pre-computed diff and patch directly.
 			// Store the full Patch so applyProposalCmd can use the exact
 			// Modified content instead of the display Diff (which may lack
@@ -787,8 +821,20 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.ti.Blur()
 		m.recalcViewportHeight()
 		m.Viewport.Height = m.computeVpHeight()
-		m.push(roleStatus, fmt.Sprintf(
-			"Proposed patch to %s", msg.Task.Target))
+
+		// Human-readable status line. msg.Task is nil for the fast-track
+		// multi-file path, so don't assume it's populated — fall back to
+		// the single extracted proposal's target, or a file count.
+		statusTarget := "the proposed change"
+		switch {
+		case msg.Task != nil:
+			statusTarget = msg.Task.Target
+		case len(props) == 1:
+			statusTarget = props[0].Target.QualifiedName
+		case len(props) > 1:
+			statusTarget = fmt.Sprintf("%d files", len(props))
+		}
+		m.push(roleStatus, fmt.Sprintf("Proposed patch to %s", statusTarget))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m, nil
@@ -1620,8 +1666,20 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// the downstream JSON parser or render pipeline. Lines matching
 		// telemetry/error markers are removed from leading/trailing context.
 		final = sanitizeFinalContent(final)
-		// Strip any remaining reasoning sentinels from final content
-		final = m.extractSentinelReasoning(final)
+		// Strip any remaining reasoning sentinels from final content.
+		var finalReasoning string
+		final, finalReasoning = m.extractSentinelReasoning(final)
+		if finalReasoning != "" {
+			m.reasoningBuffer.WriteString(finalReasoning)
+			if m.thinkingPanel != nil {
+				m.thinkingPanel.Append(finalReasoning)
+			}
+		}
+		// The stream is genuinely done now — nothing more will ever close
+		// an opening sentinel that's still pending. Surface it rather than
+		// leaving it stranded (or, as before the fix, leaking it into the
+		// next turn's content).
+		m.flushPendingReasoningFragment()
 
 		// Append the completed turn to PreRenderedHistory and freeze state.
 		m.push(roleAI, final)

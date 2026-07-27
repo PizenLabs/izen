@@ -2298,6 +2298,32 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		sentinelRSNG := "\x00RSNG\x00"
 		sentinelTCLL := "\x00TCLL\x00"
 
+		// flushSafeContent returns the portion of buf that is safe to treat
+		// as final visible content — i.e. it cannot be, or be the start of,
+		// a \x00RSNG\x00 or \x00TCLL\x00 sentinel that just hasn't fully
+		// arrived yet — and leaves the remaining tail buffered for the next
+		// read. Model output doesn't legitimately contain raw NUL bytes, so
+		// holding back everything from the last NUL onward never withholds
+		// real content; it only ever withholds an in-flight or malformed
+		// marker. At true stream end (atEOF) nothing more will ever arrive
+		// to complete a pending marker, so the whole buffer is released.
+		flushSafeContent := func(buf *strings.Builder, atEOF bool) string {
+			s := buf.String()
+			if atEOF || s == "" {
+				buf.Reset()
+				return s
+			}
+			if lastNul := strings.LastIndexByte(s, 0x00); lastNul >= 0 {
+				safe := s[:lastNul]
+				tail := s[lastNul:]
+				buf.Reset()
+				buf.WriteString(tail)
+				return safe
+			}
+			buf.Reset()
+			return s
+		}
+
 		for {
 			n, err := rawStream.Read(readBuf)
 			if n > 0 {
@@ -2367,14 +2393,28 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			}
 
 			// ── Content: send to live preview as it arrives ──
-			if buf.Len() > 0 {
-				contentChunk := buf.String()
-				fullContent.WriteString(contentChunk)
+			//
+			// This used to flush the entire remaining buf unconditionally,
+			// every iteration. That's wrong whenever buf still holds an
+			// opened-but-not-yet-closed \x00RSNG\x00/\x00TCLL\x00 marker —
+			// e.g. the closing half of a sentinel pair hadn't streamed in
+			// yet, or (before the openrouter.go Read() fix) a large chunk
+			// got truncated mid-marker. In both cases the still-in-flight
+			// reasoning/tool-call bytes, sentinel included, were dumped
+			// straight into fullContent and shown as if they were the
+			// model's answer — exactly the "thinking bleeding into the
+			// response" symptom.
+			//
+			// flushSafeContent only releases the portion of buf that can't
+			// possibly be the start of a marker still arriving, holding the
+			// rest back until either its pair completes (handled by the two
+			// loops above) or the stream truly ends (atEOF, below).
+			if content := flushSafeContent(&buf, err == io.EOF); content != "" {
+				fullContent.WriteString(content)
 				select {
-				case streamCh <- livePreviewChunkMsg{Content: contentChunk}:
+				case streamCh <- livePreviewChunkMsg{Content: content}:
 				default:
 				}
-				buf.Reset()
 			}
 
 			if err == io.EOF {
