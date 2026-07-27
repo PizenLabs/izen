@@ -223,6 +223,48 @@ var (
 			BorderForeground(lipgloss.Color(colorOrange)).
 			Foreground(lipgloss.Color(colorYellow)).
 			Padding(0, 1)
+
+	// ── Build Mutation Summary Box ──────────────────────────────
+	// Clean styled box with border highlights for BUILD MUTATION SUMMARY
+	// and other system summary output rendered through the TUI style layer.
+	buildSummaryBoxStyle = lipgloss.NewStyle().
+				Border(lipgloss.NormalBorder()).
+				BorderForeground(lipgloss.Color(colorBlue)).
+				BorderTop(false).
+				BorderBottom(false).
+				BorderLeft(false).
+				BorderRight(false).
+				Padding(0, 1)
+	buildSummaryTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color(colorBlue)).
+				PaddingLeft(1)
+
+	// ── Status Badge Styles ─────────────────────────────────────
+	// Rendered inline within system summary text to replace raw
+	// Markdown bold/asterisk syntax with clean colored TUI badges.
+	badgeOKStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreen)).Background(lipgloss.Color(colorSurface))
+	badgeFailStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed)).Background(lipgloss.Color(colorSurface))
+
+	// ── Thought Log Box Style ───────────────────────────────────
+	// Bordered container for expanded LLM reasoning content.
+	thoughtLogBoxStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color(colorMauve)).
+				Padding(0, 1)
+	thoughtLogTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color(colorMauve))
+
+	// ── System Log Box Style ────────────────────────────────────
+	// Bordered container for raw system execution log output.
+	systemLogBoxStyle = lipgloss.NewStyle().
+				Border(lipgloss.NormalBorder()).
+				BorderForeground(lipgloss.Color(colorDimmed)).
+				Padding(0, 1)
+	systemLogTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color(colorDimmed))
 )
 
 func renderHotkeyPromptWithToggle(width int) string {

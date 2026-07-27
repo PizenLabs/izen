@@ -1109,22 +1109,33 @@ func renderTitledTopBorder(totalWidth int, label string) string {
 }
 
 // styleActivityLine renders a system activity log line with mixed
-// styles: base text in muted faint-gray, [ OK ] and [FAIL] status
-// tags highlighted in pastel green/red for immediate scanability.
+// styling. Status badges ([ OK ], [FAIL]) are colorized, and any
+// remaining Markdown syntax (bold **...**, bullets - ...) in the
+// text body is stripped and re-rendered through the deterministic
+// TUI markdown pipeline so the viewport never shows raw asterisks
+// or dashes from the LLM's system summary.
 func (m *model) styleActivityLine(line string) string {
 	okTag := "[ OK ]"
 	failTag := "[FAIL]"
 	if idx := strings.Index(line, okTag); idx >= 0 {
 		pre := systemActivityStyle.Render(line[:idx])
-		tag := greenStyle.Render(okTag)
+		tag := badgeOKStyle.Render(okTag)
 		suf := systemActivityStyle.Render(line[idx+len(okTag):])
 		return pre + tag + suf
 	}
 	if idx := strings.Index(line, failTag); idx >= 0 {
 		pre := systemActivityStyle.Render(line[:idx])
-		tag := redStyle.Render(failTag)
+		tag := badgeFailStyle.Render(failTag)
 		suf := systemActivityStyle.Render(line[idx+len(failTag):])
 		return pre + tag + suf
+	}
+	// Pass the line through the deterministic TUI markdown renderer
+	// so that raw asterisks, bullet dashes, and other Markdown
+	// syntax are converted to styled TUI output instead of leaking
+	// as plain text.
+	rendered := RenderDeterministicPipeline(line, m.width, false)
+	if rendered != "" && rendered != line {
+		return rendered
 	}
 	return systemActivityStyle.Render(line)
 }

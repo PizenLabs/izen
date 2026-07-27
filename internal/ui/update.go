@@ -1394,7 +1394,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				m.createBuildCheckpoint(1)
 
 				// Log foldable entry for the file mutation.
-				m.logStore.Add(LogEdit, msg.file, true, msg.status)
+				// Capture the current thinking-panel content so it persists
+				// in the entry even during Per-Task Fallback mode.
+				thinkingContent := ""
+				if m.thinkingPanel != nil {
+					thinkingContent = m.thinkingPanel.String()
+				}
+				m.logStore.AddFull(LogEdit, msg.file, true, msg.status, thinkingContent, "")
 				// ── ADVANCE BUILD QUEUE ────────────────────────────────
 				// After a FILE_MUTATE/GIT_ACTION task completes, check for
 				// the next idle task and execute it.
@@ -1420,7 +1426,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				}
 			} else {
 				m.push(roleSystem, failureBannerStyle.Render("[✗] "+msg.file+" — "+msg.err.Error()))
-				m.logStore.Add(LogEdit, msg.file, false, msg.err.Error())
+				thinkingContent := ""
+				if m.thinkingPanel != nil {
+					thinkingContent = m.thinkingPanel.String()
+				}
+				m.logStore.AddFull(LogEdit, msg.file, false, msg.err.Error(), thinkingContent, "")
 			}
 		} else {
 			m.state = StateAwaitingApproval
@@ -1439,7 +1449,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		for _, r := range msg.results {
 			if r.err != nil {
 				m.setApplyError("apply failed: " + r.err.Error())
-				m.logStore.Add(LogEdit, r.file, false, r.err.Error())
+				thinkingContent := ""
+				if m.thinkingPanel != nil {
+					thinkingContent = m.thinkingPanel.String()
+				}
+				m.logStore.AddFull(LogEdit, r.file, false, r.err.Error(), thinkingContent, "")
 				failed++
 				continue
 			}
@@ -1447,7 +1461,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				Target: r.file,
 				Status: r.status,
 			})
-			m.logStore.Add(LogEdit, r.file, true, r.status)
+			thinkingContent := ""
+			if m.thinkingPanel != nil {
+				thinkingContent = m.thinkingPanel.String()
+			}
+			m.logStore.AddFull(LogEdit, r.file, true, r.status, thinkingContent, "")
 			applied++
 		}
 		m.pendingProposals = nil

@@ -577,6 +577,9 @@ type model struct {
 	// marker arrives. See extractSentinelReasoning.
 	pendingReasoningFragment string
 	spinnerFrame             int
+	// dotFrame advances each viewport refresh to drive the animated
+	// truncation-dots counter in execution log entries (1 → 2 → 3 → 1…).
+	dotFrame int
 	// lastSpinnerAdvance throttles spinner-frame advancement inside the 20ms
 	// smoothStreamTickMsg loop to a ~100ms cadence, so the braille animation
 	// stays visually consistent with the 100ms tickMsg loop while token
@@ -1520,6 +1523,7 @@ func (m *model) refreshViewportContent() {
 	if !m.Ready {
 		return
 	}
+	m.dotFrame = (m.dotFrame + 1) % 3
 
 	var content strings.Builder
 
@@ -1551,7 +1555,7 @@ func (m *model) refreshViewportContent() {
 			content.WriteString(dimmedStyle.Render("── Execution Log ──"))
 			content.WriteString("\n")
 			for _, entry := range entries {
-				rendered := RenderEntry(entry, m.width)
+				rendered := RenderEntry(entry, m.width, m.dotFrame)
 				content.WriteString(rendered)
 				content.WriteString("\n")
 			}

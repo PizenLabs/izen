@@ -25,13 +25,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// ── GLOBAL: Ctrl+O toggles the most recent foldable log entry ──
+	// ── GLOBAL: Ctrl+O cycles through all foldable log entries ──
+	// Each press expands the next entry, collapsing the previous one.
+	// When no entry is expanded, the first entry is expanded.
+	// Pressing Ctrl+O again cycles to the next entry.
 	if msg.Type == tea.KeyCtrlO {
 		if m.logStore != nil {
-			entries := m.logStore.Entries()
-			if len(entries) > 0 {
-				last := entries[len(entries)-1]
-				m.logStore.Toggle(last.ID)
+			newID := m.logStore.ToggleCycle()
+			if newID >= 0 {
 				m.refreshViewportContent()
 				if m.Ready && !m.userIsScrollingUp {
 					m.Viewport.GotoBottom()
