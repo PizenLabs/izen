@@ -19,6 +19,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/prompt"
+	"github.com/PizenLabs/izen/internal/workspace"
 )
 
 // debugLogPayload writes the exact outgoing LLM payload to
@@ -126,6 +127,17 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// concatenation of rendered history + status bar + prompt prefix.
 	msgs = append(msgs, ai.Message{Role: "user", Content: content})
 
+	// ── AUTOMATIC FILE CONTEXT INJECTION ──────────────────────
+	// When a workspace is detected, scan for relevant files and
+	// inject their paths + contents into the user message so the
+	// model always knows which files exist instead of asking.
+	if m.workspaceRoot != "" {
+		augmented := injectFileContext(m.workspaceRoot, content, msgs[len(msgs)-1].Content)
+		if augmented != "" {
+			msgs[len(msgs)-1].Content = augmented
+		}
+	}
+
 	uname := m.cfg.Username
 	if uname == "" {
 		uname = m.userName
@@ -225,13 +237,26 @@ func (m *model) streamCmd(content string) tea.Cmd {
 				return
 			}
 			if err != nil {
-				streamCh <- streamErrMsg{err: err}
+				streamCh <- streamErrMsg{err: err, content: full.String()}
 				return
 			}
 		}
 	}()
 
 	return tea.Batch(m.readStream(), m.spinnerTickCmd())
+}
+
+func injectFileContext(workspaceRoot, prompt, userContent string) string {
+	resolver := workspace.NewTargetFileResolver(workspaceRoot)
+	target := resolver.Resolve(prompt)
+	if target == "" {
+		return userContent
+	}
+	data, err := os.ReadFile(filepath.Join(workspaceRoot, target))
+	if err != nil {
+		return userContent
+	}
+	return userContent + "\n\n## Workspace File: " + target + "\n```\n" + string(data) + "\n```"
 }
 
 func (m *model) readStream() tea.Cmd {

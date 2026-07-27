@@ -2119,6 +2119,20 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		} else {
 			m.push(roleError, "stream error: "+msg.err.Error())
 		}
+
+		// ALWAYS flush partial stream tokens to the TUI so that tokens
+		// already received on the wire are never discarded when a
+		// mid-stream connection error or unexpected termination occurs.
+		if msg.content != "" {
+			if m.streamTickActive {
+				m.currentStreamContent += m.streamBuffer
+				m.streamBuffer = ""
+				m.streamTickActive = false
+			}
+			m.streamBuffer = msg.content
+			m.currentStreamContent = msg.content
+			m.extractReasoningContent()
+		}
 		m.refreshViewportContent()
 		flush := m.flushPendingRecords()
 		return m, flush

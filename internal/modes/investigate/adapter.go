@@ -2,7 +2,9 @@ package investigate
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -106,6 +108,16 @@ func NewShellTestExecutor(root string) *ShellTestExecutor {
 }
 
 func (e *ShellTestExecutor) run(ctx context.Context, args ...string) (*TestResultSummary, error) {
+	if len(args) > 0 && args[0] == "test" {
+		if _, err := os.Stat(filepath.Join(e.root, "go.mod")); os.IsNotExist(err) {
+			return &TestResultSummary{
+				Output:  "go.mod not found — skipping go test (non-Go workspace or unsupported module system)",
+				Passed:  true,
+				Total:   0,
+				Skipped: 1,
+			}, nil
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 

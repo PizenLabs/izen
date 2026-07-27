@@ -2425,7 +2425,7 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			}
 			if err != nil {
 				select {
-				case streamCh <- streamErrMsg{err: err}:
+				case streamCh <- streamErrMsg{err: err, content: fullContent.String()}:
 				default:
 				}
 				return

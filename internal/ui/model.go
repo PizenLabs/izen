@@ -90,7 +90,10 @@ type traceUpdateMsg struct {
 	trace *ctxpkg.CodebaseTrace
 }
 
-type streamErrMsg struct{ err error }
+type streamErrMsg struct {
+	err     error
+	content string
+}
 
 type PlanStreamingFinishedMsg struct {
 	Success bool
