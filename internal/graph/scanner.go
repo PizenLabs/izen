@@ -40,6 +40,7 @@ type FileInfo struct {
 	Lang  Language
 	Size  int64
 	Lines int
+	Mtime int64
 }
 
 func Scan(cfg ScanConfig) (*ScanResult, error) {
@@ -92,10 +93,11 @@ func Scan(cfg ScanConfig) (*ScanResult, error) {
 		}
 
 		result.Files = append(result.Files, FileInfo{
-			Path: rel,
-			Ext:  ext,
-			Lang: lang,
-			Size: info.Size(),
+			Path:  rel,
+			Ext:   ext,
+			Lang:  lang,
+			Size:  info.Size(),
+			Mtime: info.ModTime().Unix(),
 		})
 
 		return nil

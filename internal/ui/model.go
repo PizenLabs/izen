@@ -218,6 +218,10 @@ type graphBuiltMsg struct {
 	err   error
 }
 
+type graphIndexingMsg struct {
+	indexing bool
+}
+
 func buildGraphCmd(eng *graph.Engine) tea.Cmd {
 	return func() tea.Msg {
 		g, _, err := eng.BuildOrLoad()
@@ -878,6 +882,14 @@ type model struct {
 
 	// Workspace root path for config/session persistence
 	workspaceRoot string
+
+	// pendingArchArgs stores /arch arguments while indexing is in
+	// progress. When indexing completes, the arch view renders
+	// automatically using these args.
+	pendingArchArgs string
+
+	// indexingStatus tracks background graph indexing state.
+	indexingStatus string // "" | "indexing" | "indexed" | "error"
 
 	// viewRegistry resolves the current mode to its ViewMode builder. It is
 	// injected at bootstrap (explicit, deterministic) and never mutated by

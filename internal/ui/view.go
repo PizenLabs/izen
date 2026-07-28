@@ -118,8 +118,8 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 		borderColor = viBorderStyle
 	}
 
-	// ── Fixed Header: WorkflowState + CapabilitySet ──
-	headerView := renderFixedHeader(m.runtimeCtx, m.workflowSM, width)
+	// ── Fixed Header: WorkflowState + CapabilitySet + indexing ──
+	headerView := renderFixedHeader(m.runtimeCtx, m.workflowSM, width, m.indexingStatus)
 	headerLines := strings.Count(headerView, "\n") + 1
 
 	// ── Fixed Footer: Budget counters + notifications ──

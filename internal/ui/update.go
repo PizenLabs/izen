@@ -170,7 +170,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// type switch below. Without this, gitInitResultMsg gets swallowed
 		// and the init stage never advances after pressing 'Y'.
 		switch msg.(type) {
-		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg:
+		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg, graphIndexingMsg:
 			// fall through to main type switch
 		default:
 			return m, nil
@@ -514,13 +514,45 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case graphBuiltMsg:
 		m.agentRunning = false
 		m.sanitizeInputPrompt()
-		if msg.err == nil && msg.graph != nil {
+		if msg.err != nil {
+			m.push(roleError, "graph indexing failed: "+msg.err.Error())
+			m.indexingStatus = "error"
+			m.pendingArchArgs = ""
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+		if msg.graph != nil {
 			m.graph = msg.graph
+		}
+		m.indexingStatus = "indexed"
+		// Auto-render pending /arch view if user invoked it
+		// while indexing was still in progress.
+		if m.pendingArchArgs != "" && m.graph != nil {
+			args := m.pendingArchArgs
+			m.pendingArchArgs = ""
+			graphText := m.renderArch(args)
+			m.push(roleSystem, infoStyle.Render(args))
+			m.refreshViewportContent()
+			m.push(roleSystem, graphText)
+			m.Viewport.GotoBottom()
+		} else {
+			m.pendingArchArgs = ""
 		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
 		return m, flush
+
+	case graphIndexingMsg:
+		if msg.indexing {
+			m.indexingStatus = "indexing"
+		} else if m.indexingStatus != "indexed" {
+			m.indexingStatus = "indexed"
+		}
+		m.refreshViewportContent()
+		return m, nil
 
 	case reviewResultMsg:
 		m.agentRunning = false

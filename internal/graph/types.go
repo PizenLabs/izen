@@ -105,6 +105,7 @@ type FileNode struct {
 	Package  string   `json:"package,omitempty"`
 	Size     int64    `json:"size"`
 	Lines    int      `json:"lines"`
+	Mtime    int64    `json:"mtime"`
 }
 
 type Graph struct {

@@ -64,6 +64,7 @@ func (p *Parser) ParseFile(root, relPath string, lang Language) (*FileNode, erro
 		Language: lang,
 		Size:     info.Size(),
 		Lines:    lines + 1,
+		Mtime:    info.ModTime().Unix(),
 	}
 
 	parser, ok := p.parsers[lang]

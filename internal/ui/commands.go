@@ -1710,6 +1710,12 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	case strings.HasPrefix(cmd, "/arch"):
 		m.showBanner = false
 		args := strings.TrimSpace(strings.TrimPrefix(cmd, "/arch"))
+		if m.indexingStatus == "indexing" {
+			m.pendingArchArgs = args
+			m.push(roleSystem, infoStyle.Render("[⠋] Mapping codebase structure... (indexing in progress)"))
+			m.refreshViewportContent()
+			return m.spinnerTickCmd()
+		}
 		m.push(roleSystem, "Mapping codebase...")
 		m.refreshViewportContent()
 		return func() tea.Msg {
