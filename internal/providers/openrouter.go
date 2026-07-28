@@ -249,6 +249,8 @@ func (p *OpenRouterProvider) buildMessages(req ai.Request) []openrouterMessage {
 //  2. Merge consecutive messages with the same role by joining with "\n".
 //  3. Strip leading assistant messages (no response without a prior user prompt).
 //  4. Ensure the final message is not a system message (remove trailing system messages).
+//  5. Sliding window: keep at most the last 30 messages to prevent unbounded
+//     token growth across long sessions.
 func cleanMessages(msgs []openrouterMessage) []openrouterMessage {
 	// Step 1: drop empty content.
 	filtered := msgs[:0]
@@ -276,9 +278,24 @@ func cleanMessages(msgs []openrouterMessage) []openrouterMessage {
 		msgs = msgs[1:]
 	}
 
-	// Step 4: strip trailing system messages.
-	for len(msgs) > 0 && msgs[len(msgs)-1].Role == "system" {
+	// Step 4: strip trailing system messages, but preserve at least one
+	// message (the head system prompt at index 0) so the IZEN identity and
+	// user name context is never dropped.
+	for len(msgs) > 1 && msgs[len(msgs)-1].Role == "system" {
 		msgs = msgs[:len(msgs)-1]
+	}
+
+	// Step 5: sliding window truncation.
+	// Keep system + user + assistant messages bounded so the payload never
+	// explodes across long sessions. Preserve system message at index 0.
+	const maxMessages = 30
+	if len(msgs) > maxMessages {
+		head := 1
+		tail := msgs[head:]
+		if len(tail) > maxMessages {
+			tail = tail[len(tail)-maxMessages:]
+		}
+		msgs = append(msgs[:head], tail...)
 	}
 
 	return msgs

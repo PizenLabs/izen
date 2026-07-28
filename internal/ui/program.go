@@ -1,8 +1,10 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strings"
@@ -42,6 +44,9 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	if len(det) > 0 {
 		detection = det[0]
 	}
+
+	userName := resolveUsername(root, localCfg)
+
 	eng := git.NewEngine(root)
 
 	var provider ai.Provider
@@ -58,6 +63,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 
 	planStore := plan.NewPlanStore()
 	planEng := plan.NewEngine(planStore)
+	planEng.SetUserName(userName)
 	if provider != nil {
 		planEng.SetProvider(provider.Execute)
 	}
@@ -69,21 +75,6 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 
 	execEng := execution.NewEngine(root, cfg, sess, detectedLang)
 	execEng.SetPlanStore(planStore)
-
-	userName := "developer"
-	if localCfg != nil && localCfg.Username != "" {
-		userName = localCfg.Username
-	} else {
-		u := os.Getenv("USER")
-		if u == "" {
-			if currentUser, err := user.Current(); err == nil && currentUser.Username != "" {
-				u = currentUser.Username
-			}
-		}
-		if u != "" {
-			userName = u
-		}
-	}
 
 	// ── STRICT LOCAL-FIRST ONBOARDING DETECTOR ────────────────────────
 	// The init gate MUST be driven exclusively by the CURRENT local repo.
@@ -278,6 +269,51 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	investigate.SetDispatchLog(activityFn)
 
 	return tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+}
+
+// resolveUsername resolves the user's display name with the following
+// precedence:
+//  1. Local config (.izen/config.json or TUI init state).
+//  2. Git user name (git config user.name).
+//  3. Environment variable ($USER).
+//  4. OS user lookup (os/user.Current).
+//  5. Fallback to "developer".
+func resolveUsername(root string, localCfg *config.LocalConfig) string {
+	if localCfg != nil && localCfg.Username != "" {
+		return localCfg.Username
+	}
+
+	gitName := gitUsername(root)
+	if gitName != "" {
+		return gitName
+	}
+
+	u := os.Getenv("USER")
+	if u != "" {
+		return u
+	}
+
+	if currentUser, err := user.Current(); err == nil && currentUser.Username != "" {
+		return currentUser.Username
+	}
+
+	return "developer"
+}
+
+func gitUsername(root string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "config", "user.name")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	val := strings.TrimSpace(string(out))
+	if val != "" {
+		return val
+	}
+	return ""
 }
 
 func bootCommon(root string, cfg *config.Config) (*session.Session, *ai.Manager, *lynx.Controller) {

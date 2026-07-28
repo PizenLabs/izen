@@ -175,7 +175,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 		m.push(roleSystem, "$ "+shellCmd)
 		out, err := execShell(shellCmd)
 		if err != nil {
-			m.push(roleError, err.Error())
+			m.push(roleError, providers.SanitizeAPIError(err))
 		}
 		scanner := bufio.NewScanner(strings.NewReader(strings.TrimRight(out, "\r\n")))
 		for scanner.Scan() {
@@ -2217,15 +2217,7 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 	fullPrompt := fileContext.String() + "\n" + unifiedPrompt
 
 	// ── Build system and request ──────────────────────────────────
-	uname := m.cfg.Username
-	if uname == "" {
-		uname = m.userName
-	}
-	systemPrompt := prompt.ForModeWithUser(m.resolver.Current().String(), uname)
-	if identityLine := prompt.IdentityStatement(uname); identityLine != "" {
-		// Inject identity before the user message
-		fullPrompt = identityLine + "\n\n" + fullPrompt
-	}
+	systemPrompt := prompt.ForModeWithUser(m.resolver.Current().String(), m.userName)
 
 	// Construct messages without repeating the plan JSON ledger
 	// to prevent 7B context drift from the model re-printing its own plan.
@@ -2239,7 +2231,22 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			msgs = append(msgs, ai.Message{Role: msg.Role, Content: raw})
 		}
 	}
+
+	// ── SLIDING WINDOW TRUNCATION ──────────────────────────────────
+	// Keep at most the last 20 history entries (≈10 exchanges) to
+	// prevent unbounded token growth.
+	const maxHistoryMessages = 20
+	if len(msgs) > maxHistoryMessages {
+		msgs = msgs[len(msgs)-maxHistoryMessages:]
+	}
+
 	msgs = append(msgs, ai.Message{Role: "user", Content: fullPrompt})
+
+	if len(msgs) > 0 && msgs[0].Role == "system" {
+		msgs[0].Content = systemPrompt
+	} else {
+		msgs = append([]ai.Message{{Role: "system", Content: systemPrompt}}, msgs...)
+	}
 
 	req := ai.Request{
 		Model:     m.cfg.ActiveModelName(),
@@ -4691,7 +4698,7 @@ func (m *model) handleLogInput(msg logInputMsg) tea.Cmd {
 		m.pipelineRunning = false
 		m.reviewRunning = false
 		m.agentRunning = false
-		m.push(roleError, "$log: execution error: "+msg.err.Error())
+		m.push(roleError, "$log: execution error: "+providers.SanitizeAPIError(msg.err))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m.flushPendingRecords()
@@ -4713,7 +4720,7 @@ func (m *model) handleInvestigateComplete(msg investigateCompleteMsg) tea.Cmd {
 		m.pipelineRunning = false
 		m.reviewRunning = false
 		m.agentRunning = false
-		m.push(roleError, "fix pipeline: analysis failed: "+msg.err.Error())
+		m.push(roleError, "fix pipeline: analysis failed: "+providers.SanitizeAPIError(msg.err))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m.flushPendingRecords()
@@ -4737,7 +4744,7 @@ func (m *model) handleBlueprintReady(msg blueprintReadyMsg) tea.Cmd {
 	if msg.err != nil {
 		m.reviewRunning = false
 		m.agentRunning = false
-		m.push(roleError, "fix pipeline: blueprint error: "+msg.err.Error())
+		m.push(roleError, "fix pipeline: blueprint error: "+providers.SanitizeAPIError(msg.err))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m.flushPendingRecords()

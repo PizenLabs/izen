@@ -20,6 +20,7 @@ type Engine struct {
 	store    *PlanStore
 	parser   func(string) []Task
 	provider ProviderFunc
+	UserName string // collaborating engineer identity, injected into system prompts
 }
 
 // NewEngine creates a new Engine instance with the provided components.
@@ -31,6 +32,9 @@ func NewEngine(store *PlanStore) *Engine {
 		provider: nil,
 	}
 }
+
+// SetUserName sets the engineer identity for system prompt injection.
+func (e *Engine) SetUserName(name string) { e.UserName = name }
 
 // parsePlanContent enforces strict JSON schema with recovery.
 // Phase 3: If JSON parsing fails, it attempts auto-repair via autoCloseJSON
@@ -278,7 +282,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			Messages: []ai.Message{
 				{
 					Role:    "system",
-					Content: prompt.PlanSystemPrompt(),
+					Content: prompt.PlanSystemPrompt(e.UserName),
 				},
 				{
 					Role:    "user",
@@ -300,7 +304,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		// system prompt that skips all analysis entirely.
 		isDirectMut := detectDirectMutation(problem, ledgerContent) != nil
 		hasHighFlag := strings.Contains(problem, "--high") || strings.Contains(problem, "/intent high")
-		systemPrompt := prompt.SelectPlanSystemPrompt(problem, hasHighFlag) + "\n\n" + SchemaJSONInstruction()
+		systemPrompt := prompt.SelectPlanSystemPrompt(problem, hasHighFlag, e.UserName) + "\n\n" + SchemaJSONInstruction()
 		if isDirectMut {
 			systemPrompt = prompt.PlanDirectMutationSystemPrompt()
 		}
@@ -1049,7 +1053,7 @@ func (e *Engine) ProcessPlan(ctx context.Context, modelName string, objective st
 		Messages: []ai.Message{
 			{
 				Role:    "system",
-				Content: prompt.SelectPlanSystemPrompt(objective, hasHighFlag) + "\n\n" + SchemaJSONInstruction(),
+				Content: prompt.SelectPlanSystemPrompt(objective, hasHighFlag, e.UserName) + "\n\n" + SchemaJSONInstruction(),
 			},
 			{
 				Role:    "user",

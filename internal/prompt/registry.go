@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
-
-	"github.com/PizenLabs/izen/internal/config"
 )
 
 // RuntimeFacts are externally supplied facts about the runtime environment.
@@ -21,32 +19,24 @@ type RuntimeFacts struct {
 	HostOS string
 }
 
-// identityHeader returns the single, canonical engineer-identity statement.
-// Called once per Compose invocation — never duplicated in individual contracts.
-func identityHeader(username string) string {
-	return fmt.Sprintf(
-		"You are IZEN. The engineer collaborating with you is '%s'. "+
-			"This is an invariant fact for the entire session: "+
-			"NEVER say you don't know their name, ask them for it, or claim it wasn't provided. "+
-			"When asked, identify them as '%s'.\n\n",
-		username, username,
-	)
-}
-
 // Compose assembles the full system prompt:
 //
-//	Identity Header → Common Contract → Mode Contract → Environment Context (optional)
+//	Identity Header → Public Handle Context → Common Contract → Mode Contract → Environment Context (optional)
 //
 // Each section lives in exactly one place; nothing is duplicated.
 func Compose(modeContract string, facts RuntimeFacts) string {
 	var b strings.Builder
 
-	username := config.SanitizeUsername(facts.Username)
-	if username == "" {
-		username = "Developer"
+	b.WriteString("You are IZEN, a fast CLI coding companion.\n\n")
+
+	// Public Handle context — safe identity injection for natural LLM rapport.
+	if facts.Username != "" {
+		b.WriteString("Active CLI Workspace Context:\n")
+		fmt.Fprintf(&b, "- Developer Handle: %s (public session handle)\n\n", facts.Username)
+		b.WriteString("Instructions:\n")
+		fmt.Fprintf(&b, "In your responses and explanations, feel free to naturally address the developer by their handle (%s) when appropriate to keep the dialogue friendly and personal.\n\n", facts.Username)
 	}
 
-	b.WriteString(identityHeader(username))
 	b.WriteString(CommonContract())
 	b.WriteString("\n\n")
 	b.WriteString(modeContract)
@@ -68,19 +58,28 @@ func AskSystemPrompt(username string) string {
 }
 
 // BuildSystemPrompt returns the composed system prompt for build mode.
-func BuildSystemPrompt() string {
-	return Compose(BuildContract(), RuntimeFacts{HostOS: runtime.GOOS})
+func BuildSystemPrompt(username string) string {
+	if username == "" {
+		username = "Developer"
+	}
+	return Compose(BuildContract(), RuntimeFacts{Username: username, HostOS: runtime.GOOS})
 }
 
 // PlanSystemPrompt returns the composed system prompt for plan mode.
-func PlanSystemPrompt() string {
-	return Compose(PlanContract(), RuntimeFacts{HostOS: runtime.GOOS})
+func PlanSystemPrompt(username string) string {
+	if username == "" {
+		username = "Developer"
+	}
+	return Compose(PlanContract(), RuntimeFacts{Username: username, HostOS: runtime.GOOS})
 }
 
 // CompactPlanSystemPrompt returns the compact 3-bullet checklist prompt for
 // LOW and MEDIUM complexity tasks. Omits verbose plan prose.
-func CompactPlanSystemPrompt() string {
-	return Compose(CompactPlanContract(), RuntimeFacts{HostOS: runtime.GOOS})
+func CompactPlanSystemPrompt(username string) string {
+	if username == "" {
+		username = "Developer"
+	}
+	return Compose(CompactPlanContract(), RuntimeFacts{Username: username, HostOS: runtime.GOOS})
 }
 
 // SelectPlanSystemPrompt returns the appropriate plan system prompt based on
@@ -88,17 +87,20 @@ func CompactPlanSystemPrompt() string {
 // high-intent flag. High-complexity tasks (>8/10) or explicit --high flags
 // get the full plan contract; everything else gets the compact
 // 3-bullet checklist format.
-func SelectPlanSystemPrompt(objective string, hasHighFlag bool) string {
+func SelectPlanSystemPrompt(objective string, hasHighFlag bool, username string) string {
 	complexity := AssessComplexity(objective)
 	if IsHighComplexity(complexity, hasHighFlag) {
-		return PlanSystemPrompt()
+		return PlanSystemPrompt(username)
 	}
-	return CompactPlanSystemPrompt()
+	return CompactPlanSystemPrompt(username)
 }
 
 // InvestigateSystemPrompt returns the composed system prompt for investigate mode.
-func InvestigateSystemPrompt() string {
-	return Compose(InvestigateContract(), RuntimeFacts{HostOS: runtime.GOOS})
+func InvestigateSystemPrompt(username string) string {
+	if username == "" {
+		username = "Developer"
+	}
+	return Compose(InvestigateContract(), RuntimeFacts{Username: username, HostOS: runtime.GOOS})
 }
 
 // AskPromptHandoffSystemPrompt returns the composed system prompt for the
@@ -123,29 +125,14 @@ func ForModeWithUser(mode, username string) string {
 	case "ask":
 		return AskSystemPrompt(username)
 	case "build":
-		return BuildSystemPrompt()
+		return BuildSystemPrompt(username)
 	case "plan":
-		return PlanSystemPrompt()
+		return PlanSystemPrompt(username)
 	case "investigate":
-		return InvestigateSystemPrompt()
+		return InvestigateSystemPrompt(username)
 	case "review":
 		return Compose(ReviewContract(), RuntimeFacts{Username: username, HostOS: runtime.GOOS})
 	default:
 		return ""
 	}
-}
-
-// IdentityStatement returns a compact identity fact for injection into the
-// message array on every LLM turn. This lands near the user's current message
-// in the context window — useful for smaller models that poorly attend to the
-// system prompt. Returns empty string when username is blank.
-func IdentityStatement(username string) string {
-	name := config.SanitizeUsername(username)
-	if name == "" {
-		return ""
-	}
-	return fmt.Sprintf(
-		"[IZEN] You are IZEN. The human talking to you is '%s'. Address them as '%s'.",
-		name, name,
-	)
 }
