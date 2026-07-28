@@ -751,8 +751,12 @@ func (m *model) renderRuntimeStatus(width int) string {
 	}
 
 	// Tokens — always shown; this is the minimum viable status line.
+	tokDisplay := strconv.Itoa(m.TotalTokens) + " tok"
+	if m.ContextLimit > 0 {
+		tokDisplay += " / " + strconv.Itoa(m.ContextLimit)
+	}
 	if m.TotalTokens > 0 {
-		meta = append(meta, dimmedStyle.Render(strconv.Itoa(m.TotalTokens)+" tok"))
+		meta = append(meta, dimmedStyle.Render(tokDisplay))
 	} else {
 		meta = append(meta, dimmedStyle.Render("0 tok"))
 	}
@@ -1109,22 +1113,33 @@ func renderTitledTopBorder(totalWidth int, label string) string {
 }
 
 // styleActivityLine renders a system activity log line with mixed
-// styles: base text in muted faint-gray, [ OK ] and [FAIL] status
-// tags highlighted in pastel green/red for immediate scanability.
+// styling. Status badges ([ OK ], [FAIL]) are colorized, and any
+// remaining Markdown syntax (bold **...**, bullets - ...) in the
+// text body is stripped and re-rendered through the deterministic
+// TUI markdown pipeline so the viewport never shows raw asterisks
+// or dashes from the LLM's system summary.
 func (m *model) styleActivityLine(line string) string {
 	okTag := "[ OK ]"
 	failTag := "[FAIL]"
 	if idx := strings.Index(line, okTag); idx >= 0 {
 		pre := systemActivityStyle.Render(line[:idx])
-		tag := greenStyle.Render(okTag)
+		tag := badgeOKStyle.Render(okTag)
 		suf := systemActivityStyle.Render(line[idx+len(okTag):])
 		return pre + tag + suf
 	}
 	if idx := strings.Index(line, failTag); idx >= 0 {
 		pre := systemActivityStyle.Render(line[:idx])
-		tag := redStyle.Render(failTag)
+		tag := badgeFailStyle.Render(failTag)
 		suf := systemActivityStyle.Render(line[idx+len(failTag):])
 		return pre + tag + suf
+	}
+	// Pass the line through the deterministic TUI markdown renderer
+	// so that raw asterisks, bullet dashes, and other Markdown
+	// syntax are converted to styled TUI output instead of leaking
+	// as plain text.
+	rendered := RenderDeterministicPipeline(line, m.width, false)
+	if rendered != "" && rendered != line {
+		return rendered
 	}
 	return systemActivityStyle.Render(line)
 }
@@ -1145,39 +1160,54 @@ func (m *model) printRecord(rec record) string {
 	}
 
 	wrapStringToWidth := func(text string, maxW int) []string {
-		if len(text) == 0 {
+		if len(text) == 0 || maxW < 1 {
 			return []string{""}
 		}
 		var chunks []string
-		words := strings.Fields(text)
-		if len(words) == 0 {
-			runes := []rune(text)
-			for i := 0; i < len(runes); i += maxW {
-				end := i + maxW
-				if end > len(runes) {
-					end = len(runes)
-				}
-				chunks = append(chunks, string(runes[i:end]))
-			}
-			return chunks
-		}
-
 		var currentLine strings.Builder
-		for _, word := range words {
-			wordWidth := lipgloss.Width(word)
-			if currentLine.Len()+1+wordWidth > maxW {
+		flushLine := func() {
+			if currentLine.Len() > 0 {
 				chunks = append(chunks, currentLine.String())
 				currentLine.Reset()
-				currentLine.WriteString(word)
-			} else {
-				if currentLine.Len() > 0 {
-					currentLine.WriteString(" ")
-				}
-				currentLine.WriteString(word)
 			}
 		}
-		if currentLine.Len() > 0 {
-			chunks = append(chunks, currentLine.String())
+		runes := []rune(text)
+		n := len(runes)
+		wordStart := 0
+		for i := 0; i <= n; i++ {
+			if i == n || runes[i] == ' ' || runes[i] == '\t' || runes[i] == '\n' {
+				if i > wordStart {
+					word := string(runes[wordStart:i])
+					wordW := lipgloss.Width(word)
+					switch {
+					case wordW > maxW:
+						flushLine()
+						for j := 0; j < len([]rune(word)); j += maxW {
+							end := j + maxW
+							if end > len([]rune(word)) {
+								end = len([]rune(word))
+							}
+							chunks = append(chunks, string([]rune(word)[j:end]))
+						}
+					case currentLine.Len() > 0 && currentLine.Len()+1+wordW > maxW:
+						flushLine()
+						currentLine.WriteString(word)
+					default:
+						if currentLine.Len() > 0 {
+							currentLine.WriteString(" ")
+						}
+						currentLine.WriteString(word)
+					}
+				}
+				wordStart = i + 1
+				if i == n {
+					break
+				}
+			}
+		}
+		flushLine()
+		if len(chunks) == 0 {
+			return []string{""}
 		}
 		return chunks
 	}

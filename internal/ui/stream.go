@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/prompt"
+	"github.com/PizenLabs/izen/internal/workspace"
 )
 
 // debugLogPayload writes the exact outgoing LLM payload to
@@ -74,6 +76,14 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		return nil
 	}
 
+	// ── LOCAL INTENT INTERCEPTOR ─────────────────────────────────────
+	// Intercept common identity/greeting queries locally without calling
+	// the LLM API, saving tokens and providing instant responses.
+	if response := m.interceptLocalIntent(content); response != "" {
+		m.push(roleAI, response)
+		return nil
+	}
+
 	m.streamCh = make(chan tea.Msg, 1024)
 	m.streaming = true
 	m.spinnerFrame = 0
@@ -122,13 +132,27 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		}
 	}
 
+	// ── SLIDING WINDOW TRUNCATION ──────────────────────────────────
+	// Keep at most the last 20 history entries (≈10 exchanges) to
+	// prevent unbounded token growth across long sessions.
+	const maxHistoryMessages = 20
+	if len(msgs) > maxHistoryMessages {
+		msgs = msgs[len(msgs)-maxHistoryMessages:]
+	}
+
 	// ABSOLUTE GUARD: content MUST be raw input text, NOT m.Viewport.View() or any
 	// concatenation of rendered history + status bar + prompt prefix.
 	msgs = append(msgs, ai.Message{Role: "user", Content: content})
 
-	uname := m.cfg.Username
-	if uname == "" {
-		uname = m.userName
+	// ── AUTOMATIC FILE CONTEXT INJECTION ──────────────────────
+	// When a workspace is detected, scan for relevant files and
+	// inject their paths + contents into the user message so the
+	// model always knows which files exist instead of asking.
+	if m.workspaceRoot != "" {
+		augmented := injectFileContext(m.workspaceRoot, content, msgs[len(msgs)-1].Content)
+		if augmented != "" {
+			msgs[len(msgs)-1].Content = augmented
+		}
 	}
 
 	var systemPrompt string
@@ -138,12 +162,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		systemPrompt = gateway.CasualChatSystemPrompt()
 		maxTokens = gateway.CasualChatMaxTokens()
 	} else {
-		systemPrompt = prompt.ForModeWithUser(m.resolver.Current().String(), uname)
-		if identityLine := prompt.IdentityStatement(uname); identityLine != "" {
-			identityMsg := ai.Message{Role: "system", Content: identityLine}
-			beforeUser := msgs[:len(msgs)-1]
-			rest := msgs[len(msgs)-1:]
-			msgs = append(append(beforeUser, identityMsg), rest...)
+		systemPrompt = prompt.ForModeWithUser(m.resolver.Current().String(), m.userName)
+		if len(msgs) > 0 && msgs[0].Role == "system" {
+			msgs[0].Content = systemPrompt
+		} else {
+			msgs = append([]ai.Message{{Role: "system", Content: systemPrompt}}, msgs...)
 		}
 	}
 
@@ -225,13 +248,26 @@ func (m *model) streamCmd(content string) tea.Cmd {
 				return
 			}
 			if err != nil {
-				streamCh <- streamErrMsg{err: err}
+				streamCh <- streamErrMsg{err: err, content: full.String()}
 				return
 			}
 		}
 	}()
 
 	return tea.Batch(m.readStream(), m.spinnerTickCmd())
+}
+
+func injectFileContext(workspaceRoot, prompt, userContent string) string {
+	resolver := workspace.NewTargetFileResolver(workspaceRoot)
+	target := resolver.Resolve(prompt)
+	if target == "" {
+		return userContent
+	}
+	data, err := os.ReadFile(filepath.Join(workspaceRoot, target))
+	if err != nil {
+		return userContent
+	}
+	return userContent + "\n\n## Workspace File: " + target + "\n```\n" + string(data) + "\n```"
 }
 
 func (m *model) readStream() tea.Cmd {
@@ -247,4 +283,84 @@ func (m *model) readStream() tea.Cmd {
 		}
 		return msg
 	}
+}
+
+// greetingResponses provides variety when responding to a first-turn greeting.
+var greetingResponses = []string{
+	"Hello %s! How can I assist you today?",
+	"Hey %s! What are we building today?",
+	"Yo %s! Ready to crush some code?",
+	"Ciao %s! How can I help you right now?",
+	"What's up %s! What can I do for you today?",
+}
+
+// greetingPhrases is the set of normalized greeting inputs we answer locally
+// on the very first turn of a session, instead of spending a model call on
+// small talk. Keep entries lowercase and space-collapsed — see
+// normalizeIntent for how raw input is normalized before lookup.
+var greetingPhrases = map[string]struct{}{
+	"hi":             {},
+	"hii":            {},
+	"hiii":           {},
+	"hello":          {},
+	"helo":           {},
+	"hey":            {},
+	"heya":           {},
+	"hey there":      {},
+	"hi there":       {},
+	"yo":             {},
+	"yow":            {},
+	"sup":            {},
+	"wassup":         {},
+	"whats up":       {},
+	"what's up":      {},
+	"howdy":          {},
+	"greetings":      {},
+	"good morning":   {},
+	"good afternoon": {},
+	"good evening":   {},
+	"morning":        {},
+}
+
+// identityQuestions maps fixed identity/self-referential questions to
+// canned answers. These are answered regardless of session history length,
+// since a user may reasonably ask "who are you" mid-session.
+var identityQuestions = map[string]string{
+	"what is your name": "I am IZEN, a fast CLI coding companion.",
+	"whats your name":   "I am IZEN, a fast CLI coding companion.",
+	"what's your name":  "I am IZEN, a fast CLI coding companion.",
+	"who are you":       "I am IZEN, a fast CLI coding companion.",
+}
+
+// normalizeIntent lowercases, trims leading/trailing punctuation and
+// whitespace, and collapses internal whitespace so that inputs like
+// "  Hii!! " and "hi" normalize to the same lookup key.
+func normalizeIntent(s string) string {
+	s = strings.ToLower(s)
+	s = strings.Trim(s, " \t\n.,!?:;~-_")
+	s = strings.Join(strings.Fields(s), " ")
+	return s
+}
+
+// interceptLocalIntent checks whether the user input matches common identity
+// or greeting patterns that can be answered locally without calling the LLM.
+// Returns a non-empty response string if intercepted, empty string otherwise.
+func (m *model) interceptLocalIntent(content string) string {
+	normalized := normalizeIntent(content)
+
+	if answer, ok := identityQuestions[normalized]; ok {
+		return answer
+	}
+
+	switch normalized {
+	case "what is my name", "whats my name", "what's my name", "who am i", "my name":
+		return "Your name is " + m.userName + "."
+	}
+
+	if _, ok := greetingPhrases[normalized]; ok && len(m.sess.History) == 0 {
+		tpl := greetingResponses[rand.Intn(len(greetingResponses))]
+		return fmt.Sprintf(tpl, m.userName)
+	}
+
+	return ""
 }

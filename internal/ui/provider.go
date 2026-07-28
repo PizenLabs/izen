@@ -123,6 +123,10 @@ func (m *model) switchProvider(name string) tea.Cmd {
 	m.provider = provider
 	m.cfg.AI.DefaultProvider = name
 
+	if m.planEngine != nil {
+		m.planEngine.SetProvider(m.provider.Execute)
+	}
+
 	m.push(roleSystem, fmt.Sprintf("[✓] Provider switched: %s → %s", oldName, name))
 
 	return func() tea.Msg {

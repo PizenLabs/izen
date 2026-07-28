@@ -311,6 +311,7 @@ var PlaceholderPathPatterns = []string{
 	"example.go",
 	"test.go",
 	"somefile.go",
+	"workspace",
 }
 
 // DocumentationFilePatterns lists file-name substrings that identify
@@ -368,6 +369,12 @@ func IsDocumentationTarget(target string, taskType string) bool {
 func ValidateTaskTarget(target string, taskType string) (isValid bool, isPlaceholder bool) {
 	if target == "" {
 		return false, false
+	}
+
+	// HARD GUARD: "workspace" is a generic scope identifier,
+	// never a valid file target. Reject it explicitly.
+	if strings.EqualFold(strings.TrimSpace(target), "workspace") {
+		return false, true
 	}
 
 	// Shell commands are valid if they're not empty

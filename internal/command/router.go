@@ -10,6 +10,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/undo"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
+	"github.com/PizenLabs/izen/internal/workspace"
 )
 
 // UndoHandler performs multi-level undo operations. Implemented by undo.Handler.
@@ -243,4 +244,14 @@ func (r *Router) handleCommit() (bool, tea.Cmd) {
 	// The actual commit logic is handled by the build/commit engine,
 	// invoked from the TUI layer. This router handler gates access.
 	return true, nil
+}
+
+// ResolveTargetFile performs deterministic target file resolution.
+// It scans the user prompt for file path tokens and keywords,
+// matches them against the workspace file tree, and returns an
+// explicit repo-relative path. Returns "" when no match is found.
+// The bare token "workspace" is explicitly rejected.
+func ResolveTargetFile(workspaceRoot, prompt string) string {
+	resolver := workspace.NewTargetFileResolver(workspaceRoot)
+	return resolver.Resolve(prompt)
 }

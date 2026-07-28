@@ -29,6 +29,7 @@ import (
 	"github.com/PizenLabs/izen/internal/providers"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
+	verification "github.com/PizenLabs/izen/internal/verification"
 )
 
 // Init initializes the spinner tick and text input blink.
@@ -323,7 +324,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		if msg.err != nil {
-			m.push(roleError, "investigation error: "+msg.err.Error())
+			m.push(roleError, "investigation error: "+providers.SanitizeAPIError(msg.err))
 			// PERSISTENT NAVIGATION CHIPS (BUG 1): even on failure the user
 			// must never be left on a dead viewport. Surface Re-investigate
 			// so the diagnostic loop can be retried.
@@ -529,7 +530,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		if msg.err != nil {
-			m.push(roleError, "review error: "+msg.err.Error())
+			m.push(roleError, "review error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
@@ -559,7 +560,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.lastTestFailed = !msg.passed
 		m.lastTestTarget = ""
 		if msg.err != nil {
-			m.push(roleError, "test execution error: "+msg.err.Error())
+			m.push(roleError, "test execution error: "+providers.SanitizeAPIError(msg.err))
 		}
 		if msg.output != "" {
 			for _, line := range strings.Split(msg.output, "\n") {
@@ -642,11 +643,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// halt the recovery loop immediately. Do NOT waste recovery
 			// attempts on import hallucinations — the .go imports are valid,
 			// the dependency just needs to be fetched.
+			//
+			// RULE C: If the failure is an environment/setup error (e.g.,
+			// missing go.mod, "pattern ./... does not contain main module"),
+			// halt the recovery loop immediately. These are not code defects
+			// and cannot be fixed by auto-recovery — they require manual
+			// project setup before verification can succeed.
 			if !msg.passed && m.resolver.Current() == modes.ModeBuild &&
 				m.buildRecoveryCount < maxBuildRecoveryAttempts {
-				if hasMissingModuleError(msg.output) {
+				if hasMissingModuleError(msg.output) || verification.IsEnvironmentSetupError(msg.output) {
 					m.acceptAll = false
-					m.push(roleError, "[BUILD HALTED] Build failed due to missing Go module dependency. Auto-recovery cannot fix import paths. Run 'go get <package>' manually, then retry.")
+					m.push(roleError, "[BUILD HALTED] Build failed due to a Go environment setup error. Auto-recovery cannot fix missing go.mod or non-Go project verification. Run 'go mod init' or configure a Go module first, then retry.")
 				} else {
 					m.buildRecoveryCount++
 					m.acceptAll = true
@@ -666,13 +673,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.currentResult = buildVerifyResult(msg.passed)
 
 			// ── FAIL-FAST MACHINE: mirror outcome into the canonical
-			// session.ContextLedger. On a hard failure (recovery exhausted or
-			// missing-module halt) the active task is marked Failed and the
-			// queue is frozen — no subsequent task is advanced, leaving the
-			// workspace in its broken state for developer inspection.
+			// session.ContextLedger. On a hard failure (recovery exhausted,
+			// missing-module halt, or environment setup error) the active
+			// task is marked Failed and the queue is frozen — no subsequent
+			// task is advanced, leaving the workspace in its broken state
+			// for developer inspection.
 			m.bridgeBuildResultToLedger(m.currentBuildTaskID, msg.passed, msg.output)
 			if !msg.passed && m.resolver.Current() == modes.ModeBuild {
-				if m.buildRecoveryCount >= maxBuildRecoveryAttempts || hasMissingModuleError(msg.output) {
+				if m.buildRecoveryCount >= maxBuildRecoveryAttempts || hasMissingModuleError(msg.output) || verification.IsEnvironmentSetupError(msg.output) {
 					m.push(roleError, fmt.Sprintf(
 						"[BUILD HALTED] Step %d failed verification. Queue frozen — %d/%d task(s) complete. Inspect and fix, then re-run /build.",
 						m.currentBuildTaskID, m.countCompletedLedgerTasks(), len(m.sess.CurrentTasks)))
@@ -928,7 +936,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 
 		if msg.err != nil {
-			m.push(roleError, "build execution error: "+msg.err.Error())
+			m.push(roleError, "build execution error: "+providers.SanitizeAPIError(msg.err))
 			_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
 				FailureClass: classifier.FailureUnknownClass,
 			})
@@ -1076,7 +1084,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.agentLabel = ""
 			m.lastActionTime = time.Time{}
 			m.pipelineRunning = false
-			m.push(roleError, "$log: error: "+msg.err.Error())
+			m.push(roleError, "$log: error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
@@ -1093,7 +1101,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.pipelineRunning = false
-			m.push(roleError, "silent analysis error: "+msg.err.Error())
+			m.push(roleError, "silent analysis error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
@@ -1111,7 +1119,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.pipelineRunning = false
-			m.push(roleError, "blueprint error: "+msg.err.Error())
+			m.push(roleError, "blueprint error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
@@ -1127,7 +1135,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		if msg.err != nil {
-			m.push(roleError, "prompt handoff error: "+msg.err.Error())
+			m.push(roleError, "prompt handoff error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
@@ -1158,7 +1166,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		if msg.err != nil {
-			m.push(roleError, "fix error: "+msg.err.Error())
+			m.push(roleError, "fix error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
@@ -1179,7 +1187,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		if msg.err != nil {
-			m.push(roleError, "env diagnostics error: "+msg.err.Error())
+			m.push(roleError, "env diagnostics error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
@@ -1208,7 +1216,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		if msg.err != nil {
-			m.push(roleError, "trace execution error: "+msg.err.Error())
+			m.push(roleError, "trace execution error: "+providers.SanitizeAPIError(msg.err))
 		}
 
 		// Token optimization: truncate middle if output exceeds 4000 chars
@@ -1263,7 +1271,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		if msg.err != nil {
-			m.push(roleError, "diagnosis error: "+msg.err.Error())
+			m.push(roleError, "diagnosis error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
@@ -1289,7 +1297,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.sanitizeInputPrompt()
 
 		if msg.err != nil {
-			m.push(roleError, "commit error: "+msg.err.Error())
+			m.push(roleError, "commit error: "+providers.SanitizeAPIError(msg.err))
 		} else {
 			result := fmt.Sprintf("Commit: %s · %s", msg.hash, msg.subject)
 			m.push(roleSystem, successBannerStyle.Render("[✓] "+result))
@@ -1386,7 +1394,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				m.createBuildCheckpoint(1)
 
 				// Log foldable entry for the file mutation.
-				m.logStore.Add(LogEdit, msg.file, true, msg.status)
+				// Capture the current thinking-panel content so it persists
+				// in the entry even during Per-Task Fallback mode.
+				thinkingContent := ""
+				if m.thinkingPanel != nil {
+					thinkingContent = m.thinkingPanel.String()
+				}
+				m.logStore.AddFull(LogEdit, msg.file, true, msg.status, thinkingContent, "")
 				// ── ADVANCE BUILD QUEUE ────────────────────────────────
 				// After a FILE_MUTATE/GIT_ACTION task completes, check for
 				// the next idle task and execute it.
@@ -1412,7 +1426,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				}
 			} else {
 				m.push(roleSystem, failureBannerStyle.Render("[✗] "+msg.file+" — "+msg.err.Error()))
-				m.logStore.Add(LogEdit, msg.file, false, msg.err.Error())
+				thinkingContent := ""
+				if m.thinkingPanel != nil {
+					thinkingContent = m.thinkingPanel.String()
+				}
+				m.logStore.AddFull(LogEdit, msg.file, false, msg.err.Error(), thinkingContent, "")
 			}
 		} else {
 			m.state = StateAwaitingApproval
@@ -1431,7 +1449,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		for _, r := range msg.results {
 			if r.err != nil {
 				m.setApplyError("apply failed: " + r.err.Error())
-				m.logStore.Add(LogEdit, r.file, false, r.err.Error())
+				thinkingContent := ""
+				if m.thinkingPanel != nil {
+					thinkingContent = m.thinkingPanel.String()
+				}
+				m.logStore.AddFull(LogEdit, r.file, false, r.err.Error(), thinkingContent, "")
 				failed++
 				continue
 			}
@@ -1439,7 +1461,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				Target: r.file,
 				Status: r.status,
 			})
-			m.logStore.Add(LogEdit, r.file, true, r.status)
+			thinkingContent := ""
+			if m.thinkingPanel != nil {
+				thinkingContent = m.thinkingPanel.String()
+			}
+			m.logStore.AddFull(LogEdit, r.file, true, r.status, thinkingContent, "")
 			applied++
 		}
 		m.pendingProposals = nil
@@ -1680,6 +1706,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// leaving it stranded (or, as before the fix, leaking it into the
 		// next turn's content).
 		m.flushPendingReasoningFragment()
+
+		// Prevent blank lines when the response was truncated with zero
+		// content (finish_reason: length) or the provider returned nothing.
+		if final == "" {
+			final = "(response was empty)"
+		}
 
 		// Append the completed turn to PreRenderedHistory and freeze state.
 		m.push(roleAI, final)
@@ -2091,7 +2123,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleSystem, infoStyle.Render("Invalid or missing OPENROUTER_API_KEY. Please check your environment variables or run:"))
 			m.push(roleSystem, infoStyle.Render("  export OPENROUTER_API_KEY=<your_key>"))
 		} else {
-			m.push(roleError, "stream error: "+msg.err.Error())
+			sanitized := providers.SanitizeAPIError(msg.err)
+			m.push(roleError, "stream error: "+sanitized)
+		}
+
+		// ALWAYS flush partial stream tokens to the TUI so that tokens
+		// already received on the wire are never discarded when a
+		// mid-stream connection error or unexpected termination occurs.
+		if msg.content != "" {
+			if m.streamTickActive {
+				m.currentStreamContent += m.streamBuffer
+				m.streamBuffer = ""
+				m.streamTickActive = false
+			}
+			m.streamBuffer = msg.content
+			m.currentStreamContent = msg.content
+			m.extractReasoningContent()
 		}
 		m.refreshViewportContent()
 		flush := m.flushPendingRecords()
@@ -2132,7 +2179,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
-		m.push(roleError, "fast-track build failed: "+msg.Err.Error())
+		m.push(roleError, "fast-track build failed: "+providers.SanitizeAPIError(msg.Err))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()

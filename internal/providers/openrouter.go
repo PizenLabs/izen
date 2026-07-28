@@ -238,6 +238,66 @@ func (p *OpenRouterProvider) buildMessages(req ai.Request) []openrouterMessage {
 		content := sanitizeContent(m.Content)
 		msgs = append(msgs, openrouterMessage{Role: m.Role, Content: content})
 	}
+	return cleanMessages(msgs)
+}
+
+// cleanMessages validates and sanitizes a message sequence before it is
+// sent to the OpenRouter API. It prevents HTTP 400 responses caused by
+// empty content, consecutive same-role messages, or structural violations.
+// Rules applied in order:
+//  1. Drop messages with empty content (after sanitization).
+//  2. Merge consecutive messages with the same role by joining with "\n".
+//  3. Strip leading assistant messages (no response without a prior user prompt).
+//  4. Ensure the final message is not a system message (remove trailing system messages).
+//  5. Sliding window: keep at most the last 30 messages to prevent unbounded
+//     token growth across long sessions.
+func cleanMessages(msgs []openrouterMessage) []openrouterMessage {
+	// Step 1: drop empty content.
+	filtered := msgs[:0]
+	for _, m := range msgs {
+		if m.Content != "" {
+			filtered = append(filtered, m)
+		}
+	}
+	msgs = filtered
+
+	// Step 2: merge consecutive same-role messages.
+	merged := make([]openrouterMessage, 0, len(msgs))
+	for i, m := range msgs {
+		if i > 0 && m.Role == msgs[i-1].Role && m.Role != "system" {
+			last := &merged[len(merged)-1]
+			last.Content += "\n" + m.Content
+			continue
+		}
+		merged = append(merged, m)
+	}
+	msgs = merged
+
+	// Step 3: strip leading assistant messages.
+	for len(msgs) > 0 && msgs[0].Role == "assistant" {
+		msgs = msgs[1:]
+	}
+
+	// Step 4: strip trailing system messages, but preserve at least one
+	// message (the head system prompt at index 0) so the IZEN identity and
+	// user name context is never dropped.
+	for len(msgs) > 1 && msgs[len(msgs)-1].Role == "system" {
+		msgs = msgs[:len(msgs)-1]
+	}
+
+	// Step 5: sliding window truncation.
+	// Keep system + user + assistant messages bounded so the payload never
+	// explodes across long sessions. Preserve system message at index 0.
+	const maxMessages = 30
+	if len(msgs) > maxMessages {
+		head := 1
+		tail := msgs[head:]
+		if len(tail) > maxMessages {
+			tail = tail[len(tail)-maxMessages:]
+		}
+		msgs = append(msgs[:head], tail...)
+	}
+
 	return msgs
 }
 

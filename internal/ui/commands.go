@@ -39,6 +39,8 @@ import (
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/templates"
+	verification "github.com/PizenLabs/izen/internal/verification"
+	"github.com/PizenLabs/izen/internal/workspace"
 )
 
 var validSystemCommands = map[string]struct{}{
@@ -173,7 +175,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 		m.push(roleSystem, "$ "+shellCmd)
 		out, err := execShell(shellCmd)
 		if err != nil {
-			m.push(roleError, err.Error())
+			m.push(roleError, providers.SanitizeAPIError(err))
 		}
 		scanner := bufio.NewScanner(strings.NewReader(strings.TrimRight(out, "\r\n")))
 		for scanner.Scan() {
@@ -258,7 +260,6 @@ func (m *model) handleInput(line string) tea.Cmd {
 		}
 
 		// ── INTENT PRE-GUARD: Fast-track direct file mutations ──────────
-		// Inspect the raw input before dispatching to the Senior Architect
 		// pipeline. If the user is requesting a simple single-file mutation
 		// on a non-code file (e.g. $prompt rename author in @LICENSE),
 		// classify it and route directly to /build as a FILE_MUTATE task
@@ -304,12 +305,11 @@ func (m *model) handleInput(line string) tea.Cmd {
 		if currentMode != modes.ModeAsk {
 			// Mode Guard Enforced: request state transition to /ask, then
 			// queue the $prompt synthesis directly via runAskPromptHandoffCmd.
-			// This preserves the Senior Architect system template
-			// (AskPromptHandoffContract) — we MUST NOT re-enter handleInput
+			// This preserves the lean ask handoff prompt — we MUST NOT re-enter handleInput
 			// because the raw input no longer carries the $prompt prefix and
 			// would be routed to the normal AskContract() streaming path,
 			// producing conversational noise instead of the structured
-			// 5-point Forensic Context Ledger.
+			// handoff prompt.
 			m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
 				"$prompt from /%s — transitioning to /ask for structured analysis...", currentMode)))
 			m.modeChangeAuthorized = true
@@ -319,7 +319,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 			return tea.Batch(cmd, m.runAskPromptHandoffCmd(rawInput))
 		}
 
-		m.push(roleSystem, infoStyle.Render("Refining architectural idea through Senior Architect analysis..."))
+		m.push(roleSystem, infoStyle.Render("Refining prompt through ask handoff..."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m.runAskPromptHandoffCmd(rawInput)
@@ -1504,7 +1504,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("ask sub-commands ($)"))
-		m.push(roleSystem, infoStyle.Render("  $prompt <idea>  refine architectural idea via Senior Architect analysis"))
+		m.push(roleSystem, infoStyle.Render("  $prompt <idea>  refine architectural idea into actionable prompt"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("review sub-commands ($)"))
 		m.push(roleSystem, infoStyle.Render("  $test [path]  run tests (safety-gated for large repos)"))
@@ -2014,7 +2014,10 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 				taskType = "task"
 			}
 			if taskTarget == "" {
-				taskTarget = "workspace"
+				taskTarget = m.resolvePendingTodoTarget(t)
+			}
+			if taskTarget == "" {
+				continue
 			}
 			tasks = append(tasks, plan.Task{
 				StepNum:     i + 1,
@@ -2214,15 +2217,7 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 	fullPrompt := fileContext.String() + "\n" + unifiedPrompt
 
 	// ── Build system and request ──────────────────────────────────
-	uname := m.cfg.Username
-	if uname == "" {
-		uname = m.userName
-	}
-	systemPrompt := prompt.ForModeWithUser(m.resolver.Current().String(), uname)
-	if identityLine := prompt.IdentityStatement(uname); identityLine != "" {
-		// Inject identity before the user message
-		fullPrompt = identityLine + "\n\n" + fullPrompt
-	}
+	systemPrompt := prompt.ForModeWithUser(m.resolver.Current().String(), m.userName)
 
 	// Construct messages without repeating the plan JSON ledger
 	// to prevent 7B context drift from the model re-printing its own plan.
@@ -2236,7 +2231,22 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			msgs = append(msgs, ai.Message{Role: msg.Role, Content: raw})
 		}
 	}
+
+	// ── SLIDING WINDOW TRUNCATION ──────────────────────────────────
+	// Keep at most the last 20 history entries (≈10 exchanges) to
+	// prevent unbounded token growth.
+	const maxHistoryMessages = 20
+	if len(msgs) > maxHistoryMessages {
+		msgs = msgs[len(msgs)-maxHistoryMessages:]
+	}
+
 	msgs = append(msgs, ai.Message{Role: "user", Content: fullPrompt})
+
+	if len(msgs) > 0 && msgs[0].Role == "system" {
+		msgs[0].Content = systemPrompt
+	} else {
+		msgs = append([]ai.Message{{Role: "system", Content: systemPrompt}}, msgs...)
+	}
 
 	req := ai.Request{
 		Model:     m.cfg.ActiveModelName(),
@@ -2422,7 +2432,7 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			}
 			if err != nil {
 				select {
-				case streamCh <- streamErrMsg{err: err}:
+				case streamCh <- streamErrMsg{err: err, content: fullContent.String()}:
 				default:
 				}
 				return
@@ -2658,6 +2668,17 @@ func sanitizeFileOutput(content string) string {
 	// Check for markdown block suffix.
 	content = strings.TrimSuffix(content, "```")
 	return strings.TrimSpace(content)
+}
+
+// resolvePendingTodoTarget uses deterministic workspace file matching
+// to resolve a pending TODO's target path. Never returns "workspace"
+// or an empty string — callers must handle the empty case.
+func (m *model) resolvePendingTodoTarget(todo string) string {
+	if m.workspaceRoot == "" {
+		return ""
+	}
+	resolver := workspace.NewTargetFileResolver(m.workspaceRoot)
+	return resolver.Resolve(todo)
 }
 
 // resolveHotfixTarget extracts the concrete destination file path for a $hot
@@ -4119,6 +4140,15 @@ func (m *model) runTestEngine(target string) tea.Cmd {
 				msg = TaskFinishedMsg{}
 			}
 		}()
+		if !verification.IsGoProject(m.workspaceRoot) {
+			return testResultMsg{
+				output: verification.FormatSkipMessage("HTML/JS/CSS"),
+				passed: true,
+				failed: 0,
+				total:  0,
+				err:    nil,
+			}
+		}
 		runner := execExecutionRunner(".")
 		cmd := "go test -v " + target
 		result, err := runner.Run(cmd)
@@ -4194,6 +4224,13 @@ func (m *model) runBuildEngine(target string) tea.Cmd {
 				msg = TaskFinishedMsg{}
 			}
 		}()
+		if !verification.IsGoProject(m.workspaceRoot) {
+			return buildResultMsg{
+				output:   verification.FormatSkipMessage("HTML/JS/CSS"),
+				exitCode: 0,
+				err:      nil,
+			}
+		}
 		runner := execExecutionRunner(".")
 		cmd := "go build " + target
 		result, err := runner.Run(cmd)
@@ -4661,7 +4698,7 @@ func (m *model) handleLogInput(msg logInputMsg) tea.Cmd {
 		m.pipelineRunning = false
 		m.reviewRunning = false
 		m.agentRunning = false
-		m.push(roleError, "$log: execution error: "+msg.err.Error())
+		m.push(roleError, "$log: execution error: "+providers.SanitizeAPIError(msg.err))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m.flushPendingRecords()
@@ -4683,7 +4720,7 @@ func (m *model) handleInvestigateComplete(msg investigateCompleteMsg) tea.Cmd {
 		m.pipelineRunning = false
 		m.reviewRunning = false
 		m.agentRunning = false
-		m.push(roleError, "fix pipeline: analysis failed: "+msg.err.Error())
+		m.push(roleError, "fix pipeline: analysis failed: "+providers.SanitizeAPIError(msg.err))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m.flushPendingRecords()
@@ -4707,7 +4744,7 @@ func (m *model) handleBlueprintReady(msg blueprintReadyMsg) tea.Cmd {
 	if msg.err != nil {
 		m.reviewRunning = false
 		m.agentRunning = false
-		m.push(roleError, "fix pipeline: blueprint error: "+msg.err.Error())
+		m.push(roleError, "fix pipeline: blueprint error: "+providers.SanitizeAPIError(msg.err))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m.flushPendingRecords()
@@ -5271,8 +5308,8 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 }
 
 // runAskPromptHandoffCmd passes the user's raw architectural idea directly to
-// the Strict Senior Architect persona for refinement, pruning, and tradeoff
-// analysis. No session history aggregation — the raw input IS the payload.
+// the ask handoff for refinement. No session history aggregation — the raw
+// input IS the payload.
 //
 // ISOLATION CONTRACT — This function is called STRICTLY from handleInput when
 // the user types "$prompt <raw_idea>" in /ask mode. It uses its own system
