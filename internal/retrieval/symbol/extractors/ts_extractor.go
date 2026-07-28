@@ -183,7 +183,7 @@ func (e *tsExtractor) ExtractPackages(rootPath string) ([]symbol.PackageNode, er
 		if !hasExtension(path, ".ts") && !hasExtension(path, ".tsx") && !hasExtension(path, ".js") && !hasExtension(path, ".jsx") {
 			return nil
 		}
-		if strings.Contains(path, "node_modules/") {
+		if symbol.ShouldIgnorePath(path, rootPath) {
 			return nil
 		}
 

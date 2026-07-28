@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+
+	sympkg "github.com/PizenLabs/izen/internal/retrieval/symbol"
 )
 
 // NativeGoEngine implements SearchEngine using Go standard libraries.
@@ -111,7 +113,7 @@ func (e *NativeGoEngine) SearchContext(ctx context.Context, query string) ([]Cod
 		if !strings.HasSuffix(path, ".go") {
 			return nil
 		}
-		if strings.Contains(path, "vendor/") || strings.Contains(path, ".izen/") {
+		if sympkg.ShouldIgnorePath(path, e.root) {
 			return nil
 		}
 
@@ -220,7 +222,7 @@ func (e *NativeGoEngine) loadCache() ([]CacheEntry, error) {
 		if !strings.HasSuffix(path, ".go") {
 			return nil
 		}
-		if strings.Contains(path, "vendor/") || strings.Contains(path, ".izen/") {
+		if sympkg.ShouldIgnorePath(path, e.root) {
 			return nil
 		}
 		e.parseFile(path)
@@ -324,7 +326,7 @@ func (e *NativeGoEngine) regexResolve(symbol string) []CodeCoord {
 		if !strings.HasSuffix(path, ".go") {
 			return nil
 		}
-		if strings.Contains(path, "vendor/") || strings.Contains(path, ".izen/") {
+		if sympkg.ShouldIgnorePath(path, e.root) {
 			return nil
 		}
 

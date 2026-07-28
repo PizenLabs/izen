@@ -128,7 +128,7 @@ func (e *pythonExtractor) ExtractPackages(rootPath string) ([]symbol.PackageNode
 		if !strings.HasSuffix(path, ".py") {
 			return nil
 		}
-		if strings.Contains(path, "__pycache__/") {
+		if symbol.ShouldIgnorePath(path, rootPath) {
 			return nil
 		}
 

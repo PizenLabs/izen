@@ -1046,7 +1046,21 @@ func symbolKindToGraphKind(sk symbol.SymbolKind) int {
 	}
 }
 
-func (m *model) renderArch() string {
+func (m *model) renderArch(cmdArgs string) string {
+	cmdArgs = strings.TrimSpace(cmdArgs)
+
+	switch {
+	case cmdArgs == "--all" || cmdArgs == "--sum" || cmdArgs == "full":
+		return m.renderArchFull()
+	case cmdArgs != "":
+		return m.renderArchDrilldown(cmdArgs)
+	default:
+		return m.renderArchCollapsed()
+	}
+}
+
+// renderArchFull renders the complete expanded architecture map (the original behavior).
+func (m *model) renderArchFull() string {
 	g := m.graph
 	if g == nil || len(g.Files) == 0 {
 		g = m.buildArchGraph()
@@ -1421,4 +1435,246 @@ func cycleDisplay(n int) string {
 		return greenStyle.Render("0")
 	}
 	return redStyle.Render(fmt.Sprintf("%d", n))
+}
+
+// renderArchCollapsed prints a compact per-layer summary that fits
+// in a single terminal screen. Each layer shows top 3 packages
+// and a count of remaining packages.
+func (m *model) renderArchCollapsed() string {
+	g := m.graph
+	if g == nil || len(g.Files) == 0 {
+		g = m.buildArchGraph()
+		if g == nil || len(g.Files) == 0 {
+			return "no packages found in graph"
+		}
+	}
+	lang := detectGraphLanguageForGraph(g, m)
+	r := analyze(g, lang)
+	if len(r.Pkgs) == 0 {
+		return "no packages found in graph"
+	}
+
+	var b strings.Builder
+
+	b.WriteString(boldTextStyle.Render("ARCHITECTURE"))
+	b.WriteString("\n")
+	layerSet := make(map[pkgLayer]bool)
+	for _, pkg := range r.PkgOrder {
+		layerSet[r.Pkgs[pkg].Layer] = true
+	}
+	var layerList []string
+	for _, l := range layerOrder {
+		if layerSet[l] {
+			layerList = append(layerList, layerNames[l])
+		}
+	}
+
+	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Language"), textStyle.Render(r.Language))
+	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Module"), textStyle.Render(r.ModulePath))
+	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Packages"), textStyle.Render(fmt.Sprintf("%d", len(r.Pkgs))))
+	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Layers"), textStyle.Render(strings.Join(layerList, "  ·  ")))
+	b.WriteString("\n")
+
+	b.WriteString(boldTextStyle.Render("LAYERS"))
+	b.WriteString("\n")
+
+	for _, layer := range layerOrder {
+		if !layerSet[layer] {
+			continue
+		}
+		var layerPkgs []string
+		var totalFiles int
+		for _, pkg := range r.PkgOrder {
+			ps := r.Pkgs[pkg]
+			if ps.Layer != layer {
+				continue
+			}
+			layerPkgs = append(layerPkgs, pkg)
+			totalFiles += len(ps.Files)
+		}
+
+		fmt.Fprintf(&b, "  %s  (%d packages, %d files)\n",
+			accentStyle.Render(layerNames[layer]),
+			len(layerPkgs),
+			totalFiles,
+		)
+
+		topN := 3
+		if len(layerPkgs) < topN {
+			topN = len(layerPkgs)
+		}
+		for i := 0; i < topN; i++ {
+			fmt.Fprintf(&b, "    ├── %s\n", textStyle.Render(layerPkgs[i]))
+		}
+		remaining := len(layerPkgs) - topN
+		if remaining > 0 {
+			fmt.Fprintf(&b, "    └── ... and %d more (use /arch %s to expand)\n",
+				remaining, layerNames[layer])
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString(mutedStyle.Render("  /arch --all   full expanded map"))
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render("  /arch <Layer> drill into a layer (e.g. /arch Presentation)"))
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render("  /arch <pkg>   find a specific package (e.g. /arch litellm)"))
+	b.WriteString("\n")
+
+	return b.String()
+}
+
+// renderArchDrilldown shows a detailed breakdown for a specific layer or package.
+func (m *model) renderArchDrilldown(target string) string {
+	g := m.graph
+	if g == nil || len(g.Files) == 0 {
+		g = m.buildArchGraph()
+		if g == nil || len(g.Files) == 0 {
+			return "no packages found in graph"
+		}
+	}
+	lang := detectGraphLanguageForGraph(g, m)
+	r := analyze(g, lang)
+	if len(r.Pkgs) == 0 {
+		return "no packages found in graph"
+	}
+
+	targetLower := strings.ToLower(strings.TrimSpace(target))
+
+	var matchedLayer pkgLayer
+	foundLayer := false
+	for _, layer := range layerOrder {
+		if strings.ToLower(layerNames[layer]) == targetLower {
+			matchedLayer = layer
+			foundLayer = true
+			break
+		}
+	}
+
+	var matchedPkg *pkgSummary
+	for _, pkg := range r.PkgOrder {
+		ps := r.Pkgs[pkg]
+		if strings.ToLower(ps.Name) == targetLower || strings.ToLower(pkg) == targetLower {
+			matchedPkg = ps
+			break
+		}
+	}
+
+	var b strings.Builder
+
+	b.WriteString(boldTextStyle.Render("ARCHITECTURE DRILL-DOWN"))
+	b.WriteString("\n")
+	fmt.Fprintf(&b, "  Target: %s\n\n", textStyle.Render(target))
+
+	if foundLayer {
+		b.WriteString(accentStyle.Render(layerNames[matchedLayer]))
+		b.WriteString("\n\n")
+
+		var layerPkgs []string
+		var totalFiles int
+		for _, pkg := range r.PkgOrder {
+			ps := r.Pkgs[pkg]
+			if ps.Layer == matchedLayer {
+				layerPkgs = append(layerPkgs, pkg)
+				totalFiles += len(ps.Files)
+			}
+		}
+
+		fmt.Fprintf(&b, "  %d packages, %d files\n\n", len(layerPkgs), totalFiles)
+		for _, pkg := range layerPkgs {
+			ps := r.Pkgs[pkg]
+			totalSyms := ps.Structs + ps.Interfaces
+			fmt.Fprintf(&b, "  %s  (%d files, %d types)\n", textStyle.Render(ps.Name), len(ps.Files), totalSyms)
+			for _, f := range ps.Files {
+				fmt.Fprintf(&b, "    %s\n", mutedStyle.Render(f))
+			}
+			for _, ep := range ps.EntryPoints {
+				fmt.Fprintf(&b, "    %s  %s:%d\n", greenStyle.Render(ep.Name+"()"), ep.File, ep.Line)
+			}
+			if ps.FanIn > 0 || ps.FanOut > 0 {
+				fmt.Fprintf(&b, "    %s (fan-in: %d, fan-out: %d)\n",
+					mutedStyle.Render("dependencies"), ps.FanIn, ps.FanOut)
+			}
+			b.WriteString("\n")
+		}
+		return b.String()
+	}
+
+	if matchedPkg != nil {
+		b.WriteString(accentStyle.Render(matchedPkg.Name))
+		b.WriteString("\n\n")
+		fmt.Fprintf(&b, "  Layer: %s\n", mutedStyle.Render(layerNames[matchedPkg.Layer]))
+		fmt.Fprintf(&b, "  Files: %d, Types: %d (interfaces: %d, structs: %d)\n\n",
+			len(matchedPkg.Files), matchedPkg.Structs+matchedPkg.Interfaces, matchedPkg.Interfaces, matchedPkg.Structs)
+
+		fmt.Fprintf(&b, "  Files:\n")
+		for _, f := range matchedPkg.Files {
+			fmt.Fprintf(&b, "    %s\n", mutedStyle.Render(f))
+		}
+		b.WriteString("\n")
+
+		if len(matchedPkg.EntryPoints) > 0 {
+			fmt.Fprintf(&b, "  Entry Points:\n")
+			for _, ep := range matchedPkg.EntryPoints {
+				fmt.Fprintf(&b, "    %s  %s:%d\n", greenStyle.Render(ep.Name+"()"), ep.File, ep.Line)
+			}
+			b.WriteString("\n")
+		}
+
+		if matchedPkg.FanIn > 0 || matchedPkg.FanOut > 0 {
+			fmt.Fprintf(&b, "  Dependencies (fan-in: %d, fan-out: %d)\n", matchedPkg.FanIn, matchedPkg.FanOut)
+			for _, e := range r.Edges {
+				if e.From == matchedPkg.Name {
+					fmt.Fprintf(&b, "    → %s (%s)\n", textStyle.Render(e.To), mutedStyle.Render(e.Kind))
+				}
+				if e.To == matchedPkg.Name {
+					fmt.Fprintf(&b, "    ← %s (%s)\n", textStyle.Render(e.From), mutedStyle.Render(e.Kind))
+				}
+			}
+			b.WriteString("\n")
+		}
+
+		fmt.Fprintf(&b, "  Key Types in %s:\n", matchedPkg.Name)
+		typeCount := 0
+		for _, f := range m.graph.Files {
+			pkg := pkgLabel(f.Path)
+			if pkg != matchedPkg.Name {
+				continue
+			}
+			for _, sym := range f.Symbols {
+				if !sym.Exported {
+					continue
+				}
+				kindStr := "unknown"
+				switch sym.Kind {
+				case graph.SymbolInterface:
+					kindStr = "interface"
+				case graph.SymbolStruct:
+					kindStr = "struct"
+				case graph.SymbolFunction:
+					kindStr = "function"
+				case graph.SymbolMethod:
+					kindStr = "method"
+				case graph.SymbolType:
+					kindStr = "type"
+				}
+				fmt.Fprintf(&b, "    %s [%s]\n", blueStyle.Render(sym.Name), mutedStyle.Render(kindStr))
+				typeCount++
+			}
+		}
+		if typeCount == 0 {
+			fmt.Fprintf(&b, "  %s\n", mutedStyle.Render("No exported types"))
+		}
+
+		return b.String()
+	}
+
+	fmt.Fprintf(&b, "  %s\n", mutedStyle.Render("No matching layer or package found."))
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render("  Available layers: Presentation, Application, Domain, Infrastructure, Session, Quality, AI Integration"))
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render("  Use /arch to see the summary, /arch --all for the full map."))
+	b.WriteString("\n")
+
+	return b.String()
 }

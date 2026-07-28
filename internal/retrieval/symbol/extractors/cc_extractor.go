@@ -38,6 +38,9 @@ func (e *ccExtractor) DetectLanguage(rootPath string) (symbol.LanguageID, bool) 
 		if info.IsDir() {
 			return nil
 		}
+		if symbol.ShouldIgnorePath(path, rootPath) {
+			return nil
+		}
 		lower := strings.ToLower(path)
 		if strings.HasSuffix(lower, ".c") || strings.HasSuffix(lower, ".h") ||
 			strings.HasSuffix(lower, ".cpp") || strings.HasSuffix(lower, ".cc") ||
@@ -176,7 +179,7 @@ func (e *ccExtractor) ExtractPackages(rootPath string) ([]symbol.PackageNode, er
 		if !isSource {
 			return nil
 		}
-		if strings.Contains(path, "/build/") || strings.Contains(path, "/cmake-build-") {
+		if symbol.ShouldIgnorePath(path, rootPath) {
 			return nil
 		}
 

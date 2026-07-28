@@ -131,7 +131,7 @@ func (e *goExtractor) ExtractPackages(rootPath string) ([]symbol.PackageNode, er
 		if info.IsDir() || !strings.HasSuffix(path, ".go") {
 			return nil
 		}
-		if strings.Contains(path, "vendor/") || strings.Contains(path, ".izen/") {
+		if symbol.ShouldIgnorePath(path, rootPath) {
 			return nil
 		}
 

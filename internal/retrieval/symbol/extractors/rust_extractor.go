@@ -137,7 +137,7 @@ func (e *rustExtractor) ExtractPackages(rootPath string) ([]symbol.PackageNode, 
 		if info.IsDir() || !strings.HasSuffix(path, ".rs") {
 			return nil
 		}
-		if strings.Contains(path, "target/") {
+		if symbol.ShouldIgnorePath(path, rootPath) {
 			return nil
 		}
 

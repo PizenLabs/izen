@@ -78,7 +78,7 @@ func (e *PolyglotEngine) ExtractAllSymbols() ([]symbol.FileASTInfo, error) {
 		if info.IsDir() {
 			return nil
 		}
-		if strings.Contains(path, "vendor/") || strings.Contains(path, ".izen/") {
+		if symbol.ShouldIgnorePath(path, e.root) {
 			return nil
 		}
 		if info.Size() > 1<<20 {

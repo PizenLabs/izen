@@ -198,6 +198,9 @@ func (e *javaExtractor) ExtractPackages(rootPath string) ([]symbol.PackageNode, 
 		if info.IsDir() || !strings.HasSuffix(path, ".java") {
 			return nil
 		}
+		if symbol.ShouldIgnorePath(path, rootPath) {
+			return nil
+		}
 
 		src, readErr := os.ReadFile(path)
 		if readErr != nil {
