@@ -21,7 +21,16 @@ func NewEngine(root string) *Engine {
 }
 
 func (e *Engine) Build() (*Graph, error) {
+	return e.BuildWithConfig(DefaultScanConfig(e.root))
+}
+
+func (e *Engine) BuildForLanguage(lang Language) (*Graph, error) {
 	cfg := DefaultScanConfig(e.root)
+	cfg.Language = lang
+	return e.BuildWithConfig(cfg)
+}
+
+func (e *Engine) BuildWithConfig(cfg ScanConfig) (*Graph, error) {
 	result, err := Scan(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("scan: %w", err)

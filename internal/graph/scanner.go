@@ -8,6 +8,7 @@ import (
 
 type ScanConfig struct {
 	Root         string
+	Language     Language
 	ExcludeDirs  []string
 	ExcludeFiles []string
 	MaxSize      int64
@@ -78,6 +79,10 @@ func Scan(cfg ScanConfig) (*ScanResult, error) {
 		ext := strings.ToLower(filepath.Ext(path))
 		lang, ok := LangFromExt(ext)
 		if !ok {
+			return nil
+		}
+
+		if cfg.Language != "" && lang != cfg.Language {
 			return nil
 		}
 

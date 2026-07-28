@@ -2,10 +2,13 @@ package ui
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 )
 
 // ── Layer classification ──────────────────────────────────────────────
@@ -46,11 +49,52 @@ var layerOrder = []pkgLayer{
 	layerAIIntegration,
 }
 
-func classifyPath(path string) pkgLayer {
+func classifyPath(path string, lang string) pkgLayer {
 	if strings.HasPrefix(path, "cmd/") {
 		return layerEntryPoints
 	}
 	if !strings.HasPrefix(path, "internal/") {
+		switch lang {
+		case "java":
+			if isJavaLayerDir(path, "controller") || isJavaLayerDir(path, "web") || isJavaLayerDir(path, "api") {
+				return layerPresentation
+			}
+			if isJavaLayerDir(path, "service") || isJavaLayerDir(path, "business") {
+				return layerApplication
+			}
+			if isJavaLayerDir(path, "domain") || isJavaLayerDir(path, "model") {
+				return layerDomain
+			}
+			if isJavaLayerDir(path, "repository") || isJavaLayerDir(path, "dao") || isJavaLayerDir(path, "persistence") {
+				return layerInfrastructure
+			}
+			return layerInfrastructure
+		case "typescript", "javascript":
+			if strings.Contains(path, "src/") || strings.Contains(path, "pages") || strings.Contains(path, "components") || strings.Contains(path, "views") {
+				return layerPresentation
+			}
+			if strings.Contains(path, "server") || strings.Contains(path, "api") || strings.Contains(path, "routes") {
+				return layerApplication
+			}
+			if strings.Contains(path, "lib") || strings.Contains(path, "utils") || strings.Contains(path, "common") {
+				return layerDomain
+			}
+			return layerInfrastructure
+		case "python":
+			if strings.Contains(path, "app") || strings.Contains(path, "views") || strings.Contains(path, "routes") {
+				return layerPresentation
+			}
+			if strings.Contains(path, "services") || strings.Contains(path, "business") {
+				return layerApplication
+			}
+			if strings.Contains(path, "models") || strings.Contains(path, "domain") {
+				return layerDomain
+			}
+			if strings.Contains(path, "repositories") || strings.Contains(path, "db") || strings.Contains(path, "persistence") {
+				return layerInfrastructure
+			}
+			return layerInfrastructure
+		}
 		return layerInfrastructure
 	}
 	seg := strings.TrimPrefix(path, "internal/")
@@ -75,6 +119,29 @@ func classifyPath(path string) pkgLayer {
 	default:
 		return layerInfrastructure
 	}
+}
+
+func isJavaLayerDir(path, layer string) bool {
+	parts := strings.Split(path, "/")
+	for _, p := range parts {
+		if p == layer {
+			return true
+		}
+	}
+	return false
+}
+
+func detectGraphLanguageForGraph(g *graph.Graph, m *model) string {
+	if g == nil || len(g.Files) == 0 {
+		if m.extractorRegistry != nil {
+			if lang, _, ok := m.extractorRegistry.DetectLanguage(m.workspaceRoot); ok {
+				return string(lang)
+			}
+		}
+		return "go"
+	}
+	firstFile := g.Files[0]
+	return string(firstFile.Language)
 }
 
 // ── Analysis types ────────────────────────────────────────────────────
@@ -214,19 +281,19 @@ func buildSymbolIndex(g *graph.Graph, filePkg map[string]string) map[string]stri
 
 // ── Analysis ──────────────────────────────────────────────────────────
 
-func analyze(g *graph.Graph) *archReport {
+func analyze(g *graph.Graph, lang string) *archReport {
 	modPath := detectModuleRoot(g)
 	r := &archReport{
 		ModulePath: modPath,
 		Pkgs:       make(map[string]*pkgSummary),
-		Language:   "Go",
+		Language:   lang,
 	}
 	filePkg := make(map[string]string)
 
 	for _, f := range g.Files {
 		pkg := pkgLabel(f.Path)
 		if _, ok := r.Pkgs[pkg]; !ok {
-			r.Pkgs[pkg] = &pkgSummary{Name: pkg, Layer: classifyPath(f.Path)}
+			r.Pkgs[pkg] = &pkgSummary{Name: pkg, Layer: classifyPath(f.Path, lang)}
 			r.PkgOrder = append(r.PkgOrder, pkg)
 		}
 		filePkg[f.Path] = pkg
@@ -246,6 +313,8 @@ func analyze(g *graph.Graph) *archReport {
 				}
 			case graph.SymbolFunction:
 				if sym.Name == "main" {
+					ps.EntryPoints = append(ps.EntryPoints, entryPt{Name: sym.Name, File: f.Path, Line: sym.Line})
+				} else if isEntryPoint(sym.Name, f.Path, lang) {
 					ps.EntryPoints = append(ps.EntryPoints, entryPt{Name: sym.Name, File: f.Path, Line: sym.Line})
 				}
 			}
@@ -794,39 +863,199 @@ func classifyPattern(r *archReport, depMap map[string]map[string]bool) (string, 
 func readingOrder(r *archReport) []readEntry {
 	var order []readEntry
 
-	if entry, ok := r.Pkgs["cmd/izen"]; ok && len(entry.EntryPoints) > 0 {
-		order = append(order, readEntry{Path: "cmd/izen/main.go", Label: "Application bootstrap"})
-	}
+	switch r.Language {
+	case "go":
+		if entry, ok := r.Pkgs["cmd/izen"]; ok && len(entry.EntryPoints) > 0 {
+			order = append(order, readEntry{Path: "cmd/izen/main.go", Label: "Application bootstrap"})
+		}
 
-	if _, ok := r.Pkgs["ui"]; ok {
-		order = append(order, readEntry{Path: "internal/ui/", Label: "TUI lifecycle (model → view → update)"})
-	}
-	if _, ok := r.Pkgs["engine"]; ok {
-		order = append(order, readEntry{Path: "internal/engine/", Label: "Workflow engine — core dispatch"})
-	}
-	if _, ok := r.Pkgs["modes"]; ok {
-		order = append(order, readEntry{Path: "internal/modes/", Label: "Command modes (ask / plan / build / investigate / review)"})
-	}
-	if _, ok := r.Pkgs["retrieval"]; ok {
-		order = append(order, readEntry{Path: "internal/retrieval/", Label: "Code context retrieval & compression"})
-	}
-	if _, ok := r.Pkgs["ai"]; ok {
-		order = append(order, readEntry{Path: "internal/ai/", Label: "LLM provider integration"})
-	}
-	if _, ok := r.Pkgs["graph"]; ok {
-		order = append(order, readEntry{Path: "internal/graph/", Label: "Code graph — symbol index + parser"})
+		if _, ok := r.Pkgs["ui"]; ok {
+			order = append(order, readEntry{Path: "internal/ui/", Label: "TUI lifecycle (model → view → update)"})
+		}
+		if _, ok := r.Pkgs["engine"]; ok {
+			order = append(order, readEntry{Path: "internal/engine/", Label: "Workflow engine — core dispatch"})
+		}
+		if _, ok := r.Pkgs["modes"]; ok {
+			order = append(order, readEntry{Path: "internal/modes/", Label: "Command modes (ask / plan / build / investigate / review)"})
+		}
+		if _, ok := r.Pkgs["retrieval"]; ok {
+			order = append(order, readEntry{Path: "internal/retrieval/", Label: "Code context retrieval & compression"})
+		}
+		if _, ok := r.Pkgs["ai"]; ok {
+			order = append(order, readEntry{Path: "internal/ai/", Label: "LLM provider integration"})
+		}
+		if _, ok := r.Pkgs["graph"]; ok {
+			order = append(order, readEntry{Path: "internal/graph/", Label: "Code graph — symbol index + parser"})
+		}
+
+	case "java":
+		order = append(order, readEntry{Path: "src/main/java/", Label: "Main Java source tree"})
+		order = append(order, readEntry{Path: "pom.xml or build.gradle", Label: "Build configuration (dependency graph)"})
+		for _, pkg := range r.PkgOrder {
+			ps := r.Pkgs[pkg]
+			for _, ep := range ps.EntryPoints {
+				order = append(order, readEntry{Path: ep.File, Label: "Entry: " + ep.Name})
+			}
+		}
+
+	case "typescript", "javascript":
+		order = append(order, readEntry{Path: "package.json", Label: "Project configuration and dependencies"})
+		order = append(order, readEntry{Path: "src/", Label: "Main source directory"})
+		if tsEntry := findTSEntryPoint(r); tsEntry != "" {
+			order = append(order, readEntry{Path: tsEntry, Label: "Application entry point"})
+		}
+
+	case "python":
+		order = append(order, readEntry{Path: "pyproject.toml or setup.py", Label: "Project configuration"})
+		order = append(order, readEntry{Path: "app.py or main.py", Label: "Application entry point"})
+		for _, pkg := range r.PkgOrder {
+			ps := r.Pkgs[pkg]
+			for _, ep := range ps.EntryPoints {
+				order = append(order, readEntry{Path: ep.File, Label: "Entry: " + ep.Name})
+			}
+		}
+
+	default:
+		for _, pkg := range r.PkgOrder {
+			ps := r.Pkgs[pkg]
+			for _, f := range ps.Files {
+				order = append(order, readEntry{Path: f, Label: "Source file"})
+			}
+		}
 	}
 
 	return order
 }
 
+func findTSEntryPoint(r *archReport) string {
+	for _, pkg := range r.PkgOrder {
+		ps := r.Pkgs[pkg]
+		for _, f := range ps.Files {
+			base := filepath.Base(f)
+			if base == "index.ts" || base == "index.tsx" || base == "main.ts" || base == "main.tsx" || base == "server.ts" || base == "app.ts" {
+				return f
+			}
+		}
+	}
+	return ""
+}
+
+// isEntryPoint checks whether a function is a likely application entry point
+// based on its name and file path for the given language.
+func isEntryPoint(name, filePath, lang string) bool {
+	base := filepath.Base(filePath)
+	switch lang {
+	case "java":
+		return name == "main"
+	case "typescript", "javascript":
+		return base == "index.ts" || base == "index.tsx" || base == "main.ts" || base == "main.tsx" || base == "server.ts" || base == "app.ts" || base == "index.js" || base == "main.js" || base == "server.js" || base == "app.js"
+	case "python":
+		return base == "app.py" || base == "main.py" || base == "manage.py" || name == "main" || name == "cli" || name == "run" || name == "serve"
+	default:
+		return false
+	}
+}
+
 // ── Rendering ─────────────────────────────────────────────────────────
 
-func (m *model) renderArch() string {
-	if m.graph == nil {
-		return "no graph data available — run a build command first"
+func (m *model) buildArchGraph() *graph.Graph {
+	if m.extractorRegistry != nil {
+		lang, extractor, ok := m.extractorRegistry.DetectLanguage(m.workspaceRoot)
+		if ok && lang != symbol.LangGo && extractor != nil {
+			g, err := m.graphEng.BuildForLanguage(graph.Language(lang))
+			if err == nil && g != nil && len(g.Files) > 0 {
+				return g
+			}
+			syms, symErr := retrieval.NewPolyglotEngine(m.workspaceRoot, m.extractorRegistry).ExtractAllSymbols()
+			if symErr == nil && len(syms) > 0 {
+				return graphFromPolyglot(syms)
+			}
+		}
 	}
-	r := analyze(m.graph)
+	if m.graphEng != nil {
+		g, err := m.graphEng.Build()
+		if err == nil {
+			return g
+		}
+	}
+	return nil
+}
+
+func graphFromPolyglot(syms []symbol.FileASTInfo) *graph.Graph {
+	g := graph.NewGraph("")
+	for _, fi := range syms {
+		fn := graph.FileNode{
+			Path:     fi.FilePath,
+			Language: graph.Language(fi.Language),
+			Package:  fi.Package,
+			Size:     0,
+			Lines:    0,
+		}
+		for _, sym := range fi.Symbols {
+			gk := symbolKindToGraphKind(sym.Kind)
+			if gk < 0 {
+				continue
+			}
+			fn.Symbols = append(fn.Symbols, graph.Symbol{
+				Name:      sym.Name,
+				Kind:      graph.SymbolKind(gk),
+				File:      sym.FilePath,
+				Line:      sym.StartLine,
+				Column:    1,
+				EndLine:   sym.EndLine,
+				EndColumn: sym.EndLine,
+				Parent:    sym.Parent,
+				Signature: sym.Signature,
+				Exported:  sym.Exported,
+			})
+		}
+		for _, imp := range fi.Imports {
+			fn.Imports = append(fn.Imports, imp.ImportPath)
+		}
+		g.AddFile(fn)
+	}
+	return g
+}
+
+func symbolKindToGraphKind(sk symbol.SymbolKind) int {
+	switch sk {
+	case symbol.SymbolFunction:
+		return int(graph.SymbolFunction)
+	case symbol.SymbolMethod:
+		return int(graph.SymbolMethod)
+	case symbol.SymbolStruct:
+		return int(graph.SymbolStruct)
+	case symbol.SymbolInterface:
+		return int(graph.SymbolInterface)
+	case symbol.SymbolClass:
+		return int(graph.SymbolClass)
+	case symbol.SymbolVariable:
+		return int(graph.SymbolVariable)
+	case symbol.SymbolConstant:
+		return int(graph.SymbolConstant)
+	case symbol.SymbolEnum:
+		return int(graph.SymbolEnum)
+	case symbol.SymbolType:
+		return int(graph.SymbolType)
+	case symbol.SymbolPackage:
+		return int(graph.SymbolPackage)
+	case symbol.SymbolModule:
+		return int(graph.SymbolImport)
+	default:
+		return -1
+	}
+}
+
+func (m *model) renderArch() string {
+	g := m.graph
+	if g == nil || len(g.Files) == 0 {
+		g = m.buildArchGraph()
+		if g == nil || len(g.Files) == 0 {
+			return "no packages found in graph"
+		}
+	}
+	lang := detectGraphLanguageForGraph(g, m)
+	r := analyze(g, lang)
 	if len(r.Pkgs) == 0 {
 		return "no packages found in graph"
 	}

@@ -197,6 +197,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		gitEng:              eng,
 		graphEng:            graphEng,
 		graph:               g,
+		extractorRegistry:   retrieval.NewPolyglotRegistry(),
 		resolver:            modes.NewResolver(),
 		attachedFiles:       make([]string, 0),
 		execEng:             execEng,

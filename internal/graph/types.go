@@ -10,6 +10,7 @@ const (
 	SymbolType
 	SymbolStruct
 	SymbolInterface
+	SymbolClass
 	SymbolVariable
 	SymbolConstant
 	SymbolImport
@@ -30,6 +31,8 @@ func (k SymbolKind) String() string {
 		return "struct"
 	case SymbolInterface:
 		return "interface"
+	case SymbolClass:
+		return "class"
 	case SymbolVariable:
 		return "variable"
 	case SymbolConstant:
@@ -63,9 +66,12 @@ type Symbol struct {
 type Language string
 
 const (
-	LangGo     Language = "go"
-	LangPython Language = "python"
-	LangRust   Language = "rust"
+	LangGo         Language = "go"
+	LangPython     Language = "python"
+	LangRust       Language = "rust"
+	LangJava       Language = "java"
+	LangTypeScript Language = "typescript"
+	LangJavaScript Language = "javascript"
 )
 
 func LangFromExt(ext string) (Language, bool) {
@@ -76,6 +82,16 @@ func LangFromExt(ext string) (Language, bool) {
 		return LangPython, true
 	case ".rs":
 		return LangRust, true
+	case ".java":
+		return LangJava, true
+	case ".ts":
+		return LangTypeScript, true
+	case ".tsx":
+		return LangTypeScript, true
+	case ".js":
+		return LangJavaScript, true
+	case ".jsx":
+		return LangJavaScript, true
 	default:
 		return "", false
 	}
@@ -173,7 +189,7 @@ func (g *Graph) Stats() Stats {
 				s.FunctionCount++
 			case SymbolMethod:
 				s.MethodCount++
-			case SymbolType, SymbolStruct, SymbolInterface:
+			case SymbolType, SymbolStruct, SymbolInterface, SymbolClass:
 				s.TypeCount++
 			}
 		}
