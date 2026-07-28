@@ -191,11 +191,8 @@ type MCPConfig struct {
 }
 
 type LynxConfig struct {
-	Enabled           bool    `yaml:"enabled"`
-	LazyStart         bool    `yaml:"lazy_start"`
-	SemanticThreshold float64 `yaml:"semantic_threshold"`
-	IndexOnStart      bool    `yaml:"index_on_start"`
-	MaxResults        int     `yaml:"max_results"`
+	Enabled   bool `yaml:"enabled"`
+	LazyStart bool `yaml:"lazy_start"`
 }
 
 func (c *Config) ActiveProviderName() string {
@@ -426,11 +423,8 @@ func Default() *Config {
 			Enabled: true,
 		},
 		Lynx: LynxConfig{
-			Enabled:           true,
-			LazyStart:         true,
-			SemanticThreshold: 0.6,
-			IndexOnStart:      false,
-			MaxResults:        20,
+			Enabled:   true,
+			LazyStart: true,
 		},
 		MCP: MCPConfig{
 			Enabled: false,

@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/graph"
-	"github.com/PizenLabs/izen/internal/lynx"
 )
 
 // ── Log Deduplication & Topological Grouping ──────────────────────────────────
@@ -435,11 +434,23 @@ func (cc *ContextCompressor) CompressLines(text string) string {
 	return out.String()
 }
 
-func (cc *ContextCompressor) CompressResults(results []lynx.SearchResult) []lynx.SearchResult {
+func (cc *ContextCompressor) CompressChunks(chunks []CodeChunk) []CodeChunk {
+	if cc.matcher == nil || len(chunks) == 0 {
+		return chunks
+	}
+	compressed := make([]CodeChunk, len(chunks))
+	for i, c := range chunks {
+		compressed[i] = c
+		compressed[i].Content = cc.CompressLines(c.Content)
+	}
+	return compressed
+}
+
+func (cc *ContextCompressor) CompressResults(results []CodeCoord) []CodeCoord {
 	if cc.matcher == nil || len(results) == 0 {
 		return results
 	}
-	compressed := make([]lynx.SearchResult, len(results))
+	compressed := make([]CodeCoord, len(results))
 	for i, r := range results {
 		compressed[i] = r
 		compressed[i].Content = cc.CompressLines(r.Content)
@@ -483,17 +494,17 @@ func FormatPlanFrame(content string) string {
 	return b.String()
 }
 
-func FormatResultsAsSkeleton(results []lynx.SearchResult) string {
+func FormatChunksAsSkeleton(chunks []CodeChunk) string {
 	var b strings.Builder
-	for _, r := range results {
-		if r.Content == "" {
+	for _, c := range chunks {
+		if c.Content == "" {
 			continue
 		}
-		fmt.Fprintf(&b, "%s:%d\n", r.FilePath, r.StartLine)
-		if r.SymbolName != "" {
-			fmt.Fprintf(&b, "  %s\n", r.SymbolName)
+		fmt.Fprintf(&b, "%s:%d\n", c.File, c.StartLine)
+		if c.SymbolName != "" {
+			fmt.Fprintf(&b, "  %s\n", c.SymbolName)
 		}
-		for _, line := range strings.Split(r.Content, "\n") {
+		for _, line := range strings.Split(c.Content, "\n") {
 			if line != "" {
 				fmt.Fprintf(&b, "  %s\n", line)
 			}

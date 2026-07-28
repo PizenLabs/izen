@@ -1,6 +1,9 @@
 package retrieval
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestExtractSearchTermsSkipsRawLogSludge(t *testing.T) {
 	raw := `time="2024-01-01T12:00:00Z" level=error msg="panic: runtime error: invalid memory address or nil pointer dereference" goroutine 42 [running]: main.main(0x10, 0x20)`
@@ -54,8 +57,9 @@ func TestExtractSearchTermsNoRawLogSurvival(t *testing.T) {
 }
 
 func TestSearchWithExtractionSafeSkip(t *testing.T) {
-	// With nil controller, must return nil,nil (no [FAIL]).
-	res, err := SearchWithExtraction(nil, "the container exited with code 137 at 2024-05-01")
+	// With nil engine, must return nil,nil (no [FAIL]).
+	ctx := context.Background()
+	res, err := SearchWithExtraction(ctx, nil, "the container exited with code 137 at 2024-05-01")
 	if res != nil || err != nil {
 		t.Errorf("safe-skip expected nil,nil; got %v, %v", res, err)
 	}

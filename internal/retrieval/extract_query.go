@@ -1,10 +1,9 @@
 package retrieval
 
 import (
+	"context"
 	"regexp"
 	"strings"
-
-	"github.com/PizenLabs/izen/internal/lynx"
 )
 
 // extractionTokenRe matches structural search terms: filesystem paths
@@ -66,20 +65,20 @@ func ExtractSearchTerms(input string) []string {
 }
 
 // SearchWithExtraction performs a structural code search over the extracted
-// terms of input. When no clean terms are found it returns nil,nil by design
-// (safe-skip) instead of firing a raw query that would [FAIL].
-func SearchWithExtraction(lc *lynx.Controller, input string) ([]lynx.SearchResult, error) {
-	if lc == nil {
+// terms of input using the given SearchEngine. When no clean terms are found
+// it returns nil,nil by design (safe-skip) instead of firing a raw query.
+func SearchWithExtraction(ctx context.Context, engine SearchEngine, input string) ([]CodeChunk, error) {
+	if engine == nil {
 		return nil, nil
 	}
 	terms := ExtractSearchTerms(input)
 	if len(terms) == 0 {
 		return nil, nil
 	}
-	var merged []lynx.SearchResult
+	var merged []CodeChunk
 	var firstErr error
 	for _, term := range terms {
-		results, err := lc.SearchRaw(term)
+		results, err := engine.SearchContext(ctx, term)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err

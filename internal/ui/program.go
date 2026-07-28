@@ -27,7 +27,6 @@ import (
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/language"
-	"github.com/PizenLabs/izen/internal/lynx"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -198,6 +197,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		gitEng:              eng,
 		graphEng:            graphEng,
 		graph:               g,
+		extractorRegistry:   retrieval.NewPolyglotRegistry(),
 		resolver:            modes.NewResolver(),
 		attachedFiles:       make([]string, 0),
 		execEng:             execEng,
@@ -250,7 +250,6 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		m.logActivity(format, args...)
 	}
 	retrieval.SetActivityLogger(activityFn)
-	lynx.SetActivityLogger(activityFn)
 	execution.SetActivityLogger(activityFn)
 
 	// ── REDIRECT /investigate ENGINE LOG SINKS ───────────────────────────
@@ -316,7 +315,7 @@ func gitUsername(root string) string {
 	return ""
 }
 
-func bootCommon(root string, cfg *config.Config) (*session.Session, *ai.Manager, *lynx.Controller) {
+func bootCommon(root string, cfg *config.Config) (*session.Session, *ai.Manager, *retrieval.Router) {
 	sess, err := session.Load()
 	if err != nil {
 		sess = session.New()
@@ -353,21 +352,14 @@ func bootCommon(root string, cfg *config.Config) (*session.Session, *ai.Manager,
 	defaultProvider := cfg.ActiveProviderName()
 	mgr.SetDefault(defaultProvider)
 
-	var lc *lynx.Controller
-	if cfg.Lynx.Enabled {
-		lc = lynx.NewController(root, cfg.Lynx.LazyStart)
-		retrieval.SetLynxController(lc)
-
-		if err := lc.EnsureStarted(); err != nil {
-			fmt.Fprintf(os.Stderr, "izen: lynx warning: %v\n", err)
-		}
-
-		if cfg.Lynx.LazyStart {
-			lc.StartLazy()
-		}
+	// Create the search router — auto-detects lx in PATH.
+	activityFn := func(format string, args ...interface{}) {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
 	}
+	router := retrieval.NewRouter(root, activityFn)
+	retrieval.SetGlobalRouter(router)
 
-	return sess, mgr, lc
+	return sess, mgr, router
 }
 
 func runProgram(p *tea.Program) {
@@ -386,11 +378,8 @@ func runProgram(p *tea.Program) {
 }
 
 func RunMainDashboard(cfg *config.Config, root string, localCfg *config.LocalConfig, det ...project.Detection) {
-	sess, mgr, lc := bootCommon(root, cfg)
-
-	if lc != nil {
-		defer func() { _ = lc.Stop() }()
-	}
+	sess, mgr, router := bootCommon(root, cfg)
+	_ = router // router is registered globally via SetGlobalRouter
 
 	detection := project.Detection{}
 	if len(det) > 0 {
@@ -402,7 +391,8 @@ func RunMainDashboard(cfg *config.Config, root string, localCfg *config.LocalCon
 }
 
 func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalConfig, det ...project.Detection) {
-	sess, mgr, lc := bootCommon(root, cfg)
+	sess, mgr, router := bootCommon(root, cfg)
+	_ = router
 
 	// ── VIRTUAL SNAPSHOT ROLLBACK ────────────────────────────────────────
 	// Create an execution engine and rollback any in-flight patches. This
@@ -417,10 +407,6 @@ func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalCo
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "izen: rollback complete — workspace restored to last snapshot.\n")
-	}
-
-	if lc != nil {
-		defer func() { _ = lc.Stop() }()
 	}
 
 	detection := project.Detection{}

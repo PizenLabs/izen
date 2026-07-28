@@ -63,14 +63,17 @@ var validSystemCommands = map[string]struct{}{
 // corrupt regex-based stack frame parsers in auto-trace.
 var ansiRe = regexp.MustCompile("\x1b\\[[0-9;]*[a-zA-Z]")
 
-// inputANSIRe strips ALL escape sequences from the interactive text-input
+// inputANSIRe strips all escape sequences from the interactive text-input
 // buffer, including SGR mouse-tracking reports (\x1b[<0;26;37M / \x1b[<...m)
 // and trailing coordinate remnants. Bubble Tea parses genuine mouse events
 // into tea.MouseMsg before they reach the textinput, so under normal operation
 // nothing leaks — but a defensive strip here guarantees no raw terminal escape
 // can ever pollute the editable command buffer (e.g. during /build shell
 // execution context switches where raw-mode state could briefly differ).
-var inputANSIRe = regexp.MustCompile(`\x1b\[[<?][0-9;]*[a-zA-Z]`)
+// It also catches orphaned sequences (ESC byte stripped upstream) like
+// [<64;83;30M that would otherwise leak into the input buffer during
+// mouse wheel scrolling.
+var inputANSIRe = regexp.MustCompile(`\x1b\[[<?][0-9;]*[a-zA-Z]|\[<[0-9;]+M`)
 
 // sanitizeInputBuffer strips ANSI / mouse-tracking escape sequences from a
 // string so it is safe to store in the prompt's text buffer.
@@ -1496,7 +1499,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
 		m.push(roleSystem, infoStyle.Render("  /help  /usage  /model  /objective  /drop  /clear  /quit"))
-		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch"))
+		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>"))
 		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
 		m.push(roleSystem, infoStyle.Render("  /usage           inspect token usage and provider status"))
 		m.push(roleSystem, infoStyle.Render("  /model        interactive model picker (fuzzy search)"))
@@ -1704,12 +1707,13 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("/checkpoint not yet implemented"))
 		return nil
 
-	case cmd == "/arch":
+	case strings.HasPrefix(cmd, "/arch"):
 		m.showBanner = false
+		args := strings.TrimSpace(strings.TrimPrefix(cmd, "/arch"))
 		m.push(roleSystem, "Mapping codebase...")
 		m.refreshViewportContent()
 		return func() tea.Msg {
-			graphText := m.renderArch()
+			graphText := m.renderArch(args)
 			return archDoneMsg{Content: graphText}
 		}
 

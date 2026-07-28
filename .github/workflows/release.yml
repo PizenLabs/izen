@@ -23,31 +23,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      ####################################################
-      # Go
-      ####################################################
-
       - name: Setup Go
         uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-
-      ####################################################
-      # Rust
-      ####################################################
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: lynx
-
-      ####################################################
-      # Build
-      ####################################################
 
       - name: Build
         run: make build
@@ -55,18 +35,10 @@ jobs:
       - name: Verify Binary
         run: ./bin/izen --version
 
-      ####################################################
-      # Checksums
-      ####################################################
-
       - name: Generate SHA256
         run: |
           cd bin
           sha256sum izen > izen_SHA256SUMS.txt
-
-      ####################################################
-      # GitHub Release
-      ####################################################
 
       - name: Publish Release
         uses: softprops/action-gh-release@v3

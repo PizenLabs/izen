@@ -33,6 +33,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/project"
+	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
@@ -541,14 +542,15 @@ type TaskFinishedMsg struct{}
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 type model struct {
-	cfg      *config.Config
-	sess     *session.Session
-	provider ai.Provider
-	mgr      *ai.Manager
-	resolver *modes.Resolver
-	gitEng   *git.Engine
-	graphEng *graph.Engine
-	graph    *graph.Graph
+	cfg               *config.Config
+	sess              *session.Session
+	provider          ai.Provider
+	mgr               *ai.Manager
+	resolver          *modes.Resolver
+	gitEng            *git.Engine
+	graphEng          *graph.Engine
+	graph             *graph.Graph
+	extractorRegistry *symbol.ExtractorRegistry
 
 	// Input
 	ti    textinput.Model

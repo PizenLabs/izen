@@ -9,8 +9,11 @@ import (
 
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/golang"
+	"github.com/smacker/go-tree-sitter/java"
+	"github.com/smacker/go-tree-sitter/javascript"
 	"github.com/smacker/go-tree-sitter/python"
 	"github.com/smacker/go-tree-sitter/rust"
+	"github.com/smacker/go-tree-sitter/typescript/typescript"
 )
 
 type Parser struct {
@@ -24,6 +27,9 @@ func NewParser() *Parser {
 	p.init(LangGo, golang.GetLanguage())
 	p.init(LangPython, python.GetLanguage())
 	p.init(LangRust, rust.GetLanguage())
+	p.init(LangJava, java.GetLanguage())
+	p.init(LangJavaScript, javascript.GetLanguage())
+	p.init(LangTypeScript, typescript.GetLanguage())
 
 	return p
 }
@@ -121,6 +127,14 @@ func extractImports(n *sitter.Node, src []byte, lang Language) []string {
 		collectNodeTypes(n, src, "use_declaration", func(node *sitter.Node, content string) {
 			imports = append(imports, content)
 		})
+	case LangJava:
+		collectNodeTypes(n, src, "import_declaration", func(node *sitter.Node, content string) {
+			imports = append(imports, strings.Trim(content, ";"))
+		})
+	case LangJavaScript, LangTypeScript:
+		collectNodeTypes(n, src, "import_statement", func(node *sitter.Node, content string) {
+			imports = append(imports, content)
+		})
 	}
 
 	return uniqueStrings(imports)
@@ -151,6 +165,12 @@ func extractSymbols(n *sitter.Node, src []byte, lang Language, file string) []Sy
 		extractPythonSymbols(n, src, file, &symbols)
 	case LangRust:
 		extractRustSymbols(n, src, file, &symbols)
+	case LangJava:
+		extractJavaSymbols(n, src, file, &symbols)
+	case LangJavaScript:
+		extractJSSymbols(n, src, file, &symbols)
+	case LangTypeScript:
+		extractTSSymbols(n, src, file, &symbols)
 	}
 
 	return symbols
@@ -408,6 +428,149 @@ func isExportedName(name string) bool {
 		return false
 	}
 	return name[0] >= 'A' && name[0] <= 'Z'
+}
+
+func extractJavaSymbols(n *sitter.Node, src []byte, file string, symbols *[]Symbol) {
+	c := int(n.NamedChildCount())
+	for i := range c {
+		child := n.NamedChild(i)
+		if child == nil {
+			continue
+		}
+
+		switch child.Type() {
+		case "class_declaration":
+			sym := makeSymbol(child, src, file, SymbolClass)
+			if sym.Name != "" {
+				nameNode := child.ChildByFieldName("name")
+				if nameNode != nil {
+					sym.Exported = isJavaExported(nameNode.Content(src))
+				}
+				*symbols = append(*symbols, sym)
+			}
+
+		case "interface_declaration":
+			sym := makeSymbol(child, src, file, SymbolInterface)
+			if sym.Name != "" {
+				nameNode := child.ChildByFieldName("name")
+				if nameNode != nil {
+					sym.Exported = isJavaExported(nameNode.Content(src))
+				}
+				*symbols = append(*symbols, sym)
+			}
+
+		case "enum_declaration":
+			sym := makeSymbol(child, src, file, SymbolEnum)
+			if sym.Name != "" {
+				nameNode := child.ChildByFieldName("name")
+				if nameNode != nil {
+					sym.Exported = isJavaExported(nameNode.Content(src))
+				}
+				*symbols = append(*symbols, sym)
+			}
+
+		case "method_declaration":
+			sym := makeSymbol(child, src, file, SymbolMethod)
+			if sym.Name != "" {
+				nameNode := child.ChildByFieldName("name")
+				if nameNode != nil {
+					sym.Exported = isJavaExported(nameNode.Content(src))
+				}
+				*symbols = append(*symbols, sym)
+			}
+		}
+
+		extractJavaSymbols(child, src, file, symbols)
+	}
+}
+
+func extractJSSymbols(n *sitter.Node, src []byte, file string, symbols *[]Symbol) {
+	c := int(n.NamedChildCount())
+	for i := range c {
+		child := n.NamedChild(i)
+		if child == nil {
+			continue
+		}
+
+		switch child.Type() {
+		case "function_definition":
+			sym := makeSymbol(child, src, file, SymbolFunction)
+			*symbols = append(*symbols, sym)
+		case "class_declaration":
+			sym := makeSymbol(child, src, file, SymbolClass)
+			*symbols = append(*symbols, sym)
+		case "lexical_declaration":
+			for j := 0; j < int(child.ChildCount()); j++ {
+				decl := child.Child(j)
+				if decl != nil && decl.Type() == "variable_declarator" {
+					nameNode := decl.ChildByFieldName("name")
+					if nameNode != nil {
+						sym := Symbol{
+							Kind:   SymbolVariable,
+							File:   file,
+							Line:   int(decl.StartPoint().Row) + 1,
+							Column: int(decl.StartPoint().Column) + 1,
+							Name:   nameNode.Content(src),
+						}
+						*symbols = append(*symbols, sym)
+					}
+				}
+			}
+		}
+
+		extractJSSymbols(child, src, file, symbols)
+	}
+}
+
+func extractTSSymbols(n *sitter.Node, src []byte, file string, symbols *[]Symbol) {
+	c := int(n.NamedChildCount())
+	for i := range c {
+		child := n.NamedChild(i)
+		if child == nil {
+			continue
+		}
+
+		switch child.Type() {
+		case "function_definition":
+			sym := makeSymbol(child, src, file, SymbolFunction)
+			*symbols = append(*symbols, sym)
+		case "class_declaration":
+			sym := makeSymbol(child, src, file, SymbolClass)
+			*symbols = append(*symbols, sym)
+		case "interface_declaration":
+			sym := makeSymbol(child, src, file, SymbolInterface)
+			*symbols = append(*symbols, sym)
+		case "type_alias_declaration":
+			sym := makeSymbol(child, src, file, SymbolClass)
+			*symbols = append(*symbols, sym)
+		case "enum_declaration":
+			sym := makeSymbol(child, src, file, SymbolEnum)
+			*symbols = append(*symbols, sym)
+		case "lexical_declaration":
+			for j := 0; j < int(child.ChildCount()); j++ {
+				decl := child.Child(j)
+				if decl != nil && decl.Type() == "variable_declarator" {
+					nameNode := decl.ChildByFieldName("name")
+					if nameNode != nil {
+						sym := Symbol{
+							Kind:   SymbolVariable,
+							File:   file,
+							Line:   int(decl.StartPoint().Row) + 1,
+							Column: int(decl.StartPoint().Column) + 1,
+							Name:   nameNode.Content(src),
+						}
+						*symbols = append(*symbols, sym)
+					}
+				}
+			}
+		}
+
+		extractTSSymbols(child, src, file, symbols)
+	}
+}
+
+func isJavaExported(name string) bool {
+	return strings.HasPrefix(strings.TrimSpace(name), "public")
 }
 
 func uniqueStrings(s []string) []string {

@@ -17,7 +17,7 @@ var allTips = []string{
 	"Use /objective to define high-level goals that persist across sessions.",
 	"Use /undo to revert the last build operation.",
 	"Use /checkpoint to manually save the current workspace state.",
-	"Use /arch to render a dependency graph of your codebase.",
+	"Use /arch to render a codebase architecture map. Use /arch --all for the full expanded view, /arch Presentation to drill into a layer.",
 	"The ctx optimized metric shows how much context was saved by AST pruning.",
 	"Use /drop to remove attached files from the current session context.",
 	"Run /help or /? at any time to see all available commands.",

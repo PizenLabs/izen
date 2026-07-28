@@ -28,13 +28,6 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download Rust Coverage
-        uses: actions/download-artifact@v8
-        with:
-          name: coverage-rust
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Show downloaded files
         run: |
           pwd
@@ -45,7 +38,6 @@ jobs:
         with:
           files: |
             coverage-go.out
-            lcov.info
           fail_ci_if_error: true
           verbose: true
         env:
