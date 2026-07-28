@@ -1,28 +1,28 @@
 package retrieval
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/core/artifact"
 	"github.com/PizenLabs/izen/internal/graph"
-	"github.com/PizenLabs/izen/internal/lynx"
 )
 
-var globalLynx *lynx.Controller
+var globalRouter *Router
 var globalCompressor *ContextCompressor
 
-func SetLynxController(lc *lynx.Controller) {
-	globalLynx = lc
+func SetGlobalRouter(r *Router) {
+	globalRouter = r
+}
+
+func GetGlobalRouter() *Router {
+	return globalRouter
 }
 
 func SetGlobalCompressor(cc *ContextCompressor) {
 	globalCompressor = cc
-}
-
-func GetLynxController() *lynx.Controller {
-	return globalLynx
 }
 
 func GetGlobalCompressor() *ContextCompressor {
@@ -175,7 +175,7 @@ func (r *Retriever) Retrieve(query Query) *ResultSet {
 		rs := r.executeTier(tier, query)
 		if rs == nil || rs.Empty() {
 			if rs != nil && rs.Error != "" && globalActivityLog != nil {
-				globalActivityLog("[lx] tier %s error: %s", tier, rs.Error)
+				globalActivityLog("[search] tier %s error: %s", tier, rs.Error)
 			}
 			continue
 		}
@@ -228,14 +228,15 @@ func (r *Retriever) executeTier(tier Tier, query Query) *ResultSet {
 		}
 
 	case TierLynx:
-		if globalLynx == nil {
+		router := GetGlobalRouter()
+		if router == nil {
 			return nil
 		}
 		if query.Symbol != "" {
-			return r.executeLynxResolve(query)
+			return r.executeSearchResolve(router, query)
 		}
 		if query.Text != "" && len(query.Text) >= 5 {
-			return r.executeLynxSearch(query)
+			return r.executeSearchContext(router, query)
 		}
 		return nil
 
@@ -297,112 +298,61 @@ func (r *Retriever) executeTier(tier Tier, query Query) *ResultSet {
 	}
 }
 
-func (r *Retriever) executeLynxSearch(query Query) *ResultSet {
+func (r *Retriever) executeSearchResolve(router *Router, query Query) *ResultSet {
 	if globalActivityLog != nil {
-		globalActivityLog("[system] spawning engine: lx --search %q", query.Text)
+		globalActivityLog("[system] resolving symbol: %s", query.Symbol)
 	}
 
-	rawResults, err := globalLynx.SearchRaw(query.Text)
-	if err == nil && globalCompressor != nil && len(rawResults) > 0 {
-		rawResults = globalCompressor.CompressResults(rawResults)
-	}
+	coords, err := router.ResolveSymbol(context.Background(), query.Symbol)
 	if err != nil {
 		if globalActivityLog != nil {
-			globalActivityLog("[FAIL] lx --search %q: %v", query.Text, err)
+			globalActivityLog("[FAIL] resolve %q: %v", query.Symbol, err)
 		}
 		return &ResultSet{
-			Strategy:   "lynx.semantic",
+			Strategy:   "search.resolve",
 			Confidence: 0,
-			Error:      fmt.Sprintf("lynx search: %v", err),
+			Error:      fmt.Sprintf("resolve: %v", err),
 		}
 	}
 
-	rs := &ResultSet{
-		Strategy:   "lynx.semantic",
-		Confidence: ConfSemantic.Float64(),
-	}
-	maxScore := 0.0
-	for _, rr := range rawResults {
-		score := rr.Score
-		if score > maxScore {
-			maxScore = score
-		}
-		rs.Add(Result{
-			File:       rr.FilePath,
-			Line:       rr.StartLine,
-			Content:    rr.Content,
-			Strategy:   "lynx.semantic",
-			SymbolName: rr.SymbolName,
-			Score:      score,
-			Confidence: score,
-		})
-	}
-	if !rs.Empty() {
-		rs.Confidence = maxScore
-	}
+	rs := SearchResultAdapter(coords, "search.resolve")
 
-	if globalActivityLog != nil {
-		if !rs.Empty() {
-			globalActivityLog("[ OK ] lx --search %q: %d results (max BM25=%.3f)", query.Text, len(rs.Results), maxScore)
-		}
-		// Contract invariant: log low-relevance scores explicitly.
-		if rs.Empty() || maxScore < 0.3 {
-			globalActivityLog("[lx] low relevance score (%.3f) for query %q", maxScore, query.Text)
-		}
+	if globalActivityLog != nil && !rs.Empty() {
+		globalActivityLog("[ OK ] resolve %q: %d results", query.Symbol, len(rs.Results))
+	}
+	if rs.Empty() {
+		globalActivityLog("[search] no results for resolve %q", query.Symbol)
 	}
 
 	return rs
 }
 
-func (r *Retriever) executeLynxResolve(query Query) *ResultSet {
+func (r *Retriever) executeSearchContext(router *Router, query Query) *ResultSet {
 	if globalActivityLog != nil {
-		globalActivityLog("[system] spawning engine: lx --resolve %q", query.Symbol)
+		globalActivityLog("[system] searching context: %s", query.Text)
 	}
 
-	rawResults, err := globalLynx.ResolveSymbolRaw(query.Symbol)
+	chunks, err := router.SearchContext(context.Background(), query.Text)
 	if err != nil {
 		if globalActivityLog != nil {
-			globalActivityLog("[FAIL] lx --resolve %q: %v", query.Symbol, err)
+			globalActivityLog("[FAIL] search %q: %v", query.Text, err)
 		}
 		return &ResultSet{
-			Strategy:   "lynx.resolve",
+			Strategy:   "search.context",
 			Confidence: 0,
-			Error:      fmt.Sprintf("lynx resolve: %v", err),
+			Error:      fmt.Sprintf("search: %v", err),
 		}
 	}
 
-	rs := &ResultSet{
-		Strategy:   "lynx.resolve",
-		Confidence: ConfFuzzy.Float64(),
-	}
-	maxScore := 0.0
-	for _, rr := range rawResults {
-		score := rr.Score
-		if score > maxScore {
-			maxScore = score
-		}
-		rs.Add(Result{
-			File:       rr.FilePath,
-			Line:       rr.StartLine,
-			Strategy:   "lynx.resolve",
-			SymbolName: query.Symbol,
-			Content:    rr.Content,
-			Score:      score,
-			Confidence: score,
-		})
-	}
-	if !rs.Empty() {
-		rs.Confidence = maxScore
+	// Compress if available.
+	if globalCompressor != nil && len(chunks) > 0 {
+		chunks = globalCompressor.CompressChunks(chunks)
 	}
 
-	if globalActivityLog != nil {
-		if !rs.Empty() {
-			globalActivityLog("[ OK ] lx --resolve %q: %d results (max BM25=%.3f)", query.Symbol, len(rs.Results), maxScore)
-		}
-		// Contract invariant: log low-relevance scores explicitly.
-		if rs.Empty() || maxScore < 0.3 {
-			globalActivityLog("[lx] low relevance score (%.3f) for resolve %q", maxScore, query.Symbol)
-		}
+	rs := SearchChunkAdapter(chunks, "search.context")
+
+	if globalActivityLog != nil && !rs.Empty() {
+		globalActivityLog("[ OK ] search %q: %d results", query.Text, len(rs.Results))
 	}
 
 	return rs

@@ -134,9 +134,10 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	if !fastTrack && HasCanonicalImportMismatch(ledgerContent) {
 		mismatch := retrieval.ParseCanonicalMismatch(ledgerContent)
 		if mismatch != nil && mismatch.OldPath != "" && mismatch.NewPath != "" {
-			resolver := retrieval.NewLXCoordinateResolver()
-			if resolver != nil {
-				//nolint:contextcheck // lynx controller API predates context propagation
+			router := retrieval.GetGlobalRouter()
+			if router != nil {
+				resolver := retrieval.NewSearchEngineResolver(router.Engine())
+				//nolint:contextcheck // search engine API predates context propagation
 				refs, err := resolver.ResolveCanonicalMismatch(mismatch)
 				if err == nil && len(refs) > 0 {
 					tasks := make([]Task, 0, len(refs)+2)
@@ -150,7 +151,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 							Type:        "FILE_MUTATE",
 							Target:      ref.File,
 							Description: desc,
-							Rationale:   fmt.Sprintf("Canonical import mismatch resolved by lx at %s:%d-%d", ref.File, ref.StartLine, ref.EndLine),
+							Rationale:   fmt.Sprintf("Canonical import mismatch resolved by search at %s:%d-%d", ref.File, ref.StartLine, ref.EndLine),
 							Solution:    fmt.Sprintf("Replaced %q with %q in %s", mismatch.OldPath, mismatch.NewPath, ref.File),
 							IsHardcoded: true,
 						})

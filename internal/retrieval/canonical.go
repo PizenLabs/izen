@@ -1,13 +1,12 @@
 package retrieval
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
-
-	"github.com/PizenLabs/izen/internal/lynx"
 )
 
 // Canonical mismatch pattern from Go compiler:
@@ -180,9 +179,9 @@ func extractErrorCoordinate(line string) (string, int, bool) {
 	return m[1], lineNum, true
 }
 
-// ── LX Coordinate Resolver ──────────────────────────────────────────────────
+// ── Coordinate Resolver ─────────────────────────────────────────────────────
 
-// LXCoordinateRef holds a single coordinate reference resolved by lx.
+// LXCoordinateRef holds a single coordinate reference for an edit target.
 type LXCoordinateRef struct {
 	File       string
 	StartLine  int
@@ -191,131 +190,106 @@ type LXCoordinateRef struct {
 	Content    string
 }
 
-// LXCoordinateResolver uses the lynx daemon to resolve canonical import path
-// mismatches to exact file:line coordinates without loading full files.
-type LXCoordinateResolver struct {
-	ctrl *lynx.Controller
+// SearchEngineResolver resolves import mismatches and undefined symbols
+// using the active SearchEngine (native or lynx adapter).
+type SearchEngineResolver struct {
+	engine SearchEngine
 }
 
-// NewLXCoordinateResolver creates a resolver backed by the global lynx controller.
-// Returns nil if the controller is not available.
-func NewLXCoordinateResolver() *LXCoordinateResolver {
-	ctrl := GetLynxController()
-	if ctrl == nil {
-		return nil
-	}
-	return &LXCoordinateResolver{ctrl: ctrl}
-}
-
-// NewLXCoordinateResolverFromController creates a resolver from a specific controller.
-func NewLXCoordinateResolverFromController(ctrl *lynx.Controller) *LXCoordinateResolver {
-	return &LXCoordinateResolver{ctrl: ctrl}
+// NewSearchEngineResolver creates a resolver from a SearchEngine.
+func NewSearchEngineResolver(engine SearchEngine) *SearchEngineResolver {
+	return &SearchEngineResolver{engine: engine}
 }
 
 // ResolveCanonicalMismatch resolves a canonical import mismatch to exact file
 // coordinates by searching for all references to the old (incorrect) module path
-// in the workspace. Returns a list of coordinate refs — each representing a
-// single location where the old path needs to be replaced.
+// in the workspace. Returns a list of coordinate refs.
 //
-// Token budget: < 100 tokens for the full result set (coordinates only, no
-// full-file content).
-func (r *LXCoordinateResolver) ResolveCanonicalMismatch(mismatch *CanonicalMismatch) ([]LXCoordinateRef, error) {
-	if r == nil || mismatch == nil {
+// Token budget: < 100 tokens for the full result set.
+func (r *SearchEngineResolver) ResolveCanonicalMismatch(mismatch *CanonicalMismatch) ([]LXCoordinateRef, error) {
+	if r == nil || r.engine == nil || mismatch == nil {
 		return nil, nil
 	}
 
-	if err := r.ctrl.EnsureStarted(); err != nil {
-		return nil, fmt.Errorf("lx ensure started: %w", err)
-	}
-
-	// Strategy 1: If we have a file:line coordinate, use lx related to find
-	// the exact AST block at that position.
+	ctx := context.Background()
 	var refs []LXCoordinateRef
-	if mismatch.File != "" && mismatch.Line > 0 {
-		related, err := r.ctrl.FindRelatedRaw(mismatch.File, mismatch.Line)
-		if err == nil && len(related) > 0 {
-			for _, res := range related {
-				if res.FilePath == "" {
-					continue
-				}
+
+	// Strategy 1: Resolve the old path as a symbol to find import locations.
+	if len(refs) == 0 && mismatch.OldPath != "" {
+		coords, err := r.engine.ResolveSymbol(ctx, mismatch.OldPath)
+		if err == nil {
+			for _, c := range coords {
 				refs = append(refs, LXCoordinateRef{
-					File:       res.FilePath,
-					StartLine:  res.StartLine,
-					EndLine:    res.EndLine,
-					SymbolName: res.SymbolName,
-					Content:    res.Content,
+					File:       c.File,
+					StartLine:  c.StartLine,
+					EndLine:    c.EndLine,
+					SymbolName: c.SymbolName,
+					Content:    c.Content,
 				})
 			}
 		}
-
-		// Also try to resolve the exact symbol at the error coordinate.
-		resolved, err := r.ctrl.ResolveSymbolRaw(mismatch.OldPath)
-		if err == nil && len(resolved) > 0 {
-			for _, res := range resolved {
-				if res.FilePath == "" {
-					continue
-				}
-				// Deduplicate by file+startLine.
-				dup := false
-				for _, existing := range refs {
-					if existing.File == res.FilePath && existing.StartLine == res.StartLine {
-						dup = true
-						break
-					}
-				}
-				if !dup {
-					refs = append(refs, LXCoordinateRef{
-						File:       res.FilePath,
-						StartLine:  res.StartLine,
-						EndLine:    res.EndLine,
-						SymbolName: res.SymbolName,
-						Content:    res.Content,
-					})
-				}
-			}
-		}
 	}
 
-	// Strategy 2: Use canonical path components to search for import statements.
-	// Extract the last path segment of the old module path as a search token.
+	// Strategy 2: Search for the last path segment of the old module path.
 	if len(refs) == 0 {
 		searchToken := lastPathSegment(mismatch.OldPath)
 		if searchToken != "" {
-			results, err := r.ctrl.SearchRaw(searchToken)
-			if err == nil && len(results) > 0 {
-				for _, res := range results {
-					if res.FilePath == "" {
-						continue
-					}
+			chunks, err := r.engine.SearchContext(ctx, searchToken)
+			if err == nil {
+				for _, c := range chunks {
 					refs = append(refs, LXCoordinateRef{
-						File:       res.FilePath,
-						StartLine:  res.StartLine,
-						EndLine:    res.EndLine,
-						SymbolName: res.SymbolName,
-						Content:    res.Content,
+						File:       c.File,
+						StartLine:  c.StartLine,
+						EndLine:    c.EndLine,
+						SymbolName: c.SymbolName,
+						Content:    c.Content,
 					})
 				}
 			}
 		}
 	}
 
-	// Strategy 3: If we still have no refs but have the old path, resolve
-	// the full old path as a symbol.
-	if len(refs) == 0 {
-		resolved, err := r.ctrl.ResolveSymbolRaw(mismatch.OldPath)
-		if err == nil && len(resolved) > 0 {
-			for _, res := range resolved {
-				if res.FilePath == "" {
-					continue
-				}
+	// Strategy 3: Search for the full old import path as a text query.
+	if len(refs) == 0 && mismatch.OldPath != "" {
+		chunks, err := r.engine.SearchContext(ctx, mismatch.OldPath)
+		if err == nil {
+			for _, c := range chunks {
 				refs = append(refs, LXCoordinateRef{
-					File:       res.FilePath,
-					StartLine:  res.StartLine,
-					EndLine:    res.EndLine,
-					SymbolName: res.SymbolName,
-					Content:    res.Content,
+					File:       c.File,
+					StartLine:  c.StartLine,
+					EndLine:    c.EndLine,
+					SymbolName: c.SymbolName,
+					Content:    c.Content,
 				})
 			}
+		}
+	}
+
+	return refs, nil
+}
+
+// ResolveUndefinedSymbol resolves an undefined symbol error to exact file
+// coordinates. Returns coordinates that describe both the error site and the
+// symbol definition (if found).
+func (r *SearchEngineResolver) ResolveUndefinedSymbol(undef *UndefinedSymbol) ([]LXCoordinateRef, error) {
+	if r == nil || r.engine == nil || undef == nil {
+		return nil, nil
+	}
+
+	ctx := context.Background()
+	var refs []LXCoordinateRef
+
+	// Resolve the undefined symbol to find its definition.
+	coords, err := r.engine.ResolveSymbol(ctx, undef.Symbol)
+	if err == nil {
+		for _, c := range coords {
+			refs = append(refs, LXCoordinateRef{
+				File:       c.File,
+				StartLine:  c.StartLine,
+				EndLine:    c.EndLine,
+				SymbolName: c.SymbolName,
+				Content:    c.Content,
+			})
 		}
 	}
 
@@ -475,68 +449,6 @@ func FormatStdlibFixLedger(undef *UndefinedSymbol, pkgName, importPath string) s
 	fmt.Fprintf(&b, "Fix: replace %q with %q. and add import %q\n", undef.Symbol, pkgName, importPath)
 	b.WriteString("Strategy: FILE_EDIT (case correction + import) + SHELL_EXEC go test ./...\n")
 	return b.String()
-}
-
-// ResolveUndefinedSymbol resolves an undefined symbol error to exact file
-// coordinates by using lx resolve and lx related. Returns coordinates that
-// describe both the error site and the symbol definition (if found).
-func (r *LXCoordinateResolver) ResolveUndefinedSymbol(undef *UndefinedSymbol) ([]LXCoordinateRef, error) {
-	if r == nil || undef == nil {
-		return nil, nil
-	}
-
-	if err := r.ctrl.EnsureStarted(); err != nil {
-		return nil, fmt.Errorf("lx ensure started: %w", err)
-	}
-
-	var refs []LXCoordinateRef
-
-	// Strategy 1: Resolve the undefined symbol to find its definition.
-	resolved, err := r.ctrl.ResolveSymbolRaw(undef.Symbol)
-	if err == nil && len(resolved) > 0 {
-		for _, res := range resolved {
-			if res.FilePath == "" {
-				continue
-			}
-			refs = append(refs, LXCoordinateRef{
-				File:       res.FilePath,
-				StartLine:  res.StartLine,
-				EndLine:    res.EndLine,
-				SymbolName: res.SymbolName,
-				Content:    res.Content,
-			})
-		}
-	}
-
-	// Strategy 2: Use lx related at the error coordinate for context.
-	if undef.File != "" && undef.Line > 0 {
-		related, err := r.ctrl.FindRelatedRaw(undef.File, undef.Line)
-		if err == nil && len(related) > 0 {
-			for _, res := range related {
-				if res.FilePath == "" {
-					continue
-				}
-				dup := false
-				for _, existing := range refs {
-					if existing.File == res.FilePath && existing.StartLine == res.StartLine {
-						dup = true
-						break
-					}
-				}
-				if !dup {
-					refs = append(refs, LXCoordinateRef{
-						File:       res.FilePath,
-						StartLine:  res.StartLine,
-						EndLine:    res.EndLine,
-						SymbolName: res.SymbolName,
-						Content:    res.Content,
-					})
-				}
-			}
-		}
-	}
-
-	return refs, nil
 }
 
 // FormatUndefinedFixLedger produces a compact (<100 token) context snippet

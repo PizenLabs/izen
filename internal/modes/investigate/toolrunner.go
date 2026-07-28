@@ -424,23 +424,25 @@ func hasFileExtension(tok string) bool {
 func (r *ToolRunner) runPackageRemediation(ctx context.Context, target string) ToolResult {
 	pkg := strings.TrimSpace(target)
 
-	// ── LX coordinate handshake for canonical import mismatches ──────────
+	// ── Search coordinate handshake for canonical import mismatches ──────
 	// Parse the raw diagnostics for a canonical import path mismatch
 	// ("module declares its path as: X but was required as: Y"). When found,
-	// use lx to resolve the exact source locations that need edits, recording
-	// them as high-confidence evidence instead of silently routing to go mod tidy.
+	// use the active search engine to resolve the exact source locations that
+	// need edits, recording them as high-confidence evidence instead of
+	// silently routing to go mod tidy.
 	if r.diagnostics != "" {
 		mismatch := retrieval.ParseCanonicalMismatch(r.diagnostics)
 		if mismatch != nil && mismatch.OldPath != "" && mismatch.NewPath != "" {
-			resolver := retrieval.NewLXCoordinateResolver()
-			if resolver != nil {
-				//nolint:contextcheck // lynx controller API predates context propagation
+			router := retrieval.GetGlobalRouter()
+			if router != nil {
+				resolver := retrieval.NewSearchEngineResolver(router.Engine())
+				//nolint:contextcheck // search engine API predates context propagation
 				refs, err := resolver.ResolveCanonicalMismatch(mismatch)
 				if err == nil && len(refs) > 0 {
 					var b strings.Builder
-					fmt.Fprintf(&b, "## CANONICAL IMPORT MISMATCH (lx resolved)\n")
+					fmt.Fprintf(&b, "## CANONICAL IMPORT MISMATCH (search resolved)\n")
 					fmt.Fprintf(&b, "Fix: replace %q → %q\n", mismatch.OldPath, mismatch.NewPath)
-					fmt.Fprintf(&b, "Locations (lx coordinates):\n")
+					fmt.Fprintf(&b, "Locations:\n")
 					for _, ref := range refs {
 						fmt.Fprintf(&b, "  %s:%d-%d", ref.File, ref.StartLine, ref.EndLine)
 						if ref.SymbolName != "" {
@@ -471,21 +473,22 @@ func (r *ToolRunner) runPackageRemediation(ctx context.Context, target string) T
 		}
 	}
 
-	// ── LX coordinate handshake for undefined symbols ────────────────────
+	// ── Search coordinate handshake for undefined symbols ────────────────
 	// Parse the raw diagnostics for a Go undefined symbol error
-	// ("file.go:line:col: undefined: Symbol"). When found, use lx to resolve
-	// the symbol definition and the error context, recording high-confidence
-	// evidence for FILE_EDIT planning instead of routing straight to go mod tidy.
+	// ("file.go:line:col: undefined: Symbol"). When found, use the active
+	// search engine to resolve the symbol definition and the error context,
+	// recording high-confidence evidence for FILE_EDIT planning.
 	if r.diagnostics != "" {
 		undef := retrieval.ParseUndefinedSymbol(r.diagnostics)
 		if undef != nil && undef.Symbol != "" {
-			resolver := retrieval.NewLXCoordinateResolver()
-			if resolver != nil {
-				//nolint:contextcheck // lynx controller API predates context propagation
+			router := retrieval.GetGlobalRouter()
+			if router != nil {
+				resolver := retrieval.NewSearchEngineResolver(router.Engine())
+				//nolint:contextcheck // search engine API predates context propagation
 				refs, err := resolver.ResolveUndefinedSymbol(undef)
 				if err == nil && len(refs) > 0 {
 					var b strings.Builder
-					b.WriteString("## UNDEFINED SYMBOL (lx resolved)\n")
+					b.WriteString("## UNDEFINED SYMBOL (search resolved)\n")
 					fmt.Fprintf(&b, "Symbol: %s at %s:%d\n", undef.Symbol, undef.File, undef.Line)
 					fmt.Fprintf(&b, "Definition locations:\n")
 					for _, ref := range refs {
