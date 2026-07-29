@@ -16,6 +16,10 @@ func NewGraphLookup(g *graph.Graph, root string) *GraphLookup {
 	return &GraphLookup{graph: g, root: root}
 }
 
+func (gl *GraphLookup) HasGraph() bool {
+	return gl.graph != nil
+}
+
 func (gl *GraphLookup) SearchSymbol(name string) *ResultSet {
 	rs := &ResultSet{Strategy: "graph.exact"}
 
