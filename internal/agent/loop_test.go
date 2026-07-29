@@ -2,11 +2,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/agent/checkpoint"
 	"github.com/PizenLabs/izen/internal/controlplane/failure"
+	"github.com/PizenLabs/izen/internal/controlplane/guard"
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/core/runtime"
@@ -435,6 +437,106 @@ func TestAgentLoop_CheckpointManagerIntegration(t *testing.T) {
 	if len(state.SubTasks) != 1 {
 		t.Errorf("expected 1 sub task, got %d", len(state.SubTasks))
 	}
+}
+
+// ── Scope Guard / Target Drift Recovery ──────────────────────────────────
+
+func TestAgentLoop_TargetDriftRecovery_ReservedKeyword(t *testing.T) {
+	al := newTestAgent()
+
+	// Simulate reserved keyword "workspace" being used as a mutation target.
+	scopeGuard := guard.NewScopeGuard(&guard.ScopeDeclaration{
+		AllowedFiles: []string{"web/templates/header.html"},
+	}, nil)
+	err := scopeGuard.ValidateMutationTarget("workspace", nil)
+
+	if err == nil {
+		t.Fatal("ValidateMutationTarget(workspace) = nil, expected ErrReservedTarget")
+	}
+	if !errors.Is(err, guard.ErrReservedTarget) {
+		t.Errorf("ValidateMutationTarget(workspace) = %v, want ErrReservedTarget", err)
+	}
+
+	// Verify the agent's failure classifier correctly maps this to SCOPE_FAILURE.
+	fc := al.classifyFailure(err)
+	if fc != failure.SCOPE_FAILURE {
+		t.Errorf("classifyFailure(scope error) = %s, want SCOPE_FAILURE", fc)
+	}
+
+	// Verify recovery manager maps SCOPE_FAILURE to ActionImmediateRollback.
+	action := al.recoveryMgr.HandleFailure(fc, 0)
+	if action != failure.ActionImmediateRollback {
+		t.Errorf("HandleFailure(SCOPE_FAILURE) = %s, want ActionImmediateRollback", action)
+	}
+}
+
+func TestAgentLoop_TargetDriftRecovery_OutOfScope(t *testing.T) {
+	al := newTestAgent()
+
+	// Simulate a mutation to a path that is not in the planned targets.
+	scopeGuard := guard.NewScopeGuard(&guard.ScopeDeclaration{
+		AllowedFiles: []string{"web/templates/header.html"},
+	}, nil)
+	err := scopeGuard.ValidateMutationTarget("internal/auth/jwt.go", []string{"web/templates/header.html"})
+
+	if err == nil {
+		t.Fatal("ValidateMutationTarget(out-of-scope) = nil, expected ErrScopeViolation")
+	}
+	if !errors.Is(err, guard.ErrScopeViolation) {
+		t.Errorf("ValidateMutationTarget(out-of-scope) = %v, want ErrScopeViolation", err)
+	}
+
+	// Classify and verify rollback.
+	fc := al.classifyFailure(err)
+	if fc != failure.SCOPE_FAILURE {
+		t.Errorf("classifyFailure = %s, want SCOPE_FAILURE", fc)
+	}
+
+	action := al.recoveryMgr.HandleFailure(fc, 0)
+	if action != failure.ActionImmediateRollback {
+		t.Errorf("HandleFailure(SCOPE_FAILURE) = %s, want ActionImmediateRollback", action)
+	}
+}
+
+func TestAgentLoop_ValidateMutationTarget_Integration(t *testing.T) {
+	// Full round-trip: ValidateMutationTarget called with a path that matches
+	// a reserved keyword should be detected, classified, and trigger rollback.
+	al := newTestAgent()
+
+	// Build a ScopeGuard that should be protecting the planned scope.
+	planned := []string{"web/templates/header.html"}
+	sg := guard.NewScopeGuard(&guard.ScopeDeclaration{
+		AllowedFiles: planned,
+	}, nil)
+
+	t.Run("reserved keyword detected", func(t *testing.T) {
+		err := sg.ValidateMutationTarget("workspace", planned)
+		if err == nil || !errors.Is(err, guard.ErrReservedTarget) {
+			t.Fatalf("expected ErrReservedTarget, got %v", err)
+		}
+		fc := al.classifyFailure(err)
+		if fc != failure.SCOPE_FAILURE {
+			t.Fatalf("expected SCOPE_FAILURE, got %s", fc)
+		}
+		action := al.recoveryMgr.HandleFailure(fc, 0)
+		if action != failure.ActionImmediateRollback {
+			t.Fatalf("expected ActionImmediateRollback, got %s", action)
+		}
+	})
+
+	t.Run("valid path passes", func(t *testing.T) {
+		err := sg.ValidateMutationTarget("web/templates/header.html", planned)
+		if err != nil {
+			t.Fatalf("expected nil, got %v", err)
+		}
+	})
+
+	t.Run("out of scope", func(t *testing.T) {
+		err := sg.ValidateMutationTarget("other/file.go", planned)
+		if err == nil || !errors.Is(err, guard.ErrScopeViolation) {
+			t.Fatalf("expected ErrScopeViolation, got %v", err)
+		}
+	})
 }
 
 func TestAgentLoop_EventStreamWithRetrievalOrchestrator(t *testing.T) {

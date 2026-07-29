@@ -144,21 +144,31 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 
 	// ── DEADLOCK PREVENTION: NON-BUG INTENT SHORT-CIRCUIT ──────────────
 	// /investigate is STRICTLY read-only for bug diagnostics. When the
-	// intent is FeatureUnitTest, Refactor, or any code creation/mutation
-	// (detected by mutation verbs in the problem text), exit immediately
-	// with a handoff signal instead of looping through the forensic state
-	// machine. This prevents the infamous "investigate deadlock" where the
-	// engine keeps looping over test output for a task that requires writing
-	// code, not diagnosing bugs.
+	// intent is FeatureUnitTest, Refactor, FrontendUI, or any code
+	// creation/mutation (detected by mutation verbs in the problem text),
+	// exit immediately with a handoff signal instead of looping through
+	// the forensic state machine.
+	//
+	// REFORM: FRONTEND_UI tasks short-circuit to /plan (not /build) to
+	// enforce Layer 3 Hybrid Search (AST + CSS/DOM) before code edits.
+	// All other mutation intents short-circuit to /build as before.
 	//
 	// The short-circuit produces:
 	//   - No forensic evidence (no test execution, no LX lookups)
-	//   - A clear conclusion: "code mutation intent detected — hand off to build"
+	//   - A clear conclusion indicating target mode
 	//   - Resolved=false so the caller knows investigation was not the right mode
-	if e.mustShortCircuitToBuild() {
-		forensicLog("[deadlock-guard] non-bug intent detected — short-circuiting /investigate → /build handoff")
+	if target := e.shouldShortCircuit(); target != shortCircuitNone {
+		var conclusion string
+		switch target {
+		case shortCircuitToPlan:
+			conclusion = "frontend ui intent detected — hand off to plan"
+			forensicLog("[deadlock-guard] frontend UI intent detected — short-circuiting /investigate → /plan")
+		default:
+			conclusion = "code mutation intent detected — hand off to build"
+			forensicLog("[deadlock-guard] non-bug intent detected — short-circuiting /investigate → /build handoff")
+		}
 		result.Resolved = false
-		result.Conclusion = "code mutation intent detected — hand off to build"
+		result.Conclusion = conclusion
 		result.RootCause = ""
 		result.Loops = 0
 		result.Duration = time.Since(e.startedAt).Round(time.Millisecond).String()
@@ -766,6 +776,16 @@ func (e *Engine) statePropose() error {
 	return e.State.Transition(StateDone)
 }
 
+// shortCircuitTarget describes where a short-circuited investigation should
+// route to. The "" value means no short-circuit.
+type shortCircuitTarget string
+
+const (
+	shortCircuitToBuild shortCircuitTarget = "build"
+	shortCircuitToPlan  shortCircuitTarget = "plan"
+	shortCircuitNone    shortCircuitTarget = ""
+)
+
 // mutationIntentKeywords are phrases that clearly indicate the user wants to
 // create or modify code — not diagnose a bug. When detected in the problem text,
 // the investigate engine short-circuits to avoid the deadlock loop.
@@ -779,26 +799,32 @@ var mutationIntentKeywords = []string{
 	"write function",
 }
 
-// mustShortCircuitToBuild returns true when the investigation should exit
-// immediately and hand off to /build instead of running the forensic state
-// machine. This prevents the "investigate deadlock" on code creation intents.
+// shouldShortCircuit returns the target mode when the investigation should exit
+// immediately and hand off instead of running the forensic state machine.
+// This prevents the "investigate deadlock" on code creation intents.
 //
-// Detection rules:
-//  1. Explicit intent set to FeatureUnitTest or Refactor → short-circuit.
-//  2. Problem text contains mutation intent keywords → short-circuit.
-//  3. Any $hot prefix → short-circuit (already handled at gateway, but
-//     double-check here as a safety net).
-func (e *Engine) mustShortCircuitToBuild() bool {
+// REFORM RULES:
+//  1. FRONTEND_UI intent → short-circuit to /plan (enforces CSS/AST search).
+//  2. FeatureUnitTest or Refactor intent → short-circuit to /build.
+//  3. Problem text contains mutation intent keywords → short-circuit to /build.
+//  4. Any $hot prefix → short-circuit to /build.
+func (e *Engine) shouldShortCircuit() shortCircuitTarget {
+	if e.Intent.IsFrontendUI() {
+		return shortCircuitToPlan
+	}
 	if !e.Intent.IsEnvDepsAllowed() {
-		return true
+		return shortCircuitToBuild
 	}
 	lower := strings.ToLower(e.Problem)
 	for _, kw := range mutationIntentKeywords {
 		if strings.Contains(lower, kw) {
-			return true
+			return shortCircuitToBuild
 		}
 	}
-	return strings.HasPrefix(strings.TrimSpace(e.Problem), "$hot")
+	if strings.HasPrefix(strings.TrimSpace(e.Problem), "$hot") {
+		return shortCircuitToBuild
+	}
+	return shortCircuitNone
 }
 
 // deriveRootCause extracts a root cause description from the investigation result.

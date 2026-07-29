@@ -172,6 +172,11 @@ func TestSynthesizeBuildTodosFromMutation_GenericFallback(t *testing.T) {
 	if !strings.Contains(todos[0], "refactor the authentication module") {
 		t.Errorf("expected todo to contain original intent, got: %s", todos[0])
 	}
+	// MUST NOT contain "workspace" as a file target — this was the bug:
+	// the placeholder would leak into the build parser as a literal file path.
+	if strings.Contains(todos[0], "workspace") {
+		t.Errorf("todo MUST NOT contain 'workspace' as target, got: %s", todos[0])
+	}
 }
 
 func TestSynthesizeBuildTodosFromMutation_Empty(t *testing.T) {

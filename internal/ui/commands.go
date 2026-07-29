@@ -1318,19 +1318,17 @@ func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
 			return m.handoffCtx.LastFailurePayload
 		}
 	case modes.ModeBuild:
-		// /build STRICTLY consumes the atomic structural tasks produced by the
-		// /plan phase (m.handoffCtx.PendingTodos and m.sess.CurrentTasks). It
-		// must NEVER fall back to the raw conversational ProposedFix blob —
-		// that would re-inject stale $test / chat text into the build
-		// workspace. If no atomic tasks exist, return "" so setMode enters a
-		// clean idle state instead of contaminating the buffer.
+		// REFORM: /build STRICTLY consumes:
+		//   1. The user's raw intent (UserRawIntent from the ledger)
+		//   2. The atomic structural tasks produced by /plan (PendingTodos / staged tasks)
+		// It must NEVER fall back to the raw conversational ProposedFix blob or
+		// AssistantDiscussionNotes — those may contain pre-baked hallucinated steps.
+		// If no atomic tasks exist, return "" so setMode enters a clean idle state.
 		hasStagedTasks := len(m.sess.CurrentTasks) > 0
 		if len(m.handoffCtx.PendingTodos) == 0 && !hasStagedTasks {
 			// DEADLOCK-GUARD FALLBACK: when the investigate engine
 			// short-circuited with mutation intent and no structured
 			// tasks were synthesized, create one from the handoff ledger.
-			// This prevents the frozen state where /build enters idle
-			// after auto-routing from /investigate.
 			if strings.Contains(m.handoffLedgerContent, "code mutation intent detected") {
 				m.handoffCtx.PendingTodos = synthesizeBuildTodosFromMutation(m.handoffLedgerContent)
 			}
@@ -1338,7 +1336,18 @@ func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
 				return ""
 			}
 		}
+
+		rawIntent := ""
+		if m.sess != nil && m.sess.ContextLedger != nil {
+			rawIntent = m.sess.ContextLedger.UserRawIntent
+		}
+
 		var b strings.Builder
+		if rawIntent != "" {
+			b.WriteString("## USER RAW INTENT\n")
+			b.WriteString(rawIntent)
+			b.WriteString("\n\n")
+		}
 		b.WriteString("## HANDOFF BUILD EXECUTION\n\n")
 		b.WriteString("Execute the following planned tasks and output code patches directly.\n")
 		b.WriteString("Do NOT restate the plan or ask for approval — produce the mutations now.\n\n")
@@ -5591,26 +5600,37 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 		}
 
 	case modes.ModeBuild:
-		// /build consumes ONLY the atomic structural tasks (PendingTodos /
-		// staged tasks) produced by /plan. The raw ProposedFix chat blob from
-		// an earlier phase is purged here so it can never re-inject stale
-		// conversational text into the build workspace.
+		// REFORM: /build consumes ONLY:
+		//   1. The user's raw intent (UserRawIntent from the ledger)
+		//   2. The atomic structural tasks produced by /plan (PendingTodos / staged tasks)
+		// The raw ProposedFix chat blob / AssistantDiscussionNotes are STRICTLY
+		// PURGED here to prevent hallucinated procedural steps from contaminating
+		// the build execution engine.
 		if len(m.handoffCtx.PendingTodos) > 0 || len(m.sess.CurrentTasks) > 0 {
 			m.push(roleSystem, "Handoff context injected.")
 		}
-		// Purge stale conversational handoff so the build buffer stays clean.
+		// Purge stale pre-baked steps — build must not inherit them.
 		m.handoffCtx.ProposedFix = ""
 
-		// DEADLOCK-GUARD: when the investigate engine short-circuited
-		// with mutation intent, synthesize an execution context from the
-		// pending todos so the build engine receives an active mutation
-		// prompt instead of a generic greeting.
+		// Build the execution payload from raw intent + plan artifacts only.
+		rawIntent := ""
+		if m.sess != nil && m.sess.ContextLedger != nil {
+			rawIntent = m.sess.ContextLedger.UserRawIntent
+		}
+
 		if len(m.handoffCtx.PendingTodos) > 0 {
-			m.handoffCtx.LastFailurePayload = buildMutationHandoffPayload(m.handoffCtx.PendingTodos)
+			payload := buildMutationHandoffPayload(m.handoffCtx.PendingTodos)
+			if rawIntent != "" {
+				payload = "## USER RAW INTENT\n" + rawIntent + "\n\n" + payload
+			}
+			m.handoffCtx.LastFailurePayload = payload
 		} else {
-			// REFORM A: Build strict minimal context for the active task.
-			// This is injected as the initial prompt for the build execution.
-			m.handoffCtx.LastFailurePayload = m.buildStrictHandoffPayload()
+			// Build strict minimal context for the active task.
+			payload := m.buildStrictHandoffPayload()
+			if rawIntent != "" {
+				payload = "## USER RAW INTENT\n" + rawIntent + "\n\n" + payload
+			}
+			m.handoffCtx.LastFailurePayload = payload
 		}
 	}
 }

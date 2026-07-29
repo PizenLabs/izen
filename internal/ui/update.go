@@ -411,22 +411,28 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleSystem, "Investigation complete — no structured findings to report.")
 		}
 
-		// ── AUTO-HANDOFF: /investigate -> /build (mutation) or /plan (diagnostic) ──
-		// When the investigate engine short-circuited with a code mutation intent
-		// ("code mutation intent detected — hand off to build"), route directly to
-		// /build to skip the plan synthesis step entirely. Synthesize build tasks
-		// from the investigation session key (original intent) so the build engine
-		// receives a structured mutation prompt instead of freezing. For bug diagnostics,
-		// route to /plan as normal.
+		// ── AUTO-HANDOFF: /investigate -> /plan or /build ─────────────────
+		// REFORM RULES:
+		//   - FRONTEND_UI intent ("hand off to plan") → route to /plan (enforces
+		//     Layer 3 Hybrid Search — AST + CSS/DOM inspection — before edits).
+		//   - Code mutation intent ("hand off to build") → route directly to /build
+		//     (short-circuits plan for known mutation patterns).
+		//   - Bug diagnostics → route to /plan as normal (full forensic → plan synthesis).
 		var cmds []tea.Cmd
-		if strings.Contains(m.handoffLedgerContent, "code mutation intent detected") {
+		switch {
+		case strings.Contains(m.handoffLedgerContent, "hand off to plan"):
+			m.push(roleStatus, "Frontend UI intent — routing to /plan for CSS/AST inspection")
+			m.modeChangeAuthorized = true
+			m.handoffCtx.ProposedFix = m.handoffLedgerContent
+			cmds = append(cmds, m.setMode(modes.ModePlan))
+		case strings.Contains(m.handoffLedgerContent, "code mutation intent detected"):
 			m.push(roleStatus, "Code mutation intent — routing directly to /build, bypassing /plan")
 			m.modeChangeAuthorized = true
 			// Synthesize pending todos from the investigation content so the
 			// build auto-trigger in setMode finds work to do immediately.
 			m.handoffCtx.PendingTodos = synthesizeBuildTodosFromMutation(msg.sessionKey)
 			cmds = append(cmds, m.setMode(modes.ModeBuild))
-		} else {
+		default:
 			m.push(roleStatus, "Investigation complete. Auto-transitioning to /plan for execution synthesis...")
 			m.handoffCtx.ProposedFix = m.handoffLedgerContent
 			if m.handoffLedgerContent != "" {
@@ -3179,6 +3185,10 @@ func synthesizeBuildTodosFromMutation(content string) []string {
 	}
 
 	// Generic fallback: single FILE_MUTATE task captures the full mutation intent.
-	todos = append(todos, "\uf05c [FILE_MUTATE] workspace — Create or modify files as described: "+strings.TrimSpace(content))
+	// NOTE: target is intentionally a descriptive label, NOT a file path — the
+	// build engine will resolve the actual file path via LLM synthesis. Using
+	// placeholder strings like "workspace" as the target is FORBIDDEN because
+	// the build parser would interpret it as a literal file path.
+	todos = append(todos, "\uf05c [FILE_MUTATE] [resolve] — Create or modify files as described: "+strings.TrimSpace(content))
 	return todos
 }

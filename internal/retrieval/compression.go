@@ -477,7 +477,8 @@ const PlanInstructions = `You are the Execution Planning Engine for Izen. Your j
 CRITICAL INSTRUCTIONS:
 1. **Zero Speculation:** Identify the primary programming language from the provided skeleton. If the project contains .go files or Go packages, the entire plan MUST use Go tooling (go get, go build). Absolutely FORBIDDEN to mention Node.js, npm, Python, or any external stack not visible in the skeleton.
 2. **Absolute File Grounding:** Every FILE_MUTATE task description must reference exact file targets or structural layouts present in the Repository Skeleton. Do not invent boilerplate directory trees (like src/auth.js for a Go repo).
-3. **Action-Oriented Output:** Tasks must be immediately actionable via the /build engine. Keep descriptions concise, factual, and bound to the active workspace.`
+3. **Action-Oriented Output:** Tasks must be immediately actionable via the /build engine. Keep descriptions concise, factual, and bound to the active workspace.
+4. **NEVER use placeholders as file paths:** The target field of FILE_MUTATE MUST contain the exact, full relative repository path (e.g. web/templates/header.html). Contextual placeholders like "workspace", "root", "cwd", or "[n/a]" are FORBIDDEN and will be rejected by the scope guard.`
 
 const PlanSkeletonFrame = "### REPOSITORY STRUCTURAL SKELETON (LYNX + AHO-CORASICK COMPRESSED)"
 

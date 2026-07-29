@@ -14,7 +14,21 @@ import (
 var (
 	ErrScopeViolation = errors.New("scope violation: patch touches file outside declared plan scope")
 	ErrBudgetExceeded = errors.New("scope guard: patch exceeds mutation budget limits")
+	ErrReservedTarget = errors.New("scope violation: target path is a reserved system keyword")
 )
+
+// reservedTargets is the blacklist of system keywords and placeholders that
+// MUST NEVER be accepted as file mutation targets. These leak when the LLM
+// substitutes a generic workspace context identifier for a real file path.
+var reservedTargets = map[string]bool{
+	"workspace": true,
+	"root":      true,
+	"cwd":       true,
+	".":         true,
+	"/":         true,
+	"[n/a]":     true,
+	"[resolve]": true,
+}
 
 // ScopeDeclaration defines the allowed mutation boundaries for a plan. It is
 // derived from a PlanArtifact and contains the exact set of files and symbols
@@ -37,6 +51,77 @@ func NewScopeGuard(scope *ScopeDeclaration, b *budget.MutationBudget) *ScopeGuar
 		scope:  scope,
 		budget: b,
 	}
+}
+
+var knownExts = []string{".go", ".js", ".ts", ".py", ".html", ".css", ".json", ".yaml", ".yml", ".md", ".rs", ".rb", ".java", ".kt", ".swift"}
+
+// stripExt removes known file extensions from a path segment, returning the
+// base name. Used to detect reserved keywords in filenames like workspace.go.
+func stripExt(seg string) string {
+	lower := strings.ToLower(seg)
+	for _, ext := range knownExts {
+		if strings.HasSuffix(lower, ext) {
+			return seg[:len(seg)-len(ext)]
+		}
+	}
+	return seg
+}
+
+// ValidateMutationTarget checks whether a single target file path is a valid
+// mutation target. It returns:
+//   - ErrReservedTarget if the path matches a reserved system keyword (checked
+//     against each path segment both with and without known file extensions)
+//   - ErrScopeViolation if the path is not in the plannedTargets list
+//   - nil if all checks pass
+//
+// When plannedTargets is nil or empty, only reserved keyword checking is performed.
+func (sg *ScopeGuard) ValidateMutationTarget(targetPath string, plannedTargets []string) error {
+	clean := filepath.ToSlash(filepath.Clean(targetPath))
+
+	// Reject root paths directly.
+	if clean == "." || clean == "/" {
+		return fmt.Errorf("%w: %q is a root path reference", ErrReservedTarget, targetPath)
+	}
+
+	// Check the full cleaned path.
+	if reservedTargets[strings.ToLower(clean)] {
+		return fmt.Errorf("%w: %q is a reserved system keyword", ErrReservedTarget, targetPath)
+	}
+
+	// Check each path segment against the reserved keywords.
+	segments := strings.Split(clean, "/")
+	for _, seg := range segments {
+		trimmed := strings.TrimSpace(strings.ToLower(seg))
+		if trimmed == "" {
+			continue
+		}
+		if reservedTargets[trimmed] {
+			return fmt.Errorf("%w: %q contains reserved segment %q", ErrReservedTarget, targetPath, seg)
+		}
+		// Also check without known file extension.
+		if reservedTargets[stripExt(trimmed)] {
+			return fmt.Errorf("%w: %q base name matches reserved keyword", ErrReservedTarget, targetPath)
+		}
+	}
+
+	if len(plannedTargets) > 0 {
+		allowed := false
+		for _, planned := range plannedTargets {
+			if planned == clean || planned == targetPath {
+				allowed = true
+				break
+			}
+			if matchPath(clean, planned) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("%w: %q not in planned targets %v", ErrScopeViolation, targetPath, plannedTargets)
+		}
+	}
+
+	return nil
 }
 
 // ValidatePatch checks that a patch artifact respects the declared scope and

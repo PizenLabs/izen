@@ -17,6 +17,30 @@ var commandPrefixPattern = regexp.MustCompile(`^(?:\$prompt\s+|\$ask\s+|/plan\s+
 // fileRefPattern matches @filename references (e.g. @LICENSE, @README.md).
 var fileRefPattern = regexp.MustCompile(`@(\S+)`)
 
+// trivialMutationPhrases are operations that are always safe to fast-track
+// because they are single-token, single-file, and never require AST/CSS
+// inspection or /plan synthesis. Only these patterns may bypass /plan.
+// Order matters: longer phrases first so "fix typo" matches before "fix".
+var trivialMutationPhrases = []string{
+	"fix typo", "fix spelling", "fix grammar",
+	"add comment", "update comment",
+	"change description", "update description",
+	"bump version", "update version",
+}
+
+// trivialMutationBareVerbs are single-word verbs that, when combined with a
+// doc-only file reference and NO frontend/UI context, qualify as trivial.
+// These MUST be checked against IsFrontendUI first — if the input is UI-related,
+// these verbs are NOT trivial.
+var trivialMutationBareVerbs = []string{
+	"rename",
+	"format",
+	"correct",
+	"capitalize",
+	"lowercase",
+	"uppercase",
+}
+
 // directMutationVerbs are verbs/phrases that signal an intent to edit a file
 // rather than diagnose or analyse. Order matters: longer phrases first so
 // "fix typo" matches before the bare "fix".
@@ -96,6 +120,163 @@ var directMutationBareFiles = []string{
 	"changelog", "changelog.md",
 }
 
+// frontendUIWordPatterns match short UI keywords with word boundaries so
+// "ui" does not match inside "build", "layout" inside "download_layout_data", etc.
+var frontendUIWordPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`\bmove\b`),
+	regexp.MustCompile(`\bposition\b`),
+	regexp.MustCompile(`\btop\b`),
+	regexp.MustCompile(`\bbottom\b`),
+	regexp.MustCompile(`\bleft\b`),
+	regexp.MustCompile(`\bright\b`),
+	regexp.MustCompile(`\bcss\b`),
+	regexp.MustCompile(`\bflexbox\b`),
+	regexp.MustCompile(`\bflex\b`),
+	regexp.MustCompile(`\bgrid\b`),
+	regexp.MustCompile(`\blayout\b`),
+	regexp.MustCompile(`\bresponsive\b`),
+	regexp.MustCompile(`\bviewport\b`),
+	regexp.MustCompile(`\bheader\b`),
+	regexp.MustCompile(`\bnav\b`),
+	regexp.MustCompile(`\bnavigation\b`),
+	regexp.MustCompile(`\bnavbar\b`),
+	regexp.MustCompile(`\bsidebar\b`),
+	regexp.MustCompile(`\bfooter\b`),
+	regexp.MustCompile(`\bhero\b`),
+	regexp.MustCompile(`\bbanner\b`),
+	regexp.MustCompile(`\bstyling\b`),
+	regexp.MustCompile(`\bstyle\b`),
+	regexp.MustCompile(`\bstylesheet\b`),
+	regexp.MustCompile(`\bpadding\b`),
+	regexp.MustCompile(`\bmargin\b`),
+	regexp.MustCompile(`\bborder\b`),
+	regexp.MustCompile(`\bspacing\b`),
+	regexp.MustCompile(`\bz-index\b`),
+	regexp.MustCompile(`\bzindex\b`),
+	regexp.MustCompile(`\babsolute\b`),
+	regexp.MustCompile(`\brelative\b`),
+	regexp.MustCompile(`\bsticky\b`),
+	regexp.MustCompile(`\bfixed\b`),
+	regexp.MustCompile(`\bfloat\b`),
+	regexp.MustCompile(`\bclearfix\b`),
+	regexp.MustCompile(`\boverflow\b`),
+	regexp.MustCompile(`\balignment\b`),
+	regexp.MustCompile(`\balign\b`),
+	regexp.MustCompile(`\bjustify\b`),
+	regexp.MustCompile(`\bbreakpoint\b`),
+	regexp.MustCompile(`\bui\b`),
+	regexp.MustCompile(`\bdom\b`),
+	regexp.MustCompile(`\bcomponent\b`),
+	regexp.MustCompile(`\brearrange\b`),
+	regexp.MustCompile(`\breorder\b`),
+	regexp.MustCompile(`\babove\b`),
+	regexp.MustCompile(`\bbelow\b`),
+	regexp.MustCompile(`\bbeneath\b`),
+	regexp.MustCompile(`\bwebpage\b`),
+	regexp.MustCompile(`\brender\b`),
+	regexp.MustCompile(`\brendering\b`),
+}
+
+// frontendUIPhrases are longer phrases that do not need word boundaries.
+var frontendUIPhrases = []string{
+	"user interface", "user-interface",
+	"media query", "media queries",
+	"dom tree",
+	"z index",
+	"web page",
+	"re-order",
+}
+
+// IsFrontendUI reports whether the input describes a UI/Layout/Styling task
+// that requires AST + CSS/DOM inspection before any code mutation.
+func IsFrontendUI(input string) bool {
+	lower := strings.ToLower(input)
+	for _, p := range frontendUIWordPatterns {
+		if p.MatchString(lower) {
+			return true
+		}
+	}
+	for _, p := range frontendUIPhrases {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsTrivialMutation reports whether the input describes a genuinely trivial,
+// single-token mutation that can bypass /plan. Returns true ONLY for:
+//   - typo/spelling/grammar fixes
+//   - comment updates
+//   - description/version bumps
+//   - single bare verb (rename, format, correct) on a doc-only file
+//   - NO frontend UI context
+func IsTrivialMutation(input string) bool {
+	raw := strings.TrimSpace(input)
+	if raw == "" {
+		return false
+	}
+	msg := commandPrefixPattern.ReplaceAllString(raw, "")
+	msg = strings.TrimSpace(msg)
+
+	// If it's a frontend UI task, it's NEVER trivial.
+	if IsFrontendUI(msg) {
+		return false
+	}
+
+	lower := strings.ToLower(msg)
+
+	// Check multi-word trivial mutation phrases.
+	// When a phrase matches, also verify the file references (if any) are doc files.
+	for _, p := range trivialMutationPhrases {
+		if strings.Contains(lower, p) {
+			files := extractFileRefs(msg)
+			if len(files) == 0 {
+				files = extractBareFilenames(msg)
+			}
+			if len(files) > 0 {
+				allDoc := true
+				for _, fn := range files {
+					if !isDirectMutationTarget(fn) {
+						allDoc = false
+						break
+					}
+				}
+				return allDoc
+			}
+			return true
+		}
+	}
+
+	// Check bare trivial mutation verbs (renames, format, etc.)
+	// These must reference a doc-only file.
+	fields := strings.Fields(lower)
+	for _, f := range fields {
+		clean := strings.Trim(f, `.,;:'"!?()`)
+		for _, v := range trivialMutationBareVerbs {
+			if clean == v {
+				// Must have a doc file reference to qualify.
+				files := extractFileRefs(msg)
+				if len(files) == 0 {
+					files = extractBareFilenames(msg)
+				}
+				if len(files) > 0 {
+					allDoc := true
+					for _, fn := range files {
+						if !isDirectMutationTarget(fn) {
+							allDoc = false
+							break
+						}
+					}
+					return allDoc
+				}
+			}
+		}
+	}
+
+	return false
+}
+
 // knownConventions maps lowercased filenames to their canonical (correct-case)
 // form. All lookups should be done with the lowercased key; the value
 // preserves the conventional casing (e.g. "LICENSE", "README.md").
@@ -150,6 +331,12 @@ func CanonicalizeFileName(path string) string {
 // simple single-file text mutation that should bypass the Senior Architect
 // pipeline and route directly to the /build engine as a FILE_MUTATE task.
 //
+// STRICT POLICY (REFORM):
+//   - Only IsTrivialMutation inputs qualify (typo fixes, comment updates,
+//     version bumps, single renames on doc files).
+//   - FRONTEND_UI tasks NEVER fast-track — they MUST route through /plan.
+//   - Multi-file or architectural requests NEVER fast-track.
+//
 // Returns the fast-track FallbackPlanTarget and true when the input qualifies.
 // Returns an empty target and false when normal processing should continue.
 func ClassifyDirectMutation(input string) (command.FallbackPlanTarget, bool) {
@@ -165,13 +352,13 @@ func ClassifyDirectMutation(input string) (command.FallbackPlanTarget, bool) {
 		return command.FallbackPlanTarget{}, false
 	}
 
-	// If the input carries diagnostic intent, never fast-track.
-	if hasDiagnosticIntent(msg) {
+	// STRICT REFORM: only trivial mutations bypass /plan.
+	if !IsTrivialMutation(msg) {
 		return command.FallbackPlanTarget{}, false
 	}
 
-	// Check for a direct mutation verb.
-	if !hasDirectMutationVerb(msg) {
+	// If the input carries diagnostic intent, never fast-track.
+	if hasDiagnosticIntent(msg) {
 		return command.FallbackPlanTarget{}, false
 	}
 
@@ -294,15 +481,16 @@ func HasHighIntentFlag(input string) bool {
 }
 
 // ClassifyIntentMode determines whether a non-diagnostic user request should
-// route through /investigate (bug diagnostics) or go directly to /build
-// (code creation/mutation). Returns "build" for mutation intents, "investigate"
-// for bug diagnostics, and "plan" for architectural work.
+// route through /investigate (bug diagnostics), /plan (architectural/UI work),
+// or go directly to /build (trivial trivial mutations).
 //
-// Rules:
+// REFORM RULES:
 //   - Diagnostic patterns (why, what caused, investigate, crash, bug) → investigate
-//   - Mutation verbs + file refs (write test, add feature, refactor @file) → build
+//   - FRONTEND_UI tasks (layout, styling, positioning) → plan (NEVER build)
 //   - Architectural keywords (migrate, redesign, architecture) → plan
-//   - $hot prefix → build (bypass all)
+//   - Trivial mutations only (typo fix, comment update, rename on doc) → build
+//   - All other mutation intents → plan (safer default — forces /plan analysis)
+//   - $hot prefix → build (explicit bypass)
 func ClassifyIntentMode(input string) string {
 	if IsHotTrack(input) {
 		return "build"
@@ -320,6 +508,11 @@ func ClassifyIntentMode(input string) string {
 		return "investigate"
 	}
 
+	// FRONTEND_UI tasks → plan (enforces Layer 3 Hybrid Search before edits).
+	if IsFrontendUI(input) {
+		return "plan"
+	}
+
 	// Architectural keywords → plan.
 	architecturalPatterns := []string{
 		"architecture", "migrate", "redesign", "restructure",
@@ -331,14 +524,14 @@ func ClassifyIntentMode(input string) string {
 		}
 	}
 
-	// Mutation intent + file ref → build.
+	// Trivial mutations only → build (fast-track).
+	if IsTrivialMutation(input) {
+		return "build"
+	}
+
+	// Mutation intent + file ref — route to plan unless truly trivial.
 	if hasDirectMutationVerb(input) {
-		files := extractFileRefs(input)
-		if len(files) > 0 || strings.Contains(lower, "write") ||
-			strings.Contains(lower, "create") || strings.Contains(lower, "generate") ||
-			strings.Contains(lower, "add ") || strings.Contains(lower, "implement") {
-			return "build"
-		}
+		return "plan"
 	}
 
 	// Default: let the mode resolver decide.
