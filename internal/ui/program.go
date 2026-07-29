@@ -128,13 +128,8 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	// Graph cache must not be loaded before the onboarding detector runs,
 	// because BuildOrLoad creates .izen/graph/ and would cause a false
 	// positive in HasLocalState, bypassing the TUI onboarding flow.
-	var g *graph.Graph
-	if initStage == initComplete && state.HasLocalState(root) {
-		g, _, _ = graphEng.BuildOrLoad()
-	}
-	if g == nil {
-		g = graph.NewGraph(root)
-	}
+	// The graph is rebuilt incrementally in a background goroutine below.
+	g := graph.NewGraph(root)
 
 	// ── Explicit mode registry (deterministic bootstrap) ──────────────
 	// Modes are registered here, in one place, instead of via implicit
@@ -235,6 +230,14 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		}
 		m.initIdentityInput.SetValue(m.userName)
 		m.initIdentityInput.Focus()
+	}
+
+	// ── INDEXING STATUS ──────────────────────────────────────────
+	// Default is "indexing" when the project is initialized but
+	// the graph is being built in the background. On a fresh project
+	// (initNone), no indexing is needed yet.
+	if initStage == initComplete {
+		m.indexingStatus = "indexing"
 	}
 
 	m.resolver.Set(sess.Mode)
@@ -362,13 +365,34 @@ func bootCommon(root string, cfg *config.Config) (*session.Session, *ai.Manager,
 	return sess, mgr, router
 }
 
-func runProgram(p *tea.Program) {
+func runProgram(p *tea.Program, root string, graphEng *graph.Engine, initStage initStage) {
 	configCh := make(chan bool, 1)
 	config.StartConfigWatcher(configCh)
 	go func() {
 		for range configCh {
 			p.Send(config.ConfigChangeMsg{})
 		}
+	}()
+
+	// ── BACKGROUND INDEXING ─────────────────────────────────────
+	// Launch graph building in a background goroutine so the TUI
+	// boots instantly. The model tracks indexingStatus and the
+	// header renders an indicator. When indexing completes, a
+	// graphBuiltMsg or graphIndexingMsg is sent through the
+	// Bubble Tea event loop.
+	go func() {
+		if initStage == initComplete && state.HasLocalState(root) {
+			g2, fromCache, err := graphEng.BuildOrLoadIncremental()
+			if err != nil {
+				p.Send(graphBuiltMsg{err: err})
+				return
+			}
+			if g2 != nil {
+				p.Send(graphBuiltMsg{graph: g2})
+			}
+			_ = fromCache
+		}
+		p.Send(graphIndexingMsg{indexing: false})
 	}()
 
 	if _, err := p.Run(); err != nil {
@@ -386,18 +410,30 @@ func RunMainDashboard(cfg *config.Config, root string, localCfg *config.LocalCon
 		detection = det[0]
 	}
 
+	graphEng := graph.NewEngine(root)
+	initStage := initComplete
+	localCfgPath := filepath.Join(root, ".izen", "config.json")
+	_, localCfgErr := os.Stat(localCfgPath)
+	localActive := localCfgErr == nil
+	if !localActive {
+		if state.HasLocalState(root) {
+			localActive = true
+		}
+	}
+	if !localActive {
+		initStage = initNone
+	}
+
 	p := NewProgram(root, cfg, sess, mgr, localCfg, detection)
-	runProgram(p)
+	runProgram(p, root, graphEng, initStage)
 }
 
 func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalConfig, det ...project.Detection) {
 	sess, mgr, router := bootCommon(root, cfg)
 	_ = router
 
-	// ── VIRTUAL SNAPSHOT ROLLBACK ────────────────────────────────────────
-	// Create an execution engine and rollback any in-flight patches. This
-	// is the standalone rollback entry point invoked when the user explicitly
-	// requests a workspace rollback via the CLI.
+	// ── VIRTUAL SNAPSHOT ROLLBACK ────────────────────────────────
+	// Create an execution engine and rollback any in-flight patches.
 	fmt.Fprintf(os.Stderr, "izen: running rollback engine for %s...\n", root)
 	execEng := execution.NewEngine(root, cfg, sess)
 	errs := execEng.RollbackTransaction()
@@ -414,8 +450,22 @@ func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalCo
 		detection = det[0]
 	}
 
+	graphEng := graph.NewEngine(root)
+	initStage := initComplete
+	localCfgPath := filepath.Join(root, ".izen", "config.json")
+	_, localCfgErr := os.Stat(localCfgPath)
+	localActive := localCfgErr == nil
+	if !localActive {
+		if state.HasLocalState(root) {
+			localActive = true
+		}
+	}
+	if !localActive {
+		initStage = initNone
+	}
+
 	p := NewProgram(root, cfg, sess, mgr, localCfg, detection)
-	runProgram(p)
+	runProgram(p, root, graphEng, initStage)
 }
 
 // projectContextFor returns a safe ProjectContext from project detection.

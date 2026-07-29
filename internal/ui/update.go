@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,14 +33,17 @@ import (
 	verification "github.com/PizenLabs/izen/internal/verification"
 )
 
-// Init initializes the spinner tick and text input blink.
+// Init initializes the spinner tick, pro tip rotation, and text input blink.
 func (m *model) Init() tea.Cmd {
-	m.currentTip = randomTip()
+	m.currentTip = allTips[0]
+	m.lastTipRotation = time.Now()
+	m.proTipIndex = 0
 	if m.initStage != initNone && m.initStage != initComplete {
-		return m.spinnerTickCmd()
+		return tea.Batch(m.smoothStreamTickCmd(), m.proTipTickCmd())
 	}
 	return tea.Batch(
-		m.spinnerTickCmd(),
+		m.smoothStreamTickCmd(),
+		m.proTipTickCmd(),
 		m.ti.Focus(),
 		m.initSessionStartCheckpoint,
 	)
@@ -164,13 +168,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Allow tickMsg to pass through so the spinner continues animating
 		// during init stages.
 		if _, ok := msg.(tickMsg); ok {
-			return m, m.spinnerTickCmd()
+			return m, m.smoothStreamTickCmd()
 		}
 		// Allow async result messages to reach their handlers in the main
 		// type switch below. Without this, gitInitResultMsg gets swallowed
 		// and the init stage never advances after pressing 'Y'.
 		switch msg.(type) {
-		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg:
+		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg, graphIndexingMsg:
 			// fall through to main type switch
 		default:
 			return m, nil
@@ -232,7 +236,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// refusal was triggered, drop spinnerFrame to 0 immediately so
 		// the braille spinner in the status bar shows no residual animation.
 		if m.spinnerFrame > 0 && !m.streaming && !m.agentRunning && !m.reviewRunning &&
-			m.state != StateProcessing && m.state != StateAwaitingApproval && !m.pipelineRunning {
+			m.state != StateProcessing && m.state != StateAwaitingApproval && !m.pipelineRunning &&
+			m.indexingStatus != "indexing" {
 			m.spinnerFrame = 0
 		}
 
@@ -277,10 +282,36 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.state == StateProcessing {
 				m.refreshViewportContent()
 			}
-			// 3. Re-dispatch the tick to keep the render loop alive.
+			// 3. Re-dispatch the smooth tick to keep the render loop alive.
+			return m, m.smoothStreamTickCmd()
+		}
+
+		return m, nil
+
+	case spinnerTickMsg:
+		m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
+		m.refreshViewportContent()
+		if m.indexingStatus == "indexing" || m.pendingArchArgs != "" {
 			return m, m.spinnerTickCmd()
 		}
 		return m, nil
+
+	case proTipTickMsg:
+		now := time.Now()
+		if now.Sub(m.lastTipRotation) >= proTipRotationInterval {
+			n := len(allTips)
+			if n > 1 {
+				idx := rand.Intn(n - 1)
+				if idx >= m.proTipIndex {
+					idx++
+				}
+				m.proTipIndex = idx
+			}
+			m.currentTip = allTips[m.proTipIndex]
+			m.lastTipRotation = now
+		}
+		m.refreshViewportContent()
+		return m, m.proTipTickCmd()
 
 	case agentStartMsg:
 		m.agentRunning = true
@@ -514,13 +545,45 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case graphBuiltMsg:
 		m.agentRunning = false
 		m.sanitizeInputPrompt()
-		if msg.err == nil && msg.graph != nil {
+		if msg.err != nil {
+			m.push(roleError, "graph indexing failed: "+msg.err.Error())
+			m.indexingStatus = "error"
+			m.pendingArchArgs = ""
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
+		if msg.graph != nil {
 			m.graph = msg.graph
+		}
+		m.indexingStatus = "indexed"
+		// Auto-render pending /arch view if user invoked it
+		// while indexing was still in progress.
+		if m.pendingArchArgs != "" && m.graph != nil {
+			args := m.pendingArchArgs
+			m.pendingArchArgs = ""
+			graphText := m.renderArch(args)
+			m.push(roleSystem, infoStyle.Render(args))
+			m.refreshViewportContent()
+			m.push(roleSystem, graphText)
+			m.Viewport.GotoBottom()
+		} else {
+			m.pendingArchArgs = ""
 		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
 		return m, flush
+
+	case graphIndexingMsg:
+		if msg.indexing {
+			m.indexingStatus = "indexing"
+		} else if m.indexingStatus != "indexed" {
+			m.indexingStatus = "indexed"
+		}
+		m.refreshViewportContent()
+		return m, nil
 
 	case reviewResultMsg:
 		m.agentRunning = false
@@ -2235,7 +2298,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// Advance directly to identity setup, skipping the confirm step.
 			m.advancePastGitCheck()
 		}
-		return m, m.spinnerTickCmd()
+		return m, m.smoothStreamTickCmd()
 
 	case tea.MouseMsg:
 		// HARD GUARD: In destructive states (approval/exec), mouse events are
@@ -2446,7 +2509,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 }
 
 func (m *model) spinnerTickCmd() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+		return spinnerTickMsg(t)
+	})
+}
+
+func (m *model) proTipTickCmd() tea.Cmd {
+	return tea.Tick(proTipRotationInterval, func(t time.Time) tea.Msg {
+		return proTipTickMsg(t)
+	})
 }
 
 func (m *model) smoothStreamTickCmd() tea.Cmd {

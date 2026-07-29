@@ -145,10 +145,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	msgs = append(msgs, ai.Message{Role: "user", Content: content})
 
 	// ── AUTOMATIC FILE CONTEXT INJECTION ──────────────────────
-	// When a workspace is detected, scan for relevant files and
-	// inject their paths + contents into the user message so the
-	// model always knows which files exist instead of asking.
-	if m.workspaceRoot != "" {
+	// Skip injection for casual greetings / small talk — they don't
+	// need codebase context and pulling random snippets (config files,
+	// release notes, etc.) into the LLM window is both wasteful and
+	// the source of hallucinated RAG context on short inputs.
+	if m.workspaceRoot != "" && !gateway.IsCasualChat(content) {
 		augmented := injectFileContext(m.workspaceRoot, content, msgs[len(msgs)-1].Content)
 		if augmented != "" {
 			msgs[len(msgs)-1].Content = augmented
@@ -254,7 +255,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		}
 	}()
 
-	return tea.Batch(m.readStream(), m.spinnerTickCmd())
+	return tea.Batch(m.readStream(), m.smoothStreamTickCmd())
 }
 
 func injectFileContext(workspaceRoot, prompt, userContent string) string {

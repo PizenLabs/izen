@@ -260,7 +260,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "hotfix apply"} },
 					m.applyHotfixPatch(task, patch),
-					m.spinnerTickCmd(),
+					m.smoothStreamTickCmd(),
 				)
 
 			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
@@ -305,7 +305,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
 					m.runBuildShellExec(task),
-					m.spinnerTickCmd(),
+					m.smoothStreamTickCmd(),
 				)
 
 			case msg.String() == "alt+l":
@@ -322,7 +322,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
 					m.runBuildShellExec(task),
-					m.spinnerTickCmd(),
+					m.smoothStreamTickCmd(),
 				)
 
 			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:

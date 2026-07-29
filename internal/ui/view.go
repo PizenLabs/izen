@@ -2,7 +2,6 @@ package ui
 
 import (
 	"fmt"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -118,8 +117,8 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 		borderColor = viBorderStyle
 	}
 
-	// ── Fixed Header: WorkflowState + CapabilitySet ──
-	headerView := renderFixedHeader(m.runtimeCtx, m.workflowSM, width)
+	// ── Fixed Header: WorkflowState + CapabilitySet + indexing ──
+	headerView := renderFixedHeader(m.runtimeCtx, m.workflowSM, width, m.indexingStatus)
 	headerLines := strings.Count(headerView, "\n") + 1
 
 	// ── Fixed Footer: Budget counters + notifications ──
@@ -783,14 +782,6 @@ func (m *model) renderRuntimeStatus(width int) string {
 	return b.String()
 }
 
-var devTips = []string{
-	"Pro Tip: Press [Esc] three times quickly anywhere to cleanly safely quit IZEN.",
-	"Pro Tip: Use '@path' to attach files/folders. Multi-column layout automatically isolates parent package names.",
-	"Pro Tip: IZEN locks execution boundaries. /ask is strictly Read-Only, use /build to run shell mutations.",
-	"Pro Tip: Run !<command> to escape the prompt and execute short native shell actions synchronously.",
-	"Pro Tip: Toggle the global help dashboard overlay instantly by pressing [?] during idle input states.",
-}
-
 // renderStatusBar renders the runtime telemetry line — the lowest visual
 // priority element, pinned to the bottom. When capabilities are exposed by the
 // current workflow context, they are rendered INLINE on the same line,
@@ -960,7 +951,7 @@ func (m *model) renderStartupBanner(termWidth int) string {
 	metaSep := subtleStyle.Render(" · ")
 	meta := strings.Join(metaParts, metaSep)
 
-	tip := mutedStyle.Render(devTips[rand.Intn(len(devTips))])
+	tip := mutedStyle.Render(m.currentTip)
 	rows = append(rows, divider, meta, "", tip)
 	body := strings.Join(rows, "\n")
 

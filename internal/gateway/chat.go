@@ -100,9 +100,11 @@ func IsCasualChat(input string) bool {
 }
 
 // CasualChatSystemPrompt returns the minimal system prompt for
-// casual chat interactions (under 50 tokens).
+// casual chat interactions (under 50 tokens). Always identifies
+// the model as IZEN so that typos or unknown intents never
+// produce identity leaks (e.g. "Claude").
 func CasualChatSystemPrompt() string {
-	return "You are Izen, a fast CLI coding assistant. Respond concisely in 1-2 short sentences."
+	return "You are IZEN, a fast CLI coding companion created for terminal power-users. Always identify as IZEN if asked about your name, role, or identity. Respond concisely in 1-2 short sentences."
 }
 
 // CasualChatMaxTokens returns the ultra-low max_tokens budget for

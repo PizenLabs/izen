@@ -49,9 +49,63 @@ func (e *Engine) BuildWithConfig(cfg ScanConfig) (*Graph, error) {
 				Path:     fi.Path,
 				Language: fi.Lang,
 				Size:     fi.Size,
+				Lines:    fi.Lines,
+				Mtime:    fi.Mtime,
 			})
 			continue
 		}
+		fn.Mtime = fi.Mtime
+		graph.AddFile(*fn)
+	}
+
+	graph.BuiltAt = time.Now()
+
+	return graph, nil
+}
+
+func (e *Engine) BuildIncremental(prev *Graph) (*Graph, error) {
+	cfg := DefaultScanConfig(e.root)
+	result, err := Scan(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("scan: %w", err)
+	}
+
+	if len(result.Files) == 0 {
+		return NewGraph(e.root), nil
+	}
+
+	graph := NewGraph(e.root)
+
+	changedSet := make(map[string]bool)
+	for _, fi := range result.Files {
+		if prev == nil {
+			changedSet[fi.Path] = true
+			continue
+		}
+		existing, ok := prev.FileMap[fi.Path]
+		if !ok || existing.Mtime != fi.Mtime {
+			changedSet[fi.Path] = true
+		} else {
+			graph.AddFile(*existing)
+		}
+	}
+
+	for _, fi := range result.Files {
+		if !changedSet[fi.Path] {
+			continue
+		}
+		fn, err := e.parser.ParseFile(e.root, fi.Path, fi.Lang)
+		if err != nil {
+			graph.AddFile(FileNode{
+				Path:     fi.Path,
+				Language: fi.Lang,
+				Size:     fi.Size,
+				Lines:    fi.Lines,
+				Mtime:    fi.Mtime,
+			})
+			continue
+		}
+		fn.Mtime = fi.Mtime
 		graph.AddFile(*fn)
 	}
 
@@ -114,6 +168,34 @@ func (e *Engine) SaveCache(graph *Graph) error {
 func (e *Engine) BuildOrLoad() (*Graph, bool, error) {
 	g, err := e.LoadCache()
 	if err == nil && g != nil {
+		return g, true, nil
+	}
+
+	g, err = e.Build()
+	if err != nil {
+		return nil, false, err
+	}
+
+	if err := e.SaveCache(g); err != nil {
+		return g, false, fmt.Errorf("save cache: %w (graph built)", err)
+	}
+
+	return g, false, nil
+}
+
+func (e *Engine) BuildOrLoadIncremental() (*Graph, bool, error) {
+	g, err := e.LoadCache()
+	if err == nil && g != nil {
+		g2, err := e.BuildIncremental(g)
+		if err == nil && g2 != nil {
+			if g2.FileCount == g.FileCount && g2.SymCount == g.SymCount {
+				return g, true, nil
+			}
+			if err := e.SaveCache(g2); err != nil {
+				return g, true, fmt.Errorf("save cache: %w (incremental graph built)", err)
+			}
+			return g2, true, nil
+		}
 		return g, true, nil
 	}
 

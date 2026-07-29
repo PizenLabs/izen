@@ -27,12 +27,19 @@ var (
 	capBadgeDisabledStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color(colorDimmed)).
 				Padding(0, 1)
+	indexingStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(colorYellow)).
+			Bold(true)
+	indexedStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(colorGreen)).
+			Bold(true)
 )
 
-// renderFixedHeader renders the anchored top bar: WorkflowState badge and
-// CapabilitySet flags in a single compact, high-density line. This maximizes
-// scrollable viewport space by eliminating redundant mode/context info.
-func renderFixedHeader(runtimeCtx *runtime.RuntimeContext, wfSM *workflow.WorkflowStateMachine, width int) string {
+// renderFixedHeader renders the anchored top bar: WorkflowState badge,
+// indexing status Indicator, and CapabilitySet flags in a single
+// compact, high-density line. This maximizes scrollable viewport space
+// by eliminating redundant mode/context info.
+func renderFixedHeader(runtimeCtx *runtime.RuntimeContext, wfSM *workflow.WorkflowStateMachine, width int, indexingStatus string) string {
 	if runtimeCtx == nil || wfSM == nil || width < 20 {
 		return ""
 	}
@@ -42,6 +49,19 @@ func renderFixedHeader(runtimeCtx *runtime.RuntimeContext, wfSM *workflow.Workfl
 	var b strings.Builder
 
 	b.WriteString(workflowStateStyle.Render("● " + strings.ToUpper(ws.String())))
+
+	// Indexing status indicator
+	switch indexingStatus {
+	case "indexing":
+		b.WriteString("  ")
+		b.WriteString(indexingStyle.Render("⚡ Indexing..."))
+	case "indexed":
+		b.WriteString("  ")
+		b.WriteString(indexedStyle.Render("✓ Indexed"))
+	case "error":
+		b.WriteString("  ")
+		b.WriteString(indexingStyle.Render("✗ Index error"))
+	}
 
 	if runtimeCtx.Caps != nil {
 		b.WriteString("  ")
