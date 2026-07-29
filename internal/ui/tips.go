@@ -1,9 +1,5 @@
 package ui
 
-import (
-	"math/rand"
-)
-
 var allTips = []string{
 	"Use @file in your prompt to attach specific files for context.",
 	"Use Ctrl+Up/Down to scroll through command history without re-typing.",
@@ -23,8 +19,4 @@ var allTips = []string{
 	"Run /help or /? at any time to see all available commands.",
 	"Press [Alt+A] to accept individual build proposals or [Alt+L] to accept all at once.",
 	"Use /commit to auto-generate a semantic commit message from staged changes.",
-}
-
-func randomTip() string {
-	return allTips[rand.Intn(len(allTips))]
 }

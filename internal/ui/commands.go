@@ -790,7 +790,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.currentResult = nil
 		}
 
-		if m.resolver.Current() == modes.ModeAsk && len(refFiles) == 0 {
+		if m.resolver.Current() == modes.ModeAsk && len(refFiles) == 0 && !gateway.IsCasualChat(line) {
 			result := retrieval.RouteAsk(line, m.gitEng)
 			if len(result.Targets) > 0 && m.graph != nil {
 				cb := ctxpkg.NewBuilder(".", m.graph, m.gitEng, m.sess)
@@ -2634,7 +2634,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	return tea.Batch(
 		func() tea.Msg { return agentStartMsg{label: "hotfix"} },
 		m.proposeHotfixPatch(&hotfixTask),
-		m.spinnerTickCmd(),
+		m.smoothStreamTickCmd(),
 		m.hotfixProgressCmd(),
 	)
 }
@@ -3973,7 +3973,7 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 			return tea.Batch(
 				func() tea.Msg { return agentStartMsg{label: "shell exec"} },
 				m.runBuildShellExec(targetTask),
-				m.spinnerTickCmd(),
+				m.smoothStreamTickCmd(),
 			)
 		}
 
@@ -4006,7 +4006,7 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 				return tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "hybrid template"} },
 					m.proposeHybridTemplatePatch(targetTask),
-					m.spinnerTickCmd(),
+					m.smoothStreamTickCmd(),
 				)
 			}
 			return tea.Batch(
@@ -4026,13 +4026,13 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 			return tea.Batch(
 				func() tea.Msg { return agentStartMsg{label: "stdlib patch"} },
 				m.proposeStdlibBuildPatch(targetTask),
-				m.spinnerTickCmd(),
+				m.smoothStreamTickCmd(),
 			)
 		}
 		return tea.Batch(
 			func() tea.Msg { return agentStartMsg{label: "patching"} },
 			m.proposeBuildPatch(targetTask),
-			m.spinnerTickCmd(),
+			m.smoothStreamTickCmd(),
 		)
 	}
 
@@ -4101,13 +4101,13 @@ func (m *model) runTestCmd(target string) tea.Cmd {
 		return tea.Batch(
 			func() tea.Msg { return agentStartMsg{label: "testing"} },
 			m.runTestEngine("./..."),
-			m.spinnerTickCmd(),
+			m.smoothStreamTickCmd(),
 		)
 	}
 	return tea.Batch(
 		func() tea.Msg { return agentStartMsg{label: "testing"} },
 		m.runTestEngine(target),
-		m.spinnerTickCmd(),
+		m.smoothStreamTickCmd(),
 	)
 }
 
@@ -4133,13 +4133,13 @@ func (m *model) runRunCmd(target string) tea.Cmd {
 		return tea.Batch(
 			func() tea.Msg { return agentStartMsg{label: "building"} },
 			m.runBuildEngine("./..."),
-			m.spinnerTickCmd(),
+			m.smoothStreamTickCmd(),
 		)
 	}
 	return tea.Batch(
 		func() tea.Msg { return agentStartMsg{label: "building"} },
 		m.runBuildEngine(target),
-		m.spinnerTickCmd(),
+		m.smoothStreamTickCmd(),
 	)
 }
 
@@ -4330,7 +4330,7 @@ func (m *model) runFixCmd(target string) tea.Cmd {
 		func() tea.Msg {
 			return agentStartMsg{label: "fixing"}
 		},
-		m.spinnerTickCmd(),
+		m.smoothStreamTickCmd(),
 		func() tea.Msg {
 			output := m.lastTestOutput
 			frames := investigate.ParseStackFrames(output)
@@ -5332,7 +5332,7 @@ func (m *model) runAskPromptHandoffCmd(rawInput string) tea.Cmd {
 		func() tea.Msg {
 			return agentStartMsg{label: "refining architectural idea"}
 		},
-		m.spinnerTickCmd(),
+		m.smoothStreamTickCmd(),
 		func() tea.Msg {
 			if m.provider == nil {
 				m.push(roleError, "[System Error] No AI provider is configured. Run /model to select one.")

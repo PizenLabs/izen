@@ -27,7 +27,7 @@ func (m *model) runInvestigateCmd(content string) tea.Cmd {
 		func() tea.Msg {
 			return agentStartMsg{label: "investigating"}
 		},
-		m.spinnerTickCmd(),
+		m.smoothStreamTickCmd(),
 		m.runInvestigateAsyncCmd(content),
 	)
 }
@@ -389,7 +389,7 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 		func() tea.Msg {
 			return agentStartMsg{label: "reviewing"}
 		},
-		m.spinnerTickCmd(),
+		m.smoothStreamTickCmd(),
 		func() tea.Msg {
 			currentMode := m.resolver.Current()
 			if currentMode.CanWrite() {
@@ -584,7 +584,7 @@ func (m *model) runCommitCmdAgent(userMsg string) tea.Cmd {
 			}
 			return agentStartMsg{label: label}
 		},
-		m.spinnerTickCmd(),
+		m.smoothStreamTickCmd(),
 		func() tea.Msg {
 			// ── CONSECUTIVE BUILD CHECKPOINT DETECTION ─────────
 			// Scan git log for consecutive "izen build:" commits at HEAD.

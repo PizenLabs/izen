@@ -43,12 +43,12 @@ func renderFixedFooter(runtimeCtx *runtime.RuntimeContext, notification string, 
 
 	var b strings.Builder
 
-	// ── Budget counters ────────────────────────────────────────────────
+	// ── Budget counters ──────────────────────────────────────
 	if runtimeCtx.Budget != nil {
 		b.WriteString(renderBudgetCounters(runtimeCtx.Budget))
 	}
 
-	// ── Notification ───────────────────────────────────────────────────
+	// ── Notification ──────────────────────────────────────────
 	if notification != "" {
 		if b.Len() > 0 {
 			b.WriteString("  ")

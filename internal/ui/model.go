@@ -106,6 +106,10 @@ type tickMsg time.Time
 
 type smoothStreamTickMsg time.Time
 
+type spinnerTickMsg time.Time
+
+type proTipTickMsg time.Time
+
 // planSlowNoticeMsg fires once, planSlowNoticeDelay after /plan synthesis
 // starts. If synthesis is still pending when it arrives, a viewport-safe
 // warning is surfaced (never a raw terminal print) so the user learns the
@@ -115,6 +119,11 @@ type planSlowNoticeMsg struct{ startedAt time.Time }
 // planSlowNoticeDelay is how long /plan synthesis may run before the soft
 // "provider may be unresponsive" notice is shown.
 const planSlowNoticeDelay = 10 * time.Second
+
+// proTipRotationInterval is the interval at which Pro Tips rotate
+// in the welcome banner. Fast enough for visual engagement, slow
+// enough to remain gentle and readable.
+const proTipRotationInterval = 5 * time.Second
 
 type investigateResultMsg struct {
 	records           []record
@@ -704,7 +713,9 @@ type model struct {
 	currentTrace *ctxpkg.CodebaseTrace
 
 	// Tip of the Day
-	currentTip string
+	currentTip      string
+	proTipIndex     int
+	lastTipRotation time.Time
 
 	// Help overlay toggle
 	showHelpOverlay bool

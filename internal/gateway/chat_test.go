@@ -143,7 +143,7 @@ func TestIsCasualChat_Empty(t *testing.T) {
 
 func TestCasualChatSystemPrompt(t *testing.T) {
 	p := CasualChatSystemPrompt()
-	expected := "You are Izen, a fast CLI coding assistant. Respond concisely in 1-2 short sentences."
+	expected := "You are IZEN, a fast CLI coding companion created for terminal power-users. Always identify as IZEN if asked about your name, role, or identity. Respond concisely in 1-2 short sentences."
 	if p != expected {
 		t.Errorf("CasualChatSystemPrompt() = %q, want %q", p, expected)
 	}
