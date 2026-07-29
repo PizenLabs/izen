@@ -12,19 +12,32 @@ permissions:
 
 jobs:
   upload:
-    if: github.event.workflow_run.conclusion == 'success'
+    name: Upload Coverage
     runs-on: ubuntu-latest
 
+    if: >
+      github.event.workflow_run.conclusion == 'success'
+
+    timeout-minutes: 10
+
     steps:
-      - uses: actions/download-artifact@v8
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v4
         with:
           name: coverage-go
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - run: ls -R
+      - name: Verify downloaded files
+        run: |
+          pwd
+          ls -lah
+          find . -type f
 
-      - uses: codecov/codecov-action@v5
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
         with:
-          files: coverage.out
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage-go.out
           fail_ci_if_error: true
+          verbose: true
