@@ -270,6 +270,38 @@ func ParseCompilerTargets(output string) []Target {
 	return targets
 }
 
+// SanitizeDiagnosticsForVanillaWeb strips lines from raw diagnostics that
+// reference Go toolchain operations (go.mod, go test, Go compiler errors).
+// Called when the workspace archetype is VANILLA_WEB to prevent Go-related
+// evidence from reaching the LLM prompt in /plan or /build.
+func SanitizeDiagnosticsForVanillaWeb(diagnostics string) string {
+	if diagnostics == "" {
+		return ""
+	}
+	lines := strings.Split(diagnostics, "\n")
+	clean := make([]string, 0, len(lines))
+	for _, line := range lines {
+		lower := strings.ToLower(line)
+		// Strip lines mentioning Go toolchain operations
+		if strings.Contains(lower, "go.mod") ||
+			strings.Contains(lower, "go.sum") ||
+			strings.Contains(lower, "go test") ||
+			strings.Contains(lower, "go build") ||
+			strings.Contains(lower, "go get ") ||
+			strings.Contains(lower, "go mod ") ||
+			strings.Contains(lower, "no required module") ||
+			strings.Contains(lower, "cannot find package") ||
+			strings.Contains(lower, "undefined:") ||
+			strings.Contains(lower, "compilation") ||
+			strings.Contains(lower, "compile error") ||
+			strings.Contains(lower, "to add it:") {
+			continue
+		}
+		clean = append(clean, line)
+	}
+	return strings.Join(clean, "\n")
+}
+
 func (cl *ContextLedger) FormatForPlan() string {
 	var b strings.Builder
 

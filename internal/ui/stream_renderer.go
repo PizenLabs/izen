@@ -287,6 +287,22 @@ func renderCodeBlock(language string, lines []string, width int) string {
 
 // ── Streaming Content Renderer (now delegates to DeterministicPipeline) ─────
 
+// renderLiveThoughts renders the active thought stream as dimmed/faint text
+// at the top of the streaming output. During an active LLM stream, reasoning
+// tokens are displayed in real-time with a vertical-bar gutter, styled using
+// thoughtActiveStyle (faint/dimmed). After streaming completes, thoughts are
+// collapsed to a single-line summary.
+func (m *model) renderLiveThoughts(width int) string {
+	if m.thoughtStream == nil || m.thoughtStream.Len() == 0 {
+		return ""
+	}
+	if !m.streaming {
+		return ""
+	}
+	spinner := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
+	return m.thoughtStream.Render(width, spinner)
+}
+
 // renderStreamingContent renders AI content incrementally during an active
 // LLM stream. It uses parseAIContent for block classification (plans, diffs,
 // tables, etc.) and delegates plain text blocks to the deterministic pipeline.
@@ -524,7 +540,21 @@ func (m *model) renderStreamingContent(content string, width int) string {
 		}
 	}
 
-	return strings.Join(renderedBlocks, vspace(Spacing.Section))
+	result := strings.Join(renderedBlocks, vspace(Spacing.Section))
+
+	// ── LIVE THOUGHTS: prepend dimmed reasoning stream ──────────────
+	// During active streaming, render the thought stream as faint text
+	// above the main content so the user sees reasoning in real-time.
+	// After streaming, thoughts are hidden (they remain in
+	// m.thoughtStream for Alt+O expansion).
+	if m.streaming && m.thoughtStream != nil && m.thoughtStream.Len() > 0 {
+		thoughts := m.renderLiveThoughts(width)
+		if thoughts != "" {
+			result = thoughts + "\n" + result
+		}
+	}
+
+	return result
 }
 
 // planStatusSource exposes the live /plan task ledger as a plan.TaskStatusSource

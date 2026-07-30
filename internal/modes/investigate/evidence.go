@@ -523,6 +523,50 @@ func (es *EvidenceStore) Clear() {
 	es.nextID = 0
 }
 
+// goRelatedKeywords are patterns that identify Go-toolchain evidence.
+// Used by SanitizeEvidenceForVanillaWeb to strip Go references from
+// the evidence payload before building LLM prompts for VANILLA_WEB.
+var goRelatedKeywords = []string{
+	"go.mod", "go.sum", "go.work",
+	"go test", "go build", "go get", "go mod",
+	"go: finding", "go: downloading", "go: extracting",
+	"compilation", "compile error",
+	"cannot find package", "no required module",
+	"package is not in", "missing dependency",
+	"undefined:", "to add it:",
+}
+
+// isGoRelatedEvidence reports whether an evidence item carries content
+// that references Go toolchain operations — test runs, module resolution,
+// compiler diagnostics. Used by the VANILLA_WEB archetype guard.
+func isGoRelatedContent(content string) bool {
+	lower := strings.ToLower(content)
+	for _, kw := range goRelatedKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// SanitizeEvidenceForVanillaWeb removes all evidence items whose content
+// references Go toolchain operations (go.mod, go test, Go compiler errors).
+// Called when the workspace archetype is VANILLA_WEB to prevent the LLM
+// from seeing Go-related evidence that would trigger false-positive tasks.
+func (es *EvidenceStore) SanitizeEvidenceForVanillaWeb() {
+	if len(es.evidence) == 0 {
+		return
+	}
+	filtered := make([]Evidence, 0, len(es.evidence))
+	for _, ev := range es.evidence {
+		if isGoRelatedContent(ev.Content) {
+			continue
+		}
+		filtered = append(filtered, ev)
+	}
+	es.evidence = filtered
+}
+
 func (es *EvidenceStore) Summary() string {
 	sources := make(map[EvidenceSource]int)
 	for _, ev := range es.evidence {

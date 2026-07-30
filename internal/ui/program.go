@@ -255,6 +255,16 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	retrieval.SetActivityLogger(activityFn)
 	execution.SetActivityLogger(activityFn)
 
+	// ── WIRE TYPED EVENT LOGGERS ─────────────────────────────────────────
+	// The model's handleEngineEvent is injected as the typed event sink for
+	// real I/O metrics (bytes read, lines patched, exit codes, elapsed time).
+	// These feed the ActivityTree directly — no string parsing involved.
+	eventFn := func(ev interface{}) {
+		m.handleEngineEvent(ev)
+	}
+	retrieval.SetEventLogger(eventFn)
+	execution.SetEventLogger(eventFn)
+
 	// ── REDIRECT /investigate ENGINE LOG SINKS ───────────────────────────
 	// The investigate orchestrator has two package-level activity sinks:
 	// forensicLog (defaults to log.Printf → stderr) and dispatchLog (defaults

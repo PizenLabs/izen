@@ -9,6 +9,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/pkg/recon"
 )
 
 // forensicLog is the activity sink for /investigate. It defaults to the
@@ -40,6 +41,11 @@ type Engine struct {
 	// Intent classifies the investigation request (bug/regression vs feature/test/refactor).
 	// Controls whether environment/dependency resolution tools are allowed.
 	Intent Intent
+
+	// vanillaWeb is true when the workspace archetype is VANILLA_WEB (HTML/CSS/JS
+	// without Go files). When true, Go-specific diagnostic patterns are skipped
+	// and Go toolchain commands (go mod tidy, go test) are never suggested.
+	vanillaWeb bool
 
 	// forensicsRan records whether the engine actually invoked the diagnostic
 	// toolchain (test executor and/or retriever searches) during this run. It
@@ -129,6 +135,13 @@ func (e *Engine) Run() (*InvestigationResult, error) {
 
 func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 	e.runCtx = ctx
+
+	// Detect workspace archetype at run start. When VANILLA_WEB, Go-specific
+	// diagnostic patterns are skipped entirely.
+	ac, err := recon.DetectArchetype(e.root)
+	if err == nil && ac != nil {
+		e.vanillaWeb = (ac.Type == recon.VANILLA_WEB)
+	}
 
 	// Wipe stale conclusion caches from any prior (possibly broken) run so the
 	// plan handoff can never inherit leftover REMOTE DEPENDENCY BLOCKER tokens
@@ -234,6 +247,12 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 	injectDependencyBlocker(e, &e.Ledger.Conclusion)
 	injectDependencyBlocker(e, &e.Result.Conclusion)
 	injectDependencyBlocker(e, &result.Conclusion)
+
+	// VANILLA_WEB ARCHETYPE: Strip all Go toolchain evidence before the
+	// plan handoff so the LLM never sees go.mod or go test references.
+	if e.vanillaWeb {
+		e.Evidence.SanitizeEvidenceForVanillaWeb()
+	}
 
 	// MANDATORY FORENSIC EVIDENCE: /investigate MUST have actually executed the
 	// diagnostic toolchain (LX/graph search and/or the test shell) before it is
@@ -370,7 +389,7 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 	// DispatchStrategy selects the tool but its Rationale field is NOT logged —
 	// it is a pre-decision classification label, not a verified fact.
 	// Actual outcomes are logged after execution below.
-	strategy := DispatchStrategy(dctx, e.provider, e.model, diagnostics, e.Intent)
+	strategy := DispatchStrategy(dctx, e.provider, e.model, diagnostics, e.Intent, e.vanillaWeb)
 	dispatchLog("[orchestrator] classify -> tool=%s target=%q",
 		strategy.Tool, strategy.Target)
 
@@ -874,6 +893,12 @@ func (e *Engine) FormatLedgerForPlan() string {
 	if e.Result != nil {
 		e.Ledger.SetRootCause(e.Result.RootCause)
 		e.Ledger.SetConclusion(e.Result.Conclusion, e.Result.Resolved)
+	}
+	// VANILLA_WEB ARCHETYPE: Sanitize the diagnostics string before
+	// passing it to /plan, stripping all Go toolchain references so
+	// the LLM never sees go.mod, go test, or Go compiler errors.
+	if e.vanillaWeb && e.Ledger.Diagnostics != "" {
+		e.Ledger.Diagnostics = SanitizeDiagnosticsForVanillaWeb(e.Ledger.Diagnostics)
 	}
 	return e.Ledger.FormatForPlan()
 }

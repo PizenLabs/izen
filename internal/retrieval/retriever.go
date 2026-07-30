@@ -303,7 +303,9 @@ func (r *Retriever) executeSearchResolve(router *Router, query Query) *ResultSet
 		globalActivityLog("[system] resolving symbol: %s", query.Symbol)
 	}
 
+	resolveStart := time.Now()
 	coords, err := router.ResolveSymbol(context.Background(), query.Symbol)
+	elapsed := time.Since(resolveStart)
 	if err != nil {
 		if globalActivityLog != nil {
 			globalActivityLog("[FAIL] resolve %q: %v", query.Symbol, err)
@@ -323,6 +325,9 @@ func (r *Retriever) executeSearchResolve(router *Router, query Query) *ResultSet
 	if rs.Empty() {
 		globalActivityLog("[search] no results for resolve %q", query.Symbol)
 	}
+	if globalEventLog != nil {
+		globalEventLog(ResolveEvent{Symbol: query.Symbol, Hits: len(rs.Results), Elapsed: elapsed})
+	}
 
 	return rs
 }
@@ -332,7 +337,9 @@ func (r *Retriever) executeSearchContext(router *Router, query Query) *ResultSet
 		globalActivityLog("[system] searching context: %s", query.Text)
 	}
 
+	searchStart := time.Now()
 	chunks, err := router.SearchContext(context.Background(), query.Text)
+	elapsed := time.Since(searchStart)
 	if err != nil {
 		if globalActivityLog != nil {
 			globalActivityLog("[FAIL] search %q: %v", query.Text, err)
@@ -353,6 +360,9 @@ func (r *Retriever) executeSearchContext(router *Router, query Query) *ResultSet
 
 	if globalActivityLog != nil && !rs.Empty() {
 		globalActivityLog("[ OK ] search %q: %d results", query.Text, len(rs.Results))
+	}
+	if globalEventLog != nil {
+		globalEventLog(SearchEvent{Query: query.Text, Hits: len(rs.Results), Elapsed: elapsed})
 	}
 
 	return rs

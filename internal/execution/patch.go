@@ -503,6 +503,7 @@ func sanitizeCtxID(id string) string {
 }
 
 func (pm *PatchManager) Apply(patch *Patch) error {
+	patchStartTime := time.Now()
 	if err := checkAuthorization(pm.auth); err != nil {
 		if globalActivityLog != nil {
 			globalActivityLog("[FAIL] patch rejected on %s: %v", patch.File, err)
@@ -619,6 +620,10 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		if globalActivityLog != nil {
 			lineCount := len(strings.Split(patch.Modified, "\n"))
 			globalActivityLog("[ OK ] created file %s (%d lines) via FILE_CREATE", patch.File, lineCount)
+		}
+		if globalEventLog != nil {
+			lineCount := len(strings.Split(patch.Modified, "\n"))
+			globalEventLog(FileMutateEvent{File: patch.File, LinesAdd: lineCount, LinesDel: 0, Elapsed: time.Since(patchStartTime)})
 		}
 		patch.ContextID = pm.contextID
 		patch.Applied = true
@@ -814,6 +819,23 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 
 	if globalActivityLog != nil {
 		globalActivityLog("[ OK ] patched %s (%s)", patch.File, detail)
+	}
+	if globalEventLog != nil {
+		origLines := 0
+		newLines := 0
+		if patch.Original != "" {
+			origLines = len(strings.Split(patch.Original, "\n")) - 1
+		}
+		if patch.Modified != "" {
+			newLines = len(strings.Split(patch.Modified, "\n")) - 1
+		}
+		added := newLines - origLines
+		removed := 0
+		if added < 0 {
+			removed = -added
+			added = 0
+		}
+		globalEventLog(FileMutateEvent{File: patch.File, LinesAdd: added, LinesDel: removed, Elapsed: time.Since(patchStartTime)})
 	}
 
 	patch.ContextID = pm.contextID

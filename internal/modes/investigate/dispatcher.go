@@ -69,14 +69,35 @@ func boundedDispatchCtx(parent context.Context) (context.Context, context.Cancel
 // path. This prevents generic environment noise (e.g. Docker container errors)
 // from overriding an explicit missing Go module.
 //
+// When isVanillaWeb is true, Go-specific patterns are SKIPPED entirely —
+// the workspace contains only HTML/CSS/JS and Go diagnostics would produce
+// false positives. The dispatcher falls back to env/trace/diagnose for
+// web-native issues.
+//
 // If provider is nil or the model returns an unusable payload, the dispatcher
 // falls back to heuristic signature classification (offline, instant) so the
 // engine always has a valid plan within the 2-5s budget.
 //
 //nolint:contextcheck // we deliberately derive a bounded timeout from the caller's context.
-func DispatchStrategy(parent context.Context, provider ai.Provider, model string, failureLog string, intent Intent) Strategy {
+func DispatchStrategy(parent context.Context, provider ai.Provider, model string, failureLog string, intent Intent, isVanillaWeb ...bool) Strategy {
+	vanillaWeb := len(isVanillaWeb) > 0 && isVanillaWeb[0]
 	if parent == nil {
 		parent = context.Background()
+	}
+
+	// VANILLA_WEB ARCHETYPE GUARD: Skip ALL Go-specific patterns. Go module
+	// errors, undefined symbols, and toolchain checks produce false positives
+	// in HTML/CSS/JS workspaces. Fall through to the vanilla heuristic.
+	if vanillaWeb {
+		dispatchLog("[orchestrator] VANILLA_WEB archetype — skipping Go-specific checks")
+		ctx, cancel := context.WithTimeout(parent, 4*time.Second)
+		defer cancel()
+		if provider != nil && strings.TrimSpace(failureLog) != "" {
+			if s, ok := llmClassify(ctx, provider, model, failureLog); ok {
+				return s
+			}
+		}
+		return heuristicClassifyWithArchetype(failureLog, true)
 	}
 
 	// STRICT ENV_DEPS GUARD: Feature/UnitTest/Refactor intents skip all external
@@ -104,7 +125,7 @@ func DispatchStrategy(parent context.Context, provider ai.Provider, model string
 			return s
 		}
 	}
-	return heuristicClassify(failureLog)
+	return heuristicClassifyWithArchetype(failureLog, false)
 }
 
 const dispatchSystemPrompt = `You are the routing brain for the /investigate forensic engine.
@@ -242,12 +263,41 @@ func extractUndefinedCoordinate(log string) string {
 // well-known signatures and maps them to the canonical tool without any
 // network round-trip. It never returns an invalid tool.
 //
+// When isVanillaWeb is true, ALL Go-specific patterns (module errors,
+// go version, GOPATH, toolchain) are SKIPPED — the workspace contains only
+// HTML/CSS/JS and Go diagnostic tools would produce false positives.
+//
 // HIGH-PRIORITY: Go module dependency errors ("no required module provides
 // package", "cannot find module providing package") are checked FIRST so
 // that generic environment noise (Docker, toolchain) cannot override an
 // explicit missing-dependency signal.
 func heuristicClassify(log string) Strategy {
+	return heuristicClassifyWithArchetype(log, false)
+}
+
+func heuristicClassifyWithArchetype(log string, isVanillaWeb bool) Strategy {
 	l := strings.ToLower(log)
+
+	if isVanillaWeb {
+		// VANILLA_WEB archetype: skip ALL Go-specific patterns. Route
+		// environment checks to env, everything else to diagnose.
+		switch {
+		case strings.Contains(l, "docker"),
+			strings.Contains(l, "command not found"),
+			strings.Contains(l, "no such file or directory"),
+			strings.Contains(l, "exec:"):
+			return Strategy{Tool: ToolEnv}
+		case strings.Contains(l, "panic:"),
+			strings.Contains(l, "nil pointer"),
+			strings.Contains(l, "nil map"),
+			strings.Contains(l, "data race"),
+			strings.Contains(l, "--- fail:"):
+			return Strategy{Tool: ToolTrace}
+		default:
+			return Strategy{Tool: ToolDiagnose}
+		}
+	}
+
 	switch {
 	// HIGH-PRIORITY: Go module / dependency errors force lx immediately.
 	case strings.Contains(l, "no required module provides package"),

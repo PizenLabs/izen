@@ -31,6 +31,7 @@ import (
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 	verification "github.com/PizenLabs/izen/internal/verification"
+	"github.com/PizenLabs/izen/pkg/control"
 )
 
 // Init initializes the spinner tick, pro tip rotation, and text input blink.
@@ -478,6 +479,31 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
 			return m, flush
+		}
+
+		// ── SCOPE GUARD FINAL VALIDATION ───────────────────────────────────
+		// Hard validation interceptor before staging: if the plan engine has a
+		// grounded allowed file tree, verify every FILE_MUTATE/ATOMIC_REPLACE/
+		// DIFF_PATCH task targets an allowed file. Rejected plans are surfaced
+		// as a system activity (dimmed) log so the user sees the scope boundary
+		// enforcement in real-time.
+		if m.planEngine != nil && len(m.planEngine.AllowedFiles) > 0 {
+			scopeTasks := make([]control.TaskTarget, len(msg.Tasks))
+			for i, t := range msg.Tasks {
+				scopeTasks[i] = control.TaskTarget{Target: t.Target, Type: t.Type}
+			}
+			if scopeErr := control.ValidateStagedPlan(scopeTasks, m.planEngine.AllowedFiles); scopeErr != nil {
+				var sv *control.ScopeViolationError
+				if errors.As(scopeErr, &sv) {
+					m.logActivity("[ScopeGuard] Rejected target %s - Not in workspace tree", sv.TargetString())
+					m.logActivity("[ScopeGuard] Allowed files: %s", sv.AllowedString())
+					m.push(roleError, fmt.Sprintf("Plan rejected: target %q is not in the workspace file tree", sv.TargetString()))
+					m.refreshViewportContent()
+					m.Viewport.GotoBottom()
+					flush := m.flushPendingRecords()
+					return m, flush
+				}
+			}
 		}
 
 		m.sess.StageTaskList(&msg.Tasks)
@@ -1625,6 +1651,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// Extract reasoning content (sentinels + <think> tags) before
 			// emitting to the visible content buffer.
 			m.extractReasoningContent()
+
+			// ── LIVE THOUGHT STREAM ─────────────────────────────────────
+			// Feed extracted reasoning into the ThoughtStream for live
+			// dimmed rendering during streaming.
+			if m.thoughtStream != nil && m.reasoningBuffer.Len() > 0 {
+				reasoning := m.reasoningBuffer.String()
+				m.thoughtStream.Append(reasoning)
+			}
 
 			// Emit word-aligned chunks for a natural reading rhythm.
 			emit := 0
