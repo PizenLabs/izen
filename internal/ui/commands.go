@@ -3163,9 +3163,10 @@ func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
 
 		diff := computeUnifiedDiff(task.Target, orig, modified)
 
-		// ── Activity Tree: log stdlib patch ────────────────────────────
+		// ── Activity Tree: log stdlib patch with real diff metrics ─────
 		if m.activityTree != nil {
-			m.activityTree.Append(NewFileMutateEvent(task.Target, 0, 0, 0))
+			added, removed := countLinesDelta(diff)
+			m.activityTree.Append(NewFileMutateEvent(task.Target, added, removed, 0))
 		}
 
 		patch := &execution.Patch{
@@ -3212,14 +3213,39 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 		}
 
 		// ── Read fresh file content from disk ──────────────────────────
-		readFileContent := func() string {
-			if data, rerr := os.ReadFile(task.Target); rerr == nil {
-				return string(data)
+		// NON-ZERO FILE READ ENFORCEMENT: if the file exists on disk with
+		// a positive size but readFileContent returns empty, abort patch
+		// generation immediately. An empty read for an existing non-empty
+		// file indicates a stale or locked file — passing empty context to
+		// the LLM would silently overwrite the real content with a patch
+		// trained on nothing.
+		readFileContent := func() (string, error) {
+			fi, serr := os.Stat(task.Target)
+			if serr == nil && fi.Size() > 0 {
+				data, rerr := os.ReadFile(task.Target)
+				if rerr != nil {
+					return "", fmt.Errorf("read %s: %w", task.Target, rerr)
+				}
+				if len(data) == 0 {
+					return "", fmt.Errorf("zero-content read on non-empty file %s (%d bytes on disk) — aborting to prevent silent data loss", task.Target, fi.Size())
+				}
+				return string(data), nil
 			}
-			return ""
+			if serr == nil {
+				// File exists but is genuinely empty (new file creation).
+				return "", nil
+			}
+			// File does not exist on disk — new file creation.
+			return "", nil
 		}
 
-		orig := readFileContent()
+		orig, rerr := readFileContent()
+		if rerr != nil {
+			if m.activityTree != nil {
+				m.activityTree.Append(NewFileReadEvent(task.Target, 0, 0))
+			}
+			return buildProposalReadyMsg{Err: rerr}
+		}
 
 		// ── Determine strategy based on file state ─────────────────────
 		strategy := execution.StrategyForOriginal(orig)
@@ -3264,7 +3290,10 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			// (e.g. a previous retry attempt wrote partial content or
 			// another task modified it).
 			if attempt > 0 {
-				orig = readFileContent()
+				orig, rerr = readFileContent()
+				if rerr != nil {
+					return buildProposalReadyMsg{Err: rerr}
+				}
 				handoff = buildHandoff(orig)
 			}
 
@@ -3403,6 +3432,29 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				}
 			}
 
+			// ── DESTRUCTION GUARDRAIL ────────────────────────────────────
+			// Reject patches that remove > 50% of lines with zero additions.
+			// This prevents total file wipes where the LLM deletes content
+			// without providing replacements.
+			if diffContent != "" && orig != "" {
+				origLineCount := len(strings.Split(orig, "\n"))
+				if origLineCount > 0 {
+					added, removed := countLinesDelta(diffContent)
+					if removed > origLineCount/2 && added == 0 {
+						if attempt < maxRetries {
+							handoff = fmt.Sprintf(
+								"ERROR: Proposed patch deletes entire file content without replacements. Preserve existing structure and remove ONLY duplicate blocks.\n\nOriginal task:\n%s",
+								buildHandoff(orig))
+							continue
+						}
+						return buildProposalReadyMsg{
+							Err: fmt.Errorf("DESTRUCTIVE_PATCH_REJECTED: proposed patch for %s removes %d/%d lines (+%d / -%d) with no additions — refusing to wipe file",
+								task.Target, removed, origLineCount, added, removed),
+						}
+					}
+				}
+			}
+
 			patch := &execution.Patch{
 				ID:            fmt.Sprintf("build-%d", task.StepNum),
 				File:          task.Target,
@@ -3415,7 +3467,8 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 
 			// ── Activity Tree: mark read done, log patch ────────────────
 			if m.activityTree != nil {
-				m.activityTree.Append(NewFileMutateEvent(task.Target, 0, 0, 0))
+				added, removed := countLinesDelta(diffContent)
+				m.activityTree.Append(NewFileMutateEvent(task.Target, added, removed, 0))
 			}
 
 			return buildProposalReadyMsg{
@@ -3872,6 +3925,22 @@ func computeUnifiedDiff(path, original, modified string) string {
 		b.WriteString("+" + modLines[j] + "\n")
 	}
 	return b.String()
+}
+
+// countLinesDelta returns the number of added and removed lines in a unified diff.
+// Used for accurate FileMutateEvent metrics and destruction guardrail checks.
+func countLinesDelta(diff string) (added, removed int) {
+	if diff == "" {
+		return 0, 0
+	}
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			added++
+		} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+			removed++
+		}
+	}
+	return
 }
 
 // findFailedBuildTask returns the step number of the first task in the build

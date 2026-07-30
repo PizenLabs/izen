@@ -1647,20 +1647,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		}
 
-		if len(m.streamBuffer) > 0 {
-			// Extract reasoning content (sentinels + <think> tags) before
-			// emitting to the visible content buffer.
-			m.extractReasoningContent()
-
-			// ── LIVE THOUGHT STREAM ─────────────────────────────────────
-			// Feed extracted reasoning into the ThoughtStream for live
-			// dimmed rendering during streaming.
-			if m.thoughtStream != nil && m.reasoningBuffer.Len() > 0 {
-				reasoning := m.reasoningBuffer.String()
-				m.thoughtStream.Append(reasoning)
-			}
-
-			// Emit word-aligned chunks for a natural reading rhythm.
+		// ── FRAME-THROTTLED FLUSH ──────────────────────────────────────
+		// Prefer flushing from the StreamThrottle (16ms frame interval / 60FPS).
+		// Falls back to direct streamBuffer for non-throttle paths.
+		emitContent := ""
+		flushOk := false
+		if m.streamThrottle != nil {
+			emitContent, flushOk = m.streamThrottle.Flush()
+		}
+		if !flushOk && len(m.streamBuffer) > 0 {
+			// Legacy fallback: emit directly from streamBuffer.
 			emit := 0
 			minChars := 3
 			for i, c := range m.streamBuffer {
@@ -1674,14 +1670,26 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 			if emit > 80 {
 				emit = 80
-				// Walk back to the start of the current UTF-8 rune to avoid
-				// splitting a multi-byte character.
 				for emit > 0 && !utf8.RuneStart(m.streamBuffer[emit]) {
 					emit--
 				}
 			}
-			m.currentStreamContent += m.streamBuffer[:emit]
+			emitContent = m.streamBuffer[:emit]
 			m.streamBuffer = m.streamBuffer[emit:]
+		}
+		if emitContent != "" {
+			// Extract reasoning content before adding to visible buffer.
+			m.streamBuffer += emitContent
+			m.extractReasoningContent()
+			m.streamBuffer = ""
+
+			// ── LIVE THOUGHT STREAM ─────────────────────────────────
+			if m.thoughtStream != nil && m.reasoningBuffer.Len() > 0 {
+				reasoning := m.reasoningBuffer.String()
+				m.thoughtStream.Append(reasoning)
+			}
+
+			m.currentStreamContent += emitContent
 		}
 
 		// Refresh viewport with streaming content.
@@ -1733,9 +1741,19 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// by the streamDoneMsg handler below. Holding a ledger lock here would
 		// serialize the stream against the renderer and reproduce the
 		// 108-token freeze.
+		//
+		// FRAME-THROTTLED EMISSION: raw token chunks are written through the
+		// StreamThrottle which enforces a 16ms (≈60FPS) minimum frame interval.
+		// The smoothStreamTick handler then flushes word-aligned content from
+		// the throttle buffer instead of draining streamBuffer directly. This
+		// eliminates layout snapping caused by dumping raw buffer chunks.
 		raw := string(msg)
 		m.responseBuffer.WriteString(raw)
-		m.streamBuffer += raw
+		if m.streamThrottle != nil {
+			m.streamThrottle.Write(raw)
+		} else {
+			m.streamBuffer += raw
+		}
 		if m.streamParser != nil {
 			m.streamParser.ProcessChunk(raw)
 		}

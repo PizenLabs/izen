@@ -91,9 +91,14 @@ func RenderDeterministicPipeline(rawInput string, width int, isStreaming bool) s
 				continue
 			}
 
-			// WRAP FIX: word-wrap long lines to fit the terminal viewport before applying styles.
-			// Using a safety margin of -4 so text never kisses the raw edge of the terminal frame.
-			wrappedLine := lipgloss.NewStyle().Width(width - 4).Render(line)
+			// WRAP FIX: strict word-wrap using ansi.Wordwrap before rendering.
+			// This prevents hard truncation ("necessary to l...") that occurs when
+			// lipgloss.Width() is used without an explicit wrapping policy.
+			innerW := width - 4
+			if innerW < 10 {
+				innerW = 10
+			}
+			wrappedLine := ansi.Wordwrap(line, innerW, " \t")
 
 			subLines := strings.Split(wrappedLine, "\n")
 			for _, subLine := range subLines {
@@ -439,18 +444,28 @@ func (m *model) renderStreamingContent(content string, width int) string {
 			rendered = renderWidget("Table", tableContent, availableWidth, colorAccent)
 
 		case blockEvidence:
+			innerW := widgetInnerWidth - 2
+			if innerW < 10 {
+				innerW = 10
+			}
 			lines := strings.Split(block.raw, "\n")
 			var wrappedLines []string
 			for _, line := range lines {
-				wrappedLines = append(wrappedLines, wrapStreamText(line, widgetInnerWidth)...)
+				wrapped := ansi.Wordwrap(line, innerW, " \t")
+				wrappedLines = append(wrappedLines, strings.Split(wrapped, "\n")...)
 			}
 			rendered = renderWidget("Evidence", strings.Join(wrappedLines, "\n"), availableWidth, colorModeInvestigate)
 
 		case blockRisk:
+			innerW := widgetInnerWidth - 2
+			if innerW < 10 {
+				innerW = 10
+			}
 			lines := strings.Split(block.raw, "\n")
 			var wrappedLines []string
 			for _, line := range lines {
-				wrappedLines = append(wrappedLines, wrapStreamText(line, widgetInnerWidth)...)
+				wrapped := ansi.Wordwrap(line, innerW, " \t")
+				wrappedLines = append(wrappedLines, strings.Split(wrapped, "\n")...)
 			}
 			rendered = renderWidget("Risk Analysis", strings.Join(wrappedLines, "\n"), availableWidth, colorModeReview)
 

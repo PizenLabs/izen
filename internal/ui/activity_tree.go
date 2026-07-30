@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 type EventKind int
@@ -172,7 +174,8 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int) string {
 		if e == nil {
 			return ""
 		}
-		prefix := blueStyle.Render("→")
+		// ── CRITICAL ENGINE I/O: cyan/teal (#89dceb) per visual hierarchy ──
+		prefix := lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Render("→")
 		elapsed := formatElapsed(e.Elapsed)
 		return fmt.Sprintf("%s Read %s (%d B · %s)", prefix, e.File, e.Bytes, mutedStyle.Render(elapsed))
 
@@ -181,7 +184,8 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int) string {
 		if e == nil {
 			return ""
 		}
-		prefix := blueStyle.Render("→")
+		// ── CRITICAL ENGINE I/O: cyan/teal (#89dceb) per visual hierarchy ──
+		prefix := lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Render("→")
 		return fmt.Sprintf("%s Patch %s (+%d / -%d lines)", prefix, e.File, e.LinesAdd, e.LinesDel)
 
 	case EventCommandExec:

@@ -730,6 +730,28 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		}
 	}
 
+	// ── DESTRUCTION GUARDRAIL (DEFENSE IN DEPTH) ──────────────────────
+	// Reject patches that delete > 50% of the original lines with zero
+	// replacements. This catches what the proposeBuildPatch layer may miss
+	// (e.g., patches generated outside the standard build flow).
+	if patch.Original != "" && final != "" {
+		origCount := len(strings.Split(patch.Original, "\n"))
+		finalCount := len(strings.Split(final, "\n"))
+		removed := origCount - finalCount
+		added := finalCount - origCount
+		if added < 0 {
+			added = 0
+		}
+		if removed > origCount/2 && added == 0 && !patch.IsFullRewrite {
+			if globalActivityLog != nil {
+				globalActivityLog("[FAIL] DESTRUCTIVE_PATCH_REJECTED on %s: removes %d/%d lines (+%d / -%d) — refusing total wipe",
+					patch.File, removed, origCount, added, removed)
+			}
+			return fmt.Errorf("DESTRUCTIVE_PATCH_REJECTED: proposed patch for %s removes %d/%d lines (+%d / -%d) with no replacements — refuse to wipe file",
+				patch.File, removed, origCount, added, removed)
+		}
+	}
+
 	if err := os.WriteFile(fullPath, []byte(final), 0644); err != nil {
 		if globalActivityLog != nil {
 			globalActivityLog("[FAIL] patch rejected on %s: write failed: %v", patch.File, err)
@@ -821,19 +843,26 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		globalActivityLog("[ OK ] patched %s (%s)", patch.File, detail)
 	}
 	if globalEventLog != nil {
-		origLines := 0
-		newLines := 0
-		if patch.Original != "" {
-			origLines = len(strings.Split(patch.Original, "\n")) - 1
-		}
-		if patch.Modified != "" {
-			newLines = len(strings.Split(patch.Modified, "\n")) - 1
-		}
-		added := newLines - origLines
-		removed := 0
-		if added < 0 {
-			removed = -added
-			added = 0
+		// Compute accurate diff metrics from actual unified diff output,
+		// not from raw line count deltas. This ensures the ActivityTree
+		// always shows correct (+N / -M) counters.
+		added, removed := countUnifiedDiffLines(patch.Modified)
+		if added == 0 && removed == 0 {
+			// Fallback: compare total line counts when no unified diff is present.
+			origLines := 0
+			newLines := 0
+			if patch.Original != "" {
+				origLines = len(strings.Split(patch.Original, "\n")) - 1
+			}
+			if final != "" {
+				newLines = len(strings.Split(final, "\n")) - 1
+			}
+			added = newLines - origLines
+			removed = 0
+			if added < 0 {
+				removed = -added
+				added = 0
+			}
 		}
 		globalEventLog(FileMutateEvent{File: patch.File, LinesAdd: added, LinesDel: removed, Elapsed: time.Since(patchStartTime)})
 	}
@@ -1591,6 +1620,32 @@ func ApplySearchReplaceBlocks(original string, blocks []searchReplaceBlock) (str
 	}
 
 	return current, true
+}
+
+// countUnifiedDiffLines counts added (+) and removed (-) lines in a unified
+// diff string, excluding header lines (---, +++, @@). Returns zero when the
+// input is not a unified diff (e.g. SEARCH/REPLACE or full content).
+func countUnifiedDiffLines(diff string) (added, removed int) {
+	if diff == "" {
+		return 0, 0
+	}
+	hasHunk := false
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "@@") {
+			hasHunk = true
+			continue
+		}
+		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			added++
+		} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+			removed++
+		}
+	}
+	if !hasHunk {
+		// Not a unified diff — return zero (caller falls back to line-count delta).
+		return 0, 0
+	}
+	return
 }
 
 func isTruncated(original, modified string) bool {
