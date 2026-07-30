@@ -142,10 +142,10 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	if strings.Contains(c.baseURL, "openrouter") {
-		httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen")
-		httpReq.Header.Set("X-Title", "izen")
+		httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
+		httpReq.Header.Set("X-OpenRouter-Title", "izen")
+		httpReq.Header.Set("X-OpenRouter-Categories", "cli-agent")
 		httpReq.Header.Set("X-Description", "AI amplifies human judgment. Humans remain in control.")
-		httpReq.Header.Set("X-Categories", "cli-agent")
 	}
 
 	resp, err := c.client.Do(httpReq)
@@ -235,10 +235,10 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	httpReq.Header.Set("Accept", "text/event-stream")
 	httpReq.Header.Set("Cache-Control", "no-cache")
 	if strings.Contains(c.baseURL, "openrouter") {
-		httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen")
-		httpReq.Header.Set("X-Title", "izen")
+		httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
+		httpReq.Header.Set("X-OpenRouter-Title", "izen")
+		httpReq.Header.Set("X-OpenRouter-Categories", "cli-agent")
 		httpReq.Header.Set("X-Description", "AI amplifies human judgment. Humans remain in control.")
-		httpReq.Header.Set("X-Categories", "cli-agent")
 	}
 
 	resp, err := c.client.Do(httpReq)

@@ -640,6 +640,30 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	// unrelated files within a single code block.
 	diffInput := SplitAndFilterPatches(patch.Modified, patch.File)
 
+	var final string
+	var patchErr error
+
+	// ── FULL-REWRITE EARLY EXIT ──────────────────────────────────────────
+	// When the caller explicitly marks this patch as IsFullRewrite (e.g. after
+	// SEARCH/REPLACE and unified diff both failed across multiple retries),
+	// skip all diff/SEARCH/REPLACE strategies and write the modified content
+	// directly. This is the last resort for small models that cannot produce
+	// well-formed patch blocks.
+	if patch.IsFullRewrite && patch.Original != "" {
+		clean := SanitizeDiffContent(diffInput)
+		if strings.TrimSpace(clean) == "" {
+			return fmt.Errorf("full rewrite for %s: empty content", patch.File)
+		}
+		if reason := IsTruncatedOutput(clean); reason != "" {
+			return fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
+		}
+		if globalActivityLog != nil {
+			globalActivityLog("[patch] Full rewrite bypass for %s (%d bytes)", patch.File, len(clean))
+		}
+		final = clean
+		goto commitWrite
+	}
+
 	// ── FAIL-FAST: reject ambiguous snippets against existing files ──────
 	// If the file exists and the payload contains no SEARCH/REPLACE markers
 	// and no unified diff headers and is significantly smaller than the
@@ -653,9 +677,6 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		}
 		return fmt.Errorf("%w: ambiguous snippet without SEARCH/REPLACE markers for existing file %s — retry with SEARCH/REPLACE block or unified diff", ErrInvalidPatchFormat, patch.File)
 	}
-
-	var final string
-	var patchErr error
 
 	switch {
 	case strings.Contains(diffInput, "@@"):
@@ -684,6 +705,20 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 				if globalActivityLog != nil {
 					globalActivityLog("[patch] Content block fallback succeeded for %s", patch.File)
 				}
+				break
+			}
+			// ── FULL-REWRITE FALLBACK ─────────────────────────────────
+			// Both unified diff and SEARCH/REPLACE strategies failed for
+			// a patch that contains @@ hunk headers. Before giving up, try
+			// treating the entire sanitized content as a full file rewrite.
+			// This handles the case where the LLM output is a mangled diff
+			// that cannot be parsed as hunks but still contains the intended
+			// complete file content.
+			if !isTruncated(patch.Original, clean) {
+				if globalActivityLog != nil {
+					globalActivityLog("[patch] Diff and SEARCH/REPLACE failed on %s — falling back to full-content write (%d bytes)", patch.File, len(clean))
+				}
+				final = clean
 				break
 			}
 			if globalActivityLog != nil {
@@ -729,6 +764,8 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 			return fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
 		}
 	}
+
+commitWrite:
 
 	// ── DESTRUCTION GUARDRAIL (DEFENSE IN DEPTH) ──────────────────────
 	// Reject patches that delete > 50% of the original lines with zero
@@ -1136,6 +1173,10 @@ func firstNonEmptyLine(block string) string {
 // For each candidate position it compares line-by-line and picks the one with
 // the highest match count. The replacement is applied if at least one line
 // matches. This mitigates delta drifting caused by AST skeleton pruning.
+//
+// When exact line matching yields zero matches across all positions, it
+// falls back to whitespace-normalized comparison (strings.TrimSpace per line)
+// to handle indentation/whitespace drift common in 7B model outputs.
 func fuzzyMatchHunk(current string, hunk diffHunk) (string, bool) {
 	if current == "" || hunk.oldBlock == "" {
 		return "", false
@@ -1182,6 +1223,7 @@ func fuzzyMatchHunk(current string, hunk diffHunk) (string, bool) {
 		return "", false
 	}
 
+	// Phase 1: exact line matching
 	bestPos := -1
 	bestScore := 0
 
@@ -1198,16 +1240,40 @@ func fuzzyMatchHunk(current string, hunk diffHunk) (string, bool) {
 		}
 	}
 
-	if bestScore == 0 {
-		return "", false
+	if bestScore > 0 {
+		result := make([]string, 0, len(lines)-len(oldLines)+len(newLines))
+		result = append(result, lines[:bestPos]...)
+		result = append(result, newLines...)
+		result = append(result, lines[bestPos+len(oldLines):]...)
+		return strings.Join(result, "\n"), true
 	}
 
-	result := make([]string, 0, len(lines)-len(oldLines)+len(newLines))
-	result = append(result, lines[:bestPos]...)
-	result = append(result, newLines...)
-	result = append(result, lines[bestPos+len(oldLines):]...)
+	// Phase 2: whitespace-normalized fuzzy match
+	// Strips leading/trailing whitespace from each line before comparing.
+	// Handles indentation drift in 7B model outputs where search blocks
+	// have minor whitespace differences from the actual file content.
+	trimmedOld := make([]string, len(oldLines))
+	for j, l := range oldLines {
+		trimmedOld[j] = strings.TrimSpace(l)
+	}
+	for pos := lo; pos <= hi; pos++ {
+		allMatch := true
+		for i := 0; i < len(oldLines); i++ {
+			if strings.TrimSpace(lines[pos+i]) != trimmedOld[i] {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			result := make([]string, 0, len(lines)-len(oldLines)+len(newLines))
+			result = append(result, lines[:pos]...)
+			result = append(result, newLines...)
+			result = append(result, lines[pos+len(oldLines):]...)
+			return strings.Join(result, "\n"), true
+		}
+	}
 
-	return strings.Join(result, "\n"), true
+	return "", false
 }
 
 func applyUnifiedPatch(original, diff string) (string, error) {
@@ -1307,6 +1373,31 @@ func applySearchReplaceBlock(original, modified string) (string, bool) {
 			// Found the block — return original unchanged (the content is
 			// already identical, no replacement needed).
 			return original, true
+		}
+	}
+
+	// Strategy 3: whitespace-normalized fuzzy match.
+	// Strip leading/trailing whitespace from each line and compare.
+	// If the search block matches after normalization, replace the matching
+	// region while preserving the target file's base indentation.
+	trimmedMod := make([]string, len(modLines))
+	for j, l := range modLines {
+		trimmedMod[j] = strings.TrimSpace(l)
+	}
+	for i := 0; i <= len(origLines)-len(modLines); i++ {
+		match := true
+		for j := 0; j < len(modLines); j++ {
+			if strings.TrimSpace(origLines[i+j]) != trimmedMod[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			result := make([]string, 0, len(origLines)-len(modLines)+len(modLines))
+			result = append(result, origLines[:i]...)
+			result = append(result, modLines...)
+			result = append(result, origLines[i+len(modLines):]...)
+			return strings.Join(result, "\n"), true
 		}
 	}
 

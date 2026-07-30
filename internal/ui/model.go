@@ -1307,29 +1307,59 @@ func (m *model) cacheRecordToHistory(rec record) {
 
 // renderRecordForViewport renders a single record exactly as the original View()
 // inline loop did — user records get the @username header with right-padding,
-// AI records go through renderAIResponseBlocks, and everything else is raw text.
+// AI records go through renderAIResponseBlocks, and everything else is wrapped
+// per-line to a strict width bound to prevent right-border overflow.
+//
+// Per-line wrapping (not a single pass over the entire text) is critical:
+// multi-line content like the TODO CHECKLIST must preserve its line structure
+// (each checklist item on its own line) rather than being reflowed as one blob.
 func (m *model) renderRecordForViewport(rec record) string {
 	width := m.width
 	if width < 40 {
 		width = 40
 	}
 
+	wrapWidth := width - 4
+	if wrapWidth < 20 {
+		wrapWidth = 20
+	}
+
+	// Sanitize: convert literal \n escape sequences in error/log text
+	// to actual newlines so multi-line messages display correctly.
+	text := strings.ReplaceAll(rec.text, "\\n", "\n")
+
 	switch rec.role {
 	case roleUser:
 		displayName := config.SanitizeUsername(m.userName)
 		userHeader := dimmedStyle.Render("@" + displayName + "  ")
-		paddedText := " " + rec.text
+		paddedText := " " + text
 		padNeeded := width - lipgloss.Width(userHeader) - lipgloss.Width(paddedText) - 1
 		if padNeeded > 0 {
 			paddedText += strings.Repeat(" ", padNeeded)
 		}
 		return userHeader + userBgStyle.Render(paddedText)
 	case roleAI:
-		return m.renderAIResponseBlocks(rec.text, width)
+		return m.renderAIResponseBlocks(text, width)
 	case roleActivity:
-		return m.styleActivityLine(rec.text)
+		var b strings.Builder
+		for _, srcLine := range strings.Split(text, "\n") {
+			wrapped := wrapString(srcLine, wrapWidth)
+			for _, wl := range wrapped {
+				b.WriteString(m.styleActivityLine(wl))
+				b.WriteByte('\n')
+			}
+		}
+		return strings.TrimSuffix(b.String(), "\n")
 	default:
-		return rec.text
+		var b strings.Builder
+		for _, srcLine := range strings.Split(text, "\n") {
+			wrapped := wrapString(srcLine, wrapWidth)
+			for _, wl := range wrapped {
+				b.WriteString(wl)
+				b.WriteByte('\n')
+			}
+		}
+		return strings.TrimSuffix(b.String(), "\n")
 	}
 }
 

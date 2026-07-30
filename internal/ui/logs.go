@@ -173,14 +173,21 @@ func RenderEntry(entry LogEntry, width int, dotFrame int) string {
 	b.WriteString(summary)
 	b.WriteString("\n")
 
+	contentWidth := width - 6
+	if contentWidth < 10 {
+		contentWidth = 10
+	}
+
 	// Render thinking content (LLM reasoning) when expanded
 	if entry.Thinking != "" {
 		b.WriteString(thoughtLogBoxStyle.Render(thoughtLogTitleStyle.Render("  Reasoning")))
 		b.WriteString("\n")
-		lines := strings.Split(entry.Thinking, "\n")
-		for _, line := range lines {
-			b.WriteString(thoughtLogBoxStyle.Render("  " + mutedStyle.Render(line)))
-			b.WriteString("\n")
+		for _, line := range strings.Split(entry.Thinking, "\n") {
+			wrapped := wrapLine(line, contentWidth)
+			for _, wl := range wrapped {
+				b.WriteString(thoughtLogBoxStyle.Render("  " + mutedStyle.Render(wl)))
+				b.WriteString("\n")
+			}
 		}
 	}
 
@@ -188,20 +195,24 @@ func RenderEntry(entry LogEntry, width int, dotFrame int) string {
 	if entry.SystemLog != "" {
 		b.WriteString(systemLogBoxStyle.Render(systemLogTitleStyle.Render("  System Log")))
 		b.WriteString("\n")
-		lines := strings.Split(entry.SystemLog, "\n")
-		for _, line := range lines {
-			b.WriteString(systemLogBoxStyle.Render("  " + mutedStyle.Render(line)))
-			b.WriteString("\n")
+		for _, line := range strings.Split(entry.SystemLog, "\n") {
+			wrapped := wrapLine(line, contentWidth)
+			for _, wl := range wrapped {
+				b.WriteString(systemLogBoxStyle.Render("  " + mutedStyle.Render(wl)))
+				b.WriteString("\n")
+			}
 		}
 	}
 
 	if entry.Content != "" {
 		b.WriteString(buildSummaryBoxStyle.Render(buildSummaryTitleStyle.Render("  Details")))
 		b.WriteString("\n")
-		lines := strings.Split(entry.Content, "\n")
-		for _, line := range lines {
-			b.WriteString(buildSummaryBoxStyle.Render("  " + mutedStyle.Render(line)))
-			b.WriteString("\n")
+		for _, line := range strings.Split(entry.Content, "\n") {
+			wrapped := wrapLine(line, contentWidth)
+			for _, wl := range wrapped {
+				b.WriteString(buildSummaryBoxStyle.Render("  " + mutedStyle.Render(wl)))
+				b.WriteString("\n")
+			}
 		}
 	}
 
@@ -222,6 +233,45 @@ func animatedDots(dotFrame int) string {
 	default:
 		return "..."
 	}
+}
+
+// wrapLine wraps a single line of text to the specified width, splitting at
+// word boundaries. Falls back to hard rune-wrap for words that exceed the width.
+func wrapLine(text string, width int) []string {
+	if len(text) == 0 || width < 1 {
+		return []string{text}
+	}
+	var result []string
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		runes := []rune(text)
+		for i := 0; i < len(runes); i += width {
+			end := i + width
+			if end > len(runes) {
+				end = len(runes)
+			}
+			result = append(result, string(runes[i:end]))
+		}
+		return result
+	}
+	var line strings.Builder
+	for _, word := range words {
+		wordW := lipgloss.Width(word)
+		if line.Len() > 0 && line.Len()+1+wordW > width {
+			result = append(result, line.String())
+			line.Reset()
+			line.WriteString(word)
+		} else {
+			if line.Len() > 0 {
+				line.WriteString(" ")
+			}
+			line.WriteString(word)
+		}
+	}
+	if line.Len() > 0 {
+		result = append(result, line.String())
+	}
+	return result
 }
 
 // RenderLogSummary renders all collapsed log entries as compact bullet list.

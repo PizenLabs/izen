@@ -3483,6 +3483,60 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 		if m.activityTree != nil {
 			m.activityTree.Append(NewFileMutateEvent(task.Target, 0, 0, 0))
 		}
+
+		// ── FINAL FULL-FILE REWRITE RETRY ─────────────────────────────
+		// All structured patch strategies (unified diff, SEARCH/REPLACE) have
+		// failed after maxRetries attempts. Try one final time asking the LLM
+		// to output the ENTIRE file content in a clean codeblock. This handles
+		// small models (7B) that struggle with precise patch formatting.
+		if orig != "" {
+			fullRewriteHandoff := fmt.Sprintf(
+				"%s\n\nALL PRIOR PATCH ATTEMPTS FAILED. Output the COMPLETE updated file content inside a SINGLE markdown code block. Do NOT use SEARCH/REPLACE, unified diff, or FILE_CREATE markers. Return the entire file — nothing less.",
+				buildHandoff(orig))
+			fullRewriteReq := ai.Request{
+				Model:     m.cfg.ActiveModelName(),
+				System:    prompt.StrategyContract("small_fallback"),
+				Stream:    false,
+				MaxTokens: 4096,
+				Stop:      []string{"```\n\n"},
+				Messages:  []ai.Message{{Role: "user", Content: fullRewriteHandoff}},
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			fullResp, fullErr := m.provider.Execute(ctx, fullRewriteReq)
+			cancel()
+			if fullErr == nil && fullResp != nil && strings.TrimSpace(fullResp.Content) != "" {
+				var fullResolved string
+				if extracted, ok := execution.ExtractRawCodeBlock(fullResp.Content); ok {
+					fullResolved = execution.SanitizeRawCodeBlock(extracted)
+				} else if extracted, ok := execution.ExtractCodeBlockContent(fullResp.Content); ok {
+					fullResolved = execution.SanitizeRawCodeBlock(extracted)
+				} else {
+					fullResolved = execution.SanitizeRawCodeBlock(fullResp.Content)
+				}
+				if strings.TrimSpace(fullResolved) != "" {
+					fullDiff := computeUnifiedDiff(task.Target, orig, fullResolved)
+					if m.activityTree != nil {
+						added, removed := countLinesDelta(fullDiff)
+						m.activityTree.Append(NewFileMutateEvent(task.Target, added, removed, 0))
+					}
+					return buildProposalReadyMsg{
+						Task: task,
+						Patch: &execution.Patch{
+							ID:            fmt.Sprintf("build-%d", task.StepNum),
+							File:          task.Target,
+							Original:      orig,
+							Modified:      fullResolved,
+							TaskID:        task.StepNum,
+							ContextID:     m.sess.ContextID,
+							IsFullRewrite: true,
+						},
+						Diff:   fullDiff,
+						Output: fullResp.Content,
+					}
+				}
+			}
+		}
+
 		return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed after %d retries", maxRetries)}
 	}
 }
