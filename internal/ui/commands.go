@@ -3433,23 +3433,31 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			}
 
 			// ── DESTRUCTION GUARDRAIL ────────────────────────────────────
-			// Reject patches that remove > 50% of lines with zero additions.
-			// This prevents total file wipes where the LLM deletes content
-			// without providing replacements.
+			// Only reject patches that delete content with ZERO additions
+			// and leave the file empty or near-empty (≤ 5 remaining lines
+			// and > 90% deleted). This allows legitimate deduplication edits
+			// (e.g. removing 132/162 lines) and full-rewrite fallbacks while
+			// still catching actual file wipes.
+			// On the final attempt, falls through to full-rewrite retry.
 			if diffContent != "" && orig != "" {
 				origLineCount := len(strings.Split(orig, "\n"))
 				if origLineCount > 0 {
 					added, removed := countLinesDelta(diffContent)
-					if removed > origLineCount/2 && added == 0 {
-						if attempt < maxRetries {
-							handoff = fmt.Sprintf(
-								"ERROR: Proposed patch deletes entire file content without replacements. Preserve existing structure and remove ONLY duplicate blocks.\n\nOriginal task:\n%s",
-								buildHandoff(orig))
-							continue
-						}
-						return buildProposalReadyMsg{
-							Err: fmt.Errorf("DESTRUCTIVE_PATCH_REJECTED: proposed patch for %s removes %d/%d lines (+%d / -%d) with no additions — refusing to wipe file",
-								task.Target, removed, origLineCount, added, removed),
+					finalLineCount := origLineCount - removed + added
+
+					if added == 0 {
+						isEmpty := finalLineCount <= 0
+						isNearWipe := origLineCount > 0 && float64(removed)/float64(origLineCount) > 0.9 && finalLineCount < 5
+
+						if isEmpty || isNearWipe {
+							if attempt < maxRetries {
+								handoff = fmt.Sprintf(
+									"ERROR: Proposed patch deletes entire file content without replacements. Preserve existing structure and remove ONLY duplicate blocks.\n\nOriginal task:\n%s",
+									buildHandoff(orig))
+								continue
+							}
+							// Last attempt: fall through to full-rewrite retry below.
+							break
 						}
 					}
 				}

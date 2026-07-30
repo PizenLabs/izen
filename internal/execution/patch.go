@@ -768,24 +768,26 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 commitWrite:
 
 	// ── DESTRUCTION GUARDRAIL (DEFENSE IN DEPTH) ──────────────────────
-	// Reject patches that delete > 50% of the original lines with zero
-	// replacements. This catches what the proposeBuildPatch layer may miss
-	// (e.g., patches generated outside the standard build flow).
+	// Only reject a patch if the result is effectively a file wipe:
+	// 1. The resulting content is empty (zero bytes or only whitespace), OR
+	// 2. Deletion ratio exceeds 90% AND the remaining content is fewer than
+	//    5 lines. This allows legitimate deduplication edits (e.g. removing
+	//    132/162 lines) while still catching actual file wipes.
 	if patch.Original != "" && final != "" {
 		origCount := len(strings.Split(patch.Original, "\n"))
 		finalCount := len(strings.Split(final, "\n"))
 		removed := origCount - finalCount
-		added := finalCount - origCount
-		if added < 0 {
-			added = 0
-		}
-		if removed > origCount/2 && added == 0 && !patch.IsFullRewrite {
+
+		isEmpty := strings.TrimSpace(final) == ""
+		isNearWipe := origCount > 0 && float64(removed)/float64(origCount) > 0.9 && finalCount < 5
+
+		if (isEmpty || isNearWipe) && !patch.IsFullRewrite {
 			if globalActivityLog != nil {
-				globalActivityLog("[FAIL] DESTRUCTIVE_PATCH_REJECTED on %s: removes %d/%d lines (+%d / -%d) — refusing total wipe",
-					patch.File, removed, origCount, added, removed)
+				globalActivityLog("[FAIL] DESTRUCTIVE_PATCH_REJECTED on %s: removes %d/%d lines (final: %d) — refusing total wipe",
+					patch.File, removed, origCount, finalCount)
 			}
-			return fmt.Errorf("DESTRUCTIVE_PATCH_REJECTED: proposed patch for %s removes %d/%d lines (+%d / -%d) with no replacements — refuse to wipe file",
-				patch.File, removed, origCount, added, removed)
+			return fmt.Errorf("DESTRUCTIVE_PATCH_REJECTED: proposed patch for %s removes %d/%d lines (final: %d lines) — refusing to wipe file",
+				patch.File, removed, origCount, finalCount)
 		}
 	}
 
