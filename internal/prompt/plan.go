@@ -197,12 +197,43 @@ const planJSONSchema = `{
   ]
 }`
 
+// GroundedConstraint returns the ALLOWED_FILE_TREE constraint block for
+// injection into plan prompts. When archetype or allowedFiles is empty,
+// returns an empty string (no constraint).
+func GroundedConstraint(archetype string, allowedFiles []string) string {
+	if archetype == "" && len(allowedFiles) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	if archetype != "" {
+		fmt.Fprintf(&b, "PROJECT ARCHETYPE: %s\n", archetype)
+	}
+	b.WriteString("ALLOWED_FILE_TREE:\n")
+	if len(allowedFiles) == 0 {
+		b.WriteString("  (none — do not create any new files)\n")
+	} else {
+		for _, f := range allowedFiles {
+			fmt.Fprintf(&b, "  - %s\n", f)
+		}
+	}
+	b.WriteString("\nCRITICAL: You MUST ONLY target files present in ALLOWED_FILE_TREE.\n")
+	b.WriteString("Do NOT create or invent fictional file paths or frameworks.\n")
+	b.WriteString("Do NOT suggest files outside ALLOWED_FILE_TREE under any circumstance.\n")
+	return b.String()
+}
+
 // BuildPlanJSONPrompt builds the strict JSON prompt consumed by the TUI parser.
 // Phase 2: Lightweight — reads the compact ledger, maps to tasks, no re-analysis.
 // When isDirectMutation is true, omits EnvironmentContext and constrains output
 // to max_tokens: 150.
-func BuildPlanJSONPrompt(problem, ledgerContent, conclusion string, isDirectMutation bool) string {
+// groundedPayload is an optional ALLOWED_FILE_TREE constraint block (empty string
+// skips injection).
+func BuildPlanJSONPrompt(problem, ledgerContent, conclusion string, isDirectMutation bool, groundedPayload string) string {
 	cb := conclusionBlock(conclusion)
+	gp := groundedPayload
+	if gp != "" {
+		gp = "\n" + gp
+	}
 
 	if isDirectMutation {
 		return fmt.Sprintf(`You are the IZEN Plan Mapper. Read the investigation ledger below and produce a JSON plan.
@@ -214,11 +245,12 @@ LEDGER:
 
 %s
 - Total JSON under 150 tokens.
-
+%s
 OUTPUT — raw JSON only, no fences, no comments:
 %s`,
 			problem, ledgerContent, cb,
 			planDirectives,
+			gp,
 			planJSONSchema,
 		)
 	}
@@ -236,12 +268,13 @@ LEDGER:
 - For EVERY task provide rationale (why) and solution (expected end state).
 - Include root_core_factor in strategic_overview describing the fundamental root cause.
 - Total JSON under 300 tokens.
-
+%s
 OUTPUT — raw JSON only, no fences, no comments:
 %s`,
 		EnvironmentContext(),
 		problem, ledgerContent, cb,
 		planDirectives,
+		gp,
 		planJSONSchema,
 	)
 }
@@ -260,20 +293,27 @@ RULES
 // BuildPlanPrompt builds the compact Markdown prompt for user-facing terminal output.
 // Phase 2: Stripped down — the LLM returns data, UI handles rendering.
 // When isDirectMutation is true, constrains output to raw task blocks only.
-func BuildPlanPrompt(objective, contextStr string, isDirectMutation bool) string {
+// groundedPayload is an optional ALLOWED_FILE_TREE constraint block (empty string
+// skips injection).
+func BuildPlanPrompt(objective, contextStr string, isDirectMutation bool, groundedPayload string) string {
+	gp := groundedPayload
+	if gp != "" {
+		gp = "\n" + gp
+	}
+
 	if isDirectMutation {
-		return fmt.Sprintf(`%s
+		return fmt.Sprintf(`%s%s
 
 USER OBJECTIVE
 %s
 
 %s
 - Total output under 150 tokens.`,
-			contextStr, objective, planTaskBlocks,
+			contextStr, gp, objective, planTaskBlocks,
 		)
 	}
 
-	return fmt.Sprintf(`%s
+	return fmt.Sprintf(`%s%s
 
 %s
 
@@ -281,7 +321,7 @@ USER OBJECTIVE
 %s
 
 %s`,
-		contextStr,
+		contextStr, gp,
 		EnvironmentContext(),
 		objective,
 		planTaskBlocks,

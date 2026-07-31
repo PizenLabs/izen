@@ -9,6 +9,8 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/pkg/grounding"
+	"github.com/PizenLabs/izen/pkg/recon"
 )
 
 // ProviderFunc defines a structured function signature matching the ai.Request format.
@@ -17,10 +19,13 @@ type ProviderFunc func(ctx context.Context, req ai.Request) (*ai.Response, error
 // Engine is the core interface for the plan module, coordinating between data store,
 // parser, and AI provider to process plans.
 type Engine struct {
-	store    *PlanStore
-	parser   func(string) []Task
-	provider ProviderFunc
-	UserName string // collaborating engineer identity, injected into system prompts
+	store        *PlanStore
+	parser       func(string) []Task
+	provider     ProviderFunc
+	UserName     string   // collaborating engineer identity, injected into system prompts
+	rootPath     string   // workspace root for file discovery
+	AllowedFiles []string // grounded file tree for scope guard validation
+	vanillaWeb   bool     // when true, skip Go-specific fast-track paths
 }
 
 // NewEngine creates a new Engine instance with the provided components.
@@ -35,6 +40,49 @@ func NewEngine(store *PlanStore) *Engine {
 
 // SetUserName sets the engineer identity for system prompt injection.
 func (e *Engine) SetUserName(name string) { e.UserName = name }
+
+// SetRootPath sets the workspace root for file discovery.
+func (e *Engine) SetRootPath(rootPath string) { e.rootPath = rootPath }
+
+// SetAllowedFiles sets the grounded file tree for scope guard validation.
+func (e *Engine) SetAllowedFiles(files []string) { e.AllowedFiles = files }
+
+// DiscoverAllowedFiles runs pkg/recon and pkg/grounding to discover the
+// workspace file tree. Returns the allowed file list or an error.
+// If AllowedFiles is already set, returns them immediately.
+func (e *Engine) DiscoverAllowedFiles() ([]string, error) {
+	if len(e.AllowedFiles) > 0 {
+		return e.AllowedFiles, nil
+	}
+	if e.rootPath == "" {
+		return nil, fmt.Errorf("plan engine: rootPath not set — call SetRootPath first")
+	}
+	archetype, err := recon.DetectArchetype(e.rootPath)
+	if err != nil {
+		return nil, fmt.Errorf("plan engine: recon failed: %w", err)
+	}
+	intent := &grounding.CanonicalIntent{
+		RawPrompt:    "workspace discovery",
+		CleanIntent:  "workspace discovery",
+		TargetScopes: nil,
+		Confidence:   1.0,
+	}
+	gc, err := grounding.SliceContext(archetype, intent, e.rootPath)
+	if err != nil {
+		return nil, fmt.Errorf("plan engine: grounding failed: %w", err)
+	}
+	e.AllowedFiles = gc.AllowedFileTree
+	return e.AllowedFiles, nil
+}
+
+// GroundedConstraint returns the ALLOWED_FILE_TREE constraint block for prompt
+// injection, or empty string if no allowed files are set.
+func (e *Engine) GroundedConstraint() string {
+	if len(e.AllowedFiles) == 0 {
+		return ""
+	}
+	return prompt.GroundedConstraint("", e.AllowedFiles)
+}
 
 // parsePlanContent enforces strict JSON schema with recovery.
 // Phase 3: If JSON parsing fails, it attempts auto-repair via autoCloseJSON
@@ -100,6 +148,15 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		return nil, fmt.Errorf("plan engine: provider not set")
 	}
 
+	// Detect workspace archetype at run start. When VANILLA_WEB, Go-specific
+	// fast-track paths (canonical import mismatch, undefined symbol) are
+	// skipped and the LLM is instructed to avoid Go toolchain commands.
+	if !fastTrack && e.rootPath != "" {
+		if ac, err := recon.DetectArchetype(e.rootPath); err == nil && ac != nil {
+			e.vanillaWeb = (ac.Type == recon.VANILLA_WEB)
+		}
+	}
+
 	// ── DIRECT MUTATION FAST-TRACK ──────────────────────────
 	// When the prompt is a simple file replacement (refactor LICENSE
 	// from MIT to APACHE, change X to Y in @file, etc.), bypass
@@ -125,13 +182,17 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	// followed by SHELL_EXEC go mod tidy — replacing the SHELL_EXEC-only
 	// short-circuit that previously bypassed precision file editing.
 	//
+	// VANILLA_WEB GUARD: This block is SKIPPED for HTML/CSS/JS workspaces that
+	// have no Go files — the canonical import path signal is a false positive
+	// from non-Go tooling that happens to emit similar-looking error text.
+	//
 	// This implements the "Lynx Coordinate Handshake" architectural spec:
 	//   Step 1: Parse diagnostic output for canonical mismatch.
 	//   Step 2: Leverage lx related/resolve for precision discovery (no full
 	//           file loading into LLM context).
 	//   Step 3: Minimal context ledger population (under 100 tokens).
 	//   Step 4: Atomic execution blueprint (FILE_EDIT + SHELL_EXEC).
-	if !fastTrack && HasCanonicalImportMismatch(ledgerContent) {
+	if !fastTrack && !e.vanillaWeb && HasCanonicalImportMismatch(ledgerContent) {
 		mismatch := retrieval.ParseCanonicalMismatch(ledgerContent)
 		if mismatch != nil && mismatch.OldPath != "" && mismatch.NewPath != "" {
 			router := retrieval.GetGlobalRouter()
@@ -185,9 +246,13 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	// task directly from the error coordinates. No lx daemon, no LLM — the
 	// error file/line/symbol already carries the exact fix location.
 	//
+	// VANILLA_WEB GUARD: This block is SKIPPED for HTML/CSS/JS workspaces —
+	// "undefined" errors in JavaScript are normal runtime semantics, not
+	// Go-style compilation errors, and stdlib case-correction is Go-specific.
+	//
 	// CRITICAL: Both paths complete in < 1ms. The LLM synthesis retry loop
 	// and lx daemon handshake are NEVER reached for undefined symbol errors.
-	if !fastTrack && HasUndefinedSymbolError(ledgerContent) {
+	if !fastTrack && !e.vanillaWeb && HasUndefinedSymbolError(ledgerContent) {
 		undef := retrieval.ParseUndefinedSymbol(ledgerContent)
 		if undef != nil && undef.Symbol != "" {
 			sanitizedTarget, _ := retrieval.SanitizeTargetPath(undef.File)
@@ -309,12 +374,24 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		if isDirectMut {
 			systemPrompt = prompt.PlanDirectMutationSystemPrompt()
 		}
+		// VANILLA_WEB ARCHETYPE: Strict negative constraints injected at the
+		// end of the system prompt as a hard archetype lock. The LLM MUST NOT
+		// generate any backend toolchain commands for HTML/CSS/JS workspaces.
+		if e.vanillaWeb {
+			systemPrompt += `
+
+[CRITICAL ARCHETYPE LOCK: VANILLA_WEB]
+Target workspace has NO backend toolchains.
+FORBIDDEN COMMANDS: go, npm, cargo, pip, make.
+ALLOWED ACTIONS: Pure file mutations on .html, .css, .js files only.`
+		}
 
 		// Extract the investigation conclusion so it can be injected as a
 		// high-priority override signal. The conclusion carries the resolved
 		// diagnosis (e.g. corrected dependency paths) that must take precedence
 		// over raw error text when synthesising shell tasks.
 		conclusion := ExtractConclusionFromLedger(ledgerContent)
+		groundedPayload := e.GroundedConstraint()
 		req = ai.Request{
 			Model: modelName,
 			Messages: []ai.Message{
@@ -324,7 +401,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 				},
 				{
 					Role:    "user",
-					Content: prompt.BuildPlanJSONPrompt(problem, ledgerContent, conclusion, isDirectMut),
+					Content: prompt.BuildPlanJSONPrompt(problem, ledgerContent, conclusion, isDirectMut, groundedPayload),
 				},
 			},
 			Stream: false,
@@ -424,6 +501,16 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 			// symbol. The LLM may hallucinate go mod tidy for what is actually
 			// a code typo — this ensures only FILE_MUTATE tasks survive.
 			candidates = FilterUndefinedSymbolShellExec(candidates, ledgerContent)
+
+			// VANILLA_WEB GUARD: Deterministic post-filter over raw LLM task
+			// output. Strips Go toolchain tasks (go mod, go test, go get),
+			// ENV_DEPS tasks, and falls back to a safe default when all tasks
+			// are filtered out. This is the hard anti-escape barrier for
+			// VANILLA_WEB archetype that overrides any LLM hallucination.
+			if e.vanillaWeb {
+				candidates = filterGoCommands(candidates)
+				candidates = SanitizeTasksForArchetype(candidates, recon.VANILLA_WEB)
+			}
 
 			if len(candidates) > 0 {
 				if !hasInvalidShellExecCommand(candidates) {
@@ -646,6 +733,24 @@ func FilterUndefinedSymbolShellExec(tasks []Task, ledgerContent string) []Task {
 // targets. Invalid tasks are dropped silently — identical resilience pattern
 // used by the fast-track path — so a local 7B model with one bad task does
 // not abort the entire plan. Returns the original slice if all tasks are valid.
+// filterGoCommands strips SHELL_EXEC tasks whose targets contain Go toolchain
+// commands (go mod tidy, go get, go test, go build, go install, go run, go vet,
+// go list, go clean). Used by the VANILLA_WEB archetype guard to prevent Go
+// commands from reaching execution in HTML/CSS/JS workspaces.
+func filterGoCommands(tasks []Task) []Task {
+	clean := make([]Task, 0, len(tasks))
+	for _, t := range tasks {
+		if t.Type == "SHELL_EXEC" || t.Type == "GIT_ACTION" {
+			target := strings.Fields(strings.TrimSpace(t.Target))
+			if len(target) >= 2 && target[0] == "go" {
+				continue // skip go mod tidy, go get, etc.
+			}
+		}
+		clean = append(clean, t)
+	}
+	return clean
+}
+
 func filterValidTasks(tasks []Task) []Task {
 	clean := make([]Task, 0, len(tasks))
 	for _, t := range tasks {
@@ -729,6 +834,53 @@ func hasGoModMissingError(content string) bool {
 // set — especially bare file paths like "go.mod" or "relative/path/to/go.mod" —
 // is treated as a hallucinated command and triggers the deterministic fallback
 // in ValidateShellExecCommands.
+// SanitizeTasksForArchetype is a strict programmatic post-filter applied to
+// raw LLM task output before staging the plan. For VANILLA_WEB archetype:
+//   - Discards ANY task containing "go mod", "go test", "go get", or "ENV_DEPS" kind
+//   - If all tasks are filtered out, falls back to a single default task:
+//     "Inspecting and fixing static HTML/CSS/JS files"
+//
+// For non-VANILLA_WEB archetypes, tasks are returned unchanged.
+func SanitizeTasksForArchetype(tasks []Task, archetype recon.ProjectArchetype) []Task {
+	if archetype != recon.VANILLA_WEB || len(tasks) == 0 {
+		return tasks
+	}
+	clean := make([]Task, 0, len(tasks))
+	for _, t := range tasks {
+		target := strings.ToLower(strings.TrimSpace(t.Target))
+		desc := strings.ToLower(t.Description)
+		// Discard tasks with forbidden Go commands or ENV_DEPS kind.
+		if t.Type == "ENV_DEPS" {
+			continue
+		}
+		if strings.Contains(target, "go mod") ||
+			strings.Contains(target, "go test") ||
+			strings.Contains(target, "go get") ||
+			strings.Contains(desc, "go mod") ||
+			strings.Contains(desc, "go test") ||
+			strings.Contains(desc, "go get") {
+			continue
+		}
+		clean = append(clean, t)
+	}
+	if len(clean) == 0 {
+		// All tasks filtered out — fallback to a single default task.
+		return []Task{
+			{
+				StepNum:     1,
+				IsDone:      false,
+				Status:      "idle",
+				Type:        "FILE_MUTATE",
+				Target:      "",
+				Description: "Inspecting and fixing static HTML/CSS/JS files",
+				Rationale:   "All LLM-generated tasks were filtered out by VANILLA_WEB archetype guard",
+				IsHardcoded: true,
+			},
+		}
+	}
+	return clean
+}
+
 var knownShellBinaries = map[string]bool{
 	"go":             true,
 	"git":            true,
@@ -1058,7 +1210,7 @@ func (e *Engine) ProcessPlan(ctx context.Context, modelName string, objective st
 			},
 			{
 				Role:    "user",
-				Content: prompt.BuildPlanPrompt(objective, contextStr, isDirectMut),
+				Content: prompt.BuildPlanPrompt(objective, contextStr, isDirectMut, ""),
 			},
 		},
 		Stream: false,

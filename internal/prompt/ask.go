@@ -2,22 +2,30 @@ package prompt
 
 import "fmt"
 
-// AskPromptHandoffContract returns the lean technical handoff template.
-// The LLM refines a raw architectural idea into a concise, actionable
-// prompt with explicit target files and steps. No roleplay, no persona.
+// AskPromptHandoffContract returns the structured intent-extraction template.
+// The LLM extracts ONLY high-level raw intent, domain, and scope tags.
+// It MUST NOT generate concrete file manipulation steps, line numbers, or code edits.
 func AskPromptHandoffContract() string {
-	return `MODE: /ask — refine architectural idea into actionable technical prompt.
+	return `MODE: /ask — extract high-level raw intent.
 
-Evaluate the raw idea below. Extract the concrete objective, identify the
-target files to modify, and produce a minimal technical prompt.
+Evaluate the raw idea below. Extract ONLY the following three fields:
 
-OUTPUT — raw text only, no preamble, no markdown sections, no commentary:
+raw_intent: <1-2 sentence description of what the user wants, using their own words>
+affected_domain: <FRONTEND_UI | BACKEND_API | DATABASE | CONFIG | TEST | OTHER>
+scope_tags: <comma-separated list of domain-specific tags, e.g. "layout,navigation,positioning" or "api,rest,handler">
 
-Goal: <1-2 sentence task goal>
-Targets: <explicit repo file paths, comma-separated>
-Steps: <numbered actionable steps>
+FORBIDDEN:
+- Do NOT generate concrete file manipulation steps, line numbers, or code edits.
+- Do NOT produce "Steps:", "Goal:", "Targets:" sections.
+- Do NOT suggest specific CSS properties, HTML elements, or code changes.
+- Do NOT reference specific line numbers, file paths, or code snippets.
 
-Now refine the following raw user input:`
+AFFIRMATIVE:
+- Preserve the user's original wording in raw_intent.
+- Classify the domain honestly based on semantic content.
+- Tag with lightweight scoping labels.
+
+Now process the following raw user input:`
 }
 
 // AskContract returns the operational contract for ask mode.

@@ -41,6 +41,7 @@ import (
 	"github.com/PizenLabs/izen/internal/templates"
 	verification "github.com/PizenLabs/izen/internal/verification"
 	"github.com/PizenLabs/izen/internal/workspace"
+	"github.com/PizenLabs/izen/pkg/control"
 )
 
 var validSystemCommands = map[string]struct{}{
@@ -1027,6 +1028,21 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		ftCtx, ftCancel := context.WithTimeout(ctx, ftBudget)
 		defer ftCancel()
 
+		// ── WORKSPACE DISCOVERY ──────────────────────────────────────────────
+		// If the plan engine has no allowed file tree yet, discover it now via
+		// pkg/recon + pkg/grounding so the scope guard can validate targets.
+		if m.planEngine != nil && m.workspaceRoot != "" {
+			if len(m.planEngine.AllowedFiles) == 0 {
+				m.planEngine.SetRootPath(m.workspaceRoot)
+				allowed, discErr := m.planEngine.DiscoverAllowedFiles()
+				if discErr != nil {
+					debugLogPlan("WORKSPACE DISCOVERY: " + discErr.Error())
+				} else {
+					debugLogPlan("WORKSPACE DISCOVERY: " + fmt.Sprint(len(allowed)) + " files in tree")
+				}
+			}
+		}
+
 		go func() {
 			debugLogPlan("Preparing LLM payload (ledger bytes=" + fmt.Sprint(len(ledgerToSend)) +
 				"; fastTrack=" + fmt.Sprint(useFastTrack) + ")")
@@ -1038,6 +1054,52 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 				tasks, err = m.planEngine.ProcessFromLedger(ftCtx, ledgerToSend, problem, modelName)
 			}
 			debugLogPlan("Provider returned; err=" + fmt.Sprint(err))
+
+			// ── SCOPE GUARD VALIDATION ──────────────────────────────────────
+			// Validate generated tasks against the allowed file tree before
+			// returning to the event loop. If a violation is detected, reject the
+			// plan, log the rejection, and attempt ONE retry with the strict
+			// scope instruction injected into the prompt.
+			if err == nil && len(tasks) > 0 && len(m.planEngine.AllowedFiles) > 0 {
+				scopeTasks := make([]control.TaskTarget, len(tasks))
+				for i, t := range tasks {
+					scopeTasks[i] = control.TaskTarget{Target: t.Target, Type: t.Type}
+				}
+				if scopeErr := control.ValidateStagedPlan(scopeTasks, m.planEngine.AllowedFiles); scopeErr != nil {
+					var sv *control.ScopeViolationError
+					if errors.As(scopeErr, &sv) {
+						debugLogPlan("SCOPE GUARD: rejected target " + sv.TargetString())
+						// Build a retry prompt with the exact allowed file list.
+						retryPrompt := ledgerToSend + control.FormatRepromptInstruction(m.planEngine.AllowedFiles)
+						retryTasks, retryErr := m.planEngine.ProcessFromLedger(ftCtx, retryPrompt, problem, modelName)
+						if retryErr == nil && len(retryTasks) > 0 {
+							// Re-validate retry tasks.
+							retryScopeTasks := make([]control.TaskTarget, len(retryTasks))
+							for i, t := range retryTasks {
+								retryScopeTasks[i] = control.TaskTarget{Target: t.Target, Type: t.Type}
+							}
+							if retryScopeErr := control.ValidateStagedPlan(retryScopeTasks, m.planEngine.AllowedFiles); retryScopeErr == nil {
+								debugLogPlan("SCOPE GUARD: retry succeeded with " + fmt.Sprint(len(retryTasks)) + " tasks")
+								tasks = retryTasks
+								err = nil
+							} else {
+								debugLogPlan("SCOPE GUARD: retry also rejected — " + fmt.Sprint(retryScopeErr))
+								// Keep original tasks but annotate the error.
+								err = fmt.Errorf("scope guard: %w (retry also rejected %w)", scopeErr, retryScopeErr)
+							}
+						} else {
+							if retryErr != nil {
+								debugLogPlan("SCOPE GUARD: retry failed — " + fmt.Sprint(retryErr))
+								err = fmt.Errorf("scope guard: %w (retry failed %w)", scopeErr, retryErr)
+							} else {
+								debugLogPlan("SCOPE GUARD: retry produced no tasks")
+								err = fmt.Errorf("scope guard: %w (retry produced no tasks)", scopeErr)
+							}
+						}
+					}
+				}
+			}
+
 			outCh <- outcome{tasks: tasks, err: err}
 		}()
 
@@ -1318,19 +1380,17 @@ func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
 			return m.handoffCtx.LastFailurePayload
 		}
 	case modes.ModeBuild:
-		// /build STRICTLY consumes the atomic structural tasks produced by the
-		// /plan phase (m.handoffCtx.PendingTodos and m.sess.CurrentTasks). It
-		// must NEVER fall back to the raw conversational ProposedFix blob —
-		// that would re-inject stale $test / chat text into the build
-		// workspace. If no atomic tasks exist, return "" so setMode enters a
-		// clean idle state instead of contaminating the buffer.
+		// REFORM: /build STRICTLY consumes:
+		//   1. The user's raw intent (UserRawIntent from the ledger)
+		//   2. The atomic structural tasks produced by /plan (PendingTodos / staged tasks)
+		// It must NEVER fall back to the raw conversational ProposedFix blob or
+		// AssistantDiscussionNotes — those may contain pre-baked hallucinated steps.
+		// If no atomic tasks exist, return "" so setMode enters a clean idle state.
 		hasStagedTasks := len(m.sess.CurrentTasks) > 0
 		if len(m.handoffCtx.PendingTodos) == 0 && !hasStagedTasks {
 			// DEADLOCK-GUARD FALLBACK: when the investigate engine
 			// short-circuited with mutation intent and no structured
 			// tasks were synthesized, create one from the handoff ledger.
-			// This prevents the frozen state where /build enters idle
-			// after auto-routing from /investigate.
 			if strings.Contains(m.handoffLedgerContent, "code mutation intent detected") {
 				m.handoffCtx.PendingTodos = synthesizeBuildTodosFromMutation(m.handoffLedgerContent)
 			}
@@ -1338,7 +1398,18 @@ func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
 				return ""
 			}
 		}
+
+		rawIntent := ""
+		if m.sess != nil && m.sess.ContextLedger != nil {
+			rawIntent = m.sess.ContextLedger.UserRawIntent
+		}
+
 		var b strings.Builder
+		if rawIntent != "" {
+			b.WriteString("## USER RAW INTENT\n")
+			b.WriteString(rawIntent)
+			b.WriteString("\n\n")
+		}
 		b.WriteString("## HANDOFF BUILD EXECUTION\n\n")
 		b.WriteString("Execute the following planned tasks and output code patches directly.\n")
 		b.WriteString("Do NOT restate the plan or ask for approval — produce the mutations now.\n\n")
@@ -2219,6 +2290,9 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 				lang = "text"
 			}
 			fmt.Fprintf(&fileContext, "## Current Content of: %s\n```%s\n%s\n```\n\n", t.Target, lang, string(data))
+			if m.activityTree != nil {
+				m.activityTree.Append(NewFileReadEvent(t.Target, int64(len(data)), 0))
+			}
 		} else {
 			fmt.Fprintf(&fileContext, "## Target File: %s (does not yet exist)\n\n", t.Target)
 		}
@@ -3073,13 +3147,27 @@ func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
 		}
 		symbol, pkgName, importPath := parts[1], parts[2], parts[3]
 
+		// ── Activity Tree: log stdlib fix read ──────────────────────────
+		if m.activityTree != nil {
+			m.activityTree.Append(NewFileReadEvent(task.Target, 0, 0))
+		}
+
 		// Read actual file and compute deterministic fix.
 		orig, modified, err := retrieval.ApplyStdlibCaseFix(task.Target, symbol, pkgName, importPath)
 		if err != nil {
+			if m.activityTree != nil {
+				m.activityTree.Append(NewFileMutateEvent(task.Target, 0, 0, 0))
+			}
 			return buildProposalReadyMsg{Err: fmt.Errorf("stdlib fix failed for %s: %w", task.Target, err)}
 		}
 
 		diff := computeUnifiedDiff(task.Target, orig, modified)
+
+		// ── Activity Tree: log stdlib patch with real diff metrics ─────
+		if m.activityTree != nil {
+			added, removed := countLinesDelta(diff)
+			m.activityTree.Append(NewFileMutateEvent(task.Target, added, removed, 0))
+		}
 
 		patch := &execution.Patch{
 			ID:            fmt.Sprintf("stdlib-%d", task.StepNum),
@@ -3124,29 +3212,65 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
 
-		var orig string
-		if data, rerr := os.ReadFile(task.Target); rerr == nil {
-			orig = string(data)
+		// ── Read fresh file content from disk ──────────────────────────
+		// NON-ZERO FILE READ ENFORCEMENT: if the file exists on disk with
+		// a positive size but readFileContent returns empty, abort patch
+		// generation immediately. An empty read for an existing non-empty
+		// file indicates a stale or locked file — passing empty context to
+		// the LLM would silently overwrite the real content with a patch
+		// trained on nothing.
+		readFileContent := func() (string, error) {
+			fi, serr := os.Stat(task.Target)
+			if serr == nil && fi.Size() > 0 {
+				data, rerr := os.ReadFile(task.Target)
+				if rerr != nil {
+					return "", fmt.Errorf("read %s: %w", task.Target, rerr)
+				}
+				if len(data) == 0 {
+					return "", fmt.Errorf("zero-content read on non-empty file %s (%d bytes on disk) — aborting to prevent silent data loss", task.Target, fi.Size())
+				}
+				return string(data), nil
+			}
+			if serr == nil {
+				// File exists but is genuinely empty (new file creation).
+				return "", nil
+			}
+			// File does not exist on disk — new file creation.
+			return "", nil
+		}
+
+		orig, rerr := readFileContent()
+		if rerr != nil {
+			if m.activityTree != nil {
+				m.activityTree.Append(NewFileReadEvent(task.Target, 0, 0))
+			}
+			return buildProposalReadyMsg{Err: rerr}
 		}
 
 		// ── Determine strategy based on file state ─────────────────────
 		strategy := execution.StrategyForOriginal(orig)
-		baseHandoff := ctxpkg.SanitizeBuildHandoff(task, "")
 
-		switch strategy {
-		case execution.STRATEGY_NEW_FILE:
-			baseHandoff += "\n\nThis is a NEW file that does not exist yet. "
-			baseHandoff += "Output the complete file content inside a markdown code block "
-			baseHandoff += "with the appropriate language tag (e.g. ```css, ```javascript, ```html, ```python, ```go). "
-			baseHandoff += "Do NOT use FILE_CREATE markers, SEARCH/REPLACE blocks, or unified diffs."
-			baseHandoff += "Generate ONLY the content that belongs in this file.\n"
-		default:
-			baseHandoff += "\n\n### TARGET_FILE_CONTENT\n```\n" + orig + "\n```\n"
-			baseHandoff += "\nModify the above file content to fulfill the task. "
-			baseHandoff += "Output a unified diff (--- a/ ... +++ b/ ...) or a SEARCH/REPLACE block (<<<<<<< SEARCH). "
-			baseHandoff += "Do NOT rewrite the entire file. "
-			baseHandoff += "Return ONLY the SEARCH/REPLACE block or unified diff. No explanatory text."
+		// ── Build the handoff with the current file content ────────────
+		buildHandoff := func(content string) string {
+			h := ctxpkg.SanitizeBuildHandoff(task, "")
+			switch strategy {
+			case execution.STRATEGY_NEW_FILE:
+				h += "\n\nThis is a NEW file that does not exist yet. "
+				h += "Output the complete file content inside a markdown code block "
+				h += "with the appropriate language tag (e.g. ```css, ```javascript, ```html, ```python, ```go). "
+				h += "Do NOT use FILE_CREATE markers, SEARCH/REPLACE blocks, or unified diffs."
+				h += "Generate ONLY the content that belongs in this file.\n"
+			default:
+				h += "\n\n### TARGET_FILE_CONTENT\n```\n" + content + "\n```\n"
+				h += "\nModify the above file content to fulfill the task. "
+				h += "Output a unified diff (--- a/ ... +++ b/ ...) or a SEARCH/REPLACE block (<<<<<<< SEARCH). "
+				h += "Do NOT rewrite the entire file. "
+				h += "Return ONLY the SEARCH/REPLACE block or unified diff. No explanatory text."
+			}
+			return h
 		}
+
+		handoff := buildHandoff(orig)
 
 		// Select system prompt based on strategy.
 		system := prompt.StrategyContract(strategy.SystemPromptKey())
@@ -3155,16 +3279,41 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 		isCloud := cloudCfg.CloudProvider != ""
 
 		maxRetries := 2
-		handoff := baseHandoff
+
+		// ── Activity Tree: log file read ──────────────────────────────
+		if m.activityTree != nil {
+			m.activityTree.Append(NewFileReadEvent(task.Target, 0, 0))
+		}
 
 		for attempt := 0; attempt <= maxRetries; attempt++ {
+			// On retry: re-read the file from disk in case it changed
+			// (e.g. a previous retry attempt wrote partial content or
+			// another task modified it).
+			if attempt > 0 {
+				orig, rerr = readFileContent()
+				if rerr != nil {
+					return buildProposalReadyMsg{Err: rerr}
+				}
+				handoff = buildHandoff(orig)
+			}
+
 			// On retry for existing small files, switch to new-file strategy
 			// (full content overwrite) to avoid repeated diff failures.
 			currentStrategy := strategy
 			if attempt > 0 && orig != "" && execution.IsSmallFile(orig) {
 				currentStrategy = execution.STRATEGY_NEW_FILE
-				handoff = baseHandoff + "\n\nCORRECTION: Previous patch attempts failed. Output the COMPLETE new file content inside a single markdown code block. Do NOT use SEARCH/REPLACE or diff format."
+				handoff += "\n\nCORRECTION: Previous patch attempts failed. Output the COMPLETE new file content inside a single markdown code block. Do NOT use SEARCH/REPLACE or diff format."
 				system = prompt.StrategyContract("new_file")
+
+				// ── Activity Tree: log retry ───────────────────────────
+				if m.activityTree != nil {
+					m.activityTree.Append(NewFileMutateEvent(task.Target, 0, 0, 0))
+				}
+			} else if attempt > 0 {
+				// ── Activity Tree: log retry ───────────────────────────
+				if m.activityTree != nil {
+					m.activityTree.Append(NewFileReadEvent(task.Target, 0, 0))
+				}
 			}
 
 			stop := []string{">>>>>>>", "```\n\n"}
@@ -3218,7 +3367,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				if attempt < maxRetries {
 					handoff = fmt.Sprintf(
 						"%s\n\nCORRECTION: Your previous response was empty or unparseable. The expected output is a raw unified diff block like:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n line1\n-line-old\n+line-new\n\nReturn ONLY that diff. No text before or after.",
-						baseHandoff, task.Target, task.Target)
+						buildHandoff(orig), task.Target, task.Target)
 					continue
 				}
 				return buildProposalReadyMsg{Err: fmt.Errorf("patch generation returned empty output")}
@@ -3262,7 +3411,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 									"The expected format for a unified diff is:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n existing context line\n-old-line\n+new-line\n\n"+
 									"Or use SEARCH/REPLACE markers:\n<<<<<<< SEARCH\n<old code>\n=======\n<new code>\n>>>>>>>\n\n"+
 									"Return ONLY one of these formats. No conversational text. No explanations.",
-								baseHandoff, task.Target, task.Target)
+								buildHandoff(orig), task.Target, task.Target)
 							continue
 						}
 						return buildProposalReadyMsg{Err: fmt.Errorf("patch generation: no valid diff or search/replace block found in LLM output for %s after %d attempts", task.Target, attempt+1)}
@@ -3276,10 +3425,41 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 					if attempt < maxRetries {
 						handoff = fmt.Sprintf(
 							"Your proposed patch for %s was rejected due to invalid format: Ambiguous snippet without SEARCH/REPLACE markers. Re-send the modification using strict <<<<<<< SEARCH ... ======= ... >>>>>>> blocks.\n\nOriginal task:\n%s",
-							task.Target, baseHandoff)
+							task.Target, buildHandoff(orig))
 						continue
 					}
 					return buildProposalReadyMsg{Err: fmt.Errorf("%w: ambiguous snippet without SEARCH/REPLACE markers for existing file %s — retry with SEARCH/REPLACE block or unified diff", execution.ErrInvalidPatchFormat, task.Target)}
+				}
+			}
+
+			// ── DESTRUCTION GUARDRAIL ────────────────────────────────────
+			// Only reject patches that delete content with ZERO additions
+			// and leave the file empty or near-empty (≤ 5 remaining lines
+			// and > 90% deleted). This allows legitimate deduplication edits
+			// (e.g. removing 132/162 lines) and full-rewrite fallbacks while
+			// still catching actual file wipes.
+			// On the final attempt, falls through to full-rewrite retry.
+			if diffContent != "" && orig != "" {
+				origLineCount := len(strings.Split(orig, "\n"))
+				if origLineCount > 0 {
+					added, removed := countLinesDelta(diffContent)
+					finalLineCount := origLineCount - removed + added
+
+					if added == 0 {
+						isEmpty := finalLineCount <= 0
+						isNearWipe := origLineCount > 0 && float64(removed)/float64(origLineCount) > 0.9 && finalLineCount < 5
+
+						if isEmpty || isNearWipe {
+							if attempt < maxRetries {
+								handoff = fmt.Sprintf(
+									"ERROR: Proposed patch deletes entire file content without replacements. Preserve existing structure and remove ONLY duplicate blocks.\n\nOriginal task:\n%s",
+									buildHandoff(orig))
+								continue
+							}
+							// Last attempt: fall through to full-rewrite retry below.
+							break
+						}
+					}
 				}
 			}
 
@@ -3293,11 +3473,75 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				IsFullRewrite: currentStrategy == execution.STRATEGY_NEW_FILE,
 			}
 
+			// ── Activity Tree: mark read done, log patch ────────────────
+			if m.activityTree != nil {
+				added, removed := countLinesDelta(diffContent)
+				m.activityTree.Append(NewFileMutateEvent(task.Target, added, removed, 0))
+			}
+
 			return buildProposalReadyMsg{
 				Task:   task,
 				Patch:  patch,
 				Diff:   diffContent,
 				Output: rawContent,
+			}
+		}
+
+		// ── Activity Tree: mark failure on exhaustion ──────────────────
+		if m.activityTree != nil {
+			m.activityTree.Append(NewFileMutateEvent(task.Target, 0, 0, 0))
+		}
+
+		// ── FINAL FULL-FILE REWRITE RETRY ─────────────────────────────
+		// All structured patch strategies (unified diff, SEARCH/REPLACE) have
+		// failed after maxRetries attempts. Try one final time asking the LLM
+		// to output the ENTIRE file content in a clean codeblock. This handles
+		// small models (7B) that struggle with precise patch formatting.
+		if orig != "" {
+			fullRewriteHandoff := fmt.Sprintf(
+				"%s\n\nALL PRIOR PATCH ATTEMPTS FAILED. Output the COMPLETE updated file content inside a SINGLE markdown code block. Do NOT use SEARCH/REPLACE, unified diff, or FILE_CREATE markers. Return the entire file — nothing less.",
+				buildHandoff(orig))
+			fullRewriteReq := ai.Request{
+				Model:     m.cfg.ActiveModelName(),
+				System:    prompt.StrategyContract("small_fallback"),
+				Stream:    false,
+				MaxTokens: 4096,
+				Stop:      []string{"```\n\n"},
+				Messages:  []ai.Message{{Role: "user", Content: fullRewriteHandoff}},
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			fullResp, fullErr := m.provider.Execute(ctx, fullRewriteReq)
+			cancel()
+			if fullErr == nil && fullResp != nil && strings.TrimSpace(fullResp.Content) != "" {
+				var fullResolved string
+				if extracted, ok := execution.ExtractRawCodeBlock(fullResp.Content); ok {
+					fullResolved = execution.SanitizeRawCodeBlock(extracted)
+				} else if extracted, ok := execution.ExtractCodeBlockContent(fullResp.Content); ok {
+					fullResolved = execution.SanitizeRawCodeBlock(extracted)
+				} else {
+					fullResolved = execution.SanitizeRawCodeBlock(fullResp.Content)
+				}
+				if strings.TrimSpace(fullResolved) != "" {
+					fullDiff := computeUnifiedDiff(task.Target, orig, fullResolved)
+					if m.activityTree != nil {
+						added, removed := countLinesDelta(fullDiff)
+						m.activityTree.Append(NewFileMutateEvent(task.Target, added, removed, 0))
+					}
+					return buildProposalReadyMsg{
+						Task: task,
+						Patch: &execution.Patch{
+							ID:            fmt.Sprintf("build-%d", task.StepNum),
+							File:          task.Target,
+							Original:      orig,
+							Modified:      fullResolved,
+							TaskID:        task.StepNum,
+							ContextID:     m.sess.ContextID,
+							IsFullRewrite: true,
+						},
+						Diff:   fullDiff,
+						Output: fullResp.Content,
+					}
+				}
 			}
 		}
 
@@ -3743,6 +3987,22 @@ func computeUnifiedDiff(path, original, modified string) string {
 		b.WriteString("+" + modLines[j] + "\n")
 	}
 	return b.String()
+}
+
+// countLinesDelta returns the number of added and removed lines in a unified diff.
+// Used for accurate FileMutateEvent metrics and destruction guardrail checks.
+func countLinesDelta(diff string) (added, removed int) {
+	if diff == "" {
+		return 0, 0
+	}
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			added++
+		} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+			removed++
+		}
+	}
+	return
 }
 
 // findFailedBuildTask returns the step number of the first task in the build
@@ -5591,26 +5851,37 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 		}
 
 	case modes.ModeBuild:
-		// /build consumes ONLY the atomic structural tasks (PendingTodos /
-		// staged tasks) produced by /plan. The raw ProposedFix chat blob from
-		// an earlier phase is purged here so it can never re-inject stale
-		// conversational text into the build workspace.
+		// REFORM: /build consumes ONLY:
+		//   1. The user's raw intent (UserRawIntent from the ledger)
+		//   2. The atomic structural tasks produced by /plan (PendingTodos / staged tasks)
+		// The raw ProposedFix chat blob / AssistantDiscussionNotes are STRICTLY
+		// PURGED here to prevent hallucinated procedural steps from contaminating
+		// the build execution engine.
 		if len(m.handoffCtx.PendingTodos) > 0 || len(m.sess.CurrentTasks) > 0 {
 			m.push(roleSystem, "Handoff context injected.")
 		}
-		// Purge stale conversational handoff so the build buffer stays clean.
+		// Purge stale pre-baked steps — build must not inherit them.
 		m.handoffCtx.ProposedFix = ""
 
-		// DEADLOCK-GUARD: when the investigate engine short-circuited
-		// with mutation intent, synthesize an execution context from the
-		// pending todos so the build engine receives an active mutation
-		// prompt instead of a generic greeting.
+		// Build the execution payload from raw intent + plan artifacts only.
+		rawIntent := ""
+		if m.sess != nil && m.sess.ContextLedger != nil {
+			rawIntent = m.sess.ContextLedger.UserRawIntent
+		}
+
 		if len(m.handoffCtx.PendingTodos) > 0 {
-			m.handoffCtx.LastFailurePayload = buildMutationHandoffPayload(m.handoffCtx.PendingTodos)
+			payload := buildMutationHandoffPayload(m.handoffCtx.PendingTodos)
+			if rawIntent != "" {
+				payload = "## USER RAW INTENT\n" + rawIntent + "\n\n" + payload
+			}
+			m.handoffCtx.LastFailurePayload = payload
 		} else {
-			// REFORM A: Build strict minimal context for the active task.
-			// This is injected as the initial prompt for the build execution.
-			m.handoffCtx.LastFailurePayload = m.buildStrictHandoffPayload()
+			// Build strict minimal context for the active task.
+			payload := m.buildStrictHandoffPayload()
+			if rawIntent != "" {
+				payload = "## USER RAW INTENT\n" + rawIntent + "\n\n" + payload
+			}
+			m.handoffCtx.LastFailurePayload = payload
 		}
 	}
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/pkg/recon"
 )
 
 // forensicLog is the activity sink for /investigate. It defaults to the
@@ -40,6 +41,11 @@ type Engine struct {
 	// Intent classifies the investigation request (bug/regression vs feature/test/refactor).
 	// Controls whether environment/dependency resolution tools are allowed.
 	Intent Intent
+
+	// vanillaWeb is true when the workspace archetype is VANILLA_WEB (HTML/CSS/JS
+	// without Go files). When true, Go-specific diagnostic patterns are skipped
+	// and Go toolchain commands (go mod tidy, go test) are never suggested.
+	vanillaWeb bool
 
 	// forensicsRan records whether the engine actually invoked the diagnostic
 	// toolchain (test executor and/or retriever searches) during this run. It
@@ -130,6 +136,13 @@ func (e *Engine) Run() (*InvestigationResult, error) {
 func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 	e.runCtx = ctx
 
+	// Detect workspace archetype at run start. When VANILLA_WEB, Go-specific
+	// diagnostic patterns are skipped entirely.
+	ac, err := recon.DetectArchetype(e.root)
+	if err == nil && ac != nil {
+		e.vanillaWeb = (ac.Type == recon.VANILLA_WEB)
+	}
+
 	// Wipe stale conclusion caches from any prior (possibly broken) run so the
 	// plan handoff can never inherit leftover REMOTE DEPENDENCY BLOCKER tokens
 	// or other ghost state from a previous cycle.
@@ -144,21 +157,31 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 
 	// ── DEADLOCK PREVENTION: NON-BUG INTENT SHORT-CIRCUIT ──────────────
 	// /investigate is STRICTLY read-only for bug diagnostics. When the
-	// intent is FeatureUnitTest, Refactor, or any code creation/mutation
-	// (detected by mutation verbs in the problem text), exit immediately
-	// with a handoff signal instead of looping through the forensic state
-	// machine. This prevents the infamous "investigate deadlock" where the
-	// engine keeps looping over test output for a task that requires writing
-	// code, not diagnosing bugs.
+	// intent is FeatureUnitTest, Refactor, FrontendUI, or any code
+	// creation/mutation (detected by mutation verbs in the problem text),
+	// exit immediately with a handoff signal instead of looping through
+	// the forensic state machine.
+	//
+	// REFORM: FRONTEND_UI tasks short-circuit to /plan (not /build) to
+	// enforce Layer 3 Hybrid Search (AST + CSS/DOM) before code edits.
+	// All other mutation intents short-circuit to /build as before.
 	//
 	// The short-circuit produces:
 	//   - No forensic evidence (no test execution, no LX lookups)
-	//   - A clear conclusion: "code mutation intent detected — hand off to build"
+	//   - A clear conclusion indicating target mode
 	//   - Resolved=false so the caller knows investigation was not the right mode
-	if e.mustShortCircuitToBuild() {
-		forensicLog("[deadlock-guard] non-bug intent detected — short-circuiting /investigate → /build handoff")
+	if target := e.shouldShortCircuit(); target != shortCircuitNone {
+		var conclusion string
+		switch target {
+		case shortCircuitToPlan:
+			conclusion = "frontend ui intent detected — hand off to plan"
+			forensicLog("[deadlock-guard] frontend UI intent detected — short-circuiting /investigate → /plan")
+		default:
+			conclusion = "code mutation intent detected — hand off to build"
+			forensicLog("[deadlock-guard] non-bug intent detected — short-circuiting /investigate → /build handoff")
+		}
 		result.Resolved = false
-		result.Conclusion = "code mutation intent detected — hand off to build"
+		result.Conclusion = conclusion
 		result.RootCause = ""
 		result.Loops = 0
 		result.Duration = time.Since(e.startedAt).Round(time.Millisecond).String()
@@ -225,6 +248,12 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 	injectDependencyBlocker(e, &e.Result.Conclusion)
 	injectDependencyBlocker(e, &result.Conclusion)
 
+	// VANILLA_WEB ARCHETYPE: Strip all Go toolchain evidence before the
+	// plan handoff so the LLM never sees go.mod or go test references.
+	if e.vanillaWeb {
+		e.Evidence.SanitizeEvidenceForVanillaWeb()
+	}
+
 	// MANDATORY FORENSIC EVIDENCE: /investigate MUST have actually executed the
 	// diagnostic toolchain (LX/graph search and/or the test shell) before it is
 	// allowed to declare completion. If neither tool ran, force a diagnostic
@@ -281,7 +310,19 @@ func (e *Engine) forensicsExecuted() bool {
 // engine can never declare "Investigation complete" in 0s with no tool usage.
 // It is the last-resort forensic path when both the retriever and the primary
 // executor were unavailable during the state machine.
+//
+// VANILLA_WEB ARCHETYPE: When the workspace contains only HTML/CSS/JS, Go
+// toolchain diagnostics would produce false positives. The probe is skipped
+// entirely and a no-op placeholder is recorded instead.
 func (e *Engine) forceProbe(ctx context.Context) {
+	if e.vanillaWeb {
+		forensicLog("[forensic] VANILLA_WEB archetype — skipping forceProbe (go test)")
+		e.forensicsRan = true
+		e.Evidence.Add(EvSourceExecution,
+			"VANILLA_WEB archetype — no Go toolchain to probe",
+			"", 0, 0.2)
+		return
+	}
 	probe := NewShellTestExecutor(e.root)
 	summary, err := probe.RunAllTestsContext(ctx)
 	if err == nil && summary != nil {
@@ -304,7 +345,12 @@ func (e *Engine) stateObserve(ctx context.Context) error {
 	observed := fmt.Sprintf("Observing problem: %s", e.Problem)
 	e.Evidence.Add(EvSourceUser, observed, "", 0, 0.2)
 
-	if e.executor != nil {
+	// VANILLA_WEB ARCHETYPE: Skip the Go test executor entirely — there
+	// is no Go module system to probe. Fall through to dispatchForensics
+	// which also respects the VANILLA_WEB archetype by skipping Go patterns.
+	if e.vanillaWeb {
+		forensicLog("[forensic] VANILLA_WEB archetype — skipping Go test executor in stateObserve")
+	} else if e.executor != nil {
 		e.forensicsRan = true
 		summary, _ := e.TestLoop.Run(e.executor, testLoopConfig{Strategy: "all"})
 		if summary != nil {
@@ -360,9 +406,19 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 	// DispatchStrategy selects the tool but its Rationale field is NOT logged —
 	// it is a pre-decision classification label, not a verified fact.
 	// Actual outcomes are logged after execution below.
-	strategy := DispatchStrategy(dctx, e.provider, e.model, diagnostics, e.Intent)
+	strategy := DispatchStrategy(dctx, e.provider, e.model, diagnostics, e.Intent, e.vanillaWeb)
 	dispatchLog("[orchestrator] classify -> tool=%s target=%q",
 		strategy.Tool, strategy.Target)
+
+	// VANILLA_WEB ARCHETYPE: Remap ToolEnv and ToolTrace to ToolDiagnose.
+	// Environment dependency sweeps (go version, go test) would produce false
+	// positives in HTML/CSS/JS workspaces. ToolTrace runs go test -race which
+	// requires a Go module system. Only ToolDiagnose and ToolLX are safe.
+	if e.vanillaWeb && (strategy.Tool == ToolEnv || strategy.Tool == ToolTrace) {
+		dispatchLog("[orchestrator] VANILLA_WEB archetype — remapping %s to diagnose", strategy.Tool)
+		strategy.Tool = ToolDiagnose
+		strategy.Target = ""
+	}
 
 	runner := NewToolRunner(e.root, e.provider, e.model, e.retriever, diagnostics)
 
@@ -704,7 +760,10 @@ func (e *Engine) parseStackFramesFromEvidence() []StackFrame {
 }
 
 func (e *Engine) stateVerify() error {
-	if e.executor != nil {
+	// VANILLA_WEB ARCHETYPE: Skip Go test executor — no module system.
+	if e.vanillaWeb {
+		forensicLog("[forensic] VANILLA_WEB archetype — skipping Go test executor in stateVerify")
+	} else if e.executor != nil {
 		summary, _ := e.TestLoop.Run(e.executor, testLoopConfig{Strategy: "all"})
 		if summary != nil {
 			output := BoundedLogPreprocessor(summary.Output)
@@ -766,6 +825,16 @@ func (e *Engine) statePropose() error {
 	return e.State.Transition(StateDone)
 }
 
+// shortCircuitTarget describes where a short-circuited investigation should
+// route to. The "" value means no short-circuit.
+type shortCircuitTarget string
+
+const (
+	shortCircuitToBuild shortCircuitTarget = "build"
+	shortCircuitToPlan  shortCircuitTarget = "plan"
+	shortCircuitNone    shortCircuitTarget = ""
+)
+
 // mutationIntentKeywords are phrases that clearly indicate the user wants to
 // create or modify code — not diagnose a bug. When detected in the problem text,
 // the investigate engine short-circuits to avoid the deadlock loop.
@@ -779,26 +848,69 @@ var mutationIntentKeywords = []string{
 	"write function",
 }
 
-// mustShortCircuitToBuild returns true when the investigation should exit
-// immediately and hand off to /build instead of running the forensic state
-// machine. This prevents the "investigate deadlock" on code creation intents.
+// vanillaWebContentKeywords are phrases that signal a VANILLA_WEB content task
+// (HTML/CSS/JS workspace without Go files). When the workspace archetype is
+// VANILLA_WEB and the problem text matches one of these, the investigation
+// short-circuits to /plan — even if ClassifyIntent returned BugRegression.
+// This prevents language-specific forensic loops (Go module checks, go test)
+// from running on non-compiled web projects.
+var vanillaWebContentKeywords = []string{
+	"duplicate content",
+	"fix content",
+	"index.html",
+	"styles.css",
+	"script.js",
+	"style.css",
+	"app.js",
+	"main.js",
+	"main.css",
+	"static file",
+	"web asset",
+}
+
+// shouldShortCircuit returns the target mode when the investigation should exit
+// immediately and hand off instead of running the forensic state machine.
+// This prevents the "investigate deadlock" on code creation intents.
 //
-// Detection rules:
-//  1. Explicit intent set to FeatureUnitTest or Refactor → short-circuit.
-//  2. Problem text contains mutation intent keywords → short-circuit.
-//  3. Any $hot prefix → short-circuit (already handled at gateway, but
-//     double-check here as a safety net).
-func (e *Engine) mustShortCircuitToBuild() bool {
+// REFORM RULES:
+//  1. FRONTEND_UI intent → short-circuit to /plan (enforces CSS/AST search).
+//  2. VANILLA_WEB archetype + web content keywords → short-circuit to /plan
+//     even when the intent classifier returned BugRegression — prevents
+//     language-specific forensic loops on non-compiled web projects.
+//  3. FeatureUnitTest or Refactor intent → short-circuit to /build.
+//  4. Problem text contains mutation intent keywords → short-circuit to /build.
+//  5. Any $hot prefix → short-circuit to /build.
+func (e *Engine) shouldShortCircuit() shortCircuitTarget {
+	if e.Intent.IsFrontendUI() {
+		return shortCircuitToPlan
+	}
+
+	// VANILLA_WEB archetype guard: even when intent is BugRegression,
+	// if the project is HTML/CSS/JS and the problem references static
+	// web assets or content keywords, short-circuit to /plan.
+	if e.vanillaWeb {
+		lower := strings.ToLower(e.Problem)
+		for _, kw := range vanillaWebContentKeywords {
+			if strings.Contains(lower, kw) {
+				forensicLog("[deadlock-guard] VANILLA_WEB archetype detected with web content keywords — short-circuiting /investigate → /plan")
+				return shortCircuitToPlan
+			}
+		}
+	}
+
 	if !e.Intent.IsEnvDepsAllowed() {
-		return true
+		return shortCircuitToBuild
 	}
 	lower := strings.ToLower(e.Problem)
 	for _, kw := range mutationIntentKeywords {
 		if strings.Contains(lower, kw) {
-			return true
+			return shortCircuitToBuild
 		}
 	}
-	return strings.HasPrefix(strings.TrimSpace(e.Problem), "$hot")
+	if strings.HasPrefix(strings.TrimSpace(e.Problem), "$hot") {
+		return shortCircuitToBuild
+	}
+	return shortCircuitNone
 }
 
 // deriveRootCause extracts a root cause description from the investigation result.
@@ -849,6 +961,12 @@ func (e *Engine) FormatLedgerForPlan() string {
 		e.Ledger.SetRootCause(e.Result.RootCause)
 		e.Ledger.SetConclusion(e.Result.Conclusion, e.Result.Resolved)
 	}
+	// VANILLA_WEB ARCHETYPE: Sanitize the diagnostics string before
+	// passing it to /plan, stripping all Go toolchain references so
+	// the LLM never sees go.mod, go test, or Go compiler errors.
+	if e.vanillaWeb && e.Ledger.Diagnostics != "" {
+		e.Ledger.Diagnostics = SanitizeDiagnosticsForVanillaWeb(e.Ledger.Diagnostics)
+	}
 	return e.Ledger.FormatForPlan()
 }
 
@@ -886,7 +1004,14 @@ func extractPackageName(rawError string) string {
 // It scans e.Ledger.Diagnostics directly (the raw compiler/test output) rather
 // than depending on high-level conclusion strings being already populated, so
 // the REMOTE DEPENDENCY BLOCKER token is guaranteed on the very first pass.
+//
+// VANILLA_WEB ARCHETYPE: When the workspace contains only HTML/CSS/JS, Go
+// dependency blockers are NEVER injected — there is no Go module system to
+// resolve and the blocker token would produce false-positive tasks.
 func injectDependencyBlocker(e *Engine, targetConclusion *string) {
+	if e.vanillaWeb {
+		return
+	}
 	raw := e.Ledger.Diagnostics
 	if raw == "" {
 		return

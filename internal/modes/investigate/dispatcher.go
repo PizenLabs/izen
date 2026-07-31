@@ -69,14 +69,35 @@ func boundedDispatchCtx(parent context.Context) (context.Context, context.Cancel
 // path. This prevents generic environment noise (e.g. Docker container errors)
 // from overriding an explicit missing Go module.
 //
+// When isVanillaWeb is true, Go-specific patterns are SKIPPED entirely —
+// the workspace contains only HTML/CSS/JS and Go diagnostics would produce
+// false positives. The dispatcher falls back to env/trace/diagnose for
+// web-native issues.
+//
 // If provider is nil or the model returns an unusable payload, the dispatcher
 // falls back to heuristic signature classification (offline, instant) so the
 // engine always has a valid plan within the 2-5s budget.
 //
 //nolint:contextcheck // we deliberately derive a bounded timeout from the caller's context.
-func DispatchStrategy(parent context.Context, provider ai.Provider, model string, failureLog string, intent Intent) Strategy {
+func DispatchStrategy(parent context.Context, provider ai.Provider, model string, failureLog string, intent Intent, isVanillaWeb ...bool) Strategy {
+	vanillaWeb := len(isVanillaWeb) > 0 && isVanillaWeb[0]
 	if parent == nil {
 		parent = context.Background()
+	}
+
+	// VANILLA_WEB ARCHETYPE GUARD: Skip ALL Go-specific patterns. Go module
+	// errors, undefined symbols, and toolchain checks produce false positives
+	// in HTML/CSS/JS workspaces. Fall through to the vanilla heuristic.
+	if vanillaWeb {
+		dispatchLog("[orchestrator] VANILLA_WEB archetype — skipping Go-specific checks")
+		ctx, cancel := context.WithTimeout(parent, 4*time.Second)
+		defer cancel()
+		if provider != nil && strings.TrimSpace(failureLog) != "" {
+			if s, ok := llmClassify(ctx, provider, model, failureLog); ok {
+				return s
+			}
+		}
+		return heuristicClassifyWithArchetype(failureLog, true)
 	}
 
 	// STRICT ENV_DEPS GUARD: Feature/UnitTest/Refactor intents skip all external
@@ -104,7 +125,7 @@ func DispatchStrategy(parent context.Context, provider ai.Provider, model string
 			return s
 		}
 	}
-	return heuristicClassify(failureLog)
+	return heuristicClassifyWithArchetype(failureLog, false)
 }
 
 const dispatchSystemPrompt = `You are the routing brain for the /investigate forensic engine.
@@ -242,12 +263,41 @@ func extractUndefinedCoordinate(log string) string {
 // well-known signatures and maps them to the canonical tool without any
 // network round-trip. It never returns an invalid tool.
 //
+// When isVanillaWeb is true, ALL Go-specific patterns (module errors,
+// go version, GOPATH, toolchain) are SKIPPED — the workspace contains only
+// HTML/CSS/JS and Go diagnostic tools would produce false positives.
+//
 // HIGH-PRIORITY: Go module dependency errors ("no required module provides
 // package", "cannot find module providing package") are checked FIRST so
 // that generic environment noise (Docker, toolchain) cannot override an
 // explicit missing-dependency signal.
 func heuristicClassify(log string) Strategy {
+	return heuristicClassifyWithArchetype(log, false)
+}
+
+func heuristicClassifyWithArchetype(log string, isVanillaWeb bool) Strategy {
 	l := strings.ToLower(log)
+
+	if isVanillaWeb {
+		// VANILLA_WEB archetype: skip ALL Go-specific patterns. Route
+		// environment checks to env, everything else to diagnose.
+		switch {
+		case strings.Contains(l, "docker"),
+			strings.Contains(l, "command not found"),
+			strings.Contains(l, "no such file or directory"),
+			strings.Contains(l, "exec:"):
+			return Strategy{Tool: ToolEnv}
+		case strings.Contains(l, "panic:"),
+			strings.Contains(l, "nil pointer"),
+			strings.Contains(l, "nil map"),
+			strings.Contains(l, "data race"),
+			strings.Contains(l, "--- fail:"):
+			return Strategy{Tool: ToolTrace}
+		default:
+			return Strategy{Tool: ToolDiagnose}
+		}
+	}
+
 	switch {
 	// HIGH-PRIORITY: Go module / dependency errors force lx immediately.
 	case strings.Contains(l, "no required module provides package"),
@@ -299,6 +349,85 @@ var fallbackOrder = map[Tool][]Tool{
 	ToolDiagnose: {},
 }
 
+// frontendUIWordPatterns match short UI keywords with word boundaries so
+// "ui" does not match inside "build", "layout" inside "download_layout_data", etc.
+var frontendUIWordPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`\bmove\b`),
+	regexp.MustCompile(`\bposition\b`),
+	regexp.MustCompile(`\btop\b`),
+	regexp.MustCompile(`\bbottom\b`),
+	regexp.MustCompile(`\bleft\b`),
+	regexp.MustCompile(`\bright\b`),
+	regexp.MustCompile(`\bcss\b`),
+	regexp.MustCompile(`\bflexbox\b`),
+	regexp.MustCompile(`\bflex\b`),
+	regexp.MustCompile(`\bgrid\b`),
+	regexp.MustCompile(`\blayout\b`),
+	regexp.MustCompile(`\bresponsive\b`),
+	regexp.MustCompile(`\bviewport\b`),
+	regexp.MustCompile(`\bheader\b`),
+	regexp.MustCompile(`\bnav\b`),
+	regexp.MustCompile(`\bnavigation\b`),
+	regexp.MustCompile(`\bnavbar\b`),
+	regexp.MustCompile(`\bsidebar\b`),
+	regexp.MustCompile(`\bfooter\b`),
+	regexp.MustCompile(`\bhero\b`),
+	regexp.MustCompile(`\bbanner\b`),
+	regexp.MustCompile(`\bstyling\b`),
+	regexp.MustCompile(`\bstyle\b`),
+	regexp.MustCompile(`\bstylesheet\b`),
+	regexp.MustCompile(`\bpadding\b`),
+	regexp.MustCompile(`\bmargin\b`),
+	regexp.MustCompile(`\bborder\b`),
+	regexp.MustCompile(`\bspacing\b`),
+	regexp.MustCompile(`\bz-index\b`),
+	regexp.MustCompile(`\bzindex\b`),
+	regexp.MustCompile(`\babsolute\b`),
+	regexp.MustCompile(`\brelative\b`),
+	regexp.MustCompile(`\bsticky\b`),
+	regexp.MustCompile(`\bfixed\b`),
+	regexp.MustCompile(`\bfloat\b`),
+	regexp.MustCompile(`\bclearfix\b`),
+	regexp.MustCompile(`\boverflow\b`),
+	regexp.MustCompile(`\balignment\b`),
+	regexp.MustCompile(`\balign\b`),
+	regexp.MustCompile(`\bjustify\b`),
+	regexp.MustCompile(`\bbreakpoint\b`),
+	regexp.MustCompile(`\bui\b`),
+	regexp.MustCompile(`\bdom\b`),
+	regexp.MustCompile(`\bcomponent\b`),
+	regexp.MustCompile(`\brearrange\b`),
+	regexp.MustCompile(`\breorder\b`),
+	regexp.MustCompile(`\babove\b`),
+	regexp.MustCompile(`\bbelow\b`),
+	regexp.MustCompile(`\bbeneath\b`),
+	regexp.MustCompile(`\bwebpage\b`),
+	regexp.MustCompile(`\brender\b`),
+	regexp.MustCompile(`\brendering\b`),
+	regexp.MustCompile(`\bduplicate\b`),
+	regexp.MustCompile(`\bduplication\b`),
+}
+
+// frontendUIPhrases are longer phrases that do not need word boundaries.
+var frontendUIPhrases = []string{
+	"user interface", "user-interface",
+	"media query", "media queries",
+	"dom tree",
+	"z index",
+	"web page",
+	"re-order",
+	"duplicate content",
+	"index.html",
+	"styles.css",
+	"script.js",
+	"style.css",
+	"app.js",
+	"main.js",
+	"main.css",
+	"static file",
+	"web asset",
+}
+
 // Intent represents the high-level classification of an investigation request.
 type Intent int
 
@@ -306,6 +435,7 @@ const (
 	IntentBugRegression Intent = iota
 	IntentFeatureUnitTest
 	IntentRefactor
+	IntentFrontendUI
 )
 
 // String returns a human-readable label for the intent.
@@ -317,6 +447,8 @@ func (i Intent) String() string {
 		return "feature/unit-test"
 	case IntentRefactor:
 		return "refactor"
+	case IntentFrontendUI:
+		return "frontend-ui"
 	default:
 		return "unknown"
 	}
@@ -325,16 +457,40 @@ func (i Intent) String() string {
 // IsEnvDepsAllowed returns true only when the intent requires full forensic
 // evidence gathering including external dependency resolution. Feature/test/refactor
 // intents MUST NOT search for external missing packages or invent Docker requirements.
+// FRONTEND_UI intents are allowed to search for CSS/DOM context.
 func (i Intent) IsEnvDepsAllowed() bool {
-	return i == IntentBugRegression
+	return i == IntentBugRegression || i == IntentFrontendUI
+}
+
+// IsFrontendUI returns true when the intent is a UI/Layout task that requires
+// Layer 3 Hybrid Search (AST + CSS/DOM structure inspection).
+func (i Intent) IsFrontendUI() bool {
+	return i == IntentFrontendUI
 }
 
 // ClassifyIntent analyzes the incoming context text and determines the
 // investigation intent. It uses keyword heuristics to distinguish between
-// Bug/Regression (full forensic) and Feature/UnitTest/Refactor (code
-// implementation intent — skip external dependency search).
+// Bug/Regression (full forensic), Feature/UnitTest, Refactor, and FrontendUI
+// (UI/Layout — requires CSS/DOM inspection before mutation).
+//
+// REFORM: Frontend UI patterns are checked FIRST so that UI layout requests
+// like "move navigation to top" are classified as IntentFrontendUI instead
+// of IntentRefactor. This prevents the deadlock guard from short-circuiting
+// UI tasks directly to /build.
 func ClassifyIntent(contextText string) Intent {
 	lower := strings.ToLower(contextText)
+
+	// Frontend UI patterns take precedence over refactor patterns.
+	for _, p := range frontendUIWordPatterns {
+		if p.MatchString(lower) {
+			return IntentFrontendUI
+		}
+	}
+	for _, p := range frontendUIPhrases {
+		if strings.Contains(lower, p) {
+			return IntentFrontendUI
+		}
+	}
 
 	// Feature / Unit Test creation patterns
 	featurePatterns := []string{
@@ -352,10 +508,10 @@ func ClassifyIntent(contextText string) Intent {
 		}
 	}
 
-	// Refactor patterns
+	// Refactor patterns (excluding "move" which is now in frontendUIKeywords)
 	refactorPatterns := []string{
 		"refactor", "restructure", "reorganize",
-		"rename", "move", "extract",
+		"rename", "extract",
 		"simplify", "clean up", "modernize",
 	}
 	for _, p := range refactorPatterns {

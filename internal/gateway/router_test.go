@@ -12,56 +12,12 @@ func TestClassifyDirectMutation(t *testing.T) {
 		wantFile      string
 		wantTaskType  string
 	}{
-		// ── $prompt prefix tests ──────────────────────────────────────
-		{
-			name:          "$prompt create MIT LICENSE",
-			input:         "$prompt i want to create the MIT LICENSE with author named 'Maha JR' and the years 2026",
-			wantFastTrack: true,
-			wantFile:      "license",
-			wantTaskType:  "FILE_MUTATE",
-		},
-		{
-			name:          "$prompt generate @LICENSE",
-			input:         "$prompt generate @LICENSE with Apache 2.0",
-			wantFastTrack: true,
-			wantFile:      "LICENSE",
-			wantTaskType:  "FILE_MUTATE",
-		},
-		{
-			name:          "$prompt write README.md",
-			input:         "$prompt write README.md with project description",
-			wantFastTrack: true,
-			wantFile:      "readme.md",
-			wantTaskType:  "FILE_MUTATE",
-		},
-		{
-			name:          "rename author in @LICENSE",
-			input:         "$prompt rename author in @LICENSE file into 'Jay JR'",
-			wantFastTrack: true,
-			wantFile:      "LICENSE",
-			wantTaskType:  "FILE_MUTATE",
-		},
+		// ── TRIVIAL MUTATIONS: typo fixes ──────────────────────────────
 		{
 			name:          "$prompt fix typo in @README.md",
 			input:         "$prompt fix typo in @README.md",
 			wantFastTrack: true,
 			wantFile:      "README.md",
-			wantTaskType:  "FILE_MUTATE",
-		},
-		{
-			name:          "$prompt update @.env with new key",
-			input:         "$prompt update @.env with new API key",
-			wantFastTrack: true,
-			wantFile:      ".env",
-			wantTaskType:  "FILE_MUTATE",
-		},
-
-		// ── /plan prefix tests ────────────────────────────────────────
-		{
-			name:          "/plan update README.md",
-			input:         "/plan update README.md with install instructions",
-			wantFastTrack: true,
-			wantFile:      "readme.md",
 			wantTaskType:  "FILE_MUTATE",
 		},
 		{
@@ -71,36 +27,11 @@ func TestClassifyDirectMutation(t *testing.T) {
 			wantFile:      "CONTRIBUTING.md",
 			wantTaskType:  "FILE_MUTATE",
 		},
-
-		// ── Direct mutation verbs with @refs ─────────────────────────
-		{
-			name:          "rename @LICENSE",
-			input:         "rename @LICENSE to LICENSE.md",
-			wantFastTrack: true,
-			wantFile:      "LICENSE",
-			wantTaskType:  "FILE_MUTATE",
-		},
-		{
-			name:          "update @config.yml",
-			input:         "update @config.yml debug to true",
-			wantFastTrack: true,
-			wantFile:      "config.yml",
-			wantTaskType:  "FILE_MUTATE",
-		},
 		{
 			name:          "fix typo in @CHANGELOG.md",
 			input:         "fix typo in @CHANGELOG.md at line 42",
 			wantFastTrack: true,
 			wantFile:      "CHANGELOG.md",
-			wantTaskType:  "FILE_MUTATE",
-		},
-
-		// ── Bare filenames (no @ prefix) ─────────────────────────────
-		{
-			name:          "update LICENSE file",
-			input:         "update LICENSE file with new year",
-			wantFastTrack: true,
-			wantFile:      "license",
 			wantTaskType:  "FILE_MUTATE",
 		},
 		{
@@ -109,6 +40,102 @@ func TestClassifyDirectMutation(t *testing.T) {
 			wantFastTrack: true,
 			wantFile:      "readme.md",
 			wantTaskType:  "FILE_MUTATE",
+		},
+
+		// ── TRIVIAL MUTATIONS: rename on doc files ────────────────────
+		{
+			name:          "rename @LICENSE",
+			input:         "rename @LICENSE to LICENSE.md",
+			wantFastTrack: true,
+			wantFile:      "LICENSE",
+			wantTaskType:  "FILE_MUTATE",
+		},
+		{
+			name:          "rename author in @LICENSE (via $prompt)",
+			input:         "$prompt rename author in @LICENSE file into 'Jay JR'",
+			wantFastTrack: true,
+			wantFile:      "LICENSE",
+			wantTaskType:  "FILE_MUTATE",
+		},
+
+		// ── TRIVIAL MUTATIONS: correct/format on doc files ───────────
+		{
+			name:          "correct @CHANGELOG.md",
+			input:         "correct @CHANGELOG.md",
+			wantFastTrack: true,
+			wantFile:      "CHANGELOG.md",
+			wantTaskType:  "FILE_MUTATE",
+		},
+		{
+			name:          "capitalize @README.md",
+			input:         "capitalize @README.md",
+			wantFastTrack: true,
+			wantFile:      "README.md",
+			wantTaskType:  "FILE_MUTATE",
+		},
+		{
+			name:          "format @.env",
+			input:         "format @.env",
+			wantFastTrack: true,
+			wantFile:      ".env",
+			wantTaskType:  "FILE_MUTATE",
+		},
+
+		// ── NOT fast-track: non-trivial mutations on doc files ───────
+		{
+			name:          "$prompt create MIT LICENSE",
+			input:         "$prompt i want to create the MIT LICENSE with author named 'Maha JR' and the years 2026",
+			wantFastTrack: false,
+		},
+		{
+			name:          "$prompt generate @LICENSE",
+			input:         "$prompt generate @LICENSE with Apache 2.0",
+			wantFastTrack: false,
+		},
+		{
+			name:          "$prompt write README.md",
+			input:         "$prompt write README.md with project description",
+			wantFastTrack: false,
+		},
+		{
+			name:          "$prompt update @.env with new key",
+			input:         "$prompt update @.env with new API key",
+			wantFastTrack: false,
+		},
+		{
+			name:          "/plan update README.md",
+			input:         "/plan update README.md with install instructions",
+			wantFastTrack: false,
+		},
+		{
+			name:          "update @config.yml",
+			input:         "update @config.yml debug to true",
+			wantFastTrack: false,
+		},
+		{
+			name:          "update LICENSE file",
+			input:         "update LICENSE file with new year",
+			wantFastTrack: false,
+		},
+		{
+			name:          "add to @.gitignore",
+			input:         "add *.log to @.gitignore",
+			wantFastTrack: false,
+		},
+		{
+			name:          "remove from @.editorconfig",
+			input:         "remove indent_size from @.editorconfig",
+			wantFastTrack: false,
+		},
+		{
+			name:          "update @Dockerfile",
+			input:         "update @Dockerfile to use golang 1.22",
+			wantFastTrack: false,
+		},
+		{
+			name:          "multiple doc files",
+			input:         "update @README.md and @CHANGELOG.md",
+			wantFastTrack: false,
 		},
 
 		// ── NOT fast-track: diagnostic intent ────────────────────────
@@ -173,45 +200,28 @@ func TestClassifyDirectMutation(t *testing.T) {
 			input:         "$prompt hello world",
 			wantFastTrack: false,
 		},
-
-		// ── Add / remove / delete on doc files ──────────────────────
 		{
-			name:          "add to @.gitignore",
-			input:         "add *.log to @.gitignore",
-			wantFastTrack: true,
-			wantFile:      ".gitignore",
-			wantTaskType:  "FILE_MUTATE",
-		},
-		{
-			name:          "remove from @.editorconfig",
-			input:         "remove indent_size from @.editorconfig",
-			wantFastTrack: true,
-			wantFile:      ".editorconfig",
-			wantTaskType:  "FILE_MUTATE",
+			name:          "fix typo on code file (not doc)",
+			input:         "fix typo in @main.go",
+			wantFastTrack: false,
 		},
 
-		// ── Dockerfile support ──────────────────────────────────────
-		{
-			name:          "update @Dockerfile",
-			input:         "update @Dockerfile to use golang 1.22",
-			wantFastTrack: true,
-			wantFile:      "Dockerfile",
-			wantTaskType:  "FILE_MUTATE",
-		},
-
-		// ── Multiple @refs — only first file used ───────────────────
-		{
-			name:          "multiple doc files",
-			input:         "update @README.md and @CHANGELOG.md",
-			wantFastTrack: true,
-			wantFile:      "README.md",
-			wantTaskType:  "FILE_MUTATE",
-		},
-
-		// ── Mixed code + doc refs — NOT fast-track ─────────────────
+		// ── NOT fast-track: multi-file ──────────────────────────────
 		{
 			name:          "mixed code and doc refs",
 			input:         "update @main.go and @README.md",
+			wantFastTrack: false,
+		},
+
+		// ── NOT fast-track: frontend UI tasks ────────────────────────
+		{
+			name:          "frontend UI - move nav",
+			input:         "move navigation to the top of the webpage",
+			wantFastTrack: false,
+		},
+		{
+			name:          "frontend UI - fix css layout",
+			input:         "fix the css layout for the header component",
 			wantFastTrack: false,
 		},
 	}
@@ -237,21 +247,16 @@ func TestClassifyDirectMutation(t *testing.T) {
 	}
 }
 
-func TestClassifyDirectMutation_FileDetection(t *testing.T) {
+func TestClassifyDirectMutation_TrivialFileDetection(t *testing.T) {
 	tests := []struct {
 		name  string
 		input string
 		file  string
 	}{
-		{"proto file", "update @api.proto", "api.proto"},
-		{"graphql file", "fix typo in @schema.graphql", "schema.graphql"},
-		{"sql file", "update @migration.sql", "migration.sql"},
-		{"toml file", "change @config.toml", "config.toml"},
-		{"ini file", "edit @settings.ini", "settings.ini"},
-		{"svg file", "update @logo.svg", "logo.svg"},
-		{"sh file", "fix @deploy.sh", "deploy.sh"},
-		{"html file", "update @index.html", "index.html"},
-		{"css file", "fix @style.css", "style.css"},
+		{"typo fix on graphql", "fix typo in @schema.graphql", "schema.graphql"},
+		{"rename proto file", "rename @api.proto to v2.proto", "api.proto"},
+		{"correct toml file", "correct @config.toml", "config.toml"},
+		{"format ini file", "format @settings.ini", "settings.ini"},
 	}
 
 	for _, tc := range tests {
@@ -280,6 +285,8 @@ func TestClassifyDirectMutation_NoFalsePositives(t *testing.T) {
 		"test is failing",
 		"undefined symbol Log",
 		"what does this code do",
+		"move the sidebar to the left",
+		"position header above navigation",
 	}
 
 	for _, input := range inputs {
@@ -292,30 +299,16 @@ func TestClassifyDirectMutation_NoFalsePositives(t *testing.T) {
 	}
 }
 
-func TestClassifyDirectMutation_VerbDetection(t *testing.T) {
-	verbs := []string{
+func TestClassifyDirectMutation_TrivialVerbDetection(t *testing.T) {
+	// These trivial verbs should still fast-track on doc files.
+	trivialVerbs := []string{
 		"rename",
-		"update",
-		"change",
-		"modify",
-		"replace",
-		"set",
-		"add",
-		"remove",
-		"delete",
-		"bump",
 		"format",
 		"correct",
 		"capitalize",
-		"create",
-		"generate",
-		"make",
-		"write",
-		"touch",
-		"init",
 	}
 
-	for _, v := range verbs {
+	for _, v := range trivialVerbs {
 		t.Run(v, func(t *testing.T) {
 			input := v + " @README.md"
 			target, ok := ClassifyDirectMutation(input)
@@ -325,6 +318,37 @@ func TestClassifyDirectMutation_VerbDetection(t *testing.T) {
 			}
 			if target.File != "README.md" {
 				t.Errorf("ClassifyDirectMutation(%q) file = %q, want README.md", input, target.File)
+			}
+		})
+	}
+}
+
+func TestClassifyDirectMutation_NonTrivialVerbDetection(t *testing.T) {
+	// These verbs should NOT fast-track under the new strict policy.
+	nonTrivialVerbs := []string{
+		"update",
+		"change",
+		"modify",
+		"replace",
+		"set",
+		"add",
+		"remove",
+		"delete",
+		"bump",
+		"create",
+		"generate",
+		"make",
+		"write",
+		"touch",
+		"init",
+	}
+
+	for _, v := range nonTrivialVerbs {
+		t.Run(v, func(t *testing.T) {
+			input := v + " @README.md"
+			_, ok := ClassifyDirectMutation(input)
+			if ok {
+				t.Errorf("ClassifyDirectMutation(%q) = true, want false (non-trivial verb should not fast-track)", input)
 			}
 		})
 	}
@@ -377,5 +401,132 @@ func TestExtractDirectMutationTargets_NoMatch(t *testing.T) {
 	target := ExtractDirectMutationTargets("investigate why the build fails")
 	if len(target) != 0 {
 		t.Errorf("expected no targets for diagnostic input, got %v", target)
+	}
+}
+
+// ── New tests for REFORM features ─────────────────────────────────────────
+
+func TestIsFrontendUI(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"move navigation to the top", true},
+		{"fix the layout of the webpage", true},
+		{"position the header above the nav", true},
+		{"update the css for the sidebar", true},
+		{"make the page responsive", true},
+		{"fix typo in @README.md", false},
+		{"rename @LICENSE", false},
+		{"why is the build failing", false},
+		{"implement the login handler", false},
+		// New patterns: content/duplication and static web assets
+		{"duplicate content", true},
+		{"fix duplicate content", true},
+		{"update index.html", true},
+		{"fix styles.css", true},
+		{"edit script.js", true},
+		{"web asset", true},
+		{"static file", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			if got := IsFrontendUI(tc.input); got != tc.want {
+				t.Errorf("IsFrontendUI(%q) = %v, want %v", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsTrivialMutation(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		// Trivial mutations
+		{"fix typo in @README.md", true},
+		{"fix spelling in @CHANGELOG.md", true},
+		{"rename @LICENSE", true},
+		{"correct @config.yml", true},
+		{"capitalize @README.md", true},
+		{"format @.env", true},
+
+		// Non-trivial: frontend UI tasks
+		{"move navigation to top", false},
+		{"fix the css layout", false},
+		{"position header above nav", false},
+
+		// Non-trivial: non-trivial verbs
+		{"update @README.md", false},
+		{"create @LICENSE", false},
+		{"write @CHANGELOG.md", false},
+		{"add *.log to @.gitignore", false},
+		{"remove from @.editorconfig", false},
+		{"delete @file.txt", false},
+
+		// Non-trivial: code files
+		{"fix typo in @main.go", false},
+
+		// Non-trivial: diagnostic
+		{"why is the build failing", false},
+		{"investigate the crash", false},
+
+		// Edge cases
+		{"", false},
+		{"hello world", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			if got := IsTrivialMutation(tc.input); got != tc.want {
+				t.Errorf("IsTrivialMutation(%q) = %v, want %v", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestClassifyIntentMode_FrontendUIRoutesToPlan(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		// UI tasks → plan (never build)
+		{"move navigation to the top", "plan"},
+		{"fix the css layout for the header", "plan"},
+		{"position the sidebar on the left", "plan"},
+		{"make the webpage responsive", "plan"},
+
+		// Trivial mutations → build
+		{"fix typo in @README.md", "build"},
+		{"rename @LICENSE", "build"},
+		{"correct @CHANGELOG.md", "build"},
+
+		// Diagnostic → investigate
+		{"why is the build failing", "investigate"},
+		{"investigate the crash in main.go", "investigate"},
+		{"fix the bug in @handler.go", "investigate"},
+
+		// Content/duplication and static web asset patterns → plan (via IsFrontendUI)
+		{"duplicate content", "plan"},
+		{"fix duplicate content", "plan"},
+		{"update index.html", "plan"},
+		{"fix styles.css", "plan"},
+		{"edit script.js", "plan"},
+		{"web asset", "plan"},
+		{"static file", "plan"},
+
+		// Non-trivial mutation verbs → plan (new safer default)
+		{"update @config.yml", "plan"},
+		{"create @LICENSE", "plan"},
+		{"write unit test for login", "plan"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			if got := ClassifyIntentMode(tc.input); got != tc.want {
+				t.Errorf("ClassifyIntentMode(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
 	}
 }

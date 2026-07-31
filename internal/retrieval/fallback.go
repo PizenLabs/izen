@@ -10,7 +10,29 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+// FileReadEvent carries real I/O metrics for a file read operation.
+type FileReadEvent struct {
+	File    string
+	Bytes   int64
+	Elapsed time.Duration
+}
+
+// SearchEvent carries real metrics for a search operation.
+type SearchEvent struct {
+	Query   string
+	Hits    int
+	Elapsed time.Duration
+}
+
+// ResolveEvent carries real metrics for a symbol resolution operation.
+type ResolveEvent struct {
+	Symbol  string
+	Hits    int
+	Elapsed time.Duration
+}
 
 type FallbackChain struct {
 	root string
@@ -27,7 +49,9 @@ func (fc *FallbackChain) Glob(pattern string) *ResultSet {
 		globalActivityLog("[system] glob: %s", pattern)
 	}
 
+	globStart := time.Now()
 	matches, err := filepath.Glob(filepath.Join(fc.root, pattern))
+	elapsed := time.Since(globStart)
 	if err != nil {
 		rs.Error = err.Error()
 		if globalActivityLog != nil {
@@ -38,6 +62,9 @@ func (fc *FallbackChain) Glob(pattern string) *ResultSet {
 
 	if globalActivityLog != nil {
 		globalActivityLog("[ OK ] glob: %s (%d matches)", pattern, len(matches))
+	}
+	if globalEventLog != nil {
+		globalEventLog(SearchEvent{Query: "glob:" + pattern, Hits: len(matches), Elapsed: elapsed})
 	}
 
 	for _, m := range matches {
@@ -66,6 +93,7 @@ func (fc *FallbackChain) Ripgrep(pattern string, filePattern string) *ResultSet 
 		globalActivityLog("[system] rg: %s", pattern)
 	}
 
+	rgStart := time.Now()
 	args := []string{"--no-heading", "-n", pattern}
 	if filePattern != "" {
 		args = append(args, "-g", filePattern)
@@ -75,10 +103,14 @@ func (fc *FallbackChain) Ripgrep(pattern string, filePattern string) *ResultSet 
 	cmd.Dir = fc.root
 
 	out, err := cmd.Output()
+	elapsed := time.Since(rgStart)
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			if exitErr.ExitCode() == 1 {
+				if globalEventLog != nil {
+					globalEventLog(SearchEvent{Query: pattern, Hits: 0, Elapsed: elapsed})
+				}
 				return rs
 			}
 		}
@@ -90,6 +122,9 @@ func (fc *FallbackChain) Ripgrep(pattern string, filePattern string) *ResultSet 
 	}
 
 	lines := strings.Split(string(bytes.TrimSpace(out)), "\n")
+	if globalEventLog != nil {
+		globalEventLog(SearchEvent{Query: pattern, Hits: len(lines), Elapsed: elapsed})
+	}
 	for _, line := range lines {
 		if line == "" {
 			continue
@@ -117,14 +152,19 @@ func (fc *FallbackChain) Grep(pattern string) *ResultSet {
 		globalActivityLog("[system] grep: %s", pattern)
 	}
 
+	grepStart := time.Now()
 	cmd := exec.CommandContext(context.Background(), "grep", "-rn", pattern, fc.root)
 	cmd.Dir = fc.root
 
 	out, err := cmd.Output()
+	elapsed := time.Since(grepStart)
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			if exitErr.ExitCode() == 1 {
+				if globalEventLog != nil {
+					globalEventLog(SearchEvent{Query: pattern, Hits: 0, Elapsed: elapsed})
+				}
 				return rs
 			}
 		}
@@ -136,6 +176,9 @@ func (fc *FallbackChain) Grep(pattern string) *ResultSet {
 	}
 
 	lines := strings.Split(string(bytes.TrimSpace(out)), "\n")
+	if globalEventLog != nil {
+		globalEventLog(SearchEvent{Query: pattern, Hits: len(lines), Elapsed: elapsed})
+	}
 	for _, line := range lines {
 		if line == "" {
 			continue
@@ -168,8 +211,10 @@ func (fc *FallbackChain) ReadFile(path string) *ResultSet {
 		globalActivityLog("[system] read file: %s", path)
 	}
 
+	readStart := time.Now()
 	fullPath := filepath.Join(fc.root, path)
 	data, err := os.ReadFile(fullPath)
+	elapsed := time.Since(readStart)
 	if err != nil {
 		rs.Error = err.Error()
 		if globalActivityLog != nil {
@@ -180,6 +225,9 @@ func (fc *FallbackChain) ReadFile(path string) *ResultSet {
 
 	if globalActivityLog != nil {
 		globalActivityLog("[ OK ] read file: %s (%d bytes)", path, len(data))
+	}
+	if globalEventLog != nil {
+		globalEventLog(FileReadEvent{File: path, Bytes: int64(len(data)), Elapsed: elapsed})
 	}
 
 	rs.Add(Score(ConfText, Result{
@@ -207,6 +255,7 @@ func (fc *FallbackChain) ReadLines(path string, startLine, endLine int) *ResultS
 		globalActivityLog("[system] read file: %s (lines %d-%d)", path, startLine, endLine)
 	}
 
+	readStart := time.Now()
 	fullPath := filepath.Join(fc.root, path)
 	file, err := os.Open(fullPath)
 	if err != nil {
@@ -228,6 +277,10 @@ func (fc *FallbackChain) ReadLines(path string, startLine, endLine int) *ResultS
 		}
 		content.WriteString(scanner.Text())
 		content.WriteString("\n")
+	}
+	elapsed := time.Since(readStart)
+	if globalEventLog != nil {
+		globalEventLog(FileReadEvent{File: path, Bytes: int64(content.Len()), Elapsed: elapsed})
 	}
 
 	rs.Add(Score(ConfText, Result{

@@ -503,6 +503,7 @@ func sanitizeCtxID(id string) string {
 }
 
 func (pm *PatchManager) Apply(patch *Patch) error {
+	patchStartTime := time.Now()
 	if err := checkAuthorization(pm.auth); err != nil {
 		if globalActivityLog != nil {
 			globalActivityLog("[FAIL] patch rejected on %s: %v", patch.File, err)
@@ -620,6 +621,10 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 			lineCount := len(strings.Split(patch.Modified, "\n"))
 			globalActivityLog("[ OK ] created file %s (%d lines) via FILE_CREATE", patch.File, lineCount)
 		}
+		if globalEventLog != nil {
+			lineCount := len(strings.Split(patch.Modified, "\n"))
+			globalEventLog(FileMutateEvent{File: patch.File, LinesAdd: lineCount, LinesDel: 0, Elapsed: time.Since(patchStartTime)})
+		}
 		patch.ContextID = pm.contextID
 		patch.Applied = true
 		if err := pm.appendMutationLog(patch.File, patch.ID); err != nil {
@@ -635,6 +640,30 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	// unrelated files within a single code block.
 	diffInput := SplitAndFilterPatches(patch.Modified, patch.File)
 
+	var final string
+	var patchErr error
+
+	// ── FULL-REWRITE EARLY EXIT ──────────────────────────────────────────
+	// When the caller explicitly marks this patch as IsFullRewrite (e.g. after
+	// SEARCH/REPLACE and unified diff both failed across multiple retries),
+	// skip all diff/SEARCH/REPLACE strategies and write the modified content
+	// directly. This is the last resort for small models that cannot produce
+	// well-formed patch blocks.
+	if patch.IsFullRewrite && patch.Original != "" {
+		clean := SanitizeDiffContent(diffInput)
+		if strings.TrimSpace(clean) == "" {
+			return fmt.Errorf("full rewrite for %s: empty content", patch.File)
+		}
+		if reason := IsTruncatedOutput(clean); reason != "" {
+			return fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
+		}
+		if globalActivityLog != nil {
+			globalActivityLog("[patch] Full rewrite bypass for %s (%d bytes)", patch.File, len(clean))
+		}
+		final = clean
+		goto commitWrite
+	}
+
 	// ── FAIL-FAST: reject ambiguous snippets against existing files ──────
 	// If the file exists and the payload contains no SEARCH/REPLACE markers
 	// and no unified diff headers and is significantly smaller than the
@@ -648,9 +677,6 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		}
 		return fmt.Errorf("%w: ambiguous snippet without SEARCH/REPLACE markers for existing file %s — retry with SEARCH/REPLACE block or unified diff", ErrInvalidPatchFormat, patch.File)
 	}
-
-	var final string
-	var patchErr error
 
 	switch {
 	case strings.Contains(diffInput, "@@"):
@@ -679,6 +705,20 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 				if globalActivityLog != nil {
 					globalActivityLog("[patch] Content block fallback succeeded for %s", patch.File)
 				}
+				break
+			}
+			// ── FULL-REWRITE FALLBACK ─────────────────────────────────
+			// Both unified diff and SEARCH/REPLACE strategies failed for
+			// a patch that contains @@ hunk headers. Before giving up, try
+			// treating the entire sanitized content as a full file rewrite.
+			// This handles the case where the LLM output is a mangled diff
+			// that cannot be parsed as hunks but still contains the intended
+			// complete file content.
+			if !isTruncated(patch.Original, clean) {
+				if globalActivityLog != nil {
+					globalActivityLog("[patch] Diff and SEARCH/REPLACE failed on %s — falling back to full-content write (%d bytes)", patch.File, len(clean))
+				}
+				final = clean
 				break
 			}
 			if globalActivityLog != nil {
@@ -722,6 +762,32 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		// where the LLM produced the full file content directly.
 		if reason := IsTruncatedOutput(final); reason != "" {
 			return fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
+		}
+	}
+
+commitWrite:
+
+	// ── DESTRUCTION GUARDRAIL (DEFENSE IN DEPTH) ──────────────────────
+	// Only reject a patch if the result is effectively a file wipe:
+	// 1. The resulting content is empty (zero bytes or only whitespace), OR
+	// 2. Deletion ratio exceeds 90% AND the remaining content is fewer than
+	//    5 lines. This allows legitimate deduplication edits (e.g. removing
+	//    132/162 lines) while still catching actual file wipes.
+	if patch.Original != "" && final != "" {
+		origCount := len(strings.Split(patch.Original, "\n"))
+		finalCount := len(strings.Split(final, "\n"))
+		removed := origCount - finalCount
+
+		isEmpty := strings.TrimSpace(final) == ""
+		isNearWipe := origCount > 0 && float64(removed)/float64(origCount) > 0.9 && finalCount < 5
+
+		if (isEmpty || isNearWipe) && !patch.IsFullRewrite {
+			if globalActivityLog != nil {
+				globalActivityLog("[FAIL] DESTRUCTIVE_PATCH_REJECTED on %s: removes %d/%d lines (final: %d) — refusing total wipe",
+					patch.File, removed, origCount, finalCount)
+			}
+			return fmt.Errorf("DESTRUCTIVE_PATCH_REJECTED: proposed patch for %s removes %d/%d lines (final: %d lines) — refusing to wipe file",
+				patch.File, removed, origCount, finalCount)
 		}
 	}
 
@@ -814,6 +880,30 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 
 	if globalActivityLog != nil {
 		globalActivityLog("[ OK ] patched %s (%s)", patch.File, detail)
+	}
+	if globalEventLog != nil {
+		// Compute accurate diff metrics from actual unified diff output,
+		// not from raw line count deltas. This ensures the ActivityTree
+		// always shows correct (+N / -M) counters.
+		added, removed := countUnifiedDiffLines(patch.Modified)
+		if added == 0 && removed == 0 {
+			// Fallback: compare total line counts when no unified diff is present.
+			origLines := 0
+			newLines := 0
+			if patch.Original != "" {
+				origLines = len(strings.Split(patch.Original, "\n")) - 1
+			}
+			if final != "" {
+				newLines = len(strings.Split(final, "\n")) - 1
+			}
+			added = newLines - origLines
+			removed = 0
+			if added < 0 {
+				removed = -added
+				added = 0
+			}
+		}
+		globalEventLog(FileMutateEvent{File: patch.File, LinesAdd: added, LinesDel: removed, Elapsed: time.Since(patchStartTime)})
 	}
 
 	patch.ContextID = pm.contextID
@@ -1085,6 +1175,10 @@ func firstNonEmptyLine(block string) string {
 // For each candidate position it compares line-by-line and picks the one with
 // the highest match count. The replacement is applied if at least one line
 // matches. This mitigates delta drifting caused by AST skeleton pruning.
+//
+// When exact line matching yields zero matches across all positions, it
+// falls back to whitespace-normalized comparison (strings.TrimSpace per line)
+// to handle indentation/whitespace drift common in 7B model outputs.
 func fuzzyMatchHunk(current string, hunk diffHunk) (string, bool) {
 	if current == "" || hunk.oldBlock == "" {
 		return "", false
@@ -1131,6 +1225,10 @@ func fuzzyMatchHunk(current string, hunk diffHunk) (string, bool) {
 		return "", false
 	}
 
+	// Phase 1: exact line matching with blank-line normalization.
+	// Blank lines (empty after trimming) are treated as equivalent
+	// regardless of trailing whitespace, preventing context mismatches
+	// around closing HTML tags and similar structures.
 	bestPos := -1
 	bestScore := 0
 
@@ -1138,6 +1236,8 @@ func fuzzyMatchHunk(current string, hunk diffHunk) (string, bool) {
 		score := 0
 		for i := 0; i < len(oldLines); i++ {
 			if lines[pos+i] == oldLines[i] {
+				score++
+			} else if strings.TrimSpace(lines[pos+i]) == "" && strings.TrimSpace(oldLines[i]) == "" {
 				score++
 			}
 		}
@@ -1147,16 +1247,45 @@ func fuzzyMatchHunk(current string, hunk diffHunk) (string, bool) {
 		}
 	}
 
-	if bestScore == 0 {
-		return "", false
+	if bestScore > 0 {
+		result := make([]string, 0, len(lines)-len(oldLines)+len(newLines))
+		result = append(result, lines[:bestPos]...)
+		result = append(result, newLines...)
+		result = append(result, lines[bestPos+len(oldLines):]...)
+		return strings.Join(result, "\n"), true
 	}
 
-	result := make([]string, 0, len(lines)-len(oldLines)+len(newLines))
-	result = append(result, lines[:bestPos]...)
-	result = append(result, newLines...)
-	result = append(result, lines[bestPos+len(oldLines):]...)
+	// Phase 2: whitespace-normalized fuzzy match
+	// Strips leading/trailing whitespace from each line before comparing.
+	// Blank lines (empty after trimming) are always considered equal.
+	// Handles indentation drift in 7B model outputs where search blocks
+	// have minor whitespace differences from the actual file content.
+	trimmedOld := make([]string, len(oldLines))
+	for j, l := range oldLines {
+		trimmedOld[j] = strings.TrimSpace(l)
+	}
+	for pos := lo; pos <= hi; pos++ {
+		allMatch := true
+		for i := 0; i < len(oldLines); i++ {
+			trimmedFile := strings.TrimSpace(lines[pos+i])
+			if trimmedFile == "" && trimmedOld[i] == "" {
+				continue
+			}
+			if trimmedFile != trimmedOld[i] {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			result := make([]string, 0, len(lines)-len(oldLines)+len(newLines))
+			result = append(result, lines[:pos]...)
+			result = append(result, newLines...)
+			result = append(result, lines[pos+len(oldLines):]...)
+			return strings.Join(result, "\n"), true
+		}
+	}
 
-	return strings.Join(result, "\n"), true
+	return "", false
 }
 
 func applyUnifiedPatch(original, diff string) (string, error) {
@@ -1244,10 +1373,14 @@ func applySearchReplaceBlock(original, modified string) (string, bool) {
 	}
 
 	// Try to find the modified block as a contiguous sequence within origLines.
+	// Blank lines (empty after trimming) are treated as equivalent.
 	for i := 0; i <= len(origLines)-len(modLines); i++ {
 		match := true
 		for j := 0; j < len(modLines); j++ {
 			if origLines[i+j] != modLines[j] {
+				if strings.TrimSpace(origLines[i+j]) == "" && strings.TrimSpace(modLines[j]) == "" {
+					continue
+				}
 				match = false
 				break
 			}
@@ -1256,6 +1389,36 @@ func applySearchReplaceBlock(original, modified string) (string, bool) {
 			// Found the block — return original unchanged (the content is
 			// already identical, no replacement needed).
 			return original, true
+		}
+	}
+
+	// Strategy 3: whitespace-normalized fuzzy match.
+	// Strip leading/trailing whitespace from each line and compare.
+	// Blank lines (empty after trimming) are always considered equal.
+	// If the search block matches after normalization, replace the matching
+	// region while preserving the target file's base indentation.
+	trimmedMod := make([]string, len(modLines))
+	for j, l := range modLines {
+		trimmedMod[j] = strings.TrimSpace(l)
+	}
+	for i := 0; i <= len(origLines)-len(modLines); i++ {
+		match := true
+		for j := 0; j < len(modLines); j++ {
+			trimmedFile := strings.TrimSpace(origLines[i+j])
+			if trimmedFile == "" && trimmedMod[j] == "" {
+				continue
+			}
+			if trimmedFile != trimmedMod[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			result := make([]string, 0, len(origLines)-len(modLines)+len(modLines))
+			result = append(result, origLines[:i]...)
+			result = append(result, modLines...)
+			result = append(result, origLines[i+len(modLines):]...)
+			return strings.Join(result, "\n"), true
 		}
 	}
 
@@ -1498,6 +1661,7 @@ func ApplySearchReplaceBlocks(original string, blocks []searchReplaceBlock) (str
 		}
 
 		// Strategy 2: line-by-line exact contiguous match
+		// Blank lines (empty after trimming) are treated as equivalent.
 		origLines := strings.Split(current, "\n")
 		searchLines := strings.Split(block.search, "\n")
 		replaceLines := strings.Split(block.replace, "\n")
@@ -1507,6 +1671,9 @@ func ApplySearchReplaceBlocks(original string, blocks []searchReplaceBlock) (str
 				match := true
 				for j := 0; j < len(searchLines); j++ {
 					if origLines[i+j] != searchLines[j] {
+						if strings.TrimSpace(origLines[i+j]) == "" && strings.TrimSpace(searchLines[j]) == "" {
+							continue
+						}
 						match = false
 						break
 					}
@@ -1527,6 +1694,7 @@ func ApplySearchReplaceBlocks(original string, blocks []searchReplaceBlock) (str
 
 			// Strategy 3: whitespace-normalized fuzzy match
 			// Trim each line of both search and original, then compare.
+			// Blank lines (empty after trimming) are always considered equal.
 			// This handles indentation/whitespace drift between the model's
 			// SEARCH block and the actual file content.
 			trimmedSearch := make([]string, len(searchLines))
@@ -1536,7 +1704,11 @@ func ApplySearchReplaceBlocks(original string, blocks []searchReplaceBlock) (str
 			for i := 0; i <= len(origLines)-len(searchLines); i++ {
 				match := true
 				for j := 0; j < len(searchLines); j++ {
-					if strings.TrimSpace(origLines[i+j]) != trimmedSearch[j] {
+					trimmedFile := strings.TrimSpace(origLines[i+j])
+					if trimmedFile == "" && trimmedSearch[j] == "" {
+						continue
+					}
+					if trimmedFile != trimmedSearch[j] {
 						match = false
 						break
 					}
@@ -1569,6 +1741,32 @@ func ApplySearchReplaceBlocks(original string, blocks []searchReplaceBlock) (str
 	}
 
 	return current, true
+}
+
+// countUnifiedDiffLines counts added (+) and removed (-) lines in a unified
+// diff string, excluding header lines (---, +++, @@). Returns zero when the
+// input is not a unified diff (e.g. SEARCH/REPLACE or full content).
+func countUnifiedDiffLines(diff string) (added, removed int) {
+	if diff == "" {
+		return 0, 0
+	}
+	hasHunk := false
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "@@") {
+			hasHunk = true
+			continue
+		}
+		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			added++
+		} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+			removed++
+		}
+	}
+	if !hasHunk {
+		// Not a unified diff — return zero (caller falls back to line-count delta).
+		return 0, 0
+	}
+	return
 }
 
 func isTruncated(original, modified string) bool {

@@ -31,6 +31,7 @@ import (
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 	verification "github.com/PizenLabs/izen/internal/verification"
+	"github.com/PizenLabs/izen/pkg/control"
 )
 
 // Init initializes the spinner tick, pro tip rotation, and text input blink.
@@ -411,22 +412,28 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleSystem, "Investigation complete — no structured findings to report.")
 		}
 
-		// ── AUTO-HANDOFF: /investigate -> /build (mutation) or /plan (diagnostic) ──
-		// When the investigate engine short-circuited with a code mutation intent
-		// ("code mutation intent detected — hand off to build"), route directly to
-		// /build to skip the plan synthesis step entirely. Synthesize build tasks
-		// from the investigation session key (original intent) so the build engine
-		// receives a structured mutation prompt instead of freezing. For bug diagnostics,
-		// route to /plan as normal.
+		// ── AUTO-HANDOFF: /investigate -> /plan or /build ─────────────────
+		// REFORM RULES:
+		//   - FRONTEND_UI intent ("hand off to plan") → route to /plan (enforces
+		//     Layer 3 Hybrid Search — AST + CSS/DOM inspection — before edits).
+		//   - Code mutation intent ("hand off to build") → route directly to /build
+		//     (short-circuits plan for known mutation patterns).
+		//   - Bug diagnostics → route to /plan as normal (full forensic → plan synthesis).
 		var cmds []tea.Cmd
-		if strings.Contains(m.handoffLedgerContent, "code mutation intent detected") {
+		switch {
+		case strings.Contains(m.handoffLedgerContent, "hand off to plan"):
+			m.push(roleStatus, "Frontend UI intent — routing to /plan for CSS/AST inspection")
+			m.modeChangeAuthorized = true
+			m.handoffCtx.ProposedFix = m.handoffLedgerContent
+			cmds = append(cmds, m.setMode(modes.ModePlan))
+		case strings.Contains(m.handoffLedgerContent, "code mutation intent detected"):
 			m.push(roleStatus, "Code mutation intent — routing directly to /build, bypassing /plan")
 			m.modeChangeAuthorized = true
 			// Synthesize pending todos from the investigation content so the
 			// build auto-trigger in setMode finds work to do immediately.
 			m.handoffCtx.PendingTodos = synthesizeBuildTodosFromMutation(msg.sessionKey)
 			cmds = append(cmds, m.setMode(modes.ModeBuild))
-		} else {
+		default:
 			m.push(roleStatus, "Investigation complete. Auto-transitioning to /plan for execution synthesis...")
 			m.handoffCtx.ProposedFix = m.handoffLedgerContent
 			if m.handoffLedgerContent != "" {
@@ -472,6 +479,31 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
 			return m, flush
+		}
+
+		// ── SCOPE GUARD FINAL VALIDATION ───────────────────────────────────
+		// Hard validation interceptor before staging: if the plan engine has a
+		// grounded allowed file tree, verify every FILE_MUTATE/ATOMIC_REPLACE/
+		// DIFF_PATCH task targets an allowed file. Rejected plans are surfaced
+		// as a system activity (dimmed) log so the user sees the scope boundary
+		// enforcement in real-time.
+		if m.planEngine != nil && len(m.planEngine.AllowedFiles) > 0 {
+			scopeTasks := make([]control.TaskTarget, len(msg.Tasks))
+			for i, t := range msg.Tasks {
+				scopeTasks[i] = control.TaskTarget{Target: t.Target, Type: t.Type}
+			}
+			if scopeErr := control.ValidateStagedPlan(scopeTasks, m.planEngine.AllowedFiles); scopeErr != nil {
+				var sv *control.ScopeViolationError
+				if errors.As(scopeErr, &sv) {
+					m.logActivity("[ScopeGuard] Rejected target %s - Not in workspace tree", sv.TargetString())
+					m.logActivity("[ScopeGuard] Allowed files: %s", sv.AllowedString())
+					m.push(roleError, fmt.Sprintf("Plan rejected: target %q is not in the workspace file tree", sv.TargetString()))
+					m.refreshViewportContent()
+					m.Viewport.GotoBottom()
+					flush := m.flushPendingRecords()
+					return m, flush
+				}
+			}
 		}
 
 		m.sess.StageTaskList(&msg.Tasks)
@@ -1615,12 +1647,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		}
 
-		if len(m.streamBuffer) > 0 {
-			// Extract reasoning content (sentinels + <think> tags) before
-			// emitting to the visible content buffer.
-			m.extractReasoningContent()
-
-			// Emit word-aligned chunks for a natural reading rhythm.
+		// ── FRAME-THROTTLED FLUSH ──────────────────────────────────────
+		// Prefer flushing from the StreamThrottle (16ms frame interval / 60FPS).
+		// Falls back to direct streamBuffer for non-throttle paths.
+		emitContent := ""
+		flushOk := false
+		if m.streamThrottle != nil {
+			emitContent, flushOk = m.streamThrottle.Flush()
+		}
+		if !flushOk && len(m.streamBuffer) > 0 {
+			// Legacy fallback: emit directly from streamBuffer.
 			emit := 0
 			minChars := 3
 			for i, c := range m.streamBuffer {
@@ -1634,14 +1670,26 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 			if emit > 80 {
 				emit = 80
-				// Walk back to the start of the current UTF-8 rune to avoid
-				// splitting a multi-byte character.
 				for emit > 0 && !utf8.RuneStart(m.streamBuffer[emit]) {
 					emit--
 				}
 			}
-			m.currentStreamContent += m.streamBuffer[:emit]
+			emitContent = m.streamBuffer[:emit]
 			m.streamBuffer = m.streamBuffer[emit:]
+		}
+		if emitContent != "" {
+			// Extract reasoning content before adding to visible buffer.
+			m.streamBuffer += emitContent
+			m.extractReasoningContent()
+			m.streamBuffer = ""
+
+			// ── LIVE THOUGHT STREAM ─────────────────────────────────
+			if m.thoughtStream != nil && m.reasoningBuffer.Len() > 0 {
+				reasoning := m.reasoningBuffer.String()
+				m.thoughtStream.Append(reasoning)
+			}
+
+			m.currentStreamContent += emitContent
 		}
 
 		// Refresh viewport with streaming content.
@@ -1693,9 +1741,19 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// by the streamDoneMsg handler below. Holding a ledger lock here would
 		// serialize the stream against the renderer and reproduce the
 		// 108-token freeze.
+		//
+		// FRAME-THROTTLED EMISSION: raw token chunks are written through the
+		// StreamThrottle which enforces a 16ms (≈60FPS) minimum frame interval.
+		// The smoothStreamTick handler then flushes word-aligned content from
+		// the throttle buffer instead of draining streamBuffer directly. This
+		// eliminates layout snapping caused by dumping raw buffer chunks.
 		raw := string(msg)
 		m.responseBuffer.WriteString(raw)
-		m.streamBuffer += raw
+		if m.streamThrottle != nil {
+			m.streamThrottle.Write(raw)
+		} else {
+			m.streamBuffer += raw
+		}
 		if m.streamParser != nil {
 			m.streamParser.ProcessChunk(raw)
 		}
@@ -3179,6 +3237,10 @@ func synthesizeBuildTodosFromMutation(content string) []string {
 	}
 
 	// Generic fallback: single FILE_MUTATE task captures the full mutation intent.
-	todos = append(todos, "\uf05c [FILE_MUTATE] workspace — Create or modify files as described: "+strings.TrimSpace(content))
+	// NOTE: target is intentionally a descriptive label, NOT a file path — the
+	// build engine will resolve the actual file path via LLM synthesis. Using
+	// placeholder strings like "workspace" as the target is FORBIDDEN because
+	// the build parser would interpret it as a literal file path.
+	todos = append(todos, "\uf05c [FILE_MUTATE] [resolve] — Create or modify files as described: "+strings.TrimSpace(content))
 	return todos
 }

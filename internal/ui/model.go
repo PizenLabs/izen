@@ -33,6 +33,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/project"
+	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
@@ -944,6 +945,15 @@ type model struct {
 	// Realtime thinking/reasoning panel
 	thinkingPanel *ThinkingPanel
 
+	// Live thought stream — auto-dimmed rendering during streaming
+	thoughtStream *ThoughtStream
+
+	// Activity tree — structured tool call logging
+	activityTree *ActivityTree
+
+	// Stream throttle — frame-bounded token emission
+	streamThrottle *StreamThrottle
+
 	// Live code preview for streaming tool call arguments
 	liveCodePreview *LiveCodePreview
 
@@ -1069,7 +1079,9 @@ func (m *model) setApplyError(text string) {
 // logActivity appends a system activity record and forces an immediate
 // viewport redraw so the user sees every internal tool invocation in
 // real time — even during streaming (bypasses the PreRenderedHistory
-// streaming freeze).
+// streaming freeze). ActivityTree entries are NOT populated here —
+// they are fed directly from the engine via handleEngineEvent for
+// typed events with real I/O metrics.
 func (m *model) logActivity(format string, args ...interface{}) {
 	msg := sanitizeIngressANSI(fmt.Sprintf(format, args...))
 	r := record{role: roleActivity, text: msg}
@@ -1083,6 +1095,59 @@ func (m *model) logActivity(format string, args ...interface{}) {
 	m.refreshViewportContent()
 	if m.Ready && !m.userIsScrollingUp {
 		m.Viewport.GotoBottom()
+	}
+}
+
+// handleEngineEvent receives typed event payloads from the execution
+// and retrieval packages and appends them to the ActivityTree. This is the
+// ONLY path that populates ActivityTree — no string-parsing, no hardcoded
+// entries. The event interface{} is type-asserted to known struct types
+// from each engine package and converted to the canonical EngineEvent.
+func (m *model) handleEngineEvent(ev interface{}) {
+	if m.activityTree == nil {
+		return
+	}
+	// Type-assert to known event structs from engine packages.
+	switch e := ev.(type) {
+	case retrieval.FileReadEvent:
+		m.activityTree.Append(EngineEvent{
+			Kind: EventFileRead,
+			Time: time.Now(),
+			FileRead: &FileReadEvent{
+				File:    e.File,
+				Bytes:   e.Bytes,
+				Elapsed: e.Elapsed,
+			},
+		})
+	case retrieval.SearchEvent:
+		m.activityTree.Append(EngineEvent{
+			Kind: EventSearch,
+			Time: time.Now(),
+			Search: &SearchEvent{
+				Query: e.Query,
+				Hits:  e.Hits,
+			},
+		})
+	case retrieval.ResolveEvent:
+		m.activityTree.Append(EngineEvent{
+			Kind: EventResolve,
+			Time: time.Now(),
+			Resolve: &ResolveEvent{
+				Symbol: e.Symbol,
+				Hits:   e.Hits,
+			},
+		})
+	case execution.FileMutateEvent:
+		m.activityTree.Append(EngineEvent{
+			Kind: EventFileMutate,
+			Time: time.Now(),
+			FileMutate: &FileMutateEvent{
+				File:     e.File,
+				LinesAdd: e.LinesAdd,
+				LinesDel: e.LinesDel,
+				Elapsed:  e.Elapsed,
+			},
+		})
 	}
 }
 
@@ -1242,29 +1307,59 @@ func (m *model) cacheRecordToHistory(rec record) {
 
 // renderRecordForViewport renders a single record exactly as the original View()
 // inline loop did — user records get the @username header with right-padding,
-// AI records go through renderAIResponseBlocks, and everything else is raw text.
+// AI records go through renderAIResponseBlocks, and everything else is wrapped
+// per-line to a strict width bound to prevent right-border overflow.
+//
+// Per-line wrapping (not a single pass over the entire text) is critical:
+// multi-line content like the TODO CHECKLIST must preserve its line structure
+// (each checklist item on its own line) rather than being reflowed as one blob.
 func (m *model) renderRecordForViewport(rec record) string {
 	width := m.width
 	if width < 40 {
 		width = 40
 	}
 
+	wrapWidth := width - 4
+	if wrapWidth < 20 {
+		wrapWidth = 20
+	}
+
+	// Sanitize: convert literal \n escape sequences in error/log text
+	// to actual newlines so multi-line messages display correctly.
+	text := strings.ReplaceAll(rec.text, "\\n", "\n")
+
 	switch rec.role {
 	case roleUser:
 		displayName := config.SanitizeUsername(m.userName)
 		userHeader := dimmedStyle.Render("@" + displayName + "  ")
-		paddedText := " " + rec.text
+		paddedText := " " + text
 		padNeeded := width - lipgloss.Width(userHeader) - lipgloss.Width(paddedText) - 1
 		if padNeeded > 0 {
 			paddedText += strings.Repeat(" ", padNeeded)
 		}
 		return userHeader + userBgStyle.Render(paddedText)
 	case roleAI:
-		return m.renderAIResponseBlocks(rec.text, width)
+		return m.renderAIResponseBlocks(text, width)
 	case roleActivity:
-		return m.styleActivityLine(rec.text)
+		var b strings.Builder
+		for _, srcLine := range strings.Split(text, "\n") {
+			wrapped := wrapString(srcLine, wrapWidth)
+			for _, wl := range wrapped {
+				b.WriteString(m.styleActivityLine(wl))
+				b.WriteByte('\n')
+			}
+		}
+		return strings.TrimSuffix(b.String(), "\n")
 	default:
-		return rec.text
+		var b strings.Builder
+		for _, srcLine := range strings.Split(text, "\n") {
+			wrapped := wrapString(srcLine, wrapWidth)
+			for _, wl := range wrapped {
+				b.WriteString(wl)
+				b.WriteByte('\n')
+			}
+		}
+		return strings.TrimSuffix(b.String(), "\n")
 	}
 }
 
@@ -1612,6 +1707,18 @@ func (m *model) refreshViewportContent() {
 			status = m.agentLabel
 		}
 		content.WriteString(sp + " " + infoStyle.Render(status) + "\n")
+	}
+
+	// ── Activity Tree: structured tool call view ──────────────────────
+	// Rendered outside the streaming block so it appears during /build
+	// execution (non-streaming patch proposal) and persists through
+	// approval states. Only renders when the tree has active entries.
+	if m.activityTree != nil {
+		treeView := m.activityTree.Render(m.width)
+		if treeView != "" {
+			content.WriteString(treeView)
+			content.WriteString("\n")
+		}
 	}
 
 	m.Viewport.SetContent(content.String())

@@ -1829,6 +1829,112 @@ func TestRunLXRemotePackageBypass(t *testing.T) {
 	}
 }
 
+// TestClassifyIntent_FrontendUIPatterns verifies that ClassifyIntent correctly
+// identifies content/duplication and static web asset patterns as FRONTEND_UI
+// even when no layout/navigation scope tags are present.
+func TestClassifyIntent_FrontendUIPatterns(t *testing.T) {
+	cases := []struct {
+		text string
+		want Intent
+	}{
+		{"duplicate content", IntentFrontendUI},
+		{"fix duplicate content", IntentFrontendUI},
+		{"fix content duplication", IntentFrontendUI},
+		{"update index.html", IntentFrontendUI},
+		{"fix styles.css", IntentFrontendUI},
+		{"edit script.js", IntentFrontendUI},
+		{"fix style.css", IntentFrontendUI},
+		{"web asset", IntentFrontendUI},
+		{"static file", IntentFrontendUI},
+		// Non-frontend: generic bug keywords must NOT match.
+		{"fix the bug in parser.go", IntentBugRegression},
+		{"undefined symbol Log", IntentBugRegression},
+	}
+	for _, c := range cases {
+		got := ClassifyIntent(c.text)
+		if got != c.want {
+			t.Errorf("ClassifyIntent(%q) = %s, want %s", c.text, got, c.want)
+		}
+	}
+}
+
+// TestShouldShortCircuit_VanillaWebContent verifies that shouldShortCircuit
+// returns shortCircuitToPlan when the workspace is VANILLA_WEB and the problem
+// text references content/duplication or static web asset patterns — even when
+// the intent is BugRegression.
+func TestShouldShortCircuit_VanillaWebContent(t *testing.T) {
+	eng := NewEngine(".", "fix duplicate content", nil, nil)
+	eng.vanillaWeb = true
+	eng.Intent = IntentBugRegression
+
+	target := eng.shouldShortCircuit()
+	if target != shortCircuitToPlan {
+		t.Fatalf("expected shortCircuitToPlan for VANILLA_WEB + 'fix duplicate content', got %q", target)
+	}
+
+	// Non-matching text on VANILLA_WEB should NOT short-circuit (stays BugRegression).
+	eng2 := NewEngine(".", "some generic error message", nil, nil)
+	eng2.vanillaWeb = true
+	eng2.Intent = IntentBugRegression
+	target2 := eng2.shouldShortCircuit()
+	if target2 != shortCircuitNone {
+		t.Fatalf("expected shortCircuitNone for non-matching VANILLA_WEB text, got %q", target2)
+	}
+}
+
+// TestVanillaWebSkipsProbe verifies that forceProbe is skipped entirely when
+// vanillaWeb is true, and the forensicsRan flag is set to true to prevent the
+// post-loop forced-probe fallback from running go test.
+func TestVanillaWebSkipsProbe(t *testing.T) {
+	eng := NewEngine(".", "test", nil, nil)
+	eng.vanillaWeb = true
+
+	eng.forceProbe(context.Background())
+	if !eng.forensicsRan {
+		t.Fatal("expected forensicsRan = true after VANILLA_WEB forceProbe (no-op)")
+	}
+	// No evidence from go test should have been recorded.
+	for _, ev := range eng.Evidence.All() {
+		if strings.Contains(ev.Content, "go test") || strings.Contains(ev.Content, "go.mod") {
+			t.Fatalf("VANILLA_WEB forceProbe should not record Go evidence: %s", ev.Content)
+		}
+	}
+}
+
+// TestVanillaWebSkipsDependencyBlocker verifies that injectDependencyBlocker
+// returns immediately when vanillaWeb is true, even if diagnostics contain
+// Go dependency error patterns.
+func TestVanillaWebSkipsDependencyBlocker(t *testing.T) {
+	eng := NewEngine(".", "test", nil, nil)
+	eng.vanillaWeb = true
+	eng.Ledger.SetDiagnostics("no required module provides package github.com/foo/bar")
+
+	var conclusion string
+	injectDependencyBlocker(eng, &conclusion)
+	if strings.Contains(conclusion, "REMOTE DEPENDENCY BLOCKER") {
+		t.Fatal("VANILLA_WEB should never inject REMOTE DEPENDENCY BLOCKER")
+	}
+}
+
+// TestVanillaWebSkipsEnvDeps verifies that dispatchForensics remaps ToolEnv
+// and ToolTrace to ToolDiagnose when vanillaWeb is true, preventing Go version
+// checks and go test -race from executing.
+func TestVanillaWebSkipsEnvDeps(t *testing.T) {
+	origLog := dispatchLog
+	dispatchLog = func(format string, args ...interface{}) {}
+	defer func() { dispatchLog = origLog }()
+
+	eng := NewEngine(".", "test", nil, nil)
+	eng.vanillaWeb = true
+	eng.Ledger.SetDiagnostics("command not found")
+
+	eng.dispatchForensics(context.Background())
+	// Should have completed without panicking or running Go tools.
+	if !eng.forensicsRan {
+		t.Fatal("expected forensicsRan = true")
+	}
+}
+
 // TestRunLXLocalFileStillReads verifies the gate does not over-fire: a concrete
 // workspace file is still routed to the retriever's SearchFile path (no breach
 // of the normal contract).

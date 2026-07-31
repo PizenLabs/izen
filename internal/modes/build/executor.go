@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/PizenLabs/izen/internal/controlplane/guard"
 	"github.com/PizenLabs/izen/internal/engine"
 )
 
@@ -32,10 +33,15 @@ const (
 	ModeFullRewrite
 )
 
+// ErrScopeFailure indicates a mutation target falls outside the authorized
+// scope or matches a reserved system keyword. Triggers SCOPE_FAILURE recovery.
+var ErrScopeFailure = errors.New("scope failure: mutation target is invalid or reserved")
+
 type Executor struct {
-	root   string
-	engine *Engine
-	tx     *engine.Transaction
+	root       string
+	engine     *Engine
+	tx         *engine.Transaction
+	scopeGuard *guard.ScopeGuard
 }
 
 func NewExecutor(root string, engine *Engine) *Executor {
@@ -45,11 +51,26 @@ func NewExecutor(root string, engine *Engine) *Executor {
 	}
 }
 
+// SetScopeGuard attaches a scope guard for pre- and post-mutation validation.
+// When set, every ApplyMutation call first validates the target path via
+// ValidateMutationTarget and, on success, verifies the mutated file is within
+// the authorized scope declaration.
+func (ex *Executor) SetScopeGuard(sg *guard.ScopeGuard) {
+	ex.scopeGuard = sg
+}
+
 func (ex *Executor) SetTransaction(tx *engine.Transaction) {
 	ex.tx = tx
 }
 
 func (ex *Executor) ApplyMutation(ctx context.Context, mut FileMutation) error {
+	// Pre-mutation scope guard: reject reserved keywords and out-of-scope paths.
+	if ex.scopeGuard != nil {
+		if err := ex.scopeGuard.ValidateMutationTarget(mut.File, nil); err != nil {
+			return fmt.Errorf("%w: %s", ErrScopeFailure, err.Error())
+		}
+	}
+
 	absPath := filepath.Join(ex.root, mut.File)
 	dir := filepath.Dir(absPath)
 
@@ -77,18 +98,19 @@ func (ex *Executor) ApplyMutation(ctx context.Context, mut FileMutation) error {
 		return fmt.Errorf("human validation required for %s: mutation must be approved via Proposal UI before execution", mut.File)
 	}
 
-	if mut.Mode == ModeFullRewrite {
-		if err := os.WriteFile(absPath, []byte(mut.Content), 0644); err != nil {
-			return err
-		}
-		ex.engine.RecordPatch(mut.TaskID, mut.File, mutationStrategy(mut))
-		return nil
-	}
-
 	if err := os.WriteFile(absPath, []byte(mut.Content), 0644); err != nil {
 		return err
 	}
 	ex.engine.RecordPatch(mut.TaskID, mut.File, mutationStrategy(mut))
+
+	// Post-mutation scope verification: confirm the file was written within
+	// the authorized scope. If the file drifted outside scope, trigger rollback.
+	if ex.scopeGuard != nil {
+		if err := ex.scopeGuard.ValidateMutationTarget(mut.File, nil); err != nil {
+			return fmt.Errorf("%w: post-mutation scope drift: %s", ErrScopeFailure, err.Error())
+		}
+	}
+
 	return nil
 }
 

@@ -91,9 +91,14 @@ func RenderDeterministicPipeline(rawInput string, width int, isStreaming bool) s
 				continue
 			}
 
-			// WRAP FIX: word-wrap long lines to fit the terminal viewport before applying styles.
-			// Using a safety margin of -4 so text never kisses the raw edge of the terminal frame.
-			wrappedLine := lipgloss.NewStyle().Width(width - 4).Render(line)
+			// WRAP FIX: strict word-wrap using ansi.Wordwrap before rendering.
+			// This prevents hard truncation ("necessary to l...") that occurs when
+			// lipgloss.Width() is used without an explicit wrapping policy.
+			innerW := width - 4
+			if innerW < 10 {
+				innerW = 10
+			}
+			wrappedLine := ansi.Wordwrap(line, innerW, " \t")
 
 			subLines := strings.Split(wrappedLine, "\n")
 			for _, subLine := range subLines {
@@ -287,6 +292,22 @@ func renderCodeBlock(language string, lines []string, width int) string {
 
 // ── Streaming Content Renderer (now delegates to DeterministicPipeline) ─────
 
+// renderLiveThoughts renders the active thought stream as dimmed/faint text
+// at the top of the streaming output. During an active LLM stream, reasoning
+// tokens are displayed in real-time with a vertical-bar gutter, styled using
+// thoughtActiveStyle (faint/dimmed). After streaming completes, thoughts are
+// collapsed to a single-line summary.
+func (m *model) renderLiveThoughts(width int) string {
+	if m.thoughtStream == nil || m.thoughtStream.Len() == 0 {
+		return ""
+	}
+	if !m.streaming {
+		return ""
+	}
+	spinner := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
+	return m.thoughtStream.Render(width, spinner)
+}
+
 // renderStreamingContent renders AI content incrementally during an active
 // LLM stream. It uses parseAIContent for block classification (plans, diffs,
 // tables, etc.) and delegates plain text blocks to the deterministic pipeline.
@@ -423,18 +444,28 @@ func (m *model) renderStreamingContent(content string, width int) string {
 			rendered = renderWidget("Table", tableContent, availableWidth, colorAccent)
 
 		case blockEvidence:
+			innerW := widgetInnerWidth - 2
+			if innerW < 10 {
+				innerW = 10
+			}
 			lines := strings.Split(block.raw, "\n")
 			var wrappedLines []string
 			for _, line := range lines {
-				wrappedLines = append(wrappedLines, wrapStreamText(line, widgetInnerWidth)...)
+				wrapped := ansi.Wordwrap(line, innerW, " \t")
+				wrappedLines = append(wrappedLines, strings.Split(wrapped, "\n")...)
 			}
 			rendered = renderWidget("Evidence", strings.Join(wrappedLines, "\n"), availableWidth, colorModeInvestigate)
 
 		case blockRisk:
+			innerW := widgetInnerWidth - 2
+			if innerW < 10 {
+				innerW = 10
+			}
 			lines := strings.Split(block.raw, "\n")
 			var wrappedLines []string
 			for _, line := range lines {
-				wrappedLines = append(wrappedLines, wrapStreamText(line, widgetInnerWidth)...)
+				wrapped := ansi.Wordwrap(line, innerW, " \t")
+				wrappedLines = append(wrappedLines, strings.Split(wrapped, "\n")...)
 			}
 			rendered = renderWidget("Risk Analysis", strings.Join(wrappedLines, "\n"), availableWidth, colorModeReview)
 
@@ -524,7 +555,21 @@ func (m *model) renderStreamingContent(content string, width int) string {
 		}
 	}
 
-	return strings.Join(renderedBlocks, vspace(Spacing.Section))
+	result := strings.Join(renderedBlocks, vspace(Spacing.Section))
+
+	// ── LIVE THOUGHTS: prepend dimmed reasoning stream ──────────────
+	// During active streaming, render the thought stream as faint text
+	// above the main content so the user sees reasoning in real-time.
+	// After streaming, thoughts are hidden (they remain in
+	// m.thoughtStream for Alt+O expansion).
+	if m.streaming && m.thoughtStream != nil && m.thoughtStream.Len() > 0 {
+		thoughts := m.renderLiveThoughts(width)
+		if thoughts != "" {
+			result = thoughts + "\n" + result
+		}
+	}
+
+	return result
 }
 
 // planStatusSource exposes the live /plan task ledger as a plan.TaskStatusSource

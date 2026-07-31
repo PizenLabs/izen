@@ -22,6 +22,11 @@ const ContextLedgerPath = ".izen/context_ledger.json"
 // "Transaction Cache" and "Context Sanitization" layers with a single canonical
 // record written to disk on every mode transition.
 //
+// REFORM: UserRawIntent is preserved verbatim across modes so the downstream
+// engine always knows the user's original goal. AssistantDiscussionNotes carries
+// any intermediate analysis but is NOT injected into the /build execution payload
+// — only /plan artifacts and raw intent reach the build engine.
+//
 // Absolute invalidation is guaranteed by treating this file as the only source
 // of truth: on mode switch the previous ledger is overwritten (not merged), so
 // no stale prompts, build logs, or chat history can leak across modes.
@@ -37,6 +42,15 @@ type ContextLedger struct {
 	SourceMode string `json:"source_mode"`
 	// TargetFile is the file currently being audited/fixed, if any.
 	TargetFile string `json:"target_file,omitempty"`
+	// UserRawIntent is the user's original request, preserved verbatim.
+	// This is the ONLY input that reaches the /build execution engine as
+	// the user's goal. Pre-baked structural code steps are NEVER placed here.
+	UserRawIntent string `json:"user_raw_intent,omitempty"`
+	// AssistantDiscussionNotes carries intermediate analysis, brainstorming,
+	// and investigation notes. These are available to /plan but are STRICTLY
+	// excluded from the /build payload to prevent contaminating the executor
+	// with stale or hallucinated procedural steps.
+	AssistantDiscussionNotes string `json:"assistant_discussion_notes,omitempty"`
 	// Diagnostics carries raw error outputs or test logs, if any.
 	Diagnostics string `json:"diagnostics,omitempty"`
 	// Packets are the sequential, ID-tagged analytical packets injected by a
