@@ -37,7 +37,8 @@ type geminiMessage struct {
 }
 
 type geminiPart struct {
-	Text string `json:"text"`
+	Text    string `json:"text"`
+	Thought bool   `json:"thought"`
 }
 
 type geminiRequest struct {
@@ -232,7 +233,7 @@ func (p *GeminiProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		return nil, fmt.Errorf("gemini: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	sr := &geminiSSEReader{body: resp.Body}
+	sr := &geminiSSEReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
 	return &GeminiStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -249,10 +250,11 @@ func (r *GeminiStreamResult) Usage() (input, output int) {
 }
 
 type geminiSSEReader struct {
-	body       io.ReadCloser
-	reader     *bufio.Reader
-	closed     bool
-	finalUsage *geminiUsageMetadata
+	body             io.ReadCloser
+	reader           *bufio.Reader
+	closed           bool
+	finalUsage       *geminiUsageMetadata
+	reasoningHandler func(string) error
 }
 
 func (s *geminiSSEReader) Read(p []byte) (int, error) {
@@ -292,6 +294,18 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 
 		if len(event.Candidates) > 0 {
 			for _, part := range event.Candidates[0].Content.Parts {
+				// Thought parts carry reasoning content and must be routed
+				// to the reasoning handler — they must never appear in the
+				// visible response.
+				if part.Thought {
+					if s.reasoningHandler != nil {
+						if err := s.reasoningHandler(part.Text); err != nil {
+							s.closed = true
+							return 0, err
+						}
+					}
+					continue
+				}
 				if part.Text != "" {
 					n := copy(p, part.Text)
 					return n, nil

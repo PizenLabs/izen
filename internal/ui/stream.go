@@ -197,6 +197,12 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		Stream:    true,
 		System:    systemPrompt,
 		MaxTokens: maxTokens,
+		ReasoningHandler: func(chunk string) error {
+			if m.bus != nil {
+				m.bus.Publish(events.NewReasoningStream(chunk, false))
+			}
+			return nil
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

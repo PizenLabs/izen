@@ -72,8 +72,9 @@ type responseMessage struct {
 }
 
 type delta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type usage struct {
@@ -271,7 +272,7 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		return nil, fmt.Errorf("ollama: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	sr := &sseReader{body: resp.Body}
+	sr := &sseReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
 	return &StreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -288,10 +289,11 @@ func (r *StreamResult) Usage() (input, output int) {
 }
 
 type sseReader struct {
-	body       io.ReadCloser
-	reader     *bufio.Reader
-	closed     bool
-	finalUsage *usage
+	body             io.ReadCloser
+	reader           *bufio.Reader
+	closed           bool
+	finalUsage       *usage
+	reasoningHandler func(string) error
 }
 
 func (s *sseReader) Usage() (input, output int) {

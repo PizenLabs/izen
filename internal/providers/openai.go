@@ -63,8 +63,9 @@ type openaiChoice struct {
 }
 
 type openaiDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type streamOptions struct {
@@ -199,7 +200,7 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		return nil, fmt.Errorf("openai: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	sr := &openaiSSEReader{body: resp.Body}
+	sr := &openaiSSEReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
 	return &OpenAIStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -216,10 +217,11 @@ func (r *OpenAIStreamResult) Usage() (input, output int) {
 }
 
 type openaiSSEReader struct {
-	body       io.ReadCloser
-	reader     *bufio.Reader
-	closed     bool
-	finalUsage *openaiUsage
+	body             io.ReadCloser
+	reader           *bufio.Reader
+	closed           bool
+	finalUsage       *openaiUsage
+	reasoningHandler func(string) error
 }
 
 func (s *openaiSSEReader) Read(p []byte) (int, error) {
@@ -266,9 +268,23 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 			continue
 		}
 
-		if chunk.Choices[0].Delta != nil && chunk.Choices[0].Delta.Content != "" {
-			n := copy(p, chunk.Choices[0].Delta.Content)
-			return n, nil
+		if chunk.Choices[0].Delta != nil {
+			delta := chunk.Choices[0].Delta
+			// Reasoning content (thinking process) is routed to the reasoning
+			// handler only — it is never emitted into the response stream.
+			if delta.ReasoningContent != "" {
+				if s.reasoningHandler != nil {
+					if err := s.reasoningHandler(delta.ReasoningContent); err != nil {
+						s.closed = true
+						return 0, err
+					}
+				}
+				continue
+			}
+			if delta.Content != "" {
+				n := copy(p, delta.Content)
+				return n, nil
+			}
 		}
 
 		if chunk.Choices[0].FinishReason != "" {
