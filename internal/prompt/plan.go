@@ -194,7 +194,8 @@ func EvidenceBasedPlanningDirective() string {
 - BEFORE listing any FILE_MUTATE / ATOMIC_REPLACE / DIFF_PATCH task, READ the ACTUAL content of the affected file(s) to locate the exact duplicate DOM node or the exact defect. Do not reason from file names alone.
 - A file MAY ONLY appear as a task target when an explicit duplicate/diff/defect was CONFIRMED inside that file's content.
 - NEVER assume every asset (script.js, styles.css, etc.) needs modification. When a defect is confined to one file (e.g. a duplicated element in index.html), emit EXACTLY ONE FILE_MUTATE task for that file — do NOT add sibling assets as speculative targets.
-- If a file's content could not be inspected, do NOT emit a task for it. Restrict tasks to files whose content you have verified.`
+- If a file's content could not be inspected, do NOT emit a task for it. Restrict tasks to files whose content you have verified.
+- DO NOT schedule FILE_MUTATE / CODE_MOD tasks for files that need no concrete modification. A destructive edit that strips >80% of a file without an explicit delete instruction is rejected as a no-op by the build guardrail, so a task with an empty or trivial edit payload wastes a build cycle. If a file genuinely needs no change, exclude it from the plan entirely.`
 }
 
 // planJSONSchema is the canonical output schema for BuildPlanJSONPrompt.

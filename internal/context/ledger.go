@@ -35,6 +35,12 @@ const (
 	// TaskFailed is set when the patch transaction aborts or the verification
 	// gate rejects the mutation.
 	TaskFailed
+	// TaskSkipped is set when the destruction guardrail treats a proposed
+	// mutation as a no-op: >80% of a non-empty file would be stripped without
+	// an explicit delete/full-rewrite instruction, so the file is left
+	// unchanged. It is a terminal state — execution is definitively finished
+	// for this task and the sliding window advances past it.
+	TaskSkipped
 )
 
 func (s TaskStatus) String() string {
@@ -47,14 +53,16 @@ func (s TaskStatus) String() string {
 		return "COMPLETED"
 	case TaskFailed:
 		return "FAILED"
+	case TaskSkipped:
+		return "SKIPPED"
 	default:
 		return "UNKNOWN"
 	}
 }
 
-// IsTerminal returns true for completed or failed states.
+// IsTerminal returns true for completed, failed, or skipped states.
 func (s TaskStatus) IsTerminal() bool {
-	return s == TaskCompleted || s == TaskFailed
+	return s == TaskCompleted || s == TaskFailed || s == TaskSkipped
 }
 
 // TaskLedger is the atomic task state map that synchronises /plan's checklist
@@ -129,6 +137,15 @@ func (l *TaskLedger) MarkFailed(id int) {
 	l.states[id] = TaskFailed
 }
 
+// MarkSkipped records a no-op /build outcome for task id: the destruction
+// guardrail declined to mutate the file, but the outcome is terminal and the
+// sliding window advances.
+func (l *TaskLedger) MarkSkipped(id int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.states[id] = TaskSkipped
+}
+
 // Status returns the current state for id, defaulting to TaskPending.
 func (l *TaskLedger) Status(id int) TaskStatus {
 	l.mu.RLock()
@@ -139,14 +156,22 @@ func (l *TaskLedger) Status(id int) TaskStatus {
 	return TaskPending
 }
 
-// IsCompleted reports whether task id has been committed by /build.
+// IsCompleted reports whether task id has been committed by /build. Skipped
+// (no-op) tasks also count as completed so the /plan checklist renders them
+// done and the sliding window advances past them.
 func (l *TaskLedger) IsCompleted(id int) bool {
-	return l.Status(id) == TaskCompleted
+	s := l.Status(id)
+	return s == TaskCompleted || s == TaskSkipped
 }
 
 // IsFailed reports whether task id has been marked as failed.
 func (l *TaskLedger) IsFailed(id int) bool {
 	return l.Status(id) == TaskFailed
+}
+
+// IsSkipped reports whether task id was skipped as a no-op by the guardrail.
+func (l *TaskLedger) IsSkipped(id int) bool {
+	return l.Status(id) == TaskSkipped
 }
 
 // IsTerminal reports whether task id is in a terminal state.

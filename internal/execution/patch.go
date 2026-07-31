@@ -26,6 +26,15 @@ import (
 // instead of falling through to a destructive full-file overwrite.
 var ErrInvalidPatchFormat = errors.New("invalid patch format")
 
+// ErrDestructivePatchSkipped is returned by Apply when the destruction
+// guardrail fires for a non-full-rewrite patch that strips >80% of a
+// non-empty file (or reduces it to whitespace) without an explicit
+// delete/clear instruction. Unlike a hard failure, this is a graceful NO-OP:
+// the file is left byte-for-byte unchanged and the plan task is marked
+// Skipped so the /build run proceeds. Callers can distinguish it from a real
+// apply error with errors.Is.
+var ErrDestructivePatchSkipped = errors.New("destructive patch skipped as no-op")
+
 // MaxFullContentRewriteBytes caps the target file size (in bytes) for the
 // graceful full-content-rewrite fallback. When every SEARCH/REPLACE and
 // unified-diff strategy has failed twice, a small file (e.g. index.html)
@@ -707,26 +716,40 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	}
 
 	// ── DESTRUCTION GUARDRAIL (DEFENSE IN DEPTH) ──────────────────────
-	// Only reject a patch if the result is effectively a file wipe:
+	// Only skip a patch if the result is effectively a file wipe:
 	// 1. The resulting content is empty (zero bytes or only whitespace), OR
-	// 2. Deletion ratio exceeds 90% AND the remaining content is fewer than
+	// 2. Deletion ratio exceeds 80% AND the remaining content is fewer than
 	//    5 lines. This allows legitimate deduplication edits (e.g. removing
 	//    132/162 lines) while still catching actual file wipes.
+	//
+	// A fire is treated as a graceful NO-OP rather than a hard failure: an LLM
+	// that strips >80% of a non-empty file without an explicit delete/clear
+	// instruction almost always emitted a truncated or hallucinated payload.
+	// The file is left unchanged, the plan task is marked Skipped, and the
+	// /build run proceeds instead of aborting. IsFullRewrite remains the
+	// explicit user override that authorizes a genuine wipe.
 	if patch.Original != "" && final != "" {
 		origCount := len(strings.Split(patch.Original, "\n"))
 		finalCount := len(strings.Split(final, "\n"))
 		removed := origCount - finalCount
 
 		isEmpty := strings.TrimSpace(final) == ""
-		isNearWipe := origCount > 0 && float64(removed)/float64(origCount) > 0.9 && finalCount < 5
+		isNearWipe := origCount > 0 && float64(removed)/float64(origCount) > 0.8 && finalCount < 5
 
 		if (isEmpty || isNearWipe) && !patch.IsFullRewrite {
 			if globalActivityLog != nil {
-				globalActivityLog("[FAIL] DESTRUCTIVE_PATCH_REJECTED on %s: removes %d/%d lines (final: %d) — refusing total wipe",
-					patch.File, removed, origCount, finalCount)
+				detail := ""
+				if containsMeaningfulNewCode(patch.Original, final) {
+					detail = " (proposed content carries new code)"
+				} else {
+					detail = " (no meaningful new content detected)"
+				}
+				globalActivityLog("[patch] Skipped destructive patch on %s: line reduction exceeds threshold without explicit delete instruction. File left unchanged%s",
+					patch.File, detail)
 			}
-			return fmt.Errorf("DESTRUCTIVE_PATCH_REJECTED: proposed patch for %s removes %d/%d lines (final: %d lines) — refusing to wipe file",
-				patch.File, removed, origCount, finalCount)
+			pm.recordLedgerAndSkipped(patch)
+			return fmt.Errorf("%w: proposed patch for %s removes %d/%d lines (final: %d lines) — skipping as no-op, file left unchanged",
+				ErrDestructivePatchSkipped, patch.File, removed, origCount, finalCount)
 		}
 	}
 
@@ -1135,6 +1158,43 @@ func (pm *PatchManager) recordLedgerAndSummarize(patch *Patch) {
 	if globalActivityLog != nil {
 		globalActivityLog("%s", build.RenderExecutionSummary(summary))
 	}
+}
+
+// recordLedgerAndSkipped bridges a guardrail-skipped patch to the /plan task
+// ledger: when the patch carries a plan task id it marks that task Skipped (a
+// terminal, no-op outcome) so the sliding window advances and the /build run
+// proceeds. It is a no-op for ad-hoc mutations (TaskID == 0).
+func (pm *PatchManager) recordLedgerAndSkipped(patch *Patch) {
+	if pm.ledger == nil || patch.TaskID <= 0 {
+		return
+	}
+	pm.ledger.MarkSkipped(patch.TaskID)
+}
+
+// containsMeaningfulNewCode reports whether final contains at least one
+// non-whitespace line that is not present verbatim in original. It
+// distinguishes a genuinely destructive rewrite (new code replacing an old
+// body) from a truncated/hallucinated payload that merely strips existing
+// content without adding anything.
+func containsMeaningfulNewCode(original, final string) bool {
+	if strings.TrimSpace(final) == "" {
+		return false
+	}
+	origLines := make(map[string]struct{})
+	for _, line := range strings.Split(original, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			origLines[line] = struct{}{}
+		}
+	}
+	for _, line := range strings.Split(final, "\n") {
+		if line = strings.TrimSpace(line); line == "" {
+			continue
+		}
+		if _, ok := origLines[line]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 // patchStrategy resolves the plan strategy label recorded in the summary.

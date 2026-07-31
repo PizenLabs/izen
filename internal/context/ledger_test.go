@@ -23,6 +23,26 @@ func TestTaskLedgerMarkCompleted(t *testing.T) {
 	}
 }
 
+func TestTaskLedgerMarkSkipped(t *testing.T) {
+	l := NewTaskLedger()
+	l.MarkSkipped(4)
+	if l.Status(4) != TaskSkipped {
+		t.Fatalf("expected TaskSkipped, got %v", l.Status(4))
+	}
+	if !l.IsSkipped(4) {
+		t.Fatal("expected IsSkipped true")
+	}
+	if !l.IsTerminal(4) {
+		t.Fatal("expected skipped task to be terminal")
+	}
+	if !l.IsCompleted(4) {
+		t.Fatal("expected skipped task to count as completed for the plan checklist")
+	}
+	if !l.IsTerminal(4) {
+		t.Fatal("expected skipped task to advance the sliding window")
+	}
+}
+
 func TestTaskLedgerStateTransitions(t *testing.T) {
 	l := NewTaskLedger()
 	l.MarkPending(2)
@@ -64,6 +84,7 @@ func TestTaskStatusString(t *testing.T) {
 		TaskExecuting: "EXECUTING",
 		TaskCompleted: "COMPLETED",
 		TaskFailed:    "FAILED",
+		TaskSkipped:   "SKIPPED",
 	}
 	for s, want := range cases {
 		if s.String() != want {

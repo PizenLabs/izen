@@ -3894,6 +3894,25 @@ func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cm
 			}
 		}
 		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
+			// Graceful no-op skip: the destruction guardrail refused a >80%
+			// file wipe without an explicit delete/clear instruction. The file
+			// is unchanged — mark the task done (no changes needed) instead of
+			// failing the /build run.
+			if errors.Is(applyErr, execution.ErrDestructivePatchSkipped) {
+				tasks := m.sess.CurrentTasks
+				for i := range tasks {
+					if tasks[i].StepNum == task.StepNum {
+						tasks[i].Status = "completed"
+						break
+					}
+				}
+				m.sess.StageTaskList(&tasks)
+				_ = m.sess.Save()
+				return buildResultMsg{
+					output:   fmt.Sprintf("Skipped destructive hotfix patch on %s (no changes needed — file left unchanged)", task.Target),
+					exitCode: 0,
+				}
+			}
 			tasks := m.sess.CurrentTasks
 			for i := range tasks {
 				if tasks[i].StepNum == task.StepNum {

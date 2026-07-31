@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/PizenLabs/izen/internal/context"
 )
 
 func TestApplyLineRangeFallbackNeverPanics(t *testing.T) {
@@ -1496,5 +1498,121 @@ replacement two
 	}
 	if n := strings.Count(err.Error(), "apply patch to"); n != 1 {
 		t.Fatalf("expected 'apply patch to' exactly once, got %d: %v", n, err)
+	}
+}
+
+func TestDestructivePatchSkippedAsNoOp(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "izen-destructive-skip-*")
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	pm := NewPatchManager(dir)
+	pm.SetAuthorization(testAuth())
+	ledger := context.NewTaskLedger()
+	pm.SetLedger(ledger)
+	pm.SetContextID("#ctx-skip-1-r1")
+
+	var orig strings.Builder
+	for i := 1; i <= 51; i++ {
+		fmt.Fprintf(&orig, "const line_%d = %d;\n", i, i)
+	}
+
+	testFile := "script.js"
+	fullPath := filepath.Join(dir, testFile)
+	if err := os.WriteFile(fullPath, []byte(orig.String()), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// The LLM produced a tiny edit payload: a SEARCH/REPLACE block that
+	// replaces the entire 51-line body with a 2-line stub (removing 49/51)
+	// without any explicit delete instruction.
+	modified := "<<<<<<< SEARCH\n" + orig.String() + "=======\nconst line_1 = 1;\nconsole.log('done');\n>>>>>>>"
+
+	var skipLog string
+	SetActivityLogger(func(format string, args ...interface{}) {
+		skipLog += fmt.Sprintf(format, args...)
+	})
+	defer SetActivityLogger(nil)
+
+	err := pm.Apply(&Patch{
+		ID:       "skip-1",
+		File:     testFile,
+		Modified: modified,
+		TaskID:   7,
+	})
+
+	if !errors.Is(err, ErrDestructivePatchSkipped) {
+		t.Fatalf("expected ErrDestructivePatchSkipped, got: %v", err)
+	}
+
+	data, rerr := os.ReadFile(fullPath)
+	if rerr != nil {
+		t.Fatalf("read: %v", rerr)
+	}
+	if string(data) != orig.String() {
+		t.Fatalf("file was modified despite guardrail skip: got %d bytes, want %d bytes", len(data), len(orig.String()))
+	}
+
+	if !ledger.IsSkipped(7) {
+		t.Fatal("expected task 7 to be marked Skipped in the ledger")
+	}
+	if !ledger.IsCompleted(7) {
+		t.Fatal("expected skipped task to count as completed for the plan checklist")
+	}
+	if !strings.Contains(skipLog, "Skipped destructive patch on script.js") {
+		t.Fatalf("expected skip warning in activity log, got: %q", skipLog)
+	}
+	if strings.Contains(skipLog, "[FAIL]") {
+		t.Fatalf("expected no [FAIL] log for a graceful skip, got: %q", skipLog)
+	}
+}
+
+func TestDestructivePureStripDetected(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "izen-destructive-strip-*")
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	pm := NewPatchManager(dir)
+	pm.SetAuthorization(testAuth())
+
+	var orig strings.Builder
+	for i := 1; i <= 40; i++ {
+		fmt.Fprintf(&orig, "const line_%d = %d;\n", i, i)
+	}
+
+	testFile := "styles.js"
+	fullPath := filepath.Join(dir, testFile)
+	if err := os.WriteFile(fullPath, []byte(orig.String()), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Replacement is a strict subset of the original lines — a pure strip with
+	// no meaningful new content.
+	modified := "<<<<<<< SEARCH\n" + orig.String() + "=======\nconst line_1 = 1;\n>>>>>>>"
+
+	var skipLog string
+	SetActivityLogger(func(format string, args ...interface{}) {
+		skipLog += fmt.Sprintf(format, args...)
+	})
+	defer SetActivityLogger(nil)
+
+	err := pm.Apply(&Patch{
+		ID:       "strip-1",
+		File:     testFile,
+		Modified: modified,
+		TaskID:   0,
+	})
+
+	if !errors.Is(err, ErrDestructivePatchSkipped) {
+		t.Fatalf("expected ErrDestructivePatchSkipped, got: %v", err)
+	}
+	if !strings.Contains(skipLog, "no meaningful new content detected") {
+		t.Fatalf("expected 'no meaningful new content detected' in log, got: %q", skipLog)
+	}
+
+	data, rerr := os.ReadFile(fullPath)
+	if rerr != nil {
+		t.Fatalf("read: %v", rerr)
+	}
+	if string(data) != orig.String() {
+		t.Fatal("file was modified despite pure-strip guardrail skip")
 	}
 }

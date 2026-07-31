@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -467,6 +468,16 @@ func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 			return mutationResultMsg{err: err, file: p.Target.QualifiedName}
 		}
 		if err := eng.Patches.Apply(patch); err != nil {
+			// Graceful no-op skip: the destruction guardrail refused a >80%
+			// file wipe without an explicit delete/clear instruction. Treat as
+			// skipped, not failed — and DO NOT retry as a full rewrite, which
+			// would bypass the guardrail and wipe the file.
+			if errors.Is(err, execution.ErrDestructivePatchSkipped) {
+				return mutationResultMsg{
+					file:   p.Target.QualifiedName,
+					status: "skipped",
+				}
+			}
 			// Per-file full-rewrite fallback: when a patch fails due to
 			// hunk/context mismatch (e.g. whitespace variations on blank
 			// lines), retry with IsFullRewrite for this specific file
@@ -560,6 +571,14 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 				continue
 			}
 			if err := eng.Patches.Apply(patch); err != nil {
+				// Graceful no-op skip: the destruction guardrail refused a
+				// >80% file wipe without an explicit delete/clear instruction.
+				// Treat as skipped, not failed — and DO NOT retry as a full
+				// rewrite, which would bypass the guardrail and wipe the file.
+				if errors.Is(err, execution.ErrDestructivePatchSkipped) {
+					results = append(results, mutationResultMsg{file: p.Target.QualifiedName, status: "skipped"})
+					continue
+				}
 				// Per-file full-rewrite fallback: when a patch fails due to
 				// hunk/context mismatch (e.g. whitespace variations on blank
 				// lines), retry with IsFullRewrite for this specific file
