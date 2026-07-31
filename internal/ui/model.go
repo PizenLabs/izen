@@ -946,8 +946,15 @@ type model struct {
 	// Realtime thinking/reasoning panel
 	thinkingPanel *ThinkingPanel
 
-	// Live thought stream — auto-dimmed rendering during streaming
-	thoughtStream *ThoughtStream
+	// Event-driven reasoning buffer. Fed exclusively by EventReasoningStream
+	// domain events; renders as a distinct thinking box that never mixes with
+	// the response pipeline.
+	thinkingBuffer *ThinkingBuffer
+
+	// Number of reasoningBuffer bytes already flushed into thinkingBuffer from
+	// the sentinel path. Tracks the delta so the unified thinking box never
+	// double-appends the same reasoning on successive ticks.
+	sentinelReasoningFlushed int
 
 	// Activity tree — structured tool call logging
 	activityTree *ActivityTree
@@ -1179,6 +1186,30 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// Typed engine I/O event wrapped for bus transport — projected into
 		// the structured ActivityTree.
 		m.handleEngineEvent(p.Event)
+	case events.ReasoningPayload:
+		// LLM reasoning stream: chunks are appended to the dedicated thinking
+		// buffer (never the response pipeline); the terminal event collapses
+		// the box into compact mode.
+		m.handleReasoningStream(p.Chunk, p.IsComplete)
+	}
+}
+
+// handleReasoningStream projects one EventReasoningStream event onto the
+// thinking buffer. Chunks are appended verbatim; the terminal event (empty
+// chunk + IsComplete) collapses the box. Only ever runs on the UI goroutine.
+func (m *model) handleReasoningStream(chunk string, isComplete bool) {
+	if m.thinkingBuffer == nil {
+		m.thinkingBuffer = NewThinkingBuffer()
+	}
+	if chunk != "" {
+		m.thinkingBuffer.Append(chunk)
+	}
+	if isComplete {
+		m.thinkingBuffer.MarkComplete()
+	}
+	m.refreshViewportContent()
+	if m.Ready && !m.userIsScrollingUp {
+		m.Viewport.GotoBottom()
 	}
 }
 
@@ -1375,6 +1406,9 @@ func (m *model) renderRecordForViewport(rec record) string {
 	}
 
 	wrapWidth := width - 4
+	if wrapWidth <= 0 {
+		wrapWidth = 80
+	}
 	if wrapWidth < 20 {
 		wrapWidth = 20
 	}
@@ -1385,14 +1419,15 @@ func (m *model) renderRecordForViewport(rec record) string {
 	// backslash sequences or tab misalignment into the viewport.
 	text := sanitizeText(rec.text)
 
-	// Strict per-line width bound. Every wrapped line is normalized to at most
-	// wrapWidth cells so no line can ever overflow the viewport's right border
-	// and overlap adjacent text, regardless of wide glyphs. Trailing padding is
-	// trimmed so downstream ANSI-strip/cursor-injection logic sees the exact
-	// printable text.
-	widthStyle := lipgloss.NewStyle().Width(wrapWidth)
+	// Strict per-line width bound is enforced by the wrapper below
+	// (wrapIndentedLine / wrapText): every wrapped line lands at most
+	// wrapWidth cells wide. We NEVER re-wrap already-wrapped content here —
+	// applying lipgloss Width() to pre-wrapped, pre-styled text is the
+	// double-wrapping corruption source that drops words and leaves isolated
+	// punctuation. Trailing padding is trimmed so downstream
+	// ANSI-strip/cursor-injection logic sees the exact printable text.
 	renderBounded := func(s string) string {
-		return strings.TrimRight(widthStyle.Render(s), " ")
+		return strings.TrimRight(s, " ")
 	}
 
 	switch rec.role {
@@ -1433,12 +1468,15 @@ func (m *model) renderRecordForViewport(rec record) string {
 	}
 }
 
-// sanitizeEscapes converts literal backslash escape sequences (\n, \t) that
-// reach the record text from external processes or engine payloads into real
-// newline/tab control characters.
+// sanitizeEscapes converts literal backslash escape sequences that reach the
+// record text from external processes or engine payloads into real control
+// characters: \n → newline, \t → tab, \" → quote. Expanding them here means
+// Glamour/Lipgloss never sees raw backslash noise and never drops words next
+// to an escaped punctuation mark.
 func sanitizeEscapes(s string) string {
 	s = strings.ReplaceAll(s, "\\n", "\n")
 	s = strings.ReplaceAll(s, "\\t", "\t")
+	s = strings.ReplaceAll(s, "\\\"", "\"")
 	return s
 }
 
@@ -1546,6 +1584,7 @@ func (m *model) resetStreamingState() {
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 	m.reasoningBuffer.Reset()
+	m.sentinelReasoningFlushed = 0
 	m.pendingReasoningFragment = ""
 	if m.streamParser != nil {
 		m.streamParser = nil
@@ -1577,10 +1616,43 @@ func (m *model) reconcileSpinner() {
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 	m.reasoningBuffer.Reset()
+	m.sentinelReasoningFlushed = 0
 	m.pendingReasoningFragment = ""
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
+}
+
+// emitVisibleContent routes one emitted content window into the response
+// pipeline. It runs the reasoning extractor over the window, then appends only
+// the sentinel-cleaned text to currentStreamContent and projects any newly
+// extracted reasoning onto the unified ThinkingBuffer (deduplicated by the
+// flushed-byte offset). Any pre-existing streamBuffer content (the legacy
+// non-throttle path's un-emitted remainder) is preserved around the extraction
+// so nothing already received is ever dropped.
+func (m *model) emitVisibleContent(raw string) {
+	if raw == "" {
+		return
+	}
+	leftover := m.streamBuffer
+	m.streamBuffer = raw
+	m.extractReasoningContent()
+	visible := m.streamBuffer
+	m.streamBuffer = leftover
+
+	// ── LIVE THINKING BOX ─────────────────────────────────────
+	// Sentinel-extracted reasoning (reasoningBuffer, grown by
+	// extractReasoningContent above) is flushed into the unified
+	// ThinkingBuffer — the same box fed by EventReasoningStream on
+	// the /ask path — deduplicated by the flushed-byte offset so the
+	// box never re-appends already-consumed reasoning each tick.
+	if m.thinkingBuffer != nil && m.reasoningBuffer.Len() > m.sentinelReasoningFlushed {
+		reasoning := m.reasoningBuffer.String()[m.sentinelReasoningFlushed:]
+		m.thinkingBuffer.Append(reasoning)
+		m.sentinelReasoningFlushed = m.reasoningBuffer.Len()
+	}
+
+	m.currentStreamContent += visible
 }
 
 // extractReasoningContent scans raw stream text for reasoning sentinels
@@ -1834,7 +1906,12 @@ func (m *model) refreshViewportContent() {
 
 	if m.streaming {
 		if m.currentStreamContent != "" {
-			rendered := m.renderStreamingContent(m.currentStreamContent, m.width)
+			// SANITIZE BEFORE VIEWPORT: raw streamed text may still carry
+			// literal \n / \t / \" escapes (preserved verbatim through the
+			// rune-safe ingestion). They are expanded to real control
+			// characters here so the deterministic pipeline never renders
+			// backslash noise or drops words next to escaped punctuation.
+			rendered := m.renderStreamingContent(sanitizeText(m.currentStreamContent), m.width)
 			if rendered != "" {
 				content.WriteString(rendered)
 				content.WriteString("\n")
@@ -1842,7 +1919,14 @@ func (m *model) refreshViewportContent() {
 		}
 
 		// ── Collapsible reasoning block ──────────────────────────────
-		reasoningBlock := m.renderReasoningBlock(m.width)
+		// The legacy ThinkingPanel block is skipped while the unified
+		// ThinkingBuffer is already rendering live thinking above the content
+		// (renderLiveThinking in renderStreamingContent) — showing both would
+		// duplicate the same reasoning in two places.
+		reasoningBlock := ""
+		if m.thinkingBuffer == nil || m.thinkingBuffer.Len() == 0 {
+			reasoningBlock = m.renderReasoningBlock(m.width)
+		}
 		if reasoningBlock != "" {
 			content.WriteString(reasoningBlock)
 			content.WriteString("\n")

@@ -70,8 +70,9 @@ type openAIMsgContent struct {
 }
 
 type openAIDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type openAIUsage struct {
@@ -276,13 +277,25 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 			}
 		}
 
-		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil && chunk.Choices[0].Delta.Content != "" {
-			content := chunk.Choices[0].Delta.Content
-			full.WriteString(content)
-			if handler != nil {
-				if err := handler(content); err != nil {
-					_ = resp.Body.Close()
-					return LLMResponse{}, err
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil {
+			delta := chunk.Choices[0].Delta
+			// Reasoning content (thinking process) is routed to the reasoning
+			// pipeline only — it is never appended to the visible response.
+			if delta.ReasoningContent != "" {
+				if req.ReasoningHandler != nil {
+					if err := req.ReasoningHandler(delta.ReasoningContent); err != nil {
+						_ = resp.Body.Close()
+						return LLMResponse{}, err
+					}
+				}
+			}
+			if delta.Content != "" {
+				full.WriteString(delta.Content)
+				if handler != nil {
+					if err := handler(delta.Content); err != nil {
+						_ = resp.Body.Close()
+						return LLMResponse{}, err
+					}
 				}
 			}
 		}

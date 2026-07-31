@@ -288,109 +288,6 @@ func formatElapsed(d time.Duration) string {
 	}
 }
 
-type ThoughtStream struct {
-	mu        sync.Mutex
-	buffer    strings.Builder
-	visible   bool
-	maxLines  int
-	startTime time.Time
-}
-
-func NewThoughtStream() *ThoughtStream {
-	return &ThoughtStream{
-		visible:   true,
-		maxLines:  8,
-		startTime: time.Now(),
-	}
-}
-
-func (ts *ThoughtStream) Append(chunk string) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	ts.buffer.WriteString(chunk)
-}
-
-func (ts *ThoughtStream) Len() int {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	return ts.buffer.Len()
-}
-
-func (ts *ThoughtStream) Reset() {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	ts.buffer.Reset()
-	ts.startTime = time.Now()
-}
-
-func (ts *ThoughtStream) SetVisible(v bool) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	ts.visible = v
-}
-
-func (ts *ThoughtStream) Render(width int, spinner string) string {
-	ts.mu.Lock()
-	content := ts.buffer.String()
-	visible := ts.visible
-	elapsed := time.Since(ts.startTime)
-	ts.mu.Unlock()
-
-	if content == "" {
-		return ""
-	}
-
-	if !visible {
-		elapsedStr := fmt.Sprintf("%.0fs", elapsed.Seconds())
-		status := fmt.Sprintf("%s thinking... %s", spinner, elapsedStr)
-		return dimmedStyle.Faint(true).Render(status)
-	}
-
-	if width < 40 {
-		width = 40
-	}
-
-	availWidth := width - 6
-	if availWidth < 10 {
-		availWidth = 10
-	}
-
-	lines := strings.Split(content, "\n")
-	var displayed []string
-	for _, line := range lines {
-		if len(displayed) >= ts.maxLines {
-			remaining := len(lines) - len(displayed)
-			if remaining > 0 {
-				displayed = append(displayed, mutedStyle.Render(fmt.Sprintf("... %d more lines", remaining)))
-			}
-			break
-		}
-		line = strings.TrimRight(line, " \r")
-		if line == "" {
-			displayed = append(displayed, "")
-			continue
-		}
-		wrapped := wrapString(line, availWidth)
-		displayed = append(displayed, wrapped...)
-	}
-
-	elapsedStr := fmt.Sprintf("%.0fs", elapsed.Seconds())
-
-	linesOut := make([]string, 0, len(displayed)+2)
-	titleLine := fmt.Sprintf(" %s thoughts  %s", spinner, mutedStyle.Render(elapsedStr))
-	linesOut = append(linesOut, dimmedStyle.Faint(true).Render(titleLine))
-
-	for _, line := range displayed {
-		if line == "" {
-			linesOut = append(linesOut, dimmedStyle.Faint(true).Render(" \u2502"))
-		} else {
-			linesOut = append(linesOut, dimmedStyle.Faint(true).Render(" \u2502 "+line))
-		}
-	}
-
-	return strings.Join(linesOut, "\n")
-}
-
 type StreamThrottle struct {
 	buffer    strings.Builder
 	lastFlush time.Time
@@ -420,7 +317,6 @@ func (st *StreamThrottle) Flush() (string, bool) {
 	}
 
 	content := st.buffer.String()
-	st.buffer.Reset()
 	st.lastFlush = time.Now()
 
 	emit := st.maxChunk
@@ -438,7 +334,27 @@ func (st *StreamThrottle) Flush() (string, bool) {
 		}
 	}
 
+	// PRESERVE THE REMAINDER: only the emitted window leaves the buffer.
+	// Anything beyond it stays buffered for the next Flush. Historically this
+	// Reset() was called before slicing, so the tail of every flush window was
+	// permanently dropped and long responses rendered truncated — the
+	// "text missing mid-answer" bug. Content is never discarded now.
+	st.buffer.Reset()
+	if emit < len(content) {
+		st.buffer.WriteString(content[emit:])
+	}
+
 	return content[:emit], true
+}
+
+// Drain returns the entire remaining buffer and empties the throttle,
+// bypassing the frame-delay gate. It is called once at stream end so residual
+// content that the tick loop never flushed is still delivered, never dropped.
+func (st *StreamThrottle) Drain() string {
+	content := st.buffer.String()
+	st.buffer.Reset()
+	st.lastFlush = time.Now()
+	return content
 }
 
 func (st *StreamThrottle) Reset() {

@@ -1656,14 +1656,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		// ── FRAME-THROTTLED FLUSH ──────────────────────────────────────
 		// Prefer flushing from the StreamThrottle (16ms frame interval / 60FPS).
-		// Falls back to direct streamBuffer for non-throttle paths.
+		// Falls back to direct streamBuffer for non-throttle paths. The throttle
+		// retains whatever it does not release this frame, so content is never
+		// dropped — only paced.
 		emitContent := ""
-		flushOk := false
 		if m.streamThrottle != nil {
-			emitContent, flushOk = m.streamThrottle.Flush()
+			emitContent, _ = m.streamThrottle.Flush()
 		}
-		if !flushOk && len(m.streamBuffer) > 0 {
-			// Legacy fallback: emit directly from streamBuffer.
+		if emitContent == "" && len(m.streamBuffer) > 0 {
+			// Legacy fallback: emit directly from streamBuffer, up to the
+			// first word boundary (capped), keeping the remainder buffered for
+			// the next tick.
 			emit := 0
 			minChars := 3
 			for i, c := range m.streamBuffer {
@@ -1685,18 +1688,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.streamBuffer = m.streamBuffer[emit:]
 		}
 		if emitContent != "" {
-			// Extract reasoning content before adding to visible buffer.
-			m.streamBuffer += emitContent
-			m.extractReasoningContent()
-			m.streamBuffer = ""
-
-			// ── LIVE THOUGHT STREAM ─────────────────────────────────
-			if m.thoughtStream != nil && m.reasoningBuffer.Len() > 0 {
-				reasoning := m.reasoningBuffer.String()
-				m.thoughtStream.Append(reasoning)
-			}
-
-			m.currentStreamContent += emitContent
+			m.emitVisibleContent(emitContent)
 		}
 
 		// Refresh viewport with streaming content.
@@ -1786,9 +1778,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.streamParser = nil
 		}
 
-		// Flush any remaining buffered stream content
-		if m.streamTickActive {
-			m.currentStreamContent += m.streamBuffer
+		// Flush any remaining buffered stream content. The frame throttle may
+		// still hold un-emitted tokens — the stream can end before a final tick
+		// drains it — so it is drained unconditionally here. Without this, the
+		// tail of every response is silently dropped.
+		if m.streamThrottle != nil {
+			m.streamBuffer += m.streamThrottle.Drain()
+		}
+		if m.streamTickActive || len(m.streamBuffer) > 0 {
+			m.emitVisibleContent(m.streamBuffer)
 			m.streamBuffer = ""
 			m.streamTickActive = false
 		}
@@ -1825,8 +1823,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		final, finalReasoning = m.extractSentinelReasoning(final)
 		if finalReasoning != "" {
 			m.reasoningBuffer.WriteString(finalReasoning)
+			m.sentinelReasoningFlushed = m.reasoningBuffer.Len()
 			if m.thinkingPanel != nil {
 				m.thinkingPanel.Append(finalReasoning)
+			}
+			if m.thinkingBuffer != nil {
+				m.thinkingBuffer.Append(finalReasoning)
+				m.thinkingBuffer.MarkComplete()
 			}
 		}
 		// The stream is genuinely done now — nothing more will ever close

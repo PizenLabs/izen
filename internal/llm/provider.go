@@ -14,6 +14,13 @@ type PromptRequest struct {
 
 	CacheSystem   bool
 	CacheMessages []int
+
+	// ReasoningHandler receives reasoning/thinking content as it streams in,
+	// separated from the main response. It is called with verbatim chunks (the
+	// same text that reasoning_content / thinking_delta frames carry) so
+	// consumers can publish a reasoning stream without ever mixing it into the
+	// response pipeline. When nil, reasoning content is silently discarded.
+	ReasoningHandler func(chunk string) error
 }
 
 type Message struct {

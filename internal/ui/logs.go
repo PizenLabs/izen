@@ -160,6 +160,13 @@ func RenderEntry(entry LogEntry, width int, dotFrame int) string {
 		target = "..." + target[len(target)-37:]
 	}
 
+	// Sanitize tool-output/log text before rendering so literal \n / \t / \"
+	// escapes expand to real control characters and tabs align deterministically
+	// — raw backslash noise never reaches the viewport.
+	thinking := sanitizeText(entry.Thinking)
+	systemLog := sanitizeText(entry.SystemLog)
+	content := sanitizeText(entry.Content)
+
 	summary := fmt.Sprintf("%s %s(%s)", icon, label, target)
 	if !entry.Expanded {
 		// Show animated truncation dots for in-progress entries.
@@ -179,10 +186,10 @@ func RenderEntry(entry LogEntry, width int, dotFrame int) string {
 	}
 
 	// Render thinking content (LLM reasoning) when expanded
-	if entry.Thinking != "" {
+	if thinking != "" {
 		b.WriteString(thoughtLogBoxStyle.Render(thoughtLogTitleStyle.Render("  Reasoning")))
 		b.WriteString("\n")
-		for _, line := range strings.Split(entry.Thinking, "\n") {
+		for _, line := range strings.Split(thinking, "\n") {
 			wrapped := wrapLine(line, contentWidth)
 			for _, wl := range wrapped {
 				b.WriteString(thoughtLogBoxStyle.Render("  " + mutedStyle.Render(wl)))
@@ -192,10 +199,10 @@ func RenderEntry(entry LogEntry, width int, dotFrame int) string {
 	}
 
 	// Render system execution log when expanded
-	if entry.SystemLog != "" {
+	if systemLog != "" {
 		b.WriteString(systemLogBoxStyle.Render(systemLogTitleStyle.Render("  System Log")))
 		b.WriteString("\n")
-		for _, line := range strings.Split(entry.SystemLog, "\n") {
+		for _, line := range strings.Split(systemLog, "\n") {
 			wrapped := wrapLine(line, contentWidth)
 			for _, wl := range wrapped {
 				b.WriteString(systemLogBoxStyle.Render("  " + mutedStyle.Render(wl)))
@@ -204,10 +211,10 @@ func RenderEntry(entry LogEntry, width int, dotFrame int) string {
 		}
 	}
 
-	if entry.Content != "" {
+	if content != "" {
 		b.WriteString(buildSummaryBoxStyle.Render(buildSummaryTitleStyle.Render("  Details")))
 		b.WriteString("\n")
-		for _, line := range strings.Split(entry.Content, "\n") {
+		for _, line := range strings.Split(content, "\n") {
 			wrapped := wrapLine(line, contentWidth)
 			for _, wl := range wrapped {
 				b.WriteString(buildSummaryBoxStyle.Render("  " + mutedStyle.Render(wl)))

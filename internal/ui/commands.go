@@ -25,6 +25,7 @@ import (
 	"github.com/PizenLabs/izen/internal/command"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	objengine "github.com/PizenLabs/izen/internal/engine"
@@ -2418,10 +2419,23 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			return s
 		}
 
+		// runeBuf makes the fast-track ingestion UTF-8 safe: raw Read chunks
+		// are not rune-aligned, so slicing string(readBuf[:n]) directly could
+		// split a multi-byte rune across two reads. RuneBuffer holds incomplete
+		// runes until they complete and only releases whole runes.
+		runeBuf := stream.NewRuneBuffer()
+
 		for {
 			n, err := rawStream.Read(readBuf)
 			if n > 0 {
-				buf.WriteString(string(readBuf[:n]))
+				buf.WriteString(runeBuf.Write(readBuf[:n]))
+			}
+			// On EOF release any incomplete rune still held back so no
+			// already-received bytes are dropped before final dispatch.
+			if err == io.EOF {
+				if rem := runeBuf.Flush(); rem != "" {
+					buf.WriteString(rem)
+				}
 			}
 
 			// ── Extract reasoning tokens (real-time) ──

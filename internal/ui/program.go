@@ -322,6 +322,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		events.EventSelfHealingExhausted,
 		events.EventActivity,
 		events.EventEngineTelemetry,
+		events.EventReasoningStream,
 	} {
 		eventBus.Subscribe(typ, func(ev events.DomainEvent) {
 			p.Send(domainEventMsg{ev: ev})

@@ -303,20 +303,17 @@ func renderCodeBlock(language string, lines []string, width int) string {
 
 // ── Streaming Content Renderer (now delegates to DeterministicPipeline) ─────
 
-// renderLiveThoughts renders the active thought stream as dimmed/faint text
-// at the top of the streaming output. During an active LLM stream, reasoning
-// tokens are displayed in real-time with a vertical-bar gutter, styled using
-// thoughtActiveStyle (faint/dimmed). After streaming completes, thoughts are
-// collapsed to a single-line summary.
-func (m *model) renderLiveThoughts(width int) string {
-	if m.thoughtStream == nil || m.thoughtStream.Len() == 0 {
-		return ""
-	}
-	if !m.streaming {
+// renderLiveThinking renders the active reasoning block ahead of the streaming
+// response. It is fed exclusively by the event-driven thinking buffer
+// (EventReasoningStream via ThinkingBuffer); the legacy sentinel thought stream
+// has been purged so reasoning is structurally incapable of routing through an
+// un-sanitized legacy renderer.
+func (m *model) renderLiveThinking(width int) string {
+	if m.thinkingBuffer == nil || m.thinkingBuffer.Len() == 0 {
 		return ""
 	}
 	spinner := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
-	return m.thoughtStream.Render(width, spinner)
+	return m.thinkingBuffer.Render(width, m.streaming, spinner)
 }
 
 // renderStreamingContent renders AI content incrementally during an active
@@ -329,7 +326,12 @@ func (m *model) renderStreamingContent(content string, width int) string {
 	blocks := parseAIContent(content)
 	var renderedBlocks []string
 
+	// Content width = terminal width − left/right padding. A non-positive
+	// result (degenerate geometry) defaults to 80 cells.
 	availableWidth := width - 2
+	if availableWidth <= 0 {
+		availableWidth = 80
+	}
 	if availableWidth < 20 {
 		availableWidth = 20
 	}
@@ -568,13 +570,13 @@ func (m *model) renderStreamingContent(content string, width int) string {
 
 	result := strings.Join(renderedBlocks, vspace(Spacing.Section))
 
-	// ── LIVE THOUGHTS: prepend dimmed reasoning stream ──────────────
-	// During active streaming, render the thought stream as faint text
-	// above the main content so the user sees reasoning in real-time.
-	// After streaming, thoughts are hidden (they remain in
-	// m.thoughtStream for Alt+O expansion).
-	if m.streaming && m.thoughtStream != nil && m.thoughtStream.Len() > 0 {
-		thoughts := m.renderLiveThoughts(width)
+	// ── LIVE REASONING: prepend dimmed reasoning stream ──────────────
+	// During active streaming, render the reasoning block as faint text
+	// above the main content so the user sees thinking in real-time.
+	// The block collapses to a compact "Thought: …" line once the
+	// reasoning stream completes.
+	if m.streaming {
+		thoughts := m.renderLiveThinking(width)
 		if thoughts != "" {
 			result = thoughts + "\n" + result
 		}

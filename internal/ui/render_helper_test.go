@@ -60,6 +60,53 @@ func TestSanitizeText(t *testing.T) {
 	}
 }
 
+func TestSanitizeEscapesExpandsQuote(t *testing.T) {
+	// Literal \" must expand to a real quote so escaped punctuation never
+	// renders as backslash noise next to a comma/colon.
+	got := sanitizeEscapes(`say \"hello,\" then \"world\"`)
+	if strings.Contains(got, `\"`) {
+		t.Errorf("sanitizeEscapes left literal \\\": %q", got)
+	}
+	if got != `say "hello," then "world"` {
+		t.Errorf("sanitizeEscapes = %q, want unescaped quotes", got)
+	}
+	// Escapes expand together and in any order.
+	got = sanitizeEscapes(`a\nb\tc\"d`)
+	if got != "a\nb\tc\"d" {
+		t.Errorf("sanitizeEscapes combined = %q", got)
+	}
+}
+
+// TestRecordRenderNoWordLoss is a regression guard for the double-wrapping
+// corruption: pre-wrapped content must never be re-wrapped by a parent lipgloss
+// Width() style, which drops words and leaves isolated punctuation. Every word
+// of a long markdown-flavored message must survive the record renderer intact.
+func TestRecordRenderNoWordLoss(t *testing.T) {
+	longLine := "First, verify the request; then: apply the change, review the " +
+		"diff carefully, and confirm. This sentence deliberately mixes commas, " +
+		"colons, and semicolons with **bold** and `inline code` words."
+	m := &model{width: 60}
+	rec := record{role: roleError, text: longLine}
+	out := m.renderRecordForViewport(rec)
+
+	stripped := ansi.Strip(out)
+	for _, word := range strings.Fields(longLine) {
+		clean := strings.Trim(word, "*`.,;:()")
+		if clean == "" {
+			continue
+		}
+		if !strings.Contains(stripped, clean) {
+			t.Errorf("word lost after render: %q (out=%q)", clean, stripped)
+		}
+	}
+	// No line may exceed the viewport bound (gutter included).
+	for _, line := range strings.Split(stripped, "\n") {
+		if lipgloss.Width(line) > m.width {
+			t.Errorf("line %d cells exceeds viewport %d: %q", lipgloss.Width(line), m.width, line)
+		}
+	}
+}
+
 // ── ANSI-safe truncation ────────────────────────────────────────────────────
 
 func TestTruncateANSIPreservesStyleAndText(t *testing.T) {

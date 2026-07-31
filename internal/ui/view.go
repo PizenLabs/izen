@@ -192,8 +192,8 @@ func (m *model) viModeLabel() string {
 
 // renderReasoningBlock renders the collapsible reasoning block during streaming.
 // Uses the ThinkingPanel for expanded/collapsed rendering.
-// NOTE: during active streaming, live thought tokens are already shown via
-// thoughtStream (dimmed/faint) in renderStreamingContent. This block is
+// NOTE: during active streaming, live reasoning tokens are already shown via
+// the ThinkingBuffer (event-driven) in renderStreamingContent. This block is
 // the expanded/collapsible version for reviewing after streaming ends.
 func (m *model) renderReasoningBlock(width int) string {
 	if m.thinkingPanel == nil {

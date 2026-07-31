@@ -32,6 +32,11 @@ const (
 	EventStageCompleted       = "stage.completed"
 	EventSelfHealingAttempt   = "execution.selfhealing.attempt"
 	EventSelfHealingExhausted = "execution.selfhealing.exhausted"
+	// EventReasoningStream carries LLM reasoning/thinking content streamed from
+	// the LLM client as it arrives. Chunks are delivered incrementally with
+	// IsComplete=false; a final event with IsComplete=true (and an empty Chunk)
+	// marks the end of the reasoning block so projections can collapse it.
+	EventReasoningStream = "reasoning.stream"
 	// EventActivity is a free-form engine telemetry line published by the
 	// retrieval/execution packages' activity sinks. Routing it through the bus
 	// keeps the UI a pure projection: engines never call UI routines directly.
@@ -137,6 +142,15 @@ type ActivityPayload struct {
 // packages; the UI type-asserts them at projection time.
 type EngineTelemetryPayload struct {
 	Event interface{}
+}
+
+// ReasoningPayload carries one chunk of an LLM reasoning/thinking stream.
+// Chunk holds the verbatim reasoning text (never mixed with response content);
+// IsComplete is true on the terminal event that closes the reasoning block
+// (its Chunk is empty).
+type ReasoningPayload struct {
+	Chunk      string
+	IsComplete bool
 }
 
 // ── Generic event implementation ────────────────────────────────────────────
@@ -261,4 +275,14 @@ func NewActivity(line string) DomainEvent {
 // type-asserted by the projection layer.
 func NewEngineTelemetry(ev interface{}) DomainEvent {
 	return newEvent(EventEngineTelemetry, EngineTelemetryPayload{Event: ev})
+}
+
+// NewReasoningStream publishes one chunk of an LLM reasoning/thinking stream.
+// Pass IsComplete=true with an empty chunk on the terminal event that closes
+// the reasoning block.
+func NewReasoningStream(chunk string, isComplete bool) DomainEvent {
+	return newEvent(EventReasoningStream, ReasoningPayload{
+		Chunk:      chunk,
+		IsComplete: isComplete,
+	})
 }

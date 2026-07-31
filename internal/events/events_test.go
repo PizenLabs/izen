@@ -49,6 +49,29 @@ func TestNewEngineTelemetryNilWrapped(t *testing.T) {
 	}
 }
 
+func TestNewReasoningStreamPayload(t *testing.T) {
+	ev := NewReasoningStream("step one", false)
+	if ev.Type() != EventReasoningStream {
+		t.Errorf("type = %q, want %q", ev.Type(), EventReasoningStream)
+	}
+	if ev.Timestamp().IsZero() {
+		t.Error("timestamp is zero")
+	}
+	p, ok := ev.Payload().(ReasoningPayload)
+	if !ok {
+		t.Fatalf("payload = %T, want ReasoningPayload", ev.Payload())
+	}
+	if p.Chunk != "step one" || p.IsComplete {
+		t.Errorf("payload = %+v, want chunk %q incomplete", p, "step one")
+	}
+
+	done := NewReasoningStream("", true)
+	dp := done.Payload().(ReasoningPayload)
+	if dp.Chunk != "" || !dp.IsComplete {
+		t.Errorf("done payload = %+v, want empty chunk + complete", dp)
+	}
+}
+
 func TestSelfHealingEventConstructors(t *testing.T) {
 	attempt := NewSelfHealingAttempt(3, "worker.go", "SYNTAX_ERROR")
 	if attempt.Type() != EventSelfHealingAttempt {
@@ -85,5 +108,42 @@ func TestTelemetryEventsRoundTripThroughBus(t *testing.T) {
 		return countEvents(&mu, &got) == 2
 	}) {
 		t.Fatalf("delivered %d events, want 2", countEvents(&mu, &got))
+	}
+}
+
+func TestReasoningStreamRoundTripsThroughBus(t *testing.T) {
+	bus := NewBus(4)
+	defer bus.Close()
+
+	var mu sync.Mutex
+	var got []DomainEvent
+	bus.Subscribe(EventReasoningStream, collectHandler(t, &mu, &got))
+
+	bus.Publish(NewReasoningStream("first", false))
+	bus.Publish(NewReasoningStream("second", false))
+	bus.Publish(NewReasoningStream("", true))
+
+	if !waitFor(t, func() bool {
+		return countEvents(&mu, &got) == 3
+	}) {
+		t.Fatalf("delivered %d events, want 3", countEvents(&mu, &got))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	chunks := make([]string, 0, len(got))
+	for _, ev := range got {
+		p := ev.Payload().(ReasoningPayload)
+		chunks = append(chunks, p.Chunk)
+		if ev.Type() != EventReasoningStream {
+			t.Errorf("type = %q, want %q", ev.Type(), EventReasoningStream)
+		}
+	}
+	joined := ""
+	for _, c := range chunks {
+		joined += c
+	}
+	if joined != "firstsecond" {
+		t.Errorf("joined chunks = %q, want firstsecond", joined)
 	}
 }
