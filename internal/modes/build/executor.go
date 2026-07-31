@@ -8,9 +8,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/controlplane/guard"
 	"github.com/PizenLabs/izen/internal/engine"
+	"github.com/PizenLabs/izen/internal/events"
 )
 
 type FileMutation struct {
@@ -64,9 +66,16 @@ func (ex *Executor) SetTransaction(tx *engine.Transaction) {
 }
 
 func (ex *Executor) ApplyMutation(ctx context.Context, mut FileMutation) error {
+	start := time.Now()
+	strategy := mutationStrategy(mut)
+	if ex.engine != nil {
+		ex.engine.emit(events.NewPatchAttempted(mut.File, strategy, 1))
+	}
+
 	// Pre-mutation scope guard: reject reserved keywords and out-of-scope paths.
 	if ex.scopeGuard != nil {
 		if err := ex.scopeGuard.ValidateMutationTarget(mut.File, nil); err != nil {
+			ex.emitFailure(events.FailurePermanent, fmt.Errorf("%w: %s", ErrScopeFailure, err.Error()), "build.scope")
 			return fmt.Errorf("%w: %s", ErrScopeFailure, err.Error())
 		}
 	}
@@ -95,13 +104,19 @@ func (ex *Executor) ApplyMutation(ctx context.Context, mut FileMutation) error {
 	// contract. The UI routes approved proposals to this executor; unvetted
 	// mutations are never applied to disk.
 	if !ex.engine.IsApprovedByFile(mut.File, mut.TaskID) {
-		return fmt.Errorf("human validation required for %s: mutation must be approved via Proposal UI before execution", mut.File)
+		err := fmt.Errorf("human validation required for %s: mutation must be approved via Proposal UI before execution", mut.File)
+		ex.emitFailure(events.FailureRecoverable, err, "build.guardrail")
+		return err
 	}
 
 	if err := os.WriteFile(absPath, []byte(mut.Content), 0644); err != nil {
+		ex.emitFailure(events.FailureRecoverable, err, "build.patch")
 		return err
 	}
-	ex.engine.RecordPatch(mut.TaskID, mut.File, mutationStrategy(mut))
+	ex.engine.RecordPatch(mut.TaskID, mut.File, strategy)
+	if ex.engine != nil {
+		ex.engine.emit(events.NewPatchApplied(mut.File, countLines(mut.Content), 0, time.Since(start)))
+	}
 
 	// Post-mutation scope verification: confirm the file was written within
 	// the authorized scope. If the file drifted outside scope, trigger rollback.
@@ -112,6 +127,22 @@ func (ex *Executor) ApplyMutation(ctx context.Context, mut FileMutation) error {
 	}
 
 	return nil
+}
+
+// emitFailure routes a build failure to the event bus when an engine is wired.
+func (ex *Executor) emitFailure(class events.FailureClassification, err error, stage string) {
+	if ex != nil && ex.engine != nil {
+		ex.engine.emit(events.NewExecutionFailed(class, err, stage))
+	}
+}
+
+// countLines returns the number of lines in content. Empty content is 0.
+func countLines(content string) int {
+	n := strings.Count(content, "\n")
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		n++
+	}
+	return n
 }
 
 // mutationStrategy resolves the strategy label recorded in the execution

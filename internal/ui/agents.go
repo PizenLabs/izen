@@ -59,6 +59,7 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			retriever := investigate.NewRetrieverAdapter(retrieval.NewRetriever(".", m.graph))
 			executor := investigate.NewShellTestExecutor(".")
 			eng := investigate.NewEngineWithAI(".", content, retriever, executor, m.provider, m.cfg.ActiveModelName())
+			eng.WithEventBus(m.bus)
 			// Classify intent from the investigation content to enforce ENV_DEPS guard.
 			// Feature/UnitTest/Refactor intents skip external dependency search and
 			// Docker checks — only Bug/Regression intents get full forensic treatment.
@@ -366,7 +367,7 @@ func (r *reviewRunner) RunComprehensiveReview() (string, *riview.ReviewLedger, e
 	if cur := r.m.resolver.Current(); cur.CanWrite() || cur.CanShell() || cur.CanPatch() {
 		return "", nil, fmt.Errorf("review mode: write/shell/patch capability detected — review must be 100%% read-only")
 	}
-	eng := review.NewEngine(".", nil, nil)
+	eng := review.NewEngine(".", nil, nil).WithEventBus(r.m.bus)
 	result, err := eng.Run()
 	if err != nil {
 		return "", nil, err
@@ -412,7 +413,7 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 				return reviewResultMsg{err: fmt.Errorf("review mode: patch capability detected — review must lock out patch generation")}
 			}
 
-			eng := review.NewEngine(".", nil, nil)
+			eng := review.NewEngine(".", nil, nil).WithEventBus(m.bus)
 			var result *review.ReviewResult
 			var err error
 			if target != "" {

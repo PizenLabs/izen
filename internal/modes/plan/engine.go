@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
@@ -33,6 +34,11 @@ type Engine struct {
 	// diagnostic gating. They are optional; nil values are safe.
 	snapCache *wssnapshot.SnapshotCache
 	capReg    *wscap.ArchetypeCapabilityRegistry
+
+	// bus is the event bus this engine publishes domain events to. Engines are
+	// headless: they publish and never touch the UI directly. Optional; nil
+	// disables event emission.
+	bus *events.Bus
 }
 
 // NewEngine creates a new Engine instance with the provided components.
@@ -66,6 +72,23 @@ func (e *Engine) WithSnapshotCache(sc *wssnapshot.SnapshotCache) *Engine {
 func (e *Engine) WithCapabilityRegistry(cr *wscap.ArchetypeCapabilityRegistry) *Engine {
 	e.capReg = cr
 	return e
+}
+
+// WithEventBus injects the event bus this engine publishes domain events to.
+// The engine stays headless: it never mutates UI state or writes to the
+// terminal directly — consumers subscribe to the bus as projections. May be
+// nil to disable emission.
+func (e *Engine) WithEventBus(bus *events.Bus) *Engine {
+	e.bus = bus
+	return e
+}
+
+// emit publishes a domain event. It is a strict no-op when no bus is wired,
+// so engines keep working unchanged in headless/CLI contexts.
+func (e *Engine) emit(ev events.DomainEvent) {
+	if e != nil && e.bus != nil {
+		e.bus.Publish(ev)
+	}
 }
 
 // DiscoverAllowedFiles runs pkg/recon and pkg/grounding to discover the
@@ -164,10 +187,34 @@ func (e *Engine) ProcessFromLedgerFastTrack(ctx context.Context, promptText stri
 	return e.processFromLedger(ctx, "", "", modelName, true, promptText)
 }
 
-func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, problem string, modelName string, fastTrack bool, fastPrompt ...string) ([]Task, error) {
+func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, problem string, modelName string, fastTrack bool, fastPrompt ...string) (tasks []Task, err error) {
 	if e == nil || e.provider == nil {
 		return nil, fmt.Errorf("plan engine: provider not set")
 	}
+
+	// ── HEADLESS EVENT EMISSION ───────────────────────────────
+	// The plan engine is headless: every observable outcome is published to
+	// the event bus. The deferred block guarantees a terminal event (success
+	// or failure) fires for every early-return path below.
+	raw := problem
+	if raw == "" && len(fastPrompt) > 0 {
+		raw = fastPrompt[0]
+	}
+	e.emit(events.NewCommandReceived(raw, "plan"))
+	defer func() {
+		if err != nil {
+			e.emit(events.NewExecutionFailed(events.FailurePermanent, err, "plan"))
+			return
+		}
+		if len(tasks) > 0 {
+			targets := make([]string, 0, len(tasks))
+			for _, t := range tasks {
+				targets = append(targets, t.Target)
+			}
+			e.emit(events.NewPlanStaged(len(tasks), targets, "plan"))
+			e.emit(events.NewStageCompleted("plan", 0, fmt.Sprintf("staged %d tasks", len(tasks))))
+		}
+	}()
 
 	// Detect workspace archetype at run start. When VANILLA_WEB, Go-specific
 	// fast-track paths (canonical import mismatch, undefined symbol) are
@@ -202,6 +249,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	//   3. Skip investigation, test execution, and JSON synthesis.
 	if !fastTrack {
 		if target := detectDirectMutation(problem, ledgerContent); target != nil {
+			e.emit(events.NewIntentParsed("direct_mutation", problem, 1.0))
 			return []Task{*target}, nil
 		}
 	}
@@ -373,6 +421,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		}, nil
 	}
 
+	e.emit(events.NewIntentParsed("plan.synthesize", problem, 0.8))
+
 	var req ai.Request
 	if fastTrack && len(fastPrompt) > 0 {
 		req = ai.Request{
@@ -498,7 +548,8 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 		// prompt that includes the strict enforcement instruction from the
 		// previous rejection.
 		if attempt > 0 {
-			fmt.Printf("[plan-engine] JSON syntax or command schema broken. Refining prompt and retrying internally (Attempt %d/%d)...\n", attempt, maxSilentRetries)
+			e.emit(events.NewStageCompleted("plan.synthesize.retry", 0,
+				fmt.Sprintf("JSON syntax or command schema broken — refining prompt and retrying internally (Attempt %d/%d)", attempt, maxSilentRetries)))
 			req.Messages[len(req.Messages)-1].Content += shellExecReinforcement(attempt, maxSilentRetries)
 			var retryErr error
 			resp, retryErr = e.provider(ctx, req)

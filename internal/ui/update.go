@@ -175,7 +175,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// type switch below. Without this, gitInitResultMsg gets swallowed
 		// and the init stage never advances after pressing 'Y'.
 		switch msg.(type) {
-		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg, graphIndexingMsg:
+		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg, graphIndexingMsg, domainEventMsg:
 			// fall through to main type switch
 		default:
 			return m, nil
@@ -183,6 +183,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+
+	case domainEventMsg:
+		// Event bus projection: engines publish domain events headlessly and
+		// the UI renders them as activity lines. Runs on the UI goroutine, so
+		// all model mutation here is safe.
+		m.handleDomainEvent(msg.ev)
+		return m, nil
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width

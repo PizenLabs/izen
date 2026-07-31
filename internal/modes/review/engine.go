@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/modes"
 	riview "github.com/PizenLabs/izen/internal/review"
@@ -41,6 +42,12 @@ type Engine struct {
 
 	retriever Retriever
 	graph     *graph.Graph
+
+	// bus is the event bus this engine publishes domain events to. The review
+	// engine stays headless: stage transitions and outcomes are published as
+	// events rather than written to the terminal. Optional; nil disables
+	// emission.
+	bus *events.Bus
 }
 
 func NewEngine(root string, retriever Retriever, g *graph.Graph) *Engine {
@@ -56,14 +63,31 @@ func NewEngine(root string, retriever Retriever, g *graph.Graph) *Engine {
 	}
 }
 
+// WithEventBus injects the event bus this engine publishes domain events to.
+// May be nil to disable emission.
+func (e *Engine) WithEventBus(bus *events.Bus) *Engine {
+	e.bus = bus
+	return e
+}
+
+// emit publishes a domain event. It is a strict no-op when no bus is wired.
+func (e *Engine) emit(ev events.DomainEvent) {
+	if e != nil && e.bus != nil {
+		e.bus.Publish(ev)
+	}
+}
+
 func (e *Engine) Run() (*ReviewResult, error) {
 	result := &ReviewResult{
 		CreatedAt: time.Now(),
 	}
 
+	e.emit(events.NewCommandReceived("", "review"))
+
 	if err := VerifyModeCapability(modes.ModeReview); err != nil {
 		result.Error = err.Error()
 		e.Result = result
+		e.emit(events.NewExecutionFailed(events.FailurePermanent, err, "review"))
 		return result, err
 	}
 
@@ -74,9 +98,15 @@ func (e *Engine) Run() (*ReviewResult, error) {
 	}
 
 	for !e.State.ShouldStop() {
+		state := e.State.Current()
+		stateStart := time.Now()
 		if err := e.executeCurrentState(result); err != nil {
 			result.Error = err.Error()
+			e.emit(events.NewExecutionFailed(events.FailureRecoverable, err, "review."+state.String()))
 			break
+		}
+		if state != StateDone {
+			e.emit(events.NewStageCompleted("review."+state.String(), time.Since(stateStart).Round(time.Millisecond), ""))
 		}
 	}
 
@@ -86,6 +116,7 @@ func (e *Engine) Run() (*ReviewResult, error) {
 
 	if result.Error == "" {
 		e.generateSummary(result)
+		e.emit(events.NewStageCompleted("review", time.Since(e.startedAt).Round(time.Millisecond), result.Summary))
 	}
 
 	return result, nil

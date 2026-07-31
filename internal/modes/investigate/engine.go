@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
@@ -69,6 +70,12 @@ type Engine struct {
 	// diagnostic gating. They are optional; nil values are safe.
 	snapCache *wssnapshot.SnapshotCache
 	capReg    *wscap.ArchetypeCapabilityRegistry
+
+	// bus is the event bus this engine publishes domain events to. The engine
+	// stays headless: forensic/orchestrator telemetry is published to the bus
+	// instead of being written directly to the terminal. Optional; nil routes
+	// telemetry back through the legacy package-level sinks.
+	bus *events.Bus
 }
 
 type InvestigationResult struct {
@@ -148,6 +155,43 @@ func (e *Engine) WithCapabilityRegistry(cr *wscap.ArchetypeCapabilityRegistry) *
 	return e
 }
 
+// WithEventBus injects the event bus this engine publishes domain events to.
+// When wired, forensic and orchestrator telemetry is published as structured
+// stage events and the legacy package-level sinks are bypassed — the engine
+// runs headless and consumers subscribe as projections. May be nil.
+func (e *Engine) WithEventBus(bus *events.Bus) *Engine {
+	e.bus = bus
+	return e
+}
+
+// emit publishes a domain event. It is a strict no-op when no bus is wired.
+func (e *Engine) emit(ev events.DomainEvent) {
+	if e != nil && e.bus != nil {
+		e.bus.Publish(ev)
+	}
+}
+
+// forensic publishes forensic telemetry to the event bus when wired, falling
+// back to the legacy package-level sink otherwise so headless/CLI use remains
+// observable.
+func (e *Engine) forensic(format string, args ...interface{}) {
+	if e != nil && e.bus != nil {
+		e.bus.Publish(events.NewStageCompleted("investigate.forensic", 0, fmt.Sprintf(format, args...)))
+		return
+	}
+	forensicLog(format, args...)
+}
+
+// dispatch publishes orchestrator decisions to the event bus when wired,
+// falling back to the legacy package-level sink otherwise.
+func (e *Engine) dispatch(format string, args ...interface{}) {
+	if e != nil && e.bus != nil {
+		e.bus.Publish(events.NewStageCompleted("investigate.dispatch", 0, fmt.Sprintf(format, args...)))
+		return
+	}
+	dispatchLog(format, args...)
+}
+
 func (e *Engine) Run() (*InvestigationResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -156,6 +200,9 @@ func (e *Engine) Run() (*InvestigationResult, error) {
 
 func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 	e.runCtx = ctx
+
+	// ── HEADLESS EVENT EMISSION ───────────────────────────────
+	e.emit(events.NewCommandReceived(e.Problem, "investigate"))
 
 	// Detect workspace archetype at run start. When VANILLA_WEB, Go-specific
 	// diagnostic patterns are skipped entirely.
@@ -205,14 +252,17 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 	//   - Resolved=false so the caller knows investigation was not the right mode
 	if target := e.shouldShortCircuit(); target != shortCircuitNone {
 		var conclusion string
+		intent := "code_mutation"
 		switch target {
 		case shortCircuitToPlan:
 			conclusion = "frontend ui intent detected — hand off to plan"
-			forensicLog("[deadlock-guard] frontend UI intent detected — short-circuiting /investigate → /plan")
+			intent = "frontend_ui"
+			e.forensic("[deadlock-guard] frontend UI intent detected — short-circuiting /investigate → /plan")
 		default:
 			conclusion = "code mutation intent detected — hand off to build"
-			forensicLog("[deadlock-guard] non-bug intent detected — short-circuiting /investigate → /build handoff")
+			e.forensic("[deadlock-guard] non-bug intent detected — short-circuiting /investigate → /build handoff")
 		}
+		e.emit(events.NewIntentParsed(intent, e.Problem, 1.0))
 		result.Resolved = false
 		result.Conclusion = conclusion
 		result.RootCause = ""
@@ -294,14 +344,16 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 	// "no findings" result. This guarantees the developer-visible duration is
 	// real and that tool usage is on the record.
 	if !e.forensicsExecuted() {
-		forensicLog("[forensic] no diagnostic toolchain executed — forcing probe")
+		e.forensic("[forensic] no diagnostic toolchain executed — forcing probe")
 		e.forceProbe(ctx)
 		result.Duration = time.Since(e.startedAt).Round(time.Millisecond).String()
 	}
 
 	// MANDATORY TIMING LOG: prove the forensic pass actually did work.
-	forensicLog("Forensic analysis executed in %s (%d evidence, %d loops)",
+	e.forensic("Forensic analysis executed in %s (%d evidence, %d loops)",
 		result.Duration, len(result.Evidence), result.Loops)
+
+	e.emit(events.NewStageCompleted("investigate", time.Since(e.startedAt).Round(time.Millisecond), result.Conclusion))
 
 	e.Result = result
 	return result, nil
@@ -349,7 +401,7 @@ func (e *Engine) forensicsExecuted() bool {
 // entirely and a no-op placeholder is recorded instead.
 func (e *Engine) forceProbe(ctx context.Context) {
 	if e.vanillaWeb {
-		forensicLog("[forensic] VANILLA_WEB archetype — skipping forceProbe (go test)")
+		e.forensic("[forensic] VANILLA_WEB archetype — skipping forceProbe (go test)")
 		e.forensicsRan = true
 		e.Evidence.Add(EvSourceExecution,
 			"VANILLA_WEB archetype — no Go toolchain to probe",
@@ -382,7 +434,7 @@ func (e *Engine) stateObserve(ctx context.Context) error {
 	// is no Go module system to probe. Fall through to dispatchForensics
 	// which also respects the VANILLA_WEB archetype by skipping Go patterns.
 	if e.vanillaWeb {
-		forensicLog("[forensic] VANILLA_WEB archetype — skipping Go test executor in stateObserve")
+		e.forensic("[forensic] VANILLA_WEB archetype — skipping Go test executor in stateObserve")
 	} else if e.executor != nil {
 		e.forensicsRan = true
 		summary, _ := e.TestLoop.Run(e.executor, testLoopConfig{Strategy: "all"})
@@ -440,7 +492,7 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 	// it is a pre-decision classification label, not a verified fact.
 	// Actual outcomes are logged after execution below.
 	strategy := DispatchStrategy(dctx, e.provider, e.model, diagnostics, e.Intent, e.vanillaWeb)
-	dispatchLog("[orchestrator] classify -> tool=%s target=%q",
+	e.dispatch("[orchestrator] classify -> tool=%s target=%q",
 		strategy.Tool, strategy.Target)
 
 	// VANILLA_WEB ARCHETYPE: Remap ToolEnv and ToolTrace to ToolDiagnose.
@@ -448,12 +500,13 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 	// positives in HTML/CSS/JS workspaces. ToolTrace runs go test -race which
 	// requires a Go module system. Only ToolDiagnose and ToolLX are safe.
 	if e.vanillaWeb && (strategy.Tool == ToolEnv || strategy.Tool == ToolTrace) {
-		dispatchLog("[orchestrator] VANILLA_WEB archetype — remapping %s to diagnose", strategy.Tool)
+		e.dispatch("[orchestrator] VANILLA_WEB archetype — remapping %s to diagnose", strategy.Tool)
 		strategy.Tool = ToolDiagnose
 		strategy.Target = ""
 	}
 
 	runner := NewToolRunner(e.root, e.provider, e.model, e.retriever, diagnostics)
+	runner.SetLogFn(func(format string, args ...interface{}) { e.forensic(format, args...) })
 
 	actions := 0
 	current := strategy.Tool
@@ -480,7 +533,7 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 
 	for current != "" && actions < MaxActionsPerRun {
 		actions++
-		dispatchLog("[orchestrator] action %d/%d -> %s (target=%q)",
+		e.dispatch("[orchestrator] action %d/%d -> %s (target=%q)",
 			actions, MaxActionsPerRun, current, target)
 
 		res := runner.Run(dctx, current, target)
@@ -499,9 +552,9 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 		// operator sees the chain (violates "silent" — principle 2: Explicit Over Implicit).
 		next := nextFallback(current)
 		if next != "" {
-			forensicLog("[orchestrator] %s failed → falling back to %s", current, next)
+			e.forensic("[orchestrator] %s failed → falling back to %s", current, next)
 		} else {
-			forensicLog("[orchestrator] %s failed → chain exhausted (terminal)", current)
+			e.forensic("[orchestrator] %s failed → chain exhausted (terminal)", current)
 		}
 		current = next
 	}
@@ -520,7 +573,7 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 // pre-decision rationales or hardcoded guesswork strings.
 func (e *Engine) logToolOutcome(tool Tool, res ToolResult) {
 	if !res.Ok {
-		forensicLog("[orchestrator] %s returned no results", tool)
+		e.forensic("[orchestrator] %s returned no results", tool)
 		return
 	}
 
@@ -533,19 +586,19 @@ func (e *Engine) logToolOutcome(tool Tool, res ToolResult) {
 			}
 		}
 		if maxScore > 0 {
-			forensicLog("[orchestrator] %s succeeded (evidence=%d, max_BM25=%.3f)",
+			e.forensic("[orchestrator] %s succeeded (evidence=%d, max_BM25=%.3f)",
 				tool, len(res.Evidence), maxScore)
 			if maxScore < 0.3 {
-				forensicLog("[lx] BM25=%.3f BELOW THRESHOLD (0.3) for target %q — context may be insufficient for /plan synthesis", maxScore, res.Target)
+				e.forensic("[lx] BM25=%.3f BELOW THRESHOLD (0.3) for target %q — context may be insufficient for /plan synthesis", maxScore, res.Target)
 			} else {
-				forensicLog("[lx] BM25=%.3f >= 0.3 for target %q — passing structured context to /plan", maxScore, res.Target)
+				e.forensic("[lx] BM25=%.3f >= 0.3 for target %q — passing structured context to /plan", maxScore, res.Target)
 			}
 		} else {
-			forensicLog("[orchestrator] %s succeeded (evidence=%d, BM25=0)",
+			e.forensic("[orchestrator] %s succeeded (evidence=%d, BM25=0)",
 				tool, len(res.Evidence))
 		}
 	} else {
-		forensicLog("[orchestrator] %s succeeded (evidence=%d)",
+		e.forensic("[orchestrator] %s succeeded (evidence=%d)",
 			tool, len(res.Evidence))
 	}
 }
@@ -795,7 +848,7 @@ func (e *Engine) parseStackFramesFromEvidence() []StackFrame {
 func (e *Engine) stateVerify() error {
 	// VANILLA_WEB ARCHETYPE: Skip Go test executor — no module system.
 	if e.vanillaWeb {
-		forensicLog("[forensic] VANILLA_WEB archetype — skipping Go test executor in stateVerify")
+		e.forensic("[forensic] VANILLA_WEB archetype — skipping Go test executor in stateVerify")
 	} else if e.executor != nil {
 		summary, _ := e.TestLoop.Run(e.executor, testLoopConfig{Strategy: "all"})
 		if summary != nil {
@@ -925,7 +978,7 @@ func (e *Engine) shouldShortCircuit() shortCircuitTarget {
 		lower := strings.ToLower(e.Problem)
 		for _, kw := range vanillaWebContentKeywords {
 			if strings.Contains(lower, kw) {
-				forensicLog("[deadlock-guard] VANILLA_WEB archetype detected with web content keywords — short-circuiting /investigate → /plan")
+				e.forensic("[deadlock-guard] VANILLA_WEB archetype detected with web content keywords — short-circuiting /investigate → /plan")
 				return shortCircuitToPlan
 			}
 		}

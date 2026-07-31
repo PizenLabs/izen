@@ -8,6 +8,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/artifact"
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/core/workflow"
+	"github.com/PizenLabs/izen/internal/events"
 )
 
 // ── Control Plane Event Messages ──────────────────────────────────────────
@@ -16,6 +17,11 @@ import (
 // (WorkflowStateMachine, Artifact lifecycle, Budget consumption,
 // Authorization) to the Bubble Tea event loop. The UI subscribes by
 // listening for these messages in its Update method.
+
+// domainEventMsg carries a DomainEvent published on the engine event bus into
+// the Bubble Tea event loop. The UI is a pure projection of the domain event
+// stream: engines publish headlessly and never call UI routines directly.
+type domainEventMsg struct{ ev events.DomainEvent }
 
 // WorkflowStateChangedMsg is emitted when the WorkflowStateMachine transitions.
 type WorkflowStateChangedMsg struct {

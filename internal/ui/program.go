@@ -23,6 +23,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/core/runtime"
 	"github.com/PizenLabs/izen/internal/core/workflow"
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
@@ -68,6 +69,12 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	if provider != nil {
 		planEng.SetProvider(provider.Execute)
 	}
+
+	// ── EVENT BUS ──────────────────────────────────────────────────────────
+	// The single in-process event bus. The mode engines publish domain events
+	// headlessly (never calling UI routines directly); the UI subscribes below
+	// and acts purely as a projection of the event stream.
+	eventBus := events.NewBus(events.DefaultBufferSize)
 
 	var detectedLang language.ID
 	if detection.Primary != nil {
@@ -180,6 +187,8 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	// Wire snapshot cache and capability registry into the plan engine for
 	// archetype-aware diagnostic gating.
 	planEng.WithSnapshotCache(snapCache).WithCapabilityRegistry(capReg)
+	// Wire the event bus so /plan runs headless and publishes domain events.
+	planEng.WithEventBus(eventBus)
 
 	workflowSM := workflow.NewWorkflowStateMachine()
 	wcc := control.NewWorkflowCheckpointManager(execEng.Checkpoints, root)
@@ -232,6 +241,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		initPrefillProvider: globalProvider,
 		viewRegistry:        reg,
 		logStore:            NewLogStore(),
+		bus:                 eventBus,
 		toolCallBuffer:      execution.NewToolCallBuffer(root),
 		thinkingPanel:       NewThinkingPanel(),
 		liveCodePreview:     NewLiveCodePreview(),
@@ -297,7 +307,30 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	investigate.SetForensicLog(activityFn)
 	investigate.SetDispatchLog(activityFn)
 
-	return tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+
+	// ── EVENT BUS PROJECTION SUBSCRIPTION ───────────────────────────────
+	// The UI is a pure projection: every domain event published by the headless
+	// engines is forwarded into the Bubble Tea event loop as a domainEventMsg
+	// and rendered by the model's handleDomainEvent. p.Send is safe from any
+	// goroutine, so a bus dispatch goroutine can bridge into the UI safely.
+	// Subscriptions happen after the program exists because nothing runs before
+	// p.Run(); any event published before then is simply dropped (non-blocking).
+	for _, typ := range []string{
+		events.EventCommandReceived,
+		events.EventIntentParsed,
+		events.EventPlanStaged,
+		events.EventPatchAttempted,
+		events.EventPatchApplied,
+		events.EventExecutionFailed,
+		events.EventStageCompleted,
+	} {
+		eventBus.Subscribe(typ, func(ev events.DomainEvent) {
+			p.Send(domainEventMsg{ev: ev})
+		})
+	}
+
+	return p
 }
 
 // resolveUsername resolves the user's display name with the following

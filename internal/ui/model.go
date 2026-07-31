@@ -26,6 +26,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/runtime"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
@@ -957,6 +958,10 @@ type model struct {
 	// Live code preview for streaming tool call arguments
 	liveCodePreview *LiveCodePreview
 
+	// Event bus — the headless engines publish domain events here and the UI
+	// subscribes as a pure projection. Never nil after bootstrap.
+	bus *events.Bus
+
 	// Current effort level for generation
 	currentEffort EffortLevel
 }
@@ -1149,6 +1154,53 @@ func (m *model) handleEngineEvent(ev interface{}) {
 			},
 		})
 	}
+}
+
+// handleDomainEvent is the event bus projection. Every DomainEvent published
+// by the headless mode engines is rendered here as a styled activity line (and
+// enriched ActivityTree entry where metrics exist). This is the ONLY path that
+// surfaces engine events in the viewport — engines never call the UI directly.
+func (m *model) handleDomainEvent(ev events.DomainEvent) {
+	if ev == nil {
+		return
+	}
+	switch p := ev.Payload().(type) {
+	case events.CommandReceivedPayload:
+		m.logActivity("[%s] received command: %s", p.Mode, truncateForActivity(p.Command))
+	case events.IntentParsedPayload:
+		m.logActivity("[intent] parsed: %s (%.0f%% confidence)", p.Intent, p.Confidence*100)
+	case events.PlanStagedPayload:
+		m.logActivity("[plan] staged %d tasks", p.TaskCount)
+	case events.PatchAttemptedPayload:
+		m.logActivity("[build] patch attempt %d: %s (%s)", p.Attempt, p.File, p.Strategy)
+	case events.PatchAppliedPayload:
+		m.logActivity("[build] applied patch to %s (+%d/-%d lines)", p.File, p.LinesAdd, p.LinesDel)
+		if m.activityTree != nil {
+			m.activityTree.Append(EngineEvent{
+				Kind: EventFileMutate,
+				Time: ev.Timestamp(),
+				FileMutate: &FileMutateEvent{
+					File:     p.File,
+					LinesAdd: p.LinesAdd,
+					LinesDel: p.LinesDel,
+					Elapsed:  p.Elapsed,
+				},
+			})
+		}
+	case events.ExecutionFailedPayload:
+		m.logActivity("[error][%s] %s (stage: %s)", p.Classification, p.Error, p.Stage)
+	case events.StageCompletedPayload:
+		m.logActivity("[stage] %s completed (%s)", p.Stage, p.Summary)
+	}
+}
+
+// truncateForActivity bounds free-form event text for single-line rendering.
+func truncateForActivity(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= 90 {
+		return s
+	}
+	return s[:87] + "..."
 }
 
 // push appends a record. Records are flushed to the terminal's native
