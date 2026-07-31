@@ -411,6 +411,14 @@ func bootCommon(root string, cfg *config.Config) (*session.Session, *ai.Manager,
 		mgr.Register("groq", providers.NewGroqProvider(provCfg.APIKey, provCfg.DefaultModel, provCfg.BaseURL))
 	}
 
+	if provCfg, ok := cfg.AI.Providers["opencode"]; ok && provCfg.APIKey != "" {
+		mgr.Register("opencode", providers.NewOpenCodeProvider(provCfg.APIKey, provCfg.DefaultModel, provCfg.BaseURL))
+	}
+
+	if provCfg, ok := cfg.AI.Providers["9router"]; ok && provCfg.APIKey != "" {
+		mgr.Register("9router", providers.NewNineRouterProvider(provCfg.APIKey, provCfg.DefaultModel, provCfg.BaseURL))
+	}
+
 	defaultProvider := cfg.ActiveProviderName()
 	mgr.SetDefault(defaultProvider)
 

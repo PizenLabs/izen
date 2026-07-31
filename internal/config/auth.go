@@ -34,6 +34,10 @@ func envVarForProvider(provider string) string {
 		return "GEMINI_API_KEY"
 	case "groq":
 		return "GROQ_API_KEY"
+	case "opencode":
+		return "OPENCODE_API_KEY"
+	case "9router":
+		return "9ROUTER_API_KEY"
 	default:
 		return strings.ToUpper(provider) + "_API_KEY"
 	}
