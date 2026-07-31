@@ -94,11 +94,22 @@ func RenderDeterministicPipeline(rawInput string, width int, isStreaming bool) s
 			// WRAP FIX: strict word-wrap using ansi.Wordwrap before rendering.
 			// This prevents hard truncation ("necessary to l...") that occurs when
 			// lipgloss.Width() is used without an explicit wrapping policy.
+			//
+			// DOUBLE-WRAP GUARD: the inline markdown pass adds a fixed-width
+			// marker (• , ┃, "1. ", checkbox) to the FIRST wrapped line. If the
+			// content was already wrapped to the full inner width, that marker
+			// would overflow the bound and leave ragged right edges. The wrap
+			// budget therefore reserves the marker width so the styled line
+			// always lands exactly on the boundary, never past it.
 			innerW := width - 4
 			if innerW < 10 {
 				innerW = 10
 			}
-			wrappedLine := ansi.Wordwrap(line, innerW, " \t")
+			wrapW := innerW - markdownLinePrefixWidth(line)
+			if wrapW < 10 {
+				wrapW = 10
+			}
+			wrappedLine := ansi.Wordwrap(line, wrapW, " \t")
 
 			subLines := strings.Split(wrappedLine, "\n")
 			for _, subLine := range subLines {

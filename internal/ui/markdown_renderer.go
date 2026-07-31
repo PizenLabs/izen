@@ -580,47 +580,14 @@ func renderASTTable(node *goldmarkext.Table, width int, source []byte) string {
 
 // ── Helper functions ──────────────────────────────────────────────────────
 
-// wrapMText wraps text to fit within the given width, word-by-word
+// wrapMText wraps text to fit within the given width, word-by-word.
+// It delegates to the shared ANSI-aware, cell-accurate wrapper so paragraph
+// and list-item text is measured by visual cell width, never byte length.
 func wrapMText(text string, width int) []string {
 	if width <= 0 {
 		return []string{text}
 	}
-
-	inputLines := strings.Split(text, "\n")
-	var result []string
-
-	for _, line := range inputLines {
-		if line == "" {
-			result = append(result, "")
-			continue
-		}
-
-		words := strings.Fields(line)
-		if len(words) == 0 {
-			result = append(result, line)
-			continue
-		}
-
-		var currentLine strings.Builder
-		for _, word := range words {
-			switch {
-			case currentLine.Len() == 0:
-				currentLine.WriteString(word)
-			case currentLine.Len()+1+utf8.RuneCountInString(word) <= width:
-				currentLine.WriteString(" ")
-				currentLine.WriteString(word)
-			default:
-				result = append(result, currentLine.String())
-				currentLine.Reset()
-				currentLine.WriteString(word)
-			}
-		}
-		if currentLine.Len() > 0 {
-			result = append(result, currentLine.String())
-		}
-	}
-
-	return result
+	return wrapText(text, width)
 }
 
 // padMRight pads string s on the right with spaces to the given width

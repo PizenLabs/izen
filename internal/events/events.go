@@ -32,6 +32,14 @@ const (
 	EventStageCompleted       = "stage.completed"
 	EventSelfHealingAttempt   = "execution.selfhealing.attempt"
 	EventSelfHealingExhausted = "execution.selfhealing.exhausted"
+	// EventActivity is a free-form engine telemetry line published by the
+	// retrieval/execution packages' activity sinks. Routing it through the bus
+	// keeps the UI a pure projection: engines never call UI routines directly.
+	EventActivity = "engine.activity"
+	// EventEngineTelemetry is a typed engine I/O event (file read, search,
+	// resolve, mutate metrics) wrapped for bus transport. The UI projects it
+	// into its structured activity tree.
+	EventEngineTelemetry = "engine.telemetry"
 )
 
 // FailureClassification is the taxonomy used by EventExecutionFailed. It is
@@ -114,6 +122,21 @@ type SelfHealingAttemptPayload struct {
 type SelfHealingExhaustedPayload struct {
 	Attempts int
 	Output   string
+}
+
+// ActivityPayload carries a single free-form engine telemetry line emitted by
+// the retrieval/execution activity sinks (e.g. "[ OK ] search %q: %d results").
+// It exists so those sinks can publish to the bus instead of calling the UI.
+type ActivityPayload struct {
+	Line string
+}
+
+// EngineTelemetryPayload is the transport envelope for a typed engine I/O
+// event (retrieval.FileReadEvent, retrieval.SearchEvent, etc.). The payload
+// stays interface{} here because the concrete types live in their source
+// packages; the UI type-asserts them at projection time.
+type EngineTelemetryPayload struct {
+	Event interface{}
 }
 
 // ── Generic event implementation ────────────────────────────────────────────
@@ -224,4 +247,18 @@ func NewSelfHealingExhausted(attempts int, output string) DomainEvent {
 		Attempts: attempts,
 		Output:   output,
 	})
+}
+
+// NewActivity publishes a single free-form engine telemetry line. It is the
+// bus transport for the retrieval/execution activity sinks, decoupling the
+// engine packages from any direct UI callback.
+func NewActivity(line string) DomainEvent {
+	return newEvent(EventActivity, ActivityPayload{Line: line})
+}
+
+// NewEngineTelemetry publishes a typed engine I/O event wrapped for bus
+// transport. The concrete event types (e.g. retrieval.SearchEvent) are
+// type-asserted by the projection layer.
+func NewEngineTelemetry(ev interface{}) DomainEvent {
+	return newEvent(EventEngineTelemetry, EngineTelemetryPayload{Event: ev})
 }

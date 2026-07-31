@@ -1029,39 +1029,10 @@ func (m *model) cycleEffort() {
 // ── Rendering helpers ─────────────────────────────────────────────────────────
 
 // wrapStreamText wraps raw text lines dynamically during an active live stream.
+// It delegates to the shared ANSI-aware, cell-accurate wrapper so the stream
+// and the final history render identically.
 func wrapStreamText(text string, maxW int) []string {
-	if len(text) == 0 {
-		return []string{""}
-	}
-	var chunks []string
-	lines := strings.Split(text, "\n")
-
-	for _, line := range lines {
-		words := strings.Fields(line)
-		if len(words) == 0 {
-			chunks = append(chunks, "")
-			continue
-		}
-
-		var currentLine strings.Builder
-		for _, word := range words {
-			wordWidth := lipgloss.Width(word)
-			if currentLine.Len()+1+wordWidth > maxW {
-				chunks = append(chunks, currentLine.String())
-				currentLine.Reset()
-				currentLine.WriteString(word)
-			} else {
-				if currentLine.Len() > 0 {
-					currentLine.WriteString(" ")
-				}
-				currentLine.WriteString(word)
-			}
-		}
-		if currentLine.Len() > 0 {
-			chunks = append(chunks, currentLine.String())
-		}
-	}
-	return chunks
+	return wrapText(text, maxW)
 }
 
 // sanitizeInputPrompt forces the text input prompt back to a clean baseline,
@@ -1190,21 +1161,49 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	case events.ExecutionFailedPayload:
 		m.logActivity("[error][%s] %s (stage: %s)", p.Classification, p.Error, p.Stage)
 	case events.SelfHealingAttemptPayload:
-		m.logActivity("[self-heal] retry %d: %s (%s)", p.Retry, p.File, p.Category)
+		// Distinct retry badge + attempt count + failure category so the
+		// self-healing loop reads as one clean, scannable line.
+		m.logActivity("[RETRY %d] [%s] %s", p.Retry, p.Category, p.File)
 	case events.SelfHealingExhaustedPayload:
-		m.logActivity("[self-heal] exhausted after %d attempt(s); workspace rolled back clean", p.Attempts)
+		// Distinct exhausted badge + total attempt count; the raw verification
+		// output is collapsed to its first line to keep the activity line tight.
+		m.logActivity("[EXHAUSTED] self-healing stopped after %d attempt(s); workspace rolled back clean%s",
+			p.Attempts, selfHealOutputSuffix(p.Output))
 	case events.StageCompletedPayload:
 		m.logActivity("[stage] %s completed (%s)", p.Stage, p.Summary)
+	case events.ActivityPayload:
+		// Engine activity telemetry (retrieval/execution/investigate sinks)
+		// projected onto the UI goroutine through the bus.
+		m.logActivity("%s", p.Line)
+	case events.EngineTelemetryPayload:
+		// Typed engine I/O event wrapped for bus transport — projected into
+		// the structured ActivityTree.
+		m.handleEngineEvent(p.Event)
 	}
+}
+
+// selfHealOutputSuffix collapses a self-healing verification output to a short
+// trailing hint. Empty or whitespace-only output yields no suffix; otherwise
+// the first meaningful line is appended, truncated to a single line width.
+func selfHealOutputSuffix(output string) string {
+	output = strings.ReplaceAll(output, "\\n", "\n")
+	output = strings.ReplaceAll(output, "\\t", "\t")
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// ANSI-safe truncation: never byte-slice, or a style sequence (or a
+		// multi-byte rune) can be cut mid-way and drop visible text.
+		return " — " + truncateANSI(line, 64)
+	}
+	return ""
 }
 
 // truncateForActivity bounds free-form event text for single-line rendering.
 func truncateForActivity(s string) string {
 	s = strings.TrimSpace(s)
-	if len(s) <= 90 {
-		return s
-	}
-	return s[:87] + "..."
+	return truncateANSI(s, 90)
 }
 
 // push appends a record. Records are flushed to the terminal's native
@@ -1380,9 +1379,21 @@ func (m *model) renderRecordForViewport(rec record) string {
 		wrapWidth = 20
 	}
 
-	// Sanitize: convert literal \n escape sequences in error/log text
-	// to actual newlines so multi-line messages display correctly.
-	text := strings.ReplaceAll(rec.text, "\\n", "\n")
+	// Sanitize: normalize mixed line endings, convert literal \n and \t escape
+	// sequences in error/log text to real control characters, and expand tabs
+	// to spaces so multi-line messages display correctly instead of leaking raw
+	// backslash sequences or tab misalignment into the viewport.
+	text := sanitizeText(rec.text)
+
+	// Strict per-line width bound. Every wrapped line is normalized to at most
+	// wrapWidth cells so no line can ever overflow the viewport's right border
+	// and overlap adjacent text, regardless of wide glyphs. Trailing padding is
+	// trimmed so downstream ANSI-strip/cursor-injection logic sees the exact
+	// printable text.
+	widthStyle := lipgloss.NewStyle().Width(wrapWidth)
+	renderBounded := func(s string) string {
+		return strings.TrimRight(widthStyle.Render(s), " ")
+	}
 
 	switch rec.role {
 	case roleUser:
@@ -1399,9 +1410,9 @@ func (m *model) renderRecordForViewport(rec record) string {
 	case roleActivity:
 		var b strings.Builder
 		for _, srcLine := range strings.Split(text, "\n") {
-			wrapped := wrapString(srcLine, wrapWidth)
+			wrapped := wrapIndentedLine(srcLine, wrapWidth)
 			for _, wl := range wrapped {
-				b.WriteString(m.styleActivityLine(wl))
+				b.WriteString(renderBounded(m.styleActivityLine(wl)))
 				b.WriteByte('\n')
 			}
 		}
@@ -1409,14 +1420,94 @@ func (m *model) renderRecordForViewport(rec record) string {
 	default:
 		var b strings.Builder
 		for _, srcLine := range strings.Split(text, "\n") {
-			wrapped := wrapString(srcLine, wrapWidth)
+			// Explicit \n line breaks between checklist items / log lines are
+			// preserved (per-line wrap, never a single reflow pass); indented
+			// continuation lines keep their hierarchy via wrapIndentedLine.
+			wrapped := wrapIndentedLine(srcLine, wrapWidth)
 			for _, wl := range wrapped {
-				b.WriteString(wl)
+				b.WriteString(renderBounded(wl))
 				b.WriteByte('\n')
 			}
 		}
 		return strings.TrimSuffix(b.String(), "\n")
 	}
+}
+
+// sanitizeEscapes converts literal backslash escape sequences (\n, \t) that
+// reach the record text from external processes or engine payloads into real
+// newline/tab control characters.
+func sanitizeEscapes(s string) string {
+	s = strings.ReplaceAll(s, "\\n", "\n")
+	s = strings.ReplaceAll(s, "\\t", "\t")
+	return s
+}
+
+// leadingWhitespace returns the leading space/tab prefix of a line. It anchors
+// the hanging indent used by wrapIndentedLine so indented structures (TODO
+// checklist descriptions, error details) stay aligned across wrapped lines.
+func leadingWhitespace(s string) string {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	return s[:i]
+}
+
+// wrapIndentedLine wraps a single line to maxWidth using visual cell widths,
+// preserving the leading indentation on every continuation line. This keeps
+// nested structures aligned without overflowing the viewport's right border
+// (word widths are measured with lipgloss.Width, not raw byte length).
+func wrapIndentedLine(text string, maxWidth int) []string {
+	if maxWidth < 1 {
+		maxWidth = 1
+	}
+	prefix := leadingWhitespace(text)
+	body := strings.TrimLeft(text, " \t")
+	if body == "" {
+		return []string{prefix}
+	}
+
+	indent := lipgloss.Width(prefix)
+	avail := maxWidth - indent
+	if avail < 1 {
+		avail = 1
+	}
+
+	var result []string
+	line := prefix
+	flush := func() {
+		result = append(result, line)
+		line = prefix
+	}
+
+	for _, word := range strings.Fields(body) {
+		wordW := lipgloss.Width(word)
+		if wordW > avail {
+			// Unbreakable token wider than the available space — hard-chunk it
+			// at cell boundaries (ansi.Cut), each piece re-indented. Chunking
+			// by cell width (not rune index) keeps wide glyphs inside the bound.
+			flush()
+			for _, piece := range chunkWord(word, avail) {
+				result = append(result, prefix+piece)
+			}
+			line = prefix
+			continue
+		}
+		if line != prefix && lipgloss.Width(line)+1+wordW > maxWidth {
+			flush()
+		}
+		if line != prefix {
+			line += " "
+		}
+		line += word
+	}
+	if line != prefix {
+		result = append(result, line)
+	}
+	if len(result) == 0 {
+		result = []string{prefix}
+	}
+	return result
 }
 
 // pushRecords appends multiple records.

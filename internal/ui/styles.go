@@ -246,6 +246,13 @@ var (
 	badgeOKStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreen)).Background(lipgloss.Color(colorSurface))
 	badgeFailStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed)).Background(lipgloss.Color(colorSurface))
 
+	// ── Self-Healing Badge Styles ───────────────────────────────
+	// Distinct visual indicators for the build self-healing loop:
+	// a warm retry badge for each regeneration attempt and a red
+	// exhausted badge when retries run out.
+	badgeRetryStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorYellow)).Background(lipgloss.Color(colorSurface))
+	badgeExhaustedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed)).Background(lipgloss.Color(colorSurface))
+
 	// ── Thought Log Box Style ───────────────────────────────────
 	// Bordered container for expanded LLM reasoning content.
 	thoughtLogBoxStyle = lipgloss.NewStyle().

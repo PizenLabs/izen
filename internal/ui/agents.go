@@ -129,12 +129,9 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			if len(result.Evidence) > 0 {
 				b.WriteString("\nEvidence:\n")
 				for _, ev := range result.Evidence {
-					c := ev.Content
-					runes := []rune(c)
-					if len(runes) > 60 {
-						c = string(runes[:60]) + "…"
-					}
-					fmt.Fprintf(&b, "  [%s] %s\n", ev.Source, c)
+					// ANSI-safe truncation: cell-aware so style sequences and
+					// wide glyphs are never split mid-way.
+					fmt.Fprintf(&b, "  [%s] %s\n", ev.Source, truncateANSI(ev.Content, 60))
 				}
 			}
 

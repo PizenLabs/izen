@@ -272,38 +272,32 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	m.historyIndex = len(m.history)
 
 	// ── WIRE ACTIVITY LOGGERS ────────────────────────────────────────────
-	// The model's logActivity method is injected as the callback for every
-	// package that performs internal file system / search / binary actions.
-	// This guarantees every ReadFile, Grep/Search, and lx invocation is
-	// immediately visible in the chat viewport as a styled system line.
+	// The retrieval/execution activity sinks are routed through the event bus
+	// (never a direct model callback): each line is published as an
+	// EventActivity domain event and projected by handleDomainEvent on the UI
+	// goroutine. This guarantees the model is only ever mutated from the
+	// Bubble Tea event loop.
 	activityFn := func(format string, args ...interface{}) {
-		m.logActivity(format, args...)
+		eventBus.Publish(events.NewActivity(fmt.Sprintf(format, args...)))
 	}
 	retrieval.SetActivityLogger(activityFn)
 	execution.SetActivityLogger(activityFn)
 
 	// ── WIRE TYPED EVENT LOGGERS ─────────────────────────────────────────
-	// The model's handleEngineEvent is injected as the typed event sink for
-	// real I/O metrics (bytes read, lines patched, exit codes, elapsed time).
-	// These feed the ActivityTree directly — no string parsing involved.
+	// The typed engine I/O events (bytes read, lines patched, hits, elapsed)
+	// are wrapped as EventEngineTelemetry on the bus and projected into the
+	// ActivityTree by handleDomainEvent. No direct UI calls from engines.
 	eventFn := func(ev interface{}) {
-		m.handleEngineEvent(ev)
+		eventBus.Publish(events.NewEngineTelemetry(ev))
 	}
 	retrieval.SetEventLogger(eventFn)
 	execution.SetEventLogger(eventFn)
 
 	// ── REDIRECT /investigate ENGINE LOG SINKS ───────────────────────────
-	// The investigate orchestrator has two package-level activity sinks:
-	// forensicLog (defaults to log.Printf → stderr) and dispatchLog (defaults
-	// to fmt.Printf → stdout). Left at their defaults they write RAW TEXT to
-	// the terminal while Bubble Tea owns the alt-screen, corrupting the
-	// rendered frame — broken ──── separators, misaligned viewport height, and
-	// a re-drawn prompt that appears "doubled" as the raw bytes shove the real
-	// frame. Route both through the same activityFn used for every other engine
-	// package so orchestrator progress surfaces as styled viewport lines
-	// instead of frame-corrupting raw output. The engine already dispatches a
-	// single terminal investigateResultMsg on completion; these sinks are pure
-	// progress telemetry.
+	// The investigate orchestrator's forensic/dispatch sinks are also routed
+	// through the bus so progress surfaces as projected viewport lines instead
+	// of frame-corrupting raw output or direct model mutation. The engine
+	// already dispatches a single terminal investigateResultMsg on completion.
 	investigate.SetForensicLog(activityFn)
 	investigate.SetDispatchLog(activityFn)
 
@@ -326,6 +320,8 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		events.EventStageCompleted,
 		events.EventSelfHealingAttempt,
 		events.EventSelfHealingExhausted,
+		events.EventActivity,
+		events.EventEngineTelemetry,
 	} {
 		eventBus.Subscribe(typ, func(ev events.DomainEvent) {
 			p.Send(domainEventMsg{ev: ev})

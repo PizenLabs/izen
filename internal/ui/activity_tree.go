@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 )
 
 type EventKind int
@@ -168,25 +169,31 @@ func (at *ActivityTree) Render(width int) string {
 }
 
 func (at *ActivityTree) renderEvent(ev EngineEvent, width int) string {
+	// Cap the content cell count so long paths/commands/queries truncate
+	// cleanly instead of overflowing the viewport's right border. The
+	// indicator prefix and trailing metadata reserve fixed cell budget.
+	contentW := width - 24
+	if contentW < 20 {
+		contentW = 20
+	}
+
 	switch ev.Kind {
 	case EventFileRead:
 		e := ev.FileRead
 		if e == nil {
 			return ""
 		}
-		// ── CRITICAL ENGINE I/O: cyan/teal (#89dceb) per visual hierarchy ──
 		prefix := lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Render("→")
 		elapsed := formatElapsed(e.Elapsed)
-		return fmt.Sprintf("%s Read %s (%d B · %s)", prefix, e.File, e.Bytes, mutedStyle.Render(elapsed))
+		return fmt.Sprintf("%s Read %s (%d B · %s)", prefix, truncateMiddle(e.File, contentW), e.Bytes, mutedStyle.Render(elapsed))
 
 	case EventFileMutate:
 		e := ev.FileMutate
 		if e == nil {
 			return ""
 		}
-		// ── CRITICAL ENGINE I/O: cyan/teal (#89dceb) per visual hierarchy ──
 		prefix := lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Render("→")
-		return fmt.Sprintf("%s Patch %s (+%d / -%d lines)", prefix, e.File, e.LinesAdd, e.LinesDel)
+		return fmt.Sprintf("%s Patch %s (+%d / -%d lines)", prefix, truncateMiddle(e.File, contentW), e.LinesAdd, e.LinesDel)
 
 	case EventCommandExec:
 		e := ev.CommandExec
@@ -200,7 +207,7 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int) string {
 			exitStr = redStyle.Render(exitStr)
 		}
 		elapsed := formatElapsed(e.Elapsed)
-		return fmt.Sprintf("* Exec %s (%s · %s)", yellowStyle.Render(e.Command), exitStr, mutedStyle.Render(elapsed))
+		return fmt.Sprintf("* Exec %s (%s · %s)", yellowStyle.Render(truncateMiddle(e.Command, contentW)), exitStr, mutedStyle.Render(elapsed))
 
 	case EventSearch:
 		e := ev.Search
@@ -208,7 +215,7 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int) string {
 			return ""
 		}
 		prefix := orangeStyle.Render("*")
-		return fmt.Sprintf("%s Search %s (%d hits)", prefix, e.Query, e.Hits)
+		return fmt.Sprintf("%s Search %s (%d hits)", prefix, truncateMiddle(e.Query, contentW), e.Hits)
 
 	case EventResolve:
 		e := ev.Resolve
@@ -216,11 +223,55 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int) string {
 			return ""
 		}
 		prefix := orangeStyle.Render("*")
-		return fmt.Sprintf("%s Resolve %s (%d hits)", prefix, e.Symbol, e.Hits)
+		return fmt.Sprintf("%s Resolve %s (%d hits)", prefix, truncateMiddle(e.Symbol, contentW), e.Hits)
 
 	default:
 		return ""
 	}
+}
+
+// truncateMiddle shortens a long string to at most maxW visual cells, keeping
+// the head and a short tail separated by an ellipsis so identity stays
+// recognizable. Strings already within the budget are returned unchanged.
+func truncateMiddle(s string, maxW int) string {
+	if maxW < 8 {
+		maxW = 8
+	}
+	if lipgloss.Width(s) <= maxW {
+		return s
+	}
+	runes := []rune(s)
+	// Reserve room for the ellipsis and a short identity tail; the head and
+	// tail together never exceed the cell budget.
+	tail := 3
+	head := maxW - 3 - tail
+	if head < 2 {
+		head = 2
+	}
+	if head+3+tail > maxW {
+		tail = maxW - 3 - head
+		if tail < 1 {
+			tail = 1
+		}
+	}
+	// Build head greedily up to the cell budget; the tail is the final cells.
+	headS := ""
+	headW := 0
+	for _, r := range runes {
+		w := runewidth.RuneWidth(r)
+		if headW+w > head {
+			break
+		}
+		headS += string(r)
+		headW += w
+	}
+	tailS := ""
+	tailW := 0
+	for i := len(runes) - 1; i >= 0 && tailW+runewidth.RuneWidth(runes[i]) <= tail; i-- {
+		tailS = string(runes[i]) + tailS
+		tailW += runewidth.RuneWidth(runes[i])
+	}
+	return headS + "..." + tailS
 }
 
 func formatElapsed(d time.Duration) string {

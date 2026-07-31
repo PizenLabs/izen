@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -207,42 +208,9 @@ func (m *model) renderReasoningBlock(width int) string {
 }
 
 // wrapString wraps text to a given width, splitting at word boundaries.
+// It delegates to the shared ANSI-aware, cell-accurate wrapper.
 func wrapString(text string, width int) []string {
-	if len(text) == 0 || width < 1 {
-		return []string{text}
-	}
-	var result []string
-	words := strings.Fields(text)
-	if len(words) == 0 {
-		// No whitespace — hard wrap
-		runes := []rune(text)
-		for i := 0; i < len(runes); i += width {
-			end := i + width
-			if end > len(runes) {
-				end = len(runes)
-			}
-			result = append(result, string(runes[i:end]))
-		}
-		return result
-	}
-	var line strings.Builder
-	for _, word := range words {
-		wordW := lipgloss.Width(word)
-		if line.Len() > 0 && line.Len()+1+wordW > width {
-			result = append(result, line.String())
-			line.Reset()
-			line.WriteString(word)
-		} else {
-			if line.Len() > 0 {
-				line.WriteString(" ")
-			}
-			line.WriteString(word)
-		}
-	}
-	if line.Len() > 0 {
-		result = append(result, line.String())
-	}
-	return result
+	return wrapText(text, width)
 }
 
 // renderProposalBlock renders the interactive proposal/processing dock
@@ -1106,6 +1074,34 @@ func renderTitledTopBorder(totalWidth int, label string) string {
 		borderColor.Render(strings.Repeat(fill, rightFillN)+right)
 }
 
+// selfHealRetryRe matches a self-healing retry activity line emitted by the
+// event projection: "[RETRY 2] [TYPE_MISMATCH] worker.go". The optional
+// trailing text is the mutated file path.
+var selfHealRetryRe = regexp.MustCompile(`^\[RETRY (\d+)\] \[([A-Z_]+)\](?: (.*))?$`)
+
+// selfHealExhaustedRe matches a self-healing exhaustion activity line emitted
+// by the event projection: "[EXHAUSTED] self-healing stopped after N attempt(s)..."
+var selfHealExhaustedRe = regexp.MustCompile(`^\[EXHAUSTED\](.*)$`)
+
+// failureCategoryStyle maps a failure category label (e.g. "SYNTAX_ERROR") to
+// a deterministic color so each self-healing retry reads distinctly.
+func failureCategoryStyle(category string) lipgloss.Style {
+	switch strings.ToUpper(strings.TrimSpace(category)) {
+	case "SYNTAX_ERROR":
+		return redStyle
+	case "TYPE_MISMATCH":
+		return yellowStyle
+	case "MISSING_IMPORT":
+		return blueStyle
+	case "TEST_FAILURE":
+		return orangeStyle
+	case "SYSTEM_PERMISSION":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(colorMaroon))
+	default:
+		return mutedStyle
+	}
+}
+
 // styleActivityLine renders a system activity log line with mixed
 // styling. Status badges ([ OK ], [FAIL]) are colorized, and any
 // remaining Markdown syntax (bold **...**, bullets - ...) in the
@@ -1113,6 +1109,22 @@ func renderTitledTopBorder(totalWidth int, label string) string {
 // TUI markdown pipeline so the viewport never shows raw asterisks
 // or dashes from the LLM's system summary.
 func (m *model) styleActivityLine(line string) string {
+	// ── SELF-HEALING BADGES ────────────────────────────────────────
+	// Distinct retry / exhausted indicators with the attempt count and
+	// failure category colorized deterministically.
+	if mh := selfHealRetryRe.FindStringSubmatch(line); mh != nil {
+		retry := badgeRetryStyle.Render("[RETRY " + mh[1] + "]")
+		cat := failureCategoryStyle(mh[2]).Render("[" + mh[2] + "]")
+		out := retry + " " + cat
+		if mh[3] != "" {
+			out += " " + systemActivityStyle.Render(mh[3])
+		}
+		return out
+	}
+	if mh := selfHealExhaustedRe.FindStringSubmatch(line); mh != nil {
+		return badgeExhaustedStyle.Render("[EXHAUSTED]") + systemActivityStyle.Render(mh[1])
+	}
+
 	okTag := "[ OK ]"
 	failTag := "[FAIL]"
 	if idx := strings.Index(line, okTag); idx >= 0 {
@@ -1142,7 +1154,7 @@ func (m *model) styleActivityLine(line string) string {
 
 func (m *model) printRecord(rec record) string {
 	gutter := gutterFor(rec.role)
-	content := rec.text
+	content := sanitizeText(rec.text)
 
 	if rec.role == roleAI {
 		return m.renderAIResponseBlocks(content, m.width)
@@ -1153,60 +1165,13 @@ func (m *model) printRecord(rec record) string {
 		wrapWidth = 20
 	}
 
-	wrapStringToWidth := func(text string, maxW int) []string {
-		if len(text) == 0 || maxW < 1 {
-			return []string{""}
-		}
-		var chunks []string
-		var currentLine strings.Builder
-		flushLine := func() {
-			if currentLine.Len() > 0 {
-				chunks = append(chunks, currentLine.String())
-				currentLine.Reset()
-			}
-		}
-		runes := []rune(text)
-		n := len(runes)
-		wordStart := 0
-		for i := 0; i <= n; i++ {
-			if i == n || runes[i] == ' ' || runes[i] == '\t' || runes[i] == '\n' {
-				if i > wordStart {
-					word := string(runes[wordStart:i])
-					wordW := lipgloss.Width(word)
-					switch {
-					case wordW > maxW:
-						flushLine()
-						for j := 0; j < len([]rune(word)); j += maxW {
-							end := j + maxW
-							if end > len([]rune(word)) {
-								end = len([]rune(word))
-							}
-							chunks = append(chunks, string([]rune(word)[j:end]))
-						}
-					case currentLine.Len() > 0 && currentLine.Len()+1+wordW > maxW:
-						flushLine()
-						currentLine.WriteString(word)
-					default:
-						if currentLine.Len() > 0 {
-							currentLine.WriteString(" ")
-						}
-						currentLine.WriteString(word)
-					}
-				}
-				wordStart = i + 1
-				if i == n {
-					break
-				}
-			}
-		}
-		flushLine()
-		if len(chunks) == 0 {
-			return []string{""}
-		}
-		return chunks
+	// Per-line wrapping preserves explicit \n line breaks (TODO checklist
+	// items, error log lines) and keeps leading indentation on continuation
+	// lines so nested structures never collapse or overlap.
+	var wrappedLines []string
+	for _, srcLine := range strings.Split(content, "\n") {
+		wrappedLines = append(wrappedLines, wrapIndentedLine(srcLine, wrapWidth)...)
 	}
-
-	wrappedLines := wrapStringToWidth(content, wrapWidth)
 
 	switch rec.role {
 	case roleUser:
