@@ -13,6 +13,7 @@ import (
 	"github.com/PizenLabs/izen/internal/controlplane/guard"
 	"github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/events"
+	wschk "github.com/PizenLabs/izen/internal/workspace/checkpoint"
 )
 
 type FileMutation struct {
@@ -44,6 +45,12 @@ type Executor struct {
 	engine     *Engine
 	tx         *engine.Transaction
 	scopeGuard *guard.ScopeGuard
+
+	// checkpointMgr, when wired, protects every ApplyMutation with an atomic
+	// rollback checkpoint: the target's original state is captured before the
+	// write and restored if the patch or subsequent compilation fails. Nil
+	// disables checkpointing entirely (headless/CLI fallbacks unchanged).
+	checkpointMgr *wschk.Manager
 }
 
 func NewExecutor(root string, engine *Engine) *Executor {
@@ -51,6 +58,35 @@ func NewExecutor(root string, engine *Engine) *Executor {
 		root:   root,
 		engine: engine,
 	}
+}
+
+// WithCheckpointManager wires a checkpoint manager so every mutation applied
+// through this executor is protected by an atomic rollback checkpoint. Nil
+// disables checkpointing.
+func (ex *Executor) WithCheckpointManager(mgr *wschk.Manager) *Executor {
+	ex.checkpointMgr = mgr
+	return ex
+}
+
+// CommitOpenCheckpoints finalizes every open checkpoint after successful
+// build/test verification, discarding the buffered original blobs. It is a
+// no-op when no checkpoint manager is wired.
+func (ex *Executor) CommitOpenCheckpoints() error {
+	if ex.checkpointMgr == nil {
+		return nil
+	}
+	return ex.checkpointMgr.CommitAll()
+}
+
+// RollbackOpenCheckpoints atomically restores the workspace to the state
+// captured by every open checkpoint: modified files are restored byte-exactly
+// and newly created files are deleted. It is a no-op when no checkpoint
+// manager is wired.
+func (ex *Executor) RollbackOpenCheckpoints() error {
+	if ex.checkpointMgr == nil {
+		return nil
+	}
+	return ex.checkpointMgr.RollbackAll()
 }
 
 // SetScopeGuard attaches a scope guard for pre- and post-mutation validation.
@@ -65,7 +101,7 @@ func (ex *Executor) SetTransaction(tx *engine.Transaction) {
 	ex.tx = tx
 }
 
-func (ex *Executor) ApplyMutation(ctx context.Context, mut FileMutation) error {
+func (ex *Executor) ApplyMutation(ctx context.Context, mut FileMutation) (retErr error) {
 	start := time.Now()
 	strategy := mutationStrategy(mut)
 	if ex.engine != nil {
@@ -107,6 +143,26 @@ func (ex *Executor) ApplyMutation(ctx context.Context, mut FileMutation) error {
 		err := fmt.Errorf("human validation required for %s: mutation must be approved via Proposal UI before execution", mut.File)
 		ex.emitFailure(events.FailureRecoverable, err, "build.guardrail")
 		return err
+	}
+
+	// Stateful checkpoint: capture the target's byte-exact original state before
+	// writing any patch to disk. If the write, a post-mutation scope check, or
+	// the subsequent compilation verification fails, the mutation is rolled
+	// back atomically. The checkpoint stays open on success until compilation
+	// and tests pass (CommitOpenCheckpoints) or fail (RollbackOpenCheckpoints).
+	if ex.checkpointMgr != nil {
+		chk, err := ex.checkpointMgr.CreateCheckpoint("build.executor", []string{mut.File})
+		if err != nil {
+			ex.emitFailure(events.FailurePermanent, err, "build.checkpoint")
+			return fmt.Errorf("checkpoint %s: %w", mut.File, err)
+		}
+		defer func() {
+			if retErr != nil {
+				if rbErr := ex.checkpointMgr.Rollback(chk.ID); rbErr != nil {
+					retErr = fmt.Errorf("%w; rollback %s failed: %w", retErr, mut.File, rbErr)
+				}
+			}
+		}()
 	}
 
 	if err := os.WriteFile(absPath, []byte(mut.Content), 0644); err != nil {
@@ -183,10 +239,21 @@ func (ex *Executor) CheckAndRecover(ctx context.Context, file string, content st
 	}
 	if ok {
 		ex.engine.RecordCompilationSuccess()
+		// Compilation and tests passed — finalize every open checkpoint and
+		// discard the buffered original blobs.
+		if err := ex.CommitOpenCheckpoints(); err != nil {
+			return false, output, fmt.Errorf("commit checkpoints: %w", err)
+		}
 		return true, "", nil
 	}
 
 	ex.engine.RecordCompilationFailure(file)
+
+	// Compilation failed — automatically roll back every open checkpoint so the
+	// workspace returns to its exact pre-mutation state before any retry.
+	if err := ex.RollbackOpenCheckpoints(); err != nil {
+		return false, output, fmt.Errorf("rollback checkpoints: %w", err)
+	}
 
 	if ex.engine.MustRewriteEntireFile(file) {
 		mut := FileMutation{

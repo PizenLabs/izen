@@ -27,7 +27,7 @@ func NewBuildStage(engine *Engine, executor *Executor) *BuildStage {
 func (s *BuildStage) Contract() contract.StageContract {
 	return contract.StageContract{
 		Name:           "executor",
-		AllowedPerms:   []contract.PermissionLevel{contract.PermWorkspace, contract.PermExec, contract.PermPatch},
+		AllowedPerms:   []contract.PermissionLevel{contract.PermWorkspace, contract.PermExec, contract.PermPatch, contract.PermCheckpoint},
 		HasSideEffects: true,
 		CanRetry:       true,
 	}
