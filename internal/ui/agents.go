@@ -63,6 +63,16 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			// Feature/UnitTest/Refactor intents skip external dependency search and
 			// Docker checks — only Bug/Regression intents get full forensic treatment.
 			eng.Intent = investigate.ClassifyIntent(content)
+			// Inject workspace snapshot cache and capability registry for
+			// archetype-aware diagnostic gating.
+			if m.runtimeCtx != nil {
+				if m.runtimeCtx.SnapCache != nil {
+					eng.WithSnapshotCache(m.runtimeCtx.SnapCache)
+				}
+				if m.runtimeCtx.CapRegistry != nil {
+					eng.WithCapabilityRegistry(m.runtimeCtx.CapRegistry)
+				}
+			}
 			result, err := eng.RunContext(ctx)
 			ledgerContent := eng.FormatLedgerForPlan()
 			outCh <- outcome{result: result, err: err, ledgerForPlan: ledgerContent, engLedger: eng.Ledger}

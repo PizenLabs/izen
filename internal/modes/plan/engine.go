@@ -9,6 +9,8 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
+	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
 	"github.com/PizenLabs/izen/pkg/grounding"
 	"github.com/PizenLabs/izen/pkg/recon"
 )
@@ -26,6 +28,11 @@ type Engine struct {
 	rootPath     string   // workspace root for file discovery
 	AllowedFiles []string // grounded file tree for scope guard validation
 	vanillaWeb   bool     // when true, skip Go-specific fast-track paths
+
+	// snapCache and capReg are injected at bootstrap for archetype-aware
+	// diagnostic gating. They are optional; nil values are safe.
+	snapCache *wssnapshot.SnapshotCache
+	capReg    *wscap.ArchetypeCapabilityRegistry
 }
 
 // NewEngine creates a new Engine instance with the provided components.
@@ -46,6 +53,20 @@ func (e *Engine) SetRootPath(rootPath string) { e.rootPath = rootPath }
 
 // SetAllowedFiles sets the grounded file tree for scope guard validation.
 func (e *Engine) SetAllowedFiles(files []string) { e.AllowedFiles = files }
+
+// WithSnapshotCache injects a workspace snapshot cache for archetype-aware
+// diagnostic gating. May be nil.
+func (e *Engine) WithSnapshotCache(sc *wssnapshot.SnapshotCache) *Engine {
+	e.snapCache = sc
+	return e
+}
+
+// WithCapabilityRegistry injects an archetype capability registry for
+// archetype-aware diagnostic gating. May be nil.
+func (e *Engine) WithCapabilityRegistry(cr *wscap.ArchetypeCapabilityRegistry) *Engine {
+	e.capReg = cr
+	return e
+}
 
 // DiscoverAllowedFiles runs pkg/recon and pkg/grounding to discover the
 // workspace file tree. Returns the allowed file list or an error.
@@ -154,6 +175,17 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	if !fastTrack && e.rootPath != "" {
 		if ac, err := recon.DetectArchetype(e.rootPath); err == nil && ac != nil {
 			e.vanillaWeb = (ac.Type == recon.VANILLA_WEB)
+		}
+		// Also check the capability registry if available. This extends the
+		// vanillaWeb guard to cover non-Go archetypes (e.g., NODE_APP, PYTHON_ENV)
+		// that the capability registry identifies as lacking Go tooling.
+		if !e.vanillaWeb && e.capReg != nil && e.snapCache != nil {
+			//nolint:contextcheck
+			if snap, snapErr := e.snapCache.GetSnapshot(e.rootPath); snapErr == nil {
+				if !e.capReg.ArchetypeHasGoTools(snap.Archetype) {
+					e.vanillaWeb = true
+				}
+			}
 		}
 	}
 

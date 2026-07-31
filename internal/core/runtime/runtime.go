@@ -1,5 +1,6 @@
-// Package runtime aggregates the capability guard, mutation budget, and
-// artifact registry into a single RuntimeContext for the execution engine.
+// Package runtime aggregates the capability guard, mutation budget, artifact
+// registry, workspace snapshot cache, and archetype capability registry into a
+// single RuntimeContext for the execution engine.
 package runtime
 
 import (
@@ -8,23 +9,47 @@ import (
 	"github.com/PizenLabs/izen/internal/core/artifact"
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/core/capability"
+	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
+	"github.com/PizenLabs/izen/internal/workspace/snapshot"
 )
 
 // RuntimeContext is the aggregation point for the capability guard, mutation
 // budget, and artifact registry. It provides high-level evaluation functions
 // that the execution engine uses to authorise operations.
 type RuntimeContext struct {
-	Artifacts *artifact.Store
-	Caps      *capability.CapabilitySet
-	Budget    *budget.MutationBudget
+	Artifacts   *artifact.Store
+	Caps        *capability.CapabilitySet
+	Budget      *budget.MutationBudget
+	SnapCache   *snapshot.SnapshotCache
+	CapRegistry *wscap.ArchetypeCapabilityRegistry
 }
 
 // New creates a RuntimeContext with the given dependencies.
 func New(store *artifact.Store, caps *capability.CapabilitySet, b *budget.MutationBudget) *RuntimeContext {
 	return &RuntimeContext{
-		Artifacts: store,
-		Caps:      caps,
-		Budget:    b,
+		Artifacts:   store,
+		Caps:        caps,
+		Budget:      b,
+		SnapCache:   snapshot.NewSnapshotCache(),
+		CapRegistry: wscap.NewArchetypeCapabilityRegistry(),
+	}
+}
+
+// NewWithSnapRegistry creates a RuntimeContext with the given dependencies
+// including explicit snapshot cache and capability registry instances.
+func NewWithSnapRegistry(
+	store *artifact.Store,
+	caps *capability.CapabilitySet,
+	b *budget.MutationBudget,
+	snapCache *snapshot.SnapshotCache,
+	capReg *wscap.ArchetypeCapabilityRegistry,
+) *RuntimeContext {
+	return &RuntimeContext{
+		Artifacts:   store,
+		Caps:        caps,
+		Budget:      b,
+		SnapCache:   snapCache,
+		CapRegistry: capReg,
 	}
 }
 

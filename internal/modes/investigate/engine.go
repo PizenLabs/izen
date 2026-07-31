@@ -9,6 +9,8 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
+	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
 	"github.com/PizenLabs/izen/pkg/recon"
 )
 
@@ -62,6 +64,11 @@ type Engine struct {
 
 	retriever Retriever
 	executor  TestExecutor
+
+	// snapCache and capReg are injected at bootstrap for archetype-aware
+	// diagnostic gating. They are optional; nil values are safe.
+	snapCache *wssnapshot.SnapshotCache
+	capReg    *wscap.ArchetypeCapabilityRegistry
 }
 
 type InvestigationResult struct {
@@ -127,6 +134,20 @@ func NewEngineWithAI(root, problem string, retriever Retriever, executor TestExe
 	return eng
 }
 
+// WithSnapshotCache injects a workspace snapshot cache for archetype-aware
+// diagnostic gating. May be nil.
+func (e *Engine) WithSnapshotCache(sc *wssnapshot.SnapshotCache) *Engine {
+	e.snapCache = sc
+	return e
+}
+
+// WithCapabilityRegistry injects an archetype capability registry for
+// archetype-aware diagnostic gating. May be nil.
+func (e *Engine) WithCapabilityRegistry(cr *wscap.ArchetypeCapabilityRegistry) *Engine {
+	e.capReg = cr
+	return e
+}
+
 func (e *Engine) Run() (*InvestigationResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -141,6 +162,18 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 	ac, err := recon.DetectArchetype(e.root)
 	if err == nil && ac != nil {
 		e.vanillaWeb = (ac.Type == recon.VANILLA_WEB)
+	}
+
+	// Also check the capability registry if available. This extends the
+	// vanillaWeb guard to cover non-Go archetypes (e.g., NODE_APP, PYTHON_ENV)
+	// that the capability registry identifies as lacking Go tooling.
+	if !e.vanillaWeb && e.capReg != nil && e.snapCache != nil {
+		//nolint:contextcheck
+		if snap, snapErr := e.snapCache.GetSnapshot(e.root); snapErr == nil {
+			if !e.capReg.ArchetypeHasGoTools(snap.Archetype) {
+				e.vanillaWeb = true
+			}
+		}
 	}
 
 	// Wipe stale conclusion caches from any prior (possibly broken) run so the

@@ -35,6 +35,8 @@ import (
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
+	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
+	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
 )
 
 // NewProgram initializes the active model state context and instantiates the runner engine.
@@ -163,7 +165,22 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		30*time.Second, // max duration per step
 		5,              // max concurrent commands
 	)
-	runtimeCtx := runtime.New(artStore, caps, bgt)
+
+	// ── WORKSPACE SNAPSHOT + CAPABILITY REGISTRY ─────────────────────────
+	// The snapshot cache is the single source of truth for workspace state.
+	// The capability registry maps detected archetypes to allowed diagnostic
+	// capabilities, preventing dispatch of irrelevant tools (e.g., Go build
+	// on pure HTML/CSS projects).
+	snapCache := wssnapshot.NewSnapshotCache()
+	capReg := wscap.NewArchetypeCapabilityRegistry()
+	_, _ = snapCache.GetSnapshot(root) // prime the cache
+
+	runtimeCtx := runtime.NewWithSnapRegistry(artStore, caps, bgt, snapCache, capReg)
+
+	// Wire snapshot cache and capability registry into the plan engine for
+	// archetype-aware diagnostic gating.
+	planEng.WithSnapshotCache(snapCache).WithCapabilityRegistry(capReg)
+
 	workflowSM := workflow.NewWorkflowStateMachine()
 	wcc := control.NewWorkflowCheckpointManager(execEng.Checkpoints, root)
 	workflowSM.WithCheckpointCoordinator(workflow.NewCheckpointCoordinator(wcc))

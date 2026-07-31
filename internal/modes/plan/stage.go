@@ -5,14 +5,18 @@ import (
 	"fmt"
 
 	"github.com/PizenLabs/izen/internal/core/contract"
+	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
+	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
 )
 
 const (
-	CtxKeyProblem     = "problem"
-	CtxKeyModelName   = "model_name"
-	CtxKeyFastTrack   = "fast_track"
-	CtxKeyFastPrompt  = "fast_prompt"
-	CtxKeyLedgerInput = "ledger_input"
+	CtxKeyProblem            = "problem"
+	CtxKeyModelName          = "model_name"
+	CtxKeyFastTrack          = "fast_track"
+	CtxKeyFastPrompt         = "fast_prompt"
+	CtxKeyLedgerInput        = "ledger_input"
+	CtxKeyWorkspaceSnapshot  = "workspace_snapshot"
+	CtxKeyCapabilityRegistry = "capability_registry"
 )
 
 type PlanStage struct {
@@ -36,6 +40,14 @@ func (s *PlanStage) Execute(ctx context.Context, in contract.StageInput) (contra
 	ledgerInput, _ := in.Context[CtxKeyLedgerInput].(string)
 	problem, _ := in.Context[CtxKeyProblem].(string)
 	modelName, _ := in.Context[CtxKeyModelName].(string)
+
+	// Wire snapshot cache and capability registry from context if present.
+	if snapCache, ok := in.Context[CtxKeyWorkspaceSnapshot].(*wssnapshot.SnapshotCache); ok && snapCache != nil {
+		s.engine.WithSnapshotCache(snapCache)
+	}
+	if capReg, ok := in.Context[CtxKeyCapabilityRegistry].(*wscap.ArchetypeCapabilityRegistry); ok && capReg != nil {
+		s.engine.WithCapabilityRegistry(capReg)
+	}
 
 	fastTrack, _ := in.Context[CtxKeyFastTrack].(bool)
 	if fastTrack {
