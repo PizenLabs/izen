@@ -228,12 +228,14 @@ func bufferApplyPatch(tc ai.ToolCall, cwd string) (*BufferedToolCall, error) {
 	}
 	orig := string(data)
 
-	idx := strings.Index(orig, params.Search)
-	if idx == -1 {
+	// Use the whitespace/indentation-tolerant matcher shared with the LLM
+	// SEARCH/REPLACE pipeline so a search block with minor whitespace drift
+	// still applies cleanly instead of failing with a context mismatch.
+	modified, ok := ApplySearchReplace(orig, params.Search, params.Replace)
+	if !ok || modified == orig {
 		return nil, fmt.Errorf("search text not found in %s", params.Path)
 	}
 
-	modified := strings.Replace(orig, params.Search, params.Replace, 1)
 	diff := buildDiff(orig, modified, params.Path)
 
 	return &BufferedToolCall{
@@ -395,12 +397,13 @@ func dispatchApplyPatch(tc ai.ToolCall, cwd string) (*ToolCallResult, error) {
 	}
 	orig := string(data)
 
-	idx := strings.Index(orig, params.Search)
-	if idx == -1 {
+	// Use the whitespace/indentation-tolerant matcher shared with the LLM
+	// SEARCH/REPLACE pipeline so a search block with minor whitespace drift
+	// still applies cleanly instead of failing with a context mismatch.
+	modified, ok := ApplySearchReplace(orig, params.Search, params.Replace)
+	if !ok || modified == orig {
 		return nil, fmt.Errorf("search text not found in %s", params.Path)
 	}
-
-	modified := strings.Replace(orig, params.Search, params.Replace, 1)
 
 	if err := os.WriteFile(absPath, []byte(modified), 0644); err != nil {
 		return nil, fmt.Errorf("write file %s: %w", params.Path, err)

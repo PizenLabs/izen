@@ -1,8 +1,12 @@
 package plan
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/PizenLabs/izen/internal/prompt"
 )
 
 func TestIsDocumentationTarget(t *testing.T) {
@@ -196,5 +200,122 @@ func TestFilterUndefinedSymbolShellExec_EmptyInput(t *testing.T) {
 	}
 	if out := FilterUndefinedSymbolShellExec([]Task{}, ""); len(out) != 0 {
 		t.Fatalf("expected empty for empty input, got %d", len(out))
+	}
+}
+
+func TestFilterNonExistentMutationTargets(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "index.html"), []byte("<div>ok</div>"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// script.js is the classic hallucinated speculative asset — absent on disk.
+	if err := os.MkdirAll(filepath.Join(root, "docs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name  string
+		root  string
+		tasks []Task
+		want  []string
+	}{
+		{
+			name: "drops non-existent speculative asset",
+			root: root,
+			tasks: []Task{
+				{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Description: "fix duplicate"},
+				{StepNum: 2, Type: "FILE_MUTATE", Target: "script.js", Description: "wire handler"},
+			},
+			want: []string{"index.html"},
+		},
+		{
+			name: "keeps shell and git tasks",
+			root: root,
+			tasks: []Task{
+				{StepNum: 1, Type: "SHELL_EXEC", Target: "go test ./...", Description: "verify"},
+				{StepNum: 2, Type: "GIT_ACTION", Target: "commit -m fix", Description: "commit"},
+			},
+			want: []string{"go test ./...", "commit -m fix"},
+		},
+		{
+			name: "drops FILE_EDIT on missing file too",
+			root: root,
+			tasks: []Task{
+				{StepNum: 1, Type: "FILE_EDIT", Target: "styles.css", Description: "fix style"},
+			},
+			want: nil,
+		},
+		{
+			name: "preserves hardcoded tasks",
+			root: root,
+			tasks: []Task{
+				{StepNum: 1, Type: "FILE_MUTATE", Target: "not-there.go", Description: "hardcoded fix", IsHardcoded: true},
+			},
+			want: []string{"not-there.go"},
+		},
+		{
+			name: "directory target dropped",
+			root: root,
+			tasks: []Task{
+				{StepNum: 1, Type: "FILE_MUTATE", Target: "docs", Description: "patch dir"},
+			},
+			want: nil,
+		},
+		{
+			name:  "empty root passes tasks through",
+			root:  "",
+			tasks: []Task{{StepNum: 1, Type: "FILE_MUTATE", Target: "anything.js", Description: "x"}},
+			want:  []string{"anything.js"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := FilterNonExistentMutationTargets(tc.tasks, tc.root)
+			var got []string
+			for _, tk := range out {
+				got = append(got, tk.Target)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %d tasks %v, want %v", len(got), got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestFilterNonExistentMutationTargets_EmptyRootKeepsAll(t *testing.T) {
+	tasks := []Task{
+		{StepNum: 1, Type: "FILE_MUTATE", Target: "ghost.js", Description: "x"},
+		{StepNum: 2, Type: "FILE_MUTATE", Target: "real.html", Description: "y"},
+	}
+	out := FilterNonExistentMutationTargets(tasks, "")
+	if len(out) != 2 {
+		t.Fatalf("expected both tasks preserved when root is empty, got %d", len(out))
+	}
+}
+
+func TestEvidenceBasedPlanningDirectivePresentInPrompts(t *testing.T) {
+	d := prompt.EvidenceBasedPlanningDirective()
+	if d == "" {
+		t.Fatal("expected non-empty evidence directive")
+	}
+	for _, want := range []string{"EVIDENCE-BASED", "FILE_MUTATE", "script.js", "styles.css"} {
+		if !strings.Contains(d, want) {
+			t.Fatalf("evidence directive missing %q:\n%s", want, d)
+		}
+	}
+
+	jsonPrompt := prompt.BuildPlanJSONPrompt("problem", "ledger", "", false, "")
+	if !strings.Contains(jsonPrompt, "EVIDENCE-BASED PLANNING") {
+		t.Fatal("BuildPlanJSONPrompt missing evidence directive")
+	}
+	mdPrompt := prompt.BuildPlanPrompt("objective", "context", false, "")
+	if !strings.Contains(mdPrompt, "EVIDENCE-BASED PLANNING") {
+		t.Fatal("BuildPlanPrompt missing evidence directive")
 	}
 }

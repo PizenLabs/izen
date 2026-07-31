@@ -26,6 +26,14 @@ import (
 // instead of falling through to a destructive full-file overwrite.
 var ErrInvalidPatchFormat = errors.New("invalid patch format")
 
+// MaxFullContentRewriteBytes caps the target file size (in bytes) for the
+// graceful full-content-rewrite fallback. When every SEARCH/REPLACE and
+// unified-diff strategy has failed twice, a small file (e.g. index.html)
+// may be safely rewritten from the best-effort resolved content instead of
+// aborting. Larger files are never full-rewritten on a fuzzy path because a
+// mangled payload could silently clobber a large body of correct code.
+const MaxFullContentRewriteBytes = 50 * 1024
+
 // IsAmbiguousSnippet checks whether a patch payload is likely a raw code
 // snippet (not a properly formatted SEARCH/REPLACE block, unified diff, or
 // full-file rewrite). Returns true when:
@@ -549,10 +557,15 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		}
 	}
 
-	if patch.Original == "" {
-		if data, err := os.ReadFile(fullPath); err == nil {
-			patch.Original = string(data)
-		}
+	// Fresh Context Enforcement: always re-read the exact bytes currently on
+	// disk before any SEARCH/REPLACE or unified-diff matching. A stale
+	// `patch.Original` captured earlier — or captured before a sibling
+	// mutation in the same batch touched the file — is the root cause of
+	// "patch hunk does not match file content" failures. When the file does
+	// not exist yet, the value supplied by the caller (if any) is preserved
+	// for the new-file path.
+	if data, err := os.ReadFile(fullPath); err == nil {
+		patch.Original = string(data)
 	}
 
 	// Record file in transaction for rollback capability
@@ -640,132 +653,58 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	// unrelated files within a single code block.
 	diffInput := SplitAndFilterPatches(patch.Modified, patch.File)
 
-	var final string
-	var patchErr error
+	// Resolve the final file content through the strategy cascade (unified
+	// diff → SEARCH/REPLACE blocks → legacy content block → full content).
+	// `patch.Original` holds the exact bytes freshly read from disk, so every
+	// SEARCH/hunk context is matched against the true current file content.
+	final, patchErr := pm.resolvePatchContent(patch.Original, diffInput, patch)
 
-	// ── FULL-REWRITE EARLY EXIT ──────────────────────────────────────────
-	// When the caller explicitly marks this patch as IsFullRewrite (e.g. after
-	// SEARCH/REPLACE and unified diff both failed across multiple retries),
-	// skip all diff/SEARCH/REPLACE strategies and write the modified content
-	// directly. This is the last resort for small models that cannot produce
-	// well-formed patch blocks.
-	if patch.IsFullRewrite && patch.Original != "" {
-		clean := SanitizeDiffContent(diffInput)
-		if strings.TrimSpace(clean) == "" {
-			return fmt.Errorf("full rewrite for %s: empty content", patch.File)
+	// ── FRESH CONTEXT RETRY (ONCE) ──────────────────────────────────────
+	// When a patch fails to match its SEARCH/hunk context, the file may have
+	// changed between when the caller captured `patch.Original` and now (e.g.
+	// a sibling mutation in the same batch, or an external editor save).
+	// Re-read the exact bytes from disk and re-attempt the resolution ONCE
+	// before reporting a failure.
+	if patchErr != nil {
+		if data, err := os.ReadFile(fullPath); err == nil && string(data) != patch.Original {
+			patch.Original = string(data)
+			if retried, rerr := pm.resolvePatchContent(patch.Original, diffInput, patch); rerr == nil {
+				final = retried
+				patchErr = nil
+				if globalActivityLog != nil {
+					globalActivityLog("[patch] Context refresh on %s: re-read file and re-resolved patch successfully", patch.File)
+				}
+			}
 		}
-		if reason := IsTruncatedOutput(clean); reason != "" {
-			return fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
+	}
+
+	// ── FORCED FULL-CONTENT FALLBACK (≤50KB) ──────────────────────────
+	// If both attempts still failed to match and the target file is small
+	// (≤ MaxFullContentRewriteBytes, e.g. index.html), a ≤50KB file edit
+	// NEVER aborts with a hunk-mismatch error when the patch payload carries
+	// a valid full replacement text. Write that replacement payload as the
+	// full file content unconditionally. Only an ambiguous-snippet rejection
+	// (ErrInvalidPatchFormat) still short-circuits here so the build agent
+	// can retry with properly formatted SEARCH/REPLACE markers.
+	if patchErr != nil &&
+		!errors.Is(patchErr, ErrInvalidPatchFormat) &&
+		patch.Original != "" &&
+		len(patch.Original) <= MaxFullContentRewriteBytes {
+		if resolved, ok := forcedFullContentFallback(patch.Original, diffInput); ok {
+			if globalActivityLog != nil {
+				globalActivityLog("[patch] SEARCH mismatch — forced full-content fallback applied on %s (%d bytes)", patch.File, len(resolved))
+			}
+			final = resolved
+			patchErr = nil
 		}
+	}
+
+	if patchErr != nil {
 		if globalActivityLog != nil {
-			globalActivityLog("[patch] Full rewrite bypass for %s (%d bytes)", patch.File, len(clean))
+			globalActivityLog("[FAIL] patch rejected on %s: %v", patch.File, patchErr)
 		}
-		final = clean
-		goto commitWrite
+		return fmt.Errorf("apply patch to %s: %w", patch.File, patchErr)
 	}
-
-	// ── FAIL-FAST: reject ambiguous snippets against existing files ──────
-	// If the file exists and the payload contains no SEARCH/REPLACE markers
-	// and no unified diff headers and is significantly smaller than the
-	// original, it is almost certainly a raw code snippet (not a full rewrite).
-	// Rejecting here with ErrInvalidPatchFormat forces the build agent to
-	// retry with a properly formatted block instead of falling through to a
-	// destructive full-file overwrite.
-	if IsAmbiguousSnippet(patch.Original, diffInput) {
-		if globalActivityLog != nil {
-			globalActivityLog("[FAIL] patch rejected on %s: ambiguous snippet without SEARCH/REPLACE markers", patch.File)
-		}
-		return fmt.Errorf("%w: ambiguous snippet without SEARCH/REPLACE markers for existing file %s — retry with SEARCH/REPLACE block or unified diff", ErrInvalidPatchFormat, patch.File)
-	}
-
-	switch {
-	case strings.Contains(diffInput, "@@"):
-		final, patchErr = applyUnifiedPatch(patch.Original, diffInput)
-		if patchErr != nil {
-			// Unified diff failed — attempt search/replace block as fallback
-			// before giving up. This handles context drift where the hunk
-			// anchors no longer match but the modified content still exists
-			// verbatim in the file.
-			if globalActivityLog != nil {
-				globalActivityLog("[patch] Unified diff mismatch on %s — retrying as SEARCH/REPLACE block", patch.File)
-			}
-			// Try SEARCH/REPLACE blocks first (METHOD C)
-			if blocks := ParseSearchReplaceBlocks(diffInput); len(blocks) > 0 {
-				if replaced, ok := ApplySearchReplaceBlocks(patch.Original, blocks); ok && replaced != patch.Original {
-					final = replaced
-					if globalActivityLog != nil {
-						globalActivityLog("[patch] SEARCH/REPLACE block fallback succeeded for %s", patch.File)
-					}
-					break
-				}
-			}
-			clean := SanitizeDiffContent(diffInput)
-			if replaced, ok := applySearchReplaceBlock(patch.Original, clean); ok && replaced != patch.Original {
-				final = replaced
-				if globalActivityLog != nil {
-					globalActivityLog("[patch] Content block fallback succeeded for %s", patch.File)
-				}
-				break
-			}
-			// ── FULL-REWRITE FALLBACK ─────────────────────────────────
-			// Both unified diff and SEARCH/REPLACE strategies failed for
-			// a patch that contains @@ hunk headers. Before giving up, try
-			// treating the entire sanitized content as a full file rewrite.
-			// This handles the case where the LLM output is a mangled diff
-			// that cannot be parsed as hunks but still contains the intended
-			// complete file content.
-			if !isTruncated(patch.Original, clean) {
-				if globalActivityLog != nil {
-					globalActivityLog("[patch] Diff and SEARCH/REPLACE failed on %s — falling back to full-content write (%d bytes)", patch.File, len(clean))
-				}
-				final = clean
-				break
-			}
-			if globalActivityLog != nil {
-				globalActivityLog("[FAIL] patch rejected on %s: %v", patch.File, patchErr)
-			}
-			return fmt.Errorf("apply patch to %s: %w", patch.File, patchErr)
-		}
-	case patch.Original != "":
-		// Try SEARCH/REPLACE block format (METHOD C) — unambiguous markers
-		// that provide exact search context and replacement content.
-		if blocks := ParseSearchReplaceBlocks(diffInput); len(blocks) > 0 {
-			if replaced, ok := ApplySearchReplaceBlocks(patch.Original, blocks); ok && replaced != patch.Original {
-				final = replaced
-				if globalActivityLog != nil {
-					globalActivityLog("[patch] SEARCH/REPLACE block applied to %s", patch.File)
-				}
-				break
-			}
-		}
-		// Attempt legacy content match: if the LLM provided a FILE: block
-		// with only the changed section, try to find and replace it within
-		// the original file content using exact string matching.
-		clean := SanitizeDiffContent(diffInput)
-		if replaced, ok := applySearchReplaceBlock(patch.Original, clean); ok && replaced != patch.Original {
-			final = replaced
-			break
-		}
-		if isTruncated(patch.Original, clean) && !patch.IsFullRewrite && !isTemplateFile(patch.File) {
-			errMsg := fmt.Sprintf("refusing to apply truncated content to %s (%.0f%% of original size)",
-				patch.File, float64(len(clean))/float64(len(patch.Original))*100)
-			if globalActivityLog != nil {
-				globalActivityLog("[FAIL] patch rejected on %s: %s", patch.File, errMsg)
-			}
-			return fmt.Errorf("%s", errMsg)
-		}
-		final = clean
-	default:
-		final = SanitizeDiffContent(diffInput)
-		// Truncation guardrail: reject truncated LLM output before writing
-		// a new file. Only fires for new file creation (patch.Original is empty)
-		// where the LLM produced the full file content directly.
-		if reason := IsTruncatedOutput(final); reason != "" {
-			return fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
-		}
-	}
-
-commitWrite:
 
 	// ── DESTRUCTION GUARDRAIL (DEFENSE IN DEPTH) ──────────────────────
 	// Only reject a patch if the result is effectively a file wipe:
@@ -916,6 +855,258 @@ commitWrite:
 	pm.recordLedgerAndSummarize(patch)
 
 	return pm.store(patch)
+}
+
+// resolvePatchContent resolves the final file content from a patch payload
+// using the strategy cascade: unified diff → SEARCH/REPLACE blocks → legacy
+// content block → full-content rewrite. `original` is the exact bytes read
+// from disk at apply time, so every SEARCH/hunk context is matched against
+// the true current file content.
+//
+// It returns an error when no strategy can safely resolve the content. The
+// caller owns the fresh-context retry (re-read + re-resolve once) and the
+// graceful ≤50KB full-content-rewrite fallback.
+func (pm *PatchManager) resolvePatchContent(original, diffInput string, patch *Patch) (string, error) {
+	// ── FULL-REWRITE EARLY EXIT ──────────────────────────────────────────
+	// When the caller explicitly marks this patch as IsFullRewrite (e.g. after
+	// SEARCH/REPLACE and unified diff both failed across multiple retries),
+	// skip all diff/SEARCH/REPLACE strategies and write the modified content
+	// directly. This is the last resort for small models that cannot produce
+	// well-formed patch blocks.
+	if patch.IsFullRewrite && original != "" {
+		clean := SanitizeDiffContent(diffInput)
+		if strings.TrimSpace(clean) == "" {
+			return "", fmt.Errorf("full rewrite for %s: empty content", patch.File)
+		}
+		if reason := IsTruncatedOutput(clean); reason != "" {
+			return "", fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
+		}
+		if globalActivityLog != nil {
+			globalActivityLog("[patch] Full rewrite bypass for %s (%d bytes)", patch.File, len(clean))
+		}
+		return clean, nil
+	}
+
+	// ── FAIL-FAST: reject ambiguous snippets against existing files ──────
+	// If the file exists and the payload contains no SEARCH/REPLACE markers
+	// and no unified diff headers and is significantly smaller than the
+	// original, it is almost certainly a raw code snippet (not a full rewrite).
+	// Rejecting here with ErrInvalidPatchFormat forces the build agent to
+	// retry with a properly formatted block instead of falling through to a
+	// destructive full-file overwrite.
+	if IsAmbiguousSnippet(original, diffInput) {
+		if globalActivityLog != nil {
+			globalActivityLog("[FAIL] patch rejected on %s: ambiguous snippet without SEARCH/REPLACE markers", patch.File)
+		}
+		return "", fmt.Errorf("%w: ambiguous snippet without SEARCH/REPLACE markers for existing file %s — retry with SEARCH/REPLACE block or unified diff", ErrInvalidPatchFormat, patch.File)
+	}
+
+	switch {
+	// ── SEARCH/REPLACE BLOCKS (METHOD C) ─────────────────────────────────
+	// Handled BEFORE unified-diff detection: a replacement payload that
+	// contains a stray @@ / --- / +++ token (for example inside HTML, inline
+	// JS, or CSS) must never be misrouted into the unified-diff parser. That
+	// misrouting produced "patch hunk does not match file content — target
+	// code context may have changed" failures on small files even though a
+	// complete full replacement payload was present.
+	case strings.Contains(diffInput, "<<<<<<< SEARCH"):
+		if blocks := ParseSearchReplaceBlocks(diffInput); len(blocks) > 0 {
+			if replaced, ok := ApplySearchReplaceBlocks(original, blocks); ok && replaced != original {
+				if globalActivityLog != nil {
+					globalActivityLog("[patch] SEARCH/REPLACE block applied to %s", patch.File)
+				}
+				return replaced, nil
+			}
+			// ── FORCED FULL-CONTENT FALLBACK (≤50KB) ────────────────
+			// Context matching failed, but the payload still carries a valid
+			// replacement text. A ≤50KB target NEVER aborts here — write the
+			// REPLACE payload as the full file content.
+			if content, ok := forcedFullContentFallback(original, diffInput); ok {
+				if globalActivityLog != nil {
+					globalActivityLog("[patch] SEARCH mismatch — forced full-content fallback applied on %s (%d bytes)", patch.File, len(content))
+				}
+				return content, nil
+			}
+		}
+		// SEARCH markers present but no usable replacement payload — refuse
+		// to write raw markers into the file.
+		return "", fmt.Errorf("patch hunk does not match file content — SEARCH/REPLACE context mismatch for %s", patch.File)
+	case strings.Contains(diffInput, "@@"):
+		final, patchErr := applyUnifiedPatch(original, diffInput)
+		if patchErr == nil {
+			return final, nil
+		}
+		// Unified diff failed — attempt search/replace block as fallback
+		// before giving up. This handles context drift where the hunk
+		// anchors no longer match but the modified content still exists
+		// verbatim in the file.
+		if globalActivityLog != nil {
+			globalActivityLog("[patch] Unified diff mismatch on %s — retrying as SEARCH/REPLACE block", patch.File)
+		}
+		// Try SEARCH/REPLACE blocks first (METHOD C)
+		if blocks := ParseSearchReplaceBlocks(diffInput); len(blocks) > 0 {
+			if replaced, ok := ApplySearchReplaceBlocks(original, blocks); ok && replaced != original {
+				if globalActivityLog != nil {
+					globalActivityLog("[patch] SEARCH/REPLACE block fallback succeeded for %s", patch.File)
+				}
+				return replaced, nil
+			}
+		}
+		clean := SanitizeDiffContent(diffInput)
+		if replaced, ok := applySearchReplaceBlock(original, clean); ok && replaced != original {
+			if globalActivityLog != nil {
+				globalActivityLog("[patch] Content block fallback succeeded for %s", patch.File)
+			}
+			return replaced, nil
+		}
+		// ── FORCED FULL-CONTENT FALLBACK (≤50KB) ────────────────
+		// Both unified diff and SEARCH/REPLACE strategies failed. A small
+		// target (≤ MaxFullContentRewriteBytes) is never allowed to abort
+		// with a hunk-mismatch error here — write the best-effort full
+		// content.
+		if content, ok := forcedFullContentFallback(original, diffInput); ok {
+			if globalActivityLog != nil {
+				globalActivityLog("[patch] Diff mismatch on %s — forced full-content fallback applied (%d bytes)", patch.File, len(content))
+			}
+			return content, nil
+		}
+		// Return the bare hunk error: the single "apply patch to <file>:"
+		// context prefix is added ONCE by the top-level execution boundary
+		// (PatchManager.Apply). Wrapping here too would duplicate the file
+		// path in every failure message.
+		return "", patchErr
+	case original != "":
+		// Attempt legacy content match: if the LLM provided a FILE: block
+		// with only the changed section, try to find and replace it within
+		// the original file content using exact string matching.
+		clean := SanitizeDiffContent(diffInput)
+		if replaced, ok := applySearchReplaceBlock(original, clean); ok && replaced != original {
+			return replaced, nil
+		}
+		// CRITICAL: never dump raw <<<<<<< SEARCH / ======= / >>>>>>> markers
+		// into a target file.
+		if containsRawPatchMarkers(clean) {
+			return "", fmt.Errorf("patch hunk does not match file content — raw patch markers in payload for %s", patch.File)
+		}
+		if isTruncated(original, clean) && !patch.IsFullRewrite && !isTemplateFile(patch.File) {
+			// A ≤50KB target never fails over truncation suspicion alone when
+			// a full replacement payload exists in the patch.
+			if content, ok := forcedFullContentFallback(original, diffInput); ok {
+				if globalActivityLog != nil {
+					globalActivityLog("[patch] Truncation-suspected payload on %s — forced full-content fallback applied (%d bytes)", patch.File, len(content))
+				}
+				return content, nil
+			}
+			errMsg := fmt.Sprintf("refusing to apply truncated content to %s (%.0f%% of original size)",
+				patch.File, float64(len(clean))/float64(len(original))*100)
+			if globalActivityLog != nil {
+				globalActivityLog("[FAIL] patch rejected on %s: %s", patch.File, errMsg)
+			}
+			return "", fmt.Errorf("%s", errMsg)
+		}
+		return clean, nil
+	default:
+		final := SanitizeDiffContent(diffInput)
+		// Truncation guardrail: reject truncated LLM output before writing
+		// a new file. Only fires for new file creation (original is empty)
+		// where the LLM produced the full file content directly.
+		if reason := IsTruncatedOutput(final); reason != "" {
+			return "", fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
+		}
+		return final, nil
+	}
+}
+
+// isPatchArtifactContent reports whether content still contains raw patch
+// protocol markers (SEARCH/REPLACE block delimiters or unified-diff headers)
+// that must never be written into a target file as file content.
+func isPatchArtifactContent(content string) bool {
+	if strings.Contains(content, "<<<<<<< SEARCH") ||
+		strings.Contains(content, "<<<<<<< FILE_CREATE") {
+		return true
+	}
+	lines := strings.SplitN(content, "\n", 20)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "<<<<<<<") ||
+			strings.HasPrefix(trimmed, ">>>>>>>") {
+			return true
+		}
+		if strings.HasPrefix(trimmed, "@@") ||
+			strings.HasPrefix(trimmed, "--- ") ||
+			strings.HasPrefix(trimmed, "+++ ") {
+			return true
+		}
+	}
+	return false
+}
+
+// containsRawPatchMarkers reports whether content still contains raw
+// SEARCH/REPLACE protocol delimiters that must never be written into a
+// target file as file content. Only the block delimiters themselves are
+// checked — unlike isPatchArtifactContent it does NOT flag @@ / --- / +++
+// prefixed lines, because those can legitimately appear inside HTML, JS,
+// CSS, or markdown content.
+func containsRawPatchMarkers(content string) bool {
+	lines := strings.SplitN(content, "\n", 32)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "<<<<<<< SEARCH" ||
+			trimmed == "<<<<<<< FILE_CREATE" ||
+			trimmed == "=======" ||
+			trimmed == ">>>>>>>" ||
+			strings.HasPrefix(trimmed, ">>>>>>>") {
+			return true
+		}
+	}
+	return false
+}
+
+// forcedFullContentFallback extracts a usable full-file replacement from a
+// patch payload whose context matching has already failed. It is the last
+// resort for small targets (≤ MaxFullContentRewriteBytes): a SEARCH/REPLACE
+// or unified-diff mismatch must NEVER abort a valid small-file edit when the
+// payload carries replacement text.
+//
+// The guards here are intentionally minimal — the REPLACE payload is the
+// model's authoritative answer for a small file. Only raw protocol
+// delimiters are refused, since they are never valid file content.
+//
+// Returns (replacement, true) when a payload can be written as full content,
+// or ("", false) when no usable replacement exists.
+func forcedFullContentFallback(original, diffInput string) (string, bool) {
+	if original == "" || len(original) > MaxFullContentRewriteBytes {
+		return "", false
+	}
+
+	// Prefer an explicit SEARCH/REPLACE REPLACE payload. A single block's
+	// REPLACE is the model's full-content answer and is applied
+	// unconditionally. With multiple blocks, only a payload that is clearly
+	// full-file-sized (spanning at least the whole original) is promoted, so
+	// a mismatched region edit can never clobber the file.
+	if blocks := ParseSearchReplaceBlocks(diffInput); len(blocks) > 0 {
+		best := ""
+		for _, b := range blocks {
+			if b.replace == "" || containsRawPatchMarkers(b.replace) {
+				continue
+			}
+			if len(b.replace) > len(best) {
+				best = b.replace
+			}
+		}
+		if best != "" && (len(blocks) == 1 || len(best) >= len(original)) {
+			return best, true
+		}
+		return "", false
+	}
+
+	// Best-effort reconstruction for unified-diff payloads: the sanitized
+	// content is the full-file write candidate for small targets.
+	clean := SanitizeDiffContent(diffInput)
+	if clean == "" || clean == original || isPatchArtifactContent(clean) {
+		return "", false
+	}
+	return clean, true
 }
 
 // recordLedgerAndSummarize bridges a successful patch commit to the /plan task
@@ -1634,7 +1825,7 @@ func ParseSearchReplaceBlocks(content string) []searchReplaceBlock {
 // replaces it with the REPLACE text. Returns (result, true) on success or
 // (original, false) if any block's SEARCH text cannot be found.
 //
-// The matching strategy is:
+// The matching strategy is delegated to applySearchReplaceBlockTo:
 //  1. Exact substring match
 //  2. Line-by-line exact match within the line-split original
 //  3. Whitespace-normalized fuzzy match — strips leading/trailing whitespace
@@ -1648,99 +1839,126 @@ func ApplySearchReplaceBlocks(original string, blocks []searchReplaceBlock) (str
 
 	current := original
 	for _, block := range blocks {
-		if block.search == "" {
+		replaced, ok := applySearchReplaceBlockTo(current, block.search, block.replace)
+		if !ok {
 			return original, false
 		}
-		// Strategy 1: exact substring match
-		idx := strings.Index(current, block.search)
-		if idx >= 0 {
-			before := current[:idx]
-			after := current[idx+len(block.search):]
-			current = before + block.replace + after
-			continue
-		}
-
-		// Strategy 2: line-by-line exact contiguous match
-		// Blank lines (empty after trimming) are treated as equivalent.
-		origLines := strings.Split(current, "\n")
-		searchLines := strings.Split(block.search, "\n")
-		replaceLines := strings.Split(block.replace, "\n")
-		found := false
-		if len(searchLines) > 0 && len(searchLines) <= len(origLines) {
-			for i := 0; i <= len(origLines)-len(searchLines); i++ {
-				match := true
-				for j := 0; j < len(searchLines); j++ {
-					if origLines[i+j] != searchLines[j] {
-						if strings.TrimSpace(origLines[i+j]) == "" && strings.TrimSpace(searchLines[j]) == "" {
-							continue
-						}
-						match = false
-						break
-					}
-				}
-				if match {
-					result := make([]string, 0, len(origLines)-len(searchLines)+len(replaceLines))
-					result = append(result, origLines[:i]...)
-					result = append(result, replaceLines...)
-					result = append(result, origLines[i+len(searchLines):]...)
-					current = strings.Join(result, "\n")
-					found = true
-					break
-				}
-			}
-			if found {
-				continue
-			}
-
-			// Strategy 3: whitespace-normalized fuzzy match
-			// Trim each line of both search and original, then compare.
-			// Blank lines (empty after trimming) are always considered equal.
-			// This handles indentation/whitespace drift between the model's
-			// SEARCH block and the actual file content.
-			trimmedSearch := make([]string, len(searchLines))
-			for j, l := range searchLines {
-				trimmedSearch[j] = strings.TrimSpace(l)
-			}
-			for i := 0; i <= len(origLines)-len(searchLines); i++ {
-				match := true
-				for j := 0; j < len(searchLines); j++ {
-					trimmedFile := strings.TrimSpace(origLines[i+j])
-					if trimmedFile == "" && trimmedSearch[j] == "" {
-						continue
-					}
-					if trimmedFile != trimmedSearch[j] {
-						match = false
-						break
-					}
-				}
-				if match {
-					// Calculate indentation from the original for the first
-					// matched line and apply it to the replace lines.
-					result := make([]string, 0, len(origLines)-len(searchLines)+len(replaceLines))
-					result = append(result, origLines[:i]...)
-					for _, rl := range replaceLines {
-						if rl == "" {
-							result = append(result, "")
-						} else {
-							result = append(result, rl)
-						}
-					}
-					result = append(result, origLines[i+len(searchLines):]...)
-					current = strings.Join(result, "\n")
-					found = true
-					if globalActivityLog != nil {
-						globalActivityLog("[patch] Whitespace-normalized SEARCH/REPLACE match succeeded")
-					}
-					break
-				}
-			}
-		}
-		if !found {
-			return original, false
-		}
+		current = replaced
 	}
 
 	return current, true
+}
+
+// ApplySearchReplace applies a single search/replace pair to the original
+// content. It is the exported single-block variant used by the native
+// apply_patch tool (execution/toolcalls.go) so tool-driven edits enjoy the
+// same whitespace/indentation tolerance as the LLM SEARCH/REPLACE pipeline.
+// Returns (result, true) on success or (original, false) when the search text
+// cannot be located even after whitespace-normalized matching.
+func ApplySearchReplace(original, search, replace string) (string, bool) {
+	return applySearchReplaceBlockTo(original, search, replace)
+}
+
+// normalizeLineEndings converts CRLF (and bare CR) line endings to LF so that
+// context matching is line-ending agnostic — a SEARCH block authored with Unix
+// (\n) endings matches a file checked out on Windows (\r\n).
+func normalizeLineEndings(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\r", "\n")
+}
+
+// applySearchReplaceBlockTo applies a single search/replace pair to original
+// using the three-strategy cascade: exact substring match, line-by-line exact
+// match, then whitespace-normalized fuzzy match (tolerating leading/trailing
+// spaces and tabs, indentation drift, and CRLF/LF line-ending differences).
+func applySearchReplaceBlockTo(original, search, replace string) (string, bool) {
+	if original == "" || search == "" {
+		return original, false
+	}
+
+	// Strategy 1: exact substring match
+	idx := strings.Index(original, search)
+	if idx >= 0 {
+		before := original[:idx]
+		after := original[idx+len(search):]
+		return before + replace + after, true
+	}
+
+	// Normalize line endings across both blocks before line-level matching so
+	// files checked out on Windows (\r\n) match SEARCH blocks authored with
+	// Unix (\n) endings.
+	normOriginal := normalizeLineEndings(original)
+	normSearch := normalizeLineEndings(search)
+	normReplace := normalizeLineEndings(replace)
+
+	// Match against the normalized buffers, but construct the result from the
+	// ORIGINAL line array so untouched lines keep their native line endings.
+	origLines := strings.Split(original, "\n")
+	normLines := strings.Split(normOriginal, "\n")
+	searchLines := strings.Split(normSearch, "\n")
+	replaceLines := strings.Split(normReplace, "\n")
+
+	if len(searchLines) == 0 || len(searchLines) > len(normLines) {
+		return original, false
+	}
+
+	// Strategy 2: line-by-line exact contiguous match
+	// Blank lines (empty after trimming) are treated as equivalent.
+	for i := 0; i <= len(normLines)-len(searchLines); i++ {
+		match := true
+		for j := 0; j < len(searchLines); j++ {
+			if normLines[i+j] != searchLines[j] {
+				if strings.TrimSpace(normLines[i+j]) == "" && strings.TrimSpace(searchLines[j]) == "" {
+					continue
+				}
+				match = false
+				break
+			}
+		}
+		if match {
+			result := make([]string, 0, len(origLines)-len(searchLines)+len(replaceLines))
+			result = append(result, origLines[:i]...)
+			result = append(result, replaceLines...)
+			result = append(result, origLines[i+len(searchLines):]...)
+			return strings.Join(result, "\n"), true
+		}
+	}
+
+	// Strategy 3: whitespace-normalized fuzzy match
+	// Trim ALL leading/trailing spaces and tabs from every line of both the
+	// SEARCH block and the target file during comparison, so indentation
+	// drift (tabs vs spaces, extra indent) never breaks the match. When a
+	// window matches, the replacement is built on the original file buffer
+	// using the matched target line offsets.
+	trimmedSearch := make([]string, len(searchLines))
+	for j, l := range searchLines {
+		trimmedSearch[j] = strings.TrimSpace(l)
+	}
+	for i := 0; i <= len(normLines)-len(searchLines); i++ {
+		match := true
+		for j := 0; j < len(searchLines); j++ {
+			trimmedFile := strings.TrimSpace(normLines[i+j])
+			if trimmedFile == "" && trimmedSearch[j] == "" {
+				continue
+			}
+			if trimmedFile != trimmedSearch[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			result := make([]string, 0, len(origLines)-len(searchLines)+len(replaceLines))
+			result = append(result, origLines[:i]...)
+			result = append(result, replaceLines...)
+			result = append(result, origLines[i+len(searchLines):]...)
+			if globalActivityLog != nil {
+				globalActivityLog("[patch] Whitespace-normalized SEARCH/REPLACE match succeeded")
+			}
+			return strings.Join(result, "\n"), true
+		}
+	}
+
+	return original, false
 }
 
 // countUnifiedDiffLines counts added (+) and removed (-) lines in a unified

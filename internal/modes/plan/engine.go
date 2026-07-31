@@ -3,6 +3,8 @@ package plan
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -585,6 +587,13 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 			// a code typo — this ensures only FILE_MUTATE tasks survive.
 			candidates = FilterUndefinedSymbolShellExec(candidates, ledgerContent)
 
+			// EVIDENCE-BASED ANTI-HALLUCINATION BARRIER: drop FILE_MUTATE /
+			// FILE_EDIT targets that reference files not present on disk.
+			// Prevents generic plans that modify every asset (script.js,
+			// styles.css, etc.) on speculation — only files that actually
+			// exist can be mutated.
+			candidates = FilterNonExistentMutationTargets(candidates, e.rootPath)
+
 			// VANILLA_WEB GUARD: Deterministic post-filter over raw LLM task
 			// output. Strips Go toolchain tasks (go mod, go test, go get),
 			// ENV_DEPS tasks, and falls back to a safe default when all tasks
@@ -779,6 +788,59 @@ func FilterUnsolicitedPkgFiles(tasks []Task, ledgerContent string) []Task {
 		}
 	}
 	return filtered
+}
+
+// FilterNonExistentMutationTargets drops FILE_MUTATE / FILE_EDIT tasks whose
+// target file does not exist on disk under rootPath. Mutation tasks
+// semantically modify EXISTING files — a target that is not present on disk is
+// a hallucinated speculative asset (e.g. "script.js" in a workspace that has no
+// such file) that would only fail later with "patch hunk does not match file
+// content". This is the deterministic anti-hallucination barrier backing the
+// EVIDENCE-BASED PLANNING prompt directive: no static/generic assumption that
+// every asset needs modification survives unless the file actually exists.
+//
+// SHELL_EXEC / GIT_ACTION tasks and hardcoded tasks pass through untouched.
+// When rootPath is empty (verification impossible), all tasks are preserved so
+// behaviour is unchanged in headless/CLI contexts without a root.
+func FilterNonExistentMutationTargets(tasks []Task, rootPath string) []Task {
+	if len(tasks) == 0 {
+		return tasks
+	}
+	if rootPath == "" {
+		return tasks
+	}
+	filtered := make([]Task, 0, len(tasks))
+	for _, t := range tasks {
+		if t.Type == "FILE_MUTATE" || t.Type == "FILE_EDIT" {
+			if t.IsHardcoded {
+				filtered = append(filtered, t)
+				continue
+			}
+			if !mutationTargetExists(t.Target, rootPath) {
+				continue
+			}
+		}
+		filtered = append(filtered, t)
+	}
+	return filtered
+}
+
+// mutationTargetExists reports whether the given task target resolves to an
+// existing regular file under rootPath. Absolute targets are checked directly;
+// relative targets are joined onto rootPath.
+func mutationTargetExists(target, rootPath string) bool {
+	if target == "" {
+		return false
+	}
+	candidate := target
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(rootPath, candidate)
+	}
+	info, err := os.Stat(candidate)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
 }
 
 // FilterUndefinedSymbolShellExec removes SHELL_EXEC and GIT_ACTION tasks
