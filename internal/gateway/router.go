@@ -175,6 +175,8 @@ var frontendUIWordPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bwebpage\b`),
 	regexp.MustCompile(`\brender\b`),
 	regexp.MustCompile(`\brendering\b`),
+	regexp.MustCompile(`\bduplicate\b`),
+	regexp.MustCompile(`\bduplication\b`),
 }
 
 // frontendUIPhrases are longer phrases that do not need word boundaries.
@@ -185,6 +187,16 @@ var frontendUIPhrases = []string{
 	"z index",
 	"web page",
 	"re-order",
+	"duplicate content",
+	"index.html",
+	"styles.css",
+	"script.js",
+	"style.css",
+	"app.js",
+	"main.js",
+	"main.css",
+	"static file",
+	"web asset",
 }
 
 // IsFrontendUI reports whether the input describes a UI/Layout/Styling task

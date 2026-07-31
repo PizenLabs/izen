@@ -1225,7 +1225,10 @@ func fuzzyMatchHunk(current string, hunk diffHunk) (string, bool) {
 		return "", false
 	}
 
-	// Phase 1: exact line matching
+	// Phase 1: exact line matching with blank-line normalization.
+	// Blank lines (empty after trimming) are treated as equivalent
+	// regardless of trailing whitespace, preventing context mismatches
+	// around closing HTML tags and similar structures.
 	bestPos := -1
 	bestScore := 0
 
@@ -1233,6 +1236,8 @@ func fuzzyMatchHunk(current string, hunk diffHunk) (string, bool) {
 		score := 0
 		for i := 0; i < len(oldLines); i++ {
 			if lines[pos+i] == oldLines[i] {
+				score++
+			} else if strings.TrimSpace(lines[pos+i]) == "" && strings.TrimSpace(oldLines[i]) == "" {
 				score++
 			}
 		}
@@ -1252,6 +1257,7 @@ func fuzzyMatchHunk(current string, hunk diffHunk) (string, bool) {
 
 	// Phase 2: whitespace-normalized fuzzy match
 	// Strips leading/trailing whitespace from each line before comparing.
+	// Blank lines (empty after trimming) are always considered equal.
 	// Handles indentation drift in 7B model outputs where search blocks
 	// have minor whitespace differences from the actual file content.
 	trimmedOld := make([]string, len(oldLines))
@@ -1261,7 +1267,11 @@ func fuzzyMatchHunk(current string, hunk diffHunk) (string, bool) {
 	for pos := lo; pos <= hi; pos++ {
 		allMatch := true
 		for i := 0; i < len(oldLines); i++ {
-			if strings.TrimSpace(lines[pos+i]) != trimmedOld[i] {
+			trimmedFile := strings.TrimSpace(lines[pos+i])
+			if trimmedFile == "" && trimmedOld[i] == "" {
+				continue
+			}
+			if trimmedFile != trimmedOld[i] {
 				allMatch = false
 				break
 			}
@@ -1363,10 +1373,14 @@ func applySearchReplaceBlock(original, modified string) (string, bool) {
 	}
 
 	// Try to find the modified block as a contiguous sequence within origLines.
+	// Blank lines (empty after trimming) are treated as equivalent.
 	for i := 0; i <= len(origLines)-len(modLines); i++ {
 		match := true
 		for j := 0; j < len(modLines); j++ {
 			if origLines[i+j] != modLines[j] {
+				if strings.TrimSpace(origLines[i+j]) == "" && strings.TrimSpace(modLines[j]) == "" {
+					continue
+				}
 				match = false
 				break
 			}
@@ -1380,6 +1394,7 @@ func applySearchReplaceBlock(original, modified string) (string, bool) {
 
 	// Strategy 3: whitespace-normalized fuzzy match.
 	// Strip leading/trailing whitespace from each line and compare.
+	// Blank lines (empty after trimming) are always considered equal.
 	// If the search block matches after normalization, replace the matching
 	// region while preserving the target file's base indentation.
 	trimmedMod := make([]string, len(modLines))
@@ -1389,7 +1404,11 @@ func applySearchReplaceBlock(original, modified string) (string, bool) {
 	for i := 0; i <= len(origLines)-len(modLines); i++ {
 		match := true
 		for j := 0; j < len(modLines); j++ {
-			if strings.TrimSpace(origLines[i+j]) != trimmedMod[j] {
+			trimmedFile := strings.TrimSpace(origLines[i+j])
+			if trimmedFile == "" && trimmedMod[j] == "" {
+				continue
+			}
+			if trimmedFile != trimmedMod[j] {
 				match = false
 				break
 			}
@@ -1642,6 +1661,7 @@ func ApplySearchReplaceBlocks(original string, blocks []searchReplaceBlock) (str
 		}
 
 		// Strategy 2: line-by-line exact contiguous match
+		// Blank lines (empty after trimming) are treated as equivalent.
 		origLines := strings.Split(current, "\n")
 		searchLines := strings.Split(block.search, "\n")
 		replaceLines := strings.Split(block.replace, "\n")
@@ -1651,6 +1671,9 @@ func ApplySearchReplaceBlocks(original string, blocks []searchReplaceBlock) (str
 				match := true
 				for j := 0; j < len(searchLines); j++ {
 					if origLines[i+j] != searchLines[j] {
+						if strings.TrimSpace(origLines[i+j]) == "" && strings.TrimSpace(searchLines[j]) == "" {
+							continue
+						}
 						match = false
 						break
 					}
@@ -1671,6 +1694,7 @@ func ApplySearchReplaceBlocks(original string, blocks []searchReplaceBlock) (str
 
 			// Strategy 3: whitespace-normalized fuzzy match
 			// Trim each line of both search and original, then compare.
+			// Blank lines (empty after trimming) are always considered equal.
 			// This handles indentation/whitespace drift between the model's
 			// SEARCH block and the actual file content.
 			trimmedSearch := make([]string, len(searchLines))
@@ -1680,7 +1704,11 @@ func ApplySearchReplaceBlocks(original string, blocks []searchReplaceBlock) (str
 			for i := 0; i <= len(origLines)-len(searchLines); i++ {
 				match := true
 				for j := 0; j < len(searchLines); j++ {
-					if strings.TrimSpace(origLines[i+j]) != trimmedSearch[j] {
+					trimmedFile := strings.TrimSpace(origLines[i+j])
+					if trimmedFile == "" && trimmedSearch[j] == "" {
+						continue
+					}
+					if trimmedFile != trimmedSearch[j] {
 						match = false
 						break
 					}

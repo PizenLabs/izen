@@ -445,16 +445,17 @@ func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 		if p.Patch != nil && p.Patch.Modified != "" {
 			modified = p.Patch.Modified
 		}
+		origContent := ""
+		if data, err := os.ReadFile(p.Target.QualifiedName); err == nil {
+			origContent = string(data)
+		}
 		patch := &execution.Patch{
 			ID:            p.ID,
 			File:          p.Target.QualifiedName,
 			Modified:      modified,
+			Original:      origContent,
 			TaskID:        m.currentBuildTaskID,
 			IsFullRewrite: p.Patch != nil && p.Patch.IsFullRewrite,
-		}
-		orig, err := os.ReadFile(p.Target.QualifiedName)
-		if err == nil {
-			patch.Original = string(orig)
 		}
 		if err := m.transitionToBuilding(); err != nil {
 			return mutationResultMsg{err: fmt.Errorf("workflow transition: %w", err), file: p.Target.QualifiedName}
@@ -466,6 +467,29 @@ func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 			return mutationResultMsg{err: err, file: p.Target.QualifiedName}
 		}
 		if err := eng.Patches.Apply(patch); err != nil {
+			// Per-file full-rewrite fallback: when a patch fails due to
+			// hunk/context mismatch (e.g. whitespace variations on blank
+			// lines), retry with IsFullRewrite for this specific file
+			// only, preserving already-successful patches on other files.
+			if origContent != "" && !patch.IsFullRewrite {
+				resolved := execution.ResolveModifiedContent(origContent, modified)
+				if resolved != origContent && !isDiffContent(resolved) {
+					retryPatch := &execution.Patch{
+						ID:            patch.ID + "-full",
+						File:          patch.File,
+						Modified:      resolved,
+						Original:      origContent,
+						TaskID:        patch.TaskID,
+						IsFullRewrite: true,
+					}
+					if retryErr := eng.Patches.Apply(retryPatch); retryErr == nil {
+						return mutationResultMsg{
+							file:   p.Target.QualifiedName,
+							status: "modified",
+						}
+					}
+				}
+			}
 			return mutationResultMsg{err: err, file: p.Target.QualifiedName}
 		}
 		status := "modified"
@@ -512,16 +536,17 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 			if p.Patch != nil && p.Patch.Modified != "" {
 				modified = p.Patch.Modified
 			}
+			origContent := ""
+			if data, err := os.ReadFile(p.Target.QualifiedName); err == nil {
+				origContent = string(data)
+			}
 			patch := &execution.Patch{
 				ID:            p.ID,
 				File:          p.Target.QualifiedName,
 				Modified:      modified,
+				Original:      origContent,
 				TaskID:        m.currentBuildTaskID,
 				IsFullRewrite: p.Patch != nil && p.Patch.IsFullRewrite,
-			}
-			orig, err := os.ReadFile(p.Target.QualifiedName)
-			if err == nil {
-				patch.Original = string(orig)
 			}
 			if err := m.transitionToBuilding(); err != nil {
 				results = append(results, mutationResultMsg{err: fmt.Errorf("workflow transition: %w", err), file: p.Target.QualifiedName})
@@ -535,6 +560,27 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 				continue
 			}
 			if err := eng.Patches.Apply(patch); err != nil {
+				// Per-file full-rewrite fallback: when a patch fails due to
+				// hunk/context mismatch (e.g. whitespace variations on blank
+				// lines), retry with IsFullRewrite for this specific file
+				// only, preserving already-successful patches on other files.
+				if origContent != "" && !patch.IsFullRewrite {
+					resolved := execution.ResolveModifiedContent(origContent, modified)
+					if resolved != origContent && !isDiffContent(resolved) {
+						retryPatch := &execution.Patch{
+							ID:            patch.ID + "-full",
+							File:          patch.File,
+							Modified:      resolved,
+							Original:      origContent,
+							TaskID:        patch.TaskID,
+							IsFullRewrite: true,
+						}
+						if retryErr := eng.Patches.Apply(retryPatch); retryErr == nil {
+							results = append(results, mutationResultMsg{file: p.Target.QualifiedName, status: "modified"})
+							continue
+						}
+					}
+				}
 				results = append(results, mutationResultMsg{err: err, file: p.Target.QualifiedName})
 				continue
 			}
@@ -602,6 +648,22 @@ func sanitizeShellCmd(cmd string) (string, bool, string) {
 	}
 
 	return cmd, false, ""
+}
+
+// isDiffContent reports whether content appears to be a unified diff
+// (contains @@ hunk headers or ---/+++ file markers). Used by the
+// per-file full-rewrite fallback to avoid writing diff headers into files.
+func isDiffContent(s string) bool {
+	lines := strings.SplitN(s, "\n", 6)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "@@") ||
+			strings.HasPrefix(trimmed, "--- ") ||
+			strings.HasPrefix(trimmed, "+++ ") {
+			return true
+		}
+	}
+	return false
 }
 
 // execShellCmd executes a shell command and pushes output as records.

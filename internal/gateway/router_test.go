@@ -420,6 +420,14 @@ func TestIsFrontendUI(t *testing.T) {
 		{"rename @LICENSE", false},
 		{"why is the build failing", false},
 		{"implement the login handler", false},
+		// New patterns: content/duplication and static web assets
+		{"duplicate content", true},
+		{"fix duplicate content", true},
+		{"update index.html", true},
+		{"fix styles.css", true},
+		{"edit script.js", true},
+		{"web asset", true},
+		{"static file", true},
 	}
 
 	for _, tc := range tests {
@@ -498,6 +506,15 @@ func TestClassifyIntentMode_FrontendUIRoutesToPlan(t *testing.T) {
 		{"why is the build failing", "investigate"},
 		{"investigate the crash in main.go", "investigate"},
 		{"fix the bug in @handler.go", "investigate"},
+
+		// Content/duplication and static web asset patterns → plan (via IsFrontendUI)
+		{"duplicate content", "plan"},
+		{"fix duplicate content", "plan"},
+		{"update index.html", "plan"},
+		{"fix styles.css", "plan"},
+		{"edit script.js", "plan"},
+		{"web asset", "plan"},
+		{"static file", "plan"},
 
 		// Non-trivial mutation verbs → plan (new safer default)
 		{"update @config.yml", "plan"},

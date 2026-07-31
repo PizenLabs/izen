@@ -310,7 +310,19 @@ func (e *Engine) forensicsExecuted() bool {
 // engine can never declare "Investigation complete" in 0s with no tool usage.
 // It is the last-resort forensic path when both the retriever and the primary
 // executor were unavailable during the state machine.
+//
+// VANILLA_WEB ARCHETYPE: When the workspace contains only HTML/CSS/JS, Go
+// toolchain diagnostics would produce false positives. The probe is skipped
+// entirely and a no-op placeholder is recorded instead.
 func (e *Engine) forceProbe(ctx context.Context) {
+	if e.vanillaWeb {
+		forensicLog("[forensic] VANILLA_WEB archetype — skipping forceProbe (go test)")
+		e.forensicsRan = true
+		e.Evidence.Add(EvSourceExecution,
+			"VANILLA_WEB archetype — no Go toolchain to probe",
+			"", 0, 0.2)
+		return
+	}
 	probe := NewShellTestExecutor(e.root)
 	summary, err := probe.RunAllTestsContext(ctx)
 	if err == nil && summary != nil {
@@ -333,7 +345,12 @@ func (e *Engine) stateObserve(ctx context.Context) error {
 	observed := fmt.Sprintf("Observing problem: %s", e.Problem)
 	e.Evidence.Add(EvSourceUser, observed, "", 0, 0.2)
 
-	if e.executor != nil {
+	// VANILLA_WEB ARCHETYPE: Skip the Go test executor entirely — there
+	// is no Go module system to probe. Fall through to dispatchForensics
+	// which also respects the VANILLA_WEB archetype by skipping Go patterns.
+	if e.vanillaWeb {
+		forensicLog("[forensic] VANILLA_WEB archetype — skipping Go test executor in stateObserve")
+	} else if e.executor != nil {
 		e.forensicsRan = true
 		summary, _ := e.TestLoop.Run(e.executor, testLoopConfig{Strategy: "all"})
 		if summary != nil {
@@ -392,6 +409,16 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 	strategy := DispatchStrategy(dctx, e.provider, e.model, diagnostics, e.Intent, e.vanillaWeb)
 	dispatchLog("[orchestrator] classify -> tool=%s target=%q",
 		strategy.Tool, strategy.Target)
+
+	// VANILLA_WEB ARCHETYPE: Remap ToolEnv and ToolTrace to ToolDiagnose.
+	// Environment dependency sweeps (go version, go test) would produce false
+	// positives in HTML/CSS/JS workspaces. ToolTrace runs go test -race which
+	// requires a Go module system. Only ToolDiagnose and ToolLX are safe.
+	if e.vanillaWeb && (strategy.Tool == ToolEnv || strategy.Tool == ToolTrace) {
+		dispatchLog("[orchestrator] VANILLA_WEB archetype — remapping %s to diagnose", strategy.Tool)
+		strategy.Tool = ToolDiagnose
+		strategy.Target = ""
+	}
 
 	runner := NewToolRunner(e.root, e.provider, e.model, e.retriever, diagnostics)
 
@@ -733,7 +760,10 @@ func (e *Engine) parseStackFramesFromEvidence() []StackFrame {
 }
 
 func (e *Engine) stateVerify() error {
-	if e.executor != nil {
+	// VANILLA_WEB ARCHETYPE: Skip Go test executor — no module system.
+	if e.vanillaWeb {
+		forensicLog("[forensic] VANILLA_WEB archetype — skipping Go test executor in stateVerify")
+	} else if e.executor != nil {
 		summary, _ := e.TestLoop.Run(e.executor, testLoopConfig{Strategy: "all"})
 		if summary != nil {
 			output := BoundedLogPreprocessor(summary.Output)
@@ -818,19 +848,56 @@ var mutationIntentKeywords = []string{
 	"write function",
 }
 
+// vanillaWebContentKeywords are phrases that signal a VANILLA_WEB content task
+// (HTML/CSS/JS workspace without Go files). When the workspace archetype is
+// VANILLA_WEB and the problem text matches one of these, the investigation
+// short-circuits to /plan — even if ClassifyIntent returned BugRegression.
+// This prevents language-specific forensic loops (Go module checks, go test)
+// from running on non-compiled web projects.
+var vanillaWebContentKeywords = []string{
+	"duplicate content",
+	"fix content",
+	"index.html",
+	"styles.css",
+	"script.js",
+	"style.css",
+	"app.js",
+	"main.js",
+	"main.css",
+	"static file",
+	"web asset",
+}
+
 // shouldShortCircuit returns the target mode when the investigation should exit
 // immediately and hand off instead of running the forensic state machine.
 // This prevents the "investigate deadlock" on code creation intents.
 //
 // REFORM RULES:
 //  1. FRONTEND_UI intent → short-circuit to /plan (enforces CSS/AST search).
-//  2. FeatureUnitTest or Refactor intent → short-circuit to /build.
-//  3. Problem text contains mutation intent keywords → short-circuit to /build.
-//  4. Any $hot prefix → short-circuit to /build.
+//  2. VANILLA_WEB archetype + web content keywords → short-circuit to /plan
+//     even when the intent classifier returned BugRegression — prevents
+//     language-specific forensic loops on non-compiled web projects.
+//  3. FeatureUnitTest or Refactor intent → short-circuit to /build.
+//  4. Problem text contains mutation intent keywords → short-circuit to /build.
+//  5. Any $hot prefix → short-circuit to /build.
 func (e *Engine) shouldShortCircuit() shortCircuitTarget {
 	if e.Intent.IsFrontendUI() {
 		return shortCircuitToPlan
 	}
+
+	// VANILLA_WEB archetype guard: even when intent is BugRegression,
+	// if the project is HTML/CSS/JS and the problem references static
+	// web assets or content keywords, short-circuit to /plan.
+	if e.vanillaWeb {
+		lower := strings.ToLower(e.Problem)
+		for _, kw := range vanillaWebContentKeywords {
+			if strings.Contains(lower, kw) {
+				forensicLog("[deadlock-guard] VANILLA_WEB archetype detected with web content keywords — short-circuiting /investigate → /plan")
+				return shortCircuitToPlan
+			}
+		}
+	}
+
 	if !e.Intent.IsEnvDepsAllowed() {
 		return shortCircuitToBuild
 	}
@@ -937,7 +1004,14 @@ func extractPackageName(rawError string) string {
 // It scans e.Ledger.Diagnostics directly (the raw compiler/test output) rather
 // than depending on high-level conclusion strings being already populated, so
 // the REMOTE DEPENDENCY BLOCKER token is guaranteed on the very first pass.
+//
+// VANILLA_WEB ARCHETYPE: When the workspace contains only HTML/CSS/JS, Go
+// dependency blockers are NEVER injected — there is no Go module system to
+// resolve and the blocker token would produce false-positive tasks.
 func injectDependencyBlocker(e *Engine, targetConclusion *string) {
+	if e.vanillaWeb {
+		return
+	}
 	raw := e.Ledger.Diagnostics
 	if raw == "" {
 		return
