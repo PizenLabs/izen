@@ -23,13 +23,15 @@ type DomainEvent interface {
 
 // Standard event type discriminators published by the mode engines.
 const (
-	EventCommandReceived = "command.received"
-	EventIntentParsed    = "intent.parsed"
-	EventPlanStaged      = "plan.staged"
-	EventPatchAttempted  = "patch.attempted"
-	EventPatchApplied    = "patch.applied"
-	EventExecutionFailed = "execution.failed"
-	EventStageCompleted  = "stage.completed"
+	EventCommandReceived      = "command.received"
+	EventIntentParsed         = "intent.parsed"
+	EventPlanStaged           = "plan.staged"
+	EventPatchAttempted       = "patch.attempted"
+	EventPatchApplied         = "patch.applied"
+	EventExecutionFailed      = "execution.failed"
+	EventStageCompleted       = "stage.completed"
+	EventSelfHealingAttempt   = "execution.selfhealing.attempt"
+	EventSelfHealingExhausted = "execution.selfhealing.exhausted"
 )
 
 // FailureClassification is the taxonomy used by EventExecutionFailed. It is
@@ -97,6 +99,21 @@ type StageCompletedPayload struct {
 	Stage    string
 	Duration time.Duration
 	Summary  string
+}
+
+// SelfHealingAttemptPayload carries a single self-healing retry triggered by a
+// failed build verification. Retry is the 1-based attempt counter.
+type SelfHealingAttemptPayload struct {
+	Retry    int
+	File     string
+	Category string
+}
+
+// SelfHealingExhaustedPayload reports that the self-healing loop ran out of
+// retries. Attempts is the total number of attempts executed.
+type SelfHealingExhaustedPayload struct {
+	Attempts int
+	Output   string
 }
 
 // ── Generic event implementation ────────────────────────────────────────────
@@ -187,5 +204,24 @@ func NewStageCompleted(stage string, duration time.Duration, summary string) Dom
 		Stage:    stage,
 		Duration: duration,
 		Summary:  summary,
+	})
+}
+
+// NewSelfHealingAttempt publishes that the self-healing loop triggered a retry
+// after a failed verification. Retry is the 1-based attempt counter.
+func NewSelfHealingAttempt(retry int, file, category string) DomainEvent {
+	return newEvent(EventSelfHealingAttempt, SelfHealingAttemptPayload{
+		Retry:    retry,
+		File:     file,
+		Category: category,
+	})
+}
+
+// NewSelfHealingExhausted publishes that the self-healing loop exhausted all
+// retries and the workspace was rolled back to its clean pre-mutation state.
+func NewSelfHealingExhausted(attempts int, output string) DomainEvent {
+	return newEvent(EventSelfHealingExhausted, SelfHealingExhaustedPayload{
+		Attempts: attempts,
+		Output:   output,
 	})
 }

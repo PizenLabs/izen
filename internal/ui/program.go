@@ -324,6 +324,8 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		events.EventPatchApplied,
 		events.EventExecutionFailed,
 		events.EventStageCompleted,
+		events.EventSelfHealingAttempt,
+		events.EventSelfHealingExhausted,
 	} {
 		eventBus.Subscribe(typ, func(ev events.DomainEvent) {
 			p.Send(domainEventMsg{ev: ev})

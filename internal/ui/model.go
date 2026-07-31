@@ -1189,6 +1189,10 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		}
 	case events.ExecutionFailedPayload:
 		m.logActivity("[error][%s] %s (stage: %s)", p.Classification, p.Error, p.Stage)
+	case events.SelfHealingAttemptPayload:
+		m.logActivity("[self-heal] retry %d: %s (%s)", p.Retry, p.File, p.Category)
+	case events.SelfHealingExhaustedPayload:
+		m.logActivity("[self-heal] exhausted after %d attempt(s); workspace rolled back clean", p.Attempts)
 	case events.StageCompletedPayload:
 		m.logActivity("[stage] %s completed (%s)", p.Stage, p.Summary)
 	}
