@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	izenctx "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/events"
 )
 
 type BuildRecoveryState int
@@ -42,6 +43,12 @@ type Engine struct {
 	mu          sync.Mutex
 	applied     int
 	lastSummary string
+
+	// bus is the event bus this engine publishes domain events to. The build
+	// engine stays headless: mutations and compilation outcomes are published
+	// as events rather than written to the terminal. Optional; nil disables
+	// emission.
+	bus *events.Bus
 }
 
 // Proposal represents a single build mutation awaiting human validation.
@@ -64,6 +71,20 @@ func NewEngine() *Engine {
 	}
 }
 
+// WithEventBus injects the event bus this engine publishes domain events to.
+// May be nil to disable emission.
+func (e *Engine) WithEventBus(bus *events.Bus) *Engine {
+	e.bus = bus
+	return e
+}
+
+// emit publishes a domain event. It is a strict no-op when no bus is wired.
+func (e *Engine) emit(ev events.DomainEvent) {
+	if e != nil && e.bus != nil {
+		e.bus.Publish(ev)
+	}
+}
+
 func (e *Engine) RecoveryCount() int {
 	return e.recoveryCount
 }
@@ -75,6 +96,7 @@ func (e *Engine) RecoveryState() BuildRecoveryState {
 func (e *Engine) RecordCompilationFailure(file string) {
 	e.recoveryCount++
 	e.files[file]++
+	e.emit(events.NewExecutionFailed(events.FailureRecoverable, fmt.Errorf("compilation failed for %s (attempt %d)", file, e.files[file]), "build.compilation"))
 	if e.recoveryCount > e.maxRecovery {
 		e.recoveryState = RecoveryForceRewrite
 	}
@@ -83,6 +105,7 @@ func (e *Engine) RecordCompilationFailure(file string) {
 func (e *Engine) RecordCompilationSuccess() {
 	e.recoveryCount = 0
 	e.recoveryState = RecoveryNone
+	e.emit(events.NewStageCompleted("build.compilation", 0, "compilation passed"))
 }
 
 func (e *Engine) FileFailureCount(file string) int {
@@ -122,6 +145,7 @@ func (e *Engine) QueueProposal(p Proposal) string {
 		p.ID = fmt.Sprintf("build-proposal-%d", len(e.pendingProposals)+1)
 	}
 	e.pendingProposals = append(e.pendingProposals, p)
+	e.emit(events.NewPatchAttempted(p.File, p.Strategy, len(e.pendingProposals)))
 	return p.ID
 }
 
@@ -132,6 +156,8 @@ func (e *Engine) ApproveProposal(id string) error {
 	for i := range e.pendingProposals {
 		if e.pendingProposals[i].ID == id {
 			e.pendingProposals[i].Approved = true
+			e.emit(events.NewStageCompleted("build.approval", 0,
+				fmt.Sprintf("proposal %s approved for %s", id, e.pendingProposals[i].File)))
 			return nil
 		}
 	}
@@ -173,10 +199,12 @@ func (e *Engine) ExecuteFileMutation(ctx context.Context, file string, content s
 	// block the mutation. This makes the guardrail fail-closed.
 	for _, p := range e.pendingProposals {
 		if p.File == file && !p.Approved {
+			e.emit(events.NewExecutionFailed(events.FailureRecoverable, ErrHumanValidationRequired, "build.guardrail"))
 			return ErrHumanValidationRequired
 		}
 	}
 	// If no proposal exists for this file, it was never queued for validation
 	// — also block, because /build MUST route every mutation through a Proposal.
+	e.emit(events.NewExecutionFailed(events.FailureRecoverable, ErrHumanValidationRequired, "build.guardrail"))
 	return ErrHumanValidationRequired
 }

@@ -26,6 +26,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/runtime"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
@@ -945,8 +946,15 @@ type model struct {
 	// Realtime thinking/reasoning panel
 	thinkingPanel *ThinkingPanel
 
-	// Live thought stream — auto-dimmed rendering during streaming
-	thoughtStream *ThoughtStream
+	// Event-driven reasoning buffer. Fed exclusively by EventReasoningStream
+	// domain events; renders as a distinct thinking box that never mixes with
+	// the response pipeline.
+	thinkingBuffer *ThinkingBuffer
+
+	// Number of reasoningBuffer bytes already flushed into thinkingBuffer from
+	// the sentinel path. Tracks the delta so the unified thinking box never
+	// double-appends the same reasoning on successive ticks.
+	sentinelReasoningFlushed int
 
 	// Activity tree — structured tool call logging
 	activityTree *ActivityTree
@@ -956,6 +964,10 @@ type model struct {
 
 	// Live code preview for streaming tool call arguments
 	liveCodePreview *LiveCodePreview
+
+	// Event bus — the headless engines publish domain events here and the UI
+	// subscribes as a pure projection. Never nil after bootstrap.
+	bus *events.Bus
 
 	// Current effort level for generation
 	currentEffort EffortLevel
@@ -1024,39 +1036,10 @@ func (m *model) cycleEffort() {
 // ── Rendering helpers ─────────────────────────────────────────────────────────
 
 // wrapStreamText wraps raw text lines dynamically during an active live stream.
+// It delegates to the shared ANSI-aware, cell-accurate wrapper so the stream
+// and the final history render identically.
 func wrapStreamText(text string, maxW int) []string {
-	if len(text) == 0 {
-		return []string{""}
-	}
-	var chunks []string
-	lines := strings.Split(text, "\n")
-
-	for _, line := range lines {
-		words := strings.Fields(line)
-		if len(words) == 0 {
-			chunks = append(chunks, "")
-			continue
-		}
-
-		var currentLine strings.Builder
-		for _, word := range words {
-			wordWidth := lipgloss.Width(word)
-			if currentLine.Len()+1+wordWidth > maxW {
-				chunks = append(chunks, currentLine.String())
-				currentLine.Reset()
-				currentLine.WriteString(word)
-			} else {
-				if currentLine.Len() > 0 {
-					currentLine.WriteString(" ")
-				}
-				currentLine.WriteString(word)
-			}
-		}
-		if currentLine.Len() > 0 {
-			chunks = append(chunks, currentLine.String())
-		}
-	}
-	return chunks
+	return wrapText(text, maxW)
 }
 
 // sanitizeInputPrompt forces the text input prompt back to a clean baseline,
@@ -1149,6 +1132,109 @@ func (m *model) handleEngineEvent(ev interface{}) {
 			},
 		})
 	}
+}
+
+// handleDomainEvent is the event bus projection. Every DomainEvent published
+// by the headless mode engines is rendered here as a styled activity line (and
+// enriched ActivityTree entry where metrics exist). This is the ONLY path that
+// surfaces engine events in the viewport — engines never call the UI directly.
+func (m *model) handleDomainEvent(ev events.DomainEvent) {
+	if ev == nil {
+		return
+	}
+	switch p := ev.Payload().(type) {
+	case events.CommandReceivedPayload:
+		m.logActivity("[%s] received command: %s", p.Mode, truncateForActivity(p.Command))
+	case events.IntentParsedPayload:
+		m.logActivity("[intent] parsed: %s (%.0f%% confidence)", p.Intent, p.Confidence*100)
+	case events.PlanStagedPayload:
+		m.logActivity("[plan] staged %d tasks", p.TaskCount)
+	case events.PatchAttemptedPayload:
+		m.logActivity("[build] patch attempt %d: %s (%s)", p.Attempt, p.File, p.Strategy)
+	case events.PatchAppliedPayload:
+		m.logActivity("[build] applied patch to %s (+%d/-%d lines)", p.File, p.LinesAdd, p.LinesDel)
+		if m.activityTree != nil {
+			m.activityTree.Append(EngineEvent{
+				Kind: EventFileMutate,
+				Time: ev.Timestamp(),
+				FileMutate: &FileMutateEvent{
+					File:     p.File,
+					LinesAdd: p.LinesAdd,
+					LinesDel: p.LinesDel,
+					Elapsed:  p.Elapsed,
+				},
+			})
+		}
+	case events.ExecutionFailedPayload:
+		m.logActivity("[error][%s] %s (stage: %s)", p.Classification, p.Error, p.Stage)
+	case events.SelfHealingAttemptPayload:
+		// Distinct retry badge + attempt count + failure category so the
+		// self-healing loop reads as one clean, scannable line.
+		m.logActivity("[RETRY %d] [%s] %s", p.Retry, p.Category, p.File)
+	case events.SelfHealingExhaustedPayload:
+		// Distinct exhausted badge + total attempt count; the raw verification
+		// output is collapsed to its first line to keep the activity line tight.
+		m.logActivity("[EXHAUSTED] self-healing stopped after %d attempt(s); workspace rolled back clean%s",
+			p.Attempts, selfHealOutputSuffix(p.Output))
+	case events.StageCompletedPayload:
+		m.logActivity("[stage] %s completed (%s)", p.Stage, p.Summary)
+	case events.ActivityPayload:
+		// Engine activity telemetry (retrieval/execution/investigate sinks)
+		// projected onto the UI goroutine through the bus.
+		m.logActivity("%s", p.Line)
+	case events.EngineTelemetryPayload:
+		// Typed engine I/O event wrapped for bus transport — projected into
+		// the structured ActivityTree.
+		m.handleEngineEvent(p.Event)
+	case events.ReasoningPayload:
+		// LLM reasoning stream: chunks are appended to the dedicated thinking
+		// buffer (never the response pipeline); the terminal event collapses
+		// the box into compact mode.
+		m.handleReasoningStream(p.Chunk, p.IsComplete)
+	}
+}
+
+// handleReasoningStream projects one EventReasoningStream event onto the
+// thinking buffer. Chunks are appended verbatim; the terminal event (empty
+// chunk + IsComplete) collapses the box. Only ever runs on the UI goroutine.
+func (m *model) handleReasoningStream(chunk string, isComplete bool) {
+	if m.thinkingBuffer == nil {
+		m.thinkingBuffer = NewThinkingBuffer()
+	}
+	if chunk != "" {
+		m.thinkingBuffer.Append(chunk)
+	}
+	if isComplete {
+		m.thinkingBuffer.MarkComplete()
+	}
+	m.refreshViewportContent()
+	if m.Ready && !m.userIsScrollingUp {
+		m.Viewport.GotoBottom()
+	}
+}
+
+// selfHealOutputSuffix collapses a self-healing verification output to a short
+// trailing hint. Empty or whitespace-only output yields no suffix; otherwise
+// the first meaningful line is appended, truncated to a single line width.
+func selfHealOutputSuffix(output string) string {
+	output = strings.ReplaceAll(output, "\\n", "\n")
+	output = strings.ReplaceAll(output, "\\t", "\t")
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// ANSI-safe truncation: never byte-slice, or a style sequence (or a
+		// multi-byte rune) can be cut mid-way and drop visible text.
+		return " — " + truncateANSI(line, 64)
+	}
+	return ""
+}
+
+// truncateForActivity bounds free-form event text for single-line rendering.
+func truncateForActivity(s string) string {
+	s = strings.TrimSpace(s)
+	return truncateANSI(s, 90)
 }
 
 // push appends a record. Records are flushed to the terminal's native
@@ -1320,13 +1406,29 @@ func (m *model) renderRecordForViewport(rec record) string {
 	}
 
 	wrapWidth := width - 4
+	if wrapWidth <= 0 {
+		wrapWidth = 80
+	}
 	if wrapWidth < 20 {
 		wrapWidth = 20
 	}
 
-	// Sanitize: convert literal \n escape sequences in error/log text
-	// to actual newlines so multi-line messages display correctly.
-	text := strings.ReplaceAll(rec.text, "\\n", "\n")
+	// Sanitize: normalize mixed line endings, convert literal \n and \t escape
+	// sequences in error/log text to real control characters, and expand tabs
+	// to spaces so multi-line messages display correctly instead of leaking raw
+	// backslash sequences or tab misalignment into the viewport.
+	text := sanitizeText(rec.text)
+
+	// Strict per-line width bound is enforced by the wrapper below
+	// (wrapIndentedLine / wrapText): every wrapped line lands at most
+	// wrapWidth cells wide. We NEVER re-wrap already-wrapped content here —
+	// applying lipgloss Width() to pre-wrapped, pre-styled text is the
+	// double-wrapping corruption source that drops words and leaves isolated
+	// punctuation. Trailing padding is trimmed so downstream
+	// ANSI-strip/cursor-injection logic sees the exact printable text.
+	renderBounded := func(s string) string {
+		return strings.TrimRight(s, " ")
+	}
 
 	switch rec.role {
 	case roleUser:
@@ -1343,9 +1445,9 @@ func (m *model) renderRecordForViewport(rec record) string {
 	case roleActivity:
 		var b strings.Builder
 		for _, srcLine := range strings.Split(text, "\n") {
-			wrapped := wrapString(srcLine, wrapWidth)
+			wrapped := wrapIndentedLine(srcLine, wrapWidth)
 			for _, wl := range wrapped {
-				b.WriteString(m.styleActivityLine(wl))
+				b.WriteString(renderBounded(m.styleActivityLine(wl)))
 				b.WriteByte('\n')
 			}
 		}
@@ -1353,14 +1455,97 @@ func (m *model) renderRecordForViewport(rec record) string {
 	default:
 		var b strings.Builder
 		for _, srcLine := range strings.Split(text, "\n") {
-			wrapped := wrapString(srcLine, wrapWidth)
+			// Explicit \n line breaks between checklist items / log lines are
+			// preserved (per-line wrap, never a single reflow pass); indented
+			// continuation lines keep their hierarchy via wrapIndentedLine.
+			wrapped := wrapIndentedLine(srcLine, wrapWidth)
 			for _, wl := range wrapped {
-				b.WriteString(wl)
+				b.WriteString(renderBounded(wl))
 				b.WriteByte('\n')
 			}
 		}
 		return strings.TrimSuffix(b.String(), "\n")
 	}
+}
+
+// sanitizeEscapes converts literal backslash escape sequences that reach the
+// record text from external processes or engine payloads into real control
+// characters: \n → newline, \t → tab, \" → quote. Expanding them here means
+// Glamour/Lipgloss never sees raw backslash noise and never drops words next
+// to an escaped punctuation mark.
+func sanitizeEscapes(s string) string {
+	s = strings.ReplaceAll(s, "\\n", "\n")
+	s = strings.ReplaceAll(s, "\\t", "\t")
+	s = strings.ReplaceAll(s, "\\\"", "\"")
+	return s
+}
+
+// leadingWhitespace returns the leading space/tab prefix of a line. It anchors
+// the hanging indent used by wrapIndentedLine so indented structures (TODO
+// checklist descriptions, error details) stay aligned across wrapped lines.
+func leadingWhitespace(s string) string {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	return s[:i]
+}
+
+// wrapIndentedLine wraps a single line to maxWidth using visual cell widths,
+// preserving the leading indentation on every continuation line. This keeps
+// nested structures aligned without overflowing the viewport's right border
+// (word widths are measured with lipgloss.Width, not raw byte length).
+func wrapIndentedLine(text string, maxWidth int) []string {
+	if maxWidth < 1 {
+		maxWidth = 1
+	}
+	prefix := leadingWhitespace(text)
+	body := strings.TrimLeft(text, " \t")
+	if body == "" {
+		return []string{prefix}
+	}
+
+	indent := lipgloss.Width(prefix)
+	avail := maxWidth - indent
+	if avail < 1 {
+		avail = 1
+	}
+
+	var result []string
+	line := prefix
+	flush := func() {
+		result = append(result, line)
+		line = prefix
+	}
+
+	for _, word := range strings.Fields(body) {
+		wordW := lipgloss.Width(word)
+		if wordW > avail {
+			// Unbreakable token wider than the available space — hard-chunk it
+			// at cell boundaries (ansi.Cut), each piece re-indented. Chunking
+			// by cell width (not rune index) keeps wide glyphs inside the bound.
+			flush()
+			for _, piece := range chunkWord(word, avail) {
+				result = append(result, prefix+piece)
+			}
+			line = prefix
+			continue
+		}
+		if line != prefix && lipgloss.Width(line)+1+wordW > maxWidth {
+			flush()
+		}
+		if line != prefix {
+			line += " "
+		}
+		line += word
+	}
+	if line != prefix {
+		result = append(result, line)
+	}
+	if len(result) == 0 {
+		result = []string{prefix}
+	}
+	return result
 }
 
 // pushRecords appends multiple records.
@@ -1399,6 +1584,7 @@ func (m *model) resetStreamingState() {
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 	m.reasoningBuffer.Reset()
+	m.sentinelReasoningFlushed = 0
 	m.pendingReasoningFragment = ""
 	if m.streamParser != nil {
 		m.streamParser = nil
@@ -1430,10 +1616,43 @@ func (m *model) reconcileSpinner() {
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 	m.reasoningBuffer.Reset()
+	m.sentinelReasoningFlushed = 0
 	m.pendingReasoningFragment = ""
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
+}
+
+// emitVisibleContent routes one emitted content window into the response
+// pipeline. It runs the reasoning extractor over the window, then appends only
+// the sentinel-cleaned text to currentStreamContent and projects any newly
+// extracted reasoning onto the unified ThinkingBuffer (deduplicated by the
+// flushed-byte offset). Any pre-existing streamBuffer content (the legacy
+// non-throttle path's un-emitted remainder) is preserved around the extraction
+// so nothing already received is ever dropped.
+func (m *model) emitVisibleContent(raw string) {
+	if raw == "" {
+		return
+	}
+	leftover := m.streamBuffer
+	m.streamBuffer = raw
+	m.extractReasoningContent()
+	visible := m.streamBuffer
+	m.streamBuffer = leftover
+
+	// ── LIVE THINKING BOX ─────────────────────────────────────
+	// Sentinel-extracted reasoning (reasoningBuffer, grown by
+	// extractReasoningContent above) is flushed into the unified
+	// ThinkingBuffer — the same box fed by EventReasoningStream on
+	// the /ask path — deduplicated by the flushed-byte offset so the
+	// box never re-appends already-consumed reasoning each tick.
+	if m.thinkingBuffer != nil && m.reasoningBuffer.Len() > m.sentinelReasoningFlushed {
+		reasoning := m.reasoningBuffer.String()[m.sentinelReasoningFlushed:]
+		m.thinkingBuffer.Append(reasoning)
+		m.sentinelReasoningFlushed = m.reasoningBuffer.Len()
+	}
+
+	m.currentStreamContent += visible
 }
 
 // extractReasoningContent scans raw stream text for reasoning sentinels
@@ -1687,7 +1906,12 @@ func (m *model) refreshViewportContent() {
 
 	if m.streaming {
 		if m.currentStreamContent != "" {
-			rendered := m.renderStreamingContent(m.currentStreamContent, m.width)
+			// SANITIZE BEFORE VIEWPORT: raw streamed text may still carry
+			// literal \n / \t / \" escapes (preserved verbatim through the
+			// rune-safe ingestion). They are expanded to real control
+			// characters here so the deterministic pipeline never renders
+			// backslash noise or drops words next to escaped punctuation.
+			rendered := m.renderStreamingContent(sanitizeText(m.currentStreamContent), m.width)
 			if rendered != "" {
 				content.WriteString(rendered)
 				content.WriteString("\n")
@@ -1695,7 +1919,14 @@ func (m *model) refreshViewportContent() {
 		}
 
 		// ── Collapsible reasoning block ──────────────────────────────
-		reasoningBlock := m.renderReasoningBlock(m.width)
+		// The legacy ThinkingPanel block is skipped while the unified
+		// ThinkingBuffer is already rendering live thinking above the content
+		// (renderLiveThinking in renderStreamingContent) — showing both would
+		// duplicate the same reasoning in two places.
+		reasoningBlock := ""
+		if m.thinkingBuffer == nil || m.thinkingBuffer.Len() == 0 {
+			reasoningBlock = m.renderReasoningBlock(m.width)
+		}
 		if reasoningBlock != "" {
 			content.WriteString(reasoningBlock)
 			content.WriteString("\n")

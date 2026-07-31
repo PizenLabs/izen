@@ -33,6 +33,11 @@ type ToolRunner struct {
 	model       string
 	retriever   Retriever
 	diagnostics string // raw $test failure log for the diagnose fallback
+
+	// logFn is the telemetry sink. It defaults to the package-level forensicLog
+	// and is overridden by the engine when an event bus is wired so runner
+	// telemetry stays on the bus.
+	logFn func(format string, args ...interface{})
 }
 
 func NewToolRunner(root string, provider ai.Provider, model string, retriever Retriever, diagnostics string) *ToolRunner {
@@ -42,7 +47,27 @@ func NewToolRunner(root string, provider ai.Provider, model string, retriever Re
 		model:       model,
 		retriever:   retriever,
 		diagnostics: diagnostics,
+		logFn:       forensicLog,
 	}
+}
+
+// SetLogFn overrides the telemetry sink used by the runner. May be nil to
+// restore the package-level default.
+func (r *ToolRunner) SetLogFn(fn func(format string, args ...interface{})) {
+	if fn == nil {
+		r.logFn = forensicLog
+		return
+	}
+	r.logFn = fn
+}
+
+// logf routes a telemetry line through the configured sink.
+func (r *ToolRunner) logf(format string, args ...interface{}) {
+	if r != nil && r.logFn != nil {
+		r.logFn(format, args...)
+		return
+	}
+	forensicLog(format, args...)
 }
 
 // Run executes the given tool once and returns its structured result. A failed
@@ -281,11 +306,11 @@ func (r *ToolRunner) runLX(ctx context.Context, target string) ToolResult {
 		fmt.Fprintf(&b, "  %s:%d [score=%.3f] %s\n", res.File, res.Line, effScore, res.Content)
 	}
 	if len(collected) == 0 {
-		forensicLog("[lx] zero results for target %q — strict fallback to deterministic search (AST/Grep)", target)
+		r.logf("[lx] zero results for target %q — strict fallback to deterministic search (AST/Grep)", target)
 		return ToolResult{Tool: ToolLX, Target: target, Ok: false}
 	}
 	if len(evidence) == 0 {
-		forensicLog("[lx] all %d result(s) had BM25 < 0.3 for target %q — strict fallback to deterministic search (AST/Grep)", len(collected), target)
+		r.logf("[lx] all %d result(s) had BM25 < 0.3 for target %q — strict fallback to deterministic search (AST/Grep)", len(collected), target)
 		return ToolResult{Tool: ToolLX, Target: target, Ok: false}
 	}
 	return ToolResult{Tool: ToolLX, Target: target, Content: b.String(), Ok: true, Evidence: evidence}

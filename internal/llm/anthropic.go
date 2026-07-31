@@ -73,6 +73,9 @@ type anthropicStreamEvent struct {
 type anthropicDelta struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+	// Thinking carries the reasoning process text for thinking_delta events
+	// (the Anthropic native equivalent of reasoning_content).
+	Thinking string `json:"thinking"`
 }
 
 func (c *AnthropicClient) Name() string {
@@ -245,7 +248,21 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 				cacheRead = event.Usage.CacheReadTokens
 			}
 		case "content_block_delta":
-			if event.Delta != nil && event.Delta.Text != "" {
+			if event.Delta == nil {
+				continue
+			}
+			// Reasoning process (thinking_delta) is routed to the reasoning
+			// pipeline only — never appended to the visible response.
+			if event.Delta.Type == "thinking_delta" {
+				if event.Delta.Thinking != "" && req.ReasoningHandler != nil {
+					if err := req.ReasoningHandler(event.Delta.Thinking); err != nil {
+						_ = resp.Body.Close()
+						return LLMResponse{}, err
+					}
+				}
+				continue
+			}
+			if event.Delta.Text != "" {
 				full.WriteString(event.Delta.Text)
 				if handler != nil {
 					if err := handler(event.Delta.Text); err != nil {

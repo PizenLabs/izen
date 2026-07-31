@@ -15,7 +15,9 @@ import (
 
 	"github.com/PizenLabs/izen/internal/agents"
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/domain"
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/gateway"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -96,10 +98,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	if m.liveCodePreview != nil {
 		m.liveCodePreview.Reset()
 	}
-	if m.thoughtStream == nil {
-		m.thoughtStream = NewThoughtStream()
+	m.sentinelReasoningFlushed = 0
+	if m.thinkingBuffer == nil {
+		m.thinkingBuffer = NewThinkingBuffer()
 	} else {
-		m.thoughtStream.Reset()
+		m.thinkingBuffer.Reset()
 	}
 	if m.activityTree == nil {
 		m.activityTree = NewActivityTree()
@@ -233,44 +236,107 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		}
 		defer func() { _ = rawStream.Close() }()
 
-		var full strings.Builder
-		tokIn, tokOut := 0, 0
-		buf := make([]byte, 4096)
+		full, ingestErr := ingestLLMStream(rawStream, m.bus, func(text string) {
+			streamCh <- tokenMsg(text)
+		})
 
-		for {
-			n, err := rawStream.Read(buf)
-			if n > 0 {
-				chunk := string(buf[:n])
-				full.WriteString(chunk)
-				streamCh <- tokenMsg(chunk)
-			}
-			if err == io.EOF {
-				type usageProvider interface {
-					Usage() (input, output int)
-				}
-				if up, ok := rawStream.(usageProvider); ok {
-					tokIn, tokOut = up.Usage()
-				}
-				if tokIn == 0 && tokOut == 0 {
-					tokIn = len(content) / 4
-					tokOut = full.Len() / 4
-				}
-				msg := streamDoneMsg{
-					content:     full.String(),
-					tokenInput:  tokIn,
-					tokenOutput: tokOut,
-				}
-				streamCh <- msg
-				return
-			}
-			if err != nil {
-				streamCh <- streamErrMsg{err: err, content: full.String()}
-				return
-			}
+		type usageProvider interface {
+			Usage() (input, output int)
+		}
+		tokIn, tokOut := 0, 0
+		if up, ok := rawStream.(usageProvider); ok {
+			tokIn, tokOut = up.Usage()
+		}
+		if tokIn == 0 && tokOut == 0 {
+			tokIn = len(content) / 4
+			tokOut = len(full) / 4
+		}
+
+		if ingestErr != nil {
+			streamCh <- streamErrMsg{err: ingestErr, content: full}
+			return
+		}
+		streamCh <- streamDoneMsg{
+			content:     full,
+			tokenInput:  tokIn,
+			tokenOutput: tokOut,
 		}
 	}()
 
 	return tea.Batch(m.readStream(), m.smoothStreamTickCmd())
+}
+
+// ingestLLMStream reads raw bytes from r, applies UTF-8 rune-safe buffering
+// and thought/content separation, and returns the assembled response content.
+//
+// Raw LLM chunks are NOT aligned to UTF-8 rune boundaries. Slicing them
+// directly (string(buf[:n])) can split a multi-byte rune across two reads and
+// corrupt the markdown answer with replacement chars. RuneBuffer holds
+// incomplete runes until they complete. The Splitter then classifies each
+// frame: reasoning (<thought>…</thought> / reasoning sentinels) is published
+// to the event bus as EventReasoningStream and NEVER enters the response
+// pipeline; only content frames reach emitContent. Escapes are preserved
+// verbatim through both layers. A terminal ReasoningStream event (empty chunk,
+// IsComplete) is always published so the UI can collapse the thinking box.
+func ingestLLMStream(r io.Reader, bus *events.Bus, emitContent func(string)) (string, error) {
+	var full strings.Builder
+	runeBuf := stream.NewRuneBuffer()
+	splitter := stream.NewSplitter()
+
+	publishReasoning := func(text string) {
+		if bus != nil {
+			bus.Publish(events.NewReasoningStream(text, false))
+		}
+	}
+
+	emitFrame := func(fr stream.Frame) {
+		if fr.Kind == stream.ChunkReasoning {
+			if fr.Text != "" {
+				publishReasoning(fr.Text)
+			}
+			return
+		}
+		if fr.Text == "" {
+			return
+		}
+		full.WriteString(fr.Text)
+		if emitContent != nil {
+			emitContent(fr.Text)
+		}
+	}
+
+	flushBuffered := func() {
+		if rem := runeBuf.Flush(); rem != "" {
+			splitter.Write(rem, emitFrame)
+		}
+		splitter.Flush(emitFrame)
+	}
+
+	buf := make([]byte, 4096)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if text := runeBuf.Write(buf[:n]); text != "" {
+				splitter.Write(text, emitFrame)
+			}
+		}
+		if err == io.EOF {
+			// Release any trailing incomplete rune and final partial markers.
+			flushBuffered()
+			// Terminal reasoning event: closes the reasoning block so the UI
+			// can collapse the thinking box into compact mode.
+			if bus != nil {
+				bus.Publish(events.NewReasoningStream("", true))
+			}
+			return full.String(), nil
+		}
+		if err != nil {
+			// Flush buffered runes/partials before reporting the error so no
+			// already-received bytes are lost.
+			flushBuffered()
+			return full.String(), err
+		}
+	}
 }
 
 func injectFileContext(workspaceRoot, prompt, userContent string) string {

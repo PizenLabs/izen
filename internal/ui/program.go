@@ -23,6 +23,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/core/runtime"
 	"github.com/PizenLabs/izen/internal/core/workflow"
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
@@ -35,6 +36,8 @@ import (
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
+	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
+	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
 )
 
 // NewProgram initializes the active model state context and instantiates the runner engine.
@@ -66,6 +69,12 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	if provider != nil {
 		planEng.SetProvider(provider.Execute)
 	}
+
+	// ── EVENT BUS ──────────────────────────────────────────────────────────
+	// The single in-process event bus. The mode engines publish domain events
+	// headlessly (never calling UI routines directly); the UI subscribes below
+	// and acts purely as a projection of the event stream.
+	eventBus := events.NewBus(events.DefaultBufferSize)
 
 	var detectedLang language.ID
 	if detection.Primary != nil {
@@ -163,7 +172,24 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		30*time.Second, // max duration per step
 		5,              // max concurrent commands
 	)
-	runtimeCtx := runtime.New(artStore, caps, bgt)
+
+	// ── WORKSPACE SNAPSHOT + CAPABILITY REGISTRY ─────────────────────────
+	// The snapshot cache is the single source of truth for workspace state.
+	// The capability registry maps detected archetypes to allowed diagnostic
+	// capabilities, preventing dispatch of irrelevant tools (e.g., Go build
+	// on pure HTML/CSS projects).
+	snapCache := wssnapshot.NewSnapshotCache()
+	capReg := wscap.NewArchetypeCapabilityRegistry()
+	_, _ = snapCache.GetSnapshot(root) // prime the cache
+
+	runtimeCtx := runtime.NewWithSnapRegistry(artStore, caps, bgt, snapCache, capReg)
+
+	// Wire snapshot cache and capability registry into the plan engine for
+	// archetype-aware diagnostic gating.
+	planEng.WithSnapshotCache(snapCache).WithCapabilityRegistry(capReg)
+	// Wire the event bus so /plan runs headless and publishes domain events.
+	planEng.WithEventBus(eventBus)
+
 	workflowSM := workflow.NewWorkflowStateMachine()
 	wcc := control.NewWorkflowCheckpointManager(execEng.Checkpoints, root)
 	workflowSM.WithCheckpointCoordinator(workflow.NewCheckpointCoordinator(wcc))
@@ -215,6 +241,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		initPrefillProvider: globalProvider,
 		viewRegistry:        reg,
 		logStore:            NewLogStore(),
+		bus:                 eventBus,
 		toolCallBuffer:      execution.NewToolCallBuffer(root),
 		thinkingPanel:       NewThinkingPanel(),
 		liveCodePreview:     NewLiveCodePreview(),
@@ -245,42 +272,64 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	m.historyIndex = len(m.history)
 
 	// ── WIRE ACTIVITY LOGGERS ────────────────────────────────────────────
-	// The model's logActivity method is injected as the callback for every
-	// package that performs internal file system / search / binary actions.
-	// This guarantees every ReadFile, Grep/Search, and lx invocation is
-	// immediately visible in the chat viewport as a styled system line.
+	// The retrieval/execution activity sinks are routed through the event bus
+	// (never a direct model callback): each line is published as an
+	// EventActivity domain event and projected by handleDomainEvent on the UI
+	// goroutine. This guarantees the model is only ever mutated from the
+	// Bubble Tea event loop.
 	activityFn := func(format string, args ...interface{}) {
-		m.logActivity(format, args...)
+		eventBus.Publish(events.NewActivity(fmt.Sprintf(format, args...)))
 	}
 	retrieval.SetActivityLogger(activityFn)
 	execution.SetActivityLogger(activityFn)
 
 	// ── WIRE TYPED EVENT LOGGERS ─────────────────────────────────────────
-	// The model's handleEngineEvent is injected as the typed event sink for
-	// real I/O metrics (bytes read, lines patched, exit codes, elapsed time).
-	// These feed the ActivityTree directly — no string parsing involved.
+	// The typed engine I/O events (bytes read, lines patched, hits, elapsed)
+	// are wrapped as EventEngineTelemetry on the bus and projected into the
+	// ActivityTree by handleDomainEvent. No direct UI calls from engines.
 	eventFn := func(ev interface{}) {
-		m.handleEngineEvent(ev)
+		eventBus.Publish(events.NewEngineTelemetry(ev))
 	}
 	retrieval.SetEventLogger(eventFn)
 	execution.SetEventLogger(eventFn)
 
 	// ── REDIRECT /investigate ENGINE LOG SINKS ───────────────────────────
-	// The investigate orchestrator has two package-level activity sinks:
-	// forensicLog (defaults to log.Printf → stderr) and dispatchLog (defaults
-	// to fmt.Printf → stdout). Left at their defaults they write RAW TEXT to
-	// the terminal while Bubble Tea owns the alt-screen, corrupting the
-	// rendered frame — broken ──── separators, misaligned viewport height, and
-	// a re-drawn prompt that appears "doubled" as the raw bytes shove the real
-	// frame. Route both through the same activityFn used for every other engine
-	// package so orchestrator progress surfaces as styled viewport lines
-	// instead of frame-corrupting raw output. The engine already dispatches a
-	// single terminal investigateResultMsg on completion; these sinks are pure
-	// progress telemetry.
+	// The investigate orchestrator's forensic/dispatch sinks are also routed
+	// through the bus so progress surfaces as projected viewport lines instead
+	// of frame-corrupting raw output or direct model mutation. The engine
+	// already dispatches a single terminal investigateResultMsg on completion.
 	investigate.SetForensicLog(activityFn)
 	investigate.SetDispatchLog(activityFn)
 
-	return tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+
+	// ── EVENT BUS PROJECTION SUBSCRIPTION ───────────────────────────────
+	// The UI is a pure projection: every domain event published by the headless
+	// engines is forwarded into the Bubble Tea event loop as a domainEventMsg
+	// and rendered by the model's handleDomainEvent. p.Send is safe from any
+	// goroutine, so a bus dispatch goroutine can bridge into the UI safely.
+	// Subscriptions happen after the program exists because nothing runs before
+	// p.Run(); any event published before then is simply dropped (non-blocking).
+	for _, typ := range []string{
+		events.EventCommandReceived,
+		events.EventIntentParsed,
+		events.EventPlanStaged,
+		events.EventPatchAttempted,
+		events.EventPatchApplied,
+		events.EventExecutionFailed,
+		events.EventStageCompleted,
+		events.EventSelfHealingAttempt,
+		events.EventSelfHealingExhausted,
+		events.EventActivity,
+		events.EventEngineTelemetry,
+		events.EventReasoningStream,
+	} {
+		eventBus.Subscribe(typ, func(ev events.DomainEvent) {
+			p.Send(domainEventMsg{ev: ev})
+		})
+	}
+
+	return p
 }
 
 // resolveUsername resolves the user's display name with the following
