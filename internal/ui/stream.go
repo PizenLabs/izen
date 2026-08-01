@@ -253,7 +253,13 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		if up, ok := rawStream.(usageProvider); ok {
 			tokIn, tokOut = up.Usage()
 		}
-		if tokIn == 0 && tokOut == 0 {
+		// LOCAL-ONLY ESTIMATE FALLBACK: the character-count estimate (/4) is a
+		// stand-in reserved strictly for local models (ollama) that genuinely
+		// do not report usage metadata. For cloud providers the provider's
+		// final-chunk usage is authoritative: if it reports 0/0 the values are
+		// left as 0 so the footer shows only what the provider actually billed
+		// — never an invented number that diverges from the dashboard.
+		if tokIn == 0 && tokOut == 0 && !m.IsCloudModel {
 			tokIn = len(content) / 4
 			tokOut = len(full) / 4
 		}

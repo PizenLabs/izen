@@ -10,6 +10,9 @@ import (
 	"github.com/mattn/go-runewidth"
 )
 
+// stagePrefixStyle colors the ":: stage" marker of each execution-tree entry.
+var stagePrefixStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan))
+
 type EventKind int
 
 const (
@@ -148,7 +151,18 @@ func (at *ActivityTree) Len() int {
 	return len(at.entries)
 }
 
+// Render produces the full execution tree view. Completed entries carry a
+// "[done]" badge; when active=true the last entry is treated as the
+// in-flight stage and gets a "[running]" badge with animated dots so the
+// viewer can tell exactly where the pipeline stands.
 func (at *ActivityTree) Render(width int) string {
+	return at.RenderActive(width, false, 0)
+}
+
+// RenderActive renders the tree with a live "[running]" badge on the last
+// entry while active is true. dotFrame advances per viewport refresh to
+// animate the truncation dots on the running entry.
+func (at *ActivityTree) RenderActive(width int, active bool, dotFrame int) string {
 	at.mu.Lock()
 	entries := make([]EngineEvent, len(at.entries))
 	copy(entries, at.entries)
@@ -163,18 +177,53 @@ func (at *ActivityTree) Render(width int) string {
 		if i > 0 {
 			b.WriteString("\n")
 		}
-		b.WriteString(at.renderEvent(ev, width))
+		running := active && i == len(entries)-1
+		b.WriteString(at.renderEvent(ev, width, running, dotFrame))
 	}
 	return dimmedStyle.Render(b.String())
 }
 
-func (at *ActivityTree) renderEvent(ev EngineEvent, width int) string {
-	// Cap the content cell count so long paths/commands/queries truncate
-	// cleanly instead of overflowing the viewport's right border. The
-	// indicator prefix and trailing metadata reserve fixed cell budget.
-	contentW := width - 24
+// stageLabel maps an event kind to its modern pipeline stage name, rendered as
+// a ":: stage" prefix (Grok/OpenCode style) so the tool tree reads as a
+// scannable stage list rather than a raw log dump.
+func stageLabel(kind EventKind) string {
+	switch kind {
+	case EventFileRead:
+		return "explore"
+	case EventFileMutate:
+		return "diff"
+	case EventCommandExec:
+		return "exec"
+	case EventSearch:
+		return "search"
+	case EventResolve:
+		return "resolve"
+	default:
+		return "step"
+	}
+}
+
+// badge renders the trailing [running] / [done] status marker.
+func stageBadge(running bool, dotFrame int) string {
+	if running {
+		return orangeStyle.Render(fmt.Sprintf("[running%s]", animatedDots(dotFrame)))
+	}
+	return greenStyle.Render("[done]")
+}
+
+func (at *ActivityTree) renderEvent(ev EngineEvent, width int, running bool, dotFrame int) string {
+	// Reserve cell budget for the ":: stage │ " prefix and the trailing
+	// status badge so long paths/commands truncate cleanly instead of
+	// overflowing the viewport's right border.
+	prefixW := 16
+	badgeW := 9
+	contentW := width - prefixW - badgeW
 	if contentW < 20 {
 		contentW = 20
+	}
+
+	prefix := func(stage string) string {
+		return stagePrefixStyle.Render(":: "+stage) + mutedStyle.Render(" │ ")
 	}
 
 	switch ev.Kind {
@@ -183,17 +232,17 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int) string {
 		if e == nil {
 			return ""
 		}
-		prefix := lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Render("→")
 		elapsed := formatElapsed(e.Elapsed)
-		return fmt.Sprintf("%s Read %s (%d B · %s)", prefix, truncateMiddle(e.File, contentW), e.Bytes, mutedStyle.Render(elapsed))
+		return fmt.Sprintf("%sRead %s (%d B · %s) %s",
+			prefix("explore"), truncateMiddle(e.File, contentW), e.Bytes, mutedStyle.Render(elapsed), stageBadge(running, dotFrame))
 
 	case EventFileMutate:
 		e := ev.FileMutate
 		if e == nil {
 			return ""
 		}
-		prefix := lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan)).Render("→")
-		return fmt.Sprintf("%s Patch %s (+%d / -%d lines)", prefix, truncateMiddle(e.File, contentW), e.LinesAdd, e.LinesDel)
+		return fmt.Sprintf("%sPatch %s (+%d / -%d lines) %s",
+			prefix("diff"), truncateMiddle(e.File, contentW), e.LinesAdd, e.LinesDel, stageBadge(running, dotFrame))
 
 	case EventCommandExec:
 		e := ev.CommandExec
@@ -207,23 +256,24 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int) string {
 			exitStr = redStyle.Render(exitStr)
 		}
 		elapsed := formatElapsed(e.Elapsed)
-		return fmt.Sprintf("* Exec %s (%s · %s)", yellowStyle.Render(truncateMiddle(e.Command, contentW)), exitStr, mutedStyle.Render(elapsed))
+		return fmt.Sprintf("%s%s (%s · %s) %s",
+			prefix("exec"), yellowStyle.Render(truncateMiddle(e.Command, contentW)), exitStr, mutedStyle.Render(elapsed), stageBadge(running, dotFrame))
 
 	case EventSearch:
 		e := ev.Search
 		if e == nil {
 			return ""
 		}
-		prefix := orangeStyle.Render("*")
-		return fmt.Sprintf("%s Search %s (%d hits)", prefix, truncateMiddle(e.Query, contentW), e.Hits)
+		return fmt.Sprintf("%sSearch %s (%d hits) %s",
+			prefix("search"), truncateMiddle(e.Query, contentW), e.Hits, stageBadge(running, dotFrame))
 
 	case EventResolve:
 		e := ev.Resolve
 		if e == nil {
 			return ""
 		}
-		prefix := orangeStyle.Render("*")
-		return fmt.Sprintf("%s Resolve %s (%d hits)", prefix, truncateMiddle(e.Symbol, contentW), e.Hits)
+		return fmt.Sprintf("%sResolve %s (%d hits) %s",
+			prefix("resolve"), truncateMiddle(e.Symbol, contentW), e.Hits, stageBadge(running, dotFrame))
 
 	default:
 		return ""

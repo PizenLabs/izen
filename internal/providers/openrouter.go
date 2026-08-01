@@ -354,6 +354,7 @@ type openrouterDelta struct {
 	Role             string                `json:"role,omitempty"`
 	Content          string                `json:"content,omitempty"`
 	ReasoningContent string                `json:"reasoning_content,omitempty"`
+	Reasoning        string                `json:"reasoning,omitempty"`
 	ToolCalls        []openrouterToolDelta `json:"tool_calls,omitempty"`
 }
 
@@ -484,8 +485,14 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 			// don't fit in p are held in s.pending and drained on the next
 			// Read() call — never dropped, and never split without keeping
 			// the remainder for delivery (see s.pending doc comment).
-			if delta.ReasoningContent != "" {
-				reasoning := []byte(ReasoningSentinel + delta.ReasoningContent + ReasoningSentinel)
+			// Some models/gateways report reasoning under "reasoning" instead
+			// of "reasoning_content"; both are routed identically.
+			reasoningText := delta.ReasoningContent
+			if reasoningText == "" {
+				reasoningText = delta.Reasoning
+			}
+			if reasoningText != "" {
+				reasoning := []byte(ReasoningSentinel + reasoningText + ReasoningSentinel)
 				n := copy(p, reasoning)
 				if n < len(reasoning) {
 					s.pending = reasoning[n:]

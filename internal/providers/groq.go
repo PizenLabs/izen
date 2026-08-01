@@ -200,6 +200,7 @@ type groqDelta struct {
 	Role             string `json:"role,omitempty"`
 	Content          string `json:"content,omitempty"`
 	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Reasoning        string `json:"reasoning,omitempty"`
 }
 
 type groqUsage struct {
@@ -286,10 +287,15 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 			delta := chunk.Choices[0].Delta
 			// Reasoning content (thinking process) is routed to the
 			// reasoning handler only — never emitted into the response
-			// stream.
-			if delta.ReasoningContent != "" {
+			// stream. Some models report the field as "reasoning" instead of
+			// "reasoning_content"; both are routed identically.
+			reasoningText := delta.ReasoningContent
+			if reasoningText == "" {
+				reasoningText = delta.Reasoning
+			}
+			if reasoningText != "" {
 				if s.reasoningHandler != nil {
-					if err := s.reasoningHandler(delta.ReasoningContent); err != nil {
+					if err := s.reasoningHandler(reasoningText); err != nil {
 						s.closed = true
 						return 0, err
 					}

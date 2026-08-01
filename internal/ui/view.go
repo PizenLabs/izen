@@ -13,6 +13,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/ui/status"
 )
 
 type blockType int
@@ -721,15 +722,13 @@ func (m *model) renderRuntimeStatus(width int) string {
 	}
 
 	// Tokens — always shown; this is the minimum viable status line.
-	tokDisplay := strconv.Itoa(m.TotalTokens) + " tok"
-	if m.ContextLimit > 0 {
-		tokDisplay += " / " + strconv.Itoa(m.ContextLimit)
-	}
-	if m.TotalTokens > 0 {
-		meta = append(meta, dimmedStyle.Render(tokDisplay))
-	} else {
-		meta = append(meta, dimmedStyle.Render("0 tok"))
-	}
+	// Cloud providers render the exact input/output split the provider
+	// reported (2.3k + 1.5k tok); local models fall back to the session
+	// total. The percentage reflects how much of the active model's context
+	// window is consumed, so the bar stays aligned with the provider dashboard
+	// instead of a static "/128000" ceiling.
+	tokDisplay := status.FormatUsageContext(m.InputTokens, m.OutputTokens, m.TotalTokens, m.activeContextLimit())
+	meta = append(meta, dimmedStyle.Render(tokDisplay))
 
 	// Accumulated cost — dropped before checkpoint as panes narrow.
 	costDisplay := llm.EnforceFreeModelOverride(m.cfg.ActiveModelName(), m.AccumulatedCost)

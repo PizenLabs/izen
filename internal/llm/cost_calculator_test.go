@@ -225,6 +225,31 @@ func TestGetModelMetadataNotFound(t *testing.T) {
 	}
 }
 
+func TestContextWindowFor(t *testing.T) {
+	cases := []struct {
+		model string
+		want  int
+	}{
+		{"gpt-4o", 128000},
+		{"claude-3-5-sonnet-20241022", 200000},
+		{"gemini-1.5-pro", 1000000},
+		{"deepseek-chat", 64000},
+		// OpenRouter-style provider/model slugs (not in the curated catalog).
+		{"anthropic/claude-3.5-sonnet", 200000},
+		{"cohere/north-mini-code", 128000},
+		{"google/gemini-2.5-pro", 1000000},
+		{"meta-llama/llama-3.3-70b-instruct", 128000},
+		{"openai/gpt-4o-mini", 128000},
+		// Unknown model → no confident guess.
+		{"custom-model-42", 0},
+	}
+	for _, c := range cases {
+		if got := ContextWindowFor(c.model); got != c.want {
+			t.Errorf("ContextWindowFor(%q) = %d, want %d", c.model, got, c.want)
+		}
+	}
+}
+
 func TestUsageReportFormats(t *testing.T) {
 	usage := CalculateCost("claude-3-5-sonnet-20241022", UsageReport{
 		InputTokens:  100,

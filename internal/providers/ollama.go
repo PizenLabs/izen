@@ -75,6 +75,7 @@ type delta struct {
 	Role             string `json:"role,omitempty"`
 	Content          string `json:"content,omitempty"`
 	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Reasoning        string `json:"reasoning,omitempty"`
 }
 
 type usage struct {
@@ -357,9 +358,29 @@ func (s *sseReader) Read(p []byte) (int, error) {
 			s.finalUsage = chunk.Usage
 		}
 
-		if chunk.Choices[0].Delta != nil && chunk.Choices[0].Delta.Content != "" {
-			n := copy(p, chunk.Choices[0].Delta.Content)
-			return n, nil
+		if chunk.Choices[0].Delta != nil {
+			d := chunk.Choices[0].Delta
+			// Reasoning content (thinking process) is routed to the reasoning
+			// handler only — never emitted into the response stream. Some
+			// models report the field as "reasoning" instead of
+			// "reasoning_content"; both are routed identically.
+			reasoningText := d.ReasoningContent
+			if reasoningText == "" {
+				reasoningText = d.Reasoning
+			}
+			if reasoningText != "" {
+				if s.reasoningHandler != nil {
+					if err := s.reasoningHandler(reasoningText); err != nil {
+						s.closed = true
+						return 0, err
+					}
+				}
+				continue
+			}
+			if d.Content != "" {
+				n := copy(p, d.Content)
+				return n, nil
+			}
 		}
 
 		if chunk.Choices[0].FinishReason != "" {

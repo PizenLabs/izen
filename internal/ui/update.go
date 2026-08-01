@@ -31,6 +31,7 @@ import (
 	"github.com/PizenLabs/izen/internal/providers"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
+	"github.com/PizenLabs/izen/internal/ui/status"
 	verification "github.com/PizenLabs/izen/internal/verification"
 	"github.com/PizenLabs/izen/pkg/control"
 )
@@ -1802,6 +1803,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.InputTokens += msg.tokenInput
 		m.OutputTokens += msg.tokenOutput
 		m.TotalTokens = m.InputTokens + m.OutputTokens
+
+		// Sync the provider-reported usage (or the local estimate fallback
+		// computed above) to the global status tracker so the footer strictly
+		// reflects what the provider billed. The model's own counters are
+		// session-cumulative; the tracker mirrors them for the renderer.
+		if m.IsCloudModel {
+			status.Default.Record(m.InputTokens, m.OutputTokens)
+		} else {
+			status.Default.Record(msg.tokenInput, msg.tokenOutput)
+		}
 
 		// Use accumulated stream content as the canonical final text.
 		// This avoids any race between async printing and the View cycle.

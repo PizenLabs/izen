@@ -1948,8 +1948,12 @@ func (m *model) refreshViewportContent() {
 	// Rendered outside the streaming block so it appears during /build
 	// execution (non-streaming patch proposal) and persists through
 	// approval states. Only renders when the tree has active entries.
+	// The last entry carries a "[running]" badge while any background
+	// stage is still in flight, so the execution tree reads as a live
+	// pipeline rather than a static log dump.
 	if m.activityTree != nil {
-		treeView := m.activityTree.Render(m.width)
+		treeActive := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.state == StateProcessing
+		treeView := m.activityTree.RenderActive(m.width, treeActive, m.dotFrame)
 		if treeView != "" {
 			content.WriteString(treeView)
 			content.WriteString("\n")
