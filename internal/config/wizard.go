@@ -86,6 +86,16 @@ func buildProjectConfig(providers []string, apiKeys map[string]string) *localPro
 			APIKey:       "${GROQ_API_KEY}",
 			DefaultModel: "llama-3.3-70b-versatile",
 		},
+		"opencode": {
+			BaseURL:      "https://opencode.ai/zen/v1",
+			APIKey:       "${OPENCODE_API_KEY}",
+			DefaultModel: "deepseek-v4-flash",
+		},
+		"9router": {
+			BaseURL:      "http://localhost:20128/v1",
+			APIKey:       "${9ROUTER_API_KEY}",
+			DefaultModel: "kr/claude-sonnet-4",
+		},
 	}
 
 	var cfg localProjectYAML
@@ -116,6 +126,8 @@ func selectProviders(reader *bufio.Reader) []string {
 	fmt.Println("  3) Anthropic")
 	fmt.Println("  4) OpenAI")
 	fmt.Println("  5) Groq")
+	fmt.Println("  6) Opencode")
+	fmt.Println("  7) 9Router")
 	fmt.Print("Enter numbers (comma-separated, e.g. 1,3): ")
 
 	input, _ := reader.ReadString('\n')
@@ -127,6 +139,8 @@ func selectProviders(reader *bufio.Reader) []string {
 		"3": "anthropic",
 		"4": "openai",
 		"5": "groq",
+		"6": "opencode",
+		"7": "9router",
 	}
 
 	seen := make(map[string]bool)
@@ -188,6 +202,10 @@ func apiKeyEnvVar(provider string) string {
 		return "OPENAI_API_KEY"
 	case "groq":
 		return "GROQ_API_KEY"
+	case "opencode":
+		return "OPENCODE_API_KEY"
+	case "9router":
+		return "9ROUTER_API_KEY"
 	default:
 		return strings.ToUpper(provider) + "_API_KEY"
 	}

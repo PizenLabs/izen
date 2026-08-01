@@ -197,6 +197,12 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		Stream:    true,
 		System:    systemPrompt,
 		MaxTokens: maxTokens,
+		ReasoningHandler: func(chunk string) error {
+			if m.bus != nil {
+				m.bus.Publish(events.NewReasoningStream(chunk, false))
+			}
+			return nil
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -247,9 +253,24 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		if up, ok := rawStream.(usageProvider); ok {
 			tokIn, tokOut = up.Usage()
 		}
-		if tokIn == 0 && tokOut == 0 {
+		// LOCAL-ONLY ESTIMATE FALLBACK: the character-count estimate (/4) is a
+		// stand-in reserved strictly for local models (ollama) that genuinely
+		// do not report usage metadata. For cloud providers the provider's
+		// final-chunk usage is authoritative: if it reports 0/0 the values are
+		// left as 0 so the footer shows only what the provider actually billed
+		// — never an invented number that diverges from the dashboard.
+		if tokIn == 0 && tokOut == 0 && !m.IsCloudModel {
 			tokIn = len(content) / 4
 			tokOut = len(full) / 4
+		}
+
+		// TRUNCATION DETECTION: when the provider reports finish_reason ==
+		// "length", the response was cut off by the API completion ceiling, not
+		// finished naturally. Flag it so the streamDoneMsg handler can surface a
+		// visible notice instead of silently presenting an incomplete answer.
+		truncated := false
+		if frp, ok := rawStream.(ai.FinishReasonProvider); ok && frp.FinishReason() == "length" {
+			truncated = true
 		}
 
 		if ingestErr != nil {
@@ -260,6 +281,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			content:     full,
 			tokenInput:  tokIn,
 			tokenOutput: tokOut,
+			truncated:   truncated,
 		}
 	}()
 

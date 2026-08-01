@@ -145,7 +145,7 @@ func (p *GroqProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.Re
 		return nil, fmt.Errorf("groq: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	sr := &groqSSEReader{body: resp.Body}
+	sr := &groqSSEReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
 	return &GroqStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -197,8 +197,10 @@ type groqMsg struct {
 }
 
 type groqDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Reasoning        string `json:"reasoning,omitempty"`
 }
 
 type groqUsage struct {
@@ -219,11 +221,22 @@ func (r *GroqStreamResult) Usage() (input, output int) {
 	return 0, 0
 }
 
+// FinishReason reports the terminal finish_reason observed on the stream
+// ("stop", "length", "tool_calls", ...), or "" if none was seen.
+func (r *GroqStreamResult) FinishReason() string {
+	if r.sr != nil {
+		return r.sr.finishReason
+	}
+	return ""
+}
+
 type groqSSEReader struct {
-	body       io.ReadCloser
-	reader     *bufio.Reader
-	closed     bool
-	finalUsage *groqUsage
+	body             io.ReadCloser
+	reader           *bufio.Reader
+	closed           bool
+	finalUsage       *groqUsage
+	finishReason     string
+	reasoningHandler func(string) error
 }
 
 func (s *groqSSEReader) Read(p []byte) (int, error) {
@@ -270,12 +283,33 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 			s.finalUsage = chunk.Usage
 		}
 
-		if chunk.Choices[0].Delta != nil && chunk.Choices[0].Delta.Content != "" {
-			n := copy(p, chunk.Choices[0].Delta.Content)
-			return n, nil
+		if chunk.Choices[0].Delta != nil {
+			delta := chunk.Choices[0].Delta
+			// Reasoning content (thinking process) is routed to the
+			// reasoning handler only — never emitted into the response
+			// stream. Some models report the field as "reasoning" instead of
+			// "reasoning_content"; both are routed identically.
+			reasoningText := delta.ReasoningContent
+			if reasoningText == "" {
+				reasoningText = delta.Reasoning
+			}
+			if reasoningText != "" {
+				if s.reasoningHandler != nil {
+					if err := s.reasoningHandler(reasoningText); err != nil {
+						s.closed = true
+						return 0, err
+					}
+				}
+				continue
+			}
+			if delta.Content != "" {
+				n := copy(p, delta.Content)
+				return n, nil
+			}
 		}
 
 		if chunk.Choices[0].FinishReason != "" {
+			s.finishReason = chunk.Choices[0].FinishReason
 			continue
 		}
 	}

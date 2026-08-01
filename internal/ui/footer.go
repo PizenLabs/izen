@@ -34,8 +34,8 @@ var (
 )
 
 // renderFixedFooter renders the anchored bottom bar: MutationBudget usage
-// counters (Files, Diffs, Tokens, Attempts) and system notification status.
-// Reads counters directly from RuntimeContext.Budget — never stores or caches.
+// counters (Files, Diffs, Attempts) and system notification status. Reads
+// counters directly from RuntimeContext. Never stores or caches.
 func renderFixedFooter(runtimeCtx *runtime.RuntimeContext, notification string, width int) string {
 	if runtimeCtx == nil || width < 20 {
 		return ""
@@ -82,7 +82,6 @@ func renderBudgetCounters(bgt *budget.MutationBudget) string {
 	counters := []counter{
 		{"Files", bgt.MaxFiles, bgt.MaxFiles - bgt.RemainingFiles()},
 		{"Diffs", bgt.MaxDiffLines, bgt.MaxDiffLines - bgt.RemainingDiffLines()},
-		{"Tokens", bgt.MaxTokens, bgt.MaxTokens - bgt.RemainingTokens()},
 		{"Attempts", bgt.MaxAttempts, bgt.MaxAttempts - bgt.RemainingAttempts()},
 	}
 

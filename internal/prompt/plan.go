@@ -182,6 +182,22 @@ The SHELL_EXEC target MUST be a valid command with the ACTUAL package path (e.g.
 		conclusion)
 }
 
+// EvidenceBasedPlanningDirective is the strict anti-hallucination instruction
+// injected into /plan prompts. It forces the model to ground every
+// FILE_MUTATE / ATOMIC_REPLACE / DIFF_PATCH target in actually-inspected file
+// content: a plan must NEVER assume a file (script.js, styles.css, etc.) needs
+// modification unless an explicit duplicate DOM node, diff, or defect was
+// CONFIRMED inside that file's exact content. This prevents generic
+// architectural blueprints that modify every asset on speculation.
+func EvidenceBasedPlanningDirective() string {
+	return `[CRITICAL: EVIDENCE-BASED PLANNING]
+- BEFORE listing any FILE_MUTATE / ATOMIC_REPLACE / DIFF_PATCH task, READ the ACTUAL content of the affected file(s) to locate the exact duplicate DOM node or the exact defect. Do not reason from file names alone.
+- A file MAY ONLY appear as a task target when an explicit duplicate/diff/defect was CONFIRMED inside that file's content.
+- NEVER assume every asset (script.js, styles.css, etc.) needs modification. When a defect is confined to one file (e.g. a duplicated element in index.html), emit EXACTLY ONE FILE_MUTATE task for that file — do NOT add sibling assets as speculative targets.
+- If a file's content could not be inspected, do NOT emit a task for it. Restrict tasks to files whose content you have verified.
+- DO NOT schedule FILE_MUTATE / CODE_MOD tasks for files that need no concrete modification. A destructive edit that strips >80% of a file without an explicit delete instruction is rejected as a no-op by the build guardrail, so a task with an empty or trivial edit payload wastes a build cycle. If a file genuinely needs no change, exclude it from the plan entirely.`
+}
+
 // planJSONSchema is the canonical output schema for BuildPlanJSONPrompt.
 const planJSONSchema = `{
   "context_anchor": {"source": "investigate-ledger", "target_packages": ["pkg"]},
@@ -225,7 +241,7 @@ func GroundedConstraint(archetype string, allowedFiles []string) string {
 // BuildPlanJSONPrompt builds the strict JSON prompt consumed by the TUI parser.
 // Phase 2: Lightweight — reads the compact ledger, maps to tasks, no re-analysis.
 // When isDirectMutation is true, omits EnvironmentContext and constrains output
-// to max_tokens: 150.
+// to a compact single-file patch.
 // groundedPayload is an optional ALLOWED_FILE_TREE constraint block (empty string
 // skips injection).
 func BuildPlanJSONPrompt(problem, ledgerContent, conclusion string, isDirectMutation bool, groundedPayload string) string {
@@ -234,6 +250,8 @@ func BuildPlanJSONPrompt(problem, ledgerContent, conclusion string, isDirectMuta
 	if gp != "" {
 		gp = "\n" + gp
 	}
+
+	evidence := EvidenceBasedPlanningDirective()
 
 	if isDirectMutation {
 		return fmt.Sprintf(`You are the IZEN Plan Mapper. Read the investigation ledger below and produce a JSON plan.
@@ -244,12 +262,14 @@ LEDGER:
 %s%s
 
 %s
+%s
 - Total JSON under 150 tokens.
 %s
 OUTPUT — raw JSON only, no fences, no comments:
 %s`,
 			problem, ledgerContent, cb,
 			planDirectives,
+			evidence,
 			gp,
 			planJSONSchema,
 		)
@@ -265,6 +285,7 @@ LEDGER:
 %s%s
 
 %s
+%s
 - For EVERY task provide rationale (why) and solution (expected end state).
 - Include root_core_factor in strategic_overview describing the fundamental root cause.
 - Total JSON under 300 tokens.
@@ -274,6 +295,7 @@ OUTPUT — raw JSON only, no fences, no comments:
 		EnvironmentContext(),
 		problem, ledgerContent, cb,
 		planDirectives,
+		evidence,
 		gp,
 		planJSONSchema,
 	)
@@ -300,6 +322,7 @@ func BuildPlanPrompt(objective, contextStr string, isDirectMutation bool, ground
 	if gp != "" {
 		gp = "\n" + gp
 	}
+	evidence := EvidenceBasedPlanningDirective()
 
 	if isDirectMutation {
 		return fmt.Sprintf(`%s%s
@@ -308,8 +331,9 @@ USER OBJECTIVE
 %s
 
 %s
+%s
 - Total output under 150 tokens.`,
-			contextStr, gp, objective, planTaskBlocks,
+			contextStr, gp, objective, planTaskBlocks, evidence,
 		)
 	}
 
@@ -320,11 +344,13 @@ USER OBJECTIVE
 USER OBJECTIVE
 %s
 
+%s
 %s`,
 		contextStr, gp,
 		EnvironmentContext(),
 		objective,
 		planTaskBlocks,
+		evidence,
 	)
 }
 

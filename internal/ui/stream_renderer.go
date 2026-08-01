@@ -14,8 +14,16 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
-// ── Catppuccin Mocha ANSI true-color escape sequences (subdued) ─────────
-var (
+// tokenTypeColor maps a Chroma token type to its ANSI true-color sequence
+// using the Catppuccin Mocha palette. Handles partial/incomplete tokens
+// safely — unknown types default to the foreground text colour.
+func tokenTypeColor(t chroma.TokenType) string {
+	return sgrForToken(t)
+}
+
+// ── ANSI fallback constants (kept for backward compat with
+// semantic_renderer.go and render_helper_test.go). ─────────
+const (
 	ansiReset    = "\x1b[0m"
 	ansiText     = "\x1b[38;2;205;214;244m" // #cdd6f4 Foreground
 	ansiKeyword  = "\x1b[38;2;203;166;247m" // #cba6f7 Muted lavender
@@ -24,32 +32,6 @@ var (
 	ansiNumber   = "\x1b[38;2;250;179;135m" // #fab387 Soft amber
 	ansiFunction = "\x1b[38;2;137;180;250m" // #89b4fa Muted blue
 )
-
-// tokenTypeColor maps a Chroma token type to its ANSI true-color sequence
-// using the Catppuccin Mocha palette. Handles partial/incomplete tokens
-// safely — unknown types default to the foreground text color.
-func tokenTypeColor(t chroma.TokenType) string {
-	switch {
-	case t >= chroma.Keyword && t <= chroma.KeywordType:
-		return ansiKeyword
-	case t >= chroma.NameFunction && t <= chroma.NameFunctionMagic:
-		return ansiFunction
-	case t >= chroma.String && t <= chroma.StringSymbol:
-		return ansiString
-	case t >= chroma.Comment && t <= chroma.CommentPreprocFile:
-		return ansiComment
-	case t >= chroma.LiteralNumber && t <= chroma.LiteralNumberOct:
-		return ansiNumber
-	case t == chroma.GenericDeleted:
-		return ansiText
-	case t == chroma.GenericInserted || t == chroma.GenericEmph:
-		return ansiString
-	case t == chroma.GenericHeading || t == chroma.GenericStrong:
-		return ansiFunction
-	default:
-		return ansiText
-	}
-}
 
 // RenderDeterministicPipeline handles complete and partial/streaming blocks identically.
 // It uses strings.Split to guarantee a finite loop iteration count, preventing any

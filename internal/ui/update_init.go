@@ -12,6 +12,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/git"
+	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/state"
 )
 
@@ -308,6 +309,17 @@ func (m *model) getActiveModelName() string {
 		return m.sessionModel
 	}
 	return m.cfg.ActiveModelName()
+}
+
+// activeContextLimit returns the maximum context window for the currently
+// active model. It prefers the dynamic llm lookup (catalog + family heuristic
+// for OpenRouter-style provider/model slugs) and falls back to the session's
+// ContextLimit when the model is unknown.
+func (m *model) activeContextLimit() int {
+	if w := llm.ContextWindowFor(m.getActiveModelName()); w > 0 {
+		return w
+	}
+	return m.ContextLimit
 }
 
 // saveInitState persists the identity and local workspace state when the

@@ -250,7 +250,13 @@ func (m *model) primeHandoffFromLedger(mode modes.Mode) {
 	}
 
 	// Surface the user's raw intent so downstream modes know the original goal.
-	if l.UserRawIntent != "" {
+	// DEDUPE: for /investigate → /plan handoffs the raw intent is normally the
+	// exact problem line that already heads the formatted investigation
+	// diagnostics AND is re-embedded as the "problem" analytical packet.
+	// Appending it a third time as "### USER RAW INTENT" bloats the /plan
+	// synthesis payload for zero signal gain, so it is injected only when the
+	// intent text is not already present in the handoff content.
+	if l.UserRawIntent != "" && !strings.Contains(m.handoffLedgerContent, strings.TrimSpace(l.UserRawIntent)) {
 		if m.handoffLedgerContent != "" {
 			m.handoffLedgerContent += "\n\n### USER RAW INTENT\n" + l.UserRawIntent + "\n"
 		} else {

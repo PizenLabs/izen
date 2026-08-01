@@ -4,6 +4,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/alecthomas/chroma/v2"
+	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
@@ -153,7 +155,7 @@ func renderHeading(node *ast.Heading, width int, source []byte) string {
 	separator := strings.Repeat("─", utf8.RuneCountInString(headingText))
 	styledSeparator := mdMutedStyle.Render(separator)
 
-	return styledText + "\n" + styledSeparator
+	return "\n" + styledText + "\n" + styledSeparator
 }
 
 // renderInlineContent renders all inline children: text, emphasis, strong, code, links.
@@ -361,8 +363,10 @@ func renderBlockquote(node *ast.Blockquote, width int, source []byte) string {
 	return result.String()
 }
 
-// renderFencedCodeBlock renders a fenced code block with optional language label.
-// Uses the node's raw Lines() to correctly extract multi-line code content.
+// renderFencedCodeBlock renders a fenced code block with Chroma syntax
+// highlighting using the Catppuccin Mocha palette. Lines are hard-wrapped
+// to fit the available width without splitting ANSI escape sequences or
+// multi-byte runes.
 func renderFencedCodeBlock(node *ast.FencedCodeBlock, width int, source []byte) string {
 	// Extract language from the info string
 	lang := ""
@@ -400,14 +404,49 @@ func renderFencedCodeBlock(node *ast.FencedCodeBlock, width int, source []byte) 
 		builder.WriteString("\n")
 	}
 
-	for i, line := range codeLines {
-		if i > 0 {
-			builder.WriteString("\n")
+	// Tokenise and render line-by-line with per-token ANSI coloring
+	rawCode := strings.Join(codeLines, "\n")
+	lexer := lexers.Get(lang)
+	if lexer == nil {
+		lexer = lexers.Fallback
+	}
+	lexer = chroma.Coalesce(lexer)
+	iterator, err := lexer.Tokenise(nil, rawCode)
+	if err != nil {
+		for i, line := range codeLines {
+			if i > 0 {
+				builder.WriteString("\n")
+			}
+			builder.WriteString(mdCodeContStyle.Render(line))
 		}
-		builder.WriteString(mdCodeContStyle.Render(line))
+		return builder.String()
 	}
 
-	return builder.String()
+	// Walk tokens and emit each line with Chroma ANSI sequences.
+	currentLine := 0
+	for _, token := range iterator.Tokens() {
+		if token.Value == "" {
+			continue
+		}
+		fragments := strings.Split(token.Value, "\n")
+		for fi, frag := range fragments {
+			if fi > 0 {
+				builder.WriteString(ansiReset)
+				builder.WriteString("\n")
+				currentLine++
+			}
+			if frag == "" {
+				continue
+			}
+			ansiStart := sgrForToken(token.Type)
+			builder.WriteString(ansiStart)
+			builder.WriteString(frag)
+		}
+	}
+	if builder.Len() > 0 && builder.String()[builder.Len()-1] != '\n' {
+		builder.WriteString(ansiReset)
+	}
+	return strings.TrimSuffix(builder.String(), "\n")
 }
 
 // renderCodeSpan renders inline code with subtle emphasis

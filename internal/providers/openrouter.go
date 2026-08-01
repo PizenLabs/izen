@@ -354,6 +354,7 @@ type openrouterDelta struct {
 	Role             string                `json:"role,omitempty"`
 	Content          string                `json:"content,omitempty"`
 	ReasoningContent string                `json:"reasoning_content,omitempty"`
+	Reasoning        string                `json:"reasoning,omitempty"`
 	ToolCalls        []openrouterToolDelta `json:"tool_calls,omitempty"`
 }
 
@@ -384,11 +385,30 @@ func (r *OpenRouterStreamResult) Usage() (input, output int) {
 	return 0, 0
 }
 
+// FinishReason returns the terminal finish_reason observed on the stream
+// ("stop", "length", "tool_calls", ...). It reports "" when the stream ended
+// before any finish_reason chunk was seen. Consumers use it to distinguish a
+// natural completion ("stop") from a response truncated by the completion
+// ceiling ("length").
+func (r *OpenRouterStreamResult) FinishReason() string {
+	if r.sr != nil {
+		return r.sr.finishReason
+	}
+	return ""
+}
+
 type openrouterSSEReader struct {
 	body       io.ReadCloser
 	reader     *bufio.Reader
 	closed     bool
 	finalUsage *openrouterUsage
+
+	// finishReason records the terminal finish_reason chunk observed on the
+	// stream ("stop", "length", "tool_calls", ...). It is surfaced to callers
+	// via OpenRouterStreamResult.FinishReason() so consumers can detect
+	// responses truncated by the completion ceiling (finish_reason: "length")
+	// instead of assuming the response ended naturally.
+	finishReason string
 
 	// pending holds bytes produced by a parsed SSE event that did not fit
 	// into the caller's buffer on a previous Read() call. Read() must never
@@ -465,8 +485,14 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 			// don't fit in p are held in s.pending and drained on the next
 			// Read() call — never dropped, and never split without keeping
 			// the remainder for delivery (see s.pending doc comment).
-			if delta.ReasoningContent != "" {
-				reasoning := []byte(ReasoningSentinel + delta.ReasoningContent + ReasoningSentinel)
+			// Some models/gateways report reasoning under "reasoning" instead
+			// of "reasoning_content"; both are routed identically.
+			reasoningText := delta.ReasoningContent
+			if reasoningText == "" {
+				reasoningText = delta.Reasoning
+			}
+			if reasoningText != "" {
+				reasoning := []byte(ReasoningSentinel + reasoningText + ReasoningSentinel)
 				n := copy(p, reasoning)
 				if n < len(reasoning) {
 					s.pending = reasoning[n:]
@@ -510,6 +536,7 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 		}
 
 		if chunk.Choices[0].FinishReason != "" {
+			s.finishReason = chunk.Choices[0].FinishReason
 			continue
 		}
 	}

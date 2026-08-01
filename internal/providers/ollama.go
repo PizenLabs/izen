@@ -72,8 +72,10 @@ type responseMessage struct {
 }
 
 type delta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Reasoning        string `json:"reasoning,omitempty"`
 }
 
 type usage struct {
@@ -271,7 +273,7 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		return nil, fmt.Errorf("ollama: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	sr := &sseReader{body: resp.Body}
+	sr := &sseReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
 	return &StreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -287,11 +289,22 @@ func (r *StreamResult) Usage() (input, output int) {
 	return 0, 0
 }
 
+// FinishReason reports the terminal finish_reason observed on the stream
+// ("stop", "length", "tool_calls", ...), or "" if none was seen.
+func (r *StreamResult) FinishReason() string {
+	if r.sr != nil {
+		return r.sr.finishReason
+	}
+	return ""
+}
+
 type sseReader struct {
-	body       io.ReadCloser
-	reader     *bufio.Reader
-	closed     bool
-	finalUsage *usage
+	body             io.ReadCloser
+	reader           *bufio.Reader
+	closed           bool
+	finalUsage       *usage
+	finishReason     string
+	reasoningHandler func(string) error
 }
 
 func (s *sseReader) Usage() (input, output int) {
@@ -345,12 +358,33 @@ func (s *sseReader) Read(p []byte) (int, error) {
 			s.finalUsage = chunk.Usage
 		}
 
-		if chunk.Choices[0].Delta != nil && chunk.Choices[0].Delta.Content != "" {
-			n := copy(p, chunk.Choices[0].Delta.Content)
-			return n, nil
+		if chunk.Choices[0].Delta != nil {
+			d := chunk.Choices[0].Delta
+			// Reasoning content (thinking process) is routed to the reasoning
+			// handler only — never emitted into the response stream. Some
+			// models report the field as "reasoning" instead of
+			// "reasoning_content"; both are routed identically.
+			reasoningText := d.ReasoningContent
+			if reasoningText == "" {
+				reasoningText = d.Reasoning
+			}
+			if reasoningText != "" {
+				if s.reasoningHandler != nil {
+					if err := s.reasoningHandler(reasoningText); err != nil {
+						s.closed = true
+						return 0, err
+					}
+				}
+				continue
+			}
+			if d.Content != "" {
+				n := copy(p, d.Content)
+				return n, nil
+			}
 		}
 
 		if chunk.Choices[0].FinishReason != "" {
+			s.finishReason = chunk.Choices[0].FinishReason
 			continue
 		}
 	}

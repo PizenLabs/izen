@@ -75,6 +75,12 @@ type claudeStreamEvent struct {
 type claudeDelta struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+	// Thinking carries the reasoning process text for thinking_delta events
+	// (the Anthropic native equivalent of reasoning_content).
+	Thinking string `json:"thinking"`
+	// StopReason carries the terminal stop reason for message_delta events
+	// ("end_turn", "max_tokens", "tool_use", ...).
+	StopReason string `json:"stop_reason"`
 }
 
 func (p *ClaudeProvider) buildMessages(req ai.Request) []claudeMessage {
@@ -205,7 +211,7 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		return nil, fmt.Errorf("claude: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	sr := &claudeSSEReader{body: resp.Body}
+	sr := &claudeSSEReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
 	return &ClaudeStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -221,11 +227,29 @@ func (r *ClaudeStreamResult) Usage() (input, output int) {
 	return 0, 0
 }
 
+// FinishReason reports the terminal stop reason observed on the stream. The
+// Anthropic stop_reason "max_tokens" (completion ceiling hit) is normalized to
+// "length" so consumers can uniformly detect truncation; otherwise the raw
+// stop_reason ("end_turn", "tool_use", ...) is returned.
+func (r *ClaudeStreamResult) FinishReason() string {
+	if r.sr != nil {
+		switch r.sr.finishReason {
+		case "max_tokens":
+			return "length"
+		default:
+			return r.sr.finishReason
+		}
+	}
+	return ""
+}
+
 type claudeSSEReader struct {
-	body       io.ReadCloser
-	reader     *bufio.Reader
-	closed     bool
-	finalUsage *claudeUsage
+	body             io.ReadCloser
+	reader           *bufio.Reader
+	closed           bool
+	finalUsage       *claudeUsage
+	finishReason     string
+	reasoningHandler func(string) error
 }
 
 func (s *claudeSSEReader) Read(p []byte) (int, error) {
@@ -267,7 +291,21 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 				}
 			}
 		case "content_block_delta":
-			if event.Delta != nil && event.Delta.Text != "" {
+			if event.Delta == nil {
+				continue
+			}
+			// Reasoning process (thinking_delta) is routed to the reasoning
+			// handler only — never emitted into the response stream.
+			if event.Delta.Type == "thinking_delta" && event.Delta.Thinking != "" {
+				if s.reasoningHandler != nil {
+					if err := s.reasoningHandler(event.Delta.Thinking); err != nil {
+						s.closed = true
+						return 0, err
+					}
+				}
+				continue
+			}
+			if event.Delta.Text != "" {
 				n := copy(p, event.Delta.Text)
 				return n, nil
 			}
@@ -277,6 +315,9 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 					s.finalUsage = &claudeUsage{}
 				}
 				s.finalUsage.OutputTokens = event.Usage.OutputTokens
+			}
+			if event.Delta != nil && event.Delta.StopReason != "" {
+				s.finishReason = event.Delta.StopReason
 			}
 		case "message_stop":
 			s.closed = true

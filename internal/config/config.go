@@ -62,6 +62,8 @@ var ValidProviderNames = map[string]bool{
 	"openrouter": true,
 	"gemini":     true,
 	"groq":       true,
+	"opencode":   true,
+	"9router":    true,
 }
 
 // ValidateProviderName checks if name is a known provider

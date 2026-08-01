@@ -151,7 +151,7 @@ func TestCasualChatSystemPrompt(t *testing.T) {
 
 func TestCasualChatMaxTokens(t *testing.T) {
 	got := CasualChatMaxTokens()
-	if got != 80 {
-		t.Errorf("CasualChatMaxTokens() = %d, want 80", got)
+	if got != 2048 {
+		t.Errorf("CasualChatMaxTokens() = %d, want 2048", got)
 	}
 }

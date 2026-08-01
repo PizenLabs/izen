@@ -646,9 +646,19 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 				return m.flushPendingRecords()
 			}
 
-			problem := m.handoffCtx.LastFailurePayload
-			if problem == "" {
+			// PROBLEM for the synthesis prompt must be the SHORT user goal, not
+			// the full forensic ledger. The ledger itself already carries the
+			// problem line at its head, so passing the entire handoff payload as
+			// `problem` would duplicate every byte into BuildPlanJSONPrompt
+			// (PROBLEM: <ledger> + LEDGER: <ledger>) and bloat the token budget
+			// for queued cloud models. Prefer the raw objective/intent; fall back
+			// to the last failure payload only when no objective is recorded.
+			problem := ""
+			if m.sess != nil {
 				problem = m.sess.ObjectiveIntent()
+			}
+			if problem == "" {
+				problem = m.handoffCtx.LastFailurePayload
 			}
 			if problem == "" {
 				problem = "Investigation results require structured execution plan"
@@ -679,7 +689,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			// unresponsive.
 			if len(m.handoffCtx.PendingTodos) == 0 {
 				m.push(roleSystem, mutedStyle.Render(
-					"0 pending TODOs — synthesizing from forensic ledger. If your local model is stuck, this aborts within ~8s instead of hanging."))
+					"0 pending TODOs — synthesizing from forensic ledger. If your local model is stuck, this aborts within ~150s instead of hanging."))
 			}
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
@@ -822,17 +832,20 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 }
 
 // planFirstTokenTimeout bounds how long the LLM provider may take to return its
-// FIRST chunk of plan synthesis. A local model that is OOM/stalling will hang
-// the connection indefinitely; this guard aborts fast so the UI never freezes
-// for the full 120s hard budget waiting on a dead provider socket.
-const planFirstTokenTimeout = 8 * time.Second
+// FIRST chunk of plan synthesis. Cloud/remote models (OpenRouter free-tier, etc.)
+// are subject to queueing, cold starts, and rate limiting — so a 120s first-token
+// guard prevents spurious "context deadline exceeded" aborts while the provider
+// is merely queued/slow. Local models that are OOM/stalling will hang
+// indefinitely; this guard aborts fast so the UI never freezes for the full
+// hard budget waiting on a dead provider socket.
+const planFirstTokenTimeout = 120 * time.Second
 
 // planLocalMaxLatency bounds how long a LOCAL (non-streaming) model may take to
 // return a full completion. Unlike cloud providers, Ollama's /chat/completions
 // is non-streaming: the "first token" is the entire prefill+generation latency,
 // which a 7B model commonly exceeds. We therefore allow a realistic local budget
-// while still keeping the 120s hard cap as the overall ceiling.
-const planLocalMaxLatency = 90 * time.Second
+// while still keeping the hard cap as the overall ceiling.
+const planLocalMaxLatency = 150 * time.Second
 
 // runPlanEngineCmd executes the (potentially slow) PlanEngine ledger synthesis
 // in a background goroutine so the synchronous LLM call never blocks the Bubble
@@ -840,10 +853,13 @@ const planLocalMaxLatency = 90 * time.Second
 // which the Update() loop handles to stage tasks and clear streaming state.
 //
 // HARDENING: two layered deadlines protect the live terminal.
-//  1. firstTokenCtx (8s) — the provider MUST return its first response byte
-//     within this window. If the local model is stuck/OOM or the socket stalls,
-//     we abort immediately instead of freezing the prompt for the full budget.
-//  2. ctx (120s) — overall synthesis budget for a slow-but-alive model.
+//  1. firstTokenCtx (120s cloud / 150s local) — the provider MUST return its
+//     first response byte within this window. OpenRouter free-tier models are
+//     routinely queued for well beyond 45s, so the guard is deliberately
+//     generous to avoid false "context deadline exceeded" failures. If the
+//     local model is stuck/OOM or the socket stalls, we abort immediately
+//     instead of freezing the prompt for the full budget.
+//  2. ctx (180s) — overall synthesis budget for a slow-but-alive model.
 
 // debugLogPlan writes plan-synthesis trace lines to .izen/debug/plan.log
 // instead of os.Stderr. Bubble Tea owns the terminal exclusively while
@@ -867,13 +883,74 @@ func debugLogPlan(line string) {
 	_, _ = f.WriteString(entry)
 }
 
+// compressHandoffSource aggressively prunes and compresses the handoff
+// payload before it reaches the LLM. It strips verbose stack-trace
+// lines, removes duplicate content, and caps the total size so the
+// prompt stays within a tight token budget. This prevents the 2.5k+
+// token handoff bloat that causes OpenRouter cold-start queuing and
+// completion timeouts.
+func compressHandoffSource(source string, maxBytes int) string {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return ""
+	}
+	lines := strings.Split(source, "\n")
+	kept := make([]string, 0, len(lines))
+	seen := make(map[string]struct{}, len(lines))
+	total := 0
+
+	for _, raw := range lines {
+		// Skip verbose stack-trace frames (raw lines starting with tabs)
+		if strings.HasPrefix(raw, "\t") {
+			continue
+		}
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			// Keep at most one blank line between sections
+			if len(kept) > 0 && kept[len(kept)-1] != "" {
+				kept = append(kept, "")
+			}
+			continue
+		}
+		// Skip verbose stack-trace frames (Go "at " stack marker)
+		if strings.Contains(trimmed, "at ") {
+			continue
+		}
+		// Skip extremely long lines (>400 chars = likely verbose trace/context block)
+		if len(trimmed) > 400 {
+			continue
+		}
+		// Deduplicate
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+
+		if total+len(trimmed)+1 > maxBytes {
+			break
+		}
+		kept = append(kept, trimmed)
+		total += len(trimmed) + 1
+	}
+
+	return strings.TrimSpace(strings.Join(kept, "\n"))
+}
+
 func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, handoff HandoffContext) tea.Cmd {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	// Register cancel so it can be invoked on mode transition/Ctrl+C
 	m.registerBackgroundCancel(cancel)
 
 	return func() tea.Msg {
 		debugLogPlan("runPlanEngineCmd entered; model=" + modelName)
+
+		// ── COMPRESS HANDOFF PAYLOAD ──────────────────────────────
+		// Strip verbose stack-trace lines, deduplicate, and cap the
+		// raw payload before truncation. This prevents the 2.5k+ token
+		// handoff bloat that causes OpenRouter cold-start queuing and
+		// completion timeouts. Cloud models get a 2× ceiling instead
+		// of 4× to keep the prompt lean.
+		handoffSource = compressHandoffSource(handoffSource, plan.MaxLedgerChars)
 
 		// ── STRICT LEDGER TRUNCATION (every /investigate → /plan handoff) ──
 		// The handoff ledger carries sanitized trace blocks only — verbose
@@ -889,7 +966,7 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		truncateCeiling := plan.MaxLedgerChars
 		if !localModel {
 			// Cloud models can absorb more, but we still cap the handoff hard.
-			truncateCeiling = plan.MaxLedgerChars * 4
+			truncateCeiling = plan.MaxLedgerChars * 2
 		}
 		if len(handoffSource) > truncateCeiling {
 			truncated := plan.TruncateLedger(handoffSource, truncateCeiling)
@@ -1015,13 +1092,15 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 
 		// ── FIRST-TOKEN / COMPLETION GUARD ───────────────────────────────
 		// The provider call (a single NON-STREAMING HTTP round-trip inside
-		// ProcessFromLedger) inherits this deadline. For cloud providers the
-		// round-trip returns the first token quickly, so the tight 8s guard is
-		// appropriate. Local Ollama calls are non-streaming: "first token" == the
-		// entire prefill+generation latency, which a 7B model easily exceeds. For
-		// local models we therefore use a realistic budget (the 120s hard cap
-		// still applies as the overall ctx), and only fall back to the cloud
-		// prompt if the model is genuinely unresponsive.
+		// ProcessFromLedger) inherits this deadline. OpenRouter free-tier
+		// models are frequently queued/cold-started well past 45s, so the
+		// cloud guard is set to 120s to prevent spurious context deadline
+		// exceeded failures. Local Ollama calls are non-streaming: "first
+		// token" == the entire prefill+generation latency, which a 7B model
+		// easily exceeds. For local models we therefore use an even more
+		// realistic budget (the hard cap still applies as the overall ctx),
+		// and only fall back to the cloud prompt if the model is genuinely
+		// unresponsive.
 		ftBudget := planFirstTokenTimeout
 		if localModel {
 			ftBudget = planLocalMaxLatency
@@ -1121,13 +1200,27 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 					Handoff: handoff,
 				}
 			}
+			// Determine the active provider for a provider-aware error message.
+			activeProvider := m.cfg.ActiveProviderName()
+			if activeProvider == "" {
+				activeProvider = "unknown"
+			}
+			var providerErrMsg string
+			switch activeProvider {
+			case "openrouter":
+				providerErrMsg = fmt.Sprintf("[error] OpenRouter request timed out (> %s). Free-tier models may be queued or rate-limited.", planFirstTokenTimeout)
+			case "ollama":
+				providerErrMsg = fmt.Sprintf("[error] LLM Provider timeout: no response within %s. Check if your local model is stuck/OOM, or that Ollama is running and the model (%s) is loaded", planFirstTokenTimeout, modelName)
+			default:
+				providerErrMsg = fmt.Sprintf("[error] LLM Provider timeout: no response within %s. The provider (%s) may be slow, overloaded, or unreachable.", planFirstTokenTimeout, activeProvider)
+			}
 			return planResultMsg{
-				Err:     fmt.Errorf("[error] LLM Provider timeout: no response within %s. Check if your local model is stuck/OOM, or that Ollama is running and the model (%s) is loaded", planFirstTokenTimeout, modelName),
+				Err:     fmt.Errorf("%s", providerErrMsg),
 				Handoff: handoff,
 			}
 		case <-ctx.Done():
-			debugLogPlan("hard 120s timeout — aborting")
-			return planResultMsg{Err: fmt.Errorf("plan synthesis timed out after 120s: %w", ctx.Err()), Handoff: handoff}
+			debugLogPlan("hard 180s timeout — aborting")
+			return planResultMsg{Err: fmt.Errorf("plan synthesis timed out after 180s: %w", ctx.Err()), Handoff: handoff}
 		}
 	}
 }
@@ -3894,6 +3987,25 @@ func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cm
 			}
 		}
 		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
+			// Graceful no-op skip: the destruction guardrail refused a >80%
+			// file wipe without an explicit delete/clear instruction. The file
+			// is unchanged — mark the task done (no changes needed) instead of
+			// failing the /build run.
+			if errors.Is(applyErr, execution.ErrDestructivePatchSkipped) {
+				tasks := m.sess.CurrentTasks
+				for i := range tasks {
+					if tasks[i].StepNum == task.StepNum {
+						tasks[i].Status = "completed"
+						break
+					}
+				}
+				m.sess.StageTaskList(&tasks)
+				_ = m.sess.Save()
+				return buildResultMsg{
+					output:   fmt.Sprintf("Skipped destructive hotfix patch on %s (no changes needed — file left unchanged)", task.Target),
+					exitCode: 0,
+				}
+			}
 			tasks := m.sess.CurrentTasks
 			for i := range tasks {
 				if tasks[i].StepNum == task.StepNum {

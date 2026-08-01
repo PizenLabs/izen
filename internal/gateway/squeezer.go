@@ -32,7 +32,7 @@ func (t ComplexityTier) String() string {
 }
 
 // simpleMutationPatterns are verb phrases that always indicate a small,
-// targeted change under 150 tokens.
+// targeted change.
 var simpleMutationPatterns = []string{
 	"rename",
 	"fix typo",
@@ -104,7 +104,7 @@ func Squeeze(req *ai.Request, tier ComplexityTier) error {
 		return ErrTrivialCreate
 
 	case TierSimpleMutation:
-		req.MaxTokens = 150
+		req.MaxTokens = 2048
 		req.Stop = []string{">>>>>>>", "```\n\n", "###"}
 		req.Temperature = 0.0
 

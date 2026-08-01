@@ -3,8 +3,12 @@ package execution
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/PizenLabs/izen/internal/context"
 )
 
 func TestApplyLineRangeFallbackNeverPanics(t *testing.T) {
@@ -1015,5 +1019,600 @@ func TestApplyContextAwareFuzzyReplace_AtAuthor(t *testing.T) {
 	}
 	if !foundHashirama {
 		t.Errorf("expected '@author Hashirama' in output, got:\n%s", modified)
+	}
+}
+
+func TestApplySearchReplace_WhitespaceTolerance(t *testing.T) {
+	original := "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n"
+
+	t.Run("exact substring match", func(t *testing.T) {
+		got, ok := ApplySearchReplace(original, "\tprintln(\"hello\")", "\tprintln(\"hi\")")
+		if !ok {
+			t.Fatal("expected exact match to succeed")
+		}
+		if !strings.Contains(got, "\tprintln(\"hi\")") {
+			t.Fatalf("expected replacement present, got:\n%s", got)
+		}
+	})
+
+	t.Run("indentation drift tolerated via trim-normalized match", func(t *testing.T) {
+		// The search block uses 2-space indentation while the file uses tabs.
+		// The match must succeed even though the indentation differs.
+		search := "  println(\"hello\")"
+		replace := "  println(\"hi\")"
+		got, ok := ApplySearchReplace(original, search, replace)
+		if !ok {
+			t.Fatal("expected whitespace-normalized match to succeed")
+		}
+		if !strings.Contains(got, "println(\"hi\")") {
+			t.Fatalf("expected replacement present, got:\n%s", got)
+		}
+	})
+
+	t.Run("blank line equivalence", func(t *testing.T) {
+		// Search block with a tab-only blank line matches the empty line.
+		search := "package main\n\t\nfunc main() {"
+		replace := "package main\n\t\nfunc newFn() {"
+		got, ok := ApplySearchReplace(original, search, replace)
+		if !ok {
+			t.Fatal("expected blank-line equivalence match to succeed")
+		}
+		if !strings.Contains(got, "func newFn() {") {
+			t.Fatalf("expected replacement present, got:\n%s", got)
+		}
+	})
+}
+
+func TestApplySearchReplace_NoMatch(t *testing.T) {
+	original := "alpha\nbeta\ngamma\n"
+	got, ok := ApplySearchReplace(original, "delta", "epsilon")
+	if ok {
+		t.Fatal("expected false when search text is absent")
+	}
+	if got != original {
+		t.Fatalf("expected original unchanged on no-match, got:\n%s", got)
+	}
+}
+
+func TestIsPatchArtifactContent(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"search header", "<<<<<<< SEARCH\nfoo\n=======\nbar\n>>>>>>>\n", true},
+		{"file create header", "<<<<<<< FILE_CREATE: main.go\nfoo\n>>>>>>> END_FILE\n", true},
+		{"stray conflict marker", "a\n<<<<<<<\nb\n>>>>>>>\nc\n", true},
+		{"unified diff hunk", "@@ -1,3 +1,3 @@\n context\n", true},
+		{"unified diff headers", "--- a/foo\n+++ b/foo\n", true},
+		{"real file content", "package main\n\nfunc main() {}\n", false},
+		{"html content", "<!DOCTYPE html>\n<div>ok</div>\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isPatchArtifactContent(tc.content); got != tc.want {
+				t.Fatalf("isPatchArtifactContent(%q) = %v, want %v", tc.content, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolvePatchContent_SEARCHMismatchForcedFallback(t *testing.T) {
+	pm := NewPatchManager(t.TempDir())
+	original := "line one\nline two\n"
+	diffInput := "<<<<<<< SEARCH\nthis text does not exist\n=======\nreplacement\n>>>>>>>\n"
+	resolved, err := pm.resolvePatchContent(original, diffInput, &Patch{File: "target.txt"})
+	if err != nil {
+		t.Fatalf("expected SEARCH mismatch on a small file to resolve via forced full-content fallback, got: %v", err)
+	}
+	if resolved != "replacement" {
+		t.Fatalf("expected REPLACE payload as full content, got: %q", resolved)
+	}
+}
+
+func TestApply_FreshReadStaleOriginalWins(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "index.html")
+	if err := os.WriteFile(file, []byte("<div>alpha</div>\n<div>beta</div>\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Caller captured a STALE original that no longer matches disk. The
+	// SEARCH block only matches the current disk content. Apply must re-read
+	// the file and succeed instead of failing with a hunk mismatch.
+	staleOriginal := "<div>old</div>\n<div>old</div>\n"
+	patch := &Patch{
+		ID:       "fresh-read-test",
+		File:     "index.html",
+		Original: staleOriginal,
+		Modified: "<<<<<<< SEARCH\n<div>beta</div>\n=======\n<div>beta-edited</div>\n>>>>>>>\n",
+	}
+
+	pm := NewPatchManager(root)
+	pm.SetAuthorization(testAuth())
+	if err := pm.Apply(patch); err != nil {
+		t.Fatalf("Apply failed on fresh read: %v", err)
+	}
+
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "<div>beta-edited</div>") {
+		t.Fatalf("expected fresh-read content to be patched, got:\n%s", got)
+	}
+	if strings.Contains(got, "<div>old</div>") {
+		t.Fatalf("stale original leaked into result — fresh read did not win, got:\n%s", got)
+	}
+	if !strings.Contains(got, "<div>alpha</div>") {
+		t.Fatalf("expected sibling content preserved, got:\n%s", got)
+	}
+}
+
+func TestApply_SEARCHMismatchForcedFullContentFallback(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "target.txt")
+	original := "hello\nworld\n"
+	if err := os.WriteFile(file, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// SEARCH context does not match the file at all, but the REPLACE payload
+	// is the model's full-content answer. The file is ≤ 50KB, so Apply MUST
+	// succeed by writing the replacement payload as full content instead of
+	// returning "patch hunk does not match file content".
+	patch := &Patch{
+		ID:       "forced-fallback-test",
+		File:     "target.txt",
+		Original: original,
+		Modified: "<<<<<<< SEARCH\ndoes not exist\n=======\nreplacement\n>>>>>>>\n",
+	}
+
+	pm := NewPatchManager(root)
+	pm.SetAuthorization(testAuth())
+	if err := pm.Apply(patch); err != nil {
+		t.Fatalf("expected Apply to succeed via forced full-content fallback on a small file, got: %v", err)
+	}
+
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); got != "replacement" {
+		t.Fatalf("expected REPLACE payload written as full content, got:\n%s", got)
+	}
+}
+
+func TestApply_SmallFileFullContentFallback(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "index.html")
+	original := "line one\nline two\nline three\n"
+	if err := os.WriteFile(file, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unified diff whose hunk anchors are out of bounds and context cannot
+	// match. The file is small, so the resolver falls back to a full-content
+	// write of the sanitized diff — never writing raw @@ / - / + markers.
+	patch := &Patch{
+		ID:       "fallback-test",
+		File:     "index.html",
+		Original: original,
+		Modified: "@@ -99,3 +99,3 @@\n line one\n-line two\n+line two edited\n",
+	}
+
+	pm := NewPatchManager(root)
+	pm.SetAuthorization(testAuth())
+	if err := pm.Apply(patch); err != nil {
+		t.Fatalf("Apply failed on small-file fallback: %v", err)
+	}
+
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if strings.Contains(got, "@@") || strings.Contains(got, "\n-line") {
+		t.Fatalf("raw diff markers leaked into file, got:\n%s", got)
+	}
+	if !strings.Contains(got, "line two edited") {
+		t.Fatalf("expected sanitized full-content write, got:\n%s", got)
+	}
+	if !strings.Contains(got, "line one") {
+		t.Fatalf("expected context line preserved, got:\n%s", got)
+	}
+}
+
+func TestApplySearchReplace_CRLFNormalization(t *testing.T) {
+	// File checked out with Windows line endings; SEARCH block uses LF.
+	original := "line one\r\nline two\r\nline three\r\n"
+	search := "line two"
+	replace := "line two edited"
+	got, ok := ApplySearchReplace(original, search, replace)
+	if !ok {
+		t.Fatal("expected CRLF/LF-tolerant match to succeed")
+	}
+	if !strings.Contains(got, "line two edited") {
+		t.Fatalf("expected replacement present, got:\n%q", got)
+	}
+	if !strings.Contains(got, "line one\r\n") {
+		t.Fatalf("expected untouched CRLF lines preserved, got:\n%q", got)
+	}
+
+	// Multi-line search across a CRLF file using LF search lines.
+	original2 := "<!DOCTYPE html>\r\n<html>\r\n<body>\r\n  <p>old</p>\r\n</body>\r\n</html>\r\n"
+	search2 := "<body>\n  <p>old</p>"
+	replace2 := "<body>\n  <p>new</p>"
+	got2, ok2 := ApplySearchReplace(original2, search2, replace2)
+	if !ok2 {
+		t.Fatal("expected multi-line CRLF-tolerant match to succeed")
+	}
+	if !strings.Contains(got2, "<p>new</p>") {
+		t.Fatalf("expected replacement present, got:\n%q", got2)
+	}
+	if !strings.Contains(got2, "<!DOCTYPE html>\r\n") {
+		t.Fatalf("expected untouched CRLF prefix preserved, got:\n%q", got2)
+	}
+}
+
+func TestApply_IndexHTML_LeadingSpaceMismatch_FuzzyMatch(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "index.html")
+	original := `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>My Page</title>
+</head>
+<body>
+  <div class="container">
+    <p>Hello</p>
+  </div>
+  <div class="footer">
+    <p>Footer</p>
+  </div>
+</body>
+</html>
+`
+	if err := os.WriteFile(file, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The model's SEARCH block uses 4-space indentation while the file uses
+	// 2-space indentation. Trim-normalized fuzzy matching must still locate
+	// the block and apply the edit without any error.
+	patch := &Patch{
+		ID:   "index-fuzzy",
+		File: "index.html",
+		Modified: `<<<<<<< SEARCH
+    <div class="container">
+      <p>Hello</p>
+    </div>
+=======
+    <div class="container">
+      <p>Hello World</p>
+    </div>
+>>>>>>>
+`,
+	}
+
+	pm := NewPatchManager(root)
+	pm.SetAuthorization(testAuth())
+	if err := pm.Apply(patch); err != nil {
+		t.Fatalf("index.html fuzzy patch failed: %v", err)
+	}
+
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "<p>Hello World</p>") {
+		t.Fatalf("expected fuzzy-matched replacement applied, got:\n%s", got)
+	}
+	if !strings.Contains(got, `<div class="footer">`) {
+		t.Fatalf("expected surrounding content preserved, got:\n%s", got)
+	}
+	if strings.Contains(got, ">>>>>>>") || strings.Contains(got, "<<<<<<<") || strings.Contains(got, "=======") {
+		t.Fatalf("SEARCH/REPLACE markers leaked into file, got:\n%s", got)
+	}
+}
+
+func TestApply_IndexHTML_SEARCHMismatch_FullContentFallback(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "index.html")
+	original := `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>My Page</title>
+</head>
+<body>
+  <div class="container">
+    <p>Hello</p>
+  </div>
+</body>
+</html>
+`
+	if err := os.WriteFile(file, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The SEARCH context does not exist in the file at all, but the REPLACE
+	// payload is a complete valid HTML document. The file is ≤ 50KB, so the
+	// circuit breaker must proceed to a full-content write instead of
+	// returning "patch hunk does not match file content".
+	replacement := `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Rebuilt Page</title>
+</head>
+<body>
+  <main>
+    <h1>Rebuilt</h1>
+  </main>
+</body>
+</html>
+`
+	patch := &Patch{
+		ID:   "index-full",
+		File: "index.html",
+		Modified: "<<<<<<< SEARCH\nTHIS SNIPPET IS NOT PRESENT IN THE FILE\nANYWHERE AT ALL\n=======\n" +
+			replacement + "\n>>>>>>>\n",
+	}
+
+	pm := NewPatchManager(root)
+	pm.SetAuthorization(testAuth())
+	if err := pm.Apply(patch); err != nil {
+		t.Fatalf("index.html full-content fallback failed: %v", err)
+	}
+
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "<title>Rebuilt Page</title>") {
+		t.Fatalf("expected full-content replacement applied, got:\n%s", got)
+	}
+	if strings.Contains(got, "THIS SNIPPET IS NOT PRESENT") {
+		t.Fatalf("search snippet leaked into file, got:\n%s", got)
+	}
+	if strings.Contains(got, "<<<<<<<") || strings.Contains(got, ">>>>>>>") {
+		t.Fatalf("SEARCH/REPLACE markers leaked into file, got:\n%s", got)
+	}
+}
+
+func TestApply_IndexHTML_SEARCHMismatch_ForcedFullContentFallback(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "index.html")
+
+	// ~2KB index.html on disk (well under MaxFullContentRewriteBytes).
+	template := `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>My Page</title>
+</head>
+<body>
+  <div class="hero">
+    <h1>Welcome</h1>
+    <p>Original content block that the model never saw.</p>
+  </div>
+</body>
+</html>
+`
+	original := strings.Repeat(template, 9)
+	if len(original) < 2000 || len(original) > MaxFullContentRewriteBytes {
+		t.Fatalf("test fixture size %d bytes is outside the intended 2KB range", len(original))
+	}
+	if err := os.WriteFile(file, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The REPLACE payload is a complete, valid HTML document. It deliberately
+	// contains a line starting with "@@" — without SEARCH/REPLACE precedence
+	// over unified-diff detection this exact payload is misrouted into the
+	// unified-diff parser and dies with "patch hunk does not match file
+	// content — target code context may have changed". The SEARCH block is
+	// completely absent from the file, so ApplySearchReplaceBlocks must fail
+	// and the forced full-content fallback must take over.
+	replacement := strings.Repeat(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Rebuilt Page</title>
+</head>
+<body>
+@@ custom-zone @@
+  <main>
+    <h1>Rebuilt</h1>
+    <p>Full-content replacement payload.</p>
+  </main>
+</body>
+</html>
+`, 8)
+	patch := &Patch{
+		ID:   "index-forced",
+		File: "index.html",
+		Modified: "<<<<<<< SEARCH\nTHIS SNIPPET IS NOT PRESENT IN THE FILE\nANYWHERE AT ALL\n=======\n" +
+			replacement + "\n>>>>>>>\n",
+	}
+
+	pm := NewPatchManager(root)
+	pm.SetAuthorization(testAuth())
+	if err := pm.Apply(patch); err != nil {
+		t.Fatalf("index.html forced full-content fallback failed: %v", err)
+	}
+
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "<title>Rebuilt Page</title>") {
+		t.Fatalf("expected full-content replacement applied, got:\n%s", got)
+	}
+	if strings.Contains(got, "THIS SNIPPET IS NOT PRESENT") {
+		t.Fatalf("search snippet leaked into file, got:\n%s", got)
+	}
+	if strings.Contains(got, "<<<<<<<") || strings.Contains(got, ">>>>>>>") {
+		t.Fatalf("SEARCH/REPLACE markers leaked into file, got:\n%s", got)
+	}
+}
+
+func TestApply_ErrorWrappedOnce(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "target.txt")
+	original := "line a\nline b\nline c\n"
+	if err := os.WriteFile(file, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two SEARCH/REPLACE blocks, both mismatched → no full-content fallback
+	// (multi-block is ambiguous) → must fail with exactly ONE "apply patch to"
+	// prefix, never "apply patch to X: apply patch to X:...".
+	patch := &Patch{
+		ID:   "double-wrap",
+		File: "target.txt",
+		Modified: `<<<<<<< SEARCH
+missing one
+=======
+replacement one
+>>>>>>>
+<<<<<<< SEARCH
+missing two
+=======
+replacement two
+>>>>>>>
+`,
+	}
+
+	pm := NewPatchManager(root)
+	pm.SetAuthorization(testAuth())
+	err := pm.Apply(patch)
+	if err == nil {
+		t.Fatal("expected Apply to fail on multi-block SEARCH mismatch")
+	}
+	if n := strings.Count(err.Error(), "apply patch to"); n != 1 {
+		t.Fatalf("expected 'apply patch to' exactly once, got %d: %v", n, err)
+	}
+}
+
+func TestDestructivePatchSkippedAsNoOp(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "izen-destructive-skip-*")
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	pm := NewPatchManager(dir)
+	pm.SetAuthorization(testAuth())
+	ledger := context.NewTaskLedger()
+	pm.SetLedger(ledger)
+	pm.SetContextID("#ctx-skip-1-r1")
+
+	var orig strings.Builder
+	for i := 1; i <= 51; i++ {
+		fmt.Fprintf(&orig, "const line_%d = %d;\n", i, i)
+	}
+
+	testFile := "script.js"
+	fullPath := filepath.Join(dir, testFile)
+	if err := os.WriteFile(fullPath, []byte(orig.String()), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// The LLM produced a tiny edit payload: a SEARCH/REPLACE block that
+	// replaces the entire 51-line body with a 2-line stub (removing 49/51)
+	// without any explicit delete instruction.
+	modified := "<<<<<<< SEARCH\n" + orig.String() + "=======\nconst line_1 = 1;\nconsole.log('done');\n>>>>>>>"
+
+	var skipLog string
+	SetActivityLogger(func(format string, args ...interface{}) {
+		skipLog += fmt.Sprintf(format, args...)
+	})
+	defer SetActivityLogger(nil)
+
+	err := pm.Apply(&Patch{
+		ID:       "skip-1",
+		File:     testFile,
+		Modified: modified,
+		TaskID:   7,
+	})
+
+	if !errors.Is(err, ErrDestructivePatchSkipped) {
+		t.Fatalf("expected ErrDestructivePatchSkipped, got: %v", err)
+	}
+
+	data, rerr := os.ReadFile(fullPath)
+	if rerr != nil {
+		t.Fatalf("read: %v", rerr)
+	}
+	if string(data) != orig.String() {
+		t.Fatalf("file was modified despite guardrail skip: got %d bytes, want %d bytes", len(data), len(orig.String()))
+	}
+
+	if !ledger.IsSkipped(7) {
+		t.Fatal("expected task 7 to be marked Skipped in the ledger")
+	}
+	if !ledger.IsCompleted(7) {
+		t.Fatal("expected skipped task to count as completed for the plan checklist")
+	}
+	if !strings.Contains(skipLog, "Skipped destructive patch on script.js") {
+		t.Fatalf("expected skip warning in activity log, got: %q", skipLog)
+	}
+	if strings.Contains(skipLog, "[FAIL]") {
+		t.Fatalf("expected no [FAIL] log for a graceful skip, got: %q", skipLog)
+	}
+}
+
+func TestDestructivePureStripDetected(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "izen-destructive-strip-*")
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	pm := NewPatchManager(dir)
+	pm.SetAuthorization(testAuth())
+
+	var orig strings.Builder
+	for i := 1; i <= 40; i++ {
+		fmt.Fprintf(&orig, "const line_%d = %d;\n", i, i)
+	}
+
+	testFile := "styles.js"
+	fullPath := filepath.Join(dir, testFile)
+	if err := os.WriteFile(fullPath, []byte(orig.String()), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Replacement is a strict subset of the original lines — a pure strip with
+	// no meaningful new content.
+	modified := "<<<<<<< SEARCH\n" + orig.String() + "=======\nconst line_1 = 1;\n>>>>>>>"
+
+	var skipLog string
+	SetActivityLogger(func(format string, args ...interface{}) {
+		skipLog += fmt.Sprintf(format, args...)
+	})
+	defer SetActivityLogger(nil)
+
+	err := pm.Apply(&Patch{
+		ID:       "strip-1",
+		File:     testFile,
+		Modified: modified,
+		TaskID:   0,
+	})
+
+	if !errors.Is(err, ErrDestructivePatchSkipped) {
+		t.Fatalf("expected ErrDestructivePatchSkipped, got: %v", err)
+	}
+	if !strings.Contains(skipLog, "no meaningful new content detected") {
+		t.Fatalf("expected 'no meaningful new content detected' in log, got: %q", skipLog)
+	}
+
+	data, rerr := os.ReadFile(fullPath)
+	if rerr != nil {
+		t.Fatalf("read: %v", rerr)
+	}
+	if string(data) != orig.String() {
+		t.Fatal("file was modified despite pure-strip guardrail skip")
 	}
 }

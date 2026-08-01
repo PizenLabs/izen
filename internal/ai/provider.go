@@ -25,6 +25,13 @@ type Request struct {
 	Temperature    float64          `json:"-"` // 0 = use provider default
 	ResponseFormat *ResponseFormat  `json:"response_format,omitempty"`
 	Tools          []ToolDefinition `json:"-"` // Native LLM function calling tool definitions
+	// ReasoningHandler receives reasoning/thinking content as it streams in,
+	// separated from the main response. Providers call it with verbatim chunks
+	// (the same text that reasoning_content / thinking_delta / thought frames
+	// carry) so consumers can publish a reasoning stream without ever mixing it
+	// into the response pipeline. When nil, reasoning content is silently
+	// discarded by the SSE readers.
+	ReasoningHandler func(chunk string) error
 }
 
 type Response struct {
@@ -38,6 +45,14 @@ type Provider interface {
 	Name() string
 	Execute(ctx context.Context, req Request) (*Response, error)
 	ExecuteStream(ctx context.Context, req Request) (io.ReadCloser, error)
+}
+
+// FinishReasonProvider is implemented by stream results that can report the
+// provider's terminal finish_reason (e.g. "stop", "length", "tool_calls").
+// Consumers use it to detect responses truncated by the API's completion
+// ceiling (finish_reason == "length") rather than finished naturally ("stop").
+type FinishReasonProvider interface {
+	FinishReason() string
 }
 
 type ProviderConfig struct {

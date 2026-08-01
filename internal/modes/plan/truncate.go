@@ -64,7 +64,7 @@ func IsLocalModel(modelName string) bool {
 // MaxLedgerChars is the hard ceiling (in characters) for the forensic ledger
 // injected into a local model. ~4 chars/token yields a ~1.5k token budget, which
 // fits comfortably under budget.ModelTokenBudget for 7B-class models so the
-// first token reliably arrives within the 8s guard.
+// first token reliably arrives within the first-token guard.
 const MaxLedgerChars = 4000
 
 // compilationErrorMarkers identify ledger content that can be resolved purely

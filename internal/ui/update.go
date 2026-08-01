@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -30,6 +31,7 @@ import (
 	"github.com/PizenLabs/izen/internal/providers"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
+	"github.com/PizenLabs/izen/internal/ui/status"
 	verification "github.com/PizenLabs/izen/internal/verification"
 	"github.com/PizenLabs/izen/pkg/control"
 )
@@ -1802,6 +1804,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.OutputTokens += msg.tokenOutput
 		m.TotalTokens = m.InputTokens + m.OutputTokens
 
+		// Sync the provider-reported usage (or the local estimate fallback
+		// computed above) to the global status tracker so the footer strictly
+		// reflects what the provider billed. The model's own counters are
+		// session-cumulative; the tracker mirrors them for the renderer.
+		if m.IsCloudModel {
+			status.Default.Record(m.InputTokens, m.OutputTokens)
+		} else {
+			status.Default.Record(msg.tokenInput, msg.tokenOutput)
+		}
+
 		// Use accumulated stream content as the canonical final text.
 		// This avoids any race between async printing and the View cycle.
 		final := m.currentStreamContent
@@ -1846,6 +1858,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		// Append the completed turn to PreRenderedHistory and freeze state.
 		m.push(roleAI, final)
+
+		// TRUNCATION NOTICE: finish_reason == "length" means the response was
+		// cut off by the API completion ceiling, not finished naturally. Signal
+		// it so the user knows the answer is incomplete rather than assuming a
+		// full response (the ~78-token OpenRouter truncation wall).
+		if msg.truncated {
+			log.Printf("[TRUNCATION] response hit max_tokens ceiling (finish_reason: length) — %d output tokens", msg.tokenOutput)
+			m.push(roleSystem, warningStyle.Render(
+				"[TRUNCATED] The response hit the provider's max_tokens limit and was cut off mid-generation (finish_reason: \"length\"). Increase max_tokens in the provider config to allow longer responses."))
+		}
 
 		// ── IMPLICIT PIPELINE INTERCEPT: pipe stream output to next step ──
 		if m.pipelineRunning {

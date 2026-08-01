@@ -1,5 +1,7 @@
 package llm
 
+import "strings"
+
 type ModelMetadata struct {
 	ID                 string  `json:"id"`
 	Name               string  `json:"name"`
@@ -110,4 +112,39 @@ func GetModelMetadata(modelID string) *ModelMetadata {
 		}
 	}
 	return nil
+}
+
+// ContextWindowFor returns the model's maximum context window. It first
+// consults the curated catalog; for provider-prefixed IDs (OpenRouter-style
+// "provider/model" slugs) it falls back to a family heuristic so common
+// models resolve to a sensible window without a network call. Returns 0
+// when the model is unknown and no confident guess exists.
+func ContextWindowFor(modelID string) int {
+	if meta := GetModelMetadata(modelID); meta != nil {
+		return meta.ContextWindow
+	}
+
+	lower := strings.ToLower(modelID)
+	switch {
+	case strings.Contains(lower, "gemini"):
+		return 1_000_000
+	case strings.Contains(lower, "claude"):
+		return 200_000
+	case strings.Contains(lower, "gpt-4"):
+		return 128_000
+	case strings.Contains(lower, "gpt-3.5"):
+		return 16_385
+	case strings.Contains(lower, "o1"), strings.Contains(lower, "o3"):
+		return 200_000
+	case strings.Contains(lower, "deepseek"):
+		return 64_000
+	case strings.Contains(lower, "north"), strings.Contains(lower, "command"):
+		return 128_000
+	case strings.Contains(lower, "llama"):
+		return 128_000
+	case strings.Contains(lower, "qwen2.5"):
+		return 32_768
+	default:
+		return 0
+	}
 }
