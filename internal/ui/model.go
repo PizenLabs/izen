@@ -1920,6 +1920,17 @@ func (m *model) refreshViewportContent() {
 				content.WriteString(rendered)
 				content.WriteString("\n")
 			}
+		} else if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
+			// LIVE REASONING WITHOUT CONTENT: agent-style runs (e.g. /build
+			// fast-track) stream reasoning + tool-call arguments but never fill
+			// currentStreamContent, so renderStreamingContent is never reached
+			// and the thinking box would stay invisible. Render it here,
+			// dimmed, so reasoning stays on screen during agent execution too.
+			thoughts := m.renderLiveThinking(m.width)
+			if thoughts != "" {
+				content.WriteString(thoughts)
+				content.WriteString("\n")
+			}
 		}
 
 		// ── Collapsible reasoning block ──────────────────────────────

@@ -168,5 +168,7 @@ func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) stri
 }
 
 // thinkingStyle is the dimmed/italic reasoning style. Reasoning must read as a
-// distinct, subordinate stream — never as part of the answer.
-var thinkingStyle = lipgloss.NewStyle().Faint(true).Italic(true)
+// distinct, subordinate stream — never as part of the answer. The muted gray
+// foreground guarantees the dim look even on terminals that ignore the Faint
+// SGR attribute (where faint alone would render at full brightness).
+var thinkingStyle = lipgloss.NewStyle().Faint(true).Italic(true).Foreground(lipgloss.Color(colorMuted))
