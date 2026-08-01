@@ -440,7 +440,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 				},
 			},
 			Stream:    false,
-			MaxTokens: 2048,
+			MaxTokens: 1536,
 		}
 	} else {
 		// ── COMPLEXITY-CONDITIONAL SYSTEM PROMPT ──────────
@@ -488,7 +488,8 @@ ALLOWED ACTIONS: Pure file mutations on .html, .css, .js files only.`
 					Content: prompt.BuildPlanJSONPrompt(problem, ledgerContent, conclusion, isDirectMut, groundedPayload),
 				},
 			},
-			Stream: false,
+			Stream:    false,
+			MaxTokens: 1536,
 			ResponseFormat: &ai.ResponseFormat{
 				Type: "json_object",
 			},
@@ -1358,7 +1359,8 @@ func (e *Engine) ProcessPlan(ctx context.Context, modelName string, objective st
 				Content: prompt.BuildPlanPrompt(objective, contextStr, isDirectMut, ""),
 			},
 		},
-		Stream: false,
+		Stream:    false,
+		MaxTokens: 1536,
 	}
 
 	if isDirectMut {

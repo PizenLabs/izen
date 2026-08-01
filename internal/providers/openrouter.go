@@ -384,11 +384,30 @@ func (r *OpenRouterStreamResult) Usage() (input, output int) {
 	return 0, 0
 }
 
+// FinishReason returns the terminal finish_reason observed on the stream
+// ("stop", "length", "tool_calls", ...). It reports "" when the stream ended
+// before any finish_reason chunk was seen. Consumers use it to distinguish a
+// natural completion ("stop") from a response truncated by the completion
+// ceiling ("length").
+func (r *OpenRouterStreamResult) FinishReason() string {
+	if r.sr != nil {
+		return r.sr.finishReason
+	}
+	return ""
+}
+
 type openrouterSSEReader struct {
 	body       io.ReadCloser
 	reader     *bufio.Reader
 	closed     bool
 	finalUsage *openrouterUsage
+
+	// finishReason records the terminal finish_reason chunk observed on the
+	// stream ("stop", "length", "tool_calls", ...). It is surfaced to callers
+	// via OpenRouterStreamResult.FinishReason() so consumers can detect
+	// responses truncated by the completion ceiling (finish_reason: "length")
+	// instead of assuming the response ended naturally.
+	finishReason string
 
 	// pending holds bytes produced by a parsed SSE event that did not fit
 	// into the caller's buffer on a previous Read() call. Read() must never
@@ -510,6 +529,7 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 		}
 
 		if chunk.Choices[0].FinishReason != "" {
+			s.finishReason = chunk.Choices[0].FinishReason
 			continue
 		}
 	}

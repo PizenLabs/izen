@@ -220,11 +220,21 @@ func (r *GroqStreamResult) Usage() (input, output int) {
 	return 0, 0
 }
 
+// FinishReason reports the terminal finish_reason observed on the stream
+// ("stop", "length", "tool_calls", ...), or "" if none was seen.
+func (r *GroqStreamResult) FinishReason() string {
+	if r.sr != nil {
+		return r.sr.finishReason
+	}
+	return ""
+}
+
 type groqSSEReader struct {
 	body             io.ReadCloser
 	reader           *bufio.Reader
 	closed           bool
 	finalUsage       *groqUsage
+	finishReason     string
 	reasoningHandler func(string) error
 }
 
@@ -293,6 +303,7 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 		}
 
 		if chunk.Choices[0].FinishReason != "" {
+			s.finishReason = chunk.Choices[0].FinishReason
 			continue
 		}
 	}

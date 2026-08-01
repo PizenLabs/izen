@@ -87,6 +87,10 @@ type streamDoneMsg struct {
 	content     string
 	tokenInput  int
 	tokenOutput int
+	// truncated is true when the provider signalled finish_reason == "length":
+	// the response hit the API completion ceiling and was cut off mid-generation
+	// rather than finishing naturally ("stop").
+	truncated bool
 }
 
 type traceUpdateMsg struct {

@@ -64,6 +64,9 @@ type geminiResponse struct {
 
 type geminiCandidate struct {
 	Content geminiContent `json:"content"`
+	// FinishReason is the terminal generation finish reason ("STOP",
+	// "MAX_TOKENS", "SAFETY", ...) reported on the final candidate chunk.
+	FinishReason string `json:"finishReason"`
 }
 
 type geminiContent struct {
@@ -249,11 +252,28 @@ func (r *GeminiStreamResult) Usage() (input, output int) {
 	return 0, 0
 }
 
+// FinishReason reports the terminal finish reason observed on the stream.
+// The Gemini finishReason "MAX_TOKENS" (completion ceiling hit) is normalized
+// to "length" so consumers can uniformly detect truncation; otherwise the raw
+// finishReason ("STOP", "SAFETY", ...) is returned.
+func (r *GeminiStreamResult) FinishReason() string {
+	if r.sr != nil {
+		switch r.sr.finishReason {
+		case "MAX_TOKENS":
+			return "length"
+		default:
+			return r.sr.finishReason
+		}
+	}
+	return ""
+}
+
 type geminiSSEReader struct {
 	body             io.ReadCloser
 	reader           *bufio.Reader
 	closed           bool
 	finalUsage       *geminiUsageMetadata
+	finishReason     string
 	reasoningHandler func(string) error
 }
 
@@ -293,6 +313,9 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 		}
 
 		if len(event.Candidates) > 0 {
+			if event.Candidates[0].FinishReason != "" {
+				s.finishReason = event.Candidates[0].FinishReason
+			}
 			for _, part := range event.Candidates[0].Content.Parts {
 				// Thought parts carry reasoning content and must be routed
 				// to the reasoning handler — they must never appear in the

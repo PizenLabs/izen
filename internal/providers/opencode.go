@@ -306,11 +306,21 @@ func (r *OpenCodeStreamResult) Usage() (input, output int) {
 	return 0, 0
 }
 
+// FinishReason reports the terminal finish_reason observed on the stream
+// ("stop", "length", "tool_calls", ...), or "" if none was seen.
+func (r *OpenCodeStreamResult) FinishReason() string {
+	if r.sr != nil {
+		return r.sr.finishReason
+	}
+	return ""
+}
+
 type opencodeSSEReader struct {
 	body             io.ReadCloser
 	reader           *bufio.Reader
 	closed           bool
 	finalUsage       *opencodeUsage
+	finishReason     string
 	reasoningHandler func(string) error
 
 	// pending holds bytes produced by a parsed SSE event that did not fit
@@ -418,6 +428,7 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 		}
 
 		if chunk.Choices[0].FinishReason != "" {
+			s.finishReason = chunk.Choices[0].FinishReason
 			continue
 		}
 	}

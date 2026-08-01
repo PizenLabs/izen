@@ -160,8 +160,8 @@ func TestSqueeze_SimpleMutation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Squeeze(SimpleMutation) unexpected error: %v", err)
 	}
-	if req.MaxTokens != 150 {
-		t.Errorf("MaxTokens = %d, want 150", req.MaxTokens)
+	if req.MaxTokens != 2048 {
+		t.Errorf("MaxTokens = %d, want 2048", req.MaxTokens)
 	}
 	if req.Temperature != 0.0 {
 		t.Errorf("Temperature = %f, want 0.0", req.Temperature)

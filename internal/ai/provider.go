@@ -47,6 +47,14 @@ type Provider interface {
 	ExecuteStream(ctx context.Context, req Request) (io.ReadCloser, error)
 }
 
+// FinishReasonProvider is implemented by stream results that can report the
+// provider's terminal finish_reason (e.g. "stop", "length", "tool_calls").
+// Consumers use it to detect responses truncated by the API's completion
+// ceiling (finish_reason == "length") rather than finished naturally ("stop").
+type FinishReasonProvider interface {
+	FinishReason() string
+}
+
 type ProviderConfig struct {
 	APIKey  string
 	Model   string

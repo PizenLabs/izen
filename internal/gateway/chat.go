@@ -107,8 +107,11 @@ func CasualChatSystemPrompt() string {
 	return "You are IZEN, a fast CLI coding companion created for terminal power-users. Always identify as IZEN if asked about your name, role, or identity. Respond concisely in 1-2 short sentences."
 }
 
-// CasualChatMaxTokens returns the ultra-low max_tokens budget for
-// casual chat responses.
+// CasualChatMaxTokens returns the max_tokens budget for casual chat
+// responses. It is a healthy default (2048) so casual replies can form
+// complete sentences instead of being cut off mid-generation by a tiny
+// completion ceiling (which surfaced on the OpenRouter dashboard as
+// finish_reason: "length" at ~78 tokens).
 func CasualChatMaxTokens() int {
-	return 80
+	return 2048
 }

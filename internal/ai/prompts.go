@@ -2,7 +2,7 @@ package ai
 
 // SimpleMutationPrompt returns a minimal system prompt that enforces
 // SEARCH/REPLACE-only output with zero conversational filler. Designed
-// for SIMPLE_MUTATION tier requests where max_tokens ≤ 150.
+// for SIMPLE_MUTATION tier requests.
 func SimpleMutationPrompt() string {
 	return `STRICT RULE: Output ONLY a valid SEARCH/REPLACE block for the change.
 NO conversational filler. NO markdown prose outside code blocks. NO full file rewrites.

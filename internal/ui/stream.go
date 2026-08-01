@@ -258,6 +258,15 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			tokOut = len(full) / 4
 		}
 
+		// TRUNCATION DETECTION: when the provider reports finish_reason ==
+		// "length", the response was cut off by the API completion ceiling, not
+		// finished naturally. Flag it so the streamDoneMsg handler can surface a
+		// visible notice instead of silently presenting an incomplete answer.
+		truncated := false
+		if frp, ok := rawStream.(ai.FinishReasonProvider); ok && frp.FinishReason() == "length" {
+			truncated = true
+		}
+
 		if ingestErr != nil {
 			streamCh <- streamErrMsg{err: ingestErr, content: full}
 			return
@@ -266,6 +275,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			content:     full,
 			tokenInput:  tokIn,
 			tokenOutput: tokOut,
+			truncated:   truncated,
 		}
 	}()
 

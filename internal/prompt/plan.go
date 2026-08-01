@@ -241,7 +241,7 @@ func GroundedConstraint(archetype string, allowedFiles []string) string {
 // BuildPlanJSONPrompt builds the strict JSON prompt consumed by the TUI parser.
 // Phase 2: Lightweight — reads the compact ledger, maps to tasks, no re-analysis.
 // When isDirectMutation is true, omits EnvironmentContext and constrains output
-// to max_tokens: 150.
+// to a compact single-file patch.
 // groundedPayload is an optional ALLOWED_FILE_TREE constraint block (empty string
 // skips injection).
 func BuildPlanJSONPrompt(problem, ledgerContent, conclusion string, isDirectMutation bool, groundedPayload string) string {

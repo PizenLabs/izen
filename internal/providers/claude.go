@@ -78,6 +78,9 @@ type claudeDelta struct {
 	// Thinking carries the reasoning process text for thinking_delta events
 	// (the Anthropic native equivalent of reasoning_content).
 	Thinking string `json:"thinking"`
+	// StopReason carries the terminal stop reason for message_delta events
+	// ("end_turn", "max_tokens", "tool_use", ...).
+	StopReason string `json:"stop_reason"`
 }
 
 func (p *ClaudeProvider) buildMessages(req ai.Request) []claudeMessage {
@@ -224,11 +227,28 @@ func (r *ClaudeStreamResult) Usage() (input, output int) {
 	return 0, 0
 }
 
+// FinishReason reports the terminal stop reason observed on the stream. The
+// Anthropic stop_reason "max_tokens" (completion ceiling hit) is normalized to
+// "length" so consumers can uniformly detect truncation; otherwise the raw
+// stop_reason ("end_turn", "tool_use", ...) is returned.
+func (r *ClaudeStreamResult) FinishReason() string {
+	if r.sr != nil {
+		switch r.sr.finishReason {
+		case "max_tokens":
+			return "length"
+		default:
+			return r.sr.finishReason
+		}
+	}
+	return ""
+}
+
 type claudeSSEReader struct {
 	body             io.ReadCloser
 	reader           *bufio.Reader
 	closed           bool
 	finalUsage       *claudeUsage
+	finishReason     string
 	reasoningHandler func(string) error
 }
 
@@ -295,6 +315,9 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 					s.finalUsage = &claudeUsage{}
 				}
 				s.finalUsage.OutputTokens = event.Usage.OutputTokens
+			}
+			if event.Delta != nil && event.Delta.StopReason != "" {
+				s.finishReason = event.Delta.StopReason
 			}
 		case "message_stop":
 			s.closed = true

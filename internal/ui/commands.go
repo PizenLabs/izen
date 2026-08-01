@@ -679,7 +679,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			// unresponsive.
 			if len(m.handoffCtx.PendingTodos) == 0 {
 				m.push(roleSystem, mutedStyle.Render(
-					"0 pending TODOs — synthesizing from forensic ledger. If your local model is stuck, this aborts within ~8s instead of hanging."))
+					"0 pending TODOs — synthesizing from forensic ledger. If your local model is stuck, this aborts within ~45s instead of hanging."))
 			}
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
@@ -822,10 +822,12 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 }
 
 // planFirstTokenTimeout bounds how long the LLM provider may take to return its
-// FIRST chunk of plan synthesis. A local model that is OOM/stalling will hang
-// the connection indefinitely; this guard aborts fast so the UI never freezes
-// for the full 120s hard budget waiting on a dead provider socket.
-const planFirstTokenTimeout = 8 * time.Second
+// FIRST chunk of plan synthesis. Cloud/remote models (OpenRouter, etc.) are
+// subject to queuing and cold starts, so a generous guard prevents spurious
+// timeouts. Local models that are OOM/stalling will hang indefinitely; this
+// guard aborts fast so the UI never freezes for the full 120s hard budget
+// waiting on a dead provider socket.
+const planFirstTokenTimeout = 45 * time.Second
 
 // planLocalMaxLatency bounds how long a LOCAL (non-streaming) model may take to
 // return a full completion. Unlike cloud providers, Ollama's /chat/completions
@@ -840,7 +842,7 @@ const planLocalMaxLatency = 90 * time.Second
 // which the Update() loop handles to stage tasks and clear streaming state.
 //
 // HARDENING: two layered deadlines protect the live terminal.
-//  1. firstTokenCtx (8s) — the provider MUST return its first response byte
+//  1. firstTokenCtx (45s) — the provider MUST return its first response byte
 //     within this window. If the local model is stuck/OOM or the socket stalls,
 //     we abort immediately instead of freezing the prompt for the full budget.
 //  2. ctx (120s) — overall synthesis budget for a slow-but-alive model.
@@ -867,6 +869,59 @@ func debugLogPlan(line string) {
 	_, _ = f.WriteString(entry)
 }
 
+// compressHandoffSource aggressively prunes and compresses the handoff
+// payload before it reaches the LLM. It strips verbose stack-trace
+// lines, removes duplicate content, and caps the total size so the
+// prompt stays within a tight token budget. This prevents the 2.5k+
+// token handoff bloat that causes OpenRouter cold-start queuing and
+// completion timeouts.
+func compressHandoffSource(source string, maxBytes int) string {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return ""
+	}
+	lines := strings.Split(source, "\n")
+	kept := make([]string, 0, len(lines))
+	seen := make(map[string]struct{}, len(lines))
+	total := 0
+
+	for _, raw := range lines {
+		// Skip verbose stack-trace frames (raw lines starting with tabs)
+		if strings.HasPrefix(raw, "\t") {
+			continue
+		}
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			// Keep at most one blank line between sections
+			if len(kept) > 0 && kept[len(kept)-1] != "" {
+				kept = append(kept, "")
+			}
+			continue
+		}
+		// Skip verbose stack-trace frames (Go "at " stack marker)
+		if strings.Contains(trimmed, "at ") {
+			continue
+		}
+		// Skip extremely long lines (>400 chars = likely verbose trace/context block)
+		if len(trimmed) > 400 {
+			continue
+		}
+		// Deduplicate
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+
+		if total+len(trimmed)+1 > maxBytes {
+			break
+		}
+		kept = append(kept, trimmed)
+		total += len(trimmed) + 1
+	}
+
+	return strings.TrimSpace(strings.Join(kept, "\n"))
+}
+
 func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, handoff HandoffContext) tea.Cmd {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	// Register cancel so it can be invoked on mode transition/Ctrl+C
@@ -874,6 +929,14 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 
 	return func() tea.Msg {
 		debugLogPlan("runPlanEngineCmd entered; model=" + modelName)
+
+		// ── COMPRESS HANDOFF PAYLOAD ──────────────────────────────
+		// Strip verbose stack-trace lines, deduplicate, and cap the
+		// raw payload before truncation. This prevents the 2.5k+ token
+		// handoff bloat that causes OpenRouter cold-start queuing and
+		// completion timeouts. Cloud models get a 2× ceiling instead
+		// of 4× to keep the prompt lean.
+		handoffSource = compressHandoffSource(handoffSource, plan.MaxLedgerChars)
 
 		// ── STRICT LEDGER TRUNCATION (every /investigate → /plan handoff) ──
 		// The handoff ledger carries sanitized trace blocks only — verbose
@@ -889,7 +952,7 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		truncateCeiling := plan.MaxLedgerChars
 		if !localModel {
 			// Cloud models can absorb more, but we still cap the handoff hard.
-			truncateCeiling = plan.MaxLedgerChars * 4
+			truncateCeiling = plan.MaxLedgerChars * 2
 		}
 		if len(handoffSource) > truncateCeiling {
 			truncated := plan.TruncateLedger(handoffSource, truncateCeiling)
@@ -1016,7 +1079,7 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		// ── FIRST-TOKEN / COMPLETION GUARD ───────────────────────────────
 		// The provider call (a single NON-STREAMING HTTP round-trip inside
 		// ProcessFromLedger) inherits this deadline. For cloud providers the
-		// round-trip returns the first token quickly, so the tight 8s guard is
+		// round-trip returns the first token quickly, so the 45s guard is
 		// appropriate. Local Ollama calls are non-streaming: "first token" == the
 		// entire prefill+generation latency, which a 7B model easily exceeds. For
 		// local models we therefore use a realistic budget (the 120s hard cap
@@ -1121,8 +1184,22 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 					Handoff: handoff,
 				}
 			}
+			// Determine the active provider for a provider-aware error message.
+			activeProvider := m.cfg.ActiveProviderName()
+			if activeProvider == "" {
+				activeProvider = "unknown"
+			}
+			var providerErrMsg string
+			switch activeProvider {
+			case "openrouter":
+				providerErrMsg = fmt.Sprintf("[error] OpenRouter request timed out (> %s). Free-tier models may be queued or rate-limited.", planFirstTokenTimeout)
+			case "ollama":
+				providerErrMsg = fmt.Sprintf("[error] LLM Provider timeout: no response within %s. Check if your local model is stuck/OOM, or that Ollama is running and the model (%s) is loaded", planFirstTokenTimeout, modelName)
+			default:
+				providerErrMsg = fmt.Sprintf("[error] LLM Provider timeout: no response within %s. The provider (%s) may be slow, overloaded, or unreachable.", planFirstTokenTimeout, activeProvider)
+			}
 			return planResultMsg{
-				Err:     fmt.Errorf("[error] LLM Provider timeout: no response within %s. Check if your local model is stuck/OOM, or that Ollama is running and the model (%s) is loaded", planFirstTokenTimeout, modelName),
+				Err:     fmt.Errorf("%s", providerErrMsg),
 				Handoff: handoff,
 			}
 		case <-ctx.Done():

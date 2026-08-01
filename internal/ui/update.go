@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -1846,6 +1847,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		// Append the completed turn to PreRenderedHistory and freeze state.
 		m.push(roleAI, final)
+
+		// TRUNCATION NOTICE: finish_reason == "length" means the response was
+		// cut off by the API completion ceiling, not finished naturally. Signal
+		// it so the user knows the answer is incomplete rather than assuming a
+		// full response (the ~78-token OpenRouter truncation wall).
+		if msg.truncated {
+			log.Printf("[TRUNCATION] response hit max_tokens ceiling (finish_reason: length) — %d output tokens", msg.tokenOutput)
+			m.push(roleSystem, warningStyle.Render(
+				"[TRUNCATED] The response hit the provider's max_tokens limit and was cut off mid-generation (finish_reason: \"length\"). Increase max_tokens in the provider config to allow longer responses."))
+		}
 
 		// ── IMPLICIT PIPELINE INTERCEPT: pipe stream output to next step ──
 		if m.pipelineRunning {
