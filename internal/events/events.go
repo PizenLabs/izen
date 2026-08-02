@@ -45,6 +45,26 @@ const (
 	// resolve, mutate metrics) wrapped for bus transport. The UI projects it
 	// into its structured activity tree.
 	EventEngineTelemetry = "engine.telemetry"
+	// EventIntentClassified is emitted when the Hybrid Intent Gateway completes
+	// a classification (either via the deterministic fast path or the semantic
+	// classifier) and maps a raw prompt to a canonical execution phase.
+	EventIntentClassified = "intent.classified"
+	// EventPhaseChanged is emitted when the Workflow State Machine transitions
+	// between execution phases (Ask/Investigate/Plan/Build/Review).
+	EventPhaseChanged = "phase.changed"
+	// EventPatchParsed is emitted when raw LLM output is successfully parsed
+	// into structured patch representations by the patch pipeline.
+	EventPatchParsed = "patch.parsed"
+	// EventPatchValidated is emitted when a patch passes structural and safety
+	// checks in the patch pipeline.
+	EventPatchValidated = "patch.validated"
+	// EventPatchRejected is emitted when safety validation fails or a patch
+	// cannot be applied in the patch pipeline.
+	EventPatchRejected = "patch.rejected"
+	// EventApprovalRequested is emitted when the patch pipeline enters the
+	// Tier 4 Human-in-the-Loop fallback or when intent disambiguation is
+	// required at the gateway.
+	EventApprovalRequested = "approval.requested"
 )
 
 // FailureClassification is the taxonomy used by EventExecutionFailed. It is
@@ -142,6 +162,61 @@ type ActivityPayload struct {
 // packages; the UI type-asserts them at projection time.
 type EngineTelemetryPayload struct {
 	Event interface{}
+}
+
+// IntentClassifiedPayload carries the outcome of the Hybrid Intent Gateway
+// classification: the canonical execution phase, the normalized confidence,
+// the detected locale, the justification, and whether UI disambiguation is
+// required (confirmation_requirement).
+type IntentClassifiedPayload struct {
+	Intent               string
+	Raw                  string
+	Confidence           float64
+	Language             string
+	Explanation          string
+	ConfirmationRequired bool
+}
+
+// PhaseChangedPayload carries a workflow state machine transition between
+// execution phases. From/To use the canonical phase names (ask, investigate,
+// plan, build, review).
+type PhaseChangedPayload struct {
+	From string
+	To   string
+}
+
+// PatchParsedPayload carries a successfully parsed structured patch.
+type PatchParsedPayload struct {
+	File     string
+	Strategy string
+	Tier     int
+}
+
+// PatchValidatedPayload carries a patch that passed structural and safety
+// checks. Tiers: 1=Structured Diff, 2=Search/Replace, 3=Whole File Rewrite,
+// 4=Human-in-the-Loop Approval.
+type PatchValidatedPayload struct {
+	File     string
+	Strategy string
+	Tier     int
+}
+
+// PatchRejectedPayload carries a patch that failed safety validation or could
+// not be applied. Tier is the tier that rejected it.
+type PatchRejectedPayload struct {
+	File   string
+	Reason string
+	Tier   int
+}
+
+// ApprovalRequestedPayload carries a Tier 4 Human-in-the-Loop approval request
+// or a gateway-level disambiguation request. Reason carries the justification;
+// Target is the file under review (empty for intent disambiguation); Preview is
+// a rendered preview diff when available.
+type ApprovalRequestedPayload struct {
+	Target  string
+	Reason  string
+	Preview string
 }
 
 // ReasoningPayload carries one chunk of an LLM reasoning/thinking stream.
@@ -284,5 +359,67 @@ func NewReasoningStream(chunk string, isComplete bool) DomainEvent {
 	return newEvent(EventReasoningStream, ReasoningPayload{
 		Chunk:      chunk,
 		IsComplete: isComplete,
+	})
+}
+
+// NewIntentClassified publishes that the Hybrid Intent Gateway completed a
+// classification and mapped the raw prompt to a canonical execution phase.
+func NewIntentClassified(intent, raw string, confidence float64, language, explanation string, confirmRequired bool) DomainEvent {
+	return newEvent(EventIntentClassified, IntentClassifiedPayload{
+		Intent:               intent,
+		Raw:                  raw,
+		Confidence:           confidence,
+		Language:             language,
+		Explanation:          explanation,
+		ConfirmationRequired: confirmRequired,
+	})
+}
+
+// NewPhaseChanged publishes that the Workflow State Machine transitioned
+// between execution phases.
+func NewPhaseChanged(from, to string) DomainEvent {
+	return newEvent(EventPhaseChanged, PhaseChangedPayload{
+		From: from,
+		To:   to,
+	})
+}
+
+// NewPatchParsed publishes that raw LLM output was parsed into a structured
+// patch representation. Strategy is the tier strategy label (DIFF_PATCH,
+// SEARCH_REPLACE, WHOLE_FILE); Tier is the 1-4 tier index.
+func NewPatchParsed(file, strategy string, tier int) DomainEvent {
+	return newEvent(EventPatchParsed, PatchParsedPayload{
+		File:     file,
+		Strategy: strategy,
+		Tier:     tier,
+	})
+}
+
+// NewPatchValidated publishes that a patch passed structural and safety checks.
+func NewPatchValidated(file, strategy string, tier int) DomainEvent {
+	return newEvent(EventPatchValidated, PatchValidatedPayload{
+		File:     file,
+		Strategy: strategy,
+		Tier:     tier,
+	})
+}
+
+// NewPatchRejected publishes that a patch failed safety validation or could
+// not be applied.
+func NewPatchRejected(file, reason string, tier int) DomainEvent {
+	return newEvent(EventPatchRejected, PatchRejectedPayload{
+		File:   file,
+		Reason: reason,
+		Tier:   tier,
+	})
+}
+
+// NewApprovalRequested publishes a Tier 4 Human-in-the-Loop approval request
+// or a gateway-level disambiguation request.
+func NewApprovalRequested(target, reason, preview string) DomainEvent {
+	return newEvent(EventApprovalRequested, ApprovalRequestedPayload{
+		Target:  target,
+		Reason:  reason,
+		Preview: preview,
 	})
 }

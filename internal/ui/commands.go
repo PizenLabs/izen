@@ -34,6 +34,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
@@ -408,7 +409,34 @@ func (m *model) handleInput(line string) tea.Cmd {
 	m.sess.AddMessage("user", line, 5)
 	_ = m.sess.Save()
 
+	// ── HYBRID INTENT GATEWAY ────────────────────────────────────────
+	// Free-form input (no explicit mode shorthand, no command, no shell) goes
+	// through the Hybrid Intent Gateway: the deterministic fast path first, then
+	// the semantic IntentClassifier when no deterministic signal matches. The
+	// classified intent is projected onto the current phase (auto mode switch),
+	// or — at low confidence (ConfirmationRequirement) — surfaced as an
+	// interactive mode-selection prompt instead of acting on a blind guess.
+	// The route runs async because the semantic fallback may invoke the LLM.
+	if m.intentRouter != nil {
+		return m.routeFreeInput(line)
+	}
+
 	return m.handleMessageContent(line)
+}
+
+// routeFreeInput dispatches a free-form prompt through the Hybrid Intent
+// Gateway off the Bubble Tea event loop. The router runs the deterministic
+// fast path first and only falls back to the semantic classifier; both are
+// cheap enough to run inside the returned command's goroutine. The result is
+// delivered back as a routerResultMsg for the Update loop to project.
+func (m *model) routeFreeInput(line string) tea.Cmd {
+	r := m.intentRouter
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := r.Route(ctx, line)
+		return routerResultMsg{line: line, result: res, err: err}
+	}
 }
 
 func (m *model) handleMessageContent(line string) tea.Cmd {
@@ -546,7 +574,6 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 	currentMode := m.resolver.Current()
 	if currentMode == modes.ModeInvestigate && len(refFiles) > 0 {
 		if hasMutationIntent(content) {
-			m.push(roleStatus, "Code mutation intent detected — routing directly to /build, bypassing /investigate")
 			return m.runBuildCmd(content)
 		}
 	}
@@ -577,6 +604,28 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return nil
+		}
+
+		// ── INTENT-BASED /investigate BYPASS ──────────────────────────────
+		// FRONTEND_UI and code-generation/rewrite prompts add ZERO diagnostic
+		// value to /investigate: the engine short-circuits them in 0s with an
+		// "Inconclusive" result while injecting forensic overhead into the TUI
+		// and context ledger. Bypass the engine entirely and transition
+		// directly to /plan (UI/layout tasks) or /build (code mutation),
+		// mirroring the routing the engine would have performed.
+		intent := investigate.ClassifyIntent(content)
+		switch {
+		case intent.IsFrontendUI():
+			m.handoffLedgerContent = "frontend ui intent detected — hand off to plan"
+			m.handoffCtx.ProposedFix = m.handoffLedgerContent
+			m.modeChangeAuthorized = true
+			m.investigateInvocationCount++
+			return m.setMode(modes.ModePlan)
+		case hasMutationIntent(content) && hasExecutableBuildTarget(content, m):
+			m.handoffCtx.PendingTodos = synthesizeBuildTodosFromMutation(content)
+			m.modeChangeAuthorized = true
+			m.investigateInvocationCount++
+			return m.setMode(modes.ModeBuild)
 		}
 		m.investigateInvocationCount++
 		return m.runInvestigateCmd(content)
@@ -1085,13 +1134,15 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		}
 
 		type outcome struct {
-			tasks []plan.Task
-			err   error
+			tasks  []plan.Task
+			err    error
+			tokIn  int
+			tokOut int
 		}
 		outCh := make(chan outcome, 1)
 
 		// ── FIRST-TOKEN / COMPLETION GUARD ───────────────────────────────
-		// The provider call (a single NON-STREAMING HTTP round-trip inside
+		// The provider call (a single streaming round-trip inside
 		// ProcessFromLedger) inherits this deadline. OpenRouter free-tier
 		// models are frequently queued/cold-started well past 45s, so the
 		// cloud guard is set to 120s to prevent spurious context deadline
@@ -1128,10 +1179,17 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 				"; fastTrack=" + fmt.Sprint(useFastTrack) + ")")
 			var tasks []plan.Task
 			var err error
+			tokIn, tokOut := 0, 0
 			if useFastTrack {
 				tasks, err = m.planEngine.ProcessFromLedgerFastTrack(ftCtx, ledgerToSend, modelName)
 			} else {
 				tasks, err = m.planEngine.ProcessFromLedger(ftCtx, ledgerToSend, problem, modelName)
+			}
+			// Capture the provider-reported usage (committed by the plan engine
+			// even when the response was truncated at finish_reason: "length")
+			// so the token counters survive truncation.
+			if m.planEngine != nil {
+				tokIn, tokOut = m.planEngine.LastUsage()
 			}
 			debugLogPlan("Provider returned; err=" + fmt.Sprint(err))
 
@@ -1176,17 +1234,22 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 								err = fmt.Errorf("scope guard: %w (retry produced no tasks)", scopeErr)
 							}
 						}
+						// Refresh usage after the scope-guard retry (the retry
+						// consumed another provider round-trip).
+						if m.planEngine != nil {
+							tokIn, tokOut = m.planEngine.LastUsage()
+						}
 					}
 				}
 			}
 
-			outCh <- outcome{tasks: tasks, err: err}
+			outCh <- outcome{tasks: tasks, err: err, tokIn: tokIn, tokOut: tokOut}
 		}()
 
 		select {
 		case o := <-outCh:
 			cancel()
-			return planResultMsg{Tasks: o.tasks, Err: o.err, Handoff: handoff}
+			return planResultMsg{Tasks: o.tasks, Err: o.err, Handoff: handoff, TokenInput: o.tokIn, TokenOutput: o.tokOut}
 		case <-ftCtx.Done():
 			// First-token deadline missed: the provider is unresponsive.
 			cancel()
@@ -1273,7 +1336,39 @@ func parseModeShorthand(line string) (modes.Mode, string, bool) {
 	return modes.ModeAsk, "", false
 }
 
+// phaseForMode maps a UI mode onto its canonical orchestrator phase. The
+// orchestrator uses these to drive the shared WorkflowStateMachine.
+func phaseForMode(mode modes.Mode) orchestrator.Phase {
+	switch mode {
+	case modes.ModeAsk:
+		return orchestrator.PhaseAsk
+	case modes.ModeInvestigate:
+		return orchestrator.PhaseInvestigate
+	case modes.ModePlan:
+		return orchestrator.PhasePlan
+	case modes.ModeBuild:
+		return orchestrator.PhaseBuild
+	case modes.ModeReview:
+		return orchestrator.PhaseReview
+	default:
+		return orchestrator.PhaseIdle
+	}
+}
+
 func (m *model) setMode(mode modes.Mode) tea.Cmd {
+	// ── ORCHESTRATOR PHASE SYNC ─────────────────────────────────────
+	// The orchestrator maps the logical mode onto the shared WorkflowStateMachine
+	// while preserving the persistent RuntimeContext (conversation history and
+	// workspace artifacts are never reset). Force is used because an explicit
+	// user mode switch always wins over the logical phase graph (e.g. switching
+	// directly from /review to /plan is not a valid edge).
+	if m.orch != nil {
+		_ = m.orch.Force(phaseForMode(mode), workflow.TransitionContext{
+			HasPlan:         m.sess != nil && len(m.sess.CurrentTasks) > 0,
+			HasCapabilities: m.caps != nil,
+		})
+	}
+
 	// ── RULE A: STRICT MODE TRANSITION GATEKEEPER ──────────────────────
 	// Auto-transitions to /build from non-build modes are blocked unless
 	// the user explicitly authorized the switch by typing a mode command
@@ -1334,6 +1429,20 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 		m.logStore.Clear()
 	}
 
+	// ── CLEAR STALE UI WIDGETS ON MODE TRANSITION ─────────────────────
+	// Overlay/proposal widgets are scoped to the mode that created them:
+	// the Effort selector, mutation approval dock, and pending proposal
+	// cards (e.g. a stale "Edit: [Resolve]" frame) belong to the build
+	// workflow and MUST NOT bleed into /plan or /investigate views. Reset
+	// the interaction state and drop pending proposals so the incoming
+	// mode renders its own clean dock.
+	m.state = StateChat
+	m.pendingProposals = nil
+	m.proposalDiffOffset = 0
+	m.currentEffort = EffortAuto
+	m.pendingBuildApproval = false
+	m.pendingBuildTask = nil
+
 	if mode == m.resolver.Current() {
 		return nil
 	}
@@ -1357,11 +1466,11 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 		m.execEng.BeginTransaction()
 	}
 
-	modeColor := modeAccentColor(mode)
-	modeLabel := lipgloss.NewStyle().Foreground(modeColor).Render(
-		fmt.Sprintf("→ /%s — %s", mode, mode.Description()))
-	m.push(roleSystem, modeLabel)
-	m.push(roleSystem, fmt.Sprintf("Switched to /%s", mode))
+	// ── SILENT MODE TRANSITION ────────────────────────────────────────
+	// Mode switches must not spam the conversation viewport. The active
+	// prompt indicator ("plan )" / "build )") is updated by startModeTransition
+	// above; only a transient footer notice confirms the switch.
+	m.uiNotice = fmt.Sprintf("Switched to /%s", mode)
 
 	// ── SYNCHRONOUS LEDGER RELOAD (1-TURN LATENCY FIX) ────────────────
 	// CleanContextTransitions above purged transient in-memory handoff buffers
@@ -2108,6 +2217,18 @@ func (m *model) transitionToBuilding() error {
 	if state == workflow.StateBuilding || state == workflow.StateRepairing {
 		return nil
 	}
+	// ── ORCHESTRATOR-DRIVEN TRANSITION ──────────────────────────────
+	// The orchestrator owns the workflow SM. It drives the canonical
+	// Idle -> Plan -> Build path (and any required reset fallback) while
+	// sharing the persistent RuntimeContext, so conversation history and
+	// workspace artifacts survive the transition.
+	if m.orch != nil {
+		return m.orch.Transition(orchestrator.PhaseBuild, workflow.TransitionContext{
+			HasPlan:         len(m.sess.CurrentTasks) > 0,
+			HasCapabilities: m.caps != nil,
+		})
+	}
+	// Legacy raw-SM fallback (headless/test harnesses without an orchestrator).
 	if state == workflow.StateIdle {
 		if err := m.workflowSM.SendEvent(workflow.EventPlan, workflow.TransitionContext{}); err != nil {
 			return err
@@ -5960,7 +6081,6 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 		if m.handoffCtx.LastFailurePayload != "" {
 			sanitized := config.SanitizeForSession(m.handoffCtx.LastFailurePayload)
 			m.handoffCtx.LastFailurePayload = sanitized
-			m.push(roleSystem, "Handoff context injected.")
 		}
 
 	case modes.ModePlan:
@@ -5971,9 +6091,6 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 			if len(m.handoffCtx.PendingTodos) == 0 {
 				m.handoffCtx.PendingTodos = parseProposedFixIntoTodos(m.handoffCtx.ProposedFix)
 			}
-			m.push(roleSystem, fmt.Sprintf(
-				"Handoff context injected: %d pending TODO(s).",
-				len(m.handoffCtx.PendingTodos)))
 		}
 
 	case modes.ModeBuild:
@@ -5983,9 +6100,6 @@ func (m *model) injectHandoffContext(mode modes.Mode) {
 		// The raw ProposedFix chat blob / AssistantDiscussionNotes are STRICTLY
 		// PURGED here to prevent hallucinated procedural steps from contaminating
 		// the build execution engine.
-		if len(m.handoffCtx.PendingTodos) > 0 || len(m.sess.CurrentTasks) > 0 {
-			m.push(roleSystem, "Handoff context injected.")
-		}
 		// Purge stale pre-baked steps — build must not inherit them.
 		m.handoffCtx.ProposedFix = ""
 
@@ -6208,6 +6322,16 @@ var compilerCoordRe = regexp.MustCompile(`^[^\s:]+\.\w+:\d+:\d+`)
 // Used to override /investigate mode routing and prevent the deadlock loop.
 func hasMutationIntent(content string) bool {
 	lower := strings.ToLower(content)
+
+	// FRONTEND_UI / layout / rewrite intents are NEVER mutations: a request like
+	// "rewrite my personal profile website" must route to /plan (UI creation),
+	// never to /build. This guard runs BEFORE the substring checks below because
+	// naive signals such as "write" match inside "rewrite" and would otherwise
+	// misroute a UI task into the build engine.
+	if investigate.ClassifyIntent(content).IsFrontendUI() {
+		return false
+	}
+
 	mutationSignals := []string{
 		"write", "create", "generate", "implement",
 		"add ", "make ", "build ", "develop",
@@ -6234,6 +6358,39 @@ func hasMutationIntent(content string) bool {
 		}
 	}
 	return false
+}
+
+// explicitFilePathPattern matches path-like tokens or bare filenames carrying a
+// source-code extension — e.g. "internal/math/fib.go", "handler.ts", "styles.css".
+// Used to confirm a mutation bypass has a concrete target file to edit. Note:
+// gateway.ExtractDirectMutationTargets covers @refs and doc/config assets but
+// deliberately excludes code extensions (.go/.py/...) that need compilation, so
+// this backstops those cases.
+var explicitFilePathPattern = regexp.MustCompile(`(?i)(?:^|[\s,:])[a-zA-Z0-9_./\\-]+\.(?:go|py|rs|java|js|jsx|ts|tsx|html|css|scss|less|md|json|yaml|yml|toml|c|cc|cpp|h|hpp|rb|php|sh|sql|proto|graphql|xml)`)
+
+// hasExplicitFilePath reports whether content carries an explicit, targetable
+// file reference: a token that looks like a path or bare filename with a
+// source-code/document extension. This backstops gateway.ExtractDirectMutationTargets,
+// which intentionally excludes code extensions (.go/.py/...) because those
+// require compile verification and are not "direct" mutation targets.
+func hasExplicitFilePath(content string) bool {
+	return explicitFilePathPattern.MatchString(content)
+}
+
+// hasExecutableBuildTarget reports whether a mutation bypass has a concrete
+// execution target ready for the build engine: explicit file path references
+// in the content (either @refs or path/extension tokens) OR actionable pending
+// TODOs already staged (e.g. from a /plan approval). A bare mutation intent
+// with neither is NOT ready for /build — it must route through /plan for target
+// resolution first.
+func hasExecutableBuildTarget(content string, m *model) bool {
+	if len(m.handoffCtx.PendingTodos) > 0 {
+		return true
+	}
+	if len(gateway.ExtractDirectMutationTargets(content)) > 0 {
+		return true
+	}
+	return hasExplicitFilePath(content)
 }
 
 // extractTodosFromPlan extracts TODO items from a plan-mode LLM response.

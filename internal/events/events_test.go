@@ -92,6 +92,102 @@ func TestSelfHealingEventConstructors(t *testing.T) {
 	}
 }
 
+func TestNewIntentClassifiedPayload(t *testing.T) {
+	ev := NewIntentClassified("plan", "Rewrite the profile website", 0.92, "en", "frontend redesign", false)
+	if ev.Type() != EventIntentClassified {
+		t.Errorf("type = %q, want %q", ev.Type(), EventIntentClassified)
+	}
+	p, ok := ev.Payload().(IntentClassifiedPayload)
+	if !ok {
+		t.Fatalf("payload = %T, want IntentClassifiedPayload", ev.Payload())
+	}
+	if p.Intent != "plan" || p.Raw != "Rewrite the profile website" {
+		t.Errorf("payload = %+v", p)
+	}
+	if p.Confidence != 0.92 || p.Language != "en" || p.Explanation != "frontend redesign" || p.ConfirmationRequired {
+		t.Errorf("payload = %+v", p)
+	}
+}
+
+func TestNewPhaseChangedPayload(t *testing.T) {
+	ev := NewPhaseChanged("ask", "plan")
+	if ev.Type() != EventPhaseChanged {
+		t.Errorf("type = %q, want %q", ev.Type(), EventPhaseChanged)
+	}
+	p, ok := ev.Payload().(PhaseChangedPayload)
+	if !ok {
+		t.Fatalf("payload = %T, want PhaseChangedPayload", ev.Payload())
+	}
+	if p.From != "ask" || p.To != "plan" {
+		t.Errorf("payload = %+v", p)
+	}
+}
+
+func TestNewPatchPipelineEvents(t *testing.T) {
+	parsed := NewPatchParsed("index.html", "DIFF_PATCH", 1)
+	if parsed.Type() != EventPatchParsed {
+		t.Errorf("parsed type = %q", parsed.Type())
+	}
+	pp := parsed.Payload().(PatchParsedPayload)
+	if pp.File != "index.html" || pp.Strategy != "DIFF_PATCH" || pp.Tier != 1 {
+		t.Errorf("parsed payload = %+v", pp)
+	}
+
+	validated := NewPatchValidated("index.html", "SEARCH_REPLACE", 2)
+	if validated.Type() != EventPatchValidated {
+		t.Errorf("validated type = %q", validated.Type())
+	}
+	vp := validated.Payload().(PatchValidatedPayload)
+	if vp.File != "index.html" || vp.Strategy != "SEARCH_REPLACE" || vp.Tier != 2 {
+		t.Errorf("validated payload = %+v", vp)
+	}
+
+	rejected := NewPatchRejected("index.html", "safety violation", 3)
+	if rejected.Type() != EventPatchRejected {
+		t.Errorf("rejected type = %q", rejected.Type())
+	}
+	rp := rejected.Payload().(PatchRejectedPayload)
+	if rp.File != "index.html" || rp.Reason != "safety violation" || rp.Tier != 3 {
+		t.Errorf("rejected payload = %+v", rp)
+	}
+
+	approval := NewApprovalRequested("index.html", "ambiguous patch", "--- preview ---")
+	if approval.Type() != EventApprovalRequested {
+		t.Errorf("approval type = %q", approval.Type())
+	}
+	ap := approval.Payload().(ApprovalRequestedPayload)
+	if ap.Target != "index.html" || ap.Reason != "ambiguous patch" || ap.Preview != "--- preview ---" {
+		t.Errorf("approval payload = %+v", ap)
+	}
+}
+
+func TestGatewayPipelineEventsRoundTripThroughBus(t *testing.T) {
+	bus := NewBus(8)
+	defer bus.Close()
+
+	var mu sync.Mutex
+	var got []DomainEvent
+	bus.Subscribe(EventIntentClassified, collectHandler(t, &mu, &got))
+	bus.Subscribe(EventPhaseChanged, collectHandler(t, &mu, &got))
+	bus.Subscribe(EventPatchParsed, collectHandler(t, &mu, &got))
+	bus.Subscribe(EventPatchValidated, collectHandler(t, &mu, &got))
+	bus.Subscribe(EventPatchRejected, collectHandler(t, &mu, &got))
+	bus.Subscribe(EventApprovalRequested, collectHandler(t, &mu, &got))
+
+	bus.Publish(NewIntentClassified("plan", "rewrite", 0.9, "en", "ui", false))
+	bus.Publish(NewPhaseChanged("ask", "plan"))
+	bus.Publish(NewPatchParsed("f.html", "DIFF_PATCH", 1))
+	bus.Publish(NewPatchValidated("f.html", "DIFF_PATCH", 1))
+	bus.Publish(NewPatchRejected("f.html", "safety", 3))
+	bus.Publish(NewApprovalRequested("f.html", "ambiguous", "preview"))
+
+	if !waitFor(t, func() bool {
+		return countEvents(&mu, &got) == 6
+	}) {
+		t.Fatalf("delivered %d events, want 6", countEvents(&mu, &got))
+	}
+}
+
 func TestTelemetryEventsRoundTripThroughBus(t *testing.T) {
 	bus := NewBus(4)
 	defer bus.Close()

@@ -1846,6 +1846,11 @@ func TestClassifyIntent_FrontendUIPatterns(t *testing.T) {
 		{"fix style.css", IntentFrontendUI},
 		{"web asset", IntentFrontendUI},
 		{"static file", IntentFrontendUI},
+		// UI creation / rewrite intents → FRONTEND_UI (route to /plan)
+		{"Please rewrite for me a personal profile website", IntentFrontendUI},
+		{"rewrite my portfolio website", IntentFrontendUI},
+		{"create a profile page with CSS", IntentFrontendUI},
+		{"build a responsive landing page", IntentFrontendUI},
 		// Non-frontend: generic bug keywords must NOT match.
 		{"fix the bug in parser.go", IntentBugRegression},
 		{"undefined symbol Log", IntentBugRegression},

@@ -428,6 +428,12 @@ func TestIsFrontendUI(t *testing.T) {
 		{"edit script.js", true},
 		{"web asset", true},
 		{"static file", true},
+		// UI creation / rewrite intents → frontend UI (route to /plan)
+		{"rewrite my personal profile website", true},
+		{"Please rewrite for me a personal profile website", true},
+		{"build a portfolio site", true},
+		{"create a landing page", true},
+		{"update the homepage layout", true},
 	}
 
 	for _, tc := range tests {
@@ -515,6 +521,12 @@ func TestClassifyIntentMode_FrontendUIRoutesToPlan(t *testing.T) {
 		{"edit script.js", "plan"},
 		{"web asset", "plan"},
 		{"static file", "plan"},
+
+		// UI creation / rewrite intents → plan (never build)
+		{"Please rewrite for me a personal profile website", "plan"},
+		{"rewrite my portfolio website", "plan"},
+		{"create a profile page with CSS", "plan"},
+		{"build a responsive landing page", "plan"},
 
 		// Non-trivial mutation verbs → plan (new safer default)
 		{"update @config.yml", "plan"},

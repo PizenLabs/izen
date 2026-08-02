@@ -257,10 +257,8 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 		case shortCircuitToPlan:
 			conclusion = "frontend ui intent detected — hand off to plan"
 			intent = "frontend_ui"
-			e.forensic("[deadlock-guard] frontend UI intent detected — short-circuiting /investigate → /plan")
 		default:
 			conclusion = "code mutation intent detected — hand off to build"
-			e.forensic("[deadlock-guard] non-bug intent detected — short-circuiting /investigate → /build handoff")
 		}
 		e.emit(events.NewIntentParsed(intent, e.Problem, 1.0))
 		result.Resolved = false
@@ -978,7 +976,6 @@ func (e *Engine) shouldShortCircuit() shortCircuitTarget {
 		lower := strings.ToLower(e.Problem)
 		for _, kw := range vanillaWebContentKeywords {
 			if strings.Contains(lower, kw) {
-				e.forensic("[deadlock-guard] VANILLA_WEB archetype detected with web content keywords — short-circuiting /investigate → /plan")
 				return shortCircuitToPlan
 			}
 		}

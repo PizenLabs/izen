@@ -31,9 +31,12 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/orchestrator"
+	"github.com/PizenLabs/izen/internal/patch"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/internal/router"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
@@ -68,6 +71,7 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	planEng.SetUserName(userName)
 	if provider != nil {
 		planEng.SetProvider(provider.Execute)
+		planEng.SetStreamProvider(provider.ExecuteStream)
 	}
 
 	// ── EVENT BUS ──────────────────────────────────────────────────────────
@@ -194,6 +198,47 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	wcc := control.NewWorkflowCheckpointManager(execEng.Checkpoints, root)
 	workflowSM.WithCheckpointCoordinator(workflow.NewCheckpointCoordinator(wcc))
 
+	// ── HYBRID INTENT GATEWAY ────────────────────────────────────────────
+	// The new router package runs the deterministic fast path FIRST and only
+	// falls back to the semantic IntentClassifier (a provider-backed
+	// PromptIntentClassifier adapted via LLMClassifyFunc) when no deterministic
+	// signal matches. It depends solely on the abstract IntentClassifier and
+	// the event bus — no concrete provider is imported here.
+	var intentRouter *router.Router
+	if provider != nil {
+		intentRouter = router.NewRouter(
+			router.NewPromptIntentClassifier(func(ctx context.Context, systemPrompt, userInput string) (string, error) {
+				resp, err := provider.Execute(ctx, ai.Request{
+					System:         systemPrompt,
+					Messages:       []ai.Message{{Role: "user", Content: userInput}},
+					MaxTokens:      64,
+					Temperature:    0.0,
+					ResponseFormat: &ai.ResponseFormat{Type: "json_object"},
+				})
+				if err != nil {
+					return "", err
+				}
+				return resp.Content, nil
+			}),
+			nil,
+		).WithEventBus(eventBus)
+	}
+
+	// ── EXECUTION ORCHESTRATOR ───────────────────────────────────────────
+	// The orchestrator maps the logical execution phases onto the single
+	// WorkflowStateMachine while sharing the persistent RuntimeContext created
+	// above. Mode switches update the active phase dynamically WITHOUT
+	// resetting conversation history or workspace artifacts (the RuntimeContext
+	// is never replaced). Phase changes are observed via EventPhaseChanged.
+	orch := orchestrator.New(workflowSM, runtimeCtx).WithEventBus(eventBus)
+
+	// ── MULTI-TIER PATCH ENGINE ──────────────────────────────────────────
+	// The new patch engine replaces the legacy patch application pipeline in
+	// the /build flow: Tier 1 (structured diff) -> Tier 2 (SEARCH/REPLACE) ->
+	// Tier 3 (whole-file rewrite) -> Tier 4 (human approval). It emits
+	// PatchParsed/PatchValidated/PatchRejected/ApprovalRequested on the bus.
+	patchEng := patch.NewEngine().WithEventBus(eventBus)
+
 	// ── AUTHORIZATION ENGINE ───────────────────────────────────────────────
 	// Production AuthorizationEngine wired with a no-op source hash verifier
 	// and a checkpoint checker that inspects .izen/checkpoints/ on disk.
@@ -242,6 +287,9 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		viewRegistry:        reg,
 		logStore:            NewLogStore(),
 		bus:                 eventBus,
+		intentRouter:        intentRouter,
+		orch:                orch,
+		patchEngine:         patchEng,
 		toolCallBuffer:      execution.NewToolCallBuffer(root),
 		thinkingPanel:       NewThinkingPanel(),
 		liveCodePreview:     NewLiveCodePreview(),
@@ -323,6 +371,12 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		events.EventActivity,
 		events.EventEngineTelemetry,
 		events.EventReasoningStream,
+		events.EventIntentClassified,
+		events.EventPhaseChanged,
+		events.EventPatchParsed,
+		events.EventPatchValidated,
+		events.EventPatchRejected,
+		events.EventApprovalRequested,
 	} {
 		eventBus.Subscribe(typ, func(ev events.DomainEvent) {
 			p.Send(domainEventMsg{ev: ev})

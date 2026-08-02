@@ -3,12 +3,15 @@ package plan
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
@@ -21,12 +24,19 @@ import (
 // ProviderFunc defines a structured function signature matching the ai.Request format.
 type ProviderFunc func(ctx context.Context, req ai.Request) (*ai.Response, error)
 
+// StreamProviderFunc matches the ai.Provider.ExecuteStream signature. When
+// wired, the plan engine performs its LLM synthesis through a streaming
+// connection so the accumulated buffer survives finish_reason: "length"
+// truncation instead of being discarded by a non-streaming round-trip.
+type StreamProviderFunc func(ctx context.Context, req ai.Request) (io.ReadCloser, error)
+
 // Engine is the core interface for the plan module, coordinating between data store,
 // parser, and AI provider to process plans.
 type Engine struct {
 	store        *PlanStore
 	parser       func(string) []Task
 	provider     ProviderFunc
+	streamProv   StreamProviderFunc
 	UserName     string   // collaborating engineer identity, injected into system prompts
 	rootPath     string   // workspace root for file discovery
 	AllowedFiles []string // grounded file tree for scope guard validation
@@ -41,6 +51,14 @@ type Engine struct {
 	// headless: they publish and never touch the UI directly. Optional; nil
 	// disables event emission.
 	bus *events.Bus
+
+	// usageMu guards lastInput/lastOutput, the provider-reported token usage of
+	// the most recent LLM synthesis. The UI reads it via LastUsage() to commit
+	// token metrics to the status.Tracker even when the response was truncated
+	// (finish_reason: "length").
+	usageMu    sync.RWMutex
+	lastInput  int
+	lastOutput int
 }
 
 // NewEngine creates a new Engine instance with the provided components.
@@ -169,6 +187,128 @@ func (e *Engine) SetProvider(provider ProviderFunc) {
 	}
 }
 
+// SetStreamProvider configures the streaming AI provider for this engine. When
+// wired, LLM synthesis runs over ExecuteStream so the accumulated text buffer
+// is retained even when the provider truncates the response (finish_reason:
+// "length"). Optional; when nil the engine falls back to the non-streaming
+// SetProvider path.
+func (e *Engine) SetStreamProvider(sp StreamProviderFunc) {
+	if e != nil {
+		e.streamProv = sp
+	}
+}
+
+// LastUsage returns the provider-reported token usage (input, output) of the
+// most recent LLM synthesis, committed even when the response was truncated by
+// the completion ceiling. The UI reads it after ProcessFromLedger returns to
+// update the session counters and the status.Tracker.
+func (e *Engine) LastUsage() (input, output int) {
+	if e == nil {
+		return 0, 0
+	}
+	e.usageMu.RLock()
+	defer e.usageMu.RUnlock()
+	return e.lastInput, e.lastOutput
+}
+
+// recordUsage commits provider-reported token usage. It is called on every
+// synthesis attempt, truncated or not, so the token metrics are never lost to
+// a finish_reason: "length" terminal event.
+func (e *Engine) recordUsage(input, output int) {
+	if e == nil {
+		return
+	}
+	e.usageMu.Lock()
+	e.lastInput = input
+	e.lastOutput = output
+	e.usageMu.Unlock()
+}
+
+// usageReader is implemented by stream results that report provider usage.
+type usageReader interface {
+	Usage() (input, output int)
+}
+
+// complete performs a single LLM synthesis call. When a streaming provider is
+// wired it runs over ExecuteStream and accumulates the buffer rune-safe,
+// stripping reasoning sentinels; a response that ends with finish_reason
+// "length" (or any non-stop truncation) still yields its accumulated content as
+// VALID output — the plan engine can parse whatever checklist/JSON was
+// generated instead of failing with "empty response from provider". The
+// provider-reported usage is committed to the engine regardless of the
+// terminal finish_reason.
+func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	if e.streamProv == nil {
+		resp, err := e.provider(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp != nil {
+			e.recordUsage(resp.TokenInput, resp.TokenOutput)
+		}
+		return resp, nil
+	}
+
+	req.Stream = true
+	rawStream, err := e.streamProv(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rawStream.Close() }()
+
+	content, finishReason, input, output := accumulateStream(rawStream)
+	e.recordUsage(input, output)
+	_ = finishReason
+
+	// Truncation-aware response: the accumulated buffer is the canonical
+	// content. A zero-length buffer (genuinely no tokens emitted) is left empty
+	// so the caller can surface a proper "empty response" diagnostic.
+	return &ai.Response{
+		Content:     content,
+		TokenInput:  input,
+		TokenOutput: output,
+	}, nil
+}
+
+// accumulateStream drains an SSE-backed stream to EOF, keeping EVERY byte that
+// arrived. It is truncation-agnostic: a stream that ends with finish_reason
+// "length" (provider hit the completion ceiling) has its partial buffer treated
+// as valid content rather than discarded. Reasoning sentinels are stripped via
+// stream.ReasonBlock so thinking text never pollutes the parseable JSON.
+func accumulateStream(r io.Reader) (content, finishReason string, input, output int) {
+	var raw strings.Builder
+	runeBuf := stream.NewRuneBuffer()
+	buf := make([]byte, 4096)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			raw.WriteString(runeBuf.Write(buf[:n]))
+		}
+		if err == io.EOF {
+			if rem := runeBuf.Flush(); rem != "" {
+				raw.WriteString(rem)
+			}
+			break
+		}
+		if err != nil {
+			// Non-EOF error: keep whatever accumulated so far; the caller
+			// decides whether the partial content is usable.
+			if rem := runeBuf.Flush(); rem != "" {
+				raw.WriteString(rem)
+			}
+			break
+		}
+	}
+	if up, ok := r.(usageReader); ok {
+		input, output = up.Usage()
+	}
+	if frp, ok := r.(ai.FinishReasonProvider); ok {
+		finishReason = frp.FinishReason()
+	}
+	content, _ = stream.ReasonBlock(raw.String())
+	return content, finishReason, input, output
+}
+
 // ProcessFromLedger generates an execution plan directly from investigation
 // ledger data using enforced structured output (JSON mode). Returns parsed
 // Task structs, bypassing the conversational text-streaming path entirely.
@@ -190,7 +330,7 @@ func (e *Engine) ProcessFromLedgerFastTrack(ctx context.Context, promptText stri
 }
 
 func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, problem string, modelName string, fastTrack bool, fastPrompt ...string) (tasks []Task, err error) {
-	if e == nil || e.provider == nil {
+	if e == nil || (e.provider == nil && e.streamProv == nil) {
 		return nil, fmt.Errorf("plan engine: provider not set")
 	}
 
@@ -506,7 +646,7 @@ ALLOWED ACTIONS: Pure file mutations on .html, .css, .js files only.`
 The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DEPS or shell execution tasks like go mod tidy. Generate ONLY a FILE_MUTATE / CODE_MOD task targeting the source file containing the error. No SHELL_EXEC, no environment setup, no dependency installation.`
 	}
 
-	resp, err := e.provider(ctx, req)
+	resp, err := e.complete(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("plan engine: provider call failed: %w", err)
 	}
@@ -555,7 +695,7 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 				fmt.Sprintf("JSON syntax or command schema broken — refining prompt and retrying internally (Attempt %d/%d)", attempt, maxSilentRetries)))
 			req.Messages[len(req.Messages)-1].Content += shellExecReinforcement(attempt, maxSilentRetries)
 			var retryErr error
-			resp, retryErr = e.provider(ctx, req)
+			resp, retryErr = e.complete(ctx, req)
 			if retryErr != nil || resp == nil || resp.Content == "" {
 				continue
 			}

@@ -9,6 +9,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/investigate"
 )
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -90,7 +91,27 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.handoffCtx.ProposedFix = handoffContent
 		m.handoffLedgerContent = handoffContent
 
-		m.push(roleSystem, infoStyle.Render("Handing off /ask Context Ledger to /investigate..."))
+		// ── INTENT-BASED /ask HANDOFF BYPASS ───────────────────────────
+		// FRONTEND_UI and code-generation/rewrite prompts add ZERO diagnostic
+		// value to /investigate: the engine short-circuits them in 0s with an
+		// "Inconclusive" result while injecting forensic overhead into the TUI
+		// and context ledger. Bypass the engine and transition directly to
+		// /plan (UI/layout tasks) or /build (code mutation).
+		intent := investigate.ClassifyIntent(handoffContent)
+		if intent.IsFrontendUI() {
+			m.handoffLedgerContent = "frontend ui intent detected — hand off to plan"
+			m.handoffCtx.ProposedFix = handoffContent
+			m.modeChangeAuthorized = true
+			m.currentResult = nil
+			return m, m.setMode(modes.ModePlan)
+		}
+		if hasMutationIntent(handoffContent) && hasExecutableBuildTarget(handoffContent, m) {
+			m.handoffCtx.PendingTodos = synthesizeBuildTodosFromMutation(handoffContent)
+			m.modeChangeAuthorized = true
+			m.currentResult = nil
+			return m, m.setMode(modes.ModeBuild)
+		}
+
 		// Transition mode to /investigate (clean transition)
 		m.modeChangeAuthorized = true
 		m.currentResult = nil
@@ -203,6 +224,34 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// ── Awaiting approval ────────────────────────────────────────────
 	if m.state == StateAwaitingApproval {
+		// ── Hybrid Intent Gateway mode-selection prompt ─────────────
+		// The router classified the prompt with confidence below the policy
+		// threshold. Digits select a mode directly, ←/→ cycle the highlight,
+		// Enter confirms the highlighted mode, Esc falls back to /ask.
+		if m.pendingRouteConfirm && len(m.pendingRouteOptions) > 0 {
+			switch msg.String() {
+			case "1", "2", "3", "4", "5":
+				idx := int(msg.String()[0] - '1')
+				if idx >= 0 && idx < len(m.pendingRouteOptions) {
+					m.pendingRouteIdx = idx
+					m.refreshViewportContent()
+					return m, m.confirmRouteSelection(m.pendingRouteOptions[idx])
+				}
+			case "left":
+				m.pendingRouteIdx = (m.pendingRouteIdx - 1 + len(m.pendingRouteOptions)) % len(m.pendingRouteOptions)
+				m.refreshViewportContent()
+				return m, nil
+			case "right":
+				m.pendingRouteIdx = (m.pendingRouteIdx + 1) % len(m.pendingRouteOptions)
+				m.refreshViewportContent()
+				return m, nil
+			case "enter":
+				return m, m.confirmRouteSelection(m.pendingRouteOptions[m.pendingRouteIdx])
+			case "esc":
+				return m, m.cancelRouteSelection()
+			}
+		}
+
 		// ── Effort Selector (←/→) ────────────────────────────────────
 		if msg.Type == tea.KeyLeft {
 			if m.currentEffort > EffortAuto {

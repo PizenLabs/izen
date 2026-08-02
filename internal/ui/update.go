@@ -193,6 +193,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.handleDomainEvent(msg.ev)
 		return m, nil
 
+	case routerResultMsg:
+		return m.handleRouterResult(msg)
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -431,19 +434,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		var cmds []tea.Cmd
 		switch {
 		case strings.Contains(m.handoffLedgerContent, "hand off to plan"):
-			m.push(roleStatus, "Frontend UI intent — routing to /plan for CSS/AST inspection")
 			m.modeChangeAuthorized = true
 			m.handoffCtx.ProposedFix = m.handoffLedgerContent
 			cmds = append(cmds, m.setMode(modes.ModePlan))
 		case strings.Contains(m.handoffLedgerContent, "code mutation intent detected"):
-			m.push(roleStatus, "Code mutation intent — routing directly to /build, bypassing /plan")
 			m.modeChangeAuthorized = true
 			// Synthesize pending todos from the investigation content so the
 			// build auto-trigger in setMode finds work to do immediately.
 			m.handoffCtx.PendingTodos = synthesizeBuildTodosFromMutation(msg.sessionKey)
 			cmds = append(cmds, m.setMode(modes.ModeBuild))
 		default:
-			m.push(roleStatus, "Investigation complete. Auto-transitioning to /plan for execution synthesis...")
 			m.handoffCtx.ProposedFix = m.handoffLedgerContent
 			if m.handoffLedgerContent != "" {
 				m.modeChangeAuthorized = true
@@ -488,6 +488,21 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
 			return m, flush
+		}
+
+		// ── TOKEN ACCOUNTING ────────────────────────────────────────────
+		// Commit the provider-reported usage of plan synthesis into the
+		// session counters and the global status.Tracker. The plan engine
+		// records this usage even when the response was truncated by the
+		// completion ceiling (finish_reason: "length"), so the token figures
+		// never silently vanish on a truncated plan.
+		m.InputTokens += msg.TokenInput
+		m.OutputTokens += msg.TokenOutput
+		m.TotalTokens = m.InputTokens + m.OutputTokens
+		if m.IsCloudModel {
+			status.Default.Record(m.InputTokens, m.OutputTokens)
+		} else {
+			status.Default.Record(msg.TokenInput, msg.TokenOutput)
 		}
 
 		// ── SCOPE GUARD FINAL VALIDATION ───────────────────────────────────
@@ -1041,9 +1056,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		if msg.err != nil {
 			m.push(roleError, "build execution error: "+providers.SanitizeAPIError(msg.err))
-			_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
-				FailureClass: classifier.FailureUnknownClass,
-			})
+			if m.orch != nil {
+				_ = m.orch.Fail(classifier.FailureUnknownClass)
+			} else if m.workflowSM != nil {
+				_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
+					FailureClass: classifier.FailureUnknownClass,
+				})
+			}
 		}
 		if msg.output != "" {
 			for _, line := range strings.Split(msg.output, "\n") {
@@ -1143,9 +1162,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleError, fmt.Sprintf(
 				"[BUILD HALTED] Step %d failed. Queue frozen — remaining tasks marked stalled. Use /investigate or /plan to re-generate a valid ledger.",
 				m.currentBuildTaskID))
-			_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
-				FailureClass: classifier.FailureCodeClass,
-			})
+			if m.orch != nil {
+				_ = m.orch.Fail(classifier.FailureCodeClass)
+			} else if m.workflowSM != nil {
+				_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
+					FailureClass: classifier.FailureCodeClass,
+				})
+			}
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			flush := m.flushPendingRecords()
@@ -1172,9 +1195,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// ── AUTO-HANDOFF: /build → /review ──────────────────────
 		// All SHELL_EXEC steps completed successfully and no more tasks
 		// remain. Transition to /review for a full architectural review.
+		// setMode drives the orchestrator, which maps /review onto the shared
+		// WorkflowStateMachine (Build -> Review) without touching history.
 		if !hasNext && m.resolver.Current() == modes.ModeBuild {
 			m.modeChangeAuthorized = true
-			_ = m.workflowSM.SendEvent(workflow.EventReview, workflow.TransitionContext{})
 			m.setMode(modes.ModeReview)
 		}
 		return m, flush
