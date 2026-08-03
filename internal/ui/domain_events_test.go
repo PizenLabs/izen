@@ -44,6 +44,22 @@ func TestHandleDomainEventProjection(t *testing.T) {
 			"[ OK ] search \"query\": 3 results"},
 		{"engine activity (multiline escapes)", events.NewActivity("step 1\\nstep 2\\tvalue"),
 			"step 1\\nstep 2\\tvalue"},
+		{"intent classified", events.NewIntentClassified("build", "write a fix", 0.91, "en", "code mutation", false),
+			"[intent] classified: /build (91%, code mutation)"},
+		{"intent classified (ambiguous)", events.NewIntentClassified("plan", "what should we do", 0.42, "en", "ambiguous request", true),
+			"[intent] ambiguous: /plan (42%, ambiguous request) — asking user"},
+		{"phase changed", events.NewPhaseChanged("plan", "build"),
+			"[phase] plan → build"},
+		{"patch parsed", events.NewPatchParsed("x.go", "STRUCTURED_DIFF", 1),
+			"[patch] parsed x.go (strategy=STRUCTURED_DIFF, tier=1)"},
+		{"patch validated", events.NewPatchValidated("x.go", "SEARCH_REPLACE", 2),
+			"[patch] validated x.go (strategy=SEARCH_REPLACE, tier=2)"},
+		{"patch rejected", events.NewPatchRejected("x.go", "unsafe full rewrite", 3),
+			"[patch] rejected x.go (tier 3): unsafe full rewrite"},
+		{"approval requested (tier 4)", events.NewApprovalRequested("x.go", "full-file rewrite needs approval", ""),
+			"[approval] requested for x.go: full-file rewrite needs approval"},
+		{"approval requested (intent disambiguation)", events.NewApprovalRequested("", "unclear intent", ""),
+			"[approval] requested for intent disambiguation: unclear intent"},
 	}
 
 	for _, tc := range tests {

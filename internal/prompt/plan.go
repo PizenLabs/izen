@@ -364,3 +364,80 @@ func PlanDirectMutationSystemPrompt() string {
 		"No preamble, no summary." +
 		"\n" + strings.TrimSpace(TokenThriftyConstraint)
 }
+
+// PlanSynthesisSystemPrompt returns the compact, model-agnostic system prompt
+// used for JSON plan synthesis in /plan. Unlike the composed prompts it
+// carries no identity/contract preamble (CommonContract, environment context),
+// keeping the instruction block small enough for Mini/7B models to follow
+// without choking on context. It enforces the Action (strategy), Target
+// (file), Reason (rationale) output contract and explicitly forbids thinking
+// blocks and markdown decorations.
+func PlanSynthesisSystemPrompt() string {
+	return `You are IZEN, a deterministic task planner.
+Read the investigation ledger and emit a task plan.
+OUTPUT: ONE raw JSON object. No markdown fences, no comments, no prose, no <think>/<thought> blocks, no explanations.
+
+SCHEMA:
+{
+  "architectural_strategy": "one sentence",
+  "atomic_tasks": [
+    {"task_id": 1, "strategy": "SHELL_EXEC", "file": "exact command or relative path", "description": "title", "rationale": "why this step", "solution": "expected end state"}
+  ]
+}
+
+RULES
+- strategy: SHELL_EXEC = runnable command only; FILE_MUTATE = source file edit.
+- file: command text for SHELL_EXEC, relative project path for FILE_MUTATE.
+- One task per change; keep tasks atomic and ordered.
+- Never target documentation files (README.md, docs, LICENSE).
+- Missing Go dependency -> SHELL_EXEC "go get <real package>".
+- Keep the whole JSON under 300 tokens.`
+}
+
+// miniModelNameMarkers are substrings that identify small / non-reasoning
+// models (e.g. Cohere North Mini, GPT-4o-mini, Gemini Flash, llama-3.2-1b)
+// that tend to emit narrative prose instead of structured JSON. The check is
+// deliberately broad because these model families share the same
+// instruction-following weakness.
+var miniModelNameMarkers = []string{
+	"mini",
+	"nano",
+	"flash",
+	"lite",
+	"small",
+	"tiny",
+	"command-r",
+	"command r",
+	// Small parameter-count suffixes (1B/3B/7B/8B class local SLMs).
+	"1b",
+	"3b",
+	"7b",
+	"8b",
+}
+
+// IsMiniModel reports whether modelName refers to a small / non-reasoning model
+// that benefits from the strict raw-JSON output constraint.
+func IsMiniModel(modelName string) bool {
+	name := strings.ToLower(strings.TrimSpace(modelName))
+	if name == "" {
+		return false
+	}
+	for _, m := range miniModelNameMarkers {
+		if strings.Contains(name, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// MiniModelJSONConstraint returns the strict raw-JSON output directive for
+// small / non-reasoning models, or an empty string when modelName does not look
+// like one. Callers append the non-empty result to the plan system prompt so a
+// mini model is never tempted to wrap its JSON plan in explanations, preamble,
+// or markdown formatting.
+func MiniModelJSONConstraint(modelName string) string {
+	if !IsMiniModel(modelName) {
+		return ""
+	}
+	return "CRITICAL: Respond ONLY with raw JSON array/object. Do NOT include explanations, preamble, or markdown formatting outside the JSON."
+}

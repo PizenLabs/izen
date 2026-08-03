@@ -3,12 +3,15 @@ package plan
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
@@ -21,12 +24,19 @@ import (
 // ProviderFunc defines a structured function signature matching the ai.Request format.
 type ProviderFunc func(ctx context.Context, req ai.Request) (*ai.Response, error)
 
+// StreamProviderFunc matches the ai.Provider.ExecuteStream signature. When
+// wired, the plan engine performs its LLM synthesis through a streaming
+// connection so the accumulated buffer survives finish_reason: "length"
+// truncation instead of being discarded by a non-streaming round-trip.
+type StreamProviderFunc func(ctx context.Context, req ai.Request) (io.ReadCloser, error)
+
 // Engine is the core interface for the plan module, coordinating between data store,
 // parser, and AI provider to process plans.
 type Engine struct {
 	store        *PlanStore
 	parser       func(string) []Task
 	provider     ProviderFunc
+	streamProv   StreamProviderFunc
 	UserName     string   // collaborating engineer identity, injected into system prompts
 	rootPath     string   // workspace root for file discovery
 	AllowedFiles []string // grounded file tree for scope guard validation
@@ -41,6 +51,14 @@ type Engine struct {
 	// headless: they publish and never touch the UI directly. Optional; nil
 	// disables event emission.
 	bus *events.Bus
+
+	// usageMu guards lastInput/lastOutput, the provider-reported token usage of
+	// the most recent LLM synthesis. The UI reads it via LastUsage() to commit
+	// token metrics to the status.Tracker even when the response was truncated
+	// (finish_reason: "length").
+	usageMu    sync.RWMutex
+	lastInput  int
+	lastOutput int
 }
 
 // NewEngine creates a new Engine instance with the provided components.
@@ -169,6 +187,221 @@ func (e *Engine) SetProvider(provider ProviderFunc) {
 	}
 }
 
+// SetStreamProvider configures the streaming AI provider for this engine. When
+// wired, LLM synthesis runs over ExecuteStream so the accumulated text buffer
+// is retained even when the provider truncates the response (finish_reason:
+// "length"). Optional; when nil the engine falls back to the non-streaming
+// SetProvider path.
+func (e *Engine) SetStreamProvider(sp StreamProviderFunc) {
+	if e != nil {
+		e.streamProv = sp
+	}
+}
+
+// LastUsage returns the provider-reported token usage (input, output) of the
+// most recent LLM synthesis, committed even when the response was truncated by
+// the completion ceiling. The UI reads it after ProcessFromLedger returns to
+// update the session counters and the status.Tracker.
+func (e *Engine) LastUsage() (input, output int) {
+	if e == nil {
+		return 0, 0
+	}
+	e.usageMu.RLock()
+	defer e.usageMu.RUnlock()
+	return e.lastInput, e.lastOutput
+}
+
+// recordUsage commits provider-reported token usage. It is called on every
+// synthesis attempt, truncated or not, so the token metrics are never lost to
+// a finish_reason: "length" terminal event.
+func (e *Engine) recordUsage(input, output int) {
+	if e == nil {
+		return
+	}
+	e.usageMu.Lock()
+	e.lastInput = input
+	e.lastOutput = output
+	e.usageMu.Unlock()
+}
+
+// usageReader is implemented by stream results that report provider usage.
+type usageReader interface {
+	Usage() (input, output int)
+}
+
+// complete performs a single LLM synthesis call. When a streaming provider is
+// wired it runs over ExecuteStream and accumulates the buffer rune-safe,
+// stripping reasoning sentinels; a response that ends with finish_reason
+// "length" (or any non-stop truncation) still yields its accumulated content as
+// VALID output — the plan engine can parse whatever checklist/JSON was
+// generated instead of failing with "empty response from provider". When the
+// stream produced only reasoning/thinking text (content empty), the reasoning
+// is used as the payload via the reasoning fallback. The provider-reported
+// usage is committed to the engine regardless of the terminal finish_reason.
+//
+// Reasoning forwarding: when an event bus is wired, every reasoning/thinking
+// chunk (reasoning_content deltas routed through the request's ReasoningHandler
+// and <thought>/sentinel markers parsed out of the raw stream by
+// accumulateStream) is published to the bus as an EventReasoningStream as it
+// arrives, so the UI can render live thinking during plan synthesis. Reasoning
+// tokens are never dropped even when the request times out or yields empty
+// final content — the already-accumulated chunks are published before any
+// error/truncation path returns. A terminal IsComplete event closes the block
+// so the UI collapses it to a summary line.
+func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	if e.streamProv == nil {
+		resp, err := e.provider(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp != nil {
+			e.recordUsage(resp.TokenInput, resp.TokenOutput)
+		}
+		return resp, nil
+	}
+
+	// Reasoning sink: publishes each reasoning chunk to the event bus exactly
+	// as it streams in. reasoningPublished tracks whether any chunk was
+	// forwarded so the terminal IsComplete event is only emitted when there is
+	// an active thinking block to collapse.
+	reasoningPublished := false
+	var reasoningSink func(string)
+	if e.bus != nil {
+		reasoningSink = func(chunk string) {
+			if chunk == "" {
+				return
+			}
+			reasoningPublished = true
+			e.bus.Publish(events.NewReasoningStream(chunk, false))
+		}
+		// Providers that route reasoning via the request-level handler
+		// (OpenAI/Claude/Gemini/Ollama/Groq/...). Providers that embed
+		// sentinel markers in the raw stream (OpenRouter) are captured by the
+		// accumulateStream sink through the splitter — never double-forwarded,
+		// because those readers do not consult ReasoningHandler.
+		req.ReasoningHandler = func(chunk string) error {
+			reasoningSink(chunk)
+			return nil
+		}
+	}
+
+	req.Stream = true
+	rawStream, err := e.streamProv(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rawStream.Close() }()
+
+	content, reasoning, finishReason, input, output := accumulateStream(rawStream, reasoningSink)
+	e.recordUsage(input, output)
+	_ = finishReason
+
+	if strings.TrimSpace(content) == "" && strings.TrimSpace(reasoning) != "" {
+		// Reasoning fallback: the model emitted only thinking content (a
+		// Mini/reasoning model with empty message content). Promote the
+		// reasoning text to the payload so plan synthesis succeeds instead of
+		// failing with "empty response from provider".
+		content = reasoning
+	}
+
+	// Terminal reasoning event: collapses the live thinking block in the UI.
+	// Emitted whenever reasoning was forwarded, even if the request timed out
+	// or yielded empty final content — the UI must never be left with an
+	// orphaned open thinking box.
+	if reasoningPublished {
+		e.bus.Publish(events.NewReasoningStream("", true))
+	}
+
+	// Truncation-aware response: the accumulated buffer is the canonical
+	// content. A zero-length buffer (genuinely no tokens emitted) is left empty
+	// so the caller can surface a proper "empty response" diagnostic.
+	return &ai.Response{
+		Content:     content,
+		TokenInput:  input,
+		TokenOutput: output,
+	}, nil
+}
+
+// accumulateStream drains an SSE-backed stream to EOF, keeping EVERY byte that
+// arrived. It is truncation-agnostic: a stream that ends with finish_reason
+// "length" (provider hit the completion ceiling) has its partial buffer treated
+// as valid content rather than discarded. Reasoning sentinels are stripped via
+// the Splitter so thinking text never pollutes the parseable JSON; the
+// extracted reasoning is returned alongside so a reasoning-only stream can fall
+// back to it when the content buffer is empty.
+//
+// The stream is classified incrementally (not buffered-then-split), so every
+// reasoning/thinking chunk is routed to the optional sink funcs as it arrives.
+// This lets callers publish reasoning to the event bus continuously — reasoning
+// tokens are never dropped even when the request times out or yields empty
+// final content, because chunks already read are forwarded before any error
+// path returns. Each sink is invoked with verbatim reasoning text; a nil sink
+// is ignored.
+func accumulateStream(r io.Reader, sinks ...func(string)) (content, reasoning, finishReason string, input, output int) {
+	var contentParts, reasoningParts strings.Builder
+	runeBuf := stream.NewRuneBuffer()
+	splitter := stream.NewSplitter()
+
+	publishReasoning := func(text string) {
+		if text == "" {
+			return
+		}
+		for _, s := range sinks {
+			if s != nil {
+				s(text)
+			}
+		}
+	}
+
+	emitFrame := func(fr stream.Frame) {
+		switch fr.Kind {
+		case stream.ChunkContent:
+			if fr.Text != "" {
+				contentParts.WriteString(fr.Text)
+			}
+		case stream.ChunkReasoning:
+			if fr.Text != "" {
+				reasoningParts.WriteString(fr.Text)
+				publishReasoning(fr.Text)
+			}
+		}
+	}
+
+	flushBuffered := func() {
+		if rem := runeBuf.Flush(); rem != "" {
+			splitter.Write(rem, emitFrame)
+		}
+		splitter.Flush(emitFrame)
+	}
+
+	buf := make([]byte, 4096)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if text := runeBuf.Write(buf[:n]); text != "" {
+				splitter.Write(text, emitFrame)
+			}
+		}
+		if err == io.EOF {
+			flushBuffered()
+			break
+		}
+		if err != nil {
+			// Non-EOF error: keep whatever accumulated so far; the caller
+			// decides whether the partial content is usable.
+			flushBuffered()
+			break
+		}
+	}
+	if up, ok := r.(usageReader); ok {
+		input, output = up.Usage()
+	}
+	if frp, ok := r.(ai.FinishReasonProvider); ok {
+		finishReason = frp.FinishReason()
+	}
+	return contentParts.String(), reasoningParts.String(), finishReason, input, output
+}
+
 // ProcessFromLedger generates an execution plan directly from investigation
 // ledger data using enforced structured output (JSON mode). Returns parsed
 // Task structs, bypassing the conversational text-streaming path entirely.
@@ -190,7 +423,7 @@ func (e *Engine) ProcessFromLedgerFastTrack(ctx context.Context, promptText stri
 }
 
 func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, problem string, modelName string, fastTrack bool, fastPrompt ...string) (tasks []Task, err error) {
-	if e == nil || e.provider == nil {
+	if e == nil || (e.provider == nil && e.streamProv == nil) {
 		return nil, fmt.Errorf("plan engine: provider not set")
 	}
 
@@ -432,7 +665,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			Messages: []ai.Message{
 				{
 					Role:    "system",
-					Content: prompt.PlanSystemPrompt(e.UserName),
+					Content: prompt.CompactPlanContract(),
 				},
 				{
 					Role:    "user",
@@ -443,20 +676,24 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			MaxTokens: 1536,
 		}
 	} else {
-		// ── COMPLEXITY-CONDITIONAL SYSTEM PROMPT ──────────
-		// Assess heuristic complexity from the problem text. LOW and MEDIUM
-		// complexity tasks (standard code changes, config edits, unit tests)
-		// receive the compact 3-bullet checklist prompt — no verbose Senior
-		// Architect analysis. HIGH complexity or explicit high-intent flags
-		// get the full prose treatment.
-		// When the problem/ledger indicates a direct file mutation
-		// (refactor, convert, replace, etc.), use the zero-prose
-		// system prompt that skips all analysis entirely.
+		// ── COMPACT SYNTHESIS SYSTEM PROMPT ──────────
+		// Plan synthesis uses the model-agnostic PlanSynthesisSystemPrompt:
+		// a single high-signal block (no identity/contract preamble) small
+		// enough for Mini/7B models to follow without choking on context. It
+		// enforces the Action (strategy), Target (file), Reason (rationale)
+		// JSON output contract and forbids thinking blocks. Direct file
+		// mutations bypass it with the zero-prose mutation prompt.
 		isDirectMut := detectDirectMutation(problem, ledgerContent) != nil
-		hasHighFlag := strings.Contains(problem, "--high") || strings.Contains(problem, "/intent high")
-		systemPrompt := prompt.SelectPlanSystemPrompt(problem, hasHighFlag, e.UserName) + "\n\n" + SchemaJSONInstruction()
+		systemPrompt := prompt.PlanSynthesisSystemPrompt()
 		if isDirectMut {
 			systemPrompt = prompt.PlanDirectMutationSystemPrompt()
+		}
+		// MINI-MODEL HARDENING: small / non-reasoning cloud models (e.g. Cohere
+		// North Mini) routinely emit narrative reasoning prose instead of the
+		// required JSON. Inject an explicit raw-JSON-only constraint so the
+		// output stays parseable instead of exhausting the silent retry budget.
+		if c := prompt.MiniModelJSONConstraint(modelName); c != "" {
+			systemPrompt += "\n\n" + c
 		}
 		// VANILLA_WEB ARCHETYPE: Strict negative constraints injected at the
 		// end of the system prompt as a hard archetype lock. The LLM MUST NOT
@@ -506,13 +743,14 @@ ALLOWED ACTIONS: Pure file mutations on .html, .css, .js files only.`
 The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DEPS or shell execution tasks like go mod tidy. Generate ONLY a FILE_MUTATE / CODE_MOD task targeting the source file containing the error. No SHELL_EXEC, no environment setup, no dependency installation.`
 	}
 
-	resp, err := e.provider(ctx, req)
+	resp, err := e.complete(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("plan engine: provider call failed: %w", err)
 	}
 
-	if resp == nil || resp.Content == "" {
-		return nil, fmt.Errorf("plan engine: empty response from provider")
+	if resp == nil || strings.TrimSpace(resp.Content) == "" {
+		e.diagnoseSynthesisFailure("Provider returned an empty response for plan synthesis: no content and no reasoning/thinking text was emitted. This usually means the model produced only a thinking block or hit a context/output ceiling — retry with a smaller ledger or a different model.")
+		return nil, fmt.Errorf("plan engine: empty response from provider — no content or reasoning/thinking text was emitted; retry with a smaller ledger or a different model")
 	}
 
 	// Persist raw plan output to disk.
@@ -546,6 +784,11 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	// friction of /mode investigate ↔ /mode plan toggling by handling the
 	// correction transparently.
 	maxSilentRetries := 2
+	// lastRawContent preserves the most recent non-empty model output across the
+	// retry loop. The final response may be nil (a retry returned no content),
+	// but the prose the model DID emit on an earlier attempt is still the best
+	// signal the heuristic fallback can mine for file paths.
+	lastRawContent := ""
 	for attempt := 0; attempt <= maxSilentRetries; attempt++ {
 		// On retry (attempt > 0), re-invoke the provider with an augmented
 		// prompt that includes the strict enforcement instruction from the
@@ -555,11 +798,14 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 				fmt.Sprintf("JSON syntax or command schema broken — refining prompt and retrying internally (Attempt %d/%d)", attempt, maxSilentRetries)))
 			req.Messages[len(req.Messages)-1].Content += shellExecReinforcement(attempt, maxSilentRetries)
 			var retryErr error
-			resp, retryErr = e.provider(ctx, req)
+			resp, retryErr = e.complete(ctx, req)
 			if retryErr != nil || resp == nil || resp.Content == "" {
 				continue
 			}
 			_ = e.store.SaveRawMarkdown("plan", resp.Content)
+		}
+		if resp != nil && strings.TrimSpace(resp.Content) != "" {
+			lastRawContent = resp.Content
 		}
 
 		jsonResult := ParseJSONPlan(resp.Content)
@@ -624,9 +870,40 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 			}
 		}
 
+		// Tolerant markdown fallback: Mini models sometimes emit task blocks
+		// (- [ ] SHELL_EXEC: ... | why) despite the JSON instruction. Accept
+		// them through the same validation pipeline instead of burning the
+		// retry budget on reformatting.
+		if md := e.tolerantMarkdownTasks(resp.Content, problem, ledgerContent); len(md) > 0 {
+			return md, nil
+		}
+
 		// Structural parse failure or all candidates filtered out.
 		if attempt < maxSilentRetries {
 			continue
+		}
+	}
+
+	// ── HEURISTIC PROSE FALLBACK ──────────────────────────────────────
+	// Last resort before hard failure: the model emitted narrative reasoning
+	// prose (a common failure mode of free/mini cloud models) that neither the
+	// JSON parser nor the markdown task parser could consume. Mine the text for
+	// file paths and construct one FILE_MUTATE task per detected file so the
+	// execution survives instead of dying with "all 3 JSON synthesis attempts
+	// failed". A clear plan.synthesize.fallback event notifies the user that a
+	// heuristic plan was generated.
+	if strings.TrimSpace(lastRawContent) != "" {
+		if heuristic := extractTasksFromProse(lastRawContent); len(heuristic) > 0 {
+			heuristic = FilterNonExistentMutationTargets(heuristic, e.rootPath)
+			if e.vanillaWeb {
+				heuristic = filterGoCommands(heuristic)
+				heuristic = SanitizeTasksForArchetype(heuristic, recon.VANILLA_WEB)
+			}
+			if len(heuristic) > 0 {
+				e.emit(events.NewPlanFallback("prose", fmt.Sprintf(
+					"The model returned non-JSON prose; a heuristic plan with %d FILE_MUTATE task(s) was extracted from the mentioned file paths.", len(heuristic))))
+				return ForceShellExecOnCompileError(heuristic, problem, ledgerContent), nil
+			}
 		}
 	}
 
@@ -635,6 +912,15 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	// valid JSON plan. Try to extract a dependency from the conclusion for a
 	// go get task; if no dependency is found, return a hard error instead of
 	// hallucinating shell commands like go mod tidy.
+	// NIL-SAFETY: after the retry loop the last provider response may be nil
+	// (e.g. every retry returned a nil response), so resp is never
+	// dereferenced without a guard.
+	excerpt := "<no provider output>"
+	if resp != nil {
+		excerpt = truncateForLog(resp.Content)
+	}
+	e.diagnoseSynthesisFailure(fmt.Sprintf(
+		"All %d plan synthesis attempts failed after sanitization. Last provider output excerpt: %q. The model produced neither parseable JSON nor task blocks.", maxSilentRetries+1, excerpt))
 	if HasUndefinedSymbolError(ledgerContent) {
 		return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed for undefined symbol error — could not determine correct code fix", maxSilentRetries+1)
 	}
@@ -662,6 +948,38 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	}
 
 	return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed and no dependency error detected", maxSilentRetries+1)
+}
+
+// diagnoseSynthesisFailure publishes a clear, actionable plan-synthesis
+// diagnostic to the event bus so the presentation layer can surface context
+// (stage, sanitized message) instead of a raw engine error. It is a no-op when
+// no bus is wired or the engine is nil.
+func (e *Engine) diagnoseSynthesisFailure(message string) {
+	if e == nil {
+		return
+	}
+	e.emit(events.NewStageCompleted("plan.synthesize.error", 0, message))
+}
+
+// tolerantMarkdownTasks parses a non-JSON model response as markdown task
+// blocks and runs the full validation pipeline (target validity, disk
+// existence, vanilla-web and shell-command guards). It returns nil when the
+// output is unusable so the caller can fall back to the JSON retry loop.
+func (e *Engine) tolerantMarkdownTasks(content, problem, ledgerContent string) []Task {
+	md := ParseMarkdownToTasks(content)
+	if len(md) == 0 {
+		return nil
+	}
+	md = filterValidTasks(md)
+	md = FilterNonExistentMutationTargets(md, e.rootPath)
+	if e.vanillaWeb {
+		md = filterGoCommands(md)
+		md = SanitizeTasksForArchetype(md, recon.VANILLA_WEB)
+	}
+	if len(md) == 0 || hasInvalidShellExecCommand(md) {
+		return nil
+	}
+	return ForceShellExecOnCompileError(md, problem, ledgerContent)
 }
 
 // compilerErrorFileRe extracts the exact file path from a Go compiler error
@@ -1345,14 +1663,13 @@ func (e *Engine) ProcessPlan(ctx context.Context, modelName string, objective st
 	}
 
 	isDirectMut := detectDirectMutation(objective, "") != nil
-	hasHighFlag := strings.Contains(objective, "--high") || strings.Contains(objective, "/intent high")
 
 	req := ai.Request{
 		Model: modelName,
 		Messages: []ai.Message{
 			{
 				Role:    "system",
-				Content: prompt.SelectPlanSystemPrompt(objective, hasHighFlag, e.UserName) + "\n\n" + SchemaJSONInstruction(),
+				Content: prompt.PlanSynthesisSystemPrompt(),
 			},
 			{
 				Role:    "user",
@@ -1370,6 +1687,9 @@ func (e *Engine) ProcessPlan(ctx context.Context, modelName string, objective st
 	resp, err := e.provider(ctx, req)
 	if err != nil {
 		return err
+	}
+	if resp == nil {
+		return fmt.Errorf("plan engine: provider returned a nil response")
 	}
 
 	return e.store.SaveRawMarkdown("plan", resp.Content)

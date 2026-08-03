@@ -33,10 +33,15 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/orchestrator"
+	"github.com/PizenLabs/izen/internal/patch"
+	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 	riview "github.com/PizenLabs/izen/internal/review"
+	"github.com/PizenLabs/izen/internal/router"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
 )
@@ -156,6 +161,12 @@ type planResultMsg struct {
 	Err         error
 	Handoff     HandoffContext // echoed back so the handler can populate PendingTodos
 	IsFastTrack bool           // if true, auto-approve plan — bypass approval gate
+	// TokenInput/TokenOutput are the provider-reported usage of the synthesis
+	// call, committed even when the response was truncated (finish_reason:
+	// "length"). The handler mirrors them into the session counters and the
+	// global status.Tracker so token metrics are never lost to truncation.
+	TokenInput  int
+	TokenOutput int
 }
 
 type agentStartMsg struct{ label string }
@@ -220,6 +231,16 @@ type mutationResultMsg struct {
 
 type applyAllResultMsg struct {
 	results []mutationResultMsg
+}
+
+// routerResultMsg carries the outcome of the Hybrid Intent Gateway
+// classification for a free-form prompt. It is produced by an async tea.Cmd
+// because the semantic fallback may invoke the LLM and must never block the
+// Bubble Tea event loop.
+type routerResultMsg struct {
+	line   string
+	result router.ClassificationResult
+	err    error
 }
 
 type shellOutputMsg struct {
@@ -651,6 +672,17 @@ type model struct {
 	pendingProposals     []SemanticProposal
 	acceptAll            bool
 
+	// Hybrid-intent-gateway confirmation: when the router classifies a
+	// free-form prompt with confidence below the threshold
+	// (ConfirmationRequirement), the UI freezes in StateAwaitingApproval and
+	// presents an interactive mode-selection prompt instead of acting on a
+	// blind guess. pendingRouteIdx is the highlighted option index.
+	pendingRouteConfirm bool
+	pendingRouteInput   string
+	pendingRouteResult  router.ClassificationResult
+	pendingRouteOptions []modes.Mode
+	pendingRouteIdx     int
+
 	// Accepted proposals (collapsed single-line summaries)
 	acceptedProposals []acceptedProposal
 
@@ -973,6 +1005,38 @@ type model struct {
 	// subscribes as a pure projection. Never nil after bootstrap.
 	bus *events.Bus
 
+	// Application-layer Runtime facade (RFC v1.0 section 1). The UI expresses
+	// every canonical user interaction as a RuntimeCommand executed through
+	// this facade and receives state changes as translated PresentationEvents.
+	// Nil only in headless/test harnesses that never construct a model.
+	rt *appruntime.Runtime
+	// pres is the presentation-layer command/event gateway bound to rt.
+	pres *presentation.Bridge
+	// presSink forwards runtime.PresentationEvents into the Bubble Tea event
+	// loop as presentationEventMsg. It must be closed on shutdown.
+	presSink *presentation.EventSink
+
+	// Hybrid intent gateway: the router package runs the deterministic fast
+	// path first and falls back to the semantic PromptIntentClassifier when no
+	// deterministic signal matches. Route() returns an optional
+	// ConfirmationRequirement at low confidence, surfaced as an interactive
+	// mode-selection prompt before dispatch. Nil when no provider is available
+	// (routes degenerate to the deterministic fast path only).
+	intentRouter *router.Router
+
+	// Execution orchestrator: maps logical phases (Idle/Ask/Investigate/Plan/
+	// Build/Review) onto the single WorkflowStateMachine, sharing the
+	// persistent RuntimeContext. Mode switches update the active phase without
+	// resetting conversation history or workspace artifacts. Nil only in
+	// headless/test harnesses that never construct a model.
+	orch *orchestrator.Orchestrator
+
+	// Patch engine: 4-tier pipeline (Tier 1 structured diff -> Tier 2
+	// SEARCH/REPLACE -> Tier 3 whole-file -> Tier 4 human approval) replacing
+	// the legacy build patch application. Emits PatchParsed/PatchValidated/
+	// PatchRejected/ApprovalRequested on the bus. Nil only in headless/tests.
+	patchEngine *patch.Engine
+
 	// Current effort level for generation
 	currentEffort EffortLevel
 }
@@ -1182,6 +1246,31 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			p.Attempts, selfHealOutputSuffix(p.Output))
 	case events.StageCompletedPayload:
 		m.logActivity("[stage] %s completed (%s)", p.Stage, p.Summary)
+	case events.IntentClassifiedPayload:
+		// Hybrid Intent Gateway classification outcome projected onto the
+		// activity log. Ambiguity is surfaced so the operator sees WHY the UI
+		// is asking for disambiguation instead of acting.
+		if p.ConfirmationRequired {
+			m.logActivity("[intent] ambiguous: /%s (%.0f%%, %s) — asking user", p.Intent, p.Confidence*100, p.Explanation)
+		} else {
+			m.logActivity("[intent] classified: /%s (%.0f%%, %s)", p.Intent, p.Confidence*100, p.Explanation)
+		}
+	case events.PhaseChangedPayload:
+		m.logActivity("[phase] %s → %s", p.From, p.To)
+	case events.PatchParsedPayload:
+		m.logActivity("[patch] parsed %s (strategy=%s, tier=%d)", p.File, p.Strategy, p.Tier)
+	case events.PatchValidatedPayload:
+		m.logActivity("[patch] validated %s (strategy=%s, tier=%d)", p.File, p.Strategy, p.Tier)
+	case events.PatchRejectedPayload:
+		m.logActivity("[patch] rejected %s (tier %d): %s", p.File, p.Tier, truncateForActivity(p.Reason))
+	case events.ApprovalRequestedPayload:
+		// Tier 4 Human-in-the-Loop fallback or gateway disambiguation surfaced
+		// as a distinct approval activity line.
+		target := p.Target
+		if target == "" {
+			target = "intent disambiguation"
+		}
+		m.logActivity("[approval] requested for %s: %s", target, truncateForActivity(p.Reason))
 	case events.ActivityPayload:
 		// Engine activity telemetry (retrieval/execution/investigate sinks)
 		// projected onto the UI goroutine through the bus.
@@ -1195,6 +1284,27 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// buffer (never the response pipeline); the terminal event collapses
 		// the box into compact mode.
 		m.handleReasoningStream(p.Chunk, p.IsComplete)
+	}
+}
+
+// handlePresentationEvent projects one Application-layer PresentationEvent
+// onto the view. This is the ONLY path the UI renders translated workflow
+// state: it consumes the decoupled payload (severity + summary + target) and
+// never inspects the original domain event. Only ever runs on the UI
+// goroutine, so all model mutation here is race-free.
+func (m *model) handlePresentationEvent(ev appruntime.PresentationEvent) {
+	switch ev.Severity {
+	case appruntime.SeveritySuccess:
+		m.logActivity("%s", successBannerStyle.Render(ev.Summary))
+	case appruntime.SeverityWarning:
+		m.logActivity("%s", warningBannerStyle.Render(ev.Summary))
+	case appruntime.SeverityError:
+		m.logActivity("%s", errorStyle.Render(ev.Summary))
+	default:
+		m.logActivity("%s", infoStyle.Render(ev.Summary))
+	}
+	if ev.Target != "" && ev.Target != ev.Summary {
+		m.logActivity("  %s", dimmedStyle.Render(ev.Target))
 	}
 }
 
@@ -1838,6 +1948,12 @@ func (m *model) flushPendingRecords() tea.Cmd {
 func (m *model) cleanShutdownCmd() tea.Cmd {
 	return func() tea.Msg {
 		execution.KillAllOrphans()
+		// Stop the presentation event projection so no more messages are
+		// forwarded into the (terminating) event loop.
+		if m.presSink != nil {
+			m.presSink.Close()
+			m.presSink = nil
+		}
 		if m.sess != nil {
 			m.sess.SetMode(m.resolver.Current())
 			m.sess.Purge()
@@ -1953,6 +2069,18 @@ func (m *model) refreshViewportContent() {
 			status = m.agentLabel
 		}
 		content.WriteString(sp + " " + infoStyle.Render(status) + "\n")
+	}
+
+	// ── Persisted collapsible thought block ────────────────────────────
+	// After streaming ends the reasoning block is no longer rendered inline by
+	// renderStreamingContent, so it is re-rendered here as a collapsed
+	// single-line summary ("▸ Thought for Xs (N tokens)"). The user can expand
+	// the full dimmed reasoning text with Ctrl+O / Alt+O at any time.
+	if !m.streaming && m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
+		if thoughts := m.renderLiveThinking(m.width); thoughts != "" {
+			content.WriteString(thoughts)
+			content.WriteString("\n")
+		}
 	}
 
 	// ── Activity Tree: structured tool call view ──────────────────────

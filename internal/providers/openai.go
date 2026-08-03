@@ -32,8 +32,10 @@ func (p *OpenAIProvider) Name() string {
 }
 
 type openaiMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role             string `json:"role"`
+	Content          string `json:"content"`
+	Reasoning        string `json:"reasoning,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type openaiRequest struct {
@@ -142,7 +144,8 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	content := ""
 	if openaiResp.Choices[0].Message != nil {
-		content = openaiResp.Choices[0].Message.Content
+		msg := openaiResp.Choices[0].Message
+		content = firstUsableContent(msg.Content, msg.Reasoning, msg.ReasoningContent)
 	}
 
 	tokenIn := 0

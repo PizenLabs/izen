@@ -10,6 +10,8 @@ type FlatPlanSpec struct {
 	Target      string `json:"target"`
 	Action      string `json:"action"`
 	TemplateKey string `json:"template_key,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 func ParseFlatPlanSpec(content string) (*FlatPlanSpec, error) {
@@ -67,10 +69,17 @@ func FlatSpecToTasks(spec *FlatPlanSpec) []Task {
 
 	description := fmt.Sprintf("%s %s", spec.Action, spec.Target)
 	solution := fmt.Sprintf("Completed %s on %s", spec.Action, spec.Target)
+	rationale := fmt.Sprintf("Flat plan spec: action=%s target=%s", spec.Action, spec.Target)
 
 	if spec.TemplateKey != "" {
 		description = fmt.Sprintf("Apply %s template to %s", spec.TemplateKey, spec.Target)
 		solution = fmt.Sprintf("Applied %s template to %s", spec.TemplateKey, spec.Target)
+	}
+	if spec.Description != "" {
+		description = spec.Description
+	}
+	if spec.Reason != "" {
+		rationale = spec.Reason
 	}
 
 	return []Task{{
@@ -80,7 +89,7 @@ func FlatSpecToTasks(spec *FlatPlanSpec) []Task {
 		Type:        taskType,
 		Target:      spec.Target,
 		Description: description,
-		Rationale:   fmt.Sprintf("Flat plan spec: action=%s target=%s", spec.Action, spec.Target),
+		Rationale:   rationale,
 		Solution:    solution,
 		IsHardcoded: true,
 	}}

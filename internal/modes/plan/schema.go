@@ -48,6 +48,12 @@ func ParseJSONPlan(content string) *JSONPlanValidationResult {
 
 	var plan PlanOutput
 	if err := json.Unmarshal([]byte(content), &plan); err != nil {
+		// Tolerant fallback before surfacing the error: a compact JSON array of
+		// {"action","target","reason"} specs (or an object with a renamed task
+		// key) is not a PlanOutput but is still a valid Mini-model plan.
+		if tasks, ok := tolerantTaskExtraction(content); ok && len(tasks) > 0 {
+			return &JSONPlanValidationResult{Tasks: tasks, Valid: true}
+		}
 		rawPreview := content
 		runes := []rune(rawPreview)
 		if len(runes) > 120 {
@@ -68,6 +74,13 @@ func ParseJSONPlan(content string) *JSONPlanValidationResult {
 	}
 
 	if len(plan.AtomicTasks) == 0 {
+		// Tolerant fallback: some Mini models emit a compact JSON array of
+		// {"action","target","reason"} specs or an object with a renamed task
+		// key instead of the full plan object. Accept the deviation before
+		// rejecting the payload.
+		if tasks, ok := tolerantTaskExtraction(content); ok && len(tasks) > 0 {
+			return &JSONPlanValidationResult{Tasks: tasks, Valid: true}
+		}
 		return &JSONPlanValidationResult{
 			Valid: false,
 			Error: "plan must contain at least one atomic_task",
@@ -129,6 +142,93 @@ func convertAtomicTasks(atomic []AtomicTask) []Task {
 	return tasks
 }
 
+// tolerantTaskExtraction returns tasks parsed from a compact deviation of the
+// strict plan schema: either a JSON array of {"action","target","reason"} specs
+// or a plan object carrying the task list under a renamed key ("tasks", "task").
+func tolerantTaskExtraction(content string) ([]Task, bool) {
+	if tasks, ok := parseFlatPlanArray(content); ok && len(tasks) > 0 {
+		return tasks, true
+	}
+	return parseTasksObject(content)
+}
+
+// parseFlatPlanArray attempts to parse content as a compact JSON array of
+// {"action","target","reason"} specs — the "Action, Target, Reason" output
+// form that Mini models reliably emit. It returns false when content is not
+// such an array or no spec yields a usable task. Converted tasks are marked
+// non-hardcoded because they originate from the LLM, not a deterministic path.
+func parseFlatPlanArray(content string) ([]Task, bool) {
+	content = strings.TrimSpace(content)
+	if !strings.HasPrefix(content, "[") {
+		return nil, false
+	}
+	var specs []FlatPlanSpec
+	if err := json.Unmarshal([]byte(content), &specs); err != nil {
+		return nil, false
+	}
+	if len(specs) == 0 {
+		return nil, false
+	}
+	tasks := make([]Task, 0, len(specs))
+	for i, spec := range specs {
+		ts := FlatSpecToTasks(&spec)
+		if len(ts) == 0 {
+			continue
+		}
+		t := ts[0]
+		t.StepNum = i + 1
+		t.IsHardcoded = false
+		tasks = append(tasks, t)
+	}
+	if len(tasks) == 0 {
+		return nil, false
+	}
+	return tasks, true
+}
+
+// parseTasksObject attempts to extract tasks from a plan object whose task
+// array appears under a non-canonical key ("tasks" or "task" instead of
+// "atomic_tasks"). Mini models frequently rename the container key; the
+// tolerant parser accepts the deviation.
+func parseTasksObject(content string) ([]Task, bool) {
+	content = strings.TrimSpace(content)
+	if !strings.HasPrefix(content, "{") {
+		return nil, false
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(content), &m); err != nil {
+		return nil, false
+	}
+	for _, key := range []string{"tasks", "task"} {
+		raw, ok := m[key]
+		if !ok {
+			continue
+		}
+		var specs []FlatPlanSpec
+		if err := json.Unmarshal(raw, &specs); err != nil {
+			continue
+		}
+		if len(specs) == 0 {
+			continue
+		}
+		tasks := make([]Task, 0, len(specs))
+		for i, spec := range specs {
+			ts := FlatSpecToTasks(&spec)
+			if len(ts) == 0 {
+				continue
+			}
+			t := ts[0]
+			t.StepNum = i + 1
+			t.IsHardcoded = false
+			tasks = append(tasks, t)
+		}
+		if len(tasks) > 0 {
+			return tasks, true
+		}
+	}
+	return nil, false
+}
+
 func mapStrategyToType(strategy string) string {
 	switch strings.ToUpper(strategy) {
 	case "ATOMIC_REPLACE", "DIFF_PATCH", "FILE_MUTATE":
@@ -157,6 +257,13 @@ func mapStrategyToType(strategy string) string {
 // structural noise from crashing the /plan parser. It must be resilient enough
 // that a local 7B model's truncated output still produces a valid JSON plan.
 func sanitizeJSONContent(content string) string {
+	content = strings.TrimSpace(content)
+
+	// 0. Strip reasoning delimiters first: Mini/reasoning models wrap the
+	// answer in <think>/<thought> blocks or embed reasoning sentinels even
+	// inside the content field. Consume them before any structural parsing so
+	// the JSON payload is clean.
+	content = stripPlanThinkTags(content)
 	content = strings.TrimSpace(content)
 
 	// 1. Strip markdown code fences (handle nested fences too).
@@ -253,12 +360,77 @@ func sanitizeJSONContent(content string) string {
 		content = extractJSONObject(content)
 	}
 
+	// 3b. Repair unescaped newlines inside JSON string values. Mini models
+	// frequently emit literal line breaks inside a string (e.g. a multi-line
+	// description) which makes the payload invalid JSON; escaping them
+	// restores parseability.
+	content = repairUnescapedNewlines(content)
+
 	// 4. Auto-close truncated JSON structures (missing closing brackets).
 	// This recovers from premature cut-off where the model hit its token
 	// limit mid-JSON, appending } and ] in the correct nesting order.
 	content = autoCloseJSON(content)
 
 	return content
+}
+
+// repairUnescapedNewlines escapes literal \n and \r bytes that appear inside
+// quoted JSON string values. Models sometimes emit raw newlines inside a
+// string instead of the \n escape sequence, which makes the payload invalid
+// JSON. Escaped sequences (backslash + n) and whitespace between JSON tokens
+// are left untouched.
+func repairUnescapedNewlines(s string) string {
+	if !strings.ContainsAny(s, "\n\r") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 16)
+	inStr := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if escaped {
+			b.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			b.WriteByte(ch)
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			b.WriteByte(ch)
+			continue
+		}
+		if inStr && (ch == '\n' || ch == '\r') {
+			b.WriteString("\\n")
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return b.String()
+}
+
+// stripPlanThinkTags removes <think>/</think> and <thought>/</thought>
+// delimiters plus the reasoning sentinel from a plan payload. Reasoning models
+// frequently emit the whole answer inside thinking blocks; the tags must be
+// consumed before JSON parsing so the payload text is clean. Replacement is
+// applied iteratively so nested or repeated marker pairs are all removed.
+func stripPlanThinkTags(s string) string {
+	s = strings.ReplaceAll(s, "\x00RSNG\x00", "")
+	for {
+		stripped := s
+		s = strings.Replace(s, "<think>", "", 1)
+		s = strings.Replace(s, "</think>", "", 1)
+		s = strings.Replace(s, "<thought>", "", 1)
+		s = strings.Replace(s, "</thought>", "", 1)
+		if s == stripped {
+			break
+		}
+	}
+	return strings.TrimSpace(s)
 }
 
 // stripTrailingComment removes a trailing // comment from a JSON line while
@@ -436,50 +608,22 @@ func closeUnterminatedString(s string) string {
 }
 
 func SchemaJSONInstruction() string {
-	return `You MUST output ONLY a single raw JSON object — NO markdown fences, NO // comments, NO extra text — with this EXACT schema:
+	return `You MUST output ONLY a single raw JSON object — NO markdown fences, NO // comments, NO <think> blocks, NO extra text — with this EXACT schema:
 
 {
-  "context_anchor": {
-    "source": "origin of this plan (e.g. user-request, diagnose-ledger)",
-    "target_packages": ["package1", "package2"]
-  },
+  "context_anchor": {"source": "origin of this plan (e.g. user-request, diagnose-ledger)", "target_packages": ["package1", "package2"]},
   "architectural_strategy": "One-sentence summary of the architectural approach",
-  "strategic_overview": {
-    "root_core_factor": "Brief sentence identifying the fundamental root cause driving this plan",
-    "impact_domain": "Architectural layer or subsystem affected",
-    "risk_evaluation": "Risk classification: Critical / High / Medium / Low",
-    "verification_vector": "How correctness will be verified (build, test, lint, etc.)"
-  },
   "atomic_tasks": [
-    {
-      "task_id": 1,
-      "file": "relative/path/to/file.go or shell command",
-      "strategy": "ATOMIC_REPLACE",
-      "description": "Brief title of the task",
-      "rationale": "Why this task is necessary — the architectural or technical reason",
-      "solution": "What the expected end state looks like after this task completes"
-    }
+    {"task_id": 1, "file": "relative/path/to/file.go or shell command", "strategy": "ATOMIC_REPLACE", "description": "Brief title of the task", "rationale": "Why this task is necessary", "solution": "Expected end state after this task"}
   ]
 }
 
 RULES:
-1. Output ONLY the JSON object. No introductory text, no markdown, no code fences, no // comments.
-2. context_anchor.source must identify where this plan originated.
-3. context_anchor.target_packages lists all packages affected.
-4. architectural_strategy is a single concise sentence.
-5. strategic_overview.root_core_factor is a brief sentence identifying the fundamental root cause.
-6. strategic_overview provides the architectural impact domain, risk classification, and verification strategy.
-7. atomic_tasks must have at least one entry. Each entry must have all fields.
-8. strategy must be one of: ATOMIC_REPLACE, DIFF_PATCH, SHELL_EXEC, GIT_ACTION.
-9. file paths must be relative to project root.
-10. task_id values must be sequential integers starting at 1.
-11. SHELL_EXEC is REQUIRED (not forbidden) when the investigation root cause is a
-    compilation or dependency error: emit an exact command such as
-    "go get <package>" or "go mod tidy". NEVER patch documentation files
-    (README.md, docs/, CHANGELOG, etc.) to work around build failures — resolve
-    the dependency via SHELL_EXEC or mutate go.mod instead.
-12. If a file has severe syntax/AST errors, strategy MUST be "ATOMIC_REPLACE" (complete file override).
-13. Documentation files (README.md, *.md docs, LICENSE, CONTRIBUTING.md, SECURITY.md,
-    CODE_OF_CONDUCT.md) are PROHIBITED targets under every strategy.
-14. For every atomic_task, provide both rationale (the technical reason) and solution (expected end state).`
+1. Output ONLY the JSON object. No intro, no markdown, no code fences, no comments.
+2. atomic_tasks must have at least one entry; task_id values are sequential integers starting at 1.
+3. strategy must be one of: ATOMIC_REPLACE, DIFF_PATCH, FILE_MUTATE, SHELL_EXEC, GIT_ACTION.
+4. file paths must be relative to project root; for SHELL_EXEC the file field holds the exact runnable command.
+5. SHELL_EXEC is REQUIRED (not forbidden) when the investigation root cause is a compilation or dependency error: emit an exact command such as "go get <package>" or "go mod tidy". NEVER patch documentation files (README.md, docs/, CHANGELOG, etc.) to work around build failures.
+6. Documentation files (README.md, *.md docs, LICENSE, CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md) are PROHIBITED targets under every strategy.
+7. For every atomic_task, provide both rationale (the technical reason) and solution (expected end state).`
 }

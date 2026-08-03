@@ -125,6 +125,7 @@ func (m *model) switchProvider(name string) tea.Cmd {
 
 	if m.planEngine != nil {
 		m.planEngine.SetProvider(m.provider.Execute)
+		m.planEngine.SetStreamProvider(m.provider.ExecuteStream)
 	}
 
 	m.push(roleSystem, fmt.Sprintf("[✓] Provider switched: %s → %s", oldName, name))

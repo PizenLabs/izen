@@ -190,6 +190,50 @@ func TestSynthesizeBuildTodosFromMutation_Empty(t *testing.T) {
 	}
 }
 
+func TestHasMutationIntent_FrontendUIGuard(t *testing.T) {
+	cases := []struct {
+		content string
+		want    bool
+	}{
+		// UI creation / rewrite intents MUST NOT be treated as mutations —
+		// "write" is a substring of "rewrite", which previously misrouted
+		// these to /build instead of /plan.
+		{"Please rewrite for me a personal profile website", false},
+		{"rewrite my portfolio website", false},
+		{"create a landing page with CSS", false},
+		{"fix the layout of the homepage", false},
+		// Genuine mutations still classify as such.
+		{"add error handling to the payment service", true},
+		{"implement the login handler", true},
+		{"write unit tests for the parser", true},
+	}
+	for _, tc := range cases {
+		if got := hasMutationIntent(tc.content); got != tc.want {
+			t.Errorf("hasMutationIntent(%q) = %v, want %v", tc.content, got, tc.want)
+		}
+	}
+}
+
+func TestHasExecutableBuildTarget(t *testing.T) {
+	m := &model{handoffCtx: HandoffContext{}}
+
+	// No file paths, no pending todos → NOT ready for /build.
+	if hasExecutableBuildTarget("implement the login handler", m) {
+		t.Error("expected false for bare mutation intent with no file refs")
+	}
+
+	// Explicit @file path refs → ready for /build.
+	if !hasExecutableBuildTarget("add error handling to @handler.go", m) {
+		t.Error("expected true for mutation intent with explicit @file ref")
+	}
+
+	// Actionable pending todos staged (e.g. from /plan approval) → ready.
+	m.handoffCtx.PendingTodos = []string{"[FILE_MUTATE] handler.go — add error handling"}
+	if !hasExecutableBuildTarget("implement the login handler", m) {
+		t.Error("expected true when actionable pending todos exist")
+	}
+}
+
 func TestBuildMutationHandoffPayload(t *testing.T) {
 	todos := []string{
 		"\uf05c [FILE_MUTATE] index.html — Create main HTML page",

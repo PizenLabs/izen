@@ -9,15 +9,22 @@ import (
 
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/investigate"
 )
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// ── GLOBAL: Alt+O toggles reasoning block visibility ────────────
+	// The unified ThinkingBuffer (event-driven thought block) takes priority;
+	// the legacy ThinkingPanel is only toggled when no event-driven block is
+	// active (e.g. legacy build fast-track reasoning).
 	if msg.String() == "alt+o" {
-		if m.thinkingPanel != nil {
+		if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
+			m.thinkingBuffer.Toggle()
+			m.showReasoning = m.thinkingBuffer.Expanded()
+		} else if m.thinkingPanel != nil {
 			m.thinkingPanel.Toggle()
+			m.showReasoning = m.thinkingPanel.Expanded()
 		}
-		m.showReasoning = m.thinkingPanel != nil && m.thinkingPanel.Expanded()
 		m.refreshViewportContent()
 		if m.Ready && !m.userIsScrollingUp {
 			m.Viewport.GotoBottom()
@@ -25,11 +32,20 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// ── GLOBAL: Ctrl+O cycles through all foldable log entries ──
-	// Each press expands the next entry, collapsing the previous one.
-	// When no entry is expanded, the first entry is expanded.
-	// Pressing Ctrl+O again cycles to the next entry.
+	// ── GLOBAL: Ctrl+O toggles the active thought block ──────────────
+	// Expands/collapses the reasoning block for the currently active message
+	// (ThinkingBuffer). When no thought block is active, falls back to cycling
+	// through the foldable build-log entries (legacy behavior).
 	if msg.Type == tea.KeyCtrlO {
+		if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
+			m.thinkingBuffer.Toggle()
+			m.showReasoning = m.thinkingBuffer.Expanded()
+			m.refreshViewportContent()
+			if m.Ready && !m.userIsScrollingUp {
+				m.Viewport.GotoBottom()
+			}
+			return m, nil
+		}
 		if m.logStore != nil {
 			newID := m.logStore.ToggleCycle()
 			if newID >= 0 {
@@ -90,7 +106,27 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.handoffCtx.ProposedFix = handoffContent
 		m.handoffLedgerContent = handoffContent
 
-		m.push(roleSystem, infoStyle.Render("Handing off /ask Context Ledger to /investigate..."))
+		// ── INTENT-BASED /ask HANDOFF BYPASS ───────────────────────────
+		// FRONTEND_UI and code-generation/rewrite prompts add ZERO diagnostic
+		// value to /investigate: the engine short-circuits them in 0s with an
+		// "Inconclusive" result while injecting forensic overhead into the TUI
+		// and context ledger. Bypass the engine and transition directly to
+		// /plan (UI/layout tasks) or /build (code mutation).
+		intent := investigate.ClassifyIntent(handoffContent)
+		if intent.IsFrontendUI() {
+			m.handoffLedgerContent = "frontend ui intent detected — hand off to plan"
+			m.handoffCtx.ProposedFix = handoffContent
+			m.modeChangeAuthorized = true
+			m.currentResult = nil
+			return m, m.setMode(modes.ModePlan)
+		}
+		if hasMutationIntent(handoffContent) && hasExecutableBuildTarget(handoffContent, m) {
+			m.handoffCtx.PendingTodos = synthesizeBuildTodosFromMutation(handoffContent)
+			m.modeChangeAuthorized = true
+			m.currentResult = nil
+			return m, m.setMode(modes.ModeBuild)
+		}
+
 		// Transition mode to /investigate (clean transition)
 		m.modeChangeAuthorized = true
 		m.currentResult = nil
@@ -203,6 +239,34 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// ── Awaiting approval ────────────────────────────────────────────
 	if m.state == StateAwaitingApproval {
+		// ── Hybrid Intent Gateway mode-selection prompt ─────────────
+		// The router classified the prompt with confidence below the policy
+		// threshold. Digits select a mode directly, ←/→ cycle the highlight,
+		// Enter confirms the highlighted mode, Esc falls back to /ask.
+		if m.pendingRouteConfirm && len(m.pendingRouteOptions) > 0 {
+			switch msg.String() {
+			case "1", "2", "3", "4", "5":
+				idx := int(msg.String()[0] - '1')
+				if idx >= 0 && idx < len(m.pendingRouteOptions) {
+					m.pendingRouteIdx = idx
+					m.refreshViewportContent()
+					return m, m.confirmRouteSelection(m.pendingRouteOptions[idx])
+				}
+			case "left":
+				m.pendingRouteIdx = (m.pendingRouteIdx - 1 + len(m.pendingRouteOptions)) % len(m.pendingRouteOptions)
+				m.refreshViewportContent()
+				return m, nil
+			case "right":
+				m.pendingRouteIdx = (m.pendingRouteIdx + 1) % len(m.pendingRouteOptions)
+				m.refreshViewportContent()
+				return m, nil
+			case "enter":
+				return m, m.confirmRouteSelection(m.pendingRouteOptions[m.pendingRouteIdx])
+			case "esc":
+				return m, m.cancelRouteSelection()
+			}
+		}
+
 		// ── Effort Selector (←/→) ────────────────────────────────────
 		if msg.Type == tea.KeyLeft {
 			if m.currentEffort > EffortAuto {
@@ -261,6 +325,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					func() tea.Msg { return agentStartMsg{label: "hotfix apply"} },
 					m.applyHotfixPatch(task, patch),
 					m.smoothStreamTickCmd(),
+					m.runtimeApproveCmd(patch.File),
 				)
 
 			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
@@ -284,7 +349,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
-				return m, nil
+				return m, m.runtimeRejectCmd(rejectedPath, "hotfix rejected by developer")
 			}
 			return m, nil
 		}
@@ -306,6 +371,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
 					m.runBuildShellExec(task),
 					m.smoothStreamTickCmd(),
+					m.runtimeApproveCmd(task.Target),
 				)
 
 			case msg.String() == "alt+l":
@@ -323,6 +389,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
 					m.runBuildShellExec(task),
 					m.smoothStreamTickCmd(),
+					m.runtimeApproveCmd(task.Target),
 				)
 
 			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
@@ -349,7 +416,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					task.Target))
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
-				return m, nil
+				return m, m.runtimeRejectCmd(task.Target, "shell execution rejected")
 			}
 			return m, nil
 		}
@@ -383,7 +450,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// ── File-mutation proposal approval ─────────────────────────
 		switch {
 		case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
-			return m, m.applySingleProposal()
+			proposalID := ""
+			if len(m.pendingProposals) > 0 {
+				proposalID = m.pendingProposals[0].ID
+			}
+			return m, tea.Batch(m.applySingleProposal(), m.runtimeApproveCmd(proposalID))
 		case msg.String() == "alt+l":
 			m.acceptAll = true
 			return m, m.applyAllProposals()
@@ -428,7 +499,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.pendingProposals = nil
 			m.acceptAll = false
 			m.push(roleSystem, infoStyle.Render("changes rejected"))
-			return m, nil
+			return m, m.runtimeRejectCmd("proposal", "changes rejected")
 		}
 		return m, nil
 	}
@@ -446,7 +517,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.streamCancel()
 			m.streamCancel = nil
 			m.interruptRequested = true
-			return m, func() tea.Msg { return TaskFinishedMsg{} }
+			// ── APPLICATION-LAYER COMMAND RECORD ──────────────────────
+			// The interruption is routed through the Runtime facade as a
+			// CancelCmd so the canonical command/event contract observes it.
+			return m, tea.Batch(
+				func() tea.Msg { return TaskFinishedMsg{} },
+				m.runtimeCancelCmd("stream interrupted"),
+			)
 		}
 		if m.proposedShellCmd != "" {
 			m.proposedShellCmd = ""
@@ -476,7 +553,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			execution.KillAllOrphans()
 			m.cancelAllBackgroundContexts()
 			m.push(roleSystem, infoStyle.Render("Interrupted."))
-			return m, func() tea.Msg { return TaskFinishedMsg{} }
+			// ── APPLICATION-LAYER COMMAND RECORD ──────────────────────
+			// The hard interrupt is routed through the Runtime facade as a
+			// CancelCmd so the canonical command/event contract observes it.
+			return m, tea.Batch(
+				func() tea.Msg { return TaskFinishedMsg{} },
+				m.runtimeCancelCmd("ctrl-c interrupt"),
+			)
 		}
 		m.ti.SetValue("")
 		m.ti.Reset()
@@ -531,6 +614,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 			m.streamStartTime = time.Now()
 			cmd := m.handleInput(userInput)
+			// ── APPLICATION-LAYER COMMAND RECORD ──────────────────────
+			// The same submission is routed through the Runtime facade as a
+			// SubmitPromptCmd so the canonical command/event contract observes
+			// it. Nil-safe when no runtime is wired.
+			cmd = tea.Batch(cmd, m.runtimeSubmitCmd(userInput))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return m, cmd

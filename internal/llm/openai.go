@@ -65,14 +65,17 @@ type openAIChoice struct {
 }
 
 type openAIMsgContent struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role             string `json:"role"`
+	Content          string `json:"content"`
+	Reasoning        string `json:"reasoning,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type openAIDelta struct {
 	Role             string `json:"role,omitempty"`
 	Content          string `json:"content,omitempty"`
 	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Reasoning        string `json:"reasoning,omitempty"`
 }
 
 type openAIUsage struct {
@@ -171,7 +174,8 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 
 	content := ""
 	if openaiResp.Choices[0].Message != nil {
-		content = openaiResp.Choices[0].Message.Content
+		msg := openaiResp.Choices[0].Message
+		content = usableContent(msg.Content, msg.Reasoning, msg.ReasoningContent)
 	}
 	content = SanitizeOutput(content)
 
@@ -254,6 +258,7 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	}
 
 	var full strings.Builder
+	var reasoning strings.Builder
 	tokenIn, tokenOut, cacheRead := 0, 0, 0
 	var cost float64
 	reader := newOpenAIStreamReader(resp.Body)
@@ -280,10 +285,18 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil {
 			delta := chunk.Choices[0].Delta
 			// Reasoning content (thinking process) is routed to the reasoning
-			// pipeline only — it is never appended to the visible response.
-			if delta.ReasoningContent != "" {
+			// pipeline only — it is never appended to the visible response. It
+			// is also retained so a reasoning-only stream (empty content) can
+			// fall back to the thinking text instead of yielding an empty
+			// response.
+			reasoningText := delta.ReasoningContent
+			if reasoningText == "" {
+				reasoningText = delta.Reasoning
+			}
+			if reasoningText != "" {
+				reasoning.WriteString(reasoningText)
 				if req.ReasoningHandler != nil {
-					if err := req.ReasoningHandler(delta.ReasoningContent); err != nil {
+					if err := req.ReasoningHandler(reasoningText); err != nil {
 						_ = resp.Body.Close()
 						return LLMResponse{}, err
 					}
@@ -301,8 +314,14 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		}
 	}
 
+	content := full.String()
+	if strings.TrimSpace(content) == "" {
+		// Reasoning fallback: the model emitted only thinking content.
+		content = stripThinkingTags(reasoning.String())
+	}
+
 	llmResp := LLMResponse{
-		Content:         SanitizeOutput(full.String()),
+		Content:         SanitizeOutput(content),
 		TokenInput:      tokenIn,
 		TokenOutput:     tokenOut,
 		CacheReadTokens: cacheRead,

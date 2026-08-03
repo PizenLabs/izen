@@ -76,9 +76,9 @@ func TestThinkingStyleIsDimGray(t *testing.T) {
 	}
 }
 
-// TestThinkingBufferCompactThoughtUsesThinkingStyle guards the "Thought: X.Xs"
-// compact line: it must render through the dimmed reasoning style, never the
-// normal answer style.
+// TestThinkingBufferCompactThoughtUsesThinkingStyle guards the
+// "▸ Thought for Xs (N tokens)" compact summary line: it must render through
+// the dimmed reasoning style, never the normal answer style.
 func TestThinkingBufferCompactThoughtUsesThinkingStyle(t *testing.T) {
 	tb := NewThinkingBuffer()
 	tb.Append("analyze failure")
@@ -88,8 +88,11 @@ func TestThinkingBufferCompactThoughtUsesThinkingStyle(t *testing.T) {
 		return tb.Render(80, true, "✦")
 	}
 	out := renderFn()
-	if !strings.Contains(out, "Thought:") {
-		t.Fatalf("compact line missing Thought: %q", out)
+	if !strings.Contains(out, "Thought for") {
+		t.Fatalf("compact line missing Thought for: %q", out)
+	}
+	if !strings.Contains(out, "tokens)") {
+		t.Fatalf("compact line missing token count: %q", out)
 	}
 	if !thinkingStyle.GetFaint() {
 		t.Error("compact thought line must carry the dim reasoning style")

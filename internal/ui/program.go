@@ -31,9 +31,15 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/orchestrator"
+	"github.com/PizenLabs/izen/internal/patch"
+	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/internal/router"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
+	compose "github.com/PizenLabs/izen/internal/runtime/compose"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
@@ -42,6 +48,25 @@ import (
 
 // NewProgram initializes the active model state context and instantiates the runner engine.
 func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.Manager, localCfg *config.LocalConfig, det ...project.Detection) *tea.Program {
+	// Default wiring: the presentation layer builds its own Application stack
+	// (shared bus + runtime facade). The composition root may instead build the
+	// stack explicitly and pass it via NewProgramWithApp.
+	app, err := compose.Wire()
+	if err != nil {
+		panic(fmt.Sprintf("izen: wire application layer: %v", err))
+	}
+	return NewProgramWithApp(root, cfg, sess, mgr, localCfg, app, det...)
+}
+
+// NewProgramWithApp initializes the model bound to an externally wired
+// Application layer (RFC v1.0 section 1). The shared bus in app is the single
+// event bus every engine publishes onto, and app.Runtime is the single entry
+// point the presentation layer drives. Nil app degrades to a plain
+// NewProgram.
+func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, mgr *ai.Manager, localCfg *config.LocalConfig, app *compose.Application, det ...project.Detection) *tea.Program {
+	if app == nil {
+		return NewProgram(root, cfg, sess, mgr, localCfg, det...)
+	}
 	detection := project.Detection{}
 	if len(det) > 0 {
 		detection = det[0]
@@ -68,13 +93,17 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	planEng.SetUserName(userName)
 	if provider != nil {
 		planEng.SetProvider(provider.Execute)
+		planEng.SetStreamProvider(provider.ExecuteStream)
 	}
 
 	// ── EVENT BUS ──────────────────────────────────────────────────────────
 	// The single in-process event bus. The mode engines publish domain events
 	// headlessly (never calling UI routines directly); the UI subscribes below
-	// and acts purely as a projection of the event stream.
-	eventBus := events.NewBus(events.DefaultBufferSize)
+	// and acts purely as a projection of the event stream. It is the shared
+	// bus wired by the Application layer so the Runtime facade observes the
+	// same stream the engines publish onto.
+	eventBus := app.Bus
+	presenter := presentation.New(app.Runtime)
 
 	var detectedLang language.ID
 	if detection.Primary != nil {
@@ -194,6 +223,47 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	wcc := control.NewWorkflowCheckpointManager(execEng.Checkpoints, root)
 	workflowSM.WithCheckpointCoordinator(workflow.NewCheckpointCoordinator(wcc))
 
+	// ── HYBRID INTENT GATEWAY ────────────────────────────────────────────
+	// The new router package runs the deterministic fast path FIRST and only
+	// falls back to the semantic IntentClassifier (a provider-backed
+	// PromptIntentClassifier adapted via LLMClassifyFunc) when no deterministic
+	// signal matches. It depends solely on the abstract IntentClassifier and
+	// the event bus — no concrete provider is imported here.
+	var intentRouter *router.Router
+	if provider != nil {
+		intentRouter = router.NewRouter(
+			router.NewPromptIntentClassifier(func(ctx context.Context, systemPrompt, userInput string) (string, error) {
+				resp, err := provider.Execute(ctx, ai.Request{
+					System:         systemPrompt,
+					Messages:       []ai.Message{{Role: "user", Content: userInput}},
+					MaxTokens:      64,
+					Temperature:    0.0,
+					ResponseFormat: &ai.ResponseFormat{Type: "json_object"},
+				})
+				if err != nil {
+					return "", err
+				}
+				return resp.Content, nil
+			}),
+			nil,
+		).WithEventBus(eventBus)
+	}
+
+	// ── EXECUTION ORCHESTRATOR ───────────────────────────────────────────
+	// The orchestrator maps the logical execution phases onto the single
+	// WorkflowStateMachine while sharing the persistent RuntimeContext created
+	// above. Mode switches update the active phase dynamically WITHOUT
+	// resetting conversation history or workspace artifacts (the RuntimeContext
+	// is never replaced). Phase changes are observed via EventPhaseChanged.
+	orch := orchestrator.New(workflowSM, runtimeCtx).WithEventBus(eventBus)
+
+	// ── MULTI-TIER PATCH ENGINE ──────────────────────────────────────────
+	// The new patch engine replaces the legacy patch application pipeline in
+	// the /build flow: Tier 1 (structured diff) -> Tier 2 (SEARCH/REPLACE) ->
+	// Tier 3 (whole-file rewrite) -> Tier 4 (human approval). It emits
+	// PatchParsed/PatchValidated/PatchRejected/ApprovalRequested on the bus.
+	patchEng := patch.NewEngine().WithEventBus(eventBus)
+
 	// ── AUTHORIZATION ENGINE ───────────────────────────────────────────────
 	// Production AuthorizationEngine wired with a no-op source hash verifier
 	// and a checkpoint checker that inspects .izen/checkpoints/ on disk.
@@ -242,6 +312,11 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 		viewRegistry:        reg,
 		logStore:            NewLogStore(),
 		bus:                 eventBus,
+		rt:                  app.Runtime,
+		pres:                presenter,
+		intentRouter:        intentRouter,
+		orch:                orch,
+		patchEngine:         patchEng,
 		toolCallBuffer:      execution.NewToolCallBuffer(root),
 		thinkingPanel:       NewThinkingPanel(),
 		liveCodePreview:     NewLiveCodePreview(),
@@ -303,6 +378,18 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
+	// ── PRESENTATION EVENT PROJECTION SUBSCRIPTION ────────────────────────
+	// The Application layer translates the engine domain events into
+	// UI-ready PresentationEvents and forwards them here. The view updates
+	// strictly from those payloads (presentationEventMsg); the direct domain
+	// subscriptions below are kept ONLY for the rich engine event types the
+	// translator intentionally leaves to the UI (engine telemetry, reasoning
+	// streams, intent disambiguation, and approval prompts).
+	m.presSink = presentation.NewEventSink(p, app.Runtime, func(ev appruntime.PresentationEvent) tea.Msg {
+		return presentationEventMsg{ev: ev}
+	})
+	app.Runtime.Start()
+
 	// ── EVENT BUS PROJECTION SUBSCRIPTION ───────────────────────────────
 	// The UI is a pure projection: every domain event published by the headless
 	// engines is forwarded into the Bubble Tea event loop as a domainEventMsg
@@ -311,18 +398,11 @@ func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.
 	// Subscriptions happen after the program exists because nothing runs before
 	// p.Run(); any event published before then is simply dropped (non-blocking).
 	for _, typ := range []string{
-		events.EventCommandReceived,
-		events.EventIntentParsed,
-		events.EventPlanStaged,
 		events.EventPatchAttempted,
-		events.EventPatchApplied,
-		events.EventExecutionFailed,
-		events.EventStageCompleted,
-		events.EventSelfHealingAttempt,
-		events.EventSelfHealingExhausted,
-		events.EventActivity,
 		events.EventEngineTelemetry,
 		events.EventReasoningStream,
+		events.EventIntentClassified,
+		events.EventApprovalRequested,
 	} {
 		eventBus.Subscribe(typ, func(ev events.DomainEvent) {
 			p.Send(domainEventMsg{ev: ev})
@@ -469,6 +549,19 @@ func runProgram(p *tea.Program, root string, graphEng *graph.Engine, initStage i
 }
 
 func RunMainDashboard(cfg *config.Config, root string, localCfg *config.LocalConfig, det ...project.Detection) {
+	app, err := compose.Wire()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "izen: wire application layer: %v\n", err)
+		os.Exit(1)
+	}
+	RunMainDashboardWithApp(cfg, root, localCfg, app, det...)
+}
+
+// RunMainDashboardWithApp is the composition-root entry point: it launches the
+// main TUI dashboard bound to an externally wired Application layer (shared
+// bus + Runtime facade). The runtime is injected into the presentation layer
+// here, satisfying the RFC single-entry-point invariant.
+func RunMainDashboardWithApp(cfg *config.Config, root string, localCfg *config.LocalConfig, app *compose.Application, det ...project.Detection) {
 	sess, mgr, router := bootCommon(root, cfg)
 	_ = router // router is registered globally via SetGlobalRouter
 
@@ -491,7 +584,7 @@ func RunMainDashboard(cfg *config.Config, root string, localCfg *config.LocalCon
 		initStage = initNone
 	}
 
-	p := NewProgram(root, cfg, sess, mgr, localCfg, detection)
+	p := NewProgramWithApp(root, cfg, sess, mgr, localCfg, app, detection)
 	runProgram(p, root, graphEng, initStage)
 }
 

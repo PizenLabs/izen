@@ -16,16 +16,20 @@ import (
 // response pipeline), so thinking content is structurally incapable of mixing
 // with or corrupting the final answer.
 //
-// While the reasoning block is still streaming it renders an auto-scrolling
-// dimmed/italic box with a "│ Thinking…" gutter; the moment the terminal
-// IsComplete event arrives it collapses to a single compact line
-// ("Thought: 1.2s").
+// The block is collapsible: by default (IsThinkingExpanded = false) it renders
+// a compact one-line widget — a "Thinking.. (Xs)" spinner while the reasoning
+// block is still streaming, collapsing to a "▸ Thought for Xs (N tokens)"
+// summary once it completes. Toggling expansion (Ctrl+O / Alt+O) renders the
+// full reasoning text in a subtle dimmed/italic box.
 type ThinkingBuffer struct {
 	mu       sync.Mutex
 	builder  strings.Builder
 	complete bool
 	started  time.Time
 	maxLines int
+	// expanded is the IsThinkingExpanded state: false (default) renders the
+	// compact spinner/summary line, true renders the full dimmed reasoning box.
+	expanded bool
 }
 
 // NewThinkingBuffer constructs an empty reasoning buffer.
@@ -68,6 +72,27 @@ func (tb *ThinkingBuffer) Complete() bool {
 	return tb.complete
 }
 
+// Toggle flips the IsThinkingExpanded state of the thought block.
+func (tb *ThinkingBuffer) Toggle() {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.expanded = !tb.expanded
+}
+
+// SetExpanded forces the IsThinkingExpanded state of the thought block.
+func (tb *ThinkingBuffer) SetExpanded(v bool) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.expanded = v
+}
+
+// Expanded reports the IsThinkingExpanded state of the thought block.
+func (tb *ThinkingBuffer) Expanded() bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.expanded
+}
+
 // Len returns the number of reasoning bytes accumulated.
 func (tb *ThinkingBuffer) Len() int {
 	tb.mu.Lock()
@@ -88,6 +113,7 @@ func (tb *ThinkingBuffer) Reset() {
 	defer tb.mu.Unlock()
 	tb.builder.Reset()
 	tb.complete = false
+	tb.expanded = false
 	tb.started = time.Now()
 }
 
@@ -98,15 +124,28 @@ func (tb *ThinkingBuffer) Elapsed() time.Duration {
 	return time.Since(tb.started)
 }
 
+// estimateTokens is a cheap deterministic proxy for "N tokens" in the compact
+// summary line. It is display-only and never used for billing/accounting.
+func estimateTokens(text string) int {
+	t := len(text) / 4
+	if t < 1 {
+		t = 1
+	}
+	return t
+}
+
 // Render produces the thinking block. It returns "" when there is nothing to
-// show. While streaming (streaming=true and not complete) it renders an
-// auto-scrolling dimmed/italic box bounded to maxLines; once the reasoning
-// block is complete (or the stream is over) it collapses to a single compact
-// line: "Thought: 1.2s".
+// show. When the block is collapsed (the default), it renders a compact
+// one-line widget: "Thinking.. (Xs)" while the reasoning block is still
+// streaming, collapsing to "▸ Thought for Xs (N tokens)" once complete (or the
+// stream is over). When expanded (IsThinkingExpanded), it renders the full
+// reasoning text in a dimmed/italic box — auto-scrolling to the tail while
+// streaming, showing the reasoning bounded to maxLines once complete.
 func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) string {
 	tb.mu.Lock()
 	content := tb.builder.String()
 	complete := tb.complete
+	expanded := tb.expanded
 	elapsed := time.Since(tb.started)
 	tb.mu.Unlock()
 
@@ -114,57 +153,69 @@ func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) stri
 		return ""
 	}
 
-	// ── Compact mode (IsComplete or stream over) ─────────────────────────
-	if complete || !streaming {
-		return thinkingStyle.Render(fmt.Sprintf("Thought: %s", formatElapsed(elapsed)))
-	}
-
-	if width < 40 {
-		width = 40
-	}
-
-	availWidth := width - 6
-	if availWidth < 10 {
-		availWidth = 10
-	}
-
-	// Sanitize before wrapping so reasoning text with literal \n / \t / \"
-	// escapes expands to real characters (idempotent — safe on every tick).
-	content = sanitizeText(content)
-
-	// Auto-scroll: keep only the most recent maxLines worth of lines so the
-	// box tracks the tail of the reasoning stream.
-	lines := strings.Split(content, "\n")
-	var displayed []string
-	if len(lines) > tb.maxLines {
-		lines = lines[len(lines)-tb.maxLines:]
-	}
-	for _, line := range lines {
-		line = strings.TrimRight(line, " \r")
-		if line == "" {
-			displayed = append(displayed, "")
-			continue
-		}
-		displayed = append(displayed, wrapString(line, availWidth)...)
-	}
-
 	elapsedStr := formatElapsed(elapsed)
 
-	linesOut := make([]string, 0, len(displayed)+2)
-	if spinner != "" {
-		linesOut = append(linesOut, thinkingStyle.Render(fmt.Sprintf("%s Thinking… %s", spinner, mutedStyle.Render(elapsedStr))))
-	} else {
-		linesOut = append(linesOut, thinkingStyle.Render(fmt.Sprintf("│ Thinking… %s", mutedStyle.Render(elapsedStr))))
-	}
-	for _, line := range displayed {
-		if line == "" {
-			linesOut = append(linesOut, thinkingStyle.Render("│"))
-		} else {
-			linesOut = append(linesOut, thinkingStyle.Render("│ "+line))
+	// ── Expanded: full reasoning box (dimmed/faint) ───────────────────
+	if expanded {
+		if width < 40 {
+			width = 40
 		}
+
+		// Sanitize before wrapping so reasoning text with literal \n / \t / \"
+		// escapes expands to real characters (idempotent — safe on every tick).
+		content = sanitizeText(content)
+
+		// Auto-scroll while streaming: keep only the most recent maxLines
+		// worth of lines so the box tracks the tail of the reasoning stream.
+		// Once complete, show the reasoning (still bounded so a giant thought
+		// block cannot blow out the viewport).
+		lines := strings.Split(content, "\n")
+		var displayed []string
+		if !complete && len(lines) > tb.maxLines {
+			lines = lines[len(lines)-tb.maxLines:]
+		}
+		for _, line := range lines {
+			line = strings.TrimRight(line, " \r")
+			if line == "" {
+				displayed = append(displayed, "")
+				continue
+			}
+			displayed = append(displayed, wrapString(line, width-6)...)
+		}
+
+		linesOut := make([]string, 0, len(displayed)+2)
+		if spinner != "" {
+			linesOut = append(linesOut, thinkingStyle.Render(fmt.Sprintf("%s Thinking… %s", spinner, mutedStyle.Render(elapsedStr))))
+		} else {
+			linesOut = append(linesOut, thinkingStyle.Render(fmt.Sprintf("│ Thinking… %s", mutedStyle.Render(elapsedStr))))
+		}
+		for _, line := range displayed {
+			if line == "" {
+				linesOut = append(linesOut, thinkingStyle.Render("│"))
+			} else {
+				linesOut = append(linesOut, thinkingStyle.Render("│ "+line))
+			}
+		}
+		if complete {
+			linesOut = append(linesOut, thinkingStyle.Render(fmt.Sprintf("│ %s", mutedStyle.Render(
+				fmt.Sprintf("▸ Thought for %s (%d tokens)", elapsedStr, estimateTokens(content))))))
+		}
+
+		return strings.Join(linesOut, "\n")
 	}
 
-	return strings.Join(linesOut, "\n")
+	// ── Collapsed (default) ────────────────────────────────────────────
+	// While the reasoning block is still streaming show a compact spinner;
+	// once it finishes (terminal event or stream over) collapse into a
+	// single-line summary.
+	if streaming && !complete {
+		sp := spinner
+		if sp == "" {
+			sp = "✦"
+		}
+		return thinkingStyle.Render(fmt.Sprintf("%s Thinking.. (%s)", sp, elapsedStr))
+	}
+	return thinkingStyle.Render(fmt.Sprintf("▸ Thought for %s (%d tokens)", elapsedStr, estimateTokens(content)))
 }
 
 // thinkingStyle is the dimmed/italic reasoning style. Reasoning must read as a
