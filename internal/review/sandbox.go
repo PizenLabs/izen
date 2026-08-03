@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/runtime/output"
 )
 
 const SandboxBase = "/tmp/izen/review"
@@ -17,6 +19,11 @@ type Sandbox struct {
 	Workspace   string
 	ProjectRoot string
 	created     bool
+	// pipeline is the Phase 1 Tool Output Intelligence pipeline. Ephemeral
+	// `go test` verification output is normalized, classified, semantically
+	// compressed and tee-logged to `<projectRoot>/.logs/`. Nil disables
+	// processing.
+	pipeline *output.Pipeline
 }
 
 func NewSandbox(reviewID, projectRoot string) *Sandbox {
@@ -24,7 +31,15 @@ func NewSandbox(reviewID, projectRoot string) *Sandbox {
 		ReviewID:    reviewID,
 		Workspace:   filepath.Join(SandboxBase, sanitizeID(reviewID)),
 		ProjectRoot: projectRoot,
+		pipeline:    output.New().WithWorkspace(projectRoot),
 	}
+}
+
+// WithPipeline overrides the output pipeline used for verification output. Nil
+// disables normalization/compression/tee-logging.
+func (s *Sandbox) WithPipeline(p *output.Pipeline) *Sandbox {
+	s.pipeline = p
+	return s
 }
 
 func sanitizeID(id string) string {
@@ -102,6 +117,14 @@ func (s *Sandbox) RunTest(testFile string) TestResult {
 	output, err := cmd.CombinedOutput()
 	outStr := string(output)
 
+	// ── TOOL OUTPUT PIPELINE (PHASE 1) ──────────────────────────────────
+	// The `go test` output is normalized, classified as GO_TEST, semantically
+	// compressed and tee-logged to `.logs/`. The raw output still drives the
+	// Passed/Panicked classification below.
+	if s.pipeline != nil {
+		s.pipeline.Process("go test -v -count=1 "+target, output)
+	}
+
 	if err != nil {
 		if strings.Contains(outStr, "panic") {
 			return TestResult{
@@ -137,6 +160,12 @@ func (s *Sandbox) RunGoTestInProject(pkg string) TestResult {
 
 	output, err := cmd.CombinedOutput()
 	outStr := string(output)
+
+	// ── TOOL OUTPUT PIPELINE (PHASE 1) ──────────────────────────────────
+	// Same normalization/classification/compression/tee-logging as RunTest.
+	if s.pipeline != nil {
+		s.pipeline.Process("go test -v -count=1 "+pkg, output)
+	}
 
 	if err != nil {
 		if strings.Contains(outStr, "panic") {

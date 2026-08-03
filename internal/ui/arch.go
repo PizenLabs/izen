@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/graph"
+	leagraph "github.com/PizenLabs/izen/internal/lea/graph"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 )
@@ -981,6 +982,115 @@ func (m *model) buildArchGraph() *graph.Graph {
 	return nil
 }
 
+// archGraph returns the graph backing the /arch analysis. It prefers the
+// Phase 3 Lea structural engine (converted to the native shape) so arch
+// lookups are served from the canonical index — including call edges, routes,
+// and incremental freshness. It falls back to the legacy in-memory native
+// graph, then to a rebuild, when Lea has not indexed the workspace yet.
+func (m *model) archGraph() *graph.Graph {
+	if m == nil {
+		return nil
+	}
+	if m.leaEng != nil {
+		lg := m.leaEng.Graph()
+		if lg != nil && len(lg.Files()) > 0 {
+			return graphFromLea(lg)
+		}
+	}
+	if m.graph != nil && len(m.graph.Files) > 0 {
+		return m.graph
+	}
+	return m.buildArchGraph()
+}
+
+// graphFromLea converts a Lea structural graph into the native graph shape
+// consumed by the /arch analysis. It is the redirect seam that lets arch
+// lookups be served from the Phase 3 engine instead of the legacy index.
+func graphFromLea(lg *leagraph.Graph) *graph.Graph {
+	if lg == nil {
+		return graph.NewGraph("")
+	}
+	out := graph.NewGraph(lg.Root())
+	for _, path := range lg.Files() {
+		fn, ok := lg.File(path)
+		if !ok {
+			continue
+		}
+		fnode := graph.FileNode{
+			Path:    path,
+			Package: fn.Package,
+		}
+		if lang, ok := graph.LangFromExt(filepath.Ext(path)); ok {
+			fnode.Language = lang
+		}
+		for _, s := range lg.SymbolsOfFile(path) {
+			kind, ok := leaKindToGraphKind(s.Kind)
+			if !ok {
+				continue
+			}
+			fnode.Symbols = append(fnode.Symbols, graph.Symbol{
+				Name:      s.Name,
+				Kind:      kind,
+				File:      s.File,
+				Line:      s.Line,
+				EndLine:   s.EndLine,
+				Parent:    receiverFromQual(s.QualName),
+				Signature: s.Signature,
+				Exported:  s.Exported,
+			})
+		}
+		out.AddFile(fnode)
+	}
+	// Imports: IMPORTS edges connect file node IDs to package node IDs. The
+	// package node's Package field is the import path/directory.
+	imports := make(map[string][]string)
+	for _, e := range lg.ImportEdges() {
+		from, okFrom := lg.Node(e.From)
+		to, okTo := lg.Node(e.To)
+		if !okFrom || !okTo {
+			continue
+		}
+		imports[from.File] = append(imports[from.File], to.Package)
+	}
+	for i := range out.Files {
+		if imps, ok := imports[out.Files[i].Path]; ok {
+			out.Files[i].Imports = imps
+		}
+	}
+	return out
+}
+
+// leaKindToGraphKind maps a Lea node kind to a native graph symbol kind.
+func leaKindToGraphKind(k leagraph.NodeKind) (graph.SymbolKind, bool) {
+	switch k {
+	case leagraph.KindFunction:
+		return graph.SymbolFunction, true
+	case leagraph.KindMethod:
+		return graph.SymbolMethod, true
+	case leagraph.KindStruct:
+		return graph.SymbolStruct, true
+	case leagraph.KindClass:
+		return graph.SymbolClass, true
+	case leagraph.KindInterface:
+		return graph.SymbolInterface, true
+	case leagraph.KindType:
+		return graph.SymbolType, true
+	case leagraph.KindEnum:
+		return graph.SymbolEnum, true
+	default:
+		return 0, false
+	}
+}
+
+// receiverFromQual extracts the receiver from a method qualified name
+// (e.g. "Workspace.render" -> "Workspace") for the native Parent field.
+func receiverFromQual(qual string) string {
+	if i := strings.LastIndex(qual, "."); i >= 0 {
+		return qual[:i]
+	}
+	return ""
+}
+
 func graphFromPolyglot(syms []symbol.FileASTInfo) *graph.Graph {
 	g := graph.NewGraph("")
 	for _, fi := range syms {
@@ -1061,12 +1171,9 @@ func (m *model) renderArch(cmdArgs string) string {
 
 // renderArchFull renders the complete expanded architecture map (the original behavior).
 func (m *model) renderArchFull() string {
-	g := m.graph
+	g := m.archGraph()
 	if g == nil || len(g.Files) == 0 {
-		g = m.buildArchGraph()
-		if g == nil || len(g.Files) == 0 {
-			return "no packages found in graph"
-		}
+		return "no packages found in graph"
 	}
 	lang := detectGraphLanguageForGraph(g, m)
 	r := analyze(g, lang)
@@ -1187,13 +1294,13 @@ func (m *model) renderArchFull() string {
 	}
 
 	filesByPkg := make(map[string][]int)
-	for i, f := range m.graph.Files {
+	for i, f := range g.Files {
 		pkg := pkgLabel(f.Path)
 		filesByPkg[pkg] = append(filesByPkg[pkg], i)
 	}
 
 	methodCount := make(map[string]map[string]int)
-	for _, f := range m.graph.Files {
+	for _, f := range g.Files {
 		pkg := pkgLabel(f.Path)
 		for _, sym := range f.Symbols {
 			parent := sym.Name
@@ -1212,7 +1319,7 @@ func (m *model) renderArchFull() string {
 	var keyTypes []keyType
 	for _, pkg := range r.PkgOrder {
 		for _, idx := range filesByPkg[pkg] {
-			f := m.graph.Files[idx]
+			f := g.Files[idx]
 			for _, sym := range f.Symbols {
 				if !sym.Exported {
 					continue
@@ -1417,9 +1524,9 @@ func (m *model) renderArchFull() string {
 		totalEntryPts += len(ps.EntryPoints)
 	}
 
-	st := m.graph.Stats()
+	st := g.Stats()
 	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Packages"), textStyle.Render(fmt.Sprintf("%d", len(r.Pkgs))))
-	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Files"), textStyle.Render(fmt.Sprintf("%d", len(m.graph.Files))))
+	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Files"), textStyle.Render(fmt.Sprintf("%d", len(g.Files))))
 	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Symbols"), textStyle.Render(fmt.Sprintf("%d", st.SymbolCount)))
 	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Interfaces"), textStyle.Render(fmt.Sprintf("%d", totalInterfaces)))
 	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Structs"), textStyle.Render(fmt.Sprintf("%d", totalStructs)))
@@ -1441,12 +1548,9 @@ func cycleDisplay(n int) string {
 // in a single terminal screen. Each layer shows top 3 packages
 // and a count of remaining packages.
 func (m *model) renderArchCollapsed() string {
-	g := m.graph
+	g := m.archGraph()
 	if g == nil || len(g.Files) == 0 {
-		g = m.buildArchGraph()
-		if g == nil || len(g.Files) == 0 {
-			return "no packages found in graph"
-		}
+		return "no packages found in graph"
 	}
 	lang := detectGraphLanguageForGraph(g, m)
 	r := analyze(g, lang)
@@ -1526,12 +1630,9 @@ func (m *model) renderArchCollapsed() string {
 
 // renderArchDrilldown shows a detailed breakdown for a specific layer or package.
 func (m *model) renderArchDrilldown(target string) string {
-	g := m.graph
+	g := m.archGraph()
 	if g == nil || len(g.Files) == 0 {
-		g = m.buildArchGraph()
-		if g == nil || len(g.Files) == 0 {
-			return "no packages found in graph"
-		}
+		return "no packages found in graph"
 	}
 	lang := detectGraphLanguageForGraph(g, m)
 	r := analyze(g, lang)
@@ -1636,7 +1737,7 @@ func (m *model) renderArchDrilldown(target string) string {
 
 		fmt.Fprintf(&b, "  Key Types in %s:\n", matchedPkg.Name)
 		typeCount := 0
-		for _, f := range m.graph.Files {
+		for _, f := range g.Files {
 			pkg := pkgLabel(f.Path)
 			if pkg != matchedPkg.Name {
 				continue

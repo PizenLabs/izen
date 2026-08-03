@@ -8,6 +8,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/core/artifact"
 	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 )
 
 var globalRouter *Router
@@ -85,6 +86,18 @@ func WithTiers(tiers ...Tier) RetrieverOption {
 func WithEvidenceStore(s *artifact.Store) RetrieverOption {
 	return func(r *Retriever) {
 		r.store = s
+	}
+}
+
+// WithLeaEngine redirects the graph tier onto the Phase 3 Lea structural
+// engine. When set, symbol/file/package/import lookups are served from the
+// Lea index (which carries call edges and routes and stays fresh via
+// incremental sync) instead of the legacy native graph.
+func WithLeaEngine(e *lea.Engine) RetrieverOption {
+	return func(r *Retriever) {
+		if e != nil {
+			r.graph = NewLeaGraphLookup(e, r.root)
+		}
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
+	"github.com/PizenLabs/izen/internal/runtime/output"
 )
 
 type RunResult struct {
@@ -21,6 +22,16 @@ type RunResult struct {
 	ExitCode int    `json:"exit_code"`
 	Command  string `json:"command"`
 	Dir      string `json:"dir"`
+	// Compressed holds the Phase 1 semantically compressed output (test
+	// failures kept, passing blocks dropped, linter diagnostics flattened).
+	// Empty when no output pipeline is wired.
+	Compressed string `json:"compressed,omitempty"`
+	// ToolType is the classification tag assigned by the output pipeline
+	// (GO_TEST, GIT_STATUS, GENERIC, ...). Empty when no pipeline is wired.
+	ToolType string `json:"tool_type,omitempty"`
+	// LogPath is the persistent `.logs/` tee log written with the normalized
+	// uncompressed output. Empty when tee logging is disabled.
+	LogPath string `json:"log_path,omitempty"`
 }
 
 type processEntry struct {
@@ -95,6 +106,11 @@ type Runner struct {
 	riskClassifier *RiskClassifier
 	auth           *authorization.MutationAuthorization
 	budget         *budget.MutationBudget
+	// pipeline is the Phase 1 Tool Output Intelligence pipeline. Every
+	// command output is normalized, classified, semantically compressed and
+	// (when a workspace tee is attached) logged to `.logs/`. Nil keeps the
+	// runner a pure transformation-free executor (headless/tests).
+	pipeline *output.Pipeline
 }
 
 func NewRunner(root string, sandbox, confirm bool) *Runner {
@@ -105,6 +121,14 @@ func NewRunner(root string, sandbox, confirm bool) *Runner {
 		sandboxMode:    SandboxPolicy,
 		riskClassifier: NewRiskClassifier(),
 	}
+}
+
+// WithPipeline attaches the Tool Output Intelligence pipeline. A workspace-
+// rooted pipeline (output.New().WithWorkspace(root)) enables persistent
+// `.logs/` recording of every executed command.
+func (r *Runner) WithPipeline(p *output.Pipeline) *Runner {
+	r.pipeline = p
+	return r
 }
 
 func (r *Runner) SetAuthorization(auth *authorization.MutationAuthorization) {
@@ -229,6 +253,26 @@ func (r *Runner) run(command, dir string) (*RunResult, error) {
 	unregisterProcess(cmd)
 	result.Stdout = strings.TrimSpace(stdout.String())
 	result.Stderr = strings.TrimSpace(stderr.String())
+
+	// ── TOOL OUTPUT PIPELINE (PHASE 1) ──────────────────────────────────
+	// Every executed command's combined output is normalized (ANSI-stripped),
+	// classified by tool type, semantically compressed for LLM consumption,
+	// and — when the pipeline carries a workspace tee — recorded uncompressed
+	// under `.logs/`. The raw stdout/stderr stay intact for downstream UI
+	// rendering; the compressed form is what reaches LLM-facing context.
+	if r.pipeline != nil {
+		combined := result.Stdout
+		if result.Stderr != "" {
+			if combined != "" {
+				combined += "\n"
+			}
+			combined += result.Stderr
+		}
+		res := r.pipeline.Process(result.Command, []byte(combined))
+		result.Compressed = res.Compressed
+		result.ToolType = string(res.Tool)
+		result.LogPath = res.LogPath
+	}
 
 	if r.budget != nil {
 		_ = r.budget.Consume(budget.BudgetDelta{ShellCmds: 1})

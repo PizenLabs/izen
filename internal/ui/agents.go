@@ -60,7 +60,14 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 		outCh := make(chan outcome, 1)
 
 		go func() {
-			retriever := investigate.NewRetrieverAdapter(retrieval.NewRetriever(".", m.graph))
+			// The investigate retriever's graph tier is served from the Phase 3
+			// Lea structural engine when one is attached, falling back to the
+			// legacy native graph.
+			retrieverOpts := []retrieval.RetrieverOption{}
+			if m.leaEng != nil {
+				retrieverOpts = append(retrieverOpts, retrieval.WithLeaEngine(m.leaEng))
+			}
+			retriever := investigate.NewRetrieverAdapter(retrieval.NewRetriever(".", m.graph, retrieverOpts...))
 			executor := investigate.NewShellTestExecutor(".")
 			eng := investigate.NewEngineWithAI(".", content, retriever, executor, m.provider, m.cfg.ActiveModelName())
 			eng.WithEventBus(m.bus)

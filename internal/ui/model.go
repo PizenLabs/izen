@@ -30,6 +30,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -583,14 +584,19 @@ type TaskFinishedMsg struct{}
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 type model struct {
-	cfg               *config.Config
-	sess              *session.Session
-	provider          ai.Provider
-	mgr               *ai.Manager
-	resolver          *modes.Resolver
-	gitEng            *git.Engine
-	graphEng          *graph.Engine
-	graph             *graph.Graph
+	cfg      *config.Config
+	sess     *session.Session
+	provider ai.Provider
+	mgr      *ai.Manager
+	resolver *modes.Resolver
+	gitEng   *git.Engine
+	graphEng *graph.Engine
+	graph    *graph.Graph
+	// leaEng is the Phase 3 Lea structural engine (canonical index for
+	// architecture, call chains, routes and symbol lookups). It backs the
+	// context planner's graph source and the /arch analysis. Nil only in
+	// headless/test harnesses that never construct a model.
+	leaEng            *lea.Engine
 	extractorRegistry *symbol.ExtractorRegistry
 	// contextPlanner classifies the user's question and injects budget-fitted
 	// structural context (Lea graph symbols, tool logs, architecture overview)
@@ -1067,12 +1073,13 @@ func (m *model) isProjectInitialized() bool {
 }
 
 // contextPlanner returns the intent-aware Context Planner, constructing it
-// lazily from the in-memory native graph and the workspace `.logs/` tee
-// directory. It is nil when no graph is ready, so every consumer must guard.
+// lazily from the Phase 3 Lea structural engine, the workspace `.logs/` tee
+// directory, and the retrieval search engine (for governed file reads). It is
+// nil when no graph source is ready, so every consumer must guard.
 // Construction is cheap and idempotent; the planner is retained for the
 // session.
 func (m *model) contextPlanner() *planner.Planner {
-	if m == nil || m.graph == nil {
+	if m == nil || (m.leaEng == nil && m.graph == nil) {
 		return nil
 	}
 	if m.planner != nil {
@@ -1082,11 +1089,28 @@ func (m *model) contextPlanner() *planner.Planner {
 	if m.cfg != nil && m.cfg.Models.MaxTokens > 0 {
 		maxTokens = m.cfg.Models.MaxTokens
 	}
-	m.planner = planner.New(
-		planner.WithGraphSource(planner.NewGraphAdapter(m.graph)),
-		planner.WithLogSource(planner.NewTeeLogAdapter(m.workspaceRoot)),
-		planner.WithMaxTokens(maxTokens),
-	)
+
+	opts := []planner.Option{planner.WithMaxTokens(maxTokens)}
+
+	// Graph source: the Lea structural engine is canonical (symbols, call
+	// chains, architecture, routes). The native graph remains a fallback for
+	// headless/test harnesses that never attach a Lea engine.
+	if m.leaEng != nil {
+		opts = append(opts, planner.WithGraphSource(planner.NewLeaAdapter(m.leaEng)))
+	} else if m.graph != nil {
+		opts = append(opts, planner.WithGraphSource(planner.NewGraphAdapter(m.graph)))
+	}
+
+	// File source: the retrieval search engine (Lynx or native) governs file
+	// reads so the planner can pull budget-fitted snippets instead of raw
+	// whole-file dumps.
+	if router := retrieval.GetGlobalRouter(); router != nil {
+		opts = append(opts, planner.WithFileSource(planner.NewRetrievalFileAdapter(router)))
+	}
+
+	opts = append(opts, planner.WithLogSource(planner.NewTeeLogAdapter(m.workspaceRoot)))
+
+	m.planner = planner.New(opts...)
 	return m.planner
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/internal/runtime/output"
 )
 
 // ToolResult is the structured output of a single forensic tool run. The engine
@@ -38,6 +39,12 @@ type ToolRunner struct {
 	// and is overridden by the engine when an event bus is wired so runner
 	// telemetry stays on the bus.
 	logFn func(format string, args ...interface{})
+
+	// pipeline is the Phase 1 Tool Output Intelligence pipeline. Every shell
+	// invocation's combined output is normalized, classified, semantically
+	// compressed and (with a workspace tee) logged to `.logs/`. Nil disables
+	// processing (headless/tests).
+	pipeline *output.Pipeline
 }
 
 func NewToolRunner(root string, provider ai.Provider, model string, retriever Retriever, diagnostics string) *ToolRunner {
@@ -49,6 +56,14 @@ func NewToolRunner(root string, provider ai.Provider, model string, retriever Re
 		diagnostics: diagnostics,
 		logFn:       forensicLog,
 	}
+}
+
+// WithPipeline attaches the Phase 1 output pipeline so forensic tool shell
+// output is normalized, classified, semantically compressed and tee-logged to
+// `<root>/.logs/`.
+func (r *ToolRunner) WithPipeline(p *output.Pipeline) *ToolRunner {
+	r.pipeline = p
+	return r
 }
 
 // SetLogFn overrides the telemetry sink used by the runner. May be nil to
@@ -98,16 +113,16 @@ func (r *ToolRunner) runEnv(ctx context.Context, target string) ToolResult {
 	b.WriteString("═══════════════════════════════════════════\n")
 
 	fmt.Fprintf(&b, "  Host OS    : %s / %s\n", runtime.GOOS, runtime.GOARCH)
-	if v, err := shell(ectx, r.root, "go version"); err == nil {
+	if v, err := r.shell(ectx, "go version"); err == nil {
 		b.WriteString("  Go Version : " + strings.TrimSpace(v) + "\n")
 	}
-	if v, err := shell(ectx, r.root, "git rev-parse --abbrev-ref HEAD"); err == nil {
+	if v, err := r.shell(ectx, "git rev-parse --abbrev-ref HEAD"); err == nil {
 		b.WriteString("  Git Branch : " + strings.TrimSpace(v) + "\n")
 	}
-	if v, err := shell(ectx, r.root, "git rev-parse HEAD"); err == nil {
+	if v, err := r.shell(ectx, "git rev-parse HEAD"); err == nil {
 		b.WriteString("  Git Commit : " + strings.TrimSpace(v) + "\n")
 	}
-	if v, err := shell(ectx, r.root, "git status --short"); err == nil && strings.TrimSpace(v) != "" {
+	if v, err := r.shell(ectx, "git status --short"); err == nil && strings.TrimSpace(v) != "" {
 		b.WriteString("  Git Dirt   :\n")
 		for _, line := range strings.Split(strings.TrimRight(v, "\n"), "\n") {
 			line = strings.TrimSpace(line)
@@ -148,7 +163,7 @@ func (r *ToolRunner) runTrace(ctx context.Context, target string) ToolResult {
 	tctx, cancel := context.WithTimeout(ctx, traceTimeout)
 	defer cancel()
 	cmd := fmt.Sprintf("go test -run=%s -v -race 2>&1", run)
-	out, err := shell(tctx, r.root, cmd)
+	out, err := r.shell(tctx, cmd)
 
 	failed := 0
 	for _, line := range strings.Split(out, "\n") {
@@ -316,15 +331,25 @@ func (r *ToolRunner) runLX(ctx context.Context, target string) ToolResult {
 	return ToolResult{Tool: ToolLX, Target: target, Content: b.String(), Ok: true, Evidence: evidence}
 }
 
-// shell runs a command in the runner root and returns combined stdout.
-func shell(ctx context.Context, root, command string) (string, error) {
+// shell runs a command in the runner root and returns combined stdout. The
+// output is routed through the Phase 1 pipeline when one is attached:
+// normalized, classified, semantically compressed and tee-logged to `.logs/`.
+// The raw output is returned so consumers keep their existing parsing.
+func (r *ToolRunner) shell(ctx context.Context, command string) (string, error) {
 	c := exec.CommandContext(ctx, "bash", "-c", command)
-	c.Dir = root
+	c.Dir = r.root
 	var out bytes.Buffer
 	c.Stdout = &out
 	c.Stderr = &out
 	err := c.Run()
-	return out.String(), err
+	raw := out.String()
+	if r.pipeline != nil {
+		res := r.pipeline.Process(command, []byte(raw))
+		if res.LogPath != "" {
+			r.logf("[output] tee log %s (%s)", res.LogPath, res.Tool)
+		}
+	}
+	return raw, err
 }
 
 // isFilePathTarget reports whether a token denotes a directory or file path
@@ -553,7 +578,7 @@ func (r *ToolRunner) runPackageRemediation(ctx context.Context, target string) T
 	defer cancel()
 
 	cmd := fmt.Sprintf("go mod tidy 2>&1; echo '---'; go list -m %s 2>&1 || true", pkg)
-	out, err := shell(ectx, r.root, cmd)
+	out, err := r.shell(ectx, cmd)
 	if out == "" && err != nil {
 		out = err.Error()
 	}

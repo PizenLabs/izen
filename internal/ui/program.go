@@ -28,6 +28,7 @@ import (
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/language"
+	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -82,6 +83,15 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 	}
 
 	graphEng := graph.NewEngine(root)
+
+	// ── LEA STRUCTURAL ENGINE (PHASE 3) ─────────────────────────────────
+	// The canonical structural intelligence engine: it indexes the workspace
+	// into an in-memory graph (persisted to .izen/graph.bin.zst) serving the
+	// context planner (GraphSource), the /arch analysis, and the retrieval
+	// graph tier. Indexing runs in a background goroutine below — and is
+	// gated on completed onboarding, because its cache write creates .izen/
+	// and must not trip HasLocalState during the init flow.
+	leaEng := lea.NewEngine(root)
 
 	ti := textinput.New()
 	ti.Prompt = ""
@@ -288,6 +298,7 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 		gitEng:              eng,
 		graphEng:            graphEng,
 		graph:               g,
+		leaEng:              leaEng,
 		extractorRegistry:   retrieval.NewPolyglotRegistry(),
 		resolver:            modes.NewResolver(),
 		attachedFiles:       make([]string, 0),
@@ -375,6 +386,21 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 	// already dispatches a single terminal investigateResultMsg on completion.
 	investigate.SetForensicLog(activityFn)
 	investigate.SetDispatchLog(activityFn)
+
+	// ── BACKGROUND LEA INDEXING ─────────────────────────────────────────
+	// Boot the Phase 3 structural engine in the background so the TUI never
+	// blocks on the (potentially large) full index. It is gated on completed
+	// onboarding because the engine persists its cache under .izen/ — running
+	// it during the init flow would create a false positive in HasLocalState
+	// and silently bypass the setup wizard. Once indexed, /arch and the
+	// context planner read straight from the Lea graph.
+	if initStage == initComplete && state.HasLocalState(root) {
+		go func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			_ = leaEng.Start(ctx)
+		}()
+	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 

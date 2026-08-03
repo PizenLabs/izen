@@ -10,6 +10,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/internal/runtime/output"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
 	"github.com/PizenLabs/izen/pkg/recon"
@@ -553,6 +554,10 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 
 	runner := NewToolRunner(e.root, e.provider, e.model, e.retriever, diagnostics)
 	runner.SetLogFn(func(format string, args ...interface{}) { e.forensic(format, args...) })
+	// Phase 1 output pipeline: forensic shell output is normalized,
+	// classified, semantically compressed and tee-logged to <root>/.logs/ so
+	// the planner's log source can consume it for BUG_FIX intents.
+	runner.WithPipeline(output.New().WithWorkspace(e.root))
 
 	actions := 0
 	current := strategy.Tool
