@@ -339,3 +339,25 @@ func TestCredentialSourceNone(t *testing.T) {
 		t.Errorf("CredentialSource(\"gemini\") = %q, want %q", source, "")
 	}
 }
+
+func TestDefaultStylePolicy(t *testing.T) {
+	cfg := Default()
+	if cfg.Style != "balanced" {
+		t.Errorf("Default().Style = %q, want %q", cfg.Style, "balanced")
+	}
+	if got := cfg.ActiveStylePolicy().String(); got != "balanced" {
+		t.Errorf("ActiveStylePolicy() = %q, want %q", got, "balanced")
+	}
+}
+
+func TestActiveStylePolicyFallback(t *testing.T) {
+	cfg := Default()
+	cfg.Style = "terse"
+	if got := cfg.ActiveStylePolicy().String(); got != "terse" {
+		t.Errorf("ActiveStylePolicy() = %q, want %q", got, "terse")
+	}
+	cfg.Style = "not-a-policy"
+	if got := cfg.ActiveStylePolicy().String(); got != "balanced" {
+		t.Errorf("ActiveStylePolicy() = %q, want fallback %q", got, "balanced")
+	}
+}

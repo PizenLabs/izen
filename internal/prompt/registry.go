@@ -21,7 +21,7 @@ type RuntimeFacts struct {
 
 // Compose assembles the full system prompt:
 //
-//	Identity Header → Public Handle Context → Common Contract → Mode Contract → Environment Context (optional)
+//	Identity Header → Public Handle Context → Common Contract → Mode Contract → Environment Context (optional) → Style Directive (active policy)
 //
 // Each section lives in exactly one place; nothing is duplicated.
 func Compose(modeContract string, facts RuntimeFacts) string {
@@ -46,7 +46,9 @@ func Compose(modeContract string, facts RuntimeFacts) string {
 		b.WriteString(EnvironmentContextForOS(facts.HostOS))
 	}
 
-	return b.String()
+	// Response style directive — injected dynamically from the active policy
+	// so every mode honors the engineer's configured verbosity.
+	return ApplyStyle(b.String(), activeStyle)
 }
 
 // AskSystemPrompt returns the composed system prompt for ask mode.

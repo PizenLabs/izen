@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/prompt"
 	"gopkg.in/yaml.v3"
 )
 
@@ -91,6 +92,7 @@ type Config struct {
 	Fallback  FallbackConfig  `yaml:"fallback"`
 	Lynx      LynxConfig      `yaml:"lynx"`
 	MCP       MCPConfig       `yaml:"mcp"`
+	Style     string          `yaml:"style"`
 	Username  string          `yaml:"username"`
 }
 
@@ -109,6 +111,16 @@ type IntentTierConfig struct {
 	Provider       string `yaml:"provider,omitempty"`
 	Model          string `yaml:"model,omitempty"`
 	ActiveOverride string `yaml:"active_override,omitempty"`
+}
+
+// ActiveStylePolicy resolves the configured output style to a prompt policy.
+// Unknown or empty values fall back to the default (Balanced).
+func (c *Config) ActiveStylePolicy() prompt.StylePolicy {
+	p, err := prompt.ParseStylePolicy(c.Style)
+	if err != nil {
+		return prompt.DefaultStylePolicy()
+	}
+	return p
 }
 
 // ResolveTierModel returns the effective model for the given intent tier.
@@ -431,6 +443,7 @@ func Default() *Config {
 		MCP: MCPConfig{
 			Enabled: false,
 		},
+		Style: "balanced",
 	}
 }
 
