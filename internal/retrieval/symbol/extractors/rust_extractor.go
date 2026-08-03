@@ -123,6 +123,9 @@ func (e *rustExtractor) ExtractSymbols(filePath string, content []byte) (*symbol
 		}
 	}
 
+	info.Calls = scopeRegexCalls(info.Functions, extractRegexCalls(content))
+	info.Routes = extractRustRoutes(lines)
+
 	return info, nil
 }
 

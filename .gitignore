@@ -1,6 +1,7 @@
 # Binaries
 bin/
 lea
+!internal/lea/
 .pi/
 **/__pycache__/
 *.pyc
