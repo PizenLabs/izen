@@ -364,3 +364,32 @@ func PlanDirectMutationSystemPrompt() string {
 		"No preamble, no summary." +
 		"\n" + strings.TrimSpace(TokenThriftyConstraint)
 }
+
+// PlanSynthesisSystemPrompt returns the compact, model-agnostic system prompt
+// used for JSON plan synthesis in /plan. Unlike the composed prompts it
+// carries no identity/contract preamble (CommonContract, environment context),
+// keeping the instruction block small enough for Mini/7B models to follow
+// without choking on context. It enforces the Action (strategy), Target
+// (file), Reason (rationale) output contract and explicitly forbids thinking
+// blocks and markdown decorations.
+func PlanSynthesisSystemPrompt() string {
+	return `You are IZEN, a deterministic task planner.
+Read the investigation ledger and emit a task plan.
+OUTPUT: ONE raw JSON object. No markdown fences, no comments, no prose, no <think>/<thought> blocks, no explanations.
+
+SCHEMA:
+{
+  "architectural_strategy": "one sentence",
+  "atomic_tasks": [
+    {"task_id": 1, "strategy": "SHELL_EXEC", "file": "exact command or relative path", "description": "title", "rationale": "why this step", "solution": "expected end state"}
+  ]
+}
+
+RULES
+- strategy: SHELL_EXEC = runnable command only; FILE_MUTATE = source file edit.
+- file: command text for SHELL_EXEC, relative project path for FILE_MUTATE.
+- One task per change; keep tasks atomic and ordered.
+- Never target documentation files (README.md, docs, LICENSE).
+- Missing Go dependency -> SHELL_EXEC "go get <real package>".
+- Keep the whole JSON under 300 tokens.`
+}

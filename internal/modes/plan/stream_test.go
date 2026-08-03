@@ -3,9 +3,14 @@ package plan
 import (
 	"context"
 	"io"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/core/stream"
+	"github.com/PizenLabs/izen/internal/events"
 )
 
 // mockStreamResult is a test double for ai.Provider.ExecuteStream results: an
@@ -85,7 +90,7 @@ func TestAccumulateStreamTruncationAgnostic(t *testing.T) {
 		input:  64,
 		output: 32,
 	}
-	content, finishReason, in, out := accumulateStream(streamed)
+	content, _, finishReason, in, out := accumulateStream(streamed)
 	if content == "" {
 		t.Fatal("accumulateStream returned empty content for a truncated stream")
 	}
@@ -109,7 +114,7 @@ func TestAccumulateStreamPartialRunesAcrossReads(t *testing.T) {
 	var partial mockStreamResult
 	partial.data = content
 
-	got, _, _, _ := accumulateStream(&oneByteAtATime{s})
+	got, _, _, _, _ := accumulateStream(&oneByteAtATime{s})
 	if got != content {
 		t.Errorf("chunked read corrupted multibyte runes:\nwant %s\ngot  %s", content, got)
 	}
@@ -131,4 +136,162 @@ func (o *oneByteAtATime) Read(p []byte) (int, error) {
 		p[0] = one[0]
 	}
 	return n, err
+}
+
+// TestProcessFromLedgerNilResponseOnRetryNoPanic is the regression guard for
+// the nil-pointer dereference panic in the emergency fallback: when the
+// provider returns a non-empty (but unparseable) first response and then
+// returns a nil response with a nil error on every retry, the retry loop
+// exhausts with resp == nil. The emergency fallback must never dereference the
+// nil response — it must surface an explicit diagnostic error instead.
+func TestProcessFromLedgerNilResponseOnRetryNoPanic(t *testing.T) {
+	calls := 0
+	e := NewEngine(NewPlanStore())
+	e.SetProvider(func(ctx context.Context, req ai.Request) (*ai.Response, error) {
+		calls++
+		if calls == 1 {
+			// Non-empty content that fails both JSON parsing and markdown task
+			// extraction, forcing the loop into the retry path.
+			return &ai.Response{Content: "prose, not json, not tasks"}, nil
+		}
+		// Every retry returns a nil response with no error.
+		return nil, nil
+	})
+
+	_, err := e.ProcessFromLedger(context.Background(), "", "no parseable plan", "test-model")
+	if err == nil {
+		t.Fatal("expected an explicit error, got nil")
+	}
+	if !strings.Contains(err.Error(), "JSON synthesis attempts failed") {
+		t.Errorf("error = %q, want a plan synthesis diagnostic", err.Error())
+	}
+	if calls < 3 {
+		t.Errorf("provider called %d times, want at least 3 (initial + retries)", calls)
+	}
+}
+
+// waitForReasoningDelivery polls the bus-delivered reasoning stream until the
+// expected terminal event and at least one chunk have arrived (delivery is
+// asynchronous). Returns the concatenated chunk text.
+func waitForReasoningDelivery(t *testing.T, mu *sync.Mutex, chunks *[]string, complete *bool) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		done := *complete
+		joined := strings.Join(*chunks, "")
+		mu.Unlock()
+		if done && joined != "" {
+			return joined
+		}
+		if time.Now().After(deadline) {
+			return joined
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestProcessFromLedgerPublishesReasoningStreamFromSentinels verifies that
+// reasoning/thinking tokens embedded as sentinel markers in the raw stream
+// (the OpenRouter transport) are continuously published to the event bus as
+// EventReasoningStream chunks during plan synthesis, and that a terminal
+// IsComplete event closes the block — the UI can then render live thinking.
+func TestProcessFromLedgerPublishesReasoningStreamFromSentinels(t *testing.T) {
+	bus := events.NewBus(64)
+	defer bus.Close()
+
+	var mu sync.Mutex
+	var chunks []string
+	complete := false
+	bus.Subscribe(events.EventReasoningStream, func(ev events.DomainEvent) {
+		p := ev.Payload().(events.ReasoningPayload)
+		mu.Lock()
+		defer mu.Unlock()
+		if p.IsComplete {
+			complete = true
+			return
+		}
+		chunks = append(chunks, p.Chunk)
+	})
+
+	streamed := &mockStreamResult{
+		data: stream.ReasoningSentinel + "thinking hard " + stream.ReasoningSentinel + validPlanJSON,
+	}
+	e := NewEngine(NewPlanStore()).WithEventBus(bus)
+	e.SetStreamProvider(func(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+		return streamed, nil
+	})
+
+	tasks, err := e.ProcessFromLedger(context.Background(), "", "fix the plan", "test-model")
+	if err != nil {
+		t.Fatalf("ProcessFromLedger: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("got %d tasks, want 2", len(tasks))
+	}
+
+	joined := waitForReasoningDelivery(t, &mu, &chunks, &complete)
+	if joined != "thinking hard " {
+		t.Errorf("reasoning chunks = %q, want %q", joined, "thinking hard ")
+	}
+	mu.Lock()
+	done := complete
+	mu.Unlock()
+	if !done {
+		t.Error("terminal reasoning event (IsComplete) not published")
+	}
+}
+
+// TestProcessFromLedgerPublishesReasoningViaHandler verifies the provider-side
+// reasoning channel: providers (OpenAI/Claude/Gemini/Ollama/Groq) route
+// reasoning deltas through req.ReasoningHandler. The plan engine must wire that
+// handler to the event bus so thinking is forwarded even when it never appears
+// in the raw stream.
+func TestProcessFromLedgerPublishesReasoningViaHandler(t *testing.T) {
+	bus := events.NewBus(64)
+	defer bus.Close()
+
+	var mu sync.Mutex
+	var chunks []string
+	complete := false
+	bus.Subscribe(events.EventReasoningStream, func(ev events.DomainEvent) {
+		p := ev.Payload().(events.ReasoningPayload)
+		mu.Lock()
+		defer mu.Unlock()
+		if p.IsComplete {
+			complete = true
+			return
+		}
+		chunks = append(chunks, p.Chunk)
+	})
+
+	e := NewEngine(NewPlanStore()).WithEventBus(bus)
+	e.SetStreamProvider(func(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+		if req.ReasoningHandler == nil {
+			t.Error("plan engine did not wire the request ReasoningHandler")
+		} else {
+			// OpenAI-style: reasoning routed exclusively via the handler.
+			_ = req.ReasoningHandler("handler reasoning ")
+		}
+		return &mockStreamResult{data: validPlanJSON}, nil
+	})
+
+	tasks, err := e.ProcessFromLedger(context.Background(), "", "fix the plan", "test-model")
+	if err != nil {
+		t.Fatalf("ProcessFromLedger: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("got %d tasks, want 2", len(tasks))
+	}
+
+	joined := waitForReasoningDelivery(t, &mu, &chunks, &complete)
+	if joined != "handler reasoning " {
+		t.Errorf("reasoning chunks = %q, want %q", joined, "handler reasoning ")
+	}
+	mu.Lock()
+	done := complete
+	mu.Unlock()
+	if !done {
+		t.Error("terminal reasoning event (IsComplete) not published")
+	}
 }

@@ -29,6 +29,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	objengine "github.com/PizenLabs/izen/internal/engine"
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/gateway"
 	"github.com/PizenLabs/izen/internal/modes"
@@ -2609,6 +2610,17 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		var buf strings.Builder
 		readBuf := make([]byte, 4096)
 
+		// ── REASONING TERMINAL EVENT GUARANTEE ───────────────────────────
+		// Whatever way the stream ends (EOF, provider error, truncation), any
+		// reasoning already forwarded to the bus must be closed with a terminal
+		// IsComplete event so the UI never shows an orphaned open thinking
+		// block. Reasoning tokens already published are never dropped.
+		defer func() {
+			if m.bus != nil && reasoningBuf.Len() > 0 {
+				m.bus.Publish(events.NewReasoningStream("", true))
+			}
+		}()
+
 		sentinelRSNG := "\x00RSNG\x00"
 		sentinelTCLL := "\x00TCLL\x00"
 
@@ -2670,6 +2682,13 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 				}
 				reasoningChunk := rest[:endIdx]
 				reasoningBuf.WriteString(reasoningChunk)
+				// Forward to the event bus as well so the unified ThinkingBuffer
+				// (fed by EventReasoningStream) renders the same reasoning the
+				// legacy thinkingStreamMsg path shows. Never dropped even if the
+				// request times out afterwards.
+				if m.bus != nil {
+					m.bus.Publish(events.NewReasoningStream(reasoningChunk, false))
+				}
 				select {
 				case streamCh <- thinkingStreamMsg{Content: reasoningChunk}:
 				default:

@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/PizenLabs/izen/internal/events"
 )
 
@@ -73,9 +75,28 @@ func TestThinkingBufferRenderStreaming(t *testing.T) {
 	}
 }
 
+// TestThinkingBufferRenderStreamingCollapsed guards the default (collapsed)
+// streaming widget: a compact "Thinking.. (Xs)" spinner line — never the box.
+func TestThinkingBufferRenderStreamingCollapsed(t *testing.T) {
+	tb := NewThinkingBuffer()
+	tb.Append("analyze the failure mode")
+	out := tb.Render(80, true, "✦")
+
+	if !strings.Contains(out, "Thinking..") {
+		t.Errorf("collapsed streaming line missing Thinking..: %q", out)
+	}
+	if strings.Contains(out, "│") {
+		t.Errorf("collapsed streaming line must not render the box gutter: %q", out)
+	}
+	if strings.Contains(out, "analyze the failure mode") {
+		t.Errorf("collapsed streaming line must not render full reasoning: %q", out)
+	}
+}
+
 func TestThinkingBufferRenderStreamingBox(t *testing.T) {
 	tb := NewThinkingBuffer()
 	tb.Append("trace line one\ntrace line two")
+	tb.SetExpanded(true)
 	out := tb.Render(80, true, "✦")
 
 	if !strings.Contains(out, "Thinking") {
@@ -104,6 +125,7 @@ func TestThinkingBufferRenderAutoScroll(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		tb.Append("line")
 	}
+	tb.SetExpanded(true)
 	// maxLines defaults to 8 → 8 content lines + header.
 	out := tb.Render(80, true, "✦")
 	lines := strings.Count(out, "\n") + 1
@@ -118,14 +140,90 @@ func TestThinkingBufferRenderCompactOnComplete(t *testing.T) {
 	tb.MarkComplete()
 	out := tb.Render(80, true, "✦")
 
-	if !strings.Contains(out, "Thought:") {
-		t.Errorf("compact line missing Thought: %q", out)
+	if !strings.Contains(out, "Thought for") {
+		t.Errorf("compact line missing Thought for: %q", out)
+	}
+	if !strings.Contains(out, "tokens)") {
+		t.Errorf("compact line missing token count: %q", out)
 	}
 	if strings.Contains(out, "some reasoning") {
 		t.Errorf("compact mode must not render full reasoning: %q", out)
 	}
 	if strings.Contains(out, "│") {
 		t.Errorf("compact mode must not render the box gutter: %q", out)
+	}
+}
+
+// TestThinkingBufferExpandedRendersFullReasoning guards the expanded thought
+// block: toggling expansion renders the full reasoning text in the dimmed box.
+func TestThinkingBufferExpandedRendersFullReasoning(t *testing.T) {
+	tb := NewThinkingBuffer()
+	tb.Append("full reasoning text here")
+	tb.MarkComplete()
+	tb.SetExpanded(true)
+
+	out := tb.Render(80, true, "✦")
+	if !strings.Contains(out, "full reasoning text here") {
+		t.Errorf("expanded block missing reasoning text: %q", out)
+	}
+	if !strings.Contains(out, "Thought for") {
+		t.Errorf("expanded complete block missing summary footer: %q", out)
+	}
+}
+
+// TestThinkingBufferToggleFlipsExpansion guards the Ctrl+O toggle contract.
+func TestThinkingBufferToggleFlipsExpansion(t *testing.T) {
+	tb := NewThinkingBuffer()
+	tb.Append("thinking")
+	if tb.Expanded() {
+		t.Error("new buffer must start collapsed")
+	}
+	tb.Toggle()
+	if !tb.Expanded() {
+		t.Error("Toggle must expand the thought block")
+	}
+	tb.Toggle()
+	if tb.Expanded() {
+		t.Error("Toggle must collapse the thought block")
+	}
+	tb.SetExpanded(true)
+	if !tb.Expanded() {
+		t.Error("SetExpanded(true) must expand the thought block")
+	}
+}
+
+// TestCtrlOTogglesThoughtBlock guards the Ctrl+O contract: with an active
+// thought block it expands/collapses the reasoning text (IsThinkingExpanded);
+// with no thought block it falls back to cycling the foldable log entries.
+func TestCtrlOTogglesThoughtBlock(t *testing.T) {
+	m := newTestModel()
+	m.thinkingBuffer = NewThinkingBuffer()
+	m.thinkingBuffer.Append("reasoning tokens")
+
+	// First Ctrl+O: collapsed → expanded.
+	m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO})
+	if !m.thinkingBuffer.Expanded() {
+		t.Fatal("Ctrl+O did not expand the thought block")
+	}
+	if !m.showReasoning {
+		t.Error("showReasoning must mirror the expanded state")
+	}
+
+	// Second Ctrl+O: expanded → collapsed.
+	m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO})
+	if m.thinkingBuffer.Expanded() {
+		t.Fatal("Ctrl+O did not collapse the thought block")
+	}
+
+	// Empty thought buffer → fall back to log entry cycling, never panic.
+	m.thinkingBuffer = NewThinkingBuffer()
+	m.logStore.Add(LogEdit, "file.go", true, "content")
+	if m.logStore.Entries()[0].Expanded {
+		t.Fatal("log entry must start collapsed")
+	}
+	m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO})
+	if !m.logStore.Entries()[0].Expanded {
+		t.Error("Ctrl+O with no thought block must fall back to cycling log entries")
 	}
 }
 
@@ -157,6 +255,7 @@ func TestRenderLiveThinkingPrefersEventBuffer(t *testing.T) {
 		thinkingBuffer: NewThinkingBuffer(),
 	}
 	m.thinkingBuffer.Append("event-driven reasoning")
+	m.thinkingBuffer.SetExpanded(true)
 
 	out := m.renderLiveThinking(80)
 	if !strings.Contains(out, "event-driven reasoning") {

@@ -2071,6 +2071,18 @@ func (m *model) refreshViewportContent() {
 		content.WriteString(sp + " " + infoStyle.Render(status) + "\n")
 	}
 
+	// ── Persisted collapsible thought block ────────────────────────────
+	// After streaming ends the reasoning block is no longer rendered inline by
+	// renderStreamingContent, so it is re-rendered here as a collapsed
+	// single-line summary ("▸ Thought for Xs (N tokens)"). The user can expand
+	// the full dimmed reasoning text with Ctrl+O / Alt+O at any time.
+	if !m.streaming && m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
+		if thoughts := m.renderLiveThinking(m.width); thoughts != "" {
+			content.WriteString(thoughts)
+			content.WriteString("\n")
+		}
+	}
+
 	// ── Activity Tree: structured tool call view ──────────────────────
 	// Rendered outside the streaming block so it appears during /build
 	// execution (non-streaming patch proposal) and persists through

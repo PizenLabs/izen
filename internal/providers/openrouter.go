@@ -139,9 +139,10 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	content := ""
 	var toolCalls []ai.ToolCall
 	if openaiResp.Choices[0].Message != nil {
-		content = openaiResp.Choices[0].Message.Content
-		if openaiResp.Choices[0].FinishReason == "tool_calls" && len(openaiResp.Choices[0].Message.ToolCalls) > 0 {
-			for _, tc := range openaiResp.Choices[0].Message.ToolCalls {
+		msg := openaiResp.Choices[0].Message
+		content = firstUsableContent(msg.Content, msg.Reasoning, msg.ReasoningContent)
+		if openaiResp.Choices[0].FinishReason == "tool_calls" && len(msg.ToolCalls) > 0 {
+			for _, tc := range msg.ToolCalls {
 				toolCalls = append(toolCalls, ai.ToolCall{
 					ID:   tc.ID,
 					Type: tc.Type,
@@ -334,9 +335,11 @@ type openrouterChoice struct {
 }
 
 type openrouterMsg struct {
-	Role      string               `json:"role"`
-	Content   string               `json:"content"`
-	ToolCalls []openrouterToolCall `json:"tool_calls,omitempty"`
+	Role             string               `json:"role"`
+	Content          string               `json:"content"`
+	Reasoning        string               `json:"reasoning,omitempty"`
+	ReasoningContent string               `json:"reasoning_content,omitempty"`
+	ToolCalls        []openrouterToolCall `json:"tool_calls,omitempty"`
 }
 
 type openrouterToolCall struct {

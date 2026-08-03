@@ -14,11 +14,17 @@ import (
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// ── GLOBAL: Alt+O toggles reasoning block visibility ────────────
+	// The unified ThinkingBuffer (event-driven thought block) takes priority;
+	// the legacy ThinkingPanel is only toggled when no event-driven block is
+	// active (e.g. legacy build fast-track reasoning).
 	if msg.String() == "alt+o" {
-		if m.thinkingPanel != nil {
+		if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
+			m.thinkingBuffer.Toggle()
+			m.showReasoning = m.thinkingBuffer.Expanded()
+		} else if m.thinkingPanel != nil {
 			m.thinkingPanel.Toggle()
+			m.showReasoning = m.thinkingPanel.Expanded()
 		}
-		m.showReasoning = m.thinkingPanel != nil && m.thinkingPanel.Expanded()
 		m.refreshViewportContent()
 		if m.Ready && !m.userIsScrollingUp {
 			m.Viewport.GotoBottom()
@@ -26,11 +32,20 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// ── GLOBAL: Ctrl+O cycles through all foldable log entries ──
-	// Each press expands the next entry, collapsing the previous one.
-	// When no entry is expanded, the first entry is expanded.
-	// Pressing Ctrl+O again cycles to the next entry.
+	// ── GLOBAL: Ctrl+O toggles the active thought block ──────────────
+	// Expands/collapses the reasoning block for the currently active message
+	// (ThinkingBuffer). When no thought block is active, falls back to cycling
+	// through the foldable build-log entries (legacy behavior).
 	if msg.Type == tea.KeyCtrlO {
+		if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
+			m.thinkingBuffer.Toggle()
+			m.showReasoning = m.thinkingBuffer.Expanded()
+			m.refreshViewportContent()
+			if m.Ready && !m.userIsScrollingUp {
+				m.Viewport.GotoBottom()
+			}
+			return m, nil
+		}
 		if m.logStore != nil {
 			newID := m.logStore.ToggleCycle()
 			if newID >= 0 {
