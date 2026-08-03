@@ -35,6 +35,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/patch"
+	"github.com/PizenLabs/izen/internal/planner"
 	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/retrieval"
@@ -591,6 +592,11 @@ type model struct {
 	graphEng          *graph.Engine
 	graph             *graph.Graph
 	extractorRegistry *symbol.ExtractorRegistry
+	// contextPlanner classifies the user's question and injects budget-fitted
+	// structural context (Lea graph symbols, tool logs, architecture overview)
+	// ahead of the LLM call. Lazily constructed from the native graph and the
+	// workspace root; nil when no graph is ready.
+	planner *planner.Planner
 
 	// Input
 	ti    textinput.Model
@@ -1058,6 +1064,48 @@ func (m *model) isProjectInitialized() bool {
 		return false
 	}
 	return true
+}
+
+// contextPlanner returns the intent-aware Context Planner, constructing it
+// lazily from the in-memory native graph and the workspace `.logs/` tee
+// directory. It is nil when no graph is ready, so every consumer must guard.
+// Construction is cheap and idempotent; the planner is retained for the
+// session.
+func (m *model) contextPlanner() *planner.Planner {
+	if m == nil || m.graph == nil {
+		return nil
+	}
+	if m.planner != nil {
+		return m.planner
+	}
+	maxTokens := planner.DefaultMaxContextTokens
+	if m.cfg != nil && m.cfg.Models.MaxTokens > 0 {
+		maxTokens = m.cfg.Models.MaxTokens
+	}
+	m.planner = planner.New(
+		planner.WithGraphSource(planner.NewGraphAdapter(m.graph)),
+		planner.WithLogSource(planner.NewTeeLogAdapter(m.workspaceRoot)),
+		planner.WithMaxTokens(maxTokens),
+	)
+	return m.planner
+}
+
+// planContextForAsk runs the Context Planner for a question and injects the
+// budget-fitted context into the content that reaches the LLM. It degrades
+// silently (returns the input unchanged) when the planner is unavailable or
+// planning yields no chunks.
+func (m *model) planContextForAsk(line string) string {
+	p := m.contextPlanner()
+	if p == nil {
+		return line
+	}
+	plan, err := p.Plan(context.Background(), line)
+	if err != nil || plan == nil || len(plan.Chunks) == 0 {
+		return line
+	}
+	header := fmt.Sprintf("### PLANNED CONTEXT (%s intent, %d tokens)\n\n",
+		plan.Intent, plan.TokenTotal)
+	return header + plan.Assemble() + "\n\n" + line
 }
 
 // applyToolCallBuffer applies approved tool calls to disk and flushes the buffer.
