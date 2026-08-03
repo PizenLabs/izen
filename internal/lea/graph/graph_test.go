@@ -350,6 +350,69 @@ func C() {}
 	}
 }
 
+// TestNoopUpsertEdgeStability guards the structural invariant that re-indexing
+// an unchanged file (a no-op incremental refresh) leaves the edge set intact.
+// It is a regression test for the removeNode bug that failed to prune edges
+// pointing AT a removed node, which caused duplicate DEFINES/CALLS edges to
+// accumulate across incremental refreshes and corrupted the graph stats that
+// the on-demand Debug() report surfaces.
+func TestNoopUpsertEdgeStability(t *testing.T) {
+	g := buildFixture(t, map[string]string{
+		"a.go": `package p
+
+func A() { B() }
+
+func B() { C() }
+
+func C() { D() }
+
+func D() {}
+`,
+		"b.go": `package p
+
+func X() { A() }
+`,
+	})
+
+	baseline := g.Stats()
+	if baseline.EdgeCount == 0 || baseline.CallEdgeCount == 0 {
+		t.Fatalf("baseline graph has no edges: %+v", baseline)
+	}
+
+	// Re-upsert every file verbatim — a pure no-op incremental refresh.
+	unchangedA := goFixture(t, "a.go", `package p
+
+func A() { B() }
+
+func B() { C() }
+
+func C() { D() }
+
+func D() {}
+`)
+	unchangedB := goFixture(t, "b.go", `package p
+
+func X() { A() }
+`)
+	if err := g.UpsertFile(unchangedA); err != nil {
+		t.Fatalf("UpsertFile(a.go): %v", err)
+	}
+	if err := g.UpsertFile(unchangedB); err != nil {
+		t.Fatalf("UpsertFile(b.go): %v", err)
+	}
+
+	after := g.Stats()
+	if after.EdgeCount != baseline.EdgeCount {
+		t.Errorf("edge count drifted on no-op refresh: %d -> %d", baseline.EdgeCount, after.EdgeCount)
+	}
+	if after.CallEdgeCount != baseline.CallEdgeCount {
+		t.Errorf("call edge count drifted on no-op refresh: %d -> %d", baseline.CallEdgeCount, after.CallEdgeCount)
+	}
+	if after.NodeCount != baseline.NodeCount {
+		t.Errorf("node count drifted on no-op refresh: %d -> %d", baseline.NodeCount, after.NodeCount)
+	}
+}
+
 func TestSnapshotRestore(t *testing.T) {
 	g := callGraphFixture(t)
 	snap := g.Snapshot()
@@ -366,6 +429,57 @@ func TestSnapshotRestore(t *testing.T) {
 	callees := nodeNames(g2.Callees(main.ID))
 	if !contains(callees, "NewService") {
 		t.Errorf("restored graph lost CALLS edges: %v", callees)
+	}
+}
+
+// TestRestoreThenUpsertPreservesCallEdges guards the cache-load invariant that
+// an incremental UpsertFile after a snapshot Restore keeps the pre-existing
+// call/import edges intact. It is a regression test for the Restore path that
+// failed to rebuild the nodesByFile index, which silently dropped every
+// re-resolved CALLS/IMPORTS edge on the first refresh after a cache load.
+func TestRestoreThenUpsertPreservesCallEdges(t *testing.T) {
+	g := buildFixture(t, map[string]string{
+		"a.go": `package p
+
+func A() { B() }
+`,
+		"b.go": `package p
+
+func B() { C() }
+`,
+		"c.go": `package p
+
+func C() {}
+`,
+	})
+
+	g2 := NewGraph("other")
+	g2.Restore(g.Snapshot())
+	baseline := g2.Stats()
+	if baseline.CallEdgeCount != 2 {
+		t.Fatalf("restored graph calls = %d, want 2", baseline.CallEdgeCount)
+	}
+
+	// Add a fourth file via an incremental upsert on the restored graph.
+	added := goFixture(t, "d.go", `package p
+
+func D() { A() }
+`)
+	if err := g2.UpsertFile(added); err != nil {
+		t.Fatalf("UpsertFile(d.go): %v", err)
+	}
+
+	after := g2.Stats()
+	if after.CallEdgeCount != 3 {
+		t.Errorf("call edges after restore+upsert = %d, want 3 (A->B, B->C, D->A)", after.CallEdgeCount)
+	}
+	d := findNode(t, g2, "D")
+	if callees := nodeNames(g2.Callees(d.ID)); !contains(callees, "A") {
+		t.Errorf("D outbound should include A, got %v", callees)
+	}
+	b := findNode(t, g2, "B")
+	if callers := nodeNames(g2.Callers(b.ID)); !contains(callers, "A") {
+		t.Errorf("A->B edge lost after restore+upsert, callers=%v", callers)
 	}
 }
 

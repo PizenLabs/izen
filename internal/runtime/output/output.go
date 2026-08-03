@@ -64,6 +64,83 @@ type Metrics struct {
 	ErrorRegionFound    bool
 }
 
+// CompressionRatio returns the percentage of the original character payload
+// removed by semantic compression. It is 0 when the original payload is empty.
+func (m Metrics) CompressionRatio() float64 {
+	if m.OriginalChars == 0 {
+		return 0
+	}
+	return 100 * (1 - float64(m.CompressedChars)/float64(m.OriginalChars))
+}
+
+// TokenBytesSaved returns the estimated token-equivalent bytes removed by
+// compression, using the ~4 chars/token heuristic shared with the planner.
+// It is never negative.
+func (m Metrics) TokenBytesSaved() int {
+	if saved := m.OriginalChars - m.CompressedChars; saved > 0 {
+		return saved / 4
+	}
+	return 0
+}
+
+// DebugInfo is an on-demand diagnostic snapshot of one pipeline execution: the
+// semantic compression outcome plus the persistent `.logs/` file pointers.
+type DebugInfo struct {
+	Tool                ToolType
+	OriginalChars       int
+	CompressedChars     int
+	CompressionRatioPct float64
+	CharsSaved          int
+	TokenBytesSaved     int
+	LogPath             string
+	LogDir              string
+	ExitCode            int
+	Err                 error
+}
+
+// Debug materializes the on-demand diagnostic snapshot of a pipeline Result.
+// The LogDir is resolved from the tee that produced the Result (empty when none
+// was attached); LogPath is the specific `.logs/` file the execution was
+// recorded to.
+func (r Result) Debug(tee *Tee) DebugInfo {
+	di := DebugInfo{
+		Tool:            r.Tool,
+		OriginalChars:   r.Metrics.OriginalChars,
+		CompressedChars: r.Metrics.CompressedChars,
+		CharsSaved:      r.Metrics.OriginalChars - r.Metrics.CompressedChars,
+		TokenBytesSaved: r.Metrics.TokenBytesSaved(),
+		LogPath:         r.LogPath,
+		ExitCode:        r.ExitCode,
+		Err:             r.Err,
+	}
+	di.CompressionRatioPct = r.Metrics.CompressionRatio()
+	if tee != nil {
+		di.LogDir = tee.Dir()
+	}
+	return di
+}
+
+// WorkspaceInspection is a diagnostic snapshot of a workspace's persistent
+// output-pipeline state: where `.logs/` lives and which managed log files it
+// holds.
+type WorkspaceInspection struct {
+	LogDir   string
+	LogCount int
+	LogFiles []string
+	LastLog  string
+}
+
+// InspectWorkspace reports the on-demand `.logs/` state of a workspace root
+// without executing anything. It is read-only: no log files are created.
+func InspectWorkspace(root string) WorkspaceInspection {
+	tee := NewTee(root)
+	ws := WorkspaceInspection{LogDir: tee.Dir()}
+	ws.LogFiles = tee.Logs()
+	ws.LogCount = len(ws.LogFiles)
+	ws.LastLog, _ = tee.LastLog()
+	return ws
+}
+
 // Result is the outcome of processing one command execution through the
 // pipeline. Normalized holds the ANSI-stripped, line-ending-unified raw
 // output; Compressed holds the semantic compression destined for the LLM

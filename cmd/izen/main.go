@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,11 +10,16 @@ import (
 
 	"github.com/PizenLabs/izen/internal/compact"
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/debug"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/infrastructure/capabilities"
+	"github.com/PizenLabs/izen/internal/lea"
+	"github.com/PizenLabs/izen/internal/planner"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/prompt"
+	"github.com/PizenLabs/izen/internal/retrieval"
 	compose "github.com/PizenLabs/izen/internal/runtime/compose"
+	"github.com/PizenLabs/izen/internal/runtime/output"
 	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/ui"
 )
@@ -27,6 +33,7 @@ func printMinimalistHelp() {
 	fmt.Println("  izen                    Start the interactive TUI")
 	fmt.Println("  izen version            Show version information")
 	fmt.Println("  izen help               Show this help message")
+	fmt.Println("  izen debug [path]       Inspect engine diagnostics (Lea, governance, output)")
 	fmt.Println("  izen auth login         Authenticate with a provider")
 	fmt.Println("  izen stats              Show usage statistics")
 	fmt.Println("  izen config style       Set response style policy (verbose|balanced|terse|ultra)")
@@ -77,6 +84,12 @@ func main() {
 			os.Exit(0)
 		case "memory":
 			runMemoryCommand(os.Args[2:])
+			os.Exit(0)
+		case "debug":
+			if err := runDebugCommand(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
 			os.Exit(0)
 		}
 	}
@@ -343,6 +356,83 @@ func runMemoryCommand(args []string) {
 	}
 	fmt.Fprintln(os.Stderr, "Usage: izen memory optimize [flags] [path...]")
 	os.Exit(1)
+}
+
+// runDebugCommand implements `izen debug [path]`: it materializes the on-demand
+// Debug Capability report across the Phase 1-4 engines for the given workspace
+// (defaulting to the current directory). The inspection is performed on
+// request only — the engines carry no continuous instrumentation for it. The
+// command is best-effort: an unavailable engine renders its section as "not
+// available" rather than failing the whole report.
+func runDebugCommand(args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "-h", "--help":
+			fmt.Println("Usage: izen debug [path]")
+			fmt.Println()
+			fmt.Println("Inspect on-demand diagnostics for the workspace engines:")
+			fmt.Println("  Lea structural engine   index duration, files, symbols, edges, cache version")
+			fmt.Println("  Context Governance      allocated budget vs retrieved/dropped chunks")
+			fmt.Println("  Output Pipeline         compression ratio, token bytes saved, .logs/ pointers")
+			fmt.Println()
+			fmt.Println("No path argument inspects the current directory.")
+			return nil
+		}
+	}
+
+	root := "."
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		root = args[0]
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// ── Lea structural engine ───────────────────────────────────────────
+	eng := lea.NewEngine(root)
+	defer func() { _ = eng.Close() }()
+	if err := eng.Start(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "izen debug: lea engine: %v\n", err)
+		// A stale/invalid cache (or a first run) fails to load; fall back to a
+		// full re-index so the report reflects the live workspace.
+		if _, ierr := eng.Index(ctx); ierr != nil {
+			fmt.Fprintf(os.Stderr, "izen debug: lea re-index: %v\n", ierr)
+		}
+	}
+
+	// ── Context governance: one real planning pass ─────────────────────
+	// The planner is wired with the same adapters the TUI uses (Lea graph,
+	// .logs/ tee logs, retrieval file source). The plan is best-effort: an
+	// unindexed or empty workspace still yields a valid governance snapshot
+	// (allocated budget with zero chunks).
+	var plan *planner.ContextPlan
+	planEng := planner.New(
+		planner.WithGraphSource(planner.NewLeaAdapter(eng)),
+		planner.WithLogSource(planner.NewTeeLogAdapter(root)),
+		planner.WithFileSource(planner.NewRetrievalFileAdapter(
+			retrieval.NewRouter(root, func(string, ...interface{}) {}),
+		)),
+	)
+	if p, err := planEng.Plan(ctx, "explain the architecture of this project"); err == nil {
+		plan = p
+	}
+
+	// ── Output pipeline: .logs/ inspection ──────────────────────────────
+	// The report surfaces the persistent log directory, its files, and — when
+	// a log exists — what the semantic compressor would do to the newest one.
+	logs := output.InspectWorkspace(root)
+	var outDi output.DebugInfo
+	if len(logs.LogFiles) > 0 {
+		if data, err := os.ReadFile(logs.LogFiles[0]); err == nil {
+			outDi = output.New().Process("go test ./...", data).Debug(output.NewTee(root))
+		}
+	}
+
+	report := debug.NewReport(eng, plan, outDi, logs)
+	if err := report.Render(os.Stdout); err != nil {
+		return fmt.Errorf("izen debug: render report: %w", err)
+	}
+	return nil
 }
 
 func printCompactHelp() {

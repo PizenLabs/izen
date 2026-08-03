@@ -140,7 +140,7 @@ func (g *Graph) removeNode(id string) {
 		g.in[e.To] = dropEdge(g.in[e.To], id)
 	}
 	for _, e := range g.in[id] {
-		g.out[e.From] = dropEdge(g.out[e.From], id)
+		g.out[e.From] = dropEdgeTo(g.out[e.From], id)
 	}
 	delete(g.nodes, id)
 	delete(g.out, id)
@@ -169,10 +169,25 @@ func (g *Graph) removeNode(id string) {
 	}
 }
 
+// dropEdge filters out edges whose From equals the given node ID. It is used
+// by removeNode to prune the edges that originate from the deleted node.
 func dropEdge(es []Edge, from string) []Edge {
 	out := es[:0]
 	for _, e := range es {
 		if e.From != from {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// dropEdgeTo filters out edges whose To equals the given node ID. It is the
+// reverse-edge complement of dropEdge: removeNode uses it to prune the edges
+// that point AT the deleted node.
+func dropEdgeTo(es []Edge, to string) []Edge {
+	out := es[:0]
+	for _, e := range es {
+		if e.To != to {
 			out = append(out, e)
 		}
 	}
@@ -560,6 +575,16 @@ func (g *Graph) Restore(s Snapshot) {
 	g.in = make(map[string][]Edge, len(s.Edges)/4)
 	for i := range s.Nodes {
 		g.addNode(&s.Nodes[i])
+	}
+	// nodesByFile is not serialized in the snapshot; rebuild it from each
+	// node's File metadata. It must be populated before any incremental
+	// rebuild runs — funcNodesInFileLocked (and removeFileLocked) read it to
+	// locate a file's declared nodes, so a missing index silently drops every
+	// call/import edge resolved after a cache load.
+	for _, n := range g.nodes {
+		if n.File != "" {
+			g.nodesByFile[n.File] = append(g.nodesByFile[n.File], n.ID)
+		}
 	}
 	for path, id := range g.fileNodes {
 		if pkgID, ok := g.packageNodes[dirOf(path)]; ok {
