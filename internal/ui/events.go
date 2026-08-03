@@ -9,6 +9,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/events"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
 )
 
 // ── Control Plane Event Messages ──────────────────────────────────────────
@@ -22,6 +23,24 @@ import (
 // the Bubble Tea event loop. The UI is a pure projection of the domain event
 // stream: engines publish headlessly and never call UI routines directly.
 type domainEventMsg struct{ ev events.DomainEvent }
+
+// presentationEventMsg carries a runtime.PresentationEvent — a domain event
+// already translated into a UI-ready, decoupled projection by the Application
+// layer EventTranslator — into the Bubble Tea event loop. The UI renders the
+// view strictly from these payloads; it never touches the original domain
+// event vocabulary.
+type presentationEventMsg struct {
+	ev appruntime.PresentationEvent
+}
+
+// runtimeResultMsg reports the outcome of a RuntimeCommand executed through
+// the Application-layer facade on a background goroutine. It never carries
+// state: the model is only ever mutated on the UI goroutine via the message
+// stream.
+type runtimeResultMsg struct {
+	typ appruntime.CommandType
+	err error
+}
 
 // WorkflowStateChangedMsg is emitted when the WorkflowStateMachine transitions.
 type WorkflowStateChangedMsg struct {

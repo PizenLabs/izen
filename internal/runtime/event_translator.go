@@ -63,6 +63,30 @@ func NewEventTranslator() *EventTranslator {
 	return &EventTranslator{}
 }
 
+// TranslatedEventTypes enumerates the domain event types the EventTranslator
+// understands. The Runtime uses this list to subscribe the translation
+// projection; event types omitted here are deliberately left to richer
+// consumers (e.g. engine telemetry and reasoning streams).
+func TranslatedEventTypes() []string {
+	return []string{
+		events.EventCommandReceived,
+		events.EventIntentParsed,
+		events.EventIntentClassified,
+		events.EventPlanStaged,
+		events.EventPhaseChanged,
+		events.EventPatchParsed,
+		events.EventPatchValidated,
+		events.EventPatchRejected,
+		events.EventPatchApplied,
+		events.EventExecutionFailed,
+		events.EventStageCompleted,
+		events.EventSelfHealingAttempt,
+		events.EventSelfHealingExhausted,
+		events.EventApprovalRequested,
+		events.EventActivity,
+	}
+}
+
 // Translate converts one domain event into a presentation event. The bool
 // reports whether the event was recognized; unknown event types yield a zero
 // PresentationEvent and false so callers can skip them.

@@ -344,16 +344,21 @@ func (m *model) handleInput(line string) tea.Cmd {
 
 	if mode, content, ok := parseModeShorthand(line); ok {
 		m.modeChangeAuthorized = true
+		// ── APPLICATION-LAYER COMMAND RECORD ──────────────────────────
+		// Every explicit user mode switch is routed through the Runtime
+		// facade as a SwitchModeCmd so the canonical command/event contract
+		// observes it. Nil-safe when no runtime is wired.
+		switchCmd := m.runtimeSwitchCmd(mode)
 		if content != "" {
 			m.setMode(mode)
-			return m.handleMessageContent(content)
+			return tea.Batch(m.handleMessageContent(content), switchCmd)
 		}
 		if mode == modes.ModeReview {
 			m.setMode(mode)
 			m.push(roleSystem, infoStyle.Render("Running review pipeline..."))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
-			return m.runReviewCmd("")
+			return tea.Batch(m.runReviewCmd(""), switchCmd)
 		}
 		// ── AUTO-TRIGGER /build EXECUTION ──────────────────────
 		// When /build is invoked while already in /build mode and
@@ -365,10 +370,10 @@ func (m *model) handleInput(line string) tea.Cmd {
 			hasPendingTodos := len(m.handoffCtx.PendingTodos) > 0
 			hasLedgerTasks := m.sess != nil && m.sess.ContextLedger != nil && len(m.sess.ContextLedger.Tasks) > 0
 			if hasStagedTasks || hasPendingTodos || hasLedgerTasks {
-				return m.runBuildCmd("")
+				return tea.Batch(m.runBuildCmd(""), switchCmd)
 			}
 		}
-		return m.setMode(mode)
+		return tea.Batch(m.setMode(mode), switchCmd)
 	}
 
 	if strings.HasPrefix(line, "/") {

@@ -193,6 +193,26 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.handleDomainEvent(msg.ev)
 		return m, nil
 
+	case presentationEventMsg:
+		// Application-layer translation projection: the view updates strictly
+		// from the decoupled PresentationEvent payload. Runs on the UI
+		// goroutine, so all model mutation here is race-free.
+		m.handlePresentationEvent(msg.ev)
+		return m, nil
+
+	case runtimeResultMsg:
+		// Outcome of a RuntimeCommand executed through the facade. Only
+		// errors are surfaced; successful commands rendered their own
+		// presentation events.
+		if msg.err != nil {
+			m.push(roleError, fmt.Sprintf("command %s failed: %v", msg.typ, msg.err))
+			m.refreshViewportContent()
+			if m.Ready && !m.userIsScrollingUp {
+				m.Viewport.GotoBottom()
+			}
+		}
+		return m, nil
+
 	case routerResultMsg:
 		return m.handleRouterResult(msg)
 

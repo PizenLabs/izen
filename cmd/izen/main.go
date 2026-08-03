@@ -7,7 +7,10 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/infrastructure/capabilities"
 	"github.com/PizenLabs/izen/internal/project"
+	compose "github.com/PizenLabs/izen/internal/runtime/compose"
 	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/ui"
 )
@@ -107,6 +110,33 @@ func main() {
 	// ---- Local context boundary enforcement ----
 	root := targetDir
 
+	// ── COMPOSITION ROOT: INFRASTRUCTURE + APPLICATION LAYERS (RFC v1.0) ──
+	// The composition root is the only place that instantiates the concrete
+	// Infrastructure adapters and wires the Application layer (domain
+	// WorkflowRuntime + command handlers + LedgerBuilder + Runtime facade)
+	// on top of the shared event bus. The resulting Runtime is injected into
+	// the Presentation layer below, making it the single entry point of the
+	// system. Command handlers are registered inside compose.Wire.
+	osFile := capabilities.NewOSFile(root)
+	shell := capabilities.NewExecShell(30 * time.Second)
+	gitCLI := capabilities.NewGitCLI(root)
+	patchAdapter := capabilities.NewPatchAdapter(root)
+	bus := events.NewBus(events.DefaultBufferSize)
+
+	app, wireErr := compose.Wire(
+		compose.WithBus(bus),
+		compose.WithCapabilities(compose.Capabilities{
+			File:  osFile,
+			Shell: shell,
+			Git:   gitCLI,
+			Patch: patchAdapter,
+		}),
+	)
+	if wireErr != nil {
+		fmt.Fprintf(os.Stderr, "izen: wire application layer: %v\n", wireErr)
+		os.Exit(1)
+	}
+
 	localCfg, _ := config.LoadLocalConfig(root)
 
 	if err := state.MigrateLegacyFiles(root); err != nil {
@@ -126,7 +156,7 @@ func main() {
 	// detection, git init, identity setup, and provider selection — and only
 	// writes .izen/config.json when the user confirms the setup wizard.
 	if _, err := os.Stat(filepath.Join(root, ".izen", "config.json")); os.IsNotExist(err) {
-		ui.RunMainDashboard(cfg, root, localCfg)
+		ui.RunMainDashboardWithApp(cfg, root, localCfg, app)
 		return
 	}
 
@@ -154,7 +184,7 @@ func main() {
 	if isRollbackMode {
 		ui.RunRollbackEngine(cfg, root, localCfg, detection)
 	} else {
-		ui.RunMainDashboard(cfg, root, localCfg, detection)
+		ui.RunMainDashboardWithApp(cfg, root, localCfg, app, detection)
 	}
 }
 

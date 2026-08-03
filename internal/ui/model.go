@@ -35,11 +35,13 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/patch"
+	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/router"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
 )
@@ -1003,6 +1005,17 @@ type model struct {
 	// subscribes as a pure projection. Never nil after bootstrap.
 	bus *events.Bus
 
+	// Application-layer Runtime facade (RFC v1.0 section 1). The UI expresses
+	// every canonical user interaction as a RuntimeCommand executed through
+	// this facade and receives state changes as translated PresentationEvents.
+	// Nil only in headless/test harnesses that never construct a model.
+	rt *appruntime.Runtime
+	// pres is the presentation-layer command/event gateway bound to rt.
+	pres *presentation.Bridge
+	// presSink forwards runtime.PresentationEvents into the Bubble Tea event
+	// loop as presentationEventMsg. It must be closed on shutdown.
+	presSink *presentation.EventSink
+
 	// Hybrid intent gateway: the router package runs the deterministic fast
 	// path first and falls back to the semantic PromptIntentClassifier when no
 	// deterministic signal matches. Route() returns an optional
@@ -1271,6 +1284,27 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// buffer (never the response pipeline); the terminal event collapses
 		// the box into compact mode.
 		m.handleReasoningStream(p.Chunk, p.IsComplete)
+	}
+}
+
+// handlePresentationEvent projects one Application-layer PresentationEvent
+// onto the view. This is the ONLY path the UI renders translated workflow
+// state: it consumes the decoupled payload (severity + summary + target) and
+// never inspects the original domain event. Only ever runs on the UI
+// goroutine, so all model mutation here is race-free.
+func (m *model) handlePresentationEvent(ev appruntime.PresentationEvent) {
+	switch ev.Severity {
+	case appruntime.SeveritySuccess:
+		m.logActivity("%s", successBannerStyle.Render(ev.Summary))
+	case appruntime.SeverityWarning:
+		m.logActivity("%s", warningBannerStyle.Render(ev.Summary))
+	case appruntime.SeverityError:
+		m.logActivity("%s", errorStyle.Render(ev.Summary))
+	default:
+		m.logActivity("%s", infoStyle.Render(ev.Summary))
+	}
+	if ev.Target != "" && ev.Target != ev.Summary {
+		m.logActivity("  %s", dimmedStyle.Render(ev.Target))
 	}
 }
 
@@ -1914,6 +1948,12 @@ func (m *model) flushPendingRecords() tea.Cmd {
 func (m *model) cleanShutdownCmd() tea.Cmd {
 	return func() tea.Msg {
 		execution.KillAllOrphans()
+		// Stop the presentation event projection so no more messages are
+		// forwarded into the (terminating) event loop.
+		if m.presSink != nil {
+			m.presSink.Close()
+			m.presSink = nil
+		}
 		if m.sess != nil {
 			m.sess.SetMode(m.resolver.Current())
 			m.sess.Purge()

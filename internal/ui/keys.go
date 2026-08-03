@@ -310,6 +310,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					func() tea.Msg { return agentStartMsg{label: "hotfix apply"} },
 					m.applyHotfixPatch(task, patch),
 					m.smoothStreamTickCmd(),
+					m.runtimeApproveCmd(patch.File),
 				)
 
 			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
@@ -333,7 +334,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
-				return m, nil
+				return m, m.runtimeRejectCmd(rejectedPath, "hotfix rejected by developer")
 			}
 			return m, nil
 		}
@@ -355,6 +356,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
 					m.runBuildShellExec(task),
 					m.smoothStreamTickCmd(),
+					m.runtimeApproveCmd(task.Target),
 				)
 
 			case msg.String() == "alt+l":
@@ -372,6 +374,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
 					m.runBuildShellExec(task),
 					m.smoothStreamTickCmd(),
+					m.runtimeApproveCmd(task.Target),
 				)
 
 			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
@@ -398,7 +401,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					task.Target))
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
-				return m, nil
+				return m, m.runtimeRejectCmd(task.Target, "shell execution rejected")
 			}
 			return m, nil
 		}
@@ -432,7 +435,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// ── File-mutation proposal approval ─────────────────────────
 		switch {
 		case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
-			return m, m.applySingleProposal()
+			proposalID := ""
+			if len(m.pendingProposals) > 0 {
+				proposalID = m.pendingProposals[0].ID
+			}
+			return m, tea.Batch(m.applySingleProposal(), m.runtimeApproveCmd(proposalID))
 		case msg.String() == "alt+l":
 			m.acceptAll = true
 			return m, m.applyAllProposals()
@@ -477,7 +484,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.pendingProposals = nil
 			m.acceptAll = false
 			m.push(roleSystem, infoStyle.Render("changes rejected"))
-			return m, nil
+			return m, m.runtimeRejectCmd("proposal", "changes rejected")
 		}
 		return m, nil
 	}
@@ -495,7 +502,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.streamCancel()
 			m.streamCancel = nil
 			m.interruptRequested = true
-			return m, func() tea.Msg { return TaskFinishedMsg{} }
+			// ── APPLICATION-LAYER COMMAND RECORD ──────────────────────
+			// The interruption is routed through the Runtime facade as a
+			// CancelCmd so the canonical command/event contract observes it.
+			return m, tea.Batch(
+				func() tea.Msg { return TaskFinishedMsg{} },
+				m.runtimeCancelCmd("stream interrupted"),
+			)
 		}
 		if m.proposedShellCmd != "" {
 			m.proposedShellCmd = ""
@@ -525,7 +538,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			execution.KillAllOrphans()
 			m.cancelAllBackgroundContexts()
 			m.push(roleSystem, infoStyle.Render("Interrupted."))
-			return m, func() tea.Msg { return TaskFinishedMsg{} }
+			// ── APPLICATION-LAYER COMMAND RECORD ──────────────────────
+			// The hard interrupt is routed through the Runtime facade as a
+			// CancelCmd so the canonical command/event contract observes it.
+			return m, tea.Batch(
+				func() tea.Msg { return TaskFinishedMsg{} },
+				m.runtimeCancelCmd("ctrl-c interrupt"),
+			)
 		}
 		m.ti.SetValue("")
 		m.ti.Reset()
@@ -580,6 +599,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 			m.streamStartTime = time.Now()
 			cmd := m.handleInput(userInput)
+			// ── APPLICATION-LAYER COMMAND RECORD ──────────────────────
+			// The same submission is routed through the Runtime facade as a
+			// SubmitPromptCmd so the canonical command/event contract observes
+			// it. Nil-safe when no runtime is wired.
+			cmd = tea.Batch(cmd, m.runtimeSubmitCmd(userInput))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return m, cmd
