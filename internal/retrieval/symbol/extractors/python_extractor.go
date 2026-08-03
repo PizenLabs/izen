@@ -111,6 +111,9 @@ func (e *pythonExtractor) ExtractSymbols(filePath string, content []byte) (*symb
 		}
 	}
 
+	info.Calls = scopeRegexCalls(info.Functions, extractRegexCalls(content))
+	info.Routes = extractPythonRoutes(lines)
+
 	return info, nil
 }
 

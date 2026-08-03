@@ -34,6 +34,7 @@ func (e *goExtractor) ExtractSymbols(filePath string, content []byte) (*symbol.F
 	info := &symbol.FileASTInfo{
 		FilePath: filePath,
 		Language: symbol.LangGo,
+		Package:  f.Name.Name,
 	}
 
 	for _, imp := range f.Imports {
@@ -79,9 +80,22 @@ func (e *goExtractor) ExtractSymbols(filePath string, content []byte) (*symbol.F
 					pos := fset.Position(s.Pos())
 					end := fset.Position(s.End())
 					kind := symbol.SymbolStruct
-					switch s.Type.(type) {
+					switch t := s.Type.(type) {
 					case *ast.InterfaceType:
 						kind = symbol.SymbolInterface
+						if methods := interfaceMethods(t); len(methods) > 0 {
+							info.Symbols = append(info.Symbols, symbol.SymbolNode{
+								Name:      s.Name.Name,
+								Kind:      kind,
+								FilePath:  filePath,
+								StartLine: pos.Line,
+								EndLine:   end.Line,
+								Exported:  ast.IsExported(s.Name.Name),
+								Signature: "interface",
+								Methods:   methods,
+							})
+							continue
+						}
 					case *ast.StructType:
 						kind = symbol.SymbolStruct
 					}
@@ -117,7 +131,180 @@ func (e *goExtractor) ExtractSymbols(filePath string, content []byte) (*symbol.F
 		return true
 	})
 
+	info.Calls = extractGoCalls(f, fset)
+	info.Routes = extractGoRoutes(f, fset)
+
 	return info, nil
+}
+
+// interfaceMethods returns the declared method names of an interface type.
+func interfaceMethods(it *ast.InterfaceType) []string {
+	var methods []string
+	for _, field := range it.Methods.List {
+		if len(field.Names) == 0 {
+			// Embedded interface; skip for method-set purposes.
+			continue
+		}
+		for _, name := range field.Names {
+			methods = append(methods, name.Name)
+		}
+	}
+	return methods
+}
+
+// extractGoCalls walks the AST and records every function/method invocation
+// site attributed to its enclosing function or method. Unnamed closures are
+// skipped; the callee is recorded as written so the graph layer can resolve it
+// to an in-repo definition.
+func extractGoCalls(f *ast.File, fset *token.FileSet) []symbol.CallSite {
+	var calls []symbol.CallSite
+
+	// scope is the enclosing function qualified name while inside a FuncDecl.
+	var scope string
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.FuncDecl:
+			qual := node.Name.Name
+			if node.Recv != nil && len(node.Recv.List) > 0 {
+				qual = strings.TrimPrefix(exprString(node.Recv.List[0].Type), "*") + "." + qual
+			}
+			prev := scope
+			scope = qual
+			if node.Body != nil {
+				collectGoCallsIn(node.Body, qual, fset, &calls)
+			}
+			scope = prev
+			return false
+		case *ast.CallExpr:
+			if scope != "" {
+				if _, isLit := node.Fun.(*ast.FuncLit); isLit {
+					return true
+				}
+				name := calleeName(node.Fun)
+				if name == "" {
+					return true
+				}
+				pos := fset.Position(node.Pos())
+				calls = append(calls, symbol.CallSite{
+					Name:   name,
+					InFunc: scope,
+					Line:   pos.Line,
+					Column: pos.Column,
+				})
+			}
+		}
+		return true
+	})
+	return calls
+}
+
+// collectGoCallsIn records call sites inside a single function body.
+func collectGoCallsIn(body *ast.BlockStmt, scope string, fset *token.FileSet, calls *[]symbol.CallSite) {
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if _, isLit := call.Fun.(*ast.FuncLit); isLit {
+			return true
+		}
+		name := calleeName(call.Fun)
+		if name == "" {
+			return true
+		}
+		pos := fset.Position(call.Pos())
+		*calls = append(*calls, symbol.CallSite{
+			Name:   name,
+			InFunc: scope,
+			Line:   pos.Line,
+			Column: pos.Column,
+		})
+		return true
+	})
+}
+
+// calleeName renders the target of a call expression as written.
+func calleeName(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		return exprString(e.X) + "." + e.Sel.Name
+	default:
+		return ""
+	}
+}
+
+// routeRegisterVerbs maps a registration call name to the HTTP method it
+// registers. HandleFunc/Handle register the pattern for any method.
+var routeRegisterVerbs = map[string]string{
+	"HandleFunc": "ANY",
+	"Handle":     "ANY",
+	"GET":        "GET",
+	"POST":       "POST",
+	"PUT":        "PUT",
+	"PATCH":      "PATCH",
+	"DELETE":     "DELETE",
+	"HEAD":       "HEAD",
+	"OPTIONS":    "OPTIONS",
+	"Any":        "ANY",
+	"Route":      "ANY",
+	"Group":      "",
+}
+
+// extractGoRoutes detects HTTP route registrations (net/http, Gin, Echo,
+// Fiber) and maps each path/verb to its handler reference.
+func extractGoRoutes(f *ast.File, fset *token.FileSet) []symbol.HTTPRoute {
+	var routes []symbol.HTTPRoute
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		method, known := routeRegisterVerbs[sel.Sel.Name]
+		if !known || method == "" {
+			return true
+		}
+		args := call.Args
+		if len(args) < 2 {
+			return true
+		}
+		pathLit, ok := args[0].(*ast.BasicLit)
+		if !ok || pathLit.Kind != token.STRING {
+			return true
+		}
+		path := strings.Trim(pathLit.Value, `"`)
+		if !strings.HasPrefix(path, "/") {
+			return true
+		}
+		handler := handlerName(args[1])
+		pos := fset.Position(call.Pos())
+		routes = append(routes, symbol.HTTPRoute{
+			Path:    path,
+			Method:  method,
+			Handler: handler,
+			Line:    pos.Line,
+		})
+		return true
+	})
+	return routes
+}
+
+// handlerName extracts the handler reference name from a route registration
+// argument (identifier, selector or inline closure).
+func handlerName(arg ast.Expr) string {
+	switch a := arg.(type) {
+	case *ast.Ident:
+		return a.Name
+	case *ast.SelectorExpr:
+		return exprString(a.X) + "." + a.Sel.Name
+	default:
+		return ""
+	}
 }
 
 func (e *goExtractor) ExtractPackages(rootPath string) ([]symbol.PackageNode, error) {

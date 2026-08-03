@@ -166,6 +166,9 @@ func (e *tsExtractor) ExtractSymbols(filePath string, content []byte) (*symbol.F
 		}
 	}
 
+	info.Calls = scopeRegexCalls(info.Functions, extractRegexCalls(content))
+	info.Routes = extractTSRoutes(lines)
+
 	return info, nil
 }
 
