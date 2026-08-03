@@ -25,6 +25,9 @@ Thumbs.db
 # Local ctxd data
 .lea/
 
+# Tool Output Intelligence Engine tee logs
+.logs/
+
 # Go dependencies
 vendor/
 
