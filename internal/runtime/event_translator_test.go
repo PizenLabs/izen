@@ -31,6 +31,7 @@ func TestTranslateRecognizedEvents(t *testing.T) {
 		{"selfheal-exhausted", events.NewSelfHealingExhausted(3, ""), PresentationSelfHealingExpired, SeverityError},
 		{"approval", events.NewApprovalRequested("a.go", "high-risk", ""), PresentationApprovalRequested, SeverityWarning},
 		{"activity", events.NewActivity("[ OK ] done"), PresentationActivity, SeverityInfo},
+		{"plan-fallback", events.NewPlanFallback("prose", "extracted 2 heuristic tasks"), PresentationPlanFallback, SeverityWarning},
 	}
 
 	for _, tc := range cases {
@@ -78,6 +79,23 @@ func TestTranslateActivityCarriesLine(t *testing.T) {
 	}
 	if got.Summary != "search returned 4 results" {
 		t.Errorf("Summary = %q, want activity line", got.Summary)
+	}
+}
+
+func TestTranslatePlanFallbackCarriesReason(t *testing.T) {
+	tr := NewEventTranslator()
+	got, ok := tr.Translate(events.NewPlanFallback("prose", "extracted 2 heuristic tasks"))
+	if !ok {
+		t.Fatal("Translate returned ok=false")
+	}
+	if got.Type != PresentationPlanFallback {
+		t.Errorf("Type = %q, want %q", got.Type, PresentationPlanFallback)
+	}
+	if got.Detail != "extracted 2 heuristic tasks" {
+		t.Errorf("Detail = %q, want the fallback reason", got.Detail)
+	}
+	if got.Summary == "" {
+		t.Error("Summary is empty")
 	}
 }
 

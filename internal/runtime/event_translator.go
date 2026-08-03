@@ -28,6 +28,7 @@ const (
 	PresentationSelfHealingExpired PresentationEventType = "presentation.selfhealing.exhausted"
 	PresentationApprovalRequested  PresentationEventType = "presentation.approval.requested"
 	PresentationActivity           PresentationEventType = "presentation.activity"
+	PresentationPlanFallback       PresentationEventType = "presentation.plan.synthesize.fallback"
 )
 
 // PresentationSeverity is the coarse importance band of an event for the UI.
@@ -84,6 +85,7 @@ func TranslatedEventTypes() []string {
 		events.EventSelfHealingExhausted,
 		events.EventApprovalRequested,
 		events.EventActivity,
+		events.EventPlanFallback,
 	}
 }
 
@@ -188,6 +190,12 @@ func (t *EventTranslator) Translate(ev events.DomainEvent) (PresentationEvent, b
 		out.Type = PresentationActivity
 		out.Severity = SeverityInfo
 		out.Summary = p.Line
+
+	case events.PlanFallbackPayload:
+		out.Type = PresentationPlanFallback
+		out.Severity = SeverityWarning
+		out.Summary = "plan synthesis fell back to heuristic file extraction"
+		out.Detail = p.Reason
 
 	default:
 		return PresentationEvent{}, false

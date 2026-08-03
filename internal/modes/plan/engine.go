@@ -688,6 +688,13 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		if isDirectMut {
 			systemPrompt = prompt.PlanDirectMutationSystemPrompt()
 		}
+		// MINI-MODEL HARDENING: small / non-reasoning cloud models (e.g. Cohere
+		// North Mini) routinely emit narrative reasoning prose instead of the
+		// required JSON. Inject an explicit raw-JSON-only constraint so the
+		// output stays parseable instead of exhausting the silent retry budget.
+		if c := prompt.MiniModelJSONConstraint(modelName); c != "" {
+			systemPrompt += "\n\n" + c
+		}
 		// VANILLA_WEB ARCHETYPE: Strict negative constraints injected at the
 		// end of the system prompt as a hard archetype lock. The LLM MUST NOT
 		// generate any backend toolchain commands for HTML/CSS/JS workspaces.
@@ -777,6 +784,11 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	// friction of /mode investigate ↔ /mode plan toggling by handling the
 	// correction transparently.
 	maxSilentRetries := 2
+	// lastRawContent preserves the most recent non-empty model output across the
+	// retry loop. The final response may be nil (a retry returned no content),
+	// but the prose the model DID emit on an earlier attempt is still the best
+	// signal the heuristic fallback can mine for file paths.
+	lastRawContent := ""
 	for attempt := 0; attempt <= maxSilentRetries; attempt++ {
 		// On retry (attempt > 0), re-invoke the provider with an augmented
 		// prompt that includes the strict enforcement instruction from the
@@ -791,6 +803,9 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 				continue
 			}
 			_ = e.store.SaveRawMarkdown("plan", resp.Content)
+		}
+		if resp != nil && strings.TrimSpace(resp.Content) != "" {
+			lastRawContent = resp.Content
 		}
 
 		jsonResult := ParseJSONPlan(resp.Content)
@@ -866,6 +881,29 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 		// Structural parse failure or all candidates filtered out.
 		if attempt < maxSilentRetries {
 			continue
+		}
+	}
+
+	// ── HEURISTIC PROSE FALLBACK ──────────────────────────────────────
+	// Last resort before hard failure: the model emitted narrative reasoning
+	// prose (a common failure mode of free/mini cloud models) that neither the
+	// JSON parser nor the markdown task parser could consume. Mine the text for
+	// file paths and construct one FILE_MUTATE task per detected file so the
+	// execution survives instead of dying with "all 3 JSON synthesis attempts
+	// failed". A clear plan.synthesize.fallback event notifies the user that a
+	// heuristic plan was generated.
+	if strings.TrimSpace(lastRawContent) != "" {
+		if heuristic := extractTasksFromProse(lastRawContent); len(heuristic) > 0 {
+			heuristic = FilterNonExistentMutationTargets(heuristic, e.rootPath)
+			if e.vanillaWeb {
+				heuristic = filterGoCommands(heuristic)
+				heuristic = SanitizeTasksForArchetype(heuristic, recon.VANILLA_WEB)
+			}
+			if len(heuristic) > 0 {
+				e.emit(events.NewPlanFallback("prose", fmt.Sprintf(
+					"The model returned non-JSON prose; a heuristic plan with %d FILE_MUTATE task(s) was extracted from the mentioned file paths.", len(heuristic))))
+				return ForceShellExecOnCompileError(heuristic, problem, ledgerContent), nil
+			}
 		}
 	}
 

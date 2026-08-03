@@ -65,6 +65,11 @@ const (
 	// Tier 4 Human-in-the-Loop fallback or when intent disambiguation is
 	// required at the gateway.
 	EventApprovalRequested = "approval.requested"
+	// EventPlanFallback is emitted when the plan engine exhausts JSON synthesis
+	// retries and falls back to heuristic file-path extraction because the model
+	// produced narrative prose instead of structured JSON (a common failure
+	// mode of free/mini cloud models).
+	EventPlanFallback = "plan.synthesize.fallback"
 )
 
 // FailureClassification is the taxonomy used by EventExecutionFailed. It is
@@ -226,6 +231,15 @@ type ApprovalRequestedPayload struct {
 type ReasoningPayload struct {
 	Chunk      string
 	IsComplete bool
+}
+
+// PlanFallbackPayload carries the outcome of a heuristic plan extraction that
+// replaced a failed JSON synthesis. Kind describes the fallback strategy
+// ("prose" when file paths were mined from narrative text, "root-context" when
+// no specific file was detected); Reason carries the human-readable notice.
+type PlanFallbackPayload struct {
+	Kind   string
+	Reason string
 }
 
 // ── Generic event implementation ────────────────────────────────────────────
@@ -421,5 +435,14 @@ func NewApprovalRequested(target, reason, preview string) DomainEvent {
 		Target:  target,
 		Reason:  reason,
 		Preview: preview,
+	})
+}
+
+// NewPlanFallback publishes that the plan engine generated a heuristic plan
+// because the model produced non-JSON narrative prose.
+func NewPlanFallback(kind, reason string) DomainEvent {
+	return newEvent(EventPlanFallback, PlanFallbackPayload{
+		Kind:   kind,
+		Reason: reason,
 	})
 }

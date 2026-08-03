@@ -113,3 +113,31 @@ func TestPlanSynthesisSystemPrompt_Compact(t *testing.T) {
 		t.Fatalf("PlanSynthesisSystemPrompt too heavy for Mini models: %d words", words)
 	}
 }
+
+func TestMiniModelJSONConstraint(t *testing.T) {
+	miniModels := []string{
+		"cohere/command-r-mini",
+		"openai/gpt-4o-mini",
+		"gemini-2.0-flash",
+		"Cohere North Mini",
+		"meta-llama/llama-3.2-1b-instruct",
+	}
+	for _, m := range miniModels {
+		if !IsMiniModel(m) {
+			t.Errorf("IsMiniModel(%q) = false, want true", m)
+		}
+		if c := MiniModelJSONConstraint(m); !strings.Contains(c, "raw JSON") {
+			t.Errorf("MiniModelJSONConstraint(%q) = %q, want raw-JSON directive", m, c)
+		}
+	}
+
+	fullModels := []string{"claude-sonnet-4-20250514", "openai/gpt-4o", "deepseek-chat", ""}
+	for _, m := range fullModels {
+		if IsMiniModel(m) {
+			t.Errorf("IsMiniModel(%q) = true, want false", m)
+		}
+		if c := MiniModelJSONConstraint(m); c != "" {
+			t.Errorf("MiniModelJSONConstraint(%q) = %q, want empty", m, c)
+		}
+	}
+}
