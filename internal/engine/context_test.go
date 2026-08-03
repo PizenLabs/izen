@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/domain"
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 )
 
 func TestCalculateTokenWeight(t *testing.T) {
@@ -20,12 +20,12 @@ func TestCalculateTokenWeight(t *testing.T) {
 }
 
 func TestBuildObjectiveContextRequiresApprovalWhenOversized(t *testing.T) {
-	g := graph.NewGraph(".")
-	g.AddFile(graph.FileNode{
+	g := lea.NewFileGraph(".")
+	g.AddFile(lea.FileNode{
 		Path: "internal/ui/commands.go",
-		Symbols: []graph.Symbol{
-			{Name: "HandleObjective", Kind: graph.SymbolFunction, File: "internal/ui/commands.go"},
-			{Name: "ObjectiveBudgetGuard", Kind: graph.SymbolFunction, File: "internal/ui/commands.go"},
+		Symbols: []lea.Symbol{
+			{Name: "HandleObjective", Kind: lea.SymbolFunction, File: "internal/ui/commands.go"},
+			{Name: "ObjectiveBudgetGuard", Kind: lea.SymbolFunction, File: "internal/ui/commands.go"},
 		},
 	})
 

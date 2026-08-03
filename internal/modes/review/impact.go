@@ -10,16 +10,16 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 )
 
 type ImpactAnalyzer struct {
 	root  string
-	graph *graph.Graph
+	graph *lea.FileGraph
 	fset  *token.FileSet
 }
 
-func NewImpactAnalyzer(root string, g *graph.Graph) *ImpactAnalyzer {
+func NewImpactAnalyzer(root string, g *lea.FileGraph) *ImpactAnalyzer {
 	return &ImpactAnalyzer{
 		root:  root,
 		graph: g,

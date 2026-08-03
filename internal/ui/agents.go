@@ -61,13 +61,9 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 
 		go func() {
 			// The investigate retriever's graph tier is served from the Phase 3
-			// Lea structural engine when one is attached, falling back to the
-			// legacy native graph.
-			retrieverOpts := []retrieval.RetrieverOption{}
-			if m.leaEng != nil {
-				retrieverOpts = append(retrieverOpts, retrieval.WithLeaEngine(m.leaEng))
-			}
-			retriever := investigate.NewRetrieverAdapter(retrieval.NewRetriever(".", m.graph, retrieverOpts...))
+			// Lea structural engine when one is attached, degrading to a
+			// no-op graph source otherwise.
+			retriever := investigate.NewRetrieverAdapter(retrieval.NewRetriever(".", m.leaEng))
 			executor := investigate.NewShellTestExecutor(".")
 			eng := investigate.NewEngineWithAI(".", content, retriever, executor, m.provider, m.cfg.ActiveModelName())
 			eng.WithEventBus(m.bus)

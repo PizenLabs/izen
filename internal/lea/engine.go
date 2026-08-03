@@ -30,6 +30,9 @@ type Engine struct {
 	extractors map[string]symbol.LanguageExtractor
 	maxWorkers int
 	autoSync   bool
+
+	fileViewCache *FileGraph
+	fileViewBuilt time.Time
 }
 
 // Option configures an Engine.

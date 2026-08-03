@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/lea"
 )
 
@@ -85,7 +84,7 @@ func TestRenderArchFromLea(t *testing.T) {
 	}
 }
 
-// TestGraphFromLea verifies the lea→native graph converter carries files,
+// TestGraphFromLea verifies the lea→file-centric converter carries files,
 // symbols, package names and import edges.
 func TestGraphFromLea(t *testing.T) {
 	root := leaArchRepo(t)
@@ -95,25 +94,27 @@ func TestGraphFromLea(t *testing.T) {
 		t.Fatalf("lea Index: %v", err)
 	}
 
-	g := graphFromLea(e.Graph())
+	g := e.FileGraph()
 	if g == nil {
-		t.Fatal("graphFromLea returned nil")
+		t.Fatal("FileGraph returned nil")
 	}
 	if len(g.Files) != 3 {
 		t.Fatalf("expected 3 files, got %d", len(g.Files))
 	}
-	if g.Files[0].Language != graph.LangGo {
+	if g.Files[0].Language != lea.LangGo {
 		t.Errorf("language = %q, want go", g.Files[0].Language)
 	}
 	if got := g.LookupSymbol("NewService"); len(got) != 1 {
 		t.Errorf("expected 1 NewService symbol, got %d", len(got))
 	}
-	// Import edge: internal/zzcore imports internal/aapi.
+	// Import edge: internal/zzcore imports internal/aapi. The file-centric
+	// view retains the raw import path string (legacy semantics) so
+	// module-root detection and package-label mapping work identically.
 	foundImport := false
 	for _, f := range g.Files {
 		if f.Path == "internal/zzcore/main.go" {
 			for _, imp := range f.Imports {
-				if imp == "internal/aapi" {
+				if strings.Contains(imp, "internal/aapi") {
 					foundImport = true
 				}
 			}

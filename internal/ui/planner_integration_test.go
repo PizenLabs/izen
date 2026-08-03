@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 )
 
 // TestPlanContextForAskDegradesWithoutGraph verifies the planner seam is a
@@ -25,12 +25,12 @@ func TestPlanContextForAskDegradesWithoutGraph(t *testing.T) {
 // injects budget-fitted planned context for a project question once a graph
 // is ready.
 func TestPlanContextForAskInjectsPlannedContext(t *testing.T) {
-	g := graph.NewGraph(".")
-	g.AddFile(graph.FileNode{
+	g := lea.NewFileGraph(".")
+	g.AddFile(lea.FileNode{
 		Path:    "internal/core/service.go",
 		Package: "core",
-		Symbols: []graph.Symbol{
-			{Name: "Service", Kind: graph.SymbolStruct, File: "internal/core/service.go", Line: 5, Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "Service", Kind: lea.SymbolStruct, File: "internal/core/service.go", Line: 5, Exported: true},
 		},
 	})
 
@@ -62,7 +62,7 @@ func TestPlanContextForAskInjectsPlannedContext(t *testing.T) {
 // questions that yield no plan chunks leave the input untouched.
 func TestPlanContextForAskDoesNotInjectForUnknownSymbols(t *testing.T) {
 	m := newTestModel()
-	m.graph = graph.NewGraph(".")
+	m.graph = lea.NewFileGraph(".")
 	m.workspaceRoot = "."
 
 	in := "hello there, how are you doing today"

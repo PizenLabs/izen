@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 )
 
 // ── Log Deduplication & Topological Grouping ──────────────────────────────────
@@ -331,14 +331,14 @@ type ContextCompressor struct {
 	matcher *AhoCorasick
 }
 
-func NewContextCompressorFromGraph(g *graph.Graph, objective string) *ContextCompressor {
-	patterns := extractPatterns(g, objective)
+func NewContextCompressorFromGraph(fg *lea.FileGraph, objective string) *ContextCompressor {
+	patterns := extractPatterns(fg, objective)
 	return &ContextCompressor{
 		matcher: NewAhoCorasick(patterns),
 	}
 }
 
-func extractPatterns(g *graph.Graph, objective string) []string {
+func extractPatterns(fg *lea.FileGraph, objective string) []string {
 	seen := make(map[string]bool)
 	var patterns []string
 
@@ -351,8 +351,8 @@ func extractPatterns(g *graph.Graph, objective string) []string {
 		patterns = append(patterns, s)
 	}
 
-	if g != nil {
-		for _, fn := range g.Files {
+	if fg != nil {
+		for _, fn := range fg.Files {
 			add(fn.Package)
 			for _, sym := range fn.Symbols {
 				add(sym.Name)

@@ -347,6 +347,30 @@ func (g *Graph) FilesInPackage(dir string) []Node {
 	return g.idsToNodes(g.pkgFiles[pkgID])
 }
 
+// ImportingFiles returns the files that import the given package directory
+// (the reverse of PackageDeps). Used for dependent lookups.
+func (g *Graph) ImportingFiles(dir string) []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	pkgID := g.packageNodes[dir]
+	if pkgID == "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, e := range g.in[pkgID] {
+		if e.Kind != EdgeImports {
+			continue
+		}
+		if from, ok := g.nodes[e.From]; ok && from.Kind == KindFile && !seen[from.File] {
+			seen[from.File] = true
+			out = append(out, from.File)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // PackageDeps returns the distinct package directories a package depends on
 // via IMPORTS edges.
 func (g *Graph) PackageDeps(dir string) []string {
@@ -442,6 +466,30 @@ func (g *Graph) Stats() Stats {
 		}
 	}
 	return s
+}
+
+// ImportsOf returns the raw import path strings declared by a file, including
+// external imports that do not resolve to an indexed package (and therefore
+// produce no IMPORTS edge).
+func (g *Graph) ImportsOf(path string) []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if fe, ok := g.fileExtracts[path]; ok {
+		return append([]string(nil), fe.Imports...)
+	}
+	return nil
+}
+
+// Package returns the package directory of a file node, if indexed.
+func (g *Graph) Package(path string) string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if id, ok := g.fileNodes[path]; ok {
+		if n, ok := g.nodes[id]; ok {
+			return n.Package
+		}
+	}
+	return ""
 }
 
 // Snapshot captures the graph for persistence. The in-memory indexes are

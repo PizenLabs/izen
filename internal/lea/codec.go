@@ -148,6 +148,10 @@ func (w *writer) extract(fe graph.FileExtract) {
 		w.str(rt.Handler)
 		w.u32(uint32(rt.Line))
 	}
+	w.u32(uint32(len(fe.Imports)))
+	for _, imp := range fe.Imports {
+		w.str(imp)
+	}
 }
 
 func readExtract(r *reader) graph.FileExtract {
@@ -174,6 +178,13 @@ func readExtract(r *reader) graph.FileExtract {
 				Handler: r.str(),
 				Line:    int(r.u32()),
 			})
+		}
+	}
+	ni := int(r.u32())
+	if ni > 0 {
+		fe.Imports = make([]string, 0, ni)
+		for i := 0; i < ni; i++ {
+			fe.Imports = append(fe.Imports, r.str())
 		}
 	}
 	return fe

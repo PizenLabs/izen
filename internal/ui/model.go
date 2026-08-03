@@ -29,7 +29,6 @@ import (
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
-	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
@@ -252,7 +251,7 @@ type shellOutputMsg struct {
 var _ tea.Msg = shellOutputMsg{}
 
 type graphBuiltMsg struct {
-	graph *graph.Graph
+	graph *lea.FileGraph
 	err   error
 }
 
@@ -260,13 +259,15 @@ type graphIndexingMsg struct {
 	indexing bool
 }
 
-func buildGraphCmd(eng *graph.Engine) tea.Cmd {
+func buildGraphCmd(eng *lea.Engine) tea.Cmd {
 	return func() tea.Msg {
-		g, _, err := eng.BuildOrLoad()
-		if err != nil {
+		if eng == nil {
+			return graphBuiltMsg{err: fmt.Errorf("graph engine not available")}
+		}
+		if _, err := eng.Index(context.Background()); err != nil {
 			return graphBuiltMsg{err: err}
 		}
-		return graphBuiltMsg{graph: g}
+		return graphBuiltMsg{graph: eng.FileGraph()}
 	}
 }
 
@@ -590,8 +591,7 @@ type model struct {
 	mgr      *ai.Manager
 	resolver *modes.Resolver
 	gitEng   *git.Engine
-	graphEng *graph.Engine
-	graph    *graph.Graph
+	graph    *lea.FileGraph
 	// leaEng is the Phase 3 Lea structural engine (canonical index for
 	// architecture, call chains, routes and symbol lookups). It backs the
 	// context planner's graph source and the /arch analysis. Nil only in

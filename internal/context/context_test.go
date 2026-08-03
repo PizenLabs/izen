@@ -1,6 +1,7 @@
 package context
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,11 +9,25 @@ import (
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/git"
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
 var testRoot = filepath.Join("..", "..")
+
+// testGraph indexes the repository root with the Phase 3 lea engine and
+// returns its file-centric view, the canonical source for structural lookups.
+// An isolated store path prevents a stale workspace cache from short-circuiting
+// the full index.
+func testGraph(t *testing.T) *lea.FileGraph {
+	t.Helper()
+	e := lea.NewEngine(testRoot, lea.WithStorePath(filepath.Join(t.TempDir(), "graph.bin.zst")))
+	t.Cleanup(func() { _ = e.Close() })
+	if _, err := e.Index(context.Background()); err != nil {
+		t.Fatalf("lea Index: %v", err)
+	}
+	return e.FileGraph()
+}
 
 func TestBuilderEmpty(t *testing.T) {
 	b := NewBuilder(testRoot, nil, nil, session.New())
@@ -26,11 +41,7 @@ func TestBuilderEmpty(t *testing.T) {
 }
 
 func TestBuilderWithGraph(t *testing.T) {
-	e := graph.NewEngine(testRoot)
-	g, err := e.Build()
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
+	g := testGraph(t)
 
 	s := session.New()
 	s.SetObjective("test objective")
@@ -57,11 +68,7 @@ func TestBuilderWithGraph(t *testing.T) {
 }
 
 func TestBuilderSymbolLookup(t *testing.T) {
-	e := graph.NewEngine(testRoot)
-	g, err := e.Build()
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
+	g := testGraph(t)
 
 	b := NewBuilder(testRoot, g, nil, session.New())
 	ctx := b.Build(BuildRequest{
@@ -87,32 +94,24 @@ func TestBuilderSymbolLookup(t *testing.T) {
 }
 
 func TestBuilderFileLookup(t *testing.T) {
-	e := graph.NewEngine(testRoot)
-	g, err := e.Build()
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
+	g := testGraph(t)
 
 	b := NewBuilder(testRoot, g, nil, session.New())
 	ctx := b.Build(BuildRequest{
-		Files:    []string{"internal/graph/engine.go"},
+		Files:    []string{"internal/lea/engine.go"},
 		MaxFiles: 5,
 	})
 
 	if len(ctx.Files) == 0 {
 		t.Fatal("expected to find specific file")
 	}
-	if ctx.Files[0].Path != "internal/graph/engine.go" {
-		t.Fatalf("expected 'internal/graph/engine.go', got %q", ctx.Files[0].Path)
+	if ctx.Files[0].Path != "internal/lea/engine.go" {
+		t.Fatalf("expected 'internal/lea/engine.go', got %q", ctx.Files[0].Path)
 	}
 }
 
 func TestBuilderQueryLookup(t *testing.T) {
-	e := graph.NewEngine(testRoot)
-	g, err := e.Build()
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
+	g := testGraph(t)
 
 	b := NewBuilder(testRoot, g, nil, session.New())
 	ctx := b.Build(BuildRequest{
@@ -224,11 +223,7 @@ func TestRenderEmpty(t *testing.T) {
 }
 
 func TestSymbolPrioritization(t *testing.T) {
-	e := graph.NewEngine(testRoot)
-	g, err := e.Build()
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
+	g := testGraph(t)
 
 	b := NewBuilder(testRoot, g, nil, session.New())
 	ctx := b.Build(BuildRequest{
@@ -272,11 +267,7 @@ func TestStats(t *testing.T) {
 }
 
 func TestImportGraph(t *testing.T) {
-	e := graph.NewEngine(testRoot)
-	g, err := e.Build()
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
+	g := testGraph(t)
 
 	b := NewBuilder(testRoot, g, nil, session.New())
 	output := b.ImportGraph()
@@ -290,11 +281,7 @@ func TestImportGraph(t *testing.T) {
 }
 
 func TestDependentsOf(t *testing.T) {
-	e := graph.NewEngine(testRoot)
-	g, err := e.Build()
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
+	g := testGraph(t)
 
 	b := NewBuilder(testRoot, g, nil, session.New())
 	files := b.DependentsOf("fmt")
@@ -302,16 +289,16 @@ func TestDependentsOf(t *testing.T) {
 }
 
 func TestCompressFile(t *testing.T) {
-	fn := &graph.FileNode{
+	fn := &lea.FileNode{
 		Path:    "test.go",
 		Package: "test",
 		Lines:   100,
 		Size:    500,
 		Imports: []string{"fmt"},
-		Symbols: []graph.Symbol{
-			{Name: "Foo", Kind: graph.SymbolFunction, Line: 5, Exported: true, Signature: "()"},
-			{Name: "bar", Kind: graph.SymbolFunction, Line: 10, Exported: false, Signature: "()"},
-			{Name: "Baz", Kind: graph.SymbolType, Line: 15, Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "Foo", Kind: lea.SymbolFunction, Line: 5, Exported: true, Signature: "()"},
+			{Name: "bar", Kind: lea.SymbolFunction, Line: 10, Exported: false, Signature: "()"},
+			{Name: "Baz", Kind: lea.SymbolType, Line: 15, Exported: true},
 		},
 	}
 
