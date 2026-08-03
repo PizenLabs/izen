@@ -514,6 +514,12 @@ func TestEngineWatcher(t *testing.T) {
 }
 
 func TestEngineIndexPerformance20k(t *testing.T) {
+	if raceEnabled || testing.CoverMode() != "" {
+		// Race and coverage instrumentation inflate every timing measurement
+		// by 5-20x. Performance budgets are verified on an uninstrumented run:
+		//   go test -run TestEngineIndexPerformance20k ./internal/lea
+		t.Skip("perf budgets require an uninstrumented run (no -race, no -cover)")
+	}
 	root := t.TempDir()
 	const files = 100
 	const funcsPerFile = 50
@@ -540,12 +546,8 @@ func TestEngineIndexPerformance20k(t *testing.T) {
 	if stats.Files != files {
 		t.Errorf("expected %d files, got %d", files, stats.Files)
 	}
-	fullLimit := time.Second
-	if raceEnabled {
-		fullLimit = 5 * time.Second
-	}
-	if fullDur >= fullLimit {
-		t.Errorf("full index must complete in <%v, took %v", fullLimit, fullDur)
+	if fullDur >= time.Second {
+		t.Errorf("full index must complete in <1s, took %v", fullDur)
 	}
 
 	// Incremental refresh of a single file must be <100ms.
@@ -559,12 +561,8 @@ func TestEngineIndexPerformance20k(t *testing.T) {
 	}
 	refreshDur := time.Since(start)
 	t.Logf("incremental refresh of 1 file: %v", refreshDur)
-	refreshLimit := 100 * time.Millisecond
-	if raceEnabled {
-		refreshLimit = time.Second
-	}
-	if refreshDur >= refreshLimit {
-		t.Errorf("incremental refresh must complete in <%v, took %v", refreshLimit, refreshDur)
+	if refreshDur >= 100*time.Millisecond {
+		t.Errorf("incremental refresh must complete in <100ms, took %v", refreshDur)
 	}
 
 	// Cache load must be <10ms.
@@ -579,12 +577,8 @@ func TestEngineIndexPerformance20k(t *testing.T) {
 	if !stats2.FromCache {
 		t.Error("expected cache load")
 	}
-	loadLimit := 10 * time.Millisecond
-	if raceEnabled {
-		loadLimit = 100 * time.Millisecond
-	}
-	if loadDur >= loadLimit {
-		t.Errorf("cache load must complete in <%v, took %v", loadLimit, loadDur)
+	if loadDur >= 10*time.Millisecond {
+		t.Errorf("cache load must complete in <10ms, took %v", loadDur)
 	}
 }
 
