@@ -35,6 +35,17 @@ func TestGitCLIIntegration(t *testing.T) {
 	if _, err := gitEnv(t, dir, "init"); err != nil {
 		t.Fatalf("git init: %v", err)
 	}
+	// Configure a repo-local identity so commits work on bare CI runners that
+	// have no global git config (GitCLI commits run without the env vars that
+	// gitEnv injects).
+	for _, kv := range []struct{ key, value string }{
+		{"user.name", "izen-test"},
+		{"user.email", "izen-test@example.com"},
+	} {
+		if _, err := gitEnv(t, dir, "config", kv.key, kv.value); err != nil {
+			t.Fatalf("git config %s: %v", kv.key, err)
+		}
+	}
 
 	g := NewGitCLI(dir)
 	var _ ports.GitPort = g

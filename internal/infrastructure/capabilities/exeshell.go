@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"syscall"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/domain/ports"
@@ -41,13 +42,23 @@ func (s *ExecShell) ExecuteIn(ctx context.Context, dir, command string) (ports.S
 }
 
 // run executes command through the shell, bounding it by the caller's context
-// and the adapter timeout.
+// and the adapter timeout. The shell runs in its own process group so a
+// timeout can also kill grandchildren; otherwise a descendant that outlives
+// the shell keeps the captured pipes open and stalls Wait past the bound.
 func (s *ExecShell) run(ctx context.Context, dir, command string) (ports.ShellResult, error) {
 	runCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(runCtx, "sh", "-c", command)
 	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = 100 * time.Millisecond
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
