@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
 )
 
@@ -128,18 +129,23 @@ func DispatchStrategy(parent context.Context, provider ai.Provider, model string
 	return heuristicClassifyWithArchetype(failureLog, false)
 }
 
-const dispatchSystemPrompt = `You are the routing brain for the /investigate forensic engine.
+// dispatchSystemPrompt is the routing brain contract for the /investigate AI
+// dispatcher. The output schema is consolidated in prompt/schema.go
+// (DispatchSchema) so the tool contract is defined exactly once.
+func dispatchSystemPrompt() string {
+	return `You are the routing brain for the /investigate forensic engine.
 Given a raw test/compile failure log, decide the SINGLE best first diagnostic tool.
 
 Rules:
 - Output ONLY a raw JSON object. No markdown fences, no // comments, no extra text.
-- Schema: {"tool": "<env|trace|diagnose|lx>", "target": "<symbol/file/test name or empty>"}
+- Schema: ` + prompt.DispatchSchema() + `
 - Pick "env" for Docker/environment/tooling/version blockers or missing binaries.
 - Pick "trace" for panics, nil-pointer derefs, deep regressions, data races, stack traces.
 - Pick "lx" ONLY when a specific missing symbol, package, or file is clearly named.
 - Pick "diagnose" only as a generic fallback when nothing else fits.
 - Set "target" only when the log names a concrete entity (e.g. "cmd/api/main.go", "internal/database", "Foo.Bar", "TestX").
 - CRITICAL: The first non-whitespace character MUST be '{'. Do NOT output // comments or markdown fences.`
+}
 
 func llmClassify(ctx context.Context, provider ai.Provider, model, log string) (Strategy, bool) {
 	resp, err := provider.Execute(ctx, ai.Request{
@@ -148,7 +154,7 @@ func llmClassify(ctx context.Context, provider ai.Provider, model, log string) (
 			{Role: "user", Content: truncate(log, 4000)},
 		},
 		Stream: false,
-		System: dispatchSystemPrompt + "\n\n" + providers.DiagnoseSystemPrompt,
+		System: dispatchSystemPrompt() + "\n\n" + providers.DiagnoseSystemPrompt,
 	})
 	if err != nil || resp == nil || strings.TrimSpace(resp.Content) == "" {
 		return Strategy{}, false

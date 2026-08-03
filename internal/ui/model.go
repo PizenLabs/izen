@@ -762,6 +762,17 @@ type model struct {
 	// AST/Code Graph trace for rendering the AI's thought route
 	currentTrace *ctxpkg.CodebaseTrace
 
+	// askContextGoverned is set by planContextForAsk when the Context Planner
+	// successfully assembled budget-fitted context for the current /ask turn.
+	// streamCmd reads and clears it so the fallback file-read path never
+	// injects the same @file context a second time when the planner already
+	// governed it.
+	askContextGoverned bool
+
+	// lastAskTrace carries the most recent planner trace from /ask context
+	// assembly so streamCmd can update the UI thought-route panel.
+	lastAskTrace *ctxpkg.CodebaseTrace
+
 	// Tip of the Day
 	currentTip      string
 	proTipIndex     int
@@ -1117,7 +1128,9 @@ func (m *model) contextPlanner() *planner.Planner {
 // planContextForAsk runs the Context Planner for a question and injects the
 // budget-fitted context into the content that reaches the LLM. It degrades
 // silently (returns the input unchanged) when the planner is unavailable or
-// planning yields no chunks.
+// planning yields no chunks. When the planner successfully assembles context,
+// askContextGoverned is set so streamCmd skips the ungoverned file-read
+// fallback, and lastAskTrace is populated for the UI thought-route panel.
 func (m *model) planContextForAsk(line string) string {
 	p := m.contextPlanner()
 	if p == nil {
@@ -1129,7 +1142,41 @@ func (m *model) planContextForAsk(line string) string {
 	}
 	header := fmt.Sprintf("### PLANNED CONTEXT (%s intent, %d tokens)\n\n",
 		plan.Intent, plan.TokenTotal)
+	m.askContextGoverned = true
+	m.lastAskTrace = planToTrace(plan)
 	return header + plan.Assemble() + "\n\n" + line
+}
+
+// planToTrace projects a planner ContextPlan onto the UI's CodebaseTrace so the
+// thought-route panel shows which files and symbols the planner actually
+// surfaced, alongside the budget telemetry. Returns nil when the plan is empty.
+func planToTrace(plan *planner.ContextPlan) *ctxpkg.CodebaseTrace {
+	if plan == nil || len(plan.Chunks) == 0 {
+		return nil
+	}
+	tr := &ctxpkg.CodebaseTrace{}
+	seen := make(map[string]bool)
+	for _, c := range plan.Chunks {
+		switch c.Source {
+		case planner.SourceFile:
+			// File chunk content begins with the repository-relative path
+			// ("path:line" from FocusedContext or the search hit projection).
+			line := strings.TrimSpace(strings.SplitN(c.Content, "\n", 2)[0])
+			if path, _, ok := strings.Cut(line, ":"); ok && path != "" && !seen[path] {
+				seen[path] = true
+				tr.MatchedFiles = append(tr.MatchedFiles, path)
+			}
+		case planner.SourceGraph:
+			if sym, _, ok := strings.Cut(strings.TrimSpace(c.Content), " "); ok && sym != "" && !seen[sym] {
+				seen[sym] = true
+				tr.ResolvedSymbols = append(tr.ResolvedSymbols, sym)
+			}
+		}
+	}
+	if plan.Budget.Total > 0 {
+		tr.CompressionRatio = float64(plan.TokenTotal) / float64(plan.Budget.Total)
+	}
+	return tr
 }
 
 // applyToolCallBuffer applies approved tool calls to disk and flushes the buffer.

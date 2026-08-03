@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -68,5 +70,48 @@ func TestPlanContextForAskDoesNotInjectForUnknownSymbols(t *testing.T) {
 	in := "hello there, how are you doing today"
 	if got := m.planContextForAsk(in); got != in {
 		t.Errorf("casual question mutated by planner:\n%s", got)
+	}
+}
+
+// TestPlanContextForAskHonorsConfiguredBudget verifies /ask context assembly
+// honors the token budget set by Context Governance (Models.MaxTokens): the
+// token count the planner reports for the injected block never exceeds the
+// configured cap. This is the P3 budget-verification seam for the /ask flow.
+func TestPlanContextForAskHonorsConfiguredBudget(t *testing.T) {
+	g := lea.NewFileGraph(".")
+	g.AddFile(lea.FileNode{
+		Path:    "internal/core/service.go",
+		Package: "core",
+		Symbols: []lea.Symbol{
+			{Name: "Service", Kind: lea.SymbolStruct, File: "internal/core/service.go", Line: 5, Exported: true},
+		},
+	})
+
+	m := newTestModel()
+	m.graph = g
+	m.workspaceRoot = "."
+	m.cfg.Models.MaxTokens = 200
+	m.cfg.AI.MaxTokens = 200
+
+	out := m.planContextForAsk("what is the Service struct in this project")
+	if !strings.Contains(out, "PLANNED CONTEXT") {
+		t.Fatalf("expected planned context header, got:\n%s", out)
+	}
+	if m.planner == nil {
+		t.Fatal("contextPlanner did not cache the planner")
+	}
+	if m.planner.MaxTokens() != 200 {
+		t.Errorf("planner budget = %d, want 200", m.planner.MaxTokens())
+	}
+	// The header carries the enforced token total ("... intent, N tokens)").
+	// It must never exceed the Context Governance budget.
+	re := regexp.MustCompile(`PLANNED CONTEXT \([^)]*?, (\d+) tokens\)`)
+	match := re.FindStringSubmatch(out)
+	if match == nil {
+		t.Fatalf("header missing enforced token total:\n%s", out)
+	}
+	reported, _ := strconv.Atoi(match[1])
+	if reported > 200 {
+		t.Errorf("/ask injected context = %d tokens, exceeds configured budget of 200", reported)
 	}
 }

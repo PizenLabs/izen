@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
 // Planner is the Context Planner: it sits between User Input Intent
@@ -159,6 +161,7 @@ func (p *Planner) gather(ctx context.Context, intent Intent, alloc Allocation, b
 		chunks = append(chunks, p.gatherLogs(ctx, priority, budget.Source(SourceLog))...)
 		chunks = append(chunks, p.gatherCallChains(ctx, priority, input)...)
 		chunks = append(chunks, p.gatherFileHits(ctx, priority, input)...)
+		chunks = append(chunks, p.gatherFileRefs(ctx, priority, budget, input)...)
 
 	case IntentArchitecture:
 		chunks = append(chunks, p.gatherArchitecture(ctx, priority)...)
@@ -169,10 +172,12 @@ func (p *Planner) gather(ctx context.Context, intent Intent, alloc Allocation, b
 		chunks = append(chunks, p.gatherSymbols(ctx, priority, input)...)
 		chunks = append(chunks, p.gatherCallChains(ctx, priority, input)...)
 		chunks = append(chunks, p.gatherFileHits(ctx, priority, input)...)
+		chunks = append(chunks, p.gatherFileRefs(ctx, priority, budget, input)...)
 
 	default: // EXPLANATION, GENERAL
 		chunks = append(chunks, p.gatherSymbols(ctx, priority, input)...)
 		chunks = append(chunks, p.gatherFileHits(ctx, priority, input)...)
+		chunks = append(chunks, p.gatherFileRefs(ctx, priority, budget, input)...)
 	}
 	return chunks, nil
 }
@@ -421,6 +426,81 @@ func isFunctionWord(lower string) bool {
 	default:
 		return false
 	}
+}
+
+// gatherFileRefs resolves explicit @file references (e.g. "@src/main.go")
+// through the governed FileSource adapter. Explicit file references anchor the
+// answer to a specific artifact, so their reads are the highest-priority raw
+// reads: each is head-truncated to the file source's allocated share instead of
+// being dropped wholesale by budget enforcement. The adapter — never the
+// planner — performs the actual disk read.
+func (p *Planner) gatherFileRefs(ctx context.Context, priority map[SourceType]int, budget Budget, input string) []Chunk {
+	if p.files == nil {
+		return nil
+	}
+	targets := retrieval.ExtractExplicitTargets(input)
+	if len(targets) == 0 {
+		return nil
+	}
+	srcCap := budget.Source(SourceFile)
+	seen := make(map[string]bool)
+	var chunks []Chunk
+	for _, file := range targets {
+		if seen[file] {
+			continue
+		}
+		seen[file] = true
+		body, err := p.files.FocusedContext(ctx, file, 1, 0)
+		if err != nil || body == "" {
+			p.log("[planner] file-ref read error for %s: %v", file, err)
+			continue
+		}
+		toks := p.tokens.Estimate(body)
+		if srcCap > 0 && toks > srcCap {
+			body = p.truncateToBudget(body, srcCap)
+			toks = p.tokens.Estimate(body)
+		}
+		chunks = append(chunks, Chunk{
+			Source:   SourceFile,
+			Content:  body,
+			Score:    1.0,
+			Priority: priority[SourceFile],
+			Tokens:   toks,
+		})
+	}
+	return chunks
+}
+
+// ResolveFileContext returns budget-fitted, governed context for the explicit
+// file references (@file) named in query. It is the entry point used by
+// non-/ask flows (e.g. stream-side file injection) to read file context
+// strictly through the FileSource adapter — the planner orchestrates policy and
+// never touches the disk itself. Returns "" when no file source is wired, no
+// @file reference is present, or the reads yield no content.
+func (p *Planner) ResolveFileContext(ctx context.Context, query string) (string, error) {
+	if p == nil {
+		return "", fmt.Errorf("planner: nil receiver")
+	}
+	if p.files == nil {
+		return "", nil
+	}
+	if len(retrieval.ExtractExplicitTargets(query)) == 0 {
+		return "", nil
+	}
+	budget := Allocate(IntentExplanation, p.MaxTokens())
+	priority := map[SourceType]int{SourceFile: 0}
+	chunks := p.gatherFileRefs(ctx, priority, budget, query)
+	if len(chunks) == 0 {
+		return "", nil
+	}
+	fitted, total, _, truncated := p.fitBudget(chunks, budget)
+	return (&ContextPlan{
+		Intent:     IntentExplanation,
+		Budget:     budget,
+		Chunks:     fitted,
+		TokenTotal: total,
+		Truncated:  truncated,
+	}).Assemble(), nil
 }
 
 // truncateToBudget trims text to fit within the given token budget while

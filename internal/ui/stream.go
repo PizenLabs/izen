@@ -168,11 +168,24 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// release notes, etc.) into the LLM window is both wasteful and
 	// the source of hallucinated RAG context on short inputs.
 	if m.workspaceRoot != "" && !gateway.IsCasualChat(content) {
-		augmented := injectFileContext(m.workspaceRoot, content, msgs[len(msgs)-1].Content)
-		if augmented != "" {
-			msgs[len(msgs)-1].Content = augmented
+		// CONTEXT GOVERNANCE (P3): When the Context Planner already governed
+		// the /ask turn (planContextForAsk assembled budget-fitted context and
+		// routed @file references through the FileSource adapter), the
+		// ungoverned file-read fallback is skipped entirely. Otherwise —
+		// non-/ask paths and graph-less /ask setups — @file reads go through
+		// the planner's governed ResolveFileContext when a planner is wired,
+		// degrading to an isolated read only when no planner exists.
+		plannerGoverned := m.askContextGoverned && m.resolver.Current() == modes.ModeAsk
+		if !plannerGoverned {
+			augmented := m.injectFileContext(m.workspaceRoot, content, msgs[len(msgs)-1].Content)
+			if augmented != "" {
+				msgs[len(msgs)-1].Content = augmented
+			}
 		}
 	}
+	// Always clear the per-turn governance flag so a stale marker from a
+	// previous turn can never suppress the fallback read on a later one.
+	m.askContextGoverned = false
 
 	var systemPrompt string
 	var maxTokens int
@@ -285,7 +298,19 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		}
 	}()
 
-	return tea.Batch(m.readStream(), m.smoothStreamTickCmd())
+	return tea.Batch(m.streamTraceCmd(), m.readStream(), m.smoothStreamTickCmd())
+}
+
+// streamTraceCmd emits the most recent /ask planner trace (thought-route panel)
+// as a traceUpdateMsg, if one was produced by planContextForAsk. tea.Batch
+// drops nil cmds, so returning nil when there is no trace is safe.
+func (m *model) streamTraceCmd() tea.Cmd {
+	if m.lastAskTrace == nil {
+		return nil
+	}
+	tr := m.lastAskTrace
+	m.lastAskTrace = nil
+	return func() tea.Msg { return traceUpdateMsg{trace: tr} }
 }
 
 // ingestLLMStream reads raw bytes from r, applies UTF-8 rune-safe buffering
@@ -361,7 +386,19 @@ func ingestLLMStream(r io.Reader, bus *events.Bus, emitContent func(string)) (st
 	}
 }
 
-func injectFileContext(workspaceRoot, prompt, userContent string) string {
+// injectFileContext resolves explicit file references and injects their content
+// into the LLM user turn. CONTEXT GOVERNANCE (P3): when a Context Planner is
+// wired, the read is routed through Planner.ResolveFileContext, which delegates
+// the actual disk read to the FileSource adapter and applies the planner's
+// budget/ranking/compression policy — Context Governance never bypasses the I/O
+// layer. The isolated os.ReadFile fallback is reserved for setups with no
+// planner (headless / graph-less) and carries the same @file resolution.
+func (m *model) injectFileContext(workspaceRoot, prompt, userContent string) string {
+	if p := m.contextPlanner(); p != nil {
+		if governed, err := p.ResolveFileContext(context.Background(), prompt); err == nil && governed != "" {
+			return userContent + "\n\n## GOVERNED FILE CONTEXT\n" + governed
+		}
+	}
 	resolver := workspace.NewTargetFileResolver(workspaceRoot)
 	target := resolver.Resolve(prompt)
 	if target == "" {

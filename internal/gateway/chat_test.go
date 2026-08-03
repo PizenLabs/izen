@@ -1,6 +1,9 @@
 package gateway
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestIsCasualChat_Greetings(t *testing.T) {
 	tests := []struct {
@@ -143,9 +146,17 @@ func TestIsCasualChat_Empty(t *testing.T) {
 
 func TestCasualChatSystemPrompt(t *testing.T) {
 	p := CasualChatSystemPrompt()
-	expected := "You are IZEN, a fast CLI coding companion created for terminal power-users. Always identify as IZEN if asked about your name, role, or identity. Respond concisely in 1-2 short sentences."
-	if p != expected {
-		t.Errorf("CasualChatSystemPrompt() = %q, want %q", p, expected)
+	required := "Always identify as IZEN if asked about your name, role, or identity."
+	if !strings.Contains(p, required) {
+		t.Errorf("CasualChatSystemPrompt() missing identity contract %q:\n%s", required, p)
+	}
+	// P4: the hardcoded "Respond concisely in 1-2 short sentences." directive is
+	// gone — verbosity is now injected dynamically via the active StylePolicy.
+	if strings.Contains(p, "Respond concisely") {
+		t.Errorf("CasualChatSystemPrompt() still carries a hardcoded conciseness directive:\n%s", p)
+	}
+	if !strings.Contains(p, "OUTPUT STYLE") {
+		t.Errorf("CasualChatSystemPrompt() missing active style directive:\n%s", p)
 	}
 }
 

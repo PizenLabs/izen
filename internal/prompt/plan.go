@@ -109,18 +109,14 @@ func AssessComplexity(objective string) ComplexityScore {
 // PlanContract returns the technical plan contract for
 // HIGH complexity tasks. Used when IsHighComplexity is true.
 func PlanContract() string {
-	return `MODE: /plan — structured task plan.
+	return fmt.Sprintf(`MODE: /plan — structured task plan.
 
 Read the investigation ledger below and produce a JSON task plan.
 
 Output ONLY raw JSON, no fences, no comments.
 
 SCHEMA:
-{
-  "tasks": [
-    {"id": 1, "type": "SHELL_EXEC|FILE_MUTATE", "target": "<exact file path or command>", "description": "<what and why>", "rationale": "<why this step>"}
-  ]
-}
+%s
 
 RULES
 - Tasks MUST be atomic and ordered by dependency.
@@ -128,7 +124,10 @@ RULES
 - Missing Go dependency → SHELL_EXEC task with the actual package path.
 - FORBIDDEN as SHELL_EXEC target: file paths (go.mod, go.sum, relative paths), prose, placeholders.
 - No brew, docker, or OS-level setup tasks.
-- Total JSON under 300 tokens.` + TokenThriftyConstraint
+- Total JSON under 300 tokens.%s`,
+		PlanContractSchema(),
+		TokenThriftyConstraint,
+	)
 }
 
 // CompactPlanContract returns a lean 3-bullet checklist contract for
@@ -198,20 +197,10 @@ func EvidenceBasedPlanningDirective() string {
 - DO NOT schedule FILE_MUTATE / CODE_MOD tasks for files that need no concrete modification. A destructive edit that strips >80% of a file without an explicit delete instruction is rejected as a no-op by the build guardrail, so a task with an empty or trivial edit payload wastes a build cycle. If a file genuinely needs no change, exclude it from the plan entirely.`
 }
 
-// planJSONSchema is the canonical output schema for BuildPlanJSONPrompt.
-const planJSONSchema = `{
-  "context_anchor": {"source": "investigate-ledger", "target_packages": ["pkg"]},
-  "architectural_strategy": "single sentence",
-  "strategic_overview": {
-    "root_core_factor": "fundamental root cause",
-    "impact_domain": "architectural layer affected",
-    "risk_evaluation": "Low | Medium | High | Critical",
-    "verification_vector": "how correctness will be verified"
-  },
-  "atomic_tasks": [
-    {"task_id": 1, "file": "relative/path", "strategy": "SHELL_EXEC", "description": "title", "rationale": "why this task is needed", "solution": "expected end state"}
-  ]
-}`
+// planJSONSchema is the canonical output schema for BuildPlanJSONPrompt. The
+// schema body lives in schema.go (PlanTaskSchema); this reference keeps the
+// builder compact and the definition single-sourced.
+var planJSONSchema = PlanTaskSchema()
 
 // GroundedConstraint returns the ALLOWED_FILE_TREE constraint block for
 // injection into plan prompts. When archetype or allowedFiles is empty,
@@ -378,12 +367,7 @@ Read the investigation ledger and emit a task plan.
 OUTPUT: ONE raw JSON object. No markdown fences, no comments, no prose, no <think>/<thought> blocks, no explanations.
 
 SCHEMA:
-{
-  "architectural_strategy": "one sentence",
-  "atomic_tasks": [
-    {"task_id": 1, "strategy": "SHELL_EXEC", "file": "exact command or relative path", "description": "title", "rationale": "why this step", "solution": "expected end state"}
-  ]
-}
+` + PlanSynthesisSchema() + `
 
 RULES
 - strategy: SHELL_EXEC = runnable command only; FILE_MUTATE = source file edit.
