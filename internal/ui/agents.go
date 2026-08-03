@@ -35,6 +35,10 @@ func (m *model) runInvestigateCmd(content string) tea.Cmd {
 func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 	currentMode := m.resolver.Current()
 
+	// Construct the Context Planner on the UI goroutine so the closure never
+	// races lazy construction with the main loop. Nil when no graph is ready.
+	planner := m.contextPlanner()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	// Register cancel so it can be invoked on mode transition/Ctrl+C
 	m.registerBackgroundCancel(cancel)
@@ -60,6 +64,12 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			executor := investigate.NewShellTestExecutor(".")
 			eng := investigate.NewEngineWithAI(".", content, retriever, executor, m.provider, m.cfg.ActiveModelName())
 			eng.WithEventBus(m.bus)
+			// Inject the Context Planner so the forensic diagnostics are
+			// enriched with intent-aware, budget-fitted structural context
+			// (tool logs, graph symbols) before the orchestrator dispatches.
+			if planner != nil {
+				eng.WithContextPlanner(planner)
+			}
 			// Classify intent from the investigation content to enforce ENV_DEPS guard.
 			// Feature/UnitTest/Refactor intents skip external dependency search and
 			// Docker checks — only Bug/Regression intents get full forensic treatment.

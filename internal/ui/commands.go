@@ -876,6 +876,18 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			}
 		}
 
+		// ── CONTEXT PLANNER INJECTION ─────────────────────────────────────
+		// The Context Planner sits between intent recognition and the prompt
+		// pipeline: it classifies the question, computes a token budget split
+		// per context source, queries only the intent-prioritized engines
+		// (Lea graph symbols, tool logs, architecture overview), and enforces
+		// the budget before the context reaches the LLM. The injection is a
+		// strict additive enrichment: it degrades silently to the untouched
+		// input when no graph is ready or the plan yields no chunks.
+		if m.resolver.Current() == modes.ModeAsk {
+			content = m.planContextForAsk(content)
+		}
+
 		if trace != nil {
 			return tea.Batch(
 				func() tea.Msg { return traceUpdateMsg{trace: trace} },

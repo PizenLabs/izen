@@ -76,6 +76,20 @@ type Engine struct {
 	// instead of being written directly to the terminal. Optional; nil routes
 	// telemetry back through the legacy package-level sinks.
 	bus *events.Bus
+
+	// planner enriches the forensic diagnostics with intent-aware,
+	// budget-fitted structural context before the AI orchestrator dispatches.
+	// Optional; nil disables the enrichment so headless/CLI runs behave
+	// exactly as before.
+	planner ContextPlanner
+}
+
+// ContextPlanner is the seam for intent-aware context planning. It is
+// satisfied by internal/planner.Planner (via PlanAssembled) and by test fakes.
+type ContextPlanner interface {
+	// PlanAssembled classifies the input and returns the assembled,
+	// budget-fitted context block, or "" when planning yields nothing.
+	PlanAssembled(ctx context.Context, input string) (string, error)
 }
 
 type InvestigationResult struct {
@@ -161,6 +175,14 @@ func (e *Engine) WithCapabilityRegistry(cr *wscap.ArchetypeCapabilityRegistry) *
 // runs headless and consumers subscribe as projections. May be nil.
 func (e *Engine) WithEventBus(bus *events.Bus) *Engine {
 	e.bus = bus
+	return e
+}
+
+// WithContextPlanner injects the Context Planner used to enrich forensic
+// diagnostics with intent-aware, budget-fitted structural context before the
+// AI orchestrator dispatches. May be nil (default): enrichment is skipped.
+func (e *Engine) WithContextPlanner(p ContextPlanner) *Engine {
+	e.planner = p
 	return e
 }
 
@@ -424,6 +446,23 @@ func (e *Engine) forceProbe(ctx context.Context) {
 	}
 }
 
+// enrichWithPlanner prefixes the diagnostics with intent-aware planned
+// context when a Context Planner is injected. It returns the input unchanged
+// when no planner is wired, planning errors, or planning yields no chunks.
+// The original diagnostics are always preserved verbatim so the failure
+// signature reaches the orchestrator intact.
+func (e *Engine) enrichWithPlanner(ctx context.Context, diagnostics string) string {
+	if e == nil || e.planner == nil || diagnostics == "" {
+		return diagnostics
+	}
+	planned, err := e.planner.PlanAssembled(ctx, diagnostics)
+	if err != nil || planned == "" {
+		return diagnostics
+	}
+	e.forensic("[planner] enriched diagnostics with planned structural context")
+	return planned + "\n\n" + diagnostics
+}
+
 func (e *Engine) stateObserve(ctx context.Context) error {
 	observed := fmt.Sprintf("Observing problem: %s", e.Problem)
 	e.Evidence.Add(EvSourceUser, observed, "", 0, 0.2)
@@ -485,6 +524,15 @@ func (e *Engine) dispatchForensics(ctx context.Context) {
 
 	dctx, dcancel := boundedDispatchCtx(ctx)
 	defer dcancel()
+
+	// ── CONTEXT PLANNER ENRICHMENT ───────────────────────────────────────
+	// When a Context Planner is injected, the raw diagnostics are enriched
+	// with intent-aware, budget-fitted structural context (tool logs, Lea
+	// graph symbols, architecture overview) before the orchestrator classifies.
+	// The planner output is a strict additive prefix: the original diagnostics
+	// are preserved verbatim so downstream classification never loses the
+	// failure signature. Nil planner = no-op, preserving headless behavior.
+	diagnostics = e.enrichWithPlanner(dctx, diagnostics)
 
 	// DispatchStrategy selects the tool but its Rationale field is NOT logged —
 	// it is a pre-decision classification label, not a verified fact.
