@@ -109,6 +109,10 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 		pipeline.WithModel(pipeline.IntentReasoning, cfg.ResolveTierModel("reasoning")),
 		pipeline.WithModel(pipeline.IntentExecution, cfg.ResolveTierModel("execution")),
 		pipeline.WithModel(pipeline.IntentInformational, cfg.ResolveTierModel("informational")),
+		pipeline.WithProvider(pipeline.IntentReasoning, cfg.ResolveTierProvider("reasoning")),
+		pipeline.WithProvider(pipeline.IntentExecution, cfg.ResolveTierProvider("execution")),
+		pipeline.WithProvider(pipeline.IntentInformational, cfg.ResolveTierProvider("informational")),
+		pipeline.WithFallbackModel(cfg.ResolveTierModel("execution")),
 	)
 	pipeOpts := []pipeline.Option{
 		pipeline.WithEventBus(telemetry.NewEventBus(telemetry.DefaultBufferSize)),

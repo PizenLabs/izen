@@ -57,3 +57,29 @@ func TestActiveRouteModelUsesCurrentMode(t *testing.T) {
 		t.Errorf("activeRouteModel in plan mode = %q, want heavy-1", got)
 	}
 }
+
+// TestSyncPipelineTiersProviderSwitch pins the reported bug: after the active
+// provider switches to OpenRouter, the layered pipeline router must re-resolve
+// its intent tiers so the /ask prompt-synthesis handoff never sends the stale
+// local model ID ("qwen2.5-coder:7b") to OpenRouter.
+func TestSyncPipelineTiersProviderSwitch(t *testing.T) {
+	pe := pipeline.NewEngine(t.TempDir(), nil,
+		pipeline.WithRouter(pipeline.NewRouter(
+			pipeline.WithModel(pipeline.IntentInformational, "qwen2.5-coder:7b"),
+		)),
+	)
+	cfg := config.Default()
+	cfg.AI.DefaultProvider = "openrouter"
+	m := &model{pipelineEngine: pe, cfg: cfg}
+
+	// Before sync the router still carries the stale local pin.
+	if got := m.routeModel("ask"); got != "qwen2.5-coder:7b" {
+		t.Fatalf("routeModel(ask) before sync = %q, want stale qwen2.5-coder:7b", got)
+	}
+
+	m.syncPipelineTiers()
+
+	if got := m.routeModel("ask"); got != "anthropic/claude-3.5-sonnet" {
+		t.Errorf("routeModel(ask) after sync = %q, want openrouter default anthropic/claude-3.5-sonnet", got)
+	}
+}

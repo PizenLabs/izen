@@ -1949,6 +1949,9 @@ func (m *model) switchModelDirect(modelName string) tea.Cmd {
 	// the change before the provider switch completes.
 	m.sessionModel = modelName
 	m.cfg.Models.SessionModel = modelName
+	// Re-pin the pipeline router intent tiers to the newly active model so
+	// mode commands never route a stale local model into a cloud request.
+	m.syncPipelineTiers()
 
 	// Determine the provider for this model. If we couldn't resolve it from
 	// tier config, try to infer from the model name format.

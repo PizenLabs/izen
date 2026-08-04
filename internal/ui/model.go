@@ -1105,6 +1105,32 @@ func (m *model) routeModel(mode string) string {
 	return ""
 }
 
+// syncPipelineTiers re-pins the layered pipeline router's per-intent models to
+// the current configuration. It MUST be called whenever the active provider or
+// model tier changes at runtime (provider switch, /model selection, config
+// reload) so intent routing never serves a model that was pinned to a provider
+// which is no longer active — an Ollama model leaking into an OpenRouter
+// request fails with HTTP 400 "not a valid model ID".
+func (m *model) syncPipelineTiers() {
+	if m == nil || m.cfg == nil {
+		return
+	}
+	var eng *pipeline.Engine
+	switch {
+	case m.pipelineEngine != nil:
+		eng = m.pipelineEngine
+	case m.orch != nil:
+		eng = m.orch.Pipeline()
+	}
+	if eng == nil {
+		return
+	}
+	eng.Router().SyncTiers(func(i pipeline.Intent) (string, string) {
+		tier := i.String()
+		return m.cfg.ResolveTierModel(tier), m.cfg.ResolveTierProvider(tier)
+	})
+}
+
 // isProjectInitialized checks whether .izen/ exists AND contains a valid
 // config.json on disk. This is the AUTHORITATIVE first-run gate used by
 // BuildWorkspace to decide whether to render the onboarding overlay or the

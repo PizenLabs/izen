@@ -134,6 +134,34 @@ func (r *Router) FallbackModel() string {
 	return r.fallback
 }
 
+// SyncTiers re-pins the per-intent model and provider selections from a
+// resolver. It is the runtime refresh seam: callers that switch the active
+// provider or model tier after construction (e.g. /model or a config reload)
+// invoke it so the router never serves a model that was pinned to a
+// no-longer-active provider (an Ollama model leaking into an OpenRouter
+// request fails with HTTP 400 "not a valid model ID"). Empty models returned
+// by the resolver leave the current pin in place; empty providers leave the
+// current provider pin in place.
+func (r *Router) SyncTiers(resolve func(Intent) (model, provider string)) {
+	if r == nil || resolve == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, i := range allIntents {
+		model, provider := resolve(i)
+		if model != "" {
+			r.models[i] = model
+			if i == IntentExecution {
+				r.fallback = model
+			}
+		}
+		if provider != "" {
+			r.providers[i] = provider
+		}
+	}
+}
+
 // Policy returns the context policy the router uses for an intent. It never
 // returns an invalid policy; unknown intents fall back to the execution
 // policy.

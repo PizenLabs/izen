@@ -99,3 +99,51 @@ func TestRouteProfileValid(t *testing.T) {
 		t.Error("profile without model reported valid")
 	}
 }
+
+func TestRouterSyncTiers(t *testing.T) {
+	r := NewRouter(
+		WithModel(IntentReasoning, "stale-ollama-model"),
+		WithModel(IntentExecution, "stale-ollama-model"),
+		WithModel(IntentInformational, "stale-ollama-model"),
+		WithProvider(IntentReasoning, "ollama"),
+	)
+
+	// Re-pin every intent to the active (cloud) provider tier.
+	r.SyncTiers(func(i Intent) (string, string) {
+		switch i {
+		case IntentReasoning:
+			return "openrouter/heavy", "openrouter"
+		case IntentExecution:
+			return "openrouter/fast", "openrouter"
+		case IntentInformational:
+			return "openrouter/mini", "openrouter"
+		default:
+			return "", ""
+		}
+	})
+
+	if got := r.RouteFor(IntentReasoning).Model; got != "openrouter/heavy" {
+		t.Errorf("reasoning model after sync = %q, want openrouter/heavy", got)
+	}
+	if got := r.RouteFor(IntentReasoning).Provider; got != "openrouter" {
+		t.Errorf("reasoning provider after sync = %q, want openrouter", got)
+	}
+	if got := r.RouteFor(IntentExecution).Model; got != "openrouter/fast" {
+		t.Errorf("execution model after sync = %q, want openrouter/fast", got)
+	}
+	if got := r.RouteFor(IntentInformational).Model; got != "openrouter/mini" {
+		t.Errorf("informational model after sync = %q, want openrouter/mini", got)
+	}
+	// The fallback mirrors the execution tier so unknown intents never
+	// inherit a stale local model.
+	if got := r.FallbackModel(); got != "openrouter/fast" {
+		t.Errorf("fallback after sync = %q, want openrouter/fast", got)
+	}
+
+	// A nil resolver is a no-op: existing pins are preserved.
+	r2 := NewRouter(WithModel(IntentExecution, "keep-1"))
+	r2.SyncTiers(nil)
+	if got := r2.RouteFor(IntentExecution).Model; got != "keep-1" {
+		t.Errorf("execution model after nil sync = %q, want keep-1", got)
+	}
+}

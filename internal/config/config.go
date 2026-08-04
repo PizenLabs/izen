@@ -123,21 +123,37 @@ func (c *Config) ActiveStylePolicy() prompt.StylePolicy {
 	return p
 }
 
-// ResolveTierModel returns the effective model for the given intent tier.
-// It first checks for an active_override (set via /model), then falls back
-// to the tier's model, then to the global ModelConfig.Default.
+// ResolveTierModel returns the effective model for the given intent tier,
+// scoped to the currently active provider. It first checks for an
+// active_override (set via /model), then falls back to the tier's model, then
+// to the global ModelConfig.Default. A tier entry whose pinned provider differs
+// from the active provider is treated as stale (e.g. an Ollama model pinned to
+// the "informational" tier while OpenRouter is active) and is skipped, so a
+// request can never be routed to the wrong provider with an invalid model ID.
 func (c *Config) ResolveTierModel(tier string) string {
 	if c.Models.Tiers != nil {
 		if tc, ok := c.Models.Tiers[tier]; ok {
 			if tc.ActiveOverride != "" {
 				return tc.ActiveOverride
 			}
-			if tc.Model != "" {
+			if tc.Model != "" && (tc.Provider == "" || tc.Provider == c.ActiveProviderName()) {
 				return tc.Model
 			}
 		}
 	}
 	return c.ActiveModelName()
+}
+
+// ResolveTierProvider returns the provider that owns the model resolved for an
+// intent tier. It returns the tier's pinned provider only when that provider is
+// the currently active one; otherwise the active provider owns the route.
+func (c *Config) ResolveTierProvider(tier string) string {
+	if c.Models.Tiers != nil {
+		if tc, ok := c.Models.Tiers[tier]; ok && tc.Provider != "" && tc.Provider == c.ActiveProviderName() {
+			return tc.Provider
+		}
+	}
+	return c.ActiveProviderName()
 }
 
 // SetTierOverride sets the active_override for the given intent tier,
