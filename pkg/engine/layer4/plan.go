@@ -263,13 +263,13 @@ func (r *Resolver) BuildDAG(validatorFor func(stage Stage) (Validator, error)) (
 }
 
 // dependenciesOf returns the node ids a planned stage must wait for. The
-// cheap in-RAM stages are roots; lint waits for syntax; build and test wait
-// for every cheaper stage present in the plan, chaining through the cheapest
-// available prerequisite when a capability is absent.
+// cheap in-RAM stages are roots; lint waits for both structural and syntax;
+// build and test wait for every cheaper stage present in the plan, chaining
+// through the cheapest available prerequisite when a capability is absent.
 func dependenciesOf(stage Stage, plan *ValidationPlan) []string {
 	switch stage {
 	case StageLint:
-		return []string{string(StageSyntax)}
+		return []string{string(StageStructural), string(StageSyntax)}
 	case StageBuild:
 		return cheapPrerequisites(plan)
 	case StageTest:

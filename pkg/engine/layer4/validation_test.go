@@ -218,12 +218,12 @@ func TestResolverBuildDAG(t *testing.T) {
 	if got := idsOf(order); !equalStrings(got, []string{"structural", "syntax", "lint", "build", "test"}) {
 		t.Errorf("order = %v", got)
 	}
-	// Dependency wiring: cheap stages are roots; lint gates on syntax; build
-	// gates on every cheaper stage; test gates on build.
+	// Dependency wiring: cheap stages are roots; lint gates on structural and
+	// syntax; build gates on every cheaper stage; test gates on build.
 	checks := map[string][]string{
 		"structural": {},
 		"syntax":     {},
-		"lint":       {"syntax"},
+		"lint":       {"structural", "syntax"},
 		"build":      {"structural", "syntax", "lint"},
 		"test":       {"build"},
 	}
