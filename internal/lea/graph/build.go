@@ -9,11 +9,13 @@ import (
 
 // FileExtract retains the raw call/route data of an indexed file so CALLS and
 // HTTP_HANDLES edges can be deterministically re-resolved after every
-// incremental change.
+// incremental change. Imports retains the raw import path strings for
+// file-centric import/dependent queries (external imports produce no edges).
 type FileExtract struct {
-	File   string
-	Calls  []symbol.CallSite
-	Routes []symbol.HTTPRoute
+	File    string
+	Calls   []symbol.CallSite
+	Routes  []symbol.HTTPRoute
+	Imports []string
 }
 
 // Build replaces the graph contents with the structural view of files.
@@ -110,10 +112,25 @@ func (g *Graph) upsertFileLocked(fi symbol.FileASTInfo) {
 	g.addImportEdgesLocked(fileNode, dir, fi.Imports)
 	g.addRouteNodesLocked(fi, dir, path)
 	g.fileExtracts[path] = FileExtract{
-		File:   path,
-		Calls:  fi.Calls,
-		Routes: fi.Routes,
+		File:    path,
+		Calls:   fi.Calls,
+		Routes:  fi.Routes,
+		Imports: importPaths(fi.Imports),
 	}
+}
+
+// importPaths extracts the raw import path strings from dependency edges.
+func importPaths(imports []symbol.DependencyEdge) []string {
+	if len(imports) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(imports))
+	for _, imp := range imports {
+		if imp.ImportPath != "" {
+			out = append(out, imp.ImportPath)
+		}
+	}
+	return out
 }
 
 func (g *Graph) ensurePackageLocked(dir, goPkg string) string {

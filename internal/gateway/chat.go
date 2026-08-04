@@ -1,6 +1,10 @@
 package gateway
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/PizenLabs/izen/internal/prompt"
+)
 
 // casualGreetingPatterns are phrases that indicate a casual,
 // non-coding interaction (greeting, small talk, general question).
@@ -102,9 +106,10 @@ func IsCasualChat(input string) bool {
 // CasualChatSystemPrompt returns the minimal system prompt for
 // casual chat interactions (under 50 tokens). Always identifies
 // the model as IZEN so that typos or unknown intents never
-// produce identity leaks (e.g. "Claude").
+// produce identity leaks (e.g. "Claude"). Response verbosity is
+// governed by the active StylePolicy, not a hardcoded directive.
 func CasualChatSystemPrompt() string {
-	return "You are IZEN, a fast CLI coding companion created for terminal power-users. Always identify as IZEN if asked about your name, role, or identity. Respond concisely in 1-2 short sentences."
+	return prompt.CasualChatSystemPrompt()
 }
 
 // CasualChatMaxTokens returns the max_tokens budget for casual chat

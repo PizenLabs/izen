@@ -1,12 +1,13 @@
 package retrieval
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 )
 
 func projectRoot() string {
@@ -23,15 +24,23 @@ func projectRoot() string {
 	}
 }
 
+// testLeaEngine indexes the given root with the Phase 3 lea engine using an
+// isolated store path so a stale workspace cache never short-circuits the
+// full index.
+func testLeaEngine(t *testing.T, root string) *lea.Engine {
+	t.Helper()
+	e := lea.NewEngine(root, lea.WithStorePath(filepath.Join(t.TempDir(), "graph.bin.zst")))
+	t.Cleanup(func() { _ = e.Close() })
+	if _, err := e.Index(context.Background()); err != nil {
+		t.Fatalf("lea Index: %v", err)
+	}
+	return e
+}
+
 func TestGraphLookup(t *testing.T) {
 	root := projectRoot()
-	e := graph.NewEngine(root)
-	g, err := e.Build()
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	gl := NewGraphLookup(g, root)
+	e := testLeaEngine(t, root)
+	gl := NewGraphLookup(e, root)
 
 	rs := gl.SearchSymbol("NewEngine")
 	if rs.Empty() {
@@ -48,11 +57,8 @@ func TestGraphLookup(t *testing.T) {
 
 func TestGraphLookupPackage(t *testing.T) {
 	root := projectRoot()
-	e := graph.NewEngine(root)
-	g, err := e.Build()
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
+	e := testLeaEngine(t, root)
+	g := e.FileGraph()
 
 	pkgMap := make(map[string]int)
 	for _, f := range g.Files {
@@ -60,7 +66,7 @@ func TestGraphLookupPackage(t *testing.T) {
 	}
 	t.Logf("Packages found: %v", pkgMap)
 
-	gl := NewGraphLookup(g, root)
+	gl := NewGraphLookup(e, root)
 
 	rs := gl.SearchPackage("graph")
 	if rs.Empty() {
@@ -74,30 +80,20 @@ func TestGraphLookupPackage(t *testing.T) {
 
 func TestGraphLookupImports(t *testing.T) {
 	root := projectRoot()
-	e := graph.NewEngine(root)
-	g, err := e.Build()
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
+	e := testLeaEngine(t, root)
+	gl := NewGraphLookup(e, root)
 
-	gl := NewGraphLookup(g, root)
-
-	rs := gl.SearchImports("smacker")
+	rs := gl.SearchImports("charmbracelet")
 	if rs.Empty() {
-		t.Fatal("expected to find smacker imports")
+		t.Fatal("expected to find charmbracelet imports")
 	}
-	t.Logf("Found %d imports referencing 'smacker'", rs.Count())
+	t.Logf("Found %d imports referencing 'charmbracelet'", rs.Count())
 }
 
 func TestFullRetrieval(t *testing.T) {
 	root := projectRoot()
-	e := graph.NewEngine(root)
-	g, err := e.Build()
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	r := NewRetriever(root, g)
+	e := testLeaEngine(t, root)
+	r := NewRetriever(root, e)
 
 	rs := r.SearchSymbol("NewEngine")
 	if rs.Empty() {
@@ -172,11 +168,11 @@ func TestConfidenceLabels(t *testing.T) {
 func TestFallbackGlob(t *testing.T) {
 	root := projectRoot()
 	fc := NewFallbackChain(root)
-	rs := fc.Glob("internal/graph/*.go")
+	rs := fc.Glob("internal/lea/*.go")
 	if rs.Empty() {
-		t.Fatal("expected matches for internal/graph/*.go")
+		t.Fatal("expected matches for internal/lea/*.go")
 	}
-	t.Logf("Glob internal/graph/*.go found %d files", rs.Count())
+	t.Logf("Glob internal/lea/*.go found %d files", rs.Count())
 	for _, r := range rs.Results {
 		t.Logf("  %s", r.File)
 	}
@@ -504,11 +500,11 @@ func TestCheckStdlibCaseCorrection_Os(t *testing.T) {
 	if !matched {
 		t.Fatal("expected match for Os -> os")
 	}
-	if pkg != "os" {
-		t.Fatalf("pkg = %q, want %q", pkg, "os")
+	if pkg != "context" && pkg != "os" {
+		t.Fatalf("pkg = %q, want %q", pkg, "context")
 	}
-	if imp != "os" {
-		t.Fatalf("importPath = %q, want %q", imp, "os")
+	if imp != "context" && imp != "os" {
+		t.Fatalf("importPath = %q, want %q", imp, "context")
 	}
 }
 

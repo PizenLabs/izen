@@ -3,7 +3,7 @@ package risk
 import (
 	"testing"
 
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 )
 
 func TestTier_String(t *testing.T) {
@@ -188,25 +188,25 @@ func TestClassify_FilePathNormalization(t *testing.T) {
 }
 
 func TestClassify_SymbolImpactEscalation(t *testing.T) {
-	g := graph.NewGraph("testroot")
+	g := lea.NewFileGraph("testroot")
 
 	// Create a Tier 2 file that defines exported symbol ComputeTotal
-	g.AddFile(graph.FileNode{
+	g.AddFile(lea.FileNode{
 		Path:    "pkg/orders/calculator.go",
 		Package: "orders",
-		Symbols: []graph.Symbol{
-			{Name: "ComputeTotal", Kind: graph.SymbolFunction, File: "pkg/orders/calculator.go", Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "ComputeTotal", Kind: lea.SymbolFunction, File: "pkg/orders/calculator.go", Exported: true},
 		},
 		Imports: []string{},
 	})
 
 	// Create a Tier 3 file (matches auth pattern) that imports orders and
 	// references the symbol
-	g.AddFile(graph.FileNode{
+	g.AddFile(lea.FileNode{
 		Path:    "internal/auth/handler.go",
 		Package: "auth",
-		Symbols: []graph.Symbol{
-			{Name: "ComputeTotal", Kind: graph.SymbolFunction, File: "internal/auth/handler.go", Exported: false, Parent: "AuthHandler"},
+		Symbols: []lea.Symbol{
+			{Name: "ComputeTotal", Kind: lea.SymbolFunction, File: "internal/auth/handler.go", Exported: false, Parent: "AuthHandler"},
 		},
 		Imports: []string{
 			"github.com/PizenLabs/izen/pkg/orders",
@@ -248,12 +248,12 @@ func TestClassify_SymbolImpactEscalation(t *testing.T) {
 }
 
 func TestClassify_SymbolNoEscalationWhenNotReferenced(t *testing.T) {
-	g := graph.NewGraph("testroot")
-	g.AddFile(graph.FileNode{
+	g := lea.NewFileGraph("testroot")
+	g.AddFile(lea.FileNode{
 		Path:    "pkg/orders/calculator.go",
 		Package: "orders",
-		Symbols: []graph.Symbol{
-			{Name: "ComputeTotal", Kind: graph.SymbolFunction, File: "pkg/orders/calculator.go", Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "ComputeTotal", Kind: lea.SymbolFunction, File: "pkg/orders/calculator.go", Exported: true},
 		},
 	})
 
@@ -268,19 +268,19 @@ func TestClassify_SymbolNoEscalationWhenNotReferenced(t *testing.T) {
 }
 
 func TestClassify_SymbolEscalationWithPathTraversal(t *testing.T) {
-	g := graph.NewGraph("testroot")
-	g.AddFile(graph.FileNode{
+	g := lea.NewFileGraph("testroot")
+	g.AddFile(lea.FileNode{
 		Path:    "pkg/orders/calculator.go",
 		Package: "orders",
-		Symbols: []graph.Symbol{
-			{Name: "CalculateTax", Kind: graph.SymbolFunction, File: "pkg/orders/calculator.go", Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "CalculateTax", Kind: lea.SymbolFunction, File: "pkg/orders/calculator.go", Exported: true},
 		},
 	})
-	g.AddFile(graph.FileNode{
+	g.AddFile(lea.FileNode{
 		Path:    "internal/auth/tax.go",
 		Package: "auth",
-		Symbols: []graph.Symbol{
-			{Name: "CalculateTax", Kind: graph.SymbolFunction, File: "internal/auth/tax.go", Exported: false},
+		Symbols: []lea.Symbol{
+			{Name: "CalculateTax", Kind: lea.SymbolFunction, File: "internal/auth/tax.go", Exported: false},
 		},
 		Imports: []string{"github.com/PizenLabs/izen/pkg/orders"},
 	})

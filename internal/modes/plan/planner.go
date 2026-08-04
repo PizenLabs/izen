@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/git"
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 )
 
 // Task represents a single tactical operation in the markdown-based task system.
@@ -93,13 +93,13 @@ func ParseMarkdownToTasks(mdContent string) []Task {
 // Planner handles deterministic plan context assembly by querying the local AST
 // graph and git working tree BEFORE dispatching the LLM payload.
 type Planner struct {
-	graph  *graph.Graph
+	graph  *lea.FileGraph
 	gitEng *git.Engine
 	root   string
 }
 
 // NewPlanner creates a Planner wired to the project's AST graph and git engine.
-func NewPlanner(root string, g *graph.Graph, ge *git.Engine) *Planner {
+func NewPlanner(root string, g *lea.FileGraph, ge *git.Engine) *Planner {
 	return &Planner{
 		root:   root,
 		graph:  g,

@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/lea"
 	leagraph "github.com/PizenLabs/izen/internal/lea/graph"
 	"github.com/PizenLabs/izen/internal/retrieval"
@@ -152,20 +151,20 @@ func formatCallTree(b *strings.Builder, tree lea.CallTree, depth int) {
 
 // ── Native graph adapter (integration seam) ───────────────────────────────────
 
-// GraphAdapter backs the planner's GraphSource with the native in-memory
-// graph (internal/graph). It supports symbol resolution and a lightweight
-// package overview; call-chain and route data are not available in the native
-// graph and degrade to empty strings.
+// GraphAdapter backs the planner's GraphSource with a file-centric view of the
+// structural graph (lea.FileGraph). It supports symbol resolution and a
+// lightweight package overview; call-chain and route data are not available in
+// the file-centric shape and degrade to empty strings.
 type GraphAdapter struct {
-	g *graph.Graph
+	g *lea.FileGraph
 }
 
-// NewGraphAdapter wraps a native graph as a planner GraphSource.
-func NewGraphAdapter(g *graph.Graph) *GraphAdapter {
+// NewGraphAdapter wraps a file-centric structural graph as a planner GraphSource.
+func NewGraphAdapter(g *lea.FileGraph) *GraphAdapter {
 	return &GraphAdapter{g: g}
 }
 
-// ResolveSymbol resolves a symbol to its definitions in the native graph.
+// ResolveSymbol resolves a symbol to its definitions in the file-centric graph.
 func (a *GraphAdapter) ResolveSymbol(ctx context.Context, symbol string) ([]SymbolRef, error) {
 	if a == nil || a.g == nil {
 		return nil, nil
@@ -192,12 +191,12 @@ func (a *GraphAdapter) ResolveSymbol(ctx context.Context, symbol string) ([]Symb
 	return out, nil
 }
 
-// CallChain is unavailable in the native graph.
+// CallChain is unavailable in the file-centric graph.
 func (a *GraphAdapter) CallChain(ctx context.Context, symbol string, depth int) (string, error) {
 	return "", nil
 }
 
-// ArchitectureSummary renders a compact package overview from the native graph.
+// ArchitectureSummary renders a compact package overview from the graph.
 func (a *GraphAdapter) ArchitectureSummary(ctx context.Context) (string, error) {
 	if a == nil || a.g == nil {
 		return "", nil
@@ -228,7 +227,7 @@ func (a *GraphAdapter) ArchitectureSummary(ctx context.Context) (string, error) 
 	return strings.TrimSpace(b.String()), nil
 }
 
-// Routes is unavailable in the native graph.
+// Routes is unavailable in the file-centric graph.
 func (a *GraphAdapter) Routes(ctx context.Context) (string, error) {
 	return "", nil
 }

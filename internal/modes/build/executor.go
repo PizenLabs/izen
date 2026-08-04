@@ -13,6 +13,7 @@ import (
 	"github.com/PizenLabs/izen/internal/controlplane/guard"
 	"github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/runtime/output"
 	wschk "github.com/PizenLabs/izen/internal/workspace/checkpoint"
 	wsfail "github.com/PizenLabs/izen/internal/workspace/failure"
 )
@@ -136,6 +137,12 @@ type Executor struct {
 	// deterministic hook tests use to drive the self-healing loop without a Go
 	// toolchain. Nil preserves the real compiler path.
 	verifyCompilation func(ctx context.Context, packages ...string) (bool, string, error)
+
+	// pipeline is the Phase 1 Tool Output Intelligence pipeline. Compilation
+	// output is normalized, classified, semantically compressed and (with a
+	// workspace tee) logged to `.logs/`. Nil keeps the executor a pure
+	// transformation-free verifier (headless/tests).
+	pipeline *output.Pipeline
 }
 
 func NewExecutor(root string, engine *Engine) *Executor {
@@ -143,7 +150,15 @@ func NewExecutor(root string, engine *Engine) *Executor {
 		root:                  root,
 		engine:                engine,
 		maxSelfHealingRetries: DefaultMaxSelfHealingRetries,
+		pipeline:              output.New().WithWorkspace(root),
 	}
+}
+
+// WithPipeline overrides the output pipeline used for compilation output. Nil
+// disables normalization/compression/tee-logging.
+func (ex *Executor) WithPipeline(p *output.Pipeline) *Executor {
+	ex.pipeline = p
+	return ex
 }
 
 // WithConfig overrides the executor configuration (self-healing retry bound).
@@ -327,6 +342,15 @@ func (ex *Executor) VerifyCompilation(ctx context.Context, packages ...string) (
 	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = ex.root
 	output, err := cmd.CombinedOutput()
+
+	// ── TOOL OUTPUT PIPELINE (PHASE 1) ──────────────────────────────────
+	// Compilation output is normalized, classified (GO_TEST/LINTER_GO/GENERIC),
+	// semantically compressed and tee-logged to `.logs/` so the planner's log
+	// source and failure analysis always see the canonical form. The raw
+	// output still drives the success/failure return below.
+	if ex.pipeline != nil {
+		ex.pipeline.Process("go "+strings.Join(args, " "), output)
+	}
 
 	if err != nil {
 		var exitErr *exec.ExitError

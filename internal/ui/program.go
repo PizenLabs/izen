@@ -26,8 +26,8 @@ import (
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
-	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/language"
+	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -81,7 +81,14 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 		provider = defaultP
 	}
 
-	graphEng := graph.NewEngine(root)
+	// ── LEA STRUCTURAL ENGINE (PHASE 3) ─────────────────────────────────
+	// The canonical structural intelligence engine: it indexes the workspace
+	// into an in-memory graph (persisted to .izen/graph.bin.zst) serving the
+	// context planner (GraphSource), the /arch analysis, and the retrieval
+	// graph tier. Indexing runs in a background goroutine below — and is
+	// gated on completed onboarding, because its cache write creates .izen/
+	// and must not trip HasLocalState during the init flow.
+	leaEng := lea.NewEngine(root)
 
 	ti := textinput.New()
 	ti.Prompt = ""
@@ -163,11 +170,11 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 	}
 
 	// ── DEFERRED GRAPH LOAD ─────────────────────────────────────────────
-	// Graph cache must not be loaded before the onboarding detector runs,
-	// because BuildOrLoad creates .izen/graph/ and would cause a false
+	// The file-centric graph view must not be loaded before the onboarding
+	// detector runs, because indexing creates .izen/ and would cause a false
 	// positive in HasLocalState, bypassing the TUI onboarding flow.
-	// The graph is rebuilt incrementally in a background goroutine below.
-	g := graph.NewGraph(root)
+	// The graph is indexed in a background goroutine below.
+	g := lea.NewFileGraph(root)
 
 	// ── Explicit mode registry (deterministic bootstrap) ──────────────
 	// Modes are registered here, in one place, instead of via implicit
@@ -286,8 +293,8 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 		provider:            provider,
 		mgr:                 mgr,
 		gitEng:              eng,
-		graphEng:            graphEng,
 		graph:               g,
+		leaEng:              leaEng,
 		extractorRegistry:   retrieval.NewPolyglotRegistry(),
 		resolver:            modes.NewResolver(),
 		attachedFiles:       make([]string, 0),
@@ -377,6 +384,26 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 	investigate.SetDispatchLog(activityFn)
 
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+
+	// ── BACKGROUND LEA INDEXING ─────────────────────────────────────────
+	// Boot the Phase 3 structural engine in the background so the TUI never
+	// blocks on the (potentially large) full index. It is gated on completed
+	// onboarding because the engine persists its cache under .izen/ — running
+	// it during the init flow would create a false positive in HasLocalState
+	// and silently bypass the setup wizard. Once indexed, /arch and the
+	// context planner read straight from the Lea graph. The graphBuiltMsg
+	// drives the model's indexingStatus and populates the file-centric graph.
+	if initStage == initComplete && state.HasLocalState(root) {
+		go func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if err := leaEng.Start(ctx); err != nil {
+				p.Send(graphBuiltMsg{err: err})
+				return
+			}
+			p.Send(graphBuiltMsg{graph: leaEng.FileGraph()})
+		}()
+	}
 
 	// ── PRESENTATION EVENT PROJECTION SUBSCRIPTION ────────────────────────
 	// The Application layer translates the engine domain events into
@@ -512,34 +539,13 @@ func bootCommon(root string, cfg *config.Config) (*session.Session, *ai.Manager,
 	return sess, mgr, router
 }
 
-func runProgram(p *tea.Program, root string, graphEng *graph.Engine, initStage initStage) {
+func runProgram(p *tea.Program, root string, initStage initStage) {
 	configCh := make(chan bool, 1)
 	config.StartConfigWatcher(configCh)
 	go func() {
 		for range configCh {
 			p.Send(config.ConfigChangeMsg{})
 		}
-	}()
-
-	// ── BACKGROUND INDEXING ─────────────────────────────────────
-	// Launch graph building in a background goroutine so the TUI
-	// boots instantly. The model tracks indexingStatus and the
-	// header renders an indicator. When indexing completes, a
-	// graphBuiltMsg or graphIndexingMsg is sent through the
-	// Bubble Tea event loop.
-	go func() {
-		if initStage == initComplete && state.HasLocalState(root) {
-			g2, fromCache, err := graphEng.BuildOrLoadIncremental()
-			if err != nil {
-				p.Send(graphBuiltMsg{err: err})
-				return
-			}
-			if g2 != nil {
-				p.Send(graphBuiltMsg{graph: g2})
-			}
-			_ = fromCache
-		}
-		p.Send(graphIndexingMsg{indexing: false})
 	}()
 
 	if _, err := p.Run(); err != nil {
@@ -570,7 +576,6 @@ func RunMainDashboardWithApp(cfg *config.Config, root string, localCfg *config.L
 		detection = det[0]
 	}
 
-	graphEng := graph.NewEngine(root)
 	initStage := initComplete
 	localCfgPath := filepath.Join(root, ".izen", "config.json")
 	_, localCfgErr := os.Stat(localCfgPath)
@@ -585,7 +590,7 @@ func RunMainDashboardWithApp(cfg *config.Config, root string, localCfg *config.L
 	}
 
 	p := NewProgramWithApp(root, cfg, sess, mgr, localCfg, app, detection)
-	runProgram(p, root, graphEng, initStage)
+	runProgram(p, root, initStage)
 }
 
 func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalConfig, det ...project.Detection) {
@@ -610,7 +615,6 @@ func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalCo
 		detection = det[0]
 	}
 
-	graphEng := graph.NewEngine(root)
 	initStage := initComplete
 	localCfgPath := filepath.Join(root, ".izen", "config.json")
 	_, localCfgErr := os.Stat(localCfgPath)
@@ -625,7 +629,7 @@ func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalCo
 	}
 
 	p := NewProgram(root, cfg, sess, mgr, localCfg, detection)
-	runProgram(p, root, graphEng, initStage)
+	runProgram(p, root, initStage)
 }
 
 // projectContextFor returns a safe ProjectContext from project detection.

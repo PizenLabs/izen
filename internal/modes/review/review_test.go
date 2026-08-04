@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/git"
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 	riview "github.com/PizenLabs/izen/internal/review"
 )
 
@@ -819,22 +819,22 @@ func TestImpactAnalyzerExtractPackagesRootLevel(t *testing.T) {
 
 func TestImpactAnalyzerWithGraph(t *testing.T) {
 	dir := t.TempDir()
-	g := graph.NewGraph(dir)
-	g.AddFile(graph.FileNode{
+	g := lea.NewFileGraph(dir)
+	g.AddFile(lea.FileNode{
 		Path:     "pkg/foo.go",
 		Package:  "pkg",
 		Language: "go",
-		Symbols: []graph.Symbol{
-			{Name: "Foo", Kind: graph.SymbolFunction, File: "pkg/foo.go", Line: 1, Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "Foo", Kind: lea.SymbolFunction, File: "pkg/foo.go", Line: 1, Exported: true},
 		},
 		Imports: []string{},
 	})
-	g.AddFile(graph.FileNode{
+	g.AddFile(lea.FileNode{
 		Path:     "pkg/bar.go",
 		Package:  "pkg",
 		Language: "go",
-		Symbols: []graph.Symbol{
-			{Name: "Bar", Kind: graph.SymbolFunction, File: "pkg/bar.go", Line: 5, Exported: false},
+		Symbols: []lea.Symbol{
+			{Name: "Bar", Kind: lea.SymbolFunction, File: "pkg/bar.go", Line: 5, Exported: false},
 		},
 		Imports: []string{"pkg/foo.go"},
 	})
@@ -857,12 +857,12 @@ func TestImpactAnalyzerWithGraph(t *testing.T) {
 
 func TestImpactAnalyzerExtractAffectedSymbols(t *testing.T) {
 	dir := t.TempDir()
-	g := graph.NewGraph(dir)
-	g.AddFile(graph.FileNode{
+	g := lea.NewFileGraph(dir)
+	g.AddFile(lea.FileNode{
 		Path: "pkg/foo.go",
-		Symbols: []graph.Symbol{
-			{Name: "Foo", Kind: graph.SymbolFunction, File: "pkg/foo.go", Line: 1, Exported: true},
-			{Name: "helper", Kind: graph.SymbolFunction, File: "pkg/foo.go", Line: 10, Exported: false},
+		Symbols: []lea.Symbol{
+			{Name: "Foo", Kind: lea.SymbolFunction, File: "pkg/foo.go", Line: 1, Exported: true},
+			{Name: "helper", Kind: lea.SymbolFunction, File: "pkg/foo.go", Line: 10, Exported: false},
 		},
 	})
 

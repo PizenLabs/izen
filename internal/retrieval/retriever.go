@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/core/artifact"
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 )
 
 var globalRouter *Router
@@ -29,9 +29,9 @@ func GetGlobalCompressor() *ContextCompressor {
 	return globalCompressor
 }
 
-func BuildGlobalCompressor(g *graph.Graph, objective string) {
-	if g != nil {
-		globalCompressor = NewContextCompressorFromGraph(g, objective)
+func BuildGlobalCompressor(fg *lea.FileGraph, objective string) {
+	if fg != nil {
+		globalCompressor = NewContextCompressorFromGraph(fg, objective)
 	}
 }
 
@@ -88,14 +88,26 @@ func WithEvidenceStore(s *artifact.Store) RetrieverOption {
 	}
 }
 
+// WithLeaEngine redirects the graph tier onto the Phase 3 Lea structural
+// engine. When set, symbol/file/package/import lookups are served from the
+// Lea index (which carries call edges and routes and stays fresh via
+// incremental sync) instead of a native graph snapshot.
+func WithLeaEngine(e *lea.Engine) RetrieverOption {
+	return func(r *Retriever) {
+		if e != nil {
+			r.graph = NewLeaGraphLookup(e, r.root)
+		}
+	}
+}
+
 func isFallbackTier(t Tier) bool {
 	return t == TierGlob || t == TierRipgrep || t == TierGrep || t == TierRead
 }
 
-func NewRetriever(root string, g *graph.Graph, opts ...RetrieverOption) *Retriever {
+func NewRetriever(root string, e *lea.Engine, opts ...RetrieverOption) *Retriever {
 	r := &Retriever{
 		root:           root,
-		graph:          NewGraphLookup(g, root),
+		graph:          NewLeaGraphLookup(e, root),
 		fallback:       NewFallbackChain(root),
 		tokenEstimator: NewTokenWeightEstimator(),
 		tiers: []Tier{

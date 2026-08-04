@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/domain"
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
@@ -17,7 +17,7 @@ type ObjectiveContextResult struct {
 	Telemetry []string
 }
 
-func BuildObjectiveContext(rawIntent, modelName string, g *graph.Graph) ObjectiveContextResult {
+func BuildObjectiveContext(rawIntent, modelName string, g *lea.FileGraph) ObjectiveContextResult {
 	keywords := intentKeywords(rawIntent)
 	scope := matchObjectiveScope(keywords, g)
 	weight := CalculateTokenWeight(scope)
@@ -61,7 +61,7 @@ func objectiveThreshold(modelName string) int {
 	return threshold
 }
 
-func matchObjectiveScope(keywords []string, g *graph.Graph) domain.ObjectiveScope {
+func matchObjectiveScope(keywords []string, g *lea.FileGraph) domain.ObjectiveScope {
 	if g == nil || len(keywords) == 0 {
 		return domain.ObjectiveScope{}
 	}

@@ -4,26 +4,58 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 )
 
 type GraphLookup struct {
-	graph *graph.Graph
-	root  string
+	// lea is the Phase 3 structural engine. Every structural lookup is served
+	// from the Lea graph (symbol resolution, file/package discovery, import
+	// edges, dependents) via its file-centric projection.
+	lea  *lea.Engine
+	root string
 }
 
-func NewGraphLookup(g *graph.Graph, root string) *GraphLookup {
-	return &GraphLookup{graph: g, root: root}
+func NewGraphLookup(e *lea.Engine, root string) *GraphLookup {
+	return &GraphLookup{lea: e, root: root}
+}
+
+// NewLeaGraphLookup wraps a Lea structural engine as the graph-tier source.
+// It redirects structural lookups (symbols, files, packages, imports,
+// dependents, glob) onto the Lea index, which is richer (call edges, routes)
+// and stays fresh via incremental sync.
+func NewLeaGraphLookup(e *lea.Engine, root string) *GraphLookup {
+	return &GraphLookup{lea: e, root: root}
+}
+
+// leaFileGraph returns the current file-centric projection of the lea engine,
+// or nil when the engine is absent or not yet indexed.
+func (gl *GraphLookup) leaFileGraph() *lea.FileGraph {
+	if gl == nil || gl.lea == nil {
+		return nil
+	}
+	fg := gl.lea.FileGraph()
+	if fg == nil || len(fg.Files) == 0 {
+		return nil
+	}
+	return fg
 }
 
 func (gl *GraphLookup) HasGraph() bool {
-	return gl.graph != nil
+	if gl == nil {
+		return false
+	}
+	return gl.leaFileGraph() != nil
 }
 
 func (gl *GraphLookup) SearchSymbol(name string) *ResultSet {
 	rs := &ResultSet{Strategy: "graph.exact"}
 
-	symbols := gl.graph.LookupSymbol(name)
+	fg := gl.leaFileGraph()
+	if fg == nil {
+		return rs
+	}
+
+	symbols := fg.LookupSymbol(name)
 	for _, sym := range symbols {
 		rs.Add(Score(ConfExact, Result{
 			File:       sym.File,
@@ -46,7 +78,12 @@ func (gl *GraphLookup) SearchSymbol(name string) *ResultSet {
 func (gl *GraphLookup) SearchFile(path string) *ResultSet {
 	rs := &ResultSet{Strategy: "graph.file"}
 
-	fn := gl.graph.LookupFile(path)
+	fg := gl.leaFileGraph()
+	if fg == nil {
+		return rs
+	}
+
+	fn := fg.LookupFile(path)
 	if fn != nil {
 		rs.Add(Score(ConfExact, Result{
 			File:       fn.Path,
@@ -63,8 +100,20 @@ func (gl *GraphLookup) SearchFile(path string) *ResultSet {
 func (gl *GraphLookup) SearchPackage(pkg string) *ResultSet {
 	rs := &ResultSet{Strategy: "graph.fuzzy"}
 
-	files := gl.graph.FilesByPackage(pkg)
-	for _, f := range files {
+	fg := gl.leaFileGraph()
+	if fg == nil {
+		return rs
+	}
+
+	seen := make(map[string]bool)
+	for _, f := range fg.Files {
+		if f.Package != pkg {
+			continue
+		}
+		if seen[f.Path] {
+			continue
+		}
+		seen[f.Path] = true
 		rs.Add(Score(ConfFuzzy, Result{
 			File:       f.Path,
 			Strategy:   "graph.fuzzy",
@@ -82,7 +131,12 @@ func (gl *GraphLookup) SearchPackage(pkg string) *ResultSet {
 func (gl *GraphLookup) SearchImports(target string) *ResultSet {
 	rs := &ResultSet{Strategy: "graph.imports"}
 
-	for file, imports := range gl.graph.Imports {
+	fg := gl.leaFileGraph()
+	if fg == nil {
+		return rs
+	}
+
+	for file, imports := range fg.Imports {
 		for _, imp := range imports {
 			if strings.Contains(imp, target) {
 				rs.Add(Score(ConfPartial, Result{
@@ -105,13 +159,36 @@ func (gl *GraphLookup) SearchImports(target string) *ResultSet {
 func (gl *GraphLookup) SearchDependents(file string) *ResultSet {
 	rs := &ResultSet{Strategy: "graph.imports"}
 
-	deps := gl.graph.Dependents[file]
-	for _, dep := range deps {
+	fg := gl.leaFileGraph()
+	if fg == nil {
+		return rs
+	}
+
+	seen := make(map[string]bool)
+	add := func(dep string) {
+		if dep == file || seen[dep] {
+			return
+		}
+		seen[dep] = true
 		rs.Add(Score(ConfPartial, Result{
 			File:       dep,
 			Strategy:   "graph.imports",
 			SymbolName: file,
 		}))
+	}
+
+	// Files that import the target string directly (legacy Dependents map).
+	for _, dep := range fg.Dependents[file] {
+		add(dep)
+	}
+
+	// Files importing the package directory of the target file, resolved from
+	// the lea graph's import edges.
+	if gl.lea != nil {
+		dir := filepath.Dir(filepath.ToSlash(file))
+		for _, dep := range gl.lea.Graph().ImportingFiles(dir) {
+			add(dep)
+		}
 	}
 
 	if !rs.Empty() {
@@ -149,15 +226,20 @@ func (gl *GraphLookup) SearchAll(query string) *ResultSet {
 func (gl *GraphLookup) ListFiles(pattern string) *ResultSet {
 	rs := &ResultSet{Strategy: "glob.file"}
 
-	for _, f := range gl.graph.Files {
-		matched, err := filepath.Match(pattern, f.Path)
+	fg := gl.leaFileGraph()
+	if fg == nil {
+		return rs
+	}
+
+	for _, fn := range fg.Files {
+		matched, err := filepath.Match(pattern, fn.Path)
 		if err == nil && matched {
-			symName := f.Package
+			symName := fn.Package
 			if symName == "" {
-				symName = f.Path
+				symName = fn.Path
 			}
 			rs.Add(Score(ConfPartial, Result{
-				File:       f.Path,
+				File:       fn.Path,
 				Strategy:   "glob.file",
 				SymbolName: symName,
 			}))

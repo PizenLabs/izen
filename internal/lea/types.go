@@ -91,3 +91,29 @@ type IndexStats struct {
 	FromCache   bool          `json:"from_cache"`
 	Incremental bool          `json:"incremental"`
 }
+
+// DebugInfo is an on-demand diagnostic snapshot of the engine's index state.
+// It is only materialized when Engine.Debug is called — normal operation
+// carries no continuous instrumentation beyond the last-index counters the
+// engine maintains.
+type DebugInfo struct {
+	Root              string        `json:"root"`
+	CachePath         string        `json:"cache_path"`
+	CacheVersion      int           `json:"cache_version"`
+	FilesIndexed      int           `json:"files_indexed"`
+	Symbols           int           `json:"symbols"`
+	Nodes             int           `json:"nodes"`
+	Edges             int           `json:"edges"`
+	Routes            int           `json:"routes"`
+	CallEdges         int           `json:"call_edges"`
+	LastIndexDuration time.Duration `json:"last_index_duration"`
+	LastIndexedAt     time.Time     `json:"last_indexed_at"`
+	FromCache         bool          `json:"from_cache"`
+	Incremental       bool          `json:"incremental"`
+}
+
+// Indexed reports whether the engine currently holds an indexed graph (any
+// file nodes present).
+func (d DebugInfo) Indexed() bool {
+	return d.FilesIndexed > 0
+}

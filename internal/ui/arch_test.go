@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 )
 
@@ -53,7 +53,7 @@ func TestGraphFromPolyglot_JavaProject(t *testing.T) {
 	if fn.Path != "src/main/java/com/example/App.java" {
 		t.Errorf("expected path src/main/java/com/example/App.java, got %s", fn.Path)
 	}
-	if fn.Language != graph.LangJava {
+	if fn.Language != lea.LangJava {
 		t.Errorf("expected language java, got %s", fn.Language)
 	}
 	if len(fn.Symbols) != 2 {
@@ -106,7 +106,7 @@ func TestGraphFromPolyglot_TSProject(t *testing.T) {
 	}
 
 	fn := g.Files[0]
-	if fn.Language != graph.LangTypeScript {
+	if fn.Language != lea.LangTypeScript {
 		t.Errorf("expected language typescript, got %s", fn.Language)
 	}
 	if len(fn.Symbols) != 2 {
@@ -142,7 +142,7 @@ func TestGraphFromPolyglot_PythonProject(t *testing.T) {
 	}
 
 	fn := g.Files[0]
-	if fn.Language != graph.LangPython {
+	if fn.Language != lea.LangPython {
 		t.Errorf("expected language python, got %s", fn.Language)
 	}
 	if len(fn.Symbols) != 1 {
@@ -193,37 +193,37 @@ func TestSymbolKindToGraphKind(t *testing.T) {
 	tests := []struct {
 		name     string
 		sk       symbol.SymbolKind
-		expected int
+		expected lea.SymbolKind
 	}{
-		{"Function", symbol.SymbolFunction, int(graph.SymbolFunction)},
-		{"Method", symbol.SymbolMethod, int(graph.SymbolMethod)},
-		{"Struct", symbol.SymbolStruct, int(graph.SymbolStruct)},
-		{"Interface", symbol.SymbolInterface, int(graph.SymbolInterface)},
-		{"Class", symbol.SymbolClass, int(graph.SymbolClass)},
-		{"Variable", symbol.SymbolVariable, int(graph.SymbolVariable)},
-		{"Constant", symbol.SymbolConstant, int(graph.SymbolConstant)},
-		{"Enum", symbol.SymbolEnum, int(graph.SymbolEnum)},
-		{"Type", symbol.SymbolType, int(graph.SymbolType)},
-		{"Package", symbol.SymbolPackage, int(graph.SymbolPackage)},
-		{"Module", symbol.SymbolModule, int(graph.SymbolImport)},
-		{"Unknown", "nonexistent", -1},
+		{"Function", symbol.SymbolFunction, lea.SymbolFunction},
+		{"Method", symbol.SymbolMethod, lea.SymbolMethod},
+		{"Struct", symbol.SymbolStruct, lea.SymbolStruct},
+		{"Interface", symbol.SymbolInterface, lea.SymbolInterface},
+		{"Class", symbol.SymbolClass, lea.SymbolClass},
+		{"Variable", symbol.SymbolVariable, lea.SymbolVariable},
+		{"Constant", symbol.SymbolConstant, lea.SymbolConstant},
+		{"Enum", symbol.SymbolEnum, lea.SymbolEnum},
+		{"Type", symbol.SymbolType, lea.SymbolType},
+		{"Package", symbol.SymbolPackage, lea.SymbolPackage},
+		{"Module", symbol.SymbolModule, lea.SymbolImport},
+		{"Unknown", "nonexistent", ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := symbolKindToGraphKind(tt.sk)
 			if got != tt.expected {
-				t.Errorf("symbolKindToGraphKind(%q) = %d, want %d", tt.sk, got, tt.expected)
+				t.Errorf("symbolKindToGraphKind(%q) = %q, want %q", tt.sk, got, tt.expected)
 			}
 		})
 	}
 }
 
 func TestDetectGraphLanguageForGraph_ExplicitLang(t *testing.T) {
-	g := graph.NewGraph("/tmp")
-	g.AddFile(graph.FileNode{
+	g := lea.NewFileGraph("/tmp")
+	g.AddFile(lea.FileNode{
 		Path:     "src/Main.java",
-		Language: graph.LangJava,
+		Language: lea.LangJava,
 	})
 
 	lang := detectGraphLanguageForGraph(g, &model{workspaceRoot: "/tmp"})
@@ -233,7 +233,7 @@ func TestDetectGraphLanguageForGraph_ExplicitLang(t *testing.T) {
 }
 
 func TestDetectGraphLanguageForGraph_FallbackToGo(t *testing.T) {
-	g := graph.NewGraph("/tmp")
+	g := lea.NewFileGraph("/tmp")
 
 	lang := detectGraphLanguageForGraph(g, &model{workspaceRoot: "/tmp"})
 	if lang != "go" {
@@ -321,15 +321,15 @@ func TestBuildArchGraph_TsProject(t *testing.T) {
 	if len(g.Files) != 1 {
 		t.Fatalf("expected 1 file, got %d", len(g.Files))
 	}
-	if g.Files[0].Language != graph.LangTypeScript {
+	if g.Files[0].Language != lea.LangTypeScript {
 		t.Errorf("expected typescript, got %s", g.Files[0].Language)
 	}
 }
 
 func TestSymbolKindToGraphKind_UnknownKind(t *testing.T) {
 	result := symbolKindToGraphKind("nonexistent_kind")
-	if result != -1 {
-		t.Errorf("expected -1 for unknown kind, got %d", result)
+	if result != "" {
+		t.Errorf("expected empty kind for unknown, got %q", result)
 	}
 }
 
@@ -386,14 +386,14 @@ func TestGraphFromPolyglot_Imports(t *testing.T) {
 }
 
 func TestRenderArch_NonGoGraph(t *testing.T) {
-	g := graph.NewGraph("/tmp")
-	g.AddFile(graph.FileNode{
+	g := lea.NewFileGraph("/tmp")
+	g.AddFile(lea.FileNode{
 		Path:     "src/main/java/com/example/App.java",
-		Language: graph.LangJava,
+		Language: lea.LangJava,
 		Package:  "com.example",
-		Symbols: []graph.Symbol{
-			{Name: "App", Kind: graph.SymbolClass, File: "src/main/java/com/example/App.java", Line: 1, Exported: true},
-			{Name: "main", Kind: graph.SymbolMethod, File: "src/main/java/com/example/App.java", Line: 3, Parent: "App", Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "App", Kind: lea.SymbolClass, File: "src/main/java/com/example/App.java", Line: 1, Exported: true},
+			{Name: "main", Kind: lea.SymbolMethod, File: "src/main/java/com/example/App.java", Line: 3, Parent: "App", Exported: true},
 		},
 		Imports: []string{"java.util.List"},
 	})
@@ -410,7 +410,7 @@ func TestRenderArch_NonGoGraph(t *testing.T) {
 }
 
 func TestRenderArch_EmptyNonGoGraph(t *testing.T) {
-	g := graph.NewGraph("/tmp")
+	g := lea.NewFileGraph("/tmp")
 
 	m := &model{graph: g, workspaceRoot: "/tmp"}
 	result := m.renderArch("")
@@ -421,24 +421,24 @@ func TestRenderArch_EmptyNonGoGraph(t *testing.T) {
 }
 
 func TestRenderArch_CollapsedMode(t *testing.T) {
-	g := graph.NewGraph("/tmp")
-	g.AddFile(graph.FileNode{
+	g := lea.NewFileGraph("/tmp")
+	g.AddFile(lea.FileNode{
 		Path:     "internal/ui/workspace.go",
-		Language: graph.LangGo,
+		Language: lea.LangGo,
 		Package:  "ui",
-		Symbols: []graph.Symbol{
-			{Name: "Workspace", Kind: graph.SymbolStruct, File: "internal/ui/workspace.go", Line: 1, Exported: true},
-			{Name: "render", Kind: graph.SymbolMethod, File: "internal/ui/workspace.go", Line: 10, Parent: "Workspace", Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "Workspace", Kind: lea.SymbolStruct, File: "internal/ui/workspace.go", Line: 1, Exported: true},
+			{Name: "render", Kind: lea.SymbolMethod, File: "internal/ui/workspace.go", Line: 10, Parent: "Workspace", Exported: true},
 		},
 		Imports: []string{"github.com/charmbracelet/bubbletea"},
 	})
-	g.AddFile(graph.FileNode{
+	g.AddFile(lea.FileNode{
 		Path:     "internal/engine/workflow.go",
-		Language: graph.LangGo,
+		Language: lea.LangGo,
 		Package:  "engine",
-		Symbols: []graph.Symbol{
-			{Name: "Workflow", Kind: graph.SymbolStruct, File: "internal/engine/workflow.go", Line: 1, Exported: true},
-			{Name: "Run", Kind: graph.SymbolMethod, File: "internal/engine/workflow.go", Line: 5, Parent: "Workflow", Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "Workflow", Kind: lea.SymbolStruct, File: "internal/engine/workflow.go", Line: 1, Exported: true},
+			{Name: "Run", Kind: lea.SymbolMethod, File: "internal/engine/workflow.go", Line: 5, Parent: "Workflow", Exported: true},
 		},
 	})
 
@@ -460,13 +460,13 @@ func TestRenderArch_CollapsedMode(t *testing.T) {
 }
 
 func TestRenderArch_FullMode(t *testing.T) {
-	g := graph.NewGraph("/tmp")
-	g.AddFile(graph.FileNode{
+	g := lea.NewFileGraph("/tmp")
+	g.AddFile(lea.FileNode{
 		Path:     "internal/ui/workspace.go",
-		Language: graph.LangGo,
+		Language: lea.LangGo,
 		Package:  "ui",
-		Symbols: []graph.Symbol{
-			{Name: "Workspace", Kind: graph.SymbolStruct, File: "internal/ui/workspace.go", Line: 1, Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "Workspace", Kind: lea.SymbolStruct, File: "internal/ui/workspace.go", Line: 1, Exported: true},
 		},
 	})
 
@@ -482,13 +482,13 @@ func TestRenderArch_FullMode(t *testing.T) {
 }
 
 func TestRenderArch_SumAlias(t *testing.T) {
-	g := graph.NewGraph("/tmp")
-	g.AddFile(graph.FileNode{
+	g := lea.NewFileGraph("/tmp")
+	g.AddFile(lea.FileNode{
 		Path:     "internal/ui/workspace.go",
-		Language: graph.LangGo,
+		Language: lea.LangGo,
 		Package:  "ui",
-		Symbols: []graph.Symbol{
-			{Name: "Workspace", Kind: graph.SymbolStruct, File: "internal/ui/workspace.go", Line: 1, Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "Workspace", Kind: lea.SymbolStruct, File: "internal/ui/workspace.go", Line: 1, Exported: true},
 		},
 	})
 
@@ -501,22 +501,22 @@ func TestRenderArch_SumAlias(t *testing.T) {
 }
 
 func TestRenderArch_DrilldownLayer(t *testing.T) {
-	g := graph.NewGraph("/tmp")
-	g.AddFile(graph.FileNode{
+	g := lea.NewFileGraph("/tmp")
+	g.AddFile(lea.FileNode{
 		Path:     "internal/ui/workspace.go",
-		Language: graph.LangGo,
+		Language: lea.LangGo,
 		Package:  "ui",
-		Symbols: []graph.Symbol{
-			{Name: "Workspace", Kind: graph.SymbolStruct, File: "internal/ui/workspace.go", Line: 1, Exported: true},
-			{Name: "Render", Kind: graph.SymbolMethod, File: "internal/ui/workspace.go", Line: 10, Parent: "Workspace", Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "Workspace", Kind: lea.SymbolStruct, File: "internal/ui/workspace.go", Line: 1, Exported: true},
+			{Name: "Render", Kind: lea.SymbolMethod, File: "internal/ui/workspace.go", Line: 10, Parent: "Workspace", Exported: true},
 		},
 	})
-	g.AddFile(graph.FileNode{
+	g.AddFile(lea.FileNode{
 		Path:     "internal/core/artifact/store.go",
-		Language: graph.LangGo,
+		Language: lea.LangGo,
 		Package:  "artifact",
-		Symbols: []graph.Symbol{
-			{Name: "Store", Kind: graph.SymbolStruct, File: "internal/core/artifact/store.go", Line: 1, Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "Store", Kind: lea.SymbolStruct, File: "internal/core/artifact/store.go", Line: 1, Exported: true},
 		},
 	})
 
@@ -544,13 +544,13 @@ func TestRenderArch_DrilldownLayer(t *testing.T) {
 }
 
 func TestRenderArch_DrilldownNotFound(t *testing.T) {
-	g := graph.NewGraph("/tmp")
-	g.AddFile(graph.FileNode{
+	g := lea.NewFileGraph("/tmp")
+	g.AddFile(lea.FileNode{
 		Path:     "internal/ui/workspace.go",
-		Language: graph.LangGo,
+		Language: lea.LangGo,
 		Package:  "ui",
-		Symbols: []graph.Symbol{
-			{Name: "Workspace", Kind: graph.SymbolStruct, File: "internal/ui/workspace.go", Line: 1, Exported: true},
+		Symbols: []lea.Symbol{
+			{Name: "Workspace", Kind: lea.SymbolStruct, File: "internal/ui/workspace.go", Line: 1, Exported: true},
 		},
 	})
 

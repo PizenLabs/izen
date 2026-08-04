@@ -10,6 +10,7 @@ import (
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/runtime/output"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -37,6 +38,12 @@ type Engine struct {
 
 func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ...language.ID) *Engine {
 	r := NewRunner(root, cfg.Execution.Sandbox, cfg.Execution.Confirm)
+	// ── TOOL OUTPUT PIPELINE (PHASE 1) ─────────────────────────────────
+	// The production runner routes every shell command through the output
+	// intelligence pipeline: normalized, classified, semantically compressed,
+	// and tee-logged to <root>/.logs/ (activating the planner's TeeLogAdapter
+	// so tool logs feed the context planner's BUG_FIX intent).
+	r.WithPipeline(output.New().WithWorkspace(root))
 	t := NewTestRunner(root)
 	p := NewPatchManager(root)
 	c := NewCheckpointManager(root, sess)

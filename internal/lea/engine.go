@@ -27,9 +27,20 @@ type Engine struct {
 	mu sync.RWMutex
 	g  *graph.Graph
 
+	// last-index telemetry backing the on-demand Debug inspection. They are
+	// updated only when an index/refresh operation completes, so normal
+	// operation carries no continuous instrumentation overhead.
+	lastIndexAt     time.Time
+	lastIndexDur    time.Duration
+	lastFromCache   bool
+	lastIncremental bool
+
 	extractors map[string]symbol.LanguageExtractor
 	maxWorkers int
 	autoSync   bool
+
+	fileViewCache *FileGraph
+	fileViewBuilt time.Time
 }
 
 // Option configures an Engine.
@@ -185,7 +196,9 @@ func (e *Engine) Index(ctx context.Context) (IndexStats, error) {
 
 	// Try the persisted cache first; fall through to a full index.
 	if loaded, err := e.load(); err == nil && loaded {
-		return e.IndexStats(true, false, start), nil
+		stats := e.IndexStats(true, false, start)
+		e.recordIndex(stats)
+		return stats, nil
 	}
 
 	files, err := e.walkSourceFiles()
@@ -212,7 +225,20 @@ func (e *Engine) Index(ctx context.Context) (IndexStats, error) {
 	}
 
 	stats := e.IndexStats(false, false, start)
+	e.recordIndex(stats)
 	return stats, nil
+}
+
+// recordIndex stores the completed index/refresh operation for the on-demand
+// Debug() inspection. It is a plain struct write guarded by mu; it never runs
+// in the hot path outside an index operation.
+func (e *Engine) recordIndex(s IndexStats) {
+	e.mu.Lock()
+	e.lastIndexAt = time.Now()
+	e.lastIndexDur = s.Duration
+	e.lastFromCache = s.FromCache
+	e.lastIncremental = s.Incremental
+	e.mu.Unlock()
 }
 
 // IndexStats reports the current graph with operation timing.
@@ -317,6 +343,7 @@ func (e *Engine) Refresh(ctx context.Context, paths []string) (IndexStats, error
 	}
 	stats := e.IndexStats(false, true, start)
 	stats.Incremental = changed > 0
+	e.recordIndex(stats)
 	return stats, nil
 }
 
@@ -341,6 +368,8 @@ func (e *Engine) Start(ctx context.Context) error {
 		changed = nil
 	}
 
+	start := time.Now()
+
 	switch {
 	case !loaded:
 		if _, err := e.Index(ctx); err != nil {
@@ -350,6 +379,10 @@ func (e *Engine) Start(ctx context.Context) error {
 		if _, err := e.Refresh(ctx, changed); err != nil {
 			return fmt.Errorf("incremental refresh: %w", err)
 		}
+	default:
+		// Cache-only boot: nothing was re-indexed, but the load is still a
+		// real index-adjacent operation worth reporting to Debug().
+		e.recordIndex(IndexStats{Duration: time.Since(start), FromCache: true})
 	}
 
 	if e.autoSync {
@@ -366,4 +399,32 @@ func (e *Engine) Close() error {
 		return e.watcher.Close()
 	}
 	return nil
+}
+
+// Debug materializes an on-demand diagnostic snapshot of the engine's index
+// state. It reads the current graph stats plus the last-index telemetry; it is
+// only paid for when called.
+func (e *Engine) Debug() DebugInfo {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	di := DebugInfo{
+		Root:              e.root,
+		CachePath:         e.store.Path(),
+		CacheVersion:      int(storeVersion),
+		LastIndexDuration: e.lastIndexDur,
+		LastIndexedAt:     e.lastIndexAt,
+		FromCache:         e.lastFromCache,
+		Incremental:       e.lastIncremental,
+	}
+	if e.g != nil {
+		s := e.g.Stats()
+		di.FilesIndexed = s.FileCount
+		di.Symbols = s.FunctionCount + s.MethodCount + s.TypeCount
+		di.Nodes = s.NodeCount
+		di.Edges = s.EdgeCount
+		di.Routes = s.RouteCount
+		di.CallEdges = s.CallEdgeCount
+	}
+	return di
 }

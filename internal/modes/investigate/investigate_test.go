@@ -219,7 +219,7 @@ func TestEvidenceClearAndSummary(t *testing.T) {
 func TestParseStackFramesGo(t *testing.T) {
 	input := `panic: runtime error: invalid memory address or nil pointer dereference
 	main.go:42 main.Start()
-	internal/graph/engine.go:128 graph.NewEngine()
+	internal/lea/engine.go:128 graph.NewEngine()
 	cmd/izen/main.go:15 main.main()`
 
 	frames := ParseStackFrames(input)
@@ -232,7 +232,7 @@ func TestParseStackFramesGo(t *testing.T) {
 	}
 
 	if len(frames) >= 2 {
-		if frames[1].File != "internal/graph/engine.go" || frames[1].Line != 128 {
+		if frames[1].File != "internal/lea/engine.go" || frames[1].Line != 128 {
 			t.Fatalf("unexpected second frame: %+v", frames[1])
 		}
 	}
@@ -345,7 +345,7 @@ func TestExtractPackageFromFile(t *testing.T) {
 		file string
 		want string
 	}{
-		{"internal/graph/engine.go", "internal/graph"},
+		{"internal/lea/engine.go", "internal/lea"},
 		{"cmd/izen/main.go", "cmd/izen"},
 		{"pkg/foo/bar.go", "pkg/foo"},
 		{"main.go", ""},
@@ -443,7 +443,7 @@ func TestNarrowIteration(t *testing.T) {
 	}
 
 	frames := []StackFrame{
-		{File: "internal/graph/engine.go", Line: 42},
+		{File: "internal/lea/engine.go", Line: 42},
 		{File: "cmd/izen/main.go", Line: 10},
 	}
 
@@ -454,7 +454,7 @@ func TestNarrowIteration(t *testing.T) {
 
 	hasPkg := false
 	for _, c := range candidates {
-		if strings.Contains(c, "internal/graph") || strings.Contains(c, "cmd/izen") {
+		if strings.Contains(c, "internal/lea") || strings.Contains(c, "cmd/izen") {
 			hasPkg = true
 		}
 	}

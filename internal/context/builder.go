@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/git"
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
 )
@@ -30,14 +30,14 @@ var (
 // context window inflation from unrelated or future tasks.
 
 type Builder struct {
-	graph   *graph.Graph
+	graph   *lea.FileGraph
 	git     *git.Engine
 	session *session.Session
 	root    string
 	ledger  *TaskLedger
 }
 
-func NewBuilder(root string, g *graph.Graph, ge *git.Engine, sess *session.Session) *Builder {
+func NewBuilder(root string, g *lea.FileGraph, ge *git.Engine, sess *session.Session) *Builder {
 	initSeqOnce()
 	return &Builder{
 		root:    root,
@@ -245,7 +245,7 @@ func (b *Builder) AddError(ctx *Context, err error) {
 	}
 }
 
-func CompressFile(fn *graph.FileNode, maxSymbols int) FileSlice {
+func CompressFile(fn *lea.FileNode, maxSymbols int) FileSlice {
 	fs := FileSlice{
 		Path:    fn.Path,
 		Package: fn.Package,
@@ -267,7 +267,7 @@ func CompressFile(fn *graph.FileNode, maxSymbols int) FileSlice {
 	}
 
 	if maxSymbols > 0 && len(fs.Symbols) > maxSymbols {
-		exported := make([]graph.Symbol, 0)
+		exported := make([]lea.Symbol, 0)
 		for _, s := range fn.Symbols {
 			if s.Exported {
 				exported = append(exported, s)

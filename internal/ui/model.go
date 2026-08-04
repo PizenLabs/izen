@@ -29,7 +29,7 @@ import (
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -251,7 +251,7 @@ type shellOutputMsg struct {
 var _ tea.Msg = shellOutputMsg{}
 
 type graphBuiltMsg struct {
-	graph *graph.Graph
+	graph *lea.FileGraph
 	err   error
 }
 
@@ -259,13 +259,15 @@ type graphIndexingMsg struct {
 	indexing bool
 }
 
-func buildGraphCmd(eng *graph.Engine) tea.Cmd {
+func buildGraphCmd(eng *lea.Engine) tea.Cmd {
 	return func() tea.Msg {
-		g, _, err := eng.BuildOrLoad()
-		if err != nil {
+		if eng == nil {
+			return graphBuiltMsg{err: fmt.Errorf("graph engine not available")}
+		}
+		if _, err := eng.Index(context.Background()); err != nil {
 			return graphBuiltMsg{err: err}
 		}
-		return graphBuiltMsg{graph: g}
+		return graphBuiltMsg{graph: eng.FileGraph()}
 	}
 }
 
@@ -583,14 +585,18 @@ type TaskFinishedMsg struct{}
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 type model struct {
-	cfg               *config.Config
-	sess              *session.Session
-	provider          ai.Provider
-	mgr               *ai.Manager
-	resolver          *modes.Resolver
-	gitEng            *git.Engine
-	graphEng          *graph.Engine
-	graph             *graph.Graph
+	cfg      *config.Config
+	sess     *session.Session
+	provider ai.Provider
+	mgr      *ai.Manager
+	resolver *modes.Resolver
+	gitEng   *git.Engine
+	graph    *lea.FileGraph
+	// leaEng is the Phase 3 Lea structural engine (canonical index for
+	// architecture, call chains, routes and symbol lookups). It backs the
+	// context planner's graph source and the /arch analysis. Nil only in
+	// headless/test harnesses that never construct a model.
+	leaEng            *lea.Engine
 	extractorRegistry *symbol.ExtractorRegistry
 	// contextPlanner classifies the user's question and injects budget-fitted
 	// structural context (Lea graph symbols, tool logs, architecture overview)
@@ -755,6 +761,17 @@ type model struct {
 
 	// AST/Code Graph trace for rendering the AI's thought route
 	currentTrace *ctxpkg.CodebaseTrace
+
+	// askContextGoverned is set by planContextForAsk when the Context Planner
+	// successfully assembled budget-fitted context for the current /ask turn.
+	// streamCmd reads and clears it so the fallback file-read path never
+	// injects the same @file context a second time when the planner already
+	// governed it.
+	askContextGoverned bool
+
+	// lastAskTrace carries the most recent planner trace from /ask context
+	// assembly so streamCmd can update the UI thought-route panel.
+	lastAskTrace *ctxpkg.CodebaseTrace
 
 	// Tip of the Day
 	currentTip      string
@@ -1067,12 +1084,13 @@ func (m *model) isProjectInitialized() bool {
 }
 
 // contextPlanner returns the intent-aware Context Planner, constructing it
-// lazily from the in-memory native graph and the workspace `.logs/` tee
-// directory. It is nil when no graph is ready, so every consumer must guard.
+// lazily from the Phase 3 Lea structural engine, the workspace `.logs/` tee
+// directory, and the retrieval search engine (for governed file reads). It is
+// nil when no graph source is ready, so every consumer must guard.
 // Construction is cheap and idempotent; the planner is retained for the
 // session.
 func (m *model) contextPlanner() *planner.Planner {
-	if m == nil || m.graph == nil {
+	if m == nil || (m.leaEng == nil && m.graph == nil) {
 		return nil
 	}
 	if m.planner != nil {
@@ -1082,18 +1100,37 @@ func (m *model) contextPlanner() *planner.Planner {
 	if m.cfg != nil && m.cfg.Models.MaxTokens > 0 {
 		maxTokens = m.cfg.Models.MaxTokens
 	}
-	m.planner = planner.New(
-		planner.WithGraphSource(planner.NewGraphAdapter(m.graph)),
-		planner.WithLogSource(planner.NewTeeLogAdapter(m.workspaceRoot)),
-		planner.WithMaxTokens(maxTokens),
-	)
+
+	opts := []planner.Option{planner.WithMaxTokens(maxTokens)}
+
+	// Graph source: the Lea structural engine is canonical (symbols, call
+	// chains, architecture, routes). The native graph remains a fallback for
+	// headless/test harnesses that never attach a Lea engine.
+	if m.leaEng != nil {
+		opts = append(opts, planner.WithGraphSource(planner.NewLeaAdapter(m.leaEng)))
+	} else if m.graph != nil {
+		opts = append(opts, planner.WithGraphSource(planner.NewGraphAdapter(m.graph)))
+	}
+
+	// File source: the retrieval search engine (Lynx or native) governs file
+	// reads so the planner can pull budget-fitted snippets instead of raw
+	// whole-file dumps.
+	if router := retrieval.GetGlobalRouter(); router != nil {
+		opts = append(opts, planner.WithFileSource(planner.NewRetrievalFileAdapter(router)))
+	}
+
+	opts = append(opts, planner.WithLogSource(planner.NewTeeLogAdapter(m.workspaceRoot)))
+
+	m.planner = planner.New(opts...)
 	return m.planner
 }
 
 // planContextForAsk runs the Context Planner for a question and injects the
 // budget-fitted context into the content that reaches the LLM. It degrades
 // silently (returns the input unchanged) when the planner is unavailable or
-// planning yields no chunks.
+// planning yields no chunks. When the planner successfully assembles context,
+// askContextGoverned is set so streamCmd skips the ungoverned file-read
+// fallback, and lastAskTrace is populated for the UI thought-route panel.
 func (m *model) planContextForAsk(line string) string {
 	p := m.contextPlanner()
 	if p == nil {
@@ -1105,7 +1142,41 @@ func (m *model) planContextForAsk(line string) string {
 	}
 	header := fmt.Sprintf("### PLANNED CONTEXT (%s intent, %d tokens)\n\n",
 		plan.Intent, plan.TokenTotal)
+	m.askContextGoverned = true
+	m.lastAskTrace = planToTrace(plan)
 	return header + plan.Assemble() + "\n\n" + line
+}
+
+// planToTrace projects a planner ContextPlan onto the UI's CodebaseTrace so the
+// thought-route panel shows which files and symbols the planner actually
+// surfaced, alongside the budget telemetry. Returns nil when the plan is empty.
+func planToTrace(plan *planner.ContextPlan) *ctxpkg.CodebaseTrace {
+	if plan == nil || len(plan.Chunks) == 0 {
+		return nil
+	}
+	tr := &ctxpkg.CodebaseTrace{}
+	seen := make(map[string]bool)
+	for _, c := range plan.Chunks {
+		switch c.Source {
+		case planner.SourceFile:
+			// File chunk content begins with the repository-relative path
+			// ("path:line" from FocusedContext or the search hit projection).
+			line := strings.TrimSpace(strings.SplitN(c.Content, "\n", 2)[0])
+			if path, _, ok := strings.Cut(line, ":"); ok && path != "" && !seen[path] {
+				seen[path] = true
+				tr.MatchedFiles = append(tr.MatchedFiles, path)
+			}
+		case planner.SourceGraph:
+			if sym, _, ok := strings.Cut(strings.TrimSpace(c.Content), " "); ok && sym != "" && !seen[sym] {
+				seen[sym] = true
+				tr.ResolvedSymbols = append(tr.ResolvedSymbols, sym)
+			}
+		}
+	}
+	if plan.Budget.Total > 0 {
+		tr.CompressionRatio = float64(plan.TokenTotal) / float64(plan.Budget.Total)
+	}
+	return tr
 }
 
 // applyToolCallBuffer applies approved tool calls to disk and flushes the buffer.

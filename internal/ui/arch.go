@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 )
@@ -131,7 +131,7 @@ func isJavaLayerDir(path, layer string) bool {
 	return false
 }
 
-func detectGraphLanguageForGraph(g *graph.Graph, m *model) string {
+func detectGraphLanguageForGraph(g *lea.FileGraph, m *model) string {
 	if g == nil || len(g.Files) == 0 {
 		if m.extractorRegistry != nil {
 			if lang, _, ok := m.extractorRegistry.DetectLanguage(m.workspaceRoot); ok {
@@ -226,7 +226,7 @@ type readEntry struct {
 	Label string
 }
 
-func detectModuleRoot(g *graph.Graph) string {
+func detectModuleRoot(g *lea.FileGraph) string {
 	prefixes := make(map[string]int)
 	for _, f := range g.Files {
 		for _, imp := range f.Imports {
@@ -261,13 +261,13 @@ func detectModuleRoot(g *graph.Graph) string {
 // detectTypeRelations and resolveTypePkg. Only the package name is
 // needed downstream, so the index maps directly to that string (no
 // need to name the symbol Kind type explicitly).
-func buildSymbolIndex(g *graph.Graph, filePkg map[string]string) map[string]string {
+func buildSymbolIndex(g *lea.FileGraph, filePkg map[string]string) map[string]string {
 	idx := make(map[string]string)
 	for _, f := range g.Files {
 		pkg := filePkg[f.Path]
 		for _, sym := range f.Symbols {
 			switch sym.Kind {
-			case graph.SymbolInterface, graph.SymbolStruct, graph.SymbolType:
+			case lea.SymbolInterface, lea.SymbolStruct, lea.SymbolType:
 				// First definition wins; duplicate names across packages
 				// are rare enough not to warrant a multi-map here.
 				if _, exists := idx[sym.Name]; !exists {
@@ -281,7 +281,7 @@ func buildSymbolIndex(g *graph.Graph, filePkg map[string]string) map[string]stri
 
 // ── Analysis ──────────────────────────────────────────────────────────
 
-func analyze(g *graph.Graph, lang string) *archReport {
+func analyze(g *lea.FileGraph, lang string) *archReport {
 	modPath := detectModuleRoot(g)
 	r := &archReport{
 		ModulePath: modPath,
@@ -301,17 +301,17 @@ func analyze(g *graph.Graph, lang string) *archReport {
 		ps.Files = append(ps.Files, f.Path)
 		for _, sym := range f.Symbols {
 			switch sym.Kind {
-			case graph.SymbolInterface:
+			case lea.SymbolInterface:
 				ps.Interfaces++
 				if sym.Exported {
 					ps.Exported++
 				}
-			case graph.SymbolStruct:
+			case lea.SymbolStruct:
 				ps.Structs++
 				if sym.Exported {
 					ps.Exported++
 				}
-			case graph.SymbolFunction:
+			case lea.SymbolFunction:
 				if sym.Name == "main" {
 					ps.EntryPoints = append(ps.EntryPoints, entryPt{Name: sym.Name, File: f.Path, Line: sym.Line})
 				} else if isEntryPoint(sym.Name, f.Path, lang) {
@@ -476,7 +476,7 @@ func detectCycles(pkgs []string, deps map[string]map[string]bool) [][]string {
 // already written (it could never fire, since the map keys it checked
 // for were always already present).
 
-func detectTypeRelations(g *graph.Graph, filePkg map[string]string, symIdx map[string]string) []typeRel {
+func detectTypeRelations(g *lea.FileGraph, filePkg map[string]string, symIdx map[string]string) []typeRel {
 	interfaceMethods := make(map[string]map[string]bool)
 	structMethods := make(map[string]map[string]bool)
 
@@ -485,11 +485,11 @@ func detectTypeRelations(g *graph.Graph, filePkg map[string]string, symIdx map[s
 	for _, f := range g.Files {
 		for _, sym := range f.Symbols {
 			switch sym.Kind {
-			case graph.SymbolInterface:
+			case lea.SymbolInterface:
 				if interfaceMethods[sym.Name] == nil {
 					interfaceMethods[sym.Name] = make(map[string]bool)
 				}
-			case graph.SymbolStruct:
+			case lea.SymbolStruct:
 				if structMethods[sym.Name] == nil {
 					structMethods[sym.Name] = make(map[string]bool)
 				}
@@ -506,7 +506,7 @@ func detectTypeRelations(g *graph.Graph, filePkg map[string]string, symIdx map[s
 				continue
 			}
 			switch sym.Kind {
-			case graph.SymbolMethod:
+			case lea.SymbolMethod:
 				if ifaceMethods, isIface := interfaceMethods[sym.Parent]; isIface {
 					ifaceMethods[sym.Name] = true
 				}
@@ -515,7 +515,7 @@ func detectTypeRelations(g *graph.Graph, filePkg map[string]string, symIdx map[s
 				} else {
 					structMethods[sym.Parent] = map[string]bool{sym.Name: true}
 				}
-			case graph.SymbolField:
+			case lea.SymbolField:
 				if ifaceMethods, isIface := interfaceMethods[sym.Parent]; isIface {
 					ifaceMethods[sym.Name] = true
 				}
@@ -549,7 +549,7 @@ func detectTypeRelations(g *graph.Graph, filePkg map[string]string, symIdx map[s
 	for _, f := range g.Files {
 		pkg := filePkg[f.Path]
 		for _, sym := range f.Symbols {
-			if sym.Kind == graph.SymbolFunction || sym.Kind == graph.SymbolMethod {
+			if sym.Kind == lea.SymbolFunction || sym.Kind == lea.SymbolMethod {
 				name := sym.Name
 				parent := sym.Parent
 				if isRegistrationName(name) {
@@ -884,8 +884,8 @@ func readingOrder(r *archReport) []readEntry {
 		if _, ok := r.Pkgs["ai"]; ok {
 			order = append(order, readEntry{Path: "internal/ai/", Label: "LLM provider integration"})
 		}
-		if _, ok := r.Pkgs["graph"]; ok {
-			order = append(order, readEntry{Path: "internal/graph/", Label: "Code graph — symbol index + parser"})
+		if _, ok := r.Pkgs["lea"]; ok {
+			order = append(order, readEntry{Path: "internal/lea/", Label: "Code graph — structural index + queries"})
 		}
 
 	case "java":
@@ -958,47 +958,64 @@ func isEntryPoint(name, filePath, lang string) bool {
 
 // ── Rendering ─────────────────────────────────────────────────────────
 
-func (m *model) buildArchGraph() *graph.Graph {
+func (m *model) buildArchGraph() *lea.FileGraph {
 	if m.extractorRegistry != nil {
 		lang, extractor, ok := m.extractorRegistry.DetectLanguage(m.workspaceRoot)
 		if ok && lang != symbol.LangGo && extractor != nil {
-			g, err := m.graphEng.BuildForLanguage(graph.Language(lang))
-			if err == nil && g != nil && len(g.Files) > 0 {
-				return g
-			}
 			syms, symErr := retrieval.NewPolyglotEngine(m.workspaceRoot, m.extractorRegistry).ExtractAllSymbols()
 			if symErr == nil && len(syms) > 0 {
 				return graphFromPolyglot(syms)
 			}
 		}
 	}
-	if m.graphEng != nil {
-		g, err := m.graphEng.Build()
-		if err == nil {
-			return g
+	if m.leaEng != nil {
+		fg := m.leaEng.FileGraph()
+		if fg != nil && len(fg.Files) > 0 {
+			return fg
 		}
 	}
 	return nil
 }
 
-func graphFromPolyglot(syms []symbol.FileASTInfo) *graph.Graph {
-	g := graph.NewGraph("")
+// archGraph returns the file-centric graph backing the /arch analysis. It
+// prefers the Phase 3 Lea structural engine so arch lookups are served from
+// the canonical index — including call edges, routes, and incremental
+// freshness. It falls back to the in-memory file-centric graph, then to a
+// polyglot extraction, when Lea has not indexed the workspace yet.
+func (m *model) archGraph() *lea.FileGraph {
+	if m == nil {
+		return nil
+	}
+	if m.leaEng != nil {
+		fg := m.leaEng.FileGraph()
+		if fg != nil && len(fg.Files) > 0 {
+			return fg
+		}
+	}
+	if m.graph != nil && len(m.graph.Files) > 0 {
+		return m.graph
+	}
+	return m.buildArchGraph()
+}
+
+func graphFromPolyglot(syms []symbol.FileASTInfo) *lea.FileGraph {
+	g := lea.NewFileGraph("")
 	for _, fi := range syms {
-		fn := graph.FileNode{
+		fn := lea.FileNode{
 			Path:     fi.FilePath,
-			Language: graph.Language(fi.Language),
+			Language: lea.Language(fi.Language),
 			Package:  fi.Package,
 			Size:     0,
 			Lines:    0,
 		}
 		for _, sym := range fi.Symbols {
-			gk := symbolKindToGraphKind(sym.Kind)
-			if gk < 0 {
+			kind := symbolKindToGraphKind(sym.Kind)
+			if kind == "" {
 				continue
 			}
-			fn.Symbols = append(fn.Symbols, graph.Symbol{
+			fn.Symbols = append(fn.Symbols, lea.Symbol{
 				Name:      sym.Name,
-				Kind:      graph.SymbolKind(gk),
+				Kind:      kind,
 				File:      sym.FilePath,
 				Line:      sym.StartLine,
 				Column:    1,
@@ -1017,32 +1034,32 @@ func graphFromPolyglot(syms []symbol.FileASTInfo) *graph.Graph {
 	return g
 }
 
-func symbolKindToGraphKind(sk symbol.SymbolKind) int {
+func symbolKindToGraphKind(sk symbol.SymbolKind) lea.SymbolKind {
 	switch sk {
 	case symbol.SymbolFunction:
-		return int(graph.SymbolFunction)
+		return lea.SymbolFunction
 	case symbol.SymbolMethod:
-		return int(graph.SymbolMethod)
+		return lea.SymbolMethod
 	case symbol.SymbolStruct:
-		return int(graph.SymbolStruct)
+		return lea.SymbolStruct
 	case symbol.SymbolInterface:
-		return int(graph.SymbolInterface)
+		return lea.SymbolInterface
 	case symbol.SymbolClass:
-		return int(graph.SymbolClass)
+		return lea.SymbolClass
 	case symbol.SymbolVariable:
-		return int(graph.SymbolVariable)
+		return lea.SymbolVariable
 	case symbol.SymbolConstant:
-		return int(graph.SymbolConstant)
+		return lea.SymbolConstant
 	case symbol.SymbolEnum:
-		return int(graph.SymbolEnum)
+		return lea.SymbolEnum
 	case symbol.SymbolType:
-		return int(graph.SymbolType)
+		return lea.SymbolType
 	case symbol.SymbolPackage:
-		return int(graph.SymbolPackage)
+		return lea.SymbolPackage
 	case symbol.SymbolModule:
-		return int(graph.SymbolImport)
+		return lea.SymbolImport
 	default:
-		return -1
+		return ""
 	}
 }
 
@@ -1061,12 +1078,9 @@ func (m *model) renderArch(cmdArgs string) string {
 
 // renderArchFull renders the complete expanded architecture map (the original behavior).
 func (m *model) renderArchFull() string {
-	g := m.graph
+	g := m.archGraph()
 	if g == nil || len(g.Files) == 0 {
-		g = m.buildArchGraph()
-		if g == nil || len(g.Files) == 0 {
-			return "no packages found in graph"
-		}
+		return "no packages found in graph"
 	}
 	lang := detectGraphLanguageForGraph(g, m)
 	r := analyze(g, lang)
@@ -1187,13 +1201,13 @@ func (m *model) renderArchFull() string {
 	}
 
 	filesByPkg := make(map[string][]int)
-	for i, f := range m.graph.Files {
+	for i, f := range g.Files {
 		pkg := pkgLabel(f.Path)
 		filesByPkg[pkg] = append(filesByPkg[pkg], i)
 	}
 
 	methodCount := make(map[string]map[string]int)
-	for _, f := range m.graph.Files {
+	for _, f := range g.Files {
 		pkg := pkgLabel(f.Path)
 		for _, sym := range f.Symbols {
 			parent := sym.Name
@@ -1203,7 +1217,7 @@ func (m *model) renderArchFull() string {
 			if methodCount[pkg] == nil {
 				methodCount[pkg] = make(map[string]int)
 			}
-			if sym.Kind == graph.SymbolMethod || sym.Kind == graph.SymbolFunction {
+			if sym.Kind == lea.SymbolMethod || sym.Kind == lea.SymbolFunction {
 				methodCount[pkg][parent]++
 			}
 		}
@@ -1212,15 +1226,15 @@ func (m *model) renderArchFull() string {
 	var keyTypes []keyType
 	for _, pkg := range r.PkgOrder {
 		for _, idx := range filesByPkg[pkg] {
-			f := m.graph.Files[idx]
+			f := g.Files[idx]
 			for _, sym := range f.Symbols {
 				if !sym.Exported {
 					continue
 				}
 				switch sym.Kind {
-				case graph.SymbolInterface:
+				case lea.SymbolInterface:
 					keyTypes = append(keyTypes, keyType{Name: sym.Name, Kind: "interface", Pkg: pkg, Methods: methodCount[pkg][sym.Name]})
-				case graph.SymbolStruct:
+				case lea.SymbolStruct:
 					if mc := methodCount[pkg][sym.Name]; mc > 0 || sym.Exported {
 						keyTypes = append(keyTypes, keyType{Name: sym.Name, Kind: "struct", Pkg: pkg, Methods: mc})
 					}
@@ -1417,9 +1431,9 @@ func (m *model) renderArchFull() string {
 		totalEntryPts += len(ps.EntryPoints)
 	}
 
-	st := m.graph.Stats()
+	st := g.Stats()
 	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Packages"), textStyle.Render(fmt.Sprintf("%d", len(r.Pkgs))))
-	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Files"), textStyle.Render(fmt.Sprintf("%d", len(m.graph.Files))))
+	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Files"), textStyle.Render(fmt.Sprintf("%d", len(g.Files))))
 	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Symbols"), textStyle.Render(fmt.Sprintf("%d", st.SymbolCount)))
 	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Interfaces"), textStyle.Render(fmt.Sprintf("%d", totalInterfaces)))
 	fmt.Fprintf(&b, "  %-16s  %s\n", mutedStyle.Render("Structs"), textStyle.Render(fmt.Sprintf("%d", totalStructs)))
@@ -1441,12 +1455,9 @@ func cycleDisplay(n int) string {
 // in a single terminal screen. Each layer shows top 3 packages
 // and a count of remaining packages.
 func (m *model) renderArchCollapsed() string {
-	g := m.graph
+	g := m.archGraph()
 	if g == nil || len(g.Files) == 0 {
-		g = m.buildArchGraph()
-		if g == nil || len(g.Files) == 0 {
-			return "no packages found in graph"
-		}
+		return "no packages found in graph"
 	}
 	lang := detectGraphLanguageForGraph(g, m)
 	r := analyze(g, lang)
@@ -1526,12 +1537,9 @@ func (m *model) renderArchCollapsed() string {
 
 // renderArchDrilldown shows a detailed breakdown for a specific layer or package.
 func (m *model) renderArchDrilldown(target string) string {
-	g := m.graph
+	g := m.archGraph()
 	if g == nil || len(g.Files) == 0 {
-		g = m.buildArchGraph()
-		if g == nil || len(g.Files) == 0 {
-			return "no packages found in graph"
-		}
+		return "no packages found in graph"
 	}
 	lang := detectGraphLanguageForGraph(g, m)
 	r := analyze(g, lang)
@@ -1636,7 +1644,7 @@ func (m *model) renderArchDrilldown(target string) string {
 
 		fmt.Fprintf(&b, "  Key Types in %s:\n", matchedPkg.Name)
 		typeCount := 0
-		for _, f := range m.graph.Files {
+		for _, f := range g.Files {
 			pkg := pkgLabel(f.Path)
 			if pkg != matchedPkg.Name {
 				continue
@@ -1647,15 +1655,15 @@ func (m *model) renderArchDrilldown(target string) string {
 				}
 				kindStr := "unknown"
 				switch sym.Kind {
-				case graph.SymbolInterface:
+				case lea.SymbolInterface:
 					kindStr = "interface"
-				case graph.SymbolStruct:
+				case lea.SymbolStruct:
 					kindStr = "struct"
-				case graph.SymbolFunction:
+				case lea.SymbolFunction:
 					kindStr = "function"
-				case graph.SymbolMethod:
+				case lea.SymbolMethod:
 					kindStr = "method"
-				case graph.SymbolType:
+				case lea.SymbolType:
 					kindStr = "type"
 				}
 				fmt.Fprintf(&b, "    %s [%s]\n", blueStyle.Render(sym.Name), mutedStyle.Render(kindStr))

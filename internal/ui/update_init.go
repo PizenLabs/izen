@@ -180,7 +180,7 @@ func (m *model) handleInitProviderSelect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.initStage = initComplete
 			m.initProviderItems = nil
 			m.saveInitState()
-			return m, tea.Batch(m.switchProvider(selected), m.ti.Focus(), buildGraphCmd(m.graphEng))
+			return m, tea.Batch(m.switchProvider(selected), m.ti.Focus(), buildGraphCmd(m.leaEng))
 		}
 		return m, nil
 	case tea.KeyUp:

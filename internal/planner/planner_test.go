@@ -89,7 +89,7 @@ func (f *fakeFiles) FocusedContext(_ context.Context, _ string, _, _ int) (strin
 }
 
 // newFakePlanner wires the planner to scripted fakes for deterministic tests.
-func newFakePlanner(fg *fakeGraph, fl *fakeLogs, ff *fakeFiles, maxTokens int) *Planner {
+func newFakePlanner(fg *fakeGraph, fl *fakeLogs, ff FileSource, maxTokens int) *Planner {
 	opts := []Option{
 		WithTokenEstimator(NewTokenEstimator()),
 	}
@@ -452,5 +452,129 @@ func TestPlanAssembledNoChunks(t *testing.T) {
 	}
 	if out != "" {
 		t.Errorf("expected empty output for source-less planner, got %q", out)
+	}
+}
+
+// ── 8. Governed @file references (P3 strict routing) ──────────────────────────
+
+// fakeRefFiles is a scripted FileSource whose FocusedContext returns file
+// content keyed by repository-relative path, proving the planner delegates the
+// disk read to the FileSource adapter rather than reading itself.
+type fakeRefFiles struct {
+	mu        sync.Mutex
+	readCalls []string
+	content   map[string]string
+}
+
+func (f *fakeRefFiles) Search(_ context.Context, _ string) ([]SearchHit, error) {
+	return nil, nil
+}
+
+func (f *fakeRefFiles) FocusedContext(_ context.Context, file string, _, _ int) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readCalls = append(f.readCalls, file)
+	return f.content[file], nil
+}
+
+func (f *fakeRefFiles) ReadCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.readCalls...)
+}
+
+func TestPlanRoutesExplicitFileRefsThroughFileSource(t *testing.T) {
+	ff := &fakeRefFiles{content: map[string]string{
+		"src/main.go": "package main\nfunc main() {}\n",
+	}}
+	p := newFakePlanner(nil, nil, ff, DefaultMaxContextTokens)
+
+	plan, err := p.Plan(context.Background(), "explain @src/main.go")
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	// The explicit @file reference must be read via the FileSource adapter.
+	calls := ff.ReadCalls()
+	if len(calls) == 0 {
+		t.Fatal("no @file reference was routed to the FileSource adapter")
+	}
+	if calls[0] != "src/main.go" {
+		t.Errorf("FileSource read %q, want %q", calls[0], "src/main.go")
+	}
+	// The file content must be present and the assembly must stay in budget.
+	assembled := plan.Assemble()
+	if !strings.Contains(assembled, "package main") {
+		t.Errorf("assembled context missing governed file content:\n%s", assembled)
+	}
+	if plan.TokenTotal > plan.Budget.Total {
+		t.Errorf("TokenTotal %d exceeds budget %d", plan.TokenTotal, plan.Budget.Total)
+	}
+}
+
+func TestPlanFileRefsHeadTruncateToSourceBudget(t *testing.T) {
+	// Single-line payload (mirrors the oversized-log path) so the
+	// head-truncation char-slice stays exact and the truncated chunk fits its
+	// 50% file-source allocation (200 of the 400-token budget).
+	ff := &fakeRefFiles{content: map[string]string{
+		"big.go": strings.Repeat("verbose payload data ", 400), // ~2000 tokens
+	}}
+	const budget = 400
+	p := newFakePlanner(nil, nil, ff, budget)
+
+	plan, err := p.Plan(context.Background(), "inspect @big.go")
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	// The oversized @file read is head-truncated to the file source share,
+	// never dropped wholesale.
+	fileFound := false
+	for _, c := range plan.Chunks {
+		if c.Source == SourceFile {
+			fileFound = true
+			if c.Tokens > plan.Budget.Source(SourceFile) {
+				t.Errorf("file chunk %d tokens exceeds file allocation %d", c.Tokens, plan.Budget.Source(SourceFile))
+			}
+			if !strings.Contains(c.Content, "[truncated]") {
+				t.Errorf("oversized file read missing truncation marker")
+			}
+		}
+	}
+	if !fileFound {
+		t.Fatal("explicit @file read was dropped instead of head-truncated")
+	}
+	if plan.TokenTotal > plan.Budget.Total {
+		t.Errorf("TokenTotal %d exceeds budget %d", plan.TokenTotal, plan.Budget.Total)
+	}
+}
+
+func TestResolveFileContextDelegatesToAdapter(t *testing.T) {
+	ff := &fakeRefFiles{content: map[string]string{
+		"internal/api/handler.go": "package api\nfunc Handle() {}\n",
+	}}
+	p := newFakePlanner(nil, nil, ff, DefaultMaxContextTokens)
+
+	got, err := p.ResolveFileContext(context.Background(), "@internal/api/handler.go")
+	if err != nil {
+		t.Fatalf("ResolveFileContext: %v", err)
+	}
+	if got == "" {
+		t.Fatal("ResolveFileContext returned empty context")
+	}
+	if !strings.Contains(got, "package api") {
+		t.Errorf("governed context missing file content:\n%s", got)
+	}
+	if est := NewTokenEstimator().Estimate(got); est > DefaultMaxContextTokens {
+		t.Errorf("ResolveFileContext output %d tokens exceeds budget", est)
+	}
+
+	// No @file reference → empty, no adapter call.
+	if got, err := p.ResolveFileContext(context.Background(), "no explicit file"); err != nil || got != "" {
+		t.Errorf("ResolveFileContext without @ref = %q, %v; want empty, nil", got, err)
+	}
+
+	// No file source wired → empty, no error.
+	p2 := newFakePlanner(nil, nil, nil, DefaultMaxContextTokens)
+	if got, err := p2.ResolveFileContext(context.Background(), "@missing.go"); err != nil || got != "" {
+		t.Errorf("ResolveFileContext without file source = %q, %v; want empty, nil", got, err)
 	}
 }

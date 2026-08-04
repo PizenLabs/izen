@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/events"
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes"
 	riview "github.com/PizenLabs/izen/internal/review"
 )
@@ -41,7 +41,7 @@ type Engine struct {
 	Result    *ReviewResult
 
 	retriever Retriever
-	graph     *graph.Graph
+	graph     *lea.FileGraph
 
 	// bus is the event bus this engine publishes domain events to. The review
 	// engine stays headless: stage transitions and outcomes are published as
@@ -50,7 +50,7 @@ type Engine struct {
 	bus *events.Bus
 }
 
-func NewEngine(root string, retriever Retriever, g *graph.Graph) *Engine {
+func NewEngine(root string, retriever Retriever, g *lea.FileGraph) *Engine {
 	return &Engine{
 		State:     NewStateMachine(DefaultStateConfig()),
 		Diff:      NewDiffAnalyzer(root),

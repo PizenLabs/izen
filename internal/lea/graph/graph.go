@@ -140,7 +140,7 @@ func (g *Graph) removeNode(id string) {
 		g.in[e.To] = dropEdge(g.in[e.To], id)
 	}
 	for _, e := range g.in[id] {
-		g.out[e.From] = dropEdge(g.out[e.From], id)
+		g.out[e.From] = dropEdgeTo(g.out[e.From], id)
 	}
 	delete(g.nodes, id)
 	delete(g.out, id)
@@ -169,10 +169,25 @@ func (g *Graph) removeNode(id string) {
 	}
 }
 
+// dropEdge filters out edges whose From equals the given node ID. It is used
+// by removeNode to prune the edges that originate from the deleted node.
 func dropEdge(es []Edge, from string) []Edge {
 	out := es[:0]
 	for _, e := range es {
 		if e.From != from {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// dropEdgeTo filters out edges whose To equals the given node ID. It is the
+// reverse-edge complement of dropEdge: removeNode uses it to prune the edges
+// that point AT the deleted node.
+func dropEdgeTo(es []Edge, to string) []Edge {
+	out := es[:0]
+	for _, e := range es {
+		if e.To != to {
 			out = append(out, e)
 		}
 	}
@@ -347,6 +362,30 @@ func (g *Graph) FilesInPackage(dir string) []Node {
 	return g.idsToNodes(g.pkgFiles[pkgID])
 }
 
+// ImportingFiles returns the files that import the given package directory
+// (the reverse of PackageDeps). Used for dependent lookups.
+func (g *Graph) ImportingFiles(dir string) []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	pkgID := g.packageNodes[dir]
+	if pkgID == "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, e := range g.in[pkgID] {
+		if e.Kind != EdgeImports {
+			continue
+		}
+		if from, ok := g.nodes[e.From]; ok && from.Kind == KindFile && !seen[from.File] {
+			seen[from.File] = true
+			out = append(out, from.File)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // PackageDeps returns the distinct package directories a package depends on
 // via IMPORTS edges.
 func (g *Graph) PackageDeps(dir string) []string {
@@ -444,6 +483,30 @@ func (g *Graph) Stats() Stats {
 	return s
 }
 
+// ImportsOf returns the raw import path strings declared by a file, including
+// external imports that do not resolve to an indexed package (and therefore
+// produce no IMPORTS edge).
+func (g *Graph) ImportsOf(path string) []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if fe, ok := g.fileExtracts[path]; ok {
+		return append([]string(nil), fe.Imports...)
+	}
+	return nil
+}
+
+// Package returns the package directory of a file node, if indexed.
+func (g *Graph) Package(path string) string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if id, ok := g.fileNodes[path]; ok {
+		if n, ok := g.nodes[id]; ok {
+			return n.Package
+		}
+	}
+	return ""
+}
+
 // Snapshot captures the graph for persistence. The in-memory indexes are
 // rebuilt on load.
 type Snapshot struct {
@@ -512,6 +575,16 @@ func (g *Graph) Restore(s Snapshot) {
 	g.in = make(map[string][]Edge, len(s.Edges)/4)
 	for i := range s.Nodes {
 		g.addNode(&s.Nodes[i])
+	}
+	// nodesByFile is not serialized in the snapshot; rebuild it from each
+	// node's File metadata. It must be populated before any incremental
+	// rebuild runs — funcNodesInFileLocked (and removeFileLocked) read it to
+	// locate a file's declared nodes, so a missing index silently drops every
+	// call/import edge resolved after a cache load.
+	for _, n := range g.nodes {
+		if n.File != "" {
+			g.nodesByFile[n.File] = append(g.nodesByFile[n.File], n.ID)
+		}
 	}
 	for path, id := range g.fileNodes {
 		if pkgID, ok := g.packageNodes[dirOf(path)]; ok {

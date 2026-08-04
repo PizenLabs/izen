@@ -136,15 +136,15 @@ func (g *Graph) funcNodesInFileLocked(path string) map[string]string {
 	return index
 }
 
-// rebuildCallEdgesLocked deterministically re-resolves every CALLS and
-// HTTP_HANDLES edge from the retained per-file extract data. It runs after a
-// full build and after every incremental change so cross-file references stay
-// exact regardless of file processing order.
+// rebuildCallEdgesLocked deterministically re-resolves every CALLS,
+// HTTP_HANDLES, and IMPORTS edge from the retained per-file extract data. It
+// runs after a full build and after every incremental change so cross-file
+// references stay exact regardless of file processing order.
 func (g *Graph) rebuildCallEdgesLocked() {
 	for from, es := range g.out {
 		out := es[:0]
 		for _, e := range es {
-			if e.Kind != EdgeCalls && e.Kind != EdgeHTTPHandles {
+			if e.Kind != EdgeCalls && e.Kind != EdgeHTTPHandles && e.Kind != EdgeImports {
 				out = append(out, e)
 			}
 		}
@@ -153,7 +153,7 @@ func (g *Graph) rebuildCallEdgesLocked() {
 	for to, es := range g.in {
 		out := es[:0]
 		for _, e := range es {
-			if e.Kind != EdgeCalls && e.Kind != EdgeHTTPHandles {
+			if e.Kind != EdgeCalls && e.Kind != EdgeHTTPHandles && e.Kind != EdgeImports {
 				out = append(out, e)
 			}
 		}
@@ -170,6 +170,21 @@ func (g *Graph) rebuildCallEdgesLocked() {
 		fe := g.fileExtracts[path]
 		dir := dirOf(path)
 		callerIndex := g.funcNodesInFileLocked(path)
+
+		// Re-resolve IMPORTS now that every package node exists: addImportEdges
+		// may have run before an imported package was indexed, so the edge is
+		// only guaranteed here.
+		fileID := g.fileNodes[path]
+		if fileID != "" && len(fe.Imports) > 0 {
+			seen := make(map[string]bool)
+			for _, imp := range fe.Imports {
+				target := strings.TrimPrefix(imp, "./")
+				if pkgID := g.resolvePackageLocked(target); pkgID != "" && !seen[pkgID] {
+					seen[pkgID] = true
+					g.addEdge(Edge{From: fileID, To: pkgID, Kind: EdgeImports})
+				}
+			}
+		}
 
 		for _, call := range fe.Calls {
 			fromID := callerIndex[call.InFunc]

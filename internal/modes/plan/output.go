@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/prompt"
 )
 
 // BlockPattern defines the non-negotiable schema for LLM plan output.
@@ -420,29 +422,14 @@ func ValidateAllTasks(tasks []Task) error {
 	return nil
 }
 
-const SchemaTemplate = `- [ ] FILE_MUTATE: path/to/file.go | describe the change
-- [ ] SHELL_EXEC: go build ./... | reason for running this command
-- [ ] GIT_ACTION: commit -m "message" | why this commit is needed`
+// SchemaTemplate is the concrete example block for the task-block output
+// contract. The canonical definition lives in prompt/schema.go; this alias
+// keeps /plan call sites stable while the schema is single-sourced.
+const SchemaTemplate = prompt.TaskBlockSchemaTemplate
 
 // SchemaInstruction returns the schema definition block for system prompts.
+// Delegates to the consolidated prompt.SchemaInstruction so the
+// "- [ ] <TYPE>: <Target> | <Rationale>" contract is defined exactly once.
 func SchemaInstruction() string {
-	return fmt.Sprintf(`You MUST output ONLY task blocks. Each line MUST follow this EXACT syntax:
-
-  - [ ] <TYPE>: <Target> | <Rationale>
-
-ALLOWED TYPES (case-sensitive):
-  FILE_MUTATE — Target is the exact file path (relative to project root)
-  SHELL_EXEC  — Target is the exact shell command to execute
-  GIT_ACTION  — Target is the git operation
-
-RULES:
-  1. Every line MUST start with "- [ ]" or "- [x]".
-  2. No introductory text, no concluding text, no markdown code fences.
-  3. Use "|" (pipe) to separate Target from Rationale.
-  4. Target paths MUST be relative to the project root.
-  5. No speculative paths — only reference files in the directory tree above.
-
-Example:
-%s`,
-		SchemaTemplate)
+	return prompt.TaskBlockSchemaInstruction()
 }

@@ -13,7 +13,10 @@ import (
 // storeMagic prefixes the cache file so stale/foreign data is rejected.
 var storeMagic = []byte{0x4c, 0x45, 0x41, 0x47} // "LEAG"
 
-const storeVersion byte = 1
+// storeVersion is bumped whenever the snapshot codec layout changes so caches
+// written by an older layout are rejected and re-indexed instead of misread.
+// v2: FileExtract retains raw import path strings (import/dependent queries).
+const storeVersion byte = 2
 
 // Store persists the structural graph to a zstd-compressed binary file at
 // <root>/.izen/graph.bin.zst.
@@ -61,6 +64,9 @@ func (s *Store) Load(g *graph.Graph) (bool, error) {
 	}
 	if len(data) < len(storeMagic)+1 || !bytes.Equal(data[:len(storeMagic)], storeMagic) {
 		return false, fmt.Errorf("invalid graph cache format")
+	}
+	if data[len(storeMagic)] != storeVersion {
+		return false, fmt.Errorf("graph cache version %d != %d", data[len(storeMagic)], storeVersion)
 	}
 
 	dec, err := zstd.NewReader(nil)

@@ -446,9 +446,7 @@ func (m *model) routeFreeInput(line string) tea.Cmd {
 }
 
 func (m *model) handleMessageContent(line string) tea.Cmd {
-	var fileCtx strings.Builder
 	var refFiles []string
-	var trace *ctxpkg.CodebaseTrace
 	for _, field := range strings.Fields(line) {
 		if !strings.HasPrefix(field, "@") {
 			continue
@@ -462,94 +460,16 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 	refFiles = append(refFiles, m.pendingFileRefs...)
 	m.pendingFileRefs = nil
 
-	if m.graph != nil && len(refFiles) > 0 {
-		cb := ctxpkg.NewBuilder(".", m.graph, m.gitEng, m.sess)
-		renderer := ctxpkg.DefaultRenderer()
-		seen := make(map[string]bool)
-		for _, ref := range refFiles {
-			if seen[ref] {
-				continue
-			}
-			seen[ref] = true
-			symName := filepath.Base(ref)
-			symExt := filepath.Ext(symName)
-			if symExt != "" {
-				symName = strings.TrimSuffix(symName, symExt)
-			}
-			depCtx := cb.BuildDependencySlice(symName)
-			if len(depCtx.Files) == 0 {
-				fn := m.graph.LookupFile(ref)
-				if fn != nil {
-					fs := ctxpkg.CompressFile(fn, 30)
-					depCtx.Files = append(depCtx.Files, fs)
-				}
-			}
-			if len(depCtx.Files) > 0 {
-				if fileCtx.Len() > 0 {
-					fileCtx.WriteString("\n")
-				}
-				fileCtx.WriteString(renderer.Render(depCtx))
-				if depCtx.Trace != nil {
-					trace = depCtx.Trace
-				}
-			}
-			// Force sync: always include CURRENT file content read fresh from disk
-			// so the AI sees the exact byte content rather than relying on cached
-			// graph metadata alone.
-			data, err := os.ReadFile(ref)
-			if err == nil {
-				ext := filepath.Ext(ref)
-				lang := strings.TrimPrefix(ext, ".")
-				// REFORM B: Anti-prompt injection — strip legacy comments/TODOs
-				// from source code before feeding to LLM. This prevents stale
-				// developer notes in the codebase from hijacking the agent's
-				// attention away from the actual task.
-				sanitized := ctxpkg.SanitizeSourceForLLM(string(data), lang)
-				lines := strings.Split(sanitized, "\n")
-				if len(lines) > 50 {
-					lines = lines[:50]
-				}
-				if fileCtx.Len() > 0 {
-					fileCtx.WriteString("\n\n")
-				}
-				fmt.Fprintf(&fileCtx, "## Current Content of: %s\n```%s\n%s\n```",
-					ref, lang, strings.Join(lines, "\n"))
-			}
-		}
-	} else if len(refFiles) > 0 {
-		for _, ref := range refFiles {
-			data, err := os.ReadFile(ref)
-			if err != nil {
-				continue
-			}
-			if fileCtx.Len() > 0 {
-				fileCtx.WriteString("\n\n")
-			}
-			ext := filepath.Ext(ref)
-			lang := strings.TrimPrefix(ext, ".")
-			// REFORM B: Sanitize source to remove prompt-injection comments
-			sanitized := ctxpkg.SanitizeSourceForLLM(string(data), lang)
-			fmt.Fprintf(&fileCtx, "File: %s\n```%s\n%s\n```", ref, lang, sanitized)
-		}
-	}
-
-	// Inject semantic mapping rules for legal/text files to guide local SLMs
-	// that struggle with author/copyright targeting in LICENSE documents.
-	if fileCtx.Len() > 0 {
-		ctxStr := fileCtx.String()
-		lowerCtx := strings.ToLower(ctxStr)
-		if strings.Contains(lowerCtx, "license") || strings.Contains(lowerCtx, "readme") {
-			semanticRule := `[SEMANTIC MAPPING RULE]: In legal text/LICENSE documents, the "Author", "Holder", or "Organization" corresponds specifically to the string immediately following the "Copyright (c) <Year>" marker. You must strictly target your line mutation to THAT specific line. Do not alter any other paragraph.`
-			fileCtx.WriteString("\n\n" + semanticRule)
-		}
-	}
+	// CONTEXT GOVERNANCE (P3): /ask context assembly is routed EXCLUSIVELY
+	// through the Context Planner (planContextForAsk → Planner.Plan()). Explicit
+	// @file references are resolved by the planner's gatherFileRefs via the
+	// governed FileSource adapter; the fallback file-read path lives in
+	// streamCmd (injectFileContext) and is likewise planner-backed. No raw disk
+	// reads are performed here.
 
 	line = m.expandFileRefs(line)
 
 	content := strings.TrimSpace(line)
-	if fileCtx.Len() > 0 {
-		content = fileCtx.String() + "\n\n" + content
-	}
 
 	// ── $hot FAST-TRACK ─────────────────────────────────────────────────
 	// Any message starting with $hot bypasses ALL plan generation and
@@ -857,43 +777,20 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.currentResult = nil
 		}
 
-		if m.resolver.Current() == modes.ModeAsk && len(refFiles) == 0 && !gateway.IsCasualChat(line) {
-			result := retrieval.RouteAsk(line, m.gitEng)
-			if len(result.Targets) > 0 && m.graph != nil {
-				cb := ctxpkg.NewBuilder(".", m.graph, m.gitEng, m.sess)
-				ctx := cb.Build(ctxpkg.BuildRequest{
-					Files:      result.Targets,
-					MaxFiles:   len(result.Targets),
-					MaxSymbols: 20,
-				})
-				if ctx != nil && len(ctx.Files) > 0 {
-					header := fmt.Sprintf("### LOCALIZED CONTEXT (%s)\n\n", result.Label)
-					content = header + ctxpkg.DefaultRenderer().Render(ctx) + "\n" + content
-					if ctx.Trace != nil {
-						trace = ctx.Trace
-					}
-				}
-			}
-		}
-
-		// ── CONTEXT PLANNER INJECTION ─────────────────────────────────────
-		// The Context Planner sits between intent recognition and the prompt
-		// pipeline: it classifies the question, computes a token budget split
-		// per context source, queries only the intent-prioritized engines
-		// (Lea graph symbols, tool logs, architecture overview), and enforces
-		// the budget before the context reaches the LLM. The injection is a
-		// strict additive enrichment: it degrades silently to the untouched
-		// input when no graph is ready or the plan yields no chunks.
+		// CONTEXT GOVERNANCE (P3): ALL /ask context assembly routes strictly
+		// through the Context Planner. The legacy RouteAsk + context Builder
+		// path (raw file reads bypassing the I/O layer) has been removed; the
+		// planner's Plan() classifies the question, computes a token budget
+		// split per context source, queries only the intent-prioritized engines
+		// (Lea graph symbols, tool logs, @file references, architecture
+		// overview), ranks and dedupes the chunks, and enforces the budget
+		// before the context reaches the LLM. The injection is a strict
+		// additive enrichment: it degrades silently to the untouched input
+		// when no graph is ready or the plan yields no chunks.
 		if m.resolver.Current() == modes.ModeAsk {
 			content = m.planContextForAsk(content)
 		}
 
-		if trace != nil {
-			return tea.Batch(
-				func() tea.Msg { return traceUpdateMsg{trace: trace} },
-				m.streamCmd(content),
-			)
-		}
 		return m.streamCmd(content)
 	}
 }

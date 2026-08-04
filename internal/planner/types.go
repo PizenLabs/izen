@@ -175,3 +175,34 @@ func (p *ContextPlan) Assemble() string {
 	}
 	return b.String()
 }
+
+// DebugInfo is an on-demand diagnostic snapshot of one context-governance run:
+// the allocated token budget versus the chunks that were retrieved, kept, and
+// dropped by budget enforcement. RetrievedChunks counts every chunk gathered
+// before the budget enforcer ran (FittedChunks + DroppedChunks).
+type DebugInfo struct {
+	Intent          Intent
+	AllocatedTokens int
+	RetrievedChunks int
+	FittedChunks    int
+	DroppedChunks   int
+	UsedTokens      int
+}
+
+// Debug materializes the governance snapshot of a completed planning run. It
+// is pure — no state is tracked during planning beyond the plan fields the
+// budget enforcer already produces.
+func (p *ContextPlan) Debug() DebugInfo {
+	if p == nil {
+		return DebugInfo{}
+	}
+	di := DebugInfo{
+		Intent:          p.Intent,
+		AllocatedTokens: p.Budget.Total,
+		FittedChunks:    len(p.Chunks),
+		DroppedChunks:   p.Dropped,
+		UsedTokens:      p.TokenTotal,
+	}
+	di.RetrievedChunks = di.FittedChunks + di.DroppedChunks
+	return di
+}

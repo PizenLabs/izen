@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"regexp"
 
-	"github.com/PizenLabs/izen/internal/graph"
+	"github.com/PizenLabs/izen/internal/lea"
 )
 
 // Tier represents a deterministic risk classification level.
@@ -67,12 +67,12 @@ var Tier1Patterns = []*regexp.Regexp{
 
 // Classifier determines the risk tier for mutation targets.
 type Classifier struct {
-	graph *graph.Graph // optional; used for symbol impact escalation
+	graph *lea.FileGraph // optional; used for symbol impact escalation
 }
 
 // NewClassifier creates a Classifier. The graph parameter is optional — when
 // provided, symbol impact escalation is enabled.
-func NewClassifier(g *graph.Graph) *Classifier {
+func NewClassifier(g *lea.FileGraph) *Classifier {
 	return &Classifier{graph: g}
 }
 
@@ -141,8 +141,8 @@ func (c *Classifier) symbolImpactsTier3File(target Target) bool {
 		return false
 	}
 
-	symbols, ok := c.graph.SymbolIdx[target.Symbol]
-	if !ok {
+	symbols := c.graph.LookupSymbol(target.Symbol)
+	if len(symbols) == 0 {
 		return false
 	}
 
