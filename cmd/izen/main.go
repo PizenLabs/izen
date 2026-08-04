@@ -40,6 +40,7 @@ func printMinimalistHelp() {
 	fmt.Println("  izen compact            Compress prompt overhead in context/memory files")
 	fmt.Println("  izen memory optimize    Alias for izen compact")
 	fmt.Println("  izen rollback           Review recent file mutations")
+	fmt.Println("  izen run \"<prompt>\"      Execute a prompt through the v1 runtime state machine")
 	fmt.Println("  izen [path]             Start TUI at the given project path")
 	fmt.Println()
 	fmt.Println("Interactive Commands (inside TUI):")
@@ -87,6 +88,12 @@ func main() {
 			os.Exit(0)
 		case "debug":
 			if err := runDebugCommand(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		case "run":
+			if err := runRuntimeCommand(os.Args[2:]); err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				os.Exit(1)
 			}
