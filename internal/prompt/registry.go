@@ -21,7 +21,7 @@ type RuntimeFacts struct {
 
 // Compose assembles the full system prompt:
 //
-//	Identity Header → Public Handle Context → Common Contract → Mode Contract → Environment Context (optional) → Style Directive (active policy)
+//	Identity Header → Public Handle Context → Common Contract → Mode Contract → Environment Context (optional) → Style Directive (active policy) → Workspace Capabilities (Layer 1)
 //
 // Each section lives in exactly one place; nothing is duplicated.
 func Compose(modeContract string, facts RuntimeFacts) string {
@@ -48,7 +48,12 @@ func Compose(modeContract string, facts RuntimeFacts) string {
 
 	// Response style directive — injected dynamically from the active policy
 	// so every mode honors the engineer's configured verbosity.
-	return ApplyStyle(b.String(), activeStyle)
+	out := ApplyStyle(b.String(), activeStyle)
+
+	// Workspace capability contract — injected from the Layer 1 capability
+	// graph so the model never hallucinates a toolchain. It is applied last
+	// and idempotently so re-composition never duplicates it.
+	return ApplyWorkspaceCapabilities(out)
 }
 
 // AskSystemPrompt returns the composed system prompt for ask mode.

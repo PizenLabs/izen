@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/ai"
@@ -19,6 +20,47 @@ import (
 // or missing API key). The UI layer detects this sentinel error via errors.Is
 // and displays a clear actionable banner instead of a raw HTTP status message.
 var ErrOpenRouterAuth = errors.New("openrouter: authorization failed (HTTP 401): invalid or missing OPENROUTER_API_KEY — check your environment variables or run: export OPENROUTER_API_KEY=<your_key>")
+
+// DefaultOpenRouterModel is the safe fallback model ID used when a request
+// carries no model resolvable to OpenRouter's vendor/model schema.
+const DefaultOpenRouterModel = "anthropic/claude-3.5-sonnet"
+
+// openRouterModelIDRe matches OpenRouter's vendor/model-id schema: a non-empty
+// vendor component, a single "/", and a non-empty model component. Vendors
+// carry hyphens and digits (meta-llama, gpt-4o) and models may carry
+// ":free"-style variants. An ID without a vendor prefix (e.g. Ollama's
+// "qwen2.5-coder:7b") is rejected by the API with HTTP 400 "not a valid model
+// ID" and must be mapped before dispatch.
+var openRouterModelIDRe = regexp.MustCompile(`^[^/\s]+/[^/\s]+$`)
+
+// SanitizeModelForOpenRouter maps a model ID onto a valid OpenRouter model ID.
+// Local/Ollama IDs (e.g. "qwen2.5-coder:7b") carry no vendor prefix and are
+// rejected by OpenRouter with status 400; they are remapped to the provider's
+// default model. Returns "" only when neither the requested nor the fallback
+// model is valid for OpenRouter.
+func SanitizeModelForOpenRouter(model, fallback string) string {
+	for _, candidate := range []string{model, fallback} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate != "" && openRouterModelIDRe.MatchString(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// resolveModel returns the effective model ID for a request, remapping any
+// local/non-OpenRouter ID onto the provider default so the API never rejects
+// the payload with HTTP 400. Returns an error when no valid ID is available.
+func (p *OpenRouterProvider) resolveModel(reqModel string) (string, error) {
+	model := p.model
+	if reqModel != "" {
+		model = reqModel
+	}
+	if model = SanitizeModelForOpenRouter(model, p.model); model == "" {
+		return "", fmt.Errorf("openrouter: no valid model ID configured (got %q)", p.model)
+	}
+	return model, nil
+}
 
 // ReasoningSentinel is a zero-width marker embedded in the stream output to
 // distinguish reasoning content from message content. The UI layer detects
@@ -64,9 +106,9 @@ func (p *OpenRouterProvider) resolveAPIKey() string {
 }
 
 func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
-	model := p.model
-	if req.Model != "" {
-		model = req.Model
+	model, err := p.resolveModel(req.Model)
+	if err != nil {
+		return nil, err
 	}
 
 	key := p.resolveAPIKey()
@@ -171,9 +213,9 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 }
 
 func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
-	model := p.model
-	if req.Model != "" {
-		model = req.Model
+	model, err := p.resolveModel(req.Model)
+	if err != nil {
+		return nil, err
 	}
 
 	key := p.resolveAPIKey()

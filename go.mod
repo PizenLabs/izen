@@ -13,6 +13,7 @@ require (
 	github.com/klauspost/compress v1.19.1
 	github.com/mattn/go-runewidth v0.0.24
 	github.com/yuin/goldmark v1.8.5
+	golang.org/x/sync v0.22.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

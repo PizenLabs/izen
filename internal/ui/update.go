@@ -2418,6 +2418,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if err == nil {
 			m.cfg = newCfg
 		}
+		// A config file change may have altered the active provider or the
+		// intent-tier models; re-pin the pipeline router so mode commands
+		// never route a stale local model into a cloud provider.
+		m.syncPipelineTiers()
 		return m, nil
 
 	case gitInitResultMsg:
@@ -2592,6 +2596,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		effort := msg.effort
 		tierKey := effort.ConfigTier()
 		m.cfg.SetTierOverride(tierKey, msg.model.ID)
+		m.syncPipelineTiers()
 
 		modelProvider := msg.model.Provider
 		currentProvider := ""

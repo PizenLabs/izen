@@ -35,6 +35,7 @@ import (
 	"github.com/PizenLabs/izen/internal/patch"
 	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
+	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/router"
@@ -44,6 +45,10 @@ import (
 	"github.com/PizenLabs/izen/internal/state"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
+	"github.com/PizenLabs/izen/pkg/engine/layer1"
+	"github.com/PizenLabs/izen/pkg/engine/layer3"
+	"github.com/PizenLabs/izen/pkg/engine/pipeline"
+	"github.com/PizenLabs/izen/pkg/engine/telemetry"
 )
 
 // NewProgram initializes the active model state context and instantiates the runner engine.
@@ -89,6 +94,43 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 	// gated on completed onboarding, because its cache write creates .izen/
 	// and must not trip HasLocalState during the init flow.
 	leaEng := lea.NewEngine(root)
+
+	// ── LAYERED PIPELINE ENGINE (LAYERS 0-5) ─────────────────────────────
+	// The central Pipeline Engine wires the foundation layers onto the
+	// orchestrator: Layer 0 knowledge resolution, Layer 1 capability
+	// detection, Layer 2 governed context, Layer 3 policy guard + stateless
+	// worker, Layer 4 validation DAG and Layer 5 telemetry. It performs no
+	// legacy heuristic context gathering or stack detection, and its
+	// intent-based model router picks the model tier per mode (/plan and
+	// /investigate route to reasoning models under strict budgets; /build
+	// routes to fast coding models; /ask routes to a minimal read-only
+	// policy).
+	pipeRouter := pipeline.NewRouter(
+		pipeline.WithModel(pipeline.IntentReasoning, cfg.ResolveTierModel("reasoning")),
+		pipeline.WithModel(pipeline.IntentExecution, cfg.ResolveTierModel("execution")),
+		pipeline.WithModel(pipeline.IntentInformational, cfg.ResolveTierModel("informational")),
+		pipeline.WithProvider(pipeline.IntentReasoning, cfg.ResolveTierProvider("reasoning")),
+		pipeline.WithProvider(pipeline.IntentExecution, cfg.ResolveTierProvider("execution")),
+		pipeline.WithProvider(pipeline.IntentInformational, cfg.ResolveTierProvider("informational")),
+		pipeline.WithFallbackModel(cfg.ResolveTierModel("execution")),
+	)
+	pipeOpts := []pipeline.Option{
+		pipeline.WithEventBus(telemetry.NewEventBus(telemetry.DefaultBufferSize)),
+		pipeline.WithRouter(pipeRouter),
+	}
+	if provider != nil {
+		pipeOpts = append(pipeOpts, pipeline.WithClient(pipelineClient(provider)))
+	}
+	pipelineEng := pipeline.NewEngine(root, leaEng, pipeOpts...)
+
+	// Inject the Layer 1 workspace-capability header into every composed LLM
+	// system prompt so the model is told exactly which toolchain commands
+	// exist (and which do not), eliminating tech-stack hallucinations. The
+	// detection is a single cheap directory scan; a failure simply leaves the
+	// header empty and the composed prompts unchanged.
+	if g, derr := layer1.Detect(root); derr == nil {
+		prompt.SetWorkspaceCapabilities(pipeline.CapabilityHeader(g))
+	}
 
 	ti := textinput.New()
 	ti.Prompt = ""
@@ -262,7 +304,7 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 	// above. Mode switches update the active phase dynamically WITHOUT
 	// resetting conversation history or workspace artifacts (the RuntimeContext
 	// is never replaced). Phase changes are observed via EventPhaseChanged.
-	orch := orchestrator.New(workflowSM, runtimeCtx).WithEventBus(eventBus)
+	orch := orchestrator.New(workflowSM, runtimeCtx).WithEventBus(eventBus).WithPipeline(pipelineEng)
 
 	// ── MULTI-TIER PATCH ENGINE ──────────────────────────────────────────
 	// The new patch engine replaces the legacy patch application pipeline in
@@ -323,6 +365,7 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 		pres:                presenter,
 		intentRouter:        intentRouter,
 		orch:                orch,
+		pipelineEngine:      pipelineEng,
 		patchEngine:         patchEng,
 		toolCallBuffer:      execution.NewToolCallBuffer(root),
 		thinkingPanel:       NewThinkingPanel(),
@@ -537,6 +580,25 @@ func bootCommon(root string, cfg *config.Config) (*session.Session, *ai.Manager,
 	retrieval.SetGlobalRouter(router)
 
 	return sess, mgr, router
+}
+
+// pipelineClient adapts an ai.Provider onto the pipeline engine's stateless
+// WorkerClient contract. The provider's rendered prompt is delivered as the
+// user turn; model routing is handled by the pipeline router, not here.
+func pipelineClient(p ai.Provider) *pipeline.FuncClient {
+	if p == nil {
+		return pipeline.NewFuncClient(nil)
+	}
+	return pipeline.NewFuncClient(func(ctx context.Context, provider, model, prompt string) (string, layer3.TokenUsage, error) {
+		resp, err := p.Execute(ctx, ai.Request{
+			Messages: []ai.Message{{Role: "user", Content: prompt}},
+			Model:    model,
+		})
+		if err != nil {
+			return "", layer3.TokenUsage{}, err
+		}
+		return resp.Content, layer3.TokenUsage{Input: resp.TokenInput, Output: resp.TokenOutput}, nil
+	})
 }
 
 func runProgram(p *tea.Program, root string, initStage initStage) {

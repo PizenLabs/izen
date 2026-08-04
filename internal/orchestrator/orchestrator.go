@@ -19,6 +19,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/runtime"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/pkg/engine/pipeline"
 )
 
 // Phase is a logical execution phase within the workflow.
@@ -100,12 +101,13 @@ func validEdge(from, to Phase) bool {
 // Orchestrator drives the workflow state machine across execution phases while
 // keeping a single persistent RuntimeContext. It is safe for concurrent use.
 type Orchestrator struct {
-	mu      sync.RWMutex
-	sm      *workflow.WorkflowStateMachine
-	rt      *runtime.RuntimeContext
-	current Phase
-	bus     *events.Bus
-	history []Phase
+	mu       sync.RWMutex
+	sm       *workflow.WorkflowStateMachine
+	rt       *runtime.RuntimeContext
+	current  Phase
+	bus      *events.Bus
+	history  []Phase
+	pipeline *pipeline.Engine
 }
 
 // New creates an Orchestrator bound to the shared WorkflowStateMachine and
@@ -127,6 +129,28 @@ func (o *Orchestrator) WithEventBus(bus *events.Bus) *Orchestrator {
 		o.bus = bus
 	}
 	return o
+}
+
+// WithPipeline wires the layered Pipeline Engine (Layers 0-5) onto the
+// orchestrator. The pipeline supplies knowledge resolution, capability
+// detection, governed context, intent-based model routing and validation for
+// the execution phases. Nil detaches the pipeline. Returns the orchestrator
+// for chaining.
+func (o *Orchestrator) WithPipeline(pe *pipeline.Engine) *Orchestrator {
+	if o != nil {
+		o.pipeline = pe
+	}
+	return o
+}
+
+// Pipeline returns the wired layered Pipeline Engine, if any.
+func (o *Orchestrator) Pipeline() *pipeline.Engine {
+	if o == nil {
+		return nil
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.pipeline
 }
 
 // RuntimeContext returns the shared, persistent runtime context. The returned

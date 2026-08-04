@@ -128,6 +128,11 @@ func (m *model) switchProvider(name string) tea.Cmd {
 		m.planEngine.SetStreamProvider(m.provider.ExecuteStream)
 	}
 
+	// Re-pin the layered pipeline router's intent tiers to the new active
+	// provider so mode commands never route a stale local model into a cloud
+	// request (OpenRouter rejects e.g. "qwen2.5-coder:7b" with HTTP 400).
+	m.syncPipelineTiers()
+
 	m.push(roleSystem, fmt.Sprintf("[✓] Provider switched: %s → %s", oldName, name))
 
 	return func() tea.Msg {
