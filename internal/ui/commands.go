@@ -679,7 +679,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 				m.flushPendingRecords(),
 				m.smoothStreamTickCmd(),
 				m.planSlowNoticeCmd(),
-				m.runPlanEngineCmd(handoffSource, problem, m.cfg.ActiveModelName(), m.handoffCtx),
+				m.runPlanEngineCmd(handoffSource, problem, m.routeModel("plan"), m.handoffCtx),
 			)
 		}
 
@@ -723,7 +723,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			return m.flushPendingRecords()
 		}
 
-		modelName := m.cfg.ActiveModelName()
+		modelName := m.routeModel("plan")
 		if budgetErr := plan.CheckTokenBudget(modelName, assembly.EstimateTokens); budgetErr != nil {
 			m.push(roleError, budgetErr.Error())
 			m.push(roleSystem, infoStyle.Render(budgetErr.BudgetActionHint()))
@@ -2463,7 +2463,7 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 	}
 
 	req := ai.Request{
-		Model:     m.cfg.ActiveModelName(),
+		Model:     m.activeRouteModel(),
 		Messages:  msgs,
 		Stream:    true,
 		System:    systemPrompt,
@@ -2857,7 +2857,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	// generates the patch. The spinner keeps animating until the proposal
 	// message arrives and swaps the pane into the diff view.
 	m.push(roleStatus, "[HOTFIX] Generating patch (local short-circuit for simple modifications)...")
-	m.push(roleSystem, fmt.Sprintf("  ⚙ Thinking... (Invoking %s)", m.cfg.ActiveModelName()))
+	m.push(roleSystem, fmt.Sprintf("  ⚙ Thinking... (Invoking %s)", m.activeRouteModel()))
 
 	m.agentRunning = true
 	m.agentDone = false
@@ -3072,7 +3072,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		}
 
 		req := ai.Request{
-			Model:     m.cfg.ActiveModelName(),
+			Model:     m.activeRouteModel(),
 			System:    system,
 			Stream:    false,
 			MaxTokens: 2048,
@@ -3482,7 +3482,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				stop = []string{"```\n\n"}
 			}
 			req := ai.Request{
-				Model:     m.cfg.ActiveModelName(),
+				Model:     m.activeRouteModel(),
 				System:    system,
 				Stream:    false,
 				MaxTokens: 2048,
@@ -3523,7 +3523,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 						warningStyle.Render("[BUILD WARNING] %s returned empty output on attempt %d. "+
 							"The model may be wrapping the diff in markdown or conversational text. "+
 							"Retrying with explicit format instructions."),
-						m.cfg.ActiveModelName(), attempt+1))
+						m.activeRouteModel(), attempt+1))
 				}
 				if attempt < maxRetries {
 					handoff = fmt.Sprintf(
@@ -3564,7 +3564,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 								warningStyle.Render("[BUILD WARNING] %s failed structural breakdown on attempt %d. "+
 									"The output contained no diff markers (--- a/, +++ b/, @@, <<<<<<< SEARCH). "+
 									"Retrying with explicit diff format demonstration."),
-								m.cfg.ActiveModelName(), attempt+1))
+								m.activeRouteModel(), attempt+1))
 						}
 						if attempt < maxRetries {
 							handoff = fmt.Sprintf(
@@ -3663,7 +3663,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				"%s\n\nALL PRIOR PATCH ATTEMPTS FAILED. Output the COMPLETE updated file content inside a SINGLE markdown code block. Do NOT use SEARCH/REPLACE, unified diff, or FILE_CREATE markers. Return the entire file — nothing less.",
 				buildHandoff(orig))
 			fullRewriteReq := ai.Request{
-				Model:     m.cfg.ActiveModelName(),
+				Model:     m.activeRouteModel(),
 				System:    prompt.StrategyContract("small_fallback"),
 				Stream:    false,
 				MaxTokens: 4096,
@@ -3953,7 +3953,7 @@ func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
 		system := prompt.ExistingFileContract()
 
 		req := ai.Request{
-			Model:     m.cfg.ActiveModelName(),
+			Model:     m.activeRouteModel(),
 			System:    system,
 			Stream:    false,
 			MaxTokens: 2048,
@@ -5706,8 +5706,8 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 			// concrete *OllamaProvider — that assertion is what produced the
 			// false-positive "provider unreachable" error. Reusing the shared
 			// interface guarantees the exact provider configuration, model tag
-			// binding (m.cfg.ActiveModelName()), and base URL context that lets
-			// /ask execute successfully.
+			// binding (m.routeModel("investigate")), and base URL context that
+			// lets /ask execute successfully.
 			if m.provider == nil {
 				m.push(roleError, "[System Error] No AI provider is configured. Run /model to select one.")
 				m.refreshViewportContent()
@@ -5717,7 +5717,7 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 
 			// Run the diagnosis through the unified client router.
 			resp, err := m.provider.Execute(context.Background(), ai.Request{
-				Model: m.cfg.ActiveModelName(),
+				Model: m.routeModel("investigate"),
 				Messages: []ai.Message{
 					{Role: "user", Content: string(logData)},
 				},
@@ -5788,7 +5788,7 @@ func (m *model) runAskPromptHandoffCmd(rawInput string) tea.Cmd {
 			systemPrompt := prompt.AskPromptHandoffSystemPrompt(uname)
 
 			req := ai.Request{
-				Model: m.cfg.ActiveModelName(),
+				Model: m.routeModel("ask"),
 				Messages: []ai.Message{
 					{Role: "user", Content: rawInput},
 				},
@@ -5908,7 +5908,7 @@ func (m *model) analyzeObjectiveCmd(obj *domain.Objective) tea.Cmd {
 				resultCh <- objectiveAnalyzedMsg{err: fmt.Errorf("objective is nil")}
 				return
 			}
-			res := objengine.BuildObjectiveContext(obj.RawIntent, m.cfg.ActiveModelName(), m.graph)
+			res := objengine.BuildObjectiveContext(obj.RawIntent, m.routeModel("plan"), m.graph)
 			obj.Scope = res.Scope
 			obj.TokenBudget = res.Budget
 			obj.Telemetry = append(obj.Telemetry[:0], res.Telemetry...)

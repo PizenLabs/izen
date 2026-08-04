@@ -45,6 +45,7 @@ import (
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
+	"github.com/PizenLabs/izen/pkg/engine/pipeline"
 )
 
 // ── Init stage types ──────────────────────────────────────────────────────────
@@ -1060,8 +1061,48 @@ type model struct {
 	// PatchRejected/ApprovalRequested on the bus. Nil only in headless/tests.
 	patchEngine *patch.Engine
 
+	// Layered pipeline engine (Layers 0-5): knowledge resolution, capability
+	// detection, governed context, intent-based model routing and validation.
+	// It is attached to the orchestrator; the UI reads the routed model for
+	// each mode command. Nil only in headless/test harnesses.
+	pipelineEngine *pipeline.Engine
+
 	// Current effort level for generation
 	currentEffort EffortLevel
+}
+
+// isProjectInitialized checks whether .izen/ exists AND contains a valid
+// config.json on disk. This is the AUTHORITATIVE first-run gate used by
+// BuildWorkspace to decide whether to render the onboarding overlay or the
+// normal mode workspace. It supersedes any in-memory initStage value.
+// activeRouteModel resolves the intent-routed model for the currently active
+// mode (via the layered Pipeline Engine router), falling back to the
+// configured active model when the pipeline is unavailable. Mode commands use
+// this so /plan and /investigate hit reasoning models while /build hits fast
+// coding models.
+func (m *model) activeRouteModel() string {
+	if m == nil || m.resolver == nil {
+		return ""
+	}
+	return m.routeModel(m.resolver.Current().String())
+}
+
+// routeModel resolves the intent-routed model for an explicit mode name. It is
+// the single seam the UI commands use for intent-based model routing.
+func (m *model) routeModel(mode string) string {
+	if m == nil {
+		return ""
+	}
+	if m.pipelineEngine != nil {
+		return m.pipelineEngine.RouteForMode(mode).Model
+	}
+	if m.orch != nil && m.orch.Pipeline() != nil {
+		return m.orch.Pipeline().RouteForMode(mode).Model
+	}
+	if m.cfg != nil {
+		return m.cfg.ActiveModelName()
+	}
+	return ""
 }
 
 // isProjectInitialized checks whether .izen/ exists AND contains a valid

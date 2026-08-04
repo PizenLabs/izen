@@ -419,6 +419,18 @@ func Default() *Config {
 					Provider: "ollama",
 					Model:    "qwen2.5-coder:7b",
 				},
+				"reasoning": {
+					Provider: "ollama",
+					Model:    "qwen2.5-coder:7b",
+				},
+				"execution": {
+					Provider: "ollama",
+					Model:    "qwen2.5-coder:7b",
+				},
+				"informational": {
+					Provider: "ollama",
+					Model:    "qwen2.5-coder:7b",
+				},
 			},
 		},
 		Execution: ExecutionConfig{
