@@ -149,6 +149,54 @@ func TestProviderRouter(t *testing.T) {
 	}
 }
 
+func TestDirectChatStrategy(t *testing.T) {
+	gen := &fakeGenerator{responses: []string{"I remember you."}, tokens: 7}
+	s := NewDirectChatStrategy(gen)
+
+	res, err := s.Execute(context.Background(), registry.Task{Input: "do you remember me"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != registry.StatusOK {
+		t.Errorf("status = %s, want ok", res.Status)
+	}
+	if res.Text != "I remember you." {
+		t.Errorf("text = %q, want the model response", res.Text)
+	}
+	if res.Tokens != 7 {
+		t.Errorf("tokens = %d, want 7", res.Tokens)
+	}
+	if len(res.Outputs) != 0 || len(res.Patches) != 0 {
+		t.Errorf("chat strategy must never stage code outputs, got %v/%v", res.Outputs, res.Patches)
+	}
+}
+
+func TestDirectChatStrategyNoGenerator(t *testing.T) {
+	s := NewDirectChatStrategy(nil)
+	_, err := s.Execute(context.Background(), registry.Task{Input: "hi"})
+	if !errors.Is(err, ErrNoGenerator) {
+		t.Errorf("err = %v, want ErrNoGenerator", err)
+	}
+}
+
+func TestDirectChatStrategyRoutedThroughProvider(t *testing.T) {
+	caps := registry.NewCapabilityRegistry()
+	if err := caps.Register(registry.CapabilityChat, "a"); err != nil {
+		t.Fatal(err)
+	}
+	gen := &fakeGenerator{responses: []string{"Hello!"}, tokens: 1}
+	router := NewProviderRouter(caps, registry.CapabilityChat, map[string]Generator{"a": gen})
+	s := NewDirectChatStrategy(router)
+
+	res, err := s.Execute(context.Background(), registry.Task{Input: "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != registry.StatusOK || res.Text != "Hello!" {
+		t.Errorf("result = %+v, want ok with text", res)
+	}
+}
+
 func TestSelector(t *testing.T) {
 	small := &analyzer.Facts{TokenEstimate: 100, MaxFanout: 1}
 	if got := Selector(small); got != StrategyDirect {
@@ -161,6 +209,15 @@ func TestSelector(t *testing.T) {
 	bigFanout := &analyzer.Facts{TokenEstimate: 100, MaxFanout: 10}
 	if got := Selector(bigFanout); got != StrategyIterative {
 		t.Errorf("big fanout = %s, want iterative", got)
+	}
+	chat := &analyzer.Facts{Intent: analyzer.IntentChat}
+	if got := Selector(chat); got != StrategyChat {
+		t.Errorf("chat intent = %s, want direct_chat", got)
+	}
+	// Chat wins regardless of workspace size.
+	chatHuge := &analyzer.Facts{Intent: analyzer.IntentChat, TokenEstimate: 100_000, MaxFanout: 99}
+	if got := Selector(chatHuge); got != StrategyChat {
+		t.Errorf("chat intent with huge scope = %s, want direct_chat", got)
 	}
 }
 

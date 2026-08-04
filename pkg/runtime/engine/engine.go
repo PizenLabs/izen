@@ -360,8 +360,13 @@ func (e *Engine) Run(ctx context.Context, req Request) (*Result, error) {
 		return run, err
 	}
 
-	// Validate.
-	if validators := e.validations.Pipeline(); len(validators) > 0 {
+	// Validate. Conversational runs produce no workspace changes, so the
+	// code-based validation pipeline (gofmt, golangci-lint, go test) is
+	// skipped entirely and the run finishes directly with the model's text
+	// response.
+	if facts.Intent == analyzer.IntentChat {
+		r.emit("validate", metrics.StatusSkipped, 0, strategyName, 0, "conversational run skips code validation")
+	} else if validators := e.validations.Pipeline(); len(validators) > 0 {
 		targets := facts.TargetFiles
 		if len(targets) == 0 {
 			r.emit("validate", metrics.StatusSkipped, 0, strategyName, 0, "no target files to validate")

@@ -16,12 +16,26 @@ import (
 	"github.com/PizenLabs/izen/pkg/runtime/strategy"
 )
 
-// defaultPolicyYAML is the default declarative policy. It routes LOW scope
-// tasks (token estimate under 25k AND dependency fanout under 4) to
-// DirectGenerationStrategy and everything else to IterativeStrategy. The
+// defaultPolicyYAML is the default declarative policy. It routes conversational
+// prompts (intent chat) exclusively to the DirectChatStrategy — the other
+// coding strategies are denied and the validation pipeline is skipped. LOW
+// scope tasks (token estimate under 25k AND dependency fanout under 4) route
+// to DirectGenerationStrategy and everything else to IterativeStrategy. The
 // thresholds mirror strategy.Selector and DefaultDirect* constants.
 const defaultPolicyYAML = `
 rules:
+  - id: chat.fast_path
+    description: conversational prompts use the single-pass chat strategy only
+    when:
+      intents: [chat]
+    allow:
+      - strategy:direct_chat
+      - capability:chat
+    deny:
+      - strategy:direct_generation
+      - strategy:iterative
+    reason: conversational prompts bypass code editing strategies and the validation pipeline
+
   - id: scope.direct_generation
     description: small scope permits single-pass direct generation
     when:
@@ -96,18 +110,21 @@ func DefaultPolicyRules() []policy.Rule {
 	return rules
 }
 
-// RegisterBuiltinStrategies installs the direct and iterative strategies,
-// binding them to the capability-registry-routed generator.
+// RegisterBuiltinStrategies installs the direct, iterative and chat
+// strategies, binding them to the capability-registry-routed generator.
 func RegisterBuiltinStrategies(reg *registry.StrategyRegistry, caps *registry.CapabilityRegistry, gen strategy.Generator, tools strategy.ToolRunner, providers []string) {
 	if reg == nil || gen == nil {
 		return
 	}
 	router := strategy.NewProviderRouter(caps, registry.CapabilityCoding, nil)
+	chatRouter := strategy.NewProviderRouter(caps, registry.CapabilityChat, nil)
 	for _, name := range providers {
 		router.Bind(name, gen)
+		chatRouter.Bind(name, gen)
 	}
 	_ = reg.Register(strategy.StrategyDirect, strategy.NewDirectGenerationStrategy(router), registry.CapabilityCoding)
 	_ = reg.Register(strategy.StrategyIterative, strategy.NewIterativeStrategy(router, tools), registry.CapabilityCoding, registry.CapabilityToolUse)
+	_ = reg.Register(strategy.StrategyChat, strategy.NewDirectChatStrategy(chatRouter), registry.CapabilityChat)
 }
 
 // NewEngine assembles a fully-wired v1 runtime engine from cfg. It registers
@@ -122,6 +139,9 @@ func NewEngine(cfg Config) (*engine.Engine, error) {
 		}
 		if err := caps.Register(registry.CapabilityToolUse, name); err != nil {
 			return nil, fmt.Errorf("wire: bind tool_use capability: %w", err)
+		}
+		if err := caps.Register(registry.CapabilityChat, name); err != nil {
+			return nil, fmt.Errorf("wire: bind chat capability: %w", err)
 		}
 	}
 

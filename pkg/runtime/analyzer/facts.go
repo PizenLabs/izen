@@ -12,7 +12,8 @@ import "time"
 type Intent string
 
 const (
-	// IntentUnknown is the fallback when no intent markers are matched.
+	// IntentUnknown is the fallback when no intent markers are matched and
+	// the input still references code.
 	IntentUnknown Intent = "unknown"
 	// IntentBugFix matches requests describing defects.
 	IntentBugFix Intent = "bug_fix"
@@ -22,6 +23,10 @@ const (
 	IntentFeature Intent = "feature"
 	// IntentQuestion matches requests asking for an explanation.
 	IntentQuestion Intent = "question"
+	// IntentChat matches conversational, non-coding prompts: greetings,
+	// small talk, identity and memory questions. It never touches files, AST
+	// symbols or explicit code operations.
+	IntentChat Intent = "chat"
 )
 
 // knownIntents is the canonical intent set used to validate intent names.
@@ -31,6 +36,7 @@ var knownIntents = map[Intent]struct{}{
 	IntentRefactor: {},
 	IntentFeature:  {},
 	IntentQuestion: {},
+	IntentChat:     {},
 }
 
 // IsKnown reports whether the intent is one of the canonical values.
@@ -54,6 +60,7 @@ type Facts struct {
 	Root             string
 	Input            string
 	Intent           Intent
+	IntentConfidence float64
 	IntentReason     string
 	TargetFiles      []string
 	Files            int

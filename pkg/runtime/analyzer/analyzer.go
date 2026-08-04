@@ -95,10 +95,13 @@ type Request struct {
 
 // Analyze extracts workspace facts for the request. When no targets are given
 // the whole workspace is scanned; otherwise only the target files are
-// analyzed. The returned Facts are immutable and deterministically ordered.
+// analyzed. Conversational prompts (IntentChat) with no explicit targets skip
+// the scan entirely: they never touch files, AST symbols or code operations,
+// so there are no workspace facts to gather. The returned Facts are immutable
+// and deterministically ordered.
 func (a *Analyzer) Analyze(ctx context.Context, req Request) (*Facts, error) {
 	start := time.Now()
-	intent, reason := ParseIntent(req.Input)
+	intent, confidence, reason := ParseIntentConfidence(req.Input)
 	targets, err := normalizeTargets(a.root, req.Targets)
 	if err != nil {
 		return nil, err
@@ -107,10 +110,15 @@ func (a *Analyzer) Analyze(ctx context.Context, req Request) (*Facts, error) {
 		Root:             a.root,
 		Input:            req.Input,
 		Intent:           intent,
+		IntentConfidence: confidence,
 		IntentReason:     reason,
 		TargetFiles:      targets,
 		DependencyFanout: map[string][]string{},
 		GeneratedAt:      start,
+	}
+	if intent == IntentChat && len(targets) == 0 {
+		facts.Duration = time.Since(start)
+		return facts, nil
 	}
 	if err := a.scan(ctx, facts); err != nil {
 		return nil, err

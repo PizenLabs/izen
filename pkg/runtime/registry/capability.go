@@ -13,6 +13,9 @@ const (
 	CapabilityToolUse Capability = "tool_use"
 	// CapabilityCoding allows strategies to generate or modify code.
 	CapabilityCoding Capability = "coding"
+	// CapabilityChat allows strategies to produce conversational responses
+	// without touching the workspace.
+	CapabilityChat Capability = "chat"
 	// CapabilityContextLarge allows strategies to request a large context
 	// budget.
 	CapabilityContextLarge Capability = "context_size:large"
@@ -28,6 +31,7 @@ const (
 var knownCapabilities = map[Capability]struct{}{
 	CapabilityToolUse:      {},
 	CapabilityCoding:       {},
+	CapabilityChat:         {},
 	CapabilityContextLarge: {},
 	CapabilityContextSmall: {},
 	CapabilityTest:         {},

@@ -34,7 +34,13 @@ func TestParseIntent(t *testing.T) {
 		{"feature", "add a new export endpoint", IntentFeature, "add"},
 		{"refactor", "refactor the parser to reduce complexity", IntentRefactor, "refactor"},
 		{"tie bugfix wins", "how do I fix the panic?", IntentBugFix, "matched"},
-		{"unknown", "do the thing", IntentUnknown, "no intent"},
+		{"greeting", "hi", IntentChat, "hi"},
+		{"identity", "who are you", IntentChat, "who are you"},
+		{"memory", "do you remember me", IntentChat, "do you remember me"},
+		{"small talk", "what's up", IntentChat, "whats up"},
+		{"courtesy", "thank you so much", IntentChat, "thank you"},
+		{"non coding", "do the thing", IntentChat, "no code"},
+		{"greeting plus bugfix", "hello, please fix the login bug", IntentBugFix, "matched"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -49,6 +55,46 @@ func TestParseIntent(t *testing.T) {
 				t.Errorf("ParseIntent(%q) reason %q missing %q", tt.input, reason, tt.wantSub)
 			}
 		})
+	}
+}
+
+func TestParseIntentConfidence(t *testing.T) {
+	chatInputs := []string{
+		"hi",
+		"who are you",
+		"do you remember me",
+		"what's up",
+		"are you alive",
+	}
+	for _, input := range chatInputs {
+		t.Run(input, func(t *testing.T) {
+			intent, conf, reason := ParseIntentConfidence(input)
+			if intent != IntentChat {
+				t.Errorf("ParseIntentConfidence(%q) intent = %s, want chat", input, intent)
+			}
+			if conf <= 0.95 {
+				t.Errorf("ParseIntentConfidence(%q) confidence = %f, want > 0.95", input, conf)
+			}
+			if reason == "" {
+				t.Error("ParseIntentConfidence returned empty reason")
+			}
+		})
+	}
+
+	codeInputs := []struct {
+		input string
+		want  Intent
+	}{
+		{"fix the login bug", IntentBugFix},
+		{"how does the router work?", IntentQuestion},
+		{"refactor the parser", IntentRefactor},
+		{"add a new endpoint", IntentFeature},
+	}
+	for _, tt := range codeInputs {
+		intent, _, _ := ParseIntentConfidence(tt.input)
+		if intent != tt.want {
+			t.Errorf("ParseIntentConfidence(%q) = %s, want %s", tt.input, intent, tt.want)
+		}
 	}
 }
 
@@ -175,5 +221,33 @@ func TestAnalyzeDeterministic(t *testing.T) {
 	}
 	if f1.Files != f2.Files || f1.TokenEstimate != f2.TokenEstimate || f1.MaxFanout != f2.MaxFanout {
 		t.Error("analysis is not deterministic across runs")
+	}
+}
+
+func TestAnalyzeChatSkipsWorkspaceScan(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 50; i++ {
+		writeFixture(t, root, "f"+string(rune('a'+i))+".go", "package p\n")
+	}
+
+	a := New(root)
+	facts, err := a.Analyze(context.Background(), Request{Input: "do you remember me"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if facts.Intent != IntentChat {
+		t.Errorf("Intent = %s, want chat", facts.Intent)
+	}
+	if facts.IntentConfidence <= 0.95 {
+		t.Errorf("IntentConfidence = %f, want > 0.95", facts.IntentConfidence)
+	}
+	if facts.Files != 0 {
+		t.Errorf("Files = %d, want 0 (chat scan skipped)", facts.Files)
+	}
+	if facts.TokenEstimate != 0 || facts.MaxFanout != 0 {
+		t.Errorf("chat facts should carry no token/fanout signal, got %d/%d", facts.TokenEstimate, facts.MaxFanout)
+	}
+	if len(facts.TargetFiles) != 0 || len(facts.ModifiedScopes) != 0 {
+		t.Errorf("chat facts should carry no targets or scopes, got %v/%v", facts.TargetFiles, facts.ModifiedScopes)
 	}
 }

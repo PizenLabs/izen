@@ -7,9 +7,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/PizenLabs/izen/pkg/runtime/analyzer"
 	"github.com/PizenLabs/izen/pkg/runtime/engine"
 	"github.com/PizenLabs/izen/pkg/runtime/metrics"
+	"github.com/PizenLabs/izen/pkg/runtime/registry"
 	"github.com/PizenLabs/izen/pkg/runtime/strategy"
 	"github.com/PizenLabs/izen/pkg/runtime/wire"
 )
@@ -155,6 +158,124 @@ func TestEndToEndDirectGeneration(t *testing.T) {
 	joined := strings.Join(res.Decision.Summary(), "\n")
 	if !strings.Contains(joined, "scope.direct_generation") {
 		t.Errorf("decision summary missing direct rule: %q", joined)
+	}
+}
+
+func TestEndToEndChatFastPath(t *testing.T) {
+	sink := &recordingSink{}
+	gen := &replayGenerator{directText: "Of course — you're the one who asked me that before.", tokens: 9}
+	eng, mainGo := newWiredEngine(t, "package main\n", gen, nil, sink)
+
+	before, err := os.ReadFile(mainGo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	res, err := eng.Run(context.Background(), engine.Request{
+		ID:    "e2e-chat",
+		Input: "do you remember me",
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed >= time.Second {
+		t.Errorf("chat fast-path took %s, want < 1s", elapsed)
+	}
+
+	if res.State != engine.StateDone {
+		t.Fatalf("state = %s, want done (err=%v)", res.State, res.Err)
+	}
+	if res.Facts == nil || res.Facts.Intent != analyzer.IntentChat {
+		t.Errorf("facts intent = %v, want chat", res.Facts.Intent)
+	}
+	if res.Facts.IntentConfidence <= 0.95 {
+		t.Errorf("facts confidence = %f, want > 0.95", res.Facts.IntentConfidence)
+	}
+	if len(res.Facts.TargetFiles) != 0 || res.Facts.Files != 0 {
+		t.Errorf("chat facts must carry zero workspace signal, got targets=%v files=%d", res.Facts.TargetFiles, res.Facts.Files)
+	}
+
+	// The plan must route strictly through the chat strategy and stage ZERO
+	// code tasks or test commands.
+	if res.Plan == nil || res.Plan.Strategy != strategy.StrategyChat {
+		t.Errorf("plan strategy = %v, want direct_chat", res.Plan.Strategy)
+	}
+	if res.Plan.RequireTest || res.Plan.RollbackEnabled {
+		t.Errorf("chat plan must not require tests or rollback, got %+v", res.Plan)
+	}
+	if len(res.Plan.Steps) != 0 || len(res.Plan.ExpectedOutputs) != 0 {
+		t.Errorf("chat plan must stage zero steps and outputs, got %v / %v", res.Plan.Steps, res.Plan.ExpectedOutputs)
+	}
+	if strings.Contains(res.Plan.Reason, "go mod tidy") || strings.Contains(res.Plan.Reason, "go test") {
+		t.Errorf("chat plan must not reference go mod tidy or go test: %q", res.Plan.Reason)
+	}
+
+	// The policy audit trail must grant only direct_chat and deny the coding
+	// strategies.
+	if res.Decision == nil || !res.Decision.StrategyGranted(strategy.StrategyChat) {
+		t.Error("policy should grant direct_chat")
+	}
+	if res.Decision.StrategyGranted(strategy.StrategyDirect) || res.Decision.StrategyGranted(strategy.StrategyIterative) {
+		t.Error("policy must deny the coding strategies for chat")
+	}
+	if got := sink.strategy(); got != strategy.StrategyChat {
+		t.Errorf("executed strategy = %q, want direct_chat", got)
+	}
+
+	// The run finishes with the model's textual answer and zero file writes.
+	if res.Execution == nil || res.Execution.Status != registry.StatusOK {
+		t.Fatal("execution result should be ok")
+	}
+	if res.Execution.Text != gen.directText {
+		t.Errorf("execution text = %q, want the model answer", res.Execution.Text)
+	}
+	if len(res.Execution.Outputs) != 0 || len(res.Execution.Patches) != 0 {
+		t.Errorf("chat execution must stage no file writes, got %v/%v", res.Execution.Outputs, res.Execution.Patches)
+	}
+
+	// Validation must be skipped (gofmt/golangci-lint/go test bypassed).
+	if !sink.hasPhase("validate", "skipped") {
+		t.Error("chat run must emit validate:skipped")
+	}
+	if res.Validation != nil {
+		t.Error("chat run must not produce a validation result")
+	}
+
+	// The workspace file must be untouched.
+	after, err := os.ReadFile(mainGo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Error("chat run mutated the workspace")
+	}
+}
+
+func TestEndToEndChatFastPathRejectsCodingStrategies(t *testing.T) {
+	sink := &recordingSink{}
+	gen := &replayGenerator{directText: "yes", tokens: 1}
+	eng, _ := newWiredEngine(t, "package main\n", gen, nil, sink)
+
+	// A conversational prompt must never route to the coding strategies even
+	// when a target file is listed explicitly.
+	res, err := eng.Run(context.Background(), engine.Request{
+		ID:      "e2e-chat-target",
+		Input:   "hi there",
+		Targets: []string{"main.go"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Plan == nil || res.Plan.Strategy != strategy.StrategyChat {
+		t.Errorf("plan strategy = %v, want direct_chat even with a target", res.Plan.Strategy)
+	}
+	if got := sink.strategy(); got != strategy.StrategyChat {
+		t.Errorf("executed strategy = %q, want direct_chat", got)
+	}
+	if res.Execution == nil || res.Execution.Text != "yes" {
+		t.Errorf("execution = %+v, want the chat text answer", res.Execution)
 	}
 }
 

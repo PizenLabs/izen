@@ -5,7 +5,7 @@ lea
 .pi/
 **/__pycache__/
 *.pyc
-izen
+/izen
 .izen
 diagnostic
 

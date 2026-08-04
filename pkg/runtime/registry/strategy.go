@@ -43,7 +43,11 @@ type Result struct {
 	Outputs []string
 	Patches []string
 	Tokens  int
-	Err     error
+	// Text is the primary textual output of the run. It is set by
+	// conversation strategies (e.g. DirectChatStrategy) whose output is a
+	// model response rather than written files.
+	Text string
+	Err  error
 }
 
 // Strategy is the plugin interface every execution strategy implements.
