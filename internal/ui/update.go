@@ -245,6 +245,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.streamParser.SetWidth(msg.Width - 2)
 		}
 
+		m.syncShimmerWidth()
+
 		m.refreshViewportContent()
 		return m, nil
 
@@ -352,7 +354,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.agentLabel = msg.label
 		m.spinnerFrame = 0
 		m.lastAgentActivity = time.Now()
-		return m, nil
+		// Surface the loading shimmer + contextual tip for the agent's
+		// execution phase (hotfix, build, review, investigate, ...).
+		m.startShimmer(agentShimmerText(msg.label), shimmerPhaseForAgentLabel(msg.label))
+		// Ensure the shimmer tick loop is alive for agent operations whose
+		// dispatch batch did not include it (e.g. $log trace analysis).
+		return m, m.shimmerTickCmd()
 
 	case hotfixProgressMsg:
 		// Stream a $hot lifecycle log line to the terminal so the developer
@@ -374,6 +381,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
+		m.stopShimmer()
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
@@ -387,6 +395,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
+		m.stopShimmer()
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+providers.SanitizeAPIError(msg.err))
 			// PERSISTENT NAVIGATION CHIPS (BUG 1): even on failure the user
@@ -668,6 +677,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
+		m.stopShimmer()
 		if msg.err != nil {
 			m.push(roleError, "review error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
@@ -860,6 +870,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.pipelineRunning = false
 		m.streaming = false
 		m.sanitizeInputPrompt()
+		m.stopShimmer()
 
 		// ── BUILD PROPOSAL FAILURE ───────────────────────────────────
 		if msg.Err != nil {
@@ -993,6 +1004,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
+		m.stopShimmer()
 
 		// ── HOTFIX PROPOSAL FAILURE ───────────────────────────────────
 		// Patch generation failed: surface the error, abort the hotfix, and
@@ -1760,6 +1772,31 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streamTickActive = false
 		return m, nil
 
+	case shimmerFrameMsg:
+		// ── SHIMMER ANIMATION TICK (~50ms) ──────────────────────────
+		// Forwards the frame to the shimmer component, which re-schedules the
+		// next tick while Active. When shimmerActive has been cleared (first
+		// stream token, task completion, or a reconcile pass) the loop drops
+		// out here without re-scheduling — the graceful stop that replaces the
+		// animated loading line with the streaming output.
+		if !m.shimmerActive {
+			return m, nil
+		}
+		// SAFETY NET: if every background producer has released its flags but
+		// stopShimmer was never invoked by the terminal handler, the next
+		// frame self-stops. This guarantees the shimmer can never linger on a
+		// dead loading line regardless of which handler resolved the task.
+		if !m.streaming && !m.agentRunning && !m.reviewRunning && !m.pipelineRunning && !m.planPending {
+			m.stopShimmer()
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.shimmerAnim, cmd = m.shimmerAnim.Update(msg)
+		if m.Ready {
+			m.refreshViewportContent()
+		}
+		return m, cmd
+
 	case planSlowNoticeMsg:
 		// One-shot soft-timeout probe for /plan synthesis. Only act if THIS
 		// synthesis is still pending (guard against a stale probe from a prior
@@ -1793,6 +1830,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// the throttle buffer instead of draining streamBuffer directly. This
 		// eliminates layout snapping caused by dumping raw buffer chunks.
 		raw := string(msg)
+		// SMOOTH CLEARING: the first content token replaces the shimmer
+		// loading line with the streaming output. The shimmer tick loop stops
+		// itself on the next frame, so no animation frame ever bleeds into
+		// the rendered answer.
+		if raw != "" && m.shimmerActive {
+			m.stopShimmer()
+		}
 		m.responseBuffer.WriteString(raw)
 		if m.streamThrottle != nil {
 			m.streamThrottle.Write(raw)
@@ -1818,6 +1862,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streamCh = nil
 		m.streaming = false
 		m.streamCancel = nil
+		m.stopShimmer()
 
 		if m.streamParser != nil {
 			m.streamParser.Flush()
@@ -2297,6 +2342,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streamParser = nil
 		m.streamCancel = nil
 		m.planPending = false
+		m.stopShimmer()
 
 		// User-initiated interrupt — suppress error noise, just clean up.
 		if m.interruptRequested {
@@ -2376,6 +2422,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
+		m.stopShimmer()
 		m.push(roleError, "fast-track build failed: "+providers.SanitizeAPIError(msg.Err))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -2402,6 +2449,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streamTickActive = false
 		m.interruptRequested = false
 		m.spinnerFrame = 0
+		m.stopShimmer()
 		m.ti.Focus()
 		m.sanitizeInputPrompt()
 		m.refreshViewportContent()

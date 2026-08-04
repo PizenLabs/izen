@@ -46,6 +46,8 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/pkg/engine/pipeline"
+	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
+	"github.com/PizenLabs/izen/pkg/tui/tips"
 )
 
 // ── Init stage types ──────────────────────────────────────────────────────────
@@ -1025,6 +1027,19 @@ type model struct {
 	// Live code preview for streaming tool call arguments
 	liveCodePreview *LiveCodePreview
 
+	// ── Shimmer loading animation ────────────────────────────────────
+	// The loading shimmer + contextual tip drive a status line in the
+	// proposal dock during active execution states (streaming before the
+	// first token, /plan synthesis, /build, /investigate, /review). The
+	// shimmer component owns a ~50ms tick loop that self-terminates once
+	// shimmerActive clears — the smooth-clearing seam on first token or
+	// task completion.
+	shimmerAnim   shimmer.Model
+	shimmerActive bool
+	shimmerText   string
+	loadingTip    string
+	tipProvider   *tips.Provider
+
 	// Event bus — the headless engines publish domain events here and the UI
 	// subscribes as a pure projection. Never nil after bootstrap.
 	bus *events.Bus
@@ -1889,6 +1904,7 @@ func (m *model) resetStreamingState() {
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
+	m.stopShimmer()
 }
 
 // reconcileSpinner is the single deterministic reset point that ties the
@@ -1921,6 +1937,7 @@ func (m *model) reconcileSpinner() {
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
+	m.stopShimmer()
 }
 
 // emitVisibleContent routes one emitted content window into the response

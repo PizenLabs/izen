@@ -49,6 +49,8 @@ import (
 	"github.com/PizenLabs/izen/pkg/engine/layer3"
 	"github.com/PizenLabs/izen/pkg/engine/pipeline"
 	"github.com/PizenLabs/izen/pkg/engine/telemetry"
+	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
+	"github.com/PizenLabs/izen/pkg/tui/tips"
 )
 
 // NewProgram initializes the active model state context and instantiates the runner engine.
@@ -370,6 +372,8 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 		toolCallBuffer:      execution.NewToolCallBuffer(root),
 		thinkingPanel:       NewThinkingPanel(),
 		liveCodePreview:     NewLiveCodePreview(),
+		shimmerAnim:         shimmer.New(""),
+		tipProvider:         tips.Default(),
 		currentEffort:       EffortAuto,
 	}
 	if initStage == initIdentity {

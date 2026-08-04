@@ -153,7 +153,7 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 
 	// ── Proposal dock (conditional) — floats above Input ──
 	var proposalDockView string
-	if m.state == StateAwaitingApproval || m.state == StateProcessing {
+	if m.shimmerActive || m.state == StateAwaitingApproval || m.state == StateProcessing {
 		proposalDockView = m.renderProposalBlock()
 	}
 	proposalLines := strings.Count(proposalDockView, "\n")
@@ -223,6 +223,13 @@ func (m *model) renderProposalBlock() string {
 	}
 
 	var b strings.Builder
+
+	// ── Shimmer loading line + contextual tip ───────────────────────
+	// Rendered above any approval/processing dock while a background producer
+	// is active and streaming output has not replaced it yet.
+	if m.shimmerActive {
+		b.WriteString(m.renderLoadingDock())
+	}
 
 	switch m.state {
 	case StateAwaitingApproval:

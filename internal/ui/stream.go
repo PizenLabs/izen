@@ -89,6 +89,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streamCh = make(chan tea.Msg, 1024)
 	m.streaming = true
 	m.spinnerFrame = 0
+	m.startShimmer("Thinking...", "analyze")
 	m.responseBuffer.Reset()
 	m.reasoningBuffer.Reset()
 	m.pendingReasoningFragment = ""
@@ -298,7 +299,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		}
 	}()
 
-	return tea.Batch(m.streamTraceCmd(), m.readStream(), m.smoothStreamTickCmd())
+	return tea.Batch(m.streamTraceCmd(), m.readStream(), m.smoothStreamTickCmd(), m.shimmerTickCmd())
 }
 
 // streamTraceCmd emits the most recent /ask planner trace (thought-route panel)

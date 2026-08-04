@@ -656,6 +656,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.agentLabel = "synthesizing plan"
 			m.planPending = true
 			m.planStartedAt = time.Now()
+			m.startShimmer("Synthesizing plan...", "plan")
 			m.push(roleSystem, infoStyle.Render("Synthesizing structured execution plan from investigation data..."))
 			// FAST-TRACK NOTICE: when there are zero pre-parsed TODOs the
 			// synthesis runs purely on the forensic ledger. Surface an implicit
@@ -679,6 +680,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 				m.flushPendingRecords(),
 				m.smoothStreamTickCmd(),
 				m.planSlowNoticeCmd(),
+				m.shimmerTickCmd(),
 				m.runPlanEngineCmd(handoffSource, problem, m.routeModel("plan"), m.handoffCtx),
 			)
 		}
@@ -2319,10 +2321,11 @@ func (m *model) performFastTrackBuildCmd() tea.Cmd {
 	m.agentLabel = "building"
 	m.agentDone = false
 	m.pipelineRunning = true
+	m.startShimmer("Executing strategy...", "execute")
 	m.push(roleStatus, "BUILDING...")
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
-	return tea.Batch(m.smoothStreamTickCmd(), m.runBuildFastTrack())
+	return tea.Batch(m.smoothStreamTickCmd(), m.shimmerTickCmd(), m.runBuildFastTrack())
 }
 
 // runBuildFastTrack executes all staged FILE_MUTATE tasks in a single
@@ -2868,11 +2871,13 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 	m.lastAgentActivity = time.Now()
+	m.startShimmer("Applying hotfix...", "execute")
 
 	return tea.Batch(
 		func() tea.Msg { return agentStartMsg{label: "hotfix"} },
 		m.proposeHotfixPatch(&hotfixTask),
 		m.smoothStreamTickCmd(),
+		m.shimmerTickCmd(),
 		m.hotfixProgressCmd(),
 	)
 }
@@ -5055,6 +5060,7 @@ func (m *model) runLogCmd(traceData string) tea.Cmd {
 	m.cancelStaleAgentOps()
 	m.pipelineRunning = true
 	m.pipelineStep = "analyzing trace"
+	m.startShimmer("Analyzing trace...", "analyze")
 
 	// Capture raw shell output from the execution runner
 	return tea.Batch(
@@ -5162,7 +5168,11 @@ func (m *model) handleLogInput(msg logInputMsg) tea.Cmd {
 	m.streaming = false
 	m.streamParser = nil
 	flush := m.flushPendingRecords()
-	return tea.Batch(flush, m.streamCmd(msg.output))
+	cmd := m.streamCmd(msg.output)
+	// Override the generic "Thinking..." label with the pipeline step so the
+	// shimmer status text matches what the silent investigation is doing.
+	m.startShimmer("Analyzing failure...", "analyze")
+	return tea.Batch(flush, cmd)
 }
 
 // handleInvestigateComplete receives the silent analysis and pipes it into plan.
@@ -5185,7 +5195,9 @@ func (m *model) handleInvestigateComplete(msg investigateCompleteMsg) tea.Cmd {
 	m.streamParser = nil
 	m.handoffCtx.ProposedFix = msg.analysis
 	flush := m.flushPendingRecords()
-	return tea.Batch(flush, m.streamCmd(msg.analysis))
+	cmd := m.streamCmd(msg.analysis)
+	m.startShimmer("Blueprinting...", "plan")
+	return tea.Batch(flush, cmd)
 }
 
 // handleBlueprintReady receives the plan output and jumps to /build execution.
@@ -5269,6 +5281,8 @@ func (m *model) cancelStaleAgentOps() {
 	if m.pipelineRunning {
 		return
 	}
+
+	m.stopShimmer()
 
 	// Re-hydrate ledger from stash for new root allocations
 	if m.ledgerStash != nil {
