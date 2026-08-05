@@ -419,7 +419,12 @@ func (r *KnowledgeResolver) readmeCandidate() string {
 }
 
 // findInDir returns existing file names in dir matching names (case-insensitive),
-// using the canonical spelling of the first match.
+// using the ACTUAL on-disk spelling of each match. The canonical candidate
+// spelling is used only as the lower-cased match key; the returned name is the
+// real entry name so the caller can build a path that os.Stat resolves on
+// case-sensitive filesystems. Returning the canonical spelling here would
+// misreport e.g. "ARCHITECTURE.md" as "architecture.md" and silently drop the
+// doc when readDoc stats the (nonexistent) canonical path on Linux CI.
 func findInDir(dir string, names []string) []string {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -437,8 +442,8 @@ func findInDir(dir string, names []string) []string {
 		if e.IsDir() {
 			continue
 		}
-		if canon, ok := want[strings.ToLower(e.Name())]; ok {
-			found = append(found, canon)
+		if _, ok := want[strings.ToLower(e.Name())]; ok {
+			found = append(found, e.Name())
 		}
 	}
 	sort.Strings(found)
