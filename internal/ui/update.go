@@ -44,12 +44,18 @@ func (m *model) Init() tea.Cmd {
 	if m.initStage != initNone && m.initStage != initComplete {
 		return tea.Batch(m.smoothStreamTickCmd(), m.proTipTickCmd())
 	}
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		m.smoothStreamTickCmd(),
 		m.proTipTickCmd(),
 		m.ti.Focus(),
 		m.initSessionStartCheckpoint,
-	)
+	}
+	// Arm the fact-only control telemetry bridge so control.iteration /
+	// control.node_observed facts stream into the loop as controlFactMsg.
+	if cmd := m.listenControlEventsCmd(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	return tea.Batch(cmds...)
 }
 
 // Update routes state machines and events.
@@ -177,7 +183,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// type switch below. Without this, gitInitResultMsg gets swallowed
 		// and the init stage never advances after pressing 'Y'.
 		switch msg.(type) {
-		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg, graphIndexingMsg, domainEventMsg:
+		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg, graphIndexingMsg, domainEventMsg, controlFactMsg:
 			// fall through to main type switch
 		default:
 			return m, nil
@@ -191,6 +197,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// the UI renders them as activity lines. Runs on the UI goroutine, so
 		// all model mutation here is safe.
 		m.handleDomainEvent(msg.ev)
+		return m, nil
+
+	case controlFactMsg:
+		// Fact-only control telemetry projection (control.iteration /
+		// control.node_observed). Pure view-model fold on the UI goroutine:
+		// the facts update the projected execution tree and nothing else.
+		m.handleControlFact(msg.ev)
 		return m, nil
 
 	case presentationEventMsg:
@@ -1083,6 +1096,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.responseBuffer.Reset()
 			m.currentStreamContent = ""
 			m.streamBuffer = ""
+			m.resetStreamBlocks()
 			m.historyIndex = -1
 		}
 
@@ -1889,6 +1903,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		return m, m.streamCmd(msg.content)
 
+	case thinkingTokenMsg:
+		// Thinking/reasoning token emitted by the stream classifier. It is
+		// appended to the typed stream buffer as a KindThinking block so the
+		// renderer can apply the dimmed/faint style — it never enters the
+		// content pipeline. The loading shimmer keeps running (still
+		// thinking); the first CONTENT token (tokenMsg) stops it.
+		if msg == "" {
+			return m, m.readStream()
+		}
+		m.ensureStreamBlocks().Append(KindThinking, string(msg))
+		m.refreshViewportContent()
+		if m.Ready && !m.userIsScrollingUp {
+			m.Viewport.GotoBottom()
+		}
+		return m, m.readStream()
+
 	case tokenMsg:
 		// LOCK-FREE CONSUMER: this per-token handler MUST NOT acquire any
 		// ContextLedger / TaskLedger mutex. It only appends to local buffers
@@ -1987,6 +2017,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.responseBuffer.Reset()
 		m.currentStreamContent = ""
+		// The stream is over — clear the typed block buffer so the next turn
+		// starts with a clean, empty renderer (the final answer above was
+		// derived from currentStreamContent, which is content-only).
+		m.resetStreamBlocks()
 
 		// Sanitize: strip tool execution artifacts so they don't pollute
 		// the downstream JSON parser or render pipeline. Lines matching
@@ -2430,6 +2464,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.responseBuffer.Reset()
 			m.currentStreamContent = ""
 			m.streamBuffer = ""
+			m.resetStreamBlocks()
 			m.streamTickActive = false
 			m.streamCancel = nil
 			m.refreshViewportContent()
@@ -2461,6 +2496,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 			m.streamBuffer = msg.content
 			m.currentStreamContent = msg.content
+			m.ensureStreamBlocks().Append(KindContent, msg.content)
 			m.extractReasoningContent()
 		}
 		m.refreshViewportContent()
@@ -2532,6 +2568,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.streamBuffer = ""
 		m.currentStreamContent = ""
+		m.resetStreamBlocks()
 		m.streamTickActive = false
 		m.interruptRequested = false
 		m.spinnerFrame = 0

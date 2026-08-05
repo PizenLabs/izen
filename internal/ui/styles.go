@@ -387,6 +387,32 @@ var (
 	DistinctionErrorClass = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMaroon)).Bold(true)
 )
 
+// ── Differential Stream Styling (Thinking vs Content) ───────────────────────
+// The streaming content renderer applies these styles per typed block: reasoning
+// (KindThinking) is dimmed/faint/italic and subordinate; content (KindContent)
+// is bright/crisp as it arrives. They are never applied to the same text.
+var (
+	// streamThinkingStyle is applied EXCLUSIVELY to KindThinking blocks in the
+	// streaming content renderer. Faint + Italic keeps reasoning visually
+	// subordinate to the answer; the muted gray foreground guarantees the dim
+	// look even on terminals that ignore the Faint SGR attribute (where faint
+	// alone would render at full brightness).
+	streamThinkingStyle = lipgloss.NewStyle().
+				Faint(true).
+				Italic(true).
+				Foreground(lipgloss.Color(colorMuted))
+
+	// streamThinkingGutter anchors inline thinking lines with a low-contrast
+	// gutter so they stay visually aligned with the bright content blocks that
+	// follow.
+	streamThinkingGutter = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+
+	// brightStyle is applied to KindContent blocks as they arrive, making the
+	// actual answer/actions read crisp and clear against the dimmed reasoning.
+	// It mirrors the standard bright text style (colorText).
+	brightStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+)
+
 // Pre-compiled Markdown renderer styles (render-path — zero NewStyle).
 var (
 	mdEmphasisStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7")).Italic(true)

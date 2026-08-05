@@ -432,6 +432,14 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
+	// ── FACT-ONLY CONTROL BRIDGE ─────────────────────────────────────
+	// The adaptive control loop's telemetry bus publishes fact-only facts
+	// (control.iteration + control.node_observed). The UI subscribes via
+	// ListenControlEvents (armed in Init, once the program runs) and projects
+	// the raw Dynamic IR facts as a live execution tree — never reconstructing
+	// or mutating engine state.
+	m.controlFactSend = p.Send
+
 	// ── BACKGROUND LEA INDEXING ─────────────────────────────────────────
 	// Boot the Phase 3 structural engine in the background so the TUI never
 	// blocks on the (potentially large) full index. It is gated on completed

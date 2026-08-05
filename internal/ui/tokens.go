@@ -204,6 +204,18 @@ func IconRead() string { return Icon.Read }
 // in the activity tree (animated while the command is running).
 func IconExec() string { return Icon.Exec }
 
+// IconCheck returns the quiet check glyph used for confirmed / success states
+// in the execution-tree projection.
+func IconCheck() string { return Icon.Check }
+
+// IconError returns the cross glyph used for failed states in the
+// execution-tree projection.
+func IconError() string { return Icon.Error }
+
+// IconPending returns the hollow-circle glyph used for not-yet-completed
+// states in the execution-tree projection.
+func IconPending() string { return Icon.Pending }
+
 // rule returns a full-width horizontal separator rendered in the given style.
 // Used for region boundaries that must reflow deterministically on resize.
 func rule(width int, style lipgloss.Style) string {

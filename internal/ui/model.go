@@ -45,7 +45,9 @@ import (
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
+	"github.com/PizenLabs/izen/pkg/engine/ir"
 	"github.com/PizenLabs/izen/pkg/engine/pipeline"
+	"github.com/PizenLabs/izen/pkg/engine/telemetry"
 	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
 	"github.com/PizenLabs/izen/pkg/tui/tips"
 )
@@ -91,6 +93,13 @@ type record struct {
 }
 
 type tokenMsg string
+
+// thinkingTokenMsg carries a thinking/reasoning token emitted by the stream
+// classifier (delta reasoning_content, <thought>…</thought> blocks, or
+// reasoning sentinels). It is deliberately separate from tokenMsg (content) so
+// the renderer can apply the dimmed/faint style exclusively to reasoning while
+// content streams in bright.
+type thinkingTokenMsg string
 
 type streamDoneMsg struct {
 	content     string
@@ -690,6 +699,10 @@ type model struct {
 	// rendering keeps its 20ms pacing. Zero value means "advance immediately".
 	lastSpinnerAdvance   time.Time
 	currentStreamContent string // accumulated raw text during active LLM stream
+	// streamBlocks stores the active stream as typed blocks (content vs
+	// thinking) so the renderer can apply differential styling — bright content
+	// immediately, dimmed/faint reasoning while it streams.
+	streamBlocks *StreamBuffer
 
 	// Expanded metrics for status bar
 	IsCloudModel    bool
@@ -1135,6 +1148,18 @@ type model struct {
 	// each mode command. Nil only in headless/test harnesses.
 	pipelineEngine *pipeline.Engine
 
+	// ── Fact-only control projection ────────────────────────────────
+	// controlSnapshot is the projected Dynamic IR snapshot reconstructed from
+	// the fact-only control telemetry stream (control.iteration +
+	// control.node_observed). The UI renders the execution tree from these
+	// facts and never writes them back: no business logic, retries, or engine
+	// state mutations run here.
+	controlRunID    string
+	controlSnapshot *ir.ExecutionSnapshot
+	// controlFactSend bridges fact-only control events into the Bubble Tea
+	// event loop. Set to p.Send at bootstrap; nil in headless/test harnesses.
+	controlFactSend func(tea.Msg)
+
 	// Current effort level for generation
 	currentEffort EffortLevel
 }
@@ -1568,6 +1593,99 @@ func (m *model) handlePresentationEvent(ev appruntime.PresentationEvent) {
 	}
 }
 
+// handleControlFact is the fact-only control telemetry projection. It is a
+// pure view-model fold: control.iteration and control.node_observed facts
+// update the reconstructed Dynamic IR snapshot that the execution tree renders
+// from. No business logic, retry, or engine state mutation happens here — the
+// facts are read-only and the projected snapshot is never written back. Only
+// ever runs on the UI goroutine, so all model mutation here is race-free.
+func (m *model) handleControlFact(ev telemetry.Event) {
+	if ev == nil {
+		return
+	}
+	switch ev.Type() {
+	case telemetry.EventControlIteration:
+		p, ok := ev.Payload().(*telemetry.ControlIterationPayload)
+		if !ok {
+			return
+		}
+		m.applyControlIteration(p)
+	case telemetry.EventControlNodeObserved:
+		p, ok := ev.Payload().(*telemetry.ControlNodeObservedPayload)
+		if !ok {
+			return
+		}
+		m.applyControlNodeObserved(p)
+	}
+	m.refreshViewportContent()
+	if m.Ready && !m.userIsScrollingUp {
+		m.Viewport.GotoBottom()
+	}
+}
+
+// applyControlIteration folds one control.iteration fact (per-node states +
+// attempt counts) into the projected Dynamic IR snapshot.
+func (m *model) applyControlIteration(p *telemetry.ControlIterationPayload) {
+	m.ensureControlSnapshot(p.RunID)
+	for id, state := range p.NodeStates {
+		m.controlSnapshot.NodeStates[id] = ir.NodeState(state)
+	}
+	for id, attempts := range p.Attempts {
+		m.controlSnapshot.AttemptCounts[id] = attempts
+	}
+}
+
+// applyControlNodeObserved folds one control.node_observed fact (a single node
+// outcome) into the projected Dynamic IR snapshot. The observation is the
+// definitive record of the executed attempt, so the projected glyph reflects it
+// immediately rather than waiting for the next iteration.
+func (m *model) applyControlNodeObserved(p *telemetry.ControlNodeObservedPayload) {
+	m.ensureControlSnapshot(p.RunID)
+	m.controlSnapshot.LastObservation[p.NodeID] = ir.ObservationPayload{
+		NodeID:     p.NodeID,
+		OK:         p.OK,
+		Err:        p.Err,
+		SkipReason: p.SkipReason,
+		Output:     p.Output,
+		Timestamp:  p.Timestamp,
+	}
+	switch {
+	case p.OK || p.SkipReason != "":
+		m.controlSnapshot.NodeStates[p.NodeID] = ir.StateSuccess
+	default:
+		m.controlSnapshot.NodeStates[p.NodeID] = ir.StateFailed
+	}
+}
+
+// ensureControlSnapshot lazily allocates the projected Dynamic IR snapshot and
+// pins its run id to the latest control fact.
+func (m *model) ensureControlSnapshot(runID string) {
+	if m.controlSnapshot == nil {
+		m.controlSnapshot = &ir.ExecutionSnapshot{
+			ID:              runID,
+			NodeStates:      make(map[string]ir.NodeState),
+			LastObservation: make(map[string]ir.ObservationPayload),
+			AttemptCounts:   make(map[string]int),
+			Variables:       ir.Variables{},
+		}
+		m.controlRunID = runID
+		return
+	}
+	if runID != "" {
+		m.controlRunID = runID
+		m.controlSnapshot.ID = runID
+	}
+	if m.controlSnapshot.NodeStates == nil {
+		m.controlSnapshot.NodeStates = make(map[string]ir.NodeState)
+	}
+	if m.controlSnapshot.LastObservation == nil {
+		m.controlSnapshot.LastObservation = make(map[string]ir.ObservationPayload)
+	}
+	if m.controlSnapshot.AttemptCounts == nil {
+		m.controlSnapshot.AttemptCounts = make(map[string]int)
+	}
+}
+
 // handleReasoningStream projects one EventReasoningStream event onto the
 // thinking buffer. Chunks are appended verbatim; the terminal event (empty
 // chunk + IsComplete) collapses the box. Only ever runs on the UI goroutine.
@@ -1966,6 +2084,7 @@ func (m *model) resetStreamingState() {
 	m.reasoningBuffer.Reset()
 	m.sentinelReasoningFlushed = 0
 	m.pendingReasoningFragment = ""
+	m.resetStreamBlocks()
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
@@ -2005,19 +2124,35 @@ func (m *model) reconcileSpinner() {
 	m.reasoningBuffer.Reset()
 	m.sentinelReasoningFlushed = 0
 	m.pendingReasoningFragment = ""
+	m.resetStreamBlocks()
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
 	m.stopShimmer()
 }
 
+// ensureStreamBlocks lazily constructs the typed stream block buffer.
+func (m *model) ensureStreamBlocks() *StreamBuffer {
+	if m.streamBlocks == nil {
+		m.streamBlocks = NewStreamBuffer()
+	}
+	return m.streamBlocks
+}
+
+// resetStreamBlocks clears the typed stream block buffer (nil-safe).
+func (m *model) resetStreamBlocks() {
+	if m.streamBlocks != nil {
+		m.streamBlocks.Reset()
+	}
+}
+
 // emitVisibleContent routes one emitted content window into the response
 // pipeline. It runs the reasoning extractor over the window, then appends only
-// the sentinel-cleaned text to currentStreamContent and projects any newly
-// extracted reasoning onto the unified ThinkingBuffer (deduplicated by the
-// flushed-byte offset). Any pre-existing streamBuffer content (the legacy
-// non-throttle path's un-emitted remainder) is preserved around the extraction
-// so nothing already received is ever dropped.
+// the sentinel-cleaned text to currentStreamContent and the typed stream
+// buffer, and projects any newly extracted reasoning onto the unified
+// ThinkingBuffer (deduplicated by the flushed-byte offset). Any pre-existing
+// streamBuffer content (the legacy non-throttle path's un-emitted remainder) is
+// preserved around the extraction so nothing already received is ever dropped.
 func (m *model) emitVisibleContent(raw string) {
 	if raw == "" {
 		return
@@ -2040,7 +2175,10 @@ func (m *model) emitVisibleContent(raw string) {
 		m.sentinelReasoningFlushed = m.reasoningBuffer.Len()
 	}
 
-	m.currentStreamContent += visible
+	if visible != "" {
+		m.currentStreamContent += visible
+		m.ensureStreamBlocks().Append(KindContent, visible)
+	}
 }
 
 // extractReasoningContent scans raw stream text for reasoning sentinels
@@ -2072,11 +2210,13 @@ func (m *model) extractReasoningContent() {
 		if m.thinkingPanel != nil {
 			m.thinkingPanel.Append(extracted)
 		}
+		m.ensureStreamBlocks().Append(KindThinking, extracted)
 	}
 	// 2. Extract inline  thinking tags from the already-rendered content.
 	thinkContent := m.extractThinkTagsContent(m.currentStreamContent)
 	if thinkContent != "" && m.thinkingPanel != nil {
 		m.thinkingPanel.Append(thinkContent)
+		m.ensureStreamBlocks().Append(KindThinking, thinkContent)
 	}
 	m.currentStreamContent = m.extractThinkTags(m.currentStreamContent)
 }
@@ -2145,6 +2285,7 @@ func (m *model) flushPendingReasoningFragment() {
 	if m.thinkingPanel != nil {
 		m.thinkingPanel.Append(leftover)
 	}
+	m.ensureStreamBlocks().Append(KindThinking, leftover)
 }
 
 // extractThinkTagsContent extracts reasoning content from think tags
@@ -2317,17 +2458,23 @@ func (m *model) refreshViewportContent() {
 	}
 
 	if m.streaming {
-		if m.currentStreamContent != "" {
+		// ── Differential typed stream rendering ─────────────────────
+		// The structured buffer renders KindThinking blocks dimmed (faint +
+		// italic) and KindContent blocks bright, in arrival order. When no
+		// typed blocks exist (legacy non-throttle paths) it falls back to the
+		// flat content string through the deterministic pipeline.
+		streamed := m.renderStreamBlocks(m.width)
+		if streamed == "" && m.currentStreamContent != "" {
 			// SANITIZE BEFORE VIEWPORT: raw streamed text may still carry
 			// literal \n / \t / \" escapes (preserved verbatim through the
 			// rune-safe ingestion). They are expanded to real control
 			// characters here so the deterministic pipeline never renders
 			// backslash noise or drops words next to escaped punctuation.
-			rendered := m.renderStreamingContent(sanitizeText(m.currentStreamContent), m.width)
-			if rendered != "" {
-				content.WriteString(rendered)
-				content.WriteString("\n")
-			}
+			streamed = m.renderStreamingContent(sanitizeText(m.currentStreamContent), m.width)
+		}
+		if streamed != "" {
+			content.WriteString(streamed)
+			content.WriteString("\n")
 		}
 
 		// ── Inline thinking block (faint, collapsible) ───────────────
@@ -2342,9 +2489,14 @@ func (m *model) refreshViewportContent() {
 		// inline block is suppressed while the dock is live — it only appears
 		// once the dock has handed off to the first content token, or when
 		// the user expands it via Ctrl+O mid-stream (inspection overrides).
+		//
+		// When the typed buffer already renders thinking inline (streamThinking
+		// blocks), that IS the live thinking display — the separate collapsible
+		// box is suppressed to avoid duplicating the same reasoning text.
 		dockActive := m.shimmerActive
+		inlineThinking := m.streamBlocks != nil && m.streamBlocks.HasThinking()
 		if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
-			if m.thinkingBuffer.Expanded() || !dockActive {
+			if !inlineThinking && (m.thinkingBuffer.Expanded() || !dockActive) {
 				thoughts := m.renderLiveThinking(m.width)
 				if thoughts != "" {
 					content.WriteString(thoughts)
@@ -2369,6 +2521,19 @@ func (m *model) refreshViewportContent() {
 	if !m.streaming && m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
 		if thoughts := m.renderLiveThinking(m.width); thoughts != "" {
 			content.WriteString(thoughts)
+			content.WriteString("\n")
+		}
+	}
+
+	// ── Fact-only Execution Tree ────────────────────────────────────
+	// The Dynamic IR projection rendered from control.iteration /
+	// control.node_observed facts. Placed above the bottom dock so the live
+	// execution tree reads as the pipeline's current state while tool steps
+	// stream beneath it. It is a pure projection: the facts are read-only
+	// and the tree never performs retries or state mutations.
+	if m.controlSnapshot != nil && len(m.controlSnapshot.NodeStates) > 0 {
+		if treeView := ProjectSnapshotToView(m.controlSnapshot, nil); treeView != "" {
+			content.WriteString(treeView)
 			content.WriteString("\n")
 		}
 	}

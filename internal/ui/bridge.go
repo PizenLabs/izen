@@ -4,10 +4,53 @@ import (
 	"fmt"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
+	"github.com/PizenLabs/izen/pkg/engine/telemetry"
 )
+
+// controlFactMsg carries one fact-only control event (control.iteration or
+// control.node_observed) from the adaptive control loop's telemetry bus into
+// the Bubble Tea event loop. The UI is a pure projection of these facts: it
+// renders them and never reconstructs, mutates, or retries engine state.
+type controlFactMsg struct {
+	ev telemetry.Event
+}
+
+// ListenControlEvents returns a tea.Cmd that wires the fact-only control
+// telemetry stream into the Bubble Tea event loop. When executed it subscribes
+// the given sender to every control.iteration and control.node_observed event
+// and forwards each as a controlFactMsg. Delivery is non-blocking: the
+// telemetry bus owns a buffered channel per subscription, so a slow UI can
+// never stall the control loop. The cmd completes after subscribing; the
+// per-subscription dispatch goroutines continue pushing messages until the
+// program shuts down. A nil bus or sender yields a no-op cmd (batch-safe).
+func ListenControlEvents(bus *telemetry.EventBus, send func(tea.Msg)) tea.Cmd {
+	return func() tea.Msg {
+		if bus == nil || send == nil {
+			return nil
+		}
+		forward := func(ev telemetry.Event) {
+			send(controlFactMsg{ev: ev})
+		}
+		bus.Subscribe(telemetry.EventControlIteration, forward)
+		bus.Subscribe(telemetry.EventControlNodeObserved, forward)
+		return nil
+	}
+}
+
+// listenControlEventsCmd arms the fact-only control telemetry bridge for the
+// current model. It is nil-safe: without a wired sender or telemetry bus it
+// returns nil so the Init batch is unaffected in headless/test harnesses.
+func (m *model) listenControlEventsCmd() tea.Cmd {
+	if m.controlFactSend == nil || m.pipelineEngine == nil || m.pipelineEngine.Bus() == nil {
+		return nil
+	}
+	return ListenControlEvents(m.pipelineEngine.Bus(), m.controlFactSend)
+}
 
 // bridgeInvestigationToLedger projects the read-only forensic findings from
 // /investigate into the canonical session.ContextLedger (the handoff SSOT).

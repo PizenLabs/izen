@@ -130,6 +130,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// from the previous turn (the ghost-output / stale-context bug).
 	m.streamBuffer = ""
 	m.currentStreamContent = ""
+	m.resetStreamBlocks()
 	m.streamParser = NewIncrementalStreamParser(m.width - 2)
 	m.streamParser.Reset()
 	if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.HumanConfirmed {
@@ -210,6 +211,13 @@ func (m *model) streamCmd(content string) tea.Cmd {
 
 	debugLogPayload(content, msgs)
 
+	// Capture the channel reference locally so the goroutine (and the
+	// ReasoningHandler below, which runs on the producer goroutine during
+	// ExecuteStream reads) never reads m.streamCh after Update() clears it to
+	// nil. Without this, the deferred close(m.streamCh) would panic with
+	// "close of nil channel".
+	streamCh := m.streamCh
+
 	req := ai.Request{
 		Model:     m.cfg.ActiveModelName(),
 		Messages:  msgs,
@@ -220,17 +228,18 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			if m.bus != nil {
 				m.bus.Publish(events.NewReasoningStream(chunk, false))
 			}
+			// Reasoning tokens also flow into the typed stream channel so the
+			// UI renders them inline in the dimmed thinking style, in arrival
+			// order relative to content tokens.
+			if chunk != "" {
+				streamCh <- thinkingTokenMsg(chunk)
+			}
 			return nil
 		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	m.streamCancel = cancel
-
-	// Capture the channel reference locally so the goroutine never reads
-	// m.streamCh after Update() clears it to nil. Without this, the
-	// deferred close(m.streamCh) would panic with "close of nil channel".
-	streamCh := m.streamCh
 
 	// STREAM CONSUMER CONTRACT (deadlock-free):
 	// This producer goroutine is the ONLY place that reads from the LLM stream.
@@ -263,6 +272,8 @@ func (m *model) streamCmd(content string) tea.Cmd {
 
 		full, ingestErr := ingestLLMStream(rawStream, m.bus, func(text string) {
 			streamCh <- tokenMsg(text)
+		}, func(text string) {
+			streamCh <- thinkingTokenMsg(text)
 		})
 
 		type usageProvider interface {
@@ -326,16 +337,17 @@ func (m *model) streamTraceCmd() tea.Cmd {
 // Raw LLM chunks are NOT aligned to UTF-8 rune boundaries. Slicing them
 // directly (string(buf[:n])) can split a multi-byte rune across two reads and
 // corrupt the markdown answer with replacement chars. RuneBuffer holds
-// incomplete runes until they complete. The Splitter then classifies each
+// incomplete runes until they complete. The Classifier then classifies each
 // frame: reasoning (<thought>…</thought> / reasoning sentinels) is published
-// to the event bus as EventReasoningStream and NEVER enters the response
+// to the event bus as EventReasoningStream AND routed to emitThinking (so the
+// UI can render it inline in a dimmed style) — it NEVER enters the response
 // pipeline; only content frames reach emitContent. Escapes are preserved
 // verbatim through both layers. A terminal ReasoningStream event (empty chunk,
 // IsComplete) is always published so the UI can collapse the thinking box.
-func ingestLLMStream(r io.Reader, bus *events.Bus, emitContent func(string)) (string, error) {
+func ingestLLMStream(r io.Reader, bus *events.Bus, emitContent func(string), emitThinking func(string)) (string, error) {
 	var full strings.Builder
 	runeBuf := stream.NewRuneBuffer()
-	splitter := stream.NewSplitter()
+	classifier := stream.NewClassifier()
 
 	publishReasoning := func(text string) {
 		if bus != nil {
@@ -343,27 +355,30 @@ func ingestLLMStream(r io.Reader, bus *events.Bus, emitContent func(string)) (st
 		}
 	}
 
-	emitFrame := func(fr stream.Frame) {
-		if fr.Kind == stream.ChunkReasoning {
-			if fr.Text != "" {
-				publishReasoning(fr.Text)
+	emitFrame := func(tok stream.Token) {
+		if tok.Kind == stream.TokenKindThinking {
+			if tok.Text != "" {
+				publishReasoning(tok.Text)
+				if emitThinking != nil {
+					emitThinking(tok.Text)
+				}
 			}
 			return
 		}
-		if fr.Text == "" {
+		if tok.Text == "" {
 			return
 		}
-		full.WriteString(fr.Text)
+		full.WriteString(tok.Text)
 		if emitContent != nil {
-			emitContent(fr.Text)
+			emitContent(tok.Text)
 		}
 	}
 
 	flushBuffered := func() {
 		if rem := runeBuf.Flush(); rem != "" {
-			splitter.Write(rem, emitFrame)
+			classifier.Write(rem, emitFrame)
 		}
-		splitter.Flush(emitFrame)
+		classifier.Flush(emitFrame)
 	}
 
 	buf := make([]byte, 4096)
@@ -371,7 +386,7 @@ func ingestLLMStream(r io.Reader, bus *events.Bus, emitContent func(string)) (st
 		n, err := r.Read(buf)
 		if n > 0 {
 			if text := runeBuf.Write(buf[:n]); text != "" {
-				splitter.Write(text, emitFrame)
+				classifier.Write(text, emitFrame)
 			}
 		}
 		if err == io.EOF {
