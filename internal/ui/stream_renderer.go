@@ -604,6 +604,66 @@ func (m *model) planStatusSource() plan.TaskStatusSource {
 	return m.buildLedger
 }
 
+// renderStreamBlocks renders the typed stream buffer with differential styling:
+// KindThinking blocks are rendered dimmed (faint + italic), KindContent blocks
+// bright, each as it arrives. Returns "" when there is nothing to render so
+// callers can fall back to the legacy raw-content path.
+func (m *model) renderStreamBlocks(width int) string {
+	if m.streamBlocks == nil || m.streamBlocks.Len() == 0 {
+		return ""
+	}
+	var rendered []string
+	for _, blk := range m.streamBlocks.Blocks() {
+		switch blk.Kind {
+		case KindThinking:
+			if r := m.renderThinkingBlock(blk.Text, width); r != "" {
+				rendered = append(rendered, r)
+			}
+		default:
+			if r := m.renderStreamingContent(sanitizeText(blk.Text), width); r != "" {
+				rendered = append(rendered, r)
+			}
+		}
+	}
+	return strings.Join(rendered, vspace(Spacing.Section))
+}
+
+// renderThinkingBlock renders one KindThinking block in the dimmed/faint
+// reasoning style, distinct from the bright content pipeline. Reasoning is
+// wrapped to the inner width and anchored with a low-contrast gutter so it
+// reads as a subordinate stream rather than part of the answer.
+func (m *model) renderThinkingBlock(text string, width int) string {
+	text = sanitizeText(text)
+	if text == "" {
+		return ""
+	}
+	wrapW := width - 4
+	if wrapW < 20 {
+		wrapW = 20
+	}
+
+	var lines []string
+	for _, src := range strings.Split(text, "\n") {
+		src = strings.TrimRight(src, " \r")
+		if src == "" {
+			lines = append(lines, "")
+			continue
+		}
+		lines = append(lines, wrapString(src, wrapW)...)
+	}
+
+	var out []string
+	gutter := streamThinkingGutter.Render("│") + " "
+	for _, l := range lines {
+		if l == "" {
+			out = append(out, "")
+			continue
+		}
+		out = append(out, gutter+streamThinkingStyle.Render(l))
+	}
+	return strings.Join(out, "\n")
+}
+
 // planTrackIcon maps a Task to its track classification (ENV_DEPS, CODE_MOD, VERIFY)
 // and returns the icon+track label for the enriched plan display.
 // SHELL_EXEC dependency commands → 📦 [ENV_DEPS]

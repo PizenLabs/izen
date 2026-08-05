@@ -1657,6 +1657,7 @@ func (m *model) retryBuildWithStrictDirective() tea.Cmd {
 	m.responseBuffer.Reset()
 	m.streamBuffer = ""
 	m.currentStreamContent = ""
+	m.resetStreamBlocks()
 	return m.streamCmd(strictContent)
 }
 
@@ -1857,6 +1858,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.responseBuffer.Reset()
 		m.streamBuffer = ""
 		m.currentStreamContent = ""
+		m.resetStreamBlocks()
 		m.streaming = false
 
 		// Purge ContextLedger (ask_handoff_payload, investigation findings,
@@ -2166,6 +2168,7 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 	m.responseBuffer.Reset()
 	m.streamBuffer = ""
 	m.currentStreamContent = ""
+	m.resetStreamBlocks()
 	m.lastTestOutput = ""
 	m.lastTestFailed = false
 	m.lastTestTarget = ""
@@ -5337,6 +5340,7 @@ func (m *model) cancelStaleAgentOps() {
 	m.streamTickActive = false
 	m.streamBuffer = ""
 	m.currentStreamContent = ""
+	m.resetStreamBlocks()
 	m.interruptRequested = false
 
 	// Preserve pipeline state if active (implicit pipeline continues)

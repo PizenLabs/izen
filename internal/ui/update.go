@@ -1096,6 +1096,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.responseBuffer.Reset()
 			m.currentStreamContent = ""
 			m.streamBuffer = ""
+			m.resetStreamBlocks()
 			m.historyIndex = -1
 		}
 
@@ -1902,6 +1903,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		return m, m.streamCmd(msg.content)
 
+	case thinkingTokenMsg:
+		// Thinking/reasoning token emitted by the stream classifier. It is
+		// appended to the typed stream buffer as a KindThinking block so the
+		// renderer can apply the dimmed/faint style — it never enters the
+		// content pipeline. The loading shimmer keeps running (still
+		// thinking); the first CONTENT token (tokenMsg) stops it.
+		if msg == "" {
+			return m, m.readStream()
+		}
+		m.ensureStreamBlocks().Append(KindThinking, string(msg))
+		m.refreshViewportContent()
+		if m.Ready && !m.userIsScrollingUp {
+			m.Viewport.GotoBottom()
+		}
+		return m, m.readStream()
+
 	case tokenMsg:
 		// LOCK-FREE CONSUMER: this per-token handler MUST NOT acquire any
 		// ContextLedger / TaskLedger mutex. It only appends to local buffers
@@ -2000,6 +2017,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.responseBuffer.Reset()
 		m.currentStreamContent = ""
+		// The stream is over — clear the typed block buffer so the next turn
+		// starts with a clean, empty renderer (the final answer above was
+		// derived from currentStreamContent, which is content-only).
+		m.resetStreamBlocks()
 
 		// Sanitize: strip tool execution artifacts so they don't pollute
 		// the downstream JSON parser or render pipeline. Lines matching
@@ -2443,6 +2464,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.responseBuffer.Reset()
 			m.currentStreamContent = ""
 			m.streamBuffer = ""
+			m.resetStreamBlocks()
 			m.streamTickActive = false
 			m.streamCancel = nil
 			m.refreshViewportContent()
@@ -2474,6 +2496,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 			m.streamBuffer = msg.content
 			m.currentStreamContent = msg.content
+			m.ensureStreamBlocks().Append(KindContent, msg.content)
 			m.extractReasoningContent()
 		}
 		m.refreshViewportContent()
@@ -2545,6 +2568,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.streamBuffer = ""
 		m.currentStreamContent = ""
+		m.resetStreamBlocks()
 		m.streamTickActive = false
 		m.interruptRequested = false
 		m.spinnerFrame = 0

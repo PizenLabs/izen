@@ -102,7 +102,16 @@ func TestListenControlEventsIsNonBlocking(t *testing.T) {
 	bus := telemetry.NewEventBus(2)
 	defer bus.Close()
 	ch := make(chan tea.Msg, 2)
-	send := func(m tea.Msg) { ch <- m }
+	// Drop when the channel is full: the test intentionally publishes a burst
+	// beyond the capacity, so a blocking send would stall the per-subscription
+	// dispatch goroutine and deadlock bus.Close() (which waits for it). Facts
+	// are dropped, never blocking — exactly the non-blocking contract.
+	send := func(m tea.Msg) {
+		select {
+		case ch <- m:
+		default:
+		}
+	}
 
 	cmd := ListenControlEvents(bus, send)
 	cmd()

@@ -374,8 +374,11 @@ func TestIngestLLMStreamRuneSafeAcrossByteBoundaries(t *testing.T) {
 	})
 
 	var content strings.Builder
+	var thinking strings.Builder
 	full, err := ingestLLMStream(&byteChunkReader{data: []byte(input)}, bus, func(s string) {
 		content.WriteString(s)
+	}, func(s string) {
+		thinking.WriteString(s)
 	})
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
@@ -388,6 +391,9 @@ func TestIngestLLMStreamRuneSafeAcrossByteBoundaries(t *testing.T) {
 	if content.String() != "héllo 你好  ```go\ncode\n```" {
 		t.Errorf("content = %q, want %q", content.String(), "héllo 你好  ```go\ncode\n```")
 	}
+	if thinking.String() != "plan it" {
+		t.Errorf("thinking = %q, want %q", thinking.String(), "plan it")
+	}
 	if full != content.String() {
 		t.Errorf("returned full = %q, want %q", full, content.String())
 	}
@@ -399,7 +405,7 @@ func TestIngestLLMStreamPreservesEscapesVerbatim(t *testing.T) {
 	var content strings.Builder
 	full, err := ingestLLMStream(strings.NewReader(input), nil, func(s string) {
 		content.WriteString(s)
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -422,7 +428,7 @@ func TestIngestLLMStreamPublishesTerminalComplete(t *testing.T) {
 		mu.Unlock()
 	})
 
-	_, err := ingestLLMStream(strings.NewReader("plain"), bus, nil)
+	_, err := ingestLLMStream(strings.NewReader("plain"), bus, nil, nil)
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -449,7 +455,7 @@ func TestIngestLLMStreamPublishesTerminalComplete(t *testing.T) {
 }
 
 func TestIngestLLMStreamEmptyInput(t *testing.T) {
-	full, err := ingestLLMStream(strings.NewReader(""), nil, nil)
+	full, err := ingestLLMStream(strings.NewReader(""), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}

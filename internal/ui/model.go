@@ -94,6 +94,13 @@ type record struct {
 
 type tokenMsg string
 
+// thinkingTokenMsg carries a thinking/reasoning token emitted by the stream
+// classifier (delta reasoning_content, <thought>…</thought> blocks, or
+// reasoning sentinels). It is deliberately separate from tokenMsg (content) so
+// the renderer can apply the dimmed/faint style exclusively to reasoning while
+// content streams in bright.
+type thinkingTokenMsg string
+
 type streamDoneMsg struct {
 	content     string
 	tokenInput  int
@@ -692,6 +699,10 @@ type model struct {
 	// rendering keeps its 20ms pacing. Zero value means "advance immediately".
 	lastSpinnerAdvance   time.Time
 	currentStreamContent string // accumulated raw text during active LLM stream
+	// streamBlocks stores the active stream as typed blocks (content vs
+	// thinking) so the renderer can apply differential styling — bright content
+	// immediately, dimmed/faint reasoning while it streams.
+	streamBlocks *StreamBuffer
 
 	// Expanded metrics for status bar
 	IsCloudModel    bool
@@ -2073,6 +2084,7 @@ func (m *model) resetStreamingState() {
 	m.reasoningBuffer.Reset()
 	m.sentinelReasoningFlushed = 0
 	m.pendingReasoningFragment = ""
+	m.resetStreamBlocks()
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
@@ -2112,19 +2124,35 @@ func (m *model) reconcileSpinner() {
 	m.reasoningBuffer.Reset()
 	m.sentinelReasoningFlushed = 0
 	m.pendingReasoningFragment = ""
+	m.resetStreamBlocks()
 	if m.streamParser != nil {
 		m.streamParser = nil
 	}
 	m.stopShimmer()
 }
 
+// ensureStreamBlocks lazily constructs the typed stream block buffer.
+func (m *model) ensureStreamBlocks() *StreamBuffer {
+	if m.streamBlocks == nil {
+		m.streamBlocks = NewStreamBuffer()
+	}
+	return m.streamBlocks
+}
+
+// resetStreamBlocks clears the typed stream block buffer (nil-safe).
+func (m *model) resetStreamBlocks() {
+	if m.streamBlocks != nil {
+		m.streamBlocks.Reset()
+	}
+}
+
 // emitVisibleContent routes one emitted content window into the response
 // pipeline. It runs the reasoning extractor over the window, then appends only
-// the sentinel-cleaned text to currentStreamContent and projects any newly
-// extracted reasoning onto the unified ThinkingBuffer (deduplicated by the
-// flushed-byte offset). Any pre-existing streamBuffer content (the legacy
-// non-throttle path's un-emitted remainder) is preserved around the extraction
-// so nothing already received is ever dropped.
+// the sentinel-cleaned text to currentStreamContent and the typed stream
+// buffer, and projects any newly extracted reasoning onto the unified
+// ThinkingBuffer (deduplicated by the flushed-byte offset). Any pre-existing
+// streamBuffer content (the legacy non-throttle path's un-emitted remainder) is
+// preserved around the extraction so nothing already received is ever dropped.
 func (m *model) emitVisibleContent(raw string) {
 	if raw == "" {
 		return
@@ -2147,7 +2175,10 @@ func (m *model) emitVisibleContent(raw string) {
 		m.sentinelReasoningFlushed = m.reasoningBuffer.Len()
 	}
 
-	m.currentStreamContent += visible
+	if visible != "" {
+		m.currentStreamContent += visible
+		m.ensureStreamBlocks().Append(KindContent, visible)
+	}
 }
 
 // extractReasoningContent scans raw stream text for reasoning sentinels
@@ -2179,11 +2210,13 @@ func (m *model) extractReasoningContent() {
 		if m.thinkingPanel != nil {
 			m.thinkingPanel.Append(extracted)
 		}
+		m.ensureStreamBlocks().Append(KindThinking, extracted)
 	}
 	// 2. Extract inline  thinking tags from the already-rendered content.
 	thinkContent := m.extractThinkTagsContent(m.currentStreamContent)
 	if thinkContent != "" && m.thinkingPanel != nil {
 		m.thinkingPanel.Append(thinkContent)
+		m.ensureStreamBlocks().Append(KindThinking, thinkContent)
 	}
 	m.currentStreamContent = m.extractThinkTags(m.currentStreamContent)
 }
@@ -2252,6 +2285,7 @@ func (m *model) flushPendingReasoningFragment() {
 	if m.thinkingPanel != nil {
 		m.thinkingPanel.Append(leftover)
 	}
+	m.ensureStreamBlocks().Append(KindThinking, leftover)
 }
 
 // extractThinkTagsContent extracts reasoning content from think tags
@@ -2424,17 +2458,23 @@ func (m *model) refreshViewportContent() {
 	}
 
 	if m.streaming {
-		if m.currentStreamContent != "" {
+		// ── Differential typed stream rendering ─────────────────────
+		// The structured buffer renders KindThinking blocks dimmed (faint +
+		// italic) and KindContent blocks bright, in arrival order. When no
+		// typed blocks exist (legacy non-throttle paths) it falls back to the
+		// flat content string through the deterministic pipeline.
+		streamed := m.renderStreamBlocks(m.width)
+		if streamed == "" && m.currentStreamContent != "" {
 			// SANITIZE BEFORE VIEWPORT: raw streamed text may still carry
 			// literal \n / \t / \" escapes (preserved verbatim through the
 			// rune-safe ingestion). They are expanded to real control
 			// characters here so the deterministic pipeline never renders
 			// backslash noise or drops words next to escaped punctuation.
-			rendered := m.renderStreamingContent(sanitizeText(m.currentStreamContent), m.width)
-			if rendered != "" {
-				content.WriteString(rendered)
-				content.WriteString("\n")
-			}
+			streamed = m.renderStreamingContent(sanitizeText(m.currentStreamContent), m.width)
+		}
+		if streamed != "" {
+			content.WriteString(streamed)
+			content.WriteString("\n")
 		}
 
 		// ── Inline thinking block (faint, collapsible) ───────────────
@@ -2449,9 +2489,14 @@ func (m *model) refreshViewportContent() {
 		// inline block is suppressed while the dock is live — it only appears
 		// once the dock has handed off to the first content token, or when
 		// the user expands it via Ctrl+O mid-stream (inspection overrides).
+		//
+		// When the typed buffer already renders thinking inline (streamThinking
+		// blocks), that IS the live thinking display — the separate collapsible
+		// box is suppressed to avoid duplicating the same reasoning text.
 		dockActive := m.shimmerActive
+		inlineThinking := m.streamBlocks != nil && m.streamBlocks.HasThinking()
 		if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
-			if m.thinkingBuffer.Expanded() || !dockActive {
+			if !inlineThinking && (m.thinkingBuffer.Expanded() || !dockActive) {
 				thoughts := m.renderLiveThinking(m.width)
 				if thoughts != "" {
 					content.WriteString(thoughts)
