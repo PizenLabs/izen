@@ -10,9 +10,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -46,6 +48,8 @@ func newTestModel() *model {
 		},
 		showBanner: false,
 		state:      StateAwaitingApproval,
+		workflowSM: workflow.NewWorkflowStateMachine(),
+		viewState:  presentation.NewWorkflowViewState(),
 		Ready:      true,
 		Viewport:   vp,
 		logStore:   NewLogStore(),

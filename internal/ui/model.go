@@ -79,12 +79,17 @@ const (
 	roleActivity
 )
 
-type UIState uint8
+// UIState is the derived modal presentation state. The canonical type lives in
+// the presentation layer (presentation.UIState); these aliases keep the view
+// vocabulary unified with the projection so AwaitingApproval/Processing are
+// always computed from the canonical workflow state, never independent local
+// flags.
+type UIState = presentation.UIState
 
 const (
-	StateChat UIState = iota
-	StateAwaitingApproval
-	StateProcessing
+	StateChat             = presentation.StateChat
+	StateAwaitingApproval = presentation.StateAwaitingApproval
+	StateProcessing       = presentation.StateProcessing
 )
 
 type record struct {
@@ -1064,6 +1069,11 @@ type model struct {
 	// store or cache its own copies of workflow states or capability flags.
 	runtimeCtx *runtime.RuntimeContext
 	workflowSM *workflow.WorkflowStateMachine
+	// viewState is the derived presentation projection of the canonical
+	// workflow event stream (EventPhaseChanged / EventApprovalRequested). The
+	// UI derives StateAwaitingApproval/StateProcessing from it via
+	// syncUIState instead of hand-setting independent flags.
+	viewState *presentation.WorkflowViewState
 
 	// Init/setup state machine
 	initStage          initStage
@@ -1563,6 +1573,12 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		}
 	case events.PhaseChangedPayload:
 		m.logActivity("[phase] %s → %s", p.From, p.To)
+		// The presentation state is a pure projection of the canonical
+		// workflow phase: derive, never hand-set.
+		if m.viewState != nil {
+			m.viewState.Project(ev)
+		}
+		m.syncUIState()
 	case events.PatchParsedPayload:
 		m.logActivity("[patch] parsed %s (strategy=%s, tier=%d)", p.File, p.Strategy, p.Tier)
 	case events.PatchValidatedPayload:
@@ -1577,6 +1593,13 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			target = "intent disambiguation"
 		}
 		m.logActivity("[approval] requested for %s: %s", target, truncateForActivity(p.Reason))
+		// A Tier 4 approval request is projected onto the derived presentation
+		// state: the WorkflowStateMachine holds the pending-approval truth and
+		// the UI derives StateAwaitingApproval from it.
+		if m.viewState != nil {
+			m.viewState.Project(ev)
+		}
+		m.enterApprovalState()
 	case events.ActivityPayload:
 		// Engine activity telemetry (retrieval/execution/investigate sinks)
 		// projected onto the UI goroutine through the bus.
@@ -1591,6 +1614,77 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// the box into compact mode.
 		m.handleReasoningStream(p.Chunk, p.IsComplete)
 	}
+}
+
+// ── Derived UI state projection ──────────────────────────────────────────────
+// StateAwaitingApproval and StateProcessing are DERIVED presentation states:
+// they are computed through presentation.DeriveUIState from the canonical
+// WorkflowStateMachine (phase + pending-approval gate) and the workflow event
+// stream (EventPhaseChanged / EventApprovalRequested). The UI never hand-sets
+// the approval state; it records the approval gate on the canonical source
+// (MarkApprovalPending/Resolved) and re-derives.
+
+// enterApprovalState freezes the workflow pending-approval gate and derives the
+// UI state from it. The WorkflowStateMachine is the single source of truth for
+// proposals awaiting human approval.
+func (m *model) enterApprovalState() {
+	if m.workflowSM != nil {
+		m.workflowSM.MarkApprovalPending()
+	}
+	m.syncUIState()
+}
+
+// resolveApprovalState clears the workflow pending-approval gate and re-derives
+// the presentation state. Approve/reject/cancel all funnel here so no path can
+// leave the canonical gate and the UI state out of sync.
+func (m *model) resolveApprovalState() {
+	if m.workflowSM != nil {
+		m.workflowSM.MarkApprovalResolved()
+	}
+	if m.viewState != nil {
+		m.viewState.ResolveApproval()
+	}
+	m.syncUIState()
+}
+
+// syncUIState projects the canonical workflow state onto the presentation
+// state. It is the single place the approval presentation state is derived.
+//
+// StateAwaitingApproval is strictly derived from the canonical pending-approval
+// gate. StateProcessing is derived from the active workflow phase only while a
+// transient operation is genuinely in flight — a mode phase persists across
+// operations, so it cannot gate the input line by itself. Otherwise the view
+// rests in StateChat.
+func (m *model) syncUIState() {
+	if m == nil {
+		return
+	}
+	phase := ""
+	approval := false
+	if m.workflowSM != nil {
+		phase = m.workflowSM.State().String()
+		approval = m.workflowSM.PendingApproval()
+	}
+	if m.viewState != nil {
+		m.viewState.Sync(phase, approval)
+	}
+	if approval {
+		m.state = presentation.DeriveUIState(phase, true)
+		return
+	}
+	if m.isWorkflowBusy() {
+		m.state = StateProcessing
+		return
+	}
+	m.state = StateChat
+}
+
+// isWorkflowBusy reports whether a transient workflow operation (stream, agent,
+// review, pipeline or shell command) is in flight. It feeds the derived
+// UIState so Processing is only derived while an operation is genuinely
+// running.
+func (m *model) isWorkflowBusy() bool {
+	return m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.shellRunning
 }
 
 // handlePresentationEvent projects one Application-layer PresentationEvent

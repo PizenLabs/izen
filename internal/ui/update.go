@@ -1002,7 +1002,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.pendingProposals = props
 
 		// ── FREEZE FOR HUMAN APPROVAL ───────────────────────────────
-		m.state = StateAwaitingApproval
+		m.enterApprovalState()
 		m.awaitingConfirmation = true
 		m.ti.Blur()
 		m.recalcViewportHeight()
@@ -1076,7 +1076,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// ── CLEAN TRANSITION TO PROPOSAL VIEW ────────────────────────
 		m.push(roleActivity, "  ⚙ Compiling unified diff schema...")
 
-		m.state = StateAwaitingApproval
+		m.enterApprovalState()
 		m.ti.Blur()
 		m.recalcViewportHeight()
 
@@ -1566,7 +1566,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 
 			m.ti.Focus()
-			m.state = StateChat
+			m.resolveApprovalState()
 			m.recalcViewportHeight()
 			m.awaitingConfirmation = false
 			m.acceptAll = false
@@ -1622,7 +1622,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				m.logStore.AddFull(LogEdit, msg.file, false, msg.err.Error(), thinkingContent, "")
 			}
 		} else {
-			m.state = StateAwaitingApproval
+			m.enterApprovalState()
 			m.recalcViewportHeight()
 			m.Viewport.Height = m.computeVpHeight()
 			m.refreshViewportContent()
@@ -1661,7 +1661,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.awaitingConfirmation = false
 		m.acceptAll = false
 		m.ti.Focus()
-		m.state = StateChat
+		m.resolveApprovalState()
 		m.recalcViewportHeight()
 		var testCmd tea.Cmd
 		switch {
@@ -2393,7 +2393,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					return m, m.applyAllProposalsCmd()
 				} else {
 					m.pendingProposals = props
-					m.state = StateAwaitingApproval
+					m.enterApprovalState()
 					m.recalcViewportHeight()
 					m.Viewport.Height = m.computeVpHeight()
 					m.awaitingConfirmation = true

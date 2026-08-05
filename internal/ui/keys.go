@@ -374,7 +374,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.pendingHotfixTask = nil
 				m.pendingHotfixPatch = nil
 				m.pendingProposals = nil
-				m.state = StateChat
+				m.resolveApprovalState()
 				m.ti.Focus()
 				m.recalcViewportHeight()
 				m.refreshViewportContent()
@@ -394,7 +394,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.pendingHotfixTask = nil
 				m.pendingHotfixPatch = nil
 				m.pendingProposals = nil
-				m.state = StateChat
+				m.resolveApprovalState()
 				m.ti.Focus()
 				m.recalcViewportHeight()
 				m.push(roleSystem, infoStyle.Render(
@@ -422,7 +422,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
 				m.pendingBuildApproval = false
 				m.pendingBuildTask = nil
-				m.state = StateChat
+				m.resolveApprovalState()
 				m.recalcViewportHeight()
 				m.ti.Focus()
 				m.refreshViewportContent()
@@ -439,7 +439,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.pendingBuildAllowAlways = true
 				m.pendingBuildApproval = false
 				m.pendingBuildTask = nil
-				m.state = StateChat
+				m.resolveApprovalState()
 				m.recalcViewportHeight()
 				m.ti.Focus()
 				m.refreshViewportContent()
@@ -456,7 +456,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
 				m.pendingBuildApproval = false
 				m.pendingBuildTask = nil
-				m.state = StateChat
+				m.resolveApprovalState()
 				m.recalcViewportHeight()
 				m.ti.Focus()
 				if m.sess != nil {
@@ -495,7 +495,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case msg.String() == "r" || msg.Type == tea.KeyEscape:
 				// Reject — discard buffer
 				m.toolCallBuffer.Reject()
-				m.state = StateChat
+				m.resolveApprovalState()
 				m.recalcViewportHeight()
 				m.push(roleSystem, infoStyle.Render("tool calls rejected"))
 				return m, nil
@@ -554,7 +554,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 
 			m.ti.Focus()
-			m.state = StateChat
+			m.resolveApprovalState()
 			m.recalcViewportHeight()
 			m.awaitingConfirmation = false
 			m.pendingProposals = nil

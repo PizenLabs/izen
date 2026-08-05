@@ -194,7 +194,7 @@ func findLeaEngineCalls(f *ast.File, fset *token.FileSet) []leaEngineCall {
 // TestLeaEngineSingleCompositionBinding asserts the service-binding invariant:
 // the workspace bootstrap/DI binds exactly ONE canonical `lea.Engine` per
 // workspace context, and that binding is confined to the composition root
-// (internal/ui/program.go). Creating additional engines elsewhere (mode
+// (internal/runtime/compose). Creating additional engines elsewhere (mode
 // engines, adapters, retrieval) would fragment the structural index and break
 // the single-source-of-truth contract the UI, planner, and /arch analysis
 // depend on.
@@ -207,9 +207,9 @@ func findLeaEngineCalls(f *ast.File, fset *token.FileSet) []leaEngineCall {
 func TestLeaEngineSingleCompositionBinding(t *testing.T) {
 	root := repoRoot(t)
 
-	// Allowed engine-binding sites. The composition root binds the canonical
+	// Allowed engine-binding sites. The composition root wires the canonical
 	// engine; the diagnostic tool spins up a throwaway inspection instance.
-	const compositionRoot = "internal/ui/program.go"
+	const compositionRoot = "internal/runtime/compose/compose.go"
 	const diagnosticEntry = "cmd/izen/main.go"
 	allowed := map[string]bool{
 		compositionRoot: true,

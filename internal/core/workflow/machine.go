@@ -16,6 +16,13 @@ type TransitionContext struct {
 type WorkflowStateMachine struct {
 	current     WorkflowState
 	coordinator *CheckpointCoordinator
+
+	// pendingApproval is the single source of truth for whether the workflow
+	// is blocked on an explicit human approval gate (a queued build/hotfix
+	// proposal or an intent-disambiguation prompt). The presentation layer
+	// derives its AwaitingApproval UI state from this signal rather than
+	// tracking approvals independently.
+	pendingApproval bool
 }
 
 func NewWorkflowStateMachine() *WorkflowStateMachine {
@@ -31,6 +38,30 @@ func (m *WorkflowStateMachine) WithCheckpointCoordinator(cc *CheckpointCoordinat
 
 func (m *WorkflowStateMachine) State() WorkflowState {
 	return m.current
+}
+
+// MarkApprovalPending records that the workflow is blocked on an explicit
+// human approval gate. It is the canonical signal the presentation layer
+// projects onto its AwaitingApproval UI state.
+func (m *WorkflowStateMachine) MarkApprovalPending() {
+	if m != nil {
+		m.pendingApproval = true
+	}
+}
+
+// MarkApprovalResolved clears the pending-approval gate.
+func (m *WorkflowStateMachine) MarkApprovalResolved() {
+	if m != nil {
+		m.pendingApproval = false
+	}
+}
+
+// PendingApproval reports whether the workflow is awaiting human approval.
+func (m *WorkflowStateMachine) PendingApproval() bool {
+	if m == nil {
+		return false
+	}
+	return m.pendingApproval
 }
 
 func (m *WorkflowStateMachine) MustTransition(event WorkflowEvent, ctx TransitionContext) {

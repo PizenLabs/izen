@@ -1530,7 +1530,7 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	// workflow and MUST NOT bleed into /plan or /investigate views. Reset
 	// the interaction state and drop pending proposals so the incoming
 	// mode renders its own clean dock.
-	m.state = StateChat
+	m.resolveApprovalState()
 	m.pendingProposals = nil
 	m.proposalDiffOffset = 0
 	m.currentEffort = EffortAuto
@@ -4612,7 +4612,7 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 		// Render the visual permission box via the proposal dock (view layer).
 		m.pendingBuildApproval = true
 		m.pendingBuildTask = targetTask
-		m.state = StateAwaitingApproval
+		m.enterApprovalState()
 		m.ti.Blur()
 		m.recalcViewportHeight()
 		m.refreshViewportContent()
@@ -6136,7 +6136,7 @@ func (m *model) resetObjectiveContextStacks() {
 	m.pendingProposals = nil
 	m.awaitingConfirmation = false
 	m.acceptAll = false
-	m.state = StateChat
+	m.resolveApprovalState()
 	m.recalcViewportHeight()
 	m.acceptedProposals = nil
 	m.proposedShellCmd = ""

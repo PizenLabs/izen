@@ -14,66 +14,29 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
-	"github.com/PizenLabs/izen/internal/audit"
 	"github.com/PizenLabs/izen/internal/config"
-	"github.com/PizenLabs/izen/internal/control"
-	"github.com/PizenLabs/izen/internal/core/artifact"
-	"github.com/PizenLabs/izen/internal/core/authorization"
-	"github.com/PizenLabs/izen/internal/core/budget"
-	"github.com/PizenLabs/izen/internal/core/capability"
-	"github.com/PizenLabs/izen/internal/core/runtime"
-	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
-	"github.com/PizenLabs/izen/internal/git"
-	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
-	"github.com/PizenLabs/izen/internal/modes/plan"
-	"github.com/PizenLabs/izen/internal/orchestrator"
-	"github.com/PizenLabs/izen/internal/patch"
 	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
-	"github.com/PizenLabs/izen/internal/prompt"
-	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
-	"github.com/PizenLabs/izen/internal/router"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	compose "github.com/PizenLabs/izen/internal/runtime/compose"
-	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
-	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
-	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
-	"github.com/PizenLabs/izen/pkg/engine/layer1"
-	"github.com/PizenLabs/izen/pkg/engine/layer3"
-	"github.com/PizenLabs/izen/pkg/engine/pipeline"
-	"github.com/PizenLabs/izen/pkg/engine/telemetry"
 	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
 	"github.com/PizenLabs/izen/pkg/tui/tips"
 )
 
-// NewProgram initializes the active model state context and instantiates the runner engine.
-func NewProgram(root string, cfg *config.Config, sess *session.Session, mgr *ai.Manager, localCfg *config.LocalConfig, det ...project.Detection) *tea.Program {
-	// Default wiring: the presentation layer builds its own Application stack
-	// (shared bus + runtime facade). The composition root may instead build the
-	// stack explicitly and pass it via NewProgramWithApp.
-	app, err := compose.Wire()
-	if err != nil {
-		panic(fmt.Sprintf("izen: wire application layer: %v", err))
-	}
-	return NewProgramWithApp(root, cfg, sess, mgr, localCfg, app, det...)
-}
-
-// NewProgramWithApp initializes the model bound to an externally wired
+// NewProgramWithApp initializes the model bound to the externally wired
 // Application layer (RFC v1.0 section 1). The shared bus in app is the single
 // event bus every engine publishes onto, and app.Runtime is the single entry
-// point the presentation layer drives. Nil app degrades to a plain
-// NewProgram.
-func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, mgr *ai.Manager, localCfg *config.LocalConfig, app *compose.Application, det ...project.Detection) *tea.Program {
-	if app == nil {
-		return NewProgram(root, cfg, sess, mgr, localCfg, det...)
-	}
+// point the presentation layer drives. Every engine, orchestrator, capability
+// set and adapter is consumed read-only from app — this package never
+// instantiates engines.
+func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalConfig, app *compose.Application, det ...project.Detection) *tea.Program {
 	detection := project.Detection{}
 	if len(det) > 0 {
 		detection = det[0]
@@ -81,61 +44,16 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 
 	userName := resolveUsername(root, localCfg)
 
-	eng := git.NewEngine(root)
+	// The display username may be more specific than the process-level fallback
+	// wired into the plan engine (local config / git identity take precedence).
+	// Push the resolved value down so plans are attributed correctly.
+	if app != nil && app.PlanEngine != nil {
+		app.PlanEngine.SetUserName(userName)
+	}
 
 	var provider ai.Provider
-	if defaultP, _ := mgr.Default(); defaultP != nil {
-		provider = defaultP
-	}
-
-	// ── LEA STRUCTURAL ENGINE (PHASE 3) ─────────────────────────────────
-	// The canonical structural intelligence engine: it indexes the workspace
-	// into an in-memory graph (persisted to .izen/graph.bin.zst) serving the
-	// context planner (GraphSource), the /arch analysis, and the retrieval
-	// graph tier. Indexing runs in a background goroutine below — and is
-	// gated on completed onboarding, because its cache write creates .izen/
-	// and must not trip HasLocalState during the init flow.
-	leaEng := lea.NewEngine(root)
-
-	// ── LAYERED PIPELINE ENGINE (LAYERS 0-5) ─────────────────────────────
-	// The central Pipeline Engine wires the foundation layers onto the
-	// orchestrator: Layer 0 knowledge resolution, Layer 1 capability
-	// detection, Layer 2 governed context, Layer 3 policy guard + stateless
-	// worker, Layer 4 validation DAG and Layer 5 telemetry. It performs no
-	// legacy heuristic context gathering or stack detection, and its
-	// intent-based model router picks the model tier per mode (/plan and
-	// /investigate route to reasoning models under strict budgets; /build
-	// routes to fast coding models; /ask routes to a minimal read-only
-	// policy).
-	pipeRouter := pipeline.NewRouter(
-		pipeline.WithModel(pipeline.IntentReasoning, cfg.ResolveTierModel("reasoning")),
-		pipeline.WithModel(pipeline.IntentExecution, cfg.ResolveTierModel("execution")),
-		pipeline.WithModel(pipeline.IntentInformational, cfg.ResolveTierModel("informational")),
-		pipeline.WithProvider(pipeline.IntentReasoning, cfg.ResolveTierProvider("reasoning")),
-		pipeline.WithProvider(pipeline.IntentExecution, cfg.ResolveTierProvider("execution")),
-		pipeline.WithProvider(pipeline.IntentInformational, cfg.ResolveTierProvider("informational")),
-		pipeline.WithFallbackModel(cfg.ResolveTierModel("execution")),
-	)
-	// Layer 5 telemetry is observed on a dedicated telemetry EventBus; a
-	// TelemetryAdapter bridges every event onto the unified domain event bus as
-	// standardized events.Envelope values so projections consume one stream.
-	telemetryBus := telemetry.NewEventBus(telemetry.DefaultBufferSize)
-	pipeOpts := []pipeline.Option{
-		pipeline.WithEventBus(telemetryBus),
-		pipeline.WithRouter(pipeRouter),
-	}
-	if provider != nil {
-		pipeOpts = append(pipeOpts, pipeline.WithClient(pipelineClient(provider)))
-	}
-	pipelineEng := pipeline.NewEngine(root, leaEng, pipeOpts...)
-
-	// Inject the Layer 1 workspace-capability header into every composed LLM
-	// system prompt so the model is told exactly which toolchain commands
-	// exist (and which do not), eliminating tech-stack hallucinations. The
-	// detection is a single cheap directory scan; a failure simply leaves the
-	// header empty and the composed prompts unchanged.
-	if g, derr := layer1.Detect(root); derr == nil {
-		prompt.SetWorkspaceCapabilities(pipeline.CapabilityHeader(g))
+	if app != nil {
+		provider = app.Provider()
 	}
 
 	ti := textinput.New()
@@ -143,41 +61,15 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 	ti.CharLimit = 0
 	ti.Focus()
 
-	planStore := plan.NewPlanStore()
-	planEng := plan.NewEngine(planStore)
-	planEng.SetUserName(userName)
-	if provider != nil {
-		planEng.SetProvider(provider.Execute)
-		planEng.SetStreamProvider(provider.ExecuteStream)
-	}
-
 	// ── EVENT BUS ──────────────────────────────────────────────────────────
-	// The single in-process event bus. The mode engines publish domain events
-	// headlessly (never calling UI routines directly); the UI subscribes below
-	// and acts purely as a projection of the event stream. It is the shared
-	// bus wired by the Application layer so the Runtime facade observes the
-	// same stream the engines publish onto.
+	// The single in-process event bus wired by the Application layer. The mode
+	// engines publish domain events headlessly (never calling UI routines
+	// directly); the UI subscribes below and acts purely as a projection of
+	// the event stream.
 	eventBus := app.Bus
 
-	// ── TELEMETRY → DOMAIN EVENT BRIDGE ──────────────────────────────────
-	// Adapter First, Delete Later: the legacy telemetry EventBus stays, and a
-	// TelemetryAdapter subscribes to it and forwards every Layer 0-5 event onto
-	// the unified domain event bus as an events.Envelope. Forwarding is
-	// non-blocking end to end — a slow UI projection drops, never stalls the
-	// pipeline. The adapter lives for the program lifetime (like every other
-	// bus subscription); the process exits tear it down.
-	telemetryAdapter := telemetry.NewTelemetryAdapter(telemetryBus, eventBus, "telemetry.pipeline")
-	_ = telemetryAdapter.Start()
-
+	// ── PRESENTATION BRIDGE ───────────────────────────────────────────────
 	presenter := presentation.New(app.Runtime)
-
-	var detectedLang language.ID
-	if detection.Primary != nil {
-		detectedLang = detection.Primary.ID
-	}
-
-	execEng := execution.NewEngine(root, cfg, sess, detectedLang)
-	execEng.SetPlanStore(planStore)
 
 	// ── STRICT LOCAL-FIRST ONBOARDING DETECTOR ────────────────────────
 	// The init gate MUST be driven exclusively by the CURRENT local repo.
@@ -246,122 +138,28 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 	reg.Register(modes.ModeInvestigate, investigateView{})
 	reg.Register(modes.ModeReview, reviewView{})
 
-	// ── CONTROL PLANE: RuntimeContext + WorkflowStateMachine ──────────────
-	// These are the single source of truth for capability flags, budget
-	// counters, artifact lifecycle states, and workflow state. The UI reads
-	// them directly and MUST NOT cache or duplicate these values.
-	caps := capability.NewCapabilitySet()
-	caps.Grant(capability.CapabilityRead)
-	caps.Grant(capability.CapabilityWrite)
-	caps.Grant(capability.CapabilityExecute)
-	caps.Grant(capability.CapabilityTest)
-	caps.Grant(capability.CapabilityPatch)
-	caps.Grant(capability.CapabilityCheckpoint)
-	caps.Grant(capability.CapabilityRollback)
-	artStore := artifact.NewStore(root)
-	bgt := budget.NewBudget(
-		100,            // max files
-		5000,           // max diff lines
-		1_000_000,      // max tokens
-		10,             // max attempts
-		30*time.Second, // max duration per step
-		5,              // max concurrent commands
-	)
-
-	// ── WORKSPACE SNAPSHOT + CAPABILITY REGISTRY ─────────────────────────
-	// The snapshot cache is the single source of truth for workspace state.
-	// The capability registry maps detected archetypes to allowed diagnostic
-	// capabilities, preventing dispatch of irrelevant tools (e.g., Go build
-	// on pure HTML/CSS projects).
-	snapCache := wssnapshot.NewSnapshotCache()
-	capReg := wscap.NewArchetypeCapabilityRegistry()
-	_, _ = snapCache.GetSnapshot(root) // prime the cache
-
-	runtimeCtx := runtime.NewWithSnapRegistry(artStore, caps, bgt, snapCache, capReg)
-
-	// Wire snapshot cache and capability registry into the plan engine for
-	// archetype-aware diagnostic gating.
-	planEng.WithSnapshotCache(snapCache).WithCapabilityRegistry(capReg)
-	// Wire the event bus so /plan runs headless and publishes domain events.
-	planEng.WithEventBus(eventBus)
-
-	workflowSM := workflow.NewWorkflowStateMachine()
-	wcc := control.NewWorkflowCheckpointManager(execEng.Checkpoints, root)
-	workflowSM.WithCheckpointCoordinator(workflow.NewCheckpointCoordinator(wcc))
-
-	// ── HYBRID INTENT GATEWAY ────────────────────────────────────────────
-	// The new router package runs the deterministic fast path FIRST and only
-	// falls back to the semantic IntentClassifier (a provider-backed
-	// PromptIntentClassifier adapted via LLMClassifyFunc) when no deterministic
-	// signal matches. It depends solely on the abstract IntentClassifier and
-	// the event bus — no concrete provider is imported here.
-	var intentRouter *router.Router
-	if provider != nil {
-		intentRouter = router.NewRouter(
-			router.NewPromptIntentClassifier(func(ctx context.Context, systemPrompt, userInput string) (string, error) {
-				resp, err := provider.Execute(ctx, ai.Request{
-					System:         systemPrompt,
-					Messages:       []ai.Message{{Role: "user", Content: userInput}},
-					MaxTokens:      64,
-					Temperature:    0.0,
-					ResponseFormat: &ai.ResponseFormat{Type: "json_object"},
-				})
-				if err != nil {
-					return "", err
-				}
-				return resp.Content, nil
-			}),
-			nil,
-		).WithEventBus(eventBus)
-	}
-
-	// ── EXECUTION ORCHESTRATOR ───────────────────────────────────────────
-	// The orchestrator maps the logical execution phases onto the single
-	// WorkflowStateMachine while sharing the persistent RuntimeContext created
-	// above. Mode switches update the active phase dynamically WITHOUT
-	// resetting conversation history or workspace artifacts (the RuntimeContext
-	// is never replaced). Phase changes are observed via EventPhaseChanged.
-	orch := orchestrator.New(workflowSM, runtimeCtx).WithEventBus(eventBus).WithPipeline(pipelineEng)
-
-	// ── MULTI-TIER PATCH ENGINE ──────────────────────────────────────────
-	// The new patch engine replaces the legacy patch application pipeline in
-	// the /build flow: Tier 1 (structured diff) -> Tier 2 (SEARCH/REPLACE) ->
-	// Tier 3 (whole-file rewrite) -> Tier 4 (human approval). It emits
-	// PatchParsed/PatchValidated/PatchRejected/ApprovalRequested on the bus.
-	patchEng := patch.NewEngine().WithEventBus(eventBus)
-
-	// ── AUTHORIZATION ENGINE ───────────────────────────────────────────────
-	// Production AuthorizationEngine wired with a no-op source hash verifier
-	// and a checkpoint checker that inspects .izen/checkpoints/ on disk.
-	// The getState closure reads the current workflow state from the SM.
-	authEngine := authorization.NewProductionAuthorizationEngine(root, func() workflow.WorkflowState {
-		return workflowSM.State()
-	})
-	mb := budget.DefaultMicroBudget()
-	microBudget := &mb
-
 	m := &model{
 		cfg:                 cfg,
-		runtimeCtx:          runtimeCtx,
-		workflowSM:          workflowSM,
-		authEngine:          authEngine,
-		mutationBudget:      bgt,
-		microBudget:         microBudget,
-		caps:                caps,
-		sess:                sess,
+		runtimeCtx:          app.RuntimeCtx,
+		workflowSM:          app.WorkflowSM,
+		authEngine:          app.Auth,
+		mutationBudget:      app.Budget,
+		microBudget:         app.MicroBudget,
+		caps:                app.Caps,
+		sess:                app.Session(),
 		provider:            provider,
-		mgr:                 mgr,
-		gitEng:              eng,
+		mgr:                 app.Manager(),
+		gitEng:              app.Git,
 		graph:               g,
-		leaEng:              leaEng,
+		leaEng:              app.Lea,
 		extractorRegistry:   retrieval.NewPolyglotRegistry(),
 		resolver:            modes.NewResolver(),
 		attachedFiles:       make([]string, 0),
-		execEng:             execEng,
-		planStore:           planStore,
-		planEngine:          planEng,
-		microkernel:         plan.NewMicrokernelPlanner(root),
-		intentCompiler:      plan.NewIntentCompilerPlanner(root),
+		execEng:             app.Execution,
+		planStore:           app.PlanStore,
+		planEngine:          app.PlanEngine,
+		microkernel:         app.Microkernel,
+		intentCompiler:      app.IntentCompiler,
 		ledger:              NewContextLedger(),
 		ti:                  ti,
 		showBanner:          true,
@@ -382,10 +180,11 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 		bus:                 eventBus,
 		rt:                  app.Runtime,
 		pres:                presenter,
-		intentRouter:        intentRouter,
-		orch:                orch,
-		pipelineEngine:      pipelineEng,
-		patchEngine:         patchEng,
+		intentRouter:        app.IntentRouter,
+		orch:                app.Orchestrator,
+		pipelineEngine:      app.Pipeline,
+		patchEngine:         app.Patch,
+		viewState:           presentation.NewWorkflowViewState(),
 		toolCallBuffer:      execution.NewToolCallBuffer(root),
 		thinkingPanel:       NewThinkingPanel(),
 		liveCodePreview:     NewLiveCodePreview(),
@@ -413,7 +212,7 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 		m.indexingStatus = "indexing"
 	}
 
-	m.resolver.Set(sess.Mode)
+	m.resolver.Set(app.Session().Mode)
 	m.loadHistory()
 	m.historyIndex = len(m.history)
 
@@ -465,15 +264,15 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 	// and silently bypass the setup wizard. Once indexed, /arch and the
 	// context planner read straight from the Lea graph. The graphBuiltMsg
 	// drives the model's indexingStatus and populates the file-centric graph.
-	if initStage == initComplete && state.HasLocalState(root) {
+	if initStage == initComplete && state.HasLocalState(root) && app.Lea != nil {
 		go func() {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			if err := leaEng.Start(ctx); err != nil {
+			if err := app.Lea.Start(ctx); err != nil {
 				p.Send(graphBuiltMsg{err: err})
 				return
 			}
-			p.Send(graphBuiltMsg{graph: leaEng.FileGraph()})
+			p.Send(graphBuiltMsg{graph: app.Lea.FileGraph()})
 		}()
 	}
 
@@ -496,11 +295,17 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 	// goroutine, so a bus dispatch goroutine can bridge into the UI safely.
 	// Subscriptions happen after the program exists because nothing runs before
 	// p.Run(); any event published before then is simply dropped (non-blocking).
+	//
+	// EventPhaseChanged and EventApprovalRequested additionally drive the
+	// derived UI-state projection (presentation.WorkflowViewState): the
+	// AwaitingApproval/Processing presentation states are a pure function of
+	// the canonical workflow state, never independent UI flags.
 	for _, typ := range []string{
 		events.EventPatchAttempted,
 		events.EventEngineTelemetry,
 		events.EventReasoningStream,
 		events.EventIntentClassified,
+		events.EventPhaseChanged,
 		events.EventApprovalRequested,
 	} {
 		eventBus.Subscribe(typ, func(ev events.DomainEvent) {
@@ -556,80 +361,6 @@ func gitUsername(root string) string {
 	return ""
 }
 
-func bootCommon(root string, cfg *config.Config) (*session.Session, *ai.Manager, *retrieval.Router) {
-	sess, err := session.Load()
-	if err != nil {
-		sess = session.New()
-	}
-
-	_ = audit.NewLogger(root)
-
-	mgr := ai.NewManager()
-
-	if provCfg, ok := cfg.AI.Providers["ollama"]; ok && provCfg.APIKey != "" {
-		mgr.Register("ollama", providers.NewOllamaProvider(provCfg.BaseURL, provCfg.APIKey, provCfg.DefaultModel))
-	}
-
-	if provCfg, ok := cfg.AI.Providers["openrouter"]; ok && provCfg.APIKey != "" {
-		mgr.Register("openrouter", providers.NewOpenRouterProvider(provCfg.APIKey, provCfg.DefaultModel, provCfg.BaseURL))
-	}
-
-	if provCfg, ok := cfg.AI.Providers["openai"]; ok && provCfg.APIKey != "" {
-		mgr.Register("openai", providers.NewOpenAIProvider(provCfg.APIKey, provCfg.DefaultModel))
-	}
-
-	if provCfg, ok := cfg.AI.Providers["anthropic"]; ok && provCfg.APIKey != "" {
-		mgr.Register("anthropic", providers.NewClaudeProvider(provCfg.APIKey, provCfg.DefaultModel))
-	}
-
-	if provCfg, ok := cfg.AI.Providers["gemini"]; ok && provCfg.APIKey != "" {
-		mgr.Register("gemini", providers.NewGeminiProvider(provCfg.APIKey, provCfg.DefaultModel))
-	}
-
-	if provCfg, ok := cfg.AI.Providers["groq"]; ok && provCfg.APIKey != "" {
-		mgr.Register("groq", providers.NewGroqProvider(provCfg.APIKey, provCfg.DefaultModel, provCfg.BaseURL))
-	}
-
-	if provCfg, ok := cfg.AI.Providers["opencode"]; ok && provCfg.APIKey != "" {
-		mgr.Register("opencode", providers.NewOpenCodeProvider(provCfg.APIKey, provCfg.DefaultModel, provCfg.BaseURL))
-	}
-
-	if provCfg, ok := cfg.AI.Providers["9router"]; ok && provCfg.APIKey != "" {
-		mgr.Register("9router", providers.NewNineRouterProvider(provCfg.APIKey, provCfg.DefaultModel, provCfg.BaseURL))
-	}
-
-	defaultProvider := cfg.ActiveProviderName()
-	mgr.SetDefault(defaultProvider)
-
-	// Create the search router — auto-detects lx in PATH.
-	activityFn := func(format string, args ...interface{}) {
-		fmt.Fprintf(os.Stderr, format+"\n", args...)
-	}
-	router := retrieval.NewRouter(root, activityFn)
-	retrieval.SetGlobalRouter(router)
-
-	return sess, mgr, router
-}
-
-// pipelineClient adapts an ai.Provider onto the pipeline engine's stateless
-// WorkerClient contract. The provider's rendered prompt is delivered as the
-// user turn; model routing is handled by the pipeline router, not here.
-func pipelineClient(p ai.Provider) *pipeline.FuncClient {
-	if p == nil {
-		return pipeline.NewFuncClient(nil)
-	}
-	return pipeline.NewFuncClient(func(ctx context.Context, provider, model, prompt string) (string, layer3.TokenUsage, error) {
-		resp, err := p.Execute(ctx, ai.Request{
-			Messages: []ai.Message{{Role: "user", Content: prompt}},
-			Model:    model,
-		})
-		if err != nil {
-			return "", layer3.TokenUsage{}, err
-		}
-		return resp.Content, layer3.TokenUsage{Input: resp.TokenInput, Output: resp.TokenOutput}, nil
-	})
-}
-
 func runProgram(p *tea.Program, root string, initStage initStage) {
 	configCh := make(chan bool, 1)
 	config.StartConfigWatcher(configCh)
@@ -645,23 +376,13 @@ func runProgram(p *tea.Program, root string, initStage initStage) {
 	}
 }
 
-func RunMainDashboard(cfg *config.Config, root string, localCfg *config.LocalConfig, det ...project.Detection) {
-	app, err := compose.Wire(compose.WithAuditDir(filepath.Join(root, ".izen", "audit")))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "izen: wire application layer: %v\n", err)
-		os.Exit(1)
-	}
-	RunMainDashboardWithApp(cfg, root, localCfg, app, det...)
-}
-
 // RunMainDashboardWithApp is the composition-root entry point: it launches the
-// main TUI dashboard bound to an externally wired Application layer (shared
-// bus + Runtime facade). The runtime is injected into the presentation layer
-// here, satisfying the RFC single-entry-point invariant.
+// main TUI dashboard bound to the fully-wired Application layer (shared bus +
+// Runtime facade + complete engine tree). The composition root (cmd/izen)
+// builds app once via compose.Wire and injects it here, satisfying the RFC
+// single-entry-point invariant — no engine is ever instantiated in this
+// package.
 func RunMainDashboardWithApp(cfg *config.Config, root string, localCfg *config.LocalConfig, app *compose.Application, det ...project.Detection) {
-	sess, mgr, router := bootCommon(root, cfg)
-	_ = router // router is registered globally via SetGlobalRouter
-
 	detection := project.Detection{}
 	if len(det) > 0 {
 		detection = det[0]
@@ -680,19 +401,20 @@ func RunMainDashboardWithApp(cfg *config.Config, root string, localCfg *config.L
 		initStage = initNone
 	}
 
-	p := NewProgramWithApp(root, cfg, sess, mgr, localCfg, app, detection)
+	p := NewProgramWithApp(root, cfg, localCfg, app, detection)
 	runProgram(p, root, initStage)
 }
 
-func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalConfig, det ...project.Detection) {
-	sess, mgr, router := bootCommon(root, cfg)
-	_ = router
-
+func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalConfig, app *compose.Application, det ...project.Detection) {
 	// ── VIRTUAL SNAPSHOT ROLLBACK ────────────────────────────────
-	// Create an execution engine and rollback any in-flight patches.
+	// Roll back any in-flight patches using the execution engine wired by the
+	// composition root.
 	fmt.Fprintf(os.Stderr, "izen: running rollback engine for %s...\n", root)
-	execEng := execution.NewEngine(root, cfg, sess)
-	errs := execEng.RollbackTransaction()
+	if app == nil || app.Execution == nil {
+		fmt.Fprintln(os.Stderr, "izen: rollback unavailable — no execution engine wired.")
+		return
+	}
+	errs := app.Execution.RollbackTransaction()
 	if len(errs) > 0 {
 		for _, err := range errs {
 			fmt.Fprintf(os.Stderr, "izen: rollback error: %v\n", err)
@@ -719,7 +441,7 @@ func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalCo
 		initStage = initNone
 	}
 
-	p := NewProgram(root, cfg, sess, mgr, localCfg, detection)
+	p := NewProgramWithApp(root, cfg, localCfg, app, detection)
 	runProgram(p, root, initStage)
 }
 
