@@ -320,7 +320,7 @@ func (planView) BuildWorkspace(m *model) Workspace {
 		if m.planApproved {
 			actions = append(actions, Action{
 				ID:       "execute-build",
-				Label:    "▶ Execute Build",
+				Label:    Icon.Execute + " Execute Build",
 				Shortcut: "alt+b",
 				Command:  "/build",
 				Enabled:  true,
@@ -328,7 +328,7 @@ func (planView) BuildWorkspace(m *model) Workspace {
 			})
 			actions = append(actions, Action{
 				ID:       "reject-plan",
-				Label:    "✗ Reset & Clear",
+				Label:    Icon.Error + " Reset & Clear",
 				Shortcut: "alt+r",
 				Command:  "/ask",
 				Enabled:  true,
@@ -337,7 +337,7 @@ func (planView) BuildWorkspace(m *model) Workspace {
 		} else {
 			actions = append(actions, Action{
 				ID:       "approve-plan",
-				Label:    "✓ Approve & Run /build",
+				Label:    Icon.Success + " Approve & Run /build",
 				Shortcut: "alt+p",
 				Command:  "/build",
 				Enabled:  true,
@@ -345,7 +345,7 @@ func (planView) BuildWorkspace(m *model) Workspace {
 			})
 			actions = append(actions, Action{
 				ID:       "reject-plan",
-				Label:    "✗ Reject & Back",
+				Label:    Icon.Error + " Reject & Back",
 				Shortcut: "alt+r",
 				Command:  "/ask",
 				Enabled:  true,

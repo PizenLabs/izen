@@ -113,7 +113,7 @@ func (tp *ThinkingPanel) Render(width int, spinnerText string) string {
 
 	if !expanded {
 		elapsedStr := fmt.Sprintf("%.0fs", elapsed.Seconds())
-		status := fmt.Sprintf("%s Thinking... %s  %s", spinnerText, elapsedStr, mutedStyle.Render("[Alt+O to expand]"))
+		status := fmt.Sprintf("%s Thinking... %s  %s", spinnerText, elapsedStr, mutedStyle.Render("[Ctrl+O to expand]"))
 		return dimmedStyle.Render(status)
 	}
 
@@ -236,9 +236,9 @@ func (lcp *LiveCodePreview) RenderPreview(width int) string {
 
 	var b strings.Builder
 	for _, p := range previews {
-		icon := "📝"
+		icon := Icon.Edit
 		if p.IsNew {
-			icon = "✨"
+			icon = Icon.Spark
 		}
 		lines := strings.Count(p.Content, "\n") + 1
 		fmt.Fprintf(&b, "  %s %s (%d lines)\n", icon, p.Path, lines)

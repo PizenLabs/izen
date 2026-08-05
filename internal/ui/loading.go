@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -16,7 +17,7 @@ import (
 // the loop gated on the model's own lifecycle flag.
 type shimmerFrameMsg = shimmer.FrameMsg
 
-// shimmerTickCmd schedules the next 50ms shimmer animation frame. It returns
+// shimmerTickCmd schedules the next ~100ms shimmer animation frame. It returns
 // nil when the shimmer is inactive, so the tick loop self-terminates the
 // moment streaming output begins or a background producer completes (smooth
 // clearing with no leaked goroutine).
@@ -24,12 +25,18 @@ type shimmerFrameMsg = shimmer.FrameMsg
 // This also advances the spinner frame so the animated snowflake character
 // (✻ ❅ ❆ ✦) cycles on the shimmer tick cadence, keeping the snowflake
 // animation in sync with the shimmer sweep.
+//
+// UNIFIED TICK RATE: the frame is produced directly (not via shimmer.Tick) so
+// every animation loop in the UI — shimmer, braille spinner, snowflake — runs
+// on the same ~100ms cadence regardless of provider or mode.
 func (m *model) shimmerTickCmd() tea.Cmd {
 	if !m.shimmerActive {
 		return nil
 	}
 	m.spinnerFrame++
-	return shimmer.Tick()
+	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+		return shimmer.FrameMsg{}
+	})
 }
 
 // syncShimmerWidth keeps the sweep span aligned with the current pane width.
@@ -174,7 +181,8 @@ func (m *model) renderLoadingDock() string {
 func (m *model) composeDockTextWithFlake(flake string) string {
 	if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 && !m.thinkingBuffer.Complete() {
 		elapsed := m.thinkingBuffer.Elapsed()
-		return fmt.Sprintf("%s Thinking... (%s)", flake, formatElapsed(elapsed))
+		return fmt.Sprintf("%s Thinking... (%s)  %s", flake, formatElapsed(elapsed),
+			dimmedStyle.Render("[Ctrl+O to expand]"))
 	}
 	if m.shimmerText != "" {
 		return flake + " " + m.shimmerText
@@ -184,5 +192,5 @@ func (m *model) composeDockTextWithFlake(flake string) string {
 
 // composeDockText builds the dynamic status text using the default snowflake.
 func (m *model) composeDockText() string {
-	return m.composeDockTextWithFlake("✦")
+	return m.composeDockTextWithFlake(SpinnerSnowflake())
 }

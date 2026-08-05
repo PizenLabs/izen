@@ -132,7 +132,7 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 
 	case strings.HasPrefix(line, "### "):
 		// H3: blue — section subheadings
-		return "\n" + mdH3Style.Render("▸ "+strings.TrimSpace(line[4:]))
+		return "\n" + mdH3Style.Render(Icon.Chevron+" "+strings.TrimSpace(line[4:]))
 
 	case strings.HasPrefix(line, "## "):
 		// H2: bold text — major section heading
@@ -145,7 +145,7 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 
 	if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
 		content := strings.TrimSpace(trimmed[2:])
-		return mdBulletStyle.Render("• ") + applyInlineStyles(content)
+		return mdBulletStyle.Render(Icon.Bullet) + " " + applyInlineStyles(content)
 	}
 
 	if len(trimmed) > 2 && trimmed[0] >= '0' && trimmed[0] <= '9' && trimmed[1] == '.' && trimmed[2] == ' ' {

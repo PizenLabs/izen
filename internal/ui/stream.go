@@ -68,6 +68,15 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	if content == "" {
 		return nil
 	}
+
+	// ── PER-TURN CONTEXT GOVERNANCE ──────────────────────────────────
+	// The /ask async prep (prepareAskStreamCmd) sets askContextGoverned when it
+	// already assembled context. Capture it here and clear it IMMEDIATELY so a
+	// stale marker can never survive an early return (nil provider, local
+	// intent intercept) and leak into the next turn.
+	plannerGoverned := m.askContextGoverned && m.resolver.Current() == modes.ModeAsk
+	m.askContextGoverned = false
+
 	content = agents.InjectObjectiveContext(content, m.sess.ObjectiveState)
 	if m.streamCh != nil {
 		m.push(roleSystem, "Stream blocked: task active.")
@@ -170,13 +179,12 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// the source of hallucinated RAG context on short inputs.
 	if m.workspaceRoot != "" && !gateway.IsCasualChat(content) {
 		// CONTEXT GOVERNANCE (P3): When the Context Planner already governed
-		// the /ask turn (planContextForAsk assembled budget-fitted context and
+		// the /ask turn (prepareAskStreamCmd assembled budget-fitted context and
 		// routed @file references through the FileSource adapter), the
 		// ungoverned file-read fallback is skipped entirely. Otherwise —
 		// non-/ask paths and graph-less /ask setups — @file reads go through
 		// the planner's governed ResolveFileContext when a planner is wired,
 		// degrading to an isolated read only when no planner exists.
-		plannerGoverned := m.askContextGoverned && m.resolver.Current() == modes.ModeAsk
 		if !plannerGoverned {
 			augmented := m.injectFileContext(m.workspaceRoot, content, msgs[len(msgs)-1].Content)
 			if augmented != "" {
@@ -184,9 +192,6 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			}
 		}
 	}
-	// Always clear the per-turn governance flag so a stale marker from a
-	// previous turn can never suppress the fallback read on a later one.
-	m.askContextGoverned = false
 
 	var systemPrompt string
 	var maxTokens int
@@ -303,7 +308,8 @@ func (m *model) streamCmd(content string) tea.Cmd {
 }
 
 // streamTraceCmd emits the most recent /ask planner trace (thought-route panel)
-// as a traceUpdateMsg, if one was produced by planContextForAsk. tea.Batch
+// as a traceUpdateMsg, if one was produced by the async ask prep
+// (prepareAskStreamCmd). tea.Batch
 // drops nil cmds, so returning nil when there is no trace is safe.
 func (m *model) streamTraceCmd() tea.Cmd {
 	if m.lastAskTrace == nil {

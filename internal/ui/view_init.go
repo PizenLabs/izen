@@ -114,7 +114,7 @@ func (m *model) renderInitGitCheck(width int) string {
 		b.WriteString("\n\n")
 	}
 
-	choice := "  " + initGreenStyle.Render("●") + initTextStyle.Render(" Initialize git") + "    " + initDimmedStyle.Render("○ Skip")
+	choice := "  " + initGreenStyle.Render(Icon.Check) + initTextStyle.Render(" Initialize git") + "    " + initDimmedStyle.Render(Icon.Pending+" Skip")
 	b.WriteString(choice)
 	b.WriteString("\n")
 	b.WriteString(initDimmedStyle.Render("  (press ") + initCyanStyle.Render("Y") + initDimmedStyle.Render(" to init with 'main' branch, ") + initCyanStyle.Render("N") + initDimmedStyle.Render(" to skip)"))
@@ -133,7 +133,7 @@ func (m *model) renderInitConfirm(width int) string {
 	b.WriteString(initDimmedStyle.Render("This quick setup configures your workspace identity and AI provider."))
 	b.WriteString("\n\n")
 
-	choice := "  " + initGreenStyle.Render("●") + initTextStyle.Render(" Yes") + "    " + initDimmedStyle.Render("○ No")
+	choice := "  " + initGreenStyle.Render(Icon.Check) + initTextStyle.Render(" Yes") + "    " + initDimmedStyle.Render(Icon.Pending+" No")
 	b.WriteString(choice)
 	b.WriteString("\n")
 	b.WriteString(initDimmedStyle.Render("  (press ") + initCyanStyle.Render("Y") + initDimmedStyle.Render(" to begin, ") + initCyanStyle.Render("N") + initDimmedStyle.Render(" to skip)"))
@@ -179,7 +179,7 @@ func (m *model) renderInitProviderSelect(width int) string {
 	if len(items) > m.initProviderIdx && m.initProviderIdx >= 0 {
 		selected := items[m.initProviderIdx]
 		if envVar := envVarForProvider(selected); envVar != "" && os.Getenv(envVar) != "" {
-			b.WriteString(initGreenStyle.Render("  ● " + envVar + " detected from environment. Ready!"))
+			b.WriteString(initGreenStyle.Render("  " + Icon.Check + " " + envVar + " detected from environment. Ready!"))
 			b.WriteString("\n\n")
 		}
 	}
@@ -191,10 +191,10 @@ func (m *model) renderInitProviderSelect(width int) string {
 
 	activeProvider := m.getActiveProviderName()
 	for i, item := range items {
-		glyph := "○"
+		glyph := Icon.Pending
 		style := initDimmedStyle
 		if i == m.initProviderIdx {
-			glyph = "●"
+			glyph = Icon.Check
 			style = initGreenStyle
 		}
 		status := ""
@@ -204,7 +204,7 @@ func (m *model) renderInitProviderSelect(width int) string {
 		envVar := envVarForProvider(item)
 		if envVar != "" && os.Getenv(envVar) != "" {
 			if status == "" {
-				status = initGreenStyle.Render(" ✓")
+				status = initGreenStyle.Render(" " + Icon.Success)
 			}
 		}
 		line := fmt.Sprintf("  %s %s%s", style.Render(glyph), initTextStyle.Render(item), status)
@@ -230,15 +230,15 @@ func (m *model) renderInitFirstRun(width int) string {
 	b.WriteString("\n\n")
 
 	if gitExists {
-		b.WriteString(initGreenStyle.Render("  ●") + initTextStyle.Render(" Git repository detected"))
+		b.WriteString(initGreenStyle.Render("  "+Icon.Check) + initTextStyle.Render(" Git repository detected"))
 	} else {
-		b.WriteString(initRedStyle.Render("  ○") + initTextStyle.Render(" No Git repository found"))
+		b.WriteString(initRedStyle.Render("  "+Icon.Pending) + initTextStyle.Render(" No Git repository found"))
 		b.WriteString("\n")
 		b.WriteString(initDimmedStyle.Render("  (press ") + initCyanStyle.Render("G") + initDimmedStyle.Render(" to initialize git on the 'main' branch)"))
 	}
 	b.WriteString("\n\n")
 
-	choice := "  " + initGreenStyle.Render("●") + initTextStyle.Render(" Begin setup") + "    " + initDimmedStyle.Render("○ Skip")
+	choice := "  " + initGreenStyle.Render(Icon.Check) + initTextStyle.Render(" Begin setup") + "    " + initDimmedStyle.Render(Icon.Pending+" Skip")
 	b.WriteString(choice)
 	b.WriteString("\n")
 	b.WriteString(initDimmedStyle.Render("  (press ") + initCyanStyle.Render("Enter") + initDimmedStyle.Render(" to begin setup)"))

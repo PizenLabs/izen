@@ -169,7 +169,7 @@ func (m *model) renderRouteConfirmPrompt(width int) string {
 		marker := "  "
 		num := " "
 		if i == m.pendingRouteIdx {
-			marker = "▸ "
+			marker = Icon.Chevron + " "
 			num = fmt.Sprintf("%d", i+1)
 		}
 		label := opt.String()

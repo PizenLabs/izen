@@ -236,7 +236,7 @@ func renderListItem(node *ast.ListItem, width int, source []byte, ordered bool, 
 			if ordered {
 				bullet = mdBulletStyle.Render(mdIntToStr(index) + ". ")
 			} else {
-				bullet = mdBulletStyle.Render("• ")
+				bullet = mdBulletStyle.Render(Icon.Bullet + " ")
 			}
 
 			for i, line := range wrapped {

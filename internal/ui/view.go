@@ -352,14 +352,14 @@ func (m *model) renderToolCallApprovalBlock(width int) string {
 		boxWidth = 40
 	}
 
-	title := permissionTitleStyle.Render("▲ CODE MUTATION REQUIRES APPROVAL")
+	title := permissionTitleStyle.Render(Icon.Warning + " CODE MUTATION REQUIRES APPROVAL")
 	b.WriteString(title + "\n")
 
 	// List each pending tool call
 	for i, tc := range pending {
-		icon := "✏"
+		icon := Icon.Edit
 		if tc.IsNew {
-			icon = "✨"
+			icon = Icon.Spark
 		}
 		fmt.Fprintf(&b, "  %s %s\n", icon, tc.Path)
 		if tc.Diff != "" {
@@ -696,13 +696,13 @@ func (m *model) renderRuntimeStatus(width int) string {
 	if m.streaming || m.agentRunning || m.reviewRunning || m.shellRunning || m.state == StateProcessing {
 		b.WriteString(m.renderRectSpinner())
 	} else {
-		b.WriteString(dimmedStyle.Render("●"))
+		b.WriteString(dimmedStyle.Render(Icon.Check))
 	}
 	b.WriteByte(' ')
 
 	// AI INTERRUPT ENGINE: high-visibility indicator when streaming
 	if m.streaming || m.shellRunning {
-		b.WriteString(interruptLabelStyle.Render("⏹ Ctrl+C interrupt "))
+		b.WriteString(interruptLabelStyle.Render(Icon.Interrupt + " Ctrl+C interrupt "))
 	}
 
 	// Agent label — shown immediately after the spinner, before model name

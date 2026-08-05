@@ -1375,11 +1375,11 @@ func (m *model) renderArchFull() string {
 		var prefix string
 		switch ob.Severity {
 		case sevOK:
-			prefix = greenStyle.Render("  ✓")
+			prefix = greenStyle.Render("  " + Icon.Success)
 		case sevWarn:
 			prefix = yellowStyle.Render("  ⚠")
 		default:
-			prefix = mutedStyle.Render("  ●")
+			prefix = mutedStyle.Render("  " + Icon.Check)
 		}
 		fmt.Fprintf(&b, "%s  %s\n", prefix, textStyle.Render(ob.Text))
 	}
@@ -1407,10 +1407,10 @@ func (m *model) renderArchFull() string {
 	b.WriteString("\n")
 
 	if len(r.Cycles) == 0 {
-		fmt.Fprintf(&b, "  %s  %s\n", greenStyle.Render("●"), mutedStyle.Render("No circular dependencies detected"))
+		fmt.Fprintf(&b, "  %s  %s\n", greenStyle.Render(Icon.Check), mutedStyle.Render("No circular dependencies detected"))
 	} else {
 		for _, cycle := range r.Cycles {
-			fmt.Fprintf(&b, "  %s  %s\n", redStyle.Render("◆"), textStyle.Render("Circular: "+strings.Join(cycle, " → ")))
+			fmt.Fprintf(&b, "  %s  %s\n", redStyle.Render(Icon.Risk), textStyle.Render("Circular: "+strings.Join(cycle, " → ")))
 		}
 	}
 	b.WriteString("\n")

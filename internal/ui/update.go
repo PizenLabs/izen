@@ -305,7 +305,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// the next tick. When idle we return nil and the loop stops — no
 		// custom tick-source ownership, no locks, no deadlock.
 		hasActiveWork := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning ||
-			m.shellRunning || m.state == StateProcessing || m.state == StateAwaitingApproval
+			m.shellRunning || m.state == StateProcessing || m.state == StateAwaitingApproval || m.shimmerActive
 		if hasActiveWork {
 			// Keep the activity heartbeat fresh while any execution indicator
 			// is live. The idle-gate in the reconcile block above relies on
@@ -1809,8 +1809,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// buffer is empty, so gating only on those would let the loop die and
 		// starve the event loop (frozen UI). m.planPending / m.agentRunning /
 		// m.shellRunning are the authoritative "a background op is still in
-		// flight" signals.
-		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.planPending || m.shellRunning {
+		// flight" signals. m.shimmerActive is included so the loop survives
+		// the async /ask context-prep window (shimmer live, stream not yet
+		// started) and any cloud-provider burst that momentarily empties the
+		// stream flags.
+		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.planPending || m.shellRunning || m.shimmerActive {
 			m.streamTickActive = true
 			return m, m.smoothStreamTickCmd()
 		}
@@ -1819,13 +1822,23 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case shimmerFrameMsg:
-		// ── SHIMMER ANIMATION TICK (~50ms) ──────────────────────────
-		// Forwards the frame to the shimmer component, which re-schedules the
-		// next tick while Active. When shimmerActive has been cleared (first
+		// ── SHIMMER ANIMATION TICK (~100ms) ─────────────────────────
+		// Forwards the frame to the shimmer component, which advances its
+		// sweep; the next frame is then re-scheduled on the unified ~100ms
+		// shimmer tick (m.shimmerTickCmd) so every animation loop in the UI
+		// runs on the same cadence. When shimmerActive has been cleared (first
 		// stream token, task completion, or a reconcile pass) the loop drops
 		// out here without re-scheduling — the graceful stop that replaces the
 		// animated loading line with the streaming output.
-		if !m.shimmerActive {
+		//
+		// CLOUD-SPINNER GUARD: the loop MUST keep re-scheduling while either
+		// the shimmer is active OR a stream is live, regardless of provider
+		// type. Cloud providers (OpenRouter/Cohere) stream in bursts that can
+		// momentarily starve lower-priority tick messages; by re-arming here on
+		// every frame while streaming is true, the spinner can never die
+		// mid-answer. The inline braille spinner takes over from the snowflake
+		// once the first content token hands off the dock.
+		if !m.shimmerActive && !m.streaming {
 			return m, nil
 		}
 		// SAFETY NET: if every background producer has released its flags but
@@ -1836,12 +1849,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.stopShimmer()
 			return m, nil
 		}
-		var cmd tea.Cmd
-		m.shimmerAnim, cmd = m.shimmerAnim.Update(msg)
+		m.shimmerAnim, _ = m.shimmerAnim.Update(msg)
 		if m.Ready {
 			m.refreshViewportContent()
 		}
-		return m, cmd
+		// Re-arm the NEXT frame on the unified 100ms shimmer tick (the
+		// component's own Tick() cadence would otherwise drift from the rest
+		// of the animation layer).
+		return m, m.shimmerTickCmd()
 
 	case planSlowNoticeMsg:
 		// One-shot soft-timeout probe for /plan synthesis. Only act if THIS
@@ -1861,6 +1876,18 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			return m, m.flushPendingRecords()
 		}
 		return m, nil
+
+	case askStreamPreparedMsg:
+		// T=0MS ASYNC PREP RESOLUTION: the background /ask context assembly
+		// (planner query + fallback file reads) has completed. Apply its
+		// governance + trace flags, then run streamCmd synchronously on the
+		// event loop so ALL stream state mutations stay on the UI goroutine —
+		// no data race with the goroutine that produced this message.
+		m.askContextGoverned = msg.governed
+		if msg.trace != nil {
+			m.lastAskTrace = msg.trace
+		}
+		return m, m.streamCmd(msg.content)
 
 	case tokenMsg:
 		// LOCK-FREE CONSUMER: this per-token handler MUST NOT acquire any

@@ -24,7 +24,7 @@ var (
 	confirmedStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color(colorGreen)).
 			Bold(true)
-	confirmedPrefix = "● "
+	confirmedPrefix = Icon.Check + " "
 
 	hypothesisStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color(colorYellow)).
@@ -34,7 +34,7 @@ var (
 	unknownStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color(colorRed)).
 			Bold(true)
-	unknownPrefix = "◆ "
+	unknownPrefix = Icon.Risk + " "
 
 	errorClassStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color(colorMaroon)).

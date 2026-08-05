@@ -48,19 +48,19 @@ func renderFixedHeader(runtimeCtx *runtime.RuntimeContext, wfSM *workflow.Workfl
 
 	var b strings.Builder
 
-	b.WriteString(workflowStateStyle.Render("● " + strings.ToUpper(ws.String())))
+	b.WriteString(workflowStateStyle.Render(Icon.Check + " " + strings.ToUpper(ws.String())))
 
 	// Indexing status indicator
 	switch indexingStatus {
 	case "indexing":
 		b.WriteString("  ")
-		b.WriteString(indexingStyle.Render("⚡ Indexing..."))
+		b.WriteString(indexingStyle.Render(Icon.Index + " Indexing..."))
 	case "indexed":
 		b.WriteString("  ")
-		b.WriteString(indexedStyle.Render("✓ Indexed"))
+		b.WriteString(indexedStyle.Render(Icon.Success + " Indexed"))
 	case "error":
 		b.WriteString("  ")
-		b.WriteString(indexingStyle.Render("✗ Index error"))
+		b.WriteString(indexingStyle.Render(Icon.Error + " Index error"))
 	}
 
 	if runtimeCtx.Caps != nil {

@@ -259,7 +259,7 @@ func TestComposeDockTextStatic(t *testing.T) {
 	m := newTestModel()
 	m.startShimmer("Executing strategy...", "execute")
 	got := m.composeDockText()
-	if !strings.Contains(got, "✦") {
+	if !strings.Contains(got, "✻") {
 		t.Errorf("composeDockText missing snowflake: %q", got)
 	}
 	if !strings.Contains(got, "Executing strategy...") {
@@ -274,7 +274,7 @@ func TestComposeDockTextThinking(t *testing.T) {
 	m.thinkingBuffer.Append("analyzing code structure")
 
 	got := m.composeDockText()
-	if !strings.Contains(got, "✦") {
+	if !strings.Contains(got, "✻") {
 		t.Errorf("composeDockText missing snowflake: %q", got)
 	}
 	if !strings.Contains(got, "Thinking...") {
@@ -295,7 +295,7 @@ func TestComposeDockTextThinkingComplete(t *testing.T) {
 
 	got := m.composeDockText()
 	// When thinking is complete, should fall back to static shimmer text
-	if !strings.Contains(got, "✦ Thinking...") {
+	if !strings.Contains(got, "✻ Thinking...") {
 		t.Errorf("composeDockText should use static text after thinking complete: %q", got)
 	}
 }
@@ -303,8 +303,8 @@ func TestComposeDockTextThinkingComplete(t *testing.T) {
 func TestComposeDockTextFallback(t *testing.T) {
 	m := newTestModel()
 	got := m.composeDockText()
-	if got != "✦ Working..." {
-		t.Errorf("composeDockText fallback = %q, want '✦ Working...'", got)
+	if got != "✻ Working..." {
+		t.Errorf("composeDockText fallback = %q, want '✻ Working...'", got)
 	}
 }
 

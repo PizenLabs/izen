@@ -149,9 +149,9 @@ func (ls *LogStore) Entries() []LogEntry {
 // Collapsed: ✓ Edit(path/to/file.go) (ctrl+o to expand) [animated dots if in-progress]
 // Expanded:  shows full content, thinking, and system log below the summary.
 func RenderEntry(entry LogEntry, width int, dotFrame int) string {
-	icon := greenStyle.Render("✓")
+	icon := greenStyle.Render(Icon.Success)
 	if !entry.Success {
-		icon = redStyle.Render("✗")
+		icon = redStyle.Render(Icon.Error)
 	}
 
 	label := entry.Kind.String()

@@ -106,6 +106,20 @@ type traceUpdateMsg struct {
 	trace *ctxpkg.CodebaseTrace
 }
 
+// askStreamPreparedMsg carries the outcome of the async /ask context
+// assembly (Context Planner query + fallback file reads). It is produced by a
+// background tea.Cmd so the synchronous graph/file I/O never blocks the Bubble
+// Tea event loop on prompt submit — the Enter handler returns immediately with
+// the loading shimmer animating, and this message hands the fully assembled
+// content to streamCmd once the planner finishes.
+type askStreamPreparedMsg struct {
+	content string
+	// governed is true when the prep already assembled context (planned chunks
+	// OR the fallback @file reads), so streamCmd must not inject a second time.
+	governed bool
+	trace    *ctxpkg.CodebaseTrace
+}
+
 type streamErrMsg struct {
 	err     error
 	content string
@@ -592,7 +606,17 @@ var utilityCommands = map[modes.Mode][]string{
 
 var globalCommands = []string{"/help", "/?", "/usage", "/model", "/objective", "/drop", "/quit", "/arch"}
 
-var flowingSpinnerFrames = []string{" ✻ ", " ❅ ", " ❆ ", " ✦ "}
+// flowingSpinnerFrames is the space-padded snowflake sequence used by the
+// inline loading spinner. The glyphs themselves are the canonical
+// tokens.SpinnerSnowflakeFrames; only the padding is added here for the
+// inline status line's breathing room.
+var flowingSpinnerFrames = func() []string {
+	out := make([]string, len(SpinnerSnowflakeFrames))
+	for i, f := range SpinnerSnowflakeFrames {
+		out[i] = " " + f + " "
+	}
+	return out
+}()
 
 // providerSwitchMsg signals a successful provider switch.
 type providerSwitchMsg struct {
@@ -794,11 +818,11 @@ type model struct {
 	// AST/Code Graph trace for rendering the AI's thought route
 	currentTrace *ctxpkg.CodebaseTrace
 
-	// askContextGoverned is set by planContextForAsk when the Context Planner
-	// successfully assembled budget-fitted context for the current /ask turn.
-	// streamCmd reads and clears it so the fallback file-read path never
-	// injects the same @file context a second time when the planner already
-	// governed it.
+	// askContextGoverned is set by the async /ask context prep when it
+	// successfully assembled budget-fitted context for the current turn
+	// (planned chunks, or the fallback @file reads). streamCmd reads and
+	// clears it so the fallback file-read path never injects the same context
+	// a second time.
 	askContextGoverned bool
 
 	// lastAskTrace carries the most recent planner trace from /ask context
@@ -2756,7 +2780,7 @@ func (m *model) renderWorkspaceHeader() string {
 	var b strings.Builder
 	b.WriteString("\n")
 	b.WriteString("  ")
-	b.WriteString(modeNameStyle.Render("● " + modeName))
+	b.WriteString(modeNameStyle.Render(Icon.Check + " " + modeName))
 	b.WriteString("  " + dimmedStyle.Render(mode.Description()))
 	b.WriteString("\n\n")
 	return b.String()

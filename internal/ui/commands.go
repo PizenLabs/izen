@@ -199,7 +199,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 	// prefix and route this to a plain static /review, silently bypassing the
 	// dynamic-test-then-review composite shortcut).
 	if command.IsReviewTestComposite(line) {
-		m.push(roleSystem, accentStyle.Render("⚡ [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
+		m.push(roleSystem, accentStyle.Render(Icon.Index+" [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m.runReviewTestComposite()
@@ -468,7 +468,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 	m.pendingFileRefs = nil
 
 	// CONTEXT GOVERNANCE (P3): /ask context assembly is routed EXCLUSIVELY
-	// through the Context Planner (planContextForAsk → Planner.Plan()). Explicit
+	// through the Context Planner (prepareAskStreamCmd → Planner.Plan()). Explicit
 	// @file references are resolved by the planner's gatherFileRefs via the
 	// governed FileSource adapter; the fallback file-read path lives in
 	// streamCmd (injectFileContext) and is likewise planner-backed. No raw disk
@@ -796,11 +796,66 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		// before the context reaches the LLM. The injection is a strict
 		// additive enrichment: it degrades silently to the untouched input
 		// when no graph is ready or the plan yields no chunks.
+		//
+		// T=0MS ASYNC DISPATCH: the planner query + fallback file reads run on
+		// a background goroutine (prepareAskStreamCmd) so the Enter handler can
+		// return immediately with the loading shimmer animating. The assembled
+		// content is delivered as askStreamPreparedMsg, whose Update handler
+		// runs streamCmd synchronously on the event loop (all model mutations
+		// stay on the UI goroutine).
 		if m.resolver.Current() == modes.ModeAsk {
-			content = m.planContextForAsk(content)
+			// Local intent interception is cheap and MUST run first — a greeting
+			// ("hi") or identity question is answered locally with zero LLM or
+			// planner involvement, so casual chat never triggers a workspace
+			// scan. streamCmd runs the same check for non-/ask paths.
+			if response := m.interceptLocalIntent(content); response != "" {
+				m.push(roleAI, response)
+				return nil
+			}
+			return m.prepareAskStreamCmd(content)
 		}
 
 		return m.streamCmd(content)
+	}
+}
+
+// prepareAskStreamCmd assembles /ask context (Context Planner query + fallback
+// @file reads) on a background goroutine. It is the t=0ms async seam for the
+// prompt-submit hot path: the Enter handler dispatches it together with the
+// shimmer tick so the loading dock animates INSTANTLY while the planner scans
+// the workspace. The goroutine performs strictly read-only work — the planner
+// is pre-warmed on the event loop and captured, and no model field is written
+// — so there is no data race with the UI goroutine. All state mutations happen
+// in the askStreamPreparedMsg handler when the message lands.
+func (m *model) prepareAskStreamCmd(content string) tea.Cmd {
+	// Pre-warm the planner on the event loop (cheap construction — it only
+	// assembles adapters, it never queries) so the background goroutine reads
+	// an already-cached m.planner and can never race its lazy construction.
+	p := m.contextPlanner()
+	workspaceRoot := m.workspaceRoot
+	return func() tea.Msg {
+		prepared := content
+		governed := false
+		var trace *ctxpkg.CodebaseTrace
+		if p != nil {
+			if plan, err := p.Plan(context.Background(), content); err == nil && plan != nil && len(plan.Chunks) > 0 {
+				header := fmt.Sprintf("### PLANNED CONTEXT (%s intent, %d tokens)\n\n",
+					plan.Intent, plan.TokenTotal)
+				prepared = header + plan.Assemble() + "\n\n" + content
+				governed = true
+				trace = planToTrace(plan)
+			}
+		}
+		if !governed {
+			// Fallback: ungoverned @file resolution + disk read. Runs here (off
+			// the event loop) so even the degraded path never blocks submit.
+			if augmented := m.injectFileContext(workspaceRoot, content, content); augmented != content {
+				prepared = augmented
+			}
+			// The fallback attempted resolution, so streamCmd must not re-run it.
+			governed = true
+		}
+		return askStreamPreparedMsg{content: prepared, governed: governed, trace: trace}
 	}
 }
 
@@ -1673,7 +1728,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	// dynamic test suite, injects the telemetry into the forensic ledger, then
 	// triggers the risk analysis engine with both git diff AND test reports.
 	if command.IsReviewTestComposite(cmd) {
-		m.push(roleSystem, accentStyle.Render("⚡ [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
+		m.push(roleSystem, accentStyle.Render(Icon.Index+" [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m.runReviewTestComposite()

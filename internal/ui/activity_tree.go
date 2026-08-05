@@ -300,9 +300,10 @@ func (at *ActivityTree) RenderActive(width int, active bool, frame int) string {
 }
 
 // execSpinnerFrames is the 4-frame animated snowflake cycle used as the live
-// shell-exec icon. It mirrors flowingSpinnerFrames but without the surrounding
-// spaces so the glyph sits flush against the " exec │ " stage label.
-var execSpinnerFrames = []string{"✻", "❅", "❆", "✦"}
+// shell-exec icon. It is the canonical tokens.SpinnerSnowflakeFrames sequence
+// without surrounding spaces so the glyph sits flush against the " exec │ "
+// stage label.
+var execSpinnerFrames = SpinnerSnowflakeFrames
 
 // stageLabel maps an event kind to its tool stage name, rendered as the text
 // after the dedicated activity icon (Claude Code / OpenCode style).
@@ -336,7 +337,6 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int, running bool, fra
 	// cycles every 4 (✻ ❅ ❆ ✦) so a full rotation is visible.
 	dotFrame := frame % 3
 	execFrame := frame % len(execSpinnerFrames)
-
 	// Reserve cell budget for the "<icon> <stage> │ " prefix and the trailing
 	// status badge so long paths/commands truncate cleanly instead of
 	// overflowing the viewport's right border.
@@ -359,7 +359,7 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int, running bool, fra
 		}
 		elapsed := formatElapsed(e.Elapsed)
 		return fmt.Sprintf("%s%s (%d B · %s) %s",
-			prefix(Icon.Read, stageLabel(ev.Kind), blueStyle),
+			prefix(IconRead(), stageLabel(ev.Kind), blueStyle),
 			truncateMiddle(e.File, contentW), e.Bytes, mutedStyle.Render(elapsed), stageBadge(running, dotFrame))
 
 	case EventFileMutate:
@@ -378,7 +378,7 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int, running bool, fra
 		}
 		// The exec icon is the animated snowflake while the command is still
 		// running; a static snowflake marks the completed entry.
-		icon := Icon.Exec
+		icon := IconExec()
 		iconStyle := mutedStyle
 		if running {
 			icon = execSpinnerFrames[execFrame]
@@ -424,7 +424,7 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int, running bool, fra
 			return ""
 		}
 		return fmt.Sprintf("%s%s (%d hits) %s",
-			prefix(Icon.Grep, stageLabel(ev.Kind), cyanStyle),
+			prefix(IconGrep(), stageLabel(ev.Kind), cyanStyle),
 			truncateMiddle(e.Query, contentW), e.Hits, stageBadge(running, dotFrame))
 
 	case EventResolve:
@@ -433,7 +433,7 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int, running bool, fra
 			return ""
 		}
 		return fmt.Sprintf("%s%s (%d hits) %s",
-			prefix(Icon.Grep, stageLabel(ev.Kind), cyanStyle),
+			prefix(IconGrep(), stageLabel(ev.Kind), cyanStyle),
 			truncateMiddle(e.Symbol, contentW), e.Hits, stageBadge(running, dotFrame))
 
 	default:

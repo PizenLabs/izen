@@ -37,7 +37,7 @@ func renderApprovalPrompt(data approvalPromptData, width int) string {
 	innerW := width - 4
 
 	var b strings.Builder
-	b.WriteString(ApprovalTitle.Render("▲ APPROVAL REQUIRED"))
+	b.WriteString(ApprovalTitle.Render(Icon.Warning + " APPROVAL REQUIRED"))
 	b.WriteString("\n\n")
 
 	// Description
@@ -51,7 +51,7 @@ func renderApprovalPrompt(data approvalPromptData, width int) string {
 		b.WriteString(ApprovalLabel.Render("Target Files:"))
 		b.WriteString("\n")
 		for _, f := range data.TargetFiles {
-			b.WriteString("  " + ApprovalFile.Render("▸ "+f))
+			b.WriteString("  " + ApprovalFile.Render(Icon.Chevron+" "+f))
 			b.WriteString("\n")
 		}
 		b.WriteString("\n")
@@ -72,7 +72,7 @@ func renderApprovalPrompt(data approvalPromptData, width int) string {
 		b.WriteString(ApprovalLabel.Render("Required Capabilities:"))
 		b.WriteString("\n")
 		for _, capa := range data.Capabilities {
-			b.WriteString("  " + ApprovalCap.Render("● "+capa.String()))
+			b.WriteString("  " + ApprovalCap.Render(Icon.Check+" "+capa.String()))
 			b.WriteString("\n")
 		}
 		b.WriteString("\n")
@@ -119,7 +119,7 @@ func renderBuildApprovalPrompt(taskTarget, taskDesc string, width int) string {
 	}
 
 	var b strings.Builder
-	b.WriteString(ApprovalTitle.Render("▲ PERMISSION REQUIRED"))
+	b.WriteString(ApprovalTitle.Render(Icon.Warning + " PERMISSION REQUIRED"))
 	b.WriteString("\n\n")
 	b.WriteString(ApprovalLabel.Render("Action:") + " " + ApprovalValue.Render("SHELL_EXEC"))
 	b.WriteString("\n\n")
