@@ -1,6 +1,7 @@
 package review
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes"
 	riview "github.com/PizenLabs/izen/internal/review"
+	"github.com/PizenLabs/izen/pkg/engine/layer3"
+	"github.com/PizenLabs/izen/pkg/engine/pipeline"
 )
 
 var ErrWriteForbidden = errors.New("review mode: write operations are forbidden")
@@ -48,6 +51,13 @@ type Engine struct {
 	// events rather than written to the terminal. Optional; nil disables
 	// emission.
 	bus *events.Bus
+
+	// facade is the Layer 0-5 pipeline Facade injected by the composition
+	// root. When wired, stateVerify runs the Layer 4 RAM validation DAG
+	// (structural + syntax) over the changed files' current content and emits
+	// the outcome as a stage event. The outcome is advisory — review remains
+	// read-only. Optional; nil keeps the legacy verify-only path.
+	facade pipeline.Facade
 }
 
 func NewEngine(root string, retriever Retriever, g *lea.FileGraph) *Engine {
@@ -68,6 +78,24 @@ func NewEngine(root string, retriever Retriever, g *lea.FileGraph) *Engine {
 func (e *Engine) WithEventBus(bus *events.Bus) *Engine {
 	e.bus = bus
 	return e
+}
+
+// WithPipelineFacade injects the Layer 0-5 pipeline Facade so stateVerify runs
+// an advisory Layer 4 RAM validation over the changed files. May be nil to keep
+// the legacy verify-only path.
+func (e *Engine) WithPipelineFacade(f pipeline.Facade) *Engine {
+	if e != nil {
+		e.facade = f
+	}
+	return e
+}
+
+// Facade returns the injected Layer 0-5 pipeline Facade, if any.
+func (e *Engine) Facade() pipeline.Facade {
+	if e == nil {
+		return nil
+	}
+	return e.facade
 }
 
 // emit publishes a domain event. It is a strict no-op when no bus is wired.
@@ -223,6 +251,26 @@ func (e *Engine) stateVerify(result *ReviewResult) error {
 	reviewID := fmt.Sprintf("review-%s", time.Now().Format("20060102T150405"))
 	ledger := riview.NewReviewLedger(reviewID)
 
+	// Layer 4 validation via the injected pipeline.Facade: when wired, the
+	// changed files' current content is run through the RAM structural +
+	// syntax DAG. The outcome is advisory and emitted as a stage event — review
+	// never mutates anything, so the signal can only inform the report.
+	if e.facade != nil && len(result.FilesChanged) > 0 {
+		vr, verr := e.validateChangedFiles(result.FilesChanged)
+		msg := fmt.Sprintf("facade layer4 validation failed to run: %v", verr)
+		switch {
+		case vr == nil:
+			// keep the run-failure message
+		case vr.OK:
+			msg = fmt.Sprintf("facade layer4 validation ok (%d file(s) passed)", len(vr.Passed))
+		case vr.Err != nil:
+			msg = fmt.Sprintf("facade layer4 validation: %s", vr.Err.Error())
+		default:
+			msg = fmt.Sprintf("facade layer4 validation flagged %d file(s)", len(vr.Failed))
+		}
+		e.emit(events.NewStageCompleted("review.l4validation", time.Since(e.startedAt).Round(time.Millisecond), msg))
+	}
+
 	for _, df := range result.FilesChanged {
 		snippet := df.Path
 		if len(df.Hunks) > 0 {
@@ -303,6 +351,32 @@ func (e *Engine) stateVerify(result *ReviewResult) error {
 	result.Ledger = ledger
 
 	return e.State.Transition(StateReport)
+}
+
+// validateChangedFiles runs the changed files' current on-disk content through
+// the injected pipeline.Facade's Layer 4 RAM validation DAG. Files that cannot
+// be read are skipped; a nil result with a nil error means nothing was
+// validated.
+func (e *Engine) validateChangedFiles(files []DiffFile) (*pipeline.ValidationResult, error) {
+	if e == nil || e.facade == nil {
+		return nil, nil
+	}
+	patches := make([]layer3.FilePatch, 0, len(files))
+	for _, df := range files {
+		content, err := os.ReadFile(filepath.Join(e.root, df.Path))
+		if err != nil {
+			continue
+		}
+		patches = append(patches, layer3.FilePatch{
+			Path:    df.Path,
+			New:     string(content),
+			Changed: true,
+		})
+	}
+	if len(patches) == 0 {
+		return nil, nil
+	}
+	return e.facade.ValidatePatch(context.Background(), patches)
 }
 
 func (e *Engine) runDeterministicVerification(reviewID string, rf RiskFinding, verID string) (riview.EvidenceRecord, error) {

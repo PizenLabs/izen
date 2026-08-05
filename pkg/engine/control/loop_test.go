@@ -136,7 +136,7 @@ func TestLoopRetryThenSuccess(t *testing.T) {
 	})
 
 	session := NewSession(&ir.Plan{ID: "retry", Graph: g})
-	decisions := decision.NewStandardDecisionEngine(decision.WithRetryPolicy(decision.RetryPolicy{
+	decisions := decision.NewStandardDecisionEngine(decision.WithRetryPolicy(decision.RetryBudget{
 		MaxAttempts: 2,
 		Backoff:     func(int) time.Duration { return time.Millisecond },
 	}))
@@ -179,7 +179,7 @@ func TestLoopRePlanTerminates(t *testing.T) {
 	})
 
 	session := NewSession(&ir.Plan{ID: "replan", Graph: g})
-	decisions := decision.NewStandardDecisionEngine(decision.WithRetryPolicy(decision.RetryPolicy{MaxAttempts: 1}))
+	decisions := decision.NewStandardDecisionEngine(decision.WithRetryPolicy(decision.RetryBudget{MaxAttempts: 1}))
 	orch := NewControlLoopOrchestrator(session, decisions, NewWorkerPool(1, exec))
 
 	res, err := orch.Run(context.Background())
@@ -207,7 +207,7 @@ func TestLoopAbortCriticalFailure(t *testing.T) {
 	})
 
 	session := NewSession(&ir.Plan{ID: "abort", Graph: g})
-	decisions := decision.NewStandardDecisionEngine(decision.WithRetryPolicy(decision.RetryPolicy{MaxAttempts: 1}))
+	decisions := decision.NewStandardDecisionEngine(decision.WithRetryPolicy(decision.RetryBudget{MaxAttempts: 1}))
 	orch := NewControlLoopOrchestrator(session, decisions, NewWorkerPool(1, exec))
 
 	res, err := orch.Run(context.Background())

@@ -15,11 +15,14 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/domain/signal"
+	"github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
+	"github.com/PizenLabs/izen/pkg/engine/layer3"
+	"github.com/PizenLabs/izen/pkg/engine/pipeline"
 	"github.com/PizenLabs/izen/pkg/grounding"
 	"github.com/PizenLabs/izen/pkg/recon"
 )
@@ -111,6 +114,13 @@ type Engine struct {
 	usageMu    sync.RWMutex
 	lastInput  int
 	lastOutput int
+
+	// facade is the Layer 0-5 pipeline Facade injected by the composition
+	// root. When wired and no direct provider is set, the plan engine delegates
+	// its generative synthesis to the facade's ExecutePlan: the Mode engine
+	// remains the Security & Boundary gate while the stateless pipeline owns
+	// the LLM worker execution. Optional; nil keeps the legacy provider path.
+	facade pipeline.Facade
 }
 
 // NewEngine creates a new Engine instance with the provided components.
@@ -153,6 +163,24 @@ func (e *Engine) WithCapabilityRegistry(cr *wscap.ArchetypeCapabilityRegistry) *
 func (e *Engine) WithEventBus(bus *events.Bus) *Engine {
 	e.bus = bus
 	return e
+}
+
+// WithPipelineFacade injects the Layer 0-5 pipeline Facade. When wired and no
+// direct provider is set, the engine delegates its generative synthesis to the
+// facade (see processFromLedger). May be nil to keep the legacy provider path.
+func (e *Engine) WithPipelineFacade(f pipeline.Facade) *Engine {
+	if e != nil {
+		e.facade = f
+	}
+	return e
+}
+
+// Facade returns the injected Layer 0-5 pipeline Facade, if any.
+func (e *Engine) Facade() pipeline.Facade {
+	if e == nil {
+		return nil
+	}
+	return e.facade
 }
 
 // emit publishes a domain event. It is a strict no-op when no bus is wired,
@@ -507,8 +535,8 @@ func (e *Engine) ProcessFromLedgerFastTrack(ctx context.Context, promptText stri
 }
 
 func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, problem string, modelName string, fastTrack bool, fastPrompt ...string) (tasks []Task, err error) {
-	if e == nil || (e.provider == nil && e.streamProv == nil) {
-		return nil, fmt.Errorf("plan engine: provider not set")
+	if e == nil {
+		return nil, fmt.Errorf("plan engine: nil engine")
 	}
 
 	// ── HEADLESS EVENT EMISSION ───────────────────────────────
@@ -757,6 +785,19 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 				},
 			}, nil
 		}
+	}
+
+	// ── GENERATIVE SYNTHESIS SOURCE ────────────────────────────────────
+	// The Mode engine is the Security & Boundary gate. The generative core
+	// work is owned either by the legacy direct provider or — when a
+	// pipeline.Facade is injected and no direct provider is wired — by the
+	// Layer 0-5 pipeline facade. The deterministic fast-tracks above run in
+	// both cases and never require a provider.
+	if e.provider == nil && e.streamProv == nil {
+		if e.facade == nil {
+			return nil, fmt.Errorf("plan engine: provider not set")
+		}
+		return e.synthesizeViaFacade(ctx, problem, ledgerContent)
 	}
 
 	e.emit(events.NewIntentParsed("plan.synthesize", problem, 0.8))
@@ -1070,6 +1111,56 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	}
 
 	return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed and no dependency error detected", maxSilentRetries+1)
+}
+
+// synthesizeViaFacade executes the generative plan synthesis through the
+// injected pipeline.Facade. The Mode engine supplies the boundary (scope,
+// rationale, headless event emission); the facade owns the Layer 0-5 execution
+// and returns concrete file patches, which are projected onto canonical plan
+// Tasks. The error returned is wrapped so callers can distinguish "the facade
+// is unavailable" from "the facade produced no plan".
+func (e *Engine) synthesizeViaFacade(ctx context.Context, problem, ledgerContent string) ([]Task, error) {
+	if e == nil || e.facade == nil {
+		return nil, fmt.Errorf("plan engine: no pipeline facade wired")
+	}
+	res, err := e.facade.ExecutePlan(ctx, pipeline.Request{
+		Mode:        "plan",
+		Description: problem,
+		Scope:       e.AllowedFiles,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("plan engine: pipeline facade execution failed: %w", err)
+	}
+	if res == nil {
+		return nil, fmt.Errorf("plan engine: pipeline facade returned a nil result")
+	}
+	tasks := patchesToTasks(res.Patches, problem)
+	if len(tasks) == 0 {
+		return nil, fmt.Errorf("plan engine: pipeline facade produced no patches")
+	}
+	return ForceShellExecOnCompileError(tasks, problem, ledgerContent), nil
+}
+
+// patchesToTasks projects Layer 3 file patches produced by the pipeline facade
+// onto canonical plan Tasks (FILE_MUTATE). Unchanged patches are dropped;
+// step numbers are sequential from 1.
+func patchesToTasks(patches []layer3.FilePatch, problem string) []Task {
+	tasks := make([]Task, 0, len(patches))
+	for _, p := range patches {
+		if !p.Changed {
+			continue
+		}
+		tasks = append(tasks, Task{
+			StepNum:     len(tasks) + 1,
+			Status:      task.StatusIdle,
+			Type:        task.TaskFileMutate,
+			Target:      p.Path,
+			Description: fmt.Sprintf("Apply the proposed change to %s", p.Path),
+			Rationale:   problem,
+			Solution:    fmt.Sprintf("%s updated via the layered pipeline facade", p.Path),
+		})
+	}
+	return tasks
 }
 
 // diagnoseSynthesisFailure publishes a clear, actionable plan-synthesis

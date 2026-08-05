@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,6 +16,8 @@ import (
 	"github.com/PizenLabs/izen/internal/runtime/output"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
+	"github.com/PizenLabs/izen/pkg/engine/layer3"
+	"github.com/PizenLabs/izen/pkg/engine/pipeline"
 	"github.com/PizenLabs/izen/pkg/recon"
 )
 
@@ -90,6 +94,12 @@ type Engine struct {
 	// Optional; nil disables the enrichment so headless/CLI runs behave
 	// exactly as before.
 	planner ContextPlanner
+
+	// facade is the Layer 0-5 pipeline Facade injected by the composition
+	// root. When wired, ValidateTargetFile runs the Layer 4 RAM validation DAG
+	// over a candidate target's content so downstream evidence can reference
+	// the structural/syntax outcome. Optional; nil keeps the engine offline.
+	facade pipeline.Facade
 }
 
 // ContextPlanner is the seam for intent-aware context planning. It is
@@ -192,6 +202,44 @@ func (e *Engine) WithEventBus(bus *events.Bus) *Engine {
 func (e *Engine) WithContextPlanner(p ContextPlanner) *Engine {
 	e.planner = p
 	return e
+}
+
+// WithPipelineFacade injects the Layer 0-5 pipeline Facade so the engine can
+// run Layer 4 RAM validation over candidate targets. May be nil (default): the
+// engine stays fully offline.
+func (e *Engine) WithPipelineFacade(f pipeline.Facade) *Engine {
+	if e != nil {
+		e.facade = f
+	}
+	return e
+}
+
+// Facade returns the injected Layer 0-5 pipeline Facade, if any.
+func (e *Engine) Facade() pipeline.Facade {
+	if e == nil {
+		return nil
+	}
+	return e.facade
+}
+
+// ValidateTargetFile runs the Layer 4 RAM validation DAG over the current
+// content of a candidate target file through the injected pipeline.Facade. It
+// returns (nil, nil) when no facade is wired — forensic callers treat the
+// validation as an optional enhancement. An unreadable target is surfaced as
+// an error.
+func (e *Engine) ValidateTargetFile(ctx context.Context, path string) (*pipeline.ValidationResult, error) {
+	if e == nil || e.facade == nil {
+		return nil, nil
+	}
+	content, err := os.ReadFile(filepath.Join(e.root, path))
+	if err != nil {
+		return nil, err
+	}
+	return e.facade.ValidatePatch(ctx, []layer3.FilePatch{{
+		Path:    path,
+		New:     string(content),
+		Changed: true,
+	}})
 }
 
 // emit publishes a domain event. It is a strict no-op when no bus is wired.

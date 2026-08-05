@@ -62,7 +62,7 @@ func (e *Engine) RunAdaptive(ctx context.Context, req Request) (*Result, error) 
 	exec := &adaptiveExecutor{e: e, req: req}
 	session := control.NewSession(plan)
 	pool := control.NewWorkerPool(2, exec)
-	decisions := decision.NewStandardDecisionEngine(decision.WithRetryPolicy(decision.RetryPolicy{MaxAttempts: 1}))
+	decisions := decision.NewStandardDecisionEngine(decision.WithRetryPolicy(decision.RetryBudget{MaxAttempts: 1}))
 
 	orch := control.NewControlLoopOrchestrator(session, decisions, pool, control.WithEventBus(e.bus))
 	run, err := orch.Run(ctx)

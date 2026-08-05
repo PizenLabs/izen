@@ -1,13 +1,18 @@
 // Package decision implements the isolated Decision Engine of the adaptive
-// control system. The Decision Engine is a PURE function over the Dynamic IR:
+// control system. The Decision Engine is a THIN ORCHESTRATION CONTROLLER: a
+// pure function over the Dynamic IR —
 //
 //	DecisionEngine.Decide(ExecutionSnapshot) → DecisionDirective
 //
-// It owns every retry, re-plan, skip and human-approval decision. The state
-// machine and the orchestrator contain zero such logic; they only execute the
-// directives the Decision Engine produces. Because the Decision Engine
-// consumes the read-only SnapshotReader projection, it verifiably cannot
-// mutate the Dynamic IR.
+// It answers exactly one question — "what directive should be dispatched
+// next?" — by sequencing the injected policy strategies in precedence order.
+// Retry, budget and human-approval bounds live in injected strategy objects
+// (RetryPolicy, BudgetPolicy, RePlanTrigger, HumanInTheLoopTrigger); the
+// engine contains zero hardcoded retry, recovery or budget arithmetic. The
+// state machine and the orchestrator contain no decision logic either; they
+// only execute the directives the Decision Engine produces. Because the
+// Decision Engine consumes the read-only SnapshotReader projection, it
+// verifiably cannot mutate the Dynamic IR.
 package decision
 
 import (

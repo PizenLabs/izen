@@ -502,9 +502,13 @@ func Wire(opts ...Option) (*Application, error) {
 
 	// Wire snapshot cache and capability registry into the plan engine for
 	// archetype-aware diagnostic gating, and the event bus so /plan runs
-	// headless and publishes domain events.
+	// headless and publishes domain events. The layered Pipeline Engine is
+	// injected as the pipeline.Facade so the /plan UseCase can delegate its
+	// generative synthesis to the Layer 0-5 pipeline when no direct provider
+	// is wired.
 	a.PlanEngine.WithSnapshotCache(a.SnapCache).WithCapabilityRegistry(a.CapRegistry)
 	a.PlanEngine.WithEventBus(a.Bus)
+	a.PlanEngine.WithPipelineFacade(a.Pipeline)
 
 	// ── WORKFLOW STATE MACHINE + CHECKPOINT COORDINATOR ────────────────
 	a.WorkflowSM = coreWorkflow.NewWorkflowStateMachine()

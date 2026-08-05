@@ -1255,6 +1255,24 @@ func (m *model) syncPipelineTiers() {
 	})
 }
 
+// pipelineFacade returns the layered Pipeline Engine as its narrow
+// pipeline.Facade boundary, resolving it from the UI's direct engine or the
+// orchestrator. It is the seam Mode UseCases (investigate/review) consume for
+// Layer 4 validation and heavy context generation. Nil in headless/test
+// harnesses.
+func (m *model) pipelineFacade() pipeline.Facade {
+	if m == nil {
+		return nil
+	}
+	if m.pipelineEngine != nil {
+		return m.pipelineEngine
+	}
+	if m.orch != nil {
+		return m.orch.Pipeline()
+	}
+	return nil
+}
+
 // isProjectInitialized checks whether .izen/ exists AND contains a valid
 // config.json on disk. This is the AUTHORITATIVE first-run gate used by
 // BuildWorkspace to decide whether to render the onboarding overlay or the
