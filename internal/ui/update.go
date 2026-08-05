@@ -44,12 +44,18 @@ func (m *model) Init() tea.Cmd {
 	if m.initStage != initNone && m.initStage != initComplete {
 		return tea.Batch(m.smoothStreamTickCmd(), m.proTipTickCmd())
 	}
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		m.smoothStreamTickCmd(),
 		m.proTipTickCmd(),
 		m.ti.Focus(),
 		m.initSessionStartCheckpoint,
-	)
+	}
+	// Arm the fact-only control telemetry bridge so control.iteration /
+	// control.node_observed facts stream into the loop as controlFactMsg.
+	if cmd := m.listenControlEventsCmd(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	return tea.Batch(cmds...)
 }
 
 // Update routes state machines and events.
@@ -177,7 +183,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// type switch below. Without this, gitInitResultMsg gets swallowed
 		// and the init stage never advances after pressing 'Y'.
 		switch msg.(type) {
-		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg, graphIndexingMsg, domainEventMsg:
+		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg, graphIndexingMsg, domainEventMsg, controlFactMsg:
 			// fall through to main type switch
 		default:
 			return m, nil
@@ -191,6 +197,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// the UI renders them as activity lines. Runs on the UI goroutine, so
 		// all model mutation here is safe.
 		m.handleDomainEvent(msg.ev)
+		return m, nil
+
+	case controlFactMsg:
+		// Fact-only control telemetry projection (control.iteration /
+		// control.node_observed). Pure view-model fold on the UI goroutine:
+		// the facts update the projected execution tree and nothing else.
+		m.handleControlFact(msg.ev)
 		return m, nil
 
 	case presentationEventMsg:

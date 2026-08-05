@@ -45,7 +45,9 @@ import (
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
+	"github.com/PizenLabs/izen/pkg/engine/ir"
 	"github.com/PizenLabs/izen/pkg/engine/pipeline"
+	"github.com/PizenLabs/izen/pkg/engine/telemetry"
 	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
 	"github.com/PizenLabs/izen/pkg/tui/tips"
 )
@@ -1135,6 +1137,18 @@ type model struct {
 	// each mode command. Nil only in headless/test harnesses.
 	pipelineEngine *pipeline.Engine
 
+	// ── Fact-only control projection ────────────────────────────────
+	// controlSnapshot is the projected Dynamic IR snapshot reconstructed from
+	// the fact-only control telemetry stream (control.iteration +
+	// control.node_observed). The UI renders the execution tree from these
+	// facts and never writes them back: no business logic, retries, or engine
+	// state mutations run here.
+	controlRunID    string
+	controlSnapshot *ir.ExecutionSnapshot
+	// controlFactSend bridges fact-only control events into the Bubble Tea
+	// event loop. Set to p.Send at bootstrap; nil in headless/test harnesses.
+	controlFactSend func(tea.Msg)
+
 	// Current effort level for generation
 	currentEffort EffortLevel
 }
@@ -1565,6 +1579,99 @@ func (m *model) handlePresentationEvent(ev appruntime.PresentationEvent) {
 	}
 	if ev.Target != "" && ev.Target != ev.Summary {
 		m.logActivity("  %s", dimmedStyle.Render(ev.Target))
+	}
+}
+
+// handleControlFact is the fact-only control telemetry projection. It is a
+// pure view-model fold: control.iteration and control.node_observed facts
+// update the reconstructed Dynamic IR snapshot that the execution tree renders
+// from. No business logic, retry, or engine state mutation happens here — the
+// facts are read-only and the projected snapshot is never written back. Only
+// ever runs on the UI goroutine, so all model mutation here is race-free.
+func (m *model) handleControlFact(ev telemetry.Event) {
+	if ev == nil {
+		return
+	}
+	switch ev.Type() {
+	case telemetry.EventControlIteration:
+		p, ok := ev.Payload().(*telemetry.ControlIterationPayload)
+		if !ok {
+			return
+		}
+		m.applyControlIteration(p)
+	case telemetry.EventControlNodeObserved:
+		p, ok := ev.Payload().(*telemetry.ControlNodeObservedPayload)
+		if !ok {
+			return
+		}
+		m.applyControlNodeObserved(p)
+	}
+	m.refreshViewportContent()
+	if m.Ready && !m.userIsScrollingUp {
+		m.Viewport.GotoBottom()
+	}
+}
+
+// applyControlIteration folds one control.iteration fact (per-node states +
+// attempt counts) into the projected Dynamic IR snapshot.
+func (m *model) applyControlIteration(p *telemetry.ControlIterationPayload) {
+	m.ensureControlSnapshot(p.RunID)
+	for id, state := range p.NodeStates {
+		m.controlSnapshot.NodeStates[id] = ir.NodeState(state)
+	}
+	for id, attempts := range p.Attempts {
+		m.controlSnapshot.AttemptCounts[id] = attempts
+	}
+}
+
+// applyControlNodeObserved folds one control.node_observed fact (a single node
+// outcome) into the projected Dynamic IR snapshot. The observation is the
+// definitive record of the executed attempt, so the projected glyph reflects it
+// immediately rather than waiting for the next iteration.
+func (m *model) applyControlNodeObserved(p *telemetry.ControlNodeObservedPayload) {
+	m.ensureControlSnapshot(p.RunID)
+	m.controlSnapshot.LastObservation[p.NodeID] = ir.ObservationPayload{
+		NodeID:     p.NodeID,
+		OK:         p.OK,
+		Err:        p.Err,
+		SkipReason: p.SkipReason,
+		Output:     p.Output,
+		Timestamp:  p.Timestamp,
+	}
+	switch {
+	case p.OK || p.SkipReason != "":
+		m.controlSnapshot.NodeStates[p.NodeID] = ir.StateSuccess
+	default:
+		m.controlSnapshot.NodeStates[p.NodeID] = ir.StateFailed
+	}
+}
+
+// ensureControlSnapshot lazily allocates the projected Dynamic IR snapshot and
+// pins its run id to the latest control fact.
+func (m *model) ensureControlSnapshot(runID string) {
+	if m.controlSnapshot == nil {
+		m.controlSnapshot = &ir.ExecutionSnapshot{
+			ID:              runID,
+			NodeStates:      make(map[string]ir.NodeState),
+			LastObservation: make(map[string]ir.ObservationPayload),
+			AttemptCounts:   make(map[string]int),
+			Variables:       ir.Variables{},
+		}
+		m.controlRunID = runID
+		return
+	}
+	if runID != "" {
+		m.controlRunID = runID
+		m.controlSnapshot.ID = runID
+	}
+	if m.controlSnapshot.NodeStates == nil {
+		m.controlSnapshot.NodeStates = make(map[string]ir.NodeState)
+	}
+	if m.controlSnapshot.LastObservation == nil {
+		m.controlSnapshot.LastObservation = make(map[string]ir.ObservationPayload)
+	}
+	if m.controlSnapshot.AttemptCounts == nil {
+		m.controlSnapshot.AttemptCounts = make(map[string]int)
 	}
 }
 
@@ -2369,6 +2476,19 @@ func (m *model) refreshViewportContent() {
 	if !m.streaming && m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
 		if thoughts := m.renderLiveThinking(m.width); thoughts != "" {
 			content.WriteString(thoughts)
+			content.WriteString("\n")
+		}
+	}
+
+	// ── Fact-only Execution Tree ────────────────────────────────────
+	// The Dynamic IR projection rendered from control.iteration /
+	// control.node_observed facts. Placed above the bottom dock so the live
+	// execution tree reads as the pipeline's current state while tool steps
+	// stream beneath it. It is a pure projection: the facts are read-only
+	// and the tree never performs retries or state mutations.
+	if m.controlSnapshot != nil && len(m.controlSnapshot.NodeStates) > 0 {
+		if treeView := ProjectSnapshotToView(m.controlSnapshot, nil); treeView != "" {
+			content.WriteString(treeView)
 			content.WriteString("\n")
 		}
 	}
