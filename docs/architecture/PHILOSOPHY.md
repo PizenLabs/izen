@@ -293,7 +293,24 @@ Failures must be:
 
 **Rule:** Hidden failure is worse than failed execution.
 
+## Architectural Meta-Rules
+
+### Rule 13: One Question, One Owner
+Every architectural question must have exactly one authoritative owner. 
+If two components can answer the same question, the architecture is already drifting.
+
+- "System CAN" -> Capability Graph ONLY.
+- "System MAY" -> Policy Engine ONLY.
+- "What NEXT"  -> Decision Engine ONLY.
+- "What PHASE" -> Workflow StateMachine ONLY.
+- "What INTENT" -> User Intent Model ONLY.
+
+### Rule 14: Strict Unidirectional Layering
+Dependency strictly flows DOWN. Domain Events strictly flow UP.
+Lower-level components (Runtime, Pipeline) must NEVER import or reference higher-level components (UI, Workflow, Decision). The UI is a pure projection of the event stream.
+
 ---
+
 
 ## Mode System
 
