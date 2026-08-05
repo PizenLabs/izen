@@ -188,6 +188,10 @@ type planResultMsg struct {
 	Err         error
 	Handoff     HandoffContext // echoed back so the handler can populate PendingTodos
 	IsFastTrack bool           // if true, auto-approve plan — bypass approval gate
+	// Microkernel marks plans produced by the deterministic microkernel
+	// pipeline (pkg/engine) rather than LLM synthesis. The handler uses it to
+	// label the staged plan and to render rejection reasons in the footer.
+	Microkernel bool
 	// TokenInput/TokenOutput are the provider-reported usage of the synthesis
 	// call, committed even when the response was truncated (finish_reason:
 	// "length"). The handler mirrors them into the session counters and the
@@ -776,6 +780,12 @@ type model struct {
 	execEng    *execution.Engine
 	planStore  *plan.PlanStore
 	planEngine *plan.Engine // structural plan engine wired for ledger-driven execution
+
+	// microkernel is the immutable microkernel pipeline adapter. It primes
+	// plan/investigate command handling for greenfield generation prompts so
+	// the TUI renders explicit file targets instead of the legacy heuristic
+	// fallback. It is constructed at bootstrap and immutable afterwards.
+	microkernel *plan.MicrokernelPlanner
 
 	// buildLedger is the live /plan task state bridge shared with the execution
 	// engine. It is created lazily and survives across builds within a session.

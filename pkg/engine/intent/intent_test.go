@@ -144,6 +144,10 @@ func TestClassify(t *testing.T) {
 		{"show me the architecture overview and route map", FamilyArchitecture},
 		{"implement an endpoint to fetch user profiles", FamilyFeature},
 		{"tell me the weather today", FamilyGeneral},
+		{"make the website introduce for JAY with your job is software engineer using html, css and js", FamilyGreenfield},
+		{"make a website for me using html, css and js", FamilyGreenfield},
+		{"explain how websites work", FamilyQuestion},
+		{"refactor my portfolio website into modules", FamilyRefactor},
 	}
 	for _, tt := range tests {
 		got := Classify(tt.prompt)

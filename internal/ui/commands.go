@@ -549,8 +549,14 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		intent := investigate.ClassifyIntent(content)
 		switch {
 		case intent.IsFrontendUI():
-			m.handoffLedgerContent = "frontend ui intent detected — hand off to plan"
+			// Preserve the raw prompt alongside the routing marker so the
+			// microkernel pipeline (and the legacy LLM synthesis, as a
+			// fallback) can plan from the actual request instead of a
+			// placeholder. The "hand off to plan" substring is the routing
+			// marker consumed by the /investigate engine result handler.
+			m.handoffLedgerContent = "frontend ui intent detected — hand off to plan\n" + content
 			m.handoffCtx.ProposedFix = m.handoffLedgerContent
+			m.persistUserIntentPacket(content)
 			m.modeChangeAuthorized = true
 			m.investigateInvocationCount++
 			return m.setMode(modes.ModePlan)
@@ -696,6 +702,37 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		// Only reached when no investigation handoff exists (no handoffLedgerContent
 		// and no ProposedFix). The structural engine path above always terminates
 		// with either staged tasks or an explicit diagnostic — never falls through.
+
+		// ── MICROKERNEL PIPELINE PRIME PATH (direct /plan prompts) ─────
+		// A greenfield generation prompt typed straight into /plan is planned
+		// deterministically by the microkernel engine before any LLM call or
+		// heuristic assembly. Rejections surface the explicit reason in the
+		// footer; successes stage explicit CREATE/WRITE file tasks.
+		if m.microkernel != nil {
+			if tasks, handled, mkErr := m.microkernel.TryPlan(context.Background(), content); handled {
+				if mkErr != nil {
+					m.reconcileSpinner()
+					m.push(roleError, mkErr.Error())
+					m.uiNotice = mkErr.Error()
+					m.refreshViewportContent()
+					m.Viewport.GotoBottom()
+					return m.flushPendingRecords()
+				}
+				if len(tasks) > 0 {
+					m.streaming = false
+					m.agentRunning = false
+					m.planPending = false
+					m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
+						"Microkernel plan: %d deterministic task(s) staged — no model call.",
+						len(tasks))))
+					m.refreshViewportContent()
+					return func() tea.Msg {
+						return planResultMsg{Tasks: tasks, Microkernel: true}
+					}
+				}
+			}
+		}
+
 		cb := ctxpkg.NewBuilder(".", m.graph, m.gitEng, m.sess)
 		assembly := cb.BuildPlanAssembly(content, m.attachedFiles)
 
@@ -1137,6 +1174,31 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		}
 		ftCtx, ftCancel := context.WithTimeout(ctx, ftBudget)
 		defer ftCancel()
+
+		// ── MICROKERNEL PIPELINE PRIME PATH ───────────────────────────────────
+		// Greenfield generation prompts are planned deterministically by the
+		// immutable microkernel engine (intent → context → strategy → plan
+		// pipeline), bypassing LLM plan synthesis AND its heuristic fallback
+		// entirely. The candidates are the live handoff payload and the session
+		// objective, in that order. When the microkernel takes ownership it
+		// either stages explicit CREATE/WRITE tasks or surfaces the exact
+		// policy/preconditions rejection reason — never a heuristic plan.
+		if m.microkernel != nil {
+			if tasks, handled, mkErr := m.microkernel.TryPlan(ftCtx, handoffSource, problem); handled {
+				cancel()
+				if mkErr != nil {
+					debugLogPlan("MICROKERNEL: rejected — " + mkErr.Error())
+					return planResultMsg{Err: mkErr, Handoff: handoff, Microkernel: true}
+				}
+				if len(tasks) > 0 {
+					debugLogPlan("MICROKERNEL: staged " + fmt.Sprint(len(tasks)) + " deterministic task(s)")
+					return planResultMsg{Tasks: tasks, Handoff: handoff, Microkernel: true}
+				}
+				debugLogPlan("MICROKERNEL: produced zero tasks — falling back to legacy synthesis")
+			} else {
+				debugLogPlan("MICROKERNEL: not applicable — falling back to legacy plan synthesis")
+			}
+		}
 
 		// ── WORKSPACE DISCOVERY ──────────────────────────────────────────────
 		// If the plan engine has no allowed file tree yet, discover it now via

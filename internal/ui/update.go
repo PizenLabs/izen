@@ -510,6 +510,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		if msg.Err != nil {
 			m.push(roleError, fmt.Sprintf("Failed to synthesize plan from ledger: %v", msg.Err))
+			// Microkernel rejections (PolicyEngine / ExecutionPreconditions)
+			// must surface their explicit reason in the status-bar footer.
+			if msg.Microkernel {
+				m.uiNotice = msg.Err.Error()
+			}
 			// Retain a baseline Action Chip so the user is never left with a
 			// dead viewport and no buttons — they can re-investigate the failure.
 			m.currentResult = failureResult(m.handoffLedgerContent)
@@ -595,6 +600,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleStatus, accentStyle.Render(fmt.Sprintf("[Fast-Track] Plan auto-approved: %d task(s). Type /build to execute.", len(msg.Tasks))))
 		} else {
 			m.push(roleStatus, fmt.Sprintf("Plan staged: %d task(s). Approve (Alt+P) or Reject (Alt+R).", len(msg.Tasks)))
+		}
+		if msg.Microkernel {
+			// Deterministic microkernel plans consumed no model tokens.
+			m.uiNotice = fmt.Sprintf("Microkernel plan: %d deterministic task(s), no model call", len(msg.Tasks))
 		}
 		// Render the staged task list into the viewport so the developer can
 		// see exactly what /build will execute — Principal Engineer format.

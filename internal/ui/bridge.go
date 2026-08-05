@@ -133,6 +133,27 @@ func (m *model) loadOrCreateLedger(source modes.Mode) *session.ContextLedger {
 	return session.NewContextLedger(source)
 }
 
+// persistUserIntentPacket records the raw user request as a ledger packet so
+// it survives the mode-transition purge (CleanContextTransitions clears
+// in-memory handoff buffers, then re-primes handoffLedgerContent from the
+// session.ContextLedger — the handoff SSOT). Without this, a FRONTEND_UI
+// bypass loses the original prompt and /plan would synthesize from a
+// meaningless placeholder. The packet renders into the /plan handoff via
+// FormatPacketsForPlan, which is what the microkernel pipeline consumes.
+func (m *model) persistUserIntentPacket(content string) {
+	if m.sess == nil || strings.TrimSpace(content) == "" {
+		return
+	}
+	ledger := m.loadOrCreateLedger(m.resolver.Current())
+	ledger.InjectPacket(session.LedgerPacket{
+		Kind:    "user_intent",
+		Title:   "user request",
+		Payload: content,
+	})
+	m.sess.ContextLedger = ledger
+	_ = ledger.Save()
+}
+
 // bridgeBuildResultToLedger records the outcome of the active /build task into
 // the canonical session.ContextLedger, implementing the fail-fast machine's
 // state tracking. A failed verification marks the active task Failed = true and

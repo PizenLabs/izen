@@ -60,7 +60,7 @@ func Classify(raw string) Intent {
 	switch {
 	case lower == "":
 		return Intent{family: FamilyGeneral, facets: map[Facet]bool{}}
-	case hits(lower, greenfieldSignals) >= 1:
+	case hits(lower, greenfieldSignals) >= 1 || isGreenfieldWeb(lower):
 		return derived(FamilyGreenfield)
 	case hits(lower, bugFixSignals) >= 1:
 		return derived(FamilyBugFix)
@@ -96,4 +96,44 @@ func hits(lower string, signals []string) int {
 		}
 	}
 	return n
+}
+
+// greenfieldWebVerbs are generation verbs whose presence alongside a web
+// noun marks a greenfield website request ("make a website introducing X").
+var greenfieldWebVerbs = []string{
+	"make ", "make the ", "make a ", "make an ",
+	"create ", "create the ", "create a ", "create an ",
+	"build ", "build the ", "build a ", "build an ",
+	"generate ", "generate the ", "generate a ", "generate an ",
+	"write ", "write the ", "write a ", "write an ",
+	"scaffold ", "new website", "new web page", "new webpage",
+}
+
+// webNouns are the nouns that identify a static-website target.
+var webNouns = []string{
+	"website", "web page", "webpage", "web site",
+	"landing page", "portfolio page", "personal page",
+}
+
+// isGreenfieldWeb reports whether a prompt requests generating a website
+// from scratch. The noun alone ("explain how websites work") is not enough;
+// a generation verb must be present so refactor/explain requests stay in
+// their own families.
+func isGreenfieldWeb(lower string) bool {
+	hasNoun := false
+	for _, n := range webNouns {
+		if strings.Contains(lower, n) {
+			hasNoun = true
+			break
+		}
+	}
+	if !hasNoun {
+		return false
+	}
+	for _, v := range greenfieldWebVerbs {
+		if strings.Contains(lower, v) {
+			return true
+		}
+	}
+	return false
 }
