@@ -646,7 +646,7 @@ func runProgram(p *tea.Program, root string, initStage initStage) {
 }
 
 func RunMainDashboard(cfg *config.Config, root string, localCfg *config.LocalConfig, det ...project.Detection) {
-	app, err := compose.Wire()
+	app, err := compose.Wire(compose.WithAuditDir(filepath.Join(root, ".izen", "audit")))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "izen: wire application layer: %v\n", err)
 		os.Exit(1)

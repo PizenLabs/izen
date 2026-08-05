@@ -16,8 +16,8 @@ func (f *fakeStatus) IsCompleted(taskID int) bool {
 
 func sampleTasks() []Task {
 	return []Task{
-		{StepNum: 1, IsDone: false, Status: "idle", Type: "FILE_MUTATE", Target: "a.go", Description: "add handler"},
-		{StepNum: 2, IsDone: false, Status: "idle", Type: "SHELL_EXEC", Target: "go build ./...", Description: "compile"},
+		{StepNum: 1, Status: "idle", Type: "FILE_MUTATE", Target: "a.go", Description: "add handler"},
+		{StepNum: 2, Status: "idle", Type: "SHELL_EXEC", Target: "go build ./...", Description: "compile"},
 	}
 }
 
@@ -59,10 +59,10 @@ func TestParseMarkdownToTasksWithStatus(t *testing.T) {
 	if len(tasks) != 2 {
 		t.Fatalf("expected 2 tasks, got %d", len(tasks))
 	}
-	if tasks[0].IsDone || tasks[0].Status == "done" {
+	if tasks[0].Done() || tasks[0].Status == "done" {
 		t.Fatal("task 1 should remain open")
 	}
-	if !tasks[1].IsDone || tasks[1].Status != "done" {
+	if !tasks[1].Done() || tasks[1].Status != "done" {
 		t.Fatal("task 2 should be marked completed")
 	}
 }
@@ -70,7 +70,7 @@ func TestParseMarkdownToTasksWithStatus(t *testing.T) {
 func TestParseMarkdownToTasksWithStatusNilSource(t *testing.T) {
 	md := "- [ ] FILE_MUTATE: a.go | add handler"
 	tasks := ParseMarkdownToTasksWithStatus(md, nil)
-	if tasks[0].IsDone {
+	if tasks[0].Done() {
 		t.Fatal("expected no completion with nil source")
 	}
 }

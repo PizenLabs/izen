@@ -6,24 +6,19 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/lea"
 )
 
-// Task represents a single tactical operation in the markdown-based task system.
+// Task is the canonical Anti-Corruption Layer representation of a single
+// tactical operation. It is an alias for internal/domain/task.Task so the LLM
+// plan synthesis, the microkernel planner and the execution engine all share
+// one canonical type. The legacy type labels ("FILE_MUTATE", "SHELL_EXEC",
+// "GIT_ACTION") are preserved as the canonical TaskType values.
+//
 // Structure: - [ ] TYPE: Target | Description
-// Where TYPE is: "FILE_MUTATE", "SHELL_EXEC", "GIT_ACTION"
-type Task struct {
-	StepNum     int    `json:"step_num"`
-	IsDone      bool   `json:"is_done"`
-	Status      string `json:"status"`      // "idle", "processing", "done"
-	Type        string `json:"type"`        // "FILE_MUTATE", "SHELL_EXEC", "GIT_ACTION"
-	Target      string `json:"target"`      // File path or exact CLI command
-	Description string `json:"description"` // Explanation of why this step exists
-	Rationale   string `json:"rationale,omitempty"`
-	Solution    string `json:"solution,omitempty"`
-	IsHardcoded bool   `json:"is_hardcoded,omitempty"` // If true, bypass LLM sanitization/validation
-}
+type Task = task.Task
 
 // ParseMarkdownToTasks converts markdown content into structured Task objects.
 // It finds lines starting with - [ ] or - [x] and parses them into structured Task objects.
@@ -64,21 +59,18 @@ func ParseMarkdownToTasks(mdContent string) []Task {
 			// a documentation file so the model cannot silently fall back to
 			// doc edits under context pressure (this is the failure mode the
 			// local 7B model exhibits on compile/dep blockers).
-			if IsDocumentationTarget(target, typeStr) {
+			if IsDocumentationTarget(target, task.TaskType(typeStr)) {
 				continue
 			}
 
-			isDone := false
-			status := "idle"
+			status := task.StatusIdle
 			if strings.HasPrefix(line, "- [x]") {
-				isDone = true
-				status = "done"
+				status = task.StatusDone
 			}
 			task := Task{
 				StepNum:     taskCount,
-				IsDone:      isDone,
 				Status:      status,
-				Type:        typeStr,
+				Type:        task.TaskType(typeStr),
 				Target:      target,
 				Description: desc,
 			}

@@ -91,8 +91,63 @@ func countEvents(mu *sync.Mutex, got *[]DomainEvent) int {
 	return len(*got)
 }
 
-func TestMultipleSubscribersSameType(t *testing.T) {
-	// Buffer exceeds the burst so no events are dropped by the non-blocking
+func TestSubscribeAllReceivesEveryType(t *testing.T) {
+	b := NewBus(64)
+	defer b.Close()
+
+	var mu sync.Mutex
+	var got []DomainEvent
+	sub := b.SubscribeAll(func(ev DomainEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, ev)
+	})
+	defer sub.Cancel()
+
+	// All-event subscribers must receive typed events AND envelopes.
+	b.Publish(NewCommandReceived("/plan", "plan"))
+	b.Publish(NewPlanStaged(1, []string{"a.go"}, "plan"))
+	b.PublishEnvelope(NewEnvelope(DomainKindTelemetry, "telemetry", "x"))
+
+	if !waitFor(t, func() bool {
+		return countEvents(&mu, &got) == 3
+	}) {
+		t.Fatalf("SubscribeAll delivered %d events, want 3", countEvents(&mu, &got))
+	}
+
+	// A type-scoped subscriber must NOT receive the all-event stream's
+	// non-matching types (existing routing is preserved).
+	var scoped int32
+	b.Subscribe(EventPlanStaged, func(DomainEvent) { atomic.AddInt32(&scoped, 1) })
+	b.Publish(NewCommandReceived("/x", "plan"))
+	time.Sleep(20 * time.Millisecond)
+	if atomic.LoadInt32(&scoped) != 0 {
+		t.Fatal("type-scoped subscriber received a non-matching type")
+	}
+}
+
+func TestSubscribeAllCancelAndClosed(t *testing.T) {
+	b := NewBus(16)
+	got := make(chan DomainEvent, 16)
+	sub := b.SubscribeAll(func(ev DomainEvent) { got <- ev })
+	sub.Cancel()
+
+	b.Publish(NewCommandReceived("/x", "plan"))
+	select {
+	case <-got:
+		t.Fatal("cancelled SubscribeAll still delivered an event")
+	default:
+	}
+	b.Close()
+	if s := b.SubscribeAll(func(DomainEvent) {}); s != nil {
+		t.Fatal("SubscribeAll on a closed bus must return nil")
+	}
+	if s := b.SubscribeAll(nil); s != nil {
+		t.Fatal("SubscribeAll with a nil handler must return nil")
+	}
+}
+
+func TestMultipleSubscribersSameType(t *testing.T) { // Buffer exceeds the burst so no events are dropped by the non-blocking
 	// fast-path; every subscriber must see every event.
 	b := NewBus(256)
 	defer b.Close()

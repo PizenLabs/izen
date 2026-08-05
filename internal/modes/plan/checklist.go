@@ -3,6 +3,8 @@ package plan
 import (
 	"fmt"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/domain/task"
 )
 
 // TaskStatusSource reads task completion state without importing the context
@@ -30,7 +32,7 @@ func RenderChecklist(tasks []Task, src TaskStatusSource) string {
 
 // ParseMarkdownToTasksWithStatus parses the markdown checklist and merges
 // completion state from the supplied task status source, marking tasks as
-// Completed in both IsDone and Status so the checklist renders the [✓] state.
+// Completed in Status so the checklist renders the [✓] state.
 func ParseMarkdownToTasksWithStatus(mdContent string, src TaskStatusSource) []Task {
 	tasks := ParseMarkdownToTasks(mdContent)
 	if src == nil {
@@ -38,8 +40,7 @@ func ParseMarkdownToTasksWithStatus(mdContent string, src TaskStatusSource) []Ta
 	}
 	for i := range tasks {
 		if src.IsCompleted(tasks[i].StepNum) {
-			tasks[i].IsDone = true
-			tasks[i].Status = "done"
+			tasks[i].Status = task.StatusDone
 		}
 	}
 	return tasks

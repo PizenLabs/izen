@@ -146,8 +146,8 @@ func artifactsToTasks(artifacts []adapter.FileArtifact) []Task {
 			continue
 		}
 		out = append(out, Task{
-			StepNum:     len(out) + 1,
-			IsDone:      false,
+			StepNum: len(out) + 1,
+
 			Status:      "idle",
 			Type:        "FILE_MUTATE",
 			Target:      path,

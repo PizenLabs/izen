@@ -40,8 +40,8 @@ func GenerateFallbackPlan(target FallbackPlanTarget) []plan.Task {
 	if target.File == "" && target.ShellCommand == "" {
 		if target.Description != "" {
 			return []plan.Task{{
-				StepNum:     1,
-				IsDone:      false,
+				StepNum: 1,
+
 				Status:      "idle",
 				Type:        "SHELL_EXEC",
 				Target:      "go test ./...",
@@ -52,8 +52,8 @@ func GenerateFallbackPlan(target FallbackPlanTarget) []plan.Task {
 			}}
 		}
 		return []plan.Task{{
-			StepNum:     1,
-			IsDone:      false,
+			StepNum: 1,
+
 			Status:      "idle",
 			Type:        "SHELL_EXEC",
 			Target:      "go test ./...",
@@ -75,8 +75,8 @@ func GenerateFallbackPlan(target FallbackPlanTarget) []plan.Task {
 			desc = fmt.Sprintf("Run shell command: %s", cmd)
 		}
 		return []plan.Task{{
-			StepNum:     1,
-			IsDone:      false,
+			StepNum: 1,
+
 			Status:      "idle",
 			Type:        "SHELL_EXEC",
 			Target:      cmd,
@@ -105,8 +105,8 @@ func GenerateFallbackPlan(target FallbackPlanTarget) []plan.Task {
 	}
 
 	task := plan.Task{
-		StepNum:     1,
-		IsDone:      false,
+		StepNum: 1,
+
 		Status:      "idle",
 		Type:        "FILE_MUTATE",
 		Target:      target.File,

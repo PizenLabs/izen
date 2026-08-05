@@ -12,7 +12,7 @@ func TestGraphAddGetHasLen(t *testing.T) {
 	if g.Len() != 0 {
 		t.Fatalf("fresh graph Len = %d, want 0", g.Len())
 	}
-	a := Task{ID: "a", Description: "first", Dependencies: []string{"c"}}
+	a := Node{ID: "a", Description: "first", Dependencies: []string{"c"}}
 	if err := g.Add(a); err != nil {
 		t.Fatalf("Add(a): %v", err)
 	}
@@ -36,26 +36,26 @@ func TestGraphAddGetHasLen(t *testing.T) {
 
 func TestGraphAddRejectsInvalid(t *testing.T) {
 	g := New()
-	if err := g.Add(Task{ID: ""}); !errors.Is(err, ErrEmptyTaskID) {
+	if err := g.Add(Node{ID: ""}); !errors.Is(err, ErrEmptyTaskID) {
 		t.Errorf("empty id err = %v, want ErrEmptyTaskID", err)
 	}
-	if err := g.Add(Task{ID: "a"}); err != nil {
+	if err := g.Add(Node{ID: "a"}); err != nil {
 		t.Fatalf("Add(a): %v", err)
 	}
-	if err := g.Add(Task{ID: "a"}); !errors.Is(err, ErrDuplicateTask) {
+	if err := g.Add(Node{ID: "a"}); !errors.Is(err, ErrDuplicateTask) {
 		t.Errorf("duplicate err = %v, want ErrDuplicateTask", err)
 	}
-	if err := g.Add(Task{ID: "b", Dependencies: []string{"b"}}); !errors.Is(err, ErrSelfDependency) {
+	if err := g.Add(Node{ID: "b", Dependencies: []string{"b"}}); !errors.Is(err, ErrSelfDependency) {
 		t.Errorf("self dep err = %v, want ErrSelfDependency", err)
 	}
 }
 
 func TestGraphDependenciesAndDependents(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a"})
-	mustAdd(t, g, Task{ID: "b", Dependencies: []string{"a"}})
-	mustAdd(t, g, Task{ID: "c", Dependencies: []string{"a"}})
-	mustAdd(t, g, Task{ID: "d", Dependencies: []string{"b", "c"}})
+	mustAdd(t, g, Node{ID: "a"})
+	mustAdd(t, g, Node{ID: "b", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "c", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "d", Dependencies: []string{"b", "c"}})
 
 	if got := g.Dependencies("d"); !reflect.DeepEqual(got, []string{"b", "c"}) {
 		t.Errorf("Dependencies(d) = %v", got)
@@ -73,9 +73,9 @@ func TestGraphDependenciesAndDependents(t *testing.T) {
 
 func TestGraphTasksSnapshotInsertionOrder(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "x"})
-	mustAdd(t, g, Task{ID: "y"})
-	mustAdd(t, g, Task{ID: "z"})
+	mustAdd(t, g, Node{ID: "x"})
+	mustAdd(t, g, Node{ID: "y"})
+	mustAdd(t, g, Node{ID: "z"})
 	tasks := g.Tasks()
 	if len(tasks) != 3 {
 		t.Fatalf("Tasks len = %d, want 3", len(tasks))
@@ -91,9 +91,9 @@ func TestGraphTasksSnapshotInsertionOrder(t *testing.T) {
 
 func TestGraphValidateValid(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a"})
-	mustAdd(t, g, Task{ID: "b", Dependencies: []string{"a"}})
-	mustAdd(t, g, Task{ID: "c", Dependencies: []string{"a", "b"}})
+	mustAdd(t, g, Node{ID: "a"})
+	mustAdd(t, g, Node{ID: "b", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "c", Dependencies: []string{"a", "b"}})
 	if err := g.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestGraphValidateEmptyGraph(t *testing.T) {
 
 func TestGraphValidateMissingDependency(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a", Dependencies: []string{"ghost"}})
+	mustAdd(t, g, Node{ID: "a", Dependencies: []string{"ghost"}})
 	err := g.Validate()
 	if !errors.Is(err, ErrMissingDependency) {
 		t.Fatalf("Validate err = %v, want ErrMissingDependency", err)
@@ -116,8 +116,8 @@ func TestGraphValidateMissingDependency(t *testing.T) {
 
 func TestGraphValidateCycle(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a", Dependencies: []string{"b"}})
-	mustAdd(t, g, Task{ID: "b", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "a", Dependencies: []string{"b"}})
+	mustAdd(t, g, Node{ID: "b", Dependencies: []string{"a"}})
 	err := g.Validate()
 	if !errors.Is(err, ErrCycleDetected) {
 		t.Fatalf("Validate err = %v, want ErrCycleDetected", err)
@@ -126,10 +126,10 @@ func TestGraphValidateCycle(t *testing.T) {
 
 func TestGraphTopologicalOrder(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a"})
-	mustAdd(t, g, Task{ID: "b", Dependencies: []string{"a"}})
-	mustAdd(t, g, Task{ID: "c"})
-	mustAdd(t, g, Task{ID: "d", Dependencies: []string{"b", "c"}})
+	mustAdd(t, g, Node{ID: "a"})
+	mustAdd(t, g, Node{ID: "b", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "c"})
+	mustAdd(t, g, Node{ID: "d", Dependencies: []string{"b", "c"}})
 	order, err := g.TopologicalOrder()
 	if err != nil {
 		t.Fatalf("TopologicalOrder: %v", err)
@@ -152,8 +152,8 @@ func TestGraphTopologicalOrder(t *testing.T) {
 
 func TestGraphTopologicalOrderCycle(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a", Dependencies: []string{"b"}})
-	mustAdd(t, g, Task{ID: "b", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "a", Dependencies: []string{"b"}})
+	mustAdd(t, g, Node{ID: "b", Dependencies: []string{"a"}})
 	if _, err := g.TopologicalOrder(); !errors.Is(err, ErrCycleDetected) {
 		t.Fatalf("TopologicalOrder err = %v, want ErrCycleDetected", err)
 	}
@@ -161,9 +161,9 @@ func TestGraphTopologicalOrderCycle(t *testing.T) {
 
 func TestGraphReady(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a"})
-	mustAdd(t, g, Task{ID: "b", Dependencies: []string{"a"}})
-	mustAdd(t, g, Task{ID: "c", Dependencies: []string{"b"}})
+	mustAdd(t, g, Node{ID: "a"})
+	mustAdd(t, g, Node{ID: "b", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "c", Dependencies: []string{"b"}})
 
 	if got := g.Ready(nil); !reflect.DeepEqual(got, []string{"a"}) {
 		t.Errorf("Ready(nil) = %v, want [a]", got)
@@ -179,7 +179,7 @@ func TestGraphReady(t *testing.T) {
 	}
 }
 
-func mustAdd(t *testing.T, g *Graph, ts Task) {
+func mustAdd(t *testing.T, g *Graph, ts Node) {
 	t.Helper()
 	if err := g.Add(ts); err != nil {
 		t.Fatalf("Add(%s): %v", ts.ID, err)
@@ -188,9 +188,9 @@ func mustAdd(t *testing.T, g *Graph, ts Task) {
 
 func TestCursorLinearChain(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a"})
-	mustAdd(t, g, Task{ID: "b", Dependencies: []string{"a"}})
-	mustAdd(t, g, Task{ID: "c", Dependencies: []string{"b"}})
+	mustAdd(t, g, Node{ID: "a"})
+	mustAdd(t, g, Node{ID: "b", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "c", Dependencies: []string{"b"}})
 	c := NewCursor(g)
 
 	for _, want := range []string{"a", "b", "c"} {
@@ -224,9 +224,9 @@ func TestCursorLinearChain(t *testing.T) {
 
 func TestCursorSharedDependency(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "setup"})
-	mustAdd(t, g, Task{ID: "left", Dependencies: []string{"setup"}})
-	mustAdd(t, g, Task{ID: "right", Dependencies: []string{"setup"}})
+	mustAdd(t, g, Node{ID: "setup"})
+	mustAdd(t, g, Node{ID: "left", Dependencies: []string{"setup"}})
+	mustAdd(t, g, Node{ID: "right", Dependencies: []string{"setup"}})
 	c := NewCursor(g)
 
 	id, err := c.Advance()
@@ -249,8 +249,8 @@ func TestCursorSharedDependency(t *testing.T) {
 
 func TestCursorBlockedAndNoReady(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a", Dependencies: []string{"b"}})
-	mustAdd(t, g, Task{ID: "b", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "a", Dependencies: []string{"b"}})
+	mustAdd(t, g, Node{ID: "b", Dependencies: []string{"a"}})
 	c := NewCursor(g)
 
 	if _, err := c.Advance(); !errors.Is(err, ErrNoReadyTask) {
@@ -266,8 +266,8 @@ func TestCursorBlockedAndNoReady(t *testing.T) {
 
 func TestCursorCompleteEnforcesDependencies(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a"})
-	mustAdd(t, g, Task{ID: "b", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "a"})
+	mustAdd(t, g, Node{ID: "b", Dependencies: []string{"a"}})
 	c := NewCursor(g)
 
 	if err := c.Complete("b"); !errors.Is(err, ErrDependenciesPending) {
@@ -290,8 +290,8 @@ func TestCursorCompleteEnforcesDependencies(t *testing.T) {
 
 func TestCursorFail(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a"})
-	mustAdd(t, g, Task{ID: "b", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "a"})
+	mustAdd(t, g, Node{ID: "b", Dependencies: []string{"a"}})
 	c := NewCursor(g)
 
 	if _, err := c.Advance(); err != nil {
@@ -314,9 +314,9 @@ func TestCursorFail(t *testing.T) {
 
 func TestCursorProgress(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a"})
-	mustAdd(t, g, Task{ID: "b", Dependencies: []string{"a"}})
-	mustAdd(t, g, Task{ID: "c", Dependencies: []string{"b"}})
+	mustAdd(t, g, Node{ID: "a"})
+	mustAdd(t, g, Node{ID: "b", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "c", Dependencies: []string{"b"}})
 	c := NewCursor(g)
 
 	if p := c.Progress(); p.Total != 3 || p.Pending != 1 || p.Blocked != 2 {
@@ -341,8 +341,8 @@ func TestCursorProgress(t *testing.T) {
 
 func TestCursorReset(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a"})
-	mustAdd(t, g, Task{ID: "b", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "a"})
+	mustAdd(t, g, Node{ID: "b", Dependencies: []string{"a"}})
 	c := NewCursor(g)
 
 	if _, err := c.Advance(); err != nil {
@@ -362,9 +362,9 @@ func TestCursorReset(t *testing.T) {
 
 func TestCursorStatus(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a"})
+	mustAdd(t, g, Node{ID: "a"})
 	c := NewCursor(g)
-	if st, ok := c.Status("a"); !ok || st != StatusPending {
+	if st, ok := c.Status("a"); !ok || st != CursorStatusPending {
 		t.Errorf("Status(a) = (%s, %v), want (pending, true)", st, ok)
 	}
 	if _, ok := c.Status("ghost"); ok {
@@ -373,16 +373,16 @@ func TestCursorStatus(t *testing.T) {
 	if _, err := c.Advance(); err != nil {
 		t.Fatalf("Advance: %v", err)
 	}
-	if st, _ := c.Status("a"); st != StatusActive {
+	if st, _ := c.Status("a"); st != CursorStatusActive {
 		t.Errorf("Status(a) = %s, want active", st)
 	}
 }
 
 func TestCursorConcurrentReads(t *testing.T) {
 	g := New()
-	mustAdd(t, g, Task{ID: "a"})
-	mustAdd(t, g, Task{ID: "b", Dependencies: []string{"a"}})
-	mustAdd(t, g, Task{ID: "c", Dependencies: []string{"b"}})
+	mustAdd(t, g, Node{ID: "a"})
+	mustAdd(t, g, Node{ID: "b", Dependencies: []string{"a"}})
+	mustAdd(t, g, Node{ID: "c", Dependencies: []string{"b"}})
 	c := NewCursor(g)
 
 	var wg sync.WaitGroup

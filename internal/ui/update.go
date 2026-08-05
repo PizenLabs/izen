@@ -563,7 +563,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if m.planEngine != nil && len(m.planEngine.AllowedFiles) > 0 {
 			scopeTasks := make([]control.TaskTarget, len(msg.Tasks))
 			for i, t := range msg.Tasks {
-				scopeTasks[i] = control.TaskTarget{Target: t.Target, Type: t.Type}
+				scopeTasks[i] = control.TaskTarget{Target: t.Target, Type: string(t.Type)}
 			}
 			if scopeErr := control.ValidateStagedPlan(scopeTasks, m.planEngine.AllowedFiles); scopeErr != nil {
 				var sv *control.ScopeViolationError
@@ -589,7 +589,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if t.Type == "FILE_MUTATE" || t.Type == "DIFF_PATCH" || t.Type == "ATOMIC_REPLACE" {
 				icon = Icon.SrcPatch
 			}
-			m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
+			m.handoffCtx.PendingTodos[i] = icon + " [" + string(t.Type) + "] " + t.Target + " — " + t.Description
 		}
 		if msg.IsFastTrack {
 			// Auto-create a build checkpoint BEFORE presenting the plan so that
@@ -2315,7 +2315,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 							if t.Type == "FILE_MUTATE" || t.Type == "DIFF_PATCH" || t.Type == "ATOMIC_REPLACE" {
 								icon = Icon.SrcPatch
 							}
-							m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
+							m.handoffCtx.PendingTodos[i] = icon + " [" + string(t.Type) + "] " + t.Target + " — " + t.Description
 						}
 					}
 					m.currentResult = planApprovalActions()

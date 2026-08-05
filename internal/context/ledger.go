@@ -1,6 +1,10 @@
 package context
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/PizenLabs/izen/internal/domain/task"
+)
 
 // ── Sliding-Window Task Queue (Isolation State Machine) ──────────────────────
 //
@@ -63,6 +67,41 @@ func (s TaskStatus) String() string {
 // IsTerminal returns true for completed, failed, or skipped states.
 func (s TaskStatus) IsTerminal() bool {
 	return s == TaskCompleted || s == TaskFailed || s == TaskSkipped
+}
+
+// Canonical delegates the legacy int-based task lifecycle state onto the
+// canonical domain task.TaskStatus model. The legacy TaskLedger stays the
+// sliding-window state map; routing and projection code may map to the
+// canonical enum instead of the int constants.
+func (s TaskStatus) Canonical() task.TaskStatus {
+	switch s {
+	case TaskPending:
+		return task.StatusIdle
+	case TaskExecuting:
+		return task.StatusProcessing
+	case TaskCompleted, TaskSkipped:
+		return task.StatusDone
+	case TaskFailed:
+		return task.StatusFailed
+	default:
+		return task.StatusIdle
+	}
+}
+
+// TaskStatusFromCanonical maps a canonical task.TaskStatus back onto the
+// legacy int-based lifecycle state. Stalled canonical tasks have no legacy
+// equivalent and map to TaskPending (they have not finished).
+func TaskStatusFromCanonical(s task.TaskStatus) TaskStatus {
+	switch s {
+	case task.StatusProcessing:
+		return TaskExecuting
+	case task.StatusDone:
+		return TaskCompleted
+	case task.StatusFailed:
+		return TaskFailed
+	default:
+		return TaskPending
+	}
 }
 
 // TaskLedger is the atomic task state map that synchronises /plan's checklist

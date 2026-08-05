@@ -164,6 +164,7 @@ func main() {
 
 	app, wireErr := compose.Wire(
 		compose.WithBus(bus),
+		compose.WithAuditDir(filepath.Join(root, ".izen", "audit")),
 		compose.WithCapabilities(compose.Capabilities{
 			File:  osFile,
 			Shell: shell,

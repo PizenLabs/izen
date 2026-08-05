@@ -9,9 +9,12 @@
 package compose
 
 import (
+	"fmt"
+
 	"github.com/PizenLabs/izen/internal/domain/ports"
 	"github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/events/audit"
 	"github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/runtime/handlers"
 )
@@ -28,14 +31,20 @@ type Capabilities struct {
 }
 
 // Application is the fully wired Application layer of the system: the domain
-// WorkflowRuntime, the ContextLedger projection, the LedgerBuilder, and the
-// Runtime facade with every command handler registered.
+// WorkflowRuntime, the ContextLedger projection, the LedgerBuilder, the
+// append-only event audit logger, and the Runtime facade with every command
+// handler registered.
 type Application struct {
 	Bus      *events.Bus
 	Workflow workflow.WorkflowRuntime
 	Ledger   *runtime.ContextLedger
 	Builder  *runtime.LedgerBuilder
 	Runtime  *runtime.Runtime
+	Audit    *audit.AuditLogger
+
+	// auditDir is the workspace-relative audit log directory wired via
+	// WithAuditDir. Empty disables auditing.
+	auditDir string
 
 	// Approver resolves patch approvals for the approval command handlers.
 	// Defaults to handlers.NewInMemoryApprover when not supplied.
@@ -74,6 +83,18 @@ func WithApprover(approver handlers.PatchApprover) Option {
 	}
 }
 
+// WithAuditDir wires an append-only event audit logger rooted at dir. Every
+// events.Envelope published on the shared bus is appended to
+// dir/events.ndjson. An empty dir disables auditing (the Application.Audit
+// field stays nil).
+func WithAuditDir(dir string) Option {
+	return func(a *Application) {
+		if dir != "" {
+			a.auditDir = dir
+		}
+	}
+}
+
 // Wire builds the Application: domain runtime, dispatcher, handlers, ledger
 // projection, and the Runtime facade bound to the shared bus.
 func Wire(opts ...Option) (*Application, error) {
@@ -86,6 +107,23 @@ func Wire(opts ...Option) (*Application, error) {
 	}
 	if a.Approver == nil {
 		a.Approver = handlers.NewInMemoryApprover()
+	}
+
+	// ── APPEND-ONLY EVENT AUDIT ────────────────────────────────────────
+	// The audit logger subscribes to the shared bus and persists every
+	// events.Envelope (bridged telemetry, canonical signals) to
+	// <auditDir>/events.ndjson asynchronously. It is a pure projection:
+	// non-blocking end to end, so disk I/O never stalls the pipeline or the
+	// TUI.
+	if a.auditDir != "" {
+		logger, err := audit.NewLogger(a.auditDir, a.Bus)
+		if err != nil {
+			return nil, fmt.Errorf("wire: audit logger: %w", err)
+		}
+		if err := logger.Start(); err != nil {
+			return nil, fmt.Errorf("wire: start audit logger: %w", err)
+		}
+		a.Audit = logger
 	}
 
 	wf := workflow.NewWorkflowRuntime()
@@ -110,11 +148,15 @@ func Wire(opts ...Option) (*Application, error) {
 	return a, nil
 }
 
-// Close tears down the Application: it stops the ledger projection and the
-// runtime presentation projection. Idempotent.
+// Close tears down the Application: it stops the audit logger, the ledger
+// projection and the runtime presentation projection. Idempotent.
 func (a *Application) Close() {
 	if a == nil {
 		return
+	}
+	if a.Audit != nil {
+		_ = a.Audit.Close()
+		a.Audit = nil
 	}
 	if a.Builder != nil {
 		a.Builder.Close()

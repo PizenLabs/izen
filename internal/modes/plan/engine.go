@@ -613,8 +613,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 						desc := fmt.Sprintf("Replace import path %q with %q at %s:%d",
 							mismatch.OldPath, mismatch.NewPath, ref.File, ref.StartLine)
 						tasks = append(tasks, Task{
-							StepNum:     i + 1,
-							IsDone:      false,
+							StepNum: i + 1,
+
 							Status:      "idle",
 							Type:        "FILE_MUTATE",
 							Target:      ref.File,
@@ -626,8 +626,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 					}
 					tidyStep := len(refs) + 1
 					tasks = append(tasks, Task{
-						StepNum:     tidyStep,
-						IsDone:      false,
+						StepNum: tidyStep,
+
 						Status:      "idle",
 						Type:        "SHELL_EXEC",
 						Target:      "go mod tidy",
@@ -671,8 +671,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			if pkgName, importPath, matched := retrieval.CheckStdlibCaseCorrection(undef.Symbol); matched {
 				return []Task{
 					{
-						StepNum:     1,
-						IsDone:      false,
+						StepNum: 1,
+
 						Status:      "idle",
 						Type:        "FILE_MUTATE",
 						Target:      sanitizedTarget,
@@ -687,8 +687,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			// Phase 2: Deterministic fallback — no lx, no LLM.
 			return []Task{
 				{
-					StepNum:     1,
-					IsDone:      false,
+					StepNum: 1,
+
 					Status:      "idle",
 					Type:        "FILE_MUTATE",
 					Target:      sanitizedTarget,
@@ -720,8 +720,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			}
 			if dep != "" && !isPlaceholderToken(dep) {
 				taskGet := Task{
-					StepNum:     1,
-					IsDone:      false,
+					StepNum: 1,
+
 					Status:      "idle",
 					Type:        "SHELL_EXEC",
 					Target:      fmt.Sprintf("go get %s", dep),
@@ -731,8 +731,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 					IsHardcoded: true,
 				}
 				taskTidy := Task{
-					StepNum:     2,
-					IsDone:      false,
+					StepNum: 2,
+
 					Status:      "idle",
 					Type:        "SHELL_EXEC",
 					Target:      "go mod tidy",
@@ -745,8 +745,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			}
 			return []Task{
 				{
-					StepNum:     1,
-					IsDone:      false,
+					StepNum: 1,
+
 					Status:      "idle",
 					Type:        "SHELL_EXEC",
 					Target:      "go mod tidy",
@@ -1047,8 +1047,8 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 		if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
 			return []Task{
 				{
-					StepNum:     1,
-					IsDone:      false,
+					StepNum: 1,
+
 					Status:      "idle",
 					Type:        "SHELL_EXEC",
 					Target:      fmt.Sprintf("go get %s", dep),
@@ -1390,8 +1390,8 @@ func ForceShellExecOnCompileError(tasks []Task, problem, ledgerContent string) [
 		}
 	}
 	recovery := Task{
-		StepNum:     0,
-		IsDone:      false,
+		StepNum: 0,
+
 		Status:      "idle",
 		Type:        "SHELL_EXEC",
 		Target:      cmd,
@@ -1453,8 +1453,8 @@ func SanitizeTasksForArchetype(tasks []Task, archetype recon.ProjectArchetype) [
 		// All tasks filtered out — fallback to a single default task.
 		return []Task{
 			{
-				StepNum:     1,
-				IsDone:      false,
+				StepNum: 1,
+
 				Status:      "idle",
 				Type:        "FILE_MUTATE",
 				Target:      "",
@@ -1569,8 +1569,8 @@ func ValidateShellExecCommands(tasks []Task, ledgerContent string) []Task {
 			if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
 				return []Task{
 					{
-						StepNum:     1,
-						IsDone:      false,
+						StepNum: 1,
+
 						Status:      "idle",
 						Type:        "SHELL_EXEC",
 						Target:      fmt.Sprintf("go get %s", dep),
@@ -1580,8 +1580,8 @@ func ValidateShellExecCommands(tasks []Task, ledgerContent string) []Task {
 			}
 			return []Task{
 				{
-					StepNum:     1,
-					IsDone:      false,
+					StepNum: 1,
+
 					Status:      "idle",
 					Type:        "SHELL_EXEC",
 					Target:      "go mod tidy",
@@ -1915,8 +1915,8 @@ func detectDirectMutation(problem string, ledgerContent string) *Task {
 	}
 
 	return &Task{
-		StepNum:     1,
-		IsDone:      false,
+		StepNum: 1,
+
 		Status:      "idle",
 		Type:        "FILE_MUTATE",
 		Target:      targetFile,

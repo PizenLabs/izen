@@ -670,7 +670,7 @@ func (m *model) renderThinkingBlock(text string, width int) string {
 // FILE_MUTATE/DIFF_PATCH/ATOMIC_REPLACE → 📝 [CODE_MOD]
 // Verification commands (go test, go build, etc.) → 🧪 [VERIFY]
 func planTrackIcon(t plan.Task) (string, string) {
-	icon, label := enrichedTrack(t.Type, t.Target)
+	icon, label := enrichedTrack(string(t.Type), t.Target)
 	return icon, label
 }
 

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/domain/task"
 )
 
 type FlatPlanSpec struct {
@@ -62,9 +64,9 @@ func FlatSpecToTasks(spec *FlatPlanSpec) []Task {
 		return nil
 	}
 
-	taskType := "FILE_MUTATE"
+	taskType := task.TaskFileMutate
 	if spec.Action == "SHELL_EXEC" {
-		taskType = "SHELL_EXEC"
+		taskType = task.TaskShellExec
 	}
 
 	description := fmt.Sprintf("%s %s", spec.Action, spec.Target)
@@ -84,8 +86,7 @@ func FlatSpecToTasks(spec *FlatPlanSpec) []Task {
 
 	return []Task{{
 		StepNum:     1,
-		IsDone:      false,
-		Status:      "idle",
+		Status:      task.StatusIdle,
 		Type:        taskType,
 		Target:      spec.Target,
 		Description: description,

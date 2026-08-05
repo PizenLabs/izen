@@ -28,6 +28,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
+	"github.com/PizenLabs/izen/internal/domain/task"
 	objengine "github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
@@ -236,8 +237,8 @@ func (m *model) handleInput(line string) tea.Cmd {
 				var tasks []plan.Task
 				for i, f := range targets {
 					tasks = append(tasks, plan.Task{
-						StepNum:     i + 1,
-						IsDone:      false,
+						StepNum: i + 1,
+
 						Status:      "idle",
 						Type:        "FILE_MUTATE",
 						Target:      f,
@@ -283,8 +284,8 @@ func (m *model) handleInput(line string) tea.Cmd {
 				var tasks []plan.Task
 				for i, f := range multiTargets {
 					tasks = append(tasks, plan.Task{
-						StepNum:     i + 1,
-						IsDone:      false,
+						StepNum: i + 1,
+
 						Status:      "idle",
 						Type:        "FILE_MUTATE",
 						Target:      f,
@@ -1098,8 +1099,8 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 					return planResultMsg{
 						Tasks: []plan.Task{
 							{
-								StepNum:     1,
-								IsDone:      false,
+								StepNum: 1,
+
 								Status:      "idle",
 								Type:        "SHELL_EXEC",
 								Target:      "go test ./...",
@@ -1117,8 +1118,8 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 				return planResultMsg{
 					Tasks: []plan.Task{
 						{
-							StepNum:     1,
-							IsDone:      false,
+							StepNum: 1,
+
 							Status:      "idle",
 							Type:        "FILE_MUTATE",
 							Target:      sanitizedTarget,
@@ -1294,7 +1295,7 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 			if err == nil && len(tasks) > 0 && len(m.planEngine.AllowedFiles) > 0 {
 				scopeTasks := make([]control.TaskTarget, len(tasks))
 				for i, t := range tasks {
-					scopeTasks[i] = control.TaskTarget{Target: t.Target, Type: t.Type}
+					scopeTasks[i] = control.TaskTarget{Target: t.Target, Type: string(t.Type)}
 				}
 				if scopeErr := control.ValidateStagedPlan(scopeTasks, m.planEngine.AllowedFiles); scopeErr != nil {
 					var sv *control.ScopeViolationError
@@ -1307,7 +1308,7 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 							// Re-validate retry tasks.
 							retryScopeTasks := make([]control.TaskTarget, len(retryTasks))
 							for i, t := range retryTasks {
-								retryScopeTasks[i] = control.TaskTarget{Target: t.Target, Type: t.Type}
+								retryScopeTasks[i] = control.TaskTarget{Target: t.Target, Type: string(t.Type)}
 							}
 							if retryScopeErr := control.ValidateStagedPlan(retryScopeTasks, m.planEngine.AllowedFiles); retryScopeErr == nil {
 								debugLogPlan("SCOPE GUARD: retry succeeded with " + fmt.Sprint(len(retryTasks)) + " tasks")
@@ -2265,7 +2266,7 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 			ledger.Tasks = append(ledger.Tasks, plan.AtomicTask{
 				TaskID:      t.StepNum,
 				File:        t.Target,
-				Strategy:    t.Type,
+				Strategy:    string(t.Type),
 				Description: t.Description,
 			})
 		}
@@ -2420,7 +2421,7 @@ func (m *model) runBuildCmd(content string) tea.Cmd {
 			}
 			tasks = append(tasks, plan.Task{
 				StepNum:     i + 1,
-				Type:        taskType,
+				Type:        task.TaskType(taskType),
 				Target:      taskTarget,
 				Description: taskDesc,
 				Status:      "idle",
@@ -6533,7 +6534,7 @@ func extractTodosFromPlan(content string) []string {
 	if len(tasks) > 0 {
 		todos := make([]string, 0, len(tasks))
 		for _, t := range tasks {
-			label := t.Type + ": " + t.Target
+			label := string(t.Type) + ": " + t.Target
 			if t.Description != "" {
 				label += " — " + t.Description
 			}
