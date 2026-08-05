@@ -26,6 +26,7 @@ func drainFact(t *testing.T, ch <-chan tea.Msg, timeout time.Duration) tea.Msg {
 // forwarded into the Bubble Tea loop as controlFactMsg.
 func TestListenControlEventsForwardsIteration(t *testing.T) {
 	bus := telemetry.NewEventBus(64)
+	defer bus.Close()
 	ch := make(chan tea.Msg, 16)
 	send := func(m tea.Msg) { ch <- m }
 
@@ -60,6 +61,7 @@ func TestListenControlEventsForwardsIteration(t *testing.T) {
 // facts are forwarded into the Bubble Tea loop as controlFactMsg.
 func TestListenControlEventsForwardsNodeObserved(t *testing.T) {
 	bus := telemetry.NewEventBus(64)
+	defer bus.Close()
 	ch := make(chan tea.Msg, 16)
 	send := func(m tea.Msg) { ch <- m }
 
@@ -98,6 +100,7 @@ func TestListenControlEventsForwardsNodeObserved(t *testing.T) {
 // capacity must still return immediately (facts are dropped, never blocking).
 func TestListenControlEventsIsNonBlocking(t *testing.T) {
 	bus := telemetry.NewEventBus(2)
+	defer bus.Close()
 	ch := make(chan tea.Msg, 2)
 	send := func(m tea.Msg) { ch <- m }
 
