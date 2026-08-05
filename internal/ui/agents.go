@@ -128,12 +128,12 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			if len(result.Hypotheses) > 0 {
 				b.WriteString("\nHypotheses:\n")
 				for _, h := range result.Hypotheses {
-					sym := "○"
+					sym := Icon.Pending
 					switch h.Status {
 					case investigate.HypothesisConfirmed:
-						sym = "✓"
+						sym = Icon.Success
 					case investigate.HypothesisRejected:
-						sym = "✗"
+						sym = Icon.Error
 					}
 					fmt.Fprintf(&b, "  %s %s [%s] (%.0f%%)\n", sym, h.Theory, h.Status, h.Confidence*100)
 				}
@@ -182,9 +182,9 @@ func buildInvestigationEscalation(content string, result *investigate.Investigat
 		if len(result.Hypotheses) > 0 {
 			escBuilder.WriteString("### Hypotheses Tested\n\n")
 			for _, h := range result.Hypotheses {
-				statusSym := "✗"
+				statusSym := Icon.Error
 				if h.Status == investigate.HypothesisConfirmed {
-					statusSym = "✓"
+					statusSym = Icon.Success
 				}
 				fmt.Fprintf(&escBuilder, "- **%s** — %s (%.0f%% confidence) %s\n", h.Theory, h.Status, h.Confidence*100, statusSym)
 			}
@@ -239,9 +239,9 @@ func (m *model) runReviewTestComposite() tea.Cmd {
 
 			recs := []record{}
 
-			statusLine := "✓ all tests passed"
+			statusLine := Icon.Success + " all tests passed"
 			if !res.TestPassed {
-				statusLine = "✗ tests failed — see telemetry below"
+				statusLine = Icon.Error + " tests failed — see telemetry below"
 			}
 			recs = append(recs, record{role: roleSystem, text: statusLine})
 			if res.TestReport != "" {
@@ -484,7 +484,7 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 					}
 					fmt.Fprintf(&b, "  [%s] %d findings:\n", strings.ToUpper(string(sev)), len(findings))
 					for _, f := range findings {
-						fmt.Fprintf(&b, "    • %s:%d — %s\n", f.File, f.Line, f.Description)
+						fmt.Fprintf(&b, "    "+Icon.Bullet+" %s:%d — %s\n", f.File, f.Line, f.Description)
 					}
 				}
 			}
@@ -561,7 +561,7 @@ func (m *model) runUndoCmd(raw string) tea.Cmd {
 				m.push(roleError, "undo --all failed: "+err.Error())
 				return nil
 			}
-			m.push(roleStatus, "✓ Reverted all working directory changes")
+			m.push(roleStatus, Icon.Success+" Reverted all working directory changes")
 			return nil
 		}
 		// --session: restore session-start checkpoint
@@ -575,7 +575,7 @@ func (m *model) runUndoCmd(raw string) tea.Cmd {
 		}
 		m.sess.Checkpoints = nil
 		_ = m.sess.Save()
-		m.push(roleStatus, "✓ Reverted all working directory changes")
+		m.push(roleStatus, Icon.Success+" Reverted all working directory changes")
 		return nil
 	}
 

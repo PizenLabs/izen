@@ -124,10 +124,24 @@ var Icon = struct {
 	EnvDeps   string
 	CodeMod   string
 	Verify    string
+	// Interrupt is the stop-sign glyph used by the interrupt hint next to the
+	// runtime status spinner while a stream or shell command is active.
+	Interrupt string
+	// Index is the lightning-bolt glyph used by the header indexing badge.
+	Index string
+	// ── Tool activity stream icons (Claude Code / OpenCode style) ──
+	// Nerd-Font cod glyphs used to prefix live tool steps so the tree reads
+	// as a transparent execution log: grep/read/diff/exec each carry a
+	// dedicated glyph (Icon.Diff is repurposed from the unused "⇄" to the
+	// cod-diff glyph). The exec icon is the animated snowflake ✻ while a
+	// shell command is running (see SpinnerSnowflakeFrames).
+	Grep string
+	Read string
+	Exec string
 }{
 	Command:   "❯",
 	File:      "▦",
-	Diff:      "⇄",
+	Diff:      "\U000F03EB", // nf-cod-diff — patch/diff tool step
 	Task:      "✓",
 	Warning:   "▲",
 	Review:    "◎",
@@ -158,7 +172,37 @@ var Icon = struct {
 	EnvDeps:   "\U000F03D7",
 	CodeMod:   "\U000F061E",
 	Verify:    "\U000F0668",
+	Interrupt: "⏹",
+	Index:     "⚡",
+	Grep:      "\U000F0349", // nf-cod-search — grep tool step
+	Read:      "\U000F0219", // nf-cod-file — read tool step
+	Exec:      "✻",          // snowflake — shell exec step (animated while running)
 }
+
+// SpinnerSnowflakeFrames is the canonical animated snowflake sequence
+// (✻ ❅ ❆ ✦) shared by the inline loading spinner, the exec tree node, and the
+// loading dock. Every spinner in the UI must cycle these frames so the glyph
+// set stays identical across all modes.
+var SpinnerSnowflakeFrames = []string{"✻", "❅", "❆", "✦"}
+
+// SpinnerSnowflake returns the resting snowflake glyph (the first frame of
+// SpinnerSnowflakeFrames). Used whenever a static (non-animated) loading or
+// exec indicator is needed.
+func SpinnerSnowflake() string {
+	return SpinnerSnowflakeFrames[0]
+}
+
+// IconGrep returns the Nerd-Font cod-search glyph used to prefix grep tool
+// steps in the activity tree.
+func IconGrep() string { return Icon.Grep }
+
+// IconRead returns the Nerd-Font cod-file glyph used to prefix read tool
+// steps in the activity tree.
+func IconRead() string { return Icon.Read }
+
+// IconExec returns the snowflake glyph used to prefix shell-exec tool steps
+// in the activity tree (animated while the command is running).
+func IconExec() string { return Icon.Exec }
 
 // rule returns a full-width horizontal separator rendered in the given style.
 // Used for region boundaries that must reflow deterministically on resize.

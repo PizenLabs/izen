@@ -175,7 +175,7 @@ type modelPickerRefreshMsg struct {
 
 func NewModelPickerModal() *ModelPickerModal {
 	ti := textinput.New()
-	ti.Prompt = "▸ "
+	ti.Prompt = Icon.Chevron + " "
 	ti.Placeholder = "type to filter models..."
 	ti.CharLimit = 64
 	ti.Width = 40
@@ -561,7 +561,7 @@ func (mp *ModelPickerModal) renderList() string {
 			cursor := "  "
 			itemStyle := dimmedStyle
 			if row.itemIndex == mp.cursor {
-				cursor = "▸ "
+				cursor = Icon.Chevron + " "
 				itemStyle = lipgloss.NewStyle().
 					Foreground(lipgloss.Color(colorAccent)).
 					Bold(true)
@@ -635,9 +635,9 @@ func (mp *ModelPickerModal) renderEffortSlider() string {
 			for j := 0; j < trackLen; j++ {
 				switch {
 				case i == mp.effortIdx && j == 0:
-					b.WriteString(levelStyle.Render("●"))
+					b.WriteString(levelStyle.Render(Icon.Check))
 				case i < mp.effortIdx && j == trackLen-1:
-					b.WriteString(levelStyle.Render("●"))
+					b.WriteString(levelStyle.Render(Icon.Check))
 				default:
 					b.WriteString(dimmedStyle.Render("─"))
 				}

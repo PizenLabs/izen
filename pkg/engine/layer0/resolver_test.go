@@ -289,6 +289,61 @@ func TestResolve_ProjectDocsDiscovery(t *testing.T) {
 	}
 }
 
+// TestFindInDirReturnsActualOnDiskName guards the case-sensitive filesystem
+// regression: findInDir must return the ACTUAL on-disk entry name, never the
+// canonical candidate spelling. Reporting "ARCHITECTURE.md" as "architecture.md"
+// builds a path that os.Stat cannot resolve on Linux CI, silently dropping the
+// doc. This asserts the returned STRING, so it fails deterministically on any
+// filesystem.
+func TestFindInDirReturnsActualOnDiskName(t *testing.T) {
+	dir := t.TempDir()
+	// On-disk spelling differs from the canonical candidate name.
+	if err := os.WriteFile(filepath.Join(dir, "ARCHITECTURE.md"), []byte("# x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := findInDir(dir, []string{"architecture.md", "ARCHITECTURE.md"})
+	if len(got) != 1 {
+		t.Fatalf("findInDir = %v, want exactly 1 match", got)
+	}
+	if got[0] != "ARCHITECTURE.md" {
+		t.Fatalf("findInDir = %q, want the actual on-disk name %q", got[0], "ARCHITECTURE.md")
+	}
+}
+
+// TestResolve_ProjectDocsPreservesOnDiskCase pins the end-to-end contract: a
+// nested docs/architecture/ARCHITECTURE.md must be discovered with its real
+// path so readDoc resolves it on case-sensitive filesystems. The nested doc
+// plus docs/architecture.md and CONTRIBUTING.md must all surface.
+func TestResolve_ProjectDocsPreservesOnDiskCase(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"go.mod":                            "module github.com/example/x\n",
+		"docs/architecture.md":              "# Architecture\n",
+		"docs/architecture/ARCHITECTURE.md": "# Nested arch\n",
+		"CONTRIBUTING.md":                   "# Contributing\n",
+	})
+
+	k, err := NewKnowledgeResolver(dir).Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var nested *SourceDoc
+	for i := range k.ProjectDocs {
+		if k.ProjectDocs[i].Path == "docs/architecture/ARCHITECTURE.md" {
+			nested = &k.ProjectDocs[i]
+			break
+		}
+	}
+	if nested == nil {
+		t.Fatalf("nested doc missing (paths=%+v)", k.ProjectDocs)
+	}
+	if !strings.Contains(nested.Head, "Nested arch") {
+		t.Fatalf("nested doc head not read (readDoc failed to stat the on-disk path): %+v", nested)
+	}
+}
+
 func TestResolve_StaticHtmlOnly(t *testing.T) {
 	dir := t.TempDir()
 	writeFiles(t, dir, map[string]string{

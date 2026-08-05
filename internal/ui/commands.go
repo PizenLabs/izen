@@ -199,7 +199,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 	// prefix and route this to a plain static /review, silently bypassing the
 	// dynamic-test-then-review composite shortcut).
 	if command.IsReviewTestComposite(line) {
-		m.push(roleSystem, accentStyle.Render("⚡ [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
+		m.push(roleSystem, accentStyle.Render(Icon.Index+" [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m.runReviewTestComposite()
@@ -423,7 +423,14 @@ func (m *model) handleInput(line string) tea.Cmd {
 	// or — at low confidence (ConfirmationRequirement) — surfaced as an
 	// interactive mode-selection prompt instead of acting on a blind guess.
 	// The route runs async because the semantic fallback may invoke the LLM.
-	if m.intentRouter != nil {
+	//
+	// ── /ask MODE LOCK: Direct Read-Only Chat boundary ───────────────
+	// /ask is a strict read-only chat boundary. The ONLY valid sub-prompt
+	// is $prompt (handled above). Free-form input in /ask MUST NEVER route
+	// through the intent classifier — the classifier can misclassify natural
+	// questions as /plan, /investigate, or /build and auto-switch modes,
+	// violating the Direct Chat contract. Bypass the router entirely.
+	if m.intentRouter != nil && m.resolver.Current() != modes.ModeAsk {
 		return m.routeFreeInput(line)
 	}
 
@@ -461,7 +468,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 	m.pendingFileRefs = nil
 
 	// CONTEXT GOVERNANCE (P3): /ask context assembly is routed EXCLUSIVELY
-	// through the Context Planner (planContextForAsk → Planner.Plan()). Explicit
+	// through the Context Planner (prepareAskStreamCmd → Planner.Plan()). Explicit
 	// @file references are resolved by the planner's gatherFileRefs via the
 	// governed FileSource adapter; the fallback file-read path lives in
 	// streamCmd (injectFileContext) and is likewise planner-backed. No raw disk
@@ -656,6 +663,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.agentLabel = "synthesizing plan"
 			m.planPending = true
 			m.planStartedAt = time.Now()
+			m.startShimmer("Synthesizing plan...", "plan")
 			m.push(roleSystem, infoStyle.Render("Synthesizing structured execution plan from investigation data..."))
 			// FAST-TRACK NOTICE: when there are zero pre-parsed TODOs the
 			// synthesis runs purely on the forensic ledger. Surface an implicit
@@ -679,6 +687,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 				m.flushPendingRecords(),
 				m.smoothStreamTickCmd(),
 				m.planSlowNoticeCmd(),
+				m.shimmerTickCmd(),
 				m.runPlanEngineCmd(handoffSource, problem, m.routeModel("plan"), m.handoffCtx),
 			)
 		}
@@ -787,11 +796,66 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		// before the context reaches the LLM. The injection is a strict
 		// additive enrichment: it degrades silently to the untouched input
 		// when no graph is ready or the plan yields no chunks.
+		//
+		// T=0MS ASYNC DISPATCH: the planner query + fallback file reads run on
+		// a background goroutine (prepareAskStreamCmd) so the Enter handler can
+		// return immediately with the loading shimmer animating. The assembled
+		// content is delivered as askStreamPreparedMsg, whose Update handler
+		// runs streamCmd synchronously on the event loop (all model mutations
+		// stay on the UI goroutine).
 		if m.resolver.Current() == modes.ModeAsk {
-			content = m.planContextForAsk(content)
+			// Local intent interception is cheap and MUST run first — a greeting
+			// ("hi") or identity question is answered locally with zero LLM or
+			// planner involvement, so casual chat never triggers a workspace
+			// scan. streamCmd runs the same check for non-/ask paths.
+			if response := m.interceptLocalIntent(content); response != "" {
+				m.push(roleAI, response)
+				return nil
+			}
+			return m.prepareAskStreamCmd(content)
 		}
 
 		return m.streamCmd(content)
+	}
+}
+
+// prepareAskStreamCmd assembles /ask context (Context Planner query + fallback
+// @file reads) on a background goroutine. It is the t=0ms async seam for the
+// prompt-submit hot path: the Enter handler dispatches it together with the
+// shimmer tick so the loading dock animates INSTANTLY while the planner scans
+// the workspace. The goroutine performs strictly read-only work — the planner
+// is pre-warmed on the event loop and captured, and no model field is written
+// — so there is no data race with the UI goroutine. All state mutations happen
+// in the askStreamPreparedMsg handler when the message lands.
+func (m *model) prepareAskStreamCmd(content string) tea.Cmd {
+	// Pre-warm the planner on the event loop (cheap construction — it only
+	// assembles adapters, it never queries) so the background goroutine reads
+	// an already-cached m.planner and can never race its lazy construction.
+	p := m.contextPlanner()
+	workspaceRoot := m.workspaceRoot
+	return func() tea.Msg {
+		prepared := content
+		governed := false
+		var trace *ctxpkg.CodebaseTrace
+		if p != nil {
+			if plan, err := p.Plan(context.Background(), content); err == nil && plan != nil && len(plan.Chunks) > 0 {
+				header := fmt.Sprintf("### PLANNED CONTEXT (%s intent, %d tokens)\n\n",
+					plan.Intent, plan.TokenTotal)
+				prepared = header + plan.Assemble() + "\n\n" + content
+				governed = true
+				trace = planToTrace(plan)
+			}
+		}
+		if !governed {
+			// Fallback: ungoverned @file resolution + disk read. Runs here (off
+			// the event loop) so even the degraded path never blocks submit.
+			if augmented := m.injectFileContext(workspaceRoot, content, content); augmented != content {
+				prepared = augmented
+			}
+			// The fallback attempted resolution, so streamCmd must not re-run it.
+			governed = true
+		}
+		return askStreamPreparedMsg{content: prepared, governed: governed, trace: trace}
 	}
 }
 
@@ -1664,7 +1728,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	// dynamic test suite, injects the telemetry into the forensic ledger, then
 	// triggers the risk analysis engine with both git diff AND test reports.
 	if command.IsReviewTestComposite(cmd) {
-		m.push(roleSystem, accentStyle.Render("⚡ [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
+		m.push(roleSystem, accentStyle.Render(Icon.Index+" [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m.runReviewTestComposite()
@@ -2319,10 +2383,11 @@ func (m *model) performFastTrackBuildCmd() tea.Cmd {
 	m.agentLabel = "building"
 	m.agentDone = false
 	m.pipelineRunning = true
+	m.startShimmer("Executing strategy...", "execute")
 	m.push(roleStatus, "BUILDING...")
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
-	return tea.Batch(m.smoothStreamTickCmd(), m.runBuildFastTrack())
+	return tea.Batch(m.smoothStreamTickCmd(), m.shimmerTickCmd(), m.runBuildFastTrack())
 }
 
 // runBuildFastTrack executes all staged FILE_MUTATE tasks in a single
@@ -2868,11 +2933,13 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 	m.lastAgentActivity = time.Now()
+	m.startShimmer("Applying hotfix...", "execute")
 
 	return tea.Batch(
 		func() tea.Msg { return agentStartMsg{label: "hotfix"} },
 		m.proposeHotfixPatch(&hotfixTask),
 		m.smoothStreamTickCmd(),
+		m.shimmerTickCmd(),
 		m.hotfixProgressCmd(),
 	)
 }
@@ -5055,6 +5122,7 @@ func (m *model) runLogCmd(traceData string) tea.Cmd {
 	m.cancelStaleAgentOps()
 	m.pipelineRunning = true
 	m.pipelineStep = "analyzing trace"
+	m.startShimmer("Analyzing trace...", "analyze")
 
 	// Capture raw shell output from the execution runner
 	return tea.Batch(
@@ -5162,7 +5230,11 @@ func (m *model) handleLogInput(msg logInputMsg) tea.Cmd {
 	m.streaming = false
 	m.streamParser = nil
 	flush := m.flushPendingRecords()
-	return tea.Batch(flush, m.streamCmd(msg.output))
+	cmd := m.streamCmd(msg.output)
+	// Override the generic "Thinking..." label with the pipeline step so the
+	// shimmer status text matches what the silent investigation is doing.
+	m.startShimmer("Analyzing failure...", "analyze")
+	return tea.Batch(flush, cmd)
 }
 
 // handleInvestigateComplete receives the silent analysis and pipes it into plan.
@@ -5185,7 +5257,9 @@ func (m *model) handleInvestigateComplete(msg investigateCompleteMsg) tea.Cmd {
 	m.streamParser = nil
 	m.handoffCtx.ProposedFix = msg.analysis
 	flush := m.flushPendingRecords()
-	return tea.Batch(flush, m.streamCmd(msg.analysis))
+	cmd := m.streamCmd(msg.analysis)
+	m.startShimmer("Blueprinting...", "plan")
+	return tea.Batch(flush, cmd)
 }
 
 // handleBlueprintReady receives the plan output and jumps to /build execution.
@@ -5269,6 +5343,8 @@ func (m *model) cancelStaleAgentOps() {
 	if m.pipelineRunning {
 		return
 	}
+
+	m.stopShimmer()
 
 	// Re-hydrate ledger from stash for new root allocations
 	if m.ledgerStash != nil {

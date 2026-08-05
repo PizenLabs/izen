@@ -89,11 +89,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				return m, nil
 			}
 		case "alt+o":
-			m.showReasoning = !m.showReasoning
-			m.refreshViewportContent()
-			if m.Ready && !m.userIsScrollingUp {
-				m.Viewport.GotoBottom()
-			}
+			// Delegate to the unified reasoning toggle so Alt+O behaves exactly
+			// like Ctrl+O: it expands/collapses the live ThinkingBuffer box in
+			// the viewport body (immediate re-render, even mid-stream) instead
+			// of flipping the vestigial showReasoning flag nothing renders from.
+			m.toggleThoughtBlock()
 			return m, nil
 		}
 	}
@@ -245,6 +245,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.streamParser.SetWidth(msg.Width - 2)
 		}
 
+		m.syncShimmerWidth()
+
 		m.refreshViewportContent()
 		return m, nil
 
@@ -303,7 +305,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// the next tick. When idle we return nil and the loop stops — no
 		// custom tick-source ownership, no locks, no deadlock.
 		hasActiveWork := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning ||
-			m.state == StateProcessing || m.state == StateAwaitingApproval
+			m.shellRunning || m.state == StateProcessing || m.state == StateAwaitingApproval || m.shimmerActive
 		if hasActiveWork {
 			// Keep the activity heartbeat fresh while any execution indicator
 			// is live. The idle-gate in the reconcile block above relies on
@@ -312,7 +314,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// 1. Physically advance the spinner frame.
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
 			// 2. Repaint the viewport from the live stream/agent buffers.
-			if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.state == StateProcessing {
+			if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.state == StateProcessing || m.shellRunning {
 				m.refreshViewportContent()
 			}
 			// 3. Re-dispatch the smooth tick to keep the render loop alive.
@@ -352,7 +354,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.agentLabel = msg.label
 		m.spinnerFrame = 0
 		m.lastAgentActivity = time.Now()
-		return m, nil
+		// Surface the loading shimmer + contextual tip for the agent's
+		// execution phase (hotfix, build, review, investigate, ...).
+		m.startShimmer(agentShimmerText(msg.label), shimmerPhaseForAgentLabel(msg.label))
+		// Ensure the shimmer tick loop is alive for agent operations whose
+		// dispatch batch did not include it (e.g. $log trace analysis).
+		return m, m.shimmerTickCmd()
 
 	case hotfixProgressMsg:
 		// Stream a $hot lifecycle log line to the terminal so the developer
@@ -374,6 +381,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
+		m.stopShimmer()
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
@@ -387,6 +395,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
+		m.stopShimmer()
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+providers.SanitizeAPIError(msg.err))
 			// PERSISTENT NAVIGATION CHIPS (BUG 1): even on failure the user
@@ -668,6 +677,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
+		m.stopShimmer()
 		if msg.err != nil {
 			m.push(roleError, "review error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
@@ -860,6 +870,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.pipelineRunning = false
 		m.streaming = false
 		m.sanitizeInputPrompt()
+		m.stopShimmer()
 
 		// ── BUILD PROPOSAL FAILURE ───────────────────────────────────
 		if msg.Err != nil {
@@ -993,6 +1004,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
+		m.stopShimmer()
 
 		// ── HOTFIX PROPOSAL FAILURE ───────────────────────────────────
 		// Patch generation failed: surface the error, abort the hotfix, and
@@ -1662,8 +1674,50 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		for _, line := range msg.lines {
 			m.push(roleSystem, line)
 		}
+		m.stopShimmer()
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
+		flush := m.flushPendingRecords()
+		return m, flush
+
+	case shellChunkMsg:
+		// ── LIVE SHELL OUTPUT ───────────────────────────────────────
+		// Stream each stdout/stderr chunk into the running exec entry of the
+		// activity tree so the output grows in real-time (visible via Ctrl+O
+		// expansion). The heartbeat keeps the idle-gate hang detector from
+		// force-clearing the shell spinner.
+		if m.activityTree != nil {
+			m.activityTree.AppendExecOutput(msg.text)
+		}
+		m.lastAgentActivity = time.Now()
+		if m.Ready {
+			m.refreshViewportContent()
+		}
+		if !m.userIsScrollingUp {
+			m.Viewport.GotoBottom()
+		}
+		return m, m.readShellCh()
+
+	case shellExitMsg:
+		// ── SHELL TERMINAL EVENT: clean teardown ────────────────────
+		// The running exec entry flips to a completed "(exit N · Xs)" line,
+		// the shell channel is torn down, and the shimmer dock is stopped so
+		// no static loading line lingers in the viewport history.
+		m.shellCh = nil
+		m.shellRunning = false
+		if m.shellCancel != nil {
+			m.shellCancel()
+			m.shellCancel = nil
+		}
+		m.stopShimmer()
+		if m.activityTree != nil {
+			m.activityTree.CompleteLastExec(msg.exitCode, msg.elapsed)
+		}
+		if msg.err != nil && msg.exitCode != 0 {
+			m.push(roleSystem, dimmedStyle.Render(fmt.Sprintf(
+				"shell exited %d (%s)", msg.exitCode, formatElapsed(msg.elapsed))))
+		}
+		m.refreshViewportContent()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -1691,10 +1745,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// frozen. So the loop must keep self-scheduling whenever a background
 		// producer still owns the flags.
 		backgroundActive := m.streaming || m.agentRunning || m.reviewRunning ||
-			m.pipelineRunning || m.planPending
+			m.pipelineRunning || m.planPending || m.shellRunning
 		if backgroundActive {
 			m.lastAgentActivity = time.Now()
-			if time.Since(m.lastSpinnerAdvance) >= 100*time.Millisecond {
+			// GUARD: when the shimmer is active, the shimmerTickCmd already
+			// advances m.spinnerFrame at 50ms cadence. Skip the smooth-stream
+			// advance to prevent double-incrementing the snowflake frames.
+			if !m.shimmerActive && time.Since(m.lastSpinnerAdvance) >= 100*time.Millisecond {
 				m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
 				m.lastSpinnerAdvance = time.Now()
 			}
@@ -1750,15 +1807,56 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Re-schedule the tick loop as long as ANY background producer owns
 		// the flags. During /plan synthesis m.streaming is false and the stream
 		// buffer is empty, so gating only on those would let the loop die and
-		// starve the event loop (frozen UI). m.planPending / m.agentRunning are
-		// the authoritative "a background op is still in flight" signals.
-		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.planPending {
+		// starve the event loop (frozen UI). m.planPending / m.agentRunning /
+		// m.shellRunning are the authoritative "a background op is still in
+		// flight" signals. m.shimmerActive is included so the loop survives
+		// the async /ask context-prep window (shimmer live, stream not yet
+		// started) and any cloud-provider burst that momentarily empties the
+		// stream flags.
+		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.planPending || m.shellRunning || m.shimmerActive {
 			m.streamTickActive = true
 			return m, m.smoothStreamTickCmd()
 		}
 		// Streaming complete
 		m.streamTickActive = false
 		return m, nil
+
+	case shimmerFrameMsg:
+		// ── SHIMMER ANIMATION TICK (~100ms) ─────────────────────────
+		// Forwards the frame to the shimmer component, which advances its
+		// sweep; the next frame is then re-scheduled on the unified ~100ms
+		// shimmer tick (m.shimmerTickCmd) so every animation loop in the UI
+		// runs on the same cadence. When shimmerActive has been cleared (first
+		// stream token, task completion, or a reconcile pass) the loop drops
+		// out here without re-scheduling — the graceful stop that replaces the
+		// animated loading line with the streaming output.
+		//
+		// CLOUD-SPINNER GUARD: the loop MUST keep re-scheduling while either
+		// the shimmer is active OR a stream is live, regardless of provider
+		// type. Cloud providers (OpenRouter/Cohere) stream in bursts that can
+		// momentarily starve lower-priority tick messages; by re-arming here on
+		// every frame while streaming is true, the spinner can never die
+		// mid-answer. The inline braille spinner takes over from the snowflake
+		// once the first content token hands off the dock.
+		if !m.shimmerActive && !m.streaming {
+			return m, nil
+		}
+		// SAFETY NET: if every background producer has released its flags but
+		// stopShimmer was never invoked by the terminal handler, the next
+		// frame self-stops. This guarantees the shimmer can never linger on a
+		// dead loading line regardless of which handler resolved the task.
+		if !m.streaming && !m.agentRunning && !m.reviewRunning && !m.pipelineRunning && !m.planPending && !m.shellRunning {
+			m.stopShimmer()
+			return m, nil
+		}
+		m.shimmerAnim, _ = m.shimmerAnim.Update(msg)
+		if m.Ready {
+			m.refreshViewportContent()
+		}
+		// Re-arm the NEXT frame on the unified 100ms shimmer tick (the
+		// component's own Tick() cadence would otherwise drift from the rest
+		// of the animation layer).
+		return m, m.shimmerTickCmd()
 
 	case planSlowNoticeMsg:
 		// One-shot soft-timeout probe for /plan synthesis. Only act if THIS
@@ -1779,6 +1877,18 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		return m, nil
 
+	case askStreamPreparedMsg:
+		// T=0MS ASYNC PREP RESOLUTION: the background /ask context assembly
+		// (planner query + fallback file reads) has completed. Apply its
+		// governance + trace flags, then run streamCmd synchronously on the
+		// event loop so ALL stream state mutations stay on the UI goroutine —
+		// no data race with the goroutine that produced this message.
+		m.askContextGoverned = msg.governed
+		if msg.trace != nil {
+			m.lastAskTrace = msg.trace
+		}
+		return m, m.streamCmd(msg.content)
+
 	case tokenMsg:
 		// LOCK-FREE CONSUMER: this per-token handler MUST NOT acquire any
 		// ContextLedger / TaskLedger mutex. It only appends to local buffers
@@ -1793,6 +1903,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// the throttle buffer instead of draining streamBuffer directly. This
 		// eliminates layout snapping caused by dumping raw buffer chunks.
 		raw := string(msg)
+		// SMOOTH CLEARING: the first content token replaces the shimmer
+		// loading line with the streaming output. The shimmer tick loop stops
+		// itself on the next frame, so no animation frame ever bleeds into
+		// the rendered answer.
+		if raw != "" && m.shimmerActive {
+			m.stopShimmer()
+		}
 		m.responseBuffer.WriteString(raw)
 		if m.streamThrottle != nil {
 			m.streamThrottle.Write(raw)
@@ -1818,6 +1935,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streamCh = nil
 		m.streaming = false
 		m.streamCancel = nil
+		m.stopShimmer()
 
 		if m.streamParser != nil {
 			m.streamParser.Flush()
@@ -2261,7 +2379,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				mode := m.resolver.Current()
 				if !mode.CanShell() {
 					msg := fmt.Sprintf("Tool 'shell' rejected in /%s.", mode)
-					m.push(roleSystem, msg)
+					// ── POLICY REJECTION BADGE ─────────────────────────────
+					// Render the forbidden-tool notice as a clean muted status
+					// badge ("☢ [POLICY] Tool 'shell' rejected in /ask.") instead
+					// of raw unformatted text, so the scrollback reads as a
+					// styled system notice with zero layout jitter. The session
+					// copy fed to the model stays plain text.
+					m.push(roleSystem, toolRejectBadgeStyle.Render("☢ [POLICY]")+" "+
+						mutedStyle.Render(fmt.Sprintf("Tool 'shell' rejected in /%s.", mode)))
 					m.sess.AddMessage("system", msg+" You are in a Read-Only execution environment and must stop requesting system mutations.", 3)
 				} else {
 					cmd := shellCmds[0]
@@ -2297,6 +2422,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streamParser = nil
 		m.streamCancel = nil
 		m.planPending = false
+		m.stopShimmer()
 
 		// User-initiated interrupt — suppress error noise, just clean up.
 		if m.interruptRequested {
@@ -2376,6 +2502,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.agentLabel = ""
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
+		m.stopShimmer()
 		m.push(roleError, "fast-track build failed: "+providers.SanitizeAPIError(msg.Err))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -2397,11 +2524,18 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.streamCancel()
 			m.streamCancel = nil
 		}
+		m.shellRunning = false
+		m.shellCh = nil
+		if m.shellCancel != nil {
+			m.shellCancel()
+			m.shellCancel = nil
+		}
 		m.streamBuffer = ""
 		m.currentStreamContent = ""
 		m.streamTickActive = false
 		m.interruptRequested = false
 		m.spinnerFrame = 0
+		m.stopShimmer()
 		m.ti.Focus()
 		m.sanitizeInputPrompt()
 		m.refreshViewportContent()

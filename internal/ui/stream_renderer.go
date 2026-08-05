@@ -132,7 +132,7 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 
 	case strings.HasPrefix(line, "### "):
 		// H3: blue — section subheadings
-		return "\n" + mdH3Style.Render("▸ "+strings.TrimSpace(line[4:]))
+		return "\n" + mdH3Style.Render(Icon.Chevron+" "+strings.TrimSpace(line[4:]))
 
 	case strings.HasPrefix(line, "## "):
 		// H2: bold text — major section heading
@@ -145,7 +145,7 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 
 	if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
 		content := strings.TrimSpace(trimmed[2:])
-		return mdBulletStyle.Render("• ") + applyInlineStyles(content)
+		return mdBulletStyle.Render(Icon.Bullet) + " " + applyInlineStyles(content)
 	}
 
 	if len(trimmed) > 2 && trimmed[0] >= '0' && trimmed[0] <= '9' && trimmed[1] == '.' && trimmed[2] == ' ' {
@@ -290,11 +290,14 @@ func renderCodeBlock(language string, lines []string, width int) string {
 // (EventReasoningStream via ThinkingBuffer); the legacy sentinel thought stream
 // has been purged so reasoning is structurally incapable of routing through an
 // un-sanitized legacy renderer.
+//
+// The spinner uses a snowflake character (✻/❆) to match the inline status
+// spinner, ensuring visual consistency across the viewport body.
 func (m *model) renderLiveThinking(width int) string {
 	if m.thinkingBuffer == nil || m.thinkingBuffer.Len() == 0 {
 		return ""
 	}
-	spinner := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
+	spinner := flowingSpinnerFrames[m.spinnerFrame%len(flowingSpinnerFrames)]
 	return m.thinkingBuffer.Render(width, m.streaming, spinner)
 }
 
@@ -435,8 +438,18 @@ func (m *model) renderStreamingContent(content string, width int) string {
 			rendered = renderWidget("Edit", fullContent, availableWidth, colorModeBuild)
 
 		case blockTable:
-			tableContent := renderTable(block.raw, widgetInnerWidth)
-			rendered = renderWidget("Table", tableContent, availableWidth, colorAccent)
+			// ── TABLE STREAMING THROTTLE ──────────────────────────────
+			// During active streaming, full table layout (column width
+			// calculation + border rendering) causes per-token re-rendering
+			// stutter. Detect incomplete tables (still receiving rows) and
+			// stream them as raw text. Only execute full rich table layout
+			// when the table is complete (streamDoneMsg or throttled pause).
+			if m.streaming && !isTableComplete(block.raw) {
+				rendered = block.raw
+			} else {
+				tableContent := renderTable(block.raw, widgetInnerWidth)
+				rendered = renderWidget("Table", tableContent, availableWidth, colorAccent)
+			}
 
 		case blockEvidence:
 			innerW := widgetInnerWidth - 2
@@ -465,8 +478,25 @@ func (m *model) renderStreamingContent(content string, width int) string {
 			rendered = renderWidget("Risk Analysis", strings.Join(wrappedLines, "\n"), availableWidth, colorModeReview)
 
 		case blockCommand:
+			// ── COMMAND WIDGET STREAMING GATE ─────────────────────────
+			// Only render the full Command widget when the block is COMPLETE
+			// (opening + closing fence both received). An unfinished block is
+			// rendered as raw fence-stripped text instead — this prevents the
+			// opening fence from leaking in as a "$ ```bash" command line and
+			// stops the last command from being dropped when it is mistaken
+			// for the closing fence. Content is thus flushed strictly once per
+			// block token: raw while growing, widget exactly once when done.
+			if m.streaming && !isCommandBlockComplete(block.raw) {
+				rendered = stripCommandFence(block.raw)
+				break
+			}
 			cmdText := strings.TrimSpace(block.raw)
-			if strings.HasPrefix(cmdText, "```") {
+			if !isCommandBlockComplete(cmdText) {
+				// Truncated block (stream ended without a closing fence):
+				// show the command text fence-stripped rather than dropping
+				// the final line or leaking the opening fence as a command.
+				cmdText = stripCommandFence(cmdText)
+			} else {
 				cmdLines := strings.Split(cmdText, "\n")
 				if len(cmdLines) > 2 {
 					cmdText = strings.Join(cmdLines[1:len(cmdLines)-1], "\n")
@@ -552,17 +582,13 @@ func (m *model) renderStreamingContent(content string, width int) string {
 
 	result := strings.Join(renderedBlocks, vspace(Spacing.Section))
 
-	// ── LIVE REASONING: prepend dimmed reasoning stream ──────────────
-	// During active streaming, render the reasoning block as faint text
-	// above the main content so the user sees thinking in real-time.
-	// The block collapses to a compact "Thought: …" line once the
-	// reasoning stream completes.
-	if m.streaming {
-		thoughts := m.renderLiveThinking(width)
-		if thoughts != "" {
-			result = thoughts + "\n" + result
-		}
-	}
+	// NOTE: Live reasoning tokens are never rendered inside this content
+	// window. While the loading dock is live (shimmerActive) they appear in
+	// the dock's "✻ Thinking... (Xs)" line; once the dock hands off to the
+	// first content token the inline faint thinking box takes over — both are
+	// composed by refreshViewportContent, keeping this renderer a pure content
+	// projection. The collapsed thought summary ("▸ Thought for Xs (N tokens)")
+	// appears after streaming ends, also rendered by refreshViewportContent.
 
 	return result
 }
@@ -762,4 +788,84 @@ func renderJSONPlanWidget(planOutput *plan.PlanOutput, src plan.TaskStatusSource
 	}
 
 	return renderWidget("Plan", strings.TrimSuffix(b.String(), "\n"), width, colorModePlan)
+}
+
+// isTableComplete detects whether a markdown table block is complete enough
+// for full grid layout rendering. During active streaming, incomplete tables
+// (still receiving rows) are rendered as raw text to avoid per-token column
+// width recalculation and border redraw stutter. A table is considered
+// complete when it has at least a header row and one data row, and the last
+// data row ends with a pipe delimiter.
+func isTableComplete(raw string) bool {
+	lines := strings.Split(raw, "\n")
+	dataRows := 0
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if trimmed == "" {
+			continue
+		}
+		// Skip separator rows (|---|---|)
+		clean := strings.ReplaceAll(trimmed, "|", "")
+		clean = strings.ReplaceAll(clean, "-", "")
+		clean = strings.ReplaceAll(clean, " ", "")
+		if clean == "" {
+			continue
+		}
+		dataRows++
+	}
+	// Need at least header + 1 data row
+	if dataRows < 2 {
+		return false
+	}
+	// Last non-empty line should end with a pipe (complete row)
+	lastLine := ""
+	for i := len(lines) - 1; i >= 0; i-- {
+		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
+			lastLine = trimmed
+			break
+		}
+	}
+	return strings.HasSuffix(lastLine, "|")
+}
+
+// isCommandBlockComplete reports whether a bash/sh code block has been fully
+// received for Command-widget rendering: it must begin with an opening fence
+// (```bash / ```sh / bare ```) AND its last non-empty line must be a closing
+// fence. Parsing an unfinished block is a buffer-flush mis-parse: the opening
+// fence leaks in as a "$ ```bash" command line and the final command is
+// dropped because it is mistaken for the closing fence — which ghosts or
+// duplicates content in the viewport during active streaming.
+func isCommandBlockComplete(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if !strings.HasPrefix(trimmed, "```") {
+		return false
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) < 3 {
+		return false
+	}
+	last := ""
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			last = t
+			break
+		}
+	}
+	return strings.HasPrefix(last, "```")
+}
+
+// stripCommandFence removes the opening/closing ``` fence lines from a
+// possibly-incomplete bash/sh block so the streaming raw-text passthrough
+// shows only the command text (no ``` noise). It never touches lines that
+// carry actual command content.
+func stripCommandFence(raw string) string {
+	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), "```") {
+			continue
+		}
+		out = append(out, l)
+	}
+	return strings.Join(out, "\n")
 }

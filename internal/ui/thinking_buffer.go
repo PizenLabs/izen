@@ -30,13 +30,21 @@ type ThinkingBuffer struct {
 	// expanded is the IsThinkingExpanded state: false (default) renders the
 	// compact spinner/summary line, true renders the full dimmed reasoning box.
 	expanded bool
+	// scrollOffset is the reasoning line window start when the user has scrolled
+	// up inside the expanded box. It is ignored (auto-scroll to the tail) until
+	// the user explicitly scrolls up; ScrolledUp reports that state.
+	scrollOffset int
+	scrolledUp   bool
+	// lastLineCount caches the total wrapped line count from the last Render so
+	// HasOverflow is cheap and deterministic without re-wrapping.
+	lastLineCount int
 }
 
 // NewThinkingBuffer constructs an empty reasoning buffer.
 func NewThinkingBuffer() *ThinkingBuffer {
 	return &ThinkingBuffer{
 		started:  time.Now(),
-		maxLines: 8,
+		maxLines: 10,
 	}
 }
 
@@ -115,6 +123,9 @@ func (tb *ThinkingBuffer) Reset() {
 	tb.complete = false
 	tb.expanded = false
 	tb.started = time.Now()
+	tb.scrollOffset = 0
+	tb.scrolledUp = false
+	tb.lastLineCount = 0
 }
 
 // Elapsed returns the duration since the reasoning block started.
@@ -122,6 +133,67 @@ func (tb *ThinkingBuffer) Elapsed() time.Duration {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 	return time.Since(tb.started)
+}
+
+// HasOverflow reports whether the expanded reasoning box exceeds maxLines and
+// therefore supports in-box scrolling. Based on the cached line count from the
+// last Render; false before any Render call.
+func (tb *ThinkingBuffer) HasOverflow() bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.expanded && tb.lastLineCount > tb.maxLines
+}
+
+// ScrolledUp reports whether the user has scrolled up inside the expanded box,
+// which suppresses auto-scroll-to-tail while new reasoning tokens stream in.
+func (tb *ThinkingBuffer) ScrolledUp() bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.scrolledUp
+}
+
+// ScrollUp moves the expanded-box window up by amount wrapped lines (clamped).
+// It also latches scrolledUp so streaming does not yank the view back to the
+// tail while the user reads earlier reasoning. No-op when the box fits.
+func (tb *ThinkingBuffer) ScrollUp(amount int) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	maxOffset := tb.lastLineCount - tb.maxLines
+	if maxOffset <= 0 {
+		return
+	}
+	if amount <= 0 {
+		return
+	}
+	tb.scrollOffset = min(max(0, tb.scrollOffset-amount), maxOffset)
+	tb.scrolledUp = true
+}
+
+// ScrollDown moves the expanded-box window down by amount wrapped lines
+// (clamped). Reaching the tail clears scrolledUp so auto-scroll resumes.
+// No-op when the box fits.
+func (tb *ThinkingBuffer) ScrollDown(amount int) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	maxOffset := tb.lastLineCount - tb.maxLines
+	if maxOffset <= 0 {
+		return
+	}
+	if amount <= 0 {
+		return
+	}
+	tb.scrollOffset = min(max(0, tb.scrollOffset+amount), maxOffset)
+	if tb.scrollOffset >= maxOffset {
+		tb.scrolledUp = false
+	}
+}
+
+// ResetScroll clears any in-box scroll and resumes auto-scroll-to-tail.
+func (tb *ThinkingBuffer) ResetScroll() {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.scrollOffset = 0
+	tb.scrolledUp = false
 }
 
 // estimateTokens is a cheap deterministic proxy for "N tokens" in the compact
@@ -136,17 +208,27 @@ func estimateTokens(text string) int {
 
 // Render produces the thinking block. It returns "" when there is nothing to
 // show. When the block is collapsed (the default), it renders a compact
-// one-line widget: "Thinking.. (Xs)" while the reasoning block is still
-// streaming, collapsing to "▸ Thought for Xs (N tokens)" once complete (or the
-// stream is over). When expanded (IsThinkingExpanded), it renders the full
-// reasoning text in a dimmed/italic box — auto-scrolling to the tail while
-// streaming, showing the reasoning bounded to maxLines once complete.
+// one-line widget: "Thinking.. (Xs)  (Ctrl+O to expand)" while the reasoning
+// block is still streaming, collapsing to "▸ Thought for Xs (N tokens)" once
+// complete (or the stream is over). When expanded (IsThinkingExpanded), it
+// renders the full reasoning text in a dimmed/italic box — auto-scrolling to
+// the tail while streaming, but scrollable with j/k (and PgUp/PgDn) once the
+// user scrolls up, showing the reasoning bounded to maxLines once complete.
+//
+// NO-DUPLICATE CONTRACT: the expanded box NEVER re-prints its own
+// "Thinking…" status header. That status is owned by the parent indicator —
+// the loading dock's "✻ Thinking... (Xs)" line while the dock is live, or the
+// collapsed one-liner that the box replaces — so adding a header here would
+// stack two "Thinking…" lines in the viewport. The box renders the reasoning
+// window plus an optional scroll affordance footer only.
 func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) string {
 	tb.mu.Lock()
 	content := tb.builder.String()
 	complete := tb.complete
 	expanded := tb.expanded
 	elapsed := time.Since(tb.started)
+	scrollOffset := tb.scrollOffset
+	scrolledUp := tb.scrolledUp
 	tb.mu.Unlock()
 
 	if content == "" {
@@ -165,31 +247,47 @@ func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) stri
 		// escapes expands to real characters (idempotent — safe on every tick).
 		content = sanitizeText(content)
 
-		// Auto-scroll while streaming: keep only the most recent maxLines
-		// worth of lines so the box tracks the tail of the reasoning stream.
-		// Once complete, show the reasoning (still bounded so a giant thought
-		// block cannot blow out the viewport).
 		lines := strings.Split(content, "\n")
-		var displayed []string
-		if !complete && len(lines) > tb.maxLines {
-			lines = lines[len(lines)-tb.maxLines:]
-		}
+		var allLines []string
 		for _, line := range lines {
 			line = strings.TrimRight(line, " \r")
 			if line == "" {
-				displayed = append(displayed, "")
+				allLines = append(allLines, "")
 				continue
 			}
-			displayed = append(displayed, wrapString(line, width-6)...)
+			allLines = append(allLines, wrapString(line, width-6)...)
 		}
 
-		linesOut := make([]string, 0, len(displayed)+2)
-		if spinner != "" {
-			linesOut = append(linesOut, thinkingStyle.Render(fmt.Sprintf("%s Thinking… %s", spinner, mutedStyle.Render(elapsedStr))))
-		} else {
-			linesOut = append(linesOut, thinkingStyle.Render(fmt.Sprintf("│ Thinking… %s", mutedStyle.Render(elapsedStr))))
+		total := len(allLines)
+		overflow := total > tb.maxLines
+
+		// Auto-scroll while streaming unless the user scrolled up to inspect
+		// earlier reasoning (scrolledUp suppresses the tail yank).
+		var start int
+		if overflow {
+			if scrolledUp {
+				start = scrollOffset
+				// Defensive clamp: content can grow between renders, but it can
+				// also shrink (buffer reset); never slice past the new tail.
+				if maxOff := total - tb.maxLines; start > maxOff {
+					start = maxOff
+				}
+			} else {
+				start = total - tb.maxLines
+			}
 		}
-		for _, line := range displayed {
+		end := min(start+tb.maxLines, total)
+
+		// Cache the total line count for cheap HasOverflow checks on keypress.
+		tb.mu.Lock()
+		tb.lastLineCount = total
+		tb.mu.Unlock()
+
+		linesOut := make([]string, 0, tb.maxLines+2)
+		// NO header: the "Thinking…" status is owned by the parent indicator
+		// (loading dock or collapsed line) — see the NO-DUPLICATE CONTRACT
+		// above. The box starts directly with the reasoning window.
+		for _, line := range allLines[start:end] {
 			if line == "" {
 				linesOut = append(linesOut, thinkingStyle.Render("│"))
 			} else {
@@ -200,20 +298,31 @@ func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) stri
 			linesOut = append(linesOut, thinkingStyle.Render(fmt.Sprintf("│ %s", mutedStyle.Render(
 				fmt.Sprintf("▸ Thought for %s (%d tokens)", elapsedStr, estimateTokens(content))))))
 		}
+		if overflow {
+			// In-box scroll affordance footer. It only appears when the box
+			// actually overflows, so it never distracts on short reasoning.
+			hint := "Ctrl+O collapse"
+			if !complete {
+				hint = "Ctrl+O collapse · j/k scroll"
+			}
+			linesOut = append(linesOut, thinkingStyle.Render("│ "+mutedStyle.Render(
+				fmt.Sprintf("%s · %d/%d", hint, start+1, total))))
+		}
 
 		return strings.Join(linesOut, "\n")
 	}
 
 	// ── Collapsed (default) ────────────────────────────────────────────
-	// While the reasoning block is still streaming show a compact spinner;
-	// once it finishes (terminal event or stream over) collapse into a
-	// single-line summary.
+	// While the reasoning block is still streaming show a compact spinner
+	// plus a faint expand hint; once it finishes (terminal event or stream
+	// over) collapse into a single-line summary.
 	if streaming && !complete {
 		sp := spinner
 		if sp == "" {
-			sp = "✦"
+			sp = SpinnerSnowflake()
 		}
-		return thinkingStyle.Render(fmt.Sprintf("%s Thinking.. (%s)", sp, elapsedStr))
+		return thinkingStyle.Render(fmt.Sprintf("%s Thinking.. (%s)  %s",
+			sp, elapsedStr, mutedStyle.Render("[Ctrl+O to expand]")))
 	}
 	return thinkingStyle.Render(fmt.Sprintf("▸ Thought for %s (%d tokens)", elapsedStr, estimateTokens(content)))
 }

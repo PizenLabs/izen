@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
@@ -238,6 +239,15 @@ func (r *Runner) run(command, dir string) (*RunResult, error) {
 		Dir:     dir,
 	}
 
+	// ── LIVE ACTIVITY TREE: RUNNING STATE ────────────────────────────
+	// Emit a "running" exec event (exitCode -1) before the process starts so
+	// the UI tree shows the command with the animated snowflake spinner for
+	// the whole duration, not just the final [done] line.
+	if globalEventLog != nil {
+		globalEventLog(CommandExecEvent{Command: command, ExitCode: -1})
+	}
+	startTime := time.Now()
+
 	registerProcess(cmd, r.activeCtxID)
 
 	if err := cmd.Run(); err != nil {
@@ -253,6 +263,27 @@ func (r *Runner) run(command, dir string) (*RunResult, error) {
 	unregisterProcess(cmd)
 	result.Stdout = strings.TrimSpace(stdout.String())
 	result.Stderr = strings.TrimSpace(stderr.String())
+
+	// ── LIVE ACTIVITY TREE: COMPLETED STATE ──────────────────────────
+	// The terminal exec event carries the real exit code, elapsed time, and
+	// the combined output so the tree entry flips from the spinner to a
+	// scannable "(exit N · Xs)" line and the Ctrl+O expansion can show the
+	// full stdout/stderr.
+	if globalEventLog != nil {
+		combined := result.Stdout
+		if result.Stderr != "" {
+			if combined != "" {
+				combined += "\n"
+			}
+			combined += result.Stderr
+		}
+		globalEventLog(CommandExecEvent{
+			Command:  command,
+			ExitCode: result.ExitCode,
+			Elapsed:  time.Since(startTime),
+			Output:   combined,
+		})
+	}
 
 	// ── TOOL OUTPUT PIPELINE (PHASE 1) ──────────────────────────────────
 	// Every executed command's combined output is normalized (ANSI-stripped),

@@ -145,7 +145,7 @@ func (p *IncrementalStreamParser) processTextLine(line string) string {
 
 	if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
 		content := strings.TrimSpace(trimmed[2:])
-		return mdBulletStyle.Render("• ") + applyInlineStyles(content)
+		return mdBulletStyle.Render(Icon.Bullet) + " " + applyInlineStyles(content)
 	}
 
 	if len(trimmed) > 2 && trimmed[0] >= '0' && trimmed[0] <= '9' && trimmed[1] == '.' && trimmed[2] == ' ' {
@@ -156,11 +156,11 @@ func (p *IncrementalStreamParser) processTextLine(line string) string {
 
 	if strings.HasPrefix(trimmed, "- [ ]") {
 		content := strings.TrimSpace(trimmed[5:])
-		return dimmedStyle.Render("○ ") + applyInlineStyles(content)
+		return dimmedStyle.Render(Icon.Pending+" ") + applyInlineStyles(content)
 	}
 	if strings.HasPrefix(trimmed, "- [x]") {
 		content := strings.TrimSpace(trimmed[5:])
-		return greenStyle.Render("✓ ") + applyInlineStyles(content)
+		return greenStyle.Render(Icon.Success+" ") + applyInlineStyles(content)
 	}
 
 	return applyInlineStyles(line)

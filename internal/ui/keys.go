@@ -12,23 +12,50 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 )
 
+// toggleThoughtBlock expands/collapses the active reasoning block OR the live
+// shell-output block. Priority:
+//
+//  1. Shell execution (Ctrl+O during a running/completed command): expands or
+//     collapses the accumulated stdout/stderr of the exec entry in the
+//     activity tree — the "Bash Execution Spinner with Ctrl+O Expansion"
+//     contract. Takes precedence so a running shell is always inspectable.
+//  2. The event-driven ThinkingBuffer, then the legacy ThinkingPanel.
+//
+// The viewport is repainted synchronously so the inline box toggles
+// immediately on the keypress — even while reasoning tokens or shell output
+// are still streaming in (async inspection). Returns false when no thought or
+// shell block exists.
+func (m *model) toggleThoughtBlock() bool {
+	if m.activityTree != nil && m.activityTree.HasCommandExec() {
+		m.activityTree.ToggleExpanded()
+		m.refreshViewportContent()
+		if m.Ready && !m.userIsScrollingUp {
+			m.Viewport.GotoBottom()
+		}
+		return true
+	}
+	switch {
+	case m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0:
+		m.thinkingBuffer.Toggle()
+	case m.thinkingPanel != nil:
+		m.thinkingPanel.Toggle()
+	default:
+		return false
+	}
+	m.refreshViewportContent()
+	if m.Ready && !m.userIsScrollingUp {
+		m.Viewport.GotoBottom()
+	}
+	return true
+}
+
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// ── GLOBAL: Alt+O toggles reasoning block visibility ────────────
 	// The unified ThinkingBuffer (event-driven thought block) takes priority;
 	// the legacy ThinkingPanel is only toggled when no event-driven block is
 	// active (e.g. legacy build fast-track reasoning).
 	if msg.String() == "alt+o" {
-		if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
-			m.thinkingBuffer.Toggle()
-			m.showReasoning = m.thinkingBuffer.Expanded()
-		} else if m.thinkingPanel != nil {
-			m.thinkingPanel.Toggle()
-			m.showReasoning = m.thinkingPanel.Expanded()
-		}
-		m.refreshViewportContent()
-		if m.Ready && !m.userIsScrollingUp {
-			m.Viewport.GotoBottom()
-		}
+		m.toggleThoughtBlock()
 		return m, nil
 	}
 
@@ -37,13 +64,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// (ThinkingBuffer). When no thought block is active, falls back to cycling
 	// through the foldable build-log entries (legacy behavior).
 	if msg.Type == tea.KeyCtrlO {
-		if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
-			m.thinkingBuffer.Toggle()
-			m.showReasoning = m.thinkingBuffer.Expanded()
-			m.refreshViewportContent()
-			if m.Ready && !m.userIsScrollingUp {
-				m.Viewport.GotoBottom()
-			}
+		if m.toggleThoughtBlock() {
 			return m, nil
 		}
 		if m.logStore != nil {
@@ -56,6 +77,43 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	}
+
+	// ── THOUGHT-BOX SCROLL ────────────────────────────────────────────
+	// While the expanded reasoning box overflows maxLines, j/k, arrows, and
+	// PgUp/PgDn scroll WITHIN the box (the proposal-diff convention) so the
+	// user can read earlier reasoning without losing place. Space jumps back
+	// to the tail and resumes auto-scroll. When the box fits or is collapsed
+	// these keys fall through to the main viewport / input untouched — and the
+	// intercepted keys never reach the text input, so no raw ANSI/regex escape
+	// sequence can leak into the prompt bar.
+	if m.thinkingBuffer != nil && m.thinkingBuffer.Expanded() && m.thinkingBuffer.HasOverflow() &&
+		m.state != StateAwaitingApproval {
+		switch {
+		case msg.String() == "k" || msg.Type == tea.KeyUp || msg.Type == tea.KeyCtrlU:
+			m.thinkingBuffer.ScrollUp(3)
+			m.refreshViewportContent()
+			return m, nil
+		case msg.String() == "j" || msg.Type == tea.KeyDown || msg.Type == tea.KeyCtrlD:
+			m.thinkingBuffer.ScrollDown(3)
+			m.refreshViewportContent()
+			return m, nil
+		case msg.Type == tea.KeyPgUp || msg.Type == tea.KeyHome:
+			m.thinkingBuffer.ScrollUp(6)
+			m.refreshViewportContent()
+			return m, nil
+		case msg.Type == tea.KeyPgDown || msg.Type == tea.KeyEnd:
+			m.thinkingBuffer.ScrollDown(6)
+			m.refreshViewportContent()
+			return m, nil
+		case msg.Type == tea.KeySpace:
+			m.thinkingBuffer.ResetScroll()
+			m.refreshViewportContent()
+			if m.Ready && !m.userIsScrollingUp {
+				m.Viewport.GotoBottom()
+			}
+			return m, nil
+		}
 	}
 
 	// ── GLOBAL: Alt+F / Option+F / Meta+F — Handoff from /ask to /investigate ──
@@ -319,7 +377,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
 				m.push(roleSystem, infoStyle.Render(
-					fmt.Sprintf("  ✓ Approved — applying hotfix patch to %s...", patch.File)))
+					fmt.Sprintf("  "+Icon.Success+" Approved — applying hotfix patch to %s...", patch.File)))
 
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "hotfix apply"} },
@@ -337,7 +395,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.ti.Focus()
 				m.recalcViewportHeight()
 				m.push(roleSystem, infoStyle.Render(
-					"  ✗ Rejected — hotfix aborted. No files were modified."))
+					"  "+Icon.Error+" Rejected — hotfix aborted. No files were modified."))
 				m.push(roleError, fmt.Sprintf(
 					"[HOTFIX] Developer rejected patch to %s.",
 					rejectedPath))
@@ -366,7 +424,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.ti.Focus()
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
-				m.push(roleSystem, infoStyle.Render("  ✓ Approved — executing shell command..."))
+				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Approved — executing shell command..."))
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
 					m.runBuildShellExec(task),
@@ -384,7 +442,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
 				m.push(roleSystem, infoStyle.Render(
-					"  ✓ Approved (always) — executing shell command..."))
+					"  "+Icon.Success+" Approved (always) — executing shell command..."))
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
 					m.runBuildShellExec(task),
@@ -410,7 +468,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					_ = m.sess.Save()
 				}
 				m.push(roleSystem, infoStyle.Render(
-					"  ✗ Rejected — shell execution aborted."))
+					"  "+Icon.Error+" Rejected — shell execution aborted."))
 				m.push(roleError, fmt.Sprintf(
 					"[SECURITY] Aborting unauthorized shell execution: %s",
 					task.Target))
@@ -594,7 +652,20 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.push(roleUser, "$ "+cmd)
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
-			return m, m.execShellCmd(cmd)
+			// Live shell execution: start the running exec entry in the
+			// activity tree, activate the loading dock, and dispatch the
+			// shimmer + smooth ticks so the snowflake spinner animates for the
+			// whole duration. Output streams into the tree and is expandable
+			// via Ctrl+O; shellExitMsg stops the dock on completion.
+			if m.activityTree != nil {
+				m.activityTree.AppendOrUpdateExec(cmd, -1, 0, "")
+			}
+			m.startShimmer("Executing command...", "execute")
+			return m, tea.Batch(
+				m.streamShellCmd(cmd),
+				m.smoothStreamTickCmd(),
+				m.shimmerTickCmd(),
+			)
 		}
 
 		if userInput != "" {
@@ -612,13 +683,49 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 			m.push(roleUser, userInput)
 
+			// ── T=0MS SHIMMER: instant visual feedback ─────────────────
+			// Activate the loading shimmer BEFORE any orchestrator dispatch
+			// or synchronous context planning (planContextForAsk, intent
+			// classification) so the user sees the shimmer + tip dock
+			// immediately on Enter — zero perceived lag. streamCmd() will
+			// refine the shimmer text once the stream is ready; non-streaming
+			// early-return paths call stopShimmer() to clean up.
+			//
+			// CRITICAL: the shimmer tick AND the smooth stream tick are
+			// dispatched HERE, synchronously, as part of the returned batch —
+			// NOT only downstream inside streamCmd(). If the Enter handler
+			// returned without them, the first spinner.FrameMsg would be
+			// scheduled only after the (now async) context prep resolves, so
+			// the dock would sit frozen for the entire workspace scan. With
+			// them in the batch the loading line animates from the very first
+			// frame; streamCmd() re-schedules its own ticks when it runs.
+			shimmerAlreadyActive := m.shimmerActive
+			m.spinnerFrame = 0
+			m.startShimmer("Working...", "analyze")
+
 			m.streamStartTime = time.Now()
 			cmd := m.handleInput(userInput)
+			// ── CLEANUP: stop shimmer on non-streaming early returns ────
+			// If handleInput returned nil or a non-stream command (error,
+			// shell exec, pending confirm), the shimmer we started was never
+			// consumed by streamCmd — deactivate it so the dock clears.
+			// Guard: only stop if we freshly started it (not a leftover from
+			// a previous stream that hasn't been reconciled yet).
+			if cmd == nil && !shimmerAlreadyActive && m.shimmerActive {
+				m.stopShimmer()
+			}
 			// ── APPLICATION-LAYER COMMAND RECORD ──────────────────────
 			// The same submission is routed through the Runtime facade as a
 			// SubmitPromptCmd so the canonical command/event contract observes
 			// it. Nil-safe when no runtime is wired.
 			cmd = tea.Batch(cmd, m.runtimeSubmitCmd(userInput))
+			// ── INSTANT ANIMATION AT T=0MS ────────────────────────────
+			// Dispatch the shimmer + smooth ticks alongside the submission so
+			// the loading dock animates immediately, regardless of what the
+			// submitted command does next (async prep, stream, engine run).
+			// Both loops self-terminate when no background producer owns the
+			// flags, so idle submits leak nothing.
+			cmd = tea.Batch(cmd, m.shimmerTickCmd(), m.smoothStreamTickCmd())
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return m, cmd

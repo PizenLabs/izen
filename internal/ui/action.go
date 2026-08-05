@@ -100,7 +100,7 @@ func planApprovalActions() *Result {
 	return &Result{Actions: []Action{
 		{
 			ID:       "approve-plan",
-			Label:    "✓ Approve Plan",
+			Label:    Icon.Success + " Approve Plan",
 			Shortcut: "alt+p",
 			Command:  "/build",
 			Enabled:  true,
@@ -108,7 +108,7 @@ func planApprovalActions() *Result {
 		},
 		{
 			ID:       "reject-plan",
-			Label:    "✗ Reject & Back",
+			Label:    Icon.Error + " Reject & Back",
 			Shortcut: "alt+r",
 			Command:  "/ask",
 			Enabled:  true,
@@ -126,7 +126,7 @@ func fastTrackPlanActions() *Result {
 	return &Result{Actions: []Action{
 		{
 			ID:       "execute-build",
-			Label:    "▶ Execute Build",
+			Label:    Icon.Execute + " Execute Build",
 			Shortcut: "alt+b",
 			Command:  "/build",
 			Enabled:  true,
@@ -134,7 +134,7 @@ func fastTrackPlanActions() *Result {
 		},
 		{
 			ID:       "reject-plan",
-			Label:    "✗ Reset & Clear",
+			Label:    Icon.Error + " Reset & Clear",
 			Shortcut: "alt+r",
 			Command:  "/ask",
 			Enabled:  true,

@@ -325,7 +325,7 @@ func (r *MutationRenderer) Render(v MutationCardViewModel) string {
 
 	toggleLabel := dimmedStyle.Render("[▼ Expand]")
 	if v.Expanded {
-		toggleLabel = dimmedStyle.Render("[▲ Collapse]")
+		toggleLabel = dimmedStyle.Render("[" + Icon.Warning + " Collapse]")
 	}
 	actionLine := renderHotkeyPromptWithToggle(contentWidth)
 

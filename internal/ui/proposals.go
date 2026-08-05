@@ -1,13 +1,18 @@
 package ui
 
 import (
+	"bufio"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -685,18 +690,124 @@ func isDiffContent(s string) bool {
 	return false
 }
 
-// execShellCmd executes a shell command and pushes output as records.
-func (m *model) execShellCmd(cmd string) tea.Cmd {
-	return func() tea.Msg {
-		out, err := execShell(cmd)
-		var lines []string
-		lines = append(lines, "$ "+cmd)
+// streamShellCmd launches a bash process and streams its stdout/stderr to the
+// event loop as live shellChunkMsg values, followed by a terminal shellExitMsg.
+// It is the real-time counterpart of execShellCmd: the running command shows an
+// animated snowflake spinner, and its output is inspectable via Ctrl+O while it
+// is still producing. The caller must also dispatch shimmerTickCmd and
+// smoothStreamTickCmd so the spinner animates for the whole duration.
+func (m *model) streamShellCmd(cmd string) tea.Cmd {
+	ctx, cancel := context.WithCancel(context.Background())
+	// The cancel is stored on the model (main goroutine — safe) so Ctrl+C can
+	// abort the running process; it is cleared by the shellExitMsg handler.
+	m.shellCancel = cancel
+
+	// Seed the running exec entry NOW (main goroutine) so the tree shows the
+	// animated snowflake for the whole duration — even for a command that
+	// produces no output and exits before the first streamed chunk arrives.
+	if m.activityTree != nil {
+		m.activityTree.AppendOrUpdateExec(cmd, -1, 0, "")
+	}
+
+	shellCh := make(chan tea.Msg, 512)
+	m.shellCh = shellCh
+	m.shellRunning = true
+
+	go func() {
+		defer cancel()
+		defer close(shellCh)
+
+		start := time.Now()
+		c := exec.CommandContext(ctx, "bash", "-c", cmd)
+		stdout, err := c.StdoutPipe()
 		if err != nil {
-			lines = append(lines, "shell exec: "+err.Error())
+			shellCh <- shellExitMsg{cmd: cmd, exitCode: -1, elapsed: 0, err: err}
+			return
 		}
-		if out != "" {
-			lines = append(lines, strings.Split(strings.TrimRight(out, "\r\n"), "\n")...)
+		stderr, err := c.StderrPipe()
+		if err != nil {
+			shellCh <- shellExitMsg{cmd: cmd, exitCode: -1, elapsed: 0, err: err}
+			return
 		}
-		return shellOutputMsg{lines: lines}
+		if err := c.Start(); err != nil {
+			shellCh <- shellExitMsg{cmd: cmd, exitCode: -1, elapsed: 0, err: err}
+			return
+		}
+
+		// Drain both pipes concurrently so a chatty stream never deadlocks
+		// the process (pipes block writes once their kernel buffers fill).
+		var wg sync.WaitGroup
+		pump := func(r io.Reader) {
+			defer wg.Done()
+			br := bufio.NewReaderSize(r, 4096)
+			var line strings.Builder
+			for {
+				chunk := make([]byte, 1024)
+				n, readErr := br.Read(chunk)
+				if n > 0 {
+					line.Write(chunk[:n])
+					// Emit whole lines as soon as a newline arrives so the
+					// viewport updates incrementally, not in one burst.
+					raw := line.String()
+					for {
+						idx := strings.IndexByte(raw, '\n')
+						if idx < 0 {
+							break
+						}
+						select {
+						case shellCh <- shellChunkMsg{text: raw[:idx+1]}:
+						default:
+						}
+						raw = raw[idx+1:]
+					}
+					line.Reset()
+					line.WriteString(raw)
+				}
+				if readErr != nil {
+					if line.Len() > 0 {
+						select {
+						case shellCh <- shellChunkMsg{text: line.String()}:
+						default:
+						}
+					}
+					return
+				}
+			}
+		}
+		wg.Add(2)
+		go pump(stdout)
+		go pump(stderr)
+
+		runErr := c.Wait()
+		wg.Wait()
+
+		exitCode := 0
+		if runErr != nil {
+			var exitErr *exec.ExitError
+			if errors.As(runErr, &exitErr) {
+				exitCode = exitErr.ExitCode()
+			} else {
+				exitCode = -1
+			}
+		}
+		shellCh <- shellExitMsg{cmd: cmd, exitCode: exitCode, elapsed: time.Since(start), err: runErr}
+	}()
+
+	return m.readShellCh()
+}
+
+// readShellCh reads one message from the streaming shell channel and returns
+// it to the event loop. It returns nil (no-op) when the channel has been torn
+// down, mirroring the readStream pattern so the loop never blocks forever.
+func (m *model) readShellCh() tea.Cmd {
+	return func() tea.Msg {
+		if m.shellCh == nil {
+			return nil
+		}
+		msg, ok := <-m.shellCh
+		if !ok {
+			return nil
+		}
+		return msg
 	}
 }
