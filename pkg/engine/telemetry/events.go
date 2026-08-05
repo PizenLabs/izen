@@ -18,6 +18,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/PizenLabs/izen/pkg/engine/ir"
 	"github.com/PizenLabs/izen/pkg/engine/layer0"
 	"github.com/PizenLabs/izen/pkg/engine/layer1"
 	"github.com/PizenLabs/izen/pkg/engine/layer2"
@@ -44,6 +45,15 @@ const (
 	// EventValidationDAG is emitted when Layer 4 finishes a validation DAG
 	// run.
 	EventValidationDAG EventType = "layer4.validation_dag"
+	// EventControlIteration is emitted by the adaptive control loop after each
+	// Observe, carrying the raw Dynamic IR facts (node states + attempts).
+	EventControlIteration EventType = "control.iteration"
+	// EventControlNodeObserved is emitted when a node observation lands on the
+	// control loop.
+	EventControlNodeObserved EventType = "control.node_observed"
+	// EventControlTerminated is emitted when the control loop reaches a
+	// terminal directive.
+	EventControlTerminated EventType = "control.terminated"
 )
 
 // Layer returns the engine layer that produces the event type.
@@ -311,4 +321,96 @@ func NewValidationDAG(res *layer4.Result, d time.Duration) Event {
 		sort.Strings(payload.FailedStages)
 	}
 	return newEvent(EventValidationDAG, payload)
+}
+
+// ── Adaptive Control Loop ──────────────────────────────────────────────────
+
+// ControlIterationPayload carries the Dynamic IR facts of one reconciliation
+// iteration. It is fact-only: raw node states and attempt counts, never a
+// decision.
+type ControlIterationPayload struct {
+	RunID      string            `json:"run_id"`
+	NodeStates map[string]string `json:"node_states"`
+	Attempts   map[string]int    `json:"attempts"`
+}
+
+// NewControlIteration projects an ExecutionSnapshot into a fact-only iteration
+// event.
+func NewControlIteration(runID string, states map[string]ir.NodeState, attempts map[string]int) Event {
+	return newEvent(EventControlIteration, &ControlIterationPayload{
+		RunID:      runID,
+		NodeStates: nodeStateStrings(states),
+		Attempts:   attempts,
+	})
+}
+
+// ControlNodeObservedPayload carries one node observation fact: the outcome,
+// the environment and file-mutation counts, and a truncated output slice.
+type ControlNodeObservedPayload struct {
+	RunID      string    `json:"run_id"`
+	NodeID     string    `json:"node_id"`
+	OK         bool      `json:"ok"`
+	Err        string    `json:"error,omitempty"`
+	SkipReason string    `json:"skip_reason,omitempty"`
+	Files      int       `json:"files"`
+	EnvSignals int       `json:"env_signals"`
+	Output     string    `json:"output,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
+// NewControlNodeObserved projects an ObservationPayload into a fact-only event.
+func NewControlNodeObserved(runID string, obs ir.ObservationPayload) Event {
+	return newEvent(EventControlNodeObserved, &ControlNodeObservedPayload{
+		RunID:      runID,
+		NodeID:     obs.NodeID,
+		OK:         obs.OK,
+		Err:        obs.Err,
+		SkipReason: obs.SkipReason,
+		Files:      len(obs.FileMutations),
+		EnvSignals: len(obs.EnvSignals),
+		Output:     truncate(obs.Output, 256),
+		Timestamp:  obs.Timestamp,
+	})
+}
+
+// ControlTerminatedPayload carries the terminal facts of a control loop run:
+// the terminal directive, the final node states and the attempt total.
+type ControlTerminatedPayload struct {
+	RunID      string            `json:"run_id"`
+	Directive  string            `json:"directive"`
+	NodeStates map[string]string `json:"node_states"`
+	Attempts   int               `json:"attempts"`
+	Duration   time.Duration     `json:"duration_ns"`
+}
+
+// NewControlTerminated projects a terminal control loop state into a fact-only
+// event.
+func NewControlTerminated(runID, directive string, states map[string]ir.NodeState, attempts int, d time.Duration) Event {
+	return newEvent(EventControlTerminated, &ControlTerminatedPayload{
+		RunID:      runID,
+		Directive:  directive,
+		NodeStates: nodeStateStrings(states),
+		Attempts:   attempts,
+		Duration:   d,
+	})
+}
+
+// nodeStateStrings projects a NodeState map into stable string labels.
+func nodeStateStrings(states map[string]ir.NodeState) map[string]string {
+	if len(states) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(states))
+	for k, v := range states {
+		out[k] = string(v)
+	}
+	return out
+}
+
+// truncate bounds a fact string so event payloads stay lean.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
