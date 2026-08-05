@@ -118,3 +118,50 @@ func deriveProseDescription(line, file string) string {
 	}
 	return desc
 }
+
+// extractTasksFromLedger mines file paths from the forensic investigation
+// ledger/problem text when the provider timed out with no usable content. It
+// mirrors extractTasksFromProse but operates on the investigation data we
+// already have instead of model prose, so a hung free/cloud provider still
+// yields a real (evidence-grounded) plan instead of a hard error. Returns nil
+// when no source file is detected.
+func extractTasksFromLedger(text string) []Task {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+
+	var files []string
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		for _, m := range proseFilePathRe.FindAllString(line, -1) {
+			if !seen[m] {
+				seen[m] = true
+				files = append(files, m)
+			}
+		}
+	}
+
+	if len(files) == 0 {
+		return nil
+	}
+
+	tasks := make([]Task, 0, len(files))
+	for i, f := range files {
+		tasks = append(tasks, Task{
+			StepNum:     i + 1,
+			IsDone:      false,
+			Status:      "idle",
+			Type:        "FILE_MUTATE",
+			Target:      f,
+			Description: fmt.Sprintf("Apply the plan to %s per the investigation ledger after the provider timed out.", f),
+			Rationale:   "Provider timed out during plan synthesis; the plan targets the file identified by forensic analysis.",
+			Solution:    fmt.Sprintf("Applied the planned change to %s.", f),
+		})
+	}
+	return tasks
+}

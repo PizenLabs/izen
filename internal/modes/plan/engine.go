@@ -2,6 +2,7 @@ package plan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/core/stream"
@@ -41,6 +43,34 @@ const (
 	// rejected by the evidence-based filters (non-existent targets, scope).
 	failureFilteredCandidates
 )
+
+// ErrPlanAttemptTimeout is returned by Engine.complete when a single plan
+// synthesis attempt exceeded the strict per-attempt deadline. Callers use
+// errors.Is to distinguish "the provider hung" from other provider failures and
+// fail fast to the heuristic task-extraction fallback instead of blocking the
+// TUI for the full retry budget.
+var ErrPlanAttemptTimeout = errors.New("plan engine: synthesis attempt timed out")
+
+// planAttemptTimeout is the strict per-attempt deadline for plan synthesis HTTP
+// calls against free/cloud models. OpenRouter free-tier models are frequently
+// queued or cold-started for minutes; a 15s budget cuts a hung provider off fast
+// so the engine can fail over to heuristic task extraction without freezing the
+// live terminal. Each synthesis attempt (initial + retries) gets a fresh budget
+// derived from the parent context.
+//
+// It is a var (not a const) so tests can shrink the deadline and exercise the
+// fail-fast path deterministically without waiting 15s.
+var planAttemptTimeout = 15 * time.Second
+
+// useStrictAttemptTimeout reports whether a plan synthesis attempt against this
+// model must be capped by the strict per-attempt deadline. Only free-tier cloud
+// models carry the OpenRouter ":free" marker — the models reported to hang for
+// minutes. Paid cloud and local SLMs keep the parent context budget because
+// their legitimate prefill+generation latency routinely exceeds 15s.
+func useStrictAttemptTimeout(modelName string) bool {
+	name := strings.ToLower(strings.TrimSpace(modelName))
+	return strings.HasSuffix(name, ":free") || strings.Contains(name, "-free")
+}
 
 // ProviderFunc defines a structured function signature matching the ai.Request format.
 type ProviderFunc func(ctx context.Context, req ai.Request) (*ai.Response, error)
@@ -270,9 +300,26 @@ type usageReader interface {
 // error/truncation path returns. A terminal IsComplete event closes the block
 // so the UI collapses it to a summary line.
 func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	// Strict per-attempt deadline for free/cloud models: a hung provider must be
+	// cut off fast so the caller can fail over to heuristic plan synthesis
+	// instead of blocking the TUI for minutes. Each synthesis attempt gets a
+	// fresh budget derived from the parent context; local/paid models keep the
+	// parent budget because their legitimate latency exceeds a strict deadline.
+	attemptCtx := ctx
+	if useStrictAttemptTimeout(req.Model) {
+		var cancel context.CancelFunc
+		attemptCtx, cancel = context.WithTimeout(ctx, planAttemptTimeout)
+		defer cancel()
+	}
+
 	if e.streamProv == nil {
-		resp, err := e.provider(ctx, req)
+		resp, err := e.provider(attemptCtx, req)
 		if err != nil {
+			if attemptCtx.Err() != nil {
+				// Return whatever the provider produced alongside the timeout
+				// sentinel so the heuristic fallback can mine partial output.
+				return resp, fmt.Errorf("%w: provider exceeded the %.0fs per-attempt budget", ErrPlanAttemptTimeout, planAttemptTimeout.Seconds())
+			}
 			return nil, err
 		}
 		if resp != nil {
@@ -307,15 +354,17 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 	}
 
 	req.Stream = true
-	rawStream, err := e.streamProv(ctx, req)
+	rawStream, err := e.streamProv(attemptCtx, req)
 	if err != nil {
+		if attemptCtx.Err() != nil {
+			return nil, fmt.Errorf("%w: provider exceeded the %.0fs per-attempt budget", ErrPlanAttemptTimeout, planAttemptTimeout.Seconds())
+		}
 		return nil, err
 	}
 	defer func() { _ = rawStream.Close() }()
 
 	content, reasoning, finishReason, input, output := accumulateStream(rawStream, reasoningSink)
 	e.recordUsage(input, output)
-	_ = finishReason
 
 	if strings.TrimSpace(content) == "" && strings.TrimSpace(reasoning) != "" {
 		// Reasoning fallback: the model emitted only thinking content (a
@@ -331,6 +380,19 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 	// orphaned open thinking box.
 	if reasoningPublished {
 		e.bus.Publish(events.NewReasoningStream("", true))
+	}
+
+	// Per-attempt deadline fired mid-stream (or between stream open and first
+	// bytes). Return whatever partial content accumulated — flagged with the
+	// timeout sentinel — so the caller can fail fast and mine it. A natural
+	// "stop" completion is always treated as success even if the deadline
+	// expired a microsecond after the last byte.
+	if attemptCtx.Err() != nil && finishReason != "stop" {
+		return &ai.Response{
+			Content:     content,
+			TokenInput:  input,
+			TokenOutput: output,
+		}, fmt.Errorf("%w: provider exceeded the %.0fs per-attempt budget", ErrPlanAttemptTimeout, planAttemptTimeout.Seconds())
 	}
 
 	// Truncation-aware response: the accumulated buffer is the canonical
@@ -766,6 +828,14 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 
 	resp, err := e.complete(ctx, req)
 	if err != nil {
+		// FAST-FAIL TIMEOUT PATH: a free/cloud model exceeded the strict
+		// per-attempt deadline. Do NOT hard-fail and do NOT burn the retry
+		// budget on a provider that could not answer within 15s — mine the
+		// partial output (and the investigation ledger) for a heuristic plan so
+		// the TUI is unblocked immediately.
+		if errors.Is(err, ErrPlanAttemptTimeout) {
+			return e.heuristicTimeoutFallback(resp, problem, ledgerContent, err)
+		}
 		return nil, fmt.Errorf("plan engine: provider call failed: %w", err)
 	}
 
@@ -826,7 +896,20 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 			req.Messages[len(req.Messages)-1].Content += retryReinforcement(lastFailureMode, attempt, maxSilentRetries)
 			var retryErr error
 			resp, retryErr = e.complete(ctx, req)
-			if retryErr != nil || resp == nil || resp.Content == "" {
+			if retryErr != nil {
+				if errors.Is(retryErr, ErrPlanAttemptTimeout) {
+					// Fail-fast: the provider exceeded the per-attempt deadline
+					// again. Keep any partial content so the heuristic fallback
+					// can mine it, and exit the loop instead of retrying a
+					// provider that cannot answer within the strict budget.
+					if resp != nil && strings.TrimSpace(resp.Content) != "" {
+						lastRawContent = resp.Content
+					}
+					break
+				}
+				continue
+			}
+			if resp == nil || resp.Content == "" {
 				continue
 			}
 			_ = e.store.SaveRawMarkdown("plan", resp.Content)
@@ -1006,6 +1089,72 @@ func (e *Engine) diagnoseSynthesisFailure(message string) {
 		return
 	}
 	e.emit(events.NewStageCompleted("plan.synthesize.error", 0, message))
+}
+
+// heuristicTimeoutFallback is the fast-fail path for plan synthesis when a
+// free/cloud model exceeds the strict per-attempt deadline. It emits a
+// plan.synthesize.fallback event, then mines the partial provider output (the
+// accumulated reasoning/prose is frequently parseable for file paths) and the
+// investigation ledger for a heuristic plan — so a hung provider never blocks
+// the TUI for the full retry budget. Returns a clear timeout error only when no
+// source file can be derived.
+func (e *Engine) heuristicTimeoutFallback(resp *ai.Response, problem, ledgerContent string, cause error) ([]Task, error) {
+	content := ""
+	if resp != nil {
+		content = resp.Content
+	}
+	e.emit(events.NewPlanFallback("timeout", fmt.Sprintf(
+		"Plan synthesis exceeded the %.0fs per-attempt deadline — falling back to heuristic task extraction.", planAttemptTimeout.Seconds())))
+
+	// Priority 1: mine the partial provider output. A root-context catch-all
+	// from the prose miner is a generic fallback, so real ledger-derived file
+	// targets are preferred over it.
+	contentTasks := extractTasksFromProse(content)
+	if len(contentTasks) > 0 && contentTasks[0].Target != rootContextFallbackTarget {
+		if tasks := e.filteredHeuristic(contentTasks, problem, ledgerContent); len(tasks) > 0 {
+			return tasks, nil
+		}
+	}
+
+	// Priority 2: mine the investigation ledger for evidence-grounded files.
+	if ledger := strings.TrimSpace(problem + "\n" + ledgerContent); ledger != "" {
+		if tasks := e.filteredHeuristic(extractTasksFromLedger(ledger), problem, ledgerContent); len(tasks) > 0 {
+			return tasks, nil
+		}
+	}
+
+	// Priority 3: the generic root-context catch-all so execution survives.
+	if len(contentTasks) > 0 {
+		if tasks := e.filteredHeuristic(contentTasks, problem, ledgerContent); len(tasks) > 0 {
+			return tasks, nil
+		}
+	}
+
+	return nil, fmt.Errorf("plan engine: provider timed out after %s and no heuristic plan could be derived from the partial output or ledger: %w", planAttemptTimeout, cause)
+}
+
+// filteredHeuristic applies the standard post-extraction pipeline shared by the
+// heuristic fallbacks: the evidence-based disk-existence barrier, the
+// VANILLA_WEB archetype guard, the root-context catch-all (when real targets
+// were all rejected), and the compile-error SHELL_EXEC enforcement. Returns nil
+// when nothing survives.
+func (e *Engine) filteredHeuristic(tasks []Task, problem, ledgerContent string) []Task {
+	if len(tasks) == 0 {
+		return nil
+	}
+	preFilter := len(tasks)
+	tasks = FilterNonExistentMutationTargets(tasks, e.rootPath)
+	if e.vanillaWeb {
+		tasks = filterGoCommands(tasks)
+		tasks = SanitizeTasksForArchetype(tasks, recon.VANILLA_WEB)
+	}
+	if len(tasks) == 0 && preFilter > 0 {
+		tasks = []Task{rootContextFallbackTask()}
+	}
+	if len(tasks) == 0 {
+		return nil
+	}
+	return ForceShellExecOnCompileError(tasks, problem, ledgerContent)
 }
 
 // tolerantMarkdownTasks parses a non-JSON model response as markdown task

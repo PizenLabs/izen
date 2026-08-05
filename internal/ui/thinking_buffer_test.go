@@ -99,20 +99,17 @@ func TestThinkingBufferRenderStreamingBox(t *testing.T) {
 	tb.SetExpanded(true)
 	out := tb.Render(80, true, "✦")
 
-	if !strings.Contains(out, "Thinking") {
-		t.Errorf("box missing Thinking header: %q", out)
-	}
 	if !strings.Contains(out, "│") {
 		t.Errorf("box missing gutter bar: %q", out)
 	}
 	if !strings.Contains(out, "trace line one") {
 		t.Errorf("box missing reasoning line: %q", out)
 	}
-	// Reasoning text is rendered; the style properties themselves are asserted
-	// separately (TestThinkingBufferRenderStyling) because lipgloss strips ANSI
-	// in non-TTY test environments.
-	if !strings.Contains(out, "trace line one") {
-		t.Errorf("box missing reasoning line: %q", out)
+	// NO-DUPLICATE CONTRACT: the expanded box must NEVER re-print its own
+	// "Thinking…" header — that status line belongs to the parent indicator
+	// (the loading dock or the collapsed one-liner the box replaces).
+	if strings.Contains(out, "Thinking") {
+		t.Errorf("expanded box must not duplicate the parent Thinking header: %q", out)
 	}
 	// No response content may leak into the box.
 	if strings.Contains(out, "final answer") {
@@ -123,14 +120,18 @@ func TestThinkingBufferRenderStreamingBox(t *testing.T) {
 func TestThinkingBufferRenderAutoScroll(t *testing.T) {
 	tb := NewThinkingBuffer()
 	for i := 0; i < 50; i++ {
-		tb.Append("line")
+		tb.Append("line\n")
 	}
 	tb.SetExpanded(true)
-	// maxLines defaults to 8 → 8 content lines + header.
+	// maxLines defaults to 10 → 10 content lines + the overflow footer. The
+	// expanded box is capped and never renders a duplicate Thinking header.
 	out := tb.Render(80, true, "✦")
 	lines := strings.Count(out, "\n") + 1
-	if lines > 9 {
+	if lines > 11 {
 		t.Errorf("box scrolls unbounded: %d lines rendered", lines)
+	}
+	if strings.Contains(out, "Thinking") {
+		t.Errorf("expanded box must not duplicate the parent Thinking header: %q", out)
 	}
 }
 

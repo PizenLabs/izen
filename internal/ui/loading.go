@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/PizenLabs/izen/internal/gateway"
 	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
@@ -148,6 +149,16 @@ func agentShimmerText(label string) string {
 // The dock is the SINGLE active status indicator from prompt submit (t=0ms)
 // through thinking/processing. It clears smoothly ONLY when the first
 // primary output token arrives (tokenMsg handler calls stopShimmer).
+//
+// ANSI-LEAK HARDENING: the shimmer sweep re-colours every rune of the status
+// text independently, so the sweep text MUST NEVER carry pre-styled (ANSI-
+// carrying) segments. An embedded SGR sequence (e.g. dimmedStyle.Render(...))
+// gets its leading ESC byte swallowed by the adjacent per-rune colour code,
+// which leaves the bare parameters — "[38;2;88;91;112m[Ctrl+O to expand][0m" —
+// visible as literal garbage on screen. composeDockTextWithFlake therefore
+// emits plain text, and ansi.Strip is applied defensively before the sweep so
+// no raw escape sequence can ever reach the viewport regardless of what a
+// future caller injects.
 func (m *model) renderLoadingDock() string {
 	if !m.shimmerActive {
 		return ""
@@ -160,7 +171,7 @@ func (m *model) renderLoadingDock() string {
 	dockText := m.composeDockTextWithFlake(flake)
 
 	var b strings.Builder
-	b.WriteString("  " + shimmer.Render(dockText, m.shimmerAnim.Frame, m.shimmerAnim.Width))
+	b.WriteString("  " + shimmer.Render(ansi.Strip(dockText), m.shimmerAnim.Frame, m.shimmerAnim.Width))
 	b.WriteString("\n")
 	if m.loadingTip != "" {
 		b.WriteString("  ")
@@ -178,11 +189,16 @@ func (m *model) renderLoadingDock() string {
 // snowflake character. When the thinking buffer is actively receiving
 // reasoning tokens, the text shows live thinking progress with elapsed time.
 // Otherwise it falls back to the shimmer text set by startShimmer.
+//
+// The returned text is ALWAYS plain (ANSI-free): the shimmer sweep re-colours
+// every rune independently, so embedding a lipgloss-styled segment here would
+// corrupt its escape sequence into a visible "[38;2;..m" leak (see
+// renderLoadingDock). The hint is therefore plain text carried on the same
+// swept line.
 func (m *model) composeDockTextWithFlake(flake string) string {
 	if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 && !m.thinkingBuffer.Complete() {
 		elapsed := m.thinkingBuffer.Elapsed()
-		return fmt.Sprintf("%s Thinking... (%s)  %s", flake, formatElapsed(elapsed),
-			dimmedStyle.Render("[Ctrl+O to expand]"))
+		return fmt.Sprintf("%s Thinking... (%s)  [Ctrl+O to expand]", flake, formatElapsed(elapsed))
 	}
 	if m.shimmerText != "" {
 		return flake + " " + m.shimmerText

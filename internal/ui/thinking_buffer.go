@@ -44,7 +44,7 @@ type ThinkingBuffer struct {
 func NewThinkingBuffer() *ThinkingBuffer {
 	return &ThinkingBuffer{
 		started:  time.Now(),
-		maxLines: 8,
+		maxLines: 10,
 	}
 }
 
@@ -214,6 +214,13 @@ func estimateTokens(text string) int {
 // renders the full reasoning text in a dimmed/italic box — auto-scrolling to
 // the tail while streaming, but scrollable with j/k (and PgUp/PgDn) once the
 // user scrolls up, showing the reasoning bounded to maxLines once complete.
+//
+// NO-DUPLICATE CONTRACT: the expanded box NEVER re-prints its own
+// "Thinking…" status header. That status is owned by the parent indicator —
+// the loading dock's "✻ Thinking... (Xs)" line while the dock is live, or the
+// collapsed one-liner that the box replaces — so adding a header here would
+// stack two "Thinking…" lines in the viewport. The box renders the reasoning
+// window plus an optional scroll affordance footer only.
 func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) string {
 	tb.mu.Lock()
 	content := tb.builder.String()
@@ -276,12 +283,10 @@ func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) stri
 		tb.lastLineCount = total
 		tb.mu.Unlock()
 
-		linesOut := make([]string, 0, tb.maxLines+3)
-		if spinner != "" {
-			linesOut = append(linesOut, thinkingStyle.Render(fmt.Sprintf("%s Thinking… %s", spinner, mutedStyle.Render(elapsedStr))))
-		} else {
-			linesOut = append(linesOut, thinkingStyle.Render(fmt.Sprintf("│ Thinking… %s", mutedStyle.Render(elapsedStr))))
-		}
+		linesOut := make([]string, 0, tb.maxLines+2)
+		// NO header: the "Thinking…" status is owned by the parent indicator
+		// (loading dock or collapsed line) — see the NO-DUPLICATE CONTRACT
+		// above. The box starts directly with the reasoning window.
 		for _, line := range allLines[start:end] {
 			if line == "" {
 				linesOut = append(linesOut, thinkingStyle.Render("│"))
