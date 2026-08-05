@@ -23,6 +23,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/classifier"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
+	"github.com/PizenLabs/izen/internal/domain/signal"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
@@ -2867,54 +2868,29 @@ func (m *model) planSlowNoticeCmd() tea.Cmd {
 // code blocks as the heuristic — when the agent outputs code blocks with known
 // language identifiers (go, diff, python, etc.), it indicates a patch proposal.
 // detectCompileFailure scans the given output for build/compile failure
-// signatures. Returns true when the codebase is in a non-compilable state
-// that requires structural recovery before any patch can be applied.
+// signals. Returns true when the codebase is in a non-compilable state that
+// requires structural recovery before any patch can be applied.
+//
+// Detection is delegated to the canonical signal classifier: routing between
+// investigate, plan and build evaluates the detected SignalKind values instead
+// of re-scanning free text for compile-failure substrings.
 func detectCompileFailure(output string) bool {
 	if output == "" {
 		return false
 	}
-	lower := strings.ToLower(output)
-	indicators := []string{
-		"[build failed]",
-		"syntax error",
-		"compilation error",
-		"expected declaration",
-		"non-declaration statement outside function body",
-		"expected ';'",
-		"cannot find package",
-		"undefined:",
-		"not enough arguments",
-		"too many errors",
-	}
-	for _, ind := range indicators {
-		if strings.Contains(lower, ind) {
-			return true
-		}
-	}
-	return false
+	return signal.HasCompileFailure(signal.Detect(output, "ui.compile"))
 }
 
-// hasMissingModuleError detects Go missing-dependency errors in build/test
+// hasMissingModuleError detects Go missing-dependency signals in build/test
 // output. When a build fails because a module is not in go.sum/go.mod, the
 // compiler prints "no required module provides package" or hints "to add it:
 // go get". These errors cannot be fixed by editing .go files — they require
-// running go get <package>. Returns true if any such pattern is found.
+// running go get <package>. Returns true when a SignalDepMissing is present.
 func hasMissingModuleError(output string) bool {
 	if output == "" {
 		return false
 	}
-	lower := strings.ToLower(output)
-	indicators := []string{
-		"no required module provides package",
-		"to add it: go get",
-		"missing go.sum entry for module",
-	}
-	for _, ind := range indicators {
-		if strings.Contains(lower, ind) {
-			return true
-		}
-	}
-	return false
+	return signal.HasKind(signal.Detect(output, "ui.build"), signal.SignalDepMissing)
 }
 
 func containsMutationIntention(content string) bool {

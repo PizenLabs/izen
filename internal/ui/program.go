@@ -116,8 +116,12 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 		pipeline.WithProvider(pipeline.IntentInformational, cfg.ResolveTierProvider("informational")),
 		pipeline.WithFallbackModel(cfg.ResolveTierModel("execution")),
 	)
+	// Layer 5 telemetry is observed on a dedicated telemetry EventBus; a
+	// TelemetryAdapter bridges every event onto the unified domain event bus as
+	// standardized events.Envelope values so projections consume one stream.
+	telemetryBus := telemetry.NewEventBus(telemetry.DefaultBufferSize)
 	pipeOpts := []pipeline.Option{
-		pipeline.WithEventBus(telemetry.NewEventBus(telemetry.DefaultBufferSize)),
+		pipeline.WithEventBus(telemetryBus),
 		pipeline.WithRouter(pipeRouter),
 	}
 	if provider != nil {
@@ -154,6 +158,17 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 	// bus wired by the Application layer so the Runtime facade observes the
 	// same stream the engines publish onto.
 	eventBus := app.Bus
+
+	// ── TELEMETRY → DOMAIN EVENT BRIDGE ──────────────────────────────────
+	// Adapter First, Delete Later: the legacy telemetry EventBus stays, and a
+	// TelemetryAdapter subscribes to it and forwards every Layer 0-5 event onto
+	// the unified domain event bus as an events.Envelope. Forwarding is
+	// non-blocking end to end — a slow UI projection drops, never stalls the
+	// pipeline. The adapter lives for the program lifetime (like every other
+	// bus subscription); the process exits tear it down.
+	telemetryAdapter := telemetry.NewTelemetryAdapter(telemetryBus, eventBus, "telemetry.pipeline")
+	_ = telemetryAdapter.Start()
+
 	presenter := presentation.New(app.Runtime)
 
 	var detectedLang language.ID

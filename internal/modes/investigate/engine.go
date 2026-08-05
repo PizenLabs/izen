@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/domain/signal"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/runtime/output"
@@ -77,6 +78,12 @@ type Engine struct {
 	// instead of being written directly to the terminal. Optional; nil routes
 	// telemetry back through the legacy package-level sinks.
 	bus *events.Bus
+
+	// signals records the canonical system signals generated during this
+	// investigation (e.g. a SignalDepMissing remote-dependency blocker). They
+	// are the typed evidence of "what machine/system signal occurred" and are
+	// surfaced as events.Envelope values on the bus when one is wired.
+	signals []signal.Signal
 
 	// planner enriches the forensic diagnostics with intent-aware,
 	// budget-fitted structural context before the AI orchestrator dispatches.
@@ -192,6 +199,50 @@ func (e *Engine) emit(ev events.DomainEvent) {
 	if e != nil && e.bus != nil {
 		e.bus.Publish(ev)
 	}
+}
+
+// recordSignal appends a canonical system signal to the engine's signal record
+// (at most once per kind) and, when a bus is wired, surfaces it as an
+// events.Envelope so projections observe the typed signal stream.
+func (e *Engine) recordSignal(s signal.Signal) {
+	if e == nil {
+		return
+	}
+	for _, existing := range e.signals {
+		if existing.Kind == s.Kind {
+			return
+		}
+	}
+	e.signals = append(e.signals, s)
+	if e.bus != nil {
+		e.bus.PublishEnvelope(events.NewSignalEnvelope(s, "investigate"))
+	}
+}
+
+// hasSignal reports whether a signal of the given kind was already recorded.
+func (e *Engine) hasSignal(kind signal.SignalKind) bool {
+	if e == nil {
+		return false
+	}
+	for _, s := range e.signals {
+		if s.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// signalsFor returns the first recorded signal of the given kind, or nil.
+func (e *Engine) signalsFor(kind signal.SignalKind) *signal.Signal {
+	if e == nil {
+		return nil
+	}
+	for i := range e.signals {
+		if e.signals[i].Kind == kind {
+			return &e.signals[i]
+		}
+	}
+	return nil
 }
 
 // forensic publishes forensic telemetry to the event bus when wired, falling
@@ -1136,10 +1187,17 @@ func extractPackageName(rawError string) string {
 
 // injectDependencyBlocker scans the raw diagnostics for Go dependency errors
 // and injects the exact package path directly into the target conclusion pointer
-// using the canonical "lx bypassed" token format that /plan recognises.
+// using the canonical "lx bypassed" token format that /plan recognises. It also
+// records a canonical SignalDepMissing signal on the engine (surfaced as an
+// events.Envelope on the bus) so routing between investigate and plan evaluates
+// a typed signal instead of re-scanning free text.
 // It scans e.Ledger.Diagnostics directly (the raw compiler/test output) rather
 // than depending on high-level conclusion strings being already populated, so
 // the REMOTE DEPENDENCY BLOCKER token is guaranteed on the very first pass.
+//
+// Adapter First, Delete Later: the legacy token stamping is retained for
+// backward-compatible string handoffs while the typed signal is generated
+// alongside it.
 //
 // VANILLA_WEB ARCHETYPE: When the workspace contains only HTML/CSS/JS, Go
 // dependency blockers are NEVER injected — there is no Go module system to
@@ -1156,6 +1214,17 @@ func injectDependencyBlocker(e *Engine, targetConclusion *string) {
 		!strings.Contains(raw, "cannot find module providing package") {
 		return
 	}
+	// Signal generation is idempotent per engine run: the canonical
+	// SignalDepMissing signal carries the blocker flag and the dependency so
+	// downstream routing never needs to re-scan the token text.
+	if !e.hasSignal(signal.SignalDepMissing) {
+		e.recordSignal(signal.New(signal.SignalDepMissing, "investigate", map[string]string{
+			"dependency": extractPackageName(raw),
+			"blocker":    "true",
+		}))
+	}
+	// Token stamping is idempotent per conclusion string (the target may
+	// already carry a blocker from a previous pass).
 	if strings.Contains(*targetConclusion, "REMOTE DEPENDENCY BLOCKER") {
 		return
 	}

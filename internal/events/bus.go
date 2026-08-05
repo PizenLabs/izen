@@ -190,6 +190,14 @@ func (b *Bus) Publish(ev DomainEvent) {
 	}
 }
 
+// PublishEnvelope delivers an Envelope to every subscription registered for its
+// derived type discriminator (e.g. "envelope.signal.dep.missing" or
+// "envelope.telemetry"). It routes through the same non-blocking delivery as
+// Publish, so a slow consumer drops rather than stalls the publisher.
+func (b *Bus) PublishEnvelope(env Envelope) {
+	b.Publish(WrapEnvelope(env))
+}
+
 // Close stops the bus: all subscriptions are cancelled, dispatch goroutines are
 // joined, and subsequent Subscribe calls return nil. Publish after Close is a
 // no-op. Close is idempotent and safe for concurrent use.

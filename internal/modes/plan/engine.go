@@ -14,6 +14,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/core/stream"
+	"github.com/PizenLabs/izen/internal/domain/signal"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
@@ -554,6 +555,14 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		}
 	}
 
+	// ── CANONICAL SIGNAL CLASSIFICATION ────────────────────────────────
+	// Classify the ledger once into canonical signal.Signal values. All routing
+	// below (canonical import mismatch, undefined symbol, remote dependency
+	// blocker, compile/dependency fallbacks) evaluates typed SignalKind values
+	// instead of re-scanning raw terminal text — the signal classifier is the
+	// single place where free-text matching for routing happens.
+	signals := signal.Detect(ledgerContent, "plan.ledger")
+
 	// ── DIRECT MUTATION FAST-TRACK ──────────────────────────
 	// When the prompt is a simple file replacement (refactor LICENSE
 	// from MIT to APACHE, change X to Y in @file, etc.), bypass
@@ -590,7 +599,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	//           file loading into LLM context).
 	//   Step 3: Minimal context ledger population (under 100 tokens).
 	//   Step 4: Atomic execution blueprint (FILE_EDIT + SHELL_EXEC).
-	if !fastTrack && !e.vanillaWeb && HasCanonicalImportMismatch(ledgerContent) {
+	if !fastTrack && !e.vanillaWeb && signal.HasKind(signals, signal.SignalImportMismatch) {
 		mismatch := retrieval.ParseCanonicalMismatch(ledgerContent)
 		if mismatch != nil && mismatch.OldPath != "" && mismatch.NewPath != "" {
 			router := retrieval.GetGlobalRouter()
@@ -650,7 +659,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	//
 	// CRITICAL: Both paths complete in < 1ms. The LLM synthesis retry loop
 	// and lx daemon handshake are NEVER reached for undefined symbol errors.
-	if !fastTrack && !e.vanillaWeb && HasUndefinedSymbolError(ledgerContent) {
+	if !fastTrack && !e.vanillaWeb && signal.HasKind(signals, signal.SignalSymbolUndefined) {
 		undef := retrieval.ParseUndefinedSymbol(ledgerContent)
 		if undef != nil && undef.Symbol != "" {
 			sanitizedTarget, _ := retrieval.SanitizeTargetPath(undef.File)
@@ -692,51 +701,62 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		}
 	}
 
-	// REMOTE DEPENDENCY BLOCKER short-circuit: if the ledger explicitly
-	// identifies a remote dependency through forensic analysis, bypass LLM
-	// synthesis entirely and generate deterministic go get / go mod tidy
-	// tasks. This guarantees 100% success for missing package resolution,
-	// eliminating the 3-attempt JSON synthesis crash loop.
-	if !fastTrack && strings.Contains(ledgerContent, "REMOTE DEPENDENCY BLOCKER") {
-		conclusion := ExtractConclusionFromLedger(ledgerContent)
-		if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
-			taskGet := Task{
-				StepNum:     1,
-				IsDone:      false,
-				Status:      "idle",
-				Type:        "SHELL_EXEC",
-				Target:      fmt.Sprintf("go get %s", dep),
-				Description: fmt.Sprintf("Install missing dependency %s to resolve compiler/import blocker.", dep),
-				Rationale:   fmt.Sprintf("Inject the explicit third-party module %s missing from the execution boundary.", dep),
-				Solution:    fmt.Sprintf("Missing package %s successfully resolves and dependency block clears.", dep),
-				IsHardcoded: true,
+	// REMOTE DEPENDENCY BLOCKER short-circuit: if the ledger carries a
+	// SignalDepMissing whose payload marks the investigate "lx bypassed" blocker
+	// token, bypass LLM synthesis entirely and generate deterministic
+	// go get / go mod tidy tasks. This guarantees 100% success for missing
+	// package resolution, eliminating the 3-attempt JSON synthesis crash loop.
+	//
+	// The signal classifier extracts the blocker marker AND the dependency
+	// package from the ledger; the conclusion path remains the primary
+	// dependency source (it carries the corrected path from forensic analysis).
+	if !fastTrack {
+		blocker := signal.First(signals, signal.SignalDepMissing)
+		if blocker != nil && blocker.PayloadValue("blocker") == "true" {
+			conclusion := ExtractConclusionFromLedger(ledgerContent)
+			dep := dependencyFromConclusion(conclusion)
+			if dep == "" {
+				dep = blocker.PayloadValue("dependency")
 			}
-			taskTidy := Task{
-				StepNum:     2,
-				IsDone:      false,
-				Status:      "idle",
-				Type:        "SHELL_EXEC",
-				Target:      "go mod tidy",
-				Description: "Re-synchronize the dependency manifest with active imports after blocker identification.",
-				Rationale:   "Re-synchronize the dependency manifest with active imports after blocker identification.",
-				Solution:    "Clean up stale pointers and establish structural registry alignment.",
-				IsHardcoded: true,
+			if dep != "" && !isPlaceholderToken(dep) {
+				taskGet := Task{
+					StepNum:     1,
+					IsDone:      false,
+					Status:      "idle",
+					Type:        "SHELL_EXEC",
+					Target:      fmt.Sprintf("go get %s", dep),
+					Description: fmt.Sprintf("Install missing dependency %s to resolve compiler/import blocker.", dep),
+					Rationale:   fmt.Sprintf("Inject the explicit third-party module %s missing from the execution boundary.", dep),
+					Solution:    fmt.Sprintf("Missing package %s successfully resolves and dependency block clears.", dep),
+					IsHardcoded: true,
+				}
+				taskTidy := Task{
+					StepNum:     2,
+					IsDone:      false,
+					Status:      "idle",
+					Type:        "SHELL_EXEC",
+					Target:      "go mod tidy",
+					Description: "Re-synchronize the dependency manifest with active imports after blocker identification.",
+					Rationale:   "Re-synchronize the dependency manifest with active imports after blocker identification.",
+					Solution:    "Clean up stale pointers and establish structural registry alignment.",
+					IsHardcoded: true,
+				}
+				return []Task{taskGet, taskTidy}, nil
 			}
-			return []Task{taskGet, taskTidy}, nil
+			return []Task{
+				{
+					StepNum:     1,
+					IsDone:      false,
+					Status:      "idle",
+					Type:        "SHELL_EXEC",
+					Target:      "go mod tidy",
+					Description: "Re-synchronize the dependency manifest with active imports after blocker identification.",
+					Rationale:   "Re-synchronize the dependency manifest with active imports after blocker identification.",
+					Solution:    "Clean up stale pointers and establish structural registry alignment.",
+					IsHardcoded: true,
+				},
+			}, nil
 		}
-		return []Task{
-			{
-				StepNum:     1,
-				IsDone:      false,
-				Status:      "idle",
-				Type:        "SHELL_EXEC",
-				Target:      "go mod tidy",
-				Description: "Re-synchronize the dependency manifest with active imports after blocker identification.",
-				Rationale:   "Re-synchronize the dependency manifest with active imports after blocker identification.",
-				Solution:    "Clean up stale pointers and establish structural registry alignment.",
-				IsHardcoded: true,
-			},
-		}, nil
 	}
 
 	e.emit(events.NewIntentParsed("plan.synthesize", problem, 0.8))
@@ -816,10 +836,11 @@ ALLOWED ACTIONS: Pure file mutations on .html, .css, .js files only.`
 		}
 	}
 
-	// UNDEFINED SYMBOL GUARDRAIL: When the ledger contains an undefined symbol
-	// error, explicitly instruct the LLM to generate ONLY file modification tasks.
-	// Shell execution commands like go mod tidy are NEVER valid for code typos.
-	if !fastTrack && HasUndefinedSymbolError(ledgerContent) {
+	// UNDEFINED SYMBOL GUARDRAIL: When the ledger carries a SignalSymbolUndefined
+	// signal, explicitly instruct the LLM to generate ONLY file modification
+	// tasks. Shell execution commands like go mod tidy are NEVER valid for code
+	// typos.
+	if !fastTrack && signal.HasKind(signals, signal.SignalSymbolUndefined) {
 		req.Messages[len(req.Messages)-1].Content += `
 
 [SYSTEM: UNDEFINED SYMBOL ERROR — CODE FIX ONLY]
@@ -1017,10 +1038,11 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	}
 	e.diagnoseSynthesisFailure(fmt.Sprintf(
 		"All %d plan synthesis attempts failed after sanitization. Last provider output excerpt: %q. The model produced neither parseable JSON nor task blocks.", maxSilentRetries+1, excerpt))
-	if HasUndefinedSymbolError(ledgerContent) {
+	if signal.HasKind(signals, signal.SignalSymbolUndefined) {
 		return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed for undefined symbol error — could not determine correct code fix", maxSilentRetries+1)
 	}
-	if IsCompilationOrDependencyError(problem) || IsCompilationOrDependencyError(ledgerContent) {
+	if signal.IsCompilationOrDependency(signals) ||
+		signal.IsCompilationOrDependency(signal.Detect(problem, "plan.problem")) {
 		conclusion := ExtractConclusionFromLedger(ledgerContent)
 		if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
 			return []Task{
@@ -1039,7 +1061,11 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	}
 
 	// ── ABSOLUTE FALLBACK ────────────────────────────────────────
-	if hasGoFileParseError(ledgerContent) || hasGoFileParseError(problem) {
+	// A *.go compile coordinate paired with an import/parse indicator is the
+	// last signal that a structured recovery plan is required. This mirrors the
+	// legacy hasGoFileParseError detector via the canonical signal classifier.
+	if signal.HasCompileFailure(signals) ||
+		signal.HasCompileFailure(signal.Detect(problem, "plan.problem")) {
 		return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts exhausted for compile error — no valid tasks could be synthesized", maxSilentRetries+1)
 	}
 

@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/internal/domain/signal"
 )
 
 // ansiTrimRE matches ANSI escape sequences used in terminal output.
@@ -232,22 +232,28 @@ func isHighValueLine(line string) bool {
 // canonical import path mismatch error — "module declares its path as: X but was
 // required as: Y". When detected, the resolution strategy MUST include FILE_EDIT
 // tasks at lx-resolved coordinates rather than resorting to SHELL_EXEC only.
+//
+// The detection is delegated to the canonical signal classifier: routing
+// evaluates the SignalImportMismatch kind instead of re-parsing free text.
 func HasCanonicalImportMismatch(ledger string) bool {
 	if ledger == "" {
 		return false
 	}
-	return retrieval.HasCanonicalMismatch(ledger)
+	return signal.HasKind(signal.Detect(ledger, "plan.ledger"), signal.SignalImportMismatch)
 }
 
 // HasUndefinedSymbolError reports whether the ledger content contains a Go
 // "undefined: <Symbol>" compiler error. When detected with valid lx coordinates,
 // a deterministic FILE_EDIT plan is generated to correct the symbol at the
 // error location, bypassing LLM JSON plan synthesis.
+//
+// The detection is delegated to the canonical signal classifier: routing
+// evaluates the SignalSymbolUndefined kind instead of re-parsing free text.
 func HasUndefinedSymbolError(ledger string) bool {
 	if ledger == "" {
 		return false
 	}
-	return retrieval.HasUndefinedSymbol(ledger)
+	return signal.HasKind(signal.Detect(ledger, "plan.ledger"), signal.SignalSymbolUndefined)
 }
 
 // CoreErrorLine extracts the single most diagnostic line from a raw ledger —
@@ -274,75 +280,19 @@ func CoreErrorLine(ledger string) string {
 // IsCompilationOrDependencyError reports whether the ledger contains only
 // compilation / dependency / environment errors that can be resolved via
 // module/setup commands rather than a deep architectural plan.
-// goFileDependencyRe matches a compiler coordinate (e.g. `main.go:7:5:`) whose
-// message begins with a dependency/import error fragment. This catches both the
-// full phrase and the truncated "no required modul…" variant that the UI may
-// have clipped from the ledger.
-var goFileDependencyRe = regexp.MustCompile(`[^\s:]+\.go:\d+:\d+:\s*no required`)
-
-// goFileParseRe matches any *.go compiler coordinate that is followed by a
-// parsing or import failure indicator, signalling a module/environment
-// discrepancy rather than a pure source-logic bug.
-var goFileParseRe = regexp.MustCompile(`[^\s:]+\.go:\d+:\d+:`)
-
-// parseErrorIndicators are the secondary signals that, when paired with a *.go
-// coordinate, imply a module/import resolution failure.
-var parseErrorIndicators = []string{
-	"no required",
-	"could not import",
-	"missing module",
-	"cannot find module",
-	"undefined:",
-	"import",
-	"package ",
-	"build failed",
-	"compilation failed",
-}
-
-// hasGoFileParseError reports whether the content contains a *.go compile
-// coordinate paired with a parsing/import error indicator — i.e. evidence of a
-// raw source-file compile failure that implies a module/environment issue.
-func hasGoFileParseError(content string) bool {
-	trimmed := strings.TrimSpace(content)
-	if trimmed == "" {
-		return false
-	}
-	for _, line := range strings.Split(trimmed, "\n") {
-		if goFileParseRe.MatchString(line) && containsAny(line, parseErrorIndicators) {
-			return true
-		}
-	}
-	return false
-}
-
-// content describes a build/dependency blocker that can be resolved via module
-// tooling (go mod tidy / go get) rather than a deep architectural plan.
 //
-// Detection is intentionally fuzzy: it accepts strict phrases, truncated
+// The detection is delegated to the canonical signal classifier: routing
+// evaluates the detected signal kinds instead of re-parsing free text. The
+// classifier reproduces the legacy marker set — strict phrases, truncated
 // prefixes, the `*.go:N:M: no required` coordinate regex, and any *.go compile
-// coordinate combined with a parsing/import error indicator, so partially
+// coordinate combined with a parsing/import error indicator — so partially
 // clipped terminal output still trips the detector.
 func IsCompilationOrDependencyError(ledger string) bool {
 	trimmed := strings.TrimSpace(ledger)
 	if trimmed == "" {
 		return false
 	}
-	if containsAny(trimmed, compilationErrorMarkers) {
-		return true
-	}
-	// Coordinate form: `main.go:7:5: no required module provides package ...`
-	if goFileDependencyRe.MatchString(trimmed) {
-		return true
-	}
-	// Any *.go coordinate paired with an import/parse indicator.
-	if goFileParseRe.MatchString(trimmed) {
-		for _, line := range strings.Split(trimmed, "\n") {
-			if goFileParseRe.MatchString(line) && containsAny(line, parseErrorIndicators) {
-				return true
-			}
-		}
-	}
-	return false
+	return signal.IsCompilationOrDependency(signal.Detect(trimmed, "plan.classifier"))
 }
 
 // ExtractConclusionFromLedger scans a formatted ledger string (as produced by
