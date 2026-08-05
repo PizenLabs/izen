@@ -345,6 +345,8 @@ func NewProgramWithApp(root string, cfg *config.Config, sess *session.Session, m
 		execEng:             execEng,
 		planStore:           planStore,
 		planEngine:          planEng,
+		microkernel:         plan.NewMicrokernelPlanner(root),
+		intentCompiler:      plan.NewIntentCompilerPlanner(root),
 		ledger:              NewContextLedger(),
 		ti:                  ti,
 		showBanner:          true,

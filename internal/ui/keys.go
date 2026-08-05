@@ -172,8 +172,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// /plan (UI/layout tasks) or /build (code mutation).
 		intent := investigate.ClassifyIntent(handoffContent)
 		if intent.IsFrontendUI() {
-			m.handoffLedgerContent = "frontend ui intent detected — hand off to plan"
+			// Preserve the raw request alongside the routing marker so the
+			// microkernel pipeline can plan from the actual prompt.
+			m.handoffLedgerContent = "frontend ui intent detected — hand off to plan\n" + handoffContent
 			m.handoffCtx.ProposedFix = handoffContent
+			m.persistUserIntentPacket(handoffContent)
 			m.modeChangeAuthorized = true
 			m.currentResult = nil
 			return m, m.setMode(modes.ModePlan)

@@ -3,7 +3,6 @@ package plan
 import (
 	"context"
 	"io"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -51,13 +50,12 @@ func (h *hangingStream) FinishReason() string { return "" }
 
 var _ ai.FinishReasonProvider = (*hangingStream)(nil)
 
-// TestProcessFromLedger_FreeModelTimeoutFailsFastToHeuristic is the regression
-// guard for the "OpenRouter free-tier hangs for minutes" symptom: a free model
-// (`cohere/north-mini-code:free`) whose provider produces zero bytes must be
-// cut off by the strict per-attempt deadline and fall back to heuristic task
-// extraction derived from the investigation ledger — within a couple hundred
-// milliseconds, not the multi-minute provider hang.
-func TestProcessFromLedger_FreeModelTimeoutFailsFastToHeuristic(t *testing.T) {
+// TestProcessFromLedger_FreeModelTimeoutFailsFast is the regression guard for
+// the "OpenRouter free-tier hangs for minutes" symptom: a free model whose
+// provider produces zero bytes must be cut off by the strict per-attempt
+// deadline and fail fast with an explicit error (NOT a heuristic plan mined
+// from the ledger — the heuristic fallback is hard-killed).
+func TestProcessFromLedger_FreeModelTimeoutFailsFast(t *testing.T) {
 	orig := planAttemptTimeout
 	planAttemptTimeout = 60 * time.Millisecond
 	defer func() { planAttemptTimeout = orig }()
@@ -73,24 +71,21 @@ func TestProcessFromLedger_FreeModelTimeoutFailsFastToHeuristic(t *testing.T) {
 		"fix the reported issue", "cohere/north-mini-code:free")
 	elapsed := time.Since(start)
 
-	if err != nil {
-		t.Fatalf("free-model timeout must fall back to heuristic, got error: %v", err)
+	if err == nil {
+		t.Fatal("free-model timeout must fail fast with an explicit error, not a heuristic plan")
 	}
 	if elapsed > 3*time.Second {
 		t.Fatalf("timeout did not fail fast: elapsed = %v", elapsed)
 	}
-	if len(tasks) == 0 {
-		t.Fatal("heuristic fallback produced no tasks")
-	}
-	if tasks[0].Target != "cmd/api/main.go" {
-		t.Errorf("heuristic task target = %q, want cmd/api/main.go (mined from ledger): %+v", tasks[0].Target, tasks)
+	if len(tasks) != 0 {
+		t.Fatalf("timeout must not yield heuristic tasks: %+v", tasks)
 	}
 }
 
-// TestProcessFromLedger_FreeModelTimeoutEmitsFallbackEvent verifies the
-// plan.synthesize.fallback PresentationEvent is published on the timeout
-// fast-fail path so the presentation layer can notify the user.
-func TestProcessFromLedger_FreeModelTimeoutEmitsFallbackEvent(t *testing.T) {
+// TestProcessFromLedger_FreeModelTimeoutEmitsNoFallbackEvent verifies the
+// plan.synthesize.fallback event is NEVER published on the timeout fast-fail
+// path — the heuristic fallback is dead.
+func TestProcessFromLedger_FreeModelTimeoutEmitsNoFallbackEvent(t *testing.T) {
 	orig := planAttemptTimeout
 	planAttemptTimeout = 60 * time.Millisecond
 	defer func() { planAttemptTimeout = orig }()
@@ -115,26 +110,20 @@ func TestProcessFromLedger_FreeModelTimeoutEmitsFallbackEvent(t *testing.T) {
 		return &hangingStream{ctx: ctx}, nil
 	})
 
-	tasks, err := e.ProcessFromLedger(context.Background(),
+	_, _ = e.ProcessFromLedger(context.Background(),
 		"ledger: internal/parser/stream.go:40:3 error",
 		"fix it", "cohere/north-mini-code:free")
-	if err != nil {
-		t.Fatalf("timeout fallback must not error: %v", err)
-	}
-	if len(tasks) == 0 {
-		t.Fatal("expected heuristic tasks")
-	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(200 * time.Millisecond)
 	for {
 		mu.Lock()
 		n := timeoutFallbacks
 		mu.Unlock()
 		if n >= 1 {
-			break
+			t.Fatalf("timeout fallback event emitted %d time(s) — heuristic fallback must be dead", n)
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timeout fallback event not emitted (count=%d)", n)
+			break
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -142,7 +131,7 @@ func TestProcessFromLedger_FreeModelTimeoutEmitsFallbackEvent(t *testing.T) {
 
 // TestProcessFromLedger_FreeModelTimeoutNonStreaming covers the same fail-fast
 // contract on the non-streaming provider path: a provider that blocks until the
-// attempt context fires must be cut off and fall back to the heuristic plan.
+// attempt context fires must be cut off and fail with an explicit error.
 func TestProcessFromLedger_FreeModelTimeoutNonStreaming(t *testing.T) {
 	orig := planAttemptTimeout
 	planAttemptTimeout = 60 * time.Millisecond
@@ -160,14 +149,14 @@ func TestProcessFromLedger_FreeModelTimeoutNonStreaming(t *testing.T) {
 		"fix it", "cohere/north-mini-code:free")
 	elapsed := time.Since(start)
 
-	if err != nil {
-		t.Fatalf("non-streaming timeout must fall back to heuristic, got error: %v", err)
+	if err == nil {
+		t.Fatal("non-streaming timeout must fail with an explicit error")
 	}
 	if elapsed > 3*time.Second {
 		t.Fatalf("timeout did not fail fast: elapsed = %v", elapsed)
 	}
-	if len(tasks) == 0 {
-		t.Fatal("heuristic fallback produced no tasks")
+	if len(tasks) != 0 {
+		t.Fatalf("timeout must not yield heuristic tasks: %+v", tasks)
 	}
 }
 
@@ -203,29 +192,25 @@ func TestProcessFromLedger_PaidModelKeepsParentBudget(t *testing.T) {
 }
 
 // TestProcessFromLedger_FreeModelPartialProseThenTimeout verifies that when the
-// per-attempt deadline fires AFTER partial prose arrived on the stream, that
-// partial content is what the heuristic mines — not a hard error and not an
-// empty plan.
+// per-attempt deadline fires AFTER partial prose arrived on the stream, the
+// engine still fails fast with an explicit error — it does NOT mine the partial
+// prose for a heuristic plan.
 func TestProcessFromLedger_FreeModelPartialProseThenTimeout(t *testing.T) {
 	orig := planAttemptTimeout
 	planAttemptTimeout = 60 * time.Millisecond
 	defer func() { planAttemptTimeout = orig }()
 
-	// The stream yields one prose chunk mentioning a file, then blocks.
 	e := NewEngine(NewPlanStore())
 	e.SetStreamProvider(func(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
 		return &partialThenHangStream{ctx: ctx, chunk: "The fix lives in internal/retrieval/canonical.go at the mismatch parser."}, nil
 	})
 
 	tasks, err := e.ProcessFromLedger(context.Background(), "ledger", "fix the mismatch", "cohere/north-mini-code:free")
-	if err != nil {
-		t.Fatalf("partial-prose timeout must fall back to heuristic, got error: %v", err)
+	if err == nil {
+		t.Fatal("partial-prose timeout must fail with an explicit error, not a heuristic plan")
 	}
-	if len(tasks) != 1 {
-		t.Fatalf("got %d tasks, want 1 mined from the partial prose: %+v", len(tasks), tasks)
-	}
-	if tasks[0].Target != "internal/retrieval/canonical.go" {
-		t.Errorf("target = %q, want internal/retrieval/canonical.go: %+v", tasks[0].Target, tasks)
+	if len(tasks) != 0 {
+		t.Fatalf("partial-prose timeout must not yield heuristic tasks: %+v", tasks)
 	}
 }
 
@@ -254,33 +239,3 @@ func (p *partialThenHangStream) Usage() (int, int) { return 0, 0 }
 func (p *partialThenHangStream) FinishReason() string { return "" }
 
 var _ ai.FinishReasonProvider = (*partialThenHangStream)(nil)
-
-// TestExtractTasksFromLedger verifies the ledger miner builds one FILE_MUTATE
-// task per detected source file from investigation data.
-func TestExtractTasksFromLedger(t *testing.T) {
-	ledger := "cmd/api/main.go:12:5: no required module provides package\ninternal/parser/stream.go:40:3: undefined: Symbol"
-	tasks := extractTasksFromLedger(ledger)
-	if len(tasks) != 2 {
-		t.Fatalf("got %d tasks, want 2: %+v", len(tasks), tasks)
-	}
-	if tasks[0].Target != "cmd/api/main.go" {
-		t.Errorf("task 0 target = %q, want cmd/api/main.go", tasks[0].Target)
-	}
-	if tasks[1].Target != "internal/parser/stream.go" {
-		t.Errorf("task 1 target = %q, want internal/parser/stream.go", tasks[1].Target)
-	}
-	for i, tk := range tasks {
-		if tk.Type != "FILE_MUTATE" {
-			t.Errorf("task %d type = %q, want FILE_MUTATE", i, tk.Type)
-		}
-		if strings.TrimSpace(tk.Description) == "" {
-			t.Errorf("task %d description is empty", i)
-		}
-	}
-}
-
-func TestExtractTasksFromLedger_Empty(t *testing.T) {
-	if tasks := extractTasksFromLedger(""); tasks != nil {
-		t.Fatalf("got %+v, want nil for empty input", tasks)
-	}
-}
