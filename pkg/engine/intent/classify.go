@@ -104,6 +104,7 @@ var greenfieldWebVerbs = []string{
 	"make ", "make the ", "make a ", "make an ",
 	"create ", "create the ", "create a ", "create an ",
 	"build ", "build the ", "build a ", "build an ",
+	"design ", "design the ", "design a ", "design an ",
 	"generate ", "generate the ", "generate a ", "generate an ",
 	"write ", "write the ", "write a ", "write an ",
 	"scaffold ", "new website", "new web page", "new webpage",

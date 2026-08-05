@@ -128,3 +128,13 @@ func mentionsAny(lower string, keywords []string) bool {
 	}
 	return false
 }
+
+// IsGreenfieldWebPrompt reports whether a prompt requests static website
+// generation. It is the same deterministic signal set GreenfieldWebStrategy
+// uses to enumerate its canonical file set; the IR planner reuses it as its
+// applicability gate so the intent compiler and the strategy agree on what
+// "greenfield web" means.
+func IsGreenfieldWebPrompt(prompt string) bool {
+	lower := strings.ToLower(strings.TrimSpace(prompt))
+	return mentionsAny(lower, greenfieldWebKeywords)
+}

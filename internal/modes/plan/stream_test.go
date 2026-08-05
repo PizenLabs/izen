@@ -143,8 +143,8 @@ func (o *oneByteAtATime) Read(p []byte) (int, error) {
 // provider returns a non-empty (but unparseable) first response and then
 // returns a nil response with a nil error on every retry, the retry loop
 // exhausts with resp == nil. The engine must never dereference the nil
-// response — instead the prose from the first attempt is mined by the heuristic
-// fallback into a root-context task, so the execution survives without panicking.
+// response — with the heuristic fallback hard-killed it returns an explicit
+// error instead of panicking or fabricating a plan.
 func TestProcessFromLedgerNilResponseOnRetryNoPanic(t *testing.T) {
 	calls := 0
 	e := NewEngine(NewPlanStore())
@@ -160,14 +160,11 @@ func TestProcessFromLedgerNilResponseOnRetryNoPanic(t *testing.T) {
 	})
 
 	tasks, err := e.ProcessFromLedger(context.Background(), "", "no parseable plan", "test-model")
-	if err != nil {
-		t.Fatalf("expected heuristic fallback instead of error, got: %v", err)
+	if err == nil {
+		t.Fatal("expected an explicit error (heuristic fallback is hard-killed), got nil")
 	}
-	if len(tasks) != 1 {
-		t.Fatalf("got %d tasks, want 1 root-context heuristic fallback: %+v", len(tasks), tasks)
-	}
-	if tasks[0].Type != "FILE_MUTATE" {
-		t.Errorf("task type = %q, want FILE_MUTATE", tasks[0].Type)
+	if len(tasks) != 0 {
+		t.Fatalf("got %d tasks, want 0: %+v", len(tasks), tasks)
 	}
 	if calls < 3 {
 		t.Errorf("provider called %d times, want at least 3 (initial + retries)", calls)

@@ -146,6 +146,8 @@ func TestClassify(t *testing.T) {
 		{"tell me the weather today", FamilyGeneral},
 		{"make the website introduce for JAY with your job is software engineer using html, css and js", FamilyGreenfield},
 		{"make a website for me using html, css and js", FamilyGreenfield},
+		{"Design a website introducing JAY, describing your job as a software engineer, using HTML, CSS, and JavaScript.", FamilyGreenfield},
+		{"design a landing page for my startup", FamilyGreenfield},
 		{"explain how websites work", FamilyQuestion},
 		{"refactor my portfolio website into modules", FamilyRefactor},
 	}

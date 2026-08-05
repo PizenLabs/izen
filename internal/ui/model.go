@@ -192,6 +192,10 @@ type planResultMsg struct {
 	// pipeline (pkg/engine) rather than LLM synthesis. The handler uses it to
 	// label the staged plan and to render rejection reasons in the footer.
 	Microkernel bool
+	// IntentCompiler marks plans produced by the IR-driven intent compiler
+	// (inference → policy → IR plan → lowerer). The handler labels the staged
+	// plan and notes that zero model tokens were consumed.
+	IntentCompiler bool
 	// TokenInput/TokenOutput are the provider-reported usage of the synthesis
 	// call, committed even when the response was truncated (finish_reason:
 	// "length"). The handler mirrors them into the session counters and the
@@ -786,6 +790,13 @@ type model struct {
 	// the TUI renders explicit file targets instead of the legacy heuristic
 	// fallback. It is constructed at bootstrap and immutable afterwards.
 	microkernel *plan.MicrokernelPlanner
+
+	// intentCompiler is the IR-driven intent compiler planner. It is the
+	// deterministic PRIME path of the /plan handlers: it runs the full
+	// inference → policy → IR plan → lowerer pipeline and stages concrete
+	// FileArtifact targets (index.html, styles.css, script.js) without any LLM
+	// call or heuristic fallback. Constructed at bootstrap and immutable.
+	intentCompiler *plan.IntentCompilerPlanner
 
 	// buildLedger is the live /plan task state bridge shared with the execution
 	// engine. It is created lazily and survives across builds within a session.

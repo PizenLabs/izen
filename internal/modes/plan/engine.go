@@ -829,12 +829,12 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	resp, err := e.complete(ctx, req)
 	if err != nil {
 		// FAST-FAIL TIMEOUT PATH: a free/cloud model exceeded the strict
-		// per-attempt deadline. Do NOT hard-fail and do NOT burn the retry
-		// budget on a provider that could not answer within 15s — mine the
-		// partial output (and the investigation ledger) for a heuristic plan so
-		// the TUI is unblocked immediately.
+		// per-attempt deadline. The legacy path mined the partial output and
+		// the ledger for a heuristic plan; that is HARD-KILLED (it produced
+		// empty-target CODE_MOD [Target 1/1] tasks). Surface an explicit,
+		// actionable timeout error so the TUI can escalate instead.
 		if errors.Is(err, ErrPlanAttemptTimeout) {
-			return e.heuristicTimeoutFallback(resp, problem, ledgerContent, err)
+			return nil, fmt.Errorf("plan engine: provider exceeded the %.0fs per-attempt deadline — plan synthesis aborted without a heuristic fallback; retry with a different model or narrow the investigation ledger: %w", planAttemptTimeout.Seconds(), err)
 		}
 		return nil, fmt.Errorf("plan engine: provider call failed: %w", err)
 	}
@@ -875,11 +875,6 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	// friction of /mode investigate ↔ /mode plan toggling by handling the
 	// correction transparently.
 	maxSilentRetries := 2
-	// lastRawContent preserves the most recent non-empty model output across the
-	// retry loop. The final response may be nil (a retry returned no content),
-	// but the prose the model DID emit on an earlier attempt is still the best
-	// signal the heuristic fallback can mine for file paths.
-	lastRawContent := ""
 	// lastFailureMode classifies why the previous attempt was rejected so the
 	// next retry's prompt augmentation targets the ACTUAL defect. The historical
 	// retry always re-instructed SHELL_EXEC validation, which did nothing for a
@@ -899,12 +894,8 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 			if retryErr != nil {
 				if errors.Is(retryErr, ErrPlanAttemptTimeout) {
 					// Fail-fast: the provider exceeded the per-attempt deadline
-					// again. Keep any partial content so the heuristic fallback
-					// can mine it, and exit the loop instead of retrying a
-					// provider that cannot answer within the strict budget.
-					if resp != nil && strings.TrimSpace(resp.Content) != "" {
-						lastRawContent = resp.Content
-					}
+					// again. Exit the loop instead of retrying a provider that
+					// cannot answer within the strict budget.
 					break
 				}
 				continue
@@ -913,9 +904,6 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 				continue
 			}
 			_ = e.store.SaveRawMarkdown("plan", resp.Content)
-		}
-		if resp != nil && strings.TrimSpace(resp.Content) != "" {
-			lastRawContent = resp.Content
 		}
 
 		jsonResult := ParseJSONPlan(resp.Content)
@@ -1005,37 +993,15 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 		}
 	}
 
-	// ── HEURISTIC PROSE FALLBACK ──────────────────────────────────────
-	// Last resort before hard failure: the model emitted narrative reasoning
-	// prose (a common failure mode of free/mini cloud models) that neither the
-	// JSON parser nor the markdown task parser could consume. Mine the text for
-	// file paths and construct one FILE_MUTATE task per detected file so the
-	// execution survives instead of dying with "all 3 JSON synthesis attempts
-	// failed". A clear plan.synthesize.fallback event notifies the user that a
-	// heuristic plan was generated.
-	if strings.TrimSpace(lastRawContent) != "" {
-		if heuristic := extractTasksFromProse(lastRawContent); len(heuristic) > 0 {
-			preFilter := len(heuristic)
-			heuristic = FilterNonExistentMutationTargets(heuristic, e.rootPath)
-			if e.vanillaWeb {
-				heuristic = filterGoCommands(heuristic)
-				heuristic = SanitizeTasksForArchetype(heuristic, recon.VANILLA_WEB)
-			}
-			// When every prose-derived file target was rejected by the
-			// evidence-based disk-existence barrier (the model reasoned about
-			// files that do not exist on disk), fall back to the hardcoded
-			// root-context task so execution survives instead of dying with
-			// "all 3 JSON synthesis attempts failed".
-			if len(heuristic) == 0 && preFilter > 0 {
-				heuristic = []Task{rootContextFallbackTask()}
-			}
-			if len(heuristic) > 0 {
-				e.emit(events.NewPlanFallback("prose", fmt.Sprintf(
-					"The model returned non-JSON prose; a heuristic plan with %d FILE_MUTATE task(s) was extracted from the mentioned file paths.", len(heuristic))))
-				return ForceShellExecOnCompileError(heuristic, problem, ledgerContent), nil
-			}
-		}
-	}
+	// ── SYNTHESIS FAILURE ──────────────────────────────────────────────
+	// All LLM synthesis attempts produced output that neither the JSON parser
+	// nor the markdown task parser could consume. The legacy heuristic prose
+	// fallback (regex-mining file paths and synthesising a generic root-context
+	// "apply the plan" task) is HARD-KILLED: it produced empty-target
+	// CODE_MOD [Target 1/1] tasks that bypassed every evidence gate. Generation
+	// requests are owned deterministically by the intent compiler before this
+	// path is ever reached; when the model still fails here, surface an
+	// explicit, actionable error and let the caller escalate.
 
 	// ── EMERGENCY FALLBACK ────────────────────────────────────────
 	// All 3 LLM synthesis attempts (initial + 2 retries) failed to produce a
@@ -1089,72 +1055,6 @@ func (e *Engine) diagnoseSynthesisFailure(message string) {
 		return
 	}
 	e.emit(events.NewStageCompleted("plan.synthesize.error", 0, message))
-}
-
-// heuristicTimeoutFallback is the fast-fail path for plan synthesis when a
-// free/cloud model exceeds the strict per-attempt deadline. It emits a
-// plan.synthesize.fallback event, then mines the partial provider output (the
-// accumulated reasoning/prose is frequently parseable for file paths) and the
-// investigation ledger for a heuristic plan — so a hung provider never blocks
-// the TUI for the full retry budget. Returns a clear timeout error only when no
-// source file can be derived.
-func (e *Engine) heuristicTimeoutFallback(resp *ai.Response, problem, ledgerContent string, cause error) ([]Task, error) {
-	content := ""
-	if resp != nil {
-		content = resp.Content
-	}
-	e.emit(events.NewPlanFallback("timeout", fmt.Sprintf(
-		"Plan synthesis exceeded the %.0fs per-attempt deadline — falling back to heuristic task extraction.", planAttemptTimeout.Seconds())))
-
-	// Priority 1: mine the partial provider output. A root-context catch-all
-	// from the prose miner is a generic fallback, so real ledger-derived file
-	// targets are preferred over it.
-	contentTasks := extractTasksFromProse(content)
-	if len(contentTasks) > 0 && contentTasks[0].Target != rootContextFallbackTarget {
-		if tasks := e.filteredHeuristic(contentTasks, problem, ledgerContent); len(tasks) > 0 {
-			return tasks, nil
-		}
-	}
-
-	// Priority 2: mine the investigation ledger for evidence-grounded files.
-	if ledger := strings.TrimSpace(problem + "\n" + ledgerContent); ledger != "" {
-		if tasks := e.filteredHeuristic(extractTasksFromLedger(ledger), problem, ledgerContent); len(tasks) > 0 {
-			return tasks, nil
-		}
-	}
-
-	// Priority 3: the generic root-context catch-all so execution survives.
-	if len(contentTasks) > 0 {
-		if tasks := e.filteredHeuristic(contentTasks, problem, ledgerContent); len(tasks) > 0 {
-			return tasks, nil
-		}
-	}
-
-	return nil, fmt.Errorf("plan engine: provider timed out after %s and no heuristic plan could be derived from the partial output or ledger: %w", planAttemptTimeout, cause)
-}
-
-// filteredHeuristic applies the standard post-extraction pipeline shared by the
-// heuristic fallbacks: the evidence-based disk-existence barrier, the
-// VANILLA_WEB archetype guard, the root-context catch-all (when real targets
-// were all rejected), and the compile-error SHELL_EXEC enforcement. Returns nil
-// when nothing survives.
-func (e *Engine) filteredHeuristic(tasks []Task, problem, ledgerContent string) []Task {
-	if len(tasks) == 0 {
-		return nil
-	}
-	preFilter := len(tasks)
-	tasks = FilterNonExistentMutationTargets(tasks, e.rootPath)
-	if e.vanillaWeb {
-		tasks = filterGoCommands(tasks)
-		tasks = SanitizeTasksForArchetype(tasks, recon.VANILLA_WEB)
-	}
-	if len(tasks) == 0 && preFilter > 0 {
-		tasks = []Task{rootContextFallbackTask()}
-	}
-	if len(tasks) == 0 {
-		return nil
-	}
-	return ForceShellExecOnCompileError(tasks, problem, ledgerContent)
 }
 
 // tolerantMarkdownTasks parses a non-JSON model response as markdown task
