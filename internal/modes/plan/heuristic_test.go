@@ -225,3 +225,100 @@ func TestProcessFromLedger_StreamedProseFallback(t *testing.T) {
 		t.Fatalf("got %d tasks, want 3: %+v", len(tasks), tasks)
 	}
 }
+
+// TestProcessFromLedger_ProseFilesAllFilteredFallsBackToRoot is the regression
+// guard for the "all 3 JSON synthesis attempts failed" hard error in the
+// presence of a grounded root path: when the model's prose names only files
+// that do NOT exist on disk, every prose-derived task is rejected by the
+// evidence-based disk-existence barrier. The engine must fall back to the
+// hardcoded root-context task instead of erroring.
+func TestProcessFromLedger_ProseFilesAllFilteredFallsBackToRoot(t *testing.T) {
+	root := t.TempDir() // empty — no styles.css / script.js on disk
+	e := NewEngine(NewPlanStore())
+	e.SetRootPath(root)
+	e.SetProvider(func(ctx context.Context, req ai.Request) (*ai.Response, error) {
+		return &ai.Response{Content: cohereNorthMiniProse}, nil
+	})
+
+	tasks, err := e.ProcessFromLedger(context.Background(), "", "fix the duplicated hero section", "test-model")
+	if err != nil {
+		t.Fatalf("ProcessFromLedger must not error when prose targets are all filtered: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("got %d tasks, want 1 root-context fallback: %+v", len(tasks), tasks)
+	}
+	if tasks[0].Target != rootContextFallbackTarget {
+		t.Errorf("target = %q, want root-context fallback target", tasks[0].Target)
+	}
+	if !tasks[0].IsHardcoded {
+		t.Error("root-context fallback must be hardcoded so it survives filters")
+	}
+}
+
+// TestRetryReinforcementForInvalidJSON verifies the schema-aware retry
+// augmentation: a structural JSON failure re-emits the raw-JSON schema contract
+// (NOT the shell-exec reinforcement that historically did nothing for a model
+// emitting prose).
+func TestRetryReinforcementForInvalidJSON(t *testing.T) {
+	got := retryReinforcement(failureInvalidJSON, 1, 2)
+	if !strings.Contains(got, "was NOT valid raw JSON") {
+		t.Errorf("JSON reinforcement missing rejection reason: %q", got)
+	}
+	if !strings.Contains(got, "atomic_tasks") {
+		t.Errorf("JSON reinforcement must re-emit the schema (atomic_tasks): %q", got)
+	}
+	if strings.Contains(got, "SHELL_EXEC target") {
+		t.Errorf("JSON reinforcement must not use the shell-exec text: %q", got)
+	}
+}
+
+// TestRetryReinforcementForFilteredCandidates verifies the grounded-target
+// augmentation is used when valid JSON was fully rejected by the filters.
+func TestRetryReinforcementForFilteredCandidates(t *testing.T) {
+	got := retryReinforcement(failureFilteredCandidates, 2, 2)
+	if !strings.Contains(got, "do not exist") {
+		t.Errorf("filtered-candidates reinforcement missing grounding instruction: %q", got)
+	}
+}
+
+// TestProcessFromLedger_SchemaReinforcementOnRetry is the end-to-end regression
+// guard for the JSON contract re-enforcement: a model that emits invalid JSON on
+// its first attempt receives the strict schema reinforcement on the retry, and a
+// compliant second attempt succeeds — proving the "all 3 JSON synthesis attempts
+// failed" error is only reachable when no attempt is recoverable.
+func TestProcessFromLedger_SchemaReinforcementOnRetry(t *testing.T) {
+	var mu sync.Mutex
+	var callCount int
+	var retryPrompt string
+
+	e := NewEngine(NewPlanStore())
+	e.SetProvider(func(ctx context.Context, req ai.Request) (*ai.Response, error) {
+		mu.Lock()
+		callCount++
+		if callCount == 2 {
+			retryPrompt = req.Messages[len(req.Messages)-1].Content
+		}
+		mu.Unlock()
+		if callCount == 1 {
+			return &ai.Response{Content: "I should fix the duplicate hero section in index.html and add focus states."}, nil
+		}
+		return &ai.Response{Content: `{"context_anchor":{"source":"user","target_packages":[]},"architectural_strategy":"remove duplicate node","atomic_tasks":[{"task_id":1,"file":"index.html","strategy":"FILE_MUTATE","description":"remove duplicate hero","rationale":"confirmed duplicate","solution":"single hero"}]}`}, nil
+	})
+
+	tasks, err := e.ProcessFromLedger(context.Background(), "", "fix the duplicated hero section", "test-model")
+	if err != nil {
+		t.Fatalf("ProcessFromLedger must succeed after schema-reinforced retry: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("got %d tasks, want 1: %+v", len(tasks), tasks)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if callCount < 2 {
+		t.Fatalf("provider called %d times, want >= 2 (initial + retry)", callCount)
+	}
+	if !strings.Contains(retryPrompt, "was NOT valid raw JSON") {
+		t.Errorf("retry prompt missing the JSON schema reinforcement: %q", retryPrompt)
+	}
+}

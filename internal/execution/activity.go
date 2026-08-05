@@ -34,8 +34,12 @@ type FileMutateEvent struct {
 }
 
 // CommandExecEvent carries real metrics for a command execution operation.
+// ExitCode < 0 marks a RUNNING command (the activity tree renders it with the
+// animated snowflake spinner); the terminal event carries the real exit code,
+// elapsed time, and the combined stdout/stderr output for Ctrl+O expansion.
 type CommandExecEvent struct {
 	Command  string
 	ExitCode int
 	Elapsed  time.Duration
+	Output   string
 }

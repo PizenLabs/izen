@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -19,10 +20,15 @@ type shimmerFrameMsg = shimmer.FrameMsg
 // nil when the shimmer is inactive, so the tick loop self-terminates the
 // moment streaming output begins or a background producer completes (smooth
 // clearing with no leaked goroutine).
+//
+// This also advances the spinner frame so the animated snowflake character
+// (✻ ❅ ❆ ✦) cycles on the shimmer tick cadence, keeping the snowflake
+// animation in sync with the shimmer sweep.
 func (m *model) shimmerTickCmd() tea.Cmd {
 	if !m.shimmerActive {
 		return nil
 	}
+	m.spinnerFrame++
 	return shimmer.Tick()
 }
 
@@ -126,18 +132,29 @@ func agentShimmerText(label string) string {
 	}
 }
 
-// renderLoadingDock renders the shimmer loading line plus the contextual tip
-// directly below it, with a tree-branch prefix. It is drawn above the input
-// separator while any background producer is running and no streaming output
-// has replaced it yet. Returns "" when the shimmer is inactive.
+// renderLoadingDock renders the unified dynamic shimmer + thinking + tip bar.
+// The snowflake icon cycles through the 4-frame animated sequence (✻ ❅ ❆ ✦)
+// while the cosine shimmer sweep animates across the full status text. The
+// contextual tip line sits directly underneath with a tree-branch prefix.
+// Returns "" when the shimmer is inactive.
+//
+// The dock is the SINGLE active status indicator from prompt submit (t=0ms)
+// through thinking/processing. It clears smoothly ONLY when the first
+// primary output token arrives (tokenMsg handler calls stopShimmer).
 func (m *model) renderLoadingDock() string {
 	if !m.shimmerActive {
 		return ""
 	}
 
+	// Compose the animated snowflake text: use the current flowing spinner
+	// frame so the snowflake character cycles (✻ ❅ ❆ ✦) on the shimmer
+	// tick cadence. The shimmer.Render sweep animates across this text.
+	flake := flowingSpinnerFrames[m.spinnerFrame%len(flowingSpinnerFrames)]
+	dockText := m.composeDockTextWithFlake(flake)
+
 	var b strings.Builder
-	b.WriteString("  " + SpinnerStyle.Render(ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]))
-	b.WriteString(" " + m.shimmerAnim.View() + "\n")
+	b.WriteString("  " + shimmer.Render(dockText, m.shimmerAnim.Frame, m.shimmerAnim.Width))
+	b.WriteString("\n")
 	if m.loadingTip != "" {
 		b.WriteString("  ")
 		b.WriteString(subtleStyle.Render("└"))
@@ -148,4 +165,24 @@ func (m *model) renderLoadingDock() string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// composeDockTextWithFlake builds the dynamic status text using the given
+// snowflake character. When the thinking buffer is actively receiving
+// reasoning tokens, the text shows live thinking progress with elapsed time.
+// Otherwise it falls back to the shimmer text set by startShimmer.
+func (m *model) composeDockTextWithFlake(flake string) string {
+	if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 && !m.thinkingBuffer.Complete() {
+		elapsed := m.thinkingBuffer.Elapsed()
+		return fmt.Sprintf("%s Thinking... (%s)", flake, formatElapsed(elapsed))
+	}
+	if m.shimmerText != "" {
+		return flake + " " + m.shimmerText
+	}
+	return flake + " Working..."
+}
+
+// composeDockText builds the dynamic status text using the default snowflake.
+func (m *model) composeDockText() string {
+	return m.composeDockTextWithFlake("✦")
 }

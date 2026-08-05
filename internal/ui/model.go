@@ -253,6 +253,27 @@ type shellOutputMsg struct {
 
 var _ tea.Msg = shellOutputMsg{}
 
+// shellChunkMsg carries one live stdout/stderr chunk from the streaming shell
+// pipeline. The UI appends it to the ActivityTree's running exec entry so the
+// output grows in the viewport in real-time.
+type shellChunkMsg struct {
+	text string
+}
+
+var _ tea.Msg = shellChunkMsg{}
+
+// shellExitMsg is the terminal event of the streaming shell pipeline. It
+// carries the process exit code and elapsed time so the running exec entry
+// flips to a completed "(exit N · Xs)" line and the shimmer dock clears.
+type shellExitMsg struct {
+	cmd      string
+	exitCode int
+	elapsed  time.Duration
+	err      error
+}
+
+var _ tea.Msg = shellExitMsg{}
+
 type graphBuiltMsg struct {
 	graph *lea.FileGraph
 	err   error
@@ -571,7 +592,7 @@ var utilityCommands = map[modes.Mode][]string{
 
 var globalCommands = []string{"/help", "/?", "/usage", "/model", "/objective", "/drop", "/quit", "/arch"}
 
-var flowingSpinnerFrames = []string{" ✦ ", " ✧ ", " ⚙ ", " ❋ ", " ❄ ", " ✱ ", " ❋ ", " ⚙ ", " ✧ ", " ✦ "}
+var flowingSpinnerFrames = []string{" ✻ ", " ❅ ", " ❆ ", " ✦ "}
 
 // providerSwitchMsg signals a successful provider switch.
 type providerSwitchMsg struct {
@@ -627,7 +648,6 @@ type model struct {
 	streamCh        chan tea.Msg
 	responseBuffer  strings.Builder
 	reasoningBuffer strings.Builder
-	showReasoning   bool
 	streaming       bool
 	// pendingReasoningFragment holds an opened-but-not-yet-closed
 	// \x00RSNG\x00 reasoning block carried over between extraction passes.
@@ -704,6 +724,15 @@ type model struct {
 	// Shell command proposed by agent, injected into the input bar.
 	// The command only executes when the user presses Enter.
 	proposedShellCmd string
+
+	// ── Live shell execution state (streaming pipeline) ───────────────
+	// shellCh carries shellChunkMsg / shellExitMsg from the background process
+	// to the Bubble Tea event loop; shellRunning gates the spinner/shimmer
+	// tick loops while a command is in flight; shellCancel lets Ctrl+C abort
+	// the running process.
+	shellCh      chan tea.Msg
+	shellRunning bool
+	shellCancel  context.CancelFunc
 
 	state UIState
 
@@ -1400,6 +1429,12 @@ func (m *model) handleEngineEvent(ev interface{}) {
 				Elapsed:  e.Elapsed,
 			},
 		})
+	case execution.CommandExecEvent:
+		// Shell commands arrive as a running event (exitCode < 0) followed by
+		// a terminal event (real exit code + output). AppendOrUpdateExec keeps
+		// them as ONE tree line: the running entry flips to done with the exit
+		// status and the accumulated output for Ctrl+O expansion.
+		m.activityTree.AppendOrUpdateExec(e.Command, e.ExitCode, e.Elapsed, e.Output)
 	}
 }
 
@@ -1896,6 +1931,12 @@ func (m *model) resetStreamingState() {
 	m.agentRunning = false
 	m.agentLabel = ""
 	m.planPending = false
+	m.shellRunning = false
+	m.shellCh = nil
+	if m.shellCancel != nil {
+		m.shellCancel()
+		m.shellCancel = nil
+	}
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 	m.reasoningBuffer.Reset()
@@ -1929,6 +1970,12 @@ func (m *model) reconcileSpinner() {
 	m.reviewRunning = false
 	m.pipelineRunning = false
 	m.planPending = false
+	m.shellRunning = false
+	m.shellCh = nil
+	if m.shellCancel != nil {
+		m.shellCancel()
+		m.shellCancel = nil
+	}
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 	m.reasoningBuffer.Reset()
@@ -2227,6 +2274,24 @@ func (m *model) refreshViewportContent() {
 		}
 	}
 
+	// ── Inline Loading Dock (scrolls with content) ─────────────────
+	// The shimmer loading indicator is rendered INSIDE the viewport body,
+	// placed immediately below the latest streamed output or submitted
+	// prompt. It scrolls dynamically with the text content during
+	// streaming, rather than remaining fixed at the bottom above the
+	// prompt bar. Clears smoothly when the first primary output token
+	// arrives (tokenMsg handler calls stopShimmer).
+	//
+	// BUG FIX: the original condition was `shimmerActive && !m.streaming`,
+	// but m.streaming is set true immediately in streamCmd(), so the dock
+	// never rendered. Now we render whenever shimmerActive is true — the
+	// shimmer lifecycle (startShimmer/stopShimmer) handles visibility.
+	if m.shimmerActive {
+		if dock := m.renderLoadingDock(); dock != "" {
+			content.WriteString(dock)
+		}
+	}
+
 	if m.streaming {
 		if m.currentStreamContent != "" {
 			// SANITIZE BEFORE VIEWPORT: raw streamed text may still carry
@@ -2239,39 +2304,37 @@ func (m *model) refreshViewportContent() {
 				content.WriteString(rendered)
 				content.WriteString("\n")
 			}
-		} else if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
-			// LIVE REASONING WITHOUT CONTENT: agent-style runs (e.g. /build
-			// fast-track) stream reasoning + tool-call arguments but never fill
-			// currentStreamContent, so renderStreamingContent is never reached
-			// and the thinking box would stay invisible. Render it here,
-			// dimmed, so reasoning stays on screen during agent execution too.
-			thoughts := m.renderLiveThinking(m.width)
-			if thoughts != "" {
-				content.WriteString(thoughts)
+		}
+
+		// ── Inline thinking block (faint, collapsible) ───────────────
+		// Live reasoning tokens are rendered inside the viewport body so
+		// the user sees thinking in real-time. Ctrl+O / Alt+O toggles
+		// expansion during active streaming without waiting for completion.
+		//
+		// SINGLE-SOURCE-OF-TRUTH DEDUP: while the bottom loading dock is
+		// active (shimmerActive), the dock itself already carries the live
+		// thinking status ("✻ Thinking... (Xs)"). Rendering the collapsed
+		// one-liner here as well would ghost two "Thinking…" lines, so the
+		// inline block is suppressed while the dock is live — it only appears
+		// once the dock has handed off to the first content token, or when
+		// the user expands it via Ctrl+O mid-stream (inspection overrides).
+		dockActive := m.shimmerActive
+		if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
+			if m.thinkingBuffer.Expanded() || !dockActive {
+				thoughts := m.renderLiveThinking(m.width)
+				if thoughts != "" {
+					content.WriteString(thoughts)
+					content.WriteString("\n")
+				}
+			}
+		} else if !dockActive {
+			// Fallback: legacy ThinkingPanel for agent-style runs
+			reasoningBlock := m.renderReasoningBlock(m.width)
+			if reasoningBlock != "" {
+				content.WriteString(reasoningBlock)
 				content.WriteString("\n")
 			}
 		}
-
-		// ── Collapsible reasoning block ──────────────────────────────
-		// The legacy ThinkingPanel block is skipped while the unified
-		// ThinkingBuffer is already rendering live thinking above the content
-		// (renderLiveThinking in renderStreamingContent) — showing both would
-		// duplicate the same reasoning in two places.
-		reasoningBlock := ""
-		if m.thinkingBuffer == nil || m.thinkingBuffer.Len() == 0 {
-			reasoningBlock = m.renderReasoningBlock(m.width)
-		}
-		if reasoningBlock != "" {
-			content.WriteString(reasoningBlock)
-			content.WriteString("\n")
-		}
-
-		sp := m.renderFlowingSpinner()
-		status := "streaming…"
-		if m.agentRunning {
-			status = m.agentLabel
-		}
-		content.WriteString(sp + " " + infoStyle.Render(status) + "\n")
 	}
 
 	// ── Persisted collapsible thought block ────────────────────────────
@@ -2294,8 +2357,10 @@ func (m *model) refreshViewportContent() {
 	// stage is still in flight, so the execution tree reads as a live
 	// pipeline rather than a static log dump.
 	if m.activityTree != nil {
-		treeActive := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.state == StateProcessing
-		treeView := m.activityTree.RenderActive(m.width, treeActive, m.dotFrame)
+		treeActive := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.shellRunning || m.state == StateProcessing
+		// Pass the live spinner frame so the running exec snowflake cycles the
+		// full 4-frame sequence (✻ ❅ ❆ ✦), not just the 3 dot-frames.
+		treeView := m.activityTree.RenderActive(m.width, treeActive, m.spinnerFrame)
 		if treeView != "" {
 			content.WriteString(treeView)
 			content.WriteString("\n")
@@ -2636,9 +2701,10 @@ func (m *model) recalcViewportHeight() {
 	m.Viewport.Height = m.computeVpHeight()
 }
 
-// renderFlowingSpinner renders a single animated character with a smooth flowing
-// light effect: the color oscillates between dim and bright using a sine wave,
-// creating the feeling of seamless movement.
+// renderFlowingSpinner renders a snowflake character (✻ / ❆) with a subtle
+// icy color pulse: the color oscillates between dim and bright cyan using a
+// sine wave, creating a cold shimmer effect that distinguishes the inline
+// status line from the rectangular block spinner in the bottom loading dock.
 func (m *model) renderFlowingSpinner() string {
 	n := len(flowingSpinnerFrames)
 	idx := m.spinnerFrame % n
@@ -2649,15 +2715,16 @@ func (m *model) renderFlowingSpinner() string {
 	t = t * t * (3 - 2*t)
 
 	from := lipgloss.Color(colorSubtle)
-	to := lipgloss.Color(colorText)
+	to := lipgloss.Color(colorSapphire)
 	color := interpolateColor(from, to, t)
 
 	return spinnerBaseStyle.Foreground(color).Render(frameStr)
 }
 
 // renderRectSpinner renders a clean braille/rectangular spinner frame.
-// Used exclusively in the status bar to maintain layout symmetry — star
-// glyphs are reserved for the chat prompt label.
+// Used exclusively in the BOTTOM LOADING DOCK (above the prompt input bar)
+// and the status bar to maintain layout symmetry — snowflake glyphs (✻/❆)
+// are reserved for the inline status line in the viewport body.
 func (m *model) renderRectSpinner() string {
 	n := len(ProposalSpinnerFrames)
 	idx := m.spinnerFrame % n

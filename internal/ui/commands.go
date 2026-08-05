@@ -423,7 +423,14 @@ func (m *model) handleInput(line string) tea.Cmd {
 	// or — at low confidence (ConfirmationRequirement) — surfaced as an
 	// interactive mode-selection prompt instead of acting on a blind guess.
 	// The route runs async because the semantic fallback may invoke the LLM.
-	if m.intentRouter != nil {
+	//
+	// ── /ask MODE LOCK: Direct Read-Only Chat boundary ───────────────
+	// /ask is a strict read-only chat boundary. The ONLY valid sub-prompt
+	// is $prompt (handled above). Free-form input in /ask MUST NEVER route
+	// through the intent classifier — the classifier can misclassify natural
+	// questions as /plan, /investigate, or /build and auto-switch modes,
+	// violating the Direct Chat contract. Bypass the router entirely.
+	if m.intentRouter != nil && m.resolver.Current() != modes.ModeAsk {
 		return m.routeFreeInput(line)
 	}
 

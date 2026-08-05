@@ -150,6 +150,7 @@ var (
 	accentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent))
 	redStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRed))
 	blueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
+	cyanStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan))
 
 	// Bold + color
 	boldTextStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText))
@@ -252,6 +253,12 @@ var (
 	// exhausted badge when retries run out.
 	badgeRetryStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorYellow)).Background(lipgloss.Color(colorSurface))
 	badgeExhaustedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed)).Background(lipgloss.Color(colorSurface))
+
+	// ── Tool Policy Rejection Badge ──────────────────────────────
+	// Muted warm badge for forbidden tool-call notices (e.g. /ask rejecting a
+	// shell command). Rendered inline as a status badge so the rejection reads
+	// as a clean policy notice rather than raw unformatted error text.
+	toolRejectBadgeStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMaroon)).Background(lipgloss.Color(colorSurface))
 
 	// ── Thought Log Box Style ───────────────────────────────────
 	// Bordered container for expanded LLM reasoning content.

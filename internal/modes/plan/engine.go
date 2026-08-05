@@ -21,6 +21,27 @@ import (
 	"github.com/PizenLabs/izen/pkg/recon"
 )
 
+// synthesisFailureMode classifies why the most recent plan-synthesis attempt was
+// rejected, so the next retry's prompt augmentation targets the actual defect
+// instead of always re-instructing SHELL_EXEC validation (which does nothing
+// for a model that produces non-JSON prose on every attempt).
+type synthesisFailureMode int
+
+const (
+	// failureNone is the initial state before any attempt is evaluated.
+	failureNone synthesisFailureMode = iota
+	// failureInvalidJSON: the model's output could not be parsed as a valid plan
+	// JSON object/array even after structural repair (fences, comments,
+	// auto-close). The retry re-emits the strict raw-JSON schema contract.
+	failureInvalidJSON
+	// failureInvalidShellExec: the JSON parsed but contained SHELL_EXEC tasks
+	// whose targets are not runnable commands.
+	failureInvalidShellExec
+	// failureFilteredCandidates: the JSON parsed but every candidate task was
+	// rejected by the evidence-based filters (non-existent targets, scope).
+	failureFilteredCandidates
+)
+
 // ProviderFunc defines a structured function signature matching the ai.Request format.
 type ProviderFunc func(ctx context.Context, req ai.Request) (*ai.Response, error)
 
@@ -789,14 +810,20 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	// but the prose the model DID emit on an earlier attempt is still the best
 	// signal the heuristic fallback can mine for file paths.
 	lastRawContent := ""
+	// lastFailureMode classifies why the previous attempt was rejected so the
+	// next retry's prompt augmentation targets the ACTUAL defect. The historical
+	// retry always re-instructed SHELL_EXEC validation, which did nothing for a
+	// model that emitted non-JSON prose on every attempt — the JSON schema
+	// contract is re-emitted for structural failures instead.
+	lastFailureMode := failureNone
 	for attempt := 0; attempt <= maxSilentRetries; attempt++ {
 		// On retry (attempt > 0), re-invoke the provider with an augmented
-		// prompt that includes the strict enforcement instruction from the
-		// previous rejection.
+		// prompt that includes the strict enforcement instruction for the
+		// specific rejection mode of the previous attempt.
 		if attempt > 0 {
 			e.emit(events.NewStageCompleted("plan.synthesize.retry", 0,
 				fmt.Sprintf("JSON syntax or command schema broken — refining prompt and retrying internally (Attempt %d/%d)", attempt, maxSilentRetries)))
-			req.Messages[len(req.Messages)-1].Content += shellExecReinforcement(attempt, maxSilentRetries)
+			req.Messages[len(req.Messages)-1].Content += retryReinforcement(lastFailureMode, attempt, maxSilentRetries)
 			var retryErr error
 			resp, retryErr = e.complete(ctx, req)
 			if retryErr != nil || resp == nil || resp.Content == "" {
@@ -858,6 +885,7 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 				}
 
 				// Semantic failure: invalid SHELL_EXEC commands detected.
+				lastFailureMode = failureInvalidShellExec
 				if attempt < maxSilentRetries {
 					continue
 				}
@@ -868,6 +896,10 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 					ledgerContent,
 				), nil
 			}
+			// Valid JSON but every candidate was rejected by the filters
+			// (non-existent targets, scope violations) — the retry must ground
+			// its targets in real on-disk files.
+			lastFailureMode = failureFilteredCandidates
 		}
 
 		// Tolerant markdown fallback: Mini models sometimes emit task blocks
@@ -878,7 +910,13 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 			return md, nil
 		}
 
-		// Structural parse failure or all candidates filtered out.
+		// Structural parse failure: the model output was not parseable JSON.
+		// Only overwrite the mode when the JSON path did not already classify
+		// the failure (filtered candidates) — structural noise takes precedence
+		// when the payload itself never parsed.
+		if lastFailureMode != failureFilteredCandidates {
+			lastFailureMode = failureInvalidJSON
+		}
 		if attempt < maxSilentRetries {
 			continue
 		}
@@ -894,10 +932,19 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	// heuristic plan was generated.
 	if strings.TrimSpace(lastRawContent) != "" {
 		if heuristic := extractTasksFromProse(lastRawContent); len(heuristic) > 0 {
+			preFilter := len(heuristic)
 			heuristic = FilterNonExistentMutationTargets(heuristic, e.rootPath)
 			if e.vanillaWeb {
 				heuristic = filterGoCommands(heuristic)
 				heuristic = SanitizeTasksForArchetype(heuristic, recon.VANILLA_WEB)
+			}
+			// When every prose-derived file target was rejected by the
+			// evidence-based disk-existence barrier (the model reasoned about
+			// files that do not exist on disk), fall back to the hardcoded
+			// root-context task so execution survives instead of dying with
+			// "all 3 JSON synthesis attempts failed".
+			if len(heuristic) == 0 && preFilter > 0 {
+				heuristic = []Task{rootContextFallbackTask()}
 			}
 			if len(heuristic) > 0 {
 				e.emit(events.NewPlanFallback("prose", fmt.Sprintf(
@@ -1490,6 +1537,29 @@ func hasInvalidShellExecCommand(tasks []Task) bool {
 func shellExecReinforcement(attempt, maxRetries int) string {
 	return fmt.Sprintf("\n\n[SYSTEM: CRITICAL FAILURE PREVENTED] (Retry %d/%d) The SHELL_EXEC target you just generated was rejected because it is not a valid runnable command. You MUST output a real executable command — e.g. 'go get <package>', 'go mod tidy', 'git clone <url>' — NOT a file path. FORBIDDEN targets include: 'go.mod', 'go.sum', './relative/path', 'relative/path/to/go.mod', or any bare file name. The target must start with a known binary name like go, git, make, npm, docker, etc.",
 		attempt, maxRetries)
+}
+
+// retryReinforcement returns the strict-instruction block appended to the user
+// prompt on a plan-synthesis retry, tailored to the failure mode of the previous
+// attempt. Structural JSON failures re-emit the full schema contract (the model
+// is told exactly which shape to produce); filtered-candidate failures ground
+// the retry in real on-disk targets; shell-exec failures keep the command
+// validation reinforcement. This guarantees the "all 3 JSON synthesis attempts
+// failed" error can only surface when the model genuinely produced no usable
+// signal — never because the retry prompt failed to explain the defect.
+func retryReinforcement(mode synthesisFailureMode, attempt, maxRetries int) string {
+	switch mode {
+	case failureInvalidJSON:
+		return fmt.Sprintf("\n\n[SYSTEM: CRITICAL FAILURE PREVENTED] (Retry %d/%d) Your previous output was REJECTED because it was NOT valid raw JSON. You MUST output ONLY a single raw JSON object with this EXACT schema — no markdown fences, no code block, no prose, no <think>/<thought> blocks, no explanations:\n\n%s",
+			attempt, maxRetries, SchemaJSONInstruction())
+	case failureFilteredCandidates:
+		return fmt.Sprintf("\n\n[SYSTEM: CRITICAL FAILURE PREVENTED] (Retry %d/%d) Every task in your previous plan was REJECTED because it referenced files that do not exist or are out of scope. Emit tasks ONLY against real files that actually exist in the workspace. Never invent or speculate about files — if you cannot name a real file, emit a single deterministic SHELL_EXEC task instead.",
+			attempt, maxRetries)
+	case failureInvalidShellExec:
+		return shellExecReinforcement(attempt, maxRetries)
+	default:
+		return shellExecReinforcement(attempt, maxRetries)
+	}
 }
 
 // isPlaceholderToken reports whether s is a raw template placeholder

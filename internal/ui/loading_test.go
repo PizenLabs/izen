@@ -71,6 +71,9 @@ func TestRenderLoadingDock(t *testing.T) {
 	if !strings.Contains(plain, "Thinking") {
 		t.Fatalf("dock missing shimmer text: %q", dock)
 	}
+	if !strings.Contains(plain, "✻") {
+		t.Fatalf("dock missing snowflake icon: %q", dock)
+	}
 	if !strings.Contains(dock, "Tip:") {
 		t.Fatalf("dock missing tip prefix: %q", dock)
 	}
@@ -249,5 +252,122 @@ func TestAgentShimmerText(t *testing.T) {
 		if got := agentShimmerText(in); got != want {
 			t.Errorf("agentShimmerText(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestComposeDockTextStatic(t *testing.T) {
+	m := newTestModel()
+	m.startShimmer("Executing strategy...", "execute")
+	got := m.composeDockText()
+	if !strings.Contains(got, "✦") {
+		t.Errorf("composeDockText missing snowflake: %q", got)
+	}
+	if !strings.Contains(got, "Executing strategy...") {
+		t.Errorf("composeDockText missing shimmer text: %q", got)
+	}
+}
+
+func TestComposeDockTextThinking(t *testing.T) {
+	m := newTestModel()
+	m.startShimmer("Thinking...", "analyze")
+	m.thinkingBuffer = NewThinkingBuffer()
+	m.thinkingBuffer.Append("analyzing code structure")
+
+	got := m.composeDockText()
+	if !strings.Contains(got, "✦") {
+		t.Errorf("composeDockText missing snowflake: %q", got)
+	}
+	if !strings.Contains(got, "Thinking...") {
+		t.Errorf("composeDockText missing thinking text: %q", got)
+	}
+	// Elapsed time should be present
+	if !strings.Contains(got, "s)") {
+		t.Errorf("composeDockText missing elapsed time: %q", got)
+	}
+}
+
+func TestComposeDockTextThinkingComplete(t *testing.T) {
+	m := newTestModel()
+	m.startShimmer("Thinking...", "analyze")
+	m.thinkingBuffer = NewThinkingBuffer()
+	m.thinkingBuffer.Append("done reasoning")
+	m.thinkingBuffer.MarkComplete()
+
+	got := m.composeDockText()
+	// When thinking is complete, should fall back to static shimmer text
+	if !strings.Contains(got, "✦ Thinking...") {
+		t.Errorf("composeDockText should use static text after thinking complete: %q", got)
+	}
+}
+
+func TestComposeDockTextFallback(t *testing.T) {
+	m := newTestModel()
+	got := m.composeDockText()
+	if got != "✦ Working..." {
+		t.Errorf("composeDockText fallback = %q, want '✦ Working...'", got)
+	}
+}
+
+// TestLoadingDockSingleSourceNoDuplicateThinking guards the single-source-of-
+// truth lifecycle: while the bottom loading dock is active the viewport body
+// must show EXACTLY ONE thinking indicator (the dock's "✻ Thinking... (Xs)"
+// line) — the collapsed inline one-liner is suppressed so the user never sees
+// two stacked "Thinking…" lines. On the first content token the dock hands off
+// cleanly and the inline indicator becomes the sole thinking line.
+func TestLoadingDockSingleSourceNoDuplicateThinking(t *testing.T) {
+	m := newTestModel()
+	m.state = StateChat
+	m.streaming = true
+	m.awaitingConfirmation = false
+	m.pendingProposals = nil
+	m.thinkingBuffer = NewThinkingBuffer()
+	m.thinkingBuffer.Append("analyzing code structure")
+	m.startShimmer("Synthesizing plan...", "plan")
+
+	m.refreshViewportContent()
+	dockView := m.Viewport.View()
+
+	if !strings.Contains(dockView, "Tip:") {
+		t.Fatalf("dock-active view missing the tip line: %q", dockView)
+	}
+	if n := strings.Count(stripANSITest(dockView), "Thinking"); n != 1 {
+		t.Fatalf("dock-active view shows %d thinking lines, want exactly 1 (dock only, no ghost inline duplicate): %q", n, dockView)
+	}
+
+	// First primary content token → dock hands off; inline thinking is the
+	// sole live indicator now.
+	m.stopShimmer()
+	m.refreshViewportContent()
+	streamView := m.Viewport.View()
+
+	if strings.Contains(streamView, "Tip:") {
+		t.Fatalf("dock must disappear cleanly on first token: %q", streamView)
+	}
+	if n := strings.Count(stripANSITest(streamView), "Thinking"); n != 1 {
+		t.Fatalf("handoff view shows %d thinking lines, want exactly 1 (inline only): %q", n, streamView)
+	}
+}
+
+// TestLoadingDockExpandedInlineWhileActive guards the Ctrl+O inspection
+// override: even while the loading dock is live, expanding the ThinkingBuffer
+// must render the full faint reasoning box in the viewport body immediately.
+func TestLoadingDockExpandedInlineWhileActive(t *testing.T) {
+	m := newTestModel()
+	m.state = StateChat
+	m.streaming = true
+	m.awaitingConfirmation = false
+	m.pendingProposals = nil
+	m.thinkingBuffer = NewThinkingBuffer()
+	m.thinkingBuffer.Append("secret reasoning content")
+	m.thinkingBuffer.SetExpanded(true)
+	m.startShimmer("Synthesizing plan...", "plan")
+
+	m.refreshViewportContent()
+	view := m.Viewport.View()
+	if !strings.Contains(view, "secret reasoning content") {
+		t.Fatalf("expanded inline reasoning missing while dock active: %q", view)
+	}
+	if !strings.Contains(view, "Tip:") {
+		t.Fatalf("dock should remain visible while expanded box is inspected: %q", view)
 	}
 }

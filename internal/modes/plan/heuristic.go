@@ -20,6 +20,25 @@ var proseFilePathRe = regexp.MustCompile(`(?i)\b(?:[a-z0-9_]+/)*[a-z0-9_][a-z0-9
 // the "apply the plan to the whole project" intent.
 const rootContextFallbackTarget = ""
 
+// rootContextFallbackTask builds the hardcoded task that targets the project
+// root rather than a specific detected file. It is intentionally empty so it
+// passes the scope guard (empty FILE_MUTATE targets are skipped) while still
+// carrying the "apply the plan to the whole project" intent. Marked hardcoded
+// so it survives every evidence-based filter (disk-existence, scope).
+func rootContextFallbackTask() Task {
+	return Task{
+		StepNum:     1,
+		IsDone:      false,
+		Status:      "idle",
+		Type:        "FILE_MUTATE",
+		Target:      rootContextFallbackTarget,
+		Description: "Apply the plan derived from model reasoning to the project root.",
+		Rationale:   "The model produced narrative prose without parseable JSON or task blocks and no specific file was mentioned.",
+		Solution:    "Project updated per the plan reconstructed from the model output.",
+		IsHardcoded: true,
+	}
+}
+
 // extractTasksFromProse is the last-resort plan synthesis fallback. When a
 // model emits narrative reasoning prose instead of structured JSON (a common
 // failure mode of free/mini cloud models such as Cohere North Mini), the JSON
@@ -60,17 +79,7 @@ func extractTasksFromProse(rawText string) []Task {
 	}
 
 	if len(files) == 0 {
-		return []Task{{
-			StepNum:     1,
-			IsDone:      false,
-			Status:      "idle",
-			Type:        "FILE_MUTATE",
-			Target:      rootContextFallbackTarget,
-			Description: "Apply the plan derived from model reasoning to the project root.",
-			Rationale:   "The model produced narrative prose without parseable JSON or task blocks and no specific file was mentioned.",
-			Solution:    "Project updated per the plan reconstructed from the model output.",
-			IsHardcoded: true,
-		}}
+		return []Task{rootContextFallbackTask()}
 	}
 
 	tasks := make([]Task, 0, len(files))

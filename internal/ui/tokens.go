@@ -124,10 +124,19 @@ var Icon = struct {
 	EnvDeps   string
 	CodeMod   string
 	Verify    string
+	// ── Tool activity stream icons (Claude Code / OpenCode style) ──
+	// Nerd-Font cod glyphs used to prefix live tool steps so the tree reads
+	// as a transparent execution log: grep/read/diff/exec each carry a
+	// dedicated glyph (Icon.Diff is repurposed from the unused "⇄" to the
+	// cod-diff glyph). The exec icon is the animated snowflake ✻ while a
+	// shell command is running (see execSpinnerFrames).
+	Grep string
+	Read string
+	Exec string
 }{
 	Command:   "❯",
 	File:      "▦",
-	Diff:      "⇄",
+	Diff:      "\U000F03EB", // nf-cod-diff — patch/diff tool step
 	Task:      "✓",
 	Warning:   "▲",
 	Review:    "◎",
@@ -158,6 +167,9 @@ var Icon = struct {
 	EnvDeps:   "\U000F03D7",
 	CodeMod:   "\U000F061E",
 	Verify:    "\U000F0668",
+	Grep:      "\U000F0349", // nf-cod-search — grep tool step
+	Read:      "\U000F0219", // nf-cod-file — read tool step
+	Exec:      "✻",          // snowflake — shell exec step (animated while running)
 }
 
 // rule returns a full-width horizontal separator rendered in the given style.

@@ -12,23 +12,50 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 )
 
+// toggleThoughtBlock expands/collapses the active reasoning block OR the live
+// shell-output block. Priority:
+//
+//  1. Shell execution (Ctrl+O during a running/completed command): expands or
+//     collapses the accumulated stdout/stderr of the exec entry in the
+//     activity tree — the "Bash Execution Spinner with Ctrl+O Expansion"
+//     contract. Takes precedence so a running shell is always inspectable.
+//  2. The event-driven ThinkingBuffer, then the legacy ThinkingPanel.
+//
+// The viewport is repainted synchronously so the inline box toggles
+// immediately on the keypress — even while reasoning tokens or shell output
+// are still streaming in (async inspection). Returns false when no thought or
+// shell block exists.
+func (m *model) toggleThoughtBlock() bool {
+	if m.activityTree != nil && m.activityTree.HasCommandExec() {
+		m.activityTree.ToggleExpanded()
+		m.refreshViewportContent()
+		if m.Ready && !m.userIsScrollingUp {
+			m.Viewport.GotoBottom()
+		}
+		return true
+	}
+	switch {
+	case m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0:
+		m.thinkingBuffer.Toggle()
+	case m.thinkingPanel != nil:
+		m.thinkingPanel.Toggle()
+	default:
+		return false
+	}
+	m.refreshViewportContent()
+	if m.Ready && !m.userIsScrollingUp {
+		m.Viewport.GotoBottom()
+	}
+	return true
+}
+
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// ── GLOBAL: Alt+O toggles reasoning block visibility ────────────
 	// The unified ThinkingBuffer (event-driven thought block) takes priority;
 	// the legacy ThinkingPanel is only toggled when no event-driven block is
 	// active (e.g. legacy build fast-track reasoning).
 	if msg.String() == "alt+o" {
-		if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
-			m.thinkingBuffer.Toggle()
-			m.showReasoning = m.thinkingBuffer.Expanded()
-		} else if m.thinkingPanel != nil {
-			m.thinkingPanel.Toggle()
-			m.showReasoning = m.thinkingPanel.Expanded()
-		}
-		m.refreshViewportContent()
-		if m.Ready && !m.userIsScrollingUp {
-			m.Viewport.GotoBottom()
-		}
+		m.toggleThoughtBlock()
 		return m, nil
 	}
 
@@ -37,13 +64,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// (ThinkingBuffer). When no thought block is active, falls back to cycling
 	// through the foldable build-log entries (legacy behavior).
 	if msg.Type == tea.KeyCtrlO {
-		if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
-			m.thinkingBuffer.Toggle()
-			m.showReasoning = m.thinkingBuffer.Expanded()
-			m.refreshViewportContent()
-			if m.Ready && !m.userIsScrollingUp {
-				m.Viewport.GotoBottom()
-			}
+		if m.toggleThoughtBlock() {
 			return m, nil
 		}
 		if m.logStore != nil {
@@ -594,7 +615,20 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.push(roleUser, "$ "+cmd)
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
-			return m, m.execShellCmd(cmd)
+			// Live shell execution: start the running exec entry in the
+			// activity tree, activate the loading dock, and dispatch the
+			// shimmer + smooth ticks so the snowflake spinner animates for the
+			// whole duration. Output streams into the tree and is expandable
+			// via Ctrl+O; shellExitMsg stops the dock on completion.
+			if m.activityTree != nil {
+				m.activityTree.AppendOrUpdateExec(cmd, -1, 0, "")
+			}
+			m.startShimmer("Executing command...", "execute")
+			return m, tea.Batch(
+				m.streamShellCmd(cmd),
+				m.smoothStreamTickCmd(),
+				m.shimmerTickCmd(),
+			)
 		}
 
 		if userInput != "" {
@@ -612,8 +646,28 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 			m.push(roleUser, userInput)
 
+			// ── T=0ms SHIMMER: instant visual feedback ─────────────────
+			// Activate the loading shimmer BEFORE any orchestrator dispatch
+			// or synchronous context planning (planContextForAsk, intent
+			// classification) so the user sees the shimmer + tip dock
+			// immediately on Enter — zero perceived lag. streamCmd() will
+			// refine the shimmer text once the stream is ready; non-streaming
+			// early-return paths call stopShimmer() to clean up.
+			shimmerAlreadyActive := m.shimmerActive
+			m.spinnerFrame = 0
+			m.startShimmer("Working...", "analyze")
+
 			m.streamStartTime = time.Now()
 			cmd := m.handleInput(userInput)
+			// ── CLEANUP: stop shimmer on non-streaming early returns ────
+			// If handleInput returned nil or a non-stream command (error,
+			// shell exec, pending confirm), the shimmer we started was never
+			// consumed by streamCmd — deactivate it so the dock clears.
+			// Guard: only stop if we freshly started it (not a leftover from
+			// a previous stream that hasn't been reconciled yet).
+			if cmd == nil && !shimmerAlreadyActive && m.shimmerActive {
+				m.stopShimmer()
+			}
 			// ── APPLICATION-LAYER COMMAND RECORD ──────────────────────
 			// The same submission is routed through the Runtime facade as a
 			// SubmitPromptCmd so the canonical command/event contract observes

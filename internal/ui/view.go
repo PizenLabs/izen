@@ -152,8 +152,11 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 	statusBarLines := strings.Count(statusBarView, "\n") + 1
 
 	// ── Proposal dock (conditional) — floats above Input ──
+	// NOTE: shimmerActive no longer triggers the proposalDock — the loading
+	// indicator is rendered inside the viewport body (refreshViewportContent)
+	// so it scrolls with the text content.
 	var proposalDockView string
-	if m.shimmerActive || m.state == StateAwaitingApproval || m.state == StateProcessing {
+	if m.state == StateAwaitingApproval || m.state == StateProcessing {
 		proposalDockView = m.renderProposalBlock()
 	}
 	proposalLines := strings.Count(proposalDockView, "\n")
@@ -224,12 +227,9 @@ func (m *model) renderProposalBlock() string {
 
 	var b strings.Builder
 
-	// ── Shimmer loading line + contextual tip ───────────────────────
-	// Rendered above any approval/processing dock while a background producer
-	// is active and streaming output has not replaced it yet.
-	if m.shimmerActive {
-		b.WriteString(m.renderLoadingDock())
-	}
+	// NOTE: The shimmer loading dock has been moved into the viewport body
+	// (refreshViewportContent) so it scrolls with the text content instead
+	// of remaining fixed at the bottom above the prompt bar.
 
 	switch m.state {
 	case StateAwaitingApproval:
@@ -691,8 +691,9 @@ func (m *model) renderRuntimeStatus(width int) string {
 	var b strings.Builder
 
 	// ── Loading Spinner (rect/braille): background execution indicator ──
-	// Active during streaming, background tasks, or mutation processing.
-	if m.streaming || m.agentRunning || m.reviewRunning || m.state == StateProcessing {
+	// Active during streaming, background tasks, live shell execution, or
+	// mutation processing.
+	if m.streaming || m.agentRunning || m.reviewRunning || m.shellRunning || m.state == StateProcessing {
 		b.WriteString(m.renderRectSpinner())
 	} else {
 		b.WriteString(dimmedStyle.Render("●"))
@@ -700,7 +701,7 @@ func (m *model) renderRuntimeStatus(width int) string {
 	b.WriteByte(' ')
 
 	// AI INTERRUPT ENGINE: high-visibility indicator when streaming
-	if m.streaming {
+	if m.streaming || m.shellRunning {
 		b.WriteString(interruptLabelStyle.Render("⏹ Ctrl+C interrupt "))
 	}
 

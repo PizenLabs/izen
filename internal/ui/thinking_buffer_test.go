@@ -205,9 +205,6 @@ func TestCtrlOTogglesThoughtBlock(t *testing.T) {
 	if !m.thinkingBuffer.Expanded() {
 		t.Fatal("Ctrl+O did not expand the thought block")
 	}
-	if !m.showReasoning {
-		t.Error("showReasoning must mirror the expanded state")
-	}
 
 	// Second Ctrl+O: expanded → collapsed.
 	m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO})
@@ -224,6 +221,73 @@ func TestCtrlOTogglesThoughtBlock(t *testing.T) {
 	m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO})
 	if !m.logStore.Entries()[0].Expanded {
 		t.Error("Ctrl+O with no thought block must fall back to cycling log entries")
+	}
+}
+
+// TestCtrlOAsyncToggleDuringStreaming guards the async reasoning toggle: while
+// reasoning tokens are still streaming in (m.streaming == true), a Ctrl+O
+// keypress must expand the inline faint reasoning box in the Viewport body
+// IMMEDIATELY (no waiting for stream completion, no freeze). Collapsed state
+// must never leak the full reasoning text into the body; expanded state must
+// show it.
+func TestCtrlOAsyncToggleDuringStreaming(t *testing.T) {
+	m := newTestModel()
+	m.state = StateChat
+	m.streaming = true
+	m.awaitingConfirmation = false
+	m.pendingProposals = nil
+	m.thinkingBuffer = NewThinkingBuffer()
+	m.thinkingBuffer.Append("live reasoning tokens")
+	m.refreshViewportContent()
+
+	collapsed := m.Viewport.View()
+	if strings.Contains(collapsed, "live reasoning tokens") {
+		t.Fatalf("collapsed streaming body leaked full reasoning: %q", collapsed)
+	}
+	if !strings.Contains(collapsed, "Thinking") {
+		t.Fatalf("collapsed streaming body missing live thinking indicator: %q", collapsed)
+	}
+
+	// Async expand on keypress while still streaming.
+	m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO})
+	if !m.thinkingBuffer.Expanded() {
+		t.Fatal("Ctrl+O did not expand the thought block during active streaming")
+	}
+	expanded := m.Viewport.View()
+	if !strings.Contains(expanded, "live reasoning tokens") {
+		t.Fatalf("Ctrl+O during streaming did not show the inline reasoning box: %q", expanded)
+	}
+
+	// Async collapse on a second keypress while still streaming.
+	m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO})
+	if m.thinkingBuffer.Expanded() {
+		t.Fatal("Ctrl+O did not collapse the thought block during active streaming")
+	}
+	collapsedAgain := m.Viewport.View()
+	if strings.Contains(collapsedAgain, "live reasoning tokens") {
+		t.Fatalf("collapsed body leaked reasoning after second Ctrl+O: %q", collapsedAgain)
+	}
+}
+
+// TestAltOTogglesThinkingBuffer guards the Alt+O alias: it must behave exactly
+// like Ctrl+O (expand/collapse the event-driven ThinkingBuffer) rather than
+// flipping an unreferenced flag. Alt+O is intercepted at the Update layer
+// (global intercept) before handleKey, so the full Update path is exercised.
+func TestAltOTogglesThinkingBuffer(t *testing.T) {
+	m := newTestModel()
+	m.thinkingBuffer = NewThinkingBuffer()
+	m.thinkingBuffer.Append("reasoning tokens")
+
+	altO := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o"), Alt: true}
+
+	nm, _ := m.Update(altO)
+	if !nm.(*model).thinkingBuffer.Expanded() {
+		t.Fatal("Alt+O must expand the ThinkingBuffer like Ctrl+O")
+	}
+
+	nm2, _ := nm.Update(altO)
+	if nm2.(*model).thinkingBuffer.Expanded() {
+		t.Fatal("Alt+O must collapse the ThinkingBuffer like Ctrl+O")
 	}
 }
 
