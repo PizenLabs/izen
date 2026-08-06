@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -16,32 +17,33 @@ func TestActivityTreeStageBadges(t *testing.T) {
 	at.Append(NewSearchEvent("timeout", 3))
 	at.Append(NewResolveEvent("RetryLoop", 1))
 
-	// Inactive tree: every entry carries [done], none [running].
+	// Inactive tree: every entry carries a done badge, none a spinner.
 	out := at.Render(100)
 	stripped := ansi.Strip(out)
 	for _, want := range []string{
 		"read │", "diff │", "exec │", "grep │", "resolve │",
 		"󰈙", "󰏫", "✻", "󰍉",
 		"src/worker.go", "go test ./...", "timeout", "RetryLoop",
-		"(exit 0", "[done]",
+		"(exit 0", "✔ done",
 	} {
 		if !strings.Contains(stripped, want) {
 			t.Errorf("inactive render missing %q:\n%s", want, stripped)
 		}
 	}
-	if strings.Contains(stripped, "[running") {
-		t.Errorf("inactive render has [running]:\n%s", stripped)
+	if strings.Contains(stripped, "⠋") {
+		t.Errorf("inactive render has spinner frame:\n%s", stripped)
 	}
 
-	// Active tree: the last entry becomes [running] with animated dots.
+	// Active tree: the last entry becomes the running stage with a single
+	// braille spinner frame (fixed width, no dots).
 	outActive := at.RenderActive(100, true, 1)
 	strippedActive := ansi.Strip(outActive)
-	if !strings.Contains(strippedActive, "[running..]") {
-		t.Errorf("active render missing [running..]:\n%s", strippedActive)
+	if !strings.Contains(strippedActive, "⠙") {
+		t.Errorf("active render missing braille spinner frame:\n%s", strippedActive)
 	}
-	// The [done] badges of completed entries remain.
-	if !strings.Contains(strippedActive, "[done]") {
-		t.Errorf("active render lost [done] badges:\n%s", strippedActive)
+	// The done badges of completed entries remain.
+	if !strings.Contains(strippedActive, "✔ done") {
+		t.Errorf("active render lost done badges:\n%s", strippedActive)
 	}
 }
 
@@ -83,15 +85,22 @@ func TestActivityTreeRunningExecSnowflake(t *testing.T) {
 		}
 	}
 	frame0 := ansi.Strip(at.RenderActive(100, true, 0))
-	if !strings.Contains(frame0, "[running") {
-		t.Errorf("running exec missing [running] badge:\n%s", frame0)
+	if !strings.Contains(frame0, "⠋") {
+		t.Errorf("running exec missing braille spinner badge:\n%s", frame0)
 	}
 
 	// Completion flips to a done line with exit status.
 	at.CompleteLastExec(0, 1_200*time.Millisecond)
 	done := ansi.Strip(at.Render(100))
-	if !strings.Contains(done, "(exit 0") || !strings.Contains(done, "[done]") {
+	if !strings.Contains(done, "(exit 0") || !strings.Contains(done, "✔ done") {
 		t.Errorf("completed exec missing exit status / done badge:\n%s", done)
+	}
+
+	// A non-zero exit code renders the failed badge.
+	at.CompleteLastExec(1, 500*time.Millisecond)
+	failed := ansi.Strip(at.Render(100))
+	if !strings.Contains(failed, "✖ failed") {
+		t.Errorf("failed exec missing failed badge:\n%s", failed)
 	}
 }
 
@@ -149,13 +158,32 @@ func TestStageLabelMapping(t *testing.T) {
 }
 
 func TestStageBadgeForms(t *testing.T) {
-	if got := ansi.Strip(stageBadge(false, 0)); got != "[done]" {
+	if got := ansi.Strip(stageBadge(ActivityStatusDone, 0)); got != "✔ done  " {
 		t.Errorf("done badge = %q", got)
 	}
-	if got := ansi.Strip(stageBadge(true, 0)); got != "[running.]" {
+	if got := ansi.Strip(stageBadge(ActivityStatusRunning, 0)); got != "⠋       " {
 		t.Errorf("running badge frame0 = %q", got)
 	}
-	if got := ansi.Strip(stageBadge(true, 2)); got != "[running...]" {
-		t.Errorf("running badge frame2 = %q", got)
+	if got := ansi.Strip(stageBadge(ActivityStatusFailed, 0)); got != "✖ failed" {
+		t.Errorf("failed badge = %q", got)
+	}
+	// All status forms occupy exactly statusBadgeWidth cells so the content
+	// column never shifts across animation cycles.
+	for _, st := range []ActivityStatus{ActivityStatusDone, ActivityStatusRunning, ActivityStatusFailed} {
+		line := ansi.Strip(stageBadge(st, 2))
+		if lipgloss.Width(line) != statusBadgeWidth {
+			t.Errorf("badge width = %d for status %v, want %d (line %q)", lipgloss.Width(line), st, statusBadgeWidth, line)
+		}
+	}
+}
+
+func TestStageBadgeFixedWidthAcrossFrames(t *testing.T) {
+	widths := make(map[int]bool)
+	for frame := 0; frame < len(ProposalSpinnerFrames); frame++ {
+		line := ansi.Strip(stageBadge(ActivityStatusRunning, frame))
+		widths[lipgloss.Width(line)] = true
+	}
+	if len(widths) != 1 {
+		t.Errorf("running badge width changed across frames: %v", widths)
 	}
 }

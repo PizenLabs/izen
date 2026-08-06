@@ -26,6 +26,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/runtime"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
+	domainworkflow "github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
@@ -45,6 +46,7 @@ import (
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
+	"github.com/PizenLabs/izen/internal/ui/status"
 	"github.com/PizenLabs/izen/pkg/engine/ir"
 	"github.com/PizenLabs/izen/pkg/engine/pipeline"
 	"github.com/PizenLabs/izen/pkg/engine/telemetry"
@@ -137,6 +139,11 @@ type askStreamPreparedMsg struct {
 type streamErrMsg struct {
 	err     error
 	content string
+	// tokenInput/tokenOutput carry the partial provider usage captured before
+	// the stream error so consumed tokens are reported even on a failed
+	// attempt ("Explicit Over Implicit").
+	tokenInput  int
+	tokenOutput int
 }
 
 type PlanStreamingFinishedMsg struct {
@@ -360,6 +367,11 @@ type buildProposalReadyMsg struct {
 	Diff    string
 	Output  string // raw LLM response text for proposal extraction
 	Err     error
+	// TokenInput/TokenOutput carry the provider-reported usage of the build
+	// proposal call (streaming or non-streaming) so tokens are recorded even
+	// when the response is truncated.
+	TokenInput  int
+	TokenOutput int
 }
 
 // thinkingStreamMsg carries a reasoning token chunk from the SSE stream
@@ -383,6 +395,10 @@ type livePreviewChunkMsg struct {
 // the spinner is cleaned up and the pipeline is reset.
 type buildFailedMsg struct {
 	Err error
+	// TokenInput/TokenOutput carry the partial provider usage captured before
+	// the failure (see streamErrMsg).
+	TokenInput  int
+	TokenOutput int
 }
 
 // hotfixProposalMsg carries the LLM-generated patch for a $hot hotfix back to
@@ -393,6 +409,10 @@ type hotfixProposalMsg struct {
 	Patch *execution.Patch
 	Diff  string
 	Err   error
+	// TokenInput/TokenOutput carry the provider-reported usage of the hotfix
+	// patch call so tokens are recorded even on truncation.
+	TokenInput  int
+	TokenOutput int
 }
 
 // hotfixProgressMsg streams a lifecycle log line to the terminal while the
@@ -695,6 +715,22 @@ type model struct {
 	responseBuffer  strings.Builder
 	reasoningBuffer strings.Builder
 	streaming       bool
+	// traceBuffer accumulates the raw streamed response of the current/last
+	// completion so Ctrl+O can expand/collapse a full output-trace viewport
+	// even for models that emit no formal reasoning channel (e.g. Gemma family
+	// SLMs). It is reset at the start of every stream and survives completion
+	// so the trace stays inspectable after the response ends.
+	traceBuffer strings.Builder
+	// traceExpanded is the Ctrl+O expansion state of the output-trace viewport.
+	traceExpanded bool
+	// traceWindowStart anchors the output-trace window while the trace is
+	// expanded and streaming: it is frozen once anchored so new chunks never
+	// slide the inspected lines out from under the user (the Ctrl+O viewport
+	// flicker). traceWindowAnchored reports whether the anchor is live; it
+	// resets when the stream starts, the trace is re-expanded, or the user
+	// jumps back to the tail (Space).
+	traceWindowStart    int
+	traceWindowAnchored bool
 	// pendingReasoningFragment holds an opened-but-not-yet-closed
 	// \x00RSNG\x00 reasoning block carried over between extraction passes.
 	// Without this, a sentinel pair split across two ticks (or a truncated
@@ -810,6 +846,12 @@ type model struct {
 	// /build run; it is threaded into every committed patch so the ledger can
 	// be marked Completed.
 	currentBuildTaskID int
+	// fastTrackTargets records the plan task targets covered by the active
+	// fast-track patch batch (proposal targets extracted from native tool
+	// calls). When every plan FILE_MUTATE/GIT_ACTION target is covered and the
+	// batch has been applied, per-task execution is redundant and the build
+	// completes immediately (Explicit Over Implicit).
+	fastTrackTargets map[string]bool
 
 	investigateInvocationCount int
 
@@ -1069,6 +1111,12 @@ type model struct {
 	// store or cache its own copies of workflow states or capability flags.
 	runtimeCtx *runtime.RuntimeContext
 	workflowSM *workflow.WorkflowStateMachine
+	// workflowRT is the Application-layer domain WorkflowRuntime (PhaseAsk /
+	// PhaseBuild / ...) that submit_prompt / switch_mode handlers drive. On a
+	// failed build the phase must be unwound back to Ask, or every later user
+	// prompt is rejected with "transition from build to ask: moving to a
+	// previous phase is not permitted" ("Human-Centered / Reversible").
+	workflowRT domainworkflow.WorkflowRuntime
 	// viewState is the derived presentation projection of the canonical
 	// workflow event stream (EventPhaseChanged / EventApprovalRequested). The
 	// UI derives StateAwaitingApproval/StateProcessing from it via
@@ -1446,6 +1494,28 @@ func (m *model) sanitizeInputPrompt() {
 	m.ti.Prompt = ""
 }
 
+// commitTokenUsage folds provider-reported token usage into the session
+// counters and the global status.Tracker. It is the single accounting entry
+// point for BOTH successful and failed LLM attempts: on failure the provider's
+// partial usage (or a character estimate) is still committed so consumed
+// tokens are never silently zeroed ("Explicit Over Implicit").
+func (m *model) commitTokenUsage(input, output int) {
+	if input < 0 {
+		input = 0
+	}
+	if output < 0 {
+		output = 0
+	}
+	m.InputTokens += input
+	m.OutputTokens += output
+	m.TotalTokens = m.InputTokens + m.OutputTokens
+	if m.IsCloudModel {
+		status.Default.Record(m.InputTokens, m.OutputTokens)
+	} else {
+		status.Default.Record(input, output)
+	}
+}
+
 // setApplyError captures an apply error.
 func (m *model) setApplyError(text string) {
 	m.lastApplyError = text
@@ -1622,6 +1692,15 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// Engine activity telemetry (retrieval/execution/investigate sinks)
 		// projected onto the UI goroutine through the bus.
 		m.logActivity("%s", p.Line)
+	case events.StreamUsagePayload:
+		// "Explicit Over Implicit": an interrupted LLM stream reports its
+		// partial token usage so consumed tokens never vanish from telemetry.
+		statusWord := "interrupted"
+		if !p.Interrupted {
+			statusWord = "finished"
+		}
+		m.logActivity("[stream] %s: %s tok input + %s tok output (%s)", statusWord,
+			status.FormatTokens(p.InputTokens), status.FormatTokens(p.OutputTokens), truncateForActivity(p.Reason))
 	case events.EngineTelemetryPayload:
 		// Typed engine I/O event wrapped for bus transport — projected into
 		// the structured ActivityTree.
@@ -1663,6 +1742,45 @@ func (m *model) resolveApprovalState() {
 		m.viewState.ResolveApproval()
 	}
 	m.syncUIState()
+}
+
+// unwindBuildFailure releases a failed build execution back to interactive
+// state. It is the "Human-Centered / Reversible" guarantee for failed commands:
+// a stream/engine failure (HTTP 400/500, network error) must never trap the
+// user in the build phase — every later prompt would then be rejected with
+// "workflow: transition from build to ask: moving to a previous phase is not
+// permitted" and the session would be unrecoverable.
+//
+// It performs a deterministic recovery:
+//  1. Release any outstanding approval gate (build failures can arrive while a
+//     proposal freeze is pending).
+//  2. Reset the core WorkflowStateMachine to StateIdle so /ask, /plan and
+//     /build are all reachable again.
+//  3. Reset the Application-layer domain WorkflowRuntime to PhaseAsk so
+//     submit_prompt / switch_mode handlers never reject a recovery prompt.
+//  4. Re-derive the presentation state to interactive StateChat and restore
+//     keyboard focus.
+func (m *model) unwindBuildFailure() {
+	m.resolveApprovalState()
+	// Drop any in-flight approval/patch state so the viewport returns to chat.
+	m.awaitingConfirmation = false
+	m.pendingProposals = nil
+	m.pendingBuildApproval = false
+	m.pendingBuildTask = nil
+	m.pendingHotfixTask = nil
+	m.pendingHotfixPatch = nil
+	m.acceptAll = false
+	m.pendingRouteConfirm = false
+	if m.workflowSM != nil {
+		// From StateBuilding/StateFailed/StateRepairing the canonical exit is
+		// a reset back to StateIdle, from which every forward phase is reachable.
+		_ = m.workflowSM.SendEvent(workflow.EventReset, workflow.TransitionContext{})
+	}
+	if m.workflowRT != nil {
+		m.workflowRT.Reset()
+	}
+	m.syncUIState()
+	m.ti.Focus()
 }
 
 // handleEmergencyInterrupt is the unblockable emergency escape hatch. It is
@@ -1768,6 +1886,82 @@ func (m *model) syncUIState() {
 // running.
 func (m *model) isWorkflowBusy() bool {
 	return m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.shellRunning
+}
+
+// fastTrackCoversAllPlanTargets reports whether the active fast-track patch
+// batch covered every FILE_MUTATE / GIT_ACTION plan task target. When true,
+// per-task execution is redundant work on already-applied files and the build
+// MUST complete immediately (Rule "Explicit Over Implicit"): the loop must
+// never fall through to "executing step N" after a full fast-track batch.
+func (m *model) fastTrackCoversAllPlanTargets() bool {
+	if m.sess == nil || len(m.fastTrackTargets) == 0 {
+		return false
+	}
+	tasks := m.sess.CurrentTasks
+	if len(tasks) == 0 {
+		return false
+	}
+	for _, t := range tasks {
+		if t.Type != "FILE_MUTATE" && t.Type != "GIT_ACTION" {
+			return false
+		}
+		if !m.fastTrackTargets[t.Target] {
+			return false
+		}
+	}
+	return true
+}
+
+// markAllPlanTasksCompleted flips every plan task status to "completed" so the
+// build queue is fully drained and verification/handoff can run. It is used
+// after a fast-track batch covers all plan targets, where per-task execution
+// is skipped entirely.
+func (m *model) markAllPlanTasksCompleted() {
+	if m.sess == nil {
+		return
+	}
+	tasks := m.sess.CurrentTasks
+	changed := false
+	for i := range tasks {
+		if tasks[i].Status != "completed" {
+			tasks[i].Status = "completed"
+			changed = true
+		}
+	}
+	if changed {
+		m.sess.StageTaskList(&tasks)
+		_ = m.sess.Save()
+	}
+}
+
+// completeFastTrackBuild is the build completion sequence invoked when a
+// fast-track batch covered every plan target: it drains the queue, commits the
+// snapshot, clears the patching spinner and restores interactive input focus.
+// It returns the verification command so the build transitions to complete.
+func (m *model) completeFastTrackBuild() (tea.Model, tea.Cmd) {
+	m.markAllPlanTasksCompleted()
+	m.fastTrackTargets = nil
+	if m.execEng != nil {
+		m.execEng.CommitTransaction()
+	}
+	// Release any residual patching/agent flags so the derived presentation
+	// state unwinds to interactive StateChat instead of a stuck spinner.
+	m.agentRunning = false
+	m.agentDone = true
+	m.agentLabel = ""
+	m.stopShimmer()
+	m.awaitingConfirmation = false
+	m.acceptAll = false
+	m.pendingProposals = nil
+	m.resolveApprovalState()
+	m.ti.Focus()
+	m.recalcViewportHeight()
+	m.buildVerifyPending = true
+	m.push(roleSystem, "Verifying build...")
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
+	flush := m.flushPendingRecords()
+	return m, tea.Batch(flush, m.runTestEngine("./..."))
 }
 
 // handlePresentationEvent projects one Application-layer PresentationEvent
@@ -2723,6 +2917,18 @@ func (m *model) refreshViewportContent() {
 		}
 	}
 
+	// ── Unified output trace viewport (Ctrl+O) ─────────────────────────
+	// Models without a formal reasoning channel never feed the ThinkingBuffer,
+	// so Ctrl+O had nothing to expand. The raw streamed response is captured in
+	// traceBuffer instead; when the user expands it, the full output trace
+	// renders in a dimmed collapsible box for inspection.
+	if m.traceExpanded && m.traceBuffer.Len() > 0 {
+		if trace := m.renderOutputTrace(m.width); trace != "" {
+			content.WriteString(trace)
+			content.WriteString("\n")
+		}
+	}
+
 	// ── Fact-only Execution Tree ────────────────────────────────────
 	// The Dynamic IR projection rendered from control.iteration /
 	// control.node_observed facts. Placed above the bottom dock so the live
@@ -2740,13 +2946,14 @@ func (m *model) refreshViewportContent() {
 	// Rendered outside the streaming block so it appears during /build
 	// execution (non-streaming patch proposal) and persists through
 	// approval states. Only renders when the tree has active entries.
-	// The last entry carries a "[running]" badge while any background
+	// The last entry carries a braille spinner status while any background
 	// stage is still in flight, so the execution tree reads as a live
 	// pipeline rather than a static log dump.
 	if m.activityTree != nil {
 		treeActive := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.shellRunning || m.state == StateProcessing
 		// Pass the live spinner frame so the running exec snowflake cycles the
-		// full 4-frame sequence (✻ ❅ ❆ ✦), not just the 3 dot-frames.
+		// full 4-frame sequence (✻ ❅ ❆ ✦) and the status column cycles the
+		// single-width braille spinner.
 		treeView := m.activityTree.RenderActive(m.width, treeActive, m.spinnerFrame)
 		if treeView != "" {
 			content.WriteString(treeView)
@@ -2754,6 +2961,17 @@ func (m *model) refreshViewportContent() {
 		}
 	}
 
+	// ── VIEWPORT SCROLL LOCK (Ctrl+O output-trace) ────────────────────
+	// While the expanded output-trace viewport is active, preserve the exact
+	// YOffset across SetContent: a transient content shrink would otherwise
+	// make the bubbles viewport clamp to the bottom and yank the inspected
+	// lines (the Ctrl+O flicker during active generation).
+	if m.traceExpanded {
+		saved := m.Viewport.YOffset
+		m.Viewport.SetContent(content.String())
+		m.Viewport.SetYOffset(saved)
+		return
+	}
 	m.Viewport.SetContent(content.String())
 }
 

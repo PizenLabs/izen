@@ -25,6 +25,12 @@ type Request struct {
 	Temperature    float64          `json:"-"` // 0 = use provider default
 	ResponseFormat *ResponseFormat  `json:"response_format,omitempty"`
 	Tools          []ToolDefinition `json:"-"` // Native LLM function calling tool definitions
+	// Reasoning carries the resolved reasoning control (effort level, thinking
+	// budget, CoT cap) produced by the decision engine. Providers translate it
+	// into their native API payload (reasoning_effort / thinking.budget_tokens /
+	// reasoning.{effort,max_tokens}). When nil or zero, no reasoning payload is
+	// injected and the provider behaves exactly as before.
+	Reasoning *ReasoningConfig `json:"-"`
 	// ReasoningHandler receives reasoning/thinking content as it streams in,
 	// separated from the main response. Providers call it with verbatim chunks
 	// (the same text that reasoning_content / thinking_delta / thought frames

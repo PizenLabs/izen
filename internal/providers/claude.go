@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,6 +37,15 @@ type claudeMessage struct {
 	Content string `json:"content"`
 }
 
+// claudeThinking is the Anthropic extended-thinking control. When injected
+// with type "enabled" and a positive budget, the model performs extended
+// reasoning up to budget_tokens. It is injected from the dynamically resolved
+// effort directive; a zero budget omits it entirely (thinking disabled).
+type claudeThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens"`
+}
+
 type claudeRequest struct {
 	Model         string          `json:"model"`
 	Messages      []claudeMessage `json:"messages"`
@@ -44,6 +54,7 @@ type claudeRequest struct {
 	Stream        bool            `json:"stream"`
 	System        string          `json:"system,omitempty"`
 	StopSequences []string        `json:"stop_sequences,omitempty"`
+	Thinking      *claudeThinking `json:"thinking,omitempty"`
 }
 
 type claudeResponse struct {
@@ -92,6 +103,16 @@ func (p *ClaudeProvider) buildMessages(req ai.Request) []claudeMessage {
 	return msgs
 }
 
+// thinkingFor builds the Anthropic extended-thinking control from the resolved
+// effort directive. A nil request reasoning config or a non-positive budget
+// yields nil (thinking disabled, the pre-existing behavior).
+func thinkingFor(req ai.Request) *claudeThinking {
+	if req.Reasoning == nil || req.Reasoning.BudgetTokens <= 0 {
+		return nil
+	}
+	return &claudeThinking{Type: "enabled", BudgetTokens: req.Reasoning.BudgetTokens}
+}
+
 func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
 	model := p.model
 	if req.Model != "" {
@@ -112,6 +133,7 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		Stream:        false,
 		System:        req.System,
 		StopSequences: req.Stop,
+		Thinking:      thinkingFor(req),
 	}
 
 	payload, err := json.Marshal(body)
@@ -184,6 +206,7 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		Stream:        true,
 		System:        req.System,
 		StopSequences: req.Stop,
+		Thinking:      thinkingFor(req),
 	}
 
 	payload, err := json.Marshal(body)
@@ -221,8 +244,8 @@ type ClaudeStreamResult struct {
 }
 
 func (r *ClaudeStreamResult) Usage() (input, output int) {
-	if r.sr != nil && r.sr.finalUsage != nil {
-		return r.sr.finalUsage.InputTokens, r.sr.finalUsage.OutputTokens
+	if r.sr != nil {
+		return r.sr.usage.Usage()
 	}
 	return 0, 0
 }
@@ -250,6 +273,9 @@ type claudeSSEReader struct {
 	finalUsage       *claudeUsage
 	finishReason     string
 	reasoningHandler func(string) error
+
+	// usage tracks cumulative token accounting (see streamUsageTracker).
+	usage streamUsageTracker
 }
 
 func (s *claudeSSEReader) Read(p []byte) (int, error) {
@@ -264,6 +290,9 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.usage.markInterrupted()
+			}
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -289,6 +318,7 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 				s.finalUsage = &claudeUsage{
 					InputTokens: event.Usage.InputTokens,
 				}
+				s.usage.recordInputTokens(event.Usage.InputTokens)
 			}
 		case "content_block_delta":
 			if event.Delta == nil {
@@ -297,6 +327,7 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 			// Reasoning process (thinking_delta) is routed to the reasoning
 			// handler only — never emitted into the response stream.
 			if event.Delta.Type == "thinking_delta" && event.Delta.Thinking != "" {
+				s.usage.recordOutput(len(event.Delta.Thinking))
 				if s.reasoningHandler != nil {
 					if err := s.reasoningHandler(event.Delta.Thinking); err != nil {
 						s.closed = true
@@ -306,6 +337,7 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 				continue
 			}
 			if event.Delta.Text != "" {
+				s.usage.recordOutput(len(event.Delta.Text))
 				n := copy(p, event.Delta.Text)
 				return n, nil
 			}
@@ -315,6 +347,7 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 					s.finalUsage = &claudeUsage{}
 				}
 				s.finalUsage.OutputTokens = event.Usage.OutputTokens
+				s.usage.recordOutputTokens(event.Usage.OutputTokens)
 			}
 			if event.Delta != nil && event.Delta.StopReason != "" {
 				s.finishReason = event.Delta.StopReason

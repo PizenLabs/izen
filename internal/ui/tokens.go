@@ -2,13 +2,14 @@ package ui
 
 // ── Design Tokens ─────────────────────────────────────────────────────────────
 //
-// Single source of truth for colors, text priorities, spacing rhythm, icons,
-// and borders. Every renderer consumes these tokens instead of hardcoding
-// literals so the visual language stays consistent across all modes
-// (/ask, /plan, /build, /investigate, /review).
+// Design tokens define the shared visual language for the entire UI.
 //
-// Palette values are Catppuccin Mocha hex strings defined in styles.go and are
-// referenced here by their existing constants to avoid divergence.
+// They provide a single source of truth for colors, typography, spacing,
+// borders, and icons so every renderer projects the same visual identity
+// across all interaction modes (/ask, /plan, /build, /investigate, /review).
+//
+// Color values reference the Catppuccin Mocha palette defined in styles.go to
+// ensure consistency and eliminate duplicated styling decisions.
 
 import (
 	"strings"
@@ -16,13 +17,15 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Color holds the semantic palette. Each field communicates *meaning*, never
-// pure decoration:
-//   - Success : completed actions, added code, success states
-//   - Warning : pending approval, validation, warnings
-//   - Danger  : failures, removed code, rejected actions
-//   - Info    : section titles, workspace labels, informational elements
-//   - Muted   : metadata, timestamps, token usage, checkpoint IDs
+// Color defines the semantic color palette.
+//
+// Colors communicate meaning rather than appearance:
+//
+//   - Success: completed operations and positive outcomes
+//   - Warning: attention, validation, or pending approval
+//   - Danger: failures, rejected actions, and destructive changes
+//   - Info: informational content and section headers
+//   - Muted: secondary metadata and supporting information
 var Color = struct {
 	Success string
 	Warning string
@@ -53,7 +56,7 @@ var Color = struct {
 	Reject:  colorMaroon,
 }
 
-// Text holds reusable text styles ordered by visual priority.
+// Text defines reusable text styles ordered by visual priority.
 var Text = struct {
 	Primary   lipgloss.Style
 	Secondary lipgloss.Style
@@ -66,9 +69,10 @@ var Text = struct {
 	Faint:     dimmedStyle,
 }
 
-// Spacing defines the vertical rhythm (in blank lines) used to separate
-// ideas rather than simply occupy space. Whitespace performs most of the
-// structural work; these constants keep that rhythm uniform.
+// Spacing defines the vertical rhythm shared across the UI.
+//
+// Whitespace separates ideas and establishes hierarchy more effectively than
+// decorative elements, making spacing a first-class design token.
 var Spacing = struct {
 	Small   int
 	Medium  int
@@ -81,15 +85,26 @@ var Spacing = struct {
 	Section: 2,
 }
 
-// Border holds reusable border/rule tokens.
+// Border defines reusable border and separator styles.
 var Border = struct {
 	Subtle lipgloss.Style
 }{
 	Subtle: subtleStyle,
 }
 
-// Icon holds quiet, monochrome Unicode/Nerd-Font glyphs (no emoji). Icons
-// help users scan content faster and stay visually consistent across modes.
+// Icon defines the canonical glyph set shared across the UI.
+//
+// Icons communicate semantics rather than literal objects.
+//
+//   - Circle   : state (success, pending, review)
+//   - Triangle : warning or risk
+//   - Diamond  : action or metadata
+//   - Square   : artifacts
+//   - Arrow    : execution and navigation
+//
+// Unicode glyphs form the primary visual language. Nerd Font icons are
+// reserved for developer tooling (grep, read, diff, blueprint, verification)
+// to maintain a clean, professional terminal experience.
 var Icon = struct {
 	Command   string
 	File      string
@@ -124,100 +139,114 @@ var Icon = struct {
 	EnvDeps   string
 	CodeMod   string
 	Verify    string
-	// Interrupt is the stop-sign glyph used by the interrupt hint next to the
-	// runtime status spinner while a stream or shell command is active.
+
+	// Interrupt indicates that the current operation can be cancelled.
 	Interrupt string
-	// Index is the lightning-bolt glyph used by the header indexing badge.
+
+	// Index identifies workspace indexing and repository analysis.
 	Index string
-	// ── Tool activity stream icons (Claude Code / OpenCode style) ──
-	// Nerd-Font cod glyphs used to prefix live tool steps so the tree reads
-	// as a transparent execution log: grep/read/diff/exec each carry a
-	// dedicated glyph (Icon.Diff is repurposed from the unused "⇄" to the
-	// cod-diff glyph). The exec icon is the animated snowflake ✻ while a
-	// shell command is running (see SpinnerSnowflakeFrames).
+
+	// Tool activity stream icons.
+	//
+	// These glyphs prefix live execution steps in the activity tree. Developer
+	// tooling uses Nerd Font icons, while execution uses the shared animated
+	// snowflake defined by SpinnerSnowflakeFrames.
 	Grep string
 	Read string
 	Exec string
 }{
-	Command:   "❯",
-	File:      "▦",
-	Diff:      "\U000F03EB", // nf-cod-diff — patch/diff tool step
-	Task:      "✓",
-	Warning:   "▲",
-	Review:    "◎",
-	Execute:   "▶",
-	Evidence:  "◉",
-	Action:    "❖",
-	Success:   "✔",
-	Error:     "✘",
-	Info:      "ℹ",
-	Plan:      "▤",
-	Edit:      "✎",
-	Table:     "⊞",
-	Summary:   "»",
-	Risk:      "◆",
-	Context:   "⊚",
+	Command: "❯",
+
+	// Artifacts
+	File:    "□",
+	Table:   "⊞",
+	Context: "◎",
+
+	// Flow
 	Chevron:   "▸",
-	Bullet:    "•",
-	Check:     "●",
-	Cross:     "✗",
-	Pending:   "◌",
-	Spark:     "✦",
+	Execute:   "▶",
 	ShellExec: "▶",
-	Config:    "⚙",
-	SrcPatch:  "⚙",
-	Done:      "✔",
+
+	// Planning
+	Plan:      "◫",
 	Blueprint: "\U000F0313",
 	Timeline:  "\U000F0316",
-	EnvDeps:   "\U000F03D7",
-	CodeMod:   "\U000F061E",
-	Verify:    "\U000F0668",
-	Interrupt: "⏹",
-	Index:     "⚡",
-	Grep:      "\U000F0349", // nf-cod-search — grep tool step
-	Read:      "\U000F0219", // nf-cod-file — read tool step
-	Exec:      "✻",          // snowflake — shell exec step (animated while running)
+
+	// Actions
+	Action:  "◆",
+	Edit:    "◇",
+	CodeMod: "\U000F061E",
+
+	// States
+	Task:    "●",
+	Success: "●",
+	Check:   "●",
+	Done:    "●",
+	Pending: "○",
+
+	Error: "✕",
+	Cross: "✕",
+
+	// Inspection
+	Review:   "◉",
+	Evidence: "◉",
+
+	// Alerts
+	Warning: "▲",
+	Risk:    "▲",
+
+	// Misc
+	Info:    "•",
+	Bullet:  "•",
+	Summary: "»",
+	Spark:   "✦",
+
+	Config:   "◈",
+	SrcPatch: "\U000F03EB",
+	Verify:   "\U000F0668",
+	EnvDeps:  "\U000F03D7",
+
+	Interrupt: "⏸",
+	Index:     "◈",
+
+	// Tooling
+	Grep: "\U000F0349", // nf-cod-search
+	Read: "\U000F0219", // nf-cod-file
+	Diff: "\U000F03EB", // nf-cod-diff
+	Exec: "✻",          // animated via SpinnerSnowflakeFrames
 }
 
-// SpinnerSnowflakeFrames is the canonical animated snowflake sequence
-// (✻ ❅ ❆ ✦) shared by the inline loading spinner, the exec tree node, and the
-// loading dock. Every spinner in the UI must cycle these frames so the glyph
-// set stays identical across all modes.
+// SpinnerSnowflakeFrames defines the canonical loading animation.
+//
+// Every animated loading indicator should reuse these frames to preserve a
+// consistent motion language across the interface.
 var SpinnerSnowflakeFrames = []string{"✻", "❅", "❆", "✦"}
 
-// SpinnerSnowflake returns the resting snowflake glyph (the first frame of
-// SpinnerSnowflakeFrames). Used whenever a static (non-animated) loading or
-// exec indicator is needed.
+// SpinnerSnowflake returns the default resting frame of the shared loading
+// animation.
 func SpinnerSnowflake() string {
 	return SpinnerSnowflakeFrames[0]
 }
 
-// IconGrep returns the Nerd-Font cod-search glyph used to prefix grep tool
-// steps in the activity tree.
+// IconGrep returns the glyph used for search operations.
 func IconGrep() string { return Icon.Grep }
 
-// IconRead returns the Nerd-Font cod-file glyph used to prefix read tool
-// steps in the activity tree.
+// IconRead returns the glyph used for file read operations.
 func IconRead() string { return Icon.Read }
 
-// IconExec returns the snowflake glyph used to prefix shell-exec tool steps
-// in the activity tree (animated while the command is running).
+// IconExec returns the glyph used for shell execution.
 func IconExec() string { return Icon.Exec }
 
-// IconCheck returns the quiet check glyph used for confirmed / success states
-// in the execution-tree projection.
+// IconCheck returns the glyph representing a completed state.
 func IconCheck() string { return Icon.Check }
 
-// IconError returns the cross glyph used for failed states in the
-// execution-tree projection.
+// IconError returns the glyph representing a failed state.
 func IconError() string { return Icon.Error }
 
-// IconPending returns the hollow-circle glyph used for not-yet-completed
-// states in the execution-tree projection.
+// IconPending returns the glyph representing a pending state.
 func IconPending() string { return Icon.Pending }
 
-// rule returns a full-width horizontal separator rendered in the given style.
-// Used for region boundaries that must reflow deterministically on resize.
+// rule renders a full-width horizontal separator.
 func rule(width int, style lipgloss.Style) string {
 	if width < 1 {
 		width = 1
@@ -225,7 +254,7 @@ func rule(width int, style lipgloss.Style) string {
 	return style.Render(strings.Repeat("─", width))
 }
 
-// vspace returns n blank lines as a string, used to apply the Spacing rhythm.
+// vspace returns n blank lines used to apply the shared spacing rhythm.
 func vspace(n int) string {
 	if n < 0 {
 		n = 0

@@ -3,6 +3,8 @@ package prompt
 import (
 	"strings"
 	"testing"
+
+	"github.com/PizenLabs/izen/internal/domain/capability"
 )
 
 func TestAskPromptHandoffContract_NoRoleplay(t *testing.T) {
@@ -171,6 +173,85 @@ func TestCasualChatRespondsToStyleToggle(t *testing.T) {
 	}
 	if balanced == ultra {
 		t.Error("casual chat prompt did not adapt to the style toggle")
+	}
+}
+
+// guardrailPhrase is the single permitted occurrence of a fake path inside the
+// prompt contracts: the explicit "Do NOT invent subdirectories" instruction.
+// The purge test strips exactly this phrase before asserting zero fake paths.
+const guardrailPhrase = "Do NOT invent subdirectories like path/to/file/."
+
+// TestPromptContractsNoFakePathPlaceholders is the Step-1 acceptance test: no
+// prompt example may reference the fake "path/to/file" placeholder. Every
+// example target must be an exact workspace-relative filename from the root
+// (index.html, styles.css, script.js, main.go). The only occurrence allowed is
+// the explicit anti-invention guardrail phrase itself.
+func TestPromptContractsNoFakePathPlaceholders(t *testing.T) {
+	fileCtx := "## Current Content of: cmd/api/main.go\n```go\npackage main\n```\n"
+	goals := "Task 1 [FILE_MUTATE]\nTarget file: cmd/api/main.go\nDescription: add a handler\n"
+
+	contracts := map[string]string{
+		"BuildContract":               BuildContract(),
+		"NewFileContract":             NewFileContract(),
+		"ExistingFileContract":        ExistingFileContract(),
+		"ExistingFileSmallFallback":   ExistingFileSmallFallbackContract(),
+		"SLMBuildContract":            SLMBuildContract(),
+		"SLMOutputDirective":          SLMOutputDirective,
+		"SLMNewFileContract":          NewFileContractForTier(capability.TierSLM),
+		"SLMExistingFileContract":     ExistingFileContractForTier(capability.TierSLM),
+		"StrategyNewFile":             StrategyContract("new_file"),
+		"StrategyExistingFile":        StrategyContract("existing_file"),
+		"StrategySmallFallback":       StrategyContract("small_fallback"),
+		"TaskBlockSchemaInstruction":  TaskBlockSchemaInstruction(),
+		"SLMFastTrackPrompt":          SLMFastTrackPrompt(fileCtx, goals),
+		"SLMComposedBuildPrompt":      NewTierAdapter(capability.TierSLM).SystemPromptForMode("build"),
+		"FrontierComposedBuildPrompt": NewTierAdapter(capability.TierFrontier).SystemPromptForMode("build"),
+		"PlanSynthesisSLM":            PlanSynthesisSystemPromptForTier(capability.TierSLM),
+		"PlanSynthesisFrontier":       PlanSynthesisSystemPromptForTier(capability.TierFrontier),
+		"PlanContract":                PlanContract(),
+		"CompactPlanContract":         CompactPlanContract(),
+		"InvestigateContract":         InvestigateContract(),
+		"ReviewContract":              ReviewContract(),
+		"AskPromptHandoffContract":    AskPromptHandoffContract(),
+		"FastTrackMid":                FastTrackPromptForTier(capability.TierMid, fileCtx, goals),
+		"NativeToolFastTrack":         NativeToolFastTrackPrompt(fileCtx, goals),
+	}
+
+	for name, c := range contracts {
+		cleaned := strings.ReplaceAll(c, guardrailPhrase, "")
+		if strings.Contains(cleaned, "path/to/") {
+			t.Errorf("%s references a fake path placeholder:\n%s", name, c)
+		}
+	}
+}
+
+// TestPromptContractsUseExactRootFilenames asserts the positive side of the
+// purge: the output-format examples reference concrete workspace-root files
+// (index.html, styles.css, script.js, main.go), never invented directories.
+func TestPromptContractsUseExactRootFilenames(t *testing.T) {
+	examples := []string{
+		BuildContract(),
+		NewFileContract(),
+		ExistingFileContract(),
+		SLMBuildContract(),
+		SLMOutputDirective,
+		NewFileContractForTier(capability.TierSLM),
+		ExistingFileContractForTier(capability.TierSLM),
+		SLMFastTrackPrompt("ctx", "goals"),
+		NewTierAdapter(capability.TierSLM).SystemPromptForMode("build"),
+		TaskBlockSchemaInstruction(),
+	}
+	wants := []string{"index.html", "styles.css", "script.js", "main.go"}
+	found := false
+	for _, c := range examples {
+		for _, w := range wants {
+			if strings.Contains(c, w) {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("no prompt contract references an exact root filename (index.html/styles.css/script.js/main.go)")
 	}
 }
 

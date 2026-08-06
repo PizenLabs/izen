@@ -31,7 +31,7 @@ func StrategyForFile(target string) FileMutationStrategy {
 }
 
 func StrategyForOriginal(original string) FileMutationStrategy {
-	if strings.TrimSpace(original) == "" {
+	if IsStubFile(original) {
 		return STRATEGY_NEW_FILE
 	}
 	return STRATEGY_EXISTING_FILE
@@ -48,8 +48,32 @@ func (s FileMutationStrategy) SystemPromptKey() string {
 	}
 }
 
+// SmallFileLineThreshold is the "Explicit Over Implicit" stub boundary. Any
+// target file that does not exist, is 0 bytes, or has fewer than this many
+// lines is treated as a stub: forcing it through a SEARCH/REPLACE diff
+// protocol makes SLMs fail with "ambiguous snippet without SEARCH/REPLACE
+// markers" or loop on missing "old content" anchors. Stubs are ALWAYS
+// rewritten whole-file.
+const SmallFileLineThreshold = 100
+
+// IsSmallFile reports whether the content is a small/stub file (under
+// SmallFileLineThreshold lines) that must be whole-file overwritten. Line count
+// uses wc -l semantics (count of newlines), so a 99-line file with a trailing
+// newline counts as 99 < 100.
 func IsSmallFile(original string) bool {
-	return len(strings.Split(original, "\n")) < 200
+	return LineCount(original) < SmallFileLineThreshold
+}
+
+// IsStubFile reports whether the content represents a stub: empty/whitespace
+// only (new or 0-byte file) or under SmallFileLineThreshold lines.
+func IsStubFile(original string) bool {
+	return strings.TrimSpace(original) == "" || IsSmallFile(original)
+}
+
+// LineCount returns the number of newline-terminated lines in content (wc -l
+// semantics). Empty content is 0 lines.
+func LineCount(content string) int {
+	return strings.Count(content, "\n")
 }
 
 func StrategyWithFallback(original, diffInput string) FileMutationStrategy {
@@ -100,7 +124,7 @@ func ExistingFileMutationSystemPrompt() string {
 Output ONLY the minimal change needed using one of these formats:
 
 METHOD C — SEARCH/REPLACE (preferred):
-` + bt + `go:path/to/file.go
+` + bt + `go:main.go
 <<<<<<< SEARCH
 old code
 =======
@@ -110,8 +134,8 @@ new code
 
 METHOD D — Unified Diff (alternative):
 ` + bt + `diff
---- a/path/to/file.go
-+++ b/path/to/file.go
+--- a/main.go
++++ b/main.go
 @@ -1,3 +1,4 @@
  existing
 -old
@@ -120,6 +144,7 @@ METHOD D — Unified Diff (alternative):
 
 RULES:
 - Existing files -> SEARCH/REPLACE or unified diff only. Never rewrite the entire file.
+- Stub files (under 100 lines) -> output the COMPLETE, FULLY IMPLEMENTED file content in one block.
 - SEARCH blocks must match EXACTLY (whitespace-sensitive).
 - Include at least 2-3 lines of context in SEARCH blocks.
 - Do NOT output full file content — only the changed region.

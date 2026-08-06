@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -283,8 +284,8 @@ type StreamResult struct {
 }
 
 func (r *StreamResult) Usage() (input, output int) {
-	if r.sr != nil && r.sr.finalUsage != nil {
-		return r.sr.finalUsage.PromptTokens, r.sr.finalUsage.CompletionTokens
+	if r.sr != nil {
+		return r.sr.usage.Usage()
 	}
 	return 0, 0
 }
@@ -305,13 +306,13 @@ type sseReader struct {
 	finalUsage       *usage
 	finishReason     string
 	reasoningHandler func(string) error
+
+	// usage tracks cumulative token accounting (see streamUsageTracker).
+	usage streamUsageTracker
 }
 
 func (s *sseReader) Usage() (input, output int) {
-	if s.finalUsage != nil {
-		return s.finalUsage.PromptTokens, s.finalUsage.CompletionTokens
-	}
-	return 0, 0
+	return s.usage.Usage()
 }
 
 func (s *sseReader) Read(p []byte) (int, error) {
@@ -326,6 +327,9 @@ func (s *sseReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.usage.markInterrupted()
+			}
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -356,6 +360,7 @@ func (s *sseReader) Read(p []byte) (int, error) {
 
 		if chunk.Usage != nil {
 			s.finalUsage = chunk.Usage
+			s.usage.recordUsage(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
 		}
 
 		if chunk.Choices[0].Delta != nil {
@@ -369,6 +374,7 @@ func (s *sseReader) Read(p []byte) (int, error) {
 				reasoningText = d.Reasoning
 			}
 			if reasoningText != "" {
+				s.usage.recordOutput(len(reasoningText))
 				if s.reasoningHandler != nil {
 					if err := s.reasoningHandler(reasoningText); err != nil {
 						s.closed = true
@@ -378,6 +384,7 @@ func (s *sseReader) Read(p []byte) (int, error) {
 				continue
 			}
 			if d.Content != "" {
+				s.usage.recordOutput(len(d.Content))
 				n := copy(p, d.Content)
 				return n, nil
 			}

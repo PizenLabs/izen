@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -46,6 +47,10 @@ type openaiRequest struct {
 	Stop          []string        `json:"stop,omitempty"`
 	Stream        bool            `json:"stream"`
 	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
+	// ReasoningEffort is the native OpenAI qualitative reasoning control
+	// (low / medium / high / xhigh). It is injected from the dynamically
+	// resolved effort directive; empty omits the field.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 type openaiResponse struct {
@@ -102,12 +107,13 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	msgs := p.buildMessages(req)
 
 	body := openaiRequest{
-		Model:       model,
-		Messages:    msgs,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stop:        req.Stop,
-		Stream:      false,
+		Model:           model,
+		Messages:        msgs,
+		MaxTokens:       req.MaxTokens,
+		Temperature:     req.Temperature,
+		Stop:            req.Stop,
+		Stream:          false,
+		ReasoningEffort: req.Reasoning.LevelOrDefault(),
 	}
 
 	payload, err := json.Marshal(body)
@@ -171,13 +177,14 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	msgs := p.buildMessages(req)
 
 	body := openaiRequest{
-		Model:         model,
-		Messages:      msgs,
-		MaxTokens:     req.MaxTokens,
-		Temperature:   req.Temperature,
-		Stop:          req.Stop,
-		Stream:        true,
-		StreamOptions: &streamOptions{IncludeUsage: true},
+		Model:           model,
+		Messages:        msgs,
+		MaxTokens:       req.MaxTokens,
+		Temperature:     req.Temperature,
+		Stop:            req.Stop,
+		Stream:          true,
+		StreamOptions:   &streamOptions{IncludeUsage: true},
+		ReasoningEffort: req.Reasoning.LevelOrDefault(),
 	}
 
 	payload, err := json.Marshal(body)
@@ -214,8 +221,8 @@ type OpenAIStreamResult struct {
 }
 
 func (r *OpenAIStreamResult) Usage() (input, output int) {
-	if r.sr != nil && r.sr.finalUsage != nil {
-		return r.sr.finalUsage.PromptTokens, r.sr.finalUsage.CompletionTokens
+	if r.sr != nil {
+		return r.sr.usage.Usage()
 	}
 	return 0, 0
 }
@@ -236,6 +243,9 @@ type openaiSSEReader struct {
 	finalUsage       *openaiUsage
 	finishReason     string
 	reasoningHandler func(string) error
+
+	// usage tracks cumulative token accounting (see streamUsageTracker).
+	usage streamUsageTracker
 }
 
 func (s *openaiSSEReader) Read(p []byte) (int, error) {
@@ -250,6 +260,9 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.usage.markInterrupted()
+			}
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -276,6 +289,7 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 
 		if chunk.Usage != nil {
 			s.finalUsage = chunk.Usage
+			s.usage.recordUsage(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
 		}
 
 		if len(chunk.Choices) == 0 {
@@ -293,6 +307,7 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 				reasoningText = delta.Reasoning
 			}
 			if reasoningText != "" {
+				s.usage.recordOutput(len(reasoningText))
 				if s.reasoningHandler != nil {
 					if err := s.reasoningHandler(reasoningText); err != nil {
 						s.closed = true
@@ -302,6 +317,7 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 				continue
 			}
 			if delta.Content != "" {
+				s.usage.recordOutput(len(delta.Content))
 				n := copy(p, delta.Content)
 				return n, nil
 			}

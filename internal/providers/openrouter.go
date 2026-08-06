@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 )
@@ -24,6 +26,18 @@ var ErrOpenRouterAuth = errors.New("openrouter: authorization failed (HTTP 401):
 // DefaultOpenRouterModel is the safe fallback model ID used when a request
 // carries no model resolvable to OpenRouter's vendor/model schema.
 const DefaultOpenRouterModel = "anthropic/claude-3.5-sonnet"
+
+// openRouterMaxRateLimitRetries bounds how many times a request answered with
+// HTTP 429 (Too Many Requests / rate limit) is retried before the error is
+// surfaced to the caller. Each retry waits longer (exponential backoff), so the
+// total backoff window across all retries stays small while giving a
+// rate-limited free-tier model room to recover.
+const openRouterMaxRateLimitRetries = 3
+
+// openRouterRateLimitBackoffBase is the base delay unit for exponential backoff
+// on HTTP 429 responses: retries wait 1s, 2s, 4s. It is a package-level variable
+// (not a const) so tests can shrink it and keep the suite fast.
+var openRouterRateLimitBackoffBase = time.Second
 
 // openRouterModelIDRe matches OpenRouter's vendor/model-id schema: a non-empty
 // vendor component, a single "/", and a non-empty model component. Vendors
@@ -118,45 +132,11 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 
 	msgs := p.buildMessages(req)
 
-	body := openrouterRequest{
-		Model:       model,
-		Messages:    msgs,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stop:        req.Stop,
-		Stream:      false,
-	}
+	body := p.buildRequest(model, msgs, req, false)
 
-	if len(req.Tools) > 0 {
-		rawTools := make([]json.RawMessage, 0, len(req.Tools))
-		for _, t := range req.Tools {
-			data, err := json.Marshal(t)
-			if err == nil {
-				rawTools = append(rawTools, data)
-			}
-		}
-		body.Tools = rawTools
-	}
-
-	payload, err := json.Marshal(body)
+	resp, err := p.doChatRequest(ctx, key, body, false)
 	if err != nil {
-		return nil, fmt.Errorf("openrouter: marshal: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("openrouter: new request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+key)
-	httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
-	httpReq.Header.Set("X-OpenRouter-Title", "izen")
-	httpReq.Header.Set("X-OpenRouter-Categories", "cli-agent")
-	httpReq.Header.Set("X-Description", "AI amplifies human judgment. Humans remain in control.")
-
-	resp, err := p.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("openrouter: do: %w", err)
+		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -225,36 +205,11 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 
 	msgs := p.buildMessages(req)
 
-	body := openrouterRequest{
-		Model:         model,
-		Messages:      msgs,
-		MaxTokens:     req.MaxTokens,
-		Temperature:   req.Temperature,
-		Stop:          req.Stop,
-		Stream:        true,
-		StreamOptions: &streamOptions{IncludeUsage: true},
-	}
+	body := p.buildRequest(model, msgs, req, true)
 
-	payload, err := json.Marshal(body)
+	resp, err := p.doChatRequest(ctx, key, body, true)
 	if err != nil {
-		return nil, fmt.Errorf("openrouter: marshal: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("openrouter: new request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+key)
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
-	httpReq.Header.Set("X-OpenRouter-Title", "izen")
-	httpReq.Header.Set("X-OpenRouter-Categories", "cli-agent")
-	httpReq.Header.Set("X-Description", "AI amplifies human judgment. Humans remain in control.")
-
-	resp, err := p.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("openrouter: do: %w", err)
+		return nil, err
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized {
@@ -358,6 +313,221 @@ type openrouterRequest struct {
 	Stream        bool                `json:"stream"`
 	StreamOptions *streamOptions      `json:"stream_options,omitempty"`
 	Tools         []json.RawMessage   `json:"tools,omitempty"`
+	// Reasoning carries OpenRouter's provider-agnostic reasoning control. It
+	// is injected from the dynamically resolved effort directive; a nil value
+	// omits the field entirely.
+	Reasoning *openrouterReasoning `json:"reasoning,omitempty"`
+}
+
+// openrouterReasoning is OpenRouter's reasoning control payload: an optional
+// qualitative effort (low/medium/high) and an optional max_tokens reasoning
+// cap. OpenRouter relays whichever field is set to the underlying provider's
+// native mechanism.
+type openrouterReasoning struct {
+	Effort    string `json:"effort,omitempty"`
+	MaxTokens int    `json:"max_tokens,omitempty"`
+}
+
+// reasoningFor builds the OpenRouter reasoning payload from the resolved
+// effort directive. The qualitative effort maps to reasoning.effort; the CoT
+// cap and budget map to reasoning.max_tokens. A nil request reasoning config
+// yields nil (field omitted, the pre-existing behavior).
+func reasoningFor(req ai.Request) *openrouterReasoning {
+	if req.Reasoning == nil {
+		return nil
+	}
+	r := &openrouterReasoning{Effort: req.Reasoning.Level}
+	switch {
+	case req.Reasoning.CoTLimit > 0:
+		r.MaxTokens = req.Reasoning.CoTLimit
+	case req.Reasoning.BudgetTokens > 0:
+		r.MaxTokens = req.Reasoning.BudgetTokens
+	}
+	if r.Effort == "" && r.MaxTokens == 0 {
+		return nil
+	}
+	return r
+}
+
+// openRouterNonReasoningModels lists model-family markers known to reject
+// OpenRouter's provider-agnostic reasoning payload. Injecting the reasoning
+// object into these models makes the gateway reject the entire request with
+// HTTP 400 (tokens are billed at the gateway before the stream dies). Add a
+// family here when it is observed to reject the reasoning schema so the
+// payload is sanitized up front instead of relying on the retry in
+// doChatRequest.
+var openRouterNonReasoningModels = []string{
+	"gemma",
+}
+
+// openRouterModelSupportsReasoning reports whether the target model accepts
+// OpenRouter's reasoning control. Reasoning is only injected for models known
+// to expose a native reasoning mechanism; unknown models are treated as
+// reasoning-capable and fall back to the HTTP 400 retry in doChatRequest when
+// the gateway disagrees, so a false positive never fails the request.
+func openRouterModelSupportsReasoning(model string) bool {
+	name := strings.ToLower(strings.TrimSpace(model))
+	for _, marker := range openRouterNonReasoningModels {
+		if strings.Contains(name, marker) {
+			return false
+		}
+	}
+	return true
+}
+
+// buildRequest assembles the OpenRouter chat-completion payload for a request.
+// The reasoning control is injected only when the target model supports the
+// reasoning schema (see openRouterModelSupportsReasoning), so a non-reasoning
+// model never receives a payload the gateway rejects with HTTP 400.
+func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage, req ai.Request, stream bool) openrouterRequest {
+	body := openrouterRequest{
+		Model:       model,
+		Messages:    msgs,
+		MaxTokens:   req.MaxTokens,
+		Temperature: req.Temperature,
+		Stop:        req.Stop,
+		Stream:      stream,
+		Reasoning:   reasoningFor(req),
+	}
+	if stream {
+		body.StreamOptions = &streamOptions{IncludeUsage: true}
+	}
+	if !openRouterModelSupportsReasoning(model) {
+		body.Reasoning = nil
+	}
+	if len(req.Tools) > 0 {
+		rawTools := make([]json.RawMessage, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			data, err := json.Marshal(t)
+			if err == nil {
+				rawTools = append(rawTools, data)
+			}
+		}
+		body.Tools = rawTools
+	}
+	return body
+}
+
+// doChatRequest POSTs a chat-completion payload to the OpenRouter gateway and
+// returns the HTTP response (the caller owns the body). When the payload
+// carried a reasoning control and the gateway rejects it with HTTP 400, the
+// reasoning field is stripped and the request is retried exactly once: some
+// OpenRouter models do not accept the reasoning schema, and OpenRouter bills
+// tokens at the gateway before the stream fails. Stripping reasoning lets the
+// turn complete without reasoning rather than failing the whole request.
+//
+// HTTP 429 (Too Many Requests) responses are handled gracefully with a retry
+// loop before the error is thrown: the Retry-After header is honored when
+// present, otherwise the request is retried with exponential backoff
+// (1s -> 2s -> 4s) up to openRouterMaxRateLimitRetries times. The wait between
+// retries is interruptible by the request context so a cancelled or
+// deadline-exceeded context surfaces promptly instead of sleeping out the full
+// backoff window. Both the non-streaming Execute path and the streaming
+// ExecuteStream path route through this function, so rate-limited free-tier
+// builds recover instead of aborting on the first 429.
+func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body openrouterRequest, stream bool) (*http.Response, error) {
+	attempt := func(b openrouterRequest) (*http.Response, error) {
+		payload, err := json.Marshal(b)
+		if err != nil {
+			return nil, fmt.Errorf("openrouter: marshal: %w", err)
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
+		if err != nil {
+			return nil, fmt.Errorf("openrouter: new request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+key)
+		if stream {
+			httpReq.Header.Set("Accept", "text/event-stream")
+		}
+		httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
+		httpReq.Header.Set("X-OpenRouter-Title", "izen")
+		httpReq.Header.Set("X-OpenRouter-Categories", "agent-runtime")
+		httpReq.Header.Set("X-OpenRouter-Description", "AI amplifies human judgment. Humans remain in control.")
+		return p.client.Do(httpReq)
+	}
+
+	resp, err := attempt(body)
+	if err != nil {
+		return nil, fmt.Errorf("openrouter: do: %w", err)
+	}
+	if resp.StatusCode == http.StatusBadRequest && body.Reasoning != nil {
+		// A non-reasoning model rejected the reasoning schema. Discard the
+		// rejected response, strip the reasoning payload and retry once.
+		_ = resp.Body.Close()
+		body.Reasoning = nil
+		resp, err = attempt(body)
+		if err != nil {
+			return nil, fmt.Errorf("openrouter: do: %w", err)
+		}
+	}
+
+	// Rate-limited (429): retry with backoff instead of aborting the turn.
+	for retries := 0; resp.StatusCode == http.StatusTooManyRequests && retries < openRouterMaxRateLimitRetries; retries++ {
+		delay, ok := retryAfterDelay(resp)
+		if !ok {
+			delay = openRouterRateLimitBackoff(retries)
+		}
+		_ = resp.Body.Close()
+		if !waitRateLimitRetry(ctx, delay) {
+			return nil, fmt.Errorf("openrouter: rate limited (429): retry aborted: %w", ctx.Err())
+		}
+		resp, err = attempt(body)
+		if err != nil {
+			return nil, fmt.Errorf("openrouter: do: %w", err)
+		}
+	}
+	return resp, nil
+}
+
+// retryAfterDelay parses the HTTP Retry-After header from a response into the
+// delay to wait before retrying. Retry-After carries either a number of seconds
+// or an HTTP-date; both forms are honored. ok=false when the header is absent
+// or unparsable, so callers fall back to exponential backoff.
+func retryAfterDelay(resp *http.Response) (time.Duration, bool) {
+	if resp == nil {
+		return 0, false
+	}
+	v := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if v == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d, true
+		}
+		return 0, true
+	}
+	return 0, false
+}
+
+// openRouterRateLimitBackoff returns the exponential backoff delay for the
+// zero-based retry index: 1s for retry 0, 2s for retry 1, 4s for retry 2.
+func openRouterRateLimitBackoff(retry int) time.Duration {
+	if retry < 0 {
+		retry = 0
+	}
+	if retry > 10 {
+		retry = 10
+	}
+	return time.Duration(1<<retry) * openRouterRateLimitBackoffBase
+}
+
+// waitRateLimitRetry blocks for delay, aborting early when ctx is cancelled.
+// It reports false when the context was cancelled before the delay elapsed, so
+// the caller can surface the cancellation instead of sleeping out the backoff.
+func waitRateLimitRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 type openrouterResponse struct {
@@ -424,8 +594,8 @@ type OpenRouterStreamResult struct {
 }
 
 func (r *OpenRouterStreamResult) Usage() (input, output int) {
-	if r.sr != nil && r.sr.finalUsage != nil {
-		return r.sr.finalUsage.PromptTokens, r.sr.finalUsage.CompletionTokens
+	if r.sr != nil {
+		return r.sr.usage.Usage()
 	}
 	return 0, 0
 }
@@ -447,6 +617,11 @@ type openrouterSSEReader struct {
 	reader     *bufio.Reader
 	closed     bool
 	finalUsage *openrouterUsage
+
+	// usage tracks cumulative token accounting: the authoritative provider
+	// usage when a usage chunk arrives, plus a character-count estimate when
+	// the stream is interrupted (context deadline) before that chunk.
+	usage streamUsageTracker
 
 	// finishReason records the terminal finish_reason chunk observed on the
 	// stream ("stop", "length", "tool_calls", ...). It is surfaced to callers
@@ -491,6 +666,9 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.usage.markInterrupted()
+			}
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -517,6 +695,7 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 
 		if chunk.Usage != nil {
 			s.finalUsage = chunk.Usage
+			s.usage.recordUsage(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
 		}
 
 		if len(chunk.Choices) == 0 {
@@ -537,6 +716,7 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 				reasoningText = delta.Reasoning
 			}
 			if reasoningText != "" {
+				s.usage.recordOutput(len(reasoningText))
 				reasoning := []byte(ReasoningSentinel + reasoningText + ReasoningSentinel)
 				n := copy(p, reasoning)
 				if n < len(reasoning) {
@@ -545,6 +725,7 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 				return n, nil
 			}
 			if delta.Content != "" {
+				s.usage.recordOutput(len(delta.Content))
 				content := []byte(delta.Content)
 				n := copy(p, content)
 				if n < len(content) {
@@ -571,6 +752,7 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 					all = append(all, ToolCallSentinel...)
 				}
 				if len(all) > 0 {
+					s.usage.recordOutput(len(all))
 					n := copy(p, all)
 					if n < len(all) {
 						s.pending = all[n:]

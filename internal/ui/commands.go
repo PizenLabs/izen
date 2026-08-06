@@ -943,6 +943,15 @@ const planFirstTokenTimeout = 120 * time.Second
 // while still keeping the hard cap as the overall ceiling.
 const planLocalMaxLatency = 150 * time.Second
 
+// buildGenerationTimeout bounds a single build/patch generation LLM call
+// (the streaming fast-track path or the non-streaming per-task patch path).
+// It is deliberately 5 minutes (300s): SLM fast-track streams must have enough
+// headroom to emit every file mutation as raw code fences without tripping the
+// context deadline mid-output, and OpenRouter free-tier models are routinely
+// queued before the first token. This is the "5-minute fast-track window" that
+// lets a rate-limited small model finish the whole unified build in one turn.
+const buildGenerationTimeout = 5 * time.Minute
+
 // runPlanEngineCmd executes the (potentially slow) PlanEngine ledger synthesis
 // in a background goroutine so the synchronous LLM call never blocks the Bubble
 // Tea event loop. The result is delivered asynchronously as a planResultMsg,
@@ -1751,16 +1760,24 @@ func (m *model) retryBuildWithStrictDirective() tea.Cmd {
 	if targetTask == nil {
 		return nil
 	}
+	// Strategy-aware strict directive: the required output format follows the
+	// target file's on-disk state. Forcing SEARCH/REPLACE on a new/0-byte file
+	// makes small models loop on a missing "old content" anchor and time out.
+	var outputFormat string
+	if data, rerr := os.ReadFile(targetTask.Target); rerr == nil && len(data) > 0 {
+		outputFormat = "- For existing files: ```go:main.go\n  <<<<<<< SEARCH\n  ...\n  =======\n  ...\n  >>>>>>>\n  ```\n"
+	} else {
+		outputFormat = "- For new files: ```<language>\n  <COMPLETE file content>\n  ```\n  (or a FILE: <path> block). Do NOT use SEARCH/REPLACE or unified diff — the file does not exist yet.\n"
+	}
 	strictContent := fmt.Sprintf(
 		"## STRICT BUILD DIRECTIVE — ZERO CONVERSATIONAL TEXT\n\n"+
 			"YOU ARE A CODE GENERATION TOOL. DO NOT OUTPUT ANY TEXT THAT IS NOT A CODE PATCH.\n\n"+
 			"REQUIRED OUTPUT FORMAT (FIRST TOKEN MUST MATCH):\n"+
-			"- For existing files: ```go:path/to/file.go\n  <<<<<<< SEARCH\n  ...\n  =======\n  ...\n  >>>>>>>\n  ```\n"+
-			"- For new files: ```\n  <<<<<<< FILE_CREATE: path/to/newfile.go\n  ...\n  >>>>>>> END_FILE\n  ```\n\n"+
+			outputFormat+
 			"FORBIDDEN OUTPUT:\n"+
 			"- Greetings, acknowledgments, summaries, explanations\n"+
 			"- Questions, clarifications, suggestions\n"+
-			"- Markdown that is not SEARCH/REPLACE or FILE_CREATE\n"+
+			"- Markdown that is not a valid patch or complete file content\n"+
 			"- JSON, YAML, or any structured data format\n\n"+
 			"TASK:\n"+
 			"Step %d: %s\nTarget: %s\nDescription: %s\n\n"+
@@ -2544,6 +2561,8 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 	}
 
 	m.responseBuffer.Reset()
+	m.traceBuffer.Reset()
+	m.traceExpanded = false
 	if m.execEng != nil {
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
 	}
@@ -2552,6 +2571,9 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 	if m.buildLedger == nil {
 		m.buildLedger = ctxpkg.NewTaskLedger()
 	}
+	// A fresh build invocation invalidates any prior fast-track coverage
+	// tracking (Explicit Over Implicit: coverage is per-batch).
+	m.fastTrackTargets = nil
 	if m.toolCallBuffer != nil {
 		m.toolCallBuffer.Reset()
 	}
@@ -2575,23 +2597,17 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 	m.execEng.Patches.SetContextID(m.sess.ContextID)
 
 	// ── Build unified prompt from all task goals ──────────────────
-	// Combine plan goals into a SINGLE unified prompt that instructs
-	// the LLM to use native write_file / apply_patch tools for ALL
-	// file mutations at once. This bypasses the legacy per-task
-	// SEARCH/REPLACE diff parsing entirely.
+	// Combine plan goals into a SINGLE unified prompt. The prompt package owns
+	// the tier adaptation: Mid/Frontier models are told to emit native
+	// write_file / apply_patch tool calls; TierSLM models get a prompt with ALL
+	// JSON tool definitions stripped that enforces plain markdown code blocks
+	// (```lang:path) instead — a small model loops on tool-call JSON syntax, so
+	// it must be steered straight to raw code fences.
 	var goals []string
 	for i, t := range tasks {
 		goals = append(goals, fmt.Sprintf("Task %d [%s]\nTarget file: %s\nDescription: %s", i+1, t.Type, t.Target, t.Description))
 	}
 	m.currentBuildTaskID = 0 // unified session, no single task tracking
-
-	unifiedPrompt := "Execute ALL of the following file operations in a single unified session.\n\n"
-	unifiedPrompt += "Use native write_file (for new files) and apply_patch (for existing files) tools ONLY.\n"
-	unifiedPrompt += "Do NOT output SEARCH/REPLACE blocks, unified diffs, or markdown code blocks.\n"
-	unifiedPrompt += "Do NOT include any conversational text, explanations, or summaries.\n"
-	unifiedPrompt += "Output ONLY native tool calls.\n\n"
-	unifiedPrompt += "## File Operations\n\n"
-	unifiedPrompt += strings.Join(goals, "\n\n---\n\n")
 
 	// ── Build context for each target file ────────────────────────
 	// Include current file contents for existing targets so the LLM
@@ -2618,10 +2634,12 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		}
 	}
 
-	fullPrompt := fileContext.String() + "\n" + unifiedPrompt
+	fullPrompt := prompt.FastTrackPromptForTier(m.promptTier(), fileContext.String(), strings.Join(goals, "\n\n---\n\n"))
 
 	// ── Build system and request ──────────────────────────────────
-	systemPrompt := prompt.ForModeWithUser(m.resolver.Current().String(), m.userName)
+	// The system prompt is tier-adapted: SLM models receive the compact
+	// positive-only contract, Mid/Frontier models the full-context contract.
+	systemPrompt := m.tieredModePrompt(m.resolver.Current().String())
 
 	// Construct messages without repeating the plan JSON ledger
 	// to prevent 7B context drift from the model re-printing its own plan.
@@ -2658,7 +2676,10 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		Stream:    true,
 		System:    systemPrompt,
 		MaxTokens: 8192,
-		Tools:     ai.FileMutationTools(),
+		Tools:     m.fileMutationTools(),
+		// Dynamically resolved reasoning directive (auto effort / tier-aware
+		// SLM CoT caps). Nil when no reasoning control is warranted.
+		Reasoning: m.effortFromTasks(),
 	}
 
 	// ── REAL-TIME SSE STREAMING ──────────────────────────────────────
@@ -2690,7 +2711,7 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			m.streaming = false
 		}()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
 		defer cancel()
 
 		rawStream, err := m.provider.ExecuteStream(ctx, req)
@@ -2708,6 +2729,19 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		var toolCalls []ai.ToolCall
 		var buf strings.Builder
 		readBuf := make([]byte, 4096)
+
+		// usageProvider captures cumulative token usage from the stream reader
+		// (authoritative when a usage chunk arrived, otherwise a character
+		// estimate) so consumed tokens survive a timeout/error path.
+		type usageProvider interface {
+			Usage() (input, output int)
+		}
+		streamUsage := func() (int, int) {
+			if up, ok := rawStream.(usageProvider); ok {
+				return up.Usage()
+			}
+			return 0, 0
+		}
 
 		// ── REASONING TERMINAL EVENT GUARANTEE ───────────────────────────
 		// Whatever way the stream ends (EOF, provider error, truncation), any
@@ -2866,8 +2900,9 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 				break
 			}
 			if err != nil {
+				tokIn, tokOut := streamUsage()
 				select {
-				case streamCh <- streamErrMsg{err: err, content: fullContent.String()}:
+				case streamCh <- streamErrMsg{err: err, content: fullContent.String(), tokenInput: tokIn, tokenOutput: tokOut}:
 				default:
 				}
 				return
@@ -2878,12 +2913,14 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		// Parse whatever was accumulated into patches. Handle truncation
 		// (finish_reason == "length") gracefully by recovering partial
 		// tool calls from the ToolCallBuffer.
+		tokIn, tokOut := streamUsage()
 		var patches []*execution.Patch
 		if len(toolCalls) > 0 {
 			if m.toolCallBuffer != nil {
 				if bufErr := m.toolCallBuffer.BufferAll(toolCalls); bufErr != nil {
+					btokIn, btokOut := streamUsage()
 					select {
-					case streamCh <- buildFailedMsg{Err: fmt.Errorf("fast-track tool call buffer: %w", bufErr)}:
+					case streamCh <- buildFailedMsg{Err: fmt.Errorf("fast-track tool call buffer: %w", bufErr), TokenInput: btokIn, TokenOutput: btokOut}:
 					default:
 					}
 					return
@@ -2918,8 +2955,10 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 
 		select {
 		case streamCh <- buildProposalReadyMsg{
-			Patches: patches,
-			Output:  finalOutput,
+			Patches:     patches,
+			Output:      finalOutput,
+			TokenInput:  tokIn,
+			TokenOutput: tokOut,
 		}:
 		default:
 		}
@@ -3239,21 +3278,23 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		// Build a focused, non-chat patch-generation prompt with full file
 		// context using the appropriate strategy for the file state.
 		strategy := execution.StrategyForOriginal(orig)
-		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		var handoff string
 		switch strategy {
 		case execution.STRATEGY_NEW_FILE:
-			handoff += "\n\nThis is a NEW file that does not exist yet. "
-			handoff += "Output the complete file content inside a markdown code block "
-			handoff += "with the appropriate language tag (e.g. ```css, ```javascript, ```html, ```python, ```go). "
-			handoff += "Do NOT use FILE_CREATE markers, SEARCH/REPLACE, or diffs."
+			if orig == "" {
+				handoff = buildNewFileHandoff(task)
+			} else {
+				handoff = buildStubOverwriteHandoff(task, orig)
+			}
 		default:
+			handoff = ctxpkg.SanitizeBuildHandoff(task, "")
 			handoff += "\n\n### TARGET_FILE_CONTENT\n```\n" + orig + "\n```\n"
 			handoff += "\nModify the above file content to fulfill the task. "
 			handoff += "Output a unified diff (--- a/ ... +++ b/ ...) or a SEARCH/REPLACE block (<<<<<<< SEARCH). "
 			handoff += "Do NOT rewrite the entire file. "
 			handoff += "Return ONLY the SEARCH/REPLACE block or unified diff."
 		}
-		system := prompt.StrategyContract(strategy.SystemPromptKey())
+		system := m.tieredStrategyContract(strategy.SystemPromptKey())
 
 		cloudCfg := gateway.ClassifyCloudProvider(m.cfg.ActiveProviderName())
 		isCloud := cloudCfg.CloudProvider != ""
@@ -3270,10 +3311,11 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			MaxTokens: 2048,
 			Stop:      stop,
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
-			Tools:     ai.FileMutationTools(),
+			Tools:     m.fileMutationTools(),
+			Reasoning: m.effortFromTasks(),
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
 		resp, err := m.provider.Execute(ctx, req)
 		cancel()
 		if err != nil {
@@ -3434,9 +3476,11 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		}
 
 		return hotfixProposalMsg{
-			Task:  task,
-			Patch: patch,
-			Diff:  diffContent,
+			Task:        task,
+			Patch:       patch,
+			Diff:        diffContent,
+			TokenInput:  resp.TokenInput,
+			TokenOutput: resp.TokenOutput,
 		}
 	}
 }
@@ -3541,6 +3585,80 @@ func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
 	}
 }
 
+// buildNewFileHandoff renders a clean handoff for creating a brand-new file.
+// It deliberately does NOT include SanitizeBuildHandoff's unified-diff /
+// SEARCH/REPLACE instructions: a weak model (e.g. gemma-4-26b-a4b) follows
+// the first emphasized format directive and emits a diff against a file that
+// does not exist, producing a (+0 / -0 lines) no-op patch. New-file tasks get
+// a single, unambiguous full-creation contract.
+func buildNewFileHandoff(task *plan.Task) string {
+	if task == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## BUILD HANDOFF — NEW FILE CREATION\n\n")
+	b.WriteString("Execute ONLY the following task. The target file does NOT exist yet — CREATE it.\n")
+	b.WriteString("Do NOT restate the plan, do NOT explain, do NOT list other tasks.\n\n")
+	b.WriteString("### TARGET FILE\n")
+	b.WriteString(task.Target + "\n")
+	if lang := ctxpkg.LanguageFromExtension(task.Target); lang != "" {
+		b.WriteString("### EXPECTED LANGUAGE\n")
+		b.WriteString(lang + "\n")
+	}
+	b.WriteString("### TASK\n")
+	b.WriteString(string(task.Type) + ": " + task.Target)
+	if task.Description != "" {
+		b.WriteString(" — " + task.Description)
+	}
+	b.WriteString("\n\n")
+	b.WriteString("### INSTRUCTION\n")
+	b.WriteString("Output the COMPLETE file content inside a single markdown code block ")
+	b.WriteString("with the appropriate language tag (e.g. ```css, ```javascript, ```html, ```python, ```go). ")
+	b.WriteString("Do NOT use SEARCH/REPLACE blocks (<<<<<<< SEARCH) or unified diffs (--- a/ +++ b/) — the file does not exist yet. ")
+	b.WriteString("Do NOT use FILE_CREATE markers. ")
+	b.WriteString("Output ONLY the code block. No conversational text, no explanations, no greetings.\n\n")
+	fmt.Fprintf(&b, "CURRENT_YEAR: %d\n", time.Now().Year())
+	return strings.TrimSpace(b.String())
+}
+
+// buildStubOverwriteHandoff renders the full-file overwrite handoff for an
+// EXISTING stub file (under SmallFileLineThreshold lines) whose content is
+// passed in context. It demands a COMPLETE, fully-implemented rewrite inside a
+// single markdown code block and forbids SEARCH/REPLACE / unified diff — a
+// small model diffing a stub either fails with "ambiguous snippet without
+// SEARCH/REPLACE markers" or echoes the skeleton back unchanged.
+func buildStubOverwriteHandoff(task *plan.Task, orig string) string {
+	if task == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## BUILD HANDOFF — FULL FILE OVERWRITE\n\n")
+	b.WriteString("Execute ONLY the following task. The target file is an incomplete stub — output its COMPLETE, FULLY IMPLEMENTED content.\n")
+	b.WriteString("Do NOT restate the plan, do NOT explain, do NOT list other tasks.\n\n")
+	b.WriteString("### TARGET FILE\n")
+	b.WriteString(task.Target + "\n")
+	if lang := ctxpkg.LanguageFromExtension(task.Target); lang != "" {
+		b.WriteString("### EXPECTED LANGUAGE\n")
+		b.WriteString(lang + "\n")
+	}
+	b.WriteString("### TASK\n")
+	b.WriteString(string(task.Type) + ": " + task.Target)
+	if task.Description != "" {
+		b.WriteString(" — " + task.Description)
+	}
+	b.WriteString("\n\n")
+	b.WriteString("### CURRENT FILE CONTENT (incomplete skeleton)\n```\n" + orig + "\n```\n\n")
+	b.WriteString("### INSTRUCTION\n")
+	b.WriteString("The current file is an incomplete skeleton. Fully implement and expand all functions, styles, and markup. Do NOT repeat incomplete stubs. ")
+	b.WriteString("Output the COMPLETE, FULLY IMPLEMENTED file content inside a single markdown code block ")
+	b.WriteString("with the appropriate language tag (e.g. ```css, ```javascript, ```html, ```python, ```go). ")
+	b.WriteString("Do NOT use SEARCH/REPLACE blocks (<<<<<<< SEARCH) or unified diffs (--- a/ +++ b/). ")
+	b.WriteString("Do NOT use FILE_CREATE markers. ")
+	b.WriteString("Output ONLY the code block. No conversational text, no explanations, no greetings.\n\n")
+	fmt.Fprintf(&b, "CURRENT_YEAR: %d\n", time.Now().Year())
+	return strings.TrimSpace(b.String())
+}
+
 // proposeBuildPatch generates a patch for a regular FILE_MUTATE / GIT_ACTION
 // build task via the LLM (one non-streaming call) WITHOUT applying it. Instead
 // it returns a buildProposalReadyMsg so the update loop can extract proposals
@@ -3605,28 +3723,31 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 
 		// ── Build the handoff with the current file content ────────────
 		buildHandoff := func(content string) string {
-			h := ctxpkg.SanitizeBuildHandoff(task, "")
 			switch strategy {
 			case execution.STRATEGY_NEW_FILE:
-				h += "\n\nThis is a NEW file that does not exist yet. "
-				h += "Output the complete file content inside a markdown code block "
-				h += "with the appropriate language tag (e.g. ```css, ```javascript, ```html, ```python, ```go). "
-				h += "Do NOT use FILE_CREATE markers, SEARCH/REPLACE blocks, or unified diffs."
-				h += "Generate ONLY the content that belongs in this file.\n"
+				if content == "" {
+					// Clean full-creation contract: no diff instructions at all.
+					return buildNewFileHandoff(task)
+				}
+				// Existing stub (< SmallFileLineThreshold lines): whole-file
+				// overwrite with the skeleton in context so the model expands
+				// it instead of echoing it back.
+				return buildStubOverwriteHandoff(task, content)
 			default:
+				h := ctxpkg.SanitizeBuildHandoff(task, "")
 				h += "\n\n### TARGET_FILE_CONTENT\n```\n" + content + "\n```\n"
 				h += "\nModify the above file content to fulfill the task. "
 				h += "Output a unified diff (--- a/ ... +++ b/ ...) or a SEARCH/REPLACE block (<<<<<<< SEARCH). "
 				h += "Do NOT rewrite the entire file. "
 				h += "Return ONLY the SEARCH/REPLACE block or unified diff. No explanatory text."
+				return h
 			}
-			return h
 		}
 
 		handoff := buildHandoff(orig)
 
-		// Select system prompt based on strategy.
-		system := prompt.StrategyContract(strategy.SystemPromptKey())
+		// Select system prompt based on strategy (tier-adapted).
+		system := m.tieredStrategyContract(strategy.SystemPromptKey())
 
 		cloudCfg := gateway.ClassifyCloudProvider(m.cfg.ActiveProviderName())
 		isCloud := cloudCfg.CloudProvider != ""
@@ -3655,8 +3776,8 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			currentStrategy := strategy
 			if attempt > 0 && orig != "" && execution.IsSmallFile(orig) {
 				currentStrategy = execution.STRATEGY_NEW_FILE
-				handoff += "\n\nCORRECTION: Previous patch attempts failed. Output the COMPLETE new file content inside a single markdown code block. Do NOT use SEARCH/REPLACE or diff format."
-				system = prompt.StrategyContract("new_file")
+				handoff = buildStubOverwriteHandoff(task, orig) + "\n\nCORRECTION: Previous patch attempts failed. Output the COMPLETE new file content inside a single markdown code block. Do NOT use SEARCH/REPLACE or diff format."
+				system = m.tieredStrategyContract("new_file")
 
 				// ── Activity Tree: log retry ───────────────────────────
 				if m.activityTree != nil {
@@ -3680,10 +3801,11 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				MaxTokens: 2048,
 				Stop:      stop,
 				Messages:  []ai.Message{{Role: "user", Content: handoff}},
-				Tools:     ai.FileMutationTools(),
+				Tools:     m.fileMutationTools(),
+				Reasoning: m.effortFromTasks(),
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
 			resp, err := m.provider.Execute(ctx, req)
 			cancel()
 			if err != nil {
@@ -3718,9 +3840,18 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 						m.activeRouteModel(), attempt+1))
 				}
 				if attempt < maxRetries {
-					handoff = fmt.Sprintf(
-						"%s\n\nCORRECTION: Your previous response was empty or unparseable. The expected output is a raw unified diff block like:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n line1\n-line-old\n+line-new\n\nReturn ONLY that diff. No text before or after.",
-						buildHandoff(orig), task.Target, task.Target)
+					// Strategy-aware correction: a new-file task must be told to
+					// emit complete content, never a diff against a non-existent
+					// file (which makes SLMs emit (+0 / -0 lines) no-op patches).
+					correction := ""
+					if currentStrategy == execution.STRATEGY_NEW_FILE {
+						correction = "CORRECTION: Your previous response was empty or unparseable. The target file does not exist yet. Output the COMPLETE file content inside a single markdown code block with the appropriate language tag. Do NOT use SEARCH/REPLACE or unified diff."
+					} else {
+						correction = fmt.Sprintf(
+							"CORRECTION: Your previous response was empty or unparseable. The expected output is a raw unified diff block like:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n line1\n-line-old\n+line-new\n\nReturn ONLY that diff. No text before or after.",
+							task.Target, task.Target)
+					}
+					handoff = buildHandoff(orig) + "\n\n" + correction
 					continue
 				}
 				return buildProposalReadyMsg{Err: fmt.Errorf("patch generation returned empty output")}
@@ -3732,15 +3863,19 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 
 			switch currentStrategy {
 			case execution.STRATEGY_NEW_FILE:
-				// New file: extract from the outermost markdown code block.
-				// Use defensive nested fence stripping for models that double-wrap.
-				if extracted, ok := execution.ExtractRawCodeBlock(rawContent); ok {
-					resolved = execution.SanitizeRawCodeBlock(extracted)
-				} else if extracted, ok := execution.ExtractCodeBlockContent(rawContent); ok {
-					resolved = execution.SanitizeRawCodeBlock(extracted)
-				} else {
-					resolved = execution.SanitizeRawCodeBlock(rawContent)
+				// New/0-byte file: NO diff markers are ever required. The
+				// extractor accepts any path-tagged block (```lang:path,
+				// ```lang path, ```file=path, === FILE:), any fenced code
+				// block, or the raw text as the complete file content — a
+				// new file has no old content to diff against.
+				newContent, newOK := execution.ExtractNewFileContent(rawContent, task.Target)
+				if !newOK {
+					if attempt < maxRetries {
+						continue
+					}
+					return buildProposalReadyMsg{Err: fmt.Errorf("patch generation: no file content extracted for new file %s after %d attempts", task.Target, attempt+1)}
 				}
+				resolved = newContent
 				diffContent = computeUnifiedDiff(task.Target, orig, resolved)
 
 			default:
@@ -3751,23 +3886,21 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				} else {
 					resolved = execution.ResolveModifiedContent(orig, rawContent)
 					if resolved == orig && orig != "" {
-						if attempt == 0 && isCloud {
-							m.push(roleSystem, fmt.Sprintf(
-								warningStyle.Render("[BUILD WARNING] %s failed structural breakdown on attempt %d. "+
-									"The output contained no diff markers (--- a/, +++ b/, @@, <<<<<<< SEARCH). "+
-									"Retrying with explicit diff format demonstration."),
-								m.activeRouteModel(), attempt+1))
+						// ── ZERO-PATCH SHORT-CIRCUIT ─────────────────────
+						// The per-task mutation step produced 0 lines changed
+						// (+0 / -0): the model's output resolves back to the
+						// file's current content. This happens when fast-track
+						// (or an earlier task) already applied the requested
+						// modification. Complete the step gracefully instead of
+						// re-looping the LLM, which would otherwise hang the
+						// "Generating patch..." spinner for up to 3 ×
+						// buildGenerationTimeout (Rule "Human-Centered /
+						// Reversible": a step producing 0 patches MUST never
+						// leave the UI spinner hanging).
+						if m.activityTree != nil {
+							m.activityTree.Append(NewFileMutateEvent(task.Target, 0, 0, 0))
 						}
-						if attempt < maxRetries {
-							handoff = fmt.Sprintf(
-								"%s\n\nCORRECTION: Your previous patch was rejected because it lacked valid diff markers. "+
-									"The expected format for a unified diff is:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n existing context line\n-old-line\n+new-line\n\n"+
-									"Or use SEARCH/REPLACE markers:\n<<<<<<< SEARCH\n<old code>\n=======\n<new code>\n>>>>>>>\n\n"+
-									"Return ONLY one of these formats. No conversational text. No explanations.",
-								buildHandoff(orig), task.Target, task.Target)
-							continue
-						}
-						return buildProposalReadyMsg{Err: fmt.Errorf("patch generation: no valid diff or search/replace block found in LLM output for %s after %d attempts", task.Target, attempt+1)}
+						return mutationResultMsg{file: task.Target, status: "nochange"}
 					}
 					diffContent = computeUnifiedDiff(task.Target, orig, resolved)
 				}
@@ -3833,10 +3966,12 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			}
 
 			return buildProposalReadyMsg{
-				Task:   task,
-				Patch:  patch,
-				Diff:   diffContent,
-				Output: rawContent,
+				Task:        task,
+				Patch:       patch,
+				Diff:        diffContent,
+				Output:      rawContent,
+				TokenInput:  resp.TokenInput,
+				TokenOutput: resp.TokenOutput,
 			}
 		}
 
@@ -3856,13 +3991,14 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				buildHandoff(orig))
 			fullRewriteReq := ai.Request{
 				Model:     m.activeRouteModel(),
-				System:    prompt.StrategyContract("small_fallback"),
+				System:    m.tieredStrategyContract("small_fallback"),
 				Stream:    false,
 				MaxTokens: 4096,
 				Stop:      []string{"```\n\n"},
 				Messages:  []ai.Message{{Role: "user", Content: fullRewriteHandoff}},
+				Reasoning: m.effortFromTasks(),
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
 			fullResp, fullErr := m.provider.Execute(ctx, fullRewriteReq)
 			cancel()
 			if fullErr == nil && fullResp != nil && strings.TrimSpace(fullResp.Content) != "" {
@@ -4142,7 +4278,7 @@ func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
 		handoff += "\n\n### USER REQUEST\n" + task.Description
 		handoff += "\n\nOutput a <<<<<<< FILE_CREATE: " + canonicalTarget + " block with the final content."
 
-		system := prompt.ExistingFileContract()
+		system := m.tieredStrategyContract("existing_file")
 
 		req := ai.Request{
 			Model:     m.activeRouteModel(),
@@ -4150,9 +4286,10 @@ func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
 			Stream:    false,
 			MaxTokens: 2048,
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
+			Reasoning: m.effortFromTasks(),
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
 		resp, err := m.provider.Execute(ctx, req)
 		cancel()
 		if err != nil {
@@ -4503,6 +4640,22 @@ func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 	}
 }
 
+// buildFirstTokenDirective returns the format-forced first-token instruction
+// for a build task, chosen by the target file's on-disk state:
+//
+//   - existing, non-empty file -> a SEARCH/REPLACE block or unified diff
+//   - new or 0-byte file       -> a complete-file markdown code block
+//
+// Forcing a patch format onto a non-existent file makes small models loop on a
+// missing "old content" anchor until the request times out; the new-file
+// branch must always permit full content generation instead.
+func buildFirstTokenDirective(target string) string {
+	if data, err := os.ReadFile(target); err == nil && len(data) > 0 {
+		return "A SEARCH/REPLACE BLOCK (<<<<<<< SEARCH) OR A UNIFIED DIFF (--- a/ ... +++ b/ ...) for the existing file."
+	}
+	return "THE OPENING ``` FENCE OF A COMPLETE-FILE MARKDOWN CODE BLOCK (or a FILE: <path> header) containing the FULL new file content. Do NOT use SEARCH/REPLACE or unified diff — the file does not exist yet."
+}
+
 func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// Transition workflow state to Building before any execution
 	// begins. If the transition fails (e.g. missing plan guards
@@ -4559,14 +4712,19 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	_ = m.sess.Save()
 	m.push(roleStatus, fmt.Sprintf("executing step %d: %s — %s", targetTask.StepNum, targetTask.Type, targetTask.Target))
 
+	// Strategy-aware first-token instruction: never force a SEARCH/REPLACE
+	// patch onto a file that does not exist yet. For new/0-byte targets the
+	// model must emit the complete file content instead — forcing a patch
+	// format on a non-existent file makes small models loop on a missing
+	// "old content" anchor until the request times out.
 	content := fmt.Sprintf(
 		"EXECUTION MODE — implement ONLY this task. "+
 			"ZERO conversational text, ZERO explanations, ZERO greetings, ZERO summaries.\n"+
-			"YOUR FIRST OUTPUT TOKEN MUST BE A SEARCH/REPLACE BLOCK (for existing files) "+
-			"OR A FILE_CREATE BLOCK (for new files).\n"+
+			"YOUR FIRST OUTPUT TOKEN MUST BE %s\n"+
 			"Do NOT output JSON, do NOT restate the plan, do NOT list other tasks.\n"+
 			"Do NOT ask questions, do NOT ask for clarification, do NOT acknowledge.\n\n"+
 			"Step %d: %s\nTarget: %s\nDescription: %s",
+		buildFirstTokenDirective(targetTask.Target),
 		targetTask.StepNum, targetTask.Type, targetTask.Target, targetTask.Description)
 
 	if m.graph != nil {
@@ -4588,6 +4746,9 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 		m.buildLedger = ctxpkg.NewTaskLedger()
 	}
 	m.currentBuildTaskID = targetTask.StepNum
+	// Per-task execution invalidates any prior fast-track coverage state so a
+	// mixed fast-track/per-task session never mis-detects full coverage.
+	m.fastTrackTargets = nil
 	m.execEng.Patches.SetLedger(m.buildLedger)
 	m.execEng.Patches.SetContextID(m.sess.ContextID)
 

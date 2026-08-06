@@ -55,7 +55,7 @@ func DispatchSchema() string {
 
 // TaskBlockSchemaTemplate is the concrete example block for the
 // "- [ ] <TYPE>: <Target> | <Rationale>" output contract.
-const TaskBlockSchemaTemplate = `- [ ] FILE_MUTATE: path/to/file.go | describe the change
+const TaskBlockSchemaTemplate = `- [ ] FILE_MUTATE: index.html | describe the change
 - [ ] SHELL_EXEC: go build ./... | reason for running this command
 - [ ] GIT_ACTION: commit -m "message" | why this commit is needed`
 
@@ -78,6 +78,7 @@ RULES:
   3. Use "|" (pipe) to separate Target from Rationale.
   4. Target paths MUST be relative to the project root.
   5. No speculative paths — only reference files in the directory tree above.
+  6. Use exact workspace-relative file paths (e.g. index.html, styles.css, script.js). Do NOT invent subdirectories like path/to/file/.
 
 Example:
 ` + TaskBlockSchemaTemplate

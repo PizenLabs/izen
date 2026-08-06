@@ -101,6 +101,10 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.startShimmer("Thinking...", "analyze")
 	m.responseBuffer.Reset()
 	m.reasoningBuffer.Reset()
+	m.traceBuffer.Reset()
+	m.traceExpanded = false
+	m.traceWindowStart = 0
+	m.traceWindowAnchored = false
 	m.pendingReasoningFragment = ""
 	if m.thinkingPanel != nil {
 		m.thinkingPanel.Reset()
@@ -304,7 +308,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		}
 
 		if ingestErr != nil {
-			streamCh <- streamErrMsg{err: ingestErr, content: full}
+			// "Explicit Over Implicit": the stream reader accumulates the
+			// provider-reported usage (or a character estimate) even when it
+			// was interrupted — carry it on the error message so the footer
+			// reports consumed tokens instead of a silent 0.
+			streamCh <- streamErrMsg{err: ingestErr, content: full, tokenInput: tokIn, tokenOutput: tokOut}
 			return
 		}
 		streamCh <- streamDoneMsg{

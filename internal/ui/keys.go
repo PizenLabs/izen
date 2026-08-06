@@ -39,11 +39,22 @@ func (m *model) toggleThoughtBlock() bool {
 		m.thinkingBuffer.Toggle()
 	case m.thinkingPanel != nil:
 		m.thinkingPanel.Toggle()
+	case m.traceBuffer.Len() > 0:
+		// "Human-Centered / Reversible": models without a formal reasoning
+		// channel (e.g. Gemma) never feed the ThinkingBuffer, so Ctrl+O used to
+		// do nothing. The raw output trace is captured in traceBuffer instead —
+		// toggle its expanded viewport. The window anchor is released so the
+		// next render re-anchors to the trace tail on expansion.
+		m.traceExpanded = !m.traceExpanded
+		m.traceWindowAnchored = false
 	default:
 		return false
 	}
 	m.refreshViewportContent()
-	if m.Ready && !m.userIsScrollingUp {
+	// While the output-trace viewport is expanded during an active stream,
+	// preserve the user's scroll position: new chunks must never yank the
+	// viewport to the bottom (the Ctrl+O flicker).
+	if m.Ready && !m.userIsScrollingUp && !m.traceExpanded {
 		m.Viewport.GotoBottom()
 	}
 	return true
@@ -217,6 +228,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case msg.Type == tea.KeySpace:
 				m.userIsScrollingUp = false
+				m.traceWindowAnchored = false
 				m.Viewport.GotoBottom()
 				return m, nil
 			}
@@ -244,6 +256,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, vpCmd
 			case msg.Type == tea.KeySpace:
 				m.userIsScrollingUp = false
+				m.traceWindowAnchored = false
 				m.Viewport.GotoBottom()
 				return m, nil
 			}

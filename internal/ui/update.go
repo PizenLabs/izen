@@ -24,6 +24,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/domain/signal"
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
@@ -944,6 +945,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		// ── BUILD PROPOSAL FAILURE ───────────────────────────────────
 		if msg.Err != nil {
+			// Commit any partial provider usage captured before the failure so
+			// consumed tokens are not silently zeroed on a failed build attempt.
+			if msg.TokenInput > 0 || msg.TokenOutput > 0 {
+				m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
+			}
 			m.push(roleError, "patch generation failed: "+msg.Err.Error())
 			tasks := m.sess.CurrentTasks
 			for i := range tasks {
@@ -957,6 +963,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return m, m.flushPendingRecords()
+		}
+
+		// ── TOKEN ACCOUNTING ─────────────────────────────────────────
+		// Commit the provider-reported usage of the build proposal call so the
+		// footer reflects the tokens consumed to produce the proposed patch.
+		if msg.TokenInput > 0 || msg.TokenOutput > 0 {
+			m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
 		}
 
 		// ── Extract proposals from LLM output ───────────────────────
@@ -1043,6 +1056,21 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.pendingProposals = props
 
+		// ── FAST-TRACK TARGET TRACKING ─────────────────────────────
+		// The fast-track producer (Task==nil && Patch==nil) emits a unified
+		// multi-file patch batch covering all plan FILE_MUTATE/GIT_ACTION
+		// targets. Record the covered targets so the apply handlers can
+		// detect full coverage and complete the build without per-task
+		// execution (Rule "Explicit Over Implicit").
+		if msg.Task == nil && msg.Patch == nil && len(props) > 0 {
+			if m.fastTrackTargets == nil {
+				m.fastTrackTargets = make(map[string]bool)
+			}
+			for _, p := range props {
+				m.fastTrackTargets[p.Target.QualifiedName] = true
+			}
+		}
+
 		// ── FREEZE FOR HUMAN APPROVAL ───────────────────────────────
 		m.enterApprovalState()
 		m.awaitingConfirmation = true
@@ -1080,6 +1108,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Patch generation failed: surface the error, abort the hotfix, and
 		// restore the stashed plan so the pipeline returns to PAUSED cleanly.
 		if msg.Err != nil {
+			if msg.TokenInput > 0 || msg.TokenOutput > 0 {
+				m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
+			}
 			m.push(roleError, "[HOTFIX] Patch generation failed: "+msg.Err.Error())
 			m.hotfixActive = false
 			if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
@@ -1090,6 +1121,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return m, m.flushPendingRecords()
+		}
+
+		// ── TOKEN ACCOUNTING ─────────────────────────────────────────
+		// Commit the provider-reported usage of the hotfix patch call.
+		if msg.TokenInput > 0 || msg.TokenOutput > 0 {
+			m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
 		}
 
 		// ── FREEZE AND REQUEST AUTHORIZATION ─────────────────────────
@@ -1170,6 +1207,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					FailureClass: classifier.FailureUnknownClass,
 				})
 			}
+			// "Human-Centered / Reversible": an execution failure must never
+			// trap the user in the build phase. Unwind back to interactive
+			// StateChat so the next prompt routes normally.
+			m.unwindBuildFailure()
 		}
 		if msg.output != "" {
 			for _, line := range strings.Split(msg.output, "\n") {
@@ -1591,6 +1632,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.proposalDiffOffset = 0
 
 		if len(m.pendingProposals) == 0 {
+			// ── RELEASE AGENT/SPINNER STATE ───────────────────────────
+			// A terminal mutation result must always unwind the patching
+			// spinner and restore input focus. This covers the zero-patch
+			// short-circuit (proposeBuildPatch returning mutationResultMsg
+			// directly) which never passes through buildProposalReadyMsg, so
+			// the "Generating patch..." shimmer would otherwise hang forever.
+			m.agentRunning = false
+			m.agentDone = true
+			m.agentLabel = ""
+			m.stopShimmer()
+
 			// ── MARK BUILD TASK COMPLETED / FAILED ─────────────────────
 			// When the proposal flow originates from handleBuildRun
 			// (non-streaming FILE_MUTATE/GIT_ACTION), update the task
@@ -1636,6 +1688,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					thinkingContent = m.thinkingPanel.String()
 				}
 				m.logStore.AddFull(LogEdit, msg.file, true, msg.status, thinkingContent, "")
+				// ── FAST-TRACK EARLY COMPLETION ─────────────────────────
+				// When a fast-track batch covered every plan target and the
+				// last proposal has been applied, per-task execution is
+				// redundant work on already-applied files. Complete the build
+				// loop immediately instead of advancing to "executing step N"
+				// (Rule "Explicit Over Implicit").
+				if m.fastTrackCoversAllPlanTargets() {
+					return m.completeFastTrackBuild()
+				}
 				// ── ADVANCE BUILD QUEUE ────────────────────────────────
 				// After a FILE_MUTATE/GIT_ACTION task completes, check for
 				// the next idle task and execute it.
@@ -1709,6 +1770,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.ti.Focus()
 		m.resolveApprovalState()
 		m.recalcViewportHeight()
+		// ── FAST-TRACK FULL COVERAGE ──────────────────────────────────
+		// When the apply-all batch covered every plan target, drain the
+		// queue deterministically so a subsequent /build never re-executes
+		// tasks the fast-track batch already completed.
+		if m.fastTrackCoversAllPlanTargets() {
+			m.markAllPlanTasksCompleted()
+			m.fastTrackTargets = nil
+		}
 		var testCmd tea.Cmd
 		switch {
 		case applied > 0 && failed == 0:
@@ -1874,7 +1943,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.refreshViewportContent()
 			// Only auto-scroll to bottom if the user hasn't explicitly
 			// scrolled up — respects user-inspect position during streaming.
-			if m.streaming && !m.userIsScrollingUp {
+			// The expanded output-trace viewport (Ctrl+O) also disables
+			// auto-scroll so the inspected lines never jump out from under
+			// the user while chunks stream in.
+			if m.streaming && !m.userIsScrollingUp && !m.traceExpanded {
 				m.Viewport.GotoBottom()
 			}
 		}
@@ -1975,7 +2047,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.ensureStreamBlocks().Append(KindThinking, string(msg))
 		m.refreshViewportContent()
-		if m.Ready && !m.userIsScrollingUp {
+		if m.Ready && !m.userIsScrollingUp && !m.traceExpanded {
 			m.Viewport.GotoBottom()
 		}
 		return m, m.readStream()
@@ -2002,6 +2074,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.stopShimmer()
 		}
 		m.responseBuffer.WriteString(raw)
+		m.traceBuffer.WriteString(raw)
 		if m.streamThrottle != nil {
 			m.streamThrottle.Write(raw)
 		} else {
@@ -2546,6 +2619,23 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleError, "stream error: "+sanitized)
 		}
 
+		// ── TOKEN ACCOUNTING ON FAILURE ────────────────────────────────
+		// Explicit Over Implicit: commit whatever usage the provider reported
+		// (or the character estimate the stream reader produced) before the
+		// stream died, so tokens consumed on a timeout/error are not silently
+		// zeroed in the footer. Publish the typed StreamUsage event so
+		// telemetry projections observe the failed attempt too.
+		if msg.tokenInput > 0 || msg.tokenOutput > 0 {
+			m.commitTokenUsage(msg.tokenInput, msg.tokenOutput)
+			if m.bus != nil {
+				modelName := ""
+				if m.cfg != nil {
+					modelName = m.cfg.ActiveModelName()
+				}
+				m.bus.Publish(events.NewStreamUsage(modelName, msg.tokenInput, msg.tokenOutput, true, msg.err.Error()))
+			}
+		}
+
 		// ALWAYS flush partial stream tokens to the TUI so that tokens
 		// already received on the wire are never discarded when a
 		// mid-stream connection error or unexpected termination occurs.
@@ -2577,6 +2667,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case livePreviewChunkMsg:
 		// Stream content or tool call arguments directly into the
 		// LiveCodePreview for real-time code preview during fast-track builds.
+		if msg.Content != "" {
+			m.traceBuffer.WriteString(msg.Content)
+		}
 		if m.liveCodePreview != nil && msg.Content != "" {
 			label := "live_stream"
 			if msg.IsTool {
@@ -2600,7 +2693,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
+		// "Explicit Over Implicit": report partial usage on the failed fast-track
+		// attempt so consumed tokens are never silently zeroed.
+		if msg.TokenInput > 0 || msg.TokenOutput > 0 {
+			m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
+		}
 		m.push(roleError, "fast-track build failed: "+providers.SanitizeAPIError(msg.Err))
+		// "Human-Centered / Reversible": a failed build stream must never trap
+		// the workflow in the build phase. Unwind the state machine back to
+		// StateChat/interactive so the next prompt routes normally instead of
+		// failing with "transition from build to ask".
+		m.unwindBuildFailure()
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
@@ -2809,6 +2912,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// ── SPACE snap-to-bottom (resets user scroll-lock) ─────────────────
 		if msg.Type == tea.KeySpace && !m.autocompleteActive {
 			m.userIsScrollingUp = false
+			// Re-anchor the expanded output-trace window to the tail so the
+			// user "catches up" to the latest streamed content.
+			m.traceWindowAnchored = false
 			if m.Ready {
 				m.Viewport.GotoBottom()
 			}
