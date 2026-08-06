@@ -29,8 +29,7 @@ direct chat pass and return the model's text answer directly. Code-generation
 prompts are constrained by the resolved capability set (semantic HTML,
 TypeScript, portfolio structure, Go, ...) in the system prompt, and generated
 artifacts pass the capability validation gate before the planner and kernel
-write anything to disk. Rejected output triggers evidence-based retries; the
-legacy v1/v2 direct-write runtime is fully bypassed.
+write anything to disk. Rejected output triggers evidence-based retries.
 
 Flags:
   -dir <path>      Workspace root (default ".")

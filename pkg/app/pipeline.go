@@ -7,7 +7,6 @@
 //
 // Side-effects are dispatched exclusively through the pkg/event bus so a TUI
 // (or the CLI's own terminal observer) can render real-time status updates.
-// The legacy v1/v2 runtime state machine in pkg/runtime is bypassed entirely.
 package app
 
 import (
