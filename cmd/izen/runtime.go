@@ -5,72 +5,70 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/providers"
-	"github.com/PizenLabs/izen/pkg/runtime/engine"
-	"github.com/PizenLabs/izen/pkg/runtime/metrics"
-	"github.com/PizenLabs/izen/pkg/runtime/registry"
-	"github.com/PizenLabs/izen/pkg/runtime/strategy"
-	"github.com/PizenLabs/izen/pkg/runtime/wire"
+	"github.com/PizenLabs/izen/pkg/app"
+	"github.com/PizenLabs/izen/pkg/event"
 )
 
 // runRuntimeUsage describes the `izen run` subcommand.
 const runRuntimeUsage = `Usage: izen run [flags] "<prompt>"
 
-Execute a single prompt through the Izen v1 runtime state machine and print
-the full policy audit trail. Conversational prompts (greetings, small talk,
-identity/memory questions) run via the single-pass DirectChatStrategy and
-return the model's text answer directly. Small scopes (token estimate < 25k,
-dependency fanout < 4) run via DirectGenerationStrategy; larger scopes fall
-back to the iterative ReAct tool loop.
+Execute a single prompt through the Izen V3 Agent Runtime Engine and print the
+full pipeline audit trail. Every prompt is routed strictly through:
+
+  Capability Registry -> Extractor Pipeline -> Artifact IR
+  -> Planner -> ExecutionGraph -> Kernel Engine
+
+Conversational prompts (greetings, small talk, identity questions) run via a
+direct chat pass and return the model's text answer directly. Code-generation
+prompts are constrained by the resolved capability set (semantic HTML,
+TypeScript, portfolio structure, Go, ...) in the system prompt, and generated
+artifacts pass the capability validation gate before the planner and kernel
+write anything to disk. Rejected output triggers evidence-based retries; the
+legacy v1/v2 direct-write runtime is fully bypassed.
 
 Flags:
   -dir <path>      Workspace root (default ".")
   -target <path>   Target file to analyze/modify (repeatable)
 
 Examples:
-  izen run "fix the login bug" -target internal/auth/login.go
+  izen run "redesign the portfolio website"
+  izen run "scaffold a go api server"
   izen run "explain the routing layer"
-  izen run "do you remember me"
 `
 
-// runtimeProviderGenerator adapts an internal/ai provider to the strategy
-// Generator contract used by the built-in execution strategies.
-type runtimeProviderGenerator struct {
+// cliGenerator adapts the configured ai.Provider to the V3 pipeline
+// Generator contract so the pipeline stays free of any provider dependency.
+type cliGenerator struct {
 	provider ai.Provider
 	model    string
-	system   string
 }
 
-// Complete implements strategy.Generator.
-func (g *runtimeProviderGenerator) Complete(ctx context.Context, req strategy.GenerationRequest) (strategy.GenerationResult, error) {
+// Complete implements app.Generator.
+func (g *cliGenerator) Complete(ctx context.Context, system, prompt string, _ int) (string, error) {
 	resp, err := g.provider.Execute(ctx, ai.Request{
-		Model:     g.model,
-		System:    g.system,
-		Messages:  []ai.Message{{Role: "user", Content: req.Prompt}},
-		Stream:    false,
-		MaxTokens: req.MaxTokens,
+		Model:    g.model,
+		System:   system,
+		Messages: []ai.Message{{Role: "user", Content: prompt}},
+		Stream:   false,
 	})
 	if err != nil {
-		return strategy.GenerationResult{}, err
+		return "", err
 	}
 	if resp == nil {
-		return strategy.GenerationResult{}, errors.New("provider returned an empty response")
+		return "", errors.New("provider returned an empty response")
 	}
-	return strategy.GenerationResult{Text: resp.Content, Tokens: resp.TokenOutput}, nil
+	return resp.Content, nil
 }
 
-// runRuntimeCommand implements `izen run`: it builds the v1 runtime from the
-// shared wire composition, routes the prompt through engine.Run and prints
-// the policy decision audit trail, the terminal state and the emitted
-// metrics.
+// runRuntimeCommand implements `izen run`: it builds the V3 pipeline from the
+// shared configuration, routes the prompt through app.Pipeline.Run and prints
+// the capability, extraction, validation, planning and execution audit trail.
 func runRuntimeCommand(args []string) error {
 	dir := "."
 	var targets []string
@@ -115,79 +113,86 @@ func runRuntimeCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "izen: runtime provider=%s model=%s root=%s\n", provider.Name(), model, dir)
+	fmt.Fprintf(os.Stderr, "izen: v3 engine provider=%s model=%s root=%s\n", provider.Name(), model, dir)
 
-	gen := &runtimeProviderGenerator{
-		provider: provider,
-		model:    model,
-		system:   "You are the Izen coding engine. Follow the instructions and produce exactly the requested output.",
-	}
-	stdout := metrics.NewStdoutSink()
-
-	eng, err := wire.NewEngine(wire.Config{
-		Root:        dir,
-		Generator:   gen,
-		Tools:       shellToolRunner{root: dir},
-		Providers:   []string{provider.Name()},
-		MetricsSink: stdout,
-		Validators:  []registry.Validator{registry.GofmtValidator{Root: dir}},
-	})
+	pipeline, err := app.NewPipeline(
+		app.WithRoot(dir),
+		app.WithGenerator(&cliGenerator{provider: provider, model: model}),
+	)
 	if err != nil {
-		return fmt.Errorf("izen run: wire runtime: %w", err)
+		return fmt.Errorf("izen run: build v3 pipeline: %w", err)
 	}
+
+	// Attach a terminal status observer rendering kernel task and pipeline
+	// stage updates on stderr as they happen. A TUI subscribes with the same
+	// event.EventBus contract.
+	unsub := pipeline.Bus().Subscribe(nil, func(e event.Event) {
+		fmt.Fprintln(os.Stderr, app.StatusLine(e))
+	})
+	defer unsub()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	res, runErr := eng.Run(ctx, engine.Request{
-		ID:      "cli-" + time.Now().UTC().Format("20060102T150405"),
-		Mode:    "run",
-		Input:   prompt,
-		Targets: targets,
-	})
+	res, runErr := pipeline.Run(ctx, app.Request{Intent: prompt, Targets: targets})
 
 	fmt.Println()
-	fmt.Println("── Policy audit trail ──────────────────────────────────────")
-	if res != nil && res.Decision != nil {
-		for _, line := range res.Decision.Summary() {
-			fmt.Println(line)
-		}
-	} else {
-		fmt.Println("policy: (no decision produced)")
-	}
-	if res != nil && res.Plan != nil {
-		fmt.Println("plan:", res.Plan.Reason)
-		fmt.Printf("plan: strategy=%s require_test=%v rollback=%v\n",
-			res.Plan.Strategy, res.Plan.RequireTest, res.Plan.RollbackEnabled)
-	}
-
-	fmt.Println("── Execution result ───────────────────────────────────────")
+	fmt.Println("── V3 pipeline audit trail ───────────────────────────────")
 	if res != nil {
-		fmt.Printf("run_id=%s state=%s recovered=%v\n", res.RunID, res.State, res.Recovered)
-		if res.Execution != nil {
-			fmt.Printf("strategy status=%s outputs=%d tokens=%d\n",
-				res.Execution.Status, len(res.Execution.Outputs), res.Execution.Tokens)
-			for _, out := range res.Execution.Outputs {
-				fmt.Println("  wrote:", out)
+		if res.Mode != "" {
+			fmt.Printf("mode: %s\n", res.Mode)
+		}
+		if len(res.Capabilities) > 0 {
+			ids := make([]string, 0, len(res.Capabilities))
+			for _, c := range res.Capabilities {
+				ids = append(ids, string(c.ID()))
 			}
-			if res.Execution.Text != "" {
-				fmt.Println("answer:")
-				fmt.Println(res.Execution.Text)
-			}
+			fmt.Printf("capabilities: %s\n", strings.Join(ids, ", "))
 		}
-		if res.Validation != nil {
-			fmt.Printf("validation ok=%v reports=%d\n", res.Validation.OK, len(res.Validation.Reports))
+		if res.ExtractionAttempts > 0 {
+			fmt.Printf("extraction_attempts: %d  repair_rounds: %d\n", res.ExtractionAttempts, res.RepairRounds)
 		}
-		if res.Err != nil {
-			fmt.Println("error:", res.Err)
-		}
-	}
 
-	fmt.Println("── Metrics ────────────────────────────────────────────────")
-	if res != nil {
-		for _, m := range res.Metrics {
-			fmt.Println(metrics.FormatLine(m))
+		if res.Answer != "" {
+			fmt.Println()
+			fmt.Println("answer:")
+			fmt.Println(res.Answer)
 		}
+
+		if len(res.Artifacts) > 0 {
+			fmt.Printf("artifacts: %d\n", len(res.Artifacts))
+			for _, a := range res.Artifacts {
+				fmt.Printf("  %s (%d bytes)\n", a.Path, len(a.Content))
+			}
+			for _, v := range res.Validations {
+				status := "PASS"
+				if !v.Passed {
+					status = "REJECT"
+				}
+				fmt.Printf("  [%s] %s\n", status, v.Artifact.Path)
+				for _, reason := range v.Reasons {
+					fmt.Printf("      - %s\n", reason)
+				}
+			}
+		}
+
+		if res.Plan != nil {
+			fmt.Printf("planner: %s strategy=%s node_count=%s\n",
+				res.Plan.Metadata["planner"], res.Plan.Metadata["strategy"], res.Plan.Metadata["node_count"])
+		}
+
+		var started, completed, failed int
+		for _, e := range res.Events {
+			switch e.Type {
+			case event.TypeTaskStarted:
+				started++
+			case event.TypeTaskCompleted:
+				completed++
+			case event.TypeTaskFailed:
+				failed++
+			}
+		}
+		fmt.Printf("events: task_started=%d task_completed=%d task_failed=%d\n", started, completed, failed)
 	}
 
 	if runErr != nil {
@@ -227,64 +232,5 @@ func buildActiveProvider(cfg *config.Config) (ai.Provider, string, error) {
 		return providers.NewNineRouterProvider(provCfg.APIKey, model, provCfg.BaseURL), model, nil
 	default:
 		return nil, "", fmt.Errorf("izen run: unsupported provider %q", name)
-	}
-}
-
-// shellToolRunner executes the iterative strategy's ReAct tool calls:
-// write_file, read_file and run (via the shell). All paths are resolved
-// against the workspace root.
-type shellToolRunner struct {
-	root string
-}
-
-// Run implements strategy.ToolRunner.
-func (r shellToolRunner) Run(ctx context.Context, tool string, args map[string]string) (string, error) {
-	switch tool {
-	case "write_file":
-		path, content := args["path"], args["content"]
-		if path == "" {
-			return "", errors.New("write_file requires a path argument")
-		}
-		full := path
-		if !filepath.IsAbs(full) {
-			full = filepath.Join(r.root, full)
-		}
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			return "", err
-		}
-		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
-			return "", err
-		}
-		return "wrote " + path + " (" + strconv.Itoa(len(content)) + " bytes)", nil
-	case "read_file":
-		path := args["path"]
-		if path == "" {
-			return "", errors.New("read_file requires a path argument")
-		}
-		full := path
-		if !filepath.IsAbs(full) {
-			full = filepath.Join(r.root, full)
-		}
-		data, err := os.ReadFile(full)
-		if err != nil {
-			return "", err
-		}
-		return string(data), nil
-	case "run":
-		command := args["command"]
-		if command == "" {
-			return "", errors.New("run requires a command argument")
-		}
-		tctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(tctx, "sh", "-c", command)
-		cmd.Dir = r.root
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			return string(out), fmt.Errorf("command failed: %w: %s", err, out)
-		}
-		return string(out), nil
-	default:
-		return "", fmt.Errorf("unknown tool %q", tool)
 	}
 }

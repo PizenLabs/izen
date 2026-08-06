@@ -3,6 +3,12 @@
 // built-in strategies into a fully-wired engine. The CLI entrypoint and the
 // integration tests share this single wiring path so the runtime always
 // behaves identically.
+//
+// Deprecated: the v1/v2 runtime state machine is superseded by the V3 Agent
+// Runtime Engine (pkg/app, pkg/kernel, pkg/planner). The CLI routes every
+// prompt exclusively through pkg/app; this package is retained only for
+// reference and historical integration tests and performs direct, unvalidated
+// disk writes that the V3 capability-validation gate exists to prevent.
 package wire
 
 import (

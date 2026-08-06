@@ -14,6 +14,8 @@ import (
 	"github.com/PizenLabs/izen/pkg/runtime/metrics"
 	"github.com/PizenLabs/izen/pkg/runtime/registry"
 	"github.com/PizenLabs/izen/pkg/runtime/strategy"
+
+	//nolint:staticcheck // retained historical v2 integration harness
 	"github.com/PizenLabs/izen/pkg/runtime/wire"
 )
 
