@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/PizenLabs/izen/internal/domain/policy"
 	"github.com/PizenLabs/izen/pkg/engine/layer1"
 )
 
@@ -152,5 +153,70 @@ func TestPolicyGuardValidationMode(t *testing.T) {
 	}
 	if m := NewPolicyGuard(fakeCaps{caps: map[layer1.Capability]bool{layer1.CapLint: true}}).ValidationMode(); m != ValidationStructural {
 		t.Errorf("lint-only caps mode = %v, want structural", m)
+	}
+}
+
+// policyStubGraph is a controllable CapabilityGraph used to prove the guard
+// delegates the permission question to the bound PolicyEngine.
+type policyStubGraph struct {
+	mutate map[string]bool
+}
+
+func (g *policyStubGraph) Supports(cap string) bool { return false }
+
+func (g *policyStubGraph) Resolve(cap string) (string, bool) { return "", false }
+
+func (g *policyStubGraph) CanMutateFile(path string) bool {
+	return g.mutate != nil && g.mutate[path]
+}
+
+func (g *policyStubGraph) CanExecuteCommand(cmd string) bool { return false }
+
+// TestPolicyGuardAuthorize_DelegatesToPolicyEngine proves the guard forwards
+// the permission question to the bound PolicyEngine.
+func TestPolicyGuardAuthorize_DelegatesToPolicyEngine(t *testing.T) {
+	ctx := policy.PolicyContext{ActiveMode: "ask"}
+
+	// Nil engine: unconditional ALLOW (backward compatible).
+	g := NewPolicyGuard(nil)
+	if v := g.Authorize(Request{Intent: IntentRename, TargetFile: "a.go"}, ctx); !v.IsAllowed() {
+		t.Errorf("nil engine Authorize = %s, want ALLOW", v.Allowed)
+	}
+
+	// Bound engine: ask-mode file write is DENIED.
+	g.WithPolicyEngine(policy.NewPolicyEngine(&policyStubGraph{
+		mutate: map[string]bool{"a.go": true},
+	}))
+	v := g.Authorize(Request{Intent: IntentFormat, TargetFile: "a.go"}, ctx)
+	if v.Allowed != policy.VerdictDeny {
+		t.Errorf("ask-mode Authorize = %s, want DENY", v.Allowed)
+	}
+
+	// Build mode with an in-scope target: ALLOW.
+	buildCtx := policy.PolicyContext{ActiveMode: "build"}
+	v = g.Authorize(Request{Intent: IntentFormat, TargetFile: "a.go"}, buildCtx)
+	if v.Allowed != policy.VerdictAllow {
+		t.Errorf("build-mode Authorize = %s, want ALLOW (%s)", v.Allowed, v.Reason)
+	}
+
+	// Out-of-scope target in build mode: DENY (required capability missing).
+	v = g.Authorize(Request{Intent: IntentRefactor, Description: "x", TargetFile: "b.go"}, buildCtx)
+	if v.Allowed != policy.VerdictDeny {
+		t.Errorf("out-of-scope Authorize = %s, want DENY", v.Allowed)
+	}
+}
+
+// TestPolicyGuard_WithPolicyEngine proves the chainable binding.
+func TestPolicyGuard_WithPolicyEngine(t *testing.T) {
+	g := NewPolicyGuard(nil)
+	if g.PolicyEngine() != nil {
+		t.Fatal("expected nil PolicyEngine before binding")
+	}
+	pe := policy.NewPolicyEngine(&policyStubGraph{})
+	if g.WithPolicyEngine(pe) != g {
+		t.Fatal("WithPolicyEngine must be chainable")
+	}
+	if g.PolicyEngine() != pe {
+		t.Fatal("expected the bound PolicyEngine")
 	}
 }

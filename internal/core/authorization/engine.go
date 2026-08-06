@@ -8,6 +8,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/core/workflow"
+	"github.com/PizenLabs/izen/internal/domain/policy"
 )
 
 type SourceHashVerifier interface {
@@ -24,6 +25,7 @@ type AuthorizationEngine struct {
 	checkpoint CheckpointChecker
 	lifecycle  *artifact.LifecycleTransitionValidator
 	getState   func() workflow.WorkflowState
+	policy     *policy.PolicyEngine
 }
 
 func NewAuthorizationEngine(
@@ -37,6 +39,51 @@ func NewAuthorizationEngine(
 		lifecycle:  artifact.NewLifecycleTransitionValidator(),
 		getState:   getState,
 	}
+}
+
+// WithPolicyEngine binds the unified PolicyEngine. Every mutation that passes
+// the operational gates (lifecycle, scope, freshness, budget, checkpoint) is
+// additionally adjudicated by the PolicyEngine — the single owner of the "is
+// this action permitted?" question. A nil engine leaves the historical
+// behavior unchanged.
+func (e *AuthorizationEngine) WithPolicyEngine(p *policy.PolicyEngine) *AuthorizationEngine {
+	e.policy = p
+	return e
+}
+
+// PolicyEngine returns the bound PolicyEngine, or nil when none is wired.
+func (e *AuthorizationEngine) PolicyEngine() *policy.PolicyEngine { return e.policy }
+
+// delegatePolicy consults the unified PolicyEngine for every mutation target.
+// A DENY verdict maps to StepPolicy; a REQUIRE_APPROVAL verdict without human
+// approval maps to StepArtifactApproval. A nil engine is a no-op.
+func (e *AuthorizationEngine) delegatePolicy(
+	targetFiles []string,
+	b *budget.MutationBudget,
+	humanApproved bool,
+) error {
+	if e.policy == nil {
+		return nil
+	}
+	var remainingTokens int
+	if b != nil {
+		remainingTokens = b.RemainingTokens()
+	}
+	ctx := policy.PolicyContext{
+		ActiveMode:      "build",
+		RemainingTokens: remainingTokens,
+		IsHumanApproved: humanApproved,
+	}
+	for _, path := range targetFiles {
+		v := e.policy.Evaluate(policy.Action{Kind: policy.ActionFileWrite, Target: path}, ctx)
+		switch {
+		case v.Allowed == policy.VerdictDeny:
+			return &AuthorizationDenied{Step: StepPolicy, Message: v.Reason}
+		case v.RequiresApproval() && !humanApproved:
+			return &AuthorizationDenied{Step: StepArtifactApproval, Message: v.Reason}
+		}
+	}
+	return nil
 }
 
 func (e *AuthorizationEngine) Evaluate(
@@ -155,6 +202,13 @@ func (e *AuthorizationEngine) Evaluate(
 		}
 	}
 
+	// Unified PolicyEngine: the single owner of the permission question. Every
+	// mutation that passed the operational gates above is still adjudicated by
+	// the bound PolicyEngine, which re-checks mode, capability and risk policy.
+	if err := e.delegatePolicy(proposal.TargetFiles, b, humanApproved); err != nil {
+		return nil, err
+	}
+
 	// Multi-step plans get non-single-use authorization so steps 1..N
 	// can all pass through the guardrail. The budget's mutation counter
 	// enforces the actual cap — no risk of runaway execution.
@@ -235,6 +289,11 @@ func (e *AuthorizationEngine) AuthorizeBuild(
 			Step:    StepCheckpointVerification,
 			Message: fmt.Sprintf("cannot retrieve checkpoint: %s", err),
 		}
+	}
+
+	// Unified PolicyEngine consultation for the build execution path.
+	if err := e.delegatePolicy(targetFiles, mutBudget, humanApproved); err != nil {
+		return nil, err
 	}
 
 	// Multi-step plans get non-single-use authorization.

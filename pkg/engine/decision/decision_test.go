@@ -3,9 +3,11 @@ package decision
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/domain/policy"
 	"github.com/PizenLabs/izen/pkg/engine/ir"
 )
 
@@ -508,5 +510,113 @@ func TestRetryBudgetImplementsContract(t *testing.T) {
 	none := RetryBudget{}
 	if none.ShouldRetry(0, nil) {
 		t.Error("zero-value budget must not allow retries")
+	}
+}
+
+// ── CanExecute delegation to the unified PolicyEngine ─────────────────────
+
+// policyStubGraph is a controllable CapabilityGraph for decision tests.
+type policyStubGraph struct {
+	mutate map[string]bool
+	tools  []string
+}
+
+func (g *policyStubGraph) Supports(cap string) bool { return false }
+
+func (g *policyStubGraph) Resolve(cap string) (string, bool) { return "", false }
+
+func (g *policyStubGraph) CanMutateFile(path string) bool {
+	return g.mutate != nil && g.mutate[path]
+}
+
+func (g *policyStubGraph) CanExecuteCommand(cmd string) bool {
+	lower := strings.ToLower(strings.TrimSpace(cmd))
+	for _, prefix := range g.tools {
+		if strings.HasPrefix(lower, strings.ToLower(prefix)) {
+			return true
+		}
+	}
+	return false
+}
+
+// recordingPolicyEvaluator records every Evaluate invocation so tests can
+// prove CanExecute delegates to the injected PolicyEngine.
+type recordingPolicyEvaluator struct {
+	calls   int
+	verdict policy.Verdict
+}
+
+func (p *recordingPolicyEvaluator) Evaluate(_ policy.Action, _ policy.PolicyContext) policy.Verdict {
+	p.calls++
+	return p.verdict
+}
+
+// TestCanExecuteWithoutPolicyPermitsEverything proves the backward-compatible
+// default: no injected PolicyEngine means every action is permitted.
+func TestCanExecuteWithoutPolicyPermitsEverything(t *testing.T) {
+	eng := NewStandardDecisionEngine()
+	ctx := policy.PolicyContext{ActiveMode: "ask"}
+	if !eng.CanExecute(policy.Action{Kind: policy.ActionShellExec, Target: "rm -rf /"}, ctx) {
+		t.Error("no policy engine must permit every action")
+	}
+	if eng.PolicyEngine() != nil {
+		t.Error("PolicyEngine() must be nil when not injected")
+	}
+}
+
+// TestCanExecuteDelegatesToInjectedPolicy proves CanExecute routes the
+// permission question through the injected PolicyEngine.
+func TestCanExecuteDelegatesToInjectedPolicy(t *testing.T) {
+	rp := &recordingPolicyEvaluator{verdict: policy.Verdict{Allowed: policy.VerdictDeny}}
+	eng := NewStandardDecisionEngine(WithPolicy(rp))
+	ctx := policy.PolicyContext{ActiveMode: "build"}
+
+	if eng.CanExecute(policy.Action{Kind: policy.ActionFileWrite, Target: "main.go"}, ctx) {
+		t.Error("DENY verdict must veto the action")
+	}
+	if rp.calls != 1 {
+		t.Fatalf("Evaluate calls = %d, want exactly 1", rp.calls)
+	}
+
+	rp.verdict = policy.Verdict{Allowed: policy.VerdictAllow}
+	if !eng.CanExecute(policy.Action{Kind: policy.ActionFileWrite, Target: "main.go"}, ctx) {
+		t.Error("ALLOW verdict must permit the action")
+	}
+	if rp.calls != 2 {
+		t.Fatalf("Evaluate calls = %d, want exactly 2", rp.calls)
+	}
+}
+
+// TestCanExecuteWithPolicyEngineRules exercises the real PolicyEngine through
+// the Decision Engine: ask-mode mutations and missing tools are vetoed, while
+// in-scope build-mode mutations pass.
+func TestCanExecuteWithPolicyEngineRules(t *testing.T) {
+	pe := policy.NewPolicyEngine(&policyStubGraph{
+		mutate: map[string]bool{"main.go": true},
+		tools:  []string{"go test"},
+	})
+	eng := NewStandardDecisionEngine(WithPolicy(pe))
+
+	if eng.PolicyEngine() != pe {
+		t.Error("PolicyEngine() must return the injected evaluator")
+	}
+
+	askCtx := policy.PolicyContext{ActiveMode: "ask"}
+	if eng.CanExecute(policy.Action{Kind: policy.ActionFileWrite, Target: "main.go"}, askCtx) {
+		t.Error("ask-mode write must be denied")
+	}
+
+	buildCtx := policy.PolicyContext{ActiveMode: "build"}
+	if !eng.CanExecute(policy.Action{Kind: policy.ActionFileWrite, Target: "main.go"}, buildCtx) {
+		t.Error("build-mode in-scope write must be allowed")
+	}
+	if eng.CanExecute(policy.Action{Kind: policy.ActionFileWrite, Target: "secret.env"}, buildCtx) {
+		t.Error("out-of-scope write must be denied")
+	}
+	if eng.CanExecute(policy.Action{Kind: policy.ActionShellExec, Target: "rm -rf /"}, buildCtx) {
+		t.Error("shell command missing from the tool set must be denied")
+	}
+	if !eng.CanExecute(policy.Action{Kind: policy.ActionShellExec, Target: "go test ./..."}, buildCtx) {
+		t.Error("shell command covered by a resolved tool must be allowed")
 	}
 }

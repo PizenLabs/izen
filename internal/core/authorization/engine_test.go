@@ -12,6 +12,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/core/workflow"
+	"github.com/PizenLabs/izen/internal/domain/policy"
 )
 
 type mockSourceVerifier struct {
@@ -1075,5 +1076,118 @@ func BenchmarkEvaluate_Step1Denied(b *testing.B) {
 			defaultProposal(), plan, nil,
 			defaultCapSet(), defaultBudget(), nil, false, true,
 		)
+	}
+}
+
+// policyStubGraph is a controllable CapabilityGraph bound to the
+// AuthorizationEngine's PolicyEngine in tests. It models physical facts only.
+type policyStubGraph struct {
+	mutate map[string]bool
+	tools  []string
+}
+
+func (g *policyStubGraph) Supports(cap string) bool { return false }
+
+func (g *policyStubGraph) Resolve(cap string) (string, bool) { return "", false }
+
+func (g *policyStubGraph) CanMutateFile(path string) bool {
+	return g.mutate != nil && g.mutate[path]
+}
+
+func (g *policyStubGraph) CanExecuteCommand(cmd string) bool {
+	for _, prefix := range g.tools {
+		if strings.HasPrefix(cmd, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestEvaluate_DelegatesToPolicyEngine proves the permission question is
+// delegated to the unified PolicyEngine: the runtime CapabilitySet covers
+// main.go, but the PolicyEngine's bound graph does not, so the mutation is
+// denied with StepPolicy.
+func TestEvaluate_DelegatesToPolicyEngine(t *testing.T) {
+	eng := NewAuthorizationEngine(
+		&mockSourceVerifier{},
+		&mockCheckpointChecker{hasCheckpoint: true, latestRef: "cp1"},
+		func() workflow.WorkflowState { return workflow.StateBuilding },
+	)
+	eng.WithPolicyEngine(policy.NewPolicyEngine(&policyStubGraph{
+		mutate: map[string]bool{"other.go": true},
+	}))
+	plan := newPlan(t, artifact.StateAuthorized)
+	_, err := eng.Evaluate(
+		defaultProposal(), plan, nil,
+		defaultCapSet(), defaultBudget(), nil, false, true,
+	)
+	var denied *AuthorizationDenied
+	if !errors.As(err, &denied) || denied.Step != StepPolicy {
+		t.Errorf("expected StepPolicy denial from delegated PolicyEngine, got %v", err)
+	}
+}
+
+// TestEvaluate_PolicyEngineAllowsInScope proves a bound PolicyEngine whose
+// graph covers the target does not interfere with an otherwise authorized
+// mutation.
+func TestEvaluate_PolicyEngineAllowsInScope(t *testing.T) {
+	eng := NewAuthorizationEngine(
+		&mockSourceVerifier{},
+		&mockCheckpointChecker{hasCheckpoint: true, latestRef: "cp1"},
+		func() workflow.WorkflowState { return workflow.StateBuilding },
+	)
+	eng.WithPolicyEngine(policy.NewPolicyEngine(&policyStubGraph{
+		mutate: map[string]bool{"main.go": true},
+	}))
+	plan := newPlan(t, artifact.StateAuthorized)
+	auth, err := eng.Evaluate(
+		defaultProposal(), plan, nil,
+		defaultCapSet(), defaultBudget(), nil, false, true,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if auth == nil {
+		t.Fatal("expected non-nil authorization")
+	}
+}
+
+// TestAuthorizeBuild_DelegatesToPolicyEngine proves the build execution path
+// also routes through the bound PolicyEngine.
+func TestAuthorizeBuild_DelegatesToPolicyEngine(t *testing.T) {
+	eng := NewAuthorizationEngine(
+		&mockSourceVerifier{},
+		&mockCheckpointChecker{hasCheckpoint: true, latestRef: "cp1"},
+		func() workflow.WorkflowState { return workflow.StateBuilding },
+	)
+	eng.WithPolicyEngine(policy.NewPolicyEngine(&policyStubGraph{
+		mutate: map[string]bool{"other.go": true},
+	}))
+	_, err := eng.AuthorizeBuild(
+		[]string{"main.go"},
+		defaultCapSet(), defaultBudget(), nil, false, true,
+	)
+	var denied *AuthorizationDenied
+	if !errors.As(err, &denied) || denied.Step != StepPolicy {
+		t.Errorf("expected StepPolicy denial from delegated PolicyEngine, got %v", err)
+	}
+}
+
+// TestAuthorizationEngine_WithPolicyEngine proves the chainable binding.
+func TestAuthorizationEngine_WithPolicyEngine(t *testing.T) {
+	eng := NewAuthorizationEngine(
+		&mockSourceVerifier{},
+		&mockCheckpointChecker{},
+		func() workflow.WorkflowState { return workflow.StateBuilding },
+	)
+	if eng.PolicyEngine() != nil {
+		t.Fatal("expected nil PolicyEngine before binding")
+	}
+	pe := policy.NewPolicyEngine(&policyStubGraph{})
+	if eng.WithPolicyEngine(pe) != eng {
+		t.Fatal("WithPolicyEngine must be chainable")
+	}
+	if eng.PolicyEngine() != pe {
+		t.Fatal("expected the bound PolicyEngine")
 	}
 }

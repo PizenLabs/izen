@@ -52,6 +52,12 @@ func TestWireBuildsFullyFunctionalEventWiredApplication(t *testing.T) {
 	if app.Auth == nil {
 		t.Error("authorization engine not wired")
 	}
+	if app.Policy == nil {
+		t.Error("policy engine not wired")
+	}
+	if app.Auth.PolicyEngine() != app.Policy {
+		t.Error("authorization engine is not wired to the composed policy engine")
+	}
 	if app.Orchestrator == nil {
 		t.Error("orchestrator not wired")
 	}

@@ -28,6 +28,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/capability"
 	coreRuntime "github.com/PizenLabs/izen/internal/core/runtime"
 	coreWorkflow "github.com/PizenLabs/izen/internal/core/workflow"
+	"github.com/PizenLabs/izen/internal/domain/policy"
 	"github.com/PizenLabs/izen/internal/domain/ports"
 	"github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/events"
@@ -136,6 +137,7 @@ type Application struct {
 	Caps           *capability.CapabilitySet
 	Budget         *budget.MutationBudget
 	MicroBudget    *budget.MicroBudget
+	Policy         *policy.PolicyEngine
 	Artifacts      *artifact.Store
 	SnapCache      *wssnapshot.SnapshotCache
 	CapRegistry    *wscap.ArchetypeCapabilityRegistry
@@ -451,8 +453,11 @@ func Wire(opts ...Option) (*Application, error) {
 	// system prompt so the model is told exactly which toolchain commands
 	// exist (and which do not), eliminating tech-stack hallucinations. The
 	// detection is a single cheap directory scan; a failure simply leaves the
-	// header empty and the composed prompts unchanged.
+	// header empty and the composed prompts unchanged. The detected graph is
+	// kept for the PolicyEngine's physical-facts surface below.
+	var wsGraph *layer1.Graph
 	if g, derr := layer1.Detect(root); derr == nil {
+		wsGraph = g
 		prompt.SetWorkspaceCapabilities(pipeline.CapabilityHeader(g))
 	}
 
@@ -557,10 +562,13 @@ func Wire(opts ...Option) (*Application, error) {
 
 	// ── AUTHORIZATION ENGINE ───────────────────────────────────────────────
 	// Production AuthorizationEngine wired with a no-op source hash verifier
-	// and a checkpoint checker that inspects .izen/checkpoints/ on disk.
+	// and a checkpoint checker that inspects .izen/checkpoints/ on disk. The
+	// unified PolicyEngine is bound to it, so every mutation that passes the
+	// operational gates is still adjudicated by the single governance owner.
+	a.Policy = policy.NewPolicyEngine(composedCapabilityGraph{ws: wsGraph, caps: a.Caps})
 	a.Auth = authorization.NewProductionAuthorizationEngine(root, func() coreWorkflow.WorkflowState {
 		return a.WorkflowSM.State()
-	})
+	}).WithPolicyEngine(a.Policy)
 
 	a.Microkernel = plan.NewMicrokernelPlanner(root)
 	a.IntentCompiler = plan.NewIntentCompilerPlanner(root)
@@ -657,4 +665,40 @@ func pipelineClient(p ai.Provider) *pipeline.FuncClient {
 		}
 		return resp.Content, layer3.TokenUsage{Input: resp.TokenInput, Output: resp.TokenOutput}, nil
 	})
+}
+
+// composedCapabilityGraph is the PolicyEngine's physical-facts surface: the
+// Workspace Capability Graph (layer1) provides the tool capabilities, the
+// runtime CapabilitySet provides the mutation/execute scope. It answers ONLY
+// "what does the system possess?" — it carries zero Allow/Deny or mode
+// vocabulary. The PolicyEngine derives every governance verdict from it.
+type composedCapabilityGraph struct {
+	ws   *layer1.Graph
+	caps *capability.CapabilitySet
+}
+
+// Supports reports whether the detected workspace exposes the named tool
+// capability (build, test, lint, format, container).
+func (g composedCapabilityGraph) Supports(cap string) bool {
+	return g.ws != nil && g.ws.Supports(layer1.Capability(cap))
+}
+
+// Resolve returns the concrete command bound to the named capability.
+func (g composedCapabilityGraph) Resolve(cap string) (string, bool) {
+	if g.ws == nil {
+		return "", false
+	}
+	return g.ws.Resolve(layer1.Capability(cap))
+}
+
+// CanMutateFile reports whether the runtime capability set's mutation scope
+// covers the file path.
+func (g composedCapabilityGraph) CanMutateFile(path string) bool {
+	return g.caps != nil && g.caps.CanMutateFile(path)
+}
+
+// CanExecuteCommand reports whether the runtime capability set's execute
+// scope covers the command.
+func (g composedCapabilityGraph) CanExecuteCommand(cmd string) bool {
+	return g.caps != nil && g.caps.CanExecuteCommand(cmd)
 }

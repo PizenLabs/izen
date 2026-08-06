@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/domain/policy"
 	"github.com/PizenLabs/izen/pkg/engine/ir"
 )
 
@@ -33,6 +34,19 @@ func WithHumanInTheLoopTrigger(t HumanInTheLoopTrigger) Option {
 	return func(e *StandardDecisionEngine) { e.human = t }
 }
 
+// WithPolicy installs the unified PolicyEngine. When nil (default), CanExecute
+// permits every action and the engine stays fully backward compatible.
+func WithPolicy(p PolicyEvaluator) Option {
+	return func(e *StandardDecisionEngine) { e.policy = p }
+}
+
+// PolicyEvaluator is the "is this action permitted?" authority the Decision
+// Engine delegates every permission question to. It is satisfied by
+// *policy.PolicyEngine.
+type PolicyEvaluator interface {
+	Evaluate(action policy.Action, ctx policy.PolicyContext) policy.Verdict
+}
+
 // StandardDecisionEngine is the reference Decision Engine. It is a thin
 // orchestration controller over the Dynamic IR: given an ExecutionSnapshot it
 // produces exactly one explicit directive. It never mutates the snapshot and
@@ -52,6 +66,7 @@ type StandardDecisionEngine struct {
 	budget BudgetPolicy
 	replan RePlanTrigger
 	human  HumanInTheLoopTrigger
+	policy PolicyEvaluator
 }
 
 // NewStandardDecisionEngine returns a Decision Engine with the default retry
@@ -69,6 +84,22 @@ func NewStandardDecisionEngine(opts ...Option) *StandardDecisionEngine {
 	}
 	return e
 }
+
+// CanExecute asks the injected PolicyEngine whether the action is permitted
+// under the given governance context. It is the Decision Engine's single
+// delegation point for the "is this action permitted?" question: every
+// mutation and shell action the controller plans to dispatch is routed
+// through it. With no PolicyEngine injected every action is permitted
+// (backward compatible).
+func (e *StandardDecisionEngine) CanExecute(action policy.Action, ctx policy.PolicyContext) bool {
+	if e.policy == nil {
+		return true
+	}
+	return e.policy.Evaluate(action, ctx).IsAllowed()
+}
+
+// PolicyEngine returns the injected policy evaluator, or nil.
+func (e *StandardDecisionEngine) PolicyEngine() PolicyEvaluator { return e.policy }
 
 // Decide implements DecisionEngine. Precedence:
 //
