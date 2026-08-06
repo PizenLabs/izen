@@ -23,6 +23,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/classifier"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
+	"github.com/PizenLabs/izen/internal/domain/signal"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
@@ -74,6 +75,38 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			model = m
 		}
 	}()
+
+	// ── UNBLOCKABLE EMERGENCY ESCAPE HATCH ────────────────────────────────
+	// Ctrl+C, Esc, and Ctrl+D are ALWAYS processed here, at the very top of
+	// the update loop, BEFORE any state gating or sub-component intercept. A
+	// stuck StateProcessing / StateAwaitingApproval must NEVER be able to
+	// swallow the keyboard — the user can always interrupt back to
+	// interactive chat (Philosophy Rule 1: Human-Centered / Reversible).
+	//
+	//   - Ctrl+C: hard interrupt whenever any workflow operation is in flight
+	//     or the view is in a locked state.
+	//   - Esc:    emergency abort while the view is frozen in StateProcessing
+	//     (or a plan synthesis is pending); in all other states Esc keeps its
+	//     normal contextual role (reject approval, dismiss overlay, ...).
+	//   - Ctrl+D: emergency abort while frozen in StateProcessing only;
+	//     otherwise it keeps its clean-shutdown role in chat.
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		switch keyMsg.Type {
+		case tea.KeyCtrlC:
+			if m.state == StateProcessing || m.state == StateAwaitingApproval ||
+				m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.planPending {
+				return m.handleEmergencyInterrupt("ctrl-c")
+			}
+		case tea.KeyEsc:
+			if m.state == StateProcessing || m.planPending {
+				return m.handleEmergencyInterrupt("escape")
+			}
+		case tea.KeyCtrlD:
+			if m.state == StateProcessing {
+				return m.handleEmergencyInterrupt("ctrl-d")
+			}
+		}
+	}
 
 	// ── HARD KEYBOARD INTERCEPT: Approval/Processing states bypass all sub-components ──
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
@@ -409,6 +442,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
+		// Re-derive the presentation state from the cleared flags so a stale
+		// StateProcessing derived during the investigation is released and the
+		// viewport returns to interactive chat. Pending-approval overrides.
+		m.syncUIState()
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+providers.SanitizeAPIError(msg.err))
 			// PERSISTENT NAVIGATION CHIPS (BUG 1): even on failure the user
@@ -507,6 +544,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// ALWAYS clear the transient loading flags first so the spinner can
 		// never freeze, regardless of which branch below we take.
 		m.reconcileSpinner()
+		// Re-derive the presentation state from the cleared flags: a stale
+		// StateProcessing derived during synthesis (e.g. via a phase-change
+		// event while agentRunning was true) must be released here so the
+		// viewport returns to interactive chat and Alt+P / Alt+R respond
+		// immediately. Pending-approval always overrides if a gate is set.
+		m.syncUIState()
 
 		if msg.Err != nil {
 			m.push(roleError, fmt.Sprintf("Failed to synthesize plan from ledger: %v", msg.Err))
@@ -562,7 +605,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if m.planEngine != nil && len(m.planEngine.AllowedFiles) > 0 {
 			scopeTasks := make([]control.TaskTarget, len(msg.Tasks))
 			for i, t := range msg.Tasks {
-				scopeTasks[i] = control.TaskTarget{Target: t.Target, Type: t.Type}
+				scopeTasks[i] = control.TaskTarget{Target: t.Target, Type: string(t.Type)}
 			}
 			if scopeErr := control.ValidateStagedPlan(scopeTasks, m.planEngine.AllowedFiles); scopeErr != nil {
 				var sv *control.ScopeViolationError
@@ -588,7 +631,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if t.Type == "FILE_MUTATE" || t.Type == "DIFF_PATCH" || t.Type == "ATOMIC_REPLACE" {
 				icon = Icon.SrcPatch
 			}
-			m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
+			m.handoffCtx.PendingTodos[i] = icon + " [" + string(t.Type) + "] " + t.Target + " — " + t.Description
 		}
 		if msg.IsFastTrack {
 			// Auto-create a build checkpoint BEFORE presenting the plan so that
@@ -1001,7 +1044,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.pendingProposals = props
 
 		// ── FREEZE FOR HUMAN APPROVAL ───────────────────────────────
-		m.state = StateAwaitingApproval
+		m.enterApprovalState()
 		m.awaitingConfirmation = true
 		m.ti.Blur()
 		m.recalcViewportHeight()
@@ -1075,7 +1118,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// ── CLEAN TRANSITION TO PROPOSAL VIEW ────────────────────────
 		m.push(roleActivity, "  ⚙ Compiling unified diff schema...")
 
-		m.state = StateAwaitingApproval
+		m.enterApprovalState()
 		m.ti.Blur()
 		m.recalcViewportHeight()
 
@@ -1096,6 +1139,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.sanitizeInputPrompt()
 		m.lastTestOutput = msg.output
 		m.lastTestFailed = msg.exitCode != 0
+		// Re-derive the presentation state from the cleared flags so a stale
+		// StateProcessing derived during the build is released. Pending-
+		// approval overrides (e.g. a queued proposal awaiting authorization).
+		m.syncUIState()
 
 		// ── FIX 1: Flush prompt buffer on task failure ────────────────
 		// Wipe the volatile user input cache so the next keystroke or
@@ -1565,7 +1612,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 
 			m.ti.Focus()
-			m.state = StateChat
+			m.resolveApprovalState()
 			m.recalcViewportHeight()
 			m.awaitingConfirmation = false
 			m.acceptAll = false
@@ -1621,7 +1668,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				m.logStore.AddFull(LogEdit, msg.file, false, msg.err.Error(), thinkingContent, "")
 			}
 		} else {
-			m.state = StateAwaitingApproval
+			m.enterApprovalState()
 			m.recalcViewportHeight()
 			m.Viewport.Height = m.computeVpHeight()
 			m.refreshViewportContent()
@@ -1660,7 +1707,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.awaitingConfirmation = false
 		m.acceptAll = false
 		m.ti.Focus()
-		m.state = StateChat
+		m.resolveApprovalState()
 		m.recalcViewportHeight()
 		var testCmd tea.Cmd
 		switch {
@@ -2314,7 +2361,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 							if t.Type == "FILE_MUTATE" || t.Type == "DIFF_PATCH" || t.Type == "ATOMIC_REPLACE" {
 								icon = Icon.SrcPatch
 							}
-							m.handoffCtx.PendingTodos[i] = icon + " [" + t.Type + "] " + t.Target + " — " + t.Description
+							m.handoffCtx.PendingTodos[i] = icon + " [" + string(t.Type) + "] " + t.Target + " — " + t.Description
 						}
 					}
 					m.currentResult = planApprovalActions()
@@ -2392,7 +2439,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					return m, m.applyAllProposalsCmd()
 				} else {
 					m.pendingProposals = props
-					m.state = StateAwaitingApproval
+					m.enterApprovalState()
 					m.recalcViewportHeight()
 					m.Viewport.Height = m.computeVpHeight()
 					m.awaitingConfirmation = true
@@ -2867,54 +2914,29 @@ func (m *model) planSlowNoticeCmd() tea.Cmd {
 // code blocks as the heuristic — when the agent outputs code blocks with known
 // language identifiers (go, diff, python, etc.), it indicates a patch proposal.
 // detectCompileFailure scans the given output for build/compile failure
-// signatures. Returns true when the codebase is in a non-compilable state
-// that requires structural recovery before any patch can be applied.
+// signals. Returns true when the codebase is in a non-compilable state that
+// requires structural recovery before any patch can be applied.
+//
+// Detection is delegated to the canonical signal classifier: routing between
+// investigate, plan and build evaluates the detected SignalKind values instead
+// of re-scanning free text for compile-failure substrings.
 func detectCompileFailure(output string) bool {
 	if output == "" {
 		return false
 	}
-	lower := strings.ToLower(output)
-	indicators := []string{
-		"[build failed]",
-		"syntax error",
-		"compilation error",
-		"expected declaration",
-		"non-declaration statement outside function body",
-		"expected ';'",
-		"cannot find package",
-		"undefined:",
-		"not enough arguments",
-		"too many errors",
-	}
-	for _, ind := range indicators {
-		if strings.Contains(lower, ind) {
-			return true
-		}
-	}
-	return false
+	return signal.HasCompileFailure(signal.Detect(output, "ui.compile"))
 }
 
-// hasMissingModuleError detects Go missing-dependency errors in build/test
+// hasMissingModuleError detects Go missing-dependency signals in build/test
 // output. When a build fails because a module is not in go.sum/go.mod, the
 // compiler prints "no required module provides package" or hints "to add it:
 // go get". These errors cannot be fixed by editing .go files — they require
-// running go get <package>. Returns true if any such pattern is found.
+// running go get <package>. Returns true when a SignalDepMissing is present.
 func hasMissingModuleError(output string) bool {
 	if output == "" {
 		return false
 	}
-	lower := strings.ToLower(output)
-	indicators := []string{
-		"no required module provides package",
-		"to add it: go get",
-		"missing go.sum entry for module",
-	}
-	for _, ind := range indicators {
-		if strings.Contains(lower, ind) {
-			return true
-		}
-	}
-	return false
+	return signal.HasKind(signal.Detect(output, "ui.build"), signal.SignalDepMissing)
 }
 
 func containsMutationIntention(content string) bool {

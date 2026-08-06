@@ -14,11 +14,15 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/core/stream"
+	"github.com/PizenLabs/izen/internal/domain/signal"
+	"github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
+	"github.com/PizenLabs/izen/pkg/engine/layer3"
+	"github.com/PizenLabs/izen/pkg/engine/pipeline"
 	"github.com/PizenLabs/izen/pkg/grounding"
 	"github.com/PizenLabs/izen/pkg/recon"
 )
@@ -110,6 +114,13 @@ type Engine struct {
 	usageMu    sync.RWMutex
 	lastInput  int
 	lastOutput int
+
+	// facade is the Layer 0-5 pipeline Facade injected by the composition
+	// root. When wired and no direct provider is set, the plan engine delegates
+	// its generative synthesis to the facade's ExecutePlan: the Mode engine
+	// remains the Security & Boundary gate while the stateless pipeline owns
+	// the LLM worker execution. Optional; nil keeps the legacy provider path.
+	facade pipeline.Facade
 }
 
 // NewEngine creates a new Engine instance with the provided components.
@@ -152,6 +163,24 @@ func (e *Engine) WithCapabilityRegistry(cr *wscap.ArchetypeCapabilityRegistry) *
 func (e *Engine) WithEventBus(bus *events.Bus) *Engine {
 	e.bus = bus
 	return e
+}
+
+// WithPipelineFacade injects the Layer 0-5 pipeline Facade. When wired and no
+// direct provider is set, the engine delegates its generative synthesis to the
+// facade (see processFromLedger). May be nil to keep the legacy provider path.
+func (e *Engine) WithPipelineFacade(f pipeline.Facade) *Engine {
+	if e != nil {
+		e.facade = f
+	}
+	return e
+}
+
+// Facade returns the injected Layer 0-5 pipeline Facade, if any.
+func (e *Engine) Facade() pipeline.Facade {
+	if e == nil {
+		return nil
+	}
+	return e.facade
 }
 
 // emit publishes a domain event. It is a strict no-op when no bus is wired,
@@ -506,8 +535,8 @@ func (e *Engine) ProcessFromLedgerFastTrack(ctx context.Context, promptText stri
 }
 
 func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, problem string, modelName string, fastTrack bool, fastPrompt ...string) (tasks []Task, err error) {
-	if e == nil || (e.provider == nil && e.streamProv == nil) {
-		return nil, fmt.Errorf("plan engine: provider not set")
+	if e == nil {
+		return nil, fmt.Errorf("plan engine: nil engine")
 	}
 
 	// ── HEADLESS EVENT EMISSION ───────────────────────────────
@@ -554,6 +583,14 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		}
 	}
 
+	// ── CANONICAL SIGNAL CLASSIFICATION ────────────────────────────────
+	// Classify the ledger once into canonical signal.Signal values. All routing
+	// below (canonical import mismatch, undefined symbol, remote dependency
+	// blocker, compile/dependency fallbacks) evaluates typed SignalKind values
+	// instead of re-scanning raw terminal text — the signal classifier is the
+	// single place where free-text matching for routing happens.
+	signals := signal.Detect(ledgerContent, "plan.ledger")
+
 	// ── DIRECT MUTATION FAST-TRACK ──────────────────────────
 	// When the prompt is a simple file replacement (refactor LICENSE
 	// from MIT to APACHE, change X to Y in @file, etc.), bypass
@@ -590,7 +627,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	//           file loading into LLM context).
 	//   Step 3: Minimal context ledger population (under 100 tokens).
 	//   Step 4: Atomic execution blueprint (FILE_EDIT + SHELL_EXEC).
-	if !fastTrack && !e.vanillaWeb && HasCanonicalImportMismatch(ledgerContent) {
+	if !fastTrack && !e.vanillaWeb && signal.HasKind(signals, signal.SignalImportMismatch) {
 		mismatch := retrieval.ParseCanonicalMismatch(ledgerContent)
 		if mismatch != nil && mismatch.OldPath != "" && mismatch.NewPath != "" {
 			router := retrieval.GetGlobalRouter()
@@ -604,8 +641,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 						desc := fmt.Sprintf("Replace import path %q with %q at %s:%d",
 							mismatch.OldPath, mismatch.NewPath, ref.File, ref.StartLine)
 						tasks = append(tasks, Task{
-							StepNum:     i + 1,
-							IsDone:      false,
+							StepNum: i + 1,
+
 							Status:      "idle",
 							Type:        "FILE_MUTATE",
 							Target:      ref.File,
@@ -617,8 +654,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 					}
 					tidyStep := len(refs) + 1
 					tasks = append(tasks, Task{
-						StepNum:     tidyStep,
-						IsDone:      false,
+						StepNum: tidyStep,
+
 						Status:      "idle",
 						Type:        "SHELL_EXEC",
 						Target:      "go mod tidy",
@@ -650,7 +687,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	//
 	// CRITICAL: Both paths complete in < 1ms. The LLM synthesis retry loop
 	// and lx daemon handshake are NEVER reached for undefined symbol errors.
-	if !fastTrack && !e.vanillaWeb && HasUndefinedSymbolError(ledgerContent) {
+	if !fastTrack && !e.vanillaWeb && signal.HasKind(signals, signal.SignalSymbolUndefined) {
 		undef := retrieval.ParseUndefinedSymbol(ledgerContent)
 		if undef != nil && undef.Symbol != "" {
 			sanitizedTarget, _ := retrieval.SanitizeTargetPath(undef.File)
@@ -662,8 +699,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			if pkgName, importPath, matched := retrieval.CheckStdlibCaseCorrection(undef.Symbol); matched {
 				return []Task{
 					{
-						StepNum:     1,
-						IsDone:      false,
+						StepNum: 1,
+
 						Status:      "idle",
 						Type:        "FILE_MUTATE",
 						Target:      sanitizedTarget,
@@ -678,8 +715,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			// Phase 2: Deterministic fallback — no lx, no LLM.
 			return []Task{
 				{
-					StepNum:     1,
-					IsDone:      false,
+					StepNum: 1,
+
 					Status:      "idle",
 					Type:        "FILE_MUTATE",
 					Target:      sanitizedTarget,
@@ -692,51 +729,75 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		}
 	}
 
-	// REMOTE DEPENDENCY BLOCKER short-circuit: if the ledger explicitly
-	// identifies a remote dependency through forensic analysis, bypass LLM
-	// synthesis entirely and generate deterministic go get / go mod tidy
-	// tasks. This guarantees 100% success for missing package resolution,
-	// eliminating the 3-attempt JSON synthesis crash loop.
-	if !fastTrack && strings.Contains(ledgerContent, "REMOTE DEPENDENCY BLOCKER") {
-		conclusion := ExtractConclusionFromLedger(ledgerContent)
-		if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
-			taskGet := Task{
-				StepNum:     1,
-				IsDone:      false,
-				Status:      "idle",
-				Type:        "SHELL_EXEC",
-				Target:      fmt.Sprintf("go get %s", dep),
-				Description: fmt.Sprintf("Install missing dependency %s to resolve compiler/import blocker.", dep),
-				Rationale:   fmt.Sprintf("Inject the explicit third-party module %s missing from the execution boundary.", dep),
-				Solution:    fmt.Sprintf("Missing package %s successfully resolves and dependency block clears.", dep),
-				IsHardcoded: true,
+	// REMOTE DEPENDENCY BLOCKER short-circuit: if the ledger carries a
+	// SignalDepMissing whose payload marks the investigate "lx bypassed" blocker
+	// token, bypass LLM synthesis entirely and generate deterministic
+	// go get / go mod tidy tasks. This guarantees 100% success for missing
+	// package resolution, eliminating the 3-attempt JSON synthesis crash loop.
+	//
+	// The signal classifier extracts the blocker marker AND the dependency
+	// package from the ledger; the conclusion path remains the primary
+	// dependency source (it carries the corrected path from forensic analysis).
+	if !fastTrack {
+		blocker := signal.First(signals, signal.SignalDepMissing)
+		if blocker != nil && blocker.PayloadValue("blocker") == "true" {
+			conclusion := ExtractConclusionFromLedger(ledgerContent)
+			dep := dependencyFromConclusion(conclusion)
+			if dep == "" {
+				dep = blocker.PayloadValue("dependency")
 			}
-			taskTidy := Task{
-				StepNum:     2,
-				IsDone:      false,
-				Status:      "idle",
-				Type:        "SHELL_EXEC",
-				Target:      "go mod tidy",
-				Description: "Re-synchronize the dependency manifest with active imports after blocker identification.",
-				Rationale:   "Re-synchronize the dependency manifest with active imports after blocker identification.",
-				Solution:    "Clean up stale pointers and establish structural registry alignment.",
-				IsHardcoded: true,
+			if dep != "" && !isPlaceholderToken(dep) {
+				taskGet := Task{
+					StepNum: 1,
+
+					Status:      "idle",
+					Type:        "SHELL_EXEC",
+					Target:      fmt.Sprintf("go get %s", dep),
+					Description: fmt.Sprintf("Install missing dependency %s to resolve compiler/import blocker.", dep),
+					Rationale:   fmt.Sprintf("Inject the explicit third-party module %s missing from the execution boundary.", dep),
+					Solution:    fmt.Sprintf("Missing package %s successfully resolves and dependency block clears.", dep),
+					IsHardcoded: true,
+				}
+				taskTidy := Task{
+					StepNum: 2,
+
+					Status:      "idle",
+					Type:        "SHELL_EXEC",
+					Target:      "go mod tidy",
+					Description: "Re-synchronize the dependency manifest with active imports after blocker identification.",
+					Rationale:   "Re-synchronize the dependency manifest with active imports after blocker identification.",
+					Solution:    "Clean up stale pointers and establish structural registry alignment.",
+					IsHardcoded: true,
+				}
+				return []Task{taskGet, taskTidy}, nil
 			}
-			return []Task{taskGet, taskTidy}, nil
+			return []Task{
+				{
+					StepNum: 1,
+
+					Status:      "idle",
+					Type:        "SHELL_EXEC",
+					Target:      "go mod tidy",
+					Description: "Re-synchronize the dependency manifest with active imports after blocker identification.",
+					Rationale:   "Re-synchronize the dependency manifest with active imports after blocker identification.",
+					Solution:    "Clean up stale pointers and establish structural registry alignment.",
+					IsHardcoded: true,
+				},
+			}, nil
 		}
-		return []Task{
-			{
-				StepNum:     1,
-				IsDone:      false,
-				Status:      "idle",
-				Type:        "SHELL_EXEC",
-				Target:      "go mod tidy",
-				Description: "Re-synchronize the dependency manifest with active imports after blocker identification.",
-				Rationale:   "Re-synchronize the dependency manifest with active imports after blocker identification.",
-				Solution:    "Clean up stale pointers and establish structural registry alignment.",
-				IsHardcoded: true,
-			},
-		}, nil
+	}
+
+	// ── GENERATIVE SYNTHESIS SOURCE ────────────────────────────────────
+	// The Mode engine is the Security & Boundary gate. The generative core
+	// work is owned either by the legacy direct provider or — when a
+	// pipeline.Facade is injected and no direct provider is wired — by the
+	// Layer 0-5 pipeline facade. The deterministic fast-tracks above run in
+	// both cases and never require a provider.
+	if e.provider == nil && e.streamProv == nil {
+		if e.facade == nil {
+			return nil, fmt.Errorf("plan engine: provider not set")
+		}
+		return e.synthesizeViaFacade(ctx, problem, ledgerContent)
 	}
 
 	e.emit(events.NewIntentParsed("plan.synthesize", problem, 0.8))
@@ -816,10 +877,11 @@ ALLOWED ACTIONS: Pure file mutations on .html, .css, .js files only.`
 		}
 	}
 
-	// UNDEFINED SYMBOL GUARDRAIL: When the ledger contains an undefined symbol
-	// error, explicitly instruct the LLM to generate ONLY file modification tasks.
-	// Shell execution commands like go mod tidy are NEVER valid for code typos.
-	if !fastTrack && HasUndefinedSymbolError(ledgerContent) {
+	// UNDEFINED SYMBOL GUARDRAIL: When the ledger carries a SignalSymbolUndefined
+	// signal, explicitly instruct the LLM to generate ONLY file modification
+	// tasks. Shell execution commands like go mod tidy are NEVER valid for code
+	// typos.
+	if !fastTrack && signal.HasKind(signals, signal.SignalSymbolUndefined) {
 		req.Messages[len(req.Messages)-1].Content += `
 
 [SYSTEM: UNDEFINED SYMBOL ERROR — CODE FIX ONLY]
@@ -1017,16 +1079,17 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	}
 	e.diagnoseSynthesisFailure(fmt.Sprintf(
 		"All %d plan synthesis attempts failed after sanitization. Last provider output excerpt: %q. The model produced neither parseable JSON nor task blocks.", maxSilentRetries+1, excerpt))
-	if HasUndefinedSymbolError(ledgerContent) {
+	if signal.HasKind(signals, signal.SignalSymbolUndefined) {
 		return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed for undefined symbol error — could not determine correct code fix", maxSilentRetries+1)
 	}
-	if IsCompilationOrDependencyError(problem) || IsCompilationOrDependencyError(ledgerContent) {
+	if signal.IsCompilationOrDependency(signals) ||
+		signal.IsCompilationOrDependency(signal.Detect(problem, "plan.problem")) {
 		conclusion := ExtractConclusionFromLedger(ledgerContent)
 		if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
 			return []Task{
 				{
-					StepNum:     1,
-					IsDone:      false,
+					StepNum: 1,
+
 					Status:      "idle",
 					Type:        "SHELL_EXEC",
 					Target:      fmt.Sprintf("go get %s", dep),
@@ -1039,11 +1102,65 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	}
 
 	// ── ABSOLUTE FALLBACK ────────────────────────────────────────
-	if hasGoFileParseError(ledgerContent) || hasGoFileParseError(problem) {
+	// A *.go compile coordinate paired with an import/parse indicator is the
+	// last signal that a structured recovery plan is required. This mirrors the
+	// legacy hasGoFileParseError detector via the canonical signal classifier.
+	if signal.HasCompileFailure(signals) ||
+		signal.HasCompileFailure(signal.Detect(problem, "plan.problem")) {
 		return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts exhausted for compile error — no valid tasks could be synthesized", maxSilentRetries+1)
 	}
 
 	return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed and no dependency error detected", maxSilentRetries+1)
+}
+
+// synthesizeViaFacade executes the generative plan synthesis through the
+// injected pipeline.Facade. The Mode engine supplies the boundary (scope,
+// rationale, headless event emission); the facade owns the Layer 0-5 execution
+// and returns concrete file patches, which are projected onto canonical plan
+// Tasks. The error returned is wrapped so callers can distinguish "the facade
+// is unavailable" from "the facade produced no plan".
+func (e *Engine) synthesizeViaFacade(ctx context.Context, problem, ledgerContent string) ([]Task, error) {
+	if e == nil || e.facade == nil {
+		return nil, fmt.Errorf("plan engine: no pipeline facade wired")
+	}
+	res, err := e.facade.ExecutePlan(ctx, pipeline.Request{
+		Mode:        "plan",
+		Description: problem,
+		Scope:       e.AllowedFiles,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("plan engine: pipeline facade execution failed: %w", err)
+	}
+	if res == nil {
+		return nil, fmt.Errorf("plan engine: pipeline facade returned a nil result")
+	}
+	tasks := patchesToTasks(res.Patches, problem)
+	if len(tasks) == 0 {
+		return nil, fmt.Errorf("plan engine: pipeline facade produced no patches")
+	}
+	return ForceShellExecOnCompileError(tasks, problem, ledgerContent), nil
+}
+
+// patchesToTasks projects Layer 3 file patches produced by the pipeline facade
+// onto canonical plan Tasks (FILE_MUTATE). Unchanged patches are dropped;
+// step numbers are sequential from 1.
+func patchesToTasks(patches []layer3.FilePatch, problem string) []Task {
+	tasks := make([]Task, 0, len(patches))
+	for _, p := range patches {
+		if !p.Changed {
+			continue
+		}
+		tasks = append(tasks, Task{
+			StepNum:     len(tasks) + 1,
+			Status:      task.StatusIdle,
+			Type:        task.TaskFileMutate,
+			Target:      p.Path,
+			Description: fmt.Sprintf("Apply the proposed change to %s", p.Path),
+			Rationale:   problem,
+			Solution:    fmt.Sprintf("%s updated via the layered pipeline facade", p.Path),
+		})
+	}
+	return tasks
 }
 
 // diagnoseSynthesisFailure publishes a clear, actionable plan-synthesis
@@ -1364,8 +1481,8 @@ func ForceShellExecOnCompileError(tasks []Task, problem, ledgerContent string) [
 		}
 	}
 	recovery := Task{
-		StepNum:     0,
-		IsDone:      false,
+		StepNum: 0,
+
 		Status:      "idle",
 		Type:        "SHELL_EXEC",
 		Target:      cmd,
@@ -1427,8 +1544,8 @@ func SanitizeTasksForArchetype(tasks []Task, archetype recon.ProjectArchetype) [
 		// All tasks filtered out — fallback to a single default task.
 		return []Task{
 			{
-				StepNum:     1,
-				IsDone:      false,
+				StepNum: 1,
+
 				Status:      "idle",
 				Type:        "FILE_MUTATE",
 				Target:      "",
@@ -1543,8 +1660,8 @@ func ValidateShellExecCommands(tasks []Task, ledgerContent string) []Task {
 			if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
 				return []Task{
 					{
-						StepNum:     1,
-						IsDone:      false,
+						StepNum: 1,
+
 						Status:      "idle",
 						Type:        "SHELL_EXEC",
 						Target:      fmt.Sprintf("go get %s", dep),
@@ -1554,8 +1671,8 @@ func ValidateShellExecCommands(tasks []Task, ledgerContent string) []Task {
 			}
 			return []Task{
 				{
-					StepNum:     1,
-					IsDone:      false,
+					StepNum: 1,
+
 					Status:      "idle",
 					Type:        "SHELL_EXEC",
 					Target:      "go mod tidy",
@@ -1889,8 +2006,8 @@ func detectDirectMutation(problem string, ledgerContent string) *Task {
 	}
 
 	return &Task{
-		StepNum:     1,
-		IsDone:      false,
+		StepNum: 1,
+
 		Status:      "idle",
 		Type:        "FILE_MUTATE",
 		Target:      targetFile,

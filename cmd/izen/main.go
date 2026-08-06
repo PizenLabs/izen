@@ -13,6 +13,7 @@ import (
 	"github.com/PizenLabs/izen/internal/debug"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/infrastructure/capabilities"
+	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/planner"
 	"github.com/PizenLabs/izen/internal/project"
@@ -149,13 +150,24 @@ func main() {
 	// ---- Local context boundary enforcement ----
 	root := targetDir
 
+	// ---- Project type detection (pure scan, no writes) ----
+	// Computed once, before wiring, so the language-aware execution verifier
+	// can be wired into the composition root. Detection never writes to disk,
+	// so it is safe to run on the onboarding path.
+	detection := project.Detect(root)
+	var detectedLang language.ID
+	if detection.Primary != nil {
+		detectedLang = detection.Primary.ID
+	}
+
 	// ── COMPOSITION ROOT: INFRASTRUCTURE + APPLICATION LAYERS (RFC v1.0) ──
 	// The composition root is the only place that instantiates the concrete
 	// Infrastructure adapters and wires the Application layer (domain
-	// WorkflowRuntime + command handlers + LedgerBuilder + Runtime facade)
-	// on top of the shared event bus. The resulting Runtime is injected into
-	// the Presentation layer below, making it the single entry point of the
-	// system. Command handlers are registered inside compose.Wire.
+	// WorkflowRuntime + command handlers + LedgerBuilder + Runtime facade +
+	// the complete engine tree) on top of the shared event bus. The resulting
+	// Application is injected into the Presentation layer below, making it the
+	// single entry point of the system. Command handlers are registered inside
+	// compose.Wire.
 	osFile := capabilities.NewOSFile(root)
 	shell := capabilities.NewExecShell(30 * time.Second)
 	gitCLI := capabilities.NewGitCLI(root)
@@ -164,12 +176,16 @@ func main() {
 
 	app, wireErr := compose.Wire(
 		compose.WithBus(bus),
+		compose.WithAuditDir(filepath.Join(root, ".izen", "audit")),
 		compose.WithCapabilities(compose.Capabilities{
 			File:  osFile,
 			Shell: shell,
 			Git:   gitCLI,
 			Patch: patchAdapter,
 		}),
+		compose.WithRoot(root),
+		compose.WithConfig(cfg),
+		compose.WithLanguageID(detectedLang),
 	)
 	if wireErr != nil {
 		fmt.Fprintf(os.Stderr, "izen: wire application layer: %v\n", wireErr)
@@ -199,8 +215,7 @@ func main() {
 		return
 	}
 
-	// ---- Project type detection (local config exists) ----
-	detection := project.Detect(root)
+	// ---- Project type report (local config exists) ----
 	if detection.Primary != nil {
 		primaryLang := detection.Primary.Name
 		conf := detection.Confidence
@@ -221,7 +236,7 @@ func main() {
 
 	// ---- Phase 3: TUI boot routing ----
 	if isRollbackMode {
-		ui.RunRollbackEngine(cfg, root, localCfg, detection)
+		ui.RunRollbackEngine(cfg, root, localCfg, app, detection)
 	} else {
 		ui.RunMainDashboardWithApp(cfg, root, localCfg, app, detection)
 	}

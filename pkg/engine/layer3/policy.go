@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/PizenLabs/izen/internal/domain/policy"
 	"github.com/PizenLabs/izen/pkg/engine/layer1"
 )
 
@@ -184,7 +185,8 @@ var (
 // routes it to either the ASTRewriteHandler or the generative pipeline. The
 // guard is immutable after construction and safe for concurrent use.
 type PolicyGuard struct {
-	caps CapabilityReader
+	caps   CapabilityReader
+	engine *policy.PolicyEngine
 }
 
 // NewPolicyGuard returns a guard for the given workspace capabilities. A nil
@@ -194,8 +196,46 @@ func NewPolicyGuard(caps CapabilityReader) *PolicyGuard {
 	return &PolicyGuard{caps: caps}
 }
 
+// WithPolicyEngine binds the unified PolicyEngine to the guard. Every
+// Authorize call then delegates the permission question to it — the single
+// owner of "is this action permitted?". A nil engine leaves Authorize
+// returning an unconditional ALLOW.
+func (g *PolicyGuard) WithPolicyEngine(p *policy.PolicyEngine) *PolicyGuard {
+	g.engine = p
+	return g
+}
+
+// PolicyEngine returns the bound PolicyEngine, or nil when none is wired.
+func (g *PolicyGuard) PolicyEngine() *policy.PolicyEngine { return g.engine }
+
 // Capabilities returns the capability reader the guard was constructed with.
 func (g *PolicyGuard) Capabilities() CapabilityReader { return g.caps }
+
+// Authorize delegates the permission question for the request to the bound
+// PolicyEngine under the given governance context. Deterministic mutation
+// intents map to a file write; generative intents map to a patch application.
+// A nil engine yields an unconditional ALLOW.
+func (g *PolicyGuard) Authorize(req Request, ctx policy.PolicyContext) policy.Verdict {
+	if g.engine == nil {
+		return policy.Verdict{Allowed: policy.VerdictAllow}
+	}
+	return g.engine.Evaluate(actionForRequest(req), ctx)
+}
+
+// actionForRequest maps an execution request onto the policy Action
+// vocabulary: deterministic rewrites are file writes, generative intents are
+// patch applications.
+func actionForRequest(req Request) policy.Action {
+	kind := policy.ActionPatchApply
+	target := req.TargetFile
+	if req.Intent.Deterministic() {
+		kind = policy.ActionFileWrite
+	}
+	if target == "" && len(req.Scope) > 0 {
+		target = req.Scope[0]
+	}
+	return policy.Action{Kind: kind, Target: target}
+}
 
 // Validate checks that the request is well-formed for its intent.
 func (g *PolicyGuard) Validate(req Request) error {

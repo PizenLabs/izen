@@ -151,3 +151,85 @@ func (p *DefaultExecutionPolicy) MaxAttempts(op Operation) int {
 	}
 	return 1
 }
+
+// ── Unified Policy Engine domain models (Sprint 5) ──────────────────────
+// The types below are the vocabulary of the single authoritative governance
+// owner — the PolicyEngine. An Action is an intended operation, a
+// PolicyContext carries the runtime governance inputs, and a Verdict is the
+// pure answer to "is this action permitted?". These models deliberately carry
+// no physical-facts vocabulary: capabilities live in the CapabilityGraph, not
+// in the policy domain.
+
+// ActionKind discriminates the action classes the PolicyEngine adjudicates.
+type ActionKind string
+
+const (
+	// ActionFileRead is a read-only file access.
+	ActionFileRead ActionKind = "FILE_READ"
+	// ActionFileWrite is a direct workspace file write.
+	ActionFileWrite ActionKind = "FILE_WRITE"
+	// ActionShellExec is an arbitrary shell command execution.
+	ActionShellExec ActionKind = "SHELL_EXEC"
+	// ActionPatchApply is a structured patch application.
+	ActionPatchApply ActionKind = "PATCH_APPLY"
+)
+
+// Action is an intended action the PolicyEngine is asked to adjudicate.
+type Action struct {
+	// Kind identifies the class of the action.
+	Kind ActionKind `json:"kind"`
+	// Target is the primary coordinate: a file path or shell command.
+	Target string `json:"target,omitempty"`
+}
+
+// Mutating reports whether the action modifies the workspace.
+func (a Action) Mutating() bool {
+	switch a.Kind {
+	case ActionFileWrite, ActionShellExec, ActionPatchApply:
+		return true
+	default:
+		return false
+	}
+}
+
+// PolicyContext carries the runtime governance inputs for one evaluation:
+// the active mode, the remaining token budget and whether a human has
+// approved the action. It is assembled by the caller from live runtime state
+// and never probes the OS itself.
+type PolicyContext struct {
+	ActiveMode      string `json:"active_mode"`
+	RemainingTokens int    `json:"remaining_tokens"`
+	IsHumanApproved bool   `json:"is_human_approved"`
+}
+
+// Verdict is the outcome of a policy evaluation. Allowed is one of the
+// Verdict constants: ALLOW, DENY or REQUIRE_APPROVAL.
+type Verdict struct {
+	Allowed string `json:"allowed"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+// Verdict constants returned by the PolicyEngine.
+const (
+	// VerdictAllow permits the action unconditionally.
+	VerdictAllow = "ALLOW"
+	// VerdictDeny forbids the action.
+	VerdictDeny = "DENY"
+	// VerdictRequireApproval gates the action behind human approval.
+	VerdictRequireApproval = "REQUIRE_APPROVAL"
+)
+
+// IsAllowed reports whether the verdict permits the action unconditionally.
+func (v Verdict) IsAllowed() bool { return v.Allowed == VerdictAllow }
+
+// RequiresApproval reports whether the verdict gates the action behind
+// human approval.
+func (v Verdict) RequiresApproval() bool { return v.Allowed == VerdictRequireApproval }
+
+// String renders the machine-readable verdict with its rationale.
+func (v Verdict) String() string {
+	if v.Reason != "" {
+		return v.Allowed + ": " + v.Reason
+	}
+	return v.Allowed
+}

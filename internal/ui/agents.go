@@ -67,6 +67,9 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 			executor := investigate.NewShellTestExecutor(".")
 			eng := investigate.NewEngineWithAI(".", content, retriever, executor, m.provider, m.cfg.ActiveModelName())
 			eng.WithEventBus(m.bus)
+			// Inject the Layer 0-5 pipeline Facade so the investigation can run
+			// Layer 4 RAM validation over candidate targets. Nil-safe.
+			eng.WithPipelineFacade(m.pipelineFacade())
 			// Inject the Context Planner so the forensic diagnostics are
 			// enriched with intent-aware, budget-fitted structural context
 			// (tool logs, graph symbols) before the orchestrator dispatches.
@@ -378,6 +381,9 @@ func (r *reviewRunner) RunComprehensiveReview() (string, *riview.ReviewLedger, e
 		return "", nil, fmt.Errorf("review mode: write/shell/patch capability detected — review must be 100%% read-only")
 	}
 	eng := review.NewEngine(".", nil, nil).WithEventBus(r.m.bus)
+	// Inject the Layer 0-5 pipeline Facade so the review verify step runs the
+	// Layer 4 RAM validation DAG over the changed files. Nil-safe.
+	eng.WithPipelineFacade(r.m.pipelineFacade())
 	result, err := eng.Run()
 	if err != nil {
 		return "", nil, err
@@ -424,6 +430,9 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 			}
 
 			eng := review.NewEngine(".", nil, nil).WithEventBus(m.bus)
+			// Inject the Layer 0-5 pipeline Facade for the Layer 4 RAM
+			// validation of the changed files during the verify step.
+			eng.WithPipelineFacade(m.pipelineFacade())
 			var result *review.ReviewResult
 			var err error
 			if target != "" {

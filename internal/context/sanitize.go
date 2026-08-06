@@ -317,7 +317,7 @@ func SanitizeBuildHandoff(task *plan.Task, symbolContext string) string {
 	b.WriteString("Do NOT wrap in HTML if the target is CSS or JavaScript.\n\n")
 
 	b.WriteString("### TASK\n")
-	b.WriteString(task.Type + ": " + task.Target)
+	b.WriteString(string(task.Type) + ": " + task.Target)
 	if task.Description != "" {
 		b.WriteString(" — " + task.Description)
 	}

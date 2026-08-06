@@ -3,6 +3,8 @@ package plan
 import (
 	"strings"
 	"testing"
+
+	"github.com/PizenLabs/izen/internal/domain/task"
 )
 
 func TestValidatePlanOutput_Valid(t *testing.T) {
@@ -632,7 +634,7 @@ func TestValidateTaskTarget_ValidPath(t *testing.T) {
 		{"pkg/config/loader.go", "FILE_MUTATE"},
 	}
 	for _, tt := range tests {
-		isValid, isPlaceholder := ValidateTaskTarget(tt.target, tt.taskType)
+		isValid, isPlaceholder := ValidateTaskTarget(tt.target, task.TaskType(tt.taskType))
 		if !isValid {
 			t.Errorf("expected valid target %q, got isValid=%v, isPlaceholder=%v", tt.target, isValid, isPlaceholder)
 		}
@@ -657,7 +659,7 @@ func TestValidateTaskTarget_PlaceholderPaths(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			isValid, isPlaceholder := ValidateTaskTarget(tt.target, tt.taskType)
+			isValid, isPlaceholder := ValidateTaskTarget(tt.target, task.TaskType(tt.taskType))
 			if isValid {
 				t.Errorf("expected invalid placeholder target %q", tt.target)
 			}

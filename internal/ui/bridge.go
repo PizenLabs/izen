@@ -112,7 +112,7 @@ func (m *model) bridgePlanToLedger(tasks []plan.Task) {
 		atomic = append(atomic, plan.AtomicTask{
 			TaskID:      t.StepNum,
 			File:        t.Target,
-			Strategy:    t.Type,
+			Strategy:    string(t.Type),
 			Description: t.Description,
 		})
 		if t.Target != "" {

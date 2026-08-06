@@ -16,6 +16,8 @@ import (
 	"github.com/PizenLabs/izen/internal/runtime/output"
 	wschk "github.com/PizenLabs/izen/internal/workspace/checkpoint"
 	wsfail "github.com/PizenLabs/izen/internal/workspace/failure"
+	"github.com/PizenLabs/izen/pkg/engine/layer3"
+	"github.com/PizenLabs/izen/pkg/engine/pipeline"
 )
 
 type FileMutation struct {
@@ -143,6 +145,15 @@ type Executor struct {
 	// workspace tee) logged to `.logs/`. Nil keeps the executor a pure
 	// transformation-free verifier (headless/tests).
 	pipeline *output.Pipeline
+
+	// facade is the Layer 0-5 pipeline Facade injected by the composition
+	// root. When wired, ApplyMutation runs the Layer 4 RAM validation DAG
+	// (structural + syntax) over each proposed mutation BEFORE the write and
+	// emits the outcome as a stage event. The outcome is advisory — the
+	// post-apply compilation verification remains the authoritative gate — so
+	// a validation signal can never block a legitimate mutation. Optional; nil
+	// keeps the legacy apply-only path.
+	facade pipeline.Facade
 }
 
 func NewExecutor(root string, engine *Engine) *Executor {
@@ -159,6 +170,24 @@ func NewExecutor(root string, engine *Engine) *Executor {
 func (ex *Executor) WithPipeline(p *output.Pipeline) *Executor {
 	ex.pipeline = p
 	return ex
+}
+
+// WithPipelineFacade injects the Layer 0-5 pipeline Facade so ApplyMutation
+// runs an advisory Layer 4 RAM validation over each proposed mutation. May be
+// nil to keep the legacy apply-only path.
+func (ex *Executor) WithPipelineFacade(f pipeline.Facade) *Executor {
+	if ex != nil {
+		ex.facade = f
+	}
+	return ex
+}
+
+// Facade returns the injected Layer 0-5 pipeline Facade, if any.
+func (ex *Executor) Facade() pipeline.Facade {
+	if ex == nil {
+		return nil
+	}
+	return ex.facade
 }
 
 // WithConfig overrides the executor configuration (self-healing retry bound).
@@ -286,12 +315,42 @@ func (ex *Executor) ApplyMutation(ctx context.Context, mut FileMutation) (retErr
 		}()
 	}
 
+	// Layer 4 validation gate via the injected pipeline.Facade: the RAM
+	// structural + syntax checks run against the PROPOSED content before the
+	// write. The outcome is advisory — it is emitted as a stage event and never
+	// blocks the mutation, because the post-apply compilation verification
+	// remains the authoritative gate.
+	if ex.facade != nil {
+		vr, verr := ex.facade.ValidatePatch(ctx, []layer3.FilePatch{{
+			Path:    mut.File,
+			New:     mut.Content,
+			Changed: true,
+		}})
+		if ex.engine != nil {
+			msg := fmt.Sprintf("facade layer4 validation failed to run: %v", verr)
+			switch {
+			case vr == nil:
+				// keep the run-failure message
+			case vr.OK:
+				msg = fmt.Sprintf("facade layer4 validation ok (%d passed)", len(vr.Passed))
+			case vr.Err != nil:
+				msg = fmt.Sprintf("facade layer4 validation: %s", vr.Err.Error())
+			default:
+				msg = fmt.Sprintf("facade layer4 validation flagged %d file(s)", len(vr.Failed))
+			}
+			ex.engine.emit(events.NewStageCompleted("build.l4validation", time.Since(start).Round(time.Millisecond), msg))
+		}
+		if verr != nil && ex.engine != nil {
+			ex.engine.emit(events.NewStageCompleted("build.l4validation.error", 0, verr.Error()))
+		}
+	}
+
 	if err := os.WriteFile(absPath, []byte(mut.Content), 0644); err != nil {
 		ex.emitFailure(events.FailureRecoverable, err, "build.patch")
 		return err
 	}
-	ex.engine.RecordPatch(mut.TaskID, mut.File, strategy)
 	if ex.engine != nil {
+		ex.engine.RecordPatch(mut.TaskID, mut.File, strategy)
 		ex.engine.emit(events.NewPatchApplied(mut.File, countLines(mut.Content), 0, time.Since(start)))
 	}
 

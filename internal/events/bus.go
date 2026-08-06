@@ -74,6 +74,7 @@ type Bus struct {
 	closed     bool
 	nextID     uint64
 	subs       map[string]map[uint64]*subscription
+	allSubs    map[uint64]*subscription
 	wg         sync.WaitGroup
 }
 
@@ -86,6 +87,7 @@ func NewBus(bufferSize int) *Bus {
 	return &Bus{
 		bufferSize: bufferSize,
 		subs:       make(map[string]map[uint64]*subscription),
+		allSubs:    make(map[uint64]*subscription),
 	}
 }
 
@@ -124,6 +126,39 @@ func (b *Bus) Subscribe(eventType string, handler EventHandler) *Subscription {
 	return &Subscription{bus: b, sub: sub}
 }
 
+// SubscribeAll registers handler to receive every published event regardless
+// of type. It is the natural wiring for audit loggers, session replay and
+// terminal UI projections that must observe the whole stream. Delivery and
+// cancellation semantics are identical to Subscribe.
+func (b *Bus) SubscribeAll(handler EventHandler) *Subscription {
+	if handler == nil {
+		return nil
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil
+	}
+
+	sub := &subscription{
+		eventType:  "",
+		handler:    handler,
+		id:         b.nextID,
+		handlerKey: handlerPointer(handler),
+		ch:         make(chan DomainEvent, b.bufferSize),
+		done:       make(chan struct{}),
+	}
+	b.nextID++
+
+	b.allSubs[sub.id] = sub
+
+	b.wg.Add(1)
+	go b.dispatchLoop(sub)
+
+	return &Subscription{bus: b, sub: sub}
+}
+
 // Unsubscribe removes every subscription that matches the given event type and
 // handler identity. It is a best-effort removal by function pointer; for
 // precise per-subscription cancellation prefer the returned *Subscription's
@@ -152,6 +187,13 @@ func (b *Bus) Unsubscribe(eventType string, handler EventHandler) {
 func (b *Bus) remove(eventType string, id uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if eventType == "" {
+		if sub, ok := b.allSubs[id]; ok {
+			sub.cancel()
+			delete(b.allSubs, id)
+		}
+		return
+	}
 	if sub, ok := b.subs[eventType][id]; ok {
 		sub.cancel()
 		delete(b.subs[eventType], id)
@@ -162,9 +204,9 @@ func (b *Bus) remove(eventType string, id uint64) {
 }
 
 // Publish delivers a copy of the event to every subscription registered for
-// its type. Delivery is non-blocking: when a consumer buffer is full the event
-// is dropped and counted on that subscription. Publishing to a closed bus is a
-// no-op. A nil event is ignored.
+// its type (and to every all-event subscription). Delivery is non-blocking:
+// when a consumer buffer is full the event is dropped and counted on that
+// subscription. Publishing to a closed bus is a no-op. A nil event is ignored.
 func (b *Bus) Publish(ev DomainEvent) {
 	if ev == nil {
 		return
@@ -175,7 +217,10 @@ func (b *Bus) Publish(ev DomainEvent) {
 		b.mu.RUnlock()
 		return
 	}
-	subs := make([]*subscription, 0, len(b.subs[ev.Type()]))
+	subs := make([]*subscription, 0, len(b.allSubs)+len(b.subs[ev.Type()]))
+	for _, sub := range b.allSubs {
+		subs = append(subs, sub)
+	}
 	for _, sub := range b.subs[ev.Type()] {
 		subs = append(subs, sub)
 	}
@@ -190,6 +235,14 @@ func (b *Bus) Publish(ev DomainEvent) {
 	}
 }
 
+// PublishEnvelope delivers an Envelope to every subscription registered for its
+// derived type discriminator (e.g. "envelope.signal.dep.missing" or
+// "envelope.telemetry"). It routes through the same non-blocking delivery as
+// Publish, so a slow consumer drops rather than stalls the publisher.
+func (b *Bus) PublishEnvelope(env Envelope) {
+	b.Publish(WrapEnvelope(env))
+}
+
 // Close stops the bus: all subscriptions are cancelled, dispatch goroutines are
 // joined, and subsequent Subscribe calls return nil. Publish after Close is a
 // no-op. Close is idempotent and safe for concurrent use.
@@ -201,13 +254,18 @@ func (b *Bus) Close() {
 	}
 	b.closed = true
 	subs := b.subs
+	allSubs := b.allSubs
 	b.subs = make(map[string]map[uint64]*subscription)
+	b.allSubs = make(map[uint64]*subscription)
 	b.mu.Unlock()
 
 	for _, byType := range subs {
 		for _, sub := range byType {
 			sub.cancel()
 		}
+	}
+	for _, sub := range allSubs {
+		sub.cancel()
 	}
 	b.wg.Wait()
 }

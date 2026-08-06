@@ -11,6 +11,8 @@ import (
 	eintent "github.com/PizenLabs/izen/pkg/engine/intent"
 	eplan "github.com/PizenLabs/izen/pkg/engine/plan"
 	estrate "github.com/PizenLabs/izen/pkg/engine/strategy"
+
+	"github.com/PizenLabs/izen/internal/domain/task"
 )
 
 // MicrokernelPlanner is the bridge between the immutable microkernel engine
@@ -69,6 +71,19 @@ func (p *MicrokernelPlanner) TryPlan(ctx stdctx.Context, candidates ...string) (
 		}
 	}
 	return nil, false, nil
+}
+
+// TryPlanCanonical is the canonical-equivalent of TryPlan: it runs the full
+// microkernel pipeline and returns the resulting tasks framed as a
+// *task.Plan. Every task is already a canonical task.Task (plan.Task is an
+// alias); the framing adds the fast-track marker and a summary.
+func (p *MicrokernelPlanner) TryPlanCanonical(ctx stdctx.Context, candidates ...string) (*task.Plan, bool, error) {
+	tasks, handled, err := p.TryPlan(ctx, candidates...)
+	if err != nil || !handled {
+		return nil, handled, err
+	}
+	summary := fmt.Sprintf("microkernel: %d executable task(s)", len(tasks))
+	return ToCanonicalPlan(tasks, true, summary), true, nil
 }
 
 // tryOne runs the pipeline for a single candidate. It returns
@@ -160,8 +175,8 @@ func convertExecutableToTasks(ep *eplan.ExecutablePlan) []Task {
 			continue
 		case eplan.StepRun:
 			out = append(out, Task{
-				StepNum:     len(out) + 1,
-				IsDone:      false,
+				StepNum: len(out) + 1,
+
 				Status:      "idle",
 				Type:        "SHELL_EXEC",
 				Target:      s.Target(),
@@ -172,8 +187,8 @@ func convertExecutableToTasks(ep *eplan.ExecutablePlan) []Task {
 			continue
 		case eplan.StepVerify:
 			out = append(out, Task{
-				StepNum:     len(out) + 1,
-				IsDone:      false,
+				StepNum: len(out) + 1,
+
 				Status:      "idle",
 				Type:        "SHELL_EXEC",
 				Target:      s.Target(),
@@ -186,8 +201,8 @@ func convertExecutableToTasks(ep *eplan.ExecutablePlan) []Task {
 			continue
 		}
 		out = append(out, Task{
-			StepNum:     len(out) + 1,
-			IsDone:      false,
+			StepNum: len(out) + 1,
+
 			Status:      "idle",
 			Type:        "FILE_MUTATE",
 			Target:      s.Target(),

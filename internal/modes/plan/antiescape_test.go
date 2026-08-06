@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/prompt"
 )
 
@@ -30,7 +31,7 @@ func TestIsDocumentationTarget(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := IsDocumentationTarget(tt.target, tt.taskTyp); got != tt.want {
+			if got := IsDocumentationTarget(tt.target, task.TaskType(tt.taskTyp)); got != tt.want {
 				t.Fatalf("IsDocumentationTarget(%q, %q) = %v, want %v", tt.target, tt.taskTyp, got, tt.want)
 			}
 		})

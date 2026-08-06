@@ -4,15 +4,20 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/domain/signal"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/runtime/output"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
+	"github.com/PizenLabs/izen/pkg/engine/layer3"
+	"github.com/PizenLabs/izen/pkg/engine/pipeline"
 	"github.com/PizenLabs/izen/pkg/recon"
 )
 
@@ -78,11 +83,23 @@ type Engine struct {
 	// telemetry back through the legacy package-level sinks.
 	bus *events.Bus
 
+	// signals records the canonical system signals generated during this
+	// investigation (e.g. a SignalDepMissing remote-dependency blocker). They
+	// are the typed evidence of "what machine/system signal occurred" and are
+	// surfaced as events.Envelope values on the bus when one is wired.
+	signals []signal.Signal
+
 	// planner enriches the forensic diagnostics with intent-aware,
 	// budget-fitted structural context before the AI orchestrator dispatches.
 	// Optional; nil disables the enrichment so headless/CLI runs behave
 	// exactly as before.
 	planner ContextPlanner
+
+	// facade is the Layer 0-5 pipeline Facade injected by the composition
+	// root. When wired, ValidateTargetFile runs the Layer 4 RAM validation DAG
+	// over a candidate target's content so downstream evidence can reference
+	// the structural/syntax outcome. Optional; nil keeps the engine offline.
+	facade pipeline.Facade
 }
 
 // ContextPlanner is the seam for intent-aware context planning. It is
@@ -187,11 +204,93 @@ func (e *Engine) WithContextPlanner(p ContextPlanner) *Engine {
 	return e
 }
 
+// WithPipelineFacade injects the Layer 0-5 pipeline Facade so the engine can
+// run Layer 4 RAM validation over candidate targets. May be nil (default): the
+// engine stays fully offline.
+func (e *Engine) WithPipelineFacade(f pipeline.Facade) *Engine {
+	if e != nil {
+		e.facade = f
+	}
+	return e
+}
+
+// Facade returns the injected Layer 0-5 pipeline Facade, if any.
+func (e *Engine) Facade() pipeline.Facade {
+	if e == nil {
+		return nil
+	}
+	return e.facade
+}
+
+// ValidateTargetFile runs the Layer 4 RAM validation DAG over the current
+// content of a candidate target file through the injected pipeline.Facade. It
+// returns (nil, nil) when no facade is wired — forensic callers treat the
+// validation as an optional enhancement. An unreadable target is surfaced as
+// an error.
+func (e *Engine) ValidateTargetFile(ctx context.Context, path string) (*pipeline.ValidationResult, error) {
+	if e == nil || e.facade == nil {
+		return nil, nil
+	}
+	content, err := os.ReadFile(filepath.Join(e.root, path))
+	if err != nil {
+		return nil, err
+	}
+	return e.facade.ValidatePatch(ctx, []layer3.FilePatch{{
+		Path:    path,
+		New:     string(content),
+		Changed: true,
+	}})
+}
+
 // emit publishes a domain event. It is a strict no-op when no bus is wired.
 func (e *Engine) emit(ev events.DomainEvent) {
 	if e != nil && e.bus != nil {
 		e.bus.Publish(ev)
 	}
+}
+
+// recordSignal appends a canonical system signal to the engine's signal record
+// (at most once per kind) and, when a bus is wired, surfaces it as an
+// events.Envelope so projections observe the typed signal stream.
+func (e *Engine) recordSignal(s signal.Signal) {
+	if e == nil {
+		return
+	}
+	for _, existing := range e.signals {
+		if existing.Kind == s.Kind {
+			return
+		}
+	}
+	e.signals = append(e.signals, s)
+	if e.bus != nil {
+		e.bus.PublishEnvelope(events.NewSignalEnvelope(s, "investigate"))
+	}
+}
+
+// hasSignal reports whether a signal of the given kind was already recorded.
+func (e *Engine) hasSignal(kind signal.SignalKind) bool {
+	if e == nil {
+		return false
+	}
+	for _, s := range e.signals {
+		if s.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// signalsFor returns the first recorded signal of the given kind, or nil.
+func (e *Engine) signalsFor(kind signal.SignalKind) *signal.Signal {
+	if e == nil {
+		return nil
+	}
+	for i := range e.signals {
+		if e.signals[i].Kind == kind {
+			return &e.signals[i]
+		}
+	}
+	return nil
 }
 
 // forensic publishes forensic telemetry to the event bus when wired, falling
@@ -1136,10 +1235,17 @@ func extractPackageName(rawError string) string {
 
 // injectDependencyBlocker scans the raw diagnostics for Go dependency errors
 // and injects the exact package path directly into the target conclusion pointer
-// using the canonical "lx bypassed" token format that /plan recognises.
+// using the canonical "lx bypassed" token format that /plan recognises. It also
+// records a canonical SignalDepMissing signal on the engine (surfaced as an
+// events.Envelope on the bus) so routing between investigate and plan evaluates
+// a typed signal instead of re-scanning free text.
 // It scans e.Ledger.Diagnostics directly (the raw compiler/test output) rather
 // than depending on high-level conclusion strings being already populated, so
 // the REMOTE DEPENDENCY BLOCKER token is guaranteed on the very first pass.
+//
+// Adapter First, Delete Later: the legacy token stamping is retained for
+// backward-compatible string handoffs while the typed signal is generated
+// alongside it.
 //
 // VANILLA_WEB ARCHETYPE: When the workspace contains only HTML/CSS/JS, Go
 // dependency blockers are NEVER injected — there is no Go module system to
@@ -1156,6 +1262,17 @@ func injectDependencyBlocker(e *Engine, targetConclusion *string) {
 		!strings.Contains(raw, "cannot find module providing package") {
 		return
 	}
+	// Signal generation is idempotent per engine run: the canonical
+	// SignalDepMissing signal carries the blocker flag and the dependency so
+	// downstream routing never needs to re-scan the token text.
+	if !e.hasSignal(signal.SignalDepMissing) {
+		e.recordSignal(signal.New(signal.SignalDepMissing, "investigate", map[string]string{
+			"dependency": extractPackageName(raw),
+			"blocker":    "true",
+		}))
+	}
+	// Token stamping is idempotent per conclusion string (the target may
+	// already carry a blocker from a previous pass).
 	if strings.Contains(*targetConclusion, "REMOTE DEPENDENCY BLOCKER") {
 		return
 	}

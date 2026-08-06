@@ -5,20 +5,20 @@ import (
 	"sync"
 )
 
-// Status describes the lifecycle of a single task within the cursor.
-type Status string
+// CursorStatus describes the lifecycle of a single node within the cursor.
+type CursorStatus string
 
 const (
-	// StatusPending marks a task that has not started.
-	StatusPending Status = "pending"
-	// StatusActive marks a task currently being executed.
-	StatusActive Status = "active"
-	// StatusCompleted marks a task that finished successfully.
-	StatusCompleted Status = "completed"
-	// StatusBlocked marks a pending task whose dependencies are unmet.
-	StatusBlocked Status = "blocked"
-	// StatusFailed marks a task that errored during execution.
-	StatusFailed Status = "failed"
+	// CursorStatusPending marks a node that has not started.
+	CursorStatusPending CursorStatus = "pending"
+	// CursorStatusActive marks a node currently being executed.
+	CursorStatusActive CursorStatus = "active"
+	// CursorStatusCompleted marks a node that finished successfully.
+	CursorStatusCompleted CursorStatus = "completed"
+	// CursorStatusBlocked marks a pending node whose dependencies are unmet.
+	CursorStatusBlocked CursorStatus = "blocked"
+	// CursorStatusFailed marks a node that errored during execution.
+	CursorStatusFailed CursorStatus = "failed"
 )
 
 // Progress is a snapshot of the cursor's aggregate counts.
@@ -44,7 +44,7 @@ type Cursor struct {
 	mu             sync.RWMutex
 	deps           map[string][]string
 	order          []string
-	statuses       map[string]Status
+	statuses       map[string]CursorStatus
 	completedOrder []string
 	activeOrder    []string
 	failedOrder    []string
@@ -64,22 +64,22 @@ func NewCursor(g *Graph) *Cursor {
 	return &Cursor{
 		deps:     deps,
 		order:    order,
-		statuses: make(map[string]Status, len(order)),
+		statuses: make(map[string]CursorStatus, len(order)),
 	}
 }
 
 // Status returns the current status of a task. Tasks absent from the cursor's
-// snapshot report StatusPending and false.
-func (c *Cursor) Status(id string) (Status, bool) {
+// snapshot report CursorStatusPending and false.
+func (c *Cursor) Status(id string) (CursorStatus, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if _, ok := c.deps[id]; !ok {
-		return StatusPending, false
+		return CursorStatusPending, false
 	}
 	if st, ok := c.statuses[id]; ok {
 		return st, true
 	}
-	return StatusPending, true
+	return CursorStatusPending, true
 }
 
 // Active returns the ids of tasks currently running, in activation order.
@@ -136,7 +136,7 @@ func (c *Cursor) pendingLocked() []string {
 	out := make([]string, 0, len(c.order))
 	for _, id := range c.order {
 		st := c.statuses[id]
-		if st == StatusCompleted || st == StatusFailed || st == StatusActive {
+		if st == CursorStatusCompleted || st == CursorStatusFailed || st == CursorStatusActive {
 			continue
 		}
 		out = append(out, id)
@@ -147,7 +147,7 @@ func (c *Cursor) pendingLocked() []string {
 // depsDoneLocked reports whether every dependency of id is completed.
 func (c *Cursor) depsDoneLocked(id string) bool {
 	for _, dep := range c.deps[id] {
-		if c.statuses[dep] != StatusCompleted {
+		if c.statuses[dep] != CursorStatusCompleted {
 			return false
 		}
 	}
@@ -162,11 +162,11 @@ func (c *Cursor) Advance() (string, error) {
 	defer c.mu.Unlock()
 	for _, id := range c.order {
 		st, ok := c.statuses[id]
-		if ok && st != StatusPending {
+		if ok && st != CursorStatusPending {
 			continue
 		}
 		if c.depsDoneLocked(id) {
-			c.statuses[id] = StatusActive
+			c.statuses[id] = CursorStatusActive
 			c.activeOrder = append(c.activeOrder, id)
 			return id, nil
 		}
@@ -186,13 +186,13 @@ func (c *Cursor) Complete(id string) error {
 	if _, ok := c.deps[id]; !ok {
 		return fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 	}
-	if c.statuses[id] == StatusCompleted {
+	if c.statuses[id] == CursorStatusCompleted {
 		return fmt.Errorf("%w: %s", ErrTaskAlreadyCompleted, id)
 	}
 	if !c.depsDoneLocked(id) {
 		return fmt.Errorf("%w: %s", ErrDependenciesPending, id)
 	}
-	c.statuses[id] = StatusCompleted
+	c.statuses[id] = CursorStatusCompleted
 	c.completedOrder = append(c.completedOrder, id)
 	c.removeActiveLocked(id)
 	return nil
@@ -207,10 +207,10 @@ func (c *Cursor) Fail(id string) error {
 	if _, ok := c.deps[id]; !ok {
 		return fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 	}
-	if c.statuses[id] == StatusCompleted || c.statuses[id] == StatusFailed {
+	if c.statuses[id] == CursorStatusCompleted || c.statuses[id] == CursorStatusFailed {
 		return nil
 	}
-	c.statuses[id] = StatusFailed
+	c.statuses[id] = CursorStatusFailed
 	c.failedOrder = append(c.failedOrder, id)
 	c.removeActiveLocked(id)
 	return nil
@@ -233,15 +233,15 @@ func (c *Cursor) Progress() Progress {
 	p := Progress{Total: len(c.order)}
 	for _, id := range c.order {
 		switch c.statuses[id] {
-		case StatusCompleted:
+		case CursorStatusCompleted:
 			p.Completed++
-		case StatusActive:
+		case CursorStatusActive:
 			p.Active++
-		case StatusFailed:
+		case CursorStatusFailed:
 			p.Failed++
-		case StatusBlocked:
+		case CursorStatusBlocked:
 			p.Blocked++
-		case StatusPending, "":
+		case CursorStatusPending, "":
 			if c.depsDoneLocked(id) {
 				p.Pending++
 			} else {
@@ -263,7 +263,7 @@ func (c *Cursor) IsComplete() bool {
 func (c *Cursor) Reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.statuses = make(map[string]Status, len(c.order))
+	c.statuses = make(map[string]CursorStatus, len(c.order))
 	c.completedOrder = nil
 	c.activeOrder = nil
 	c.failedOrder = nil

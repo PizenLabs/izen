@@ -138,6 +138,11 @@ func (e *Engine) ValidateFirstToken(output string) error {
 // QueueProposal registers a mutation for human validation. It MUST be called
 // before any file mutation or bash execution under /build. The returned ID is
 // used to track approval state. No mutation is applied until Approved==true.
+//
+// The approval request is announced on the bus as the canonical
+// EventApprovalRequested signal (Tier 4 Human-in-the-Loop) so projections —
+// including the presentation layer's derived AwaitingApproval state — observe
+// the workflow awaiting human approval from a single source.
 func (e *Engine) QueueProposal(p Proposal) string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -146,6 +151,7 @@ func (e *Engine) QueueProposal(p Proposal) string {
 	}
 	e.pendingProposals = append(e.pendingProposals, p)
 	e.emit(events.NewPatchAttempted(p.File, p.Strategy, len(e.pendingProposals)))
+	e.emit(events.NewApprovalRequested(p.File, "build proposal awaiting human approval", ""))
 	return p.ID
 }
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/domain/signal"
 	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
@@ -1918,6 +1919,44 @@ func TestVanillaWebSkipsDependencyBlocker(t *testing.T) {
 	injectDependencyBlocker(eng, &conclusion)
 	if strings.Contains(conclusion, "REMOTE DEPENDENCY BLOCKER") {
 		t.Fatal("VANILLA_WEB should never inject REMOTE DEPENDENCY BLOCKER")
+	}
+	if eng.hasSignal(signal.SignalDepMissing) {
+		t.Fatal("VANILLA_WEB should never record a SignalDepMissing signal")
+	}
+}
+
+// TestInjectDependencyBlockerRecordsSignal verifies that injectDependencyBlocker
+// generates a canonical SignalDepMissing signal (with blocker flag and
+// dependency payload) alongside the legacy token, and that the signal is
+// idempotent across repeated injections.
+func TestInjectDependencyBlockerRecordsSignal(t *testing.T) {
+	eng := NewEngine(".", "test", nil, nil)
+	eng.Ledger.SetDiagnostics("no required module provides package github.com/foo/bar")
+
+	var conclusion string
+	injectDependencyBlocker(eng, &conclusion)
+	if !strings.Contains(conclusion, "REMOTE DEPENDENCY BLOCKER") {
+		t.Fatal("expected legacy blocker token to be stamped")
+	}
+	dep := eng.signalsFor(signal.SignalDepMissing)
+	if dep == nil {
+		t.Fatal("expected a SignalDepMissing signal to be recorded")
+	}
+	if dep.PayloadValue("blocker") != "true" {
+		t.Fatalf("blocker flag missing: %+v", dep.Payload)
+	}
+	if dep.PayloadValue("dependency") != "github.com/foo/bar" {
+		t.Fatalf("dependency payload = %q, want github.com/foo/bar", dep.PayloadValue("dependency"))
+	}
+
+	// A second injection into another conclusion must not duplicate the signal.
+	var other string
+	injectDependencyBlocker(eng, &other)
+	if len(eng.signals) != 1 {
+		t.Fatalf("expected exactly 1 recorded signal, got %d", len(eng.signals))
+	}
+	if !strings.Contains(other, "REMOTE DEPENDENCY BLOCKER") {
+		t.Fatal("expected second conclusion to receive the blocker token")
 	}
 }
 

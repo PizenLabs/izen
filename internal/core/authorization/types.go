@@ -65,6 +65,7 @@ const (
 	StepCapabilityGuard
 	StepBudgetSufficiency
 	StepCheckpointVerification
+	StepPolicy
 )
 
 func (s DeniedStep) String() string {
@@ -85,6 +86,8 @@ func (s DeniedStep) String() string {
 		return "budget-sufficiency"
 	case StepCheckpointVerification:
 		return "checkpoint-verification"
+	case StepPolicy:
+		return "policy"
 	default:
 		return fmt.Sprintf("denied-step(%d)", int(s))
 	}

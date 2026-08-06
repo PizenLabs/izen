@@ -6,33 +6,33 @@ import (
 	"sync"
 )
 
-// Task is a single unit of work in the execution graph.
-type Task struct {
-	// ID uniquely identifies the task within the graph.
+// Node is a single unit of work in the execution graph.
+type Node struct {
+	// ID uniquely identifies the node within the graph.
 	ID string
 	// Description is a human-readable summary of the work.
 	Description string
-	// Dependencies lists the ids of tasks that must complete first.
+	// Dependencies lists the ids of nodes that must complete first.
 	Dependencies []string
 }
 
-// Graph is a thread-safe directed acyclic graph of tasks keyed by id. Edges
-// point from a task to the tasks it depends on.
+// Graph is a thread-safe directed acyclic graph of work nodes keyed by id.
+// Edges point from a node to the nodes it depends on.
 type Graph struct {
 	mu    sync.RWMutex
-	tasks map[string]Task
+	tasks map[string]Node
 	order []string
 }
 
 // New builds an empty task graph.
 func New() *Graph {
-	return &Graph{tasks: make(map[string]Task)}
+	return &Graph{tasks: make(map[string]Node)}
 }
 
-// Add inserts a task, rejecting empty ids, duplicate ids, and self
+// Add inserts a node, rejecting empty ids, duplicate ids, and self
 // dependencies. Forward references to not-yet-added dependencies are allowed
 // and are validated by Validate.
-func (g *Graph) Add(t Task) error {
+func (g *Graph) Add(t Node) error {
 	if t.ID == "" {
 		return ErrEmptyTaskID
 	}
@@ -51,15 +51,15 @@ func (g *Graph) Add(t Task) error {
 	return nil
 }
 
-// Get returns the task with the given id.
-func (g *Graph) Get(id string) (Task, bool) {
+// Get returns the node with the given id.
+func (g *Graph) Get(id string) (Node, bool) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	t, ok := g.tasks[id]
 	return t, ok
 }
 
-// Has reports whether a task with the given id exists.
+// Has reports whether a node with the given id exists.
 func (g *Graph) Has(id string) bool {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -67,18 +67,18 @@ func (g *Graph) Has(id string) bool {
 	return ok
 }
 
-// Len returns the number of tasks in the graph.
+// Len returns the number of nodes in the graph.
 func (g *Graph) Len() int {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return len(g.tasks)
 }
 
-// Tasks returns a snapshot of all tasks in insertion order.
-func (g *Graph) Tasks() []Task {
+// Tasks returns a snapshot of all nodes in insertion order.
+func (g *Graph) Tasks() []Node {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	out := make([]Task, 0, len(g.order))
+	out := make([]Node, 0, len(g.order))
 	for _, id := range g.order {
 		out = append(out, g.tasks[id])
 	}
@@ -175,7 +175,7 @@ func (g *Graph) TopologicalOrder() ([]string, error) {
 // topoLocked runs Kahn's algorithm over the graph under an already-held read
 // lock. It returns ErrCycleDetected when the graph is cyclic. Iteration follows
 // insertion order so the result is deterministic.
-func topoLocked(tasks map[string]Task, order []string) ([]string, error) {
+func topoLocked(tasks map[string]Node, order []string) ([]string, error) {
 	indeg := make(map[string]int, len(tasks))
 	for _, id := range order {
 		indeg[id] = len(tasks[id].Dependencies)
@@ -206,7 +206,7 @@ func topoLocked(tasks map[string]Task, order []string) ([]string, error) {
 
 // dependentsOf returns the ids of tasks that directly depend on id, iterated in
 // insertion order.
-func dependentsOf(tasks map[string]Task, order []string, id string) []string {
+func dependentsOf(tasks map[string]Node, order []string, id string) []string {
 	var out []string
 	for _, tID := range order {
 		for _, dep := range tasks[tID].Dependencies {

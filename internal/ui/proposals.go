@@ -418,7 +418,7 @@ func parseUnifiedDiffHunks(content string) (string, string) {
 
 func (m *model) applySingleProposal() tea.Cmd {
 	if len(m.pendingProposals) == 0 {
-		m.state = StateChat
+		m.resolveApprovalState()
 		m.recalcViewportHeight()
 		m.awaitingConfirmation = false
 		return nil

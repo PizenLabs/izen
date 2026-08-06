@@ -1,55 +1,55 @@
-# Pull Request Template
-
 ## Description
 
-Brief description of changes.
+<!-- Provide a brief summary of the change, the problem it solves, or the feature it adds. -->
 
 ## Type of Change
 
 - [ ] Bug fix (non-breaking change fixing an issue)
 - [ ] New feature (non-breaking change adding functionality)
-- [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
+- [ ] Refactoring / Architectural improvement
 - [ ] Documentation update
-- [ ] Refactoring (no functional changes)
-- [ ] Performance improvement
-- [ ] Test coverage
 
-## Related Issues
+---
 
-Closes #(issue number)
+## Architectural Compliance Checklist
 
-## Philosophy Check
+Please confirm your PR adheres to Izen's **Architecture Guardrails**:
 
-- [ ] Improves human understanding
-- [ ] Reduces noise / complexity
-- [ ] Preserves human control
-- [ ] Increases trust through visibility
-- [ ] Fits local-first
-- [ ] Mutations are reversible
-- [ ] Graph-first / structure before intelligence
-- [ ] Behavior is deterministic
+### 1. "One Question, One Owner" Check
 
-## Testing
+- [ ] **Component Ownership:** Does this PR add logic to a component? If so, does it answer *only* the single question owned by that component?
+- [ ] **No Policy Creep:** `Capability Graph` contains NO `Allow/Deny` logic.
+- [ ] **No Capability Creep:** `Policy Engine` reads facts from `Capability Graph` rather than probing OS/tools directly.
+- [ ] **Thin Decision Loop:** `DecisionEngine` delegates specific calculations (budget, retry, risk) to injected policies.
 
-- [ ] All existing tests pass (`go test ./...`)
-- [ ] New tests added for new functionality
-- [ ] Race detector passes (`go test -race ./...`)
-- [ ] Linter passes (`go vet ./...` and `staticcheck ./...`)
-- [ ] Lynx tests pass (`cd lynx && cargo test`)
+### 2. Dependency & Layering Rules
 
-## Checklist
+- [ ] **Unidirectional Imports:** Does dependency flow strictly DOWN? (e.g., `pkg/engine` or `internal/domain` do NOT import `internal/ui` or `internal/modes`).
+- [ ] **Events Flow UP:** State changes are communicated to upper layers via `events.Envelope` on `internal/events.Bus`.
+- [ ] **Single Composition Root:** New services/engines are wired inside `internal/runtime/compose/compose.go`. No direct `new Engine()` instantiations inside UI or handlers.
 
-- [ ] Code follows project style (gofmt, clippy)
-- [ ] Public APIs have Go doc comments
-- [ ] Commit messages follow conventional commits
-- [ ] Documentation updated if needed
-- [ ] No new warnings from linters
-- [ ] Config changes documented in README/TECHSTACK
+### 3. Implementation Integrity
 
-## Screenshots (if UI changes)
+- [ ] **Typed Signals:** No raw string or regex matching on terminal/log output for error routing or mode handoffs (uses `domain.Signal`).
+- [ ] **Canonical Types:** Uses canonical domain types (`domain.Task`, `domain.Signal`, `events.Envelope`, `UserIntent`).
 
-<!-- Add screenshots here -->
+---
 
-## Additional Notes
+## Verification
 
-<!-- Any other context -->
+Please run the following commands locally and attach test output:
+
+```bash
+# 1. Build verification
+go build ./...
+
+# 2. Race detector & Unit tests
+go test ./... -race
+
+# 3. Linter check
+golangci-lint run ./...
+```
+
+- [ ] `go build ./...` passed cleanly.
+- [ ] `go test ./... -race` passed cleanly.
+- [ ] `golangci-lint run ./...` returned 0 issues.

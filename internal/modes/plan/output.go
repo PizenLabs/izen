@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/prompt"
 )
 
@@ -340,7 +341,7 @@ var DocumentationFilePatterns = []string{
 // targets it matches against DocumentationFilePatterns. This is the primary
 // anti-escape gate that prevents the local model from "fixing" compile/dep
 // failures by silently patching README.md or other docs.
-func IsDocumentationTarget(target string, taskType string) bool {
+func IsDocumentationTarget(target string, taskType task.TaskType) bool {
 	if taskType == "SHELL_EXEC" {
 		// Only block shell commands that explicitly write to doc files
 		// (e.g. redirection into README.md). Plain build/dep commands are fine.
@@ -368,7 +369,7 @@ func IsDocumentationTarget(target string, taskType string) bool {
 // Returns (isValid, isPlaceholder) where:
 // - isValid: true if the target is a valid, non-placeholder path
 // - isPlaceholder: true if the target contains placeholder patterns
-func ValidateTaskTarget(target string, taskType string) (isValid bool, isPlaceholder bool) {
+func ValidateTaskTarget(target string, taskType task.TaskType) (isValid bool, isPlaceholder bool) {
 	if target == "" {
 		return false, false
 	}
@@ -380,7 +381,7 @@ func ValidateTaskTarget(target string, taskType string) (isValid bool, isPlaceho
 	}
 
 	// Shell commands are valid if they're not empty
-	if taskType == "SHELL_EXEC" {
+	if taskType == task.TaskShellExec {
 		return len(strings.TrimSpace(target)) > 0, false
 	}
 

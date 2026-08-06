@@ -79,12 +79,17 @@ const (
 	roleActivity
 )
 
-type UIState uint8
+// UIState is the derived modal presentation state. The canonical type lives in
+// the presentation layer (presentation.UIState); these aliases keep the view
+// vocabulary unified with the projection so AwaitingApproval/Processing are
+// always computed from the canonical workflow state, never independent local
+// flags.
+type UIState = presentation.UIState
 
 const (
-	StateChat UIState = iota
-	StateAwaitingApproval
-	StateProcessing
+	StateChat             = presentation.StateChat
+	StateAwaitingApproval = presentation.StateAwaitingApproval
+	StateProcessing       = presentation.StateProcessing
 )
 
 type record struct {
@@ -1064,6 +1069,11 @@ type model struct {
 	// store or cache its own copies of workflow states or capability flags.
 	runtimeCtx *runtime.RuntimeContext
 	workflowSM *workflow.WorkflowStateMachine
+	// viewState is the derived presentation projection of the canonical
+	// workflow event stream (EventPhaseChanged / EventApprovalRequested). The
+	// UI derives StateAwaitingApproval/StateProcessing from it via
+	// syncUIState instead of hand-setting independent flags.
+	viewState *presentation.WorkflowViewState
 
 	// Init/setup state machine
 	initStage          initStage
@@ -1243,6 +1253,24 @@ func (m *model) syncPipelineTiers() {
 		tier := i.String()
 		return m.cfg.ResolveTierModel(tier), m.cfg.ResolveTierProvider(tier)
 	})
+}
+
+// pipelineFacade returns the layered Pipeline Engine as its narrow
+// pipeline.Facade boundary, resolving it from the UI's direct engine or the
+// orchestrator. It is the seam Mode UseCases (investigate/review) consume for
+// Layer 4 validation and heavy context generation. Nil in headless/test
+// harnesses.
+func (m *model) pipelineFacade() pipeline.Facade {
+	if m == nil {
+		return nil
+	}
+	if m.pipelineEngine != nil {
+		return m.pipelineEngine
+	}
+	if m.orch != nil {
+		return m.orch.Pipeline()
+	}
+	return nil
 }
 
 // isProjectInitialized checks whether .izen/ exists AND contains a valid
@@ -1563,6 +1591,12 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		}
 	case events.PhaseChangedPayload:
 		m.logActivity("[phase] %s → %s", p.From, p.To)
+		// The presentation state is a pure projection of the canonical
+		// workflow phase: derive, never hand-set.
+		if m.viewState != nil {
+			m.viewState.Project(ev)
+		}
+		m.syncUIState()
 	case events.PatchParsedPayload:
 		m.logActivity("[patch] parsed %s (strategy=%s, tier=%d)", p.File, p.Strategy, p.Tier)
 	case events.PatchValidatedPayload:
@@ -1577,6 +1611,13 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			target = "intent disambiguation"
 		}
 		m.logActivity("[approval] requested for %s: %s", target, truncateForActivity(p.Reason))
+		// A Tier 4 approval request is projected onto the derived presentation
+		// state: the WorkflowStateMachine holds the pending-approval truth and
+		// the UI derives StateAwaitingApproval from it.
+		if m.viewState != nil {
+			m.viewState.Project(ev)
+		}
+		m.enterApprovalState()
 	case events.ActivityPayload:
 		// Engine activity telemetry (retrieval/execution/investigate sinks)
 		// projected onto the UI goroutine through the bus.
@@ -1591,6 +1632,142 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// the box into compact mode.
 		m.handleReasoningStream(p.Chunk, p.IsComplete)
 	}
+}
+
+// ── Derived UI state projection ──────────────────────────────────────────────
+// StateAwaitingApproval and StateProcessing are DERIVED presentation states:
+// they are computed through presentation.DeriveUIState from the canonical
+// WorkflowStateMachine (phase + pending-approval gate) and the workflow event
+// stream (EventPhaseChanged / EventApprovalRequested). The UI never hand-sets
+// the approval state; it records the approval gate on the canonical source
+// (MarkApprovalPending/Resolved) and re-derives.
+
+// enterApprovalState freezes the workflow pending-approval gate and derives the
+// UI state from it. The WorkflowStateMachine is the single source of truth for
+// proposals awaiting human approval.
+func (m *model) enterApprovalState() {
+	if m.workflowSM != nil {
+		m.workflowSM.MarkApprovalPending()
+	}
+	m.syncUIState()
+}
+
+// resolveApprovalState clears the workflow pending-approval gate and re-derives
+// the presentation state. Approve/reject/cancel all funnel here so no path can
+// leave the canonical gate and the UI state out of sync.
+func (m *model) resolveApprovalState() {
+	if m.workflowSM != nil {
+		m.workflowSM.MarkApprovalResolved()
+	}
+	if m.viewState != nil {
+		m.viewState.ResolveApproval()
+	}
+	m.syncUIState()
+}
+
+// handleEmergencyInterrupt is the unblockable emergency escape hatch. It is
+// invoked from the very top of Update, BEFORE any state gating, so a stuck
+// processing/approval state can NEVER swallow the keyboard (Philosophy Rule 1:
+// Human-Centered / Reversible, Rule 3: Explicit Over Implicit).
+//
+// It performs a full deterministic reset:
+//  1. Cancels every in-flight background context (ghost-loop prevention).
+//  2. Clears every transient processing flag via reconcileSpinner so the
+//     spinner can never stay up on a phantom producer.
+//  3. Releases any outstanding approval gate on the canonical workflow source.
+//  4. Drops in-flight approval/patch state so the viewport returns to chat.
+//  5. Re-derives the presentation state to interactive StateChat.
+func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
+	// 1. Cancel every in-flight background context (ghost-loop prevention).
+	m.cancelAllBackgroundContexts()
+	if m.streamCancel != nil {
+		m.streamCancel()
+		m.streamCancel = nil
+	}
+	if m.shellCancel != nil {
+		m.shellCancel()
+		m.shellCancel = nil
+	}
+	execution.KillAllOrphans()
+
+	// 2. Clear every transient processing flag so the spinner can never stay
+	// up and the view can never block on a phantom producer.
+	m.reconcileSpinner()
+
+	// 3. Release any outstanding approval gate on the canonical source.
+	m.resolveApprovalState()
+
+	// 4. Drop in-flight approval/patch state so the viewport returns to chat.
+	m.awaitingConfirmation = false
+	m.pendingProposals = nil
+	m.pendingBuildApproval = false
+	m.pendingBuildTask = nil
+	m.pendingHotfixTask = nil
+	m.pendingHotfixPatch = nil
+	m.acceptAll = false
+	m.pendingRouteConfirm = false
+	if m.toolCallBuffer != nil {
+		m.toolCallBuffer.Reject()
+	}
+
+	// 5. Restore interactive input and force the presentation back to chat.
+	m.ti.Focus()
+	m.recalcViewportHeight()
+	m.state = StateChat
+
+	m.push(roleSystem, infoStyle.Render("Interrupted."))
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
+	return m, tea.Batch(
+		func() tea.Msg { return TaskFinishedMsg{} },
+		m.runtimeCancelCmd(reason+" interrupt"),
+	)
+}
+
+// syncUIState projects the canonical workflow state onto the presentation
+// state. It is the single place the approval presentation state is derived.
+//
+// StateAwaitingApproval is strictly derived from the canonical pending-approval
+// gate. StateProcessing is derived from the active workflow phase only while a
+// transient operation is genuinely in flight — a mode phase persists across
+// operations, so it cannot gate the input line by itself. Otherwise the view
+// rests in StateChat.
+func (m *model) syncUIState() {
+	if m == nil {
+		return
+	}
+	phase := ""
+	approval := false
+	if m.workflowSM != nil {
+		phase = m.workflowSM.State().String()
+		approval = m.workflowSM.PendingApproval()
+	}
+	if m.viewState != nil {
+		m.viewState.Sync(phase, approval)
+	}
+	busy := m.isWorkflowBusy()
+	if approval {
+		// Approval ALWAYS overrides any residual processing signal: a plan
+		// awaiting approval must hand control to the user even if a
+		// background process forgot to clear its transient flags.
+		m.state = presentation.DeriveUIState(phase, true, busy)
+		return
+	}
+	if busy {
+		m.state = presentation.DeriveUIState(phase, false, true)
+		return
+	}
+	// Resting in a mode phase must never gate the input line by itself —
+	// a persistent phase is NOT an in-flight operation.
+	m.state = StateChat
+}
+
+// isWorkflowBusy reports whether a transient workflow operation (stream, agent,
+// review, pipeline or shell command) is in flight. It feeds the derived
+// UIState so Processing is only derived while an operation is genuinely
+// running.
+func (m *model) isWorkflowBusy() bool {
+	return m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.shellRunning
 }
 
 // handlePresentationEvent projects one Application-layer PresentationEvent

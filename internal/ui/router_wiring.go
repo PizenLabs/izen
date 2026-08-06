@@ -59,7 +59,7 @@ func (m *model) handleRouterResult(msg routerResultMsg) (tea.Model, tea.Cmd) {
 		m.pendingRouteResult = res
 		m.pendingRouteOptions = options
 		m.pendingRouteIdx = idx
-		m.state = StateAwaitingApproval
+		m.enterApprovalState()
 		m.awaitingConfirmation = true
 		m.ti.Blur()
 		m.recalcViewportHeight()
@@ -110,7 +110,7 @@ func (m *model) confirmRouteSelection(mode modes.Mode) tea.Cmd {
 	m.pendingRouteResult = router.ClassificationResult{}
 	m.pendingRouteOptions = nil
 	m.pendingRouteIdx = 0
-	m.state = StateChat
+	m.resolveApprovalState()
 	m.awaitingConfirmation = false
 	m.recalcViewportHeight()
 	m.ti.Focus()
@@ -137,13 +137,10 @@ func (m *model) cancelRouteSelection() tea.Cmd {
 	m.pendingRouteResult = router.ClassificationResult{}
 	m.pendingRouteOptions = nil
 	m.pendingRouteIdx = 0
-	m.state = StateChat
+	m.resolveApprovalState()
 	m.awaitingConfirmation = false
 	m.recalcViewportHeight()
 	m.ti.Focus()
-	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
-	m.push(roleStatus, "Prompt sent to /ask")
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
 	return m.handleMessageContent(line)

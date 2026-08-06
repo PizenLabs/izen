@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/domain/task"
 )
 
 type StrategicOverview struct {
@@ -130,9 +132,8 @@ func convertAtomicTasks(atomic []AtomicTask) []Task {
 		}
 		tasks = append(tasks, Task{
 			StepNum:     i + 1,
-			IsDone:      false,
-			Status:      "idle",
-			Type:        taskType,
+			Status:      task.StatusIdle,
+			Type:        task.TaskType(taskType),
 			Target:      target,
 			Description: desc,
 			Rationale:   rationale,

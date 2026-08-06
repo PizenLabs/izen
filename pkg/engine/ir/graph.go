@@ -214,9 +214,12 @@ func (g *ExecutionGraph) TopoOrder() ([]*ExecutionNode, error) {
 			succ[dep] = append(succ[dep], n.ID)
 		}
 	}
+	// Roots are seeded in graph insertion order (not map order) so the
+	// topological order is deterministic across runs: independent nodes keep
+	// their declaration order.
 	var roots []string
-	for id, deg := range indeg {
-		if deg == 0 {
+	for _, id := range g.order {
+		if indeg[id] == 0 {
 			roots = append(roots, id)
 		}
 	}
