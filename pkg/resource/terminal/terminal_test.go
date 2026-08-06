@@ -2,6 +2,7 @@ package terminal
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -137,5 +138,31 @@ func TestTerminalResourceRestoreRejectsForeignSnapshot(t *testing.T) {
 	}
 	if err := tr.Restore(ctx, fakeSnapshot{}); err == nil {
 		t.Fatal("expected error restoring a foreign snapshot type")
+	}
+}
+
+func TestTerminalResourceRun(t *testing.T) {
+	ctx := t.Context()
+	tr, err := NewTerminalResource(t.TempDir(), nil, "")
+	if err != nil {
+		t.Fatalf("NewTerminalResource: %v", err)
+	}
+	out, err := tr.Run(ctx, "echo hello")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(out, "hello") {
+		t.Fatalf("unexpected output %q", out)
+	}
+}
+
+func TestTerminalResourceRunFailure(t *testing.T) {
+	ctx := t.Context()
+	tr, err := NewTerminalResource(t.TempDir(), nil, "")
+	if err != nil {
+		t.Fatalf("NewTerminalResource: %v", err)
+	}
+	if _, err := tr.Run(ctx, "exit 1"); err == nil {
+		t.Fatal("expected error for a failing command")
 	}
 }

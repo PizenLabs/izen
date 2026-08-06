@@ -205,3 +205,16 @@ func (f *FileResource) Write(data []byte) error {
 	}
 	return nil
 }
+
+// Delete removes the target file. It is idempotent: deleting a file that does
+// not exist is a no-op.
+func (f *FileResource) Delete() error {
+	path := f.targetPath()
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("file: delete %q: %w", path, err)
+	}
+	return nil
+}

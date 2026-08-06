@@ -147,3 +147,23 @@ func TestFileResourceRestoreRejectsForeignSnapshot(t *testing.T) {
 		t.Fatal("expected error restoring a foreign snapshot type")
 	}
 }
+
+func TestFileResourceDelete(t *testing.T) {
+	r, path := newTestFileResource(t)
+	if err := r.Delete(); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected file removed, stat err %v", err)
+	}
+}
+
+func TestFileResourceDeleteIdempotent(t *testing.T) {
+	r, _ := newTestFileResource(t)
+	if err := r.Delete(); err != nil {
+		t.Fatalf("first Delete: %v", err)
+	}
+	if err := r.Delete(); err != nil {
+		t.Fatalf("second Delete should be a no-op: %v", err)
+	}
+}

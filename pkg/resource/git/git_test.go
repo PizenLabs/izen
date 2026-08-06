@@ -153,3 +153,38 @@ func TestGitResourceRestoreRejectsForeignSnapshot(t *testing.T) {
 		t.Fatal("expected error restoring a foreign snapshot type")
 	}
 }
+
+func TestGitResourceCommit(t *testing.T) {
+	requireGit(t)
+	t.Setenv("GIT_AUTHOR_NAME", "test")
+	t.Setenv("GIT_AUTHOR_EMAIL", "test@example.com")
+	t.Setenv("GIT_COMMITTER_NAME", "test")
+	t.Setenv("GIT_COMMITTER_EMAIL", "test@example.com")
+
+	ctx := t.Context()
+	dir := t.TempDir()
+	initRepo(t, dir)
+	if err := os.WriteFile(filepath.Join(dir, "file.txt"), []byte("v2"), 0o644); err != nil {
+		t.Fatalf("write v2: %v", err)
+	}
+
+	g, err := NewGitResource(dir)
+	if err != nil {
+		t.Fatalf("NewGitResource: %v", err)
+	}
+	before := strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
+	sha, err := g.Commit(ctx, "second")
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	after := strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
+	if sha != after {
+		t.Fatalf("expected returned SHA %q to equal HEAD %q", sha, after)
+	}
+	if after == before {
+		t.Fatal("expected a new commit")
+	}
+	if got := strings.TrimSpace(runGit(t, dir, "show", "HEAD:file.txt")); got != "v2" {
+		t.Fatalf("expected committed content %q, got %q", "v2", got)
+	}
+}

@@ -122,3 +122,19 @@ func (g *GitResource) gitOutput(ctx context.Context, args ...string) (string, er
 	}
 	return string(out), nil
 }
+
+// Commit stages all changes in the workspace and creates a commit with the
+// given message, returning the new HEAD commit SHA.
+func (g *GitResource) Commit(ctx context.Context, message string) (string, error) {
+	if err := g.runGit(ctx, "add", "-A"); err != nil {
+		return "", fmt.Errorf("git: stage changes: %w", err)
+	}
+	if err := g.runGit(ctx, "commit", "-m", message); err != nil {
+		return "", fmt.Errorf("git: commit %q: %w", message, err)
+	}
+	sha, err := g.gitOutput(ctx, "rev-parse", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("git: resolve HEAD: %w", err)
+	}
+	return strings.TrimSpace(sha), nil
+}

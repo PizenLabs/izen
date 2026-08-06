@@ -146,3 +146,17 @@ func (t *TerminalResource) Restore(ctx context.Context, s resource.Snapshot) err
 	t.shell = snap.data.Shell
 	return nil
 }
+
+// Run executes command through the configured shell in the resource's working
+// directory and environment, returning the combined output. The command is
+// bound to ctx so cancellation interrupts the subprocess.
+func (t *TerminalResource) Run(ctx context.Context, command string) (string, error) {
+	cmd := exec.CommandContext(ctx, t.shell, "-c", command)
+	cmd.Dir = t.dir
+	cmd.Env = append([]string(nil), t.env...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("terminal: command %q failed: %w", command, err)
+	}
+	return string(out), nil
+}
