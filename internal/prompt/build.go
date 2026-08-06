@@ -17,7 +17,7 @@ that do not exist yet. Choose the output format based on the file's state:
 
 EXISTING FILE (content already on disk)
 - Output ONLY the minimal change using SEARCH/REPLACE blocks or unified diffs.
-- ` + cb + `go:path/to/file.go
+- ` + cb + `go:main.go
 <<<<<<< SEARCH
 old code
 =======
@@ -26,14 +26,17 @@ new code
 ` + cb + `
 - Never rewrite the entire file.
 
-NEW FILE or 0-BYTE FILE (no content on disk yet)
+NEW FILE, 0-BYTE FILE, OR STUB (no content or under 100 lines on disk)
 - Output the COMPLETE file content inside a single markdown code block with the
   appropriate language tag (e.g. ` + cb + `css, ` + cb + `javascript, ` + cb + `html, ` + cb + `python, ` + cb + `go), OR a ` + "`FILE: <path>`" + ` block followed by the full content.
 - Do NOT force a SEARCH/REPLACE patch or unified diff on a file that does not
   exist — there is no "old content" to search for.
+- Stub files are incomplete skeletons: output the COMPLETE, FULLY IMPLEMENTED
+  content and expand every function, style, and markup. Do NOT repeat stubs.
 - Do NOT use FILE_CREATE markers.
 
 RULES
+- Output exact target relative file paths from the workspace root. Do NOT invent subdirectories like path/to/file/.
 - No conversational text, explanations, or markdown outside the block.
 - Output ends immediately after the last block.` + TokenThriftyConstraint
 }
@@ -54,7 +57,7 @@ func NewFileContract() string {
 Generate ONLY the raw file content for the requested file.
 Output the complete file content either inside a SINGLE markdown code block
 or as a FILE: <path> block:
-` + "`FILE: " + `path/to/newfile.go
+` + "`FILE: " + `index.html
 <complete file content>
 ` + "`" + `
 Use the appropriate language tag on the opening fence (e.g. ` + "```" + `css, ` + "```" + `javascript, ` + "```" + `html, ` + "```" + `python, ` + "```" + `go).
@@ -87,7 +90,7 @@ func ExistingFileContract() string {
 Output ONLY the minimal change needed using one of these formats:
 
 METHOD C — SEARCH/REPLACE (preferred):
-` + code + `go:path/to/file.go
+` + code + `go:main.go
 <<<<<<< SEARCH
 old code
 =======
@@ -97,8 +100,8 @@ new code
 
 METHOD D — Unified Diff (alternative):
 ` + code + `diff
---- a/path/to/file.go
-+++ b/path/to/file.go
+--- a/main.go
++++ b/main.go
 @@ -1,3 +1,4 @@
  existing
 -old
@@ -107,6 +110,7 @@ METHOD D — Unified Diff (alternative):
 
 RULES
 - Existing files -> SEARCH/REPLACE or unified diff only. Never rewrite the entire file.
+- Stub files (under 100 lines) -> output the COMPLETE, FULLY IMPLEMENTED file content in one block. Never use SEARCH/REPLACE or unified diff.
 - The SEARCH blocks you emit MUST match text that actually exists in the file.
 - SEARCH blocks must match EXACTLY (whitespace-sensitive).
 - Include at least 2-3 lines of context in SEARCH blocks.

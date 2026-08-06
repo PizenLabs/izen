@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 )
@@ -24,6 +26,18 @@ var ErrOpenRouterAuth = errors.New("openrouter: authorization failed (HTTP 401):
 // DefaultOpenRouterModel is the safe fallback model ID used when a request
 // carries no model resolvable to OpenRouter's vendor/model schema.
 const DefaultOpenRouterModel = "anthropic/claude-3.5-sonnet"
+
+// openRouterMaxRateLimitRetries bounds how many times a request answered with
+// HTTP 429 (Too Many Requests / rate limit) is retried before the error is
+// surfaced to the caller. Each retry waits longer (exponential backoff), so the
+// total backoff window across all retries stays small while giving a
+// rate-limited free-tier model room to recover.
+const openRouterMaxRateLimitRetries = 3
+
+// openRouterRateLimitBackoffBase is the base delay unit for exponential backoff
+// on HTTP 429 responses: retries wait 1s, 2s, 4s. It is a package-level variable
+// (not a const) so tests can shrink it and keep the suite fast.
+var openRouterRateLimitBackoffBase = time.Second
 
 // openRouterModelIDRe matches OpenRouter's vendor/model-id schema: a non-empty
 // vendor component, a single "/", and a non-empty model component. Vendors
@@ -401,6 +415,16 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 // OpenRouter models do not accept the reasoning schema, and OpenRouter bills
 // tokens at the gateway before the stream fails. Stripping reasoning lets the
 // turn complete without reasoning rather than failing the whole request.
+//
+// HTTP 429 (Too Many Requests) responses are handled gracefully with a retry
+// loop before the error is thrown: the Retry-After header is honored when
+// present, otherwise the request is retried with exponential backoff
+// (1s -> 2s -> 4s) up to openRouterMaxRateLimitRetries times. The wait between
+// retries is interruptible by the request context so a cancelled or
+// deadline-exceeded context surfaces promptly instead of sleeping out the full
+// backoff window. Both the non-streaming Execute path and the streaming
+// ExecuteStream path route through this function, so rate-limited free-tier
+// builds recover instead of aborting on the first 429.
 func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body openrouterRequest, stream bool) (*http.Response, error) {
 	attempt := func(b openrouterRequest) (*http.Response, error) {
 		payload, err := json.Marshal(b)
@@ -437,7 +461,73 @@ func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body
 			return nil, fmt.Errorf("openrouter: do: %w", err)
 		}
 	}
+
+	// Rate-limited (429): retry with backoff instead of aborting the turn.
+	for retries := 0; resp.StatusCode == http.StatusTooManyRequests && retries < openRouterMaxRateLimitRetries; retries++ {
+		delay, ok := retryAfterDelay(resp)
+		if !ok {
+			delay = openRouterRateLimitBackoff(retries)
+		}
+		_ = resp.Body.Close()
+		if !waitRateLimitRetry(ctx, delay) {
+			return nil, fmt.Errorf("openrouter: rate limited (429): retry aborted: %w", ctx.Err())
+		}
+		resp, err = attempt(body)
+		if err != nil {
+			return nil, fmt.Errorf("openrouter: do: %w", err)
+		}
+	}
 	return resp, nil
+}
+
+// retryAfterDelay parses the HTTP Retry-After header from a response into the
+// delay to wait before retrying. Retry-After carries either a number of seconds
+// or an HTTP-date; both forms are honored. ok=false when the header is absent
+// or unparsable, so callers fall back to exponential backoff.
+func retryAfterDelay(resp *http.Response) (time.Duration, bool) {
+	if resp == nil {
+		return 0, false
+	}
+	v := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if v == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d, true
+		}
+		return 0, true
+	}
+	return 0, false
+}
+
+// openRouterRateLimitBackoff returns the exponential backoff delay for the
+// zero-based retry index: 1s for retry 0, 2s for retry 1, 4s for retry 2.
+func openRouterRateLimitBackoff(retry int) time.Duration {
+	if retry < 0 {
+		retry = 0
+	}
+	if retry > 10 {
+		retry = 10
+	}
+	return time.Duration(1<<retry) * openRouterRateLimitBackoffBase
+}
+
+// waitRateLimitRetry blocks for delay, aborting early when ctx is cancelled.
+// It reports false when the context was cancelled before the delay elapsed, so
+// the caller can surface the cancellation instead of sleeping out the backoff.
+func waitRateLimitRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 type openrouterResponse struct {

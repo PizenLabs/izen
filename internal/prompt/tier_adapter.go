@@ -33,14 +33,17 @@ func (a *TierAdapter) Tier() capability.ModelTier { return a.tier }
 // SLMCoTTermination is the explicit chain-of-thought termination rule injected
 // into SLM prompts. It is the single mechanism that keeps small models from
 // entering long reasoning loops: a positive instruction to stop thinking and
-// emit code immediately, never a prohibitive list.
-const SLMCoTTermination = "Keep reasoning under 200 tokens, output code immediately."
+// emit code blocks immediately, never a prohibitive list.
+const SLMCoTTermination = "Keep internal thinking under 200 tokens and start outputting code blocks immediately."
 
 // SLMOutputDirective is the compact output discipline block for SLM tiers. It
-// is positive-only — zero negative/prohibitive rules.
+// is positive-only — zero negative/prohibitive rules — and enforces the
+// lang:path markdown code-block form so a small model writes raw code fences
+// instead of reaching for tool-call JSON syntax.
 const SLMOutputDirective = `OUTPUT: concise code only.
-- Use plain markdown code blocks with a language tag.
-- Reason briefly, then output code.
+- Use plain markdown code blocks tagged with a language and a path, like ` + "`" + "```html:index.html`" + `.
+- Output exact target relative file paths from the workspace root. Do NOT invent subdirectories like path/to/file/.
+- Open every block with the fence, the language tag, and the path; close it with the closing fence.
 ` + SLMCoTTermination
 
 // ResolveTierForModel classifies a model name/provider into a ModelTier via
@@ -170,7 +173,7 @@ func NewFileContractForTier(t capability.ModelTier) string {
 	return `MODE: FILE_CREATE — create a new file.
 
 Write the complete file content in one markdown code block.
-Open the block with the language tag and the path, like ` + "`" + cb + `go:path/to/newfile.go` + "`" + `.
+Open the block with the language tag and the path, like ` + "`" + cb + `html:index.html` + "`" + `.
 Close the block with the closing fence. Nothing comes after it.
 
 Output the full content. The file does not exist yet, so write everything.
@@ -189,9 +192,10 @@ func ExistingFileContractForTier(t capability.ModelTier) string {
 	return `MODE: PATCH — modify an existing file.
 
 Rewrite the changed file and place it in one markdown code block.
-Open the block with the language tag and the path, like ` + "`" + cb + `go:path/to/file.go` + "`" + `.
+Open the block with the language tag and the path, like ` + "`" + cb + `go:main.go` + "`" + `.
 Close the block with the closing fence. Nothing comes after it.
 
+If the file is an incomplete stub (under 100 lines), output its COMPLETE, FULLY IMPLEMENTED content.
 Preserve every unchanged part of the file exactly as-is.
 Only modify the parts that must change.
 ` + SLMCoTTermination
@@ -205,14 +209,73 @@ func SLMBuildContract() string {
 	return `MODE: BUILD — create or modify files.
 
 For every file, write the complete file content in one markdown code block.
-Open the block with the language tag and the path, like ` + "`" + cb + `go:path/to/file.go` + "`" + `.
+Open the block with the language tag and the path, like ` + "`" + cb + `html:index.html` + "`" + `.
 Close the block with the closing fence. Nothing comes after it.
 
 New files: write the entire content.
 Existing files: keep every unchanged part exact, change only what must change.
+Stub files (under 100 lines): output the COMPLETE, FULLY IMPLEMENTED content.
 
 Output ends right after the last block.
 ` + SLMCoTTermination
+}
+
+// NativeToolsForTier reports whether the tier's fast-track build prompt speaks
+// the native tool-call protocol (write_file / apply_patch). TierMid and
+// TierFrontier use native tools; TierSLM does NOT — its prompt strips every
+// JSON tool definition and enforces plain markdown code blocks instead. Callers
+// pair this with the request's Tools field: when it reports false, the native
+// tool schemas must be omitted so a small model never sees tool-call JSON that
+// would re-trigger syntax paralysis.
+func NativeToolsForTier(t capability.ModelTier) bool {
+	return t != capability.TierSLM
+}
+
+// FastTrackPromptForTier returns the unified fast-track build prompt for a
+// tier, combining the injected file context with the list of file operations.
+// TierMid/TierFrontier keep the native write_file / apply_patch tool protocol;
+// TierSLM strips all JSON tool definitions and enforces standard markdown code
+// blocks tagged ```lang:path, with the CoT termination rule injected so the
+// model emits code immediately instead of reasoning about tool-call syntax.
+func FastTrackPromptForTier(t capability.ModelTier, fileContext, goals string) string {
+	if !NativeToolsForTier(t) {
+		return SLMFastTrackPrompt(fileContext, goals)
+	}
+	return NativeToolFastTrackPrompt(fileContext, goals)
+}
+
+// NativeToolFastTrackPrompt is the Mid/Frontier fast-track build prompt: it
+// instructs the model to emit native write_file / apply_patch tool calls for
+// every file mutation in a single unified session.
+func NativeToolFastTrackPrompt(fileContext, goals string) string {
+	p := "Execute ALL of the following file operations in a single unified session.\n\n"
+	p += "Use native write_file (for new files) and apply_patch (for existing files) tools ONLY.\n"
+	p += "Do NOT output SEARCH/REPLACE blocks, unified diffs, or markdown code blocks.\n"
+	p += "Do NOT include any conversational text, explanations, or summaries.\n"
+	p += "Output ONLY native tool calls.\n\n"
+	p += "## File Operations\n\n"
+	p += goals
+	return fileContext + "\n" + p
+}
+
+// SLMFastTrackPrompt is the TierSLM fast-track build prompt. It contains ZERO
+// JSON tool definitions — no write_file, no apply_patch, no tool-call syntax.
+// Every file is emitted as a standard markdown code block opened with the
+// fence, the language tag and the path (```lang:path), and the CoT termination
+// rule is injected so a small model starts writing raw code blocks immediately
+// instead of entering a long reasoning loop about tool JSON.
+func SLMFastTrackPrompt(fileContext, goals string) string {
+	cb := "```"
+	p := "Execute ALL of the following file operations in a single unified session.\n\n"
+	p += "For every file, write the complete file content in one markdown code block.\n"
+	p += "Open the block with the language tag and the path, like `" + cb + "html:index.html`.\n"
+	p += "Close the block with the closing fence. Nothing comes after it.\n\n"
+	p += "New files: write the entire content.\n"
+	p += "Existing files: keep every unchanged part exact, change only what must change.\n\n"
+	p += "## File Operations\n\n"
+	p += goals + "\n\n"
+	p += SLMCoTTermination
+	return fileContext + "\n" + p
 }
 
 // PlanSynthesisSystemPromptForTier returns the JSON plan-synthesis prompt for

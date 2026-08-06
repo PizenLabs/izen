@@ -73,13 +73,12 @@ func TestProposeBuildPatch_RetriesOnAmbiguousSnippet(t *testing.T) {
 		_ = result
 	})
 
-	t.Run("retries on ambiguous snippet then falls back to full rewrite for small file", func(t *testing.T) {
+	t.Run("stub file uses whole-file overwrite from the first attempt", func(t *testing.T) {
+		// Existing files under 100 lines are stubs: the whole-file overwrite
+		// protocol is selected immediately (no diff retry). Raw content is
+		// accepted as the COMPLETE new file content.
 		mock := &mockProvider{
 			responses: []*ai.Response{
-				// First call: ambiguous snippet (no markers, small)
-				{Content: smallSnippet},
-				// Second call: still no diff markers, but now we use new-file
-				// strategy for small files (<200 lines), which accepts raw content.
 				{Content: "package main\n\nfunc main() {}\n"},
 			},
 		}
@@ -87,7 +86,8 @@ func TestProposeBuildPatch_RetriesOnAmbiguousSnippet(t *testing.T) {
 
 		dir := t.TempDir()
 		filePath := dir + "/main.go"
-		// Write the file to disk so StrategyForOriginal returns EXISTING
+		// Write a stub to disk so StrategyForOriginal classifies it as
+		// NEW_FILE (whole-file overwrite) via IsStubFile.
 		if err := writeFile(filePath, largeOriginalContent); err != nil {
 			t.Fatal(err)
 		}
@@ -104,12 +104,15 @@ func TestProposeBuildPatch_RetriesOnAmbiguousSnippet(t *testing.T) {
 			t.Fatalf("expected buildProposalReadyMsg, got %T", msg)
 		}
 		if result.Err != nil {
-			t.Fatalf("expected retry to succeed with fallback, got error: %v", result.Err)
+			t.Fatalf("expected stub whole-file overwrite to succeed, got error: %v", result.Err)
 		}
-		// Call 1: existing_file strategy fails -> retry
-		// Call 2: new_file strategy (full rewrite) succeeds
-		if mock.callCount != 2 {
-			t.Fatalf("expected 2 LLM calls (1 initial + 1 retry fallback), got %d", mock.callCount)
+		if result.Patch == nil || !result.Patch.IsFullRewrite {
+			t.Fatalf("expected full-rewrite patch for a stub file, got: %+v", result.Patch)
+		}
+		// The stub is accepted as raw content on the first attempt — no diff
+		// retry cycle is ever entered for files under 100 lines.
+		if mock.callCount != 1 {
+			t.Fatalf("expected 1 LLM call (whole-file overwrite, no retry), got %d", mock.callCount)
 		}
 	})
 

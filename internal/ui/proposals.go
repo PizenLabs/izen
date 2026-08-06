@@ -19,6 +19,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/gateway"
+	"github.com/PizenLabs/izen/internal/patch"
 )
 
 // searchReplaceBlockRe matches SEARCH/REPLACE blocks that the LLM may emit
@@ -146,54 +147,30 @@ func buildSyntheticDiff(path, oldContent, newContent string) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// extractLangPathBlocks parses ```lang:path blocks (original format).
+// extractLangPathBlocks parses path-tagged markdown code blocks (```lang:path,
+// ```lang path, ```file=path) and === FILE: blocks into proposals. Parsing is
+// owned by internal/patch.ParseCodeFences, the single owner of patch
+// extraction ("One Question, One Owner"). This is the fast-track multi-file
+// extractor: a North Mini / SLM model that emits every file as a path-tagged
+// block in one pass yields one proposal per file, so a single-pass build never
+// falls back to per-task execution.
 func extractLangPathBlocks(response string) []SemanticProposal {
 	var proposals []SemanticProposal
-	lines := strings.Split(response, "\n")
-	var current *SemanticProposal
-	inBlock := false
-	content := &strings.Builder{}
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if !inBlock {
-			if strings.HasPrefix(trimmed, "```") {
-				lang := strings.TrimPrefix(trimmed, "```")
-				inBlock = true
-				content.Reset()
-				if strings.Contains(lang, ":") {
-					parts := strings.SplitN(lang, ":", 2)
-					current = &SemanticProposal{
-						ID: fmt.Sprintf("build-%d", time.Now().UnixNano()),
-						Target: SemanticTarget{
-							QualifiedName: strings.TrimSpace(parts[1]),
-						},
-					}
-				} else {
-					current = nil
-				}
-				continue
-			}
-		} else {
-			if strings.HasPrefix(trimmed, "```") {
-				inBlock = false
-				if current != nil && content.Len() > 0 {
-					current.Diff = content.String()
-					current.Expanded = true
-					clean := filepath.Clean(current.Target.QualifiedName)
-					if clean != "" && clean != "." {
-						current.Target.QualifiedName = gateway.CanonicalizeFileName(clean)
-						proposals = append(proposals, *current)
-					}
-				}
-				current = nil
-				continue
-			}
-			if current != nil {
-				content.WriteString(line)
-				content.WriteString("\n")
-			}
+	for _, f := range patch.ParseCodeFences(response) {
+		if f.Path == "" || strings.TrimSpace(f.Content) == "" {
+			continue
 		}
+		clean := filepath.Clean(f.Path)
+		if clean == "" || clean == "." {
+			continue
+		}
+		clean = gateway.CanonicalizeFileName(clean)
+		proposals = append(proposals, SemanticProposal{
+			ID:       fmt.Sprintf("build-%d", time.Now().UnixNano()),
+			Target:   SemanticTarget{QualifiedName: clean},
+			Diff:     strings.TrimSuffix(f.Content, "\n"),
+			Expanded: true,
+		})
 	}
 	return proposals
 }

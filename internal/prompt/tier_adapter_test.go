@@ -49,7 +49,7 @@ func TestSLMContractsCarryCoTTermination(t *testing.T) {
 		SLMBuildContract(),
 		PlanSynthesisSystemPromptForTier(capability.TierSLM),
 	} {
-		if !strings.Contains(c, "Keep reasoning under 200 tokens") {
+		if !strings.Contains(c, "Keep internal thinking under 200 tokens") {
 			t.Errorf("SLM contract missing CoT termination:\n%s", c)
 		}
 	}
@@ -103,7 +103,7 @@ func TestStrategyContractForTier(t *testing.T) {
 func TestTierAdapterSystemPromptForMode(t *testing.T) {
 	slm := NewTierAdapter(capability.TierSLM)
 	build := slm.SystemPromptForMode("build")
-	if !strings.Contains(build, "Keep reasoning under 200 tokens") {
+	if !strings.Contains(build, "Keep internal thinking under 200 tokens") {
 		t.Errorf("SLM build prompt missing CoT termination:\n%s", build)
 	}
 	if !strings.Contains(build, "You are IZEN") {
@@ -115,7 +115,7 @@ func TestTierAdapterSystemPromptForMode(t *testing.T) {
 	if !strings.Contains(full, "SEARCH/REPLACE") {
 		t.Errorf("frontier build prompt must carry SEARCH/REPLACE protocol:\n%s", full)
 	}
-	if strings.Contains(full, "Keep reasoning under 200 tokens") {
+	if strings.Contains(full, "Keep internal thinking under 200 tokens") {
 		t.Error("frontier build prompt must not carry the SLM CoT termination rule")
 	}
 }
@@ -123,7 +123,7 @@ func TestTierAdapterSystemPromptForMode(t *testing.T) {
 func TestTierAdapterComposeTiered(t *testing.T) {
 	slm := NewTierAdapter(capability.TierSLM)
 	out := slm.ComposeTiered("MODE: TEST", RuntimeFacts{Username: "Dev", HostOS: "darwin"})
-	for _, want := range []string{"You are IZEN", "MODE: TEST", "Keep reasoning under 200 tokens"} {
+	for _, want := range []string{"You are IZEN", "MODE: TEST", "Keep internal thinking under 200 tokens"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("ComposeTiered missing %q:\n%s", want, out)
 		}
@@ -134,5 +134,107 @@ func TestUnknownTierFallsBackToMid(t *testing.T) {
 	adapter := NewTierAdapter(capability.ModelTier(99))
 	if adapter.Tier() != capability.TierMid {
 		t.Errorf("unknown tier should fall back to TierMid, got %v", adapter.Tier())
+	}
+}
+
+// TestTierSLMFastTrackPromptStripsJSONSchemas pins the "One Question, One
+// Owner" guardrail: the TierSLM fast-track prompt must contain ZERO native
+// tool / JSON schemas (no write_file, no apply_patch, no tool-call syntax) and
+// must instead enforce standard markdown code blocks tagged ```lang:path with
+// the CoT termination rule injected, so a small model emits raw code fences
+// within seconds instead of looping on tool-call JSON.
+func TestTierSLMFastTrackPromptStripsJSONSchemas(t *testing.T) {
+	fileCtx := "## Current Content of: cmd/api/main.go\n```go\npackage main\n```\n"
+	goals := "Task 1 [FILE_MUTATE]\nTarget file: cmd/api/main.go\nDescription: add a handler\n"
+	p := FastTrackPromptForTier(capability.TierSLM, fileCtx, goals)
+
+	for _, forbidden := range []string{
+		"write_file",
+		"apply_patch",
+		`"tools"`,
+		`"type": "function"`,
+		`{"action"`,
+		"native tool",
+	} {
+		if strings.Contains(p, forbidden) {
+			t.Errorf("TierSLM fast-track prompt must not contain %q:\n%s", forbidden, p)
+		}
+	}
+
+	if !strings.Contains(p, "```html:index.html") {
+		t.Errorf("TierSLM fast-track prompt must enforce ```lang:path markdown blocks:\n%s", p)
+	}
+	if !strings.Contains(p, SLMCoTTermination) {
+		t.Errorf("TierSLM fast-track prompt must carry the CoT termination rule:\n%s", p)
+	}
+	if !strings.Contains(p, fileCtx) {
+		t.Errorf("TierSLM fast-track prompt must preserve the injected file context:\n%s", p)
+	}
+	if !strings.Contains(p, goals) {
+		t.Errorf("TierSLM fast-track prompt must preserve the file operations:\n%s", p)
+	}
+}
+
+// TestFastTrackPromptForTier_TierAware asserts the tier split: Mid/Frontier keep
+// the native write_file / apply_patch tool protocol while TierSLM strips it.
+func TestFastTrackPromptForTier_TierAware(t *testing.T) {
+	fileCtx := "## Current Content of: x.go\n```go\n// x\n```\n"
+	goals := "Task 1 [FILE_MUTATE]\nTarget file: x.go\nDescription: change x\n"
+
+	slm := FastTrackPromptForTier(capability.TierSLM, fileCtx, goals)
+	if strings.Contains(slm, "write_file") || strings.Contains(slm, "apply_patch") {
+		t.Errorf("TierSLM prompt must not reference native tools:\n%s", slm)
+	}
+	if !strings.Contains(slm, "markdown code block") {
+		t.Errorf("TierSLM prompt must instruct markdown code blocks:\n%s", slm)
+	}
+
+	frontier := FastTrackPromptForTier(capability.TierFrontier, fileCtx, goals)
+	for _, want := range []string{"write_file", "apply_patch", "native tool calls"} {
+		if !strings.Contains(frontier, want) {
+			t.Errorf("TierFrontier prompt must keep the native tool protocol (%q):\n%s", want, frontier)
+		}
+	}
+
+	// The Mid/Frontier prompt must be byte-identical to the pre-tier-split
+	// fast-track prompt so existing Mid/Frontier build behavior is unchanged.
+	mid := FastTrackPromptForTier(capability.TierMid, fileCtx, goals)
+	if mid != frontier {
+		t.Error("TierMid and TierFrontier fast-track prompts must be identical")
+	}
+	wantNative := "Execute ALL of the following file operations in a single unified session.\n\n" +
+		"Use native write_file (for new files) and apply_patch (for existing files) tools ONLY.\n" +
+		"Do NOT output SEARCH/REPLACE blocks, unified diffs, or markdown code blocks.\n" +
+		"Do NOT include any conversational text, explanations, or summaries.\n" +
+		"Output ONLY native tool calls.\n\n" +
+		"## File Operations\n\n" + goals
+	if frontier != fileCtx+"\n"+wantNative {
+		t.Errorf("TierMid/Frontier fast-track prompt must equal the legacy prompt exactly:\n%s", frontier)
+	}
+}
+
+// TestNativeToolsForTier pins the tool-schema gating decision: only TierSLM
+// omits native tool schemas from fast-track requests.
+func TestNativeToolsForTier(t *testing.T) {
+	for tier, want := range map[capability.ModelTier]bool{
+		capability.TierSLM:      false,
+		capability.TierMid:      true,
+		capability.TierFrontier: true,
+	} {
+		if got := NativeToolsForTier(tier); got != want {
+			t.Errorf("NativeToolsForTier(%v) = %v, want %v", tier, got, want)
+		}
+	}
+}
+
+// TestSLMOutputDirectiveEnforcesLangPath ensures the shared SLM output
+// directive (appended to every composed SLM system prompt) enforces the
+// lang:path code-block form and carries the CoT termination rule.
+func TestSLMOutputDirectiveEnforcesLangPath(t *testing.T) {
+	if !strings.Contains(SLMOutputDirective, "```html:index.html") {
+		t.Errorf("SLMOutputDirective must enforce lang:path markdown blocks:\n%s", SLMOutputDirective)
+	}
+	if !strings.Contains(SLMOutputDirective, SLMCoTTermination) {
+		t.Errorf("SLMOutputDirective must carry the CoT termination rule:\n%s", SLMOutputDirective)
 	}
 }

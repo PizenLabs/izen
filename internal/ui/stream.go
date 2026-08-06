@@ -103,6 +103,8 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.reasoningBuffer.Reset()
 	m.traceBuffer.Reset()
 	m.traceExpanded = false
+	m.traceWindowStart = 0
+	m.traceWindowAnchored = false
 	m.pendingReasoningFragment = ""
 	if m.thinkingPanel != nil {
 		m.thinkingPanel.Reset()

@@ -17,6 +17,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/modes/build"
+	"github.com/PizenLabs/izen/internal/patch"
 	"github.com/PizenLabs/izen/internal/templates"
 )
 
@@ -2950,6 +2951,47 @@ func SanitizeRawCodeBlock(content string) string {
 		result = append(result, line)
 	}
 	return strings.TrimSpace(strings.Join(result, "\n"))
+}
+
+// ExtractNewFileContent resolves the complete content for a brand-new (missing
+// or 0-byte) target file from an LLM response. A new file has no old content to
+// diff against, so diff markers are NEVER required — any code block or raw text
+// is accepted as the full file content ("Explicit Over Implicit"). The response
+// is resolved in order:
+//
+//  1. A path-tagged block (```lang:path, ```lang path, ```file=path, === FILE:)
+//     whose path matches the target, via the shared internal/patch parser.
+//  2. A single fenced code block.
+//  3. The raw response text as-is.
+//
+// ok=false only when the response is empty.
+func ExtractNewFileContent(raw, target string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", false
+	}
+	cleanTarget := filepath.Clean(target)
+
+	for _, f := range patch.ParseCodeFences(raw) {
+		if f.Path == "" || filepath.Clean(f.Path) != cleanTarget {
+			continue
+		}
+		if content := SanitizeRawCodeBlock(f.Content); content != "" {
+			return content, true
+		}
+	}
+
+	if extracted, ok := ExtractRawCodeBlock(trimmed); ok {
+		if content := SanitizeRawCodeBlock(extracted); content != "" {
+			return content, true
+		}
+	}
+	if extracted, ok := ExtractCodeBlockContent(trimmed); ok {
+		if content := SanitizeRawCodeBlock(extracted); content != "" {
+			return content, true
+		}
+	}
+	return SanitizeRawCodeBlock(trimmed), true
 }
 
 func (pm *PatchManager) store(patch *Patch) error {

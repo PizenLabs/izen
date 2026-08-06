@@ -306,6 +306,13 @@ func (m *model) renderLiveThinking(width int) string {
 // streamed response is captured in traceBuffer; when the user expands it via
 // Ctrl+O, the full output trace renders in a dimmed, scrollable box so the
 // model's exact output can be inspected. Returns "" when there is no trace.
+//
+// VIEWPORT SCROLL LOCK: while the trace is expanded during an active stream,
+// the window start is anchored once (traceWindowStart) and kept frozen — new
+// streaming chunks append BELOW the anchored window instead of sliding the
+// inspected lines out from under the user. The anchor is released on the next
+// non-streaming render (the box re-anchors to the trace tail) or when the
+// trace is re-expanded / the user jumps back to the tail.
 func (m *model) renderOutputTrace(width int) string {
 	if m.traceBuffer.Len() == 0 {
 		return ""
@@ -331,6 +338,21 @@ func (m *model) renderOutputTrace(width int) string {
 	start := 0
 	if len(allLines) > maxTraceLines {
 		start = len(allLines) - maxTraceLines
+	}
+
+	if m.streaming && m.traceExpanded {
+		// Streaming + expanded: freeze the anchor so the visible lines are
+		// stable while chunks arrive. Only the first render (or a Space
+		// re-anchor) resets it to the current tail.
+		if !m.traceWindowAnchored {
+			m.traceWindowStart = start
+			m.traceWindowAnchored = true
+		}
+		start = m.traceWindowStart
+	} else {
+		// Not streaming (or trace collapsed): always show the tail.
+		m.traceWindowStart = 0
+		m.traceWindowAnchored = false
 	}
 
 	out := make([]string, 0, maxTraceLines+2)

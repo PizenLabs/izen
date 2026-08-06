@@ -3,6 +3,7 @@ package layer3
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -176,6 +177,51 @@ func TestLinePatchParserMalformed(t *testing.T) {
 	}
 }
 
+// TestLinePatchParserFencedBlocks covers the per-task raw-code acceptance: a
+// model that emits path-tagged markdown fences (```lang:path, ```lang path,
+// ```file=path) instead of === FILE: blocks must have every block accepted as
+// the complete replacement content — never rejected for lacking diff markers.
+func TestLinePatchParserFencedBlocks(t *testing.T) {
+	text := "```html:index.html\n<!DOCTYPE html>\n<html></html>\n```\n" +
+		"```css styles.css\nbody { margin: 0; }\n```\n" +
+		"```file=script.js\nconsole.log('hi');\n```\n"
+	patches, err := (LinePatchParser{}).Parse(text)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(patches) != 3 {
+		t.Fatalf("patches = %d, want 3:\n%+v", len(patches), patches)
+	}
+	if patches[0].Path != "index.html" || patches[0].New != "<!DOCTYPE html>\n<html></html>" {
+		t.Errorf("patches[0] = %+v", patches[0])
+	}
+	if patches[1].Path != "styles.css" || !strings.Contains(patches[1].New, "margin: 0") {
+		t.Errorf("patches[1] = %+v", patches[1])
+	}
+	if patches[2].Path != "script.js" || !strings.Contains(patches[2].New, "console.log") {
+		t.Errorf("patches[2] = %+v", patches[2])
+	}
+	for i, p := range patches {
+		if !p.Changed {
+			t.Errorf("patches[%d] = %+v, want Changed", i, p)
+		}
+	}
+}
+
+// TestLinePatchParserMixedProtocols ensures the === FILE: pass and the fence
+// pass coexist without duplicating blocks.
+func TestLinePatchParserMixedProtocols(t *testing.T) {
+	text := "=== FILE: a.go\npackage a\n=== END\n" +
+		"```go: b.go\npackage b\n```\n"
+	patches, err := (LinePatchParser{}).Parse(text)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(patches) != 2 {
+		t.Fatalf("patches = %d, want 2 (no duplicates):\n%+v", len(patches), patches)
+	}
+}
+
 func TestFuncWorker(t *testing.T) {
 	worker := FuncWorker(func(_ context.Context, _ *layer2.ExecutionContext, _ Request) (*WorkerResult, error) {
 		return &WorkerResult{Patches: []FilePatch{{Path: "x.go", New: "package x", Changed: true}}}, nil
@@ -247,25 +293,69 @@ func TestBuildPromptNewFileSelectsFullCreation(t *testing.T) {
 	}
 }
 
-// TestBuildPromptExistingFileSelectsReplacement pins the counterpart: when the
-// target file EXISTS on disk with content, the worker prompt must switch to the
-// complete-replacement contract and carry the on-disk content so the model can
-// see what it is replacing.
-func TestBuildPromptExistingFileSelectsReplacement(t *testing.T) {
+// TestBuildPromptStubSelectsWholeFileOverwrite pins the "Explicit Over
+// Implicit" law for the Layer3 worker: a target that EXISTS on disk but is a
+// stub (under 100 lines) must be forced through the whole-file overwrite
+// protocol — output the COMPLETE, FULLY IMPLEMENTED content, never a diff
+// against incomplete "old content". The skeleton is passed in context with the
+// "fully implement and expand" directive so a weak model expands it instead of
+// echoing the stub back unchanged.
+func TestBuildPromptStubSelectsWholeFileOverwrite(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "index.html")
-	if err := os.WriteFile(target, []byte("<!DOCTYPE html>\n<html></html>\n"), 0644); err != nil {
+	stub := "<!DOCTYPE html>\n<html>\n<body>\n<h1>hi</h1>\n</body>\n</html>\n"
+	if err := os.WriteFile(target, []byte(stub), 0644); err != nil {
 		t.Fatal(err)
 	}
 	req := Request{
 		Intent:      IntentRefactor,
 		TargetFile:  target,
-		Description: "edit the landing page",
+		Description: "fully implement the landing page",
+	}
+	prompt := BuildPrompt(minimalExec(), req, 0)
+	if !strings.Contains(prompt, "is a stub") {
+		t.Errorf("prompt should classify the target as a stub:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "COMPLETE, FULLY IMPLEMENTED content") {
+		t.Errorf("prompt should demand complete full implementation:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Do NOT output a unified diff") {
+		t.Errorf("prompt should forbid diff formats for a stub:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "incomplete skeleton") {
+		t.Errorf("prompt should pass the stub context with the expand directive:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "<!DOCTYPE html>") {
+		t.Errorf("prompt should carry the on-disk skeleton content:\n%s", prompt)
+	}
+}
+
+// TestBuildPromptExistingFileSelectsReplacement pins the large-file path: when
+// the target file EXISTS on disk with substantial content (100+ lines), the
+// worker prompt must switch to the complete-replacement contract and carry the
+// on-disk content so the model can see what it is replacing.
+func TestBuildPromptExistingFileSelectsReplacement(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "main.go")
+	var sb strings.Builder
+	sb.WriteString("package main\n")
+	for i := 0; i < 120; i++ {
+		fmt.Fprintf(&sb, "// line %d\n", i)
+	}
+	if err := os.WriteFile(target, []byte(sb.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+	req := Request{
+		Intent:      IntentRefactor,
+		TargetFile:  target,
+		Description: "edit the main module",
 	}
 	prompt := BuildPrompt(minimalExec(), req, 0)
 	if !strings.Contains(prompt, "EXISTS on disk") {
 		t.Errorf("prompt should mark the target as existing:\n%s", prompt)
 	}
-	if !strings.Contains(prompt, "<!DOCTYPE html>") {
+	if !strings.Contains(prompt, "COMPLETE replacement content") {
+		t.Errorf("prompt should instruct complete replacement:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "// line 0") {
 		t.Errorf("prompt should carry the on-disk content:\n%s", prompt)
 	}
 }

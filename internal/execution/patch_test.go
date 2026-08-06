@@ -1616,3 +1616,82 @@ func TestDestructivePureStripDetected(t *testing.T) {
 		t.Fatal("file was modified despite pure-strip guardrail skip")
 	}
 }
+
+// TestExtractNewFileContent_0ByteRawCode pins the per-task 0-byte fallback: a
+// new/0-byte target accepts ANY raw code block as its complete content — no
+// diff markers (--- a/, +++ b/, @@, <<<<<<< SEARCH) required, and never a
+// retry failure.
+func TestExtractNewFileContent_0ByteRawCode(t *testing.T) {
+	cases := []struct {
+		name   string
+		raw    string
+		target string
+		want   string
+	}{
+		{
+			name:   "lang:path fence",
+			raw:    "```html:index.html\n<!DOCTYPE html>\n<html></html>\n```\n",
+			target: "index.html",
+			want:   "<!DOCTYPE html>\n<html></html>",
+		},
+		{
+			name:   "lang space path fence",
+			raw:    "```css styles.css\nbody { margin: 0; }\n```\n",
+			target: "styles.css",
+			want:   "body { margin: 0; }",
+		},
+		{
+			name:   "file=path fence",
+			raw:    "```file=script.js\nconsole.log('hi');\n```\n",
+			target: "script.js",
+			want:   "console.log('hi');",
+		},
+		{
+			name:   "FILE protocol block",
+			raw:    "=== FILE: index.html\n<p>full</p>\n=== END\n",
+			target: "index.html",
+			want:   "<p>full</p>",
+		},
+		{
+			name:   "bare code fence",
+			raw:    "```html\n<p>bare</p>\n```\n",
+			target: "index.html",
+			want:   "<p>bare</p>",
+		},
+		{
+			name:   "raw text",
+			raw:    "<p>no fences at all</p>",
+			target: "index.html",
+			want:   "<p>no fences at all</p>",
+		},
+		{
+			name:   "path-tagged block matching target wins",
+			raw:    "```html:index.html\n<p>target</p>\n```\n```css:other.css\nbody{}\n```\n",
+			target: "index.html",
+			want:   "<p>target</p>",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ExtractNewFileContent(tc.raw, tc.target)
+			if !ok {
+				t.Fatal("ExtractNewFileContent returned ok=false for non-empty response")
+			}
+			if got != tc.want {
+				t.Errorf("content = %q, want %q", got, tc.want)
+			}
+			if strings.Contains(got, "--- a/") || strings.Contains(got, "@@") || strings.Contains(got, "<<<<<<<") {
+				t.Errorf("0-byte extraction must never carry diff markers:\n%s", got)
+			}
+		})
+	}
+}
+
+func TestExtractNewFileContent_Empty(t *testing.T) {
+	if _, ok := ExtractNewFileContent("", "index.html"); ok {
+		t.Fatal("empty response must report ok=false")
+	}
+	if _, ok := ExtractNewFileContent("   \n  ", "index.html"); ok {
+		t.Fatal("whitespace-only response must report ok=false")
+	}
+}

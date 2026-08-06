@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/PizenLabs/izen/internal/patch"
 	"github.com/PizenLabs/izen/pkg/engine/layer2"
 )
 
@@ -88,19 +89,30 @@ type PatchParser interface {
 // ErrInvalidPatch is returned when a completion cannot be parsed into patches.
 var ErrInvalidPatch = errors.New("layer3: invalid patch")
 
-// LinePatchParser parses the deterministic file-block protocol:
+// LinePatchParser parses a completion into proposed file patches. Two output
+// forms are accepted — both never require diff markers, because a new file has
+// no old content to diff against:
 //
-//	=== FILE: <relative path>
-//	<full replacement content>
-//	=== END
+//  1. The deterministic file-block protocol:
 //
-// Whitespace inside a block is preserved verbatim; the content between the
-// header and the terminator replaces the target file entirely. Blocks may
-// appear in any order and may target different paths.
+//     === FILE: <relative path>
+//     <full replacement content>
+//     === END
+//
+//     Whitespace inside a block is preserved verbatim; the content between the
+//     header and the terminator replaces the target file entirely. Blocks may
+//     appear in any order and may target different paths.
+//
+//  2. Markdown code fences carrying an inline path header (```lang:path,
+//     ```lang path, ```file=path). Small models frequently emit path-tagged
+//     fences instead of === FILE: blocks; both are interpreted as complete
+//     replacement content for the tagged path. Parsing is delegated to
+//     internal/patch (the single owner of patch extraction).
 type LinePatchParser struct{}
 
 // Parse implements PatchParser.
 func (LinePatchParser) Parse(text string) ([]FilePatch, error) {
+	// Pass 1: the deterministic === FILE: protocol.
 	var out []FilePatch
 	lines := strings.Split(text, "\n")
 	var cur *FilePatch
@@ -140,6 +152,22 @@ func (LinePatchParser) Parse(text string) ([]FilePatch, error) {
 	}
 	if err := flush(); err != nil {
 		return nil, err
+	}
+
+	// Pass 2: markdown code fences with path headers. Fence-only parsing so a
+	// === FILE: block handled in pass 1 is never duplicated.
+	for _, cf := range patch.ParseMarkdownFences(text) {
+		if cf.Path == "" {
+			continue
+		}
+		newContent := strings.TrimSuffix(cf.Content, "\n")
+		out = append(out, FilePatch{
+			Path:       cf.Path,
+			Language:   cf.Lang,
+			New:        newContent,
+			LinesAdded: strings.Count(newContent, "\n"),
+			Changed:    true,
+		})
 	}
 	return out, nil
 }
@@ -257,6 +285,27 @@ func targetFileOnDisk(target string) (string, bool) {
 	return string(data), true
 }
 
+// smallFileLineThreshold is the "Explicit Over Implicit" stub boundary. A
+// target that does not exist, is 0 bytes, or has fewer than this many lines is
+// treated as a stub and forced through the whole-file overwrite protocol: a
+// SEARCH/REPLACE diff against a stub has no reliable "old content" anchor and
+// makes weak models fail with "ambiguous snippet without SEARCH/REPLACE
+// markers" or loop until timeout.
+const smallFileLineThreshold = 100
+
+// isStubContent reports whether the on-disk content represents a stub
+// (empty/whitespace only or under smallFileLineThreshold lines) that must be
+// whole-file overwritten, never diffed.
+func isStubContent(content string) bool {
+	return strings.TrimSpace(content) == "" || fileLineCount(content) < smallFileLineThreshold
+}
+
+// fileLineCount returns the number of newline-terminated lines in content
+// (wc -l semantics), matching the execution layer's stub boundary.
+func fileLineCount(content string) int {
+	return strings.Count(content, "\n")
+}
+
 // BuildPrompt deterministically renders a Layer 2 execution context plus a
 // request into a stateless worker prompt, bounded to maxChars characters.
 //
@@ -281,6 +330,10 @@ func BuildPrompt(exec *layer2.ExecutionContext, req Request, maxChars int) strin
 	// Authoritative on-disk state of the target, decided before any prompt
 	// section is rendered.
 	targetContent, targetExists := targetFileOnDisk(req.TargetFile)
+	// Stub classification drives the whole-file overwrite protocol: missing,
+	// 0-byte, or under-smallFileLineThreshold content is always overwritten in
+	// full and never forced through a diff against incomplete "old content".
+	targetStub := !targetExists || isStubContent(targetContent)
 
 	files := 0
 	if exec != nil {
@@ -296,23 +349,32 @@ func BuildPrompt(exec *layer2.ExecutionContext, req Request, maxChars int) strin
 	}
 	if targetExists {
 		fmt.Fprintf(&b, "\n### %s\n%s\n", req.TargetFile, targetContent)
+		if targetStub {
+			fmt.Fprintf(&b, "The current file is an incomplete skeleton. Fully implement and expand all functions, styles, and markup. Do NOT repeat incomplete stubs.\n")
+		}
 		files++
 	}
 	fmt.Fprintf(&b, "Files: %d\n", files)
 
 	// ── OUTPUT PROTOCOL ─────────────────────────────────────────────────
-	// The format is driven by the stat above. New files get an explicit
-	// full-creation contract with diff formats forbidden; existing files get
-	// a complete-replacement contract. Both use the deterministic FILE block
+	// The format is driven by the stat above. Stubs (new/0-byte/under
+	// smallFileLineThreshold lines) get an explicit whole-file overwrite
+	// contract with diff formats forbidden; large existing files keep the
+	// complete-replacement contract. Both use the deterministic FILE block
 	// protocol (never fragments, never a raw unified diff).
 	b.WriteString("\nOUTPUT PROTOCOL\n")
-	if targetExists {
-		fmt.Fprintf(&b, "- The target file %q EXISTS on disk (%d bytes). Output its COMPLETE replacement content.\n",
-			req.TargetFile, len(targetContent))
+	if targetStub {
+		if targetExists {
+			fmt.Fprintf(&b, "- The target file %q is a stub (%d bytes, %d lines). Output its COMPLETE, FULLY IMPLEMENTED content.\n",
+				req.TargetFile, len(targetContent), fileLineCount(targetContent))
+		} else {
+			fmt.Fprintf(&b, "- The target file %q does NOT exist on disk (new file). CREATE it with the COMPLETE new file content.\n",
+				req.TargetFile)
+		}
+		b.WriteString("- Do NOT output a unified diff (--- a/ ... +++ b/) or SEARCH/REPLACE blocks (<<<<<<< SEARCH) — a stub has no complete old content to diff against.\n")
 	} else {
-		fmt.Fprintf(&b, "- The target file %q does NOT exist on disk (new file). CREATE it with the COMPLETE new file content.\n",
-			req.TargetFile)
-		b.WriteString("- Do NOT output a unified diff (--- a/ ... +++ b/) or SEARCH/REPLACE blocks (<<<<<<< SEARCH) — a new file has no old content to diff against.\n")
+		fmt.Fprintf(&b, "- The target file %q EXISTS on disk (%d bytes, %d lines). Output its COMPLETE replacement content.\n",
+			req.TargetFile, len(targetContent), fileLineCount(targetContent))
 	}
 	b.WriteString("- Output the full file content in a single block:\n")
 	b.WriteString("  === FILE: <relative path>\n  <complete file content>\n  === END\n")

@@ -1900,7 +1900,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.refreshViewportContent()
 			// Only auto-scroll to bottom if the user hasn't explicitly
 			// scrolled up — respects user-inspect position during streaming.
-			if m.streaming && !m.userIsScrollingUp {
+			// The expanded output-trace viewport (Ctrl+O) also disables
+			// auto-scroll so the inspected lines never jump out from under
+			// the user while chunks stream in.
+			if m.streaming && !m.userIsScrollingUp && !m.traceExpanded {
 				m.Viewport.GotoBottom()
 			}
 		}
@@ -2001,7 +2004,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.ensureStreamBlocks().Append(KindThinking, string(msg))
 		m.refreshViewportContent()
-		if m.Ready && !m.userIsScrollingUp {
+		if m.Ready && !m.userIsScrollingUp && !m.traceExpanded {
 			m.Viewport.GotoBottom()
 		}
 		return m, m.readStream()
@@ -2866,6 +2869,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// ── SPACE snap-to-bottom (resets user scroll-lock) ─────────────────
 		if msg.Type == tea.KeySpace && !m.autocompleteActive {
 			m.userIsScrollingUp = false
+			// Re-anchor the expanded output-trace window to the tail so the
+			// user "catches up" to the latest streamed content.
+			m.traceWindowAnchored = false
 			if m.Ready {
 				m.Viewport.GotoBottom()
 			}

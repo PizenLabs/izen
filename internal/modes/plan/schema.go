@@ -615,7 +615,7 @@ func SchemaJSONInstruction() string {
   "context_anchor": {"source": "origin of this plan (e.g. user-request, diagnose-ledger)", "target_packages": ["package1", "package2"]},
   "architectural_strategy": "One-sentence summary of the architectural approach",
   "atomic_tasks": [
-    {"task_id": 1, "file": "relative/path/to/file.go or shell command", "strategy": "ATOMIC_REPLACE", "description": "Brief title of the task", "rationale": "Why this task is necessary", "solution": "Expected end state after this task"}
+    {"task_id": 1, "file": "index.html or exact shell command", "strategy": "ATOMIC_REPLACE", "description": "Brief title of the task", "rationale": "Why this task is necessary", "solution": "Expected end state after this task"}
   ]
 }
 

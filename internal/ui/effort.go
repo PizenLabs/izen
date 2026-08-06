@@ -67,6 +67,18 @@ func (m *model) tieredStrategyContract(strategy string) string {
 	return prompt.StrategyContractForTier(strategy, m.promptTier())
 }
 
+// fileMutationTools returns the native write_file / apply_patch tool schemas
+// for build requests, or nil for TierSLM. An SLM's fast-track prompt strips
+// every JSON tool definition and enforces plain markdown code blocks; shipping
+// the native tool schemas alongside would push the small model straight back
+// into tool-call JSON syntax paralysis instead of raw code fences.
+func (m *model) fileMutationTools() []ai.ToolDefinition {
+	if !prompt.NativeToolsForTier(m.promptTier()) {
+		return nil
+	}
+	return ai.FileMutationTools()
+}
+
 func (m *model) activeModelName() string {
 	if name := m.activeRouteModel(); name != "" {
 		return name

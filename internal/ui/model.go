@@ -723,6 +723,14 @@ type model struct {
 	traceBuffer strings.Builder
 	// traceExpanded is the Ctrl+O expansion state of the output-trace viewport.
 	traceExpanded bool
+	// traceWindowStart anchors the output-trace window while the trace is
+	// expanded and streaming: it is frozen once anchored so new chunks never
+	// slide the inspected lines out from under the user (the Ctrl+O viewport
+	// flicker). traceWindowAnchored reports whether the anchor is live; it
+	// resets when the stream starts, the trace is re-expanded, or the user
+	// jumps back to the tail (Space).
+	traceWindowStart    int
+	traceWindowAnchored bool
 	// pendingReasoningFragment holds an opened-but-not-yet-closed
 	// \x00RSNG\x00 reasoning block carried over between extraction passes.
 	// Without this, a sentinel pair split across two ticks (or a truncated
@@ -2871,6 +2879,17 @@ func (m *model) refreshViewportContent() {
 		}
 	}
 
+	// ── VIEWPORT SCROLL LOCK (Ctrl+O output-trace) ────────────────────
+	// While the expanded output-trace viewport is active, preserve the exact
+	// YOffset across SetContent: a transient content shrink would otherwise
+	// make the bubbles viewport clamp to the bottom and yank the inspected
+	// lines (the Ctrl+O flicker during active generation).
+	if m.traceExpanded {
+		saved := m.Viewport.YOffset
+		m.Viewport.SetContent(content.String())
+		m.Viewport.SetYOffset(saved)
+		return
+	}
 	m.Viewport.SetContent(content.String())
 }
 
