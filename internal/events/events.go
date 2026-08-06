@@ -70,6 +70,11 @@ const (
 	// produced narrative prose instead of structured JSON (a common failure
 	// mode of free/mini cloud models).
 	EventPlanFallback = "plan.synthesize.fallback"
+	// EventStreamUsage carries the cumulative token usage of an interrupted LLM
+	// stream. It is published by the stream reader / consumer when a request is
+	// cut short by a context deadline or cancellation so tokens already billed
+	// by the provider are never silently zeroed in local telemetry.
+	EventStreamUsage = "stream.usage"
 )
 
 // FailureClassification is the taxonomy used by EventExecutionFailed. It is
@@ -240,6 +245,20 @@ type ReasoningPayload struct {
 type PlanFallbackPayload struct {
 	Kind   string
 	Reason string
+}
+
+// StreamUsagePayload carries the cumulative token usage of an LLM stream that
+// did not complete naturally. Interrupted is true when the stream was cut
+// short by a context deadline/cancellation; Reason carries the error text.
+// InputTokens/OutputTokens are the authoritative provider-reported counts when
+// a usage chunk arrived before the interruption, otherwise a best-effort
+// estimate from the streamed bytes — never silently zero.
+type StreamUsagePayload struct {
+	Model        string
+	InputTokens  int
+	OutputTokens int
+	Interrupted  bool
+	Reason       string
 }
 
 // ── Generic event implementation ────────────────────────────────────────────
@@ -444,5 +463,19 @@ func NewPlanFallback(kind, reason string) DomainEvent {
 	return newEvent(EventPlanFallback, PlanFallbackPayload{
 		Kind:   kind,
 		Reason: reason,
+	})
+}
+
+// NewStreamUsage publishes the cumulative token usage of an interrupted LLM
+// stream (context deadline / cancellation). It is the transport for
+// "Explicit Over Implicit" token accounting: tokens billed by the provider are
+// surfaced even when the request never completed.
+func NewStreamUsage(model string, inputTokens, outputTokens int, interrupted bool, reason string) DomainEvent {
+	return newEvent(EventStreamUsage, StreamUsagePayload{
+		Model:        model,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		Interrupted:  interrupted,
+		Reason:       reason,
 	})
 }

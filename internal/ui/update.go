@@ -24,6 +24,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/domain/signal"
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
@@ -944,6 +945,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		// ── BUILD PROPOSAL FAILURE ───────────────────────────────────
 		if msg.Err != nil {
+			// Commit any partial provider usage captured before the failure so
+			// consumed tokens are not silently zeroed on a failed build attempt.
+			if msg.TokenInput > 0 || msg.TokenOutput > 0 {
+				m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
+			}
 			m.push(roleError, "patch generation failed: "+msg.Err.Error())
 			tasks := m.sess.CurrentTasks
 			for i := range tasks {
@@ -957,6 +963,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return m, m.flushPendingRecords()
+		}
+
+		// ── TOKEN ACCOUNTING ─────────────────────────────────────────
+		// Commit the provider-reported usage of the build proposal call so the
+		// footer reflects the tokens consumed to produce the proposed patch.
+		if msg.TokenInput > 0 || msg.TokenOutput > 0 {
+			m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
 		}
 
 		// ── Extract proposals from LLM output ───────────────────────
@@ -1080,6 +1093,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Patch generation failed: surface the error, abort the hotfix, and
 		// restore the stashed plan so the pipeline returns to PAUSED cleanly.
 		if msg.Err != nil {
+			if msg.TokenInput > 0 || msg.TokenOutput > 0 {
+				m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
+			}
 			m.push(roleError, "[HOTFIX] Patch generation failed: "+msg.Err.Error())
 			m.hotfixActive = false
 			if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
@@ -1090,6 +1106,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return m, m.flushPendingRecords()
+		}
+
+		// ── TOKEN ACCOUNTING ─────────────────────────────────────────
+		// Commit the provider-reported usage of the hotfix patch call.
+		if msg.TokenInput > 0 || msg.TokenOutput > 0 {
+			m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
 		}
 
 		// ── FREEZE AND REQUEST AUTHORIZATION ─────────────────────────
@@ -2546,6 +2568,23 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleError, "stream error: "+sanitized)
 		}
 
+		// ── TOKEN ACCOUNTING ON FAILURE ────────────────────────────────
+		// Explicit Over Implicit: commit whatever usage the provider reported
+		// (or the character estimate the stream reader produced) before the
+		// stream died, so tokens consumed on a timeout/error are not silently
+		// zeroed in the footer. Publish the typed StreamUsage event so
+		// telemetry projections observe the failed attempt too.
+		if msg.tokenInput > 0 || msg.tokenOutput > 0 {
+			m.commitTokenUsage(msg.tokenInput, msg.tokenOutput)
+			if m.bus != nil {
+				modelName := ""
+				if m.cfg != nil {
+					modelName = m.cfg.ActiveModelName()
+				}
+				m.bus.Publish(events.NewStreamUsage(modelName, msg.tokenInput, msg.tokenOutput, true, msg.err.Error()))
+			}
+		}
+
 		// ALWAYS flush partial stream tokens to the TUI so that tokens
 		// already received on the wire are never discarded when a
 		// mid-stream connection error or unexpected termination occurs.
@@ -2600,6 +2639,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
+		// "Explicit Over Implicit": report partial usage on the failed fast-track
+		// attempt so consumed tokens are never silently zeroed.
+		if msg.TokenInput > 0 || msg.TokenOutput > 0 {
+			m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
+		}
 		m.push(roleError, "fast-track build failed: "+providers.SanitizeAPIError(msg.Err))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()

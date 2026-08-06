@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -301,8 +302,8 @@ type OpenCodeStreamResult struct {
 }
 
 func (r *OpenCodeStreamResult) Usage() (input, output int) {
-	if r.sr != nil && r.sr.finalUsage != nil {
-		return r.sr.finalUsage.PromptTokens, r.sr.finalUsage.CompletionTokens
+	if r.sr != nil {
+		return r.sr.usage.Usage()
 	}
 	return 0, 0
 }
@@ -323,6 +324,9 @@ type opencodeSSEReader struct {
 	finalUsage       *opencodeUsage
 	finishReason     string
 	reasoningHandler func(string) error
+
+	// usage tracks cumulative token accounting (see streamUsageTracker).
+	usage streamUsageTracker
 
 	// pending holds bytes produced by a parsed SSE event that did not fit
 	// into the caller's buffer on a previous Read() call. Read() must never
@@ -352,6 +356,9 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.usage.markInterrupted()
+			}
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -378,6 +385,7 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 
 		if chunk.Usage != nil {
 			s.finalUsage = chunk.Usage
+			s.usage.recordUsage(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
 		}
 
 		if len(chunk.Choices) == 0 {
@@ -395,6 +403,7 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 				reasoningText = delta.Reasoning
 			}
 			if reasoningText != "" {
+				s.usage.recordOutput(len(reasoningText))
 				if s.reasoningHandler != nil {
 					if err := s.reasoningHandler(reasoningText); err != nil {
 						s.closed = true
@@ -404,6 +413,7 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 				continue
 			}
 			if delta.Content != "" {
+				s.usage.recordOutput(len(delta.Content))
 				n := copy(p, delta.Content)
 				if n < len(delta.Content) {
 					s.pending = []byte(delta.Content)[n:]
@@ -425,6 +435,7 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 					all = append(all, ToolCallSentinel...)
 				}
 				if len(all) > 0 {
+					s.usage.recordOutput(len(all))
 					n := copy(p, all)
 					if n < len(all) {
 						s.pending = all[n:]

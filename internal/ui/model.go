@@ -45,6 +45,7 @@ import (
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
+	"github.com/PizenLabs/izen/internal/ui/status"
 	"github.com/PizenLabs/izen/pkg/engine/ir"
 	"github.com/PizenLabs/izen/pkg/engine/pipeline"
 	"github.com/PizenLabs/izen/pkg/engine/telemetry"
@@ -137,6 +138,11 @@ type askStreamPreparedMsg struct {
 type streamErrMsg struct {
 	err     error
 	content string
+	// tokenInput/tokenOutput carry the partial provider usage captured before
+	// the stream error so consumed tokens are reported even on a failed
+	// attempt ("Explicit Over Implicit").
+	tokenInput  int
+	tokenOutput int
 }
 
 type PlanStreamingFinishedMsg struct {
@@ -360,6 +366,11 @@ type buildProposalReadyMsg struct {
 	Diff    string
 	Output  string // raw LLM response text for proposal extraction
 	Err     error
+	// TokenInput/TokenOutput carry the provider-reported usage of the build
+	// proposal call (streaming or non-streaming) so tokens are recorded even
+	// when the response is truncated.
+	TokenInput  int
+	TokenOutput int
 }
 
 // thinkingStreamMsg carries a reasoning token chunk from the SSE stream
@@ -383,6 +394,10 @@ type livePreviewChunkMsg struct {
 // the spinner is cleaned up and the pipeline is reset.
 type buildFailedMsg struct {
 	Err error
+	// TokenInput/TokenOutput carry the partial provider usage captured before
+	// the failure (see streamErrMsg).
+	TokenInput  int
+	TokenOutput int
 }
 
 // hotfixProposalMsg carries the LLM-generated patch for a $hot hotfix back to
@@ -393,6 +408,10 @@ type hotfixProposalMsg struct {
 	Patch *execution.Patch
 	Diff  string
 	Err   error
+	// TokenInput/TokenOutput carry the provider-reported usage of the hotfix
+	// patch call so tokens are recorded even on truncation.
+	TokenInput  int
+	TokenOutput int
 }
 
 // hotfixProgressMsg streams a lifecycle log line to the terminal while the
@@ -1446,6 +1465,28 @@ func (m *model) sanitizeInputPrompt() {
 	m.ti.Prompt = ""
 }
 
+// commitTokenUsage folds provider-reported token usage into the session
+// counters and the global status.Tracker. It is the single accounting entry
+// point for BOTH successful and failed LLM attempts: on failure the provider's
+// partial usage (or a character estimate) is still committed so consumed
+// tokens are never silently zeroed ("Explicit Over Implicit").
+func (m *model) commitTokenUsage(input, output int) {
+	if input < 0 {
+		input = 0
+	}
+	if output < 0 {
+		output = 0
+	}
+	m.InputTokens += input
+	m.OutputTokens += output
+	m.TotalTokens = m.InputTokens + m.OutputTokens
+	if m.IsCloudModel {
+		status.Default.Record(m.InputTokens, m.OutputTokens)
+	} else {
+		status.Default.Record(input, output)
+	}
+}
+
 // setApplyError captures an apply error.
 func (m *model) setApplyError(text string) {
 	m.lastApplyError = text
@@ -1622,6 +1663,15 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// Engine activity telemetry (retrieval/execution/investigate sinks)
 		// projected onto the UI goroutine through the bus.
 		m.logActivity("%s", p.Line)
+	case events.StreamUsagePayload:
+		// "Explicit Over Implicit": an interrupted LLM stream reports its
+		// partial token usage so consumed tokens never vanish from telemetry.
+		statusWord := "interrupted"
+		if !p.Interrupted {
+			statusWord = "finished"
+		}
+		m.logActivity("[stream] %s: %s tok input + %s tok output (%s)", statusWord,
+			status.FormatTokens(p.InputTokens), status.FormatTokens(p.OutputTokens), truncateForActivity(p.Reason))
 	case events.EngineTelemetryPayload:
 		// Typed engine I/O event wrapped for bus transport — projected into
 		// the structured ActivityTree.
@@ -2740,13 +2790,14 @@ func (m *model) refreshViewportContent() {
 	// Rendered outside the streaming block so it appears during /build
 	// execution (non-streaming patch proposal) and persists through
 	// approval states. Only renders when the tree has active entries.
-	// The last entry carries a "[running]" badge while any background
+	// The last entry carries a braille spinner status while any background
 	// stage is still in flight, so the execution tree reads as a live
 	// pipeline rather than a static log dump.
 	if m.activityTree != nil {
 		treeActive := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.shellRunning || m.state == StateProcessing
 		// Pass the live spinner frame so the running exec snowflake cycles the
-		// full 4-frame sequence (✻ ❅ ❆ ✦), not just the 3 dot-frames.
+		// full 4-frame sequence (✻ ❅ ❆ ✦) and the status column cycles the
+		// single-width braille spinner.
 		treeView := m.activityTree.RenderActive(m.width, treeActive, m.spinnerFrame)
 		if treeView != "" {
 			content.WriteString(treeView)

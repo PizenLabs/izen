@@ -60,6 +60,10 @@ func TestHandleDomainEventProjection(t *testing.T) {
 			"[approval] requested for x.go: full-file rewrite needs approval"},
 		{"approval requested (intent disambiguation)", events.NewApprovalRequested("", "unclear intent", ""),
 			"[approval] requested for intent disambiguation: unclear intent"},
+		{"stream usage interrupted", events.NewStreamUsage("cohere/north-mini-code", 512, 240, true, "context deadline exceeded"),
+			"[stream] interrupted: 512 tok input + 240 tok output (context deadline exceeded)"},
+		{"stream usage clean", events.NewStreamUsage("gpt-4o-mini", 100, 200, false, ""),
+			"[stream] finished: 100 tok input + 200 tok output ()"},
 	}
 
 	for _, tc := range tests {

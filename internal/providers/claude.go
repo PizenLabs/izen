@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -221,8 +222,8 @@ type ClaudeStreamResult struct {
 }
 
 func (r *ClaudeStreamResult) Usage() (input, output int) {
-	if r.sr != nil && r.sr.finalUsage != nil {
-		return r.sr.finalUsage.InputTokens, r.sr.finalUsage.OutputTokens
+	if r.sr != nil {
+		return r.sr.usage.Usage()
 	}
 	return 0, 0
 }
@@ -250,6 +251,9 @@ type claudeSSEReader struct {
 	finalUsage       *claudeUsage
 	finishReason     string
 	reasoningHandler func(string) error
+
+	// usage tracks cumulative token accounting (see streamUsageTracker).
+	usage streamUsageTracker
 }
 
 func (s *claudeSSEReader) Read(p []byte) (int, error) {
@@ -264,6 +268,9 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.usage.markInterrupted()
+			}
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -289,6 +296,7 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 				s.finalUsage = &claudeUsage{
 					InputTokens: event.Usage.InputTokens,
 				}
+				s.usage.recordInputTokens(event.Usage.InputTokens)
 			}
 		case "content_block_delta":
 			if event.Delta == nil {
@@ -297,6 +305,7 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 			// Reasoning process (thinking_delta) is routed to the reasoning
 			// handler only — never emitted into the response stream.
 			if event.Delta.Type == "thinking_delta" && event.Delta.Thinking != "" {
+				s.usage.recordOutput(len(event.Delta.Thinking))
 				if s.reasoningHandler != nil {
 					if err := s.reasoningHandler(event.Delta.Thinking); err != nil {
 						s.closed = true
@@ -306,6 +315,7 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 				continue
 			}
 			if event.Delta.Text != "" {
+				s.usage.recordOutput(len(event.Delta.Text))
 				n := copy(p, event.Delta.Text)
 				return n, nil
 			}
@@ -315,6 +325,7 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 					s.finalUsage = &claudeUsage{}
 				}
 				s.finalUsage.OutputTokens = event.Usage.OutputTokens
+				s.usage.recordOutputTokens(event.Usage.OutputTokens)
 			}
 			if event.Delta != nil && event.Delta.StopReason != "" {
 				s.finishReason = event.Delta.StopReason

@@ -72,6 +72,32 @@ func TestNewReasoningStreamPayload(t *testing.T) {
 	}
 }
 
+func TestNewStreamUsagePayload(t *testing.T) {
+	ev := NewStreamUsage("cohere/north-mini-code", 512, 240, true, "context deadline exceeded")
+	if ev.Type() != EventStreamUsage {
+		t.Errorf("type = %q, want %q", ev.Type(), EventStreamUsage)
+	}
+	if ev.Timestamp().IsZero() {
+		t.Error("timestamp is zero")
+	}
+	p, ok := ev.Payload().(StreamUsagePayload)
+	if !ok {
+		t.Fatalf("payload = %T, want StreamUsagePayload", ev.Payload())
+	}
+	if p.Model != "cohere/north-mini-code" || p.InputTokens != 512 || p.OutputTokens != 240 {
+		t.Errorf("payload = %+v, want model/token counts", p)
+	}
+	if !p.Interrupted || p.Reason != "context deadline exceeded" {
+		t.Errorf("payload = %+v, want interrupted + reason", p)
+	}
+
+	clean := NewStreamUsage("gpt-4o-mini", 100, 200, false, "")
+	cp := clean.Payload().(StreamUsagePayload)
+	if cp.Interrupted || cp.Reason != "" {
+		t.Errorf("clean payload = %+v, want not interrupted", cp)
+	}
+}
+
 func TestSelfHealingEventConstructors(t *testing.T) {
 	attempt := NewSelfHealingAttempt(3, "worker.go", "SYNTAX_ERROR")
 	if attempt.Type() != EventSelfHealingAttempt {

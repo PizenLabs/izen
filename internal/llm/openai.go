@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/events"
 )
 
 type OpenAIClient struct {
@@ -16,6 +18,7 @@ type OpenAIClient struct {
 	model   string
 	baseURL string
 	client  *http.Client
+	bus     *events.Bus
 }
 
 func NewOpenAIClient(apiKey, model, baseURL string) *OpenAIClient {
@@ -28,6 +31,32 @@ func NewOpenAIClient(apiKey, model, baseURL string) *OpenAIClient {
 		baseURL: strings.TrimRight(baseURL, "/"),
 		client:  &http.Client{},
 	}
+}
+
+// WithEventBus wires an optional event bus. When set, an interrupted stream
+// (context deadline / cancellation) publishes a StreamUsage envelope with the
+// partial token usage before the timeout error is returned, so tokens billed by
+// the provider are never silently zeroed in telemetry.
+func (c *OpenAIClient) WithEventBus(bus *events.Bus) *OpenAIClient {
+	c.bus = bus
+	return c
+}
+
+// publishStreamUsage emits the partial token usage of an interrupted stream as
+// a StreamUsage envelope. It never blocks (the bus is non-blocking) and never
+// mutates any state.
+func (c *OpenAIClient) publishStreamUsage(model string, input, output int, interrupted bool, reason string) {
+	if c.bus == nil {
+		return
+	}
+	env := events.NewEnvelope(events.DomainKindTelemetry, "llm.stream", events.StreamUsagePayload{
+		Model:        model,
+		InputTokens:  input,
+		OutputTokens: output,
+		Interrupted:  interrupted,
+		Reason:       reason,
+	})
+	c.bus.PublishEnvelope(env)
 }
 
 type openAIMessage struct {
@@ -261,7 +290,23 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	var reasoning strings.Builder
 	tokenIn, tokenOut, cacheRead := 0, 0, 0
 	var cost float64
+	// outputChars accumulates streamed output characters so partial token usage
+	// can be estimated when the request is interrupted (context deadline)
+	// before the provider delivers its final usage chunk.
+	outputChars := 0
 	reader := newOpenAIStreamReader(resp.Body)
+
+	// resolveUsage returns the authoritative token counts when a usage chunk
+	// arrived, otherwise a character-count estimate of the output tokens.
+	resolveUsage := func() (int, int) {
+		if tokenIn > 0 || tokenOut > 0 {
+			return tokenIn, tokenOut
+		}
+		if outputChars > 0 {
+			return tokenIn, outputChars / 4
+		}
+		return tokenIn, tokenOut
+	}
 
 	for {
 		chunk, err := reader.ReadChunk()
@@ -269,6 +314,15 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 			break
 		}
 		if err != nil {
+			// "Explicit Over Implicit": report the partial usage before
+			// returning the timeout/cancel error. Consumed tokens must never
+			// silently vanish from telemetry. A natural EOF is handled above.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				estIn, estOut := resolveUsage()
+				c.publishStreamUsage(c.resolveModel(req.Model), estIn, estOut, true, ctxErr.Error())
+				_ = resp.Body.Close()
+				return LLMResponse{TokenInput: estIn, TokenOutput: estOut}, fmt.Errorf("openai: stream: %w", err)
+			}
 			_ = resp.Body.Close()
 			return LLMResponse{}, fmt.Errorf("openai: stream: %w", err)
 		}
@@ -294,6 +348,7 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 				reasoningText = delta.Reasoning
 			}
 			if reasoningText != "" {
+				outputChars += len(reasoningText)
 				reasoning.WriteString(reasoningText)
 				if req.ReasoningHandler != nil {
 					if err := req.ReasoningHandler(reasoningText); err != nil {
@@ -303,6 +358,7 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 				}
 			}
 			if delta.Content != "" {
+				outputChars += len(delta.Content)
 				full.WriteString(delta.Content)
 				if handler != nil {
 					if err := handler(delta.Content); err != nil {

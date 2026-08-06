@@ -1751,16 +1751,24 @@ func (m *model) retryBuildWithStrictDirective() tea.Cmd {
 	if targetTask == nil {
 		return nil
 	}
+	// Strategy-aware strict directive: the required output format follows the
+	// target file's on-disk state. Forcing SEARCH/REPLACE on a new/0-byte file
+	// makes small models loop on a missing "old content" anchor and time out.
+	var outputFormat string
+	if data, rerr := os.ReadFile(targetTask.Target); rerr == nil && len(data) > 0 {
+		outputFormat = "- For existing files: ```go:path/to/file.go\n  <<<<<<< SEARCH\n  ...\n  =======\n  ...\n  >>>>>>>\n  ```\n"
+	} else {
+		outputFormat = "- For new files: ```<language>\n  <COMPLETE file content>\n  ```\n  (or a FILE: <path> block). Do NOT use SEARCH/REPLACE or unified diff — the file does not exist yet.\n"
+	}
 	strictContent := fmt.Sprintf(
 		"## STRICT BUILD DIRECTIVE — ZERO CONVERSATIONAL TEXT\n\n"+
 			"YOU ARE A CODE GENERATION TOOL. DO NOT OUTPUT ANY TEXT THAT IS NOT A CODE PATCH.\n\n"+
 			"REQUIRED OUTPUT FORMAT (FIRST TOKEN MUST MATCH):\n"+
-			"- For existing files: ```go:path/to/file.go\n  <<<<<<< SEARCH\n  ...\n  =======\n  ...\n  >>>>>>>\n  ```\n"+
-			"- For new files: ```\n  <<<<<<< FILE_CREATE: path/to/newfile.go\n  ...\n  >>>>>>> END_FILE\n  ```\n\n"+
+			outputFormat+
 			"FORBIDDEN OUTPUT:\n"+
 			"- Greetings, acknowledgments, summaries, explanations\n"+
 			"- Questions, clarifications, suggestions\n"+
-			"- Markdown that is not SEARCH/REPLACE or FILE_CREATE\n"+
+			"- Markdown that is not a valid patch or complete file content\n"+
 			"- JSON, YAML, or any structured data format\n\n"+
 			"TASK:\n"+
 			"Step %d: %s\nTarget: %s\nDescription: %s\n\n"+
@@ -2709,6 +2717,19 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		var buf strings.Builder
 		readBuf := make([]byte, 4096)
 
+		// usageProvider captures cumulative token usage from the stream reader
+		// (authoritative when a usage chunk arrived, otherwise a character
+		// estimate) so consumed tokens survive a timeout/error path.
+		type usageProvider interface {
+			Usage() (input, output int)
+		}
+		streamUsage := func() (int, int) {
+			if up, ok := rawStream.(usageProvider); ok {
+				return up.Usage()
+			}
+			return 0, 0
+		}
+
 		// ── REASONING TERMINAL EVENT GUARANTEE ───────────────────────────
 		// Whatever way the stream ends (EOF, provider error, truncation), any
 		// reasoning already forwarded to the bus must be closed with a terminal
@@ -2866,8 +2887,9 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 				break
 			}
 			if err != nil {
+				tokIn, tokOut := streamUsage()
 				select {
-				case streamCh <- streamErrMsg{err: err, content: fullContent.String()}:
+				case streamCh <- streamErrMsg{err: err, content: fullContent.String(), tokenInput: tokIn, tokenOutput: tokOut}:
 				default:
 				}
 				return
@@ -2878,12 +2900,14 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		// Parse whatever was accumulated into patches. Handle truncation
 		// (finish_reason == "length") gracefully by recovering partial
 		// tool calls from the ToolCallBuffer.
+		tokIn, tokOut := streamUsage()
 		var patches []*execution.Patch
 		if len(toolCalls) > 0 {
 			if m.toolCallBuffer != nil {
 				if bufErr := m.toolCallBuffer.BufferAll(toolCalls); bufErr != nil {
+					btokIn, btokOut := streamUsage()
 					select {
-					case streamCh <- buildFailedMsg{Err: fmt.Errorf("fast-track tool call buffer: %w", bufErr)}:
+					case streamCh <- buildFailedMsg{Err: fmt.Errorf("fast-track tool call buffer: %w", bufErr), TokenInput: btokIn, TokenOutput: btokOut}:
 					default:
 					}
 					return
@@ -2918,8 +2942,10 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 
 		select {
 		case streamCh <- buildProposalReadyMsg{
-			Patches: patches,
-			Output:  finalOutput,
+			Patches:     patches,
+			Output:      finalOutput,
+			TokenInput:  tokIn,
+			TokenOutput: tokOut,
 		}:
 		default:
 		}
@@ -3434,9 +3460,11 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		}
 
 		return hotfixProposalMsg{
-			Task:  task,
-			Patch: patch,
-			Diff:  diffContent,
+			Task:        task,
+			Patch:       patch,
+			Diff:        diffContent,
+			TokenInput:  resp.TokenInput,
+			TokenOutput: resp.TokenOutput,
 		}
 	}
 }
@@ -3833,10 +3861,12 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			}
 
 			return buildProposalReadyMsg{
-				Task:   task,
-				Patch:  patch,
-				Diff:   diffContent,
-				Output: rawContent,
+				Task:        task,
+				Patch:       patch,
+				Diff:        diffContent,
+				Output:      rawContent,
+				TokenInput:  resp.TokenInput,
+				TokenOutput: resp.TokenOutput,
 			}
 		}
 
@@ -4503,6 +4533,22 @@ func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 	}
 }
 
+// buildFirstTokenDirective returns the format-forced first-token instruction
+// for a build task, chosen by the target file's on-disk state:
+//
+//   - existing, non-empty file -> a SEARCH/REPLACE block or unified diff
+//   - new or 0-byte file       -> a complete-file markdown code block
+//
+// Forcing a patch format onto a non-existent file makes small models loop on a
+// missing "old content" anchor until the request times out; the new-file
+// branch must always permit full content generation instead.
+func buildFirstTokenDirective(target string) string {
+	if data, err := os.ReadFile(target); err == nil && len(data) > 0 {
+		return "A SEARCH/REPLACE BLOCK (<<<<<<< SEARCH) OR A UNIFIED DIFF (--- a/ ... +++ b/ ...) for the existing file."
+	}
+	return "THE OPENING ``` FENCE OF A COMPLETE-FILE MARKDOWN CODE BLOCK (or a FILE: <path> header) containing the FULL new file content. Do NOT use SEARCH/REPLACE or unified diff — the file does not exist yet."
+}
+
 func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// Transition workflow state to Building before any execution
 	// begins. If the transition fails (e.g. missing plan guards
@@ -4559,14 +4605,19 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	_ = m.sess.Save()
 	m.push(roleStatus, fmt.Sprintf("executing step %d: %s — %s", targetTask.StepNum, targetTask.Type, targetTask.Target))
 
+	// Strategy-aware first-token instruction: never force a SEARCH/REPLACE
+	// patch onto a file that does not exist yet. For new/0-byte targets the
+	// model must emit the complete file content instead — forcing a patch
+	// format on a non-existent file makes small models loop on a missing
+	// "old content" anchor until the request times out.
 	content := fmt.Sprintf(
 		"EXECUTION MODE — implement ONLY this task. "+
 			"ZERO conversational text, ZERO explanations, ZERO greetings, ZERO summaries.\n"+
-			"YOUR FIRST OUTPUT TOKEN MUST BE A SEARCH/REPLACE BLOCK (for existing files) "+
-			"OR A FILE_CREATE BLOCK (for new files).\n"+
+			"YOUR FIRST OUTPUT TOKEN MUST BE %s\n"+
 			"Do NOT output JSON, do NOT restate the plan, do NOT list other tasks.\n"+
 			"Do NOT ask questions, do NOT ask for clarification, do NOT acknowledge.\n\n"+
 			"Step %d: %s\nTarget: %s\nDescription: %s",
+		buildFirstTokenDirective(targetTask.Target),
 		targetTask.StepNum, targetTask.Type, targetTask.Target, targetTask.Description)
 
 	if m.graph != nil {

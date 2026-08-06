@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -215,8 +216,8 @@ type GroqStreamResult struct {
 }
 
 func (r *GroqStreamResult) Usage() (input, output int) {
-	if r.sr != nil && r.sr.finalUsage != nil {
-		return r.sr.finalUsage.PromptTokens, r.sr.finalUsage.CompletionTokens
+	if r.sr != nil {
+		return r.sr.usage.Usage()
 	}
 	return 0, 0
 }
@@ -237,6 +238,9 @@ type groqSSEReader struct {
 	finalUsage       *groqUsage
 	finishReason     string
 	reasoningHandler func(string) error
+
+	// usage tracks cumulative token accounting (see streamUsageTracker).
+	usage streamUsageTracker
 }
 
 func (s *groqSSEReader) Read(p []byte) (int, error) {
@@ -251,6 +255,9 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.usage.markInterrupted()
+			}
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -281,6 +288,7 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 
 		if chunk.Usage != nil {
 			s.finalUsage = chunk.Usage
+			s.usage.recordUsage(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
 		}
 
 		if chunk.Choices[0].Delta != nil {
@@ -294,6 +302,7 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 				reasoningText = delta.Reasoning
 			}
 			if reasoningText != "" {
+				s.usage.recordOutput(len(reasoningText))
 				if s.reasoningHandler != nil {
 					if err := s.reasoningHandler(reasoningText); err != nil {
 						s.closed = true
@@ -303,6 +312,7 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 				continue
 			}
 			if delta.Content != "" {
+				s.usage.recordOutput(len(delta.Content))
 				n := copy(p, delta.Content)
 				return n, nil
 			}

@@ -257,6 +257,19 @@ func BuildPrompt(exec *layer2.ExecutionContext, req Request, maxChars int) strin
 		}
 	}
 	fmt.Fprintf(&b, "Files: %d\n", files)
+
+	// ── OUTPUT PROTOCOL ─────────────────────────────────────────────────
+	// The target file may or may not exist. When it is not listed above
+	// (or is empty), it must be created from scratch — a SEARCH/REPLACE
+	// patch against a non-existent file has no "old content" to match and
+	// causes reasoning loops on small models.
+	b.WriteString("\nOUTPUT PROTOCOL\n")
+	fmt.Fprintf(&b, "- The target file %q is listed above with its full current content only if it exists on disk.\n", req.TargetFile)
+	b.WriteString("- If the target file is NOT listed above (it does not exist or is 0 bytes), produce the COMPLETE new file content in a single block:\n")
+	b.WriteString("  === FILE: <relative path>\n  <complete replacement content>\n  === END\n")
+	b.WriteString("- If the target file IS listed above, output a full replacement block for it too (the complete updated content between === FILE: and === END) — never a fragment.\n")
+	b.WriteString("- Do NOT output any text outside FILE blocks.\n")
+
 	out := b.String()
 	if maxChars > 0 && len(out) > maxChars {
 		out = out[:maxChars]

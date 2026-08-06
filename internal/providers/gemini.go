@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -246,8 +247,8 @@ type GeminiStreamResult struct {
 }
 
 func (r *GeminiStreamResult) Usage() (input, output int) {
-	if r.sr != nil && r.sr.finalUsage != nil {
-		return r.sr.finalUsage.PromptTokenCount, r.sr.finalUsage.CandidatesTokenCount
+	if r.sr != nil {
+		return r.sr.usage.Usage()
 	}
 	return 0, 0
 }
@@ -275,6 +276,9 @@ type geminiSSEReader struct {
 	finalUsage       *geminiUsageMetadata
 	finishReason     string
 	reasoningHandler func(string) error
+
+	// usage tracks cumulative token accounting (see streamUsageTracker).
+	usage streamUsageTracker
 }
 
 func (s *geminiSSEReader) Read(p []byte) (int, error) {
@@ -289,6 +293,9 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.usage.markInterrupted()
+			}
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -310,6 +317,7 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 
 		if event.UsageMetadata != nil {
 			s.finalUsage = event.UsageMetadata
+			s.usage.recordUsage(event.UsageMetadata.PromptTokenCount, event.UsageMetadata.CandidatesTokenCount)
 		}
 
 		if len(event.Candidates) > 0 {
@@ -321,6 +329,7 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 				// to the reasoning handler — they must never appear in the
 				// visible response.
 				if part.Thought {
+					s.usage.recordOutput(len(part.Text))
 					if s.reasoningHandler != nil {
 						if err := s.reasoningHandler(part.Text); err != nil {
 							s.closed = true
@@ -330,6 +339,7 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 					continue
 				}
 				if part.Text != "" {
+					s.usage.recordOutput(len(part.Text))
 					n := copy(p, part.Text)
 					return n, nil
 				}

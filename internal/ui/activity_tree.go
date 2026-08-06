@@ -13,6 +13,26 @@ import (
 // stagePrefixStyle colors the ":: stage" marker of each execution-tree entry.
 var stagePrefixStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorCyan))
 
+// ActivityStatus is the fixed lifecycle state rendered in the status column of
+// every execution-tree entry. It is a pure render concept: completed entries
+// carry Done, the in-flight entry carries Running, and a completed shell exec
+// with a non-zero exit code carries Failed.
+type ActivityStatus int
+
+const (
+	// ActivityStatusDone marks a completed entry.
+	ActivityStatusDone ActivityStatus = iota
+	// ActivityStatusRunning marks the in-flight entry.
+	ActivityStatusRunning
+	// ActivityStatusFailed marks a completed entry that errored.
+	ActivityStatusFailed
+)
+
+// statusBadgeWidth is the fixed cell width of the trailing status column. All
+// three status forms render to exactly this width so animation cycles and
+// done→running transitions never shift the content column horizontally.
+const statusBadgeWidth = 8
+
 type EventKind int
 
 const (
@@ -264,19 +284,20 @@ func (at *ActivityTree) Len() int {
 }
 
 // Render produces the full execution tree view. Completed entries carry a
-// "[done]" badge; when active=true the last entry is treated as the
-// in-flight stage and gets a "[running]" badge with animated dots so the
-// viewer can tell exactly where the pipeline stands.
+// fixed-width status column ("✔ done" / "✖ failed"); when active=true the last
+// entry is treated as the in-flight stage and gets a single braille spinner
+// frame so the viewer can tell exactly where the pipeline stands.
 func (at *ActivityTree) Render(width int) string {
 	return at.RenderActive(width, false, 0)
 }
 
-// RenderActive renders the tree with a live "[running]" badge on the last
+// RenderActive renders the tree with a live braille spinner frame on the last
 // entry while active is true. frame is the live spinner frame (advanced by the
-// shimmer / smooth tick loops): its low bits drive the truncation dots and the
-// 4-frame animated snowflake exec icon, so a running shell visibly cycles
-// ✻ → ❅ → ❆ → ✦. When the tree is expanded (Ctrl+O) the most recent shell-exec
-// entry's accumulated output is rendered inline below its command line.
+// shimmer / smooth tick loops): its low bits drive the braille status spinner
+// and the 4-frame animated snowflake exec icon, so a running shell visibly
+// cycles ✻ → ❅ → ❆ → ✦. When the tree is expanded (Ctrl+O) the most recent
+// shell-exec entry's accumulated output is rendered inline below its command
+// line.
 func (at *ActivityTree) RenderActive(width int, active bool, frame int) string {
 	at.mu.Lock()
 	entries := make([]EngineEvent, len(at.entries))
@@ -324,24 +345,40 @@ func stageLabel(kind EventKind) string {
 	}
 }
 
-// badge renders the trailing [running] / [done] status marker.
-func stageBadge(running bool, dotFrame int) string {
-	if running {
-		return orangeStyle.Render(fmt.Sprintf("[running%s]", animatedDots(dotFrame)))
+// stageBadge renders the trailing fixed-width status column. The running
+// status uses a single braille spinner frame (all frames are one cell wide, so
+// animation never reflows); done and failed use constant strings padded to the
+// same width. No brackets, no variable-length dots — the column never shifts.
+func stageBadge(status ActivityStatus, spinnerFrame int) string {
+	switch status {
+	case ActivityStatusRunning:
+		frame := ProposalSpinnerFrames[spinnerFrame%len(ProposalSpinnerFrames)]
+		return orangeStyle.Render(padRightVisual(frame, statusBadgeWidth))
+	case ActivityStatusFailed:
+		return redStyle.Render("✖ failed")
+	default:
+		return greenStyle.Render(padRightVisual("✔ done", statusBadgeWidth))
 	}
-	return greenStyle.Render("[done]")
+}
+
+// padRightVisual pads s to exactly width visual cells with trailing spaces.
+func padRightVisual(s string, width int) string {
+	if gap := width - lipgloss.Width(s); gap > 0 {
+		return s + strings.Repeat(" ", gap)
+	}
+	return s
 }
 
 func (at *ActivityTree) renderEvent(ev EngineEvent, width int, running bool, frame int, expanded bool) string {
-	// The running badge dots cycle every 3 frames; the snowflake exec icon
-	// cycles every 4 (✻ ❅ ❆ ✦) so a full rotation is visible.
-	dotFrame := frame % 3
+	// The braille status spinner cycles over its full frame set; the snowflake
+	// exec icon cycles every 4 frames (✻ ❅ ❆ ✦) so a full rotation is visible.
+	spinnerFrame := frame % len(ProposalSpinnerFrames)
 	execFrame := frame % len(execSpinnerFrames)
 	// Reserve cell budget for the "<icon> <stage> │ " prefix and the trailing
-	// status badge so long paths/commands truncate cleanly instead of
-	// overflowing the viewport's right border.
+	// fixed-width status column so long paths/commands truncate cleanly instead
+	// of overflowing the viewport's right border.
 	prefixW := 14
-	badgeW := 9
+	badgeW := statusBadgeWidth + 1
 	contentW := width - prefixW - badgeW
 	if contentW < 20 {
 		contentW = 20
@@ -360,7 +397,7 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int, running bool, fra
 		elapsed := formatElapsed(e.Elapsed)
 		return fmt.Sprintf("%s%s (%d B · %s) %s",
 			prefix(IconRead(), stageLabel(ev.Kind), blueStyle),
-			truncateMiddle(e.File, contentW), e.Bytes, mutedStyle.Render(elapsed), stageBadge(running, dotFrame))
+			truncateMiddle(e.File, contentW), e.Bytes, mutedStyle.Render(elapsed), stageBadge(statusOf(running, false), spinnerFrame))
 
 	case EventFileMutate:
 		e := ev.FileMutate
@@ -369,7 +406,7 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int, running bool, fra
 		}
 		return fmt.Sprintf("%s%s (+%d / -%d lines) %s",
 			prefix(Icon.Diff, stageLabel(ev.Kind), orangeStyle),
-			truncateMiddle(e.File, contentW), e.LinesAdd, e.LinesDel, stageBadge(running, dotFrame))
+			truncateMiddle(e.File, contentW), e.LinesAdd, e.LinesDel, stageBadge(statusOf(running, false), spinnerFrame))
 
 	case EventCommandExec:
 		e := ev.CommandExec
@@ -396,9 +433,9 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int, running bool, fra
 				exitStr = redStyle.Render(exitStr)
 			}
 			fmt.Fprintf(&b, " (%s · %s) %s",
-				exitStr, mutedStyle.Render(formatElapsed(e.Elapsed)), stageBadge(running, dotFrame))
+				exitStr, mutedStyle.Render(formatElapsed(e.Elapsed)), stageBadge(statusOf(running, e.ExitCode != 0), spinnerFrame))
 		} else {
-			b.WriteString(" " + stageBadge(running, dotFrame))
+			b.WriteString(" " + stageBadge(statusOf(running, false), spinnerFrame))
 		}
 
 		// Ctrl+O expanded shell output: render the accumulated stdout/stderr
@@ -425,7 +462,7 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int, running bool, fra
 		}
 		return fmt.Sprintf("%s%s (%d hits) %s",
 			prefix(IconGrep(), stageLabel(ev.Kind), cyanStyle),
-			truncateMiddle(e.Query, contentW), e.Hits, stageBadge(running, dotFrame))
+			truncateMiddle(e.Query, contentW), e.Hits, stageBadge(statusOf(running, false), spinnerFrame))
 
 	case EventResolve:
 		e := ev.Resolve
@@ -434,11 +471,23 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int, running bool, fra
 		}
 		return fmt.Sprintf("%s%s (%d hits) %s",
 			prefix(IconGrep(), stageLabel(ev.Kind), cyanStyle),
-			truncateMiddle(e.Symbol, contentW), e.Hits, stageBadge(running, dotFrame))
+			truncateMiddle(e.Symbol, contentW), e.Hits, stageBadge(statusOf(running, false), spinnerFrame))
 
 	default:
 		return ""
 	}
+}
+
+// statusOf derives the ActivityStatus for an entry: the in-flight entry is
+// Running, a completed entry with failed=true is Failed, otherwise Done.
+func statusOf(running, failed bool) ActivityStatus {
+	if running {
+		return ActivityStatusRunning
+	}
+	if failed {
+		return ActivityStatusFailed
+	}
+	return ActivityStatusDone
 }
 
 // truncateMiddle shortens a long string to at most maxW visual cells, keeping

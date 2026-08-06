@@ -424,8 +424,8 @@ type OpenRouterStreamResult struct {
 }
 
 func (r *OpenRouterStreamResult) Usage() (input, output int) {
-	if r.sr != nil && r.sr.finalUsage != nil {
-		return r.sr.finalUsage.PromptTokens, r.sr.finalUsage.CompletionTokens
+	if r.sr != nil {
+		return r.sr.usage.Usage()
 	}
 	return 0, 0
 }
@@ -447,6 +447,11 @@ type openrouterSSEReader struct {
 	reader     *bufio.Reader
 	closed     bool
 	finalUsage *openrouterUsage
+
+	// usage tracks cumulative token accounting: the authoritative provider
+	// usage when a usage chunk arrives, plus a character-count estimate when
+	// the stream is interrupted (context deadline) before that chunk.
+	usage streamUsageTracker
 
 	// finishReason records the terminal finish_reason chunk observed on the
 	// stream ("stop", "length", "tool_calls", ...). It is surfaced to callers
@@ -491,6 +496,9 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.usage.markInterrupted()
+			}
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -517,6 +525,7 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 
 		if chunk.Usage != nil {
 			s.finalUsage = chunk.Usage
+			s.usage.recordUsage(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
 		}
 
 		if len(chunk.Choices) == 0 {
@@ -537,6 +546,7 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 				reasoningText = delta.Reasoning
 			}
 			if reasoningText != "" {
+				s.usage.recordOutput(len(reasoningText))
 				reasoning := []byte(ReasoningSentinel + reasoningText + ReasoningSentinel)
 				n := copy(p, reasoning)
 				if n < len(reasoning) {
@@ -545,6 +555,7 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 				return n, nil
 			}
 			if delta.Content != "" {
+				s.usage.recordOutput(len(delta.Content))
 				content := []byte(delta.Content)
 				n := copy(p, content)
 				if n < len(content) {
@@ -571,6 +582,7 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 					all = append(all, ToolCallSentinel...)
 				}
 				if len(all) > 0 {
+					s.usage.recordOutput(len(all))
 					n := copy(p, all)
 					if n < len(all) {
 						s.pending = all[n:]
