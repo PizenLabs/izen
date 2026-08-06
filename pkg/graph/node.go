@@ -130,7 +130,11 @@ func (n *OpNode) executeRunCommand(ctx context.Context) kernel.TaskResult {
 	}
 	out, err := r.Run(ctx, command)
 	if err != nil {
-		return failedResult(fmt.Errorf("graph: command %q: %w", command, err))
+		return kernel.TaskResult{
+			Status: kernel.StatusFailed,
+			Error:  fmt.Errorf("graph: command %q: %w", command, err),
+			Data:   out,
+		}
 	}
 	return kernel.TaskResult{Status: kernel.StatusCompleted, Data: out}
 }
