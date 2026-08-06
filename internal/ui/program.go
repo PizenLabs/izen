@@ -142,6 +142,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		cfg:                 cfg,
 		runtimeCtx:          app.RuntimeCtx,
 		workflowSM:          app.WorkflowSM,
+		workflowRT:          app.Workflow,
 		authEngine:          app.Auth,
 		mutationBudget:      app.Budget,
 		microBudget:         app.MicroBudget,

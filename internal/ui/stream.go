@@ -101,6 +101,8 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.startShimmer("Thinking...", "analyze")
 	m.responseBuffer.Reset()
 	m.reasoningBuffer.Reset()
+	m.traceBuffer.Reset()
+	m.traceExpanded = false
 	m.pendingReasoningFragment = ""
 	if m.thinkingPanel != nil {
 		m.thinkingPanel.Reset()

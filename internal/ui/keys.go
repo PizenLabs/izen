@@ -39,6 +39,12 @@ func (m *model) toggleThoughtBlock() bool {
 		m.thinkingBuffer.Toggle()
 	case m.thinkingPanel != nil:
 		m.thinkingPanel.Toggle()
+	case m.traceBuffer.Len() > 0:
+		// "Human-Centered / Reversible": models without a formal reasoning
+		// channel (e.g. Gemma) never feed the ThinkingBuffer, so Ctrl+O used to
+		// do nothing. The raw output trace is captured in traceBuffer instead —
+		// toggle its expanded viewport.
+		m.traceExpanded = !m.traceExpanded
 	default:
 		return false
 	}

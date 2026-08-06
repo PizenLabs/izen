@@ -1192,6 +1192,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					FailureClass: classifier.FailureUnknownClass,
 				})
 			}
+			// "Human-Centered / Reversible": an execution failure must never
+			// trap the user in the build phase. Unwind back to interactive
+			// StateChat so the next prompt routes normally.
+			m.unwindBuildFailure()
 		}
 		if msg.output != "" {
 			for _, line := range strings.Split(msg.output, "\n") {
@@ -2024,6 +2028,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.stopShimmer()
 		}
 		m.responseBuffer.WriteString(raw)
+		m.traceBuffer.WriteString(raw)
 		if m.streamThrottle != nil {
 			m.streamThrottle.Write(raw)
 		} else {
@@ -2616,6 +2621,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case livePreviewChunkMsg:
 		// Stream content or tool call arguments directly into the
 		// LiveCodePreview for real-time code preview during fast-track builds.
+		if msg.Content != "" {
+			m.traceBuffer.WriteString(msg.Content)
+		}
 		if m.liveCodePreview != nil && msg.Content != "" {
 			label := "live_stream"
 			if msg.IsTool {
@@ -2645,6 +2653,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
 		}
 		m.push(roleError, "fast-track build failed: "+providers.SanitizeAPIError(msg.Err))
+		// "Human-Centered / Reversible": a failed build stream must never trap
+		// the workflow in the build phase. Unwind the state machine back to
+		// StateChat/interactive so the next prompt routes normally instead of
+		// failing with "transition from build to ask".
+		m.unwindBuildFailure()
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()

@@ -2552,6 +2552,8 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 	}
 
 	m.responseBuffer.Reset()
+	m.traceBuffer.Reset()
+	m.traceExpanded = false
 	if m.execEng != nil {
 		m.execEng.SetStreamContextFiles(m.attachedFiles)
 	}
@@ -3270,14 +3272,12 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		// Build a focused, non-chat patch-generation prompt with full file
 		// context using the appropriate strategy for the file state.
 		strategy := execution.StrategyForOriginal(orig)
-		handoff := ctxpkg.SanitizeBuildHandoff(task, "")
+		var handoff string
 		switch strategy {
 		case execution.STRATEGY_NEW_FILE:
-			handoff += "\n\nThis is a NEW file that does not exist yet. "
-			handoff += "Output the complete file content inside a markdown code block "
-			handoff += "with the appropriate language tag (e.g. ```css, ```javascript, ```html, ```python, ```go). "
-			handoff += "Do NOT use FILE_CREATE markers, SEARCH/REPLACE, or diffs."
+			handoff = buildNewFileHandoff(task)
 		default:
+			handoff = ctxpkg.SanitizeBuildHandoff(task, "")
 			handoff += "\n\n### TARGET_FILE_CONTENT\n```\n" + orig + "\n```\n"
 			handoff += "\nModify the above file content to fulfill the task. "
 			handoff += "Output a unified diff (--- a/ ... +++ b/ ...) or a SEARCH/REPLACE block (<<<<<<< SEARCH). "
@@ -3575,6 +3575,42 @@ func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
 	}
 }
 
+// buildNewFileHandoff renders a clean handoff for creating a brand-new file.
+// It deliberately does NOT include SanitizeBuildHandoff's unified-diff /
+// SEARCH/REPLACE instructions: a weak model (e.g. gemma-4-26b-a4b) follows
+// the first emphasized format directive and emits a diff against a file that
+// does not exist, producing a (+0 / -0 lines) no-op patch. New-file tasks get
+// a single, unambiguous full-creation contract.
+func buildNewFileHandoff(task *plan.Task) string {
+	if task == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## BUILD HANDOFF — NEW FILE CREATION\n\n")
+	b.WriteString("Execute ONLY the following task. The target file does NOT exist yet — CREATE it.\n")
+	b.WriteString("Do NOT restate the plan, do NOT explain, do NOT list other tasks.\n\n")
+	b.WriteString("### TARGET FILE\n")
+	b.WriteString(task.Target + "\n")
+	if lang := ctxpkg.LanguageFromExtension(task.Target); lang != "" {
+		b.WriteString("### EXPECTED LANGUAGE\n")
+		b.WriteString(lang + "\n")
+	}
+	b.WriteString("### TASK\n")
+	b.WriteString(string(task.Type) + ": " + task.Target)
+	if task.Description != "" {
+		b.WriteString(" — " + task.Description)
+	}
+	b.WriteString("\n\n")
+	b.WriteString("### INSTRUCTION\n")
+	b.WriteString("Output the COMPLETE file content inside a single markdown code block ")
+	b.WriteString("with the appropriate language tag (e.g. ```css, ```javascript, ```html, ```python, ```go). ")
+	b.WriteString("Do NOT use SEARCH/REPLACE blocks (<<<<<<< SEARCH) or unified diffs (--- a/ +++ b/) — the file does not exist yet. ")
+	b.WriteString("Do NOT use FILE_CREATE markers. ")
+	b.WriteString("Output ONLY the code block. No conversational text, no explanations, no greetings.\n\n")
+	fmt.Fprintf(&b, "CURRENT_YEAR: %d\n", time.Now().Year())
+	return strings.TrimSpace(b.String())
+}
+
 // proposeBuildPatch generates a patch for a regular FILE_MUTATE / GIT_ACTION
 // build task via the LLM (one non-streaming call) WITHOUT applying it. Instead
 // it returns a buildProposalReadyMsg so the update loop can extract proposals
@@ -3639,22 +3675,19 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 
 		// ── Build the handoff with the current file content ────────────
 		buildHandoff := func(content string) string {
-			h := ctxpkg.SanitizeBuildHandoff(task, "")
 			switch strategy {
 			case execution.STRATEGY_NEW_FILE:
-				h += "\n\nThis is a NEW file that does not exist yet. "
-				h += "Output the complete file content inside a markdown code block "
-				h += "with the appropriate language tag (e.g. ```css, ```javascript, ```html, ```python, ```go). "
-				h += "Do NOT use FILE_CREATE markers, SEARCH/REPLACE blocks, or unified diffs."
-				h += "Generate ONLY the content that belongs in this file.\n"
+				// Clean full-creation contract: no diff instructions at all.
+				return buildNewFileHandoff(task)
 			default:
+				h := ctxpkg.SanitizeBuildHandoff(task, "")
 				h += "\n\n### TARGET_FILE_CONTENT\n```\n" + content + "\n```\n"
 				h += "\nModify the above file content to fulfill the task. "
 				h += "Output a unified diff (--- a/ ... +++ b/ ...) or a SEARCH/REPLACE block (<<<<<<< SEARCH). "
 				h += "Do NOT rewrite the entire file. "
 				h += "Return ONLY the SEARCH/REPLACE block or unified diff. No explanatory text."
+				return h
 			}
-			return h
 		}
 
 		handoff := buildHandoff(orig)
@@ -3753,9 +3786,18 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 						m.activeRouteModel(), attempt+1))
 				}
 				if attempt < maxRetries {
-					handoff = fmt.Sprintf(
-						"%s\n\nCORRECTION: Your previous response was empty or unparseable. The expected output is a raw unified diff block like:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n line1\n-line-old\n+line-new\n\nReturn ONLY that diff. No text before or after.",
-						buildHandoff(orig), task.Target, task.Target)
+					// Strategy-aware correction: a new-file task must be told to
+					// emit complete content, never a diff against a non-existent
+					// file (which makes SLMs emit (+0 / -0 lines) no-op patches).
+					correction := ""
+					if currentStrategy == execution.STRATEGY_NEW_FILE {
+						correction = "CORRECTION: Your previous response was empty or unparseable. The target file does not exist yet. Output the COMPLETE file content inside a single markdown code block with the appropriate language tag. Do NOT use SEARCH/REPLACE or unified diff."
+					} else {
+						correction = fmt.Sprintf(
+							"CORRECTION: Your previous response was empty or unparseable. The expected output is a raw unified diff block like:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n line1\n-line-old\n+line-new\n\nReturn ONLY that diff. No text before or after.",
+							task.Target, task.Target)
+					}
+					handoff = buildHandoff(orig) + "\n\n" + correction
 					continue
 				}
 				return buildProposalReadyMsg{Err: fmt.Errorf("patch generation returned empty output")}

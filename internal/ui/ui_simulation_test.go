@@ -11,6 +11,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/core/workflow"
+	domainworkflow "github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -49,6 +50,7 @@ func newTestModel() *model {
 		showBanner: false,
 		state:      StateAwaitingApproval,
 		workflowSM: workflow.NewWorkflowStateMachine(),
+		workflowRT: domainworkflow.NewWorkflowRuntime(),
 		viewState:  presentation.NewWorkflowViewState(),
 		Ready:      true,
 		Viewport:   vp,

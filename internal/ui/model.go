@@ -26,6 +26,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/runtime"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
+	domainworkflow "github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
@@ -714,6 +715,14 @@ type model struct {
 	responseBuffer  strings.Builder
 	reasoningBuffer strings.Builder
 	streaming       bool
+	// traceBuffer accumulates the raw streamed response of the current/last
+	// completion so Ctrl+O can expand/collapse a full output-trace viewport
+	// even for models that emit no formal reasoning channel (e.g. Gemma family
+	// SLMs). It is reset at the start of every stream and survives completion
+	// so the trace stays inspectable after the response ends.
+	traceBuffer strings.Builder
+	// traceExpanded is the Ctrl+O expansion state of the output-trace viewport.
+	traceExpanded bool
 	// pendingReasoningFragment holds an opened-but-not-yet-closed
 	// \x00RSNG\x00 reasoning block carried over between extraction passes.
 	// Without this, a sentinel pair split across two ticks (or a truncated
@@ -1088,6 +1097,12 @@ type model struct {
 	// store or cache its own copies of workflow states or capability flags.
 	runtimeCtx *runtime.RuntimeContext
 	workflowSM *workflow.WorkflowStateMachine
+	// workflowRT is the Application-layer domain WorkflowRuntime (PhaseAsk /
+	// PhaseBuild / ...) that submit_prompt / switch_mode handlers drive. On a
+	// failed build the phase must be unwound back to Ask, or every later user
+	// prompt is rejected with "transition from build to ask: moving to a
+	// previous phase is not permitted" ("Human-Centered / Reversible").
+	workflowRT domainworkflow.WorkflowRuntime
 	// viewState is the derived presentation projection of the canonical
 	// workflow event stream (EventPhaseChanged / EventApprovalRequested). The
 	// UI derives StateAwaitingApproval/StateProcessing from it via
@@ -1713,6 +1728,45 @@ func (m *model) resolveApprovalState() {
 		m.viewState.ResolveApproval()
 	}
 	m.syncUIState()
+}
+
+// unwindBuildFailure releases a failed build execution back to interactive
+// state. It is the "Human-Centered / Reversible" guarantee for failed commands:
+// a stream/engine failure (HTTP 400/500, network error) must never trap the
+// user in the build phase — every later prompt would then be rejected with
+// "workflow: transition from build to ask: moving to a previous phase is not
+// permitted" and the session would be unrecoverable.
+//
+// It performs a deterministic recovery:
+//  1. Release any outstanding approval gate (build failures can arrive while a
+//     proposal freeze is pending).
+//  2. Reset the core WorkflowStateMachine to StateIdle so /ask, /plan and
+//     /build are all reachable again.
+//  3. Reset the Application-layer domain WorkflowRuntime to PhaseAsk so
+//     submit_prompt / switch_mode handlers never reject a recovery prompt.
+//  4. Re-derive the presentation state to interactive StateChat and restore
+//     keyboard focus.
+func (m *model) unwindBuildFailure() {
+	m.resolveApprovalState()
+	// Drop any in-flight approval/patch state so the viewport returns to chat.
+	m.awaitingConfirmation = false
+	m.pendingProposals = nil
+	m.pendingBuildApproval = false
+	m.pendingBuildTask = nil
+	m.pendingHotfixTask = nil
+	m.pendingHotfixPatch = nil
+	m.acceptAll = false
+	m.pendingRouteConfirm = false
+	if m.workflowSM != nil {
+		// From StateBuilding/StateFailed/StateRepairing the canonical exit is
+		// a reset back to StateIdle, from which every forward phase is reachable.
+		_ = m.workflowSM.SendEvent(workflow.EventReset, workflow.TransitionContext{})
+	}
+	if m.workflowRT != nil {
+		m.workflowRT.Reset()
+	}
+	m.syncUIState()
+	m.ti.Focus()
 }
 
 // handleEmergencyInterrupt is the unblockable emergency escape hatch. It is
@@ -2769,6 +2823,18 @@ func (m *model) refreshViewportContent() {
 	if !m.streaming && m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
 		if thoughts := m.renderLiveThinking(m.width); thoughts != "" {
 			content.WriteString(thoughts)
+			content.WriteString("\n")
+		}
+	}
+
+	// ── Unified output trace viewport (Ctrl+O) ─────────────────────────
+	// Models without a formal reasoning channel never feed the ThinkingBuffer,
+	// so Ctrl+O had nothing to expand. The raw streamed response is captured in
+	// traceBuffer instead; when the user expands it, the full output trace
+	// renders in a dimmed collapsible box for inspection.
+	if m.traceExpanded && m.traceBuffer.Len() > 0 {
+		if trace := m.renderOutputTrace(m.width); trace != "" {
+			content.WriteString(trace)
 			content.WriteString("\n")
 		}
 	}

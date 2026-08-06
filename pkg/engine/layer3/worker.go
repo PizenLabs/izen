@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/PizenLabs/izen/pkg/engine/layer2"
@@ -235,8 +237,34 @@ func (f FuncWorker) Execute(ctx context.Context, exec *layer2.ExecutionContext, 
 	return f(ctx, exec, req)
 }
 
+// targetFileOnDisk stats the target file and returns its current content. It
+// is the single owner of the new-vs-existing decision for the worker prompt
+// ("One Question, One Owner"): whether the target happens to be listed in the
+// Layer 2 execution context is NOT authoritative — the actual filesystem state
+// is. A missing path, a directory, or a 0-byte file is treated as new.
+func targetFileOnDisk(target string) (string, bool) {
+	if target == "" {
+		return "", false
+	}
+	fi, err := os.Stat(target)
+	if err != nil || fi.IsDir() || fi.Size() == 0 {
+		return "", false
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
 // BuildPrompt deterministically renders a Layer 2 execution context plus a
 // request into a stateless worker prompt, bounded to maxChars characters.
+//
+// The OUTPUT PROTOCOL (full-creation vs replacement) is chosen by an
+// authoritative on-disk stat of the target file, never by whether the file is
+// listed in the Layer 2 context. A new/0-byte target must be created from
+// scratch: forcing a diff against a file with no old content makes weak models
+// emit invalid diffs and loop until the request times out.
 func BuildPrompt(exec *layer2.ExecutionContext, req Request, maxChars int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Intent: %s\n", req.Intent)
@@ -249,25 +277,45 @@ func BuildPrompt(exec *layer2.ExecutionContext, req Request, maxChars int) strin
 	if req.Description != "" {
 		fmt.Fprintf(&b, "Description: %s\n", req.Description)
 	}
+
+	// Authoritative on-disk state of the target, decided before any prompt
+	// section is rendered.
+	targetContent, targetExists := targetFileOnDisk(req.TargetFile)
+
 	files := 0
 	if exec != nil {
-		files = len(exec.Files)
 		for _, f := range exec.Files {
+			// The target's on-disk content is rendered below; skip a stale
+			// context copy so the model never sees two versions of one file.
+			if targetExists && filepath.Clean(f.Path) == filepath.Clean(req.TargetFile) {
+				continue
+			}
 			fmt.Fprintf(&b, "\n### %s\n%s\n", f.Path, f.Source)
+			files++
 		}
+	}
+	if targetExists {
+		fmt.Fprintf(&b, "\n### %s\n%s\n", req.TargetFile, targetContent)
+		files++
 	}
 	fmt.Fprintf(&b, "Files: %d\n", files)
 
 	// ── OUTPUT PROTOCOL ─────────────────────────────────────────────────
-	// The target file may or may not exist. When it is not listed above
-	// (or is empty), it must be created from scratch — a SEARCH/REPLACE
-	// patch against a non-existent file has no "old content" to match and
-	// causes reasoning loops on small models.
+	// The format is driven by the stat above. New files get an explicit
+	// full-creation contract with diff formats forbidden; existing files get
+	// a complete-replacement contract. Both use the deterministic FILE block
+	// protocol (never fragments, never a raw unified diff).
 	b.WriteString("\nOUTPUT PROTOCOL\n")
-	fmt.Fprintf(&b, "- The target file %q is listed above with its full current content only if it exists on disk.\n", req.TargetFile)
-	b.WriteString("- If the target file is NOT listed above (it does not exist or is 0 bytes), produce the COMPLETE new file content in a single block:\n")
-	b.WriteString("  === FILE: <relative path>\n  <complete replacement content>\n  === END\n")
-	b.WriteString("- If the target file IS listed above, output a full replacement block for it too (the complete updated content between === FILE: and === END) — never a fragment.\n")
+	if targetExists {
+		fmt.Fprintf(&b, "- The target file %q EXISTS on disk (%d bytes). Output its COMPLETE replacement content.\n",
+			req.TargetFile, len(targetContent))
+	} else {
+		fmt.Fprintf(&b, "- The target file %q does NOT exist on disk (new file). CREATE it with the COMPLETE new file content.\n",
+			req.TargetFile)
+		b.WriteString("- Do NOT output a unified diff (--- a/ ... +++ b/) or SEARCH/REPLACE blocks (<<<<<<< SEARCH) — a new file has no old content to diff against.\n")
+	}
+	b.WriteString("- Output the full file content in a single block:\n")
+	b.WriteString("  === FILE: <relative path>\n  <complete file content>\n  === END\n")
 	b.WriteString("- Do NOT output any text outside FILE blocks.\n")
 
 	out := b.String()

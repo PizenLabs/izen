@@ -118,46 +118,11 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 
 	msgs := p.buildMessages(req)
 
-	body := openrouterRequest{
-		Model:       model,
-		Messages:    msgs,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stop:        req.Stop,
-		Stream:      false,
-		Reasoning:   reasoningFor(req),
-	}
+	body := p.buildRequest(model, msgs, req, false)
 
-	if len(req.Tools) > 0 {
-		rawTools := make([]json.RawMessage, 0, len(req.Tools))
-		for _, t := range req.Tools {
-			data, err := json.Marshal(t)
-			if err == nil {
-				rawTools = append(rawTools, data)
-			}
-		}
-		body.Tools = rawTools
-	}
-
-	payload, err := json.Marshal(body)
+	resp, err := p.doChatRequest(ctx, key, body, false)
 	if err != nil {
-		return nil, fmt.Errorf("openrouter: marshal: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("openrouter: new request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+key)
-	httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
-	httpReq.Header.Set("X-OpenRouter-Title", "izen")
-	httpReq.Header.Set("X-OpenRouter-Categories", "cli-agent")
-	httpReq.Header.Set("X-Description", "AI amplifies human judgment. Humans remain in control.")
-
-	resp, err := p.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("openrouter: do: %w", err)
+		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -226,37 +191,11 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 
 	msgs := p.buildMessages(req)
 
-	body := openrouterRequest{
-		Model:         model,
-		Messages:      msgs,
-		MaxTokens:     req.MaxTokens,
-		Temperature:   req.Temperature,
-		Stop:          req.Stop,
-		Stream:        true,
-		StreamOptions: &streamOptions{IncludeUsage: true},
-		Reasoning:     reasoningFor(req),
-	}
+	body := p.buildRequest(model, msgs, req, true)
 
-	payload, err := json.Marshal(body)
+	resp, err := p.doChatRequest(ctx, key, body, true)
 	if err != nil {
-		return nil, fmt.Errorf("openrouter: marshal: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("openrouter: new request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+key)
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
-	httpReq.Header.Set("X-OpenRouter-Title", "izen")
-	httpReq.Header.Set("X-OpenRouter-Categories", "cli-agent")
-	httpReq.Header.Set("X-Description", "AI amplifies human judgment. Humans remain in control.")
-
-	resp, err := p.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("openrouter: do: %w", err)
+		return nil, err
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized {
@@ -394,6 +333,111 @@ func reasoningFor(req ai.Request) *openrouterReasoning {
 		return nil
 	}
 	return r
+}
+
+// openRouterNonReasoningModels lists model-family markers known to reject
+// OpenRouter's provider-agnostic reasoning payload. Injecting the reasoning
+// object into these models makes the gateway reject the entire request with
+// HTTP 400 (tokens are billed at the gateway before the stream dies). Add a
+// family here when it is observed to reject the reasoning schema so the
+// payload is sanitized up front instead of relying on the retry in
+// doChatRequest.
+var openRouterNonReasoningModels = []string{
+	"gemma",
+}
+
+// openRouterModelSupportsReasoning reports whether the target model accepts
+// OpenRouter's reasoning control. Reasoning is only injected for models known
+// to expose a native reasoning mechanism; unknown models are treated as
+// reasoning-capable and fall back to the HTTP 400 retry in doChatRequest when
+// the gateway disagrees, so a false positive never fails the request.
+func openRouterModelSupportsReasoning(model string) bool {
+	name := strings.ToLower(strings.TrimSpace(model))
+	for _, marker := range openRouterNonReasoningModels {
+		if strings.Contains(name, marker) {
+			return false
+		}
+	}
+	return true
+}
+
+// buildRequest assembles the OpenRouter chat-completion payload for a request.
+// The reasoning control is injected only when the target model supports the
+// reasoning schema (see openRouterModelSupportsReasoning), so a non-reasoning
+// model never receives a payload the gateway rejects with HTTP 400.
+func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage, req ai.Request, stream bool) openrouterRequest {
+	body := openrouterRequest{
+		Model:       model,
+		Messages:    msgs,
+		MaxTokens:   req.MaxTokens,
+		Temperature: req.Temperature,
+		Stop:        req.Stop,
+		Stream:      stream,
+		Reasoning:   reasoningFor(req),
+	}
+	if stream {
+		body.StreamOptions = &streamOptions{IncludeUsage: true}
+	}
+	if !openRouterModelSupportsReasoning(model) {
+		body.Reasoning = nil
+	}
+	if len(req.Tools) > 0 {
+		rawTools := make([]json.RawMessage, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			data, err := json.Marshal(t)
+			if err == nil {
+				rawTools = append(rawTools, data)
+			}
+		}
+		body.Tools = rawTools
+	}
+	return body
+}
+
+// doChatRequest POSTs a chat-completion payload to the OpenRouter gateway and
+// returns the HTTP response (the caller owns the body). When the payload
+// carried a reasoning control and the gateway rejects it with HTTP 400, the
+// reasoning field is stripped and the request is retried exactly once: some
+// OpenRouter models do not accept the reasoning schema, and OpenRouter bills
+// tokens at the gateway before the stream fails. Stripping reasoning lets the
+// turn complete without reasoning rather than failing the whole request.
+func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body openrouterRequest, stream bool) (*http.Response, error) {
+	attempt := func(b openrouterRequest) (*http.Response, error) {
+		payload, err := json.Marshal(b)
+		if err != nil {
+			return nil, fmt.Errorf("openrouter: marshal: %w", err)
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
+		if err != nil {
+			return nil, fmt.Errorf("openrouter: new request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+key)
+		if stream {
+			httpReq.Header.Set("Accept", "text/event-stream")
+		}
+		httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
+		httpReq.Header.Set("X-OpenRouter-Title", "izen")
+		httpReq.Header.Set("X-OpenRouter-Categories", "cli-agent")
+		httpReq.Header.Set("X-Description", "AI amplifies human judgment. Humans remain in control.")
+		return p.client.Do(httpReq)
+	}
+
+	resp, err := attempt(body)
+	if err != nil {
+		return nil, fmt.Errorf("openrouter: do: %w", err)
+	}
+	if resp.StatusCode == http.StatusBadRequest && body.Reasoning != nil {
+		// A non-reasoning model rejected the reasoning schema. Discard the
+		// rejected response, strip the reasoning payload and retry once.
+		_ = resp.Body.Close()
+		body.Reasoning = nil
+		resp, err = attempt(body)
+		if err != nil {
+			return nil, fmt.Errorf("openrouter: do: %w", err)
+		}
+	}
+	return resp, nil
 }
 
 type openrouterResponse struct {

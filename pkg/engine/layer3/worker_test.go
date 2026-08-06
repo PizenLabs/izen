@@ -3,6 +3,8 @@ package layer3
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -212,6 +214,59 @@ func TestBuildPrompt(t *testing.T) {
 
 	if prompt := BuildPrompt(nil, Request{Intent: IntentRefactor, Description: "d"}, 0); !strings.Contains(prompt, "Files: 0") {
 		t.Errorf("nil exec prompt missing Files header:\n%s", prompt)
+	}
+}
+
+// TestBuildPromptNewFileSelectsFullCreation pins the per-task new-file fallback:
+// when the target file does NOT exist on disk, the worker prompt must instruct
+// complete full-file creation and explicitly forbid diff formats (SEARCH/REPLACE
+// or unified diff) — a diff against a non-existent file has no "old content" and
+// makes weak models emit (+0 / -0 lines) no-op patches.
+func TestBuildPromptNewFileSelectsFullCreation(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "index.html")
+	req := Request{
+		Intent:      IntentNewFeature,
+		TargetFile:  target,
+		Description: "create the landing page",
+	}
+	prompt := BuildPrompt(minimalExec(), req, 0)
+	if !strings.Contains(prompt, "does NOT exist on disk") {
+		t.Errorf("prompt should mark the target as a new file:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "CREATE it with the COMPLETE new file content") {
+		t.Errorf("prompt should instruct complete full-file creation:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "=== FILE:") {
+		t.Errorf("prompt should instruct the FILE block protocol:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Do NOT output a unified diff") {
+		t.Errorf("prompt should explicitly forbid diff formats for a new file:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "Output a unified diff") {
+		t.Errorf("prompt must not ask the model to output a diff for a new file:\n%s", prompt)
+	}
+}
+
+// TestBuildPromptExistingFileSelectsReplacement pins the counterpart: when the
+// target file EXISTS on disk with content, the worker prompt must switch to the
+// complete-replacement contract and carry the on-disk content so the model can
+// see what it is replacing.
+func TestBuildPromptExistingFileSelectsReplacement(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "index.html")
+	if err := os.WriteFile(target, []byte("<!DOCTYPE html>\n<html></html>\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	req := Request{
+		Intent:      IntentRefactor,
+		TargetFile:  target,
+		Description: "edit the landing page",
+	}
+	prompt := BuildPrompt(minimalExec(), req, 0)
+	if !strings.Contains(prompt, "EXISTS on disk") {
+		t.Errorf("prompt should mark the target as existing:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "<!DOCTYPE html>") {
+		t.Errorf("prompt should carry the on-disk content:\n%s", prompt)
 	}
 }
 

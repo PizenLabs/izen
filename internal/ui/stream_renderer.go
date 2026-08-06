@@ -301,6 +301,51 @@ func (m *model) renderLiveThinking(width int) string {
 	return m.thinkingBuffer.Render(width, m.streaming, spinner)
 }
 
+// renderOutputTrace renders the expanded full-output-trace viewport for models
+// that emit no formal reasoning channel (e.g. Gemma family SLMs). The raw
+// streamed response is captured in traceBuffer; when the user expands it via
+// Ctrl+O, the full output trace renders in a dimmed, scrollable box so the
+// model's exact output can be inspected. Returns "" when there is no trace.
+func (m *model) renderOutputTrace(width int) string {
+	if m.traceBuffer.Len() == 0 {
+		return ""
+	}
+	if width < 40 {
+		width = 40
+	}
+	content := sanitizeText(m.traceBuffer.String())
+	lines := strings.Split(content, "\n")
+	var allLines []string
+	for _, line := range lines {
+		line = strings.TrimRight(line, " \r")
+		if line == "" {
+			allLines = append(allLines, "")
+			continue
+		}
+		allLines = append(allLines, wrapString(line, width-6)...)
+	}
+
+	// Bound the trace to a window so a long response never floods the
+	// viewport; the user can collapse with Ctrl+O after inspection.
+	const maxTraceLines = 20
+	start := 0
+	if len(allLines) > maxTraceLines {
+		start = len(allLines) - maxTraceLines
+	}
+
+	out := make([]string, 0, maxTraceLines+2)
+	out = append(out, thinkingStyle.Render("│ "+mutedStyle.Render("OUTPUT TRACE")))
+	for _, line := range allLines[start:] {
+		if line == "" {
+			out = append(out, thinkingStyle.Render("│"))
+		} else {
+			out = append(out, thinkingStyle.Render("│ "+line))
+		}
+	}
+	out = append(out, thinkingStyle.Render("│ "+mutedStyle.Render("Ctrl+O collapse")))
+	return strings.Join(out, "\n")
+}
+
 // renderStreamingContent renders AI content incrementally during an active
 // LLM stream. It uses parseAIContent for block classification (plans, diffs,
 // tables, etc.) and delegates plain text blocks to the deterministic pipeline.
