@@ -37,6 +37,15 @@ type claudeMessage struct {
 	Content string `json:"content"`
 }
 
+// claudeThinking is the Anthropic extended-thinking control. When injected
+// with type "enabled" and a positive budget, the model performs extended
+// reasoning up to budget_tokens. It is injected from the dynamically resolved
+// effort directive; a zero budget omits it entirely (thinking disabled).
+type claudeThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens"`
+}
+
 type claudeRequest struct {
 	Model         string          `json:"model"`
 	Messages      []claudeMessage `json:"messages"`
@@ -45,6 +54,7 @@ type claudeRequest struct {
 	Stream        bool            `json:"stream"`
 	System        string          `json:"system,omitempty"`
 	StopSequences []string        `json:"stop_sequences,omitempty"`
+	Thinking      *claudeThinking `json:"thinking,omitempty"`
 }
 
 type claudeResponse struct {
@@ -93,6 +103,16 @@ func (p *ClaudeProvider) buildMessages(req ai.Request) []claudeMessage {
 	return msgs
 }
 
+// thinkingFor builds the Anthropic extended-thinking control from the resolved
+// effort directive. A nil request reasoning config or a non-positive budget
+// yields nil (thinking disabled, the pre-existing behavior).
+func thinkingFor(req ai.Request) *claudeThinking {
+	if req.Reasoning == nil || req.Reasoning.BudgetTokens <= 0 {
+		return nil
+	}
+	return &claudeThinking{Type: "enabled", BudgetTokens: req.Reasoning.BudgetTokens}
+}
+
 func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
 	model := p.model
 	if req.Model != "" {
@@ -113,6 +133,7 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		Stream:        false,
 		System:        req.System,
 		StopSequences: req.Stop,
+		Thinking:      thinkingFor(req),
 	}
 
 	payload, err := json.Marshal(body)
@@ -185,6 +206,7 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		Stream:        true,
 		System:        req.System,
 		StopSequences: req.Stop,
+		Thinking:      thinkingFor(req),
 	}
 
 	payload, err := json.Marshal(body)

@@ -47,6 +47,10 @@ type openaiRequest struct {
 	Stop          []string        `json:"stop,omitempty"`
 	Stream        bool            `json:"stream"`
 	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
+	// ReasoningEffort is the native OpenAI qualitative reasoning control
+	// (low / medium / high / xhigh). It is injected from the dynamically
+	// resolved effort directive; empty omits the field.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 type openaiResponse struct {
@@ -103,12 +107,13 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	msgs := p.buildMessages(req)
 
 	body := openaiRequest{
-		Model:       model,
-		Messages:    msgs,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stop:        req.Stop,
-		Stream:      false,
+		Model:           model,
+		Messages:        msgs,
+		MaxTokens:       req.MaxTokens,
+		Temperature:     req.Temperature,
+		Stop:            req.Stop,
+		Stream:          false,
+		ReasoningEffort: req.Reasoning.LevelOrDefault(),
 	}
 
 	payload, err := json.Marshal(body)
@@ -172,13 +177,14 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	msgs := p.buildMessages(req)
 
 	body := openaiRequest{
-		Model:         model,
-		Messages:      msgs,
-		MaxTokens:     req.MaxTokens,
-		Temperature:   req.Temperature,
-		Stop:          req.Stop,
-		Stream:        true,
-		StreamOptions: &streamOptions{IncludeUsage: true},
+		Model:           model,
+		Messages:        msgs,
+		MaxTokens:       req.MaxTokens,
+		Temperature:     req.Temperature,
+		Stop:            req.Stop,
+		Stream:          true,
+		StreamOptions:   &streamOptions{IncludeUsage: true},
+		ReasoningEffort: req.Reasoning.LevelOrDefault(),
 	}
 
 	payload, err := json.Marshal(body)

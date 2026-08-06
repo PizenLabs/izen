@@ -828,7 +828,10 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		// JSON output contract and forbids thinking blocks. Direct file
 		// mutations bypass it with the zero-prose mutation prompt.
 		isDirectMut := detectDirectMutation(problem, ledgerContent) != nil
-		systemPrompt := prompt.PlanSynthesisSystemPrompt()
+		// Tier-adapted synthesis prompt: SLM models get the compact raw-JSON
+		// contract with a hard CoT termination rule; Mid/Frontier models keep
+		// the canonical model-agnostic block.
+		systemPrompt := prompt.PlanSynthesisSystemPromptForTier(prompt.ResolveTierForModel(modelName, ""))
 		if isDirectMut {
 			systemPrompt = prompt.PlanDirectMutationSystemPrompt()
 		}
@@ -1905,7 +1908,7 @@ func (e *Engine) ProcessPlan(ctx context.Context, modelName string, objective st
 		Messages: []ai.Message{
 			{
 				Role:    "system",
-				Content: prompt.PlanSynthesisSystemPrompt(),
+				Content: prompt.PlanSynthesisSystemPromptForTier(prompt.ResolveTierForModel(modelName, "")),
 			},
 			{
 				Role:    "user",

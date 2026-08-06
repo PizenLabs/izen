@@ -2629,7 +2629,9 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 	fullPrompt := fileContext.String() + "\n" + unifiedPrompt
 
 	// ── Build system and request ──────────────────────────────────
-	systemPrompt := prompt.ForModeWithUser(m.resolver.Current().String(), m.userName)
+	// The system prompt is tier-adapted: SLM models receive the compact
+	// positive-only contract, Mid/Frontier models the full-context contract.
+	systemPrompt := m.tieredModePrompt(m.resolver.Current().String())
 
 	// Construct messages without repeating the plan JSON ledger
 	// to prevent 7B context drift from the model re-printing its own plan.
@@ -2667,6 +2669,9 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		System:    systemPrompt,
 		MaxTokens: 8192,
 		Tools:     ai.FileMutationTools(),
+		// Dynamically resolved reasoning directive (auto effort / tier-aware
+		// SLM CoT caps). Nil when no reasoning control is warranted.
+		Reasoning: m.effortFromTasks(),
 	}
 
 	// ── REAL-TIME SSE STREAMING ──────────────────────────────────────
@@ -3279,7 +3284,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			handoff += "Do NOT rewrite the entire file. "
 			handoff += "Return ONLY the SEARCH/REPLACE block or unified diff."
 		}
-		system := prompt.StrategyContract(strategy.SystemPromptKey())
+		system := m.tieredStrategyContract(strategy.SystemPromptKey())
 
 		cloudCfg := gateway.ClassifyCloudProvider(m.cfg.ActiveProviderName())
 		isCloud := cloudCfg.CloudProvider != ""
@@ -3297,6 +3302,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			Stop:      stop,
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
 			Tools:     ai.FileMutationTools(),
+			Reasoning: m.effortFromTasks(),
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -3653,8 +3659,8 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 
 		handoff := buildHandoff(orig)
 
-		// Select system prompt based on strategy.
-		system := prompt.StrategyContract(strategy.SystemPromptKey())
+		// Select system prompt based on strategy (tier-adapted).
+		system := m.tieredStrategyContract(strategy.SystemPromptKey())
 
 		cloudCfg := gateway.ClassifyCloudProvider(m.cfg.ActiveProviderName())
 		isCloud := cloudCfg.CloudProvider != ""
@@ -3684,7 +3690,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 			if attempt > 0 && orig != "" && execution.IsSmallFile(orig) {
 				currentStrategy = execution.STRATEGY_NEW_FILE
 				handoff += "\n\nCORRECTION: Previous patch attempts failed. Output the COMPLETE new file content inside a single markdown code block. Do NOT use SEARCH/REPLACE or diff format."
-				system = prompt.StrategyContract("new_file")
+				system = m.tieredStrategyContract("new_file")
 
 				// ── Activity Tree: log retry ───────────────────────────
 				if m.activityTree != nil {
@@ -3709,6 +3715,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				Stop:      stop,
 				Messages:  []ai.Message{{Role: "user", Content: handoff}},
 				Tools:     ai.FileMutationTools(),
+				Reasoning: m.effortFromTasks(),
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -3886,11 +3893,12 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				buildHandoff(orig))
 			fullRewriteReq := ai.Request{
 				Model:     m.activeRouteModel(),
-				System:    prompt.StrategyContract("small_fallback"),
+				System:    m.tieredStrategyContract("small_fallback"),
 				Stream:    false,
 				MaxTokens: 4096,
 				Stop:      []string{"```\n\n"},
 				Messages:  []ai.Message{{Role: "user", Content: fullRewriteHandoff}},
+				Reasoning: m.effortFromTasks(),
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			fullResp, fullErr := m.provider.Execute(ctx, fullRewriteReq)
@@ -4172,7 +4180,7 @@ func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
 		handoff += "\n\n### USER REQUEST\n" + task.Description
 		handoff += "\n\nOutput a <<<<<<< FILE_CREATE: " + canonicalTarget + " block with the final content."
 
-		system := prompt.ExistingFileContract()
+		system := m.tieredStrategyContract("existing_file")
 
 		req := ai.Request{
 			Model:     m.activeRouteModel(),
@@ -4180,6 +4188,7 @@ func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
 			Stream:    false,
 			MaxTokens: 2048,
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
+			Reasoning: m.effortFromTasks(),
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)

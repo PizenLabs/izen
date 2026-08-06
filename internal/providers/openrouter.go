@@ -125,6 +125,7 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 		Temperature: req.Temperature,
 		Stop:        req.Stop,
 		Stream:      false,
+		Reasoning:   reasoningFor(req),
 	}
 
 	if len(req.Tools) > 0 {
@@ -233,6 +234,7 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		Stop:          req.Stop,
 		Stream:        true,
 		StreamOptions: &streamOptions{IncludeUsage: true},
+		Reasoning:     reasoningFor(req),
 	}
 
 	payload, err := json.Marshal(body)
@@ -358,6 +360,40 @@ type openrouterRequest struct {
 	Stream        bool                `json:"stream"`
 	StreamOptions *streamOptions      `json:"stream_options,omitempty"`
 	Tools         []json.RawMessage   `json:"tools,omitempty"`
+	// Reasoning carries OpenRouter's provider-agnostic reasoning control. It
+	// is injected from the dynamically resolved effort directive; a nil value
+	// omits the field entirely.
+	Reasoning *openrouterReasoning `json:"reasoning,omitempty"`
+}
+
+// openrouterReasoning is OpenRouter's reasoning control payload: an optional
+// qualitative effort (low/medium/high) and an optional max_tokens reasoning
+// cap. OpenRouter relays whichever field is set to the underlying provider's
+// native mechanism.
+type openrouterReasoning struct {
+	Effort    string `json:"effort,omitempty"`
+	MaxTokens int    `json:"max_tokens,omitempty"`
+}
+
+// reasoningFor builds the OpenRouter reasoning payload from the resolved
+// effort directive. The qualitative effort maps to reasoning.effort; the CoT
+// cap and budget map to reasoning.max_tokens. A nil request reasoning config
+// yields nil (field omitted, the pre-existing behavior).
+func reasoningFor(req ai.Request) *openrouterReasoning {
+	if req.Reasoning == nil {
+		return nil
+	}
+	r := &openrouterReasoning{Effort: req.Reasoning.Level}
+	switch {
+	case req.Reasoning.CoTLimit > 0:
+		r.MaxTokens = req.Reasoning.CoTLimit
+	case req.Reasoning.BudgetTokens > 0:
+		r.MaxTokens = req.Reasoning.BudgetTokens
+	}
+	if r.Effort == "" && r.MaxTokens == 0 {
+		return nil
+	}
+	return r
 }
 
 type openrouterResponse struct {
