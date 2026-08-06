@@ -33,6 +33,7 @@ import (
 	"github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/events/audit"
+	"github.com/PizenLabs/izen/internal/events/timeline"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/language"
@@ -141,6 +142,11 @@ type Application struct {
 	Artifacts      *artifact.Store
 	SnapCache      *wssnapshot.SnapshotCache
 	CapRegistry    *wscap.ArchetypeCapabilityRegistry
+
+	// timeline is the live session execution timeline projection. It
+	// subscribes to the shared bus during Wire and is never nil after; read it
+	// via the Timeline accessor.
+	timeline *timeline.Timeline
 
 	// provider is the resolved default AI provider from Manager. It is nil
 	// when no provider is configured.
@@ -314,6 +320,16 @@ func (a *Application) LanguageID() language.ID {
 	return a.Inputs.LanguageID
 }
 
+// Timeline returns the live session execution timeline projection. It is never
+// nil after Wire. Consumers (TUI/Metrics) read it via Snapshot and Playback
+// for race-free access.
+func (a *Application) Timeline() *timeline.Timeline {
+	if a == nil {
+		return nil
+	}
+	return a.timeline
+}
+
 // Wire builds the Application: domain runtime, dispatcher, handlers, ledger
 // projection, the Runtime facade, and the complete engine tree — all bound to
 // the shared event bus. It is the sole place the application dependency graph
@@ -402,6 +418,16 @@ func Wire(opts ...Option) (*Application, error) {
 	builder.Start()
 	a.Builder = builder
 	a.Ledger = builder.Ledger()
+
+	// ── UNIFIED EXECUTION TIMELINE ──────────────────────────────────────
+	// The timeline subscribes to every envelope on the shared bus and groups
+	// them into chronological spans by (source, kind). It is the single
+	// abstraction Metrics, Tracing, and Audit Replay consume; the presentation
+	// layer reads it via Application.Timeline() (Snapshot/Playback).
+	a.timeline = timeline.NewTimeline(a.Inputs.Session.ContextLabel())
+	if err := a.timeline.Start(a.Bus); err != nil {
+		return nil, fmt.Errorf("wire: start timeline: %w", err)
+	}
 
 	a.Runtime = runtime.NewRuntime(dispatcher, runtime.WithEventBus(a.Bus))
 
@@ -593,6 +619,10 @@ func (a *Application) Close() {
 	}
 	if a.Builder != nil {
 		a.Builder.Close()
+	}
+	if a.timeline != nil {
+		a.timeline.Stop()
+		a.timeline = nil
 	}
 	if a.Runtime != nil {
 		a.Runtime.Close()
