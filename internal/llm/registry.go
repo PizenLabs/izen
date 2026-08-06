@@ -148,8 +148,8 @@ func fetchOpenRouterModels(client *http.Client, apiKey string) ([]ModelInfo, err
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
 	req.Header.Set("X-OpenRouter-Title", "izen")
-	req.Header.Set("X-OpenRouter-Categories", "cli-agent")
-	req.Header.Set("X-Description", "AI amplifies human judgment. Humans remain in control.")
+	req.Header.Set("X-OpenRouter-Categories", "agent-runtime")
+	req.Header.Set("X-OpenRouter-Description", "AI amplifies human judgment. Humans remain in control.")
 
 	resp, err := client.Do(req)
 	if err != nil {

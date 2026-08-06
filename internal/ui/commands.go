@@ -2571,6 +2571,9 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 	if m.buildLedger == nil {
 		m.buildLedger = ctxpkg.NewTaskLedger()
 	}
+	// A fresh build invocation invalidates any prior fast-track coverage
+	// tracking (Explicit Over Implicit: coverage is per-batch).
+	m.fastTrackTargets = nil
 	if m.toolCallBuffer != nil {
 		m.toolCallBuffer.Reset()
 	}
@@ -3883,23 +3886,21 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				} else {
 					resolved = execution.ResolveModifiedContent(orig, rawContent)
 					if resolved == orig && orig != "" {
-						if attempt == 0 && isCloud {
-							m.push(roleSystem, fmt.Sprintf(
-								warningStyle.Render("[BUILD WARNING] %s failed structural breakdown on attempt %d. "+
-									"The output contained no diff markers (--- a/, +++ b/, @@, <<<<<<< SEARCH). "+
-									"Retrying with explicit diff format demonstration."),
-								m.activeRouteModel(), attempt+1))
+						// ── ZERO-PATCH SHORT-CIRCUIT ─────────────────────
+						// The per-task mutation step produced 0 lines changed
+						// (+0 / -0): the model's output resolves back to the
+						// file's current content. This happens when fast-track
+						// (or an earlier task) already applied the requested
+						// modification. Complete the step gracefully instead of
+						// re-looping the LLM, which would otherwise hang the
+						// "Generating patch..." spinner for up to 3 ×
+						// buildGenerationTimeout (Rule "Human-Centered /
+						// Reversible": a step producing 0 patches MUST never
+						// leave the UI spinner hanging).
+						if m.activityTree != nil {
+							m.activityTree.Append(NewFileMutateEvent(task.Target, 0, 0, 0))
 						}
-						if attempt < maxRetries {
-							handoff = fmt.Sprintf(
-								"%s\n\nCORRECTION: Your previous patch was rejected because it lacked valid diff markers. "+
-									"The expected format for a unified diff is:\n\n--- a/%s\n+++ b/%s\n@@ -1,3 +1,3 @@\n existing context line\n-old-line\n+new-line\n\n"+
-									"Or use SEARCH/REPLACE markers:\n<<<<<<< SEARCH\n<old code>\n=======\n<new code>\n>>>>>>>\n\n"+
-									"Return ONLY one of these formats. No conversational text. No explanations.",
-								buildHandoff(orig), task.Target, task.Target)
-							continue
-						}
-						return buildProposalReadyMsg{Err: fmt.Errorf("patch generation: no valid diff or search/replace block found in LLM output for %s after %d attempts", task.Target, attempt+1)}
+						return mutationResultMsg{file: task.Target, status: "nochange"}
 					}
 					diffContent = computeUnifiedDiff(task.Target, orig, resolved)
 				}
@@ -4745,6 +4746,9 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 		m.buildLedger = ctxpkg.NewTaskLedger()
 	}
 	m.currentBuildTaskID = targetTask.StepNum
+	// Per-task execution invalidates any prior fast-track coverage state so a
+	// mixed fast-track/per-task session never mis-detects full coverage.
+	m.fastTrackTargets = nil
 	m.execEng.Patches.SetLedger(m.buildLedger)
 	m.execEng.Patches.SetContextID(m.sess.ContextID)
 

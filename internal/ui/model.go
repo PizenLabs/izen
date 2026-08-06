@@ -846,6 +846,12 @@ type model struct {
 	// /build run; it is threaded into every committed patch so the ledger can
 	// be marked Completed.
 	currentBuildTaskID int
+	// fastTrackTargets records the plan task targets covered by the active
+	// fast-track patch batch (proposal targets extracted from native tool
+	// calls). When every plan FILE_MUTATE/GIT_ACTION target is covered and the
+	// batch has been applied, per-task execution is redundant and the build
+	// completes immediately (Explicit Over Implicit).
+	fastTrackTargets map[string]bool
 
 	investigateInvocationCount int
 
@@ -1880,6 +1886,82 @@ func (m *model) syncUIState() {
 // running.
 func (m *model) isWorkflowBusy() bool {
 	return m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.shellRunning
+}
+
+// fastTrackCoversAllPlanTargets reports whether the active fast-track patch
+// batch covered every FILE_MUTATE / GIT_ACTION plan task target. When true,
+// per-task execution is redundant work on already-applied files and the build
+// MUST complete immediately (Rule "Explicit Over Implicit"): the loop must
+// never fall through to "executing step N" after a full fast-track batch.
+func (m *model) fastTrackCoversAllPlanTargets() bool {
+	if m.sess == nil || len(m.fastTrackTargets) == 0 {
+		return false
+	}
+	tasks := m.sess.CurrentTasks
+	if len(tasks) == 0 {
+		return false
+	}
+	for _, t := range tasks {
+		if t.Type != "FILE_MUTATE" && t.Type != "GIT_ACTION" {
+			return false
+		}
+		if !m.fastTrackTargets[t.Target] {
+			return false
+		}
+	}
+	return true
+}
+
+// markAllPlanTasksCompleted flips every plan task status to "completed" so the
+// build queue is fully drained and verification/handoff can run. It is used
+// after a fast-track batch covers all plan targets, where per-task execution
+// is skipped entirely.
+func (m *model) markAllPlanTasksCompleted() {
+	if m.sess == nil {
+		return
+	}
+	tasks := m.sess.CurrentTasks
+	changed := false
+	for i := range tasks {
+		if tasks[i].Status != "completed" {
+			tasks[i].Status = "completed"
+			changed = true
+		}
+	}
+	if changed {
+		m.sess.StageTaskList(&tasks)
+		_ = m.sess.Save()
+	}
+}
+
+// completeFastTrackBuild is the build completion sequence invoked when a
+// fast-track batch covered every plan target: it drains the queue, commits the
+// snapshot, clears the patching spinner and restores interactive input focus.
+// It returns the verification command so the build transitions to complete.
+func (m *model) completeFastTrackBuild() (tea.Model, tea.Cmd) {
+	m.markAllPlanTasksCompleted()
+	m.fastTrackTargets = nil
+	if m.execEng != nil {
+		m.execEng.CommitTransaction()
+	}
+	// Release any residual patching/agent flags so the derived presentation
+	// state unwinds to interactive StateChat instead of a stuck spinner.
+	m.agentRunning = false
+	m.agentDone = true
+	m.agentLabel = ""
+	m.stopShimmer()
+	m.awaitingConfirmation = false
+	m.acceptAll = false
+	m.pendingProposals = nil
+	m.resolveApprovalState()
+	m.ti.Focus()
+	m.recalcViewportHeight()
+	m.buildVerifyPending = true
+	m.push(roleSystem, "Verifying build...")
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
+	flush := m.flushPendingRecords()
+	return m, tea.Batch(flush, m.runTestEngine("./..."))
 }
 
 // handlePresentationEvent projects one Application-layer PresentationEvent

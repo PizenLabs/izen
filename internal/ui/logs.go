@@ -172,7 +172,7 @@ func RenderEntry(entry LogEntry, width int, dotFrame int) string {
 		// Show animated truncation dots for in-progress entries.
 		// When expanded (via Ctrl+O), dots are removed and full content is shown.
 		dots := animatedDots(dotFrame)
-		hint := dimmedStyle.Render(fmt.Sprintf(" (ctrl+o to expand %s)", dots))
+		hint := dimmedStyle.Render(fmt.Sprintf(" ctrl+o to expand %s", dots))
 		return lipgloss.NewStyle().Width(width).Render(summary + hint)
 	}
 

@@ -1056,6 +1056,21 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.pendingProposals = props
 
+		// ── FAST-TRACK TARGET TRACKING ─────────────────────────────
+		// The fast-track producer (Task==nil && Patch==nil) emits a unified
+		// multi-file patch batch covering all plan FILE_MUTATE/GIT_ACTION
+		// targets. Record the covered targets so the apply handlers can
+		// detect full coverage and complete the build without per-task
+		// execution (Rule "Explicit Over Implicit").
+		if msg.Task == nil && msg.Patch == nil && len(props) > 0 {
+			if m.fastTrackTargets == nil {
+				m.fastTrackTargets = make(map[string]bool)
+			}
+			for _, p := range props {
+				m.fastTrackTargets[p.Target.QualifiedName] = true
+			}
+		}
+
 		// ── FREEZE FOR HUMAN APPROVAL ───────────────────────────────
 		m.enterApprovalState()
 		m.awaitingConfirmation = true
@@ -1617,6 +1632,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.proposalDiffOffset = 0
 
 		if len(m.pendingProposals) == 0 {
+			// ── RELEASE AGENT/SPINNER STATE ───────────────────────────
+			// A terminal mutation result must always unwind the patching
+			// spinner and restore input focus. This covers the zero-patch
+			// short-circuit (proposeBuildPatch returning mutationResultMsg
+			// directly) which never passes through buildProposalReadyMsg, so
+			// the "Generating patch..." shimmer would otherwise hang forever.
+			m.agentRunning = false
+			m.agentDone = true
+			m.agentLabel = ""
+			m.stopShimmer()
+
 			// ── MARK BUILD TASK COMPLETED / FAILED ─────────────────────
 			// When the proposal flow originates from handleBuildRun
 			// (non-streaming FILE_MUTATE/GIT_ACTION), update the task
@@ -1662,6 +1688,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					thinkingContent = m.thinkingPanel.String()
 				}
 				m.logStore.AddFull(LogEdit, msg.file, true, msg.status, thinkingContent, "")
+				// ── FAST-TRACK EARLY COMPLETION ─────────────────────────
+				// When a fast-track batch covered every plan target and the
+				// last proposal has been applied, per-task execution is
+				// redundant work on already-applied files. Complete the build
+				// loop immediately instead of advancing to "executing step N"
+				// (Rule "Explicit Over Implicit").
+				if m.fastTrackCoversAllPlanTargets() {
+					return m.completeFastTrackBuild()
+				}
 				// ── ADVANCE BUILD QUEUE ────────────────────────────────
 				// After a FILE_MUTATE/GIT_ACTION task completes, check for
 				// the next idle task and execute it.
@@ -1735,6 +1770,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.ti.Focus()
 		m.resolveApprovalState()
 		m.recalcViewportHeight()
+		// ── FAST-TRACK FULL COVERAGE ──────────────────────────────────
+		// When the apply-all batch covered every plan target, drain the
+		// queue deterministically so a subsequent /build never re-executes
+		// tasks the fast-track batch already completed.
+		if m.fastTrackCoversAllPlanTargets() {
+			m.markAllPlanTasksCompleted()
+			m.fastTrackTargets = nil
+		}
 		var testCmd tea.Cmd
 		switch {
 		case applied > 0 && failed == 0:

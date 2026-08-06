@@ -442,8 +442,8 @@ func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body
 		}
 		httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
 		httpReq.Header.Set("X-OpenRouter-Title", "izen")
-		httpReq.Header.Set("X-OpenRouter-Categories", "cli-agent")
-		httpReq.Header.Set("X-Description", "AI amplifies human judgment. Humans remain in control.")
+		httpReq.Header.Set("X-OpenRouter-Categories", "agent-runtime")
+		httpReq.Header.Set("X-OpenRouter-Description", "AI amplifies human judgment. Humans remain in control.")
 		return p.client.Do(httpReq)
 	}
 
