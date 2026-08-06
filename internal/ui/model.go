@@ -1665,6 +1665,65 @@ func (m *model) resolveApprovalState() {
 	m.syncUIState()
 }
 
+// handleEmergencyInterrupt is the unblockable emergency escape hatch. It is
+// invoked from the very top of Update, BEFORE any state gating, so a stuck
+// processing/approval state can NEVER swallow the keyboard (Philosophy Rule 1:
+// Human-Centered / Reversible, Rule 3: Explicit Over Implicit).
+//
+// It performs a full deterministic reset:
+//  1. Cancels every in-flight background context (ghost-loop prevention).
+//  2. Clears every transient processing flag via reconcileSpinner so the
+//     spinner can never stay up on a phantom producer.
+//  3. Releases any outstanding approval gate on the canonical workflow source.
+//  4. Drops in-flight approval/patch state so the viewport returns to chat.
+//  5. Re-derives the presentation state to interactive StateChat.
+func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
+	// 1. Cancel every in-flight background context (ghost-loop prevention).
+	m.cancelAllBackgroundContexts()
+	if m.streamCancel != nil {
+		m.streamCancel()
+		m.streamCancel = nil
+	}
+	if m.shellCancel != nil {
+		m.shellCancel()
+		m.shellCancel = nil
+	}
+	execution.KillAllOrphans()
+
+	// 2. Clear every transient processing flag so the spinner can never stay
+	// up and the view can never block on a phantom producer.
+	m.reconcileSpinner()
+
+	// 3. Release any outstanding approval gate on the canonical source.
+	m.resolveApprovalState()
+
+	// 4. Drop in-flight approval/patch state so the viewport returns to chat.
+	m.awaitingConfirmation = false
+	m.pendingProposals = nil
+	m.pendingBuildApproval = false
+	m.pendingBuildTask = nil
+	m.pendingHotfixTask = nil
+	m.pendingHotfixPatch = nil
+	m.acceptAll = false
+	m.pendingRouteConfirm = false
+	if m.toolCallBuffer != nil {
+		m.toolCallBuffer.Reject()
+	}
+
+	// 5. Restore interactive input and force the presentation back to chat.
+	m.ti.Focus()
+	m.recalcViewportHeight()
+	m.state = StateChat
+
+	m.push(roleSystem, infoStyle.Render("Interrupted."))
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
+	return m, tea.Batch(
+		func() tea.Msg { return TaskFinishedMsg{} },
+		m.runtimeCancelCmd(reason+" interrupt"),
+	)
+}
+
 // syncUIState projects the canonical workflow state onto the presentation
 // state. It is the single place the approval presentation state is derived.
 //
@@ -1686,14 +1745,20 @@ func (m *model) syncUIState() {
 	if m.viewState != nil {
 		m.viewState.Sync(phase, approval)
 	}
+	busy := m.isWorkflowBusy()
 	if approval {
-		m.state = presentation.DeriveUIState(phase, true)
+		// Approval ALWAYS overrides any residual processing signal: a plan
+		// awaiting approval must hand control to the user even if a
+		// background process forgot to clear its transient flags.
+		m.state = presentation.DeriveUIState(phase, true, busy)
 		return
 	}
-	if m.isWorkflowBusy() {
-		m.state = StateProcessing
+	if busy {
+		m.state = presentation.DeriveUIState(phase, false, true)
 		return
 	}
+	// Resting in a mode phase must never gate the input line by itself —
+	// a persistent phase is NOT an in-flight operation.
 	m.state = StateChat
 }
 

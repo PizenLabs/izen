@@ -76,6 +76,38 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 	}()
 
+	// ── UNBLOCKABLE EMERGENCY ESCAPE HATCH ────────────────────────────────
+	// Ctrl+C, Esc, and Ctrl+D are ALWAYS processed here, at the very top of
+	// the update loop, BEFORE any state gating or sub-component intercept. A
+	// stuck StateProcessing / StateAwaitingApproval must NEVER be able to
+	// swallow the keyboard — the user can always interrupt back to
+	// interactive chat (Philosophy Rule 1: Human-Centered / Reversible).
+	//
+	//   - Ctrl+C: hard interrupt whenever any workflow operation is in flight
+	//     or the view is in a locked state.
+	//   - Esc:    emergency abort while the view is frozen in StateProcessing
+	//     (or a plan synthesis is pending); in all other states Esc keeps its
+	//     normal contextual role (reject approval, dismiss overlay, ...).
+	//   - Ctrl+D: emergency abort while frozen in StateProcessing only;
+	//     otherwise it keeps its clean-shutdown role in chat.
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		switch keyMsg.Type {
+		case tea.KeyCtrlC:
+			if m.state == StateProcessing || m.state == StateAwaitingApproval ||
+				m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.planPending {
+				return m.handleEmergencyInterrupt("ctrl-c")
+			}
+		case tea.KeyEsc:
+			if m.state == StateProcessing || m.planPending {
+				return m.handleEmergencyInterrupt("escape")
+			}
+		case tea.KeyCtrlD:
+			if m.state == StateProcessing {
+				return m.handleEmergencyInterrupt("ctrl-d")
+			}
+		}
+	}
+
 	// ── HARD KEYBOARD INTERCEPT: Approval/Processing states bypass all sub-components ──
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
@@ -410,6 +442,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
+		// Re-derive the presentation state from the cleared flags so a stale
+		// StateProcessing derived during the investigation is released and the
+		// viewport returns to interactive chat. Pending-approval overrides.
+		m.syncUIState()
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+providers.SanitizeAPIError(msg.err))
 			// PERSISTENT NAVIGATION CHIPS (BUG 1): even on failure the user
@@ -508,6 +544,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// ALWAYS clear the transient loading flags first so the spinner can
 		// never freeze, regardless of which branch below we take.
 		m.reconcileSpinner()
+		// Re-derive the presentation state from the cleared flags: a stale
+		// StateProcessing derived during synthesis (e.g. via a phase-change
+		// event while agentRunning was true) must be released here so the
+		// viewport returns to interactive chat and Alt+P / Alt+R respond
+		// immediately. Pending-approval always overrides if a gate is set.
+		m.syncUIState()
 
 		if msg.Err != nil {
 			m.push(roleError, fmt.Sprintf("Failed to synthesize plan from ledger: %v", msg.Err))
@@ -1097,6 +1139,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.sanitizeInputPrompt()
 		m.lastTestOutput = msg.output
 		m.lastTestFailed = msg.exitCode != 0
+		// Re-derive the presentation state from the cleared flags so a stale
+		// StateProcessing derived during the build is released. Pending-
+		// approval overrides (e.g. a queued proposal awaiting authorization).
+		m.syncUIState()
 
 		// ── FIX 1: Flush prompt buffer on task failure ────────────────
 		// Wipe the volatile user input cache so the next keystroke or

@@ -47,20 +47,28 @@ func (s UIState) String() string {
 
 // DeriveUIState is the single pure projection from canonical workflow signals
 // onto presentation state. It is deterministic and side-effect free: given the
-// same phase and pending-approval signal it always yields the same UIState.
+// same signals it always yields the same UIState.
 //
-//   - A pending approval always freezes into StateAwaitingApproval (it takes
-//     precedence over the execution phase).
-//   - An active execution phase yields StateProcessing.
-//   - Every other phase (idle, verified, failed, ask) yields StateChat.
+//   - A pending approval ALWAYS freezes into StateAwaitingApproval. It takes
+//     precedence over every processing signal — if a plan is awaiting approval
+//     the user MUST be given control, even if a background process forgot to
+//     clear its processing flag (fallback safeguard).
+//   - An explicit isProcessing signal yields StateProcessing. It is the
+//     in-flight override callers use when they track busy-ness explicitly.
+//   - Otherwise the workflow phase maps: active execution phases
+//     (investigating/planning/building/reviewing/repairing) yield
+//     StateProcessing, every other phase yields StateChat.
 //
 // The phase names may come from either canonical vocabulary: the workflow
 // state-machine names (core/workflow.WorkflowState.String(): "investigating",
 // "planning", "building", ...) or the orchestrator phase names
 // (orchestrator.Phase.String(): "plan", "build", ...). Both are mapped.
-func DeriveUIState(phase string, approvalPending bool) UIState {
+func DeriveUIState(phase string, approvalPending bool, isProcessing bool) UIState {
 	if approvalPending {
 		return StateAwaitingApproval
+	}
+	if isProcessing {
+		return StateProcessing
 	}
 	switch phase {
 	case "investigating", "investigate",
@@ -175,5 +183,5 @@ func (w *WorkflowViewState) UIState() UIState {
 	if w == nil {
 		return StateChat
 	}
-	return DeriveUIState(w.Phase(), w.ApprovalPending())
+	return DeriveUIState(w.Phase(), w.ApprovalPending(), false)
 }

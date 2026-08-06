@@ -7,32 +7,39 @@ import (
 )
 
 // TestDeriveUIState asserts the pure projection from canonical workflow signals
-// onto the presentation UIState: a pending approval always freezes, an active
-// execution phase processes, and every resting phase yields chat.
+// onto the presentation UIState: a pending approval always freezes (even over
+// an explicit processing signal), an explicit processing signal processes, an
+// active execution phase processes, and every resting phase yields chat.
 func TestDeriveUIState(t *testing.T) {
 	tests := []struct {
 		name            string
 		phase           string
 		approvalPending bool
+		isProcessing    bool
 		want            UIState
 	}{
-		{"idle rest", "idle", false, StateChat},
-		{"ask rest", "ask", false, StateChat},
-		{"verified terminal", "verified", false, StateChat},
-		{"failed terminal", "failed", false, StateChat},
-		{"unknown phase", "", false, StateChat},
-		{"investigating processes", "investigating", false, StateProcessing},
-		{"planning processes", "planning", false, StateProcessing},
-		{"building processes", "building", false, StateProcessing},
-		{"reviewing processes", "reviewing", false, StateProcessing},
-		{"repairing processes", "repairing", false, StateProcessing},
-		{"approval overrides processing", "building", true, StateAwaitingApproval},
-		{"approval overrides chat", "idle", true, StateAwaitingApproval},
+		{"idle rest", "idle", false, false, StateChat},
+		{"ask rest", "ask", false, false, StateChat},
+		{"verified terminal", "verified", false, false, StateChat},
+		{"failed terminal", "failed", false, false, StateChat},
+		{"unknown phase", "", false, false, StateChat},
+		{"investigating processes", "investigating", false, false, StateProcessing},
+		{"planning processes", "planning", false, false, StateProcessing},
+		{"building processes", "building", false, false, StateProcessing},
+		{"reviewing processes", "reviewing", false, false, StateProcessing},
+		{"repairing processes", "repairing", false, false, StateProcessing},
+		{"explicit processing overrides idle phase", "idle", false, true, StateProcessing},
+		{"explicit processing overrides ask phase", "ask", false, true, StateProcessing},
+		{"explicit processing overrides execution phase", "planning", false, true, StateProcessing},
+		{"approval overrides processing", "building", true, true, StateAwaitingApproval},
+		{"approval overrides explicit processing", "idle", true, true, StateAwaitingApproval},
+		{"approval overrides chat", "idle", true, false, StateAwaitingApproval},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := DeriveUIState(tt.phase, tt.approvalPending); got != tt.want {
-				t.Errorf("DeriveUIState(%q, %v) = %v, want %v", tt.phase, tt.approvalPending, got, tt.want)
+			if got := DeriveUIState(tt.phase, tt.approvalPending, tt.isProcessing); got != tt.want {
+				t.Errorf("DeriveUIState(%q, %v, %v) = %v, want %v",
+					tt.phase, tt.approvalPending, tt.isProcessing, got, tt.want)
 			}
 		})
 	}

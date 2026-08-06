@@ -99,7 +99,7 @@ func TestWorkflowSMApprovalGateTransitions(t *testing.T) {
 		if !sm.PendingApproval() {
 			t.Fatalf("iteration %d: pending flag not set", i)
 		}
-		if got := presentation.DeriveUIState(sm.State().String(), sm.PendingApproval()); got != StateAwaitingApproval {
+		if got := presentation.DeriveUIState(sm.State().String(), sm.PendingApproval(), false); got != StateAwaitingApproval {
 			t.Fatalf("iteration %d: derived state = %v, want StateAwaitingApproval", i, got)
 		}
 		sm.MarkApprovalResolved()
