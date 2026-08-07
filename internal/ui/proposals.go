@@ -714,6 +714,24 @@ func (m *model) streamShellCmd(cmd string) tea.Cmd {
 		// Drain both pipes concurrently so a chatty stream never deadlocks
 		// the process (pipes block writes once their kernel buffers fill).
 		var wg sync.WaitGroup
+
+		// emit delivers a streamed chunk to the event loop. Delivery is
+		// RELIABLE — a previous non-blocking `select { default: }` silently
+		// dropped output whenever the channel was momentarily contended, which
+		// produced "shell exited 0 but no output streamed" failures under CI
+		// load. The consumer (readShellCh, always dispatched by the event loop)
+		// continuously drains the buffered channel, so a blocking send cannot
+		// deadlock; the context-cancellation branch unblocks the pump if the
+		// shell is aborted mid-stream.
+		emit := func(text string) bool {
+			select {
+			case shellCh <- shellChunkMsg{text: text}:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+
 		pump := func(r io.Reader) {
 			defer wg.Done()
 			br := bufio.NewReaderSize(r, 4096)
@@ -731,9 +749,8 @@ func (m *model) streamShellCmd(cmd string) tea.Cmd {
 						if idx < 0 {
 							break
 						}
-						select {
-						case shellCh <- shellChunkMsg{text: raw[:idx+1]}:
-						default:
+						if !emit(raw[:idx+1]) {
+							return
 						}
 						raw = raw[idx+1:]
 					}
@@ -742,10 +759,7 @@ func (m *model) streamShellCmd(cmd string) tea.Cmd {
 				}
 				if readErr != nil {
 					if line.Len() > 0 {
-						select {
-						case shellCh <- shellChunkMsg{text: line.String()}:
-						default:
-						}
+						emit(line.String())
 					}
 					return
 				}
