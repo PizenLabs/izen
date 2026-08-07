@@ -28,7 +28,9 @@ func (a *AmbiguityDetector) Process(_ *Resolution, _ WorkspaceState, conflict Co
 }
 
 // Questions returns the ClarificationQuestions to ask when the intent is
-// ambiguous. It returns nil when no conflict exists.
+// ambiguous. It returns nil when no conflict exists. Every option is a
+// structured ir.QuestionOption carrying a semantic ID the pipeline maps onto
+// IntentIR.PreserveWorkspace, plus a free-form "type your own answer" branch.
 func (a *AmbiguityDetector) Questions(_ *Resolution, _ WorkspaceState, conflict Conflict) []ir.ClarificationQuestion {
 	if !conflict.Present {
 		return nil
@@ -37,15 +39,35 @@ func (a *AmbiguityDetector) Questions(_ *Resolution, _ WorkspaceState, conflict 
 	if detected == "" {
 		detected = "unknown"
 	}
+	requested := conflict.Requested
+	if requested == "" {
+		requested = "the requested target"
+	}
 	return []ir.ClarificationQuestion{{
-		Question: fmt.Sprintf(
+		ID:     "workspace-conflict",
+		Header: "Workspace Conflict Detected",
+		QuestionText: fmt.Sprintf(
 			"Your request targets a %s, but this workspace is currently a %s workspace. How should I proceed?",
 			conflict.Requested, detected,
 		),
-		Options: []string{
-			fmt.Sprintf("Replace the existing %s workspace entirely", detected),
-			fmt.Sprintf("Build the %s alongside the existing workspace", conflict.Requested),
-			"Merge selectively and keep both",
+		Options: []ir.QuestionOption{
+			{
+				ID:          ir.OptionReplaceWorkspace,
+				Label:       fmt.Sprintf("Completely replace workspace with %s", requested),
+				Description: fmt.Sprintf("Discards the existing %s files and builds a clean %s", detected, requested),
+			},
+			{
+				ID:          ir.OptionBuildAlongside,
+				Label:       fmt.Sprintf("Build %s alongside the existing workspace", requested),
+				Description: fmt.Sprintf("Keeps the current %s files and adds the new %s next to them", detected, requested),
+			},
+			{
+				ID:          ir.OptionMergeSelective,
+				Label:       "Merge selectively and keep both",
+				Description: fmt.Sprintf("Keeps the relevant %s parts and folds the %s in where it fits", detected, requested),
+				IsDefault:   true,
+			},
+			ir.NewCustomAnswerOption(),
 		},
 		Reason: conflict.Reason,
 	}}

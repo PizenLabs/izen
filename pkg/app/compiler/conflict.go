@@ -2,11 +2,10 @@ package compiler
 
 import (
 	"fmt"
-	"io/fs"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/PizenLabs/izen/pkg/knowledge"
 )
 
 // WorkspaceState summarises what the compiler can observe about the
@@ -44,143 +43,57 @@ type Conflict struct {
 // ConflictDetector scans a workspace for target-type markers and compares
 // them against the resolved intent.
 type ConflictDetector struct {
-	contentCap int
+	// knowledge is the optional shared RuntimeKnowledge graph. When set,
+	// Detect serves the cached workspace state instead of re-walking the
+	// disk, so repeated compiles over the same root cost no I/O.
+	knowledge *knowledge.KnowledgeGraph
 }
 
-// NewConflictDetector builds a ConflictDetector that reads file contents up
-// to a 256 KiB cap per file when scanning for markers.
+// NewConflictDetector builds a ConflictDetector. It scans the disk on demand;
+// attach a shared knowledge.KnowledgeGraph via SetKnowledge to cache scans
+// across calls.
 func NewConflictDetector() *ConflictDetector {
-	return &ConflictDetector{contentCap: 256 * 1024}
+	return &ConflictDetector{}
 }
 
-// Detect scans root and returns the observable workspace state. A missing or
-// empty directory yields an empty state, never an error.
+// SetKnowledge binds the detector to a shared RuntimeKnowledge graph. When
+// set, Detect reads the graph's cached workspace state instead of performing
+// a fresh disk sweep. A nil argument detaches the graph.
+func (c *ConflictDetector) SetKnowledge(kg *knowledge.KnowledgeGraph) {
+	c.knowledge = kg
+}
+
+// Detect returns the observable workspace state for root. With an attached
+// KnowledgeGraph it is served from memory (scanning the root once on first
+// use); without one, a transient graph is scanned on the fly so standalone
+// use behaves identically.
 func (c *ConflictDetector) Detect(root string) WorkspaceState {
-	ws := WorkspaceState{
-		Root:       root,
-		AppTypes:   make(map[string]bool),
-		Archetypes: make(map[string]bool),
+	var snap knowledge.WorkspaceState
+	if c.knowledge != nil {
+		snap = c.knowledge.Ensure(root)
+	} else {
+		transient := knowledge.NewKnowledgeGraph()
+		snap = transient.Ensure(root)
 	}
-	info, err := os.Stat(root)
-	if err != nil || !info.IsDir() {
-		ws.Empty = true
-		return ws
-	}
-	if err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		name := d.Name()
-		if d.IsDir() {
-			if path != root && (name == ".git" || name == "node_modules" || name == "vendor" || name == ".izen" || name == ".codebase-memory") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		ws.FileCount++
-		c.scanFile(path, name, &ws)
-		return nil
-	}); err != nil {
-		ws.Empty = true
-		return ws
-	}
-	ws.Empty = ws.FileCount == 0
-	return ws
-}
-
-// scanFile examines one workspace file and folds its markers into ws.
-func (c *ConflictDetector) scanFile(path, name string, ws *WorkspaceState) {
-	lower := strings.ToLower(name)
-
-	// Application-level target type markers are file-name driven first.
-	switch {
-	case strings.Contains(lower, "todo"):
-		c.mark(ws, "todo_app", "file %s matches todo marker", name)
-	case strings.Contains(lower, "portfolio"):
-		c.mark(ws, "portfolio", "file %s matches portfolio marker", name)
-	}
-
-	// Technical archetype markers.
-	switch {
-	case lower == "go.mod":
-		c.markArchetype(ws, "go", "go.mod present")
-	case lower == "package.json" && hasPackageDep(path, "react", "next"):
-		c.markArchetype(ws, "react", "package.json declares react/next")
-	case strings.HasSuffix(lower, ".html"):
-		c.markArchetype(ws, "vanilla_web", "html file present")
-	}
-
-	// Content markers are only consulted for small text files.
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	if len(data) > c.contentCap {
-		return
-	}
-	content := strings.ToLower(string(data))
-	if c.hasAny(content, []string{"todo app", "task list", "tasklist", "addtask", "newtodo", "todolist", "let todos", "todos =", "to-do list"}) {
-		c.mark(ws, "todo_app", "content of %s matches todo marker", name)
-	}
-	if strings.Contains(content, "portfolio") {
-		c.mark(ws, "portfolio", "content of %s matches portfolio marker", name)
+	return WorkspaceState{
+		Root:       snap.Root,
+		Empty:      snap.Empty,
+		FileCount:  snap.FileCount,
+		AppTypes:   copyBoolSet(snap.AppTypes),
+		Archetypes: copyBoolSet(snap.Archetypes),
+		Markers:    append([]string(nil), snap.Markers...),
 	}
 }
 
-// mark records an application-level target type marker.
-func (c *ConflictDetector) mark(ws *WorkspaceState, appType, format string, args ...any) {
-	if ws.AppTypes[appType] {
-		return
+// copyBoolSet returns a defensive copy of src.
+func copyBoolSet(src map[string]bool) map[string]bool {
+	if len(src) == 0 {
+		return make(map[string]bool)
 	}
-	ws.AppTypes[appType] = true
-	ws.Markers = append(ws.Markers, fmt.Sprintf(format, args...))
-}
-
-// markArchetype records a technical archetype marker.
-func (c *ConflictDetector) markArchetype(ws *WorkspaceState, arch, detail string) {
-	if ws.Archetypes[arch] {
-		return
+	out := make(map[string]bool, len(src))
+	for k, v := range src {
+		out[k] = v
 	}
-	ws.Archetypes[arch] = true
-	ws.Markers = append(ws.Markers, detail)
-}
-
-// hasAny reports whether content contains any of the needles.
-func (c *ConflictDetector) hasAny(content string, needles []string) bool {
-	for _, n := range needles {
-		if strings.Contains(content, n) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasPackageDep reports whether the JSON file at path declares one of the
-// given dependency names. It is best-effort and never fails on malformed
-// input.
-func hasPackageDep(path string, names ...string) bool {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	lower := strings.ToLower(string(data))
-	for _, n := range names {
-		if strings.Contains(lower, `"`+n+`"`) {
-			return true
-		}
-	}
-	return false
-}
-
-// SortedKeys returns the true-valued keys of set in stable sorted order.
-func SortedKeys(set map[string]bool) []string {
-	out := make([]string, 0, len(set))
-	for k, on := range set {
-		if on {
-			out = append(out, k)
-		}
-	}
-	sort.Strings(out)
 	return out
 }
 
@@ -213,4 +126,16 @@ func (c *ConflictDetector) Process(res *Resolution, ws WorkspaceState) Conflict 
 		return conf
 	}
 	return conf
+}
+
+// SortedKeys returns the true-valued keys of set in stable sorted order.
+func SortedKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k, on := range set {
+		if on {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

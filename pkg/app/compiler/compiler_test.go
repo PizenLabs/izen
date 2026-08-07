@@ -641,14 +641,32 @@ func TestAmbiguityDetector(t *testing.T) {
 		t.Fatalf("Questions = %d, want 1", len(qs))
 	}
 	q := qs[0]
-	if !strings.Contains(q.Question, "portfolio") || !strings.Contains(q.Question, "todo_app") {
-		t.Errorf("Question = %q", q.Question)
+	if q.ID == "" || q.Header == "" {
+		t.Errorf("question ID/Header empty: %+v", q)
 	}
-	if len(q.Options) != 3 {
-		t.Errorf("Options = %v, want 3 branches", q.Options)
+	if !strings.Contains(q.QuestionText, "portfolio") || !strings.Contains(q.QuestionText, "todo_app") {
+		t.Errorf("QuestionText = %q", q.QuestionText)
+	}
+	if len(q.Options) != 4 {
+		t.Errorf("Options = %v, want 4 branches (replace, alongside, merge, custom)", q.Options)
+	}
+	if got := q.DefaultOptionID(); got != ir.OptionMergeSelective {
+		t.Errorf("DefaultOptionID = %q, want merge_selective", got)
 	}
 	if q.Reason == "" {
 		t.Error("Reason empty")
+	}
+	var hasCustom, hasReplace bool
+	for _, o := range q.Options {
+		if o.ID == ir.OptionTypeYourOwn {
+			hasCustom = true
+		}
+		if o.ID == ir.OptionReplaceWorkspace {
+			hasReplace = true
+		}
+	}
+	if !hasCustom || !hasReplace {
+		t.Errorf("options must include the custom and replace branches, got %+v", q.Options)
 	}
 
 	if a.Process(res, ws, Conflict{}) {

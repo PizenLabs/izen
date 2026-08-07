@@ -4,7 +4,23 @@ import (
 	"context"
 
 	"github.com/PizenLabs/izen/pkg/ir"
+	"github.com/PizenLabs/izen/pkg/knowledge"
 )
+
+// Option configures an IntentCompiler.
+type Option func(*IntentCompiler)
+
+// WithKnowledgeGraph binds the compiler to a shared RuntimeKnowledge graph.
+// The ConflictDetector then serves the workspace state from the graph's cache
+// instead of re-walking the disk on every Compile call. A nil argument is
+// ignored.
+func WithKnowledgeGraph(kg *knowledge.KnowledgeGraph) Option {
+	return func(c *IntentCompiler) {
+		if kg != nil {
+			c.conflicts.SetKnowledge(kg)
+		}
+	}
+}
 
 // IntentCompiler is the facade that composes the four single-responsibility
 // compiler stages into the final ir.IntentIR:
@@ -27,14 +43,18 @@ type IntentCompiler struct {
 // root (scanned by the ConflictDetector for target-type markers) and backed
 // by the given semantic extractor. A nil extractor is allowed at
 // construction time; Compile reports ErrNoExtractor when it is used.
-func NewIntentCompiler(root string, extractor SemanticExtractor) *IntentCompiler {
-	return &IntentCompiler{
+func NewIntentCompiler(root string, extractor SemanticExtractor, opts ...Option) *IntentCompiler {
+	c := &IntentCompiler{
 		root:       root,
 		normalizer: NewNormalizer(),
 		resolver:   NewEntityResolver(extractor),
 		conflicts:  NewConflictDetector(),
 		ambiguity:  NewAmbiguityDetector(),
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // Compile translates a raw natural language prompt into a strongly-typed

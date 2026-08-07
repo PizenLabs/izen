@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/PizenLabs/izen/pkg/event"
+	"github.com/PizenLabs/izen/pkg/ir"
 	"github.com/PizenLabs/izen/pkg/kernel"
 )
 
@@ -30,6 +31,11 @@ func StatusLine(e event.Event) string {
 			return fmt.Sprintf("pipeline      stage %s", s.Stage)
 		}
 		return "pipeline      checkpoint"
+	case event.TypeClarificationRequired:
+		if qs, ok := e.Payload.([]ir.ClarificationQuestion); ok {
+			return fmt.Sprintf("pipeline      clarification required: %d question(s)", len(qs))
+		}
+		return "pipeline      clarification required"
 	default:
 		return fmt.Sprintf("event         %s (%s)", e.Type, e.TaskID)
 	}

@@ -57,18 +57,139 @@ func (c Category) PreservesWorkspace() bool {
 	return c != CategoryRedesign
 }
 
+// Well-known QuestionOption identifiers understood by the planner. The
+// workspace-conflict options carry a semantic meaning the pipeline maps onto
+// IntentIR.PreserveWorkspace; OptionTypeYourOwn lets the user supply a
+// free-form answer instead of picking a fixed branch.
+const (
+	// OptionReplaceWorkspace discards the existing workspace content and
+	// builds the requested target from scratch.
+	OptionReplaceWorkspace = "replace_workspace"
+	// OptionBuildAlongside keeps the existing workspace and adds the
+	// requested target next to it.
+	OptionBuildAlongside = "build_alongside"
+	// OptionMergeSelective keeps the relevant parts of both workspaces.
+	OptionMergeSelective = "merge_selective"
+	// OptionTypeYourOwn switches the UI into free-form text entry mode.
+	OptionTypeYourOwn = "type_your_own"
+)
+
+// QuestionOption is one mutually-exclusive execution branch the user can pick
+// from. Label is the short choice headline; Description is the one-line
+// consequence card rendered underneath it by the UI.
+type QuestionOption struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	IsDefault   bool   `json:"is_default"`
+}
+
+// NewCustomAnswerOption builds the free-form "type your own answer" branch
+// that the interactive UI treats specially: confirming it opens a text input
+// instead of resolving the question.
+func NewCustomAnswerOption() QuestionOption {
+	return QuestionOption{
+		ID:          OptionTypeYourOwn,
+		Label:       "Type your own answer",
+		Description: "Enter a custom instruction instead of picking a preset branch",
+	}
+}
+
+// IsCustomAnswerOption reports whether opt is the free-form text-entry branch.
+func IsCustomAnswerOption(opt QuestionOption) bool {
+	return opt.ID == OptionTypeYourOwn
+}
+
 // ClarificationQuestion captures a high-impact ambiguity the compiler
 // surfaced so the UI can ask the user before planning proceeds. A
 // ClarificationQuestion never describes a preference; it always names an
 // execution branch whose outcome changes the plan materially.
 type ClarificationQuestion struct {
-	// Question is the user-facing prompt.
-	Question string
+	// ID uniquely identifies the question within an IntentIR.
+	ID string `json:"id"`
+	// Header is the short UI badge shown above the prompt (e.g. "Workspace
+	// Conflict Detected").
+	Header string `json:"header"`
+	// QuestionText is the user-facing prompt.
+	QuestionText string `json:"question_text"`
 	// Options are the mutually-exclusive execution branches the user can
 	// pick between. Empty when free-form input is the only sensible answer.
-	Options []string
+	Options []QuestionOption `json:"options"`
+	// SelectedOption is the option ID chosen by the user. Populated by the
+	// pipeline after the clarification UI resolves the question.
+	SelectedOption string `json:"selected_option"`
+	// CustomAnswer carries the free-form answer when SelectedOption is
+	// OptionTypeYourOwn.
+	CustomAnswer string `json:"custom_answer,omitempty"`
 	// Reason is the machine-readable trigger that raised the question.
-	Reason string
+	Reason string `json:"reason,omitempty"`
+}
+
+// DefaultOptionID returns the ID of the option the UI should pre-highlight:
+// the first IsDefault option, or the first option when none is marked.
+func (q ClarificationQuestion) DefaultOptionID() string {
+	for _, o := range q.Options {
+		if o.IsDefault {
+			return o.ID
+		}
+	}
+	if len(q.Options) > 0 {
+		return q.Options[0].ID
+	}
+	return ""
+}
+
+// IsAnswered reports whether the question already carries a user selection.
+func (q ClarificationQuestion) IsAnswered() bool {
+	return q.SelectedOption != "" || q.CustomAnswer != ""
+}
+
+// ClarificationAnswer is one user's reply to one ClarificationQuestion. It
+// either names a preset option or, for OptionTypeYourOwn, carries the typed
+// CustomAnswer.
+type ClarificationAnswer struct {
+	QuestionID   string `json:"question_id"`
+	OptionID     string `json:"option_id"`
+	CustomAnswer string `json:"custom_answer,omitempty"`
+}
+
+// ClarificationResponse is the full set of answers the clarification UI
+// returns to the pipeline for one ambiguous intent. It unblocks the pipeline's
+// synchronous response channel.
+type ClarificationResponse struct {
+	Answers []ClarificationAnswer `json:"answers"`
+}
+
+// DefaultAnswers resolves every question to its default option. It is the
+// non-interactive fallback the pipeline uses when no TUI clarifier is wired,
+// so a headless run can never hang on an unanswered question.
+func DefaultAnswers(questions []ClarificationQuestion) []ClarificationAnswer {
+	answers := make([]ClarificationAnswer, 0, len(questions))
+	for _, q := range questions {
+		answers = append(answers, ClarificationAnswer{
+			QuestionID: q.ID,
+			OptionID:   q.DefaultOptionID(),
+		})
+	}
+	return answers
+}
+
+// ApplyAnswers copies questions and folds every answer back onto the matching
+// question by ID, setting SelectedOption and CustomAnswer. Unanswered
+// questions are preserved unchanged.
+func ApplyAnswers(questions []ClarificationQuestion, answers []ClarificationAnswer) []ClarificationQuestion {
+	out := make([]ClarificationQuestion, len(questions))
+	copy(out, questions)
+	for _, a := range answers {
+		for i := range out {
+			if out[i].ID != a.QuestionID {
+				continue
+			}
+			out[i].SelectedOption = a.OptionID
+			out[i].CustomAnswer = a.CustomAnswer
+		}
+	}
+	return out
 }
 
 // IntentIR is the strongly-typed, zero-ambiguity translation of one natural

@@ -70,6 +70,18 @@ func WithGenerator(g Generator) Option {
 	}
 }
 
+// WithClarifier binds the interactive clarifier the pipeline blocks on when an
+// ambiguous intent asks its questions. A TUI host wires the AskModel here;
+// when absent, ambiguous intents auto-resolve to their default options so
+// headless runs never hang.
+func WithClarifier(c Clarifier) Option {
+	return func(p *Pipeline) {
+		if c != nil {
+			p.clarifier = c
+		}
+	}
+}
+
 // WithEventBus overrides the shared event bus. A bus is created when absent.
 func WithEventBus(bus *event.MemoryEventBus) Option {
 	return func(p *Pipeline) {
@@ -220,7 +232,11 @@ func fileExists(root, name string) bool {
 // greenfield or brownfield planner. Parent directories are created here,
 // strictly after the validation gate, so no unvalidated content ever reaches
 // disk.
-func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artifact) (*planner.PlanResult, Mode, *brownfield.BrownfieldPlanner, error) {
+//
+// A compiled intent that resolved to "replace the workspace" (PreserveWorkspace
+// false) forces the greenfield one-shot planner in auto mode, since keeping the
+// brownfield repair loop would contradict the user's explicit replacement.
+func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artifact, intentIR *ir.IntentIR) (*planner.PlanResult, Mode, *brownfield.BrownfieldPlanner, error) {
 	useBrownfield := p.mode == ModeBrownfield
 	if p.mode == ModeAuto {
 		bf, err := p.detect(p.root)
@@ -228,6 +244,9 @@ func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artif
 			return nil, ModeAuto, nil, fmt.Errorf("detect workspace: %w", err)
 		}
 		useBrownfield = bf
+	}
+	if intentIR != nil && !intentIR.PreserveWorkspace {
+		useBrownfield = false
 	}
 
 	if err := ensureParentDirs(p.root, artifacts); err != nil {

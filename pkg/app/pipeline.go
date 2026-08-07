@@ -45,12 +45,41 @@ type Generator interface {
 	Complete(ctx context.Context, system, prompt string, maxTokens int) (string, error)
 }
 
+// Clarifier resolves the ClarificationQuestions the pipeline raises for an
+// ambiguous intent. The TUI host subscribes to the TypeClarificationRequired
+// event to learn which questions are pending, then feeds the user's selections
+// into the response channel the pipeline is blocking on.
+//
+// Implementations MUST send exactly one ir.ClarificationResponse on resp and
+// return, or return an error. When no Clarifier is configured the pipeline
+// auto-resolves the default options so a headless run never hangs.
+type Clarifier interface {
+	// Clarify receives the questions to ask and the channel the pipeline
+	// blocks on. resp is buffered with capacity one: a synchronous send that
+	// does not block the caller is guaranteed.
+	Clarify(ctx context.Context, questions []ir.ClarificationQuestion, resp chan<- ir.ClarificationResponse) error
+}
+
+// ClarifierFunc adapts a function value to the Clarifier interface.
+type ClarifierFunc func(ctx context.Context, questions []ir.ClarificationQuestion, resp chan<- ir.ClarificationResponse) error
+
+// Clarify implements Clarifier.
+func (f ClarifierFunc) Clarify(ctx context.Context, questions []ir.ClarificationQuestion, resp chan<- ir.ClarificationResponse) error {
+	return f(ctx, questions, resp)
+}
+
 // Request is a single pipeline invocation.
 type Request struct {
 	// Intent is the raw user prompt to route through the pipeline.
 	Intent string
 	// Targets are optional workspace files the intent references.
 	Targets []string
+	// IntentIR is the compiled intent (optional). When it reports
+	// DecisionAmbiguity, Run pauses at the clarification gate: it publishes a
+	// TypeClarificationRequired event and blocks on a response channel until
+	// the configured Clarifier resolves every question, then folds the
+	// answers back onto the intent and continues.
+	IntentIR *ir.IntentIR
 }
 
 // Result is the full audit trail of one pipeline run.
@@ -70,6 +99,10 @@ type Result struct {
 	Validations []ArtifactValidation
 	// Plan is the planner result whose graph was executed.
 	Plan *planner.PlanResult
+	// IntentIR is the compiled intent processed by the run (nil when the
+	// request carried none). After an ambiguity is resolved it carries the
+	// user's selections and the reconciled PreserveWorkspace flag.
+	IntentIR *ir.IntentIR
 	// Mode records which planning strategy ran.
 	Mode Mode
 	// Answer carries the direct text answer for conversational intents.
@@ -104,6 +137,7 @@ type Pipeline struct {
 	extractors  []extractor.Extractor
 	generator   Generator
 	bus         *event.MemoryEventBus
+	clarifier   Clarifier
 	root        string
 	mode        Mode
 	detect      Detector
@@ -166,6 +200,25 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 	}
 
 	res := &Result{Intent: req.Intent}
+	if req.IntentIR != nil {
+		intentCopy := *req.IntentIR
+		intentCopy.Entities = copyMap(req.IntentIR.Entities)
+		intentCopy.Technologies = append([]string(nil), req.IntentIR.Technologies...)
+		res.IntentIR = &intentCopy
+	}
+
+	// Clarification gate: an ambiguous intent pauses the pipeline before any
+	// planning or generation. The TypeClarificationRequired event notifies UI
+	// hosts which questions are pending; the pipeline then blocks on a
+	// response channel until the Clarifier feeds the user's selections back.
+	if req.IntentIR != nil && req.IntentIR.DecisionAmbiguity {
+		if err := p.clarifyGate(ctx, res.IntentIR); err != nil {
+			return nil, err
+		}
+		// The reconciled intent drives the planning strategy: a "replace the
+		// workspace" answer forces a greenfield one-shot write.
+		req.IntentIR = res.IntentIR
+	}
 
 	// Conversational intents short-circuit to a single direct chat pass.
 	if IsConversationalIntent(req.Intent) {
@@ -241,7 +294,7 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 
 	// Stage 6 — Planning & strategy selection.
 	p.emitStage(ctx, "plan")
-	planResult, planMode, bfPlanner, err := p.plan(ctx, req.Intent, res.Artifacts)
+	planResult, planMode, bfPlanner, err := p.plan(ctx, req.Intent, res.Artifacts, req.IntentIR)
 	if err != nil {
 		return nil, fmt.Errorf("app: plan: %w", err)
 	}
@@ -270,6 +323,84 @@ func (p *Pipeline) generate(ctx context.Context, system, prompt string) (string,
 		return "", ErrEmptyGeneration
 	}
 	return out, nil
+}
+
+// clarifyGate pauses the pipeline on an ambiguous intent. It publishes the
+// pending ClarificationQuestions as a TypeClarificationRequired event, then
+// blocks on a response channel until the configured Clarifier resolves them.
+// Without a Clarifier the default options are auto-selected so headless runs
+// never hang. The reconciled intent has DecisionAmbiguity cleared and
+// PreserveWorkspace folded in from the selected branch.
+func (p *Pipeline) clarifyGate(ctx context.Context, intent *ir.IntentIR) error {
+	if intent == nil || !intent.DecisionAmbiguity {
+		return nil
+	}
+	if len(intent.ClarificationQuestions) == 0 {
+		intent.DecisionAmbiguity = false
+		return nil
+	}
+	questions := intent.ClarificationQuestions
+	p.bus.Publish(event.NewEvent(event.TypeClarificationRequired, "pipeline", questions))
+
+	responseChan := make(chan ir.ClarificationResponse, 1)
+	go p.dispatchClarification(ctx, questions, responseChan)
+
+	select {
+	case resp := <-responseChan:
+		applyClarification(intent, resp)
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// dispatchClarification routes the pending questions to the configured
+// Clarifier (or the default auto-resolution) and delivers the response to the
+// channel the pipeline is blocking on. A failing Clarifier degrades to the
+// default answers and surfaces the error on the bus so the run can continue.
+func (p *Pipeline) dispatchClarification(ctx context.Context, questions []ir.ClarificationQuestion, resp chan<- ir.ClarificationResponse) {
+	if p.clarifier == nil {
+		resp <- ir.ClarificationResponse{Answers: ir.DefaultAnswers(questions)}
+		return
+	}
+	if err := p.clarifier.Clarify(ctx, questions, resp); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		p.bus.Publish(event.NewEvent(event.TypeTaskFailed, "pipeline", err))
+		resp <- ir.ClarificationResponse{Answers: ir.DefaultAnswers(questions)}
+	}
+}
+
+// applyClarification folds the user's answers back onto the intent: every
+// question records its SelectedOption/CustomAnswer, DecisionAmbiguity is
+// cleared, and PreserveWorkspace is reconciled from the semantic option IDs.
+func applyClarification(intent *ir.IntentIR, resp ir.ClarificationResponse) {
+	if intent == nil {
+		return
+	}
+	intent.ClarificationQuestions = ir.ApplyAnswers(intent.ClarificationQuestions, resp.Answers)
+	intent.DecisionAmbiguity = false
+	for _, a := range resp.Answers {
+		switch a.OptionID {
+		case ir.OptionReplaceWorkspace:
+			intent.PreserveWorkspace = false
+		case ir.OptionBuildAlongside, ir.OptionMergeSelective, ir.OptionTypeYourOwn:
+			intent.PreserveWorkspace = true
+		}
+	}
+}
+
+// copyMap returns a defensive copy of src.
+func copyMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return make(map[string]string)
+	}
+	out := make(map[string]string, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 // extract runs the configured extractors over raw and returns the first
