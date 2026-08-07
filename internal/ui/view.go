@@ -60,7 +60,11 @@ func (m *model) renderContextHeader() string {
 // nothing about modes, banners, prompts, footers, or action logic — only how
 // to project a Workspace onto the terminal.
 func (m *model) View() string {
-	return renderWorkspace(m.BuildWorkspace())
+	base := renderWorkspace(m.BuildWorkspace())
+	if m.pendingQuitConfirm {
+		return m.renderQuitConfirmOverlay(base)
+	}
+	return base
 }
 
 // renderWorkspace is the ONLY rendering primitive. It projects a Workspace
@@ -413,76 +417,62 @@ func (m *model) modeStyle(mode modes.Mode) lipgloss.Style {
 
 // ── Autocomplete Dropdown ──────────────────────────────────────────────────
 
-// ── Command section categories for autocomplete ───────────────────────
+// maxSuggestionsVisible caps the dropdown rows; the highlighted row stays
+// centered via autocompleteWindow.
+const maxSuggestionsVisible = 8
 
-type cmdCategory int
-
-const (
-	catPrimaryMode cmdCategory = iota
-	catSystemCommand
-	catModeContextual
+// suggestHeader styles give each Context Selection section a bold, distinct
+// header so the grouping reads at a glance.
+var (
+	suggestHeaderAccent = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorAccent))
+	suggestHeaderSubtle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorSubtle))
+	suggestHeaderMuted  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMuted))
 )
 
-type cmdSection struct {
-	title string
-	style lipgloss.Style
-	items []string
+// sectionStyleFor assigns the bold header style to a suggestion section title.
+func sectionStyleFor(title string) lipgloss.Style {
+	switch title {
+	case "WORKSPACE CONTEXTS":
+		return suggestHeaderAccent
+	case "GLOBAL COMMANDS":
+		return suggestHeaderSubtle
+	default:
+		return suggestHeaderMuted
+	}
 }
 
-func (m *model) cmdCategoryFor(item string) cmdCategory {
-	for _, c := range coreModes {
-		if c == item {
-			return catPrimaryMode
-		}
+// autocompleteWindow returns the visible slice of suggestions and the absolute
+// index of the first returned item, centering the highlighted row so it never
+// scrolls out of the dropdown.
+func (m *model) autocompleteWindow() ([]Suggestion, int) {
+	all := m.autocompleteItems
+	if len(all) <= maxSuggestionsVisible {
+		return all, 0
 	}
-	for _, c := range globalCommands {
-		if c == item {
-			return catSystemCommand
-		}
+	start := m.autocompleteIdx - maxSuggestionsVisible/2
+	if start < 0 {
+		start = 0
 	}
-	return catModeContextual
-}
-
-func (m *model) buildCmdSections(items []string) []cmdSection {
-	var primary, sys, ctx []string
-	for _, it := range items {
-		switch m.cmdCategoryFor(it) {
-		case catPrimaryMode:
-			primary = append(primary, it)
-		case catSystemCommand:
-			sys = append(sys, it)
-		case catModeContextual:
-			ctx = append(ctx, it)
-		}
+	if start+maxSuggestionsVisible > len(all) {
+		start = len(all) - maxSuggestionsVisible
 	}
-	var sections []cmdSection
-	if len(primary) > 0 {
-		sections = append(sections, cmdSection{title: "PRIMARY MODES", style: accentStyle, items: primary})
-	}
-	if len(sys) > 0 {
-		sections = append(sections, cmdSection{title: "SYSTEM COMMANDS", style: subtleStyle, items: sys})
-	}
-	if len(ctx) > 0 {
-		sections = append(sections, cmdSection{title: "MODE CONTEXTUAL", style: mutedStyle, items: ctx})
-	}
-	return sections
+	return all[start : start+maxSuggestionsVisible], start
 }
 
 // renderAutocompleteDropdown renders a compact border-box suggestion list
-// positioned directly above the top parallel line. For file selections (@),
+// positioned directly above the top parallel line. For scope selections (@)
 // it uses a two-column layout with filename on the left and directory on the
-// right. Command selections (/) are displayed in categorized section blocks.
+// right. Command selections (/) and directives ($) are displayed in registry
+// -driven categorized sections.
 func (m *model) renderAutocompleteDropdown(width int) string {
 	if len(m.autocompleteItems) == 0 || !m.autocompleteActive {
 		return ""
 	}
-	var b strings.Builder
-
-	maxShow := 8
-	list := m.autocompleteItems
-	if len(list) > maxShow {
-		list = list[:maxShow]
+	list, baseIdx := m.autocompleteWindow()
+	if len(list) == 0 {
+		return ""
 	}
+	var b strings.Builder
 
 	// Pre-compiled styles for the dropdown
 	highlightedBgStyle := lipgloss.NewStyle().
@@ -497,116 +487,135 @@ func (m *model) renderAutocompleteDropdown(width int) string {
 	}
 	b.WriteString(subtleStyle.Render("╭"+titleSection+strings.Repeat("─", topFiller)+"╮") + "\n")
 
-	if m.autocompleteType == "file" {
-		if width < dropdownTwoColThreshold {
-			// Narrow/split-pane fallback: the directory column has no room
-			// to breathe next to the filename, so collapse to a single
-			// column showing just the (possibly truncated) path.
-			for i, item := range list {
-				icon := "↪ "
-				if i == m.autocompleteIdx {
-					icon = "▶ "
-				}
-				display := icon + item
-				maxContent := width - 4
-				if maxContent < 6 {
-					maxContent = 6
-				}
-				if lipgloss.Width(display) > maxContent {
-					runes := []rune(display)
-					if len(runes) > maxContent-1 {
-						display = string(runes[:maxContent-1]) + "…"
-					} else {
-						display = string(runes) + "…"
-					}
-				}
-				pad := width - lipgloss.Width(display) - 4
-				if pad < 0 {
-					pad = 0
-				}
-				rowString := display + strings.Repeat(" ", pad)
-				if i == m.autocompleteIdx {
-					b.WriteString("│ " + highlightedBgStyle.Render(rowString) + " │\n")
-				} else {
-					b.WriteString("│ " + textStyle.Render(rowString) + " │\n")
-				}
-			}
-		} else {
-			for i, item := range list {
-				name := filepath.Base(item)
-				dir := filepath.Dir(item)
-				if dir == "." {
-					dir = "./"
-				}
-
-				icon := "↪ "
-				if i == m.autocompleteIdx {
-					icon = "▶ "
-				}
-
-				// Left column: file name (high contrast)
-				leftSide := textStyle.Render(icon + name)
-				// Right column: parent directory (low contrast #6c7086)
-				rightSide := mutedStyle.Render(dir + " ")
-
-				paddingCount := width - lipgloss.Width(icon+name) - lipgloss.Width(dir+" ") - 4
-				if paddingCount < 0 {
-					paddingCount = 0
-				}
-
-				if i == m.autocompleteIdx {
-					rowString := leftSide + strings.Repeat(" ", paddingCount) + rightSide
-					b.WriteString("│ " + highlightedBgStyle.Render(rowString) + " │\n")
-				} else {
-					b.WriteString("│ " + leftSide + strings.Repeat(" ", paddingCount) + rightSide + " │\n")
-				}
-			}
-		}
+	if m.autocompleteType == "scope" {
+		m.renderScopeRows(&b, list, m.autocompleteIdx, baseIdx, width, highlightedBgStyle)
 	} else {
-		sections := m.buildCmdSections(list)
-		itemIdx := 0
-		for _, sec := range sections {
-			// Section header
-			headerStr := "  " + sec.style.Render(sec.title)
-			hPad := width - lipgloss.Width(headerStr) - 4
-			if hPad < 0 {
-				hPad = 0
-			}
-			b.WriteString("│ " + headerStr + strings.Repeat(" ", hPad) + " │\n")
-
-			for _, item := range sec.items {
-				display := item
-				lw := lipgloss.Width(display)
-				maxContent := width - 8
-				if maxContent < 10 {
-					maxContent = 10
-				}
-				if lw > maxContent {
-					runes := []rune(display)
-					if len(runes) > maxContent-1 {
-						display = string(runes[:maxContent-1]) + "…"
-					} else {
-						display = string(runes) + "…"
-					}
-					lw = lipgloss.Width(display)
-				}
-				pad := strings.Repeat(" ", width-lw-6)
-
-				rowString := display + pad
-				if itemIdx == m.autocompleteIdx {
-					b.WriteString("│ " + highlightedBgStyle.Render("▶ "+rowString) + " │\n")
-				} else {
-					b.WriteString("│ " + dimmedStyle.Render("↪ "+rowString) + " │\n")
-				}
-				itemIdx++
-			}
-		}
+		m.renderSuggestSections(&b, list, m.autocompleteIdx, baseIdx, width, highlightedBgStyle)
 	}
 
 	// Bottom border
 	b.WriteString(subtleStyle.Render("╰"+strings.Repeat("─", width-2)+"╯") + "\n")
 
 	return b.String()
+}
+
+// renderScopeRows renders the two-column @ target rows: filename on the left,
+// parent directory dimmed on the right. On narrow terminals it collapses to a
+// single truncated path column.
+func (m *model) renderScopeRows(b *strings.Builder, list []Suggestion, activeIdx, baseIdx, width int, highlightedBgStyle lipgloss.Style) {
+	if width < dropdownTwoColThreshold {
+		for i, item := range list {
+			icon := "↪ "
+			if i+baseIdx == activeIdx {
+				icon = "▶ "
+			}
+			display := icon + item.Label
+			maxContent := width - 4
+			if maxContent < 6 {
+				maxContent = 6
+			}
+			if lipgloss.Width(display) > maxContent {
+				runes := []rune(display)
+				if len(runes) > maxContent-1 {
+					display = string(runes[:maxContent-1]) + "…"
+				} else {
+					display = string(runes) + "…"
+				}
+			}
+			pad := width - lipgloss.Width(display) - 4
+			if pad < 0 {
+				pad = 0
+			}
+			rowString := display + strings.Repeat(" ", pad)
+			if i+baseIdx == activeIdx {
+				b.WriteString("│ " + highlightedBgStyle.Render(rowString) + " │\n")
+			} else {
+				b.WriteString("│ " + textStyle.Render(rowString) + " │\n")
+			}
+		}
+		return
+	}
+	for i, item := range list {
+		name := filepath.Base(item.Label)
+		dir := filepath.Dir(item.Label)
+		if dir == "." {
+			dir = "./"
+		}
+
+		icon := "↪ "
+		if i+baseIdx == activeIdx {
+			icon = "▶ "
+		}
+
+		// Left column: file name (high contrast)
+		leftSide := textStyle.Render(icon + name)
+		// Right column: parent directory (low contrast #6c7086)
+		rightSide := mutedStyle.Render(dir + " ")
+
+		paddingCount := width - lipgloss.Width(icon+name) - lipgloss.Width(dir+" ") - 4
+		if paddingCount < 0 {
+			paddingCount = 0
+		}
+
+		if i+baseIdx == activeIdx {
+			rowString := leftSide + strings.Repeat(" ", paddingCount) + rightSide
+			b.WriteString("│ " + highlightedBgStyle.Render(rowString) + " │\n")
+		} else {
+			b.WriteString("│ " + leftSide + strings.Repeat(" ", paddingCount) + rightSide + " │\n")
+		}
+	}
+}
+
+// renderSuggestSections renders grouped command/directive rows with bold,
+// color-distinct section headers and 2-space-indented items, highlighting the
+// active row with a background fill and ▶ cursor.
+func (m *model) renderSuggestSections(b *strings.Builder, list []Suggestion, activeIdx, baseIdx, width int, highlightedBgStyle lipgloss.Style) {
+	activeRowStyle := highlightedBgStyle.Bold(true)
+	sections := buildSuggestionSections(list)
+	itemIdx := 0
+	for _, sec := range sections {
+		// Section header (bold, distinct color, flush under the border).
+		headerStr := sectionStyleFor(sec.Title).Render(sec.Title)
+		hPad := width - lipgloss.Width(headerStr) - 4
+		if hPad < 0 {
+			hPad = 0
+		}
+		b.WriteString("│ " + headerStr + strings.Repeat(" ", hPad) + " │\n")
+
+		for _, item := range sec.Items {
+			display := item.Label
+			if item.Detail != "" {
+				detail := "  " + dimmedStyle.Render(item.Detail)
+				if lipgloss.Width(display)+lipgloss.Width(detail) <= width-10 {
+					display += detail
+				}
+			}
+			lw := lipgloss.Width(display)
+			maxContent := width - 10
+			if maxContent < 10 {
+				maxContent = 10
+			}
+			if lw > maxContent {
+				runes := []rune(display)
+				if len(runes) > maxContent-1 {
+					display = string(runes[:maxContent-1]) + "…"
+				} else {
+					display = string(runes) + "…"
+				}
+				lw = lipgloss.Width(display)
+			}
+			// Items sit 2 spaces under their section header.
+			pad := strings.Repeat(" ", width-lw-8)
+
+			rowString := "  " + display + pad
+			if itemIdx+baseIdx == activeIdx {
+				b.WriteString("│ " + activeRowStyle.Render("▶ "+rowString) + " │\n")
+			} else {
+				b.WriteString("│ " + dimmedStyle.Render("↳ "+rowString) + " │\n")
+			}
+			itemIdx++
+		}
+	}
 }
 
 // ── Help Overlay ───────────────────────────────────────────────────────────

@@ -636,18 +636,6 @@ const (
 	selClose    = "\x00/SEL\x00"
 )
 
-var coreModes = []string{"/ask", "/plan", "/build", "/investigate", "/review"}
-
-var utilityCommands = map[modes.Mode][]string{
-	modes.ModeAsk:         {"/clear"},
-	modes.ModePlan:        {"/clear"},
-	modes.ModeBuild:       {"/undo", "/commit", "/checkpoint", "/clear"},
-	modes.ModeInvestigate: {"/clear"},
-	modes.ModeReview:      {"/clear"},
-}
-
-var globalCommands = []string{"/help", "/?", "/usage", "/model", "/objective", "/drop", "/quit", "/arch"}
-
 // flowingSpinnerFrames is the space-padded snowflake sequence used by the
 // inline loading spinner. The glyphs themselves are the canonical
 // tokens.SpinnerSnowflakeFrames; only the padding is added here for the
@@ -772,17 +760,23 @@ type model struct {
 	agentLabel   string
 	agentDone    bool
 
+	// Quit-confirmation modal (exit safety guard). pendingQuitConfirm gates
+	// clean shutdown behind an explicit [ No ] / [ Yes ] dialog; the dialog
+	// defaults to [ No ] so a stray Enter can never exit accidentally.
+	pendingQuitConfirm bool
+	quitConfirmYes     bool
+
 	// Suggestions
 	showSuggestions bool
 	suggestionType  string
-	suggestions     []string
+	suggestions     []Suggestion
 	suggestionIdx   int
 
 	// Autocomplete (Prompt Sandwich dropdown)
 	autocompleteActive bool
-	autocompleteType   string   // "file" or "command"
-	autocompleteItems  []string // filtered matching items
-	autocompleteIdx    int      // currently highlighted index
+	autocompleteType   string       // "scope", "command", or "directive"
+	autocompleteItems  []Suggestion // filtered matching items
+	autocompleteIdx    int          // currently highlighted index
 
 	// File context
 	pendingFileRefs []string
@@ -3264,12 +3258,18 @@ func (m *model) getAutocompleteHeight() int {
 	if !m.autocompleteActive || len(m.autocompleteItems) == 0 {
 		return 0
 	}
-	maxShow := 8
-	n := len(m.autocompleteItems)
-	if n > maxShow {
-		n = maxShow
+	list, _ := m.autocompleteWindow()
+	if len(list) == 0 {
+		return 0
 	}
-	return n + 2 // items + top border + bottom border
+	if m.autocompleteType == "scope" {
+		return len(list) + 2 // rows + top border + bottom border
+	}
+	h := 2 // borders
+	for _, sec := range buildSuggestionSections(list) {
+		h += 1 + len(sec.Items) // header + rows
+	}
+	return h
 }
 
 // computeVpHeight returns the number of terminal rows available for the

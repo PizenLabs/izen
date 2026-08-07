@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/pkg/domain/command"
 )
 
 func (m *model) dismissSuggestions() {
@@ -18,6 +18,10 @@ func (m *model) dismissSuggestions() {
 	m.recalcViewportHeight()
 }
 
+// updateSuggestions re-projects the Context Selection menu from the registry
+// based on the cursor context. It recognizes markers ANYWHERE in the line: the
+// token being edited determines the marker family, and the workspace declared
+// in the line (or the active session workspace) gates '$' directives.
 func (m *model) updateSuggestions() {
 	current := m.input.String()
 	if current == "" {
@@ -30,69 +34,57 @@ func (m *model) updateSuggestions() {
 		cursorIdx = len(current)
 	}
 
-	// Scan backward from cursor for @ trigger — works at any cursor position.
-	atIdx := -1
-	for i := cursorIdx - 1; i >= 0; i-- {
-		if current[i] == '@' {
-			atIdx = i
-			break
-		}
-	}
-	if atIdx >= 0 {
-		prefix := current[atIdx+1 : cursorIdx]
-		if !strings.Contains(prefix, " ") {
-			m.showSuggestions = true
-			m.suggestionType = "@"
-			m.suggestions = filterFilesRecursive(prefix)
-			m.suggestionIdx = 0
-			if len(m.suggestions) == 1 && m.suggestions[0] == prefix {
-				m.showSuggestions = false
-			}
-			m.syncAutocompleteFromSuggestions()
-			if m.autocompleteActive {
-				m.recalcViewportHeight()
-			}
-			return
-		}
-	}
+	ctx := analyzeCursor(current, cursorIdx)
+	ctx.ActiveWorkspace = m.activeWorkspaceFor(current)
 
-	// $ at start of input only.
-	if strings.HasPrefix(current, "$") {
-		m.showSuggestions = true
-		m.suggestionType = "$"
-		m.suggestions = m.filterDollarCommands(current[1:])
-		m.suggestionIdx = 0
-		if len(m.suggestions) == 1 && "$"+m.suggestions[0] == current {
-			m.showSuggestions = false
-		}
-		m.syncAutocompleteFromSuggestions()
-		if m.autocompleteActive {
-			m.recalcViewportHeight()
-		}
+	var items []Suggestion
+	switch ctx.ActiveMarker {
+	case command.MarkerAt:
+		items = projectAtSuggestions(ctx.PartialTerm, m.gitModifiedPaths())
+	case command.MarkerDollar:
+		items = projectDollarSuggestions(command.Default(), ctx.ActiveWorkspace, ctx.PartialTerm)
+	case command.MarkerSlash:
+		items = projectSlashSuggestions(command.Default(), ctx.ActiveWorkspace, ctx.PartialTerm)
+	default:
+		m.dismissSuggestions()
 		return
 	}
 
-	// / at start of input only.
-	if strings.HasPrefix(current, "/") {
-		m.showSuggestions = true
-		m.suggestionType = "/"
-		m.suggestions = m.filterCommands(current[1:])
-		m.suggestionIdx = 0
-		if len(m.suggestions) == 1 && m.suggestions[0] == current {
-			m.showSuggestions = false
-		}
-		m.syncAutocompleteFromSuggestions()
-		if m.autocompleteActive {
-			m.recalcViewportHeight()
-		}
+	if len(items) == 0 {
+		m.dismissSuggestions()
+		return
+	}
+	if len(items) == 1 && items[0].Token == string(ctx.ActiveMarker)+ctx.PartialTerm {
+		m.dismissSuggestions()
 		return
 	}
 
-	m.dismissSuggestions()
+	m.showSuggestions = true
+	m.suggestionType = suggestionTypeFor(ctx.ActiveMarker)
+	m.suggestions = items
+	m.suggestionIdx = 0
+	m.syncAutocompleteFromSuggestions()
+	if m.autocompleteActive {
+		m.recalcViewportHeight()
+	}
 }
 
-// syncAutocompleteFromSuggestions bridges the old suggestion system to the new
-// Prompt Sandwich autocomplete state so the dropdown renderer can read from
+// suggestionTypeFor maps an active marker to the renderer layout selector:
+// "scope" renders the two-column file rows, everything else renders grouped
+// command sections.
+func suggestionTypeFor(marker rune) string {
+	switch marker {
+	case command.MarkerAt:
+		return "scope"
+	case command.MarkerDollar:
+		return "directive"
+	default:
+		return "command"
+	}
+}
+
+// syncAutocompleteFromSuggestions bridges the suggestion state to the Prompt
+// Sandwich autocomplete state so the dropdown renderer reads from
 // autocompleteActive / autocompleteItems / autocompleteIdx directly.
 func (m *model) syncAutocompleteFromSuggestions() {
 	m.autocompleteActive = m.showSuggestions
@@ -101,8 +93,8 @@ func (m *model) syncAutocompleteFromSuggestions() {
 	m.autocompleteIdx = m.suggestionIdx
 }
 
-// dismissAutocomplete cleanly closes the dropdown and clears both state systems.
-// Restores viewport height that was reserved for the dropdown.
+// dismissAutocomplete cleanly closes the dropdown and clears both state
+// systems. Restores viewport height that was reserved for the dropdown.
 func (m *model) dismissAutocomplete() {
 	m.autocompleteActive = false
 	m.autocompleteType = ""
@@ -112,7 +104,8 @@ func (m *model) dismissAutocomplete() {
 	m.recalcViewportHeight()
 }
 
-// navigateAutocomplete moves the dropdown highlight by dir (+1 or -1).
+// navigateAutocomplete moves the dropdown highlight by dir (+1 or -1),
+// wrapping around the full item list.
 func (m *model) navigateAutocomplete(dir int) {
 	if !m.autocompleteActive || len(m.autocompleteItems) == 0 {
 		return
@@ -124,54 +117,65 @@ func (m *model) navigateAutocomplete(dir int) {
 	}
 }
 
-// completeAutocomplete replaces the input buffer with the highlighted item,
-// using cursor-aware backward scanning to find the trigger (@ or /).
-// For @-files: prepends @ to the selected path. For /-commands: uses the
-// selection as-is (already contains /). Preserves text after cursor.
-func (m *model) completeAutocomplete() {
+// completeAutocomplete replaces the partial token under the caret with the
+// highlighted suggestion's Token (marker included), preserving all text before
+// and after the caret. A trailing space is ALWAYS appended so the user can
+// keep typing without tokens sticking together ("$fix check in @main" →
+// "$fix check in @main.go "). The one exception is a whole-line completion
+// committed via Enter (commit=true and the token occupies the entire line): no
+// trailing space is added and the method returns true so the caller submits
+// the completed command immediately ("/q" → "/quit" executes instead of
+// dumping "unknown command: /q").
+func (m *model) completeAutocomplete(commit bool) bool {
 	if !m.autocompleteActive || len(m.autocompleteItems) == 0 {
-		return
+		return false
 	}
 	sel := m.autocompleteItems[m.autocompleteIdx]
 	val := m.ti.Value()
 	cursorIdx := m.ti.Position()
-
-	triggerIdx := -1
-	var activeTrigger byte
-	for i := cursorIdx - 1; i >= 0; i-- {
-		if val[i] == '@' || val[i] == '/' || val[i] == '$' {
-			triggerIdx = i
-			activeTrigger = val[i]
-			break
-		}
-	}
-	if triggerIdx < 0 {
-		return
+	if cursorIdx > len(val) {
+		cursorIdx = len(val)
 	}
 
-	var selectedToken string
-	switch activeTrigger {
-	case '@':
-		selectedToken = "@" + sel
-		m.pendingFileRefs = append(m.pendingFileRefs, sel)
-		m.attachedFiles = append(m.attachedFiles, sel)
-	case '$':
-		selectedToken = "$" + sel
-	default:
-		selectedToken = sel
+	ctx := analyzeCursor(val, cursorIdx)
+	if ctx.ActiveMarker == 0 {
+		return false
+	}
+	markerIdx := cursorIdx - len(ctx.PartialTerm) - 1
+	if markerIdx < 0 {
+		return false
 	}
 
-	beforeTrigger := val[:triggerIdx]
+	if ctx.ActiveMarker == command.MarkerAt {
+		target := strings.TrimPrefix(sel.Token, "@")
+		m.pendingFileRefs = append(m.pendingFileRefs, target)
+		m.attachedFiles = append(m.attachedFiles, target)
+	}
+
+	beforeTrigger := val[:markerIdx]
 	afterCursor := val[cursorIdx:]
-	newVal := beforeTrigger + selectedToken + " " + afterCursor
+
+	wholeLine := strings.TrimSpace(beforeTrigger) == "" && strings.TrimSpace(afterCursor) == ""
+	// Commit-and-execute only when the completed token is a unique command
+	// suggestion occupying the entire line ("/q" → "/quit"). Ambiguous prefixes
+	// and mid-sentence completions just complete with a trailing space.
+	commitLine := commit && wholeLine && m.autocompleteType == "command" && len(m.autocompleteItems) == 1
+	sep := " "
+	if commitLine {
+		sep = ""
+	}
+	newVal := beforeTrigger + sel.Token + sep + afterCursor
 	m.ti.SetValue(newVal)
-	m.ti.SetCursor(len(beforeTrigger + selectedToken + " "))
+	m.ti.SetCursor(len(beforeTrigger + sel.Token + sep))
 
 	m.autocompleteActive = false
 	m.syncInputFromTI()
 	m.recalcViewportHeight()
+	return commitLine
 }
 
+// fuzzyMatch reports whether the pattern's runes appear, in order, within the
+// target (subsequence matching).
 func fuzzyMatch(pattern, target string) bool {
 	pattern = strings.ToLower(pattern)
 	target = strings.ToLower(target)
@@ -184,102 +188,9 @@ func fuzzyMatch(pattern, target string) bool {
 	return pi == len(pattern)
 }
 
-func (m *model) filterCommands(prefix string) []string {
-	var result []string
-	matches := func(cmd string) bool {
-		if prefix == "" {
-			return true
-		}
-		cmdName := strings.TrimPrefix(cmd, "/")
-		return strings.HasPrefix(cmdName, prefix) || fuzzyMatch(prefix, cmdName)
-	}
-	currentMode := m.resolver.Current()
-
-	// Sub-command expansion: if the user has typed "undo " (with space) in
-	// build mode, show sub-commands like "undo session" and "undo --all".
-	if subCmds := expandSubCommands(prefix, currentMode); subCmds != nil {
-		for _, sc := range subCmds {
-			if fuzzyMatch(lastToken(prefix), sc) {
-				result = append(result, "/"+prefix+sc)
-			}
-		}
-		return result
-	}
-
-	for _, c := range coreModes {
-		if matches(c) {
-			result = append(result, c)
-		}
-	}
-	for _, c := range utilityCommands[currentMode] {
-		// Strictly hide build-only commands unless in build mode.
-		if (c == "/undo" || c == "/commit" || c == "/checkpoint") && currentMode != modes.ModeBuild {
-			continue
-		}
-		if matches(c) {
-			result = append(result, c)
-		}
-	}
-	for _, c := range globalCommands {
-		if matches(c) {
-			result = append(result, c)
-		}
-	}
-	return result
-}
-
-// undoSubCommands are the available sub-command flags for /undo.
-var undoSubCommands = []string{"session", "--all", "--session"}
-
-// expandSubCommands checks whether the prefix matches a known command that
-// has sub-command completions. Returns the sub-command candidates, or nil
-// if no expansion applies. Sub-commands are only available in build mode
-// to prevent accidental misuse in read-only modes.
-func expandSubCommands(prefix string, mode modes.Mode) []string {
-	if mode != modes.ModeBuild {
-		return nil
-	}
-	if !strings.HasPrefix(prefix, "undo ") {
-		return nil
-	}
-	return undoSubCommands
-}
-
-// lastToken returns the last space-delimited token in s.
-func lastToken(s string) string {
-	if idx := strings.LastIndex(s, " "); idx >= 0 {
-		return s[idx+1:]
-	}
-	return s
-}
-
-func (m *model) filterDollarCommands(prefix string) []string {
-	mode := m.resolver.Current()
-	var candidates []string
-	switch mode {
-	case modes.ModeAsk:
-		candidates = []string{"prompt"}
-	case modes.ModeReview:
-		candidates = []string{"test", "run", "log"}
-	case modes.ModeInvestigate:
-		candidates = []string{"env", "trace", "diagnose", "log"}
-	case modes.ModeBuild:
-		candidates = []string{"fix", "fix --apply", "hot"}
-	default:
-		return nil
-	}
-	if prefix == "" {
-		return candidates
-	}
-	var result []string
-	for _, c := range candidates {
-		if strings.HasPrefix(c, prefix) {
-			result = append(result, c)
-		}
-	}
-	return result
-}
-
+// filterFilesRecursive walks the workspace and returns file paths matching
+// the prefix fragment, capped at a small limit and sorted with exact prefix
+// matches first.
 func filterFilesRecursive(prefix string) []string {
 	const limit = 20
 
