@@ -15,7 +15,7 @@ require (
 	github.com/muesli/termenv v0.16.0
 	github.com/yuin/goldmark v1.8.5
 	golang.org/x/sync v0.22.0
-	golang.org/x/text v0.3.8
+	golang.org/x/text v0.39.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
