@@ -29,21 +29,26 @@ func ParseDefault(input string) (*IntentAST, error) {
 
 // parseTokens assembles a token stream into an IntentAST in two passes:
 //
-//  1. Collect the workspace, directives, scopes, and goal fragments, validating
-//     every marker against the registry (order-independent).
+//  1. Collect the workspace, global commands, directives, scopes, and goal
+//     fragments, validating every marker against the registry
+//     (order-independent).
 //  2. Enforce the permission policy and chain-support contract against the
-//     effective workspace, now fully known.
+//     effective workspace, now fully known: every $ directive AND every /
+//     global command must be permitted by the effective workspace's
+//     permission set.
 func parseTokens(toks []Token, reg *command.Registry) (*IntentAST, error) {
 	var (
-		ws     command.WorkspaceType
-		wsSet  bool
-		wsDesc *command.CommandDescriptor
-		wsPos  Position
-		dirs   = make([]command.CommandDescriptor, 0, 4)
-		dirPos = make([]Position, 0, 4)
-		scopes = make([]SemanticScope, 0, 2)
-		words  = make([]string, 0, 4)
-		cmdCt  int
+		ws        command.WorkspaceType
+		wsSet     bool
+		wsDesc    *command.CommandDescriptor
+		wsPos     Position
+		globals   = make([]command.CommandDescriptor, 0, 2)
+		globalPos = make([]Position, 0, 2)
+		dirs      = make([]command.CommandDescriptor, 0, 4)
+		dirPos    = make([]Position, 0, 4)
+		scopes    = make([]SemanticScope, 0, 2)
+		words     = make([]string, 0, 4)
+		cmdCt     int
 	)
 
 	for _, tok := range toks {
@@ -58,6 +63,11 @@ func parseTokens(toks []Token, reg *command.Registry) (*IntentAST, error) {
 				if err != nil {
 					return nil, err
 				}
+				if d.Global {
+					globals = appendUniqueCommand(globals, d.Descriptor)
+					globalPos = append(globalPos, tok.Pos)
+					continue
+				}
 				if wsSet {
 					return nil, &ParseError{Kind: ErrMultipleWorkspaces, Marker: tok.Marker, Name: tok.Name, Pos: tok.Pos}
 				}
@@ -66,7 +76,7 @@ func parseTokens(toks []Token, reg *command.Registry) (*IntentAST, error) {
 				if tok.Name == "" {
 					return nil, emptyNameErr(tok)
 				}
-				d, ok := reg.Lookup(command.MarkerDollar, tok.Name)
+				d, ok := reg.LookupPrefix(command.MarkerDollar, tok.Name)
 				if !ok {
 					return nil, unknownErr(tok)
 				}
@@ -89,6 +99,14 @@ func parseTokens(toks []Token, reg *command.Registry) (*IntentAST, error) {
 	if !wsSet {
 		effective = command.WorkspaceAsk
 	}
+	for i, g := range globals {
+		if !effective.Permissions().Contains(g.RequiredPerms) {
+			return nil, &ParseError{
+				Kind: ErrPermissionDenied, Marker: command.MarkerSlash, Name: g.Name,
+				Workspace: effective, Required: g.RequiredPerms, Pos: globalPos[i],
+			}
+		}
+	}
 	for i, d := range dirs {
 		if !effective.Permissions().Contains(d.RequiredPerms) {
 			return nil, &ParseError{
@@ -109,27 +127,32 @@ func parseTokens(toks []Token, reg *command.Registry) (*IntentAST, error) {
 	}
 
 	return &IntentAST{
-		Workspace:  effective,
-		Directives: dirs,
-		Scopes:     scopes,
-		Goal:       strings.Join(words, " "),
+		Workspace:      effective,
+		GlobalCommands: globals,
+		Directives:     dirs,
+		Scopes:         scopes,
+		Goal:           strings.Join(words, " "),
 	}, nil
 }
 
-// resolvedSlash is a / command resolved against the registry.
+// resolvedSlash is a / command resolved against the registry: either a
+// workspace switcher or a global command.
 type resolvedSlash struct {
 	Descriptor command.CommandDescriptor
 	Workspace  command.WorkspaceType
+	Global     bool
 }
 
-// resolveSlash validates a / token: it must name a registered workspace
-// (KindWorkspace). Global commands (/help) are rejected because they route
-// through the command router rather than the intent pipeline.
+// resolveSlash validates a / token against the registry. KindWorkspace tokens
+// resolve to a workspace switcher; KindGlobal tokens resolve to a global
+// command whose permission is enforced once the effective workspace is known.
+// LookupPrefix means registered aliases (/q → quit) and unambiguous prefixes
+// (/qu → quit) resolve natively to their canonical descriptor.
 func resolveSlash(tok Token, reg *command.Registry) (resolvedSlash, error) {
 	if tok.Name == "" {
 		return resolvedSlash{}, emptyNameErr(tok)
 	}
-	d, ok := reg.Lookup(command.MarkerSlash, tok.Name)
+	d, ok := reg.LookupPrefix(command.MarkerSlash, tok.Name)
 	if !ok {
 		return resolvedSlash{}, unknownErr(tok)
 	}
@@ -141,7 +164,7 @@ func resolveSlash(tok Token, reg *command.Registry) (resolvedSlash, error) {
 		}
 		return resolvedSlash{Descriptor: *d, Workspace: ws}, nil
 	case command.KindGlobal:
-		return resolvedSlash{}, &ParseError{Kind: ErrUnsupportedCommand, Marker: tok.Marker, Name: tok.Name, Pos: tok.Pos}
+		return resolvedSlash{Descriptor: *d, Global: true}, nil
 	default:
 		return resolvedSlash{}, unknownErr(tok)
 	}
@@ -166,6 +189,17 @@ func workspaceFromName(name string) (command.WorkspaceType, bool) {
 // appendUniqueDirective appends d unless a descriptor with the same marker and
 // name is already present.
 func appendUniqueDirective(ds []command.CommandDescriptor, d command.CommandDescriptor) []command.CommandDescriptor {
+	for _, existing := range ds {
+		if existing.Marker == d.Marker && existing.Name == d.Name {
+			return ds
+		}
+	}
+	return append(ds, d)
+}
+
+// appendUniqueCommand appends d unless a descriptor with the same marker and
+// name is already present. Shared by global-command collection.
+func appendUniqueCommand(ds []command.CommandDescriptor, d command.CommandDescriptor) []command.CommandDescriptor {
 	for _, existing := range ds {
 		if existing.Marker == d.Marker && existing.Name == d.Name {
 			return ds

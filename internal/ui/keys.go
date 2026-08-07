@@ -614,7 +614,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlD:
 		if m.ti.Value() == "" && !m.agentRunning && !m.streaming && !m.reviewRunning && !m.pipelineRunning {
-			return m, m.cleanShutdownCmd()
+			// Route the exit through the confirmation gate so a stray Ctrl+D
+			// can never close the session without an explicit [ Yes ].
+			m.beginQuitConfirm()
+			return m, nil
 		}
 		return m, nil
 
@@ -653,105 +656,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// sending it to the LLM. The system remains deterministic, fully visible,
 		// and safe from unintended execution.
 	case tea.KeyEnter:
-		m.userIsScrollingUp = false
-
-		userInput := m.ti.Value()
-		m.dismissSuggestions()
-
-		// ── Proposed shell command checkpoint ──────────────────────────────
-		if m.proposedShellCmd != "" {
-			cmd := m.proposedShellCmd
-			m.proposedShellCmd = ""
-			m.ti.SetValue("")
-			m.ti.Reset()
-			m.syncInputFromTI()
-			m.push(roleUser, "$ "+cmd)
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			// Live shell execution: start the running exec entry in the
-			// activity tree, activate the loading dock, and dispatch the
-			// shimmer + smooth ticks so the snowflake spinner animates for the
-			// whole duration. Output streams into the tree and is expandable
-			// via Ctrl+O; shellExitMsg stops the dock on completion.
-			if m.activityTree != nil {
-				m.activityTree.AppendOrUpdateExec(cmd, -1, 0, "")
-			}
-			m.startShimmer("Executing command...", "execute")
-			return m, tea.Batch(
-				m.streamShellCmd(cmd),
-				m.smoothStreamTickCmd(),
-				m.shimmerTickCmd(),
-			)
-		}
-
-		if userInput != "" {
-			m.currentPrompt = userInput
-			if m.showBanner {
-				m.showBanner = false
-			}
-			m.ti.SetValue("")
-			m.ti.Reset()
-			m.syncInputFromTI()
-
-			m.history = append(m.history, userInput)
-			m.historyIndex = len(m.history)
-			m.saveHistory()
-
-			m.push(roleUser, userInput)
-
-			// ── T=0MS SHIMMER: instant visual feedback ─────────────────
-			// Activate the loading shimmer BEFORE any orchestrator dispatch
-			// or synchronous context planning (planContextForAsk, intent
-			// classification) so the user sees the shimmer + tip dock
-			// immediately on Enter — zero perceived lag. streamCmd() will
-			// refine the shimmer text once the stream is ready; non-streaming
-			// early-return paths call stopShimmer() to clean up.
-			//
-			// CRITICAL: the shimmer tick AND the smooth stream tick are
-			// dispatched HERE, synchronously, as part of the returned batch —
-			// NOT only downstream inside streamCmd(). If the Enter handler
-			// returned without them, the first spinner.FrameMsg would be
-			// scheduled only after the (now async) context prep resolves, so
-			// the dock would sit frozen for the entire workspace scan. With
-			// them in the batch the loading line animates from the very first
-			// frame; streamCmd() re-schedules its own ticks when it runs.
-			shimmerAlreadyActive := m.shimmerActive
-			m.spinnerFrame = 0
-			m.startShimmer("Working...", "analyze")
-
-			m.streamStartTime = time.Now()
-			cmd := m.handleInput(userInput)
-			// ── CLEANUP: stop shimmer on non-streaming early returns ────
-			// If handleInput returned nil or a non-stream command (error,
-			// shell exec, pending confirm), the shimmer we started was never
-			// consumed by streamCmd — deactivate it so the dock clears.
-			// Guard: only stop if we freshly started it (not a leftover from
-			// a previous stream that hasn't been reconciled yet).
-			if cmd == nil && !shimmerAlreadyActive && m.shimmerActive {
-				m.stopShimmer()
-			}
-			// ── APPLICATION-LAYER COMMAND RECORD ──────────────────────
-			// The same submission is routed through the Runtime facade as a
-			// SubmitPromptCmd so the canonical command/event contract observes
-			// it. Nil-safe when no runtime is wired.
-			cmd = tea.Batch(cmd, m.runtimeSubmitCmd(userInput))
-			// ── INSTANT ANIMATION AT T=0MS ────────────────────────────
-			// Dispatch the shimmer + smooth ticks alongside the submission so
-			// the loading dock animates immediately, regardless of what the
-			// submitted command does next (async prep, stream, engine run).
-			// Both loops self-terminate when no background producer owns the
-			// flags, so idle submits leak nothing.
-			cmd = tea.Batch(cmd, m.shimmerTickCmd(), m.smoothStreamTickCmd())
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			return m, cmd
-		}
-		m.ti.SetValue("")
-		m.ti.Reset()
-		m.syncInputFromTI()
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return m, nil
+		return m.submitEnter()
 
 		// ── History navigation (only when suggestions are NOT active) ─────────
 	case tea.KeyUp:
@@ -795,10 +700,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tiCmd
 
 		// ── Text-editing keys: forward directly to textinput, no swallowing ────
+		// Suggestions are re-evaluated so moving the caret into a marker token
+		// (or past it) re-projects the menu from the new cursor context.
 	default:
 		var tiCmd tea.Cmd
 		m.ti, tiCmd = m.ti.Update(msg)
 		m.syncInputFromTI()
+		m.updateSuggestions()
 		return m, tiCmd
 	}
 }
@@ -811,4 +719,111 @@ func (m *model) syncInputFromTI() {
 	// textinput, but this guarantees the buffer stays clean regardless of
 	// terminal raw-mode state during /build shell execution.
 	m.input.WriteString(sanitizeInputBuffer(m.ti.Value()))
+}
+
+// submitEnter executes the canonical Enter submission path: it submits the
+// current input buffer through handleInput with full shimmer, history, and
+// runtime-command wiring. It is shared by the plain Enter handler and the
+// autocomplete Enter path, which completes a unique whole-line suggestion
+// before handing off here.
+func (m *model) submitEnter() (tea.Model, tea.Cmd) {
+	m.userIsScrollingUp = false
+
+	userInput := m.ti.Value()
+	m.dismissSuggestions()
+
+	// ── Proposed shell command checkpoint ──────────────────────────────
+	if m.proposedShellCmd != "" {
+		cmd := m.proposedShellCmd
+		m.proposedShellCmd = ""
+		m.ti.SetValue("")
+		m.ti.Reset()
+		m.syncInputFromTI()
+		m.push(roleUser, "$ "+cmd)
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		// Live shell execution: start the running exec entry in the
+		// activity tree, activate the loading dock, and dispatch the
+		// shimmer + smooth ticks so the snowflake spinner animates for the
+		// whole duration. Output streams into the tree and is expandable
+		// via Ctrl+O; shellExitMsg stops the dock on completion.
+		if m.activityTree != nil {
+			m.activityTree.AppendOrUpdateExec(cmd, -1, 0, "")
+		}
+		m.startShimmer("Executing command...", "execute")
+		return m, tea.Batch(
+			m.streamShellCmd(cmd),
+			m.smoothStreamTickCmd(),
+			m.shimmerTickCmd(),
+		)
+	}
+
+	if userInput != "" {
+		m.currentPrompt = userInput
+		if m.showBanner {
+			m.showBanner = false
+		}
+		m.ti.SetValue("")
+		m.ti.Reset()
+		m.syncInputFromTI()
+
+		m.history = append(m.history, userInput)
+		m.historyIndex = len(m.history)
+		m.saveHistory()
+
+		m.push(roleUser, userInput)
+
+		// ── T=0MS SHIMMER: instant visual feedback ─────────────────
+		// Activate the loading shimmer BEFORE any orchestrator dispatch
+		// or synchronous context planning (planContextForAsk, intent
+		// classification) so the user sees the shimmer + tip dock
+		// immediately on Enter — zero perceived lag. streamCmd() will
+		// refine the shimmer text once the stream is ready; non-streaming
+		// early-return paths call stopShimmer() to clean up.
+		//
+		// CRITICAL: the shimmer tick AND the smooth stream tick are
+		// dispatched HERE, synchronously, as part of the returned batch —
+		// NOT only downstream inside streamCmd(). If the Enter handler
+		// returned without them, the first spinner.FrameMsg would be
+		// scheduled only after the (now async) context prep resolves, so
+		// the dock would sit frozen for the entire workspace scan. With
+		// them in the batch the loading line animates from the very first
+		// frame; streamCmd() re-schedules its own ticks when it runs.
+		shimmerAlreadyActive := m.shimmerActive
+		m.spinnerFrame = 0
+		m.startShimmer("Working...", "analyze")
+
+		m.streamStartTime = time.Now()
+		cmd := m.handleInput(userInput)
+		// ── CLEANUP: stop shimmer on non-streaming early returns ────
+		// If handleInput returned nil or a non-stream command (error,
+		// shell exec, pending confirm), the shimmer we started was never
+		// consumed by streamCmd — deactivate it so the dock clears.
+		// Guard: only stop if we freshly started it (not a leftover from
+		// a previous stream that hasn't been reconciled yet).
+		if cmd == nil && !shimmerAlreadyActive && m.shimmerActive {
+			m.stopShimmer()
+		}
+		// ── APPLICATION-LAYER COMMAND RECORD ──────────────────────
+		// The same submission is routed through the Runtime facade as a
+		// SubmitPromptCmd so the canonical command/event contract observes
+		// it. Nil-safe when no runtime is wired.
+		cmd = tea.Batch(cmd, m.runtimeSubmitCmd(userInput))
+		// ── INSTANT ANIMATION AT T=0MS ────────────────────────────
+		// Dispatch the shimmer + smooth ticks alongside the submission so
+		// the loading dock animates immediately, regardless of what the
+		// submitted command does next (async prep, stream, engine run).
+		// Both loops self-terminate when no background producer owns the
+		// flags, so idle submits leak nothing.
+		cmd = tea.Batch(cmd, m.shimmerTickCmd(), m.smoothStreamTickCmd())
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, cmd
+	}
+	m.ti.SetValue("")
+	m.ti.Reset()
+	m.syncInputFromTI()
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
+	return m, nil
 }

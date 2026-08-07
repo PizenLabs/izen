@@ -46,7 +46,28 @@ import (
 	verification "github.com/PizenLabs/izen/internal/verification"
 	"github.com/PizenLabs/izen/internal/workspace"
 	"github.com/PizenLabs/izen/pkg/control"
+	cmdreg "github.com/PizenLabs/izen/pkg/domain/command"
 )
+
+// resolveCommandToken canonicalizes a typed '/token' through the command
+// registry: registered aliases ("/q" → quit, "/?" → help) and unambiguous
+// prefixes ("/qu" → quit) resolve to the canonical command when that command
+// is a valid system command. Unknown or ambiguous tokens are returned
+// unchanged so the caller reports "unknown command" as before.
+func resolveCommandToken(token string) string {
+	if _, ok := validSystemCommands[token]; ok {
+		return token
+	}
+	d, ok := cmdreg.Default().LookupPrefix(cmdreg.MarkerSlash, strings.TrimPrefix(token, "/"))
+	if !ok {
+		return token
+	}
+	canonical := "/" + d.Name
+	if _, known := validSystemCommands[canonical]; known {
+		return canonical
+	}
+	return token
+}
 
 var validSystemCommands = map[string]struct{}{
 	"/help":             {},
@@ -1867,6 +1888,18 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return m.runReviewTestComposite()
 	}
 
+	// ── Alias / prefix resolution ───────────────────────────────────────
+	// Resolve registered aliases and unambiguous prefixes to their canonical
+	// command so "/q" executes as "/quit" instead of dumping "unknown
+	// command: /q" to the output. Args are preserved for prefixed commands
+	// ("/m claude" → "/model claude"); the trailing separator is trimmed so
+	// exact-match cases still fire for bare commands.
+	if resolved := resolveCommandToken(name[0]); resolved != name[0] {
+		cmd = resolved + " " + strings.Join(name[1:], " ")
+		name[0] = resolved
+		cmd = strings.TrimSpace(cmd)
+	}
+
 	if _, ok := validSystemCommands[name[0]]; !ok {
 		m.push(roleError, "unknown command: "+cmd)
 		m.refreshViewportContent()
@@ -1912,8 +1945,8 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case cmd == "/quit":
-		m.push(roleSystem, "goodbye.")
-		return m.cleanShutdownCmd()
+		m.beginQuitConfirm()
+		return nil
 
 	case cmd == "/usage":
 		return m.runUsageCmd()

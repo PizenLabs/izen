@@ -77,6 +77,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 	}()
 
+	// ── QUIT-CONFIRM MODAL INTERCEPT ─────────────────────────────────────
+	// While the exit-safety dialog is open, every key is routed to the modal
+	// handler: input is frozen and only [ No ]/[ Yes ] navigation, cancel, and
+	// confirm keys are honored. This runs before any other key routing so a
+	// stray keystroke can never dismiss or bypass the modal.
+	if m.pendingQuitConfirm {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			return m, m.handleQuitConfirmKey(keyMsg)
+		}
+	}
+
 	// ── UNBLOCKABLE EMERGENCY ESCAPE HATCH ────────────────────────────────
 	// Ctrl+C, Esc, and Ctrl+D are ALWAYS processed here, at the very top of
 	// the update loop, BEFORE any state gating or sub-component intercept. A
@@ -2908,10 +2919,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				m.navigateAutocomplete(1)
 				return m, nil
 			case tea.KeyTab:
-				m.completeAutocomplete()
+				m.completeAutocomplete(false)
 				return m, nil
 			case tea.KeyEnter:
-				m.completeAutocomplete()
+				// A unique whole-line suggestion completes and executes
+				// immediately ("/q" → "/quit"); anything else just completes
+				// the token under the caret and stays in the input.
+				if m.completeAutocomplete(true) {
+					return m.submitEnter()
+				}
 				return m, nil
 			case tea.KeySpace:
 				m.dismissAutocomplete()

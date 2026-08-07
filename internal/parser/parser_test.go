@@ -155,7 +155,7 @@ func TestParseAllowedDirectivesByWorkspace(t *testing.T) {
 
 func TestParsePermissionDeniedMessages(t *testing.T) {
 	pe := parseErrKind(t, "/ask $hot fix x", ErrPermissionDenied)
-	want := "parser: directive \"$hot\" requires write but workspace /ask grants read at 1:6"
+	want := "parser: command \"$hot\" requires write but workspace /ask grants read at 1:6"
 	if got := pe.Error(); got != want {
 		t.Errorf("Error() = %q, want %q", got, want)
 	}
@@ -184,10 +184,97 @@ func TestParseMultipleWorkspaces(t *testing.T) {
 	_ = parseErrKind(t, "/plan $hot /build", ErrMultipleWorkspaces)
 }
 
-func TestParseGlobalCommandRejected(t *testing.T) {
-	for _, input := range []string{"/build /help", "/help", "/usage", "/build /commit $hot"} {
-		_ = parseErrKind(t, input, ErrUnsupportedCommand)
+// TestParseGlobalCommandDeniedInReadOnlyWorkspace verifies the core DoD:
+// mutation-capable global commands embedded in an intent are denied when the
+// effective workspace lacks the required permission.
+func TestParseGlobalCommandDeniedInReadOnlyWorkspace(t *testing.T) {
+	pe := parseErrKind(t, "/undo", ErrPermissionDenied)
+	if pe.Marker != '/' || pe.Name != "undo" {
+		t.Errorf("denied token = %q%q, want /undo", pe.Marker, pe.Name)
 	}
+	if pe.Workspace != command.WorkspaceAsk {
+		t.Errorf("denied workspace = %v, want ask (default)", pe.Workspace)
+	}
+	for _, input := range []string{"/commit", "/checkpoint", "/ask /commit", "/plan /undo"} {
+		_ = parseErrKind(t, input, ErrPermissionDenied)
+	}
+}
+
+// TestParseUndoAllowedInBuild verifies the flip side: the same command parses
+// cleanly once the effective workspace grants write.
+func TestParseUndoAllowedInBuild(t *testing.T) {
+	ast := parseOK(t, "/build /undo")
+	if ast.Workspace != command.WorkspaceBuild {
+		t.Errorf("Workspace = %v, want build", ast.Workspace)
+	}
+	if len(ast.GlobalCommands) != 1 || ast.GlobalCommands[0].Name != "undo" {
+		t.Errorf("GlobalCommands = %+v, want [/undo]", ast.GlobalCommands)
+	}
+	// Order independence: the global command may precede the workspace marker.
+	if got := parseOK(t, "/undo /build"); !reflect.DeepEqual(got, ast) {
+		t.Errorf("/undo /build (%v) != /build /undo (%v)", got, ast)
+	}
+}
+
+// TestParseGlobalCommandAllowedInBuild verifies read-only globals and mutation
+// globals coexist with directives in a write-capable workspace.
+func TestParseGlobalCommandAllowedInBuild(t *testing.T) {
+	ast := parseOK(t, "/build /commit $hot fix deadlock")
+	if len(ast.GlobalCommands) != 1 || ast.GlobalCommands[0].Name != "commit" {
+		t.Errorf("GlobalCommands = %+v, want [/commit]", ast.GlobalCommands)
+	}
+	if len(ast.Directives) != 1 || ast.Directives[0].Name != "hot" {
+		t.Errorf("Directives = %+v, want [$hot]", ast.Directives)
+	}
+	// Read-only globals are valid in every workspace.
+	ask := parseOK(t, "/help")
+	if len(ask.GlobalCommands) != 1 || ask.GlobalCommands[0].Name != "help" {
+		t.Errorf("GlobalCommands = %+v, want [/help]", ask.GlobalCommands)
+	}
+}
+
+// TestParseGlobalCommandDeduplication verifies repeated global commands
+// collapse to a single descriptor.
+func TestParseGlobalCommandDeduplication(t *testing.T) {
+	ast := parseOK(t, "/build /undo /undo fix")
+	if len(ast.GlobalCommands) != 1 || ast.GlobalCommands[0].Name != "undo" {
+		t.Errorf("GlobalCommands = %+v, want exactly one [/undo]", ast.GlobalCommands)
+	}
+}
+
+// TestParseGlobalCommandCanonicalString verifies global commands render in the
+// canonical interaction-language form.
+func TestParseGlobalCommandCanonicalString(t *testing.T) {
+	if got := parseOK(t, "/build /undo fix x").String(); got != "/build /undo fix x" {
+		t.Errorf("String() = %q, want %q", got, "/build /undo fix x")
+	}
+}
+
+// TestParseAliasAndPrefixResolution verifies the native prefix/alias matcher:
+// "/q" and "/qu" resolve to the canonical /quit global command, and "$ho"
+// resolves to the $hot directive.
+func TestParseAliasAndPrefixResolution(t *testing.T) {
+	ast := parseOK(t, "/q")
+	if len(ast.GlobalCommands) != 1 || ast.GlobalCommands[0].Name != "quit" {
+		t.Errorf("Parse(/q) GlobalCommands = %+v, want [/quit]", ast.GlobalCommands)
+	}
+
+	build := parseOK(t, "/build /qu")
+	if len(build.GlobalCommands) != 1 || build.GlobalCommands[0].Name != "quit" {
+		t.Errorf("Parse(/build /qu) GlobalCommands = %+v, want [/quit]", build.GlobalCommands)
+	}
+
+	hot := parseOK(t, "/build $ho fix x")
+	if len(hot.Directives) != 1 || hot.Directives[0].Name != "hot" {
+		t.Errorf("Parse(/build $ho) Directives = %+v, want [$hot]", hot.Directives)
+	}
+}
+
+// TestParseAmbiguousPrefixRejected verifies ambiguous prefixes never resolve
+// to a wrong guess: "/u" could be undo or usage, so it stays unknown.
+func TestParseAmbiguousPrefixRejected(t *testing.T) {
+	_ = parseErrKind(t, "/u", ErrUnknownCommand)
+	_ = parseErrKind(t, "/build $t", ErrUnknownCommand) // test or trace
 }
 
 // TestParseCaseInsensitivity verifies marker names match regardless of case

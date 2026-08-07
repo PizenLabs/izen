@@ -171,6 +171,88 @@ func TestLookup(t *testing.T) {
 	}
 }
 
+// TestLookupAliases verifies registered aliases resolve to their canonical
+// descriptor: "/q" → "/quit" and "/?" → "/help".
+func TestLookupAliases(t *testing.T) {
+	tests := []struct {
+		marker rune
+		name   string
+		want   string
+		ok     bool
+	}{
+		{MarkerSlash, "q", "quit", true},
+		{MarkerSlash, "Q", "quit", true}, // case-insensitive alias
+		{MarkerSlash, "?", "help", true},
+		{MarkerSlash, "quit", "quit", true}, // canonical still resolves
+		{MarkerSlash, "help", "help", true},
+		{MarkerDollar, "q", "", false}, // alias family is marker-scoped
+	}
+	for _, tc := range tests {
+		d, ok := Default().Lookup(tc.marker, tc.name)
+		if ok != tc.ok {
+			t.Errorf("Lookup(%q, %q) ok = %v, want %v", tc.marker, tc.name, ok, tc.ok)
+			continue
+		}
+		if ok && d.Name != tc.want {
+			t.Errorf("Lookup(%q, %q) Name = %q, want %q", tc.marker, tc.name, d.Name, tc.want)
+		}
+	}
+}
+
+// TestLookupPrefixResolvesUnambiguousPrefixes verifies the native prefix
+// matcher: unambiguous prefixes resolve to the canonical descriptor.
+func TestLookupPrefixResolvesUnambiguousPrefixes(t *testing.T) {
+	tests := []struct {
+		marker rune
+		name   string
+		want   string
+		ok     bool
+	}{
+		{MarkerSlash, "q", "quit", true},   // alias
+		{MarkerSlash, "qu", "quit", true},  // unambiguous prefix
+		{MarkerSlash, "qui", "quit", true}, // unambiguous prefix
+		{MarkerSlash, "?", "help", true},   // alias
+		{MarkerSlash, "hel", "help", true},
+		{MarkerSlash, "b", "build", true}, // workspace prefix
+		{MarkerSlash, "u", "", false},     // ambiguous: undo + usage
+		{MarkerSlash, "p", "", false},     // ambiguous: plan + provider
+		{MarkerSlash, "bogus", "", false},
+		{MarkerDollar, "t", "", false}, // ambiguous: test + trace
+		{MarkerDollar, "ho", "hot", true},
+	}
+	for _, tc := range tests {
+		d, ok := Default().LookupPrefix(tc.marker, tc.name)
+		if ok != tc.ok {
+			t.Errorf("LookupPrefix(%q, %q) ok = %v, want %v", tc.marker, tc.name, ok, tc.ok)
+			continue
+		}
+		if ok && d.Name != tc.want {
+			t.Errorf("LookupPrefix(%q, %q) Name = %q, want %q", tc.marker, tc.name, d.Name, tc.want)
+		}
+	}
+}
+
+// TestAllExcludesAliases verifies aliases never pollute the enumeration: each
+// canonical command appears exactly once.
+func TestAllExcludesAliases(t *testing.T) {
+	all := NewDefault().All()
+	count := map[descriptorKey]int{}
+	for _, d := range all {
+		count[descriptorKey{marker: d.Marker, name: d.Name}]++
+	}
+	for key, n := range count {
+		if n != 1 {
+			t.Errorf("descriptor %+v appears %d times in All()", key, n)
+		}
+	}
+	if _, ok := count[descriptorKey{marker: MarkerSlash, name: "q"}]; ok {
+		t.Error("All() must not expose the alias /q as a separate command")
+	}
+	if _, ok := count[descriptorKey{marker: MarkerSlash, name: "quit"}]; !ok {
+		t.Error("All() must expose the canonical /quit command")
+	}
+}
+
 func TestLookupReturnsCopy(t *testing.T) {
 	r := NewDefault()
 	d, ok := r.Lookup(MarkerSlash, "build")
@@ -184,6 +266,112 @@ func TestLookupReturnsCopy(t *testing.T) {
 	}
 	if again.Name != "build" {
 		t.Errorf("Lookup returned a mutable alias; got %q", again.Name)
+	}
+}
+
+// TestGetAllowedGlobalCommandsAskHidesMutation verifies the primary DoD:
+// WorkspaceAsk must never expose mutation-capable global commands (/undo,
+// /commit, /checkpoint), while read-only globals remain available.
+func TestGetAllowedGlobalCommandsAskHidesMutation(t *testing.T) {
+	got := names(Default().GetAllowedGlobalCommands(WorkspaceAsk))
+	allowed := map[string]bool{}
+	for _, n := range got {
+		allowed[n] = true
+	}
+	for _, forbidden := range []string{"undo", "commit", "checkpoint"} {
+		if allowed[forbidden] {
+			t.Errorf("WorkspaceAsk must not expose /%s", forbidden)
+		}
+	}
+	for _, present := range []string{"arch", "clear", "drop", "usage", "model", "help"} {
+		if !allowed[present] {
+			t.Errorf("WorkspaceAsk must expose /%s, got %v", present, got)
+		}
+	}
+}
+
+// TestGetAllowedGlobalCommandsBuildExposesMutation verifies the flip side:
+// WorkspaceBuild grants every global command, including the mutation family.
+func TestGetAllowedGlobalCommandsBuildExposesMutation(t *testing.T) {
+	got := names(Default().GetAllowedGlobalCommands(WorkspaceBuild))
+	allowed := map[string]bool{}
+	for _, n := range got {
+		allowed[n] = true
+	}
+	for _, present := range []string{"undo", "commit", "checkpoint", "arch", "help", "usage"} {
+		if !allowed[present] {
+			t.Errorf("WorkspaceBuild must expose /%s, got %v", present, got)
+		}
+	}
+}
+
+// TestGetAllowedGlobalCommandsReadOnlyWorkspaces verifies the intermediate
+// workspaces: investigate/plan/review lack PermWrite so the mutation globals
+// stay hidden there too.
+func TestGetAllowedGlobalCommandsReadOnlyWorkspaces(t *testing.T) {
+	for _, ws := range []WorkspaceType{WorkspaceInvestigate, WorkspacePlan, WorkspaceReview} {
+		allowed := map[string]bool{}
+		for _, d := range Default().GetAllowedGlobalCommands(ws) {
+			allowed[d.Name] = true
+		}
+		for _, forbidden := range []string{"undo", "commit", "checkpoint"} {
+			if allowed[forbidden] {
+				t.Errorf("%s must not expose /%s", ws, forbidden)
+			}
+		}
+	}
+}
+
+// TestAllEnumeration verifies the full-surface projection consumed by the
+// suggestion engine: every workspace and global command under '/', every
+// directive under '$', sorted deterministically by marker then name.
+func TestAllEnumeration(t *testing.T) {
+	all := NewDefault().All()
+	if len(all) == 0 {
+		t.Fatal("All() returned an empty registry")
+	}
+	seen := map[descriptorKey]bool{}
+	var wsNames, globalNames, dollarNames []string
+	for _, d := range all {
+		key := descriptorKey{marker: d.Marker, name: d.Name}
+		if seen[key] {
+			t.Errorf("All() returned duplicate %q (marker %q)", d.Name, d.Marker)
+		}
+		seen[key] = true
+		switch d.Kind {
+		case KindWorkspace:
+			wsNames = append(wsNames, d.Name)
+		case KindGlobal:
+			globalNames = append(globalNames, d.Name)
+		case KindDirective:
+			dollarNames = append(dollarNames, d.Name)
+		}
+	}
+
+	if !equalStrings(wsNames, []string{"ask", "build", "investigate", "plan", "review"}) {
+		t.Errorf("workspace surface = %v", wsNames)
+	}
+	if !equalStrings(globalNames, []string{"arch", "checkpoint", "clear", "commit", "drop", "explain-decision", "help", "model", "objective", "provider", "quit", "session", "undo", "usage"}) {
+		t.Errorf("global surface = %v", globalNames)
+	}
+	if !equalStrings(dollarNames, []string{"diagnose", "env", "fix", "hot", "prompt", "run", "test", "trace"}) {
+		t.Errorf("dollar surface = %v", dollarNames)
+	}
+}
+
+// TestAllReturnsCopies verifies All() does not hand out mutable aliases into
+// the registry's internal map.
+func TestAllReturnsCopies(t *testing.T) {
+	r := NewDefault()
+	all := r.All()
+	for i := range all {
+		all[i].Name = "mutated"
+	}
+	again := r.All()
+	for _, d := range again {
+		if d.Name == "mutated" {
+			t.Errorf("All() returned a mutable alias for %q", d.Marker)
+		}
 	}
 }
 

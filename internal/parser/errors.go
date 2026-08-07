@@ -19,11 +19,12 @@ const (
 	ErrUnknownCommand
 	// ErrMultipleWorkspaces reports more than one /workspace marker.
 	ErrMultipleWorkspaces
-	// ErrUnsupportedCommand reports a global command (/help) embedded in an
-	// intent; such commands route through the command router, not the intent.
+	// ErrUnsupportedCommand is retained for API compatibility; global commands
+	// are now permission-checked rather than rejected outright.
 	ErrUnsupportedCommand
-	// ErrPermissionDenied reports a $ directive whose RequiredPerms is not a
-	// subset of the effective workspace's permission set.
+	// ErrPermissionDenied reports a $ directive or / global command whose
+	// RequiredPerms is not a subset of the effective workspace's permission
+	// set.
 	ErrPermissionDenied
 	// ErrNoChainSupport reports a descriptor in a chained (multi-marker) input
 	// whose SupportsChain flag is false.
@@ -79,7 +80,7 @@ func (e *ParseError) Error() string {
 	case ErrUnsupportedCommand:
 		fmt.Fprintf(&b, "parser: %q is a global command, not an intent construct", markerName(e.Marker, e.Name))
 	case ErrPermissionDenied:
-		fmt.Fprintf(&b, "parser: directive %q requires %s but workspace /%s grants %s",
+		fmt.Fprintf(&b, "parser: command %q requires %s but workspace /%s grants %s",
 			markerName(e.Marker, e.Name), e.Required, e.Workspace, e.Workspace.Permissions())
 	case ErrNoChainSupport:
 		fmt.Fprintf(&b, "parser: command %q does not support chaining", markerName(e.Marker, e.Name))

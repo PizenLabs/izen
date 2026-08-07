@@ -58,11 +58,16 @@ type ASTMetadata struct {
 
 // IntentAST is the deterministic, structured parse of a user input line. It
 // normalizes the order-independent marker language into a fixed shape:
-// workspace, directives, scopes, and the natural-language goal.
+// workspace, global commands, directives, scopes, and the natural-language
+// goal.
 type IntentAST struct {
 	// Workspace is the effective workflow context. When the input carries no
 	// /workspace marker, this defaults to WorkspaceAsk (the read-only context).
 	Workspace command.WorkspaceType
+	// GlobalCommands are the resolved / global command descriptors (/undo,
+	// /help, …), deduplicated and permission-checked against the effective
+	// workspace. Empty when the line carries no global command.
+	GlobalCommands []command.CommandDescriptor
 	// Directives are the resolved $ capability descriptors, deduplicated and
 	// permission-checked against the effective workspace.
 	Directives []command.CommandDescriptor
@@ -79,6 +84,9 @@ type IntentAST struct {
 func (a *IntentAST) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "/%s", a.Workspace)
+	for _, g := range a.GlobalCommands {
+		fmt.Fprintf(&b, " /%s", g.Name)
+	}
 	for _, d := range a.Directives {
 		fmt.Fprintf(&b, " $%s", d.Name)
 	}
