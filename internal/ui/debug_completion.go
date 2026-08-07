@@ -25,10 +25,24 @@ type completionLogEntry struct {
 	Stage        string `json:"stage,omitempty"`
 }
 
+// debugEnabled reports whether IZEN_DEBUG=1 or IZEN_DEBUG=true is set.
+func debugEnabled() bool {
+	switch os.Getenv("IZEN_DEBUG") {
+	case "1", "true":
+		return true
+	default:
+		return false
+	}
+}
+
 // debugLogCompletion appends one raw-completion composition record to
 // .izen/debug/completions.log. It is purely diagnostic — it never affects the
-// runtime path, and it is a strict no-op when the log cannot be written.
+// runtime path, and it is a strict no-op when the log cannot be written or
+// when IZEN_DEBUG is not enabled.
 func debugLogCompletion(raw string, tokIn, tokOut int, finishReason string, stage string) {
+	if !debugEnabled() {
+		return
+	}
 	dir := filepath.Join(".izen", "debug")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
