@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/pkg/event"
+	"github.com/PizenLabs/izen/pkg/ir"
+	"github.com/PizenLabs/izen/pkg/op"
 )
 
 // scriptedGenerator serves a scripted sequence of responses, consuming each
@@ -353,4 +355,151 @@ func TestResolveCapabilitiesForIntent(t *testing.T) {
 	if len(caps) != 1 || string(caps[0].ID()) != "generic_code" {
 		t.Errorf("unmatched intent should resolve generic_code, got %v", caps)
 	}
+}
+
+// TestPipelineRewriteStripsObsoleteContentFromPromptContext proves Phase 3's
+// core invariant: under a Redesign intent the StrategyResolver compiles
+// PolicyRewrite, which strips the obsolete workspace file contents from the
+// LLM prompt context (paths + directive only), and derives the execution mode
+// from that policy (one-shot greenfield, not the brownfield repair loop).
+func TestPipelineRewriteStripsObsoleteContentFromPromptContext(t *testing.T) {
+	root := t.TempDir()
+	const obsolete = `<div id="old">OUTDATED LAYOUT CONTENT</div>`
+	if err := os.WriteFile(filepath.Join(root, "index.html"),
+		[]byte("<!DOCTYPE html><html><body>"+obsolete+"</body></html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	gen := &scriptedGenerator{resp: []string{fenced("html", "index.html", portfolioPage)}}
+	p := mustPipeline(t, WithRoot(root), WithGenerator(gen))
+
+	intentIR := &ir.IntentIR{
+		Category:          ir.CategoryRedesign,
+		TargetType:        "portfolio",
+		PreserveWorkspace: false,
+	}
+	res, err := p.Run(t.Context(), Request{Intent: "redesign my portfolio website", IntentIR: intentIR})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if !strings.Contains(res.SystemPrompt, "index.html") {
+		t.Error("rewrite context must name the target path")
+	}
+	if !strings.Contains(res.SystemPrompt, "Do NOT preserve existing code") {
+		t.Error("rewrite context must inject the obsolete-content directive")
+	}
+	if strings.Contains(res.SystemPrompt, "OUTDATED LAYOUT CONTENT") {
+		t.Error("obsolete file contents leaked into the LLM prompt context")
+	}
+	if res.Mode != ModeGreenfield {
+		t.Errorf("mode = %s, want greenfield under PolicyRewrite", res.Mode)
+	}
+	got := readFile(t, filepath.Join(root, "index.html"))
+	if strings.Contains(got, "OUTDATED LAYOUT CONTENT") || !strings.Contains(got, "My Portfolio") {
+		t.Fatalf("index.html was not rewritten: %q", got)
+	}
+}
+
+// TestSemanticsFlowEntirelyThroughIntentIR proves OperationSemantics is derived
+// strictly from the compiled IntentIR.Category — there is no keyword
+// classification left in the pipeline layer.
+func TestSemanticsFlowEntirelyThroughIntentIR(t *testing.T) {
+	cases := []struct {
+		category ir.Category
+		want     op.OperationSemantics
+	}{
+		{ir.CategoryCreate, op.SemanticCreateProject},
+		{ir.CategoryRedesign, op.SemanticRewriteProject},
+		{ir.CategoryRefactor, op.SemanticRefactor},
+		{ir.CategoryFixBug, op.SemanticFixBug},
+	}
+	for _, c := range cases {
+		req := Request{IntentIR: &ir.IntentIR{Category: c.category}}
+		if got := semanticsForRequest(req); got != c.want {
+			t.Errorf("semanticsForRequest(category=%s) = %s, want %s", c.category, got, c.want)
+		}
+	}
+}
+
+// stubIntentCompiler is an injectable IntentCompiler for pipeline tests. It
+// records that it was triggered and returns a fixed compile result.
+type stubIntentCompiler struct {
+	out    ir.IntentIR
+	err    error
+	called bool
+}
+
+func (s *stubIntentCompiler) Compile(_ context.Context, _ string) (ir.IntentIR, error) {
+	s.called = true
+	return s.out, s.err
+}
+
+// TestPipelineHeadlessCompileTriggered proves a request without a compiled
+// IntentIR triggers the wired IntentCompiler, and that the compiled category
+// drives the policy and execution mode entirely through IntentIR — even for a
+// gibberish prompt with no recognizable keywords.
+func TestPipelineHeadlessCompileTriggered(t *testing.T) {
+	root := t.TempDir()
+	gen := &scriptedGenerator{resp: []string{fenced("html", "index.html", portfolioPage)}}
+	comp := &stubIntentCompiler{
+		out: ir.IntentIR{Category: ir.CategoryRedesign, TargetType: "portfolio", PreserveWorkspace: false},
+	}
+	p := mustPipeline(t, WithRoot(root), WithGenerator(gen), WithIntentCompiler(comp))
+
+	res, err := p.Run(t.Context(), Request{Intent: "lam lai cai website nay"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !comp.called {
+		t.Fatal("wired IntentCompiler was not triggered for an uncompiled request")
+	}
+	if res.IntentIR == nil || res.IntentIR.Category != ir.CategoryRedesign {
+		t.Fatalf("compiled intent not surfaced, got %+v", res.IntentIR)
+	}
+	if !strings.Contains(res.SystemPrompt, "Do NOT preserve existing code") {
+		t.Error("compiled redesign must compile to PolicyRewrite and strip obsolete context")
+	}
+	if res.Mode != ModeGreenfield {
+		t.Errorf("mode = %s, want greenfield under rewrite policy", res.Mode)
+	}
+}
+
+// TestPipelineHeadlessCompileFallbackDeterministic proves that when no
+// IntentCompiler is wired, or compilation fails, the pipeline falls back to the
+// compiler package's deterministic greenfield intent — never to keyword
+// guessing in the pipeline layer.
+func TestPipelineHeadlessCompileFallbackDeterministic(t *testing.T) {
+	t.Run("no compiler wired", func(t *testing.T) {
+		root := t.TempDir()
+		gen := &scriptedGenerator{resp: []string{fenced("html", "index.html", portfolioPage)}}
+		p := mustPipeline(t, WithRoot(root), WithGenerator(gen))
+		res, err := p.Run(t.Context(), Request{Intent: "zxb qwv redesign nothing recognizable"})
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.IntentIR == nil || res.IntentIR.Category != ir.CategoryCreate {
+			t.Fatalf("expected deterministic greenfield fallback, got %+v", res.IntentIR)
+		}
+		if strings.Contains(res.SystemPrompt, "Do NOT preserve existing code") {
+			t.Fatal("deterministic fallback must not compile to a rewrite policy")
+		}
+	})
+
+	t.Run("compilation fails", func(t *testing.T) {
+		root := t.TempDir()
+		gen := &scriptedGenerator{resp: []string{fenced("html", "index.html", portfolioPage)}}
+		failing := &stubIntentCompiler{err: errors.New("model timeout")}
+		p := mustPipeline(t, WithRoot(root), WithGenerator(gen), WithIntentCompiler(failing))
+		res, err := p.Run(t.Context(), Request{Intent: "build a portfolio website"})
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if !failing.called {
+			t.Fatal("IntentCompiler must be triggered before the fallback")
+		}
+		if res.IntentIR == nil || res.IntentIR.Category != ir.CategoryCreate {
+			t.Fatalf("expected deterministic greenfield fallback on compile failure, got %+v", res.IntentIR)
+		}
+	})
 }

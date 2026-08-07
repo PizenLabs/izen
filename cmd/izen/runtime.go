@@ -147,9 +147,17 @@ func runRuntimeCommand(args []string) error {
 	// intent compilation stage so no redundant disk sweeps occur.
 	kg := knowledge.NewKnowledgeGraph()
 
+	// The IntentCompiler is wired into the pipeline, which triggers it whenever
+	// a request carries no compiled intent. OperationSemantics is therefore
+	// always derived from a strongly-typed ir.Category — never from keyword
+	// lists in the pipeline layer.
+	intentCompiler := compiler.NewIntentCompiler(dir, &semanticExtractorAdapter{provider: provider, model: model}, compiler.WithKnowledgeGraph(kg))
+
 	pipeline, err := app.NewPipeline(
 		app.WithRoot(dir),
 		app.WithGenerator(&cliGenerator{provider: provider, model: model}),
+		app.WithKnowledgeGraph(kg),
+		app.WithIntentCompiler(intentCompiler),
 		// The interactive "Questions Before Implementation" component unblocks
 		// the pipeline when an ambiguous intent asks its questions.
 		app.WithClarifier(app.ClarifierFunc(func(ctx context.Context, questions []ir.ClarificationQuestion, resp chan<- ir.ClarificationResponse) error {
@@ -180,22 +188,7 @@ func runRuntimeCommand(args []string) error {
 	})
 	defer unsub()
 
-	// Compile the intent so a workspace conflict pauses the pipeline for
-	// clarification before anything is planned or written. The cheap
-	// knowledge-graph check skips the semantic extraction pass entirely when
-	// the workspace holds no application-level content, since a conflict is
-	// impossible there.
-	var intentIR *ir.IntentIR
-	if len(kg.Ensure(dir).AppTypes) > 0 {
-		c := compiler.NewIntentCompiler(dir, &semanticExtractorAdapter{provider: provider, model: model}, compiler.WithKnowledgeGraph(kg))
-		if compiled, cerr := c.Compile(ctx, prompt); cerr == nil {
-			intentIR = &compiled
-		} else {
-			fmt.Fprintf(os.Stderr, "izen: intent compilation skipped: %v\n", cerr)
-		}
-	}
-
-	res, runErr := pipeline.Run(ctx, app.Request{Intent: prompt, Targets: targets, IntentIR: intentIR})
+	res, runErr := pipeline.Run(ctx, app.Request{Intent: prompt, Targets: targets})
 
 	fmt.Println()
 	fmt.Println("── V3 pipeline audit trail ───────────────────────────────")

@@ -24,7 +24,6 @@ const (
 	// target alongside existing workspace content.
 	CategoryCreate Category = "create"
 	// CategoryRedesign re-plans an existing target's look, structure or
-	// content while preserving its purpose (e.g. "lam lai website",
 	// "redesign my portfolio").
 	CategoryRedesign Category = "redesign"
 	// CategoryRefactor restructures existing code without changing external

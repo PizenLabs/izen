@@ -15,6 +15,8 @@ import (
 	"github.com/PizenLabs/izen/pkg/extractor"
 	"github.com/PizenLabs/izen/pkg/ir"
 	"github.com/PizenLabs/izen/pkg/kernel"
+	"github.com/PizenLabs/izen/pkg/knowledge"
+	"github.com/PizenLabs/izen/pkg/op"
 	"github.com/PizenLabs/izen/pkg/planner"
 	"github.com/PizenLabs/izen/pkg/planner/brownfield"
 	"github.com/PizenLabs/izen/pkg/planner/greenfield"
@@ -96,6 +98,40 @@ func WithRoot(root string) Option {
 	return func(p *Pipeline) {
 		if root != "" {
 			p.root = root
+		}
+	}
+}
+
+// WithStrategyRegistry overrides the op.StrategyResolver registry used to
+// compile a ContextPolicy from the intent semantics. Defaults to the registry
+// of canonical resolvers.
+func WithStrategyRegistry(r *op.StrategyRegistry) Option {
+	return func(p *Pipeline) {
+		if r != nil {
+			p.strategy = r
+		}
+	}
+}
+
+// WithKnowledgeGraph overrides the shared RuntimeKnowledge graph used to list
+// workspace files, strip obsolete contents under PolicyRewrite and inject
+// bounded baseline context under PolicyEdit/PolicyPatch.
+func WithKnowledgeGraph(kg *knowledge.KnowledgeGraph) Option {
+	return func(p *Pipeline) {
+		if kg != nil {
+			p.kg = kg
+		}
+	}
+}
+
+// WithIntentCompiler wires the IntentCompiler the pipeline triggers when a
+// request carries no compiled ir.IntentIR, so OperationSemantics always derives
+// from a strongly-typed ir.Category. When absent, or when compilation fails,
+// the pipeline uses the compiler package's deterministic headless fallback.
+func WithIntentCompiler(c IntentCompiler) Option {
+	return func(p *Pipeline) {
+		if c != nil {
+			p.compiler = c
 		}
 	}
 }
@@ -233,10 +269,12 @@ func fileExists(root, name string) bool {
 // strictly after the validation gate, so no unvalidated content ever reaches
 // disk.
 //
-// A compiled intent that resolved to "replace the workspace" (PreserveWorkspace
-// false) forces the greenfield one-shot planner in auto mode, since keeping the
-// brownfield repair loop would contradict the user's explicit replacement.
-func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artifact, intentIR *ir.IntentIR) (*planner.PlanResult, Mode, *brownfield.BrownfieldPlanner, error) {
+// Execution modes derive strictly from the compiled ContextPolicy: a
+// PolicyRewrite (total replacement) forces the one-shot greenfield planner,
+// because keeping the brownfield repair loop would contradict the user's
+// explicit replacement. A compiled intent that resolved to PreserveWorkspace
+// false does the same.
+func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artifact, intentIR *ir.IntentIR, policy op.ContextPolicy) (*planner.PlanResult, Mode, *brownfield.BrownfieldPlanner, error) {
 	useBrownfield := p.mode == ModeBrownfield
 	if p.mode == ModeAuto {
 		bf, err := p.detect(p.root)
@@ -245,7 +283,7 @@ func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artif
 		}
 		useBrownfield = bf
 	}
-	if intentIR != nil && !intentIR.PreserveWorkspace {
+	if policy == op.PolicyRewrite || (intentIR != nil && !intentIR.PreserveWorkspace) {
 		useBrownfield = false
 	}
 

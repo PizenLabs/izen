@@ -97,3 +97,18 @@ func copyEntities(src map[string]string) map[string]string {
 	}
 	return out
 }
+
+// DeterministicIntent is the deterministic, language-agnostic headless fallback
+// an outer layer (e.g. the pipeline) uses when a prompt cannot be compiled —
+// no extractor is wired, the model fails, or no compiler exists at all. It
+// never guesses categories from keyword lists: the category is always
+// greenfield creation (the least destructive, context-neutral default that
+// maps to a generate policy) and the target type is the canonical workspace
+// label, so the returned value always validates.
+func DeterministicIntent() ir.IntentIR {
+	return ir.IntentIR{
+		Category:          ir.CategoryCreate,
+		TargetType:        "workspace",
+		PreserveWorkspace: true,
+	}
+}

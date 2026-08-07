@@ -19,10 +19,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PizenLabs/izen/pkg/app/compiler"
 	"github.com/PizenLabs/izen/pkg/capability"
 	"github.com/PizenLabs/izen/pkg/event"
 	"github.com/PizenLabs/izen/pkg/extractor"
 	"github.com/PizenLabs/izen/pkg/ir"
+	"github.com/PizenLabs/izen/pkg/knowledge"
+	"github.com/PizenLabs/izen/pkg/op"
 	"github.com/PizenLabs/izen/pkg/planner"
 )
 
@@ -66,6 +69,15 @@ type ClarifierFunc func(ctx context.Context, questions []ir.ClarificationQuestio
 // Clarify implements Clarifier.
 func (f ClarifierFunc) Clarify(ctx context.Context, questions []ir.ClarificationQuestion, resp chan<- ir.ClarificationResponse) error {
 	return f(ctx, questions, resp)
+}
+
+// IntentCompiler is the contract the pipeline triggers to compile a raw prompt
+// into a strongly-typed ir.IntentIR when a request carries none. It is
+// implemented by *compiler.IntentCompiler and is injectable for tests.
+type IntentCompiler interface {
+	// Compile translates a raw prompt into a fully-bound ir.IntentIR, or
+	// returns an error when the semantic extractor cannot produce one.
+	Compile(ctx context.Context, raw string) (ir.IntentIR, error)
 }
 
 // Request is a single pipeline invocation.
@@ -146,6 +158,10 @@ type Pipeline struct {
 	maxAttempts int
 	maxRepairs  int
 
+	strategy *op.StrategyRegistry
+	kg       *knowledge.KnowledgeGraph
+	compiler IntentCompiler
+
 	eventsMu sync.Mutex
 	events   []event.Event
 }
@@ -165,6 +181,8 @@ func NewPipeline(opts ...Option) (*Pipeline, error) {
 		modelTier:   "full",
 		maxAttempts: 3,
 		maxRepairs:  2,
+		strategy:    op.NewStrategyRegistry(),
+		kg:          knowledge.NewKnowledgeGraph(),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -200,6 +218,16 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 	}
 
 	res := &Result{Intent: req.Intent}
+
+	// Headless guard: when the caller supplies no compiled intent, the pipeline
+	// triggers the IntentCompiler so OperationSemantics is derived strictly from
+	// a strongly-typed ir.Category — never from keyword lists in this layer.
+	// Conversational prompts skip compilation and short-circuit below.
+	if req.IntentIR == nil && !IsConversationalIntent(req.Intent) {
+		compiled := p.compileIntent(ctx, req.Intent)
+		req.IntentIR = &compiled
+	}
+
 	if req.IntentIR != nil {
 		intentCopy := *req.IntentIR
 		intentCopy.Entities = copyMap(req.IntentIR.Entities)
@@ -233,13 +261,27 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 		return res, nil
 	}
 
-	// Stage 1 — Policy & capability resolution.
+	// Stage 1 — Policy & capability resolution. The StrategyResolver registry
+	// compiles the intent semantics into a ContextPolicy that governs how the
+	// prompt context is assembled: PolicyRewrite strips obsolete file contents
+	// and declares User Intent the absolute source of truth; PolicyEdit/Patch
+	// inject bounded baseline code; PolicyGenerate injects none.
 	caps, err := ResolveCapabilitiesForIntent(p.registry, req.Intent)
 	if err != nil {
 		return nil, fmt.Errorf("app: resolve capabilities: %w", err)
 	}
 	res.Capabilities = caps
-	res.SystemPrompt = p.buildSystemPrompt(caps, req.Targets)
+
+	semantics := semanticsForRequest(req)
+	if p.kg != nil {
+		p.kg.Ensure(p.root)
+	}
+	builder := NewPromptBuilder(p.strategy, p.kg,
+		WithBuilderRoot(p.root),
+		WithBuilderModelTier(p.modelTier))
+	policy := builder.CompilePolicy(semantics)
+	res.SystemPrompt = builder.BuildSystem(policy, caps, req.Targets)
+	userPrompt := builder.BuildUser(policy, req.Intent, req.Targets)
 	p.emitStage(ctx, "capability.resolve")
 
 	// Stages 2-5 — generate, extract, evaluate evidence, validate. A
@@ -256,7 +298,7 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 		}
 		attempts++
 
-		raw, err = p.generate(ctx, res.SystemPrompt, p.userPrompt(req))
+		raw, err = p.generate(ctx, res.SystemPrompt, userPrompt)
 		if err != nil {
 			return nil, fmt.Errorf("app: generation: %w", err)
 		}
@@ -294,7 +336,7 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 
 	// Stage 6 — Planning & strategy selection.
 	p.emitStage(ctx, "plan")
-	planResult, planMode, bfPlanner, err := p.plan(ctx, req.Intent, res.Artifacts, req.IntentIR)
+	planResult, planMode, bfPlanner, err := p.plan(ctx, req.Intent, res.Artifacts, req.IntentIR, policy)
 	if err != nil {
 		return nil, fmt.Errorf("app: plan: %w", err)
 	}
@@ -442,35 +484,27 @@ func (p *Pipeline) validate(ctx context.Context, caps []capability.Capability, a
 	return out
 }
 
-// buildSystemPrompt assembles the capability-constrained system prompt from
-// the resolved capability set.
-func (p *Pipeline) buildSystemPrompt(caps []capability.Capability, targets []string) string {
-	var b strings.Builder
-	b.WriteString("You are Izen, the human-centered coding engine. Route the user's intent into a coherent set of workspace files that Izen writes for you.\n")
-	if len(targets) > 0 {
-		b.WriteString("\nWorkspace target files already referenced:\n")
-		for _, t := range targets {
-			b.WriteString("  - " + t + "\n")
-		}
-	}
-	b.WriteString("\nACTIVE CAPABILITIES (enforce every constraint, never fall back to a generic template):\n")
-	for _, c := range caps {
-		b.WriteString(c.PromptRepresentation(p.modelTier) + "\n")
-	}
-	b.WriteString("\nOUTPUT FORMAT\n")
-	b.WriteString("Emit exactly one fenced block per file. The fence header MUST name the language and the workspace-relative target path:\n")
-	b.WriteString("```html:index.html\n<!DOCTYPE html>\n...\n```\n")
-	b.WriteString("A fence header is always \"```lang:path\" where path is the relative file location (e.g. html:index.html, go:main.go, css:styles/main.css). Plain code fences without a :path header, or prose, will be rejected.\n")
-	b.WriteString("You may add brief narration before the blocks. Never write to disk yourself.\n")
-	return b.String()
+// semanticsForRequest derives the OperationSemantics of a request strictly
+// from the compiled intent's category. It is the sole translation seam between
+// the Intent Compiler and the strategy layer: no keyword guessing happens in
+// the pipeline. The caller guarantees req.IntentIR is non-nil (Run compiles
+// or falls back before reaching here).
+func semanticsForRequest(req Request) op.OperationSemantics {
+	return op.SemanticsFromCategory(req.IntentIR.Category)
 }
 
-// userPrompt folds targets into the user-facing prompt.
-func (p *Pipeline) userPrompt(req Request) string {
-	if len(req.Targets) == 0 {
-		return req.Intent
+// compileIntent triggers the wired IntentCompiler when a request carries no
+// compiled ir.IntentIR. When no compiler is wired, or the model cannot compile
+// the prompt, the deterministic language-agnostic fallback from the compiler
+// package is returned. OperationSemantics therefore always derives from a
+// strongly-typed ir.Category — never from keyword lists in this layer.
+func (p *Pipeline) compileIntent(ctx context.Context, raw string) ir.IntentIR {
+	if p.compiler != nil {
+		if compiled, err := p.compiler.Compile(ctx, raw); err == nil {
+			return compiled
+		}
 	}
-	return req.Intent + "\n\nWorkspace context files: " + strings.Join(req.Targets, ", ")
+	return compiler.DeterministicIntent()
 }
 
 // emitStage publishes a pipeline stage checkpoint on the shared bus.
@@ -593,37 +627,6 @@ func ResolveCapabilitiesForIntent(reg *capability.Registry, intent string) ([]ca
 	}
 	return reg.Resolve(ids...)
 }
-
-// IsConversationalIntent reports whether intent is a conversational prompt
-// (greeting, small talk, identity/memory question, or a read-only explain)
-// that runs as a direct chat pass instead of the code-generation pipeline.
-func IsConversationalIntent(intent string) bool {
-	lower := strings.ToLower(strings.TrimSpace(intent))
-	if len(lower) < 3 {
-		return true
-	}
-	switch lower {
-	case "hi", "hello", "hey", "yo", "sup", "hiya", "howdy":
-		return true
-	}
-	for _, g := range []string{"hi ", "hello ", "hey ", "how are you", "what's up", "good morning", "good evening", "yo "} {
-		if strings.HasPrefix(lower, g) && len(lower) <= len(g)+8 {
-			return true
-		}
-	}
-	for _, p := range []string{
-		"who are you", "what are you", "what can you do", "do you remember",
-		"thank you", "thanks", "explain ", "explain:", "describe ", "what is ", "what does ", "what's ",
-	} {
-		if strings.HasPrefix(lower, p) {
-			return true
-		}
-	}
-	return false
-}
-
-const chatSystemPrompt = "You are Izen, the human-centered coding engine. " +
-	"Answer the user's question directly and conversationally."
 
 // appendExtractionFailure re-prompts the model with the evidence payload of a
 // rejected extraction.

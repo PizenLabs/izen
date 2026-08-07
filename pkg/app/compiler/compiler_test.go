@@ -685,3 +685,21 @@ func TestSortedKeys(t *testing.T) {
 		t.Errorf("SortedKeys = %v, want [portfolio todo_app]", got)
 	}
 }
+
+// TestDeterministicIntent proves the headless fallback is deterministic,
+// language-agnostic (no keyword guessing) and always valid.
+func TestDeterministicIntent(t *testing.T) {
+	got := DeterministicIntent()
+	if got.Category != ir.CategoryCreate {
+		t.Errorf("Category = %s, want %s", got.Category, ir.CategoryCreate)
+	}
+	if got.TargetType == "" {
+		t.Error("TargetType must be non-empty")
+	}
+	if !got.PreserveWorkspace {
+		t.Error("deterministic fallback must preserve the workspace")
+	}
+	if err := got.Validate(); err != nil {
+		t.Errorf("deterministic fallback must validate: %v", err)
+	}
+}
