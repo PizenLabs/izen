@@ -2603,38 +2603,37 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 	// JSON tool definitions stripped that enforces plain markdown code blocks
 	// (```lang:path) instead — a small model loops on tool-call JSON syntax, so
 	// it must be steered straight to raw code fences.
-	var goals []string
-	for i, t := range tasks {
-		goals = append(goals, fmt.Sprintf("Task %d [%s]\nTarget file: %s\nDescription: %s", i+1, t.Type, t.Target, t.Description))
-	}
+	//
+	// ── REWRITE CONTEXT SANITIZATION (TaskContext hygiene) ────────────
+	// Under a full-rewrite intent (CLEAR ALL EXISTING CODE / redesign /
+	// rewrite / brand-new-from-scratch) the current workspace file contents are
+	// OBSOLETE. fastTrackGoals and fastTrackFileContext strip the old file
+	// bytes and carry ONLY the explicit user intent, the target filename and
+	// the create-from-scratch directive — never the old implementation — so
+	// the model can never anchor on it (e.g. regenerating the To-Do App
+	// instead of the requested Portfolio).
 	m.currentBuildTaskID = 0 // unified session, no single task tracking
+	intent := m.buildIntentContext()
 
-	// ── Build context for each target file ────────────────────────
-	// Include current file contents for existing targets so the LLM
-	// can produce correct apply_patch operations in a single pass.
-	var fileContext strings.Builder
+	var targets []string
 	seen := make(map[string]bool)
 	for _, t := range tasks {
 		if seen[t.Target] {
 			continue
 		}
 		seen[t.Target] = true
-		if data, err := os.ReadFile(t.Target); err == nil {
-			ext := filepath.Ext(t.Target)
-			lang := strings.TrimPrefix(ext, ".")
-			if lang == "" {
-				lang = "text"
+		targets = append(targets, t.Target)
+	}
+	fileContext := fastTrackFileContext(intent, targets, os.ReadFile)
+	if !isFullRewriteIntent(intent) && m.activityTree != nil {
+		for _, target := range targets {
+			if data, err := os.ReadFile(target); err == nil {
+				m.activityTree.Append(NewFileReadEvent(target, int64(len(data)), 0))
 			}
-			fmt.Fprintf(&fileContext, "## Current Content of: %s\n```%s\n%s\n```\n\n", t.Target, lang, string(data))
-			if m.activityTree != nil {
-				m.activityTree.Append(NewFileReadEvent(t.Target, int64(len(data)), 0))
-			}
-		} else {
-			fmt.Fprintf(&fileContext, "## Target File: %s (does not yet exist)\n\n", t.Target)
 		}
 	}
 
-	fullPrompt := prompt.FastTrackPromptForTier(m.promptTier(), fileContext.String(), strings.Join(goals, "\n\n---\n\n"))
+	fullPrompt := prompt.FastTrackPromptForTier(m.promptTier(), fileContext, fastTrackGoals(intent, tasks))
 
 	// ── Build system and request ──────────────────────────────────
 	// The system prompt is tier-adapted: SLM models receive the compact
@@ -2914,6 +2913,10 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		// (finish_reason == "length") gracefully by recovering partial
 		// tool calls from the ToolCallBuffer.
 		tokIn, tokOut := streamUsage()
+		finishReason := ""
+		if frp, ok := rawStream.(ai.FinishReasonProvider); ok {
+			finishReason = frp.FinishReason()
+		}
 		var patches []*execution.Patch
 		if len(toolCalls) > 0 {
 			if m.toolCallBuffer != nil {
@@ -2943,15 +2946,22 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			}
 		}
 
-		finalOutput := fullContent.String()
-		// Include buffered reasoning in the output for proposal extraction
-		if reasoningBuf.Len() > 0 {
-			if finalOutput != "" {
-				finalOutput = reasoningBuf.String() + "\n" + finalOutput
-			} else {
-				finalOutput = reasoningBuf.String()
-			}
+		// ── FINAL OUTPUT ASSEMBLY (reasoning-token hygiene) ────────────
+		// Reasoning/thinking text is STRIPPED from the output handed to
+		// proposal extraction: prepending <thought> chain-of-thought text
+		// previously leaked into extractBuildProposals (fake FILE:/fence
+		// matches → garbage proposals) and inflated the reported completion
+		// tokens while the visible code stayed tiny. VisibleCompletion strips
+		// thinking blocks; reasoning is only used as the output when content
+		// is entirely absent (models that emit their whole answer in
+		// reasoning_content, e.g. Cohere North Mini).
+		finalOutput := ai.VisibleCompletion(fullContent.String())
+		if strings.TrimSpace(finalOutput) == "" && reasoningBuf.Len() > 0 {
+			finalOutput = ai.VisibleCompletion(reasoningBuf.String())
 		}
+		// Dump the raw-vs-visible completion composition (content len vs
+		// stripped reasoning len, provider tokens, truncation) for audit.
+		debugLogCompletion(fullContent.String(), tokIn, tokOut, finishReason, "build.fasttrack")
 
 		select {
 		case streamCh <- buildProposalReadyMsg{

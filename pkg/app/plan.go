@@ -13,8 +13,11 @@ import (
 	"github.com/PizenLabs/izen/pkg/capability"
 	"github.com/PizenLabs/izen/pkg/event"
 	"github.com/PizenLabs/izen/pkg/extractor"
+	txfs "github.com/PizenLabs/izen/pkg/fs"
 	"github.com/PizenLabs/izen/pkg/ir"
 	"github.com/PizenLabs/izen/pkg/kernel"
+	"github.com/PizenLabs/izen/pkg/knowledge"
+	"github.com/PizenLabs/izen/pkg/op"
 	"github.com/PizenLabs/izen/pkg/planner"
 	"github.com/PizenLabs/izen/pkg/planner/brownfield"
 	"github.com/PizenLabs/izen/pkg/planner/greenfield"
@@ -70,6 +73,18 @@ func WithGenerator(g Generator) Option {
 	}
 }
 
+// WithClarifier binds the interactive clarifier the pipeline blocks on when an
+// ambiguous intent asks its questions. A TUI host wires the AskModel here;
+// when absent, ambiguous intents auto-resolve to their default options so
+// headless runs never hang.
+func WithClarifier(c Clarifier) Option {
+	return func(p *Pipeline) {
+		if c != nil {
+			p.clarifier = c
+		}
+	}
+}
+
 // WithEventBus overrides the shared event bus. A bus is created when absent.
 func WithEventBus(bus *event.MemoryEventBus) Option {
 	return func(p *Pipeline) {
@@ -84,6 +99,40 @@ func WithRoot(root string) Option {
 	return func(p *Pipeline) {
 		if root != "" {
 			p.root = root
+		}
+	}
+}
+
+// WithStrategyRegistry overrides the op.StrategyResolver registry used to
+// compile a ContextPolicy from the intent semantics. Defaults to the registry
+// of canonical resolvers.
+func WithStrategyRegistry(r *op.StrategyRegistry) Option {
+	return func(p *Pipeline) {
+		if r != nil {
+			p.strategy = r
+		}
+	}
+}
+
+// WithKnowledgeGraph overrides the shared RuntimeKnowledge graph used to list
+// workspace files, strip obsolete contents under PolicyRewrite and inject
+// bounded baseline context under PolicyEdit/PolicyPatch.
+func WithKnowledgeGraph(kg *knowledge.KnowledgeGraph) Option {
+	return func(p *Pipeline) {
+		if kg != nil {
+			p.kg = kg
+		}
+	}
+}
+
+// WithIntentCompiler wires the IntentCompiler the pipeline triggers when a
+// request carries no compiled ir.IntentIR, so OperationSemantics always derives
+// from a strongly-typed ir.Category. When absent, or when compilation fails,
+// the pipeline uses the compiler package's deterministic headless fallback.
+func WithIntentCompiler(c IntentCompiler) Option {
+	return func(p *Pipeline) {
+		if c != nil {
+			p.compiler = c
 		}
 	}
 }
@@ -143,6 +192,17 @@ func WithMaxRepairs(n int) Option {
 	return func(p *Pipeline) {
 		if n > 0 {
 			p.maxRepairs = n
+		}
+	}
+}
+
+// WithTxFS overrides the transactional file system artifact writes stage
+// through. Defaults to a TxFS bound to the pipeline workspace root. The bound
+// root must match the pipeline root; it is reused across runs.
+func WithTxFS(tx *txfs.TxFS) Option {
+	return func(p *Pipeline) {
+		if tx != nil {
+			p.tx = tx
 		}
 	}
 }
@@ -220,7 +280,16 @@ func fileExists(root, name string) bool {
 // greenfield or brownfield planner. Parent directories are created here,
 // strictly after the validation gate, so no unvalidated content ever reaches
 // disk.
-func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artifact) (*planner.PlanResult, Mode, *brownfield.BrownfieldPlanner, error) {
+//
+// Execution modes derive strictly from the compiled ContextPolicy: a
+// PolicyRewrite (total replacement) forces the one-shot greenfield planner,
+// because keeping the brownfield repair loop would contradict the user's
+// explicit replacement. A compiled intent that resolved to PreserveWorkspace
+// false does the same. The decision is delegated to
+// planner.ExecutionModeForPolicy so the planner layer owns the strict
+// greenfield guarantee: every rewrite artifact is a Direct Full-File
+// Overwrite and the Search/Replace diff path is disabled for the run.
+func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artifact, intentIR *ir.IntentIR, policy op.ContextPolicy) (*planner.PlanResult, Mode, *brownfield.BrownfieldPlanner, error) {
 	useBrownfield := p.mode == ModeBrownfield
 	if p.mode == ModeAuto {
 		bf, err := p.detect(p.root)
@@ -229,12 +298,29 @@ func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artif
 		}
 		useBrownfield = bf
 	}
+	var preserve *bool
+	if intentIR != nil {
+		pv := intentIR.PreserveWorkspace
+		preserve = &pv
+	}
+	if planner.ExecutionModeForPolicy(policy == op.PolicyRewrite, preserve) == planner.ModeGreenfield {
+		useBrownfield = false
+	}
 
-	if err := ensureParentDirs(p.root, artifacts); err != nil {
+	// Reject any artifact path that escapes the workspace root before a single
+	// directory is created or byte is written.
+	if err := validateArtifactPaths(p.root, artifacts); err != nil {
 		return nil, ModeAuto, nil, err
 	}
 
 	if useBrownfield {
+		// Brownfield writes and its verify command run against the live
+		// workspace, so parent directories are created eagerly here. The
+		// greenfield path defers directory creation to TxFS.Commit, letting a
+		// failed run roll the workspace back to a completely pristine state.
+		if err := ensureParentDirs(p.root, artifacts); err != nil {
+			return nil, ModeAuto, nil, err
+		}
 		verify := p.verify
 		if verify == nil {
 			verify = detectVerifyCommand
@@ -254,7 +340,7 @@ func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artif
 		return res, ModeBrownfield, bf, nil
 	}
 
-	gf := greenfield.NewGreenfieldPlanner(p.root)
+	gf := greenfield.NewGreenfieldPlanner(p.root, greenfield.WithTxFS(p.tx))
 	res, err := gf.Plan(ctx, intent, artifacts)
 	if err != nil {
 		return nil, ModeGreenfield, nil, err
@@ -262,12 +348,33 @@ func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artif
 	return res, ModeGreenfield, nil, nil
 }
 
+// fullOverwriteActive reports whether a run must treat every generated
+// artifact as a Direct Full-File Overwrite: the compiled ContextPolicy is
+// PolicyRewrite (total replacement/redesign) or the compiled intent does not
+// preserve the workspace. When true, the Search/Replace diff path is disabled
+// and workspace file reads are sanitized so obsolete content can never anchor
+// the model or re-enter its context.
+func fullOverwriteActive(policy op.ContextPolicy, intentIR *ir.IntentIR) bool {
+	if policy == op.PolicyRewrite {
+		return true
+	}
+	return intentIR != nil && !intentIR.PreserveWorkspace
+}
+
 // execute runs the planned graph on the kernel engine, dispatching side
-// effects exclusively through the shared event bus. Brownfield graphs run
-// through the closed-loop repair loop.
+// effects exclusively through the shared event bus. Before any file is
+// touched, the plan's artifact writes are sequenced through the execution DAG
+// and checked for cyclic inter-file dependencies. Brownfield graphs run
+// through the closed-loop repair loop; greenfield writes stage through the
+// pipeline's TxFS transaction and reach disk only at Commit.
 func (p *Pipeline) execute(ctx context.Context, planResult *planner.PlanResult, mode Mode, bf *brownfield.BrownfieldPlanner) error {
 	if planResult == nil || planResult.Graph == nil {
 		return errors.New("app: plan produced no graph")
+	}
+	// Sequence the artifact application through the DAG topological order and
+	// reject any cyclic dependency before a single file is written.
+	if _, err := planExecutionOrder(planResult.Artifacts); err != nil {
+		return fmt.Errorf("app: execution order: %w", err)
 	}
 	engine := kernel.NewEngine(p.bus)
 	if mode == ModeBrownfield && bf != nil {

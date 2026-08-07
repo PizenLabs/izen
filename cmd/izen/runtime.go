@@ -12,7 +12,11 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/pkg/app"
+	"github.com/PizenLabs/izen/pkg/app/compiler"
 	"github.com/PizenLabs/izen/pkg/event"
+	"github.com/PizenLabs/izen/pkg/ir"
+	"github.com/PizenLabs/izen/pkg/knowledge"
+	"github.com/PizenLabs/izen/pkg/tui/components/ask"
 )
 
 // runRuntimeUsage describes the `izen run` subcommand.
@@ -52,6 +56,31 @@ type cliGenerator struct {
 func (g *cliGenerator) Complete(ctx context.Context, system, prompt string, _ int) (string, error) {
 	resp, err := g.provider.Execute(ctx, ai.Request{
 		Model:    g.model,
+		System:   system,
+		Messages: []ai.Message{{Role: "user", Content: prompt}},
+		Stream:   false,
+	})
+	if err != nil {
+		return "", err
+	}
+	if resp == nil {
+		return "", errors.New("provider returned an empty response")
+	}
+	return resp.Content, nil
+}
+
+// semanticExtractorAdapter adapts the configured ai.Provider to the intent
+// compiler's SemanticExtractor contract so the compiler stays free of a
+// concrete AI dependency.
+type semanticExtractorAdapter struct {
+	provider ai.Provider
+	model    string
+}
+
+// Extract implements compiler.SemanticExtractor.
+func (e *semanticExtractorAdapter) Extract(ctx context.Context, system, prompt string) (string, error) {
+	resp, err := e.provider.Execute(ctx, ai.Request{
+		Model:    e.model,
 		System:   system,
 		Messages: []ai.Message{{Role: "user", Content: prompt}},
 		Stream:   false,
@@ -114,13 +143,42 @@ func runRuntimeCommand(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "izen: v3 engine provider=%s model=%s root=%s\n", provider.Name(), model, dir)
 
+	// A shared RuntimeKnowledge graph caches the workspace scan across the
+	// intent compilation stage so no redundant disk sweeps occur.
+	kg := knowledge.NewKnowledgeGraph()
+
+	// The IntentCompiler is wired into the pipeline, which triggers it whenever
+	// a request carries no compiled intent. OperationSemantics is therefore
+	// always derived from a strongly-typed ir.Category — never from keyword
+	// lists in the pipeline layer.
+	intentCompiler := compiler.NewIntentCompiler(dir, &semanticExtractorAdapter{provider: provider, model: model}, compiler.WithKnowledgeGraph(kg))
+
 	pipeline, err := app.NewPipeline(
 		app.WithRoot(dir),
 		app.WithGenerator(&cliGenerator{provider: provider, model: model}),
+		app.WithKnowledgeGraph(kg),
+		app.WithIntentCompiler(intentCompiler),
+		// The interactive "Questions Before Implementation" component unblocks
+		// the pipeline when an ambiguous intent asks its questions.
+		app.WithClarifier(app.ClarifierFunc(func(ctx context.Context, questions []ir.ClarificationQuestion, resp chan<- ir.ClarificationResponse) error {
+			r, err := ask.Run(ctx, questions)
+			if err != nil {
+				return err
+			}
+			select {
+			case resp <- r:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})),
 	)
 	if err != nil {
 		return fmt.Errorf("izen run: build v3 pipeline: %w", err)
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
 
 	// Attach a terminal status observer rendering kernel task and pipeline
 	// stage updates on stderr as they happen. A TUI subscribes with the same
@@ -130,9 +188,6 @@ func runRuntimeCommand(args []string) error {
 	})
 	defer unsub()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
 	res, runErr := pipeline.Run(ctx, app.Request{Intent: prompt, Targets: targets})
 
 	fmt.Println()
@@ -140,6 +195,15 @@ func runRuntimeCommand(args []string) error {
 	if res != nil {
 		if res.Mode != "" {
 			fmt.Printf("mode: %s\n", res.Mode)
+		}
+		if res.IntentIR != nil && len(res.IntentIR.ClarificationQuestions) > 0 {
+			for _, q := range res.IntentIR.ClarificationQuestions {
+				choice := q.SelectedOption
+				if q.CustomAnswer != "" {
+					choice += " (" + q.CustomAnswer + ")"
+				}
+				fmt.Printf("clarified: %s -> %s\n", q.Header, choice)
+			}
 		}
 		if len(res.Capabilities) > 0 {
 			ids := make([]string, 0, len(res.Capabilities))

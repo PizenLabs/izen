@@ -19,10 +19,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PizenLabs/izen/pkg/app/compiler"
 	"github.com/PizenLabs/izen/pkg/capability"
 	"github.com/PizenLabs/izen/pkg/event"
 	"github.com/PizenLabs/izen/pkg/extractor"
+	txfs "github.com/PizenLabs/izen/pkg/fs"
 	"github.com/PizenLabs/izen/pkg/ir"
+	"github.com/PizenLabs/izen/pkg/knowledge"
+	"github.com/PizenLabs/izen/pkg/op"
 	"github.com/PizenLabs/izen/pkg/planner"
 )
 
@@ -45,12 +49,50 @@ type Generator interface {
 	Complete(ctx context.Context, system, prompt string, maxTokens int) (string, error)
 }
 
+// Clarifier resolves the ClarificationQuestions the pipeline raises for an
+// ambiguous intent. The TUI host subscribes to the TypeClarificationRequired
+// event to learn which questions are pending, then feeds the user's selections
+// into the response channel the pipeline is blocking on.
+//
+// Implementations MUST send exactly one ir.ClarificationResponse on resp and
+// return, or return an error. When no Clarifier is configured the pipeline
+// auto-resolves the default options so a headless run never hangs.
+type Clarifier interface {
+	// Clarify receives the questions to ask and the channel the pipeline
+	// blocks on. resp is buffered with capacity one: a synchronous send that
+	// does not block the caller is guaranteed.
+	Clarify(ctx context.Context, questions []ir.ClarificationQuestion, resp chan<- ir.ClarificationResponse) error
+}
+
+// ClarifierFunc adapts a function value to the Clarifier interface.
+type ClarifierFunc func(ctx context.Context, questions []ir.ClarificationQuestion, resp chan<- ir.ClarificationResponse) error
+
+// Clarify implements Clarifier.
+func (f ClarifierFunc) Clarify(ctx context.Context, questions []ir.ClarificationQuestion, resp chan<- ir.ClarificationResponse) error {
+	return f(ctx, questions, resp)
+}
+
+// IntentCompiler is the contract the pipeline triggers to compile a raw prompt
+// into a strongly-typed ir.IntentIR when a request carries none. It is
+// implemented by *compiler.IntentCompiler and is injectable for tests.
+type IntentCompiler interface {
+	// Compile translates a raw prompt into a fully-bound ir.IntentIR, or
+	// returns an error when the semantic extractor cannot produce one.
+	Compile(ctx context.Context, raw string) (ir.IntentIR, error)
+}
+
 // Request is a single pipeline invocation.
 type Request struct {
 	// Intent is the raw user prompt to route through the pipeline.
 	Intent string
 	// Targets are optional workspace files the intent references.
 	Targets []string
+	// IntentIR is the compiled intent (optional). When it reports
+	// DecisionAmbiguity, Run pauses at the clarification gate: it publishes a
+	// TypeClarificationRequired event and blocks on a response channel until
+	// the configured Clarifier resolves every question, then folds the
+	// answers back onto the intent and continues.
+	IntentIR *ir.IntentIR
 }
 
 // Result is the full audit trail of one pipeline run.
@@ -70,6 +112,10 @@ type Result struct {
 	Validations []ArtifactValidation
 	// Plan is the planner result whose graph was executed.
 	Plan *planner.PlanResult
+	// IntentIR is the compiled intent processed by the run (nil when the
+	// request carried none). After an ambiguity is resolved it carries the
+	// user's selections and the reconciled PreserveWorkspace flag.
+	IntentIR *ir.IntentIR
 	// Mode records which planning strategy ran.
 	Mode Mode
 	// Answer carries the direct text answer for conversational intents.
@@ -78,6 +124,10 @@ type Result struct {
 	ExtractionAttempts int
 	// RepairRounds counts validation-gate repair rounds performed.
 	RepairRounds int
+	// BlockedReads counts workspace file reads blocked (sanitized to empty
+	// output) during the run. Under a full-overwrite context every read is
+	// blocked so obsolete workspace code can never anchor the model.
+	BlockedReads int
 	// Events is a best-effort snapshot of events observed on the bus during
 	// the run. Live observers receive the same events in real time.
 	Events []event.Event
@@ -104,6 +154,7 @@ type Pipeline struct {
 	extractors  []extractor.Extractor
 	generator   Generator
 	bus         *event.MemoryEventBus
+	clarifier   Clarifier
 	root        string
 	mode        Mode
 	detect      Detector
@@ -111,6 +162,21 @@ type Pipeline struct {
 	modelTier   string
 	maxAttempts int
 	maxRepairs  int
+
+	strategy *op.StrategyRegistry
+	kg       *knowledge.KnowledgeGraph
+	compiler IntentCompiler
+
+	// tx is the transactional file system every artifact application stages
+	// through. It is created bound to the workspace root and is reusable
+	// across runs: Begin opens a transaction, Commit applies it atomically and
+	// Rollback restores the workspace after a rejection or failure.
+	tx *txfs.TxFS
+
+	// readGuard is the enforcement seam for workspace file reads. Under a
+	// full-overwrite context it sanitizes every read so obsolete content can
+	// never re-enter the model context; BlockedReads exposes the count.
+	readGuard *readGuard
 
 	eventsMu sync.Mutex
 	events   []event.Event
@@ -131,9 +197,15 @@ func NewPipeline(opts ...Option) (*Pipeline, error) {
 		modelTier:   "full",
 		maxAttempts: 3,
 		maxRepairs:  2,
+		strategy:    op.NewStrategyRegistry(),
+		kg:          knowledge.NewKnowledgeGraph(),
+		readGuard:   &readGuard{mode: readAllowed},
 	}
 	for _, opt := range opts {
 		opt(p)
+	}
+	if p.tx == nil {
+		p.tx = txfs.NewTxFS(p.root)
 	}
 	if p.registry == nil {
 		return nil, errors.New("app: nil capability registry")
@@ -167,6 +239,35 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 
 	res := &Result{Intent: req.Intent}
 
+	// Headless guard: when the caller supplies no compiled intent, the pipeline
+	// triggers the IntentCompiler so OperationSemantics is derived strictly from
+	// a strongly-typed ir.Category — never from keyword lists in this layer.
+	// Conversational prompts skip compilation and short-circuit below.
+	if req.IntentIR == nil && !IsConversationalIntent(req.Intent) {
+		compiled := p.compileIntent(ctx, req.Intent)
+		req.IntentIR = &compiled
+	}
+
+	if req.IntentIR != nil {
+		intentCopy := *req.IntentIR
+		intentCopy.Entities = copyMap(req.IntentIR.Entities)
+		intentCopy.Technologies = append([]string(nil), req.IntentIR.Technologies...)
+		res.IntentIR = &intentCopy
+	}
+
+	// Clarification gate: an ambiguous intent pauses the pipeline before any
+	// planning or generation. The TypeClarificationRequired event notifies UI
+	// hosts which questions are pending; the pipeline then blocks on a
+	// response channel until the Clarifier feeds the user's selections back.
+	if req.IntentIR != nil && req.IntentIR.DecisionAmbiguity {
+		if err := p.clarifyGate(ctx, res.IntentIR); err != nil {
+			return nil, err
+		}
+		// The reconciled intent drives the planning strategy: a "replace the
+		// workspace" answer forces a greenfield one-shot write.
+		req.IntentIR = res.IntentIR
+	}
+
 	// Conversational intents short-circuit to a single direct chat pass.
 	if IsConversationalIntent(req.Intent) {
 		p.emitStage(ctx, "chat")
@@ -175,36 +276,67 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 			return nil, fmt.Errorf("app: chat generation: %w", err)
 		}
 		res.Answer = strings.TrimSpace(out)
+		res.BlockedReads = p.readGuard.blockedReads()
 		p.settleEvents()
 		res.Events = p.snapshotEvents()
 		return res, nil
 	}
 
-	// Stage 1 — Policy & capability resolution.
+	// Stage 1 — Policy & capability resolution. The StrategyResolver registry
+	// compiles the intent semantics into a ContextPolicy that governs how the
+	// prompt context is assembled: PolicyRewrite strips obsolete file contents
+	// and declares User Intent the absolute source of truth; PolicyEdit/Patch
+	// inject bounded baseline code; PolicyGenerate injects none.
 	caps, err := ResolveCapabilitiesForIntent(p.registry, req.Intent)
 	if err != nil {
 		return nil, fmt.Errorf("app: resolve capabilities: %w", err)
 	}
 	res.Capabilities = caps
-	res.SystemPrompt = p.buildSystemPrompt(caps, req.Targets)
+
+	semantics := semanticsForRequest(req)
+	if p.kg != nil {
+		p.kg.Ensure(p.root)
+	}
+	builder := NewPromptBuilder(p.strategy, p.kg,
+		WithBuilderRoot(p.root),
+		WithBuilderModelTier(p.modelTier),
+		WithBuilderReadGuard(p.readGuard))
+	policy := builder.CompilePolicy(semantics)
+	// Enforce the context policy at every workspace file read boundary: under
+	// a full-overwrite context obsolete reads are blocked, never injected.
+	if fullOverwriteActive(policy, res.IntentIR) {
+		p.readGuard.setMode(readBlocked)
+	} else {
+		p.readGuard.setMode(readAllowed)
+	}
+	res.SystemPrompt = builder.BuildSystem(policy, caps, req.Targets)
+	userPrompt := builder.BuildUser(policy, req.Intent, req.Targets)
 	p.emitStage(ctx, "capability.resolve")
 
 	// Stages 2-5 — generate, extract, evaluate evidence, validate. A
 	// rejected extraction or a failed validation gate re-prompts with the
 	// failure payload; nothing is written to disk before every artifact
-	// passes.
+	// passes. The whole write pipeline runs inside a TxFS transaction: a
+	// failed generation or a rejected Semantic Alignment Gate rolls the
+	// transaction back before re-entering the repair loop or exiting, so a
+	// rejected output can never reach the workspace.
+	if err := p.tx.Begin(); err != nil {
+		return nil, fmt.Errorf("app: begin transaction: %w", err)
+	}
 	attempts := 0
 	rejections := 0
 	repairs := 0
 	var raw string
 	for {
 		if err := ctx.Err(); err != nil {
+			_ = p.tx.Rollback()
 			return nil, err
 		}
 		attempts++
 
-		raw, err = p.generate(ctx, res.SystemPrompt, p.userPrompt(req))
+		raw, err = p.generate(ctx, res.SystemPrompt, userPrompt)
 		if err != nil {
+			_ = p.tx.Rollback()
 			return nil, fmt.Errorf("app: generation: %w", err)
 		}
 		p.emitStage(ctx, "extraction")
@@ -213,7 +345,11 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 		if extraction.Evaluate() != extractor.DecisionAccept {
 			rejections++
 			if rejections >= p.maxAttempts {
+				_ = p.tx.Rollback()
 				return nil, &ExtractionError{Attempts: attempts, Evidence: extraction.EvidenceSet(), Raw: raw}
+			}
+			if err := p.restartTx(); err != nil {
+				return nil, err
 			}
 			res.SystemPrompt = appendExtractionFailure(res.SystemPrompt, raw, extraction)
 			continue
@@ -221,13 +357,42 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 
 		artifacts := extraction.Artifacts
 		res.Artifacts = artifacts
+
+		// Semantic Alignment Gate — hard stop before any write. The generated
+		// artifacts' primary text tokens must describe the requested target
+		// type: a portfolio intent that produced a To-Do App is a semantic
+		// mismatch, so the staged transaction is rolled back and the model is
+		// re-prompted with an explicit regeneration directive. The gate runs
+		// before capability validation so an anchoring regeneration can never
+		// reach the planner or the workspace.
+		if res.IntentIR != nil && res.IntentIR.TargetType != "" {
+			alignCheck, alignErr := capability.CheckAlignment(res.IntentIR.TargetType, alignmentFiles(artifacts))
+			if alignErr != nil || !alignCheck.Passed() {
+				if repairs >= p.maxRepairs {
+					_ = p.tx.Rollback()
+					return nil, &SemanticMismatchError{TargetType: res.IntentIR.TargetType, Mismatches: alignCheck.Mismatches, Repairs: repairs}
+				}
+				repairs++
+				if err := p.restartTx(); err != nil {
+					return nil, err
+				}
+				res.SystemPrompt = appendSemanticAlignmentRejection(res.SystemPrompt, res.IntentIR.TargetType, alignCheck)
+				p.emitStage(ctx, "alignment.reject")
+				continue
+			}
+		}
+
 		validations := p.validate(ctx, caps, artifacts)
 		res.Validations = validations
 		if !allValidationsPass(validations) {
 			if repairs >= p.maxRepairs {
+				_ = p.tx.Rollback()
 				return nil, &ValidationError{Repairs: repairs, Validations: validations}
 			}
 			repairs++
+			if err := p.restartTx(); err != nil {
+				return nil, err
+			}
 			res.SystemPrompt = appendValidationRejection(res.SystemPrompt, validations)
 			p.emitStage(ctx, "validation.repair")
 			continue
@@ -241,19 +406,28 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 
 	// Stage 6 — Planning & strategy selection.
 	p.emitStage(ctx, "plan")
-	planResult, planMode, bfPlanner, err := p.plan(ctx, req.Intent, res.Artifacts)
+	planResult, planMode, bfPlanner, err := p.plan(ctx, req.Intent, res.Artifacts, req.IntentIR, policy)
 	if err != nil {
+		_ = p.tx.Rollback()
 		return nil, fmt.Errorf("app: plan: %w", err)
 	}
 	res.Plan = planResult
 	res.Mode = planMode
 
-	// Stage 7 — Kernel engine execution.
+	// Stage 7 — Kernel engine execution. Greenfield writes are staged through
+	// the transaction and become visible only when the plan commits atomically.
 	p.emitStage(ctx, "execute")
 	if err := p.execute(ctx, planResult, planMode, bfPlanner); err != nil {
+		_ = p.tx.Rollback()
 		return nil, fmt.Errorf("app: execute: %w", err)
 	}
 
+	if err := p.tx.Commit(); err != nil {
+		_ = p.tx.Rollback()
+		return nil, fmt.Errorf("app: commit transaction: %w", err)
+	}
+
+	res.BlockedReads = p.readGuard.blockedReads()
 	p.settleEvents()
 	res.Events = p.snapshotEvents()
 	return res, nil
@@ -270,6 +444,84 @@ func (p *Pipeline) generate(ctx context.Context, system, prompt string) (string,
 		return "", ErrEmptyGeneration
 	}
 	return out, nil
+}
+
+// clarifyGate pauses the pipeline on an ambiguous intent. It publishes the
+// pending ClarificationQuestions as a TypeClarificationRequired event, then
+// blocks on a response channel until the configured Clarifier resolves them.
+// Without a Clarifier the default options are auto-selected so headless runs
+// never hang. The reconciled intent has DecisionAmbiguity cleared and
+// PreserveWorkspace folded in from the selected branch.
+func (p *Pipeline) clarifyGate(ctx context.Context, intent *ir.IntentIR) error {
+	if intent == nil || !intent.DecisionAmbiguity {
+		return nil
+	}
+	if len(intent.ClarificationQuestions) == 0 {
+		intent.DecisionAmbiguity = false
+		return nil
+	}
+	questions := intent.ClarificationQuestions
+	p.bus.Publish(event.NewEvent(event.TypeClarificationRequired, "pipeline", questions))
+
+	responseChan := make(chan ir.ClarificationResponse, 1)
+	go p.dispatchClarification(ctx, questions, responseChan)
+
+	select {
+	case resp := <-responseChan:
+		applyClarification(intent, resp)
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// dispatchClarification routes the pending questions to the configured
+// Clarifier (or the default auto-resolution) and delivers the response to the
+// channel the pipeline is blocking on. A failing Clarifier degrades to the
+// default answers and surfaces the error on the bus so the run can continue.
+func (p *Pipeline) dispatchClarification(ctx context.Context, questions []ir.ClarificationQuestion, resp chan<- ir.ClarificationResponse) {
+	if p.clarifier == nil {
+		resp <- ir.ClarificationResponse{Answers: ir.DefaultAnswers(questions)}
+		return
+	}
+	if err := p.clarifier.Clarify(ctx, questions, resp); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		p.bus.Publish(event.NewEvent(event.TypeTaskFailed, "pipeline", err))
+		resp <- ir.ClarificationResponse{Answers: ir.DefaultAnswers(questions)}
+	}
+}
+
+// applyClarification folds the user's answers back onto the intent: every
+// question records its SelectedOption/CustomAnswer, DecisionAmbiguity is
+// cleared, and PreserveWorkspace is reconciled from the semantic option IDs.
+func applyClarification(intent *ir.IntentIR, resp ir.ClarificationResponse) {
+	if intent == nil {
+		return
+	}
+	intent.ClarificationQuestions = ir.ApplyAnswers(intent.ClarificationQuestions, resp.Answers)
+	intent.DecisionAmbiguity = false
+	for _, a := range resp.Answers {
+		switch a.OptionID {
+		case ir.OptionReplaceWorkspace:
+			intent.PreserveWorkspace = false
+		case ir.OptionBuildAlongside, ir.OptionMergeSelective, ir.OptionTypeYourOwn:
+			intent.PreserveWorkspace = true
+		}
+	}
+}
+
+// copyMap returns a defensive copy of src.
+func copyMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return make(map[string]string)
+	}
+	out := make(map[string]string, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 // extract runs the configured extractors over raw and returns the first
@@ -311,35 +563,27 @@ func (p *Pipeline) validate(ctx context.Context, caps []capability.Capability, a
 	return out
 }
 
-// buildSystemPrompt assembles the capability-constrained system prompt from
-// the resolved capability set.
-func (p *Pipeline) buildSystemPrompt(caps []capability.Capability, targets []string) string {
-	var b strings.Builder
-	b.WriteString("You are Izen, the human-centered coding engine. Route the user's intent into a coherent set of workspace files that Izen writes for you.\n")
-	if len(targets) > 0 {
-		b.WriteString("\nWorkspace target files already referenced:\n")
-		for _, t := range targets {
-			b.WriteString("  - " + t + "\n")
-		}
-	}
-	b.WriteString("\nACTIVE CAPABILITIES (enforce every constraint, never fall back to a generic template):\n")
-	for _, c := range caps {
-		b.WriteString(c.PromptRepresentation(p.modelTier) + "\n")
-	}
-	b.WriteString("\nOUTPUT FORMAT\n")
-	b.WriteString("Emit exactly one fenced block per file. The fence header MUST name the language and the workspace-relative target path:\n")
-	b.WriteString("```html:index.html\n<!DOCTYPE html>\n...\n```\n")
-	b.WriteString("A fence header is always \"```lang:path\" where path is the relative file location (e.g. html:index.html, go:main.go, css:styles/main.css). Plain code fences without a :path header, or prose, will be rejected.\n")
-	b.WriteString("You may add brief narration before the blocks. Never write to disk yourself.\n")
-	return b.String()
+// semanticsForRequest derives the OperationSemantics of a request strictly
+// from the compiled intent's category. It is the sole translation seam between
+// the Intent Compiler and the strategy layer: no keyword guessing happens in
+// the pipeline. The caller guarantees req.IntentIR is non-nil (Run compiles
+// or falls back before reaching here).
+func semanticsForRequest(req Request) op.OperationSemantics {
+	return op.SemanticsFromCategory(req.IntentIR.Category)
 }
 
-// userPrompt folds targets into the user-facing prompt.
-func (p *Pipeline) userPrompt(req Request) string {
-	if len(req.Targets) == 0 {
-		return req.Intent
+// compileIntent triggers the wired IntentCompiler when a request carries no
+// compiled ir.IntentIR. When no compiler is wired, or the model cannot compile
+// the prompt, the deterministic language-agnostic fallback from the compiler
+// package is returned. OperationSemantics therefore always derives from a
+// strongly-typed ir.Category — never from keyword lists in this layer.
+func (p *Pipeline) compileIntent(ctx context.Context, raw string) ir.IntentIR {
+	if p.compiler != nil {
+		if compiled, err := p.compiler.Compile(ctx, raw); err == nil {
+			return compiled
+		}
 	}
-	return req.Intent + "\n\nWorkspace context files: " + strings.Join(req.Targets, ", ")
+	return compiler.DeterministicIntent()
 }
 
 // emitStage publishes a pipeline stage checkpoint on the shared bus.
@@ -429,6 +673,30 @@ func (e *ValidationError) Error() string {
 		e.Repairs, strings.Join(paths, ", "))
 }
 
+// SemanticMismatchError reports that the generated artifacts failed the
+// Semantic Alignment Gate after every repair round: their primary text tokens
+// contradict the requested target type (e.g. a To-Do App generated for a
+// Portfolio intent). The staged transaction was rolled back; nothing was
+// written to the workspace.
+type SemanticMismatchError struct {
+	// TargetType is the canonical target type the intent requested.
+	TargetType string
+	// Mismatches lists every artifact that contradicted TargetType.
+	Mismatches []capability.AlignmentMismatch
+	// Repairs is the number of repair rounds already performed.
+	Repairs int
+}
+
+// Error implements error.
+func (e *SemanticMismatchError) Error() string {
+	return fmt.Sprintf("app: semantic alignment mismatch after %d repair round(s): generated artifacts do not describe target %q",
+		e.Repairs, e.TargetType)
+}
+
+// Unwrap exposes the sentinel capability.ErrSemanticMismatch so callers can
+// classify the failure with errors.Is.
+func (e *SemanticMismatchError) Unwrap() error { return capability.ErrSemanticMismatch }
+
 // ResolveCapabilitiesForIntent maps a user intent to the active capability id
 // set, preserving request order, and resolves them through the registry. The
 // generic catch-all is only used when no specific capability matches.
@@ -462,37 +730,6 @@ func ResolveCapabilitiesForIntent(reg *capability.Registry, intent string) ([]ca
 	}
 	return reg.Resolve(ids...)
 }
-
-// IsConversationalIntent reports whether intent is a conversational prompt
-// (greeting, small talk, identity/memory question, or a read-only explain)
-// that runs as a direct chat pass instead of the code-generation pipeline.
-func IsConversationalIntent(intent string) bool {
-	lower := strings.ToLower(strings.TrimSpace(intent))
-	if len(lower) < 3 {
-		return true
-	}
-	switch lower {
-	case "hi", "hello", "hey", "yo", "sup", "hiya", "howdy":
-		return true
-	}
-	for _, g := range []string{"hi ", "hello ", "hey ", "how are you", "what's up", "good morning", "good evening", "yo "} {
-		if strings.HasPrefix(lower, g) && len(lower) <= len(g)+8 {
-			return true
-		}
-	}
-	for _, p := range []string{
-		"who are you", "what are you", "what can you do", "do you remember",
-		"thank you", "thanks", "explain ", "explain:", "describe ", "what is ", "what does ", "what's ",
-	} {
-		if strings.HasPrefix(lower, p) {
-			return true
-		}
-	}
-	return false
-}
-
-const chatSystemPrompt = "You are Izen, the human-centered coding engine. " +
-	"Answer the user's question directly and conversationally."
 
 // appendExtractionFailure re-prompts the model with the evidence payload of a
 // rejected extraction.
@@ -528,6 +765,35 @@ func appendValidationRejection(system string, vals []ArtifactValidation) string 
 	}
 	b.WriteString("Re-emit every file as a fenced block, matching the capability constraints exactly. Never fall back to a generic template.\n")
 	return system + b.String()
+}
+
+// appendSemanticAlignmentRejection re-prompts the model after the Semantic
+// Alignment Gate rejected the generated artifacts. It injects the explicit
+// regeneration directive so a small model that anchored on obsolete workspace
+// code is forced to re-synthesize the requested target from scratch.
+func appendSemanticAlignmentRejection(system, targetType string, check capability.AlignmentCheck) string {
+	var b strings.Builder
+	b.WriteString("\n\n### SEMANTIC ALIGNMENT REJECTED — REGENERATE REQUIRED\n")
+	b.WriteString("Your previous response produced artifacts that do NOT describe the requested target. Nothing was written.\n")
+	for _, m := range check.Mismatches {
+		fmt.Fprintf(&b, "CRITICAL: Output describes %s, but user requested %s. Re-generate completely.\n",
+			m.Detected, capability.DisplayTargetType(targetType))
+	}
+	b.WriteString("Re-emit every file as a fenced block for the requested target only. Do not reproduce the rejected output.\n")
+	return system + b.String()
+}
+
+// alignmentFiles lowers the extracted file artifacts into the capability
+// alignment checker's input contract. Non-file artifacts are skipped.
+func alignmentFiles(artifacts []ir.Artifact) []capability.AlignmentFile {
+	out := make([]capability.AlignmentFile, 0, len(artifacts))
+	for _, a := range artifacts {
+		if a.Kind != ir.ArtifactFile {
+			continue
+		}
+		out = append(out, capability.AlignmentFile{Path: a.Path, Content: a.Content})
+	}
+	return out
 }
 
 // missingEvidence returns the structural evidence flags absent from res.
@@ -573,6 +839,22 @@ func allValidationsPass(vals []ArtifactValidation) bool {
 		}
 	}
 	return true
+}
+
+// validateArtifactPaths rejects any artifact whose path is absolute or
+// resolves outside the workspace root. It performs no I/O and runs before any
+// planning or write so a malicious or malformed path can never reach disk.
+func validateArtifactPaths(root string, artifacts []ir.Artifact) error {
+	for _, a := range artifacts {
+		if a.Kind != ir.ArtifactFile || a.Path == "" {
+			continue
+		}
+		clean := filepath.Clean(a.Path)
+		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("app: artifact path %q escapes workspace root %q", a.Path, root)
+		}
+	}
+	return nil
 }
 
 // ensureParentDirs creates the parent directories of every file artifact

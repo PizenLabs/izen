@@ -23,10 +23,15 @@ type Frame struct {
 }
 
 // ThoughtOpen and ThoughtClose are the thinking markers recognized between
-// chunks, including when they straddle a chunk boundary.
+// chunks, including when they straddle a chunk boundary. <think>/</think> are
+// recognized as synonyms (Gemma/Cohere families emit either spelling).
 const (
 	ThoughtOpen  = "<thought>"
 	ThoughtClose = "</thought>"
+	// ThoughtAltOpen is the <think> synonym of ThoughtOpen.
+	ThoughtAltOpen = "<think>"
+	// ThoughtAltClose is the </think> synonym of ThoughtClose.
+	ThoughtAltClose = "</think>"
 )
 
 // ReasoningSentinel is the zero-width marker used by providers that surface
@@ -102,8 +107,8 @@ func (s *Splitter) Flush(emit func(Frame)) {
 // </thought> and the (symmetric) reasoning sentinel are. It holds back only a
 // partial marker tail at the very end of the buffer.
 func (s *Splitter) scan(emit func(Frame)) {
-	openers := []string{ThoughtOpen, ReasoningSentinel}
-	closers := []string{ThoughtClose, ReasoningSentinel}
+	openers := []string{ThoughtOpen, ThoughtAltOpen, ReasoningSentinel}
+	closers := []string{ThoughtClose, ThoughtAltClose, ReasoningSentinel}
 	for {
 		raw := s.buf.String()
 		markers := openers

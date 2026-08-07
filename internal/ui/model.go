@@ -871,6 +871,12 @@ type model struct {
 	// Cached prompt text for logging (set on submit, cleared after stream completion)
 	currentPrompt string
 
+	// lastPlanIntent is the raw user intent captured when /plan staged its task
+	// list. It survives mode transitions (the current prompt is overwritten by
+	// the later "/build" invocation) so /build can reconstruct the rewrite
+	// context WITHOUT reading obsolete workspace file contents.
+	lastPlanIntent string
+
 	// Authorization engine for build/patch execution
 	authEngine     *authorization.AuthorizationEngine
 	mutationBudget *budget.MutationBudget

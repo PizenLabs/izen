@@ -622,6 +622,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		}
 
+		// ── PLAN INTENT CAPTURE (TaskContext hygiene) ──────────────────
+		// Record the raw user intent that produced this plan so /build can
+		// reconstruct the rewrite context WITHOUT reading obsolete workspace
+		// file contents. The current prompt (mode prefix stripped) is
+		// preferred; the persisted objective is the fallback.
+		if intent := stripModePrefix(m.currentPrompt); intent != "" {
+			m.lastPlanIntent = intent
+		} else if m.sess != nil {
+			m.lastPlanIntent = m.sess.ObjectiveIntent()
+		}
+
 		m.sess.StageTaskList(&msg.Tasks)
 		// BRIDGE: mirror the structured /plan queue into the canonical
 		// session.ContextLedger as []AtomicTask — the SSOT /build consumes.
@@ -1056,6 +1067,26 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.pendingProposals = props
 
+		// ── SEMANTIC ALIGNMENT GATE (before any patch is rendered) ───────
+		// A proposal that contradicts the requested target type must NEVER be
+		// displayed. A portfolio intent that produced a To-Do App (the
+		// obsolete-workspace anchoring scenario) is a HARD STOP: the patch is
+		// not rendered, the session task cache is purged so the stale plan
+		// cannot poison the next build, and the UI raises an explicit critical
+		// alignment banner.
+		if len(props) > 0 {
+			accepted, rejection := gateBuildProposals(m.buildIntentContext(), props)
+			if rejection != nil {
+				if len(accepted) == 0 {
+					m.hardKillAlignmentFailure(rejection)
+					return m, m.flushPendingRecords()
+				}
+				m.push(roleError, "[CRITICAL ALIGNMENT FAIL] "+rejection.Error()+" Mismatched file(s): "+strings.Join(rejection.Files, ", ")+" were NOT rendered and will not be applied.")
+				props = accepted
+				m.pendingProposals = accepted
+			}
+		}
+
 		// ── FAST-TRACK TARGET TRACKING ─────────────────────────────
 		// The fast-track producer (Task==nil && Patch==nil) emits a unified
 		// multi-file patch batch covering all plan FILE_MUTATE/GIT_ACTION
@@ -1151,6 +1182,28 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			Expanded: true,
 		}
 		m.pendingProposals = []SemanticProposal{proposal}
+
+		// ── SEMANTIC ALIGNMENT GATE (hotfix, before rendering) ───────
+		// Mirror of the /build gate: a hotfix patch whose content contradicts
+		// the requested target type is never rendered or written. A hard
+		// failure raises the critical alignment banner and purges the task
+		// cache before restoring the stashed plan.
+		if msg.Task != nil {
+			intent := m.buildIntentContext()
+			if intent == "" {
+				intent = msg.Task.Description
+			}
+			if accepted, rejection := gateBuildProposals(intent, m.pendingProposals); rejection != nil && len(accepted) == 0 {
+				m.hardKillAlignmentFailure(rejection)
+				m.hotfixActive = false
+				if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
+					m.sess.StageTaskList(&stashedTasks)
+					_ = m.sess.Save()
+				}
+				m.push(roleSystem, infoStyle.Render("[HOTFIX] Pipeline PAUSED. No files were modified."))
+				return m, m.flushPendingRecords()
+			}
+		}
 
 		// ── CLEAN TRANSITION TO PROPOSAL VIEW ────────────────────────
 		m.push(roleActivity, "  ⚙ Compiling unified diff schema...")

@@ -17,12 +17,13 @@ type EventType string
 
 // Core system event types emitted by the kernel and runtime layers.
 const (
-	TypeTaskStarted    EventType = "task.started"
-	TypeTaskCompleted  EventType = "task.completed"
-	TypeTaskFailed     EventType = "task.failed"
-	TypeTaskCanceled   EventType = "task.canceled"
-	TypeBudgetExceeded EventType = "budget.exceeded"
-	TypeStateCheckpt   EventType = "state.checkpoint"
+	TypeTaskStarted           EventType = "task.started"
+	TypeTaskCompleted         EventType = "task.completed"
+	TypeTaskFailed            EventType = "task.failed"
+	TypeTaskCanceled          EventType = "task.canceled"
+	TypeBudgetExceeded        EventType = "budget.exceeded"
+	TypeStateCheckpt          EventType = "state.checkpoint"
+	TypeClarificationRequired EventType = "clarification.required"
 )
 
 // Event is an immutable record of something that happened in the runtime.
