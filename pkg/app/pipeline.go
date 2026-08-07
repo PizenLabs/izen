@@ -124,6 +124,10 @@ type Result struct {
 	ExtractionAttempts int
 	// RepairRounds counts validation-gate repair rounds performed.
 	RepairRounds int
+	// BlockedReads counts workspace file reads blocked (sanitized to empty
+	// output) during the run. Under a full-overwrite context every read is
+	// blocked so obsolete workspace code can never anchor the model.
+	BlockedReads int
 	// Events is a best-effort snapshot of events observed on the bus during
 	// the run. Live observers receive the same events in real time.
 	Events []event.Event
@@ -169,6 +173,11 @@ type Pipeline struct {
 	// Rollback restores the workspace after a rejection or failure.
 	tx *txfs.TxFS
 
+	// readGuard is the enforcement seam for workspace file reads. Under a
+	// full-overwrite context it sanitizes every read so obsolete content can
+	// never re-enter the model context; BlockedReads exposes the count.
+	readGuard *readGuard
+
 	eventsMu sync.Mutex
 	events   []event.Event
 }
@@ -190,6 +199,7 @@ func NewPipeline(opts ...Option) (*Pipeline, error) {
 		maxRepairs:  2,
 		strategy:    op.NewStrategyRegistry(),
 		kg:          knowledge.NewKnowledgeGraph(),
+		readGuard:   &readGuard{mode: readAllowed},
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -266,6 +276,7 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 			return nil, fmt.Errorf("app: chat generation: %w", err)
 		}
 		res.Answer = strings.TrimSpace(out)
+		res.BlockedReads = p.readGuard.blockedReads()
 		p.settleEvents()
 		res.Events = p.snapshotEvents()
 		return res, nil
@@ -288,8 +299,16 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 	}
 	builder := NewPromptBuilder(p.strategy, p.kg,
 		WithBuilderRoot(p.root),
-		WithBuilderModelTier(p.modelTier))
+		WithBuilderModelTier(p.modelTier),
+		WithBuilderReadGuard(p.readGuard))
 	policy := builder.CompilePolicy(semantics)
+	// Enforce the context policy at every workspace file read boundary: under
+	// a full-overwrite context obsolete reads are blocked, never injected.
+	if fullOverwriteActive(policy, res.IntentIR) {
+		p.readGuard.setMode(readBlocked)
+	} else {
+		p.readGuard.setMode(readAllowed)
+	}
 	res.SystemPrompt = builder.BuildSystem(policy, caps, req.Targets)
 	userPrompt := builder.BuildUser(policy, req.Intent, req.Targets)
 	p.emitStage(ctx, "capability.resolve")
@@ -338,6 +357,31 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 
 		artifacts := extraction.Artifacts
 		res.Artifacts = artifacts
+
+		// Semantic Alignment Gate — hard stop before any write. The generated
+		// artifacts' primary text tokens must describe the requested target
+		// type: a portfolio intent that produced a To-Do App is a semantic
+		// mismatch, so the staged transaction is rolled back and the model is
+		// re-prompted with an explicit regeneration directive. The gate runs
+		// before capability validation so an anchoring regeneration can never
+		// reach the planner or the workspace.
+		if res.IntentIR != nil && res.IntentIR.TargetType != "" {
+			alignCheck, alignErr := capability.CheckAlignment(res.IntentIR.TargetType, alignmentFiles(artifacts))
+			if alignErr != nil || !alignCheck.Passed() {
+				if repairs >= p.maxRepairs {
+					_ = p.tx.Rollback()
+					return nil, &SemanticMismatchError{TargetType: res.IntentIR.TargetType, Mismatches: alignCheck.Mismatches, Repairs: repairs}
+				}
+				repairs++
+				if err := p.restartTx(); err != nil {
+					return nil, err
+				}
+				res.SystemPrompt = appendSemanticAlignmentRejection(res.SystemPrompt, res.IntentIR.TargetType, alignCheck)
+				p.emitStage(ctx, "alignment.reject")
+				continue
+			}
+		}
+
 		validations := p.validate(ctx, caps, artifacts)
 		res.Validations = validations
 		if !allValidationsPass(validations) {
@@ -383,6 +427,7 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 		return nil, fmt.Errorf("app: commit transaction: %w", err)
 	}
 
+	res.BlockedReads = p.readGuard.blockedReads()
 	p.settleEvents()
 	res.Events = p.snapshotEvents()
 	return res, nil
@@ -628,6 +673,30 @@ func (e *ValidationError) Error() string {
 		e.Repairs, strings.Join(paths, ", "))
 }
 
+// SemanticMismatchError reports that the generated artifacts failed the
+// Semantic Alignment Gate after every repair round: their primary text tokens
+// contradict the requested target type (e.g. a To-Do App generated for a
+// Portfolio intent). The staged transaction was rolled back; nothing was
+// written to the workspace.
+type SemanticMismatchError struct {
+	// TargetType is the canonical target type the intent requested.
+	TargetType string
+	// Mismatches lists every artifact that contradicted TargetType.
+	Mismatches []capability.AlignmentMismatch
+	// Repairs is the number of repair rounds already performed.
+	Repairs int
+}
+
+// Error implements error.
+func (e *SemanticMismatchError) Error() string {
+	return fmt.Sprintf("app: semantic alignment mismatch after %d repair round(s): generated artifacts do not describe target %q",
+		e.Repairs, e.TargetType)
+}
+
+// Unwrap exposes the sentinel capability.ErrSemanticMismatch so callers can
+// classify the failure with errors.Is.
+func (e *SemanticMismatchError) Unwrap() error { return capability.ErrSemanticMismatch }
+
 // ResolveCapabilitiesForIntent maps a user intent to the active capability id
 // set, preserving request order, and resolves them through the registry. The
 // generic catch-all is only used when no specific capability matches.
@@ -696,6 +765,35 @@ func appendValidationRejection(system string, vals []ArtifactValidation) string 
 	}
 	b.WriteString("Re-emit every file as a fenced block, matching the capability constraints exactly. Never fall back to a generic template.\n")
 	return system + b.String()
+}
+
+// appendSemanticAlignmentRejection re-prompts the model after the Semantic
+// Alignment Gate rejected the generated artifacts. It injects the explicit
+// regeneration directive so a small model that anchored on obsolete workspace
+// code is forced to re-synthesize the requested target from scratch.
+func appendSemanticAlignmentRejection(system, targetType string, check capability.AlignmentCheck) string {
+	var b strings.Builder
+	b.WriteString("\n\n### SEMANTIC ALIGNMENT REJECTED — REGENERATE REQUIRED\n")
+	b.WriteString("Your previous response produced artifacts that do NOT describe the requested target. Nothing was written.\n")
+	for _, m := range check.Mismatches {
+		fmt.Fprintf(&b, "CRITICAL: Output describes %s, but user requested %s. Re-generate completely.\n",
+			m.Detected, capability.DisplayTargetType(targetType))
+	}
+	b.WriteString("Re-emit every file as a fenced block for the requested target only. Do not reproduce the rejected output.\n")
+	return system + b.String()
+}
+
+// alignmentFiles lowers the extracted file artifacts into the capability
+// alignment checker's input contract. Non-file artifacts are skipped.
+func alignmentFiles(artifacts []ir.Artifact) []capability.AlignmentFile {
+	out := make([]capability.AlignmentFile, 0, len(artifacts))
+	for _, a := range artifacts {
+		if a.Kind != ir.ArtifactFile {
+			continue
+		}
+		out = append(out, capability.AlignmentFile{Path: a.Path, Content: a.Content})
+	}
+	return out
 }
 
 // missingEvidence returns the structural evidence flags absent from res.

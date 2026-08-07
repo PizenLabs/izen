@@ -1056,6 +1056,27 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.pendingProposals = props
 
+		// ── SEMANTIC ALIGNMENT GATE (before any patch is rendered) ───────
+		// A proposal that contradicts the requested target type must NEVER be
+		// displayed. A portfolio intent that produced a To-Do App (the
+		// obsolete-workspace anchoring scenario) is rejected here: the patch
+		// is not rendered and the run surfaces an explicit regeneration
+		// directive. No mismatched diff reaches the TUI screen.
+		if len(props) > 0 {
+			accepted, rejection := gateBuildProposals(m.currentPrompt, props)
+			if rejection != nil {
+				if len(accepted) == 0 {
+					m.push(roleError, "Semantic Alignment Rejected: every generated patch contradicts the requested target. "+rejection.Error()+" No patch was displayed; nothing was written.")
+					m.refreshViewportContent()
+					m.Viewport.GotoBottom()
+					return m, m.flushPendingRecords()
+				}
+				m.push(roleError, "Semantic Alignment Rejected: "+rejection.Error()+" Mismatched file(s): "+strings.Join(rejection.Files, ", ")+" were not displayed.")
+				props = accepted
+				m.pendingProposals = accepted
+			}
+		}
+
 		// ── FAST-TRACK TARGET TRACKING ─────────────────────────────
 		// The fast-track producer (Task==nil && Patch==nil) emits a unified
 		// multi-file patch batch covering all plan FILE_MUTATE/GIT_ACTION
@@ -1151,6 +1172,28 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			Expanded: true,
 		}
 		m.pendingProposals = []SemanticProposal{proposal}
+
+		// ── SEMANTIC ALIGNMENT GATE (hotfix, before rendering) ───────
+		// Mirror of the /build gate: a hotfix patch whose content contradicts
+		// the requested target type is never rendered or written.
+		if msg.Task != nil {
+			intent := m.currentPrompt
+			if intent == "" {
+				intent = msg.Task.Description
+			}
+			if accepted, rejection := gateBuildProposals(intent, m.pendingProposals); rejection != nil && len(accepted) == 0 {
+				m.push(roleError, "[HOTFIX] Semantic Alignment Rejected: "+rejection.Error()+" No patch was displayed; nothing was written.")
+				m.hotfixActive = false
+				if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
+					m.sess.StageTaskList(&stashedTasks)
+					_ = m.sess.Save()
+				}
+				m.push(roleSystem, infoStyle.Render("[HOTFIX] Pipeline PAUSED. No files were modified."))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, m.flushPendingRecords()
+			}
+		}
 
 		// ── CLEAN TRANSITION TO PROPOSAL VIEW ────────────────────────
 		m.push(roleActivity, "  ⚙ Compiling unified diff schema...")

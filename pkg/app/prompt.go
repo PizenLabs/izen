@@ -37,6 +37,7 @@ type PromptBuilder struct {
 	root      string
 	modelTier string
 	readFile  func(rel string) ([]byte, error)
+	guard     *readGuard
 }
 
 // PromptBuilderOption configures a PromptBuilder.
@@ -67,6 +68,18 @@ func WithBaselineReader(fn func(rel string) ([]byte, error)) PromptBuilderOption
 	return func(b *PromptBuilder) {
 		if fn != nil {
 			b.readFile = fn
+		}
+	}
+}
+
+// WithBuilderReadGuard binds the pipeline's read guard to the builder. Every
+// baseline read is routed through the guard, which blocks (sanitizes) reads
+// under a full-overwrite context so obsolete workspace content can never leak
+// into the prompt.
+func WithBuilderReadGuard(g *readGuard) PromptBuilderOption {
+	return func(b *PromptBuilder) {
+		if g != nil {
+			b.guard = g
 		}
 	}
 }
@@ -243,7 +256,9 @@ func (b *PromptBuilder) contextPaths(targets []string) []string {
 // readBaseline returns the bounded content of a workspace-relative baseline
 // file. Paths that would escape the workspace root are refused, and unreadable
 // or oversized files degrade to an empty string so the prompt stays safe and
-// bounded.
+// bounded. Every read is routed through the pipeline read guard, which blocks
+// (sanitizes) it under a full-overwrite context: obsolete content is never
+// injected, not even through the baseline path.
 func (b *PromptBuilder) readBaseline(rel string) string {
 	if b.readFile == nil {
 		return ""
@@ -252,8 +267,19 @@ func (b *PromptBuilder) readBaseline(rel string) string {
 	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
 		return ""
 	}
-	data, err := b.readFile(clean)
+	var (
+		data []byte
+		err  error
+	)
+	if b.guard != nil {
+		data, err = b.guard.read(rel, b.readFile)
+	} else {
+		data, err = b.readFile(rel)
+	}
 	if err != nil {
+		return ""
+	}
+	if len(data) == 0 {
 		return ""
 	}
 	content := strings.TrimRight(string(data), "\n")

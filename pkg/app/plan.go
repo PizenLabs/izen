@@ -285,7 +285,10 @@ func fileExists(root, name string) bool {
 // PolicyRewrite (total replacement) forces the one-shot greenfield planner,
 // because keeping the brownfield repair loop would contradict the user's
 // explicit replacement. A compiled intent that resolved to PreserveWorkspace
-// false does the same.
+// false does the same. The decision is delegated to
+// planner.ExecutionModeForPolicy so the planner layer owns the strict
+// greenfield guarantee: every rewrite artifact is a Direct Full-File
+// Overwrite and the Search/Replace diff path is disabled for the run.
 func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artifact, intentIR *ir.IntentIR, policy op.ContextPolicy) (*planner.PlanResult, Mode, *brownfield.BrownfieldPlanner, error) {
 	useBrownfield := p.mode == ModeBrownfield
 	if p.mode == ModeAuto {
@@ -295,7 +298,12 @@ func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artif
 		}
 		useBrownfield = bf
 	}
-	if policy == op.PolicyRewrite || (intentIR != nil && !intentIR.PreserveWorkspace) {
+	var preserve *bool
+	if intentIR != nil {
+		pv := intentIR.PreserveWorkspace
+		preserve = &pv
+	}
+	if planner.ExecutionModeForPolicy(policy == op.PolicyRewrite, preserve) == planner.ModeGreenfield {
 		useBrownfield = false
 	}
 
@@ -338,6 +346,19 @@ func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artif
 		return nil, ModeGreenfield, nil, err
 	}
 	return res, ModeGreenfield, nil, nil
+}
+
+// fullOverwriteActive reports whether a run must treat every generated
+// artifact as a Direct Full-File Overwrite: the compiled ContextPolicy is
+// PolicyRewrite (total replacement/redesign) or the compiled intent does not
+// preserve the workspace. When true, the Search/Replace diff path is disabled
+// and workspace file reads are sanitized so obsolete content can never anchor
+// the model or re-enter its context.
+func fullOverwriteActive(policy op.ContextPolicy, intentIR *ir.IntentIR) bool {
+	if policy == op.PolicyRewrite {
+		return true
+	}
+	return intentIR != nil && !intentIR.PreserveWorkspace
 }
 
 // execute runs the planned graph on the kernel engine, dispatching side

@@ -63,6 +63,39 @@ func TestStripThinkingTags_RepeatedBlocks(t *testing.T) {
 	}
 }
 
+// TestFirstUsableContent_StripsThinkingFromContent proves reasoning tokens
+// never leak into the parseable main content: a response carrying real code
+// alongside <thought> blocks returns only the code, so the rendered code
+// volume matches the completion budget instead of being dwarfed by reasoning.
+func TestFirstUsableContent_StripsThinkingFromContent(t *testing.T) {
+	got := firstUsableContent("<thought>reasoning here</thought>\n```html\n<h1>hi</h1>\n```", "", "")
+	if strings.Contains(got, "reasoning here") {
+		t.Fatalf("reasoning leaked into content: %q", got)
+	}
+	if !strings.Contains(got, "<h1>hi</h1>") {
+		t.Fatalf("code lost from content: %q", got)
+	}
+}
+
+// TestFirstUsableContent_AllThinkingContentFallsBack proves a main content
+// that is entirely a thinking block falls back to the reasoning field so the
+// answer survives.
+func TestFirstUsableContent_AllThinkingContentFallsBack(t *testing.T) {
+	got := firstUsableContent("<think>entire answer</think>", "fallback answer", "")
+	if got != "fallback answer" {
+		t.Fatalf("got %q, want %q", got, "fallback answer")
+	}
+}
+
+// TestFirstUsableContent_AllThinkingContentWithEmptyReasoning proves a main
+// content that is entirely a thinking block still surfaces the text when the
+// reasoning fields are empty — the thinking block is the model's only output.
+func TestFirstUsableContent_AllThinkingContentWithEmptyReasoning(t *testing.T) {
+	if got := firstUsableContent("<think>only thinking</think>", "", ""); got != "only thinking" {
+		t.Fatalf("got %q, want %q", got, "only thinking")
+	}
+}
+
 // ── OpenRouter non-streaming reasoning fallback ──────────────────────────────
 
 // TestOpenRouterExecute_ReasoningFallback simulates the reported Mini/Free

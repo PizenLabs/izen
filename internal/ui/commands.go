@@ -2914,6 +2914,10 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		// (finish_reason == "length") gracefully by recovering partial
 		// tool calls from the ToolCallBuffer.
 		tokIn, tokOut := streamUsage()
+		finishReason := ""
+		if frp, ok := rawStream.(ai.FinishReasonProvider); ok {
+			finishReason = frp.FinishReason()
+		}
 		var patches []*execution.Patch
 		if len(toolCalls) > 0 {
 			if m.toolCallBuffer != nil {
@@ -2943,15 +2947,22 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			}
 		}
 
-		finalOutput := fullContent.String()
-		// Include buffered reasoning in the output for proposal extraction
-		if reasoningBuf.Len() > 0 {
-			if finalOutput != "" {
-				finalOutput = reasoningBuf.String() + "\n" + finalOutput
-			} else {
-				finalOutput = reasoningBuf.String()
-			}
+		// ── FINAL OUTPUT ASSEMBLY (reasoning-token hygiene) ────────────
+		// Reasoning/thinking text is STRIPPED from the output handed to
+		// proposal extraction: prepending <thought> chain-of-thought text
+		// previously leaked into extractBuildProposals (fake FILE:/fence
+		// matches → garbage proposals) and inflated the reported completion
+		// tokens while the visible code stayed tiny. VisibleCompletion strips
+		// thinking blocks; reasoning is only used as the output when content
+		// is entirely absent (models that emit their whole answer in
+		// reasoning_content, e.g. Cohere North Mini).
+		finalOutput := ai.VisibleCompletion(fullContent.String())
+		if strings.TrimSpace(finalOutput) == "" && reasoningBuf.Len() > 0 {
+			finalOutput = ai.VisibleCompletion(reasoningBuf.String())
 		}
+		// Dump the raw-vs-visible completion composition (content len vs
+		// stripped reasoning len, provider tokens, truncation) for audit.
+		debugLogCompletion(fullContent.String(), tokIn, tokOut, finishReason, "build.fasttrack")
 
 		select {
 		case streamCh <- buildProposalReadyMsg{

@@ -114,8 +114,11 @@ func NewGreenfieldPlanner(workspaceRoot string, opts ...Option) *GreenfieldPlann
 
 // Plan implements planner.Planner. It lowers every writable file artifact
 // into an op.OpWriteFile node and returns a graph with zero tool-call
-// overhead. Non-file artifacts are retained in the result but produce no
-// node.
+// overhead. Every write is a Direct Full-File Overwrite of the artifact's
+// content: the planner never parses or applies SEARCH/REPLACE diffs against
+// existing files, so obsolete workspace code cannot anchor the model or
+// trigger patch-thrashing repair loops. Non-file artifacts are retained in
+// the result but produce no node.
 func (p *GreenfieldPlanner) Plan(ctx context.Context, intent string, artifacts []ir.Artifact) (*planner.PlanResult, error) {
 	if p == nil {
 		return nil, errors.New("greenfield: nil receiver")
@@ -189,6 +192,8 @@ func (p *GreenfieldPlanner) build(intent string, artifacts []ir.Artifact) (*plan
 			"planner":        "greenfield",
 			"intent":         intent,
 			"strategy":       "one-shot",
+			"overwrite":      "full-content",
+			"diff":           "none",
 			"roundtrips":     "0",
 			"node_count":     strconv.Itoa(planned),
 			"artifact_count": strconv.Itoa(len(artifacts)),
