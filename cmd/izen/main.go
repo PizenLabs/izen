@@ -41,7 +41,7 @@ func printMinimalistHelp() {
 	fmt.Println("  izen compact            Compress prompt overhead in context/memory files")
 	fmt.Println("  izen memory optimize    Alias for izen compact")
 	fmt.Println("  izen rollback           Review recent file mutations")
-	fmt.Println("  izen run \"<prompt>\"      Execute a prompt through the v1 runtime state machine")
+	fmt.Println("  izen run \"<prompt>\"      Execute a prompt through the v3 agent runtime")
 	fmt.Println("  izen [path]             Start TUI at the given project path")
 	fmt.Println()
 	fmt.Println("Interactive Commands (inside TUI):")
