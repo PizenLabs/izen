@@ -17,10 +17,12 @@ import (
 	"strings"
 	"time"
 
+	txfs "github.com/PizenLabs/izen/pkg/fs"
 	"github.com/PizenLabs/izen/pkg/graph"
 	"github.com/PizenLabs/izen/pkg/ir"
 	"github.com/PizenLabs/izen/pkg/op"
 	"github.com/PizenLabs/izen/pkg/planner"
+	"github.com/PizenLabs/izen/pkg/resource"
 	"github.com/PizenLabs/izen/pkg/resource/file"
 )
 
@@ -59,6 +61,7 @@ type GreenfieldPlanner struct {
 	mode          fs.FileMode
 	timeout       time.Duration
 	nodePrefix    string
+	tx            *txfs.TxFS
 }
 
 // Option configures a GreenfieldPlanner.
@@ -79,6 +82,18 @@ func WithNodePrefix(prefix string) Option {
 	return func(p *GreenfieldPlanner) {
 		if prefix != "" {
 			p.nodePrefix = prefix
+		}
+	}
+}
+
+// WithTxFS binds an active transactional file system. When set, write
+// operations stage through the transaction and reach the workspace atomically
+// at Commit; Rollback restores it to a pristine state. The transaction must
+// span the graph's execution (Begin before, Commit or Rollback after).
+func WithTxFS(tx *txfs.TxFS) Option {
+	return func(p *GreenfieldPlanner) {
+		if tx != nil {
+			p.tx = tx
 		}
 	}
 }
@@ -139,7 +154,7 @@ func (p *GreenfieldPlanner) build(intent string, artifacts []ir.Artifact) (*plan
 		if a.Kind != ir.ArtifactFile {
 			continue
 		}
-		res, err := file.NewFileResource(p.workspaceRoot, a.Path, p.mode)
+		res, err := p.fileResource(a)
 		if err != nil {
 			return nil, fmt.Errorf("greenfield: target %q: %w", a.Path, err)
 		}
@@ -179,6 +194,20 @@ func (p *GreenfieldPlanner) build(intent string, artifacts []ir.Artifact) (*plan
 			"artifact_count": strconv.Itoa(len(artifacts)),
 		},
 	}, nil
+}
+
+// fileResource lowers an artifact into a resource.Resource. When a TxFS is
+// bound, the file write is staged transactionally so the workspace stays
+// pristine until Commit.
+func (p *GreenfieldPlanner) fileResource(a ir.Artifact) (resource.Resource, error) {
+	base, err := file.NewFileResource(p.workspaceRoot, a.Path, p.mode)
+	if err != nil {
+		return nil, err
+	}
+	if p.tx == nil {
+		return base, nil
+	}
+	return txfs.NewTxResource(base, p.tx)
 }
 
 // preconditions resolves the artifact's depends_on metadata to writable graph

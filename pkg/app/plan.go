@@ -13,6 +13,7 @@ import (
 	"github.com/PizenLabs/izen/pkg/capability"
 	"github.com/PizenLabs/izen/pkg/event"
 	"github.com/PizenLabs/izen/pkg/extractor"
+	txfs "github.com/PizenLabs/izen/pkg/fs"
 	"github.com/PizenLabs/izen/pkg/ir"
 	"github.com/PizenLabs/izen/pkg/kernel"
 	"github.com/PizenLabs/izen/pkg/knowledge"
@@ -195,6 +196,17 @@ func WithMaxRepairs(n int) Option {
 	}
 }
 
+// WithTxFS overrides the transactional file system artifact writes stage
+// through. Defaults to a TxFS bound to the pipeline workspace root. The bound
+// root must match the pipeline root; it is reused across runs.
+func WithTxFS(tx *txfs.TxFS) Option {
+	return func(p *Pipeline) {
+		if tx != nil {
+			p.tx = tx
+		}
+	}
+}
+
 // defaultDetector treats a workspace as brownfield when it contains any
 // non-hidden file or directory beyond the empty greenfield case.
 func defaultDetector(root string) (bool, error) {
@@ -287,11 +299,20 @@ func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artif
 		useBrownfield = false
 	}
 
-	if err := ensureParentDirs(p.root, artifacts); err != nil {
+	// Reject any artifact path that escapes the workspace root before a single
+	// directory is created or byte is written.
+	if err := validateArtifactPaths(p.root, artifacts); err != nil {
 		return nil, ModeAuto, nil, err
 	}
 
 	if useBrownfield {
+		// Brownfield writes and its verify command run against the live
+		// workspace, so parent directories are created eagerly here. The
+		// greenfield path defers directory creation to TxFS.Commit, letting a
+		// failed run roll the workspace back to a completely pristine state.
+		if err := ensureParentDirs(p.root, artifacts); err != nil {
+			return nil, ModeAuto, nil, err
+		}
 		verify := p.verify
 		if verify == nil {
 			verify = detectVerifyCommand
@@ -311,7 +332,7 @@ func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artif
 		return res, ModeBrownfield, bf, nil
 	}
 
-	gf := greenfield.NewGreenfieldPlanner(p.root)
+	gf := greenfield.NewGreenfieldPlanner(p.root, greenfield.WithTxFS(p.tx))
 	res, err := gf.Plan(ctx, intent, artifacts)
 	if err != nil {
 		return nil, ModeGreenfield, nil, err
@@ -320,11 +341,19 @@ func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artif
 }
 
 // execute runs the planned graph on the kernel engine, dispatching side
-// effects exclusively through the shared event bus. Brownfield graphs run
-// through the closed-loop repair loop.
+// effects exclusively through the shared event bus. Before any file is
+// touched, the plan's artifact writes are sequenced through the execution DAG
+// and checked for cyclic inter-file dependencies. Brownfield graphs run
+// through the closed-loop repair loop; greenfield writes stage through the
+// pipeline's TxFS transaction and reach disk only at Commit.
 func (p *Pipeline) execute(ctx context.Context, planResult *planner.PlanResult, mode Mode, bf *brownfield.BrownfieldPlanner) error {
 	if planResult == nil || planResult.Graph == nil {
 		return errors.New("app: plan produced no graph")
+	}
+	// Sequence the artifact application through the DAG topological order and
+	// reject any cyclic dependency before a single file is written.
+	if _, err := planExecutionOrder(planResult.Artifacts); err != nil {
+		return fmt.Errorf("app: execution order: %w", err)
 	}
 	engine := kernel.NewEngine(p.bus)
 	if mode == ModeBrownfield && bf != nil {

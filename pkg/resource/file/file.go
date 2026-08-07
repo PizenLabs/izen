@@ -72,6 +72,16 @@ func (f *FileResource) ID() string {
 	return filepath.Join(f.workspaceRoot, f.relPath)
 }
 
+// RelPath returns the workspace-relative path of the wrapped file.
+func (f *FileResource) RelPath() string {
+	return f.relPath
+}
+
+// Mode returns the permission bits applied when the file is (re)created.
+func (f *FileResource) Mode() fs.FileMode {
+	return f.mode
+}
+
 // Kind returns resource.KindFile.
 func (f *FileResource) Kind() resource.ResourceKind { return resource.KindFile }
 

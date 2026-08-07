@@ -23,6 +23,7 @@ import (
 	"github.com/PizenLabs/izen/pkg/capability"
 	"github.com/PizenLabs/izen/pkg/event"
 	"github.com/PizenLabs/izen/pkg/extractor"
+	txfs "github.com/PizenLabs/izen/pkg/fs"
 	"github.com/PizenLabs/izen/pkg/ir"
 	"github.com/PizenLabs/izen/pkg/knowledge"
 	"github.com/PizenLabs/izen/pkg/op"
@@ -162,6 +163,12 @@ type Pipeline struct {
 	kg       *knowledge.KnowledgeGraph
 	compiler IntentCompiler
 
+	// tx is the transactional file system every artifact application stages
+	// through. It is created bound to the workspace root and is reusable
+	// across runs: Begin opens a transaction, Commit applies it atomically and
+	// Rollback restores the workspace after a rejection or failure.
+	tx *txfs.TxFS
+
 	eventsMu sync.Mutex
 	events   []event.Event
 }
@@ -186,6 +193,9 @@ func NewPipeline(opts ...Option) (*Pipeline, error) {
 	}
 	for _, opt := range opts {
 		opt(p)
+	}
+	if p.tx == nil {
+		p.tx = txfs.NewTxFS(p.root)
 	}
 	if p.registry == nil {
 		return nil, errors.New("app: nil capability registry")
@@ -287,19 +297,27 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 	// Stages 2-5 — generate, extract, evaluate evidence, validate. A
 	// rejected extraction or a failed validation gate re-prompts with the
 	// failure payload; nothing is written to disk before every artifact
-	// passes.
+	// passes. The whole write pipeline runs inside a TxFS transaction: a
+	// failed generation or a rejected Semantic Alignment Gate rolls the
+	// transaction back before re-entering the repair loop or exiting, so a
+	// rejected output can never reach the workspace.
+	if err := p.tx.Begin(); err != nil {
+		return nil, fmt.Errorf("app: begin transaction: %w", err)
+	}
 	attempts := 0
 	rejections := 0
 	repairs := 0
 	var raw string
 	for {
 		if err := ctx.Err(); err != nil {
+			_ = p.tx.Rollback()
 			return nil, err
 		}
 		attempts++
 
 		raw, err = p.generate(ctx, res.SystemPrompt, userPrompt)
 		if err != nil {
+			_ = p.tx.Rollback()
 			return nil, fmt.Errorf("app: generation: %w", err)
 		}
 		p.emitStage(ctx, "extraction")
@@ -308,7 +326,11 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 		if extraction.Evaluate() != extractor.DecisionAccept {
 			rejections++
 			if rejections >= p.maxAttempts {
+				_ = p.tx.Rollback()
 				return nil, &ExtractionError{Attempts: attempts, Evidence: extraction.EvidenceSet(), Raw: raw}
+			}
+			if err := p.restartTx(); err != nil {
+				return nil, err
 			}
 			res.SystemPrompt = appendExtractionFailure(res.SystemPrompt, raw, extraction)
 			continue
@@ -320,9 +342,13 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 		res.Validations = validations
 		if !allValidationsPass(validations) {
 			if repairs >= p.maxRepairs {
+				_ = p.tx.Rollback()
 				return nil, &ValidationError{Repairs: repairs, Validations: validations}
 			}
 			repairs++
+			if err := p.restartTx(); err != nil {
+				return nil, err
+			}
 			res.SystemPrompt = appendValidationRejection(res.SystemPrompt, validations)
 			p.emitStage(ctx, "validation.repair")
 			continue
@@ -338,15 +364,23 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 	p.emitStage(ctx, "plan")
 	planResult, planMode, bfPlanner, err := p.plan(ctx, req.Intent, res.Artifacts, req.IntentIR, policy)
 	if err != nil {
+		_ = p.tx.Rollback()
 		return nil, fmt.Errorf("app: plan: %w", err)
 	}
 	res.Plan = planResult
 	res.Mode = planMode
 
-	// Stage 7 — Kernel engine execution.
+	// Stage 7 — Kernel engine execution. Greenfield writes are staged through
+	// the transaction and become visible only when the plan commits atomically.
 	p.emitStage(ctx, "execute")
 	if err := p.execute(ctx, planResult, planMode, bfPlanner); err != nil {
+		_ = p.tx.Rollback()
 		return nil, fmt.Errorf("app: execute: %w", err)
+	}
+
+	if err := p.tx.Commit(); err != nil {
+		_ = p.tx.Rollback()
+		return nil, fmt.Errorf("app: commit transaction: %w", err)
 	}
 
 	p.settleEvents()
@@ -707,6 +741,22 @@ func allValidationsPass(vals []ArtifactValidation) bool {
 		}
 	}
 	return true
+}
+
+// validateArtifactPaths rejects any artifact whose path is absolute or
+// resolves outside the workspace root. It performs no I/O and runs before any
+// planning or write so a malicious or malformed path can never reach disk.
+func validateArtifactPaths(root string, artifacts []ir.Artifact) error {
+	for _, a := range artifacts {
+		if a.Kind != ir.ArtifactFile || a.Path == "" {
+			continue
+		}
+		clean := filepath.Clean(a.Path)
+		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("app: artifact path %q escapes workspace root %q", a.Path, root)
+		}
+	}
+	return nil
 }
 
 // ensureParentDirs creates the parent directories of every file artifact
