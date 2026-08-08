@@ -106,11 +106,12 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 
 	initStage := initComplete
 	if !localActive {
-		// Even if a local .izen/config.json is missing but .izen/ dir state
-		// exists, recover into the completed state rather than re-onboarding.
-		if state.HasLocalState(root) {
-			localActive = true
-		}
+		// .izen/config.json is missing. Do NOT let leftover .izen/ directory
+		// state (state.HasLocalState) promote this workspace past onboarding:
+		// isProjectInitialized() requires config.json to render the workspace,
+		// so any initStage other than initNone here deadlocks into a frozen
+		// welcome header. Route to the wizard instead.
+		initStage = initNone
 	}
 	if !localActive {
 		// Always start at the welcome screen (initNone) when .izen/ does not
@@ -394,11 +395,8 @@ func RunMainDashboardWithApp(cfg *config.Config, root string, localCfg *config.L
 	_, localCfgErr := os.Stat(localCfgPath)
 	localActive := localCfgErr == nil
 	if !localActive {
-		if state.HasLocalState(root) {
-			localActive = true
-		}
-	}
-	if !localActive {
+		// config.json is the sole onboarding authority; leftover .izen/ dir
+		// state must never promote past onboarding (see NewProgramWithApp).
 		initStage = initNone
 	}
 
@@ -434,11 +432,8 @@ func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalCo
 	_, localCfgErr := os.Stat(localCfgPath)
 	localActive := localCfgErr == nil
 	if !localActive {
-		if state.HasLocalState(root) {
-			localActive = true
-		}
-	}
-	if !localActive {
+		// config.json is the sole onboarding authority; leftover .izen/ dir
+		// state must never promote past onboarding (see NewProgramWithApp).
 		initStage = initNone
 	}
 

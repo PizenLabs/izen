@@ -44,13 +44,14 @@ func (m *model) Init() tea.Cmd {
 	m.lastTipRotation = time.Now()
 	m.proTipIndex = 0
 	if m.initStage != initNone && m.initStage != initComplete {
-		return tea.Batch(m.smoothStreamTickCmd(), m.proTipTickCmd())
+		return tea.Batch(m.smoothStreamTickCmd(), m.proTipTickCmd(), m.configLoadedCmd())
 	}
 	cmds := []tea.Cmd{
 		m.smoothStreamTickCmd(),
 		m.proTipTickCmd(),
 		m.ti.Focus(),
 		m.initSessionStartCheckpoint,
+		m.configLoadedCmd(),
 	}
 	// Arm the fact-only control telemetry bridge so control.iteration /
 	// control.node_observed facts stream into the loop as controlFactMsg.
@@ -76,6 +77,21 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			model = m
 		}
 	}()
+
+	// ── DEFENSIVE WORKSPACE GUARD ──────────────────────────────────────────
+	// Reconcile the in-memory initStage with the on-disk workspace state on
+	// every update. A completed initStage that is no longer backed by disk
+	// state (e.g. the user deleted .izen/ mid-session) must either self-heal
+	// or route back to the onboarding wizard — it can never be left rendering
+	// a frozen welcome header with no interactive input bar. This runs before
+	// any key routing so the deadlock state is dissolved on the very first
+	// event after the workspace disappears.
+	if m.initStage == initComplete && !m.isProjectInitialized() {
+		if !m.selfHealWorkspace() {
+			m.initStage = initNone
+			m.ti.Blur()
+		}
+	}
 
 	// ── QUIT-CONFIRM MODAL INTERCEPT ─────────────────────────────────────
 	// While the exit-safety dialog is open, every key is routed to the modal
@@ -241,6 +257,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+
+	case configLoadedMsg:
+		// Defensive workspace loader result (dispatched once per startup from
+		// Init). Reconciles initStage with the on-disk workspace state so the
+		// UI always reaches the interactive input bar or the onboarding
+		// wizard — never a frozen, header-only screen.
+		m.handleConfigLoaded(msg)
+		return m, nil
 
 	case domainEventMsg:
 		// Event bus projection: engines publish domain events headlessly and

@@ -47,6 +47,14 @@ func (m *model) renderInitView() string {
 		// initStage was left at the zero value, show a meaningful welcome
 		// screen with git detection instead of a blank/empty UI.
 		b.WriteString(m.renderInitFirstRun(width))
+	case initComplete:
+		// Defensive: the project is uninitialized on disk even though
+		// initStage was marked complete (e.g. .izen/ was deleted and
+		// self-healing is unavailable). Render the first-run welcome so the
+		// screen is never a bare banner with no onboarding content — the
+		// Update guard will re-route initStage to the wizard on the next
+		// event anyway.
+		b.WriteString(m.renderInitFirstRun(width))
 	}
 
 	b.WriteString("\n")
@@ -258,6 +266,8 @@ func (m *model) renderInitHelp(width int) string {
 	case initProviderSelect:
 		hint = "↑/↓ to select • Enter: confirm • Type: to search"
 	case initNone:
+		hint = "Enter: begin setup • G: init git • Esc: skip"
+	case initComplete:
 		hint = "Enter: begin setup • G: init git • Esc: skip"
 	}
 	return initMutedStyle.Render(hint)

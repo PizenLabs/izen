@@ -67,6 +67,17 @@ const (
 	initComplete
 )
 
+// configLoadedMsg is dispatched after the defensive workspace loader runs
+// (guaranteed once per startup via Init). It is the single seam that
+// reconciles the in-memory initStage with the on-disk workspace state: a
+// completed initStage backed by a missing .izen/ is self-healed (recreated
+// with default project settings) or routed back to the onboarding wizard —
+// never left rendering a frozen welcome header with no interactive input.
+type configLoadedMsg struct {
+	localCfg *config.LocalConfig
+	err      error
+}
+
 // ── Message types ─────────────────────────────────────────────────────────────
 
 type role uint8
@@ -1330,17 +1341,22 @@ func (m *model) pipelineFacade() pipeline.Facade {
 // isProjectInitialized checks whether .izen/ exists AND contains a valid
 // config.json on disk. This is the AUTHORITATIVE first-run gate used by
 // BuildWorkspace to decide whether to render the onboarding overlay or the
-// normal mode workspace. It supersedes any in-memory initStage value.
+// normal mode workspace. It supersedes any in-memory initStage value. Any
+// stat failure (missing, unreadable, ENOTDIR, or a non-directory .izen/)
+// reports "not initialized" so the UI can never enter a workspace the disk
+// does not back.
 func (m *model) isProjectInitialized() bool {
 	if m.workspaceRoot == "" {
 		return false
 	}
 	izenDir := filepath.Join(m.workspaceRoot, ".izen")
-	if _, err := os.Stat(izenDir); os.IsNotExist(err) {
+	fi, err := os.Stat(izenDir)
+	if err != nil || !fi.IsDir() {
 		return false
 	}
 	cfgPath := filepath.Join(m.workspaceRoot, ".izen", "config.json")
-	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+	fi, err = os.Stat(cfgPath)
+	if err != nil || fi.IsDir() {
 		return false
 	}
 	return true
