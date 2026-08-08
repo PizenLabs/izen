@@ -371,3 +371,51 @@ func TestParseChainSupport(t *testing.T) {
 		t.Errorf("Directives = %v, want [$run $test]", ast.Directives)
 	}
 }
+
+// TestParseInWorkspaceDefaultContext verifies that a bare $hot typed inside
+// the /build workspace resolves against the build permission set — the TUI's
+// active-workspace semantics — instead of the read-only WorkspaceAsk default.
+func TestParseInWorkspaceDefaultContext(t *testing.T) {
+	ast, err := ParseInWorkspace("$hot fix login timeout", command.Default(), command.WorkspaceBuild)
+	if err != nil {
+		t.Fatalf("ParseInWorkspace($hot in build) unexpected error: %v", err)
+	}
+	if ast.Workspace != command.WorkspaceBuild {
+		t.Errorf("Workspace = %v, want build (session default)", ast.Workspace)
+	}
+	if len(ast.Directives) != 1 || ast.Directives[0].Name != "hot" {
+		t.Errorf("Directives = %v, want [$hot]", ast.Directives)
+	}
+	if ast.Goal != "fix login timeout" {
+		t.Errorf("Goal = %q, want %q", ast.Goal, "fix login timeout")
+	}
+}
+
+// TestParseInWorkspaceReadOnlyDefault verifies the same line is rejected in a
+// read-only workspace: the default workspace still gates the directive.
+func TestParseInWorkspaceReadOnlyDefault(t *testing.T) {
+	_, err := ParseInWorkspace("$hot fix login timeout", command.Default(), command.WorkspaceAsk)
+	if err == nil {
+		t.Fatal("ParseInWorkspace($hot in ask) expected ErrPermissionDenied, got nil")
+	}
+	var pe *ParseError
+	if !errors.As(err, &pe) || pe.Kind != ErrPermissionDenied {
+		t.Fatalf("error = %v, want *ParseError{Kind: ErrPermissionDenied}", err)
+	}
+}
+
+// TestParseInWorkspaceExplicitMarkerOverridesDefault verifies an explicit
+// /workspace marker in the line always wins over the session default.
+func TestParseInWorkspaceExplicitMarkerOverridesDefault(t *testing.T) {
+	ast, err := ParseInWorkspace("/ask $hot x", command.Default(), command.WorkspaceBuild)
+	if err == nil {
+		t.Fatalf("ParseInWorkspace(/ask $hot) expected ErrPermissionDenied, got %+v", ast)
+	}
+	var pe *ParseError
+	if !errors.As(err, &pe) || pe.Kind != ErrPermissionDenied {
+		t.Fatalf("error = %v, want *ParseError{Kind: ErrPermissionDenied}", err)
+	}
+	if pe.Workspace != command.WorkspaceAsk {
+		t.Errorf("denied workspace = %v, want ask (from explicit marker)", pe.Workspace)
+	}
+}

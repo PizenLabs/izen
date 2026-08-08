@@ -87,6 +87,27 @@ func workspaceForMode(m modes.Mode) command.WorkspaceType {
 	}
 }
 
+// modeForWorkspace maps a command-domain workspace back to the session mode.
+// It is the inverse of workspaceForMode and drives the workspace transition
+// the deterministic parser pipeline performs when an intent declares a
+// /workspace marker different from the active session mode.
+func modeForWorkspace(ws command.WorkspaceType) modes.Mode {
+	switch ws {
+	case command.WorkspaceAsk:
+		return modes.ModeAsk
+	case command.WorkspaceInvestigate:
+		return modes.ModeInvestigate
+	case command.WorkspacePlan:
+		return modes.ModePlan
+	case command.WorkspaceBuild:
+		return modes.ModeBuild
+	case command.WorkspaceReview:
+		return modes.ModeReview
+	default:
+		return modes.ModeAsk
+	}
+}
+
 // workspaceFromName maps a canonical workspace name back to its type.
 func workspaceFromName(name string) (command.WorkspaceType, bool) {
 	for _, ws := range []command.WorkspaceType{

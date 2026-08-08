@@ -218,154 +218,30 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
-	// ── Composite fast-query routing: /review $test ───────────────────
-	// MUST be evaluated at the very top of the evaluation tree, strictly
-	// before parseModeShorthand (which would otherwise match the "/review "
-	// prefix and route this to a plain static /review, silently bypassing the
-	// dynamic-test-then-review composite shortcut).
-	if command.IsReviewTestComposite(line) {
-		m.push(roleSystem, accentStyle.Render(Icon.Index+" [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
+	// ── DETERMINISTIC PARSE PIPELINE ───────────────────────────────────
+	// Every remaining input reaches the parser BEFORE any string-prefix
+	// command lookup or intent dispatch. parser.ParseInWorkspace resolves
+	// /workspace markers, $ directives, @ scopes, and the natural-language
+	// goal into a structured IntentAST and enforces the permission policy
+	// against the effective workspace (the active session workspace when the
+	// line declares none). Parse errors are surfaced verbatim and execution
+	// stops — the raw-input "unknown command: <line>" fallback is never
+	// emitted.
+	ast, err := m.intentFromInput(line)
+	if err != nil {
+		m.push(roleError, err.Error())
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
-		return m.runReviewTestComposite()
+		return nil
 	}
 
-	// ── $prompt — GLOBAL MODE-GUARD ROUTER TO /ask ───────────────────────
-	// $prompt is a global routing entry point, not an execution mode. From
-	// ANY active mode it transitions cleanly to /ask, injecting the query as
-	// /ask input for structured Forensic Context Ledger generation. It MUST
-	// NEVER execute /build, /review, /plan, or /investigate logic inside the
-	// originating mode — the only allowed action is the transition to /ask.
-	if line == "$prompt" || strings.HasPrefix(line, "$prompt ") {
-		m.cancelStaleAgentOps()
-		if line == "$prompt" {
-			m.push(roleError, "[Usage] $prompt <your raw architectural idea or description>")
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			return nil
-		}
-		rawInput := strings.TrimSpace(line[8:])
-
-		// ── COMPRESSOR FAST-TRACK ──────────────────────────
-		// Check the prompt compressor first. If it signals a direct
-		// mutation (BypassInvest=true) with a target file, skip ALL
-		// Architect prompts, skip /investigate mode routing entirely,
-		// and route directly to BUILD with a staged FILE_MUTATE task.
-		if compressed := gateway.CompressPrompt(rawInput); compressed != nil && compressed.BypassInvest && compressed.Target != "" {
-			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected by compressor. Bypassing architect analysis."))
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			targets := gateway.ExtractDirectMutationTargets(rawInput)
-			if len(targets) > 1 {
-				var tasks []plan.Task
-				for i, f := range targets {
-					tasks = append(tasks, plan.Task{
-						StepNum: i + 1,
-
-						Status:      "idle",
-						Type:        "FILE_MUTATE",
-						Target:      f,
-						Description: rawInput,
-						Rationale:   fmt.Sprintf("Fast-Track multi-file decomposition: target %d of %d", i+1, len(targets)),
-						IsHardcoded: true,
-					})
-				}
-				return func() tea.Msg {
-					return planResultMsg{
-						Tasks:       tasks,
-						IsFastTrack: true,
-					}
-				}
-			}
-			target := command.FallbackPlanTarget{
-				File:        compressed.Target,
-				Description: rawInput,
-				TaskType:    "FILE_MUTATE",
-			}
-			tasks := command.GenerateFallbackPlan(target)
-			return func() tea.Msg {
-				return planResultMsg{
-					Tasks:       tasks,
-					IsFastTrack: true,
-				}
-			}
-		}
-
-		// ── INTENT PRE-GUARD: Fast-track direct file mutations ──────────
-		// pipeline. If the user is requesting a simple single-file mutation
-		// on a non-code file (e.g. $prompt rename author in @LICENSE),
-		// classify it and route directly to /build as a FILE_MUTATE task
-		// with zero LLM involvement — no forensic analysis, no go test.
-		if target, isDirect := gateway.ClassifyDirectMutation(rawInput); isDirect {
-			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected. Bypassing architect analysis."))
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			// Multi-file decomposition: when the prompt lists multiple
-			// files (comma-separated), create distinct TODO items for each.
-			multiTargets := gateway.ExtractDirectMutationTargets(rawInput)
-			if len(multiTargets) > 1 {
-				var tasks []plan.Task
-				for i, f := range multiTargets {
-					tasks = append(tasks, plan.Task{
-						StepNum: i + 1,
-
-						Status:      "idle",
-						Type:        "FILE_MUTATE",
-						Target:      f,
-						Description: rawInput,
-						Rationale:   fmt.Sprintf("Fast-Track multi-file decomposition: target %d of %d", i+1, len(multiTargets)),
-						IsHardcoded: true,
-					})
-				}
-				return func() tea.Msg {
-					return planResultMsg{
-						Tasks:       tasks,
-						IsFastTrack: true,
-					}
-				}
-			}
-			tasks := command.GenerateFallbackPlan(target)
-			return func() tea.Msg {
-				return planResultMsg{
-					Tasks:       tasks,
-					IsFastTrack: true,
-				}
-			}
-		}
-
-		currentMode := m.resolver.Current()
-		if currentMode != modes.ModeAsk {
-			// Mode Guard Enforced: request state transition to /ask, then
-			// queue the $prompt synthesis directly via runAskPromptHandoffCmd.
-			// This preserves the lean ask handoff prompt — we MUST NOT re-enter handleInput
-			// because the raw input no longer carries the $prompt prefix and
-			// would be routed to the normal AskContract() streaming path,
-			// producing conversational noise instead of the structured
-			// handoff prompt.
-			m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
-				"$prompt from /%s — transitioning to /ask for structured analysis...", currentMode)))
-			m.modeChangeAuthorized = true
-			cmd := m.setMode(modes.ModeAsk)
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			return tea.Batch(cmd, m.runAskPromptHandoffCmd(rawInput))
-		}
-
-		m.push(roleSystem, infoStyle.Render("Refining prompt through ask handoff..."))
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return m.runAskPromptHandoffCmd(rawInput)
-	}
-
-	// $ sub-command prefix — delegates to handleReviewDollar for routing.
-	if strings.HasPrefix(line, "$") {
-		// ANTI-DEADLOCK: unconditionally sanitize stale execution flags
-		// before spawning any background task. Prevents ghost spinner lock
-		// when sequential $ commands are issued without a clean reset.
-		cmd := m.handleReviewDollar(line)
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return cmd
+	// Directive- and global-bearing intents (including the /review $test
+	// composite and the $prompt /ask router) are dispatched structurally from
+	// the AST: workspace transition first, then commands, then directives.
+	// Bare workspace switches and free-form goals fall through to the legacy
+	// string routing below, which already handles them.
+	if len(ast.Directives) > 0 || len(ast.GlobalCommands) > 0 {
+		return m.dispatchASTIntent(ast)
 	}
 
 	if mode, content, ok := parseModeShorthand(line); ok {

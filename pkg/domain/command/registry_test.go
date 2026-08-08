@@ -50,7 +50,7 @@ func TestWorkspacePermissions(t *testing.T) {
 		lacks Permission
 	}{
 		{WorkspaceAsk, PermissionSet(PermRead), PermRead, PermWrite},
-		{WorkspaceInvestigate, PermissionSet(PermRead | PermAnalyze), PermAnalyze, PermExecute},
+		{WorkspaceInvestigate, PermissionSet(PermRead | PermAnalyze | PermExecute), PermExecute, PermWrite},
 		{WorkspacePlan, PermissionSet(PermRead | PermAnalyze), PermRead, PermExecute},
 		{WorkspaceBuild, PermissionSet(PermRead | PermAnalyze | PermWrite | PermExecute), PermWrite, 0},
 		{WorkspaceReview, PermissionSet(PermRead | PermAnalyze | PermExecute), PermExecute, PermWrite},
@@ -106,7 +106,7 @@ func TestGetAllowedDirectivesAskExact(t *testing.T) {
 // must return every registered directive.
 func TestGetAllowedDirectivesBuildReturnsAll(t *testing.T) {
 	got := names(Default().GetAllowedDirectives(WorkspaceBuild))
-	want := []string{"diagnose", "env", "fix", "hot", "prompt", "run", "test", "trace"}
+	want := []string{"diagnose", "env", "fix", "hot", "log", "prompt", "run", "test", "trace"}
 	if !equalStrings(got, want) {
 		t.Errorf("WorkspaceBuild directives = %v, want %v", got, want)
 	}
@@ -116,14 +116,15 @@ func TestGetAllowedDirectivesBuildReturnsAll(t *testing.T) {
 }
 
 // TestGetAllowedDirectivesSubsetLogic verifies the bitwise subset behavior for
-// the intermediate workspaces: investigate/plan never receive execute or write
-// directives, review receives execute (run/test) but never write (hot/fix).
+// the intermediate workspaces: plan never receives execute or write directives;
+// investigate receives execute (test/log) but never write; review receives
+// execute (run/test) but never write (hot/fix).
 func TestGetAllowedDirectivesSubsetLogic(t *testing.T) {
 	tests := []struct {
 		ws        WorkspaceType
 		forbidden []string
 	}{
-		{WorkspaceInvestigate, []string{"hot", "fix", "run", "test"}},
+		{WorkspaceInvestigate, []string{"hot", "fix"}},
 		{WorkspacePlan, []string{"hot", "fix", "run", "test"}},
 		{WorkspaceReview, []string{"hot", "fix"}},
 	}
@@ -354,7 +355,7 @@ func TestAllEnumeration(t *testing.T) {
 	if !equalStrings(globalNames, []string{"arch", "checkpoint", "clear", "commit", "drop", "explain-decision", "help", "model", "objective", "provider", "quit", "session", "undo", "usage"}) {
 		t.Errorf("global surface = %v", globalNames)
 	}
-	if !equalStrings(dollarNames, []string{"diagnose", "env", "fix", "hot", "prompt", "run", "test", "trace"}) {
+	if !equalStrings(dollarNames, []string{"diagnose", "env", "fix", "hot", "log", "prompt", "run", "test", "trace"}) {
 		t.Errorf("dollar surface = %v", dollarNames)
 	}
 }
