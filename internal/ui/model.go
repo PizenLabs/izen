@@ -1839,6 +1839,18 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 		m.toolCallBuffer.Reject()
 	}
 
+	// 4b. Abort any in-flight hotfix: restore the stashed plan and clear the
+	// hotfixActive flag so a subsequent buildResultMsg can NEVER wrongly
+	// trigger the plan-restore branch for a hotfix that was interrupted before
+	// completion. Mirrors the Alt+R rejection path in keys.go.
+	if m.hotfixActive {
+		if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
+			m.sess.StageTaskList(&stashedTasks)
+			_ = m.sess.Save()
+		}
+		m.hotfixActive = false
+	}
+
 	// 5. Restore interactive input and force the presentation back to chat.
 	m.ti.Focus()
 	m.recalcViewportHeight()

@@ -1141,10 +1141,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case hotfixProposalMsg:
+		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
+		// processing flag, then re-derive the presentation state so a stale
+		// StateProcessing derived during patch generation is released — the
+		// "[HOTFIX] Pipeline PAUSED" / "Applying hotfix..." spinner can never
+		// stay up. Pending-approval overrides below via enterApprovalState.
 		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
+		m.syncUIState()
 
 		// ── HOTFIX PROPOSAL FAILURE ───────────────────────────────────
 		// Patch generation failed: surface the error, abort the hotfix, and

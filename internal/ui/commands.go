@@ -867,6 +867,13 @@ const planLocalMaxLatency = 150 * time.Second
 // lets a rate-limited small model finish the whole unified build in one turn.
 const buildGenerationTimeout = 5 * time.Minute
 
+// hotfixApplyTimeout is the strict deadline for applying an approved hotfix
+// patch to disk (file IO, shadow backup, transaction recording). A wedged
+// filesystem or git operation must never freeze the "Applying hotfix..."
+// spinner indefinitely — on expiry the apply aborts cleanly and a terminal
+// buildResultMsg is emitted.
+const hotfixApplyTimeout = 30 * time.Second
+
 // runPlanEngineCmd executes the (potentially slow) PlanEngine ledger synthesis
 // in a background goroutine so the synchronous LLM call never blocks the Bubble
 // Tea event loop. The result is delivered asynchronously as a planResultMsg,
@@ -3175,7 +3182,17 @@ func resolveHotfixTarget(prompt string) string {
 // exits cleanly — ensuring a single $hot command never triggers multiple LLM
 // API calls.
 func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal hotfixProposalMsg MUST reach the TUI event loop on ANY
+		// exit path — success, error, or panic — so the "Applying hotfix..."
+		// spinner can never be orphaned while the patch is generated.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = hotfixProposalMsg{Err: fmt.Errorf("hotfix patch generation panic: %v", r)}
+			}
+		}()
+
 		// ── Read existing file content ──────────────────────────
 		// Without the original content, local fuzzy replacement and
 		// LLM-based diff computation both produce incorrect results.
@@ -4328,7 +4345,23 @@ func resolveReferenceTemplate(target, description string) string {
 }
 
 func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal buildResultMsg MUST reach the TUI event loop on ANY
+		// exit path — success, error, timeout, or panic — so the "Applying
+		// hotfix..." spinner can never be orphaned. A panic inside the apply
+		// pipeline (e.g. a nil execution engine) is converted into an
+		// error-carrying buildResultMsg below.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildResultMsg{
+					output:   "",
+					exitCode: -1,
+					err:      fmt.Errorf("hotfix apply panic: %v", r),
+				}
+			}
+		}()
+
 		if err := m.transitionToBuilding(); err != nil {
 			return buildResultMsg{
 				output:   "",
@@ -4343,7 +4376,24 @@ func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cm
 				err:      fmt.Errorf("hotfix authorization failed: %w", err),
 			}
 		}
-		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
+
+		// ── STRICT MUTATION TIMEOUT ─────────────────────────────────────
+		// The patch application (file IO + shadow backup + transaction
+		// recording) is bounded by a strict deadline so a deadlocked Apply can
+		// never freeze the "Applying hotfix..." spinner indefinitely. On
+		// expiry a terminal error message is emitted and the enclosing
+		// transaction is rolled back by the buildResultMsg handler.
+		if m.execEng == nil {
+			return buildResultMsg{
+				output:   "",
+				exitCode: 1,
+				err:      fmt.Errorf("hotfix patch apply aborted: execution engine not configured"),
+			}
+		}
+		applyCtx, applyCancel := context.WithTimeout(context.Background(), hotfixApplyTimeout)
+		defer applyCancel()
+		applyErr := m.execEng.Patches.ApplyContext(applyCtx, patch)
+		if applyErr != nil {
 			// Graceful no-op skip: the destruction guardrail refused a >80%
 			// file wipe without an explicit delete/clear instruction. The file
 			// is unchanged — mark the task done (no changes needed) instead of
