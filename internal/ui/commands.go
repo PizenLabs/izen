@@ -5579,6 +5579,7 @@ func (m *model) cancelStaleAgentOps() {
 	m.cancelAllBackgroundContexts()
 
 	m.reviewRunning = false
+	m.investigateRunning = false
 	m.agentRunning = false
 	m.agentDone = false
 	m.agentLabel = ""

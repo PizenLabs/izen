@@ -23,6 +23,13 @@ import (
 )
 
 func (m *model) runInvestigateCmd(content string) tea.Cmd {
+	// Set investigateRunning synchronously (event-loop thread) so the view
+	// renders the spinner immediately and Esc/Ctrl+C can cancel the in-flight
+	// run through the central Emergency Interrupt Registry before the async
+	// agentStartMsg is even processed (mirrors runReviewCmd).
+	m.investigateRunning = true
+	m.lastActionTime = time.Now()
+
 	return tea.Batch(
 		func() tea.Msg {
 			return agentStartMsg{label: "investigating"}
@@ -43,7 +50,27 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 	// Register cancel so it can be invoked on mode transition/Ctrl+C
 	m.registerBackgroundCancel(cancel)
 
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal investigateResultMsg MUST reach the TUI event loop on
+		// ANY exit path — success, error, or panic. If the closure itself
+		// panics (e.g. a nil result during escalation formatting), the recover
+		// below converts it into an error-carrying investigateResultMsg so the
+		// spinner can never be orphaned. The named return + defer order
+		// guarantees msg is set before cancel() runs.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = investigateResultMsg{
+					records:    []record{{role: roleError, text: fmt.Sprintf("investigation failed: %v", r)}},
+					err:        fmt.Errorf("investigate pipeline panic: %v", r),
+					sessionKey: content,
+				}
+			}
+		}()
+		// Release the 60s watchdog once the run completes (a no-op on the
+		// registered background cancel if it was already fired by Esc/Ctrl+C).
+		defer cancel()
+
 		if !currentMode.CanShell() {
 			return investigateResultMsg{err: fmt.Errorf("investigate mode: shell execution denied by %s capabilities", currentMode)}
 		}
@@ -60,6 +87,14 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 		outCh := make(chan outcome, 1)
 
 		go func() {
+			// Panic guard: a panic inside the engine must still deliver an
+			// error outcome so the select below resolves immediately instead of
+			// freezing the spinner for the full 60s deadline waiting on outCh.
+			defer func() {
+				if r := recover(); r != nil {
+					outCh <- outcome{err: fmt.Errorf("investigate engine panic: %v", r)}
+				}
+			}()
 			// The investigate retriever's graph tier is served from the Phase 3
 			// Lea structural engine when one is attached, degrading to a
 			// no-op graph source otherwise.
@@ -109,9 +144,6 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 		case <-ctx.Done():
 			engErr = fmt.Errorf("investigation timed out after 60s: %w", ctx.Err())
 		}
-
-		// Unregister cancel since we're done
-		cancel()
 
 		var recs []record
 

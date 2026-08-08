@@ -110,11 +110,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				return m.handleEmergencyInterrupt("ctrl-c")
 			}
 		case tea.KeyEsc:
-			// Esc aborts any active review pipeline (manual /review or a
-			// $test/$run/$log sub-command that holds reviewRunning) by
-			// cancelling the registered review context and returning focus to
-			// the input bar — never killing the app.
-			if m.state == StateProcessing || m.planPending || m.reviewRunning {
+			// Esc aborts any active review OR investigate pipeline (manual
+			// /review, /investigate, or a $test/$run/$log sub-command that
+			// holds reviewRunning) by cancelling the registered background
+			// context and returning focus to the input bar — never killing
+			// the app.
+			if m.state == StateProcessing || m.planPending || m.reviewRunning || m.investigateRunning {
 				return m.handleEmergencyInterrupt("escape")
 			}
 		case tea.KeyCtrlD:
@@ -437,10 +438,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case agentDoneMsg:
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
@@ -451,16 +449,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 	case investigateResultMsg:
 		m.lastAgentActivity = time.Now()
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
+		// processing flag (including investigateRunning) so the spinner can
+		// never be orphaned on a failed, timed-out, or aborted investigation —
+		// then re-derive the presentation state so a stale StateProcessing
+		// derived during the run is released and the viewport returns to
+		// interactive chat. Pending-approval overrides.
+		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
-		// Re-derive the presentation state from the cleared flags so a stale
-		// StateProcessing derived during the investigation is released and the
-		// viewport returns to interactive chat. Pending-approval overrides.
 		m.syncUIState()
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+providers.SanitizeAPIError(msg.err))
@@ -557,14 +555,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.planPending = false
 		m.planStartedAt = time.Time{}
 
-		// ALWAYS clear the transient loading flags first so the spinner can
-		// never freeze, regardless of which branch below we take.
+		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
+		// processing flag first so the spinner can never freeze, regardless of
+		// which branch below we take, then re-derive the presentation state
+		// from the cleared flags: a stale StateProcessing derived during
+		// synthesis (e.g. via a phase-change event while agentRunning was
+		// true) must be released here so the viewport returns to interactive
+		// chat and Alt+P / Alt+R respond immediately. Pending-approval always
+		// overrides if a gate is set.
+		m.clearBusyFlags()
 		m.reconcileSpinner()
-		// Re-derive the presentation state from the cleared flags: a stale
-		// StateProcessing derived during synthesis (e.g. via a phase-change
-		// event while agentRunning was true) must be released here so the
-		// viewport returns to interactive chat and Alt+P / Alt+R respond
-		// immediately. Pending-approval always overrides if a gate is set.
 		m.syncUIState()
 
 		if msg.Err != nil {
@@ -725,7 +725,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, flush
 
 	case graphBuiltMsg:
-		m.agentRunning = false
+		m.clearBusyFlags()
 		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "graph indexing failed: "+msg.err.Error())
@@ -768,18 +768,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case reviewResultMsg:
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
+		// processing flag so the spinner can never be orphaned on a failed or
+		// aborted review, then re-derive the presentation state so a stale
+		// StateProcessing derived during the run (e.g. via a phase-change
+		// event arriving while reviewRunning was true) is released here and
+		// the "Processing file mutations..." spinner can never stay up.
+		// Pending-approval always overrides if a gate is set.
+		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
-		// Re-derive the presentation state from the cleared flags so a stale
-		// StateProcessing derived during the review run (e.g. via a phase-change
-		// event arriving while reviewRunning was true) is released here and the
-		// "Processing file mutations..." spinner can never stay up. Pending-
-		// approval always overrides if a gate is set.
 		m.syncUIState()
 		if msg.err != nil {
 			m.push(roleError, "review error: "+providers.SanitizeAPIError(msg.err))
@@ -802,10 +801,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, flush
 
 	case testResultMsg:
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.lastTestOutput = msg.output
@@ -965,10 +961,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, flush
 
 	case buildProposalReadyMsg:
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.pipelineRunning = false
 		m.streaming = false
@@ -1148,10 +1141,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case hotfixProposalMsg:
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
@@ -1242,17 +1232,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case buildResultMsg:
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
+		// processing flag so the spinner can never be orphaned on a failed or
+		// aborted build, then re-derive the presentation state from the cleared
+		// flags so a stale StateProcessing derived during the build is
+		// released. Pending-approval overrides (e.g. a queued proposal
+		// awaiting authorization).
+		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.lastTestOutput = msg.output
 		m.lastTestFailed = msg.exitCode != 0
-		// Re-derive the presentation state from the cleared flags so a stale
-		// StateProcessing derived during the build is released. Pending-
-		// approval overrides (e.g. a queued proposal awaiting authorization).
 		m.syncUIState()
 
 		// ── FIX 1: Flush prompt buffer on task failure ────────────────

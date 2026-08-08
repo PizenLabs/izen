@@ -998,6 +998,12 @@ type model struct {
 	// async agentStartMsg to be processed.
 	reviewRunning bool
 
+	// Investigate action spinner: set synchronously on /investigate dispatch
+	// (runInvestigateCmd) so the view immediately renders a spinner and Esc /
+	// Ctrl+C can cancel the in-flight run via the central Emergency Interrupt
+	// Registry before the async engine even starts.
+	investigateRunning bool
+
 	// Safety valve: timestamp of the last review action dispatch. If
 	// reviewRunning stays true longer than the timeout threshold, the
 	// tick loop force-clears it to prevent ghost spinner lock.
@@ -1812,6 +1818,11 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	// up and the view can never block on a phantom producer.
 	m.reconcileSpinner()
 
+	// 2b. Re-derive the presentation state from the cleared flags so the tick
+	// spinner loop halts and the viewport unwinds to interactive chat. Any
+	// residual approval gate is overridden below.
+	m.syncUIState()
+
 	// 3. Release any outstanding approval gate on the canonical source.
 	m.resolveApprovalState()
 
@@ -2483,6 +2494,35 @@ func (m *model) resetStreamingState() {
 	m.stopShimmer()
 }
 
+// clearBusyFlags is the UNIVERSAL TUI state reset for the async pipeline
+// lifecycle. It resets every transient processing flag that drives the tick
+// spinner loop (m.isProcessing is derived from these via syncUIState), so a
+// pipeline that errors or aborts early can NEVER leave an orphaned spinner.
+//
+// GUARANTEED LIFECYCLE PATTERN: every async terminal message handler
+// (investigateResultMsg, hotfixProposalMsg, reviewResultMsg, buildResultMsg,
+// planResultMsg, ...) MUST execute clearBusyFlags() + syncUIState() so the
+// spinner loop halts regardless of the exit path the producer took.
+//
+// IMPORTANT: this method ONLY touches transient processing flags. It must
+// NEVER reset stream buffers, reasoning state, parser references, or persistent
+// view state (m.state, m.currentResult, m.handoffCtx, m.pendingProposals) —
+// reconcileSpinner() layers that additional cleanup on top.
+func (m *model) clearBusyFlags() {
+	m.streaming = false
+	m.streamTickActive = false
+	m.agentRunning = false
+	m.agentLabel = ""
+	m.agentDone = true
+	m.reviewRunning = false
+	m.investigateRunning = false
+	m.pipelineRunning = false
+	m.planPending = false
+	m.shellRunning = false
+	m.spinnerFrame = 0
+	m.lastSpinnerAdvance = time.Time{}
+}
+
 // reconcileSpinner is the single deterministic reset point that ties the
 // Bubble Tea spinner lifecycle to command resolution. It is called whenever an
 // async producer (plan result, investigate result, ledger handoff) resolves or
@@ -2495,24 +2535,14 @@ func (m *model) resetStreamingState() {
 // visibility — otherwise it would wipe the user's actionable buttons or corrupt
 // the active layout when a background command resolves.
 func (m *model) reconcileSpinner() {
-	m.streaming = false
+	m.clearBusyFlags()
 	m.streamCh = nil
 	m.streamCancel = nil
-	m.streamTickActive = false
-	m.agentRunning = false
-	m.agentLabel = ""
-	m.agentDone = true
-	m.reviewRunning = false
-	m.pipelineRunning = false
-	m.planPending = false
-	m.shellRunning = false
 	m.shellCh = nil
 	if m.shellCancel != nil {
 		m.shellCancel()
 		m.shellCancel = nil
 	}
-	m.spinnerFrame = 0
-	m.lastSpinnerAdvance = time.Time{}
 	m.reasoningBuffer.Reset()
 	m.sentinelReasoningFlushed = 0
 	m.pendingReasoningFragment = ""
