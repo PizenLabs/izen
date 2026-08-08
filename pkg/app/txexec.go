@@ -29,7 +29,7 @@ func planExecutionOrder(artifacts []ir.Artifact) ([]*dag.Node, error) {
 		if a.Kind != ir.ArtifactFile {
 			continue
 		}
-		for _, dep := range strings.Split(a.Metadata[greenfield.DependsOnKey], ",") {
+		for _, dep := range strings.Split(a.Metadata.Get(greenfield.DependsOnKey), ",") {
 			dep = strings.TrimSpace(dep)
 			if dep == "" {
 				continue

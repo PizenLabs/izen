@@ -218,7 +218,7 @@ func (p *GreenfieldPlanner) fileResource(a ir.Artifact) (resource.Resource, erro
 // preconditions resolves the artifact's depends_on metadata to writable graph
 // node IDs. The result is sorted for determinism.
 func (p *GreenfieldPlanner) preconditions(a ir.Artifact, writable map[string]string) []string {
-	deps := strings.Split(a.Metadata[DependsOnKey], ",")
+	deps := strings.Split(a.Metadata.Get(DependsOnKey), ",")
 	seen := make(map[string]bool, len(deps))
 	out := make([]string, 0, len(deps))
 	for _, dep := range deps {

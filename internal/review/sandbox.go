@@ -155,6 +155,23 @@ func (s *Sandbox) RunGoTestInProject(pkg string) TestResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
+	return s.RunGoTestInProjectContext(ctx, pkg)
+}
+
+// RunGoTestInProjectContext runs `go test` against the project root, bounded by
+// the caller's context (its deadline or cancellation) instead of a fixed local
+// timeout. Cancellation surfaces as a non-passed result with a timeout marker.
+func (s *Sandbox) RunGoTestInProjectContext(ctx context.Context, pkg string) TestResult { //nolint:contextcheck // threads a caller-provided scope into exec.CommandContext below
+	if !s.created {
+		return TestResult{Passed: false, Output: "sandbox not created", Panicked: false}
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
 	cmd := exec.CommandContext(ctx, "go", "test", "-v", "-count=1", pkg)
 	cmd.Dir = s.ProjectRoot
 
@@ -168,6 +185,9 @@ func (s *Sandbox) RunGoTestInProject(pkg string) TestResult {
 	}
 
 	if err != nil {
+		if ctx.Err() != nil {
+			return TestResult{Passed: false, Output: truncateOutput("verification timed out or was cancelled: "+ctx.Err().Error()+"\n"+outStr, 2000), Panicked: false}
+		}
 		if strings.Contains(outStr, "panic") {
 			return TestResult{Passed: false, Output: truncateOutput(outStr, 2000), Panicked: true}
 		}
@@ -187,16 +207,35 @@ func truncateOutput(s string, max int) string {
 type SandboxRunFn func(sb *Sandbox) (EvidenceStatus, EvidenceConfidence, string, string)
 
 func RunWithSandbox(reviewID, projectRoot string, fn SandboxRunFn) (EvidenceRecord, error) {
+	return RunWithSandboxContext(context.Background(), reviewID, projectRoot, fn)
+}
+
+// RunWithSandboxContext is RunWithSandbox with an external cancellation scope.
+// The sandbox lifecycle honours ctx: when ctx is cancelled before the sandbox
+// callback runs, the run is skipped and reported as cancelled rather than
+// executing an abandoned verification.
+func RunWithSandboxContext(ctx context.Context, reviewID, projectRoot string, fn SandboxRunFn) (EvidenceRecord, error) {
 	sb := NewSandbox(reviewID, projectRoot)
 	if err := sb.Create(); err != nil {
 		return EvidenceRecord{}, fmt.Errorf("sandbox create: %w", err)
 	}
 
-	status, confidence, artifactRef, output := fn(sb)
+	// Cleanup is guaranteed on every exit path (including a cancelled ctx).
+	defer func() { _ = sb.Cleanup() }()
 
-	if err := sb.Cleanup(); err != nil {
-		return EvidenceRecord{}, fmt.Errorf("sandbox cleanup: %w", err)
+	if ctx != nil && ctx.Err() != nil {
+		rec := EvidenceRecord{
+			ID:          "E-ephemeral",
+			Type:        EvTypeEphemeralTest,
+			Status:      EvStatusSkipped,
+			Confidence:  ConfLow,
+			ArtifactRef: "",
+			Output:      "Verification skipped — review context cancelled: " + ctx.Err().Error(),
+		}
+		return rec, nil
 	}
+
+	status, confidence, artifactRef, output := fn(sb)
 
 	rec := EvidenceRecord{
 		ID:          "E-ephemeral",

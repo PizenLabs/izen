@@ -284,6 +284,7 @@ func officialCommands() []CommandDescriptor {
 		directive("env", CategoryObservation, PermissionSet(PermRead), true, "inspect the workspace environment (go, git, env)"),
 		directive("trace", CategoryObservation, PermissionSet(PermAnalyze), true, "collect runtime execution information (race trace)"),
 		directive("diagnose", CategoryObservation, PermissionSet(PermAnalyze), true, "produce a one-sentence root-cause diagnosis"),
+		directive("log", CategoryObservation, PermissionSet(PermAnalyze), true, "evaluate a shell trace & run the implicit analysis pipeline"),
 		directive("run", CategoryValidation, PermissionSet(PermExecute), true, "execute the application (go build)"),
 		directive("test", CategoryValidation, PermissionSet(PermExecute), true, "run the project test suite"),
 		directive("hot", CategoryMutation, PermissionSet(PermWrite), true, "fast targeted mutation for small localized edits"),

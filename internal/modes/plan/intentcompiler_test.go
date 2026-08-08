@@ -1,6 +1,8 @@
 package plan
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -179,5 +181,109 @@ func TestIntentCompilerPipeline_EndToEnd(t *testing.T) {
 func TestStrategyGreenfieldWebRecognizesDesignPrompt(t *testing.T) {
 	if !strategy.IsGreenfieldWebPrompt(verificationPrompt) {
 		t.Fatal("verification prompt must be recognized as a greenfield web request")
+	}
+}
+
+// TestIntentCompiler_SingleCandidateStaticWebSynthesizesPlan is the DoD
+// verification of the single-candidate resolution guard: a Vanilla/Static Web
+// project whose only framework hypothesis is Static HTML/CSS/JS at confidence
+// 0.60 with a zero runner-up (no competing framework) must synthesize a plan —
+// it must NEVER abort with "cannot choose a framework unilaterally".
+func TestIntentCompiler_SingleCandidateStaticWebSynthesizesPlan(t *testing.T) {
+	ws := t.TempDir()
+	// index.html + styles.css + script.js → Static HTML/CSS/JS @ 0.60 from
+	// workspace file evidence alone (0.20 × 3). The prompt deliberately avoids
+	// every Static HTML/CSS/JS detector keyword so the confidence stays at
+	// exactly 0.60 and no second framework detector fires (runner_up == 0.00).
+	for _, f := range []string{"index.html", "styles.css", "script.js"} {
+		if err := os.WriteFile(filepath.Join(ws, f), []byte("body {}\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", f, err)
+		}
+	}
+
+	const prompt = "create a landing page for our bakery"
+	set := inference.NewInferenceEngine().Infer(
+		inference.NewWorkspaceInspector(ws).Inspect(),
+		inference.PromptSlots{Raw: prompt},
+	)
+	top, ok := set.Top(inference.TypeFramework)
+	if !ok {
+		t.Fatal("expected a framework hypothesis for a vanilla web workspace")
+	}
+	if top.Label != "Static HTML/CSS/JS" {
+		t.Fatalf("top = %q, want Static HTML/CSS/JS", top.Label)
+	}
+	if top.Confidence() <= 0.50 {
+		t.Fatalf("top confidence = %.2f, want > 0.50", top.Confidence())
+	}
+	if hyps := set.Hypotheses(inference.TypeFramework); len(hyps) > 1 {
+		t.Fatalf("expected zero competing frameworks, got %d hypotheses", len(hyps))
+	}
+
+	p := NewIntentCompilerPlanner(ws)
+	tasks, handled, err := p.TryPlan(stdctx.Background(), prompt)
+	if err != nil {
+		t.Fatalf("TryPlan must not abort on a single static candidate: %v", err)
+	}
+	if !handled {
+		t.Fatal("intent compiler must own a greenfield static web prompt")
+	}
+	if len(tasks) == 0 {
+		t.Fatal("intent compiler must stage file tasks for the static web project")
+	}
+	for _, tk := range tasks {
+		if strings.TrimSpace(tk.Target) == "" {
+			t.Fatal("intent compiler produced an empty target")
+		}
+	}
+}
+
+// TestIntentCompiler_StaticWebGuardDoesNotRescueRealCompetition pins the
+// boundary of the single-candidate guard: the forced VANILLA_WEB resolution
+// only fires when runner_up == 0.00 (zero competing frameworks). A workspace
+// carrying BOTH static web files AND a genuine React + Vite signal (src/)
+// still resolves through the normal policy path — a runner-up with positive
+// confidence is a real competition, never a lone-candidate false positive.
+func TestIntentCompiler_StaticWebGuardDoesNotRescueRealCompetition(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ws, "src"), 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	for _, f := range []string{"index.html", "styles.css", "script.js"} {
+		if err := os.WriteFile(filepath.Join(ws, f), []byte("body {}\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", f, err)
+		}
+	}
+
+	const prompt = "create a landing page for our bakery"
+	set := inference.NewInferenceEngine().Infer(
+		inference.NewWorkspaceInspector(ws).Inspect(),
+		inference.PromptSlots{Raw: prompt},
+	)
+	hyps := set.Hypotheses(inference.TypeFramework)
+	hasRunnerUp := false
+	for _, h := range hyps {
+		if h.Label != "Static HTML/CSS/JS" && h.Confidence() > 0.00 {
+			hasRunnerUp = true
+			break
+		}
+	}
+	if !hasRunnerUp {
+		t.Fatalf("precondition: expected a real runner-up from src/, got %d hypotheses", len(hyps))
+	}
+
+	// The runner-up is real (positive confidence), so the guard's
+	// runner_up == 0.00 condition is false. The plan resolves through the
+	// normal policy path without error.
+	p := NewIntentCompilerPlanner(ws)
+	tasks, handled, err := p.TryPlan(stdctx.Background(), prompt)
+	if err != nil {
+		t.Fatalf("TryPlan: %v", err)
+	}
+	if !handled {
+		t.Fatal("intent compiler must still own the greenfield prompt")
+	}
+	if len(tasks) == 0 {
+		t.Fatal("expected staged file tasks")
 	}
 }

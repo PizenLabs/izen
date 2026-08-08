@@ -112,6 +112,40 @@ func TestTokenizeWordStopsAtMarker(t *testing.T) {
 	}
 }
 
+// TestTokenizeWordKeepsSlashPath verifies '/' inside a bare word is a path
+// separator, not a command marker: $test ./... and $test cmd/main.go keep
+// their goal path as a single word instead of a spurious "/..." command.
+func TestTokenizeWordKeepsSlashPath(t *testing.T) {
+	toks := Tokenize("$test ./...")
+	got := make([]string, 0, len(toks))
+	for _, tok := range toks {
+		got = append(got, tok.String())
+	}
+	want := []string{"$test", "./...", "<eof>"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Tokenize = %v, want %v", got, want)
+	}
+
+	toks = Tokenize("$test cmd/main.go")
+	if toks[1].Kind != TokenWord || toks[1].Text != "cmd/main.go" {
+		t.Fatalf("toks[1] = %v, want word 'cmd/main.go'", toks[1])
+	}
+}
+
+// TestTokenizeSlashAtWordStartIsCommand verifies '/' following whitespace still
+// begins a command token — the word-boundary command marker is preserved.
+func TestTokenizeSlashAtWordStartIsCommand(t *testing.T) {
+	toks := Tokenize("fix /undo")
+	got := make([]string, 0, len(toks))
+	for _, tok := range toks {
+		got = append(got, tok.String())
+	}
+	want := []string{"fix", "/undo", "<eof>"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Tokenize = %v, want %v", got, want)
+	}
+}
+
 func TestTokenizePositions(t *testing.T) {
 	toks := Tokenize("fix\n/build")
 	if toks[0].Pos.Line != 1 || toks[0].Pos.Column != 1 {

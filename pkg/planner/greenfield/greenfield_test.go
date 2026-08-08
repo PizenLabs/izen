@@ -79,9 +79,9 @@ func TestGreenfieldPlannerTopologicalDependencies(t *testing.T) {
 	root := t.TempDir()
 	mod := ir.NewFile("go.mod", []byte("module demo\ngo 1.26\n"))
 	main := ir.NewFile("main.go", []byte("package main\n"))
-	main.Metadata = map[string]string{DependsOnKey: mod.ID}
+	main.Metadata.Set(DependsOnKey, mod.ID)
 	config := ir.NewFile("config.go", []byte("package main\n"))
-	config.Metadata = map[string]string{DependsOnKey: mod.ID + "," + main.ID}
+	config.Metadata.Set(DependsOnKey, mod.ID+","+main.ID)
 
 	p := NewGreenfieldPlanner(root)
 	result, err := p.Plan(t.Context(), "generate a go project", []ir.Artifact{mod, main, config})
@@ -109,10 +109,12 @@ func TestGreenfieldPlannerSkipsNonFileArtifacts(t *testing.T) {
 	root := t.TempDir()
 	fileArtifact := ir.NewFile("a.txt", []byte("hello"))
 	meta := ir.Artifact{
-		ID:       "notes",
-		Path:     "notes.md",
-		Kind:     ir.ArtifactMeta,
-		Metadata: map[string]string{"purpose": "doc"},
+		ID:   "notes",
+		Path: "notes.md",
+		Kind: ir.ArtifactMeta,
+		Metadata: ir.ArtifactMetadata{
+			Custom: map[string]string{"purpose": "doc"},
+		},
 	}
 
 	result, err := NewGreenfieldPlanner(root).Plan(t.Context(), "create", []ir.Artifact{meta, fileArtifact})

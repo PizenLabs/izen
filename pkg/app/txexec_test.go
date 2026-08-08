@@ -15,9 +15,9 @@ import (
 func TestPlanExecutionOrderSequencesDependencies(t *testing.T) {
 	mod := ir.NewFile("go.mod", []byte("module demo\ngo 1.26\n"))
 	main := ir.NewFile("main.go", []byte("package main\n"))
-	main.Metadata = map[string]string{greenfield.DependsOnKey: mod.ID}
+	main.Metadata.Set(greenfield.DependsOnKey, mod.ID)
 	config := ir.NewFile("config.go", []byte("package main\n"))
-	config.Metadata = map[string]string{greenfield.DependsOnKey: mod.ID + ", " + main.ID}
+	config.Metadata.Set(greenfield.DependsOnKey, mod.ID+", "+main.ID)
 
 	order, err := planExecutionOrder([]ir.Artifact{config, main, mod})
 	if err != nil {
@@ -35,8 +35,8 @@ func TestPlanExecutionOrderSequencesDependencies(t *testing.T) {
 func TestPlanExecutionOrderRejectsCycles(t *testing.T) {
 	a := ir.NewFile("a.txt", []byte("a"))
 	b := ir.NewFile("b.txt", []byte("b"))
-	a.Metadata = map[string]string{greenfield.DependsOnKey: b.ID}
-	b.Metadata = map[string]string{greenfield.DependsOnKey: a.ID}
+	a.Metadata.Set(greenfield.DependsOnKey, b.ID)
+	b.Metadata.Set(greenfield.DependsOnKey, a.ID)
 
 	_, err := planExecutionOrder([]ir.Artifact{a, b})
 	if !errors.Is(err, dag.ErrCyclicDependency) {
@@ -54,9 +54,7 @@ func TestPlanExecutionOrderRejectsCycles(t *testing.T) {
 func TestPlanExecutionOrderSkipsNonFileAndUnknownDependencies(t *testing.T) {
 	meta := ir.Artifact{ID: "meta", Path: "notes.md", Kind: ir.ArtifactMeta}
 	fileArtifact := ir.NewFile("a.txt", []byte("a"))
-	fileArtifact.Metadata = map[string]string{
-		greenfield.DependsOnKey: "meta,missing",
-	}
+	fileArtifact.Metadata.Set(greenfield.DependsOnKey, "meta,missing")
 
 	order, err := planExecutionOrder([]ir.Artifact{meta, fileArtifact})
 	if err != nil {
@@ -69,7 +67,7 @@ func TestPlanExecutionOrderSkipsNonFileAndUnknownDependencies(t *testing.T) {
 
 func TestPlanExecutionOrderRejectsSelfDependency(t *testing.T) {
 	a := ir.NewFile("a.txt", []byte("a"))
-	a.Metadata = map[string]string{greenfield.DependsOnKey: a.ID}
+	a.Metadata.Set(greenfield.DependsOnKey, a.ID)
 	if _, err := planExecutionOrder([]ir.Artifact{a}); !errors.Is(err, dag.ErrSelfDependency) {
 		t.Fatalf("expected ErrSelfDependency, got %v", err)
 	}

@@ -19,7 +19,20 @@ func Parse(input string, reg *command.Registry) (*IntentAST, error) {
 	if reg == nil {
 		reg = command.Default()
 	}
-	return parseTokens(Tokenize(input), reg)
+	return parseTokens(Tokenize(input), reg, command.WorkspaceAsk)
+}
+
+// ParseInWorkspace parses input with a session-supplied default workspace.
+// When the input carries no /workspace marker, the permission policy is
+// enforced against defaultWS instead of the read-only WorkspaceAsk. This is
+// the TUI entry point: a bare $hot typed inside /build resolves against the
+// build permission set rather than the ask default, so directive validation
+// reflects the session's active context exactly.
+func ParseInWorkspace(input string, reg *command.Registry, defaultWS command.WorkspaceType) (*IntentAST, error) {
+	if reg == nil {
+		reg = command.Default()
+	}
+	return parseTokens(Tokenize(input), reg, defaultWS)
 }
 
 // ParseDefault is Parse bound to the process-wide canonical registry.
@@ -35,8 +48,10 @@ func ParseDefault(input string) (*IntentAST, error) {
 //  2. Enforce the permission policy and chain-support contract against the
 //     effective workspace, now fully known: every $ directive AND every /
 //     global command must be permitted by the effective workspace's
-//     permission set.
-func parseTokens(toks []Token, reg *command.Registry) (*IntentAST, error) {
+//     permission set. When no workspace marker is present, defaultWS is the
+//     effective context (Parse passes the read-only WorkspaceAsk; the TUI
+//     passes the session's active workspace via ParseInWorkspace).
+func parseTokens(toks []Token, reg *command.Registry, defaultWS command.WorkspaceType) (*IntentAST, error) {
 	var (
 		ws        command.WorkspaceType
 		wsSet     bool
@@ -97,7 +112,7 @@ func parseTokens(toks []Token, reg *command.Registry) (*IntentAST, error) {
 
 	effective := ws
 	if !wsSet {
-		effective = command.WorkspaceAsk
+		effective = defaultWS
 	}
 	for i, g := range globals {
 		if !effective.Permissions().Contains(g.RequiredPerms) {

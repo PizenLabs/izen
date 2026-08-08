@@ -42,10 +42,15 @@ func (w WorkspaceType) String() string {
 
 // Permissions returns the immutable PermissionSet bound to the workspace.
 //
+// Investigate carries Execute (not Write) because the forensic engine runs
+// bounded validation (go test / go build traces) without ever mutating files —
+// mirroring the modes capability matrix, where investigate exposes Shell and
+// Test capabilities.
+//
 //	| Workspace    | Read | Analyze | Execute | Write |
 //	|--------------|------|---------|---------|-------|
 //	| ask          | Y    | N       | N       | N     |
-//	| investigate  | Y    | Y       | N       | N     |
+//	| investigate  | Y    | Y       | Y       | N     |
 //	| plan         | Y    | Y       | N       | N     |
 //	| build        | Y    | Y       | Y       | Y     |
 //	| review       | Y    | Y       | Y       | N     |
@@ -54,7 +59,7 @@ func (w WorkspaceType) Permissions() PermissionSet {
 	case WorkspaceAsk:
 		return PermissionSet(PermRead)
 	case WorkspaceInvestigate:
-		return PermissionSet(PermRead | PermAnalyze)
+		return PermissionSet(PermRead | PermAnalyze | PermExecute)
 	case WorkspacePlan:
 		return PermissionSet(PermRead | PermAnalyze)
 	case WorkspaceBuild:

@@ -36,6 +36,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/modes/review"
 	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
@@ -45,6 +46,7 @@ import (
 	"github.com/PizenLabs/izen/internal/templates"
 	verification "github.com/PizenLabs/izen/internal/verification"
 	"github.com/PizenLabs/izen/internal/workspace"
+	"github.com/PizenLabs/izen/pkg/capability/policy"
 	"github.com/PizenLabs/izen/pkg/control"
 	cmdreg "github.com/PizenLabs/izen/pkg/domain/command"
 )
@@ -216,154 +218,30 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
-	// ── Composite fast-query routing: /review $test ───────────────────
-	// MUST be evaluated at the very top of the evaluation tree, strictly
-	// before parseModeShorthand (which would otherwise match the "/review "
-	// prefix and route this to a plain static /review, silently bypassing the
-	// dynamic-test-then-review composite shortcut).
-	if command.IsReviewTestComposite(line) {
-		m.push(roleSystem, accentStyle.Render(Icon.Index+" [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
+	// ── DETERMINISTIC PARSE PIPELINE ───────────────────────────────────
+	// Every remaining input reaches the parser BEFORE any string-prefix
+	// command lookup or intent dispatch. parser.ParseInWorkspace resolves
+	// /workspace markers, $ directives, @ scopes, and the natural-language
+	// goal into a structured IntentAST and enforces the permission policy
+	// against the effective workspace (the active session workspace when the
+	// line declares none). Parse errors are surfaced verbatim and execution
+	// stops — the raw-input "unknown command: <line>" fallback is never
+	// emitted.
+	ast, err := m.intentFromInput(line)
+	if err != nil {
+		m.push(roleError, err.Error())
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
-		return m.runReviewTestComposite()
+		return nil
 	}
 
-	// ── $prompt — GLOBAL MODE-GUARD ROUTER TO /ask ───────────────────────
-	// $prompt is a global routing entry point, not an execution mode. From
-	// ANY active mode it transitions cleanly to /ask, injecting the query as
-	// /ask input for structured Forensic Context Ledger generation. It MUST
-	// NEVER execute /build, /review, /plan, or /investigate logic inside the
-	// originating mode — the only allowed action is the transition to /ask.
-	if line == "$prompt" || strings.HasPrefix(line, "$prompt ") {
-		m.cancelStaleAgentOps()
-		if line == "$prompt" {
-			m.push(roleError, "[Usage] $prompt <your raw architectural idea or description>")
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			return nil
-		}
-		rawInput := strings.TrimSpace(line[8:])
-
-		// ── COMPRESSOR FAST-TRACK ──────────────────────────
-		// Check the prompt compressor first. If it signals a direct
-		// mutation (BypassInvest=true) with a target file, skip ALL
-		// Architect prompts, skip /investigate mode routing entirely,
-		// and route directly to BUILD with a staged FILE_MUTATE task.
-		if compressed := gateway.CompressPrompt(rawInput); compressed != nil && compressed.BypassInvest && compressed.Target != "" {
-			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected by compressor. Bypassing architect analysis."))
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			targets := gateway.ExtractDirectMutationTargets(rawInput)
-			if len(targets) > 1 {
-				var tasks []plan.Task
-				for i, f := range targets {
-					tasks = append(tasks, plan.Task{
-						StepNum: i + 1,
-
-						Status:      "idle",
-						Type:        "FILE_MUTATE",
-						Target:      f,
-						Description: rawInput,
-						Rationale:   fmt.Sprintf("Fast-Track multi-file decomposition: target %d of %d", i+1, len(targets)),
-						IsHardcoded: true,
-					})
-				}
-				return func() tea.Msg {
-					return planResultMsg{
-						Tasks:       tasks,
-						IsFastTrack: true,
-					}
-				}
-			}
-			target := command.FallbackPlanTarget{
-				File:        compressed.Target,
-				Description: rawInput,
-				TaskType:    "FILE_MUTATE",
-			}
-			tasks := command.GenerateFallbackPlan(target)
-			return func() tea.Msg {
-				return planResultMsg{
-					Tasks:       tasks,
-					IsFastTrack: true,
-				}
-			}
-		}
-
-		// ── INTENT PRE-GUARD: Fast-track direct file mutations ──────────
-		// pipeline. If the user is requesting a simple single-file mutation
-		// on a non-code file (e.g. $prompt rename author in @LICENSE),
-		// classify it and route directly to /build as a FILE_MUTATE task
-		// with zero LLM involvement — no forensic analysis, no go test.
-		if target, isDirect := gateway.ClassifyDirectMutation(rawInput); isDirect {
-			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected. Bypassing architect analysis."))
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			// Multi-file decomposition: when the prompt lists multiple
-			// files (comma-separated), create distinct TODO items for each.
-			multiTargets := gateway.ExtractDirectMutationTargets(rawInput)
-			if len(multiTargets) > 1 {
-				var tasks []plan.Task
-				for i, f := range multiTargets {
-					tasks = append(tasks, plan.Task{
-						StepNum: i + 1,
-
-						Status:      "idle",
-						Type:        "FILE_MUTATE",
-						Target:      f,
-						Description: rawInput,
-						Rationale:   fmt.Sprintf("Fast-Track multi-file decomposition: target %d of %d", i+1, len(multiTargets)),
-						IsHardcoded: true,
-					})
-				}
-				return func() tea.Msg {
-					return planResultMsg{
-						Tasks:       tasks,
-						IsFastTrack: true,
-					}
-				}
-			}
-			tasks := command.GenerateFallbackPlan(target)
-			return func() tea.Msg {
-				return planResultMsg{
-					Tasks:       tasks,
-					IsFastTrack: true,
-				}
-			}
-		}
-
-		currentMode := m.resolver.Current()
-		if currentMode != modes.ModeAsk {
-			// Mode Guard Enforced: request state transition to /ask, then
-			// queue the $prompt synthesis directly via runAskPromptHandoffCmd.
-			// This preserves the lean ask handoff prompt — we MUST NOT re-enter handleInput
-			// because the raw input no longer carries the $prompt prefix and
-			// would be routed to the normal AskContract() streaming path,
-			// producing conversational noise instead of the structured
-			// handoff prompt.
-			m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
-				"$prompt from /%s — transitioning to /ask for structured analysis...", currentMode)))
-			m.modeChangeAuthorized = true
-			cmd := m.setMode(modes.ModeAsk)
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			return tea.Batch(cmd, m.runAskPromptHandoffCmd(rawInput))
-		}
-
-		m.push(roleSystem, infoStyle.Render("Refining prompt through ask handoff..."))
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return m.runAskPromptHandoffCmd(rawInput)
-	}
-
-	// $ sub-command prefix — delegates to handleReviewDollar for routing.
-	if strings.HasPrefix(line, "$") {
-		// ANTI-DEADLOCK: unconditionally sanitize stale execution flags
-		// before spawning any background task. Prevents ghost spinner lock
-		// when sequential $ commands are issued without a clean reset.
-		cmd := m.handleReviewDollar(line)
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return cmd
+	// Directive- and global-bearing intents (including the /review $test
+	// composite and the $prompt /ask router) are dispatched structurally from
+	// the AST: workspace transition first, then commands, then directives.
+	// Bare workspace switches and free-form goals fall through to the legacy
+	// string routing below, which already handles them.
+	if len(ast.Directives) > 0 || len(ast.GlobalCommands) > 0 {
+		return m.dispatchASTIntent(ast)
 	}
 
 	if mode, content, ok := parseModeShorthand(line); ok {
@@ -382,6 +260,22 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.push(roleSystem, infoStyle.Render("Running review pipeline..."))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
+			// ── FAST-PATH EARLY EXIT: CLEAN WORKING TREE ────────────────────
+			// A full-diff /review on a clean tree has nothing to audit. Report
+			// it immediately and reset every processing flag WITHOUT starting
+			// the async pipeline or its spinner — the "Processing file
+			// mutations..." animation must never appear for a run that will
+			// perform zero mutations.
+			if rev := review.NewEngine(".", nil, nil); rev.IsCleanWorkingTree() {
+				m.push(roleSystem, infoStyle.Render("no changes to review — working tree is clean"))
+				m.reviewRunning = false
+				m.agentRunning = false
+				m.lastActionTime = time.Time{}
+				m.syncUIState()
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return tea.Batch(switchCmd)
+			}
 			return tea.Batch(m.runReviewCmd(""), switchCmd)
 		}
 		// ── AUTO-TRIGGER /build EXECUTION ──────────────────────
@@ -973,6 +867,27 @@ const planLocalMaxLatency = 150 * time.Second
 // lets a rate-limited small model finish the whole unified build in one turn.
 const buildGenerationTimeout = 5 * time.Minute
 
+// hotfixApplyTimeout is the strict deadline for applying an approved hotfix
+// patch to disk (file IO, shadow backup, transaction recording). A wedged
+// filesystem or git operation must never freeze the "Applying hotfix..."
+// spinner indefinitely — on expiry the apply aborts cleanly and a terminal
+// buildResultMsg is emitted.
+const hotfixApplyTimeout = 30 * time.Second
+
+// applyPatchWithDeadline applies a patch through the execution engine under
+// the strict 30s patch-apply deadline so a wedged filesystem or git operation
+// can never freeze the TUI spinner on ANY file-write / patch-application path
+// (hotfix apply, single/all proposal apply, trivial template, shell-mutation).
+// A nil engine degrades to a clean error carrying a terminal message.
+func (m *model) applyPatchWithDeadline(patch *execution.Patch) error {
+	if m.execEng == nil || m.execEng.Patches == nil {
+		return fmt.Errorf("execution engine not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), hotfixApplyTimeout)
+	defer cancel()
+	return m.execEng.Patches.ApplyContext(ctx, patch)
+}
+
 // runPlanEngineCmd executes the (potentially slow) PlanEngine ledger synthesis
 // in a background goroutine so the synchronous LLM call never blocks the Bubble
 // Tea event loop. The result is delivered asynchronously as a planResultMsg,
@@ -1067,8 +982,23 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 	// Register cancel so it can be invoked on mode transition/Ctrl+C
 	m.registerBackgroundCancel(cancel)
 
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
 		debugLogPlan("runPlanEngineCmd entered; model=" + modelName)
+
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal planResultMsg MUST reach the TUI event loop on ANY
+		// exit path — success, model error, fallback failure, timeout, or
+		// runtime panic. A panic inside the closure (e.g. a nil engine during
+		// scope-guard validation) is converted into an error-carrying
+		// planResultMsg so the plan spinner can never be orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = planResultMsg{
+					Err:     fmt.Errorf("plan pipeline panic: %v", r),
+					Handoff: handoff,
+				}
+			}
+		}()
 
 		// ── COMPRESS HANDOFF PAYLOAD ──────────────────────────────
 		// Strip verbose stack-trace lines, deduplicate, and cap the
@@ -1299,6 +1229,19 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		}
 
 		go func() {
+			// ── PANIC GUARD ─────────────────────────────────────────────
+			// A panic inside the LLM plan synthesis (or the scope-guard
+			// retry) must still deliver an error outcome to outCh so the
+			// select below resolves immediately instead of freezing the
+			// spinner for the full deadline waiting on the channel.
+			defer func() {
+				if r := recover(); r != nil {
+					select {
+					case outCh <- outcome{tasks: nil, err: fmt.Errorf("plan engine panic: %v", r)}:
+					default:
+					}
+				}
+			}()
 			debugLogPlan("Preparing LLM payload (ledger bytes=" + fmt.Sprint(len(ledgerToSend)) +
 				"; fastTrack=" + fmt.Sprint(useFastTrack) + ")")
 			var tasks []plan.Task
@@ -3281,7 +3224,17 @@ func resolveHotfixTarget(prompt string) string {
 // exits cleanly — ensuring a single $hot command never triggers multiple LLM
 // API calls.
 func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal hotfixProposalMsg MUST reach the TUI event loop on ANY
+		// exit path — success, error, or panic — so the "Applying hotfix..."
+		// spinner can never be orphaned while the patch is generated.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = hotfixProposalMsg{Err: fmt.Errorf("hotfix patch generation panic: %v", r)}
+			}
+		}()
+
 		// ── Read existing file content ──────────────────────────
 		// Without the original content, local fuzzy replacement and
 		// LLM-based diff computation both produce incorrect results.
@@ -3579,7 +3532,17 @@ func hasDiffMarkerPrefix(content string) bool {
 // and returns a buildProposalReadyMsg for human approval — identical UX to the
 // LLM-based patch flow but with zero model cost and no placeholder-code risk.
 func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// A panic inside the deterministic stdlib fix must still deliver a
+		// terminal buildProposalReadyMsg so the spinner can never be
+		// orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildProposalReadyMsg{Err: fmt.Errorf("stdlib patch panic: %v", r)}
+			}
+		}()
+
 		// Extract fix parameters from Solution: "STDLIB:symbol:pkgName:importPath"
 		parts := strings.SplitN(task.Solution, ":", 4)
 		if len(parts) != 4 || parts[0] != "STDLIB" {
@@ -3721,7 +3684,17 @@ func buildStubOverwriteHandoff(task *plan.Task, orig string) string {
 // with an explicit diff format demonstration to prevent token burn on
 // repetitive empty retries.
 func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal buildProposalReadyMsg MUST reach the TUI event loop on
+		// ANY exit path — success, model error, or panic — so the build
+		// spinner can never be orphaned while the patch is generated.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildProposalReadyMsg{Err: fmt.Errorf("patch generation panic: %v", r)}
+			}
+		}()
+
 		if m.provider == nil {
 			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
@@ -3992,6 +3965,32 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				}
 			}
 
+			// ── V3 ARTIFACT GATE (protocol-centric) ─────────────────────
+			// Normalize + validate the resolved content inside the execution
+			// engine before any proposal is surfaced for approval. A syntax
+			// failure triggers the configured failure policy: reprompt with
+			// the parser diagnostics while the retry budget allows, abort
+			// once it is exhausted. The reasoning-leak observer consumes the
+			// raw LLM output asynchronously and never blocks this path.
+			if m.execEng != nil && m.execEng.Artifact != nil {
+				m.execEng.Artifact.InspectReasoning(rawContent)
+				gate := m.execEng.Artifact.ValidateContent(task.Target, []byte(resolved), attempt)
+				if !gate.Passed {
+					if gate.Decision == policy.DecisionRetry && attempt < maxRetries {
+						handoff = buildHandoff(orig) + "\n\nCORRECTION: " + gate.Directive
+						continue
+					}
+					return buildProposalReadyMsg{Err: fmt.Errorf("artifact validation rejected %s: %w", task.Target, gate.Error)}
+				}
+				if string(gate.Normalized) != resolved {
+					// The canonical normalized bytes differ from the model
+					// output (CRLF/BOM/trailing-newline). Propose the
+					// canonical form so disk always receives protocol bytes.
+					resolved = string(gate.Normalized)
+					diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+				}
+			}
+
 			patch := &execution.Patch{
 				ID:            fmt.Sprintf("build-%d", task.StepNum),
 				File:          task.Target,
@@ -4054,6 +4053,17 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 					fullResolved = execution.SanitizeRawCodeBlock(fullResp.Content)
 				}
 				if strings.TrimSpace(fullResolved) != "" {
+					// V3 artifact gate on the last-resort rewrite: the
+					// normalized canonical bytes are proposed so the disk
+					// always receives protocol bytes.
+					if m.execEng != nil && m.execEng.Artifact != nil {
+						m.execEng.Artifact.InspectReasoning(fullResp.Content)
+						gate := m.execEng.Artifact.ValidateContent(task.Target, []byte(fullResolved), maxRetries)
+						if !gate.Passed {
+							return buildProposalReadyMsg{Err: fmt.Errorf("artifact validation rejected %s: %w", task.Target, gate.Error)}
+						}
+						fullResolved = string(gate.Normalized)
+					}
 					fullDiff := computeUnifiedDiff(task.Target, orig, fullResolved)
 					if m.activityTree != nil {
 						added, removed := countLinesDelta(fullDiff)
@@ -4086,7 +4096,20 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 // deterministically from Go templates, applies it immediately, and returns
 // a buildResultMsg — completing in < 50ms with zero LLM calls.
 func (m *model) applyTrivialTemplate(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// A panic inside the trivial template write must still produce a
+		// terminal buildResultMsg so the spinner can never be orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildResultMsg{
+					output:   "",
+					exitCode: -1,
+					err:      fmt.Errorf("trivial template apply panic: %v", r),
+				}
+			}
+		}()
+
 		canonicalTarget := gateway.CanonicalizeFileName(task.Target)
 		var orig string
 		if data, rerr := os.ReadFile(canonicalTarget); rerr == nil {
@@ -4114,13 +4137,11 @@ func (m *model) applyTrivialTemplate(task *plan.Task) tea.Cmd {
 			}
 		}
 
-		if m.execEng != nil && m.execEng.Patches != nil {
-			if err := m.execEng.Patches.Apply(patch); err != nil {
-				return buildResultMsg{
-					output:   "",
-					exitCode: 1,
-					err:      fmt.Errorf("trivial template apply failed: %w", err),
-				}
+		if err := m.applyPatchWithDeadline(patch); err != nil {
+			return buildResultMsg{
+				output:   "",
+				exitCode: 1,
+				err:      fmt.Errorf("trivial template apply failed: %w", err),
 			}
 		}
 
@@ -4274,7 +4295,17 @@ func hasCustomizationDirectives(description string) bool {
 // If the reference text cannot be resolved (unexpected target) the function
 // falls through to generateTrivialContent — the static template renderer.
 func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// A panic inside the hybrid template generation must still deliver a
+		// terminal buildProposalReadyMsg so the spinner can never be
+		// orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildProposalReadyMsg{Err: fmt.Errorf("hybrid template patch panic: %v", r)}
+			}
+		}()
+
 		if m.provider == nil {
 			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
@@ -4397,7 +4428,23 @@ func resolveReferenceTemplate(target, description string) string {
 }
 
 func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal buildResultMsg MUST reach the TUI event loop on ANY
+		// exit path — success, error, timeout, or panic — so the "Applying
+		// hotfix..." spinner can never be orphaned. A panic inside the apply
+		// pipeline (e.g. a nil execution engine) is converted into an
+		// error-carrying buildResultMsg below.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildResultMsg{
+					output:   "",
+					exitCode: -1,
+					err:      fmt.Errorf("hotfix apply panic: %v", r),
+				}
+			}
+		}()
+
 		if err := m.transitionToBuilding(); err != nil {
 			return buildResultMsg{
 				output:   "",
@@ -4412,7 +4459,22 @@ func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cm
 				err:      fmt.Errorf("hotfix authorization failed: %w", err),
 			}
 		}
-		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
+
+		// ── STRICT MUTATION TIMEOUT ─────────────────────────────────────
+		// The patch application (file IO + shadow backup + transaction
+		// recording) is bounded by a strict 30s deadline so a deadlocked Apply
+		// can never freeze the "Applying hotfix..." spinner indefinitely. On
+		// expiry a terminal error message is emitted and the enclosing
+		// transaction is rolled back by the buildResultMsg handler.
+		if m.execEng == nil {
+			return buildResultMsg{
+				output:   "",
+				exitCode: 1,
+				err:      fmt.Errorf("hotfix patch apply aborted: execution engine not configured"),
+			}
+		}
+		applyErr := m.applyPatchWithDeadline(patch)
+		if applyErr != nil {
 			// Graceful no-op skip: the destruction guardrail refused a >80%
 			// file wipe without an explicit delete/clear instruction. The file
 			// is unchanged — mark the task done (no changes needed) instead of
@@ -4597,7 +4659,20 @@ func (m *model) amendBuildTask(stepNum int, feedback string) tea.Cmd {
 // being executed. The user must copy the command and run it manually outside
 // IZEN. This is the absolute last line of defense against silent root escalation.
 func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// A panic inside the shell execution wrapper must still deliver a
+		// terminal buildResultMsg so the spinner can never be orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildResultMsg{
+					output:   "",
+					exitCode: -1,
+					err:      fmt.Errorf("shell exec pipeline panic: %v", r),
+				}
+			}
+		}()
+
 		if err := m.authorizeBuildExecution([]string{task.Target}, m.pendingBuildAllowAlways); err != nil {
 			return buildResultMsg{
 				output:   "",
@@ -5648,6 +5723,7 @@ func (m *model) cancelStaleAgentOps() {
 	m.cancelAllBackgroundContexts()
 
 	m.reviewRunning = false
+	m.investigateRunning = false
 	m.agentRunning = false
 	m.agentDone = false
 	m.agentLabel = ""
