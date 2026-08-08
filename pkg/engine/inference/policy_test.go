@@ -93,3 +93,60 @@ func TestPolicyCustomThresholds(t *testing.T) {
 		t.Fatalf("fully relaxed decision = %q, want proceed", v.Decision)
 	}
 }
+
+// TestPolicySingleHypothesisNeverEscalates is the DoD single-candidate guard:
+// a lone confident hypothesis (no runner-up — zero competing frameworks) must
+// Proceed, never EscalateToHuman. Escalation semantics require TWO credible
+// hypotheses competing within the delta threshold; a single Static HTML/CSS/JS
+// candidate in a Vanilla/Static Web project must never deadlock planning on
+// "cannot choose a framework unilaterally".
+func TestPolicySingleHypothesisNeverEscalates(t *testing.T) {
+	set := NewInferenceSet()
+	set.set(TypeFramework, []hypothesis{
+		{label: "Static HTML/CSS/JS", evidence: []EvidenceTrace{
+			{Source: SourceWorkspace, ID: "index.html", Weight: 0.20, Reason: "file"},
+			{Source: SourceWorkspace, ID: "styles.css", Weight: 0.20, Reason: "file"},
+			{Source: SourceWorkspace, ID: "script.js", Weight: 0.20, Reason: "file"},
+		}},
+	})
+
+	verdict := NewPolicyEngine().Evaluate(set, TypeFramework)
+	if verdict.Decision != DecisionProceed {
+		t.Fatalf("decision = %q, want %q (single hypothesis, runner_up 0.00)", verdict.Decision, DecisionProceed)
+	}
+	if verdict.Top.Label != "Static HTML/CSS/JS" {
+		t.Fatalf("top = %q, want Static HTML/CSS/JS", verdict.Top.Label)
+	}
+	if verdict.RunnerUp != nil {
+		t.Fatalf("runner-up = %+v, want nil for a single hypothesis", verdict.RunnerUp)
+	}
+}
+
+// TestPolicyTwoHypothesesWithinDeltaStillEscalate pins the guard's boundary:
+// the delta escalation must still fire for a genuine two-candidate race even
+// at a high confidence level.
+func TestPolicyTwoHypothesesWithinDeltaStillEscalate(t *testing.T) {
+	set := NewInferenceSet()
+	set.set(TypeFramework, []hypothesis{
+		{label: "Static HTML/CSS/JS", evidence: []EvidenceTrace{
+			{Source: SourceWorkspace, ID: "index.html", Weight: 0.20, Reason: "file"},
+			{Source: SourceWorkspace, ID: "styles.css", Weight: 0.20, Reason: "file"},
+			{Source: SourceWorkspace, ID: "script.js", Weight: 0.20, Reason: "file"},
+		}},
+		{label: "React + Vite", evidence: []EvidenceTrace{
+			{Source: SourcePrompt, ID: "react", Weight: 0.20, Reason: "prompt"},
+			{Source: SourceWorkspace, ID: "src/", Weight: 0.20, Reason: "dir"},
+			{Source: SourceConfig, ID: "vite.config.ts", Weight: 0.10, Reason: "cfg"},
+		}},
+	})
+
+	// The runner-up (0.50) is within 0.15 of the top (0.60): real competition
+	// must still escalate — the single-candidate guard must not rescue it.
+	verdict := NewPolicyEngine().Evaluate(set, TypeFramework)
+	if verdict.Decision != DecisionEscalateToHuman {
+		t.Fatalf("decision = %q, want %q (real competition within delta)", verdict.Decision, DecisionEscalateToHuman)
+	}
+	if verdict.RunnerUp == nil || verdict.RunnerUp.Label != "React + Vite" {
+		t.Fatalf("runner-up = %+v, want React + Vite", verdict.RunnerUp)
+	}
+}

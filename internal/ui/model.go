@@ -1444,7 +1444,16 @@ func planToTrace(plan *planner.ContextPlan) *ctxpkg.CodebaseTrace {
 
 // applyToolCallBuffer applies approved tool calls to disk and flushes the buffer.
 func (m *model) applyToolCallBuffer() tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// A panic inside the tool-call disk write must still produce a
+		// terminal mutationResultMsg so the spinner can never be orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = mutationResultMsg{err: fmt.Errorf("tool call apply panic: %v", r)}
+			}
+		}()
+
 		if m.toolCallBuffer == nil {
 			return mutationResultMsg{err: fmt.Errorf("no tool call buffer")}
 		}

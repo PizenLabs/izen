@@ -874,6 +874,20 @@ const buildGenerationTimeout = 5 * time.Minute
 // buildResultMsg is emitted.
 const hotfixApplyTimeout = 30 * time.Second
 
+// applyPatchWithDeadline applies a patch through the execution engine under
+// the strict 30s patch-apply deadline so a wedged filesystem or git operation
+// can never freeze the TUI spinner on ANY file-write / patch-application path
+// (hotfix apply, single/all proposal apply, trivial template, shell-mutation).
+// A nil engine degrades to a clean error carrying a terminal message.
+func (m *model) applyPatchWithDeadline(patch *execution.Patch) error {
+	if m.execEng == nil || m.execEng.Patches == nil {
+		return fmt.Errorf("execution engine not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), hotfixApplyTimeout)
+	defer cancel()
+	return m.execEng.Patches.ApplyContext(ctx, patch)
+}
+
 // runPlanEngineCmd executes the (potentially slow) PlanEngine ledger synthesis
 // in a background goroutine so the synchronous LLM call never blocks the Bubble
 // Tea event loop. The result is delivered asynchronously as a planResultMsg,
@@ -968,8 +982,23 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 	// Register cancel so it can be invoked on mode transition/Ctrl+C
 	m.registerBackgroundCancel(cancel)
 
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
 		debugLogPlan("runPlanEngineCmd entered; model=" + modelName)
+
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal planResultMsg MUST reach the TUI event loop on ANY
+		// exit path — success, model error, fallback failure, timeout, or
+		// runtime panic. A panic inside the closure (e.g. a nil engine during
+		// scope-guard validation) is converted into an error-carrying
+		// planResultMsg so the plan spinner can never be orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = planResultMsg{
+					Err:     fmt.Errorf("plan pipeline panic: %v", r),
+					Handoff: handoff,
+				}
+			}
+		}()
 
 		// ── COMPRESS HANDOFF PAYLOAD ──────────────────────────────
 		// Strip verbose stack-trace lines, deduplicate, and cap the
@@ -1200,6 +1229,19 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		}
 
 		go func() {
+			// ── PANIC GUARD ─────────────────────────────────────────────
+			// A panic inside the LLM plan synthesis (or the scope-guard
+			// retry) must still deliver an error outcome to outCh so the
+			// select below resolves immediately instead of freezing the
+			// spinner for the full deadline waiting on the channel.
+			defer func() {
+				if r := recover(); r != nil {
+					select {
+					case outCh <- outcome{tasks: nil, err: fmt.Errorf("plan engine panic: %v", r)}:
+					default:
+					}
+				}
+			}()
 			debugLogPlan("Preparing LLM payload (ledger bytes=" + fmt.Sprint(len(ledgerToSend)) +
 				"; fastTrack=" + fmt.Sprint(useFastTrack) + ")")
 			var tasks []plan.Task
@@ -3490,7 +3532,17 @@ func hasDiffMarkerPrefix(content string) bool {
 // and returns a buildProposalReadyMsg for human approval — identical UX to the
 // LLM-based patch flow but with zero model cost and no placeholder-code risk.
 func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// A panic inside the deterministic stdlib fix must still deliver a
+		// terminal buildProposalReadyMsg so the spinner can never be
+		// orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildProposalReadyMsg{Err: fmt.Errorf("stdlib patch panic: %v", r)}
+			}
+		}()
+
 		// Extract fix parameters from Solution: "STDLIB:symbol:pkgName:importPath"
 		parts := strings.SplitN(task.Solution, ":", 4)
 		if len(parts) != 4 || parts[0] != "STDLIB" {
@@ -3632,7 +3684,17 @@ func buildStubOverwriteHandoff(task *plan.Task, orig string) string {
 // with an explicit diff format demonstration to prevent token burn on
 // repetitive empty retries.
 func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal buildProposalReadyMsg MUST reach the TUI event loop on
+		// ANY exit path — success, model error, or panic — so the build
+		// spinner can never be orphaned while the patch is generated.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildProposalReadyMsg{Err: fmt.Errorf("patch generation panic: %v", r)}
+			}
+		}()
+
 		if m.provider == nil {
 			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
@@ -4034,7 +4096,20 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 // deterministically from Go templates, applies it immediately, and returns
 // a buildResultMsg — completing in < 50ms with zero LLM calls.
 func (m *model) applyTrivialTemplate(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// A panic inside the trivial template write must still produce a
+		// terminal buildResultMsg so the spinner can never be orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildResultMsg{
+					output:   "",
+					exitCode: -1,
+					err:      fmt.Errorf("trivial template apply panic: %v", r),
+				}
+			}
+		}()
+
 		canonicalTarget := gateway.CanonicalizeFileName(task.Target)
 		var orig string
 		if data, rerr := os.ReadFile(canonicalTarget); rerr == nil {
@@ -4062,13 +4137,11 @@ func (m *model) applyTrivialTemplate(task *plan.Task) tea.Cmd {
 			}
 		}
 
-		if m.execEng != nil && m.execEng.Patches != nil {
-			if err := m.execEng.Patches.Apply(patch); err != nil {
-				return buildResultMsg{
-					output:   "",
-					exitCode: 1,
-					err:      fmt.Errorf("trivial template apply failed: %w", err),
-				}
+		if err := m.applyPatchWithDeadline(patch); err != nil {
+			return buildResultMsg{
+				output:   "",
+				exitCode: 1,
+				err:      fmt.Errorf("trivial template apply failed: %w", err),
 			}
 		}
 
@@ -4222,7 +4295,17 @@ func hasCustomizationDirectives(description string) bool {
 // If the reference text cannot be resolved (unexpected target) the function
 // falls through to generateTrivialContent — the static template renderer.
 func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// A panic inside the hybrid template generation must still deliver a
+		// terminal buildProposalReadyMsg so the spinner can never be
+		// orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildProposalReadyMsg{Err: fmt.Errorf("hybrid template patch panic: %v", r)}
+			}
+		}()
+
 		if m.provider == nil {
 			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
@@ -4379,8 +4462,8 @@ func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cm
 
 		// ── STRICT MUTATION TIMEOUT ─────────────────────────────────────
 		// The patch application (file IO + shadow backup + transaction
-		// recording) is bounded by a strict deadline so a deadlocked Apply can
-		// never freeze the "Applying hotfix..." spinner indefinitely. On
+		// recording) is bounded by a strict 30s deadline so a deadlocked Apply
+		// can never freeze the "Applying hotfix..." spinner indefinitely. On
 		// expiry a terminal error message is emitted and the enclosing
 		// transaction is rolled back by the buildResultMsg handler.
 		if m.execEng == nil {
@@ -4390,9 +4473,7 @@ func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cm
 				err:      fmt.Errorf("hotfix patch apply aborted: execution engine not configured"),
 			}
 		}
-		applyCtx, applyCancel := context.WithTimeout(context.Background(), hotfixApplyTimeout)
-		defer applyCancel()
-		applyErr := m.execEng.Patches.ApplyContext(applyCtx, patch)
+		applyErr := m.applyPatchWithDeadline(patch)
 		if applyErr != nil {
 			// Graceful no-op skip: the destruction guardrail refused a >80%
 			// file wipe without an explicit delete/clear instruction. The file
@@ -4578,7 +4659,20 @@ func (m *model) amendBuildTask(stepNum int, feedback string) tea.Cmd {
 // being executed. The user must copy the command and run it manually outside
 // IZEN. This is the absolute last line of defense against silent root escalation.
 func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// A panic inside the shell execution wrapper must still deliver a
+		// terminal buildResultMsg so the spinner can never be orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildResultMsg{
+					output:   "",
+					exitCode: -1,
+					err:      fmt.Errorf("shell exec pipeline panic: %v", r),
+				}
+			}
+		}()
+
 		if err := m.authorizeBuildExecution([]string{task.Target}, m.pendingBuildAllowAlways); err != nil {
 			return buildResultMsg{
 				output:   "",
