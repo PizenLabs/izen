@@ -40,6 +40,58 @@ func (k ArtifactKind) Valid() bool {
 // String returns the machine-readable kind label.
 func (k ArtifactKind) String() string { return string(k) }
 
+// ArtifactMetadata carries typed, structured facts about an artifact. It is
+// the schema of the V3 Artifact Protocol: well-known fields are typed, and
+// arbitrary extension keys live in Custom so the schema stays stable while
+// consumers (e.g. the greenfield planner's depends_on wiring) keep working.
+//
+// The zero value is valid and means "no metadata observed".
+type ArtifactMetadata struct {
+	// Language is the primary programming/markup language tag (e.g. "go",
+	// "html", "json") when the artifact declares one.
+	Language string
+	// MimeType is the IANA media type of Content when known (e.g.
+	// "text/html; charset=utf-8").
+	MimeType string
+	// Encoding names the character encoding of Content. It defaults to the
+	// empty string, which callers interpret as UTF-8.
+	Encoding string
+	// Source records where the artifact originated (e.g. "llm:openrouter",
+	// "extractor:markdown-fence").
+	Source string
+	// Custom holds arbitrary extension key/value facts that do not fit a
+	// typed field (e.g. "depends_on" for planner graph wiring).
+	Custom map[string]string
+}
+
+// Get returns the value of key from the Custom extension store, or the empty
+// string when key is absent.
+func (m ArtifactMetadata) Get(key string) string {
+	if m.Custom == nil {
+		return ""
+	}
+	return m.Custom[key]
+}
+
+// Set records key/value in the Custom extension store, lazily initializing
+// the map so callers can use Set on a zero-value metadata.
+func (m *ArtifactMetadata) Set(key, value string) {
+	if m.Custom == nil {
+		m.Custom = make(map[string]string)
+	}
+	m.Custom[key] = value
+}
+
+// Clone returns a deep copy of m so mutations never alias the original.
+func (m ArtifactMetadata) Clone() ArtifactMetadata {
+	out := m
+	out.Custom = make(map[string]string, len(m.Custom))
+	for k, v := range m.Custom {
+		out.Custom[k] = v
+	}
+	return out
+}
+
 // Artifact is the canonical workspace representation produced by extractors.
 // A zero or hand-assembled Artifact is permitted for construction phases, but
 // values returned by extractors always carry a computed Hash.
@@ -57,9 +109,10 @@ type Artifact struct {
 	// Hash is the hex-encoded SHA-256 digest of Content, or an empty string
 	// for artifacts assembled without content.
 	Hash string
-	// Metadata carries arbitrary structured key/value facts about the
-	// artifact (language tag, mime type, source header, ...).
-	Metadata map[string]string
+	// Metadata carries typed, structured facts about the artifact (language
+	// tag, mime type, source, extension keys). It is populated at
+	// construction time and treated as read-only afterwards.
+	Metadata ArtifactMetadata
 }
 
 // ComputeHash returns the lower-case hex-encoded SHA-256 digest of content.

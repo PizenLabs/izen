@@ -45,6 +45,7 @@ import (
 	"github.com/PizenLabs/izen/internal/templates"
 	verification "github.com/PizenLabs/izen/internal/verification"
 	"github.com/PizenLabs/izen/internal/workspace"
+	"github.com/PizenLabs/izen/pkg/capability/policy"
 	"github.com/PizenLabs/izen/pkg/control"
 	cmdreg "github.com/PizenLabs/izen/pkg/domain/command"
 )
@@ -3992,6 +3993,32 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				}
 			}
 
+			// ── V3 ARTIFACT GATE (protocol-centric) ─────────────────────
+			// Normalize + validate the resolved content inside the execution
+			// engine before any proposal is surfaced for approval. A syntax
+			// failure triggers the configured failure policy: reprompt with
+			// the parser diagnostics while the retry budget allows, abort
+			// once it is exhausted. The reasoning-leak observer consumes the
+			// raw LLM output asynchronously and never blocks this path.
+			if m.execEng != nil && m.execEng.Artifact != nil {
+				m.execEng.Artifact.InspectReasoning(rawContent)
+				gate := m.execEng.Artifact.ValidateContent(task.Target, []byte(resolved), attempt)
+				if !gate.Passed {
+					if gate.Decision == policy.DecisionRetry && attempt < maxRetries {
+						handoff = buildHandoff(orig) + "\n\nCORRECTION: " + gate.Directive
+						continue
+					}
+					return buildProposalReadyMsg{Err: fmt.Errorf("artifact validation rejected %s: %w", task.Target, gate.Error)}
+				}
+				if string(gate.Normalized) != resolved {
+					// The canonical normalized bytes differ from the model
+					// output (CRLF/BOM/trailing-newline). Propose the
+					// canonical form so disk always receives protocol bytes.
+					resolved = string(gate.Normalized)
+					diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+				}
+			}
+
 			patch := &execution.Patch{
 				ID:            fmt.Sprintf("build-%d", task.StepNum),
 				File:          task.Target,
@@ -4054,6 +4081,17 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 					fullResolved = execution.SanitizeRawCodeBlock(fullResp.Content)
 				}
 				if strings.TrimSpace(fullResolved) != "" {
+					// V3 artifact gate on the last-resort rewrite: the
+					// normalized canonical bytes are proposed so the disk
+					// always receives protocol bytes.
+					if m.execEng != nil && m.execEng.Artifact != nil {
+						m.execEng.Artifact.InspectReasoning(fullResp.Content)
+						gate := m.execEng.Artifact.ValidateContent(task.Target, []byte(fullResolved), maxRetries)
+						if !gate.Passed {
+							return buildProposalReadyMsg{Err: fmt.Errorf("artifact validation rejected %s: %w", task.Target, gate.Error)}
+						}
+						fullResolved = string(gate.Normalized)
+					}
 					fullDiff := computeUnifiedDiff(task.Target, orig, fullResolved)
 					if m.activityTree != nil {
 						added, removed := countLinesDelta(fullDiff)

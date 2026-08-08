@@ -32,8 +32,8 @@ func TestMarkdownColonHeader(t *testing.T) {
 	if a.Hash != ir.ComputeHash(a.Content) {
 		t.Errorf("hash %q does not match content", a.Hash)
 	}
-	if a.Metadata["language"] != "go" {
-		t.Errorf("language metadata = %q, want go", a.Metadata["language"])
+	if a.Metadata.Language != "go" {
+		t.Errorf("language metadata = %q, want go", a.Metadata.Language)
 	}
 	for _, f := range []EvidenceFlag{EvValidFenceHeader, EvPathInHeader, EvFenceClosed, EvValidUTF8} {
 		if !res.HasEvidence(f) {
