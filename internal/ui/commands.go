@@ -36,6 +36,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/modes/review"
 	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
@@ -383,6 +384,22 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.push(roleSystem, infoStyle.Render("Running review pipeline..."))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
+			// ── FAST-PATH EARLY EXIT: CLEAN WORKING TREE ────────────────────
+			// A full-diff /review on a clean tree has nothing to audit. Report
+			// it immediately and reset every processing flag WITHOUT starting
+			// the async pipeline or its spinner — the "Processing file
+			// mutations..." animation must never appear for a run that will
+			// perform zero mutations.
+			if rev := review.NewEngine(".", nil, nil); rev.IsCleanWorkingTree() {
+				m.push(roleSystem, infoStyle.Render("no changes to review — working tree is clean"))
+				m.reviewRunning = false
+				m.agentRunning = false
+				m.lastActionTime = time.Time{}
+				m.syncUIState()
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return tea.Batch(switchCmd)
+			}
 			return tea.Batch(m.runReviewCmd(""), switchCmd)
 		}
 		// ── AUTO-TRIGGER /build EXECUTION ──────────────────────

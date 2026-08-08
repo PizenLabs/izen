@@ -110,7 +110,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				return m.handleEmergencyInterrupt("ctrl-c")
 			}
 		case tea.KeyEsc:
-			if m.state == StateProcessing || m.planPending {
+			// Esc aborts any active review pipeline (manual /review or a
+			// $test/$run/$log sub-command that holds reviewRunning) by
+			// cancelling the registered review context and returning focus to
+			// the input bar — never killing the app.
+			if m.state == StateProcessing || m.planPending || m.reviewRunning {
 				return m.handleEmergencyInterrupt("escape")
 			}
 		case tea.KeyCtrlD:
@@ -771,6 +775,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
+		// Re-derive the presentation state from the cleared flags so a stale
+		// StateProcessing derived during the review run (e.g. via a phase-change
+		// event arriving while reviewRunning was true) is released here and the
+		// "Processing file mutations..." spinner can never stay up. Pending-
+		// approval always overrides if a gate is set.
+		m.syncUIState()
 		if msg.err != nil {
 			m.push(roleError, "review error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()

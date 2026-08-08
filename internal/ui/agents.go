@@ -229,6 +229,10 @@ func buildInvestigationEscalation(content string, result *investigate.Investigat
 // diff AND the test reports. Returns a tea.Cmd so the synchronous pipeline
 // never blocks the Bubble Tea event loop.
 func (m *model) runReviewTestComposite() tea.Cmd {
+	// Set reviewRunning synchronously so Esc/Ctrl+C can abort the composite
+	// (test suite + risk engine) before the async agentStartMsg is processed.
+	m.reviewRunning = true
+	m.lastActionTime = time.Now()
 	return tea.Sequence(
 		func() tea.Msg {
 			return agentStartMsg{label: "review+test"}
@@ -411,13 +415,43 @@ func (r *reviewRunner) RunComprehensiveReview() (string, *riview.ReviewLedger, e
 	return b.String(), result.Ledger, nil
 }
 
+// reviewPipelineTimeout is the hard fallback deadline for a /review pipeline
+// run. The review engine is read-only, so a run that exceeds this bound is
+// almost certainly wedged (e.g. a sandboxed `go test` stalled on a broken
+// module graph) and must be aborted rather than spinning forever.
+const reviewPipelineTimeout = 30 * time.Second
+
 func (m *model) runReviewCmd(target string) tea.Cmd {
+	// Set reviewRunning synchronously (event-loop thread) so the view renders
+	// the spinner immediately and Esc/Ctrl+C can cancel the in-flight run
+	// before the async agentStartMsg is even processed.
+	m.reviewRunning = true
+	m.lastActionTime = time.Now()
+
+	// Strict fallback timeout for the whole /review pipeline. Registered as a
+	// background cancel so a mode transition, Esc, or Ctrl+C aborts a stuck
+	// run instead of leaving the spinner up forever.
+	ctx, cancel := context.WithTimeout(context.Background(), reviewPipelineTimeout)
+	m.registerBackgroundCancel(cancel)
+
 	return tea.Sequence(
 		func() tea.Msg {
 			return agentStartMsg{label: "reviewing"}
 		},
 		m.smoothStreamTickCmd(),
-		func() tea.Msg {
+		func() (msg tea.Msg) {
+			// DEFENSIVE CLEANUP: guarantee the terminal reviewResultMsg is
+			// delivered on every exit path (including a panic inside the
+			// engine), so the spinner can never be left orphaned.
+			defer func() {
+				if r := recover(); r != nil {
+					msg = reviewResultMsg{err: fmt.Errorf("review pipeline panic: %v", r)}
+				}
+			}()
+			// Release the 30s watchdog once the run completes (a no-op on the
+			// registered background cancel if it was already fired by Esc).
+			defer cancel()
+
 			currentMode := m.resolver.Current()
 			if currentMode.CanWrite() {
 				return reviewResultMsg{err: fmt.Errorf("review mode: write capability detected — review must be 100%% read-only")}
@@ -429,15 +463,17 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 				return reviewResultMsg{err: fmt.Errorf("review mode: patch capability detected — review must lock out patch generation")}
 			}
 
-			eng := review.NewEngine(".", nil, nil).WithEventBus(m.bus)
+			eng := review.NewEngine(".", nil, nil).WithContext(ctx).WithEventBus(m.bus)
 			// Inject the Layer 0-5 pipeline Facade for the Layer 4 RAM
 			// validation of the changed files during the verify step.
 			eng.WithPipelineFacade(m.pipelineFacade())
 			var result *review.ReviewResult
 			var err error
 			if target != "" {
+				//nolint:contextcheck // engine consumes the injected ctx internally
 				result, err = eng.RunTarget(target)
 			} else {
+				//nolint:contextcheck // engine consumes the injected ctx internally
 				result, err = eng.Run()
 			}
 			if err != nil {
