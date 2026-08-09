@@ -191,6 +191,18 @@ func (e *Engine) emit(ev events.DomainEvent) {
 	}
 }
 
+// finalizeTasks applies the compile-error shell enforcement (go get / go mod
+// tidy injection) unless the workspace is a frontend/vanilla archetype. A
+// FRONTEND_UI intent or VANILLA_WEB archetype MUST NEVER receive injected Go
+// dependency tasks — the enforcement heuristic is invalidated immediately when
+// the domain isolation guard is active.
+func (e *Engine) finalizeTasks(tasks []Task, problem, ledgerContent string) []Task {
+	if e != nil && e.vanillaWeb {
+		return tasks
+	}
+	return ForceShellExecOnCompileError(tasks, problem, ledgerContent)
+}
+
 // DiscoverAllowedFiles runs pkg/recon and pkg/grounding to discover the
 // workspace file tree. Returns the allowed file list or an error.
 // If AllowedFiles is already set, returns them immediately.
@@ -566,7 +578,9 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	// Detect workspace archetype at run start. When VANILLA_WEB, Go-specific
 	// fast-track paths (canonical import mismatch, undefined symbol) are
 	// skipped and the LLM is instructed to avoid Go toolchain commands.
-	if !fastTrack && e.rootPath != "" {
+	// Archetype detection gates EVERY synthesis path (including fast-track) so
+	// a pure-frontend workspace can never receive Go dependency tasks.
+	if e.rootPath != "" {
 		if ac, err := recon.DetectArchetype(e.rootPath); err == nil && ac != nil {
 			e.vanillaWeb = (ac.Type == recon.VANILLA_WEB)
 		}
@@ -738,7 +752,13 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	// The signal classifier extracts the blocker marker AND the dependency
 	// package from the ledger; the conclusion path remains the primary
 	// dependency source (it carries the corrected path from forensic analysis).
-	if !fastTrack {
+	// ── FRONTEND DOMAIN ISOLATION (Module D) ───────────────────────────
+	// A FRONTEND_UI / VANILLA_WEB workspace MUST NEVER stage Go dependency
+	// tasks. The REMOTE DEPENDENCY BLOCKER short-circuit below is a Go
+	// dependency heuristic: it is invalidated immediately for frontend
+	// workspaces so a pure HTML/CSS/JS project can never receive go get /
+	// go mod tidy tasks.
+	if !fastTrack && !e.vanillaWeb {
 		blocker := signal.First(signals, signal.SignalDepMissing)
 		if blocker != nil && blocker.PayloadValue("blocker") == "true" {
 			conclusion := ExtractConclusionFromLedger(ledgerContent)
@@ -925,6 +945,12 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 				clean = append(clean, t)
 			}
 		}
+		// FRONTEND DOMAIN ISOLATION: fast-track shell resolution is a Go
+		// dependency heuristic. In a VANILLA_WEB workspace it is invalidated
+		// immediately — no Go toolchain command may be staged.
+		if e.vanillaWeb {
+			clean = EnforceFrontendDomainIsolation(clean)
+		}
 		if len(clean) == 0 {
 			return nil, fmt.Errorf("plan engine: fast-track produced no runnable shell tasks (model returned: %s)", truncateForLog(resp.Content))
 		}
@@ -1010,14 +1036,16 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 			// are filtered out. This is the hard anti-escape barrier for
 			// VANILLA_WEB archetype that overrides any LLM hallucination.
 			if e.vanillaWeb {
-				candidates = filterGoCommands(candidates)
+				candidates = EnforceFrontendDomainIsolation(candidates)
 				candidates = SanitizeTasksForArchetype(candidates, recon.VANILLA_WEB)
 			}
 
 			if len(candidates) > 0 {
 				if !hasInvalidShellExecCommand(candidates) {
-					// All checks passed — return with compile-error enforcement.
-					return ForceShellExecOnCompileError(candidates, problem, ledgerContent), nil
+					// All checks passed — return with compile-error enforcement
+					// (skipped for frontend workspaces: Go dependency tasks are
+					// domain-forbidden there).
+					return e.finalizeTasks(candidates, problem, ledgerContent), nil
 				}
 
 				// Semantic failure: invalid SHELL_EXEC commands detected.
@@ -1028,7 +1056,7 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 
 				// Max retries exceeded for semantic failures — deterministic fallback.
 				return ValidateShellExecCommands(
-					ForceShellExecOnCompileError(candidates, problem, ledgerContent),
+					e.finalizeTasks(candidates, problem, ledgerContent),
 					ledgerContent,
 				), nil
 			}
@@ -1087,6 +1115,12 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	}
 	if signal.IsCompilationOrDependency(signals) ||
 		signal.IsCompilationOrDependency(signal.Detect(problem, "plan.problem")) {
+		// FRONTEND DOMAIN ISOLATION: the go get emergency fallback is a Go
+		// dependency heuristic and is invalidated immediately for frontend
+		// workspaces — a pure HTML/CSS/JS project has no Go dependency graph.
+		if e.vanillaWeb {
+			return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed for a frontend workspace — no Go dependency fallback applies", maxSilentRetries+1)
+		}
 		conclusion := ExtractConclusionFromLedger(ledgerContent)
 		if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
 			return []Task{
@@ -1141,7 +1175,7 @@ func (e *Engine) synthesizeViaFacade(ctx context.Context, problem, ledgerContent
 	if len(tasks) == 0 {
 		return nil, fmt.Errorf("plan engine: pipeline facade produced no patches")
 	}
-	return ForceShellExecOnCompileError(tasks, problem, ledgerContent), nil
+	return e.finalizeTasks(tasks, problem, ledgerContent), nil
 }
 
 // patchesToTasks projects Layer 3 file patches produced by the pipeline facade
@@ -1189,13 +1223,13 @@ func (e *Engine) tolerantMarkdownTasks(content, problem, ledgerContent string) [
 	md = filterValidTasks(md)
 	md = FilterNonExistentMutationTargets(md, e.rootPath)
 	if e.vanillaWeb {
-		md = filterGoCommands(md)
+		md = EnforceFrontendDomainIsolation(md)
 		md = SanitizeTasksForArchetype(md, recon.VANILLA_WEB)
 	}
 	if len(md) == 0 || hasInvalidShellExecCommand(md) {
 		return nil
 	}
-	return ForceShellExecOnCompileError(md, problem, ledgerContent)
+	return e.finalizeTasks(md, problem, ledgerContent)
 }
 
 // compilerErrorFileRe extracts the exact file path from a Go compiler error
@@ -1407,28 +1441,6 @@ func FilterUndefinedSymbolShellExec(tasks []Task, ledgerContent string) []Task {
 		return filtered
 	}
 	return filtered
-}
-
-// filterValidTasks filters a task slice to only tasks with valid, non-empty
-// targets. Invalid tasks are dropped silently — identical resilience pattern
-// used by the fast-track path — so a local 7B model with one bad task does
-// not abort the entire plan. Returns the original slice if all tasks are valid.
-// filterGoCommands strips SHELL_EXEC tasks whose targets contain Go toolchain
-// commands (go mod tidy, go get, go test, go build, go install, go run, go vet,
-// go list, go clean). Used by the VANILLA_WEB archetype guard to prevent Go
-// commands from reaching execution in HTML/CSS/JS workspaces.
-func filterGoCommands(tasks []Task) []Task {
-	clean := make([]Task, 0, len(tasks))
-	for _, t := range tasks {
-		if t.Type == "SHELL_EXEC" || t.Type == "GIT_ACTION" {
-			target := strings.Fields(strings.TrimSpace(t.Target))
-			if len(target) >= 2 && target[0] == "go" {
-				continue // skip go mod tidy, go get, etc.
-			}
-		}
-		clean = append(clean, t)
-	}
-	return clean
 }
 
 func filterValidTasks(tasks []Task) []Task {

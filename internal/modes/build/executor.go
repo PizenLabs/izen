@@ -10,9 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/changeset"
 	"github.com/PizenLabs/izen/internal/controlplane/guard"
 	"github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/patch"
 	"github.com/PizenLabs/izen/internal/runtime/output"
 	wschk "github.com/PizenLabs/izen/internal/workspace/checkpoint"
 	wsfail "github.com/PizenLabs/izen/internal/workspace/failure"
@@ -251,6 +253,69 @@ func (ex *Executor) SetTransaction(tx *engine.Transaction) {
 	ex.tx = tx
 }
 
+// CompileChangeSets transforms an ordered ChangeSet IR into authoritative file
+// mutations for this executor. Each change is:
+//
+//  1. compiled by the changeset Diff Compiler into a ---/+++ unified diff
+//     against the on-disk target (the SINGLE AUTHORITATIVE SOURCE of diff
+//     patches in the pipeline),
+//  2. validated by the changeset Patch Validator,
+//  3. reduced to final content through the patch engine's tiered parser.
+//
+// It is read-only: no file is written until ApplyMutation is invoked on the
+// returned mutations.
+func (ex *Executor) CompileChangeSets(css []changeset.ChangeSet) ([]FileMutation, error) {
+	compiler := changeset.NewCompiler()
+	validator := changeset.NewValidator()
+	muts := make([]FileMutation, 0, len(css))
+	for _, cs := range css {
+		original, err := os.ReadFile(filepath.Join(ex.root, cs.TargetFile))
+		if err != nil {
+			// REPLACE_BLOCK anchors require an existing file; REPLACE_FILE may
+			// create a brand-new file (empty original).
+			if cs.Kind != changeset.KindReplaceFile {
+				return nil, fmt.Errorf("compile change set %s: %w", cs.TargetFile, err)
+			}
+			original = nil
+		}
+		diff, err := compiler.CompileToPatch(cs, original)
+		if err != nil {
+			return nil, fmt.Errorf("compile change set %s: %w", cs.TargetFile, err)
+		}
+		if report := validator.Validate(diff); !report.Valid {
+			return nil, fmt.Errorf("compile change set %s: patch validation failed: %s",
+				cs.TargetFile, strings.Join(report.Reasons, "; "))
+		}
+		final, err := reduceDiffToContent(cs, original, diff)
+		if err != nil {
+			return nil, err
+		}
+		muts = append(muts, FileMutation{
+			File:     cs.TargetFile,
+			Content:  final,
+			Strategy: string(cs.Kind),
+		})
+	}
+	return muts, nil
+}
+
+// reduceDiffToContent resolves the final file content a compiled diff produces.
+// A brand-new-file REPLACE_FILE carries no on-disk original to apply against,
+// so the replacement content is used directly; otherwise the diff is reduced
+// through the patch engine's tiered parser.
+func reduceDiffToContent(cs changeset.ChangeSet, original []byte, diff []byte) (string, error) {
+	if cs.Kind == changeset.KindReplaceFile && len(original) == 0 {
+		return cs.NewContent, nil
+	}
+	p, err := patch.NewTieredParser().Parse(string(original), string(diff))
+	if err != nil {
+		return "", fmt.Errorf("compile change set %s: reduce diff to content: %w", cs.TargetFile, err)
+	}
+	return p.Modified, nil
+}
+
+// ApplyMutation applies a single mutation to disk. See CompileChangeSets for the
+// ChangeSet → mutation front-end.
 func (ex *Executor) ApplyMutation(ctx context.Context, mut FileMutation) (retErr error) {
 	start := time.Now()
 	strategy := mutationStrategy(mut)
