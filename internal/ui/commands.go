@@ -276,7 +276,13 @@ func (m *model) handleInput(line string) tea.Cmd {
 				m.syncUIState()
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
-				return tea.Batch(switchCmd)
+				// No command is returned on this path — not even the runtime
+				// SwitchModeCmd. A clean-tree review performs zero work, so the
+				// fast-path must be fully synchronous: the mode switch already
+				// happened via setMode above, and any dispatched command (e.g. a
+				// wired runtime switch) would read as "a pipeline/spinner was
+				// started" to the caller.
+				return nil
 			}
 			return tea.Batch(m.runReviewCmd(""), switchCmd)
 		}
