@@ -23,6 +23,13 @@ import (
 )
 
 func (m *model) runInvestigateCmd(content string) tea.Cmd {
+	// Set investigateRunning synchronously (event-loop thread) so the view
+	// renders the spinner immediately and Esc/Ctrl+C can cancel the in-flight
+	// run through the central Emergency Interrupt Registry before the async
+	// agentStartMsg is even processed (mirrors runReviewCmd).
+	m.investigateRunning = true
+	m.lastActionTime = time.Now()
+
 	return tea.Batch(
 		func() tea.Msg {
 			return agentStartMsg{label: "investigating"}
@@ -43,7 +50,27 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 	// Register cancel so it can be invoked on mode transition/Ctrl+C
 	m.registerBackgroundCancel(cancel)
 
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal investigateResultMsg MUST reach the TUI event loop on
+		// ANY exit path — success, error, or panic. If the closure itself
+		// panics (e.g. a nil result during escalation formatting), the recover
+		// below converts it into an error-carrying investigateResultMsg so the
+		// spinner can never be orphaned. The named return + defer order
+		// guarantees msg is set before cancel() runs.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = investigateResultMsg{
+					records:    []record{{role: roleError, text: fmt.Sprintf("investigation failed: %v", r)}},
+					err:        fmt.Errorf("investigate pipeline panic: %v", r),
+					sessionKey: content,
+				}
+			}
+		}()
+		// Release the 60s watchdog once the run completes (a no-op on the
+		// registered background cancel if it was already fired by Esc/Ctrl+C).
+		defer cancel()
+
 		if !currentMode.CanShell() {
 			return investigateResultMsg{err: fmt.Errorf("investigate mode: shell execution denied by %s capabilities", currentMode)}
 		}
@@ -60,6 +87,14 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 		outCh := make(chan outcome, 1)
 
 		go func() {
+			// Panic guard: a panic inside the engine must still deliver an
+			// error outcome so the select below resolves immediately instead of
+			// freezing the spinner for the full 60s deadline waiting on outCh.
+			defer func() {
+				if r := recover(); r != nil {
+					outCh <- outcome{err: fmt.Errorf("investigate engine panic: %v", r)}
+				}
+			}()
 			// The investigate retriever's graph tier is served from the Phase 3
 			// Lea structural engine when one is attached, degrading to a
 			// no-op graph source otherwise.
@@ -109,9 +144,6 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 		case <-ctx.Done():
 			engErr = fmt.Errorf("investigation timed out after 60s: %w", ctx.Err())
 		}
-
-		// Unregister cancel since we're done
-		cancel()
 
 		var recs []record
 
@@ -229,6 +261,10 @@ func buildInvestigationEscalation(content string, result *investigate.Investigat
 // diff AND the test reports. Returns a tea.Cmd so the synchronous pipeline
 // never blocks the Bubble Tea event loop.
 func (m *model) runReviewTestComposite() tea.Cmd {
+	// Set reviewRunning synchronously so Esc/Ctrl+C can abort the composite
+	// (test suite + risk engine) before the async agentStartMsg is processed.
+	m.reviewRunning = true
+	m.lastActionTime = time.Now()
 	return tea.Sequence(
 		func() tea.Msg {
 			return agentStartMsg{label: "review+test"}
@@ -411,13 +447,43 @@ func (r *reviewRunner) RunComprehensiveReview() (string, *riview.ReviewLedger, e
 	return b.String(), result.Ledger, nil
 }
 
+// reviewPipelineTimeout is the hard fallback deadline for a /review pipeline
+// run. The review engine is read-only, so a run that exceeds this bound is
+// almost certainly wedged (e.g. a sandboxed `go test` stalled on a broken
+// module graph) and must be aborted rather than spinning forever.
+const reviewPipelineTimeout = 30 * time.Second
+
 func (m *model) runReviewCmd(target string) tea.Cmd {
+	// Set reviewRunning synchronously (event-loop thread) so the view renders
+	// the spinner immediately and Esc/Ctrl+C can cancel the in-flight run
+	// before the async agentStartMsg is even processed.
+	m.reviewRunning = true
+	m.lastActionTime = time.Now()
+
+	// Strict fallback timeout for the whole /review pipeline. Registered as a
+	// background cancel so a mode transition, Esc, or Ctrl+C aborts a stuck
+	// run instead of leaving the spinner up forever.
+	ctx, cancel := context.WithTimeout(context.Background(), reviewPipelineTimeout)
+	m.registerBackgroundCancel(cancel)
+
 	return tea.Sequence(
 		func() tea.Msg {
 			return agentStartMsg{label: "reviewing"}
 		},
 		m.smoothStreamTickCmd(),
-		func() tea.Msg {
+		func() (msg tea.Msg) {
+			// DEFENSIVE CLEANUP: guarantee the terminal reviewResultMsg is
+			// delivered on every exit path (including a panic inside the
+			// engine), so the spinner can never be left orphaned.
+			defer func() {
+				if r := recover(); r != nil {
+					msg = reviewResultMsg{err: fmt.Errorf("review pipeline panic: %v", r)}
+				}
+			}()
+			// Release the 30s watchdog once the run completes (a no-op on the
+			// registered background cancel if it was already fired by Esc).
+			defer cancel()
+
 			currentMode := m.resolver.Current()
 			if currentMode.CanWrite() {
 				return reviewResultMsg{err: fmt.Errorf("review mode: write capability detected — review must be 100%% read-only")}
@@ -429,15 +495,17 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 				return reviewResultMsg{err: fmt.Errorf("review mode: patch capability detected — review must lock out patch generation")}
 			}
 
-			eng := review.NewEngine(".", nil, nil).WithEventBus(m.bus)
+			eng := review.NewEngine(".", nil, nil).WithContext(ctx).WithEventBus(m.bus)
 			// Inject the Layer 0-5 pipeline Facade for the Layer 4 RAM
 			// validation of the changed files during the verify step.
 			eng.WithPipelineFacade(m.pipelineFacade())
 			var result *review.ReviewResult
 			var err error
 			if target != "" {
+				//nolint:contextcheck // engine consumes the injected ctx internally
 				result, err = eng.RunTarget(target)
 			} else {
+				//nolint:contextcheck // engine consumes the injected ctx internally
 				result, err = eng.Run()
 			}
 			if err != nil {

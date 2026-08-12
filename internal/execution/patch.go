@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +36,13 @@ var ErrInvalidPatchFormat = errors.New("invalid patch format")
 // Skipped so the /build run proceeds. Callers can distinguish it from a real
 // apply error with errors.Is.
 var ErrDestructivePatchSkipped = errors.New("destructive patch skipped as no-op")
+
+// ErrPatchApplyTimeout is returned by ApplyContext when the patch application
+// (file IO, shadow backup, transaction recording) does not complete within the
+// caller's strict deadline. It exists so the TUI can abort cleanly and emit a
+// terminal error message instead of freezing the "Applying hotfix..." spinner
+// indefinitely on a deadlocked Apply.
+var ErrPatchApplyTimeout = errors.New("patch apply timed out")
 
 // MaxFullContentRewriteBytes caps the target file size (in bytes) for the
 // graceful full-content-rewrite fallback. When every SEARCH/REPLACE and
@@ -879,6 +887,49 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	pm.recordLedgerAndSummarize(patch)
 
 	return pm.store(patch)
+}
+
+// ApplyContext applies the patch under a strict context deadline. The
+// synchronous Apply performs unbounded file IO (reads, shadow backups,
+// transaction records, writes); if it cannot complete within the deadline —
+// e.g. a wedged git operation or a hung filesystem — this returns
+// ErrPatchApplyTimeout so the caller can abort cleanly and emit a terminal
+// error message instead of blocking the TUI spinner forever.
+//
+// NOTE: the underlying Apply still runs to completion in its own goroutine
+// when the deadline expires (Go has no safe way to kill a blocked syscall).
+// Callers MUST therefore treat a timeout as an aborted mutation and roll back
+// the enclosing transaction so a late write cannot silently corrupt state.
+func (pm *PatchManager) ApplyContext(ctx context.Context, patch *Patch) error {
+	if pm == nil {
+		return fmt.Errorf("patch manager not configured")
+	}
+	if ctx == nil {
+		//nolint:contextcheck // nil ctx deliberately degrades to legacy Apply
+		return pm.Apply(patch)
+	}
+	// Fast-path: if the deadline has already expired, abort BEFORE spawning
+	// any patch work so a stale caller gets a deterministic timeout error.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %w", ErrPatchApplyTimeout, err)
+	}
+	type outcome struct{ err error }
+	done := make(chan outcome, 1)
+	//nolint:contextcheck // legacy Apply has no ctx; the deadline is enforced here
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- outcome{err: fmt.Errorf("patch apply panic: %v", r)}
+			}
+		}()
+		done <- outcome{err: pm.Apply(patch)}
+	}()
+	select {
+	case o := <-done:
+		return o.err
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", ErrPatchApplyTimeout, ctx.Err())
+	}
 }
 
 // resolvePatchContent resolves the final file content from a patch payload

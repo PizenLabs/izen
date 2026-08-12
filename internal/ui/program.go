@@ -106,11 +106,12 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 
 	initStage := initComplete
 	if !localActive {
-		// Even if a local .izen/config.json is missing but .izen/ dir state
-		// exists, recover into the completed state rather than re-onboarding.
-		if state.HasLocalState(root) {
-			localActive = true
-		}
+		// .izen/config.json is missing. Do NOT let leftover .izen/ directory
+		// state (state.HasLocalState) promote this workspace past onboarding:
+		// isProjectInitialized() requires config.json to render the workspace,
+		// so any initStage other than initNone here deadlocks into a frozen
+		// welcome header. Route to the wizard instead.
+		initStage = initNone
 	}
 	if !localActive {
 		// Always start at the welcome screen (initNone) when .izen/ does not
@@ -249,6 +250,11 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
+	// ── FORCE-EXIT TERMINAL RESTORE ──────────────────────────────────────
+	// The model needs the owning program to restore the terminal before a hard
+	// double-Ctrl+C exit (status 130).
+	m.program = p
+
 	// ── FACT-ONLY CONTROL BRIDGE ─────────────────────────────────────
 	// The adaptive control loop's telemetry bus publishes fact-only facts
 	// (control.iteration + control.node_observed). The UI subscribes via
@@ -371,8 +377,16 @@ func runProgram(p *tea.Program, root string, initStage initStage) {
 		}
 	}()
 
-	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error running Izen: %v\n", err)
+	// ── ROOT SIGINT/SIGTERM CANCELLATION BRIDGE ──────────────────────────
+	// First signal: graceful cancellation of the active operation. Second
+	// signal while a cancellation is in progress: hard exit with status 130.
+	// The application must never require tmux kill-pane to recover.
+	stopSignals := installRootSignalBridge(p)
+
+	_, runErr := p.Run()
+	stopSignals()
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "Error running Izen: %v\n", runErr)
 		os.Exit(1)
 	}
 }
@@ -394,11 +408,8 @@ func RunMainDashboardWithApp(cfg *config.Config, root string, localCfg *config.L
 	_, localCfgErr := os.Stat(localCfgPath)
 	localActive := localCfgErr == nil
 	if !localActive {
-		if state.HasLocalState(root) {
-			localActive = true
-		}
-	}
-	if !localActive {
+		// config.json is the sole onboarding authority; leftover .izen/ dir
+		// state must never promote past onboarding (see NewProgramWithApp).
 		initStage = initNone
 	}
 
@@ -434,11 +445,8 @@ func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalCo
 	_, localCfgErr := os.Stat(localCfgPath)
 	localActive := localCfgErr == nil
 	if !localActive {
-		if state.HasLocalState(root) {
-			localActive = true
-		}
-	}
-	if !localActive {
+		// config.json is the sole onboarding authority; leftover .izen/ dir
+		// state must never promote past onboarding (see NewProgramWithApp).
 		initStage = initNone
 	}
 

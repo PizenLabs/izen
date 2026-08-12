@@ -95,10 +95,28 @@ func DispatchStrategy(parent context.Context, provider ai.Provider, model string
 		defer cancel()
 		if provider != nil && strings.TrimSpace(failureLog) != "" {
 			if s, ok := llmClassify(ctx, provider, model, failureLog); ok {
+				// FRONTEND DOMAIN ISOLATION: a remote package import path would
+				// route to the Go dependency remediation blueprint (go mod tidy /
+				// go get). In a pure-frontend workspace those Go dependency task
+				// heuristics are invalidated immediately.
+				if s.Tool == ToolLX && isRemotePackageTarget(s.Target) {
+					dispatchLog("[orchestrator] VANILLA_WEB archetype — lx remote-package target downgraded to diagnose (Go dependency heuristics invalid)")
+					return Strategy{Tool: ToolDiagnose, Target: ""}
+				}
 				return s
 			}
 		}
 		return heuristicClassifyWithArchetype(failureLog, true)
+	}
+
+	// FRONTEND_UI INTENT GUARD: an HTML/CSS/JS intent MUST NEVER route a remote
+	// package import path to lx, which would spawn the Go dependency remediation
+	// blueprint. Frontend tooling search is limited to local DOM/CSS context.
+	if intent.IsFrontendUI() {
+		if pkg := extractAnyPackageName(failureLog); pkg != "" && isRemotePackageTarget(pkg) {
+			dispatchLog("[orchestrator] intent=%s — lx remote-package target downgraded to diagnose (frontend domain isolation)", intent)
+			return Strategy{Tool: ToolDiagnose, Target: ""}
+		}
 	}
 
 	// STRICT ENV_DEPS GUARD: Feature/UnitTest/Refactor intents skip all external

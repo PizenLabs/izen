@@ -32,6 +32,10 @@ type Engine struct {
 	Verifier *Verifier
 	Diff     *DiffAnalyzer
 	Pipeline *PipelineRunner
+	// Artifact is the V3 protocol-centric artifact pipeline (contract
+	// parsing, normalization, pluggable validation, failure policy and
+	// reasoning-leak telemetry). It is non-nil for every engine.
+	Artifact *V3ArtifactPipeline
 
 	Tx *engine.Transaction
 }
@@ -84,6 +88,7 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ..
 		Risk:        rc,
 		Verifier:    v,
 		Diff:        d,
+		Artifact:    NewV3ArtifactPipeline(),
 	}
 	p.SetTransaction(tx)
 	e.PatchQueue = NewPatchQueue(root, e.Patches)

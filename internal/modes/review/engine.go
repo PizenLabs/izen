@@ -58,6 +58,12 @@ type Engine struct {
 	// the outcome as a stage event. The outcome is advisory — review remains
 	// read-only. Optional; nil keeps the legacy verify-only path.
 	facade pipeline.Facade
+
+	// ctx is the cancellation/timeout scope for the whole review pipeline.
+	// It is threaded into every long-running sub-step (Layer 4 validation,
+	// deterministic sandbox verification) so the caller can abort a stuck
+	// run. Defaults to context.Background() when not injected.
+	ctx context.Context
 }
 
 func NewEngine(root string, retriever Retriever, g *lea.FileGraph) *Engine {
@@ -70,7 +76,24 @@ func NewEngine(root string, retriever Retriever, g *lea.FileGraph) *Engine {
 		startedAt: time.Now(),
 		retriever: retriever,
 		graph:     g,
+		ctx:       context.Background(),
 	}
+}
+
+// WithContext injects the cancellation scope for the review pipeline. When the
+// context is cancelled or its deadline expires, Run aborts at the next state
+// boundary and long-running sub-steps (Layer 4 validation, sandboxed
+// verification) stop honouring work. May be nil to keep the default
+// context.Background scope.
+func (e *Engine) WithContext(ctx context.Context) *Engine { //nolint:contextcheck // stores a caller-provided scope, never derives a fresh one
+	if e == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	e.ctx = ctx
+	return e
 }
 
 // WithEventBus injects the event bus this engine publishes domain events to.
@@ -105,6 +128,18 @@ func (e *Engine) emit(ev events.DomainEvent) {
 	}
 }
 
+// IsCleanWorkingTree reports whether a full-diff review would immediately
+// short-circuit because the working tree has no changes to review. It mirrors
+// the fast-path inside Run so callers (e.g. the TUI) can skip starting a
+// spinner entirely for a clean tree. Target-scoped audits (RunTarget) are
+// never "clean" — an explicit audit target is always reviewable.
+func (e *Engine) IsCleanWorkingTree() bool {
+	if e == nil || e.Diff == nil {
+		return false
+	}
+	return e.target == "" && e.Diff.isRepo() && !e.Diff.hasChanges()
+}
+
 func (e *Engine) Run() (*ReviewResult, error) {
 	result := &ReviewResult{
 		CreatedAt: time.Now(),
@@ -126,6 +161,14 @@ func (e *Engine) Run() (*ReviewResult, error) {
 	}
 
 	for !e.State.ShouldStop() {
+		if e.ctx != nil && e.ctx.Err() != nil {
+			// Abort on external cancellation/timeout: surface the context
+			// error as a recoverable failure instead of spinning forever.
+			result.Error = fmt.Sprintf("review aborted: %v", e.ctx.Err())
+			e.Result = result
+			e.emit(events.NewExecutionFailed(events.FailureTransient, e.ctx.Err(), "review"))
+			return result, e.ctx.Err()
+		}
 		state := e.State.Current()
 		stateStart := time.Now()
 		if err := e.executeCurrentState(result); err != nil {
@@ -376,11 +419,25 @@ func (e *Engine) validateChangedFiles(files []DiffFile) (*pipeline.ValidationRes
 	if len(patches) == 0 {
 		return nil, nil
 	}
-	return e.facade.ValidatePatch(context.Background(), patches)
+	ctx := e.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return e.facade.ValidatePatch(ctx, patches)
 }
 
 func (e *Engine) runDeterministicVerification(reviewID string, rf RiskFinding, verID string) (riview.EvidenceRecord, error) {
-	return riview.RunWithSandbox(reviewID, e.root, func(sb *riview.Sandbox) (riview.EvidenceStatus, riview.EvidenceConfidence, string, string) {
+	if e.ctx != nil && e.ctx.Err() != nil {
+		return riview.EvidenceRecord{}, e.ctx.Err()
+	}
+	ctx := e.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return riview.RunWithSandboxContext(ctx, reviewID, e.root, func(sb *riview.Sandbox) (riview.EvidenceStatus, riview.EvidenceConfidence, string, string) {
+		if ctx.Err() != nil {
+			return riview.EvStatusSkipped, riview.ConfLow, "", "Verification aborted — review context cancelled"
+		}
 		testContent := e.generateTestForRisk(rf)
 		if testContent == "" {
 			return riview.EvStatusSkipped, riview.ConfLow, "", "No test template available for this risk pattern"
@@ -391,7 +448,7 @@ func (e *Engine) runDeterministicVerification(reviewID string, rf RiskFinding, v
 			return riview.EvStatusFailed, riview.ConfLow, "", fmt.Sprintf("Failed to write test: %v", err)
 		}
 
-		result := sb.RunGoTestInProject("./...")
+		result := sb.RunGoTestInProjectContext(ctx, "./...")
 		_ = verID
 		if result.Passed {
 			return riview.EvStatusPassed, riview.ConfHigh, testFileName, result.Output

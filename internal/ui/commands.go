@@ -22,6 +22,7 @@ import (
 	"github.com/mattn/go-runewidth"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/changeset"
 	"github.com/PizenLabs/izen/internal/command"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
@@ -33,9 +34,11 @@ import (
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/gateway"
+	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/modes/review"
 	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
@@ -45,6 +48,7 @@ import (
 	"github.com/PizenLabs/izen/internal/templates"
 	verification "github.com/PizenLabs/izen/internal/verification"
 	"github.com/PizenLabs/izen/internal/workspace"
+	"github.com/PizenLabs/izen/pkg/capability/policy"
 	"github.com/PizenLabs/izen/pkg/control"
 	cmdreg "github.com/PizenLabs/izen/pkg/domain/command"
 )
@@ -216,154 +220,30 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
-	// ── Composite fast-query routing: /review $test ───────────────────
-	// MUST be evaluated at the very top of the evaluation tree, strictly
-	// before parseModeShorthand (which would otherwise match the "/review "
-	// prefix and route this to a plain static /review, silently bypassing the
-	// dynamic-test-then-review composite shortcut).
-	if command.IsReviewTestComposite(line) {
-		m.push(roleSystem, accentStyle.Render(Icon.Index+" [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
+	// ── DETERMINISTIC PARSE PIPELINE ───────────────────────────────────
+	// Every remaining input reaches the parser BEFORE any string-prefix
+	// command lookup or intent dispatch. parser.ParseInWorkspace resolves
+	// /workspace markers, $ directives, @ scopes, and the natural-language
+	// goal into a structured IntentAST and enforces the permission policy
+	// against the effective workspace (the active session workspace when the
+	// line declares none). Parse errors are surfaced verbatim and execution
+	// stops — the raw-input "unknown command: <line>" fallback is never
+	// emitted.
+	ast, err := m.intentFromInput(line)
+	if err != nil {
+		m.push(roleError, err.Error())
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
-		return m.runReviewTestComposite()
+		return nil
 	}
 
-	// ── $prompt — GLOBAL MODE-GUARD ROUTER TO /ask ───────────────────────
-	// $prompt is a global routing entry point, not an execution mode. From
-	// ANY active mode it transitions cleanly to /ask, injecting the query as
-	// /ask input for structured Forensic Context Ledger generation. It MUST
-	// NEVER execute /build, /review, /plan, or /investigate logic inside the
-	// originating mode — the only allowed action is the transition to /ask.
-	if line == "$prompt" || strings.HasPrefix(line, "$prompt ") {
-		m.cancelStaleAgentOps()
-		if line == "$prompt" {
-			m.push(roleError, "[Usage] $prompt <your raw architectural idea or description>")
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			return nil
-		}
-		rawInput := strings.TrimSpace(line[8:])
-
-		// ── COMPRESSOR FAST-TRACK ──────────────────────────
-		// Check the prompt compressor first. If it signals a direct
-		// mutation (BypassInvest=true) with a target file, skip ALL
-		// Architect prompts, skip /investigate mode routing entirely,
-		// and route directly to BUILD with a staged FILE_MUTATE task.
-		if compressed := gateway.CompressPrompt(rawInput); compressed != nil && compressed.BypassInvest && compressed.Target != "" {
-			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected by compressor. Bypassing architect analysis."))
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			targets := gateway.ExtractDirectMutationTargets(rawInput)
-			if len(targets) > 1 {
-				var tasks []plan.Task
-				for i, f := range targets {
-					tasks = append(tasks, plan.Task{
-						StepNum: i + 1,
-
-						Status:      "idle",
-						Type:        "FILE_MUTATE",
-						Target:      f,
-						Description: rawInput,
-						Rationale:   fmt.Sprintf("Fast-Track multi-file decomposition: target %d of %d", i+1, len(targets)),
-						IsHardcoded: true,
-					})
-				}
-				return func() tea.Msg {
-					return planResultMsg{
-						Tasks:       tasks,
-						IsFastTrack: true,
-					}
-				}
-			}
-			target := command.FallbackPlanTarget{
-				File:        compressed.Target,
-				Description: rawInput,
-				TaskType:    "FILE_MUTATE",
-			}
-			tasks := command.GenerateFallbackPlan(target)
-			return func() tea.Msg {
-				return planResultMsg{
-					Tasks:       tasks,
-					IsFastTrack: true,
-				}
-			}
-		}
-
-		// ── INTENT PRE-GUARD: Fast-track direct file mutations ──────────
-		// pipeline. If the user is requesting a simple single-file mutation
-		// on a non-code file (e.g. $prompt rename author in @LICENSE),
-		// classify it and route directly to /build as a FILE_MUTATE task
-		// with zero LLM involvement — no forensic analysis, no go test.
-		if target, isDirect := gateway.ClassifyDirectMutation(rawInput); isDirect {
-			m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected. Bypassing architect analysis."))
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			// Multi-file decomposition: when the prompt lists multiple
-			// files (comma-separated), create distinct TODO items for each.
-			multiTargets := gateway.ExtractDirectMutationTargets(rawInput)
-			if len(multiTargets) > 1 {
-				var tasks []plan.Task
-				for i, f := range multiTargets {
-					tasks = append(tasks, plan.Task{
-						StepNum: i + 1,
-
-						Status:      "idle",
-						Type:        "FILE_MUTATE",
-						Target:      f,
-						Description: rawInput,
-						Rationale:   fmt.Sprintf("Fast-Track multi-file decomposition: target %d of %d", i+1, len(multiTargets)),
-						IsHardcoded: true,
-					})
-				}
-				return func() tea.Msg {
-					return planResultMsg{
-						Tasks:       tasks,
-						IsFastTrack: true,
-					}
-				}
-			}
-			tasks := command.GenerateFallbackPlan(target)
-			return func() tea.Msg {
-				return planResultMsg{
-					Tasks:       tasks,
-					IsFastTrack: true,
-				}
-			}
-		}
-
-		currentMode := m.resolver.Current()
-		if currentMode != modes.ModeAsk {
-			// Mode Guard Enforced: request state transition to /ask, then
-			// queue the $prompt synthesis directly via runAskPromptHandoffCmd.
-			// This preserves the lean ask handoff prompt — we MUST NOT re-enter handleInput
-			// because the raw input no longer carries the $prompt prefix and
-			// would be routed to the normal AskContract() streaming path,
-			// producing conversational noise instead of the structured
-			// handoff prompt.
-			m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
-				"$prompt from /%s — transitioning to /ask for structured analysis...", currentMode)))
-			m.modeChangeAuthorized = true
-			cmd := m.setMode(modes.ModeAsk)
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-			return tea.Batch(cmd, m.runAskPromptHandoffCmd(rawInput))
-		}
-
-		m.push(roleSystem, infoStyle.Render("Refining prompt through ask handoff..."))
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return m.runAskPromptHandoffCmd(rawInput)
-	}
-
-	// $ sub-command prefix — delegates to handleReviewDollar for routing.
-	if strings.HasPrefix(line, "$") {
-		// ANTI-DEADLOCK: unconditionally sanitize stale execution flags
-		// before spawning any background task. Prevents ghost spinner lock
-		// when sequential $ commands are issued without a clean reset.
-		cmd := m.handleReviewDollar(line)
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return cmd
+	// Directive- and global-bearing intents (including the /review $test
+	// composite and the $prompt /ask router) are dispatched structurally from
+	// the AST: workspace transition first, then commands, then directives.
+	// Bare workspace switches and free-form goals fall through to the legacy
+	// string routing below, which already handles them.
+	if len(ast.Directives) > 0 || len(ast.GlobalCommands) > 0 {
+		return m.dispatchASTIntent(ast)
 	}
 
 	if mode, content, ok := parseModeShorthand(line); ok {
@@ -382,6 +262,28 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.push(roleSystem, infoStyle.Render("Running review pipeline..."))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
+			// ── FAST-PATH EARLY EXIT: CLEAN WORKING TREE ────────────────────
+			// A full-diff /review on a clean tree has nothing to audit. Report
+			// it immediately and reset every processing flag WITHOUT starting
+			// the async pipeline or its spinner — the "Processing file
+			// mutations..." animation must never appear for a run that will
+			// perform zero mutations.
+			if rev := review.NewEngine(".", nil, nil); rev.IsCleanWorkingTree() {
+				m.push(roleSystem, infoStyle.Render("no changes to review — working tree is clean"))
+				m.reviewRunning = false
+				m.agentRunning = false
+				m.lastActionTime = time.Time{}
+				m.syncUIState()
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				// No command is returned on this path — not even the runtime
+				// SwitchModeCmd. A clean-tree review performs zero work, so the
+				// fast-path must be fully synchronous: the mode switch already
+				// happened via setMode above, and any dispatched command (e.g. a
+				// wired runtime switch) would read as "a pipeline/spinner was
+				// started" to the caller.
+				return nil
+			}
 			return tea.Batch(m.runReviewCmd(""), switchCmd)
 		}
 		// ── AUTO-TRIGGER /build EXECUTION ──────────────────────
@@ -973,6 +875,27 @@ const planLocalMaxLatency = 150 * time.Second
 // lets a rate-limited small model finish the whole unified build in one turn.
 const buildGenerationTimeout = 5 * time.Minute
 
+// hotfixApplyTimeout is the strict deadline for applying an approved hotfix
+// patch to disk (file IO, shadow backup, transaction recording). A wedged
+// filesystem or git operation must never freeze the "Applying hotfix..."
+// spinner indefinitely — on expiry the apply aborts cleanly and a terminal
+// buildResultMsg is emitted.
+const hotfixApplyTimeout = 30 * time.Second
+
+// applyPatchWithDeadline applies a patch through the execution engine under
+// the strict 30s patch-apply deadline so a wedged filesystem or git operation
+// can never freeze the TUI spinner on ANY file-write / patch-application path
+// (hotfix apply, single/all proposal apply, trivial template, shell-mutation).
+// A nil engine degrades to a clean error carrying a terminal message.
+func (m *model) applyPatchWithDeadline(patch *execution.Patch) error {
+	if m.execEng == nil || m.execEng.Patches == nil {
+		return fmt.Errorf("execution engine not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), hotfixApplyTimeout)
+	defer cancel()
+	return m.execEng.Patches.ApplyContext(ctx, patch)
+}
+
 // runPlanEngineCmd executes the (potentially slow) PlanEngine ledger synthesis
 // in a background goroutine so the synchronous LLM call never blocks the Bubble
 // Tea event loop. The result is delivered asynchronously as a planResultMsg,
@@ -1067,8 +990,23 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 	// Register cancel so it can be invoked on mode transition/Ctrl+C
 	m.registerBackgroundCancel(cancel)
 
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
 		debugLogPlan("runPlanEngineCmd entered; model=" + modelName)
+
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal planResultMsg MUST reach the TUI event loop on ANY
+		// exit path — success, model error, fallback failure, timeout, or
+		// runtime panic. A panic inside the closure (e.g. a nil engine during
+		// scope-guard validation) is converted into an error-carrying
+		// planResultMsg so the plan spinner can never be orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = planResultMsg{
+					Err:     fmt.Errorf("plan pipeline panic: %v", r),
+					Handoff: handoff,
+				}
+			}
+		}()
 
 		// ── COMPRESS HANDOFF PAYLOAD ──────────────────────────────
 		// Strip verbose stack-trace lines, deduplicate, and cap the
@@ -1299,6 +1237,19 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		}
 
 		go func() {
+			// ── PANIC GUARD ─────────────────────────────────────────────
+			// A panic inside the LLM plan synthesis (or the scope-guard
+			// retry) must still deliver an error outcome to outCh so the
+			// select below resolves immediately instead of freezing the
+			// spinner for the full deadline waiting on the channel.
+			defer func() {
+				if r := recover(); r != nil {
+					select {
+					case outCh <- outcome{tasks: nil, err: fmt.Errorf("plan engine panic: %v", r)}:
+					default:
+					}
+				}
+			}()
 			debugLogPlan("Preparing LLM payload (ledger bytes=" + fmt.Sprint(len(ledgerToSend)) +
 				"; fastTrack=" + fmt.Sprint(useFastTrack) + ")")
 			var tasks []plan.Task
@@ -2371,16 +2322,33 @@ func (m *model) transitionToBuilding() error {
 	if state == workflow.StateBuilding || state == workflow.StateRepairing {
 		return nil
 	}
+	tctx := workflow.TransitionContext{
+		HasPlan:         m.sess != nil && len(m.sess.CurrentTasks) > 0,
+		HasCapabilities: m.caps != nil,
+	}
 	// ── ORCHESTRATOR-DRIVEN TRANSITION ──────────────────────────────
 	// The orchestrator owns the workflow SM. It drives the canonical
 	// Idle -> Plan -> Build path (and any required reset fallback) while
 	// sharing the persistent RuntimeContext, so conversation history and
 	// workspace artifacts survive the transition.
 	if m.orch != nil {
-		return m.orch.Transition(orchestrator.PhaseBuild, workflow.TransitionContext{
-			HasPlan:         len(m.sess.CurrentTasks) > 0,
-			HasCapabilities: m.caps != nil,
-		})
+		err := m.orch.Transition(orchestrator.PhaseBuild, tctx)
+		if err == nil {
+			return nil
+		}
+		// ── ILLEGAL PHASE-HOP FALLBACK (e.g. $hot from Idle) ─────────
+		// A $hot urgent fix skips the plan phase: the orchestrator may sit at
+		// PhaseIdle (or Ask/Review), where the strict phase table forbids a
+		// direct Idle -> Build hop. Falling back to Force resets the shared SM
+		// to idle and drives it forward along the canonical path so the
+		// workspace lands in StateBuilding cleanly — never surfacing
+		// "invalid transition idle -> build" after a valid patch apply and
+		// never triggering automated rollback of an applied hotfix.
+		var te *orchestrator.TransitionError
+		if errors.As(err, &te) {
+			return m.orch.Force(orchestrator.PhaseBuild, tctx)
+		}
+		return err
 	}
 	// Legacy raw-SM fallback (headless/test harnesses without an orchestrator).
 	if state == workflow.StateIdle {
@@ -2389,10 +2357,7 @@ func (m *model) transitionToBuilding() error {
 		}
 	}
 	if m.workflowSM.State() == workflow.StatePlanning {
-		return m.workflowSM.SendEvent(workflow.EventBuild, workflow.TransitionContext{
-			HasPlan:         len(m.sess.CurrentTasks) > 0,
-			HasCapabilities: m.caps != nil,
-		})
+		return m.workflowSM.SendEvent(workflow.EventBuild, tctx)
 	}
 	return fmt.Errorf("workflow: cannot transition to building from %s", state)
 }
@@ -2858,6 +2823,12 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 				case streamCh <- thinkingStreamMsg{Content: reasoningChunk}:
 				default:
 				}
+				// Full stream transparency: retain the reasoning chunk in the
+				// active ThinkingBuffer via the ThoughtBufferUpdatedMsg protocol.
+				select {
+				case streamCh <- ThoughtBufferUpdatedMsg{Content: reasoningChunk}:
+				default:
+				}
 				// Remove processed content from buf
 				remaining := buf.String()[:idx] + rest[endIdx+len(sentinelRSNG):]
 				buf.Reset()
@@ -2926,6 +2897,12 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 				case streamCh <- livePreviewChunkMsg{Content: content}:
 				default:
 				}
+				// Full stream transparency: retain the content chunk in the
+				// active ThinkingBuffer via the ThoughtBufferUpdatedMsg protocol.
+				select {
+				case streamCh <- ThoughtBufferUpdatedMsg{Content: content}:
+				default:
+				}
 			}
 
 			if err == io.EOF {
@@ -2935,6 +2912,10 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 				tokIn, tokOut := streamUsage()
 				select {
 				case streamCh <- streamErrMsg{err: err, content: fullContent.String(), tokenInput: tokIn, tokenOutput: tokOut}:
+				default:
+				}
+				select {
+				case streamCh <- ThoughtBufferUpdatedMsg{Done: true}:
 				default:
 				}
 				return
@@ -2957,6 +2938,10 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 					btokIn, btokOut := streamUsage()
 					select {
 					case streamCh <- buildFailedMsg{Err: fmt.Errorf("fast-track tool call buffer: %w", bufErr), TokenInput: btokIn, TokenOutput: btokOut}:
+					default:
+					}
+					select {
+					case streamCh <- ThoughtBufferUpdatedMsg{Done: true}:
 					default:
 					}
 					return
@@ -3003,6 +2988,12 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			TokenInput:  tokIn,
 			TokenOutput: tokOut,
 		}:
+		default:
+		}
+		// Full stream transparency: close the live thought block so the Ctrl+O
+		// drawer collapses to its summary once the build stream completes.
+		select {
+		case streamCh <- ThoughtBufferUpdatedMsg{Done: true}:
 		default:
 		}
 	}()
@@ -3117,6 +3108,40 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	m.sess.StageTaskList(&tasks)
 	_ = m.sess.Save()
 
+	// ── TARGET-CONFIDENCE / AMBIGUITY BOUNDARY (BEFORE any progress) ─────
+	// The ambiguity decision is made synchronously HERE, before any
+	// "Invoking provider" progress is rendered, so the UI can never claim a
+	// provider invocation the gate already prevented. An ambiguous request
+	// pauses with an actionable resolution state — no provider call, no patch,
+	// no mutation.
+	//
+	// OPERATION LIFECYCLE: the request is registered as a foreground operation
+	// (op A) at dispatch. AMBIGUOUS is its TERMINAL outcome: the operation is
+	// finalized when the ambiguous message reaches the event loop, releasing
+	// ownership, busy flags and the spinner. No worker remains waiting for the
+	// human; continuing (Clarify / candidate selection) starts operation B.
+	var orig string
+	if data, rerr := os.ReadFile(target); rerr == nil {
+		orig = string(data)
+	}
+	if dec := classifyHotfixAmbiguity(prompt, target, orig); dec.ambiguous {
+		m.beginOperation(OpHotfix)
+		m.hotfixActive = false
+		if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
+			m.sess.StageTaskList(&stashedTasks)
+			_ = m.sess.Save()
+		}
+		m.push(roleStatus, "[HOTFIX] Target is ambiguous. No model call was made and no files were modified.")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return tea.Batch(
+			func() tea.Msg {
+				return hotfixAmbiguousMsg{Task: &hotfixTask, Reason: dec.reason, Candidates: dec.candidates}
+			},
+			m.opWatchdogCmd(),
+		)
+	}
+
 	// Stage 5: Generate the patch but DO NOT apply it. The engine must render
 	// a code diff proposal and obtain explicit developer authorization before
 	// any byte is written to disk (Bug Fix 2). After approval (y) the patch is
@@ -3128,6 +3153,10 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	// developer never sees a 30s frozen pane while the local LLM silently
 	// generates the patch. The spinner keeps animating until the proposal
 	// message arrives and swaps the pane into the diff view.
+	//
+	// The "Invoking provider" line is emitted ONLY here, i.e. after the
+	// ambiguity gate has already passed — it is truthful by construction.
+	m.beginOperation(OpHotfix)
 	m.push(roleStatus, "[HOTFIX] Generating patch (local short-circuit for simple modifications)...")
 	m.push(roleSystem, fmt.Sprintf("  ⚙ Thinking... (Invoking %s)", m.activeRouteModel()))
 
@@ -3145,6 +3174,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 		m.smoothStreamTickCmd(),
 		m.shimmerTickCmd(),
 		m.hotfixProgressCmd(),
+		m.opWatchdogCmd(),
 	)
 }
 
@@ -3153,18 +3183,26 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 // the local LLM silently generates the patch — eliminating the 30s "deadlock"
 // freeze. The lines are delivered as hotfixProgressMsg through the event loop,
 // never from the background goroutine, so there is no data race on the record
-// buffer.
+// buffer. Each line reflects an actual execution boundary, and the extended
+// cadence keeps the operation watchdog informed that a long provider call is
+// still making progress.
 func (m *model) hotfixProgressCmd() tea.Cmd {
-	lines := []string{
-		"  ↺ Attempting local resolution for hotfix...",
-		"  ⚙ Compiling unified diff schema...",
+	lines := []struct {
+		delay time.Duration
+		line  string
+	}{
+		{900 * time.Millisecond, "  ↺ Attempting local resolution for hotfix..."},
+		{1800 * time.Millisecond, "  ⚙ Compiling changeset pipeline (Output Normalizer → Diff Compiler)..."},
+		{4 * time.Second, "  ⏳ Waiting for provider response..."},
+		{10 * time.Second, "  ⏳ Provider still generating — Ctrl+C to cancel"},
+		{25 * time.Second, "  ⏳ Provider still generating — Ctrl+C to cancel"},
+		{40 * time.Second, "  ⏳ Provider still generating — Ctrl+C to cancel"},
 	}
 	var cmds = make([]tea.Cmd, 0, len(lines))
-	for i, line := range lines {
-		delay := time.Duration(i+1) * 900 * time.Millisecond
-		l := line
+	for _, l := range lines {
+		delay, line := l.delay, l.line
 		cmds = append(cmds, tea.Tick(delay, func(time.Time) tea.Msg {
-			return hotfixProgressMsg{Line: l}
+			return hotfixProgressMsg{Line: line}
 		}))
 	}
 	return tea.Batch(cmds...)
@@ -3264,6 +3302,298 @@ func resolveHotfixTarget(prompt string) string {
 	return ""
 }
 
+// minHotfixResponseTokens is the $hot resilience threshold. A model response
+// at or below this many tokens is treated as a dropped/truncated SSE connection
+// (e.g. cohere/north-mini-code:free returning a 1-token answer after minutes of
+// reasoning) — never as a valid patch payload. Such a response triggers a
+// non-streaming fallback retry; if the retry is also empty the hotfix aborts
+// with an explicit connectivity message instead of surfacing a misleading
+// "ambiguous change representation".
+const minHotfixResponseTokens = 5
+
+// responseTokenEstimate returns the provider-reported output token count when
+// available, falling back to the local chars/4 heuristic.
+func responseTokenEstimate(resp *ai.Response) int {
+	if resp == nil {
+		return 0
+	}
+	if resp.TokenOutput > 0 {
+		return resp.TokenOutput
+	}
+	return len(strings.TrimSpace(resp.Content)) / 4
+}
+
+// responseEffectivelyEmpty reports whether a model response carries no usable
+// patch payload: empty content, or at most minHotfixResponseTokens tokens (the
+// dropped/truncated-SSE signature). Such responses MUST NOT be handed to the
+// changeset pipeline. The chars/4 heuristic is deliberately stricter than the
+// provider-reported count so a genuinely short-but-valid patch (e.g. a
+// single-line <h3> replacement) is never misclassified.
+func responseEffectivelyEmpty(resp *ai.Response) bool {
+	if resp == nil || strings.TrimSpace(resp.Content) == "" {
+		return true
+	}
+	if resp.TokenOutput > 0 {
+		return resp.TokenOutput <= minHotfixResponseTokens
+	}
+	return len(strings.TrimSpace(resp.Content))/4 < minHotfixResponseTokens
+}
+
+// hotfixContract is the output artifact contract Izen pins BEFORE the model is
+// invoked. The model is never free to choose between a full-file rewrite, a
+// large arbitrary dump, and a localized mutation: Izen decides, and the
+// changeset pipeline enforces the same boundary deterministically.
+type hotfixContract int
+
+const (
+	// contractReplaceFile: whole-file rewrite. Legitimate ONLY for a new,
+	// missing, or stub/small file whose complete re-emission is bounded (under
+	// the established SmallFileLineThreshold line count).
+	contractReplaceFile hotfixContract = iota
+	// contractReplaceBlock: anchored snippet. The ONLY legitimate contract for
+	// an existing large file: the model outputs the exact lines that must
+	// change and the changeset pipeline anchors them onto the on-disk content.
+	contractReplaceBlock
+)
+
+func (c hotfixContract) String() string {
+	switch c {
+	case contractReplaceFile:
+		return "REPLACE_FILE"
+	case contractReplaceBlock:
+		return "REPLACE_BLOCK"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// hotfixContractFor derives the artifact contract from the on-disk state. New,
+// missing, and stub/small files use the bounded whole-file rewrite; existing
+// files at or over SmallFileLineThreshold lines use the anchored-snippet
+// contract exclusively.
+func hotfixContractFor(orig string) hotfixContract {
+	if orig == "" || execution.IsStubFile(orig) {
+		return contractReplaceFile
+	}
+	return contractReplaceBlock
+}
+
+// isHTMLTarget reports whether the target file is an HTML document eligible for
+// the deterministic target-resolution stage.
+func isHTMLTarget(target string) bool {
+	ext := strings.ToLower(filepath.Ext(target))
+	return ext == ".html" || ext == ".htm" || ext == ".xhtml"
+}
+
+// structuralHotfixKeywords are the deterministic signals that a $hot request is
+// about finding and fixing a DEFECT in the file (a syntax error, an unclosed or
+// mismatched tag, broken markup) rather than an arbitrary content edit. Only a
+// structural-intent request may claim a located HTML anomaly as its mutation
+// target; content mutations must carry their own explicit target.
+var structuralHotfixKeywords = []string{
+	"syntax", "error", "unclosed", "unmatched", "mismatch", "malformed",
+	"broken", "invalid", "closing tag", "missing", "structur", "markup",
+	"doctype", "defect", "bug", "typo", "spelling", "grammar", "repair",
+}
+
+// isStructuralHotfixIntent reports whether the $hot request is deterministic
+// structural-intent: it asks Izen (or the model) to locate and fix a defect in
+// the target file. This is the ONLY intent class that may use a located HTML
+// structural anomaly as the mutation target, and it is the ONLY intent class
+// exempt from the ambiguity pause on large files.
+func isStructuralHotfixIntent(description string) bool {
+	lower := strings.ToLower(description)
+	for _, kw := range structuralHotfixKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// ambiguousHotfixTargetReason renders the human-readable ambiguity reason for a
+// bounded $hot request that names no explicit or uniquely-inferable mutation
+// target.
+func ambiguousHotfixTargetReason(description string) string {
+	return fmt.Sprintf(
+		"the request %q does not name an explicit or uniquely-inferable mutation target, so it is ambiguous. "+
+			"Specify the exact change and location, e.g. \"$hot fix the unclosed <section> tag @index.html\" "+
+			"or \"$hot change '2023' to '2026' @LICENSE\".",
+		description,
+	)
+}
+
+// hotfixAmbiguityDecision is the deterministic outcome of the target-confidence
+// boundary for a $hot request.
+type hotfixAmbiguityDecision struct {
+	ambiguous  bool
+	reason     string
+	candidates []hotfix.Target
+}
+
+// classifyHotfixAmbiguity is the deterministic target-confidence boundary. It
+// runs BEFORE any model invocation and decides whether a bounded $hot request
+// carries an explicit or uniquely-inferable target (execute) or is ambiguous
+// (pause and request clarification). It never invokes the model and never
+// selects a candidate automatically.
+//
+//   - new / missing / small files → whole-file bounded rewrite (execute)
+//   - deterministic local string mutation → explicit (execute)
+//   - structural-intent request → the defect is the unique target (execute)
+//   - otherwise → ambiguous (pause), with deterministic HTML anomaly candidates
+//     offered ONLY for human inspection
+func classifyHotfixAmbiguity(description, target, orig string) hotfixAmbiguityDecision {
+	if orig == "" || execution.IsSmallFile(orig) {
+		return hotfixAmbiguityDecision{ambiguous: false}
+	}
+	if isHotfixLocalCandidate(description, target) {
+		if _, ok := execution.ApplyContextAwareFuzzyReplace(orig, description, target); ok {
+			return hotfixAmbiguityDecision{ambiguous: false}
+		}
+	}
+	if isStructuralHotfixIntent(description) {
+		return hotfixAmbiguityDecision{ambiguous: false}
+	}
+	var candidates []hotfix.Target
+	if isHTMLTarget(target) {
+		candidates = hotfix.ResolveHTMLCandidates(orig)
+	}
+	return hotfixAmbiguityDecision{
+		ambiguous:  true,
+		reason:     ambiguousHotfixTargetReason(description),
+		candidates: candidates,
+	}
+}
+
+// hotfixSystemPrompt returns the contract-aware system prompt used by $hot. It
+// deliberately avoids the aggressive SEARCH/REPLACE + unified-diff contracts
+// whose prohibitive rules caused Cohere / OpenRouter models to hit premature
+// stop sequences (a 1-token answer after minutes of thinking). The prompt pins
+// the artifact representation Izen chose: a bounded snippet for large existing
+// files, or a complete-file block for new/stub/small files — exactly the
+// contracts the changeset pipeline's block extractor consumes.
+func hotfixSystemPrompt(contract hotfixContract) string {
+	cb := "```"
+	if contract == contractReplaceBlock {
+		return `Fix the target file precisely. The target is an existing file; output ONLY the exact lines that must change — the corrected snippet — inside a single markdown code block (e.g. ` + cb + `html ... ` + cb + `).
+Do NOT output the entire file. Do NOT reproduce unchanged lines.
+Match the surrounding formatting exactly so the change can be located in the file.
+Close the block with the closing fence. Nothing comes after it.`
+	}
+	return `Generate the complete target file content inside a single markdown code block.
+Open the block with the appropriate language tag (e.g. ` + cb + `html).
+Close the block with the closing fence. Nothing comes after it.
+Output ONLY the code block. No conversational text, no explanations.`
+}
+
+// buildHotfixSnippetHandoff renders the BOUNDED artifact contract for a $hot
+// edit against an existing LARGE file. Izen pins the output representation
+// BEFORE invocation: the file content is provided as reference context only,
+// and the model must return ONLY the exact lines that change — never the entire
+// file. A whole-file re-emission is out-of-contract and is rejected downstream
+// by the changeset pipeline, which anchors the snippet as a REPLACE_BLOCK onto
+// the on-disk content.
+func buildHotfixSnippetHandoff(task *plan.Task, orig string) string {
+	if task == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## HOTFIX TASK\n")
+	b.WriteString("Fix the target file precisely.\n\n")
+	b.WriteString("### TARGET FILE\n")
+	b.WriteString(task.Target + "\n\n")
+	if orig != "" {
+		b.WriteString("### TARGET_FILE_CONTENT (reference only)\n```\n" + orig + "\n```\n\n")
+	}
+	b.WriteString("### TASK\n")
+	b.WriteString(task.Description + "\n\n")
+	cb := "```"
+	b.WriteString("### OUTPUT CONTRACT\n")
+	b.WriteString("Output ONLY the exact lines that must change — the corrected snippet — inside a single markdown code block (e.g. " + cb + "html ... " + cb + "). ")
+	b.WriteString("Do NOT output the entire file. Do NOT reproduce unchanged lines. ")
+	b.WriteString("Match the surrounding formatting exactly so the change can be located. ")
+	b.WriteString("Do NOT use SEARCH/REPLACE blocks or unified diff format.\n\n")
+	fmt.Fprintf(&b, "CURRENT_YEAR: %d\n", time.Now().Year())
+	return strings.TrimSpace(b.String())
+}
+
+// buildHotfixTargetedHandoff renders the TARGETED artifact contract for a $hot
+// edit against an existing LARGE HTML file where Izen has already resolved the
+// exact mutation target (Target Resolution). Only the resolved target block
+// crosses to the model — the entire file NEVER does, which makes a full-document
+// response structurally impossible at generation time. The model must return
+// ONLY the corrected target block, which the changeset pipeline anchors onto the
+// on-disk block as a REPLACE_BLOCK.
+func buildHotfixTargetedHandoff(task *plan.Task, tgt *hotfix.Target) string {
+	if task == nil || tgt == nil {
+		return ""
+	}
+	cb := "```"
+	lang := strings.ToLower(ctxpkg.LanguageFromExtension(task.Target))
+	if lang == "" {
+		lang = "html"
+	}
+	var b strings.Builder
+	b.WriteString("## HOTFIX TASK\n")
+	b.WriteString("Fix the target file precisely.\n\n")
+	b.WriteString("### TARGET FILE\n")
+	b.WriteString(task.Target + "\n\n")
+	b.WriteString("### TARGET MUTATION\n")
+	b.WriteString(tgt.Mismatch.Describe() + "\n\n")
+	fmt.Fprintf(&b, "### TARGET BLOCK (lines %d-%d)\n", tgt.StartLine, tgt.EndLine)
+	b.WriteString("The syntax error is inside this block. Copy it, apply the fix, and return ONLY the corrected block:\n\n")
+	b.WriteString(cb + lang + "\n" + tgt.Block + "\n" + cb + "\n\n")
+	b.WriteString("### OUTPUT CONTRACT\n")
+	b.WriteString("Return ONLY the corrected version of the TARGET BLOCK inside a single markdown code block (e.g. " + cb + "html ... " + cb + "). ")
+	b.WriteString("Do NOT output the entire file. Do NOT include lines outside the TARGET BLOCK. ")
+	b.WriteString("Match the existing formatting exactly. ")
+	b.WriteString("Do NOT use SEARCH/REPLACE blocks or unified diff format.\n\n")
+	fmt.Fprintf(&b, "CURRENT_YEAR: %d\n", time.Now().Year())
+	return strings.TrimSpace(b.String())
+}
+
+// buildHotfixFallbackHandoff renders the clean, positive fallback handoff for
+// the $hot non-streaming retry. It carries the same file context as the primary
+// prompt but with zero prohibitive/aggressive framing so the model completes
+// the code block instead of stopping early. The artifact contract stays pinned
+// by the caller (contractReplaceBlock for large existing files). When a
+// deterministic target was resolved (tgt != nil), the fallback re-presents ONLY
+// that target block — never the whole file.
+func buildHotfixFallbackHandoff(task *plan.Task, orig string, contract hotfixContract, tgt *hotfix.Target) string {
+	if task == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## HOTFIX TASK\n")
+	b.WriteString("Fix the syntax error in the target file.\n\n")
+	b.WriteString("### TARGET FILE\n")
+	b.WriteString(task.Target + "\n\n")
+	if tgt != nil {
+		b.WriteString("### TARGET MUTATION\n")
+		b.WriteString(tgt.Mismatch.Describe() + "\n\n")
+		fmt.Fprintf(&b, "### TARGET BLOCK (lines %d-%d)\n```\n%s\n```\n\n", tgt.StartLine, tgt.EndLine, tgt.Block)
+		cb := "```"
+		b.WriteString("Return ONLY the corrected TARGET BLOCK inside a single markdown code block (e.g. " + cb + "html ... " + cb + "). ")
+		b.WriteString("Do NOT output the entire file. Match the surrounding formatting exactly.")
+		return strings.TrimSpace(b.String())
+	}
+	if orig != "" {
+		b.WriteString("### CURRENT FILE CONTENT\n```\n" + orig + "\n```\n\n")
+	}
+	b.WriteString("### TASK\n")
+	b.WriteString(task.Description + "\n\n")
+	cb := "```"
+	if contract == contractReplaceBlock {
+		b.WriteString("Output ONLY the exact lines that must change — the corrected snippet — inside a markdown code block (e.g. " + cb + "html ... " + cb + "). ")
+		b.WriteString("Do NOT output the entire file. Match the surrounding formatting exactly.")
+		return strings.TrimSpace(b.String())
+	}
+	b.WriteString("Return the corrected code block inside markdown code fences (e.g. " + cb + "html ... " + cb + "). ")
+	b.WriteString("For a small file, return the COMPLETE corrected file content inside a single code block. ")
+	b.WriteString("Preserve every unchanged part of the file exactly as-is.")
+	return strings.TrimSpace(b.String())
+}
+
 // proposeHotfixPatch generates the patch for a $hot FILE_MUTATE task via the
 // LLM (one non-streaming call) WITHOUT applying it. Instead, it renders a code
 // diff proposal and freezes the pipeline in StateAwaitingApproval so the
@@ -3274,14 +3604,35 @@ func resolveHotfixTarget(prompt string) string {
 // update/replace a string), execution.ApplyContextAwareFuzzyReplace is attempted locally
 // first. On success the patch is returned immediately without any LLM call.
 //
-// Early abort (Path B): when the active provider is a cloud model, the raw
-// LLM response is checked for diff markers (---, diff, <<<<<<<) before
-// attempting expensive extraction. If the response lacks diff markers, the
-// function aborts immediately and falls back to local fuzzy replacement or
-// exits cleanly — ensuring a single $hot command never triggers multiple LLM
-// API calls.
+// ChangeSet pipeline (Path B): for existing files the raw LLM output — a unified
+// diff, a markdown code block (the common Cohere / Gemma 4 contract), or plain
+// text — is routed through changeset.NewPipeline().Run(...). The strict
+// Output Normalizer → Change Extractor → ChangeSet IR → Diff Compiler → Patch
+// Validator chain compiles the SINGLE AUTHORITATIVE unified diff, which is
+// carried in the proposal Patch so applyPatchWithDeadline applies it after
+// human approval. When the pipeline pauses (ErrAmbiguousChange) the function
+// falls back to local fuzzy replacement before surfacing an error.
+//
+// Non-streaming fallback (Path C): when the model returns an effectively-empty
+// response (<= minHotfixResponseTokens tokens — a dropped/truncated SSE
+// connection such as cohere/north-mini-code:free's 1-token answer), the
+// function retries ONCE with a standard non-streaming request and a relaxed
+// prompt. If the retry is also empty it aborts with an explicit
+// "Provider returned empty response (N tokens)" message — a tiny buffer is
+// NEVER passed into the changeset pipeline, so a dropped connection can never
+// surface as a misleading "ambiguous change representation".
 func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal hotfixProposalMsg MUST reach the TUI event loop on ANY
+		// exit path — success, error, or panic — so the "Applying hotfix..."
+		// spinner can never be orphaned while the patch is generated.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = hotfixProposalMsg{Err: fmt.Errorf("hotfix patch generation panic: %v", r)}
+			}
+		}()
+
 		// ── Read existing file content ──────────────────────────
 		// Without the original content, local fuzzy replacement and
 		// LLM-based diff computation both produce incorrect results.
@@ -3318,47 +3669,89 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			return hotfixProposalMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
 
-		// Build a focused, non-chat patch-generation prompt with full file
-		// context using the appropriate strategy for the file state.
-		strategy := execution.StrategyForOriginal(orig)
-		var handoff string
-		switch strategy {
-		case execution.STRATEGY_NEW_FILE:
-			if orig == "" {
-				handoff = buildNewFileHandoff(task)
-			} else {
-				handoff = buildStubOverwriteHandoff(task, orig)
+		// ── BOUNDED CHANGE CONTRACT (Izen decides BEFORE invocation) ──────
+		// The artifact representation is pinned here, never left to the model:
+		// new/stub/small files use the bounded whole-file rewrite; existing
+		// large files use the anchored-snippet contract exclusively. For HTML,
+		// TARGET RESOLUTION additionally locates the deterministic structural
+		// mismatch and extracts the bounded block that must change — only that
+		// block crosses to the model, so a full-document response is
+		// structurally impossible at generation time.
+		contract := hotfixContractFor(orig)
+
+		// ── TARGET-CONFIDENCE / AMBIGUITY BOUNDARY (deterministic) ────────
+		// A bounded (ReplaceBlock) mutation on a large existing file requires
+		// an explicit or uniquely-inferable target BEFORE the model is invoked.
+		// A structural-intent request is uniquely inferable — the structural
+		// anomaly (or the defect itself) is the target. A content mutation with
+		// no deterministic target is ambiguous: the system PAUSES with an
+		// actionable resolution state rather than letting the model invent a
+		// target. A target is NEVER invented merely because an HTML structural
+		// anomaly exists.
+		//
+		// NOTE: in production the ambiguity decision is made synchronously in
+		// handleHotfixCmd BEFORE any provider-invocation progress is rendered;
+		// this gate is the safety net for direct proposeHotfixPatch callers.
+		if contract == contractReplaceBlock && !isStructuralHotfixIntent(task.Description) {
+			dec := classifyHotfixAmbiguity(task.Description, task.Target, orig)
+			return hotfixAmbiguousMsg{
+				Task:       task,
+				Reason:     dec.reason,
+				Candidates: dec.candidates,
 			}
-		default:
-			handoff = ctxpkg.SanitizeBuildHandoff(task, "")
-			handoff += "\n\n### TARGET_FILE_CONTENT\n```\n" + orig + "\n```\n"
-			handoff += "\nModify the above file content to fulfill the task. "
-			handoff += "Output a unified diff (--- a/ ... +++ b/ ...) or a SEARCH/REPLACE block (<<<<<<< SEARCH). "
-			handoff += "Do NOT rewrite the entire file. "
-			handoff += "Return ONLY the SEARCH/REPLACE block or unified diff."
 		}
-		system := m.tieredStrategyContract(strategy.SystemPromptKey())
+
+		var tgt *hotfix.Target
+		if contract == contractReplaceBlock && isHTMLTarget(task.Target) && isStructuralHotfixIntent(task.Description) {
+			if m.pendingHotfixCandidate != nil {
+				// A candidate was explicitly selected by the human: its block is
+				// the deterministic target — never re-resolved and never
+				// auto-selected.
+				tgt = m.pendingHotfixCandidate
+			} else if r, ok := hotfix.ResolveHTMLTarget(orig); ok {
+				tgt = &r
+			}
+		}
+		var handoff string
+		switch {
+		case contract == contractReplaceFile && orig == "":
+			handoff = buildNewFileHandoff(task)
+		case contract == contractReplaceFile:
+			handoff = buildStubOverwriteHandoff(task, orig)
+		case tgt != nil:
+			handoff = buildHotfixTargetedHandoff(task, tgt)
+		default:
+			handoff = buildHotfixSnippetHandoff(task, orig)
+		}
+		system := hotfixSystemPrompt(contract)
 
 		cloudCfg := gateway.ClassifyCloudProvider(m.cfg.ActiveProviderName())
 		isCloud := cloudCfg.CloudProvider != ""
 
-		stop := []string{">>>>>>>"}
-		if strategy == execution.STRATEGY_NEW_FILE {
-			stop = []string{"```\n\n"}
-		}
+		// NOTE: NO explicit Stop sequences on the $hot request. Aggressive stop
+		// tokens ("```\n\n", ">>>>>>>") caused Cohere / OpenRouter models to cut
+		// the response off prematurely (a 1-token answer after minutes of
+		// reasoning). The changeset pipeline strips preambles and trailing prose
+		// so the model can finish naturally.
 
 		req := ai.Request{
 			Model:     m.activeRouteModel(),
 			System:    system,
 			Stream:    false,
 			MaxTokens: 2048,
-			Stop:      stop,
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
 			Tools:     m.fileMutationTools(),
 			Reasoning: m.effortFromTasks(),
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
+		// The operation context is the cancellation parent: a Ctrl+C during
+		// patch generation cancels the provider request (Section 6). The
+		// per-call deadline bounds a single provider invocation (Section 7).
+		timeout := buildGenerationTimeout
+		if m.hotfixTimeout > 0 {
+			timeout = m.hotfixTimeout
+		}
+		ctx, cancel := context.WithTimeout(m.operationContext(), timeout)
 		resp, err := m.provider.Execute(ctx, req)
 		cancel()
 		if err != nil {
@@ -3384,12 +3777,72 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			return hotfixProposalMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
 		}
 
+		// Accumulate provider-reported usage across the initial attempt and any
+		// non-streaming fallback so the footer never under-reports consumed
+		// tokens.
+		totalTokIn, totalTokOut := 0, 0
+		if resp != nil {
+			totalTokIn, totalTokOut = resp.TokenInput, resp.TokenOutput
+		}
+
+		// ── RESILIENT NON-STREAMING FALLBACK (dropped/truncated SSE) ──────
+		// cohere/north-mini-code:free and similar reasoning-first cloud models
+		// can return a 1-token answer after minutes of thinking — the signature
+		// of a dropped/truncated SSE connection, NOT a real patch. When the
+		// response is effectively empty (<= minHotfixResponseTokens tokens),
+		// retry ONCE with a standard non-streaming request and a relaxed,
+		// model-friendly prompt. The tiny buffer is NEVER handed to the
+		// changeset pipeline, which would otherwise surface a misleading
+		// "ambiguous change representation".
+		if len(resp.ToolCalls) == 0 && responseEffectivelyEmpty(resp) {
+			if isCloud {
+				m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
+					"[HOTFIX] Model returned a truncated response (%d tokens). Retrying with a non-streaming request...",
+					responseTokenEstimate(resp))))
+			}
+			retryReq := ai.Request{
+				Model:     m.activeRouteModel(),
+				System:    hotfixSystemPrompt(contract),
+				Stream:    false,
+				MaxTokens: 2048,
+				Messages:  []ai.Message{{Role: "user", Content: buildHotfixFallbackHandoff(task, orig, contract, tgt)}},
+				Tools:     m.fileMutationTools(),
+				Reasoning: m.effortFromTasks(),
+			}
+			timeout := buildGenerationTimeout
+			if m.hotfixTimeout > 0 {
+				timeout = m.hotfixTimeout
+			}
+			retryCtx, retryCancel := context.WithTimeout(m.operationContext(), timeout)
+			retryResp, retryErr := m.provider.Execute(retryCtx, retryReq)
+			retryCancel()
+			if retryErr == nil && retryResp != nil {
+				resp = retryResp
+				totalTokIn += retryResp.TokenInput
+				totalTokOut += retryResp.TokenOutput
+			}
+		}
+
+		// rawContent is the verbatim LLM output. It is carried on every
+		// terminal hotfixProposalMsg (RawOutput) so the Ctrl+O thought drawer
+		// renders the raw model stream during cloud execution, and the token
+		// accounting path can attribute the consumed tokens.
+		rawContent := ""
+		if resp != nil {
+			rawContent = resp.Content
+		}
+
 		// ── NATIVE TOOL CALLING PATH (BUFFERED, REQUIRES APPROVAL) ──
 		// Tool calls are now intercepted in memory and presented for human
 		// approval before any disk mutation occurs.
 		if len(resp.ToolCalls) > 0 {
 			if err := m.toolCallBuffer.BufferAll(resp.ToolCalls); err != nil {
-				return hotfixProposalMsg{Err: fmt.Errorf("tool call buffer: %w", err)}
+				return hotfixProposalMsg{
+					Err:         fmt.Errorf("tool call buffer: %w", err),
+					TokenInput:  totalTokIn,
+					TokenOutput: totalTokOut,
+					RawOutput:   rawContent,
+				}
 			}
 			// Feed live preview for each buffered call
 			for _, tc := range m.toolCallBuffer.All() {
@@ -3401,14 +3854,27 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			// The main handler will transition to StateAwaitingApproval
 			// This is a hot fix path, so we trigger the approval gate
 			return hotfixProposalMsg{
-				Err: fmt.Errorf("tool calls buffered for approval"),
+				Err:         fmt.Errorf("tool calls buffered for approval"),
+				TokenInput:  totalTokIn,
+				TokenOutput: totalTokOut,
+				RawOutput:   rawContent,
 			}
 		}
 
-		// ── FALLBACK: No tool calls — use existing markdown extraction ──
-		if resp == nil || strings.TrimSpace(resp.Content) == "" {
+		// ── EXPLICIT PROVIDER EMPTY-RESPONSE ABORT ───────────────────
+		// The final model response (initial + fallback) is empty or at most
+		// minHotfixResponseTokens tokens: that is a connectivity/model failure,
+		// not an ambiguous patch. Abort with an explicit message and NEVER pass
+		// a tiny buffer into the changeset extractor. A deterministic local
+		// fuzzy replacement is still attempted first (it can synthesize a valid
+		// patch from the task description alone).
+		if resp == nil || strings.TrimSpace(resp.Content) == "" || responseEffectivelyEmpty(resp) {
+			emptyTokens := 0
+			if resp != nil {
+				emptyTokens = responseTokenEstimate(resp)
+			}
 			if isCloud {
-				m.push(roleSystem, infoStyle.Render("[HOTFIX] Cloud model returned empty output. Aborting LLM attempt, trying local fallback..."))
+				m.push(roleSystem, infoStyle.Render("[HOTFIX] Provider returned an empty/truncated response. Trying local fallback..."))
 			}
 			if orig != "" {
 				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
@@ -3423,46 +3889,35 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 						IsFullRewrite: true,
 					}
 					return hotfixProposalMsg{
-						Task:  task,
-						Patch: patch,
-						Diff:  diffContent,
+						Task:        task,
+						Patch:       patch,
+						Diff:        diffContent,
+						TokenInput:  totalTokIn,
+						TokenOutput: totalTokOut,
+						RawOutput:   rawContent,
 					}
 				}
 			}
-			return hotfixProposalMsg{Err: fmt.Errorf("patch generation returned empty output")}
-		}
-
-		rawContent := resp.Content
-
-		if isCloud && !hasDiffMarkerPrefix(rawContent) && orig != "" {
-			m.push(roleSystem, infoStyle.Render("[HOTFIX] Cloud model output lacks diff markers. Aborting early, trying local fallback..."))
-			if orig != "" {
-				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
-					diffContent := computeUnifiedDiff(task.Target, orig, modified)
-					patch := &execution.Patch{
-						ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
-						File:          task.Target,
-						Original:      orig,
-						Modified:      modified,
-						TaskID:        task.StepNum,
-						ContextID:     m.sess.ContextID,
-						IsFullRewrite: true,
-					}
-					return hotfixProposalMsg{
-						Task:  task,
-						Patch: patch,
-						Diff:  diffContent,
-					}
-				}
+			tokenLabel := "tokens"
+			if emptyTokens == 1 {
+				tokenLabel = "token"
 			}
-			return hotfixProposalMsg{Err: fmt.Errorf("patch generation: cloud model produced output without diff markers and local fallback also failed for %s", task.Target)}
+			//nolint:staticcheck // ST1005: the trailing period is the spec-mandated connectivity pause contract.
+			return hotfixProposalMsg{
+				Err:         fmt.Errorf("Pipeline PAUSED. Reason: Provider returned empty response (%d %s). Check API/model connectivity.", emptyTokens, tokenLabel),
+				TokenInput:  totalTokIn,
+				TokenOutput: totalTokOut,
+				RawOutput:   rawContent,
+			}
 		}
 
-		var resolved string
-		var diffContent string
-
-		switch strategy {
-		case execution.STRATEGY_NEW_FILE:
+		// ── NEW FILE CREATION ─────────────────────────────────────────
+		// The changeset pipeline cannot map a bare markdown code block onto a
+		// nonexistent target (there is no on-disk anchor to match against), so
+		// brand-new files keep the established full-creation extraction: the
+		// code block IS the complete new file content.
+		if orig == "" {
+			var resolved string
 			if extracted, ok := execution.ExtractRawCodeBlock(rawContent); ok {
 				resolved = execution.SanitizeRawCodeBlock(extracted)
 			} else if extracted, ok := execution.ExtractCodeBlockContent(rawContent); ok {
@@ -3470,52 +3925,102 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			} else {
 				resolved = execution.SanitizeRawCodeBlock(rawContent)
 			}
-			diffContent = computeUnifiedDiff(task.Target, orig, resolved)
-
-		default:
-			resolved, diffFound := execution.ExtractDiffFromLLMOutput(rawContent, orig, task.Description)
-			if diffFound {
-				diffContent = computeUnifiedDiff(task.Target, orig, resolved)
-			} else {
-				resolved = execution.ResolveModifiedContent(orig, rawContent)
-				if resolved == orig && orig != "" {
-					if isCloud {
-						m.push(roleSystem, infoStyle.Render("[HOTFIX] Cloud model structural breakdown. Trying local fallback..."))
-						if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
-							diffContent = computeUnifiedDiff(task.Target, orig, modified)
-							patch := &execution.Patch{
-								ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
-								File:          task.Target,
-								Original:      orig,
-								Modified:      modified,
-								TaskID:        task.StepNum,
-								ContextID:     m.sess.ContextID,
-								IsFullRewrite: true,
-							}
-							return hotfixProposalMsg{
-								Task:  task,
-								Patch: patch,
-								Diff:  diffContent,
-							}
-						}
-						return hotfixProposalMsg{Err: fmt.Errorf("patch generation: cloud model returned unparseable output and local fallback also failed for %s", task.Target)}
-					}
-					return hotfixProposalMsg{Err: fmt.Errorf("patch generation: no valid diff or search/replace block found in LLM output for %s", task.Target)}
-				}
-				diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+			diffContent := computeUnifiedDiff(task.Target, orig, resolved)
+			patch := &execution.Patch{
+				ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+				File:          task.Target,
+				Original:      orig,
+				Modified:      resolved,
+				TaskID:        task.StepNum,
+				ContextID:     m.sess.ContextID,
+				IsFullRewrite: true,
+			}
+			return hotfixProposalMsg{
+				Task:        task,
+				Patch:       patch,
+				Diff:        diffContent,
+				TokenInput:  resp.TokenInput,
+				TokenOutput: resp.TokenOutput,
+				RawOutput:   rawContent,
 			}
 		}
 
-		cleaned := sanitizeFileOutput(rawContent)
+		// ── FUZZY LOCAL FALLBACK (shared by every pipeline failure path) ──
+		// When the changeset pipeline pauses (ErrAmbiguousChange) or a compiled
+		// patch fails validation, fall back to the deterministic local fuzzy
+		// replacement before surfacing an error — preserving the single-$hot,
+		// zero-retry guarantee for cloud models.
+		fuzzyFallback := func() (hotfixProposalMsg, bool) {
+			if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
+				diffContent := computeUnifiedDiff(task.Target, orig, modified)
+				patch := &execution.Patch{
+					ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
+					File:          task.Target,
+					Original:      orig,
+					Modified:      modified,
+					TaskID:        task.StepNum,
+					ContextID:     m.sess.ContextID,
+					IsFullRewrite: true,
+				}
+				return hotfixProposalMsg{
+					Task:        task,
+					Patch:       patch,
+					Diff:        diffContent,
+					TokenInput:  resp.TokenInput,
+					TokenOutput: resp.TokenOutput,
+					RawOutput:   rawContent,
+				}, true
+			}
+			return hotfixProposalMsg{}, false
+		}
+
+		// ── CHANGESET PIPELINE (SINGLE AUTHORITATIVE DIFF SOURCE) ───────
+		// Route the raw LLM output — unified diff, markdown code block, or
+		// plain text — through the strict changeset pipeline: Output
+		// Normalizer → Change Extractor → ChangeSet IR → Diff Compiler →
+		// Patch Validator. Markdown code blocks emitted by cloud models
+		// (Cohere / Gemma 4) are classified as REPLACE_FILE or REPLACE_BLOCK
+		// ChangeSets and compiled into the authoritative ---/+++ unified diff.
+		// The compiled diff is carried in the proposal Patch so that after
+		// human approval applyPatchWithDeadline applies it in place.
+		compiled, pipeErr := changeset.NewPipeline().Run(rawContent, task.Target, []byte(orig))
+		if pipeErr != nil {
+			if fb, ok := fuzzyFallback(); ok {
+				return fb
+			}
+			return hotfixProposalMsg{
+				Err:         fmt.Errorf("patch generation: changeset pipeline could not map model output to %s: %w", task.Target, pipeErr),
+				TokenInput:  resp.TokenInput,
+				TokenOutput: resp.TokenOutput,
+				RawOutput:   rawContent,
+			}
+		}
+
+		cc := compiled[0]
+		if !cc.Validation.Valid {
+			if fb, ok := fuzzyFallback(); ok {
+				return fb
+			}
+			return hotfixProposalMsg{
+				Err:         fmt.Errorf("patch generation: changeset validation failed for %s: %s", task.Target, strings.Join(cc.Validation.Reasons, "; ")),
+				TokenInput:  resp.TokenInput,
+				TokenOutput: resp.TokenOutput,
+				RawOutput:   rawContent,
+			}
+		}
+
+		diffContent := string(cc.Diff)
 
 		patch := &execution.Patch{
-			ID:            fmt.Sprintf("hotfix-%d", task.StepNum),
-			File:          task.Target,
-			Original:      orig,
-			Modified:      cleaned,
-			TaskID:        task.StepNum,
-			ContextID:     m.sess.ContextID,
-			IsFullRewrite: strategy == execution.STRATEGY_NEW_FILE,
+			ID:        fmt.Sprintf("hotfix-%d", task.StepNum),
+			File:      task.Target,
+			Original:  orig,
+			Modified:  diffContent,
+			TaskID:    task.StepNum,
+			ContextID: m.sess.ContextID,
+			// IsFullRewrite stays false: Modified is the authoritative unified
+			// diff the patch engine applies in place; a full-rewrite flag would
+			// bypass the hunk parser and mangle the payload.
 		}
 
 		return hotfixProposalMsg{
@@ -3524,6 +4029,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			Diff:        diffContent,
 			TokenInput:  resp.TokenInput,
 			TokenOutput: resp.TokenOutput,
+			RawOutput:   rawContent,
 		}
 	}
 }
@@ -3579,7 +4085,17 @@ func hasDiffMarkerPrefix(content string) bool {
 // and returns a buildProposalReadyMsg for human approval — identical UX to the
 // LLM-based patch flow but with zero model cost and no placeholder-code risk.
 func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// A panic inside the deterministic stdlib fix must still deliver a
+		// terminal buildProposalReadyMsg so the spinner can never be
+		// orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildProposalReadyMsg{Err: fmt.Errorf("stdlib patch panic: %v", r)}
+			}
+		}()
+
 		// Extract fix parameters from Solution: "STDLIB:symbol:pkgName:importPath"
 		parts := strings.SplitN(task.Solution, ":", 4)
 		if len(parts) != 4 || parts[0] != "STDLIB" {
@@ -3721,7 +4237,17 @@ func buildStubOverwriteHandoff(task *plan.Task, orig string) string {
 // with an explicit diff format demonstration to prevent token burn on
 // repetitive empty retries.
 func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal buildProposalReadyMsg MUST reach the TUI event loop on
+		// ANY exit path — success, model error, or panic — so the build
+		// spinner can never be orphaned while the patch is generated.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildProposalReadyMsg{Err: fmt.Errorf("patch generation panic: %v", r)}
+			}
+		}()
+
 		if m.provider == nil {
 			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
@@ -3992,6 +4518,32 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				}
 			}
 
+			// ── V3 ARTIFACT GATE (protocol-centric) ─────────────────────
+			// Normalize + validate the resolved content inside the execution
+			// engine before any proposal is surfaced for approval. A syntax
+			// failure triggers the configured failure policy: reprompt with
+			// the parser diagnostics while the retry budget allows, abort
+			// once it is exhausted. The reasoning-leak observer consumes the
+			// raw LLM output asynchronously and never blocks this path.
+			if m.execEng != nil && m.execEng.Artifact != nil {
+				m.execEng.Artifact.InspectReasoning(rawContent)
+				gate := m.execEng.Artifact.ValidateContent(task.Target, []byte(resolved), attempt)
+				if !gate.Passed {
+					if gate.Decision == policy.DecisionRetry && attempt < maxRetries {
+						handoff = buildHandoff(orig) + "\n\nCORRECTION: " + gate.Directive
+						continue
+					}
+					return buildProposalReadyMsg{Err: fmt.Errorf("artifact validation rejected %s: %w", task.Target, gate.Error)}
+				}
+				if string(gate.Normalized) != resolved {
+					// The canonical normalized bytes differ from the model
+					// output (CRLF/BOM/trailing-newline). Propose the
+					// canonical form so disk always receives protocol bytes.
+					resolved = string(gate.Normalized)
+					diffContent = computeUnifiedDiff(task.Target, orig, resolved)
+				}
+			}
+
 			patch := &execution.Patch{
 				ID:            fmt.Sprintf("build-%d", task.StepNum),
 				File:          task.Target,
@@ -4054,6 +4606,17 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 					fullResolved = execution.SanitizeRawCodeBlock(fullResp.Content)
 				}
 				if strings.TrimSpace(fullResolved) != "" {
+					// V3 artifact gate on the last-resort rewrite: the
+					// normalized canonical bytes are proposed so the disk
+					// always receives protocol bytes.
+					if m.execEng != nil && m.execEng.Artifact != nil {
+						m.execEng.Artifact.InspectReasoning(fullResp.Content)
+						gate := m.execEng.Artifact.ValidateContent(task.Target, []byte(fullResolved), maxRetries)
+						if !gate.Passed {
+							return buildProposalReadyMsg{Err: fmt.Errorf("artifact validation rejected %s: %w", task.Target, gate.Error)}
+						}
+						fullResolved = string(gate.Normalized)
+					}
 					fullDiff := computeUnifiedDiff(task.Target, orig, fullResolved)
 					if m.activityTree != nil {
 						added, removed := countLinesDelta(fullDiff)
@@ -4086,7 +4649,20 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 // deterministically from Go templates, applies it immediately, and returns
 // a buildResultMsg — completing in < 50ms with zero LLM calls.
 func (m *model) applyTrivialTemplate(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// A panic inside the trivial template write must still produce a
+		// terminal buildResultMsg so the spinner can never be orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildResultMsg{
+					output:   "",
+					exitCode: -1,
+					err:      fmt.Errorf("trivial template apply panic: %v", r),
+				}
+			}
+		}()
+
 		canonicalTarget := gateway.CanonicalizeFileName(task.Target)
 		var orig string
 		if data, rerr := os.ReadFile(canonicalTarget); rerr == nil {
@@ -4114,13 +4690,11 @@ func (m *model) applyTrivialTemplate(task *plan.Task) tea.Cmd {
 			}
 		}
 
-		if m.execEng != nil && m.execEng.Patches != nil {
-			if err := m.execEng.Patches.Apply(patch); err != nil {
-				return buildResultMsg{
-					output:   "",
-					exitCode: 1,
-					err:      fmt.Errorf("trivial template apply failed: %w", err),
-				}
+		if err := m.applyPatchWithDeadline(patch); err != nil {
+			return buildResultMsg{
+				output:   "",
+				exitCode: 1,
+				err:      fmt.Errorf("trivial template apply failed: %w", err),
 			}
 		}
 
@@ -4274,7 +4848,17 @@ func hasCustomizationDirectives(description string) bool {
 // If the reference text cannot be resolved (unexpected target) the function
 // falls through to generateTrivialContent — the static template renderer.
 func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// A panic inside the hybrid template generation must still deliver a
+		// terminal buildProposalReadyMsg so the spinner can never be
+		// orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildProposalReadyMsg{Err: fmt.Errorf("hybrid template patch panic: %v", r)}
+			}
+		}()
+
 		if m.provider == nil {
 			return buildProposalReadyMsg{Err: fmt.Errorf("build execution error: no provider configured")}
 		}
@@ -4397,7 +4981,41 @@ func resolveReferenceTemplate(target, description string) string {
 }
 
 func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cmd {
-	return func() tea.Msg {
+	// ── MUTATION SPINNER (explicit, synchronous) ──────────────────────
+	// Set the processing flags HERE — on the caller's (event-loop) thread —
+	// so the mutation spinner ("Processing file mutations... Please wait.")
+	// is guaranteed to render while the patch is written to disk and the
+	// verification gate runs. Relying solely on the batch's agentStartMsg
+	// left a window where the spinner could be skipped if messages were
+	// delivered out of order. The flags stay set until the terminal
+	// buildResultMsg handler clears them AFTER the hotfix result is rendered.
+	//
+	// OPERATION LIFECYCLE: human approval resumes execution as a NEW
+	// operation (the hotfix apply). It is finalized by the terminal
+	// buildResultMsg handler via the single cleanup path.
+	m.beginOperation(OpHotfix)
+	m.agentRunning = true
+	m.pipelineRunning = true
+	m.agentDone = false
+	m.agentLabel = "hotfix apply"
+	m.syncUIState()
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// The terminal buildResultMsg MUST reach the TUI event loop on ANY
+		// exit path — success, error, timeout, or panic — so the "Applying
+		// hotfix..." spinner can never be orphaned. A panic inside the apply
+		// pipeline (e.g. a nil execution engine) is converted into an
+		// error-carrying buildResultMsg below.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildResultMsg{
+					output:   "",
+					exitCode: -1,
+					err:      fmt.Errorf("hotfix apply panic: %v", r),
+				}
+			}
+		}()
+
 		if err := m.transitionToBuilding(); err != nil {
 			return buildResultMsg{
 				output:   "",
@@ -4412,7 +5030,22 @@ func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cm
 				err:      fmt.Errorf("hotfix authorization failed: %w", err),
 			}
 		}
-		if applyErr := m.execEng.Patches.Apply(patch); applyErr != nil {
+
+		// ── STRICT MUTATION TIMEOUT ─────────────────────────────────────
+		// The patch application (file IO + shadow backup + transaction
+		// recording) is bounded by a strict 30s deadline so a deadlocked Apply
+		// can never freeze the "Applying hotfix..." spinner indefinitely. On
+		// expiry a terminal error message is emitted and the enclosing
+		// transaction is rolled back by the buildResultMsg handler.
+		if m.execEng == nil {
+			return buildResultMsg{
+				output:   "",
+				exitCode: 1,
+				err:      fmt.Errorf("hotfix patch apply aborted: execution engine not configured"),
+			}
+		}
+		applyErr := m.applyPatchWithDeadline(patch)
+		if applyErr != nil {
 			// Graceful no-op skip: the destruction guardrail refused a >80%
 			// file wipe without an explicit delete/clear instruction. The file
 			// is unchanged — mark the task done (no changes needed) instead of
@@ -4597,7 +5230,20 @@ func (m *model) amendBuildTask(stepNum int, feedback string) tea.Cmd {
 // being executed. The user must copy the command and run it manually outside
 // IZEN. This is the absolute last line of defense against silent root escalation.
 func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
+		// A panic inside the shell execution wrapper must still deliver a
+		// terminal buildResultMsg so the spinner can never be orphaned.
+		defer func() {
+			if r := recover(); r != nil {
+				msg = buildResultMsg{
+					output:   "",
+					exitCode: -1,
+					err:      fmt.Errorf("shell exec pipeline panic: %v", r),
+				}
+			}
+		}()
+
 		if err := m.authorizeBuildExecution([]string{task.Target}, m.pendingBuildAllowAlways); err != nil {
 			return buildResultMsg{
 				output:   "",
@@ -5648,6 +6294,7 @@ func (m *model) cancelStaleAgentOps() {
 	m.cancelAllBackgroundContexts()
 
 	m.reviewRunning = false
+	m.investigateRunning = false
 	m.agentRunning = false
 	m.agentDone = false
 	m.agentLabel = ""

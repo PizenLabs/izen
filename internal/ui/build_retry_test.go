@@ -20,16 +20,18 @@ import (
 type mockProvider struct {
 	responses []*ai.Response
 	callCount int
+	requests  []ai.Request
 }
 
 func (m *mockProvider) Name() string {
 	return "mock"
 }
 
-func (m *mockProvider) Execute(_ context.Context, _ ai.Request) (*ai.Response, error) {
+func (m *mockProvider) Execute(_ context.Context, req ai.Request) (*ai.Response, error) {
 	if m.callCount >= len(m.responses) {
 		return nil, fmt.Errorf("unexpected call #%d (only %d responses configured)", m.callCount+1, len(m.responses))
 	}
+	m.requests = append(m.requests, req)
 	resp := m.responses[m.callCount]
 	m.callCount++
 	return resp, nil

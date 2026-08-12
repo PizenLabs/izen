@@ -29,6 +29,13 @@ const (
 	// is in an execution phase (investigating/planning/building/reviewing/
 	// repairing).
 	StateProcessing
+	// StateHotfixAmbiguous is the result state of a $hot request paused by the
+	// target-confidence boundary. It is NOT a workflow phase and does NOT
+	// transition the workflow state machine: it represents an actionable
+	// ambiguity resolution card (Clarify / Inspect candidates / Cancel) that
+	// the view renders instead of a patch proposal. No provider call, no patch,
+	// and no mutation ever occur in this state.
+	StateHotfixAmbiguous
 )
 
 // String renders the presentation state name.
@@ -40,6 +47,8 @@ func (s UIState) String() string {
 		return "awaiting-approval"
 	case StateProcessing:
 		return "processing"
+	case StateHotfixAmbiguous:
+		return "hotfix-ambiguous"
 	default:
 		return "chat"
 	}

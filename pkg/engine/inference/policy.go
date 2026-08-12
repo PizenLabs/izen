@@ -88,9 +88,14 @@ func NewPolicyEngine(opts ...PolicyOption) *PolicyEngine {
 //
 //   - no hypothesis → Fallback (the engine has nothing to act on);
 //   - top confidence below the threshold → Fallback;
-//   - top confidence minus runner-up confidence below the delta threshold →
-//     EscalateToHuman (two credible hypotheses compete);
+//   - at least two hypotheses AND top confidence minus runner-up confidence
+//     below the delta threshold → EscalateToHuman (two credible hypotheses
+//     compete);
 //   - otherwise → Proceed.
+//
+// A single hypothesis never escalates: with no runner-up there is no
+// competition to defer to a human, so a confident lone candidate (e.g. the
+// only detector firing for a Vanilla/Static Web project) always Proceeds.
 func (p *PolicyEngine) Evaluate(set *InferenceSet, t InferenceType) PolicyVerdict {
 	hyps := set.Hypotheses(t)
 	if len(hyps) == 0 {
@@ -123,11 +128,10 @@ func (p *PolicyEngine) Evaluate(set *InferenceSet, t InferenceType) PolicyVerdic
 				"top %s confidence %.2f is below the %.2f threshold",
 				top.Label, top.Confidence(), p.confidenceThreshold),
 		}
-	case delta < p.deltaThreshold:
-		ruLabel := "no runner-up"
-		if runnerUp != nil {
-			ruLabel = runnerUp.Label
-		}
+	case runnerUp != nil && delta < p.deltaThreshold:
+		// Escalation requires two competing hypotheses. A lone hypothesis
+		// (runnerUp == nil, delta stays 0.00) is not a competition — never
+		// defer a confident single candidate to a human.
 		return PolicyVerdict{
 			Dimension: t,
 			Decision:  DecisionEscalateToHuman,
@@ -136,7 +140,7 @@ func (p *PolicyEngine) Evaluate(set *InferenceSet, t InferenceType) PolicyVerdic
 			Delta:     delta,
 			Reason: fmt.Sprintf(
 				"%s (%.2f) and %s (%.2f) are within %.2f — the engine cannot choose unilaterally",
-				top.Label, top.Confidence(), ruLabel, runnerUpConfidence(runnerUp), p.deltaThreshold),
+				top.Label, top.Confidence(), runnerUp.Label, runnerUp.Confidence(), p.deltaThreshold),
 		}
 	default:
 		return PolicyVerdict{
@@ -150,14 +154,6 @@ func (p *PolicyEngine) Evaluate(set *InferenceSet, t InferenceType) PolicyVerdic
 				top.Label, top.Confidence(), delta),
 		}
 	}
-}
-
-// runnerUpConfidence returns the runner-up confidence, or 0.
-func runnerUpConfidence(h *Hypothesis) float64 {
-	if h == nil {
-		return 0
-	}
-	return h.Confidence()
 }
 
 // round4 rounds a delta to 4 decimal places so threshold comparisons are

@@ -107,7 +107,7 @@ func (m *MarkdownFenceExtractor) Extract(ctx context.Context, raw string) Extrac
 // newFileArtifact builds a file artifact carrying its language as metadata.
 func newFileArtifact(path, lang string, lines []string) ir.Artifact {
 	a := ir.NewFile(path, joinContent(lines))
-	a.Metadata = map[string]string{"language": lang}
+	a.Metadata.Language = lang
 	return a
 }
 

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -28,8 +29,123 @@ func (m *model) handleInitKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleInitProviderSelect(msg)
 	case initNone:
 		return m.handleInitNone(msg)
+	case initComplete:
+		// Defensive: initStage is complete but the workspace was re-entered
+		// while the project is still uninitialized on disk (e.g. .izen/ was
+		// deleted and self-healing is unavailable). Route back to the welcome
+		// screen so onboarding restarts instead of swallowing keys into a
+		// frozen header-only view.
+		m.initStage = initNone
+		return m, nil
 	}
 	return m, nil
+}
+
+// configLoadedCmd runs the defensive workspace loader off the event loop so
+// the startup config check never blocks the Bubble Tea init sequence. The
+// returned configLoadedMsg is ALWAYS dispatched to Update, guaranteeing the
+// UI reconciles its initStage with the on-disk workspace state exactly once
+// at startup (StateInitializing → StateInteractive or the onboarding wizard).
+func (m *model) configLoadedCmd() tea.Cmd {
+	root := m.workspaceRoot
+	return func() tea.Msg {
+		if root == "" {
+			root, _ = os.Getwd()
+		}
+		localCfg, err := config.EnsureLocalWorkspace(root)
+		return configLoadedMsg{localCfg: localCfg, err: err}
+	}
+}
+
+// handleConfigLoaded reconciles the in-memory initStage with the on-disk
+// workspace state after the defensive loader runs. A completed initStage that
+// is no longer backed by disk state is self-healed (default project settings
+// are recreated under .izen/) or, when healing is impossible, routed back to
+// the onboarding wizard. A fresh workspace (initNone / wizard stages) is never
+// auto-completed here — onboarding remains the single source of truth.
+func (m *model) handleConfigLoaded(msg configLoadedMsg) {
+	_ = msg.localCfg
+	_ = msg.err
+
+	// Self-heal: an app that already completed onboarding (initComplete) but
+	// lost its workspace on disk (e.g. the user deleted .izen/ mid-session)
+	// must recreate the workspace instead of freezing. Fresh workspaces
+	// (initNone and wizard stages) are deliberately skipped — they must flow
+	// through the interactive wizard.
+	if m.initStage == initComplete && !m.isProjectInitialized() {
+		if m.selfHealWorkspace() {
+			m.ti.Focus()
+			if m.Ready {
+				m.refreshViewportContent()
+			}
+			return
+		}
+		// Healing failed — route to the wizard so keys keep working.
+		m.initStage = initNone
+		return
+	}
+
+	// Belt-and-suspenders: any other state must never end up with a completed
+	// initStage that the disk does not back. Re-route to onboarding.
+	if m.initStage == initComplete && !m.isProjectInitialized() {
+		m.initStage = initNone
+		return
+	}
+
+	if m.isProjectInitialized() {
+		if m.initStage != initComplete {
+			m.initStage = initComplete
+		}
+		m.ti.Focus()
+	}
+}
+
+// selfHealWorkspace recreates a deleted/emptied .izen/ workspace with default
+// project settings for an app that had already completed onboarding. It is the
+// defensive recovery path: it recreates the directory structure, anchors
+// .izen/config.json with the in-session identity/project detection, and writes
+// the session.json marker. Returns true when the project is initialized again.
+func (m *model) selfHealWorkspace() bool {
+	if m.workspaceRoot == "" {
+		return false
+	}
+	localCfg, err := config.EnsureLocalWorkspace(m.workspaceRoot)
+	if err != nil {
+		return false
+	}
+
+	// Anchor config.json when it is missing (the app was already onboarded, so
+	// fabricating default project settings is safe and correct).
+	cfgPath := filepath.Join(m.workspaceRoot, ".izen", "config.json")
+	if _, statErr := os.Stat(cfgPath); os.IsNotExist(statErr) {
+		if localCfg == nil {
+			localCfg = &config.LocalConfig{}
+		}
+		if localCfg.Username == "" {
+			localCfg.Username = config.SanitizeUsername(m.userName)
+		}
+		if m.detection.Primary != nil {
+			localCfg.DetectedLang = string(m.detection.Primary.ID)
+			if len(m.detection.Frameworks) > 0 {
+				localCfg.DetectedFw = string(m.detection.Frameworks[0].Def.ID)
+			}
+		}
+		localCfg.ProjectName = filepath.Base(m.workspaceRoot)
+		localCfg.LastDetected = time.Now().Format(time.RFC3339)
+		if saveErr := config.SaveLocalConfig(m.workspaceRoot, localCfg); saveErr != nil {
+			return false
+		}
+	}
+
+	// Session marker anchors HasLocalState so restart never re-enters
+	// onboarding for a workspace that was already initialized.
+	sessPath := filepath.Join(m.workspaceRoot, ".izen", state.SessionFile)
+	if _, statErr := os.Stat(sessPath); os.IsNotExist(statErr) {
+		if writeErr := os.WriteFile(sessPath, []byte("{}"), 0644); writeErr != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *model) handleInitNone(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -140,7 +256,12 @@ func (m *model) handleInitIdentity(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if val != "" {
 			m.userName = val
 		}
-		m.saveInitState()
+		if err := m.saveInitState(); err != nil {
+			// Persistence failed — do NOT advance the wizard. Stay on the
+			// identity stage so the write can be retried instead of stranding
+			// the UI in a workspace the disk does not back.
+			return m, nil
+		}
 		m.initStage = initProviderSelect
 		m.initProviderIdx = 0
 		m.initProviderItems = m.buildProviderList()
@@ -177,9 +298,14 @@ func (m *model) handleInitProviderSelect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEnter:
 		if m.initProviderIdx >= 0 && m.initProviderIdx < len(m.filteredProviders()) {
 			selected := m.filteredProviders()[m.initProviderIdx]
+			// Persist BEFORE marking init complete: if the write fails, the
+			// wizard stays on screen for a retry instead of leaving the UI
+			// in a completed initStage with no on-disk backing.
+			if err := m.saveInitState(); err != nil {
+				return m, nil
+			}
 			m.initStage = initComplete
 			m.initProviderItems = nil
-			m.saveInitState()
 			return m, tea.Batch(m.switchProvider(selected), m.ti.Focus(), buildGraphCmd(m.leaEng))
 		}
 		return m, nil
@@ -323,17 +449,26 @@ func (m *model) activeContextLimit() int {
 }
 
 // saveInitState persists the identity and local workspace state when the
-// TUI onboarding flow completes, preventing stale init loops on restart.
-func (m *model) saveInitState() {
+// TUI onboarding flow completes, preventing stale init loops on restart. It
+// returns an error when any write fails so callers can keep the wizard on
+// screen instead of transitioning to a workspace that the disk cannot back.
+func (m *model) saveInitState() error {
 	root := m.workspaceRoot
 	if root == "" {
 		root, _ = os.Getwd()
 	}
-	_ = state.InitLocalState(root)
-	_ = config.SaveLocalConfig(root, &config.LocalConfig{Username: m.userName})
+	if err := state.InitLocalState(root); err != nil {
+		return err
+	}
+	if err := config.SaveLocalConfig(root, &config.LocalConfig{Username: m.userName}); err != nil {
+		return err
+	}
 	// Write a minimal session.json to anchor HasLocalState
 	sessPath := filepath.Join(root, ".izen", "session.json")
 	if _, err := os.Stat(sessPath); os.IsNotExist(err) {
-		_ = os.WriteFile(sessPath, []byte("{}"), 0644)
+		if err := os.WriteFile(sessPath, []byte("{}"), 0644); err != nil {
+			return err
+		}
 	}
+	return nil
 }

@@ -407,7 +407,6 @@ func (m *model) applySingleProposal() tea.Cmd {
 }
 
 func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
-	eng := m.execEng
 	return func() (msg tea.Msg) {
 		// Never let a panic in patch application crash the TUI. Recover, log
 		// the trace internally, and surface a user-friendly status-bar error.
@@ -449,7 +448,7 @@ func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 		if err := m.authorizeBuildExecution([]string{p.Target.QualifiedName}, true); err != nil {
 			return mutationResultMsg{err: err, file: p.Target.QualifiedName}
 		}
-		if err := eng.Patches.Apply(patch); err != nil {
+		if err := m.applyPatchWithDeadline(patch); err != nil {
 			// Graceful no-op skip: the destruction guardrail refused a >80%
 			// file wipe without an explicit delete/clear instruction. Treat as
 			// skipped, not failed — and DO NOT retry as a full rewrite, which
@@ -475,7 +474,7 @@ func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 						TaskID:        patch.TaskID,
 						IsFullRewrite: true,
 					}
-					if retryErr := eng.Patches.Apply(retryPatch); retryErr == nil {
+					if retryErr := m.applyPatchWithDeadline(retryPatch); retryErr == nil {
 						return mutationResultMsg{
 							file:   p.Target.QualifiedName,
 							status: "modified",
@@ -506,7 +505,6 @@ func (m *model) applyAllProposals() tea.Cmd {
 func (m *model) applyAllProposalsCmd() tea.Cmd {
 	proposals := make([]SemanticProposal, len(m.pendingProposals))
 	copy(proposals, m.pendingProposals)
-	eng := m.execEng
 	return func() (msg tea.Msg) {
 		var results []mutationResultMsg
 		// Never let a panic in patch application crash the TUI. Recover, log
@@ -552,7 +550,7 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 				results = append(results, mutationResultMsg{err: err, file: p.Target.QualifiedName})
 				continue
 			}
-			if err := eng.Patches.Apply(patch); err != nil {
+			if err := m.applyPatchWithDeadline(patch); err != nil {
 				// Graceful no-op skip: the destruction guardrail refused a
 				// >80% file wipe without an explicit delete/clear instruction.
 				// Treat as skipped, not failed — and DO NOT retry as a full
@@ -576,7 +574,7 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 							TaskID:        patch.TaskID,
 							IsFullRewrite: true,
 						}
-						if retryErr := eng.Patches.Apply(retryPatch); retryErr == nil {
+						if retryErr := m.applyPatchWithDeadline(retryPatch); retryErr == nil {
 							results = append(results, mutationResultMsg{file: p.Target.QualifiedName, status: "modified"})
 							continue
 						}
@@ -710,6 +708,25 @@ func (m *model) streamShellCmd(cmd string) tea.Cmd {
 			shellCh <- shellExitMsg{cmd: cmd, exitCode: -1, elapsed: 0, err: err}
 			return
 		}
+
+		// ── CANCELLATION-SAFE PIPE DRAIN ─────────────────────────────
+		// Killing the direct child does not necessarily release its pipes: a
+		// grandchild that inherited the write ends (e.g. `bash -c "sleep 30"`
+		// keeps `sleep` alive) holds them open, which would block the pump
+		// goroutines below forever — leaking the worker even though the
+		// operation was cancelled. Closing the read ends on ctx.Done makes the
+		// pumps return immediately so the terminal shellExitMsg is ALWAYS
+		// emitted after a cancellation.
+		stopPipes := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = stdout.Close()
+				_ = stderr.Close()
+			case <-stopPipes:
+			}
+		}()
+		defer close(stopPipes)
 
 		// Drain both pipes concurrently so a chatty stream never deadlocks
 		// the process (pipes block writes once their kernel buffers fill).

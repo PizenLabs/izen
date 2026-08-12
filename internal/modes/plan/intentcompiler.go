@@ -91,6 +91,18 @@ func (p *IntentCompilerPlanner) tryOne(ctx stdctx.Context, prompt string) ([]Tas
 
 	switch verdict.Decision {
 	case inference.DecisionEscalateToHuman:
+		// SINGLE-CANDIDATE RESOLUTION GUARD: a Static HTML/CSS/JS (Vanilla
+		// Web archetype) project whose only credible hypothesis is confident
+		// and has NO competing runner-up (nil or 0.00 confidence) is a false
+		// positive of the delta policy — there is nothing to escalate to. The
+		// engine selects the VANILLA_WEB adapter unilaterally instead of
+		// aborting with "cannot choose a framework unilaterally".
+		if fw == adapter.FrameworkStaticWeb &&
+			verdict.Top.Confidence() > 0.50 &&
+			runnerUpConfidenceForPlan(verdict.RunnerUp) == 0.00 {
+			resolved = true
+			break
+		}
 		// Two credible framework hypotheses compete within the delta
 		// threshold — never choose unilaterally; escalate to the human.
 		return nil, true, fmt.Errorf("intent compiler: cannot choose a framework unilaterally — %s", verdict.Reason)
@@ -134,6 +146,15 @@ func (p *IntentCompilerPlanner) tryOne(ctx stdctx.Context, prompt string) ([]Tas
 	// 6. Populate the TUI staged plan tasks directly from the FileArtifacts.
 	tasks := artifactsToTasks(artifacts)
 	return tasks, true, nil
+}
+
+// runnerUpConfidenceForPlan returns the runner-up confidence, or 0.00 when no
+// competing hypothesis exists (nil runner-up = zero competing frameworks).
+func runnerUpConfidenceForPlan(h *inference.Hypothesis) float64 {
+	if h == nil {
+		return 0.00
+	}
+	return h.Confidence()
 }
 
 // artifactsToTasks converts lowered FileArtifacts into hardcoded FILE_MUTATE

@@ -44,13 +44,14 @@ func (m *model) Init() tea.Cmd {
 	m.lastTipRotation = time.Now()
 	m.proTipIndex = 0
 	if m.initStage != initNone && m.initStage != initComplete {
-		return tea.Batch(m.smoothStreamTickCmd(), m.proTipTickCmd())
+		return tea.Batch(m.smoothStreamTickCmd(), m.proTipTickCmd(), m.configLoadedCmd())
 	}
 	cmds := []tea.Cmd{
 		m.smoothStreamTickCmd(),
 		m.proTipTickCmd(),
 		m.ti.Focus(),
 		m.initSessionStartCheckpoint,
+		m.configLoadedCmd(),
 	}
 	// Arm the fact-only control telemetry bridge so control.iteration /
 	// control.node_observed facts stream into the loop as controlFactMsg.
@@ -76,6 +77,21 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			model = m
 		}
 	}()
+
+	// ── DEFENSIVE WORKSPACE GUARD ──────────────────────────────────────────
+	// Reconcile the in-memory initStage with the on-disk workspace state on
+	// every update. A completed initStage that is no longer backed by disk
+	// state (e.g. the user deleted .izen/ mid-session) must either self-heal
+	// or route back to the onboarding wizard — it can never be left rendering
+	// a frozen welcome header with no interactive input bar. This runs before
+	// any key routing so the deadlock state is dissolved on the very first
+	// event after the workspace disappears.
+	if m.initStage == initComplete && !m.isProjectInitialized() {
+		if !m.selfHealWorkspace() {
+			m.initStage = initNone
+			m.ti.Blur()
+		}
+	}
 
 	// ── QUIT-CONFIRM MODAL INTERCEPT ─────────────────────────────────────
 	// While the exit-safety dialog is open, every key is routed to the modal
@@ -105,12 +121,25 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch keyMsg.Type {
 		case tea.KeyCtrlC:
+			// Unified Ctrl+C protocol: first press cancels the active
+			// operation (or dismisses the ambiguity card) gracefully; a
+			// second press while a cancellation is in progress hard-exits
+			// with status 130. Falls back to the legacy interrupt path when
+			// no cancellation applies.
+			if handled, cmd := m.handleCtrlC(); handled {
+				return m, cmd
+			}
 			if m.state == StateProcessing || m.state == StateAwaitingApproval ||
 				m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.planPending {
 				return m.handleEmergencyInterrupt("ctrl-c")
 			}
 		case tea.KeyEsc:
-			if m.state == StateProcessing || m.planPending {
+			// Esc aborts any active review OR investigate pipeline (manual
+			// /review, /investigate, or a $test/$run/$log sub-command that
+			// holds reviewRunning) by cancelling the registered background
+			// context and returning focus to the input bar — never killing
+			// the app.
+			if m.state == StateProcessing || m.planPending || m.reviewRunning || m.investigateRunning {
 				return m.handleEmergencyInterrupt("escape")
 			}
 		case tea.KeyCtrlD:
@@ -120,8 +149,35 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 	}
 
+	// ── OS-SIGNAL INTERRUPT ──────────────────────────────────────────────
+	// Bubble Tea forwards an OS SIGINT (non-TTY input) as tea.InterruptMsg;
+	// the root signal bridge forwards SIGINT/SIGTERM as interruptSignalMsg.
+	// Both route through the same graceful Ctrl+C cancellation protocol.
+	if interruptMsg, ok := msg.(tea.InterruptMsg); ok {
+		if handled, cmd := m.handleCtrlC(); handled {
+			return m, cmd
+		}
+		_ = interruptMsg
+		return m, nil
+	}
+	if sigMsg, ok := msg.(interruptSignalMsg); ok {
+		if handled, cmd := m.handleCtrlC(); handled {
+			return m, cmd
+		}
+		_ = sigMsg
+		return m, nil
+	}
+
+	// ── OPERATION WATCHDOG TICK ──────────────────────────────────────────
+	// The stuck-detection loop runs on the UI goroutine only: it reports —
+	// never kills — operations that have made no meaningful progress for a
+	// long window, and self-terminates when the runtime is idle.
+	if w, ok := msg.(watchdogMsg); ok {
+		return m, m.handleWatchdog(w)
+	}
+
 	// ── HARD KEYBOARD INTERCEPT: Approval/Processing states bypass all sub-components ──
-	if m.state == StateAwaitingApproval || m.state == StateProcessing {
+	if m.state == StateAwaitingApproval || m.state == StateProcessing || m.state == StateHotfixAmbiguous {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
 			return m.handleKey(keyMsg)
 		}
@@ -236,6 +292,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+
+	case configLoadedMsg:
+		// Defensive workspace loader result (dispatched once per startup from
+		// Init). Reconciles initStage with the on-disk workspace state so the
+		// UI always reaches the interactive input bar or the onboarding
+		// wizard — never a frozen, header-only screen.
+		m.handleConfigLoaded(msg)
+		return m, nil
 
 	case domainEventMsg:
 		// Event bus projection: engines publish domain events headlessly and
@@ -426,6 +490,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// message clears these flags), preventing stale trailing logs from
 		// polluting the approval view.
 		if m.agentRunning && m.agentLabel == "hotfix" {
+			m.touchOperationProgress()
 			m.push(roleActivity, msg.Line)
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
@@ -433,10 +498,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case agentDoneMsg:
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
@@ -447,16 +509,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 	case investigateResultMsg:
 		m.lastAgentActivity = time.Now()
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
+		// processing flag (including investigateRunning) so the spinner can
+		// never be orphaned on a failed, timed-out, or aborted investigation —
+		// then re-derive the presentation state so a stale StateProcessing
+		// derived during the run is released and the viewport returns to
+		// interactive chat. Pending-approval overrides.
+		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
-		// Re-derive the presentation state from the cleared flags so a stale
-		// StateProcessing derived during the investigation is released and the
-		// viewport returns to interactive chat. Pending-approval overrides.
 		m.syncUIState()
 		if msg.err != nil {
 			m.push(roleError, "investigation error: "+providers.SanitizeAPIError(msg.err))
@@ -553,14 +615,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.planPending = false
 		m.planStartedAt = time.Time{}
 
-		// ALWAYS clear the transient loading flags first so the spinner can
-		// never freeze, regardless of which branch below we take.
+		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
+		// processing flag first so the spinner can never freeze, regardless of
+		// which branch below we take, then re-derive the presentation state
+		// from the cleared flags: a stale StateProcessing derived during
+		// synthesis (e.g. via a phase-change event while agentRunning was
+		// true) must be released here so the viewport returns to interactive
+		// chat and Alt+P / Alt+R respond immediately. Pending-approval always
+		// overrides if a gate is set.
+		m.clearBusyFlags()
 		m.reconcileSpinner()
-		// Re-derive the presentation state from the cleared flags: a stale
-		// StateProcessing derived during synthesis (e.g. via a phase-change
-		// event while agentRunning was true) must be released here so the
-		// viewport returns to interactive chat and Alt+P / Alt+R respond
-		// immediately. Pending-approval always overrides if a gate is set.
 		m.syncUIState()
 
 		if msg.Err != nil {
@@ -594,19 +658,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 
 		// ── TOKEN ACCOUNTING ────────────────────────────────────────────
-		// Commit the provider-reported usage of plan synthesis into the
-		// session counters and the global status.Tracker. The plan engine
-		// records this usage even when the response was truncated by the
-		// completion ceiling (finish_reason: "length"), so the token figures
-		// never silently vanish on a truncated plan.
-		m.InputTokens += msg.TokenInput
-		m.OutputTokens += msg.TokenOutput
-		m.TotalTokens = m.InputTokens + m.OutputTokens
-		if m.IsCloudModel {
-			status.Default.Record(m.InputTokens, m.OutputTokens)
-		} else {
-			status.Default.Record(msg.TokenInput, msg.TokenOutput)
-		}
+		// The provider-reported usage of plan synthesis is dispatched as a
+		// TokenUsageMsg (see the final return of this case) so the TokenUsageMsg
+		// handler accumulates it into the session counters and refreshes the
+		// footer. The plan engine records usage even when the response was
+		// truncated by the completion ceiling (finish_reason: "length"), so the
+		// token figures never silently vanish on a truncated plan.
 
 		// ── SCOPE GUARD FINAL VALIDATION ───────────────────────────────────
 		// Hard validation interceptor before staging: if the plan engine has a
@@ -718,10 +775,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
-		return m, flush
+		return m, tea.Batch(flush, m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput))
 
 	case graphBuiltMsg:
-		m.agentRunning = false
+		m.clearBusyFlags()
 		m.sanitizeInputPrompt()
 		if msg.err != nil {
 			m.push(roleError, "graph indexing failed: "+msg.err.Error())
@@ -764,13 +821,18 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case reviewResultMsg:
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
+		// processing flag so the spinner can never be orphaned on a failed or
+		// aborted review, then re-derive the presentation state so a stale
+		// StateProcessing derived during the run (e.g. via a phase-change
+		// event arriving while reviewRunning was true) is released here and
+		// the "Processing file mutations..." spinner can never stay up.
+		// Pending-approval always overrides if a gate is set.
+		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
+		m.syncUIState()
 		if msg.err != nil {
 			m.push(roleError, "review error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
@@ -792,10 +854,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, flush
 
 	case testResultMsg:
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.lastTestOutput = msg.output
@@ -955,10 +1014,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, flush
 
 	case buildProposalReadyMsg:
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.pipelineRunning = false
 		m.streaming = false
@@ -967,11 +1023,6 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		// ── BUILD PROPOSAL FAILURE ───────────────────────────────────
 		if msg.Err != nil {
-			// Commit any partial provider usage captured before the failure so
-			// consumed tokens are not silently zeroed on a failed build attempt.
-			if msg.TokenInput > 0 || msg.TokenOutput > 0 {
-				m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
-			}
 			m.push(roleError, "patch generation failed: "+msg.Err.Error())
 			tasks := m.sess.CurrentTasks
 			for i := range tasks {
@@ -984,14 +1035,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			_ = m.sess.Save()
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
-			return m, m.flushPendingRecords()
-		}
-
-		// ── TOKEN ACCOUNTING ─────────────────────────────────────────
-		// Commit the provider-reported usage of the build proposal call so the
-		// footer reflects the tokens consumed to produce the proposed patch.
-		if msg.TokenInput > 0 || msg.TokenOutput > 0 {
-			m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
+			return m, tea.Batch(
+				m.flushPendingRecords(),
+				m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput),
+			)
 		}
 
 		// ── Extract proposals from LLM output ───────────────────────
@@ -1135,40 +1182,69 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.push(roleStatus, fmt.Sprintf("Proposed patch to %s", statusTarget))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
-		return m, nil
+		return m, m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput)
 
 	case hotfixProposalMsg:
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
+		// processing flag, then re-derive the presentation state so a stale
+		// StateProcessing derived during patch generation is released — the
+		// "[HOTFIX] Pipeline PAUSED" / "Applying hotfix..." spinner can never
+		// stay up. Pending-approval overrides below via enterApprovalState.
+		// A candidate-selected hotfix has reached its terminal message: the
+		// explicit target is consumed.
+		//
+		// OPERATION LIFECYCLE: the hotfix generation operation ends here —
+		// SUCCESS (proposal staged for approval), FAILURE, CANCELLED (the
+		// provider was interrupted via Ctrl+C) or TIMEOUT. finalizeOperation
+		// is the single terminal cleanup path; it cancels the operation
+		// context, clears ownership and stops the spinner.
+		m.pendingHotfixCandidate = nil
+		outcome, outErr := classifyOpErrWithErr(msg.Err)
+		m.finalizeOperation(outcome, outErr)
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
-		m.stopShimmer()
+		m.syncUIState()
 
-		// ── HOTFIX PROPOSAL FAILURE ───────────────────────────────────
-		// Patch generation failed: surface the error, abort the hotfix, and
-		// restore the stashed plan so the pipeline returns to PAUSED cleanly.
+		// ── THOUGHT CAPTURE (Ctrl+O) ──────────────────────────────────
+		// Project the verbatim LLM output of the hotfix call into the thought
+		// drawer BEFORE any error/approval rendering so Ctrl+O can expand the
+		// raw model stream (reasoning + response text) during cloud execution —
+		// even when the resulting patch paused the pipeline.
+		if msg.RawOutput != "" {
+			m.captureHotfixThought(msg.RawOutput)
+		}
+		thoughtDone := m.thoughtUpdateCmd(msg.RawOutput, true)
+
+		// ── HOTFIX PROPOSAL FAILURE / CANCELLATION / TIMEOUT ──────────
+		// Patch generation failed, was interrupted (Ctrl+C), or exceeded its
+		// operation deadline: surface the truthful reason, abort the hotfix,
+		// and restore the stashed plan so the pipeline returns to PAUSED
+		// cleanly. Provider-reported tokens are STILL dispatched (TokenUsageMsg)
+		// so the footer reflects the tokens a cloud model consumed even when the
+		// resulting patch was unparseable / the pipeline paused.
 		if msg.Err != nil {
-			if msg.TokenInput > 0 || msg.TokenOutput > 0 {
-				m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
+			switch outcome {
+			case OpOutcomeCancelled:
+				m.push(roleSystem, infoStyle.Render("[HOTFIX] Interrupted — patch generation cancelled. No files were modified."))
+			case OpOutcomeTimeout:
+				m.push(roleError, "[HOTFIX] Patch generation timed out: "+msg.Err.Error())
+				m.push(roleSystem, infoStyle.Render("[HOTFIX] Pipeline PAUSED. No files were modified."))
+			default:
+				m.push(roleError, "[HOTFIX] Patch generation failed: "+msg.Err.Error())
+				m.push(roleSystem, infoStyle.Render("[HOTFIX] Pipeline PAUSED. No files were modified."))
 			}
-			m.push(roleError, "[HOTFIX] Patch generation failed: "+msg.Err.Error())
 			m.hotfixActive = false
 			if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
 				m.sess.StageTaskList(&stashedTasks)
 				_ = m.sess.Save()
 			}
-			m.push(roleSystem, infoStyle.Render("[HOTFIX] Pipeline PAUSED. No files were modified."))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
-			return m, m.flushPendingRecords()
-		}
-
-		// ── TOKEN ACCOUNTING ─────────────────────────────────────────
-		// Commit the provider-reported usage of the hotfix patch call.
-		if msg.TokenInput > 0 || msg.TokenOutput > 0 {
-			m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
+			return m, tea.Batch(
+				m.flushPendingRecords(),
+				m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput),
+				thoughtDone,
+			)
 		}
 
 		// ── FREEZE AND REQUEST AUTHORIZATION ─────────────────────────
@@ -1212,12 +1288,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					_ = m.sess.Save()
 				}
 				m.push(roleSystem, infoStyle.Render("[HOTFIX] Pipeline PAUSED. No files were modified."))
-				return m, m.flushPendingRecords()
+				return m, tea.Batch(m.flushPendingRecords(), thoughtDone)
 			}
 		}
 
 		// ── CLEAN TRANSITION TO PROPOSAL VIEW ────────────────────────
-		m.push(roleActivity, "  ⚙ Compiling unified diff schema...")
+		m.push(roleActivity, "  ⚙ Patch compiled by changeset pipeline.")
 
 		m.enterApprovalState()
 		m.ti.Blur()
@@ -1229,20 +1305,100 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			"Review the code diff below. Use Alt+A to accept, Alt+R to reject."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
+		// ── TOKEN ACCOUNTING ─────────────────────────────────────────
+		// Dispatch the provider-reported usage of the hotfix patch call as a
+		// TokenUsageMsg so the TokenUsageMsg handler accumulates it into the
+		// session counters and forces syncUIState (footer refresh) immediately.
+		// thoughtDone also dispatches the ThoughtBufferUpdatedMsg that marks the
+		// captured thought block complete.
+		return m, tea.Batch(m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput), thoughtDone)
+
+	case hotfixAmbiguousMsg:
+		// ── HOTFIX AMBIGUITY RESULT STATE ────────────────────────────
+		// The target-confidence boundary paused the $hot request: no provider
+		// call, no patch, no mutation. Enter the actionable ambiguity card
+		// (StateHotfixAmbiguous) so the developer can Clarify target, Inspect
+		// candidates (read-only), or Cancel.
+		//
+		// OPERATION LIFECYCLE: AMBIGUOUS is a TERMINAL outcome of the hotfix
+		// operation. finalizeOperation releases the operation ownership, every
+		// transient busy flag and the spinner — no worker remains waiting for
+		// the human. The card renders as a result state; the input stays
+		// focused and editable so the next command can be typed immediately.
+		m.finalizeOperation(OpOutcomeAmbiguous, nil)
+		m.pendingHotfixCandidate = nil
+		m.pendingHotfixAmbiguous = &hotfixAmbiguousData{
+			Task:       msg.Task,
+			Reason:     msg.Reason,
+			Candidates: msg.Candidates,
+		}
+		m.hotfixCandidatesMode = false
+		m.pendingProposals = nil
+		m.hotfixActive = false
+		m.ti.Focus()
+		m.recalcViewportHeight()
+		m.push(roleActivity, "  ◇ HOTFIX target is ambiguous — no model call was made.")
+		m.push(roleSystem, infoStyle.Render("No files were modified."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		m.syncUIState()
+		return m, m.flushPendingRecords()
+
+	case TokenUsageMsg:
+		// TokenUsageMsg is dispatched on EVERY async execution exit path —
+		// success, parse error, truncation, or abort — so the status bar
+		// footer never reports 0 tokens after a provider has consumed tokens.
+		// Accumulate into the session counters and force an immediate footer
+		// refresh via syncUIState.
+		if msg.PromptTokens > 0 || msg.CompletionTokens > 0 {
+			m.commitTokenUsage(msg.PromptTokens, msg.CompletionTokens)
+		}
+		m.syncUIState()
+		return m, nil
+
+	case ThoughtBufferUpdatedMsg:
+		// Full stream transparency: one raw LLM chunk (reasoning or content)
+		// appended to the active ThinkingBuffer in real time so the Ctrl+O
+		// thought drawer renders the model's raw stream live — 100% of the
+		// output is retained, never discarded. Done collapses the block to its
+		// summary once the stream/hotfix completes.
+		if msg.Content != "" {
+			if m.thinkingBuffer == nil {
+				m.thinkingBuffer = NewThinkingBuffer()
+			}
+			m.thinkingBuffer.Append(msg.Content)
+		}
+		if msg.Done {
+			if m.thinkingBuffer != nil {
+				m.thinkingBuffer.MarkComplete()
+			}
+		}
+		m.refreshViewportContent()
+		if m.Ready && !m.userIsScrollingUp {
+			m.Viewport.GotoBottom()
+		}
 		return m, nil
 
 	case buildResultMsg:
-		m.agentRunning = false
-		m.reviewRunning = false
-		m.agentDone = true
-		m.agentLabel = ""
+		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
+		// processing flag so the spinner can never be orphaned on a failed or
+		// aborted build, then re-derive the presentation state from the cleared
+		// flags so a stale StateProcessing derived during the build is
+		// released. Pending-approval overrides (e.g. a queued proposal
+		// awaiting authorization).
+		//
+		// HOTFIX ORDERING: for a $hot apply result the flags are NOT cleared
+		// here — the hotfix branch below assembles the full terminal result
+		// records FIRST and releases the processing flags only AFTER the
+		// "Applied hotfix patch to <file>" / "Pipeline PAUSED" message is
+		// rendered, so the mutation spinner persists until the result frame.
+		if !m.hotfixActive {
+			m.clearBusyFlags()
+		}
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.lastTestOutput = msg.output
 		m.lastTestFailed = msg.exitCode != 0
-		// Re-derive the presentation state from the cleared flags so a stale
-		// StateProcessing derived during the build is released. Pending-
-		// approval overrides (e.g. a queued proposal awaiting authorization).
 		m.syncUIState()
 
 		// ── FIX 1: Flush prompt buffer on task failure ────────────────
@@ -1325,10 +1481,39 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// user explicitly types "run" or provides feedback.
 			m.push(roleSystem, infoStyle.Render("[HOTFIX] Stashed plan restored successfully. Pipeline PAUSED."))
 
+			// ── BUSY-FLAG RELEASE AFTER RENDER ─────────────────────────
+			// The terminal hotfix result records are now fully assembled
+			// ("Applied hotfix patch to <file>" / "Pipeline PAUSED"). ONLY
+			// now are the processing flags cleared so the mutation spinner
+			// runs until the very frame that shows the result, and the
+			// presentation state is re-derived before the final refresh.
+			//
+			// OPERATION LIFECYCLE: the hotfix apply operation (op begun at
+			// human approval) reaches its terminal outcome here — SUCCESS on
+			// exit 0, otherwise FAILURE (or TIMEOUT for a deadline-exceeded
+			// apply). finalizeOperation is the single cleanup path.
+			m.clearBusyFlags()
+			outcome := OpOutcomeSuccess
+			if msg.exitCode != 0 {
+				outcome = classifyOpErr(msg.err)
+			}
+			m.finalizeOperation(outcome, msg.err)
+			m.syncUIState()
+
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
-			flush := m.flushPendingRecords()
-			return m, flush
+			// ── AUTHORIZED APPLY PROJECTION ────────────────────────────
+			// The runtime approve_patch projection reports that the patch was
+			// applied to disk. It must fire ONLY when the authoritative apply
+			// (budget / authorization gated) succeeded — never when the apply
+			// was blocked (e.g. "mutation budget already exhausted"), so the
+			// event stream can never claim a success the gate denied.
+			cmds := []tea.Cmd{m.flushPendingRecords()}
+			if msg.exitCode == 0 && m.appliedHotfixFile != "" {
+				cmds = append(cmds, m.runtimeApproveCmd(m.appliedHotfixFile))
+			}
+			m.appliedHotfixFile = ""
+			return m, tea.Batch(cmds...)
 		}
 
 		// ── FIX 2: Freeze state machine on task failure ───────────────
@@ -2110,11 +2295,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			return m, m.readStream()
 		}
 		m.ensureStreamBlocks().Append(KindThinking, string(msg))
+		// Full stream transparency: the reasoning chunk is also retained in the
+		// active ThinkingBuffer via the ThoughtBufferUpdatedMsg protocol so the
+		// Ctrl+O thought drawer renders it live.
 		m.refreshViewportContent()
 		if m.Ready && !m.userIsScrollingUp && !m.traceExpanded {
 			m.Viewport.GotoBottom()
 		}
-		return m, m.readStream()
+		return m, tea.Batch(m.readStream(), m.thoughtUpdateCmd(string(msg), false))
 
 	case tokenMsg:
 		// LOCK-FREE CONSUMER: this per-token handler MUST NOT acquire any
@@ -2149,6 +2337,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		var cmds []tea.Cmd
 		cmds = append(cmds, m.readStream())
+		// Full stream transparency: every content chunk is retained in the
+		// active ThinkingBuffer via the ThoughtBufferUpdatedMsg protocol so the
+		// Ctrl+O thought drawer renders the raw stream live.
+		cmds = append(cmds, m.thoughtUpdateCmd(raw, false))
 		if !m.streamTickActive {
 			m.streamTickActive = true
 			cmds = append(cmds, m.smoothStreamTickCmd())
@@ -2646,7 +2838,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.planPending = false
 
 		m.refreshViewportContent()
-		return m, nil
+		// Full stream transparency: mark the live thought block complete so the
+		// Ctrl+O drawer collapses to its "▸ Thought for Xs (N tokens)" summary.
+		return m, m.thoughtUpdateCmd("", true)
 
 	case streamErrMsg:
 		m.streamCh = nil
@@ -2684,13 +2878,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 
 		// ── TOKEN ACCOUNTING ON FAILURE ────────────────────────────────
-		// Explicit Over Implicit: commit whatever usage the provider reported
-		// (or the character estimate the stream reader produced) before the
-		// stream died, so tokens consumed on a timeout/error are not silently
-		// zeroed in the footer. Publish the typed StreamUsage event so
-		// telemetry projections observe the failed attempt too.
+		// Explicit Over Implicit: whatever usage the provider reported (or the
+		// character estimate the stream reader produced) is dispatched as a
+		// TokenUsageMsg — even before the stream died — so tokens consumed on a
+		// timeout/error are not silently zeroed in the footer. Publish the
+		// typed StreamUsage event so telemetry projections observe the failed
+		// attempt too.
 		if msg.tokenInput > 0 || msg.tokenOutput > 0 {
-			m.commitTokenUsage(msg.tokenInput, msg.tokenOutput)
 			if m.bus != nil {
 				modelName := ""
 				if m.cfg != nil {
@@ -2716,7 +2910,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.refreshViewportContent()
 		flush := m.flushPendingRecords()
-		return m, flush
+		return m, tea.Batch(flush, m.tokenUsageCmd(msg.tokenInput, msg.tokenOutput))
 
 	case thinkingStreamMsg:
 		// Real-time reasoning token dispatch to the TUI Thinking Panel.
@@ -2758,10 +2952,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
 		// "Explicit Over Implicit": report partial usage on the failed fast-track
-		// attempt so consumed tokens are never silently zeroed.
-		if msg.TokenInput > 0 || msg.TokenOutput > 0 {
-			m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
-		}
+		// attempt so consumed tokens are never silently zeroed (dispatched as a
+		// TokenUsageMsg so the footer refreshes immediately).
 		m.push(roleError, "fast-track build failed: "+providers.SanitizeAPIError(msg.Err))
 		// "Human-Centered / Reversible": a failed build stream must never trap
 		// the workflow in the build phase. Unwind the state machine back to
@@ -2771,7 +2963,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
-		return m, flush
+		return m, tea.Batch(flush, m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput))
 
 	case TaskFinishedMsg:
 		m.agentRunning = false
