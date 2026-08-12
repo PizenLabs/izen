@@ -250,6 +250,11 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
+	// ── FORCE-EXIT TERMINAL RESTORE ──────────────────────────────────────
+	// The model needs the owning program to restore the terminal before a hard
+	// double-Ctrl+C exit (status 130).
+	m.program = p
+
 	// ── FACT-ONLY CONTROL BRIDGE ─────────────────────────────────────
 	// The adaptive control loop's telemetry bus publishes fact-only facts
 	// (control.iteration + control.node_observed). The UI subscribes via
@@ -372,8 +377,16 @@ func runProgram(p *tea.Program, root string, initStage initStage) {
 		}
 	}()
 
-	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error running Izen: %v\n", err)
+	// ── ROOT SIGINT/SIGTERM CANCELLATION BRIDGE ──────────────────────────
+	// First signal: graceful cancellation of the active operation. Second
+	// signal while a cancellation is in progress: hard exit with status 130.
+	// The application must never require tmux kill-pane to recover.
+	stopSignals := installRootSignalBridge(p)
+
+	_, runErr := p.Run()
+	stopSignals()
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "Error running Izen: %v\n", runErr)
 		os.Exit(1)
 	}
 }

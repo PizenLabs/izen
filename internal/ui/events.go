@@ -68,6 +68,28 @@ type AuthorizationStatusMsg struct {
 	Reason   string
 }
 
+// TokenUsageMsg carries provider-reported token usage from an async execution
+// path (hotfix, build, plan, investigate) to the Bubble Tea event loop. It is
+// dispatched on EVERY exit path — success, parse error, truncation, or abort —
+// so the status bar footer never reports 0 tokens after a cloud model has
+// consumed tokens (e.g. OpenRouter prompt + completion usage during $hot).
+type TokenUsageMsg struct {
+	PromptTokens     int
+	CompletionTokens int
+	Model            string
+}
+
+// ThoughtBufferUpdatedMsg carries one raw LLM chunk (reasoning or content) to
+// the Bubble Tea event loop for real-time retention in the active thought
+// buffer. It is dispatched on EVERY chunk received from the provider so the
+// Ctrl+O thought drawer can render the model's raw stream live — NO model
+// output is discarded, hidden, or silently swallowed. Done=true marks the
+// thought block complete (collapses to its summary).
+type ThoughtBufferUpdatedMsg struct {
+	Content string
+	Done    bool
+}
+
 // ── Event Emitters ────────────────────────────────────────────────────────
 //
 // These functions create tea.Msg values for the Control Plane to send.

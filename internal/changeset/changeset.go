@@ -34,6 +34,28 @@ const (
 //nolint:staticcheck // ST1005: the trailing period is the spec-mandated pipeline pause contract.
 var ErrAmbiguousChange = errors.New("Pipeline PAUSED. Reason: ambiguous change representation.")
 
+// ErrTruncatedOutput is the truncation guard sentinel. It is returned by the
+// Diff Compiler when a KindReplaceBlock / KindReplaceFile payload is
+// structurally unbalanced (unclosed HTML tags / markdown fences / JSON
+// delimiters) — the canonical signature of a response cut off mid-generation by
+// the completion ceiling. The pipeline PAUSES and NEVER emits a broken diff
+// that would delete subsequent valid file sections.
+//
+//nolint:staticcheck // ST1005: the trailing period is the spec-mandated pipeline pause contract.
+var ErrTruncatedOutput = errors.New("Pipeline PAUSED. Reason: model output was truncated before completion.")
+
+// ErrFullFileRejected is the bounded-change-contract sentinel. It is returned
+// by the Change Extractor when a model block claims whole-file replacement of a
+// LARGE existing file (an explicit path tag or >= fullFileCoverageThreshold
+// structural coverage). The artifact contract is pinned BEFORE model invocation:
+// Izen permits the full-file rewrite only for stub/small files whose re-emission
+// is bounded; a large existing file uses the anchored ReplaceBlock contract
+// exclusively, so a whole-file re-emission is an out-of-contract artifact and is
+// rejected rather than silently upgraded into a full-file rewrite.
+//
+//nolint:staticcheck // ST1005: the trailing period is the spec-mandated pipeline pause contract.
+var ErrFullFileRejected = errors.New("Pipeline PAUSED. Reason: model output would replace the entire file, which is out of the bounded hotfix contract.")
+
 // ChangeSet is the intermediate representation of one intended change. It is
 // the boundary between the Change Extractor (model intent) and the Diff
 // Compiler (authoritative diff synthesis).

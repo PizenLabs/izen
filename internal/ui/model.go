@@ -30,6 +30,7 @@ import (
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
+	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
@@ -103,6 +104,7 @@ const (
 	StateChat             = presentation.StateChat
 	StateAwaitingApproval = presentation.StateAwaitingApproval
 	StateProcessing       = presentation.StateProcessing
+	StateHotfixAmbiguous  = presentation.StateHotfixAmbiguous
 )
 
 type record struct {
@@ -424,6 +426,32 @@ type hotfixProposalMsg struct {
 	// patch call so tokens are recorded even on truncation.
 	TokenInput  int
 	TokenOutput int
+	// RawOutput is the verbatim LLM output (reasoning + response text) of the
+	// hotfix patch call. It is projected into the Ctrl+O thought / trace
+	// buffers by the update handler so the thought drawer renders the raw
+	// model stream during and after cloud execution.
+	RawOutput string
+}
+
+// hotfixAmbiguousMsg is the terminal result of a $hot request paused by the
+// deterministic target-confidence boundary. It is NOT a patch proposal: the
+// provider was never invoked, no patch exists, and no mutation may occur. It
+// carries everything the actionable ambiguity-resolution card needs.
+type hotfixAmbiguousMsg struct {
+	Task   *plan.Task // the original hotfix request (Target + Description)
+	Reason string     // why the target is ambiguous
+	// Candidates are deterministic, inspectable target options (HTML structural
+	// anomalies). Human selection makes the target explicit; it is never chosen
+	// automatically.
+	Candidates []hotfix.Target
+}
+
+// hotfixAmbiguousData is the persisted ambiguity-resolution state rendered by
+// the StateHotfixAmbiguous card.
+type hotfixAmbiguousData struct {
+	Task       *plan.Task
+	Reason     string
+	Candidates []hotfix.Target
 }
 
 // hotfixProgressMsg streams a lifecycle log line to the terminal while the
@@ -998,6 +1026,44 @@ type model struct {
 	// pendingHotfixPatch holds the generated patch awaiting approval so the
 	// apply step does not need to re-invoke the LLM on confirmation.
 	pendingHotfixPatch *execution.Patch
+	// pendingHotfixAmbiguous holds the actionable ambiguity-resolution state
+	// rendered by the StateHotfixAmbiguous card. Non-nil only while a $hot
+	// request is paused by the target-confidence boundary (no provider, no
+	// patch, no mutation).
+	pendingHotfixAmbiguous *hotfixAmbiguousData
+	// hotfixCandidatesMode toggles the read-only candidate-inspection sub-view
+	// of the ambiguous card. Inspecting candidates never mutates the file.
+	hotfixCandidatesMode bool
+	// pendingHotfixCandidate is the explicitly selected candidate target for a
+	// candidate-driven structural hotfix. It is set synchronously by the
+	// candidate-selection handler and cleared when the resulting proposal (or
+	// an error) reaches the event loop.
+	pendingHotfixCandidate *hotfix.Target
+	// appliedHotfixFile records the target file of an APPROVED hotfix so the
+	// terminal buildResultMsg handler can dispatch the runtime approve_patch
+	// projection ONLY after the authoritative apply (budget/authorization
+	// gated) actually succeeded. Cleared on the terminal result.
+	appliedHotfixFile string
+
+	// ── Foreground operation lifecycle (single authoritative operation) ──
+	// activeOp is the one foreground operation currently owned by the runtime,
+	// or nil when idle. Every execution path (hotfix generation, build apply,
+	// provider calls, subprocesses) registers here; AMBIGUOUS/CANCELLED/... are
+	// terminal outcomes that release the ownership. See operation.go.
+	activeOp *operation
+	// opIDCounter issues monotonically increasing operation IDs.
+	opIDCounter uint64
+	// cancelGraceDeadline is the double-Ctrl+C force-exit window armed when a
+	// graceful cancellation is initiated. A second Ctrl+C before this deadline
+	// hard-exits with status 130.
+	cancelGraceDeadline time.Time
+	// hotfixTimeout bounds a single $hot provider invocation when non-zero;
+	// zero uses the package-level buildGenerationTimeout. Tests inject a short
+	// deadline to exercise the TIMEOUT lifecycle deterministically.
+	hotfixTimeout time.Duration
+	// program is the owning Bubble Tea program, used to restore the terminal
+	// before a hard force-exit. Nil in harnesses/tests.
+	program *tea.Program
 
 	// Active review ledger from the last /review pipeline run. Carries the
 	// C-R-H-V-E evidence chain for /review provenance and $log display. Stored
@@ -1547,6 +1613,30 @@ func (m *model) commitTokenUsage(input, output int) {
 	}
 }
 
+// tokenUsageCmd returns a command that dispatches the provider-reported token
+// usage of an execution path to the Bubble Tea event loop as a TokenUsageMsg.
+// The TokenUsageMsg handler in update.go accumulates the counts into the
+// session counters and forces syncUIState so the status bar footer refreshes
+// the token counters immediately — even when the underlying execution failed,
+// was aborted, or was truncated mid-stream. Zero usage produces a nil command
+// (nothing was consumed, nothing to report).
+func (m *model) tokenUsageCmd(input, output int) tea.Cmd {
+	if input <= 0 && output <= 0 {
+		return nil
+	}
+	model := ""
+	if m.cfg != nil {
+		model = m.cfg.ActiveModelName()
+	}
+	return func() tea.Msg {
+		return TokenUsageMsg{
+			PromptTokens:     input,
+			CompletionTokens: output,
+			Model:            model,
+		}
+	}
+}
+
 // setApplyError captures an apply error.
 func (m *model) setApplyError(text string) {
 	m.lastApplyError = text
@@ -1800,6 +1890,9 @@ func (m *model) unwindBuildFailure() {
 	m.pendingBuildTask = nil
 	m.pendingHotfixTask = nil
 	m.pendingHotfixPatch = nil
+	m.pendingHotfixAmbiguous = nil
+	m.hotfixCandidatesMode = false
+	m.pendingHotfixCandidate = nil
 	m.acceptAll = false
 	m.pendingRouteConfirm = false
 	if m.workflowSM != nil {
@@ -1827,6 +1920,12 @@ func (m *model) unwindBuildFailure() {
 //  4. Drops in-flight approval/patch state so the viewport returns to chat.
 //  5. Re-derives the presentation state to interactive StateChat.
 func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
+	// 0. Cancel the authoritative operation context FIRST so provider calls
+	// and subprocesses spawned under the active operation observe the
+	// cancellation immediately (Section 6: context propagation).
+	if m.activeOp != nil {
+		m.activeOp.Cancel()
+	}
 	// 1. Cancel every in-flight background context (ghost-loop prevention).
 	m.cancelAllBackgroundContexts()
 	if m.streamCancel != nil {
@@ -1838,6 +1937,10 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 		m.shellCancel = nil
 	}
 	execution.KillAllOrphans()
+
+	// 1b. Release the active-operation ownership and clear the transient busy
+	// flags + spinner through the single authoritative finalization path.
+	m.finalizeOperation(OpOutcomeCancelled, nil)
 
 	// 2. Clear every transient processing flag so the spinner can never stay
 	// up and the view can never block on a phantom producer.
@@ -1858,6 +1961,9 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	m.pendingBuildTask = nil
 	m.pendingHotfixTask = nil
 	m.pendingHotfixPatch = nil
+	m.pendingHotfixAmbiguous = nil
+	m.hotfixCandidatesMode = false
+	m.pendingHotfixCandidate = nil
 	m.acceptAll = false
 	m.pendingRouteConfirm = false
 	if m.toolCallBuffer != nil {
@@ -1900,6 +2006,15 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 // rests in StateChat.
 func (m *model) syncUIState() {
 	if m == nil {
+		return
+	}
+	// ── HOTFIX AMBIGUITY RESULT STATE ──────────────────────────────
+	// The ambiguity pause is a result/state of the $hot operation, NOT a
+	// workflow phase: it does NOT touch the workflow state machine and takes
+	// precedence over any transient busy flag so the actionable resolution card
+	// keeps rendering until the user acts.
+	if m.pendingHotfixAmbiguous != nil {
+		m.state = presentation.StateHotfixAmbiguous
 		return
 	}
 	phase := ""
@@ -2142,6 +2257,32 @@ func (m *model) handleReasoningStream(chunk string, isComplete bool) {
 	m.refreshViewportContent()
 	if m.Ready && !m.userIsScrollingUp {
 		m.Viewport.GotoBottom()
+	}
+}
+
+// captureHotfixThought projects the verbatim $hot LLM output into the
+// output-trace viewport (traceBuffer) — the canonical raw-stream store for
+// models with no formal reasoning channel. The ThinkingBuffer is fed via the
+// dispatched ThoughtBufferUpdatedMsg protocol (thoughtUpdateCmd), keeping the
+// Ctrl+O thought drawer live with 100% of the raw model stream. Only ever
+// called on the UI goroutine.
+func (m *model) captureHotfixThought(raw string) {
+	if strings.TrimSpace(raw) == "" {
+		return
+	}
+	m.traceBuffer.WriteString(raw)
+}
+
+// thoughtUpdateCmd returns a command that dispatches one raw LLM chunk to the
+// Bubble Tea event loop as a ThoughtBufferUpdatedMsg. The handler appends the
+// chunk to the active ThinkingBuffer (the Ctrl+O thought drawer) in real time
+// so NO model output is discarded; Done marks the thought block complete.
+func (m *model) thoughtUpdateCmd(content string, done bool) tea.Cmd {
+	if content == "" && !done {
+		return nil
+	}
+	return func() tea.Msg {
+		return ThoughtBufferUpdatedMsg{Content: content, Done: done}
 	}
 }
 

@@ -283,11 +283,20 @@ func extractText(no NormalizedOutput, targetFile string, original []byte) ([]Cha
 }
 
 // classifyBlock decides whether a code block is a full-file replacement or an
-// anchored partial replacement. A block is a full-file replacement when it
-// carries an explicit full-file indicator (a fence-header target path) or when
-// it structurally covers >= fullFileCoverageThreshold of the on-disk original.
-// Otherwise it is treated as a partial snippet and anchored to the closest
-// original line; an unmatchable snippet aborts with ErrAmbiguousChange.
+// anchored partial replacement, enforcing the bounded-change contract:
+//
+//   - A block is a full-file replacement (KindReplaceFile) ONLY when the
+//     on-disk original is a stub/small file whose complete re-emission is
+//     bounded (isBoundedFullRewrite) AND the block carries a full-file
+//     indicator (a fence-header target path) or structurally covers >=
+//     fullFileCoverageThreshold of the original.
+//   - For a LARGE existing file, the anchored snippet (KindReplaceBlock) is
+//     the ONLY legitimate contract. A block claiming whole-file replacement on
+//     a large file is an out-of-contract artifact and is rejected with
+//     ErrFullFileRejected — it is NEVER silently upgraded into a full-file
+//     rewrite. Otherwise the block is treated as a partial snippet and anchored
+//     to the closest original line; an unmatchable snippet aborts with
+//     ErrAmbiguousChange.
 func classifyBlock(b CodeBlock, targetFile string, original string) (ChangeSet, error) {
 	path := b.Path
 	if path == "" {
@@ -299,6 +308,9 @@ func classifyBlock(b CodeBlock, targetFile string, original string) (ChangeSet, 
 
 	content := strings.TrimRight(b.Content, "\n")
 	if b.Path != "" || coverageRatio(original, content) >= fullFileCoverageThreshold {
+		if !isBoundedFullRewrite(original) {
+			return ChangeSet{}, ErrFullFileRejected
+		}
 		return ChangeSet{
 			TargetFile: path,
 			Kind:       KindReplaceFile,
@@ -324,6 +336,20 @@ func classifyBlock(b CodeBlock, targetFile string, original string) (ChangeSet, 
 // lines that a block must structurally cover to be classified as a whole-file
 // replacement (>95% per the architectural spec).
 const fullFileCoverageThreshold = 0.95
+
+// smallFileLineThreshold is the bounded-rewrite boundary: a whole-file
+// replacement is a legitimate, BOUNDED contract only for stub/small files whose
+// full re-emission fits in the output budget. It mirrors the established
+// execution.SmallFileLineThreshold convention (100 newline-terminated lines).
+// Large existing files use the anchored ReplaceBlock contract exclusively.
+const smallFileLineThreshold = 100
+
+// isBoundedFullRewrite reports whether a whole-file replacement of the original
+// is a bounded, legitimate contract: the original is empty (new file) or has
+// fewer than smallFileLineThreshold newline-terminated lines (stub/small file).
+func isBoundedFullRewrite(original string) bool {
+	return strings.TrimSpace(original) == "" || strings.Count(original, "\n") < smallFileLineThreshold
+}
 
 // coverageRatio reports the fraction of the original's non-empty lines that
 // appear (by trimmed equality) inside the block.
@@ -351,18 +377,33 @@ func coverageRatio(original, block string) float64 {
 const minAnchorSimilarity = 0.6
 
 // matchAnchor resolves the exact on-disk text (OldContent) that the snippet
-// should replace. It prefers an exact line match, then a fuzzy best-line match.
-// ok=false when no line is a confident anchor.
+// should replace. It prefers a multi-line block-window match (HTML sections
+// frequently span several lines — <div><h3>..</h3><p>..</p></div>), then an
+// exact single-line match, then a fuzzy best-line match. ok=false when no
+// confident anchor exists.
+//
+// The block-window pass is what prevents ErrAmbiguousChange false-positives on
+// small HTML snippets: comparing a multi-line snippet against a SINGLE original
+// line structurally cannot exceed the similarity threshold, so a two-line
+// "corrected <h3> + sibling <p>" snippet used to pause the pipeline even when
+// the exact target section was sitting in index.html. Sliding the snippet over
+// a contiguous window of original lines lets the unchanged sibling lines match
+// at 1.0 and pulls the anchor above threshold.
 func matchAnchor(original, snippet string) (anchor string, sim float64, ok bool) {
 	s := strings.TrimSpace(snippet)
 	if s == "" {
 		return "", 0, false
 	}
+	if blockAnchor, blockSim, blockOK := matchAnchorBlock(original, s); blockOK {
+		return blockAnchor, blockSim, true
+	}
+	// Single-line exact match.
 	for _, line := range splitLines(original) {
 		if strings.TrimSpace(line) == s {
 			return line, 1.0, true
 		}
 	}
+	// Single-line fuzzy best match.
 	bestLine, bestSim := "", 0.0
 	for _, line := range splitLines(original) {
 		t := strings.TrimSpace(line)
@@ -377,6 +418,82 @@ func matchAnchor(original, snippet string) (anchor string, sim float64, ok bool)
 		return "", 0, false
 	}
 	return bestLine, bestSim, true
+}
+
+// matchAnchorBlock slides the snippet over a contiguous window of original
+// lines and returns the highest-scoring window as the anchor. A window is a
+// candidate only when its per-line mean similarity clears minAnchorSimilarity.
+//
+// The returned anchor preserves the ORIGINAL line whitespace for multi-line
+// windows (so the Patch Validator / Diff Compiler can locate the exact
+// contiguous substring on disk) but is trimmed for single-line windows (the
+// established ReplaceBlock convention — a trimmed line is still a substring of
+// its indented original). A window length that exceeds the original yields no
+// match.
+func matchAnchorBlock(original, snippet string) (anchor string, sim float64, ok bool) {
+	origLines := splitLines(original)
+	snip := trimBlankEdges(splitLines(snippet))
+	if len(snip) == 0 || len(origLines) < len(snip) {
+		return "", 0, false
+	}
+	bestStart, bestSim := -1, 0.0
+	for start := 0; start+len(snip) <= len(origLines); start++ {
+		window := origLines[start : start+len(snip)]
+		if d := windowSimilarity(window, snip); d > bestSim {
+			bestSim, bestStart = d, start
+		}
+	}
+	if bestStart < 0 || bestSim < minAnchorSimilarity {
+		return "", 0, false
+	}
+	if len(snip) == 1 {
+		return strings.TrimSpace(origLines[bestStart]), bestSim, true
+	}
+	return strings.Join(origLines[bestStart:bestStart+len(snip)], "\n"), bestSim, true
+}
+
+// windowSimilarity scores how well the snippet's lines align with one
+// contiguous window of original lines. Each snippet line is matched against the
+// most similar window line; the score is the mean of those per-line
+// similarities over the non-blank snippet lines. An unchanged sibling (e.g.
+// "<p>Stable content</p>") pins at 1.0, which lets the one genuinely-changed
+// line (e.g. "<h3>Project Delta</h3>") pull the window above threshold via its
+// fuzzy match against "<h3>Old Delta</h3>".
+func windowSimilarity(window, snippet []string) float64 {
+	total, count := 0.0, 0
+	for _, s := range snippet {
+		st := strings.TrimSpace(s)
+		if st == "" {
+			continue
+		}
+		best := 0.0
+		for _, w := range window {
+			if wt := strings.TrimSpace(w); wt != "" {
+				if d := runeSimilarity(st, wt); d > best {
+					best = d
+				}
+			}
+		}
+		total += best
+		count++
+	}
+	if count == 0 {
+		return 0
+	}
+	return total / float64(count)
+}
+
+// trimBlankEdges removes leading and trailing blank lines so newline noise
+// around a code block does not force a wider anchor window.
+func trimBlankEdges(lines []string) []string {
+	start, end := 0, len(lines)
+	for start < end && strings.TrimSpace(lines[start]) == "" {
+		start++
+	}
+	for end > start && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	return lines[start:end]
 }
 
 // runeSimilarity is the normalized longest-common-subsequence similarity over

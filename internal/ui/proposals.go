@@ -709,6 +709,25 @@ func (m *model) streamShellCmd(cmd string) tea.Cmd {
 			return
 		}
 
+		// ── CANCELLATION-SAFE PIPE DRAIN ─────────────────────────────
+		// Killing the direct child does not necessarily release its pipes: a
+		// grandchild that inherited the write ends (e.g. `bash -c "sleep 30"`
+		// keeps `sleep` alive) holds them open, which would block the pump
+		// goroutines below forever — leaking the worker even though the
+		// operation was cancelled. Closing the read ends on ctx.Done makes the
+		// pumps return immediately so the terminal shellExitMsg is ALWAYS
+		// emitted after a cancellation.
+		stopPipes := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = stdout.Close()
+				_ = stderr.Close()
+			case <-stopPipes:
+			}
+		}()
+		defer close(stopPipes)
+
 		// Drain both pipes concurrently so a chatty stream never deadlocks
 		// the process (pipes block writes once their kernel buffers fill).
 		var wg sync.WaitGroup

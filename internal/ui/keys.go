@@ -311,8 +311,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// ── Awaiting approval ────────────────────────────────────────────
-	if m.state == StateAwaitingApproval {
+	// ── Awaiting approval / hotfix ambiguity ─────────────────────────
+	// Both states hard-intercept the keyboard: the proposal/approval gate and
+	// the actionable ambiguity card (Clarify / Inspect candidates / Cancel).
+	if m.state == StateAwaitingApproval || m.state == StateHotfixAmbiguous {
 		// ── Hybrid Intent Gateway mode-selection prompt ─────────────
 		// The router classified the prompt with confidence below the policy
 		// threshold. Digits select a mode directly, ←/→ cycle the highlight,
@@ -373,6 +375,55 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, vpCmd
 		}
 
+		// ── $hot AMBIGUOUS RESOLUTION CARD ─────────────────────────
+		// The target-confidence boundary paused the request. The developer must
+		// Clarify target ([c]), Inspect candidates ([i], read-only), or
+		// Cancel ([x]/Esc). NO Accept/Reject is rendered — there is no patch.
+		// Candidate selection ([1-9] in inspect mode) is an explicit human act
+		// that makes the target explicit; it never happens automatically.
+		//
+		// LIVENESS: the card is a terminal outcome of the hotfix operation,
+		// not a locked execution worker. The input line stays focused and
+		// editable: every non-card keystroke is forwarded to the text input,
+		// and Enter with a typed command submits it (dismissing the card and
+		// starting a NEW operation). Ctrl+C cancels the card gracefully.
+		if m.pendingHotfixAmbiguous != nil {
+			switch {
+			case msg.Type == tea.KeyCtrlC:
+				return m.cancelHotfixAmbiguous()
+			case msg.String() == "c":
+				return m.clarifyHotfixTarget()
+			case msg.String() == "i":
+				return m.toggleHotfixCandidates()
+			case msg.String() == "x" || msg.Type == tea.KeyEscape:
+				return m.cancelHotfixAmbiguous()
+			case msg.Type == tea.KeyEnter:
+				if m.ti.Focused() && m.ti.Value() != "" {
+					return m.submitHotfixCardCommand()
+				}
+				return m.clarifyHotfixTarget()
+			default:
+				if m.hotfixCandidatesMode && len(m.pendingHotfixAmbiguous.Candidates) > 0 {
+					if msg.Type == tea.KeyRunes {
+						d := msg.Runes
+						if len(d) == 1 && d[0] >= '1' && d[0] <= '9' {
+							n := int(d[0] - '0')
+							if n <= len(m.pendingHotfixAmbiguous.Candidates) {
+								return m.selectHotfixCandidate(n)
+							}
+						}
+					}
+				}
+				// Forward every other keystroke to the text input so the next
+				// command can be composed while the card renders.
+				var tiCmd tea.Cmd
+				m.ti, tiCmd = m.ti.Update(msg)
+				m.syncInputFromTI()
+				m.updateSuggestions()
+				return m, tiCmd
+			}
+		}
+
 		// ── $hot HOTFIX APPROVAL GATE ─────────────────────────────
 		// The hotfix patch was generated but NOT applied. The developer must
 		// explicitly authorize (Alt+A / Enter) or reject (Alt+R / Esc).
@@ -395,11 +446,17 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.push(roleSystem, infoStyle.Render(
 					fmt.Sprintf("  "+Icon.Success+" Approved — applying hotfix patch to %s...", patch.File)))
 
+				// The runtime approve_patch projection is NOT dispatched here:
+				// it must only fire AFTER the authoritative apply (budget /
+				// authorization gated) succeeds, otherwise a budget-blocked
+				// hotfix would still report "approve_patch applied". The file is
+				// recorded and the projection is emitted from the terminal
+				// buildResultMsg handler on success only.
+				m.appliedHotfixFile = patch.File
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "hotfix apply"} },
 					m.applyHotfixPatch(task, patch),
 					m.smoothStreamTickCmd(),
-					m.runtimeApproveCmd(patch.File),
 				)
 
 			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
