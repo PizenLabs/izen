@@ -708,6 +708,12 @@ func (m *model) streamShellCmd(cmd string) tea.Cmd {
 	m.shellRunning = true
 
 	go func() {
+		// ── WORKER LIFETIME (Phase 3) ────────────────────────────────
+		// The streaming shell pump is a real worker; register it against the
+		// active operation so terminal-lifecycle tests can prove it releases
+		// before operation finalization. A no-op when no operation is attached.
+		m.spawnOpWorker("shell")
+		defer m.releaseOpWorker("shell")
 		defer cancel()
 		defer close(shellCh)
 

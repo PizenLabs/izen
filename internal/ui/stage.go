@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/execution"
 )
 
 // ── Authoritative execution-stage record ────────────────────────────────────
@@ -57,6 +59,12 @@ type execStage struct {
 	Elapsed time.Duration
 	// Tokens is the real provider-reported / streamed token count.
 	Tokens int
+	// Telemetry is the per-operation execution record fed from this stage's
+	// boundaries. It is attached at beginOperation (UI goroutine) and read by
+	// setStage/setStageMetrics/finishStage — including from worker goroutines —
+	// so it lives under this stage's mutex to stay race-safe. It is never
+	// detached mid-operation; Record is a no-op after the record is finalized.
+	Telemetry *execution.Telemetry
 }
 
 // stageView is a lock-free snapshot of the authoritative stage consumed by the
@@ -121,6 +129,11 @@ func (m *model) resetStage(kind OperationKind) {
 
 // setStage records a real execution-stage transition. It is safe to call from
 // worker goroutines. target is optional (pass "" to keep the previous target).
+//
+// It also feeds the authoritative per-operation execution telemetry so stage
+// latency is attributed to the real runtime stage: a provider round-trip
+// records as the "model" stage with waiting/streaming sub-phases, a local
+// stage records as running→done. See execution_telemetry.go.
 func (m *model) setStage(label, target string, state execStageState) {
 	if m.stage == nil {
 		m.stage = &execStage{}
@@ -133,8 +146,68 @@ func (m *model) setStage(label, target string, state execStageState) {
 	}
 	m.stage.State = state
 	m.stage.LastTs = now
+	te := m.stage.Telemetry
 	m.stage.mu.Unlock()
+	if ts := stageStateToTelemetry(state); ts != "" && te != nil {
+		te.Record(label, target, ts, 0, 0, 0)
+	}
 }
+
+// stageStateToTelemetry maps the truthful UI stage state onto the telemetry
+// stage state. Synthetic/animation states (blocked) map to running so the
+// telemetry only ever records real runtime conditions.
+func stageStateToTelemetry(s execStageState) execution.StageState {
+	switch s {
+	case stageRunning:
+		return execution.StageRunning
+	case stageWaiting:
+		return execution.StageWaiting
+	case stageStreaming:
+		return execution.StageStreaming
+	case stageDone:
+		return execution.StageDone
+	case stageFailed:
+		return execution.StageFailed
+	case stageCancelled:
+		return execution.StageCancelled
+	case stageBlocked:
+		return execution.StageRunning
+	default:
+		return ""
+	}
+}
+
+// spawnOpWorker registers a live worker under the active operation's
+// telemetry so the terminal-lifecycle tests can assert no worker survives the
+// operation. It is a strict no-op when no operation/telemetry is attached.
+// Callers MUST pair it with a defer releaseOpWorker(label).
+func (m *model) spawnOpWorker(label string) {
+	if m.stage == nil {
+		return
+	}
+	m.stage.mu.Lock()
+	te := m.stage.Telemetry
+	m.stage.mu.Unlock()
+	if te != nil {
+		te.Workers().Spawn(label)
+	}
+}
+
+// releaseOpWorker unregisters a live worker under the active operation's
+// telemetry. Paired with spawnOpWorker.
+func (m *model) releaseOpWorker(label string) {
+	if m.stage == nil {
+		return
+	}
+	m.stage.mu.Lock()
+	te := m.stage.Telemetry
+	m.stage.mu.Unlock()
+	if te != nil {
+		te.Workers().Release(label)
+	}
+}
+
+// setStageMetrics attaches real runtime metrics to the active stage.
 
 // setStageMetrics attaches real runtime metrics to the active stage.
 func (m *model) setStageMetrics(bytes int64, elapsed time.Duration, tokens int) {
@@ -151,25 +224,46 @@ func (m *model) setStageMetrics(bytes int64, elapsed time.Duration, tokens int) 
 	if tokens >= 0 {
 		m.stage.Tokens = tokens
 	}
+	label := m.stage.Label
+	target := m.stage.Target
+	te := m.stage.Telemetry
 	m.stage.mu.Unlock()
+	// Feed the real metrics into the per-operation execution telemetry so the
+	// stage span carries the true bytes/tokens/elapsed observed on disk or
+	// from the provider.
+	if te != nil {
+		te.Record(label, target, stageStateToTelemetry(stageRunning), bytes, tokens, elapsed)
+	}
 }
 
 // finishStage maps a terminal operation outcome onto the stage so the stage can
-// never outlive the operation as a live indicator.
+// never outlive the operation as a live indicator. The terminal state is also
+// recorded into the per-operation execution telemetry so the stage span has a
+// real terminal marker.
 func (m *model) finishStage(outcome OperationOutcome) {
 	if m.stage == nil {
 		return
 	}
 	m.stage.mu.Lock()
+	var state execStageState
 	switch outcome {
 	case OpOutcomeSuccess:
-		m.stage.State = stageDone
+		state = stageDone
 	case OpOutcomeCancelled:
-		m.stage.State = stageCancelled
+		state = stageCancelled
 	default:
-		m.stage.State = stageFailed
+		state = stageFailed
 	}
+	m.stage.State = state
+	label := m.stage.Label
+	target := m.stage.Target
+	te := m.stage.Telemetry
 	m.stage.mu.Unlock()
+	if te != nil {
+		if ts := stageStateToTelemetry(state); ts != "" && label != "" {
+			te.Record(label, target, ts, 0, 0, 0)
+		}
+	}
 }
 
 // stageSnapshot returns a consistent lock-free snapshot of the authoritative

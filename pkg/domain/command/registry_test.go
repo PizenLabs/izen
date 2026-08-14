@@ -96,7 +96,7 @@ func TestGetAllowedDirectivesAskIsReadOnly(t *testing.T) {
 // exposed by WorkspaceAsk.
 func TestGetAllowedDirectivesAskExact(t *testing.T) {
 	got := names(Default().GetAllowedDirectives(WorkspaceAsk))
-	want := []string{"env", "prompt"}
+	want := []string{"env", "inspect", "prompt"}
 	if !equalStrings(got, want) {
 		t.Errorf("WorkspaceAsk directives = %v, want %v", got, want)
 	}
@@ -106,7 +106,7 @@ func TestGetAllowedDirectivesAskExact(t *testing.T) {
 // must return every registered directive.
 func TestGetAllowedDirectivesBuildReturnsAll(t *testing.T) {
 	got := names(Default().GetAllowedDirectives(WorkspaceBuild))
-	want := []string{"diagnose", "env", "fix", "hot", "log", "prompt", "run", "test", "trace"}
+	want := []string{"diagnose", "env", "fix", "hot", "inspect", "log", "prompt", "run", "test", "trace"}
 	if !equalStrings(got, want) {
 		t.Errorf("WorkspaceBuild directives = %v, want %v", got, want)
 	}
@@ -153,6 +153,7 @@ func TestLookup(t *testing.T) {
 		{MarkerSlash, "help", true},
 		{MarkerDollar, "hot", true},
 		{MarkerDollar, "test", true},
+		{MarkerDollar, "inspect", true},
 		{MarkerSlash, "hot", false}, // wrong marker family
 		{MarkerDollar, "build", false},
 		{MarkerSlash, "bogus", false},
@@ -355,7 +356,7 @@ func TestAllEnumeration(t *testing.T) {
 	if !equalStrings(globalNames, []string{"arch", "checkpoint", "clear", "commit", "drop", "explain-decision", "help", "model", "objective", "provider", "quit", "session", "undo", "usage"}) {
 		t.Errorf("global surface = %v", globalNames)
 	}
-	if !equalStrings(dollarNames, []string{"diagnose", "env", "fix", "hot", "log", "prompt", "run", "test", "trace"}) {
+	if !equalStrings(dollarNames, []string{"diagnose", "env", "fix", "hot", "inspect", "log", "prompt", "run", "test", "trace"}) {
 		t.Errorf("dollar surface = %v", dollarNames)
 	}
 }

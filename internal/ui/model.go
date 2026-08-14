@@ -1247,6 +1247,16 @@ type model struct {
 	// Never written from the renderer.
 	stage *execStage
 
+	// lastExecutionSnapshot is the retained telemetry snapshot of the most
+	// recently finalized foreground operation. It backs the debug/inspect
+	// execution-timeline view (see execution_telemetry.go). Written on the UI
+	// goroutine at finalization; read on the UI goroutine only.
+	lastExecutionSnapshot execution.TelemetrySnapshot
+	// lastExecutionTelemetry retains the finalized record itself so the
+	// inspect view can render live counters (invocations/retries) without
+	// re-folding the marker log. Nil until an operation completes.
+	lastExecutionTelemetry *execution.Telemetry
+
 	// Stream throttle — frame-bounded token emission
 	streamThrottle *StreamThrottle
 

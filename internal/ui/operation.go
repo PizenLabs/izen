@@ -7,6 +7,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/PizenLabs/izen/internal/execution"
 )
 
 // Foreground operation lifecycle.
@@ -101,6 +103,15 @@ type operation struct {
 	// The watchdog uses it to distinguish a genuine long-running worker from a
 	// stuck one. It is only updated on the UI goroutine (no data races).
 	LastProgress time.Time
+
+	// Telemetry is the authoritative per-operation execution record. It
+	// attributes wall-clock latency to real runtime stages (target, read,
+	// model/provider, patch, validate, apply) and to provider sub-phases
+	// (request → waiting → first-token → streaming → terminal). It is created
+	// at dispatch, fed from the stage boundaries the worker goroutines reach,
+	// and finalized at the operation terminal. It is never nil for a
+	// foreground operation. See internal/execution/telemetry.go.
+	Telemetry *execution.Telemetry
 }
 
 // running reports whether the operation is still owned by the runtime (not yet
@@ -146,6 +157,22 @@ func (m *model) beginOperation(kind OperationKind) *operation {
 		StartedAt:    time.Now(),
 		LastProgress: time.Now(),
 	}
+	// ── EXECUTION TELEMETRY (Phase 3) ────────────────────────────────
+	// Every foreground operation carries the authoritative execution record.
+	// It is fed from the real stage boundaries the worker goroutines reach
+	// (setStage / setStageMetrics) and finalized on the terminal outcome so
+	// stage timestamps never outlive the operation. The operation ID is the
+	// stable identity every telemetry event traces back to. The record is
+	// attached to the mutex-protected authoritative stage so workers publish
+	// into it race-safely without touching the UI-owned activeOp pointer.
+	op.Telemetry = execution.NewTelemetry(op.ID, string(kind))
+	op.Telemetry.Workers().Spawn("operation")
+	if m.stage == nil {
+		m.stage = &execStage{}
+	}
+	m.stage.mu.Lock()
+	m.stage.Telemetry = op.Telemetry
+	m.stage.mu.Unlock()
 	// A new operation supersedes any previous one (single-ownership rule).
 	if m.activeOp != nil {
 		m.activeOp.Cancel()
@@ -208,6 +235,16 @@ func (m *model) finalizeOperation(outcome OperationOutcome, err error) {
 		}
 		op.LastProgress = time.Now()
 		op.State = OpStateTerminal
+		// ── EXECUTION TELEMETRY TERMINALIZATION (Phase 3) ─────────────
+		// The authoritative execution record is closed with the operation's
+		// terminal outcome so no stage span can survive the operation. The
+		// retained snapshot backs the debug/inspect view.
+		if op.Telemetry != nil {
+			op.Telemetry.Workers().Release("operation")
+			op.Telemetry.Finalize(outcome.String())
+			m.lastExecutionSnapshot = op.Telemetry.Snapshot()
+			m.lastExecutionTelemetry = op.Telemetry
+		}
 		m.activeOp = nil
 	}
 	// The authoritative stage is terminalized alongside the operation so no

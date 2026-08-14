@@ -266,6 +266,14 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// the stream (the historical 108-token stall). The producer only touches
 	// the channel, the local buffer, and the captured `streamCh`/`cancel`.
 	go func() {
+		// ── WORKER LIFETIME (Phase 3) ────────────────────────────────
+		// The producer goroutine is a real worker of the current operation:
+		// register it so the terminal-lifecycle tests can prove it is released
+		// before the operation finalizes. A no-op for plain /ask streams that
+		// hold no operation.
+		m.spawnOpWorker("stream")
+		defer m.releaseOpWorker("stream")
+
 		defer func() {
 			if r := recover(); r != nil {
 				select {

@@ -1241,6 +1241,14 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		}
 
 		go func() {
+			// ── WORKER LIFETIME (Phase 3) ────────────────────────────────
+			// The plan-synthesis worker is registered against the active
+			// operation (when one exists) so no orphan worker can survive the
+			// operation's terminalization. A no-op for plan synthesis that
+			// holds no operation.
+			m.spawnOpWorker("plan")
+			defer m.releaseOpWorker("plan")
+
 			// ── PANIC GUARD ─────────────────────────────────────────────
 			// A panic inside the LLM plan synthesis (or the scope-guard
 			// retry) must still deliver an error outcome to outCh so the
@@ -2698,6 +2706,14 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 	streamCh := m.streamCh
 
 	go func() {
+		// ── WORKER LIFETIME (Phase 3) ────────────────────────────────
+		// The unified fast-track stream producer is a real worker of the build
+		// operation: register it so the terminal-lifecycle tests can prove it
+		// is released before the operation finalizes. A no-op when no
+		// operation is attached.
+		m.spawnOpWorker("fasttrack")
+		defer m.releaseOpWorker("fasttrack")
+
 		// Recover from any panic in the stream goroutine so a bad token
 		// chunk or streaming error never kills the Bubble Tea loop.
 		defer func() {
@@ -5348,7 +5364,14 @@ func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 			}
 		}
 
-		result, err := runner.Run(task.Target)
+		// ── CANCELLATION-COMPLETE SHELL EXECUTION ─────────────────────
+		// The subprocess runs under the active operation context so Ctrl+C /
+		// Esc cancel it through the context AND the global orphan-kill list.
+		// The shell stage is recorded as a real execution stage on the
+		// operation telemetry so its latency is attributed truthfully.
+		m.setStage("shell", task.Target, stageRunning)
+		result, err := runner.RunContext(m.operationContext(), task.Target)
+		m.setStage("shell", task.Target, stageDone)
 		output := ""
 		exitCode := 0
 		if result != nil {
@@ -5722,7 +5745,7 @@ func (m *model) runTestEngine(target string) tea.Cmd {
 		}
 		runner := execExecutionRunner(".")
 		cmd := "go test -v " + target
-		result, err := runner.Run(cmd)
+		result, err := runner.RunContext(m.operationContext(), cmd)
 		output := ""
 		passed := true
 		failedCount := 0
@@ -5804,7 +5827,7 @@ func (m *model) runBuildEngine(target string) tea.Cmd {
 		}
 		runner := execExecutionRunner(".")
 		cmd := "go build " + target
-		result, err := runner.Run(cmd)
+		result, err := runner.RunContext(m.operationContext(), cmd)
 		output := ""
 		exitCode := 0
 
@@ -5841,8 +5864,25 @@ type executionRunner struct {
 	root string
 }
 
+// Run executes a shell command under a plain background context (legacy). The
+// command is still registered for the global orphan-kill list so a Ctrl+C
+// hard interrupt can terminate it. Prefer RunContext when a caller holds a
+// cancellable operation context.
 func (r *executionRunner) Run(command string) (*executionRunResult, error) {
-	c := exec.CommandContext(context.Background(), "bash", "-c", command)
+	return r.RunContext(context.Background(), command)
+}
+
+// RunContext executes a shell command under ctx so a cancelled operation
+// context (Ctrl+C / Esc / mode transition) cancels the subprocess promptly via
+// the context in addition to the global orphan-kill list. It is the
+// cancellation-complete variant of Run.
+//
+//nolint:contextcheck // ctx is the caller-supplied cancellation scope, never a fresh one
+func (r *executionRunner) RunContext(ctx context.Context, command string) (*executionRunResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c := exec.CommandContext(ctx, "bash", "-c", command)
 	c.Dir = r.root
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
@@ -6187,7 +6227,7 @@ func (m *model) runLogCmd(traceData string) tea.Cmd {
 			runner := execExecutionRunner(".")
 			var output string
 			if traceData != "" {
-				out, err := runner.Run(traceData)
+				out, err := runner.RunContext(m.operationContext(), traceData)
 				if err != nil {
 					return logInputMsg{err: err}
 				}
@@ -6434,6 +6474,18 @@ func (m *model) cancelAllBackgroundContexts() {
 func (m *model) handleReviewDollar(line string) tea.Cmd {
 	action := strings.TrimSpace(line[1:])
 	mode := m.resolver.Current()
+
+	// ── $inspect — DETAILED EXECUTION TELEMETRY (Phase 3) ───────────────
+	// Renders the authoritative execution timeline of the most recently
+	// finalized foreground operation: every real stage (target, read, model,
+	// patch, validate, apply) with started/completed/elapsed, provider
+	// request→waiting→first-token→streaming→terminal attribution, invocation
+	// and retry counters, and live-worker tracking. This is execution
+	// telemetry, NEVER chain-of-thought. The normal UI stays compact; the
+	// detailed timeline lives behind this interaction only.
+	if action == "inspect" || strings.HasPrefix(action, "inspect ") {
+		return m.runInspectCmd(strings.TrimSpace(strings.TrimPrefix(action, "inspect")))
+	}
 
 	// ── $log — UNDER-THE-HOOD IMPLICIT PIPELINE ──────────────────────────
 	// $log evaluates a shell failure trace, fires the silent analysis pipeline
