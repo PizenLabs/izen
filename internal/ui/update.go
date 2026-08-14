@@ -1014,20 +1014,51 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, flush
 
 	case buildProposalReadyMsg:
+		// OPERATION LIFECYCLE: the build-patch generation operation (op begun
+		// in handleBuildRun) reaches its terminal outcome here — SUCCESS when a
+		// proposal is staged for approval, otherwise FAILURE / CANCELLED /
+		// TIMEOUT. finalizeBuildOperation is the single cleanup path: it
+		// releases ownership, cancels the operation context and stops the
+		// "Processing file mutations..." spinner so it can never outlive the
+		// patch-generation phase.
+		m.finalizeBuildOperation(msg.Err)
 		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.pipelineRunning = false
 		m.streaming = false
+		m.streamCancel = nil
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
 
 		// ── BUILD PROPOSAL FAILURE ───────────────────────────────────
 		if msg.Err != nil {
-			m.push(roleError, "patch generation failed: "+msg.Err.Error())
+			outcome, _ := classifyOpErrWithErr(msg.Err)
+			if outcome == OpOutcomeCancelled {
+				m.push(roleSystem, infoStyle.Render("[BUILD] Interrupted — patch generation cancelled. No files were modified."))
+			} else {
+				m.push(roleError, "patch generation failed: "+msg.Err.Error())
+			}
+			// Mark the current task terminal so the build queue can never
+			// remain frozen on a "processing" task after a failure. Prefer the
+			// driving task carried on the message; fall back to the task index
+			// handleBuildRun armed (retry-exhaustion failures do not always
+			// carry a Task). A cancelled generation returns the task to idle so
+			// the next command can re-submit it cleanly; a hard failure freezes
+			// the queue for inspection (existing behavior).
+			stepNum := 0
+			if msg.Task != nil {
+				stepNum = msg.Task.StepNum
+			} else {
+				stepNum = m.currentBuildTaskID
+			}
 			tasks := m.sess.CurrentTasks
 			for i := range tasks {
-				if msg.Task != nil && tasks[i].StepNum == msg.Task.StepNum {
-					tasks[i].Status = "failed"
+				if stepNum > 0 && tasks[i].StepNum == stepNum {
+					if outcome == OpOutcomeCancelled {
+						tasks[i].Status = "idle"
+					} else {
+						tasks[i].Status = "failed"
+					}
 					break
 				}
 			}
@@ -1866,6 +1897,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case mutationResultMsg:
+		// OPERATION LIFECYCLE: the zero-patch short-circuit returns
+		// mutationResultMsg directly from proposeBuildPatch (skipping
+		// buildProposalReadyMsg), so the build-patch operation begun in
+		// handleBuildRun must be finalized here too. On the normal apply path
+		// the operation was already finalized at proposal-ready — this is an
+		// idempotent no-op.
+		m.finalizeBuildOperation(msg.err)
 		if msg.err != nil {
 			m.setApplyError("apply failed: " + msg.err.Error())
 		} else {
@@ -1989,6 +2027,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, flush
 
 	case applyAllResultMsg:
+		// OPERATION LIFECYCLE: the apply-all batch operation (begun in
+		// applyAllProposals) reaches its terminal outcome here. finalizeBuildOperation
+		// releases ownership and stops the "Processing file mutations..."
+		// spinner; idempotent when the operation was already finalized.
+		m.finalizeBuildOperation(nil)
 		applied := 0
 		failed := 0
 		for _, r := range msg.results {
@@ -2843,6 +2886,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, m.thoughtUpdateCmd("", true)
 
 	case streamErrMsg:
+		// OPERATION LIFECYCLE: a stream error must release any in-flight
+		// build-patch operation (defensive; streams normally run without one).
+		m.finalizeBuildOperation(msg.err)
 		m.streamCh = nil
 		m.streaming = false
 		m.streamParser = nil
@@ -2940,6 +2986,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, m.readStream()
 
 	case buildFailedMsg:
+		// OPERATION LIFECYCLE: a failed fast-track stream must release any
+		// in-flight build-patch operation (defensive; the fast-track path is
+		// streaming-based and normally holds no operation).
+		m.finalizeBuildOperation(msg.Err)
 		// Guaranteed cleanup from stream defer: spinner stops, pipeline resets.
 		m.streamCh = nil
 		m.streaming = false

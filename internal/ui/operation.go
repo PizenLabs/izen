@@ -219,6 +219,22 @@ func (m *model) touchOperationProgress() {
 	}
 }
 
+// finalizeBuildOperation finalizes the active build-patch operation (OpBuild)
+// if one is in flight. It is the single terminal cleanup path for the legacy
+// per-task FILE_MUTATE / GIT_ACTION patch-generation path: the operation begun
+// in handleBuildRun is released here on EVERY terminal message — proposal
+// ready, failure, cancellation, or the zero-patch short-circuit — so the
+// "Processing file mutations..." spinner can never survive the generation
+// phase. It is idempotent: when the operation was already finalized (e.g.
+// superseded by a Ctrl+C cancellation), it is a no-op. err is classified into
+// SUCCESS / CANCELLED / TIMEOUT / FAILURE exactly like every other worker.
+func (m *model) finalizeBuildOperation(err error) {
+	if m.activeOp != nil && m.activeOp.Kind == OpBuild {
+		outcome, outErr := classifyOpErrWithErr(err)
+		m.finalizeOperation(outcome, outErr)
+	}
+}
+
 // cancelActiveOperation gracefully cancels the active foreground operation and
 // runs the universal emergency reset. It is the Ctrl+C / Esc / OS-signal
 // cancellation entry point.

@@ -886,12 +886,16 @@ const hotfixApplyTimeout = 30 * time.Second
 // the strict 30s patch-apply deadline so a wedged filesystem or git operation
 // can never freeze the TUI spinner on ANY file-write / patch-application path
 // (hotfix apply, single/all proposal apply, trivial template, shell-mutation).
+// The context is derived from the active operation so a Ctrl+C during the
+// apply cancels it immediately (ApplyContext's select observes ctx.Done() and
+// returns ErrPatchApplyTimeout); when no operation is active (deterministic
+// branches) it degrades to a plain background parent with the 30s ceiling.
 // A nil engine degrades to a clean error carrying a terminal message.
 func (m *model) applyPatchWithDeadline(patch *execution.Patch) error {
 	if m.execEng == nil || m.execEng.Patches == nil {
 		return fmt.Errorf("execution engine not configured")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), hotfixApplyTimeout)
+	ctx, cancel := context.WithTimeout(m.operationContext(), hotfixApplyTimeout)
 	defer cancel()
 	return m.execEng.Patches.ApplyContext(ctx, patch)
 }
@@ -2708,8 +2712,16 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			m.streaming = false
 		}()
 
-		ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
+		// The operation context is the cancellation parent: a Ctrl+C during a
+		// fast-track stream cancels the provider request immediately. The
+		// per-call deadline bounds a single unified build generation. The
+		// cancel is ALSO published as m.streamCancel so the Ctrl+C emergency
+		// interrupt (handleEmergencyInterrupt) and the stale-agent release
+		// (cancelStaleAgentOps) can terminate a stalled stream directly — the
+		// fast-track path is streaming-based and holds no discrete operation.
+		ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
 		defer cancel()
+		m.streamCancel = cancel
 
 		rawStream, err := m.provider.ExecuteStream(ctx, req)
 		if err != nil {
@@ -2787,6 +2799,20 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		runeBuf := stream.NewRuneBuffer()
 
 		for {
+			// BOUNDED STREAM READ: a stalled provider stream (no bytes, no EOF)
+			// must never block the execution pipeline forever. When the request
+			// context is cancelled (Ctrl+C) or its deadline expires, net/http
+			// closes the underlying connection so the blocked Read below fails
+			// promptly; this pre-read check releases the loop immediately even
+			// for a provider reader that swallows the connection close.
+			if cerr := ctx.Err(); cerr != nil {
+				tokIn, tokOut := streamUsage()
+				select {
+				case streamCh <- streamErrMsg{err: cerr, content: fullContent.String(), tokenInput: tokIn, tokenOutput: tokOut}:
+				default:
+				}
+				return
+			}
 			n, err := rawStream.Read(readBuf)
 			if n > 0 {
 				buf.WriteString(runeBuf.Write(readBuf[:n]))
@@ -4374,7 +4400,11 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				Reasoning: m.effortFromTasks(),
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
+			// The operation context is the cancellation parent: a Ctrl+C during
+			// patch generation cancels the provider request immediately (the
+			// "Processing file mutations..." spinner can never outlive it). The
+			// per-call deadline bounds a single provider invocation.
+			ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
 			resp, err := m.provider.Execute(ctx, req)
 			cancel()
 			if err != nil {
@@ -4593,7 +4623,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				Messages:  []ai.Message{{Role: "user", Content: fullRewriteHandoff}},
 				Reasoning: m.effortFromTasks(),
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
+			ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
 			fullResp, fullErr := m.provider.Execute(ctx, fullRewriteReq)
 			cancel()
 			if fullErr == nil && fullResp != nil && strings.TrimSpace(fullResp.Content) != "" {
@@ -4916,7 +4946,7 @@ func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
 			Reasoning: m.effortFromTasks(),
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
+		ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
 		resp, err := m.provider.Execute(ctx, req)
 		cancel()
 		if err != nil {
@@ -5476,6 +5506,22 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// non-streaming call and returned as buildProposalReadyMsg, which freezes
 	// the pipeline in StateAwaitingApproval and renders a unified diff for
 	// explicit authorization (Alt+A / Alt+L / Alt+R).
+	//
+	// OPERATION LIFECYCLE: every provider-invoking branch below registers the
+	// execution as the single authoritative foreground operation (OpBuild) on
+	// the UI goroutine BEFORE the patch-generation command is dispatched. This
+	// (1) gives Ctrl+C a single cancellation handle into the provider call —
+	// proposeBuildPatch / proposeHybridTemplatePatch derive their request
+	// context from m.operationContext(), so handleEmergencyInterrupt's
+	// activeOp.Cancel() releases the blocked HTTP call immediately instead of
+	// leaving the UI stuck on "Processing file mutations" until the 5-minute
+	// buildGenerationTimeout expires — and (2) enforces single-ownership: a
+	// duplicate dispatch supersedes (cancels) any previous build operation
+	// rather than running two overlapping execution loops. The operation is
+	// finalized by the terminal buildProposalReadyMsg / mutationResultMsg
+	// handlers via finalizeBuildOperation. The deterministic branches below
+	// (trivial template, stdlib fix) perform zero provider work and run under
+	// their own strict apply deadline, so they need no operation.
 	if targetTask.Type == "FILE_MUTATE" || targetTask.Type == "GIT_ACTION" {
 		// ── TRIVIAL TEMPLATE CREATE (local generation, 0 cloud tokens) ─
 		// If the task targets a trivial template file (LICENSE, .gitignore,
@@ -5485,6 +5531,7 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 		// calls, zero cloud tokens consumed.
 		if targetTask.IsHardcoded && gateway.IsTrivialCreateTarget(targetTask.Target) {
 			if hasCustomizationDirectives(targetTask.Description) {
+				m.beginOperation(OpBuild)
 				return tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "hybrid template"} },
 					m.proposeHybridTemplatePatch(targetTask),
@@ -5511,6 +5558,7 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 				m.smoothStreamTickCmd(),
 			)
 		}
+		m.beginOperation(OpBuild)
 		return tea.Batch(
 			func() tea.Msg { return agentStartMsg{label: "patching"} },
 			m.proposeBuildPatch(targetTask),
@@ -6768,8 +6816,11 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 				return agentDoneMsg{}
 			}
 
-			// Run the diagnosis through the unified client router.
-			resp, err := m.provider.Execute(context.Background(), ai.Request{
+			// Run the diagnosis through the unified client router. Bounded by
+			// the operation context + generation deadline so a hung provider can
+			// never freeze the /investigate $diagnose spinner.
+			ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
+			resp, err := m.provider.Execute(ctx, ai.Request{
 				Model: m.routeModel("investigate"),
 				Messages: []ai.Message{
 					{Role: "user", Content: string(logData)},
@@ -6777,6 +6828,7 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 				Stream: false,
 				System: providers.DiagnoseSystemPrompt,
 			})
+			cancel()
 			if err != nil {
 				m.push(roleError, fmt.Sprintf("[System Error] Diagnosis failed: %v", err))
 				m.refreshViewportContent()
@@ -6849,7 +6901,11 @@ func (m *model) runAskPromptHandoffCmd(rawInput string) tea.Cmd {
 				System: systemPrompt,
 			}
 
-			resp, err := m.provider.Execute(context.Background(), req)
+			// The $prompt refinement is bounded by the operation context +
+			// generation deadline so a hung provider can never freeze the spinner.
+			ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
+			resp, err := m.provider.Execute(ctx, req)
+			cancel()
 			if err != nil {
 				return promptHandoffMsg{err: fmt.Errorf("prompt synthesis failed: %w", err)}
 			}

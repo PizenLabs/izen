@@ -759,7 +759,9 @@ func (m *model) runCommitCmdAgent(userMsg string) tea.Cmd {
 					Messages: msgs,
 					Stream:   false,
 				}
-				resp, err := m.provider.Execute(context.Background(), req)
+				ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
+				resp, err := m.provider.Execute(ctx, req)
+				cancel()
 				if err != nil {
 					return commitGeneratedMsg{err: fmt.Errorf("LLM call failed: %w", err)}
 				}

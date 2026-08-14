@@ -242,7 +242,13 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// The request context is derived from the active operation (when one is
+	// registered, e.g. a build-context stream) so Ctrl+C cancels the provider
+	// stream; otherwise it falls back to a plain background parent and only the
+	// 5-minute ceiling applies. m.streamCancel is the handle
+	// handleEmergencyInterrupt and cancelStaleAgentOps already invoke to tear
+	// the stream down.
+	ctx, cancel := context.WithTimeout(m.operationContext(), 5*time.Minute)
 	m.streamCancel = cancel
 
 	// STREAM CONSUMER CONTRACT (deadlock-free):

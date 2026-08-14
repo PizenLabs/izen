@@ -403,6 +403,12 @@ func (m *model) applySingleProposal() tea.Cmd {
 	p := m.pendingProposals[0]
 	m.state = StateProcessing
 	m.recalcViewportHeight()
+	// OPERATION LIFECYCLE: register the apply as the single authoritative
+	// foreground operation so Ctrl+C during the disk mutation cancels the
+	// patch-apply context (applyPatchWithDeadline derives from
+	// operationContext) and the terminal mutationResultMsg handler finalizes it
+	// via finalizeBuildOperation.
+	m.beginOperation(OpBuild)
 	return m.applyProposalCmd(p)
 }
 
@@ -499,6 +505,10 @@ func (m *model) applyAllProposals() tea.Cmd {
 	m.state = StateProcessing
 	m.recalcViewportHeight()
 	m.acceptAll = true
+	// OPERATION LIFECYCLE: register the apply-all batch as the single
+	// authoritative foreground operation (see applySingleProposal). The
+	// terminal applyAllResultMsg handler finalizes it.
+	m.beginOperation(OpBuild)
 	return m.applyAllProposalsCmd()
 }
 
