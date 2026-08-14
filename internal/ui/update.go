@@ -483,20 +483,6 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// dispatch batch did not include it (e.g. $log trace analysis).
 		return m, m.shimmerTickCmd()
 
-	case hotfixProgressMsg:
-		// Stream a $hot lifecycle log line to the terminal so the developer
-		// sees active progress while the LLM generates the patch. Only accept
-		// lines while the hotfix is still generating (the proposal/error
-		// message clears these flags), preventing stale trailing logs from
-		// polluting the approval view.
-		if m.agentRunning && m.agentLabel == "hotfix" {
-			m.touchOperationProgress()
-			m.push(roleActivity, msg.Line)
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-		}
-		return m, nil
-
 	case agentDoneMsg:
 		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
@@ -2337,6 +2323,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg == "" {
 			return m, m.readStream()
 		}
+		// ── AUTHORITATIVE STAGE: provider bytes are arriving ────────
+		// Reasoning tokens are real provider output — the indicator becomes
+		// "streaming" (never "thinking"), without exposing the reasoning text.
+		m.setStage("model", m.getActiveModelName(), stageStreaming)
+		m.setStageMetrics(0, 0, len(m.responseBuffer.String())/4+1)
 		m.ensureStreamBlocks().Append(KindThinking, string(msg))
 		// Full stream transparency: the reasoning chunk is also retained in the
 		// active ThinkingBuffer via the ThoughtBufferUpdatedMsg protocol so the
@@ -2369,6 +2360,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.stopShimmer()
 		}
 		m.responseBuffer.WriteString(raw)
+		// ── AUTHORITATIVE STAGE: real provider tokens are arriving ──
+		// Only content bytes received from the provider mark the stage as
+		// streaming; the token count tracks the real response buffer.
+		if raw != "" {
+			m.setStage("model", m.getActiveModelName(), stageStreaming)
+			m.setStageMetrics(0, 0, len(m.responseBuffer.String())/4+1)
+		}
 		m.traceBuffer.WriteString(raw)
 		if m.streamThrottle != nil {
 			m.streamThrottle.Write(raw)
@@ -2395,6 +2393,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case streamDoneMsg:
+		// ── AUTHORITATIVE STAGE: provider stream completed ─────────
+		// A terminal stream is done; the stage can never linger as "streaming".
+		m.setStage("model", m.getActiveModelName(), stageDone)
 		m.streamCh = nil
 		m.streaming = false
 		m.streamCancel = nil
@@ -2889,6 +2890,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// OPERATION LIFECYCLE: a stream error must release any in-flight
 		// build-patch operation (defensive; streams normally run without one).
 		m.finalizeBuildOperation(msg.err)
+		// ── AUTHORITATIVE STAGE: provider stream failed ─────────────
+		// A terminal stream failure marks the stage failed so no "waiting" /
+		// "streaming" indicator can survive the error.
+		m.setStage("model", m.getActiveModelName(), stageFailed)
 		m.streamCh = nil
 		m.streaming = false
 		m.streamParser = nil

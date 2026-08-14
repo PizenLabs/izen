@@ -454,14 +454,6 @@ type hotfixAmbiguousData struct {
 	Candidates []hotfix.Target
 }
 
-// hotfixProgressMsg streams a lifecycle log line to the terminal while the
-// $hot patch is being generated in the background. It is delivered through the
-// Bubble Tea event loop (never from the background goroutine) so the spinner
-// stays alive and the developer sees active progress instead of a frozen pane.
-type hotfixProgressMsg struct {
-	Line string
-}
-
 type fixResultMsg struct {
 	content string
 	err     error
@@ -1248,6 +1240,12 @@ type model struct {
 
 	// Activity tree — structured tool call logging
 	activityTree *ActivityTree
+
+	// Authoritative execution-stage record — the single source of truth for
+	// "what is the runtime doing right now". Every progress indicator derives
+	// from it; it is updated ONLY at real execution boundaries (see stage.go).
+	// Never written from the renderer.
+	stage *execStage
 
 	// Stream throttle — frame-bounded token emission
 	streamThrottle *StreamThrottle

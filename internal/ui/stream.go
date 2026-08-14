@@ -98,7 +98,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streamCh = make(chan tea.Msg, 1024)
 	m.streaming = true
 	m.spinnerFrame = 0
-	m.startShimmer("Thinking...", "analyze")
+	// TRUTHFUL PROVIDER STATUS: the loading dock derives its indicator from
+	// the authoritative stage — a provider round-trip before the first byte
+	// renders as "Model ● waiting", never as "Thinking...".
+	m.startShimmer("Waiting for model...", "analyze")
+	m.setStage("model", m.cfg.ActiveModelName(), stageWaiting)
 	m.responseBuffer.Reset()
 	m.reasoningBuffer.Reset()
 	m.traceBuffer.Reset()

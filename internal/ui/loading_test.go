@@ -103,18 +103,16 @@ func TestRenderLoadingDockInactive(t *testing.T) {
 // renderLoadingDock must strip any stray escape sequence before the sweep.
 func TestLoadingDockNoANSILeak(t *testing.T) {
 	m := newTestModel()
-	m.startShimmer("Synthesizing plan...", "plan")
-	m.thinkingBuffer = NewThinkingBuffer()
-	m.thinkingBuffer.Append("analyzing code structure")
+	m.startShimmer("Waiting for model...", "analyze")
+	m.setStage("model", "qwen2.5-coder:7b", stageWaiting)
 
-	// The sweep text must be plain — zero escape sequences — while still
-	// carrying the expand hint.
+	// The sweep text must be plain — zero escape sequences.
 	got := m.composeDockTextWithFlake("✻")
 	if strings.Contains(got, "\x1b") {
 		t.Fatalf("dock sweep text contains raw ANSI: %q", got)
 	}
-	if !strings.Contains(got, "[Ctrl+O to expand]") {
-		t.Fatalf("dock thinking line missing expand hint: %q", got)
+	if !strings.Contains(got, "waiting") {
+		t.Fatalf("dock missing the truthful waiting state: %q", got)
 	}
 
 	// The rendered dock must never leak bare SGR parameters as literal text.
@@ -329,36 +327,52 @@ func TestComposeDockTextStatic(t *testing.T) {
 	}
 }
 
-func TestComposeDockTextThinking(t *testing.T) {
+func TestComposeDockTextProviderWaiting(t *testing.T) {
 	m := newTestModel()
-	m.startShimmer("Thinking...", "analyze")
-	m.thinkingBuffer = NewThinkingBuffer()
-	m.thinkingBuffer.Append("analyzing code structure")
+	m.startShimmer("Waiting for model...", "analyze")
+	m.setStage("model", "qwen2.5-coder:7b", stageWaiting)
 
 	got := m.composeDockText()
 	if !strings.Contains(got, "✻") {
 		t.Errorf("composeDockText missing snowflake: %q", got)
 	}
-	if !strings.Contains(got, "Thinking...") {
-		t.Errorf("composeDockText missing thinking text: %q", got)
+	// The provider wait must render as a truthful waiting state with an
+	// elapsed time — never as "Thinking...".
+	if !strings.Contains(got, "waiting") {
+		t.Errorf("composeDockText missing waiting state: %q", got)
 	}
-	// Elapsed time should be present
-	if !strings.Contains(got, "s)") {
-		t.Errorf("composeDockText missing elapsed time: %q", got)
+	if strings.Contains(got, "Thinking") {
+		t.Errorf("composeDockText claims the model is thinking: %q", got)
 	}
 }
 
-func TestComposeDockTextThinkingComplete(t *testing.T) {
+func TestComposeDockTextProviderStreaming(t *testing.T) {
 	m := newTestModel()
-	m.startShimmer("Thinking...", "analyze")
-	m.thinkingBuffer = NewThinkingBuffer()
-	m.thinkingBuffer.Append("done reasoning")
-	m.thinkingBuffer.MarkComplete()
+	m.startShimmer("Executing strategy...", "execute")
+	m.setStage("model", "qwen2.5-coder:7b", stageStreaming)
+	m.setStageMetrics(0, 0, 921)
 
 	got := m.composeDockText()
-	// When thinking is complete, should fall back to static shimmer text
-	if !strings.Contains(got, "✻ Thinking...") {
-		t.Errorf("composeDockText should use static text after thinking complete: %q", got)
+	if !strings.Contains(got, "streaming") {
+		t.Errorf("composeDockText missing streaming state: %q", got)
+	}
+	if !strings.Contains(got, "921") {
+		t.Errorf("composeDockText missing real token count: %q", got)
+	}
+}
+
+func TestComposeDockTextNoFabricatedStage(t *testing.T) {
+	// No execution event has occurred — the dock must fall back to the
+	// caller-supplied shimmer text and MUST NOT fabricate a stage.
+	m := newTestModel()
+	m.startShimmer("Executing strategy...", "execute")
+
+	got := m.composeDockText()
+	if !strings.Contains(got, "Executing strategy...") {
+		t.Errorf("composeDockText missing shimmer fallback: %q", got)
+	}
+	if strings.Contains(got, "waiting") || strings.Contains(got, "streaming") {
+		t.Errorf("composeDockText fabricated a provider stage with no execution event: %q", got)
 	}
 }
 
@@ -370,13 +384,11 @@ func TestComposeDockTextFallback(t *testing.T) {
 	}
 }
 
-// TestLoadingDockSingleSourceNoDuplicateThinking guards the single-source-of-
-// truth lifecycle: while the bottom loading dock is active the viewport body
-// must show EXACTLY ONE thinking indicator (the dock's "✻ Thinking... (Xs)"
-// line) — the collapsed inline one-liner is suppressed so the user never sees
-// two stacked "Thinking…" lines. On the first content token the dock hands off
-// cleanly and the inline indicator becomes the sole thinking line.
-func TestLoadingDockSingleSourceNoDuplicateThinking(t *testing.T) {
+// TestLoadingDockTruthfulNoThinking guards execution-truthful progress: while
+// the loading dock is live the viewport MUST NOT render any "Thinking..." claim
+// — the dock derives its status from the authoritative execution stage, and the
+// reasoning drawer only appears after the dock hands off to streaming.
+func TestLoadingDockTruthfulNoThinking(t *testing.T) {
 	m := newTestModel()
 	m.state = StateChat
 	m.streaming = true
@@ -392,12 +404,13 @@ func TestLoadingDockSingleSourceNoDuplicateThinking(t *testing.T) {
 	if !strings.Contains(dockView, "Tip:") {
 		t.Fatalf("dock-active view missing the tip line: %q", dockView)
 	}
-	if n := strings.Count(stripANSITest(dockView), "Thinking"); n != 1 {
-		t.Fatalf("dock-active view shows %d thinking lines, want exactly 1 (dock only, no ghost inline duplicate): %q", n, dockView)
+	// No "Thinking..." progress claim while the dock is live.
+	if n := strings.Count(stripANSITest(dockView), "Thinking"); n != 0 {
+		t.Fatalf("dock-active view shows %d fake Thinking lines, want 0 (progress must be truthful): %q", n, dockView)
 	}
 
-	// First primary content token → dock hands off; inline thinking is the
-	// sole live indicator now.
+	// Hand off to streaming: the reasoning drawer becomes the sole thinking
+	// line (explicit inspection, not a progress claim).
 	m.stopShimmer()
 	m.refreshViewportContent()
 	streamView := m.Viewport.View()
@@ -406,7 +419,7 @@ func TestLoadingDockSingleSourceNoDuplicateThinking(t *testing.T) {
 		t.Fatalf("dock must disappear cleanly on first token: %q", streamView)
 	}
 	if n := strings.Count(stripANSITest(streamView), "Thinking"); n != 1 {
-		t.Fatalf("handoff view shows %d thinking lines, want exactly 1 (inline only): %q", n, streamView)
+		t.Fatalf("handoff view shows %d thinking lines, want exactly 1 (inline drawer only): %q", n, streamView)
 	}
 }
 

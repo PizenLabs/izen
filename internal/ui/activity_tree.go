@@ -47,6 +47,10 @@ type FileReadEvent struct {
 	File    string
 	Bytes   int64
 	Elapsed time.Duration
+	// Retry distinguishes a REAL re-read of the same file during a retry cycle
+	// from a fresh read — the renderer labels it "(retry N)" so repeated disk
+	// work is visible as such instead of masquerading as duplicate fresh reads.
+	Retry int
 }
 
 type FileMutateEvent struct {
@@ -95,6 +99,22 @@ func NewFileReadEvent(file string, bytes int64, elapsed time.Duration) EngineEve
 			File:    file,
 			Bytes:   bytes,
 			Elapsed: elapsed,
+		},
+	}
+}
+
+// NewFileReadEventRetry records a REAL repeated read of the same file during a
+// retry cycle (attempt > 0). The retry count is surfaced so the activity tree
+// distinguishes genuine repeated disk reads from UI duplication.
+func NewFileReadEventRetry(file string, bytes int64, elapsed time.Duration, retry int) EngineEvent {
+	return EngineEvent{
+		Kind: EventFileRead,
+		Time: time.Now(),
+		FileRead: &FileReadEvent{
+			File:    file,
+			Bytes:   bytes,
+			Elapsed: elapsed,
+			Retry:   retry,
 		},
 	}
 }
@@ -395,9 +415,19 @@ func (at *ActivityTree) renderEvent(ev EngineEvent, width int, running bool, fra
 			return ""
 		}
 		elapsed := formatElapsed(e.Elapsed)
-		return fmt.Sprintf("%s%s (%d B · %s) %s",
+		label := truncateMiddle(e.File, contentW)
+		// A retry is a REAL repeated read — surfaced explicitly so repeated
+		// disk work is never mistaken for duplicate fresh reads.
+		if e.Retry > 0 {
+			label += " " + dimmedStyle.Render(fmt.Sprintf("(retry %d)", e.Retry))
+		}
+		bytes := fmt.Sprintf("%d B", e.Bytes)
+		if e.Bytes >= 1024 {
+			bytes = fmt.Sprintf("%.1f KB", float64(e.Bytes)/1024)
+		}
+		return fmt.Sprintf("%s%s (%s · %s) %s",
 			prefix(IconRead(), stageLabel(ev.Kind), blueStyle),
-			truncateMiddle(e.File, contentW), e.Bytes, mutedStyle.Render(elapsed), stageBadge(statusOf(running, false), spinnerFrame))
+			label, bytes, mutedStyle.Render(elapsed), stageBadge(statusOf(running, false), spinnerFrame))
 
 	case EventFileMutate:
 		e := ev.FileMutate

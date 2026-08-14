@@ -116,7 +116,7 @@ func (m *model) selectHotfixCandidate(n int) (tea.Model, tea.Cmd) {
 	m.lastAgentActivity = time.Now()
 	m.startShimmer("Applying hotfix...", "execute")
 	m.push(roleStatus, fmt.Sprintf("[HOTFIX] Target set to candidate %d — generating patch for %s", n, amb.Task.Target))
-	m.push(roleSystem, fmt.Sprintf("  ⚙ Thinking... (Invoking %s)", m.activeRouteModel()))
+	m.push(roleSystem, fmt.Sprintf("  ⚙ Invoking %s...", m.activeRouteModel()))
 
 	return m, tea.Batch(
 		func() tea.Msg { return agentStartMsg{label: "hotfix"} },

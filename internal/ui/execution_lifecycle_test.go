@@ -45,6 +45,7 @@ func buildRunModel(t *testing.T, provider ai.Provider, tasks []plan.Task, fileCo
 	m.provider = provider
 	m.caps = capability.NewCapabilitySet()
 	m.execEng = execution.NewEngine(".", m.cfg, m.sess)
+	m.activityTree = NewActivityTree()
 	m.sess.StageTaskList(&tasks)
 	driveIntoBuildPhase(t, m)
 	m.ti.Focus()
@@ -74,7 +75,7 @@ func runBuildCmdsFiltered(t *testing.T, c tea.Cmd) []tea.Msg {
 			continue
 		}
 		switch msg.(type) {
-		case smoothStreamTickMsg, tickMsg, shimmerFrameMsg, hotfixProgressMsg,
+		case smoothStreamTickMsg, tickMsg, shimmerFrameMsg,
 			watchdogMsg, spinnerTickMsg, proTipTickMsg:
 			continue
 		}
@@ -106,7 +107,7 @@ func runBuildCmdsFilteredBackground(c tea.Cmd) <-chan tea.Msg {
 				continue
 			}
 			switch msg.(type) {
-			case smoothStreamTickMsg, tickMsg, shimmerFrameMsg, hotfixProgressMsg,
+			case smoothStreamTickMsg, tickMsg, shimmerFrameMsg,
 				watchdogMsg, spinnerTickMsg, proTipTickMsg:
 				continue
 			}

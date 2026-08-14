@@ -164,6 +164,10 @@ func (m *model) beginOperation(kind OperationKind) *operation {
 	m.lastSpinnerAdvance = time.Time{}
 	m.lastAgentActivity = time.Now()
 	m.lastActionTime = time.Now()
+	// Start the authoritative execution stage for the new operation. The
+	// progress UI derives its indicator from this stage — never from a
+	// fabricated label.
+	m.resetStage(kind)
 	m.syncUIState()
 	return op
 }
@@ -206,17 +210,12 @@ func (m *model) finalizeOperation(outcome OperationOutcome, err error) {
 		op.State = OpStateTerminal
 		m.activeOp = nil
 	}
+	// The authoritative stage is terminalized alongside the operation so no
+	// progress indicator can survive the operation that produced it.
+	m.finishStage(outcome)
 	m.clearBusyFlags()
 	m.stopShimmer()
 	m.syncUIState()
-}
-
-// touchOperationProgress records meaningful runtime progress on the active
-// operation. It MUST only be called from the UI goroutine (no data races).
-func (m *model) touchOperationProgress() {
-	if m.activeOp != nil {
-		m.activeOp.LastProgress = time.Now()
-	}
 }
 
 // finalizeBuildOperation finalizes the active build-patch operation (OpBuild)

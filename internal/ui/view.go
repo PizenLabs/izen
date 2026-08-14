@@ -303,9 +303,17 @@ func (m *model) renderProposalBlock() string {
 		b.WriteString(m.renderHotfixAmbiguousBlock(width))
 
 	case StateProcessing:
+		// ── Truthful in-flight mutation dock ───────────────────────
+		// Derived from the authoritative execution stage: the dock shows what
+		// the runtime is ACTUALLY doing (apply/patch/model), never the generic
+		// "Processing file mutations..." claim.
 		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
 		sp := SpinnerStyle.Render(frame)
-		b.WriteString("  " + sp + " " + infoStyle.Render("Processing file mutations... Please wait."))
+		stageLine := m.renderStageLine()
+		if stageLine == "" {
+			stageLine = "Applying mutation..."
+		}
+		b.WriteString("  " + sp + " " + infoStyle.Render(stageLine))
 		if len(m.pendingProposals) > 0 {
 			b.WriteString(" " + tracerStyle.Render(m.pendingProposals[0].Target.QualifiedName))
 		}
@@ -716,8 +724,12 @@ func (m *model) renderRuntimeStatus(width int) string {
 	}
 	b.WriteByte(' ')
 
-	// AI INTERRUPT ENGINE: high-visibility indicator when streaming
-	if m.streaming || m.shellRunning {
+	// AI INTERRUPT ENGINE: high-visibility indicator that Ctrl+C is available
+	// while ANY execution operation is in flight (streaming, provider wait,
+	// agent run, patch generation, shell). Cancellation must be discoverable,
+	// not implied.
+	if m.streaming || m.shellRunning || m.agentRunning || m.reviewRunning ||
+		m.pipelineRunning || m.planPending || m.activeOp != nil {
 		b.WriteString(interruptLabelStyle.Render(Icon.Interrupt + " Ctrl+C interrupt "))
 	}
 

@@ -414,6 +414,11 @@ func (m *model) applySingleProposal() tea.Cmd {
 
 func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 	return func() (msg tea.Msg) {
+		// ── AUTHORITATIVE STAGE: mutation apply ─────────────────────
+		// The disk mutation is a real local stage; its target is the file the
+		// proposal will write. The terminal mutationResultMsg handler finalizes
+		// the stage together with the apply operation.
+		m.setStage("apply", p.Target.QualifiedName, stageRunning)
 		// Never let a panic in patch application crash the TUI. Recover, log
 		// the trace internally, and surface a user-friendly status-bar error.
 		defer func() {
@@ -516,6 +521,10 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 	proposals := make([]SemanticProposal, len(m.pendingProposals))
 	copy(proposals, m.pendingProposals)
 	return func() (msg tea.Msg) {
+		// ── AUTHORITATIVE STAGE: batch mutation apply ────────────────
+		if len(proposals) > 0 {
+			m.setStage("apply", proposals[0].Target.QualifiedName, stageRunning)
+		}
 		var results []mutationResultMsg
 		// Never let a panic in patch application crash the TUI. Recover, log
 		// the trace internally, and surface a user-friendly status-bar error
