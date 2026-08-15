@@ -533,6 +533,36 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// ── MULTI-FILE $hot APPROVAL GATE (Phase 9B) ──────────────────
+		// A multi-file hotfix stages N proposals under ONE graph + ONE
+		// MutationSet. Approve (Alt+A/Enter) applies ALL nodes in graph order
+		// under that single boundary — never one commit per file. Reject
+		// (Alt+R/Esc) aborts with zero mutation.
+		if m.pendingHotfixGraph != nil {
+			switch {
+			case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
+				graph := m.pendingHotfixGraph
+				m.pendingHotfixGraph = nil
+				m.pendingProposals = nil
+				m.resolveApprovalState()
+				m.ti.Focus()
+				m.recalcViewportHeight()
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				m.push(roleSystem, infoStyle.Render(
+					fmt.Sprintf("  "+Icon.Success+" Approved — applying multi-file hotfix to %d files...", len(graph.Nodes))))
+				return m, tea.Batch(
+					func() tea.Msg { return agentStartMsg{label: "multi-hotfix apply"} },
+					m.applyMultiHotfixGraph(graph),
+					m.smoothStreamTickCmd(),
+				)
+			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
+				m.rejectMultiHotfix()
+				return m, nil
+			}
+			return m, nil
+		}
+
 		// ── Build approval (SHELL_EXEC permission box) ──────────────
 		if m.pendingBuildApproval && m.pendingBuildTask != nil {
 			task := m.pendingBuildTask

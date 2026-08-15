@@ -60,6 +60,16 @@ func (m *model) runInspectCmd(filter string) tea.Cmd {
 				m.push(roleSystem, mutedStyle.Render(line))
 			}
 		}
+		// ── MULTI-FILE EXECUTION GRAPH (Phase 9B) ────────────────────
+		// The aggregate graph — one user intent → one graph → one MutationSet
+		// → one terminal outcome — with per-node evidence. Only rendered when a
+		// multi-file graph was executed; the single-file path stays unchanged.
+		if m.lastExecutionGraph != nil {
+			m.push(roleSystem, mutedStyle.Render(""))
+			for _, line := range strings.Split(strings.TrimRight(renderExecutionGraph(m.lastExecutionGraph), "\n"), "\n") {
+				m.push(roleSystem, mutedStyle.Render(line))
+			}
+		}
 		m.push(roleSystem, mutedStyle.Render("  — execution metadata only; model reasoning is never exposed."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -93,4 +103,43 @@ func renderInspectTimeline(snap execution.TelemetrySnapshot, filter string) stri
 		filtered.Providers = snap.Providers
 	}
 	return filtered.RenderTimeline()
+}
+
+// renderExecutionGraph renders the aggregate multi-file execution graph for
+// $inspect: the graph state, the single MutationSet terminal state, the
+// invocation count, and every node's semantic evidence. It carries no model
+// reasoning.
+func renderExecutionGraph(g *execution.ExecutionGraph) string {
+	if g == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("graph:")
+	if g.ID != "" {
+		b.WriteString(" op=" + g.ID)
+	}
+	b.WriteString(" state=" + string(g.State) + " nodes=" + itoa(len(g.Nodes)))
+	if g.MutationSet != nil {
+		b.WriteString(" mutation-set=" + string(g.MutationSet.State))
+		if g.MutationSet.Transaction != nil {
+			b.WriteString(" tx=" + string(g.MutationSet.Transaction.State))
+		}
+	}
+	if len(g.Edges) > 0 {
+		b.WriteString("\n  edges=" + itoa(len(g.Edges)))
+		for _, e := range g.Edges {
+			b.WriteString(" " + e.From + "->" + e.To)
+		}
+	}
+	for _, n := range g.Nodes {
+		b.WriteString("\n  " + n.Target + ": state=" + string(n.State))
+		b.WriteString(" artifact=" + boolWord(n.Evidence.ArtifactPresent))
+		b.WriteString(" apply=" + boolWord(n.Evidence.ApplyExecuted))
+		b.WriteString(" changed=" + boolWord(n.Evidence.FilesystemChanged))
+		b.WriteString(" verify=" + boolWord(n.Evidence.VerificationPassed))
+		if n.Evidence.Outcome != "" {
+			b.WriteString(" outcome=" + string(n.Evidence.Outcome))
+		}
+	}
+	return b.String()
 }

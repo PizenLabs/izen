@@ -3111,6 +3111,31 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 		return nil
 	}
 
+	// ── PHASE 9B: deterministic multi-file targeting ────────────────
+	// A $hot naming ≥2 explicit @file targets runs as ONE user mutation under
+	// ONE ExecutionGraph + ONE MutationSet. Ambiguity and missing targets stop
+	// here — before any provider invocation or mutation.
+	targets, hardErr, ambiguous := resolveMultiHotfixTargets(prompt)
+	if hardErr != "" {
+		m.hotfixActive = false
+		m.push(roleError, "[HOTFIX] "+hardErr)
+		m.push(roleSystem, infoStyle.Render("No files were modified."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+	if ambiguous {
+		m.hotfixActive = false
+		m.push(roleError, "[HOTFIX] Multi-file target is ambiguous. Name explicit @file targets, e.g. \"$hot fix @a.html and @b.html\".")
+		m.push(roleSystem, infoStyle.Render("No model call was made and no files were modified."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+	if len(targets) >= 2 {
+		return m.runMultiHotfix(prompt, targets)
+	}
+
 	// Stage 1: Stash the current plan if tasks exist.
 	hasTasks := len(m.sess.CurrentTasks) > 0
 	if hasTasks {

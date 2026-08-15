@@ -3,6 +3,7 @@ package ui
 import (
 	"strings"
 
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 )
@@ -203,6 +204,23 @@ func itoa(v int) string {
 
 // ── ExecutionProof ─────────────────────────────────────────────────────────
 
+// NodeProof is the per-target execution-evidence record of a multi-file
+// (Phase 9B) execution. It lets $inspect answer, for EVERY file, whether an
+// artifact existed, a patch was present, the apply ran, the filesystem
+// changed and verification passed — never collapsed into a generic success.
+type NodeProof struct {
+	Target             string
+	Model              string
+	InputTokens        int
+	OutputTokens       int
+	ArtifactPresent    bool
+	DiffPresent        bool
+	ApplyExecuted      bool
+	FilesystemChanged  bool
+	VerificationPassed bool
+	Outcome            string
+}
+
 // ExecutionProof is the execution-evidence account for one operation. It is
 // derived ONLY from real runtime evidence — the authoritative per-operation
 // telemetry (invocation count, provider usage) folded with the semantic
@@ -221,6 +239,19 @@ type ExecutionProof struct {
 	ApplyExecuted      bool
 	FilesystemChanged  bool
 	VerificationPassed bool
+
+	// ── Multi-file execution (Phase 9B) ─────────────────────────────
+	// Targets lists every mutation target in stable graph order.
+	Targets []string
+	// Nodes carries the per-target evidence of a multi-file execution.
+	Nodes []NodeProof
+	// MutationSetState is the terminal state of the owning MutationSet.
+	MutationSetState string
+	// RolledBack reports whether the operation ended by rolling back the
+	// whole MutationSet (never a partial commit).
+	RolledBack bool
+	// FailureNode is the first failed target ("" when none failed).
+	FailureNode string
 }
 
 // Successful reports whether the operation provably changed the filesystem.
@@ -260,7 +291,8 @@ func (m *model) completeHotfixProof(applied, verifyPassed bool) {
 }
 
 // renderExecutionProof renders the execution-evidence account as a compact
-// $inspect section.
+// $inspect section. A multi-file proof renders the aggregate plus every node's
+// per-target evidence.
 func renderExecutionProof(p ExecutionProof) string {
 	var b strings.Builder
 	b.WriteString("proof:")
@@ -270,11 +302,31 @@ func renderExecutionProof(p ExecutionProof) string {
 	if p.Target != "" {
 		b.WriteString(" target=" + p.Target)
 	}
+	if len(p.Targets) > 0 {
+		b.WriteString(" targets=" + itoa(len(p.Targets)))
+	}
 	b.WriteString("\n")
 	b.WriteString("  provider-invocations=" + itoa(p.ProviderInvocations) + "\n")
 	b.WriteString("  input=" + formatUsageValue(p.InputUsage) + " output=" + formatUsageValue(p.OutputUsage) + "\n")
 	b.WriteString("  artifact=" + boolWord(p.ArtifactPresent) + " diff=" + boolWord(p.DiffPresent) + "\n")
 	b.WriteString("  apply=" + boolWord(p.ApplyExecuted) + " filesystem-changed=" + boolWord(p.FilesystemChanged) + " verify=" + boolWord(p.VerificationPassed))
+	if p.MutationSetState != "" {
+		b.WriteString("\n  mutation-set=" + p.MutationSetState)
+		if p.RolledBack {
+			b.WriteString(" rolled-back=yes")
+		}
+		if p.FailureNode != "" {
+			b.WriteString(" failed-node=" + p.FailureNode)
+		}
+	}
+	for _, n := range p.Nodes {
+		b.WriteString("\n  node " + n.Target + ": artifact=" + boolWord(n.ArtifactPresent) +
+			" patch=" + boolWord(n.DiffPresent) +
+			" apply=" + boolWord(n.ApplyExecuted) +
+			" changed=" + boolWord(n.FilesystemChanged) +
+			" verify=" + boolWord(n.VerificationPassed) +
+			" outcome=" + n.Outcome)
+	}
 	return b.String()
 }
 
@@ -283,4 +335,62 @@ func boolWord(b bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+// recordMultiHotfixProposalProof captures the Phase A (prepare) facts of a
+// multi-file hotfix at the proposal terminal: the authoritative invocation
+// count from the telemetry snapshot, the AGGREGATE provider usage of every
+// node, and the per-node artifact/diff presence.
+func (m *model) recordMultiHotfixProposalProof(msg multiHotfixProposalMsg) {
+	if msg.Graph == nil {
+		return
+	}
+	p := ExecutionProof{
+		OperationID:         m.lastExecutionSnapshot.OpID,
+		ProviderInvocations: m.lastExecutionSnapshot.Invocations,
+		InputUsage:          msg.TokenInput,
+		OutputUsage:         msg.TokenOutput,
+		Targets:             msg.Graph.Targets(),
+	}
+	for _, n := range msg.Graph.Nodes {
+		p.Nodes = append(p.Nodes, NodeProof{
+			Target:          n.Target,
+			ArtifactPresent: n.Evidence.ArtifactPresent,
+			DiffPresent:     n.Evidence.DiffPresent,
+			Outcome:         string(n.Evidence.Outcome),
+		})
+	}
+	m.lastExecutionProof = p
+}
+
+// completeMultiHotfixProof merges the apply-phase facts into the retained
+// proof at the multi-file hotfix apply terminal. The aggregate outcome is the
+// MutationSet terminal state: committed only when every node applied and
+// verified; rolled back otherwise — never a per-file success claim.
+func (m *model) completeMultiHotfixProof(success bool, graph *execution.ExecutionGraph) {
+	p := m.lastExecutionProof
+	if graph != nil {
+		p.Targets = graph.Targets()
+		p.MutationSetState = string(graph.State)
+		p.RolledBack = graph.State == execution.GraphRolledBack ||
+			graph.State == execution.GraphFailed ||
+			graph.State == execution.GraphCancelled
+		p.FailureNode = graph.FirstFailedNode()
+		p.ApplyExecuted = success
+		p.FilesystemChanged = success
+		p.VerificationPassed = success
+		p.Nodes = nil
+		for _, n := range graph.Nodes {
+			p.Nodes = append(p.Nodes, NodeProof{
+				Target:             n.Target,
+				ArtifactPresent:    n.Evidence.ArtifactPresent,
+				DiffPresent:        n.Evidence.DiffPresent,
+				ApplyExecuted:      n.Evidence.ApplyExecuted,
+				FilesystemChanged:  n.Evidence.FilesystemChanged,
+				VerificationPassed: n.Evidence.VerificationPassed,
+				Outcome:            string(n.Evidence.Outcome),
+			})
+		}
+	}
+	m.lastExecutionProof = p
 }

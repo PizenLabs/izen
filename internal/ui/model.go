@@ -499,6 +499,27 @@ type hotfixProposalMsg struct {
 	Envelope PromptEnvelope
 }
 
+// multiHotfixProposalMsg is the terminal message of the Phase A (prepare) stage
+// of a multi-file $hot. It carries the fully prepared ExecutionGraph (every
+// node has a validated artifact), the per-node SemanticProposals for the
+// approval surface, and the AGGREGATE provider usage of ALL node invocations.
+// It never mutates the filesystem — apply happens only after human approval.
+type multiHotfixProposalMsg struct {
+	// Graph is the prepared execution graph (Phase A complete).
+	Graph *execution.ExecutionGraph
+	// Proposals is one proposal per graph node, in stable order.
+	Proposals []SemanticProposal
+	// Err is set when Phase A failed before any artifact was applied. The
+	// owning MutationSet is rolled back by the handler.
+	Err error
+	// TokenInput / TokenOutput are the aggregate provider-reported usage of
+	// every node invocation (summed once per node, never duplicated).
+	TokenInput  int
+	TokenOutput int
+	// RawOutput is the concatenated raw LLM output of every node.
+	RawOutput string
+}
+
 // hotfixAmbiguousMsg is the terminal result of a $hot request paused by the
 // deterministic target-confidence boundary. It is NOT a patch proposal: the
 // provider was never invoked, no patch exists, and no mutation may occur. It
@@ -1108,6 +1129,19 @@ type model struct {
 	// projection ONLY after the authoritative apply (budget/authorization
 	// gated) actually succeeded. Cleared on the terminal result.
 	appliedHotfixFile string
+
+	// ── Multi-file hotfix (Phase 9B): deterministic execution graph ──
+	// activeGraph is the single ExecutionGraph owned by the active multi-file
+	// $hot operation. Exactly one graph is active at a time (beginOperation
+	// supersedes a previous one). It carries the one MutationSet the whole
+	// graph executes under.
+	activeGraph *execution.ExecutionGraph
+	// pendingHotfixGraph is the prepared graph awaiting the approval gate. It
+	// is non-nil only while a multi-file proposal is staged for review.
+	pendingHotfixGraph *execution.ExecutionGraph
+	// lastExecutionGraph retains the most recently finalized multi-file graph
+	// so $inspect can expose the aggregate execution evidence.
+	lastExecutionGraph *execution.ExecutionGraph
 
 	// ── Foreground operation lifecycle (single authoritative operation) ──
 	// activeOp is the one foreground operation currently owned by the runtime,

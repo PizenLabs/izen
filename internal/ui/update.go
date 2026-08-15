@@ -1232,6 +1232,73 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.Viewport.GotoBottom()
 		return m, m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput)
 
+	case multiHotfixProposalMsg:
+		// ── MULTI-FILE $hot PROPOSAL TERMINAL (Phase 9B) ─────────────
+		// Phase A (prepare) reached a terminal outcome. On failure NOTHING was
+		// applied: the owned MutationSet is rolled back (it recorded nothing,
+		// so this is a clean no-op) and the stashed plan is restored. On
+		// success the prepared graph + per-node proposals are staged for the
+		// approval gate.
+		m.pendingHotfixCandidate = nil
+		outcome, outErr := classifyOpErrWithErr(msg.Err)
+		if msg.Err != nil {
+			// A preparation failure never mutates: roll back the owned set.
+			if m.execEng != nil {
+				if errs := m.execEng.RollbackTransaction(); len(errs) > 0 {
+					for _, err := range errs {
+						m.push(roleError, fmt.Sprintf("multi-hotfix rollback error: %v", err))
+					}
+				}
+			}
+			m.finalizeOperation(outcome, outErr)
+			m.hotfixActive = false
+			m.activeGraph = nil
+			m.pendingHotfixGraph = nil
+			if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
+				m.sess.StageTaskList(&stashedTasks)
+				_ = m.sess.Save()
+			}
+			m.push(roleError, "[HOTFIX] Multi-file patch generation failed: "+providers.SanitizeAPIError(msg.Err))
+			m.push(roleSystem, infoStyle.Render("[HOTFIX] Pipeline PAUSED. No files were modified."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m, tea.Batch(m.flushPendingRecords(), m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput))
+		}
+
+		// Phase A succeeded: stage the prepared graph + proposals for approval.
+		m.finalizeOperation(OpOutcomeSuccess, nil)
+		m.activeGraph = msg.Graph
+		m.pendingHotfixGraph = msg.Graph
+		m.pendingProposals = msg.Proposals
+		m.pendingHotfixTask = nil
+		m.pendingHotfixPatch = nil
+		// ── AGGREGATE PROOF (Phase A facts) ─────────────────────────
+		// Authoritative invocation count + aggregate provider usage + per-node
+		// artifact/diff presence. Apply facts merge at the apply terminal.
+		m.recordMultiHotfixProposalProof(msg)
+		// ── THOUGHT CAPTURE (Ctrl+O) ────────────────────────────────
+		if msg.RawOutput != "" {
+			m.captureHotfixThought(msg.RawOutput)
+		}
+		thoughtDone := m.thoughtUpdateCmd(msg.RawOutput, true)
+
+		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
+		m.syncUIState()
+		m.push(roleActivity, "  ⚙ Multi-file proposal compiled by the execution graph.")
+		m.push(roleStatus, multiHotfixProposalSummary(msg.Proposals))
+		m.push(roleSystem, infoStyle.Render("Review the diffs below. Use Alt+A to apply all, Alt+R to reject."))
+		m.enterApprovalState()
+		m.ti.Blur()
+		m.recalcViewportHeight()
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, tea.Batch(
+			m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput),
+			m.flushPendingRecords(),
+			thoughtDone,
+		)
+
 	case hotfixProposalMsg:
 		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
 		// processing flag, then re-derive the presentation state so a stale
@@ -1583,7 +1650,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// (invocations + authoritative usage recorded at the model stage);
 			// apply facts come from the real apply result. A mutation is only
 			// successful when the apply ran AND the filesystem changed.
-			m.completeHotfixProof(msg.exitCode == 0, msg.err == nil)
+			if m.activeGraph != nil {
+				// ── MULTI-FILE GRAPH TERMINAL (Phase 9B) ────────────
+				// The whole graph reaches ONE terminal outcome from the real
+				// apply result: committed only when every node applied and
+				// verified, otherwise rolled back/cancelled/failed. The graph
+				// terminal never claims per-file success for un-applied nodes.
+				m.terminalizeMultiHotfixGraph(msg.exitCode == 0, outcome)
+			} else {
+				m.completeHotfixProof(msg.exitCode == 0, msg.err == nil)
+			}
 			m.finalizeOperation(outcome, msg.err)
 			m.syncUIState()
 

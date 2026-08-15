@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/execution"
@@ -234,6 +235,19 @@ func (m *model) discardPendingAction() {
 	}
 	execution.KillAllOrphans()
 
+	// ── ROLL BACK THE ACTIVE MUTATION BOUNDARY (Phase 9A/9B) ────────
+	// If a mutation already occurred (an apply in flight), /drop restores the
+	// workspace by rolling back exactly the current MutationSet — the one owned
+	// by the operation being discarded. A pending (unapplied) set rolls back as
+	// a clean no-op. This is the /drop counterpart of the Ctrl+C cancel path.
+	if m.execEng != nil {
+		if errs := m.execEng.RollbackTransaction(); len(errs) > 0 {
+			for _, err := range errs {
+				m.push(roleError, fmt.Sprintf("drop rollback error: %v", err))
+			}
+		}
+	}
+
 	// ── Discard pending proposals / pending actions ─────────────────
 	m.awaitingConfirmation = false
 	m.pendingProposals = nil
@@ -248,6 +262,10 @@ func (m *model) discardPendingAction() {
 	m.hotfixCandidatesMode = false
 	m.pendingHotfixCandidate = nil
 	m.appliedHotfixFile = ""
+	// Discard the multi-file execution graph (Phase 9B). The MutationSet it
+	// owned was rolled back above.
+	m.activeGraph = nil
+	m.pendingHotfixGraph = nil
 	m.pendingRouteConfirm = false
 	m.pendingRouteInput = ""
 	m.pendingRouteResult = router.ClassificationResult{}
