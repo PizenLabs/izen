@@ -493,6 +493,10 @@ type hotfixProposalMsg struct {
 	// buffers by the update handler so the thought drawer renders the raw
 	// model stream during and after cloud execution.
 	RawOutput string
+	// Envelope is the deterministic context-ownership account of the provider
+	// request Izen constructed for this hotfix (Phase 8). It proves what
+	// context crossed to the provider — never a reconstruction.
+	Envelope PromptEnvelope
 }
 
 // hotfixAmbiguousMsg is the terminal result of a $hot request paused by the
@@ -1332,6 +1336,16 @@ type model struct {
 	// inspect view can render live counters (invocations/retries) without
 	// re-folding the marker log. Nil until an operation completes.
 	lastExecutionTelemetry *execution.Telemetry
+	// lastPromptEnvelope is the deterministic context-ownership account of the
+	// most recent directive execution (Phase 8). It proves what context crossed
+	// to the provider and is exposed through $inspect. Written and read on the
+	// UI goroutine only.
+	lastPromptEnvelope PromptEnvelope
+	// lastExecutionProof is the execution-evidence account of the most recent
+	// hotfix/build mutation (Phase 8): provider invocations, usage, artifact/
+	// diff/apply/filesystem/verify facts derived only from real runtime
+	// evidence. Written and read on the UI goroutine only.
+	lastExecutionProof ExecutionProof
 
 	// Stream throttle — frame-bounded token emission
 	streamThrottle *StreamThrottle

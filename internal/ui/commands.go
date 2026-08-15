@@ -3382,12 +3382,16 @@ func (c hotfixContract) String() string {
 	}
 }
 
-// hotfixContractFor derives the artifact contract from the on-disk state. New,
-// missing, and stub/small files use the bounded whole-file rewrite; existing
-// files at or over SmallFileLineThreshold lines use the anchored-snippet
-// contract exclusively.
+// hotfixContractFor derives the artifact contract from the on-disk state.
+// Phase 8 ownership fix: a file with REAL content — however small — uses the
+// anchored-snippet contract, so a tiny mutation never forces the model to
+// re-emit the entire file (the historical ~2048-token full-file blowup). The
+// whole-file rewrite is reserved strictly for new / empty / whitespace-only
+// files whose complete creation is the only sensible artifact. A small file
+// is not a "stub" merely because it is short: the snippet contract anchors
+// onto its real content exactly like a large file.
 func hotfixContractFor(orig string) hotfixContract {
-	if orig == "" || execution.IsStubFile(orig) {
+	if strings.TrimSpace(orig) == "" {
 		return contractReplaceFile
 	}
 	return contractReplaceBlock
@@ -3637,6 +3641,12 @@ func buildHotfixFallbackHandoff(task *plan.Task, orig string, contract hotfixCon
 // NEVER passed into the changeset pipeline, so a dropped connection can never
 // surface as a misleading "ambiguous change representation".
 func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
+	// Capture the owning operation ID synchronously (UI goroutine) so the
+	// worker closure can build the PromptEnvelope race-free.
+	opID := ""
+	if m.activeOp != nil {
+		opID = m.activeOp.ID
+	}
 	return func() (msg tea.Msg) {
 		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
 		// The terminal hotfixProposalMsg MUST reach the TUI event loop on ANY
@@ -3709,12 +3719,22 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		// NOTE: in production the ambiguity decision is made synchronously in
 		// handleHotfixCmd BEFORE any provider-invocation progress is rendered;
 		// this gate is the safety net for direct proposeHotfixPatch callers.
+		// It respects the deterministic decision: a request classifyHotfixAmbiguity
+		// deemed executable (a small/real file, or a resolved fuzzy/structural
+		// target) proceeds with the snippet contract; only genuinely ambiguous
+		// content mutations on large files pause for clarification.
 		if contract == contractReplaceBlock && !isStructuralHotfixIntent(task.Description) {
 			dec := classifyHotfixAmbiguity(task.Description, task.Target, orig)
-			return hotfixAmbiguousMsg{
-				Task:       task,
-				Reason:     dec.reason,
-				Candidates: dec.candidates,
+			if !dec.ambiguous {
+				// The target is deterministic (small/real content file or a
+				// resolved fuzzy target): continue with the bounded snippet
+				// contract below.
+			} else {
+				return hotfixAmbiguousMsg{
+					Task:       task,
+					Reason:     dec.reason,
+					Candidates: dec.candidates,
+				}
 			}
 		}
 
@@ -3742,6 +3762,14 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		}
 		system := hotfixSystemPrompt(contract)
 
+		// ── CONTEXT-OWNERSHIP ENVELOPE (Phase 8) ───────────────────────
+		// The deterministic account of the provider context this request
+		// carries. It is embedded in the terminal message so the UI goroutine
+		// stores it race-free and $inspect / tests can prove what crossed to
+		// the provider (one explicit file → one file context; no history; no
+		// unrelated repository content).
+		env := hotfixPromptEnvelope(opID, "hot", task, orig, contract, tgt)
+
 		cloudCfg := gateway.ClassifyCloudProvider(m.cfg.ActiveProviderName())
 		isCloud := cloudCfg.CloudProvider != ""
 
@@ -3750,6 +3778,14 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		// the response off prematurely (a 1-token answer after minutes of
 		// reasoning). The changeset pipeline strips preambles and trailing prose
 		// so the model can finish naturally.
+		//
+		// NO native tools on $hot (Phase 8): the contract pins a plain markdown
+		// code block (snippet or full file), and the changeset pipeline parses
+		// that block. Shipping the write_file / apply_patch tool schemas
+		// alongside both contradicts the output contract (a model may answer
+		// with a tool call instead of a code block, derailing into the
+		// "tool calls buffered" dead-end) and costs ~200 input tokens of
+		// metadata the contract never consumes.
 
 		req := ai.Request{
 			Model:     m.activeRouteModel(),
@@ -3757,7 +3793,6 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			Stream:    false,
 			MaxTokens: 2048,
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
-			Tools:     m.fileMutationTools(),
 			Reasoning: m.effortFromTasks(),
 		}
 
@@ -3791,9 +3826,10 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 						IsFullRewrite: true,
 					}
 					return hotfixProposalMsg{
-						Task:  task,
-						Patch: patch,
-						Diff:  diffContent,
+						Task:     task,
+						Patch:    patch,
+						Diff:     diffContent,
+						Envelope: env,
 					}
 				}
 			}
@@ -3829,7 +3865,6 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 				Stream:    false,
 				MaxTokens: 2048,
 				Messages:  []ai.Message{{Role: "user", Content: buildHotfixFallbackHandoff(task, orig, contract, tgt)}},
-				Tools:     m.fileMutationTools(),
 				Reasoning: m.effortFromTasks(),
 			}
 			timeout := buildGenerationTimeout
@@ -3920,6 +3955,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 						TokenInput:  totalTokIn,
 						TokenOutput: totalTokOut,
 						RawOutput:   rawContent,
+						Envelope:    env,
 					}
 				}
 			}
@@ -3967,6 +4003,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 				TokenInput:  resp.TokenInput,
 				TokenOutput: resp.TokenOutput,
 				RawOutput:   rawContent,
+				Envelope:    env,
 			}
 		}
 
@@ -3994,6 +4031,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 					TokenInput:  resp.TokenInput,
 					TokenOutput: resp.TokenOutput,
 					RawOutput:   rawContent,
+					Envelope:    env,
 				}, true
 			}
 			return hotfixProposalMsg{}, false
@@ -4060,6 +4098,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			TokenInput:  resp.TokenInput,
 			TokenOutput: resp.TokenOutput,
 			RawOutput:   rawContent,
+			Envelope:    env,
 		}
 	}
 }

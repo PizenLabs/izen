@@ -98,6 +98,8 @@ func (m *model) clearExecutionActivity() {
 	m.controlRunID = ""
 	m.lastExecutionSnapshot = execution.TelemetrySnapshot{}
 	m.lastExecutionTelemetry = nil
+	m.lastPromptEnvelope = PromptEnvelope{}
+	m.lastExecutionProof = ExecutionProof{}
 	if m.stage != nil {
 		m.stage.mu.Lock()
 		m.stage.Label = ""

@@ -44,6 +44,22 @@ func (m *model) runInspectCmd(filter string) tea.Cmd {
 		for _, line := range strings.Split(strings.TrimRight(rendered, "\n"), "\n") {
 			m.push(roleSystem, mutedStyle.Render(line))
 		}
+		// ── CONTEXT OWNERSHIP + EXECUTION PROOF (Phase 8) ──────────────
+		// The detailed view also exposes what context crossed to the provider
+		// and the execution-evidence account — both derived from real runtime
+		// records, never reconstructed from UI state.
+		if m.lastPromptEnvelope.OperationID != "" || m.lastPromptEnvelope.Target != "" {
+			m.push(roleSystem, mutedStyle.Render(""))
+			for _, line := range strings.Split(strings.TrimRight(renderPromptEnvelope(m.lastPromptEnvelope), "\n"), "\n") {
+				m.push(roleSystem, mutedStyle.Render(line))
+			}
+		}
+		if m.lastExecutionProof.OperationID != "" || m.lastExecutionProof.Target != "" {
+			m.push(roleSystem, mutedStyle.Render(""))
+			for _, line := range strings.Split(strings.TrimRight(renderExecutionProof(m.lastExecutionProof), "\n"), "\n") {
+				m.push(roleSystem, mutedStyle.Render(line))
+			}
+		}
 		m.push(roleSystem, mutedStyle.Render("  — execution metadata only; model reasoning is never exposed."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()

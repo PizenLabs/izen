@@ -1247,8 +1247,25 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// is the single terminal cleanup path; it cancels the operation
 		// context, clears ownership and stops the spinner.
 		m.pendingHotfixCandidate = nil
+		// ── CONTEXT-OWNERSHIP ACCOUNT (Phase 8) ──────────────────────
+		// Retain the deterministic envelope of the provider context this
+		// hotfix sent, with the authoritative provider-reported input usage
+		// attached (0 stays 0 only when the provider reported none).
+		m.lastPromptEnvelope = msg.Envelope
+		if msg.TokenInput > 0 {
+			m.lastPromptEnvelope.TotalInputTokens = msg.TokenInput
+		}
 		outcome, outErr := classifyOpErrWithErr(msg.Err)
 		m.finalizeOperation(outcome, outErr)
+		// ── EXECUTION PROOF — GENERATION FACTS (Phase 8) ─────────────
+		// finalizeOperation above retained the generation telemetry snapshot;
+		// fold its authoritative invocation count + the provider usage with the
+		// real artifact/diff presence. The apply facts are merged at the apply
+		// terminal (buildResultMsg).
+		if msg.Task != nil {
+			m.recordHotfixProposalProof(msg.Task.Target, msg.Patch != nil,
+				msg.Diff != "", msg.TokenInput, msg.TokenOutput)
+		}
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.syncUIState()
@@ -1550,6 +1567,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if msg.exitCode != 0 {
 				outcome = classifyOpErr(msg.err)
 			}
+			// ── EXECUTION PROOF (Phase 8) ─────────────────────────────
+			// Assemble the full execution-evidence account BEFORE the apply
+			// operation's finalization overwrites the retained generation
+			// telemetry. Provider facts come from the generation snapshot
+			// (invocations + authoritative usage recorded at the model stage);
+			// apply facts come from the real apply result. A mutation is only
+			// successful when the apply ran AND the filesystem changed.
+			m.completeHotfixProof(msg.exitCode == 0, msg.err == nil)
 			m.finalizeOperation(outcome, msg.err)
 			m.syncUIState()
 
