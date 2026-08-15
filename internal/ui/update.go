@@ -1567,6 +1567,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if msg.exitCode != 0 {
 				outcome = classifyOpErr(msg.err)
 			}
+			// ── MUTATION BOUNDARY TERMINAL (Phase 9A) ────────────────
+			// A successful hotfix is a committed user mutation: commit the
+			// MutationSet this apply owned so the transaction becomes terminal
+			// and NO future operation (a later failure, `izen rollback`) can
+			// undo it. On any failure/cancellation path the rollback above
+			// (RollbackTransaction) already restored exactly this boundary.
+			if msg.exitCode == 0 && m.execEng != nil {
+				m.execEng.CommitTransaction()
+			}
 			// ── EXECUTION PROOF (Phase 8) ─────────────────────────────
 			// Assemble the full execution-evidence account BEFORE the apply
 			// operation's finalization overwrites the retained generation

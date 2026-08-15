@@ -5101,6 +5101,14 @@ func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cm
 	// operation (the hotfix apply). It is finalized by the terminal
 	// buildResultMsg handler via the single cleanup path.
 	m.beginOperation(OpHotfix)
+	// ── MUTATION BOUNDARY (Phase 9A) ────────────────────────────────
+	// This user-level mutation owns its own MutationSet / transaction
+	// boundary. The apply records into it and the terminal buildResultMsg
+	// handler commits it on success or rolls it back on failure/cancellation.
+	// No other operation can ever roll back a committed hotfix.
+	if m.execEng != nil {
+		m.execEng.BeginTransaction()
+	}
 	m.agentRunning = true
 	m.pipelineRunning = true
 	m.agentDone = false
