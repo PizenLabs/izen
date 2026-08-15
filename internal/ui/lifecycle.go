@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/execution"
@@ -21,18 +22,31 @@ import (
 //	SESSION   — durable conversational/runtime context. NEVER touched by /clear.
 //	WORKSPACE — repository state + current mode. NEVER touched by /clear.
 //	OPERATION — the single authoritative foreground execution. /clear does not
-//	           kill it; it only stops projecting its remaining events.
+//	           kill it; it only stops projecting its remaining events. /drop
+//	           cancels it explicitly (discard pending action).
 //	EXECUTION ACTIVITY — transient records produced by an execution
-//	           (read/edit/apply/verify/model stages). Owned by the execution,
-//	           cleared by /clear.
+//	           (read/edit/apply/verify/model stages). Cleared by /clear.
 //	PRESENTATION — everything currently rendered (stream, thinking, loading
 //	           dock, chips, viewport buffers). Cleared by /clear.
 //
-// /clear === resetTransientInteraction(): clears PRESENTATION + EXECUTION
-// ACTIVITY + the transient interaction gates, and seals the activity surface
-// so late events from a cleared execution can never repopulate the viewport.
-// /clear is NOT /new: session, workspace, mode, objective and token telemetry
-// all survive.
+// Command contract (see commands.go):
+//
+//	/clear = "Clear what I SEE."  resetTransientInteraction() clears
+//	           PRESENTATION + EXECUTION ACTIVITY + the visible approval
+//	           presentation and seals the activity surface. It keeps the
+//	           session, workspace, mode, context (context ledger, attached
+//	           files, staged plan tasks, persistent history), git and token
+//	           telemetry. It executes nothing and creates nothing.
+//	/drop   = "Discard what I am ABOUT TO DO."  discardPendingAction() cancels
+//	           the active transient execution and discards every pending
+//	           proposal / pending action / unresolved mutation / staged plan.
+//	           It keeps the conversation (records), session and workspace.
+//	/new    = FUTURE session boundary: new session, new conversation context,
+//	           reset transient state, fresh presentation. NOT implemented in
+//	           this phase — /clear is deliberately NOT /new.
+//
+// /clear is NOT /new: session, workspace, mode, objective, context, staged
+// plan tasks and token telemetry all survive a clear.
 
 // clearPresentation clears the transient presentation surface: stream buffers,
 // thinking buffers, loading shimmer, trace/output buffers, and streaming flags.
@@ -155,15 +169,6 @@ func (m *model) resetTransientInteraction() {
 	m.pendingFileRefs = nil
 	m.uiNotice = ""
 
-	// ── Pending plan artifact ─────────────────────────────────────
-	// The staged plan task list is a pending execution/proposal artifact (the
-	// ownership table's "pending artifact" row): /clear discards it so a
-	// subsequent /build starts from a clean slate. Durable session state
-	// (history, objective, context ledger, investigation/review IDs) survives.
-	if m.sess != nil {
-		m.sess.ClearTasks()
-	}
-
 	// ── Unwind transient busy flags + spinner to interactive chat ──
 	// clearBusyFlags ONLY clears transient processing flags — it never cancels
 	// cancellation handles (streamCancel/shellCancel) or the active operation,
@@ -200,4 +205,68 @@ func (m *model) sealActivitySurface() {
 // its events are welcome in the viewport again.
 func (m *model) unsealActivitySurface() {
 	m.activitySurfaceSealed = false
+}
+
+// discardPendingAction is the /drop entry point: "Discard what I am ABOUT TO
+// DO." It cancels the active transient execution (if any) and discards every
+// pending proposal, pending action, unresolved mutation and the staged plan
+// task list. Unlike /clear it NEVER touches the conversation: records,
+// execution activity surfaces, session history, objective, context ledger and
+// workspace all survive a drop. It also never seals the activity surface — the
+// conversation stays live.
+func (m *model) discardPendingAction() {
+	// ── Cancel active transient execution (if applicable) ─────────
+	// The single authoritative terminal path releases the operation and
+	// cancels its context so provider/subprocess/worker observe cancellation.
+	if m.activeOp != nil {
+		m.finalizeOperation(OpOutcomeCancelled, context.Canceled)
+	}
+	m.cancelAllBackgroundContexts()
+	if m.streamCancel != nil {
+		m.streamCancel()
+		m.streamCancel = nil
+	}
+	if m.shellCancel != nil {
+		m.shellCancel()
+		m.shellCancel = nil
+	}
+	execution.KillAllOrphans()
+
+	// ── Discard pending proposals / pending actions ─────────────────
+	m.awaitingConfirmation = false
+	m.pendingProposals = nil
+	m.acceptedProposals = nil
+	m.acceptAll = false
+	m.pendingBuildApproval = false
+	m.pendingBuildTask = nil
+	m.pendingBuildAllowAlways = false
+	m.pendingHotfixTask = nil
+	m.pendingHotfixPatch = nil
+	m.pendingHotfixAmbiguous = nil
+	m.hotfixCandidatesMode = false
+	m.pendingHotfixCandidate = nil
+	m.appliedHotfixFile = ""
+	m.pendingRouteConfirm = false
+	m.pendingRouteInput = ""
+	m.pendingRouteResult = router.ClassificationResult{}
+	m.pendingRouteOptions = nil
+	m.pendingRouteIdx = 0
+	m.pendingTestConfirm = false
+	m.pendingTestTarget = ""
+	// Discard unresolved mutations pending in the tool-call buffer.
+	if m.toolCallBuffer != nil {
+		m.toolCallBuffer.Reject()
+	}
+
+	// ── Discard the staged plan task list (a pending execution plan
+	// is precisely "what I am about to do"). The durable session record
+	// (history, objective, context ledger) survives. ──
+	if m.sess != nil {
+		m.sess.ClearTasks()
+	}
+
+	// ── Unwind transient busy flags / approval gate back to chat ──
+	m.resolveApprovalState()
+	m.syncUIState()
+	m.ti.Focus()
 }

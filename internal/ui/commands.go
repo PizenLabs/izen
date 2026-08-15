@@ -83,6 +83,7 @@ var validSystemCommands = map[string]struct{}{
 	"/objective":        {},
 	"/clear":            {},
 	"/drop":             {},
+	"/new":              {},
 	"/undo":             {},
 	"/commit":           {},
 	"/checkpoint":       {},
@@ -1979,33 +1980,34 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case cmd == "/clear":
-		// ── /CLEAR = clear the visible/transient interaction surface ──
-		// It clears PRESENTATION state (records, stream, thinking, loading,
-		// chips) and EXECUTION-ACTIVITY surfaces (activity tree, execution
-		// log, control tree, stage, telemetry) plus the transient interaction
-		// gates (proposals/approvals/routing confirms/tool-call buffer) and
-		// the staged plan task list (a pending artifact).
+		// ── /CLEAR = "Clear what I SEE" ────────────────────────────
+		// Clears the visible output, resets the viewport, and hides old
+		// execution presentation (activity tree, execution log, control tree,
+		// thinking/loading, chips) plus the visible approval presentation.
 		//
-		// It does NOT destroy the workspace, the current mode, the repository,
-		// or durable session state (history, objective, context ledger) — and
-		// it does NOT create a new session. /clear is NOT /new. It also seals
+		// It keeps the session, workspace, mode, git, context (context
+		// ledger, attached files, staged plan tasks, persistent history) and
+		// token telemetry. It executes nothing and creates nothing. It seals
 		// the activity surface so a late event from the cleared execution can
 		// never resurrect stale activity. See lifecycle.go.
 		m.resetTransientInteraction()
 		return tea.Sequence(
 			tea.ClearScreen,
-			tea.Println("✕ [IZEN Memory] Transient interaction surface cleared. Session, workspace and mode preserved."),
+			tea.Println("✕ [IZEN Memory] View cleared. Session, context, workspace and history preserved."),
 		)
 
 	case cmd == "/drop" || cmd == "/drop all":
-		// ── /DROP = detach retained context files from the session ──
-		// Distinct from /clear: /drop removes the user-attached @file context
-		// (attachedFiles / pendingFileRefs) from the session, nothing else.
-		// It does NOT touch the records, execution activity, or presentation
-		// surfaces — a drop is never a visual clear.
+		// ── /DROP = "Discard what I am ABOUT TO DO" ────────────────
+		// Cancels the active transient execution (if any) and discards every
+		// pending proposal / pending action / unresolved mutation / staged
+		// plan task list. It keeps the conversation (records), the session,
+		// the workspace and the mode. Bare /drop also detaches all attached
+		// context files (the historical file-pruning role). It is deliberately
+		// NOT a visual clear — nothing visible is erased. See lifecycle.go.
+		m.discardPendingAction()
 		m.attachedFiles = nil
 		m.pendingFileRefs = nil
-		m.push(roleSystem, infoStyle.Render("all context files detached"))
+		m.push(roleSystem, infoStyle.Render("pending action discarded · context files detached"))
 		return nil
 
 	case strings.HasPrefix(cmd, "/drop "):
@@ -2033,6 +2035,17 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		} else {
 			m.push(roleSystem, infoStyle.Render("detached: "+raw))
 		}
+		return nil
+
+	case cmd == "/new":
+		// ── /NEW = FUTURE session boundary ─────────────────────────
+		// Reserved semantic: "Start somewhere NEW" — a new session, new
+		// conversation context, reset transient state, fresh presentation
+		// (workspace may remain the same; the old session becomes
+		// recoverable/history). Deliberately NOT implemented in this phase;
+		// /clear is NOT /new (it keeps the session, context and history).
+		// See lifecycle.go for the full command contract.
+		m.push(roleSystem, infoStyle.Render("/new is the future session boundary — not yet implemented. Use /clear to clear the view (keeps session & context) or /drop to discard a pending action."))
 		return nil
 
 	case strings.HasPrefix(cmd, "/undo"):

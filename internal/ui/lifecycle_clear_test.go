@@ -175,11 +175,10 @@ func TestClearDoesNotCreateANewSession(t *testing.T) {
 	if m.sess.Objective != "refactor the landing page" {
 		t.Errorf("session objective must survive /clear, got %q", m.sess.Objective)
 	}
-	// The staged plan task list is a pending artifact — /clear discards it so
-	// a subsequent /build starts from a clean slate (ownership table row:
-	// pending artifact → clearable).
-	if len(m.sess.CurrentTasks) != 0 {
-		t.Errorf("staged plan tasks must be discarded by /clear, got %d", len(m.sess.CurrentTasks))
+	// Context (including the staged plan task list) survives /clear — the plan
+	// is "context", not "what I see". /drop discards it instead.
+	if len(m.sess.CurrentTasks) != 1 {
+		t.Errorf("staged plan tasks must survive /clear, got %d", len(m.sess.CurrentTasks))
 	}
 }
 
@@ -317,26 +316,111 @@ func TestClearNoStaleActivityAfterNewCommand(t *testing.T) {
 	}
 }
 
-// TestDropSemanticsDistinctFromClear verifies /drop only detaches context
-// files and never behaves as a visual clear.
+// TestDropSemanticsDistinctFromClear verifies /drop is NOT a visual clear: it
+// discards pending actions but keeps the conversation visible.
 func TestDropSemanticsDistinctFromClear(t *testing.T) {
 	m := clearTestModel()
 	m.attachedFiles = []string{"index.html", "styles.css"}
+	beforeTree := m.activityTree.Len()
 
 	m.handleCommand("/drop all")
 
 	if len(m.attachedFiles) != 0 {
 		t.Errorf("attachedFiles must be detached by /drop all, got %v", m.attachedFiles)
 	}
-	// /drop must NOT clear the visible surface.
-	if len(m.records) == 0 {
-		t.Error("/drop must not clear the records (it is not a visual clear)")
+	// /drop must NOT clear the visible conversation: the original activity
+	// records are still present (only /drop's own confirmation notice was added).
+	if len(m.records) != beforeTree+1 && len(m.records) < 3 {
+		t.Error("/drop must not wipe the conversation records (it is not a visual clear)")
 	}
-	if m.activityTree == nil || m.activityTree.Len() == 0 {
+	if m.activityTree == nil || m.activityTree.Len() != beforeTree {
 		t.Error("/drop must not clear the activity tree")
 	}
 	if m.activitySurfaceSealed {
 		t.Error("/drop must not seal the activity surface")
+	}
+}
+
+// TestDropDiscardsPendingAction verifies /drop cancels pending proposals,
+// discards the staged plan task list and detaches context files — while keeping
+// session, conversation and workspace intact.
+func TestDropDiscardsPendingAction(t *testing.T) {
+	m := clearTestModel()
+	m.awaitingConfirmation = true
+	m.pendingProposals = []SemanticProposal{
+		{ID: "p1", Target: SemanticTarget{QualifiedName: "index.html"}, Diff: "--- a/index.html\n+++ b/index.html\n"},
+	}
+	m.acceptAll = true
+	m.toolCallBuffer = execution.NewToolCallBuffer(m.workspaceRoot)
+
+	m.handleCommand("/drop all")
+
+	// Pending proposals / approvals are discarded.
+	if len(m.pendingProposals) != 0 || m.awaitingConfirmation || m.acceptAll {
+		t.Errorf("pending proposals/approvals must be discarded by /drop")
+	}
+	// The staged plan task list (a pending execution plan) is discarded.
+	if len(m.sess.CurrentTasks) != 0 {
+		t.Errorf("staged plan tasks must be discarded by /drop, got %d", len(m.sess.CurrentTasks))
+	}
+	// Context files are detached (historical file-pruning role).
+	if len(m.attachedFiles) != 0 {
+		t.Errorf("attached files must be detached by /drop, got %v", m.attachedFiles)
+	}
+	// Conversation and session survive.
+	if len(m.records) == 0 {
+		t.Error("conversation records must survive /drop")
+	}
+	if len(m.sess.History) != 2 {
+		t.Errorf("session history must survive /drop, got %d messages", len(m.sess.History))
+	}
+	if m.resolver.Current() != modes.ModeBuild {
+		t.Errorf("mode must survive /drop, got %v", m.resolver.Current())
+	}
+}
+
+// TestDropCancelsActiveOperation verifies /drop cancels a genuinely running
+// foreground operation ("cancel active transient execution if applicable")
+// while keeping the conversation intact.
+func TestDropCancelsActiveOperation(t *testing.T) {
+	m := clearTestModel()
+	m.beginOperation(OpBuild)
+	if m.activeOp == nil {
+		t.Fatal("precondition: an operation must be active")
+	}
+
+	m.handleCommand("/drop all")
+
+	if m.activeOp != nil {
+		t.Error("/drop must cancel the active operation (activeOp still set)")
+	}
+	if len(m.records) == 0 {
+		t.Error("conversation records must survive /drop")
+	}
+	if m.activityTree == nil || m.activityTree.Len() == 0 {
+		t.Error("activity tree must survive /drop")
+	}
+}
+
+// TestNewIsFutureBoundaryNotClear pins that /new is a reserved future session
+// boundary, is NOT a visual clear, and does NOT create anything.
+func TestNewIsFutureBoundaryNotClear(t *testing.T) {
+	m := clearTestModel()
+	beforeRecords := len(m.records)
+	sessBefore := m.sess
+
+	m.handleCommand("/new")
+
+	if m.sess != sessBefore {
+		t.Fatal("/new must not create or replace a session in this phase")
+	}
+	// /new is a future boundary — it must not wipe the conversation records.
+	if len(m.records) < beforeRecords {
+		t.Error("/new must not clear the visible records (it is a future boundary, not /clear)")
+	}
+	// /new must not seal the activity surface.
+	if m.activitySurfaceSealed {
+		t.Error("/new must not seal the activity surface")
 	}
 }
 
