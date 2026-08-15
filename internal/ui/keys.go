@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -11,6 +12,38 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 )
+
+// isPrintableRunes reports whether a key message is a plain, unmodified
+// printable character (or character run). This is the canonical test for
+// "text the user is typing": Alt-modified keys and control keys are
+// keybinding mechanisms, never text.
+func isPrintableRunes(msg tea.KeyMsg) bool {
+	if msg.Type != tea.KeyRunes || len(msg.Runes) == 0 {
+		return false
+	}
+	if msg.Alt {
+		return false
+	}
+	for _, r := range msg.Runes {
+		if !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// forwardToInput routes a printable keystroke into the focused text input,
+// returning the textinput command. It is the single implementation of the
+// "active text input" keyboard precedence (priority 1): a printable character
+// typed into the focused input is ALWAYS text — it can never be hijacked by a
+// card, chip, or keybinding shortcut.
+func (m *model) forwardToInput(msg tea.KeyMsg) tea.Cmd {
+	var tiCmd tea.Cmd
+	m.ti, tiCmd = m.ti.Update(msg)
+	m.syncInputFromTI()
+	m.updateSuggestions()
+	return tiCmd
+}
 
 // toggleThoughtBlock expands/collapses the active reasoning block OR the live
 // shell-output block. Priority:
@@ -315,6 +348,16 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Both states hard-intercept the keyboard: the proposal/approval gate and
 	// the actionable ambiguity card (Clarify / Inspect candidates / Cancel).
 	if m.state == StateAwaitingApproval || m.state == StateHotfixAmbiguous {
+		// ── PRIORITY 1: ACTIVE TEXT INPUT ───────────────────────────
+		// A printable character typed into the focused input is ALWAYS text.
+		// Card/chip actions (Clarify, Inspect, Select, Accept, Reject) use
+		// explicit keybinding mechanisms (alt+…, Enter, Esc) so they can never
+		// hijack normal typing — the developer can compose the next command
+		// while an approval or ambiguity card is on screen.
+		if m.ti.Focused() && isPrintableRunes(msg) {
+			return m, m.forwardToInput(msg)
+		}
+
 		// ── Hybrid Intent Gateway mode-selection prompt ─────────────
 		// The router classified the prompt with confidence below the policy
 		// threshold. Digits select a mode directly, ←/→ cycle the highlight,
@@ -377,33 +420,42 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		// ── $hot AMBIGUOUS RESOLUTION CARD ─────────────────────────
 		// The target-confidence boundary paused the request. The developer must
-		// Clarify target ([c]), Inspect candidates ([i], read-only), or
-		// Cancel ([x]/Esc). NO Accept/Reject is rendered — there is no patch.
+		// Clarify target ([⌥C]), Inspect candidates ([⌥I], read-only), or
+		// Cancel ([⌥X]/Esc). NO Accept/Reject is rendered — there is no patch.
 		// Candidate selection ([1-9] in inspect mode) is an explicit human act
 		// that makes the target explicit; it never happens automatically.
 		//
 		// LIVENESS: the card is a terminal outcome of the hotfix operation,
 		// not a locked execution worker. The input line stays focused and
-		// editable: every non-card keystroke is forwarded to the text input,
-		// and Enter with a typed command submits it (dismissing the card and
+		// editable: every plain keystroke is forwarded to the text input
+		// (priority 1), card actions use explicit alt+ / Esc keybindings, and
+		// Enter with a typed command submits it (dismissing the card and
 		// starting a NEW operation). Ctrl+C cancels the card gracefully.
+		//
+		// KEYBOARD PRECEDENCE: because the input stays focused, candidate
+		// selection owns the number keys ONLY while the candidate-inspection
+		// sub-view blurs the input (an explicit modal interaction). All other
+		// printable characters remain text.
 		if m.pendingHotfixAmbiguous != nil {
 			switch {
 			case msg.Type == tea.KeyCtrlC:
 				return m.cancelHotfixAmbiguous()
-			case msg.String() == "c":
+			case msg.String() == "alt+c":
 				return m.clarifyHotfixTarget()
-			case msg.String() == "i":
+			case msg.String() == "alt+i":
 				return m.toggleHotfixCandidates()
-			case msg.String() == "x" || msg.Type == tea.KeyEscape:
+			case msg.String() == "alt+x" || msg.Type == tea.KeyEscape:
 				return m.cancelHotfixAmbiguous()
 			case msg.Type == tea.KeyEnter:
 				if m.ti.Focused() && m.ti.Value() != "" {
 					return m.submitHotfixCardCommand()
 				}
+				if m.hotfixCandidatesMode {
+					return m.toggleHotfixCandidates()
+				}
 				return m.clarifyHotfixTarget()
 			default:
-				if m.hotfixCandidatesMode && len(m.pendingHotfixAmbiguous.Candidates) > 0 {
+				if m.hotfixCandidatesMode && len(m.pendingHotfixAmbiguous.Candidates) > 0 && !m.ti.Focused() {
 					if msg.Type == tea.KeyRunes {
 						d := msg.Runes
 						if len(d) == 1 && d[0] >= '1' && d[0] <= '9' {
@@ -416,11 +468,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				// Forward every other keystroke to the text input so the next
 				// command can be composed while the card renders.
-				var tiCmd tea.Cmd
-				m.ti, tiCmd = m.ti.Update(msg)
-				m.syncInputFromTI()
-				m.updateSuggestions()
-				return m, tiCmd
+				return m, m.forwardToInput(msg)
 			}
 		}
 

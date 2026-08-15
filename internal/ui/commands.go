@@ -164,6 +164,13 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
+	// ── STALE ACTION-CHIP INVALIDATION ───────────────────────────────
+	// Any new user input ends the previous result's relevance: a chip
+	// referencing a completed, cancelled, or superseded operation must not
+	// linger and offer to re-run an obsolete action. A fresh interaction
+	// always renders with a clean chip surface.
+	m.currentResult = nil
+
 	// Clear any stale error bar on new user input
 	m.lastApplyError = ""
 
@@ -293,10 +300,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 		// immediately trigger execution instead of returning nil
 		// (which leaves the UI frozen in an idle state).
 		if mode == modes.ModeBuild {
-			hasStagedTasks := len(m.sess.CurrentTasks) > 0
-			hasPendingTodos := len(m.handoffCtx.PendingTodos) > 0
-			hasLedgerTasks := m.sess != nil && m.sess.ContextLedger != nil && len(m.sess.ContextLedger.Tasks) > 0
-			if hasStagedTasks || hasPendingTodos || hasLedgerTasks {
+			if m.hasStagedBuildWork() {
 				return tea.Batch(m.runBuildCmd(""), switchCmd)
 			}
 		}
@@ -2352,6 +2356,16 @@ func (m *model) transitionToBuilding() error {
 // atomic structural tasks are staged (the zombie-data guard) and otherwise
 // executes EXCLUSIVELY on the structured items, ignoring any unstructured
 // message history or stale conversational buffers.
+// hasStagedBuildWork reports whether the session carries any executable build
+// work (staged typed tasks, pending TODO checklist, or ledger tasks). It is
+// the single source of truth for "a build can start right now" used by the
+// continuous-execution seams (chip activation, mode auto-entry).
+func (m *model) hasStagedBuildWork() bool {
+	return (m.sess != nil && len(m.sess.CurrentTasks) > 0) ||
+		len(m.handoffCtx.PendingTodos) > 0 ||
+		(m.sess != nil && m.sess.ContextLedger != nil && len(m.sess.ContextLedger.Tasks) > 0)
+}
+
 func (m *model) runBuildCmd(content string) tea.Cmd {
 	hasStagedTasks := len(m.sess.CurrentTasks) > 0
 	hasPendingTodos := len(m.handoffCtx.PendingTodos) > 0
@@ -7300,6 +7314,19 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 		m.handoffLedgerContent = ""
 		m.currentResult = nil
 		cmd := m.setMode(mode)
+
+		// ── CONTINUOUS EXECUTION: an approved /build chip executes directly ──
+		// The "Approve Plan" and "Execute Build" chips represent real
+		// executable-now actions, not decorative mode switches. setMode's
+		// auto-trigger dispatches the build executor when staged tasks exist
+		// (buildHandoffTriggerContent → runBuildCmd) — so the user never
+		// repeats `/build` to start the pipeline they just approved. When the
+		// auto-trigger cannot fire (e.g. no staged handoff payload), run the
+		// executor directly against the staged task queue.
+		if mode == modes.ModeBuild && m.hasStagedBuildWork() && m.buildHandoffTriggerContent(mode) == "" {
+			return tea.Batch(m.runBuildCmd(""), cmd)
+		}
+
 		if action.Query != "" {
 			return m.handleMessageContent(action.Query)
 		}

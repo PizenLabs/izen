@@ -725,11 +725,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// interactive todo checklist look in the TUI.
 		// Also expose the plan approval action chips — the user must explicitly
 		// approve the plan before /build execution begins.
-		// Fast-track plans are auto-approved — show execute-build + reset actions
-		// so action chips are visible from ANY mode (including /ask).
+		// Fast-track plans are auto-approved — execution continues IMMEDIATELY
+		// (continuous execution: no artificial chip gate for an already
+		// authorized, deterministic plan). The plan is still rendered first so
+		// the user sees what /build is executing, then runBuildCmd picks up the
+		// staged tasks in the same turn.
 		// Non-fast-track plans show the explicit approval gate.
 		if msg.IsFastTrack {
-			m.currentResult = fastTrackPlanActions()
+			m.currentResult = nil
 		} else {
 			m.currentResult = planApprovalActions()
 		}
@@ -761,7 +764,35 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
-		return m, tea.Batch(flush, m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput))
+		base := []tea.Cmd{flush, m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput)}
+
+		// ── CONTINUOUS EXECUTION: auto-approved fast-track continues to build ──
+		// A fast-track plan is pre-approved and deterministic (the compressor /
+		// intent compiler already resolved the target). The build executor
+		// starts in the same turn — no second /build, no chip press, no
+		// artificial pause between plan and execution. The mutation approval
+		// gate (patch proposal) still protects every byte that reaches disk.
+		//
+		// SINGLE-DISPATCH GUARD: setMode's own auto-trigger already dispatches
+		// build execution when a handoff payload exists (buildHandoffTriggerContent
+		// → handleMessageContent → runBuildCmd), so we NEVER pair setMode with an
+		// explicit runBuildCmd in the same batch. runBuildCmd is dispatched
+		// directly only when already in /build (no transition) or when the
+		// handoff auto-trigger cannot produce a payload.
+		if msg.IsFastTrack {
+			if m.resolver.Current() != modes.ModeBuild {
+				m.modeChangeAuthorized = true
+				if m.buildHandoffTriggerContent(modes.ModeBuild) != "" {
+					base = append(base, m.setMode(modes.ModeBuild))
+				} else {
+					base = append(base, m.setMode(modes.ModeBuild), m.runBuildCmd(""))
+				}
+			} else {
+				base = append(base, m.runBuildCmd(""))
+			}
+			base = append(base, m.smoothStreamTickCmd(), m.shimmerTickCmd())
+		}
+		return m, tea.Batch(base...)
 
 	case graphBuiltMsg:
 		m.clearBusyFlags()
@@ -3167,6 +3198,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+
+		// ── PRIORITY 1: ACTIVE TEXT INPUT ────────────────────────────
+		// A printable character typed into the focused input is ALWAYS text.
+		// It can never be hijacked by a capability hotkey, the '?' help
+		// toggle, or any other single-character keybinding. Explicit
+		// keybinding mechanisms (Enter, Esc, arrows, alt+…, ctrl+…) fall
+		// through to the handlers below.
+		if m.ti.Focused() && isPrintableRunes(msg) {
+			return m, m.forwardToInput(msg)
+		}
 
 		// ── Capability Hotkeys (alt+ modifier only) ────────────────────
 		// Single-character hotkeys are strictly banned to prevent key

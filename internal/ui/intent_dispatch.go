@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -21,8 +22,86 @@ import (
 // (/build$hot$test …) and marker-based intent resolve natively. The active
 // session workspace supplies the default permission context when the line
 // carries no /workspace marker.
+//
+// CONTINUOUS EXECUTION: when the current workspace lacks a directive's
+// required permission AND the line declares no explicit /workspace marker,
+// the parse is re-attempted against the directive's canonical execution
+// context (directive_contract.go). The returned AST then declares that
+// context, so dispatchASTIntent performs the internal mode transition and
+// continues — the user is never forced to repeat the mode command. A line
+// that explicitly declares /ask (or any other workspace) still honors that
+// declaration and is rejected by the parser's permission policy unchanged.
 func (m *model) intentFromInput(line string) (*parser.IntentAST, error) {
-	return parser.ParseInWorkspace(line, cmdreg.Default(), workspaceForMode(m.resolver.Current()))
+	current := workspaceForMode(m.resolver.Current())
+	ast, err := parser.ParseInWorkspace(line, cmdreg.Default(), current)
+	if err == nil {
+		return m.alignDirectiveContext(ast, line), nil
+	}
+
+	var pe *parser.ParseError
+	if !errors.As(err, &pe) || pe.Kind != parser.ErrPermissionDenied || pe.Marker != cmdreg.MarkerDollar {
+		return nil, err
+	}
+	// An explicit /workspace marker overrides any auto-transition: the user
+	// declared the context, so its permission boundary is authoritative.
+	if _, explicit := workspaceFromInput(line, cmdreg.Default()); explicit {
+		return nil, err
+	}
+	mode, ok := executionModeForDirective(pe.Name)
+	if !ok || directiveWorksIn(pe.Name, m.resolver.Current()) {
+		return nil, err
+	}
+	ast, retryErr := parser.ParseInWorkspace(line, cmdreg.Default(), workspaceForMode(mode))
+	if retryErr != nil {
+		return nil, err
+	}
+	return m.alignDirectiveContext(ast, line), nil
+}
+
+// alignDirectiveContext performs the continuous-execution mode alignment for a
+// successfully parsed intent: when the intent carries directives and the
+// active mode is not a native context for any of them, the AST's workspace is
+// re-resolved to the single unambiguous execution context the directives
+// share (directive_contract.go). dispatchASTIntent then performs the internal
+// mode transition and execution continues — the user never repeats the mode
+// command. An explicit /workspace marker in the line is always authoritative
+// and prevents any alignment; directives with conflicting execution contexts
+// (e.g. "$test $env" from one mode) are left untouched.
+func (m *model) alignDirectiveContext(ast *parser.IntentAST, line string) *parser.IntentAST {
+	if len(ast.Directives) == 0 {
+		return ast
+	}
+	if _, explicit := workspaceFromInput(line, cmdreg.Default()); explicit {
+		return ast
+	}
+	current := m.resolver.Current()
+	target := modes.ModeAsk
+	found := false
+	for _, d := range ast.Directives {
+		if directiveWorksIn(d.Name, current) {
+			// At least one directive dispatches natively here: the mode is a
+			// valid execution context — do not force a transition.
+			return ast
+		}
+		mode, ok := executionModeForDirective(d.Name)
+		if !ok {
+			return ast
+		}
+		if !found {
+			target = mode
+			found = true
+			continue
+		}
+		if mode != target {
+			// Conflicting execution contexts: leave routing to the legacy
+			// mode-scoped handler rather than guessing.
+			return ast
+		}
+	}
+	if found && target != current {
+		ast.Workspace = workspaceForMode(target)
+	}
+	return ast
 }
 
 // dispatchASTIntent executes a parsed IntentAST through the active executor.
