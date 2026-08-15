@@ -1101,6 +1101,14 @@ type model struct {
 	activeOp *operation
 	// opIDCounter issues monotonically increasing operation IDs.
 	opIDCounter uint64
+	// activitySurfaceSealed is set by /clear (resetTransientInteraction) and
+	// cleared by the next foreground operation (beginOperation) or user
+	// submission (submitEnter). While sealed, engine-derived activity
+	// projections (domain events, engine telemetry, shell output, terminal
+	// result records, reasoning streams, control facts) are dropped so a late
+	// event from the cleared execution can never resurrect stale activity in
+	// the viewport. See lifecycle.go.
+	activitySurfaceSealed bool
 	// cancelGraceDeadline is the double-Ctrl+C force-exit window armed when a
 	// graceful cancellation is initiated. A second Ctrl+C before this deadline
 	// hard-exits with status 130.
@@ -1733,6 +1741,13 @@ func (m *model) setApplyError(text string) {
 // they are fed directly from the engine via handleEngineEvent for
 // typed events with real I/O metrics.
 func (m *model) logActivity(format string, args ...interface{}) {
+	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
+	// After /clear the surface is sealed until the next operation or user
+	// submission: a late engine activity line from the cleared execution must
+	// never repopulate the cleared records.
+	if m.activitySurfaceSealed {
+		return
+	}
 	msg := sanitizeIngressANSI(fmt.Sprintf(format, args...))
 	r := record{role: roleActivity, text: msg}
 	m.records = append(m.records, r)
@@ -1755,6 +1770,13 @@ func (m *model) logActivity(format string, args ...interface{}) {
 // from each engine package and converted to the canonical EngineEvent.
 func (m *model) handleEngineEvent(ev interface{}) {
 	if m.activityTree == nil {
+		return
+	}
+	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
+	// After /clear the structured activity tree is cleared and sealed; a late
+	// typed engine I/O event (file read/mutate/search/resolve) from the cleared
+	// execution must not re-append to it.
+	if m.activitySurfaceSealed {
 		return
 	}
 	// Type-assert to known event structs from engine packages.
@@ -1813,6 +1835,15 @@ func (m *model) handleEngineEvent(ev interface{}) {
 // surfaces engine events in the viewport — engines never call the UI directly.
 func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	if ev == nil {
+		return
+	}
+	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
+	// After /clear the surface is sealed until the next operation or user
+	// submission: a late domain event from the cleared execution (activity
+	// line, engine telemetry, reasoning stream) must never resurrect stale
+	// activity. Engine-side workflow state (the WorkflowStateMachine) is
+	// untouched — only the UI projection is dropped.
+	if m.activitySurfaceSealed {
 		return
 	}
 	switch p := ev.Payload().(type) {
@@ -2238,6 +2269,12 @@ func (m *model) handleControlFact(ev telemetry.Event) {
 	if ev == nil {
 		return
 	}
+	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
+	// After /clear the fact-only execution tree is cleared and sealed; a late
+	// control fact from the cleared execution must not rebuild it.
+	if m.activitySurfaceSealed {
+		return
+	}
 	switch ev.Type() {
 	case telemetry.EventControlIteration:
 		p, ok := ev.Payload().(*telemetry.ControlIterationPayload)
@@ -2325,6 +2362,12 @@ func (m *model) ensureControlSnapshot(runID string) {
 // thinking buffer. Chunks are appended verbatim; the terminal event (empty
 // chunk + IsComplete) collapses the box. Only ever runs on the UI goroutine.
 func (m *model) handleReasoningStream(chunk string, isComplete bool) {
+	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
+	// After /clear the thinking buffer is cleared and sealed; a late reasoning
+	// chunk from the cleared execution must not resurrect the thinking block.
+	if m.activitySurfaceSealed {
+		return
+	}
 	if m.thinkingBuffer == nil {
 		m.thinkingBuffer = NewThinkingBuffer()
 	}
@@ -2393,6 +2436,15 @@ func truncateForActivity(s string) string {
 // push appends a record. Records are flushed to the terminal's native
 // scrollback at explicit sync points (user submit, stream done, etc.).
 func (m *model) push(r role, text string) {
+	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
+	// After /clear the surface is sealed until the next operation or user
+	// submission: a terminal result record pushed by the cleared execution
+	// must never repopulate the cleared records. submitEnter reopens the
+	// surface before any user-initiated interaction, so interactive messages
+	// always render.
+	if m.activitySurfaceSealed {
+		return
+	}
 	text = sanitizeIngressANSI(text)
 	m.records = append(m.records, record{role: r, text: text})
 	m.cacheRecordToHistory(record{role: r, text: text})
@@ -2962,6 +3014,11 @@ func (m *model) flushPendingReasoningFragment() {
 		return
 	}
 	m.reasoningBuffer.WriteString(leftover)
+	// A late stream-completion reasoning flush after /clear (sealed surface)
+	// must not resurrect the cleared thinking panel / stream blocks.
+	if m.activitySurfaceSealed {
+		return
+	}
 	if m.thinkingPanel != nil {
 		m.thinkingPanel.Append(leftover)
 	}

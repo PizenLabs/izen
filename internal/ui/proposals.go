@@ -675,6 +675,9 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 }
 
 func (m *model) createBuildCheckpoint(fileCount int) {
+	if m.execEng == nil {
+		return
+	}
 	cp, err := m.execEng.Checkpoints.Create(fmt.Sprintf("izen build: %d file(s)", fileCount))
 	if err != nil {
 		m.push(roleSystem, infoStyle.Render("checkpoint: "+err.Error()))

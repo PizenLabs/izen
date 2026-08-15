@@ -1990,7 +1990,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				// nochange and skipped render neutrally, never as a green ✓ Edit.
 				outcome := msg.outcome()
 				mutated := outcome.MutationSucceeded()
-				m.logStore.AddFullSemantic(LogResult, msg.file, mutated, evidenceDetail, thinkingContent, "", execution.StageResult, outcome)
+				if !m.activitySurfaceSealed {
+					m.logStore.AddFullSemantic(LogResult, msg.file, mutated, evidenceDetail, thinkingContent, "", execution.StageResult, outcome)
+				}
 				// ── FAST-TRACK EARLY COMPLETION ─────────────────────────
 				// When a fast-track batch covered every plan target and the
 				// last proposal has been applied, per-task execution is
@@ -2029,7 +2031,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				if m.thinkingPanel != nil {
 					thinkingContent = m.thinkingPanel.String()
 				}
-				m.logStore.AddFullSemantic(LogResult, msg.file, false, msg.err.Error(), thinkingContent, "", execution.StageResult, msg.outcome())
+				if !m.activitySurfaceSealed {
+					m.logStore.AddFullSemantic(LogResult, msg.file, false, msg.err.Error(), thinkingContent, "", execution.StageResult, msg.outcome())
+				}
 			}
 		} else {
 			m.enterApprovalState()
@@ -2053,11 +2057,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		for _, r := range msg.results {
 			if r.err != nil {
 				m.setApplyError("apply failed: " + r.err.Error())
-				thinkingContent := ""
-				if m.thinkingPanel != nil {
-					thinkingContent = m.thinkingPanel.String()
+				// Late failure from a cleared execution (sealed surface): keep
+				// the error state but do not resurrect the cleared log.
+				if !m.activitySurfaceSealed {
+					thinkingContent := ""
+					if m.thinkingPanel != nil {
+						thinkingContent = m.thinkingPanel.String()
+					}
+					m.logStore.AddFullSemantic(LogResult, r.file, false, r.err.Error(), thinkingContent, "", execution.StageResult, r.outcome())
 				}
-				m.logStore.AddFullSemantic(LogResult, r.file, false, r.err.Error(), thinkingContent, "", execution.StageResult, r.outcome())
 				failed++
 				continue
 			}
@@ -2073,7 +2081,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// Only a real filesystem mutation renders as a successful Edit;
 			// nochange/skipped render neutrally with their outcome label.
 			outcome := r.outcome()
-			m.logStore.AddFullSemantic(LogResult, r.file, outcome.MutationSucceeded(), r.status, thinkingContent, "", execution.StageResult, outcome)
+			if !m.activitySurfaceSealed {
+				m.logStore.AddFullSemantic(LogResult, r.file, outcome.MutationSucceeded(), r.status, thinkingContent, "", execution.StageResult, outcome)
+			}
 			applied++
 		}
 		m.pendingProposals = nil
@@ -2142,7 +2152,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// activity tree so the output grows in real-time (visible via Ctrl+O
 		// expansion). The heartbeat keeps the idle-gate hang detector from
 		// force-clearing the shell spinner.
-		if m.activityTree != nil {
+		if !m.activitySurfaceSealed && m.activityTree != nil {
 			m.activityTree.AppendExecOutput(msg.text)
 		}
 		m.lastAgentActivity = time.Now()
@@ -2166,10 +2176,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.shellCancel = nil
 		}
 		m.stopShimmer()
-		if m.activityTree != nil {
+		if !m.activitySurfaceSealed && m.activityTree != nil {
 			m.activityTree.CompleteLastExec(msg.exitCode, msg.elapsed)
 		}
-		if msg.err != nil && msg.exitCode != 0 {
+		if !m.activitySurfaceSealed && msg.err != nil && msg.exitCode != 0 {
 			m.push(roleSystem, dimmedStyle.Render(fmt.Sprintf(
 				"shell exited %d (%s)", msg.exitCode, formatElapsed(msg.elapsed))))
 		}
@@ -2505,12 +2515,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if finalReasoning != "" {
 			m.reasoningBuffer.WriteString(finalReasoning)
 			m.sentinelReasoningFlushed = m.reasoningBuffer.Len()
-			if m.thinkingPanel != nil {
-				m.thinkingPanel.Append(finalReasoning)
-			}
-			if m.thinkingBuffer != nil {
-				m.thinkingBuffer.Append(finalReasoning)
-				m.thinkingBuffer.MarkComplete()
+			// A late stream completion after /clear (sealed surface) must not
+			// resurrect the cleared thinking buffers.
+			if !m.activitySurfaceSealed {
+				if m.thinkingPanel != nil {
+					m.thinkingPanel.Append(finalReasoning)
+				}
+				if m.thinkingBuffer != nil {
+					m.thinkingBuffer.Append(finalReasoning)
+					m.thinkingBuffer.MarkComplete()
+				}
 			}
 		}
 		// The stream is genuinely done now — nothing more will ever close
@@ -3005,7 +3019,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case thinkingStreamMsg:
 		// Real-time reasoning token dispatch to the TUI Thinking Panel.
 		// Updates from token #1 — no waiting for the full response.
-		if m.thinkingPanel != nil {
+		// A late chunk after /clear (sealed surface) must not resurrect the
+		// cleared thinking panel.
+		if !m.activitySurfaceSealed && m.thinkingPanel != nil {
 			m.thinkingPanel.Append(msg.Content)
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()

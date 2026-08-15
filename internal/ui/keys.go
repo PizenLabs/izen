@@ -785,6 +785,10 @@ func (m *model) syncInputFromTI() {
 // before handing off here.
 func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 	m.userIsScrollingUp = false
+	// A new user interaction reopens the activity surface sealed by /clear:
+	// everything the user submits from here on is a fresh interaction whose
+	// events belong in the viewport again (see lifecycle.go).
+	m.unsealActivitySurface()
 
 	userInput := m.ti.Value()
 	m.dismissSuggestions()

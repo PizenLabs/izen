@@ -148,6 +148,9 @@ func (m *model) nextOperationID() string {
 // derived presentation state enters StateProcessing immediately.
 func (m *model) beginOperation(kind OperationKind) *operation {
 	ctx, cancel := context.WithCancel(context.Background())
+	// A new foreground operation reopens the activity surface sealed by /clear:
+	// this operation's events are a fresh execution and belong in the viewport.
+	m.unsealActivitySurface()
 	op := &operation{
 		ID:           m.nextOperationID(),
 		Kind:         kind,

@@ -1979,69 +1979,30 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case cmd == "/clear":
-		m.records = nil
-		m.PreRenderedHistory = ""
-		m.showBanner = true
-		m.currentResult = nil
-		m.currentPrompt = ""
-		m.responseBuffer.Reset()
-		m.streamBuffer = ""
-		m.currentStreamContent = ""
-		m.resetStreamBlocks()
-		m.streaming = false
-
-		// Purge ContextLedger (ask_handoff_payload, investigation findings,
-		// pending execution tasks, and all analytical packets).
-		if m.sess != nil {
-			m.sess.ContextLedger = nil
-			m.sess.InvestigationID = ""
-			m.sess.ReviewID = ""
-			m.sess.ClearHistory()
-			m.sess.ClearTasks()
-			_ = m.sess.Save()
-		}
-
-		// Clear handoff pipeline state.
-		m.handoffCtx = HandoffContext{}
-		m.handoffLedgerContent = ""
-		m.lastInvestigateLedger = nil
-
-		// Clear forensic / test telemetry caches.
-		m.lastTestOutput = ""
-		m.lastTestFailed = false
-		m.lastTestTarget = ""
-		m.pendingFileRefs = nil
-
-		// Reset build and proposal gates.
-		m.buildRecoveryCount = 0
-		m.buildVerifyPending = false
-		m.pendingBuildApproval = false
-		m.pendingBuildTask = nil
-		m.pendingBuildAllowAlways = false
-		m.pendingProposals = nil
-		m.acceptedProposals = nil
-		m.awaitingConfirmation = false
-		m.acceptAll = false
-		m.pendingHotfixTask = nil
-		m.currentBuildTaskID = 0
-		m.pendingTestConfirm = false
-		m.pendingTestTarget = ""
-		m.investigateInvocationCount = 0
-
-		// Zero out cumulative token counters.
-		m.InputTokens = 0
-		m.OutputTokens = 0
-		m.TotalTokens = 0
-		m.ContextLimit = 0
-		m.AccumulatedCost = 0
-
-		m.refreshViewportContent()
+		// ── /CLEAR = clear the visible/transient interaction surface ──
+		// It clears PRESENTATION state (records, stream, thinking, loading,
+		// chips) and EXECUTION-ACTIVITY surfaces (activity tree, execution
+		// log, control tree, stage, telemetry) plus the transient interaction
+		// gates (proposals/approvals/routing confirms/tool-call buffer) and
+		// the staged plan task list (a pending artifact).
+		//
+		// It does NOT destroy the workspace, the current mode, the repository,
+		// or durable session state (history, objective, context ledger) — and
+		// it does NOT create a new session. /clear is NOT /new. It also seals
+		// the activity surface so a late event from the cleared execution can
+		// never resurrect stale activity. See lifecycle.go.
+		m.resetTransientInteraction()
 		return tea.Sequence(
 			tea.ClearScreen,
-			tea.Println("✕ [IZEN Memory] Context ledger and pending tasks successfully purged. Workspace reset."),
+			tea.Println("✕ [IZEN Memory] Transient interaction surface cleared. Session, workspace and mode preserved."),
 		)
 
 	case cmd == "/drop" || cmd == "/drop all":
+		// ── /DROP = detach retained context files from the session ──
+		// Distinct from /clear: /drop removes the user-attached @file context
+		// (attachedFiles / pendingFileRefs) from the session, nothing else.
+		// It does NOT touch the records, execution activity, or presentation
+		// surfaces — a drop is never a visual clear.
 		m.attachedFiles = nil
 		m.pendingFileRefs = nil
 		m.push(roleSystem, infoStyle.Render("all context files detached"))
