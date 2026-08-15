@@ -2827,10 +2827,14 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			if n > 0 {
 				// ── AUTHORITATIVE STAGE: provider streaming ──────────
 				// Bytes are actively arriving from the provider — only now does
-				// the indicator claim streaming, using the provider-reported
-				// token usage when available.
+				// the indicator claim streaming. The token count is populated
+				// EXCLUSIVELY from the provider's authoritative reported usage
+				// (Known && !Estimated) so a character-count estimate is never
+				// presented as billed tokens.
 				m.setStage("model", req.Model, stageStreaming)
-				m.setStageMetrics(0, 0, streamUsage().CompletionTokens)
+				if su := streamUsage(); su.Known && !su.Estimated {
+					m.setStageMetrics(0, 0, su.CompletionTokens)
+				}
 				buf.WriteString(runeBuf.Write(readBuf[:n]))
 			}
 			// On EOF release any incomplete rune still held back so no

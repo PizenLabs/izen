@@ -121,6 +121,18 @@ type tokenMsg string
 // content streams in bright.
 type thinkingTokenMsg string
 
+// streamUsageMsg carries the provider's AUTHORITATIVE cumulative token usage
+// observed mid-stream. It is emitted by the stream producer only when the
+// provider reports a usage update (Known && !Estimated — never a character-count
+// estimate), so the live streaming indicator reflects billed tokens and never a
+// fabricated count. Reasoning carries the provider-reported reasoning-token
+// split when available, which backs the compact thought summary.
+type streamUsageMsg struct {
+	input     int
+	output    int
+	reasoning int
+}
+
 type streamDoneMsg struct {
 	content     string
 	tokenInput  int

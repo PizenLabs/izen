@@ -138,14 +138,15 @@ func TestThinkingBufferRenderAutoScroll(t *testing.T) {
 func TestThinkingBufferRenderCompactOnComplete(t *testing.T) {
 	tb := NewThinkingBuffer()
 	tb.Append("some reasoning")
+	tb.SetReasoningTokens(64)
 	tb.MarkComplete()
 	out := tb.Render(80, true, "✦")
 
 	if !strings.Contains(out, "Thought for") {
 		t.Errorf("compact line missing Thought for: %q", out)
 	}
-	if !strings.Contains(out, "tokens)") {
-		t.Errorf("compact line missing token count: %q", out)
+	if !strings.Contains(out, "64") {
+		t.Errorf("compact line missing authoritative token count: %q", out)
 	}
 	if strings.Contains(out, "some reasoning") {
 		t.Errorf("compact mode must not render full reasoning: %q", out)

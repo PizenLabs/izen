@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/ui/status"
 )
 
 // ── Authoritative execution-stage record ────────────────────────────────────
@@ -322,7 +323,14 @@ func renderStageStatus(st stageView) string {
 		}
 		return fmt.Sprintf("Model ● waiting · %s", formatDurationElapsed(wait))
 	case stageStreaming:
-		return fmt.Sprintf("Model ● streaming · %d tokens", st.Tokens)
+		// The token count is ONLY ever the authoritative provider-reported
+		// count (fed via setStageMetrics from the stream's ProviderUsage).
+		// When no authoritative usage has arrived, the indicator stays plain
+		// "streaming" — it never fabricates a number from a buffer length.
+		if st.Tokens > 0 {
+			return fmt.Sprintf("Model ● streaming · %s tok", status.FormatTokens(st.Tokens))
+		}
+		return "Model ● streaming"
 	case stageBlocked:
 		return fmt.Sprintf("Model ● blocked · %s", formatDurationElapsed(time.Since(st.LastTs)))
 	case stageRunning:

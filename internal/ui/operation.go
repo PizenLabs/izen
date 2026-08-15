@@ -148,6 +148,13 @@ func (m *model) nextOperationID() string {
 // derived presentation state enters StateProcessing immediately.
 func (m *model) beginOperation(kind OperationKind) *operation {
 	ctx, cancel := context.WithCancel(context.Background())
+	// ── ACTION SURFACE OWNERSHIP (Phase 7) ────────────────────────────
+	// A new operation owns the action surface: any chips left over from a
+	// PREVIOUS operation's result are stale the moment actual execution begins.
+	// They disappear here (centralized) so no completed operation's actions can
+	// be re-triggered by a newer one. The operation's own terminal result
+	// message re-populates the surface with its valid transitions.
+	m.currentResult = nil
 	// A new foreground operation reopens the activity surface sealed by /clear:
 	// this operation's events are a fresh execution and belong in the viewport.
 	m.unsealActivitySurface()

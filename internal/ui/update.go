@@ -2401,8 +2401,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// ── AUTHORITATIVE STAGE: provider bytes are arriving ────────
 		// Reasoning tokens are real provider output — the indicator becomes
 		// "streaming" (never "thinking"), without exposing the reasoning text.
+		// NO token count is asserted here: only the producer's authoritative
+		// streamUsageMsg (provider-reported usage) may populate the count.
 		m.setStage("model", m.getActiveModelName(), stageStreaming)
-		m.setStageMetrics(0, 0, len(m.responseBuffer.String())/4+1)
 		m.ensureStreamBlocks().Append(KindThinking, string(msg))
 		// Full stream transparency: the reasoning chunk is also retained in the
 		// active ThinkingBuffer via the ThoughtBufferUpdatedMsg protocol so the
@@ -2437,10 +2438,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.responseBuffer.WriteString(raw)
 		// ── AUTHORITATIVE STAGE: real provider tokens are arriving ──
 		// Only content bytes received from the provider mark the stage as
-		// streaming; the token count tracks the real response buffer.
+		// streaming. The token count is NEVER derived from the response
+		// buffer length — it is populated only by the producer's authoritative
+		// streamUsageMsg (provider-reported usage).
 		if raw != "" {
 			m.setStage("model", m.getActiveModelName(), stageStreaming)
-			m.setStageMetrics(0, 0, len(m.responseBuffer.String())/4+1)
 		}
 		m.traceBuffer.WriteString(raw)
 		if m.streamThrottle != nil {
@@ -2466,6 +2468,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.ti, tiCmd = m.ti.Update(msg)
 		cmds = append(cmds, tiCmd)
 		return m, tea.Batch(cmds...)
+
+	case streamUsageMsg:
+		// ── AUTHORITATIVE LIVE TOKEN USAGE ───────────────────────────
+		// The provider reported a usage update while the stream is live. Feed
+		// ONLY that authoritative count into the streaming indicator — never a
+		// character-count estimate. A zero/unknown usage leaves the count
+		// empty so the renderer shows plain "streaming". The reasoning split
+		// also backs the compact thought summary so its "N tokens" is
+		// provider-reported, not estimated.
+		m.setStageMetrics(0, 0, msg.output)
+		if m.thinkingBuffer != nil && msg.reasoning > 0 {
+			m.thinkingBuffer.SetReasoningTokens(msg.reasoning)
+		}
+		// The usage message was pulled off the stream channel — chain the next
+		// read so the token/done messages behind it keep flowing.
+		return m, m.readStream()
 
 	case streamDoneMsg:
 		// ── AUTHORITATIVE STAGE: provider stream completed ─────────

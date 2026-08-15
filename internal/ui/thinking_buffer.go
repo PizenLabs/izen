@@ -27,6 +27,12 @@ type ThinkingBuffer struct {
 	complete bool
 	started  time.Time
 	maxLines int
+	// reasoningTokens is the provider-reported reasoning-token count for the
+	// captured thinking block. It is set ONLY from the authoritative
+	// ProviderUsage.ReasoningTokens (via streamUsageMsg); when unknown it stays
+	// 0 and the compact summary omits the token count entirely rather than
+	// deriving one from the reasoning text length.
+	reasoningTokens int
 	// expanded is the IsThinkingExpanded state: false (default) renders the
 	// compact spinner/summary line, true renders the full dimmed reasoning box.
 	expanded bool
@@ -71,6 +77,22 @@ func (tb *ThinkingBuffer) MarkComplete() {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 	tb.complete = true
+}
+
+// SetReasoningTokens records the provider-reported reasoning-token count. It
+// is authoritative usage only — never a character-count estimate.
+func (tb *ThinkingBuffer) SetReasoningTokens(n int) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.reasoningTokens = n
+}
+
+// ReasoningTokens reports the provider-reported reasoning-token count (0 when
+// unknown).
+func (tb *ThinkingBuffer) ReasoningTokens() int {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.reasoningTokens
 }
 
 // Complete reports whether the reasoning block has been marked complete.
@@ -122,6 +144,7 @@ func (tb *ThinkingBuffer) Reset() {
 	tb.builder.Reset()
 	tb.complete = false
 	tb.expanded = false
+	tb.reasoningTokens = 0
 	tb.started = time.Now()
 	tb.scrollOffset = 0
 	tb.scrolledUp = false
@@ -196,14 +219,14 @@ func (tb *ThinkingBuffer) ResetScroll() {
 	tb.scrolledUp = false
 }
 
-// estimateTokens is a cheap deterministic proxy for "N tokens" in the compact
-// summary line. It is display-only and never used for billing/accounting.
-func estimateTokens(text string) int {
-	t := len(text) / 4
-	if t < 1 {
-		t = 1
+// renderThoughtSummary renders the compact "▸ Thought for Xs" summary line. It
+// appends "(N tokens)" ONLY when the provider-reported reasoning-token count is
+// known — a character-derived estimate is never presented as a token count.
+func renderThoughtSummary(elapsed string, reasoningTokens int) string {
+	if reasoningTokens > 0 {
+		return fmt.Sprintf("▸ Thought for %s (%d tokens)", elapsed, reasoningTokens)
 	}
-	return t
+	return fmt.Sprintf("▸ Thought for %s", elapsed)
 }
 
 // Render produces the thinking block. It returns "" when there is nothing to
@@ -226,6 +249,7 @@ func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) stri
 	content := tb.builder.String()
 	complete := tb.complete
 	expanded := tb.expanded
+	reasoningTokens := tb.reasoningTokens
 	elapsed := time.Since(tb.started)
 	scrollOffset := tb.scrollOffset
 	scrolledUp := tb.scrolledUp
@@ -295,8 +319,8 @@ func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) stri
 			}
 		}
 		if complete {
-			linesOut = append(linesOut, thinkingStyle.Render(fmt.Sprintf("│ %s", mutedStyle.Render(
-				fmt.Sprintf("▸ Thought for %s (%d tokens)", elapsedStr, estimateTokens(content))))))
+			linesOut = append(linesOut, thinkingStyle.Render("│ "+mutedStyle.Render(
+				renderThoughtSummary(elapsedStr, reasoningTokens))))
 		}
 		if overflow {
 			// In-box scroll affordance footer. It only appears when the box
@@ -324,7 +348,7 @@ func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) stri
 		return thinkingStyle.Render(fmt.Sprintf("%s Thinking.. (%s)  %s",
 			sp, elapsedStr, mutedStyle.Render("[Ctrl+O to expand]")))
 	}
-	return thinkingStyle.Render(fmt.Sprintf("▸ Thought for %s (%d tokens)", elapsedStr, estimateTokens(content)))
+	return thinkingStyle.Render(renderThoughtSummary(elapsedStr, reasoningTokens))
 }
 
 // thinkingStyle is the dimmed/italic reasoning style. Reasoning must read as a

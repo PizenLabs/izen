@@ -292,10 +292,42 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		}
 		defer func() { _ = rawStream.Close() }()
 
+		// ── AUTHORITATIVE LIVE USAGE ───────────────────────────────────
+		// The streaming indicator must never display a character-count
+		// estimate. usageUp exposes the provider's real cumulative usage as
+		// usage chunks arrive (Claude reports input at message_start and
+		// cumulative output per message_delta; OpenAI-compatible providers
+		// report once at the end). emitUsage forwards ONLY authoritative
+		// updates (Known && !Estimated) so a partial or final provider count
+		// reaches the stage while an unknown/estimated count renders as plain
+		// "streaming" with no number.
+		var usageUp ai.UsageProvider
+		if up, ok := rawStream.(ai.UsageProvider); ok {
+			usageUp = up
+		}
+		var lastUsage = ai.ProviderUsage{}
+		emitUsage := func() {
+			if usageUp == nil {
+				return
+			}
+			u := usageUp.Usage()
+			if !u.Known || u.Estimated {
+				return
+			}
+			if u.PromptTokens == lastUsage.PromptTokens && u.CompletionTokens == lastUsage.CompletionTokens &&
+				u.ReasoningTokens == lastUsage.ReasoningTokens {
+				return
+			}
+			lastUsage = u
+			streamCh <- streamUsageMsg{input: u.PromptTokens, output: u.CompletionTokens, reasoning: u.ReasoningTokens}
+		}
+
 		full, ingestErr := ingestLLMStream(rawStream, m.bus, func(text string) {
 			streamCh <- tokenMsg(text)
+			emitUsage()
 		}, func(text string) {
 			streamCh <- thinkingTokenMsg(text)
+			emitUsage()
 		})
 
 		// ── AUTHORITATIVE PROVIDER USAGE ──────────────────────────────

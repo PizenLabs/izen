@@ -124,8 +124,23 @@ func (m *model) dispatchASTIntent(ast *parser.IntentAST) tea.Cmd {
 	// ── 1. WORKSPACE TRANSITION (BEFORE directives/globals) ──────────────
 	target := modeForWorkspace(ast.Workspace)
 	if target != m.resolver.Current() {
+		// CONTINUOUS $fix: the auto-transition's HANDOFF SANITIZER clears the
+		// transient test context (lastTestOutput) — exactly the payload $fix
+		// consumes. A $fix directive typed outside /build must not lose that
+		// context to the transition it performed internally: preserve it for
+		// the directive dispatch that follows. When no test ran before, the
+		// preserved empty value still yields the truthful "run $test first"
+		// notice — never a silent dead-end.
+		var savedOut, savedTarget string
+		savedFailed := m.lastTestFailed
+		if hasDirective(ast, "fix") {
+			savedOut, savedTarget = m.lastTestOutput, m.lastTestTarget
+		}
 		m.modeChangeAuthorized = true
 		m.setMode(target)
+		if hasDirective(ast, "fix") {
+			m.lastTestOutput, m.lastTestTarget, m.lastTestFailed = savedOut, savedTarget, savedFailed
+		}
 		cmds = append(cmds, m.runtimeSwitchCmd(target))
 	}
 
