@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 )
@@ -81,9 +82,42 @@ type geminiUsageMetadata struct {
 	TotalTokenCount      int `json:"totalTokenCount"`
 }
 
+// ProviderUsage converts the parsed Gemini usage metadata into the
+// authoritative ai.ProviderUsage contract.
+func (u *geminiUsageMetadata) ProviderUsage() ai.ProviderUsage {
+	out := ai.ProviderUsage{
+		PromptTokens:     u.PromptTokenCount,
+		CompletionTokens: u.CandidatesTokenCount,
+		TotalTokens:      u.TotalTokenCount,
+		Known:            true,
+	}
+	if out.TotalTokens == 0 {
+		out.TotalTokens = out.PromptTokens + out.CompletionTokens
+	}
+	return out
+}
+
 type geminiStreamResponse struct {
 	Candidates    []geminiCandidate    `json:"candidates"`
 	UsageMetadata *geminiUsageMetadata `json:"usageMetadata,omitempty"`
+}
+
+// finishReasonLabel normalizes a Gemini terminal finish reason onto the
+// canonical label set ("stop", "length", "tool_calls", ...). "MAX_TOKENS"
+// (completion ceiling hit) maps to "length" so consumers can uniformly detect
+// truncation.
+func finishReasonLabel(candidates []geminiCandidate) string {
+	if len(candidates) == 0 {
+		return ""
+	}
+	switch candidates[0].FinishReason {
+	case "MAX_TOKENS":
+		return "length"
+	case "STOP":
+		return "stop"
+	default:
+		return strings.ToLower(candidates[0].FinishReason)
+	}
 }
 
 func (p *GeminiProvider) buildMessages(req ai.Request) []geminiMessage {
@@ -175,15 +209,24 @@ func (p *GeminiProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	tokenIn := 0
 	tokenOut := 0
+	var usage ai.ProviderUsage
+	usage.RequestStartedAt = time.Now()
 	if geminiResp.UsageMetadata != nil {
 		tokenIn = geminiResp.UsageMetadata.PromptTokenCount
 		tokenOut = geminiResp.UsageMetadata.CandidatesTokenCount
+		usage = geminiResp.UsageMetadata.ProviderUsage()
+	}
+	usage.CompletedAt = time.Now()
+	usage.FinishReason = finishReasonLabel(geminiResp.Candidates)
+	if usage.FirstTokenAt.IsZero() {
+		usage.FirstTokenAt = usage.CompletedAt
 	}
 
 	return &ai.Response{
 		Content:     content,
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
+		Usage:       usage,
 	}, nil
 }
 
@@ -238,6 +281,7 @@ func (p *GeminiProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	}
 
 	sr := &geminiSSEReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
+	sr.usage.markRequestStarted(time.Now())
 	return &GeminiStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -246,11 +290,11 @@ type GeminiStreamResult struct {
 	sr *geminiSSEReader
 }
 
-func (r *GeminiStreamResult) Usage() (input, output int) {
+func (r *GeminiStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
 		return r.sr.usage.Usage()
 	}
-	return 0, 0
+	return ai.ProviderUsage{}
 }
 
 // FinishReason reports the terminal finish reason observed on the stream.
@@ -317,12 +361,13 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 
 		if event.UsageMetadata != nil {
 			s.finalUsage = event.UsageMetadata
-			s.usage.recordUsage(event.UsageMetadata.PromptTokenCount, event.UsageMetadata.CandidatesTokenCount)
+			s.usage.recordUsageFull(event.UsageMetadata.ProviderUsage())
 		}
 
 		if len(event.Candidates) > 0 {
 			if event.Candidates[0].FinishReason != "" {
 				s.finishReason = event.Candidates[0].FinishReason
+				s.usage.markCompleted(time.Now(), finishReasonLabel(event.Candidates))
 			}
 			for _, part := range event.Candidates[0].Content.Parts {
 				// Thought parts carry reasoning content and must be routed
@@ -348,6 +393,7 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 
 		if len(event.Candidates) > 0 && event.Candidates[0].Content.Role == "" {
 			s.closed = true
+			s.usage.markCompleted(time.Now(), finishReasonLabel(event.Candidates))
 			return 0, io.EOF
 		}
 	}

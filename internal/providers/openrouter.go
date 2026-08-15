@@ -179,9 +179,17 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 
 	tokenIn := 0
 	tokenOut := 0
+	var usage ai.ProviderUsage
+	usage.RequestStartedAt = time.Now()
 	if openaiResp.Usage != nil {
 		tokenIn = openaiResp.Usage.PromptTokens
 		tokenOut = openaiResp.Usage.CompletionTokens
+		usage = openaiResp.Usage.ProviderUsage()
+	}
+	usage.CompletedAt = time.Now()
+	usage.FinishReason = openaiResp.Choices[0].FinishReason
+	if usage.FirstTokenAt.IsZero() {
+		usage.FirstTokenAt = usage.CompletedAt
 	}
 
 	return &ai.Response{
@@ -189,6 +197,7 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
 		ToolCalls:   toolCalls,
+		Usage:       usage,
 	}, nil
 }
 
@@ -224,6 +233,7 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 	}
 
 	sr := &openrouterSSEReader{body: resp.Body}
+	sr.usage.markRequestStarted(time.Now())
 	return &OpenRouterStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -583,9 +593,48 @@ type openrouterToolDelta struct {
 }
 
 type openrouterUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens     int                       `json:"prompt_tokens"`
+	CompletionTokens int                       `json:"completion_tokens"`
+	TotalTokens      int                       `json:"total_tokens"`
+	PromptDetails    *openrouterUsageDetails   `json:"prompt_tokens_details,omitempty"`
+	CompletionDetail *openrouterCompletionInfo `json:"completion_tokens_details,omitempty"`
+}
+
+// openrouterUsageDetails carries the input-token split OpenRouter exposes
+// through the OpenAI-compatible prompt_tokens_details object.
+type openrouterUsageDetails struct {
+	CachedTokens    int `json:"cached_tokens,omitempty"`
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+}
+
+// openrouterCompletionInfo carries the output-token split for reasoning.
+type openrouterCompletionInfo struct {
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+}
+
+// ProviderUsage converts the parsed OpenRouter usage object into the
+// authoritative ai.ProviderUsage contract. Known is always true for a parsed
+// object: OpenRouter reports a usage object on every non-streaming response.
+func (u *openrouterUsage) ProviderUsage() ai.ProviderUsage {
+	out := ai.ProviderUsage{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		TotalTokens:      u.TotalTokens,
+		Known:            true,
+	}
+	if u.PromptDetails != nil {
+		out.CachedTokens = u.PromptDetails.CachedTokens
+		if out.ReasoningTokens == 0 {
+			out.ReasoningTokens = u.PromptDetails.ReasoningTokens
+		}
+	}
+	if u.CompletionDetail != nil {
+		out.ReasoningTokens += u.CompletionDetail.ReasoningTokens
+	}
+	if out.TotalTokens == 0 {
+		out.TotalTokens = out.PromptTokens + out.CompletionTokens + out.ReasoningTokens
+	}
+	return out
 }
 
 type OpenRouterStreamResult struct {
@@ -593,11 +642,11 @@ type OpenRouterStreamResult struct {
 	sr *openrouterSSEReader
 }
 
-func (r *OpenRouterStreamResult) Usage() (input, output int) {
+func (r *OpenRouterStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
 		return r.sr.usage.Usage()
 	}
-	return 0, 0
+	return ai.ProviderUsage{}
 }
 
 // FinishReason returns the terminal finish_reason observed on the stream
@@ -685,6 +734,7 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 
 		if data == "[DONE]" {
 			s.closed = true
+			s.usage.markCompleted(time.Now(), s.finishReason)
 			return 0, io.EOF
 		}
 
@@ -695,10 +745,16 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 
 		if chunk.Usage != nil {
 			s.finalUsage = chunk.Usage
-			s.usage.recordUsage(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
+			s.usage.recordUsageFull(chunk.Usage.ProviderUsage())
 		}
 
 		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		if chunk.Choices[0].FinishReason != "" {
+			s.finishReason = chunk.Choices[0].FinishReason
+			s.usage.markCompleted(time.Now(), chunk.Choices[0].FinishReason)
 			continue
 		}
 

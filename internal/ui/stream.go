@@ -298,22 +298,32 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			streamCh <- thinkingTokenMsg(text)
 		})
 
-		type usageProvider interface {
-			Usage() (input, output int)
-		}
+		// ── AUTHORITATIVE PROVIDER USAGE ──────────────────────────────
+		// The provider's final usage is the single source of truth for the
+		// footer token count. Streaming and non-streaming executions converge
+		// on the same ProviderUsage contract; the provider's authoritative
+		// counts are preserved verbatim and NEVER replaced by a local
+		// token-event counter. When the provider reports no usage (Known==false)
+		// the values stay 0 so the footer can render "usage unknown" instead of
+		// inventing a number.
 		tokIn, tokOut := 0, 0
-		if up, ok := rawStream.(usageProvider); ok {
-			tokIn, tokOut = up.Usage()
+		usageKnown := false
+		usageEstimated := false
+		if up, ok := rawStream.(ai.UsageProvider); ok {
+			u := up.Usage()
+			usageKnown = u.Known
+			usageEstimated = u.Estimated
+			tokIn = u.PromptTokens
+			tokOut = u.CompletionTokens
 		}
-		// LOCAL-ONLY ESTIMATE FALLBACK: the character-count estimate (/4) is a
-		// stand-in reserved strictly for local models (ollama) that genuinely
-		// do not report usage metadata. For cloud providers the provider's
-		// final-chunk usage is authoritative: if it reports 0/0 the values are
-		// left as 0 so the footer shows only what the provider actually billed
-		// — never an invented number that diverges from the dashboard.
-		if tokIn == 0 && tokOut == 0 && !m.IsCloudModel {
+		// LOCAL-ONLY ESTIMATE FALLBACK: reserved strictly for local models
+		// (ollama) that genuinely do not report usage metadata. Cloud
+		// providers never get a fabricated count — their reported usage is
+		// authoritative and 0 stays 0 when the provider billed nothing.
+		if !usageKnown && !m.IsCloudModel {
 			tokIn = len(content) / 4
 			tokOut = len(full) / 4
+			usageEstimated = true
 		}
 
 		// TRUNCATION DETECTION: when the provider reports finish_reason ==
@@ -330,14 +340,15 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			// provider-reported usage (or a character estimate) even when it
 			// was interrupted — carry it on the error message so the footer
 			// reports consumed tokens instead of a silent 0.
-			streamCh <- streamErrMsg{err: ingestErr, content: full, tokenInput: tokIn, tokenOutput: tokOut}
+			streamCh <- streamErrMsg{err: ingestErr, content: full, tokenInput: tokIn, tokenOutput: tokOut, usageEstimated: usageEstimated}
 			return
 		}
 		streamCh <- streamDoneMsg{
-			content:     full,
-			tokenInput:  tokIn,
-			tokenOutput: tokOut,
-			truncated:   truncated,
+			content:        full,
+			tokenInput:     tokIn,
+			tokenOutput:    tokOut,
+			usageEstimated: usageEstimated,
+			truncated:      truncated,
 		}
 	}()
 

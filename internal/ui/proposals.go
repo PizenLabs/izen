@@ -412,6 +412,65 @@ func (m *model) applySingleProposal() tea.Cmd {
 	return m.applyProposalCmd(p)
 }
 
+// applyEvidence assembles the authoritative MutationEvidence for an apply
+// attempt — the single source of truth for artifact/diff/apply/verify facts
+// (Part I). The renderer projects this record; it never infers a mutation from
+// a planned "Edit" event. Diff presence is derived from the actual compiled
+// artifact, filesystem mutation is re-read from disk, and the outcome is the
+// semantic vocabulary of execution.MutationOutcome.
+func applyEvidence(p SemanticProposal, origContent string, applied bool, applyErr error) *execution.MutationEvidence {
+	ev := &execution.MutationEvidence{
+		Stage: execution.StageApply,
+		File:  p.Target.QualifiedName,
+	}
+	artifact := p.Diff
+	if p.Patch != nil && p.Patch.Modified != "" {
+		artifact = p.Patch.Modified
+	}
+	ev.ArtifactPresent = artifact != ""
+	ev.DiffPresent = artifact != "" && strings.Contains(artifact, "@@")
+	if p.Diff != "" {
+		ev.DiffAdds, ev.DiffRemoves = countLinesDelta(p.Diff)
+	}
+
+	if !applied {
+		ev.Outcome = execution.OutcomeApplyFailed
+		switch {
+		case applyErr != nil && errors.Is(applyErr, execution.ErrDestructivePatchSkipped):
+			ev.Outcome = execution.OutcomeSkipped
+		case applyErr != nil && isContextCancelled(applyErr):
+			ev.Outcome = execution.OutcomeCancelled
+		case applyErr != nil && isContextDeadline(applyErr):
+			ev.Outcome = execution.OutcomeCancelled
+		}
+		if applyErr != nil {
+			ev.Reason = applyErr.Error()
+		}
+		return ev
+	}
+
+	// ── FILESYSTEM REALITY (Part D) ──────────────────────────────────
+	// NO_CHANGE is only recorded after a valid artifact was applied and the
+	// post-apply content is byte-for-byte unchanged. Otherwise the outcome is
+	// the concrete mutation the filesystem reflects.
+	ev.ApplyExecuted = true
+	if data, rerr := os.ReadFile(p.Target.QualifiedName); rerr == nil {
+		ev.FilesystemChanged = string(data) != origContent
+	}
+	ev.Outcome = execution.OutcomeChanged
+	if isNewFileCreation(p.Diff) {
+		ev.Outcome = execution.OutcomeCreated
+	}
+	if !ev.FilesystemChanged {
+		ev.Outcome = execution.OutcomeNoChange
+	}
+	// The patch manager runs the deterministic verification gate inside Apply;
+	// reaching this branch with no error means verification passed.
+	ev.VerificationRun = true
+	ev.VerificationPassed = true
+	return ev
+}
+
 func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 	return func() (msg tea.Msg) {
 		// ── AUTHORITATIVE STAGE: mutation apply ─────────────────────
@@ -466,8 +525,9 @@ func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 			// would bypass the guardrail and wipe the file.
 			if errors.Is(err, execution.ErrDestructivePatchSkipped) {
 				return mutationResultMsg{
-					file:   p.Target.QualifiedName,
-					status: "skipped",
+					file:     p.Target.QualifiedName,
+					status:   "skipped",
+					evidence: applyEvidence(p, origContent, false, err),
 				}
 			}
 			// Per-file full-rewrite fallback: when a patch fails due to
@@ -487,21 +547,23 @@ func (m *model) applyProposalCmd(p SemanticProposal) tea.Cmd {
 					}
 					if retryErr := m.applyPatchWithDeadline(retryPatch); retryErr == nil {
 						return mutationResultMsg{
-							file:   p.Target.QualifiedName,
-							status: "modified",
+							file:     p.Target.QualifiedName,
+							status:   "modified",
+							evidence: applyEvidence(p, origContent, true, nil),
 						}
 					}
 				}
 			}
-			return mutationResultMsg{err: err, file: p.Target.QualifiedName}
+			return mutationResultMsg{err: err, file: p.Target.QualifiedName, evidence: applyEvidence(p, origContent, false, err)}
 		}
 		status := "modified"
 		if isNewFileCreation(p.Diff) {
 			status = "created"
 		}
 		return mutationResultMsg{
-			file:   p.Target.QualifiedName,
-			status: status,
+			file:     p.Target.QualifiedName,
+			status:   status,
+			evidence: applyEvidence(p, origContent, true, nil),
 		}
 	}
 }
@@ -575,7 +637,7 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 				// Treat as skipped, not failed — and DO NOT retry as a full
 				// rewrite, which would bypass the guardrail and wipe the file.
 				if errors.Is(err, execution.ErrDestructivePatchSkipped) {
-					results = append(results, mutationResultMsg{file: p.Target.QualifiedName, status: "skipped"})
+					results = append(results, mutationResultMsg{file: p.Target.QualifiedName, status: "skipped", evidence: applyEvidence(p, origContent, false, err)})
 					continue
 				}
 				// Per-file full-rewrite fallback: when a patch fails due to
@@ -594,19 +656,19 @@ func (m *model) applyAllProposalsCmd() tea.Cmd {
 							IsFullRewrite: true,
 						}
 						if retryErr := m.applyPatchWithDeadline(retryPatch); retryErr == nil {
-							results = append(results, mutationResultMsg{file: p.Target.QualifiedName, status: "modified"})
+							results = append(results, mutationResultMsg{file: p.Target.QualifiedName, status: "modified", evidence: applyEvidence(p, origContent, true, nil)})
 							continue
 						}
 					}
 				}
-				results = append(results, mutationResultMsg{err: err, file: p.Target.QualifiedName})
+				results = append(results, mutationResultMsg{err: err, file: p.Target.QualifiedName, evidence: applyEvidence(p, origContent, false, err)})
 				continue
 			}
 			status := "modified"
 			if isNewFileCreation(p.Diff) {
 				status = "created"
 			}
-			results = append(results, mutationResultMsg{file: p.Target.QualifiedName, status: status})
+			results = append(results, mutationResultMsg{file: p.Target.QualifiedName, status: status, evidence: applyEvidence(p, origContent, true, nil)})
 		}
 		return applyAllResultMsg{results: results}
 	}

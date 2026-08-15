@@ -1,20 +1,38 @@
 package providers
 
 import (
+	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/PizenLabs/izen/internal/ai"
 )
 
 // TestStreamUsageTracker_Authoritative verifies a reader that received a usage
-// chunk reports the authoritative provider counts.
+// chunk reports the authoritative provider counts with Known=true.
 func TestStreamUsageTracker_Authoritative(t *testing.T) {
 	var tr streamUsageTracker
-	tr.recordUsage(128, 96)
-	in, out := tr.Usage()
-	if in != 128 || out != 96 {
-		t.Errorf("Usage() = (%d, %d), want (128, 96)", in, out)
+	tr.recordUsageFull(ai.ProviderUsage{
+		PromptTokens:     128,
+		CompletionTokens: 96,
+		Known:            true,
+	})
+	u := tr.Usage()
+	if u.PromptTokens != 128 || u.CompletionTokens != 96 {
+		t.Errorf("Usage() = (%d, %d), want (128, 96)", u.PromptTokens, u.CompletionTokens)
+	}
+	if !u.Known {
+		t.Error("Known = false, want true for authoritative usage")
+	}
+	if u.Estimated {
+		t.Error("Estimated = true for an authoritative usage chunk")
+	}
+	if u.TotalTokens != 224 {
+		t.Errorf("TotalTokens = %d, want 224 (128+96)", u.TotalTokens)
 	}
 	if tr.Estimated() {
 		t.Error("Estimated() = true, want false for authoritative usage")
@@ -25,24 +43,42 @@ func TestStreamUsageTracker_Authoritative(t *testing.T) {
 }
 
 // TestStreamUsageTracker_InterruptedEstimatesOutput verifies that a stream
-// interrupted before any usage chunk reports an estimated output-token count
-// derived from the characters that actually streamed (never a silent 0).
+// interrupted before any usage chunk reports an ESTIMATED output-token count
+// derived from the characters that actually streamed — a real zero would
+// silently zero billed work.
 func TestStreamUsageTracker_InterruptedEstimatesOutput(t *testing.T) {
 	var tr streamUsageTracker
 	tr.recordOutput(40) // 40 chars → 10 estimated output tokens
 	tr.markInterrupted()
-	in, out := tr.Usage()
-	if in != 0 {
-		t.Errorf("input = %d, want 0 (no usage chunk arrived)", in)
+	u := tr.Usage()
+	if u.PromptTokens != 0 {
+		t.Errorf("input = %d, want 0 (no usage chunk arrived)", u.PromptTokens)
 	}
-	if out != 10 {
-		t.Errorf("output = %d, want 10 (40 chars / 4)", out)
+	if u.CompletionTokens != 10 {
+		t.Errorf("output = %d, want 10 (40 chars / 4)", u.CompletionTokens)
 	}
-	if !tr.Estimated() {
-		t.Error("Estimated() = false, want true for character estimate")
+	if !u.Known {
+		t.Error("Known = false, want true (estimate is displayed, never a silent 0)")
+	}
+	if !u.Estimated {
+		t.Error("Estimated = false, want true for character estimate")
 	}
 	if !tr.Interrupted() {
 		t.Error("Interrupted() = false, want true")
+	}
+}
+
+// TestStreamUsageTracker_UnknownReportsKnownFalse verifies a reader that saw
+// neither a usage chunk nor any output bytes reports usage UNKNOWN (Known
+// false), not a fabricated zero.
+func TestStreamUsageTracker_UnknownReportsKnownFalse(t *testing.T) {
+	var tr streamUsageTracker
+	u := tr.Usage()
+	if u.Known {
+		t.Error("Known = true for a tracker with no provider usage and no bytes")
+	}
+	if u.CompletionTokens != 0 {
+		t.Errorf("CompletionTokens = %d, want 0 (unknown)", u.CompletionTokens)
 	}
 }
 
@@ -51,22 +87,30 @@ func TestStreamUsageTracker_InterruptedEstimatesOutput(t *testing.T) {
 func TestStreamUsageTracker_AuthoritativeWinsOverEstimate(t *testing.T) {
 	var tr streamUsageTracker
 	tr.recordOutput(400)
-	tr.recordUsage(64, 32)
-	in, out := tr.Usage()
-	if in != 64 || out != 32 {
-		t.Errorf("Usage() = (%d, %d), want (64, 32)", in, out)
+	tr.recordUsageFull(ai.ProviderUsage{
+		PromptTokens:     64,
+		CompletionTokens: 32,
+		Known:            true,
+	})
+	u := tr.Usage()
+	if u.PromptTokens != 64 || u.CompletionTokens != 32 {
+		t.Errorf("Usage() = (%d, %d), want (64, 32)", u.PromptTokens, u.CompletionTokens)
+	}
+	if u.Estimated {
+		t.Error("Estimated = true, want false once the authoritative chunk arrived")
 	}
 }
 
 // TestOpenRouterStreamResult_UsageAuthoritative verifies the reader surfaces
-// the provider-reported usage when a usage chunk arrives on the stream.
+// the provider-reported usage when a usage chunk arrives on the stream,
+// including the cached/reasoning token splits OpenRouter exposes.
 func TestOpenRouterStreamResult_UsageAuthoritative(t *testing.T) {
 	sse := strings.Join([]string{
 		"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}",
 		"",
 		"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"world\"}}]}",
 		"",
-		"data: {\"id\":\"1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":512,\"completion_tokens\":240,\"total_tokens\":752}}",
+		"data: {\"id\":\"1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":512,\"completion_tokens\":240,\"total_tokens\":752,\"prompt_tokens_details\":{\"cached_tokens\":128,\"reasoning_tokens\":32},\"completion_tokens_details\":{\"reasoning_tokens\":16}}}",
 		"",
 		"data: [DONE]",
 		"",
@@ -78,15 +122,27 @@ func TestOpenRouterStreamResult_UsageAuthoritative(t *testing.T) {
 	if got := drainStream(t, res); got != "Hello world" {
 		t.Fatalf("content = %q, want %q", got, "Hello world")
 	}
-	in, out := res.Usage()
-	if in != 512 || out != 240 {
-		t.Errorf("Usage() = (%d, %d), want (512, 240)", in, out)
+	u := res.Usage()
+	if u.PromptTokens != 512 || u.CompletionTokens != 240 {
+		t.Errorf("Usage() = (%d, %d), want (512, 240)", u.PromptTokens, u.CompletionTokens)
+	}
+	if !u.Known {
+		t.Error("Known = false, want true")
+	}
+	if u.CachedTokens != 128 {
+		t.Errorf("CachedTokens = %d, want 128", u.CachedTokens)
+	}
+	if u.ReasoningTokens != 48 {
+		t.Errorf("ReasoningTokens = %d, want 48 (32 prompt + 16 completion)", u.ReasoningTokens)
+	}
+	if u.FinishReason != "stop" {
+		t.Errorf("FinishReason = %q, want %q", u.FinishReason, "stop")
 	}
 }
 
 // TestOpenRouterStreamResult_UsageInterruptedEstimates verifies a reader that
-// hits a mid-stream error (e.g. context deadline) reports a character-based
-// estimate instead of a silent (0, 0).
+// hits a mid-stream error (e.g. context deadline) reports an ESTIMATED
+// character-based count instead of a silent unknown.
 func TestOpenRouterStreamResult_UsageInterruptedEstimates(t *testing.T) {
 	// A body that yields one content chunk then fails with a sentinel error.
 	sse := "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"partial answer \"}}]}\n\n"
@@ -111,12 +167,60 @@ func TestOpenRouterStreamResult_UsageInterruptedEstimates(t *testing.T) {
 		}
 	}
 
-	in, out := res.Usage()
-	if in != 0 {
-		t.Errorf("input = %d, want 0", in)
+	u := res.Usage()
+	if u.PromptTokens != 0 {
+		t.Errorf("input = %d, want 0", u.PromptTokens)
 	}
-	if out < 1 {
-		t.Errorf("output = %d, want a non-zero estimate for %q", out, got.String())
+	if u.CompletionTokens < 1 {
+		t.Errorf("output = %d, want a non-zero estimate for %q", u.CompletionTokens, got.String())
+	}
+	if !u.Estimated {
+		t.Error("Estimated = false, want true for an interrupted stream estimate")
+	}
+}
+
+// TestOpenRouterExecute_PreservesProviderUsage proves the NON-STREAMING
+// Execute path propagates the provider's authoritative usage verbatim — the
+// exact contract the regression test in Part A depends on ("provider reports
+// 2048 completion tokens → Izen execution telemetry records 2048 → UI renders
+// 2048 tok").
+func TestOpenRouterExecute_PreservesProviderUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"1","object":"chat.completion","model":"vendor/model",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":2860,"completion_tokens":2048,"total_tokens":4908,
+				"prompt_tokens_details":{"cached_tokens":512}}
+		}`))
+	}))
+	defer srv.Close()
+
+	p := NewOpenRouterProvider("test-key", "vendor/model", srv.URL)
+	resp, err := p.Execute(context.Background(), ai.Request{Model: "vendor/model"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if resp.TokenInput != 2860 {
+		t.Errorf("TokenInput = %d, want 2860", resp.TokenInput)
+	}
+	if resp.TokenOutput != 2048 {
+		t.Errorf("TokenOutput = %d, want 2048", resp.TokenOutput)
+	}
+	if !resp.Usage.Known {
+		t.Error("Usage.Known = false, want true")
+	}
+	if resp.Usage.CompletionTokens != 2048 {
+		t.Errorf("Usage.CompletionTokens = %d, want 2048", resp.Usage.CompletionTokens)
+	}
+	if resp.Usage.TotalTokens != 4908 {
+		t.Errorf("Usage.TotalTokens = %d, want 4908", resp.Usage.TotalTokens)
+	}
+	if resp.Usage.CachedTokens != 512 {
+		t.Errorf("Usage.CachedTokens = %d, want 512", resp.Usage.CachedTokens)
+	}
+	if resp.Usage.FinishReason != "stop" {
+		t.Errorf("Usage.FinishReason = %q, want %q", resp.Usage.FinishReason, "stop")
 	}
 }
 

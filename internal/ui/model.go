@@ -125,6 +125,10 @@ type streamDoneMsg struct {
 	content     string
 	tokenInput  int
 	tokenOutput int
+	// usageEstimated is true when the token counts came from a character-count
+	// estimate (local models that report no usage, or an interrupted stream)
+	// rather than the provider's authoritative usage chunk.
+	usageEstimated bool
 	// truncated is true when the provider signalled finish_reason == "length":
 	// the response hit the API completion ceiling and was cut off mid-generation
 	// rather than finishing naturally ("stop").
@@ -157,6 +161,9 @@ type streamErrMsg struct {
 	// attempt ("Explicit Over Implicit").
 	tokenInput  int
 	tokenOutput int
+	// usageEstimated is true when the token counts are a character-count
+	// estimate rather than the provider's authoritative usage.
+	usageEstimated bool
 }
 
 type PlanStreamingFinishedMsg struct {
@@ -287,6 +294,49 @@ type mutationResultMsg struct {
 	err    error
 	file   string
 	status string
+	// evidence is the single source of truth for the mutation attempt's facts
+	// (artifact presence, diff presence, apply execution, filesystem result,
+	// verification). The renderer projects it — it never infers a mutation
+	// from a planned "Edit" event. May be nil on pre-apply failures.
+	evidence *execution.MutationEvidence
+	// TokenInput/TokenOutput carry the provider-reported usage of the call
+	// that produced this mutation result (the zero-patch short-circuit and
+	// the apply paths). Without them the provider's real token consumption
+	// would be silently dropped whenever a task ends in "nochange" or "skipped"
+	// — the exact "OpenRouter billed 2048 completion tokens while the footer
+	// shows 0 tok" bug. usageKnown is false when the provider reported no usage.
+	TokenInput  int
+	TokenOutput int
+	usageKnown  bool
+}
+
+// outcome returns the semantic outcome of the mutation result, normalized onto
+// the execution.MutationOutcome vocabulary. When the runtime filled a
+// MutationEvidence record it is the single source of truth; otherwise the
+// error/status is normalized so a vague status can never claim a mutation.
+func (r mutationResultMsg) outcome() execution.MutationOutcome {
+	if r.evidence != nil && r.evidence.Outcome != "" {
+		return r.evidence.Outcome
+	}
+	if r.err != nil {
+		if isContextCancelled(r.err) || isContextDeadline(r.err) {
+			return execution.OutcomeCancelled
+		}
+		return execution.OutcomeApplyFailed
+	}
+	return execution.ParseMutationOutcome(r.status)
+}
+
+// respUsage extracts the authoritative provider usage from a response for
+// propagation onto terminal execution messages. known is true when the
+// provider reported usage (or the response carries non-zero counts, preserving
+// the legacy contract used by tests); a nil response reports unknown.
+func respUsage(resp *ai.Response) (input, output int, known bool) {
+	if resp == nil {
+		return 0, 0, false
+	}
+	known = resp.Usage.Known || resp.TokenInput > 0 || resp.TokenOutput > 0
+	return resp.TokenInput, resp.TokenOutput, known
 }
 
 type applyAllResultMsg struct {
@@ -780,6 +830,12 @@ type model struct {
 	ContextLimit    int
 	AccumulatedCost float64
 	CheckpointID    string
+
+	// usageKnown reports whether the provider has ever reported authoritative
+	// (or explicit-estimate) usage this session. The footer distinguishes
+	// "usage unknown" (never reported) from a genuine "0 tok" (provider
+	// reported zero). "0 tok" must mean an actual zero, not an unknown.
+	usageKnown bool
 
 	streamParser     *IncrementalStreamParser
 	streamBuffer     string // buffered tokens for smooth tick emission
@@ -1603,7 +1659,9 @@ func (m *model) sanitizeInputPrompt() {
 // counters and the global status.Tracker. It is the single accounting entry
 // point for BOTH successful and failed LLM attempts: on failure the provider's
 // partial usage (or a character estimate) is still committed so consumed
-// tokens are never silently zeroed ("Explicit Over Implicit").
+// tokens are never silently zeroed ("Explicit Over Implicit"). known marks
+// whether the provider reported usage at all; unknown usage leaves the
+// "usage unknown" state intact so the footer never fabricates a zero.
 func (m *model) commitTokenUsage(input, output int) {
 	if input < 0 {
 		input = 0
@@ -1621,6 +1679,12 @@ func (m *model) commitTokenUsage(input, output int) {
 	}
 }
 
+// markUsageKnown records that the provider reported authoritative usage this
+// session, transitioning the footer from "usage unknown" to a real count.
+func (m *model) markUsageKnown() {
+	m.usageKnown = true
+}
+
 // tokenUsageCmd returns a command that dispatches the provider-reported token
 // usage of an execution path to the Bubble Tea event loop as a TokenUsageMsg.
 // The TokenUsageMsg handler in update.go accumulates the counts into the
@@ -1629,7 +1693,14 @@ func (m *model) commitTokenUsage(input, output int) {
 // was aborted, or was truncated mid-stream. Zero usage produces a nil command
 // (nothing was consumed, nothing to report).
 func (m *model) tokenUsageCmd(input, output int) tea.Cmd {
-	if input <= 0 && output <= 0 {
+	return m.tokenUsageCmdKnown(input, output, input > 0 || output > 0)
+}
+
+// tokenUsageCmdKnown is tokenUsageCmd with an explicit known flag: known=true
+// even with zero counts means the provider genuinely reported zero usage, so
+// the footer renders "0 tok" instead of "usage unknown".
+func (m *model) tokenUsageCmdKnown(input, output int, known bool) tea.Cmd {
+	if input <= 0 && output <= 0 && !known {
 		return nil
 	}
 	model := ""
@@ -1641,6 +1712,7 @@ func (m *model) tokenUsageCmd(input, output int) tea.Cmd {
 			PromptTokens:     input,
 			CompletionTokens: output,
 			Model:            model,
+			Known:            known,
 		}
 	}
 }

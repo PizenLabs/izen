@@ -35,7 +35,15 @@ func (m *mockStreamResult) Read(p []byte) (int, error) {
 
 func (m *mockStreamResult) Close() error { return nil }
 
-func (m *mockStreamResult) Usage() (int, int) { return m.input, m.output }
+func (m *mockStreamResult) Usage() ai.ProviderUsage {
+	return ai.ProviderUsage{
+		PromptTokens:     m.input,
+		CompletionTokens: m.output,
+		TotalTokens:      m.input + m.output,
+		FinishReason:     m.finish,
+		Known:            true,
+	}
+}
 
 func (m *mockStreamResult) FinishReason() string { return m.finish }
 

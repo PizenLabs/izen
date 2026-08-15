@@ -1370,6 +1370,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.PromptTokens > 0 || msg.CompletionTokens > 0 {
 			m.commitTokenUsage(msg.PromptTokens, msg.CompletionTokens)
 		}
+		if msg.Known {
+			// The provider reported usage this turn (even zero): the footer
+			// may now render a real "0 tok" instead of "usage unknown".
+			m.markUsageKnown()
+		}
 		m.syncUIState()
 		return m, nil
 
@@ -1890,6 +1895,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// the operation was already finalized at proposal-ready — this is an
 		// idempotent no-op.
 		m.finalizeBuildOperation(msg.err)
+		// ── AUTHORITATIVE PROVIDER USAGE ─────────────────────────────
+		// The zero-patch short-circuit and the apply paths carry the provider
+		// usage of the call that produced the result. Commit it so the footer
+		// reflects the real tokens the provider consumed even when the task
+		// ended in "nochange"/"skipped" — never a silent drop to 0.
+		if msg.usageKnown {
+			m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
+			m.markUsageKnown()
+		}
 		if msg.err != nil {
 			m.setApplyError("apply failed: " + msg.err.Error())
 		} else {
@@ -1950,6 +1964,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				}
 
 				outcomeLine := fmt.Sprintf("%s %s • %s", successBannerStyle.Render("[✓]"), msg.file, msg.status)
+				// ── REAL DIFF EVIDENCE (Phase 4) ──────────────────────────
+				// When the runtime captured the compiled diff metrics, surface them
+				// in the outcome line so the UI proves the actual patch ("+3 -1"),
+				// never a vague "Edit(file)" success event.
+				evidenceDetail := msg.status
+				if msg.evidence != nil && msg.evidence.DiffPresent {
+					outcomeLine = fmt.Sprintf("%s %s • +%d -%d",
+						successBannerStyle.Render("[✓]"), msg.file, msg.evidence.DiffAdds, msg.evidence.DiffRemoves)
+					evidenceDetail = fmt.Sprintf("+%d -%d", msg.evidence.DiffAdds, msg.evidence.DiffRemoves)
+				}
 				m.push(roleSystem, outcomeLine)
 				m.createBuildCheckpoint(1)
 
@@ -1960,7 +1984,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				if m.thinkingPanel != nil {
 					thinkingContent = m.thinkingPanel.String()
 				}
-				m.logStore.AddFull(LogEdit, msg.file, true, msg.status, thinkingContent, "")
+				// ── TRUTHFUL RESULT ENTRY (Phase 4) ───────────────────────
+				// The terminal result is logged with its semantic outcome. Only a
+				// real filesystem mutation (changed/created) is a successful Edit;
+				// nochange and skipped render neutrally, never as a green ✓ Edit.
+				outcome := msg.outcome()
+				mutated := outcome.MutationSucceeded()
+				m.logStore.AddFullSemantic(LogResult, msg.file, mutated, evidenceDetail, thinkingContent, "", execution.StageResult, outcome)
 				// ── FAST-TRACK EARLY COMPLETION ─────────────────────────
 				// When a fast-track batch covered every plan target and the
 				// last proposal has been applied, per-task execution is
@@ -1999,7 +2029,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				if m.thinkingPanel != nil {
 					thinkingContent = m.thinkingPanel.String()
 				}
-				m.logStore.AddFull(LogEdit, msg.file, false, msg.err.Error(), thinkingContent, "")
+				m.logStore.AddFullSemantic(LogResult, msg.file, false, msg.err.Error(), thinkingContent, "", execution.StageResult, msg.outcome())
 			}
 		} else {
 			m.enterApprovalState()
@@ -2027,7 +2057,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				if m.thinkingPanel != nil {
 					thinkingContent = m.thinkingPanel.String()
 				}
-				m.logStore.AddFull(LogEdit, r.file, false, r.err.Error(), thinkingContent, "")
+				m.logStore.AddFullSemantic(LogResult, r.file, false, r.err.Error(), thinkingContent, "", execution.StageResult, r.outcome())
 				failed++
 				continue
 			}
@@ -2039,7 +2069,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if m.thinkingPanel != nil {
 				thinkingContent = m.thinkingPanel.String()
 			}
-			m.logStore.AddFull(LogEdit, r.file, true, r.status, thinkingContent, "")
+			// ── TRUTHFUL RESULT ENTRY (Phase 4) ───────────────────────
+			// Only a real filesystem mutation renders as a successful Edit;
+			// nochange/skipped render neutrally with their outcome label.
+			outcome := r.outcome()
+			m.logStore.AddFullSemantic(LogResult, r.file, outcome.MutationSucceeded(), r.status, thinkingContent, "", execution.StageResult, outcome)
 			applied++
 		}
 		m.pendingProposals = nil
@@ -2429,6 +2463,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.InputTokens += msg.tokenInput
 		m.OutputTokens += msg.tokenOutput
 		m.TotalTokens = m.InputTokens + m.OutputTokens
+		// Provider-reported usage (authoritative or an explicit local-model
+		// estimate) transitions the footer out of "usage unknown".
+		if msg.tokenInput > 0 || msg.tokenOutput > 0 || msg.usageEstimated {
+			m.markUsageKnown()
+		}
 
 		// Sync the provider-reported usage (or the local estimate fallback
 		// computed above) to the global status tracker so the footer strictly

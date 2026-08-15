@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 )
@@ -75,6 +76,36 @@ type claudeContent struct {
 type claudeUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+}
+
+// ProviderUsage converts the parsed Claude usage into the authoritative
+// ai.ProviderUsage contract. Claude reports a usage object on every message,
+// so Known is always true.
+func (u *claudeUsage) ProviderUsage() ai.ProviderUsage {
+	out := ai.ProviderUsage{
+		PromptTokens:     u.InputTokens,
+		CompletionTokens: u.OutputTokens,
+		TotalTokens:      u.InputTokens + u.OutputTokens,
+		Known:            true,
+	}
+	return out
+}
+
+// claudeStopReason normalizes an Anthropic stop_reason onto the canonical
+// label set ("stop", "length", "tool_calls", ...).
+func claudeStopReason(raw string) string {
+	switch raw {
+	case "end_turn", "stop_sequence":
+		return "stop"
+	case "max_tokens":
+		return "length"
+	case "tool_use":
+		return "tool_calls"
+	case "":
+		return ""
+	default:
+		return strings.ToLower(raw)
+	}
 }
 
 type claudeStreamEvent struct {
@@ -174,15 +205,24 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	tokenIn := 0
 	tokenOut := 0
+	var usage ai.ProviderUsage
+	usage.RequestStartedAt = time.Now()
 	if claudeResp.Usage != nil {
 		tokenIn = claudeResp.Usage.InputTokens
 		tokenOut = claudeResp.Usage.OutputTokens
+		usage = claudeResp.Usage.ProviderUsage()
+	}
+	usage.CompletedAt = time.Now()
+	usage.FinishReason = claudeStopReason(claudeResp.StopReason)
+	if usage.FirstTokenAt.IsZero() {
+		usage.FirstTokenAt = usage.CompletedAt
 	}
 
 	return &ai.Response{
 		Content:     content,
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
+		Usage:       usage,
 	}, nil
 }
 
@@ -235,6 +275,7 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	}
 
 	sr := &claudeSSEReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
+	sr.usage.markRequestStarted(time.Now())
 	return &ClaudeStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -243,11 +284,11 @@ type ClaudeStreamResult struct {
 	sr *claudeSSEReader
 }
 
-func (r *ClaudeStreamResult) Usage() (input, output int) {
+func (r *ClaudeStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
 		return r.sr.usage.Usage()
 	}
-	return 0, 0
+	return ai.ProviderUsage{}
 }
 
 // FinishReason reports the terminal stop reason observed on the stream. The
@@ -351,9 +392,11 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 			}
 			if event.Delta != nil && event.Delta.StopReason != "" {
 				s.finishReason = event.Delta.StopReason
+				s.usage.markCompleted(time.Now(), claudeStopReason(event.Delta.StopReason))
 			}
 		case "message_stop":
 			s.closed = true
+			s.usage.markCompleted(time.Now(), claudeStopReason(s.finishReason))
 			return 0, io.EOF
 		}
 	}

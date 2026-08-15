@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 )
@@ -83,6 +84,12 @@ type usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+}
+
+// ProviderUsage converts the parsed Ollama usage into the authoritative
+// ai.ProviderUsage contract.
+func (u *usage) ProviderUsage() ai.ProviderUsage {
+	return openAICompatibleUsage(u.PromptTokens, u.CompletionTokens, u.TotalTokens)
 }
 
 // sanitizeContent strips ANSI escape sequences and TUI UI artifact patterns
@@ -205,23 +212,43 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	tokenIn := 0
 	tokenOut := 0
+	var usage ai.ProviderUsage
+	usage.RequestStartedAt = time.Now()
 	if ollamaResp.Usage != nil {
 		tokenIn = ollamaResp.Usage.PromptTokens
 		tokenOut = ollamaResp.Usage.CompletionTokens
+		usage = ollamaResp.Usage.ProviderUsage()
 	}
-	if tokenIn == 0 && tokenOut == 0 {
+	if !usage.Known {
+		// Local Ollama models that do not report usage metadata: report a
+		// character-count estimate explicitly marked as estimated so the
+		// footer can render "≈N tok" instead of a fabricated authoritative
+		// count — never a silent 0.
 		promptLen := 0
 		for _, m := range req.Messages {
 			promptLen += len(m.Content)
 		}
 		tokenIn = promptLen / 4
 		tokenOut = len(content) / 4
+		usage.Known = true
+		usage.Estimated = true
+		usage.PromptTokens = tokenIn
+		usage.CompletionTokens = tokenOut
+		usage.TotalTokens = tokenIn + tokenOut
+	}
+	usage.CompletedAt = time.Now()
+	if len(ollamaResp.Choices) > 0 {
+		usage.FinishReason = ollamaResp.Choices[0].FinishReason
+	}
+	if usage.FirstTokenAt.IsZero() {
+		usage.FirstTokenAt = usage.CompletedAt
 	}
 
 	return &ai.Response{
 		Content:     content,
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
+		Usage:       usage,
 	}, nil
 }
 
@@ -275,6 +302,7 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	}
 
 	sr := &sseReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
+	sr.usage.markRequestStarted(time.Now())
 	return &StreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -283,11 +311,11 @@ type StreamResult struct {
 	sr *sseReader
 }
 
-func (r *StreamResult) Usage() (input, output int) {
+func (r *StreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
 		return r.sr.usage.Usage()
 	}
-	return 0, 0
+	return ai.ProviderUsage{}
 }
 
 // FinishReason reports the terminal finish_reason observed on the stream
@@ -311,7 +339,7 @@ type sseReader struct {
 	usage streamUsageTracker
 }
 
-func (s *sseReader) Usage() (input, output int) {
+func (s *sseReader) Usage() ai.ProviderUsage {
 	return s.usage.Usage()
 }
 
@@ -346,6 +374,7 @@ func (s *sseReader) Read(p []byte) (int, error) {
 
 		if data == "[DONE]" {
 			s.closed = true
+			s.usage.markCompleted(time.Now(), s.finishReason)
 			return 0, io.EOF
 		}
 
@@ -354,13 +383,19 @@ func (s *sseReader) Read(p []byte) (int, error) {
 			continue
 		}
 
+		if chunk.Usage != nil {
+			s.finalUsage = chunk.Usage
+			s.usage.recordUsageFull(chunk.Usage.ProviderUsage())
+		}
+
 		if len(chunk.Choices) == 0 {
 			continue
 		}
 
-		if chunk.Usage != nil {
-			s.finalUsage = chunk.Usage
-			s.usage.recordUsage(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
+		if chunk.Choices[0].FinishReason != "" {
+			s.finishReason = chunk.Choices[0].FinishReason
+			s.usage.markCompleted(time.Now(), chunk.Choices[0].FinishReason)
+			continue
 		}
 
 		if chunk.Choices[0].Delta != nil {

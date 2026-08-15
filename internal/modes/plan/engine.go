@@ -318,7 +318,7 @@ func (e *Engine) recordUsage(input, output int) {
 
 // usageReader is implemented by stream results that report provider usage.
 type usageReader interface {
-	Usage() (input, output int)
+	Usage() ai.ProviderUsage
 }
 
 // complete performs a single LLM synthesis call. When a streaming provider is
@@ -518,7 +518,9 @@ func accumulateStream(r io.Reader, sinks ...func(string)) (content, reasoning, f
 		}
 	}
 	if up, ok := r.(usageReader); ok {
-		input, output = up.Usage()
+		usage := up.Usage()
+		input = usage.PromptTokens
+		output = usage.CompletionTokens
 	}
 	if frp, ok := r.(ai.FinishReasonProvider); ok {
 		finishReason = frp.FinishReason()

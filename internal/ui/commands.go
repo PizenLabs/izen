@@ -2758,17 +2758,16 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		var buf strings.Builder
 		readBuf := make([]byte, 4096)
 
-		// usageProvider captures cumulative token usage from the stream reader
-		// (authoritative when a usage chunk arrived, otherwise a character
-		// estimate) so consumed tokens survive a timeout/error path.
-		type usageProvider interface {
-			Usage() (input, output int)
-		}
-		streamUsage := func() (int, int) {
-			if up, ok := rawStream.(usageProvider); ok {
+		// usageProvider captures the AUTHORITATIVE cumulative token usage from
+		// the stream reader (ProviderUsage: provider-reported counts when a
+		// usage chunk arrived, otherwise an interrupted-stream estimate) so
+		// consumed tokens survive a timeout/error path. Streaming and
+		// non-streaming executions converge on the same usage contract.
+		streamUsage := func() ai.ProviderUsage {
+			if up, ok := rawStream.(ai.UsageProvider); ok {
 				return up.Usage()
 			}
-			return 0, 0
+			return ai.ProviderUsage{}
 		}
 
 		// ── REASONING TERMINAL EVENT GUARANTEE ───────────────────────────
@@ -2829,9 +2828,9 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			// promptly; this pre-read check releases the loop immediately even
 			// for a provider reader that swallows the connection close.
 			if cerr := ctx.Err(); cerr != nil {
-				tokIn, tokOut := streamUsage()
+				su := streamUsage()
 				select {
-				case streamCh <- streamErrMsg{err: cerr, content: fullContent.String(), tokenInput: tokIn, tokenOutput: tokOut}:
+				case streamCh <- streamErrMsg{err: cerr, content: fullContent.String(), tokenInput: su.PromptTokens, tokenOutput: su.CompletionTokens}:
 				default:
 				}
 				return
@@ -2842,9 +2841,8 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 				// Bytes are actively arriving from the provider — only now does
 				// the indicator claim streaming, using the provider-reported
 				// token usage when available.
-				_, tokOut := streamUsage()
 				m.setStage("model", req.Model, stageStreaming)
-				m.setStageMetrics(0, 0, tokOut)
+				m.setStageMetrics(0, 0, streamUsage().CompletionTokens)
 				buf.WriteString(runeBuf.Write(readBuf[:n]))
 			}
 			// On EOF release any incomplete rune still held back so no
@@ -2965,9 +2963,9 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 				break
 			}
 			if err != nil {
-				tokIn, tokOut := streamUsage()
+				su := streamUsage()
 				select {
-				case streamCh <- streamErrMsg{err: err, content: fullContent.String(), tokenInput: tokIn, tokenOutput: tokOut}:
+				case streamCh <- streamErrMsg{err: err, content: fullContent.String(), tokenInput: su.PromptTokens, tokenOutput: su.CompletionTokens}:
 				default:
 				}
 				select {
@@ -2982,7 +2980,8 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		// Parse whatever was accumulated into patches. Handle truncation
 		// (finish_reason == "length") gracefully by recovering partial
 		// tool calls from the ToolCallBuffer.
-		tokIn, tokOut := streamUsage()
+		su := streamUsage()
+		tokIn, tokOut := su.PromptTokens, su.CompletionTokens
 		finishReason := ""
 		if frp, ok := rawStream.(ai.FinishReasonProvider); ok {
 			finishReason = frp.FinishReason()
@@ -2991,9 +2990,9 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		if len(toolCalls) > 0 {
 			if m.toolCallBuffer != nil {
 				if bufErr := m.toolCallBuffer.BufferAll(toolCalls); bufErr != nil {
-					btokIn, btokOut := streamUsage()
+					bsu := streamUsage()
 					select {
-					case streamCh <- buildFailedMsg{Err: fmt.Errorf("fast-track tool call buffer: %w", bufErr), TokenInput: btokIn, TokenOutput: btokOut}:
+					case streamCh <- buildFailedMsg{Err: fmt.Errorf("fast-track tool call buffer: %w", bufErr), TokenInput: bsu.PromptTokens, TokenOutput: bsu.CompletionTokens}:
 					default:
 					}
 					select {
@@ -4535,7 +4534,13 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 						if m.activityTree != nil {
 							m.activityTree.Append(NewFileMutateEvent(task.Target, 0, 0, 0))
 						}
-						return mutationResultMsg{file: task.Target, status: "nochange"}
+						// NO_CHANGE is semantically valid here: the model's
+						// resolved artifact was compared against the actual
+						// filesystem and the result is byte-for-byte unchanged.
+						// The provider's real usage is carried on the result so
+						// the footer never zeroes the tokens the model consumed.
+						ti, to, known := respUsage(resp)
+						return mutationResultMsg{file: task.Target, status: "nochange", TokenInput: ti, TokenOutput: to, usageKnown: known}
 					}
 					diffContent = computeUnifiedDiff(task.Target, orig, resolved)
 				}
