@@ -243,6 +243,20 @@ func (m *model) routePromptDirective(rawInput string) tea.Cmd {
 		return nil
 	}
 
+	// ── ENGINE-FIRST EXECUTION STRATEGY (Phase 10) ────────────────────
+	// Before any model is invoked, the engine classifies the request into a
+	// bounded execution strategy and records the decision (intent, targets,
+	// complexity, context channels, artifact contract, budgets) in
+	// m.lastExecutionStrategy for $inspect. Simple explicit-target mutations
+	// route directly to the bounded mutation executor; unresolved targets stop
+	// for human clarification; repository-level requests fall through to the
+	// existing ask-handoff/investigate/plan path ONLY when evidence justifies
+	// it. The model is never consulted for filesystem resolution, strategy
+	// selection, or complexity.
+	if cmd, handled := m.routeEngineFirstPrompt(rawInput); handled {
+		return cmd
+	}
+
 	// ── COMPRESSOR FAST-TRACK ──────────────────────────────────────────
 	// Check the prompt compressor first. If it signals a direct mutation
 	// (BypassInvest=true) with a target file, skip ALL Architect prompts, skip

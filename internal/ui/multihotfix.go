@@ -104,7 +104,7 @@ func (m *model) runMultiHotfix(prompt string, targets []execution.Target) tea.Cm
 	// Stage 1: stash the current plan (mirrors the single-file $hot contract).
 	if hasTasks := len(m.sess.CurrentTasks) > 0; hasTasks {
 		if err := m.stashPlan(); err != nil {
-			m.push(roleError, fmt.Sprintf("[HOTFIX] Failed to stash current plan: %v", err))
+			m.push(roleError, fmt.Sprintf("[%s] Failed to stash current plan: %v", m.hotfixBrandingLabel(), err))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return nil
@@ -112,7 +112,7 @@ func (m *model) runMultiHotfix(prompt string, targets []execution.Target) tea.Cm
 	}
 	m.sess.ClearTasks()
 	m.hotfixActive = true
-	m.push(roleStatus, fmt.Sprintf("[HOTFIX] Multi-file urgent hotfix: %s (%d files)", prompt, len(targets)))
+	m.push(roleStatus, fmt.Sprintf("[%s] Multi-file urgent hotfix: %s (%d files)", m.hotfixBrandingLabel(), prompt, len(targets)))
 
 	// ── SINGLE OWNERSHIP + SINGLE MUTATION BOUNDARY ────────────────
 	// One user intent → one operation → one MutationSet → one graph.

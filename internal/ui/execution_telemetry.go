@@ -1,11 +1,13 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/execution/strategy"
 )
 
 // ── Execution Telemetry: debug / inspect view (Phase 3) ─────────────────────
@@ -57,6 +59,28 @@ func (m *model) runInspectCmd(filter string) tea.Cmd {
 		if m.lastExecutionProof.OperationID != "" || m.lastExecutionProof.Target != "" {
 			m.push(roleSystem, mutedStyle.Render(""))
 			for _, line := range strings.Split(strings.TrimRight(renderExecutionProof(m.lastExecutionProof), "\n"), "\n") {
+				m.push(roleSystem, mutedStyle.Render(line))
+			}
+		}
+		// ── ENGINE-FIRST STRATEGY DECISION (Phase 10) ─────────────────
+		// The deterministic decision record of the most recent $prompt: the
+		// selected strategy, the target-resolution outcomes, the
+		// execution-factor complexity, the context channels, the artifact
+		// contract and the budgets the engine chose BEFORE any model call.
+		// It answers "why did Izen call the model / read this file / need
+		// /plan?" with execution facts — never model reasoning.
+		if m.lastExecutionStrategy.Strategy != "" {
+			m.push(roleSystem, mutedStyle.Render(""))
+			for _, line := range strings.Split(strings.TrimRight(renderExecutionStrategy(m.lastExecutionStrategy), "\n"), "\n") {
+				m.push(roleSystem, mutedStyle.Render(line))
+			}
+		}
+		// ── CONTEXT ENVELOPE (Phase 10) ──────────────────────────────
+		// The compiled minimum-sufficient context account: every item with its
+		// owner (engine/model), source, and reason for inclusion.
+		if m.lastContextEnvelope.ItemCount() > 0 {
+			m.push(roleSystem, mutedStyle.Render(""))
+			for _, line := range strings.Split(strings.TrimRight(renderContextEnvelope(m.lastContextEnvelope), "\n"), "\n") {
 				m.push(roleSystem, mutedStyle.Render(line))
 			}
 		}
@@ -139,6 +163,115 @@ func renderExecutionGraph(g *execution.ExecutionGraph) string {
 		b.WriteString(" verify=" + boolWord(n.Evidence.VerificationPassed))
 		if n.Evidence.Outcome != "" {
 			b.WriteString(" outcome=" + string(n.Evidence.Outcome))
+		}
+	}
+	return b.String()
+}
+
+// renderExecutionStrategy renders the engine-first strategy decision record of
+// the most recent $prompt for $inspect: the strategy, its deterministic
+// rationale, the target-resolution outcomes, the execution-factor complexity,
+// the minimum-sufficient context channels, the artifact contract and the
+// budgets the engine selected BEFORE any model invocation. It exposes
+// execution facts only — never model reasoning.
+func renderExecutionStrategy(p strategy.ExecutionStrategyProfile) string {
+	var b strings.Builder
+	b.WriteString("strategy:")
+	if p.Intent != "" {
+		b.WriteString(" intent=" + truncateInline(p.Intent, 80))
+	}
+	fmt.Fprintf(&b, "\n  strategy=%s complexity=%s", p.Strategy, p.Complexity.Level)
+	if p.Complexity.Score > 0 {
+		fmt.Fprintf(&b, " (score=%d)", p.Complexity.Score)
+	}
+	for _, f := range p.Complexity.Factors {
+		b.WriteString("\n    factor " + f.Name + "=" + itoa(f.Score) + " — " + f.Reason)
+	}
+	if p.StrategyReason != "" {
+		b.WriteString("\n  reason=" + p.StrategyReason)
+	}
+	if p.Deterministic {
+		b.WriteString("\n  deterministic=yes")
+	}
+	b.WriteString("\n  model=" + boolWord(p.ModelRequired))
+	if p.ModelRequired {
+		b.WriteString(" decision=" + p.ModelDecision)
+	}
+	for _, t := range p.Targets {
+		b.WriteString("\n  target " + t.Resolved)
+		if t.Resolved == "" || t.Resolved == t.Raw {
+			b.WriteString(" (raw=" + t.Raw + ")")
+		}
+		b.WriteString(" status=" + string(t.Status))
+		if t.Source != "" {
+			b.WriteString(" source=" + t.Source)
+		}
+		b.WriteString(" exists=" + boolWord(t.Exists))
+		if t.Reason != "" {
+			b.WriteString(" — " + t.Reason)
+		}
+	}
+	if len(p.ContextKinds) > 0 {
+		b.WriteString("\n  context=")
+		first := true
+		for _, k := range p.ContextKinds {
+			if !first {
+				b.WriteString(",")
+			}
+			first = false
+			b.WriteString(k.Label())
+		}
+	}
+	if p.Artifact.Kind != "" {
+		b.WriteString("\n  artifact=" + p.Artifact.Kind)
+		if p.Artifact.Bounded {
+			b.WriteString(" (bounded)")
+		}
+	}
+	if p.ReasoningBudget > 0 {
+		fmt.Fprintf(&b, "\n  reasoning-budget=%d", p.ReasoningBudget)
+	}
+	if p.MaxOutputTokens > 0 {
+		fmt.Fprintf(&b, "\n  output-budget=%d", p.MaxOutputTokens)
+	}
+	if p.Escalation {
+		b.WriteString("\n  escalated=" + p.EscalationReason)
+	}
+	if p.ModelRequired {
+		ic := strategy.For(p, 1)
+		b.WriteString("\n  " + ic.String())
+	}
+	return b.String()
+}
+
+func truncateInline(s string, max int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
+// renderContextEnvelope renders the compiled minimum-sufficient context
+// account of the most recent $prompt for $inspect. Every item names its owner
+// ("engine" / "model"), its source, and the concrete reason it was included —
+// the context ownership model made observable. It never exposes model
+// reasoning, only what context the engine supplied and why.
+func renderContextEnvelope(env strategy.ContextEnvelope) string {
+	var b strings.Builder
+	b.WriteString("context-envelope:")
+	if env.Expanded {
+		b.WriteString(" expanded=" + env.ExpansionReason)
+	}
+	for _, it := range env.Items {
+		b.WriteString("\n  " + it.Kind.Label())
+		b.WriteString(" owner=" + it.Owner)
+		b.WriteString(" source=" + it.Source.Label())
+		if it.Content != "" {
+			b.WriteString(" " + truncateInline(it.Content, 80))
+		}
+		if it.ReasonForInclusion != "" {
+			b.WriteString(" — " + it.ReasonForInclusion)
 		}
 	}
 	return b.String()

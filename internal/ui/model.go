@@ -29,6 +29,7 @@ import (
 	domainworkflow "github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/lea"
@@ -240,6 +241,10 @@ type planResultMsg struct {
 	// (inference → policy → IR plan → lowerer). The handler labels the staged
 	// plan and notes that zero model tokens were consumed.
 	IntentCompiler bool
+	// EngineFirst marks plans staged by the engine-first strategy layer
+	// (Phase 10): deterministic tasks the engine resolved without LLM
+	// reasoning. The handler labels the staged plan truthfully.
+	EngineFirst bool
 	// TokenInput/TokenOutput are the provider-reported usage of the synthesis
 	// call, committed even when the response was truncated (finish_reason:
 	// "length"). The handler mirrors them into the session counters and the
@@ -1380,6 +1385,30 @@ type model struct {
 	// diff/apply/filesystem/verify facts derived only from real runtime
 	// evidence. Written and read on the UI goroutine only.
 	lastExecutionProof ExecutionProof
+
+	// lastExecutionStrategy is the engine-first execution-strategy decision
+	// record of the most recent $prompt (Phase 10). It captures the strategy,
+	// the target-resolution outcomes, the execution-factor complexity, the
+	// context channels, the artifact contract and the budgets the engine
+	// selected BEFORE any model invocation — exposed through $inspect so a
+	// user can answer "why did Izen call the model / read this file / need
+	// /plan?" without seeing model reasoning. Written on the UI goroutine only.
+	lastExecutionStrategy strategy.ExecutionStrategyProfile
+	// lastContextEnvelope is the minimum-sufficient context envelope the
+	// engine-first compiler assembled for the most recent $prompt (Phase 10).
+	// Every item names its owner, source and reason for inclusion; $inspect
+	// renders it so context ownership is observable and auditable.
+	lastContextEnvelope strategy.ContextEnvelope
+	// activeStrategyBudget is the adaptive output budget the engine-first
+	// router selected for the currently dispatched targeted mutation. Zero
+	// means "use the default bounded budget". It is cleared when the mutation
+	// operation reaches a terminal message.
+	activeStrategyBudget int
+	// hotfixBranding labels the bounded mutation executor's status lines.
+	// "HOTFIX" for $hot, "PROMPT" when a $prompt routed to the same executor
+	// via the engine-first strategy layer, so telemetry never mislabels the
+	// operation source.
+	hotfixBranding string
 
 	// Stream throttle — frame-bounded token emission
 	streamThrottle *StreamThrottle

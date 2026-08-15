@@ -1240,6 +1240,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// success the prepared graph + per-node proposals are staged for the
 		// approval gate.
 		m.pendingHotfixCandidate = nil
+		m.clearEngineFirstMutationState()
 		outcome, outErr := classifyOpErrWithErr(msg.Err)
 		if msg.Err != nil {
 			// A preparation failure never mutates: roll back the owned set.
@@ -1322,6 +1323,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.TokenInput > 0 {
 			m.lastPromptEnvelope.TotalInputTokens = msg.TokenInput
 		}
+		// The generation operation reached its terminal message: release the
+		// engine-first transient state (adaptive budget + branding). The
+		// decision record stays in m.lastExecutionStrategy for $inspect.
+		m.clearEngineFirstMutationState()
 		outcome, outErr := classifyOpErrWithErr(msg.Err)
 		m.finalizeOperation(outcome, outErr)
 		// ── EXECUTION PROOF — GENERATION FACTS (Phase 8) ─────────────
@@ -1459,6 +1464,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// focused and editable so the next command can be typed immediately.
 		m.finalizeOperation(OpOutcomeAmbiguous, nil)
 		m.pendingHotfixCandidate = nil
+		m.clearEngineFirstMutationState()
 		m.pendingHotfixAmbiguous = &hotfixAmbiguousData{
 			Task:       msg.Task,
 			Reason:     msg.Reason,

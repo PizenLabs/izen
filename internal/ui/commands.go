@@ -3118,7 +3118,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	targets, hardErr, ambiguous := resolveMultiHotfixTargets(prompt)
 	if hardErr != "" {
 		m.hotfixActive = false
-		m.push(roleError, "[HOTFIX] "+hardErr)
+		m.push(roleError, "["+m.hotfixBrandingLabel()+"] "+hardErr)
 		m.push(roleSystem, infoStyle.Render("No files were modified."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -3126,7 +3126,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	}
 	if ambiguous {
 		m.hotfixActive = false
-		m.push(roleError, "[HOTFIX] Multi-file target is ambiguous. Name explicit @file targets, e.g. \"$hot fix @a.html and @b.html\".")
+		m.push(roleError, "["+m.hotfixBrandingLabel()+"] Multi-file target is ambiguous. Name explicit @file targets, e.g. \"$hot fix @a.html and @b.html\".")
 		m.push(roleSystem, infoStyle.Render("No model call was made and no files were modified."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -3140,7 +3140,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	hasTasks := len(m.sess.CurrentTasks) > 0
 	if hasTasks {
 		if err := m.stashPlan(); err != nil {
-			m.push(roleError, fmt.Sprintf("[HOTFIX] Failed to stash current plan: %v", err))
+			m.push(roleError, fmt.Sprintf("[%s] Failed to stash current plan: %v", m.hotfixBrandingLabel(), err))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return nil
@@ -3154,7 +3154,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	m.hotfixActive = true
 
 	// Stage 4: Create a single ad-hoc FILE_MUTATE task.
-	m.push(roleStatus, fmt.Sprintf("[HOTFIX] Urgent hotfix: %s", prompt))
+	m.push(roleStatus, fmt.Sprintf("[%s] Urgent hotfix: %s", m.hotfixBrandingLabel(), prompt))
 
 	// ── DYNAMIC TARGET RESOLUTION ─────────────────────────────────────
 	// Extract the real target file path from the developer's request.
@@ -3203,7 +3203,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 			m.sess.StageTaskList(&stashedTasks)
 			_ = m.sess.Save()
 		}
-		m.push(roleStatus, "[HOTFIX] Target is ambiguous. No model call was made and no files were modified.")
+		m.push(roleStatus, "["+m.hotfixBrandingLabel()+"] Target is ambiguous. No model call was made and no files were modified.")
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return tea.Batch(
@@ -3229,7 +3229,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	// The "Invoking provider" line is emitted ONLY here, i.e. after the
 	// ambiguity gate has already passed — it is truthful by construction.
 	m.beginOperation(OpHotfix)
-	m.push(roleStatus, "[HOTFIX] Generating patch (local short-circuit for simple modifications)...")
+	m.push(roleStatus, "["+m.hotfixBrandingLabel()+"] Generating patch (local short-circuit for simple modifications)...")
 	m.push(roleSystem, fmt.Sprintf("  ⚙ Invoking %s...", m.activeRouteModel()))
 
 	m.agentRunning = true
@@ -3816,7 +3816,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			Model:     m.activeRouteModel(),
 			System:    system,
 			Stream:    false,
-			MaxTokens: 2048,
+			MaxTokens: m.hotfixOutputBudget(),
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
 			Reasoning: m.effortFromTasks(),
 		}
@@ -3881,14 +3881,14 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		if len(resp.ToolCalls) == 0 && responseEffectivelyEmpty(resp) {
 			if isCloud {
 				m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
-					"[HOTFIX] Model returned a truncated response (%d tokens). Retrying with a non-streaming request...",
-					responseTokenEstimate(resp))))
+					"[%s] Model returned a truncated response (%d tokens). Retrying with a non-streaming request...",
+					m.hotfixBrandingLabel(), responseTokenEstimate(resp))))
 			}
 			retryReq := ai.Request{
 				Model:     m.activeRouteModel(),
 				System:    hotfixSystemPrompt(contract),
 				Stream:    false,
-				MaxTokens: 2048,
+				MaxTokens: m.hotfixOutputBudget(),
 				Messages:  []ai.Message{{Role: "user", Content: buildHotfixFallbackHandoff(task, orig, contract, tgt)}},
 				Reasoning: m.effortFromTasks(),
 			}
@@ -3959,7 +3959,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 				emptyTokens = responseTokenEstimate(resp)
 			}
 			if isCloud {
-				m.push(roleSystem, infoStyle.Render("[HOTFIX] Provider returned an empty/truncated response. Trying local fallback..."))
+				m.push(roleSystem, infoStyle.Render("["+m.hotfixBrandingLabel()+"] Provider returned an empty/truncated response. Trying local fallback..."))
 			}
 			if orig != "" {
 				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
@@ -6696,6 +6696,10 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 
 	case mode == modes.ModeBuild && (strings.HasPrefix(action, "hot ") || action == "hot"):
 		rest := strings.TrimSpace(strings.TrimPrefix(action, "hot"))
+		// A $hot always labels the bounded executor as HOTFIX — it can never
+		// inherit a stale PROMPT label from an earlier engine-first $prompt
+		// mutation that aborted before a terminal message.
+		m.hotfixBranding = ""
 		// handleHotfixCmd handles its own state and returns an appropriate cmd.
 		cmd = m.handleHotfixCmd(rest)
 
