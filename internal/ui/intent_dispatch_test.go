@@ -148,25 +148,39 @@ func TestHandleInputUnknownCommandShowsParseError(t *testing.T) {
 	}
 }
 
-// TestHandleInputPermissionDeniedFromReadOnly verifies a $hot directive typed
-// inside /ask (no workspace marker) is rejected by the parser's permission
-// policy against the active workspace and never dispatches.
-func TestHandleInputPermissionDeniedFromReadOnly(t *testing.T) {
+// TestHandleInputHotFromAskAutoTransitionsToBuild verifies a $hot directive
+// typed inside /ask (no /workspace marker) does NOT dead-end on a permission
+// error: the parser pipeline re-resolves the directive's execution context
+// (/build) and the dispatcher transitions internally and continues — the user
+// is never forced to repeat `/build`.
+func TestHandleInputHotFromAskAutoTransitionsToBuild(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
 	m := newTestModel()
 	m.resolver.Set(modes.ModeAsk)
+	m.state = StateChat
+	m.awaitingConfirmation = false
+	m.pendingProposals = nil
+	m.streaming = false
+	m.agentRunning = false
 
-	cmd := m.handleInput("$hot fix x")
-	if cmd != nil {
-		t.Fatalf("handleInput($hot in ask) returned a cmd (%T) — permission-denied directive must not dispatch", cmd)
+	cmd := m.handleInput("$hot fix login timeout @index.html")
+	if cmd == nil {
+		t.Fatal("handleInput($hot in ask) returned nil cmd — continuous execution must dispatch")
+	}
+	if got := m.resolver.Current(); got != modes.ModeBuild {
+		t.Errorf("workspace = /%s, want /build after internal auto-transition", got)
 	}
 	found := false
 	for _, r := range m.records {
-		if strings.Contains(r.text, `requires write`) && strings.Contains(r.text, `/ask`) {
+		if strings.Contains(r.text, "[HOTFIX] Urgent hotfix:") {
 			found = true
+			break
 		}
 	}
 	if !found {
-		t.Error("expected a permission-denied parse error referencing /ask in the chat log")
+		t.Error("expected $hot to dispatch the hotfix pipeline after the internal /build transition")
 	}
 }
 
@@ -316,10 +330,16 @@ func TestHandleInputLogFromReview(t *testing.T) {
 	}
 }
 
-// TestHandleInputHotDeniedInInvestigate verifies a Write-capable directive is
-// rejected by the parser's permission policy against the read-only-mutation
-// investigate workspace — no dispatch, formatted error surfaced.
-func TestHandleInputHotDeniedInInvestigate(t *testing.T) {
+// TestHandleInputHotFromInvestigateAutoTransitionsToBuild verifies a $hot
+// directive typed inside /investigate auto-transitions into /build (the
+// directive's execution context) and continues, instead of dead-ending on a
+// write-permission denial. An explicit /ask / /investigate marker in the same
+// line still honors the declared context (see TestHandleInputExplicitAskMarker
+// below).
+func TestHandleInputHotFromInvestigateAutoTransitionsToBuild(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
 	m := newTestModel()
 	m.resolver.Set(modes.ModeInvestigate)
 	m.state = StateChat
@@ -328,18 +348,48 @@ func TestHandleInputHotDeniedInInvestigate(t *testing.T) {
 	m.streaming = false
 	m.agentRunning = false
 
-	cmd := m.handleInput("$hot fix x")
-	if cmd != nil {
-		t.Fatalf("handleInput($hot in investigate) returned a cmd (%T) — denied directive must not dispatch", cmd)
+	cmd := m.handleInput("$hot fix x @index.html")
+	if cmd == nil {
+		t.Fatal("handleInput($hot in investigate) returned nil cmd — continuous execution must dispatch")
+	}
+	if got := m.resolver.Current(); got != modes.ModeBuild {
+		t.Errorf("workspace = /%s, want /build after internal auto-transition", got)
 	}
 	found := false
 	for _, r := range m.records {
-		if strings.Contains(r.text, `requires write`) && strings.Contains(r.text, `/investigate`) {
+		if strings.Contains(r.text, "[HOTFIX] Urgent hotfix:") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected $hot to dispatch the hotfix pipeline after the internal /build transition")
+	}
+}
+
+// TestHandleInputExplicitAskMarkerStillDenied verifies an explicit /workspace
+// marker in the line is authoritative: "$ask $hot x" is rejected by the
+// parser's permission policy unchanged — the user declared /ask, so /ask's
+// read-only boundary applies.
+func TestHandleInputExplicitAskMarkerStillDenied(t *testing.T) {
+	m := newTestModel()
+	m.resolver.Set(modes.ModeBuild)
+
+	cmd := m.handleInput("/ask $hot fix x")
+	if cmd != nil {
+		t.Fatalf("handleInput(/ask $hot) returned a cmd (%T) — explicit-marker permission denial must stop dispatch", cmd)
+	}
+	if got := m.resolver.Current(); got != modes.ModeBuild {
+		t.Errorf("workspace = /%s, want /build (unchanged on explicit-marker denial)", got)
+	}
+	found := false
+	for _, r := range m.records {
+		if strings.Contains(r.text, `requires write`) && strings.Contains(r.text, `/ask`) {
 			found = true
 		}
 	}
 	if !found {
-		t.Error("expected a permission-denied parse error referencing /investigate in the chat log")
+		t.Error("expected a permission-denied parse error referencing /ask in the chat log")
 	}
 }
 

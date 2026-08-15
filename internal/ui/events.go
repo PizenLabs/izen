@@ -77,6 +77,10 @@ type TokenUsageMsg struct {
 	PromptTokens     int
 	CompletionTokens int
 	Model            string
+	// Known is true when the provider reported usage (authoritative or an
+	// explicit estimate). false means usage is unknown and must never render
+	// as a literal "0 tok".
+	Known bool
 }
 
 // ThoughtBufferUpdatedMsg carries one raw LLM chunk (reasoning or content) to

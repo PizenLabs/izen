@@ -202,12 +202,12 @@ func TestProjectDollarSuggestionsBuild(t *testing.T) {
 
 func TestProjectDollarSuggestionsAskIsReadOnly(t *testing.T) {
 	items := projectDollarSuggestions(command.Default(), command.WorkspaceAsk, "")
-	if len(items) != 2 {
-		t.Fatalf("ask projection returned %d items, want exactly 2 read-only directives", len(items))
+	if len(items) != 3 {
+		t.Fatalf("ask projection returned %d items, want exactly 3 read-only directives", len(items))
 	}
-	got := []string{items[0].Token, items[1].Token}
-	if !equalSlices(got, []string{"$env", "$prompt"}) {
-		t.Errorf("ask projection = %v, want [$env $prompt]", got)
+	got := []string{items[0].Token, items[1].Token, items[2].Token}
+	if !equalSlices(got, []string{"$env", "$inspect", "$prompt"}) {
+		t.Errorf("ask projection = %v, want [$env $inspect $prompt]", got)
 	}
 }
 
@@ -356,8 +356,8 @@ func TestUpdateSuggestionsDollarAskReadOnly(t *testing.T) {
 	for _, s := range m.suggestions {
 		labels = append(labels, s.Token)
 	}
-	if !equalSlices(labels, []string{"$env", "$prompt"}) {
-		t.Errorf("ask '$' menu = %v, want only read-compatible [$env $prompt]", labels)
+	if !equalSlices(labels, []string{"$env", "$inspect", "$prompt"}) {
+		t.Errorf("ask '$' menu = %v, want only read-compatible [$env $inspect $prompt]", labels)
 	}
 }
 

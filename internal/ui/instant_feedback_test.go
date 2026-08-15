@@ -113,17 +113,26 @@ func TestThinkingBufferCollapsedExpandHint(t *testing.T) {
 	}
 }
 
-// TestDockThinkingLineExpandHint guards the expand hint on the loading dock's
-// live thinking line.
-func TestDockThinkingLineExpandHint(t *testing.T) {
+// TestDockNoThinkingClaim guards execution-truthful progress: while the loading
+// dock is live and the runtime is waiting on the provider, the dock MUST show a
+// truthful provider state ("Model ● waiting"), never a "Thinking..." claim and
+// never a reasoning expand hint on the progress line.
+func TestDockNoThinkingClaim(t *testing.T) {
 	m := newTestModel()
-	m.startShimmer("Thinking...", "analyze")
+	m.startShimmer("Waiting for model...", "analyze")
 	m.thinkingBuffer = NewThinkingBuffer()
 	m.thinkingBuffer.Append("analyzing code structure")
+	m.setStage("model", "qwen2.5-coder:7b", stageWaiting)
 
 	got := m.composeDockTextWithFlake("✻")
-	if !strings.Contains(got, "[Ctrl+O to expand]") {
-		t.Fatalf("dock thinking line missing expand hint: %q", got)
+	if strings.Contains(got, "Thinking") {
+		t.Fatalf("dock claims the model is thinking: %q", got)
+	}
+	if strings.Contains(got, "[Ctrl+O to expand]") {
+		t.Fatalf("dock progress line carries a reasoning expand hint: %q", got)
+	}
+	if !strings.Contains(got, "waiting") {
+		t.Fatalf("dock does not render the truthful waiting state: %q", got)
 	}
 }
 

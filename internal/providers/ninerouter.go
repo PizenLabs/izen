@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 )
@@ -149,9 +150,17 @@ func (p *NineRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 
 	tokenIn := 0
 	tokenOut := 0
+	var usage ai.ProviderUsage
+	usage.RequestStartedAt = time.Now()
 	if nrResp.Usage != nil {
 		tokenIn = nrResp.Usage.PromptTokens
 		tokenOut = nrResp.Usage.CompletionTokens
+		usage = nrResp.Usage.ProviderUsage()
+	}
+	usage.CompletedAt = time.Now()
+	usage.FinishReason = nrResp.Choices[0].FinishReason
+	if usage.FirstTokenAt.IsZero() {
+		usage.FirstTokenAt = usage.CompletedAt
 	}
 
 	return &ai.Response{
@@ -159,6 +168,7 @@ func (p *NineRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
 		ToolCalls:   toolCalls,
+		Usage:       usage,
 	}, nil
 }
 
@@ -221,6 +231,7 @@ func (p *NineRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 	}
 
 	sr := &ninerouterSSEReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
+	sr.usage.markRequestStarted(time.Now())
 	return &NineRouterStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -296,16 +307,31 @@ type ninerouterUsage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// ProviderUsage converts the parsed 9Router usage object into the
+// authoritative ai.ProviderUsage contract.
+func (u *ninerouterUsage) ProviderUsage() ai.ProviderUsage {
+	out := ai.ProviderUsage{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		TotalTokens:      u.TotalTokens,
+		Known:            true,
+	}
+	if out.TotalTokens == 0 {
+		out.TotalTokens = out.PromptTokens + out.CompletionTokens
+	}
+	return out
+}
+
 type NineRouterStreamResult struct {
 	io.ReadCloser
 	sr *ninerouterSSEReader
 }
 
-func (r *NineRouterStreamResult) Usage() (input, output int) {
+func (r *NineRouterStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
 		return r.sr.usage.Usage()
 	}
-	return 0, 0
+	return ai.ProviderUsage{}
 }
 
 // FinishReason reports the terminal finish_reason observed on the stream
@@ -375,6 +401,7 @@ func (s *ninerouterSSEReader) Read(p []byte) (int, error) {
 
 		if data == "[DONE]" {
 			s.closed = true
+			s.usage.markCompleted(time.Now(), s.finishReason)
 			return 0, io.EOF
 		}
 
@@ -385,10 +412,16 @@ func (s *ninerouterSSEReader) Read(p []byte) (int, error) {
 
 		if chunk.Usage != nil {
 			s.finalUsage = chunk.Usage
-			s.usage.recordUsage(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
+			s.usage.recordUsageFull(chunk.Usage.ProviderUsage())
 		}
 
 		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		if chunk.Choices[0].FinishReason != "" {
+			s.finishReason = chunk.Choices[0].FinishReason
+			s.usage.markCompleted(time.Now(), chunk.Choices[0].FinishReason)
 			continue
 		}
 

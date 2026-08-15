@@ -145,8 +145,8 @@ func TestRegressionRuntimeUsableAfterAmbiguous(t *testing.T) {
 	mock := &mockProvider{responses: []*ai.Response{{Content: "x", TokenOutput: 10}}}
 	m := ambiguousHotfixModel(t, mock)
 
-	// Dismiss the card via Cancel ([x]).
-	res, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	// Dismiss the card via Cancel ([⌥X]).
+	res, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}, Alt: true})
 	m2 := res.(*model)
 	if m2.state != StateChat {
 		t.Fatalf("after cancel: state = %v, want StateChat", m2.state)
@@ -178,8 +178,8 @@ func TestRegressionRuntimeDispatchesHotfixAfterAmbiguity(t *testing.T) {
 	mock := &mockProvider{responses: []*ai.Response{{Content: "```\nhello\n```", TokenOutput: 10}}}
 	m := ambiguousHotfixModel(t, mock)
 
-	// Dismiss the card via Clarify ([c]) — focus returns to the input.
-	res, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	// Dismiss the card via Clarify ([⌥C]) — focus returns to the input.
+	res, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}, Alt: true})
 	m2 := res.(*model)
 	if m2.state != StateChat || !m2.ti.Focused() {
 		t.Fatalf("after clarify: state=%v focused=%v", m2.state, m2.ti.Focused())
@@ -555,8 +555,9 @@ func TestRegressionCandidateSelectionStartsNewOperation(t *testing.T) {
 		t.Fatal("busy after ambiguous result")
 	}
 
-	// Enter candidate inspection and explicitly select candidate #1.
-	m3, _ := m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	// Enter candidate inspection (alt+i — a plain 'i' is always text) and
+	// explicitly select candidate #1.
+	m3, _ := m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}, Alt: true})
 	m4 := m3.(*model)
 	if !m4.hotfixCandidatesMode {
 		t.Fatal("precondition: candidate inspection mode not entered")

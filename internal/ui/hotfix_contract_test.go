@@ -170,21 +170,78 @@ func TestHotfixLargeFileSnippetProducesBoundedPatch(t *testing.T) {
 	}
 }
 
-// TestHotfixSmallFileKeepsFullFileContract is the negative control: for a
-// stub/small file the whole-file rewrite IS the legitimate bounded contract, so
-// the prompt must still carry the complete-file instruction and the pipeline
-// must still accept it. The invariant is size-relative, not snippet-everywhere.
-func TestHotfixSmallFileKeepsFullFileContract(t *testing.T) {
+// TestHotfixSmallFileBoundedSnippetContract is the Phase 8 regression for the
+// exact observed problem: a SMALL but real-content index.html must NOT force a
+// full-file re-emission. The contract Izen pins is the bounded snippet — the
+// prompt carries "output ONLY the exact lines that must change" — so a model
+// that follows it produces a tiny, bounded patch. A model that (wrongly) dumps
+// the complete small file still yields a valid bounded REPLACE_FILE artifact
+// (the pipeline accepts a whole-file block only because the file is small), but
+// the PROMPT never invites it.
+func TestHotfixSmallFileBoundedSnippetContract(t *testing.T) {
 	small := hotfixIndexHTML
 	if execution.LineCount(small) >= 100 {
 		t.Fatalf("fixture must be below the small-file boundary, got %d lines", execution.LineCount(small))
 	}
 	indexPath := writeHotfixFixture(t, "index.html", small)
 
-	complete := strings.Replace(small, "</html>", "  <p>Appended</p>\n</html>", 1)
+	// The model follows the snippet contract: only the changed lines.
+	snippet := "```html\n  <h3>Project Delta</h3>\n  <p>Stable content</p>\n```"
+	mock := &mockProvider{
+		responses: []*ai.Response{{Content: snippet, TokenOutput: 30}},
+	}
+	m := newTestModel()
+	m.provider = mock
+
+	task := &plan.Task{
+		StepNum:     1,
+		Type:        "FILE_MUTATE",
+		Target:      indexPath,
+		Description: "Remove extra text from @index.html",
+	}
+
+	msg := m.proposeHotfixPatch(task)()
+	result, ok := msg.(hotfixProposalMsg)
+	if !ok {
+		t.Fatalf("expected hotfixProposalMsg, got %T", msg)
+	}
+	if mock.callCount != 1 {
+		t.Fatalf("provider calls = %d, want 1", mock.callCount)
+	}
+	if result.Err != nil {
+		t.Fatalf("bounded snippet hotfix on a small file failed: %v", result.Err)
+	}
+	if result.Patch == nil || !strings.Contains(result.Patch.Modified, "@@") {
+		t.Fatalf("expected a compiled diff, got: %+v", result.Patch)
+	}
+
+	// The prompt Izen sent must carry the bounded snippet contract and must
+	// NEVER invite a complete-file re-emission.
+	if len(mock.requests) != 1 {
+		t.Fatalf("captured requests = %d, want 1", len(mock.requests))
+	}
+	user := ""
+	if len(mock.requests[0].Messages) > 0 {
+		user = mock.requests[0].Messages[0].Content
+	}
+	if strings.Contains(user, "COMPLETE, FULLY IMPLEMENTED") {
+		t.Errorf("small real-content file prompt must not invite a complete-file rewrite:\n%s", user)
+	}
+	if !strings.Contains(user, "Do NOT output the entire file") {
+		t.Errorf("small real-content file prompt missing the snippet-only output contract:\n%s", user)
+	}
+}
+
+// TestHotfixNewFileKeepsFullCreationContract is the negative control for the
+// Phase 8 contract fix: a genuinely NEW/empty file keeps the complete-file
+// creation contract — bounded artifact economy applies only to real content.
+func TestHotfixNewFileKeepsFullCreationContract(t *testing.T) {
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, "index.html")
+
 	mock := &mockProvider{
 		responses: []*ai.Response{
-			{Content: "```html\n" + complete + "\n```", TokenOutput: 120},
+			{Content: "```html\n<!DOCTYPE html>\n<html><body><p>New</p></body></html>\n```", TokenOutput: 40},
 		},
 	}
 	m := newTestModel()
@@ -194,7 +251,7 @@ func TestHotfixSmallFileKeepsFullFileContract(t *testing.T) {
 		StepNum:     1,
 		Type:        "FILE_MUTATE",
 		Target:      indexPath,
-		Description: "update the landing page footer",
+		Description: "create an index page",
 	}
 
 	msg := m.proposeHotfixPatch(task)()
@@ -203,15 +260,8 @@ func TestHotfixSmallFileKeepsFullFileContract(t *testing.T) {
 		t.Fatalf("expected hotfixProposalMsg, got %T", msg)
 	}
 	if result.Err != nil {
-		t.Fatalf("small-file whole-file hotfix failed: %v", result.Err)
+		t.Fatalf("new-file creation failed: %v", result.Err)
 	}
-	if result.Patch == nil || result.Patch.Modified == "" {
-		t.Fatal("expected a compiled patch for the small-file whole-file contract")
-	}
-	if !strings.Contains(result.Patch.Modified, "@@") {
-		t.Fatalf("expected a compiled unified diff, got:\n%s", result.Patch.Modified)
-	}
-
 	if len(mock.requests) != 1 {
 		t.Fatalf("captured requests = %d, want 1", len(mock.requests))
 	}
@@ -219,8 +269,8 @@ func TestHotfixSmallFileKeepsFullFileContract(t *testing.T) {
 	if len(mock.requests[0].Messages) > 0 {
 		user = mock.requests[0].Messages[0].Content
 	}
-	if !strings.Contains(user, "COMPLETE, FULLY IMPLEMENTED") {
-		t.Errorf("small-file prompt must keep the complete-file contract:\n%s", user)
+	if !strings.Contains(user, "COMPLETE file content") {
+		t.Errorf("new-file prompt must keep the complete-file creation contract:\n%s", user)
 	}
 }
 
@@ -254,7 +304,10 @@ func largeMismatchedIndexHTML() string {
 // TestHotfixContractSelectsReplaceBlockBeforeInvocation is regression test 1:
 // a large-file $hot selects the ReplaceBlock artifact contract BEFORE any model
 // invocation — the decision is made by Izen from the on-disk state, not by the
-// model's output.
+// model's output. Phase 8 ownership fix: ANY existing file with real content —
+// however small — also selects ReplaceBlock, so a tiny mutation never forces a
+// full-file re-emission. Whole-file rewrite survives only for new / empty /
+// whitespace-only files.
 func TestHotfixContractSelectsReplaceBlockBeforeInvocation(t *testing.T) {
 	if got := hotfixContractFor(largeMismatchedIndexHTML()); got != contractReplaceBlock {
 		t.Errorf("hotfixContractFor(large) = %v, want contractReplaceBlock", got)
@@ -262,11 +315,14 @@ func TestHotfixContractSelectsReplaceBlockBeforeInvocation(t *testing.T) {
 	if got := hotfixContractFor(largeHotfixIndexHTML()); got != contractReplaceBlock {
 		t.Errorf("hotfixContractFor(large) = %v, want contractReplaceBlock", got)
 	}
-	if got := hotfixContractFor(hotfixIndexHTML); got != contractReplaceFile {
-		t.Errorf("hotfixContractFor(small) = %v, want contractReplaceFile", got)
+	if got := hotfixContractFor(hotfixIndexHTML); got != contractReplaceBlock {
+		t.Errorf("hotfixContractFor(small real file) = %v, want contractReplaceBlock", got)
 	}
 	if got := hotfixContractFor(""); got != contractReplaceFile {
 		t.Errorf("hotfixContractFor(new) = %v, want contractReplaceFile", got)
+	}
+	if got := hotfixContractFor("   \n\t "); got != contractReplaceFile {
+		t.Errorf("hotfixContractFor(whitespace-only) = %v, want contractReplaceFile", got)
 	}
 }
 

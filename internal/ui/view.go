@@ -303,9 +303,17 @@ func (m *model) renderProposalBlock() string {
 		b.WriteString(m.renderHotfixAmbiguousBlock(width))
 
 	case StateProcessing:
+		// ── Truthful in-flight mutation dock ───────────────────────
+		// Derived from the authoritative execution stage: the dock shows what
+		// the runtime is ACTUALLY doing (apply/patch/model), never the generic
+		// "Processing file mutations..." claim.
 		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
 		sp := SpinnerStyle.Render(frame)
-		b.WriteString("  " + sp + " " + infoStyle.Render("Processing file mutations... Please wait."))
+		stageLine := m.renderStageLine()
+		if stageLine == "" {
+			stageLine = "Applying mutation..."
+		}
+		b.WriteString("  " + sp + " " + infoStyle.Render(stageLine))
 		if len(m.pendingProposals) > 0 {
 			b.WriteString(" " + tracerStyle.Render(m.pendingProposals[0].Target.QualifiedName))
 		}
@@ -716,8 +724,12 @@ func (m *model) renderRuntimeStatus(width int) string {
 	}
 	b.WriteByte(' ')
 
-	// AI INTERRUPT ENGINE: high-visibility indicator when streaming
-	if m.streaming || m.shellRunning {
+	// AI INTERRUPT ENGINE: high-visibility indicator that Ctrl+C is available
+	// while ANY execution operation is in flight (streaming, provider wait,
+	// agent run, patch generation, shell). Cancellation must be discoverable,
+	// not implied.
+	if m.streaming || m.shellRunning || m.agentRunning || m.reviewRunning ||
+		m.pipelineRunning || m.planPending || m.activeOp != nil {
 		b.WriteString(interruptLabelStyle.Render(Icon.Interrupt + " Ctrl+C interrupt "))
 	}
 
@@ -760,7 +772,11 @@ func (m *model) renderRuntimeStatus(width int) string {
 	// total. The percentage reflects how much of the active model's context
 	// window is consumed, so the bar stays aligned with the provider dashboard
 	// instead of a static "/128000" ceiling.
-	tokDisplay := status.FormatUsageContext(m.InputTokens, m.OutputTokens, m.TotalTokens, m.activeContextLimit())
+	//
+	// USAGE TRUTH (Phase 4): "usage unknown" is rendered until the provider
+	// reports usage this session — never a fabricated "0 tok". Once usage is
+	// known, "0 tok" genuinely means the provider reported zero tokens.
+	tokDisplay := renderTokenUsage(m.usageKnown, m.InputTokens, m.OutputTokens, m.TotalTokens, m.activeContextLimit())
 	meta = append(meta, dimmedStyle.Render(tokDisplay))
 
 	// Accumulated cost — dropped before checkpoint as panes narrow.
@@ -1582,4 +1598,15 @@ func parseDiffMetadata(diffBody string) (file, symbol, linesRange, cleanDiff str
 	}
 	cleanDiff = strings.Join(diffLines, "\n")
 	return
+}
+
+// renderTokenUsage renders the footer token segment with USAGE TRUTH
+// semantics (Phase 4): "usage unknown" until the provider reports usage —
+// never a fabricated "0 tok". Once known, "0 tok" genuinely means the provider
+// reported zero tokens.
+func renderTokenUsage(known bool, input, output, total, contextLimit int) string {
+	if !known && input == 0 && output == 0 && total == 0 {
+		return "usage unknown"
+	}
+	return status.FormatUsageContext(input, output, total, contextLimit)
 }

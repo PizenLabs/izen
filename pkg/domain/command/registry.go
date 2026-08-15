@@ -289,5 +289,6 @@ func officialCommands() []CommandDescriptor {
 		directive("test", CategoryValidation, PermissionSet(PermExecute), true, "run the project test suite"),
 		directive("hot", CategoryMutation, PermissionSet(PermWrite), true, "fast targeted mutation for small localized edits"),
 		directive("fix", CategoryMutation, PermissionSet(PermWrite|PermExecute), true, "structured implementation for larger fixes"),
+		directive("inspect", CategoryObservation, PermissionSet(PermRead), true, "render the detailed execution telemetry timeline (op, stages, provider)"),
 	}
 }

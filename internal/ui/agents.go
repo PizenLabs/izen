@@ -87,6 +87,13 @@ func (m *model) runInvestigateAsyncCmd(content string) tea.Cmd {
 		outCh := make(chan outcome, 1)
 
 		go func() {
+			// ── WORKER LIFETIME (Phase 3) ────────────────────────────────
+			// The investigate engine runs on its own goroutine; register it as
+			// a worker of the active operation so the terminal-lifecycle tests
+			// can prove it is released. A no-op when no operation is attached.
+			m.spawnOpWorker("investigate")
+			defer m.releaseOpWorker("investigate")
+
 			// Panic guard: a panic inside the engine must still deliver an
 			// error outcome so the select below resolves immediately instead of
 			// freezing the spinner for the full 60s deadline waiting on outCh.
@@ -361,7 +368,7 @@ type reviewTestExecutor struct {
 
 func (e *reviewTestExecutor) RunDynamicTests() (bool, string, error) {
 	runner := execExecutionRunner(".")
-	result, err := runner.Run("go test -v ./...")
+	result, err := runner.RunContext(e.m.operationContext(), "go test -v ./...")
 	if err != nil && result == nil {
 		return false, err.Error(), err
 	}
@@ -759,7 +766,9 @@ func (m *model) runCommitCmdAgent(userMsg string) tea.Cmd {
 					Messages: msgs,
 					Stream:   false,
 				}
-				resp, err := m.provider.Execute(context.Background(), req)
+				ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
+				resp, err := m.provider.Execute(ctx, req)
+				cancel()
 				if err != nil {
 					return commitGeneratedMsg{err: fmt.Errorf("LLM call failed: %w", err)}
 				}

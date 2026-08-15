@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"fmt"
 	"strings"
 	"time"
 
@@ -186,9 +185,11 @@ func (m *model) renderLoadingDock() string {
 }
 
 // composeDockTextWithFlake builds the dynamic status text using the given
-// snowflake character. When the thinking buffer is actively receiving
-// reasoning tokens, the text shows live thinking progress with elapsed time.
-// Otherwise it falls back to the shimmer text set by startShimmer.
+// snowflake character. It is derived from the AUTHORITATIVE execution stage
+// (stage.go): the dock can only ever claim work the runtime actually reported —
+// a provider wait renders as "waiting" (never "thinking"), a token stream as
+// "streaming", a local stage as its canonical label. When no stage is active
+// it falls back to the shimmer text set by startShimmer.
 //
 // The returned text is ALWAYS plain (ANSI-free): the shimmer sweep re-colours
 // every rune independently, so embedding a lipgloss-styled segment here would
@@ -196,9 +197,10 @@ func (m *model) renderLoadingDock() string {
 // renderLoadingDock). The hint is therefore plain text carried on the same
 // swept line.
 func (m *model) composeDockTextWithFlake(flake string) string {
-	if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 && !m.thinkingBuffer.Complete() {
-		elapsed := m.thinkingBuffer.Elapsed()
-		return fmt.Sprintf("%s Thinking... (%s)  [Ctrl+O to expand]", flake, formatElapsed(elapsed))
+	if st := m.stageSnapshot(); st.active() {
+		if line := renderStageStatus(st); line != "" {
+			return flake + " " + line
+		}
 	}
 	if m.shimmerText != "" {
 		return flake + " " + m.shimmerText

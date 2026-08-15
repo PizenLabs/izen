@@ -71,8 +71,18 @@ func (m *model) submitHotfixCardCommand() (tea.Model, tea.Cmd) {
 // toggleHotfixCandidates toggles the read-only candidate-inspection sub-view.
 // Inspecting candidates NEVER mutates the file and NEVER selects a candidate —
 // the human chooses explicitly, or the card returns to Clarify/Cancel.
+//
+// FOCUS CONTRACT: candidate selection ([1-9]) is an explicit modal
+// interaction, so entering the sub-view blurs the text input and the number
+// keys become modal. Leaving it restores focus so the next command can be
+// typed immediately.
 func (m *model) toggleHotfixCandidates() (tea.Model, tea.Cmd) {
 	m.hotfixCandidatesMode = !m.hotfixCandidatesMode
+	if m.hotfixCandidatesMode {
+		m.ti.Blur()
+	} else {
+		m.ti.Focus()
+	}
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
 	return m, nil
@@ -116,7 +126,7 @@ func (m *model) selectHotfixCandidate(n int) (tea.Model, tea.Cmd) {
 	m.lastAgentActivity = time.Now()
 	m.startShimmer("Applying hotfix...", "execute")
 	m.push(roleStatus, fmt.Sprintf("[HOTFIX] Target set to candidate %d — generating patch for %s", n, amb.Task.Target))
-	m.push(roleSystem, fmt.Sprintf("  ⚙ Thinking... (Invoking %s)", m.activeRouteModel()))
+	m.push(roleSystem, fmt.Sprintf("  ⚙ Invoking %s...", m.activeRouteModel()))
 
 	return m, tea.Batch(
 		func() tea.Msg { return agentStartMsg{label: "hotfix"} },
@@ -186,16 +196,16 @@ func (m *model) renderHotfixAmbiguousBlock(width int) string {
 	if m.hotfixCandidatesMode && len(amb.Candidates) > 0 {
 		fmt.Fprintf(&b, "%s  %s  %s",
 			permissionKeyStyle.Render("[1-9] Select"),
-			permissionKeyStyle.Render("[c] Clarify"),
-			permissionKeyStyle.Render("[x] Cancel"),
+			permissionKeyStyle.Render("[⌥C] Clarify"),
+			permissionKeyStyle.Render("[⌥X] Cancel"),
 		)
 		b.WriteString("\n")
 	} else {
-		keys := permissionKeyStyle.Render("[c] Clarify target")
+		keys := permissionKeyStyle.Render("[⌥C] Clarify target")
 		if len(amb.Candidates) > 0 {
-			keys += "  " + permissionKeyStyle.Render("[i] Inspect candidates")
+			keys += "  " + permissionKeyStyle.Render("[⌥I] Inspect candidates")
 		}
-		keys += "  " + permissionKeyStyle.Render("[x] Cancel")
+		keys += "  " + permissionKeyStyle.Render("[⌥X] Cancel")
 		b.WriteString(keys)
 		b.WriteString("\n")
 	}

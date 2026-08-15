@@ -121,10 +121,26 @@ type tokenMsg string
 // content streams in bright.
 type thinkingTokenMsg string
 
+// streamUsageMsg carries the provider's AUTHORITATIVE cumulative token usage
+// observed mid-stream. It is emitted by the stream producer only when the
+// provider reports a usage update (Known && !Estimated — never a character-count
+// estimate), so the live streaming indicator reflects billed tokens and never a
+// fabricated count. Reasoning carries the provider-reported reasoning-token
+// split when available, which backs the compact thought summary.
+type streamUsageMsg struct {
+	input     int
+	output    int
+	reasoning int
+}
+
 type streamDoneMsg struct {
 	content     string
 	tokenInput  int
 	tokenOutput int
+	// usageEstimated is true when the token counts came from a character-count
+	// estimate (local models that report no usage, or an interrupted stream)
+	// rather than the provider's authoritative usage chunk.
+	usageEstimated bool
 	// truncated is true when the provider signalled finish_reason == "length":
 	// the response hit the API completion ceiling and was cut off mid-generation
 	// rather than finishing naturally ("stop").
@@ -157,6 +173,9 @@ type streamErrMsg struct {
 	// attempt ("Explicit Over Implicit").
 	tokenInput  int
 	tokenOutput int
+	// usageEstimated is true when the token counts are a character-count
+	// estimate rather than the provider's authoritative usage.
+	usageEstimated bool
 }
 
 type PlanStreamingFinishedMsg struct {
@@ -287,6 +306,49 @@ type mutationResultMsg struct {
 	err    error
 	file   string
 	status string
+	// evidence is the single source of truth for the mutation attempt's facts
+	// (artifact presence, diff presence, apply execution, filesystem result,
+	// verification). The renderer projects it — it never infers a mutation
+	// from a planned "Edit" event. May be nil on pre-apply failures.
+	evidence *execution.MutationEvidence
+	// TokenInput/TokenOutput carry the provider-reported usage of the call
+	// that produced this mutation result (the zero-patch short-circuit and
+	// the apply paths). Without them the provider's real token consumption
+	// would be silently dropped whenever a task ends in "nochange" or "skipped"
+	// — the exact "OpenRouter billed 2048 completion tokens while the footer
+	// shows 0 tok" bug. usageKnown is false when the provider reported no usage.
+	TokenInput  int
+	TokenOutput int
+	usageKnown  bool
+}
+
+// outcome returns the semantic outcome of the mutation result, normalized onto
+// the execution.MutationOutcome vocabulary. When the runtime filled a
+// MutationEvidence record it is the single source of truth; otherwise the
+// error/status is normalized so a vague status can never claim a mutation.
+func (r mutationResultMsg) outcome() execution.MutationOutcome {
+	if r.evidence != nil && r.evidence.Outcome != "" {
+		return r.evidence.Outcome
+	}
+	if r.err != nil {
+		if isContextCancelled(r.err) || isContextDeadline(r.err) {
+			return execution.OutcomeCancelled
+		}
+		return execution.OutcomeApplyFailed
+	}
+	return execution.ParseMutationOutcome(r.status)
+}
+
+// respUsage extracts the authoritative provider usage from a response for
+// propagation onto terminal execution messages. known is true when the
+// provider reported usage (or the response carries non-zero counts, preserving
+// the legacy contract used by tests); a nil response reports unknown.
+func respUsage(resp *ai.Response) (input, output int, known bool) {
+	if resp == nil {
+		return 0, 0, false
+	}
+	known = resp.Usage.Known || resp.TokenInput > 0 || resp.TokenOutput > 0
+	return resp.TokenInput, resp.TokenOutput, known
 }
 
 type applyAllResultMsg struct {
@@ -431,6 +493,31 @@ type hotfixProposalMsg struct {
 	// buffers by the update handler so the thought drawer renders the raw
 	// model stream during and after cloud execution.
 	RawOutput string
+	// Envelope is the deterministic context-ownership account of the provider
+	// request Izen constructed for this hotfix (Phase 8). It proves what
+	// context crossed to the provider — never a reconstruction.
+	Envelope PromptEnvelope
+}
+
+// multiHotfixProposalMsg is the terminal message of the Phase A (prepare) stage
+// of a multi-file $hot. It carries the fully prepared ExecutionGraph (every
+// node has a validated artifact), the per-node SemanticProposals for the
+// approval surface, and the AGGREGATE provider usage of ALL node invocations.
+// It never mutates the filesystem — apply happens only after human approval.
+type multiHotfixProposalMsg struct {
+	// Graph is the prepared execution graph (Phase A complete).
+	Graph *execution.ExecutionGraph
+	// Proposals is one proposal per graph node, in stable order.
+	Proposals []SemanticProposal
+	// Err is set when Phase A failed before any artifact was applied. The
+	// owning MutationSet is rolled back by the handler.
+	Err error
+	// TokenInput / TokenOutput are the aggregate provider-reported usage of
+	// every node invocation (summed once per node, never duplicated).
+	TokenInput  int
+	TokenOutput int
+	// RawOutput is the concatenated raw LLM output of every node.
+	RawOutput string
 }
 
 // hotfixAmbiguousMsg is the terminal result of a $hot request paused by the
@@ -452,14 +539,6 @@ type hotfixAmbiguousData struct {
 	Task       *plan.Task
 	Reason     string
 	Candidates []hotfix.Target
-}
-
-// hotfixProgressMsg streams a lifecycle log line to the terminal while the
-// $hot patch is being generated in the background. It is delivered through the
-// Bubble Tea event loop (never from the background goroutine) so the spinner
-// stays alive and the developer sees active progress instead of a frozen pane.
-type hotfixProgressMsg struct {
-	Line string
 }
 
 type fixResultMsg struct {
@@ -789,6 +868,12 @@ type model struct {
 	AccumulatedCost float64
 	CheckpointID    string
 
+	// usageKnown reports whether the provider has ever reported authoritative
+	// (or explicit-estimate) usage this session. The footer distinguishes
+	// "usage unknown" (never reported) from a genuine "0 tok" (provider
+	// reported zero). "0 tok" must mean an actual zero, not an unknown.
+	usageKnown bool
+
 	streamParser     *IncrementalStreamParser
 	streamBuffer     string // buffered tokens for smooth tick emission
 	streamTickActive bool   // whether smooth-stream tick is active
@@ -1045,6 +1130,19 @@ type model struct {
 	// gated) actually succeeded. Cleared on the terminal result.
 	appliedHotfixFile string
 
+	// ── Multi-file hotfix (Phase 9B): deterministic execution graph ──
+	// activeGraph is the single ExecutionGraph owned by the active multi-file
+	// $hot operation. Exactly one graph is active at a time (beginOperation
+	// supersedes a previous one). It carries the one MutationSet the whole
+	// graph executes under.
+	activeGraph *execution.ExecutionGraph
+	// pendingHotfixGraph is the prepared graph awaiting the approval gate. It
+	// is non-nil only while a multi-file proposal is staged for review.
+	pendingHotfixGraph *execution.ExecutionGraph
+	// lastExecutionGraph retains the most recently finalized multi-file graph
+	// so $inspect can expose the aggregate execution evidence.
+	lastExecutionGraph *execution.ExecutionGraph
+
 	// ── Foreground operation lifecycle (single authoritative operation) ──
 	// activeOp is the one foreground operation currently owned by the runtime,
 	// or nil when idle. Every execution path (hotfix generation, build apply,
@@ -1053,6 +1151,14 @@ type model struct {
 	activeOp *operation
 	// opIDCounter issues monotonically increasing operation IDs.
 	opIDCounter uint64
+	// activitySurfaceSealed is set by /clear (resetTransientInteraction) and
+	// cleared by the next foreground operation (beginOperation) or user
+	// submission (submitEnter). While sealed, engine-derived activity
+	// projections (domain events, engine telemetry, shell output, terminal
+	// result records, reasoning streams, control facts) are dropped so a late
+	// event from the cleared execution can never resurrect stale activity in
+	// the viewport. See lifecycle.go.
+	activitySurfaceSealed bool
 	// cancelGraceDeadline is the double-Ctrl+C force-exit window armed when a
 	// graceful cancellation is initiated. A second Ctrl+C before this deadline
 	// hard-exits with status 130.
@@ -1248,6 +1354,32 @@ type model struct {
 
 	// Activity tree — structured tool call logging
 	activityTree *ActivityTree
+
+	// Authoritative execution-stage record — the single source of truth for
+	// "what is the runtime doing right now". Every progress indicator derives
+	// from it; it is updated ONLY at real execution boundaries (see stage.go).
+	// Never written from the renderer.
+	stage *execStage
+
+	// lastExecutionSnapshot is the retained telemetry snapshot of the most
+	// recently finalized foreground operation. It backs the debug/inspect
+	// execution-timeline view (see execution_telemetry.go). Written on the UI
+	// goroutine at finalization; read on the UI goroutine only.
+	lastExecutionSnapshot execution.TelemetrySnapshot
+	// lastExecutionTelemetry retains the finalized record itself so the
+	// inspect view can render live counters (invocations/retries) without
+	// re-folding the marker log. Nil until an operation completes.
+	lastExecutionTelemetry *execution.Telemetry
+	// lastPromptEnvelope is the deterministic context-ownership account of the
+	// most recent directive execution (Phase 8). It proves what context crossed
+	// to the provider and is exposed through $inspect. Written and read on the
+	// UI goroutine only.
+	lastPromptEnvelope PromptEnvelope
+	// lastExecutionProof is the execution-evidence account of the most recent
+	// hotfix/build mutation (Phase 8): provider invocations, usage, artifact/
+	// diff/apply/filesystem/verify facts derived only from real runtime
+	// evidence. Written and read on the UI goroutine only.
+	lastExecutionProof ExecutionProof
 
 	// Stream throttle — frame-bounded token emission
 	streamThrottle *StreamThrottle
@@ -1595,7 +1727,9 @@ func (m *model) sanitizeInputPrompt() {
 // counters and the global status.Tracker. It is the single accounting entry
 // point for BOTH successful and failed LLM attempts: on failure the provider's
 // partial usage (or a character estimate) is still committed so consumed
-// tokens are never silently zeroed ("Explicit Over Implicit").
+// tokens are never silently zeroed ("Explicit Over Implicit"). known marks
+// whether the provider reported usage at all; unknown usage leaves the
+// "usage unknown" state intact so the footer never fabricates a zero.
 func (m *model) commitTokenUsage(input, output int) {
 	if input < 0 {
 		input = 0
@@ -1613,6 +1747,12 @@ func (m *model) commitTokenUsage(input, output int) {
 	}
 }
 
+// markUsageKnown records that the provider reported authoritative usage this
+// session, transitioning the footer from "usage unknown" to a real count.
+func (m *model) markUsageKnown() {
+	m.usageKnown = true
+}
+
 // tokenUsageCmd returns a command that dispatches the provider-reported token
 // usage of an execution path to the Bubble Tea event loop as a TokenUsageMsg.
 // The TokenUsageMsg handler in update.go accumulates the counts into the
@@ -1621,7 +1761,14 @@ func (m *model) commitTokenUsage(input, output int) {
 // was aborted, or was truncated mid-stream. Zero usage produces a nil command
 // (nothing was consumed, nothing to report).
 func (m *model) tokenUsageCmd(input, output int) tea.Cmd {
-	if input <= 0 && output <= 0 {
+	return m.tokenUsageCmdKnown(input, output, input > 0 || output > 0)
+}
+
+// tokenUsageCmdKnown is tokenUsageCmd with an explicit known flag: known=true
+// even with zero counts means the provider genuinely reported zero usage, so
+// the footer renders "0 tok" instead of "usage unknown".
+func (m *model) tokenUsageCmdKnown(input, output int, known bool) tea.Cmd {
+	if input <= 0 && output <= 0 && !known {
 		return nil
 	}
 	model := ""
@@ -1633,6 +1780,7 @@ func (m *model) tokenUsageCmd(input, output int) tea.Cmd {
 			PromptTokens:     input,
 			CompletionTokens: output,
 			Model:            model,
+			Known:            known,
 		}
 	}
 }
@@ -1653,6 +1801,13 @@ func (m *model) setApplyError(text string) {
 // they are fed directly from the engine via handleEngineEvent for
 // typed events with real I/O metrics.
 func (m *model) logActivity(format string, args ...interface{}) {
+	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
+	// After /clear the surface is sealed until the next operation or user
+	// submission: a late engine activity line from the cleared execution must
+	// never repopulate the cleared records.
+	if m.activitySurfaceSealed {
+		return
+	}
 	msg := sanitizeIngressANSI(fmt.Sprintf(format, args...))
 	r := record{role: roleActivity, text: msg}
 	m.records = append(m.records, r)
@@ -1675,6 +1830,13 @@ func (m *model) logActivity(format string, args ...interface{}) {
 // from each engine package and converted to the canonical EngineEvent.
 func (m *model) handleEngineEvent(ev interface{}) {
 	if m.activityTree == nil {
+		return
+	}
+	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
+	// After /clear the structured activity tree is cleared and sealed; a late
+	// typed engine I/O event (file read/mutate/search/resolve) from the cleared
+	// execution must not re-append to it.
+	if m.activitySurfaceSealed {
 		return
 	}
 	// Type-assert to known event structs from engine packages.
@@ -1733,6 +1895,15 @@ func (m *model) handleEngineEvent(ev interface{}) {
 // surfaces engine events in the viewport — engines never call the UI directly.
 func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	if ev == nil {
+		return
+	}
+	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
+	// After /clear the surface is sealed until the next operation or user
+	// submission: a late domain event from the cleared execution (activity
+	// line, engine telemetry, reasoning stream) must never resurrect stale
+	// activity. Engine-side workflow state (the WorkflowStateMachine) is
+	// untouched — only the UI projection is dropped.
+	if m.activitySurfaceSealed {
 		return
 	}
 	switch p := ev.Payload().(type) {
@@ -2158,6 +2329,12 @@ func (m *model) handleControlFact(ev telemetry.Event) {
 	if ev == nil {
 		return
 	}
+	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
+	// After /clear the fact-only execution tree is cleared and sealed; a late
+	// control fact from the cleared execution must not rebuild it.
+	if m.activitySurfaceSealed {
+		return
+	}
 	switch ev.Type() {
 	case telemetry.EventControlIteration:
 		p, ok := ev.Payload().(*telemetry.ControlIterationPayload)
@@ -2245,6 +2422,12 @@ func (m *model) ensureControlSnapshot(runID string) {
 // thinking buffer. Chunks are appended verbatim; the terminal event (empty
 // chunk + IsComplete) collapses the box. Only ever runs on the UI goroutine.
 func (m *model) handleReasoningStream(chunk string, isComplete bool) {
+	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
+	// After /clear the thinking buffer is cleared and sealed; a late reasoning
+	// chunk from the cleared execution must not resurrect the thinking block.
+	if m.activitySurfaceSealed {
+		return
+	}
 	if m.thinkingBuffer == nil {
 		m.thinkingBuffer = NewThinkingBuffer()
 	}
@@ -2313,6 +2496,15 @@ func truncateForActivity(s string) string {
 // push appends a record. Records are flushed to the terminal's native
 // scrollback at explicit sync points (user submit, stream done, etc.).
 func (m *model) push(r role, text string) {
+	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
+	// After /clear the surface is sealed until the next operation or user
+	// submission: a terminal result record pushed by the cleared execution
+	// must never repopulate the cleared records. submitEnter reopens the
+	// surface before any user-initiated interaction, so interactive messages
+	// always render.
+	if m.activitySurfaceSealed {
+		return
+	}
 	text = sanitizeIngressANSI(text)
 	m.records = append(m.records, record{role: r, text: text})
 	m.cacheRecordToHistory(record{role: r, text: text})
@@ -2882,6 +3074,11 @@ func (m *model) flushPendingReasoningFragment() {
 		return
 	}
 	m.reasoningBuffer.WriteString(leftover)
+	// A late stream-completion reasoning flush after /clear (sealed surface)
+	// must not resurrect the cleared thinking panel / stream blocks.
+	if m.activitySurfaceSealed {
+		return
+	}
 	if m.thinkingPanel != nil {
 		m.thinkingPanel.Append(leftover)
 	}

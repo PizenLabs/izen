@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 )
@@ -86,6 +87,12 @@ type openaiUsage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// ProviderUsage converts the parsed OpenAI usage into the authoritative
+// ai.ProviderUsage contract.
+func (u *openaiUsage) ProviderUsage() ai.ProviderUsage {
+	return openAICompatibleUsage(u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+}
+
 func (p *OpenAIProvider) buildMessages(req ai.Request) []openaiMessage {
 	msgs := make([]openaiMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
@@ -156,15 +163,24 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	tokenIn := 0
 	tokenOut := 0
+	var usage ai.ProviderUsage
+	usage.RequestStartedAt = time.Now()
 	if openaiResp.Usage != nil {
 		tokenIn = openaiResp.Usage.PromptTokens
 		tokenOut = openaiResp.Usage.CompletionTokens
+		usage = openAICompatibleUsage(openaiResp.Usage.PromptTokens, openaiResp.Usage.CompletionTokens, openaiResp.Usage.TotalTokens)
+	}
+	usage.CompletedAt = time.Now()
+	usage.FinishReason = openaiResp.Choices[0].FinishReason
+	if usage.FirstTokenAt.IsZero() {
+		usage.FirstTokenAt = usage.CompletedAt
 	}
 
 	return &ai.Response{
 		Content:     content,
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
+		Usage:       usage,
 	}, nil
 }
 
@@ -212,6 +228,7 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	}
 
 	sr := &openaiSSEReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
+	sr.usage.markRequestStarted(time.Now())
 	return &OpenAIStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -220,11 +237,11 @@ type OpenAIStreamResult struct {
 	sr *openaiSSEReader
 }
 
-func (r *OpenAIStreamResult) Usage() (input, output int) {
+func (r *OpenAIStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
 		return r.sr.usage.Usage()
 	}
-	return 0, 0
+	return ai.ProviderUsage{}
 }
 
 // FinishReason reports the terminal finish_reason observed on the stream
@@ -279,6 +296,7 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 
 		if data == "[DONE]" {
 			s.closed = true
+			s.usage.markCompleted(time.Now(), s.finishReason)
 			return 0, io.EOF
 		}
 
@@ -289,10 +307,16 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 
 		if chunk.Usage != nil {
 			s.finalUsage = chunk.Usage
-			s.usage.recordUsage(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
+			s.usage.recordUsageFull(chunk.Usage.ProviderUsage())
 		}
 
 		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		if chunk.Choices[0].FinishReason != "" {
+			s.finishReason = chunk.Choices[0].FinishReason
+			s.usage.markCompleted(time.Now(), chunk.Choices[0].FinishReason)
 			continue
 		}
 

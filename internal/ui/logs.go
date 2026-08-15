@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/PizenLabs/izen/internal/execution"
 )
 
 // LogEntryKind is the type of execution log action.
@@ -17,8 +19,21 @@ const (
 	LogSearch
 	LogDelete
 	LogOther
+	// Semantic lifecycle kinds (Phase 4 — execution truth). These extend the
+	// existing execution-log taxonomy so one generic "Edit" event can never
+	// represent plan / model / patch / apply / verify / result at the same
+	// time. The stage kinds are always rendered with their semantic stage
+	// label; the result kind carries the terminal mutation outcome.
+	LogPlan
+	LogModel
+	LogArtifact
+	LogPatch
+	LogApply
+	LogVerify
+	LogResult
 )
 
+// String returns the canonical log kind label.
 func (k LogEntryKind) String() string {
 	switch k {
 	case LogCreate:
@@ -31,6 +46,20 @@ func (k LogEntryKind) String() string {
 		return "Search"
 	case LogDelete:
 		return "Delete"
+	case LogPlan:
+		return "Plan"
+	case LogModel:
+		return "Model"
+	case LogArtifact:
+		return "Artifact"
+	case LogPatch:
+		return "Patch"
+	case LogApply:
+		return "Apply"
+	case LogVerify:
+		return "Verify"
+	case LogResult:
+		return "Result"
 	default:
 		return "Action"
 	}
@@ -50,6 +79,16 @@ type LogEntry struct {
 	Thinking  string // full LLM reasoning content (shown when expanded)
 	SystemLog string // raw system execution log (shown when expanded)
 	Expanded  bool
+
+	// Stage is the semantic lifecycle stage of the entry (Part G). It
+	// disambiguates what the entry actually represents — a planned intent,
+	// a model artifact, a compiled patch, an executed apply, a verification
+	// pass, or the terminal result. Zero value keeps legacy rendering.
+	Stage execution.MutationStage
+	// Outcome is the semantic terminal outcome of a result-stage entry.
+	// NO_CHANGE is only ever recorded after a valid artifact was compared
+	// against the actual filesystem and found byte-for-byte unchanged.
+	Outcome execution.MutationOutcome
 }
 
 // LogStore holds a collection of foldable log entries.
@@ -74,6 +113,15 @@ func (ls *LogStore) Add(kind LogEntryKind, target string, success bool, content 
 // then returns its ID. The thinking and systemLog fields are retained even
 // during Per-Task Fallback mode so expandable thought logs remain available.
 func (ls *LogStore) AddFull(kind LogEntryKind, target string, success bool, content string, thinking string, systemLog string) int {
+	return ls.AddFullSemantic(kind, target, success, content, thinking, systemLog, "", "")
+}
+
+// AddFullSemantic appends a log entry carrying the semantic lifecycle stage
+// and terminal mutation outcome (Phase 4 — execution truth). The renderer uses
+// the stage/outcome to present the entry truthfully: a nochange or skipped
+// outcome is never rendered as a successful mutation. It is the single way
+// mutation-capable executions write to the execution log.
+func (ls *LogStore) AddFullSemantic(kind LogEntryKind, target string, success bool, content string, thinking string, systemLog string, stage execution.MutationStage, outcome execution.MutationOutcome) int {
 	id := ls.nextID
 	ls.nextID++
 	ls.entries = append(ls.entries, LogEntry{
@@ -85,6 +133,8 @@ func (ls *LogStore) AddFull(kind LogEntryKind, target string, success bool, cont
 		Thinking:  thinking,
 		SystemLog: systemLog,
 		Expanded:  false,
+		Stage:     stage,
+		Outcome:   outcome,
 	})
 	return id
 }
@@ -140,6 +190,35 @@ func (ls *LogStore) Clear() {
 	ls.nextID = 1
 }
 
+// EntryCountContains reports whether any entry's rendered kind label contains
+// the given substring.
+func (ls *LogStore) EntryCountContains(label string) bool {
+	if ls == nil {
+		return false
+	}
+	for _, e := range ls.entries {
+		if strings.Contains(e.Kind.String(), label) {
+			return true
+		}
+	}
+	return false
+}
+
+// LastResult returns the most recent entry whose kind is a semantic result
+// entry, or nil when none exists.
+func (ls *LogStore) LastResult() *LogEntry {
+	if ls == nil {
+		return nil
+	}
+	for i := len(ls.entries) - 1; i >= 0; i-- {
+		if ls.entries[i].Kind == LogResult {
+			e := ls.entries[i]
+			return &e
+		}
+	}
+	return nil
+}
+
 // Entries returns all log entries.
 func (ls *LogStore) Entries() []LogEntry {
 	return ls.entries
@@ -154,7 +233,36 @@ func RenderEntry(entry LogEntry, width int, dotFrame int) string {
 		icon = redStyle.Render(Icon.Error)
 	}
 
+	// ── TRUTHFUL RESULT RENDERING (Phase 4) ───────────────────────────
+	// A semantic result entry is NEVER shown as a green successful mutation
+	// unless the outcome is actually a changed/created filesystem mutation.
+	// nochange / skipped / failures render with their own neutral or error
+	// glyph so the execution log can never claim an edit that did not happen.
 	label := entry.Kind.String()
+	if entry.Outcome != "" {
+		switch entry.Outcome {
+		case execution.OutcomeChanged, execution.OutcomeCreated:
+			icon = greenStyle.Render(Icon.Success)
+		case execution.OutcomeNoChange:
+			icon = dimmedStyle.Render("∅")
+			label = "NoChange"
+		case execution.OutcomeSkipped:
+			icon = dimmedStyle.Render("↷")
+			label = "Skipped"
+		case execution.OutcomeCancelled:
+			icon = yellowStyle.Render(Icon.Warning)
+			label = "Cancelled"
+		case execution.OutcomeNoArtifact, execution.OutcomePatchGenerationFailed,
+			execution.OutcomeApplyFailed, execution.OutcomeVerifyFailed:
+			icon = redStyle.Render(Icon.Error)
+			label = entry.Outcome.Display()
+		}
+	} else if entry.Stage != "" {
+		// Non-result semantic stages (plan/model/artifact/patch/apply/verify)
+		// are informational and render with the neutral bullet glyph.
+		icon = dimmedStyle.Render("▸")
+		label = entry.Stage.Display()
+	}
 	target := entry.Target
 	if len(target) > 40 {
 		target = "..." + target[len(target)-37:]

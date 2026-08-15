@@ -78,10 +78,12 @@ func TestThinkingStyleIsDimGray(t *testing.T) {
 
 // TestThinkingBufferCompactThoughtUsesThinkingStyle guards the
 // "▸ Thought for Xs (N tokens)" compact summary line: it must render through
-// the dimmed reasoning style, never the normal answer style.
+// the dimmed reasoning style, never the normal answer style. The token count
+// appears ONLY when the provider-reported reasoning-token count is known.
 func TestThinkingBufferCompactThoughtUsesThinkingStyle(t *testing.T) {
 	tb := NewThinkingBuffer()
 	tb.Append("analyze failure")
+	tb.SetReasoningTokens(512)
 	tb.MarkComplete()
 
 	renderFn := func() string {
@@ -91,10 +93,27 @@ func TestThinkingBufferCompactThoughtUsesThinkingStyle(t *testing.T) {
 	if !strings.Contains(out, "Thought for") {
 		t.Fatalf("compact line missing Thought for: %q", out)
 	}
-	if !strings.Contains(out, "tokens)") {
-		t.Fatalf("compact line missing token count: %q", out)
+	if !strings.Contains(out, "512") {
+		t.Fatalf("compact line missing authoritative token count: %q", out)
 	}
 	if !thinkingStyle.GetFaint() {
 		t.Error("compact thought line must carry the dim reasoning style")
+	}
+}
+
+// TestThinkingBufferCompactOmitsUnknownTokenCount guards token-truthful
+// rendering: when the provider reports NO reasoning-token count, the compact
+// summary must NOT invent one from the reasoning text length.
+func TestThinkingBufferCompactOmitsUnknownTokenCount(t *testing.T) {
+	tb := NewThinkingBuffer()
+	tb.Append("analyze failure")
+	tb.MarkComplete()
+
+	out := tb.Render(80, true, "✦")
+	if !strings.Contains(out, "Thought for") {
+		t.Fatalf("compact line missing Thought for: %q", out)
+	}
+	if strings.Contains(out, "tokens)") {
+		t.Fatalf("compact line fabricated a token count: %q", out)
 	}
 }

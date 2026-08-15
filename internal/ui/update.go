@@ -483,20 +483,6 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// dispatch batch did not include it (e.g. $log trace analysis).
 		return m, m.shimmerTickCmd()
 
-	case hotfixProgressMsg:
-		// Stream a $hot lifecycle log line to the terminal so the developer
-		// sees active progress while the LLM generates the patch. Only accept
-		// lines while the hotfix is still generating (the proposal/error
-		// message clears these flags), preventing stale trailing logs from
-		// polluting the approval view.
-		if m.agentRunning && m.agentLabel == "hotfix" {
-			m.touchOperationProgress()
-			m.push(roleActivity, msg.Line)
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
-		}
-		return m, nil
-
 	case agentDoneMsg:
 		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
@@ -739,11 +725,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// interactive todo checklist look in the TUI.
 		// Also expose the plan approval action chips — the user must explicitly
 		// approve the plan before /build execution begins.
-		// Fast-track plans are auto-approved — show execute-build + reset actions
-		// so action chips are visible from ANY mode (including /ask).
+		// Fast-track plans are auto-approved — execution continues IMMEDIATELY
+		// (continuous execution: no artificial chip gate for an already
+		// authorized, deterministic plan). The plan is still rendered first so
+		// the user sees what /build is executing, then runBuildCmd picks up the
+		// staged tasks in the same turn.
 		// Non-fast-track plans show the explicit approval gate.
 		if msg.IsFastTrack {
-			m.currentResult = fastTrackPlanActions()
+			m.currentResult = nil
 		} else {
 			m.currentResult = planApprovalActions()
 		}
@@ -775,7 +764,35 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		flush := m.flushPendingRecords()
-		return m, tea.Batch(flush, m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput))
+		base := []tea.Cmd{flush, m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput)}
+
+		// ── CONTINUOUS EXECUTION: auto-approved fast-track continues to build ──
+		// A fast-track plan is pre-approved and deterministic (the compressor /
+		// intent compiler already resolved the target). The build executor
+		// starts in the same turn — no second /build, no chip press, no
+		// artificial pause between plan and execution. The mutation approval
+		// gate (patch proposal) still protects every byte that reaches disk.
+		//
+		// SINGLE-DISPATCH GUARD: setMode's own auto-trigger already dispatches
+		// build execution when a handoff payload exists (buildHandoffTriggerContent
+		// → handleMessageContent → runBuildCmd), so we NEVER pair setMode with an
+		// explicit runBuildCmd in the same batch. runBuildCmd is dispatched
+		// directly only when already in /build (no transition) or when the
+		// handoff auto-trigger cannot produce a payload.
+		if msg.IsFastTrack {
+			if m.resolver.Current() != modes.ModeBuild {
+				m.modeChangeAuthorized = true
+				if m.buildHandoffTriggerContent(modes.ModeBuild) != "" {
+					base = append(base, m.setMode(modes.ModeBuild))
+				} else {
+					base = append(base, m.setMode(modes.ModeBuild), m.runBuildCmd(""))
+				}
+			} else {
+				base = append(base, m.runBuildCmd(""))
+			}
+			base = append(base, m.smoothStreamTickCmd(), m.shimmerTickCmd())
+		}
+		return m, tea.Batch(base...)
 
 	case graphBuiltMsg:
 		m.clearBusyFlags()
@@ -1014,20 +1031,51 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, flush
 
 	case buildProposalReadyMsg:
+		// OPERATION LIFECYCLE: the build-patch generation operation (op begun
+		// in handleBuildRun) reaches its terminal outcome here — SUCCESS when a
+		// proposal is staged for approval, otherwise FAILURE / CANCELLED /
+		// TIMEOUT. finalizeBuildOperation is the single cleanup path: it
+		// releases ownership, cancels the operation context and stops the
+		// "Processing file mutations..." spinner so it can never outlive the
+		// patch-generation phase.
+		m.finalizeBuildOperation(msg.Err)
 		m.clearBusyFlags()
 		m.lastActionTime = time.Time{}
 		m.pipelineRunning = false
 		m.streaming = false
+		m.streamCancel = nil
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
 
 		// ── BUILD PROPOSAL FAILURE ───────────────────────────────────
 		if msg.Err != nil {
-			m.push(roleError, "patch generation failed: "+msg.Err.Error())
+			outcome, _ := classifyOpErrWithErr(msg.Err)
+			if outcome == OpOutcomeCancelled {
+				m.push(roleSystem, infoStyle.Render("[BUILD] Interrupted — patch generation cancelled. No files were modified."))
+			} else {
+				m.push(roleError, "patch generation failed: "+msg.Err.Error())
+			}
+			// Mark the current task terminal so the build queue can never
+			// remain frozen on a "processing" task after a failure. Prefer the
+			// driving task carried on the message; fall back to the task index
+			// handleBuildRun armed (retry-exhaustion failures do not always
+			// carry a Task). A cancelled generation returns the task to idle so
+			// the next command can re-submit it cleanly; a hard failure freezes
+			// the queue for inspection (existing behavior).
+			stepNum := 0
+			if msg.Task != nil {
+				stepNum = msg.Task.StepNum
+			} else {
+				stepNum = m.currentBuildTaskID
+			}
 			tasks := m.sess.CurrentTasks
 			for i := range tasks {
-				if msg.Task != nil && tasks[i].StepNum == msg.Task.StepNum {
-					tasks[i].Status = "failed"
+				if stepNum > 0 && tasks[i].StepNum == stepNum {
+					if outcome == OpOutcomeCancelled {
+						tasks[i].Status = "idle"
+					} else {
+						tasks[i].Status = "failed"
+					}
 					break
 				}
 			}
@@ -1184,6 +1232,73 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.Viewport.GotoBottom()
 		return m, m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput)
 
+	case multiHotfixProposalMsg:
+		// ── MULTI-FILE $hot PROPOSAL TERMINAL (Phase 9B) ─────────────
+		// Phase A (prepare) reached a terminal outcome. On failure NOTHING was
+		// applied: the owned MutationSet is rolled back (it recorded nothing,
+		// so this is a clean no-op) and the stashed plan is restored. On
+		// success the prepared graph + per-node proposals are staged for the
+		// approval gate.
+		m.pendingHotfixCandidate = nil
+		outcome, outErr := classifyOpErrWithErr(msg.Err)
+		if msg.Err != nil {
+			// A preparation failure never mutates: roll back the owned set.
+			if m.execEng != nil {
+				if errs := m.execEng.RollbackTransaction(); len(errs) > 0 {
+					for _, err := range errs {
+						m.push(roleError, fmt.Sprintf("multi-hotfix rollback error: %v", err))
+					}
+				}
+			}
+			m.finalizeOperation(outcome, outErr)
+			m.hotfixActive = false
+			m.activeGraph = nil
+			m.pendingHotfixGraph = nil
+			if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
+				m.sess.StageTaskList(&stashedTasks)
+				_ = m.sess.Save()
+			}
+			m.push(roleError, "[HOTFIX] Multi-file patch generation failed: "+providers.SanitizeAPIError(msg.Err))
+			m.push(roleSystem, infoStyle.Render("[HOTFIX] Pipeline PAUSED. No files were modified."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m, tea.Batch(m.flushPendingRecords(), m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput))
+		}
+
+		// Phase A succeeded: stage the prepared graph + proposals for approval.
+		m.finalizeOperation(OpOutcomeSuccess, nil)
+		m.activeGraph = msg.Graph
+		m.pendingHotfixGraph = msg.Graph
+		m.pendingProposals = msg.Proposals
+		m.pendingHotfixTask = nil
+		m.pendingHotfixPatch = nil
+		// ── AGGREGATE PROOF (Phase A facts) ─────────────────────────
+		// Authoritative invocation count + aggregate provider usage + per-node
+		// artifact/diff presence. Apply facts merge at the apply terminal.
+		m.recordMultiHotfixProposalProof(msg)
+		// ── THOUGHT CAPTURE (Ctrl+O) ────────────────────────────────
+		if msg.RawOutput != "" {
+			m.captureHotfixThought(msg.RawOutput)
+		}
+		thoughtDone := m.thoughtUpdateCmd(msg.RawOutput, true)
+
+		m.lastActionTime = time.Time{}
+		m.sanitizeInputPrompt()
+		m.syncUIState()
+		m.push(roleActivity, "  ⚙ Multi-file proposal compiled by the execution graph.")
+		m.push(roleStatus, multiHotfixProposalSummary(msg.Proposals))
+		m.push(roleSystem, infoStyle.Render("Review the diffs below. Use Alt+A to apply all, Alt+R to reject."))
+		m.enterApprovalState()
+		m.ti.Blur()
+		m.recalcViewportHeight()
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, tea.Batch(
+			m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput),
+			m.flushPendingRecords(),
+			thoughtDone,
+		)
+
 	case hotfixProposalMsg:
 		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
 		// processing flag, then re-derive the presentation state so a stale
@@ -1199,8 +1314,25 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// is the single terminal cleanup path; it cancels the operation
 		// context, clears ownership and stops the spinner.
 		m.pendingHotfixCandidate = nil
+		// ── CONTEXT-OWNERSHIP ACCOUNT (Phase 8) ──────────────────────
+		// Retain the deterministic envelope of the provider context this
+		// hotfix sent, with the authoritative provider-reported input usage
+		// attached (0 stays 0 only when the provider reported none).
+		m.lastPromptEnvelope = msg.Envelope
+		if msg.TokenInput > 0 {
+			m.lastPromptEnvelope.TotalInputTokens = msg.TokenInput
+		}
 		outcome, outErr := classifyOpErrWithErr(msg.Err)
 		m.finalizeOperation(outcome, outErr)
+		// ── EXECUTION PROOF — GENERATION FACTS (Phase 8) ─────────────
+		// finalizeOperation above retained the generation telemetry snapshot;
+		// fold its authoritative invocation count + the provider usage with the
+		// real artifact/diff presence. The apply facts are merged at the apply
+		// terminal (buildResultMsg).
+		if msg.Task != nil {
+			m.recordHotfixProposalProof(msg.Task.Target, msg.Patch != nil,
+				msg.Diff != "", msg.TokenInput, msg.TokenOutput)
+		}
 		m.lastActionTime = time.Time{}
 		m.sanitizeInputPrompt()
 		m.syncUIState()
@@ -1353,6 +1485,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.PromptTokens > 0 || msg.CompletionTokens > 0 {
 			m.commitTokenUsage(msg.PromptTokens, msg.CompletionTokens)
 		}
+		if msg.Known {
+			// The provider reported usage this turn (even zero): the footer
+			// may now render a real "0 tok" instead of "usage unknown".
+			m.markUsageKnown()
+		}
 		m.syncUIState()
 		return m, nil
 
@@ -1496,6 +1633,32 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			outcome := OpOutcomeSuccess
 			if msg.exitCode != 0 {
 				outcome = classifyOpErr(msg.err)
+			}
+			// ── MUTATION BOUNDARY TERMINAL (Phase 9A) ────────────────
+			// A successful hotfix is a committed user mutation: commit the
+			// MutationSet this apply owned so the transaction becomes terminal
+			// and NO future operation (a later failure, `izen rollback`) can
+			// undo it. On any failure/cancellation path the rollback above
+			// (RollbackTransaction) already restored exactly this boundary.
+			if msg.exitCode == 0 && m.execEng != nil {
+				m.execEng.CommitTransaction()
+			}
+			// ── EXECUTION PROOF (Phase 8) ─────────────────────────────
+			// Assemble the full execution-evidence account BEFORE the apply
+			// operation's finalization overwrites the retained generation
+			// telemetry. Provider facts come from the generation snapshot
+			// (invocations + authoritative usage recorded at the model stage);
+			// apply facts come from the real apply result. A mutation is only
+			// successful when the apply ran AND the filesystem changed.
+			if m.activeGraph != nil {
+				// ── MULTI-FILE GRAPH TERMINAL (Phase 9B) ────────────
+				// The whole graph reaches ONE terminal outcome from the real
+				// apply result: committed only when every node applied and
+				// verified, otherwise rolled back/cancelled/failed. The graph
+				// terminal never claims per-file success for un-applied nodes.
+				m.terminalizeMultiHotfixGraph(msg.exitCode == 0, outcome)
+			} else {
+				m.completeHotfixProof(msg.exitCode == 0, msg.err == nil)
 			}
 			m.finalizeOperation(outcome, msg.err)
 			m.syncUIState()
@@ -1866,6 +2029,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case mutationResultMsg:
+		// OPERATION LIFECYCLE: the zero-patch short-circuit returns
+		// mutationResultMsg directly from proposeBuildPatch (skipping
+		// buildProposalReadyMsg), so the build-patch operation begun in
+		// handleBuildRun must be finalized here too. On the normal apply path
+		// the operation was already finalized at proposal-ready — this is an
+		// idempotent no-op.
+		m.finalizeBuildOperation(msg.err)
+		// ── AUTHORITATIVE PROVIDER USAGE ─────────────────────────────
+		// The zero-patch short-circuit and the apply paths carry the provider
+		// usage of the call that produced the result. Commit it so the footer
+		// reflects the real tokens the provider consumed even when the task
+		// ended in "nochange"/"skipped" — never a silent drop to 0.
+		if msg.usageKnown {
+			m.commitTokenUsage(msg.TokenInput, msg.TokenOutput)
+			m.markUsageKnown()
+		}
 		if msg.err != nil {
 			m.setApplyError("apply failed: " + msg.err.Error())
 		} else {
@@ -1926,6 +2105,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				}
 
 				outcomeLine := fmt.Sprintf("%s %s • %s", successBannerStyle.Render("[✓]"), msg.file, msg.status)
+				// ── REAL DIFF EVIDENCE (Phase 4) ──────────────────────────
+				// When the runtime captured the compiled diff metrics, surface them
+				// in the outcome line so the UI proves the actual patch ("+3 -1"),
+				// never a vague "Edit(file)" success event.
+				evidenceDetail := msg.status
+				if msg.evidence != nil && msg.evidence.DiffPresent {
+					outcomeLine = fmt.Sprintf("%s %s • +%d -%d",
+						successBannerStyle.Render("[✓]"), msg.file, msg.evidence.DiffAdds, msg.evidence.DiffRemoves)
+					evidenceDetail = fmt.Sprintf("+%d -%d", msg.evidence.DiffAdds, msg.evidence.DiffRemoves)
+				}
 				m.push(roleSystem, outcomeLine)
 				m.createBuildCheckpoint(1)
 
@@ -1936,7 +2125,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				if m.thinkingPanel != nil {
 					thinkingContent = m.thinkingPanel.String()
 				}
-				m.logStore.AddFull(LogEdit, msg.file, true, msg.status, thinkingContent, "")
+				// ── TRUTHFUL RESULT ENTRY (Phase 4) ───────────────────────
+				// The terminal result is logged with its semantic outcome. Only a
+				// real filesystem mutation (changed/created) is a successful Edit;
+				// nochange and skipped render neutrally, never as a green ✓ Edit.
+				outcome := msg.outcome()
+				mutated := outcome.MutationSucceeded()
+				if !m.activitySurfaceSealed {
+					m.logStore.AddFullSemantic(LogResult, msg.file, mutated, evidenceDetail, thinkingContent, "", execution.StageResult, outcome)
+				}
 				// ── FAST-TRACK EARLY COMPLETION ─────────────────────────
 				// When a fast-track batch covered every plan target and the
 				// last proposal has been applied, per-task execution is
@@ -1975,7 +2172,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				if m.thinkingPanel != nil {
 					thinkingContent = m.thinkingPanel.String()
 				}
-				m.logStore.AddFull(LogEdit, msg.file, false, msg.err.Error(), thinkingContent, "")
+				if !m.activitySurfaceSealed {
+					m.logStore.AddFullSemantic(LogResult, msg.file, false, msg.err.Error(), thinkingContent, "", execution.StageResult, msg.outcome())
+				}
 			}
 		} else {
 			m.enterApprovalState()
@@ -1989,16 +2188,25 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, flush
 
 	case applyAllResultMsg:
+		// OPERATION LIFECYCLE: the apply-all batch operation (begun in
+		// applyAllProposals) reaches its terminal outcome here. finalizeBuildOperation
+		// releases ownership and stops the "Processing file mutations..."
+		// spinner; idempotent when the operation was already finalized.
+		m.finalizeBuildOperation(nil)
 		applied := 0
 		failed := 0
 		for _, r := range msg.results {
 			if r.err != nil {
 				m.setApplyError("apply failed: " + r.err.Error())
-				thinkingContent := ""
-				if m.thinkingPanel != nil {
-					thinkingContent = m.thinkingPanel.String()
+				// Late failure from a cleared execution (sealed surface): keep
+				// the error state but do not resurrect the cleared log.
+				if !m.activitySurfaceSealed {
+					thinkingContent := ""
+					if m.thinkingPanel != nil {
+						thinkingContent = m.thinkingPanel.String()
+					}
+					m.logStore.AddFullSemantic(LogResult, r.file, false, r.err.Error(), thinkingContent, "", execution.StageResult, r.outcome())
 				}
-				m.logStore.AddFull(LogEdit, r.file, false, r.err.Error(), thinkingContent, "")
 				failed++
 				continue
 			}
@@ -2010,7 +2218,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if m.thinkingPanel != nil {
 				thinkingContent = m.thinkingPanel.String()
 			}
-			m.logStore.AddFull(LogEdit, r.file, true, r.status, thinkingContent, "")
+			// ── TRUTHFUL RESULT ENTRY (Phase 4) ───────────────────────
+			// Only a real filesystem mutation renders as a successful Edit;
+			// nochange/skipped render neutrally with their outcome label.
+			outcome := r.outcome()
+			if !m.activitySurfaceSealed {
+				m.logStore.AddFullSemantic(LogResult, r.file, outcome.MutationSucceeded(), r.status, thinkingContent, "", execution.StageResult, outcome)
+			}
 			applied++
 		}
 		m.pendingProposals = nil
@@ -2079,7 +2293,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// activity tree so the output grows in real-time (visible via Ctrl+O
 		// expansion). The heartbeat keeps the idle-gate hang detector from
 		// force-clearing the shell spinner.
-		if m.activityTree != nil {
+		if !m.activitySurfaceSealed && m.activityTree != nil {
 			m.activityTree.AppendExecOutput(msg.text)
 		}
 		m.lastAgentActivity = time.Now()
@@ -2103,10 +2317,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.shellCancel = nil
 		}
 		m.stopShimmer()
-		if m.activityTree != nil {
+		if !m.activitySurfaceSealed && m.activityTree != nil {
 			m.activityTree.CompleteLastExec(msg.exitCode, msg.elapsed)
 		}
-		if msg.err != nil && msg.exitCode != 0 {
+		if !m.activitySurfaceSealed && msg.err != nil && msg.exitCode != 0 {
 			m.push(roleSystem, dimmedStyle.Render(fmt.Sprintf(
 				"shell exited %d (%s)", msg.exitCode, formatElapsed(msg.elapsed))))
 		}
@@ -2294,6 +2508,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg == "" {
 			return m, m.readStream()
 		}
+		// ── AUTHORITATIVE STAGE: provider bytes are arriving ────────
+		// Reasoning tokens are real provider output — the indicator becomes
+		// "streaming" (never "thinking"), without exposing the reasoning text.
+		// NO token count is asserted here: only the producer's authoritative
+		// streamUsageMsg (provider-reported usage) may populate the count.
+		m.setStage("model", m.getActiveModelName(), stageStreaming)
 		m.ensureStreamBlocks().Append(KindThinking, string(msg))
 		// Full stream transparency: the reasoning chunk is also retained in the
 		// active ThinkingBuffer via the ThoughtBufferUpdatedMsg protocol so the
@@ -2326,6 +2546,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.stopShimmer()
 		}
 		m.responseBuffer.WriteString(raw)
+		// ── AUTHORITATIVE STAGE: real provider tokens are arriving ──
+		// Only content bytes received from the provider mark the stage as
+		// streaming. The token count is NEVER derived from the response
+		// buffer length — it is populated only by the producer's authoritative
+		// streamUsageMsg (provider-reported usage).
+		if raw != "" {
+			m.setStage("model", m.getActiveModelName(), stageStreaming)
+		}
 		m.traceBuffer.WriteString(raw)
 		if m.streamThrottle != nil {
 			m.streamThrottle.Write(raw)
@@ -2351,7 +2579,26 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		cmds = append(cmds, tiCmd)
 		return m, tea.Batch(cmds...)
 
+	case streamUsageMsg:
+		// ── AUTHORITATIVE LIVE TOKEN USAGE ───────────────────────────
+		// The provider reported a usage update while the stream is live. Feed
+		// ONLY that authoritative count into the streaming indicator — never a
+		// character-count estimate. A zero/unknown usage leaves the count
+		// empty so the renderer shows plain "streaming". The reasoning split
+		// also backs the compact thought summary so its "N tokens" is
+		// provider-reported, not estimated.
+		m.setStageMetrics(0, 0, msg.output)
+		if m.thinkingBuffer != nil && msg.reasoning > 0 {
+			m.thinkingBuffer.SetReasoningTokens(msg.reasoning)
+		}
+		// The usage message was pulled off the stream channel — chain the next
+		// read so the token/done messages behind it keep flowing.
+		return m, m.readStream()
+
 	case streamDoneMsg:
+		// ── AUTHORITATIVE STAGE: provider stream completed ─────────
+		// A terminal stream is done; the stage can never linger as "streaming".
+		m.setStage("model", m.getActiveModelName(), stageDone)
 		m.streamCh = nil
 		m.streaming = false
 		m.streamCancel = nil
@@ -2385,6 +2632,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.InputTokens += msg.tokenInput
 		m.OutputTokens += msg.tokenOutput
 		m.TotalTokens = m.InputTokens + m.OutputTokens
+		// Provider-reported usage (authoritative or an explicit local-model
+		// estimate) transitions the footer out of "usage unknown".
+		if msg.tokenInput > 0 || msg.tokenOutput > 0 || msg.usageEstimated {
+			m.markUsageKnown()
+		}
 
 		// Sync the provider-reported usage (or the local estimate fallback
 		// computed above) to the global status tracker so the footer strictly
@@ -2422,12 +2674,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if finalReasoning != "" {
 			m.reasoningBuffer.WriteString(finalReasoning)
 			m.sentinelReasoningFlushed = m.reasoningBuffer.Len()
-			if m.thinkingPanel != nil {
-				m.thinkingPanel.Append(finalReasoning)
-			}
-			if m.thinkingBuffer != nil {
-				m.thinkingBuffer.Append(finalReasoning)
-				m.thinkingBuffer.MarkComplete()
+			// A late stream completion after /clear (sealed surface) must not
+			// resurrect the cleared thinking buffers.
+			if !m.activitySurfaceSealed {
+				if m.thinkingPanel != nil {
+					m.thinkingPanel.Append(finalReasoning)
+				}
+				if m.thinkingBuffer != nil {
+					m.thinkingBuffer.Append(finalReasoning)
+					m.thinkingBuffer.MarkComplete()
+				}
 			}
 		}
 		// The stream is genuinely done now — nothing more will ever close
@@ -2843,6 +3099,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, m.thoughtUpdateCmd("", true)
 
 	case streamErrMsg:
+		// OPERATION LIFECYCLE: a stream error must release any in-flight
+		// build-patch operation (defensive; streams normally run without one).
+		m.finalizeBuildOperation(msg.err)
+		// ── AUTHORITATIVE STAGE: provider stream failed ─────────────
+		// A terminal stream failure marks the stage failed so no "waiting" /
+		// "streaming" indicator can survive the error.
+		m.setStage("model", m.getActiveModelName(), stageFailed)
 		m.streamCh = nil
 		m.streaming = false
 		m.streamParser = nil
@@ -2915,7 +3178,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case thinkingStreamMsg:
 		// Real-time reasoning token dispatch to the TUI Thinking Panel.
 		// Updates from token #1 — no waiting for the full response.
-		if m.thinkingPanel != nil {
+		// A late chunk after /clear (sealed surface) must not resurrect the
+		// cleared thinking panel.
+		if !m.activitySurfaceSealed && m.thinkingPanel != nil {
 			m.thinkingPanel.Append(msg.Content)
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
@@ -2940,6 +3205,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, m.readStream()
 
 	case buildFailedMsg:
+		// OPERATION LIFECYCLE: a failed fast-track stream must release any
+		// in-flight build-patch operation (defensive; the fast-track path is
+		// streaming-based and normally holds no operation).
+		m.finalizeBuildOperation(msg.Err)
 		// Guaranteed cleanup from stream defer: spinner stops, pipeline resets.
 		m.streamCh = nil
 		m.streaming = false
@@ -3057,6 +3326,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+
+		// ── PRIORITY 1: ACTIVE TEXT INPUT ────────────────────────────
+		// A printable character typed into the focused input is ALWAYS text.
+		// It can never be hijacked by a capability hotkey, the '?' help
+		// toggle, or any other single-character keybinding. Explicit
+		// keybinding mechanisms (Enter, Esc, arrows, alt+…, ctrl+…) fall
+		// through to the handlers below.
+		if m.ti.Focused() && isPrintableRunes(msg) {
+			return m, m.forwardToInput(msg)
+		}
 
 		// ── Capability Hotkeys (alt+ modifier only) ────────────────────
 		// Single-character hotkeys are strictly banned to prevent key

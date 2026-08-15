@@ -57,10 +57,10 @@ func TestHotfixAmbiguousRendersActionableState(t *testing.T) {
 	if !strings.Contains(view, "HOTFIX TARGET AMBIGUOUS") {
 		t.Errorf("card missing the ambiguity title:\n%s", view)
 	}
-	if !strings.Contains(view, "[c] Clarify target") {
+	if !strings.Contains(view, "[⌥C] Clarify target") {
 		t.Errorf("card missing the Clarify action:\n%s", view)
 	}
-	if !strings.Contains(view, "[x] Cancel") {
+	if !strings.Contains(view, "[⌥X] Cancel") {
 		t.Errorf("card missing the Cancel action:\n%s", view)
 	}
 }
@@ -91,7 +91,8 @@ func TestHotfixAmbiguousClarifyReturnsFocusToInput(t *testing.T) {
 	m2 := res.(*model)
 	m2.ti.Blur()
 
-	m3, cmd := m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	// Clarify uses the explicit alt+c keybinding (a plain 'c' is always text).
+	m3, cmd := m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}, Alt: true})
 	if cmd != nil {
 		t.Fatalf("clarify returned a cmd: %v", cmd)
 	}
@@ -126,10 +127,10 @@ func TestHotfixAmbiguousInspectCandidatesNoMutation(t *testing.T) {
 	res, _ := m.Update(ambiguousMsgFor("Remove extra text from @index.html", target, cands))
 	m2 := res.(*model)
 
-	m3, _ := m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	m3, _ := m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}, Alt: true})
 	after := m3.(*model)
 	if !after.hotfixCandidatesMode {
-		t.Fatal("i must toggle candidate-inspection mode")
+		t.Fatal("alt+i must toggle candidate-inspection mode")
 	}
 	view := after.renderProposalBlock()
 	if !strings.Contains(view, cands[0].Mismatch.Describe()) {
@@ -337,12 +338,17 @@ func TestHotfixCandidateSelectionRunsTargetedPipeline(t *testing.T) {
 		t.Fatalf("provider called before candidate selection: %d", mock.callCount)
 	}
 
-	// The human enters candidate-inspection mode, then explicitly selects
-	// candidate #1.
-	m3, _ := m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	// The human enters candidate-inspection mode (alt+i — a plain 'i' is
+	// always text), then explicitly selects candidate #1.
+	m3, _ := m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}, Alt: true})
 	m4 := m3.(*model)
 	if !m4.hotfixCandidatesMode {
-		t.Fatal("i must enter candidate-inspection mode")
+		t.Fatal("alt+i must enter candidate-inspection mode")
+	}
+	// Candidate selection owns the number keys ONLY while the inspection
+	// sub-view blurs the input (explicit modal interaction).
+	if m4.ti.Focused() {
+		t.Fatal("candidate-inspection mode must blur the input so [1-9] are modal")
 	}
 	sel, cmds := m4.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'1'}})
 	after := sel.(*model)

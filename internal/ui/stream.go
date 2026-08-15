@@ -98,7 +98,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streamCh = make(chan tea.Msg, 1024)
 	m.streaming = true
 	m.spinnerFrame = 0
-	m.startShimmer("Thinking...", "analyze")
+	// TRUTHFUL PROVIDER STATUS: the loading dock derives its indicator from
+	// the authoritative stage — a provider round-trip before the first byte
+	// renders as "Model ● waiting", never as "Thinking...".
+	m.startShimmer("Waiting for model...", "analyze")
+	m.setStage("model", m.cfg.ActiveModelName(), stageWaiting)
 	m.responseBuffer.Reset()
 	m.reasoningBuffer.Reset()
 	m.traceBuffer.Reset()
@@ -242,7 +246,13 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// The request context is derived from the active operation (when one is
+	// registered, e.g. a build-context stream) so Ctrl+C cancels the provider
+	// stream; otherwise it falls back to a plain background parent and only the
+	// 5-minute ceiling applies. m.streamCancel is the handle
+	// handleEmergencyInterrupt and cancelStaleAgentOps already invoke to tear
+	// the stream down.
+	ctx, cancel := context.WithTimeout(m.operationContext(), 5*time.Minute)
 	m.streamCancel = cancel
 
 	// STREAM CONSUMER CONTRACT (deadlock-free):
@@ -256,6 +266,14 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// the stream (the historical 108-token stall). The producer only touches
 	// the channel, the local buffer, and the captured `streamCh`/`cancel`.
 	go func() {
+		// ── WORKER LIFETIME (Phase 3) ────────────────────────────────
+		// The producer goroutine is a real worker of the current operation:
+		// register it so the terminal-lifecycle tests can prove it is released
+		// before the operation finalizes. A no-op for plain /ask streams that
+		// hold no operation.
+		m.spawnOpWorker("stream")
+		defer m.releaseOpWorker("stream")
+
 		defer func() {
 			if r := recover(); r != nil {
 				select {
@@ -274,28 +292,70 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		}
 		defer func() { _ = rawStream.Close() }()
 
+		// ── AUTHORITATIVE LIVE USAGE ───────────────────────────────────
+		// The streaming indicator must never display a character-count
+		// estimate. usageUp exposes the provider's real cumulative usage as
+		// usage chunks arrive (Claude reports input at message_start and
+		// cumulative output per message_delta; OpenAI-compatible providers
+		// report once at the end). emitUsage forwards ONLY authoritative
+		// updates (Known && !Estimated) so a partial or final provider count
+		// reaches the stage while an unknown/estimated count renders as plain
+		// "streaming" with no number.
+		var usageUp ai.UsageProvider
+		if up, ok := rawStream.(ai.UsageProvider); ok {
+			usageUp = up
+		}
+		var lastUsage = ai.ProviderUsage{}
+		emitUsage := func() {
+			if usageUp == nil {
+				return
+			}
+			u := usageUp.Usage()
+			if !u.Known || u.Estimated {
+				return
+			}
+			if u.PromptTokens == lastUsage.PromptTokens && u.CompletionTokens == lastUsage.CompletionTokens &&
+				u.ReasoningTokens == lastUsage.ReasoningTokens {
+				return
+			}
+			lastUsage = u
+			streamCh <- streamUsageMsg{input: u.PromptTokens, output: u.CompletionTokens, reasoning: u.ReasoningTokens}
+		}
+
 		full, ingestErr := ingestLLMStream(rawStream, m.bus, func(text string) {
 			streamCh <- tokenMsg(text)
+			emitUsage()
 		}, func(text string) {
 			streamCh <- thinkingTokenMsg(text)
+			emitUsage()
 		})
 
-		type usageProvider interface {
-			Usage() (input, output int)
-		}
+		// ── AUTHORITATIVE PROVIDER USAGE ──────────────────────────────
+		// The provider's final usage is the single source of truth for the
+		// footer token count. Streaming and non-streaming executions converge
+		// on the same ProviderUsage contract; the provider's authoritative
+		// counts are preserved verbatim and NEVER replaced by a local
+		// token-event counter. When the provider reports no usage (Known==false)
+		// the values stay 0 so the footer can render "usage unknown" instead of
+		// inventing a number.
 		tokIn, tokOut := 0, 0
-		if up, ok := rawStream.(usageProvider); ok {
-			tokIn, tokOut = up.Usage()
+		usageKnown := false
+		usageEstimated := false
+		if up, ok := rawStream.(ai.UsageProvider); ok {
+			u := up.Usage()
+			usageKnown = u.Known
+			usageEstimated = u.Estimated
+			tokIn = u.PromptTokens
+			tokOut = u.CompletionTokens
 		}
-		// LOCAL-ONLY ESTIMATE FALLBACK: the character-count estimate (/4) is a
-		// stand-in reserved strictly for local models (ollama) that genuinely
-		// do not report usage metadata. For cloud providers the provider's
-		// final-chunk usage is authoritative: if it reports 0/0 the values are
-		// left as 0 so the footer shows only what the provider actually billed
-		// — never an invented number that diverges from the dashboard.
-		if tokIn == 0 && tokOut == 0 && !m.IsCloudModel {
+		// LOCAL-ONLY ESTIMATE FALLBACK: reserved strictly for local models
+		// (ollama) that genuinely do not report usage metadata. Cloud
+		// providers never get a fabricated count — their reported usage is
+		// authoritative and 0 stays 0 when the provider billed nothing.
+		if !usageKnown && !m.IsCloudModel {
 			tokIn = len(content) / 4
 			tokOut = len(full) / 4
+			usageEstimated = true
 		}
 
 		// TRUNCATION DETECTION: when the provider reports finish_reason ==
@@ -312,14 +372,15 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			// provider-reported usage (or a character estimate) even when it
 			// was interrupted — carry it on the error message so the footer
 			// reports consumed tokens instead of a silent 0.
-			streamCh <- streamErrMsg{err: ingestErr, content: full, tokenInput: tokIn, tokenOutput: tokOut}
+			streamCh <- streamErrMsg{err: ingestErr, content: full, tokenInput: tokIn, tokenOutput: tokOut, usageEstimated: usageEstimated}
 			return
 		}
 		streamCh <- streamDoneMsg{
-			content:     full,
-			tokenInput:  tokIn,
-			tokenOutput: tokOut,
-			truncated:   truncated,
+			content:        full,
+			tokenInput:     tokIn,
+			tokenOutput:    tokOut,
+			usageEstimated: usageEstimated,
+			truncated:      truncated,
 		}
 	}()
 

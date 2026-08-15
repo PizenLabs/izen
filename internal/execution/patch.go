@@ -273,7 +273,11 @@ type PatchManager struct {
 	auth   *authorization.MutationAuthorization
 	budget *budget.MutationBudget
 
-	tx *engine.Transaction
+	// mutationSet is the authoritative mutation boundary this manager operates
+	// inside. The set OWNS the transaction lifetime (begin/commit/rollback are
+	// driven by the engine/UI terminal handlers, never by PatchManager).
+	// Apply records each target into the set before mutating the filesystem.
+	mutationSet *MutationSet
 }
 
 func NewPatchManager(root string) *PatchManager {
@@ -288,8 +292,71 @@ func NewPatchManager(root string) *PatchManager {
 // patch manager runs verifier.RunAll() after every write and refuses to mark
 // the task as completed if verification fails — enforcing the Zero Syntax
 // Leakage guarantee.
+// SetTransaction attaches a raw transaction as the manager's mutation
+// boundary. It is the legacy adapter for callers that still hold a raw
+// *engine.Transaction (e.g. the build executor). New code must use
+// SetMutationSet so the aggregate owns the transaction lifetime.
 func (pm *PatchManager) SetTransaction(tx *engine.Transaction) {
-	pm.tx = tx
+	if tx == nil {
+		pm.mutationSet = nil
+		return
+	}
+	pm.mutationSet = &MutationSet{
+		ID:          "legacy-tx",
+		Transaction: tx,
+		State:       MutationPending,
+	}
+}
+
+// SetMutationSet attaches the authoritative mutation boundary this manager
+// operates inside. The set owns the transaction lifetime; the manager only
+// records targets into it during Apply.
+func (pm *PatchManager) SetMutationSet(ms *MutationSet) {
+	pm.mutationSet = ms
+}
+
+// MutationSet returns the boundary currently attached to this manager.
+func (pm *PatchManager) MutationSet() *MutationSet {
+	return pm.mutationSet
+}
+
+// recordTransaction snapshots a target into the owned mutation boundary before
+// the filesystem is mutated. It is a no-op when no boundary is attached (raw
+// PatchManager usage without an engine) — mirroring the historical behavior of
+// a nil transaction.
+func (pm *PatchManager) recordTransaction(filePath string) error {
+	if pm.mutationSet == nil {
+		return nil
+	}
+	return pm.mutationSet.Record(filePath)
+}
+
+// recordMutationEvidence appends the semantic outcome of an apply attempt into
+// the owned MutationSet. It reuses the existing MutationEvidence vocabulary —
+// no second mutation taxonomy. It runs at the real apply boundary, so the
+// record reflects what Apply actually did.
+func (pm *PatchManager) recordMutationEvidence(patch *Patch, outcome MutationOutcome, reason string) {
+	if pm.mutationSet == nil || patch == nil {
+		return
+	}
+	ev := MutationEvidence{
+		Stage:   StageResult,
+		File:    patch.File,
+		Outcome: outcome,
+		Reason:  reason,
+	}
+	ev.ArtifactPresent = patch.Modified != ""
+	ev.DiffPresent = patch.Modified != "" && strings.Contains(patch.Modified, "@@")
+	if outcome == OutcomeChanged || outcome == OutcomeCreated {
+		ev.ApplyExecuted = true
+		ev.FilesystemChanged = true
+		ev.VerificationRun = true
+		ev.VerificationPassed = true
+		added, removed := countUnifiedDiffLines(patch.Modified)
+		ev.DiffAdds = added
+		ev.DiffRemoves = removed
+	}
+	pm.mutationSet.AddOutcome(ev)
 }
 
 func (pm *PatchManager) SetVerifier(v *Verifier) {
@@ -586,14 +653,13 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		patch.Original = string(data)
 	}
 
-	// Record file in transaction for rollback capability
-	if pm.tx != nil {
-		if err := pm.tx.Record(fullPath); err != nil {
-			if globalActivityLog != nil {
-				globalActivityLog("[FAIL] patch rejected on %s: transaction record failed: %v", patch.File, err)
-			}
-			return fmt.Errorf("transaction record %s: %w", patch.File, err)
+	// Record file into the owned mutation boundary for rollback capability.
+	// The MutationSet owns the transaction lifetime; PatchManager only records.
+	if err := pm.recordTransaction(fullPath); err != nil {
+		if globalActivityLog != nil {
+			globalActivityLog("[FAIL] patch rejected on %s: transaction record failed: %v", patch.File, err)
 		}
+		return fmt.Errorf("transaction record %s: %w", patch.File, err)
 	}
 
 	// Create shadow backup before mutation
@@ -632,10 +698,8 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 			return fmt.Errorf("mkdir %s: %w", dir, err)
 		}
 		patch.Original = ""
-		if pm.tx != nil {
-			if err := pm.tx.Record(fullPath); err != nil {
-				return fmt.Errorf("transaction record %s: %w", patch.File, err)
-			}
+		if err := pm.recordTransaction(fullPath); err != nil {
+			return fmt.Errorf("transaction record %s: %w", patch.File, err)
 		}
 		if err := pm.createShadowBackup(fullPath); err != nil {
 			return fmt.Errorf("shadow backup %s: %w", patch.File, err)
@@ -662,6 +726,7 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 			return fmt.Errorf("patch applied but audit log failed: %w", err)
 		}
 		pm.recordLedgerAndSummarize(patch)
+		pm.recordMutationEvidence(patch, OutcomeCreated, "")
 		return pm.store(patch)
 	}
 
@@ -721,6 +786,7 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		if globalActivityLog != nil {
 			globalActivityLog("[FAIL] patch rejected on %s: %v", patch.File, patchErr)
 		}
+		pm.recordMutationEvidence(patch, OutcomeApplyFailed, patchErr.Error())
 		return fmt.Errorf("apply patch to %s: %w", patch.File, patchErr)
 	}
 
@@ -757,6 +823,7 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 					patch.File, detail)
 			}
 			pm.recordLedgerAndSkipped(patch)
+			pm.recordMutationEvidence(patch, OutcomeSkipped, "destructive patch skipped as no-op, file left unchanged")
 			return fmt.Errorf("%w: proposed patch for %s removes %d/%d lines (final: %d lines) — skipping as no-op, file left unchanged",
 				ErrDestructivePatchSkipped, patch.File, removed, origCount, finalCount)
 		}
@@ -810,6 +877,7 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 			if len(syntaxErrors) > 0 {
 				errMsg += ": " + syntaxErrors[0]
 			}
+			pm.recordMutationEvidence(patch, OutcomeVerifyFailed, errMsg)
 			return fmt.Errorf("%s", errMsg)
 		}
 
@@ -885,6 +953,7 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	}
 
 	pm.recordLedgerAndSummarize(patch)
+	pm.recordMutationEvidence(patch, OutcomeChanged, "")
 
 	return pm.store(patch)
 }

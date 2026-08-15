@@ -7,6 +7,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/PizenLabs/izen/internal/execution"
 )
 
 // Foreground operation lifecycle.
@@ -101,6 +103,15 @@ type operation struct {
 	// The watchdog uses it to distinguish a genuine long-running worker from a
 	// stuck one. It is only updated on the UI goroutine (no data races).
 	LastProgress time.Time
+
+	// Telemetry is the authoritative per-operation execution record. It
+	// attributes wall-clock latency to real runtime stages (target, read,
+	// model/provider, patch, validate, apply) and to provider sub-phases
+	// (request → waiting → first-token → streaming → terminal). It is created
+	// at dispatch, fed from the stage boundaries the worker goroutines reach,
+	// and finalized at the operation terminal. It is never nil for a
+	// foreground operation. See internal/execution/telemetry.go.
+	Telemetry *execution.Telemetry
 }
 
 // running reports whether the operation is still owned by the runtime (not yet
@@ -137,6 +148,16 @@ func (m *model) nextOperationID() string {
 // derived presentation state enters StateProcessing immediately.
 func (m *model) beginOperation(kind OperationKind) *operation {
 	ctx, cancel := context.WithCancel(context.Background())
+	// ── ACTION SURFACE OWNERSHIP (Phase 7) ────────────────────────────
+	// A new operation owns the action surface: any chips left over from a
+	// PREVIOUS operation's result are stale the moment actual execution begins.
+	// They disappear here (centralized) so no completed operation's actions can
+	// be re-triggered by a newer one. The operation's own terminal result
+	// message re-populates the surface with its valid transitions.
+	m.currentResult = nil
+	// A new foreground operation reopens the activity surface sealed by /clear:
+	// this operation's events are a fresh execution and belong in the viewport.
+	m.unsealActivitySurface()
 	op := &operation{
 		ID:           m.nextOperationID(),
 		Kind:         kind,
@@ -146,6 +167,22 @@ func (m *model) beginOperation(kind OperationKind) *operation {
 		StartedAt:    time.Now(),
 		LastProgress: time.Now(),
 	}
+	// ── EXECUTION TELEMETRY (Phase 3) ────────────────────────────────
+	// Every foreground operation carries the authoritative execution record.
+	// It is fed from the real stage boundaries the worker goroutines reach
+	// (setStage / setStageMetrics) and finalized on the terminal outcome so
+	// stage timestamps never outlive the operation. The operation ID is the
+	// stable identity every telemetry event traces back to. The record is
+	// attached to the mutex-protected authoritative stage so workers publish
+	// into it race-safely without touching the UI-owned activeOp pointer.
+	op.Telemetry = execution.NewTelemetry(op.ID, string(kind))
+	op.Telemetry.Workers().Spawn("operation")
+	if m.stage == nil {
+		m.stage = &execStage{}
+	}
+	m.stage.mu.Lock()
+	m.stage.Telemetry = op.Telemetry
+	m.stage.mu.Unlock()
 	// A new operation supersedes any previous one (single-ownership rule).
 	if m.activeOp != nil {
 		m.activeOp.Cancel()
@@ -164,6 +201,10 @@ func (m *model) beginOperation(kind OperationKind) *operation {
 	m.lastSpinnerAdvance = time.Time{}
 	m.lastAgentActivity = time.Now()
 	m.lastActionTime = time.Now()
+	// Start the authoritative execution stage for the new operation. The
+	// progress UI derives its indicator from this stage — never from a
+	// fabricated label.
+	m.resetStage(kind)
 	m.syncUIState()
 	return op
 }
@@ -204,18 +245,39 @@ func (m *model) finalizeOperation(outcome OperationOutcome, err error) {
 		}
 		op.LastProgress = time.Now()
 		op.State = OpStateTerminal
+		// ── EXECUTION TELEMETRY TERMINALIZATION (Phase 3) ─────────────
+		// The authoritative execution record is closed with the operation's
+		// terminal outcome so no stage span can survive the operation. The
+		// retained snapshot backs the debug/inspect view.
+		if op.Telemetry != nil {
+			op.Telemetry.Workers().Release("operation")
+			op.Telemetry.Finalize(outcome.String())
+			m.lastExecutionSnapshot = op.Telemetry.Snapshot()
+			m.lastExecutionTelemetry = op.Telemetry
+		}
 		m.activeOp = nil
 	}
+	// The authoritative stage is terminalized alongside the operation so no
+	// progress indicator can survive the operation that produced it.
+	m.finishStage(outcome)
 	m.clearBusyFlags()
 	m.stopShimmer()
 	m.syncUIState()
 }
 
-// touchOperationProgress records meaningful runtime progress on the active
-// operation. It MUST only be called from the UI goroutine (no data races).
-func (m *model) touchOperationProgress() {
-	if m.activeOp != nil {
-		m.activeOp.LastProgress = time.Now()
+// finalizeBuildOperation finalizes the active build-patch operation (OpBuild)
+// if one is in flight. It is the single terminal cleanup path for the legacy
+// per-task FILE_MUTATE / GIT_ACTION patch-generation path: the operation begun
+// in handleBuildRun is released here on EVERY terminal message — proposal
+// ready, failure, cancellation, or the zero-patch short-circuit — so the
+// "Processing file mutations..." spinner can never survive the generation
+// phase. It is idempotent: when the operation was already finalized (e.g.
+// superseded by a Ctrl+C cancellation), it is a no-op. err is classified into
+// SUCCESS / CANCELLED / TIMEOUT / FAILURE exactly like every other worker.
+func (m *model) finalizeBuildOperation(err error) {
+	if m.activeOp != nil && m.activeOp.Kind == OpBuild {
+		outcome, outErr := classifyOpErrWithErr(err)
+		m.finalizeOperation(outcome, outErr)
 	}
 }
 

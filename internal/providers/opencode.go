@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 )
@@ -149,9 +150,19 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 
 	tokenIn := 0
 	tokenOut := 0
+	var usage ai.ProviderUsage
+	usage.RequestStartedAt = time.Now()
 	if ocResp.Usage != nil {
 		tokenIn = ocResp.Usage.PromptTokens
 		tokenOut = ocResp.Usage.CompletionTokens
+		usage = ocResp.Usage.ProviderUsage()
+	}
+	usage.CompletedAt = time.Now()
+	if len(ocResp.Choices) > 0 {
+		usage.FinishReason = ocResp.Choices[0].FinishReason
+	}
+	if usage.FirstTokenAt.IsZero() {
+		usage.FirstTokenAt = usage.CompletedAt
 	}
 
 	return &ai.Response{
@@ -159,6 +170,7 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
 		ToolCalls:   toolCalls,
+		Usage:       usage,
 	}, nil
 }
 
@@ -221,6 +233,7 @@ func (p *OpenCodeProvider) ExecuteStream(ctx context.Context, req ai.Request) (i
 	}
 
 	sr := &opencodeSSEReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
+	sr.usage.markRequestStarted(time.Now())
 	return &OpenCodeStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -296,16 +309,22 @@ type opencodeUsage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// ProviderUsage converts the parsed opencode usage into the authoritative
+// ai.ProviderUsage contract.
+func (u *opencodeUsage) ProviderUsage() ai.ProviderUsage {
+	return openAICompatibleUsage(u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+}
+
 type OpenCodeStreamResult struct {
 	io.ReadCloser
 	sr *opencodeSSEReader
 }
 
-func (r *OpenCodeStreamResult) Usage() (input, output int) {
+func (r *OpenCodeStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
 		return r.sr.usage.Usage()
 	}
-	return 0, 0
+	return ai.ProviderUsage{}
 }
 
 // FinishReason reports the terminal finish_reason observed on the stream
@@ -375,6 +394,7 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 
 		if data == "[DONE]" {
 			s.closed = true
+			s.usage.markCompleted(time.Now(), s.finishReason)
 			return 0, io.EOF
 		}
 
@@ -385,10 +405,16 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 
 		if chunk.Usage != nil {
 			s.finalUsage = chunk.Usage
-			s.usage.recordUsage(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
+			s.usage.recordUsageFull(chunk.Usage.ProviderUsage())
 		}
 
 		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		if chunk.Choices[0].FinishReason != "" {
+			s.finishReason = chunk.Choices[0].FinishReason
+			s.usage.markCompleted(time.Now(), chunk.Choices[0].FinishReason)
 			continue
 		}
 

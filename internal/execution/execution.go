@@ -5,7 +5,6 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
-	"github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/modes"
@@ -37,7 +36,12 @@ type Engine struct {
 	// reasoning-leak telemetry). It is non-nil for every engine.
 	Artifact *V3ArtifactPipeline
 
-	Tx *engine.Transaction
+	// mutationSet is the CURRENT authoritative mutation boundary. It owns the
+	// transaction lifetime of the in-flight user mutation: PatchManager
+	// records inside it, and CommitTransaction/RollbackTransaction drive it to
+	// a terminal state. It is replaced with a fresh boundary after every
+	// terminal outcome so one user mutation can never bleed into the next.
+	mutationSet *MutationSet
 }
 
 func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ...language.ID) *Engine {
@@ -72,8 +76,6 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ..
 
 	d := NewDiffAnalyzer()
 
-	tx := engine.NewTransaction()
-
 	e := &Engine{
 		Runner:      r,
 		Test:        t,
@@ -83,14 +85,16 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ..
 		Git:         git.NewEngine(root),
 		root:        root,
 		langID:      activeLangID,
-		Tx:          tx,
 		Policy:      pe,
 		Risk:        rc,
 		Verifier:    v,
 		Diff:        d,
 		Artifact:    NewV3ArtifactPipeline(),
 	}
-	p.SetTransaction(tx)
+	// The engine owns a fresh mutation boundary from construction. PatchManager
+	// records inside it; a terminal outcome replaces it (Commit/Rollback).
+	e.mutationSet = NewMutationSet()
+	p.SetMutationSet(e.mutationSet)
 	e.PatchQueue = NewPatchQueue(root, e.Patches)
 	e.StreamMon = NewStreamMonitor(e.PatchQueue)
 	e.Pipeline = NewPipelineRunner(e)
@@ -198,26 +202,60 @@ func (e *Engine) SetPlanStore(ps *plan.PlanStore) {
 	e.PlanStore = ps
 }
 
-func (e *Engine) BeginTransaction() {
-	tx := engine.NewTransaction()
-	e.Tx = tx
-	e.Patches.SetTransaction(tx)
-}
-
-func (e *Engine) CommitTransaction() {
-	if e.Tx == nil {
-		return
-	}
-	e.Tx.Commit()
-}
-
-func (e *Engine) RollbackTransaction() []error {
-	if e.Tx == nil {
+// MutationSet returns the CURRENT authoritative mutation boundary. It is the
+// single transaction owner: PatchManager records inside it and every terminal
+// outcome replaces it with a fresh boundary. A committed set is terminal and
+// can never be rolled back.
+func (e *Engine) MutationSet() *MutationSet {
+	if e == nil {
 		return nil
 	}
-	errs := e.Tx.Rollback()
-	tx := engine.NewTransaction()
-	e.Tx = tx
-	e.Patches.SetTransaction(tx)
+	return e.mutationSet
+}
+
+// BeginTransaction opens a fresh mutation boundary for a new user-level
+// mutation and relinks PatchManager into it. Any prior boundary is abandoned
+// by the owner (never independently committed/rolled back by PatchManager).
+func (e *Engine) BeginTransaction() {
+	e.mutationSet = NewMutationSet()
+	e.relinkMutationSet()
+}
+
+// CommitTransaction terminates the current mutation boundary as a durable
+// success and installs a fresh boundary for the next mutation. A committed
+// mutation is terminal: no future operation can roll it back.
+func (e *Engine) CommitTransaction() {
+	if e.mutationSet == nil {
+		e.mutationSet = NewMutationSet()
+		e.relinkMutationSet()
+		return
+	}
+	_ = e.mutationSet.Commit()
+	e.mutationSet = NewMutationSet()
+	e.relinkMutationSet()
+}
+
+// RollbackTransaction rolls back the CURRENT mutation boundary — and only that
+// boundary — restoring every snapshot it recorded. It can never roll back an
+// earlier committed mutation. A fresh boundary is installed for the next
+// mutation.
+func (e *Engine) RollbackTransaction() []error {
+	if e.mutationSet == nil {
+		e.mutationSet = NewMutationSet()
+		e.relinkMutationSet()
+		return nil
+	}
+	errs := e.mutationSet.Rollback()
+	e.mutationSet = NewMutationSet()
+	e.relinkMutationSet()
 	return errs
+}
+
+// relinkMutationSet attaches the current boundary to the PatchManager. It is
+// nil-safe for Engine literals constructed without a PatchManager (test
+// harnesses).
+func (e *Engine) relinkMutationSet() {
+	if e.Patches != nil {
+		e.Patches.SetMutationSet(e.mutationSet)
+	}
 }

@@ -168,6 +168,9 @@ func TestRouteConfirmPromptKeyHandling(t *testing.T) {
 	}
 	m.pendingRouteIdx = 0
 	m.state = StateAwaitingApproval
+	// The route-confirmation prompt is an explicit modal: entering it blurs
+	// the text input (handleRouterResult), so digit keys are modal, not text.
+	m.ti.Blur()
 
 	// Digit 3 selects /plan.
 	next, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})

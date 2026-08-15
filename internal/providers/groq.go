@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 )
@@ -93,15 +94,24 @@ func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respons
 
 	tokenIn := 0
 	tokenOut := 0
+	var usage ai.ProviderUsage
+	usage.RequestStartedAt = time.Now()
 	if groqResp.Usage != nil {
 		tokenIn = groqResp.Usage.PromptTokens
 		tokenOut = groqResp.Usage.CompletionTokens
+		usage = groqResp.Usage.ProviderUsage()
+	}
+	usage.CompletedAt = time.Now()
+	usage.FinishReason = groqResp.Choices[0].FinishReason
+	if usage.FirstTokenAt.IsZero() {
+		usage.FirstTokenAt = usage.CompletedAt
 	}
 
 	return &ai.Response{
 		Content:     content,
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
+		Usage:       usage,
 	}, nil
 }
 
@@ -147,6 +157,7 @@ func (p *GroqProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.Re
 	}
 
 	sr := &groqSSEReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
+	sr.usage.markRequestStarted(time.Now())
 	return &GroqStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -210,16 +221,22 @@ type groqUsage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// ProviderUsage converts the parsed Groq usage into the authoritative
+// ai.ProviderUsage contract.
+func (u *groqUsage) ProviderUsage() ai.ProviderUsage {
+	return openAICompatibleUsage(u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+}
+
 type GroqStreamResult struct {
 	io.ReadCloser
 	sr *groqSSEReader
 }
 
-func (r *GroqStreamResult) Usage() (input, output int) {
+func (r *GroqStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
 		return r.sr.usage.Usage()
 	}
-	return 0, 0
+	return ai.ProviderUsage{}
 }
 
 // FinishReason reports the terminal finish_reason observed on the stream
@@ -274,6 +291,7 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 
 		if data == "[DONE]" {
 			s.closed = true
+			s.usage.markCompleted(time.Now(), s.finishReason)
 			return 0, io.EOF
 		}
 
@@ -282,13 +300,19 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 			continue
 		}
 
+		if chunk.Usage != nil {
+			s.finalUsage = chunk.Usage
+			s.usage.recordUsageFull(chunk.Usage.ProviderUsage())
+		}
+
 		if len(chunk.Choices) == 0 {
 			continue
 		}
 
-		if chunk.Usage != nil {
-			s.finalUsage = chunk.Usage
-			s.usage.recordUsage(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
+		if chunk.Choices[0].FinishReason != "" {
+			s.finishReason = chunk.Choices[0].FinishReason
+			s.usage.markCompleted(time.Now(), chunk.Choices[0].FinishReason)
+			continue
 		}
 
 		if chunk.Choices[0].Delta != nil {

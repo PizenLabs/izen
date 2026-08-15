@@ -83,6 +83,7 @@ var validSystemCommands = map[string]struct{}{
 	"/objective":        {},
 	"/clear":            {},
 	"/drop":             {},
+	"/new":              {},
 	"/undo":             {},
 	"/commit":           {},
 	"/checkpoint":       {},
@@ -162,6 +163,13 @@ func (m *model) handleInput(line string) tea.Cmd {
 	if line == "" {
 		return nil
 	}
+
+	// ── STALE ACTION-CHIP INVALIDATION ───────────────────────────────
+	// Any new user input ends the previous result's relevance: a chip
+	// referencing a completed, cancelled, or superseded operation must not
+	// linger and offer to re-run an obsolete action. A fresh interaction
+	// always renders with a clean chip surface.
+	m.currentResult = nil
 
 	// Clear any stale error bar on new user input
 	m.lastApplyError = ""
@@ -292,10 +300,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 		// immediately trigger execution instead of returning nil
 		// (which leaves the UI frozen in an idle state).
 		if mode == modes.ModeBuild {
-			hasStagedTasks := len(m.sess.CurrentTasks) > 0
-			hasPendingTodos := len(m.handoffCtx.PendingTodos) > 0
-			hasLedgerTasks := m.sess != nil && m.sess.ContextLedger != nil && len(m.sess.ContextLedger.Tasks) > 0
-			if hasStagedTasks || hasPendingTodos || hasLedgerTasks {
+			if m.hasStagedBuildWork() {
 				return tea.Batch(m.runBuildCmd(""), switchCmd)
 			}
 		}
@@ -886,12 +891,16 @@ const hotfixApplyTimeout = 30 * time.Second
 // the strict 30s patch-apply deadline so a wedged filesystem or git operation
 // can never freeze the TUI spinner on ANY file-write / patch-application path
 // (hotfix apply, single/all proposal apply, trivial template, shell-mutation).
+// The context is derived from the active operation so a Ctrl+C during the
+// apply cancels it immediately (ApplyContext's select observes ctx.Done() and
+// returns ErrPatchApplyTimeout); when no operation is active (deterministic
+// branches) it degrades to a plain background parent with the 30s ceiling.
 // A nil engine degrades to a clean error carrying a terminal message.
 func (m *model) applyPatchWithDeadline(patch *execution.Patch) error {
 	if m.execEng == nil || m.execEng.Patches == nil {
 		return fmt.Errorf("execution engine not configured")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), hotfixApplyTimeout)
+	ctx, cancel := context.WithTimeout(m.operationContext(), hotfixApplyTimeout)
 	defer cancel()
 	return m.execEng.Patches.ApplyContext(ctx, patch)
 }
@@ -1237,6 +1246,14 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		}
 
 		go func() {
+			// ── WORKER LIFETIME (Phase 3) ────────────────────────────────
+			// The plan-synthesis worker is registered against the active
+			// operation (when one exists) so no orphan worker can survive the
+			// operation's terminalization. A no-op for plan synthesis that
+			// holds no operation.
+			m.spawnOpWorker("plan")
+			defer m.releaseOpWorker("plan")
+
 			// ── PANIC GUARD ─────────────────────────────────────────────
 			// A panic inside the LLM plan synthesis (or the scope-guard
 			// retry) must still deliver an error outcome to outCh so the
@@ -1967,72 +1984,34 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case cmd == "/clear":
-		m.records = nil
-		m.PreRenderedHistory = ""
-		m.showBanner = true
-		m.currentResult = nil
-		m.currentPrompt = ""
-		m.responseBuffer.Reset()
-		m.streamBuffer = ""
-		m.currentStreamContent = ""
-		m.resetStreamBlocks()
-		m.streaming = false
-
-		// Purge ContextLedger (ask_handoff_payload, investigation findings,
-		// pending execution tasks, and all analytical packets).
-		if m.sess != nil {
-			m.sess.ContextLedger = nil
-			m.sess.InvestigationID = ""
-			m.sess.ReviewID = ""
-			m.sess.ClearHistory()
-			m.sess.ClearTasks()
-			_ = m.sess.Save()
-		}
-
-		// Clear handoff pipeline state.
-		m.handoffCtx = HandoffContext{}
-		m.handoffLedgerContent = ""
-		m.lastInvestigateLedger = nil
-
-		// Clear forensic / test telemetry caches.
-		m.lastTestOutput = ""
-		m.lastTestFailed = false
-		m.lastTestTarget = ""
-		m.pendingFileRefs = nil
-
-		// Reset build and proposal gates.
-		m.buildRecoveryCount = 0
-		m.buildVerifyPending = false
-		m.pendingBuildApproval = false
-		m.pendingBuildTask = nil
-		m.pendingBuildAllowAlways = false
-		m.pendingProposals = nil
-		m.acceptedProposals = nil
-		m.awaitingConfirmation = false
-		m.acceptAll = false
-		m.pendingHotfixTask = nil
-		m.currentBuildTaskID = 0
-		m.pendingTestConfirm = false
-		m.pendingTestTarget = ""
-		m.investigateInvocationCount = 0
-
-		// Zero out cumulative token counters.
-		m.InputTokens = 0
-		m.OutputTokens = 0
-		m.TotalTokens = 0
-		m.ContextLimit = 0
-		m.AccumulatedCost = 0
-
-		m.refreshViewportContent()
+		// ── /CLEAR = "Clear what I SEE" ────────────────────────────
+		// Clears the visible output, resets the viewport, and hides old
+		// execution presentation (activity tree, execution log, control tree,
+		// thinking/loading, chips) plus the visible approval presentation.
+		//
+		// It keeps the session, workspace, mode, git, context (context
+		// ledger, attached files, staged plan tasks, persistent history) and
+		// token telemetry. It executes nothing and creates nothing. It seals
+		// the activity surface so a late event from the cleared execution can
+		// never resurrect stale activity. See lifecycle.go.
+		m.resetTransientInteraction()
 		return tea.Sequence(
 			tea.ClearScreen,
-			tea.Println("✕ [IZEN Memory] Context ledger and pending tasks successfully purged. Workspace reset."),
+			tea.Println("✕ [IZEN Memory] View cleared. Session, context, workspace and history preserved."),
 		)
 
 	case cmd == "/drop" || cmd == "/drop all":
+		// ── /DROP = "Discard what I am ABOUT TO DO" ────────────────
+		// Cancels the active transient execution (if any) and discards every
+		// pending proposal / pending action / unresolved mutation / staged
+		// plan task list. It keeps the conversation (records), the session,
+		// the workspace and the mode. Bare /drop also detaches all attached
+		// context files (the historical file-pruning role). It is deliberately
+		// NOT a visual clear — nothing visible is erased. See lifecycle.go.
+		m.discardPendingAction()
 		m.attachedFiles = nil
 		m.pendingFileRefs = nil
-		m.push(roleSystem, infoStyle.Render("all context files detached"))
+		m.push(roleSystem, infoStyle.Render("pending action discarded · context files detached"))
 		return nil
 
 	case strings.HasPrefix(cmd, "/drop "):
@@ -2060,6 +2039,17 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		} else {
 			m.push(roleSystem, infoStyle.Render("detached: "+raw))
 		}
+		return nil
+
+	case cmd == "/new":
+		// ── /NEW = FUTURE session boundary ─────────────────────────
+		// Reserved semantic: "Start somewhere NEW" — a new session, new
+		// conversation context, reset transient state, fresh presentation
+		// (workspace may remain the same; the old session becomes
+		// recoverable/history). Deliberately NOT implemented in this phase;
+		// /clear is NOT /new (it keeps the session, context and history).
+		// See lifecycle.go for the full command contract.
+		m.push(roleSystem, infoStyle.Render("/new is the future session boundary — not yet implemented. Use /clear to clear the view (keeps session & context) or /drop to discard a pending action."))
 		return nil
 
 	case strings.HasPrefix(cmd, "/undo"):
@@ -2366,6 +2356,16 @@ func (m *model) transitionToBuilding() error {
 // atomic structural tasks are staged (the zombie-data guard) and otherwise
 // executes EXCLUSIVELY on the structured items, ignoring any unstructured
 // message history or stale conversational buffers.
+// hasStagedBuildWork reports whether the session carries any executable build
+// work (staged typed tasks, pending TODO checklist, or ledger tasks). It is
+// the single source of truth for "a build can start right now" used by the
+// continuous-execution seams (chip activation, mode auto-entry).
+func (m *model) hasStagedBuildWork() bool {
+	return (m.sess != nil && len(m.sess.CurrentTasks) > 0) ||
+		len(m.handoffCtx.PendingTodos) > 0 ||
+		(m.sess != nil && m.sess.ContextLedger != nil && len(m.sess.ContextLedger.Tasks) > 0)
+}
+
 func (m *model) runBuildCmd(content string) tea.Cmd {
 	hasStagedTasks := len(m.sess.CurrentTasks) > 0
 	hasPendingTodos := len(m.handoffCtx.PendingTodos) > 0
@@ -2625,8 +2625,11 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 	fileContext := fastTrackFileContext(intent, targets, os.ReadFile)
 	if !isFullRewriteIntent(intent) && m.activityTree != nil {
 		for _, target := range targets {
-			if data, err := os.ReadFile(target); err == nil {
-				m.activityTree.Append(NewFileReadEvent(target, int64(len(data)), 0))
+			start := time.Now()
+			data, err := os.ReadFile(target)
+			elapsed := time.Since(start)
+			if err == nil {
+				m.activityTree.Append(NewFileReadEvent(target, int64(len(data)), elapsed))
 			}
 		}
 	}
@@ -2691,6 +2694,14 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 	streamCh := m.streamCh
 
 	go func() {
+		// ── WORKER LIFETIME (Phase 3) ────────────────────────────────
+		// The unified fast-track stream producer is a real worker of the build
+		// operation: register it so the terminal-lifecycle tests can prove it
+		// is released before the operation finalizes. A no-op when no
+		// operation is attached.
+		m.spawnOpWorker("fasttrack")
+		defer m.releaseOpWorker("fasttrack")
+
 		// Recover from any panic in the stream goroutine so a bad token
 		// chunk or streaming error never kills the Bubble Tea loop.
 		defer func() {
@@ -2708,8 +2719,16 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 			m.streaming = false
 		}()
 
-		ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
+		// The operation context is the cancellation parent: a Ctrl+C during a
+		// fast-track stream cancels the provider request immediately. The
+		// per-call deadline bounds a single unified build generation. The
+		// cancel is ALSO published as m.streamCancel so the Ctrl+C emergency
+		// interrupt (handleEmergencyInterrupt) and the stale-agent release
+		// (cancelStaleAgentOps) can terminate a stalled stream directly — the
+		// fast-track path is streaming-based and holds no discrete operation.
+		ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
 		defer cancel()
+		m.streamCancel = cancel
 
 		rawStream, err := m.provider.ExecuteStream(ctx, req)
 		if err != nil {
@@ -2727,17 +2746,16 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		var buf strings.Builder
 		readBuf := make([]byte, 4096)
 
-		// usageProvider captures cumulative token usage from the stream reader
-		// (authoritative when a usage chunk arrived, otherwise a character
-		// estimate) so consumed tokens survive a timeout/error path.
-		type usageProvider interface {
-			Usage() (input, output int)
-		}
-		streamUsage := func() (int, int) {
-			if up, ok := rawStream.(usageProvider); ok {
+		// usageProvider captures the AUTHORITATIVE cumulative token usage from
+		// the stream reader (ProviderUsage: provider-reported counts when a
+		// usage chunk arrived, otherwise an interrupted-stream estimate) so
+		// consumed tokens survive a timeout/error path. Streaming and
+		// non-streaming executions converge on the same usage contract.
+		streamUsage := func() ai.ProviderUsage {
+			if up, ok := rawStream.(ai.UsageProvider); ok {
 				return up.Usage()
 			}
-			return 0, 0
+			return ai.ProviderUsage{}
 		}
 
 		// ── REASONING TERMINAL EVENT GUARANTEE ───────────────────────────
@@ -2786,9 +2804,37 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		// runes until they complete and only releases whole runes.
 		runeBuf := stream.NewRuneBuffer()
 
+		// ── AUTHORITATIVE STAGE: provider invocation ─────────────────
+		// The stream call is live but no bytes have arrived: truthful waiting.
+		m.setStage("model", req.Model, stageWaiting)
+
 		for {
+			// BOUNDED STREAM READ: a stalled provider stream (no bytes, no EOF)
+			// must never block the execution pipeline forever. When the request
+			// context is cancelled (Ctrl+C) or its deadline expires, net/http
+			// closes the underlying connection so the blocked Read below fails
+			// promptly; this pre-read check releases the loop immediately even
+			// for a provider reader that swallows the connection close.
+			if cerr := ctx.Err(); cerr != nil {
+				su := streamUsage()
+				select {
+				case streamCh <- streamErrMsg{err: cerr, content: fullContent.String(), tokenInput: su.PromptTokens, tokenOutput: su.CompletionTokens}:
+				default:
+				}
+				return
+			}
 			n, err := rawStream.Read(readBuf)
 			if n > 0 {
+				// ── AUTHORITATIVE STAGE: provider streaming ──────────
+				// Bytes are actively arriving from the provider — only now does
+				// the indicator claim streaming. The token count is populated
+				// EXCLUSIVELY from the provider's authoritative reported usage
+				// (Known && !Estimated) so a character-count estimate is never
+				// presented as billed tokens.
+				m.setStage("model", req.Model, stageStreaming)
+				if su := streamUsage(); su.Known && !su.Estimated {
+					m.setStageMetrics(0, 0, su.CompletionTokens)
+				}
 				buf.WriteString(runeBuf.Write(readBuf[:n]))
 			}
 			// On EOF release any incomplete rune still held back so no
@@ -2909,9 +2955,9 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 				break
 			}
 			if err != nil {
-				tokIn, tokOut := streamUsage()
+				su := streamUsage()
 				select {
-				case streamCh <- streamErrMsg{err: err, content: fullContent.String(), tokenInput: tokIn, tokenOutput: tokOut}:
+				case streamCh <- streamErrMsg{err: err, content: fullContent.String(), tokenInput: su.PromptTokens, tokenOutput: su.CompletionTokens}:
 				default:
 				}
 				select {
@@ -2926,7 +2972,8 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		// Parse whatever was accumulated into patches. Handle truncation
 		// (finish_reason == "length") gracefully by recovering partial
 		// tool calls from the ToolCallBuffer.
-		tokIn, tokOut := streamUsage()
+		su := streamUsage()
+		tokIn, tokOut := su.PromptTokens, su.CompletionTokens
 		finishReason := ""
 		if frp, ok := rawStream.(ai.FinishReasonProvider); ok {
 			finishReason = frp.FinishReason()
@@ -2935,9 +2982,9 @@ func (m *model) runBuildFastTrack() tea.Cmd {
 		if len(toolCalls) > 0 {
 			if m.toolCallBuffer != nil {
 				if bufErr := m.toolCallBuffer.BufferAll(toolCalls); bufErr != nil {
-					btokIn, btokOut := streamUsage()
+					bsu := streamUsage()
 					select {
-					case streamCh <- buildFailedMsg{Err: fmt.Errorf("fast-track tool call buffer: %w", bufErr), TokenInput: btokIn, TokenOutput: btokOut}:
+					case streamCh <- buildFailedMsg{Err: fmt.Errorf("fast-track tool call buffer: %w", bufErr), TokenInput: bsu.PromptTokens, TokenOutput: bsu.CompletionTokens}:
 					default:
 					}
 					select {
@@ -3064,6 +3111,31 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 		return nil
 	}
 
+	// ── PHASE 9B: deterministic multi-file targeting ────────────────
+	// A $hot naming ≥2 explicit @file targets runs as ONE user mutation under
+	// ONE ExecutionGraph + ONE MutationSet. Ambiguity and missing targets stop
+	// here — before any provider invocation or mutation.
+	targets, hardErr, ambiguous := resolveMultiHotfixTargets(prompt)
+	if hardErr != "" {
+		m.hotfixActive = false
+		m.push(roleError, "[HOTFIX] "+hardErr)
+		m.push(roleSystem, infoStyle.Render("No files were modified."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+	if ambiguous {
+		m.hotfixActive = false
+		m.push(roleError, "[HOTFIX] Multi-file target is ambiguous. Name explicit @file targets, e.g. \"$hot fix @a.html and @b.html\".")
+		m.push(roleSystem, infoStyle.Render("No model call was made and no files were modified."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+	if len(targets) >= 2 {
+		return m.runMultiHotfix(prompt, targets)
+	}
+
 	// Stage 1: Stash the current plan if tasks exist.
 	hasTasks := len(m.sess.CurrentTasks) > 0
 	if hasTasks {
@@ -3158,7 +3230,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	// ambiguity gate has already passed — it is truthful by construction.
 	m.beginOperation(OpHotfix)
 	m.push(roleStatus, "[HOTFIX] Generating patch (local short-circuit for simple modifications)...")
-	m.push(roleSystem, fmt.Sprintf("  ⚙ Thinking... (Invoking %s)", m.activeRouteModel()))
+	m.push(roleSystem, fmt.Sprintf("  ⚙ Invoking %s...", m.activeRouteModel()))
 
 	m.agentRunning = true
 	m.agentDone = false
@@ -3173,39 +3245,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 		m.proposeHotfixPatch(&hotfixTask),
 		m.smoothStreamTickCmd(),
 		m.shimmerTickCmd(),
-		m.hotfixProgressCmd(),
-		m.opWatchdogCmd(),
 	)
-}
-
-// hotfixProgressCmd emits the $hot generation lifecycle log lines on a timer so
-// the developer sees active progress (and the spinner keeps animating) while
-// the local LLM silently generates the patch — eliminating the 30s "deadlock"
-// freeze. The lines are delivered as hotfixProgressMsg through the event loop,
-// never from the background goroutine, so there is no data race on the record
-// buffer. Each line reflects an actual execution boundary, and the extended
-// cadence keeps the operation watchdog informed that a long provider call is
-// still making progress.
-func (m *model) hotfixProgressCmd() tea.Cmd {
-	lines := []struct {
-		delay time.Duration
-		line  string
-	}{
-		{900 * time.Millisecond, "  ↺ Attempting local resolution for hotfix..."},
-		{1800 * time.Millisecond, "  ⚙ Compiling changeset pipeline (Output Normalizer → Diff Compiler)..."},
-		{4 * time.Second, "  ⏳ Waiting for provider response..."},
-		{10 * time.Second, "  ⏳ Provider still generating — Ctrl+C to cancel"},
-		{25 * time.Second, "  ⏳ Provider still generating — Ctrl+C to cancel"},
-		{40 * time.Second, "  ⏳ Provider still generating — Ctrl+C to cancel"},
-	}
-	var cmds = make([]tea.Cmd, 0, len(lines))
-	for _, l := range lines {
-		delay, line := l.delay, l.line
-		cmds = append(cmds, tea.Tick(delay, func(time.Time) tea.Msg {
-			return hotfixProgressMsg{Line: line}
-		}))
-	}
-	return tea.Batch(cmds...)
 }
 
 // sanitizeFileOutput cleans generated file content produced by the local model
@@ -3367,12 +3407,16 @@ func (c hotfixContract) String() string {
 	}
 }
 
-// hotfixContractFor derives the artifact contract from the on-disk state. New,
-// missing, and stub/small files use the bounded whole-file rewrite; existing
-// files at or over SmallFileLineThreshold lines use the anchored-snippet
-// contract exclusively.
+// hotfixContractFor derives the artifact contract from the on-disk state.
+// Phase 8 ownership fix: a file with REAL content — however small — uses the
+// anchored-snippet contract, so a tiny mutation never forces the model to
+// re-emit the entire file (the historical ~2048-token full-file blowup). The
+// whole-file rewrite is reserved strictly for new / empty / whitespace-only
+// files whose complete creation is the only sensible artifact. A small file
+// is not a "stub" merely because it is short: the snippet contract anchors
+// onto its real content exactly like a large file.
 func hotfixContractFor(orig string) hotfixContract {
-	if orig == "" || execution.IsStubFile(orig) {
+	if strings.TrimSpace(orig) == "" {
 		return contractReplaceFile
 	}
 	return contractReplaceBlock
@@ -3622,6 +3666,12 @@ func buildHotfixFallbackHandoff(task *plan.Task, orig string, contract hotfixCon
 // NEVER passed into the changeset pipeline, so a dropped connection can never
 // surface as a misleading "ambiguous change representation".
 func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
+	// Capture the owning operation ID synchronously (UI goroutine) so the
+	// worker closure can build the PromptEnvelope race-free.
+	opID := ""
+	if m.activeOp != nil {
+		opID = m.activeOp.ID
+	}
 	return func() (msg tea.Msg) {
 		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
 		// The terminal hotfixProposalMsg MUST reach the TUI event loop on ANY
@@ -3635,11 +3685,13 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 
 		// ── Read existing file content ──────────────────────────
 		// Without the original content, local fuzzy replacement and
-		// LLM-based diff computation both produce incorrect results.
+		// LLM-based diff computation both produce incorrect results. The read
+		// is REAL work and advances the authoritative execution stage.
 		var orig string
 		if data, rerr := os.ReadFile(task.Target); rerr == nil {
 			orig = string(data)
 		}
+		m.setStage("read", task.Target, stageDone)
 
 		// ── PATH A: Deterministic Local Short-Circuit (0 Tokens) ──
 		// If the target file is explicitly referenced with @ syntax
@@ -3692,12 +3744,22 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		// NOTE: in production the ambiguity decision is made synchronously in
 		// handleHotfixCmd BEFORE any provider-invocation progress is rendered;
 		// this gate is the safety net for direct proposeHotfixPatch callers.
+		// It respects the deterministic decision: a request classifyHotfixAmbiguity
+		// deemed executable (a small/real file, or a resolved fuzzy/structural
+		// target) proceeds with the snippet contract; only genuinely ambiguous
+		// content mutations on large files pause for clarification.
 		if contract == contractReplaceBlock && !isStructuralHotfixIntent(task.Description) {
 			dec := classifyHotfixAmbiguity(task.Description, task.Target, orig)
-			return hotfixAmbiguousMsg{
-				Task:       task,
-				Reason:     dec.reason,
-				Candidates: dec.candidates,
+			if !dec.ambiguous {
+				// The target is deterministic (small/real content file or a
+				// resolved fuzzy target): continue with the bounded snippet
+				// contract below.
+			} else {
+				return hotfixAmbiguousMsg{
+					Task:       task,
+					Reason:     dec.reason,
+					Candidates: dec.candidates,
+				}
 			}
 		}
 
@@ -3725,6 +3787,14 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		}
 		system := hotfixSystemPrompt(contract)
 
+		// ── CONTEXT-OWNERSHIP ENVELOPE (Phase 8) ───────────────────────
+		// The deterministic account of the provider context this request
+		// carries. It is embedded in the terminal message so the UI goroutine
+		// stores it race-free and $inspect / tests can prove what crossed to
+		// the provider (one explicit file → one file context; no history; no
+		// unrelated repository content).
+		env := hotfixPromptEnvelope(opID, "hot", task, orig, contract, tgt)
+
 		cloudCfg := gateway.ClassifyCloudProvider(m.cfg.ActiveProviderName())
 		isCloud := cloudCfg.CloudProvider != ""
 
@@ -3733,6 +3803,14 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		// the response off prematurely (a 1-token answer after minutes of
 		// reasoning). The changeset pipeline strips preambles and trailing prose
 		// so the model can finish naturally.
+		//
+		// NO native tools on $hot (Phase 8): the contract pins a plain markdown
+		// code block (snippet or full file), and the changeset pipeline parses
+		// that block. Shipping the write_file / apply_patch tool schemas
+		// alongside both contradicts the output contract (a model may answer
+		// with a tool call instead of a code block, derailing into the
+		// "tool calls buffered" dead-end) and costs ~200 input tokens of
+		// metadata the contract never consumes.
 
 		req := ai.Request{
 			Model:     m.activeRouteModel(),
@@ -3740,20 +3818,25 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			Stream:    false,
 			MaxTokens: 2048,
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
-			Tools:     m.fileMutationTools(),
 			Reasoning: m.effortFromTasks(),
 		}
 
 		// The operation context is the cancellation parent: a Ctrl+C during
 		// patch generation cancels the provider request (Section 6). The
 		// per-call deadline bounds a single provider invocation (Section 7).
+		//
+		// ── AUTHORITATIVE STAGE: provider invocation ─────────────
+		// Before the round-trip the stage is waiting; only a completed call
+		// advances it. The dock renders "Model ● waiting", never "Thinking...".
 		timeout := buildGenerationTimeout
 		if m.hotfixTimeout > 0 {
 			timeout = m.hotfixTimeout
 		}
+		m.setStage("model", m.activeRouteModel(), stageWaiting)
 		ctx, cancel := context.WithTimeout(m.operationContext(), timeout)
 		resp, err := m.provider.Execute(ctx, req)
 		cancel()
+		m.setStage("model", m.activeRouteModel(), stageDone)
 		if err != nil {
 			if orig != "" {
 				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
@@ -3768,9 +3851,10 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 						IsFullRewrite: true,
 					}
 					return hotfixProposalMsg{
-						Task:  task,
-						Patch: patch,
-						Diff:  diffContent,
+						Task:     task,
+						Patch:    patch,
+						Diff:     diffContent,
+						Envelope: env,
 					}
 				}
 			}
@@ -3806,16 +3890,17 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 				Stream:    false,
 				MaxTokens: 2048,
 				Messages:  []ai.Message{{Role: "user", Content: buildHotfixFallbackHandoff(task, orig, contract, tgt)}},
-				Tools:     m.fileMutationTools(),
 				Reasoning: m.effortFromTasks(),
 			}
 			timeout := buildGenerationTimeout
 			if m.hotfixTimeout > 0 {
 				timeout = m.hotfixTimeout
 			}
+			m.setStage("model", m.activeRouteModel(), stageWaiting)
 			retryCtx, retryCancel := context.WithTimeout(m.operationContext(), timeout)
 			retryResp, retryErr := m.provider.Execute(retryCtx, retryReq)
 			retryCancel()
+			m.setStage("model", m.activeRouteModel(), stageDone)
 			if retryErr == nil && retryResp != nil {
 				resp = retryResp
 				totalTokIn += retryResp.TokenInput
@@ -3895,6 +3980,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 						TokenInput:  totalTokIn,
 						TokenOutput: totalTokOut,
 						RawOutput:   rawContent,
+						Envelope:    env,
 					}
 				}
 			}
@@ -3942,6 +4028,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 				TokenInput:  resp.TokenInput,
 				TokenOutput: resp.TokenOutput,
 				RawOutput:   rawContent,
+				Envelope:    env,
 			}
 		}
 
@@ -3969,6 +4056,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 					TokenInput:  resp.TokenInput,
 					TokenOutput: resp.TokenOutput,
 					RawOutput:   rawContent,
+					Envelope:    env,
 				}, true
 			}
 			return hotfixProposalMsg{}, false
@@ -3983,6 +4071,11 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		// ChangeSets and compiled into the authoritative ---/+++ unified diff.
 		// The compiled diff is carried in the proposal Patch so that after
 		// human approval applyPatchWithDeadline applies it in place.
+		//
+		// ── AUTHORITATIVE STAGE: patch compilation ─────────────────
+		// The provider round-trip completed; the changeset pipeline is a real
+		// local stage compiling the authoritative diff.
+		m.setStage("patch", task.Target, stageRunning)
 		compiled, pipeErr := changeset.NewPipeline().Run(rawContent, task.Target, []byte(orig))
 		if pipeErr != nil {
 			if fb, ok := fuzzyFallback(); ok {
@@ -4030,6 +4123,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			TokenInput:  resp.TokenInput,
 			TokenOutput: resp.TokenOutput,
 			RawOutput:   rawContent,
+			Envelope:    env,
 		}
 	}
 }
@@ -4103,12 +4197,9 @@ func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
 		}
 		symbol, pkgName, importPath := parts[1], parts[2], parts[3]
 
-		// ── Activity Tree: log stdlib fix read ──────────────────────────
-		if m.activityTree != nil {
-			m.activityTree.Append(NewFileReadEvent(task.Target, 0, 0))
-		}
-
-		// Read actual file and compute deterministic fix.
+		// Read actual file and compute deterministic fix. The read is real
+		// work: its bytes and the read stage are recorded from the actual
+		// on-disk content — never fabricated before the read happens.
 		orig, modified, err := retrieval.ApplyStdlibCaseFix(task.Target, symbol, pkgName, importPath)
 		if err != nil {
 			if m.activityTree != nil {
@@ -4116,6 +4207,13 @@ func (m *model) proposeStdlibBuildPatch(task *plan.Task) tea.Cmd {
 			}
 			return buildProposalReadyMsg{Err: fmt.Errorf("stdlib fix failed for %s: %w", task.Target, err)}
 		}
+
+		// ── Activity Tree: log the real stdlib-fix read ────────────────
+		if m.activityTree != nil {
+			m.activityTree.Append(NewFileReadEvent(task.Target, int64(len(orig)), 0))
+		}
+		m.setStage("read", task.Target, stageDone)
+		m.setStage("patch", task.Target, stageRunning)
 
 		diff := computeUnifiedDiff(task.Target, orig, modified)
 
@@ -4259,36 +4357,44 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 		// file indicates a stale or locked file — passing empty context to
 		// the LLM would silently overwrite the real content with a patch
 		// trained on nothing.
-		readFileContent := func() (string, error) {
+		readFileContent := func() (string, int64, error) {
 			fi, serr := os.Stat(task.Target)
 			if serr == nil && fi.Size() > 0 {
 				data, rerr := os.ReadFile(task.Target)
 				if rerr != nil {
-					return "", fmt.Errorf("read %s: %w", task.Target, rerr)
+					return "", 0, fmt.Errorf("read %s: %w", task.Target, rerr)
 				}
 				if len(data) == 0 {
-					return "", fmt.Errorf("zero-content read on non-empty file %s (%d bytes on disk) — aborting to prevent silent data loss", task.Target, fi.Size())
+					return "", fi.Size(), fmt.Errorf("zero-content read on non-empty file %s (%d bytes on disk) — aborting to prevent silent data loss", task.Target, fi.Size())
 				}
-				return string(data), nil
+				return string(data), fi.Size(), nil
 			}
 			if serr == nil {
 				// File exists but is genuinely empty (new file creation).
-				return "", nil
+				return "", 0, nil
 			}
 			// File does not exist on disk — new file creation.
-			return "", nil
+			return "", 0, nil
 		}
 
-		orig, rerr := readFileContent()
+		readStart := time.Now()
+		orig, origSize, rerr := readFileContent()
+		readElapsed := time.Since(readStart)
 		if rerr != nil {
 			if m.activityTree != nil {
-				m.activityTree.Append(NewFileReadEvent(task.Target, 0, 0))
+				m.activityTree.Append(NewFileReadEvent(task.Target, origSize, readElapsed))
 			}
 			return buildProposalReadyMsg{Err: rerr}
 		}
 
 		// ── Determine strategy based on file state ─────────────────────
 		strategy := execution.StrategyForOriginal(orig)
+
+		// ── Authoritative stage: the file was genuinely read ──────────
+		// Only the successful read advances the stage; the metrics are the
+		// real bytes read on disk and the real wall-clock read duration.
+		m.setStage("read", task.Target, stageDone)
+		m.setStageMetrics(0, 0, -1)
 
 		// ── Build the handoff with the current file content ────────────
 		buildHandoff := func(content string) string {
@@ -4323,21 +4429,29 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 
 		maxRetries := 2
 
-		// ── Activity Tree: log file read ──────────────────────────────
+		// ── Activity Tree: log the real first read ────────────────────
+		// The read is real work: it carries the true bytes read on disk and
+		// the true wall-clock duration — never a fabricated (0 B · 0s) row.
 		if m.activityTree != nil {
-			m.activityTree.Append(NewFileReadEvent(task.Target, 0, 0))
+			m.activityTree.Append(NewFileReadEvent(task.Target, origSize, readElapsed))
 		}
 
 		for attempt := 0; attempt <= maxRetries; attempt++ {
 			// On retry: re-read the file from disk in case it changed
 			// (e.g. a previous retry attempt wrote partial content or
-			// another task modified it).
+			// another task modified it). The re-read is a REAL repeated read
+			// and is reported as a retry — never as a fresh read row.
 			if attempt > 0 {
-				orig, rerr = readFileContent()
+				retryStart := time.Now()
+				orig, _, rerr = readFileContent()
+				retryElapsed := time.Since(retryStart)
 				if rerr != nil {
 					return buildProposalReadyMsg{Err: rerr}
 				}
 				handoff = buildHandoff(orig)
+				if m.activityTree != nil {
+					m.activityTree.Append(NewFileReadEventRetry(task.Target, int64(len(orig)), retryElapsed, attempt))
+				}
 			}
 
 			// On retry for existing small files, switch to new-file strategy
@@ -4348,14 +4462,9 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				handoff = buildStubOverwriteHandoff(task, orig) + "\n\nCORRECTION: Previous patch attempts failed. Output the COMPLETE new file content inside a single markdown code block. Do NOT use SEARCH/REPLACE or diff format."
 				system = m.tieredStrategyContract("new_file")
 
-				// ── Activity Tree: log retry ───────────────────────────
+				// ── Activity Tree: log retry strategy switch ──────────
 				if m.activityTree != nil {
 					m.activityTree.Append(NewFileMutateEvent(task.Target, 0, 0, 0))
-				}
-			} else if attempt > 0 {
-				// ── Activity Tree: log retry ───────────────────────────
-				if m.activityTree != nil {
-					m.activityTree.Append(NewFileReadEvent(task.Target, 0, 0))
 				}
 			}
 
@@ -4374,9 +4483,21 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				Reasoning: m.effortFromTasks(),
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
+			// The operation context is the cancellation parent: a Ctrl+C during
+			// patch generation cancels the provider request immediately (the
+			// "Processing file mutations..." spinner can never outlive it). The
+			// per-call deadline bounds a single provider invocation.
+			//
+			// ── AUTHORITATIVE STAGE: provider invocation ─────────────
+			// Before the round-trip the stage is "waiting" (no bytes from the
+			// provider yet); the dock renders "Model ● waiting · 4.2s", never
+			// "Thinking..." / "Processing...". Only a completed call advances
+			// the stage.
+			m.setStage("model", m.activeRouteModel(), stageWaiting)
+			ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
 			resp, err := m.provider.Execute(ctx, req)
 			cancel()
+			m.setStage("model", m.activeRouteModel(), stageDone)
 			if err != nil {
 				return buildProposalReadyMsg{Err: fmt.Errorf("patch generation failed: %w", err)}
 			}
@@ -4469,7 +4590,13 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 						if m.activityTree != nil {
 							m.activityTree.Append(NewFileMutateEvent(task.Target, 0, 0, 0))
 						}
-						return mutationResultMsg{file: task.Target, status: "nochange"}
+						// NO_CHANGE is semantically valid here: the model's
+						// resolved artifact was compared against the actual
+						// filesystem and the result is byte-for-byte unchanged.
+						// The provider's real usage is carried on the result so
+						// the footer never zeroes the tokens the model consumed.
+						ti, to, known := respUsage(resp)
+						return mutationResultMsg{file: task.Target, status: "nochange", TokenInput: ti, TokenOutput: to, usageKnown: known}
 					}
 					diffContent = computeUnifiedDiff(task.Target, orig, resolved)
 				}
@@ -4593,7 +4720,7 @@ func (m *model) proposeBuildPatch(task *plan.Task) tea.Cmd {
 				Messages:  []ai.Message{{Role: "user", Content: fullRewriteHandoff}},
 				Reasoning: m.effortFromTasks(),
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
+			ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
 			fullResp, fullErr := m.provider.Execute(ctx, fullRewriteReq)
 			cancel()
 			if fullErr == nil && fullResp != nil && strings.TrimSpace(fullResp.Content) != "" {
@@ -4916,9 +5043,14 @@ func (m *model) proposeHybridTemplatePatch(task *plan.Task) tea.Cmd {
 			Reasoning: m.effortFromTasks(),
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), buildGenerationTimeout)
+		// ── AUTHORITATIVE STAGE: provider invocation ─────────────
+		// Before the round-trip the stage is waiting; only a completed call
+		// advances it. The dock renders "Model ● waiting", never "Thinking...".
+		m.setStage("model", m.activeRouteModel(), stageWaiting)
+		ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
 		resp, err := m.provider.Execute(ctx, req)
 		cancel()
+		m.setStage("model", m.activeRouteModel(), stageDone)
 		if err != nil {
 			return buildProposalReadyMsg{Err: fmt.Errorf("hybrid template patch failed: %w", err)}
 		}
@@ -4994,10 +5126,21 @@ func (m *model) applyHotfixPatch(task *plan.Task, patch *execution.Patch) tea.Cm
 	// operation (the hotfix apply). It is finalized by the terminal
 	// buildResultMsg handler via the single cleanup path.
 	m.beginOperation(OpHotfix)
+	// ── MUTATION BOUNDARY (Phase 9A) ────────────────────────────────
+	// This user-level mutation owns its own MutationSet / transaction
+	// boundary. The apply records into it and the terminal buildResultMsg
+	// handler commits it on success or rolls it back on failure/cancellation.
+	// No other operation can ever roll back a committed hotfix.
+	if m.execEng != nil {
+		m.execEng.BeginTransaction()
+	}
 	m.agentRunning = true
 	m.pipelineRunning = true
 	m.agentDone = false
 	m.agentLabel = "hotfix apply"
+	if task != nil {
+		m.setStage("apply", task.Target, stageRunning)
+	}
 	m.syncUIState()
 	return func() (msg tea.Msg) {
 		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
@@ -5290,7 +5433,14 @@ func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 			}
 		}
 
-		result, err := runner.Run(task.Target)
+		// ── CANCELLATION-COMPLETE SHELL EXECUTION ─────────────────────
+		// The subprocess runs under the active operation context so Ctrl+C /
+		// Esc cancel it through the context AND the global orphan-kill list.
+		// The shell stage is recorded as a real execution stage on the
+		// operation telemetry so its latency is attributed truthfully.
+		m.setStage("shell", task.Target, stageRunning)
+		result, err := runner.RunContext(m.operationContext(), task.Target)
+		m.setStage("shell", task.Target, stageDone)
 		output := ""
 		exitCode := 0
 		if result != nil {
@@ -5400,6 +5550,9 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	m.sess.StageTaskList(&tasks)
 	_ = m.sess.Save()
 	m.push(roleStatus, fmt.Sprintf("executing step %d: %s — %s", targetTask.StepNum, targetTask.Type, targetTask.Target))
+	// ── AUTHORITATIVE STAGE: target resolution ──────────────────────
+	// The concrete mutation target was resolved and selected — a real stage.
+	m.setStage("target", targetTask.Target, stageDone)
 
 	// Strategy-aware first-token instruction: never force a SEARCH/REPLACE
 	// patch onto a file that does not exist yet. For new/0-byte targets the
@@ -5476,6 +5629,22 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// non-streaming call and returned as buildProposalReadyMsg, which freezes
 	// the pipeline in StateAwaitingApproval and renders a unified diff for
 	// explicit authorization (Alt+A / Alt+L / Alt+R).
+	//
+	// OPERATION LIFECYCLE: every provider-invoking branch below registers the
+	// execution as the single authoritative foreground operation (OpBuild) on
+	// the UI goroutine BEFORE the patch-generation command is dispatched. This
+	// (1) gives Ctrl+C a single cancellation handle into the provider call —
+	// proposeBuildPatch / proposeHybridTemplatePatch derive their request
+	// context from m.operationContext(), so handleEmergencyInterrupt's
+	// activeOp.Cancel() releases the blocked HTTP call immediately instead of
+	// leaving the UI stuck on "Processing file mutations" until the 5-minute
+	// buildGenerationTimeout expires — and (2) enforces single-ownership: a
+	// duplicate dispatch supersedes (cancels) any previous build operation
+	// rather than running two overlapping execution loops. The operation is
+	// finalized by the terminal buildProposalReadyMsg / mutationResultMsg
+	// handlers via finalizeBuildOperation. The deterministic branches below
+	// (trivial template, stdlib fix) perform zero provider work and run under
+	// their own strict apply deadline, so they need no operation.
 	if targetTask.Type == "FILE_MUTATE" || targetTask.Type == "GIT_ACTION" {
 		// ── TRIVIAL TEMPLATE CREATE (local generation, 0 cloud tokens) ─
 		// If the task targets a trivial template file (LICENSE, .gitignore,
@@ -5485,6 +5654,7 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 		// calls, zero cloud tokens consumed.
 		if targetTask.IsHardcoded && gateway.IsTrivialCreateTarget(targetTask.Target) {
 			if hasCustomizationDirectives(targetTask.Description) {
+				m.beginOperation(OpBuild)
 				return tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "hybrid template"} },
 					m.proposeHybridTemplatePatch(targetTask),
@@ -5511,6 +5681,7 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 				m.smoothStreamTickCmd(),
 			)
 		}
+		m.beginOperation(OpBuild)
 		return tea.Batch(
 			func() tea.Msg { return agentStartMsg{label: "patching"} },
 			m.proposeBuildPatch(targetTask),
@@ -5643,7 +5814,7 @@ func (m *model) runTestEngine(target string) tea.Cmd {
 		}
 		runner := execExecutionRunner(".")
 		cmd := "go test -v " + target
-		result, err := runner.Run(cmd)
+		result, err := runner.RunContext(m.operationContext(), cmd)
 		output := ""
 		passed := true
 		failedCount := 0
@@ -5725,7 +5896,7 @@ func (m *model) runBuildEngine(target string) tea.Cmd {
 		}
 		runner := execExecutionRunner(".")
 		cmd := "go build " + target
-		result, err := runner.Run(cmd)
+		result, err := runner.RunContext(m.operationContext(), cmd)
 		output := ""
 		exitCode := 0
 
@@ -5762,8 +5933,25 @@ type executionRunner struct {
 	root string
 }
 
+// Run executes a shell command under a plain background context (legacy). The
+// command is still registered for the global orphan-kill list so a Ctrl+C
+// hard interrupt can terminate it. Prefer RunContext when a caller holds a
+// cancellable operation context.
 func (r *executionRunner) Run(command string) (*executionRunResult, error) {
-	c := exec.CommandContext(context.Background(), "bash", "-c", command)
+	return r.RunContext(context.Background(), command)
+}
+
+// RunContext executes a shell command under ctx so a cancelled operation
+// context (Ctrl+C / Esc / mode transition) cancels the subprocess promptly via
+// the context in addition to the global orphan-kill list. It is the
+// cancellation-complete variant of Run.
+//
+//nolint:contextcheck // ctx is the caller-supplied cancellation scope, never a fresh one
+func (r *executionRunner) RunContext(ctx context.Context, command string) (*executionRunResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c := exec.CommandContext(ctx, "bash", "-c", command)
 	c.Dir = r.root
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
@@ -6108,7 +6296,7 @@ func (m *model) runLogCmd(traceData string) tea.Cmd {
 			runner := execExecutionRunner(".")
 			var output string
 			if traceData != "" {
-				out, err := runner.Run(traceData)
+				out, err := runner.RunContext(m.operationContext(), traceData)
 				if err != nil {
 					return logInputMsg{err: err}
 				}
@@ -6355,6 +6543,18 @@ func (m *model) cancelAllBackgroundContexts() {
 func (m *model) handleReviewDollar(line string) tea.Cmd {
 	action := strings.TrimSpace(line[1:])
 	mode := m.resolver.Current()
+
+	// ── $inspect — DETAILED EXECUTION TELEMETRY (Phase 3) ───────────────
+	// Renders the authoritative execution timeline of the most recently
+	// finalized foreground operation: every real stage (target, read, model,
+	// patch, validate, apply) with started/completed/elapsed, provider
+	// request→waiting→first-token→streaming→terminal attribution, invocation
+	// and retry counters, and live-worker tracking. This is execution
+	// telemetry, NEVER chain-of-thought. The normal UI stays compact; the
+	// detailed timeline lives behind this interaction only.
+	if action == "inspect" || strings.HasPrefix(action, "inspect ") {
+		return m.runInspectCmd(strings.TrimSpace(strings.TrimPrefix(action, "inspect")))
+	}
 
 	// ── $log — UNDER-THE-HOOD IMPLICIT PIPELINE ──────────────────────────
 	// $log evaluates a shell failure trace, fires the silent analysis pipeline
@@ -6768,8 +6968,11 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 				return agentDoneMsg{}
 			}
 
-			// Run the diagnosis through the unified client router.
-			resp, err := m.provider.Execute(context.Background(), ai.Request{
+			// Run the diagnosis through the unified client router. Bounded by
+			// the operation context + generation deadline so a hung provider can
+			// never freeze the /investigate $diagnose spinner.
+			ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
+			resp, err := m.provider.Execute(ctx, ai.Request{
 				Model: m.routeModel("investigate"),
 				Messages: []ai.Message{
 					{Role: "user", Content: string(logData)},
@@ -6777,6 +6980,7 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 				Stream: false,
 				System: providers.DiagnoseSystemPrompt,
 			})
+			cancel()
 			if err != nil {
 				m.push(roleError, fmt.Sprintf("[System Error] Diagnosis failed: %v", err))
 				m.refreshViewportContent()
@@ -6849,7 +7053,11 @@ func (m *model) runAskPromptHandoffCmd(rawInput string) tea.Cmd {
 				System: systemPrompt,
 			}
 
-			resp, err := m.provider.Execute(context.Background(), req)
+			// The $prompt refinement is bounded by the operation context +
+			// generation deadline so a hung provider can never freeze the spinner.
+			ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
+			resp, err := m.provider.Execute(ctx, req)
+			cancel()
 			if err != nil {
 				return promptHandoffMsg{err: fmt.Errorf("prompt synthesis failed: %w", err)}
 			}
@@ -7182,6 +7390,19 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 		m.handoffLedgerContent = ""
 		m.currentResult = nil
 		cmd := m.setMode(mode)
+
+		// ── CONTINUOUS EXECUTION: an approved /build chip executes directly ──
+		// The "Approve Plan" and "Execute Build" chips represent real
+		// executable-now actions, not decorative mode switches. setMode's
+		// auto-trigger dispatches the build executor when staged tasks exist
+		// (buildHandoffTriggerContent → runBuildCmd) — so the user never
+		// repeats `/build` to start the pipeline they just approved. When the
+		// auto-trigger cannot fire (e.g. no staged handoff payload), run the
+		// executor directly against the staged task queue.
+		if mode == modes.ModeBuild && m.hasStagedBuildWork() && m.buildHandoffTriggerContent(mode) == "" {
+			return tea.Batch(m.runBuildCmd(""), cmd)
+		}
+
 		if action.Query != "" {
 			return m.handleMessageContent(action.Query)
 		}
