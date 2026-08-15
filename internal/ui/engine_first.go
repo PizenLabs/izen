@@ -114,6 +114,10 @@ func (m *model) routeEngineFirstPrompt(rawInput string) (tea.Cmd, bool) {
 	// reason; $inspect renders it so "why did Izen read this file / use this
 	// much context" is answerable without exposing model reasoning.
 	m.lastContextEnvelope = strategy.NewCompiler(m.strategyDeps()).Compile(profile)
+	// Compile the explicit execution graph the strategy dictates and drive its
+	// initial deterministic nodes (Phase 11). The graph exists before any
+	// model invocation and records real runtime boundaries as they happen.
+	m.recordStrategyGraph(profile)
 
 	switch profile.Strategy {
 	case strategy.HumanClarification:

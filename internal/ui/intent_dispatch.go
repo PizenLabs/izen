@@ -266,6 +266,11 @@ func (m *model) routePromptDirective(rawInput string) tea.Cmd {
 		m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected by compressor. Bypassing architect analysis."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
+		// ── STRATEGY GRAPH LIFECYCLE (Phase 11) ────────────────────
+		// The compressor overrides the engine-first strategy decision with a
+		// direct mutation; the compiled repository/planning graph no longer
+		// describes the execution, so it must not be recorded into.
+		m.lastStrategyGraph = nil
 		targets := gateway.ExtractDirectMutationTargets(rawInput)
 		if len(targets) > 1 {
 			var tasks []plan.Task
@@ -310,6 +315,10 @@ func (m *model) routePromptDirective(rawInput string) tea.Cmd {
 		m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected. Bypassing architect analysis."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
+		// ── STRATEGY GRAPH LIFECYCLE (Phase 11) ────────────────────
+		// The direct-mutation classifier overrides the strategy decision; the
+		// compiled graph no longer describes the execution.
+		m.lastStrategyGraph = nil
 		multiTargets := gateway.ExtractDirectMutationTargets(rawInput)
 		if len(multiTargets) > 1 {
 			var tasks []plan.Task

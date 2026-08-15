@@ -534,6 +534,18 @@ func (m *model) terminalizeMultiHotfixGraph(success bool, outcome OperationOutco
 	m.lastExecutionGraph = graph
 	m.pendingHotfixGraph = nil
 	m.activeGraph = nil
+	// ── STRATEGY GRAPH (Phase 11) ────────────────────────────────────
+	// The compiled execution graph records the multi-file apply terminal from
+	// the real outcome: committed (mutate+verify complete), rolled back (mutate
+	// failed) or cancelled. No-op outside the strategy layer.
+	switch {
+	case success:
+		m.recordStrategyGraphMutation(true)
+	case outcome == OpOutcomeCancelled:
+		m.cancelStrategyGraph("multi-file apply cancelled by the runtime")
+	default:
+		m.recordStrategyGraphMutation(false)
+	}
 }
 
 // multiHotfixProposalSummary renders the compact aggregate approval header.

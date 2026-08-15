@@ -3103,6 +3103,17 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 		return nil
 	}
 
+	// ── STRATEGY GRAPH LIFECYCLE (Phase 11) ─────────────────────────
+	// A plain $hot (not engine-first $prompt branded) is a direct mutation
+	// executor outside the strategy layer: it must not record into a stale
+	// execution graph left by an earlier $prompt. The graph is cleared here so
+	// every $hot executes with its own (nil) strategy surface and $inspect
+	// stays truthful. $prompt-targeted mutations set hotfixBranding to "PROMPT"
+	// before calling this, so their graph survives to the apply terminal.
+	if m.hotfixBranding != "PROMPT" {
+		m.lastStrategyGraph = nil
+	}
+
 	// Guard: must be in /build mode.
 	if m.resolver.Current() != modes.ModeBuild {
 		m.push(roleError, "$hot is only available in /build mode")

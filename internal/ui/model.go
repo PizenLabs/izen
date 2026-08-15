@@ -1399,6 +1399,14 @@ type model struct {
 	// Every item names its owner, source and reason for inclusion; $inspect
 	// renders it so context ownership is observable and auditable.
 	lastContextEnvelope strategy.ContextEnvelope
+	// lastStrategyGraph is the compiled explicit execution graph of the most
+	// recent engine-first $prompt (Phase 11). It is the typed node sequence
+	// (resolve_target → … → verify) compiled deterministically from the
+	// selected strategy BEFORE any model invocation; the runtime records node
+	// states as execution reaches real boundaries. $inspect renders it so the
+	// intended and executed execution are both answerable. Written and read on
+	// the UI goroutine only.
+	lastStrategyGraph *strategy.ExecutionGraph
 	// activeStrategyBudget is the adaptive output budget the engine-first
 	// router selected for the currently dispatched targeted mutation. Zero
 	// means "use the default bounded budget". It is cleared when the mutation

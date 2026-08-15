@@ -240,6 +240,11 @@ type ExecutionProof struct {
 	FilesystemChanged  bool
 	VerificationPassed bool
 
+	// ── Engine-first decision (Phase 11) ───────────────────────────
+	// Strategy is the execution strategy the operation was compiled from
+	// ("" when the operation ran outside the strategy layer, e.g. $hot).
+	Strategy string
+
 	// ── Multi-file execution (Phase 9B) ─────────────────────────────
 	// Targets lists every mutation target in stable graph order.
 	Targets []string
@@ -275,6 +280,7 @@ func (m *model) recordHotfixProposalProof(target string, artifactPresent, diffPr
 		OutputUsage:         outputUsage,
 		ArtifactPresent:     artifactPresent,
 		DiffPresent:         diffPresent,
+		Strategy:            string(m.lastExecutionStrategy.Strategy),
 	}
 }
 
@@ -307,6 +313,9 @@ func renderExecutionProof(p ExecutionProof) string {
 	}
 	b.WriteString("\n")
 	b.WriteString("  provider-invocations=" + itoa(p.ProviderInvocations) + "\n")
+	if p.Strategy != "" {
+		b.WriteString("  strategy=" + p.Strategy + "\n")
+	}
 	b.WriteString("  input=" + formatUsageValue(p.InputUsage) + " output=" + formatUsageValue(p.OutputUsage) + "\n")
 	b.WriteString("  artifact=" + boolWord(p.ArtifactPresent) + " diff=" + boolWord(p.DiffPresent) + "\n")
 	b.WriteString("  apply=" + boolWord(p.ApplyExecuted) + " filesystem-changed=" + boolWord(p.FilesystemChanged) + " verify=" + boolWord(p.VerificationPassed))
@@ -351,6 +360,7 @@ func (m *model) recordMultiHotfixProposalProof(msg multiHotfixProposalMsg) {
 		InputUsage:          msg.TokenInput,
 		OutputUsage:         msg.TokenOutput,
 		Targets:             msg.Graph.Targets(),
+		Strategy:            string(m.lastExecutionStrategy.Strategy),
 	}
 	for _, n := range msg.Graph.Nodes {
 		p.Nodes = append(p.Nodes, NodeProof{

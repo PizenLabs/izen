@@ -1255,6 +1255,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.hotfixActive = false
 			m.activeGraph = nil
 			m.pendingHotfixGraph = nil
+			// ── STRATEGY GRAPH: generation failed under the contract ──
+			m.recordStrategyGraphModelFailed(msg.Err)
 			if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
 				m.sess.StageTaskList(&stashedTasks)
 				_ = m.sess.Save()
@@ -1277,6 +1279,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Authoritative invocation count + aggregate provider usage + per-node
 		// artifact/diff presence. Apply facts merge at the apply terminal.
 		m.recordMultiHotfixProposalProof(msg)
+		// ── STRATEGY GRAPH: the bounded model produced its artifact ──
+		m.recordStrategyGraphProposal()
 		// ── THOUGHT CAPTURE (Ctrl+O) ────────────────────────────────
 		if msg.RawOutput != "" {
 			m.captureHotfixThought(msg.RawOutput)
@@ -1371,6 +1375,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				m.push(roleSystem, infoStyle.Render("[HOTFIX] Pipeline PAUSED. No files were modified."))
 			}
 			m.hotfixActive = false
+			// ── STRATEGY GRAPH: generation failed under the contract ──
+			m.recordStrategyGraphModelFailed(msg.Err)
 			if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
 				m.sess.StageTaskList(&stashedTasks)
 				_ = m.sess.Save()
@@ -1383,6 +1389,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				thoughtDone,
 			)
 		}
+
+		// ── STRATEGY GRAPH: the bounded model produced its artifact ──
+		m.recordStrategyGraphProposal()
 
 		// ── FREEZE AND REQUEST AUTHORIZATION ─────────────────────────
 		// Store the synthesized patch + rendered diff proposal. Enter the
@@ -1666,6 +1675,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			} else {
 				m.completeHotfixProof(msg.exitCode == 0, msg.err == nil)
 			}
+			// ── STRATEGY GRAPH (Phase 11) ────────────────────────────
+			// The compiled execution graph records the apply terminal from the
+			// real result: mutate + verify complete (committed MutationSet) or
+			// failed (rolled back). No-op outside the strategy layer.
+			m.recordStrategyGraphMutation(msg.exitCode == 0)
 			m.finalizeOperation(outcome, msg.err)
 			m.syncUIState()
 
@@ -1703,6 +1717,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					}
 				}
 			}
+			// ── STRATEGY GRAPH (Phase 11) ────────────────────────────
+			// The build failed and rolled the owning MutationSet back: the
+			// compiled execution graph records the failed mutation terminal.
+			m.recordStrategyGraphMutation(false)
 
 			// ── CLEAR DIALOG BUFFER ON TASK FAILURE ────────────────
 			// Wipe the LLM conversation history so the next diagnostic

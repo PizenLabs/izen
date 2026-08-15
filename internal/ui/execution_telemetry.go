@@ -84,6 +84,19 @@ func (m *model) runInspectCmd(filter string) tea.Cmd {
 				m.push(roleSystem, mutedStyle.Render(line))
 			}
 		}
+		// ── EXECUTION GRAPH (Phase 11) ───────────────────────────────
+		// The compiled explicit execution graph of the most recent engine-first
+		// $prompt: the typed node sequence (resolve_target → … → verify), the
+		// node states recorded at real runtime boundaries, the expected model
+		// invocations and the escalation history. It answers "what did Izen
+		// intend to execute, what has it actually executed so far" with engine
+		// facts — never model reasoning.
+		if m.lastStrategyGraph != nil {
+			m.push(roleSystem, mutedStyle.Render(""))
+			for _, line := range strings.Split(strings.TrimRight(renderStrategyGraph(m.lastStrategyGraph), "\n"), "\n") {
+				m.push(roleSystem, mutedStyle.Render(line))
+			}
+		}
 		// ── MULTI-FILE EXECUTION GRAPH (Phase 9B) ────────────────────
 		// The aggregate graph — one user intent → one graph → one MutationSet
 		// → one terminal outcome — with per-node evidence. Only rendered when a
@@ -250,6 +263,46 @@ func truncateInline(s string, max int) string {
 		return s
 	}
 	return s[:max] + "…"
+}
+
+// renderStrategyGraph renders the compiled explicit execution graph of the most
+// recent engine-first $prompt for $inspect: the strategy, the graph lifecycle
+// state, the expected model invocations, every typed node with its recorded
+// state, and the escalation history. It exposes execution facts only — the
+// graph carries no model reasoning.
+func renderStrategyGraph(g *strategy.ExecutionGraph) string {
+	if g == nil {
+		return "execution-graph: <nil>"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "execution-graph: strategy=%s state=%s nodes=%d expected-invocations=%d",
+		g.Strategy, g.State, g.NodeCount(), g.ExpectedInvocations)
+	if len(g.MutationTargets) > 0 {
+		fmt.Fprintf(&b, " mutation-targets=%s", strings.Join(g.MutationTargets, ","))
+	}
+	fmt.Fprintf(&b, "\n  metrics: %s", g.Metrics().String())
+	for _, n := range g.Nodes {
+		fmt.Fprintf(&b, "\n  %s %s: %s", n.ID, n.Kind.Label(), n.State)
+		if n.Target != "" {
+			b.WriteString(" " + n.Target)
+		}
+		if n.RequiresModel {
+			fmt.Fprintf(&b, " model=yes invocation#%d", n.Invocation)
+		}
+		if n.Kind.HumanBoundary() {
+			b.WriteString(" human")
+		}
+		if n.Evidence != "" {
+			b.WriteString(" — " + truncateInline(n.Evidence, 80))
+		}
+	}
+	if g.EscalationCount() > 0 {
+		fmt.Fprintf(&b, "\n  escalations=%d", g.EscalationCount())
+		for _, e := range g.Escalations {
+			b.WriteString("\n    " + e.String())
+		}
+	}
+	return b.String()
 }
 
 // renderContextEnvelope renders the compiled minimum-sufficient context
