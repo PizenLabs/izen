@@ -130,9 +130,16 @@ type Compiler struct {
 func NewCompiler(deps Deps) *Compiler { return &Compiler{deps: deps} }
 
 // Compile builds the envelope for a profile. The profile.ContextKinds is the
-// required channel set; the compiler maps each kind onto an owned item.
+// required channel set; the compiler maps each kind onto an owned item. The
+// strategy's ContextPolicy is authoritative: a ContextPolicyNone strategy
+// (DirectResponse / casual chat) compiles to an EMPTY envelope — zero context,
+// no user-intent item, no file channel, no workspace scan.
 func (c *Compiler) Compile(p ExecutionStrategyProfile) ContextEnvelope {
 	env := ContextEnvelope{CompiledAt: time.Now()}
+
+	if p.Policy() == ContextPolicyNone {
+		return env
+	}
 
 	need := p.HasContext
 

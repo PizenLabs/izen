@@ -59,7 +59,7 @@ func expectedInvocations(p ExecutionStrategyProfile) int {
 		return 0
 	}
 	switch p.Strategy {
-	case TargetedMutation, TargetedReasoning, RepositoryInvestigation, MultiFilePlanning:
+	case TargetedMutation, TargetedReasoning, DirectResponse, RepositoryInvestigation, MultiFilePlanning:
 		return 1
 	default:
 		return 0
@@ -94,6 +94,8 @@ func Compile(p ExecutionStrategyProfile) *ExecutionGraph {
 		compileClarification(g, p)
 	case TargetedReasoning:
 		compileReasoning(g, p)
+	case DirectResponse:
+		compileDirectResponse(g, p)
 	case RepositoryInvestigation:
 		compileInvestigation(g, p)
 	case MultiFilePlanning:
@@ -173,6 +175,13 @@ func compileClarification(g *ExecutionGraph, p ExecutionStrategyProfile) {
 func compileReasoning(g *ExecutionGraph, p ExecutionStrategyProfile) {
 	g.Add(NodeResolveTarget, targetOf(p), false, 0, "")
 	g.Add(NodeReadTarget, targetOf(p), false, 0, "")
+	g.Add(NodeReason, targetOf(p), true, 1, contractFor(p, 1))
+}
+
+// compileDirectResponse compiles the zero-context direct-chat graph: a single
+// bounded reason invocation with no target read, no workspace scan, and no
+// mutation path. There is nothing to resolve or read — "hi" has no file.
+func compileDirectResponse(g *ExecutionGraph, p ExecutionStrategyProfile) {
 	g.Add(NodeReason, targetOf(p), true, 1, contractFor(p, 1))
 }
 

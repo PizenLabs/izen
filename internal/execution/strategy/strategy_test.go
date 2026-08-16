@@ -169,8 +169,9 @@ func TestSelectAmbiguousTarget(t *testing.T) {
 
 // TestSelectGreetingNeverPlans pins the strategy-quality contract: a greeting
 // or direct-chat request ("hi") must NEVER select multi_file_planning — the
-// workspace-planning path. It is classified as direct chat: a single bounded
-// read-only invocation with zero repository evidence.
+// workspace-planning path. It is classified as DirectResponse: a single bounded
+// read-only invocation with ZERO repository context, no workspace scan, and no
+// file channels.
 func TestSelectGreetingNeverPlans(t *testing.T) {
 	d := deps(t, map[string]string{"main.go": "package main"})
 	for _, input := range []string{
@@ -182,8 +183,8 @@ func TestSelectGreetingNeverPlans(t *testing.T) {
 			t.Fatalf("%q selected %s — a greeting must never trigger workspace planning (reason: %s)",
 				input, p.Strategy, p.StrategyReason)
 		}
-		if p.Strategy != TargetedReasoning {
-			t.Fatalf("%q strategy = %s, want targeted_reasoning (direct chat)", input, p.Strategy)
+		if p.Strategy != DirectResponse {
+			t.Fatalf("%q strategy = %s, want direct_response (direct chat)", input, p.Strategy)
 		}
 		if p.ModelRequired {
 			if p.ModelDecision == "" {
@@ -218,8 +219,8 @@ func TestSelectGreetingWithTargetIsCodingTask(t *testing.T) {
 }
 
 // TestSelectDirectQuestionIsReadOnly pins that a read-only question without a
-// target is answered directly (targeted_reasoning) instead of expanding into
-// repository planning.
+// target is answered directly (direct_response, zero context) instead of
+// expanding into repository planning.
 func TestSelectDirectQuestionIsReadOnly(t *testing.T) {
 	d := deps(t, map[string]string{"main.go": "package main"})
 	for _, input := range []string{
@@ -233,11 +234,48 @@ func TestSelectDirectQuestionIsReadOnly(t *testing.T) {
 			t.Fatalf("%q selected %s — a direct question must not expand into workspace planning",
 				input, p.Strategy)
 		}
-		if p.Strategy != TargetedReasoning {
-			t.Fatalf("%q strategy = %s, want targeted_reasoning (read-only answer)", input, p.Strategy)
+		if p.Strategy != DirectResponse {
+			t.Fatalf("%q strategy = %s, want direct_response (read-only answer)", input, p.Strategy)
 		}
-		if p.Artifact.Kind != "explanation" {
-			t.Fatalf("%q artifact = %s, want explanation", input, p.Artifact.Kind)
+		if p.Policy() != ContextPolicyNone {
+			t.Fatalf("%q context policy = %s, want none (zero-context answer)", input, p.Policy())
+		}
+		if len(p.ContextKinds) != 0 {
+			t.Fatalf("%q demands context kinds %v, want zero channels", input, p.ContextKinds)
+		}
+	}
+}
+
+// TestGreetingUsesDirectResponseStrategy is the Phase 4 acceptance contract: a
+// greeting must classify as Intent casual_chat / Strategy direct_response with
+// ZERO context channels. Greetings never load repository context and never
+// trigger workspace planning.
+func TestGreetingUsesDirectResponseStrategy(t *testing.T) {
+	d := deps(t, map[string]string{"main.go": "package main"})
+	for _, input := range []string{
+		"hi", "hello", "thanks", "good morning",
+	} {
+		p := Select(input, d)
+		if p.Strategy != DirectResponse {
+			t.Fatalf("%q strategy = %s, want direct_response (reason: %s)", input, p.Strategy, p.StrategyReason)
+		}
+		if p.Intent != "casual_chat" {
+			t.Fatalf("%q intent = %q, want casual_chat", input, p.Intent)
+		}
+		if p.Policy() != ContextPolicyNone {
+			t.Fatalf("%q context policy = %s, want none", input, p.Policy())
+		}
+		if len(p.ContextKinds) != 0 {
+			t.Fatalf("%q context channels = %v, want 0", input, p.ContextKinds)
+		}
+		if p.ContextKinds != nil {
+			t.Fatalf("%q ContextKinds must be nil (zero context), got %v", input, p.ContextKinds)
+		}
+		if p.HasContext(ContextRepositoryConstraints) || p.HasContext(ContextDependencyEvidence) {
+			t.Fatalf("%q must not demand repository context", input)
+		}
+		if p.TargetCount() != 0 {
+			t.Fatalf("%q resolved %d targets, want 0", input, p.TargetCount())
 		}
 	}
 }

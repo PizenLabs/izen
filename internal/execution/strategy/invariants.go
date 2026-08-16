@@ -47,8 +47,8 @@ func CheckInvariants(p ExecutionStrategyProfile, g *ExecutionGraph) []string {
 	}
 
 	// Simple task → no investigation / no repository scan.
-	if (p.Strategy == TargetedMutation || p.Strategy == TargetedReasoning || p.Strategy == DirectDeterministic) &&
-		g.Has(NodeGatherEvidence) {
+	if (p.Strategy == TargetedMutation || p.Strategy == TargetedReasoning || p.Strategy == DirectDeterministic ||
+		p.Strategy == DirectResponse) && g.Has(NodeGatherEvidence) {
 		violations = append(violations, "targeted/simple strategy compiled a gather_evidence node (repository scan)")
 	}
 

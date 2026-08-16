@@ -887,6 +887,15 @@ type model struct {
 	// terminal runtime event can never clobber an unrelated operation.
 	executionResolving bool
 
+	// execView is the single execution-view projection of the gated
+	// RuntimeExecutor path. It REDUCES the canonical runtime lifecycle events
+	// into one ExecutionViewState (Idle/Running(step)/WaitingApproval/
+	// Completed/Failed) plus the human + debug narratives. The renderer for the
+	// gated path depends ONLY on this state — it never invents execution truth.
+	// It is reset at each gated dispatch and driven exclusively by
+	// handleDomainEvent. Nil until the first gated execution.
+	execView *presentation.ExecutionProjection
+
 	// Quit-confirmation modal (exit safety guard). pendingQuitConfirm gates
 	// clean shutdown behind an explicit [ No ] / [ Yes ] dialog; the dialog
 	// defaults to [ No ] so a stray Enter can never exit accidentally.
@@ -1939,6 +1948,15 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	if m.activitySurfaceSealed {
 		return
 	}
+	// ── SINGLE EXECUTION-VIEW PROJECTION (Phase 4) ────────────────
+	// Every canonical runtime lifecycle event advances the execution-view
+	// projection. The renderer for the gated path reads ONLY this projection's
+	// state — it never invents execution truth, and a terminal event ALWAYS
+	// transitions it into a terminal phase (no stale spinner after success,
+	// failure, or cancellation).
+	if m.execView != nil {
+		m.execView.Project(ev)
+	}
 	switch p := ev.Payload().(type) {
 	case events.CommandReceivedPayload:
 		m.logActivity("[%s] received command: %s", p.Mode, truncateForActivity(p.Command))
@@ -1988,6 +2006,8 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		m.logActivity("[runtime] context prepared: %d channel(s), ~%d tokens", len(p.Channels), p.Tokens)
 	case events.ModelInvokedPayload:
 		m.logActivity("[runtime] model invoked: %s", p.Model)
+	case events.ProviderResponsePayload:
+		m.logActivity("[runtime] provider response: %s (%d tok in / %d tok out)", p.Model, p.TokenInput, p.TokenOutput)
 	case events.ArtifactProducedPayload:
 		m.logActivity("[runtime] artifact produced: %s (%s)", p.Kind, p.Target)
 	case events.MutationStartedPayload:

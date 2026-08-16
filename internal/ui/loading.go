@@ -197,6 +197,17 @@ func (m *model) renderLoadingDock() string {
 // renderLoadingDock). The hint is therefore plain text carried on the same
 // swept line.
 func (m *model) composeDockTextWithFlake(flake string) string {
+	// The gated RuntimeExecutor path renders its status EXCLUSIVELY from the
+	// single execution-view projection (Part 5): the human step the runtime
+	// events produced — "Thinking...", "Found target index.html",
+	// "Generated change", "Applying...". The UI never invents execution truth.
+	// Gated on the in-flight marker so a later legacy operation can never
+	// inherit a stale execution step.
+	if m.execView != nil && m.executionResolving && m.execView.Active() {
+		if step := m.execView.HumanStep(); step != "" {
+			return flake + " " + step
+		}
+	}
 	if st := m.stageSnapshot(); st.active() {
 		if line := renderStageStatus(st); line != "" {
 			return flake + " " + line

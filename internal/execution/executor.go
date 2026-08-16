@@ -374,8 +374,10 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 
 	// ── 5. Target-bound clarification ─────────────────────────────────
 	// A target-bound strategy whose target cannot be resolved stops before any
-	// invocation. Read-only strategies may run without a target set.
+	// invocation. Read-only strategies (and zero-context direct response) may
+	// run without a target set.
 	if len(targets) == 0 && profile.Strategy != strategy.TargetedReasoning &&
+		profile.Strategy != strategy.DirectResponse &&
 		profile.Strategy != strategy.MultiFilePlanning &&
 		profile.Strategy != strategy.RepositoryInvestigation {
 		res.ClarificationRequired = true
@@ -391,17 +393,25 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	}
 
 	// ── 6. Context compilation ─────────────────────────────────────────
-	contextChannels, contextTokens := x.compileContext(targets)
+	// The strategy owns the context contract: profile.ContextPolicy decides
+	// what crosses (zero for direct_response, target content for a targeted
+	// mutation, repository evidence for investigation). The generic compiler
+	// never decides.
+	contextChannels, contextTokens := x.compileContext(profile, targets)
 	x.emit(events.NewContextPrepared(requestID, contextChannels, contextTokens))
 	res.Proof.Graph = append(res.Proof.Graph, GraphStep{Stage: "context_prepared", State: "completed", Started: time.Now()})
 
-	// ── 7. Read-only strategies (targeted_reasoning / multi_file_planning /
-	// repository_investigation): one bounded invocation, content returned, no
-	// mutation path, no approval surface. ───────────────────────────────
+	// ── 7. Read-only strategies (targeted_reasoning / direct_response /
+	// multi_file_planning / repository_investigation): one bounded invocation,
+	// content returned, no mutation path, no approval surface. ─────────
+	//
+	// EVENT SEMANTICS (Phase 4): model.invoked is emitted BEFORE the provider
+	// call; provider.response is emitted ONLY after a successful response; and
+	// artifact.produced can never precede it. A failed invocation emits NO
+	// model.invoked, NO provider.response and NO artifact.produced — a failed
+	// execution must never emit a misleading success artifact.
 	if profile.Strategy != strategy.TargetedMutation {
-		content, inv, err := x.invokeReadOnly(ctx, req, profile, targets)
-		res.ModelCalls = append(res.ModelCalls, inv)
-		res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, inv)
+		content, inv, err := x.invokeReadOnly(ctx, req, requestID, profile, targets)
 		if err != nil {
 			res.Err = err
 			res.Proof.Outcome = OutcomeFailed
@@ -410,7 +420,8 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			x.emit(events.NewExecutionFinished(requestID, false, string(OutcomeFailed)))
 			return res, err
 		}
-		x.emit(events.NewModelInvoked(requestID, inv.Model, inv.TokenInput, inv.TokenOutput))
+		res.ModelCalls = append(res.ModelCalls, inv)
+		res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, inv)
 		res.ArtifactKind = artifactKindFor(profile)
 		res.Content = content
 		x.emit(events.NewArtifactProduced(requestID, res.ArtifactKind, firstTarget(targets)))
@@ -422,9 +433,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	}
 
 	// ── 7. Targeted mutation: model invocation ─────────────────────────
-	original, modified, raw, inv, err := x.invokeMutation(ctx, req, targets)
-	res.ModelCalls = append(res.ModelCalls, inv)
-	res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, inv)
+	original, modified, raw, inv, err := x.invokeMutation(ctx, req, requestID, targets)
 	if err != nil {
 		res.ArtifactKind = ""
 		res.Err = err
@@ -434,7 +443,8 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		x.emit(events.NewExecutionFinished(requestID, false, string(OutcomePatchGenerationFailed)))
 		return res, err
 	}
-	x.emit(events.NewModelInvoked(requestID, inv.Model, inv.TokenInput, inv.TokenOutput))
+	res.ModelCalls = append(res.ModelCalls, inv)
+	res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, inv)
 
 	// ── 8. Artifact production ─────────────────────────────────────────
 	target := targets[0]
@@ -655,11 +665,24 @@ func (x *RuntimeExecutor) selectStrategy(_ context.Context, req ExecuteRequest) 
 }
 
 // compileContext assembles the minimum-sufficient context envelope for the
-// target set: the bounded target content (owner: runtime). It returns the
-// context channel names and a token estimate. Provider usage is never
-// estimated here — this is context-accounting, not billing.
-func (x *RuntimeExecutor) compileContext(targets []string) (channels []string, tokens int) {
-	channels = append(channels, "user_intent", "explicit_targets", "target_content")
+// target set. The STRATEGY owns the context contract: profile.ContextPolicy
+// decides what may be read. A ContextPolicyNone strategy (direct_response /
+// casual chat) compiles ZERO channels and reads no file — no workspace scan,
+// no repository context. A target_file_only policy reads exactly the resolved
+// targets. A repository policy admits the wider evidence channels. Provider
+// usage is never estimated here — this is context-accounting, not billing.
+func (x *RuntimeExecutor) compileContext(profile strategy.ExecutionStrategyProfile, targets []string) (channels []string, tokens int) {
+	switch profile.Policy() {
+	case strategy.ContextPolicyNone:
+		// Zero context: no workspace scan, no file channels, no repository
+		// context. "hi" prepares nothing.
+		return nil, 0
+	case strategy.ContextPolicyRepository:
+		channels = append(channels, "user_intent", "explicit_targets", "target_content",
+			"dependency_evidence", "repository_constraints")
+	default: // target_file_only
+		channels = append(channels, "user_intent", "explicit_targets", "target_content")
+	}
 	var b strings.Builder
 	for _, t := range targets {
 		path := filepath.Join(x.root, t)
@@ -676,7 +699,7 @@ func (x *RuntimeExecutor) compileContext(targets []string) (channels []string, t
 	return channels, estimateTokens(b.String())
 }
 
-func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, targets []string) (original, modified, raw string, inv ModelInvocation, err error) {
+func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, requestID string, targets []string) (original, modified, raw string, inv ModelInvocation, err error) {
 	target := targets[0]
 	path := filepath.Join(x.root, target)
 	data, readErr := os.ReadFile(path)
@@ -701,6 +724,9 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		Messages:  []ai.Message{{Role: "user", Content: user}},
 		MaxTokens: req.MaxOutputTokens,
 	}
+	// model.invoked is emitted when the invocation BEGINS — before the provider
+	// call — so the event stream truthfully records the invocation start.
+	x.emit(events.NewModelInvoked(requestID, model, 0, 0))
 	resp, callErr := x.provider.Execute(ctx, aiReq)
 	if callErr != nil {
 		return original, "", "", inv, fmt.Errorf("executor: model invocation: %w", callErr)
@@ -716,6 +742,9 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		inv.TokenInput = resp.TokenInput
 		inv.TokenOutput = resp.TokenOutput
 	}
+	// provider.response is emitted ONLY on a successful response — the
+	// authoritative usage travels here. No artifact may precede it.
+	x.emit(events.NewProviderResponse(requestID, model, inv.TokenInput, inv.TokenOutput))
 
 	raw = strings.TrimSpace(resp.Content)
 	modified = ResolveModifiedContent(original, raw)
@@ -743,11 +772,14 @@ func (x *RuntimeExecutor) compileDiff(raw, target, original string) string {
 }
 
 // invokeReadOnly performs the single bounded provider invocation for read-only
-// strategies (targeted_reasoning, multi_file_planning,
+// strategies (targeted_reasoning, direct_response, multi_file_planning,
 // repository_investigation). It returns the produced content; no mutation path
-// and no approval surface exist. ProviderResponse → Artifact → ExecutionResult:
-// the response is owned by the runtime and never reaches the UI raw.
-func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest, profile strategy.ExecutionStrategyProfile, targets []string) (content string, inv ModelInvocation, err error) {
+// and no approval surface exist. Event semantics (Phase 4): model.invoked is
+// emitted before the provider call; provider.response is emitted only after a
+// successful response; a failure returns an error and emits neither — the
+// artifact can never precede the response that produced it. The response is
+// owned by the runtime and never reaches the UI raw.
+func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string) (content string, inv ModelInvocation, err error) {
 	if x.provider == nil {
 		return "", inv, fmt.Errorf("executor: no provider configured for read-only invocation")
 	}
@@ -783,6 +815,9 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		Messages:  []ai.Message{{Role: "user", Content: b.String()}},
 		MaxTokens: req.MaxOutputTokens,
 	}
+	// model.invoked is emitted when the invocation BEGINS — before the provider
+	// call — so the event stream truthfully records the invocation start.
+	x.emit(events.NewModelInvoked(requestID, model, 0, 0))
 	resp, callErr := x.provider.Execute(ctx, aiReq)
 	if callErr != nil {
 		return "", inv, fmt.Errorf("executor: read-only invocation: %w", callErr)
@@ -798,6 +833,9 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		inv.TokenInput = resp.TokenInput
 		inv.TokenOutput = resp.TokenOutput
 	}
+	// provider.response is emitted ONLY on a successful response — the
+	// authoritative usage travels here. No artifact may precede it.
+	x.emit(events.NewProviderResponse(requestID, model, inv.TokenInput, inv.TokenOutput))
 	return strings.TrimSpace(resp.Content), inv, nil
 }
 
@@ -809,6 +847,8 @@ func readOnlySystemPrompt(s strategy.ExecutionStrategy) string {
 		return "You are the repository investigation engine. Produce a root-cause analysis from the provided repository evidence. Be concrete and cite the evidence. Never modify files."
 	case strategy.MultiFilePlanning:
 		return "You are the execution planner. Produce a concrete, structured execution plan (files, tasks, rationale) for the requested change. Never modify files."
+	case strategy.DirectResponse:
+		return "You are IZEN. Answer the user's greeting or casual question directly and concisely. You are not an agent here — no files, no planning, no tooling."
 	default:
 		return "You are the understanding engine. Answer the user's question using only the provided context. Never modify files."
 	}
@@ -821,6 +861,8 @@ func artifactKindFor(profile strategy.ExecutionStrategyProfile) string {
 		return "investigation"
 	case strategy.MultiFilePlanning:
 		return "plan"
+	case strategy.DirectResponse:
+		return "response"
 	default:
 		return "explanation"
 	}

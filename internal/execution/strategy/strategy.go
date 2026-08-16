@@ -60,6 +60,12 @@ const (
 	// necessary, not because a mode existed.
 	MultiFilePlanning ExecutionStrategy = "multi_file_planning"
 
+	// DirectResponse is casual conversation / a greeting that is answered
+	// directly with a single bounded read-only invocation and ZERO repository
+	// context. It must never trigger workspace planning, never load repository
+	// context, and never scan the workspace: "hi" is not a coding task.
+	DirectResponse ExecutionStrategy = "direct_response"
+
 	// HumanClarification stops the runtime before any model invocation: target
 	// resolution is ambiguous or unresolved and the syntax clearly indicates a
 	// file target. The human is the authority; no file is read into a prompt
@@ -226,6 +232,33 @@ func (k ContextKind) Label() string {
 	return string(k)
 }
 
+// ContextPolicy is the STRATEGY-OWNED context contract. The strategy decides
+// the minimum sufficient context — never a generic compiler. It answers
+// "what may the runtime read before any model invocation?":
+//
+//	none             — zero context: no workspace scan, no repository context,
+//	                   no file channels (casual chat / direct response).
+//	target_file_only — exactly the resolved target file(s) and their content,
+//	                   nothing else (targeted mutation / reasoning).
+//	repository       — repository evidence: symbol graph, relevant files and
+//	                   dependency context (investigation / multi-file planning).
+type ContextPolicy string
+
+const (
+	// ContextPolicyNone is the zero-context policy. It forbids any workspace
+	// scan, any repository context and any file channel.
+	ContextPolicyNone ContextPolicy = "none"
+	// ContextPolicyTargetFileOnly confines context to the resolved target
+	// file(s) and their content.
+	ContextPolicyTargetFileOnly ContextPolicy = "target_file_only"
+	// ContextPolicyRepository admits repository evidence (symbol graph,
+	// relevant files, dependency context) before reasoning.
+	ContextPolicyRepository ContextPolicy = "repository"
+)
+
+// String returns the canonical context-policy name.
+func (p ContextPolicy) String() string { return string(p) }
+
 // ExecutionStrategyProfile is the observable, immutable record of the
 // engine-first decision for one operation. It is produced deterministically
 // BEFORE any model invocation and answers every "why" question about the
@@ -248,6 +281,11 @@ type ExecutionStrategyProfile struct {
 	Complexity Complexity
 	// ContextKinds is the minimum sufficient context channel set.
 	ContextKinds []ContextKind
+	// ContextPolicy is the strategy-owned context contract that governs what
+	// the runtime may read before any model invocation. The strategy decides
+	// the minimum sufficient context — the compiler never does. A zero value
+	// is normalized to ContextPolicyNone for zero-context strategies.
+	ContextPolicy ContextPolicy
 	// Artifact is the artifact contract the model must satisfy.
 	Artifact ArtifactContract
 	// ReasoningBudget is the thinking budget justified by complexity (0 = none).
@@ -294,6 +332,16 @@ func (p ExecutionStrategyProfile) HasContext(k ContextKind) bool {
 		}
 	}
 	return false
+}
+
+// Policy returns the effective context policy. The zero value normalizes to
+// ContextPolicyNone so a strategy that omits the policy is never accidentally
+// granted repository context.
+func (p ExecutionStrategyProfile) Policy() ContextPolicy {
+	if p.ContextPolicy == "" {
+		return ContextPolicyNone
+	}
+	return p.ContextPolicy
 }
 
 // HasUnresolvedTarget reports whether any target could not be resolved to an

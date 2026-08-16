@@ -86,6 +86,7 @@ const (
 	EventTargetResolved        = "execution.target.resolved"
 	EventContextPrepared       = "execution.context.prepared"
 	EventModelInvoked          = "execution.model.invoked"
+	EventProviderResponse      = "execution.provider.response"
 	EventArtifactProduced      = "execution.artifact.produced"
 	EventMutationStarted       = "execution.mutation.started"
 	EventMutationCompleted     = "execution.mutation.completed"
@@ -319,6 +320,17 @@ type ContextPreparedPayload struct {
 // ModelInvokedPayload records a single provider invocation. TokenInput/Output
 // are the authoritative provider-reported usage of the completed call.
 type ModelInvokedPayload struct {
+	RequestID   string
+	Model       string
+	TokenInput  int
+	TokenOutput int
+}
+
+// ProviderResponsePayload records a SUCCESSFUL provider response with the
+// authoritative usage the provider reported. It is emitted only after the
+// invocation returned without error — an artifact can never exist before this
+// event, and a failed invocation never emits it.
+type ProviderResponsePayload struct {
 	RequestID   string
 	Model       string
 	TokenInput  int
@@ -615,9 +627,18 @@ func NewContextPrepared(requestID string, channels []string, tokens int) DomainE
 	return newEvent(EventContextPrepared, ContextPreparedPayload{RequestID: requestID, Channels: channels, Tokens: tokens})
 }
 
-// NewModelInvoked publishes one provider invocation with its authoritative usage.
+// NewModelInvoked publishes that a provider invocation began with the resolved
+// model. It is emitted BEFORE the provider call; authoritative usage travels on
+// NewProviderResponse.
 func NewModelInvoked(requestID, model string, tokenInput, tokenOutput int) DomainEvent {
 	return newEvent(EventModelInvoked, ModelInvokedPayload{RequestID: requestID, Model: model, TokenInput: tokenInput, TokenOutput: tokenOutput})
+}
+
+// NewProviderResponse publishes a successful provider response with its
+// authoritative usage. It is emitted AFTER the invocation completes and MUST
+// precede any artifact.produced event of the same execution.
+func NewProviderResponse(requestID, model string, tokenInput, tokenOutput int) DomainEvent {
+	return newEvent(EventProviderResponse, ProviderResponsePayload{RequestID: requestID, Model: model, TokenInput: tokenInput, TokenOutput: tokenOutput})
 }
 
 // NewArtifactProduced publishes a parsed artifact from a model invocation.

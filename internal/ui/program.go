@@ -323,6 +323,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		events.EventTargetResolved,
 		events.EventContextPrepared,
 		events.EventModelInvoked,
+		events.EventProviderResponse,
 		events.EventArtifactProduced,
 		events.EventMutationStarted,
 		events.EventMutationCompleted,

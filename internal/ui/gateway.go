@@ -11,6 +11,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/presentation"
 )
 
 // ── Unified Intent Gateway bridge (execution-driven runtime) ───────────────
@@ -70,6 +71,12 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	m.executionResolving = true
 	m.agentRunning = true
 	m.agentLabel = "resolving execution"
+	// The single execution-view projection resets at dispatch. From here on
+	// the renderer derives the execution status ONLY from this projection's
+	// state, which handleDomainEvent advances from the canonical runtime
+	// events — the UI never invents execution truth.
+	m.execView = presentation.NewExecutionProjection()
+	m.execView.Begin(req.RequestID)
 
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

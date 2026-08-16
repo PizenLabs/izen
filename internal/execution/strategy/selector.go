@@ -99,6 +99,7 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 	if raw == "" {
 		profile.Strategy = HumanClarification
 		profile.StrategyReason = "empty request"
+		profile.ContextPolicy = ContextPolicyNone
 		return profile
 	}
 
@@ -129,6 +130,7 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 			profile.Complexity = Assess(ComplexityInputs{Operation: op, TargetCount: 1, FileCount: 1,
 				ExplicitTargets: true, VerificationDepth: 0})
 			profile.ContextKinds = []ContextKind{ContextUserIntent, ContextExplicitTargets, ContextArtifactContract}
+			profile.ContextPolicy = ContextPolicyTargetFileOnly
 			return profile
 		}
 	}
@@ -145,6 +147,7 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 		profile.StrategyReason = "file-target syntax used but no file target could be extracted; the human must name the exact target"
 		profile.Complexity = Assess(ComplexityInputs{Operation: op, Ambiguous: true})
 		profile.ContextKinds = []ContextKind{ContextUserIntent}
+		profile.ContextPolicy = ContextPolicyNone
 		profile.Escalation = true
 		profile.EscalationReason = "human clarification required before execution"
 		return profile
@@ -158,6 +161,7 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 			FileCount: len(explicit) + len(inferred), Ambiguous: true,
 			ExplicitTargets: len(explicit) > 0})
 		profile.ContextKinds = []ContextKind{ContextUserIntent}
+		profile.ContextPolicy = ContextPolicyNone
 		profile.Escalation = true
 		profile.EscalationReason = "human clarification required before execution"
 		return profile
@@ -174,6 +178,7 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 			FileCount: len(explicit) + len(inferred), Ambiguous: true,
 			ExplicitTargets: len(explicit) > 0})
 		profile.ContextKinds = []ContextKind{ContextUserIntent}
+		profile.ContextPolicy = ContextPolicyNone
 		profile.Escalation = true
 		profile.EscalationReason = "human clarification required before execution"
 		return profile
@@ -191,6 +196,7 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 			VerificationDepth: 1})
 		profile.ContextKinds = []ContextKind{ContextUserIntent, ContextPriorExecution,
 			ContextDependencyEvidence, ContextRepositoryConstraints}
+		profile.ContextPolicy = ContextPolicyRepository
 		return withBudgets(profile)
 	}
 
@@ -205,6 +211,7 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 			VerificationDepth: 2})
 		profile.ContextKinds = []ContextKind{ContextUserIntent, ContextDependencyEvidence,
 			ContextRepositoryConstraints}
+		profile.ContextPolicy = ContextPolicyRepository
 		return withBudgets(profile)
 	}
 
@@ -223,6 +230,7 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 			profile.Artifact = ArtifactContract{Kind: "explanation", Bounded: true,
 				Description: "focused explanation of the target"}
 			profile.ContextKinds = []ContextKind{ContextUserIntent, ContextExplicitTargets, ContextTargetContent}
+			profile.ContextPolicy = ContextPolicyTargetFileOnly
 			profile.Complexity = Assess(ComplexityInputs{Operation: op, TargetCount: len(named),
 				FileCount: len(named), ExplicitTargets: true})
 			return withBudgets(profile)
@@ -234,6 +242,7 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 			profile.Artifact = artifactForMutation(op, named, deps)
 			profile.ContextKinds = []ContextKind{ContextUserIntent, ContextExplicitTargets,
 				ContextTargetContent, ContextArtifactContract, ContextVerificationContract}
+			profile.ContextPolicy = ContextPolicyTargetFileOnly
 			profile.Complexity = Assess(ComplexityInputs{Operation: op, TargetCount: len(named),
 				FileCount: len(named), ExplicitTargets: true, VerificationDepth: verifyDepth(op)})
 			return withBudgets(profile)
@@ -249,6 +258,7 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 		profile.Artifact = artifactForMutation(op, inferred, deps)
 		profile.ContextKinds = []ContextKind{ContextUserIntent, ContextExplicitTargets,
 			ContextTargetContent, ContextArtifactContract, ContextVerificationContract}
+		profile.ContextPolicy = ContextPolicyTargetFileOnly
 		profile.Complexity = Assess(ComplexityInputs{Operation: op, TargetCount: len(inferred),
 			FileCount: len(inferred), VerificationDepth: verifyDepth(op)})
 		return withBudgets(profile)
@@ -257,19 +267,24 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 	// ── 6. Casual chat / direct greeting (never workspace planning) ────
 	// A greeting, small talk, or direct question that resolved no target and
 	// matched no coding operation is direct chat: exactly one bounded read-only
-	// invocation with zero repository evidence. It must NEVER expand into
+	// invocation with ZERO repository context. It must NEVER expand into
 	// repository-level planning — "hi" is not a planning request. This guard
 	// runs last so a stronger signal (create / clarify / diagnose / architect /
 	// explicit or inferred target) always wins.
+	//
+	// The strategy is DirectResponse with ContextPolicyNone: no workspace scan,
+	// no repository context, no file channels.
 	if gateway.IsCasualChat(raw) {
-		profile.Strategy = TargetedReasoning
+		profile.Strategy = DirectResponse
 		profile.ModelRequired = true
-		profile.StrategyReason = "casual greeting / direct chat; answered directly, no workspace planning"
+		profile.Intent = "casual_chat"
+		profile.StrategyReason = "casual greeting / direct chat; answered directly, zero repository context"
 		profile.ModelDecision = "answer the greeting or question directly"
-		profile.Artifact = ArtifactContract{Kind: "explanation", Bounded: true,
+		profile.Artifact = ArtifactContract{Kind: "response", Bounded: true,
 			Description: "direct chat reply"}
 		profile.Complexity = Assess(ComplexityInputs{Operation: OperationExplain, TargetCount: 0, FileCount: 0})
-		profile.ContextKinds = []ContextKind{ContextUserIntent}
+		profile.ContextKinds = nil
+		profile.ContextPolicy = ContextPolicyNone
 		return withBudgets(profile)
 	}
 
@@ -284,6 +299,7 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 		VerificationDepth: 2})
 	profile.ContextKinds = []ContextKind{ContextUserIntent, ContextRepositoryConstraints,
 		ContextDependencyEvidence}
+	profile.ContextPolicy = ContextPolicyRepository
 	return withBudgets(profile)
 }
 
@@ -604,6 +620,8 @@ func outputForArtifact(kind string, level ComplexityLevel) int {
 		return 2048
 	case "explanation":
 		return 1024
+	case "response":
+		return 512
 	default: // replace_block / replace_file
 		switch level {
 		case ComplexityLow:
