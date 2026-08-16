@@ -60,95 +60,76 @@ func initializedChatModel(t *testing.T) *model {
 	return m
 }
 
-// ── 1. $hot inside /build executes immediately ────────────────────────────
+// ── 1. $hot inside /build executes immediately through the gateway ─────────
 
 func TestPhase6HotInBuildExecutesImmediately(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
-
-	m := readyChatModel(newTestModel())
+	m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "x"}}}, nil)
 	m.resolver.Set(modes.ModeBuild)
 
 	cmd := m.handleInput("$hot add a README file @README.md")
 	if cmd == nil {
-		t.Fatal("$hot inside /build returned nil cmd — the directive must dispatch immediately")
+		t.Fatal("$hot inside /build returned nil cmd — the execution request must dispatch immediately")
 	}
 	if got := m.resolver.Current(); got != modes.ModeBuild {
-		t.Fatalf("mode = /%s, want /build (unchanged — /build is already the execution context)", got)
+		t.Fatalf("mode = /%s, want /build (unchanged)", got)
 	}
-	if m.activeOp == nil || m.activeOp.Kind != OpHotfix {
-		t.Fatalf("expected an active hotfix operation, got %+v", m.activeOp)
-	}
-	if !strings.Contains(recordsText(m), "[HOTFIX] Urgent hotfix:") {
-		t.Error("expected the hotfix pipeline to have started")
+	if !hasDispatchRecord(m, "Resolving your request...") {
+		t.Error("expected $hot to dispatch through the unified gateway")
 	}
 }
 
-// ── 2 + 3. $hot outside /build auto-enters /build and continues; no repeat ─
+// ── 2 + 3. $hot outside /build does NOT transition modes; single dispatch ──
 
-func TestPhase6HotOutsideBuildTransitionsAndContinues(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
-
+func TestPhase6HotOutsideBuildNoTransition(t *testing.T) {
 	for _, start := range []modes.Mode{modes.ModeAsk, modes.ModePlan, modes.ModeReview} {
-		m := readyChatModel(newTestModel())
+		m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "x"}}}, nil)
 		m.resolver.Set(start)
 
 		cmd := m.handleInput("$hot add a README file @README.md")
 		if cmd == nil {
-			t.Fatalf("from /%s: $hot returned nil cmd — continuous execution must dispatch", start)
+			t.Fatalf("from /%s: $hot returned nil cmd — execution request must dispatch", start)
 		}
-		// The transition happens internally; the directive continues in /build.
-		if got := m.resolver.Current(); got != modes.ModeBuild {
-			t.Fatalf("from /%s: mode = /%s, want /build after internal transition", start, got)
+		// Modes are presentation contexts: $hot must NOT auto-transition.
+		if got := m.resolver.Current(); got != start {
+			t.Fatalf("from /%s: mode = /%s, want /%s (no mode transition — the gateway decides the path)", start, got, start)
 		}
-		if m.activeOp == nil || m.activeOp.Kind != OpHotfix {
-			t.Fatalf("from /%s: expected an active hotfix operation", start)
-		}
-		// Test 3: no second /build — the pipeline ran from the single input.
-		if n := strings.Count(recordsText(m), "[HOTFIX] Urgent hotfix:"); n != 1 {
-			t.Fatalf("from /%s: hotfix dispatched %d times, want exactly 1 (single input → single execution)", start, n)
+		// Single dispatch: one input → one gateway execution.
+		if n := strings.Count(recordsText(m), "Resolving your request..."); n != 1 {
+			t.Fatalf("from /%s: $hot dispatched %d times, want exactly 1 (single input → single execution)", start, n)
 		}
 	}
 }
 
 // TestPhase6HotFromAskSingleDispatch guards test 14 (no duplicate dispatch):
-// the auto-transition + directive dispatch must yield exactly one execution
-// start, never a re-parse of the raw input through a second routing path.
+// a $hot action yields exactly one gateway execution, never a re-parse of the
+// raw input through a second routing path.
 func TestPhase6HotFromAskSingleDispatch(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
-
-	m := readyChatModel(newTestModel())
+	m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "x"}}}, nil)
 	m.resolver.Set(modes.ModeAsk)
 
 	m.handleInput("$hot add a LICENSE file @LICENSE")
 
-	if n := strings.Count(recordsText(m), "[HOTFIX] Urgent hotfix:"); n != 1 {
+	if n := strings.Count(recordsText(m), "Resolving your request..."); n != 1 {
 		t.Fatalf("hotfix dispatched %d times, want exactly 1", n)
-	}
-	if m.activeOp == nil {
-		t.Fatal("expected one active hotfix operation")
 	}
 }
 
-// ── 4. $prompt does not unnecessarily stop at a mode transition ───────────
+// ── 4. $prompt is an execution request, not a message command ──────────────
 
-func TestPhase6PromptTransitionsAndContinues(t *testing.T) {
-	m := readyChatModel(newTestModel())
+func TestPhase6PromptNoModeTransition(t *testing.T) {
+	m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "plan"}}}, nil)
 	m.resolver.Set(modes.ModeBuild)
 
 	cmd := m.handleInput("$prompt design a plugin architecture")
 	if cmd == nil {
-		t.Fatal("$prompt returned nil cmd — the /ask handoff must fire, not stop at the transition")
+		t.Fatal("$prompt returned nil cmd — the execution request must fire")
 	}
-	if got := m.resolver.Current(); got != modes.ModeAsk {
-		t.Fatalf("mode = /%s, want /ask after $prompt router", got)
+	// $prompt is an execution request: it must NOT transition to /ask.
+	if got := m.resolver.Current(); got != modes.ModeBuild {
+		t.Fatalf("mode = /%s, want /build (no transition — $prompt is an execution request)", got)
 	}
-	// The transition is NOT a dead end: the ask-handoff command continues the
-	// pipeline in the same turn.
-	if !strings.Contains(recordsText(m), "transitioning to /ask for structured analysis") {
-		t.Error("expected the mode transition notice alongside continued execution")
+	if !hasDispatchRecord(m, "Resolving your request...") {
+		t.Error("expected $prompt to dispatch through the unified gateway")
 	}
 }
 
@@ -238,27 +219,21 @@ func TestPhase6TestInBuildTransitionsToReview(t *testing.T) {
 // ── 7. A resolved target executes without unnecessary confirmation ────────
 
 func TestPhase6ResolvedTargetExecutesWithoutAmbiguityStop(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
-	if err := os.WriteFile("LICENSE", []byte("Copyright 2023\nAll rights reserved.\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	mock := &mockProvider{responses: []*ai.Response{{Content: "Copyright 2026\nAll rights reserved.\n", TokenOutput: 20}}}
-	m := readyChatModel(newTestModel())
-	m.provider = mock
+	m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "Copyright 2026\nAll rights reserved.\n"}}}, map[string]string{
+		"LICENSE": "Copyright 2023\nAll rights reserved.\n",
+	})
 	m.resolver.Set(modes.ModeBuild)
 
 	cmd := m.handleInput("$hot update the year to 2026 @LICENSE")
 	if cmd == nil {
 		t.Fatal("$hot with a resolved target returned nil cmd")
 	}
-	// No ambiguity stop: the operation began executing immediately.
+	// No ambiguity stop: the execution request dispatched immediately.
 	if m.state == StateHotfixAmbiguous {
 		t.Fatal("a resolved target must not enter the ambiguity card")
 	}
-	if m.activeOp == nil || m.activeOp.Kind != OpHotfix {
-		t.Fatalf("expected an active hotfix operation for a resolved target")
+	if !hasDispatchRecord(m, "Resolving your request...") {
+		t.Error("expected $hot to dispatch through the unified gateway")
 	}
 }
 
@@ -397,12 +372,10 @@ func TestPhase6CancelledOperationNotResumable(t *testing.T) {
 // ── 13. The next command is accepted immediately after a terminal state ───
 
 func TestPhase6NextCommandAcceptedAfterTerminalState(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
+	m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "x"}}}, nil)
+	m.resolver.Set(modes.ModeBuild)
 
 	// Terminal state: a hotfix apply completed → StateChat, input focused.
-	m := readyChatModel(newTestModel())
-	m.resolver.Set(modes.ModeBuild)
 	m.Update(buildResultMsg{output: "applied", exitCode: 0})
 
 	if m.state != StateChat {
@@ -415,7 +388,7 @@ func TestPhase6NextCommandAcceptedAfterTerminalState(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("the next command after a terminal state must dispatch immediately")
 	}
-	if !strings.Contains(recordsText(m2), "[HOTFIX] Urgent hotfix:") {
+	if !hasDispatchRecord(m2, "Resolving your request...") {
 		t.Error("the next command did not execute after the terminal state")
 	}
 }
@@ -423,27 +396,39 @@ func TestPhase6NextCommandAcceptedAfterTerminalState(t *testing.T) {
 // ── 14 + 15. No duplicate dispatch; one action → one ownership ────────────
 
 func TestPhase6OneActionOneOwnership(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
+	m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "x"}}}, map[string]string{
+		"LICENSE": "Copyright 2023\nAll rights reserved.\n",
+	})
+	m.resolver.Set(modes.ModeBuild)
 
-	m := readyChatModel(newTestModel())
-	m.resolver.Set(modes.ModeAsk)
-
-	m.handleInput("$hot add a LICENSE file @LICENSE")
-
-	// Exactly one active operation, of exactly one kind — a single user action
-	// owns a single execution.
-	if m.activeOp == nil {
-		t.Fatal("expected exactly one active operation")
+	// Dispatch the execution request, run it through the runtime, and project
+	// the approval-gate result — the operation begins at the proposal terminal,
+	// owned by exactly one OpHotfix.
+	cmd := m.handleInput("$hot add a LICENSE file @LICENSE")
+	if cmd == nil {
+		t.Fatal("$hot dispatch returned nil cmd")
 	}
-	if m.activeOp.Kind != OpHotfix {
-		t.Fatalf("operation kind = %s, want hotfix", m.activeOp.Kind)
+	msg := cmd()
+	gem, ok := msg.(gatedExecutionMsg)
+	if !ok {
+		t.Fatalf("got %T, want gatedExecutionMsg", msg)
+	}
+	if gem.err != nil {
+		t.Fatalf("gate err: %v", gem.err)
+	}
+	if gem.res == nil {
+		t.Fatal("nil gate result")
+	}
+	res, _ := m.executionResultUpdate(executionResultMsg{res: gem.res})
+	m2 := res.(*model)
+	if m2.activeOp == nil || m2.activeOp.Kind != OpHotfix {
+		t.Fatalf("expected exactly one hotfix operation at the proposal terminal, got %+v", m2.activeOp)
 	}
 	// The ownership is exclusive: beginning a new operation supersedes any
 	// prior one (never accumulates workers).
-	before := m.activeOp.ID
-	m.beginOperation(OpHotfix)
-	if m.activeOp == nil || m.activeOp.ID == before {
+	before := m2.activeOp.ID
+	m2.beginOperation(OpHotfix)
+	if m2.activeOp == nil || m2.activeOp.ID == before {
 		t.Fatal("a new user action must own a fresh operation, not reuse the previous one")
 	}
 }

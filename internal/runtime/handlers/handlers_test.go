@@ -102,8 +102,11 @@ func TestSubmitPromptHandler_ExplicitModeRoutesPhase(t *testing.T) {
 	if !hasType(c, events.EventIntentParsed) {
 		t.Fatalf("expected EventIntentParsed, got %+v", c.snapshot())
 	}
-	if !hasType(c, events.EventPlanStaged) {
-		t.Fatalf("expected EventPlanStaged, got %+v", c.snapshot())
+	// The fake plan staging was removed (Rule 3: no fake states). The handler
+	// must NOT emit EventPlanStaged — a staged plan only exists when a real
+	// plan engine produced one.
+	if hasType(c, events.EventPlanStaged) {
+		t.Fatalf("expected no EventPlanStaged, got %+v", c.snapshot())
 	}
 	if !hasType(c, events.EventStageCompleted) {
 		t.Fatalf("expected EventStageCompleted, got %+v", c.snapshot())
@@ -147,12 +150,23 @@ func TestApprovePatchHandler_EmitsApplied(t *testing.T) {
 
 func TestRejectPatchHandler_EmitsRejected(t *testing.T) {
 	deps, c := newDeps()
+	deps.Approver.(*InMemoryApprover).Register("p2", ApprovalResult{File: "a.go", LinesAdd: 0, LinesDel: 0})
 	h := New(deps).Reject()
 	if err := h.Handle(context.Background(), runtime.RejectPatchCmd{PatchID: "p2", Reason: "too risky"}); err != nil {
 		t.Fatalf("Reject: %v", err)
 	}
 	if !hasType(c, events.EventPatchRejected) {
 		t.Fatalf("expected EventPatchRejected, got %+v", c.snapshot())
+	}
+}
+
+func TestRejectPatchHandler_NoFakeRecord(t *testing.T) {
+	// Rule 3: rejecting an approval with no registered record and no executor
+	// must fail deterministically — never fabricate a mutation outcome.
+	deps, _ := newDeps()
+	h := New(deps).Reject()
+	if err := h.Handle(context.Background(), runtime.RejectPatchCmd{PatchID: "unknown", Reason: "x"}); err == nil {
+		t.Fatal("Reject of unknown patch without authority should fail")
 	}
 }
 
@@ -235,15 +249,6 @@ func TestClassifyIntent(t *testing.T) {
 		if conf <= 0 || conf > 1 {
 			t.Errorf("ClassifyIntent confidence out of range: %f", conf)
 		}
-	}
-}
-
-func TestExtractTasks(t *testing.T) {
-	if got := ExtractTasks("a\nb\n\nc"); len(got) != 3 {
-		t.Fatalf("ExtractTasks = %v, want 3 tasks", got)
-	}
-	if got := ExtractTasks("single"); len(got) != 1 || got[0] != "single" {
-		t.Fatalf("ExtractTasks = %v, want [single]", got)
 	}
 }
 

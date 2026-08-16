@@ -247,11 +247,11 @@ func (m *model) handleInput(line string) tea.Cmd {
 
 	// Directive- and global-bearing intents (including the /review $test
 	// composite and the $prompt /ask router) are dispatched structurally from
-	// the AST: workspace transition first, then commands, then directives.
-	// Bare workspace switches and free-form goals fall through to the legacy
-	// string routing below, which already handles them.
+	// the AST: explicit workspace transition first, then commands, then
+	// directives. Bare workspace switches and free-form goals fall through to
+	// the legacy string routing below, which already handles them.
 	if len(ast.Directives) > 0 || len(ast.GlobalCommands) > 0 {
-		return m.dispatchASTIntent(ast)
+		return m.dispatchASTIntent(ast, line)
 	}
 
 	if mode, content, ok := parseModeShorthand(line); ok {
@@ -345,41 +345,14 @@ func (m *model) handleInput(line string) tea.Cmd {
 	m.sess.AddMessage("user", line, 5)
 	_ = m.sess.Save()
 
-	// ── HYBRID INTENT GATEWAY ────────────────────────────────────────
-	// Free-form input (no explicit mode shorthand, no command, no shell) goes
-	// through the Hybrid Intent Gateway: the deterministic fast path first, then
-	// the semantic IntentClassifier when no deterministic signal matches. The
-	// classified intent is projected onto the current phase (auto mode switch),
-	// or — at low confidence (ConfirmationRequirement) — surfaced as an
-	// interactive mode-selection prompt instead of acting on a blind guess.
-	// The route runs async because the semantic fallback may invoke the LLM.
-	//
-	// ── /ask MODE LOCK: Direct Read-Only Chat boundary ───────────────
-	// /ask is a strict read-only chat boundary. The ONLY valid sub-prompt
-	// is $prompt (handled above). Free-form input in /ask MUST NEVER route
-	// through the intent classifier — the classifier can misclassify natural
-	// questions as /plan, /investigate, or /build and auto-switch modes,
-	// violating the Direct Chat contract. Bypass the router entirely.
-	if m.intentRouter != nil && m.resolver.Current() != modes.ModeAsk {
-		return m.routeFreeInput(line)
-	}
-
-	return m.handleMessageContent(line)
-}
-
-// routeFreeInput dispatches a free-form prompt through the Hybrid Intent
-// Gateway off the Bubble Tea event loop. The router runs the deterministic
-// fast path first and only falls back to the semantic classifier; both are
-// cheap enough to run inside the returned command's goroutine. The result is
-// delivered back as a routerResultMsg for the Update loop to project.
-func (m *model) routeFreeInput(line string) tea.Cmd {
-	r := m.intentRouter
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		res, err := r.Route(ctx, line)
-		return routerResultMsg{line: line, result: res, err: err}
-	}
+	// ── UNIFIED INTENT GATEWAY (execution-driven runtime) ──────────────
+	// Every remaining execution-bearing input — bare text, $prompt, $hot —
+	// produces an ExecuteRequest through the unified IntentGateway. The
+	// runtime (RuntimeExecutor) decides the execution path via unconditional
+	// Strategy.Select: never the UI, never a mode transition, never a hidden
+	// /build invocation. The UI renders the canonical runtime events and the
+	// returned result.
+	return m.runGatedLine(line)
 }
 
 func (m *model) handleMessageContent(line string) tea.Cmd {
@@ -408,14 +381,12 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 
 	content := strings.TrimSpace(line)
 
-	// ── $hot FAST-TRACK ─────────────────────────────────────────────────
-	// Any message starting with $hot bypasses ALL plan generation and
-	// diagnostic loops, routing directly to the /build engine for instant
-	// execution. Also strip the $hot prefix before passing to build.
-	if strings.HasPrefix(strings.TrimSpace(content), "$hot") {
-		hotContent := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(content), "$hot"))
-		return m.runBuildCmd(hotContent)
-	}
+	// ── $hot routes EXCLUSIVELY through the unified IntentGateway ────
+	// $hot is an execution directive: the AST parser classifies it and
+	// dispatchDirectives routes it through runHotExecution → runGatedLine
+	// (IntentGateway.Gate → RuntimeExecutor.Execute). There is NO legacy
+	// provider-path branch here — the runtime owns every $hot execution and the
+	// UI only submits the request and projects the events.
 
 	if m.resolver.Current() == modes.ModeBuild && m.graph != nil {
 		compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.ObjectiveIntent())
@@ -3103,6 +3074,17 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 		return nil
 	}
 
+	// ── STRATEGY GRAPH LIFECYCLE (Phase 11) ─────────────────────────
+	// A plain $hot (not engine-first $prompt branded) is a direct mutation
+	// executor outside the strategy layer: it must not record into a stale
+	// execution graph left by an earlier $prompt. The graph is cleared here so
+	// every $hot executes with its own (nil) strategy surface and $inspect
+	// stays truthful. $prompt-targeted mutations set hotfixBranding to "PROMPT"
+	// before calling this, so their graph survives to the apply terminal.
+	if m.hotfixBranding != "PROMPT" {
+		m.lastStrategyGraph = nil
+	}
+
 	// Guard: must be in /build mode.
 	if m.resolver.Current() != modes.ModeBuild {
 		m.push(roleError, "$hot is only available in /build mode")
@@ -3118,7 +3100,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	targets, hardErr, ambiguous := resolveMultiHotfixTargets(prompt)
 	if hardErr != "" {
 		m.hotfixActive = false
-		m.push(roleError, "[HOTFIX] "+hardErr)
+		m.push(roleError, "["+m.hotfixBrandingLabel()+"] "+hardErr)
 		m.push(roleSystem, infoStyle.Render("No files were modified."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -3126,7 +3108,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	}
 	if ambiguous {
 		m.hotfixActive = false
-		m.push(roleError, "[HOTFIX] Multi-file target is ambiguous. Name explicit @file targets, e.g. \"$hot fix @a.html and @b.html\".")
+		m.push(roleError, "["+m.hotfixBrandingLabel()+"] Multi-file target is ambiguous. Name explicit @file targets, e.g. \"$hot fix @a.html and @b.html\".")
 		m.push(roleSystem, infoStyle.Render("No model call was made and no files were modified."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -3140,7 +3122,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	hasTasks := len(m.sess.CurrentTasks) > 0
 	if hasTasks {
 		if err := m.stashPlan(); err != nil {
-			m.push(roleError, fmt.Sprintf("[HOTFIX] Failed to stash current plan: %v", err))
+			m.push(roleError, fmt.Sprintf("[%s] Failed to stash current plan: %v", m.hotfixBrandingLabel(), err))
 			m.refreshViewportContent()
 			m.Viewport.GotoBottom()
 			return nil
@@ -3154,7 +3136,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	m.hotfixActive = true
 
 	// Stage 4: Create a single ad-hoc FILE_MUTATE task.
-	m.push(roleStatus, fmt.Sprintf("[HOTFIX] Urgent hotfix: %s", prompt))
+	m.push(roleStatus, fmt.Sprintf("[%s] Urgent hotfix: %s", m.hotfixBrandingLabel(), prompt))
 
 	// ── DYNAMIC TARGET RESOLUTION ─────────────────────────────────────
 	// Extract the real target file path from the developer's request.
@@ -3203,7 +3185,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 			m.sess.StageTaskList(&stashedTasks)
 			_ = m.sess.Save()
 		}
-		m.push(roleStatus, "[HOTFIX] Target is ambiguous. No model call was made and no files were modified.")
+		m.push(roleStatus, "["+m.hotfixBrandingLabel()+"] Target is ambiguous. No model call was made and no files were modified.")
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return tea.Batch(
@@ -3229,7 +3211,7 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	// The "Invoking provider" line is emitted ONLY here, i.e. after the
 	// ambiguity gate has already passed — it is truthful by construction.
 	m.beginOperation(OpHotfix)
-	m.push(roleStatus, "[HOTFIX] Generating patch (local short-circuit for simple modifications)...")
+	m.push(roleStatus, "["+m.hotfixBrandingLabel()+"] Generating patch (local short-circuit for simple modifications)...")
 	m.push(roleSystem, fmt.Sprintf("  ⚙ Invoking %s...", m.activeRouteModel()))
 
 	m.agentRunning = true
@@ -3816,7 +3798,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 			Model:     m.activeRouteModel(),
 			System:    system,
 			Stream:    false,
-			MaxTokens: 2048,
+			MaxTokens: m.hotfixOutputBudget(),
 			Messages:  []ai.Message{{Role: "user", Content: handoff}},
 			Reasoning: m.effortFromTasks(),
 		}
@@ -3881,14 +3863,14 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 		if len(resp.ToolCalls) == 0 && responseEffectivelyEmpty(resp) {
 			if isCloud {
 				m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
-					"[HOTFIX] Model returned a truncated response (%d tokens). Retrying with a non-streaming request...",
-					responseTokenEstimate(resp))))
+					"[%s] Model returned a truncated response (%d tokens). Retrying with a non-streaming request...",
+					m.hotfixBrandingLabel(), responseTokenEstimate(resp))))
 			}
 			retryReq := ai.Request{
 				Model:     m.activeRouteModel(),
 				System:    hotfixSystemPrompt(contract),
 				Stream:    false,
-				MaxTokens: 2048,
+				MaxTokens: m.hotfixOutputBudget(),
 				Messages:  []ai.Message{{Role: "user", Content: buildHotfixFallbackHandoff(task, orig, contract, tgt)}},
 				Reasoning: m.effortFromTasks(),
 			}
@@ -3959,7 +3941,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 				emptyTokens = responseTokenEstimate(resp)
 			}
 			if isCloud {
-				m.push(roleSystem, infoStyle.Render("[HOTFIX] Provider returned an empty/truncated response. Trying local fallback..."))
+				m.push(roleSystem, infoStyle.Render("["+m.hotfixBrandingLabel()+"] Provider returned an empty/truncated response. Trying local fallback..."))
 			}
 			if orig != "" {
 				if modified, ok := execution.ApplyFuzzyStringReplace(orig, task.Description, task.Target); ok {
@@ -6486,6 +6468,7 @@ func (m *model) cancelStaleAgentOps() {
 	m.agentRunning = false
 	m.agentDone = false
 	m.agentLabel = ""
+	m.executionResolving = false
 	m.lastActionTime = time.Time{}
 	m.spinnerFrame = 0
 
@@ -6696,6 +6679,10 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 
 	case mode == modes.ModeBuild && (strings.HasPrefix(action, "hot ") || action == "hot"):
 		rest := strings.TrimSpace(strings.TrimPrefix(action, "hot"))
+		// A $hot always labels the bounded executor as HOTFIX — it can never
+		// inherit a stale PROMPT label from an earlier engine-first $prompt
+		// mutation that aborted before a terminal message.
+		m.hotfixBranding = ""
 		// handleHotfixCmd handles its own state and returns an appropriate cmd.
 		cmd = m.handleHotfixCmd(rest)
 
@@ -7010,84 +6997,6 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 			m.currentResult = failureResult(diagnosis)
 
 			return agentDoneMsg{}
-		},
-	)
-}
-
-// runAskPromptHandoffCmd passes the user's raw architectural idea directly to
-// the ask handoff for refinement. No session history aggregation — the raw
-// input IS the payload.
-//
-// ISOLATION CONTRACT — This function is called STRICTLY from handleInput when
-// the user types "$prompt <raw_idea>" in /ask mode. It uses its own system
-// prompt (AskPromptHandoffSystemPrompt) and a non-streaming provider call that
-// NEVER touches the normal chat session history (no AddMessage, no sess.Save).
-// Normal chat continues to use AskContract() via the streamCmd path with zero
-// contamination.
-func (m *model) runAskPromptHandoffCmd(rawInput string) tea.Cmd {
-	return tea.Batch(
-		func() tea.Msg {
-			return agentStartMsg{label: "refining architectural idea"}
-		},
-		m.smoothStreamTickCmd(),
-		func() tea.Msg {
-			if m.provider == nil {
-				m.push(roleError, "[System Error] No AI provider is configured. Run /model to select one.")
-				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
-				return agentDoneMsg{}
-			}
-
-			uname := m.cfg.Username
-			if uname == "" {
-				uname = m.userName
-			}
-			systemPrompt := prompt.AskPromptHandoffSystemPrompt(uname)
-
-			req := ai.Request{
-				Model: m.routeModel("ask"),
-				Messages: []ai.Message{
-					{Role: "user", Content: rawInput},
-				},
-				Stream: false,
-				System: systemPrompt,
-			}
-
-			// The $prompt refinement is bounded by the operation context +
-			// generation deadline so a hung provider can never freeze the spinner.
-			ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
-			resp, err := m.provider.Execute(ctx, req)
-			cancel()
-			if err != nil {
-				return promptHandoffMsg{err: fmt.Errorf("prompt synthesis failed: %w", err)}
-			}
-
-			var content string
-			if resp != nil {
-				content = strings.TrimSpace(resp.Content)
-			}
-
-			if content == "" {
-				return promptHandoffMsg{err: fmt.Errorf("prompt synthesis returned empty response")}
-			}
-
-			// The FollowUp action chip is delivered via the promptHandoffMsg.actions
-			// field and rendered as an interactive terminal component by the
-			// promptHandoffMsg handler in update.go — never embedded in the
-			// markdown body.
-			followUpAction := []Action{
-				{
-					ID:       "ask-prompt-handoff-investigate",
-					Label:    "Forward to /investigate for deep-dive forensic analysis",
-					Shortcut: "alt+f",
-					Command:  "/mode investigate",
-					Query:    content,
-					Enabled:  true,
-					Priority: 100,
-				},
-			}
-
-			return promptHandoffMsg{content: content, actions: followUpAction}
 		},
 	)
 }

@@ -2,15 +2,11 @@ package ui
 
 import (
 	"errors"
-	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/PizenLabs/izen/internal/command"
-	"github.com/PizenLabs/izen/internal/gateway"
 	"github.com/PizenLabs/izen/internal/modes"
-	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/parser"
 	cmdreg "github.com/PizenLabs/izen/pkg/domain/command"
 )
@@ -42,11 +38,23 @@ func (m *model) intentFromInput(line string) (*parser.IntentAST, error) {
 	if !errors.As(err, &pe) || pe.Kind != parser.ErrPermissionDenied || pe.Marker != cmdreg.MarkerDollar {
 		return nil, err
 	}
-	// An explicit /workspace marker overrides any auto-transition: the user
-	// declared the context, so its permission boundary is authoritative.
+	// An explicit /workspace marker overrides any fallback: the user declared
+	// the context, so its permission boundary is authoritative.
 	if _, explicit := workspaceFromInput(line, cmdreg.Default()); explicit {
 		return nil, err
 	}
+	// Execution directives ($prompt/$hot) are EXECUTION REQUESTS resolved by
+	// the runtime, never by the presentation mode: re-parse in the permissive
+	// execution workspace WITHOUT any mode alignment.
+	if pe.Name == "prompt" || pe.Name == "hot" {
+		ast, retryErr := parser.ParseInWorkspace(line, cmdreg.Default(), cmdreg.WorkspaceBuild)
+		if retryErr != nil {
+			return nil, err
+		}
+		return ast, nil
+	}
+	// Legacy mode-scoped directives ($test/$fix/...) keep their continuous
+	// execution alignment: re-parse in the directive's execution workspace.
 	mode, ok := executionModeForDirective(pe.Name)
 	if !ok || directiveWorksIn(pe.Name, m.resolver.Current()) {
 		return nil, err
@@ -59,14 +67,12 @@ func (m *model) intentFromInput(line string) (*parser.IntentAST, error) {
 }
 
 // alignDirectiveContext performs the continuous-execution mode alignment for a
-// successfully parsed intent: when the intent carries directives and the
+// successfully parsed intent carrying legacy mode-scoped directives: when the
 // active mode is not a native context for any of them, the AST's workspace is
-// re-resolved to the single unambiguous execution context the directives
-// share (directive_contract.go). dispatchASTIntent then performs the internal
-// mode transition and execution continues — the user never repeats the mode
-// command. An explicit /workspace marker in the line is always authoritative
-// and prevents any alignment; directives with conflicting execution contexts
-// (e.g. "$test $env" from one mode) are left untouched.
+// re-resolved to the single unambiguous execution context the directives share.
+// Execution directives ($prompt/$hot) NEVER align — they are resolved by the
+// runtime. An explicit /workspace marker in the line is always authoritative
+// and prevents any alignment.
 func (m *model) alignDirectiveContext(ast *parser.IntentAST, line string) *parser.IntentAST {
 	if len(ast.Directives) == 0 {
 		return ast
@@ -78,6 +84,10 @@ func (m *model) alignDirectiveContext(ast *parser.IntentAST, line string) *parse
 	target := modes.ModeAsk
 	found := false
 	for _, d := range ast.Directives {
+		if d.Name == "prompt" || d.Name == "hot" {
+			// Execution directives never align to a mode.
+			continue
+		}
 		if directiveWorksIn(d.Name, current) {
 			// At least one directive dispatches natively here: the mode is a
 			// valid execution context — do not force a transition.
@@ -93,8 +103,6 @@ func (m *model) alignDirectiveContext(ast *parser.IntentAST, line string) *parse
 			continue
 		}
 		if mode != target {
-			// Conflicting execution contexts: leave routing to the legacy
-			// mode-scoped handler rather than guessing.
 			return ast
 		}
 	}
@@ -104,44 +112,53 @@ func (m *model) alignDirectiveContext(ast *parser.IntentAST, line string) *parse
 	return ast
 }
 
-// dispatchASTIntent executes a parsed IntentAST through the active executor.
-// It is the structured dispatch seam of the parser pipeline:
+// hasExecutionDirective reports whether the intent carries an execution
+// directive ($prompt/$hot) that the runtime resolves.
+func hasExecutionDirective(ast *parser.IntentAST) bool {
+	for _, d := range ast.Directives {
+		if d.Name == "prompt" || d.Name == "hot" {
+			return true
+		}
+	}
+	return false
+}
+
+// dispatchASTIntent executes a parsed IntentAST through the execution gateway
+// and the system command handler. It is the structured dispatch seam of the
+// parser pipeline:
 //
-//  1. Workspace transition first: when the AST's effective workspace differs
-//     from the active session mode, the mode is switched BEFORE any directive
-//     or global command runs. The user explicitly typed the /workspace marker,
-//     so the switch is authorized regardless of the plan-approval gate.
+//  1. Workspace transition for an explicit /workspace marker OR legacy
+//     directive alignment — NEVER for an execution directive ($prompt/$hot).
+//     Modes are presentation contexts only; the unified gateway + RuntimeExecutor
+//     decide the execution path.
 //  2. Global commands (/undo, /help, …) dispatch through the system command
 //     handler.
-//  3. Directives ($hot, $test, $prompt, …) dispatch through the mode-scoped
-//     directive handlers, with $prompt routed to the /ask refinement router.
-//
-// The AST was already permission-validated by parser.ParseInWorkspace, so no
-// re-validation occurs here.
-func (m *model) dispatchASTIntent(ast *parser.IntentAST) tea.Cmd {
+//  3. Directives dispatch through the execution gateway or the mode-scoped
+//     legacy handlers.
+func (m *model) dispatchASTIntent(ast *parser.IntentAST, line string) tea.Cmd {
 	var cmds []tea.Cmd
 
-	// ── 1. WORKSPACE TRANSITION (BEFORE directives/globals) ──────────────
+	// ── 1. WORKSPACE TRANSITION (presentation only, never for execution) ──
 	target := modeForWorkspace(ast.Workspace)
 	if target != m.resolver.Current() {
-		// CONTINUOUS $fix: the auto-transition's HANDOFF SANITIZER clears the
-		// transient test context (lastTestOutput) — exactly the payload $fix
-		// consumes. A $fix directive typed outside /build must not lose that
-		// context to the transition it performed internally: preserve it for
-		// the directive dispatch that follows. When no test ran before, the
-		// preserved empty value still yields the truthful "run $test first"
-		// notice — never a silent dead-end.
-		var savedOut, savedTarget string
-		savedFailed := m.lastTestFailed
-		if hasDirective(ast, "fix") {
-			savedOut, savedTarget = m.lastTestOutput, m.lastTestTarget
+		_, explicit := workspaceFromInput(line, cmdreg.Default())
+		// Execution directives never transition the mode — the runtime decides
+		// the path. Explicit markers and legacy directive alignment do.
+		if !hasExecutionDirective(ast) || explicit {
+			// CONTINUOUS $fix: preserve the transient test context across the
+			// internal transition so $fix still consumes lastTestOutput.
+			var savedOut, savedTarget string
+			savedFailed := m.lastTestFailed
+			if hasDirective(ast, "fix") {
+				savedOut, savedTarget = m.lastTestOutput, m.lastTestTarget
+			}
+			m.modeChangeAuthorized = true
+			m.setMode(target)
+			if hasDirective(ast, "fix") {
+				m.lastTestOutput, m.lastTestTarget, m.lastTestFailed = savedOut, savedTarget, savedFailed
+			}
+			cmds = append(cmds, m.runtimeSwitchCmd(target))
 		}
-		m.modeChangeAuthorized = true
-		m.setMode(target)
-		if hasDirective(ast, "fix") {
-			m.lastTestOutput, m.lastTestTarget, m.lastTestFailed = savedOut, savedTarget, savedFailed
-		}
-		cmds = append(cmds, m.runtimeSwitchCmd(target))
 	}
 
 	// ── COMPOSITE: /review $test ───────────────────────────────────────
@@ -167,16 +184,20 @@ func (m *model) dispatchASTIntent(ast *parser.IntentAST) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// dispatchDirectives routes the AST's $ directives through the mode-scoped
-// directive handlers. Directives are dispatched together as a single chained
-// line so multi-directive quick-chaining (/build$hot$test …) routes through
-// the same mode-specific handler the bare $ syntax uses. The $prompt directive
-// is special-cased: it is the global /ask router, not a mode-scoped action.
+// dispatchDirectives routes the AST's $ directives through the execution
+// gateway or the mode-scoped directive handlers. Execution directives
+// ($prompt, $hot) are EXECUTION REQUESTS: they cross the unified IntentGateway
+// (unconditional Strategy.Select → ExecuteRequest) and never route by mode. The
+// remaining mode-scoped directives ($test, $fix, ...) keep their legacy
+// handlers.
 func (m *model) dispatchDirectives(ast *parser.IntentAST) tea.Cmd {
 	tail := directiveTail(ast)
 	for _, d := range ast.Directives {
-		if d.Name == "prompt" {
+		switch d.Name {
+		case "prompt":
 			return m.routePromptDirective(tail)
+		case "hot":
+			return m.runHotExecution(tail)
 		}
 	}
 
@@ -227,124 +248,12 @@ func hasDirective(ast *parser.IntentAST, name string) bool {
 	return false
 }
 
-// routePromptDirective implements the $prompt global router: a raw idea is
-// refined into a structured /ask handoff. From ANY active mode it transitions
-// cleanly to /ask, injecting the query as /ask input. It NEVER executes
-// /build, /review, /plan, or /investigate logic inside the originating mode —
-// the only allowed action is the transition to /ask. It is shared by the
-// bare $prompt syntax and the AST-directive dispatch seam.
+// routePromptDirective implements the $prompt execution directive. A $prompt is
+// an EXECUTION REQUEST — not a message command. It crosses the unified
+// IntentGateway, which selects the strategy deterministically (Strategy.Select
+// unconditional) and produces an ExecuteRequest. The runtime decides the
+// execution path; the UI never routes by mode, never triggers a hidden /build,
+// and never invokes a provider here.
 func (m *model) routePromptDirective(rawInput string) tea.Cmd {
-	m.cancelStaleAgentOps()
-	rawInput = strings.TrimSpace(rawInput)
-	if rawInput == "" {
-		m.push(roleError, "[Usage] $prompt <your raw architectural idea or description>")
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return nil
-	}
-
-	// ── COMPRESSOR FAST-TRACK ──────────────────────────────────────────
-	// Check the prompt compressor first. If it signals a direct mutation
-	// (BypassInvest=true) with a target file, skip ALL Architect prompts, skip
-	// /investigate mode routing entirely, and route directly to BUILD with a
-	// staged FILE_MUTATE task.
-	if compressed := gateway.CompressPrompt(rawInput); compressed != nil && compressed.BypassInvest && compressed.Target != "" {
-		m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected by compressor. Bypassing architect analysis."))
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		targets := gateway.ExtractDirectMutationTargets(rawInput)
-		if len(targets) > 1 {
-			var tasks []plan.Task
-			for i, f := range targets {
-				tasks = append(tasks, plan.Task{
-					StepNum: i + 1,
-
-					Status:      "idle",
-					Type:        "FILE_MUTATE",
-					Target:      f,
-					Description: rawInput,
-					Rationale:   fmt.Sprintf("Fast-Track multi-file decomposition: target %d of %d", i+1, len(targets)),
-					IsHardcoded: true,
-				})
-			}
-			return func() tea.Msg {
-				return planResultMsg{
-					Tasks:       tasks,
-					IsFastTrack: true,
-				}
-			}
-		}
-		target := command.FallbackPlanTarget{
-			File:        compressed.Target,
-			Description: rawInput,
-			TaskType:    "FILE_MUTATE",
-		}
-		tasks := command.GenerateFallbackPlan(target)
-		return func() tea.Msg {
-			return planResultMsg{
-				Tasks:       tasks,
-				IsFastTrack: true,
-			}
-		}
-	}
-
-	// ── INTENT PRE-GUARD: Fast-track direct file mutations ──────────────
-	// If the user is requesting a simple single-file mutation on a non-code
-	// file (e.g. $prompt rename author in @LICENSE), classify it and route
-	// directly to /build as a FILE_MUTATE task with zero LLM involvement.
-	if target, isDirect := gateway.ClassifyDirectMutation(rawInput); isDirect {
-		m.push(roleSystem, accentStyle.Render("[Fast-Track] Direct file mutation detected. Bypassing architect analysis."))
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		multiTargets := gateway.ExtractDirectMutationTargets(rawInput)
-		if len(multiTargets) > 1 {
-			var tasks []plan.Task
-			for i, f := range multiTargets {
-				tasks = append(tasks, plan.Task{
-					StepNum: i + 1,
-
-					Status:      "idle",
-					Type:        "FILE_MUTATE",
-					Target:      f,
-					Description: rawInput,
-					Rationale:   fmt.Sprintf("Fast-Track multi-file decomposition: target %d of %d", i+1, len(multiTargets)),
-					IsHardcoded: true,
-				})
-			}
-			return func() tea.Msg {
-				return planResultMsg{
-					Tasks:       tasks,
-					IsFastTrack: true,
-				}
-			}
-		}
-		tasks := command.GenerateFallbackPlan(target)
-		return func() tea.Msg {
-			return planResultMsg{
-				Tasks:       tasks,
-				IsFastTrack: true,
-			}
-		}
-	}
-
-	// ── MODE GUARD: transition to /ask, then refine ─────────────────────
-	// Preserve the lean ask handoff prompt — we MUST NOT re-enter handleInput
-	// because the raw input no longer carries the $prompt prefix and would be
-	// routed to the normal AskContract() streaming path, producing
-	// conversational noise instead of the structured handoff prompt.
-	currentMode := m.resolver.Current()
-	if currentMode != modes.ModeAsk {
-		m.push(roleSystem, infoStyle.Render(fmt.Sprintf(
-			"$prompt from /%s — transitioning to /ask for structured analysis...", currentMode)))
-		m.modeChangeAuthorized = true
-		cmd := m.setMode(modes.ModeAsk)
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return tea.Batch(cmd, m.runAskPromptHandoffCmd(rawInput))
-	}
-
-	m.push(roleSystem, infoStyle.Render("Refining prompt through ask handoff..."))
-	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
-	return m.runAskPromptHandoffCmd(rawInput)
+	return m.runPromptExecution(rawInput)
 }

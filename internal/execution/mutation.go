@@ -80,6 +80,14 @@ const (
 	OutcomeVerifyFailed          MutationOutcome = "verify_failed"
 	OutcomeSkipped               MutationOutcome = "skipped"
 	OutcomeCancelled             MutationOutcome = "cancelled"
+	// OutcomeFailed is the generic terminal execution failure (no artifact was
+	// produced, or a non-apply stage failed). It is distinct from the
+	// apply/verify-specific failures so evidence never overclaims a stage.
+	OutcomeFailed MutationOutcome = "failed"
+	// OutcomeCompleted is the terminal outcome of a read-only execution that
+	// produced an artifact (explanation / plan / investigation) with no
+	// mutation. It never claims a filesystem change.
+	OutcomeCompleted MutationOutcome = "completed"
 )
 
 // Display returns the human-readable outcome label.
@@ -143,6 +151,10 @@ func ParseMutationOutcome(s string) MutationOutcome {
 		return OutcomeSkipped
 	case "cancelled", "canceled":
 		return OutcomeCancelled
+	case "failed", "execution_failed":
+		return OutcomeFailed
+	case "completed", "done":
+		return OutcomeCompleted
 	default:
 		return OutcomeNoArtifact
 	}

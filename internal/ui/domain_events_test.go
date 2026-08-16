@@ -31,7 +31,7 @@ func TestHandleDomainEventProjection(t *testing.T) {
 		{"patch applied", events.NewPatchApplied("x.go", 12, 4, 350*time.Millisecond),
 			"[build] applied patch to x.go (+12/-4 lines)"},
 		{"execution failed", events.NewExecutionFailed(events.FailureRecoverable, errors.New("boom"), "build.compilation"),
-			"[error][recoverable] boom (stage: build.compilation)"},
+			"[error] boom"},
 		{"self-healing attempt", events.NewSelfHealingAttempt(2, "worker.go", "TYPE_MISMATCH"),
 			"[RETRY 2] [TYPE_MISMATCH] worker.go"},
 		{"self-healing exhausted", events.NewSelfHealingExhausted(4, "./x.go:5: undefined: foo"),

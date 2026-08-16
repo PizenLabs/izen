@@ -160,6 +160,8 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		execEng:             app.Execution,
 		planStore:           app.PlanStore,
 		planEngine:          app.PlanEngine,
+		executor:            app.Executor,
+		gateway:             app.Gateway,
 		microkernel:         app.Microkernel,
 		intentCompiler:      app.IntentCompiler,
 		ledger:              NewContextLedger(),
@@ -182,7 +184,6 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		bus:                 eventBus,
 		rt:                  app.Runtime,
 		pres:                presenter,
-		intentRouter:        app.IntentRouter,
 		orch:                app.Orchestrator,
 		pipelineEngine:      app.Pipeline,
 		patchEngine:         app.Patch,
@@ -314,6 +315,26 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		events.EventIntentClassified,
 		events.EventPhaseChanged,
 		events.EventApprovalRequested,
+		// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──
+		// The runtime owns every execution; the UI renders its lifecycle purely
+		// as a projection of these events.
+		events.EventExecutionStarted,
+		events.EventStrategySelected,
+		events.EventTargetResolved,
+		events.EventContextPrepared,
+		events.EventModelInvoked,
+		events.EventProviderWaiting,
+		events.EventProviderFirstToken,
+		events.EventProviderStreamDelta,
+		events.EventProviderUsageUpdate,
+		events.EventReasoningTelemetry,
+		events.EventProviderResponse,
+		events.EventArtifactProduced,
+		events.EventMutationStarted,
+		events.EventMutationCompleted,
+		events.EventVerificationCompleted,
+		events.EventExecutionFinished,
+		events.EventApprovalRequired,
 	} {
 		eventBus.Subscribe(typ, func(ev events.DomainEvent) {
 			p.Send(domainEventMsg{ev: ev})

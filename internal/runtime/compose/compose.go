@@ -121,13 +121,24 @@ type Application struct {
 	// ── Engine tree (Sprint 3) ────────────────────────────────────────
 	// Every engine below is constructed here, in Wire, and shares the single
 	// event bus (Bus). The presentation layer consumes them read-only.
-	RuntimeCtx     *coreRuntime.RuntimeContext
-	WorkflowSM     *coreWorkflow.WorkflowStateMachine
-	Orchestrator   *orchestrator.Orchestrator
-	Pipeline       *pipeline.Engine
-	PlanStore      *plan.PlanStore
-	PlanEngine     *plan.Engine
-	Execution      *execution.Engine
+	RuntimeCtx   *coreRuntime.RuntimeContext
+	WorkflowSM   *coreWorkflow.WorkflowStateMachine
+	Orchestrator *orchestrator.Orchestrator
+	Pipeline     *pipeline.Engine
+	PlanStore    *plan.PlanStore
+	PlanEngine   *plan.Engine
+	Execution    *execution.Engine
+	// Executor is the RuntimeExecutor boundary: the single execution authority
+	// that owns provider invocation, patch creation, the mutation lifecycle and
+	// verification on the migrated paths. The UI submits ExecuteRequests and
+	// approves/rejects via this boundary — it never calls a provider or a
+	// PatchManager directly on those paths.
+	Executor *execution.RuntimeExecutor
+	// Gateway is the unified IntentGateway: the single entry point every user
+	// action (bare text, $prompt, $hot) crosses to produce an ExecuteRequest
+	// with an unconditional Strategy.Select profile. The UI never routes by
+	// mode or triggers hidden executions on the migrated paths.
+	Gateway        *execution.IntentGateway
 	Patch          *patch.Engine
 	Auth           *authorization.AuthorizationEngine
 	IntentRouter   *router.Router
@@ -343,7 +354,10 @@ func Wire(opts ...Option) (*Application, error) {
 		a.Bus = events.NewBus(events.DefaultBufferSize)
 	}
 	if a.Approver == nil {
-		a.Approver = handlers.NewInMemoryApprover()
+		// No in-memory approval default: production approval is routed through
+		// the RuntimeExecutor (a.Executor), which applies real mutations. The
+		// injected approver is a harness/tests seam only.
+		a.Approver = nil
 	}
 	if a.Inputs.Config == nil {
 		a.Inputs.Config = config.Default()
@@ -404,11 +418,22 @@ func Wire(opts ...Option) (*Application, error) {
 	wf := workflow.NewWorkflowRuntime()
 	a.Workflow = wf
 
+	// ── RUNTIME EXECUTOR (authority boundary) ───────────────────────────
+	// The RuntimeExecutor is the execution authority the presentation layer
+	// submits requests to on the migrated paths ($prompt targeted mutation,
+	// $hot). It owns provider invocation, patch creation, the mutation
+	// lifecycle and verification, and emits the canonical execution lifecycle
+	// events onto the shared bus. The approval command handlers route through
+	// it, so approving a patch applies a REAL mutation.
+	a.Executor = execution.NewRuntimeExecutor(a.Inputs.Root, a.Inputs.Config, a.provider, a.Bus, a.Inputs.LanguageID)
+	a.Gateway = execution.NewIntentGateway(a.Inputs.Root)
+
 	dispatcher := runtime.NewCommandDispatcher()
 	hs := handlers.New(handlers.HandlerDeps{
 		Workflow: wf,
 		Bus:      a.Bus,
 		Approver: a.Approver,
+		Executor: a.Executor,
 	})
 	if err := hs.Register(dispatcher); err != nil {
 		return nil, err

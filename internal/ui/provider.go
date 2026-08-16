@@ -128,6 +128,17 @@ func (m *model) switchProvider(name string) tea.Cmd {
 		m.planEngine.SetStreamProvider(m.provider.ExecuteStream)
 	}
 
+	// Re-bind the RuntimeExecutor to the switched provider. The executor
+	// resolves the model that travels with ITS bound provider at invocation
+	// time; without this re-bind it would keep the construction-time provider
+	// (e.g. Ollama) while reading the new provider's model (e.g. an OpenRouter
+	// model) — the exact provider/model mismatch that must never reach the
+	// network. Provider identity and model identity travel together only when
+	// the runtime's provider tracks the switch.
+	if m.executor != nil {
+		m.executor.SetProvider(provider)
+	}
+
 	// Re-pin the layered pipeline router's intent tiers to the new active
 	// provider so mode commands never route a stale local model into a cloud
 	// request (OpenRouter rejects e.g. "qwen2.5-coder:7b" with HTTP 400).

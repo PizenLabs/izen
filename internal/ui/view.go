@@ -237,15 +237,6 @@ func (m *model) renderProposalBlock() string {
 
 	switch m.state {
 	case StateAwaitingApproval:
-		// ── Hybrid Intent Gateway mode-selection prompt ───────────────
-		// The router classified the prompt below the confidence threshold and
-		// the UI is asking which execution phase to enter. Rendered above all
-		// other approval widgets because it blocks further input processing.
-		if m.pendingRouteConfirm && len(m.pendingRouteOptions) > 0 {
-			b.WriteString(m.renderRouteConfirmPrompt(width))
-			break
-		}
-
 		// ── Build Approval Permission Box (SHELL_EXEC gate) ─────────────
 		if m.pendingBuildApproval && m.pendingBuildTask != nil {
 			task := m.pendingBuildTask
@@ -306,12 +297,13 @@ func (m *model) renderProposalBlock() string {
 		// ── Truthful in-flight mutation dock ───────────────────────
 		// Derived from the authoritative execution stage: the dock shows what
 		// the runtime is ACTUALLY doing (apply/patch/model), never the generic
-		// "Processing file mutations..." claim.
+		// "Processing file mutations..." claim. When no authoritative stage
+		// exists, nothing is rendered — empty is better than fake.
 		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
 		sp := SpinnerStyle.Render(frame)
 		stageLine := m.renderStageLine()
 		if stageLine == "" {
-			stageLine = "Applying mutation..."
+			return b.String()
 		}
 		b.WriteString("  " + sp + " " + infoStyle.Render(stageLine))
 		if len(m.pendingProposals) > 0 {

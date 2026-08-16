@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/PizenLabs/izen/internal/gateway"
+	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
 	"github.com/PizenLabs/izen/pkg/tui/tips"
 )
@@ -143,11 +145,14 @@ func agentShimmerText(label string) string {
 // The snowflake icon cycles through the 4-frame animated sequence (✻ ❅ ❆ ✦)
 // while the cosine shimmer sweep animates across the full status text. The
 // contextual tip line sits directly underneath with a tree-branch prefix.
-// Returns "" when the shimmer is inactive.
+// Returns "" when the dock has nothing truthful to say.
 //
-// The dock is the SINGLE active status indicator from prompt submit (t=0ms)
-// through thinking/processing. It clears smoothly ONLY when the first
-// primary output token arrives (tokenMsg handler calls stopShimmer).
+// The dock is the SINGLE active status indicator for the legacy agent/stream
+// paths from prompt submit (t=0ms) through thinking/processing. On the gated
+// RuntimeExecutor path it stays alive (spinner + tips) but its TEXT is the
+// event-derived human step of the execution-view projection — never a static
+// dispatch template — so nothing is claimed until a real execution event
+// arrives.
 //
 // ANSI-LEAK HARDENING: the shimmer sweep re-colours every rune of the status
 // text independently, so the sweep text MUST NEVER carry pre-styled (ANSI-
@@ -170,7 +175,14 @@ func (m *model) renderLoadingDock() string {
 	dockText := m.composeDockTextWithFlake(flake)
 
 	var b strings.Builder
-	b.WriteString("  " + shimmer.Render(ansi.Strip(dockText), m.shimmerAnim.Frame, m.shimmerAnim.Width))
+	if dockText != "" {
+		b.WriteString("  " + shimmer.Render(ansi.Strip(dockText), m.shimmerAnim.Frame, m.shimmerAnim.Width))
+	} else {
+		// No event-derived step yet (pre-first-event, or a conversation): the
+		// animated spinner renders alone with NO text claim — progress is never
+		// fabricated before a real runtime event exists.
+		b.WriteString("  " + ansi.Strip(flake))
+	}
 	b.WriteString("\n")
 	if m.loadingTip != "" {
 		b.WriteString("  ")
@@ -185,11 +197,12 @@ func (m *model) renderLoadingDock() string {
 }
 
 // composeDockTextWithFlake builds the dynamic status text using the given
-// snowflake character. It is derived from the AUTHORITATIVE execution stage
-// (stage.go): the dock can only ever claim work the runtime actually reported —
-// a provider wait renders as "waiting" (never "thinking"), a token stream as
-// "streaming", a local stage as its canonical label. When no stage is active
-// it falls back to the shimmer text set by startShimmer.
+// snowflake character. It is derived from AUTHORITATIVE execution signals only:
+// the execution-view projection (event-derived human step), the runtime stage
+// record (stage.go), or — on the legacy agent/stream paths — the shimmer text
+// set by startShimmer. When no authoritative signal exists it returns "" so the
+// dock renders nothing: a static "Working..." placeholder would be a fake
+// progress claim.
 //
 // The returned text is ALWAYS plain (ANSI-free): the shimmer sweep re-colours
 // every rune independently, so embedding a lipgloss-styled segment here would
@@ -197,6 +210,16 @@ func (m *model) renderLoadingDock() string {
 // renderLoadingDock). The hint is therefore plain text carried on the same
 // swept line.
 func (m *model) composeDockTextWithFlake(flake string) string {
+	// The gated RuntimeExecutor path renders its status EXCLUSIVELY from the
+	// single execution-view projection (Part 5): the human step the runtime
+	// events produced — "Reading index.html", "Analyzing", "Applying changes".
+	// The UI never invents execution truth. Gated on the in-flight marker so a
+	// later legacy operation can never inherit a stale execution step.
+	if m.execView != nil && m.executionResolving && m.execView.Active() {
+		if step := m.execView.HumanStep(); step != "" {
+			return flake + " " + step
+		}
+	}
 	if st := m.stageSnapshot(); st.active() {
 		if line := renderStageStatus(st); line != "" {
 			return flake + " " + line
@@ -205,10 +228,152 @@ func (m *model) composeDockTextWithFlake(flake string) string {
 	if m.shimmerText != "" {
 		return flake + " " + m.shimmerText
 	}
-	return flake + " Working..."
+	return ""
 }
 
 // composeDockText builds the dynamic status text using the default snowflake.
 func (m *model) composeDockText() string {
 	return m.composeDockTextWithFlake(SpinnerSnowflake())
+}
+
+// renderExecutionNarrative renders the Claude-like human narrative panel of the
+// gated RuntimeExecutor execution. It is derived EXCLUSIVELY from the
+// execution-view projection (ExecutionViewState + ExecutionNarrative) — the UI
+// never authors progress text and never surfaces raw machine events here. It
+// returns "" when no gated execution is in flight.
+//
+// Shape:
+//
+//	✓ Understanding request
+//	✓ Inspecting index.html
+//	◇ Preparing change          ← current step
+func (m *model) renderExecutionNarrative() string {
+	if m.execView == nil || !m.executionResolving || !m.execView.Active() {
+		return ""
+	}
+	return renderExecutionFrame(m.execView.Frame(presentation.VisibilityNormal))
+}
+
+// renderExecutionLayered renders the gated execution panel for the ACTIVE
+// visibility layer (Normal / Expanded / Debug). The renderer is a pure
+// formatting function of the presentation-computed ExecutionFrame — it never
+// decides what belongs in a layer.
+func (m *model) renderExecutionLayered() string {
+	if m.execView == nil || !m.executionResolving || !m.execView.Active() {
+		return ""
+	}
+	return renderExecutionFrame(m.execView.Frame(m.execVisibility))
+}
+
+// renderExecutionFrame is the pure visual formatter of an ExecutionFrame. It
+// contains no interpretation: it renders exactly what the presentation layer
+// put into the frame.
+//
+// NORMAL: human narrative milestones + the live current step.
+// EXPANDED: NORMAL + runtime metadata (strategy, context, model, tokens,
+// duration, artifacts).
+// DEBUG: EXPANDED + the full machine event stream.
+func renderExecutionFrame(f presentation.ExecutionFrame) string {
+	steps := f.Steps
+	if len(steps) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	last := len(steps) - 1
+	for i, step := range steps {
+		if step.Current {
+			b.WriteString("  " + orangeStyle.Render("◇") + " " + brightStyle.Render(step.Sentence))
+		} else {
+			b.WriteString("  " + infoStyle.Render(Icon.Success+" "+step.Sentence))
+		}
+		b.WriteString("\n")
+		// Every narrative step carries its derivation source (the ExecutionGraph
+		// transition that produced it). The source sub-line is surfaced in the
+		// EXPANDED/DEBUG layers — it proves the step is event-derived, never a
+		// static template. NORMAL keeps the human milestones clean.
+		if f.Visibility >= presentation.VisibilityExpanded && step.Transition != "" {
+			b.WriteString("     " + mutedStyle.Render("source: "+step.Transition) + "\n")
+		}
+		if i == last {
+			break
+		}
+	}
+	if f.Visibility >= presentation.VisibilityExpanded {
+		if detail := renderExecutionDetails(f.Details); detail != "" {
+			b.WriteString(detail)
+		}
+	}
+	if f.Visibility >= presentation.VisibilityDebug {
+		b.WriteString(renderExecutionDebug(f.Events))
+	}
+	return b.String()
+}
+
+// renderExecutionDetails renders the EXPANDED-layer runtime metadata. It is
+// visual formatting of the accumulated details only.
+func renderExecutionDetails(d presentation.ExecutionDetails) string {
+	if d.Empty() && d.Duration() == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n")
+	b.WriteString(dimmedStyle.Render("  ── execution details ──") + "\n")
+	if d.Strategy != "" {
+		b.WriteString("  " + dimmedStyle.Render("strategy:") + " " + textStyle.Render(d.Strategy) + "\n")
+	}
+	if len(d.ContextChannels) > 0 {
+		policy := strings.Join(d.ContextChannels, ", ")
+		b.WriteString("  " + dimmedStyle.Render("context policy:") + " " + textStyle.Render(policy))
+		if d.ContextTokens > 0 {
+			b.WriteString(" " + mutedStyle.Render(fmt.Sprintf("(~%d tok)", d.ContextTokens)))
+		}
+		b.WriteString("\n")
+	}
+	if d.Model != "" {
+		b.WriteString("  " + dimmedStyle.Render("model:") + " " + textStyle.Render(d.Model))
+		if d.ProviderState != "" {
+			b.WriteString(" " + mutedStyle.Render("("+d.ProviderState+")"))
+		}
+		b.WriteString("\n")
+	}
+	if d.TokenInput > 0 || d.TokenOutput > 0 {
+		b.WriteString("  " + dimmedStyle.Render("tokens:") + " " + mutedStyle.Render(
+			fmt.Sprintf("%d in / %d out", d.TokenInput, d.TokenOutput)) + "\n")
+	}
+	if d.ReasoningDuration > 0 || d.ReasoningTokens > 0 {
+		b.WriteString("  " + dimmedStyle.Render("reasoning:") + " " + mutedStyle.Render(
+			fmt.Sprintf("%s (%d tok)", d.ReasoningDuration.Round(time.Millisecond), d.ReasoningTokens)) + "\n")
+	}
+	if dur := d.Duration(); dur > 0 {
+		b.WriteString("  " + dimmedStyle.Render("duration:") + " " + mutedStyle.Render(dur.Round(time.Millisecond).String()) + "\n")
+	}
+	for _, a := range d.Artifacts {
+		b.WriteString("  " + dimmedStyle.Render("artifact:") + " " + renderArtifactSummary(a) + "\n")
+	}
+	return b.String()
+}
+
+// renderArtifactSummary renders one artifact through the semantic renderer and
+// collapses it to a single summary line. Structured artifacts (plans) never
+// render as raw JSON.
+func renderArtifactSummary(a presentation.ArtifactView) string {
+	lines := presentation.RenderArtifact(a.Kind, a.Target, a.Content)
+	if len(lines) == 0 {
+		return a.Kind
+	}
+	return strings.Join(lines, " ")
+}
+
+// renderExecutionDebug renders the DEBUG-layer machine event stream.
+func renderExecutionDebug(events []string) string {
+	if len(events) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n")
+	b.WriteString(dimmedStyle.Render("  ── runtime events ──") + "\n")
+	for _, e := range events {
+		b.WriteString("  " + mutedStyle.Render(e) + "\n")
+	}
+	return b.String()
 }

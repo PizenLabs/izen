@@ -29,6 +29,8 @@ import (
 	domainworkflow "github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
+	runtimegraph "github.com/PizenLabs/izen/internal/execution/graph"
+	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/lea"
@@ -43,7 +45,6 @@ import (
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 	riview "github.com/PizenLabs/izen/internal/review"
-	"github.com/PizenLabs/izen/internal/router"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
@@ -240,6 +241,10 @@ type planResultMsg struct {
 	// (inference → policy → IR plan → lowerer). The handler labels the staged
 	// plan and notes that zero model tokens were consumed.
 	IntentCompiler bool
+	// EngineFirst marks plans staged by the engine-first strategy layer
+	// (Phase 10): deterministic tasks the engine resolved without LLM
+	// reasoning. The handler labels the staged plan truthfully.
+	EngineFirst bool
 	// TokenInput/TokenOutput are the provider-reported usage of the synthesis
 	// call, committed even when the response was truncated (finish_reason:
 	// "length"). The handler mirrors them into the session counters and the
@@ -353,16 +358,6 @@ func respUsage(resp *ai.Response) (input, output int, known bool) {
 
 type applyAllResultMsg struct {
 	results []mutationResultMsg
-}
-
-// routerResultMsg carries the outcome of the Hybrid Intent Gateway
-// classification for a free-form prompt. It is produced by an async tea.Cmd
-// because the semantic fallback may invoke the LLM and must never block the
-// Bubble Tea event loop.
-type routerResultMsg struct {
-	line   string
-	result router.ClassificationResult
-	err    error
 }
 
 type shellOutputMsg struct {
@@ -884,6 +879,30 @@ type model struct {
 	agentLabel   string
 	agentDone    bool
 
+	// executionResolving is the single in-flight marker of the gated
+	// RuntimeExecutor loading phase. It is set at dispatch, cleared when a new
+	// operation supersedes it, and cleared by the terminal execution events
+	// (execution.finished / execution.failed / cancelled) so every terminal
+	// event releases the loading state and the pending operation. It gates
+	// clearExecutionLoading so a terminal runtime event can never clobber an
+	// unrelated operation.
+	executionResolving bool
+
+	// execView is the single execution-view projection of the gated
+	// RuntimeExecutor path. It REDUCES the canonical runtime lifecycle events
+	// into one ExecutionViewState (Idle/Running(step)/WaitingApproval/
+	// Completed/Failed) plus the human + debug narratives. The renderer for the
+	// gated path depends ONLY on this state — it never invents execution truth.
+	// It is reset at each gated dispatch and driven exclusively by
+	// handleDomainEvent. Nil until the first gated execution.
+	execView *presentation.ExecutionProjection
+
+	// execVisibility is the active human presentation layer of the gated
+	// execution. It is NORMAL by default (human narrative only); Ctrl+O cycles
+	// Normal → Expanded → Debug. The renderer formats the projection's
+	// ExecutionFrame for this layer and never decides what belongs in it.
+	execVisibility presentation.Visibility
+
 	// Quit-confirmation modal (exit safety guard). pendingQuitConfirm gates
 	// clean shutdown behind an explicit [ No ] / [ Yes ] dialog; the dialog
 	// defaults to [ No ] so a stray Enter can never exit accidentally.
@@ -911,17 +930,6 @@ type model struct {
 	pendingProposals     []SemanticProposal
 	acceptAll            bool
 
-	// Hybrid-intent-gateway confirmation: when the router classifies a
-	// free-form prompt with confidence below the threshold
-	// (ConfirmationRequirement), the UI freezes in StateAwaitingApproval and
-	// presents an interactive mode-selection prompt instead of acting on a
-	// blind guess. pendingRouteIdx is the highlighted option index.
-	pendingRouteConfirm bool
-	pendingRouteInput   string
-	pendingRouteResult  router.ClassificationResult
-	pendingRouteOptions []modes.Mode
-	pendingRouteIdx     int
-
 	// Accepted proposals (collapsed single-line summaries)
 	acceptedProposals []acceptedProposal
 
@@ -943,6 +951,23 @@ type model struct {
 	execEng    *execution.Engine
 	planStore  *plan.PlanStore
 	planEngine *plan.Engine // structural plan engine wired for ledger-driven execution
+
+	// executor is the RuntimeExecutor authority boundary (composition root).
+	// It owns provider invocation, patch creation, the mutation lifecycle and
+	// verification on the migrated paths ($prompt targeted mutation). The UI
+	// submits ExecuteRequests and approves/rejects via this boundary — it never
+	// calls a provider or a PatchManager directly on those paths. Nil only in
+	// headless/test harnesses that do not wire one.
+	executor *execution.RuntimeExecutor
+	// gateway is the unified IntentGateway: every user action (bare text,
+	// $prompt, $hot) crosses it to produce an ExecuteRequest with an
+	// unconditional Strategy.Select profile. The UI never routes by mode or
+	// triggers hidden executions on the migrated paths.
+	gateway *execution.IntentGateway
+	// executorPendingPatchID is the approval-held patch ID of the executor
+	// execution currently staged in the proposal dock. Non-empty routes the
+	// approval keys through RuntimeExecutor.Approve/Reject.
+	executorPendingPatchID string
 
 	// microkernel is the immutable microkernel pipeline adapter. It primes
 	// plan/investigate command handling for greenfield generation prompts so
@@ -1380,6 +1405,43 @@ type model struct {
 	// diff/apply/filesystem/verify facts derived only from real runtime
 	// evidence. Written and read on the UI goroutine only.
 	lastExecutionProof ExecutionProof
+	// lastRuntimeGraph is the runtime-owned execution graph evidence of the most
+	// recent RuntimeExecutor execution (RequestID, per-stage kind/state/evidence/
+	// timestamps). It is the authoritative execution timeline produced by the
+	// runtime; $inspect renders it. Written and read on the UI goroutine only.
+	lastRuntimeGraph []runtimegraph.StageSnapshot
+
+	// lastExecutionStrategy is the engine-first execution-strategy decision
+	// record of the most recent $prompt (Phase 10). It captures the strategy,
+	// the target-resolution outcomes, the execution-factor complexity, the
+	// context channels, the artifact contract and the budgets the engine
+	// selected BEFORE any model invocation — exposed through $inspect so a
+	// user can answer "why did Izen call the model / read this file / need
+	// /plan?" without seeing model reasoning. Written on the UI goroutine only.
+	lastExecutionStrategy strategy.ExecutionStrategyProfile
+	// lastContextEnvelope is the minimum-sufficient context envelope the
+	// engine-first compiler assembled for the most recent $prompt (Phase 10).
+	// Every item names its owner, source and reason for inclusion; $inspect
+	// renders it so context ownership is observable and auditable.
+	lastContextEnvelope strategy.ContextEnvelope
+	// lastStrategyGraph is the compiled explicit execution graph of the most
+	// recent engine-first $prompt (Phase 11). It is the typed node sequence
+	// (resolve_target → … → verify) compiled deterministically from the
+	// selected strategy BEFORE any model invocation; the runtime records node
+	// states as execution reaches real boundaries. $inspect renders it so the
+	// intended and executed execution are both answerable. Written and read on
+	// the UI goroutine only.
+	lastStrategyGraph *strategy.ExecutionGraph
+	// activeStrategyBudget is the adaptive output budget the engine-first
+	// router selected for the currently dispatched targeted mutation. Zero
+	// means "use the default bounded budget". It is cleared when the mutation
+	// operation reaches a terminal message.
+	activeStrategyBudget int
+	// hotfixBranding labels the bounded mutation executor's status lines.
+	// "HOTFIX" for $hot, "PROMPT" when a $prompt routed to the same executor
+	// via the engine-first strategy layer, so telemetry never mislabels the
+	// operation source.
+	hotfixBranding string
 
 	// Stream throttle — frame-bounded token emission
 	streamThrottle *StreamThrottle
@@ -1414,14 +1476,6 @@ type model struct {
 	// presSink forwards runtime.PresentationEvents into the Bubble Tea event
 	// loop as presentationEventMsg. It must be closed on shutdown.
 	presSink *presentation.EventSink
-
-	// Hybrid intent gateway: the router package runs the deterministic fast
-	// path first and falls back to the semantic PromptIntentClassifier when no
-	// deterministic signal matches. Route() returns an optional
-	// ConfirmationRequirement at low confidence, surfaced as an interactive
-	// mode-selection prompt before dispatch. Nil when no provider is available
-	// (routes degenerate to the deterministic fast path only).
-	intentRouter *router.Router
 
 	// Execution orchestrator: maps logical phases (Idle/Ask/Investigate/Plan/
 	// Build/Review) onto the single WorkflowStateMachine, sharing the
@@ -1823,6 +1877,17 @@ func (m *model) logActivity(format string, args ...interface{}) {
 	}
 }
 
+// logRuntimeDetail writes a runtime lifecycle detail line (strategy, provider,
+// token usage, event names) ONLY when the gated execution is in the DEBUG
+// layer. In NORMAL and EXPANDED the human narrative panel is the only execution
+// surface — internal runtime states are never rendered directly by default.
+func (m *model) logRuntimeDetail(format string, args ...interface{}) {
+	if m.execVisibility != presentation.VisibilityDebug {
+		return
+	}
+	m.logActivity(format, args...)
+}
+
 // handleEngineEvent receives typed event payloads from the execution
 // and retrieval packages and appends them to the ActivityTree. This is the
 // ONLY path that populates ActivityTree — no string-parsing, no hardcoded
@@ -1906,6 +1971,15 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	if m.activitySurfaceSealed {
 		return
 	}
+	// ── SINGLE EXECUTION-VIEW PROJECTION (Phase 4) ────────────────
+	// Every canonical runtime lifecycle event advances the execution-view
+	// projection. The renderer for the gated path reads ONLY this projection's
+	// state — it never invents execution truth, and a terminal event ALWAYS
+	// transitions it into a terminal phase (no stale spinner after success,
+	// failure, or cancellation).
+	if m.execView != nil {
+		m.execView.Project(ev)
+	}
 	switch p := ev.Payload().(type) {
 	case events.CommandReceivedPayload:
 		m.logActivity("[%s] received command: %s", p.Mode, truncateForActivity(p.Command))
@@ -1930,7 +2004,10 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			})
 		}
 	case events.ExecutionFailedPayload:
-		m.logActivity("[error][%s] %s (stage: %s)", p.Classification, p.Error, p.Stage)
+		m.logActivity("[error] %s", p.Error)
+		// A terminal failure event is authoritative execution truth: it must
+		// release the loading state, spinner, and pending operation.
+		m.clearExecutionLoading(OpOutcomeFailure)
 	case events.SelfHealingAttemptPayload:
 		// Distinct retry badge + attempt count + failure category so the
 		// self-healing loop reads as one clean, scannable line.
@@ -1942,6 +2019,78 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			p.Attempts, selfHealOutputSuffix(p.Output))
 	case events.StageCompletedPayload:
 		m.logActivity("[stage] %s completed (%s)", p.Stage, p.Summary)
+	case events.ExecutionStartedPayload:
+		m.logRuntimeDetail("[runtime] execution started: %s (mode %s)", truncateForActivity(p.Prompt), p.Mode)
+	case events.StrategySelectedPayload:
+		m.logRuntimeDetail("[runtime] strategy selected: %s", p.Strategy)
+	case events.TargetResolvedPayload:
+		// The authoritative stage is driven from the real runtime boundary: the
+		// resolved target the runtime actually touches. Never a fabricated label.
+		m.setStage("target", p.Target, stageRunning)
+		m.logRuntimeDetail("[runtime] target resolved: %s (exists=%t, %s)", p.Target, p.Exists, p.Source)
+	case events.ContextPreparedPayload:
+		m.setStage("context", "", stageRunning)
+		m.logRuntimeDetail("[runtime] context prepared: %d channel(s), ~%d tokens", len(p.Channels), p.Tokens)
+	case events.ModelInvokedPayload:
+		m.setStage("model", p.Model, stageWaiting)
+		m.logRuntimeDetail("[runtime] model invoked: %s", p.Model)
+	case events.ProviderWaitingPayload:
+		// provider.waiting: the round-trip is in flight before the first byte —
+		// the truthful provider state, never a fabricated "thinking" claim.
+		m.setStage("model", p.Model, stageWaiting)
+		m.logRuntimeDetail("[runtime] provider waiting: %s", p.Model)
+	case events.ProviderFirstTokenPayload:
+		// provider.first_token: real provider bytes are arriving.
+		m.setStage("model", p.Model, stageStreaming)
+		m.logRuntimeDetail("[runtime] provider first token: %s (%s)", p.Model, p.Latency.Round(time.Millisecond))
+	case events.ProviderStreamDeltaPayload:
+		// Evidence transport only: the provider is actively streaming. No
+		// per-delta activity line (noise); the state is kept truthful.
+		m.setStage("model", m.getActiveModelName(), stageStreaming)
+	case events.ProviderUsageUpdatePayload:
+		// Authoritative provider-reported usage during the live stream — only
+		// real counts reach the indicator, never a character-count estimate.
+		m.setStage("model", p.Model, stageStreaming)
+		m.setStageMetrics(0, 0, p.OutputTokens)
+		m.logRuntimeDetail("[runtime] provider usage: %d in / %d out", p.InputTokens, p.OutputTokens)
+	case events.ReasoningTelemetryPayload:
+		// Reasoning TELEMETRY only (duration + token count). Raw chain-of-
+		// thought never crosses this boundary.
+		m.logRuntimeDetail("[runtime] reasoning: %s (%d tok)", p.Duration.Round(time.Millisecond), p.Tokens)
+	case events.ProviderResponsePayload:
+		m.setStage("model", p.Model, stageDone)
+		m.logRuntimeDetail("[runtime] provider response: %s (%d tok in / %d tok out)", p.Model, p.TokenInput, p.TokenOutput)
+	case events.ArtifactProducedPayload:
+		m.setStage("patch", p.Target, stageRunning)
+		m.logRuntimeDetail("[runtime] artifact produced: %s (%s)", p.Kind, p.Target)
+	case events.MutationStartedPayload:
+		target := ""
+		if len(p.Targets) > 0 {
+			target = p.Targets[0]
+		}
+		m.setStage("apply", target, stageRunning)
+		m.logRuntimeDetail("[runtime] mutation started: %d target(s)", len(p.Targets))
+	case events.MutationCompletedPayload:
+		m.setStage("apply", p.Target, stageDone)
+		m.logRuntimeDetail("[runtime] mutation completed: %s (%s)", p.Target, p.Outcome)
+	case events.VerificationCompletedPayload:
+		m.setStage("validate", "", stageDone)
+		m.logRuntimeDetail("[runtime] verification %s: %d step(s)", verificationTick(p.Passed), len(p.Steps))
+	case events.ExecutionFinishedPayload:
+		m.logRuntimeDetail("[runtime] execution finished: success=%t (%s)", p.Success, p.Outcome)
+		// A terminal finished event is authoritative execution truth: it must
+		// release the loading state, spinner, and pending operation regardless
+		// of whether the result message has arrived yet.
+		outcome := OpOutcomeSuccess
+		if !p.Success {
+			outcome = OpOutcomeFailure
+		}
+		if p.Outcome == string(execution.OutcomeCancelled) {
+			outcome = OpOutcomeCancelled
+		}
+		m.clearExecutionLoading(outcome)
+	case events.ApprovalRequiredPayload:
+		m.logRuntimeDetail("[runtime] approval required: %s", p.Target)
 	case events.IntentClassifiedPayload:
 		// Hybrid Intent Gateway classification outcome projected onto the
 		// activity log. Ambiguity is surfaced so the operator sees WHY the UI
@@ -2005,6 +2154,25 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	}
 }
 
+// clearExecutionLoading terminates the gated-execution loading projection
+// (in-flight marker + busy flags + pending operation) when a terminal execution
+// event arrives from the runtime. It is the projection-layer counterpart of
+// finalizeOperation: the runtime emits execution.finished / execution.failed /
+// cancelled as authoritative truth and the UI clears its loading state from
+// those events — the gated execution's loading state can never outlive a
+// terminal execution event.
+//
+// It is gated on the execution in-flight marker so a terminal runtime event can
+// never clobber an unrelated operation's spinner: the marker is cleared the
+// moment a new operation supersedes the gated execution or any terminal cleanup
+// runs, making this a no-op everywhere except the genuine resolving phase.
+func (m *model) clearExecutionLoading(outcome OperationOutcome) {
+	if !m.executionResolving {
+		return
+	}
+	m.finalizeOperation(outcome, nil)
+}
+
 // ── Derived UI state projection ──────────────────────────────────────────────
 // StateAwaitingApproval and StateProcessing are DERIVED presentation states:
 // they are computed through presentation.DeriveUIState from the canonical
@@ -2065,7 +2233,6 @@ func (m *model) unwindBuildFailure() {
 	m.hotfixCandidatesMode = false
 	m.pendingHotfixCandidate = nil
 	m.acceptAll = false
-	m.pendingRouteConfirm = false
 	if m.workflowSM != nil {
 		// From StateBuilding/StateFailed/StateRepairing the canonical exit is
 		// a reset back to StateIdle, from which every forward phase is reachable.
@@ -2136,7 +2303,6 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	m.hotfixCandidatesMode = false
 	m.pendingHotfixCandidate = nil
 	m.acceptAll = false
-	m.pendingRouteConfirm = false
 	if m.toolCallBuffer != nil {
 		m.toolCallBuffer.Reject()
 	}
@@ -2304,6 +2470,19 @@ func (m *model) completeFastTrackBuild() (tea.Model, tea.Cmd) {
 // never inspects the original domain event. Only ever runs on the UI
 // goroutine, so all model mutation here is race-free.
 func (m *model) handlePresentationEvent(ev appruntime.PresentationEvent) {
+	// ── DEDUPLICATION (Rule 4: one execution path) ─────────────────────
+	// IntentClassified / PhaseChanged / ApprovalRequested are ALSO subscribed
+	// as raw domain events (program.go), which carry the structured payloads
+	// the UI projects (viewState, approval gate). Rendering both the raw line
+	// and the translated line would duplicate every one of them. The translated
+	// presentation event is therefore dropped for these three types — the raw
+	// projection is the single render.
+	switch ev.Type {
+	case appruntime.PresentationIntentClassified,
+		appruntime.PresentationPhaseChanged,
+		appruntime.PresentationApprovalRequested:
+		return
+	}
 	switch ev.Severity {
 	case appruntime.SeveritySuccess:
 		m.logActivity("%s", successBannerStyle.Render(ev.Summary))
@@ -2491,6 +2670,15 @@ func selfHealOutputSuffix(output string) string {
 func truncateForActivity(s string) string {
 	s = strings.TrimSpace(s)
 	return truncateANSI(s, 90)
+}
+
+// verificationTick renders the verifier's real verdict as a truthful glyph.
+// "passed"/"failed" only ever appear from a real VerificationCompleted event.
+func verificationTick(passed bool) string {
+	if passed {
+		return "passed"
+	}
+	return "failed"
 }
 
 // push appends a record. Records are flushed to the terminal's native
@@ -2884,6 +3072,7 @@ func (m *model) clearBusyFlags() {
 	m.agentRunning = false
 	m.agentLabel = ""
 	m.agentDone = true
+	m.executionResolving = false
 	m.reviewRunning = false
 	m.investigateRunning = false
 	m.pipelineRunning = false
@@ -3252,6 +3441,15 @@ func (m *model) refreshViewportContent() {
 		if dock := m.renderLoadingDock(); dock != "" {
 			content.WriteString(dock)
 		}
+	}
+
+	// ── Execution narrative panel (Phase 5/6) ─────────────────────
+	// The gated RuntimeExecutor path renders its human narrative EXCLUSIVELY
+	// from the execution-view projection (ExecutionNarrative) — never from raw
+	// machine events and never from UI-authored progress text. The active
+	// visibility layer (Normal/Expanded/Debug) selects what the frame carries.
+	if panel := m.renderExecutionLayered(); panel != "" {
+		content.WriteString(panel)
 	}
 
 	if m.streaming {

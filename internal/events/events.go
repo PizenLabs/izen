@@ -75,6 +75,49 @@ const (
 	// cut short by a context deadline or cancellation so tokens already billed
 	// by the provider are never silently zeroed in local telemetry.
 	EventStreamUsage = "stream.usage"
+
+	// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──────────
+	// These events are the single authoritative stream of a full execution
+	// through the RuntimeExecutor. They are emitted ONLY at real runtime
+	// boundaries — never synthesised by the presentation layer — so the UI can
+	// render a truthful execution timeline purely from events.
+	EventExecutionStarted      = "execution.started"
+	EventStrategySelected      = "execution.strategy.selected"
+	EventTargetResolved        = "execution.target.resolved"
+	EventContextPrepared       = "execution.context.prepared"
+	EventModelInvoked          = "execution.model.invoked"
+	EventProviderResponse      = "execution.provider.response"
+	EventArtifactProduced      = "execution.artifact.produced"
+	EventMutationStarted       = "execution.mutation.started"
+	EventMutationCompleted     = "execution.mutation.completed"
+	EventVerificationCompleted = "execution.verification.completed"
+	EventExecutionFinished     = "execution.finished"
+	// EventApprovalRequired is the canonical runtime approval event emitted when
+	// a RuntimeExecutor execution stops at the human-in-the-loop approval gate.
+	// It is distinct from EventApprovalRequested (the patch-engine Tier-4
+	// fallback event) — it carries the runtime request + target.
+	EventApprovalRequired = "approval.required"
+
+	// ── PROVIDER STREAM LIFECYCLE (RuntimeExecutor, live evidence) ───────
+	// These events make a runtime model invocation observable BETWEEN
+	// model.invoked (request begins) and provider.response (successful
+	// completion). They are emitted ONLY by the runtime from a live streaming
+	// invocation and carry provider telemetry — never invented progress:
+	//
+	//   model.invoked  → provider.waiting  → provider.first_token →
+	//   provider.stream_delta* → provider.usage_update* → provider.response
+	//
+	// (*) stream_delta is pure evidence transport: a dropped delta never loses
+	// execution truth because the authoritative content always travels on the
+	// ExecutionResult. usage_update carries provider-reported counts only.
+	EventProviderWaiting     = "provider.waiting"
+	EventProviderFirstToken  = "provider.first_token"
+	EventProviderStreamDelta = "provider.stream_delta"
+	EventProviderUsageUpdate = "provider.usage_update"
+	// EventReasoningTelemetry carries reasoning TELEMETRY ONLY — duration and
+	// the provider-reported reasoning token count when available. Raw
+	// chain-of-thought text NEVER travels on the bus.
+	EventReasoningTelemetry = "reasoning.telemetry"
 )
 
 // FailureClassification is the taxonomy used by EventExecutionFailed. It is
@@ -259,6 +302,155 @@ type StreamUsagePayload struct {
 	OutputTokens int
 	Interrupted  bool
 	Reason       string
+}
+
+// ExecutionStartedPayload opens a runtime execution. RequestID links every
+// subsequent lifecycle event of the same execution.
+type ExecutionStartedPayload struct {
+	RequestID string
+	Mode      string
+	Prompt    string
+}
+
+// StrategySelectedPayload records the deterministic strategy decision the
+// runtime selected for the request. Strategy is the canonical name
+// (targeted_mutation, multi_file_planning, repository_investigation, ...).
+type StrategySelectedPayload struct {
+	RequestID      string
+	Strategy       string
+	ModelRequired  bool
+	StrategyReason string
+}
+
+// TargetResolvedPayload records one deterministically resolved mutation target.
+type TargetResolvedPayload struct {
+	RequestID string
+	Target    string
+	Exists    bool
+	Source    string
+}
+
+// ContextPreparedPayload records the minimum-sufficient context compiled
+// before any model invocation.
+type ContextPreparedPayload struct {
+	RequestID string
+	Channels  []string
+	Tokens    int
+}
+
+// ModelInvokedPayload records a single provider invocation. TokenInput/Output
+// are the authoritative provider-reported usage of the completed call.
+type ModelInvokedPayload struct {
+	RequestID   string
+	Model       string
+	TokenInput  int
+	TokenOutput int
+}
+
+// ProviderResponsePayload records a SUCCESSFUL provider response with the
+// authoritative usage the provider reported. It is emitted only after the
+// invocation returned without error — an artifact can never exist before this
+// event, and a failed invocation never emits it.
+type ProviderResponsePayload struct {
+	RequestID   string
+	Model       string
+	TokenInput  int
+	TokenOutput int
+}
+
+// ArtifactProducedPayload records a parsed artifact (e.g. a patch) produced by
+// a model invocation.
+type ArtifactProducedPayload struct {
+	RequestID string
+	Kind      string // "patch", "plan", "explanation", ...
+	Target    string
+}
+
+// MutationStartedPayload records that the runtime began applying a mutation.
+type MutationStartedPayload struct {
+	RequestID string
+	Targets   []string
+}
+
+// MutationCompletedPayload records a mutation outcome. Outcome uses the
+// execution.MutationOutcome vocabulary (committed, rolled_back, apply_failed,
+// cancelled, ...).
+type MutationCompletedPayload struct {
+	RequestID string
+	Target    string
+	Outcome   string
+}
+
+// VerificationCompletedPayload records the deterministic verification result of
+// a mutation. Passed is the verifier's real verdict; Steps lists the executed
+// step names. It is never rendered "verified" without this real result.
+type VerificationCompletedPayload struct {
+	RequestID string
+	Passed    bool
+	Steps     []string
+}
+
+// ExecutionFinishedPayload is the terminal event of a runtime execution.
+// Success is true only when every stage reached a real terminal success.
+type ExecutionFinishedPayload struct {
+	RequestID string
+	Success   bool
+	Outcome   string
+}
+
+// ApprovalRequiredPayload carries a RuntimeExecutor approval-gate request.
+type ApprovalRequiredPayload struct {
+	RequestID string
+	Target    string
+	Preview   string
+}
+
+// ProviderWaitingPayload records that a provider round-trip is in flight
+// (request sent, no byte received yet). It is emitted when the streaming
+// invocation begins and is the truthful "waiting" state of the model stage.
+type ProviderWaitingPayload struct {
+	RequestID string
+	Model     string
+}
+
+// ProviderFirstTokenPayload records the arrival of the first provider byte of
+// an invocation. Latency is the wall-clock time from invocation begin to the
+// first byte.
+type ProviderFirstTokenPayload struct {
+	RequestID string
+	Model     string
+	Latency   time.Duration
+}
+
+// ProviderStreamDeltaPayload carries one content delta of a live provider
+// stream. It is evidence transport ONLY — the authoritative content always
+// travels on the ExecutionResult, so a dropped delta never loses execution
+// truth.
+type ProviderStreamDeltaPayload struct {
+	RequestID string
+	Delta     string
+}
+
+// ProviderUsageUpdatePayload carries the cumulative provider-reported usage of
+// a live stream. It is emitted ONLY for authoritative counts (Known &&
+// !Estimated) — never a character-count estimate.
+type ProviderUsageUpdatePayload struct {
+	RequestID       string
+	Model           string
+	InputTokens     int
+	OutputTokens    int
+	ReasoningTokens int
+}
+
+// ReasoningTelemetryPayload carries reasoning TELEMETRY ONLY: the wall-clock
+// reasoning duration and the provider-reported reasoning token count when
+// available. It never carries reasoning text — raw chain-of-thought is never
+// exposed.
+type ReasoningTelemetryPayload struct {
+	RequestID string
+	Model     string
+	Duration  time.Duration
+	Tokens    int
 }
 
 // ── Generic event implementation ────────────────────────────────────────────
@@ -478,4 +670,102 @@ func NewStreamUsage(model string, inputTokens, outputTokens int, interrupted boo
 		Interrupted:  interrupted,
 		Reason:       reason,
 	})
+}
+
+// ── Runtime execution lifecycle constructors ────────────────────────────────
+
+// NewExecutionStarted publishes the start of a runtime execution.
+func NewExecutionStarted(requestID, mode, prompt string) DomainEvent {
+	return newEvent(EventExecutionStarted, ExecutionStartedPayload{RequestID: requestID, Mode: mode, Prompt: prompt})
+}
+
+// NewStrategySelected publishes the deterministic strategy decision.
+func NewStrategySelected(requestID, strategy string, modelRequired bool, reason string) DomainEvent {
+	return newEvent(EventStrategySelected, StrategySelectedPayload{
+		RequestID: requestID, Strategy: strategy, ModelRequired: modelRequired, StrategyReason: reason,
+	})
+}
+
+// NewTargetResolved publishes one resolved mutation target.
+func NewTargetResolved(requestID, target string, exists bool, source string) DomainEvent {
+	return newEvent(EventTargetResolved, TargetResolvedPayload{RequestID: requestID, Target: target, Exists: exists, Source: source})
+}
+
+// NewContextPrepared publishes the compiled context envelope.
+func NewContextPrepared(requestID string, channels []string, tokens int) DomainEvent {
+	return newEvent(EventContextPrepared, ContextPreparedPayload{RequestID: requestID, Channels: channels, Tokens: tokens})
+}
+
+// NewModelInvoked publishes that a provider invocation began with the resolved
+// model. It is emitted BEFORE the provider call; authoritative usage travels on
+// NewProviderResponse.
+func NewModelInvoked(requestID, model string, tokenInput, tokenOutput int) DomainEvent {
+	return newEvent(EventModelInvoked, ModelInvokedPayload{RequestID: requestID, Model: model, TokenInput: tokenInput, TokenOutput: tokenOutput})
+}
+
+// NewProviderResponse publishes a successful provider response with its
+// authoritative usage. It is emitted AFTER the invocation completes and MUST
+// precede any artifact.produced event of the same execution.
+func NewProviderResponse(requestID, model string, tokenInput, tokenOutput int) DomainEvent {
+	return newEvent(EventProviderResponse, ProviderResponsePayload{RequestID: requestID, Model: model, TokenInput: tokenInput, TokenOutput: tokenOutput})
+}
+
+// NewArtifactProduced publishes a parsed artifact from a model invocation.
+func NewArtifactProduced(requestID, kind, target string) DomainEvent {
+	return newEvent(EventArtifactProduced, ArtifactProducedPayload{RequestID: requestID, Kind: kind, Target: target})
+}
+
+// NewMutationStarted publishes the start of a mutation application.
+func NewMutationStarted(requestID string, targets []string) DomainEvent {
+	return newEvent(EventMutationStarted, MutationStartedPayload{RequestID: requestID, Targets: targets})
+}
+
+// NewMutationCompleted publishes a mutation outcome for one target.
+func NewMutationCompleted(requestID, target, outcome string) DomainEvent {
+	return newEvent(EventMutationCompleted, MutationCompletedPayload{RequestID: requestID, Target: target, Outcome: outcome})
+}
+
+// NewVerificationCompleted publishes the verifier's real result.
+func NewVerificationCompleted(requestID string, passed bool, steps []string) DomainEvent {
+	return newEvent(EventVerificationCompleted, VerificationCompletedPayload{RequestID: requestID, Passed: passed, Steps: steps})
+}
+
+// NewExecutionFinished publishes the terminal outcome of a runtime execution.
+func NewExecutionFinished(requestID string, success bool, outcome string) DomainEvent {
+	return newEvent(EventExecutionFinished, ExecutionFinishedPayload{RequestID: requestID, Success: success, Outcome: outcome})
+}
+
+// NewApprovalRequired publishes a RuntimeExecutor approval-gate request.
+func NewApprovalRequired(requestID, target, preview string) DomainEvent {
+	return newEvent(EventApprovalRequired, ApprovalRequiredPayload{RequestID: requestID, Target: target, Preview: preview})
+}
+
+// NewProviderWaiting publishes that a provider round-trip is in flight.
+func NewProviderWaiting(requestID, model string) DomainEvent {
+	return newEvent(EventProviderWaiting, ProviderWaitingPayload{RequestID: requestID, Model: model})
+}
+
+// NewProviderFirstToken publishes the arrival of the first provider byte.
+func NewProviderFirstToken(requestID, model string, latency time.Duration) DomainEvent {
+	return newEvent(EventProviderFirstToken, ProviderFirstTokenPayload{RequestID: requestID, Model: model, Latency: latency})
+}
+
+// NewProviderStreamDelta publishes one content delta of a live provider stream
+// (evidence transport only).
+func NewProviderStreamDelta(requestID, delta string) DomainEvent {
+	return newEvent(EventProviderStreamDelta, ProviderStreamDeltaPayload{RequestID: requestID, Delta: delta})
+}
+
+// NewProviderUsageUpdate publishes the cumulative provider-reported usage of a
+// live stream.
+func NewProviderUsageUpdate(requestID, model string, inputTokens, outputTokens, reasoningTokens int) DomainEvent {
+	return newEvent(EventProviderUsageUpdate, ProviderUsageUpdatePayload{
+		RequestID: requestID, Model: model, InputTokens: inputTokens, OutputTokens: outputTokens, ReasoningTokens: reasoningTokens,
+	})
+}
+
+// NewReasoningTelemetry publishes reasoning TELEMETRY only (duration + token
+// count when provided) — never reasoning text.
+func NewReasoningTelemetry(requestID, model string, duration time.Duration, tokens int) DomainEvent {
+	return newEvent(EventReasoningTelemetry, ReasoningTelemetryPayload{RequestID: requestID, Model: model, Duration: duration, Tokens: tokens})
 }

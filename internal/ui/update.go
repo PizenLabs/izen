@@ -335,9 +335,6 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		return m, nil
 
-	case routerResultMsg:
-		return m.handleRouterResult(msg)
-
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -1240,6 +1237,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// success the prepared graph + per-node proposals are staged for the
 		// approval gate.
 		m.pendingHotfixCandidate = nil
+		m.clearEngineFirstMutationState()
 		outcome, outErr := classifyOpErrWithErr(msg.Err)
 		if msg.Err != nil {
 			// A preparation failure never mutates: roll back the owned set.
@@ -1254,6 +1252,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.hotfixActive = false
 			m.activeGraph = nil
 			m.pendingHotfixGraph = nil
+			// ── STRATEGY GRAPH: generation failed under the contract ──
+			m.recordStrategyGraphModelFailed(msg.Err)
 			if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
 				m.sess.StageTaskList(&stashedTasks)
 				_ = m.sess.Save()
@@ -1276,6 +1276,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Authoritative invocation count + aggregate provider usage + per-node
 		// artifact/diff presence. Apply facts merge at the apply terminal.
 		m.recordMultiHotfixProposalProof(msg)
+		// ── STRATEGY GRAPH: the bounded model produced its artifact ──
+		m.recordStrategyGraphProposal()
 		// ── THOUGHT CAPTURE (Ctrl+O) ────────────────────────────────
 		if msg.RawOutput != "" {
 			m.captureHotfixThought(msg.RawOutput)
@@ -1298,6 +1300,23 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.flushPendingRecords(),
 			thoughtDone,
 		)
+
+	case executionResultMsg:
+		// ── RUNTIME EXECUTOR RESULT (authority migration, Steps 2-4) ──
+		// The RuntimeExecutor returned the terminal outcome of an execution
+		// request. The runtime owned every provider invocation, patch creation,
+		// mutation and verification; the UI projects the result and renders the
+		// canonical events (MutationCompleted / VerificationCompleted /
+		// ExecutionFinished) it already receives on the bus. No provider or
+		// PatchManager call lives on this path anymore.
+		return m.executionResultUpdate(msg)
+
+	case gatedExecutionMsg:
+		// ── UNIFIED INTENT GATEWAY RESULT ─────────────────────────────
+		// Every execution-bearing user action (bare text, $prompt, $hot)
+		// produces a gated execution; the update loop projects the runtime
+		// result through the same executionResultUpdate projection.
+		return m.handleGatedExecution(msg)
 
 	case hotfixProposalMsg:
 		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
@@ -1322,6 +1341,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.TokenInput > 0 {
 			m.lastPromptEnvelope.TotalInputTokens = msg.TokenInput
 		}
+		// The generation operation reached its terminal message: release the
+		// engine-first transient state (adaptive budget + branding). The
+		// decision record stays in m.lastExecutionStrategy for $inspect.
+		m.clearEngineFirstMutationState()
 		outcome, outErr := classifyOpErrWithErr(msg.Err)
 		m.finalizeOperation(outcome, outErr)
 		// ── EXECUTION PROOF — GENERATION FACTS (Phase 8) ─────────────
@@ -1366,6 +1389,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				m.push(roleSystem, infoStyle.Render("[HOTFIX] Pipeline PAUSED. No files were modified."))
 			}
 			m.hotfixActive = false
+			// ── STRATEGY GRAPH: generation failed under the contract ──
+			m.recordStrategyGraphModelFailed(msg.Err)
 			if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
 				m.sess.StageTaskList(&stashedTasks)
 				_ = m.sess.Save()
@@ -1378,6 +1403,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				thoughtDone,
 			)
 		}
+
+		// ── STRATEGY GRAPH: the bounded model produced its artifact ──
+		m.recordStrategyGraphProposal()
 
 		// ── FREEZE AND REQUEST AUTHORIZATION ─────────────────────────
 		// Store the synthesized patch + rendered diff proposal. Enter the
@@ -1459,6 +1487,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// focused and editable so the next command can be typed immediately.
 		m.finalizeOperation(OpOutcomeAmbiguous, nil)
 		m.pendingHotfixCandidate = nil
+		m.clearEngineFirstMutationState()
 		m.pendingHotfixAmbiguous = &hotfixAmbiguousData{
 			Task:       msg.Task,
 			Reason:     msg.Reason,
@@ -1660,6 +1689,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			} else {
 				m.completeHotfixProof(msg.exitCode == 0, msg.err == nil)
 			}
+			// ── STRATEGY GRAPH (Phase 11) ────────────────────────────
+			// The compiled execution graph records the apply terminal from the
+			// real result: mutate + verify complete (committed MutationSet) or
+			// failed (rolled back). No-op outside the strategy layer.
+			m.recordStrategyGraphMutation(msg.exitCode == 0)
 			m.finalizeOperation(outcome, msg.err)
 			m.syncUIState()
 
@@ -1697,6 +1731,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					}
 				}
 			}
+			// ── STRATEGY GRAPH (Phase 11) ────────────────────────────
+			// The build failed and rolled the owning MutationSet back: the
+			// compiled execution graph records the failed mutation terminal.
+			m.recordStrategyGraphMutation(false)
 
 			// ── CLEAR DIALOG BUFFER ON TASK FAILURE ────────────────
 			// Wipe the LLM conversation history so the next diagnostic

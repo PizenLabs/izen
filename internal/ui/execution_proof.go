@@ -240,6 +240,11 @@ type ExecutionProof struct {
 	FilesystemChanged  bool
 	VerificationPassed bool
 
+	// ── Engine-first decision (Phase 11) ───────────────────────────
+	// Strategy is the execution strategy the operation was compiled from
+	// ("" when the operation ran outside the strategy layer, e.g. $hot).
+	Strategy string
+
 	// ── Multi-file execution (Phase 9B) ─────────────────────────────
 	// Targets lists every mutation target in stable graph order.
 	Targets []string
@@ -275,6 +280,7 @@ func (m *model) recordHotfixProposalProof(target string, artifactPresent, diffPr
 		OutputUsage:         outputUsage,
 		ArtifactPresent:     artifactPresent,
 		DiffPresent:         diffPresent,
+		Strategy:            string(m.lastExecutionStrategy.Strategy),
 	}
 }
 
@@ -307,6 +313,9 @@ func renderExecutionProof(p ExecutionProof) string {
 	}
 	b.WriteString("\n")
 	b.WriteString("  provider-invocations=" + itoa(p.ProviderInvocations) + "\n")
+	if p.Strategy != "" {
+		b.WriteString("  strategy=" + p.Strategy + "\n")
+	}
 	b.WriteString("  input=" + formatUsageValue(p.InputUsage) + " output=" + formatUsageValue(p.OutputUsage) + "\n")
 	b.WriteString("  artifact=" + boolWord(p.ArtifactPresent) + " diff=" + boolWord(p.DiffPresent) + "\n")
 	b.WriteString("  apply=" + boolWord(p.ApplyExecuted) + " filesystem-changed=" + boolWord(p.FilesystemChanged) + " verify=" + boolWord(p.VerificationPassed))
@@ -351,6 +360,7 @@ func (m *model) recordMultiHotfixProposalProof(msg multiHotfixProposalMsg) {
 		InputUsage:          msg.TokenInput,
 		OutputUsage:         msg.TokenOutput,
 		Targets:             msg.Graph.Targets(),
+		Strategy:            string(m.lastExecutionStrategy.Strategy),
 	}
 	for _, n := range msg.Graph.Nodes {
 		p.Nodes = append(p.Nodes, NodeProof{
@@ -361,6 +371,55 @@ func (m *model) recordMultiHotfixProposalProof(msg multiHotfixProposalMsg) {
 		})
 	}
 	m.lastExecutionProof = p
+}
+
+// recordRuntimeProof retains the runtime-owned execution evidence of a gated
+// RuntimeExecutor execution for $inspect: the authoritative ExecutionProof
+// (strategy, targets, invocations, usage, apply/verify evidence) and the full
+// runtime graph timeline (per-stage kind/state/evidence/timestamps). It is a
+// pure retention of runtime truth — nothing is reconstructed from UI state.
+func (m *model) recordRuntimeProof(res *execution.ExecutionResult) {
+	if res == nil {
+		return
+	}
+	pr := res.Proof
+	if pr == nil {
+		m.lastRuntimeGraph = nil
+		return
+	}
+	m.lastRuntimeGraph = pr.RuntimeGraph
+
+	applied := false
+	failureNode := ""
+	for _, mut := range pr.Mutations {
+		if mut.Outcome == execution.OutcomeChanged || mut.Outcome == execution.OutcomeCreated {
+			applied = true
+		}
+		if mut.Outcome == execution.OutcomeApplyFailed {
+			failureNode = mut.File
+		}
+	}
+	target := ""
+	if len(pr.Targets) > 0 {
+		target = pr.Targets[0]
+	}
+	m.lastExecutionProof = ExecutionProof{
+		OperationID:         pr.RequestID,
+		Target:              target,
+		Targets:             append([]string(nil), pr.Targets...),
+		ProviderInvocations: len(pr.ModelInvocations),
+		InputUsage:          res.Completed.InputTokens,
+		OutputUsage:         res.Completed.OutputTokens,
+		Strategy:            pr.Strategy,
+		ArtifactPresent:     res.ArtifactKind != "",
+		DiffPresent:         res.Diff != "",
+		ApplyExecuted:       applied,
+		FilesystemChanged:   applied,
+		VerificationPassed:  pr.Verification.Passed,
+		MutationSetState:    string(pr.Outcome),
+		RolledBack:          pr.Outcome == execution.OutcomeApplyFailed,
+		FailureNode:         failureNode,
+	}
 }
 
 // completeMultiHotfixProof merges the apply-phase facts into the retained
