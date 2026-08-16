@@ -3383,6 +3383,14 @@ func (m *model) refreshViewportContent() {
 		}
 	}
 
+	// ── Execution narrative panel (Phase 5) ──────────────────────────
+	// The gated RuntimeExecutor path renders its human narrative EXCLUSIVELY
+	// from the execution-view projection (ExecutionNarrative) — never from raw
+	// machine events and never from UI-authored progress text.
+	if panel := m.renderExecutionNarrative(); panel != "" {
+		content.WriteString(panel)
+	}
+
 	if m.streaming {
 		// ── Differential typed stream rendering ─────────────────────
 		// The structured buffer renders KindThinking blocks dimmed (faint +

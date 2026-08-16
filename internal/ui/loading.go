@@ -223,3 +223,37 @@ func (m *model) composeDockTextWithFlake(flake string) string {
 func (m *model) composeDockText() string {
 	return m.composeDockTextWithFlake(SpinnerSnowflake())
 }
+
+// renderExecutionNarrative renders the Claude-like human narrative panel of the
+// gated RuntimeExecutor execution. It is derived EXCLUSIVELY from the
+// execution-view projection (ExecutionViewState + ExecutionNarrative) — the UI
+// never authors progress text and never surfaces raw machine events here. It
+// returns "" when no gated execution is in flight.
+//
+// Shape:
+//
+//	✓ Understanding request
+//	✓ Inspecting index.html
+//	◇ Preparing change          ← current step
+func (m *model) renderExecutionNarrative() string {
+	if m.execView == nil || !m.executionResolving || !m.execView.Active() {
+		return ""
+	}
+	steps := m.execView.HumanTimeline()
+	if len(steps) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	// The last step is the live current step; everything before is a completed
+	// narrative step.
+	last := len(steps) - 1
+	for i, step := range steps {
+		if i == last {
+			b.WriteString("  " + orangeStyle.Render("◇") + " " + brightStyle.Render(step))
+		} else {
+			b.WriteString("  " + infoStyle.Render(Icon.Success+" "+step))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}

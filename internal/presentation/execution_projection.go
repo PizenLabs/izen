@@ -4,7 +4,8 @@
 // context.prepared → model.invoked → provider.response → artifact.produced →
 // approval.required → mutation.completed → verification.completed →
 // execution.finished); this package REDUCES that stream into a concise human
-// narrative plus a single ExecutionViewState the renderer depends on.
+// narrative (ExecutionNarrative) plus a single ExecutionViewState the renderer
+// depends on.
 //
 // The UI never invents state: every narrative line and every state transition
 // here is derived from an observed events.DomainEvent. A terminal event
@@ -14,8 +15,6 @@
 package presentation
 
 import (
-	"fmt"
-
 	"github.com/PizenLabs/izen/internal/events"
 )
 
@@ -28,8 +27,8 @@ const (
 	// PhaseIdle is the resting state: no execution in flight and no terminal
 	// result rendered.
 	PhaseIdle ViewPhase = iota
-	// PhaseRunning carries the current human step (Thinking..., Found target…,
-	// Generated change…).
+	// PhaseRunning carries the current human step (Understanding request,
+	// Inspecting index.html, Generated a proposed change…).
 	PhaseRunning
 	// PhaseWaitingApproval blocks on the human approval gate.
 	PhaseWaitingApproval
@@ -68,11 +67,12 @@ func (p ViewPhase) Terminal() bool {
 type ExecutionViewState struct {
 	// Phase is the execution phase.
 	Phase ViewPhase
-	// Step is the current human step while Phase == PhaseRunning (e.g.
-	// "Thinking...", "Found target index.html", "Generated change").
+	// Step is the current human narrative step while Phase == PhaseRunning
+	// (e.g. "Understanding request", "Inspecting index.html", "Generated a
+	// proposed change").
 	Step string
 	// Outcome is the terminal outcome label when Phase is terminal (e.g.
-	// "completed", "cancelled", "patch_generation_failed").
+	// "completed", "cancelled", "patch_failed").
 	Outcome string
 	// RequestID is the execution this state projects.
 	RequestID string
@@ -100,36 +100,18 @@ func (s ExecutionViewState) Valid() bool {
 }
 
 // ExecutionProjection reduces the canonical runtime event stream into the
-// execution view state plus Debug (machine) and Human (narrative) timelines.
-// It is a single-execution projection: a new execution.started resets it.
+// execution view state plus the ExecutionNarrative (human + machine). It is a
+// single-execution projection: a new execution.started resets it.
 type ExecutionProjection struct {
 	state ExecutionViewState
-
-	// human is the concise human narrative (Thinking…, ✓ Found target…, …).
-	human []string
-	// debug is the developer diagnostics projection (execution.started,
-	// strategy.selected, context.prepared, model.invoked, artifact.produced).
-	debug []string
+	// narrative is the deterministic human/machine narrative layer. The UI
+	// reads it; it never authors narration text.
+	narrative *ExecutionNarrative
 }
 
 // NewExecutionProjection returns an idle single-execution projection.
 func NewExecutionProjection() *ExecutionProjection {
-	return &ExecutionProjection{state: NewIdle()}
-}
-
-// Begin starts the projection for a fresh execution (Running "Thinking...") as
-// the synchronous dispatch-time seed. The first execution.started event (which
-// travels asynchronously on the bus) resets the projection to the identical
-// initial state, so Begin never conflicts with the authoritative stream.
-func (p *ExecutionProjection) Begin(requestID string) {
-	if p == nil {
-		return
-	}
-	*p = ExecutionProjection{
-		state: ExecutionViewState{Phase: PhaseRunning, Step: "Thinking...", RequestID: requestID},
-		human: []string{"Thinking..."},
-		debug: []string{"execution.started"},
-	}
+	return &ExecutionProjection{state: NewIdle(), narrative: NewExecutionNarrative()}
 }
 
 // State returns the current projection state (read-only copy).
@@ -149,32 +131,55 @@ func (p *ExecutionProjection) Active() bool {
 	return p.state.Phase != PhaseIdle
 }
 
-// HumanTimeline returns the concise human narrative lines observed so far.
+// HumanTimeline returns the human narrative sentences observed so far.
 func (p *ExecutionProjection) HumanTimeline() []string {
 	if p == nil {
 		return nil
 	}
-	out := make([]string, len(p.human))
-	copy(out, p.human)
-	return out
+	return p.narrative.Human()
 }
 
-// DebugTimeline returns the developer diagnostics lines observed so far.
+// DebugTimeline returns the machine event records observed so far (the debug
+// projection).
 func (p *ExecutionProjection) DebugTimeline() []string {
 	if p == nil {
 		return nil
 	}
-	out := make([]string, len(p.debug))
-	copy(out, p.debug)
-	return out
+	return p.narrative.Machine()
 }
 
-// HumanStep returns the current human step for a Running state ("" otherwise).
+// HumanStep returns the current human narrative step for a Running state ("").
 func (p *ExecutionProjection) HumanStep() string {
 	if p == nil || p.state.Phase != PhaseRunning {
 		return ""
 	}
-	return p.state.Step
+	return p.narrative.CurrentHuman()
+}
+
+// Narrative returns the execution narrative layer (for consumers that need the
+// full machine/human separation). It is never nil after construction.
+func (p *ExecutionProjection) Narrative() *ExecutionNarrative {
+	if p == nil {
+		return NewExecutionNarrative()
+	}
+	return p.narrative
+}
+
+// Begin starts the projection for a fresh execution (Running "Understanding
+// request") as the synchronous dispatch-time seed. The first
+// execution.started event (which travels asynchronously on the bus) resets the
+// projection to the identical initial state, so Begin never conflicts with the
+// authoritative stream.
+func (p *ExecutionProjection) Begin(requestID string) {
+	if p == nil {
+		return
+	}
+	*p = ExecutionProjection{
+		state:     ExecutionViewState{Phase: PhaseRunning, Step: "Understanding request", RequestID: requestID},
+		narrative: NewExecutionNarrative(),
+	}
+	p.narrative.lines = append(p.narrative.lines, narrativeLine{machine: "execution.started", human: "Understanding request"})
+	p.narrative.current = 0
 }
 
 // Project consumes one canonical runtime lifecycle event and advances the
@@ -192,33 +197,35 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 	if payload == nil {
 		return
 	}
+	// The narrative always records the event (it manages request binding and
+	// reset internally).
+	p.narrative.Project(ev)
+
 	switch pl := payload.(type) {
 	case events.ExecutionStartedPayload:
 		// Fresh execution: reset the projection (single-execution scope).
 		*p = ExecutionProjection{
-			state: ExecutionViewState{Phase: PhaseRunning, Step: "Thinking...", RequestID: pl.RequestID},
-			human: []string{"Thinking..."},
-			debug: []string{"execution.started"},
+			state:     ExecutionViewState{Phase: PhaseRunning, Step: "Understanding request", RequestID: pl.RequestID},
+			narrative: p.narrative,
 		}
 	case events.StrategySelectedPayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
-		p.debug = append(p.debug, fmt.Sprintf("strategy.selected: %s", pl.Strategy))
+		if p.state.Phase == PhaseRunning {
+			p.state.Step = p.narrative.CurrentHuman()
+		}
 	case events.TargetResolvedPayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
 		if p.state.Phase == PhaseRunning {
-			p.state.Step = "Found target " + pl.Target
+			p.state.Step = p.narrative.CurrentHuman()
 		}
-		p.human = append(p.human, "✓ Found target "+pl.Target)
-		p.debug = append(p.debug, fmt.Sprintf("target.resolved: %s (exists=%t)", pl.Target, pl.Exists))
 	case events.ContextPreparedPayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
-		p.debug = append(p.debug, fmt.Sprintf("context.prepared: %d channel(s), ~%d tokens", len(pl.Channels), pl.Tokens))
 	case events.ModelInvokedPayload:
 		if !p.matches(pl.RequestID) {
 			return
@@ -226,29 +233,23 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 		if p.state.Phase == PhaseRunning {
 			p.state.Step = "Thinking..."
 		}
-		p.debug = append(p.debug, "model.invoked: "+pl.Model)
 	case events.ProviderResponsePayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
-		p.debug = append(p.debug, fmt.Sprintf("provider.response: %s (%d in / %d out)", pl.Model, pl.TokenInput, pl.TokenOutput))
 	case events.ArtifactProducedPayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
 		if p.state.Phase == PhaseRunning {
-			p.state.Step = "Generated change"
+			p.state.Step = p.narrative.CurrentHuman()
 		}
-		p.human = append(p.human, "✓ Generated change")
-		p.debug = append(p.debug, fmt.Sprintf("artifact.produced: %s (%s)", pl.Kind, pl.Target))
 	case events.ApprovalRequiredPayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
 		p.state.Phase = PhaseWaitingApproval
 		p.state.Step = "Waiting for approval"
-		p.human = append(p.human, "Waiting for approval")
-		p.debug = append(p.debug, "approval.required: "+pl.Target)
 	case events.MutationStartedPayload:
 		if !p.matches(pl.RequestID) {
 			return
@@ -256,24 +257,21 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 		if p.state.Phase == PhaseWaitingApproval {
 			p.state.Phase = PhaseRunning
 		}
-		p.state.Step = "Applying..."
-		p.debug = append(p.debug, fmt.Sprintf("mutation.started: %d target(s)", len(pl.Targets)))
+		p.state.Step = "Applying changes"
 	case events.MutationCompletedPayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
-		if mutationSucceeded(pl.Outcome) {
-			p.human = append(p.human, "✓ Applied")
+		if p.state.Phase == PhaseRunning {
+			p.state.Step = p.narrative.CurrentHuman()
 		}
-		p.debug = append(p.debug, fmt.Sprintf("mutation.completed: %s (%s)", pl.Target, pl.Outcome))
 	case events.VerificationCompletedPayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
-		if pl.Passed {
-			p.human = append(p.human, "✓ Verified")
+		if p.state.Phase == PhaseRunning {
+			p.state.Step = p.narrative.CurrentHuman()
 		}
-		p.debug = append(p.debug, fmt.Sprintf("verification.completed: passed=%t (%d step(s))", pl.Passed, len(pl.Steps)))
 	case events.ExecutionFinishedPayload:
 		if !p.matches(pl.RequestID) {
 			return
@@ -283,20 +281,16 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 			p.state = ExecutionViewState{
 				Phase: PhaseCompleted, Outcome: pl.Outcome, RequestID: pl.RequestID,
 			}
-			p.human = append(p.human, "✓ Completed")
 		case pl.Outcome == "cancelled":
 			// A clean cancellation is a terminal, non-failure outcome.
 			p.state = ExecutionViewState{
 				Phase: PhaseCompleted, Outcome: "cancelled", RequestID: pl.RequestID,
 			}
-			p.human = append(p.human, "Cancelled")
 		default:
 			p.state = ExecutionViewState{
 				Phase: PhaseFailed, Outcome: pl.Outcome, RequestID: pl.RequestID,
 			}
-			p.human = append(p.human, "✗ Failed")
 		}
-		p.debug = append(p.debug, fmt.Sprintf("execution.finished: success=%t (%s)", pl.Success, pl.Outcome))
 	case events.ExecutionFailedPayload:
 		// execution.failed may arrive before execution.finished; both are
 		// terminal transitions. The finished event carries the authoritative
@@ -306,7 +300,6 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 				Phase: PhaseFailed, Outcome: pl.Stage, RequestID: p.state.RequestID,
 			}
 		}
-		p.debug = append(p.debug, fmt.Sprintf("execution.failed: %s (%s)", pl.Classification, pl.Stage))
 	}
 }
 
@@ -317,14 +310,4 @@ func (p *ExecutionProjection) matches(requestID string) bool {
 		return true
 	}
 	return p.state.RequestID == requestID
-}
-
-// mutationSucceeded reports whether a MutationOutcome string denotes success.
-func mutationSucceeded(outcome string) bool {
-	switch outcome {
-	case "changed", "created", "committed":
-		return true
-	default:
-		return false
-	}
 }

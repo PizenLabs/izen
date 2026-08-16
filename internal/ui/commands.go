@@ -381,14 +381,12 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 
 	content := strings.TrimSpace(line)
 
-	// ── $hot FAST-TRACK ─────────────────────────────────────────────────
-	// Any message starting with $hot bypasses ALL plan generation and
-	// diagnostic loops, routing directly to the /build engine for instant
-	// execution. Also strip the $hot prefix before passing to build.
-	if strings.HasPrefix(strings.TrimSpace(content), "$hot") {
-		hotContent := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(content), "$hot"))
-		return m.runBuildCmd(hotContent)
-	}
+	// ── $hot routes EXCLUSIVELY through the unified IntentGateway ────
+	// $hot is an execution directive: the AST parser classifies it and
+	// dispatchDirectives routes it through runHotExecution → runGatedLine
+	// (IntentGateway.Gate → RuntimeExecutor.Execute). There is NO legacy
+	// provider-path branch here — the runtime owns every $hot execution and the
+	// UI only submits the request and projects the events.
 
 	if m.resolver.Current() == modes.ModeBuild && m.graph != nil {
 		compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.ObjectiveIntent())

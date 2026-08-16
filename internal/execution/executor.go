@@ -16,6 +16,7 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/events"
+	runtimegraph "github.com/PizenLabs/izen/internal/execution/graph"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/language"
 )
@@ -80,17 +81,47 @@ type GraphStep struct {
 // ExecutionProof is the authoritative evidence account of one execution. It is
 // produced ONLY by the runtime and reflects real runtime boundaries.
 type ExecutionProof struct {
-	RequestID        string             `json:"request_id"`
-	Strategy         string             `json:"strategy"`
-	StrategyReason   string             `json:"strategy_reason"`
-	Targets          []string           `json:"targets"`
-	Graph            []GraphStep        `json:"graph"`
-	ModelInvocations []ModelInvocation  `json:"model_invocations"`
-	Mutations        []MutationEvidence `json:"mutations"`
-	Verification     VerificationReport `json:"verification"`
-	Outcome          MutationOutcome    `json:"outcome"`
-	StartedAt        time.Time          `json:"started_at"`
-	FinishedAt       time.Time          `json:"finished_at"`
+	RequestID      string      `json:"request_id"`
+	Strategy       string      `json:"strategy"`
+	StrategyReason string      `json:"strategy_reason"`
+	Targets        []string    `json:"targets"`
+	Graph          []GraphStep `json:"graph"`
+	// RuntimeGraph is the runtime-owned execution graph evidence: the ordered,
+	// per-stage lifecycle record produced by graph transitions. It is the
+	// authoritative execution timeline; Graph is its compact projection.
+	RuntimeGraph     []runtimegraph.StageSnapshot `json:"runtime_graph"`
+	ModelInvocations []ModelInvocation            `json:"model_invocations"`
+	Mutations        []MutationEvidence           `json:"mutations"`
+	Verification     VerificationReport           `json:"verification"`
+	// AffectedFiles is the set of files a mutation execution actually mutated.
+	AffectedFiles []string `json:"affected_files,omitempty"`
+	// DiffSummary is the compact per-file diff accounting of the mutation
+	// (e.g. "index.html +12/-4").
+	DiffSummary []string `json:"diff_summary,omitempty"`
+	// TransactionID is the MutationSet transaction identity of the mutation.
+	TransactionID string `json:"transaction_id,omitempty"`
+	// ContextDecisions records the strategy-owned context decisions (policy,
+	// budget, per-item inclusion reasons) of the execution.
+	ContextDecisions []ContextDecision `json:"context_decisions,omitempty"`
+	Outcome          MutationOutcome   `json:"outcome"`
+	StartedAt        time.Time         `json:"started_at"`
+	FinishedAt       time.Time         `json:"finished_at"`
+}
+
+// ContextDecision is one strategy-owned context decision recorded in the
+// execution proof: which policy applied, the budget, and why each context item
+// was included.
+type ContextDecision struct {
+	Policy string                `json:"policy"`
+	Budget int                   `json:"budget"`
+	Items  []ContextItemDecision `json:"items"`
+}
+
+// ContextItemDecision names a context channel and its deterministic inclusion
+// reason — the compiler never includes context it cannot explain.
+type ContextItemDecision struct {
+	Kind   string `json:"kind"`
+	Reason string `json:"reason"`
 }
 
 // ExecutionResult is the full result of one runtime execution.
@@ -133,13 +164,17 @@ type pendingMutation struct {
 	mode           string
 	target         string
 	original       string
-	patch          *Patch
+	patches        []*Patch
+	diffs          []string
 	ms             *MutationSet
 	strategy       string
 	strategyReason string
 	targets        []string
 	modelCalls     []ModelInvocation
 	startedAt      time.Time
+	// g is the runtime-owned execution graph resumed at approval time. It is
+	// the single lifecycle authority of the whole execution.
+	g *runtimegraph.Graph
 }
 
 // RuntimeExecutor is the runtime-owned execution boundary.
@@ -300,7 +335,10 @@ func (x *RuntimeExecutor) resolveModel() (string, error) {
 	return model, nil
 }
 
-// Execute runs the deterministic execution flow for req. For a targeted
+// Execute runs the deterministic execution flow for req, driving the
+// runtime-owned ExecutionGraph. The graph is the single lifecycle authority:
+// every canonical lifecycle event is generated from a graph transition, and
+// the graph's stage evidence folds into ExecutionProof. For a targeted
 // mutation it stops at the approval gate and returns PendingPatchID; the
 // caller resolves it via Approve/Reject.
 func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*ExecutionResult, error) {
@@ -315,21 +353,30 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	}
 
 	start := time.Now()
-	x.emit(events.NewExecutionStarted(requestID, req.Mode, req.Prompt))
-	res.Proof.Graph = append(res.Proof.Graph, GraphStep{Stage: "resolve_target", State: "started", Started: time.Now()})
+	// ── RUNTIME-OWNED EXECUTION GRAPH (Phase 5) ───────────────────────
+	// Every execution drives the explicit graph. Transitions generate events;
+	// stage evidence becomes the proof timeline. The UI only projects.
+	g := runtimegraph.New(requestID, x.emit)
+	setProofGraph(res, g)
+	g.Start(req.Mode, req.Prompt)
+	g.CompleteUserIntent()
 
 	// ── 1. Strategy selection ──────────────────────────────────────────
 	profile, err := x.selectStrategy(ctx, req)
 	if err != nil {
-		x.fail(ctx, res, err)
+		g.FailExecution(events.FailureRecoverable, err, "executor")
+		res.Err = err
+		res.Proof.Outcome = OutcomeFailed
+		res.Proof.FinishedAt = time.Now()
+		setProofGraph(res, g)
 		return res, err
 	}
 	res.Strategy = string(profile.Strategy)
 	res.StrategyReason = profile.StrategyReason
 	res.Proof.Strategy = res.Strategy
 	res.Proof.StrategyReason = profile.StrategyReason
-	x.emit(events.NewStrategySelected(requestID, res.Strategy, profile.ModelRequired, profile.StrategyReason))
-	res.Proof.Graph = append(res.Proof.Graph, GraphStep{Stage: "strategy_selected", State: res.Strategy, Started: time.Now()})
+	res.Proof.ContextDecisions = contextDecisions(profile)
+	g.CompleteStrategy(res.Strategy, profile.ModelRequired, profile.StrategyReason)
 
 	// ── 2. Target resolution ───────────────────────────────────────────
 	targets := req.Targets
@@ -346,8 +393,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	res.Targets = targets
 	res.Proof.Targets = targets
 	for _, t := range targets {
-		exists := fileExists(filepath.Join(x.root, t))
-		x.emit(events.NewTargetResolved(requestID, t, exists, "strategy"))
+		g.CompleteTarget(t, fileExists(filepath.Join(x.root, t)), "strategy")
 	}
 
 	// ── 3. Human clarification (no model, no mutation) ────────────────
@@ -356,19 +402,22 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// outcome is a human stop, never a completed execution. The human is the
 	// authority; no file is read into a prompt and no mutation is proposed.
 	if profile.Strategy == strategy.HumanClarification {
+		skipTail(g, "human clarification")
+		g.CancelExecution("clarification_required")
 		res.ClarificationRequired = true
 		res.Proof.Outcome = OutcomeCancelled
 		res.Proof.FinishedAt = time.Now()
-		x.emit(events.NewExecutionFinished(requestID, false, "clarification_required"))
+		setProofGraph(res, g)
 		return res, nil
 	}
 
 	// ── 4. Deterministic strategies (zero model) ───────────────────────
 	if profile.Deterministic {
-		res.Proof.Graph = append(res.Proof.Graph, GraphStep{Stage: "deterministic", State: "completed", Started: time.Now()})
+		skipTail(g, "deterministic execution")
+		g.CompleteExecution("deterministic")
 		res.Proof.Outcome = OutcomeNoArtifact
 		res.Proof.FinishedAt = time.Now()
-		x.emit(events.NewExecutionFinished(requestID, true, "deterministic"))
+		setProofGraph(res, g)
 		return res, nil
 	}
 
@@ -380,26 +429,32 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		profile.Strategy != strategy.DirectResponse &&
 		profile.Strategy != strategy.MultiFilePlanning &&
 		profile.Strategy != strategy.RepositoryInvestigation {
+		skipTail(g, "clarification required")
+		g.CancelExecution("clarification_required")
 		res.ClarificationRequired = true
 		res.Proof.Outcome = OutcomeCancelled
 		res.Proof.FinishedAt = time.Now()
-		x.emit(events.NewExecutionFinished(requestID, false, "clarification_required"))
+		setProofGraph(res, g)
 		return res, nil
 	}
 
 	if x.provider == nil {
-		x.fail(ctx, res, fmt.Errorf("executor: strategy %q requires a provider but none is configured", res.Strategy))
+		err := fmt.Errorf("executor: strategy %q requires a provider but none is configured", res.Strategy)
+		g.FailExecution(events.FailureRecoverable, err, "executor")
+		res.Err = err
+		res.Proof.Outcome = OutcomeFailed
+		res.Proof.FinishedAt = time.Now()
+		setProofGraph(res, g)
 		return res, res.Err
 	}
 
 	// ── 6. Context compilation ─────────────────────────────────────────
-	// The strategy owns the context contract: profile.ContextPolicy decides
-	// what crosses (zero for direct_response, target content for a targeted
-	// mutation, repository evidence for investigation). The generic compiler
-	// never decides.
+	// The strategy owns the context contract: profile.ContextPolicy and
+	// profile.ContextBudget decide what crosses (zero for direct_response,
+	// target content for a targeted mutation, repository evidence for
+	// investigation). The generic compiler never decides.
 	contextChannels, contextTokens := x.compileContext(profile, targets)
-	x.emit(events.NewContextPrepared(requestID, contextChannels, contextTokens))
-	res.Proof.Graph = append(res.Proof.Graph, GraphStep{Stage: "context_prepared", State: "completed", Started: time.Now()})
+	g.CompleteContext(contextChannels, contextTokens)
 
 	// ── 7. Read-only strategies (targeted_reasoning / direct_response /
 	// multi_file_planning / repository_investigation): one bounded invocation,
@@ -411,82 +466,86 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// model.invoked, NO provider.response and NO artifact.produced — a failed
 	// execution must never emit a misleading success artifact.
 	if profile.Strategy != strategy.TargetedMutation {
-		content, inv, err := x.invokeReadOnly(ctx, req, requestID, profile, targets)
+		content, inv, err := x.invokeReadOnly(ctx, req, requestID, profile, targets, g)
 		if err != nil {
+			g.FailExecution(events.FailureRecoverable, err, "executor.model")
 			res.Err = err
 			res.Proof.Outcome = OutcomeFailed
 			res.Proof.FinishedAt = time.Now()
-			x.emit(events.NewExecutionFailed(events.FailureRecoverable, err, "executor.model"))
-			x.emit(events.NewExecutionFinished(requestID, false, string(OutcomeFailed)))
+			setProofGraph(res, g)
 			return res, err
 		}
 		res.ModelCalls = append(res.ModelCalls, inv)
 		res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, inv)
 		res.ArtifactKind = artifactKindFor(profile)
 		res.Content = content
-		x.emit(events.NewArtifactProduced(requestID, res.ArtifactKind, firstTarget(targets)))
-		res.Proof.Graph = append(res.Proof.Graph, GraphStep{Stage: "artifact_produced", State: res.ArtifactKind, Started: time.Now()})
+		g.CompleteArtifact(res.ArtifactKind, firstTarget(targets))
+		g.Skip(runtimegraph.StageApprovalGate, "read-only execution")
+		g.Skip(runtimegraph.StageMutationTransaction, "read-only execution")
+		g.Skip(runtimegraph.StageVerification, "read-only execution")
+		g.CompleteExecution(string(OutcomeCompleted))
 		res.Proof.Outcome = OutcomeCompleted
 		res.Proof.FinishedAt = time.Now()
-		x.emit(events.NewExecutionFinished(requestID, true, string(OutcomeCompleted)))
+		setProofGraph(res, g)
 		return res, nil
 	}
 
-	// ── 7. Targeted mutation: model invocation ─────────────────────────
-	original, modified, raw, inv, err := x.invokeMutation(ctx, req, requestID, targets)
+	// ── 7. Targeted mutation: per-target model invocation ──────────────
+	patches, invs, diffs, err := x.invokeMutation(ctx, req, requestID, targets, g)
 	if err != nil {
+		g.FailExecution(events.FailureRecoverable, err, "executor.model")
 		res.ArtifactKind = ""
 		res.Err = err
 		res.Proof.Outcome = OutcomePatchGenerationFailed
 		res.Proof.FinishedAt = time.Now()
-		x.emit(events.NewExecutionFailed(events.FailureRecoverable, err, "executor.model"))
-		x.emit(events.NewExecutionFinished(requestID, false, string(OutcomePatchGenerationFailed)))
+		setProofGraph(res, g)
 		return res, err
 	}
-	res.ModelCalls = append(res.ModelCalls, inv)
-	res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, inv)
+	res.ModelCalls = append(res.ModelCalls, invs...)
+	res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, invs...)
 
 	// ── 8. Artifact production ─────────────────────────────────────────
 	target := targets[0]
-	patch := &Patch{
-		ID:       fmt.Sprintf("%s-patch", requestID),
-		File:     target,
-		Original: original,
-		Modified: modified,
-	}
 	res.ArtifactKind = "patch"
-	res.Original = original
-	res.Content = modified
-	res.Diff = x.compileDiff(raw, target, original)
-	x.emit(events.NewArtifactProduced(requestID, "patch", target))
-	res.Proof.Graph = append(res.Proof.Graph, GraphStep{Stage: "artifact_produced", State: "patch", Started: time.Now()})
+	res.Original = patches[0].Original
+	res.Content = patches[0].Modified
+	res.Diff = diffs[0]
+	for _, p := range patches {
+		g.CompleteArtifact("patch", p.File)
+	}
 
 	// ── 9. Approval gate ───────────────────────────────────────────────
 	pm := &pendingMutation{
 		requestID:      requestID,
 		mode:           req.Mode,
 		target:         target,
-		original:       original,
-		patch:          patch,
+		original:       res.Original,
+		patches:        patches,
+		diffs:          diffs,
 		strategy:       res.Strategy,
 		strategyReason: res.StrategyReason,
 		targets:        targets,
 		modelCalls:     res.ModelCalls,
 		startedAt:      start,
+		g:              g,
 	}
 	x.mu.Lock()
-	x.pending[patch.ID] = pm
+	x.pending[patches[0].ID] = pm
 	x.mu.Unlock()
-	res.PendingPatchID = patch.ID
+	res.PendingPatchID = patches[0].ID
 	res.Proof.Outcome = OutcomeNoArtifact // pending approval
 	res.Proof.FinishedAt = time.Now()
-	x.emit(events.NewApprovalRequired(requestID, target, res.Diff))
+	g.WaitApproval(target, res.Diff)
+	setProofGraph(res, g)
 	return res, nil
 }
 
-// Approve resolves the approval gate: it applies the held patch through the
-// PatchManager (owning the filesystem write + verification gate), commits the
-// MutationSet, and returns the terminal result with evidence.
+// Approve resolves the approval gate: it applies the held patch(es) through the
+// PatchManager inside ONE MutationSet transaction (owning the filesystem write
+// + verification gate), commits the MutationSet, and returns the terminal
+// result with evidence. The runtime-owned execution graph is resumed and driven
+// through the mutation/verification/completion stages — every event comes from
+// a graph transition.
 func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*ExecutionResult, error) {
 	x.mu.Lock()
 	pm, ok := x.pending[patchID]
@@ -506,7 +565,7 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		Targets:        pm.targets,
 		ModelCalls:     pm.modelCalls,
 		ArtifactKind:   "patch",
-		Content:        pm.patch.Modified,
+		Content:        pm.patches[0].Modified,
 		Proof: &ExecutionProof{
 			RequestID:        pm.requestID,
 			Strategy:         pm.strategy,
@@ -516,6 +575,11 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 			StartedAt:        pm.startedAt,
 		},
 	}
+	g := pm.g
+	if g == nil {
+		g = runtimegraph.New(pm.requestID, x.emit)
+	}
+	setProofGraph(res, g)
 
 	// The runtime owns a fresh mutation boundary for this apply.
 	ms := NewMutationSet()
@@ -525,38 +589,59 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		x.verifier.SetAuthorization(x.auth)
 	}
 	pm.ms = ms
+	res.Proof.TransactionID = ms.ID
 
-	x.emit(events.NewMutationStarted(pm.requestID, pm.targets))
-	res.Proof.Graph = append(res.Proof.Graph, GraphStep{Stage: "mutate", State: "started", Started: time.Now()})
+	g.BeginMutation(pm.targets)
+	setProofGraph(res, g)
 
+	// ── Apply EVERY held patch inside the single MutationSet transaction ──
 	applyCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	if err := x.patches.ApplyContext(applyCtx, pm.patch); err != nil {
+	var applyErr error
+	for _, p := range pm.patches {
+		if err := x.patches.ApplyContext(applyCtx, p); err != nil {
+			applyErr = err
+			break
+		}
+	}
+	if applyErr != nil {
 		_ = ms.RollbackTo(MutationFailed)
 		outcome := OutcomeApplyFailed
-		if ms.OutcomeFor(pm.target) != OutcomeNoArtifact {
-			outcome = ms.OutcomeFor(pm.target)
+		for _, p := range pm.patches {
+			if ms.OutcomeFor(p.File) != OutcomeNoArtifact {
+				outcome = ms.OutcomeFor(p.File)
+				break
+			}
 		}
 		res.Mutations = append(res.Mutations, ms.Outcomes...)
 		res.Proof.Mutations = res.Mutations
 		res.Proof.Outcome = outcome
+		for _, p := range pm.patches {
+			g.CompleteMutation(p.File, string(outcome))
+		}
+		g.FailExecution(events.FailureRecoverable, applyErr, "executor.mutation")
+		res.Err = applyErr
 		res.Proof.FinishedAt = time.Now()
-		x.emit(events.NewMutationCompleted(pm.requestID, pm.target, string(outcome)))
-		x.emit(events.NewExecutionFailed(events.FailureRecoverable, err, "executor.mutation"))
-		x.emit(events.NewExecutionFinished(pm.requestID, false, string(outcome)))
-		res.Err = err
-		return res, err
+		setProofGraph(res, g)
+		return res, applyErr
 	}
 
+	// ── Commit the transaction ─────────────────────────────────────────
 	outcome := OutcomeChanged
-	if ms.OutcomeFor(pm.target) != OutcomeNoArtifact {
-		outcome = ms.OutcomeFor(pm.target)
+	for _, p := range pm.patches {
+		if o := ms.OutcomeFor(p.File); o != OutcomeNoArtifact {
+			outcome = o
+		}
 	}
 	_ = ms.Commit()
 	res.Mutations = append(res.Mutations, ms.Outcomes...)
 	res.Proof.Mutations = res.Mutations
 	res.Proof.Outcome = outcome
-	res.Proof.Graph = append(res.Proof.Graph, GraphStep{Stage: "mutate", State: "committed", Started: time.Now()})
+	res.Proof.AffectedFiles = append([]string(nil), pm.targets...)
+	res.Proof.DiffSummary = pm.diffs
+	for _, p := range pm.patches {
+		g.CompleteMutation(p.File, string(outcome))
+	}
 
 	// ── Verification evidence comes from the real verifier ─────────────
 	if x.verifier != nil {
@@ -568,19 +653,21 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		for _, s := range report.Results {
 			steps = append(steps, s.Step.Name)
 		}
-		x.emit(events.NewVerificationCompleted(pm.requestID, report.Passed, steps))
-		res.Proof.Graph = append(res.Proof.Graph, GraphStep{Stage: "verify", State: fmt.Sprintf("passed=%t", report.Passed), Started: time.Now()})
+		g.CompleteVerification(report.Passed, steps)
+	} else {
+		g.Skip(runtimegraph.StageVerification, "no verifier attached")
 	}
 
-	x.emit(events.NewMutationCompleted(pm.requestID, pm.target, string(outcome)))
-	x.emit(events.NewExecutionFinished(pm.requestID, true, string(outcome)))
+	g.CompleteExecution(string(outcome))
 	res.Proof.FinishedAt = time.Now()
+	setProofGraph(res, g)
 	return res, nil
 }
 
-// Reject resolves the approval gate negatively: the held patch is never
+// Reject resolves the approval gate negatively: the held patches are never
 // applied and the mutation boundary is rolled back (restoring any recorded
-// snapshot — none exist yet, since apply never ran).
+// snapshot — none exist yet, since apply never ran). The graph is cancelled
+// cleanly.
 func (x *RuntimeExecutor) Reject(ctx context.Context, patchID, reason string) (*ExecutionResult, error) {
 	x.mu.Lock()
 	pm, ok := x.pending[patchID]
@@ -609,16 +696,20 @@ func (x *RuntimeExecutor) Reject(ctx context.Context, patchID, reason string) (*
 			StartedAt:        pm.startedAt,
 		},
 	}
+	g := pm.g
+	if g == nil {
+		g = runtimegraph.New(pm.requestID, x.emit)
+	}
 	ms := NewMutationSet()
-	if pm.patch != nil {
-		_ = ms.Record(pm.patch.File)
+	for _, p := range pm.patches {
+		_ = ms.Record(p.File)
 	}
 	_ = ms.RollbackTo(MutationCancelled)
+	g.CancelExecution(string(OutcomeCancelled))
 	res.Proof.Mutations = ms.Outcomes
 	res.Proof.Outcome = OutcomeCancelled
 	res.Proof.FinishedAt = time.Now()
-	res.Proof.Graph = append(res.Proof.Graph, GraphStep{Stage: "approval", State: "rejected", Started: time.Now()})
-	x.emit(events.NewExecutionFinished(pm.requestID, false, string(OutcomeCancelled)))
+	setProofGraph(res, g)
 	return res, nil
 }
 
@@ -699,61 +790,84 @@ func (x *RuntimeExecutor) compileContext(profile strategy.ExecutionStrategyProfi
 	return channels, estimateTokens(b.String())
 }
 
-func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, requestID string, targets []string) (original, modified, raw string, inv ModelInvocation, err error) {
-	target := targets[0]
-	path := filepath.Join(x.root, target)
-	data, readErr := os.ReadFile(path)
-	if readErr != nil && !os.IsNotExist(readErr) {
-		return "", "", "", inv, fmt.Errorf("executor: read target %s: %w", target, readErr)
+// invokeMutation performs the bounded provider invocation(s) for a targeted
+// mutation — one bounded call per resolved target. It drives the model stage of
+// the execution graph: model.invoked is emitted BEFORE each provider call and
+// provider.response ONLY after a successful response. On any failure it returns
+// the error and emits neither response nor artifact. The returned patches carry
+// the full resolved content of each target; the diffs are the authoritative
+// unified diffs for rendering.
+func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, requestID string, targets []string, g *runtimegraph.Graph) ([]*Patch, []ModelInvocation, []string, error) {
+	if len(targets) == 0 {
+		return nil, nil, nil, fmt.Errorf("executor: no mutation target resolved")
 	}
-	original = string(data)
-
 	if x.provider == nil {
-		return original, "", "", inv, fmt.Errorf("executor: no provider configured for model invocation")
+		return nil, nil, nil, fmt.Errorf("executor: no provider configured for model invocation")
 	}
 
-	system := boundedMutationSystemPrompt()
-	user := buildMutationUserPrompt(req.Prompt, target, original)
 	model, modelErr := x.resolveModel()
 	if modelErr != nil {
-		return original, "", "", inv, modelErr
+		return nil, nil, nil, modelErr
 	}
-	aiReq := ai.Request{
-		Model:     model,
-		System:    system,
-		Messages:  []ai.Message{{Role: "user", Content: user}},
-		MaxTokens: req.MaxOutputTokens,
-	}
-	// model.invoked is emitted when the invocation BEGINS — before the provider
-	// call — so the event stream truthfully records the invocation start.
-	x.emit(events.NewModelInvoked(requestID, model, 0, 0))
-	resp, callErr := x.provider.Execute(ctx, aiReq)
-	if callErr != nil {
-		return original, "", "", inv, fmt.Errorf("executor: model invocation: %w", callErr)
-	}
-	if resp == nil {
-		return original, "", "", inv, fmt.Errorf("executor: model returned an empty response")
-	}
-	inv.Model = model
-	if resp.Usage.Known {
-		inv.TokenInput = resp.Usage.PromptTokens
-		inv.TokenOutput = resp.Usage.CompletionTokens
-	} else {
-		inv.TokenInput = resp.TokenInput
-		inv.TokenOutput = resp.TokenOutput
-	}
-	// provider.response is emitted ONLY on a successful response — the
-	// authoritative usage travels here. No artifact may precede it.
-	x.emit(events.NewProviderResponse(requestID, model, inv.TokenInput, inv.TokenOutput))
 
-	raw = strings.TrimSpace(resp.Content)
-	modified = ResolveModifiedContent(original, raw)
-	if modified == "" {
-		// The model returned only prose or a fence without content — treat the
-		// full response as the replacement attempt (best-effort).
-		modified = raw
+	patches := make([]*Patch, 0, len(targets))
+	invs := make([]ModelInvocation, 0, len(targets))
+	diffs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		path := filepath.Join(x.root, target)
+		data, readErr := os.ReadFile(path)
+		if readErr != nil && !os.IsNotExist(readErr) {
+			return nil, nil, nil, fmt.Errorf("executor: read target %s: %w", target, readErr)
+		}
+		original := string(data)
+
+		system := boundedMutationSystemPrompt()
+		user := buildMutationUserPrompt(req.Prompt, target, original)
+		aiReq := ai.Request{
+			Model:     model,
+			System:    system,
+			Messages:  []ai.Message{{Role: "user", Content: user}},
+			MaxTokens: req.MaxOutputTokens,
+		}
+		// model.invoked is emitted when the invocation BEGINS — before the
+		// provider call — so the event stream truthfully records the start.
+		g.BeginModel(model)
+		resp, callErr := x.provider.Execute(ctx, aiReq)
+		if callErr != nil {
+			return nil, nil, nil, fmt.Errorf("executor: model invocation: %w", callErr)
+		}
+		if resp == nil {
+			return nil, nil, nil, fmt.Errorf("executor: model returned an empty response")
+		}
+		inv := ModelInvocation{Model: model}
+		if resp.Usage.Known {
+			inv.TokenInput = resp.Usage.PromptTokens
+			inv.TokenOutput = resp.Usage.CompletionTokens
+		} else {
+			inv.TokenInput = resp.TokenInput
+			inv.TokenOutput = resp.TokenOutput
+		}
+		// provider.response is emitted ONLY on a successful response — the
+		// authoritative usage travels here. No artifact may precede it.
+		g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
+		invs = append(invs, inv)
+
+		raw := strings.TrimSpace(resp.Content)
+		modified := ResolveModifiedContent(original, raw)
+		if modified == "" {
+			// The model returned only prose or a fence without content — treat
+			// the full response as the replacement attempt (best-effort).
+			modified = raw
+		}
+		patches = append(patches, &Patch{
+			ID:       fmt.Sprintf("%s-patch-%d", requestID, len(patches)+1),
+			File:     target,
+			Original: original,
+			Modified: modified,
+		})
+		diffs = append(diffs, x.compileDiff(raw, target, original))
 	}
-	return original, modified, raw, inv, nil
+	return patches, invs, diffs, nil
 }
 
 // compileDiff runs the changeset pipeline over the raw model output to produce
@@ -779,7 +893,7 @@ func (x *RuntimeExecutor) compileDiff(raw, target, original string) string {
 // successful response; a failure returns an error and emits neither — the
 // artifact can never precede the response that produced it. The response is
 // owned by the runtime and never reaches the UI raw.
-func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string) (content string, inv ModelInvocation, err error) {
+func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) (content string, inv ModelInvocation, err error) {
 	if x.provider == nil {
 		return "", inv, fmt.Errorf("executor: no provider configured for read-only invocation")
 	}
@@ -817,7 +931,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	}
 	// model.invoked is emitted when the invocation BEGINS — before the provider
 	// call — so the event stream truthfully records the invocation start.
-	x.emit(events.NewModelInvoked(requestID, model, 0, 0))
+	g.BeginModel(model)
 	resp, callErr := x.provider.Execute(ctx, aiReq)
 	if callErr != nil {
 		return "", inv, fmt.Errorf("executor: read-only invocation: %w", callErr)
@@ -835,7 +949,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	}
 	// provider.response is emitted ONLY on a successful response — the
 	// authoritative usage travels here. No artifact may precede it.
-	x.emit(events.NewProviderResponse(requestID, model, inv.TokenInput, inv.TokenOutput))
+	g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
 	return strings.TrimSpace(resp.Content), inv, nil
 }
 
@@ -876,12 +990,83 @@ func firstTarget(targets []string) string {
 	return targets[0]
 }
 
-func (x *RuntimeExecutor) fail(_ context.Context, res *ExecutionResult, err error) {
-	res.Err = err
-	res.Proof.Outcome = OutcomeFailed
-	res.Proof.FinishedAt = time.Now()
-	x.emit(events.NewExecutionFailed(events.FailureRecoverable, err, "executor"))
-	x.emit(events.NewExecutionFinished(res.RequestID, false, string(OutcomeFailed)))
+// skipTail marks every stage after context compilation as explicitly skipped
+// with the given reason (clarification / deterministic paths never reach the
+// model or mutation boundaries). Skipped stages emit no canonical event — they
+// are honest "not reached", never fabricated progress.
+func skipTail(g *runtimegraph.Graph, reason string) {
+	for _, kind := range []runtimegraph.StageKind{
+		runtimegraph.StageContextCompilation,
+		runtimegraph.StageModelInvocation,
+		runtimegraph.StageArtifactValidation,
+		runtimegraph.StageApprovalGate,
+		runtimegraph.StageMutationTransaction,
+		runtimegraph.StageVerification,
+	} {
+		g.Skip(kind, reason)
+	}
+}
+
+// setProofGraph folds the runtime graph's stage evidence into the proof: the
+// authoritative RuntimeGraph record plus the compact GraphStep projection.
+func setProofGraph(res *ExecutionResult, g *runtimegraph.Graph) {
+	if res == nil || res.Proof == nil || g == nil {
+		return
+	}
+	evidence := g.Evidence()
+	res.Proof.RuntimeGraph = evidence
+	steps := make([]GraphStep, 0, len(evidence))
+	for _, e := range evidence {
+		steps = append(steps, GraphStep{Stage: e.Kind, State: e.State, Started: e.StartedAt})
+	}
+	res.Proof.Graph = steps
+}
+
+// contextDecisions records the strategy-owned context decisions of the
+// execution into the proof: the policy, the budget, and why each context
+// channel was included. The compiler never includes context it cannot explain.
+func contextDecisions(profile strategy.ExecutionStrategyProfile) []ContextDecision {
+	budget := profile.ContextBudget
+	dec := ContextDecision{
+		Policy: string(profile.Policy()),
+		Budget: budget.Tokens,
+	}
+	for _, k := range profile.ContextKinds {
+		dec.Items = append(dec.Items, ContextItemDecision{
+			Kind:   string(k),
+			Reason: contextInclusionReason(k),
+		})
+	}
+	return []ContextDecision{dec}
+}
+
+// contextInclusionReason is the deterministic inclusion reason of a context
+// channel — the single explanation source for both the compiler and the proof.
+func contextInclusionReason(k strategy.ContextKind) string {
+	switch k {
+	case strategy.ContextUserIntent:
+		return "every execution is anchored to the user intent"
+	case strategy.ContextExplicitTargets:
+		return "explicit targets bound the execution scope"
+	case strategy.ContextTargetContent:
+		return "the mutation requires the target content"
+	case strategy.ContextStructuralEvidence:
+		return "the mutation anchors to a located block"
+	case strategy.ContextDependencyEvidence:
+		return "cross-file coupling must be visible before reasoning"
+	case strategy.ContextRepositoryConstraints:
+		return "the execution must honor the workspace contract"
+	case strategy.ContextRelevantHistory:
+		return "prior conversation directly relevant to the decision"
+	case strategy.ContextPriorExecution:
+		return "execution continuity preserves prior evidence"
+	case strategy.ContextArtifactContract:
+		return "the model must produce a bounded parseable artifact"
+	case strategy.ContextVerificationContract:
+		return "success is defined by the verification gate"
+	default:
+		return string(k)
+	}
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────

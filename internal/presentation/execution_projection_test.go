@@ -28,9 +28,9 @@ func runProjection(evs ...events.DomainEvent) *ExecutionProjection {
 	return p
 }
 
-// TestReducerHumanNarrativePins the acceptance human timeline: Thinking… →
-// ✓ Found target → ✓ Generated change → Waiting for approval → ✓ Applied →
-// ✓ Verified → ✓ Completed.
+// TestReducerHumanNarrativePins the acceptance human timeline: Understanding
+// request → Inspecting index.html → Generated a proposed change → Waiting for
+// approval → Applied change → Verified the change → Completed.
 func TestReducerHumanNarrative(t *testing.T) {
 	p := runProjection(
 		events.NewExecutionStarted("r1", "build", "fix index.html"),
@@ -48,13 +48,17 @@ func TestReducerHumanNarrative(t *testing.T) {
 	)
 
 	want := []string{
+		"Understanding request",
+		"Preparing a targeted edit",
+		"Inspecting index.html",
+		"Gathering context (2 channels)",
 		"Thinking...",
-		"✓ Found target index.html",
-		"✓ Generated change",
+		"Generated a proposed change",
 		"Waiting for approval",
-		"✓ Applied",
-		"✓ Verified",
-		"✓ Completed",
+		"Applying changes",
+		"Applied change to index.html",
+		"Verified the change",
+		"Completed",
 	}
 	got := p.HumanTimeline()
 	if len(got) != len(want) {
@@ -228,8 +232,8 @@ func TestReducerResetOnNewExecution(t *testing.T) {
 	if st.RequestID != "new" {
 		t.Fatalf("request = %s, want new", st.RequestID)
 	}
-	if st.Phase != PhaseRunning || st.Step != "Thinking..." {
-		t.Fatalf("state = %+v, want fresh running Thinking...", st)
+	if st.Phase != PhaseRunning || st.Step != "Understanding request" {
+		t.Fatalf("state = %+v, want fresh running Understanding request", st)
 	}
 	// The stale execution's target must not leak into the new narrative.
 	for _, line := range p.HumanTimeline() {

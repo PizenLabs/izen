@@ -39,12 +39,12 @@ func TestGatedDispatchStartsExecutionProjection(t *testing.T) {
 	if !m.execView.Active() {
 		t.Fatal("execView must be active at dispatch")
 	}
-	if m.execView.HumanStep() != "Thinking..." {
-		t.Fatalf("initial human step = %q, want Thinking...", m.execView.HumanStep())
+	if m.execView.HumanStep() != "Understanding request" {
+		t.Fatalf("initial human step = %q, want Understanding request", m.execView.HumanStep())
 	}
 	// The dock text must derive from the projection.
 	dock := m.composeDockText()
-	if !strings.Contains(dock, "Thinking...") {
+	if !strings.Contains(dock, "Understanding request") {
 		t.Fatalf("dock text %q does not derive from the projection step", dock)
 	}
 }
@@ -65,10 +65,10 @@ func TestGatedProjectionFollowsRuntimeEvents(t *testing.T) {
 	m.handleDomainEvent(events.NewExecutionStarted("g1", "hot", "fix typo in @index.html"))
 	m.handleDomainEvent(events.NewTargetResolved("g1", "index.html", true, "strategy"))
 
-	if m.execView.HumanStep() != "Found target index.html" {
-		t.Fatalf("step after target.resolved = %q, want Found target index.html", m.execView.HumanStep())
+	if m.execView.HumanStep() != "Inspecting index.html" {
+		t.Fatalf("step after target.resolved = %q, want Inspecting index.html", m.execView.HumanStep())
 	}
-	if dock := m.composeDockText(); !strings.Contains(dock, "Found target index.html") {
+	if dock := m.composeDockText(); !strings.Contains(dock, "Inspecting index.html") {
 		t.Fatalf("dock %q missing the projected target step", dock)
 	}
 
@@ -76,8 +76,8 @@ func TestGatedProjectionFollowsRuntimeEvents(t *testing.T) {
 	m.handleDomainEvent(events.NewProviderResponse("g1", "mock", 5, 5))
 	m.handleDomainEvent(events.NewArtifactProduced("g1", "patch", "index.html"))
 
-	if m.execView.HumanStep() != "Generated change" {
-		t.Fatalf("step after artifact.produced = %q, want Generated change", m.execView.HumanStep())
+	if m.execView.HumanStep() != "Generated a proposed change" {
+		t.Fatalf("step after artifact.produced = %q, want Generated a proposed change", m.execView.HumanStep())
 	}
 
 	m.handleDomainEvent(events.NewApprovalRequired("g1", "index.html", "<diff>"))
@@ -88,9 +88,9 @@ func TestGatedProjectionFollowsRuntimeEvents(t *testing.T) {
 	// Human narrative matches the runtime truth, nothing invented.
 	joined := strings.Join(m.execView.HumanTimeline(), "|")
 	for _, want := range []string{
-		"Thinking...",
-		"✓ Found target index.html",
-		"✓ Generated change",
+		"Understanding request",
+		"Inspecting index.html",
+		"Generated a proposed change",
 		"Waiting for approval",
 	} {
 		if !strings.Contains(joined, want) {
@@ -162,7 +162,41 @@ func TestUIProjectionNeverRendersImpossibleStates(t *testing.T) {
 		t.Fatalf("renderer resurrected a running step after terminal: %q", m.execView.HumanStep())
 	}
 	// The dock must not claim any step.
-	if dock := m.composeDockText(); strings.Contains(dock, "Generated change") && m.shimmerActive {
+	if dock := m.composeDockText(); strings.Contains(dock, "proposed change") && m.shimmerActive {
 		t.Fatalf("dock claims a running step after terminal: %q", dock)
+	}
+}
+
+// TestNarrativePanelRendersProjectionPins the Phase 5 TUI contract: the gated
+// execution renders its human narrative panel from the projection — never raw
+// machine events.
+func TestNarrativePanelRendersProjection(t *testing.T) {
+	mock := &mockProvider{}
+	m := gatedDispatchModel(t, mock, map[string]string{"index.html": "<p>hi</p>"})
+	m.state = StateChat
+
+	cmd := m.runGatedLine("$hot fix typo in @index.html")
+	if cmd == nil {
+		t.Fatal("gated execution returned nil command")
+	}
+
+	panel := m.renderExecutionNarrative()
+	if !strings.Contains(panel, "Understanding request") {
+		t.Fatalf("narrative panel missing the initial step: %q", panel)
+	}
+	// Raw machine events must never leak into the human panel.
+	if strings.Contains(panel, "execution.started") || strings.Contains(panel, "strategy.selected") {
+		t.Fatalf("narrative panel leaked a raw machine event: %q", panel)
+	}
+
+	// Advancing runtime events project the next narrative steps.
+	m.handleDomainEvent(events.NewExecutionStarted("n1", "hot", "fix typo in @index.html"))
+	m.handleDomainEvent(events.NewTargetResolved("n1", "index.html", true, "strategy"))
+	panel = m.renderExecutionNarrative()
+	if !strings.Contains(panel, "Inspecting index.html") {
+		t.Fatalf("narrative panel missing the projected step: %q", panel)
+	}
+	if strings.Contains(panel, "execution.target.resolved") {
+		t.Fatalf("narrative panel leaked a machine event: %q", panel)
 	}
 }

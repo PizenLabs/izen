@@ -580,19 +580,49 @@ func verifyDepth(op OperationKind) int {
 }
 
 // withBudgets derives the reasoning/output budgets from complexity and the
-// artifact contract. Budgets follow task complexity and artifact shape — a
-// SEARCH/REPLACE block never needs a plan's budget, and a model is never
-// forced to re-emit a complete file merely because the target is small.
+// artifact contract, and the strategy-owned context budget from the context
+// policy. Budgets follow task complexity and artifact shape — a SEARCH/REPLACE
+// block never needs a plan's budget, and a model is never forced to re-emit a
+// complete file merely because the target is small.
 func withBudgets(profile ExecutionStrategyProfile) ExecutionStrategyProfile {
 	if !profile.ModelRequired {
 		profile.ReasoningBudget = 0
 		profile.MaxOutputTokens = 0
+		profile.ContextBudget = contextBudgetFor(profile)
 		return profile
 	}
 
 	profile.ReasoningBudget = reasoningForComplexity(profile.Complexity.Level)
 	profile.MaxOutputTokens = outputForArtifact(profile.Artifact.Kind, profile.Complexity.Level)
+	profile.ContextBudget = contextBudgetFor(profile)
 	return profile
+}
+
+// contextBudgetFor derives the strategy-owned context allowance from the
+// profile's context policy. The policy decides; the compiler spends inside the
+// budget. Example budgets: casual_chat → none/0; single-file edit →
+// target_file_only/4000; repository investigation → repository/16000.
+func contextBudgetFor(p ExecutionStrategyProfile) ContextBudget {
+	switch p.Policy() {
+	case ContextPolicyNone:
+		return ContextBudget{Policy: ContextPolicyNone, Tokens: 0, MaxFiles: 0}
+	case ContextPolicyTargetFileOnly:
+		return ContextBudget{
+			Policy:     ContextPolicyTargetFileOnly,
+			Tokens:     4000,
+			MaxFiles:   10,
+			Evidence:   []ContextKind{ContextTargetContent},
+			Escalation: p.Escalation,
+		}
+	default: // ContextPolicyRepository
+		return ContextBudget{
+			Policy:     ContextPolicyRepository,
+			Tokens:     16000,
+			MaxFiles:   50,
+			Evidence:   []ContextKind{ContextDependencyEvidence, ContextRepositoryConstraints},
+			Escalation: p.Escalation,
+		}
+	}
 }
 
 // reasoningForComplexity maps complexity onto a bounded reasoning budget.

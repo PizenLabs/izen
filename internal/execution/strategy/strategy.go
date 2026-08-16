@@ -259,6 +259,36 @@ const (
 // String returns the canonical context-policy name.
 func (p ContextPolicy) String() string { return string(p) }
 
+// ContextBudget is the strategy-owned context allowance of one execution: the
+// token budget, the file cap, the evidence requirements and the escalation
+// rule. The strategy decides the minimum sufficient context; the compiler
+// spends inside the budget and must explain every inclusion.
+type ContextBudget struct {
+	// Policy is the context policy the budget belongs to.
+	Policy ContextPolicy
+	// Tokens is the token budget the strategy justifies for context (0 = none).
+	// It is an ACCOUNTING budget — the provider-reported usage is the only
+	// authoritative token count.
+	Tokens int
+	// MaxFiles bounds how many files may contribute context (0 = no file
+	// budget → zero-context, or unbounded for repository policy).
+	MaxFiles int
+	// Evidence is the evidence requirement set that must be satisfied before
+	// reasoning (e.g. symbol_graph, relevant_files, dependency_context).
+	Evidence []ContextKind
+	// Escalation reports whether context may grow beyond the initial budget
+	// when evidence demands it (recorded, never silent).
+	Escalation bool
+}
+
+// String renders the budget compactly for $inspect.
+func (b ContextBudget) String() string {
+	if b.Tokens == 0 && b.Policy == ContextPolicyNone {
+		return "context-budget: none (0 tokens)"
+	}
+	return fmt.Sprintf("context-budget: %s (max %d tokens, max %d files)", b.Policy, b.Tokens, b.MaxFiles)
+}
+
 // ExecutionStrategyProfile is the observable, immutable record of the
 // engine-first decision for one operation. It is produced deterministically
 // BEFORE any model invocation and answers every "why" question about the
@@ -286,6 +316,9 @@ type ExecutionStrategyProfile struct {
 	// the minimum sufficient context — the compiler never does. A zero value
 	// is normalized to ContextPolicyNone for zero-context strategies.
 	ContextPolicy ContextPolicy
+	// ContextBudget is the strategy-owned context allowance (token budget,
+	// file cap, evidence requirements, escalation rule).
+	ContextBudget ContextBudget
 	// Artifact is the artifact contract the model must satisfy.
 	Artifact ArtifactContract
 	// ReasoningBudget is the thinking budget justified by complexity (0 = none).

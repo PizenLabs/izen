@@ -111,18 +111,31 @@ func TestApprovePatchHandler_RoutesThroughExecutor(t *testing.T) {
 		t.Fatal("approve through the runtime did not mutate the file")
 	}
 
-	// The canonical lifecycle events fired (no fake PatchApplied).
-	deadline := time.Now().Add(2 * time.Second)
-	for !c.has(events.EventPatchApplied) && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	for _, typ := range []string{
+	// The canonical lifecycle events fired (no fake PatchApplied). Each event
+	// type is delivered on its own bus subscription goroutine, so wait until
+	// every expected type has arrived rather than a single sentinel.
+	wantTypes := []string{
 		events.EventMutationStarted,
 		events.EventMutationCompleted,
 		events.EventVerificationCompleted,
 		events.EventExecutionFinished,
 		events.EventPatchApplied,
-	} {
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		all := true
+		for _, typ := range wantTypes {
+			if !c.has(typ) {
+				all = false
+				break
+			}
+		}
+		if all {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for _, typ := range wantTypes {
 		if !c.has(typ) {
 			t.Errorf("missing event %q", typ)
 		}
