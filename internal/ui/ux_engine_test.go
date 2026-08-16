@@ -43,11 +43,14 @@ func TestConversationFlowDoesNotCreateExecutionNarrative(t *testing.T) {
 	if !m.executionResolving {
 		t.Fatal("conversation must still set the in-flight marker for terminal cleanup")
 	}
-	// The loading dock reflects the conversational state, never an execution
-	// milestone.
-	dock := m.composeDockText()
-	if !strings.Contains(dock, "Answering") {
-		t.Fatalf("conversation dock = %q, want a conversational status (no pipeline)", dock)
+	// No execution timeline: the dock TEXT has no execution-derived claim (and
+	// never a static "Answering..." placeholder). The dock SURFACE (spinner +
+	// contextual tip) stays alive so the answer wait is never a frozen pane.
+	if dock := m.composeDockText(); dock != "" {
+		t.Fatalf("conversation dock text = %q, want empty (no execution timeline)", dock)
+	}
+	if dock := m.renderLoadingDock(); dock == "" {
+		t.Fatal("conversation loading dock (spinner + tip) must be active while the answer is generated")
 	}
 }
 
@@ -141,7 +144,7 @@ func TestExpandedFrameShowsStepSources(t *testing.T) {
 	m.handleDomainEvent(events.NewTargetResolved("ux", "index.html", true, "strategy"))
 
 	panel := stripANSITest(m.renderExecutionLayered())
-	if !strings.Contains(panel, "Inspecting index.html") {
+	if !strings.Contains(panel, "Reading index.html") {
 		t.Fatalf("expanded view missing the narrative step: %q", panel)
 	}
 	if !strings.Contains(panel, "source: target.resolved") {
@@ -162,7 +165,7 @@ func TestNormalFrameHasNoStepSources(t *testing.T) {
 	m.handleDomainEvent(events.NewTargetResolved("ux", "index.html", true, "strategy"))
 
 	panel := stripANSITest(m.renderExecutionLayered())
-	if !strings.Contains(panel, "Inspecting index.html") {
+	if !strings.Contains(panel, "Reading index.html") {
 		t.Fatalf("normal view missing the narrative step: %q", panel)
 	}
 	if strings.Contains(panel, "source:") {

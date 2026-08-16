@@ -30,14 +30,14 @@ func TestNarrativeTransitionDerivation(t *testing.T) {
 		want string
 	}{
 		{
-			name: "strategy.selected",
+			name: "strategy.selected (no human step — deterministic plumbing)",
 			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewStrategySelected("r", "targeted_mutation", true, "reason")},
-			want: "Understanding request",
+			want: "",
 		},
 		{
 			name: "target.resolved",
 			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewTargetResolved("r", "index.html", true, "strategy")},
-			want: "Inspecting index.html",
+			want: "Reading index.html",
 		},
 		{
 			name: "context.prepared",
@@ -45,9 +45,14 @@ func TestNarrativeTransitionDerivation(t *testing.T) {
 			want: "Gathering context",
 		},
 		{
+			name: "context.prepared zero channels (no context gathered → no step)",
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewContextPrepared("r", nil, 0)},
+			want: "",
+		},
+		{
 			name: "provider.invoked",
 			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewModelInvoked("r", "mock", 0, 0)},
-			want: "Generating response",
+			want: "Analyzing",
 		},
 		{
 			name: "artifact.produced",
@@ -87,21 +92,17 @@ func TestNarrativeTransitionDerivation(t *testing.T) {
 // for a transition that did not occur: a partial graph produces a partial
 // narrative, never a canned full-lifecycle script.
 func TestNarrativeNoFakeStaticSteps(t *testing.T) {
-	// Only execution.started + strategy.selected occurred. The narrative must
-	// NOT claim inspection, context, generation, results, or verification.
+	// Only execution.started + strategy.selected occurred. These are
+	// deterministic plumbing transitions with no human-visible work, so the
+	// narrative must contain NO steps at all — nothing is claimed before the
+	// engine actually does something.
 	n := NewExecutionNarrative()
 	n.Project(events.NewExecutionStarted("r", "build", "fix index.html"))
 	n.Project(events.NewStrategySelected("r", "targeted_mutation", true, "x"))
 
 	got := n.Human()
-	want := []string{"Understanding request"}
-	if len(got) != len(want) {
-		t.Fatalf("narrative for a partial graph = %v, want %v (no fake steps)", got, want)
-	}
-	for i, w := range want {
-		if got[i] != w {
-			t.Errorf("human[%d] = %q, want %q (a step that never happened leaked)", i, got[i], w)
-		}
+	if len(got) != 0 {
+		t.Fatalf("narrative for started+strategy = %v, want [] (no fake steps, no invented progress)", got)
 	}
 	for _, forbidden := range []string{"Inspecting", "Gathering", "Generating", "Preparing", "Verified", "Applied"} {
 		for _, line := range got {
@@ -199,7 +200,7 @@ func TestNarrativeMachineSeparated(t *testing.T) {
 	}
 	// Machine and human are strictly separated: no sentence text in machine.
 	for _, m := range machine {
-		if m == "Inspecting index.html" || m == "Understanding request" {
+		if m == "Reading index.html" || m == "Completed" {
 			t.Fatalf("machine record leaked a human sentence: %q", m)
 		}
 	}
@@ -236,19 +237,16 @@ func TestNarrativeStepsCarryTransitions(t *testing.T) {
 	n.Project(events.NewTargetResolved("r", "index.html", true, "strategy"))
 
 	steps := n.Steps()
-	if len(steps) != 2 {
-		t.Fatalf("steps = %d, want 2 (execution.started + strategy.selected collapse to one Understanding request)", len(steps))
+	if len(steps) != 1 {
+		t.Fatalf("steps = %d, want 1 (started+strategy carry no human step; only target.resolved)", len(steps))
 	}
-	// execution.started and strategy.selected both derive "Understanding
-	// request"; the identical sentence collapses into one step.
-	if steps[0].Transition != "execution.started" && steps[0].Transition != "strategy.selected" {
-		t.Errorf("steps[0].Transition = %q, want execution.started or strategy.selected", steps[0].Transition)
+	// execution.started / strategy.selected are plumbing — the first human step
+	// is the target the runtime actually touches.
+	if steps[0].Transition != "target.resolved" {
+		t.Errorf("steps[0].Transition = %q, want target.resolved", steps[0].Transition)
 	}
-	if steps[0].Sentence != "Understanding request" {
-		t.Errorf("steps[0].Sentence = %q, want Understanding request", steps[0].Sentence)
-	}
-	if steps[1].Transition != "target.resolved" || steps[1].Sentence != "Inspecting index.html" {
-		t.Errorf("steps[1] = %+v, want target.resolved / Inspecting index.html", steps[1])
+	if steps[0].Sentence != "Reading index.html" {
+		t.Errorf("steps[0].Sentence = %q, want Reading index.html", steps[0].Sentence)
 	}
 	// The Current flag is projection-owned (phase-aware); the narrative itself
 	// does not flag it. Verify via the projection's running frame.
@@ -261,7 +259,7 @@ func TestNarrativeStepsCarryTransitions(t *testing.T) {
 		p.Project(ev)
 	}
 	f := p.Frame(VisibilityNormal)
-	if len(f.Steps) != 2 || !f.Steps[1].Current {
+	if len(f.Steps) != 1 || !f.Steps[0].Current {
 		t.Errorf("running frame must flag the last step Current: %+v", f.Steps)
 	}
 }

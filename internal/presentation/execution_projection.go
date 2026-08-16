@@ -15,8 +15,6 @@
 package presentation
 
 import (
-	"time"
-
 	"github.com/PizenLabs/izen/internal/events"
 )
 
@@ -29,8 +27,9 @@ const (
 	// PhaseIdle is the resting state: no execution in flight and no terminal
 	// result rendered.
 	PhaseIdle ViewPhase = iota
-	// PhaseRunning carries the current human step (Understanding request,
-	// Inspecting index.html, Generated a proposed change…).
+	// PhaseRunning carries the current human step (Reading index.html,
+	// Analyzing, Applying changes…) derived from the observed transitions. The
+	// step is empty in the brief pre-transition window after execution.started.
 	PhaseRunning
 	// PhaseWaitingApproval blocks on the human approval gate.
 	PhaseWaitingApproval
@@ -70,8 +69,7 @@ type ExecutionViewState struct {
 	// Phase is the execution phase.
 	Phase ViewPhase
 	// Step is the current human narrative step while Phase == PhaseRunning
-	// (e.g. "Understanding request", "Inspecting index.html", "Generated a
-	// proposed change").
+	// (e.g. "Reading index.html", "Analyzing", "Applying changes").
 	Step string
 	// Outcome is the terminal outcome label when Phase is terminal (e.g.
 	// "completed", "cancelled", "patch_failed").
@@ -89,19 +87,21 @@ func NewIdle() ExecutionViewState {
 	return ExecutionViewState{Phase: PhaseIdle}
 }
 
-// Valid enforces the "no impossible states" invariant: a running state must
-// carry a step, a terminal state must carry an outcome, and a terminal phase
-// must never be followed by a running step (enforced by the reducer).
+// Valid enforces the "no impossible states" invariant: a running state may be
+// step-less only in the pre-first-human-step window (execution.started arrived
+// but no human-visible transition has occurred yet), a terminal state must
+// carry an outcome, and a terminal phase must never be followed by a running
+// step (enforced by the reducer).
 func (s ExecutionViewState) Valid() bool {
 	switch s.Phase {
 	case PhaseRunning:
-		return s.Step != ""
+		return true
 	case PhaseWaitingApproval:
 		return true
 	case PhaseCompleted, PhaseFailed:
 		return s.Outcome != ""
 	default:
-		return s.Step == "" && s.Outcome == "" && s.RequestID == ""
+		return s.Step == "" && s.Outcome == ""
 	}
 }
 
@@ -175,23 +175,20 @@ func (p *ExecutionProjection) Narrative() *ExecutionNarrative {
 	return p.narrative
 }
 
-// Begin starts the projection for a fresh execution (Running "Understanding
-// request") as the synchronous dispatch-time seed. The first
-// execution.started event (which travels asynchronously on the bus) resets the
-// projection to the identical initial state, so Begin never conflicts with the
-// authoritative stream.
+// Begin binds the projection to a fresh execution BEFORE any event arrives. It
+// is a pure reset — it never fabricates a narrative step or a running state:
+// no real runtime event has been observed yet, so there is nothing truthful to
+// render. The state stays Idle (Active() == false) until the first
+// execution.started event is projected. RequestID is bound eagerly so a stale
+// lifecycle event from a prior execution can never seed a fresh projection.
 func (p *ExecutionProjection) Begin(requestID string) {
 	if p == nil {
 		return
 	}
 	*p = ExecutionProjection{
-		state:     ExecutionViewState{Phase: PhaseRunning, Step: "Understanding request", RequestID: requestID},
+		state:     ExecutionViewState{RequestID: requestID},
 		narrative: NewExecutionNarrative(),
 	}
-	p.narrative.lines = append(p.narrative.lines, narrativeLine{transition: "execution.started", machine: "execution.started", human: "Understanding request"})
-	p.narrative.current = 0
-	p.details.StartedAt = time.Now()
-	p.syncDetails()
 }
 
 // Project consumes one canonical runtime lifecycle event and advances the
@@ -215,9 +212,11 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 
 	switch pl := payload.(type) {
 	case events.ExecutionStartedPayload:
-		// Fresh execution: reset the projection (single-execution scope).
+		// Fresh execution: reset the projection (single-execution scope). The
+		// step stays empty — no human-visible transition has occurred yet; the
+		// step is derived from the narrative as real transitions arrive.
 		*p = ExecutionProjection{
-			state:     ExecutionViewState{Phase: PhaseRunning, Step: "Understanding request", RequestID: pl.RequestID},
+			state:     ExecutionViewState{Phase: PhaseRunning, RequestID: pl.RequestID},
 			narrative: p.narrative,
 		}
 		p.details.StartedAt = ev.Timestamp()
@@ -286,7 +285,7 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 			return
 		}
 		p.state.Phase = PhaseWaitingApproval
-		p.state.Step = "Waiting for approval"
+		p.state.Step = p.narrative.CurrentHuman()
 	case events.MutationStartedPayload:
 		if !p.matches(pl.RequestID) {
 			return
@@ -294,7 +293,7 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 		if p.state.Phase == PhaseWaitingApproval {
 			p.state.Phase = PhaseRunning
 		}
-		p.state.Step = "Applying changes"
+		p.state.Step = p.narrative.CurrentHuman()
 	case events.MutationCompletedPayload:
 		if !p.matches(pl.RequestID) {
 			return

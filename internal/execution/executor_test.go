@@ -374,6 +374,96 @@ func TestRuntimeExecutor_TargetedMutationFlow(t *testing.T) {
 	}
 }
 
+// TestRuntimeExecutor_CompletedUsageAccount pins requirement 5 of the UX/exec
+// consistency work: the runtime stamps the AUTHORITATIVE terminal usage account
+// (provider, model, aggregate provider-reported input/output tokens, latency,
+// artifact) onto ExecutionResult.Completed on EVERY terminal path — the
+// renderer consumes it directly and never re-sums model calls.
+func TestRuntimeExecutor_CompletedUsageAccount(t *testing.T) {
+	root := t.TempDir()
+	writeTarget(t, root, "note.txt", sampleOriginal)
+
+	bus := events.NewBus(events.DefaultBufferSize)
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content:     sampleReplace,
+		TokenInput:  2860,
+		TokenOutput: 2048,
+		Usage: ai.ProviderUsage{
+			PromptTokens:     2860,
+			CompletionTokens: 2048,
+			TotalTokens:      4908,
+			Known:            true,
+		},
+	}, {
+		Content:     sampleReplace,
+		TokenInput:  2860,
+		TokenOutput: 2048,
+		Usage: ai.ProviderUsage{
+			PromptTokens:     2860,
+			CompletionTokens: 2048,
+			TotalTokens:      4908,
+			Known:            true,
+		},
+	}}}
+	x := testExecutor(t, root, mock, bus)
+
+	ctx := context.Background()
+	res, err := x.Execute(ctx, ExecuteRequest{
+		RequestID: "r-usage",
+		Mode:      "build",
+		Prompt:    "change bar to qux",
+		Target:    "note.txt",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// ── The approval-gate result carries the authoritative usage account ──
+	if res.Completed.Provider != "mock" {
+		t.Errorf("Completed.Provider = %q, want mock", res.Completed.Provider)
+	}
+	if res.Completed.InputTokens != 2860 || res.Completed.OutputTokens != 2048 {
+		t.Errorf("Completed tokens = %d/%d, want provider-reported 2860/2048", res.Completed.InputTokens, res.Completed.OutputTokens)
+	}
+	if res.Completed.Model == "" {
+		t.Error("Completed.Model must name the invoked model")
+	}
+	if res.Completed.Latency <= 0 {
+		t.Errorf("Completed.Latency = %v, want positive", res.Completed.Latency)
+	}
+	if res.Completed.Artifact != "patch" {
+		t.Errorf("Completed.Artifact = %q, want patch", res.Completed.Artifact)
+	}
+
+	// ── Approve: the terminal mutation result keeps the same account ─────
+	apr, err := x.Approve(ctx, res.PendingPatchID)
+	if err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if apr.Completed.InputTokens != 2860 || apr.Completed.OutputTokens != 2048 {
+		t.Errorf("approve Completed tokens = %d/%d, want provider-reported 2860/2048",
+			apr.Completed.InputTokens, apr.Completed.OutputTokens)
+	}
+	if apr.Completed.Provider != "mock" || apr.Completed.Artifact != "patch" {
+		t.Errorf("approve Completed = %+v, want provider=mock artifact=patch", apr.Completed)
+	}
+
+	// ── Reject path also stamps the account ──────────────────────────────
+	writeTarget(t, root, "note.txt", sampleOriginal)
+	res2, err := x.Execute(ctx, ExecuteRequest{RequestID: "r-usage2", Mode: "build", Prompt: "change bar to qux", Target: "note.txt"})
+	if err != nil {
+		t.Fatalf("Execute 2: %v", err)
+	}
+	rej, err := x.Reject(ctx, res2.PendingPatchID, "skip")
+	if err != nil {
+		t.Fatalf("Reject: %v", err)
+	}
+	if rej.Completed.InputTokens != 2860 || rej.Completed.OutputTokens != 2048 {
+		t.Errorf("reject Completed tokens = %d/%d, want provider-reported 2860/2048",
+			rej.Completed.InputTokens, rej.Completed.OutputTokens)
+	}
+}
+
 func TestRuntimeExecutor_RejectDoesNotMutate(t *testing.T) {
 	root := t.TempDir()
 	writeTarget(t, root, "note.txt", sampleOriginal)

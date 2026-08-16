@@ -53,7 +53,7 @@ func TestHumanViewDoesNotContainProviderNames(t *testing.T) {
 	feedFullExecution(m)
 
 	panel := stripANSITest(m.renderExecutionLayered())
-	if !strings.Contains(panel, "Understanding request") {
+	if !strings.Contains(panel, "Reading index.html") {
 		t.Fatalf("human view missing the narrative: %q", panel)
 	}
 	if strings.Contains(panel, "mock-provider") {
@@ -160,6 +160,9 @@ func TestCtrlOCyclesVisibility(t *testing.T) {
 	m.execView.Begin("p6")
 	m.executionResolving = true
 	m.execVisibility = presentation.VisibilityNormal
+	// The projection becomes Active only when a real execution event arrives —
+	// Ctrl+O must not cycle a projection with no runtime truth behind it.
+	m.handleDomainEvent(events.NewExecutionStarted("p6", "build", "x"))
 
 	if !m.cycleExecVisibility() || m.execVisibility != presentation.VisibilityExpanded {
 		t.Fatalf("first Ctrl+O must go to EXPANDED, got %s", m.execVisibility)
@@ -187,13 +190,14 @@ func TestNarrativeChangesAccordingToGraphState(t *testing.T) {
 	m.executionResolving = true
 	m.execVisibility = presentation.VisibilityNormal
 
-	// Partial graph: only started + strategy. The rendered view must show
-	// "Understanding request" and never the later static steps.
+	// Partial graph: only started + strategy. Neither transition is human-
+	// visible progress, so the rendered view must be EMPTY — never a canned
+	// "Understanding request" step and never the later static steps.
 	m.handleDomainEvent(events.NewExecutionStarted("p6", "build", "fix index.html"))
 	m.handleDomainEvent(events.NewStrategySelected("p6", "targeted_mutation", true, "x"))
 	panel := stripANSITest(m.renderExecutionLayered())
-	if !strings.Contains(panel, "Understanding request") {
-		t.Fatalf("partial narrative missing Understanding request: %q", panel)
+	if panel != "" {
+		t.Fatalf("partial graph must render no steps (started+strategy are plumbing): %q", panel)
 	}
 	for _, forbidden := range []string{"Inspecting", "Gathering", "Generating", "Preparing", "Verified"} {
 		if strings.Contains(panel, forbidden) {
@@ -204,8 +208,8 @@ func TestNarrativeChangesAccordingToGraphState(t *testing.T) {
 	// Advance the graph: the view changes with the actual state.
 	m.handleDomainEvent(events.NewTargetResolved("p6", "index.html", true, "strategy"))
 	panel2 := stripANSITest(m.renderExecutionLayered())
-	if !strings.Contains(panel2, "Inspecting index.html") {
-		t.Fatalf("advanced narrative missing Inspecting index.html: %q", panel2)
+	if !strings.Contains(panel2, "Reading index.html") {
+		t.Fatalf("advanced narrative missing Reading index.html: %q", panel2)
 	}
 	if panel == panel2 {
 		t.Fatal("narrative did not change with the actual graph state")

@@ -30,10 +30,10 @@ func askTestModel() *model {
 }
 
 // TestEnterDispatchesInstantShimmer guards the t=0ms contract: pressing Enter
-// must set shimmerActive and return a command batch that schedules the
-// animation ticks SYNCHRONOUSLY — before any async context prep resolves —
-// so the loading dock animates immediately instead of freezing for the
-// workspace scan.
+// activates the loading dock (spinner + tips) immediately and dispatches the
+// execution request synchronously — but the dock text is NEVER a static
+// template ("Resolving execution...", "Working..."); it is event-derived, so
+// the shimmer text stays empty until a real runtime event exists.
 func TestEnterDispatchesInstantShimmer(t *testing.T) {
 	m := askTestModel()
 	m.ti.SetValue("fix the bug in main.go")
@@ -47,13 +47,16 @@ func TestEnterDispatchesInstantShimmer(t *testing.T) {
 	m2 := nm.(*model)
 
 	if !m2.shimmerActive {
-		t.Fatal("Enter did not activate the shimmer at t=0ms")
+		t.Fatal("Enter did not activate the loading dock (spinner + tips) at t=0ms")
 	}
-	if m2.shimmerText != "Resolving execution..." {
-		t.Fatalf("shimmer text = %q, want %q", m2.shimmerText, "Resolving execution...")
+	if m2.shimmerText != "" {
+		t.Fatalf("shimmer text = %q, want \"\" (no fabricated progress before an event)", m2.shimmerText)
+	}
+	if !m2.executionResolving {
+		t.Fatal("execution in-flight marker not set at dispatch")
 	}
 	if cmd == nil {
-		t.Fatal("Enter returned a nil command — no shimmer/smooth ticks scheduled")
+		t.Fatal("Enter returned a nil command — the execution request did not dispatch")
 	}
 	// The prompt must be committed to the chat history synchronously.
 	if len(m2.records) == 0 {

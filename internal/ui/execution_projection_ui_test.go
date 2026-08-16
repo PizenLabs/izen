@@ -23,7 +23,9 @@ import (
 //     phase, and the dock never shows a step the runtime never emitted.
 
 // TestGatedDispatchStartsExecutionProjection pins that a gated dispatch
-// initialises the single execution-view projection.
+// initialises the single execution-view projection WITHOUT fabricating any
+// runtime state: the projection is Idle (nothing truthful to render) until the
+// first canonical execution event arrives.
 func TestGatedDispatchStartsExecutionProjection(t *testing.T) {
 	mock := &mockProvider{}
 	m := gatedDispatchModel(t, mock, map[string]string{"note.txt": "foo\nbar\nbaz\n"})
@@ -36,16 +38,22 @@ func TestGatedDispatchStartsExecutionProjection(t *testing.T) {
 	if m.execView == nil {
 		t.Fatal("execView not initialised at gated dispatch")
 	}
-	if !m.execView.Active() {
-		t.Fatal("execView must be active at dispatch")
+	// No static dispatch-time step: the projection stays idle until a real
+	// runtime event arrives (no "Understanding request", no fake thinking).
+	if m.execView.Active() {
+		t.Fatal("execView must NOT be active at dispatch — no event has occurred yet")
 	}
-	if m.execView.HumanStep() != "Understanding request" {
-		t.Fatalf("initial human step = %q, want Understanding request", m.execView.HumanStep())
+	if m.execView.HumanStep() != "" {
+		t.Fatalf("initial human step = %q, want \"\" (a step requires a real event)", m.execView.HumanStep())
 	}
-	// The dock text must derive from the projection.
-	dock := m.composeDockText()
-	if !strings.Contains(dock, "Understanding request") {
-		t.Fatalf("dock text %q does not derive from the projection step", dock)
+	// The dock TEXT derives from the projection — with no event there is no
+	// text claim. The dock SURFACE (animated spinner + contextual tip) stays
+	// alive so the execution is never a frozen pane.
+	if dock := m.composeDockText(); dock != "" {
+		t.Fatalf("dock text %q before any runtime event — no event-derived step exists", dock)
+	}
+	if dock := m.renderLoadingDock(); dock == "" {
+		t.Fatal("loading dock (spinner + tip) must be active during the gated execution")
 	}
 }
 
@@ -65,10 +73,10 @@ func TestGatedProjectionFollowsRuntimeEvents(t *testing.T) {
 	m.handleDomainEvent(events.NewExecutionStarted("g1", "hot", "fix typo in @index.html"))
 	m.handleDomainEvent(events.NewTargetResolved("g1", "index.html", true, "strategy"))
 
-	if m.execView.HumanStep() != "Inspecting index.html" {
-		t.Fatalf("step after target.resolved = %q, want Inspecting index.html", m.execView.HumanStep())
+	if m.execView.HumanStep() != "Reading index.html" {
+		t.Fatalf("step after target.resolved = %q, want Reading index.html", m.execView.HumanStep())
 	}
-	if dock := m.composeDockText(); !strings.Contains(dock, "Inspecting index.html") {
+	if dock := m.composeDockText(); !strings.Contains(dock, "Reading index.html") {
 		t.Fatalf("dock %q missing the projected target step", dock)
 	}
 
@@ -88,8 +96,8 @@ func TestGatedProjectionFollowsRuntimeEvents(t *testing.T) {
 	// Human narrative matches the runtime truth, nothing invented.
 	joined := strings.Join(m.execView.HumanTimeline(), "|")
 	for _, want := range []string{
-		"Understanding request",
-		"Inspecting index.html",
+		"Reading index.html",
+		"Analyzing",
 		"Preparing result",
 		"Waiting for approval",
 	} {
@@ -101,7 +109,7 @@ func TestGatedProjectionFollowsRuntimeEvents(t *testing.T) {
 
 // TestGatedProjectionTerminalClearsLoading pins that a terminal runtime event
 // transitions the projection to a terminal phase AND clears the loading
-// shimmer — no stale spinner after success.
+// state — no stale spinner after success.
 func TestGatedProjectionTerminalClearsLoading(t *testing.T) {
 	mock := &mockProvider{}
 	m := gatedDispatchModel(t, mock, map[string]string{"note.txt": "foo\nbar\nbaz\n"})
@@ -111,11 +119,20 @@ func TestGatedProjectionTerminalClearsLoading(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("gated execution returned nil command")
 	}
+	// The gated path keeps the loading dock alive (spinner + tips) but its
+	// text derives ONLY from real events — a dispatch-time progress template is
+	// never claimed. The in-flight marker is the loading signal set at t=0.
 	if !m.shimmerActive {
-		t.Fatal("shimmer must be active at dispatch")
+		t.Fatal("gated dispatch must keep the loading dock (spinner + tips) active")
+	}
+	if m.shimmerText != "" {
+		t.Fatalf("gated dispatch must not seed a static shimmer text, got %q", m.shimmerText)
+	}
+	if !m.executionResolving {
+		t.Fatal("execution in-flight marker not set at dispatch")
 	}
 
-	// Terminal success event → projection terminal + shimmer cleared.
+	// Terminal success event → projection terminal + loading state released.
 	m.handleDomainEvent(events.NewExecutionStarted("g2", "hot", "change bar to qux"))
 	m.handleDomainEvent(events.NewArtifactProduced("g2", "patch", "note.txt"))
 	m.handleDomainEvent(events.NewExecutionFinished("g2", true, "completed"))
@@ -128,11 +145,12 @@ func TestGatedProjectionTerminalClearsLoading(t *testing.T) {
 		t.Fatalf("running step %q survives the terminal event", m.execView.HumanStep())
 	}
 	// clearExecutionLoading is gated on executionResolving; simulate the full
-	// terminal flow so the loading state is released.
+	// terminal flow so the loading state is released. A terminal event is
+	// authoritative execution truth — it must release the in-flight marker.
 	m.executionResolving = true
 	m.handleDomainEvent(events.NewExecutionFinished("g2", true, "completed"))
-	if m.shimmerActive {
-		t.Fatal("terminal event left the shimmer active")
+	if m.executionResolving {
+		t.Fatal("terminal event left the execution in-flight marker set")
 	}
 }
 
@@ -180,20 +198,17 @@ func TestNarrativePanelRendersProjection(t *testing.T) {
 		t.Fatal("gated execution returned nil command")
 	}
 
-	panel := m.renderExecutionNarrative()
-	if !strings.Contains(panel, "Understanding request") {
-		t.Fatalf("narrative panel missing the initial step: %q", panel)
-	}
-	// Raw machine events must never leak into the human panel.
-	if strings.Contains(panel, "execution.started") || strings.Contains(panel, "strategy.selected") {
-		t.Fatalf("narrative panel leaked a raw machine event: %q", panel)
+	// No event has arrived yet: the panel must be empty — a dispatch-time
+	// "Understanding request" seed would be a fabricated step.
+	if panel := m.renderExecutionNarrative(); panel != "" {
+		t.Fatalf("narrative panel renders a step before any runtime event: %q", panel)
 	}
 
 	// Advancing runtime events project the next narrative steps.
 	m.handleDomainEvent(events.NewExecutionStarted("n1", "hot", "fix typo in @index.html"))
 	m.handleDomainEvent(events.NewTargetResolved("n1", "index.html", true, "strategy"))
-	panel = m.renderExecutionNarrative()
-	if !strings.Contains(panel, "Inspecting index.html") {
+	panel := m.renderExecutionNarrative()
+	if !strings.Contains(panel, "Reading index.html") {
 		t.Fatalf("narrative panel missing the projected step: %q", panel)
 	}
 	if strings.Contains(panel, "execution.target.resolved") {

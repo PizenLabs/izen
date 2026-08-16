@@ -31,9 +31,11 @@ func runProjection(evs ...events.DomainEvent) *ExecutionProjection {
 }
 
 // TestReducerHumanNarrativePins the acceptance human timeline derived from the
-// ExecutionGraph transitions: Understanding request → Inspecting index.html →
-// Gathering context → Generating response → Preparing result → Waiting for
-// approval → Applying changes → Applied change → Verified changes → Completed.
+// ExecutionGraph transitions: Reading index.html → Gathering context →
+// Analyzing → Preparing result → Waiting for approval → Applying changes →
+// Applied change → Verified changes → Completed. execution.started /
+// strategy.selected carry no human step (deterministic plumbing — the first
+// meaningful human progress appears when the runtime touches a target).
 func TestReducerHumanNarrative(t *testing.T) {
 	p := runProjection(
 		events.NewExecutionStarted("r1", "build", "fix index.html"),
@@ -51,10 +53,9 @@ func TestReducerHumanNarrative(t *testing.T) {
 	)
 
 	want := []string{
-		"Understanding request",
-		"Inspecting index.html",
+		"Reading index.html",
 		"Gathering context",
-		"Generating response",
+		"Analyzing",
 		"Preparing result",
 		"Waiting for approval",
 		"Applying changes",
@@ -286,8 +287,8 @@ func TestReducerResetOnNewExecution(t *testing.T) {
 	if st.RequestID != "new" {
 		t.Fatalf("request = %s, want new", st.RequestID)
 	}
-	if st.Phase != PhaseRunning || st.Step != "Understanding request" {
-		t.Fatalf("state = %+v, want fresh running Understanding request", st)
+	if st.Phase != PhaseRunning || st.Step != "" {
+		t.Fatalf("state = %+v, want fresh running with no fabricated step (events drive the narrative)", st)
 	}
 	// The stale execution's target must not leak into the new narrative.
 	for _, line := range p.HumanTimeline() {
@@ -308,5 +309,45 @@ func TestReducerStaleRequestIgnored(t *testing.T) {
 	st := p.State()
 	if st.RequestID != "r6" || st.Phase != PhaseRunning {
 		t.Fatalf("stale request mutated the projection: %+v", st)
+	}
+}
+
+// TestReducerBeginHasNoFabricatedState pins requirement 1 of the UX/exec
+// consistency work: Begin (the dispatch-time binding) must NOT fabricate a
+// running state or a narrative step. No real runtime event has been observed
+// yet, so nothing truthful exists to render — the projection stays Idle until
+// the first execution.started event arrives, and the narrative is empty. A
+// static "Understanding request" seed would be a fake progress claim.
+func TestReducerBeginHasNoFabricatedState(t *testing.T) {
+	p := NewExecutionProjection()
+	p.Begin("req-1")
+
+	st := p.State()
+	if st.Phase != PhaseIdle {
+		t.Fatalf("phase after Begin = %s, want idle (no event yet)", st.Phase)
+	}
+	if p.Active() {
+		t.Fatal("projection must not be active before any runtime event")
+	}
+	if steps := p.HumanTimeline(); len(steps) != 0 {
+		t.Fatalf("Begin fabricated narrative steps: %v", steps)
+	}
+	if p.HumanStep() != "" {
+		t.Fatalf("Begin fabricated a human step: %q", p.HumanStep())
+	}
+	// The projection activates and derives its narrative ONLY from the real
+	// event stream.
+	p.Project(events.NewExecutionStarted("req-1", "build", "fix x"))
+	st = p.State()
+	if st.Phase != PhaseRunning {
+		t.Fatalf("phase after execution.started = %s, want running", st.Phase)
+	}
+	if steps := p.HumanTimeline(); len(steps) != 0 {
+		t.Fatalf("execution.started alone must not fabricate a human step: %v", steps)
+	}
+	p.Project(events.NewTargetResolved("req-1", "index.html", true, "strategy"))
+	got := p.HumanTimeline()
+	if len(got) != 1 || got[0] != "Reading index.html" {
+		t.Fatalf("narrative after target.resolved = %v, want [Reading index.html]", got)
 	}
 }

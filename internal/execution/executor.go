@@ -124,6 +124,28 @@ type ContextItemDecision struct {
 	Reason string `json:"reason"`
 }
 
+// ExecutionCompleted is the authoritative terminal usage account of one
+// execution. It is computed ONLY by the runtime from the provider-reported
+// usage (ai.ProviderUsage) — the renderer consumes it directly and never
+// re-sums model calls, so the displayed token counts are always the provider's
+// real billing, never a UI estimate.
+type ExecutionCompleted struct {
+	// Provider is the provider that served the execution.
+	Provider string
+	// Model is the model the execution invoked (first invocation's model).
+	Model string
+	// InputTokens is the aggregate provider-reported input usage of every
+	// invocation of the execution.
+	InputTokens int
+	// OutputTokens is the aggregate provider-reported output usage of every
+	// invocation of the execution.
+	OutputTokens int
+	// Latency is the wall-clock duration of the execution window.
+	Latency time.Duration
+	// Artifact is the semantic artifact the execution produced ("" when none).
+	Artifact string
+}
+
 // ExecutionResult is the full result of one runtime execution.
 type ExecutionResult struct {
 	RequestID      string
@@ -154,6 +176,10 @@ type ExecutionResult struct {
 	Verification VerificationReport
 	// Proof is the evidence account of the whole execution.
 	Proof *ExecutionProof
+	// Completed is the authoritative terminal usage account computed by the
+	// runtime from the provider-reported usage. The renderer reads it for the
+	// footer / EXPANDED token numbers and never re-derives them.
+	Completed ExecutionCompleted
 	// Err is the terminal execution error, if any.
 	Err error
 }
@@ -369,7 +395,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		res.Proof.Outcome = OutcomeFailed
 		res.Proof.FinishedAt = time.Now()
 		setProofGraph(res, g)
-		return res, err
+		return x.finalizeResult(res), err
 	}
 	res.Strategy = string(profile.Strategy)
 	res.StrategyReason = profile.StrategyReason
@@ -408,7 +434,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		res.Proof.Outcome = OutcomeCancelled
 		res.Proof.FinishedAt = time.Now()
 		setProofGraph(res, g)
-		return res, nil
+		return x.finalizeResult(res), nil
 	}
 
 	// ── 4. Deterministic strategies (zero model) ───────────────────────
@@ -418,7 +444,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		res.Proof.Outcome = OutcomeNoArtifact
 		res.Proof.FinishedAt = time.Now()
 		setProofGraph(res, g)
-		return res, nil
+		return x.finalizeResult(res), nil
 	}
 
 	// ── 5. Target-bound clarification ─────────────────────────────────
@@ -435,7 +461,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		res.Proof.Outcome = OutcomeCancelled
 		res.Proof.FinishedAt = time.Now()
 		setProofGraph(res, g)
-		return res, nil
+		return x.finalizeResult(res), nil
 	}
 
 	if x.provider == nil {
@@ -445,7 +471,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		res.Proof.Outcome = OutcomeFailed
 		res.Proof.FinishedAt = time.Now()
 		setProofGraph(res, g)
-		return res, res.Err
+		return x.finalizeResult(res), res.Err
 	}
 
 	// ── 6. Context compilation ─────────────────────────────────────────
@@ -473,7 +499,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			res.Proof.Outcome = OutcomeFailed
 			res.Proof.FinishedAt = time.Now()
 			setProofGraph(res, g)
-			return res, err
+			return x.finalizeResult(res), err
 		}
 		res.ModelCalls = append(res.ModelCalls, inv)
 		res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, inv)
@@ -487,7 +513,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		res.Proof.Outcome = OutcomeCompleted
 		res.Proof.FinishedAt = time.Now()
 		setProofGraph(res, g)
-		return res, nil
+		return x.finalizeResult(res), nil
 	}
 
 	// ── 7. Targeted mutation: per-target model invocation ──────────────
@@ -499,7 +525,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		res.Proof.Outcome = OutcomePatchGenerationFailed
 		res.Proof.FinishedAt = time.Now()
 		setProofGraph(res, g)
-		return res, err
+		return x.finalizeResult(res), err
 	}
 	res.ModelCalls = append(res.ModelCalls, invs...)
 	res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, invs...)
@@ -537,7 +563,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	res.Proof.FinishedAt = time.Now()
 	g.WaitApproval(target, res.Diff)
 	setProofGraph(res, g)
-	return res, nil
+	return x.finalizeResult(res), nil
 }
 
 // Approve resolves the approval gate: it applies the held patch(es) through the
@@ -623,7 +649,7 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		res.Err = applyErr
 		res.Proof.FinishedAt = time.Now()
 		setProofGraph(res, g)
-		return res, applyErr
+		return x.finalizeResult(res), applyErr
 	}
 
 	// ── Commit the transaction ─────────────────────────────────────────
@@ -661,7 +687,7 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 	g.CompleteExecution(string(outcome))
 	res.Proof.FinishedAt = time.Now()
 	setProofGraph(res, g)
-	return res, nil
+	return x.finalizeResult(res), nil
 }
 
 // Reject resolves the approval gate negatively: the held patches are never
@@ -710,7 +736,7 @@ func (x *RuntimeExecutor) Reject(ctx context.Context, patchID, reason string) (*
 	res.Proof.Outcome = OutcomeCancelled
 	res.Proof.FinishedAt = time.Now()
 	setProofGraph(res, g)
-	return res, nil
+	return x.finalizeResult(res), nil
 }
 
 // PendingPatchIDs returns the approval-held patch IDs (observability).
@@ -1020,6 +1046,46 @@ func setProofGraph(res *ExecutionResult, g *runtimegraph.Graph) {
 		steps = append(steps, GraphStep{Stage: e.Kind, State: e.State, Started: e.StartedAt})
 	}
 	res.Proof.Graph = steps
+}
+
+// finalizeResult stamps the authoritative terminal usage account (provider,
+// model, aggregate input/output tokens, latency, artifact) onto the result. It
+// is the SINGLE place token accounting is computed — from the provider-reported
+// ModelInvocations — so the renderer reads ExecutionResult.Completed and never
+// re-sums usage. It must be called on every terminal return path of the
+// executor (Execute / Approve / Reject).
+func (x *RuntimeExecutor) finalizeResult(res *ExecutionResult) *ExecutionResult {
+	if res == nil {
+		return nil
+	}
+	cc := res.Completed
+	cc.Provider = x.providerName()
+	for _, inv := range res.ModelCalls {
+		if cc.Model == "" {
+			cc.Model = inv.Model
+		}
+		cc.InputTokens += inv.TokenInput
+		cc.OutputTokens += inv.TokenOutput
+	}
+	if res.Proof != nil && !res.Proof.StartedAt.IsZero() {
+		cc.Latency = time.Since(res.Proof.StartedAt)
+		if cc.Latency < 0 {
+			cc.Latency = 0
+		}
+	}
+	cc.Artifact = res.ArtifactKind
+	res.Completed = cc
+	return res
+}
+
+// providerName returns the bound provider's name ("" when none).
+func (x *RuntimeExecutor) providerName() string {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.provider == nil {
+		return ""
+	}
+	return x.provider.Name()
 }
 
 // contextDecisions records the strategy-owned context decisions of the

@@ -32,9 +32,15 @@ func TestGatedExecutionFailureLeavesResolvingState(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("gated execution returned nil command")
 	}
-	// The loading shimmer activates synchronously at dispatch.
-	if !m.shimmerActive || m.shimmerText != "Resolving execution..." {
-		t.Fatalf("execution shimmer not active at dispatch: active=%v text=%q", m.shimmerActive, m.shimmerText)
+	// The gated path keeps the loading dock (spinner + tips) active, but its
+	// text derives ONLY from real runtime events — a dispatch-time progress
+	// template is never claimed. A terminal event must release the loading
+	// state.
+	if !m.shimmerActive {
+		t.Fatal("gated dispatch must keep the loading dock (spinner + tips) active")
+	}
+	if m.shimmerText != "" {
+		t.Fatalf("gated dispatch must not seed a static shimmer text, got %q", m.shimmerText)
 	}
 	if !m.executionResolving {
 		t.Fatal("execution in-flight marker not set at dispatch")

@@ -145,11 +145,14 @@ func agentShimmerText(label string) string {
 // The snowflake icon cycles through the 4-frame animated sequence (✻ ❅ ❆ ✦)
 // while the cosine shimmer sweep animates across the full status text. The
 // contextual tip line sits directly underneath with a tree-branch prefix.
-// Returns "" when the shimmer is inactive.
+// Returns "" when the dock has nothing truthful to say.
 //
-// The dock is the SINGLE active status indicator from prompt submit (t=0ms)
-// through thinking/processing. It clears smoothly ONLY when the first
-// primary output token arrives (tokenMsg handler calls stopShimmer).
+// The dock is the SINGLE active status indicator for the legacy agent/stream
+// paths from prompt submit (t=0ms) through thinking/processing. On the gated
+// RuntimeExecutor path it stays alive (spinner + tips) but its TEXT is the
+// event-derived human step of the execution-view projection — never a static
+// dispatch template — so nothing is claimed until a real execution event
+// arrives.
 //
 // ANSI-LEAK HARDENING: the shimmer sweep re-colours every rune of the status
 // text independently, so the sweep text MUST NEVER carry pre-styled (ANSI-
@@ -172,7 +175,14 @@ func (m *model) renderLoadingDock() string {
 	dockText := m.composeDockTextWithFlake(flake)
 
 	var b strings.Builder
-	b.WriteString("  " + shimmer.Render(ansi.Strip(dockText), m.shimmerAnim.Frame, m.shimmerAnim.Width))
+	if dockText != "" {
+		b.WriteString("  " + shimmer.Render(ansi.Strip(dockText), m.shimmerAnim.Frame, m.shimmerAnim.Width))
+	} else {
+		// No event-derived step yet (pre-first-event, or a conversation): the
+		// animated spinner renders alone with NO text claim — progress is never
+		// fabricated before a real runtime event exists.
+		b.WriteString("  " + ansi.Strip(flake))
+	}
 	b.WriteString("\n")
 	if m.loadingTip != "" {
 		b.WriteString("  ")
@@ -187,11 +197,12 @@ func (m *model) renderLoadingDock() string {
 }
 
 // composeDockTextWithFlake builds the dynamic status text using the given
-// snowflake character. It is derived from the AUTHORITATIVE execution stage
-// (stage.go): the dock can only ever claim work the runtime actually reported —
-// a provider wait renders as "waiting" (never "thinking"), a token stream as
-// "streaming", a local stage as its canonical label. When no stage is active
-// it falls back to the shimmer text set by startShimmer.
+// snowflake character. It is derived from AUTHORITATIVE execution signals only:
+// the execution-view projection (event-derived human step), the runtime stage
+// record (stage.go), or — on the legacy agent/stream paths — the shimmer text
+// set by startShimmer. When no authoritative signal exists it returns "" so the
+// dock renders nothing: a static "Working..." placeholder would be a fake
+// progress claim.
 //
 // The returned text is ALWAYS plain (ANSI-free): the shimmer sweep re-colours
 // every rune independently, so embedding a lipgloss-styled segment here would
@@ -201,10 +212,9 @@ func (m *model) renderLoadingDock() string {
 func (m *model) composeDockTextWithFlake(flake string) string {
 	// The gated RuntimeExecutor path renders its status EXCLUSIVELY from the
 	// single execution-view projection (Part 5): the human step the runtime
-	// events produced — "Thinking...", "Found target index.html",
-	// "Generated change", "Applying...". The UI never invents execution truth.
-	// Gated on the in-flight marker so a later legacy operation can never
-	// inherit a stale execution step.
+	// events produced — "Reading index.html", "Analyzing", "Applying changes".
+	// The UI never invents execution truth. Gated on the in-flight marker so a
+	// later legacy operation can never inherit a stale execution step.
 	if m.execView != nil && m.executionResolving && m.execView.Active() {
 		if step := m.execView.HumanStep(); step != "" {
 			return flake + " " + step
@@ -218,7 +228,7 @@ func (m *model) composeDockTextWithFlake(flake string) string {
 	if m.shimmerText != "" {
 		return flake + " " + m.shimmerText
 	}
-	return flake + " Working..."
+	return ""
 }
 
 // composeDockText builds the dynamic status text using the default snowflake.

@@ -68,12 +68,17 @@ func transitionForEvent(ev events.DomainEvent) string {
 // is the single source of truth for the human narrative. A transition that has
 // no sentence still carries a machine record (DEBUG layer) but adds no human
 // step — the narrative never invents a step that has no transition behind it.
+//
+// NORMAL-layer visibility rule: only transitions that represent MEANINGFUL
+// human progress carry a sentence. execution.started / strategy.selected are
+// deterministic plumbing (request receipt + a decision the engine already made)
+// and deliberately produce NO human step — the engine has done nothing visible
+// yet. The first human step appears when the runtime actually touches a target
+// (target.resolved → "Reading {target}") or invokes the model.
 var transitionNarrative = map[string]string{
-	"execution.started":      "Understanding request",
-	"strategy.selected":      "Understanding request",
-	"target.resolved":        "Inspecting target",
+	"target.resolved":        "Reading target",
 	"context.prepared":       "Gathering context",
-	"provider.invoked":       "Generating response",
+	"provider.invoked":       "Analyzing",
 	"artifact.produced":      "Preparing result",
 	"approval.required":      "Waiting for approval",
 	"mutation.started":       "Applying changes",
@@ -192,9 +197,18 @@ func (n *ExecutionNarrative) Project(ev events.DomainEvent) {
 		n.requestID = p.RequestID
 	case events.TargetResolvedPayload:
 		// Enrich the derived step with the actual resolved target — still
-		// derived from the transition payload, never a static label.
+		// derived from the transition payload, never a static label. The
+		// runtime reads the resolved target content, so the truthful human
+		// sentence is "Reading {target}", never a fabricated "thinking".
 		if p.Target != "" {
-			human = "Inspecting " + p.Target
+			human = "Reading " + p.Target
+		}
+	case events.ContextPreparedPayload:
+		// Zero-context policies (direct_response / casual chat) compiled no
+		// context: nothing was gathered, so no human step exists. A real
+		// context envelope (target_file_only / repository) produces the step.
+		if len(p.Channels) == 0 {
+			human = ""
 		}
 	case events.MutationCompletedPayload:
 		if mutationOutcomeSucceeded(p.Outcome) {
@@ -210,6 +224,12 @@ func (n *ExecutionNarrative) Project(ev events.DomainEvent) {
 		human = finishedSentence(p.Success, p.Outcome)
 	}
 	if human == "" {
+		// Machine-only record: the transition carries no meaningful human
+		// progress (e.g. execution.started / strategy.selected), but the raw
+		// record must still be kept for the DEBUG layer — dropping it would
+		// falsify the event stream. A machine-only line never becomes a human
+		// step (Human/Steps filter on the sentence).
+		n.lines = append(n.lines, narrativeLine{transition: transition, machine: machine})
 		return
 	}
 	// Derive only: a step identical to the last one (e.g. two targets) is

@@ -379,8 +379,11 @@ func TestComposeDockTextNoFabricatedStage(t *testing.T) {
 func TestComposeDockTextFallback(t *testing.T) {
 	m := newTestModel()
 	got := m.composeDockText()
-	if got != "✻ Working..." {
-		t.Errorf("composeDockText fallback = %q, want '✻ Working...'", got)
+	// No authoritative signal (execution projection, runtime stage, legacy
+	// shimmer text) exists: the dock must render NOTHING — a static "Working..."
+	// fallback would be a fabricated progress claim.
+	if got != "" {
+		t.Errorf("composeDockText fallback = %q, want \"\" (no fabricated progress)", got)
 	}
 }
 

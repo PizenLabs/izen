@@ -57,6 +57,9 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	// the async execution runs. Modes never select the path.
 	req, det, gateErr := m.gateway.Gate(context.Background(), line)
 	if gateErr != nil {
+		// A gate failure is a terminal, non-execution outcome: release the
+		// generic Enter shimmer so no stale loading claim survives it.
+		m.stopShimmer()
 		return func() tea.Msg { return gatedExecutionMsg{det: det, err: gateErr} }
 	}
 	m.lastExecutionStrategy = det.Profile
@@ -65,29 +68,31 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	// Mode is a presentation label only — never an execution-path decision.
 	req.Mode = m.resolver.Current().String()
 
-	// The loading shimmer activates synchronously at dispatch (t=0ms) so the
-	// runtime execution is never a frozen pane. The in-flight marker is cleared
-	// by the terminal execution events and by any terminal cleanup.
-	m.startShimmer("Resolving execution...", "execution")
+	// ── LOADING DOCK: SPINNER + TIPS, EVENT-DERIVED TEXT ──────────────
+	// The generic Enter path seeded a "Working..." shimmer at t=0ms; the gated
+	// path overrides it with an EMPTY shimmer text so the loading dock (the
+	// animated spinner + contextual tip) stays alive — the execution is never a
+	// frozen pane — while its text derives EXCLUSIVELY from the execution-view
+	// projection (real runtime events). No static progress template is ever
+	// claimed. The in-flight marker is cleared by the terminal execution events
+	// and by any terminal cleanup.
+	m.startShimmer("", "execution")
 	m.executionResolving = true
 	m.agentRunning = true
-	m.agentLabel = "resolving execution"
+	m.agentLabel = ""
 
 	// ── CONVERSATION FLOW (UX_ENGINE #4) ─────────────────────────────
 	// A direct-response request (casual greeting / simple question) is a single
 	// human action: Izen → understands intent → answers. It must NOT create an
 	// execution narrative, a workspace-context pipeline, or planning states.
 	// The runtime still resolves and executes it (zero repository context), but
-	// the human surface is the answer only — no narrative panel, no milestones.
+	// the human surface is the answer only — no narrative panel, no milestones,
+	// no execution timeline (the loading dock keeps only its spinner + tips).
+	// The visibility layer is also reset so no runtime detail lines from a
+	// prior debug view can leak into a conversational exchange.
 	if det.Profile.Strategy == strategy.DirectResponse {
-		// The execution-view projection stays nil for conversation so the
-		// narrative panel never renders; the loading dock falls back to the
-		// shimmer text ("Answering...") derived from the conversational intent.
-		// The visibility layer is also reset so no runtime detail lines from a
-		// prior debug view can leak into a conversational exchange.
 		m.execView = nil
 		m.execVisibility = presentation.VisibilityNormal
-		m.startShimmer("Answering...", "chat")
 		return func() tea.Msg {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
@@ -172,12 +177,11 @@ func (m *model) pushArtifact(kind, target, content string) {
 // result surface. It delegates to the shared executionResultMsg handler so the
 // rendering truth is identical for every execution path.
 //
-// A GATE failure (before any execution began, the loading shimmer was never
-// started) is surfaced distinctly and stays idle. An EXECUTION failure
-// (the runtime returned a result alongside the error) is delegated to the
-// shared terminal projection, which finalizes the operation and clears the
-// loading state — the "Resolving execution..." shimmer must never outlive a
-// terminal execution event.
+// A GATE failure (before any execution began) is surfaced distinctly and stays
+// idle. An EXECUTION failure (the runtime returned a result alongside the
+// error) is delegated to the shared terminal projection, which finalizes the
+// operation and clears the loading state — a terminal execution event must
+// never leave the in-flight marker behind.
 func (m *model) handleGatedExecution(msg gatedExecutionMsg) (tea.Model, tea.Cmd) {
 	if msg.err != nil && msg.res == nil {
 		m.push(roleError, "Couldn't start: "+msg.err.Error())
@@ -219,12 +223,13 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		return m, nil
 	}
 
-	// ── Terminal token accounting from the runtime's provider usage ──
-	var tokenInput, tokenOutput int
-	for _, inv := range res.ModelCalls {
-		tokenInput += inv.TokenInput
-		tokenOutput += inv.TokenOutput
-	}
+	// ── Terminal token accounting from the runtime's authoritative usage ──
+	// The runtime computed the aggregate provider-reported usage (provider,
+	// model, input/output tokens, latency, artifact) on ExecutionResult.Completed.
+	// The renderer consumes that account directly and never re-sums model calls
+	// — the footer numbers are always the provider's real billing.
+	tokenInput := res.Completed.InputTokens
+	tokenOutput := res.Completed.OutputTokens
 
 	// ── READ-ONLY TERMINAL: the runtime produced an artifact, no mutation ──
 	if res.Proof != nil && res.Proof.Outcome == execution.OutcomeCompleted && res.Content != "" {
