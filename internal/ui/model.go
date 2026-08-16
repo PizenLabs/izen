@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/core/authorization"
@@ -1484,6 +1485,14 @@ type model struct {
 	// headless/test harnesses that never construct a model.
 	orch *orchestrator.Orchestrator
 
+	// Autonomy decision runtime: classifies intent independently from workspace
+	// selection, evaluates the autonomy decision model (auto_continue /
+	// ask_user / block / direct_response), records session capability grants,
+	// and drives the autonomous loop. The UI is a read-only observer: it
+	// projects the autonomy events onto the activity log and never mutates the
+	// engine. Nil only in headless/test harnesses.
+	autonomy *autonomy.Engine
+
 	// Patch engine: 4-tier pipeline (Tier 1 structured diff -> Tier 2
 	// SEARCH/REPLACE -> Tier 3 whole-file -> Tier 4 human approval) replacing
 	// the legacy build patch application. Emits PatchParsed/PatchValidated/
@@ -2151,6 +2160,50 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// buffer (never the response pipeline); the terminal event collapses
 		// the box into compact mode.
 		m.handleReasoningStream(p.Chunk, p.IsComplete)
+	case events.AutonomyDecisionPayload:
+		// Autonomy decision runtime verdict: the canonical record of when the
+		// runtime continues, asks, blocks or answers directly. Distinct visual
+		// markers per verdict keep the autonomy surface scannable.
+		marker := "◆"
+		switch p.Decision {
+		case "auto_continue":
+			marker = "▶"
+		case "ask_user":
+			marker = "◈"
+		case "block":
+			marker = "■"
+		case "direct_response":
+			marker = "◇"
+		}
+		ws := p.Workspace
+		if ws == "" {
+			ws = "none"
+		}
+		if p.Decision == "direct_response" {
+			m.logActivity("[autonomy] %s direct response — no workspace", marker)
+		} else {
+			m.logActivity("[autonomy] %s %s → workspace %s (risk %s, %.0f%%): %s",
+				marker, p.Decision, ws, p.Risk, p.Confidence*100, truncateForActivity(p.Reason))
+		}
+		if len(p.MissingCapabilities) > 0 {
+			m.logActivity("[autonomy] requesting capability: %s",
+				strings.Join(p.MissingCapabilities, "+"))
+		}
+	case events.CapabilityGrantedPayload:
+		// A session capability grant: one grant authorizes every operation in
+		// its scope — the "no repeated approvals" guarantee.
+		m.logActivity("[grant] %s: %s granted for %s (expires %s)",
+			p.GrantID, strings.Join(p.Capabilities, "+"), p.Scope, orNever(p.ExpiresAt))
+	case events.LoopTransitionPayload:
+		// One step of the autonomous loop. Failure transitions are shown like
+		// any other: the loop produces diagnosis, never termination.
+		m.logActivity("[loop] %s → %s (%s): %s",
+			p.From, p.To, p.Event, truncateForActivity(p.Reason))
+	case events.ContextCompiledPayload:
+		// The context intelligence layer compiled a structural understanding
+		// of an artifact: findings, not raw bytes.
+		m.logActivity("[context] compiled %s (%s): %d finding(s)",
+			p.Path, p.Kind, p.FindingCount)
 	}
 }
 
@@ -2679,6 +2732,14 @@ func verificationTick(passed bool) string {
 		return "passed"
 	}
 	return "failed"
+}
+
+// orNever renders an RFC3339 expiry as "never" when empty.
+func orNever(ts string) string {
+	if ts == "" {
+		return "never"
+	}
+	return ts
 }
 
 // push appends a record. Records are flushed to the terminal's native

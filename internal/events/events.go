@@ -75,8 +75,7 @@ const (
 	// cut short by a context deadline or cancellation so tokens already billed
 	// by the provider are never silently zeroed in local telemetry.
 	EventStreamUsage = "stream.usage"
-
-	// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──────────
+// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──────────
 	// These events are the single authoritative stream of a full execution
 	// through the RuntimeExecutor. They are emitted ONLY at real runtime
 	// boundaries — never synthesised by the presentation layer — so the UI can
@@ -118,6 +117,24 @@ const (
 	// the provider-reported reasoning token count when available. Raw
 	// chain-of-thought text NEVER travels on the bus.
 	EventReasoningTelemetry = "reasoning.telemetry"
+	// EventAutonomyDecision is emitted when the autonomy controller renders a
+	// verdict (direct_response / auto_continue / ask_user / block). Every
+	// autonomy decision is observable through this canonical event; the runtime
+	// never hides a gate.
+	EventAutonomyDecision = "autonomy.decision"
+	// EventCapabilityGranted is emitted when a session capability grant is
+	// issued. Grants replace per-file approvals: one grant authorizes every
+	// operation inside its scope boundary.
+	EventCapabilityGranted = "capability.granted"
+	// EventLoopTransition is emitted on every autonomous loop step
+	// (investigate -> plan -> build -> verify -> diagnose -> ...). Failure
+	// transitions are published like any other: the loop produces diagnosis,
+	// not termination.
+	EventLoopTransition = "loop.transition"
+	// EventContextCompiled is emitted when the context intelligence layer
+	// compiles a structural understanding of an artifact (HTML structure,
+	// orphan content, invalid regions, code symbols, dependencies).
+	EventContextCompiled = "context.compiled"
 )
 
 // FailureClassification is the taxonomy used by EventExecutionFailed. It is
@@ -453,6 +470,49 @@ type ReasoningTelemetryPayload struct {
 	Tokens    int
 }
 
+// AutonomyDecisionPayload carries an autonomy controller verdict. Decision is
+// one of direct_response / auto_continue / ask_user / block. Intent is the
+// canonical intent category, Workspace the selected capability domain, Risk
+// the normalized mutation risk, MissingCapabilities the ungranted capability
+// vector (empty when none), and Reason the observable justification.
+type AutonomyDecisionPayload struct {
+	Decision            string
+	Intent              string
+	Confidence          float64
+	Workspace           string
+	Risk                string
+	MissingCapabilities []string
+	Reason              string
+}
+
+// CapabilityGrantedPayload carries a session capability grant. GrantID/Scope
+// identify the boundary; Capabilities lists the granted permission bits.
+type CapabilityGrantedPayload struct {
+	GrantID      string
+	Scope        string
+	Capabilities []string
+	ExpiresAt    string
+}
+
+// LoopTransitionPayload carries one step of the autonomous execution loop.
+// From/To use the canonical loop states (investigate/plan/build/verify/
+// diagnose/ask_user/stop); Event names the loop event that caused the move.
+type LoopTransitionPayload struct {
+	From   string
+	To     string
+	Event  string
+	Reason string
+}
+
+// ContextCompiledPayload carries the structural understanding of one artifact.
+// Kind is html/code/text; FindingCount is the number of evidence findings the
+// compiler produced for it.
+type ContextCompiledPayload struct {
+	Path         string
+	Kind         string
+	FindingCount int
+}
+
 // ── Generic event implementation ────────────────────────────────────────────
 
 // event is the shared DomainEvent implementation. All events are immutable:
@@ -768,4 +828,46 @@ func NewProviderUsageUpdate(requestID, model string, inputTokens, outputTokens, 
 // count when provided) — never reasoning text.
 func NewReasoningTelemetry(requestID, model string, duration time.Duration, tokens int) DomainEvent {
 	return newEvent(EventReasoningTelemetry, ReasoningTelemetryPayload{RequestID: requestID, Model: model, Duration: duration, Tokens: tokens})
+}
+
+// NewAutonomyDecision publishes an autonomy controller verdict.
+func NewAutonomyDecision(decision, intent string, confidence float64, workspace, risk string, missing []string, reason string) DomainEvent {
+	return newEvent(EventAutonomyDecision, AutonomyDecisionPayload{
+		Decision:            decision,
+		Intent:              intent,
+		Confidence:          confidence,
+		Workspace:           workspace,
+		Risk:                risk,
+		MissingCapabilities: missing,
+		Reason:              reason,
+	})
+}
+
+// NewCapabilityGranted publishes a session capability grant.
+func NewCapabilityGranted(grantID, scope string, capabilities []string, expiresAt string) DomainEvent {
+	return newEvent(EventCapabilityGranted, CapabilityGrantedPayload{
+		GrantID:      grantID,
+		Scope:        scope,
+		Capabilities: capabilities,
+		ExpiresAt:    expiresAt,
+	})
+}
+
+// NewLoopTransition publishes one step of the autonomous execution loop.
+func NewLoopTransition(from, to, event, reason string) DomainEvent {
+	return newEvent(EventLoopTransition, LoopTransitionPayload{
+		From:   from,
+		To:     to,
+		Event:  event,
+		Reason: reason,
+	})
+}
+
+// NewContextCompiled publishes the structural understanding of one artifact.
+func NewContextCompiled(path, kind string, findingCount int) DomainEvent {
+	return newEvent(EventContextCompiled, ContextCompiledPayload{
+		Path:         path,
+		Kind:         kind,
+		FindingCount: findingCount,
+	})
 }

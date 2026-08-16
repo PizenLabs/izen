@@ -89,6 +89,8 @@ var validSystemCommands = map[string]struct{}{
 	"/checkpoint":       {},
 	"/arch":             {},
 	"/explain-decision": {},
+	"/grant":            {},
+	"/decide":           {},
 }
 
 // ansiRe strips terminal ANSI escape color codes (e.g. \x1b[31m) that can
@@ -185,6 +187,22 @@ func (m *model) handleInput(line string) tea.Cmd {
 	// Safety gate confirmation: pending test/run confirmation for large repos
 	if m.pendingTestConfirm {
 		return m.handleReviewTestConfirm(line)
+	}
+
+	// ── $decide AUTONOMY TRACE (intercepted BEFORE the parser pipeline) ──
+	// $decide <prompt> runs the human-authorized decision runtime: intent
+	// classification (independent of mode), capability-based workspace
+	// selection, and the autonomy verdict. It is purely observational — it
+	// changes no routing and executes nothing.
+	if strings.HasPrefix(line, "$decide") {
+		decideContent := strings.TrimSpace(strings.TrimPrefix(line, "$decide"))
+		if decideContent == "" {
+			m.push(roleSystem, infoStyle.Render("[Usage] $decide <prompt> — run the intent → workspace → autonomy decision trace"))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+		return m.runAutonomyDecideCmd(decideContent)
 	}
 
 	if strings.HasPrefix(line, "!") {
@@ -1855,6 +1873,10 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /investigate debug bugs, failures, regressions"))
 		m.push(roleSystem, infoStyle.Render("  /review      audit changes, detect risks"))
 		m.push(roleSystem, "")
+		m.push(roleSystem, labelBoldStyle.Render("autonomy"))
+		m.push(roleSystem, infoStyle.Render("  $decide <prompt>  run the intent → workspace → decision trace"))
+		m.push(roleSystem, infoStyle.Render("  /grant           grant BUILD capability for the workspace (one approval, many actions)"))
+		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
 		m.push(roleSystem, infoStyle.Render("  /help  /usage  /model  /objective  /drop  /clear  /quit"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>"))
@@ -1889,6 +1911,21 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 	case cmd == "/usage":
 		return m.runUsageCmd()
+
+	case cmd == "/grant":
+		// Session capability authorization: one grant authorizes every action
+		// inside the workspace scope — the runtime loops without asking again.
+		return m.handleAutonomyGrant("")
+
+	case strings.HasPrefix(cmd, "/decide"):
+		content := strings.TrimSpace(strings.TrimPrefix(cmd, "/decide"))
+		if content == "" {
+			m.push(roleSystem, infoStyle.Render("usage: /decide <prompt>  — run the intent → workspace → decision trace"))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+		return m.runAutonomyDecideCmd(content)
 
 	case strings.HasPrefix(cmd, "/provider"):
 		parts := strings.Fields(cmd)

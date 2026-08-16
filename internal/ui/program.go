@@ -185,6 +185,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		rt:                  app.Runtime,
 		pres:                presenter,
 		orch:                app.Orchestrator,
+		autonomy:            app.Autonomy,
 		pipelineEngine:      app.Pipeline,
 		patchEngine:         app.Patch,
 		viewState:           presentation.NewWorkflowViewState(),
@@ -315,7 +316,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		events.EventIntentClassified,
 		events.EventPhaseChanged,
 		events.EventApprovalRequested,
-		// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──
+// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──
 		// The runtime owns every execution; the UI renders its lifecycle purely
 		// as a projection of these events.
 		events.EventExecutionStarted,
@@ -335,6 +336,15 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		events.EventVerificationCompleted,
 		events.EventExecutionFinished,
 		events.EventApprovalRequired,
+		// Autonomy decision runtime events: every gate (auto_continue /
+		// ask_user / block / direct_response), capability grant, loop step and
+		// context compilation is projected as an activity line so the operator
+		// observes exactly when the runtime thinks, asks, switches, loops, acts
+		// and stops.
+		events.EventAutonomyDecision,
+		events.EventCapabilityGranted,
+		events.EventLoopTransition,
+		events.EventContextCompiled,
 	} {
 		eventBus.Subscribe(typ, func(ev events.DomainEvent) {
 			p.Send(domainEventMsg{ev: ev})
