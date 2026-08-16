@@ -6470,6 +6470,7 @@ func (m *model) cancelStaleAgentOps() {
 	m.agentRunning = false
 	m.agentDone = false
 	m.agentLabel = ""
+	m.executionResolving = false
 	m.lastActionTime = time.Time{}
 	m.spinnerFrame = 0
 

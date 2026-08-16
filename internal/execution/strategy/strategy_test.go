@@ -167,6 +167,81 @@ func TestSelectAmbiguousTarget(t *testing.T) {
 	}
 }
 
+// TestSelectGreetingNeverPlans pins the strategy-quality contract: a greeting
+// or direct-chat request ("hi") must NEVER select multi_file_planning — the
+// workspace-planning path. It is classified as direct chat: a single bounded
+// read-only invocation with zero repository evidence.
+func TestSelectGreetingNeverPlans(t *testing.T) {
+	d := deps(t, map[string]string{"main.go": "package main"})
+	for _, input := range []string{
+		"hi", "hello", "hey there", "good morning", "thanks", "what's up",
+		"how are you", "who are you",
+	} {
+		p := Select(input, d)
+		if p.Strategy == MultiFilePlanning {
+			t.Fatalf("%q selected %s — a greeting must never trigger workspace planning (reason: %s)",
+				input, p.Strategy, p.StrategyReason)
+		}
+		if p.Strategy != TargetedReasoning {
+			t.Fatalf("%q strategy = %s, want targeted_reasoning (direct chat)", input, p.Strategy)
+		}
+		if p.ModelRequired {
+			if p.ModelDecision == "" {
+				t.Fatalf("%q requires a model but has no model decision", input)
+			}
+		}
+		// Direct chat never demands repository-wide evidence.
+		if p.HasContext(ContextDependencyEvidence) {
+			t.Fatalf("%q demands dependency evidence for direct chat", input)
+		}
+		if p.HasContext(ContextRepositoryConstraints) {
+			t.Fatalf("%q demands repository constraints for direct chat", input)
+		}
+		if p.TargetCount() != 0 {
+			t.Fatalf("%q resolved %d targets, want 0 for direct chat", input, p.TargetCount())
+		}
+	}
+}
+
+// TestSelectGreetingWithTargetIsCodingTask pins that a greeting is only direct
+// chat when no target and no coding signal is present: the same greeting with a
+// file reference is a coding task, never chat.
+func TestSelectGreetingWithTargetIsCodingTask(t *testing.T) {
+	d := deps(t, map[string]string{"index.html": "<p>hi</p>"})
+	p := Select("hi, fix the typo in @index.html", d)
+	if p.Strategy != TargetedMutation {
+		t.Fatalf("Strategy = %s, want targeted_mutation (reason: %s)", p.Strategy, p.StrategyReason)
+	}
+	if p.TargetCount() != 1 {
+		t.Fatalf("TargetCount = %d, want 1", p.TargetCount())
+	}
+}
+
+// TestSelectDirectQuestionIsReadOnly pins that a read-only question without a
+// target is answered directly (targeted_reasoning) instead of expanding into
+// repository planning.
+func TestSelectDirectQuestionIsReadOnly(t *testing.T) {
+	d := deps(t, map[string]string{"main.go": "package main"})
+	for _, input := range []string{
+		"what is a goroutine",
+		"how does a rate limiter work",
+		"define dependency injection",
+		"what can you do",
+	} {
+		p := Select(input, d)
+		if p.Strategy == MultiFilePlanning {
+			t.Fatalf("%q selected %s — a direct question must not expand into workspace planning",
+				input, p.Strategy)
+		}
+		if p.Strategy != TargetedReasoning {
+			t.Fatalf("%q strategy = %s, want targeted_reasoning (read-only answer)", input, p.Strategy)
+		}
+		if p.Artifact.Kind != "explanation" {
+			t.Fatalf("%q artifact = %s, want explanation", input, p.Artifact.Kind)
+		}
+	}
+}
+
 func TestSelectRepositoryInvestigation(t *testing.T) {
 	d := deps(t, map[string]string{"main.go": "package main"})
 	p := Select("why is the build failing", d)

@@ -64,8 +64,10 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	req.Mode = m.resolver.Current().String()
 
 	// The loading shimmer activates synchronously at dispatch (t=0ms) so the
-	// runtime execution is never a frozen pane.
+	// runtime execution is never a frozen pane. The in-flight marker is cleared
+	// by the terminal execution events and by any terminal cleanup.
 	m.startShimmer("Resolving execution...", "execution")
+	m.executionResolving = true
 	m.agentRunning = true
 	m.agentLabel = "resolving execution"
 
@@ -83,15 +85,22 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 // handleGatedExecution projects a gated execution result into the proposal /
 // result surface. It delegates to the shared executionResultMsg handler so the
 // rendering truth is identical for every execution path.
+//
+// A GATE failure (before any execution began, the loading shimmer was never
+// started) is surfaced distinctly and stays idle. An EXECUTION failure
+// (the runtime returned a result alongside the error) is delegated to the
+// shared terminal projection, which finalizes the operation and clears the
+// loading state — the "Resolving execution..." shimmer must never outlive a
+// terminal execution event.
 func (m *model) handleGatedExecution(msg gatedExecutionMsg) (tea.Model, tea.Cmd) {
-	if msg.err != nil {
+	if msg.err != nil && msg.res == nil {
 		m.push(roleError, "[execution] gate failed: "+msg.err.Error())
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m, nil
 	}
 	m.clearEngineFirstMutationState()
-	return m.executionResultUpdate(executionResultMsg{res: msg.res, err: msg.res.Err})
+	return m.executionResultUpdate(executionResultMsg{res: msg.res, err: msg.err})
 }
 
 // executionResultUpdate projects a RuntimeExecutor result onto the proposal /

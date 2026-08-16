@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -109,6 +110,155 @@ func trivialVerifier(root string) *Verifier {
 		root:  root,
 		steps: []VerificationStep{{Name: "noop", Command: "true", Optional: false}},
 	}
+}
+
+// namedMockProvider is an ai.Provider with a controllable identity + call
+// counter so contract tests can assert WHICH adapter a model was routed to.
+type namedMockProvider struct {
+	name      string
+	err       error
+	mu        sync.Mutex
+	callCount int
+	requests  []ai.Request
+}
+
+func (m *namedMockProvider) Name() string { return m.name }
+
+func (m *namedMockProvider) Execute(_ context.Context, req ai.Request) (*ai.Response, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.callCount++
+	m.requests = append(m.requests, req)
+	if m.err != nil {
+		return nil, m.err
+	}
+	return &ai.Response{Content: sampleReplace}, nil
+}
+
+func (m *namedMockProvider) ExecuteStream(_ context.Context, _ ai.Request) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("stream not supported in mock")
+}
+
+func (m *namedMockProvider) calls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.callCount
+}
+
+func (m *namedMockProvider) modelsCalled() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.requests))
+	for _, r := range m.requests {
+		out = append(out, r.Model)
+	}
+	return out
+}
+
+func TestRuntimeExecutor_ProviderModelContract(t *testing.T) {
+	writeNote := func(t *testing.T, root string) {
+		t.Helper()
+		writeTarget(t, root, "note.txt", sampleOriginal)
+	}
+	exec := func(t *testing.T, root string, cfg *config.Config, p ai.Provider) *RuntimeExecutor {
+		t.Helper()
+		return NewRuntimeExecutor(root, cfg, p, nil, "")
+	}
+
+	t.Run("openrouter provider + openrouter model => openrouter invocation", func(t *testing.T) {
+		root := t.TempDir()
+		writeNote(t, root)
+		cfg := config.Default()
+		cfg.AI.Providers["openrouter"] = config.AIProviderConfig{
+			BaseURL:      "https://openrouter.ai/api/v1",
+			APIKey:       "sk-test",
+			DefaultModel: "cohere/north-mini-code:free",
+		}
+		cfg.Models.SessionModel = "cohere/north-mini-code:free"
+		p := &namedMockProvider{name: "openrouter"}
+		x := exec(t, root, cfg, p)
+
+		res, err := x.Execute(context.Background(), ExecuteRequest{
+			RequestID: "c1",
+			Mode:      "build",
+			Prompt:    "change bar to qux",
+			Target:    "note.txt",
+		})
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if res.Err != nil {
+			t.Fatalf("Execute res.Err: %v", res.Err)
+		}
+		if p.calls() != 1 {
+			t.Fatalf("provider calls = %d, want exactly 1", p.calls())
+		}
+		if got := p.modelsCalled(); len(got) != 1 || got[0] != "cohere/north-mini-code:free" {
+			t.Fatalf("invoked models = %v, want [cohere/north-mini-code:free]", got)
+		}
+	})
+
+	t.Run("ollama provider + local model => ollama invocation", func(t *testing.T) {
+		root := t.TempDir()
+		writeNote(t, root)
+		cfg := config.Default() // ollama default qwen2.5-coder:7b, no session override
+		p := &namedMockProvider{name: "ollama"}
+		x := exec(t, root, cfg, p)
+
+		res, err := x.Execute(context.Background(), ExecuteRequest{
+			RequestID: "c2",
+			Mode:      "build",
+			Prompt:    "change bar to qux",
+			Target:    "note.txt",
+		})
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if res.Err != nil {
+			t.Fatalf("Execute res.Err: %v", res.Err)
+		}
+		if p.calls() != 1 {
+			t.Fatalf("provider calls = %d, want exactly 1", p.calls())
+		}
+		if got := p.modelsCalled(); len(got) != 1 || got[0] != "qwen2.5-coder:7b" {
+			t.Fatalf("invoked models = %v, want [qwen2.5-coder:7b]", got)
+		}
+	})
+
+	t.Run("provider mismatch fails deterministically before any network call", func(t *testing.T) {
+		root := t.TempDir()
+		writeNote(t, root)
+		cfg := config.Default()
+		// The user's active model is an OpenRouter model…
+		cfg.Models.SessionModel = "cohere/north-mini-code:free"
+		// …but the executor is bound to the Ollama adapter (a stale provider
+		// that was never re-bound after the UI switched). This is the exact
+		// mismatch that must never reach the network.
+		p := &namedMockProvider{name: "ollama"}
+		x := exec(t, root, cfg, p)
+
+		res, err := x.Execute(context.Background(), ExecuteRequest{
+			RequestID: "c3",
+			Mode:      "build",
+			Prompt:    "change bar to qux",
+			Target:    "note.txt",
+		})
+		if err == nil {
+			t.Fatal("expected a deterministic error for a provider/model mismatch")
+		}
+		if res == nil || res.Err == nil {
+			t.Fatal("expected the result to carry the error")
+		}
+		if !errors.Is(res.Err, ErrProviderModelMismatch) {
+			t.Fatalf("error = %v, want ErrProviderModelMismatch", res.Err)
+		}
+		if p.calls() != 0 {
+			t.Fatalf("provider invoked %d times on a mismatch, want 0 (must fail before the network)", p.calls())
+		}
+		if got := mustRead(t, root, "note.txt"); got != sampleOriginal {
+			t.Fatalf("file mutated on a mismatch: %q", got)
+		}
+	})
 }
 
 func testExecutor(t *testing.T, root string, mock *mockProvider, bus *events.Bus) *RuntimeExecutor {

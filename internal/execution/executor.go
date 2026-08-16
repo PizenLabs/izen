@@ -2,9 +2,11 @@ package execution
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -213,15 +215,89 @@ func (x *RuntimeExecutor) nextID() string {
 	return fmt.Sprintf("exec-%d", x.counter)
 }
 
-// activeModel returns the configured active model. Model routing is a runtime
-// decision — the caller never selects it.
-func (x *RuntimeExecutor) activeModel() string {
-	if x.cfg != nil {
-		if m := x.cfg.ActiveModelName(); m != "" {
-			return m
+// ErrProviderModelMismatch is the deterministic error returned when the model
+// resolved for an invocation does not belong to the provider the executor is
+// bound to. It fires BEFORE any network call, so an OpenRouter model can never
+// be executed by the Ollama adapter (or any other mismatched provider/model
+// pair).
+var ErrProviderModelMismatch = errors.New("executor: provider/model mismatch")
+
+// openRouterStyleModelIDRe matches OpenRouter's vendor/model schema — the same
+// schema OpenRouter itself requires for every model ID. A model carrying a
+// vendor prefix (vendor/model) is a cross-provider ID; a bare local ID
+// (name[:tag], no slash) is a local/direct-provider model.
+var openRouterStyleModelIDRe = regexp.MustCompile(`^[^/\s]+/[^/\s]+$`)
+
+// modelBelongsTo reports whether model is a member of providerName's model
+// family. The schema gate is deliberately focused on the two families whose
+// crossing is catastrophic: OpenRouter REQUIRES the vendor/model schema and
+// Ollama local models never carry a vendor prefix, so a vendor-prefixed model
+// can never be executed by the Ollama adapter and a bare local ID can never be
+// sent to OpenRouter. Every other adapter (direct cloud, routers, custom/test
+// seams) validates its own model IDs.
+func modelBelongsTo(providerName, model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	switch providerName {
+	case "ollama":
+		// Local models never carry an OpenRouter vendor prefix.
+		return !openRouterStyleModelIDRe.MatchString(model)
+	case "openrouter":
+		// OpenRouter REQUIRES the vendor/model schema.
+		return openRouterStyleModelIDRe.MatchString(model)
+	default:
+		return true
+	}
+}
+
+// resolveModel resolves the model that travels with the provider the executor
+// is bound to. The model is ALWAYS derived from the bound provider's own
+// configuration — never from the global active provider, which can drift from
+// the bound adapter — so provider identity and model identity travel together.
+//
+// The session model (the user's explicit /model selection) is authoritative but
+// must belong to the bound provider: when it does not, the runtime fails
+// deterministically before any network call instead of silently routing an
+// OpenRouter model into an Ollama adapter. Model routing is a runtime decision;
+// the caller never selects it.
+func (x *RuntimeExecutor) resolveModel() (string, error) {
+	x.mu.Lock()
+	p := x.provider
+	x.mu.Unlock()
+	if p == nil {
+		return "", fmt.Errorf("executor: no provider configured for model invocation")
+	}
+	if x.cfg == nil {
+		return "", fmt.Errorf("executor: no configuration to resolve the model for provider %q", p.Name())
+	}
+	name := p.Name()
+	model := ""
+	switch {
+	case x.cfg.Models.SessionModel != "":
+		model = x.cfg.Models.SessionModel
+	default:
+		if provCfg, ok := x.cfg.AI.Providers[name]; ok && provCfg.DefaultModel != "" {
+			model = provCfg.DefaultModel
+		} else if x.cfg.Models.Default != "" {
+			model = x.cfg.Models.Default
+		} else {
+			// The bound provider is not described in the config registry (a
+			// test seam or custom adapter): fall back to the global active
+			// model so the runtime still invokes with a model.
+			model = x.cfg.ActiveModelName()
 		}
 	}
-	return ""
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "", fmt.Errorf("executor: no model bound to provider %q", name)
+	}
+	if !modelBelongsTo(name, model) {
+		return "", fmt.Errorf("%w: model %q does not belong to provider %q",
+			ErrProviderModelMismatch, model, name)
+	}
+	return model, nil
 }
 
 // Execute runs the deterministic execution flow for req. For a targeted
@@ -615,7 +691,10 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 
 	system := boundedMutationSystemPrompt()
 	user := buildMutationUserPrompt(req.Prompt, target, original)
-	model := x.activeModel()
+	model, modelErr := x.resolveModel()
+	if modelErr != nil {
+		return original, "", "", inv, modelErr
+	}
 	aiReq := ai.Request{
 		Model:     model,
 		System:    system,
@@ -694,7 +773,10 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	b.WriteString(req.Prompt)
 	b.WriteString("\n")
 
-	model := x.activeModel()
+	model, modelErr := x.resolveModel()
+	if modelErr != nil {
+		return "", inv, modelErr
+	}
 	aiReq := ai.Request{
 		Model:     model,
 		System:    readOnlySystemPrompt(profile.Strategy),

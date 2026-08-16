@@ -254,7 +254,26 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 		return withBudgets(profile)
 	}
 
-	// ── 6. No targets → repository-level planning ─────────────────────
+	// ── 6. Casual chat / direct greeting (never workspace planning) ────
+	// A greeting, small talk, or direct question that resolved no target and
+	// matched no coding operation is direct chat: exactly one bounded read-only
+	// invocation with zero repository evidence. It must NEVER expand into
+	// repository-level planning — "hi" is not a planning request. This guard
+	// runs last so a stronger signal (create / clarify / diagnose / architect /
+	// explicit or inferred target) always wins.
+	if gateway.IsCasualChat(raw) {
+		profile.Strategy = TargetedReasoning
+		profile.ModelRequired = true
+		profile.StrategyReason = "casual greeting / direct chat; answered directly, no workspace planning"
+		profile.ModelDecision = "answer the greeting or question directly"
+		profile.Artifact = ArtifactContract{Kind: "explanation", Bounded: true,
+			Description: "direct chat reply"}
+		profile.Complexity = Assess(ComplexityInputs{Operation: OperationExplain, TargetCount: 0, FileCount: 0})
+		profile.ContextKinds = []ContextKind{ContextUserIntent}
+		return withBudgets(profile)
+	}
+
+	// ── 7. No targets → repository-level planning ─────────────────────
 	profile.Strategy = MultiFilePlanning
 	profile.ModelRequired = true
 	profile.StrategyReason = "no explicit target set; repository-level reasoning is justified"

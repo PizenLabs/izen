@@ -192,6 +192,9 @@ func (m *model) beginOperation(kind OperationKind) *operation {
 	m.streaming = false
 	m.agentRunning = true
 	m.agentDone = false
+	// A new operation supersedes the gated-execution resolving phase: its
+	// terminal events must never clear a newer operation's loading state.
+	m.executionResolving = false
 	m.reviewRunning = false
 	m.investigateRunning = false
 	m.pipelineRunning = false

@@ -878,6 +878,15 @@ type model struct {
 	agentLabel   string
 	agentDone    bool
 
+	// executionResolving is the single in-flight marker of the gated
+	// RuntimeExecutor loading phase ("Resolving execution..."). It is set at
+	// dispatch, cleared when a new operation supersedes it, and cleared by the
+	// terminal execution events (execution.finished / execution.failed /
+	// cancelled) so every terminal event releases the loading state, the
+	// spinner, and the pending operation. It gates clearExecutionLoading so a
+	// terminal runtime event can never clobber an unrelated operation.
+	executionResolving bool
+
 	// Quit-confirmation modal (exit safety guard). pendingQuitConfirm gates
 	// clean shutdown behind an explicit [ No ] / [ Yes ] dialog; the dialog
 	// defaults to [ No ] so a stray Enter can never exit accidentally.
@@ -1955,6 +1964,9 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		}
 	case events.ExecutionFailedPayload:
 		m.logActivity("[error][%s] %s (stage: %s)", p.Classification, p.Error, p.Stage)
+		// A terminal failure event is authoritative execution truth: it must
+		// release the loading state, spinner, and pending operation.
+		m.clearExecutionLoading(OpOutcomeFailure)
 	case events.SelfHealingAttemptPayload:
 		// Distinct retry badge + attempt count + failure category so the
 		// self-healing loop reads as one clean, scannable line.
@@ -1986,6 +1998,17 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		m.logActivity("[runtime] verification %s: %d step(s)", verificationTick(p.Passed), len(p.Steps))
 	case events.ExecutionFinishedPayload:
 		m.logActivity("[runtime] execution finished: success=%t (%s)", p.Success, p.Outcome)
+		// A terminal finished event is authoritative execution truth: it must
+		// release the loading state, spinner, and pending operation regardless
+		// of whether the result message has arrived yet.
+		outcome := OpOutcomeSuccess
+		if !p.Success {
+			outcome = OpOutcomeFailure
+		}
+		if p.Outcome == string(execution.OutcomeCancelled) {
+			outcome = OpOutcomeCancelled
+		}
+		m.clearExecutionLoading(outcome)
 	case events.ApprovalRequiredPayload:
 		m.logActivity("[runtime] approval required: %s", p.Target)
 	case events.IntentClassifiedPayload:
@@ -2049,6 +2072,25 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// the box into compact mode.
 		m.handleReasoningStream(p.Chunk, p.IsComplete)
 	}
+}
+
+// clearExecutionLoading terminates the gated-execution loading projection
+// (shimmer + busy flags + pending operation) when a terminal execution event
+// arrives from the runtime. It is the projection-layer counterpart of
+// finalizeOperation: the runtime emits execution.finished / execution.failed /
+// cancelled as authoritative truth and the UI clears its loading state from
+// those events — the "Resolving execution..." shimmer can never outlive a
+// terminal execution event.
+//
+// It is gated on the execution in-flight marker so a terminal runtime event can
+// never clobber an unrelated operation's spinner: the marker is cleared the
+// moment a new operation supersedes the gated execution or any terminal cleanup
+// runs, making this a no-op everywhere except the genuine resolving phase.
+func (m *model) clearExecutionLoading(outcome OperationOutcome) {
+	if !m.executionResolving {
+		return
+	}
+	m.finalizeOperation(outcome, nil)
 }
 
 // ── Derived UI state projection ──────────────────────────────────────────────
@@ -2950,6 +2992,7 @@ func (m *model) clearBusyFlags() {
 	m.agentRunning = false
 	m.agentLabel = ""
 	m.agentDone = true
+	m.executionResolving = false
 	m.reviewRunning = false
 	m.investigateRunning = false
 	m.pipelineRunning = false
