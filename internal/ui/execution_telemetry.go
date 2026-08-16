@@ -7,6 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/execution"
+	runtimegraph "github.com/PizenLabs/izen/internal/execution/graph"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 )
 
@@ -107,6 +108,17 @@ func (m *model) runInspectCmd(filter string) tea.Cmd {
 				m.push(roleSystem, mutedStyle.Render(line))
 			}
 		}
+		// ── RUNTIME GRAPH (Phase 12 / P1 #6) ────────────────────────
+		// The runtime-owned execution graph evidence of the most recent gated
+		// RuntimeExecutor execution: every canonical stage with its real
+		// state/evidence/timestamp. It is the authoritative execution timeline
+		// the runtime produced — never reconstructed by the UI.
+		if len(m.lastRuntimeGraph) > 0 {
+			m.push(roleSystem, mutedStyle.Render(""))
+			for _, line := range strings.Split(strings.TrimRight(renderRuntimeGraph(m.lastRuntimeGraph), "\n"), "\n") {
+				m.push(roleSystem, mutedStyle.Render(line))
+			}
+		}
 		m.push(roleSystem, mutedStyle.Render("  — execution metadata only; model reasoning is never exposed."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -176,6 +188,29 @@ func renderExecutionGraph(g *execution.ExecutionGraph) string {
 		b.WriteString(" verify=" + boolWord(n.Evidence.VerificationPassed))
 		if n.Evidence.Outcome != "" {
 			b.WriteString(" outcome=" + string(n.Evidence.Outcome))
+		}
+	}
+	return b.String()
+}
+
+// renderRuntimeGraph renders the runtime-owned execution graph evidence of a
+// gated RuntimeExecutor execution for $inspect: every canonical stage with its
+// real state, evidence and start timestamp. It renders ONLY what the runtime
+// recorded — a pending stage is a stage that was never reached. It never
+// exposes model reasoning.
+func renderRuntimeGraph(stages []runtimegraph.StageSnapshot) string {
+	if len(stages) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "runtime-graph: stages=%d", len(stages))
+	for _, s := range stages {
+		b.WriteString("\n  " + s.Kind + ": " + string(s.State))
+		if s.Evidence != "" {
+			b.WriteString(" — " + truncateInline(s.Evidence, 80))
+		}
+		if !s.StartedAt.IsZero() {
+			b.WriteString(" at=" + s.StartedAt.Format("15:04:05.000"))
 		}
 	}
 	return b.String()

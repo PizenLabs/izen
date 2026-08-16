@@ -57,10 +57,10 @@ func TestConsistencyCase1_HiAnswerOnlyNoTimeline(t *testing.T) {
 	if panel := m.renderExecutionLayered(); panel != "" {
 		t.Fatalf("conversation must not render an execution panel: %q", panel)
 	}
-	// The loading dock (spinner + tips) is kept for feedback while the answer
-	// is generated — but with no execution/progress claim.
-	if dock := m.renderLoadingDock(); dock == "" {
-		t.Fatal("conversation must keep the loading dock (spinner + tips) active")
+	// The loading dock (spinner + tips) must NOT render for a conversation:
+	// PROMPT.md Test 1 requires a direct answer only — no spinner, no timeline.
+	if dock := m.renderLoadingDock(); dock != "" {
+		t.Fatalf("conversation must show no loading dock (no spinner), got %q", dock)
 	}
 
 	// Run the executor and project the result: the answer lands in the AI role.

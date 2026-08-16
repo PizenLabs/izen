@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/events"
 )
@@ -350,4 +351,78 @@ func TestReducerBeginHasNoFabricatedState(t *testing.T) {
 	if len(got) != 1 || got[0] != "Reading index.html" {
 		t.Fatalf("narrative after target.resolved = %v, want [Reading index.html]", got)
 	}
+}
+
+// TestReducerProviderStreamLifecycle pins the live provider-state projection:
+// the EXPANDED details carry the truthful provider phase (waiting → streaming),
+// the authoritative provider-reported usage updates, and the reasoning
+// telemetry — all derived from canonical events, never inferred by the UI.
+func TestReducerProviderStreamLifecycle(t *testing.T) {
+	p := NewExecutionProjection()
+	p.Project(events.NewExecutionStarted("s1", "build", "fix x"))
+	p.Project(events.NewStrategySelected("s1", "targeted_mutation", true, "x"))
+	p.Project(events.NewTargetResolved("s1", "index.html", true, "strategy"))
+	p.Project(events.NewModelInvoked("s1", "mock", 0, 0))
+
+	if d := p.State().Details; d.ProviderState != "" {
+		t.Fatalf("provider state before provider.waiting = %q, want empty", d.ProviderState)
+	}
+	if step := p.HumanStep(); step != "Analyzing" {
+		t.Fatalf("human step after model.invoked = %q, want Analyzing", step)
+	}
+
+	p.Project(events.NewProviderWaiting("s1", "mock"))
+	if d := p.State().Details; d.ProviderState != "waiting" {
+		t.Fatalf("provider state after provider.waiting = %q, want waiting", d.ProviderState)
+	}
+	if step := p.HumanStep(); step != "Waiting for model" {
+		t.Fatalf("human step after provider.waiting = %q, want Waiting for model", step)
+	}
+
+	p.Project(events.NewProviderFirstToken("s1", "mock", time.Second))
+	if d := p.State().Details; d.ProviderState != "streaming" {
+		t.Fatalf("provider state after provider.first_token = %q, want streaming", d.ProviderState)
+	}
+	if step := p.HumanStep(); step != "Model responding" {
+		t.Fatalf("human step after provider.first_token = %q, want Model responding", step)
+	}
+
+	p.Project(events.NewProviderUsageUpdate("s1", "mock", 12, 6, 4))
+	d := p.State().Details
+	if d.ProviderState != "streaming" {
+		t.Fatalf("provider state after usage update = %q, want streaming", d.ProviderState)
+	}
+	if d.TokenInput != 12 || d.TokenOutput != 6 || d.ReasoningTokens != 4 {
+		t.Fatalf("details tokens = %d/%d reasoning=%d, want 12/6/4", d.TokenInput, d.TokenOutput, d.ReasoningTokens)
+	}
+
+	p.Project(events.NewReasoningTelemetry("s1", "mock", 800*time.Millisecond, 4))
+	d = p.State().Details
+	if d.ReasoningDuration != 800*time.Millisecond || d.ReasoningTokens != 4 {
+		t.Fatalf("reasoning telemetry details = %s/%d, want 800ms/4", d.ReasoningDuration, d.ReasoningTokens)
+	}
+
+	p.Project(events.NewProviderResponse("s1", "mock", 12, 6))
+	if d := p.State().Details; d.ProviderState != "done" {
+		t.Fatalf("provider state after provider.response = %q, want done", d.ProviderState)
+	}
+	// provider.response is machine-only: "Model responding" remains the current
+	// human step; "Analyzing" never re-appears as a duplicate.
+	if step := p.HumanStep(); step != "Model responding" {
+		t.Fatalf("human step after provider.response = %q, want Model responding", step)
+	}
+	if steps := p.HumanTimeline(); countSentence(steps, "Analyzing") != 1 {
+		t.Fatalf("Analyzing must appear exactly once, got %v", steps)
+	}
+}
+
+// countSentence counts how many timeline entries equal sentence.
+func countSentence(steps []string, sentence string) int {
+	n := 0
+	for _, s := range steps {
+		if s == sentence {
+			n++
+		}
+	}
+	return n
 }

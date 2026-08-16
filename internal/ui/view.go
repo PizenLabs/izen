@@ -297,12 +297,13 @@ func (m *model) renderProposalBlock() string {
 		// ── Truthful in-flight mutation dock ───────────────────────
 		// Derived from the authoritative execution stage: the dock shows what
 		// the runtime is ACTUALLY doing (apply/patch/model), never the generic
-		// "Processing file mutations..." claim.
+		// "Processing file mutations..." claim. When no authoritative stage
+		// exists, nothing is rendered — empty is better than fake.
 		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
 		sp := SpinnerStyle.Render(frame)
 		stageLine := m.renderStageLine()
 		if stageLine == "" {
-			stageLine = "Applying mutation..."
+			return b.String()
 		}
 		b.WriteString("  " + sp + " " + infoStyle.Render(stageLine))
 		if len(m.pendingProposals) > 0 {

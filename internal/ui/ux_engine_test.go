@@ -44,13 +44,14 @@ func TestConversationFlowDoesNotCreateExecutionNarrative(t *testing.T) {
 		t.Fatal("conversation must still set the in-flight marker for terminal cleanup")
 	}
 	// No execution timeline: the dock TEXT has no execution-derived claim (and
-	// never a static "Answering..." placeholder). The dock SURFACE (spinner +
-	// contextual tip) stays alive so the answer wait is never a frozen pane.
+	// never a static "Answering..." placeholder). Per PROMPT.md Test 1 a
+	// conversation must not render the loading dock/spinner either — the
+	// direct answer is the only surface.
 	if dock := m.composeDockText(); dock != "" {
 		t.Fatalf("conversation dock text = %q, want empty (no execution timeline)", dock)
 	}
-	if dock := m.renderLoadingDock(); dock == "" {
-		t.Fatal("conversation loading dock (spinner + tip) must be active while the answer is generated")
+	if dock := m.renderLoadingDock(); dock != "" {
+		t.Fatalf("conversation must render no loading dock (no spinner), got %q", dock)
 	}
 }
 

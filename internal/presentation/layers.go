@@ -70,6 +70,17 @@ type ExecutionDetails struct {
 	// TokenInput / TokenOutput are the authoritative provider-reported usage.
 	TokenInput  int
 	TokenOutput int
+	// ReasoningTokens is the provider-reported reasoning token count (0 when
+	// the provider reported none).
+	ReasoningTokens int
+	// ReasoningDuration is the measured wall-clock reasoning window (0 when no
+	// reasoning was observed).
+	ReasoningDuration time.Duration
+	// ProviderState is the truthful live provider phase of the model stage:
+	// "" (not yet invoked), "waiting" (round-trip in flight), "streaming"
+	// (provider bytes arriving), or "done". It is derived ONLY from the
+	// canonical provider events — never inferred by the renderer.
+	ProviderState string
 	// StartedAt / FinishedAt bound the execution window.
 	StartedAt  time.Time
 	FinishedAt time.Time
@@ -91,7 +102,8 @@ func (d ExecutionDetails) Duration() time.Duration {
 
 // Empty reports whether no runtime metadata was observed yet.
 func (d ExecutionDetails) Empty() bool {
-	return d.Strategy == "" && d.Model == "" && len(d.ContextChannels) == 0 && len(d.Artifacts) == 0
+	return d.Strategy == "" && d.Model == "" && len(d.ContextChannels) == 0 && len(d.Artifacts) == 0 &&
+		d.ProviderState == "" && d.ReasoningDuration == 0
 }
 
 // ExecutionFrame is the renderer-ready, visibility-scoped presentation of one

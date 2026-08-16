@@ -97,6 +97,27 @@ const (
 	// It is distinct from EventApprovalRequested (the patch-engine Tier-4
 	// fallback event) — it carries the runtime request + target.
 	EventApprovalRequired = "approval.required"
+
+	// ── PROVIDER STREAM LIFECYCLE (RuntimeExecutor, live evidence) ───────
+	// These events make a runtime model invocation observable BETWEEN
+	// model.invoked (request begins) and provider.response (successful
+	// completion). They are emitted ONLY by the runtime from a live streaming
+	// invocation and carry provider telemetry — never invented progress:
+	//
+	//   model.invoked  → provider.waiting  → provider.first_token →
+	//   provider.stream_delta* → provider.usage_update* → provider.response
+	//
+	// (*) stream_delta is pure evidence transport: a dropped delta never loses
+	// execution truth because the authoritative content always travels on the
+	// ExecutionResult. usage_update carries provider-reported counts only.
+	EventProviderWaiting     = "provider.waiting"
+	EventProviderFirstToken  = "provider.first_token"
+	EventProviderStreamDelta = "provider.stream_delta"
+	EventProviderUsageUpdate = "provider.usage_update"
+	// EventReasoningTelemetry carries reasoning TELEMETRY ONLY — duration and
+	// the provider-reported reasoning token count when available. Raw
+	// chain-of-thought text NEVER travels on the bus.
+	EventReasoningTelemetry = "reasoning.telemetry"
 )
 
 // FailureClassification is the taxonomy used by EventExecutionFailed. It is
@@ -384,6 +405,54 @@ type ApprovalRequiredPayload struct {
 	Preview   string
 }
 
+// ProviderWaitingPayload records that a provider round-trip is in flight
+// (request sent, no byte received yet). It is emitted when the streaming
+// invocation begins and is the truthful "waiting" state of the model stage.
+type ProviderWaitingPayload struct {
+	RequestID string
+	Model     string
+}
+
+// ProviderFirstTokenPayload records the arrival of the first provider byte of
+// an invocation. Latency is the wall-clock time from invocation begin to the
+// first byte.
+type ProviderFirstTokenPayload struct {
+	RequestID string
+	Model     string
+	Latency   time.Duration
+}
+
+// ProviderStreamDeltaPayload carries one content delta of a live provider
+// stream. It is evidence transport ONLY — the authoritative content always
+// travels on the ExecutionResult, so a dropped delta never loses execution
+// truth.
+type ProviderStreamDeltaPayload struct {
+	RequestID string
+	Delta     string
+}
+
+// ProviderUsageUpdatePayload carries the cumulative provider-reported usage of
+// a live stream. It is emitted ONLY for authoritative counts (Known &&
+// !Estimated) — never a character-count estimate.
+type ProviderUsageUpdatePayload struct {
+	RequestID       string
+	Model           string
+	InputTokens     int
+	OutputTokens    int
+	ReasoningTokens int
+}
+
+// ReasoningTelemetryPayload carries reasoning TELEMETRY ONLY: the wall-clock
+// reasoning duration and the provider-reported reasoning token count when
+// available. It never carries reasoning text — raw chain-of-thought is never
+// exposed.
+type ReasoningTelemetryPayload struct {
+	RequestID string
+	Model     string
+	Duration  time.Duration
+	Tokens    int
+}
+
 // ── Generic event implementation ────────────────────────────────────────────
 
 // event is the shared DomainEvent implementation. All events are immutable:
@@ -669,4 +738,34 @@ func NewExecutionFinished(requestID string, success bool, outcome string) Domain
 // NewApprovalRequired publishes a RuntimeExecutor approval-gate request.
 func NewApprovalRequired(requestID, target, preview string) DomainEvent {
 	return newEvent(EventApprovalRequired, ApprovalRequiredPayload{RequestID: requestID, Target: target, Preview: preview})
+}
+
+// NewProviderWaiting publishes that a provider round-trip is in flight.
+func NewProviderWaiting(requestID, model string) DomainEvent {
+	return newEvent(EventProviderWaiting, ProviderWaitingPayload{RequestID: requestID, Model: model})
+}
+
+// NewProviderFirstToken publishes the arrival of the first provider byte.
+func NewProviderFirstToken(requestID, model string, latency time.Duration) DomainEvent {
+	return newEvent(EventProviderFirstToken, ProviderFirstTokenPayload{RequestID: requestID, Model: model, Latency: latency})
+}
+
+// NewProviderStreamDelta publishes one content delta of a live provider stream
+// (evidence transport only).
+func NewProviderStreamDelta(requestID, delta string) DomainEvent {
+	return newEvent(EventProviderStreamDelta, ProviderStreamDeltaPayload{RequestID: requestID, Delta: delta})
+}
+
+// NewProviderUsageUpdate publishes the cumulative provider-reported usage of a
+// live stream.
+func NewProviderUsageUpdate(requestID, model string, inputTokens, outputTokens, reasoningTokens int) DomainEvent {
+	return newEvent(EventProviderUsageUpdate, ProviderUsageUpdatePayload{
+		RequestID: requestID, Model: model, InputTokens: inputTokens, OutputTokens: outputTokens, ReasoningTokens: reasoningTokens,
+	})
+}
+
+// NewReasoningTelemetry publishes reasoning TELEMETRY only (duration + token
+// count when provided) — never reasoning text.
+func NewReasoningTelemetry(requestID, model string, duration time.Duration, tokens int) DomainEvent {
+	return newEvent(EventReasoningTelemetry, ReasoningTelemetryPayload{RequestID: requestID, Model: model, Duration: duration, Tokens: tokens})
 }

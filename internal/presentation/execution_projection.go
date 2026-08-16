@@ -263,10 +263,54 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 		p.details.Model = pl.Model
 		p.details.TokenInput = pl.TokenInput
 		p.details.TokenOutput = pl.TokenOutput
+		p.details.ProviderState = "done"
 		p.syncDetails()
 		if p.state.Phase == PhaseRunning {
 			p.state.Step = p.narrative.CurrentHuman()
 		}
+	case events.ProviderWaitingPayload:
+		if !p.matches(pl.RequestID) {
+			return
+		}
+		p.details.Model = pl.Model
+		p.details.ProviderState = "waiting"
+		p.syncDetails()
+		if p.state.Phase == PhaseRunning {
+			p.state.Step = p.narrative.CurrentHuman()
+		}
+	case events.ProviderFirstTokenPayload:
+		if !p.matches(pl.RequestID) {
+			return
+		}
+		p.details.Model = pl.Model
+		p.details.ProviderState = "streaming"
+		p.syncDetails()
+		if p.state.Phase == PhaseRunning {
+			p.state.Step = p.narrative.CurrentHuman()
+		}
+	case events.ProviderStreamDeltaPayload:
+		if !p.matches(pl.RequestID) {
+			return
+		}
+		p.details.ProviderState = "streaming"
+		p.syncDetails()
+	case events.ProviderUsageUpdatePayload:
+		if !p.matches(pl.RequestID) {
+			return
+		}
+		p.details.Model = pl.Model
+		p.details.TokenInput = pl.InputTokens
+		p.details.TokenOutput = pl.OutputTokens
+		p.details.ReasoningTokens = pl.ReasoningTokens
+		p.details.ProviderState = "streaming"
+		p.syncDetails()
+	case events.ReasoningTelemetryPayload:
+		if !p.matches(pl.RequestID) {
+			return
+		}
+		p.details.ReasoningTokens = pl.Tokens
+		p.details.ReasoningDuration = pl.Duration
+		p.syncDetails()
 	case events.ArtifactProducedPayload:
 		if !p.matches(pl.RequestID) {
 			return

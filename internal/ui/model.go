@@ -29,6 +29,7 @@ import (
 	domainworkflow "github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
+	runtimegraph "github.com/PizenLabs/izen/internal/execution/graph"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/hotfix"
@@ -1404,6 +1405,11 @@ type model struct {
 	// diff/apply/filesystem/verify facts derived only from real runtime
 	// evidence. Written and read on the UI goroutine only.
 	lastExecutionProof ExecutionProof
+	// lastRuntimeGraph is the runtime-owned execution graph evidence of the most
+	// recent RuntimeExecutor execution (RequestID, per-stage kind/state/evidence/
+	// timestamps). It is the authoritative execution timeline produced by the
+	// runtime; $inspect renders it. Written and read on the UI goroutine only.
+	lastRuntimeGraph []runtimegraph.StageSnapshot
 
 	// lastExecutionStrategy is the engine-first execution-strategy decision
 	// record of the most recent $prompt (Phase 10). It captures the strategy,
@@ -2018,20 +2024,57 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	case events.StrategySelectedPayload:
 		m.logRuntimeDetail("[runtime] strategy selected: %s", p.Strategy)
 	case events.TargetResolvedPayload:
+		// The authoritative stage is driven from the real runtime boundary: the
+		// resolved target the runtime actually touches. Never a fabricated label.
+		m.setStage("target", p.Target, stageRunning)
 		m.logRuntimeDetail("[runtime] target resolved: %s (exists=%t, %s)", p.Target, p.Exists, p.Source)
 	case events.ContextPreparedPayload:
+		m.setStage("context", "", stageRunning)
 		m.logRuntimeDetail("[runtime] context prepared: %d channel(s), ~%d tokens", len(p.Channels), p.Tokens)
 	case events.ModelInvokedPayload:
+		m.setStage("model", p.Model, stageWaiting)
 		m.logRuntimeDetail("[runtime] model invoked: %s", p.Model)
+	case events.ProviderWaitingPayload:
+		// provider.waiting: the round-trip is in flight before the first byte —
+		// the truthful provider state, never a fabricated "thinking" claim.
+		m.setStage("model", p.Model, stageWaiting)
+		m.logRuntimeDetail("[runtime] provider waiting: %s", p.Model)
+	case events.ProviderFirstTokenPayload:
+		// provider.first_token: real provider bytes are arriving.
+		m.setStage("model", p.Model, stageStreaming)
+		m.logRuntimeDetail("[runtime] provider first token: %s (%s)", p.Model, p.Latency.Round(time.Millisecond))
+	case events.ProviderStreamDeltaPayload:
+		// Evidence transport only: the provider is actively streaming. No
+		// per-delta activity line (noise); the state is kept truthful.
+		m.setStage("model", m.getActiveModelName(), stageStreaming)
+	case events.ProviderUsageUpdatePayload:
+		// Authoritative provider-reported usage during the live stream — only
+		// real counts reach the indicator, never a character-count estimate.
+		m.setStage("model", p.Model, stageStreaming)
+		m.setStageMetrics(0, 0, p.OutputTokens)
+		m.logRuntimeDetail("[runtime] provider usage: %d in / %d out", p.InputTokens, p.OutputTokens)
+	case events.ReasoningTelemetryPayload:
+		// Reasoning TELEMETRY only (duration + token count). Raw chain-of-
+		// thought never crosses this boundary.
+		m.logRuntimeDetail("[runtime] reasoning: %s (%d tok)", p.Duration.Round(time.Millisecond), p.Tokens)
 	case events.ProviderResponsePayload:
+		m.setStage("model", p.Model, stageDone)
 		m.logRuntimeDetail("[runtime] provider response: %s (%d tok in / %d tok out)", p.Model, p.TokenInput, p.TokenOutput)
 	case events.ArtifactProducedPayload:
+		m.setStage("patch", p.Target, stageRunning)
 		m.logRuntimeDetail("[runtime] artifact produced: %s (%s)", p.Kind, p.Target)
 	case events.MutationStartedPayload:
+		target := ""
+		if len(p.Targets) > 0 {
+			target = p.Targets[0]
+		}
+		m.setStage("apply", target, stageRunning)
 		m.logRuntimeDetail("[runtime] mutation started: %d target(s)", len(p.Targets))
 	case events.MutationCompletedPayload:
+		m.setStage("apply", p.Target, stageDone)
 		m.logRuntimeDetail("[runtime] mutation completed: %s (%s)", p.Target, p.Outcome)
 	case events.VerificationCompletedPayload:
+		m.setStage("validate", "", stageDone)
 		m.logRuntimeDetail("[runtime] verification %s: %d step(s)", verificationTick(p.Passed), len(p.Steps))
 	case events.ExecutionFinishedPayload:
 		m.logRuntimeDetail("[runtime] execution finished: success=%t (%s)", p.Success, p.Outcome)

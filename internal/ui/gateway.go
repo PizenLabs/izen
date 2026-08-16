@@ -68,33 +68,27 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	// Mode is a presentation label only — never an execution-path decision.
 	req.Mode = m.resolver.Current().String()
 
-	// ── LOADING DOCK: SPINNER + TIPS, EVENT-DERIVED TEXT ──────────────
-	// The generic Enter path seeded a "Working..." shimmer at t=0ms; the gated
-	// path overrides it with an EMPTY shimmer text so the loading dock (the
-	// animated spinner + contextual tip) stays alive — the execution is never a
-	// frozen pane — while its text derives EXCLUSIVELY from the execution-view
-	// projection (real runtime events). No static progress template is ever
-	// claimed. The in-flight marker is cleared by the terminal execution events
-	// and by any terminal cleanup.
-	m.startShimmer("", "execution")
-	m.executionResolving = true
-	m.agentRunning = true
-	m.agentLabel = ""
-
 	// ── CONVERSATION FLOW (UX_ENGINE #4) ─────────────────────────────
 	// A direct-response request (casual greeting / simple question) is a single
 	// human action: Izen → understands intent → answers. It must NOT create an
 	// execution narrative, a workspace-context pipeline, or planning states.
 	// The runtime still resolves and executes it (zero repository context), but
 	// the human surface is the answer only — no narrative panel, no milestones,
-	// no execution timeline (the loading dock keeps only its spinner + tips).
-	// The visibility layer is also reset so no runtime detail lines from a
-	// prior debug view can leak into a conversational exchange.
+	// no execution timeline, and no loading spinner. The in-flight marker stays
+	// set so terminal cleanup releases input and a second submission is blocked
+	// while the direct answer is produced; the provider call stays cancellable
+	// (Ctrl+C) via the registered background cancel.
 	if det.Profile.Strategy == strategy.DirectResponse {
 		m.execView = nil
 		m.execVisibility = presentation.VisibilityNormal
+		m.executionResolving = true
+		m.agentRunning = true
+		m.agentLabel = ""
+		dirCtx, dirCancel := context.WithCancel(context.Background())
+		m.streamCancel = dirCancel
+		m.registerBackgroundCancel(dirCancel)
 		return func() tea.Msg {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			ctx, cancel := context.WithTimeout(dirCtx, 5*time.Minute)
 			defer cancel()
 			res, err := m.executor.Execute(ctx, req)
 			if res == nil {
@@ -103,6 +97,25 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 			return gatedExecutionMsg{res: res, det: det, err: err}
 		}
 	}
+
+	// ── OPERATION LIFECYCLE BINDING (P0 #1) ───────────────────────────
+	// The gated execution runs as a real foreground operation: it owns a
+	// cancellable context the provider call inherits, a watchdog, per-operation
+	// telemetry and the busy flags. Ctrl+C now cancels the active execution
+	// immediately (operationContext → provider stream) instead of leaving a
+	// detached background call running silently.
+	m.beginOperation(OpHotfix)
+	// beginOperation supersedes the gated resolving marker; restore it so the
+	// execution-view projection keeps driving the loading dock and the terminal
+	// events finalize THIS operation (no newer operation exists to clobber).
+	m.executionResolving = true
+	m.agentLabel = ""
+
+	// ── LOADING DOCK: SPINNER + TIPS, EVENT-DERIVED TEXT ──────────────
+	// The dock stays alive (spinner + tips) while its text derives EXCLUSIVELY
+	// from the execution-view projection (real runtime events) and the
+	// authoritative stage — no static progress template is ever claimed.
+	m.startShimmer("", "execution")
 
 	// The single execution-view projection resets at dispatch. From here on
 	// the renderer derives the execution status ONLY from this projection's
@@ -113,10 +126,15 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	// A fresh execution starts in the NORMAL human layer.
 	m.execVisibility = presentation.VisibilityNormal
 
+	// The provider call context is derived from the ACTIVE OPERATION context
+	// synchronously (no goroutine race on m.activeOp) and registered so
+	// Ctrl+C / stale-agent release propagate cancellation into the runtime
+	// provider call immediately.
+	execCtx, execCancel := context.WithTimeout(m.operationContext(), 5*time.Minute)
+	m.streamCancel = execCancel
+	m.registerBackgroundCancel(execCancel)
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		res, err := m.executor.Execute(ctx, req)
+		res, err := m.executor.Execute(execCtx, req)
 		if res == nil {
 			res = &execution.ExecutionResult{RequestID: req.RequestID}
 		}
@@ -211,9 +229,21 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		if execErr == nil {
 			execErr = msg.res.Err
 		}
-		m.finalizeOperation(OpOutcomeFailure, execErr)
-		m.push(roleError, "Execution failed: "+execErr.Error())
-		m.push(roleSystem, infoStyle.Render("No files were modified."))
+		// Classify the terminal outcome truthfully: a cancellation or timeout is
+		// distinct from a hard failure (the watchdog and the execView both
+		// report it as such, never as a fabricated failure).
+		outcome := classifyOpErr(execErr)
+		if msg.res != nil {
+			m.recordRuntimeProof(msg.res)
+		}
+		m.finalizeOperation(outcome, execErr)
+		switch outcome {
+		case OpOutcomeCancelled:
+			m.push(roleSystem, infoStyle.Render("Cancelled. No files were modified."))
+		default:
+			m.push(roleError, "Execution failed: "+execErr.Error())
+			m.push(roleSystem, infoStyle.Render("No files were modified."))
+		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m, m.flushPendingRecords()
@@ -222,6 +252,11 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 	if res == nil {
 		return m, nil
 	}
+
+	// ── RUNTIME EXECUTION EVIDENCE RETENTION (P1 #6) ───────────────
+	// The runtime-owned proof + runtime graph are retained for $inspect — the
+	// authoritative execution timeline is never reconstructed from UI state.
+	m.recordRuntimeProof(res)
 
 	// ── Terminal token accounting from the runtime's authoritative usage ──
 	// The runtime computed the aggregate provider-reported usage (provider,
@@ -271,7 +306,7 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		m.pendingProposals = nil
 		m.resolveApprovalState()
 		m.finalizeOperation(OpOutcomeCancelled, nil)
-		m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Mutation rejected. No files were modified."))
+		m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Cancelled. No files were modified."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m, m.tokenUsageCmd(tokenInput, tokenOutput)

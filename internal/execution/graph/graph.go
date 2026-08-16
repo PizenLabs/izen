@@ -331,6 +331,41 @@ func (g *Graph) CompleteModel(model string, tokenInput, tokenOutput int) {
 	g.emitEvent(events.NewProviderResponse(g.RequestID, model, tokenInput, tokenOutput))
 }
 
+// BeginWaiting emits provider.waiting — the provider round-trip is in flight
+// and no byte has arrived yet. It is emitted right before the streaming
+// invocation begins so the model stage truthfully reads "waiting", never a
+// fabricated thinking/processing claim.
+func (g *Graph) BeginWaiting(model string) {
+	g.emitEvent(events.NewProviderWaiting(g.RequestID, model))
+}
+
+// FirstToken emits provider.first_token when the first provider byte arrives.
+// Latency is measured from invocation begin (BeginModel/BeginWaiting) to the
+// first byte — the truthful first-token latency of the model stage.
+func (g *Graph) FirstToken(model string, latency time.Duration) {
+	g.emitEvent(events.NewProviderFirstToken(g.RequestID, model, latency))
+}
+
+// StreamDelta emits one content delta of the live provider stream. It is pure
+// evidence transport: the authoritative content always travels on the
+// ExecutionResult, so a dropped delta never loses execution truth.
+func (g *Graph) StreamDelta(delta string) {
+	g.emitEvent(events.NewProviderStreamDelta(g.RequestID, delta))
+}
+
+// UpdateUsage emits the cumulative provider-reported usage of the live stream
+// (authoritative counts only — never a local estimate).
+func (g *Graph) UpdateUsage(model string, inputTokens, outputTokens, reasoningTokens int) {
+	g.emitEvent(events.NewProviderUsageUpdate(g.RequestID, model, inputTokens, outputTokens, reasoningTokens))
+}
+
+// ReasoningTelemetry emits reasoning TELEMETRY only: the wall-clock reasoning
+// duration and the provider-reported reasoning token count when available.
+// Raw chain-of-thought text never travels on the event stream.
+func (g *Graph) ReasoningTelemetry(model string, duration time.Duration, tokens int) {
+	g.emitEvent(events.NewReasoningTelemetry(g.RequestID, model, duration, tokens))
+}
+
 // CompleteArtifact closes the artifact-validation stage and emits
 // artifact.produced. It can never precede CompleteModel for the same execution.
 func (g *Graph) CompleteArtifact(kind, target string) {

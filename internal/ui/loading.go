@@ -330,11 +330,19 @@ func renderExecutionDetails(d presentation.ExecutionDetails) string {
 		b.WriteString("\n")
 	}
 	if d.Model != "" {
-		b.WriteString("  " + dimmedStyle.Render("model:") + " " + textStyle.Render(d.Model) + "\n")
+		b.WriteString("  " + dimmedStyle.Render("model:") + " " + textStyle.Render(d.Model))
+		if d.ProviderState != "" {
+			b.WriteString(" " + mutedStyle.Render("("+d.ProviderState+")"))
+		}
+		b.WriteString("\n")
 	}
 	if d.TokenInput > 0 || d.TokenOutput > 0 {
 		b.WriteString("  " + dimmedStyle.Render("tokens:") + " " + mutedStyle.Render(
 			fmt.Sprintf("%d in / %d out", d.TokenInput, d.TokenOutput)) + "\n")
+	}
+	if d.ReasoningDuration > 0 || d.ReasoningTokens > 0 {
+		b.WriteString("  " + dimmedStyle.Render("reasoning:") + " " + mutedStyle.Render(
+			fmt.Sprintf("%s (%d tok)", d.ReasoningDuration.Round(time.Millisecond), d.ReasoningTokens)) + "\n")
 	}
 	if dur := d.Duration(); dur > 0 {
 		b.WriteString("  " + dimmedStyle.Render("duration:") + " " + mutedStyle.Render(dur.Round(time.Millisecond).String()) + "\n")

@@ -334,6 +334,12 @@ func renderStageStatus(st stageView) string {
 	case stageBlocked:
 		return fmt.Sprintf("Model ● blocked · %s", formatDurationElapsed(time.Since(st.LastTs)))
 	case stageRunning:
+		// A running stage with no real label/target carries no truthful claim
+		// (e.g. a freshly begun operation before any execution boundary) —
+		// render nothing rather than a fabricated "Working".
+		if label == "Working" && target == "" {
+			return ""
+		}
 		if target != "" {
 			return fmt.Sprintf("%s ● %s", label, target)
 		}

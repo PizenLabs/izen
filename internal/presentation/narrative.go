@@ -15,6 +15,7 @@ package presentation
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/events"
 )
@@ -43,8 +44,18 @@ func transitionForEvent(ev events.DomainEvent) string {
 		return "target.resolved"
 	case events.EventContextPrepared:
 		return "context.prepared"
-	case events.EventModelInvoked, events.EventProviderResponse:
+	case events.EventModelInvoked:
 		return "provider.invoked"
+	case events.EventProviderResponse:
+		return "provider.completed"
+	case events.EventProviderWaiting:
+		return "provider.waiting"
+	case events.EventProviderFirstToken:
+		return "provider.first_token"
+	case events.EventProviderUsageUpdate:
+		return "provider.usage_update"
+	case events.EventReasoningTelemetry:
+		return "reasoning.telemetry"
 	case events.EventArtifactProduced:
 		return "artifact.produced"
 	case events.EventApprovalRequired:
@@ -79,6 +90,8 @@ var transitionNarrative = map[string]string{
 	"target.resolved":        "Reading target",
 	"context.prepared":       "Gathering context",
 	"provider.invoked":       "Analyzing",
+	"provider.waiting":       "Waiting for model",
+	"provider.first_token":   "Model responding",
 	"artifact.produced":      "Preparing result",
 	"approval.required":      "Waiting for approval",
 	"mutation.started":       "Applying changes",
@@ -258,6 +271,16 @@ func requestIDOf(payload interface{}) string {
 		return p.RequestID
 	case events.ProviderResponsePayload:
 		return p.RequestID
+	case events.ProviderWaitingPayload:
+		return p.RequestID
+	case events.ProviderFirstTokenPayload:
+		return p.RequestID
+	case events.ProviderStreamDeltaPayload:
+		return p.RequestID
+	case events.ProviderUsageUpdatePayload:
+		return p.RequestID
+	case events.ReasoningTelemetryPayload:
+		return p.RequestID
 	case events.ArtifactProducedPayload:
 		return p.RequestID
 	case events.ApprovalRequiredPayload:
@@ -313,6 +336,14 @@ func machineRecord(ev events.DomainEvent) string {
 		return fmt.Sprintf("%s: %s", ev.Type(), p.Model)
 	case events.ProviderResponsePayload:
 		return fmt.Sprintf("%s: %s (%d in / %d out)", ev.Type(), p.Model, p.TokenInput, p.TokenOutput)
+	case events.ProviderWaitingPayload:
+		return fmt.Sprintf("%s: %s", ev.Type(), p.Model)
+	case events.ProviderFirstTokenPayload:
+		return fmt.Sprintf("%s: %s (first token after %s)", ev.Type(), p.Model, p.Latency.Round(time.Millisecond))
+	case events.ProviderUsageUpdatePayload:
+		return fmt.Sprintf("%s: %s (%d in / %d out, %d reasoning)", ev.Type(), p.Model, p.InputTokens, p.OutputTokens, p.ReasoningTokens)
+	case events.ReasoningTelemetryPayload:
+		return fmt.Sprintf("%s: %s for %s (%d tokens)", ev.Type(), p.Model, p.Duration.Round(time.Millisecond), p.Tokens)
 	case events.ArtifactProducedPayload:
 		return fmt.Sprintf("%s: %s", ev.Type(), p.Kind)
 	case events.ExecutionFinishedPayload:

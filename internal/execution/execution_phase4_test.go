@@ -57,6 +57,13 @@ func (c *phase4Collector) types() []string {
 	return append([]string{}, c.kinds...)
 }
 
+// eventsSnapshot returns a locked copy of the collected events.
+func (c *phase4Collector) eventsSnapshot() []events.DomainEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]events.DomainEvent{}, c.events...)
+}
+
 func (c *phase4Collector) count(typ string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,10 +16,12 @@ import (
 	"github.com/PizenLabs/izen/internal/changeset"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/core/authorization"
+	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/events"
 	runtimegraph "github.com/PizenLabs/izen/internal/execution/graph"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/language"
+	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
 // ── RuntimeExecutor (Steps 1-3 of the authority migration) ─────────────────
@@ -494,6 +497,16 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	if profile.Strategy != strategy.TargetedMutation {
 		content, inv, err := x.invokeReadOnly(ctx, req, requestID, profile, targets, g)
 		if err != nil {
+			// A user cancellation is a clean terminal outcome, never a
+			// failure: the workspace is untouched and no rollback runs.
+			if errors.Is(err, context.Canceled) {
+				g.CancelExecution(string(OutcomeCancelled))
+				res.Err = nil
+				res.Proof.Outcome = OutcomeCancelled
+				res.Proof.FinishedAt = time.Now()
+				setProofGraph(res, g)
+				return x.finalizeResult(res), nil
+			}
 			g.FailExecution(events.FailureRecoverable, err, "executor.model")
 			res.Err = err
 			res.Proof.Outcome = OutcomeFailed
@@ -519,6 +532,17 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// ── 7. Targeted mutation: per-target model invocation ──────────────
 	patches, invs, diffs, err := x.invokeMutation(ctx, req, requestID, targets, g)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			// A user cancellation is a clean terminal outcome: no artifact was
+			// produced, nothing was applied, and no rollback runs.
+			g.CancelExecution(string(OutcomeCancelled))
+			res.ArtifactKind = ""
+			res.Err = nil
+			res.Proof.Outcome = OutcomeCancelled
+			res.Proof.FinishedAt = time.Now()
+			setProofGraph(res, g)
+			return x.finalizeResult(res), nil
+		}
 		g.FailExecution(events.FailureRecoverable, err, "executor.model")
 		res.ArtifactKind = ""
 		res.Err = err
@@ -807,6 +831,9 @@ func (x *RuntimeExecutor) compileContext(profile strategy.ExecutionStrategyProfi
 		if err != nil {
 			continue
 		}
+		// Runtime context activity evidence: the target content actually read
+		// by the runtime crosses only when it really happens.
+		x.emitContextActivity(t, len(data))
 		if len(data) > maxExecutorContextBytes {
 			data = data[:maxExecutorContextBytes]
 		}
@@ -846,6 +873,9 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			return nil, nil, nil, fmt.Errorf("executor: read target %s: %w", target, readErr)
 		}
 		original := string(data)
+		// Runtime context activity evidence: the target content actually read
+		// by the runtime crosses only when it really happens.
+		x.emitContextActivity(target, len(data))
 
 		system := boundedMutationSystemPrompt()
 		user := buildMutationUserPrompt(req.Prompt, target, original)
@@ -858,27 +888,20 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// model.invoked is emitted when the invocation BEGINS — before the
 		// provider call — so the event stream truthfully records the start.
 		g.BeginModel(model)
-		resp, callErr := x.provider.Execute(ctx, aiReq)
+		raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g)
 		if callErr != nil {
 			return nil, nil, nil, fmt.Errorf("executor: model invocation: %w", callErr)
 		}
-		if resp == nil {
-			return nil, nil, nil, fmt.Errorf("executor: model returned an empty response")
-		}
 		inv := ModelInvocation{Model: model}
-		if resp.Usage.Known {
-			inv.TokenInput = resp.Usage.PromptTokens
-			inv.TokenOutput = resp.Usage.CompletionTokens
-		} else {
-			inv.TokenInput = resp.TokenInput
-			inv.TokenOutput = resp.TokenOutput
+		if usage.Known {
+			inv.TokenInput = usage.PromptTokens
+			inv.TokenOutput = usage.CompletionTokens
 		}
 		// provider.response is emitted ONLY on a successful response — the
 		// authoritative usage travels here. No artifact may precede it.
 		g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
 		invs = append(invs, inv)
 
-		raw := strings.TrimSpace(resp.Content)
 		modified := ResolveModifiedContent(original, raw)
 		if modified == "" {
 			// The model returned only prose or a fence without content — treat
@@ -932,6 +955,9 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		if readErr != nil {
 			continue
 		}
+		// Runtime context activity evidence: the file content the runtime
+		// actually read crosses only when it really happens.
+		x.emitContextActivity(t, len(data))
 		if len(data) > maxExecutorContextBytes {
 			data = data[:maxExecutorContextBytes]
 		}
@@ -958,25 +984,205 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	// model.invoked is emitted when the invocation BEGINS — before the provider
 	// call — so the event stream truthfully records the invocation start.
 	g.BeginModel(model)
-	resp, callErr := x.provider.Execute(ctx, aiReq)
+	raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g)
 	if callErr != nil {
 		return "", inv, fmt.Errorf("executor: read-only invocation: %w", callErr)
 	}
-	if resp == nil {
-		return "", inv, fmt.Errorf("executor: model returned an empty response")
-	}
 	inv.Model = model
-	if resp.Usage.Known {
-		inv.TokenInput = resp.Usage.PromptTokens
-		inv.TokenOutput = resp.Usage.CompletionTokens
-	} else {
-		inv.TokenInput = resp.TokenInput
-		inv.TokenOutput = resp.TokenOutput
+	if usage.Known {
+		inv.TokenInput = usage.PromptTokens
+		inv.TokenOutput = usage.CompletionTokens
 	}
 	// provider.response is emitted ONLY on a successful response — the
 	// authoritative usage travels here. No artifact may precede it.
 	g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
-	return strings.TrimSpace(resp.Content), inv, nil
+	return raw, inv, nil
+}
+
+// invokeStream executes one bounded provider invocation through a live
+// streaming connection, emitting the canonical provider lifecycle events
+// (provider.waiting → provider.first_token → provider.stream_delta →
+// provider.usage_update) as REAL evidence while the call runs. It is the
+// evidence transport of the model stage: the UI never infers provider state.
+//
+// Reasoning is never surfaced as text: the stream classifier and the request's
+// ReasoningHandler only drive reasoning TELEMETRY (duration + the
+// provider-reported reasoning token count when available) emitted as a single
+// reasoning.telemetry event on completion. The accumulated visible content and
+// the authoritative provider usage are returned; the authoritative artifact
+// always travels on the ExecutionResult afterwards.
+func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph) (string, ai.ProviderUsage, error) {
+	var reasoningStartedAt time.Time
+	var reasoningDuration time.Duration
+	var reasoningSeen bool
+
+	reasoningOpen := func() {
+		reasoningSeen = true
+		if reasoningStartedAt.IsZero() {
+			reasoningStartedAt = time.Now()
+		}
+	}
+	reasoningClose := func() {
+		if !reasoningStartedAt.IsZero() {
+			reasoningDuration += time.Since(reasoningStartedAt)
+			reasoningStartedAt = time.Time{}
+		}
+	}
+
+	// Reasoning chunks are consumed for telemetry ONLY — the verbatim text is
+	// never published to the bus or exposed to the presentation layer.
+	req.Stream = true
+	req.ReasoningHandler = func(_ string) error {
+		reasoningOpen()
+		return nil
+	}
+
+	// provider.waiting: the round-trip is in flight before the first byte.
+	g.BeginWaiting(model)
+	began := time.Now()
+	rawStream, err := x.provider.ExecuteStream(ctx, req)
+	if err != nil || rawStream == nil {
+		// Streaming is not available (the provider failed to start a stream
+		// before any byte, or lacks one entirely): revert to the non-streaming
+		// Execute. The invocation stays observable via model.invoked →
+		// provider.response and never double-bills — the failed stream
+		// consumed nothing. `where possible` is honoured: providers that
+		// stream get the full lifecycle, others stay correct.
+		resp, cerr := x.provider.Execute(ctx, req)
+		if cerr != nil {
+			return "", ai.ProviderUsage{}, cerr
+		}
+		if resp == nil {
+			return "", ai.ProviderUsage{}, fmt.Errorf("executor: provider returned an empty response")
+		}
+		usage := resp.Usage
+		if !usage.Known && (resp.TokenInput > 0 || resp.TokenOutput > 0) {
+			// Legacy usage transport: some adapters/mocks report usage on the
+			// response fields rather than the ProviderUsage record.
+			usage = ai.ProviderUsage{
+				PromptTokens:     resp.TokenInput,
+				CompletionTokens: resp.TokenOutput,
+				Known:            true,
+			}
+		}
+		return ai.VisibleCompletion(resp.Content), usage, nil
+	}
+	defer func() { _ = rawStream.Close() }()
+
+	// Authoritative live usage: only provider-reported counts (Known &&
+	// !Estimated) are ever emitted as provider.usage_update.
+	var usageUp ai.UsageProvider
+	if up, ok := rawStream.(ai.UsageProvider); ok {
+		usageUp = up
+	}
+	var lastUsage ai.ProviderUsage
+	emitUsage := func() {
+		if usageUp == nil {
+			return
+		}
+		u := usageUp.Usage()
+		if !u.Known || u.Estimated {
+			return
+		}
+		if u.PromptTokens == lastUsage.PromptTokens && u.CompletionTokens == lastUsage.CompletionTokens &&
+			u.ReasoningTokens == lastUsage.ReasoningTokens {
+			return
+		}
+		lastUsage = u
+		g.UpdateUsage(model, u.PromptTokens, u.CompletionTokens, u.ReasoningTokens)
+	}
+
+	var content strings.Builder
+	// reasoningBuf is the reasoning fallback ONLY for models that emit their
+	// whole answer inside reasoning_content. It is never published.
+	var reasoningBuf strings.Builder
+	firstToken := false
+	runeBuf := stream.NewRuneBuffer()
+	classifier := stream.NewClassifier()
+
+	emitFrame := func(tok stream.Token) {
+		if tok.Text == "" {
+			return
+		}
+		if !firstToken {
+			firstToken = true
+			g.FirstToken(model, time.Since(began))
+		}
+		if tok.Kind == stream.TokenKindThinking {
+			reasoningOpen()
+			reasoningBuf.WriteString(tok.Text)
+			return
+		}
+		reasoningClose()
+		content.WriteString(tok.Text)
+		// stream_delta is evidence transport: a dropped delta never loses
+		// execution truth because the content accumulates here regardless.
+		g.StreamDelta(tok.Text)
+	}
+
+	flushStream := func() {
+		if rem := runeBuf.Flush(); rem != "" {
+			classifier.Write(rem, emitFrame)
+		}
+		classifier.Flush(emitFrame)
+	}
+
+	buf := make([]byte, 4096)
+	for {
+		if cerr := ctx.Err(); cerr != nil {
+			reasoningClose()
+			return content.String(), lastUsage, cerr
+		}
+		n, rerr := rawStream.Read(buf)
+		if n > 0 {
+			if text := runeBuf.Write(buf[:n]); text != "" {
+				classifier.Write(text, emitFrame)
+			}
+			emitUsage()
+		}
+		if rerr == io.EOF {
+			flushStream()
+			reasoningClose()
+			break
+		}
+		if rerr != nil {
+			flushStream()
+			reasoningClose()
+			if cerr := ctx.Err(); cerr != nil {
+				return content.String(), lastUsage, cerr
+			}
+			return content.String(), lastUsage, rerr
+		}
+	}
+
+	usage := lastUsage
+	if usageUp != nil {
+		if u := usageUp.Usage(); u.Known {
+			usage = u
+		}
+	}
+	// Reasoning telemetry: duration + provider-reported token count only.
+	if reasoningSeen && (reasoningDuration > 0 || usage.ReasoningTokens > 0) {
+		g.ReasoningTelemetry(model, reasoningDuration, usage.ReasoningTokens)
+	}
+	visible := ai.VisibleCompletion(content.String())
+	if strings.TrimSpace(visible) == "" && reasoningBuf.Len() > 0 {
+		visible = ai.VisibleCompletion(reasoningBuf.String())
+	}
+	return visible, usage, nil
+}
+
+// emitContextActivity surfaces a real runtime file read as engine evidence
+// through the existing activity/event loggers (wired by the UI at startup).
+// It fires ONLY when the runtime actually reads the file, and is a no-op when
+// no logger is attached (headless/harness).
+func (x *RuntimeExecutor) emitContextActivity(target string, bytes int) {
+	if globalActivityLog != nil {
+		globalActivityLog("[runtime] reading %s (%d bytes)", target, bytes)
+	}
+	if globalEventLog != nil {
+		globalEventLog(retrieval.FileReadEvent{File: target, Bytes: int64(bytes)})
+	}
 }
 
 // readOnlySystemPrompt selects the bounded system prompt for a read-only

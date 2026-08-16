@@ -373,6 +373,55 @@ func (m *model) recordMultiHotfixProposalProof(msg multiHotfixProposalMsg) {
 	m.lastExecutionProof = p
 }
 
+// recordRuntimeProof retains the runtime-owned execution evidence of a gated
+// RuntimeExecutor execution for $inspect: the authoritative ExecutionProof
+// (strategy, targets, invocations, usage, apply/verify evidence) and the full
+// runtime graph timeline (per-stage kind/state/evidence/timestamps). It is a
+// pure retention of runtime truth — nothing is reconstructed from UI state.
+func (m *model) recordRuntimeProof(res *execution.ExecutionResult) {
+	if res == nil {
+		return
+	}
+	pr := res.Proof
+	if pr == nil {
+		m.lastRuntimeGraph = nil
+		return
+	}
+	m.lastRuntimeGraph = pr.RuntimeGraph
+
+	applied := false
+	failureNode := ""
+	for _, mut := range pr.Mutations {
+		if mut.Outcome == execution.OutcomeChanged || mut.Outcome == execution.OutcomeCreated {
+			applied = true
+		}
+		if mut.Outcome == execution.OutcomeApplyFailed {
+			failureNode = mut.File
+		}
+	}
+	target := ""
+	if len(pr.Targets) > 0 {
+		target = pr.Targets[0]
+	}
+	m.lastExecutionProof = ExecutionProof{
+		OperationID:         pr.RequestID,
+		Target:              target,
+		Targets:             append([]string(nil), pr.Targets...),
+		ProviderInvocations: len(pr.ModelInvocations),
+		InputUsage:          res.Completed.InputTokens,
+		OutputUsage:         res.Completed.OutputTokens,
+		Strategy:            pr.Strategy,
+		ArtifactPresent:     res.ArtifactKind != "",
+		DiffPresent:         res.Diff != "",
+		ApplyExecuted:       applied,
+		FilesystemChanged:   applied,
+		VerificationPassed:  pr.Verification.Passed,
+		MutationSetState:    string(pr.Outcome),
+		RolledBack:          pr.Outcome == execution.OutcomeApplyFailed,
+		FailureNode:         failureNode,
+	}
+}
+
 // completeMultiHotfixProof merges the apply-phase facts into the retained
 // proof at the multi-file hotfix apply terminal. The aggregate outcome is the
 // MutationSet terminal state: committed only when every node applied and

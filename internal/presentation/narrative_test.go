@@ -2,6 +2,7 @@ package presentation
 
 import (
 	"testing"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/events"
 )
@@ -53,6 +54,32 @@ func TestNarrativeTransitionDerivation(t *testing.T) {
 			name: "provider.invoked",
 			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewModelInvoked("r", "mock", 0, 0)},
 			want: "Analyzing",
+		},
+		{
+			name: "provider.waiting",
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewProviderWaiting("r", "mock")},
+			want: "Waiting for model",
+		},
+		{
+			name: "provider.first_token",
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewProviderFirstToken("r", "mock", time.Second)},
+			want: "Model responding",
+		},
+		{
+			name: "provider.response is machine-only (never re-adds Analyzing)",
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewModelInvoked("r", "mock", 0, 0), events.NewProviderResponse("r", "mock", 5, 7)},
+			want: "Analyzing",
+		},
+		{
+			name: "model lifecycle dedups to one Analyzing",
+			evs: []events.DomainEvent{
+				events.NewExecutionStarted("r", "build", "x"),
+				events.NewModelInvoked("r", "mock", 0, 0),
+				events.NewProviderWaiting("r", "mock"),
+				events.NewProviderFirstToken("r", "mock", time.Second),
+				events.NewProviderResponse("r", "mock", 5, 7),
+			},
+			want: "Model responding",
 		},
 		{
 			name: "artifact.produced",
