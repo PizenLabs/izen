@@ -15,6 +15,8 @@
 package presentation
 
 import (
+	"time"
+
 	"github.com/PizenLabs/izen/internal/events"
 )
 
@@ -76,6 +78,10 @@ type ExecutionViewState struct {
 	Outcome string
 	// RequestID is the execution this state projects.
 	RequestID string
+	// Details is the accumulated runtime metadata (strategy, context policy,
+	// model, token usage, duration, artifacts). It is populated by the reducer
+	// from the observed payloads and is never authored by the renderer.
+	Details ExecutionDetails
 }
 
 // NewIdle returns the resting execution view state.
@@ -104,6 +110,10 @@ func (s ExecutionViewState) Valid() bool {
 // single-execution projection: a new execution.started resets it.
 type ExecutionProjection struct {
 	state ExecutionViewState
+	// details is the accumulated runtime metadata of the current execution. It
+	// survives the terminal state reassignment (which rebuilds ExecutionViewState
+	// wholesale) so the EXPANDED layer keeps its metadata at completion.
+	details ExecutionDetails
 	// narrative is the deterministic human/machine narrative layer. The UI
 	// reads it; it never authors narration text.
 	narrative *ExecutionNarrative
@@ -178,8 +188,10 @@ func (p *ExecutionProjection) Begin(requestID string) {
 		state:     ExecutionViewState{Phase: PhaseRunning, Step: "Understanding request", RequestID: requestID},
 		narrative: NewExecutionNarrative(),
 	}
-	p.narrative.lines = append(p.narrative.lines, narrativeLine{machine: "execution.started", human: "Understanding request"})
+	p.narrative.lines = append(p.narrative.lines, narrativeLine{transition: "execution.started", machine: "execution.started", human: "Understanding request"})
 	p.narrative.current = 0
+	p.details.StartedAt = time.Now()
+	p.syncDetails()
 }
 
 // Project consumes one canonical runtime lifecycle event and advances the
@@ -208,10 +220,14 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 			state:     ExecutionViewState{Phase: PhaseRunning, Step: "Understanding request", RequestID: pl.RequestID},
 			narrative: p.narrative,
 		}
+		p.details.StartedAt = ev.Timestamp()
+		p.syncDetails()
 	case events.StrategySelectedPayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
+		p.details.Strategy = pl.Strategy
+		p.syncDetails()
 		if p.state.Phase == PhaseRunning {
 			p.state.Step = p.narrative.CurrentHuman()
 		}
@@ -226,21 +242,42 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 		if !p.matches(pl.RequestID) {
 			return
 		}
+		p.details.ContextChannels = append([]string(nil), pl.Channels...)
+		p.details.ContextTokens = pl.Tokens
+		p.syncDetails()
+		if p.state.Phase == PhaseRunning {
+			p.state.Step = p.narrative.CurrentHuman()
+		}
 	case events.ModelInvokedPayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
+		p.details.Model = pl.Model
+		p.syncDetails()
 		if p.state.Phase == PhaseRunning {
-			p.state.Step = "Thinking..."
+			p.state.Step = p.narrative.CurrentHuman()
 		}
 	case events.ProviderResponsePayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
+		p.details.Model = pl.Model
+		p.details.TokenInput = pl.TokenInput
+		p.details.TokenOutput = pl.TokenOutput
+		p.syncDetails()
+		if p.state.Phase == PhaseRunning {
+			p.state.Step = p.narrative.CurrentHuman()
+		}
 	case events.ArtifactProducedPayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
+		p.details.Artifacts = append(p.details.Artifacts, ArtifactView{
+			Type:   ClassifyArtifact(pl.Kind),
+			Kind:   pl.Kind,
+			Target: pl.Target,
+		})
+		p.syncDetails()
 		if p.state.Phase == PhaseRunning {
 			p.state.Step = p.narrative.CurrentHuman()
 		}
@@ -276,19 +313,20 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 		if !p.matches(pl.RequestID) {
 			return
 		}
+		p.details.FinishedAt = ev.Timestamp()
 		switch {
 		case pl.Success:
 			p.state = ExecutionViewState{
-				Phase: PhaseCompleted, Outcome: pl.Outcome, RequestID: pl.RequestID,
+				Phase: PhaseCompleted, Outcome: pl.Outcome, RequestID: pl.RequestID, Details: p.details,
 			}
 		case pl.Outcome == "cancelled":
 			// A clean cancellation is a terminal, non-failure outcome.
 			p.state = ExecutionViewState{
-				Phase: PhaseCompleted, Outcome: "cancelled", RequestID: pl.RequestID,
+				Phase: PhaseCompleted, Outcome: "cancelled", RequestID: pl.RequestID, Details: p.details,
 			}
 		default:
 			p.state = ExecutionViewState{
-				Phase: PhaseFailed, Outcome: pl.Outcome, RequestID: pl.RequestID,
+				Phase: PhaseFailed, Outcome: pl.Outcome, RequestID: pl.RequestID, Details: p.details,
 			}
 		}
 	case events.ExecutionFailedPayload:
@@ -297,10 +335,19 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 		// phase, but a failed event must never leave the state Running.
 		if p.state.Phase == PhaseRunning || p.state.Phase == PhaseWaitingApproval {
 			p.state = ExecutionViewState{
-				Phase: PhaseFailed, Outcome: pl.Stage, RequestID: p.state.RequestID,
+				Phase: PhaseFailed, Outcome: pl.Stage, RequestID: p.state.RequestID, Details: p.details,
 			}
 		}
 	}
+}
+
+// syncDetails mirrors the accumulated metadata onto the live view state so the
+// EXPANDED layer always reflects the observed payloads.
+func (p *ExecutionProjection) syncDetails() {
+	if p == nil {
+		return
+	}
+	p.state.Details = p.details
 }
 
 // matches reports whether the event belongs to the projected execution. An idle
@@ -310,4 +357,37 @@ func (p *ExecutionProjection) matches(requestID string) bool {
 		return true
 	}
 	return p.state.RequestID == requestID
+}
+
+// Frame computes the renderer-ready presentation slice for the given
+// visibility layer. It is a pure function of the projection state + narrative —
+// the presentation layer decides what belongs in each layer, the renderer only
+// formats the frame.
+//
+// NORMAL: human narrative milestones + the live current step. No providers,
+// strategies, tokens, or event names.
+// EXPANDED: NORMAL + accumulated runtime metadata (strategy, context policy,
+// model, token usage, duration, artifacts).
+// DEBUG: EXPANDED metadata + the full machine event stream.
+func (p *ExecutionProjection) Frame(v Visibility) ExecutionFrame {
+	if p == nil {
+		return ExecutionFrame{Visibility: v}
+	}
+	frame := ExecutionFrame{Visibility: v, State: p.State()}
+	frame.Steps = p.narrative.Steps()
+	// Mark the live step only while the execution is actually in flight (running
+	// or awaiting approval). A terminal phase has no live step — the renderer
+	// never shows a spinner/current marker after completion.
+	if st := frame.State; st.Phase == PhaseRunning || st.Phase == PhaseWaitingApproval {
+		if len(frame.Steps) > 0 {
+			frame.Steps[len(frame.Steps)-1].Current = true
+		}
+	}
+	if v == VisibilityExpanded || v == VisibilityDebug {
+		frame.Details = p.State().Details
+	}
+	if v == VisibilityDebug {
+		frame.Events = p.narrative.Machine()
+	}
+	return frame
 }

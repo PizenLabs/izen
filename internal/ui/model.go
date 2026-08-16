@@ -896,6 +896,12 @@ type model struct {
 	// handleDomainEvent. Nil until the first gated execution.
 	execView *presentation.ExecutionProjection
 
+	// execVisibility is the active human presentation layer of the gated
+	// execution. It is NORMAL by default (human narrative only); Ctrl+O cycles
+	// Normal → Expanded → Debug. The renderer formats the projection's
+	// ExecutionFrame for this layer and never decides what belongs in it.
+	execVisibility presentation.Visibility
+
 	// Quit-confirmation modal (exit safety guard). pendingQuitConfirm gates
 	// clean shutdown behind an explicit [ No ] / [ Yes ] dialog; the dialog
 	// defaults to [ No ] so a stray Enter can never exit accidentally.
@@ -1865,6 +1871,17 @@ func (m *model) logActivity(format string, args ...interface{}) {
 	}
 }
 
+// logRuntimeDetail writes a runtime lifecycle detail line (strategy, provider,
+// token usage, event names) ONLY when the gated execution is in the DEBUG
+// layer. In NORMAL and EXPANDED the human narrative panel is the only execution
+// surface — internal runtime states are never rendered directly by default.
+func (m *model) logRuntimeDetail(format string, args ...interface{}) {
+	if m.execVisibility != presentation.VisibilityDebug {
+		return
+	}
+	m.logActivity(format, args...)
+}
+
 // handleEngineEvent receives typed event payloads from the execution
 // and retrieval packages and appends them to the ActivityTree. This is the
 // ONLY path that populates ActivityTree — no string-parsing, no hardcoded
@@ -1981,7 +1998,7 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			})
 		}
 	case events.ExecutionFailedPayload:
-		m.logActivity("[error][%s] %s (stage: %s)", p.Classification, p.Error, p.Stage)
+		m.logActivity("[error] %s", p.Error)
 		// A terminal failure event is authoritative execution truth: it must
 		// release the loading state, spinner, and pending operation.
 		m.clearExecutionLoading(OpOutcomeFailure)
@@ -1997,27 +2014,27 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	case events.StageCompletedPayload:
 		m.logActivity("[stage] %s completed (%s)", p.Stage, p.Summary)
 	case events.ExecutionStartedPayload:
-		m.logActivity("[runtime] execution started: %s (mode %s)", truncateForActivity(p.Prompt), p.Mode)
+		m.logRuntimeDetail("[runtime] execution started: %s (mode %s)", truncateForActivity(p.Prompt), p.Mode)
 	case events.StrategySelectedPayload:
-		m.logActivity("[runtime] strategy selected: %s", p.Strategy)
+		m.logRuntimeDetail("[runtime] strategy selected: %s", p.Strategy)
 	case events.TargetResolvedPayload:
-		m.logActivity("[runtime] target resolved: %s (exists=%t, %s)", p.Target, p.Exists, p.Source)
+		m.logRuntimeDetail("[runtime] target resolved: %s (exists=%t, %s)", p.Target, p.Exists, p.Source)
 	case events.ContextPreparedPayload:
-		m.logActivity("[runtime] context prepared: %d channel(s), ~%d tokens", len(p.Channels), p.Tokens)
+		m.logRuntimeDetail("[runtime] context prepared: %d channel(s), ~%d tokens", len(p.Channels), p.Tokens)
 	case events.ModelInvokedPayload:
-		m.logActivity("[runtime] model invoked: %s", p.Model)
+		m.logRuntimeDetail("[runtime] model invoked: %s", p.Model)
 	case events.ProviderResponsePayload:
-		m.logActivity("[runtime] provider response: %s (%d tok in / %d tok out)", p.Model, p.TokenInput, p.TokenOutput)
+		m.logRuntimeDetail("[runtime] provider response: %s (%d tok in / %d tok out)", p.Model, p.TokenInput, p.TokenOutput)
 	case events.ArtifactProducedPayload:
-		m.logActivity("[runtime] artifact produced: %s (%s)", p.Kind, p.Target)
+		m.logRuntimeDetail("[runtime] artifact produced: %s (%s)", p.Kind, p.Target)
 	case events.MutationStartedPayload:
-		m.logActivity("[runtime] mutation started: %d target(s)", len(p.Targets))
+		m.logRuntimeDetail("[runtime] mutation started: %d target(s)", len(p.Targets))
 	case events.MutationCompletedPayload:
-		m.logActivity("[runtime] mutation completed: %s (%s)", p.Target, p.Outcome)
+		m.logRuntimeDetail("[runtime] mutation completed: %s (%s)", p.Target, p.Outcome)
 	case events.VerificationCompletedPayload:
-		m.logActivity("[runtime] verification %s: %d step(s)", verificationTick(p.Passed), len(p.Steps))
+		m.logRuntimeDetail("[runtime] verification %s: %d step(s)", verificationTick(p.Passed), len(p.Steps))
 	case events.ExecutionFinishedPayload:
-		m.logActivity("[runtime] execution finished: success=%t (%s)", p.Success, p.Outcome)
+		m.logRuntimeDetail("[runtime] execution finished: success=%t (%s)", p.Success, p.Outcome)
 		// A terminal finished event is authoritative execution truth: it must
 		// release the loading state, spinner, and pending operation regardless
 		// of whether the result message has arrived yet.
@@ -2030,7 +2047,7 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		}
 		m.clearExecutionLoading(outcome)
 	case events.ApprovalRequiredPayload:
-		m.logActivity("[runtime] approval required: %s", p.Target)
+		m.logRuntimeDetail("[runtime] approval required: %s", p.Target)
 	case events.IntentClassifiedPayload:
 		// Hybrid Intent Gateway classification outcome projected onto the
 		// activity log. Ambiguity is surfaced so the operator sees WHY the UI
@@ -3383,11 +3400,12 @@ func (m *model) refreshViewportContent() {
 		}
 	}
 
-	// ── Execution narrative panel (Phase 5) ──────────────────────────
+	// ── Execution narrative panel (Phase 5/6) ─────────────────────
 	// The gated RuntimeExecutor path renders its human narrative EXCLUSIVELY
 	// from the execution-view projection (ExecutionNarrative) — never from raw
-	// machine events and never from UI-authored progress text.
-	if panel := m.renderExecutionNarrative(); panel != "" {
+	// machine events and never from UI-authored progress text. The active
+	// visibility layer (Normal/Expanded/Debug) selects what the frame carries.
+	if panel := m.renderExecutionLayered(); panel != "" {
 		content.WriteString(panel)
 	}
 

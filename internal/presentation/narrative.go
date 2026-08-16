@@ -1,12 +1,13 @@
 // Execution narrative layer: Claude-style UX separates MACHINE events from the
 // HUMAN narrative. This type is the deterministic, side-effect-free reducer that
-// turns the canonical runtime event stream into human sentences ("Inspecting
-// index.html", "Preparing a targeted edit", "Generated a proposed change",
-// "Waiting for approval").
+// turns the canonical runtime event stream into human sentences derived from
+// ExecutionGraph transitions.
 //
 // Rules:
-//   - Narrative is generated from events — never from a UI-typed string.
-//   - Narrative is deterministic: the same event always yields the same
+//   - Narrative is derived from the ExecutionGraph transitions (the canonical
+//     event stream) — never from a UI-typed string and never a static
+//     predefined step. A step exists only because a real transition occurred.
+//   - Narrative is deterministic: the same transition always yields the same
 //     sentence.
 //   - No LLM call is ever used for narration.
 //   - The UI reads the narrative; it does not author it.
@@ -18,17 +19,74 @@ import (
 	"github.com/PizenLabs/izen/internal/events"
 )
 
-// narrativeLine is one deterministic narrative record: the machine event and
-// the human sentence it maps to.
+// narrativeLine is one deterministic narrative record: the canonical
+// transition, the machine event, and the human sentence it derives from.
 type narrativeLine struct {
-	machine string
-	human   string
+	// transition is the canonical ExecutionGraph transition this line derives
+	// from ("strategy.selected", "target.resolved", ...). It is the derivation
+	// key — the same transition always yields the same sentence.
+	transition string
+	machine    string
+	human      string
+}
+
+// transitionForEvent maps a canonical runtime event onto its ExecutionGraph
+// transition name. This is the single derivation seam: every human sentence is
+// keyed by a transition, so no step can exist without a real transition.
+func transitionForEvent(ev events.DomainEvent) string {
+	switch ev.Type() {
+	case events.EventExecutionStarted:
+		return "execution.started"
+	case events.EventStrategySelected:
+		return "strategy.selected"
+	case events.EventTargetResolved:
+		return "target.resolved"
+	case events.EventContextPrepared:
+		return "context.prepared"
+	case events.EventModelInvoked, events.EventProviderResponse:
+		return "provider.invoked"
+	case events.EventArtifactProduced:
+		return "artifact.produced"
+	case events.EventApprovalRequired:
+		return "approval.required"
+	case events.EventMutationStarted:
+		return "mutation.started"
+	case events.EventMutationCompleted:
+		return "mutation.completed"
+	case events.EventVerificationCompleted:
+		return "verification.completed"
+	case events.EventExecutionFinished:
+		return "execution.finished"
+	case events.EventExecutionFailed:
+		return "execution.failed"
+	default:
+		return ""
+	}
+}
+
+// transitionNarrative is the canonical transition → human sentence mapping. It
+// is the single source of truth for the human narrative. A transition that has
+// no sentence still carries a machine record (DEBUG layer) but adds no human
+// step — the narrative never invents a step that has no transition behind it.
+var transitionNarrative = map[string]string{
+	"execution.started":      "Understanding request",
+	"strategy.selected":      "Understanding request",
+	"target.resolved":        "Inspecting target",
+	"context.prepared":       "Gathering context",
+	"provider.invoked":       "Generating response",
+	"artifact.produced":      "Preparing result",
+	"approval.required":      "Waiting for approval",
+	"mutation.started":       "Applying changes",
+	"mutation.completed":     "Applied change",
+	"verification.completed": "Verified changes",
+	"execution.finished":     "Completed",
+	"execution.failed":       "Failed",
 }
 
 // ExecutionNarrative separates machine events from the human narrative of one
-// execution. It is pure and deterministic — given the same events it always
-// yields the same sentences. It never invents a sentence it cannot attribute
-// to an observed event.
+// execution. It is pure and deterministic — given the same transitions it
+// always yields the same sentences. It never invents a sentence it cannot
+// attribute to an observed ExecutionGraph transition.
 type ExecutionNarrative struct {
 	lines []narrativeLine
 	// current is the index of the most recent human sentence.
@@ -57,6 +115,22 @@ func (n *ExecutionNarrative) Human() []string {
 	return out
 }
 
+// Steps returns the ordered narrative steps with their canonical transitions.
+// A human step exists only for transitions that actually occurred. The Current
+// flag is not set here — the projection marks the live step based on phase.
+func (n *ExecutionNarrative) Steps() []NarrativeStep {
+	if n == nil {
+		return nil
+	}
+	out := make([]NarrativeStep, 0, len(n.lines))
+	for _, l := range n.lines {
+		if l.human != "" {
+			out = append(out, NarrativeStep{Transition: l.transition, Sentence: l.human})
+		}
+	}
+	return out
+}
+
 // Machine returns the ordered machine event records.
 func (n *ExecutionNarrative) Machine() []string {
 	if n == nil {
@@ -80,7 +154,8 @@ func (n *ExecutionNarrative) CurrentHuman() string {
 }
 
 // Project consumes one canonical runtime event and appends its deterministic
-// narrative record. Events of other types and stale-request events are ignored.
+// narrative record. The human sentence is derived from the ExecutionGraph
+// transition — events of other types and stale-request events are ignored.
 func (n *ExecutionNarrative) Project(ev events.DomainEvent) {
 	if n == nil || ev == nil {
 		return
@@ -89,8 +164,23 @@ func (n *ExecutionNarrative) Project(ev events.DomainEvent) {
 	if payload == nil {
 		return
 	}
+	transition := transitionForEvent(ev)
+	if transition == "" {
+		return
+	}
+	// Stale-request events are ignored once the narrative is bound to a
+	// different execution — except execution.started, which IS the rebinding
+	// event (a fresh execution is a clean slate).
+	if _, isStart := payload.(events.ExecutionStartedPayload); !isStart {
+		if rid := requestIDOf(payload); rid != "" && n.requestID != "" && n.requestID != rid {
+			return
+		}
+	}
 	machine := machineRecord(ev)
 	var human string
+	if sentence, ok := transitionNarrative[transition]; ok {
+		human = sentence
+	}
 	switch p := payload.(type) {
 	case events.ExecutionStartedPayload:
 		// A fresh execution (new request) resets the narrative — a new
@@ -100,117 +190,68 @@ func (n *ExecutionNarrative) Project(ev events.DomainEvent) {
 			n.current = -1
 		}
 		n.requestID = p.RequestID
-		human = "Understanding request"
-	case events.StrategySelectedPayload:
-		if !n.matches(p.RequestID) {
-			return
-		}
-		human = strategySentence(p.Strategy)
 	case events.TargetResolvedPayload:
-		if !n.matches(p.RequestID) {
-			return
+		// Enrich the derived step with the actual resolved target — still
+		// derived from the transition payload, never a static label.
+		if p.Target != "" {
+			human = "Inspecting " + p.Target
 		}
-		human = "Inspecting " + p.Target
-	case events.ContextPreparedPayload:
-		if !n.matches(p.RequestID) {
-			return
-		}
-		if len(p.Channels) > 0 {
-			human = fmt.Sprintf("Gathering context (%d channels)", len(p.Channels))
-		}
-	case events.ModelInvokedPayload:
-		if !n.matches(p.RequestID) {
-			return
-		}
-		human = "Thinking..."
-	case events.ProviderResponsePayload:
-		if !n.matches(p.RequestID) {
-			return
-		}
-	case events.ArtifactProducedPayload:
-		if !n.matches(p.RequestID) {
-			return
-		}
-		human = artifactSentence(p.Kind)
-	case events.ApprovalRequiredPayload:
-		if !n.matches(p.RequestID) {
-			return
-		}
-		human = "Waiting for approval"
-	case events.MutationStartedPayload:
-		if !n.matches(p.RequestID) {
-			return
-		}
-		human = "Applying changes"
 	case events.MutationCompletedPayload:
-		if !n.matches(p.RequestID) {
-			return
-		}
 		if mutationOutcomeSucceeded(p.Outcome) {
 			human = "Applied change to " + p.Target
 		} else {
 			human = "Change to " + p.Target + " not applied (" + p.Outcome + ")"
 		}
 	case events.VerificationCompletedPayload:
-		if !n.matches(p.RequestID) {
-			return
-		}
-		if p.Passed {
-			human = "Verified the change"
-		} else {
+		if !p.Passed {
 			human = "Verification failed"
 		}
 	case events.ExecutionFinishedPayload:
-		if !n.matches(p.RequestID) {
-			return
-		}
 		human = finishedSentence(p.Success, p.Outcome)
-	case events.ExecutionFailedPayload:
-		human = "Failed"
 	}
-	n.lines = append(n.lines, narrativeLine{machine: machine, human: human})
-	if human != "" {
-		n.current = len(n.lines) - 1
+	if human == "" {
+		return
 	}
+	// Derive only: a step identical to the last one (e.g. two targets) is
+	// recorded as a machine event but adds no duplicate human step.
+	if n.current >= 0 && n.lines[n.current].human == human {
+		n.lines = append(n.lines, narrativeLine{transition: transition, machine: machine})
+		return
+	}
+	n.lines = append(n.lines, narrativeLine{transition: transition, machine: machine, human: human})
+	n.current = len(n.lines) - 1
 }
 
-// matches reports whether the event belongs to the narrated execution.
-func (n *ExecutionNarrative) matches(requestID string) bool {
-	if n.requestID == "" {
-		return true
-	}
-	return n.requestID == requestID
-}
-
-// strategySentence is the deterministic human sentence for a strategy decision.
-func strategySentence(s string) string {
-	switch s {
-	case "targeted_mutation":
-		return "Preparing a targeted edit"
-	case "direct_response":
-		return "Answering directly"
-	case "repository_investigation":
-		return "Investigating the repository"
-	case "multi_file_planning":
-		return "Planning the change"
+// requestIDOf returns the RequestID carried by a lifecycle payload ("" when the
+// payload has no request binding).
+func requestIDOf(payload interface{}) string {
+	switch p := payload.(type) {
+	case events.ExecutionStartedPayload:
+		return p.RequestID
+	case events.StrategySelectedPayload:
+		return p.RequestID
+	case events.TargetResolvedPayload:
+		return p.RequestID
+	case events.ContextPreparedPayload:
+		return p.RequestID
+	case events.ModelInvokedPayload:
+		return p.RequestID
+	case events.ProviderResponsePayload:
+		return p.RequestID
+	case events.ArtifactProducedPayload:
+		return p.RequestID
+	case events.ApprovalRequiredPayload:
+		return p.RequestID
+	case events.MutationStartedPayload:
+		return p.RequestID
+	case events.MutationCompletedPayload:
+		return p.RequestID
+	case events.VerificationCompletedPayload:
+		return p.RequestID
+	case events.ExecutionFinishedPayload:
+		return p.RequestID
 	default:
-		return "Preparing execution"
-	}
-}
-
-// artifactSentence is the deterministic human sentence for an artifact.
-func artifactSentence(kind string) string {
-	switch kind {
-	case "patch":
-		return "Generated a proposed change"
-	case "plan":
-		return "Drafted a plan"
-	case "investigation":
-		return "Completed the investigation"
-	case "response":
-		return "Generated response"
-	default:
-		return "Prepared the change"
+		return ""
 	}
 }
 

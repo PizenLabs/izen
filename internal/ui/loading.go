@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/PizenLabs/izen/internal/gateway"
+	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
 	"github.com/PizenLabs/izen/pkg/tui/tips"
 )
@@ -239,21 +241,121 @@ func (m *model) renderExecutionNarrative() string {
 	if m.execView == nil || !m.executionResolving || !m.execView.Active() {
 		return ""
 	}
-	steps := m.execView.HumanTimeline()
+	return renderExecutionFrame(m.execView.Frame(presentation.VisibilityNormal))
+}
+
+// renderExecutionLayered renders the gated execution panel for the ACTIVE
+// visibility layer (Normal / Expanded / Debug). The renderer is a pure
+// formatting function of the presentation-computed ExecutionFrame — it never
+// decides what belongs in a layer.
+func (m *model) renderExecutionLayered() string {
+	if m.execView == nil || !m.executionResolving || !m.execView.Active() {
+		return ""
+	}
+	return renderExecutionFrame(m.execView.Frame(m.execVisibility))
+}
+
+// renderExecutionFrame is the pure visual formatter of an ExecutionFrame. It
+// contains no interpretation: it renders exactly what the presentation layer
+// put into the frame.
+//
+// NORMAL: human narrative milestones + the live current step.
+// EXPANDED: NORMAL + runtime metadata (strategy, context, model, tokens,
+// duration, artifacts).
+// DEBUG: EXPANDED + the full machine event stream.
+func renderExecutionFrame(f presentation.ExecutionFrame) string {
+	steps := f.Steps
 	if len(steps) == 0 {
 		return ""
 	}
 	var b strings.Builder
-	// The last step is the live current step; everything before is a completed
-	// narrative step.
 	last := len(steps) - 1
 	for i, step := range steps {
-		if i == last {
-			b.WriteString("  " + orangeStyle.Render("◇") + " " + brightStyle.Render(step))
+		if step.Current {
+			b.WriteString("  " + orangeStyle.Render("◇") + " " + brightStyle.Render(step.Sentence))
 		} else {
-			b.WriteString("  " + infoStyle.Render(Icon.Success+" "+step))
+			b.WriteString("  " + infoStyle.Render(Icon.Success+" "+step.Sentence))
 		}
 		b.WriteString("\n")
+		// Every narrative step carries its derivation source (the ExecutionGraph
+		// transition that produced it). The source sub-line is surfaced in the
+		// EXPANDED/DEBUG layers — it proves the step is event-derived, never a
+		// static template. NORMAL keeps the human milestones clean.
+		if f.Visibility >= presentation.VisibilityExpanded && step.Transition != "" {
+			b.WriteString("     " + mutedStyle.Render("source: "+step.Transition) + "\n")
+		}
+		if i == last {
+			break
+		}
+	}
+	if f.Visibility >= presentation.VisibilityExpanded {
+		if detail := renderExecutionDetails(f.Details); detail != "" {
+			b.WriteString(detail)
+		}
+	}
+	if f.Visibility >= presentation.VisibilityDebug {
+		b.WriteString(renderExecutionDebug(f.Events))
+	}
+	return b.String()
+}
+
+// renderExecutionDetails renders the EXPANDED-layer runtime metadata. It is
+// visual formatting of the accumulated details only.
+func renderExecutionDetails(d presentation.ExecutionDetails) string {
+	if d.Empty() && d.Duration() == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n")
+	b.WriteString(dimmedStyle.Render("  ── execution details ──") + "\n")
+	if d.Strategy != "" {
+		b.WriteString("  " + dimmedStyle.Render("strategy:") + " " + textStyle.Render(d.Strategy) + "\n")
+	}
+	if len(d.ContextChannels) > 0 {
+		policy := strings.Join(d.ContextChannels, ", ")
+		b.WriteString("  " + dimmedStyle.Render("context policy:") + " " + textStyle.Render(policy))
+		if d.ContextTokens > 0 {
+			b.WriteString(" " + mutedStyle.Render(fmt.Sprintf("(~%d tok)", d.ContextTokens)))
+		}
+		b.WriteString("\n")
+	}
+	if d.Model != "" {
+		b.WriteString("  " + dimmedStyle.Render("model:") + " " + textStyle.Render(d.Model) + "\n")
+	}
+	if d.TokenInput > 0 || d.TokenOutput > 0 {
+		b.WriteString("  " + dimmedStyle.Render("tokens:") + " " + mutedStyle.Render(
+			fmt.Sprintf("%d in / %d out", d.TokenInput, d.TokenOutput)) + "\n")
+	}
+	if dur := d.Duration(); dur > 0 {
+		b.WriteString("  " + dimmedStyle.Render("duration:") + " " + mutedStyle.Render(dur.Round(time.Millisecond).String()) + "\n")
+	}
+	for _, a := range d.Artifacts {
+		b.WriteString("  " + dimmedStyle.Render("artifact:") + " " + renderArtifactSummary(a) + "\n")
+	}
+	return b.String()
+}
+
+// renderArtifactSummary renders one artifact through the semantic renderer and
+// collapses it to a single summary line. Structured artifacts (plans) never
+// render as raw JSON.
+func renderArtifactSummary(a presentation.ArtifactView) string {
+	lines := presentation.RenderArtifact(a.Kind, a.Target, a.Content)
+	if len(lines) == 0 {
+		return a.Kind
+	}
+	return strings.Join(lines, " ")
+}
+
+// renderExecutionDebug renders the DEBUG-layer machine event stream.
+func renderExecutionDebug(events []string) string {
+	if len(events) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n")
+	b.WriteString(dimmedStyle.Render("  ── runtime events ──") + "\n")
+	for _, e := range events {
+		b.WriteString("  " + mutedStyle.Render(e) + "\n")
 	}
 	return b.String()
 }

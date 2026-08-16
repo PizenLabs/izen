@@ -11,6 +11,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
+	"github.com/PizenLabs/izen/internal/presentation"
 )
 
 // isPrintableRunes reports whether a key message is a plain, unmodified
@@ -43,6 +44,29 @@ func (m *model) forwardToInput(msg tea.KeyMsg) tea.Cmd {
 	m.syncInputFromTI()
 	m.updateSuggestions()
 	return tiCmd
+}
+
+// cycleExecVisibility advances the active human presentation layer of a gated
+// execution: NORMAL → EXPANDED → DEBUG → NORMAL. It is the Ctrl+O execution
+// expansion contract. Returns false when no gated execution is active so the
+// key falls through to the thought-block / log-store behavior.
+func (m *model) cycleExecVisibility() bool {
+	if m.execView == nil || !m.executionResolving || !m.execView.Active() {
+		return false
+	}
+	switch m.execVisibility {
+	case presentation.VisibilityNormal:
+		m.execVisibility = presentation.VisibilityExpanded
+	case presentation.VisibilityExpanded:
+		m.execVisibility = presentation.VisibilityDebug
+	default:
+		m.execVisibility = presentation.VisibilityNormal
+	}
+	m.refreshViewportContent()
+	if m.Ready && !m.userIsScrollingUp {
+		m.Viewport.GotoBottom()
+	}
+	return true
 }
 
 // toggleThoughtBlock expands/collapses the active reasoning block OR the live
@@ -107,7 +131,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Expands/collapses the reasoning block for the currently active message
 	// (ThinkingBuffer). When no thought block is active, falls back to cycling
 	// through the foldable build-log entries (legacy behavior).
+	//
+	// PHASE 6: while a gated execution is active, Ctrl+O cycles the human
+	// presentation layer (NORMAL → EXPANDED → DEBUG → NORMAL) so the user can
+	// reveal runtime details and the full event stream on demand.
 	if msg.Type == tea.KeyCtrlO {
+		if m.cycleExecVisibility() {
+			return m, nil
+		}
 		if m.toggleThoughtBlock() {
 			return m, nil
 		}

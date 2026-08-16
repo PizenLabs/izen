@@ -122,7 +122,7 @@ func TestHandleInputDirectiveChainFromAsk(t *testing.T) {
 	}
 
 	// The $hot directive dispatched through the unified gateway.
-	if !hasDispatchRecord(m, "resolving hotfix intent deterministically") {
+	if !hasDispatchRecord(m, "Resolving your request...") {
 		t.Error("expected $hot to dispatch through the unified gateway")
 	}
 }
@@ -194,7 +194,7 @@ func TestHandleInputHotFromAskNoModeTransition(t *testing.T) {
 	if got := m.resolver.Current(); got != modes.ModeAsk {
 		t.Errorf("mode = /%s, want /ask (no mode transition — the gateway decides the path)", got)
 	}
-	if !hasDispatchRecord(m, "resolving hotfix intent deterministically") {
+	if !hasDispatchRecord(m, "Resolving your request...") {
 		t.Error("expected $hot to dispatch through the unified gateway")
 	}
 }
@@ -215,7 +215,7 @@ func TestHandleInputHotFromBuild(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("handleInput($hot in build) returned nil cmd — hotfix dispatch did not fire")
 	}
-	if !hasDispatchRecord(m, "resolving hotfix intent deterministically") {
+	if !hasDispatchRecord(m, "Resolving your request...") {
 		t.Error("expected $hot to dispatch through the unified gateway")
 	}
 }
@@ -234,7 +234,7 @@ func TestHandleInputPromptNoModeTransition(t *testing.T) {
 	if got := m.resolver.Current(); got != modes.ModeBuild {
 		t.Errorf("mode = /%s, want /build (no transition — $prompt is an execution request)", got)
 	}
-	if !hasDispatchRecord(m, "resolving intent deterministically") {
+	if !hasDispatchRecord(m, "Resolving your request...") {
 		t.Error("expected $prompt to dispatch through the unified gateway")
 	}
 }
@@ -351,7 +351,7 @@ func TestHandleInputHotFromInvestigateNoModeTransition(t *testing.T) {
 	if got := m.resolver.Current(); got != modes.ModeInvestigate {
 		t.Errorf("mode = /%s, want /investigate (no mode transition — the gateway decides the path)", got)
 	}
-	if !hasDispatchRecord(m, "resolving hotfix intent deterministically") {
+	if !hasDispatchRecord(m, "Resolving your request...") {
 		t.Error("expected $hot to dispatch through the unified gateway")
 	}
 }

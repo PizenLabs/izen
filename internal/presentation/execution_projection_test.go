@@ -19,6 +19,8 @@ import (
 //  4. No impossible state is ever reachable (artifact before invocation,
 //     verification without mutation, running step after terminal).
 //  5. A new execution resets the projection.
+//  6. The reducer accumulates runtime metadata (strategy, context policy,
+//     model, tokens, artifacts) for the EXPANDED layer.
 
 func runProjection(evs ...events.DomainEvent) *ExecutionProjection {
 	p := NewExecutionProjection()
@@ -28,9 +30,10 @@ func runProjection(evs ...events.DomainEvent) *ExecutionProjection {
 	return p
 }
 
-// TestReducerHumanNarrativePins the acceptance human timeline: Understanding
-// request → Inspecting index.html → Generated a proposed change → Waiting for
-// approval → Applied change → Verified the change → Completed.
+// TestReducerHumanNarrativePins the acceptance human timeline derived from the
+// ExecutionGraph transitions: Understanding request → Inspecting index.html →
+// Gathering context → Generating response → Preparing result → Waiting for
+// approval → Applying changes → Applied change → Verified changes → Completed.
 func TestReducerHumanNarrative(t *testing.T) {
 	p := runProjection(
 		events.NewExecutionStarted("r1", "build", "fix index.html"),
@@ -49,15 +52,14 @@ func TestReducerHumanNarrative(t *testing.T) {
 
 	want := []string{
 		"Understanding request",
-		"Preparing a targeted edit",
 		"Inspecting index.html",
-		"Gathering context (2 channels)",
-		"Thinking...",
-		"Generated a proposed change",
+		"Gathering context",
+		"Generating response",
+		"Preparing result",
 		"Waiting for approval",
 		"Applying changes",
 		"Applied change to index.html",
-		"Verified the change",
+		"Verified changes",
 		"Completed",
 	}
 	got := p.HumanTimeline()
@@ -76,6 +78,58 @@ func TestReducerHumanNarrative(t *testing.T) {
 	}
 	if !st.Valid() {
 		t.Fatalf("terminal state failed validation: %+v", st)
+	}
+}
+
+// TestReducerAccumulatesDetails pins that the EXPANDED-layer metadata is
+// accumulated from the observed payloads — strategy, context policy, model,
+// token usage, duration, and artifacts.
+func TestReducerAccumulatesDetails(t *testing.T) {
+	p := runProjection(
+		events.NewExecutionStarted("r1", "build", "fix index.html"),
+		events.NewStrategySelected("r1", "targeted_mutation", true, "explicit target"),
+		events.NewContextPrepared("r1", []string{"user_intent", "target_content"}, 40),
+		events.NewModelInvoked("r1", "mock", 0, 0),
+		events.NewProviderResponse("r1", "mock", 12, 6),
+		events.NewArtifactProduced("r1", "patch", "index.html"),
+		events.NewExecutionFinished("r1", true, "completed"),
+	)
+
+	d := p.State().Details
+	if d.Strategy != "targeted_mutation" {
+		t.Errorf("Details.Strategy = %q, want targeted_mutation", d.Strategy)
+	}
+	if len(d.ContextChannels) != 2 || d.ContextTokens != 40 {
+		t.Errorf("Details context = %v / %d, want 2 channels / 40 tokens", d.ContextChannels, d.ContextTokens)
+	}
+	if d.Model != "mock" {
+		t.Errorf("Details.Model = %q, want mock", d.Model)
+	}
+	if d.TokenInput != 12 || d.TokenOutput != 6 {
+		t.Errorf("Details tokens = %d in / %d out, want 12 / 6", d.TokenInput, d.TokenOutput)
+	}
+	if len(d.Artifacts) != 1 || d.Artifacts[0].Kind != "patch" || d.Artifacts[0].Type != ArtifactDiff {
+		t.Errorf("Details.Artifacts = %+v, want one classified patch artifact", d.Artifacts)
+	}
+	if d.Duration() <= 0 {
+		t.Error("Details.Duration() must be positive for a completed execution")
+	}
+}
+
+// TestReducerDetailsSurviveTerminal pins that the accumulated metadata survives
+// the terminal state reassignment (EXPANDED layer keeps its metadata at
+// completion).
+func TestReducerDetailsSurviveTerminal(t *testing.T) {
+	p := runProjection(
+		events.NewExecutionStarted("r1", "build", "fix index.html"),
+		events.NewStrategySelected("r1", "targeted_mutation", true, "explicit target"),
+		events.NewModelInvoked("r1", "mock", 0, 0),
+		events.NewProviderResponse("r1", "mock", 12, 6),
+		events.NewExecutionFinished("r1", true, "completed"),
+	)
+	d := p.State().Details
+	if d.Strategy != "targeted_mutation" || d.Model != "mock" || d.TokenInput != 12 {
+		t.Fatalf("terminal state lost details: %+v", d)
 	}
 }
 

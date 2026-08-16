@@ -73,7 +73,7 @@ func TestPhase6HotInBuildExecutesImmediately(t *testing.T) {
 	if got := m.resolver.Current(); got != modes.ModeBuild {
 		t.Fatalf("mode = /%s, want /build (unchanged)", got)
 	}
-	if !hasDispatchRecord(m, "resolving hotfix intent deterministically") {
+	if !hasDispatchRecord(m, "Resolving your request...") {
 		t.Error("expected $hot to dispatch through the unified gateway")
 	}
 }
@@ -94,7 +94,7 @@ func TestPhase6HotOutsideBuildNoTransition(t *testing.T) {
 			t.Fatalf("from /%s: mode = /%s, want /%s (no mode transition — the gateway decides the path)", start, got, start)
 		}
 		// Single dispatch: one input → one gateway execution.
-		if n := strings.Count(recordsText(m), "resolving hotfix intent deterministically"); n != 1 {
+		if n := strings.Count(recordsText(m), "Resolving your request..."); n != 1 {
 			t.Fatalf("from /%s: $hot dispatched %d times, want exactly 1 (single input → single execution)", start, n)
 		}
 	}
@@ -109,7 +109,7 @@ func TestPhase6HotFromAskSingleDispatch(t *testing.T) {
 
 	m.handleInput("$hot add a LICENSE file @LICENSE")
 
-	if n := strings.Count(recordsText(m), "resolving hotfix intent deterministically"); n != 1 {
+	if n := strings.Count(recordsText(m), "Resolving your request..."); n != 1 {
 		t.Fatalf("hotfix dispatched %d times, want exactly 1", n)
 	}
 }
@@ -128,7 +128,7 @@ func TestPhase6PromptNoModeTransition(t *testing.T) {
 	if got := m.resolver.Current(); got != modes.ModeBuild {
 		t.Fatalf("mode = /%s, want /build (no transition — $prompt is an execution request)", got)
 	}
-	if !hasDispatchRecord(m, "resolving intent deterministically") {
+	if !hasDispatchRecord(m, "Resolving your request...") {
 		t.Error("expected $prompt to dispatch through the unified gateway")
 	}
 }
@@ -232,7 +232,7 @@ func TestPhase6ResolvedTargetExecutesWithoutAmbiguityStop(t *testing.T) {
 	if m.state == StateHotfixAmbiguous {
 		t.Fatal("a resolved target must not enter the ambiguity card")
 	}
-	if !hasDispatchRecord(m, "resolving hotfix intent deterministically") {
+	if !hasDispatchRecord(m, "Resolving your request...") {
 		t.Error("expected $hot to dispatch through the unified gateway")
 	}
 }
@@ -388,7 +388,7 @@ func TestPhase6NextCommandAcceptedAfterTerminalState(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("the next command after a terminal state must dispatch immediately")
 	}
-	if !hasDispatchRecord(m2, "resolving hotfix intent deterministically") {
+	if !hasDispatchRecord(m2, "Resolving your request...") {
 		t.Error("the next command did not execute after the terminal state")
 	}
 }

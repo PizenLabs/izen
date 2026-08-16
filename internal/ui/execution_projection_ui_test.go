@@ -76,8 +76,8 @@ func TestGatedProjectionFollowsRuntimeEvents(t *testing.T) {
 	m.handleDomainEvent(events.NewProviderResponse("g1", "mock", 5, 5))
 	m.handleDomainEvent(events.NewArtifactProduced("g1", "patch", "index.html"))
 
-	if m.execView.HumanStep() != "Generated a proposed change" {
-		t.Fatalf("step after artifact.produced = %q, want Generated a proposed change", m.execView.HumanStep())
+	if m.execView.HumanStep() != "Preparing result" {
+		t.Fatalf("step after artifact.produced = %q, want Preparing result", m.execView.HumanStep())
 	}
 
 	m.handleDomainEvent(events.NewApprovalRequired("g1", "index.html", "<diff>"))
@@ -90,7 +90,7 @@ func TestGatedProjectionFollowsRuntimeEvents(t *testing.T) {
 	for _, want := range []string{
 		"Understanding request",
 		"Inspecting index.html",
-		"Generated a proposed change",
+		"Preparing result",
 		"Waiting for approval",
 	} {
 		if !strings.Contains(joined, want) {

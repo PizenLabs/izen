@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/presentation"
 )
@@ -71,12 +72,41 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	m.executionResolving = true
 	m.agentRunning = true
 	m.agentLabel = "resolving execution"
+
+	// ── CONVERSATION FLOW (UX_ENGINE #4) ─────────────────────────────
+	// A direct-response request (casual greeting / simple question) is a single
+	// human action: Izen → understands intent → answers. It must NOT create an
+	// execution narrative, a workspace-context pipeline, or planning states.
+	// The runtime still resolves and executes it (zero repository context), but
+	// the human surface is the answer only — no narrative panel, no milestones.
+	if det.Profile.Strategy == strategy.DirectResponse {
+		// The execution-view projection stays nil for conversation so the
+		// narrative panel never renders; the loading dock falls back to the
+		// shimmer text ("Answering...") derived from the conversational intent.
+		// The visibility layer is also reset so no runtime detail lines from a
+		// prior debug view can leak into a conversational exchange.
+		m.execView = nil
+		m.execVisibility = presentation.VisibilityNormal
+		m.startShimmer("Answering...", "chat")
+		return func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			res, err := m.executor.Execute(ctx, req)
+			if res == nil {
+				res = &execution.ExecutionResult{RequestID: req.RequestID}
+			}
+			return gatedExecutionMsg{res: res, det: det, err: err}
+		}
+	}
+
 	// The single execution-view projection resets at dispatch. From here on
 	// the renderer derives the execution status ONLY from this projection's
 	// state, which handleDomainEvent advances from the canonical runtime
 	// events — the UI never invents execution truth.
 	m.execView = presentation.NewExecutionProjection()
 	m.execView.Begin(req.RequestID)
+	// A fresh execution starts in the NORMAL human layer.
+	m.execVisibility = presentation.VisibilityNormal
 
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -87,6 +117,55 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 		}
 		return gatedExecutionMsg{res: res, det: det, err: err}
 	}
+}
+
+// executionFirstTarget returns the first resolved mutation target, or "".
+func executionFirstTarget(targets []string) string {
+	if len(targets) == 0 {
+		return ""
+	}
+	return targets[0]
+}
+
+// humanArtifactActivity renders the human activity line for a produced
+// artifact, converting the runtime artifact kind into human language
+// (UX_ENGINE: "artifact produced" → "Prepared result"). A direct-response /
+// explanation artifact is the conversation answer itself — it is rendered
+// without an internal activity line.
+func humanArtifactActivity(kind, target string) string {
+	switch presentation.ClassifyArtifact(kind) {
+	case presentation.ArtifactPlan:
+		return "Prepared a plan"
+	case presentation.ArtifactDiff:
+		return "Prepared a proposed change"
+	case presentation.ArtifactInspection:
+		return "Prepared findings"
+	case presentation.ArtifactVerification:
+		return "Verified changes"
+	case presentation.ArtifactError:
+		return "Prepared an error report"
+	default:
+		if target != "" {
+			return "Generated response for " + target
+		}
+		return "Generated response"
+	}
+}
+
+// pushArtifact routes a terminal artifact through the semantic ArtifactRenderer
+// so structured artifacts (plans, diffs, verification, errors) are NEVER pushed
+// as raw JSON/text. Response-type artifacts render as human content lines.
+func (m *model) pushArtifact(kind, target, content string) {
+	if kind == "" {
+		m.push(roleAI, content)
+		return
+	}
+	lines := presentation.RenderArtifact(kind, target, content)
+	if len(lines) == 0 {
+		m.push(roleAI, content)
+		return
+	}
+	m.push(roleAI, strings.Join(lines, "\n"))
 }
 
 // handleGatedExecution projects a gated execution result into the proposal /
@@ -101,7 +180,7 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 // terminal execution event.
 func (m *model) handleGatedExecution(msg gatedExecutionMsg) (tea.Model, tea.Cmd) {
 	if msg.err != nil && msg.res == nil {
-		m.push(roleError, "[execution] gate failed: "+msg.err.Error())
+		m.push(roleError, "Couldn't start: "+msg.err.Error())
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m, nil
@@ -129,7 +208,7 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 			execErr = msg.res.Err
 		}
 		m.finalizeOperation(OpOutcomeFailure, execErr)
-		m.push(roleError, "[PROMPT] execution failed: "+execErr.Error())
+		m.push(roleError, "Execution failed: "+execErr.Error())
 		m.push(roleSystem, infoStyle.Render("No files were modified."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -150,8 +229,8 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 	// ── READ-ONLY TERMINAL: the runtime produced an artifact, no mutation ──
 	if res.Proof != nil && res.Proof.Outcome == execution.OutcomeCompleted && res.Content != "" {
 		m.finalizeOperation(OpOutcomeSuccess, nil)
-		m.push(roleActivity, fmt.Sprintf("[runtime] artifact produced: %s", res.ArtifactKind))
-		m.push(roleAI, res.Content)
+		m.push(roleActivity, humanArtifactActivity(res.ArtifactKind, executionFirstTarget(res.Targets)))
+		m.pushArtifact(res.ArtifactKind, executionFirstTarget(res.Targets), res.Content)
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		return m, m.tokenUsageCmd(tokenInput, tokenOutput)
@@ -167,7 +246,7 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		m.resolveApprovalState()
 		m.finalizeOperation(OpOutcomeSuccess, nil)
 		for _, mut := range res.Mutations {
-			m.logActivity("[mutation] %s: %s", mut.File, mut.Outcome.Display())
+			m.logActivity("Applied change to %s", mut.File)
 		}
 		if res.Verification.Passed {
 			m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Mutation applied and verified."))
@@ -196,7 +275,7 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 	// ── CLARIFICATION REQUIRED (no model call, no mutation) ────────
 	if res.ClarificationRequired {
 		m.finalizeOperation(OpOutcomeAmbiguous, nil)
-		m.push(roleError, "[PROMPT] "+res.StrategyReason)
+		m.push(roleError, "I need more information: "+res.StrategyReason)
 		m.push(roleSystem, infoStyle.Render("  No model call was made and no files were modified. Name the exact target."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -238,7 +317,7 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		m.enterApprovalState()
 		m.ti.Blur()
 		m.recalcViewportHeight()
-		m.push(roleStatus, fmt.Sprintf("[%s APPROVAL] Proposed patch to %s", m.hotfixBrandingLabel(), target))
+		m.push(roleStatus, fmt.Sprintf("Proposed change to %s", target))
 		m.push(roleSystem, infoStyle.Render("Review the code diff below. Use Alt+A to accept, Alt+R to reject."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -246,7 +325,7 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 	}
 
 	m.finalizeOperation(OpOutcomeSuccess, nil)
-	m.push(roleSystem, infoStyle.Render("Execution completed with no artifact."))
+	m.push(roleSystem, infoStyle.Render("Completed — nothing produced."))
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
 	return m, m.tokenUsageCmd(tokenInput, tokenOutput)
@@ -263,7 +342,7 @@ func (m *model) runPromptExecution(rawInput string) tea.Cmd {
 		m.Viewport.GotoBottom()
 		return nil
 	}
-	m.push(roleSystem, infoStyle.Render(" engine-first: resolving intent deterministically (no mode routing)."))
+	m.push(roleSystem, infoStyle.Render("Resolving your request..."))
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
 	return m.runGatedLine("$prompt " + rawInput)
@@ -279,7 +358,7 @@ func (m *model) runHotExecution(rawInput string) tea.Cmd {
 		m.Viewport.GotoBottom()
 		return nil
 	}
-	m.push(roleSystem, infoStyle.Render(" engine-first: resolving hotfix intent deterministically."))
+	m.push(roleSystem, infoStyle.Render("Resolving your request..."))
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
 	return m.runGatedLine("$hot " + rawInput)

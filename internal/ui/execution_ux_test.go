@@ -239,7 +239,7 @@ func TestUxPromptDirectiveNoDuplicateOperation(t *testing.T) {
 	if got := m.resolver.Current(); got != modes.ModeBuild {
 		t.Errorf("mode = /%s, want /build (no transition — $prompt is an execution request)", got)
 	}
-	if !hasDispatchRecord(m, "resolving intent deterministically") {
+	if !hasDispatchRecord(m, "Resolving your request...") {
 		t.Error("expected $prompt to dispatch through the unified gateway")
 	}
 }
