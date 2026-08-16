@@ -4,72 +4,14 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 )
 
-// ── PHASE 11 — EXECUTION GRAPH WIRING ──────────────────────────────────────
+// ── EXECUTION GRAPH (retained UI projection) ────────────────────────────────
 //
-// The strategy layer compiles an explicit ExecutionGraph (typed nodes:
-// resolve_target → read_target → reason → propose → approve → mutate → verify,
-// or the bounded topology of the selected strategy) BEFORE any model
-// invocation. This file drives that graph from the real runtime boundaries the
-// UI reaches: dispatch (resolve/read), the mutation-proposal terminal (reason/
-// propose), the apply/verification terminal (mutate/verify), and the human
-// clarification boundary (clarify). Node states are recorded ONLY at real
-// boundaries — never inferred from a spinner — and every record is a no-op
-// when no strategy graph is active ($hot, explicit /build, … run outside the
-// strategy layer and keep their existing $inspect surfaces).
-//
-// The graph is UI-agnostic: it is a pure engine record the UI projects. No
-// presentation concern lives in the graph.
-
-// recordStrategyGraph compiles the explicit execution graph for the strategy
-// decision and records the initial deterministic nodes (target resolution and,
-// where deterministic, target reading). It is called at dispatch, before any
-// model invocation, so the graph exists the moment the engine decides WHAT to
-// execute.
-func (m *model) recordStrategyGraph(p strategy.ExecutionStrategyProfile) {
-	m.lastStrategyGraph = strategy.Compile(p)
-	g := m.lastStrategyGraph
-	if g == nil {
-		return
-	}
-	g.Start()
-
-	switch p.Strategy {
-	case strategy.HumanClarification:
-		// Deterministic resolution was attempted; the operation stops at the
-		// human boundary. No file is read, no model is called.
-		if n := g.First(strategy.NodeResolveTarget); n != nil {
-			g.Complete(n.ID, "target resolution attempted deterministically")
-		}
-		if n := g.First(strategy.NodeClarify); n != nil {
-			g.Wait(n.ID, p.StrategyReason)
-		}
-	case strategy.TargetedReasoning:
-		// The /ask chat path supplies the explicit target content through the
-		// governed context planner; resolve and read are deterministic at
-		// dispatch. The reason node completes at the /ask stream terminal.
-		if n := g.First(strategy.NodeResolveTarget); n != nil {
-			g.Complete(n.ID, "target resolved deterministically")
-		}
-		if n := g.First(strategy.NodeReadTarget); n != nil {
-			g.Complete(n.ID, "target content supplied by the governed context planner")
-		}
-	case strategy.DirectDeterministic:
-		// Deterministic template create: the engine already resolved and read
-		// the template; mutate + verify complete at the apply terminal.
-		if n := g.First(strategy.NodeResolveTarget); n != nil {
-			g.Complete(n.ID, "template target resolved deterministically")
-		}
-		if n := g.First(strategy.NodeReadTarget); n != nil {
-			g.Complete(n.ID, "template content enumerated deterministically")
-		}
-	case strategy.TargetedMutation, strategy.RepositoryInvestigation, strategy.MultiFilePlanning:
-		// Target resolution completed deterministically by the selector. The
-		// remaining nodes are driven at their real runtime boundaries.
-		if n := g.First(strategy.NodeResolveTarget); n != nil {
-			g.Complete(n.ID, "target resolution completed deterministically")
-		}
-	}
-}
+// The execution graph for the engine-first strategy layer is compiled and
+// driven by the RUNTIME now: the RuntimeExecutor records real graph boundaries
+// in its ExecutionProof (internal/execution). The UI-side record functions
+// below remain ONLY for the legacy hotfix/build paths that still run outside
+// the strategy layer; the migrated gated-execution path renders the runtime's
+// proof instead.
 
 // recordStrategyGraphProposal marks the reasoning and proposal nodes complete
 // at the mutation-proposal terminal: the bounded model produced its artifact

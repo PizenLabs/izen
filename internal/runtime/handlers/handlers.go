@@ -18,6 +18,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/runtime"
 )
 
@@ -44,10 +45,16 @@ type HandlerDeps struct {
 	// Bus is the domain event bus handlers publish onto. Nil disables
 	// emission so headless/CLI harnesses can execute commands silently.
 	Bus *events.Bus
-	// Approver resolves a pending approval by ID. A nil approver yields a
-	// deterministic in-memory resolution so the approval commands work in
-	// any wiring.
+	// Approver resolves a pending approval by ID. It is the TEST/fallback
+	// seam only: production approval is routed through Executor.Approve/Reject
+	// and never fabricates a mutation record.
 	Approver PatchApprover
+	// Executor is the RuntimeExecutor authority boundary. When wired, the
+	// approval commands resolve a REAL pending mutation through it (apply,
+	// verification, commit) instead of emitting a fabricated PatchApplied
+	// event. A nil executor degrades approval to the injected Approver (tests)
+	// or a deterministic error — never a fake mutation.
+	Executor *execution.RuntimeExecutor
 	// Now is an injectable clock for deterministic duration telemetry.
 	// Defaults to time.Since at the handler level.
 	Now func() time.Time
@@ -157,12 +164,6 @@ func (h *SubmitPromptHandler) Handle(ctx context.Context, cmd runtime.RuntimeCom
 		return err
 	}
 
-	// 3. Plan staging for plan-intent prompts.
-	if strings.EqualFold(target, workflow.PhasePlan.String()) {
-		tasks := ExtractTasks(c.Prompt)
-		h.emit(events.NewPlanStaged(len(tasks), tasks, "plan"))
-	}
-
 	h.emit(events.NewStageCompleted("submit_prompt", time.Since(start),
 		fmt.Sprintf("prompt routed to %s", target)))
 	return nil
@@ -235,8 +236,12 @@ func (h *SwitchModeHandler) Handle(ctx context.Context, cmd runtime.RuntimeComma
 
 // ── ApprovePatchHandler ──────────────────────────────────────────────────────
 
-// ApprovePatchHandler approves a pending patch, emitting the applied-mutation
-// domain event.
+// ApprovePatchHandler approves a pending patch. When a RuntimeExecutor is
+// wired, the approval is REAL: it applies the held patch (owning the
+// filesystem write + verification gate), commits the MutationSet and emits the
+// mutation lifecycle events. Without an executor, approval degrades to the
+// injected Approver (tests) or a deterministic error — never a fabricated
+// mutation record.
 type ApprovePatchHandler struct {
 	handlerBase
 }
@@ -254,6 +259,31 @@ func (h *ApprovePatchHandler) Handle(ctx context.Context, cmd runtime.RuntimeCom
 		return fmt.Errorf("handlers: unexpected command %T", cmd)
 	}
 	start := h.now()
+
+	if x := h.deps.Executor; x != nil {
+		res, err := x.Approve(ctx, c.PatchID)
+		if err != nil {
+			h.emit(events.NewExecutionFailed(events.FailureRecoverable, err, "approve_patch"))
+			return err
+		}
+		if res == nil {
+			return fmt.Errorf("handlers: executor returned no result for patch %s", c.PatchID)
+		}
+		// Emit the mutation outcome only from the real result — never a
+		// fabricated +1/-0 record.
+		for _, m := range res.Mutations {
+			if m.Outcome.MutationSucceeded() {
+				h.emit(events.NewPatchApplied(m.File, m.DiffAdds, m.DiffRemoves, time.Since(start)))
+			}
+		}
+		if !res.Proof.Outcome.MutationSucceeded() {
+			return fmt.Errorf("handlers: patch %s resolved as %s", c.PatchID, res.Proof.Outcome)
+		}
+		h.emit(events.NewStageCompleted("approve_patch", time.Since(start),
+			fmt.Sprintf("approved patch %s", c.PatchID)))
+		return nil
+	}
+
 	res, err := h.resolve(ctx, c.PatchID, true, "")
 	if err != nil {
 		return err
@@ -266,8 +296,11 @@ func (h *ApprovePatchHandler) Handle(ctx context.Context, cmd runtime.RuntimeCom
 
 // ── RejectPatchHandler ───────────────────────────────────────────────────────
 
-// RejectPatchHandler rejects a pending patch, emitting the rejected-mutation
-// domain event.
+// RejectPatchHandler rejects a pending patch. When a RuntimeExecutor is wired,
+// the rejection is REAL: the held mutation is rolled back and its boundary
+// terminated as cancelled. Without an executor, rejection degrades to the
+// injected Approver (tests) or a deterministic error — never a fabricated
+// record.
 type RejectPatchHandler struct {
 	handlerBase
 }
@@ -285,6 +318,22 @@ func (h *RejectPatchHandler) Handle(ctx context.Context, cmd runtime.RuntimeComm
 		return fmt.Errorf("handlers: unexpected command %T", cmd)
 	}
 	start := h.now()
+
+	if x := h.deps.Executor; x != nil {
+		res, err := x.Reject(ctx, c.PatchID, c.Reason)
+		if err != nil {
+			h.emit(events.NewExecutionFailed(events.FailurePermanent, err, "reject_patch"))
+			return err
+		}
+		if res == nil {
+			return fmt.Errorf("handlers: executor returned no result for patch %s", c.PatchID)
+		}
+		h.emit(events.NewPatchRejected(c.PatchID, c.Reason, 4))
+		h.emit(events.NewStageCompleted("reject_patch", time.Since(start),
+			fmt.Sprintf("rejected patch %s", c.PatchID)))
+		return nil
+	}
+
 	res, err := h.resolve(ctx, c.PatchID, false, c.Reason)
 	if err != nil {
 		return err
@@ -295,8 +344,9 @@ func (h *RejectPatchHandler) Handle(ctx context.Context, cmd runtime.RuntimeComm
 	return nil
 }
 
-// resolve maps an approval decision to a concrete mutation record. A nil
-// approver falls back to a deterministic in-memory mapping keyed by patch ID.
+// resolve maps an approval decision to a concrete mutation record. It is the
+// test/fallback seam: production approval is routed through the executor (see
+// Approve/Reject handlers), which never fabricates a record.
 func (h *ApprovePatchHandler) resolve(ctx context.Context, patchID string, approve bool, reason string) (ApprovalResult, error) {
 	return resolveApproval(ctx, h.deps.Approver, patchID, approve, reason)
 }
@@ -305,11 +355,14 @@ func (h *RejectPatchHandler) resolve(ctx context.Context, patchID string, approv
 	return resolveApproval(ctx, h.deps.Approver, patchID, approve, reason)
 }
 
+// resolveApproval delegates to the injected Approver when present. Without an
+// approver it returns a deterministic error — a nil approver NEVER fabricates
+// a mutation record (Rule 3: no fake states).
 func resolveApproval(ctx context.Context, a PatchApprover, patchID string, approve bool, reason string) (ApprovalResult, error) {
 	if a != nil {
 		return a.Resolve(ctx, patchID, approve, reason)
 	}
-	return ApprovalResult{File: patchID, LinesAdd: 1, LinesDel: 0}, nil
+	return ApprovalResult{}, fmt.Errorf("handlers: no approval authority wired for patch %q", patchID)
 }
 
 // ── CancelHandler ────────────────────────────────────────────────────────────
@@ -380,23 +433,6 @@ func containsAny(s string, keywords []string) bool {
 		}
 	}
 	return false
-}
-
-// ExtractTasks deterministically splits a prompt into plan tasks: one task per
-// non-blank newline; when no line breaks exist the whole prompt is a single
-// task. It is a pure projection used only for plan staging telemetry.
-func ExtractTasks(prompt string) []string {
-	var tasks []string
-	for _, line := range strings.Split(prompt, "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			tasks = append(tasks, line)
-		}
-	}
-	if len(tasks) == 0 {
-		tasks = append(tasks, strings.TrimSpace(prompt))
-	}
-	return tasks
 }
 
 // ── Handlers bundle + registration ───────────────────────────────────────────
@@ -470,8 +506,9 @@ func RegisterDefaults(d *runtime.CommandDispatcher) error {
 }
 
 // InMemoryApprover is a deterministic, thread-safe PatchApprover that maps
-// patch IDs to pre-registered mutation records. It is the default fallback and
-// the harness/tests seam.
+// patch IDs to pre-registered mutation records. It is the harness/tests seam
+// only — production approval is routed through the RuntimeExecutor, which
+// applies real mutations. It NEVER fabricates a record for an unknown ID.
 type InMemoryApprover struct {
 	mu      sync.Mutex
 	pending map[string]ApprovalResult
@@ -502,5 +539,5 @@ func (a *InMemoryApprover) Resolve(ctx context.Context, patchID string, approve 
 	if res, ok := a.pending[patchID]; ok {
 		return res, nil
 	}
-	return ApprovalResult{File: patchID, LinesAdd: 1, LinesDel: 0}, nil
+	return ApprovalResult{}, fmt.Errorf("handlers: no registered approval record for patch %q", patchID)
 }

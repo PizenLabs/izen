@@ -1,13 +1,66 @@
 package ui
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/core/authorization"
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/parser"
 	cmdreg "github.com/PizenLabs/izen/pkg/domain/command"
 )
+
+// gatedDispatchModel wires a model to the unified IntentGateway + RuntimeExecutor
+// over a temp workspace so directive dispatch crosses the runtime boundary
+// (never a UI-owned execution path).
+func gatedDispatchModel(t *testing.T, mock *mockProvider, files map[string]string) *model {
+	t.Helper()
+	dir := t.TempDir()
+	for name, content := range files {
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(dir)
+
+	m := newTestModel()
+	m.workspaceRoot = dir
+	m.state = StateChat
+	m.awaitingConfirmation = false
+	m.pendingProposals = nil
+	m.streaming = false
+	m.agentRunning = false
+	m.gateway = execution.NewIntentGateway(dir)
+	m.executor = execution.NewRuntimeExecutor(dir, m.cfg, mock, nil, "")
+	trivial := execution.NewVerifier(dir)
+	trivial.SetCustomSteps([]execution.VerificationStep{{Name: "noop", Command: "true", Optional: false}})
+	m.executor.SetVerifier(trivial)
+	m.executor.SetAuthorization(&authorization.MutationAuthorization{
+		ID:        authorization.NewAuthorizationID(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	return m
+}
+
+// hasDispatchRecord reports whether the model emitted the unified-gateway
+// dispatch record for the given directive.
+func hasDispatchRecord(m *model, needle string) bool {
+	for _, r := range m.records {
+		if strings.Contains(r.text, needle) {
+			return true
+		}
+	}
+	return false
+}
 
 // ── DoD: /build$hot quick-chain from /ask ────────────────────────────────
 
@@ -44,27 +97,19 @@ func TestIntentFromInputDirectiveChain(t *testing.T) {
 }
 
 // TestHandleInputDirectiveChainFromAsk drives the full dispatcher with the
-// DoD input: it must parse cleanly (no "unknown command" fallback),
-// auto-transition the workspace from /ask to /build BEFORE dispatching, and
-// route the $hot directive into the hotfix pipeline.
+// DoD input: it must parse cleanly (no "unknown command" fallback), apply the
+// explicit /build workspace marker as a presentation transition, and route the
+// $hot directive through the unified gateway — never a UI-owned execution.
 func TestHandleInputDirectiveChainFromAsk(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
-
-	m := newTestModel()
+	m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "x"}}}, nil)
 	m.resolver.Set(modes.ModeAsk)
-	m.state = StateChat
-	m.awaitingConfirmation = false
-	m.pendingProposals = nil
-	m.streaming = false
-	m.agentRunning = false
 
 	cmd := m.handleInput("/build$hot fix syntax in @index.html")
 	if cmd == nil {
 		t.Fatal("handleInput returned nil cmd — directive dispatch did not fire")
 	}
 
-	// Workspace automatically transitions to /build.
+	// The explicit /build marker is a presentation transition.
 	if got := m.resolver.Current(); got != modes.ModeBuild {
 		t.Errorf("workspace = /%s, want /build after parser-pipeline transition", got)
 	}
@@ -76,33 +121,18 @@ func TestHandleInputDirectiveChainFromAsk(t *testing.T) {
 		}
 	}
 
-	// The $hot directive dispatched the hotfix pipeline with the goal + scope.
-	found := false
-	for _, r := range m.records {
-		if strings.Contains(r.text, "[HOTFIX] Urgent hotfix: fix syntax in @index.html") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("expected $hot to dispatch the hotfix pipeline with the goal and @index.html scope")
+	// The $hot directive dispatched through the unified gateway.
+	if !hasDispatchRecord(m, "resolving hotfix intent deterministically") {
+		t.Error("expected $hot to dispatch through the unified gateway")
 	}
 }
 
 // TestHandleInputDirectiveChainSameWorkspace verifies the chain also executes
 // when the declared workspace already matches the active mode (no redundant
-// transition, directive still dispatched).
+// transition, directive still dispatched through the gateway).
 func TestHandleInputDirectiveChainSameWorkspace(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
-
-	m := newTestModel()
+	m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "x"}}}, nil)
 	m.resolver.Set(modes.ModeBuild)
-	m.state = StateChat
-	m.awaitingConfirmation = false
-	m.pendingProposals = nil
-	m.streaming = false
-	m.agentRunning = false
 
 	cmd := m.handleInput("/build$hot fix syntax in @index.html")
 	if cmd == nil {
@@ -148,88 +178,64 @@ func TestHandleInputUnknownCommandShowsParseError(t *testing.T) {
 	}
 }
 
-// TestHandleInputHotFromAskAutoTransitionsToBuild verifies a $hot directive
-// typed inside /ask (no /workspace marker) does NOT dead-end on a permission
-// error: the parser pipeline re-resolves the directive's execution context
-// (/build) and the dispatcher transitions internally and continues — the user
-// is never forced to repeat `/build`.
-func TestHandleInputHotFromAskAutoTransitionsToBuild(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
-
-	m := newTestModel()
+// TestHandleInputHotFromAskNoModeTransition verifies the new contract: a $hot
+// directive typed inside /ask does NOT trigger a mode transition. Modes are
+// presentation contexts only; the execution is resolved by the unified gateway
+// and never depends on a /build switch.
+func TestHandleInputHotFromAskNoModeTransition(t *testing.T) {
+	m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "x"}}}, nil)
 	m.resolver.Set(modes.ModeAsk)
-	m.state = StateChat
-	m.awaitingConfirmation = false
-	m.pendingProposals = nil
-	m.streaming = false
-	m.agentRunning = false
 
 	cmd := m.handleInput("$hot fix login timeout @index.html")
 	if cmd == nil {
-		t.Fatal("handleInput($hot in ask) returned nil cmd — continuous execution must dispatch")
+		t.Fatal("handleInput($hot in ask) returned nil cmd — execution must dispatch")
 	}
-	if got := m.resolver.Current(); got != modes.ModeBuild {
-		t.Errorf("workspace = /%s, want /build after internal auto-transition", got)
+	// Modes are presentation contexts: $hot must NOT auto-switch to /build.
+	if got := m.resolver.Current(); got != modes.ModeAsk {
+		t.Errorf("mode = /%s, want /ask (no mode transition — the gateway decides the path)", got)
 	}
-	found := false
-	for _, r := range m.records {
-		if strings.Contains(r.text, "[HOTFIX] Urgent hotfix:") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("expected $hot to dispatch the hotfix pipeline after the internal /build transition")
+	if !hasDispatchRecord(m, "resolving hotfix intent deterministically") {
+		t.Error("expected $hot to dispatch through the unified gateway")
 	}
 }
 
 // ── Directive routing preserved through the AST dispatch ────────────────
 
 // TestHandleInputHotFromBuild verifies the bare $hot directive inside /build
-// still dispatches through the mode-scoped handler after the parser pipeline.
-// The directive tail is the canonical reconstruction (goal then @scopes), so
-// the hotfix prompt carries the goal and the LICENSE scope.
+// still dispatches through the unified gateway after the parser pipeline. The
+// directive tail is the canonical reconstruction (goal then @scopes), so the
+// execution prompt carries the goal and the LICENSE scope.
 func TestHandleInputHotFromBuild(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
-
-	m := newTestModel()
+	m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "x"}}}, map[string]string{
+		"LICENSE": "Copyright 2023\nAll rights reserved.\n",
+	})
 	m.resolver.Set(modes.ModeBuild)
-	m.state = StateChat
-	m.awaitingConfirmation = false
-	m.pendingProposals = nil
-	m.streaming = false
-	m.agentRunning = false
 
 	cmd := m.handleInput("$hot rename author in @LICENSE to Hashirama")
 	if cmd == nil {
 		t.Fatal("handleInput($hot in build) returned nil cmd — hotfix dispatch did not fire")
 	}
-	found := false
-	for _, r := range m.records {
-		if strings.Contains(r.text, "[HOTFIX] Urgent hotfix:") && strings.Contains(r.text, "Hashirama") && strings.Contains(r.text, "@LICENSE") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("expected $hot to dispatch the hotfix pipeline with the goal and @LICENSE scope")
+	if !hasDispatchRecord(m, "resolving hotfix intent deterministically") {
+		t.Error("expected $hot to dispatch through the unified gateway")
 	}
 }
 
-// TestHandleInputPromptRoutesToAsk verifies $prompt still transitions to /ask
-// after moving its routing into the AST dispatch (routePromptDirective).
-func TestHandleInputPromptRoutesToAsk(t *testing.T) {
-	m := newTestModel()
+// TestHandleInputPromptNoModeTransition verifies the new contract: $prompt is an
+// EXECUTION REQUEST, not a message command. It never transitions to /ask — the
+// gateway resolves the strategy and the runtime executes.
+func TestHandleInputPromptNoModeTransition(t *testing.T) {
+	m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "plan"}}}, nil)
 	m.resolver.Set(modes.ModeBuild)
 
 	cmd := m.handleInput("$prompt design a plugin architecture")
 	if cmd == nil {
-		t.Fatal("handleInput($prompt) returned nil cmd — /ask handoff did not fire")
+		t.Fatal("handleInput($prompt) returned nil cmd — execution request did not fire")
 	}
-	if got := m.resolver.Current(); got != modes.ModeAsk {
-		t.Errorf("workspace = /%s, want /ask after $prompt router", got)
+	if got := m.resolver.Current(); got != modes.ModeBuild {
+		t.Errorf("mode = /%s, want /build (no transition — $prompt is an execution request)", got)
+	}
+	if !hasDispatchRecord(m, "resolving intent deterministically") {
+		t.Error("expected $prompt to dispatch through the unified gateway")
 	}
 }
 
@@ -330,40 +336,23 @@ func TestHandleInputLogFromReview(t *testing.T) {
 	}
 }
 
-// TestHandleInputHotFromInvestigateAutoTransitionsToBuild verifies a $hot
-// directive typed inside /investigate auto-transitions into /build (the
-// directive's execution context) and continues, instead of dead-ending on a
-// write-permission denial. An explicit /ask / /investigate marker in the same
-// line still honors the declared context (see TestHandleInputExplicitAskMarker
-// below).
-func TestHandleInputHotFromInvestigateAutoTransitionsToBuild(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
-
-	m := newTestModel()
+// TestHandleInputHotFromInvestigateNoModeTransition verifies the new contract:
+// a $hot directive typed inside /investigate does NOT auto-transition into
+// /build. Modes are presentation contexts only; the unified gateway resolves
+// the execution path.
+func TestHandleInputHotFromInvestigateNoModeTransition(t *testing.T) {
+	m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "x"}}}, nil)
 	m.resolver.Set(modes.ModeInvestigate)
-	m.state = StateChat
-	m.awaitingConfirmation = false
-	m.pendingProposals = nil
-	m.streaming = false
-	m.agentRunning = false
 
 	cmd := m.handleInput("$hot fix x @index.html")
 	if cmd == nil {
-		t.Fatal("handleInput($hot in investigate) returned nil cmd — continuous execution must dispatch")
+		t.Fatal("handleInput($hot in investigate) returned nil cmd — execution must dispatch")
 	}
-	if got := m.resolver.Current(); got != modes.ModeBuild {
-		t.Errorf("workspace = /%s, want /build after internal auto-transition", got)
+	if got := m.resolver.Current(); got != modes.ModeInvestigate {
+		t.Errorf("mode = /%s, want /investigate (no mode transition — the gateway decides the path)", got)
 	}
-	found := false
-	for _, r := range m.records {
-		if strings.Contains(r.text, "[HOTFIX] Urgent hotfix:") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("expected $hot to dispatch the hotfix pipeline after the internal /build transition")
+	if !hasDispatchRecord(m, "resolving hotfix intent deterministically") {
+		t.Error("expected $hot to dispatch through the unified gateway")
 	}
 }
 

@@ -12,6 +12,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/core/authorization"
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 )
@@ -185,15 +187,39 @@ func TestRegressionRuntimeDispatchesHotfixAfterAmbiguity(t *testing.T) {
 		t.Fatalf("after clarify: state=%v focused=%v", m2.state, m2.ti.Focused())
 	}
 
-	// A new $hot request is accepted and begins a new operation.
-	m2.ti.SetValue("$hot add a README file @README.md")
-	m3, cmd := m2.submitEnter()
-	after := m3.(*model)
+	// A new $hot request is accepted and dispatches through the unified
+	// gateway; the fresh OpHotfix operation begins at the proposal terminal.
+	// Wire the runtime boundary (the ambiguity card was built by the legacy
+	// path, which does not wire it).
+	m2.workspaceRoot = "."
+	m2.gateway = execution.NewIntentGateway(".")
+	m2.executor = execution.NewRuntimeExecutor(".", m2.cfg, mock, nil, "")
+	trivial := execution.NewVerifier(".")
+	trivial.SetCustomSteps([]execution.VerificationStep{{Name: "noop", Command: "true", Optional: false}})
+	m2.executor.SetVerifier(trivial)
+	m2.executor.SetAuthorization(&authorization.MutationAuthorization{
+		ID:        authorization.NewAuthorizationID(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	cmd := m2.handleInput("$hot add a note file @note.md")
 	if cmd == nil {
 		t.Fatal("new $hot returned nil cmd after ambiguity")
 	}
-	if after.activeOp == nil {
-		t.Fatal("new $hot did not begin a fresh operation after ambiguity")
+	msg := cmd()
+	gem, ok := msg.(gatedExecutionMsg)
+	if !ok {
+		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
+	}
+	if gem.err != nil {
+		t.Fatalf("gate err: %v", gem.err)
+	}
+	if gem.res == nil {
+		t.Fatal("nil gate result")
+	}
+	res, _ = m2.executionResultUpdate(executionResultMsg{res: gem.res})
+	after := res.(*model)
+	if after.activeOp == nil || after.activeOp.Kind != OpHotfix {
+		t.Fatal("new $hot did not begin a fresh hotfix operation after ambiguity")
 	}
 }
 

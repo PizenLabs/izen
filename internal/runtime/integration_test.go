@@ -90,12 +90,15 @@ func TestAskPlanBuildFlow(t *testing.T) {
 		t.Fatalf("build submit: %v", err)
 	}
 
-	// approvals
-	if err := app.Runtime.Execute(ctx, runtime.ApprovePatchCmd{PatchID: "patch-a"}); err != nil {
-		t.Fatalf("approve: %v", err)
+	// approvals: the runtime NEVER fabricates a mutation. Approving or
+	// rejecting a patch with no pending execution must fail deterministically
+	// (Rule 3: no fake states). Real approval is exercised in the
+	// RuntimeExecutor tests, which stage a genuine pending mutation first.
+	if err := app.Runtime.Execute(ctx, runtime.ApprovePatchCmd{PatchID: "patch-a"}); err == nil {
+		t.Fatal("approve of non-pending patch should fail (no fake mutation)")
 	}
-	if err := app.Runtime.Execute(ctx, runtime.RejectPatchCmd{PatchID: "patch-b", Reason: "too risky"}); err != nil {
-		t.Fatalf("reject: %v", err)
+	if err := app.Runtime.Execute(ctx, runtime.RejectPatchCmd{PatchID: "patch-b", Reason: "too risky"}); err == nil {
+		t.Fatal("reject of non-pending patch should fail (no fake mutation)")
 	}
 	if err := app.Runtime.Execute(ctx, runtime.CancelCmd{Reason: "stop"}); err != nil {
 		t.Fatalf("cancel: %v", err)
@@ -106,14 +109,12 @@ func TestAskPlanBuildFlow(t *testing.T) {
 		t.Fatalf("final phase = %s, want build", got)
 	}
 
-	// Presentation events must reflect every stage.
+	// Presentation events must reflect every stage. PatchApplied/PatchRejected
+	// are intentionally absent: no real mutation was staged or resolved.
 	wantEvents := []runtime.PresentationEventType{
 		runtime.PresentationCommandReceived,
 		runtime.PresentationIntentParsed,
 		runtime.PresentationPhaseChanged,
-		runtime.PresentationPlanStaged,
-		runtime.PresentationPatchApplied,
-		runtime.PresentationPatchRejected,
 		runtime.PresentationStageCompleted,
 	}
 	for _, typ := range wantEvents {
@@ -122,7 +123,8 @@ func TestAskPlanBuildFlow(t *testing.T) {
 		}
 	}
 
-	// The plan staging must have produced the two-line task list in the ledger.
+	// The plan staging must NOT have produced a fabricated task list: the fake
+	// newline-splitting projection was removed.
 	snap := app.Ledger.Snapshot()
 	if len(snap.Commands) == 0 {
 		t.Error("ledger: expected command entries")
@@ -130,14 +132,13 @@ func TestAskPlanBuildFlow(t *testing.T) {
 	if snap.Phase != "build" {
 		t.Errorf("ledger phase = %q, want build", snap.Phase)
 	}
-	if snap.Plan.TaskCount != 2 {
-		t.Errorf("ledger plan task count = %d, want 2", snap.Plan.TaskCount)
+	if snap.Plan.TaskCount != 0 {
+		t.Errorf("ledger plan task count = %d, want 0 (no fake plan)", snap.Plan.TaskCount)
 	}
-	if len(snap.Patches) != 1 {
-		t.Errorf("ledger patches = %d, want 1 applied", len(snap.Patches))
-	}
-	if len(snap.Failures) != 0 {
-		t.Errorf("ledger failures = %d, want 0", len(snap.Failures))
+	// Two approval attempts were truthfully rejected (no pending mutations), so
+	// the ledger records two failures — never a fabricated success.
+	if len(snap.Failures) != 2 {
+		t.Errorf("ledger failures = %d, want 2 (the two rejected approval attempts)", len(snap.Failures))
 	}
 }
 

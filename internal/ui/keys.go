@@ -362,30 +362,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// The router classified the prompt with confidence below the policy
 		// threshold. Digits select a mode directly, ←/→ cycle the highlight,
 		// Enter confirms the highlighted mode, Esc falls back to /ask.
-		if m.pendingRouteConfirm && len(m.pendingRouteOptions) > 0 {
-			switch msg.String() {
-			case "1", "2", "3", "4", "5":
-				idx := int(msg.String()[0] - '1')
-				if idx >= 0 && idx < len(m.pendingRouteOptions) {
-					m.pendingRouteIdx = idx
-					m.refreshViewportContent()
-					return m, m.confirmRouteSelection(m.pendingRouteOptions[idx])
-				}
-			case "left":
-				m.pendingRouteIdx = (m.pendingRouteIdx - 1 + len(m.pendingRouteOptions)) % len(m.pendingRouteOptions)
-				m.refreshViewportContent()
-				return m, nil
-			case "right":
-				m.pendingRouteIdx = (m.pendingRouteIdx + 1) % len(m.pendingRouteOptions)
-				m.refreshViewportContent()
-				return m, nil
-			case "enter":
-				return m, m.confirmRouteSelection(m.pendingRouteOptions[m.pendingRouteIdx])
-			case "esc":
-				return m, m.cancelRouteSelection()
-			}
-		}
-
 		// ── Effort Selector (←/→) ────────────────────────────────────
 		if msg.Type == tea.KeyLeft {
 			if m.currentEffort > EffortAuto {
@@ -483,6 +459,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
 				task := m.pendingHotfixTask
 				patch := m.pendingHotfixPatch
+				executorPatchID := m.executorPendingPatchID
 				m.pendingHotfixTask = nil
 				m.pendingHotfixPatch = nil
 				m.pendingProposals = nil
@@ -491,9 +468,25 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.recalcViewportHeight()
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
-				m.push(roleSystem, infoStyle.Render(
-					fmt.Sprintf("  "+Icon.Success+" Approved — applying hotfix patch to %s...", patch.File)))
 
+				// ── EXECUTOR-OWNED APPROVAL (authority migration) ──
+				// When the proposal came from the RuntimeExecutor, the apply,
+				// verification and commit happen inside the runtime via
+				// Approve. The runtime emits the mutation lifecycle events; the
+				// UI renders them and the returned executionResultMsg. The UI
+				// never calls PatchManager.Apply here.
+				if executorPatchID != "" {
+					m.executorPendingPatchID = ""
+					m.push(roleSystem, infoStyle.Render(
+						fmt.Sprintf("  "+Icon.Success+" Approved — runtime applying patch to %s...", patch.File)))
+					return m, tea.Batch(
+						func() tea.Msg { return agentStartMsg{label: "runtime hotfix apply"} },
+						m.runExecutorApproveCmd(executorPatchID),
+						m.smoothStreamTickCmd(),
+					)
+				}
+
+				// ── LEGACY UI-OWNED APPLY (pre-migration path) ──────
 				// The runtime approve_patch projection is NOT dispatched here:
 				// it must only fire AFTER the authoritative apply (budget /
 				// authorization gated) succeeds, otherwise a budget-blocked
@@ -509,9 +502,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
 				rejectedPath := m.pendingHotfixTask.Target
+				executorPatchID := m.executorPendingPatchID
 				m.pendingHotfixTask = nil
 				m.pendingHotfixPatch = nil
 				m.pendingProposals = nil
+				m.executorPendingPatchID = ""
 				m.resolveApprovalState()
 				m.ti.Focus()
 				m.recalcViewportHeight()
@@ -528,6 +523,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
+				if executorPatchID != "" {
+					return m, m.runExecutorRejectCmd(executorPatchID, "hotfix rejected by developer")
+				}
 				return m, m.runtimeRejectCmd(rejectedPath, "hotfix rejected by developer")
 			}
 			return m, nil

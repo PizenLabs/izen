@@ -75,6 +75,27 @@ const (
 	// cut short by a context deadline or cancellation so tokens already billed
 	// by the provider are never silently zeroed in local telemetry.
 	EventStreamUsage = "stream.usage"
+
+	// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──────────
+	// These events are the single authoritative stream of a full execution
+	// through the RuntimeExecutor. They are emitted ONLY at real runtime
+	// boundaries — never synthesised by the presentation layer — so the UI can
+	// render a truthful execution timeline purely from events.
+	EventExecutionStarted      = "execution.started"
+	EventStrategySelected      = "execution.strategy.selected"
+	EventTargetResolved        = "execution.target.resolved"
+	EventContextPrepared       = "execution.context.prepared"
+	EventModelInvoked          = "execution.model.invoked"
+	EventArtifactProduced      = "execution.artifact.produced"
+	EventMutationStarted       = "execution.mutation.started"
+	EventMutationCompleted     = "execution.mutation.completed"
+	EventVerificationCompleted = "execution.verification.completed"
+	EventExecutionFinished     = "execution.finished"
+	// EventApprovalRequired is the canonical runtime approval event emitted when
+	// a RuntimeExecutor execution stops at the human-in-the-loop approval gate.
+	// It is distinct from EventApprovalRequested (the patch-engine Tier-4
+	// fallback event) — it carries the runtime request + target.
+	EventApprovalRequired = "approval.required"
 )
 
 // FailureClassification is the taxonomy used by EventExecutionFailed. It is
@@ -259,6 +280,96 @@ type StreamUsagePayload struct {
 	OutputTokens int
 	Interrupted  bool
 	Reason       string
+}
+
+// ExecutionStartedPayload opens a runtime execution. RequestID links every
+// subsequent lifecycle event of the same execution.
+type ExecutionStartedPayload struct {
+	RequestID string
+	Mode      string
+	Prompt    string
+}
+
+// StrategySelectedPayload records the deterministic strategy decision the
+// runtime selected for the request. Strategy is the canonical name
+// (targeted_mutation, multi_file_planning, repository_investigation, ...).
+type StrategySelectedPayload struct {
+	RequestID      string
+	Strategy       string
+	ModelRequired  bool
+	StrategyReason string
+}
+
+// TargetResolvedPayload records one deterministically resolved mutation target.
+type TargetResolvedPayload struct {
+	RequestID string
+	Target    string
+	Exists    bool
+	Source    string
+}
+
+// ContextPreparedPayload records the minimum-sufficient context compiled
+// before any model invocation.
+type ContextPreparedPayload struct {
+	RequestID string
+	Channels  []string
+	Tokens    int
+}
+
+// ModelInvokedPayload records a single provider invocation. TokenInput/Output
+// are the authoritative provider-reported usage of the completed call.
+type ModelInvokedPayload struct {
+	RequestID   string
+	Model       string
+	TokenInput  int
+	TokenOutput int
+}
+
+// ArtifactProducedPayload records a parsed artifact (e.g. a patch) produced by
+// a model invocation.
+type ArtifactProducedPayload struct {
+	RequestID string
+	Kind      string // "patch", "plan", "explanation", ...
+	Target    string
+}
+
+// MutationStartedPayload records that the runtime began applying a mutation.
+type MutationStartedPayload struct {
+	RequestID string
+	Targets   []string
+}
+
+// MutationCompletedPayload records a mutation outcome. Outcome uses the
+// execution.MutationOutcome vocabulary (committed, rolled_back, apply_failed,
+// cancelled, ...).
+type MutationCompletedPayload struct {
+	RequestID string
+	Target    string
+	Outcome   string
+}
+
+// VerificationCompletedPayload records the deterministic verification result of
+// a mutation. Passed is the verifier's real verdict; Steps lists the executed
+// step names. It is never rendered "verified" without this real result.
+type VerificationCompletedPayload struct {
+	RequestID string
+	Passed    bool
+	Steps     []string
+}
+
+// ExecutionFinishedPayload is the terminal event of a runtime execution.
+// Success is true only when every stage reached a real terminal success.
+type ExecutionFinishedPayload struct {
+	RequestID string
+	Success   bool
+	Outcome   string
+}
+
+// ApprovalRequiredPayload carries a RuntimeExecutor approval-gate request.
+type ApprovalRequiredPayload struct {
+	RequestID string
+	Target    string
+	Preview   string
 }
 
 // ── Generic event implementation ────────────────────────────────────────────
@@ -478,4 +589,63 @@ func NewStreamUsage(model string, inputTokens, outputTokens int, interrupted boo
 		Interrupted:  interrupted,
 		Reason:       reason,
 	})
+}
+
+// ── Runtime execution lifecycle constructors ────────────────────────────────
+
+// NewExecutionStarted publishes the start of a runtime execution.
+func NewExecutionStarted(requestID, mode, prompt string) DomainEvent {
+	return newEvent(EventExecutionStarted, ExecutionStartedPayload{RequestID: requestID, Mode: mode, Prompt: prompt})
+}
+
+// NewStrategySelected publishes the deterministic strategy decision.
+func NewStrategySelected(requestID, strategy string, modelRequired bool, reason string) DomainEvent {
+	return newEvent(EventStrategySelected, StrategySelectedPayload{
+		RequestID: requestID, Strategy: strategy, ModelRequired: modelRequired, StrategyReason: reason,
+	})
+}
+
+// NewTargetResolved publishes one resolved mutation target.
+func NewTargetResolved(requestID, target string, exists bool, source string) DomainEvent {
+	return newEvent(EventTargetResolved, TargetResolvedPayload{RequestID: requestID, Target: target, Exists: exists, Source: source})
+}
+
+// NewContextPrepared publishes the compiled context envelope.
+func NewContextPrepared(requestID string, channels []string, tokens int) DomainEvent {
+	return newEvent(EventContextPrepared, ContextPreparedPayload{RequestID: requestID, Channels: channels, Tokens: tokens})
+}
+
+// NewModelInvoked publishes one provider invocation with its authoritative usage.
+func NewModelInvoked(requestID, model string, tokenInput, tokenOutput int) DomainEvent {
+	return newEvent(EventModelInvoked, ModelInvokedPayload{RequestID: requestID, Model: model, TokenInput: tokenInput, TokenOutput: tokenOutput})
+}
+
+// NewArtifactProduced publishes a parsed artifact from a model invocation.
+func NewArtifactProduced(requestID, kind, target string) DomainEvent {
+	return newEvent(EventArtifactProduced, ArtifactProducedPayload{RequestID: requestID, Kind: kind, Target: target})
+}
+
+// NewMutationStarted publishes the start of a mutation application.
+func NewMutationStarted(requestID string, targets []string) DomainEvent {
+	return newEvent(EventMutationStarted, MutationStartedPayload{RequestID: requestID, Targets: targets})
+}
+
+// NewMutationCompleted publishes a mutation outcome for one target.
+func NewMutationCompleted(requestID, target, outcome string) DomainEvent {
+	return newEvent(EventMutationCompleted, MutationCompletedPayload{RequestID: requestID, Target: target, Outcome: outcome})
+}
+
+// NewVerificationCompleted publishes the verifier's real result.
+func NewVerificationCompleted(requestID string, passed bool, steps []string) DomainEvent {
+	return newEvent(EventVerificationCompleted, VerificationCompletedPayload{RequestID: requestID, Passed: passed, Steps: steps})
+}
+
+// NewExecutionFinished publishes the terminal outcome of a runtime execution.
+func NewExecutionFinished(requestID string, success bool, outcome string) DomainEvent {
+	return newEvent(EventExecutionFinished, ExecutionFinishedPayload{RequestID: requestID, Success: success, Outcome: outcome})
+}
+
+// NewApprovalRequired publishes a RuntimeExecutor approval-gate request.
+func NewApprovalRequired(requestID, target, preview string) DomainEvent {
+	return newEvent(EventApprovalRequired, ApprovalRequiredPayload{RequestID: requestID, Target: target, Preview: preview})
 }

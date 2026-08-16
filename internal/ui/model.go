@@ -44,7 +44,6 @@ import (
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 	riview "github.com/PizenLabs/izen/internal/review"
-	"github.com/PizenLabs/izen/internal/router"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
@@ -358,16 +357,6 @@ func respUsage(resp *ai.Response) (input, output int, known bool) {
 
 type applyAllResultMsg struct {
 	results []mutationResultMsg
-}
-
-// routerResultMsg carries the outcome of the Hybrid Intent Gateway
-// classification for a free-form prompt. It is produced by an async tea.Cmd
-// because the semantic fallback may invoke the LLM and must never block the
-// Bubble Tea event loop.
-type routerResultMsg struct {
-	line   string
-	result router.ClassificationResult
-	err    error
 }
 
 type shellOutputMsg struct {
@@ -916,17 +905,6 @@ type model struct {
 	pendingProposals     []SemanticProposal
 	acceptAll            bool
 
-	// Hybrid-intent-gateway confirmation: when the router classifies a
-	// free-form prompt with confidence below the threshold
-	// (ConfirmationRequirement), the UI freezes in StateAwaitingApproval and
-	// presents an interactive mode-selection prompt instead of acting on a
-	// blind guess. pendingRouteIdx is the highlighted option index.
-	pendingRouteConfirm bool
-	pendingRouteInput   string
-	pendingRouteResult  router.ClassificationResult
-	pendingRouteOptions []modes.Mode
-	pendingRouteIdx     int
-
 	// Accepted proposals (collapsed single-line summaries)
 	acceptedProposals []acceptedProposal
 
@@ -948,6 +926,23 @@ type model struct {
 	execEng    *execution.Engine
 	planStore  *plan.PlanStore
 	planEngine *plan.Engine // structural plan engine wired for ledger-driven execution
+
+	// executor is the RuntimeExecutor authority boundary (composition root).
+	// It owns provider invocation, patch creation, the mutation lifecycle and
+	// verification on the migrated paths ($prompt targeted mutation). The UI
+	// submits ExecuteRequests and approves/rejects via this boundary — it never
+	// calls a provider or a PatchManager directly on those paths. Nil only in
+	// headless/test harnesses that do not wire one.
+	executor *execution.RuntimeExecutor
+	// gateway is the unified IntentGateway: every user action (bare text,
+	// $prompt, $hot) crosses it to produce an ExecuteRequest with an
+	// unconditional Strategy.Select profile. The UI never routes by mode or
+	// triggers hidden executions on the migrated paths.
+	gateway *execution.IntentGateway
+	// executorPendingPatchID is the approval-held patch ID of the executor
+	// execution currently staged in the proposal dock. Non-empty routes the
+	// approval keys through RuntimeExecutor.Approve/Reject.
+	executorPendingPatchID string
 
 	// microkernel is the immutable microkernel pipeline adapter. It primes
 	// plan/investigate command handling for greenfield generation prompts so
@@ -1451,14 +1446,6 @@ type model struct {
 	// presSink forwards runtime.PresentationEvents into the Bubble Tea event
 	// loop as presentationEventMsg. It must be closed on shutdown.
 	presSink *presentation.EventSink
-
-	// Hybrid intent gateway: the router package runs the deterministic fast
-	// path first and falls back to the semantic PromptIntentClassifier when no
-	// deterministic signal matches. Route() returns an optional
-	// ConfirmationRequirement at low confidence, surfaced as an interactive
-	// mode-selection prompt before dispatch. Nil when no provider is available
-	// (routes degenerate to the deterministic fast path only).
-	intentRouter *router.Router
 
 	// Execution orchestrator: maps logical phases (Idle/Ask/Investigate/Plan/
 	// Build/Review) onto the single WorkflowStateMachine, sharing the
@@ -1979,6 +1966,28 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			p.Attempts, selfHealOutputSuffix(p.Output))
 	case events.StageCompletedPayload:
 		m.logActivity("[stage] %s completed (%s)", p.Stage, p.Summary)
+	case events.ExecutionStartedPayload:
+		m.logActivity("[runtime] execution started: %s (mode %s)", truncateForActivity(p.Prompt), p.Mode)
+	case events.StrategySelectedPayload:
+		m.logActivity("[runtime] strategy selected: %s", p.Strategy)
+	case events.TargetResolvedPayload:
+		m.logActivity("[runtime] target resolved: %s (exists=%t, %s)", p.Target, p.Exists, p.Source)
+	case events.ContextPreparedPayload:
+		m.logActivity("[runtime] context prepared: %d channel(s), ~%d tokens", len(p.Channels), p.Tokens)
+	case events.ModelInvokedPayload:
+		m.logActivity("[runtime] model invoked: %s", p.Model)
+	case events.ArtifactProducedPayload:
+		m.logActivity("[runtime] artifact produced: %s (%s)", p.Kind, p.Target)
+	case events.MutationStartedPayload:
+		m.logActivity("[runtime] mutation started: %d target(s)", len(p.Targets))
+	case events.MutationCompletedPayload:
+		m.logActivity("[runtime] mutation completed: %s (%s)", p.Target, p.Outcome)
+	case events.VerificationCompletedPayload:
+		m.logActivity("[runtime] verification %s: %d step(s)", verificationTick(p.Passed), len(p.Steps))
+	case events.ExecutionFinishedPayload:
+		m.logActivity("[runtime] execution finished: success=%t (%s)", p.Success, p.Outcome)
+	case events.ApprovalRequiredPayload:
+		m.logActivity("[runtime] approval required: %s", p.Target)
 	case events.IntentClassifiedPayload:
 		// Hybrid Intent Gateway classification outcome projected onto the
 		// activity log. Ambiguity is surfaced so the operator sees WHY the UI
@@ -2102,7 +2111,6 @@ func (m *model) unwindBuildFailure() {
 	m.hotfixCandidatesMode = false
 	m.pendingHotfixCandidate = nil
 	m.acceptAll = false
-	m.pendingRouteConfirm = false
 	if m.workflowSM != nil {
 		// From StateBuilding/StateFailed/StateRepairing the canonical exit is
 		// a reset back to StateIdle, from which every forward phase is reachable.
@@ -2173,7 +2181,6 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	m.hotfixCandidatesMode = false
 	m.pendingHotfixCandidate = nil
 	m.acceptAll = false
-	m.pendingRouteConfirm = false
 	if m.toolCallBuffer != nil {
 		m.toolCallBuffer.Reject()
 	}
@@ -2341,6 +2348,19 @@ func (m *model) completeFastTrackBuild() (tea.Model, tea.Cmd) {
 // never inspects the original domain event. Only ever runs on the UI
 // goroutine, so all model mutation here is race-free.
 func (m *model) handlePresentationEvent(ev appruntime.PresentationEvent) {
+	// ── DEDUPLICATION (Rule 4: one execution path) ─────────────────────
+	// IntentClassified / PhaseChanged / ApprovalRequested are ALSO subscribed
+	// as raw domain events (program.go), which carry the structured payloads
+	// the UI projects (viewState, approval gate). Rendering both the raw line
+	// and the translated line would duplicate every one of them. The translated
+	// presentation event is therefore dropped for these three types — the raw
+	// projection is the single render.
+	switch ev.Type {
+	case appruntime.PresentationIntentClassified,
+		appruntime.PresentationPhaseChanged,
+		appruntime.PresentationApprovalRequested:
+		return
+	}
 	switch ev.Severity {
 	case appruntime.SeveritySuccess:
 		m.logActivity("%s", successBannerStyle.Render(ev.Summary))
@@ -2528,6 +2548,15 @@ func selfHealOutputSuffix(output string) string {
 func truncateForActivity(s string) string {
 	s = strings.TrimSpace(s)
 	return truncateANSI(s, 90)
+}
+
+// verificationTick renders the verifier's real verdict as a truthful glyph.
+// "passed"/"failed" only ever appear from a real VerificationCompleted event.
+func verificationTick(passed bool) string {
+	if passed {
+		return "passed"
+	}
+	return "failed"
 }
 
 // push appends a record. Records are flushed to the terminal's native

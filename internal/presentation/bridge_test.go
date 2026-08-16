@@ -114,11 +114,13 @@ func TestBridge_ExecuteRoutesCommands(t *testing.T) {
 	if app.Workflow.Phase().String() != "plan" {
 		t.Fatalf("phase = %s, want plan", app.Workflow.Phase())
 	}
-	if err := b.ApprovePatch(context.Background(), "p1"); err != nil {
-		t.Fatalf("ApprovePatch: %v", err)
+	// The runtime never fabricates a mutation: approving/rejecting a patch with
+	// no pending execution must fail deterministically (Rule 3).
+	if err := b.ApprovePatch(context.Background(), "p1"); err == nil {
+		t.Fatal("ApprovePatch of non-pending patch should fail (no fake mutation)")
 	}
-	if err := b.RejectPatch(context.Background(), "p2", "too risky"); err != nil {
-		t.Fatalf("RejectPatch: %v", err)
+	if err := b.RejectPatch(context.Background(), "p2", "too risky"); err == nil {
+		t.Fatal("RejectPatch of non-pending patch should fail (no fake mutation)")
 	}
 	if err := b.Cancel(context.Background(), "stop"); err != nil {
 		t.Fatalf("Cancel: %v", err)

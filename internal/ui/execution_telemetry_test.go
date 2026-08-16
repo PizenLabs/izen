@@ -12,6 +12,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
@@ -36,69 +37,57 @@ func hotfixModelWithProvider(t *testing.T, mock *mockProvider) *model {
 }
 
 // TestExecutionTelemetry_HotfixSingleProviderInvocation asserts a successful
-// $hot performs exactly ONE provider invocation and the operation telemetry
-// records exactly one invocation with the correct operation ID (tests #1/#13).
+// $hot performs exactly ONE provider invocation, owned by the RuntimeExecutor
+// (recorded in the runtime proof), and the UI's operation telemetry records
+// ZERO invocations — the UI owns no provider calls on the migrated path.
 func TestExecutionTelemetry_HotfixSingleProviderInvocation(t *testing.T) {
 	mock := &mockProvider{responses: []*ai.Response{{
 		Content:     "```\nMIT License\n\nCopyright (c) 2026\n```",
 		TokenInput:  12,
 		TokenOutput: 50,
 	}}}
-	m := hotfixModelWithProvider(t, mock)
+	m := gatedDispatchModel(t, mock, nil)
+	m.resolver.Set(modes.ModeBuild)
 
-	cmd := m.handleInput("$hot add a MIT LICENSE file @LICENSE")
+	cmd := m.handleInput("$hot add a note file @note.md")
 	if cmd == nil {
 		t.Fatal("handleInput returned nil for $hot")
 	}
-	if m.activeOp == nil || m.activeOp.Kind != OpHotfix {
-		t.Fatalf("expected exactly one hotfix operation at dispatch, got: %+v", m.activeOp)
-	}
-	opID := m.activeOp.ID
-	if opID == "" {
-		t.Fatal("operation ID is empty")
+	if mock.callCount != 0 {
+		t.Fatalf("provider invoked %d times before the execution ran, want 0", mock.callCount)
 	}
 
-	// Run the generation command (drop animation ticks).
-	task := &plan.Task{StepNum: 0, Type: "FILE_MUTATE", Target: "LICENSE", Description: "add a MIT LICENSE file @LICENSE"}
-	msg := m.proposeHotfixPatch(task)()
-	hp, ok := msg.(hotfixProposalMsg)
+	msg := cmd()
+	gem, ok := msg.(gatedExecutionMsg)
 	if !ok {
-		t.Fatalf("expected hotfixProposalMsg, got %T", msg)
+		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
 	}
-	if hp.Err != nil {
-		t.Fatalf("hotfix generation failed: %v", hp.Err)
+	if gem.err != nil {
+		t.Fatalf("gate err: %v", gem.err)
+	}
+	if gem.res == nil {
+		t.Fatal("nil gate result")
 	}
 	if mock.callCount != 1 {
 		t.Fatalf("provider called %d times for one $hot, want exactly 1", mock.callCount)
 	}
-
-	// The telemetry record reflects the single provider invocation and the
-	// same operation ID.
-	if m.activeOp == nil || m.activeOp.Telemetry == nil {
-		t.Fatal("operation telemetry not created")
+	// The runtime proof carries the single provider invocation.
+	if len(gem.res.Proof.ModelInvocations) != 1 {
+		t.Fatalf("proof model invocations = %d, want 1", len(gem.res.Proof.ModelInvocations))
 	}
-	snap := m.activeOp.Telemetry.Snapshot()
-	if snap.OpID != opID {
-		t.Fatalf("telemetry OpID = %q, want %q (stable operation identity)", snap.OpID, opID)
-	}
-	if snap.Invocations != 1 {
-		t.Fatalf("telemetry invocations = %d, want exactly 1", snap.Invocations)
-	}
-	if snap.Retries != 0 {
-		t.Fatalf("telemetry retries = %d, want 0", snap.Retries)
+	if gem.res.Proof.ModelInvocations[0].TokenOutput != 50 {
+		t.Fatalf("proof token output = %d, want 50 (provider usage is authoritative)", gem.res.Proof.ModelInvocations[0].TokenOutput)
 	}
 
-	// Terminal proposal → operation finalized → telemetry terminal.
-	res, _ := m.Update(hp)
+	// Terminal proposal → OpHotfix operation begins at the approval gate.
+	res, _ := m.executionResultUpdate(executionResultMsg{res: gem.res})
 	m2 := res.(*model)
-	if m2.activeOp != nil {
-		t.Fatalf("hotfix operation not finalized: %+v", m2.activeOp)
+	if m2.activeOp == nil || m2.activeOp.Kind != OpHotfix {
+		t.Fatalf("expected an OpHotfix operation at the proposal terminal, got %+v", m2.activeOp)
 	}
-	if m2.lastExecutionTelemetry == nil || !m2.lastExecutionTelemetry.Finalized() {
-		t.Fatal("telemetry not finalized with the operation")
-	}
-	if m2.lastExecutionSnapshot.OpID != opID {
-		t.Fatalf("finalized snapshot OpID = %q, want %q", m2.lastExecutionSnapshot.OpID, opID)
+	// The UI's operation telemetry records ZERO invocations — the UI made none.
+	if snap := m2.activeOp.Telemetry.Snapshot(); snap.Invocations != 0 {
+		t.Fatalf("UI telemetry invocations = %d, want 0 (the runtime owns all invocations)", snap.Invocations)
 	}
 }
 

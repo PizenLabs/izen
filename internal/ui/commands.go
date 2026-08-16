@@ -247,11 +247,11 @@ func (m *model) handleInput(line string) tea.Cmd {
 
 	// Directive- and global-bearing intents (including the /review $test
 	// composite and the $prompt /ask router) are dispatched structurally from
-	// the AST: workspace transition first, then commands, then directives.
-	// Bare workspace switches and free-form goals fall through to the legacy
-	// string routing below, which already handles them.
+	// the AST: explicit workspace transition first, then commands, then
+	// directives. Bare workspace switches and free-form goals fall through to
+	// the legacy string routing below, which already handles them.
 	if len(ast.Directives) > 0 || len(ast.GlobalCommands) > 0 {
-		return m.dispatchASTIntent(ast)
+		return m.dispatchASTIntent(ast, line)
 	}
 
 	if mode, content, ok := parseModeShorthand(line); ok {
@@ -345,41 +345,14 @@ func (m *model) handleInput(line string) tea.Cmd {
 	m.sess.AddMessage("user", line, 5)
 	_ = m.sess.Save()
 
-	// ── HYBRID INTENT GATEWAY ────────────────────────────────────────
-	// Free-form input (no explicit mode shorthand, no command, no shell) goes
-	// through the Hybrid Intent Gateway: the deterministic fast path first, then
-	// the semantic IntentClassifier when no deterministic signal matches. The
-	// classified intent is projected onto the current phase (auto mode switch),
-	// or — at low confidence (ConfirmationRequirement) — surfaced as an
-	// interactive mode-selection prompt instead of acting on a blind guess.
-	// The route runs async because the semantic fallback may invoke the LLM.
-	//
-	// ── /ask MODE LOCK: Direct Read-Only Chat boundary ───────────────
-	// /ask is a strict read-only chat boundary. The ONLY valid sub-prompt
-	// is $prompt (handled above). Free-form input in /ask MUST NEVER route
-	// through the intent classifier — the classifier can misclassify natural
-	// questions as /plan, /investigate, or /build and auto-switch modes,
-	// violating the Direct Chat contract. Bypass the router entirely.
-	if m.intentRouter != nil && m.resolver.Current() != modes.ModeAsk {
-		return m.routeFreeInput(line)
-	}
-
-	return m.handleMessageContent(line)
-}
-
-// routeFreeInput dispatches a free-form prompt through the Hybrid Intent
-// Gateway off the Bubble Tea event loop. The router runs the deterministic
-// fast path first and only falls back to the semantic classifier; both are
-// cheap enough to run inside the returned command's goroutine. The result is
-// delivered back as a routerResultMsg for the Update loop to project.
-func (m *model) routeFreeInput(line string) tea.Cmd {
-	r := m.intentRouter
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		res, err := r.Route(ctx, line)
-		return routerResultMsg{line: line, result: res, err: err}
-	}
+	// ── UNIFIED INTENT GATEWAY (execution-driven runtime) ──────────────
+	// Every remaining execution-bearing input — bare text, $prompt, $hot —
+	// produces an ExecuteRequest through the unified IntentGateway. The
+	// runtime (RuntimeExecutor) decides the execution path via unconditional
+	// Strategy.Select: never the UI, never a mode transition, never a hidden
+	// /build invocation. The UI renders the canonical runtime events and the
+	// returned result.
+	return m.runGatedLine(line)
 }
 
 func (m *model) handleMessageContent(line string) tea.Cmd {
@@ -7025,84 +6998,6 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 			m.currentResult = failureResult(diagnosis)
 
 			return agentDoneMsg{}
-		},
-	)
-}
-
-// runAskPromptHandoffCmd passes the user's raw architectural idea directly to
-// the ask handoff for refinement. No session history aggregation — the raw
-// input IS the payload.
-//
-// ISOLATION CONTRACT — This function is called STRICTLY from handleInput when
-// the user types "$prompt <raw_idea>" in /ask mode. It uses its own system
-// prompt (AskPromptHandoffSystemPrompt) and a non-streaming provider call that
-// NEVER touches the normal chat session history (no AddMessage, no sess.Save).
-// Normal chat continues to use AskContract() via the streamCmd path with zero
-// contamination.
-func (m *model) runAskPromptHandoffCmd(rawInput string) tea.Cmd {
-	return tea.Batch(
-		func() tea.Msg {
-			return agentStartMsg{label: "refining architectural idea"}
-		},
-		m.smoothStreamTickCmd(),
-		func() tea.Msg {
-			if m.provider == nil {
-				m.push(roleError, "[System Error] No AI provider is configured. Run /model to select one.")
-				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
-				return agentDoneMsg{}
-			}
-
-			uname := m.cfg.Username
-			if uname == "" {
-				uname = m.userName
-			}
-			systemPrompt := prompt.AskPromptHandoffSystemPrompt(uname)
-
-			req := ai.Request{
-				Model: m.routeModel("ask"),
-				Messages: []ai.Message{
-					{Role: "user", Content: rawInput},
-				},
-				Stream: false,
-				System: systemPrompt,
-			}
-
-			// The $prompt refinement is bounded by the operation context +
-			// generation deadline so a hung provider can never freeze the spinner.
-			ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
-			resp, err := m.provider.Execute(ctx, req)
-			cancel()
-			if err != nil {
-				return promptHandoffMsg{err: fmt.Errorf("prompt synthesis failed: %w", err)}
-			}
-
-			var content string
-			if resp != nil {
-				content = strings.TrimSpace(resp.Content)
-			}
-
-			if content == "" {
-				return promptHandoffMsg{err: fmt.Errorf("prompt synthesis returned empty response")}
-			}
-
-			// The FollowUp action chip is delivered via the promptHandoffMsg.actions
-			// field and rendered as an interactive terminal component by the
-			// promptHandoffMsg handler in update.go — never embedded in the
-			// markdown body.
-			followUpAction := []Action{
-				{
-					ID:       "ask-prompt-handoff-investigate",
-					Label:    "Forward to /investigate for deep-dive forensic analysis",
-					Shortcut: "alt+f",
-					Command:  "/mode investigate",
-					Query:    content,
-					Enabled:  true,
-					Priority: 100,
-				},
-			}
-
-			return promptHandoffMsg{content: content, actions: followUpAction}
 		},
 	)
 }

@@ -11,7 +11,7 @@ import (
 )
 
 // askTestModel builds a /ask chat model with a wired execution engine so the
-// full Enter → handleInput → handleMessageContent path can be exercised.
+// full Enter → handleInput → unified gateway path can be exercised.
 func askTestModel() *model {
 	m := newTestModel()
 	m.resolver.Set(modes.ModeAsk)
@@ -20,6 +20,12 @@ func askTestModel() *model {
 	m.pendingProposals = nil
 	m.ti.Focus()
 	m.execEng = execution.NewEngine(".", m.cfg, m.sess)
+	m.workspaceRoot = "."
+	m.gateway = execution.NewIntentGateway(".")
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, nil, nil, "")
+	trivial := execution.NewVerifier(".")
+	trivial.SetCustomSteps([]execution.VerificationStep{{Name: "noop", Command: "true", Optional: false}})
+	m.executor.SetVerifier(trivial)
 	return m
 }
 
@@ -43,8 +49,8 @@ func TestEnterDispatchesInstantShimmer(t *testing.T) {
 	if !m2.shimmerActive {
 		t.Fatal("Enter did not activate the shimmer at t=0ms")
 	}
-	if m2.shimmerText != "Working..." {
-		t.Fatalf("shimmer text = %q, want %q", m2.shimmerText, "Working...")
+	if m2.shimmerText != "Resolving execution..." {
+		t.Fatalf("shimmer text = %q, want %q", m2.shimmerText, "Resolving execution...")
 	}
 	if cmd == nil {
 		t.Fatal("Enter returned a nil command — no shimmer/smooth ticks scheduled")

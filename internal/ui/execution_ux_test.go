@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/modes"
 )
 
@@ -222,7 +223,7 @@ func TestUxFixOutsideBuildExecutesContinuously(t *testing.T) {
 // outside /ask routes through the ask handoff without creating a spurious
 // proposal/operation chain in the originating mode.
 func TestUxPromptDirectiveNoDuplicateOperation(t *testing.T) {
-	m := newTestModel()
+	m := gatedDispatchModel(t, &mockProvider{responses: []*ai.Response{{Content: "plan"}}}, nil)
 	m.resolver.Set(modes.ModeBuild)
 	m.state = StateChat
 	m.awaitingConfirmation = false
@@ -234,8 +235,12 @@ func TestUxPromptDirectiveNoDuplicateOperation(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("routePromptDirective returned nil — $prompt must dispatch")
 	}
-	if got := m.resolver.Current(); got != modes.ModeAsk {
-		t.Errorf("workspace = /%s, want /ask after $prompt routing", got)
+	// $prompt is an execution request: it never transitions to /ask.
+	if got := m.resolver.Current(); got != modes.ModeBuild {
+		t.Errorf("mode = /%s, want /build (no transition — $prompt is an execution request)", got)
+	}
+	if !hasDispatchRecord(m, "resolving intent deterministically") {
+		t.Error("expected $prompt to dispatch through the unified gateway")
 	}
 }
 

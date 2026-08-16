@@ -36,11 +36,10 @@ func TestHandlePresentationEventProjection(t *testing.T) {
 			appruntime.PresentationEvent{Type: appruntime.PresentationExecutionFailed, Severity: appruntime.SeverityError, Summary: "execution failed in build: boom"},
 			"execution failed in build: boom",
 		},
-		{
-			"approval requested (warning)",
-			appruntime.PresentationEvent{Type: appruntime.PresentationApprovalRequested, Severity: appruntime.SeverityWarning, Summary: "approval requested", Target: "x.go"},
-			"approval requested",
-		},
+		// ApprovalRequested / PhaseChanged / IntentClassified are deliberately
+		// NOT projected here: they are deduplicated (Rule 4) — the UI renders
+		// the raw domain event, which carries the structured payload the
+		// viewState/approval projections need.
 	}
 
 	for _, tc := range tests {

@@ -237,15 +237,6 @@ func (m *model) renderProposalBlock() string {
 
 	switch m.state {
 	case StateAwaitingApproval:
-		// ── Hybrid Intent Gateway mode-selection prompt ───────────────
-		// The router classified the prompt below the confidence threshold and
-		// the UI is asking which execution phase to enter. Rendered above all
-		// other approval widgets because it blocks further input processing.
-		if m.pendingRouteConfirm && len(m.pendingRouteOptions) > 0 {
-			b.WriteString(m.renderRouteConfirmPrompt(width))
-			break
-		}
-
 		// ── Build Approval Permission Box (SHELL_EXEC gate) ─────────────
 		if m.pendingBuildApproval && m.pendingBuildTask != nil {
 			task := m.pendingBuildTask

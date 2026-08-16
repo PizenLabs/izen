@@ -335,9 +335,6 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		return m, nil
 
-	case routerResultMsg:
-		return m.handleRouterResult(msg)
-
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -1303,6 +1300,23 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.flushPendingRecords(),
 			thoughtDone,
 		)
+
+	case executionResultMsg:
+		// ── RUNTIME EXECUTOR RESULT (authority migration, Steps 2-4) ──
+		// The RuntimeExecutor returned the terminal outcome of an execution
+		// request. The runtime owned every provider invocation, patch creation,
+		// mutation and verification; the UI projects the result and renders the
+		// canonical events (MutationCompleted / VerificationCompleted /
+		// ExecutionFinished) it already receives on the bus. No provider or
+		// PatchManager call lives on this path anymore.
+		return m.executionResultUpdate(msg)
+
+	case gatedExecutionMsg:
+		// ── UNIFIED INTENT GATEWAY RESULT ─────────────────────────────
+		// Every execution-bearing user action (bare text, $prompt, $hot)
+		// produces a gated execution; the update loop projects the runtime
+		// result through the same executionResultUpdate projection.
+		return m.handleGatedExecution(msg)
 
 	case hotfixProposalMsg:
 		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient

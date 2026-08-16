@@ -14,6 +14,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
@@ -395,47 +396,38 @@ func TestBuildLifecycleCancelReleasesAllWorkers(t *testing.T) {
 
 func TestBuildLifecycleNoDuplicateDispatch(t *testing.T) {
 	mock := &mockProvider{responses: []*ai.Response{{Content: "```\nhello izen\n```", TokenOutput: 50}}}
-	m := newTestModel()
-	m.provider = mock
-	m.caps = capability.NewCapabilitySet()
+	m := gatedDispatchModel(t, mock, nil)
+	m.resolver.Set(modes.ModeBuild)
 
-	// A single $hot user command dispatches exactly ONE operation and, after
-	// the batch's generation command runs, exactly ONE provider invocation.
-	cmd := m.handleInput("$hot add a README file @README.md")
+	// A single $hot user action dispatches exactly ONE execution request
+	// through the unified gateway and, after the runtime's model invocation,
+	// exactly ONE provider call (owned by the executor, never by the UI).
+	cmd := m.handleInput("$hot add a note file @note.md")
 	if cmd == nil {
 		t.Fatal("handleInput returned nil for $hot")
 	}
-	if m.activeOp == nil || m.activeOp.Kind != OpHotfix {
-		t.Fatalf("expected exactly one hotfix operation at dispatch, got: %+v", m.activeOp)
-	}
-	if m.activeOp.State != OpStateDispatched {
-		t.Fatalf("operation state = %s, want dispatched", m.activeOp.State)
-	}
 	if mock.callCount != 0 {
-		t.Fatalf("provider invoked %d times before the generation command ran, want 0", mock.callCount)
+		t.Fatalf("provider invoked %d times before the execution ran, want 0", mock.callCount)
 	}
 
-	// Run only the generation command (the batch also carries animation ticks
-	// that are dropped here) and verify a single provider call.
-	task := &plan.Task{StepNum: 0, Type: "FILE_MUTATE", Target: "README.md", Description: "add a README file @README.md"}
-	msg := m.proposeHotfixPatch(task)()
-	hp, ok := msg.(hotfixProposalMsg)
+	msg := cmd()
+	gem, ok := msg.(gatedExecutionMsg)
 	if !ok {
-		t.Fatalf("expected hotfixProposalMsg, got %T", msg)
+		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
 	}
-	if hp.Err != nil {
-		t.Fatalf("hotfix generation failed: %v", hp.Err)
+	if gem.err != nil {
+		t.Fatalf("gate err: %v", gem.err)
+	}
+	if gem.res == nil {
+		t.Fatal("nil gate result")
 	}
 	if mock.callCount != 1 {
 		t.Fatalf("provider called %d times for one command, want exactly 1", mock.callCount)
 	}
 
-	// Terminal proposal → finalize → approval gate, exactly one lifecycle.
-	res, _ := m.Update(hp)
+	// Terminal proposal → approval gate, exactly one lifecycle.
+	res, _ := m.executionResultUpdate(executionResultMsg{res: gem.res})
 	m2 := res.(*model)
-	if m2.activeOp != nil {
-		t.Fatalf("hotfix operation not finalized: %+v", m2.activeOp)
-	}
 	if m2.state != StateAwaitingApproval {
 		t.Fatalf("state = %v, want StateAwaitingApproval", m2.state)
 	}
@@ -604,39 +596,36 @@ func TestBuildLifecycleCancelledExecutionAllowsNextCommand(t *testing.T) {
 // ── 13. Existing hotfix authorization/budget behavior remains unchanged ────
 
 func TestBuildLifecycleHotfixBehaviorUnaffected(t *testing.T) {
-	mock := &mockProvider{responses: []*ai.Response{{Content: "```\nMIT License\n\nCopyright (c) 2024\n```\n", TokenOutput: 50}}}
-	m := newTestModel()
-	m.provider = mock
-	m.caps = capability.NewCapabilitySet()
+	mock := &mockProvider{responses: []*ai.Response{{Content: "<<<<<<< SEARCH\n# README\n=======\n# Fixed README\n>>>>>>>", TokenOutput: 50}}}
+	m := gatedDispatchModel(t, mock, map[string]string{
+		"README.md": "# README\nbody\n",
+	})
+	m.resolver.Set(modes.ModeBuild)
 
-	// $hot still dispatches through the OpHotfix lifecycle (never OpBuild) and
-	// reaches the same approval gate with a staged proposal.
-	cmd := m.handleInput("$hot add a LICENSE file @LICENSE")
+	// $hot dispatches through the unified gateway → RuntimeExecutor and reaches
+	// the same approval gate with a staged proposal.
+	cmd := m.handleInput("$hot update the header in @README.md")
 	if cmd == nil {
 		t.Fatal("handleInput returned nil for $hot")
 	}
-	if m.activeOp == nil || m.activeOp.Kind != OpHotfix {
-		t.Fatalf("hotfix did not begin an OpHotfix operation: %+v", m.activeOp)
-	}
-	task := &plan.Task{StepNum: 0, Type: "FILE_MUTATE", Target: "LICENSE", Description: "add a LICENSE file @LICENSE"}
-	msg := m.proposeHotfixPatch(task)()
-	hp, ok := msg.(hotfixProposalMsg)
+	msg := cmd()
+	gem, ok := msg.(gatedExecutionMsg)
 	if !ok {
-		t.Fatalf("expected hotfixProposalMsg, got %T", msg)
+		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
 	}
-	if hp.Err != nil {
-		t.Fatalf("hotfix generation failed: %v", hp.Err)
+	if gem.err != nil {
+		t.Fatalf("gate err: %v", gem.err)
 	}
-	res, _ := m.Update(hp)
+	if gem.res == nil {
+		t.Fatal("nil gate result")
+	}
+	res, _ := m.executionResultUpdate(executionResultMsg{res: gem.res})
 	m2 := res.(*model)
 	if m2.state != StateAwaitingApproval {
 		t.Fatalf("state = %v, want StateAwaitingApproval (unchanged hotfix gate)", m2.state)
 	}
 	if m2.pendingHotfixTask == nil || m2.pendingHotfixPatch == nil {
 		t.Fatal("hotfix proposal not staged for authorization")
-	}
-	if m2.activeOp != nil {
-		t.Fatalf("hotfix operation not finalized: %+v", m2.activeOp)
 	}
 }
 

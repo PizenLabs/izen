@@ -223,8 +223,9 @@ func DirectiveContractFor(name string) (DirectiveContract, bool) {
 }
 
 // executionModeForDirective resolves the canonical execution context for a
-// directive. It reports false when the directive has no fixed execution mode
-// (global directives like $prompt / $inspect already route from any mode).
+// LEGACY mode-scoped directive. It reports false when the directive has no
+// fixed execution mode (execution directives $prompt / $hot and global
+// directives like $inspect route from any mode).
 func executionModeForDirective(name string) (modes.Mode, bool) {
 	c, ok := directiveContracts[name]
 	if !ok || len(c.WorksIn) == 0 {
