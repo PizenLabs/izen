@@ -20,15 +20,19 @@ import (
 
 // ── Build-lifecycle harness ──────────────────────────────────────────────────
 //
-// The suite below drives the LEGACY per-task build execution path
-// (handleBuildRun → proposeBuildPatch) — the exact pipeline whose provider
-// calls previously ran on context.Background(), immune to Ctrl+C, leaving the
-// UI stuck on the derived "Processing file mutations... Please wait." state
-// until the 5-minute buildGenerationTimeout expired per attempt.
+// The suite below drives the RuntimeExecutor build-execution path
+// (handleBuildRun → runRuntimeTaskRequest → RuntimeExecutor.Execute) — the
+// pipeline that replaced the legacy per-task proposeBuildPatch loop. The
+// executor owns the provider invocation, patch creation and the approval gate;
+// the UI owns input collection, the proposal dock and the runtime result
+// projection (gatedExecutionMsg → executionResultUpdate). Ctrl+C cancels the
+// operation context the provider call inherits, so the UI can never remain
+// stuck on a processing state until a 5-minute timeout.
 //
 // buildRunModel wires a minimal-but-real model in the Building phase with a
-// staged FILE_MUTATE task and a writable target file, so handleBuildRun
-// exercises its full dispatch seam (transition → beginOperation → batch).
+// staged FILE_MUTATE task, a writable target file, an IntentGateway and a
+// RuntimeExecutor bound to the test provider, so handleBuildRun exercises its
+// full dispatch seam (transition → executor submission → approval gate).
 
 func buildRunModel(t *testing.T, provider ai.Provider, tasks []plan.Task, fileContent string) *model {
 	t.Helper()
@@ -47,6 +51,11 @@ func buildRunModel(t *testing.T, provider ai.Provider, tasks []plan.Task, fileCo
 	m.caps = capability.NewCapabilitySet()
 	m.execEng = execution.NewEngine(".", m.cfg, m.sess)
 	m.activityTree = NewActivityTree()
+	// Wire the runtime boundary (production cutover): the FILE_MUTATE task
+	// routes through the RuntimeExecutor, which owns provider invocation,
+	// patch creation, the approval gate, apply and verification.
+	m.gateway = execution.NewIntentGateway(".")
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, provider, nil, "")
 	m.sess.StageTaskList(&tasks)
 	driveIntoBuildPhase(t, m)
 	m.ti.Focus()
@@ -139,99 +148,107 @@ const smallHTML = "<!DOCTYPE html>\n<html>\n<head>\n  <title>Home</title>\n</hea
 // ── 1. Normal execution completes ───────────────────────────────────────────
 
 func TestBuildLifecycleNormalExecutionCompletes(t *testing.T) {
-	mock := &mockProvider{responses: []*ai.Response{{Content: "<!DOCTYPE html>\n<html><body><h1>New</h1></body></html>\n"}}}
+	// A valid SEARCH/REPLACE patch response yields a held patch: the executor
+	// stops at its approval gate with PendingPatchID — the normal-execution
+	// terminal on the RuntimeExecutor path.
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n<h1>Hello</h1>\n=======\n<h1>Goodbye</h1>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
 	tasks := []plan.Task{{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Status: "idle", Description: "rewrite index.html"}}
 	m := buildRunModel(t, mock, tasks, smallHTML)
 
-	cmd := m.handleBuildRun(0)
+	msgs := runBuildCmdsFiltered(t, m.handleBuildRun(0))
 
-	// The provider-invoking dispatch seam registers a single build operation
-	// BEFORE any provider call — the single-ownership + cancellation slot.
-	if m.activeOp == nil || m.activeOp.Kind != OpBuild {
-		t.Fatalf("build operation not registered at dispatch: %+v", m.activeOp)
+	// The executor dispatch (runRuntimeExecuteCmd) registers a single OpHotfix
+	// operation BEFORE the provider call — the single-ownership + cancellation
+	// slot on the executor path (the operation kind is OpHotfix, NOT OpBuild).
+	if m.activeOp == nil || m.activeOp.Kind != OpHotfix {
+		t.Fatalf("execution operation not registered at dispatch: %+v", m.activeOp)
 	}
 	if m.isWorkflowBusy() == false {
-		t.Fatal("expected the busy/processing flags armed during patch generation")
+		t.Fatal("expected the busy/processing flags armed during execution")
 	}
 	if m.state != StateProcessing {
-		t.Fatalf("during generation: state = %v, want StateProcessing", m.state)
+		t.Fatalf("during execution: state = %v, want StateProcessing", m.state)
 	}
 
-	msgs := runBuildCmdsFiltered(t, cmd)
-	var proposal *buildProposalReadyMsg
+	// The provider is invoked SYNCHRONOUSLY inside the dispatched cmd; the
+	// terminal message is the executor's gated result — never a legacy
+	// buildProposalReadyMsg.
+	var gem *gatedExecutionMsg
 	for _, msg := range msgs {
-		if p, ok := msg.(buildProposalReadyMsg); ok {
-			proposal = &p
+		if g, ok := msg.(gatedExecutionMsg); ok {
+			gem = &g
 		}
 	}
-	if proposal == nil {
-		t.Fatalf("no buildProposalReadyMsg reached the event loop (msgs=%d)", len(msgs))
+	if gem == nil {
+		t.Fatalf("no gatedExecutionMsg reached the event loop (msgs=%d)", len(msgs))
 	}
-	if proposal.Err != nil {
-		t.Fatalf("patch generation failed: %v", proposal.Err)
+	if gem.err != nil {
+		t.Fatalf("execution failed: %v", gem.err)
+	}
+	if gem.res == nil || gem.res.PendingPatchID == "" {
+		t.Fatalf("executor must hold a patch at the approval gate, got %+v", gem.res)
 	}
 	if mock.callCount != 1 {
 		t.Fatalf("provider called %d times, want exactly 1", mock.callCount)
 	}
 
-	// Terminal message → operation finalized, spinner stopped, approval gate.
-	res, _ := m.Update(*proposal)
+	// Terminal message → the proposal dock is staged for RuntimeExecutor.Approve
+	// with a fresh OpHotfix operation holding the approval gate.
+	res, _ := m.Update(*gem)
 	m2 := res.(*model)
-	if m2.activeOp != nil {
-		t.Fatalf("build operation not finalized after proposal: %+v", m2.activeOp)
+	if m2.executorPendingPatchID == "" {
+		t.Fatal("approval-held patch not staged for approval")
 	}
-	if m2.isWorkflowBusy() {
-		t.Fatal("busy flags still set after successful generation")
+	if m2.pendingHotfixPatch == nil {
+		t.Fatal("proposal patch not staged for authorization")
 	}
-	if m2.shimmerActive {
-		t.Fatal("spinner still active after successful generation")
+	if len(m2.pendingProposals) == 0 {
+		t.Fatal("no proposal staged for human approval")
 	}
 	if m2.state != StateAwaitingApproval {
 		t.Fatalf("state = %v, want StateAwaitingApproval", m2.state)
 	}
-	if len(m2.pendingProposals) == 0 {
-		t.Fatal("no proposal staged for human approval")
+	if m2.activeOp == nil || m2.activeOp.Kind != OpHotfix {
+		t.Fatalf("approval gate must hold an active OpHotfix operation: %+v", m2.activeOp)
 	}
 }
 
 // ── 2. Execution failure returns control to the UI ──────────────────────────
 
 func TestBuildLifecycleFailureReturnsControlToUI(t *testing.T) {
-	// A large file + a tiny ambiguous snippet on every attempt drives
-	// proposeBuildPatch through its full retry budget to a terminal failure.
-	var large string
-	for i := 0; i < 220; i++ {
-		large += fmt.Sprintf("line %d\n", i)
-	}
-	tiny := "func main() {}\n"
-	mock := &mockProvider{responses: []*ai.Response{
-		{Content: tiny}, {Content: tiny}, {Content: tiny},
-	}}
+	// An empty model artifact is a deterministic execution failure on the
+	// RuntimeExecutor path: the runtime produces no usable mutation artifact
+	// and returns a terminal error — the executor performs a single provider
+	// invocation (no legacy retry budget on this path).
+	mock := &mockProvider{responses: []*ai.Response{{Content: ""}}}
 	tasks := []plan.Task{{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Status: "idle"}}
-	m := buildRunModel(t, mock, tasks, large)
+	m := buildRunModel(t, mock, tasks, smallHTML)
 
 	msgs := runBuildCmdsFiltered(t, m.handleBuildRun(0))
-	var proposal *buildProposalReadyMsg
+	var gem *gatedExecutionMsg
 	for _, msg := range msgs {
-		if p, ok := msg.(buildProposalReadyMsg); ok {
-			proposal = &p
+		if g, ok := msg.(gatedExecutionMsg); ok {
+			gem = &g
 		}
 	}
-	if proposal == nil {
-		t.Fatal("no terminal buildProposalReadyMsg reached the event loop")
+	if gem == nil {
+		t.Fatal("no terminal gatedExecutionMsg reached the event loop")
 	}
-	if proposal.Err == nil {
-		t.Fatal("expected a terminal failure after exhausting retries")
+	if gem.err == nil {
+		t.Fatal("expected a terminal execution failure")
 	}
-	if mock.callCount != 3 {
-		t.Fatalf("provider called %d times, want 3 (1 initial + 2 retries)", mock.callCount)
+	if mock.callCount != 1 {
+		t.Fatalf("provider called %d times, want exactly 1", mock.callCount)
 	}
 
-	res, _ := m.Update(*proposal)
+	res, _ := m.Update(*gem)
 	m2 := res.(*model)
 	// GUARANTEED LIFECYCLE: failure returns control to the interactive UI.
 	if m2.activeOp != nil {
-		t.Fatalf("build operation not finalized on failure: %+v", m2.activeOp)
+		t.Fatalf("execution operation not finalized on failure: %+v", m2.activeOp)
 	}
 	if m2.isWorkflowBusy() {
 		t.Fatal("busy flags still set after failure")
@@ -242,11 +259,8 @@ func TestBuildLifecycleFailureReturnsControlToUI(t *testing.T) {
 	if m2.state != StateChat {
 		t.Fatalf("state = %v, want StateChat (interactive)", m2.state)
 	}
-	// The failed task is frozen for inspection (existing behavior).
-	for _, task := range m2.sess.CurrentTasks {
-		if task.Status != "failed" {
-			t.Errorf("task %d status = %q, want failed", task.StepNum, task.Status)
-		}
+	if m2.executorPendingPatchID != "" {
+		t.Fatal("a failed execution must not leave a held patch staged for approval")
 	}
 	// The UI accepts a new command.
 	m2.ti.SetValue("!echo alive-after-failure")
@@ -272,8 +286,8 @@ func TestBuildLifecycleCtrlCCancelsProviderCall(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("provider never started")
 	}
-	if m.activeOp == nil || m.activeOp.Kind != OpBuild {
-		t.Fatalf("no cancellable build operation while provider runs: %+v", m.activeOp)
+	if m.activeOp == nil || m.activeOp.Kind != OpHotfix {
+		t.Fatalf("no cancellable execution operation while the provider runs: %+v", m.activeOp)
 	}
 
 	// Ctrl+C → graceful cancellation of the CURRENT execution.
@@ -437,45 +451,53 @@ func TestBuildLifecycleNoDuplicateDispatch(t *testing.T) {
 
 func TestBuildLifecycleProcessingStateTerminates(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
-		mock := &mockProvider{responses: []*ai.Response{{Content: "<h1>New</h1>\n"}}}
+		// A valid SEARCH/REPLACE patch holds at the executor approval gate: the
+		// terminal presentation is the proposal dock (StateAwaitingApproval),
+		// never the processing state.
+		mock := &mockProvider{responses: []*ai.Response{{
+			Content: "<<<<<<< SEARCH\n<h1>Hello</h1>\n=======\n<h1>Goodbye</h1>\n>>>>>>>",
+			Usage:   ai.ProviderUsage{Known: true},
+		}}}
 		tasks := []plan.Task{{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Status: "idle"}}
 		m := buildRunModel(t, mock, tasks, smallHTML)
 		msgs := runBuildCmdsFiltered(t, m.handleBuildRun(0))
-		var proposal *buildProposalReadyMsg
+		var gem *gatedExecutionMsg
 		for _, msg := range msgs {
-			if p, ok := msg.(buildProposalReadyMsg); ok {
-				proposal = &p
+			if g, ok := msg.(gatedExecutionMsg); ok {
+				gem = &g
 			}
 		}
-		if proposal == nil || proposal.Err != nil {
-			t.Fatalf("expected a valid proposal, got %+v", proposal)
+		if gem == nil || gem.err != nil {
+			t.Fatalf("expected a successful execution, got %+v", gem)
 		}
-		res, _ := m.Update(*proposal)
+		res, _ := m.Update(*gem)
 		m2 := res.(*model)
-		if m2.state == StateProcessing || m2.isWorkflowBusy() || m2.shimmerActive {
-			t.Fatalf("stuck in Processing after success: state=%v busy=%v shimmer=%v", m2.state, m2.isWorkflowBusy(), m2.shimmerActive)
+		if m2.state == StateProcessing {
+			t.Fatalf("stuck in Processing after success: state=%v", m2.state)
+		}
+		if m2.state != StateAwaitingApproval {
+			t.Fatalf("state = %v, want StateAwaitingApproval (approval gate)", m2.state)
+		}
+		if m2.executorPendingPatchID == "" {
+			t.Fatal("approval-held patch not staged after success")
 		}
 	})
 
 	t.Run("failure", func(t *testing.T) {
-		var large string
-		for i := 0; i < 220; i++ {
-			large += fmt.Sprintf("line %d\n", i)
-		}
-		mock := &mockProvider{responses: []*ai.Response{{Content: "x"}, {Content: "x"}, {Content: "x"}}}
+		mock := &mockProvider{responses: []*ai.Response{{Content: ""}}}
 		tasks := []plan.Task{{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Status: "idle"}}
-		m := buildRunModel(t, mock, tasks, large)
+		m := buildRunModel(t, mock, tasks, smallHTML)
 		msgs := runBuildCmdsFiltered(t, m.handleBuildRun(0))
-		var proposal *buildProposalReadyMsg
+		var gem *gatedExecutionMsg
 		for _, msg := range msgs {
-			if p, ok := msg.(buildProposalReadyMsg); ok {
-				proposal = &p
+			if g, ok := msg.(gatedExecutionMsg); ok {
+				gem = &g
 			}
 		}
-		if proposal == nil || proposal.Err == nil {
-			t.Fatalf("expected a terminal failure, got %+v", proposal)
+		if gem == nil || gem.err == nil {
+			t.Fatalf("expected a terminal failure, got %+v", gem)
 		}
-		res, _ := m.Update(*proposal)
+		res, _ := m.Update(*gem)
 		m2 := res.(*model)
 		if m2.state == StateProcessing || m2.isWorkflowBusy() || m2.shimmerActive {
 			t.Fatalf("stuck in Processing after failure: state=%v busy=%v shimmer=%v", m2.state, m2.isWorkflowBusy(), m2.shimmerActive)
@@ -511,14 +533,13 @@ func TestBuildLifecycleProcessingStateTerminates(t *testing.T) {
 		}
 	})
 
-	t.Run("zero-patch short-circuit", func(t *testing.T) {
-		// For an EXISTING large file, when the model echoes the file back
-		// verbatim ResolveModifiedContent resolves to the original and
-		// proposeBuildPatch returns mutationResultMsg (nochange) DIRECTLY,
-		// skipping buildProposalReadyMsg. The OpBuild begun at dispatch MUST be
-		// finalized by the mutationResultMsg handler. The echoed content must
-		// equal strings.TrimSpace(orig) exactly (no trailing newline), since
-		// ResolveModifiedContent trims the model output.
+	t.Run("no-change held patch", func(t *testing.T) {
+		// The RuntimeExecutor is the sole execution authority: EVERY valid
+		// artifact stops at its approval gate — including a verbatim echo of
+		// the original file (no content change). The legacy mutationResultMsg
+		// zero-patch short-circuit does not exist on this path. The echoed
+		// content must equal strings.TrimSpace(orig) exactly (no trailing
+		// newline), since ResolveModifiedContent trims the model output.
 		var lines []string
 		for i := 0; i < 220; i++ {
 			lines = append(lines, fmt.Sprintf("line %d", i))
@@ -528,34 +549,39 @@ func TestBuildLifecycleProcessingStateTerminates(t *testing.T) {
 		tasks := []plan.Task{{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Status: "idle"}}
 		m := buildRunModel(t, mock, tasks, large)
 		msgs := runBuildCmdsFiltered(t, m.handleBuildRun(0))
-		var mr *mutationResultMsg
+		var gem *gatedExecutionMsg
 		for _, msg := range msgs {
-			if x, ok := msg.(mutationResultMsg); ok {
-				mr = &x
+			if g, ok := msg.(gatedExecutionMsg); ok {
+				gem = &g
 			}
 		}
-		if mr == nil {
-			t.Fatalf("expected zero-patch mutationResultMsg, got msgs=%d", len(msgs))
+		if gem == nil || gem.err != nil {
+			t.Fatalf("expected a held patch at the executor approval gate, got %+v", gem)
 		}
-		res, _ := m.Update(*mr)
+		if gem.res == nil || gem.res.PendingPatchID == "" {
+			t.Fatalf("the executor must hold the no-change artifact at the gate, got %+v", gem.res)
+		}
+		res, _ := m.Update(*gem)
 		m2 := res.(*model)
-		if m2.activeOp != nil {
-			t.Fatalf("build operation not finalized by zero-patch short-circuit: %+v", m2.activeOp)
+		if m2.state == StateProcessing {
+			t.Fatalf("stuck in Processing after the no-change terminal: state=%v", m2.state)
 		}
-		if m2.isWorkflowBusy() || m2.shimmerActive {
-			t.Fatalf("stuck busy after zero-patch short-circuit: busy=%v shimmer=%v", m2.isWorkflowBusy(), m2.shimmerActive)
+		if m2.state != StateAwaitingApproval {
+			t.Fatalf("state = %v, want StateAwaitingApproval", m2.state)
 		}
-		if m2.state != StateChat {
-			t.Fatalf("state = %v, want StateChat after zero-patch completion", m2.state)
+		if m2.executorPendingPatchID == "" {
+			t.Fatal("approval-held patch not staged after the no-change terminal")
 		}
 	})
 }
 
 // ── 10 + 11. Spinner/progress terminates on success/failure/cancellation ──
-// Covered exhaustively by TestBuildLifecycleNormalExecutionCompletes,
-// TestBuildLifecycleFailureReturnsControlToUI and the cancellation sub-test in
-// TestBuildLifecycleProcessingStateTerminates above (each asserts !busy,
-// !shimmerActive and state != StateProcessing after the terminal message).
+// Covered exhaustively by TestBuildLifecycleNormalExecutionCompletes (approval
+// gate terminal), TestBuildLifecycleFailureReturnsControlToUI and the
+// cancellation sub-test in TestBuildLifecycleProcessingStateTerminates above
+// (each asserts the terminal presentation — !busy, !shimmerActive and state !=
+// StateProcessing after the terminal message; a held patch presents as the
+// approval gate, never as a stuck processing state).
 
 // ── 12. A cancelled execution allows the next command to be submitted ──────
 

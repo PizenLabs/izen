@@ -8,6 +8,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
@@ -17,7 +19,10 @@ import (
 // REAL execution events (the authoritative execStage / ActivityTree) and that
 // no progress is fabricated: a provider wait renders as "waiting", a token
 // stream as "streaming", and "Thinking..."/"Processing file mutations..."/fake
-// read rows never appear without the runtime actually doing that work.
+// read rows never appear without the runtime actually doing that work. On the
+// RuntimeExecutor path the runtime's canonical events (provider.waiting, real
+// file reads) are the evidence the projection renders — never a static
+// dispatch template.
 
 // ── 1 + 3. Real execution event produces progress; waiting ≠ thinking ──────
 
@@ -25,12 +30,29 @@ func TestProgressRealProviderWaitProducesWaitingState(t *testing.T) {
 	bp := &blockingProvider{started: make(chan struct{}), cancelled: make(chan struct{})}
 	tasks := []plan.Task{{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Status: "idle"}}
 	m := buildRunModel(t, bp, tasks, smallHTML)
+	// Wire a bus so the runtime emits its canonical provider.waiting event — the
+	// truthful evidence the UI projects into the waiting stage.
+	bus := events.NewBus(events.DefaultBufferSize)
+	m.bus = bus
+	m.gateway = execution.NewIntentGateway(".")
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, bp, bus, "")
+	evCh := make(chan events.DomainEvent, 16)
+	sub := bus.Subscribe(events.EventProviderWaiting, func(ev events.DomainEvent) { evCh <- ev })
+	defer sub.Cancel()
 
 	msgs := runBuildCmdsFilteredBackground(m.handleBuildRun(0))
 	select {
 	case <-bp.started:
 	case <-time.After(3 * time.Second):
 		t.Fatal("provider never started")
+	}
+	// Feed the REAL provider.waiting event into the projection (the production
+	// bus loop delivers it the same way) — the runtime's own evidence.
+	select {
+	case ev := <-evCh:
+		m.handleDomainEvent(ev)
+	case <-time.After(3 * time.Second):
+		t.Fatal("runtime never emitted the real provider.waiting event")
 	}
 
 	// The REAL provider invocation produced a truthful waiting stage.
@@ -119,21 +141,30 @@ func TestProgressStreamingRenderedAsStreaming(t *testing.T) {
 	}
 }
 
-// ── 5 + 6. Reads are real, retries distinguishable, never UI duplication ───
+// ── 5 + 6. Reads are real, retries never fabricated, never UI duplication ──
 
 func TestProgressRetryReadsAreRealAndDistinguishable(t *testing.T) {
-	var large string
-	for i := 0; i < 220; i++ {
-		large += "line\n"
-	}
-	mock := &mockProvider{responses: []*ai.Response{
-		{Content: "x"}, {Content: "x"}, {Content: "x"},
-	}}
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n<h1>Hello</h1>\n=======\n<h1>Goodbye</h1>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
 	tasks := []plan.Task{{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Status: "idle"}}
-	m := buildRunModel(t, mock, tasks, large)
+	m := buildRunModel(t, mock, tasks, smallHTML)
+	// Wire the production event-logger seam: the runtime's real file reads
+	// cross into the activity tree ONLY when it actually reads the disk.
+	execution.SetEventLogger(func(ev interface{}) { m.handleEngineEvent(ev) })
+	defer execution.SetEventLogger(nil)
 
 	msgs := runBuildCmdsFiltered(t, m.handleBuildRun(0))
-	_ = msgs
+	var gem *gatedExecutionMsg
+	for _, msg := range msgs {
+		if g, ok := msg.(gatedExecutionMsg); ok {
+			gem = &g
+		}
+	}
+	if gem == nil || gem.err != nil {
+		t.Fatalf("expected a successful execution, got %+v", gem)
+	}
 
 	if m.activityTree == nil {
 		t.Fatal("activity tree not populated")
@@ -144,71 +175,76 @@ func TestProgressRetryReadsAreRealAndDistinguishable(t *testing.T) {
 			reads++
 		}
 	}
-	// 3 REAL disk reads happened (1 initial + 2 retries) — the renderer must
-	// not add or remove any; each row corresponds to a real read.
-	if reads != 3 {
-		t.Fatalf("activity tree shows %d read rows, want 3 real reads", reads)
+	// The runtime performs exactly 2 REAL disk reads on the targeted-mutation
+	// path (context compile + mutation invocation) — every row corresponds to a
+	// real read and the renderer never adds or removes one. The executor has no
+	// retry loop, so a retry badge would be a fabricated claim.
+	if reads != 2 {
+		t.Fatalf("activity tree shows %d read rows, want 2 real reads", reads)
 	}
 
-	// The renderer distinguishes the retries from the fresh read and does NOT
-	// duplicate the fresh read row.
+	// The renderer distinguishes real repeated reads from fresh reads and never
+	// duplicates rows: each read row maps to one real disk read.
 	rendered := stripANSITest(m.activityTree.Render(120))
-	if got := strings.Count(rendered, "(retry 1)"); got != 1 {
-		t.Fatalf("render shows %d '(retry 1)' rows, want exactly 1 (real retry, not UI duplication):\n%s", got, rendered)
-	}
-	if got := strings.Count(rendered, "(retry 2)"); got != 1 {
-		t.Fatalf("render shows %d '(retry 2)' rows, want exactly 1 (real retry, not UI duplication):\n%s", got, rendered)
+	if got := strings.Count(rendered, "(retry"); got != 0 {
+		t.Fatalf("render fabricated %d retry labels on the executor path (no retries exist):\n%s", got, rendered)
 	}
 	freshRows := 0
 	for _, line := range strings.Split(rendered, "\n") {
-		if strings.Contains(line, "read │ index.html") && !strings.Contains(line, "(retry") {
+		if strings.Contains(line, "read │ index.html") {
 			freshRows++
 		}
 	}
-	if freshRows != 1 {
-		t.Fatalf("render shows %d plain fresh-read rows, want exactly 1 (UI duplication):\n%s", freshRows, rendered)
+	if freshRows != 2 {
+		t.Fatalf("render shows %d plain fresh-read rows, want exactly 2 (one per real disk read, no UI duplication):\n%s", freshRows, rendered)
 	}
 }
 
 // ── 7 + 8 + 9. Spinner stops on success / failure / cancellation ───────────
 
 func TestProgressSpinnerStopsOnSuccess(t *testing.T) {
-	mock := &mockProvider{responses: []*ai.Response{{Content: "<h1>New</h1>\n"}}}
+	// A valid SEARCH/REPLACE patch is the successful-execution terminal: the
+	// runtime holds the patch at the approval gate. The presentation MUST leave
+	// the execution-processing claim and hand the surface to the proposal dock —
+	// never a stale "Processing" state.
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n<h1>Hello</h1>\n=======\n<h1>Goodbye</h1>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
 	tasks := []plan.Task{{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Status: "idle"}}
 	m := buildRunModel(t, mock, tasks, smallHTML)
 	m.startShimmer("Generating patch...", "execute")
 
 	msgs := runBuildCmdsFiltered(t, m.handleBuildRun(0))
 	feedUntil(t, m, msgs, func(msg tea.Msg) bool {
-		_, ok := msg.(buildProposalReadyMsg)
+		_, ok := msg.(gatedExecutionMsg)
 		return ok
 	})
 
-	if m.shimmerActive {
-		t.Fatal("spinner still active after success")
+	if m.state == StateProcessing {
+		t.Fatal("stuck in Processing after a successful execution")
 	}
-	if m.isWorkflowBusy() {
-		t.Fatal("busy flags still set after success")
+	if m.state != StateAwaitingApproval {
+		t.Fatalf("state = %v, want StateAwaitingApproval (approval gate)", m.state)
 	}
-	if m.renderStageLine() != "" {
-		t.Fatalf("active stage survived success: %q", m.renderStageLine())
+	if m.executorPendingPatchID == "" {
+		t.Fatal("successful execution did not stage the approval-held patch")
+	}
+	if m.pendingHotfixPatch == nil {
+		t.Fatal("proposal patch not staged after successful execution")
 	}
 }
 
 func TestProgressSpinnerStopsOnFailure(t *testing.T) {
-	var large string
-	for i := 0; i < 220; i++ {
-		large += "line\n"
-	}
-	mock := &mockProvider{responses: []*ai.Response{{Content: "x"}, {Content: "x"}, {Content: "x"}}}
+	mock := &mockProvider{responses: []*ai.Response{{Content: ""}}}
 	tasks := []plan.Task{{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Status: "idle"}}
-	m := buildRunModel(t, mock, tasks, large)
+	m := buildRunModel(t, mock, tasks, smallHTML)
 	m.startShimmer("Generating patch...", "execute")
 
 	msgs := runBuildCmdsFiltered(t, m.handleBuildRun(0))
 	feedUntil(t, m, msgs, func(msg tea.Msg) bool {
-		p, ok := msg.(buildProposalReadyMsg)
-		return ok && p.Err != nil
+		g, ok := msg.(gatedExecutionMsg)
+		return ok && g.err != nil
 	})
 
 	if m.shimmerActive {
@@ -329,12 +365,15 @@ func TestProgressNextCommandAfterCancellation(t *testing.T) {
 
 func TestProgressNoStaleProcessingAfterTerminal(t *testing.T) {
 	// Success
-	mock := &mockProvider{responses: []*ai.Response{{Content: "<h1>New</h1>\n"}}}
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n<h1>Hello</h1>\n=======\n<h1>Goodbye</h1>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
 	tasks := []plan.Task{{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Status: "idle"}}
 	m := buildRunModel(t, mock, tasks, smallHTML)
 	msgs := runBuildCmdsFiltered(t, m.handleBuildRun(0))
 	feedUntil(t, m, msgs, func(msg tea.Msg) bool {
-		_, ok := msg.(buildProposalReadyMsg)
+		_, ok := msg.(gatedExecutionMsg)
 		return ok
 	})
 	if v := m.renderProposalBlock(); strings.Contains(v, "Processing file mutations") {

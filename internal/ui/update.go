@@ -782,10 +782,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				if m.buildHandoffTriggerContent(modes.ModeBuild) != "" {
 					base = append(base, m.setMode(modes.ModeBuild))
 				} else {
-					base = append(base, m.setMode(modes.ModeBuild), m.runBuildCmd(""))
+					base = append(base, m.setMode(modes.ModeBuild), m.runStagedBuildViaRuntime())
 				}
 			} else {
-				base = append(base, m.runBuildCmd(""))
+				base = append(base, m.runStagedBuildViaRuntime())
 			}
 			base = append(base, m.smoothStreamTickCmd(), m.shimmerTickCmd())
 		}

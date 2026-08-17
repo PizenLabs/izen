@@ -160,33 +160,6 @@ func TestRuntimeCutoverFlagOnRoutesPromptMutationThroughExecutor(t *testing.T) {
 	}
 }
 
-// TestRuntimeCutoverFlagOffPreservesLegacyPath is the legacy rollback
-// compatibility fixture: with IZEN_RUNTIME_EXECUTOR=0 (the migration-era
-// override) the same input routes through the legacy build staging
-// (planResultMsg) exactly as before the cutover. It exists only to pin the
-// historical behavior until the legacy execution authority is removed in Phase
-// 3; it is deleted together with the legacy path.
-func TestRuntimeCutoverFlagOffPreservesLegacyPath(t *testing.T) {
-	t.Setenv("IZEN_RUNTIME_EXECUTOR", "0")
-	writeIndexFixture(t)
-	mock := &mockProvider{responses: []*ai.Response{{Content: "ok", TokenOutput: 5}}}
-	m := cutoverModel(t, mock)
-	grantMutationCaps(m)
-
-	cmd := m.handleInput("$prompt read @index.html and remove redundant content")
-	if cmd == nil {
-		t.Fatal("flag-off granted mutation must dispatch the legacy builder")
-	}
-	msg := cmd()
-	prm, ok := msg.(planResultMsg)
-	if !ok {
-		t.Fatalf("flag-off must route through legacy build staging (planResultMsg), got %T", msg)
-	}
-	if len(prm.Tasks) == 0 || prm.Tasks[0].Target != "index.html" {
-		t.Fatalf("legacy staged build target = %+v, want index.html", prm.Tasks)
-	}
-}
-
 // TestRuntimeCutoverFlagOnRoutesHotThroughExecutor proves the fast-track/$hot
 // requirement: a $hot execution request under the flag routes through the
 // RuntimeExecutor (TargetedMutation), never a special legacy hotfix authority.

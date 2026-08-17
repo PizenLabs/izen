@@ -11,6 +11,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/presentation"
 )
 
@@ -174,21 +175,24 @@ func resolvedTargetsForExecution(profile strategy.ExecutionStrategyProfile, fall
 // FILE_MUTATE targets become the execution target set. The executor owns the
 // context, model invocation, patch creation, approval gate, apply and
 // verification for the whole batch. Plans that carry SHELL_EXEC (or any other
-// non-file) task fall back to the legacy builder: OS command execution is not a
-// file mutation and the runtime executor does not own it.
+// non-file) task fall back to the per-task dispatcher: OS command execution is
+// not a file mutation and the runtime executor does not own it (handleBuildRun
+// routes its FILE_MUTATE tasks through the executor and its SHELL_EXEC tasks
+// through the shell capability).
 func (m *model) runStagedBuildViaRuntime() tea.Cmd {
 	tasks := m.sess.CurrentTasks
 	if len(tasks) == 0 || m.gateway == nil || m.executor == nil {
-		return m.runBuildCmd("")
+		return m.handleBuildRun(0)
 	}
 	var targets []string
 	var goals []string
 	seen := make(map[string]bool)
 	for _, t := range tasks {
-		if t.Type != "FILE_MUTATE" {
+		if t.Type != "FILE_MUTATE" && t.Type != "GIT_ACTION" {
 			// A non-file task (e.g. SHELL_EXEC) is not a RuntimeExecutor file
-			// mutation — keep the legacy builder for that plan.
-			return m.runBuildCmd("")
+			// mutation — dispatch per-task so FILE_MUTATE tasks still execute
+			// through the executor and SHELL_EXEC through the shell capability.
+			return m.handleBuildRun(0)
 		}
 		if t.Target != "" && !seen[t.Target] {
 			seen[t.Target] = true
@@ -199,7 +203,7 @@ func (m *model) runStagedBuildViaRuntime() tea.Cmd {
 		}
 	}
 	if len(targets) == 0 {
-		return m.runBuildCmd("")
+		return m.handleBuildRun(0)
 	}
 	prompt := strings.Join(goals, "\n")
 	if strings.TrimSpace(prompt) == "" {
@@ -227,13 +231,44 @@ func (m *model) runStagedBuildViaRuntime() tea.Cmd {
 	return m.runRuntimeExecuteCmd(req)
 }
 
+// runRuntimeTaskRequest submits a single staged task's FILE_MUTATE/GIT_ACTION
+// execution through the RuntimeExecutor. It is the executor-side replacement
+// for the legacy per-task proposeBuildPatch loop: the task target becomes the
+// execution target set and the executor owns provider, patch, approval gate,
+// apply and verification.
+func (m *model) runRuntimeTaskRequest(task *plan.Task) tea.Cmd {
+	if m.gateway == nil || m.executor == nil || task == nil {
+		m.push(roleError, "execution runtime not wired — cannot execute the mutation task")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+	prompt := task.Description
+	if strings.TrimSpace(prompt) == "" {
+		prompt = "implement task " + task.Target
+	}
+	profile := m.gateway.SelectStrategy(prompt)
+	profile.Strategy = strategy.TargetedMutation
+	profile.ModelRequired = true
+	profile.StrategyReason = "staged FILE_MUTATE task routed through the runtime executor"
+	m.lastExecutionStrategy = profile
+	targets := []string{task.Target}
+	req := execution.ExecuteRequest{
+		Mode:     modes.ModeBuild.String(),
+		Prompt:   prompt,
+		Targets:  targets,
+		Strategy: &profile,
+	}
+	return m.runRuntimeExecuteCmd(req)
+}
+
 // runRuntimePrompt submits a free-form mutation prompt in build mode through
 // the RuntimeExecutor. It is the cutover equivalent of the legacy build-mode
 // handleMessageContent path (legacy reclassification inside an
 // autonomy-decided workspace).
 func (m *model) runRuntimePrompt(content string) tea.Cmd {
 	if m.gateway == nil || m.executor == nil {
-		return m.runBuildCmd(content)
+		return m.handleBuildRun(0)
 	}
 	profile := m.gateway.SelectStrategy(content)
 	m.lastExecutionStrategy = profile

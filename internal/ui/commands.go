@@ -331,10 +331,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 		// (which leaves the UI frozen in an idle state).
 		if mode == modes.ModeBuild {
 			if m.hasStagedBuildWork() {
-				if runtimeExecutorEnabled() {
-					return tea.Batch(m.runStagedBuildViaRuntime(), switchCmd)
-				}
-				return tea.Batch(m.runBuildCmd(""), switchCmd)
+				return tea.Batch(m.runStagedBuildViaRuntime(), switchCmd)
 			}
 		}
 		return tea.Batch(m.setMode(mode), switchCmd)
@@ -472,12 +469,9 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 	currentMode := m.resolver.Current()
 	if currentMode == modes.ModeInvestigate && len(refFiles) > 0 {
 		if hasMutationIntent(content) {
-			if runtimeExecutorEnabled() {
-				// Phase 1 cutover: an investigate-decided mutation routes
-				// through the RuntimeExecutor, never the legacy build engine.
-				return m.runRuntimePrompt(content)
-			}
-			return m.runBuildCmd(content)
+			// An investigate-decided mutation routes through the RuntimeExecutor,
+			// never the legacy build engine.
+			return m.runRuntimePrompt(content)
 		}
 	}
 
@@ -806,10 +800,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		// engine (the zombie-data / stale-context bug). When no tasks are
 		// staged, block immediately instead of contaminating the executor.
 		if m.resolver.Current() == modes.ModeBuild {
-			if runtimeExecutorEnabled() {
-				return m.runRuntimePrompt(content)
-			}
-			return m.runBuildCmd(content)
+			return m.runRuntimePrompt(content)
 		}
 
 		m.responseBuffer.Reset()
@@ -5817,46 +5808,15 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// handlers via finalizeBuildOperation. The deterministic branches below
 	// (trivial template, stdlib fix) perform zero provider work and run under
 	// their own strict apply deadline, so they need no operation.
+	// ── FILE_MUTATE / GIT_ACTION: RuntimeExecutor mutation ─────────────
+	// These tasks mutate the workspace. The mutation is submitted through the
+	// RuntimeExecutor, which owns the model invocation, patch creation, the
+	// approval gate, apply and verification. The executor's approval gate is
+	// the single mutation authorization surface (Alt+A → RuntimeExecutor.Approve).
 	if targetTask.Type == "FILE_MUTATE" || targetTask.Type == "GIT_ACTION" {
-		// ── TRIVIAL TEMPLATE CREATE (local generation, 0 cloud tokens) ─
-		// If the task targets a trivial template file (LICENSE, .gitignore,
-		// .env) AND the description contains no customization directives
-		// (author name, year, refactor, etc.), generate it locally using
-		// Go string templates. This bypasses the LLM entirely — zero HTTP
-		// calls, zero cloud tokens consumed.
-		if targetTask.IsHardcoded && gateway.IsTrivialCreateTarget(targetTask.Target) {
-			if hasCustomizationDirectives(targetTask.Description) {
-				m.beginOperation(OpBuild)
-				return tea.Batch(
-					func() tea.Msg { return agentStartMsg{label: "hybrid template"} },
-					m.proposeHybridTemplatePatch(targetTask),
-					m.smoothStreamTickCmd(),
-				)
-			}
-			return tea.Batch(
-				func() tea.Msg { return agentStartMsg{label: "template"} },
-				m.applyTrivialTemplate(targetTask),
-			)
-		}
-
-		// ── DETERMINISTIC STDLIB FIX (no LLM) ──────────────────────────
-		// Hardcoded stdlib case-correction tasks carry fix parameters in
-		// the Solution field ("STDLIB:symbol:pkgName:importPath"). Apply
-		// the fix directly by reading the actual file and computing the
-		// targeted replacement — bypassing the LLM entirely. This prevents
-		// the model from generating placeholder code ("// existing code")
-		// and ensures the file is mutated in-place at the correct location.
-		if targetTask.IsHardcoded && strings.HasPrefix(targetTask.Solution, "STDLIB:") {
-			return tea.Batch(
-				func() tea.Msg { return agentStartMsg{label: "stdlib patch"} },
-				m.proposeStdlibBuildPatch(targetTask),
-				m.smoothStreamTickCmd(),
-			)
-		}
-		m.beginOperation(OpBuild)
 		return tea.Batch(
 			func() tea.Msg { return agentStartMsg{label: "patching"} },
-			m.proposeBuildPatch(targetTask),
+			m.runRuntimeTaskRequest(targetTask),
 			m.smoothStreamTickCmd(),
 		)
 	}
@@ -7499,7 +7459,7 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 		// auto-trigger cannot fire (e.g. no staged handoff payload), run the
 		// executor directly against the staged task queue.
 		if mode == modes.ModeBuild && m.hasStagedBuildWork() && m.buildHandoffTriggerContent(mode) == "" {
-			return tea.Batch(m.runBuildCmd(""), cmd)
+			return tea.Batch(m.runStagedBuildViaRuntime(), cmd)
 		}
 
 		if action.Query != "" {

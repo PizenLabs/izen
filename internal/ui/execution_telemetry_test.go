@@ -357,45 +357,51 @@ func TestExecutionTelemetry_InspectDirectiveReachable(t *testing.T) {
 	}
 }
 
-// TestExecutionTelemetry_WorkersReleasedAfterRealBuild drives the legacy
-// build patch-generation path through a real worker and asserts the worker
-// tracker returns to zero live workers once the operation finalizes — the
-// "no worker survives operation finalization" guarantee end to end (test #12).
+// TestExecutionTelemetry_WorkersReleasedAfterRealBuild drives the RuntimeExecutor
+// build-execution path through the real worker machinery and asserts the worker
+// tracker returns to zero live workers once the operation finalizes — the "no
+// worker survives operation finalization" guarantee end to end (test #12). On
+// the executor path the terminal that finalizes the operation is a terminal
+// execution outcome (a failed execution here); a held patch instead pauses at
+// the approval gate under a fresh operation, so the finalization guarantee is
+// exercised through the failure terminal.
 func TestExecutionTelemetry_WorkersReleasedAfterRealBuild(t *testing.T) {
-	mock := &mockProvider{responses: []*ai.Response{{
-		Content:     "<!DOCTYPE html>\n<html><body><h1>New</h1></body></html>\n",
-		TokenInput:  5,
-		TokenOutput: 20,
-	}}}
+	mock := &mockProvider{responses: []*ai.Response{{Content: ""}}}
 	tasks := []plan.Task{{
 		StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Status: "idle",
 		Description: "rewrite index.html",
 	}}
 	m := buildRunModel(t, mock, tasks, smallHTML)
 
-	// The dispatch seam spawns the operation worker; the proposal production
-	// runs synchronously under the operation.
+	// The dispatch seam runs the executor synchronously under the operation; an
+	// empty model artifact is a deterministic execution failure.
 	msgs := runBuildCmdsFiltered(t, m.handleBuildRun(0))
-	var proposal *buildProposalReadyMsg
+	var gem *gatedExecutionMsg
 	for _, msg := range msgs {
-		if p, ok := msg.(buildProposalReadyMsg); ok {
-			proposal = &p
+		if g, ok := msg.(gatedExecutionMsg); ok {
+			gem = &g
 		}
 	}
-	if proposal == nil || proposal.Err != nil {
-		t.Fatalf("expected a valid proposal, got %+v", proposal)
+	if gem == nil || gem.err == nil {
+		t.Fatalf("expected a terminal execution failure, got %+v", gem)
 	}
-	res, _ := m.Update(*proposal)
+	if mock.callCount != 1 {
+		t.Fatalf("provider called %d times, want exactly 1", mock.callCount)
+	}
+	res, _ := m.Update(*gem)
 	m2 := res.(*model)
 	if m2.lastExecutionTelemetry == nil {
-		t.Fatal("no telemetry retained after build")
+		t.Fatal("no telemetry retained after the build execution terminal")
+	}
+	if !m2.lastExecutionTelemetry.Finalized() {
+		t.Fatal("telemetry not finalized after the build execution terminal")
 	}
 	snap := m2.lastExecutionSnapshot
 	if len(snap.LiveWorkers) != 0 {
 		t.Fatalf("live workers after build finalization: %v", snap.LiveWorkers)
 	}
-	if snap.Invocations != 1 {
-		t.Fatalf("build performed %d provider invocations, want 1", snap.Invocations)
+	if snap.Outcome != "failure" {
+		t.Fatalf("telemetry outcome = %q, want failure", snap.Outcome)
 	}
 }
 
