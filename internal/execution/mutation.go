@@ -76,10 +76,26 @@ const (
 	OutcomeNoChange              MutationOutcome = "nochange"
 	OutcomeNoArtifact            MutationOutcome = "no_artifact"
 	OutcomePatchGenerationFailed MutationOutcome = "patch_failed"
-	OutcomeApplyFailed           MutationOutcome = "apply_failed"
-	OutcomeVerifyFailed          MutationOutcome = "verify_failed"
-	OutcomeSkipped               MutationOutcome = "skipped"
-	OutcomeCancelled             MutationOutcome = "cancelled"
+	// OutcomeArtifactRejected is the terminal outcome of an execution whose
+	// model output produced an artifact that FAILED the artifact validation
+	// boundary (malformed HTML/JSON/Go, raw patch markers, truncated content).
+	// It is distinct from OutcomePatchGenerationFailed: an artifact existed but
+	// was rejected before any approval or mutation surface.
+	OutcomeArtifactRejected MutationOutcome = "artifact_rejected"
+	OutcomeApplyFailed      MutationOutcome = "apply_failed"
+	OutcomeVerifyFailed     MutationOutcome = "verify_failed"
+	OutcomeSkipped          MutationOutcome = "skipped"
+	OutcomeCancelled        MutationOutcome = "cancelled"
+	// OutcomePendingApproval is the outcome of a targeted mutation that stopped
+	// at the human-in-the-loop approval gate with a valid held artifact. It is
+	// NEVER a terminal mutation outcome — the execution is paused, awaiting a
+	// human decision (Approve/Reject).
+	OutcomePendingApproval MutationOutcome = "pending_approval"
+	// OutcomeRejected is the terminal outcome of an execution whose proposal
+	// the human explicitly rejected at the approval gate. It is distinct from
+	// OutcomeCancelled (an execution aborted mid-run): a rejection is a
+	// deliberate decision on a held artifact.
+	OutcomeRejected MutationOutcome = "rejected"
 	// OutcomeFailed is the generic terminal execution failure (no artifact was
 	// produced, or a non-apply stage failed). It is distinct from the
 	// apply/verify-specific failures so evidence never overclaims a stage.
@@ -103,6 +119,8 @@ func (o MutationOutcome) Display() string {
 		return "no artifact"
 	case OutcomePatchGenerationFailed:
 		return "patch generation failed"
+	case OutcomeArtifactRejected:
+		return "artifact rejected"
 	case OutcomeApplyFailed:
 		return "apply failed"
 	case OutcomeVerifyFailed:
@@ -111,6 +129,10 @@ func (o MutationOutcome) Display() string {
 		return "skipped"
 	case OutcomeCancelled:
 		return "cancelled"
+	case OutcomePendingApproval:
+		return "pending approval"
+	case OutcomeRejected:
+		return "rejected"
 	default:
 		return string(o)
 	}
@@ -125,6 +147,44 @@ func (o MutationOutcome) MutationSucceeded() bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// AggregateMutationOutcome derives the aggregate semantic result of a
+// multi-file mutation from its per-file evidence. The rules are explicit so a
+// batch never overclaims:
+//
+//   - any changed file            → changed   (the mutation produced a mutation)
+//   - otherwise any created file  → created
+//   - otherwise any nochange file → nochange  (everything applied, nothing changed)
+//   - otherwise                   → no_artifact (no apply evidence)
+//
+// A failure outcome is NEVER derived here: failures carry their own explicit
+// aggregate (apply_failed / verify_failed / cancelled) chosen at the boundary
+// that rolled back the transaction.
+func AggregateMutationOutcome(evidence []MutationEvidence) MutationOutcome {
+	nochange := false
+	created := false
+	changed := false
+	for _, ev := range evidence {
+		switch ev.Outcome {
+		case OutcomeChanged:
+			changed = true
+		case OutcomeCreated:
+			created = true
+		case OutcomeNoChange:
+			nochange = true
+		}
+	}
+	switch {
+	case changed:
+		return OutcomeChanged
+	case created:
+		return OutcomeCreated
+	case nochange:
+		return OutcomeNoChange
+	default:
+		return OutcomeNoArtifact
 	}
 }
 
@@ -143,6 +203,8 @@ func ParseMutationOutcome(s string) MutationOutcome {
 		return OutcomeNoArtifact
 	case "patch_failed", "patch-failed", "patch generation failed":
 		return OutcomePatchGenerationFailed
+	case "artifact_rejected", "artifact-rejected", "artifact rejected":
+		return OutcomeArtifactRejected
 	case "apply_failed", "apply-failed", "apply failed":
 		return OutcomeApplyFailed
 	case "verify_failed", "verify-failed", "verify failed":
@@ -151,6 +213,10 @@ func ParseMutationOutcome(s string) MutationOutcome {
 		return OutcomeSkipped
 	case "cancelled", "canceled":
 		return OutcomeCancelled
+	case "pending_approval", "pending approval":
+		return OutcomePendingApproval
+	case "rejected":
+		return OutcomeRejected
 	case "failed", "execution_failed":
 		return OutcomeFailed
 	case "completed", "done":
