@@ -985,6 +985,11 @@ type model struct {
 	// execution currently staged in the proposal dock. Non-empty routes the
 	// approval keys through RuntimeExecutor.Approve/Reject.
 	executorPendingPatchID string
+	// executorPendingTargets is the execution target set of the approval-held
+	// patch. It is captured when the proposal is staged so the approval key
+	// can issue a MutationAuthorization over exactly these files before
+	// RuntimeExecutor.Approve applies them.
+	executorPendingTargets []string
 
 	// microkernel is the immutable microkernel pipeline adapter. It primes
 	// plan/investigate command handling for greenfield generation prompts so
@@ -2143,12 +2148,16 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		if !p.Success {
 			outcome = OpOutcomeFailure
 		}
-		if p.Outcome == string(execution.OutcomeCancelled) {
+		if p.Outcome == string(execution.OutcomeCancelled) || p.Outcome == string(execution.OutcomeRejected) {
 			outcome = OpOutcomeCancelled
 		}
 		m.clearExecutionLoading(outcome)
 	case events.ApprovalRequiredPayload:
 		m.logRuntimeDetail("[runtime] approval required: %s", p.Target)
+	case events.ApprovalRejectedPayload:
+		// The human explicitly rejected the held proposal — a real lifecycle
+		// transition, distinct from a cancellation.
+		m.logRuntimeDetail("[runtime] approval rejected: %s", p.Target)
 	case events.IntentClassifiedPayload:
 		// Hybrid Intent Gateway classification outcome projected onto the
 		// activity log. Ambiguity is surfaced so the operator sees WHY the UI

@@ -417,7 +417,7 @@ func (m *model) recordRuntimeProof(res *execution.ExecutionResult) {
 		FilesystemChanged:   applied,
 		VerificationPassed:  pr.Verification.Passed,
 		MutationSetState:    string(pr.Outcome),
-		RolledBack:          pr.Outcome == execution.OutcomeApplyFailed,
+		RolledBack:          pr.Outcome == execution.OutcomeApplyFailed || pr.Outcome == execution.OutcomeVerifyFailed,
 		FailureNode:         failureNode,
 	}
 }

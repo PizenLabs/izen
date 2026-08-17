@@ -273,13 +273,49 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		m.pushArtifact(res.ArtifactKind, executionFirstTarget(res.Targets), res.Content)
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
-		return m, m.tokenUsageCmd(tokenInput, tokenOutput)
+		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
+	}
+
+	// ── NO-CHANGE TERMINAL: the mutation applied but nothing changed ──
+	// A committed OutcomeNoChange is a successful execution that produced no
+	// filesystem change. It is projected distinctly — never the generic
+	// "Completed — nothing produced." fallback.
+	if res.Proof != nil && res.Proof.Outcome == execution.OutcomeNoChange {
+		m.executorPendingPatchID = ""
+		m.executorPendingTargets = nil
+		m.pendingHotfixTask = nil
+		m.pendingHotfixPatch = nil
+		m.pendingProposals = nil
+		m.resolveApprovalState()
+		m.finalizeOperation(OpOutcomeSuccess, nil)
+		m.push(roleSystem, infoStyle.Render("  "+Icon.Info+" Mutation applied — no content changed."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
+	}
+
+	// ── REJECTED TERMINAL: the human rejected the held proposal ────────
+	// A rejection is a deliberate decision on the held artifact, distinct from
+	// an execution cancelled mid-run.
+	if res.Proof != nil && res.Proof.Outcome == execution.OutcomeRejected {
+		m.executorPendingPatchID = ""
+		m.executorPendingTargets = nil
+		m.pendingHotfixTask = nil
+		m.pendingHotfixPatch = nil
+		m.pendingProposals = nil
+		m.resolveApprovalState()
+		m.finalizeOperation(OpOutcomeCancelled, nil)
+		m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Rejected — no files were modified."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
 	}
 
 	// ── APPROVAL TERMINAL: the runtime applied the mutation ────────
 	terminal := res.Proof != nil && res.Proof.Outcome.MutationSucceeded()
 	if terminal {
 		m.executorPendingPatchID = ""
+		m.executorPendingTargets = nil
 		m.pendingHotfixTask = nil
 		m.pendingHotfixPatch = nil
 		m.pendingProposals = nil
@@ -295,12 +331,13 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
-		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, true)
+		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
 	}
 
 	// ── CANCELLED / REJECTED TERMINAL ──────────────────────────────
 	if res.Proof != nil && res.Proof.Outcome == execution.OutcomeCancelled {
 		m.executorPendingPatchID = ""
+		m.executorPendingTargets = nil
 		m.pendingHotfixTask = nil
 		m.pendingHotfixPatch = nil
 		m.pendingProposals = nil
@@ -309,7 +346,7 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Cancelled. No files were modified."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
-		return m, m.tokenUsageCmd(tokenInput, tokenOutput)
+		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
 	}
 
 	// ── CLARIFICATION REQUIRED (no model call, no mutation) ────────
@@ -328,6 +365,9 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 	// back through RuntimeExecutor.Approve/Reject (keys.go).
 	if res.PendingPatchID != "" && len(res.Targets) > 0 {
 		target := res.Targets[0]
+		// The execution target set is captured for the approval authorization
+		// (Alt+A issues a MutationAuthorization over exactly these files).
+		m.executorPendingTargets = append([]string(nil), res.Targets...)
 		task := &plan.Task{
 			StepNum:     0,
 			Status:      "idle",
@@ -361,14 +401,14 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		m.push(roleSystem, infoStyle.Render("Review the code diff below. Use Alt+A to accept, Alt+R to reject."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
-		return m, m.tokenUsageCmd(tokenInput, tokenOutput)
+		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
 	}
 
 	m.finalizeOperation(OpOutcomeSuccess, nil)
 	m.push(roleSystem, infoStyle.Render("Completed — nothing produced."))
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
-	return m, m.tokenUsageCmd(tokenInput, tokenOutput)
+	return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
 }
 
 // runPromptExecution routes a $prompt action through the unified gateway. It is

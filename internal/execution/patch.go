@@ -331,11 +331,30 @@ func (pm *PatchManager) recordTransaction(filePath string) error {
 	return pm.mutationSet.Record(filePath)
 }
 
+// applyFacts are the authoritative apply-boundary facts a mutation evidence
+// record must carry. They are derived ONLY from what the apply step actually
+// did — never from the model, the provider, or the parser:
+//
+//   - executed: the apply step ran against the filesystem (a write was
+//     attempted). False for resolution failures that never reached the write.
+//   - changed: the post-apply filesystem bytes differ byte-for-byte from the
+//     pre-apply bytes. A no-change or a rolled-back apply is never "changed".
+//   - verifyRun / verifyPassed: whether the deterministic verification gate
+//     executed and whether it passed. Never fabricated for a gate that did
+//     not run.
+type applyFacts struct {
+	executed     bool
+	changed      bool
+	verifyRun    bool
+	verifyPassed bool
+}
+
 // recordMutationEvidence appends the semantic outcome of an apply attempt into
 // the owned MutationSet. It reuses the existing MutationEvidence vocabulary —
 // no second mutation taxonomy. It runs at the real apply boundary, so the
-// record reflects what Apply actually did.
-func (pm *PatchManager) recordMutationEvidence(patch *Patch, outcome MutationOutcome, reason string) {
+// record reflects what Apply actually did: apply-execution, filesystem result
+// and verification facts come from the boundary, never from a prior stage.
+func (pm *PatchManager) recordMutationEvidence(patch *Patch, outcome MutationOutcome, reason string, facts applyFacts) {
 	if pm.mutationSet == nil || patch == nil {
 		return
 	}
@@ -347,16 +366,27 @@ func (pm *PatchManager) recordMutationEvidence(patch *Patch, outcome MutationOut
 	}
 	ev.ArtifactPresent = patch.Modified != ""
 	ev.DiffPresent = patch.Modified != "" && strings.Contains(patch.Modified, "@@")
+	ev.ApplyExecuted = facts.executed
+	ev.FilesystemChanged = facts.changed
+	ev.VerificationRun = facts.verifyRun
+	ev.VerificationPassed = facts.verifyPassed
 	if outcome == OutcomeChanged || outcome == OutcomeCreated {
-		ev.ApplyExecuted = true
-		ev.FilesystemChanged = true
-		ev.VerificationRun = true
-		ev.VerificationPassed = true
 		added, removed := countUnifiedDiffLines(patch.Modified)
 		ev.DiffAdds = added
 		ev.DiffRemoves = removed
 	}
 	pm.mutationSet.AddOutcome(ev)
+}
+
+// recordVerification captures the verification-gate report actually produced
+// inside the apply boundary so the owning MutationSet (and the execution
+// result) reflects the real gate outcome. It is a no-op when the gate did not
+// run or no boundary is attached.
+func (pm *PatchManager) recordVerification(report *VerificationReport) {
+	if report == nil || pm.mutationSet == nil {
+		return
+	}
+	pm.mutationSet.Verification = report
 }
 
 func (pm *PatchManager) SetVerifier(v *Verifier) {
@@ -726,7 +756,10 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 			return fmt.Errorf("patch applied but audit log failed: %w", err)
 		}
 		pm.recordLedgerAndSummarize(patch)
-		pm.recordMutationEvidence(patch, OutcomeCreated, "")
+		// The FILE_CREATE boundary executed a write that created the file; the
+		// verification gate does not run on this path, so the evidence never
+		// claims a verification that did not happen.
+		pm.recordMutationEvidence(patch, OutcomeCreated, "", applyFacts{executed: true, changed: true})
 		return pm.store(patch)
 	}
 
@@ -786,7 +819,9 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		if globalActivityLog != nil {
 			globalActivityLog("[FAIL] patch rejected on %s: %v", patch.File, patchErr)
 		}
-		pm.recordMutationEvidence(patch, OutcomeApplyFailed, patchErr.Error())
+		// The apply never reached the filesystem write — no mutation was
+		// executed and no verification ran.
+		pm.recordMutationEvidence(patch, OutcomeApplyFailed, patchErr.Error(), applyFacts{})
 		return fmt.Errorf("apply patch to %s: %w", patch.File, patchErr)
 	}
 
@@ -823,7 +858,7 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 					patch.File, detail)
 			}
 			pm.recordLedgerAndSkipped(patch)
-			pm.recordMutationEvidence(patch, OutcomeSkipped, "destructive patch skipped as no-op, file left unchanged")
+			pm.recordMutationEvidence(patch, OutcomeSkipped, "destructive patch skipped as no-op, file left unchanged", applyFacts{})
 			return fmt.Errorf("%w: proposed patch for %s removes %d/%d lines (final: %d lines) — skipping as no-op, file left unchanged",
 				ErrDestructivePatchSkipped, patch.File, removed, origCount, finalCount)
 		}
@@ -846,9 +881,17 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	// specific faulty lines, and route a pinpointed, high-velocity micro-patch
 	// back to fix the syntax typo natively at the execution layer.
 	//
-	// This is the core of the Micro-Fix Loop Architecture.
+	// This is the core of the Micro-Fix Loop Architecture. The gate report is
+	// the AUTHORITATIVE verification result of the apply: it is captured on
+	// the mutation boundary (recordVerification) so the execution result reads
+	// the real gate outcome and never re-runs verification after commit.
+	gateRun := false
+	gatePassed := false
 	if pm.verifier != nil {
 		report := pm.verifier.RunAll()
+		gateRun = true
+		gatePassed = report.Passed
+		pm.recordVerification(&report)
 		if !report.Passed {
 			// Verification failed — extract syntax errors for micro-fix loop.
 			var syntaxErrors []string
@@ -877,7 +920,15 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 			if len(syntaxErrors) > 0 {
 				errMsg += ": " + syntaxErrors[0]
 			}
-			pm.recordMutationEvidence(patch, OutcomeVerifyFailed, errMsg)
+			// The apply DID execute (the write ran) and was then rolled back.
+			// The evidence records the actual post-restore filesystem state —
+			// the truth is byte comparison, never an assumption.
+			diskChanged := true
+			if data, err := os.ReadFile(fullPath); err == nil {
+				diskChanged = string(data) != patch.Original
+			}
+			pm.recordMutationEvidence(patch, OutcomeVerifyFailed, errMsg,
+				applyFacts{executed: true, changed: diskChanged, verifyRun: true, verifyPassed: false})
 			return fmt.Errorf("%s", errMsg)
 		}
 
@@ -953,7 +1004,24 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	}
 
 	pm.recordLedgerAndSummarize(patch)
-	pm.recordMutationEvidence(patch, OutcomeChanged, "")
+	// ── MUTATION TRUTH (Phase 1 cutover safety rule) ──────────────────
+	// Never report a mutation as CHANGED unless actual mutation evidence
+	// confirms the filesystem changed. When the resolved final content is
+	// byte-for-byte identical to the on-disk original, the apply wrote
+	// nothing: the outcome is NO_CHANGE, never changed. Model output is never
+	// execution truth.
+	if final == patch.Original {
+		// The apply executed (wrote byte-identical content) and the filesystem
+		// did not change. NO_CHANGE is only valid here because a valid artifact
+		// was compared byte-for-byte against the real on-disk state. The
+		// verification gate facts are the ones that actually ran — never
+		// fabricated.
+		pm.recordMutationEvidence(patch, OutcomeNoChange, "no file content changed",
+			applyFacts{executed: true, verifyRun: gateRun, verifyPassed: gatePassed})
+		return pm.store(patch)
+	}
+	pm.recordMutationEvidence(patch, OutcomeChanged, "",
+		applyFacts{executed: true, changed: true, verifyRun: gateRun, verifyPassed: gatePassed})
 
 	return pm.store(patch)
 }

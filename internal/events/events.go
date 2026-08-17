@@ -75,7 +75,7 @@ const (
 	// cut short by a context deadline or cancellation so tokens already billed
 	// by the provider are never silently zeroed in local telemetry.
 	EventStreamUsage = "stream.usage"
-// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──────────
+	// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──────────
 	// These events are the single authoritative stream of a full execution
 	// through the RuntimeExecutor. They are emitted ONLY at real runtime
 	// boundaries — never synthesised by the presentation layer — so the UI can
@@ -96,6 +96,11 @@ const (
 	// It is distinct from EventApprovalRequested (the patch-engine Tier-4
 	// fallback event) — it carries the runtime request + target.
 	EventApprovalRequired = "approval.required"
+	// EventApprovalRejected is the canonical runtime event emitted when the
+	// human explicitly rejects the held proposal at the approval gate. It is a
+	// real lifecycle transition, distinct from EventExecutionFinished(success=
+	// false) for an execution cancelled mid-run.
+	EventApprovalRejected = "approval.rejected"
 
 	// ── PROVIDER STREAM LIFECYCLE (RuntimeExecutor, live evidence) ───────
 	// These events make a runtime model invocation observable BETWEEN
@@ -420,6 +425,14 @@ type ApprovalRequiredPayload struct {
 	RequestID string
 	Target    string
 	Preview   string
+}
+
+// ApprovalRejectedPayload carries a human rejection of a held RuntimeExecutor
+// proposal at the approval gate.
+type ApprovalRejectedPayload struct {
+	RequestID string
+	Target    string
+	Reason    string
 }
 
 // ProviderWaitingPayload records that a provider round-trip is in flight
@@ -803,6 +816,12 @@ func NewExecutionFinished(requestID string, success bool, outcome string) Domain
 // NewApprovalRequired publishes a RuntimeExecutor approval-gate request.
 func NewApprovalRequired(requestID, target, preview string) DomainEvent {
 	return newEvent(EventApprovalRequired, ApprovalRequiredPayload{RequestID: requestID, Target: target, Preview: preview})
+}
+
+// NewApprovalRejected publishes that the human rejected the held RuntimeExecutor
+// proposal at the approval gate.
+func NewApprovalRejected(requestID, target, reason string) DomainEvent {
+	return newEvent(EventApprovalRejected, ApprovalRejectedPayload{RequestID: requestID, Target: target, Reason: reason})
 }
 
 // NewProviderWaiting publishes that a provider round-trip is in flight.

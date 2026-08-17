@@ -80,6 +80,11 @@ func NewV3ArtifactPipeline() *V3ArtifactPipeline {
 	}
 }
 
+// v3Artifact is the shared V3 artifact pipeline the RuntimeExecutor uses to
+// validate mutation artifacts at the artifact boundary. It is read-only and
+// safe for concurrent use.
+var v3Artifact = NewV3ArtifactPipeline()
+
 // Parser returns the strict contract parser.
 func (p *V3ArtifactPipeline) Parser() *extractor.ArtifactContractParser { return p.parser }
 

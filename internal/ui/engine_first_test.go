@@ -102,14 +102,16 @@ func TestEngineFirstPromptSimpleTargeted(t *testing.T) {
 		t.Fatalf("mode switched to /%s — modes must not decide the execution path", m.resolver.Current())
 	}
 
-	// The execution reached the RuntimeExecutor approval gate.
-	if gem.res == nil || gem.err != nil {
-		t.Fatalf("gate result err = %v", gem.err)
-	}
+	// The execution reached the RuntimeExecutor approval gate with a valid
+	// held artifact: the outcome is pending_approval (never a fabricated
+	// mutation, never "no artifact").
 	if gem.res.PendingPatchID == "" {
 		t.Fatal("expected a pending patch id (approval gate)")
 	}
-	if !gem.res.Proof.Outcome.MutationSucceeded() && gem.res.Proof.Outcome != execution.OutcomeNoArtifact {
+	if gem.res.Proof.Outcome.MutationSucceeded() {
+		t.Fatalf("pre-approval proof outcome %q must not claim a mutation", gem.res.Proof.Outcome)
+	}
+	if gem.res.Proof.Outcome != execution.OutcomePendingApproval && gem.res.Proof.Outcome != execution.OutcomeNoArtifact {
 		t.Fatalf("unexpected proof outcome %q", gem.res.Proof.Outcome)
 	}
 }
@@ -269,7 +271,10 @@ func TestEngineFirstPromptRoutesThroughExecutor(t *testing.T) {
 	if gem.res.PendingPatchID == "" {
 		t.Fatal("expected a pending patch id (approval gate)")
 	}
-	if gem.res.Proof == nil || !gem.res.Proof.Outcome.MutationSucceeded() && gem.res.Proof.Outcome != execution.OutcomeNoArtifact {
+	if gem.res.Proof == nil || gem.res.Proof.Outcome.MutationSucceeded() {
+		t.Fatalf("pre-approval proof outcome %v must not claim a mutation", gem.res.Proof.Outcome)
+	}
+	if gem.res.Proof.Outcome != execution.OutcomePendingApproval && gem.res.Proof.Outcome != execution.OutcomeNoArtifact {
 		t.Fatalf("unexpected proof outcome %v", gem.res.Proof.Outcome)
 	}
 }

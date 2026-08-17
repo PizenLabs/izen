@@ -65,13 +65,34 @@ type ExecuteRequest struct {
 	// the runtime selects it itself. It is the single source of the execution
 	// path decision — never a mode.
 	Strategy *strategy.ExecutionStrategyProfile
+	// ── Autonomy handoff (Phase 1 Step 6) ─────────────────────────────
+	// These fields carry the autonomy decision metadata so an already
+	// classified intent is never re-classified downstream and the decision
+	// facts (intent, confidence, target confidence, workspace scope) survive
+	// into the execution proof. They are optional: direct/gated callers leave
+	// them empty.
+	Intent           string
+	IntentConfidence float64
+	TargetConfidence float64
+	Scope            string
+	// Evidence is the authoritative bounded evidence ledger compiled for the
+	// target set (structural findings, redundancy ledger). It is authoritative
+	// evidence; the full-file context the runtime reads is supporting context
+	// only (Phase 1 Step 5).
+	Evidence string
 }
 
 // ModelInvocation records one provider call with its authoritative usage.
+// TokenInput/TokenOutput are the provider-reported counts (zero when usage is
+// unknown); Known distinguishes "provider reported usage" from "usage unknown"
+// so a genuine zero is never conflated with a missing usage record.
 type ModelInvocation struct {
-	Model       string `json:"model"`
-	TokenInput  int    `json:"token_input"`
-	TokenOutput int    `json:"token_output"`
+	Model           string `json:"model"`
+	TokenInput      int    `json:"token_input"`
+	TokenOutput     int    `json:"token_output"`
+	Known           bool   `json:"known"`
+	CachedTokens    int    `json:"cached_tokens,omitempty"`
+	ReasoningTokens int    `json:"reasoning_tokens,omitempty"`
 }
 
 // GraphStep is one executed node of the execution graph.
@@ -106,9 +127,17 @@ type ExecutionProof struct {
 	// ContextDecisions records the strategy-owned context decisions (policy,
 	// budget, per-item inclusion reasons) of the execution.
 	ContextDecisions []ContextDecision `json:"context_decisions,omitempty"`
-	Outcome          MutationOutcome   `json:"outcome"`
-	StartedAt        time.Time         `json:"started_at"`
-	FinishedAt       time.Time         `json:"finished_at"`
+	// Intent / IntentConfidence / TargetConfidence / Scope preserve the
+	// autonomy decision handoff (Phase 1 Step 6): the execution proof carries
+	// the classified intent and its confidence so the runtime never loses the
+	// decision facts between autonomy and execution.
+	Intent           string          `json:"intent,omitempty"`
+	IntentConfidence float64         `json:"intent_confidence,omitempty"`
+	TargetConfidence float64         `json:"target_confidence,omitempty"`
+	Scope            string          `json:"scope,omitempty"`
+	Outcome          MutationOutcome `json:"outcome"`
+	StartedAt        time.Time       `json:"started_at"`
+	FinishedAt       time.Time       `json:"finished_at"`
 }
 
 // ContextDecision is one strategy-owned context decision recorded in the
@@ -143,6 +172,15 @@ type ExecutionCompleted struct {
 	// OutputTokens is the aggregate provider-reported output usage of every
 	// invocation of the execution.
 	OutputTokens int
+	// CachedTokens / ReasoningTokens are the aggregate provider-reported
+	// cached and reasoning token counts (semantically distinct from
+	// input/output; zero when the provider did not report them).
+	CachedTokens    int
+	ReasoningTokens int
+	// Known reports whether at least one invocation carried provider-reported
+	// usage. When false, InputTokens/OutputTokens are NOT a genuine zero — the
+	// usage is unknown and must render as "usage unknown", never "0 tok".
+	Known bool
 	// Latency is the wall-clock duration of the execution window.
 	Latency time.Duration
 	// Artifact is the semantic artifact the execution produced ("" when none).
@@ -286,6 +324,13 @@ func (x *RuntimeExecutor) nextID() string {
 // pair).
 var ErrProviderModelMismatch = errors.New("executor: provider/model mismatch")
 
+// ErrArtifactRejected is the deterministic error returned when a mutation
+// artifact fails the artifact validation boundary before any approval or
+// mutation surface (malformed HTML/JSON/Go, raw patch markers, truncated
+// content). The execution outcome is OutcomeArtifactRejected — an artifact
+// existed but was rejected, distinct from a missing artifact.
+var ErrArtifactRejected = errors.New("executor: mutation artifact rejected")
+
 // openRouterStyleModelIDRe matches OpenRouter's vendor/model schema — the same
 // schema OpenRouter itself requires for every model ID. A model carrying a
 // vendor prefix (vendor/model) is a cross-provider ID; a bare local ID
@@ -380,6 +425,12 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		Mode:      req.Mode,
 		Proof:     &ExecutionProof{RequestID: requestID, StrategyReason: "", StartedAt: time.Now()},
 	}
+	// Preserve the autonomy decision handoff (Phase 1 Step 6) so the intent,
+	// confidence, target confidence and scope survive into the execution proof.
+	res.Proof.Intent = req.Intent
+	res.Proof.IntentConfidence = req.IntentConfidence
+	res.Proof.TargetConfidence = req.TargetConfidence
+	res.Proof.Scope = req.Scope
 
 	start := time.Now()
 	// ── RUNTIME-OWNED EXECUTION GRAPH (Phase 5) ───────────────────────
@@ -543,6 +594,19 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			setProofGraph(res, g)
 			return x.finalizeResult(res), nil
 		}
+		if errors.Is(err, ErrArtifactRejected) {
+			// The model produced an artifact that FAILED the artifact
+			// boundary. The execution is a permanent artifact rejection, never
+			// a recoverable patch failure: retrying the same malformed output
+			// cannot repair it.
+			g.FailExecution(events.FailurePermanent, err, "executor.artifact")
+			res.ArtifactKind = ""
+			res.Err = err
+			res.Proof.Outcome = OutcomeArtifactRejected
+			res.Proof.FinishedAt = time.Now()
+			setProofGraph(res, g)
+			return x.finalizeResult(res), err
+		}
 		g.FailExecution(events.FailureRecoverable, err, "executor.model")
 		res.ArtifactKind = ""
 		res.Err = err
@@ -583,7 +647,9 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	x.pending[patches[0].ID] = pm
 	x.mu.Unlock()
 	res.PendingPatchID = patches[0].ID
-	res.Proof.Outcome = OutcomeNoArtifact // pending approval
+	// The execution stopped at the approval gate with a VALID held artifact —
+	// the outcome is pending approval, never "no artifact".
+	res.Proof.Outcome = OutcomePendingApproval
 	res.Proof.FinishedAt = time.Now()
 	g.WaitApproval(target, res.Diff)
 	setProofGraph(res, g)
@@ -636,6 +702,12 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 	x.patches.SetMutationSet(ms)
 	x.patches.SetAuthorization(x.auth)
 	if x.verifier != nil {
+		// Phase 1 safety rule: the verifier is the APPLY GATE, not an
+		// after-the-fact report. Attaching it to the runtime's own
+		// PatchManager activates the micro-fix gate inside Apply, so a
+		// verification failure restores the shadow backup and fails the apply
+		// (never a committed mutation reported as changed).
+		x.patches.SetVerifier(x.verifier)
 		x.verifier.SetAuthorization(x.auth)
 	}
 	pm.ms = ms
@@ -654,20 +726,51 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 			break
 		}
 	}
+
+	// ── Verification truth comes from the gate that ACTUALLY ran ──────
+	// The verification gate executes INSIDE the apply boundary (PatchManager
+	// Apply) as the apply gate, and its report is captured on the MutationSet.
+	// The execution reads that real gate outcome — it never re-runs
+	// verification after commit and never reports a verification that did not
+	// happen. Verification therefore always precedes the terminal result.
+	var verificationSteps []string
+	if ms.Verification != nil {
+		res.Verification = *ms.Verification
+		res.Proof.Verification = res.Verification
+		for _, s := range res.Verification.Results {
+			verificationSteps = append(verificationSteps, s.Step.Name)
+		}
+	}
+
 	if applyErr != nil {
+		// ── FAILURE: roll back the WHOLE transaction ─────────────────
+		// A failure at any point rolls back the entire boundary. The
+		// aggregate outcome is a FAILURE outcome — never "changed", even when
+		// a sibling file applied before the failure (the rollback restored
+		// it). Per-file evidence is corrected to the actual post-rollback
+		// filesystem state so nothing overclaims a mutation.
 		_ = ms.RollbackTo(MutationFailed)
+		// Reconcile per-file evidence to the actual post-rollback filesystem
+		// state BEFORE it is copied into the result/proof.
+		x.correctEvidenceAfterRollback(ms, pm.patches)
 		outcome := OutcomeApplyFailed
-		for _, p := range pm.patches {
-			if ms.OutcomeFor(p.File) != OutcomeNoArtifact {
-				outcome = ms.OutcomeFor(p.File)
-				break
-			}
+		if ms.Verification != nil && !ms.Verification.Passed {
+			outcome = OutcomeVerifyFailed
 		}
 		res.Mutations = append(res.Mutations, ms.Outcomes...)
 		res.Proof.Mutations = res.Mutations
 		res.Proof.Outcome = outcome
+		res.Proof.AffectedFiles = append([]string(nil), pm.targets...)
+		res.Proof.DiffSummary = pm.diffs
 		for _, p := range pm.patches {
-			g.CompleteMutation(p.File, string(outcome))
+			o := ms.OutcomeFor(p.File)
+			if o == OutcomeNoArtifact {
+				o = OutcomeApplyFailed
+			}
+			g.CompleteMutation(p.File, string(o))
+		}
+		if ms.Verification != nil {
+			g.CompleteVerification(ms.Verification.Passed, verificationSteps)
 		}
 		g.FailExecution(events.FailureRecoverable, applyErr, "executor.mutation")
 		res.Err = applyErr
@@ -676,42 +779,67 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		return x.finalizeResult(res), applyErr
 	}
 
-	// ── Commit the transaction ─────────────────────────────────────────
-	outcome := OutcomeChanged
-	for _, p := range pm.patches {
-		if o := ms.OutcomeFor(p.File); o != OutcomeNoArtifact {
-			outcome = o
-		}
-	}
+	// ── SUCCESS: commit the transaction ─────────────────────────────
+	// The aggregate outcome is derived from the per-file evidence with
+	// explicit multi-file semantics: any changed → changed; otherwise any
+	// created → created; otherwise any nochange → nochange. A multi-file
+	// mutation never reports success merely because one file changed.
 	_ = ms.Commit()
+	outcome := AggregateMutationOutcome(ms.Outcomes)
 	res.Mutations = append(res.Mutations, ms.Outcomes...)
 	res.Proof.Mutations = res.Mutations
 	res.Proof.Outcome = outcome
 	res.Proof.AffectedFiles = append([]string(nil), pm.targets...)
 	res.Proof.DiffSummary = pm.diffs
 	for _, p := range pm.patches {
-		g.CompleteMutation(p.File, string(outcome))
-	}
-
-	// ── Verification evidence comes from the real verifier ─────────────
-	if x.verifier != nil {
-		//nolint:contextcheck // Verifier.RunAll predates context propagation; the apply is already bounded.
-		report := x.verifier.RunAll()
-		res.Verification = report
-		res.Proof.Verification = report
-		var steps []string
-		for _, s := range report.Results {
-			steps = append(steps, s.Step.Name)
+		o := ms.OutcomeFor(p.File)
+		if o == OutcomeNoArtifact {
+			o = OutcomeNoChange
 		}
-		g.CompleteVerification(report.Passed, steps)
+		g.CompleteMutation(p.File, string(o))
+	}
+	if ms.Verification != nil {
+		g.CompleteVerification(ms.Verification.Passed, verificationSteps)
 	} else {
-		g.Skip(runtimegraph.StageVerification, "no verifier attached")
+		g.Skip(runtimegraph.StageVerification, "no verifier gate ran during apply")
 	}
 
 	g.CompleteExecution(string(outcome))
 	res.Proof.FinishedAt = time.Now()
 	setProofGraph(res, g)
 	return x.finalizeResult(res), nil
+}
+
+// correctEvidenceAfterRollback reconciles the per-file mutation evidence to
+// the actual post-rollback filesystem state: a mutation that was applied and
+// then rolled back is NOT changed on disk. The evidence records apply-time
+// facts (the write happened); the rollback truth is byte comparison against
+// the held patch originals. It is a no-op when a file is missing.
+func (x *RuntimeExecutor) correctEvidenceAfterRollback(ms *MutationSet, patches []*Patch) {
+	if ms == nil {
+		return
+	}
+	originals := make(map[string]string, len(patches))
+	for _, p := range patches {
+		if p != nil {
+			originals[p.File] = p.Original
+		}
+	}
+	for i := range ms.Outcomes {
+		orig, ok := originals[ms.Outcomes[i].File]
+		if !ok {
+			continue
+		}
+		fullPath := filepath.Join(x.root, ms.Outcomes[i].File)
+		data, err := os.ReadFile(fullPath)
+		if err != nil {
+			// A file that no longer exists after rollback was created by this
+			// mutation and removed — it is not changed.
+			ms.Outcomes[i].FilesystemChanged = false
+			continue
+		}
+		ms.Outcomes[i].FilesystemChanged = string(data) != orig
+	}
 }
 
 // Reject resolves the approval gate negatively: the held patches are never
@@ -754,10 +882,13 @@ func (x *RuntimeExecutor) Reject(ctx context.Context, patchID, reason string) (*
 	for _, p := range pm.patches {
 		_ = ms.Record(p.File)
 	}
-	_ = ms.RollbackTo(MutationCancelled)
-	g.CancelExecution(string(OutcomeCancelled))
+	_ = ms.RollbackTo(MutationRejected)
+	// The rejection is a real lifecycle transition: the human decided against
+	// the held proposal. It is distinct from an execution cancellation.
+	g.RejectApproval(firstTarget(pm.targets), reason)
+	g.CancelExecution(string(OutcomeRejected))
 	res.Proof.Mutations = ms.Outcomes
-	res.Proof.Outcome = OutcomeCancelled
+	res.Proof.Outcome = OutcomeRejected
 	res.Proof.FinishedAt = time.Now()
 	setProofGraph(res, g)
 	return x.finalizeResult(res), nil
@@ -878,7 +1009,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		x.emitContextActivity(target, len(data))
 
 		system := boundedMutationSystemPrompt()
-		user := buildMutationUserPrompt(req.Prompt, target, original)
+		user := buildMutationUserPrompt(req.Prompt, target, original, req.Evidence)
 		aiReq := ai.Request{
 			Model:     model,
 			System:    system,
@@ -894,8 +1025,11 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		}
 		inv := ModelInvocation{Model: model}
 		if usage.Known {
+			inv.Known = true
 			inv.TokenInput = usage.PromptTokens
 			inv.TokenOutput = usage.CompletionTokens
+			inv.CachedTokens = usage.CachedTokens
+			inv.ReasoningTokens = usage.ReasoningTokens
 		}
 		// provider.response is emitted ONLY on a successful response — the
 		// authoritative usage travels here. No artifact may precede it.
@@ -908,6 +1042,25 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// the full response as the replacement attempt (best-effort).
 			modified = raw
 		}
+		if strings.TrimSpace(modified) == "" {
+			// Phase 1 safety rule: an artifact extraction failure is a FAILURE,
+			// never a proposal staged for approval. The model produced no
+			// usable mutation artifact — abort before any approval surface.
+			return nil, nil, nil, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
+		}
+		// ── ARTIFACT BOUNDARY (Phase 2) ─────────────────────────────
+		// A model response is NOT an artifact until it passes the artifact
+		// validation boundary. Registered-language targets (go/html/json) that
+		// fail validation are rejected BEFORE any approval or mutation surface —
+		// a malformed artifact can never become a proposal. Unregistered
+		// languages pass normalized (canonical bytes), so the proposal preview
+		// and the eventual disk write agree.
+		//nolint:contextcheck // artifact validation is pure content checking, no context needed
+		normalized, gateErr := x.artifactGate(target, modified)
+		if gateErr != nil {
+			return nil, nil, nil, gateErr
+		}
+		modified = normalized
 		patches = append(patches, &Patch{
 			ID:       fmt.Sprintf("%s-patch-%d", requestID, len(patches)+1),
 			File:     target,
@@ -917,6 +1070,20 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		diffs = append(diffs, x.compileDiff(raw, target, original))
 	}
 	return patches, invs, diffs, nil
+}
+
+// artifactGate validates the resolved mutation artifact against the target's
+// language contract using the established V3 artifact pipeline. A
+// registered-language target (go/html/json) that fails validation is rejected
+// deterministically (ErrArtifactRejected) with the validation diagnostic. The
+// canonical normalized content is returned so the proposal and the disk agree.
+// A language with no registered validator passes normalized but unvalidated.
+func (x *RuntimeExecutor) artifactGate(target, modified string) (string, error) {
+	gate := v3Artifact.ValidateContent(target, []byte(modified), 0)
+	if !gate.Passed {
+		return "", fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, gate.Error)
+	}
+	return string(gate.Normalized), nil
 }
 
 // compileDiff runs the changeset pipeline over the raw model output to produce
@@ -990,8 +1157,11 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	}
 	inv.Model = model
 	if usage.Known {
+		inv.Known = true
 		inv.TokenInput = usage.PromptTokens
 		inv.TokenOutput = usage.CompletionTokens
+		inv.CachedTokens = usage.CachedTokens
+		inv.ReasoningTokens = usage.ReasoningTokens
 	}
 	// provider.response is emitted ONLY on a successful response — the
 	// authoritative usage travels here. No artifact may precede it.
@@ -1270,8 +1440,18 @@ func (x *RuntimeExecutor) finalizeResult(res *ExecutionResult) *ExecutionResult 
 		if cc.Model == "" {
 			cc.Model = inv.Model
 		}
-		cc.InputTokens += inv.TokenInput
-		cc.OutputTokens += inv.TokenOutput
+		if inv.Known {
+			// The usage is authoritative (provider-reported): aggregate the
+			// counts and mark the account known. The account is Known when at
+			// least one invocation reported usage (the reported counts are
+			// real billing); it stays Unknown only when NO invocation reported
+			// usage, so "usage unknown" is never rendered as a genuine zero.
+			cc.InputTokens += inv.TokenInput
+			cc.OutputTokens += inv.TokenOutput
+			cc.CachedTokens += inv.CachedTokens
+			cc.ReasoningTokens += inv.ReasoningTokens
+			cc.Known = true
+		}
 	}
 	if res.Proof != nil && !res.Proof.StartedAt.IsZero() {
 		cc.Latency = time.Since(res.Proof.StartedAt)
@@ -1381,10 +1561,19 @@ Never explain. Never add markdown outside a single code fence. Preserve every
 unrelated line byte-for-byte.`
 }
 
-func buildMutationUserPrompt(request, target, original string) string {
+func buildMutationUserPrompt(request, target, original, evidence string) string {
 	var b strings.Builder
 	b.WriteString("### USER REQUEST\n")
 	b.WriteString(request)
+	b.WriteString("\n\n### EVIDENCE LEDGER\n")
+	if strings.TrimSpace(evidence) == "" {
+		b.WriteString("(no deterministic evidence compiled — resolve from the target content below)\n")
+	} else {
+		// The deterministic evidence ledger is authoritative: structural
+		// findings, redundancy blocks and line ranges the model must reason
+		// over. It never re-discovers deterministic facts from raw text.
+		b.WriteString(evidence)
+	}
 	b.WriteString("\n\n### TARGET FILE: ")
 	b.WriteString(target)
 	b.WriteString("\n")

@@ -101,6 +101,15 @@ func (m *model) executeAutonomyWorkspace(trace autonomy.Trace) tea.Cmd {
 	case modes.ModeInvestigate:
 		return m.runInvestigateCmd(trace.Input)
 	case modes.ModeBuild:
+		// ── PHASE 1 CUTOVER (IZEN_RUNTIME_EXECUTOR=1) ─────────────────
+		// A BUILD workspace executes through the RuntimeExecutor boundary: the
+		// runtime owns provider invocation, patch creation, the approval gate,
+		// apply and verification, and emits the canonical lifecycle events. The
+		// UI projects results and approval. The flag is the rollback boundary —
+		// disabled behavior preserves the legacy mode-engine path verbatim.
+		if runtimeExecutorEnabled() {
+			return m.executeAutonomyViaRuntime(trace)
+		}
 		// A BUILD workspace executes with hotfix semantics when the objective
 		// arrived as a hotfix execution request (/build$hot …). The runtime
 		// already authorized the capability boundary; the hotfix pipeline then

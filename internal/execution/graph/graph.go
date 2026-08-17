@@ -399,6 +399,22 @@ func (g *Graph) CompleteVerification(passed bool, steps []string) {
 	g.emitEvent(events.NewVerificationCompleted(g.RequestID, passed, steps))
 }
 
+// RejectApproval records the human's explicit rejection of the held proposal
+// at the approval gate and emits approval.rejected — a real lifecycle
+// transition, distinct from a mid-run cancellation. The graph is then
+// terminated by CancelExecution.
+func (g *Graph) RejectApproval(target, reason string) {
+	if g == nil {
+		return
+	}
+	if s := g.Stage(StageApprovalGate); s != nil && !s.State.Terminal() {
+		s.State = StageComplete
+		s.Evidence = "rejected: " + reason
+		s.FinishedAt = time.Now()
+	}
+	g.emitEvent(events.NewApprovalRejected(g.RequestID, target, reason))
+}
+
 // Skip marks a stage as cleanly unnecessary (its boundary is never reached).
 func (g *Graph) Skip(kind StageKind, reason string) {
 	if g == nil {

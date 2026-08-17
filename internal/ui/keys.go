@@ -562,6 +562,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// never calls PatchManager.Apply here.
 				if executorPatchID != "" {
 					m.executorPendingPatchID = ""
+					m.executorPendingTargets = nil
 					m.push(roleSystem, infoStyle.Render(
 						fmt.Sprintf("  "+Icon.Success+" Approved — runtime applying patch to %s...", patch.File)))
 					return m, tea.Batch(
@@ -592,6 +593,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.pendingHotfixPatch = nil
 				m.pendingProposals = nil
 				m.executorPendingPatchID = ""
+				m.executorPendingTargets = nil
 				m.resolveApprovalState()
 				m.ti.Focus()
 				m.recalcViewportHeight()

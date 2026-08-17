@@ -423,7 +423,10 @@ func TestMutationSet_NoDoubleCommitNoDoubleRollback(t *testing.T) {
 
 // TestMutationSet_MutationEvidenceSemanticsPreserved is #15: the per-target
 // outcomes recorded into the boundary keep the existing MutationEvidence
-// semantics (changed ⇒ ApplyExecutedChanged + Verify; failed ⇒ no success).
+// semantics (changed ⇒ ApplyExecutedChanged; failed ⇒ no success). The hotfix
+// harness disables the compile-gate verifier (SetVerifier(nil)), so the
+// evidence must NOT claim a verification that did not run — the old fabricated
+// VerificationRun/Passed=true for changed outcomes is gone.
 func TestMutationSet_MutationEvidenceSemanticsPreserved(t *testing.T) {
 	_, ms := runSuccessfulHotfix(t, "index.html", hotfixOrig, hotfixFixed)
 	ev := ms.OutcomeFor("index.html")
@@ -443,8 +446,10 @@ func TestMutationSet_MutationEvidenceSemanticsPreserved(t *testing.T) {
 	if !rec.ApplyExecutedChanged() {
 		t.Fatalf("evidence does not prove an executed mutation: %+v", rec)
 	}
-	if !rec.Verify() {
-		t.Fatalf("evidence does not prove verification passed: %+v", rec)
+	// No verifier was attached to this boundary's PatchManager — the evidence
+	// must never claim a verification pass (INVARIANT 6: verification truth).
+	if rec.Verify() {
+		t.Fatalf("evidence claims verification passed without a verifier gate: %+v", rec)
 	}
 	if !rec.Outcome.MutationSucceeded() {
 		t.Fatalf("changed outcome must MutationSucceeded: %+v", rec)

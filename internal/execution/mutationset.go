@@ -44,13 +44,17 @@ const (
 	// MutationCancelled: the mutation was cancelled and was rolled back if a
 	// mutation had already occurred.
 	MutationCancelled MutationState = "cancelled"
+	// MutationRejected: the held proposal was explicitly rejected by the human
+	// at the approval gate. No mutation was ever applied. It is distinct from
+	// MutationCancelled (an execution aborted mid-run).
+	MutationRejected MutationState = "rejected"
 )
 
 // Terminal reports whether the state is terminal. A terminal set is never
 // re-entered: Commit/Rollback become no-ops and Record refuses new targets.
 func (s MutationState) Terminal() bool {
 	switch s {
-	case MutationCommitted, MutationRolledBack, MutationFailed, MutationCancelled:
+	case MutationCommitted, MutationRolledBack, MutationFailed, MutationCancelled, MutationRejected:
 		return true
 	}
 	return false
@@ -73,6 +77,10 @@ type MutationSet struct {
 	// Outcomes are the per-target semantic mutation outcomes recorded by the
 	// apply boundary. They use the existing MutationEvidence vocabulary.
 	Outcomes []MutationEvidence
+	// Verification is the authoritative verification-gate report produced
+	// inside the apply boundary (nil when the verification gate never ran).
+	// It is the report the gate actually executed — never a synthetic pass.
+	Verification *VerificationReport
 	// Transaction is the snapshot-record boundary this set owns. It is never
 	// shared with another set.
 	Transaction *engine.Transaction
