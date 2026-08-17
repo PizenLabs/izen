@@ -150,9 +150,11 @@ func TestMultiFileMutationSingleTransaction(t *testing.T) {
 	}
 }
 
-// emptySecondProvider returns a valid patch for the first target and an empty
-// response for the second — producing a patch with empty content that the
-// apply boundary deterministically rejects.
+// emptySecondProvider returns a valid patch for the first target and a
+// short non-empty snippet for the second — producing a patch the apply
+// boundary deterministically rejects as an ambiguous snippet (a file-mutation
+// that fails at apply, distinct from an empty artifact which the runtime now
+// rejects before the approval gate).
 type emptySecondProvider struct {
 	mu     sync.Mutex
 	callCt int
@@ -166,7 +168,7 @@ func (p *emptySecondProvider) Execute(_ context.Context, req ai.Request) (*ai.Re
 	call := p.callCt
 	p.mu.Unlock()
 	if call >= 2 {
-		return &ai.Response{Content: ""}, nil
+		return &ai.Response{Content: "x"}, nil
 	}
 	return &ai.Response{
 		Content: "<<<<<<< SEARCH\nfirst\n=======\nchanged\n>>>>>>>",
