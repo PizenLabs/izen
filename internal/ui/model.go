@@ -985,6 +985,11 @@ type model struct {
 	// execution currently staged in the proposal dock. Non-empty routes the
 	// approval keys through RuntimeExecutor.Approve/Reject.
 	executorPendingPatchID string
+	// executorPendingTargets is the execution target set of the approval-held
+	// patch. It is captured when the proposal is staged so the approval key
+	// can issue a MutationAuthorization over exactly these files before
+	// RuntimeExecutor.Approve applies them.
+	executorPendingTargets []string
 
 	// microkernel is the immutable microkernel pipeline adapter. It primes
 	// plan/investigate command handling for greenfield generation prompts so

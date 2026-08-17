@@ -560,16 +560,17 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// Approve. The runtime emits the mutation lifecycle events; the
 				// UI renders them and the returned executionResultMsg. The UI
 				// never calls PatchManager.Apply here.
-				if executorPatchID != "" {
-					m.executorPendingPatchID = ""
-					m.push(roleSystem, infoStyle.Render(
-						fmt.Sprintf("  "+Icon.Success+" Approved — runtime applying patch to %s...", patch.File)))
-					return m, tea.Batch(
-						func() tea.Msg { return agentStartMsg{label: "runtime hotfix apply"} },
-						m.runExecutorApproveCmd(executorPatchID),
-						m.smoothStreamTickCmd(),
-					)
-				}
+if executorPatchID != "" {
+				m.executorPendingPatchID = ""
+				m.executorPendingTargets = nil
+				m.push(roleSystem, infoStyle.Render(
+					fmt.Sprintf("  "+Icon.Success+" Approved — runtime applying patch to %s...", patch.File)))
+				return m, tea.Batch(
+					func() tea.Msg { return agentStartMsg{label: "runtime hotfix apply"} },
+					m.runExecutorApproveCmd(executorPatchID),
+					m.smoothStreamTickCmd(),
+				)
+			}
 
 				// ── LEGACY UI-OWNED APPLY (pre-migration path) ──────
 				// The runtime approve_patch projection is NOT dispatched here:
@@ -590,13 +591,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				executorPatchID := m.executorPendingPatchID
 				m.pendingHotfixTask = nil
 				m.pendingHotfixPatch = nil
-				m.pendingProposals = nil
-				m.executorPendingPatchID = ""
-				m.resolveApprovalState()
-				m.ti.Focus()
-				m.recalcViewportHeight()
-				m.push(roleSystem, infoStyle.Render(
-					"  "+Icon.Error+" Rejected — hotfix aborted. No files were modified."))
+m.pendingProposals = nil
+			m.executorPendingPatchID = ""
+			m.executorPendingTargets = nil
+			m.resolveApprovalState()
+			m.ti.Focus()
+			m.recalcViewportHeight()
+			m.push(roleSystem, infoStyle.Render(
+				"  "+Icon.Error+" Rejected — hotfix aborted. No files were modified."))
 				m.push(roleError, fmt.Sprintf(
 					"[HOTFIX] Developer rejected patch to %s.",
 					rejectedPath))

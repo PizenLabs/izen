@@ -33,11 +33,22 @@ type executionResultMsg struct {
 var _ tea.Msg = executionResultMsg{}
 
 // runExecutorApproveCmd approves the held mutation through the RuntimeExecutor.
+// The approval is a REAL human authorization (Alt+A): a fresh
+// MutationAuthorization is issued through the production AuthorizationEngine
+// over the held execution's target files and attached to the runtime BEFORE
+// the apply, so the runtime's internal PatchManager + Verifier run under the
+// same governance owner the legacy path used. Without a token the runtime
+// denies deterministically.
 func (m *model) runExecutorApproveCmd(patchID string) tea.Cmd {
 	x := m.executor
 	if x == nil {
 		return func() tea.Msg {
 			return executionResultMsg{err: fmt.Errorf("executor not wired")}
+		}
+	}
+	if err := m.authorizeExecutorApproval(); err != nil {
+		return func() tea.Msg {
+			return executionResultMsg{err: err}
 		}
 	}
 	return func() tea.Msg {
@@ -49,6 +60,36 @@ func (m *model) runExecutorApproveCmd(patchID string) tea.Cmd {
 		}
 		return executionResultMsg{res: res, err: err}
 	}
+}
+
+// authorizeExecutorApproval issues a MutationAuthorization through the
+// production AuthorizationEngine and attaches it to the RuntimeExecutor. The
+// token covers exactly the execution's held target files; the human approval
+// flag is true (the user pressed Alt+A on the proposal). Nil-safe for
+// harnesses without an AuthorizationEngine.
+func (m *model) authorizeExecutorApproval() error {
+	if m.executor == nil || m.authEngine == nil {
+		return nil
+	}
+	targets := m.executorPendingTargets
+	if len(targets) == 0 {
+		if m.pendingHotfixPatch != nil {
+			targets = []string{m.pendingHotfixPatch.File}
+		}
+	}
+	auth, err := m.authEngine.AuthorizeBuild(
+		targets,
+		m.caps,
+		m.mutationBudget,
+		m.microBudget,
+		false,
+		true, // human-approved: the developer pressed Alt+A on the proposal
+	)
+	if err != nil {
+		return fmt.Errorf("build authorization: %w", err)
+	}
+	m.executor.SetAuthorization(auth)
+	return nil
 }
 
 // runExecutorRejectCmd rejects the held mutation through the RuntimeExecutor.

@@ -280,6 +280,7 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 	terminal := res.Proof != nil && res.Proof.Outcome.MutationSucceeded()
 	if terminal {
 		m.executorPendingPatchID = ""
+		m.executorPendingTargets = nil
 		m.pendingHotfixTask = nil
 		m.pendingHotfixPatch = nil
 		m.pendingProposals = nil
@@ -301,6 +302,7 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 	// ── CANCELLED / REJECTED TERMINAL ──────────────────────────────
 	if res.Proof != nil && res.Proof.Outcome == execution.OutcomeCancelled {
 		m.executorPendingPatchID = ""
+		m.executorPendingTargets = nil
 		m.pendingHotfixTask = nil
 		m.pendingHotfixPatch = nil
 		m.pendingProposals = nil
@@ -328,6 +330,9 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 	// back through RuntimeExecutor.Approve/Reject (keys.go).
 	if res.PendingPatchID != "" && len(res.Targets) > 0 {
 		target := res.Targets[0]
+		// The execution target set is captured for the approval authorization
+		// (Alt+A issues a MutationAuthorization over exactly these files).
+		m.executorPendingTargets = append([]string(nil), res.Targets...)
 		task := &plan.Task{
 			StepNum:     0,
 			Status:      "idle",
