@@ -95,6 +95,11 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ..
 	// records inside it; a terminal outcome replaces it (Commit/Rollback).
 	e.mutationSet = NewMutationSet()
 	p.SetMutationSet(e.mutationSet)
+	// Wire the verifier onto the engine's own PatchManager so the deterministic
+	// verification gate (patch.go micro-fix gate) runs on every Apply. Phase 1
+	// cutover P0#2: the verifier was constructed but never attached, so the
+	// production mutation path applied unverified.
+	p.SetVerifier(v)
 	e.PatchQueue = NewPatchQueue(root, e.Patches)
 	e.StreamMon = NewStreamMonitor(e.PatchQueue)
 	e.Pipeline = NewPipelineRunner(e)

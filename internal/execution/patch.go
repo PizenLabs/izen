@@ -953,6 +953,16 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	}
 
 	pm.recordLedgerAndSummarize(patch)
+	// ── MUTATION TRUTH (Phase 1 cutover safety rule) ──────────────────
+	// Never report a mutation as CHANGED unless actual mutation evidence
+	// confirms the filesystem changed. When the resolved final content is
+	// byte-for-byte identical to the on-disk original, the apply wrote
+	// nothing: the outcome is NO_CHANGE, never changed. Model output is never
+	// execution truth.
+	if final == patch.Original {
+		pm.recordMutationEvidence(patch, OutcomeNoChange, "no file content changed")
+		return pm.store(patch)
+	}
 	pm.recordMutationEvidence(patch, OutcomeChanged, "")
 
 	return pm.store(patch)
