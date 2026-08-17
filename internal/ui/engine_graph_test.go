@@ -215,7 +215,8 @@ func TestEngineGraphExecutionProofCarriesStrategy(t *testing.T) {
 }
 
 // TestEngineGraphProofOutcomeCarriesEvidence verifies the approval-gate proof
-// carries no fabricated mutation — the outcome stays no_artifact until Approve.
+// carries no fabricated mutation — the outcome stays pending_approval (a valid
+// held artifact, never a committed mutation) until Approve.
 func TestEngineGraphProofOutcomeCarriesEvidence(t *testing.T) {
 	m, _ := gatedHarness(t, map[string]string{
 		"note.txt": "foo\nbar\nbaz\n",
@@ -226,8 +227,8 @@ func TestEngineGraphProofOutcomeCarriesEvidence(t *testing.T) {
 	if gem.res == nil || gem.res.Proof == nil {
 		t.Fatal("expected a runtime proof")
 	}
-	if gem.res.Proof.Outcome != execution.OutcomeNoArtifact {
-		t.Fatalf("pre-approval proof outcome = %q, want no_artifact (no fake mutation)", gem.res.Proof.Outcome)
+	if gem.res.Proof.Outcome != execution.OutcomePendingApproval {
+		t.Fatalf("pre-approval proof outcome = %q, want pending_approval (a valid held artifact, no committed mutation)", gem.res.Proof.Outcome)
 	}
 	if len(gem.res.Proof.Mutations) != 0 {
 		t.Fatalf("pre-approval proof mutations = %d, want 0", len(gem.res.Proof.Mutations))
