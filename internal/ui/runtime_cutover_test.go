@@ -3,12 +3,19 @@ package ui
 import (
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/core/authorization"
+	"github.com/PizenLabs/izen/internal/core/budget"
+	"github.com/PizenLabs/izen/internal/core/capability"
+	"github.com/PizenLabs/izen/internal/core/workflow"
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/modes"
@@ -302,5 +309,168 @@ func unwrapBatch(cmd tea.Cmd) []tea.Cmd {
 		return v
 	default:
 		return []tea.Cmd{func() tea.Msg { return msg }}
+	}
+}
+
+// eventCollector subscribes to a set of event types on a bus and records which
+// of them fired. Cross-subscription delivery is nondeterministic (concurrent
+// dispatch goroutines), so assertions check by type, never by order.
+type eventCollector struct {
+	mu      sync.Mutex
+	fired   map[string]bool
+	subs    []*events.Subscription
+}
+
+func newEventCollector(bus *events.Bus, types ...string) *eventCollector {
+	c := &eventCollector{fired: make(map[string]bool)}
+	for _, typ := range types {
+		sub := bus.Subscribe(typ, func(ev events.DomainEvent) {
+			c.mu.Lock()
+			c.fired[ev.Type()] = true
+			c.mu.Unlock()
+		})
+		c.subs = append(c.subs, sub)
+	}
+	return c
+}
+
+func (c *eventCollector) has(typ string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fired[typ]
+}
+
+func (c *eventCollector) Stop() {
+	for _, s := range c.subs {
+		s.Cancel()
+	}
+}
+
+// TestRuntimeCutoverApproveAppliesThroughExecutor is the full-loop cutover
+// proof: Execute → approval gate → Alt+A (authorize) → executor.Approve →
+// PatchManager apply → verifier → canonical events. The UI never touches a
+// provider or PatchManager; it authorizes the boundary and the runtime applies.
+func TestRuntimeCutoverApproveAppliesThroughExecutor(t *testing.T) {
+	t.Setenv("IZEN_RUNTIME_EXECUTOR", "1")
+	dir := t.TempDir()
+	t.Chdir(dir)
+	// A fixture whose mutation preserves the file size (≥80% of the original),
+	// matching the executor's bounded-mutation apply contract for existing
+	// files.
+	orig := "<!DOCTYPE html>\n<html>\n<body>\n  <h1>Home</h1>\n  <p>body</p>\n</body>\n</html>\n"
+	if err := os.WriteFile("index.html", []byte(orig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n  <p>body</p>\n=======\n  <p>body updated</p>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
+
+	bus := events.NewBus(events.DefaultBufferSize)
+	collected := newEventCollector(bus,
+		events.EventExecutionStarted,
+		events.EventStrategySelected,
+		events.EventTargetResolved,
+		events.EventModelInvoked,
+		events.EventArtifactProduced,
+		events.EventMutationStarted,
+		events.EventMutationCompleted,
+		events.EventVerificationCompleted,
+		events.EventExecutionFinished,
+	)
+	defer collected.Stop()
+
+	m := cutoverModel(t, mock)
+	// Production-grade governance surface: real AuthorizationEngine + budget +
+	// capabilities, and a deterministic trivial verifier (the compile-gate
+	// would invoke the real Go toolchain).
+	m.authEngine = authorization.NewAuthorizationEngine(
+		fakeSourceVerifier{},
+		fakeCheckpointChecker{},
+		func() workflow.WorkflowState { return workflow.StateBuilding },
+	)
+	m.mutationBudget = budget.NewBudget(10, 1000, 100000, 3, 30*time.Minute, 10)
+	caps := capability.NewCapabilitySet()
+	caps.Grant(capability.CapabilityWrite)
+	caps.Grant(capability.CapabilityPatch)
+	m.caps = caps
+	m.bus = bus
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, mock, bus, "")
+	trivial := execution.NewVerifier(".")
+	trivial.SetCustomSteps([]execution.VerificationStep{{Name: "noop", Command: "true", Optional: false}})
+	m.executor.SetVerifier(trivial)
+	grantMutationCaps(m)
+
+	cmd := m.handleInput("$prompt read @index.html and remove redundant content")
+	gem := cmd().(gatedExecutionMsg)
+	if gem.err != nil {
+		t.Fatalf("executor failed: %v", gem.err)
+	}
+	res, _ := m.Update(gem)
+	m2 := res.(*model)
+	if m2.executorPendingPatchID == "" {
+		t.Fatal("approval-held patch not staged")
+	}
+
+	// Alt+A approval: authorize the boundary and let the runtime apply.
+	approveCmd := m2.runExecutorApproveCmd(m2.executorPendingPatchID)
+	amsg := approveCmd()
+	mr, ok := amsg.(executionResultMsg)
+	if !ok {
+		t.Fatalf("expected executionResultMsg from approve, got %T", amsg)
+	}
+	if mr.err != nil {
+		t.Fatalf("approve failed: %v", mr.err)
+	}
+	if mr.res == nil || mr.res.Proof == nil {
+		t.Fatal("approve returned no proof")
+	}
+	if !mr.res.Proof.Outcome.MutationSucceeded() {
+		t.Fatalf("approve outcome = %q, want a successful mutation", mr.res.Proof.Outcome)
+	}
+	if len(mr.res.Mutations) == 0 {
+		t.Fatal("approve must carry mutation evidence")
+	}
+
+	// The filesystem actually changed.
+	onDisk, rerr := os.ReadFile("index.html")
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(onDisk) == orig {
+		t.Fatal("approve did not mutate the file")
+	}
+
+	// The canonical lifecycle events fired on the shared bus (UI projection
+	// contract).
+	want := []string{
+		events.EventExecutionStarted,
+		events.EventStrategySelected,
+		events.EventTargetResolved,
+		events.EventModelInvoked,
+		events.EventArtifactProduced,
+		events.EventMutationStarted,
+		events.EventMutationCompleted,
+		events.EventVerificationCompleted,
+		events.EventExecutionFinished,
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		all := true
+		for _, typ := range want {
+			if !collected.has(typ) {
+				all = false
+				break
+			}
+		}
+		if all {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for _, typ := range want {
+		if !collected.has(typ) {
+			t.Errorf("missing canonical lifecycle event %q on the cutover path", typ)
+		}
 	}
 }
