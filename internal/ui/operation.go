@@ -309,10 +309,6 @@ func (m *model) handleCtrlC() (bool, tea.Cmd) {
 		return true, nil
 	}
 	switch {
-	case m.state == StateHotfixAmbiguous:
-		m.armCancelGrace()
-		_, cmd := m.cancelHotfixAmbiguous()
-		return true, cmd
 	case m.activeOp != nil || m.isWorkflowBusy():
 		m.armCancelGrace()
 		_, cmd := m.cancelActiveOperation("ctrl-c")

@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/execution"
-	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
 const todoHtmlContent = `<!DOCTYPE html>
@@ -71,61 +70,6 @@ func TestStripModePrefix(t *testing.T) {
 	}
 	if got := stripModePrefix("plain prompt"); got != "plain prompt" {
 		t.Errorf("got %q", got)
-	}
-}
-
-// TestFastTrackGoals_RewritePrepending proves the explicit user intent is
-// prepended to the task goals under a full-rewrite context.
-func TestFastTrackGoals_RewritePrepending(t *testing.T) {
-	tasks := []plan.Task{
-		{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Description: "CREATE index.html"},
-		{StepNum: 2, Type: "FILE_MUTATE", Target: "styles.css", Description: "CREATE styles.css"},
-	}
-	intent := "Clear all existing code and create a brand new portfolio website for Alex Josie"
-	goals := fastTrackGoals(intent, tasks)
-	if !strings.Contains(goals, intent) {
-		t.Errorf("goals must embed the explicit user intent:\n%s", goals)
-	}
-	if !strings.Contains(goals, "DO NOT USE OR REFERENCE ANY EXISTING CODE") && !strings.Contains(goals, "CREATE FROM SCRATCH") {
-		t.Errorf("goals must carry the create-from-scratch directive:\n%s", goals)
-	}
-}
-
-// TestFastTrackFileContext_RewriteStripsObsoleteContent is the TaskContext
-// hygiene regression core: under a rewrite intent the current file contents
-// are NEVER injected into the build prompt — only the target name and the
-// create-from-scratch directive.
-func TestFastTrackFileContext_RewriteStripsObsoleteContent(t *testing.T) {
-	intent := "CLEAR ALL EXISTING CODE and build a brand new portfolio website"
-	targets := []string{"index.html", "styles.css"}
-	obsolete := "<title>To-Do App</title>"
-	ctx := fastTrackFileContext(intent, targets, func(string) ([]byte, error) {
-		return []byte(obsolete), nil
-	})
-	if strings.Contains(ctx, obsolete) || strings.Contains(ctx, "To-Do App") {
-		t.Fatalf("obsolete workspace content leaked into the rewrite task context:\n%s", ctx)
-	}
-	if !strings.Contains(ctx, "index.html") || !strings.Contains(ctx, "styles.css") {
-		t.Errorf("rewrite context must name every target file:\n%s", ctx)
-	}
-	if !strings.Contains(ctx, "DO NOT USE OR REFERENCE ANY EXISTING CODE IN THE WORKSPACE. CREATE FROM SCRATCH.") {
-		t.Errorf("rewrite context must carry the create-from-scratch directive:\n%s", ctx)
-	}
-}
-
-// TestFastTrackFileContext_NonRewriteKeepsBaseline proves ordinary edits still
-// receive the current file contents (bounded baseline) — the stripping only
-// applies under a rewrite context.
-func TestFastTrackFileContext_NonRewriteKeepsBaseline(t *testing.T) {
-	intent := "fix the button color"
-	ctx := fastTrackFileContext(intent, []string{"styles.css"}, func(string) ([]byte, error) {
-		return []byte("body { color: red; }"), nil
-	})
-	if !strings.Contains(ctx, "body { color: red; }") {
-		t.Errorf("non-rewrite context must keep baseline content:\n%s", ctx)
-	}
-	if strings.Contains(ctx, "CREATE FROM SCRATCH") {
-		t.Errorf("non-rewrite context must not carry the rewrite directive:\n%s", ctx)
 	}
 }
 

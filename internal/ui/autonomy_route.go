@@ -8,10 +8,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
-	"github.com/PizenLabs/izen/internal/command"
 	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/modes"
-	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
 // runAutonomyRoutedCmd is the autonomy activation boundary. A human objective
@@ -141,78 +139,6 @@ func (m *model) publishAutonomyLoop(trace autonomy.Trace) {
 	}
 	if len(trans) > 0 {
 		m.autonomy.PublishTransitions(trans)
-	}
-}
-
-// executeAutonomyBuild stages the deterministic FILE_MUTATE plan the mutation
-// target requires and hands it to the build engine. The engine owns the
-// workflow (resolve → read → detect → propose → apply → verify); the runtime
-// already authorized the BUILD capability domain through the grant gate.
-//
-// CONTEXT COMPILER VALIDATION (§6): before the build engine asks the model to
-// propose a mutation, the runtime compiles the target's structural evidence
-// (orphan text nodes, invalid regions, duplicate content, malformed structure)
-// and appends the Context Evidence Ledger to the task description. The model
-// never discovers deterministic facts on its own — it reasons over the ledger.
-//
-// TARGET RESOLUTION (§8): the mutation target is resolved deterministically
-// against the workspace BEFORE any model reasoning. An ambiguous target (several
-// files match the name) pauses with a small candidate selector; a target that
-// exists nowhere surfaces a clear not-found diagnosis. The model is never asked
-// to compensate for a deterministic resolution failure.
-func (m *model) executeAutonomyBuild(trace autonomy.Trace) tea.Cmd {
-	// ── DETERMINISTIC TARGET RESOLUTION (§8) ─────────────────────────
-	target, candidates := m.resolveAutonomyBuildTarget(trace.Intent.Target())
-	switch {
-	case len(candidates) > 1:
-		// Several safe candidates remain — ambiguity is a decision, not a
-		// dead end. The candidate selector pauses without a model call.
-		m.stageAutonomyTargetSelector(trace, candidates)
-		return nil
-	case len(candidates) == 0:
-		if !isAutonomyCreationRequest(trace.Input) {
-			return m.reportAutonomyTargetNotFound(trace, target)
-		}
-		// New-file objective: proceed with the raw target.
-		target = trace.Intent.Target()
-	}
-	return m.stageAutonomyBuild(trace, target)
-}
-
-// stageAutonomyBuild stages the deterministic FILE_MUTATE plan for a RESOLVED
-// mutation target and hands it to the build engine. The engine owns the
-// workflow (resolve → read → detect → propose → apply → verify); the runtime
-// already authorized the BUILD capability domain through the grant gate.
-//
-// CONTEXT COMPILER VALIDATION (§6): before the build engine asks the model to
-// propose a mutation, the runtime compiles the target's structural evidence
-// (orphan text nodes, invalid regions, duplicate content, malformed structure)
-// and appends the Context Evidence Ledger to the task description. The model
-// never discovers deterministic facts on its own — it reasons over the ledger.
-func (m *model) stageAutonomyBuild(trace autonomy.Trace, target string) tea.Cmd {
-	var tasks []plan.Task
-	if target != "" {
-		tasks = command.GenerateFallbackPlan(command.FallbackPlanTarget{
-			File:        target,
-			Description: trace.Input,
-			TaskType:    "FILE_MUTATE",
-		})
-		// Compile structural evidence for the resolved target so the proposal
-		// the build engine generates is grounded in deterministic findings.
-		if evidence := m.compileAutonomyBuildEvidence(target); evidence != "" {
-			for i := range tasks {
-				tasks[i].Evidence = evidence
-			}
-		}
-	}
-	if len(tasks) == 0 {
-		m.push(roleSystem, infoStyle.Render("[autonomy] build workspace selected but no target resolved — describing objective to build engine."))
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return m.runBuildCmd(trace.Input)
-	}
-	return func() tea.Msg {
-		return planResultMsg{Tasks: tasks, IsFastTrack: true}
 	}
 }
 

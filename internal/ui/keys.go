@@ -487,52 +487,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// that makes the target explicit; it never happens automatically.
 		//
 		// LIVENESS: the card is a terminal outcome of the hotfix operation,
-		// not a locked execution worker. The input line stays focused and
-		// editable: every plain keystroke is forwarded to the text input
-		// (priority 1), card actions use explicit alt+ / Esc keybindings, and
-		// Enter with a typed command submits it (dismissing the card and
-		// starting a NEW operation). Ctrl+C cancels the card gracefully.
-		//
-		// KEYBOARD PRECEDENCE: because the input stays focused, candidate
-		// selection owns the number keys ONLY while the candidate-inspection
-		// sub-view blurs the input (an explicit modal interaction). All other
-		// printable characters remain text.
-		if m.pendingHotfixAmbiguous != nil {
-			switch {
-			case msg.Type == tea.KeyCtrlC:
-				return m.cancelHotfixAmbiguous()
-			case msg.String() == "alt+c":
-				return m.clarifyHotfixTarget()
-			case msg.String() == "alt+i":
-				return m.toggleHotfixCandidates()
-			case msg.String() == "alt+x" || msg.Type == tea.KeyEscape:
-				return m.cancelHotfixAmbiguous()
-			case msg.Type == tea.KeyEnter:
-				if m.ti.Focused() && m.ti.Value() != "" {
-					return m.submitHotfixCardCommand()
-				}
-				if m.hotfixCandidatesMode {
-					return m.toggleHotfixCandidates()
-				}
-				return m.clarifyHotfixTarget()
-			default:
-				if m.hotfixCandidatesMode && len(m.pendingHotfixAmbiguous.Candidates) > 0 && !m.ti.Focused() {
-					if msg.Type == tea.KeyRunes {
-						d := msg.Runes
-						if len(d) == 1 && d[0] >= '1' && d[0] <= '9' {
-							n := int(d[0] - '0')
-							if n <= len(m.pendingHotfixAmbiguous.Candidates) {
-								return m.selectHotfixCandidate(n)
-							}
-						}
-					}
-				}
-				// Forward every other keystroke to the text input so the next
-				// command can be composed while the card renders.
-				return m, m.forwardToInput(msg)
-			}
-		}
-
 		// ── $hot HOTFIX APPROVAL GATE ─────────────────────────────
 		// The hotfix patch was generated but NOT applied. The developer must
 		// explicitly authorize (Alt+A / Enter) or reject (Alt+R / Esc).
@@ -542,7 +496,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.pendingHotfixTask != nil && m.pendingHotfixPatch != nil {
 			switch {
 			case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
-				task := m.pendingHotfixTask
 				patch := m.pendingHotfixPatch
 				executorPatchID := m.executorPendingPatchID
 				m.pendingHotfixTask = nil
@@ -572,17 +525,21 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					)
 				}
 
-				// ── LEGACY UI-OWNED APPLY (pre-migration path) ──────
-				// The runtime approve_patch projection is NOT dispatched here:
-				// it must only fire AFTER the authoritative apply (budget /
-				// authorization gated) succeeds, otherwise a budget-blocked
-				// hotfix would still report "approve_patch applied". The file is
-				// recorded and the projection is emitted from the terminal
-				// buildResultMsg handler on success only.
+				// ── EXECUTOR-OWNED APPLY (single authority) ──────────
+				// The RuntimeExecutor is the sole mutation apply authority. A
+				// proposal staged without an executor-held patch ID routes
+				// through RuntimeExecutor.Approve with the dock's patch ID;
+				// without a held patch the approval is a no-op with a message.
+				if patch == nil {
+					m.push(roleSystem, infoStyle.Render("No held patch to approve — the executor owns apply."))
+					m.refreshViewportContent()
+					m.Viewport.GotoBottom()
+					return m, nil
+				}
 				m.appliedHotfixFile = patch.File
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "hotfix apply"} },
-					m.applyHotfixPatch(task, patch),
+					m.runExecutorApproveCmd(patch.ID),
 					m.smoothStreamTickCmd(),
 				)
 
@@ -614,36 +571,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m, m.runExecutorRejectCmd(executorPatchID, "hotfix rejected by developer")
 				}
 				return m, m.runtimeRejectCmd(rejectedPath, "hotfix rejected by developer")
-			}
-			return m, nil
-		}
-
-		// ── MULTI-FILE $hot APPROVAL GATE (Phase 9B) ──────────────────
-		// A multi-file hotfix stages N proposals under ONE graph + ONE
-		// MutationSet. Approve (Alt+A/Enter) applies ALL nodes in graph order
-		// under that single boundary — never one commit per file. Reject
-		// (Alt+R/Esc) aborts with zero mutation.
-		if m.pendingHotfixGraph != nil {
-			switch {
-			case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
-				graph := m.pendingHotfixGraph
-				m.pendingHotfixGraph = nil
-				m.pendingProposals = nil
-				m.resolveApprovalState()
-				m.ti.Focus()
-				m.recalcViewportHeight()
-				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
-				m.push(roleSystem, infoStyle.Render(
-					fmt.Sprintf("  "+Icon.Success+" Approved — applying multi-file hotfix to %d files...", len(graph.Nodes))))
-				return m, tea.Batch(
-					func() tea.Msg { return agentStartMsg{label: "multi-hotfix apply"} },
-					m.applyMultiHotfixGraph(graph),
-					m.smoothStreamTickCmd(),
-				)
-			case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
-				m.rejectMultiHotfix()
-				return m, nil
 			}
 			return m, nil
 		}
@@ -744,14 +671,32 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// ── File-mutation proposal approval ─────────────────────────
 		switch {
 		case msg.String() == "alt+a" || msg.Type == tea.KeyEnter:
-			proposalID := ""
-			if len(m.pendingProposals) > 0 {
-				proposalID = m.pendingProposals[0].ID
+			// The RuntimeExecutor is the sole mutation apply authority. The
+			// executor-staged proposals are handled by the $hot approval gate
+			// above (executorPatchID path). For the generic dock, route
+			// through RuntimeExecutor.Approve when a held patch exists,
+			// otherwise no-op with a message.
+			if m.executorPendingPatchID != "" {
+				return m, m.runExecutorApproveCmd(m.executorPendingPatchID)
 			}
-			return m, tea.Batch(m.applySingleProposal(), m.runtimeApproveCmd(proposalID))
+			if len(m.pendingProposals) > 0 {
+				return m, m.runExecutorApproveCmd(m.pendingProposals[0].ID)
+			}
+			m.push(roleSystem, infoStyle.Render("No held patch to approve — the executor owns apply."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m, nil
 		case msg.String() == "alt+l":
-			m.acceptAll = true
-			return m, m.applyAllProposals()
+			if m.executorPendingPatchID != "" {
+				return m, m.runExecutorApproveCmd(m.executorPendingPatchID)
+			}
+			if len(m.pendingProposals) > 0 {
+				return m, m.runExecutorApproveCmd(m.pendingProposals[0].ID)
+			}
+			m.push(roleSystem, infoStyle.Render("No held patch to approve — the executor owns apply."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return m, nil
 		case msg.String() == "alt+p":
 			if len(m.pendingProposals) > 0 {
 				m.pendingProposals[0].Expanded = !m.pendingProposals[0].Expanded

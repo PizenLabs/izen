@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -332,47 +331,6 @@ func TestBuildLifecycleCtrlCCancelsProviderCall(t *testing.T) {
 	goroutineDelta(t, baseline, "Ctrl+C provider cancellation")
 }
 
-// ── 4. Ctrl+C cancels a running file mutation ──────────────────────────────
-
-func TestBuildLifecycleCtrlCCancelsRunningFileMutation(t *testing.T) {
-	m := newTestModel()
-	m.execEng = execution.NewEngine(".", m.cfg, m.sess)
-
-	// Drive the apply seam: Alt+A (applySingleProposal) registers an OpBuild
-	// whose context is the cancellation parent of applyPatchWithDeadline.
-	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}, Alt: true})
-	m2 := res.(*model)
-	if cmd == nil {
-		t.Fatal("Alt+A did not dispatch the apply command")
-	}
-	if m2.activeOp == nil || m2.activeOp.Kind != OpBuild {
-		t.Fatalf("apply did not register a cancellable build operation: %+v", m2.activeOp)
-	}
-
-	// Ctrl+C during the mutation cancels the apply and returns to chat.
-	res2, _ := m2.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
-	m3 := res2.(*model)
-	if m3.activeOp != nil {
-		t.Fatal("apply operation not released by Ctrl+C")
-	}
-	if m3.state != StateChat {
-		t.Fatalf("state = %v, want StateChat after Ctrl+C during mutation", m3.state)
-	}
-	if m3.isWorkflowBusy() {
-		t.Fatal("busy after Ctrl+C during mutation")
-	}
-
-	// The apply context is derived from the operation: an already-cancelled
-	// operation makes applyPatchWithDeadline abort deterministically.
-	m4 := newTestModel()
-	m4.execEng = execution.NewEngine(".", m4.cfg, m4.sess)
-	m4.beginOperation(OpBuild)
-	m4.activeOp.Cancel()
-	if err := m4.applyPatchWithDeadline(&execution.Patch{File: "x", Modified: "y"}); !errors.Is(err, execution.ErrPatchApplyTimeout) {
-		t.Fatalf("apply after cancellation = %v, want ErrPatchApplyTimeout", err)
-	}
-}
-
 // ── 5 + 6. Ctrl+C releases every worker goroutine; none remain blocked ─────
 
 func TestBuildLifecycleCancelReleasesAllWorkers(t *testing.T) {
@@ -655,22 +613,7 @@ func TestBuildLifecycleHotfixBehaviorUnaffected(t *testing.T) {
 	}
 }
 
-// ── 14. Existing ambiguity behavior remains unchanged ──────────────────────
-
-func TestBuildLifecycleAmbiguityBehaviorUnaffected(t *testing.T) {
-	mock := &mockProvider{responses: []*ai.Response{{Content: "x", TokenOutput: 10}}}
-	m := ambiguousHotfixModel(t, mock)
-
-	if m.state != StateHotfixAmbiguous {
-		t.Fatalf("state = %v, want StateHotfixAmbiguous (unchanged ambiguity gate)", m.state)
-	}
-	if mock.callCount != 0 {
-		t.Fatalf("provider called %d times for an ambiguous request, want 0", mock.callCount)
-	}
-	if m.activeOp != nil {
-		t.Fatalf("active operation after ambiguous result: %+v", m.activeOp)
-	}
-	if m.isWorkflowBusy() {
-		t.Fatal("busy after ambiguous result")
-	}
-}
+// ── 14. Ambiguity stays explicit on the executor path ─────────────────────
+// An unresolvable mutation target stops before any provider invocation and is
+// surfaced explicitly — covered by TestRuntimeCutoverFlagOnAmbiguousTargetStaysExplicit
+// (runtime_cutover_test.go) on the executor path.

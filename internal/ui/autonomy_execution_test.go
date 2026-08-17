@@ -245,29 +245,19 @@ func TestAutonomyModificationProposalRedundancyEvidence(t *testing.T) {
 	if gem.res == nil || gem.res.PendingPatchID == "" {
 		t.Fatal("authorized hotfix must stop at the executor approval gate")
 	}
-	// The redundancy decision is deterministic: orphan text + duplicate blocks.
-	orig, _ := os.ReadFile("index.html")
-	dec := classifyHotfixAmbiguity("check @index.html and remove redundant content", "index.html", string(orig))
-	if dec.ambiguous {
-		t.Fatal("redundancy-resolved hotfix must not be ambiguous")
-	}
-	if len(dec.redundant) == 0 {
-		t.Fatal("redundancy resolution must produce deterministic evidence")
-	}
-	foundOrphan := false
-	foundDup := false
-	for _, r := range dec.redundant {
-		switch r.Kind {
-		case "orphan_text":
-			foundOrphan = true
-		case "duplicate_block":
-			foundDup = true
+	// The runtime owns the deterministic redundancy classification; the UI
+	// never re-classifies the request after the executor resolved it. The
+	// deterministic evidence ledger crosses into the model as the
+	// authoritative evidence contract.
+	evidenceInPrompt := false
+	for _, r := range mock.requests {
+		for _, m := range r.Messages {
+			if strings.Contains(m.Content, "Context Evidence Ledger") {
+				evidenceInPrompt = true
+			}
 		}
 	}
-	if !foundOrphan {
-		t.Error("evidence must include the orphan text finding")
-	}
-	if !foundDup {
-		t.Error("evidence must include the duplicate-block finding")
+	if !evidenceInPrompt {
+		t.Error("mutation prompt must carry the deterministic redundancy evidence ledger")
 	}
 }

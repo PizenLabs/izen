@@ -87,9 +87,13 @@ func (m *model) executeAutonomyViaRuntime(trace autonomy.Trace) tea.Cmd {
 		}
 	}
 	if m.gateway == nil || m.executor == nil {
-		// Runtime boundary not wired (harness): fall back to the legacy builder
-		// so an autonomy-decided mutation never silently drops.
-		return m.executeAutonomyBuild(trace)
+		// Runtime boundary not wired (harness): an autonomy-decided mutation
+		// must never silently drop, but no legacy provider path may run either.
+		// The executor is the only production mutation authority.
+		m.push(roleError, "execution runtime not wired — cannot execute the decided mutation")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
 	}
 
 	// ── CANONICAL STRATEGY + TARGET RESOLUTION (Step 2) ──────────────

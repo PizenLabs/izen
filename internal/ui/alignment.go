@@ -3,10 +3,8 @@ package ui
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 
-	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/pkg/capability"
 )
 
@@ -73,58 +71,6 @@ func (m *model) buildIntentContext() string {
 		return intent
 	}
 	return strings.TrimSpace(m.handoffLedgerContent)
-}
-
-// fastTrackGoals renders the task goal list for the fast-track build prompt.
-// Under a full-rewrite intent the explicit user intent is prepended as the
-// absolute source of truth so the model synthesizes every target from the
-// request, never from workspace state.
-func fastTrackGoals(intent string, tasks []plan.Task) string {
-	var goals []string
-	for i, t := range tasks {
-		goal := fmt.Sprintf("Task %d [%s]\nTarget file: %s\nDescription: %s", i+1, t.Type, t.Target, t.Description)
-		if t.Evidence != "" {
-			goal += "\n\n" + t.Evidence
-		}
-		goals = append(goals, goal)
-	}
-	if isFullRewriteIntent(intent) && strings.TrimSpace(intent) != "" {
-		goals = append([]string{"USER INTENT (ABSOLUTE SOURCE OF TRUTH — CREATE FROM SCRATCH):", intent}, goals...)
-	}
-	return strings.Join(goals, "\n\n---\n\n")
-}
-
-// fastTrackFileContext renders the per-target file context block for the
-// fast-track build prompt. Under a full-rewrite intent (obsolete workspace) it
-// emits ONLY the target filename and the create-from-scratch directive — never
-// the current file contents, which would anchor a small model on the old
-// implementation. readTarget supplies live content for non-rewrite contexts
-// (os.ReadFile); a nil reader treats every target as new.
-func fastTrackFileContext(intent string, targets []string, readTarget func(string) ([]byte, error)) string {
-	rewrite := isFullRewriteIntent(intent)
-	var b strings.Builder
-	for _, target := range targets {
-		if rewrite {
-			fmt.Fprintf(&b, "## Target File: %s (obsolete — rewrite required)\n", target)
-			fmt.Fprintf(&b, "%s\n\n", rewriteBuildDirective)
-			continue
-		}
-		if readTarget == nil {
-			fmt.Fprintf(&b, "## Target File: %s (does not yet exist)\n\n", target)
-			continue
-		}
-		if data, err := readTarget(target); err == nil {
-			ext := filepath.Ext(target)
-			lang := strings.TrimPrefix(ext, ".")
-			if lang == "" {
-				lang = "text"
-			}
-			fmt.Fprintf(&b, "## Current Content of: %s\n```%s\n%s\n```\n\n", target, lang, string(data))
-		} else {
-			fmt.Fprintf(&b, "## Target File: %s (does not yet exist)\n\n", target)
-		}
-	}
-	return b.String()
 }
 
 // detectBuildTargetType classifies the requested target type from a build

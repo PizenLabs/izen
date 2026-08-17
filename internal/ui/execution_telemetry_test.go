@@ -1,8 +1,6 @@
 package ui
 
 import (
-	"errors"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -11,7 +9,6 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/core/capability"
-	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 )
@@ -88,160 +85,6 @@ func TestExecutionTelemetry_HotfixSingleProviderInvocation(t *testing.T) {
 	// The UI's operation telemetry records ZERO invocations — the UI made none.
 	if snap := m2.activeOp.Telemetry.Snapshot(); snap.Invocations != 0 {
 		t.Fatalf("UI telemetry invocations = %d, want 0 (the runtime owns all invocations)", snap.Invocations)
-	}
-}
-
-// TestExecutionTelemetry_AmbiguousHotfixZeroProviderInvocations asserts an
-// ambiguous $hot performs ZERO provider invocations and the telemetry records
-// zero invocations (test #14).
-func TestExecutionTelemetry_AmbiguousHotfixZeroProviderInvocations(t *testing.T) {
-	mock := &mockProvider{responses: []*ai.Response{{Content: "x", TokenOutput: 10}}}
-	m := ambiguousHotfixModel(t, mock)
-
-	if m.state != StateHotfixAmbiguous {
-		t.Fatalf("state = %v, want StateHotfixAmbiguous", m.state)
-	}
-	if mock.callCount != 0 {
-		t.Fatalf("provider called %d times for an ambiguous request, want 0", mock.callCount)
-	}
-	// The ambiguity gate is terminal: the operation is released with zero
-	// provider invocations — the telemetry must prove no provider was called.
-	if m.activeOp != nil {
-		t.Fatalf("active operation after ambiguous result: %+v", m.activeOp)
-	}
-	if m.lastExecutionSnapshot.OpID == "" {
-		t.Fatal("ambiguous execution should retain a telemetry record proving zero invocations")
-	}
-	if m.lastExecutionSnapshot.Invocations != 0 {
-		t.Fatalf("ambiguous execution recorded %d provider invocations, want 0", m.lastExecutionSnapshot.Invocations)
-	}
-}
-
-// TestExecutionTelemetry_SuccessfulHotfixReachesPatchStage asserts a
-// successful hotfix reaches the patch stage: the telemetry stage list contains
-// model + patch (and the terminal apply path records when run) (test #15).
-func TestExecutionTelemetry_SuccessfulHotfixReachesPatchStage(t *testing.T) {
-	mock := &mockProvider{responses: []*ai.Response{{
-		Content:     "```html\n<h1>Fixed</h1>\n```",
-		TokenInput:  5,
-		TokenOutput: 20,
-	}}}
-	m := hotfixModelWithProvider(t, mock)
-	_ = os.WriteFile("index.html", []byte("<h1>Old</h1>\n"), 0o644)
-
-	m.beginOperation(OpHotfix)
-	op := m.activeOp
-	task := &plan.Task{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Description: "fix the heading @index.html"}
-	msg := m.proposeHotfixPatch(task)()
-	hp, ok := msg.(hotfixProposalMsg)
-	if !ok {
-		t.Fatalf("expected hotfixProposalMsg, got %T", msg)
-	}
-	if hp.Err != nil {
-		t.Fatalf("hotfix generation failed: %v", hp.Err)
-	}
-	// Drive the terminal proposal through the event loop so the operation (and
-	// its telemetry) finalizes with a real terminal patch stage.
-	res, _ := m.Update(hp)
-	m2 := res.(*model)
-	if m2.activeOp != nil {
-		t.Fatalf("hotfix operation not finalized: %+v", m2.activeOp)
-	}
-
-	// The finalized telemetry stage log must contain the model (provider) and
-	// patch (changeset compilation) stages — a real execution reached both.
-	snap := m2.lastExecutionSnapshot
-	var sawModel, sawPatch bool
-	for _, sp := range snap.Stages {
-		if sp.Stage == "model" && sp.State.Terminal() {
-			sawModel = true
-		}
-		if sp.Stage == "patch" && sp.State.Terminal() {
-			sawPatch = true
-		}
-	}
-	if !sawModel {
-		t.Fatalf("telemetry missing terminal model stage: %+v", snap.Stages)
-	}
-	if !sawPatch {
-		t.Fatalf("telemetry missing terminal patch stage: %+v", snap.Stages)
-	}
-	_ = op
-}
-
-// TestExecutionTelemetry_FailedPatchExtractionReportsPatchStage asserts a
-// failed patch extraction is attributed to the patch stage (test #16). A
-// large-file $hot whose model re-emits the whole document is rejected by the
-// bounded-contract changeset pipeline at the patch stage.
-func TestExecutionTelemetry_FailedPatchExtractionReportsPatchStage(t *testing.T) {
-	large := largeMismatchedIndexHTML()
-	mock := &mockProvider{responses: []*ai.Response{{
-		Content:     "```html\n" + large + "\n```",
-		TokenInput:  3,
-		TokenOutput: 1200,
-	}}}
-	// hotfixModelWithProvider chdirs into its temp dir; write the fixture
-	// AFTER so the file lands in the same working directory the target
-	// resolves against.
-	m := hotfixModelWithProvider(t, mock)
-	_ = os.WriteFile("index.html", []byte(large), 0o644)
-
-	m.beginOperation(OpHotfix)
-	op := m.activeOp
-	task := &plan.Task{StepNum: 1, Type: "FILE_MUTATE", Target: "index.html", Description: "Fix an HTML syntax error in @index.html"}
-	msg := m.proposeHotfixPatch(task)()
-	hp, ok := msg.(hotfixProposalMsg)
-	if !ok {
-		t.Fatalf("expected hotfixProposalMsg, got %T", msg)
-	}
-	if hp.Err == nil || !strings.Contains(hp.Err.Error(), "bounded hotfix contract") {
-		t.Fatalf("expected the bounded-contract rejection, got: %v", hp.Err)
-	}
-
-	res, _ := m.Update(hp)
-	m2 := res.(*model)
-	snap := m2.lastExecutionSnapshot
-	var sawPatchFailed bool
-	for _, sp := range snap.Stages {
-		if sp.Stage == "patch" && sp.State == execution.StageFailed {
-			sawPatchFailed = true
-		}
-	}
-	if !sawPatchFailed {
-		t.Fatalf("failed patch extraction not attributed to patch stage: %+v", snap.Stages)
-	}
-	_ = op
-}
-
-// TestExecutionTelemetry_ProviderCompletionClearsWaiting asserts that after
-// provider completion the authoritative stage is never left in "waiting"
-// (test #17). The stage transitions waiting → streaming → done exactly as the
-// provider round-trip completes.
-func TestExecutionTelemetry_ProviderCompletionClearsWaiting(t *testing.T) {
-	mock := &mockProvider{responses: []*ai.Response{{
-		Content:     "```\n# New\n```",
-		TokenInput:  1,
-		TokenOutput: 10,
-	}}}
-	m := hotfixModelWithProvider(t, mock)
-	_ = os.WriteFile("README.md", []byte("# Old\n"), 0o644)
-
-	m.beginOperation(OpHotfix)
-	op := m.activeOp
-	task := &plan.Task{StepNum: 1, Type: "FILE_MUTATE", Target: "README.md", Description: "update README @README.md"}
-	msg := m.proposeHotfixPatch(task)()
-	if _, ok := msg.(hotfixProposalMsg); !ok {
-		t.Fatalf("expected hotfixProposalMsg, got %T", msg)
-	}
-
-	// The provider span must be terminal — the waiting state cannot survive
-	// provider completion.
-	snap := op.Telemetry.Snapshot()
-	if len(snap.Providers) != 1 {
-		t.Fatalf("providers = %d, want 1", len(snap.Providers))
-	}
-	if !snap.Providers[0].State.Terminal() {
-		t.Fatalf("provider span state = %q, want terminal (waiting must be cleared)", snap.Providers[0].State)
 	}
 }
 
@@ -326,34 +169,44 @@ func TestExecutionTelemetry_InspectDirectiveReachable(t *testing.T) {
 		TokenInput:  1,
 		TokenOutput: 10,
 	}}}
-	m := hotfixModelWithProvider(t, mock)
+	m := gatedDispatchModel(t, mock, nil)
+	m.resolver.Set(modes.ModeBuild)
 
-	// Produce telemetry to inspect: a successful hotfix.
-	m.beginOperation(OpHotfix)
-	task := &plan.Task{StepNum: 0, Type: "FILE_MUTATE", Target: "LICENSE", Description: "add LICENSE @LICENSE"}
-	msg := m.proposeHotfixPatch(task)()
-	hp, ok := msg.(hotfixProposalMsg)
+	// Produce telemetry to inspect: a successful $hot through the runtime.
+	cmd := m.handleInput("$hot add a note file @note.md")
+	if cmd == nil {
+		t.Fatal("handleInput returned nil for $hot")
+	}
+	msg := cmd()
+	gem, ok := msg.(gatedExecutionMsg)
 	if !ok {
-		t.Fatalf("expected hotfixProposalMsg, got %T", msg)
+		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
 	}
-	if hp.Err != nil {
-		t.Fatalf("hotfix generation failed: %v", hp.Err)
+	if gem.err != nil {
+		t.Fatalf("execution failed: %v", gem.err)
 	}
-	m.Update(hp)
+	if gem.res == nil {
+		t.Fatal("nil gate result")
+	}
+	m.executionResultUpdate(executionResultMsg{res: gem.res})
 
 	// $inspect routes through the parser + handleReviewDollar without error.
-	cmd := m.handleInput("$inspect")
-	if cmd == nil {
+	icmd := m.handleInput("$inspect")
+	if icmd == nil {
 		t.Fatal("handleInput returned nil for $inspect")
 	}
-	res := cmd()
+	res := icmd()
 	if res != nil {
 		t.Fatalf("inspect command produced a stray message: %T", res)
 	}
 	// The detailed timeline is rendered directly from the retained record.
 	rendered := renderInspectTimeline(m.lastExecutionSnapshot, "")
-	if !strings.Contains(rendered, "Execution:") || !strings.Contains(rendered, "invocations=1") {
+	if !strings.Contains(rendered, "Execution:") {
 		t.Fatalf("inspect timeline missing execution metadata:\n%s", rendered)
+	}
+	// The runtime-owned proof carries the single authoritative invocation.
+	if proof := renderExecutionProof(m.lastExecutionProof); !strings.Contains(proof, "provider-invocations=1") {
+		t.Fatalf("inspect proof missing the authoritative invocation count:\n%s", proof)
 	}
 }
 
@@ -414,19 +267,19 @@ func TestExecutionTelemetry_NormalUIStaysCompact(t *testing.T) {
 		TokenInput:  1,
 		TokenOutput: 10,
 	}}}
-	m := hotfixModelWithProvider(t, mock)
+	m := gatedDispatchModel(t, mock, nil)
+	m.resolver.Set(modes.ModeBuild)
 
-	m.beginOperation(OpHotfix)
-	task := &plan.Task{StepNum: 0, Type: "FILE_MUTATE", Target: "LICENSE", Description: "add LICENSE @LICENSE"}
-	msg := m.proposeHotfixPatch(task)()
-	hp, ok := msg.(hotfixProposalMsg)
+	cmd := m.handleInput("$hot add a note file @note.md")
+	msg := cmd()
+	gem, ok := msg.(gatedExecutionMsg)
 	if !ok {
-		t.Fatalf("expected hotfixProposalMsg, got %T", msg)
+		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
 	}
-	if hp.Err != nil {
-		t.Fatalf("hotfix generation failed: %v", hp.Err)
+	if gem.err != nil {
+		t.Fatalf("execution failed: %v", gem.err)
 	}
-	res, _ := m.Update(hp)
+	res, _ := m.executionResultUpdate(executionResultMsg{res: gem.res})
 	m2 := res.(*model)
 
 	// The authoritative stage renders as a single-line status, never a
@@ -459,19 +312,19 @@ func TestExecutionTelemetry_NormalUIContainsNoReasoning(t *testing.T) {
 		TokenInput:  1,
 		TokenOutput: 10,
 	}}}
-	m := hotfixModelWithProvider(t, mock)
+	m := gatedDispatchModel(t, mock, nil)
+	m.resolver.Set(modes.ModeBuild)
 
-	m.beginOperation(OpHotfix)
-	task := &plan.Task{StepNum: 0, Type: "FILE_MUTATE", Target: "LICENSE", Description: "add LICENSE @LICENSE"}
-	msg := m.proposeHotfixPatch(task)()
-	hp, ok := msg.(hotfixProposalMsg)
+	cmd := m.handleInput("$hot add a note file @note.md")
+	msg := cmd()
+	gem, ok := msg.(gatedExecutionMsg)
 	if !ok {
-		t.Fatalf("expected hotfixProposalMsg, got %T", msg)
+		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
 	}
-	if hp.Err != nil {
-		t.Fatalf("hotfix generation failed: %v", hp.Err)
+	if gem.err != nil {
+		t.Fatalf("execution failed: %v", gem.err)
 	}
-	res, _ := m.Update(hp)
+	res, _ := m.executionResultUpdate(executionResultMsg{res: gem.res})
 	m2 := res.(*model)
 
 	rendered := renderInspectTimeline(m2.lastExecutionSnapshot, "")
@@ -480,81 +333,10 @@ func TestExecutionTelemetry_NormalUIContainsNoReasoning(t *testing.T) {
 			t.Fatalf("inspect view leaks %q:\n%s", forbidden, rendered)
 		}
 	}
-	if !strings.Contains(rendered, "invocations=1") {
-		t.Fatalf("inspect view missing invocation counter:\n%s", rendered)
+	// The authoritative invocation count lives in the runtime-owned proof.
+	if proof := renderExecutionProof(m2.lastExecutionProof); !strings.Contains(proof, "provider-invocations=1") {
+		t.Fatalf("inspect proof missing the authoritative invocation count:\n%s", proof)
 	}
 }
 
-// TestExecutionTelemetry_TimedOutExecutionTerminatesAllWorkers asserts a
-// provider that exceeds its operation deadline reaches TIMEOUT, the telemetry
-// finalizes with a timeout outcome, and no worker survives (tests #11/#12 at
-// the UI integration level).
-func TestExecutionTelemetry_TimedOutExecutionTerminatesAllWorkers(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
-	_ = os.WriteFile("index.html", []byte(largeMismatchedIndexHTML()), 0o644)
-
-	bp := &blockingProvider{started: make(chan struct{})}
-	m := newTestModel()
-	m.ti.Focus()
-	m.provider = bp
-	m.hotfixTimeout = 50 * time.Millisecond
-
-	m.beginOperation(OpHotfix)
-	op := m.activeOp
-	op.Telemetry.Workers().Spawn("hotfix")
-
-	m.hotfixActive = true
-	msg := m.proposeHotfixPatch(structuralHotfixTask())()
-	hp, ok := msg.(hotfixProposalMsg)
-	if !ok {
-		t.Fatalf("expected hotfixProposalMsg, got %T", msg)
-	}
-	if hp.Err == nil || !isContextDeadline(hp.Err) {
-		t.Fatalf("expected deadline-exceeded error, got %v", hp.Err)
-	}
-
-	// The worker observed the deadline and returned: release it.
-	op.Telemetry.Workers().Release("hotfix")
-
-	// Feed the terminal message: TIMEOUT → cleanup → telemetry finalized.
-	res, _ := m.Update(hp)
-	m2 := res.(*model)
-	if m2.activeOp != nil {
-		t.Fatal("active operation not released after timeout")
-	}
-	if m2.lastExecutionTelemetry == nil || !m2.lastExecutionTelemetry.Finalized() {
-		t.Fatal("telemetry not finalized after timeout")
-	}
-	snap := m2.lastExecutionSnapshot
-	if snap.Outcome != "timeout" {
-		t.Fatalf("telemetry outcome = %q, want timeout", snap.Outcome)
-	}
-	if len(snap.LiveWorkers) != 0 {
-		t.Fatalf("workers still live after timeout: %v", snap.LiveWorkers)
-	}
-}
-
-// TestExecutionTelemetry_ApplyStageRecordsUnderDeadline asserts the mutation
-// apply path records a terminal apply stage under its deadline (test #15 apply
-// leg): a cancelled operation makes the apply abort with a truthful error.
-func TestExecutionTelemetry_ApplyStageRecordsUnderDeadline(t *testing.T) {
-	m4 := newTestModel()
-	m4.execEng = execution.NewEngine(".", m4.cfg, m4.sess)
-	m4.beginOperation(OpBuild)
-	op := m4.activeOp
-	m4.activeOp.Cancel()
-	err := m4.applyPatchWithDeadline(&execution.Patch{File: "x", Modified: "y"})
-	if !errors.Is(err, execution.ErrPatchApplyTimeout) {
-		t.Fatalf("apply after cancellation = %v, want ErrPatchApplyTimeout", err)
-	}
-	// The operation was cancelled before the apply could start: the apply
-	// stage must not linger as a live stage after the operation terminalizes.
-	m4.finalizeOperation(OpOutcomeCancelled, nil)
-	snap := op.Telemetry.Snapshot()
-	for _, sp := range snap.Stages {
-		if !sp.State.Terminal() {
-			t.Fatalf("stage %s non-terminal after finalize: %+v", sp.Stage, sp.State)
-		}
-	}
-}
+// TestExecutionTelemetry_WorkersReleasedAfterRealBuild drives the RuntimeExecutor

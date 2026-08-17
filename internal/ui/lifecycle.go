@@ -142,9 +142,7 @@ func (m *model) resetTransientInteraction() {
 	m.pendingBuildAllowAlways = false
 	m.pendingHotfixTask = nil
 	m.pendingHotfixPatch = nil
-	m.pendingHotfixAmbiguous = nil
 	m.hotfixCandidatesMode = false
-	m.pendingHotfixCandidate = nil
 	m.appliedHotfixFile = ""
 	m.pendingRouteConfirm = false
 	m.pendingRouteInput = ""
@@ -259,14 +257,11 @@ func (m *model) discardPendingAction() {
 	m.pendingBuildAllowAlways = false
 	m.pendingHotfixTask = nil
 	m.pendingHotfixPatch = nil
-	m.pendingHotfixAmbiguous = nil
 	m.hotfixCandidatesMode = false
-	m.pendingHotfixCandidate = nil
 	m.appliedHotfixFile = ""
 	// Discard the multi-file execution graph (Phase 9B). The MutationSet it
 	// owned was rolled back above.
 	m.activeGraph = nil
-	m.pendingHotfixGraph = nil
 	m.pendingRouteConfirm = false
 	m.pendingRouteInput = ""
 	m.pendingRouteResult = router.ClassificationResult{}

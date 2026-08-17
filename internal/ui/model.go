@@ -33,7 +33,6 @@ import (
 	runtimegraph "github.com/PizenLabs/izen/internal/execution/graph"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/git"
-	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
@@ -476,72 +475,6 @@ type buildFailedMsg struct {
 // hotfixProposalMsg carries the LLM-generated patch for a $hot hotfix back to
 // the Update loop. The engine does NOT apply it — it freezes the pipeline in
 // StateAwaitingApproval and renders a diff proposal for explicit authorization.
-type hotfixProposalMsg struct {
-	Task  *plan.Task
-	Patch *execution.Patch
-	Diff  string
-	Err   error
-	// TokenInput/TokenOutput carry the provider-reported usage of the hotfix
-	// patch call so tokens are recorded even on truncation.
-	TokenInput  int
-	TokenOutput int
-	// RawOutput is the verbatim LLM output (reasoning + response text) of the
-	// hotfix patch call. It is projected into the Ctrl+O thought / trace
-	// buffers by the update handler so the thought drawer renders the raw
-	// model stream during and after cloud execution.
-	RawOutput string
-	// Envelope is the deterministic context-ownership account of the provider
-	// request Izen constructed for this hotfix (Phase 8). It proves what
-	// context crossed to the provider — never a reconstruction.
-	Envelope PromptEnvelope
-}
-
-// multiHotfixProposalMsg is the terminal message of the Phase A (prepare) stage
-// of a multi-file $hot. It carries the fully prepared ExecutionGraph (every
-// node has a validated artifact), the per-node SemanticProposals for the
-// approval surface, and the AGGREGATE provider usage of ALL node invocations.
-// It never mutates the filesystem — apply happens only after human approval.
-type multiHotfixProposalMsg struct {
-	// Graph is the prepared execution graph (Phase A complete).
-	Graph *execution.ExecutionGraph
-	// Proposals is one proposal per graph node, in stable order.
-	Proposals []SemanticProposal
-	// Err is set when Phase A failed before any artifact was applied. The
-	// owning MutationSet is rolled back by the handler.
-	Err error
-	// TokenInput / TokenOutput are the aggregate provider-reported usage of
-	// every node invocation (summed once per node, never duplicated).
-	TokenInput  int
-	TokenOutput int
-	// RawOutput is the concatenated raw LLM output of every node.
-	RawOutput string
-}
-
-// hotfixAmbiguousMsg is the terminal result of a $hot request paused by the
-// deterministic target-confidence boundary. It is NOT a patch proposal: the
-// provider was never invoked, no patch exists, and no mutation may occur. It
-// carries everything the actionable ambiguity-resolution card needs.
-type hotfixAmbiguousMsg struct {
-	Task   *plan.Task // the original hotfix request (Target + Description)
-	Reason string     // why the target is ambiguous
-	// Status distinguishes target_not_found from target_ambiguous so the card
-	// never collapses them into a generic hotfix failure.
-	Status hotfixTargetStatus
-	// Candidates are deterministic, inspectable target options (HTML structural
-	// anomalies). Human selection makes the target explicit; it is never chosen
-	// automatically.
-	Candidates []hotfix.Target
-}
-
-// hotfixAmbiguousData is the persisted ambiguity-resolution state rendered by
-// the StateHotfixAmbiguous card.
-type hotfixAmbiguousData struct {
-	Task       *plan.Task
-	Reason     string
-	Status     hotfixTargetStatus
-	Candidates []hotfix.Target
-}
-
 type fixResultMsg struct {
 	content string
 	err     error
@@ -1156,21 +1089,11 @@ type model struct {
 	// pendingHotfixTask is the synthesized FILE_MUTATE task awaiting y/n.
 	pendingHotfixTask *plan.Task
 	// pendingHotfixPatch holds the generated patch awaiting approval so the
-	// apply step does not need to re-invoke the LLM on confirmation.
+	// terminal buildResultMsg handler can apply it (hotfix apply).
 	pendingHotfixPatch *execution.Patch
-	// pendingHotfixAmbiguous holds the actionable ambiguity-resolution state
-	// rendered by the StateHotfixAmbiguous card. Non-nil only while a $hot
-	// request is paused by the target-confidence boundary (no provider, no
-	// patch, no mutation).
-	pendingHotfixAmbiguous *hotfixAmbiguousData
 	// hotfixCandidatesMode toggles the read-only candidate-inspection sub-view
 	// of the ambiguous card. Inspecting candidates never mutates the file.
 	hotfixCandidatesMode bool
-	// pendingHotfixCandidate is the explicitly selected candidate target for a
-	// candidate-driven structural hotfix. It is set synchronously by the
-	// candidate-selection handler and cleared when the resulting proposal (or
-	// an error) reaches the event loop.
-	pendingHotfixCandidate *hotfix.Target
 	// appliedHotfixFile records the target file of an APPROVED hotfix so the
 	// terminal buildResultMsg handler can dispatch the runtime approve_patch
 	// projection ONLY after the authoritative apply (budget/authorization
@@ -1183,9 +1106,6 @@ type model struct {
 	// supersedes a previous one). It carries the one MutationSet the whole
 	// graph executes under.
 	activeGraph *execution.ExecutionGraph
-	// pendingHotfixGraph is the prepared graph awaiting the approval gate. It
-	// is non-nil only while a multi-file proposal is staged for review.
-	pendingHotfixGraph *execution.ExecutionGraph
 	// lastExecutionGraph retains the most recently finalized multi-file graph
 	// so $inspect can expose the aggregate execution evidence.
 	lastExecutionGraph *execution.ExecutionGraph
@@ -2340,9 +2260,7 @@ func (m *model) unwindBuildFailure() {
 	m.pendingBuildTask = nil
 	m.pendingHotfixTask = nil
 	m.pendingHotfixPatch = nil
-	m.pendingHotfixAmbiguous = nil
 	m.hotfixCandidatesMode = false
-	m.pendingHotfixCandidate = nil
 	m.acceptAll = false
 	m.pendingRouteConfirm = false
 	m.clearAutonomyProposal()
@@ -2412,9 +2330,7 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	m.pendingBuildTask = nil
 	m.pendingHotfixTask = nil
 	m.pendingHotfixPatch = nil
-	m.pendingHotfixAmbiguous = nil
 	m.hotfixCandidatesMode = false
-	m.pendingHotfixCandidate = nil
 	m.acceptAll = false
 	m.pendingRouteConfirm = false
 	m.clearAutonomyProposal()
@@ -2474,15 +2390,6 @@ func (m *model) syncUIState() {
 	// candidate selector (↑/↓ + Enter, Esc).
 	if len(m.pendingAutonomyTargets) > 0 {
 		m.state = presentation.StateAwaitingApproval
-		return
-	}
-	// ── HOTFIX AMBIGUITY RESULT STATE ──────────────────────────────
-	// The ambiguity pause is a result/state of the $hot operation, NOT a
-	// workflow phase: it does NOT touch the workflow state machine and takes
-	// precedence over any transient busy flag so the actionable resolution card
-	// keeps rendering until the user acts.
-	if m.pendingHotfixAmbiguous != nil {
-		m.state = presentation.StateHotfixAmbiguous
 		return
 	}
 	phase := ""
