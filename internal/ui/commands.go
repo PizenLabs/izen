@@ -89,6 +89,7 @@ var validSystemCommands = map[string]struct{}{
 	"/checkpoint":       {},
 	"/arch":             {},
 	"/explain-decision": {},
+	"/decide":           {},
 }
 
 // ansiRe strips terminal ANSI escape color codes (e.g. \x1b[31m) that can
@@ -187,6 +188,22 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return m.handleReviewTestConfirm(line)
 	}
 
+	// ── $decide AUTONOMY TRACE (intercepted BEFORE the parser pipeline) ──
+	// $decide <prompt> runs the human-authorized decision runtime: intent
+	// classification (independent of mode), capability-based workspace
+	// selection, and the autonomy verdict. It is purely observational — it
+	// changes no routing and executes nothing.
+	if strings.HasPrefix(line, "$decide") {
+		decideContent := strings.TrimSpace(strings.TrimPrefix(line, "$decide"))
+		if decideContent == "" {
+			m.push(roleSystem, infoStyle.Render("[Usage] $decide <prompt> — run the intent → workspace → autonomy decision trace"))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+		return m.runAutonomyDecideCmd(decideContent)
+	}
+
 	if strings.HasPrefix(line, "!") {
 		shellCmd := strings.TrimSpace(line[1:])
 		if shellCmd == "" {
@@ -263,6 +280,19 @@ func (m *model) handleInput(line string) tea.Cmd {
 		switchCmd := m.runtimeSwitchCmd(mode)
 		if content != "" {
 			m.setMode(mode)
+			// ── /ask SINGLE DECISION AUTHORITY (§4) ────────────────────
+			// /ask is the explicit read-only chat boundary, so its content
+			// flows through the SAME autonomy decision authority as every other
+			// objective. A read-only /ask request (question, inspection,
+			// explanation) answers in the ask workspace as before; a mutation
+			// request typed into /ask ("/ask remove redundant content from
+			// @index.html") must NEVER silently execute or be answered as chat —
+			// the autonomy runtime classifies it as a mutation and returns a
+			// capability escalation proposal. The user authorizes the boundary;
+			// the runtime never re-asks for a mode command.
+			if mode == modes.ModeAsk && m.autonomy != nil {
+				return tea.Batch(m.runAutonomyRoutedCmd(content), switchCmd)
+			}
 			return tea.Batch(m.handleMessageContent(content), switchCmd)
 		}
 		if mode == modes.ModeReview {
@@ -345,13 +375,44 @@ func (m *model) handleInput(line string) tea.Cmd {
 	m.sess.AddMessage("user", line, 5)
 	_ = m.sess.Save()
 
-	// ── UNIFIED INTENT GATEWAY (execution-driven runtime) ──────────────
-	// Every remaining execution-bearing input — bare text, $prompt, $hot —
-	// produces an ExecuteRequest through the unified IntentGateway. The
-	// runtime (RuntimeExecutor) decides the execution path via unconditional
-	// Strategy.Select: never the UI, never a mode transition, never a hidden
-	// /build invocation. The UI renders the canonical runtime events and the
-	// returned result.
+// ── HYBRID INTENT GATEWAY ────────────────────────────────────────
+	// Free-form input (no explicit mode shorthand, no command, no shell) goes
+	// through the Hybrid Intent Gateway: the deterministic fast path first, then
+	// the semantic IntentClassifier when no deterministic signal matches. The
+	// classified intent is projected onto the current phase (auto mode switch),
+	// or — at low confidence (ConfirmationRequirement) — surfaced as an
+	// interactive mode-selection prompt instead of acting on a blind guess.
+	// The route runs async because the semantic fallback may invoke the LLM.
+	//
+	// ── /ask MODE LOCK: Direct Read-Only Chat boundary ───────────────
+	// /ask is a strict read-only chat boundary. The ONLY valid sub-prompt
+	// is $prompt (handled above). Free-form input in /ask MUST NEVER route
+	// through the intent classifier — the classifier can misclassify natural
+	// questions as /plan, /investigate, or /build and auto-switch modes,
+	// violating the Direct Chat contract. Bypass the router entirely.
+	//
+	// When the autonomy decision runtime is wired, free-form input flows
+	// through it in ANY workspace (including /ask): the runtime classifies
+	// conversation directly (no workspace switch, no execution) and routes
+	// meaningful requests to their capability-driven workspace. This replaces
+	// the mode-first router as the decision layer.
+	if m.autonomy != nil {
+		return m.routeFreeInput(line)
+	}
+	return m.runGatedLine(line)
+}
+
+// routeFreeInput dispatches a free-form prompt through the autonomy runtime
+// when it is wired: the runtime classifies intent, resolves capabilities,
+// evaluates risk and selects the workspace — conversation answers directly,
+// meaningful requests execute in the decided workspace. When the decision
+// runtime is not wired (headless/test harnesses), the input falls through to
+// the unified IntentGateway (RuntimeExecutor), which selects the execution
+// path deterministically; the UI never decides the path.
+func (m *model) routeFreeInput(line string) tea.Cmd {
+	if m.autonomy != nil {
+		return m.runAutonomyRoutedCmd(line)
+	}
 	return m.runGatedLine(line)
 }
 
@@ -1505,6 +1566,7 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	m.currentEffort = EffortAuto
 	m.pendingBuildApproval = false
 	m.pendingBuildTask = nil
+	m.clearAutonomyProposal()
 
 	if mode == m.resolver.Current() {
 		return nil
@@ -1855,6 +1917,10 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /investigate debug bugs, failures, regressions"))
 		m.push(roleSystem, infoStyle.Render("  /review      audit changes, detect risks"))
 		m.push(roleSystem, "")
+		m.push(roleSystem, labelBoldStyle.Render("autonomy"))
+		m.push(roleSystem, infoStyle.Render("  $prompt <objective>  enter the autonomous runtime (intent → capability → workspace → decision → execution)"))
+		m.push(roleSystem, infoStyle.Render("  $decide <prompt>     run the intent → workspace → decision trace"))
+		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
 		m.push(roleSystem, infoStyle.Render("  /help  /usage  /model  /objective  /drop  /clear  /quit"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>"))
@@ -1889,6 +1955,23 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 	case cmd == "/usage":
 		return m.runUsageCmd()
+
+	case cmd == "/grant":
+		// DEPRECATED: authorization is now an internal operation of the
+		// autonomy proposal (ask_user → Execute). The handler remains only as
+		// an internal compatibility seam; the /grant token is not a registry
+		// command and is not reachable through the parser pipeline.
+		return m.handleAutonomyGrant("")
+
+	case strings.HasPrefix(cmd, "/decide"):
+		content := strings.TrimSpace(strings.TrimPrefix(cmd, "/decide"))
+		if content == "" {
+			m.push(roleSystem, infoStyle.Render("usage: /decide <prompt>  — run the intent → workspace → decision trace"))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+		return m.runAutonomyDecideCmd(content)
 
 	case strings.HasPrefix(cmd, "/provider"):
 		parts := strings.Fields(cmd)
@@ -3178,7 +3261,8 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 	if data, rerr := os.ReadFile(target); rerr == nil {
 		orig = string(data)
 	}
-	if dec := classifyHotfixAmbiguity(prompt, target, orig); dec.ambiguous {
+	dec := classifyHotfixAmbiguity(prompt, target, orig)
+	if dec.ambiguous {
 		m.beginOperation(OpHotfix)
 		m.hotfixActive = false
 		if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
@@ -3190,10 +3274,19 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 		m.Viewport.GotoBottom()
 		return tea.Batch(
 			func() tea.Msg {
-				return hotfixAmbiguousMsg{Task: &hotfixTask, Reason: dec.reason, Candidates: dec.candidates}
+				return hotfixAmbiguousMsg{Task: &hotfixTask, Reason: dec.reason, Status: dec.status, Candidates: dec.candidates}
 			},
 			m.opWatchdogCmd(),
 		)
+	}
+
+	// ── REDUNDANCY EVIDENCE (target_resolved) ─────────────────────────
+	// A redundancy-removal request resolved deterministically: the located
+	// redundant regions are the mutation target. The evidence is compiled
+	// BEFORE the model is asked to reason — the model removes exactly the
+	// located redundant blocks, never re-discovering them from raw text.
+	if len(dec.redundant) > 0 {
+		hotfixTask.Evidence = formatRedundancyLedger(target, dec.redundant)
 	}
 
 	// Stage 5: Generate the patch but DO NOT apply it. The engine must render
@@ -3228,6 +3321,26 @@ func (m *model) handleHotfixCmd(prompt string) tea.Cmd {
 		m.smoothStreamTickCmd(),
 		m.shimmerTickCmd(),
 	)
+}
+
+// formatRedundancyLedger renders the deterministic redundant-content findings
+// as a compact Context Evidence Ledger the model reasons over — it never
+// re-discovers structural facts (requirement §8: context evidence precedes
+// model reasoning).
+func formatRedundancyLedger(target string, redundant []hotfix.RedundantTarget) string {
+	if len(redundant) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Context Evidence Ledger\nTarget: %s\nRedundant content findings:\n", target)
+	for i, r := range redundant {
+		if i >= 6 {
+			b.WriteString("* ... more findings omitted\n")
+			break
+		}
+		fmt.Fprintf(&b, "* %s — %s\n", r.Kind, r.Describe())
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // sanitizeFileOutput cleans generated file content produced by the local model
@@ -3449,12 +3562,54 @@ func ambiguousHotfixTargetReason(description string) string {
 	)
 }
 
+// hotfixTargetStatus distinguishes the three deterministic target-resolution
+// outcomes. They are never collapsed into a generic hotfix failure: the card
+// tells the operator whether no target exists, multiple targets remain, or the
+// target was resolved.
+type hotfixTargetStatus string
+
+const (
+	targetNotFound  hotfixTargetStatus = "target_not_found"
+	targetAmbiguous hotfixTargetStatus = "target_ambiguous"
+	targetResolved  hotfixTargetStatus = "target_resolved"
+)
+
 // hotfixAmbiguityDecision is the deterministic outcome of the target-confidence
 // boundary for a $hot request.
 type hotfixAmbiguityDecision struct {
 	ambiguous  bool
+	status     hotfixTargetStatus
 	reason     string
 	candidates []hotfix.Target
+	// redundant carries the deterministic redundant-content regions when a
+	// redundancy-removal request resolved (target_resolved). The model is
+	// given this evidence as the mutation target — it never re-discovers
+	// redundant content from raw text.
+	redundant []hotfix.RedundantTarget
+}
+
+// redundantContentIntentKeywords are the deterministic signals that a $hot
+// request asks to REMOVE redundant/unnecessary content from a file rather than
+// to make a point-specific content edit.
+var redundantContentIntentKeywords = []string{
+	"redundant", "duplicate", "unnecessary", "extraneous", "stray",
+	"leftover", "dead content", "unused content", "extra content",
+	"remove content", "remove text", "delete content", "delete text",
+	"strip content", "clean content",
+}
+
+// isRedundantContentIntent reports whether the $hot request is a
+// redundancy-removal request. For such requests the deterministic redundancy
+// evidence (orphan text nodes, duplicate blocks) IS the mutation target — the
+// request never dead-ends on ambiguity when evidence exists.
+func isRedundantContentIntent(description string) bool {
+	lower := strings.ToLower(description)
+	for _, kw := range redundantContentIntentKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // classifyHotfixAmbiguity is the deterministic target-confidence boundary. It
@@ -3466,26 +3621,45 @@ type hotfixAmbiguityDecision struct {
 //   - new / missing / small files → whole-file bounded rewrite (execute)
 //   - deterministic local string mutation → explicit (execute)
 //   - structural-intent request → the defect is the unique target (execute)
-//   - otherwise → ambiguous (pause), with deterministic HTML anomaly candidates
-//     offered ONLY for human inspection
+//   - redundancy-removal request with deterministic redundant regions → the
+//     redundant content IS the target (execute)
+//   - otherwise → ambiguous (pause), with deterministic candidates offered
+//     ONLY for human inspection/selection
+//
+// The runtime distinguishes target_not_found / target_ambiguous /
+// target_resolved: a redundancy request with no located redundant region is
+// target_not_found and still pauses for clarification, but a request with
+// evidence always resolves.
 func classifyHotfixAmbiguity(description, target, orig string) hotfixAmbiguityDecision {
 	if orig == "" || execution.IsSmallFile(orig) {
-		return hotfixAmbiguityDecision{ambiguous: false}
+		return hotfixAmbiguityDecision{ambiguous: false, status: targetResolved}
 	}
 	if isHotfixLocalCandidate(description, target) {
 		if _, ok := execution.ApplyContextAwareFuzzyReplace(orig, description, target); ok {
-			return hotfixAmbiguityDecision{ambiguous: false}
+			return hotfixAmbiguityDecision{ambiguous: false, status: targetResolved}
 		}
 	}
 	if isStructuralHotfixIntent(description) {
-		return hotfixAmbiguityDecision{ambiguous: false}
+		return hotfixAmbiguityDecision{ambiguous: false, status: targetResolved}
+	}
+	// NEW: redundancy-removal intent on an HTML target with deterministic
+	// redundant regions resolves — the redundant content is the target.
+	if isRedundantContentIntent(description) && isHTMLTarget(target) {
+		if redundant, ok := hotfix.ResolveRedundantTargets(orig); ok {
+			return hotfixAmbiguityDecision{ambiguous: false, status: targetResolved, redundant: redundant}
+		}
 	}
 	var candidates []hotfix.Target
 	if isHTMLTarget(target) {
 		candidates = hotfix.ResolveHTMLCandidates(orig)
 	}
+	status := targetAmbiguous
+	if len(candidates) == 0 {
+		status = targetNotFound
+	}
 	return hotfixAmbiguityDecision{
 		ambiguous:  true,
+		status:     status,
 		reason:     ambiguousHotfixTargetReason(description),
 		candidates: candidates,
 	}
@@ -3528,6 +3702,10 @@ func buildHotfixSnippetHandoff(task *plan.Task, orig string) string {
 	b.WriteString("Fix the target file precisely.\n\n")
 	b.WriteString("### TARGET FILE\n")
 	b.WriteString(task.Target + "\n\n")
+	if task.Evidence != "" {
+		b.WriteString("### CONTEXT EVIDENCE LEDGER (deterministic findings — act on these)\n")
+		b.WriteString(task.Evidence + "\n\n")
+	}
 	if orig != "" {
 		b.WriteString("### TARGET_FILE_CONTENT (reference only)\n```\n" + orig + "\n```\n\n")
 	}
@@ -3740,6 +3918,7 @@ func (m *model) proposeHotfixPatch(task *plan.Task) tea.Cmd {
 				return hotfixAmbiguousMsg{
 					Task:       task,
 					Reason:     dec.reason,
+					Status:     dec.status,
 					Candidates: dec.candidates,
 				}
 			}

@@ -82,7 +82,11 @@ func (m *model) buildIntentContext() string {
 func fastTrackGoals(intent string, tasks []plan.Task) string {
 	var goals []string
 	for i, t := range tasks {
-		goals = append(goals, fmt.Sprintf("Task %d [%s]\nTarget file: %s\nDescription: %s", i+1, t.Type, t.Target, t.Description))
+		goal := fmt.Sprintf("Task %d [%s]\nTarget file: %s\nDescription: %s", i+1, t.Type, t.Target, t.Description)
+		if t.Evidence != "" {
+			goal += "\n\n" + t.Evidence
+		}
+		goals = append(goals, goal)
 	}
 	if isFullRewriteIntent(intent) && strings.TrimSpace(intent) != "" {
 		goals = append([]string{"USER INTENT (ABSOLUTE SOURCE OF TRUTH — CREATE FROM SCRATCH):", intent}, goals...)

@@ -143,8 +143,11 @@ func (m *model) dispatchASTIntent(ast *parser.IntentAST, line string) tea.Cmd {
 	if target != m.resolver.Current() {
 		_, explicit := workspaceFromInput(line, cmdreg.Default())
 		// Execution directives never transition the mode — the runtime decides
-		// the path. Explicit markers and legacy directive alignment do.
-		if !hasExecutionDirective(ast) || explicit {
+		// the path — UNLESS the autonomy decision runtime is wired: then the
+		// decided workspace transition happens here so the hotfix/build
+		// pipeline runs inside its capability workspace. Explicit markers and
+		// legacy directive alignment also transition.
+		if !hasExecutionDirective(ast) || explicit || m.autonomy != nil {
 			// CONTINUOUS $fix: preserve the transient test context across the
 			// internal transition so $fix still consumes lastTestOutput.
 			var savedOut, savedTarget string
@@ -193,11 +196,20 @@ func (m *model) dispatchASTIntent(ast *parser.IntentAST, line string) tea.Cmd {
 func (m *model) dispatchDirectives(ast *parser.IntentAST) tea.Cmd {
 	tail := directiveTail(ast)
 	for _, d := range ast.Directives {
-		switch d.Name {
-		case "prompt":
+		if d.Name == "prompt" {
 			return m.routePromptDirective(tail)
-		case "hot":
-			return m.runHotExecution(tail)
+		}
+	}
+
+	// ── AUTONOMY ACTIVATION BOUNDARY ($hot) ────────────────────────────
+	// A $hot directive typed as an execution request ("/build$hot check
+	// @index.html and remove redundant content") enters the autonomy runtime.
+	// The runtime owns intent → capability → workspace → decision; the decided
+	// BUILD workspace executes with hotfix semantics. It must never require a
+	// second /build command.
+	for _, d := range ast.Directives {
+		if d.Name == "hot" {
+			return m.routeHotfixThroughAutonomy(tail)
 		}
 	}
 
@@ -248,12 +260,36 @@ func hasDirective(ast *parser.IntentAST, name string) bool {
 	return false
 }
 
-// routePromptDirective implements the $prompt execution directive. A $prompt is
-// an EXECUTION REQUEST — not a message command. It crosses the unified
-// IntentGateway, which selects the strategy deterministically (Strategy.Select
-// unconditional) and produces an ExecuteRequest. The runtime decides the
-// execution path; the UI never routes by mode, never triggers a hidden /build,
-// and never invokes a provider here.
+// routePromptDirective implements the $prompt activation boundary. $prompt
+// means "enter autonomous execution/reasoning runtime for this request": the
+// objective flows through the autonomy runtime (intent → capability →
+// workspace → decision → execution). It is NOT a request to be re-asked for a
+// mode command. The legacy /ask refinement handoff survives only as a
+// compatibility path when the decision runtime is not wired (headless/test
+// harnesses).
 func (m *model) routePromptDirective(rawInput string) tea.Cmd {
+	m.cancelStaleAgentOps()
+	rawInput = strings.TrimSpace(rawInput)
+	if rawInput == "" {
+		m.push(roleError, "[Usage] $prompt <your raw architectural idea or description>")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+
+	// ── AUTONOMY ACTIVATION BOUNDARY ───────────────────────────────────
+	// $prompt <human objective> means "enter autonomous problem-solving
+	// runtime". The objective flows through the autonomy runtime — intent
+	// classification, capability resolution, risk evaluation, autonomy
+	// controller, workspace selection — and only THEN executes. The runtime
+	// decides the workspace; the user never manually selects one.
+	//
+	// When the decision runtime is not wired (headless/test harnesses), the
+	// unified IntentGateway fallback preserves the engine-first behavior: the
+	// runtime (RuntimeExecutor) still decides the execution path.
+	if m.autonomy != nil {
+		return m.runAutonomyRoutedCmd(rawInput)
+	}
+
 	return m.runPromptExecution(rawInput)
 }

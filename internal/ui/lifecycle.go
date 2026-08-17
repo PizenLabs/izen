@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/router"
 )
 
 // ── Interaction-surface lifecycle (Phase 5) ──────────────────────────────────
@@ -145,6 +146,12 @@ func (m *model) resetTransientInteraction() {
 	m.hotfixCandidatesMode = false
 	m.pendingHotfixCandidate = nil
 	m.appliedHotfixFile = ""
+	m.pendingRouteConfirm = false
+	m.pendingRouteInput = ""
+	m.pendingRouteResult = router.ClassificationResult{}
+	m.pendingRouteOptions = nil
+	m.pendingRouteIdx = 0
+	m.clearAutonomyProposal()
 	m.currentBuildTaskID = 0
 	m.pendingTestConfirm = false
 	m.pendingTestTarget = ""
@@ -260,6 +267,12 @@ func (m *model) discardPendingAction() {
 	// owned was rolled back above.
 	m.activeGraph = nil
 	m.pendingHotfixGraph = nil
+	m.pendingRouteConfirm = false
+	m.pendingRouteInput = ""
+	m.pendingRouteResult = router.ClassificationResult{}
+	m.pendingRouteOptions = nil
+	m.pendingRouteIdx = 0
+	m.clearAutonomyProposal()
 	m.pendingTestConfirm = false
 	m.pendingTestTarget = ""
 	// Discard unresolved mutations pending in the tool-call buffer.

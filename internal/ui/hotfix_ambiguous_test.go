@@ -34,6 +34,57 @@ func ambiguousMsgFor(desc, target string, cands []hotfix.Target) hotfixAmbiguous
 	}
 }
 
+// TestHotfixTargetResolutionStatusDistinction pins requirement 5: the runtime
+// distinguishes target_not_found (no deterministic candidates) from
+// target_ambiguous (multiple candidates) from target_resolved — they are never
+// collapsed into a generic hotfix failure.
+func TestHotfixTargetResolutionStatusDistinction(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	// target_ambiguous: a large HTML file with structural candidates.
+	large := largeMismatchedIndexHTML()
+	if err := os.WriteFile("a.html", []byte(large), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ambiguous := classifyHotfixAmbiguity("Remove extra text from @a.html", "a.html", large)
+	if !ambiguous.ambiguous {
+		t.Fatal("structural-content request on a large file must be ambiguous")
+	}
+	if ambiguous.status != targetAmbiguous || len(ambiguous.candidates) == 0 {
+		t.Errorf("status = %s candidates=%d, want target_ambiguous with candidates", ambiguous.status, len(ambiguous.candidates))
+	}
+
+	// target_not_found: a large HTML file with no structural candidates.
+	wellFormed := "<!DOCTYPE html>\n<html><head><title>T</title></head><body><main><p>ok</p></main></body></html>\n"
+	// Pad beyond the small-file threshold so the ambiguity boundary runs.
+	for i := 0; i < 120; i++ {
+		wellFormed += "<p>padding " + numStr(i) + "</p>\n"
+	}
+	if err := os.WriteFile("b.html", []byte(wellFormed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	notFound := classifyHotfixAmbiguity("Remove extra text from @b.html", "b.html", wellFormed)
+	if !notFound.ambiguous {
+		t.Fatal("content mutation on a large well-formed file must pause")
+	}
+	if notFound.status != targetNotFound {
+		t.Errorf("status = %s, want target_not_found", notFound.status)
+	}
+
+	// target_resolved: a redundancy-removal request with deterministic evidence.
+	if err := os.WriteFile("c.html", []byte(largeRedundantIndexHTML()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolved := classifyHotfixAmbiguity("check @c.html and remove redundant content", "c.html", largeRedundantIndexHTML())
+	if resolved.ambiguous {
+		t.Fatal("redundancy-resolved request must not pause")
+	}
+	if resolved.status != targetResolved || len(resolved.redundant) == 0 {
+		t.Errorf("status = %s redundant=%d, want target_resolved with evidence", resolved.status, len(resolved.redundant))
+	}
+}
+
 // TestHotfixAmbiguousRendersActionableState is regression test 1: an ambiguous
 // $hot request renders an actionable ambiguity state with Clarify / Cancel
 // actions — not a bare "Patch generation failed" line.

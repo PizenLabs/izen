@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/core/authorization"
@@ -45,6 +46,7 @@ import (
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 	riview "github.com/PizenLabs/izen/internal/review"
+	"github.com/PizenLabs/izen/internal/router"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
@@ -522,6 +524,9 @@ type multiHotfixProposalMsg struct {
 type hotfixAmbiguousMsg struct {
 	Task   *plan.Task // the original hotfix request (Target + Description)
 	Reason string     // why the target is ambiguous
+	// Status distinguishes target_not_found from target_ambiguous so the card
+	// never collapses them into a generic hotfix failure.
+	Status hotfixTargetStatus
 	// Candidates are deterministic, inspectable target options (HTML structural
 	// anomalies). Human selection makes the target explicit; it is never chosen
 	// automatically.
@@ -533,6 +538,7 @@ type hotfixAmbiguousMsg struct {
 type hotfixAmbiguousData struct {
 	Task       *plan.Task
 	Reason     string
+	Status     hotfixTargetStatus
 	Candidates []hotfix.Target
 }
 
@@ -929,6 +935,17 @@ type model struct {
 	awaitingConfirmation bool
 	pendingProposals     []SemanticProposal
 	acceptAll            bool
+
+	// Hybrid-intent-gateway confirmation: when the router classifies a
+	// free-form prompt with confidence below the threshold
+	// (ConfirmationRequirement), the UI freezes in StateAwaitingApproval and
+	// presents an interactive mode-selection prompt instead of acting on a
+	// blind guess. pendingRouteIdx is the highlighted option index.
+	pendingRouteConfirm bool
+	pendingRouteInput   string
+	pendingRouteResult  router.ClassificationResult
+	pendingRouteOptions []modes.Mode
+	pendingRouteIdx     int
 
 	// Accepted proposals (collapsed single-line summaries)
 	acceptedProposals []acceptedProposal
@@ -1483,6 +1500,47 @@ type model struct {
 	// resetting conversation history or workspace artifacts. Nil only in
 	// headless/test harnesses that never construct a model.
 	orch *orchestrator.Orchestrator
+
+	// Autonomy decision runtime: classifies intent independently from workspace
+	// selection, evaluates the autonomy decision model (auto_continue /
+	// ask_user / block / direct_response), records session capability grants,
+	// and drives the autonomous loop. The UI is a read-only observer: it
+	// projects the autonomy events onto the activity log and never mutates the
+	// engine. Nil only in headless/test harnesses.
+	autonomy *autonomy.Engine
+	// pendingAutonomyProposal holds the ask_user decision surface awaiting a
+	// human decision. It is the ONLY user-facing authorization gate — Execute
+	// issues the session capability grant internally, re-runs the decision and
+	// continues execution. Nil when no proposal is outstanding.
+	pendingAutonomyProposal *autonomy.Proposal
+	// autonomyProposalSelect is the highlighted action index in the proposal
+	// menu (Execute / Inspect / Cancel), navigated with ↑/↓.
+	autonomyProposalSelect int
+	// autonomyProposalInspect toggles the read-only decision-detail view of the
+	// pending proposal.
+	autonomyProposalInspect bool
+	// pendingAutonomyTargets holds the deterministic candidate files when a
+	// mutation target is ambiguous (§8). The user selects explicitly; no
+	// candidate is ever auto-picked. Nil when no selector is outstanding.
+	pendingAutonomyTargets []string
+	// autonomyTargetSelect is the highlighted candidate index in the target
+	// selector.
+	autonomyTargetSelect int
+	// pendingAutonomyTargetTrace is the decision trace resumed after the human
+	// selects a candidate. The grant already covers the boundary, so selection
+	// continues execution without re-authorization.
+	pendingAutonomyTargetTrace autonomy.Trace
+	// autonomyHotfix marks the current objective as a BUILD/hotfix execution
+	// request (e.g. "/build$hot check @index.html and remove redundant
+	// content"). While set, the decided BUILD workspace executes with hotfix
+	// semantics (deterministic target resolution → targeted patch) instead of
+	// the generic plan→build flow. It is cleared once the hotfix pipeline
+	// starts.
+	autonomyHotfix bool
+	// pendingHotfixObjective carries the hotfix tail while the autonomy
+	// authorization proposal is outstanding, so Execute can resume the hotfix
+	// pipeline on the SAME objective without re-parsing a command.
+	pendingHotfixObjective string
 
 	// Patch engine: 4-tier pipeline (Tier 1 structured diff -> Tier 2
 	// SEARCH/REPLACE -> Tier 3 whole-file -> Tier 4 human approval) replacing
@@ -2151,6 +2209,50 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// buffer (never the response pipeline); the terminal event collapses
 		// the box into compact mode.
 		m.handleReasoningStream(p.Chunk, p.IsComplete)
+	case events.AutonomyDecisionPayload:
+		// Autonomy decision runtime verdict: the canonical record of when the
+		// runtime continues, asks, blocks or answers directly. Distinct visual
+		// markers per verdict keep the autonomy surface scannable.
+		marker := "◆"
+		switch p.Decision {
+		case "auto_continue":
+			marker = "▶"
+		case "ask_user":
+			marker = "◈"
+		case "block":
+			marker = "■"
+		case "direct_response":
+			marker = "◇"
+		}
+		ws := p.Workspace
+		if ws == "" {
+			ws = "none"
+		}
+		if p.Decision == "direct_response" {
+			m.logActivity("[autonomy] %s direct response — no workspace", marker)
+		} else {
+			m.logActivity("[autonomy] %s %s → workspace %s (risk %s, %.0f%%): %s",
+				marker, p.Decision, ws, p.Risk, p.Confidence*100, truncateForActivity(p.Reason))
+		}
+		if len(p.MissingCapabilities) > 0 {
+			m.logActivity("[autonomy] requesting capability: %s",
+				strings.Join(p.MissingCapabilities, "+"))
+		}
+	case events.CapabilityGrantedPayload:
+		// A session capability grant: one grant authorizes every operation in
+		// its scope — the "no repeated approvals" guarantee.
+		m.logActivity("[grant] %s: %s granted for %s (expires %s)",
+			p.GrantID, strings.Join(p.Capabilities, "+"), p.Scope, orNever(p.ExpiresAt))
+	case events.LoopTransitionPayload:
+		// One step of the autonomous loop. Failure transitions are shown like
+		// any other: the loop produces diagnosis, never termination.
+		m.logActivity("[loop] %s → %s (%s): %s",
+			p.From, p.To, p.Event, truncateForActivity(p.Reason))
+	case events.ContextCompiledPayload:
+		// The context intelligence layer compiled a structural understanding
+		// of an artifact: findings, not raw bytes.
+		m.logActivity("[context] compiled %s (%s): %d finding(s)",
+			p.Path, p.Kind, p.FindingCount)
 	}
 }
 
@@ -2233,6 +2335,8 @@ func (m *model) unwindBuildFailure() {
 	m.hotfixCandidatesMode = false
 	m.pendingHotfixCandidate = nil
 	m.acceptAll = false
+	m.pendingRouteConfirm = false
+	m.clearAutonomyProposal()
 	if m.workflowSM != nil {
 		// From StateBuilding/StateFailed/StateRepairing the canonical exit is
 		// a reset back to StateIdle, from which every forward phase is reachable.
@@ -2303,6 +2407,8 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	m.hotfixCandidatesMode = false
 	m.pendingHotfixCandidate = nil
 	m.acceptAll = false
+	m.pendingRouteConfirm = false
+	m.clearAutonomyProposal()
 	if m.toolCallBuffer != nil {
 		m.toolCallBuffer.Reject()
 	}
@@ -2343,6 +2449,22 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 // rests in StateChat.
 func (m *model) syncUIState() {
 	if m == nil {
+		return
+	}
+	// ── AUTONOMY PROPOSAL GATE ───────────────────────────────────────
+	// The ask_user proposal is a pending human decision: it freezes the
+	// interaction into StateAwaitingApproval so the keyboard routes to the
+	// proposal (↑/↓ + Enter, Esc), independent of the workflow state machine.
+	if m.pendingAutonomyProposal != nil {
+		m.state = presentation.StateAwaitingApproval
+		return
+	}
+	// ── AUTONOMY TARGET SELECTOR GATE (§8) ─────────────────────────
+	// An ambiguous mutation target is a pending human decision: it freezes the
+	// interaction into StateAwaitingApproval so the keyboard routes to the
+	// candidate selector (↑/↓ + Enter, Esc).
+	if len(m.pendingAutonomyTargets) > 0 {
+		m.state = presentation.StateAwaitingApproval
 		return
 	}
 	// ── HOTFIX AMBIGUITY RESULT STATE ──────────────────────────────
@@ -2679,6 +2801,14 @@ func verificationTick(passed bool) string {
 		return "passed"
 	}
 	return "failed"
+}
+
+// orNever renders an RFC3339 expiry as "never" when empty.
+func orNever(ts string) string {
+	if ts == "" {
+		return "never"
+	}
+	return ts
 }
 
 // push appends a record. Records are flushed to the terminal's native

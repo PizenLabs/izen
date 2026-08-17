@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/control"
 	"github.com/PizenLabs/izen/internal/core/artifact"
@@ -153,6 +154,14 @@ type Application struct {
 	Artifacts      *artifact.Store
 	SnapCache      *wssnapshot.SnapshotCache
 	CapRegistry    *wscap.ArchetypeCapabilityRegistry
+
+	// ── Autonomy (decision runtime) ───────────────────────────────────
+	// The human-authorized autonomous runtime sits ABOVE the execution modes:
+	// it classifies intent independently from workspace selection, evaluates
+	// the autonomy decision model (auto_continue / ask_user / block / direct),
+	// records session capability grants, and drives the autonomous loop. Every
+	// decision is published as a canonical event on the shared bus.
+	Autonomy *autonomy.Engine
 
 	// timeline is the live session execution timeline projection. It
 	// subscribes to the shared bus during Wire and is never nil after; read it
@@ -603,6 +612,34 @@ func Wire(opts ...Option) (*Application, error) {
 	// conversation history or workspace artifacts. Phase changes are observed
 	// via EventPhaseChanged.
 	a.Orchestrator = orchestrator.New(a.WorkflowSM, a.RuntimeCtx).WithEventBus(a.Bus).WithPipeline(a.Pipeline)
+
+	// ── AUTONOMY DECISION RUNTIME ────────────────────────────────────────
+	// The autonomy engine is the decision layer above the modes. Its scope is
+	// the workspace root (falling back to "repository" when no root is wired,
+	// e.g. in harnesses). The mutation risk probe is bound to the execution
+	// engine's RiskClassifier so the decision model sees the same risk surface
+	// the mutation guards enforce; rollback availability is probed against the
+	// checkpoint manager. Both probes degrade gracefully to safe defaults.
+	scope := "repository"
+	if root != "" {
+		scope = root
+	}
+	autoOpts := []autonomy.Option{
+		autonomy.WithEventBus(a.Bus),
+		autonomy.WithScope(scope),
+	}
+	if a.Execution != nil && a.Execution.Risk != nil {
+		autoOpts = append(autoOpts, autonomy.WithRiskFunc(func(target string) autonomy.MutationRiskInput {
+			res := a.Execution.Risk.ClassifyFileOp(target, true)
+			return autonomy.MutationRiskInput{Level: autonomy.ParseRisk(res.Label)}
+		}))
+	}
+	if a.Execution != nil && a.Execution.Checkpoints != nil {
+		autoOpts = append(autoOpts, autonomy.WithRollbackFunc(func() bool {
+			return len(a.Execution.Checkpoints.List()) > 0
+		}))
+	}
+	a.Autonomy = autonomy.NewEngine(autoOpts...)
 
 	// ── MULTI-TIER PATCH ENGINE ──────────────────────────────────────────
 	// The new patch engine replaces the legacy patch application pipeline in
