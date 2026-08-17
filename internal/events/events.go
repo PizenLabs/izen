@@ -75,7 +75,7 @@ const (
 	// cut short by a context deadline or cancellation so tokens already billed
 	// by the provider are never silently zeroed in local telemetry.
 	EventStreamUsage = "stream.usage"
-// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──────────
+	// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──────────
 	// These events are the single authoritative stream of a full execution
 	// through the RuntimeExecutor. They are emitted ONLY at real runtime
 	// boundaries — never synthesised by the presentation layer — so the UI can

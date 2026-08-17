@@ -316,7 +316,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		events.EventIntentClassified,
 		events.EventPhaseChanged,
 		events.EventApprovalRequested,
-// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──
+		// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──
 		// The runtime owns every execution; the UI renders its lifecycle purely
 		// as a projection of these events.
 		events.EventExecutionStarted,

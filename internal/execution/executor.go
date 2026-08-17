@@ -125,13 +125,13 @@ type ExecutionProof struct {
 	// autonomy decision handoff (Phase 1 Step 6): the execution proof carries
 	// the classified intent and its confidence so the runtime never loses the
 	// decision facts between autonomy and execution.
-	Intent           string  `json:"intent,omitempty"`
-	IntentConfidence float64 `json:"intent_confidence,omitempty"`
-	TargetConfidence float64 `json:"target_confidence,omitempty"`
-	Scope            string  `json:"scope,omitempty"`
-	Outcome          MutationOutcome   `json:"outcome"`
-	StartedAt        time.Time         `json:"started_at"`
-	FinishedAt       time.Time         `json:"finished_at"`
+	Intent           string          `json:"intent,omitempty"`
+	IntentConfidence float64         `json:"intent_confidence,omitempty"`
+	TargetConfidence float64         `json:"target_confidence,omitempty"`
+	Scope            string          `json:"scope,omitempty"`
+	Outcome          MutationOutcome `json:"outcome"`
+	StartedAt        time.Time       `json:"started_at"`
+	FinishedAt       time.Time       `json:"finished_at"`
 }
 
 // ContextDecision is one strategy-owned context decision recorded in the

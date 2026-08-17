@@ -378,7 +378,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 	m.sess.AddMessage("user", line, 5)
 	_ = m.sess.Save()
 
-// ── HYBRID INTENT GATEWAY ────────────────────────────────────────
+	// ── HYBRID INTENT GATEWAY ────────────────────────────────────────
 	// Free-form input (no explicit mode shorthand, no command, no shell) goes
 	// through the Hybrid Intent Gateway: the deterministic fast path first, then
 	// the semantic IntentClassifier when no deterministic signal matches. The

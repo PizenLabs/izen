@@ -316,9 +316,9 @@ func unwrapBatch(cmd tea.Cmd) []tea.Cmd {
 // of them fired. Cross-subscription delivery is nondeterministic (concurrent
 // dispatch goroutines), so assertions check by type, never by order.
 type eventCollector struct {
-	mu      sync.Mutex
-	fired   map[string]bool
-	subs    []*events.Subscription
+	mu    sync.Mutex
+	fired map[string]bool
+	subs  []*events.Subscription
 }
 
 func newEventCollector(bus *events.Bus, types ...string) *eventCollector {
