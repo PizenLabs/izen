@@ -345,18 +345,6 @@ func (r mutationResultMsg) outcome() execution.MutationOutcome {
 	return execution.ParseMutationOutcome(r.status)
 }
 
-// respUsage extracts the authoritative provider usage from a response for
-// propagation onto terminal execution messages. known is true when the
-// provider reported usage (or the response carries non-zero counts, preserving
-// the legacy contract used by tests); a nil response reports unknown.
-func respUsage(resp *ai.Response) (input, output int, known bool) {
-	if resp == nil {
-		return 0, 0, false
-	}
-	known = resp.Usage.Known || resp.TokenInput > 0 || resp.TokenOutput > 0
-	return resp.TokenInput, resp.TokenOutput, known
-}
-
 type applyAllResultMsg struct {
 	results []mutationResultMsg
 }
@@ -424,25 +412,6 @@ type buildResultMsg struct {
 	output   string
 	exitCode int
 	err      error
-}
-
-// buildProposalReadyMsg carries the LLM-generated patch for a regular
-// FILE_MUTATE/GIT_ACTION build task back to the Update loop. The engine does
-// NOT apply the patch — it freezes the pipeline in StateAwaitingApproval and
-// renders a diff proposal for explicit human authorization before any disk
-// write occurs.
-type buildProposalReadyMsg struct {
-	Task    *plan.Task
-	Patch   *execution.Patch
-	Patches []*execution.Patch
-	Diff    string
-	Output  string // raw LLM response text for proposal extraction
-	Err     error
-	// TokenInput/TokenOutput carry the provider-reported usage of the build
-	// proposal call (streaming or non-streaming) so tokens are recorded even
-	// when the response is truncated.
-	TokenInput  int
-	TokenOutput int
 }
 
 // thinkingStreamMsg carries a reasoning token chunk from the SSE stream
@@ -1130,10 +1099,6 @@ type model struct {
 	// graceful cancellation is initiated. A second Ctrl+C before this deadline
 	// hard-exits with status 130.
 	cancelGraceDeadline time.Time
-	// hotfixTimeout bounds a single $hot provider invocation when non-zero;
-	// zero uses the package-level buildGenerationTimeout. Tests inject a short
-	// deadline to exercise the TIMEOUT lifecycle deterministically.
-	hotfixTimeout time.Duration
 	// program is the owning Bubble Tea program, used to restore the terminal
 	// before a hard force-exit. Nil in harnesses/tests.
 	program *tea.Program
@@ -2658,19 +2623,6 @@ func (m *model) handleReasoningStream(chunk string, isComplete bool) {
 	if m.Ready && !m.userIsScrollingUp {
 		m.Viewport.GotoBottom()
 	}
-}
-
-// captureHotfixThought projects the verbatim $hot LLM output into the
-// output-trace viewport (traceBuffer) — the canonical raw-stream store for
-// models with no formal reasoning channel. The ThinkingBuffer is fed via the
-// dispatched ThoughtBufferUpdatedMsg protocol (thoughtUpdateCmd), keeping the
-// Ctrl+O thought drawer live with 100% of the raw model stream. Only ever
-// called on the UI goroutine.
-func (m *model) captureHotfixThought(raw string) {
-	if strings.TrimSpace(raw) == "" {
-		return
-	}
-	m.traceBuffer.WriteString(raw)
 }
 
 // thoughtUpdateCmd returns a command that dispatches one raw LLM chunk to the

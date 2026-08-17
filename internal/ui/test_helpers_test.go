@@ -10,10 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
-	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/core/workflow"
-	"github.com/PizenLabs/izen/internal/modes"
-	"github.com/PizenLabs/izen/internal/session"
 )
 
 // fakeSourceVerifier always passes source-hash verification.
@@ -52,23 +49,6 @@ func (m *mockProvider) Execute(_ context.Context, req ai.Request) (*ai.Response,
 
 func (m *mockProvider) ExecuteStream(_ context.Context, _ ai.Request) (io.ReadCloser, error) {
 	return nil, fmt.Errorf("stream not supported in mock")
-}
-
-// testModelWithProvider creates a minimal model with a mock provider for testing.
-func testModelWithProvider(p *mockProvider) *model {
-	cfg := &config.Config{
-		Models: config.ModelConfig{
-			Default: "test-model",
-		},
-	}
-	return &model{
-		cfg:      cfg,
-		provider: p,
-		resolver: modes.NewResolver(),
-		sess: &session.Session{
-			ContextID: "test-context",
-		},
-	}
 }
 
 // drainCmds executes a tea.Cmd and returns every terminal message it yields,

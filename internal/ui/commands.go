@@ -111,24 +111,6 @@ func sanitizeInputBuffer(s string) string {
 // preventing 7B context drift across urgent interventions.
 const stashedPlanPath = ".izen/stashed_plan.json"
 
-// stashPlan serializes the current /build task queue to a static cache file so
-// it can be restored deterministically after a $hot hotfix completes. Returns
-// nil if there are no tasks to stash (no-op).
-func (m *model) stashPlan() error {
-	tasks := m.sess.CurrentTasks
-	if len(tasks) == 0 {
-		return nil
-	}
-	data, err := json.MarshalIndent(tasks, "", "  ")
-	if err != nil {
-		return fmt.Errorf("serialize plan: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(stashedPlanPath), 0755); err != nil {
-		return fmt.Errorf("create .izen: %w", err)
-	}
-	return os.WriteFile(stashedPlanPath, data, 0644)
-}
-
 // restorePlan reads the stashed plan from the deterministic cache file and
 // re-hydrates the active /build execution queue. The cache file is deleted
 // after a successful read. Returns nil, nil if no stash exists.
@@ -1736,59 +1718,6 @@ func (m *model) buildHandoffTriggerContent(mode modes.Mode) string {
 // 3. The raw relevant symbol definition/context from the codebase
 // This prevents cognitive drift by stripping all conversational history,
 // raw chat logs, and unrelated codebase files.
-// retryBuildWithStrictDirective re-executes the current build task with a
-// maximally strict instruction that prohibits any conversational output.
-// The LLM is told to output ONLY SEARCH/REPLACE or FILE_CREATE blocks with
-// zero preamble, zero explanation, zero greeting.
-func (m *model) retryBuildWithStrictDirective() tea.Cmd {
-	tasks := m.sess.CurrentTasks
-	if len(tasks) == 0 {
-		return nil
-	}
-	// Find the current processing/failed task.
-	var targetTask *plan.Task
-	for i, t := range tasks {
-		if t.Status == "processing" || t.Status == "failed" || t.Status == "idle" {
-			targetTask = &tasks[i]
-			break
-		}
-	}
-	if targetTask == nil {
-		return nil
-	}
-	// Strategy-aware strict directive: the required output format follows the
-	// target file's on-disk state. Forcing SEARCH/REPLACE on a new/0-byte file
-	// makes small models loop on a missing "old content" anchor and time out.
-	var outputFormat string
-	if data, rerr := os.ReadFile(targetTask.Target); rerr == nil && len(data) > 0 {
-		outputFormat = "- For existing files: ```go:main.go\n  <<<<<<< SEARCH\n  ...\n  =======\n  ...\n  >>>>>>>\n  ```\n"
-	} else {
-		outputFormat = "- For new files: ```<language>\n  <COMPLETE file content>\n  ```\n  (or a FILE: <path> block). Do NOT use SEARCH/REPLACE or unified diff — the file does not exist yet.\n"
-	}
-	strictContent := fmt.Sprintf(
-		"## STRICT BUILD DIRECTIVE — ZERO CONVERSATIONAL TEXT\n\n"+
-			"YOU ARE A CODE GENERATION TOOL. DO NOT OUTPUT ANY TEXT THAT IS NOT A CODE PATCH.\n\n"+
-			"REQUIRED OUTPUT FORMAT (FIRST TOKEN MUST MATCH):\n"+
-			outputFormat+
-			"FORBIDDEN OUTPUT:\n"+
-			"- Greetings, acknowledgments, summaries, explanations\n"+
-			"- Questions, clarifications, suggestions\n"+
-			"- Markdown that is not a valid patch or complete file content\n"+
-			"- JSON, YAML, or any structured data format\n\n"+
-			"TASK:\n"+
-			"Step %d: %s\nTarget: %s\nDescription: %s\n\n"+
-			"OUTPUT YOUR PATCH NOW:",
-		targetTask.StepNum, targetTask.Type, targetTask.Target, targetTask.Description)
-	m.push(roleSystem, "Conversational output detected. Re-triggering build with strict directive...")
-	m.sess.ClearHistory()
-	_ = m.sess.Save()
-	m.responseBuffer.Reset()
-	m.streamBuffer = ""
-	m.currentStreamContent = ""
-	m.resetStreamBlocks()
-	return m.streamCmd(strictContent)
-}
-
 // buildStrictHandoffPayload creates a minimal, focused context for the /build
 // task execution. It contains ONLY:
 // 1. The exact target file path(s) for the current task

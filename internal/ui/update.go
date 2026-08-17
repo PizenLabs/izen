@@ -37,6 +37,19 @@ import (
 	"github.com/PizenLabs/izen/pkg/control"
 )
 
+// stripModePrefix removes a leading mode command (e.g. "/plan", "/build",
+// "/investigate") from an input so the raw user intent is extracted for
+// context decisions. Inputs without a mode prefix are returned trimmed.
+func stripModePrefix(s string) string {
+	s = strings.TrimSpace(s)
+	for _, cmd := range []string{"/plan", "/build", "/investigate", "/objective"} {
+		if strings.HasPrefix(strings.ToLower(s), cmd) {
+			s = strings.TrimSpace(s[len(cmd):])
+		}
+	}
+	return strings.TrimSpace(s)
+}
+
 // Init initializes the spinner tick, pro tip rotation, and text input blink.
 func (m *model) Init() tea.Cmd {
 	m.currentTip = allTips[0]

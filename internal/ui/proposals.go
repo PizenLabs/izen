@@ -74,22 +74,6 @@ func sanitizeShellCmd(cmd string) (string, bool, string) {
 	return cmd, false, ""
 }
 
-// isDiffContent reports whether content appears to be a unified diff
-// (contains @@ hunk headers or ---/+++ file markers). Used by the
-// per-file full-rewrite fallback to avoid writing diff headers into files.
-func isDiffContent(s string) bool {
-	lines := strings.SplitN(s, "\n", 6)
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "@@") ||
-			strings.HasPrefix(trimmed, "--- ") ||
-			strings.HasPrefix(trimmed, "+++ ") {
-			return true
-		}
-	}
-	return false
-}
-
 // streamShellCmd launches a bash process and streams its stdout/stderr to the
 // event loop as live shellChunkMsg values, followed by a terminal shellExitMsg.
 // It is the real-time counterpart of execShellCmd: the running command shows an

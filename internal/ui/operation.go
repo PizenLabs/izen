@@ -308,8 +308,7 @@ func (m *model) handleCtrlC() (bool, tea.Cmd) {
 		m.hardExit130()
 		return true, nil
 	}
-	switch {
-	case m.activeOp != nil || m.isWorkflowBusy():
+	if m.activeOp != nil || m.isWorkflowBusy() {
 		m.armCancelGrace()
 		_, cmd := m.cancelActiveOperation("ctrl-c")
 		return true, cmd
