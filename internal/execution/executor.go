@@ -65,6 +65,21 @@ type ExecuteRequest struct {
 	// the runtime selects it itself. It is the single source of the execution
 	// path decision — never a mode.
 	Strategy *strategy.ExecutionStrategyProfile
+	// ── Autonomy handoff (Phase 1 Step 6) ─────────────────────────────
+	// These fields carry the autonomy decision metadata so an already
+	// classified intent is never re-classified downstream and the decision
+	// facts (intent, confidence, target confidence, workspace scope) survive
+	// into the execution proof. They are optional: direct/gated callers leave
+	// them empty.
+	Intent           string
+	IntentConfidence float64
+	TargetConfidence float64
+	Scope            string
+	// Evidence is the authoritative bounded evidence ledger compiled for the
+	// target set (structural findings, redundancy ledger). It is authoritative
+	// evidence; the full-file context the runtime reads is supporting context
+	// only (Phase 1 Step 5).
+	Evidence string
 }
 
 // ModelInvocation records one provider call with its authoritative usage.
@@ -106,6 +121,14 @@ type ExecutionProof struct {
 	// ContextDecisions records the strategy-owned context decisions (policy,
 	// budget, per-item inclusion reasons) of the execution.
 	ContextDecisions []ContextDecision `json:"context_decisions,omitempty"`
+	// Intent / IntentConfidence / TargetConfidence / Scope preserve the
+	// autonomy decision handoff (Phase 1 Step 6): the execution proof carries
+	// the classified intent and its confidence so the runtime never loses the
+	// decision facts between autonomy and execution.
+	Intent           string  `json:"intent,omitempty"`
+	IntentConfidence float64 `json:"intent_confidence,omitempty"`
+	TargetConfidence float64 `json:"target_confidence,omitempty"`
+	Scope            string  `json:"scope,omitempty"`
 	Outcome          MutationOutcome   `json:"outcome"`
 	StartedAt        time.Time         `json:"started_at"`
 	FinishedAt       time.Time         `json:"finished_at"`
@@ -380,6 +403,12 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		Mode:      req.Mode,
 		Proof:     &ExecutionProof{RequestID: requestID, StrategyReason: "", StartedAt: time.Now()},
 	}
+	// Preserve the autonomy decision handoff (Phase 1 Step 6) so the intent,
+	// confidence, target confidence and scope survive into the execution proof.
+	res.Proof.Intent = req.Intent
+	res.Proof.IntentConfidence = req.IntentConfidence
+	res.Proof.TargetConfidence = req.TargetConfidence
+	res.Proof.Scope = req.Scope
 
 	start := time.Now()
 	// ── RUNTIME-OWNED EXECUTION GRAPH (Phase 5) ───────────────────────
@@ -878,7 +907,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		x.emitContextActivity(target, len(data))
 
 		system := boundedMutationSystemPrompt()
-		user := buildMutationUserPrompt(req.Prompt, target, original)
+		user := buildMutationUserPrompt(req.Prompt, target, original, req.Evidence)
 		aiReq := ai.Request{
 			Model:     model,
 			System:    system,
@@ -1381,10 +1410,19 @@ Never explain. Never add markdown outside a single code fence. Preserve every
 unrelated line byte-for-byte.`
 }
 
-func buildMutationUserPrompt(request, target, original string) string {
+func buildMutationUserPrompt(request, target, original, evidence string) string {
 	var b strings.Builder
 	b.WriteString("### USER REQUEST\n")
 	b.WriteString(request)
+	b.WriteString("\n\n### EVIDENCE LEDGER\n")
+	if strings.TrimSpace(evidence) == "" {
+		b.WriteString("(no deterministic evidence compiled — resolve from the target content below)\n")
+	} else {
+		// The deterministic evidence ledger is authoritative: structural
+		// findings, redundancy blocks and line ranges the model must reason
+		// over. It never re-discovers deterministic facts from raw text.
+		b.WriteString(evidence)
+	}
 	b.WriteString("\n\n### TARGET FILE: ")
 	b.WriteString(target)
 	b.WriteString("\n")

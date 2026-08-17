@@ -170,6 +170,12 @@ type Trace struct {
 	// time. It is carried on the trace so the ask_user proposal surface can
 	// present rollback availability without re-probing the execution layer.
 	Rollback bool
+	// TargetConfidence is the deterministic confidence in the resolved target
+	// (1.0 when a concrete target reference exists, 0.5 otherwise, overridable
+	// via WithTargetConfidence). It was historically computed for the decision
+	// verdict and then dropped; it now travels on the trace so the execution
+	// handoff (RuntimeExecutor) preserves it.
+	TargetConfidence float64
 }
 
 // Decide is the main decision entry point. It classifies the input, selects the
@@ -212,6 +218,9 @@ func (e *Engine) Decide(input string, opts ...DecideOption) Trace {
 	if do.targetConfidence > 0 {
 		targetConfidence = do.targetConfidence
 	}
+	// Preserve the deterministic target confidence on the trace so the
+	// execution handoff never drops it (Phase 1 Step 6).
+	trace.TargetConfidence = targetConfidence
 
 	scope := e.Scope()
 	granted := e.Grants().ActiveCaps(scope)

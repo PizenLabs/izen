@@ -331,6 +331,9 @@ func (m *model) handleInput(line string) tea.Cmd {
 		// (which leaves the UI frozen in an idle state).
 		if mode == modes.ModeBuild {
 			if m.hasStagedBuildWork() {
+				if runtimeExecutorEnabled() {
+					return tea.Batch(m.runStagedBuildViaRuntime(), switchCmd)
+				}
 				return tea.Batch(m.runBuildCmd(""), switchCmd)
 			}
 		}
@@ -469,6 +472,11 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 	currentMode := m.resolver.Current()
 	if currentMode == modes.ModeInvestigate && len(refFiles) > 0 {
 		if hasMutationIntent(content) {
+			if runtimeExecutorEnabled() {
+				// Phase 1 cutover: an investigate-decided mutation routes
+				// through the RuntimeExecutor, never the legacy build engine.
+				return m.runRuntimePrompt(content)
+			}
 			return m.runBuildCmd(content)
 		}
 	}
@@ -798,6 +806,9 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		// engine (the zombie-data / stale-context bug). When no tasks are
 		// staged, block immediately instead of contaminating the executor.
 		if m.resolver.Current() == modes.ModeBuild {
+			if runtimeExecutorEnabled() {
+				return m.runRuntimePrompt(content)
+			}
 			return m.runBuildCmd(content)
 		}
 
