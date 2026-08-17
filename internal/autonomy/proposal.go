@@ -130,3 +130,75 @@ func (p *Proposal) String() string {
 		p.Intent, p.Workspace, p.Target, p.Risk, p.Missing, p.Rollback,
 	)
 }
+
+// ── Mutation proposal contract ───────────────────────────────────────────────
+//
+// The MutationProposal is the engine-truth mutation contract a mutation MUST
+// carry before it may be executed: the compiled structural evidence, the
+// reason, the compiled diff, the classified risk and rollback availability.
+// Nothing is executed from a proposal that is not Complete().
+
+// MutationProposal bundles the five facts every mutation must be justified by:
+// evidence, reason, diff, risk and rollback. It is a plain value record — the
+// runtime fills it at the mutation boundary and the renderer projects it.
+type MutationProposal struct {
+	// File is the mutation target.
+	File string `json:"file"`
+	// Evidence is the compiled structural evidence the pipeline produced for
+	// the target. It may be empty when the artifact is structurally clean.
+	Evidence []Finding `json:"evidence"`
+	// EvidenceLedger is the rendered evidence ledger. It is non-empty whenever
+	// the context intelligence pipeline ran, even for clean artifacts, so it
+	// doubles as the "evidence stage ran" flag.
+	EvidenceLedger string `json:"evidence_ledger"`
+	// Reason is the justification for the mutation.
+	Reason string `json:"reason"`
+	// Diff is the compiled unified diff the mutation will apply.
+	Diff string `json:"diff"`
+	// Risk is the classified mutation risk.
+	Risk RiskLevel `json:"risk"`
+	// Rollback reports whether a rollback checkpoint protects the mutation.
+	Rollback bool `json:"rollback"`
+}
+
+// Complete reports whether the proposal carries the full mutation contract:
+// compiled evidence, reason, diff, a classified risk and rollback coverage.
+// A proposal that is not Complete() must never reach the mutation pipeline.
+func (p MutationProposal) Complete() bool {
+	return p.EvidenceLedger != "" &&
+		p.Reason != "" &&
+		p.Diff != "" &&
+		p.Risk != RiskUnknown &&
+		p.Rollback
+}
+
+// MutationProposalInput carries the raw ingredients BuildMutationProposal
+// assembles into a MutationProposal. The context is the compiled artifact
+// understanding produced by the pipeline.
+type MutationProposalInput struct {
+	File     string
+	Context  ArtifactContext
+	Reason   string
+	Diff     string
+	Risk     RiskLevel
+	Rollback bool
+}
+
+// BuildMutationProposal assembles a MutationProposal from the compiled
+// artifact context and the mutation facts. The evidence ledger is always
+// derived from the context — a proposal never fabricates evidence.
+func BuildMutationProposal(in MutationProposalInput) MutationProposal {
+	file := in.File
+	if file == "" {
+		file = in.Context.Path
+	}
+	return MutationProposal{
+		File:           file,
+		Evidence:       in.Context.Evidence(),
+		EvidenceLedger: in.Context.FormatEvidenceLedger(),
+		Reason:         in.Reason,
+		Diff:           in.Diff,
+		Risk:           in.Risk,
+		Rollback:       in.Rollback,
+	}
+}

@@ -506,11 +506,16 @@ type LoopTransitionPayload struct {
 
 // ContextCompiledPayload carries the structural understanding of one artifact.
 // Kind is html/code/text; FindingCount is the number of evidence findings the
-// compiler produced for it.
+// compiler produced for it. Language, Strategy and Confidence are the File
+// Intelligence fingerprint of the artifact (empty when compiled without
+// intelligence).
 type ContextCompiledPayload struct {
 	Path         string
 	Kind         string
 	FindingCount int
+	Language     string
+	Strategy     string
+	Confidence   float64
 }
 
 // ── Generic event implementation ────────────────────────────────────────────
@@ -869,5 +874,19 @@ func NewContextCompiled(path, kind string, findingCount int) DomainEvent {
 		Path:         path,
 		Kind:         kind,
 		FindingCount: findingCount,
+	})
+}
+
+// NewContextCompiledIntel publishes the structural understanding of one
+// artifact together with its File Intelligence fingerprint (language, analysis
+// strategy and aggregate evidence confidence).
+func NewContextCompiledIntel(path, kind string, findingCount int, language, strategy string, confidence float64) DomainEvent {
+	return newEvent(EventContextCompiled, ContextCompiledPayload{
+		Path:         path,
+		Kind:         kind,
+		FindingCount: findingCount,
+		Language:     language,
+		Strategy:     strategy,
+		Confidence:   confidence,
 	})
 }

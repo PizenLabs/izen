@@ -309,11 +309,28 @@ func (e *Engine) emitDecision(t Trace) {
 }
 
 // CompileContext builds the structural understanding of an artifact and
-// publishes the ContextCompiled event. The caller owns file access.
+// publishes the ContextCompiled event. The caller owns file access. It is the
+// bus-observable entry point of the context intelligence pipeline.
 func (e *Engine) CompileContext(path, content string) ArtifactContext {
+	return e.Analyze(path, content)
+}
+
+// Analyze runs the full context intelligence pipeline over an artifact and
+// publishes the ContextCompiled event carrying the intelligence fingerprint
+// (language, analysis strategy, aggregate confidence). The caller owns file
+// access. This is the engine-truth entry point: it compiles deterministic
+// structural evidence BEFORE any AI reasoning is invoked.
+func (e *Engine) Analyze(path, content string) ArtifactContext {
 	ctx := CompileContext(path, content)
 	if e != nil && e.bus != nil {
-		e.bus.Publish(events.NewContextCompiled(ctx.Path, string(ctx.Kind), len(ctx.Evidence())))
+		e.bus.Publish(events.NewContextCompiledIntel(
+			ctx.Path,
+			string(ctx.Kind),
+			len(ctx.Evidence()),
+			ctx.Intelligence.Language,
+			ctx.Intelligence.Strategy.String(),
+			ctx.AggregateConfidence(),
+		))
 	}
 	return ctx
 }

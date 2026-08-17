@@ -29,12 +29,16 @@ const (
 )
 
 // Finding is one piece of structural evidence about an artifact. The context
-// intelligence layer produces findings — it does not produce raw text.
+// intelligence layer produces findings — it does not produce raw text. Every
+// finding carries a confidence score (0..1) and a suggested action so
+// consumers can weigh evidence and route remediation without re-deriving it.
 type Finding struct {
-	Type     string          `json:"type"`
-	Severity FindingSeverity `json:"severity"`
-	Line     int             `json:"line,omitempty"`
-	Detail   string          `json:"detail"`
+	Type       string          `json:"type"`
+	Severity   FindingSeverity `json:"severity"`
+	Line       int             `json:"line,omitempty"`
+	Detail     string          `json:"detail"`
+	Confidence float64         `json:"confidence,omitempty"`
+	Action     string          `json:"action,omitempty"`
 }
 
 // SemanticBlock is a structural region of an HTML document with a purpose.
@@ -76,12 +80,17 @@ type CodeUnderstanding struct {
 // "structural understanding -> semantic context" tier of the context
 // intelligence layer: consumers reason over findings, not byte slices.
 type ArtifactContext struct {
-	Path     string             `json:"path"`
-	Kind     ArtifactKind       `json:"kind"`
-	Size     int                `json:"size"`
-	HTML     *HTMLUnderstanding `json:"html,omitempty"`
-	Code     *CodeUnderstanding `json:"code,omitempty"`
-	Findings []Finding          `json:"findings,omitempty"`
+	Path         string             `json:"path"`
+	Kind         ArtifactKind       `json:"kind"`
+	Size         int                `json:"size"`
+	Intelligence FileIntelligence   `json:"intelligence"`
+	HTML         *HTMLUnderstanding `json:"html,omitempty"`
+	Code         *CodeUnderstanding `json:"code,omitempty"`
+	Findings     []Finding          `json:"findings,omitempty"`
+	// Regions are the bounded, labeled source spans the AI may reason over.
+	// They are compiled deterministically from the affected scope and are the
+	// ONLY content slices handed to the model — never whole files.
+	Regions []Region `json:"regions,omitempty"`
 }
 
 // Evidence returns the aggregate findings: artifact-level findings plus any
@@ -102,6 +111,20 @@ func (a ArtifactContext) Evidence() []Finding {
 	return a.Findings
 }
 
+// AggregateConfidence returns the mean confidence of the compiled evidence.
+// Zero evidence yields zero confidence.
+func (a ArtifactContext) AggregateConfidence() float64 {
+	ev := a.Evidence()
+	if len(ev) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, f := range ev {
+		sum += f.Confidence
+	}
+	return sum / float64(len(ev))
+}
+
 // FormatEvidenceLedger renders the compiled structural understanding as a
 // compact Context Evidence Ledger — the deterministic evidence the runtime
 // hands the model BEFORE it is asked to interpret, diagnose or propose. The
@@ -110,6 +133,9 @@ func (a ArtifactContext) Evidence() []Finding {
 func (a ArtifactContext) FormatEvidenceLedger() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Context Evidence Ledger\nTarget: %s\n", a.Path)
+	if a.Intelligence.Language != "" {
+		fmt.Fprintf(&b, "Language: %s\n", a.Intelligence.Language)
+	}
 	ev := a.Evidence()
 	if len(ev) == 0 {
 		b.WriteString("Structural findings: none\n")
@@ -126,7 +152,14 @@ func (a ArtifactContext) FormatEvidenceLedger() string {
 		if f.Line > 0 {
 			line = fmt.Sprintf(" at line %d", f.Line)
 		}
-		fmt.Fprintf(&b, "* %s%s — %s\n", f.Type, line, truncateForContext(f.Detail, 80))
+		conf := ""
+		if f.Confidence > 0 {
+			conf = fmt.Sprintf(" (confidence %.0f%%)", f.Confidence*100)
+		}
+		fmt.Fprintf(&b, "* %s%s%s — %s\n", f.Type, line, conf, truncateForContext(f.Detail, 80))
+		if f.Action != "" {
+			fmt.Fprintf(&b, "  → %s\n", truncateForContext(f.Action, 80))
+		}
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -144,25 +177,103 @@ func KindOf(path string) ArtifactKind {
 	}
 }
 
-// CompileContext builds the structural understanding of an artifact from its
-// raw content. It never reads disk: the caller owns file access. The compiler
-// degrades gracefully — a parse failure yields findings, never an error.
+// CompileContext runs the full context intelligence pipeline over an artifact:
+// File Intelligence (language, parser availability, complexity, strategy
+// selection) → structural analyzer dispatch → evidence ledger + regions. It
+// never reads disk: the caller owns file access. The pipeline degrades
+// gracefully — a parse failure yields findings, never an error.
 func CompileContext(path, content string) ArtifactContext {
-	kind := KindOf(path)
+	fi := AnalyzeFile(path, content)
 	ctx := ArtifactContext{
-		Path: path,
-		Kind: kind,
-		Size: len(content),
+		Path:         path,
+		Kind:         KindOf(path),
+		Size:         len(content),
+		Intelligence: fi,
 	}
-	switch kind {
-	case KindHTML:
-		ctx.HTML = compileHTML(content)
-	case KindCode:
+	switch fi.Strategy {
+	case StrategyAST:
+		ctx.Code = analyzeCodeAST(path, content)
+	case StrategyTreeSitter:
+		// Declared tree-sitter support with no wired backend: the AST-lite
+		// scanner runs and the degradation is recorded as evidence so the
+		// model knows the analysis tier it is reasoning over.
 		ctx.Code = compileCode(path, content)
+		ctx.Code.Findings = append(ctx.Code.Findings, Finding{
+			Type:       "file.parser_degraded",
+			Severity:   SeverityInfo,
+			Confidence: 1.0,
+			Detail:     fmt.Sprintf("tree-sitter backend not wired for %s — degraded to AST-lite structural scanner", fi.Language),
+		})
+	case StrategySemantic:
+		switch ctx.Kind {
+		case KindHTML:
+			ctx.HTML = compileHTML(content)
+		case KindCode:
+			ctx.Code = compileCode(path, content)
+		default:
+			ctx.Findings = textFindings(content)
+		}
 	default:
 		ctx.Findings = textFindings(content)
 	}
+
+	normalizeEvidence(&ctx)
+	ctx.Regions = ctx.RegionsFor(content)
 	return ctx
+}
+
+// normalizeEvidence applies default confidence scores and suggested actions to
+// every finding slice of the compiled context, so no evidence reaches the
+// model unweighted or without a remediation hint.
+func normalizeEvidence(ctx *ArtifactContext) {
+	ctx.Findings = normalizeFindings(ctx.Findings)
+	if ctx.HTML != nil {
+		ctx.HTML.OrphanContent = normalizeFindings(ctx.HTML.OrphanContent)
+		ctx.HTML.InvalidRegion = normalizeFindings(ctx.HTML.InvalidRegion)
+	}
+	if ctx.Code != nil {
+		ctx.Code.Findings = normalizeFindings(ctx.Code.Findings)
+	}
+}
+
+func normalizeFindings(findings []Finding) []Finding {
+	for i := range findings {
+		if findings[i].Confidence <= 0 {
+			findings[i].Confidence = defaultConfidence(findings[i].Severity)
+		}
+		if findings[i].Action == "" {
+			if action, ok := suggestedActions[findings[i].Type]; ok {
+				findings[i].Action = action
+			}
+		}
+	}
+	return findings
+}
+
+// defaultConfidence weights evidence deterministically by severity: errors are
+// compiler/parser facts (1.0), warnings are structural observations (0.7),
+// info is best-effort signal (0.5).
+func defaultConfidence(sev FindingSeverity) float64 {
+	switch sev {
+	case SeverityError:
+		return 1.0
+	case SeverityWarn:
+		return 0.7
+	default:
+		return 0.5
+	}
+}
+
+// suggestedActions maps each known finding type to a concrete remediation the
+// model may adopt verbatim. Unknown types keep an empty action.
+var suggestedActions = map[string]string{
+	"html.parse_error":     "repair the malformed markup at the reported location",
+	"html.orphan_text":     "wrap the orphan text in a semantic block element",
+	"html.unclosed_tag":    "close the reported tag to balance the document",
+	"code.parse_error":     "fix the syntax error reported by the parser",
+	"file.parser_degraded": "wire a tree-sitter backend for full structural analysis",
+	"text.lines":           "no action required — informational",
+	"text.non_printable":   "remove non-printable characters from the artifact",
 }
 
 // ── HTML ────────────────────────────────────────────────────────────────────
