@@ -19,6 +19,8 @@ func autonomyTestModel() *model {
 	m.autonomy = autonomy.NewEngine(autonomy.WithScope("repository"))
 	m.execEng = execution.NewEngine(".", m.cfg, m.sess)
 	m.provider = &mockProvider{responses: []*ai.Response{{Content: "ok", TokenOutput: 5}}}
+	m.gateway = execution.NewIntentGateway(".")
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, m.provider, nil, "")
 	return m
 }
 
@@ -361,6 +363,12 @@ func TestAutonomyContextEvidenceLedger(t *testing.T) {
 	}
 
 	m := autonomyTestModel()
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n<p>keep</p>\n=======\n<p>kept</p>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
+	m.provider = mock
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, mock, nil, "")
 	m.autonomy.GrantDefault(autonomy.CapRead, autonomy.CapAnalyze, autonomy.CapPropose, autonomy.CapMutate, autonomy.CapVerify)
 	m.resolver.Set(modes.ModeAsk)
 
@@ -370,22 +378,35 @@ func TestAutonomyContextEvidenceLedger(t *testing.T) {
 	}
 	// The runtime must have compiled the target's structural evidence: orphan
 	// text (stray text) is a deterministic finding the model never has to
-	// rediscover.
+	// rediscover. It crosses into the provider request as the authoritative
+	// evidence contract.
 	msg := cmd()
-	prm, ok := msg.(planResultMsg)
+	gem, ok := msg.(gatedExecutionMsg)
 	if !ok {
-		t.Fatalf("expected planResultMsg, got %T", msg)
+		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
 	}
-	if len(prm.Tasks) == 0 {
-		t.Fatal("expected staged build tasks")
+	if gem.err != nil {
+		t.Fatalf("executor failed: %v", gem.err)
 	}
-	if !strings.Contains(prm.Tasks[0].Evidence, "Context Evidence Ledger") {
-		t.Errorf("task evidence missing ledger, got: %q", prm.Tasks[0].Evidence)
+	if gem.res == nil || gem.res.PendingPatchID == "" {
+		t.Fatal("granted mutation must hold a patch at the executor approval gate")
 	}
-	if !strings.Contains(prm.Tasks[0].Evidence, "html.orphan_text") {
-		t.Errorf("task evidence missing orphan-text finding, got: %q", prm.Tasks[0].Evidence)
+	if len(mock.requests) == 0 {
+		t.Fatal("provider must have received the execution request")
 	}
-	if prm.Tasks[0].Target != "index.html" {
-		t.Errorf("build target = %q, want index.html", prm.Tasks[0].Target)
+	userContent := ""
+	for _, m := range mock.requests[0].Messages {
+		if m.Role == "user" {
+			userContent += m.Content
+		}
+	}
+	if !strings.Contains(userContent, "Context Evidence Ledger") {
+		t.Errorf("mutation prompt missing ledger: %q", userContent)
+	}
+	if !strings.Contains(userContent, "html.orphan_text") {
+		t.Errorf("mutation prompt missing orphan-text finding: %q", userContent)
+	}
+	if len(gem.res.Targets) == 0 || gem.res.Targets[0] != "index.html" {
+		t.Errorf("execution target = %v, want index.html", gem.res.Targets)
 	}
 }

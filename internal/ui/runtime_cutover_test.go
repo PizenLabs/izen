@@ -160,10 +160,14 @@ func TestRuntimeCutoverFlagOnRoutesPromptMutationThroughExecutor(t *testing.T) {
 	}
 }
 
-// TestRuntimeCutoverFlagOffPreservesLegacyPath proves the rollback boundary:
-// with the flag unset (default) the same input routes through the legacy build
-// staging (planResultMsg) exactly as before the cutover.
+// TestRuntimeCutoverFlagOffPreservesLegacyPath is the legacy rollback
+// compatibility fixture: with IZEN_RUNTIME_EXECUTOR=0 (the migration-era
+// override) the same input routes through the legacy build staging
+// (planResultMsg) exactly as before the cutover. It exists only to pin the
+// historical behavior until the legacy execution authority is removed in Phase
+// 3; it is deleted together with the legacy path.
 func TestRuntimeCutoverFlagOffPreservesLegacyPath(t *testing.T) {
+	t.Setenv("IZEN_RUNTIME_EXECUTOR", "0")
 	writeIndexFixture(t)
 	mock := &mockProvider{responses: []*ai.Response{{Content: "ok", TokenOutput: 5}}}
 	m := cutoverModel(t, mock)

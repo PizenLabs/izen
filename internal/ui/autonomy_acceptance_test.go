@@ -4,11 +4,16 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/core/authorization"
+	"github.com/PizenLabs/izen/internal/core/budget"
+	"github.com/PizenLabs/izen/internal/core/capability"
+	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
 )
@@ -50,13 +55,17 @@ func writeIndexFixture(t *testing.T) {
 }
 
 // autonomyAcceptanceModel is a chat-ready, autonomy-wired model with the mock
-// provider and an execution engine, positioned in /ask.
+// provider, the RuntimeExecutor and the IntentGateway, positioned in /ask. The
+// executor+gateway mirror the production composition (compose.Wire) so the
+// exercised mutation path is the RuntimeExecutor, never a UI-owned provider.
 func autonomyAcceptanceModel() *model {
 	m := readyChatModel(newTestModel())
 	m.resolver.Set(modes.ModeAsk)
 	m.autonomy = autonomy.NewEngine(autonomy.WithScope("repository"))
 	m.execEng = execution.NewEngine(".", m.cfg, m.sess)
 	m.provider = &mockProvider{responses: []*ai.Response{{Content: "ok", TokenOutput: 5}}}
+	m.gateway = execution.NewIntentGateway(".")
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, m.provider, nil, "")
 	return m
 }
 
@@ -189,11 +198,18 @@ func TestAcceptanceCaseCPromptInspectReadOnly(t *testing.T) {
 // "$prompt read @index.html and remove redundant content" resolves intent =
 // modification, workspace = BUILD, target = index.html. Without authorization
 // it renders ONE autonomy proposal; Execute authorizes internally and the
-// runtime stages the deterministic build (evidence before model reasoning) —
-// no /grant, no re-submitted prompt, no manual /build.
+// mutation continues on the RuntimeExecutor — no /grant, no re-submitted
+// prompt, no manual /build, and the deterministic evidence ledger reaches the
+// model before any reasoning.
 func TestAcceptanceCaseDPromptMutationProposalAndEvidence(t *testing.T) {
 	writeIndexFixture(t)
 	m := autonomyAcceptanceModel()
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n<p>Keep this meaningful section.</p>\n=======\n<p>Kept.</p>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
+	m.provider = mock
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, mock, nil, "")
 
 	cmd := m.handleInput("$prompt read @index.html and remove redundant content")
 	if cmd != nil {
@@ -225,35 +241,55 @@ func TestAcceptanceCaseDPromptMutationProposalAndEvidence(t *testing.T) {
 		t.Error("authority must hold after the internal grant")
 	}
 
-	// The runtime stages the deterministic BUILD plan with evidence (§9/§10).
+	// The authorized mutation routes through the RuntimeExecutor and stops at
+	// its approval gate with a held patch — never a legacy staged plan.
 	msg := executeCmd()
-	prm, ok := msg.(planResultMsg)
+	gem, ok := msg.(gatedExecutionMsg)
 	if !ok {
-		t.Fatalf("expected planResultMsg after authorization, got %T", msg)
+		t.Fatalf("expected gatedExecutionMsg after authorization, got %T", msg)
 	}
-	if len(prm.Tasks) == 0 {
-		t.Fatal("expected staged build tasks")
+	if gem.err != nil {
+		t.Fatalf("executor failed: %v", gem.err)
 	}
-	if prm.Tasks[0].Target != "index.html" {
-		t.Errorf("build target = %q, want index.html", prm.Tasks[0].Target)
+	if gem.res == nil || gem.res.PendingPatchID == "" {
+		t.Fatal("authorized mutation must hold a patch at the executor approval gate")
 	}
-	ev := prm.Tasks[0].Evidence
-	if !strings.Contains(ev, "Context Evidence Ledger") {
-		t.Errorf("task evidence missing context ledger: %q", ev)
+	if len(gem.res.Targets) == 0 || gem.res.Targets[0] != "index.html" {
+		t.Errorf("execution target = %v, want index.html", gem.res.Targets)
 	}
-	if !strings.Contains(ev, "Redundant content findings") {
-		t.Errorf("task evidence missing redundancy ledger: %q", ev)
+	// The deterministic evidence ledger (context + redundancy) reaches the
+	// provider request as the authoritative evidence contract (§9/§10).
+	if len(mock.requests) == 0 {
+		t.Fatal("provider must have received the execution request")
+	}
+	userContent := ""
+	for _, m := range mock.requests[0].Messages {
+		if m.Role == "user" {
+			userContent += m.Content
+		}
+	}
+	if !strings.Contains(userContent, "Context Evidence Ledger") {
+		t.Errorf("mutation prompt missing context ledger: %q", userContent)
+	}
+	if !strings.Contains(userContent, "Redundant content findings") {
+		t.Errorf("mutation prompt missing redundancy ledger: %q", userContent)
 	}
 }
 
 // CASE E — /build$hot execution request.
 // "/build$hot check @index.html and remove redundant content" is a direct
 // autonomy execution request. The target resolves deterministically (never a
-// "target ambiguous" dead end when redundancy evidence exists) and no second
-// /build is required.
+// "target ambiguous" dead end when redundancy evidence exists) and execution
+// continues on the RuntimeExecutor — no second /build.
 func TestAcceptanceCaseEBuildHotExecution(t *testing.T) {
 	writeIndexFixture(t)
 	m := autonomyAcceptanceModel()
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n<p>Keep this meaningful section.</p>\n=======\n<p>Kept.</p>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
+	m.provider = mock
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, mock, nil, "")
 
 	cmd := m.handleInput("/build$hot check @index.html and remove redundant content")
 	if cmd != nil {
@@ -266,16 +302,27 @@ func TestAcceptanceCaseEBuildHotExecution(t *testing.T) {
 		t.Fatalf("workspace = /%s, want /build", got)
 	}
 
-	// Execute authorizes internally; the hotfix pipeline dispatches on the SAME
-	// objective — no second /build, no ambiguity dead end.
+	// Execute authorizes internally; the hotfix continues on the RuntimeExecutor
+	// with the SAME objective — no second /build, no ambiguity dead end.
 	executeCmd := m.executeAutonomyProposal()
 	if executeCmd == nil {
 		t.Fatal("authorized hotfix must continue execution")
 	}
-	logged := recordsText(m)
-	if !strings.Contains(logged, "[HOTFIX] Urgent hotfix:") {
-		t.Errorf("hotfix pipeline must dispatch without a second command:\n%s", logged)
+	msg := executeCmd()
+	gem, ok := msg.(gatedExecutionMsg)
+	if !ok {
+		t.Fatalf("authorized hotfix must route through the executor (gatedExecutionMsg), got %T", msg)
 	}
+	if gem.err != nil {
+		t.Fatalf("executor failed: %v", gem.err)
+	}
+	if gem.res == nil || gem.res.PendingPatchID == "" {
+		t.Fatal("hotfix must stop at the executor approval gate with a held patch")
+	}
+	if len(gem.res.Targets) == 0 || gem.res.Targets[0] != "index.html" {
+		t.Errorf("hotfix target = %v, want index.html", gem.res.Targets)
+	}
+	logged := recordsText(m)
 	if strings.Contains(logged, "Target is ambiguous") {
 		t.Errorf("redundancy-resolved hotfix must not dead-end on ambiguity:\n%s", logged)
 	}
@@ -289,6 +336,12 @@ func TestAcceptanceCaseEBuildHotExecution(t *testing.T) {
 func TestAcceptanceCaseFMalformedHTMLEvidence(t *testing.T) {
 	writeIndexFixture(t)
 	m := autonomyAcceptanceModel()
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n<p>Keep this meaningful section.</p>\n=======\n<p>Kept.</p>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
+	m.provider = mock
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, mock, nil, "")
 	m.grantMutation()
 
 	cmd := m.handleInput("$prompt inspect and remove redundant content from @index.html")
@@ -306,22 +359,35 @@ func TestAcceptanceCaseFMalformedHTMLEvidence(t *testing.T) {
 	}
 
 	msg := cmd()
-	prm, ok := msg.(planResultMsg)
+	gem, ok := msg.(gatedExecutionMsg)
 	if !ok {
-		t.Fatalf("expected planResultMsg, got %T", msg)
+		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
 	}
-	if len(prm.Tasks) == 0 {
-		t.Fatal("expected staged build tasks")
+	if gem.err != nil {
+		t.Fatalf("executor failed: %v", gem.err)
 	}
-	ev := prm.Tasks[0].Evidence
-	if !strings.Contains(ev, "Redundant content findings") {
-		t.Errorf("task evidence missing redundancy ledger:\n%s", ev)
+	if gem.res == nil || gem.res.PendingPatchID == "" {
+		t.Fatal("granted mutation must hold a patch at the executor approval gate")
 	}
-	if !strings.Contains(ev, "orphan") {
-		t.Errorf("task evidence missing orphan-content finding:\n%s", ev)
+	// The deterministic evidence reaches the provider request — the model never
+	// re-discovers the redundant content from raw text.
+	if len(mock.requests) == 0 {
+		t.Fatal("provider must have received the execution request")
 	}
-	if strings.Contains(ev, "empty document") {
-		t.Errorf("evidence must never claim an empty document for a readable file:\n%s", ev)
+	userContent := ""
+	for _, m := range mock.requests[0].Messages {
+		if m.Role == "user" {
+			userContent += m.Content
+		}
+	}
+	if !strings.Contains(userContent, "Redundant content findings") {
+		t.Errorf("mutation prompt missing redundancy ledger:\n%s", userContent)
+	}
+	if !strings.Contains(userContent, "orphan") {
+		t.Errorf("mutation prompt missing orphan-content finding:\n%s", userContent)
+	}
+	if strings.Contains(userContent, "empty document") {
+		t.Errorf("evidence must never claim an empty document for a readable file:\n%s", userContent)
 	}
 }
 
@@ -332,18 +398,66 @@ func TestAcceptanceCaseFMalformedHTMLEvidence(t *testing.T) {
 func TestAcceptanceCaseGApprovedLoopNoReauthorization(t *testing.T) {
 	writeIndexFixture(t)
 	m := autonomyAcceptanceModel()
+	mock := &mockProvider{responses: []*ai.Response{
+		{Content: "<<<<<<< SEARCH\n<p>Keep this meaningful section.</p>\n=======\n<p>Kept.</p>\n>>>>>>>", Usage: ai.ProviderUsage{Known: true}},
+		{Content: "<<<<<<< SEARCH\n<p>Keep this meaningful section.</p>\n=======\n<p>Kept.</p>\n>>>>>>>", Usage: ai.ProviderUsage{Known: true}},
+	}}
+	m.provider = mock
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, mock, nil, "")
+	// Governance surface for a real approval: AuthorizationEngine + budget +
+	// capabilities + a trivial verifier (the compile gate would invoke the real
+	// toolchain).
+	m.authEngine = authorization.NewAuthorizationEngine(
+		fakeSourceVerifier{},
+		fakeCheckpointChecker{},
+		func() workflow.WorkflowState { return workflow.StateBuilding },
+	)
+	m.mutationBudget = budget.NewBudget(10, 1000, 100000, 3, 30*time.Minute, 10)
+	caps := capability.NewCapabilitySet()
+	caps.Grant(capability.CapabilityWrite)
+	caps.Grant(capability.CapabilityPatch)
+	m.caps = caps
+	trivial := execution.NewVerifier(".")
+	trivial.SetCustomSteps([]execution.VerificationStep{{Name: "noop", Command: "true", Optional: false}})
+	m.executor.SetVerifier(trivial)
 
 	// First request: one proposal, one Execute.
 	firstCmd := m.handleInput("$prompt read @index.html and remove redundant content")
 	if firstCmd != nil || m.pendingAutonomyProposal == nil {
 		t.Fatal("first mutation must gate on a proposal")
 	}
-	if cmd := m.executeAutonomyProposal(); cmd == nil {
+	firstExec := m.executeAutonomyProposal()
+	if firstExec == nil {
 		t.Fatal("Execute must continue the first mutation")
 	}
 	if !m.autonomy.Authority(autonomy.RequiredCapabilities(autonomy.IntentModification)) {
 		t.Fatal("grant must cover the approved boundary after one authorization")
 	}
+	// Drive the first execution to its approval gate, approve it, and complete
+	// it so the agent-active flag clears before the second objective.
+	firstMsg := firstExec()
+	gem, ok := firstMsg.(gatedExecutionMsg)
+	if !ok {
+		t.Fatalf("first mutation must route through the executor, got %T", firstMsg)
+	}
+	if gem.err != nil {
+		t.Fatalf("first executor failed: %v", gem.err)
+	}
+	res, _ := m.Update(gem)
+	m = res.(*model)
+	if m.executorPendingPatchID == "" {
+		t.Fatal("first execution must stage a patch at the approval gate")
+	}
+	approveMsg := m.runExecutorApproveCmd(m.executorPendingPatchID)()
+	mr, ok := approveMsg.(executionResultMsg)
+	if !ok {
+		t.Fatalf("expected executionResultMsg from approve, got %T", approveMsg)
+	}
+	if mr.err != nil {
+		t.Fatalf("first approve failed: %v", mr.err)
+	}
+	res, _ = m.Update(mr)
+	m = res.(*model)
 
 	// Second objective inside the same boundary: auto-continue, no re-ask.
 	secondCmd := m.handleInput("$prompt remove the stray orphan text from @index.html")
@@ -384,24 +498,37 @@ func TestAcceptanceTargetNotFoundDiagnosis(t *testing.T) {
 	}
 }
 
-// §8 — target ambiguity is a decision: several workspace files match the
-// target name → a small candidate selector pauses, Enter continues on the
-// selected file without restarting the command.
+// §8 — target ambiguity is a decision: several workspace files match a target
+// that has no exact root path → a small candidate selector pauses, Enter
+// continues on the selected file without restarting the command. (An explicit
+// @path that exists at the workspace root is authoritative and resolves without
+// a selector — the canonical strategy resolver decides.)
 func TestAcceptanceAmbiguousTargetSelector(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 	if err := os.MkdirAll("templates", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile("index.html", []byte(redundantFixture), 0o644); err != nil {
+	if err := os.MkdirAll("src", 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// No ./index.html exists: only two same-named files deeper in the tree, so
+	// the canonical resolver surfaces a genuine ambiguity.
 	if err := os.WriteFile("templates/index.html", []byte("<html><body><p>template</p></body></html>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("src/index.html", []byte("<html><body><p>src</p></body></html>\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	m := autonomyAcceptanceModel()
 	m.grantMutation()
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n<p>template</p>\n=======\n<p>kept</p>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
+	m.provider = mock
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, mock, nil, "")
 
 	cmd := m.handleInput("$prompt remove redundant content from @index.html")
 	if cmd != nil {
@@ -415,7 +542,7 @@ func TestAcceptanceAmbiguousTargetSelector(t *testing.T) {
 		t.Errorf("selector block missing title:\n%s", view)
 	}
 
-	// Enter selects the highlighted candidate and continues execution.
+	// Enter selects the highlighted candidate and resumes on the RuntimeExecutor.
 	res, selCmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
 	m2 := res.(*model)
 	if selCmd == nil {
@@ -425,11 +552,14 @@ func TestAcceptanceAmbiguousTargetSelector(t *testing.T) {
 		t.Fatal("selection must consume the selector")
 	}
 	msg := selCmd()
-	prm, ok := msg.(planResultMsg)
+	gem, ok := msg.(gatedExecutionMsg)
 	if !ok {
-		t.Fatalf("expected planResultMsg after target selection, got %T", msg)
+		t.Fatalf("expected gatedExecutionMsg after target selection, got %T", msg)
 	}
-	if len(prm.Tasks) == 0 || prm.Tasks[0].Target != "index.html" {
-		t.Errorf("selected build target = %q, want index.html", prm.Tasks[0].Target)
+	if gem.err != nil {
+		t.Fatalf("executor failed: %v", gem.err)
+	}
+	if len(gem.res.Targets) == 0 || gem.res.Targets[0] == "index.html" {
+		t.Errorf("selected execution target = %v, want a resolved tree path (templates/… or src/…)", gem.res.Targets)
 	}
 }

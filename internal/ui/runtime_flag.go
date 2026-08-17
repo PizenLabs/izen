@@ -2,16 +2,17 @@ package ui
 
 import "os"
 
-// runtimeExecutorEnabled reports whether the RuntimeExecutor cutover is
-// enabled via the IZEN_RUNTIME_EXECUTOR environment variable.
+// runtimeExecutorEnabled reports whether the RuntimeExecutor is the production
+// execution authority.
 //
-//	disabled (default) → legacy mode-engine execution (rollback path)
-//	enabled  (IZEN_RUNTIME_EXECUTOR=1) → RuntimeExecutor execution authority
+//	enabled (default) → RuntimeExecutor execution authority
+//	disabled (IZEN_RUNTIME_EXECUTOR=0) → legacy mode-engine execution
 //
-// The flag is a migration mechanism only. It is NOT a permanent execution
-// mode: once the cutover is validated the legacy path is removed and the flag
-// disappears. Every migration step that alters production routing MUST be
-// gated on this flag so a regression can flip the whole cutover back.
+// The flag is a migration mechanism only and is NOT a permanent execution
+// mode. It now defaults to ENABLED: the RuntimeExecutor is the production
+// execution authority. The legacy path remains reachable ONLY through the
+// explicit IZEN_RUNTIME_EXECUTOR=0 override, which is itself removed in the
+// Phase 3 pruning once the legacy execution authority is deleted.
 func runtimeExecutorEnabled() bool {
-	return os.Getenv("IZEN_RUNTIME_EXECUTOR") == "1"
+	return os.Getenv("IZEN_RUNTIME_EXECUTOR") != "0"
 }
