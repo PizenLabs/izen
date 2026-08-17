@@ -1491,6 +1491,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.pendingHotfixAmbiguous = &hotfixAmbiguousData{
 			Task:       msg.Task,
 			Reason:     msg.Reason,
+			Status:     msg.Status,
 			Candidates: msg.Candidates,
 		}
 		m.hotfixCandidatesMode = false

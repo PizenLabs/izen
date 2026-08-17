@@ -6,6 +6,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/modes"
 )
 
 // ── Event projection ─────────────────────────────────────────────────────────
@@ -140,8 +141,13 @@ func TestRunAutonomyDecideCmdUnwired(t *testing.T) {
 	}
 }
 
-// ── /grant command ──────────────────────────────────────────────────────────
+// ── /grant DEPRECATED ───────────────────────────────────────────────────
 
+// TestHandleAutonomyGrantDeprecatedSeam verifies the deprecated /grant handler
+// still works as an internal compatibility seam but is no longer a required
+// user-facing command: it issues the BUILD capability vector and records the
+// deprecation notice. The autonomy proposal (ask_user → Execute) is the only
+// user-facing authorization path.
 func TestHandleAutonomyGrant(t *testing.T) {
 	m := &model{autonomy: autonomy.NewEngine(autonomy.WithScope("repository"))}
 	m.handleAutonomyGrant("")
@@ -167,5 +173,48 @@ func TestHandleAutonomyGrantUnwired(t *testing.T) {
 	m.handleAutonomyGrant("")
 	if len(m.records) == 0 || !strings.Contains(m.records[0].text, "not wired") {
 		t.Errorf("unwired grant must report not wired: %q", m.records[0].text)
+	}
+}
+
+// TestGrantTokenNotARegistryCommand pins requirement E: /grant is NOT a
+// registry command and cannot be parsed as a user-facing command through the
+// parser pipeline — authorization is internal to the autonomy proposal.
+func TestGrantTokenNotARegistryCommand(t *testing.T) {
+	m := newTestModel()
+	m.resolver.Set(modes.ModeAsk)
+	cmd := m.handleInput("/grant")
+	if cmd != nil {
+		t.Fatalf("/grant must not dispatch a command, got %T", cmd)
+	}
+	found := false
+	for _, r := range m.records {
+		if strings.Contains(r.text, "unknown command") && strings.Contains(r.text, "grant") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected /grant to be rejected as an unknown command")
+	}
+}
+
+// TestAutonomyProposalActions verifies the proposal carries the planned
+// high-level actions for a mutation intent (requirement 1).
+func TestAutonomyProposalActions(t *testing.T) {
+	tr := autonomy.Trace{
+		Input: "remove redundant content from @index.html",
+		Intent: autonomy.IntentResult{
+			Intent:   autonomy.IntentModification,
+			Required: autonomy.RequiredCapabilities(autonomy.IntentModification),
+		},
+	}
+	prop := tr.Proposal()
+	if len(prop.Actions) == 0 {
+		t.Fatal("mutation proposal must list planned high-level actions")
+	}
+	joined := strings.Join(prop.Actions, "|")
+	for _, want := range []string{"inspect target", "apply mutation", "verify"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("proposal actions missing %q: %v", want, prop.Actions)
+		}
 	}
 }

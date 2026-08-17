@@ -21,7 +21,7 @@ import (
 //
 //   - conversation → DecisionDirectResponse → ASK chat (no workspace, no loop)
 //   - read-only task → DecisionAutoContinue → execute the decided workspace
-//   - mutation without grant → DecisionAskUser → grant gate, then execute
+//   - mutation without grant → DecisionAskUser → proposal gate, then execute
 //   - impossible action → DecisionBlock → explain
 func (m *model) runAutonomyRoutedCmd(objective string) tea.Cmd {
 	if m.autonomy == nil {
@@ -29,6 +29,23 @@ func (m *model) runAutonomyRoutedCmd(objective string) tea.Cmd {
 	}
 	trace := m.autonomy.Decide(objective)
 	return m.dispatchAutonomyTrace(trace)
+}
+
+// routeHotfixThroughAutonomy enters the autonomy runtime for a BUILD/hotfix
+// execution request ("/build$hot check @index.html and remove redundant
+// content"). The hotfix directive already expresses an execution intent, so it
+// must NEVER bounce back to a mode command: the objective flows through
+// intent → capability → workspace → decision, and the decided BUILD workspace
+// executes with hotfix semantics.
+func (m *model) routeHotfixThroughAutonomy(objective string) tea.Cmd {
+	if m.autonomy == nil {
+		// Legacy compatibility: no decision runtime wired — fall back to the
+		// unified IntentGateway, which decides the execution path deterministically.
+		return m.runHotExecution(objective)
+	}
+	m.autonomyHotfix = true
+	m.pendingHotfixObjective = objective
+	return m.runAutonomyRoutedCmd(objective)
 }
 
 // dispatchAutonomyTrace projects a decision trace onto the execution layer. It
@@ -42,19 +59,20 @@ func (m *model) dispatchAutonomyTrace(trace autonomy.Trace) tea.Cmd {
 		// and no autonomous loop. In /ask the full governed chat path runs; in
 		// any other mode the generic chat stream answers without entering the
 		// mode's execution engine.
+		m.autonomyHotfix = false
+		m.pendingHotfixObjective = ""
 		if m.resolver.Current() == modes.ModeAsk {
 			return m.handleMessageContent(trace.Input)
 		}
 		return m.streamCmd(trace.Input)
 	case autonomy.DecisionAskUser:
-		if len(trace.Decision.Missing) > 0 {
-			return m.requestAutonomyGrant(trace)
-		}
-		m.push(roleSystem, infoStyle.Render("[autonomy] "+trace.Decision.Reason))
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return nil
+		// ask_user is the ONLY verdict that renders the proposal surface
+		// (authorization, risk acknowledgement, or target confirmation). The
+		// human decides with ↑/↓ + Enter; Execute authorizes internally.
+		return m.requestAutonomyProposal(trace)
 	case autonomy.DecisionBlock:
+		m.autonomyHotfix = false
+		m.pendingHotfixObjective = ""
 		m.push(roleError, "[autonomy] blocked: "+trace.Decision.Reason)
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -62,26 +80,6 @@ func (m *model) dispatchAutonomyTrace(trace autonomy.Trace) tea.Cmd {
 	default: // auto_continue
 		return m.executeAutonomyWorkspace(trace)
 	}
-}
-
-// requestAutonomyGrant stages a capability grant request: the runtime asks the
-// human for the missing mutation capability exactly once. The /grant command
-// consumes pendingAutonomyGrant, issues the grant, re-runs the decision and
-// executes the decided workspace — no repeated approval for the granted scope.
-func (m *model) requestAutonomyGrant(trace autonomy.Trace) tea.Cmd {
-	m.pendingAutonomyGrant = &trace
-
-	var b strings.Builder
-	b.WriteString(boldSapphireStyle.Render(Icon.Blueprint+" AUTONOMY GRANT REQUEST") + "\n")
-	fmt.Fprintf(&b, "  workspace   : %s\n", trace.Route.Workspace)
-	fmt.Fprintf(&b, "  required    : %s\n", trace.Intent.Required.String())
-	fmt.Fprintf(&b, "  missing     : %s\n", strings.Join(capNames(trace.Decision.Missing), " + "))
-	fmt.Fprintf(&b, "  reason      : %s\n", trace.Decision.Reason)
-	b.WriteString("\n  " + infoStyle.Render("Approve with /grant — the runtime then executes inside this boundary without asking again.") + "\n")
-	m.push(roleStatus, b.String())
-	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
-	return nil
 }
 
 // executeAutonomyWorkspace switches into the workspace the runtime selected and
@@ -102,6 +100,19 @@ func (m *model) executeAutonomyWorkspace(trace autonomy.Trace) tea.Cmd {
 	case modes.ModeInvestigate:
 		return m.runInvestigateCmd(trace.Input)
 	case modes.ModeBuild:
+		// A BUILD workspace executes with hotfix semantics when the objective
+		// arrived as a hotfix execution request (/build$hot …). The runtime
+		// already authorized the capability boundary; the hotfix pipeline then
+		// resolves the target deterministically and mutates inside it.
+		if m.autonomyHotfix {
+			m.autonomyHotfix = false
+			objective := m.pendingHotfixObjective
+			m.pendingHotfixObjective = ""
+			if objective == "" {
+				objective = trace.Input
+			}
+			return m.handleHotfixCmd(objective)
+		}
 		return m.executeAutonomyBuild(trace)
 	case modes.ModeReview:
 		return m.runReviewCmd("")

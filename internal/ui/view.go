@@ -231,6 +231,14 @@ func (m *model) renderProposalBlock() string {
 
 	var b strings.Builder
 
+	// ── AUTONOMY PROPOSAL (ask_user decision surface) ──────────────
+	// The proposal is the ONLY authorization gate. It renders whenever a
+	// proposal is outstanding, independent of the derived workflow state.
+	if m.pendingAutonomyProposal != nil {
+		b.WriteString(m.renderAutonomyProposalBlock(width))
+		return b.String()
+	}
+
 	// NOTE: The shimmer loading dock has been moved into the viewport body
 	// (refreshViewportContent) so it scrolls with the text content instead
 	// of remaining fixed at the bottom above the prompt bar.

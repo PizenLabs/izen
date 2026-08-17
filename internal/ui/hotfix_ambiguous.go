@@ -137,6 +137,18 @@ func (m *model) selectHotfixCandidate(n int) (tea.Model, tea.Cmd) {
 	)
 }
 
+// statusLabel renders the canonical target-resolution status label.
+func statusLabel(s hotfixTargetStatus) string {
+	switch s {
+	case targetNotFound:
+		return "NOT FOUND"
+	case targetResolved:
+		return "RESOLVED"
+	default:
+		return "AMBIGUOUS"
+	}
+}
+
 // renderHotfixAmbiguousBlock renders the actionable ambiguity-resolution card.
 // It is NOT a patch proposal: it NEVER renders Accept/Reject actions (there is
 // no patch), and candidate inspection is strictly read-only.
@@ -151,7 +163,7 @@ func (m *model) renderHotfixAmbiguousBlock(width int) string {
 	}
 
 	var b strings.Builder
-	b.WriteString(permissionTitleStyle.Render(Icon.Warning + " HOTFIX TARGET AMBIGUOUS"))
+	b.WriteString(permissionTitleStyle.Render(Icon.Warning + " HOTFIX TARGET " + statusLabel(amb.Status)))
 	b.WriteString("\n\n")
 	if amb.Task != nil {
 		b.WriteString(permissionDescStyle.Render("Request:"))

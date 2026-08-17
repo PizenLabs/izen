@@ -154,6 +154,36 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// ── AUTONOMY PROPOSAL (ask_user decision surface) ──────────────────
+	// The proposal is the ONLY authorization gate: ↑/↓ navigate the action
+	// list, Enter activates the highlighted action (Execute / Inspect /
+	// Cancel), Esc cancels. It takes precedence over every other key handler
+	// while a proposal is outstanding. No /grant command exists.
+	if m.pendingAutonomyProposal != nil {
+		switch {
+		case msg.Type == tea.KeyUp || msg.String() == "k":
+			m.navigateAutonomyProposal(-1)
+			return m, nil
+		case msg.Type == tea.KeyDown || msg.String() == "j":
+			m.navigateAutonomyProposal(1)
+			return m, nil
+		case msg.Type == tea.KeyEnter:
+			return m, m.activateAutonomyProposal()
+		case msg.Type == tea.KeyEscape || msg.String() == "alt+x":
+			return m, m.cancelAutonomyProposal()
+		case msg.String() == "i":
+			m.toggleAutonomyProposalInspect()
+			return m, nil
+		default:
+			// Printable text still composes the next command while the
+			// proposal renders (the input line stays focused).
+			if m.ti.Focused() && isPrintableRunes(msg) {
+				return m, m.forwardToInput(msg)
+			}
+			return m, nil
+		}
+	}
+
 	// ── THOUGHT-BOX SCROLL ────────────────────────────────────────────
 	// While the expanded reasoning box overflows maxLines, j/k, arrows, and
 	// PgUp/PgDn scroll WITHIN the box (the proposal-diff convention) so the

@@ -166,6 +166,10 @@ type Trace struct {
 	Grant     GrantRequest
 	Risk      RiskLevel
 	ScopeSize int
+	// Rollback reports whether a rollback checkpoint is available at decision
+	// time. It is carried on the trace so the ask_user proposal surface can
+	// present rollback availability without re-probing the execution layer.
+	Rollback bool
 }
 
 // Decide is the main decision entry point. It classifies the input, selects the
@@ -212,6 +216,9 @@ func (e *Engine) Decide(input string, opts ...DecideOption) Trace {
 	scope := e.Scope()
 	granted := e.Grants().ActiveCaps(scope)
 
+	rollback := e.rollbackAvailable()
+	trace.Rollback = rollback
+
 	decInput := DecisionInput{
 		Intent:           res.Intent,
 		IntentConfidence: res.Confidence,
@@ -221,7 +228,7 @@ func (e *Engine) Decide(input string, opts ...DecideOption) Trace {
 			Level: risk,
 		},
 		AffectedScope:     do.scopeSize,
-		RollbackAvailable: e.rollbackAvailable(),
+		RollbackAvailable: rollback,
 		Granted:           granted,
 	}
 	out := e.controller.Decide(decInput)

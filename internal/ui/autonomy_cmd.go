@@ -57,7 +57,7 @@ func (m *model) runAutonomyDecideCmd(content string) tea.Cmd {
 		if trace.Grant.Scope != "" {
 			fmt.Fprintf(&b, "  scope       : %s\n", trace.Grant.Scope)
 		}
-		b.WriteString("\n  " + infoStyle.Render("Approve with /grant — the runtime then loops inside that boundary without asking again.") + "\n")
+		b.WriteString("\n  " + infoStyle.Render("Execution is suspended — the autonomy proposal (↑/↓ + Enter) will request this authorization internally.") + "\n")
 	}
 	if trace.Decision.Decision == autonomy.DecisionDirectResponse {
 		b.WriteString("\n  " + infoStyle.Render("Direct response — no execution workspace, no timeline.") + "\n")
@@ -128,15 +128,12 @@ func NewAutonomyLoopPreview(i autonomy.Intent) []string {
 	}
 }
 
-// handleAutonomyGrant implements the /grant command: it issues a session
-// capability grant for the engine scope so the runtime may loop inside the
-// boundary without repeated approvals.
-//
-// When a pending autonomy grant request exists (a decision that halted at
-// ask_user because the mutation capability was missing), /grant consumes it:
-// it issues exactly the missing capabilities, re-runs the decision (which now
-// auto-continues) and executes the decided workspace — the "one approval, no
-// repeated approvals" guarantee.
+// handleAutonomyGrant is the DEPRECATED /grant command handler. Grant is no
+// longer a user-facing command: authorization happens through the autonomy
+// proposal (ask_user → Execute). This handler remains ONLY as an internal
+// compatibility seam — it executes the same internal grant + revalidate +
+// continue flow the proposal's Execute action uses. It is not reachable from
+// the parser (the /grant token is not a registry command).
 func (m *model) handleAutonomyGrant(content string) tea.Cmd {
 	if m.autonomy == nil {
 		m.push(roleError, "[autonomy] decision runtime not wired")
@@ -145,28 +142,12 @@ func (m *model) handleAutonomyGrant(content string) tea.Cmd {
 		return nil
 	}
 
-	if m.pendingAutonomyGrant != nil {
-		pending := *m.pendingAutonomyGrant
-		m.pendingAutonomyGrant = nil
-		caps := pending.Decision.Missing
-		if len(caps) == 0 {
-			caps = autonomy.CapabilitySet{autonomy.CapMutate}
-		}
-		g := m.autonomy.GrantDefault(caps...)
-		m.push(roleStatus, fmt.Sprintf(
-			"%s Capability granted: %s\n  scope: %s\n%s\n%s",
-			greenStyle.Render("✓"), strings.Join(capNames(g.Capabilities), " + "), g.Scope,
-			strings.Join(g.Permissions(), "\n"),
-			mutedStyle.Render("The runtime may now inspect, plan, patch and verify inside this boundary without asking again."),
-		))
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return m.dispatchAutonomyTrace(m.autonomy.Decide(pending.Input))
+	if m.pendingAutonomyProposal != nil {
+		return m.executeAutonomyProposal()
 	}
 
-	// Grant the full BUILD capability vector (the only domain that may mutate).
-	// The grant is scoped to the engine scope (workspace root) and persists for
-	// the session — one approval, many actions.
+	// Deprecated bare-grant path: grant the full BUILD capability vector and
+	// report that authorization is internal from now on.
 	g := m.autonomy.GrantDefault(
 		autonomy.CapRead, autonomy.CapAnalyze, autonomy.CapPropose,
 		autonomy.CapMutate, autonomy.CapVerify,
@@ -179,7 +160,7 @@ func (m *model) handleAutonomyGrant(content string) tea.Cmd {
 		"%s Capability granted: %s\n  scope: %s\n%s\n%s",
 		greenStyle.Render("✓"), strings.Join(capNames(g.Capabilities), " + "), g.Scope,
 		strings.Join(perms, "\n"),
-		mutedStyle.Render("The runtime may now inspect, plan, patch and verify inside this boundary without asking again."),
+		mutedStyle.Render("/grant is deprecated — authorization is now an internal operation of the autonomy proposal (ask_user → Execute)."),
 	))
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()

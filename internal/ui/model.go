@@ -46,6 +46,7 @@ import (
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 	riview "github.com/PizenLabs/izen/internal/review"
+	"github.com/PizenLabs/izen/internal/router"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
@@ -523,6 +524,9 @@ type multiHotfixProposalMsg struct {
 type hotfixAmbiguousMsg struct {
 	Task   *plan.Task // the original hotfix request (Target + Description)
 	Reason string     // why the target is ambiguous
+	// Status distinguishes target_not_found from target_ambiguous so the card
+	// never collapses them into a generic hotfix failure.
+	Status hotfixTargetStatus
 	// Candidates are deterministic, inspectable target options (HTML structural
 	// anomalies). Human selection makes the target explicit; it is never chosen
 	// automatically.
@@ -534,6 +538,7 @@ type hotfixAmbiguousMsg struct {
 type hotfixAmbiguousData struct {
 	Task       *plan.Task
 	Reason     string
+	Status     hotfixTargetStatus
 	Candidates []hotfix.Target
 }
 
@@ -930,6 +935,17 @@ type model struct {
 	awaitingConfirmation bool
 	pendingProposals     []SemanticProposal
 	acceptAll            bool
+
+	// Hybrid-intent-gateway confirmation: when the router classifies a
+	// free-form prompt with confidence below the threshold
+	// (ConfirmationRequirement), the UI freezes in StateAwaitingApproval and
+	// presents an interactive mode-selection prompt instead of acting on a
+	// blind guess. pendingRouteIdx is the highlighted option index.
+	pendingRouteConfirm bool
+	pendingRouteInput   string
+	pendingRouteResult  router.ClassificationResult
+	pendingRouteOptions []modes.Mode
+	pendingRouteIdx     int
 
 	// Accepted proposals (collapsed single-line summaries)
 	acceptedProposals []acceptedProposal
@@ -1492,12 +1508,28 @@ type model struct {
 	// projects the autonomy events onto the activity log and never mutates the
 	// engine. Nil only in headless/test harnesses.
 	autonomy *autonomy.Engine
-	// pendingAutonomyGrant holds the autonomy decision trace that is awaiting
-	// a human capability grant (ask_user with missing mutation capability). The
-	// /grant command consumes it: it issues the missing capabilities, re-runs
-	// the decision and executes the decided workspace — the "one approval, no
-	// repeated approvals" guarantee. Nil when no grant request is outstanding.
-	pendingAutonomyGrant *autonomy.Trace
+	// pendingAutonomyProposal holds the ask_user decision surface awaiting a
+	// human decision. It is the ONLY user-facing authorization gate — Execute
+	// issues the session capability grant internally, re-runs the decision and
+	// continues execution. Nil when no proposal is outstanding.
+	pendingAutonomyProposal *autonomy.Proposal
+	// autonomyProposalSelect is the highlighted action index in the proposal
+	// menu (Execute / Inspect / Cancel), navigated with ↑/↓.
+	autonomyProposalSelect int
+	// autonomyProposalInspect toggles the read-only decision-detail view of the
+	// pending proposal.
+	autonomyProposalInspect bool
+	// autonomyHotfix marks the current objective as a BUILD/hotfix execution
+	// request (e.g. "/build$hot check @index.html and remove redundant
+	// content"). While set, the decided BUILD workspace executes with hotfix
+	// semantics (deterministic target resolution → targeted patch) instead of
+	// the generic plan→build flow. It is cleared once the hotfix pipeline
+	// starts.
+	autonomyHotfix bool
+	// pendingHotfixObjective carries the hotfix tail while the autonomy
+	// authorization proposal is outstanding, so Execute can resume the hotfix
+	// pipeline on the SAME objective without re-parsing a command.
+	pendingHotfixObjective string
 
 	// Patch engine: 4-tier pipeline (Tier 1 structured diff -> Tier 2
 	// SEARCH/REPLACE -> Tier 3 whole-file -> Tier 4 human approval) replacing
@@ -2292,6 +2324,8 @@ func (m *model) unwindBuildFailure() {
 	m.hotfixCandidatesMode = false
 	m.pendingHotfixCandidate = nil
 	m.acceptAll = false
+	m.pendingRouteConfirm = false
+	m.clearAutonomyProposal()
 	if m.workflowSM != nil {
 		// From StateBuilding/StateFailed/StateRepairing the canonical exit is
 		// a reset back to StateIdle, from which every forward phase is reachable.
@@ -2362,6 +2396,8 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	m.hotfixCandidatesMode = false
 	m.pendingHotfixCandidate = nil
 	m.acceptAll = false
+	m.pendingRouteConfirm = false
+	m.clearAutonomyProposal()
 	if m.toolCallBuffer != nil {
 		m.toolCallBuffer.Reject()
 	}
@@ -2402,6 +2438,14 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 // rests in StateChat.
 func (m *model) syncUIState() {
 	if m == nil {
+		return
+	}
+	// ── AUTONOMY PROPOSAL GATE ───────────────────────────────────────
+	// The ask_user proposal is a pending human decision: it freezes the
+	// interaction into StateAwaitingApproval so the keyboard routes to the
+	// proposal (↑/↓ + Enter, Esc), independent of the workflow state machine.
+	if m.pendingAutonomyProposal != nil {
+		m.state = presentation.StateAwaitingApproval
 		return
 	}
 	// ── HOTFIX AMBIGUITY RESULT STATE ──────────────────────────────
