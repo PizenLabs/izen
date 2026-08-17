@@ -154,6 +154,30 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// ── AUTONOMY TARGET SELECTOR (§8) ─────────────────────────────────
+	// An ambiguous mutation target presents a small candidate selector: ↑/↓
+	// navigate, Enter selects and continues execution, Esc cancels. It takes
+	// precedence over every other key handler while a selector is outstanding.
+	if len(m.pendingAutonomyTargets) > 0 {
+		switch {
+		case msg.Type == tea.KeyUp || msg.String() == "k":
+			m.navigateAutonomyTarget(-1)
+			return m, nil
+		case msg.Type == tea.KeyDown || msg.String() == "j":
+			m.navigateAutonomyTarget(1)
+			return m, nil
+		case msg.Type == tea.KeyEnter:
+			return m, m.activateAutonomyTarget()
+		case msg.Type == tea.KeyEscape || msg.String() == "alt+x":
+			return m, m.cancelAutonomyTargetSelector()
+		default:
+			if m.ti.Focused() && isPrintableRunes(msg) {
+				return m, m.forwardToInput(msg)
+			}
+			return m, nil
+		}
+	}
+
 	// ── AUTONOMY PROPOSAL (ask_user decision surface) ──────────────────
 	// The proposal is the ONLY authorization gate: ↑/↓ navigate the action
 	// list, Enter activates the highlighted action (Execute / Inspect /

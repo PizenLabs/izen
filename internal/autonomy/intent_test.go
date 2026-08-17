@@ -73,6 +73,31 @@ func TestClassifyVerification(t *testing.T) {
 	}
 }
 
+func TestClassifyMutationVerbDominatesInspection(t *testing.T) {
+	// Case F: "$prompt inspect and remove redundant content from @index.html"
+	// carries a mutation verb ("remove") — it is a modification, never a
+	// read-only investigation.
+	res := Classify("inspect and remove redundant content from @index.html", nil)
+	if res.Intent != IntentModification {
+		t.Errorf("inspect+remove = %s, want modification", res.Intent)
+	}
+	if !res.RequiresMutation() {
+		t.Error("inspect+remove must require mutation")
+	}
+}
+
+func TestClassifyInspectionWithoutMutationStaysInvestigation(t *testing.T) {
+	// Case C: "$prompt inspect @index.html" carries no mutation verb — it stays
+	// a read-only investigation.
+	res := Classify("inspect @index.html", nil)
+	if res.Intent != IntentInvestigation {
+		t.Errorf("inspect = %s, want investigation", res.Intent)
+	}
+	if res.RequiresMutation() {
+		t.Error("pure inspect must not require mutation")
+	}
+}
+
 func TestClassifyDebuggingDominatesMutation(t *testing.T) {
 	res := Classify("why is the build failing after the fix", nil)
 	if res.Intent != IntentDebugging {

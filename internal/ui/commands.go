@@ -280,6 +280,19 @@ func (m *model) handleInput(line string) tea.Cmd {
 		switchCmd := m.runtimeSwitchCmd(mode)
 		if content != "" {
 			m.setMode(mode)
+			// ── /ask SINGLE DECISION AUTHORITY (§4) ────────────────────
+			// /ask is the explicit read-only chat boundary, so its content
+			// flows through the SAME autonomy decision authority as every other
+			// objective. A read-only /ask request (question, inspection,
+			// explanation) answers in the ask workspace as before; a mutation
+			// request typed into /ask ("/ask remove redundant content from
+			// @index.html") must NEVER silently execute or be answered as chat —
+			// the autonomy runtime classifies it as a mutation and returns a
+			// capability escalation proposal. The user authorizes the boundary;
+			// the runtime never re-asks for a mode command.
+			if mode == modes.ModeAsk && m.autonomy != nil {
+				return tea.Batch(m.runAutonomyRoutedCmd(content), switchCmd)
+			}
 			return tea.Batch(m.handleMessageContent(content), switchCmd)
 		}
 		if mode == modes.ModeReview {

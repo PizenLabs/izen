@@ -9,6 +9,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/command"
+	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 )
@@ -161,9 +162,44 @@ func (m *model) publishAutonomyLoop(trace autonomy.Trace) {
 // (orphan text nodes, invalid regions, duplicate content, malformed structure)
 // and appends the Context Evidence Ledger to the task description. The model
 // never discovers deterministic facts on its own — it reasons over the ledger.
+//
+// TARGET RESOLUTION (§8): the mutation target is resolved deterministically
+// against the workspace BEFORE any model reasoning. An ambiguous target (several
+// files match the name) pauses with a small candidate selector; a target that
+// exists nowhere surfaces a clear not-found diagnosis. The model is never asked
+// to compensate for a deterministic resolution failure.
 func (m *model) executeAutonomyBuild(trace autonomy.Trace) tea.Cmd {
+	// ── DETERMINISTIC TARGET RESOLUTION (§8) ─────────────────────────
+	target, candidates := m.resolveAutonomyBuildTarget(trace.Intent.Target())
+	switch {
+	case len(candidates) > 1:
+		// Several safe candidates remain — ambiguity is a decision, not a
+		// dead end. The candidate selector pauses without a model call.
+		m.stageAutonomyTargetSelector(trace, candidates)
+		return nil
+	case len(candidates) == 0:
+		if !isAutonomyCreationRequest(trace.Input) {
+			return m.reportAutonomyTargetNotFound(trace, target)
+		}
+		// New-file objective: proceed with the raw target.
+		target = trace.Intent.Target()
+	}
+	return m.stageAutonomyBuild(trace, target)
+}
+
+// stageAutonomyBuild stages the deterministic FILE_MUTATE plan for a RESOLVED
+// mutation target and hands it to the build engine. The engine owns the
+// workflow (resolve → read → detect → propose → apply → verify); the runtime
+// already authorized the BUILD capability domain through the grant gate.
+//
+// CONTEXT COMPILER VALIDATION (§6): before the build engine asks the model to
+// propose a mutation, the runtime compiles the target's structural evidence
+// (orphan text nodes, invalid regions, duplicate content, malformed structure)
+// and appends the Context Evidence Ledger to the task description. The model
+// never discovers deterministic facts on its own — it reasons over the ledger.
+func (m *model) stageAutonomyBuild(trace autonomy.Trace, target string) tea.Cmd {
 	var tasks []plan.Task
-	if target := trace.Intent.Target(); target != "" {
+	if target != "" {
 		tasks = command.GenerateFallbackPlan(command.FallbackPlanTarget{
 			File:        target,
 			Description: trace.Input,
@@ -171,12 +207,9 @@ func (m *model) executeAutonomyBuild(trace autonomy.Trace) tea.Cmd {
 		})
 		// Compile structural evidence for the resolved target so the proposal
 		// the build engine generates is grounded in deterministic findings.
-		if content, err := os.ReadFile(target); err == nil {
-			ctx := m.autonomy.CompileContext(target, string(content))
-			if ledger := ctx.FormatEvidenceLedger(); ledger != "" {
-				for i := range tasks {
-					tasks[i].Evidence = ledger
-				}
+		if evidence := m.compileAutonomyBuildEvidence(target); evidence != "" {
+			for i := range tasks {
+				tasks[i].Evidence = evidence
 			}
 		}
 	}
@@ -189,6 +222,36 @@ func (m *model) executeAutonomyBuild(trace autonomy.Trace) tea.Cmd {
 	return func() tea.Msg {
 		return planResultMsg{Tasks: tasks, IsFastTrack: true}
 	}
+}
+
+// compileAutonomyBuildEvidence compiles the deterministic structural evidence
+// for the resolved mutation target: the general Context Evidence Ledger
+// (orphan text, invalid regions) plus, for HTML targets, the redundancy ledger
+// (exact redundant blocks with line ranges). The model reasons over this
+// ledger — it never re-discovers structural facts or redundant content from
+// raw text (§9/§10). Returns "" when the target cannot be read.
+func (m *model) compileAutonomyBuildEvidence(target string) string {
+	content, err := os.ReadFile(target)
+	if err != nil {
+		return ""
+	}
+	var parts []string
+	if m.autonomy != nil {
+		if ledger := m.autonomy.CompileContext(target, string(content)).FormatEvidenceLedger(); ledger != "" {
+			parts = append(parts, ledger)
+		}
+	}
+	if isHTMLTarget(target) {
+		if redundant, ok := hotfix.ResolveRedundantTargets(string(content)); ok && len(redundant) > 0 {
+			if ledger := formatRedundancyLedger(target, redundant); ledger != "" {
+				parts = append(parts, ledger)
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // renderAutonomyDecision presents the runtime's decision before execution so

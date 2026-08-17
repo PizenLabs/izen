@@ -270,22 +270,32 @@ func classifyDeterministic(input string) (Intent, float64, string) {
 		return IntentConversation, 0.95, "direct conversational signal"
 	}
 
-	// Investigation signals dominate pure diagnostic phrasing.
-	for _, p := range investigationPatterns {
-		if strings.Contains(lower, p) {
-			return IntentInvestigation, 0.9, "evidence-collection signal"
+	// Mutation verbs dominate read-only investigation phrasing. A request like
+	// "inspect and remove redundant content from @index.html" is a MUTATION —
+	// "remove" decides the intent, never "inspect". Investigation keeps its
+	// read-only classification only when the objective carries no mutation verb
+	// (e.g. "inspect @index.html" is pure investigation).
+	hasMutationLike := containsAny(lower, modificationPatterns) ||
+		containsAny(lower, refactoringPatterns)
+
+	// Investigation signals dominate pure diagnostic phrasing — but only when
+	// the objective carries no mutation verb.
+	if !hasMutationLike {
+		for _, p := range investigationPatterns {
+			if strings.Contains(lower, p) {
+				return IntentInvestigation, 0.9, "evidence-collection signal"
+			}
 		}
 	}
 
-	// Debugging: failure/crash phrasing is never a mutation request.
+	// Debugging: failure/crash phrasing is never a mutation request. It stays
+	// dominant even when a trailing mutation verb exists ("why is the build
+	// failing after the fix") — the question form owns the intent.
 	for _, p := range debuggingPatterns {
 		if strings.Contains(lower, p) {
 			return IntentDebugging, 0.9, "failure root-cause signal"
 		}
 	}
-
-	hasMutationLike := containsAny(lower, modificationPatterns) ||
-		containsAny(lower, refactoringPatterns)
 
 	// Verification wins only when the input carries no mutation verb.
 	if !hasMutationLike && containsAny(lower, verificationPatterns) {

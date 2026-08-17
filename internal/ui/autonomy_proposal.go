@@ -200,6 +200,7 @@ func (m *model) clearAutonomyProposal() {
 	m.autonomyProposalInspect = false
 	m.autonomyHotfix = false
 	m.pendingHotfixObjective = ""
+	m.clearAutonomyTargetSelector()
 }
 
 // renderAutonomyProposalBlock renders the ask_user decision surface. It is the

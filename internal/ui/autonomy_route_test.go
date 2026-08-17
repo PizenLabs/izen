@@ -78,6 +78,12 @@ func TestAutonomyValidationCase2InspectRoutesToInvestigate(t *testing.T) {
 // capability grant internally, re-runs the decision and executes in BUILD
 // without a repeated approval.
 func TestAutonomyValidationCase3MutationProposalThenExecutes(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile("index.html", []byte("<html><body><main><p>keep</p></main>stray text</body></html>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	m := autonomyTestModel()
 
 	cmd := m.runAutonomyRoutedCmd("read @index.html and remove extra contents")
@@ -175,6 +181,12 @@ func TestAutonomyProposalKeyboardNavigation(t *testing.T) {
 // granted scope" guarantee: after one proposal Execute, the same objective
 // auto-continues.
 func TestAutonomyGrantNoRepeatedApproval(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile("index.html", []byte("<html><body><main><p>keep</p></main>stray text</body></html>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	m := autonomyTestModel()
 
 	// First request: ask_user (mutation not granted).
@@ -287,6 +299,12 @@ func TestAutonomyOwnsIntentAfterBoundary(t *testing.T) {
 // re-entering the same gate — the runtime executes the decided workspace
 // directly and never loops back to a duplicate proposal.
 func TestAutonomyConfirmationGateNoLoop(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile("index.html", []byte("<html><body><main><p>keep</p></main>stray text</body></html>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	m := autonomyTestModel()
 	// Wire a high-risk classifier so the controller raises a risk-acknowledgement
 	// gate AFTER the mutation capability is granted.

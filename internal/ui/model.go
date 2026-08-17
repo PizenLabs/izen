@@ -1519,6 +1519,17 @@ type model struct {
 	// autonomyProposalInspect toggles the read-only decision-detail view of the
 	// pending proposal.
 	autonomyProposalInspect bool
+	// pendingAutonomyTargets holds the deterministic candidate files when a
+	// mutation target is ambiguous (§8). The user selects explicitly; no
+	// candidate is ever auto-picked. Nil when no selector is outstanding.
+	pendingAutonomyTargets []string
+	// autonomyTargetSelect is the highlighted candidate index in the target
+	// selector.
+	autonomyTargetSelect int
+	// pendingAutonomyTargetTrace is the decision trace resumed after the human
+	// selects a candidate. The grant already covers the boundary, so selection
+	// continues execution without re-authorization.
+	pendingAutonomyTargetTrace autonomy.Trace
 	// autonomyHotfix marks the current objective as a BUILD/hotfix execution
 	// request (e.g. "/build$hot check @index.html and remove redundant
 	// content"). While set, the decided BUILD workspace executes with hotfix
@@ -2445,6 +2456,14 @@ func (m *model) syncUIState() {
 	// interaction into StateAwaitingApproval so the keyboard routes to the
 	// proposal (↑/↓ + Enter, Esc), independent of the workflow state machine.
 	if m.pendingAutonomyProposal != nil {
+		m.state = presentation.StateAwaitingApproval
+		return
+	}
+	// ── AUTONOMY TARGET SELECTOR GATE (§8) ─────────────────────────
+	// An ambiguous mutation target is a pending human decision: it freezes the
+	// interaction into StateAwaitingApproval so the keyboard routes to the
+	// candidate selector (↑/↓ + Enter, Esc).
+	if len(m.pendingAutonomyTargets) > 0 {
 		m.state = presentation.StateAwaitingApproval
 		return
 	}
