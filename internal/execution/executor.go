@@ -665,6 +665,12 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 	x.patches.SetMutationSet(ms)
 	x.patches.SetAuthorization(x.auth)
 	if x.verifier != nil {
+		// Phase 1 safety rule: the verifier is the APPLY GATE, not an
+		// after-the-fact report. Attaching it to the runtime's own
+		// PatchManager activates the micro-fix gate inside Apply, so a
+		// verification failure restores the shadow backup and fails the apply
+		// (never a committed mutation reported as changed).
+		x.patches.SetVerifier(x.verifier)
 		x.verifier.SetAuthorization(x.auth)
 	}
 	pm.ms = ms

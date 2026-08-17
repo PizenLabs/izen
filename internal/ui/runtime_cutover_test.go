@@ -346,10 +346,71 @@ func (c *eventCollector) Stop() {
 	}
 }
 
-// TestRuntimeCutoverApproveAppliesThroughExecutor is the full-loop cutover
-// proof: Execute → approval gate → Alt+A (authorize) → executor.Approve →
-// PatchManager apply → verifier → canonical events. The UI never touches a
-// provider or PatchManager; it authorizes the boundary and the runtime applies.
+// TestRuntimeCutoverVerificationFailureIsNotSuccess proves the executor apply
+// gate safety rule on the cutover path: a verifier failure after the write is
+// reported as a failure (never success), the mutation boundary is rolled back,
+// and the file is restored to its pre-mutation bytes.
+func TestRuntimeCutoverVerificationFailureIsNotSuccess(t *testing.T) {
+	t.Setenv("IZEN_RUNTIME_EXECUTOR", "1")
+	dir := t.TempDir()
+	t.Chdir(dir)
+	orig := "<!DOCTYPE html>\n<html>\n<body>\n  <h1>Home</h1>\n  <p>body</p>\n</body>\n</html>\n"
+	if err := os.WriteFile("index.html", []byte(orig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n  <p>body</p>\n=======\n  <p>body updated</p>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
+
+	m := cutoverModel(t, mock)
+	m.authEngine = authorization.NewAuthorizationEngine(
+		fakeSourceVerifier{},
+		fakeCheckpointChecker{},
+		func() workflow.WorkflowState { return workflow.StateBuilding },
+	)
+	m.mutationBudget = budget.NewBudget(10, 1000, 100000, 3, 30*time.Minute, 10)
+	caps := capability.NewCapabilitySet()
+	caps.Grant(capability.CapabilityWrite)
+	caps.Grant(capability.CapabilityPatch)
+	m.caps = caps
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, mock, nil, "")
+	failing := execution.NewVerifier(".")
+	failing.SetCustomSteps([]execution.VerificationStep{{Name: "syntax", Command: "false", Optional: false}})
+	m.executor.SetVerifier(failing)
+	grantMutationCaps(m)
+
+	cmd := m.handleInput("$prompt read @index.html and remove redundant content")
+	gem := cmd().(gatedExecutionMsg)
+	res, _ := m.Update(gem)
+	m2 := res.(*model)
+	if m2.executorPendingPatchID == "" {
+		t.Fatal("approval-held patch not staged")
+	}
+
+	amsg := m2.runExecutorApproveCmd(m2.executorPendingPatchID)()
+	mr, ok := amsg.(executionResultMsg)
+	if !ok {
+		t.Fatalf("expected executionResultMsg, got %T", amsg)
+	}
+	if mr.err == nil {
+		t.Fatal("a verifier failure must fail the approve — never a silent success")
+	}
+	if mr.res == nil || mr.res.Proof == nil {
+		t.Fatal("failed approve must still carry its proof")
+	}
+	if mr.res.Proof.Outcome.MutationSucceeded() {
+		t.Fatalf("verifier failure must not report a successful mutation, outcome=%q", mr.res.Proof.Outcome)
+	}
+	// The failed apply must not leave the mutation on disk.
+	onDisk, rerr := os.ReadFile("index.html")
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(onDisk) != orig {
+		t.Fatal("verifier failure must restore the file to its pre-mutation bytes")
+	}
+}
 func TestRuntimeCutoverApproveAppliesThroughExecutor(t *testing.T) {
 	t.Setenv("IZEN_RUNTIME_EXECUTOR", "1")
 	dir := t.TempDir()
