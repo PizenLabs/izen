@@ -336,6 +336,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		events.EventVerificationCompleted,
 		events.EventExecutionFinished,
 		events.EventApprovalRequired,
+		events.EventApprovalRejected,
 		// Autonomy decision runtime events: every gate (auto_continue /
 		// ask_user / block / direct_response), capability grant, loop step and
 		// context compilation is projected as an activity line so the operator
