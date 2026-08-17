@@ -411,6 +411,40 @@ func TestRuntimeCutoverVerificationFailureIsNotSuccess(t *testing.T) {
 		t.Fatal("verifier failure must restore the file to its pre-mutation bytes")
 	}
 }
+
+// TestRuntimeCutoverEmptyArtifactIsFailure proves validation item 10: a model
+// that produces no usable mutation artifact yields an execution failure on the
+// cutover path — never a proposal staged for approval and never a success.
+func TestRuntimeCutoverEmptyArtifactIsFailure(t *testing.T) {
+	t.Setenv("IZEN_RUNTIME_EXECUTOR", "1")
+	writeIndexFixture(t)
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
+	m := cutoverModel(t, mock)
+	grantMutationCaps(m)
+
+	cmd := m.handleInput("$prompt read @index.html and remove redundant content")
+	if cmd == nil {
+		t.Fatal("granted mutation must dispatch an execution")
+	}
+	msg := cmd()
+	gem, ok := msg.(gatedExecutionMsg)
+	if !ok {
+		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
+	}
+	if gem.err == nil {
+		t.Fatal("an empty model artifact must fail the execution — never a success")
+	}
+	if gem.res != nil && gem.res.PendingPatchID != "" {
+		t.Fatal("an empty artifact must not reach the approval gate")
+	}
+	if gem.res != nil && gem.res.Proof != nil && gem.res.Proof.Outcome.MutationSucceeded() {
+		t.Fatal("an empty artifact must never report a successful mutation")
+	}
+}
+
 func TestRuntimeCutoverApproveAppliesThroughExecutor(t *testing.T) {
 	t.Setenv("IZEN_RUNTIME_EXECUTOR", "1")
 	dir := t.TempDir()

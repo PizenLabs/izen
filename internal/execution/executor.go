@@ -943,6 +943,12 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// the full response as the replacement attempt (best-effort).
 			modified = raw
 		}
+		if strings.TrimSpace(modified) == "" {
+			// Phase 1 safety rule: an artifact extraction failure is a FAILURE,
+			// never a proposal staged for approval. The model produced no
+			// usable mutation artifact — abort before any approval surface.
+			return nil, nil, nil, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
+		}
 		patches = append(patches, &Patch{
 			ID:       fmt.Sprintf("%s-patch-%d", requestID, len(patches)+1),
 			File:     target,
