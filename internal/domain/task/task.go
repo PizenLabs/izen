@@ -83,6 +83,11 @@ type Task struct {
 	Solution    string     `json:"solution,omitempty"`
 	IsHardcoded bool       `json:"is_hardcoded,omitempty"`
 	IsFastTrack bool       `json:"is_fast_track,omitempty"`
+	// Evidence carries deterministic structural findings compiled by the
+	// autonomy runtime BEFORE the model is asked to interpret or propose (e.g.
+	// a Context Evidence Ledger for the mutation target). The model reasons
+	// over this ledger; it never discovers structural facts on its own.
+	Evidence string `json:"evidence,omitempty"`
 }
 
 // Done reports whether the task has reached the completed state. It is the

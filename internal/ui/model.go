@@ -1492,6 +1492,12 @@ type model struct {
 	// projects the autonomy events onto the activity log and never mutates the
 	// engine. Nil only in headless/test harnesses.
 	autonomy *autonomy.Engine
+	// pendingAutonomyGrant holds the autonomy decision trace that is awaiting
+	// a human capability grant (ask_user with missing mutation capability). The
+	// /grant command consumes it: it issues the missing capabilities, re-runs
+	// the decision and executes the decided workspace — the "one approval, no
+	// repeated approvals" guarantee. Nil when no grant request is outstanding.
+	pendingAutonomyGrant *autonomy.Trace
 
 	// Patch engine: 4-tier pipeline (Tier 1 structured diff -> Tier 2
 	// SEARCH/REPLACE -> Tier 3 whole-file -> Tier 4 human approval) replacing

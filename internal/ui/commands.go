@@ -363,13 +363,44 @@ func (m *model) handleInput(line string) tea.Cmd {
 	m.sess.AddMessage("user", line, 5)
 	_ = m.sess.Save()
 
-	// ── UNIFIED INTENT GATEWAY (execution-driven runtime) ──────────────
-	// Every remaining execution-bearing input — bare text, $prompt, $hot —
-	// produces an ExecuteRequest through the unified IntentGateway. The
-	// runtime (RuntimeExecutor) decides the execution path via unconditional
-	// Strategy.Select: never the UI, never a mode transition, never a hidden
-	// /build invocation. The UI renders the canonical runtime events and the
-	// returned result.
+// ── HYBRID INTENT GATEWAY ────────────────────────────────────────
+	// Free-form input (no explicit mode shorthand, no command, no shell) goes
+	// through the Hybrid Intent Gateway: the deterministic fast path first, then
+	// the semantic IntentClassifier when no deterministic signal matches. The
+	// classified intent is projected onto the current phase (auto mode switch),
+	// or — at low confidence (ConfirmationRequirement) — surfaced as an
+	// interactive mode-selection prompt instead of acting on a blind guess.
+	// The route runs async because the semantic fallback may invoke the LLM.
+	//
+	// ── /ask MODE LOCK: Direct Read-Only Chat boundary ───────────────
+	// /ask is a strict read-only chat boundary. The ONLY valid sub-prompt
+	// is $prompt (handled above). Free-form input in /ask MUST NEVER route
+	// through the intent classifier — the classifier can misclassify natural
+	// questions as /plan, /investigate, or /build and auto-switch modes,
+	// violating the Direct Chat contract. Bypass the router entirely.
+	//
+	// When the autonomy decision runtime is wired, free-form input flows
+	// through it in ANY workspace (including /ask): the runtime classifies
+	// conversation directly (no workspace switch, no execution) and routes
+	// meaningful requests to their capability-driven workspace. This replaces
+	// the mode-first router as the decision layer.
+	if m.autonomy != nil {
+		return m.routeFreeInput(line)
+	}
+	return m.runGatedLine(line)
+}
+
+// routeFreeInput dispatches a free-form prompt through the autonomy runtime
+// when it is wired: the runtime classifies intent, resolves capabilities,
+// evaluates risk and selects the workspace — conversation answers directly,
+// meaningful requests execute in the decided workspace. When the decision
+// runtime is not wired (headless/test harnesses), the input falls through to
+// the unified IntentGateway (RuntimeExecutor), which selects the execution
+// path deterministically; the UI never decides the path.
+func (m *model) routeFreeInput(line string) tea.Cmd {
+	if m.autonomy != nil {
+		return m.runAutonomyRoutedCmd(line)
+	}
 	return m.runGatedLine(line)
 }
 

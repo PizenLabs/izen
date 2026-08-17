@@ -131,6 +131,12 @@ func NewAutonomyLoopPreview(i autonomy.Intent) []string {
 // handleAutonomyGrant implements the /grant command: it issues a session
 // capability grant for the engine scope so the runtime may loop inside the
 // boundary without repeated approvals.
+//
+// When a pending autonomy grant request exists (a decision that halted at
+// ask_user because the mutation capability was missing), /grant consumes it:
+// it issues exactly the missing capabilities, re-runs the decision (which now
+// auto-continues) and executes the decided workspace — the "one approval, no
+// repeated approvals" guarantee.
 func (m *model) handleAutonomyGrant(content string) tea.Cmd {
 	if m.autonomy == nil {
 		m.push(roleError, "[autonomy] decision runtime not wired")
@@ -138,6 +144,26 @@ func (m *model) handleAutonomyGrant(content string) tea.Cmd {
 		m.Viewport.GotoBottom()
 		return nil
 	}
+
+	if m.pendingAutonomyGrant != nil {
+		pending := *m.pendingAutonomyGrant
+		m.pendingAutonomyGrant = nil
+		caps := pending.Decision.Missing
+		if len(caps) == 0 {
+			caps = autonomy.CapabilitySet{autonomy.CapMutate}
+		}
+		g := m.autonomy.GrantDefault(caps...)
+		m.push(roleStatus, fmt.Sprintf(
+			"%s Capability granted: %s\n  scope: %s\n%s\n%s",
+			greenStyle.Render("✓"), strings.Join(capNames(g.Capabilities), " + "), g.Scope,
+			strings.Join(g.Permissions(), "\n"),
+			mutedStyle.Render("The runtime may now inspect, plan, patch and verify inside this boundary without asking again."),
+		))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m.dispatchAutonomyTrace(m.autonomy.Decide(pending.Input))
+	}
+
 	// Grant the full BUILD capability vector (the only domain that may mutate).
 	// The grant is scoped to the engine scope (workspace root) and persists for
 	// the session — one approval, many actions.

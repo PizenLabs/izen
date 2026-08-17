@@ -102,6 +102,35 @@ func (a ArtifactContext) Evidence() []Finding {
 	return a.Findings
 }
 
+// FormatEvidenceLedger renders the compiled structural understanding as a
+// compact Context Evidence Ledger — the deterministic evidence the runtime
+// hands the model BEFORE it is asked to interpret, diagnose or propose. The
+// model never discovers structural facts on its own; it reasons over this
+// ledger. The output stays under ~100 tokens so it fits any model budget.
+func (a ArtifactContext) FormatEvidenceLedger() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Context Evidence Ledger\nTarget: %s\n", a.Path)
+	ev := a.Evidence()
+	if len(ev) == 0 {
+		b.WriteString("Structural findings: none\n")
+		return strings.TrimSpace(b.String())
+	}
+	b.WriteString("Structural findings:\n")
+	limit := 8
+	for i, f := range ev {
+		if i >= limit {
+			b.WriteString("* ... more findings omitted\n")
+			break
+		}
+		line := ""
+		if f.Line > 0 {
+			line = fmt.Sprintf(" at line %d", f.Line)
+		}
+		fmt.Fprintf(&b, "* %s%s — %s\n", f.Type, line, truncateForContext(f.Detail, 80))
+	}
+	return strings.TrimSpace(b.String())
+}
+
 // KindOf infers the artifact kind from its file extension.
 func KindOf(path string) ArtifactKind {
 	switch strings.ToLower(filepath.Ext(path)) {

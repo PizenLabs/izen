@@ -255,5 +255,28 @@ func hasDirective(ast *parser.IntentAST, name string) bool {
 // execution path; the UI never routes by mode, never triggers a hidden /build,
 // and never invokes a provider here.
 func (m *model) routePromptDirective(rawInput string) tea.Cmd {
+	m.cancelStaleAgentOps()
+	rawInput = strings.TrimSpace(rawInput)
+	if rawInput == "" {
+		m.push(roleError, "[Usage] $prompt <your raw architectural idea or description>")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+
+	// ── AUTONOMY ACTIVATION BOUNDARY ───────────────────────────────────
+	// $prompt <human objective> means "enter autonomous problem-solving
+	// runtime". The objective flows through the autonomy runtime — intent
+	// classification, capability resolution, risk evaluation, autonomy
+	// controller, workspace selection — and only THEN executes. The runtime
+	// decides the workspace; the user never manually selects one.
+	//
+	// When the decision runtime is not wired (headless/test harnesses), the
+	// unified IntentGateway fallback preserves the engine-first behavior: the
+	// runtime (RuntimeExecutor) still decides the execution path.
+	if m.autonomy != nil {
+		return m.runAutonomyRoutedCmd(rawInput)
+	}
+
 	return m.runPromptExecution(rawInput)
 }
