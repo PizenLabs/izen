@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/execution"
-	"github.com/PizenLabs/izen/internal/router"
 )
 
 // ── Interaction-surface lifecycle (Phase 5) ──────────────────────────────────
@@ -144,11 +143,6 @@ func (m *model) resetTransientInteraction() {
 	m.pendingHotfixPatch = nil
 	m.hotfixCandidatesMode = false
 	m.appliedHotfixFile = ""
-	m.pendingRouteConfirm = false
-	m.pendingRouteInput = ""
-	m.pendingRouteResult = router.ClassificationResult{}
-	m.pendingRouteOptions = nil
-	m.pendingRouteIdx = 0
 	m.clearAutonomyProposal()
 	m.currentBuildTaskID = 0
 	m.pendingTestConfirm = false
@@ -262,11 +256,6 @@ func (m *model) discardPendingAction() {
 	// Discard the multi-file execution graph (Phase 9B). The MutationSet it
 	// owned was rolled back above.
 	m.activeGraph = nil
-	m.pendingRouteConfirm = false
-	m.pendingRouteInput = ""
-	m.pendingRouteResult = router.ClassificationResult{}
-	m.pendingRouteOptions = nil
-	m.pendingRouteIdx = 0
 	m.clearAutonomyProposal()
 	m.pendingTestConfirm = false
 	m.pendingTestTarget = ""

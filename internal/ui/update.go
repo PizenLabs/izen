@@ -1192,11 +1192,6 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					}
 				}
 			}
-			// ── STRATEGY GRAPH (Phase 11) ────────────────────────────
-			// The build failed and rolled the owning MutationSet back: the
-			// compiled execution graph records the failed mutation terminal.
-			m.recordStrategyGraphMutation(false)
-
 			// ── CLEAR DIALOG BUFFER ON TASK FAILURE ────────────────
 			// Wipe the LLM conversation history so the next diagnostic
 			// or restart prompt starts with a clean context scope, never

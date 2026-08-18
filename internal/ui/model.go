@@ -45,7 +45,6 @@ import (
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 	riview "github.com/PizenLabs/izen/internal/review"
-	"github.com/PizenLabs/izen/internal/router"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
@@ -838,17 +837,6 @@ type model struct {
 	pendingProposals     []SemanticProposal
 	acceptAll            bool
 
-	// Hybrid-intent-gateway confirmation: when the router classifies a
-	// free-form prompt with confidence below the threshold
-	// (ConfirmationRequirement), the UI freezes in StateAwaitingApproval and
-	// presents an interactive mode-selection prompt instead of acting on a
-	// blind guess. pendingRouteIdx is the highlighted option index.
-	pendingRouteConfirm bool
-	pendingRouteInput   string
-	pendingRouteResult  router.ClassificationResult
-	pendingRouteOptions []modes.Mode
-	pendingRouteIdx     int
-
 	// Accepted proposals (collapsed single-line summaries)
 	acceptedProposals []acceptedProposal
 
@@ -1331,14 +1319,6 @@ type model struct {
 	// Every item names its owner, source and reason for inclusion; $inspect
 	// renders it so context ownership is observable and auditable.
 	lastContextEnvelope strategy.ContextEnvelope
-	// lastStrategyGraph is the compiled explicit execution graph of the most
-	// recent engine-first $prompt (Phase 11). It is the typed node sequence
-	// (resolve_target → … → verify) compiled deterministically from the
-	// selected strategy BEFORE any model invocation; the runtime records node
-	// states as execution reaches real boundaries. $inspect renders it so the
-	// intended and executed execution are both answerable. Written and read on
-	// the UI goroutine only.
-	lastStrategyGraph *strategy.ExecutionGraph
 	// activeStrategyBudget is the adaptive output budget the engine-first
 	// router selected for the currently dispatched targeted mutation. Zero
 	// means "use the default bounded budget". It is cleared when the mutation
@@ -2227,7 +2207,7 @@ func (m *model) unwindBuildFailure() {
 	m.pendingHotfixPatch = nil
 	m.hotfixCandidatesMode = false
 	m.acceptAll = false
-	m.pendingRouteConfirm = false
+
 	m.clearAutonomyProposal()
 	if m.workflowSM != nil {
 		// From StateBuilding/StateFailed/StateRepairing the canonical exit is
@@ -2297,7 +2277,7 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	m.pendingHotfixPatch = nil
 	m.hotfixCandidatesMode = false
 	m.acceptAll = false
-	m.pendingRouteConfirm = false
+
 	m.clearAutonomyProposal()
 	if m.toolCallBuffer != nil {
 		m.toolCallBuffer.Reject()
