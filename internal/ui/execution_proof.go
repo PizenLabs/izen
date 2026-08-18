@@ -4,8 +4,6 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/execution"
-	"github.com/PizenLabs/izen/internal/hotfix"
-	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
 // ── PHASE 8 — CONTEXT ECONOMY & EXECUTION PROOF ─────────────────────────────
@@ -64,40 +62,6 @@ type PromptEnvelope struct {
 	TotalInputTokens int
 }
 
-// hotfixPromptEnvelope builds the context-ownership account for a $hot request
-// from the same deterministic inputs the handoff builders consume. It is pure
-// and race-free: callers embed the value into the terminal message.
-func hotfixPromptEnvelope(opID, directive string, task *plan.Task, orig string, contract hotfixContract, tgt *hotfix.Target) PromptEnvelope {
-	env := PromptEnvelope{
-		OperationID:      opID,
-		Directive:        directive,
-		Target:           taskTarget(task),
-		UserIntent:       taskDescription(task),
-		SystemContext:    hotfixSystemPrompt(contract),
-		WorkspaceContext: "",
-		HistoryContext:   "",
-		ToolContext:      "",
-		TotalInputTokens: 0, // UNKNOWN until the provider reports usage.
-	}
-	if tgt != nil {
-		// Targeted handoff: ONLY the resolved block crosses to the model — the
-		// entire file never does. Structural context names the defect.
-		env.FileContext = tgt.Block
-		env.StructuralContext = tgt.Mismatch.Describe()
-		return env
-	}
-	switch contract {
-	case contractReplaceFile:
-		// New / empty file: no reference content is needed.
-		env.FileContext = ""
-	case contractReplaceBlock:
-		// Snippet contract: the full (small) file is the reference context the
-		// model needs to locate the mutation. It is embedded exactly once.
-		env.FileContext = orig
-	}
-	return env
-}
-
 // FileContextCount returns how many times the target file's content appears in
 // the request context. A single explicit file must yield exactly ONE file
 // context unless duplication is explicitly required.
@@ -118,20 +82,6 @@ func (e PromptEnvelope) HasUnrelatedRepositoryContext() bool {
 // replayed to the provider.
 func (e PromptEnvelope) HasConversationHistory() bool {
 	return e.HistoryContext != ""
-}
-
-func taskTarget(t *plan.Task) string {
-	if t == nil {
-		return ""
-	}
-	return t.Target
-}
-
-func taskDescription(t *plan.Task) string {
-	if t == nil {
-		return ""
-	}
-	return t.Description
 }
 
 // renderPromptEnvelope renders the context-ownership account as a compact
@@ -265,37 +215,6 @@ func (p ExecutionProof) Successful() bool {
 	return p.ApplyExecuted && p.FilesystemChanged
 }
 
-// recordHotfixProposalProof captures the generation-phase facts of a $hot
-// operation at the terminal proposal message. It runs on the UI goroutine
-// after the generation operation finalized (so lastExecutionSnapshot is the
-// generation telemetry): the authoritative invocation count folds with the
-// provider-reported usage and the real artifact/diff presence. Apply facts are
-// merged later by completeHotfixProof at the apply terminal.
-func (m *model) recordHotfixProposalProof(target string, artifactPresent, diffPresent bool, inputUsage, outputUsage int) {
-	m.lastExecutionProof = ExecutionProof{
-		OperationID:         m.lastExecutionSnapshot.OpID,
-		Target:              target,
-		ProviderInvocations: m.lastExecutionSnapshot.Invocations,
-		InputUsage:          inputUsage,
-		OutputUsage:         outputUsage,
-		ArtifactPresent:     artifactPresent,
-		DiffPresent:         diffPresent,
-		Strategy:            string(m.lastExecutionStrategy.Strategy),
-	}
-}
-
-// completeHotfixProof merges the apply-phase facts into the retained proof at
-// the hotfix apply terminal. A mutation is only successful when the apply ran
-// against the filesystem AND the resulting state changed; verification passed
-// only when the deterministic post-apply gate reported success.
-func (m *model) completeHotfixProof(applied, verifyPassed bool) {
-	p := m.lastExecutionProof
-	p.ApplyExecuted = applied
-	p.FilesystemChanged = applied
-	p.VerificationPassed = verifyPassed
-	m.lastExecutionProof = p
-}
-
 // renderExecutionProof renders the execution-evidence account as a compact
 // $inspect section. A multi-file proof renders the aggregate plus every node's
 // per-target evidence.
@@ -346,33 +265,6 @@ func boolWord(b bool) string {
 	return "no"
 }
 
-// recordMultiHotfixProposalProof captures the Phase A (prepare) facts of a
-// multi-file hotfix at the proposal terminal: the authoritative invocation
-// count from the telemetry snapshot, the AGGREGATE provider usage of every
-// node, and the per-node artifact/diff presence.
-func (m *model) recordMultiHotfixProposalProof(msg multiHotfixProposalMsg) {
-	if msg.Graph == nil {
-		return
-	}
-	p := ExecutionProof{
-		OperationID:         m.lastExecutionSnapshot.OpID,
-		ProviderInvocations: m.lastExecutionSnapshot.Invocations,
-		InputUsage:          msg.TokenInput,
-		OutputUsage:         msg.TokenOutput,
-		Targets:             msg.Graph.Targets(),
-		Strategy:            string(m.lastExecutionStrategy.Strategy),
-	}
-	for _, n := range msg.Graph.Nodes {
-		p.Nodes = append(p.Nodes, NodeProof{
-			Target:          n.Target,
-			ArtifactPresent: n.Evidence.ArtifactPresent,
-			DiffPresent:     n.Evidence.DiffPresent,
-			Outcome:         string(n.Evidence.Outcome),
-		})
-	}
-	m.lastExecutionProof = p
-}
-
 // recordRuntimeProof retains the runtime-owned execution evidence of a gated
 // RuntimeExecutor execution for $inspect: the authoritative ExecutionProof
 // (strategy, targets, invocations, usage, apply/verify evidence) and the full
@@ -420,36 +312,4 @@ func (m *model) recordRuntimeProof(res *execution.ExecutionResult) {
 		RolledBack:          pr.Outcome == execution.OutcomeApplyFailed || pr.Outcome == execution.OutcomeVerifyFailed,
 		FailureNode:         failureNode,
 	}
-}
-
-// completeMultiHotfixProof merges the apply-phase facts into the retained
-// proof at the multi-file hotfix apply terminal. The aggregate outcome is the
-// MutationSet terminal state: committed only when every node applied and
-// verified; rolled back otherwise — never a per-file success claim.
-func (m *model) completeMultiHotfixProof(success bool, graph *execution.ExecutionGraph) {
-	p := m.lastExecutionProof
-	if graph != nil {
-		p.Targets = graph.Targets()
-		p.MutationSetState = string(graph.State)
-		p.RolledBack = graph.State == execution.GraphRolledBack ||
-			graph.State == execution.GraphFailed ||
-			graph.State == execution.GraphCancelled
-		p.FailureNode = graph.FirstFailedNode()
-		p.ApplyExecuted = success
-		p.FilesystemChanged = success
-		p.VerificationPassed = success
-		p.Nodes = nil
-		for _, n := range graph.Nodes {
-			p.Nodes = append(p.Nodes, NodeProof{
-				Target:             n.Target,
-				ArtifactPresent:    n.Evidence.ArtifactPresent,
-				DiffPresent:        n.Evidence.DiffPresent,
-				ApplyExecuted:      n.Evidence.ApplyExecuted,
-				FilesystemChanged:  n.Evidence.FilesystemChanged,
-				VerificationPassed: n.Evidence.VerificationPassed,
-				Outcome:            string(n.Evidence.Outcome),
-			})
-		}
-	}
-	m.lastExecutionProof = p
 }

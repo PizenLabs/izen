@@ -3,8 +3,6 @@ package build
 import (
 	"fmt"
 	"strings"
-
-	izenctx "github.com/PizenLabs/izen/internal/context"
 )
 
 // MutationRecord describes a single file mutation committed by /build.
@@ -71,72 +69,4 @@ func RenderExecutionSummary(s ExecutionSummary) string {
 	fmt.Fprintf(&b, "- **Guardrail Status:** %s (%d/%d mutations)\n", guardrail, count, limit)
 
 	return b.String()
-}
-
-// SetLedger attaches the shared plan ledger used to flag tasks Completed after
-// a successful commit.
-func (e *Engine) SetLedger(l *izenctx.TaskLedger) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.ledger = l
-}
-
-// SetContextID scopes build mutations for the guardrail audit log.
-func (e *Engine) SetContextID(id string) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.contextID = id
-}
-
-// RenderExecutionSummary returns the Markdown summary of the most recent
-// successful patch commit. It is the post-execution hook the /build loop
-// invokes once a patch transaction completes — kept non-blocking and silent so
-// active execution stays fast.
-func (e *Engine) RenderExecutionSummary() string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.lastSummary
-}
-
-// RecordPatch is the post-commit hook: it marks the associated plan task as
-// Completed in the shared ledger (when a task id is supplied) and renders the
-// execution summary, storing it for RenderExecutionSummary.
-func (e *Engine) RecordPatch(taskID int, file, strategy string) ExecutionSummary {
-	e.mu.Lock()
-	e.applied++
-	count := e.applied
-	e.mu.Unlock()
-
-	if taskID > 0 {
-		if l := e.ledgerForRead(); l != nil {
-			l.MarkCompleted(taskID)
-		}
-	}
-
-	summary := ExecutionSummary{
-		Success:        true,
-		Mutations:      []MutationRecord{{File: file, Strategy: strategy}},
-		ContextID:      e.contextIDForRead(),
-		GuardrailPass:  true,
-		GuardrailCount: count,
-		GuardrailLimit: buildGuardrailLimit,
-	}
-	e.mu.Lock()
-	e.lastSummary = RenderExecutionSummary(summary)
-	e.mu.Unlock()
-	return summary
-}
-
-const buildGuardrailLimit = 3
-
-func (e *Engine) ledgerForRead() *izenctx.TaskLedger {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.ledger
-}
-
-func (e *Engine) contextIDForRead() string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.contextID
 }

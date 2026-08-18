@@ -63,7 +63,6 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 		return func() tea.Msg { return gatedExecutionMsg{det: det, err: gateErr} }
 	}
 	m.lastExecutionStrategy = det.Profile
-	m.lastStrategyGraph = nil
 	m.hotfixBranding = "PROMPT"
 	// Mode is a presentation label only — never an execution-path decision.
 	req.Mode = m.resolver.Current().String()

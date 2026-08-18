@@ -136,9 +136,14 @@ func TestAskPlanBuildFlow(t *testing.T) {
 		t.Errorf("ledger plan task count = %d, want 0 (no fake plan)", snap.Plan.TaskCount)
 	}
 	// Two approval attempts were truthfully rejected (no pending mutations), so
-	// the ledger records two failures — never a fabricated success.
-	if len(snap.Failures) != 2 {
-		t.Errorf("ledger failures = %d, want 2 (the two rejected approval attempts)", len(snap.Failures))
+	// the ledger records two failures — never a fabricated success. Delivery is
+	// asynchronous (the ledger subscribes to the bus's dispatch goroutines), so
+	// poll for the projection to catch up rather than snapshotting immediately.
+	ledgerCaughtUp := waitFor(2*time.Second, func() bool {
+		return len(app.Ledger.Snapshot().Failures) == 2
+	})
+	if !ledgerCaughtUp {
+		t.Errorf("ledger failures = %d, want 2 (the two rejected approval attempts)", len(app.Ledger.Snapshot().Failures))
 	}
 }
 

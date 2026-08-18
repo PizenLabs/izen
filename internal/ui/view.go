@@ -302,13 +302,6 @@ func (m *model) renderProposalBlock() string {
 		mr := &MutationRenderer{Width: width, ScrollOffset: m.proposalDiffOffset}
 		b.WriteString(mr.Render(vm))
 
-	case StateHotfixAmbiguous:
-		// ── $hot Ambiguity Resolution Card ─────────────────────────
-		// The target-confidence boundary paused the request: no patch exists,
-		// so Accept/Reject are never rendered. The card offers Clarify target,
-		// read-only candidate inspection, and Cancel.
-		b.WriteString(m.renderHotfixAmbiguousBlock(width))
-
 	case StateProcessing:
 		// ── Truthful in-flight mutation dock ───────────────────────
 		// Derived from the authoritative execution stage: the dock shows what

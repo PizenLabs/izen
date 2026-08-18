@@ -45,7 +45,7 @@ func numStr(i int) string {
 // target from @index.html, classifies intent as modification, selects the BUILD
 // workspace, and — when mutation authorization is missing — renders ONE
 // autonomy proposal. Executing the proposal issues the internal grant and
-// continues into the hotfix pipeline WITHOUT a second /build command.
+// continues on the RuntimeExecutor WITHOUT a second /build command.
 func TestBuildHotAutonomyExecution(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
@@ -57,7 +57,13 @@ func TestBuildHotAutonomyExecution(t *testing.T) {
 	m.resolver.Set(modes.ModeAsk)
 	m.autonomy = autonomy.NewEngine(autonomy.WithScope("repository"))
 	m.execEng = execution.NewEngine(".", m.cfg, m.sess)
-	m.provider = &mockProvider{responses: []*ai.Response{{Content: "x", TokenOutput: 10}}}
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n<p>Keep this meaningful section number 1.</p>\n=======\n<p>Kept.</p>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
+	m.provider = mock
+	m.gateway = execution.NewIntentGateway(".")
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, mock, nil, "")
 	m.state = StateChat
 	m.awaitingConfirmation = false
 	m.pendingProposals = nil
@@ -119,21 +125,32 @@ func TestBuildHotAutonomyExecution(t *testing.T) {
 		t.Error("authority must hold after the internal grant")
 	}
 
-	// The hotfix pipeline dispatches on the SAME objective — no second /build.
-	logged := recordsText(m2)
-	if !strings.Contains(logged, "[HOTFIX] Urgent hotfix: check and remove redundant content @index.html") {
-		t.Errorf("hotfix pipeline must dispatch on the resolved objective:\n%s", logged)
+	// The hotfix continues on the RuntimeExecutor with the SAME objective — no
+	// second /build — and stops at the executor approval gate.
+	msg := executeCmd()
+	gem, ok := msg.(gatedExecutionMsg)
+	if !ok {
+		t.Fatalf("hotfix must route through the executor (gatedExecutionMsg), got %T", msg)
+	}
+	if gem.err != nil {
+		t.Fatalf("executor failed: %v", gem.err)
+	}
+	if gem.res == nil || gem.res.PendingPatchID == "" {
+		t.Fatal("hotfix must stop at the executor approval gate with a held patch")
+	}
+	if len(gem.res.Targets) == 0 || gem.res.Targets[0] != "index.html" {
+		t.Errorf("hotfix target = %v, want index.html", gem.res.Targets)
 	}
 	// Requirement 5/4: ambiguity is a decision, never a dead end — the
 	// "Target is ambiguous. No model call was made." collapse must not occur.
-	if strings.Contains(logged, "Target is ambiguous") {
-		t.Errorf("redundancy-resolved hotfix must not dead-end on ambiguity:\n%s", logged)
+	if strings.Contains(recordsText(m2), "Target is ambiguous") {
+		t.Errorf("redundancy-resolved hotfix must not dead-end on ambiguity:\n%s", recordsText(m2))
 	}
 }
 
 // TestBuildHotAutonomyAutoContinue pins that a /build$hot execution request
-// with mutation already authorized auto-continues directly into the hotfix
-// pipeline — no proposal, no second /build (requirement 4/6).
+// with mutation already authorized auto-continues directly into the
+// RuntimeExecutor — no proposal, no second /build (requirement 4/6).
 func TestBuildHotAutonomyAutoContinue(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
@@ -146,7 +163,13 @@ func TestBuildHotAutonomyAutoContinue(t *testing.T) {
 	m.autonomy = autonomy.NewEngine(autonomy.WithScope("repository"))
 	m.autonomy.GrantDefault(autonomy.CapRead, autonomy.CapAnalyze, autonomy.CapPropose, autonomy.CapMutate, autonomy.CapVerify)
 	m.execEng = execution.NewEngine(".", m.cfg, m.sess)
-	m.provider = &mockProvider{responses: []*ai.Response{{Content: "x", TokenOutput: 10}}}
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n<p>Keep this meaningful section number 1.</p>\n=======\n<p>Kept.</p>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
+	m.provider = mock
+	m.gateway = execution.NewIntentGateway(".")
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, mock, nil, "")
 	m.state = StateChat
 	m.awaitingConfirmation = false
 	m.pendingProposals = nil
@@ -163,9 +186,16 @@ func TestBuildHotAutonomyAutoContinue(t *testing.T) {
 	if got := m.resolver.Current(); got != modes.ModeBuild {
 		t.Fatalf("workspace = /%s, want /build", got)
 	}
-	logged := recordsText(m)
-	if !strings.Contains(logged, "[HOTFIX] Urgent hotfix:") {
-		t.Errorf("hotfix pipeline must dispatch without a second command:\n%s", logged)
+	msg := cmd()
+	gem, ok := msg.(gatedExecutionMsg)
+	if !ok {
+		t.Fatalf("authorized hotfix must route through the executor (gatedExecutionMsg), got %T", msg)
+	}
+	if gem.err != nil {
+		t.Fatalf("executor failed: %v", gem.err)
+	}
+	if gem.res == nil || gem.res.PendingPatchID == "" {
+		t.Fatal("authorized hotfix must stop at the executor approval gate")
 	}
 }
 
@@ -184,7 +214,13 @@ func TestAutonomyModificationProposalRedundancyEvidence(t *testing.T) {
 	m.autonomy = autonomy.NewEngine(autonomy.WithScope("repository"))
 	m.autonomy.GrantDefault(autonomy.CapRead, autonomy.CapAnalyze, autonomy.CapPropose, autonomy.CapMutate, autonomy.CapVerify)
 	m.execEng = execution.NewEngine(".", m.cfg, m.sess)
-	m.provider = &mockProvider{responses: []*ai.Response{{Content: "x", TokenOutput: 10}}}
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n<p>Keep this meaningful section number 1.</p>\n=======\n<p>Kept.</p>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
+	m.provider = mock
+	m.gateway = execution.NewIntentGateway(".")
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, mock, nil, "")
 	m.state = StateChat
 	m.awaitingConfirmation = false
 	m.pendingProposals = nil
@@ -198,33 +234,30 @@ func TestAutonomyModificationProposalRedundancyEvidence(t *testing.T) {
 	if m.pendingAutonomyProposal != nil {
 		t.Fatal("authorized mutation must not render a proposal")
 	}
-	logged := recordsText(m)
-	if !strings.Contains(logged, "[HOTFIX] Urgent hotfix:") {
-		t.Errorf("hotfix pipeline must dispatch:\n%s", logged)
+	msg := cmd()
+	gem, ok := msg.(gatedExecutionMsg)
+	if !ok {
+		t.Fatalf("authorized hotfix must route through the executor (gatedExecutionMsg), got %T", msg)
 	}
-	// The redundancy decision is deterministic: orphan text + duplicate blocks.
-	orig, _ := os.ReadFile("index.html")
-	dec := classifyHotfixAmbiguity("check @index.html and remove redundant content", "index.html", string(orig))
-	if dec.ambiguous {
-		t.Fatal("redundancy-resolved hotfix must not be ambiguous")
+	if gem.err != nil {
+		t.Fatalf("executor failed: %v", gem.err)
 	}
-	if len(dec.redundant) == 0 {
-		t.Fatal("redundancy resolution must produce deterministic evidence")
+	if gem.res == nil || gem.res.PendingPatchID == "" {
+		t.Fatal("authorized hotfix must stop at the executor approval gate")
 	}
-	foundOrphan := false
-	foundDup := false
-	for _, r := range dec.redundant {
-		switch r.Kind {
-		case "orphan_text":
-			foundOrphan = true
-		case "duplicate_block":
-			foundDup = true
+	// The runtime owns the deterministic redundancy classification; the UI
+	// never re-classifies the request after the executor resolved it. The
+	// deterministic evidence ledger crosses into the model as the
+	// authoritative evidence contract.
+	evidenceInPrompt := false
+	for _, r := range mock.requests {
+		for _, m := range r.Messages {
+			if strings.Contains(m.Content, "Context Evidence Ledger") {
+				evidenceInPrompt = true
+			}
 		}
 	}
-	if !foundOrphan {
-		t.Error("evidence must include the orphan text finding")
-	}
-	if !foundDup {
-		t.Error("evidence must include the duplicate-block finding")
+	if !evidenceInPrompt {
+		t.Error("mutation prompt must carry the deterministic redundancy evidence ledger")
 	}
 }

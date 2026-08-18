@@ -117,51 +117,32 @@ func TestSpinnerTickInStateChat(t *testing.T) {
 	}
 }
 
-// ── Test 2: streamDoneMsg → StateAwaitingApproval ────────────────────────
+// ── Test 2: streamDoneMsg ────────────────────────────────────────────────
+// The RuntimeExecutor owns the mutation apply authority. The legacy chat
+// stream (streamDoneMsg) is a read-only conversational path; it does not
+// fabricate a UI-owned mutation proposal on the authoritative path.
 
-func TestStreamDoneMsgTransitionsToStateAwaitingApproval(t *testing.T) {
-	m := newTestModel()
-	m.state = StateChat
-	m.awaitingConfirmation = false
-	m.currentPrompt = "" // skip session persist path
-	m.currentStreamContent = "FILE: fix.go\n```go\npackage main\nfunc main() {}\n```"
-
-	newModel, cmd := m.Update(streamDoneMsg{
-		content:     m.currentStreamContent,
-		tokenInput:  10,
-		tokenOutput: 20,
-	})
-	m2 := newModel.(*model)
-
-	if len(m2.pendingProposals) == 0 {
-		t.Fatal("streamDoneMsg produced 0 proposals — extractBuildProposals may be failing")
-	}
-	if m2.state != StateAwaitingApproval {
-		t.Errorf("state = %v, want StateAwaitingApproval", m2.state)
-	}
-	if m2.awaitingConfirmation != true {
-		t.Error("awaitingConfirmation should be true after streamDoneMsg with proposals")
-	}
-	if m2.ti.Focused() {
-		t.Error("textinput should be blurred in StateAwaitingApproval")
-	}
-	_ = cmd // streamDoneMsg returns nil cmd by design
-}
-
-// ── Test 3: Key A → StateProcessing + apply command ──────────────────────
+// ── Test 3: Key A → executor approval dispatch ───────────────────────────
 
 func TestKeyAToAcceptProposal(t *testing.T) {
 	m := newTestModel()
+	m.state = StateAwaitingApproval
+	m.enterApprovalState()
+	m.pendingProposals = []SemanticProposal{{ID: "exec-1-patch-1", Target: SemanticTarget{QualifiedName: "x"}}}
 
+	// Alt+A issues the RuntimeExecutor approval command — the UI does not
+	// apply; it authorizes the boundary.
 	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}, Alt: true})
 	m2 := newModel.(*model)
 
-	if m2.state != StateProcessing {
-		t.Errorf("after 'alt+a': state = %v, want StateProcessing", m2.state)
-	}
 	if cmd == nil {
-		t.Fatal("after 'alt+a': cmd is nil — applySingleProposal not triggered")
+		t.Fatal("after 'alt+a': cmd is nil — executor approve not dispatched")
 	}
+	msg := cmd()
+	if _, ok := msg.(executionResultMsg); !ok {
+		t.Fatalf("after 'alt+a': got %T, want executionResultMsg (executor apply)", msg)
+	}
+	_ = m2
 }
 
 // ── Test 4: Key P toggle (BUG — broken without fix) ──────────────────────
@@ -391,17 +372,24 @@ func TestKeyAIsNoOpInHotfixApproval(t *testing.T) {
 
 func TestAltAStillWorksInProposalMode(t *testing.T) {
 	m := newTestModel()
+	m.state = StateAwaitingApproval
+	m.enterApprovalState()
+	m.executorPendingPatchID = "exec-1-patch-1"
+	m.pendingProposals = []SemanticProposal{{ID: "exec-1-patch-1", Target: SemanticTarget{QualifiedName: "x"}}}
 
-	// Press Alt+A — must still accept and transition to StateProcessing
+	// Press Alt+A — must issue the RuntimeExecutor approval command (the sole
+	// mutation apply authority), not a UI-owned apply.
 	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}, Alt: true})
 	m2 := newModel.(*model)
 
-	if m2.state != StateProcessing {
-		t.Errorf("Alt+A: state = %v, want StateProcessing", m2.state)
-	}
 	if cmd == nil {
-		t.Fatal("Alt+A: cmd is nil — applySingleProposal not triggered")
+		t.Fatal("Alt+A: cmd is nil — executor approve not dispatched")
 	}
+	msg := cmd()
+	if _, ok := msg.(executionResultMsg); !ok {
+		t.Fatalf("Alt+A: got %T, want executionResultMsg (executor apply)", msg)
+	}
+	_ = m2
 }
 
 func TestAltRStillWorksInProposalMode(t *testing.T) {
@@ -419,49 +407,6 @@ func TestAltRStillWorksInProposalMode(t *testing.T) {
 	}
 	if !m2.ti.Focused() {
 		t.Error("Alt+R: textinput should be focused after rejection")
-	}
-}
-
-// TestSanitizeFileOutputFences is the regression guard for the $hot markdown
-// fence bug: the file content cleanse must strip a wrapping code block (with or
-// without a language identifier) so literal triple backticks never reach disk.
-func TestSanitizeFileOutputFences(t *testing.T) {
-	cases := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{
-			name:  "mit fence",
-			input: "```mit\nMIT License\n\nCopyright (c) 2024\n```",
-			want:  "MIT License\n\nCopyright (c) 2024",
-		},
-		{
-			name:  "go fence",
-			input: "```go\npackage main\n\nfunc main() {}\n```",
-			want:  "package main\n\nfunc main() {}",
-		},
-		{
-			name:  "bare fence",
-			input: "```\nhello\n```",
-			want:  "hello",
-		},
-		{
-			name:  "no fence passthrough",
-			input: "MIT License\n\nCopyright (c) 2024",
-			want:  "MIT License\n\nCopyright (c) 2024",
-		},
-		{
-			name:  "surrounding whitespace trimmed",
-			input: "\n\n```text\npayload\n```\n\n",
-			want:  "payload",
-		},
-	}
-	for _, c := range cases {
-		got := sanitizeFileOutput(c.input)
-		if got != c.want {
-			t.Errorf("%s: sanitizeFileOutput =\n %q\nwant\n %q", c.name, got, c.want)
-		}
 	}
 }
 

@@ -164,12 +164,9 @@ func (m *model) activateAutonomyTarget() tea.Cmd {
 	m.push(roleStatus, fmt.Sprintf("[autonomy] target resolved: %s", selected))
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
-	// Phase 1 cutover: the selected candidate resumes on the RuntimeExecutor
-	// path when the flag is on — never the legacy build staging.
-	if runtimeExecutorEnabled() {
-		return m.executeAutonomyViaRuntime(trace)
-	}
-	return m.stageAutonomyBuild(trace, selected)
+	// The selected candidate resumes on the RuntimeExecutor path — never the
+	// legacy build staging.
+	return m.executeAutonomyViaRuntime(trace)
 }
 
 // cancelAutonomyTargetSelector abandons the ambiguous objective: no file is

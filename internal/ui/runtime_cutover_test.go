@@ -24,12 +24,14 @@ import (
 
 // ── Phase 1 cutover tests ─────────────────────────────────────────────────
 //
-// These tests pin the IZEN_RUNTIME_EXECUTOR rollback boundary:
-//   - flag ON  → autonomy-decided BUILD mutations route through RuntimeExecutor
-//     (Execute → approval gate → proposal dock), never the legacy build engine.
-//   - flag OFF → the legacy mode-engine path is preserved verbatim.
+// These tests pin the RuntimeExecutor authority boundary established during
+// the Phase 1 cutover and carried into Phase 3 (the IZEN_RUNTIME_EXECUTOR
+// feature flag was removed — the executor is the only production execution
+// path):
+//   - autonomy-decided BUILD mutations route through RuntimeExecutor
+//     (Execute → approval gate → proposal dock), never a legacy build engine.
 //
-// The flag is a migration mechanism, not a permanent execution mode.
+// The flag was a migration mechanism, not a permanent execution mode.
 
 // cutoverModel wires the full runtime composition surface a production TUI
 // exposes to an autonomy-decided mutation: autonomy runtime, IntentGateway,
@@ -59,12 +61,10 @@ func grantMutationCaps(m *model) {
 }
 
 // TestRuntimeCutoverFlagOnRoutesPromptMutationThroughExecutor is the core
-// Phase 1 cutover proof: with IZEN_RUNTIME_EXECUTOR=1 a $prompt mutation
-// crosses the RuntimeExecutor and stops at its approval gate with a held
-// patch (PendingPatchID + staged proposal) — the UI never calls a provider or
-// a PatchManager on this path.
+// Phase 1 cutover proof: a $prompt mutation crosses the RuntimeExecutor and
+// stops at its approval gate with a held patch (PendingPatchID + staged
+// proposal) — the UI never calls a provider or a PatchManager on this path.
 func TestRuntimeCutoverFlagOnRoutesPromptMutationThroughExecutor(t *testing.T) {
-	t.Setenv("IZEN_RUNTIME_EXECUTOR", "1")
 	writeIndexFixture(t)
 	fixed := "<!DOCTYPE html>\n<html>\n<body>\n  <h1>Home</h1>\n</body>\n</html>\n"
 	mock := &mockProvider{responses: []*ai.Response{{
@@ -160,34 +160,10 @@ func TestRuntimeCutoverFlagOnRoutesPromptMutationThroughExecutor(t *testing.T) {
 	}
 }
 
-// TestRuntimeCutoverFlagOffPreservesLegacyPath proves the rollback boundary:
-// with the flag unset (default) the same input routes through the legacy build
-// staging (planResultMsg) exactly as before the cutover.
-func TestRuntimeCutoverFlagOffPreservesLegacyPath(t *testing.T) {
-	writeIndexFixture(t)
-	mock := &mockProvider{responses: []*ai.Response{{Content: "ok", TokenOutput: 5}}}
-	m := cutoverModel(t, mock)
-	grantMutationCaps(m)
-
-	cmd := m.handleInput("$prompt read @index.html and remove redundant content")
-	if cmd == nil {
-		t.Fatal("flag-off granted mutation must dispatch the legacy builder")
-	}
-	msg := cmd()
-	prm, ok := msg.(planResultMsg)
-	if !ok {
-		t.Fatalf("flag-off must route through legacy build staging (planResultMsg), got %T", msg)
-	}
-	if len(prm.Tasks) == 0 || prm.Tasks[0].Target != "index.html" {
-		t.Fatalf("legacy staged build target = %+v, want index.html", prm.Tasks)
-	}
-}
-
 // TestRuntimeCutoverFlagOnRoutesHotThroughExecutor proves the fast-track/$hot
-// requirement: a $hot execution request under the flag routes through the
-// RuntimeExecutor (TargetedMutation), never a special legacy hotfix authority.
+// requirement: a $hot execution request routes through the RuntimeExecutor
+// (TargetedMutation), never a special legacy hotfix authority.
 func TestRuntimeCutoverFlagOnRoutesHotThroughExecutor(t *testing.T) {
-	t.Setenv("IZEN_RUNTIME_EXECUTOR", "1")
 	writeIndexFixture(t)
 	fixed := "<!DOCTYPE html>\n<html>\n<body>\n  <h1>Home</h1>\n</body>\n</html>\n"
 	mock := &mockProvider{responses: []*ai.Response{{
@@ -221,7 +197,6 @@ func TestRuntimeCutoverFlagOnRoutesHotThroughExecutor(t *testing.T) {
 // explicit on the cutover path: an unresolvable target surfaces the autonomy
 // target-not-found diagnosis before any provider call.
 func TestRuntimeCutoverFlagOnAmbiguousTargetStaysExplicit(t *testing.T) {
-	t.Setenv("IZEN_RUNTIME_EXECUTOR", "1")
 	dir := t.TempDir()
 	t.Chdir(dir)
 	if err := os.WriteFile("README.md", []byte("# repo\n"), 0o644); err != nil {
@@ -245,10 +220,8 @@ func TestRuntimeCutoverFlagOnAmbiguousTargetStaysExplicit(t *testing.T) {
 }
 
 // TestRuntimeCutoverFlagOnBuildCommandRoutesThroughExecutor proves the manual
-// /build command (staged FILE_MUTATE plan) routes through the executor when
-// the flag is on.
+// /build command (staged FILE_MUTATE plan) routes through the executor.
 func TestRuntimeCutoverFlagOnBuildCommandRoutesThroughExecutor(t *testing.T) {
-	t.Setenv("IZEN_RUNTIME_EXECUTOR", "1")
 	writeIndexFixture(t)
 	fixed := "<!DOCTYPE html>\n<html>\n<body>\n  <h1>Home</h1>\n</body>\n</html>\n"
 	mock := &mockProvider{responses: []*ai.Response{{
@@ -351,7 +324,6 @@ func (c *eventCollector) Stop() {
 // reported as a failure (never success), the mutation boundary is rolled back,
 // and the file is restored to its pre-mutation bytes.
 func TestRuntimeCutoverVerificationFailureIsNotSuccess(t *testing.T) {
-	t.Setenv("IZEN_RUNTIME_EXECUTOR", "1")
 	dir := t.TempDir()
 	t.Chdir(dir)
 	orig := "<!DOCTYPE html>\n<html>\n<body>\n  <h1>Home</h1>\n  <p>body</p>\n</body>\n</html>\n"
@@ -416,7 +388,6 @@ func TestRuntimeCutoverVerificationFailureIsNotSuccess(t *testing.T) {
 // that produces no usable mutation artifact yields an execution failure on the
 // cutover path — never a proposal staged for approval and never a success.
 func TestRuntimeCutoverEmptyArtifactIsFailure(t *testing.T) {
-	t.Setenv("IZEN_RUNTIME_EXECUTOR", "1")
 	writeIndexFixture(t)
 	mock := &mockProvider{responses: []*ai.Response{{
 		Content: "",
@@ -446,7 +417,6 @@ func TestRuntimeCutoverEmptyArtifactIsFailure(t *testing.T) {
 }
 
 func TestRuntimeCutoverApproveAppliesThroughExecutor(t *testing.T) {
-	t.Setenv("IZEN_RUNTIME_EXECUTOR", "1")
 	dir := t.TempDir()
 	t.Chdir(dir)
 	// A fixture whose mutation preserves the file size (≥80% of the original),

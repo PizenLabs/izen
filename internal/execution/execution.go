@@ -7,7 +7,6 @@ import (
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/language"
-	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/runtime/output"
 	"github.com/PizenLabs/izen/internal/session"
@@ -20,17 +19,12 @@ type Engine struct {
 	Checkpoints *CheckpointManager
 	ShadowCP    *checkpoint.Engine
 	Git         *git.Engine
-	PatchQueue  *PatchQueue
-	StreamMon   *StreamMonitor
 	PlanStore   *plan.PlanStore
 	root        string
 	langID      language.ID
 
-	Policy   *PolicyEngine
 	Risk     *RiskClassifier
 	Verifier *Verifier
-	Diff     *DiffAnalyzer
-	Pipeline *PipelineRunner
 	// Artifact is the V3 protocol-centric artifact pipeline (contract
 	// parsing, normalization, pluggable validation, failure policy and
 	// reasoning-leak telemetry). It is non-nil for every engine.
@@ -57,12 +51,6 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ..
 	c := NewCheckpointManager(root, sess)
 	sc := checkpoint.NewEngine(root)
 
-	pe := NewPolicyEngine(func() modes.Capability {
-		if sess != nil {
-			return sess.Mode.Capabilities()
-		}
-		return 0
-	})
 	rc := NewRiskClassifier()
 
 	var v *Verifier
@@ -74,8 +62,6 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ..
 		v = NewVerifier(root)
 	}
 
-	d := NewDiffAnalyzer()
-
 	e := &Engine{
 		Runner:      r,
 		Test:        t,
@@ -85,10 +71,8 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ..
 		Git:         git.NewEngine(root),
 		root:        root,
 		langID:      activeLangID,
-		Policy:      pe,
 		Risk:        rc,
 		Verifier:    v,
-		Diff:        d,
 		Artifact:    NewV3ArtifactPipeline(),
 	}
 	// The engine owns a fresh mutation boundary from construction. PatchManager
@@ -100,9 +84,6 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ..
 	// cutover P0#2: the verifier was constructed but never attached, so the
 	// production mutation path applied unverified.
 	p.SetVerifier(v)
-	e.PatchQueue = NewPatchQueue(root, e.Patches)
-	e.StreamMon = NewStreamMonitor(e.PatchQueue)
-	e.Pipeline = NewPipelineRunner(e)
 
 	r.SetRiskClassifier(rc)
 	sandboxMode := SandboxPolicy
@@ -147,40 +128,6 @@ func configureVerifier(v *Verifier, vc config.VerificationConfig) {
 
 func (e *Engine) Root() string {
 	return e.root
-}
-
-func (e *Engine) IsPatchStaged() bool {
-	return e.PatchQueue.IsStaged()
-}
-
-func (e *Engine) StagedPatches() []StagedPatch {
-	return e.PatchQueue.List()
-}
-
-func (e *Engine) ApplyNextPatch() error {
-	return e.PatchQueue.ApplyNext()
-}
-
-func (e *Engine) ApplyAllPatches() (int, error) {
-	return e.PatchQueue.ApplyAll()
-}
-
-func (e *Engine) RejectPatches() {
-	e.PatchQueue.Clear()
-}
-
-func (e *Engine) FeedStream(chunk string) {
-	e.StreamMon.Feed(chunk)
-}
-
-func (e *Engine) SetStreamContextFiles(files []string) {
-	e.StreamMon.SetContextFiles(files)
-	e.PatchQueue.SetContextFiles(files)
-}
-
-func (e *Engine) FlushStream() {
-	e.StreamMon.Flush()
-	e.StreamMon.Reset()
 }
 
 func (e *Engine) SetAuthorization(auth *authorization.MutationAuthorization) {

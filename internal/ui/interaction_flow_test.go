@@ -10,9 +10,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/execution"
-	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/modes"
-	"github.com/PizenLabs/izen/internal/modes/plan"
 )
 
 // ── PHASE 6: DIRECTIVE → ACTION → EXECUTION UX REGRESSION SUITE ───────────
@@ -167,34 +165,6 @@ func TestPhase6QuestionMarkTypesInsteadOfHelp(t *testing.T) {
 	}
 }
 
-func TestPhase6TypingDuringAmbiguityCardIsText(t *testing.T) {
-	m := readyChatModel(newTestModel())
-	res, _ := m.Update(ambiguousMsgFor("Remove extra text from @index.html", "index.html", nil))
-	m2 := res.(*model)
-	if m2.state != StateHotfixAmbiguous {
-		t.Fatalf("precondition: state = %v, want StateHotfixAmbiguous", m2.state)
-	}
-	if !m2.ti.Focused() {
-		t.Fatal("precondition: input must be focused while the ambiguity card renders")
-	}
-
-	// Typing "check" while the card is up must produce text in the input — a
-	// 'c' must NOT trigger Clarify, an 'x' must NOT trigger Cancel.
-	for _, r := range "check" {
-		res, _ = m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
-		m2 = res.(*model)
-	}
-	if got := m2.ti.Value(); got != "check" {
-		t.Fatalf("input value = %q, want %q — printable chars were hijacked by the card", got, "check")
-	}
-	if m2.pendingHotfixAmbiguous == nil {
-		t.Fatal("typing must not dismiss the ambiguity card")
-	}
-	if m2.state != StateHotfixAmbiguous {
-		t.Fatalf("state = %v, want StateHotfixAmbiguous while typing", m2.state)
-	}
-}
-
 // TestPhase6TestInBuildTransitionsToReview pins the general continuity rule:
 // a directive typed in a mode that is NOT one of its native contexts performs
 // the internal transition and continues. $test executes in /review or
@@ -237,63 +207,9 @@ func TestPhase6ResolvedTargetExecutesWithoutAmbiguityStop(t *testing.T) {
 	}
 }
 
-// ── 8. An ambiguous target stops with useful action chips ─────────────────
-
-func TestPhase6AmbiguousTargetStopsWithActionableChips(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "index.html")
-	if err := os.WriteFile(target, []byte(largeMismatchedIndexHTML()), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cands := hotfix.ResolveHTMLCandidates(largeMismatchedIndexHTML())
-	if len(cands) == 0 {
-		t.Fatal("fixture must yield deterministic candidates")
-	}
-
-	m := readyChatModel(newTestModel())
-	res, _ := m.Update(ambiguousMsgFor("Remove extra text from @index.html", target, cands))
-	m2 := res.(*model)
-	if m2.state != StateHotfixAmbiguous {
-		t.Fatalf("state = %v, want StateHotfixAmbiguous", m2.state)
-	}
-	view := m2.renderHotfixAmbiguousBlock(100)
-	// The card offers genuine next actions (inspect / cancel), not decoration.
-	for _, want := range []string{"Inspect candidates", "Cancel", "Clarify target"} {
-		if !strings.Contains(view, want) {
-			t.Errorf("ambiguity card missing actionable chip %q:\n%s", want, view)
-		}
-	}
-}
-
 // ── 9. A confirmation-required action stops correctly ─────────────────────
-
-func TestPhase6ConfirmationRequiredStopsAtApproval(t *testing.T) {
-	m := newHotfixBusyModel(t)
-
-	res, _ := m.Update(hotfixProposalMsg{
-		Task: &plan.Task{StepNum: 1, Type: "FILE_MUTATE", Target: "LICENSE"},
-		Patch: &execution.Patch{
-			ID:       "hotfix-1",
-			File:     "LICENSE",
-			Original: "old",
-			Modified: "new",
-		},
-		Diff: "--- a/LICENSE\n+++ b/LICENSE\n@@ -1 +1 @@\n-old\n+new\n",
-	})
-	m2 := res.(*model)
-	if m2.state != StateAwaitingApproval {
-		t.Fatalf("state = %v, want StateAwaitingApproval — the confirmation gate must hold", m2.state)
-	}
-	if len(m2.pendingProposals) == 0 {
-		t.Fatal("confirmation-required stop must stage the reviewable proposal")
-	}
-	// The stop is a clean pause, not a leaked worker: no transient execution
-	// flag remains spinning.
-	if m2.agentRunning || m2.reviewRunning || m2.streaming || m2.pipelineRunning {
-		t.Errorf("transient execution flags still set at the confirmation stop: %v/%v/%v/%v",
-			m2.agentRunning, m2.reviewRunning, m2.streaming, m2.pipelineRunning)
-	}
-}
+// (the executor approval gate holds the confirmation; the proposal dock stages
+// the reviewable diff — see runtime_cutover_test.go and gateway.go)
 
 // ── 10 + 11. Action chips disappear after execution / new input ───────────
 
@@ -335,37 +251,52 @@ func TestPhase6StaleChipsClearedOnNewInput(t *testing.T) {
 func TestPhase6CancelledOperationNotResumable(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "index.html")
-	if err := os.WriteFile(target, []byte(largeMismatchedIndexHTML()), 0o644); err != nil {
+	if err := os.WriteFile(target, []byte("<html><body><p>old</p></body></html>\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	mock := &mockProvider{responses: []*ai.Response{{Content: "x", TokenOutput: 10}}}
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n<p>old</p>\n=======\n<p>new</p>\n>>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true},
+	}}}
 	m := newTestModel()
 	m.provider = mock
-	res, _ := m.Update(ambiguousMsgFor("Remove extra text from @index.html", target, nil))
+	m.gateway = execution.NewIntentGateway(".")
+	m.executor = execution.NewRuntimeExecutor(".", m.cfg, mock, nil, "")
+	m.resolver.Set(modes.ModeBuild)
+
+	// Dispatch the mutation through the executor and stage it at the approval
+	// gate.
+	cmd := m.handleInput("$hot remove redundant content from @index.html")
+	if cmd == nil {
+		t.Fatal("granted hotfix must dispatch")
+	}
+	msg := cmd()
+	gem, ok := msg.(gatedExecutionMsg)
+	if !ok {
+		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
+	}
+	if gem.err != nil {
+		t.Fatalf("executor failed: %v", gem.err)
+	}
+	res, _ := m.Update(gem)
 	m2 := res.(*model)
 
-	// Cancel the ambiguous operation explicitly ([⌥X]).
-	res, _ = m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}, Alt: true})
+	// Reject the held proposal (Esc) — the operation terminates and releases
+	// ownership; no mutation is applied.
+	res, _ = m2.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
 	m3 := res.(*model)
-	if m3.pendingHotfixAmbiguous != nil {
-		t.Fatal("cancel must dismiss the ambiguity card")
+	if m3.executorPendingPatchID != "" {
+		t.Fatal("reject must clear the held patch")
 	}
 	if m3.activeOp != nil {
-		t.Fatal("cancel must release operation ownership")
+		t.Fatal("reject must release operation ownership")
 	}
-
-	// A subsequent idle keystroke (Enter on empty input) must NOT resume the
-	// cancelled operation.
-	res, _ = m3.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
-	m4 := res.(*model)
-	if m4.activeOp != nil {
-		t.Fatal("idle Enter resumed the cancelled operation")
+	onDisk, rerr := os.ReadFile(target)
+	if rerr != nil {
+		t.Fatal(rerr)
 	}
-	if mock.callCount != 0 {
-		t.Fatalf("provider invoked after cancel: %d calls", mock.callCount)
-	}
-	if m4.pendingHotfixAmbiguous != nil {
-		t.Fatal("idle Enter resurrected the cancelled ambiguity card")
+	if !strings.Contains(string(onDisk), "<p>old</p>") {
+		t.Fatal("a rejected proposal must not mutate the file")
 	}
 }
 

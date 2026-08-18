@@ -34,7 +34,6 @@ import (
 	"github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/events/audit"
-	"github.com/PizenLabs/izen/internal/events/timeline"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/language"
@@ -45,7 +44,6 @@ import (
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
-	"github.com/PizenLabs/izen/internal/router"
 	"github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/runtime/handlers"
 	"github.com/PizenLabs/izen/internal/session"
@@ -142,7 +140,6 @@ type Application struct {
 	Gateway        *execution.IntentGateway
 	Patch          *patch.Engine
 	Auth           *authorization.AuthorizationEngine
-	IntentRouter   *router.Router
 	Microkernel    *plan.MicrokernelPlanner
 	IntentCompiler *plan.IntentCompilerPlanner
 	Git            *git.Engine
@@ -162,11 +159,6 @@ type Application struct {
 	// records session capability grants, and drives the autonomous loop. Every
 	// decision is published as a canonical event on the shared bus.
 	Autonomy *autonomy.Engine
-
-	// timeline is the live session execution timeline projection. It
-	// subscribes to the shared bus during Wire and is never nil after; read it
-	// via the Timeline accessor.
-	timeline *timeline.Timeline
 
 	// provider is the resolved default AI provider from Manager. It is nil
 	// when no provider is configured.
@@ -340,16 +332,6 @@ func (a *Application) LanguageID() language.ID {
 	return a.Inputs.LanguageID
 }
 
-// Timeline returns the live session execution timeline projection. It is never
-// nil after Wire. Consumers (TUI/Metrics) read it via Snapshot and Playback
-// for race-free access.
-func (a *Application) Timeline() *timeline.Timeline {
-	if a == nil {
-		return nil
-	}
-	return a.timeline
-}
-
 // Wire builds the Application: domain runtime, dispatcher, handlers, ledger
 // projection, the Runtime facade, and the complete engine tree — all bound to
 // the shared event bus. It is the sole place the application dependency graph
@@ -452,16 +434,6 @@ func Wire(opts ...Option) (*Application, error) {
 	builder.Start()
 	a.Builder = builder
 	a.Ledger = builder.Ledger()
-
-	// ── UNIFIED EXECUTION TIMELINE ──────────────────────────────────────
-	// The timeline subscribes to every envelope on the shared bus and groups
-	// them into chronological spans by (source, kind). It is the single
-	// abstraction Metrics, Tracing, and Audit Replay consume; the presentation
-	// layer reads it via Application.Timeline() (Snapshot/Playback).
-	a.timeline = timeline.NewTimeline(a.Inputs.Session.ContextLabel())
-	if err := a.timeline.Start(a.Bus); err != nil {
-		return nil, fmt.Errorf("wire: start timeline: %w", err)
-	}
 
 	a.Runtime = runtime.NewRuntime(dispatcher, runtime.WithEventBus(a.Bus))
 
@@ -580,31 +552,6 @@ func Wire(opts ...Option) (*Application, error) {
 	wcc := control.NewWorkflowCheckpointManager(a.Execution.Checkpoints, root)
 	a.WorkflowSM.WithCheckpointCoordinator(coreWorkflow.NewCheckpointCoordinator(wcc))
 
-	// ── HYBRID INTENT GATEWAY ──────────────────────────────────────────
-	// The router package runs the deterministic fast path FIRST and only
-	// falls back to the semantic IntentClassifier (a provider-backed
-	// PromptIntentClassifier) when no deterministic signal matches. It
-	// depends solely on the abstract IntentClassifier and the event bus — no
-	// concrete provider is imported here.
-	if provider != nil {
-		a.IntentRouter = router.NewRouter(
-			router.NewPromptIntentClassifier(func(ctx context.Context, systemPrompt, userInput string) (string, error) {
-				resp, err := provider.Execute(ctx, ai.Request{
-					System:         systemPrompt,
-					Messages:       []ai.Message{{Role: "user", Content: userInput}},
-					MaxTokens:      64,
-					Temperature:    0.0,
-					ResponseFormat: &ai.ResponseFormat{Type: "json_object"},
-				})
-				if err != nil {
-					return "", err
-				}
-				return resp.Content, nil
-			}),
-			nil,
-		).WithEventBus(a.Bus)
-	}
-
 	// ── EXECUTION ORCHESTRATOR ───────────────────────────────────────────
 	// The orchestrator maps the logical execution phases onto the single
 	// WorkflowStateMachine while sharing the persistent RuntimeContext. Mode
@@ -681,10 +628,6 @@ func (a *Application) Close() {
 	}
 	if a.Builder != nil {
 		a.Builder.Close()
-	}
-	if a.timeline != nil {
-		a.timeline.Stop()
-		a.timeline = nil
 	}
 	if a.Runtime != nil {
 		a.Runtime.Close()
