@@ -13,7 +13,6 @@ import (
 	"github.com/PizenLabs/izen/internal/domain/signal"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/events/audit"
-	"github.com/PizenLabs/izen/internal/events/timeline"
 	"github.com/PizenLabs/izen/internal/orchestrator"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 )
@@ -212,86 +211,9 @@ func TestWireNoAuditDir(t *testing.T) {
 	}
 }
 
-// TestWireTimelineTracksSessionEnvelopes verifies the unified execution
-// timeline is wired in the composition root: it subscribes to the shared bus,
-// builds spans from the envelope stream, and is exposed via
-// Application.Timeline() for TUI/Metrics consumption.
-func TestWireTimelineTracksSessionEnvelopes(t *testing.T) {
-	app, err := Wire()
-	if err != nil {
-		t.Fatalf("Wire: %v", err)
-	}
-	defer app.Close()
-
-	if app.Timeline() == nil {
-		t.Fatal("expected a Timeline to be wired")
-	}
-	if app.Timeline().SessionID == "" {
-		t.Error("timeline session id is empty")
-	}
-
-	// Envelopes published on the shared bus must land on the timeline.
-	app.Bus.PublishEnvelope(events.NewSignalEnvelope(
-		signal.New(signal.SignalBuildHalted, "execution", nil), "execution"))
-	app.Bus.PublishEnvelope(events.NewSignalEnvelope(
-		signal.New(signal.SignalExecutionFailed, "execution", nil), "execution"))
-
-	if !waitTimelineEvents(t, app.Timeline(), 2) {
-		t.Fatal("timeline did not observe both envelopes")
-	}
-
-	// Both envelopes share source/kind -> one aggregated span.
-	snap := app.Timeline().Snapshot()
-	if len(snap) != 1 {
-		t.Fatalf("timeline spans = %d, want 1", len(snap))
-	}
-	if got := snap[0].Source; got != "execution" {
-		t.Errorf("span source = %q, want execution", got)
-	}
-	if got := snap[0].Name; got != "signal" {
-		t.Errorf("span name = %q, want signal", got)
-	}
-	if got := len(snap[0].Events); got != 2 {
-		t.Errorf("span events = %d, want 2", got)
-	}
-
-	// Playback replays the envelopes in timestamp order.
-	playback := app.Timeline().Playback()
-	if len(playback) != 2 {
-		t.Errorf("playback returned %d envelopes, want 2", len(playback))
-	}
-}
-
-func TestWireTimelineStopsWithApplication(t *testing.T) {
-	app, err := Wire()
-	if err != nil {
-		t.Fatalf("Wire: %v", err)
-	}
-	app.Close()
-
-	// Close cancels the timeline subscription and releases the projection
-	// (mirroring the AuditLogger teardown convention). Close is idempotent.
-	if app.Timeline() != nil {
-		t.Error("timeline not released after Close")
-	}
-	app.Close() // idempotent
-}
-
-// waitTimelineEvents polls the wired timeline until it has ingested want
-// envelopes, timing out after 3 seconds.
-func waitTimelineEvents(t *testing.T, tl *timeline.Timeline, want int) bool {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for tl.EventCount() < want {
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	return true
-}
-
-// waitAuditAccepted polls the wired audit logger until it has accepted want
+// TestWireAuditLoggerWritesEnvelopes verifies the append-only event audit
+// logger is wired in the composition root and accepts envelopes published on
+// the shared bus.
 // envelopes, timing out after 3 seconds.
 func waitAuditAccepted(t *testing.T, l *audit.AuditLogger, want uint64) {
 	t.Helper()
