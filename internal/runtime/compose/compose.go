@@ -45,7 +45,6 @@ import (
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
-	"github.com/PizenLabs/izen/internal/router"
 	"github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/runtime/handlers"
 	"github.com/PizenLabs/izen/internal/session"
@@ -142,7 +141,6 @@ type Application struct {
 	Gateway        *execution.IntentGateway
 	Patch          *patch.Engine
 	Auth           *authorization.AuthorizationEngine
-	IntentRouter   *router.Router
 	Microkernel    *plan.MicrokernelPlanner
 	IntentCompiler *plan.IntentCompilerPlanner
 	Git            *git.Engine
@@ -579,31 +577,6 @@ func Wire(opts ...Option) (*Application, error) {
 	a.WorkflowSM = coreWorkflow.NewWorkflowStateMachine()
 	wcc := control.NewWorkflowCheckpointManager(a.Execution.Checkpoints, root)
 	a.WorkflowSM.WithCheckpointCoordinator(coreWorkflow.NewCheckpointCoordinator(wcc))
-
-	// ── HYBRID INTENT GATEWAY ──────────────────────────────────────────
-	// The router package runs the deterministic fast path FIRST and only
-	// falls back to the semantic IntentClassifier (a provider-backed
-	// PromptIntentClassifier) when no deterministic signal matches. It
-	// depends solely on the abstract IntentClassifier and the event bus — no
-	// concrete provider is imported here.
-	if provider != nil {
-		a.IntentRouter = router.NewRouter(
-			router.NewPromptIntentClassifier(func(ctx context.Context, systemPrompt, userInput string) (string, error) {
-				resp, err := provider.Execute(ctx, ai.Request{
-					System:         systemPrompt,
-					Messages:       []ai.Message{{Role: "user", Content: userInput}},
-					MaxTokens:      64,
-					Temperature:    0.0,
-					ResponseFormat: &ai.ResponseFormat{Type: "json_object"},
-				})
-				if err != nil {
-					return "", err
-				}
-				return resp.Content, nil
-			}),
-			nil,
-		).WithEventBus(a.Bus)
-	}
 
 	// ── EXECUTION ORCHESTRATOR ───────────────────────────────────────────
 	// The orchestrator maps the logical execution phases onto the single
