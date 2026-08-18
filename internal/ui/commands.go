@@ -521,7 +521,6 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		return m.runReviewCmd(target)
 	case modes.ModePlan:
 		m.responseBuffer.Reset()
-		m.execEng.SetStreamContextFiles(m.attachedFiles)
 
 		// ── STRUCTURAL ENGINE PATH (Handoff from /investigate) ──────────
 		// When the Context-Ledger or a proposed fix is present, bypass the
@@ -783,7 +782,6 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		}
 
 		m.responseBuffer.Reset()
-		m.execEng.SetStreamContextFiles(m.attachedFiles)
 
 		// ── ISOLATION BARRIER: Normal /ask chat vs $prompt handoff ────────
 		// If the user is typing a normal chat message in /ask mode, clear any
@@ -2595,7 +2593,6 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	}
 
 	m.responseBuffer.Reset()
-	m.execEng.SetStreamContextFiles(m.attachedFiles)
 
 	// Bridge the live /plan task ledger into the execution engine: the patch
 	// manager marks task Completed and renders the build summary on commit.
