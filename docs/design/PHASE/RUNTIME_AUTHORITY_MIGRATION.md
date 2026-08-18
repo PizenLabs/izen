@@ -311,6 +311,35 @@ ExecutionProof + canonical RuntimeEvents -> UI renders (pure projection)
   artifact inside the runtime, returned as `ExecutionResult`, rendered by the
   UI. The raw response never reaches the UI.
 
+### Canonical target resolution (single resolver, bounded UI surface)
+
+`strategy.Select` — reached via `IntentGateway.SelectStrategy`
+(`internal/execution/intent.go:62`) and `IntentGateway.Gate` — is the ONE
+canonical target-resolution authority. Every execution request (`bare text`,
+`$prompt`, `$hot`) has its target set determined by `Strategy.Select`
+(`internal/execution/strategy/selector.go:95`), not by a UI-side resolver.
+
+The only UI-side resolution surface left after the pruning is
+`resolveAutonomyBuildTarget` (`internal/ui/autonomy_target.go:38`), and its
+scope is strictly bounded:
+
+- It is called on ONE path: `executeAutonomyViaRuntime`
+  (`internal/ui/runtime_cutover.go:107`), and only when the gateway's
+  `SelectStrategy` already returned `HumanClarification` (the strategy
+  selector declared the raw target ambiguous/unresolvable).
+- It never re-resolves a target the strategy selector resolved. It only
+  expands the ambiguity into a concrete candidate list for the human selector
+  (`stageAutonomyTargetSelector`) or produces the terminal not-found diagnosis
+  (`reportAutonomyTargetNotFound`). Selection is an explicit human act; no
+  candidate is auto-picked, and the selected candidate is staged directly
+  (`activateAutonomyTarget` → `executeAutonomyViaRuntime`) — never re-resolved.
+- It must never grow into a second resolver: any new UI-side path that maps a
+  raw target to a file is an architectural regression. Target resolution
+  belongs to `strategy.Select`; ambiguity resolution is a human decision.
+
+`resolveHotfixTarget`/`resolveMultiHotfixTargets` (the legacy regex fast-track
+resolvers) were removed with the legacy hotfix path.
+
 ### Removed from the UI (dead architecture deleted)
 
 - UI-side engine-first strategy router (`routeEngineFirstPrompt` /
