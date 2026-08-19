@@ -186,6 +186,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		pres:                presenter,
 		orch:                app.Orchestrator,
 		autonomy:            app.Autonomy,
+		autonomousDriver:    app.Autonomous,
 		pipelineEngine:      app.Pipeline,
 		patchEngine:         app.Patch,
 		viewState:           presentation.NewWorkflowViewState(),

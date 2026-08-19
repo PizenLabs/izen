@@ -141,20 +141,14 @@ func TestEnginePublishesCapabilityGranted(t *testing.T) {
 	waitDelivered(t, n)
 }
 
-func TestEnginePublishesLoopTransitionAndContext(t *testing.T) {
+func TestEnginePublishesContextCompiled(t *testing.T) {
 	bus := events.NewBus(32)
 	eng := NewEngine(WithEventBus(bus), WithScope("repository"))
-	loopN, loopSub := countSub(t, bus, events.EventLoopTransition)
 	ctxN, ctxSub := countSub(t, bus, events.EventContextCompiled)
-	defer loopSub.Cancel()
 	defer ctxSub.Cancel()
-
-	loop := NewAutonomousLoop(3)
-	eng.PublishTransitions(loop.Start("user requested mutation"))
 
 	eng.CompileContext("index.html", "<html><body><div>hi</div>stray</body></html>")
 
-	waitDelivered(t, loopN)
 	waitDelivered(t, ctxN)
 }
 

@@ -271,6 +271,31 @@ func RecoverFailure(o Observation, class FailureClass, b LoopBounds) LoopDecisio
 // AwaitingHuman: an approval requirement, a target ambiguity, insufficient
 // evidence for a bounded decision, or recovery exhaustion. While parked the
 // loop holds its runtime state and never burns budget.
+//
+// Phase 6 added the presentation-enabling fields (Targets, Action, Resumable)
+// so the UI can render a boundary card without sniffing internals. They are
+// derived deterministically by the loop and, when set, the human resumes via
+// the matching Driver.Resume* surface.
+
+// HumanBoundaryAction discriminates the kind of human response a parked
+// boundary requires.
+type HumanBoundaryAction string
+
+const (
+	// HumanBoundaryApproval is an approval gate: a held patch awaits
+	// Approve/Reject (resumable).
+	HumanBoundaryApproval HumanBoundaryAction = "approve"
+	// HumanBoundaryClarify is a target ambiguity: the human must pick a
+	// candidate before any execution (resumable).
+	HumanBoundaryClarify HumanBoundaryAction = "clarify"
+	// HumanBoundaryInform is an informational park (recovery exhaustion,
+	// bounds exhaustion): no resume decision exists — the human may start a
+	// fresh bounded run.
+	HumanBoundaryInform HumanBoundaryAction = "inform"
+)
+
+// String returns the canonical boundary-action label.
+func (a HumanBoundaryAction) String() string { return string(a) }
 
 type HumanBoundary struct {
 	Reason string
@@ -283,6 +308,36 @@ type HumanBoundary struct {
 	// Options is the candidate list for a target ambiguity; nil for a
 	// yes/no decision.
 	Options []string
+	// Targets is the resolved workspace-relative target set the parked
+	// execution holds (approval gates) or would hold (clarify). It is
+	// authoritative for the UI: the executor authorization issued on approve
+	// covers exactly these files.
+	Targets []string
+	// Action discriminates the boundary kind (approve/clarify/inform).
+	Action HumanBoundaryAction
+	// Resumable reports whether a Resume* decision exists for this boundary.
+	// An inform boundary is not resumable; only a fresh bounded run continues.
+	Resumable bool
+}
+
+// deriveBoundaryAction computes the canonical Action/Resumable from a boundary's
+// fields. Deterministic: identical boundary facts always yield identical
+// presentation facts.
+func deriveBoundaryAction(b *HumanBoundary) {
+	if b == nil {
+		return
+	}
+	switch {
+	case b.PatchID != "":
+		b.Action = HumanBoundaryApproval
+		b.Resumable = true
+	case len(b.Options) > 0:
+		b.Action = HumanBoundaryClarify
+		b.Resumable = true
+	default:
+		b.Action = HumanBoundaryInform
+		b.Resumable = false
+	}
 }
 
 // ── LoopBounds / LoopTermination ────────────────────────────────────────────
@@ -580,7 +635,9 @@ func (l *RuntimeLoop) applyDecision(d LoopDecision) RuntimeState {
 		l.terminate(LoopComplete, RuntimeCompleted, d.Reason, "")
 	case LoopAskHuman:
 		l.push(d.Action, RuntimeAwaitingHuman, d.Reason)
-		l.boundary = &HumanBoundary{Reason: d.Reason, PatchID: d.PatchID, Options: d.Options}
+		b := &HumanBoundary{Reason: d.Reason, PatchID: d.PatchID, Options: d.Options}
+		deriveBoundaryAction(b)
+		l.boundary = b
 	case LoopAbort:
 		l.terminate(LoopAbort, RuntimeAborted, d.Reason, FailurePermanent)
 	}
@@ -593,6 +650,7 @@ func (l *RuntimeLoop) AwaitHuman(b HumanBoundary) RuntimeState {
 	if l == nil || l.state.IsTerminal() {
 		return l.State()
 	}
+	deriveBoundaryAction(&b)
 	l.boundary = &b
 	return l.push(LoopAskHuman, RuntimeAwaitingHuman, b.Reason)
 }

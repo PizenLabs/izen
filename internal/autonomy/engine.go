@@ -343,14 +343,3 @@ func (e *Engine) Analyze(path, content string) ArtifactContext {
 	}
 	return ctx
 }
-
-// PublishTransitions publishes loop transitions onto the bus. Callers drive
-// the autonomous loop and hand the recorded steps here so they stay observable.
-func (e *Engine) PublishTransitions(trans []LoopTransition) {
-	if e == nil || e.bus == nil || len(trans) == 0 {
-		return
-	}
-	for _, t := range trans {
-		e.bus.Publish(events.NewLoopTransition(string(t.From), string(t.To), string(t.Event), t.Reason))
-	}
-}

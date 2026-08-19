@@ -98,11 +98,16 @@ func (m *model) executeAutonomyWorkspace(trace autonomy.Trace) tea.Cmd {
 	case modes.ModeInvestigate:
 		return m.runInvestigateCmd(trace.Input)
 	case modes.ModeBuild:
-		// A BUILD workspace executes through the RuntimeExecutor boundary: the
-		// runtime owns provider invocation, patch creation, the approval gate,
-		// apply and verification, and emits the canonical lifecycle events. The
-		// UI projects results and approval. There is no legacy mode-engine
-		// mutation path on the production architecture.
+		// A BUILD workspace executes through the bounded autonomous Driver when
+		// it is wired (Phase 6): the driver owns resolve → observe → decide →
+		// execute → interpret → approval → complete through the RuntimeExecutor
+		// and publishes the canonical loop.transition events. The UI projects
+		// results, renders the parked human boundary and resumes it. When the
+		// driver is not wired (harness), the single-shot executor submission
+		// below is the compatibility path.
+		if m.autonomousDriver != nil {
+			return m.executeAutonomyViaDriver(trace)
+		}
 		return m.executeAutonomyViaRuntime(trace)
 	case modes.ModeReview:
 		return m.runReviewCmd("")
@@ -158,11 +163,6 @@ func (m *model) renderAutonomyDecision(trace autonomy.Trace) {
 	fmt.Fprintf(&b, "  workspace   : %s\n", trace.Route.Workspace)
 	marker, label := autonomyMarker(trace.Decision.Decision)
 	fmt.Fprintf(&b, "  decision    : %s%s (%s)\n", marker, label, trace.Decision.Reason)
-	if trace.Decision.Decision == autonomy.DecisionAutoContinue {
-		if loop := NewAutonomyLoopPreview(trace.Intent.Intent); len(loop) > 0 {
-			fmt.Fprintf(&b, "  loop        : %s\n", strings.Join(loop, " → "))
-		}
-	}
 	m.push(roleStatus, b.String())
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()

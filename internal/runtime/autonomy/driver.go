@@ -92,6 +92,14 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	if d.adapter == nil {
 		return nil, errors.New("autonomy: driver requires an executor adapter")
 	}
+	// ── DUPLICATE-START PROTECTION (§18 / §21-I) ──────────────────────
+	// Exactly one run at a time: a second Run while the current loop is still
+	// active (executing) OR parked (awaiting human) must never silently
+	// clobber the parked approval/decision state. A fresh Run is legal only
+	// after the previous run reached a terminal state.
+	if d.loop != nil && !d.loop.State().IsTerminal() {
+		return d.term(), errors.New("autonomy: a run is already active or parked at a human boundary — resume or abort it first")
+	}
 	d.loop = autonomy.NewRuntimeLoop(d.bounds)
 	d.prompt = objective
 	d.obs = autonomy.Observation{}
@@ -103,17 +111,34 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	// never guesses a target. A clarification boundary parks BEFORE any
 	// execution — no model call, no mutation.
 	d.resolved = d.adapter.Resolve(objective)
+	d.req = autonomy.LoopRequest{Prompt: objective, Targets: d.resolved.Targets}
 	if d.resolved.Ambiguous {
 		d.loop.AwaitHuman(autonomy.HumanBoundary{
 			Reason:  "target clarification required before any execution",
 			Options: d.resolved.Options,
 		})
+		d.enrichBoundary()
 		d.publish(ctx)
 		return d.term(), nil
 	}
-	d.req = autonomy.LoopRequest{Prompt: objective, Targets: d.resolved.Targets}
 	d.obs = d.contextObservation()
 	return d.observeAndRun(ctx)
+}
+
+// Abort terminates the current parked or active run as a permanent human
+// cancellation. It is the ONLY way to cancel a run that is already parked at
+// a human boundary (an in-flight run is cancelled via its context). After
+// Abort the loop is terminal and a fresh Run may start. Aborting a loop that
+// has not started or is already terminal is a no-op.
+func (d *Driver) Abort(reason string) (*autonomy.LoopTermination, error) {
+	if d.loop == nil {
+		return nil, errors.New("autonomy: abort requires a started run")
+	}
+	if d.loop.State().IsTerminal() {
+		return d.term(), nil
+	}
+	term := d.terminateAbort(context.Background(), "aborted by operator: "+reason, autonomy.FailurePermanent)
+	return term, nil
 }
 
 // ResumeApprove resolves a parked approval gate: it approves the held patch
@@ -243,6 +268,7 @@ func (d *Driver) observeAndRun(ctx context.Context) (*autonomy.LoopTermination, 
 				return nil, err
 			}
 		case autonomy.RuntimeAwaitingHuman:
+			d.enrichBoundary()
 			return d.term(), nil
 		default:
 			return d.term(), nil
@@ -277,6 +303,33 @@ func (d *Driver) approvalPatchID() (string, error) {
 		return "", errors.New("autonomy: parked boundary is not an approval gate")
 	}
 	return b.PatchID, nil
+}
+
+// enrichBoundary completes a parked boundary's presentation facts: the loop
+// derives Action/Resumable at park time; the driver supplies the authoritative
+// target set the parked execution holds (approval) or would hold (clarify).
+// The UI's executor authorization on approve covers exactly these targets.
+func (d *Driver) enrichBoundary() {
+	b := d.loop.Boundary()
+	if b == nil {
+		return
+	}
+	if b.Action == "" {
+		switch {
+		case b.PatchID != "":
+			b.Action = autonomy.HumanBoundaryApproval
+			b.Resumable = true
+		case len(b.Options) > 0:
+			b.Action = autonomy.HumanBoundaryClarify
+			b.Resumable = true
+		default:
+			b.Action = autonomy.HumanBoundaryInform
+			b.Resumable = false
+		}
+	}
+	if len(b.Targets) == 0 {
+		b.Targets = append([]string(nil), d.req.Targets...)
+	}
 }
 
 // publish emits every not-yet-published loop transition as a canonical
