@@ -141,3 +141,74 @@ func TestAutonomousLoopNoProviderInvocation(t *testing.T) {
 		t.Errorf("architecture: autonomous loop MUST NOT invoke a provider, found %d site(s)", len(sites))
 	}
 }
+
+// TestRuntimeAutonomyPackageHasSingleBoundary asserts the Phase 5 binding
+// package (internal/runtime/autonomy) is the ONLY composition-boundary surface
+// between the loop contract and the execution authority, and that it stays a
+// boundary: it may reach the RuntimeExecutor (internal/execution) but MUST NOT
+// reach the providers, the patch manager, or the ai provider API directly. The
+// adapter/driver drive execution exclusively through the RuntimeExecutor.
+func TestRuntimeAutonomyPackageHasSingleBoundary(t *testing.T) {
+	root := repoRoot(t)
+	got := importsOfDir(t, root, "internal/runtime/autonomy")
+	forbidden := []string{
+		moduleImport("internal/providers"),
+		moduleImport("internal/patch"),
+		moduleImport("internal/ai"),
+	}
+	for _, f := range forbidden {
+		if got[f] {
+			t.Errorf("architecture: internal/runtime/autonomy MUST NOT import %q (single execution boundary is the RuntimeExecutor)", f)
+		}
+	}
+}
+
+// TestUINeverFabricatesLoopTransitions asserts the UI is a pure projection of
+// loop.transition events. Phase 4 briefly let the UI synthesize preview loop
+// transitions (publishAutonomyLoop); that surface is removed. The UI must only
+// subscribe to the event, never publish it, and never drive the bounded loop
+// (internal/runtime/autonomy) itself.
+func TestUINeverFabricatesLoopTransitions(t *testing.T) {
+	root := repoRoot(t)
+	got := importsOfDir(t, root, "internal/ui")
+	if got[moduleImport("internal/runtime/autonomy")] {
+		t.Errorf("architecture: internal/ui MUST NOT import internal/runtime/autonomy (UI is a projection, the driver owns the loop)")
+	}
+}
+
+// TestAutonomousDriverContractExists is an anti-vacuous guard: the negative
+// boundary assertions above are only meaningful while the Phase 5 contract
+// (ExecutorAdapter + Driver) is present.
+func TestAutonomousDriverContractExists(t *testing.T) {
+	root := repoRoot(t)
+	// Assert the contract symbols exist by parsing both files together.
+	required := []string{"ExecutorAdapter", "NewExecutorAdapter", "Driver", "NewDriver", "Resolved"}
+	declared := map[string]bool{}
+	for _, rel := range []string{"adapter.go", "driver.go"} {
+		f, _ := parseFile(t, filepath.Join(root, "internal/runtime/autonomy", rel))
+		for _, decl := range f.Decls {
+			if gd, ok := decl.(*ast.GenDecl); ok {
+				for _, spec := range gd.Specs {
+					if ts, ok := spec.(*ast.TypeSpec); ok {
+						declared[ts.Name.Name] = true
+					}
+				}
+			}
+		}
+	}
+	used := map[string]bool{}
+	for _, rel := range []string{"adapter.go", "driver.go"} {
+		f, _ := parseFile(t, filepath.Join(root, "internal/runtime/autonomy", rel))
+		ast.Inspect(f, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok {
+				used[id.Name] = true
+			}
+			return true
+		})
+	}
+	for _, sym := range required {
+		if !declared[sym] && !used[sym] {
+			t.Errorf("architecture: Phase 5 contract symbol %q must exist in internal/runtime/autonomy", sym)
+		}
+	}
+}

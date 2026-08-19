@@ -1,0 +1,356 @@
+package autonomy
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/events"
+)
+
+// Decider maps a bounded observation to the next loop decision. It is
+// injectable for policy tests; the default uses the canonical recovery matrix.
+type Decider func(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopDecision
+
+// RepairFunc re-scopes a failed request before a bounded re-execution. It is
+// injectable; the default only appends the failed outcome as evidence.
+type RepairFunc func(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.LoopRequest, error)
+
+// Driver is the real autonomous loop: it owns the bounded control flow over
+// the RuntimeExecutor (through the ExecutorAdapter) and publishes every
+// transition as a canonical loop.transition event on the shared bus. It is a
+// single-lane control flow: exactly one loop per Driver, not safe for
+// concurrent use.
+//
+// Flow: resolve target (gateway) → observe → decide → execute (adapter) →
+// verify → interpret → complete/recover/abort/park. The loop only drives; the
+// executor executes; the human approves/clarifies; the loop NEVER mutates the
+// filesystem or invokes a provider itself.
+type Driver struct {
+	adapter   *ExecutorAdapter
+	bus       *events.Bus
+	bounds    autonomy.LoopBounds
+	decide    Decider
+	repair    RepairFunc
+	loop      *autonomy.RuntimeLoop
+	prompt    string
+	resolved  Resolved
+	req       autonomy.LoopRequest
+	obs       autonomy.Observation
+	published int
+}
+
+// Option configures the Driver during construction.
+type Option func(*Driver)
+
+// WithLoopBounds overrides the runtime-owned termination bounds.
+func WithLoopBounds(b autonomy.LoopBounds) Option {
+	return func(d *Driver) { d.bounds = b }
+}
+
+// WithDecider overrides the observation → decision policy.
+func WithDecider(dec Decider) Option {
+	return func(d *Driver) {
+		if dec != nil {
+			d.decide = dec
+		}
+	}
+}
+
+// WithRepair overrides the bounded recovery re-scope.
+func WithRepair(f RepairFunc) Option {
+	return func(d *Driver) {
+		if f != nil {
+			d.repair = f
+		}
+	}
+}
+
+// NewDriver wires the bounded loop over the executor adapter. bus may be nil
+// (loop runs headless; transitions are still recorded in History).
+func NewDriver(adapter *ExecutorAdapter, bus *events.Bus, opts ...Option) *Driver {
+	d := &Driver{
+		adapter: adapter,
+		bus:     bus,
+		bounds:  autonomy.DefaultLoopBounds(),
+		decide:  decideDefault,
+		repair:  defaultRepair,
+	}
+	for _, o := range opts {
+		o(d)
+	}
+	return d
+}
+
+// Run starts a fresh bounded run for the objective and drives it until the loop
+// terminates or parks at a human boundary. A parked loop returns a nil
+// termination with a non-nil Boundary(); resume via ResumeApprove/Reject/
+// Clarify. A completed or aborted run returns its terminal outcome.
+func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermination, error) {
+	if d.adapter == nil {
+		return nil, errors.New("autonomy: driver requires an executor adapter")
+	}
+	d.loop = autonomy.NewRuntimeLoop(d.bounds)
+	d.prompt = objective
+	d.obs = autonomy.Observation{}
+	d.published = 0
+	d.loop.Start("user objective: " + objective)
+	d.publish(ctx)
+
+	// Target resolution is the gateway's deterministic authority; the loop
+	// never guesses a target. A clarification boundary parks BEFORE any
+	// execution — no model call, no mutation.
+	d.resolved = d.adapter.Resolve(objective)
+	if d.resolved.Ambiguous {
+		d.loop.AwaitHuman(autonomy.HumanBoundary{
+			Reason:  "target clarification required before any execution",
+			Options: d.resolved.Options,
+		})
+		d.publish(ctx)
+		return d.term(), nil
+	}
+	d.req = autonomy.LoopRequest{Prompt: objective, Targets: d.resolved.Targets}
+	d.obs = d.contextObservation()
+	return d.observeAndRun(ctx)
+}
+
+// ResumeApprove resolves a parked approval gate: it approves the held patch
+// through the executor and INTERPRETS the terminal result of the SAME
+// execution. It never re-executes the mutation (idempotency).
+func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, error) {
+	pid, err := d.approvalPatchID()
+	if err != nil {
+		return d.term(), err
+	}
+	obs, err := d.adapter.Approve(ctx, pid)
+	if err != nil {
+		return nil, fmt.Errorf("autonomy: approve: %w", err)
+	}
+	d.obs = obs
+	d.loop.ReleaseHuman("patch approved")
+	d.publish(ctx)
+	return d.observeAndRun(ctx)
+}
+
+// ResumeReject resolves a parked approval gate by rejecting the held patch
+// through the executor; the rejection is a terminal human decision, never a
+// re-execution.
+func (d *Driver) ResumeReject(ctx context.Context, reason string) (*autonomy.LoopTermination, error) {
+	pid, err := d.approvalPatchID()
+	if err != nil {
+		return d.term(), err
+	}
+	obs, err := d.adapter.Reject(ctx, pid, reason)
+	if err != nil {
+		return nil, fmt.Errorf("autonomy: reject: %w", err)
+	}
+	d.obs = obs
+	d.loop.ReleaseHuman("patch rejected")
+	d.publish(ctx)
+	return d.observeAndRun(ctx)
+}
+
+// ResumeClarify continues a parked clarification with an explicit human-chosen
+// target. No mutation ever happened before the boundary, so a bounded
+// re-resolution and re-execution is safe.
+func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.LoopTermination, error) {
+	if d.loop == nil || d.loop.State() != autonomy.RuntimeAwaitingHuman {
+		return d.term(), errors.New("autonomy: clarify requires a parked clarification boundary")
+	}
+	d.req = autonomy.LoopRequest{Prompt: d.prompt, Targets: []string{target}}
+	d.obs = d.contextObservation()
+	d.loop.ReleaseHuman("target specified: " + target)
+	d.publish(ctx)
+	return d.observeAndRun(ctx)
+}
+
+// State returns the current loop position.
+func (d *Driver) State() autonomy.RuntimeState {
+	if d.loop == nil {
+		return autonomy.RuntimeIdle
+	}
+	return d.loop.State()
+}
+
+// Boundary returns the active human boundary, or nil while not parked.
+func (d *Driver) Boundary() *autonomy.HumanBoundary {
+	if d.loop == nil {
+		return nil
+	}
+	return d.loop.Boundary()
+}
+
+// Termination returns the terminal outcome, or nil while running/parked.
+func (d *Driver) Termination() *autonomy.LoopTermination { return d.term() }
+
+// History returns the observed transitions, oldest first.
+func (d *Driver) History() []autonomy.RuntimeTransition {
+	if d.loop == nil {
+		return nil
+	}
+	return d.loop.History()
+}
+
+// LastObservation returns the most recent observation the driver consumed.
+func (d *Driver) LastObservation() autonomy.Observation { return d.obs }
+
+// ── drive helpers ───────────────────────────────────────────────────────────
+
+// observeAndRun pushes the current observation through Observe → decide →
+// execute until the loop terminates or parks at AwaitingHuman.
+func (d *Driver) observeAndRun(ctx context.Context) (*autonomy.LoopTermination, error) {
+	if got := d.loop.Observe(d.obs); got != autonomy.RuntimeDeciding {
+		return d.term(), fmt.Errorf("autonomy: observe -> %s, want deciding", got)
+	}
+	d.publish(ctx)
+	for !d.loop.State().IsTerminal() {
+		if cerr := ctx.Err(); cerr != nil {
+			// Cancellation is a clean permanent abort, not a propagated error.
+			return d.terminateAbort(ctx, "context cancelled", autonomy.FailurePermanent), nil //nolint:nilerr // termination, not a failure
+		}
+		switch d.loop.State() {
+		case autonomy.RuntimeDeciding, autonomy.RuntimeInterpreting:
+			// The loop owns the attempt/cycle counters; the decider sees them
+			// through the bounded observation so the recovery matrix can
+			// decide "exhausted → ask human" from the authoritative facts.
+			d.obs.AttemptNum = d.loop.Attempts()
+			d.obs.RecoveryCycle = d.loop.RecoveryCycles()
+			decision := d.decide(d.obs, d.loop.Bounds())
+			if _, err := d.step(ctx, decision); err != nil {
+				return nil, err
+			}
+		case autonomy.RuntimeExecuting:
+			obs, err := d.adapter.Execute(ctx, d.req)
+			if err != nil {
+				return nil, fmt.Errorf("autonomy: execute: %w", err)
+			}
+			d.obs = obs
+			d.loop.ConsumeExecution(obs)
+			d.loop.ConsumeVerification(obs)
+			d.publish(ctx)
+		case autonomy.RuntimeRecovering:
+			req, err := d.repair(d.obs, d.req)
+			if err != nil {
+				return nil, fmt.Errorf("autonomy: repair: %w", err)
+			}
+			d.req = req
+			if _, err := d.step(ctx, autonomy.LoopDecision{
+				Action: autonomy.LoopContinue,
+				Reason: "re-scoped — re-execute",
+			}); err != nil {
+				return nil, err
+			}
+		case autonomy.RuntimeAwaitingHuman:
+			return d.term(), nil
+		default:
+			return d.term(), nil
+		}
+	}
+	return d.term(), nil
+}
+
+func (d *Driver) step(ctx context.Context, decision autonomy.LoopDecision) (autonomy.RuntimeState, error) {
+	state, err := d.loop.Step(ctx, decision)
+	if err != nil {
+		return state, err
+	}
+	d.publish(ctx)
+	return state, nil
+}
+
+func (d *Driver) contextObservation() autonomy.Observation {
+	return autonomy.Observation{
+		Intent:   autonomy.ParseIntent(d.prompt),
+		Target:   firstTarget(d.req.Targets),
+		Evidence: d.req.Evidence,
+	}
+}
+
+func (d *Driver) approvalPatchID() (string, error) {
+	if d.loop == nil || d.loop.State() != autonomy.RuntimeAwaitingHuman {
+		return "", errors.New("autonomy: approval requires a parked approval gate")
+	}
+	b := d.loop.Boundary()
+	if b == nil || b.PatchID == "" {
+		return "", errors.New("autonomy: parked boundary is not an approval gate")
+	}
+	return b.PatchID, nil
+}
+
+// publish emits every not-yet-published loop transition as a canonical
+// loop.transition event. The driver is the single owner of these events;
+// consumers (UI projection, tests) only observe.
+func (d *Driver) publish(_ context.Context) {
+	if d.bus == nil || d.loop == nil {
+		return
+	}
+	history := d.loop.History()
+	for i := d.published; i < len(history); i++ {
+		t := history[i]
+		d.bus.Publish(events.NewLoopTransition(t.From.String(), t.To.String(), string(t.Action), t.Reason))
+	}
+	d.published = len(history)
+}
+
+func (d *Driver) term() *autonomy.LoopTermination {
+	if d.loop == nil {
+		return nil
+	}
+	return d.loop.Termination()
+}
+
+func (d *Driver) terminateAbort(ctx context.Context, reason string, class autonomy.FailureClass) *autonomy.LoopTermination {
+	_, term := d.loop.Abort(reason, class)
+	d.publish(ctx)
+	return term
+}
+
+// ── default policies ────────────────────────────────────────────────────────
+
+// decideDefault maps a bounded observation onto the closed decision vocabulary:
+//
+//	context observation (no outcome)     → continue (execute)
+//	changed/created/nochange/completed   → complete (objective satisfied)
+//	pending_approval                     → ask_human (approval gate, patch id)
+//	clarification required               → ask_human
+//	cancelled/rejected/artifact_rejected → abort (permanent, never auto-retry)
+//	no_artifact/failed/patch/apply/verify → canonical recovery matrix (bounded)
+func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopDecision {
+	if o.ClarificationRequired {
+		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
+			Reason: "target clarification required before any execution"}
+	}
+	switch o.Outcome {
+	case autonomy.OutcomeChanged, autonomy.OutcomeCreated, autonomy.OutcomeNoChange,
+		autonomy.OutcomeCompleted, autonomy.OutcomeArtifactProduced:
+		return autonomy.LoopDecision{Action: autonomy.LoopComplete,
+			Reason: "objective satisfied: " + string(o.Outcome)}
+	case autonomy.OutcomePendingApproval:
+		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
+			Reason: "mutation awaiting approval", PatchID: o.PatchID}
+	case autonomy.OutcomeCancelled, autonomy.OutcomeRejected, autonomy.OutcomeArtifactRejected:
+		return autonomy.LoopDecision{Action: autonomy.LoopAbort,
+			Reason: "terminal outcome: " + string(o.Outcome)}
+	case autonomy.OutcomeNoArtifact, autonomy.OutcomeFailed, autonomy.OutcomePatchGenFailed,
+		autonomy.OutcomePatchFailed, autonomy.OutcomeApplyFailed, autonomy.OutcomeVerifyFailed,
+		autonomy.OutcomeSkipped:
+		return autonomy.RecoverFailure(o, autonomy.ClassifyOutcome(o.Outcome), b)
+	case "":
+		return autonomy.LoopDecision{Action: autonomy.LoopContinue,
+			Reason: "objective resolved — execute"}
+	default:
+		return autonomy.LoopDecision{Action: autonomy.LoopAbort,
+			Reason: "unrecognized outcome: " + string(o.Outcome)}
+	}
+}
+
+// defaultRepair re-scopes a failed request for a bounded re-execution by
+// appending the failed outcome as evidence. Real re-planning policies inject a
+// RepairFunc; this default only preserves determinism.
+func defaultRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.LoopRequest, error) {
+	req.Evidence = strings.TrimSpace(req.Evidence + "\n" +
+		"recovery of failed execution (outcome " + string(o.Outcome) + ")")
+	return req, nil
+}

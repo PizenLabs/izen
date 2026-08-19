@@ -94,7 +94,6 @@ func (m *model) executeAutonomyWorkspace(trace autonomy.Trace) tea.Cmd {
 		m.currentResult = nil
 		m.setMode(mode)
 	}
-	m.publishAutonomyLoop(trace)
 	switch mode {
 	case modes.ModeInvestigate:
 		return m.runInvestigateCmd(trace.Input)
@@ -109,36 +108,6 @@ func (m *model) executeAutonomyWorkspace(trace autonomy.Trace) tea.Cmd {
 		return m.runReviewCmd("")
 	default: // plan / ask
 		return m.handleMessageContent(trace.Input)
-	}
-}
-
-// publishAutonomyLoop records the canonical execution chain the runtime owns
-// for the decided workspace. The loop state machine drives the transitions; the
-// UI only executes inside the current position. Transitions are published on
-// the shared bus so the event truth pipeline observes the loop.
-func (m *model) publishAutonomyLoop(trace autonomy.Trace) {
-	if m.autonomy == nil {
-		return
-	}
-	loop := autonomy.NewAutonomousLoop(3)
-	var trans []autonomy.LoopTransition
-	trans = append(trans, loop.Start("user objective: "+trace.Input)...)
-
-	switch trace.Intent.Intent {
-	case autonomy.IntentInvestigation, autonomy.IntentDebugging:
-		trans = append(trans, loop.EvidenceReady("evidence collected in INVESTIGATE workspace")...)
-	case autonomy.IntentPlanning:
-		trans = append(trans, loop.EvidenceReady("evidence sufficient — entering PLAN")...)
-	case autonomy.IntentVerification:
-		trans = append(trans, loop.EvidenceReady("evidence collected — entering REVIEW")...)
-	case autonomy.IntentModification, autonomy.IntentRefactoring:
-		trans = append(trans, loop.EvidenceReady("target resolved — entering PLAN")...)
-		trans = append(trans, loop.AuthorizeBuild("capability granted — entering BUILD")...)
-		trans = append(trans, loop.BuildDone("mutation dispatched")...)
-		trans = append(trans, loop.VerifyPassed("verification queued")...)
-	}
-	if len(trans) > 0 {
-		m.autonomy.PublishTransitions(trans)
 	}
 }
 

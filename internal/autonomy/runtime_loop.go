@@ -87,6 +87,26 @@ const (
 	OutcomeFailed           ExecutionOutcome = "failed"
 	OutcomeArtifactProduced ExecutionOutcome = "artifact_produced"
 	OutcomePatchGenFailed   ExecutionOutcome = "patch_generation_failed"
+	// ── Extended vocabulary (Phase 5) ─────────────────────────────────
+	// The extended outcomes mirror the canonical MutationOutcome strings one
+	// to one so the composition-root adapter maps execution.ExecutionResult
+	// outcomes onto loop outcomes without lossy reclassification. The Phase 4
+	// outcomes above are retained for backward compatibility; the adapter
+	// always emits the canonical strings below.
+	OutcomeChanged          ExecutionOutcome = "changed"
+	OutcomeCreated          ExecutionOutcome = "created"
+	OutcomeNoChange         ExecutionOutcome = "nochange"
+	OutcomeArtifactRejected ExecutionOutcome = "artifact_rejected"
+	// OutcomePatchFailed is the canonical MutationOutcome string ("patch_failed").
+	// It differs from the Phase 4 OutcomePatchGenFailed value
+	// ("patch_generation_failed"); the adapter always emits the canonical string.
+	OutcomePatchFailed     ExecutionOutcome = "patch_failed"
+	OutcomeApplyFailed     ExecutionOutcome = "apply_failed"
+	OutcomeVerifyFailed    ExecutionOutcome = "verify_failed"
+	OutcomeSkipped         ExecutionOutcome = "skipped"
+	OutcomePendingApproval ExecutionOutcome = "pending_approval"
+	OutcomeRejected        ExecutionOutcome = "rejected"
+	OutcomeCompleted       ExecutionOutcome = "completed"
 )
 
 // Failed reports whether the outcome represents a failed execution.
@@ -99,11 +119,15 @@ func (o ExecutionOutcome) Failed() bool {
 // always classify identically.
 func ClassifyOutcome(o ExecutionOutcome) FailureClass {
 	switch o {
-	case OutcomeNoArtifact, OutcomeArtifactProduced:
+	case OutcomeNoArtifact, OutcomeArtifactProduced, OutcomeChanged, OutcomeCreated,
+		OutcomeNoChange, OutcomeCompleted, OutcomeSkipped, OutcomePendingApproval:
+		// Successes and non-failure outcomes are classified as transient
+		// (never permanent): the recovery matrix is only consulted for actual
+		// failures, and the success/human outcomes are decided before it.
 		return FailureTransient
-	case OutcomeCancelled:
+	case OutcomeCancelled, OutcomeRejected, OutcomeArtifactRejected:
 		return FailurePermanent
-	case OutcomeFailed, OutcomePatchGenFailed:
+	case OutcomeFailed, OutcomePatchGenFailed, OutcomePatchFailed, OutcomeApplyFailed, OutcomeVerifyFailed:
 		return FailureRecoverable
 	default:
 		return FailurePermanent
@@ -134,6 +158,14 @@ type Observation struct {
 	Evidence string
 	// Outcome is the normalized authoritative execution outcome.
 	Outcome ExecutionOutcome
+	// PatchID is the approval-held patch identity when Outcome is
+	// pending_approval (authoritative). It is the ONLY handle the loop may
+	// forward to the human approval boundary; the loop never inspects the patch.
+	PatchID string
+	// ClarificationRequired is true when the execution demanded human input
+	// before any model call or mutation (no invocation occurred). The loop
+	// parks at AwaitingHuman instead of treating it as a failure.
+	ClarificationRequired bool
 	// Verification is the verification outcome (populated post-execution).
 	Verification VerificationOutcome
 	// TokenUsage is the provider usage accounted by the loop for bounds.
@@ -183,6 +215,13 @@ func (a LoopAction) Valid() bool {
 type LoopDecision struct {
 	Action LoopAction
 	Reason string
+	// PatchID is the approval-held patch identity when Action is LoopAskHuman
+	// and the boundary is an approval gate. It is carried onto the
+	// HumanBoundary verbatim; the loop never inspects the patch.
+	PatchID string
+	// Options is the candidate list for a target-ambiguity AskHuman; nil for a
+	// yes/no decision.
+	Options []string
 }
 
 // Valid reports whether the decision carries a legal action.
@@ -238,6 +277,9 @@ type HumanBoundary struct {
 	// RequestID identifies the parked execution when the boundary is an
 	// approval gate.
 	RequestID string
+	// PatchID identifies the approval-held patch when the boundary is an
+	// approval gate. The human resumes via Approve/Reject of this identity.
+	PatchID string
 	// Options is the candidate list for a target ambiguity; nil for a
 	// yes/no decision.
 	Options []string
@@ -303,6 +345,9 @@ func (t RuntimeTransition) String() string {
 // provider, the PatchManager, or the filesystem directly.
 
 type LoopRequest struct {
+	// RequestID correlates the execution's lifecycle events and observation.
+	// Empty yields a deterministic auto-generated ID inside the runtime.
+	RequestID        string
 	Prompt           string
 	Target           string
 	Targets          []string
@@ -359,6 +404,22 @@ func (l *RuntimeLoop) Bounds() LoopBounds {
 		return DefaultLoopBounds()
 	}
 	return l.bounds
+}
+
+// Attempts returns the execution-attempt counter for the current objective.
+func (l *RuntimeLoop) Attempts() int {
+	if l == nil {
+		return 0
+	}
+	return l.attempts
+}
+
+// RecoveryCycles returns the recovery-cycle counter for the current objective.
+func (l *RuntimeLoop) RecoveryCycles() int {
+	if l == nil {
+		return 0
+	}
+	return l.recoveryCycles
 }
 
 // History returns the observed transitions, oldest first.
@@ -419,10 +480,12 @@ func (l *RuntimeLoop) Observe(o Observation) RuntimeState {
 //   - From AwaitingHuman only Abort is legal; re-entry happens via
 //     ReleaseHuman.
 //
-// Bounds are enforced at every decision position: when a bound is violated the
-// loop terminates with RuntimeAborted. A cancelled context terminates with
-// FailurePermanent. Terminal loops reject further steps. An invalid or illegal
-// decision is rejected, never silently accepted.
+// Bounds are enforced at execution-bound decision positions (Continue/Retry/
+// Repair): when a bound is violated the loop terminates with RuntimeAborted
+// before the next execution. Non-executing decisions (Complete/AskHuman/Abort)
+// are never budget-gated. A cancelled context terminates with FailurePermanent.
+// Terminal loops reject further steps. An invalid or illegal decision is
+// rejected, never silently accepted.
 func (l *RuntimeLoop) Step(ctx context.Context, d LoopDecision) (RuntimeState, error) {
 	if l == nil {
 		return "", errors.New("autonomy: nil runtime loop")
@@ -453,9 +516,16 @@ func (l *RuntimeLoop) Step(ctx context.Context, d LoopDecision) (RuntimeState, e
 		}
 	}
 
-	// Enforce remaining bounds at decision positions.
-	if t := l.violation(); t != nil {
-		return l.terminate(LoopAbort, t.State, t.Reason, t.Class), nil
+	// Enforce remaining bounds at decision positions — but ONLY for
+	// execution-bound decisions (Continue/Retry/Repair). Bounds gate the NEXT
+	// execution, never a legitimate completion or a human park: a Complete
+	// decision is honored exactly at the attempt bound, and RecoverFailure's
+	// "bounds exhausted → AskHuman" parks the loop instead of aborting it.
+	executionBound := d.Action == LoopContinue || d.Action == LoopRetry || d.Action == LoopRepair
+	if executionBound {
+		if t := l.violation(); t != nil {
+			return l.terminate(LoopAbort, t.State, t.Reason, t.Class), nil
+		}
 	}
 
 	if !l.legalFrom(l.state, d.Action) {
@@ -463,7 +533,7 @@ func (l *RuntimeLoop) Step(ctx context.Context, d LoopDecision) (RuntimeState, e
 	}
 
 	next := l.applyDecision(d)
-	if !next.IsTerminal() {
+	if !next.IsTerminal() && executionBound {
 		if t := l.violation(); t != nil {
 			return l.terminate(LoopAbort, t.State, t.Reason, t.Class), nil
 		}
@@ -494,26 +564,25 @@ func (l *RuntimeLoop) ConsumeVerification(o Observation) RuntimeState {
 	return l.push(LoopContinue, RuntimeInterpreting, "verification consumed")
 }
 
-// applyDecision applies a validated decision from a decision position.
+// applyDecision applies a validated decision from a decision position. The
+// transition is recorded with the true from-state (push captures it before
+// moving), so the history/event projection never shows self-transitions.
 func (l *RuntimeLoop) applyDecision(d LoopDecision) RuntimeState {
 	l.recordUsage(d)
 
 	switch d.Action {
 	case LoopContinue, LoopRetry:
-		l.state = RuntimeExecuting
+		l.push(d.Action, RuntimeExecuting, d.Reason)
 	case LoopRepair:
 		l.recoveryCycles++
-		l.state = RuntimeRecovering
+		l.push(d.Action, RuntimeRecovering, d.Reason)
 	case LoopComplete:
 		l.terminate(LoopComplete, RuntimeCompleted, d.Reason, "")
 	case LoopAskHuman:
-		l.state = RuntimeAwaitingHuman
-		l.boundary = &HumanBoundary{Reason: d.Reason}
+		l.push(d.Action, RuntimeAwaitingHuman, d.Reason)
+		l.boundary = &HumanBoundary{Reason: d.Reason, PatchID: d.PatchID, Options: d.Options}
 	case LoopAbort:
 		l.terminate(LoopAbort, RuntimeAborted, d.Reason, FailurePermanent)
-	}
-	if !l.state.IsTerminal() {
-		l.push(d.Action, l.state, d.Reason)
 	}
 	return l.state
 }
