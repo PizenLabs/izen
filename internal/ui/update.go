@@ -1056,6 +1056,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// result through the same executionResultUpdate projection.
 		return m.handleGatedExecution(msg)
 
+	case autonomousRunMsg:
+		// ── PRODUCTION AUTONOMOUS DRIVER OUTCOME (Phase 6) ───────────
+		// The bounded driver Run/Resume/Abort returned: a terminal outcome
+		// (completed/aborted) is projected; a nil term means the run parked at
+		// a human boundary (approve/clarify/inform) and the boundary card
+		// renders for the operator's decision.
+		return m, m.handleAutonomousRun(msg)
+
 	case TokenUsageMsg:
 		// TokenUsageMsg is dispatched on EVERY async execution exit path —
 		// success, parse error, truncation, or abort — so the status bar

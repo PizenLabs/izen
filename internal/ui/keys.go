@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
@@ -441,6 +442,52 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// while an approval or ambiguity card is on screen.
 		if m.ti.Focused() && isPrintableRunes(msg) {
 			return m, m.forwardToInput(msg)
+		}
+
+		// ── PRODUCTION AUTONOMOUS DRIVER BOUNDARY (Phase 6) ─────────
+		// A parked autonomous run holds one human decision: approve the held
+		// mutation (Alt+A / Enter), reject it (Alt+R / Esc), pick a clarify
+		// candidate (↑/↓ + Enter), or abort the parked run (Ctrl+C). The
+		// driver owns the loop; the UI only decides and resumes.
+		if m.autonomousParked() {
+			b := m.autonomousBoundary
+			switch {
+			case b.Action == autonomy.HumanBoundaryApproval &&
+				(msg.String() == "alt+a" || msg.Type == tea.KeyEnter):
+				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Approved — runtime applying patch..."))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, m.resumeAutonomousApprove()
+			case b.Action == autonomy.HumanBoundaryClarify && msg.Type == tea.KeyUp:
+				m.navigateAutonomousBoundary(-1)
+				return m, nil
+			case b.Action == autonomy.HumanBoundaryClarify && msg.Type == tea.KeyDown:
+				m.navigateAutonomousBoundary(1)
+				return m, nil
+			case b.Action == autonomy.HumanBoundaryClarify && msg.Type == tea.KeyEnter:
+				m.push(roleSystem, infoStyle.Render("  target selected — resuming the run..."))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, m.resumeAutonomousClarify()
+			case b.Action == autonomy.HumanBoundaryApproval &&
+				(msg.String() == "alt+r" || msg.Type == tea.KeyEscape):
+				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Rejected — runtime finalizing. No files were modified."))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, m.resumeAutonomousReject("rejected by operator")
+			case b.Action == autonomy.HumanBoundaryInform &&
+				(msg.String() == "alt+r" || msg.Type == tea.KeyEscape):
+				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Dismissed — autonomous run aborted."))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, m.abortAutonomousRun("dismissed by operator")
+			case b.Action == autonomy.HumanBoundaryClarify && msg.Type == tea.KeyEscape:
+				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Cancelled — autonomous run aborted."))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, m.abortAutonomousRun("cancelled by operator")
+			}
+			return m, nil
 		}
 
 		// ── Hybrid Intent Gateway mode-selection prompt ─────────────

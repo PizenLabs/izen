@@ -41,6 +41,11 @@ const (
 	OpAsk         OperationKind = "ask"
 	OpPlan        OperationKind = "plan"
 	OpShell       OperationKind = "shell"
+	// OpAutonomous is the production autonomous Driver loop (Phase 6): the
+	// bounded observe→decide→execute→interpret loop over the RuntimeExecutor.
+	// It is the foreground operation that owns the driver run's spinner and
+	// cancellation context.
+	OpAutonomous OperationKind = "autonomous"
 )
 
 // String returns the canonical kind name.
@@ -307,6 +312,15 @@ func (m *model) handleCtrlC() (bool, tea.Cmd) {
 	if !m.cancelGraceDeadline.IsZero() && time.Now().Before(m.cancelGraceDeadline) {
 		m.hardExit130()
 		return true, nil
+	}
+	// A parked autonomous run is cancelled through the driver's Abort: no
+	// worker is blocked and the run already holds its state.
+	if m.autonomousParked() {
+		m.armCancelGrace()
+		m.push(roleSystem, infoStyle.Render("  Cancelling the parked autonomous run..."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return true, m.abortAutonomousRun("ctrl-c")
 	}
 	if m.activeOp != nil || m.isWorkflowBusy() {
 		m.armCancelGrace()

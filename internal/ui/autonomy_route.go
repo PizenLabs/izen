@@ -94,51 +94,25 @@ func (m *model) executeAutonomyWorkspace(trace autonomy.Trace) tea.Cmd {
 		m.currentResult = nil
 		m.setMode(mode)
 	}
-	m.publishAutonomyLoop(trace)
 	switch mode {
 	case modes.ModeInvestigate:
 		return m.runInvestigateCmd(trace.Input)
 	case modes.ModeBuild:
-		// A BUILD workspace executes through the RuntimeExecutor boundary: the
-		// runtime owns provider invocation, patch creation, the approval gate,
-		// apply and verification, and emits the canonical lifecycle events. The
-		// UI projects results and approval. There is no legacy mode-engine
-		// mutation path on the production architecture.
+		// A BUILD workspace executes through the bounded autonomous Driver when
+		// it is wired (Phase 6): the driver owns resolve → observe → decide →
+		// execute → interpret → approval → complete through the RuntimeExecutor
+		// and publishes the canonical loop.transition events. The UI projects
+		// results, renders the parked human boundary and resumes it. When the
+		// driver is not wired (harness), the single-shot executor submission
+		// below is the compatibility path.
+		if m.autonomousDriver != nil {
+			return m.executeAutonomyViaDriver(trace)
+		}
 		return m.executeAutonomyViaRuntime(trace)
 	case modes.ModeReview:
 		return m.runReviewCmd("")
 	default: // plan / ask
 		return m.handleMessageContent(trace.Input)
-	}
-}
-
-// publishAutonomyLoop records the canonical execution chain the runtime owns
-// for the decided workspace. The loop state machine drives the transitions; the
-// UI only executes inside the current position. Transitions are published on
-// the shared bus so the event truth pipeline observes the loop.
-func (m *model) publishAutonomyLoop(trace autonomy.Trace) {
-	if m.autonomy == nil {
-		return
-	}
-	loop := autonomy.NewAutonomousLoop(3)
-	var trans []autonomy.LoopTransition
-	trans = append(trans, loop.Start("user objective: "+trace.Input)...)
-
-	switch trace.Intent.Intent {
-	case autonomy.IntentInvestigation, autonomy.IntentDebugging:
-		trans = append(trans, loop.EvidenceReady("evidence collected in INVESTIGATE workspace")...)
-	case autonomy.IntentPlanning:
-		trans = append(trans, loop.EvidenceReady("evidence sufficient — entering PLAN")...)
-	case autonomy.IntentVerification:
-		trans = append(trans, loop.EvidenceReady("evidence collected — entering REVIEW")...)
-	case autonomy.IntentModification, autonomy.IntentRefactoring:
-		trans = append(trans, loop.EvidenceReady("target resolved — entering PLAN")...)
-		trans = append(trans, loop.AuthorizeBuild("capability granted — entering BUILD")...)
-		trans = append(trans, loop.BuildDone("mutation dispatched")...)
-		trans = append(trans, loop.VerifyPassed("verification queued")...)
-	}
-	if len(trans) > 0 {
-		m.autonomy.PublishTransitions(trans)
 	}
 }
 
@@ -189,11 +163,6 @@ func (m *model) renderAutonomyDecision(trace autonomy.Trace) {
 	fmt.Fprintf(&b, "  workspace   : %s\n", trace.Route.Workspace)
 	marker, label := autonomyMarker(trace.Decision.Decision)
 	fmt.Fprintf(&b, "  decision    : %s%s (%s)\n", marker, label, trace.Decision.Reason)
-	if trace.Decision.Decision == autonomy.DecisionAutoContinue {
-		if loop := NewAutonomyLoopPreview(trace.Intent.Intent); len(loop) > 0 {
-			fmt.Fprintf(&b, "  loop        : %s\n", strings.Join(loop, " → "))
-		}
-	}
 	m.push(roleStatus, b.String())
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()

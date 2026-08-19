@@ -85,15 +85,6 @@ func TestAutonomyMarker(t *testing.T) {
 	}
 }
 
-func TestNewAutonomyLoopPreview(t *testing.T) {
-	if got := NewAutonomyLoopPreview(autonomy.IntentModification); strings.Join(got, "→") != "investigate→plan→build→verify→diagnose ↺" {
-		t.Errorf("mutation loop preview = %v", got)
-	}
-	if got := NewAutonomyLoopPreview(autonomy.IntentConversation); got != nil {
-		t.Errorf("conversation loop preview = %v, want nil", got)
-	}
-}
-
 func TestRunAutonomyDecideCmdWired(t *testing.T) {
 	m := &model{autonomy: autonomy.NewEngine(autonomy.WithScope("repository"))}
 	cmd := m.runAutonomyDecideCmd("remove unused content from @index.html")

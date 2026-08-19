@@ -63,15 +63,6 @@ func (m *model) runAutonomyDecideCmd(content string) tea.Cmd {
 		b.WriteString("\n  " + infoStyle.Render("Direct response — no execution workspace, no timeline.") + "\n")
 	}
 
-	// Autonomous loop preview: show what the runtime WOULD do inside the
-	// selected capability domain.
-	if trace.Decision.Decision == autonomy.DecisionAutoContinue {
-		loop := NewAutonomyLoopPreview(trace.Intent.Intent)
-		if len(loop) > 0 {
-			fmt.Fprintf(&b, "  loop        : %s\n", strings.Join(loop, " → "))
-		}
-	}
-
 	m.push(roleStatus, b.String())
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
@@ -101,31 +92,6 @@ func capNames(caps autonomy.CapabilitySet) []string {
 		out = append(out, string(c))
 	}
 	return out
-}
-
-// NewAutonomyLoopPreview projects the canonical autonomous loop for an intent:
-// investigate → plan → build → verify, with diagnosis feedback on failure. It
-// is a pure description of the loop contract — it executes nothing.
-func NewAutonomyLoopPreview(i autonomy.Intent) []string {
-	if i == autonomy.IntentConversation {
-		return nil
-	}
-	if !i.RequiresWorkspace() {
-		return nil
-	}
-	if i.RequiresMutation() {
-		return []string{"investigate", "plan", "build", "verify", "diagnose ↺"}
-	}
-	switch i {
-	case autonomy.IntentInvestigation, autonomy.IntentDebugging:
-		return []string{"investigate", "evidence", "report"}
-	case autonomy.IntentPlanning:
-		return []string{"investigate", "plan", "propose"}
-	case autonomy.IntentVerification:
-		return []string{"review", "verify", "report"}
-	default:
-		return []string{"ask", "read", "answer"}
-	}
 }
 
 // handleAutonomyGrant is the DEPRECATED /grant command handler. Grant is no

@@ -45,6 +45,7 @@ import (
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/runtime"
+	runtimeAutonomy "github.com/PizenLabs/izen/internal/runtime/autonomy"
 	"github.com/PizenLabs/izen/internal/runtime/handlers"
 	"github.com/PizenLabs/izen/internal/session"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
@@ -159,6 +160,14 @@ type Application struct {
 	// records session capability grants, and drives the autonomous loop. Every
 	// decision is published as a canonical event on the shared bus.
 	Autonomy *autonomy.Engine
+
+	// ── Autonomous runtime loop (Phase 5) ──────────────────────────────
+	// Autonomous is the real bounded loop: it drives Observe → Decide →
+	// Execute → Interpret over the single RuntimeExecutor authority (through
+	// the composition-boundary adapter) and publishes every transition as a
+	// canonical loop.transition event. It is a consumer of the executor — never
+	// a second execution authority. Headless runs and the UI both consume it.
+	Autonomous *runtimeAutonomy.Driver
 
 	// provider is the resolved default AI provider from Manager. It is nil
 	// when no provider is configured.
@@ -587,6 +596,18 @@ func Wire(opts ...Option) (*Application, error) {
 		}))
 	}
 	a.Autonomy = autonomy.NewEngine(autoOpts...)
+
+	// ── AUTONOMOUS RUNTIME LOOP (Phase 5) ───────────────────────────────
+	// The real bounded loop is bound to the RuntimeExecutor through the
+	// composition-boundary adapter. The loop is a consumer of the executor:
+	// it resolves targets via the IntentGateway, submits ExecuteRequests
+	// through the RuntimeExecutor, forwards approvals via Approve/Reject, and
+	// publishes loop.transition transitions on the shared bus. The presentation
+	// layer only projects those events.
+	a.Autonomous = runtimeAutonomy.NewDriver(
+		runtimeAutonomy.NewExecutorAdapter(root, a.Gateway, a.Executor),
+		a.Bus,
+	)
 
 	// ── MULTI-TIER PATCH ENGINE ──────────────────────────────────────────
 	// The new patch engine replaces the legacy patch application pipeline in

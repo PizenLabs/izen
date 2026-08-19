@@ -253,6 +253,15 @@ func (m *model) renderProposalBlock() string {
 
 	switch m.state {
 	case StateAwaitingApproval:
+		// ── Production Autonomous Driver Boundary (Phase 6) ──────────
+		// A parked driver run holds one human decision (approve / clarify /
+		// inform). The boundary card is the ONLY decision surface for a parked
+		// run; it renders ahead of every other approval widget.
+		if m.autonomousParked() {
+			b.WriteString(m.renderAutonomousBoundaryBlock(width))
+			break
+		}
+
 		// ── Build Approval Permission Box (SHELL_EXEC gate) ─────────────
 		if m.pendingBuildApproval && m.pendingBuildTask != nil {
 			task := m.pendingBuildTask

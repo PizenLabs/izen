@@ -881,6 +881,27 @@ type model struct {
 	// RuntimeExecutor.Approve applies them.
 	executorPendingTargets []string
 
+	// ── PRODUCTION AUTONOMOUS DRIVER BRIDGE (Phase 6) ────────────────
+	// autonomousDriver is the composition-bound runtime autonomy Driver, driven
+	// through a structural interface so this package never imports
+	// internal/runtime/autonomy (architecture invariant). The driver owns the
+	// bounded loop; the UI initiates (Run), resumes (ResumeApprove/Reject/
+	// Clarify) and aborts (Abort) parked runs, and projects its state. Nil in
+	// harnesses without the driver wired — those fall back to the legacy
+	// single-shot executor path.
+	autonomousDriver autonomousDriver
+	// autonomousActive is true while a driver Run command is in flight
+	// (executing or parked). It gates duplicate-start protection in the UI.
+	autonomousActive bool
+	// autonomousBoundary is the snapshot of the driver's parked boundary while
+	// awaiting a human response (approve/clarify/inform).
+	autonomousBoundary *autonomy.HumanBoundary
+	// autonomousSelect is the highlighted candidate index of a parked
+	// clarify boundary.
+	autonomousSelect int
+	// autonomousObjective is the objective of the active/parked driver run.
+	autonomousObjective string
+
 	// microkernel is the immutable microkernel pipeline adapter. It primes
 	// plan/investigate command handling for greenfield generation prompts so
 	// the TUI renders explicit file targets instead of the legacy heuristic
@@ -2303,10 +2324,25 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	m.push(roleSystem, infoStyle.Render("Interrupted."))
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
-	return m, tea.Batch(
+
+	// 5b. Abort any parked autonomous run. The driver holds its own loop state
+	// (no worker is blocked); Abort terminates it as a permanent human
+	// cancellation and the terminal message projects through the normal
+	// autonomousRunMsg path.
+	var extra []tea.Cmd
+	if m.autonomousDriver != nil && m.autonomousBoundary != nil {
+		driver := m.autonomousDriver
+		m.clearAutonomousRun()
+		extra = append(extra, func() tea.Msg {
+			term, err := driver.Abort(reason + " interrupt")
+			return autonomousRunMsg{term: term, err: err}
+		})
+	}
+
+	return m, tea.Batch(append(extra,
 		func() tea.Msg { return TaskFinishedMsg{} },
 		m.runtimeCancelCmd(reason+" interrupt"),
-	)
+	)...)
 }
 
 // syncUIState projects the canonical workflow state onto the presentation
