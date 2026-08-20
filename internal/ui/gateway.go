@@ -110,6 +110,45 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	m.executionResolving = true
 	m.agentLabel = ""
 
+	// ── EXECUTOR STREAMING ─────────────────────────────────────────────
+	// Reuse the same incremental streaming mechanism as /ask: a channel +
+	// reader goroutine + callback. The executor invokes the callback for each
+	// content delta, first token, and completion. The UI reads from the channel
+	// and renders incrementally via the existing tokenMsg/streamDoneMsg handlers.
+	m.execStreamCh = make(chan tea.Msg, 1024)
+	m.execStreaming = true
+	m.spinnerFrame = 0
+	m.startShimmer("Waiting for model...", "execution")
+	m.setStage("model", m.cfg.ActiveModelName(), stageWaiting)
+
+	req.StreamCallback = func(ev execution.StreamEvent) {
+		// Capture channel locally to avoid race with cleanup
+		ch := m.execStreamCh
+		if ch == nil {
+			return
+		}
+		switch ev.Kind {
+		case "first_token":
+			ch <- tokenMsg("")
+		case "content_delta":
+			if ev.Content != "" {
+				ch <- tokenMsg(ev.Content)
+			}
+		case "done":
+			ch <- streamDoneMsg{
+				content:        ev.Content,
+				tokenInput:     ev.Usage.PromptTokens,
+				tokenOutput:    ev.Usage.CompletionTokens,
+				usageEstimated: ev.Usage.Estimated,
+				truncated:      strings.EqualFold(strings.TrimSpace(ev.FinishReason), "length"),
+			}
+		case "error":
+			if ev.Err != nil {
+				ch <- streamErrMsg{err: ev.Err}
+			}
+		}
+	}
+
 	// ── LOADING DOCK: SPINNER + TIPS, EVENT-DERIVED TEXT ──────────────
 	// The dock stays alive (spinner + tips) while its text derives EXCLUSIVELY
 	// from the execution-view projection (real runtime events) and the
@@ -132,13 +171,22 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	execCtx, execCancel := context.WithTimeout(m.operationContext(), 5*time.Minute)
 	m.streamCancel = execCancel
 	m.registerBackgroundCancel(execCancel)
-	return func() tea.Msg {
+
+	// Reader goroutine: reads from execStreamCh and returns messages to Update loop
+	readerCmd := func() tea.Msg {
+		return m.readExecStream()
+	}
+
+	// Executor background task
+	executorCmd := func() tea.Msg {
 		res, err := m.executor.Execute(execCtx, req)
 		if res == nil {
 			res = &execution.ExecutionResult{RequestID: req.RequestID}
 		}
 		return gatedExecutionMsg{res: res, det: det, err: err}
 	}
+
+	return tea.Batch(readerCmd, executorCmd, m.smoothStreamTickCmd(), m.shimmerTickCmd())
 }
 
 // executionFirstTarget returns the first resolved mutation target, or "".
@@ -228,6 +276,14 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		if execErr == nil {
 			execErr = msg.res.Err
 		}
+		var usageCmd tea.Cmd
+		if msg.res != nil {
+			usageCmd = m.tokenUsageCmdKnown(
+				msg.res.Completed.InputTokens,
+				msg.res.Completed.OutputTokens,
+				msg.res.Completed.Known,
+			)
+		}
 		// Classify the terminal outcome truthfully: a cancellation or timeout is
 		// distinct from a hard failure (the watchdog and the execView both
 		// report it as such, never as a fabricated failure).
@@ -236,16 +292,15 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 			m.recordRuntimeProof(msg.res)
 		}
 		m.finalizeOperation(outcome, execErr)
-		switch outcome {
-		case OpOutcomeCancelled:
+		if outcome == OpOutcomeCancelled {
 			m.push(roleSystem, infoStyle.Render("Cancelled. No files were modified."))
-		default:
-			m.push(roleError, "Execution failed: "+execErr.Error())
+		} else {
+			m.push(roleError, runtimeExecutionFailureMessage(msg.res, execErr))
 			m.push(roleSystem, infoStyle.Render("No files were modified."))
 		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
-		return m, m.flushPendingRecords()
+		return m, tea.Batch(m.flushPendingRecords(), usageCmd)
 	}
 	res := msg.res
 	if res == nil {
@@ -348,6 +403,44 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
 	}
 
+	// ── TRUNCATED TERMINAL ───────────────────────────────────────────
+	// The provider reported finish_reason=length. This is a terminal
+	// execution fact, distinct from artifact syntax rejection, and must never
+	// fall through to "Completed — nothing produced."
+	if res.Proof != nil && res.Proof.Outcome == execution.OutcomeTruncated {
+		m.executorPendingPatchID = ""
+		m.executorPendingTargets = nil
+		m.pendingHotfixTask = nil
+		m.pendingHotfixPatch = nil
+		m.pendingProposals = nil
+		m.resolveApprovalState()
+		m.finalizeOperation(OpOutcomeFailure, res.Err)
+		m.push(roleError, runtimeExecutionFailureMessage(res, res.Err))
+		m.push(roleSystem, infoStyle.Render("No files were modified."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
+	}
+
+	// ── RETRYABLE ARTIFACT REJECTION TERMINAL ────────────────────────
+	// The artifact gate preserved a DecisionRetry verdict. The UI reports the
+	// terminal boundary explicitly; recovery ownership remains with the runtime
+	// driver, not a hidden UI retry.
+	if res.Proof != nil && res.Proof.Outcome == execution.OutcomeArtifactRetryableRejected {
+		m.executorPendingPatchID = ""
+		m.executorPendingTargets = nil
+		m.pendingHotfixTask = nil
+		m.pendingHotfixPatch = nil
+		m.pendingProposals = nil
+		m.resolveApprovalState()
+		m.finalizeOperation(OpOutcomeFailure, res.Err)
+		m.push(roleError, runtimeExecutionFailureMessage(res, res.Err))
+		m.push(roleSystem, infoStyle.Render("No files were modified."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
+	}
+
 	// ── CLARIFICATION REQUIRED (no model call, no mutation) ────────
 	if res.ClarificationRequired {
 		m.finalizeOperation(OpOutcomeAmbiguous, nil)
@@ -408,6 +501,23 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
 	return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
+}
+
+func runtimeExecutionFailureMessage(res *execution.ExecutionResult, err error) string {
+	if res != nil && res.Proof != nil {
+		switch res.Proof.Outcome {
+		case execution.OutcomeTruncated:
+			return "Execution stopped: provider output was truncated (finish_reason=length)."
+		case execution.OutcomeArtifactRetryableRejected:
+			return "Execution stopped: artifact validation requested a model repair, but no recovery invocation was run in this workflow."
+		case execution.OutcomeArtifactRejected:
+			return "Execution failed: artifact rejected."
+		}
+	}
+	if err != nil {
+		return "Execution failed: " + err.Error()
+	}
+	return "Execution failed."
 }
 
 // runPromptExecution routes a $prompt action through the unified gateway. It is

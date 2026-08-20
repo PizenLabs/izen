@@ -720,9 +720,11 @@ type model struct {
 
 	// Streaming
 	streamCh        chan tea.Msg
+	execStreamCh    chan tea.Msg
 	responseBuffer  strings.Builder
 	reasoningBuffer strings.Builder
 	streaming       bool
+	execStreaming   bool
 	// traceBuffer accumulates the raw streamed response of the current/last
 	// completion so Ctrl+O can expand/collapse a full output-trace viewport
 	// even for models that emit no formal reasoning channel (e.g. Gemma family

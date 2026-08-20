@@ -44,6 +44,29 @@ import (
 // MutationSet transaction boundary. It never shares the UI's execution.Engine
 // mutation state, so the authority is unambiguous.
 
+// StreamEvent represents a streaming event from the provider during execution.
+// It is a domain-level type — no UI framework dependencies.
+type StreamEvent struct {
+	RequestID string
+	// Kind is the event kind: "first_token", "content_delta", "done", "error".
+	Kind string
+	// Content is the text content for content_delta events.
+	Content string
+	// FinishReason is the provider's finish_reason for done events.
+	FinishReason string
+	// Usage is the provider's usage for done events.
+	Usage ai.ProviderUsage
+	// Err is the error for error events.
+	Err error
+}
+
+// StreamCallback is an optional callback invoked during provider streaming.
+// It is called from the executor's streaming goroutine for each content delta,
+// first token, and completion. The callback must be non-blocking and return
+// quickly. It allows the UI to receive incremental streaming progress without
+// the executor depending on any UI framework.
+type StreamCallback func(StreamEvent)
+
 // ExecuteRequest is a user execution submitted to the runtime.
 type ExecuteRequest struct {
 	// RequestID correlates every lifecycle event of this execution. Empty
@@ -81,6 +104,11 @@ type ExecuteRequest struct {
 	// evidence; the full-file context the runtime reads is supporting context
 	// only (Phase 1 Step 5).
 	Evidence string
+	// StreamCallback is an optional callback for incremental streaming progress.
+	// When set, the executor invokes it during provider streaming for each
+	// content delta, first token, and completion. This enables the UI to
+	// render streaming output without the executor depending on any UI framework.
+	StreamCallback StreamCallback
 }
 
 // ModelInvocation records one provider call with its authoritative usage.
@@ -1087,7 +1115,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// model.invoked is emitted when the invocation BEGINS — before the
 		// provider call — so the event stream truthfully records the start.
 		g.BeginModel(model)
-		raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g)
+		raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
 		// The invocation evidence is built from the stream outcome REGARDLESS
 		// of the artifact result: the provider billed these tokens whether the
 		// stream succeeded, was cancelled mid-flight, or produced a malformed
@@ -1239,7 +1267,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	// model.invoked is emitted when the invocation BEGINS — before the provider
 	// call — so the event stream truthfully records the invocation start.
 	g.BeginModel(model)
-	raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g)
+	raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
 	if callErr != nil {
 		return "", inv, fmt.Errorf("executor: read-only invocation: %w", callErr)
 	}
@@ -1270,7 +1298,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 // reasoning.telemetry event on completion. The accumulated visible content and
 // the authoritative provider usage are returned; the authoritative artifact
 // always travels on the ExecutionResult afterwards.
-func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph) (string, ai.ProviderUsage, error) {
+func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback) (string, ai.ProviderUsage, error) {
 	var reasoningStartedAt time.Time
 	var reasoningDuration time.Duration
 	var reasoningSeen bool
@@ -1309,10 +1337,17 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		// stream get the full lifecycle, others stay correct.
 		resp, cerr := x.provider.Execute(ctx, req)
 		if cerr != nil {
+			if streamCb != nil {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
+			}
 			return "", ai.ProviderUsage{}, cerr
 		}
 		if resp == nil {
-			return "", ai.ProviderUsage{}, fmt.Errorf("executor: provider returned an empty response")
+			err := fmt.Errorf("executor: provider returned an empty response")
+			if streamCb != nil {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: err})
+			}
+			return "", ai.ProviderUsage{}, err
 		}
 		usage := resp.Usage
 		if !usage.Known && (resp.TokenInput > 0 || resp.TokenOutput > 0) {
@@ -1323,6 +1358,13 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 				CompletionTokens: resp.TokenOutput,
 				Known:            true,
 			}
+		}
+		if streamCb != nil {
+			streamCb(StreamEvent{RequestID: requestID, Kind: "first_token"})
+			if resp.Content != "" {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "content_delta", Content: resp.Content})
+			}
+			streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: usage.FinishReason, Usage: usage})
 		}
 		return ai.VisibleCompletion(resp.Content), usage, nil
 	}
@@ -1366,6 +1408,9 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		if !firstToken {
 			firstToken = true
 			g.FirstToken(model, time.Since(began))
+			if streamCb != nil {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "first_token"})
+			}
 		}
 		if tok.Kind == stream.TokenKindThinking {
 			reasoningOpen()
@@ -1377,6 +1422,9 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		// stream_delta is evidence transport: a dropped delta never loses
 		// execution truth because the content accumulates here regardless.
 		g.StreamDelta(tok.Text)
+		if streamCb != nil {
+			streamCb(StreamEvent{RequestID: requestID, Kind: "content_delta", Content: tok.Text})
+		}
 	}
 
 	flushStream := func() {
@@ -1390,6 +1438,9 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	for {
 		if cerr := ctx.Err(); cerr != nil {
 			reasoningClose()
+			if streamCb != nil {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
+			}
 			return content.String(), lastUsage, cerr
 		}
 		n, rerr := rawStream.Read(buf)
@@ -1408,7 +1459,13 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			flushStream()
 			reasoningClose()
 			if cerr := ctx.Err(); cerr != nil {
+				if streamCb != nil {
+					streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
+				}
 				return content.String(), lastUsage, cerr
+			}
+			if streamCb != nil {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: rerr})
 			}
 			return content.String(), lastUsage, rerr
 		}
@@ -1427,6 +1484,9 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	visible := ai.VisibleCompletion(content.String())
 	if strings.TrimSpace(visible) == "" && reasoningBuf.Len() > 0 {
 		visible = ai.VisibleCompletion(reasoningBuf.String())
+	}
+	if streamCb != nil {
+		streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: usage.FinishReason, Usage: usage})
 	}
 	return visible, usage, nil
 }

@@ -197,6 +197,22 @@ func TestNoImplicitExecutionRetry(t *testing.T) {
 	}
 }
 
+func TestDecideDefaultRecognizesRecoveryOutcomes(t *testing.T) {
+	for _, outcome := range []autonomy.ExecutionOutcome{
+		autonomy.OutcomeTruncated,
+		autonomy.OutcomeArtifactRetryableRejected,
+	} {
+		obs := autonomy.Observation{Outcome: outcome}
+		dec := decideDefault(obs, autonomy.DefaultLoopBounds())
+		if dec.Action != autonomy.LoopRepair {
+			t.Errorf("outcome %s decided %s (%q), want repair", outcome, dec.Action, dec.Reason)
+		}
+		if strings.Contains(dec.Reason, "unrecognized outcome") {
+			t.Errorf("outcome %s was treated as unrecognized: %q", outcome, dec.Reason)
+		}
+	}
+}
+
 // TestRetryStateIsExplicit verifies that retries/repairs explicitly transition through
 // RuntimeRecovering and increment loop counters.
 func TestRetryStateIsExplicit(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/execution"
 )
 
 // ── PRODUCTION AUTONOMOUS DRIVER BRIDGE (Phase 6) ───────────────────────────
@@ -60,6 +61,7 @@ type autonomousDriver interface {
 	State() autonomy.RuntimeState
 	Boundary() *autonomy.HumanBoundary
 	Termination() *autonomy.LoopTermination
+	SetStreamCallback(cb execution.StreamCallback)
 }
 
 // autonomousRunMsg carries a driver Run/Resume/Abort outcome back into the
@@ -93,11 +95,55 @@ func (m *model) runAutonomousDriver(objective string) tea.Cmd {
 	m.beginOperation(OpAutonomous)
 	m.agentLabel = ""
 	m.startShimmer("", "autonomy")
-	ctx := m.operationContext()
-	return func() tea.Msg {
-		term, err := m.autonomousDriver.Run(ctx, objective)
-		return autonomousRunMsg{term: term, err: err}
+
+	// Set up executor streaming (same mechanism as $prompt/$hot gateway path)
+	m.execStreamCh = make(chan tea.Msg, 1024)
+	m.execStreaming = true
+	m.spinnerFrame = 0
+	m.startShimmer("Waiting for model...", "autonomy")
+	m.setStage("model", m.cfg.ActiveModelName(), stageWaiting)
+
+	m.autonomousDriver.SetStreamCallback(func(ev execution.StreamEvent) {
+		ch := m.execStreamCh
+		if ch == nil {
+			return
+		}
+		switch ev.Kind {
+		case "first_token":
+			ch <- tokenMsg("")
+		case "content_delta":
+			if ev.Content != "" {
+				ch <- tokenMsg(ev.Content)
+			}
+		case "done":
+			ch <- streamDoneMsg{
+				content:        ev.Content,
+				tokenInput:     ev.Usage.PromptTokens,
+				tokenOutput:    ev.Usage.CompletionTokens,
+				usageEstimated: ev.Usage.Estimated,
+				truncated:      strings.EqualFold(strings.TrimSpace(ev.FinishReason), "length"),
+			}
+		case "error":
+			if ev.Err != nil {
+				ch <- streamErrMsg{err: ev.Err}
+			}
+		}
+	})
+
+	readerCmd := func() tea.Msg {
+		return m.readExecStream()
 	}
+
+	ctx := m.operationContext()
+	return tea.Batch(
+		readerCmd,
+		func() tea.Msg {
+			term, err := m.autonomousDriver.Run(ctx, objective)
+			return autonomousRunMsg{term: term, err: err}
+		},
+		m.smoothStreamTickCmd(),
+		m.shimmerTickCmd(),
+	)
 }
 
 // resumeAutonomousApprove approves the parked approval boundary. It first

@@ -2073,7 +2073,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.streamParser.ProcessChunk(raw)
 		}
 		var cmds []tea.Cmd
-		cmds = append(cmds, m.readStream())
+		if m.execStreaming {
+			cmds = append(cmds, m.readExecStream())
+		} else {
+			cmds = append(cmds, m.readStream())
+		}
 		// Full stream transparency: every content chunk is retained in the
 		// active ThinkingBuffer via the ThoughtBufferUpdatedMsg protocol so the
 		// Ctrl+O thought drawer renders the raw stream live.
@@ -2102,12 +2106,27 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		// The usage message was pulled off the stream channel — chain the next
 		// read so the token/done messages behind it keep flowing.
+		if m.execStreaming {
+			return m, m.readExecStream()
+		}
 		return m, m.readStream()
 
 	case streamDoneMsg:
 		// ── AUTHORITATIVE STAGE: provider stream completed ─────────
 		// A terminal stream is done; the stage can never linger as "streaming".
 		m.setStage("model", m.getActiveModelName(), stageDone)
+
+		// Handle executor streaming (gated path) separately from /ask streaming.
+		// The executor stream is for provider output during patch generation;
+		// the final result arrives via gatedExecutionMsg.
+		if m.execStreaming {
+			m.execStreamCh = nil
+			m.execStreaming = false
+			m.stopShimmer()
+			// The final result will arrive via gatedExecutionMsg -> executionResultUpdate
+			return m, nil
+		}
+
 		m.streamCh = nil
 		m.streaming = false
 		m.streamCancel = nil
@@ -2556,6 +2575,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, m.thoughtUpdateCmd("", true)
 
 	case streamErrMsg:
+		// Handle executor streaming error separately.
+		if m.execStreaming {
+			m.execStreamCh = nil
+			m.execStreaming = false
+			m.stopShimmer()
+			// The error will be surfaced via gatedExecutionMsg -> executionResultUpdate
+			return m, nil
+		}
+
 		// OPERATION LIFECYCLE: a stream error must release any in-flight
 		// build-patch operation (defensive; streams normally run without one).
 		m.finalizeBuildOperation(msg.err)

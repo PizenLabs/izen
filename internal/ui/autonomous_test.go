@@ -78,6 +78,29 @@ func (f *fakeAutonomousDriver) Boundary() *autonomy.HumanBoundary {
 }
 func (f *fakeAutonomousDriver) Termination() *autonomy.LoopTermination { return f.term }
 
+func (f *fakeAutonomousDriver) SetStreamCallback(cb execution.StreamCallback) {}
+
+// extractAutonomousRunMsg extracts an autonomousRunMsg from either a batch message
+// or a direct autonomousRunMsg.
+func extractAutonomousRunMsg(t *testing.T, msg tea.Msg) autonomousRunMsg {
+	t.Helper()
+	if batchMsg, ok := msg.(tea.BatchMsg); ok {
+		for _, c := range batchMsg {
+			if m := c(); m != nil {
+				if am, ok := m.(autonomousRunMsg); ok {
+					return am
+				}
+			}
+		}
+		t.Fatalf("batch must contain autonomousRunMsg, got %v", batchMsg)
+	}
+	if am, ok := msg.(autonomousRunMsg); ok {
+		return am
+	}
+	t.Fatalf("expected autonomousRunMsg or batch containing it, got %T", msg)
+	return autonomousRunMsg{}
+}
+
 // autonomousTestModel is a chat-ready model wired with the fake driver.
 func autonomousTestModel(drv *fakeAutonomousDriver) *model {
 	m := readyChatModel(newTestModel())
@@ -107,9 +130,21 @@ func TestAutonomousRunParksAtApproval(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("runAutonomousDriver must return a command")
 	}
-	msg, ok := cmd().(autonomousRunMsg)
-	if !ok {
-		t.Fatalf("cmd() = %T, want autonomousRunMsg", cmd())
+	// runAutonomousDriver returns a batch; execute it and find the autonomousRunMsg
+	batchMsg := cmd().(tea.BatchMsg)
+	var msg autonomousRunMsg
+	found := false
+	for _, c := range batchMsg {
+		if m := c(); m != nil {
+			if am, ok := m.(autonomousRunMsg); ok {
+				msg = am
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("batch must contain autonomousRunMsg, got %v", batchMsg)
 	}
 	next := m.handleAutonomousRun(msg)
 	if next != nil {
@@ -152,7 +187,21 @@ func TestAutonomousRunParksAtClarify(t *testing.T) {
 	m := autonomousTestModel(drv)
 
 	cmd := m.runAutonomousDriver("change @* to something")
-	msg := cmd().(autonomousRunMsg)
+	batchMsg := cmd().(tea.BatchMsg)
+	var msg autonomousRunMsg
+	found := false
+	for _, c := range batchMsg {
+		if m := c(); m != nil {
+			if am, ok := m.(autonomousRunMsg); ok {
+				msg = am
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("batch must contain autonomousRunMsg, got %v", batchMsg)
+	}
 	m.handleAutonomousRun(msg)
 	if m.autonomousBoundary == nil || m.autonomousBoundary.Action != autonomy.HumanBoundaryClarify {
 		t.Fatalf("boundary = %+v, want clarify", m.autonomousBoundary)
@@ -217,7 +266,7 @@ func TestAutonomousResumeApproveAuthorizesExecutor(t *testing.T) {
 
 	// Park the boundary first.
 	cmd := m.runAutonomousDriver("change bar to qux @note.txt")
-	msg := cmd().(autonomousRunMsg)
+	msg := extractAutonomousRunMsg(t, cmd())
 	m.handleAutonomousRun(msg)
 	if !m.autonomousParked() {
 		t.Fatal("run must be parked before approve")
@@ -227,7 +276,7 @@ func TestAutonomousResumeApproveAuthorizesExecutor(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("approve must return a command")
 	}
-	msg2 := cmd().(autonomousRunMsg)
+	msg2 := extractAutonomousRunMsg(t, cmd())
 	if msg2.term == nil || msg2.term.State != autonomy.RuntimeCompleted {
 		t.Fatalf("resume outcome = %+v, want completed", msg2.term)
 	}
@@ -270,14 +319,14 @@ func TestAutonomousAbortParkedProvesTerminal(t *testing.T) {
 	m := autonomousTestModel(drv)
 
 	cmd := m.runAutonomousDriver("change bar to qux @note.txt")
-	msg := cmd().(autonomousRunMsg)
+	msg := extractAutonomousRunMsg(t, cmd())
 	m.handleAutonomousRun(msg)
 
 	cmd = m.abortAutonomousRun("ctrl-c")
 	if cmd == nil {
 		t.Fatal("abort must return a command")
 	}
-	msg2 := cmd().(autonomousRunMsg)
+	msg2 := extractAutonomousRunMsg(t, cmd())
 	if msg2.term == nil || msg2.term.State != autonomy.RuntimeAborted {
 		t.Fatalf("abort outcome = %+v, want aborted", msg2.term)
 	}
@@ -311,7 +360,8 @@ func TestAutonomousDriverKeyBindings(t *testing.T) {
 	}
 	m := autonomousTestModel(drv)
 	cmd := m.runAutonomousDriver("change bar to qux @note.txt")
-	m.handleAutonomousRun(cmd().(autonomousRunMsg))
+	msg := extractAutonomousRunMsg(t, cmd())
+	m.handleAutonomousRun(msg)
 
 	// Esc rejects (through the executor-backed reject path).
 	_, kcmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
@@ -345,7 +395,9 @@ func TestAutonomousDriverKeyBindings(t *testing.T) {
 		},
 	}
 	m2 := autonomousTestModel(drv2)
-	m2.handleAutonomousRun(m2.runAutonomousDriver("change bar to qux @note.txt")().(autonomousRunMsg))
+	cmd = m2.runAutonomousDriver("change bar to qux @note.txt")
+	msg = extractAutonomousRunMsg(t, cmd())
+	m2.handleAutonomousRun(msg)
 	_, kcmd = m2.handleKey(tea.KeyMsg{Alt: true, Type: tea.KeyRunes, Runes: []rune{'a'}})
 	if kcmd == nil {
 		t.Fatal("Alt+A on a parked approval must return a command")
@@ -387,7 +439,9 @@ func TestAutonomousInformBoundaryRendersNonResumable(t *testing.T) {
 		term: nil,
 	}
 	m := autonomousTestModel(drv)
-	m.handleAutonomousRun(m.runAutonomousDriver("change bar to qux @note.txt")().(autonomousRunMsg))
+	cmd := m.runAutonomousDriver("change bar to qux @note.txt")
+	msg := extractAutonomousRunMsg(t, cmd())
+	m.handleAutonomousRun(msg)
 
 	if m.autonomousBoundary == nil || m.autonomousBoundary.Action != autonomy.HumanBoundaryInform {
 		t.Fatalf("boundary = %+v, want inform", m.autonomousBoundary)
@@ -419,7 +473,9 @@ func TestAutonomousDuplicateStartGuard(t *testing.T) {
 		},
 	}
 	m := autonomousTestModel(drv)
-	m.handleAutonomousRun(m.runAutonomousDriver("first")().(autonomousRunMsg))
+	cmd := m.runAutonomousDriver("first")
+	msg := extractAutonomousRunMsg(t, cmd())
+	m.handleAutonomousRun(msg)
 
 	if cmd := m.runAutonomousDriver("second"); cmd != nil {
 		t.Fatalf("second run while parked must be refused, got %v", cmd)

@@ -66,7 +66,7 @@ func TestInspectRetainsRuntimeGraph(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("nil command")
 	}
-	msg := cmd().(gatedExecutionMsg)
+	msg := extractGatedExecutionMsg(t, cmd)
 	if msg.err != nil {
 		t.Fatalf("execution err: %v", msg.err)
 	}

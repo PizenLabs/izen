@@ -107,6 +107,7 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		TargetConfidence: req.TargetConfidence,
 		Scope:            req.Scope,
 		Evidence:         req.Evidence,
+		StreamCallback:   req.StreamCallback,
 		// The strategy-selected output ceiling is a REQUEST budget, not a
 		// reporting change: max_tokens bounds the provider's generation so a
 		// verbose reasoning model cannot spend an unbounded output budget, and

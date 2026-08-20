@@ -48,7 +48,13 @@ func (m *mockProvider) Execute(_ context.Context, req ai.Request) (*ai.Response,
 }
 
 func (m *mockProvider) ExecuteStream(_ context.Context, _ ai.Request) (io.ReadCloser, error) {
-	return nil, fmt.Errorf("stream not supported in mock")
+	if m.callCount >= len(m.responses) {
+		return nil, fmt.Errorf("unexpected call #%d (only %d responses configured)", m.callCount+1, len(m.responses))
+	}
+	resp := m.responses[m.callCount]
+	m.callCount++
+	// Return a reader that streams the response content
+	return io.NopCloser(strings.NewReader(resp.Content)), nil
 }
 
 // drainCmds executes a tea.Cmd and returns every terminal message it yields,
@@ -72,6 +78,20 @@ func drainCmds(t *testing.T, c tea.Cmd) []tea.Msg {
 		out = append(out, msg)
 	}
 	return out
+}
+
+// extractGatedExecutionMsg executes a command and returns the gatedExecutionMsg
+// from the result, handling both direct messages and batch messages.
+func extractGatedExecutionMsg(t *testing.T, c tea.Cmd) gatedExecutionMsg {
+	t.Helper()
+	msgs := drainCmds(t, c)
+	for _, msg := range msgs {
+		if gem, ok := msg.(gatedExecutionMsg); ok {
+			return gem
+		}
+	}
+	t.Fatalf("no gatedExecutionMsg found in command result, got %v", msgs)
+	return gatedExecutionMsg{}
 }
 
 // recordsText joins every record the model has pushed so tests can assert what

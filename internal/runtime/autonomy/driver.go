@@ -8,6 +8,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/execution"
 )
 
 // Decider maps a bounded observation to the next loop decision. It is
@@ -49,6 +50,10 @@ type Driver struct {
 	// runID is a monotonically increasing identity for each run.
 	// Late results from a previous run cannot overwrite a newer run's state.
 	runID uint64
+
+	// streamCb is an optional callback for incremental streaming progress during
+	// provider invocations. Set by the UI before Run; cleared after each run.
+	streamCb execution.StreamCallback
 }
 
 // Option configures the Driver during construction.
@@ -75,6 +80,13 @@ func WithRepair(f RepairFunc) Option {
 			d.repair = f
 		}
 	}
+}
+
+// WithStreamCallback sets a callback for incremental streaming progress during
+// provider invocations. The callback is invoked for each content delta, first
+// token, and completion. It is cleared after each run.
+func WithStreamCallback(cb execution.StreamCallback) Option {
+	return func(d *Driver) { d.streamCb = cb }
 }
 
 // NewDriver wires the bounded loop over the executor adapter. bus may be nil
@@ -127,7 +139,13 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	// never guesses a target. A clarification boundary parks BEFORE any
 	// execution — no model call, no mutation.
 	d.resolved = d.adapter.Resolve(objective)
-	d.req = autonomy.LoopRequest{Prompt: objective, Targets: d.resolved.Targets}
+	d.req = autonomy.LoopRequest{
+		Prompt:           objective,
+		Targets:          d.resolved.Targets,
+		StreamCallback:   d.streamCb,
+	}
+	// Clear the callback after capturing it for this run.
+	d.streamCb = nil
 	if d.resolved.Ambiguous {
 		d.loop.AwaitHuman(autonomy.HumanBoundary{
 			Reason:  "target clarification required before any execution",
@@ -318,6 +336,12 @@ func (d *Driver) History() []autonomy.RuntimeTransition {
 // LastObservation returns the most recent observation the driver consumed.
 func (d *Driver) LastObservation() autonomy.Observation { return d.obs }
 
+// SetStreamCallback sets a callback for incremental streaming progress during
+// the next provider invocation. It is called by the UI before Run.
+func (d *Driver) SetStreamCallback(cb execution.StreamCallback) {
+	d.streamCb = cb
+}
+
 // ── drive helpers ───────────────────────────────────────────────────────────
 
 // observeAndRun pushes the current observation through Observe → decide →
@@ -477,7 +501,8 @@ func (d *Driver) terminateAbort(ctx context.Context, reason string, class autono
 //	pending_approval                     → ask_human (approval gate, patch id)
 //	clarification required               → ask_human
 //	cancelled/rejected/artifact_rejected → abort (permanent, never auto-retry)
-//	no_artifact/failed/patch/apply/verify → canonical recovery matrix (bounded)
+//	no_artifact/failed/patch/apply/verify/truncated/retryable_artifact
+//	                                    → canonical recovery matrix (bounded)
 func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopDecision {
 	if o.ClarificationRequired {
 		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
@@ -496,7 +521,7 @@ func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopD
 			Reason: "terminal outcome: " + string(o.Outcome)}
 	case autonomy.OutcomeNoArtifact, autonomy.OutcomeFailed, autonomy.OutcomePatchGenFailed,
 		autonomy.OutcomePatchFailed, autonomy.OutcomeApplyFailed, autonomy.OutcomeVerifyFailed,
-		autonomy.OutcomeSkipped:
+		autonomy.OutcomeSkipped, autonomy.OutcomeArtifactRetryableRejected, autonomy.OutcomeTruncated:
 		return autonomy.RecoverFailure(o, autonomy.ClassifyOutcome(o.Outcome), b)
 	case "":
 		return autonomy.LoopDecision{Action: autonomy.LoopContinue,

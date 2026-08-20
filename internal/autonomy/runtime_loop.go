@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"github.com/PizenLabs/izen/internal/execution"
 )
 
 // ── RuntimeState ────────────────────────────────────────────────────────────
@@ -414,6 +416,10 @@ type LoopRequest struct {
 	IntentConfidence float64
 	TargetConfidence float64
 	Scope            string
+	// StreamCallback is an optional callback for incremental streaming progress.
+	// When set, the executor invokes it during provider streaming for each
+	// content delta, first token, and completion.
+	StreamCallback execution.StreamCallback
 }
 
 // Executor is the ONLY authority the loop may invoke. The loop is a consumer
