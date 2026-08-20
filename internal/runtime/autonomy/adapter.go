@@ -107,6 +107,15 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		TargetConfidence: req.TargetConfidence,
 		Scope:            req.Scope,
 		Evidence:         req.Evidence,
+		// The strategy-selected output ceiling is a REQUEST budget, not a
+		// reporting change: max_tokens bounds the provider's generation so a
+		// verbose reasoning model cannot spend an unbounded output budget, and
+		// whatever the provider does bill is reported verbatim (finalizeResult
+		// preserves the authoritative usage). The /build path already carries
+		// this bound via the intent gateway; the autonomous path must apply the
+		// same strategy-owned bound or it runs unbounded (the 5,883-token
+		// repro: max_tokens was omitted because req.MaxOutputTokens stayed 0).
+		MaxOutputTokens: profile.MaxOutputTokens,
 	}
 	res, err := a.executor.Execute(ctx, execReq)
 	if err != nil && res == nil {

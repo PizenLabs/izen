@@ -2,7 +2,10 @@ package autonomy
 
 import (
 	"context"
+	"errors"
+	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -324,7 +327,149 @@ func htmlTestHarness(t *testing.T) (string, *mockProvider, *ExecutorAdapter, *ev
 	return root, mock, NewExecutorAdapter(root, execution.NewIntentGateway(root), x), bus
 }
 
-// TestHTMLApprovalConvergesExactlyOnce is the P0/P1 acceptance regression: one
+// TestSingleObjectiveDoesNotImplicitlyReinvokeProvider is the P0 loop-level
+// pin for the 5,883-token repro: ONE objective through the full autonomous
+// lifecycle (Run → approval → completed) triggers EXACTLY ONE provider
+// invocation. The authoritative usage (5883 output / 5000 reasoning) is
+// observable on the loop's event bus as provider.usage_update — the number
+// OpenRouter billed survives the loop verbatim, and no implicit re-invocation
+// ever re-runs the model.
+func TestSingleObjectiveDoesNotImplicitlyReinvokeProvider(t *testing.T) {
+	root := t.TempDir()
+	writeTarget(t, root, "index.html", htmlOriginal)
+	bus := events.NewBus(events.DefaultBufferSize)
+
+	stream := &reproUsageStream{
+		content: []byte(htmlReplace),
+		usage: ai.ProviderUsage{
+			PromptTokens:     2181,
+			CompletionTokens: 5883,
+			ReasoningTokens:  5000,
+			TotalTokens:      7064,
+			Known:            true,
+		},
+	}
+	prov := &reproStreamProvider{stream: stream}
+	cfg := config.Default()
+	x := execution.NewRuntimeExecutor(root, cfg, prov, bus, language.HTML)
+	x.SetAuthorization(&authorization.MutationAuthorization{
+		ID:        authorization.NewAuthorizationID(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	adapter := NewExecutorAdapter(root, execution.NewIntentGateway(root), x)
+	driver := NewDriver(adapter, bus)
+
+	// Subscribe to the authoritative usage update BEFORE the objective runs —
+	// the bus never replays, so the observer must be wired ahead of execution.
+	usageCh := make(chan events.ProviderUsageUpdatePayload, 1)
+	usageSub := bus.Subscribe(events.EventProviderUsageUpdate, func(ev events.DomainEvent) {
+		if p, ok := ev.Payload().(events.ProviderUsageUpdatePayload); ok {
+			select {
+			case usageCh <- p:
+			default:
+			}
+		}
+	})
+	if usageSub == nil {
+		t.Fatal("usage subscription failed")
+	}
+	defer usageSub.Cancel()
+
+	// Stage 1: Run the single objective → parked at approval after exactly one
+	// provider invocation.
+	ctx := context.Background()
+	term, err := driver.Run(ctx, "change old to new @index.html")
+	if err != nil {
+		t.Fatalf("driver.Run: %v", err)
+	}
+	if term != nil {
+		t.Fatalf("run terminated early: %+v, want parked at approval", term)
+	}
+	if prov.calls() != 1 {
+		t.Fatalf("provider invocations after Run = %d, want exactly 1", prov.calls())
+	}
+
+	// The 5,883-token account is on the bus as authoritative usage.
+	var usage events.ProviderUsageUpdatePayload
+	select {
+	case usage = <-usageCh:
+	case <-time.After(time.Second):
+		t.Fatal("no authoritative provider.usage_update within deadline")
+	}
+	if usage.InputTokens != 2181 || usage.OutputTokens != 5883 || usage.ReasoningTokens != 5000 {
+		t.Errorf("provider.usage_update = %+v, want 2181/5883/5000 (authoritative repro numbers)", usage)
+	}
+
+	// Stage 2: Approve → exactly one terminal outcome, zero additional calls.
+	term, err = driver.ResumeApprove(ctx)
+	if err != nil {
+		t.Fatalf("ResumeApprove: %v", err)
+	}
+	if term == nil || term.State != autonomy.RuntimeCompleted {
+		t.Fatalf("termination = %+v, want completed", term)
+	}
+	if prov.calls() != 1 {
+		t.Fatalf("provider invocations after approval = %d, want still exactly 1 (no implicit re-invocation)", prov.calls())
+	}
+	if got := readTarget(t, root, "index.html"); got != "<html>\n<body>new</body>\n</html>\n" {
+		t.Fatalf("file = %q, want the approved rewrite", got)
+	}
+}
+
+// reproUsageStream serves content once, then reports the authoritative
+// 5,883-token usage of the repro.
+type reproUsageStream struct {
+	content []byte
+	usage   ai.ProviderUsage
+	done    bool
+}
+
+func (s *reproUsageStream) Read(p []byte) (int, error) {
+	if len(s.content) == 0 {
+		if s.done {
+			return 0, io.EOF
+		}
+		s.done = true
+		return 0, io.EOF
+	}
+	n := copy(p, s.content)
+	s.content = s.content[n:]
+	return n, nil
+}
+
+func (s *reproUsageStream) Close() error            { return nil }
+func (s *reproUsageStream) Usage() ai.ProviderUsage { return s.usage }
+func (s *reproUsageStream) FinishReason() string    { return "stop" }
+
+// reproStreamProvider serves a single streaming response and counts invocations.
+type reproStreamProvider struct {
+	mu     sync.Mutex
+	stream io.ReadCloser
+	callsN int
+}
+
+func (p *reproStreamProvider) Name() string { return "repro" }
+
+func (p *reproStreamProvider) Execute(_ context.Context, _ ai.Request) (*ai.Response, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.callsN++
+	return nil, errors.New("streaming repro provider must not fall back to Execute")
+}
+
+func (p *reproStreamProvider) ExecuteStream(_ context.Context, _ ai.Request) (io.ReadCloser, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.callsN++
+	return p.stream, nil
+}
+
+func (p *reproStreamProvider) calls() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.callsN
+}
+
 // Run + one Alt+A on an HTML workspace → exactly one provider invocation, one
 // apply (file changed), verification skipped (no Go commands), exactly one
 // terminal outcome (RuntimeCompleted) and zero re-execution.

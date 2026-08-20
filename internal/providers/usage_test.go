@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 )
@@ -291,3 +292,65 @@ func (f *failingBody) Read(p []byte) (int, error) {
 }
 
 func (f *failingBody) Close() error { return nil }
+
+// TestReasoningTokensDoNotPolluteOutputEstimate pins the exact 5,883-token
+// repro arithmetic: a thinking-heavy stream whose reasoning alone would have
+// inflated the estimate by ~2000 tokens must still estimate CompletionTokens
+// from the visible content characters ONLY. The authoritative split (5883
+// completion / 5000 reasoning) is the provider's, never the estimator's.
+func TestReasoningTokensDoNotPolluteOutputEstimate(t *testing.T) {
+	var tr streamUsageTracker
+	tr.recordReasoning(20000) // ~20000 reasoning chars would add ~5000 if mixed in
+	tr.recordOutput(883)      // ~883 visible content chars -> 220 estimated tokens
+	tr.markInterrupted()
+	u := tr.Usage()
+	if !u.Known || !u.Estimated {
+		t.Fatalf("Known=%v Estimated=%v, want true/true", u.Known, u.Estimated)
+	}
+	if u.CompletionTokens != 883/4 {
+		t.Errorf("CompletionTokens = %d, want %d (estimate uses outputChars only, never reasoningChars)",
+			u.CompletionTokens, 883/4)
+	}
+	if u.ReasoningTokens != 0 {
+		t.Errorf("ReasoningTokens = %d, want 0 (estimate never fabricates a reasoning split)", u.ReasoningTokens)
+	}
+}
+
+// TestProviderTimingUsesCorrectBoundary pins the timing forensics boundaries:
+// RequestStartedAt -> FirstTokenAt is the time-to-first-token window,
+// FirstTokenAt -> CompletedAt is the generation window. These are the exact
+// intervals Izen exposes on ProviderUsage — never one opaque "latency" value.
+func TestProviderTimingUsesCorrectBoundary(t *testing.T) {
+	var tr streamUsageTracker
+	t0 := time.Now()
+	tr.markRequestStarted(t0)
+	t1 := t0.Add(420 * time.Millisecond) // 0.42s time-to-first-token
+	time.Sleep(time.Millisecond)         // ensure t1 is strictly after t0 wall-clock
+	// recordOutput latches firstTokenAt at the real current time; to keep the
+	// test deterministic we re-seed the tracker's first-token marker directly.
+	tr.requestStartedAt = t0
+	tr.firstTokenAt = t1
+	tr.recordOutput(400)            // no-op on firstTokenAt (already set) but accumulates chars
+	t2 := t1.Add(136 * time.Second) // 136s generation window (5883/43.1 ≈ 136.5s)
+	tr.markCompleted(t2, "stop")
+
+	u := tr.Usage()
+	if u.RequestStartedAt != t0 {
+		t.Errorf("RequestStartedAt = %v, want %v", u.RequestStartedAt, t0)
+	}
+	if u.FirstTokenAt != t1 {
+		t.Errorf("FirstTokenAt = %v, want %v", u.FirstTokenAt, t1)
+	}
+	if u.CompletedAt != t2 {
+		t.Errorf("CompletedAt = %v, want %v", u.CompletedAt, t2)
+	}
+	if got := u.FirstTokenAt.Sub(u.RequestStartedAt); got != 420*time.Millisecond {
+		t.Errorf("TTFT boundary = %v, want 420ms (FirstTokenAt - RequestStartedAt)", got)
+	}
+	if got := u.CompletedAt.Sub(u.FirstTokenAt); got != 136*time.Second {
+		t.Errorf("generation window = %v, want 136s (CompletedAt - FirstTokenAt)", got)
+	}
+	if tr.Interrupted() {
+		t.Error("Interrupted() = true, want false (natural stop)")
+	}
+}

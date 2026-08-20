@@ -185,10 +185,15 @@ func TestModelFailureProducesNoArtifact(t *testing.T) {
 		}
 	}
 
-	// The proof must not record a fake successful invocation.
-	if len(res.Proof.ModelInvocations) != 0 {
-		t.Errorf("proof recorded %d model invocations on failure, want 0: %+v",
+	// The proof records the FAILED attempt (Known=false, zero tokens) — the
+	// invocation began and must be observable — but never a fake successful
+	// invocation: no Known usage may be fabricated for a provider that failed.
+	if len(res.Proof.ModelInvocations) != 1 {
+		t.Fatalf("proof recorded %d model invocations on failure, want 1 (the failed attempt): %+v",
 			len(res.Proof.ModelInvocations), res.Proof.ModelInvocations)
+	}
+	if inv := res.Proof.ModelInvocations[0]; inv.Known || inv.TokenInput != 0 || inv.TokenOutput != 0 {
+		t.Errorf("failed invocation must be Known=false with zero tokens, got %+v", inv)
 	}
 	if res.Proof.Outcome != OutcomePatchGenerationFailed && res.Proof.Outcome != OutcomeFailed {
 		t.Errorf("proof outcome = %s, want a failure outcome", res.Proof.Outcome)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -423,6 +424,90 @@ func TestOpenRouterExecute_429HonorsRetryAfter(t *testing.T) {
 	if tr.attempts != 2 {
 		t.Fatalf("attempts = %d, want 2", tr.attempts)
 	}
+}
+
+// TestUsageIsNotDoubleCountedAcrossHTTPRetries proves the 5,883-token account
+// is summed exactly ONCE across a 429 retry sequence: the provider bills one
+// usage object on the final 200, and Izen must surface that single authoritative
+// count with HTTPAttempts=3 / RateLimitedRetries=2 — never 3x, never a sum of
+// per-attempt guesses. The 429 responses carry no usage and must not fabricate
+// billed tokens.
+func TestUsageIsNotDoubleCountedAcrossHTTPRetries(t *testing.T) {
+	const completionTokens = 5883
+	const promptTokens = 2181
+	usageResponse := `{"id":"1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":` + strconv.Itoa(promptTokens) + `,"completion_tokens":` + strconv.Itoa(completionTokens) + `,"total_tokens":` + strconv.Itoa(promptTokens+completionTokens) + `}}`
+
+	tr := &usageRateLimitTransport{rateLimits: 2, finalPayload: usageResponse, retryAfter: "0"}
+	p := NewOpenRouterProvider("key", "openai/gpt-4o", "https://openrouter.example.com/api/v1")
+	p.client = &http.Client{Transport: tr}
+
+	resp, err := p.Execute(context.Background(), ai.Request{Model: "openai/gpt-4o"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if resp.Content != "ok" {
+		t.Fatalf("Content = %q, want ok", resp.Content)
+	}
+	if tr.attempts != 3 {
+		t.Fatalf("HTTP attempts = %d, want 3 (1 initial + 2 rate-limit retries)", tr.attempts)
+	}
+	if resp.Usage.HTTPAttempts != 3 || resp.Usage.RateLimitedRetries != 2 {
+		t.Errorf("retry forensics = HTTPAttempts:%d RateLimitedRetries:%d, want 3/2", resp.Usage.HTTPAttempts, resp.Usage.RateLimitedRetries)
+	}
+	// The single authoritative usage object is surfaced verbatim — the account
+	// is counted once, never multiplied by the 3 HTTP attempts.
+	if resp.Usage.CompletionTokens != completionTokens {
+		t.Errorf("CompletionTokens = %d, want %d (counted once across 3 HTTP attempts)", resp.Usage.CompletionTokens, completionTokens)
+	}
+	if resp.Usage.PromptTokens != promptTokens {
+		t.Errorf("PromptTokens = %d, want %d", resp.Usage.PromptTokens, promptTokens)
+	}
+	if !resp.Usage.Known {
+		t.Error("Usage.Known = false, want true (authoritative chunk on the final 200)")
+	}
+	if resp.Usage.Estimated {
+		t.Error("Usage.Estimated = true, want false (authoritative usage overrides any estimate)")
+	}
+}
+
+// usageRateLimitTransport answers HTTP 429 for the first rateLimits requests,
+// then the finalPayload (a full chat completion WITH usage) on the next 200.
+type usageRateLimitTransport struct {
+	mu           sync.Mutex
+	rateLimits   int
+	attempts     int
+	finalPayload string
+	retryAfter   string
+}
+
+func (t *usageRateLimitTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	t.attempts++
+	rateLimited := t.attempts <= t.rateLimits
+	t.mu.Unlock()
+
+	status := http.StatusOK
+	statusText := "200 OK"
+	payload := t.finalPayload
+	if r.Header.Get("Accept") == "text/event-stream" {
+		payload = "data: [DONE]\n"
+	}
+	if rateLimited {
+		status = http.StatusTooManyRequests
+		statusText = "429 Too Many Requests"
+		payload = `{"error":{"message":"Rate limit exceeded"}}`
+	}
+	header := make(http.Header)
+	if t.retryAfter != "" {
+		header.Set("Retry-After", t.retryAfter)
+	}
+	return &http.Response{
+		StatusCode: status,
+		Status:     statusText,
+		Body:       io.NopCloser(strings.NewReader(payload)),
+		Header:     header,
+		Request:    r,
+	}, nil
 }
 
 // TestOpenRouterExecute_RetryForensicsSingleInvocation pins Phase 7 P5 retry

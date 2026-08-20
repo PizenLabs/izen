@@ -594,6 +594,14 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// ── 7. Targeted mutation: per-target model invocation ──────────────
 	patches, invs, diffs, err := x.invokeMutation(ctx, req, requestID, targets, g)
 	if err != nil {
+		// Retain the invocation evidence on EVERY error return: the provider
+		// billed these tokens whether the run was cancelled, the artifact was
+		// rejected, or the response was empty. Truthful accounting never drops
+		// provider billing because the mutation failed. finalizeResult sums
+		// res.ModelCalls, so the authoritative counts survive into
+		// Completed.OutputTokens and Proof.ModelInvocations.
+		res.ModelCalls = append(res.ModelCalls, invs...)
+		res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, invs...)
 		if errors.Is(err, context.Canceled) {
 			// A user cancellation is a clean terminal outcome: no artifact was
 			// produced, nothing was applied, and no rollback runs.
@@ -1042,9 +1050,13 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// provider call — so the event stream truthfully records the start.
 		g.BeginModel(model)
 		raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g)
-		if callErr != nil {
-			return nil, nil, nil, fmt.Errorf("executor: model invocation: %w", callErr)
-		}
+		// The invocation evidence is built from the stream outcome REGARDLESS
+		// of the artifact result: the provider billed these tokens whether the
+		// stream succeeded, was cancelled mid-flight, or produced a malformed
+		// artifact. Dropping the invocation on any error return erased real
+		// billing from Completed.OutputTokens (the 5,883-token repro: the
+		// artifact was rejected as "unterminated <script> element" and the
+		// provider's authoritative usage vanished from Izen's account).
 		inv := ModelInvocation{Model: model}
 		if usage.Known {
 			inv.Known = true
@@ -1055,6 +1067,9 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		}
 		inv.HTTPAttempts = usage.HTTPAttempts
 		inv.RateLimitedRetries = usage.RateLimitedRetries
+		if callErr != nil {
+			return nil, append(invs, inv), nil, fmt.Errorf("executor: model invocation: %w", callErr)
+		}
 		// provider.response is emitted ONLY on a successful response — the
 		// authoritative usage travels here. No artifact may precede it.
 		g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
@@ -1070,7 +1085,8 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// Phase 1 safety rule: an artifact extraction failure is a FAILURE,
 			// never a proposal staged for approval. The model produced no
 			// usable mutation artifact — abort before any approval surface.
-			return nil, nil, nil, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
+			// The billed invocation is still returned so usage is preserved.
+			return nil, invs, nil, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
 		}
 		// ── ARTIFACT BOUNDARY (Phase 2) ─────────────────────────────
 		// A model response is NOT an artifact until it passes the artifact
@@ -1082,7 +1098,10 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		//nolint:contextcheck // artifact validation is pure content checking, no context needed
 		normalized, gateErr := x.artifactGate(target, modified)
 		if gateErr != nil {
-			return nil, nil, nil, gateErr
+			// The artifact was rejected, but the invocation evidence (and the
+			// real provider billing it carries) must survive: the token count
+			// is provider truth, not a function of artifact validity.
+			return nil, invs, nil, gateErr
 		}
 		modified = normalized
 		patches = append(patches, &Patch{
