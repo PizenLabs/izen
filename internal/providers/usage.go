@@ -103,10 +103,10 @@ func (t *streamUsageTracker) recordOutput(n int) {
 }
 
 // recordReasoning accumulates streamed REASONING characters separately from the
-// output content (Phase 7 P6). Reasoning is internal model deliberation, not
-// billed output content: mixing its character count into the output estimate
-// inflates CompletionTokens for thinking-heavy streams. Reasoning is also a
-// token the provider emitted, so it latches the first-token timestamp too.
+// visible output content (Phase 7 P6). Providers may include reasoning tokens
+// inside completion/output usage, so they are part of billed provider usage
+// when reported; the character estimate keeps them separate only to avoid
+// inventing visible-output tokens from hidden reasoning text.
 func (t *streamUsageTracker) recordReasoning(n int) {
 	if n <= 0 {
 		return

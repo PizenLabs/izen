@@ -93,10 +93,12 @@ const (
 	// outcomes onto loop outcomes without lossy reclassification. The Phase 4
 	// outcomes above are retained for backward compatibility; the adapter
 	// always emits the canonical strings below.
-	OutcomeChanged          ExecutionOutcome = "changed"
-	OutcomeCreated          ExecutionOutcome = "created"
-	OutcomeNoChange         ExecutionOutcome = "nochange"
-	OutcomeArtifactRejected ExecutionOutcome = "artifact_rejected"
+	OutcomeChanged                   ExecutionOutcome = "changed"
+	OutcomeCreated                   ExecutionOutcome = "created"
+	OutcomeNoChange                  ExecutionOutcome = "nochange"
+	OutcomeArtifactRejected          ExecutionOutcome = "artifact_rejected"
+	OutcomeArtifactRetryableRejected ExecutionOutcome = "artifact_retryable_rejected"
+	OutcomeTruncated                 ExecutionOutcome = "truncated"
 	// OutcomePatchFailed is the canonical MutationOutcome string ("patch_failed").
 	// It differs from the Phase 4 OutcomePatchGenFailed value
 	// ("patch_generation_failed"); the adapter always emits the canonical string.
@@ -127,7 +129,8 @@ func ClassifyOutcome(o ExecutionOutcome) FailureClass {
 		return FailureTransient
 	case OutcomeCancelled, OutcomeRejected, OutcomeArtifactRejected:
 		return FailurePermanent
-	case OutcomeFailed, OutcomePatchGenFailed, OutcomePatchFailed, OutcomeApplyFailed, OutcomeVerifyFailed:
+	case OutcomeFailed, OutcomePatchGenFailed, OutcomePatchFailed, OutcomeApplyFailed, OutcomeVerifyFailed,
+		OutcomeArtifactRetryableRejected, OutcomeTruncated:
 		return FailureRecoverable
 	default:
 		return FailurePermanent

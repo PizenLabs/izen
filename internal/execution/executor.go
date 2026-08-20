@@ -22,6 +22,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/pkg/capability/policy"
 )
 
 // ── RuntimeExecutor (Steps 1-3 of the authority migration) ─────────────────
@@ -93,6 +94,7 @@ type ModelInvocation struct {
 	Known           bool   `json:"known"`
 	CachedTokens    int    `json:"cached_tokens,omitempty"`
 	ReasoningTokens int    `json:"reasoning_tokens,omitempty"`
+	FinishReason    string `json:"finish_reason,omitempty"`
 	// HTTPAttempts is the number of transport round-trips this single LOGICAL
 	// invocation performed (1 + every 429 backoff / 400-schema retry). Retry
 	// forensics (Phase 7 P5): one model invocation may span multiple HTTP
@@ -341,6 +343,10 @@ var ErrProviderModelMismatch = errors.New("executor: provider/model mismatch")
 // content). The execution outcome is OutcomeArtifactRejected — an artifact
 // existed but was rejected, distinct from a missing artifact.
 var ErrArtifactRejected = errors.New("executor: mutation artifact rejected")
+
+var ErrArtifactRetryableRejected = errors.New("executor: mutation artifact rejected with retry directive")
+
+var ErrOutputTruncated = errors.New("executor: model output truncated")
 
 // openRouterStyleModelIDRe matches OpenRouter's vendor/model schema — the same
 // schema OpenRouter itself requires for every model ID. A model carrying a
@@ -592,7 +598,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	}
 
 	// ── 7. Targeted mutation: per-target model invocation ──────────────
-	patches, invs, diffs, err := x.invokeMutation(ctx, req, requestID, targets, g)
+	patches, invs, diffs, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
 	if err != nil {
 		// Retain the invocation evidence on EVERY error return: the provider
 		// billed these tokens whether the run was cancelled, the artifact was
@@ -622,6 +628,24 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			res.ArtifactKind = ""
 			res.Err = err
 			res.Proof.Outcome = OutcomeArtifactRejected
+			res.Proof.FinishedAt = time.Now()
+			setProofGraph(res, g)
+			return x.finalizeResult(res), err
+		}
+		if errors.Is(err, ErrArtifactRetryableRejected) {
+			g.FailExecution(events.FailureRecoverable, err, "executor.artifact")
+			res.ArtifactKind = ""
+			res.Err = err
+			res.Proof.Outcome = OutcomeArtifactRetryableRejected
+			res.Proof.FinishedAt = time.Now()
+			setProofGraph(res, g)
+			return x.finalizeResult(res), err
+		}
+		if errors.Is(err, ErrOutputTruncated) {
+			g.FailExecution(events.FailureRecoverable, err, "executor.model")
+			res.ArtifactKind = ""
+			res.Err = err
+			res.Proof.Outcome = OutcomeTruncated
 			res.Proof.FinishedAt = time.Now()
 			setProofGraph(res, g)
 			return x.finalizeResult(res), err
@@ -1004,6 +1028,20 @@ func (x *RuntimeExecutor) compileContext(profile strategy.ExecutionStrategyProfi
 	return channels, estimateTokens(b.String())
 }
 
+// effectiveMaxOutput returns the max tokens to use for a request. It prefers
+// the explicitly-set request budget, falling back to the profile budget so that
+// UI callers that omit max_tokens on the wire still receive the strategy-owned
+// bound.
+func effectiveMaxOutput(req int, profile *strategy.ExecutionStrategyProfile) int {
+	if req > 0 {
+		return req
+	}
+	if profile != nil && profile.MaxOutputTokens > 0 {
+		return profile.MaxOutputTokens
+	}
+	return 0
+}
+
 // invokeMutation performs the bounded provider invocation(s) for a targeted
 // mutation — one bounded call per resolved target. It drives the model stage of
 // the execution graph: model.invoked is emitted BEFORE each provider call and
@@ -1011,7 +1049,7 @@ func (x *RuntimeExecutor) compileContext(profile strategy.ExecutionStrategyProfi
 // the error and emits neither response nor artifact. The returned patches carry
 // the full resolved content of each target; the diffs are the authoritative
 // unified diffs for rendering.
-func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, requestID string, targets []string, g *runtimegraph.Graph) ([]*Patch, []ModelInvocation, []string, error) {
+func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) ([]*Patch, []ModelInvocation, []string, error) {
 	if len(targets) == 0 {
 		return nil, nil, nil, fmt.Errorf("executor: no mutation target resolved")
 	}
@@ -1044,7 +1082,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			Model:     model,
 			System:    system,
 			Messages:  []ai.Message{{Role: "user", Content: user}},
-			MaxTokens: req.MaxOutputTokens,
+			MaxTokens: effectiveMaxOutput(req.MaxOutputTokens, &profile),
 		}
 		// model.invoked is emitted when the invocation BEGINS — before the
 		// provider call — so the event stream truthfully records the start.
@@ -1065,6 +1103,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			inv.CachedTokens = usage.CachedTokens
 			inv.ReasoningTokens = usage.ReasoningTokens
 		}
+		inv.FinishReason = usage.FinishReason
 		inv.HTTPAttempts = usage.HTTPAttempts
 		inv.RateLimitedRetries = usage.RateLimitedRetries
 		if callErr != nil {
@@ -1080,6 +1119,9 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// The model returned only prose or a fence without content — treat
 			// the full response as the replacement attempt (best-effort).
 			modified = raw
+		}
+		if strings.EqualFold(strings.TrimSpace(inv.FinishReason), "length") {
+			return nil, invs, nil, fmt.Errorf("%w: %s", ErrOutputTruncated, target)
 		}
 		if strings.TrimSpace(modified) == "" {
 			// Phase 1 safety rule: an artifact extraction failure is a FAILURE,
@@ -1124,6 +1166,9 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 func (x *RuntimeExecutor) artifactGate(target, modified string) (string, error) {
 	gate := v3Artifact.ValidateContent(target, []byte(modified), 0)
 	if !gate.Passed {
+		if gate.Decision == policy.DecisionRetry {
+			return "", fmt.Errorf("%w: %s: %w: %s", ErrArtifactRetryableRejected, target, gate.Error, gate.Directive)
+		}
 		return "", fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, gate.Error)
 	}
 	return string(gate.Normalized), nil
@@ -1189,7 +1234,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		Model:     model,
 		System:    readOnlySystemPrompt(profile.Strategy),
 		Messages:  []ai.Message{{Role: "user", Content: b.String()}},
-		MaxTokens: req.MaxOutputTokens,
+		MaxTokens: effectiveMaxOutput(req.MaxOutputTokens, &profile),
 	}
 	// model.invoked is emitted when the invocation BEGINS — before the provider
 	// call — so the event stream truthfully records the invocation start.
@@ -1206,6 +1251,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		inv.CachedTokens = usage.CachedTokens
 		inv.ReasoningTokens = usage.ReasoningTokens
 	}
+	inv.FinishReason = usage.FinishReason
 	// provider.response is emitted ONLY on a successful response — the
 	// authoritative usage travels here. No artifact may precede it.
 	g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)

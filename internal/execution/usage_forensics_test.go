@@ -151,8 +151,8 @@ func TestArtifactRejectedPreservesProviderUsageAndTerminalSemantics(t *testing.T
 	if err == nil {
 		t.Fatal("Execute must fail on the malformed HTML artifact")
 	}
-	if !errors.Is(err, ErrArtifactRejected) {
-		t.Fatalf("err = %v, want ErrArtifactRejected", err)
+	if !errors.Is(err, ErrArtifactRetryableRejected) {
+		t.Fatalf("err = %v, want ErrArtifactRetryableRejected", err)
 	}
 	if res == nil {
 		t.Fatal("Execute must return a non-nil result carrying the rejection")
@@ -170,13 +170,14 @@ func TestArtifactRejectedPreservesProviderUsageAndTerminalSemantics(t *testing.T
 	if !res.Completed.Known {
 		t.Error("Completed.Known = false, want true — provider billing is real regardless of artifact validity")
 	}
-	if res.Proof.Outcome != OutcomeArtifactRejected {
-		t.Errorf("Proof.Outcome = %q, want %q", res.Proof.Outcome, OutcomeArtifactRejected)
+	if res.Proof.Outcome != OutcomeArtifactRetryableRejected {
+		t.Errorf("Proof.Outcome = %q, want %q", res.Proof.Outcome, OutcomeArtifactRetryableRejected)
 	}
 	if len(res.Proof.ModelInvocations) != 1 {
 		t.Errorf("Proof.ModelInvocations = %d entries, want 1 (one logical invocation, billed)", len(res.Proof.ModelInvocations))
 	}
-	// P4: artifact_rejected is a PERMANENT failure, never recoverable.
+	// Phase 7E: DecisionRetry is preserved as a recoverable execution fact;
+	// the executor does not perform a second model invocation here.
 	if !collector.waitHas(events.EventExecutionFailed, time.Second) {
 		t.Error("no EventExecutionFailed emitted")
 	}
