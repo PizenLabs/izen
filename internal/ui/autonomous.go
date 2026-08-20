@@ -233,7 +233,12 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 	} else {
 		m.finalizeOperation(OpOutcomeFailure, nil)
 		m.push(roleError, "[autonomous] aborted — "+msg.term.Reason)
+		m.push(roleSystem, infoStyle.Render("Interrupted."))
 	}
+	// Restore interactive input for terminal autonomous runs.
+	m.ti.Focus()
+	m.recalcViewportHeight()
+	m.state = StateChat
 	m.resolveApprovalState()
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
@@ -246,6 +251,11 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 func (m *model) authorizeAutonomousApproval() error {
 	if m.executor == nil || m.authEngine == nil {
 		return nil
+	}
+	// Ensure workflow is in Building/Repairing state for authorization.
+	// Autonomous execution from /model mode starts in Planning; we must transition.
+	if err := m.transitionToBuilding(); err != nil {
+		return fmt.Errorf("workflow transition to building failed: %w", err)
 	}
 	b := m.autonomousBoundary
 	var targets []string

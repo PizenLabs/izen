@@ -213,6 +213,14 @@ type VerificationResult struct {
 type VerificationReport struct {
 	Results []VerificationResult `json:"results"`
 	Passed  bool                 `json:"passed"`
+	// Skipped is true when NO verification contract exists for the target's
+	// language (unknown language, or a language definition with an empty
+	// Verification config). It is semantically NOT APPLICABLE — distinct from
+	// a verification that ran and failed. A skipped gate never claims a pass
+	// and never rolls back a patch.
+	Skipped bool `json:"skipped,omitempty"`
+	// Reason explains why verification was skipped ("" when it ran).
+	Reason string `json:"reason,omitempty"`
 }
 
 type Verifier struct {
@@ -230,19 +238,14 @@ func (v *Verifier) Authorization() *authorization.MutationAuthorization {
 	return v.auth
 }
 
-var defaultVerificationSteps = []VerificationStep{
-	{Name: "go fmt", Command: "go fmt ./...", Optional: false},
-	{Name: "go vet", Command: "go vet ./...", Optional: false},
-	{Name: "go test", Command: "go test ./...", Optional: false},
-	{Name: "golangci-lint", Command: "golangci-lint run ./...", Optional: true},
-	{Name: "govulncheck", Command: "govulncheck ./...", Optional: true},
-}
-
 func NewVerifier(root string) *Verifier {
-	return &Verifier{
-		root:  root,
-		steps: make([]VerificationStep, len(defaultVerificationSteps)),
-	}
+	// A plain verifier carries NO implicit steps. It never falls back to the
+	// Go verification commands on its own: verification steps must be attached
+	// explicitly via SetCustomSteps or via SetLanguage (which resolves the
+	// language's own configured steps). A verifier with no steps reports
+	// Skipped — semantically "no verification applicable", never a fabricated
+	// pass and never a Go fallback (Phase 7 P1).
+	return &Verifier{root: root}
 }
 
 func NewLanguageVerifier(root string, langID language.ID) *Verifier {
@@ -290,9 +293,10 @@ func (v *Verifier) RunSyntaxQuickCheck() VerificationReport {
 func stepsForLanguage(langID language.ID) []VerificationStep {
 	def, ok := language.Global().Lookup(langID)
 	if !ok {
-		result := make([]VerificationStep, len(defaultVerificationSteps))
-		copy(result, defaultVerificationSteps)
-		return result
+		// Unknown language: no verification contract exists. Return nil —
+		// NEVER fall back to the Go verification steps for a language the
+		// registry does not know (Phase 7 P1).
+		return nil
 	}
 
 	v := def.Verification
@@ -314,12 +318,9 @@ func stepsForLanguage(langID language.ID) []VerificationStep {
 		steps = append(steps, VerificationStep{Name: fmt.Sprintf("test (%s)", cmd), Command: cmd, Optional: false})
 	}
 
-	if len(steps) == 0 {
-		result := make([]VerificationStep, len(defaultVerificationSteps))
-		copy(result, defaultVerificationSteps)
-		return result
-	}
-
+	// A language with an empty Verification config (e.g. HTML, CSS) has NO
+	// verification contract: return nil so the gate reports Skipped instead of
+	// running Go commands against a non-Go project (Phase 7 P1).
 	return steps
 }
 
@@ -334,7 +335,15 @@ func (v *Verifier) SetCustomSteps(steps []VerificationStep) {
 
 func (v *Verifier) RunAll() VerificationReport {
 	if len(v.steps) == 0 {
-		v.steps = stepsForLanguage(v.langID)
+		// No verification contract exists for this target (unknown language or
+		// a language definition with an empty Verification config). Report the
+		// gate as NOT APPLICABLE — semantically distinct from a pass and from a
+		// failure: nothing ran, nothing claimed, nothing rolled back (Phase 7
+		// P1). Go verification is NEVER an implicit fallback.
+		return VerificationReport{
+			Skipped: true,
+			Reason:  "no verification configured for language " + string(v.langID),
+		}
 	}
 
 	var report VerificationReport

@@ -93,6 +93,15 @@ type ModelInvocation struct {
 	Known           bool   `json:"known"`
 	CachedTokens    int    `json:"cached_tokens,omitempty"`
 	ReasoningTokens int    `json:"reasoning_tokens,omitempty"`
+	// HTTPAttempts is the number of transport round-trips this single LOGICAL
+	// invocation performed (1 + every 429 backoff / 400-schema retry). Retry
+	// forensics (Phase 7 P5): one model invocation may span multiple HTTP
+	// attempts; a rate-limited free-tier build that recovers is still ONE
+	// invocation, never two.
+	HTTPAttempts int `json:"http_attempts,omitempty"`
+	// RateLimitedRetries is how many of HTTPAttempts were 429 rate-limit
+	// retries that succeeded on a later attempt.
+	RateLimitedRetries int `json:"rate_limited_retries,omitempty"`
 }
 
 // GraphStep is one executed node of the execution graph.
@@ -261,10 +270,12 @@ type RuntimeExecutor struct {
 }
 
 // NewRuntimeExecutor wires a self-contained execution authority. When langID is
-// non-empty a language-aware verifier is attached; otherwise verification is
-// attached with the default Go steps. A nil provider makes model-required
-// strategies fail with a deterministic error (the runtime still resolves
-// deterministic strategies without a provider).
+// non-empty a language-aware verifier is attached (resolving that language's
+// own configured steps); when langID is empty a plain verifier is attached with
+// NO implicit steps — verification is Skipped (not applicable) unless explicit
+// steps are configured (Phase 7 P1: no implicit Go fallback). A nil provider
+// makes model-required strategies fail with a deterministic error (the runtime
+// still resolves deterministic strategies without a provider).
 func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, bus *events.Bus, langID language.ID) *RuntimeExecutor {
 	x := &RuntimeExecutor{
 		root:     root,
@@ -754,7 +765,10 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		// state BEFORE it is copied into the result/proof.
 		x.correctEvidenceAfterRollback(ms, pm.patches)
 		outcome := OutcomeApplyFailed
-		if ms.Verification != nil && !ms.Verification.Passed {
+		if ms.Verification != nil && !ms.Verification.Passed && !ms.Verification.Skipped {
+			// Only a gate that actually ran and failed is a verify failure; a
+			// not-applicable (Skipped) gate never makes an apply failure a
+			// verify failure (Phase 7 P1).
 			outcome = OutcomeVerifyFailed
 		}
 		res.Mutations = append(res.Mutations, ms.Outcomes...)
@@ -770,7 +784,11 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 			g.CompleteMutation(p.File, string(o))
 		}
 		if ms.Verification != nil {
-			g.CompleteVerification(ms.Verification.Passed, verificationSteps)
+			if ms.Verification.Skipped {
+				g.Skip(runtimegraph.StageVerification, ms.Verification.Reason)
+			} else {
+				g.CompleteVerification(ms.Verification.Passed, verificationSteps)
+			}
 		}
 		g.FailExecution(events.FailureRecoverable, applyErr, "executor.mutation")
 		res.Err = applyErr
@@ -799,7 +817,11 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		g.CompleteMutation(p.File, string(o))
 	}
 	if ms.Verification != nil {
-		g.CompleteVerification(ms.Verification.Passed, verificationSteps)
+		if ms.Verification.Skipped {
+			g.Skip(runtimegraph.StageVerification, ms.Verification.Reason)
+		} else {
+			g.CompleteVerification(ms.Verification.Passed, verificationSteps)
+		}
 	} else {
 		g.Skip(runtimegraph.StageVerification, "no verifier gate ran during apply")
 	}
@@ -1031,6 +1053,8 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			inv.CachedTokens = usage.CachedTokens
 			inv.ReasoningTokens = usage.ReasoningTokens
 		}
+		inv.HTTPAttempts = usage.HTTPAttempts
+		inv.RateLimitedRetries = usage.RateLimitedRetries
 		// provider.response is emitted ONLY on a successful response — the
 		// authoritative usage travels here. No artifact may precede it.
 		g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)

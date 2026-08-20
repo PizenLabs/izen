@@ -2273,18 +2273,27 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	}
 	execution.KillAllOrphans()
 
-	// 1b. Release the active-operation ownership and clear the transient busy
-	// flags + spinner through the single authoritative finalization path.
-	m.finalizeOperation(OpOutcomeCancelled, nil)
+	// For active autonomous runs, the canonical terminal path is the
+	// autonomousRunMsg returned by the driver when its context is cancelled.
+	// We must NOT finalize the operation here — that would race with the
+	// driver's terminal message and leave the presentation in an inconsistent
+	// state (spinner stopped, but autonomousActive not released).
+	// The autonomous run's terminal message will call finalizeOperation.
+	if !m.autonomousActive {
+		// 1b. Release the active-operation ownership and clear the transient
+		// busy flags + spinner through the single authoritative finalization
+		// path. This is ONLY for non-autonomous operations.
+		m.finalizeOperation(OpOutcomeCancelled, nil)
 
-	// 2. Clear every transient processing flag so the spinner can never stay
-	// up and the view can never block on a phantom producer.
-	m.reconcileSpinner()
+		// 2. Clear every transient processing flag so the spinner can never
+		// stay up and the view can never block on a phantom producer.
+		m.reconcileSpinner()
 
-	// 2b. Re-derive the presentation state from the cleared flags so the tick
-	// spinner loop halts and the viewport unwinds to interactive chat. Any
-	// residual approval gate is overridden below.
-	m.syncUIState()
+		// 2b. Re-derive the presentation state from the cleared flags so the
+		// tick spinner loop halts and the viewport unwinds to interactive
+		// chat. Any residual approval gate is overridden below.
+		m.syncUIState()
+	}
 
 	// 3. Release any outstanding approval gate on the canonical source.
 	m.resolveApprovalState()
@@ -2317,16 +2326,20 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	}
 
 	// 5. Restore interactive input and force the presentation back to chat.
-	m.ti.Focus()
-	m.recalcViewportHeight()
-	m.state = StateChat
+	// For autonomous runs, this will be done by handleAutonomousRun when the
+	// terminal message arrives. For non-autonomous, do it now.
+	if !m.autonomousActive {
+		m.ti.Focus()
+		m.recalcViewportHeight()
+		m.state = StateChat
 
-	m.push(roleSystem, infoStyle.Render("Interrupted."))
-	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
+		m.push(roleSystem, infoStyle.Render("Interrupted."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+	}
 
-	// 5b. Abort any parked autonomous run. The driver holds its own loop state
-	// (no worker is blocked); Abort terminates it as a permanent human
+	// 5b. Abort any parked autonomous run. The driver holds its own loop
+	// state (no worker is blocked); Abort terminates it as a permanent human
 	// cancellation and the terminal message projects through the normal
 	// autonomousRunMsg path.
 	var extra []tea.Cmd

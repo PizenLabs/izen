@@ -40,6 +40,15 @@ type Driver struct {
 	req       autonomy.LoopRequest
 	obs       autonomy.Observation
 	published int
+
+	// runCtx is the context for the current run. It is stored so Abort()
+	// can cancel the same context that observeAndRun is watching.
+	runCtx context.Context
+	// runCancel cancels runCtx. Set when a run starts, nil when terminal.
+	runCancel context.CancelFunc
+	// runID is a monotonically increasing identity for each run.
+	// Late results from a previous run cannot overwrite a newer run's state.
+	runID uint64
 }
 
 // Option configures the Driver during construction.
@@ -100,12 +109,19 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	if d.loop != nil && !d.loop.State().IsTerminal() {
 		return d.term(), errors.New("autonomy: a run is already active or parked at a human boundary — resume or abort it first")
 	}
+
+	// Create a new run context with cancellation for this run.
+	// This context is the single cancellation authority for the run.
+	d.runCtx, d.runCancel = context.WithCancel(ctx)
+	d.runID++
+	runID := d.runID
+
 	d.loop = autonomy.NewRuntimeLoop(d.bounds)
 	d.prompt = objective
 	d.obs = autonomy.Observation{}
 	d.published = 0
 	d.loop.Start("user objective: " + objective)
-	d.publish(ctx)
+	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 
 	// Target resolution is the gateway's deterministic authority; the loop
 	// never guesses a target. A clarification boundary parks BEFORE any
@@ -118,11 +134,17 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 			Options: d.resolved.Options,
 		})
 		d.enrichBoundary()
-		d.publish(ctx)
+		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 		return d.term(), nil
 	}
 	d.obs = d.contextObservation()
-	return d.observeAndRun(ctx)
+	term, err := d.observeAndRun(d.runCtx, runID) //nolint:contextcheck // runCtx is the run's own cancellation context
+	// Clear run context on terminal completion; preserve when parked.
+	if term != nil && term.State.IsTerminal() {
+		d.runCtx = nil
+		d.runCancel = nil
+	}
+	return term, err
 }
 
 // Abort terminates the current parked or active run as a permanent human
@@ -137,26 +159,75 @@ func (d *Driver) Abort(reason string) (*autonomy.LoopTermination, error) {
 	if d.loop.State().IsTerminal() {
 		return d.term(), nil
 	}
-	term := d.terminateAbort(context.Background(), "aborted by operator: "+reason, autonomy.FailurePermanent)
+	// Cancel the run context so the in-flight observeAndRun/execute sees it.
+	if d.runCancel != nil {
+		d.runCancel()
+	}
+	// Use the run context (now cancelled) for termination so the termination
+	// event carries the correct cancellation context.
+	term := d.terminateAbort(d.runCtx, "aborted by operator: "+reason, autonomy.FailurePermanent)
+	// Clear the run context so a fresh Run can start.
+	d.runCtx = nil
+	d.runCancel = nil
 	return term, nil
 }
 
 // ResumeApprove resolves a parked approval gate: it approves the held patch
 // through the executor and INTERPRETS the terminal result of the SAME
 // execution. It never re-executes the mutation (idempotency).
+//
+// Convergence: the approval decision converges to exactly ONE terminal
+// outcome. A successful apply completes the loop; a failed apply/verify
+// aborts it permanently — the loop NEVER auto-repairs an approved proposal
+// into a second provider invocation (the human approved THIS patch, not a
+// regeneration). A hard approve error (no result, e.g. double-approve)
+// aborts the run so it can never park at a stale awaiting_human.
 func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, error) {
 	pid, err := d.approvalPatchID()
 	if err != nil {
 		return d.term(), err
 	}
 	obs, err := d.adapter.Approve(ctx, pid)
-	if err != nil {
-		return nil, fmt.Errorf("autonomy: approve: %w", err)
+	if obs.RequestID == "" {
+		// Hard approve error: no terminal result exists (the held patch is
+		// gone). Release the human and converge to a permanent abort so the
+		// run never sits at a stale awaiting_human.
+		reason := "approval failed: patch no longer held by the executor"
+		if err != nil {
+			reason = "approval failed: " + err.Error()
+		}
+		if d.loop != nil && !d.loop.State().IsTerminal() {
+			d.loop.ReleaseHuman(reason)
+			d.publish(ctx)
+			term := d.terminateAbort(ctx, reason, autonomy.FailurePermanent)
+			d.runCtx, d.runCancel = nil, nil
+			return term, nil
+		}
+		return d.term(), nil
 	}
 	d.obs = obs
 	d.loop.ReleaseHuman("patch approved")
 	d.publish(ctx)
-	return d.observeAndRun(ctx)
+	if approvalFailureOutcome(obs) {
+		// The approved proposal failed to apply/verify. This is a terminal
+		// human-decision outcome: converge to ONE aborted terminal state and
+		// NEVER re-execute (a repair would regenerate a patch the human did
+		// not see). err, when set, is surfaced via the termination reason.
+		reason := "approved mutation failed: " + string(obs.Outcome)
+		if err != nil {
+			reason += ": " + err.Error()
+		}
+		term := d.terminateAbort(ctx, reason, autonomy.FailurePermanent)
+		d.runCtx, d.runCancel = nil, nil
+		return term, nil
+	}
+	d.runID++
+	term, err := d.observeAndRun(ctx, d.runID)
+	if term != nil && term.State.IsTerminal() {
+		d.runCtx = nil
+		d.runCancel = nil
+	}
+	return term, err
 }
 
 // ResumeReject resolves a parked approval gate by rejecting the held patch
@@ -168,13 +239,33 @@ func (d *Driver) ResumeReject(ctx context.Context, reason string) (*autonomy.Loo
 		return d.term(), err
 	}
 	obs, err := d.adapter.Reject(ctx, pid, reason)
-	if err != nil {
-		return nil, fmt.Errorf("autonomy: reject: %w", err)
+	if obs.RequestID == "" {
+		// Hard reject error: no terminal result exists. Release the human and
+		// converge to a permanent abort so the run never parks at a stale
+		// awaiting_human.
+		r := "rejection failed: patch no longer held by the executor"
+		if err != nil {
+			r = "rejection failed: " + err.Error()
+		}
+		if d.loop != nil && !d.loop.State().IsTerminal() {
+			d.loop.ReleaseHuman(r)
+			d.publish(ctx)
+			term := d.terminateAbort(ctx, r, autonomy.FailurePermanent)
+			d.runCtx, d.runCancel = nil, nil
+			return term, nil
+		}
+		return d.term(), nil
 	}
 	d.obs = obs
 	d.loop.ReleaseHuman("patch rejected")
 	d.publish(ctx)
-	return d.observeAndRun(ctx)
+	d.runID++
+	term, err := d.observeAndRun(ctx, d.runID)
+	if term != nil && term.State.IsTerminal() {
+		d.runCtx = nil
+		d.runCancel = nil
+	}
+	return term, err
 }
 
 // ResumeClarify continues a parked clarification with an explicit human-chosen
@@ -188,7 +279,13 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 	d.obs = d.contextObservation()
 	d.loop.ReleaseHuman("target specified: " + target)
 	d.publish(ctx)
-	return d.observeAndRun(ctx)
+	d.runID++
+	term, err := d.observeAndRun(ctx, d.runID)
+	if term != nil && term.State.IsTerminal() {
+		d.runCtx = nil
+		d.runCancel = nil
+	}
+	return term, err
 }
 
 // State returns the current loop position.
@@ -225,12 +322,18 @@ func (d *Driver) LastObservation() autonomy.Observation { return d.obs }
 
 // observeAndRun pushes the current observation through Observe → decide →
 // execute until the loop terminates or parks at AwaitingHuman.
-func (d *Driver) observeAndRun(ctx context.Context) (*autonomy.LoopTermination, error) {
+// runID is the identity of the run that started this observation loop;
+// late results from a different runID are discarded.
+func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.LoopTermination, error) {
 	if got := d.loop.Observe(d.obs); got != autonomy.RuntimeDeciding {
 		return d.term(), fmt.Errorf("autonomy: observe -> %s, want deciding", got)
 	}
 	d.publish(ctx)
 	for !d.loop.State().IsTerminal() {
+		// Late-result guard: if the run was aborted/superseded, exit immediately.
+		if d.runID != runID {
+			return d.term(), nil
+		}
 		if cerr := ctx.Err(); cerr != nil {
 			// Cancellation is a clean permanent abort, not a propagated error.
 			return d.terminateAbort(ctx, "context cancelled", autonomy.FailurePermanent), nil //nolint:nilerr // termination, not a failure
@@ -248,6 +351,11 @@ func (d *Driver) observeAndRun(ctx context.Context) (*autonomy.LoopTermination, 
 			}
 		case autonomy.RuntimeExecuting:
 			obs, err := d.adapter.Execute(ctx, d.req)
+			// Late-result guard: if the run was aborted/superseded while we were
+			// executing, discard the result and return the terminal state.
+			if d.runID != runID {
+				return d.term(), nil
+			}
 			if err != nil {
 				return nil, fmt.Errorf("autonomy: execute: %w", err)
 			}
@@ -396,6 +504,21 @@ func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopD
 	default:
 		return autonomy.LoopDecision{Action: autonomy.LoopAbort,
 			Reason: "unrecognized outcome: " + string(o.Outcome)}
+	}
+}
+
+// approvalFailureOutcome reports whether an observation produced by an approval
+// apply is a failure. A success (changed/created/nochange) completes the loop; a
+// failure must converge to a terminal aborted outcome — the loop never
+// auto-repairs an approved proposal into a second provider invocation, because
+// the human approved THIS patch, not a regeneration of it.
+func approvalFailureOutcome(o autonomy.Observation) bool {
+	switch o.Outcome {
+	case autonomy.OutcomeFailed, autonomy.OutcomePatchGenFailed, autonomy.OutcomePatchFailed,
+		autonomy.OutcomeApplyFailed, autonomy.OutcomeVerifyFailed, autonomy.OutcomeSkipped:
+		return true
+	default:
+		return false
 	}
 }
 

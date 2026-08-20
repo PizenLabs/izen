@@ -425,6 +425,75 @@ func TestOpenRouterExecute_429HonorsRetryAfter(t *testing.T) {
 	}
 }
 
+// TestOpenRouterExecute_RetryForensicsSingleInvocation pins Phase 7 P5 retry
+// forensics on the non-streaming path: two 429 rate-limit retries inside ONE
+// logical invocation must surface as HTTPAttempts=3 / RateLimitedRetries=2 on
+// the returned usage, while the invocation count stays 1. The 429 responses
+// carry no billed tokens — Known stays false because the retried 200 reported
+// no usage, proving 429 recovery never fabricates billed output.
+func TestOpenRouterExecute_RetryForensicsSingleInvocation(t *testing.T) {
+	tr := &rateLimitTransport{rateLimits: 2, retryAfter: "0"}
+	p := NewOpenRouterProvider("key", "openai/gpt-4o", "https://openrouter.example.com/api/v1")
+	p.client = &http.Client{Transport: tr}
+
+	resp, err := p.Execute(context.Background(), ai.Request{Model: "openai/gpt-4o"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if resp.Content != "ok" {
+		t.Fatalf("Content = %q, want ok", resp.Content)
+	}
+	if tr.attempts != 3 {
+		t.Fatalf("transport attempts = %d, want 3 (1 initial + 2 429 retries)", tr.attempts)
+	}
+	if resp.Usage.HTTPAttempts != 3 {
+		t.Errorf("Usage.HTTPAttempts = %d, want 3 (one logical invocation, three HTTP attempts)", resp.Usage.HTTPAttempts)
+	}
+	if resp.Usage.RateLimitedRetries != 2 {
+		t.Errorf("Usage.RateLimitedRetries = %d, want 2", resp.Usage.RateLimitedRetries)
+	}
+	if resp.Usage.Known {
+		t.Error("Usage.Known = true, want false — 429 responses carry no billed tokens and the retried 200 reported no usage")
+	}
+	if resp.Usage.CompletionTokens != 0 {
+		t.Errorf("Usage.CompletionTokens = %d, want 0 (no usage chunk -> no billed tokens)", resp.Usage.CompletionTokens)
+	}
+}
+
+// TestOpenRouterExecuteStream_RetryForensicsSingleInvocation pins the same
+// Phase 7 P5 forensics on the streaming path: a single logical streaming
+// invocation that recovered from one 429 must report HTTPAttempts=2 /
+// RateLimitedRetries=1 via the UsageProvider contract, and the stream must
+// still deliver its content.
+func TestOpenRouterExecuteStream_RetryForensicsSingleInvocation(t *testing.T) {
+	tr := &rateLimitTransport{rateLimits: 1, retryAfter: "0"}
+	p := NewOpenRouterProvider("key", "openai/gpt-4o", "https://openrouter.example.com/api/v1")
+	p.client = &http.Client{Transport: tr}
+
+	rc, err := p.ExecuteStream(context.Background(), ai.Request{Model: "openai/gpt-4o"})
+	if err != nil {
+		t.Fatalf("ExecuteStream: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+	if _, readErr := io.ReadAll(rc); readErr != nil {
+		t.Fatalf("stream read: %v", readErr)
+	}
+	if tr.attempts != 2 {
+		t.Fatalf("transport attempts = %d, want 2 (1 initial + 1 429 retry)", tr.attempts)
+	}
+	up, ok := rc.(ai.UsageProvider)
+	if !ok {
+		t.Fatal("stream result does not implement ai.UsageProvider")
+	}
+	u := up.Usage()
+	if u.HTTPAttempts != 2 {
+		t.Errorf("Usage.HTTPAttempts = %d, want 2", u.HTTPAttempts)
+	}
+	if u.RateLimitedRetries != 1 {
+		t.Errorf("Usage.RateLimitedRetries = %d, want 1", u.RateLimitedRetries)
+	}
+}
+
 // TestOpenRouterExecute_429ExponentialBackoffEscalates proves the real request
 // path sleeps on the exponential schedule (1x, 2x, 4x base) between retries:
 // the gaps between consecutive attempt starts must grow by at least the

@@ -194,6 +194,13 @@ func TestAutonomousResumeApproveAuthorizesExecutor(t *testing.T) {
 		},
 	}
 	m := autonomousTestModel(drv)
+	// Set workflow to Building state so authorization succeeds.
+	m.workflowSM = workflow.NewWorkflowStateMachine()
+	_ = m.workflowSM.SendEvent(workflow.EventPlan, workflow.TransitionContext{})
+	_ = m.workflowSM.SendEvent(workflow.EventBuild, workflow.TransitionContext{
+		HasPlan:         true,
+		HasCapabilities: true,
+	})
 	m.authEngine = authorization.NewAuthorizationEngine(
 		fakeSourceVerifier{},
 		fakeCheckpointChecker{},

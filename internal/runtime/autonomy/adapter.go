@@ -118,9 +118,15 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 // Approve resolves an approval gate held by the executor and returns the
 // terminal observation of the SAME execution. It never re-executes the
 // mutation: the held patch was already produced, approval applies it.
+//
+// The executor returns a NON-NIL terminal result even when the apply/verify
+// fails (the result carries the real failure outcome). That result must flow
+// back to the loop so a failed approval converges to a terminal state — a hard
+// error is ONLY returned when no result exists at all (e.g. double-approve of
+// an unknown patch id).
 func (a *ExecutorAdapter) Approve(ctx context.Context, patchID string) (autonomy.Observation, error) {
 	res, err := a.executor.Approve(ctx, patchID)
-	if err != nil {
+	if err != nil && res == nil {
 		return autonomy.Observation{}, err
 	}
 	return a.observe(autonomy.LoopRequest{RequestID: res.RequestID}, res), nil
@@ -130,7 +136,7 @@ func (a *ExecutorAdapter) Approve(ctx context.Context, patchID string) (autonomy
 // observation of the SAME execution.
 func (a *ExecutorAdapter) Reject(ctx context.Context, patchID, reason string) (autonomy.Observation, error) {
 	res, err := a.executor.Reject(ctx, patchID, reason)
-	if err != nil {
+	if err != nil && res == nil {
 		return autonomy.Observation{}, err
 	}
 	return a.observe(autonomy.LoopRequest{RequestID: res.RequestID}, res), nil

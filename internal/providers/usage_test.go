@@ -68,6 +68,51 @@ func TestStreamUsageTracker_InterruptedEstimatesOutput(t *testing.T) {
 	}
 }
 
+// TestStreamUsageTracker_ReasoningCharsDoNotInflateOutputEstimate pins Phase 7
+// P6: reasoning characters are accounted separately and must NEVER be mixed
+// into the output-character estimate. A thinking-heavy stream with a large
+// reasoning payload must report an output estimate derived from the content
+// chars alone.
+func TestStreamUsageTracker_ReasoningCharsDoNotInflateOutputEstimate(t *testing.T) {
+	var tr streamUsageTracker
+	tr.recordReasoning(8000) // heavy reasoning, would add 2000 tokens if mixed in
+	tr.recordOutput(40)      // 40 content chars → 10 estimated output tokens
+	tr.markInterrupted()
+	u := tr.Usage()
+	if u.CompletionTokens != 10 {
+		t.Errorf("output = %d, want 10 (reasoning chars must not inflate the output estimate)", u.CompletionTokens)
+	}
+	if !u.Known || !u.Estimated {
+		t.Errorf("Known=%v Estimated=%v, want true/true", u.Known, u.Estimated)
+	}
+}
+
+// TestStreamUsageTracker_AuthoritativeReasoningSplitsSurvive verifies that the
+// provider-reported reasoning split is preserved verbatim when authoritative
+// usage arrives (estimation is only ever a fallback for interrupted streams).
+func TestStreamUsageTracker_AuthoritativeReasoningSplitsSurvive(t *testing.T) {
+	var tr streamUsageTracker
+	tr.recordReasoning(8000)
+	tr.recordOutput(40)
+	tr.recordUsageFull(ai.ProviderUsage{
+		PromptTokens:     100,
+		CompletionTokens: 200,
+		ReasoningTokens:  50,
+		TotalTokens:      350,
+		Known:            true,
+	})
+	u := tr.Usage()
+	if u.CompletionTokens != 200 {
+		t.Errorf("output = %d, want authoritative 200", u.CompletionTokens)
+	}
+	if u.ReasoningTokens != 50 {
+		t.Errorf("reasoning = %d, want authoritative 50", u.ReasoningTokens)
+	}
+	if u.Estimated {
+		t.Error("Estimated = true, want false once the authoritative chunk arrived")
+	}
+}
+
 // TestStreamUsageTracker_UnknownReportsKnownFalse verifies a reader that saw
 // neither a usage chunk nor any output bytes reports usage UNKNOWN (Known
 // false), not a fabricated zero.

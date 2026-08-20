@@ -368,7 +368,7 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 			// Reasoning process (thinking_delta) is routed to the reasoning
 			// handler only — never emitted into the response stream.
 			if event.Delta.Type == "thinking_delta" && event.Delta.Thinking != "" {
-				s.usage.recordOutput(len(event.Delta.Thinking))
+				s.usage.recordReasoning(len(event.Delta.Thinking))
 				if s.reasoningHandler != nil {
 					if err := s.reasoningHandler(event.Delta.Thinking); err != nil {
 						s.closed = true

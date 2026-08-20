@@ -1957,7 +1957,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// stopShimmer was never invoked by the terminal handler, the next
 		// frame self-stops. This guarantees the shimmer can never linger on a
 		// dead loading line regardless of which handler resolved the task.
-		if !m.streaming && !m.agentRunning && !m.reviewRunning && !m.pipelineRunning && !m.planPending && !m.shellRunning {
+		// autonomousActive is included so the safety-net never fires while the
+		// autonomous driver Run/Resume command is in flight: autonomous runs are
+		// the ONLY operation that uses shimmerActive without setting any of the
+		// legacy background-producer flags (agentRunning, streaming, etc.).
+		// Without this guard the shimmer self-terminates on the first frame
+		// after startShimmer("", "autonomy") is called, freezing the spinner
+		// for the entire provider invocation.
+		if !m.streaming && !m.agentRunning && !m.reviewRunning && !m.pipelineRunning && !m.planPending && !m.shellRunning && !m.autonomousActive {
 			m.stopShimmer()
 			return m, nil
 		}
