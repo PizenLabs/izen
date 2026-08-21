@@ -262,11 +262,7 @@ func TestEngineFirstPromptRoutesThroughExecutor(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("routePromptDirective returned nil")
 	}
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("got %T, want gatedExecutionMsg", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("gate err: %v", gem.err)
 	}

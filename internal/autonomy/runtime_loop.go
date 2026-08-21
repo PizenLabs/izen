@@ -175,6 +175,17 @@ type Observation struct {
 	Verification VerificationOutcome
 	// TokenUsage is the provider usage accounted by the loop for bounds.
 	TokenUsage int
+	// InputTokens / OutputTokens are the authoritative provider-reported
+	// input/output counts for this observation (split for aggregate truth).
+	InputTokens int
+	OutputTokens int
+	// UsageKnown reports whether the provider reported authoritative usage for
+	// this observation.
+	UsageKnown bool
+	// FinishReason is the provider's terminal finish_reason for this observation.
+	FinishReason string
+	// MaxOutputTokens is the output budget that was enforced for this attempt.
+	MaxOutputTokens int
 	// AttemptNum is the attempt counter for the current objective.
 	AttemptNum int
 	// RecoveryCycle is the recovery-cycle counter for the current objective.
@@ -416,6 +427,17 @@ type LoopRequest struct {
 	IntentConfidence float64
 	TargetConfidence float64
 	Scope            string
+	// RecoveryAttempt is the 1-indexed attempt number for this request (0 = initial).
+	RecoveryAttempt int
+	// RecoveryReason is the human-readable reason for a recovery re-execution.
+	RecoveryReason string
+	// RecoveryStrategy is the explicit strategy change for this recovery attempt
+	// (e.g. "bounded_patch" after a truncation). Empty for the initial attempt.
+	RecoveryStrategy string
+	// MaxOutputTokens is an explicit output budget override for this attempt (0 = use profile default).
+	MaxOutputTokens int
+	// FinishReason carries the previous attempt's finish_reason for observability.
+	FinishReason string
 	// StreamCallback is an optional callback for incremental streaming progress.
 	// When set, the executor invokes it during provider streaming for each
 	// content delta, first token, and completion.

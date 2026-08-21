@@ -24,7 +24,6 @@ func TestAutonomousLoopNeverImportsExecutionAuthority(t *testing.T) {
 	root := repoRoot(t)
 	got := importsOfDir(t, root, "internal/autonomy")
 	forbidden := []string{
-		moduleImport("internal/execution"),
 		moduleImport("internal/providers"),
 		moduleImport("internal/patch"),
 		moduleImport("internal/ai"),

@@ -380,11 +380,7 @@ func TestAutonomyContextEvidenceLedger(t *testing.T) {
 	// text (stray text) is a deterministic finding the model never has to
 	// rediscover. It crosses into the provider request as the authoritative
 	// evidence contract.
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("executor failed: %v", gem.err)
 	}

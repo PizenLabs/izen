@@ -80,6 +80,8 @@ func (f *fakeAutonomousDriver) Termination() *autonomy.LoopTermination { return 
 
 func (f *fakeAutonomousDriver) SetStreamCallback(cb execution.StreamCallback) {}
 
+func (f *fakeAutonomousDriver) AggregatedUsage() (int, int, bool) { return 0, 0, false }
+
 // extractAutonomousRunMsg extracts an autonomousRunMsg from either a batch message
 // or a direct autonomousRunMsg.
 func extractAutonomousRunMsg(t *testing.T, msg tea.Msg) autonomousRunMsg {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
@@ -54,6 +55,13 @@ type Driver struct {
 	// streamCb is an optional callback for incremental streaming progress during
 	// provider invocations. Set by the UI before Run; cleared after each run.
 	streamCb execution.StreamCallback
+
+	// aggregated usage across all logical invocations of the current run.
+	aggInput  int
+	aggOutput int
+	aggKnown  bool
+	// runRequestID is the stable parent request identity for the current run.
+	runRequestID string
 }
 
 // Option configures the Driver during construction.
@@ -132,6 +140,10 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.prompt = objective
 	d.obs = autonomy.Observation{}
 	d.published = 0
+	d.aggInput = 0
+	d.aggOutput = 0
+	d.aggKnown = false
+	d.runRequestID = fmt.Sprintf("run-%d", d.runID)
 	d.loop.Start("user objective: " + objective)
 	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 
@@ -140,9 +152,10 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	// execution — no model call, no mutation.
 	d.resolved = d.adapter.Resolve(objective)
 	d.req = autonomy.LoopRequest{
-		Prompt:           objective,
-		Targets:          d.resolved.Targets,
-		StreamCallback:   d.streamCb,
+		RequestID:      d.runRequestID,
+		Prompt:         objective,
+		Targets:        d.resolved.Targets,
+		StreamCallback: d.streamCb,
 	}
 	// Clear the callback after capturing it for this run.
 	d.streamCb = nil
@@ -336,6 +349,23 @@ func (d *Driver) History() []autonomy.RuntimeTransition {
 // LastObservation returns the most recent observation the driver consumed.
 func (d *Driver) LastObservation() autonomy.Observation { return d.obs }
 
+// AggregatedUsage returns the authoritative aggregate provider usage across all
+// logical invocations of the current run (one count per recovery attempt).
+func (d *Driver) AggregatedUsage() (input, output int, known bool) {
+	if d == nil {
+		return 0, 0, false
+	}
+	return d.aggInput, d.aggOutput, d.aggKnown
+}
+
+// RunRequestID returns the stable parent request identity for the current run.
+func (d *Driver) RunRequestID() string {
+	if d == nil {
+		return ""
+	}
+	return d.runRequestID
+}
+
 // SetStreamCallback sets a callback for incremental streaming progress during
 // the next provider invocation. It is called by the UI before Run.
 func (d *Driver) SetStreamCallback(cb execution.StreamCallback) {
@@ -374,6 +404,10 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 				return nil, err
 			}
 		case autonomy.RuntimeExecuting:
+			// Ensure child attempt identity: stable parent runRequestID with attempt suffix.
+			if d.req.RequestID == "" {
+				d.req.RequestID = d.runRequestID
+			}
 			obs, err := d.adapter.Execute(ctx, d.req)
 			// Late-result guard: if the run was aborted/superseded while we were
 			// executing, discard the result and return the terminal state.
@@ -384,6 +418,16 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 				return nil, fmt.Errorf("autonomy: execute: %w", err)
 			}
 			d.obs = obs
+			// Aggregate authoritative usage exactly once per logical invocation.
+			if obs.UsageKnown {
+				d.aggInput += obs.InputTokens
+				d.aggOutput += obs.OutputTokens
+				d.aggKnown = true
+			} else if obs.TokenUsage > 0 {
+				// Fallback sum when split counts unavailable (should not happen for provider paths).
+				d.aggInput += obs.TokenUsage
+				d.aggKnown = d.aggKnown || obs.UsageKnown
+			}
 			d.loop.ConsumeExecution(obs)
 			d.loop.ConsumeVerification(obs)
 			d.publish(ctx)
@@ -392,10 +436,20 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			if err != nil {
 				return nil, fmt.Errorf("autonomy: repair: %w", err)
 			}
+			// Child attempt identity: parent run ID plus attempt number.
+			if req.RecoveryAttempt > 0 {
+				req.RequestID = fmt.Sprintf("%s-attempt-%d", d.runRequestID, req.RecoveryAttempt)
+			}
+			reason := req.RecoveryReason
+			if reason == "" {
+				reason = "re-scoped — re-execute"
+			} else {
+				reason = fmt.Sprintf("re-scoped [%s] — re-execute", req.RecoveryStrategy)
+			}
 			d.req = req
 			if _, err := d.step(ctx, autonomy.LoopDecision{
 				Action: autonomy.LoopContinue,
-				Reason: "re-scoped — re-execute",
+				Reason: reason,
 			}); err != nil {
 				return nil, err
 			}
@@ -547,11 +601,69 @@ func approvalFailureOutcome(o autonomy.Observation) bool {
 	}
 }
 
-// defaultRepair re-scopes a failed request for a bounded re-execution by
-// appending the failed outcome as evidence. Real re-planning policies inject a
-// RepairFunc; this default only preserves determinism.
+// defaultRepair re-scopes a failed request for a bounded re-execution.
+// It guarantees a MATERIAL execution-contract change on every recovery: the
+// recovery attempt carries explicit failure evidence, a recovery strategy, and
+// a bounded budget decision. A truncation never retries the same full-file
+// generation.
 func defaultRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.LoopRequest, error) {
-	req.Evidence = strings.TrimSpace(req.Evidence + "\n" +
-		"recovery of failed execution (outcome " + string(o.Outcome) + ")")
-	return req, nil
+	target := o.Target
+	if target == "" {
+		target = firstTarget(req.Targets)
+		if target == "" {
+			target = req.Target
+		}
+	}
+	attempt := o.AttemptNum + 1
+	if attempt < 1 {
+		attempt = req.RecoveryAttempt + 1
+		if attempt < 1 {
+			attempt = 1
+		}
+	}
+
+	var strategy string
+	var reason string
+	var budget int
+	var evidenceAdd string
+
+	switch o.Outcome {
+	case autonomy.OutcomeTruncated:
+		strategy = "bounded_patch"
+		reason = fmt.Sprintf("output_budget_exceeded: truncated target %s budget=%d finish_reason=%s", target, o.MaxOutputTokens, o.FinishReason)
+		// Keep budget bounded: do not silently multiply. Prefer patch artifact
+		// over full-file rewrite so it fits the existing ceiling.
+		budget = o.MaxOutputTokens
+		if budget == 0 {
+			budget = req.MaxOutputTokens
+		}
+		evidenceAdd = fmt.Sprintf(
+			"[RECOVERY attempt=%d/%d strategy=%s -> %s target=%s budget=%d finish_reason=%s outcome=%s]\nFailure: model output truncated (finish_reason=length) while generating full artifact for %s.\nRecovery: produce a bounded SEARCH/REPLACE patch (or unified diff hunk) for the minimal change instead of regenerating the entire file. Preserve required target context, trim unrelated output.",
+			o.AttemptNum, attempt, "full_artifact", strategy, target, o.MaxOutputTokens, o.FinishReason, o.Outcome, target)
+	default:
+		strategy = "retry_with_evidence"
+		reason = fmt.Sprintf("recoverable failure %s on %s (attempt %d)", o.Outcome, target, attempt)
+		budget = req.MaxOutputTokens
+		evidenceAdd = fmt.Sprintf("[RECOVERY attempt=%d strategy=%s outcome=%s target=%s finish_reason=%s]", attempt, strategy, o.Outcome, target, o.FinishReason)
+	}
+
+	// Structured trace line — concise, per attempt, visible in logs.
+	log.Printf("[execution] attempt=%d strategy=%s target=%s budget=%d", o.AttemptNum, "full_artifact", target, o.MaxOutputTokens)
+	log.Printf("[execution] result=truncated input=%d output=%d finish_reason=%s outcome=%s", o.InputTokens, o.OutputTokens, o.FinishReason, o.Outcome)
+	log.Printf("[recovery] reason=%s", reason)
+	log.Printf("[recovery] strategy=%s", strategy)
+	log.Printf("[execution] attempt=%d strategy=%s target=%s budget=%d", attempt, strategy, target, budget)
+
+	next := req
+	next.Evidence = strings.TrimSpace(req.Evidence + "\n" + evidenceAdd)
+	next.RecoveryAttempt = attempt
+	next.RecoveryReason = reason
+	next.RecoveryStrategy = strategy
+	next.FinishReason = o.FinishReason
+	if budget > 0 {
+		next.MaxOutputTokens = budget
+	}
+	// Ensure the next executor invocation is not identical: the recovery
+	// strategy and evidence are now materially different.
+	return next, nil
 }

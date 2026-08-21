@@ -177,11 +177,7 @@ func TestRuntimeCutoverFlagOnRoutesHotThroughExecutor(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("granted $hot must dispatch an execution")
 	}
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("$hot must route through the executor (gatedExecutionMsg), got %T", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("executor failed: %v", gem.err)
 	}

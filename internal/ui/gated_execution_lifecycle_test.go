@@ -48,11 +48,7 @@ func TestGatedExecutionFailureLeavesResolvingState(t *testing.T) {
 
 	// Run the worker: the provider fails, the executor returns a terminal
 	// result alongside the error.
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err == nil {
 		t.Fatal("expected the provider failure to surface as an execution error")
 	}

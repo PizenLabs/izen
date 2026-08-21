@@ -62,6 +62,7 @@ type autonomousDriver interface {
 	Boundary() *autonomy.HumanBoundary
 	Termination() *autonomy.LoopTermination
 	SetStreamCallback(cb execution.StreamCallback)
+	AggregatedUsage() (input, output int, known bool)
 }
 
 // autonomousRunMsg carries a driver Run/Resume/Abort outcome back into the
@@ -101,7 +102,6 @@ func (m *model) runAutonomousDriver(objective string) tea.Cmd {
 	m.execStreaming = true
 	m.spinnerFrame = 0
 	m.startShimmer("Waiting for model...", "autonomy")
-	m.setStage("model", m.cfg.ActiveModelName(), stageWaiting)
 
 	m.autonomousDriver.SetStreamCallback(func(ev execution.StreamEvent) {
 		ch := m.execStreamCh
@@ -236,12 +236,39 @@ func (m *model) autonomousParked() bool {
 // terminal outcome, and keeps the driver's loop state as the single truth.
 func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 	m.autonomousActive = false
+	// ── STREAMING TERMINALIZATION (spinner contract) ────────────────
+	// The autonomous streaming channel is terminalized here idempotently: every
+	// terminal/parked outcome clears the streaming state, stops the shimmer and
+	// marks the stage done so no spinner can survive the execution lifecycle.
+	m.execStreamCh = nil
+	if m.execStreaming {
+		m.execStreaming = false
+		m.stopShimmer()
+		m.setStage("model", m.getActiveModelName(), stageDone)
+	}
+	// Fetch aggregated authoritative usage from the driver (one count per logical invocation).
+	var aggIn, aggOut int
+	var aggKnown bool
+	if m.autonomousDriver != nil {
+		aggIn, aggOut, aggKnown = m.autonomousDriver.AggregatedUsage()
+	}
+	usageCmd := func() tea.Cmd {
+		if aggKnown {
+			return m.tokenUsageCmdKnown(aggIn, aggOut, true)
+		}
+		return nil
+	}
+
 	if msg.err != nil {
 		m.autonomousBoundary = nil
 		m.finalizeOperation(OpOutcomeFailure, msg.err)
 		m.push(roleError, "[autonomous] "+msg.err.Error())
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
+		cmd := usageCmd()
+		if cmd != nil {
+			return cmd
+		}
 		return nil
 	}
 
@@ -268,6 +295,11 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
+		cmd := usageCmd()
+		if cmd != nil {
+			// Even while parked, the provider usage of completed attempts is authoritative and must reach the footer.
+			return cmd
+		}
 		return nil
 	}
 
@@ -288,6 +320,10 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 	m.resolveApprovalState()
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
+	cmd := usageCmd()
+	if cmd != nil {
+		return cmd
+	}
 	return nil
 }
 

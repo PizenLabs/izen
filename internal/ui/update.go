@@ -2579,8 +2579,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if m.execStreaming {
 			m.execStreamCh = nil
 			m.execStreaming = false
+			m.setStage("model", m.getActiveModelName(), stageFailed)
 			m.stopShimmer()
-			// The error will be surfaced via gatedExecutionMsg -> executionResultUpdate
+			// The error will be surfaced via gatedExecutionMsg -> executionResultUpdate or autonomousRunMsg
 			return m, nil
 		}
 

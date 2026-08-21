@@ -119,7 +119,6 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	m.execStreaming = true
 	m.spinnerFrame = 0
 	m.startShimmer("Waiting for model...", "execution")
-	m.setStage("model", m.cfg.ActiveModelName(), stageWaiting)
 
 	req.StreamCallback = func(ev execution.StreamEvent) {
 		// Capture channel locally to avoid race with cleanup
