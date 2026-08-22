@@ -95,10 +95,25 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		// re-asking for clarification.
 		strategyPtr = nil
 	}
+	effectiveMax := profile.MaxOutputTokens
+	if req.MaxOutputTokens > 0 {
+		effectiveMax = req.MaxOutputTokens
+	}
+	// The observation must carry the budget the invocation will ACTUALLY be
+	// bounded by (profile default or explicit override) — recovery decisions
+	// and traces read it as the authoritative per-attempt output ceiling.
+	req.MaxOutputTokens = effectiveMax
+	// Recovery prompt augmentation: when a recovery strategy is set, the
+	// objective is annotated with the explicit failure evidence so the next
+	// model invocation does not have to rediscover the truncation.
+	prompt := req.Prompt
+	if req.RecoveryStrategy != "" && req.RecoveryReason != "" {
+		prompt = prompt + "\n\n[RECOVERY " + req.RecoveryStrategy + ": " + req.RecoveryReason + "]"
+	}
 	execReq := execution.ExecuteRequest{
 		RequestID:        req.RequestID,
 		Mode:             "autonomy",
-		Prompt:           req.Prompt,
+		Prompt:           prompt,
 		Target:           req.Target,
 		Targets:          req.Targets,
 		Strategy:         strategyPtr,
@@ -107,6 +122,33 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		TargetConfidence: req.TargetConfidence,
 		Scope:            req.Scope,
 		Evidence:         req.Evidence,
+		StreamCallback:   req.StreamCallback,
+		// The recovery decision travels with the request so the executor can
+		// change the ACTUAL execution protocol (bounded-patch windowed
+		// context + strict SEARCH/REPLACE contract), not just annotations.
+		RecoveryStrategy: req.RecoveryStrategy,
+		RecoveryAttempt:  req.RecoveryAttempt,
+		// The strategy-selected output ceiling is a REQUEST budget, not a
+		// reporting change: max_tokens bounds the provider's generation so a
+		// verbose reasoning model cannot spend an unbounded output budget, and
+		// whatever the provider does bill is reported verbatim (finalizeResult
+		// preserves the authoritative usage). The /build path already carries
+		// this bound via the intent gateway; the autonomous path must apply the
+		// same strategy-owned bound or it runs unbounded (the 5,883-token
+		// repro: max_tokens was omitted because req.MaxOutputTokens stayed 0).
+		MaxOutputTokens: effectiveMax,
+	}
+	if strategyPtr != nil && req.RecoveryStrategy == "bounded_patch" {
+		// Material artifact-contract change: the recovery attempt MUST produce
+		// a structured bounded patch. The search_replace kind is enforced by
+		// the executor at the artifact boundary — the model is never asked to
+		// emit the full file and a full-file response is rejected — so a
+		// truncated full-file regeneration can never repeat under a new label.
+		mod := *strategyPtr
+		mod.Artifact.Bounded = true
+		mod.Artifact.Kind = "search_replace"
+		mod.StrategyReason += " [recovery: bounded_patch after truncation]"
+		execReq.Strategy = &mod
 	}
 	res, err := a.executor.Execute(ctx, execReq)
 	if err != nil && res == nil {
@@ -118,9 +160,15 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 // Approve resolves an approval gate held by the executor and returns the
 // terminal observation of the SAME execution. It never re-executes the
 // mutation: the held patch was already produced, approval applies it.
+//
+// The executor returns a NON-NIL terminal result even when the apply/verify
+// fails (the result carries the real failure outcome). That result must flow
+// back to the loop so a failed approval converges to a terminal state — a hard
+// error is ONLY returned when no result exists at all (e.g. double-approve of
+// an unknown patch id).
 func (a *ExecutorAdapter) Approve(ctx context.Context, patchID string) (autonomy.Observation, error) {
 	res, err := a.executor.Approve(ctx, patchID)
-	if err != nil {
+	if err != nil && res == nil {
 		return autonomy.Observation{}, err
 	}
 	return a.observe(autonomy.LoopRequest{RequestID: res.RequestID}, res), nil
@@ -130,7 +178,7 @@ func (a *ExecutorAdapter) Approve(ctx context.Context, patchID string) (autonomy
 // observation of the SAME execution.
 func (a *ExecutorAdapter) Reject(ctx context.Context, patchID, reason string) (autonomy.Observation, error) {
 	res, err := a.executor.Reject(ctx, patchID, reason)
-	if err != nil {
+	if err != nil && res == nil {
 		return autonomy.Observation{}, err
 	}
 	return a.observe(autonomy.LoopRequest{RequestID: res.RequestID}, res), nil
@@ -152,6 +200,21 @@ func (a *ExecutorAdapter) observe(req autonomy.LoopRequest, res *execution.Execu
 	if res.Proof != nil {
 		outcome = res.Proof.Outcome
 	}
+	// Extract finish reason and budget from the authoritative invocation when present.
+	finishReason := ""
+	maxOut := 0
+	if len(res.Proof.ModelInvocations) > 0 {
+		finishReason = res.Proof.ModelInvocations[len(res.Proof.ModelInvocations)-1].FinishReason
+	}
+	if len(res.ModelCalls) > 0 {
+		if fr := res.ModelCalls[len(res.ModelCalls)-1].FinishReason; fr != "" {
+			finishReason = fr
+		}
+	}
+	// MaxOutputTokens is not stored on the result; recover via request's effective budget or profile.
+	if req.MaxOutputTokens > 0 {
+		maxOut = req.MaxOutputTokens
+	}
 	return autonomy.Observation{
 		RequestID:             res.RequestID,
 		Intent:                autonomy.Intent(req.Intent),
@@ -162,6 +225,11 @@ func (a *ExecutorAdapter) observe(req autonomy.LoopRequest, res *execution.Execu
 		ClarificationRequired: res.ClarificationRequired,
 		Verification:          autonomy.VerificationOutcome{Passed: res.Verification.Passed},
 		TokenUsage:            res.Completed.InputTokens + res.Completed.OutputTokens,
+		InputTokens:           res.Completed.InputTokens,
+		OutputTokens:          res.Completed.OutputTokens,
+		UsageKnown:            res.Completed.Known,
+		FinishReason:          finishReason,
+		MaxOutputTokens:       maxOut,
 	}
 }
 

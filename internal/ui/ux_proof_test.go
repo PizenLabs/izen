@@ -45,8 +45,7 @@ func TestUXProofCase3(t *testing.T) {
 	m := gatedDispatchModel(t, mock, map[string]string{"index.html": orig})
 	m.state = StateChat
 	cmd := m.runGatedLine("$prompt remove extra content @index.html")
-	msg := cmd()
-	gem := msg.(gatedExecutionMsg)
+	gem := extractGatedExecutionMsg(t, cmd)
 	res, _ := m.executionResultUpdate(executionResultMsg{res: gem.res})
 	m2 := res.(*model)
 	before, _ := os.ReadFile("index.html")

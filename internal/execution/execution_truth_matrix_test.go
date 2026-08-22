@@ -183,11 +183,11 @@ func TestTruthMatrix_MalformedArtifactRejected(t *testing.T) {
 	if err == nil || res == nil || res.Err == nil {
 		t.Fatalf("malformed artifact must fail: err=%v resErr=%v", err, resErr(res))
 	}
-	if !errors.Is(res.Err, ErrArtifactRejected) {
-		t.Fatalf("error = %v, want ErrArtifactRejected", res.Err)
+	if !errors.Is(res.Err, ErrArtifactRetryableRejected) {
+		t.Fatalf("error = %v, want ErrArtifactRetryableRejected", res.Err)
 	}
-	if res.Proof.Outcome != OutcomeArtifactRejected {
-		t.Fatalf("proof outcome = %s, want artifact_rejected", res.Proof.Outcome)
+	if res.Proof.Outcome != OutcomeArtifactRetryableRejected {
+		t.Fatalf("proof outcome = %s, want artifact_retryable_rejected", res.Proof.Outcome)
 	}
 	if res.PendingPatchID != "" {
 		t.Fatal("malformed artifact must never reach the approval gate")

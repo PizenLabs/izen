@@ -722,51 +722,65 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	gatePassed := false
 	if pm.verifier != nil {
 		report := pm.verifier.RunAll()
-		gateRun = true
-		gatePassed = report.Passed
+		// The gate report is captured on the mutation boundary unconditionally
+		// so the execution result reads the REAL gate outcome — including the
+		// not-applicable (Skipped) case — and never re-runs verification.
 		pm.recordVerification(&report)
-		if !report.Passed {
-			// Verification failed — extract syntax errors for micro-fix loop.
-			var syntaxErrors []string
-			for _, res := range report.Results {
-				if !res.Passed && !res.Step.Optional {
-					syntaxErrors = append(syntaxErrors, fmt.Sprintf("%s: %s", res.Step.Name, firstLine(res.Output)))
-				}
+		if report.Skipped {
+			// NO verification contract for this language: the gate is NOT
+			// APPLICABLE. Nothing ran and nothing failed — the patch is not
+			// rolled back and the apply does not claim a verification that did
+			// not happen (Phase 7 P1: no implicit Go fallback, no fabricated
+			// pass, no spurious failure).
+			if globalActivityLog != nil {
+				globalActivityLog("[VERIFY] verification skipped for %s: %s", patch.File, report.Reason)
 			}
-
-			// Roll back: restore original from shadow backup.
-			if err := pm.restoreFromShadowBackup(fullPath); err != nil {
-				if globalActivityLog != nil {
-					globalActivityLog("[FAIL] patch write-back failed on %s: %v", patch.File, err)
+		} else {
+			gateRun = true
+			gatePassed = report.Passed
+			if !report.Passed {
+				// Verification failed — extract syntax errors for micro-fix loop.
+				var syntaxErrors []string
+				for _, res := range report.Results {
+					if !res.Passed && !res.Step.Optional {
+						syntaxErrors = append(syntaxErrors, fmt.Sprintf("%s: %s", res.Step.Name, firstLine(res.Output)))
+					}
 				}
+
+				// Roll back: restore original from shadow backup.
+				if err := pm.restoreFromShadowBackup(fullPath); err != nil {
+					if globalActivityLog != nil {
+						globalActivityLog("[FAIL] patch write-back failed on %s: %v", patch.File, err)
+					}
+				}
+
+				if globalActivityLog != nil {
+					for _, se := range syntaxErrors {
+						globalActivityLog("[VERIFY] syntax degradation in %s: %s", patch.File, se)
+					}
+					globalActivityLog("[FAIL] patch rejected on %s: verification gate blocked — micro-fix required", patch.File)
+				}
+
+				errMsg := fmt.Sprintf("verification gate blocked patch on %s (syntax degradation detected)",
+					patch.File)
+				if len(syntaxErrors) > 0 {
+					errMsg += ": " + syntaxErrors[0]
+				}
+				// The apply DID execute (the write ran) and was then rolled back.
+				// The evidence records the actual post-restore filesystem state —
+				// the truth is byte comparison, never an assumption.
+				diskChanged := true
+				if data, err := os.ReadFile(fullPath); err == nil {
+					diskChanged = string(data) != patch.Original
+				}
+				pm.recordMutationEvidence(patch, OutcomeVerifyFailed, errMsg,
+					applyFacts{executed: true, changed: diskChanged, verifyRun: true, verifyPassed: false})
+				return fmt.Errorf("%s", errMsg)
 			}
 
 			if globalActivityLog != nil {
-				for _, se := range syntaxErrors {
-					globalActivityLog("[VERIFY] syntax degradation in %s: %s", patch.File, se)
-				}
-				globalActivityLog("[FAIL] patch rejected on %s: verification gate blocked — micro-fix required", patch.File)
+				globalActivityLog("[VERIFY] verification gate passed for %s", patch.File)
 			}
-
-			errMsg := fmt.Sprintf("verification gate blocked patch on %s (syntax degradation detected)",
-				patch.File)
-			if len(syntaxErrors) > 0 {
-				errMsg += ": " + syntaxErrors[0]
-			}
-			// The apply DID execute (the write ran) and was then rolled back.
-			// The evidence records the actual post-restore filesystem state —
-			// the truth is byte comparison, never an assumption.
-			diskChanged := true
-			if data, err := os.ReadFile(fullPath); err == nil {
-				diskChanged = string(data) != patch.Original
-			}
-			pm.recordMutationEvidence(patch, OutcomeVerifyFailed, errMsg,
-				applyFacts{executed: true, changed: diskChanged, verifyRun: true, verifyPassed: false})
-			return fmt.Errorf("%s", errMsg)
-		}
-
-		if globalActivityLog != nil {
-			globalActivityLog("[VERIFY] verification gate passed for %s", patch.File)
 		}
 	}
 
@@ -1792,6 +1806,63 @@ func ResolveModifiedContent(original, rawLLMOutput string) string {
 
 	// Strategy 3: Treated as full file content
 	return input
+}
+
+// ExtractBoundedPatch extracts a bounded patch from raw LLM output using ONLY
+// the structured patch representations — SEARCH/REPLACE blocks or unified diff
+// hunks — and validates the anchor deterministically:
+//
+//   - every SEARCH block MUST occur EXACTLY ONCE, byte-for-byte, in the
+//     original (a duplicated or missing anchor can never apply unambiguously);
+//   - the applied result MUST differ from the original;
+//   - full-file or otherwise unstructured output NEVER passes.
+//
+// It is the artifact boundary for the search_replace contract (truncation
+// recovery): a verbose or truncated response can never masquerade as the
+// mutation.
+func ExtractBoundedPatch(original, raw string) (string, bool) {
+	input := strings.TrimSpace(raw)
+	if input == "" || original == "" {
+		return "", false
+	}
+
+	// Strip outer markdown code fences if present (the parser explicitly
+	// supports fenced blocks; prose outside them is not part of the artifact).
+	if strings.HasPrefix(input, "```") {
+		if idx := strings.Index(input, "\n"); idx != -1 {
+			input = input[idx+1:]
+		}
+	}
+	input = strings.TrimSuffix(input, "```")
+	input = strings.TrimSpace(input)
+
+	// Structured form 1: SEARCH/REPLACE blocks with exact-once anchor proof.
+	if strings.Contains(input, "<<<<<<< SEARCH") {
+		blocks := ParseSearchReplaceBlocks(input)
+		if len(blocks) == 0 {
+			return "", false
+		}
+		for _, block := range blocks {
+			if block.search == "" || strings.Count(original, block.search) != 1 {
+				return "", false
+			}
+		}
+		if modified, ok := ApplySearchReplaceBlocks(original, blocks); ok && modified != original {
+			return modified, true
+		}
+		return "", false
+	}
+
+	// Structured form 2: unified diff with @@ hunk headers.
+	if strings.Contains(input, "@@") {
+		if modified, err := applyUnifiedPatch(original, input); err == nil && modified != original {
+			return modified, true
+		}
+		return "", false
+	}
+
+	// No structured patch representation present.
+	return "", false
 }
 
 // ExtractCodeBlockContent extracts content from the first markdown code block

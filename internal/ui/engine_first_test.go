@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/execution"
@@ -59,6 +61,17 @@ func runGate(m *model, input string) gatedExecutionMsg {
 		return gatedExecutionMsg{}
 	}
 	msg := cmd()
+	// runGatedLine now returns a batch; find the gatedExecutionMsg in it
+	if batchMsg, ok := msg.(tea.BatchMsg); ok {
+		for _, c := range batchMsg {
+			if m := c(); m != nil {
+				if gem, ok := m.(gatedExecutionMsg); ok {
+					return gem
+				}
+			}
+		}
+		return gatedExecutionMsg{}
+	}
 	gem, ok := msg.(gatedExecutionMsg)
 	if !ok {
 		return gatedExecutionMsg{}
@@ -249,11 +262,7 @@ func TestEngineFirstPromptRoutesThroughExecutor(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("routePromptDirective returned nil")
 	}
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("got %T, want gatedExecutionMsg", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("gate err: %v", gem.err)
 	}

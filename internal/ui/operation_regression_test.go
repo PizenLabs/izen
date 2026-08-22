@@ -6,12 +6,14 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/autonomy"
 )
 
 // blockingProvider blocks Execute until its context is cancelled, proving
@@ -19,14 +21,17 @@ import (
 type blockingProvider struct {
 	started   chan struct{}
 	cancelled chan struct{}
+	once      sync.Once
 }
 
 func (b *blockingProvider) Name() string { return "blocking" }
 
 func (b *blockingProvider) Execute(ctx context.Context, _ ai.Request) (*ai.Response, error) {
-	if b.started != nil {
-		close(b.started)
-	}
+	b.once.Do(func() {
+		if b.started != nil {
+			close(b.started)
+		}
+	})
 	select {
 	case <-ctx.Done():
 		if b.cancelled != nil {
@@ -309,4 +314,117 @@ func TestRegressionCtrlCCancelsIdleChatKeepsInput(t *testing.T) {
 	if m2.cancelGraceDeadline != (time.Time{}) {
 		t.Fatal("idle Ctrl+C must not arm the force-exit grace window")
 	}
+}
+
+// ── Autonomous cancellation lifecycle ────────────────────────────────────────
+
+// TestRegressionEscDuringAutonomousExecutionReleasesSpinner asserts that
+// handleEmergencyInterrupt does NOT finalize the operation when an autonomous
+// run is active, allowing the autonomous run's terminal message to be the
+// canonical cleanup path.
+func TestRegressionEscDuringAutonomousExecutionReleasesSpinner(t *testing.T) {
+	m := newTestModel()
+	m.state = StateChat
+	m.autonomousActive = true
+	m.activeOp = &operation{
+		ID:     "test-op-1",
+		Kind:   OpAutonomous,
+		Ctx:    context.Background(),
+		Cancel: func() {},
+		State:  OpStateRunning,
+	}
+
+	t.Logf("Before handleEmergencyInterrupt: autonomousActive=%v, activeOp=%v", m.autonomousActive, m.activeOp)
+
+	// Before fix: handleEmergencyInterrupt would finalize the operation immediately
+	// After fix: it should NOT finalize when autonomousActive is true
+	m.handleEmergencyInterrupt("test")
+
+	t.Logf("After handleEmergencyInterrupt: autonomousActive=%v, activeOp=%v", m.autonomousActive, m.activeOp)
+
+	// The operation should NOT be finalized by handleEmergencyInterrupt
+	// (it will be finalized by handleAutonomousRun when the autonomous run's
+	// terminal message arrives)
+	if m.activeOp == nil {
+		t.Fatal("activeOp should NOT be nil - handleEmergencyInterrupt should not finalize for active autonomous runs")
+	}
+	if !m.autonomousActive {
+		t.Fatal("autonomousActive should remain true until terminal message is processed")
+	}
+
+	// Now simulate the autonomous run's terminal message arriving
+	m.handleAutonomousRun(autonomousRunMsg{
+		term: &autonomy.LoopTermination{
+			State:  autonomy.RuntimeAborted,
+			Reason: "context cancelled",
+			Class:  autonomy.FailurePermanent,
+		},
+		err: nil,
+	})
+
+	// Now the operation should be finalized and presentation released
+	if m.activeOp != nil {
+		t.Fatal("activeOp should be nil after autonomous terminal message")
+	}
+	if m.autonomousActive {
+		t.Fatal("autonomousActive should be false after terminal message")
+	}
+	if m.state != StateChat {
+		t.Fatalf("state = %v, want StateChat", m.state)
+	}
+	if !m.ti.Focused() {
+		t.Fatal("input should be focused")
+	}
+}
+
+// TestAutonomousSpinnerLifecycle verifies the shimmer/spinner starts when
+// an autonomous run begins and stops only after the terminal result is processed.
+func TestAutonomousSpinnerLifecycle(t *testing.T) {
+	m := newTestModel()
+	m.state = StateChat
+	m.autonomousActive = false
+	m.shimmerActive = false
+	m.activeOp = nil
+
+	// Simulate starting an autonomous run
+	m.autonomousActive = true
+	m.beginOperation(OpAutonomous)
+	m.startShimmer("", "autonomy")
+
+	if !m.shimmerActive {
+		t.Fatal("shimmer should be active after starting autonomous run")
+	}
+	if m.activeOp == nil {
+		t.Fatal("activeOp should be set after starting autonomous run")
+	}
+
+	// Simulate autonomous run completing (terminal result)
+	m.handleAutonomousRun(autonomousRunMsg{
+		term: &autonomy.LoopTermination{
+			State:  autonomy.RuntimeCompleted,
+			Reason: "objective satisfied",
+			Class:  autonomy.FailureTransient,
+		},
+		err: nil,
+	})
+
+	// Spinner should be stopped after terminal result processed
+	if m.shimmerActive {
+		t.Fatal("shimmer should be inactive after autonomous run completes")
+	}
+	if m.activeOp != nil {
+		t.Fatal("activeOp should be nil after autonomous run completes")
+	}
+	if !m.ti.Focused() {
+		t.Fatal("input should be focused after autonomous run completes")
+	}
+}
+
+// TestAutonomousProviderUsageTracking verifies that provider usage is accurately
+// tracked and reported through the autonomous execution path.
+func TestAutonomousProviderUsageTracking(t *testing.T) {
+	// This test is a placeholder - the actual provider usage tracking is tested
+	// in internal/runtime/autonomy/driver_test.go using the autonomy test harness.
+	// The UI layer simply propagates the usage from the driver's observation.
+	t.Skip("Provider usage tracking tested in internal/runtime/autonomy/driver_test.go")
 }

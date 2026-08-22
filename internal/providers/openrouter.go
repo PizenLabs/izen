@@ -134,7 +134,7 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 
 	body := p.buildRequest(model, msgs, req, false)
 
-	resp, err := p.doChatRequest(ctx, key, body, false)
+	resp, stats, err := p.doChatRequest(ctx, key, body, false)
 	if err != nil {
 		return nil, err
 	}
@@ -191,6 +191,8 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	if usage.FirstTokenAt.IsZero() {
 		usage.FirstTokenAt = usage.CompletedAt
 	}
+	usage.HTTPAttempts = stats.attempts
+	usage.RateLimitedRetries = stats.rateLimitedRetries
 
 	return &ai.Response{
 		Content:     content,
@@ -216,7 +218,7 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 
 	body := p.buildRequest(model, msgs, req, true)
 
-	resp, err := p.doChatRequest(ctx, key, body, true)
+	resp, stats, err := p.doChatRequest(ctx, key, body, true)
 	if err != nil {
 		return nil, err
 	}
@@ -234,6 +236,7 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 
 	sr := &openrouterSSEReader{body: resp.Body}
 	sr.usage.markRequestStarted(time.Now())
+	sr.usage.recordTransport(stats.attempts, stats.rateLimitedRetries)
 	return &OpenRouterStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -330,21 +333,29 @@ type openrouterRequest struct {
 }
 
 // openrouterReasoning is OpenRouter's reasoning control payload: an optional
-// qualitative effort (low/medium/high) and an optional max_tokens reasoning
-// cap. OpenRouter relays whichever field is set to the underlying provider's
-// native mechanism.
+// qualitative effort (low/medium/high), an optional max_tokens reasoning cap,
+// and an optional on/off switch. OpenRouter relays whichever field is set to
+// the underlying provider's native mechanism.
 type openrouterReasoning struct {
 	Effort    string `json:"effort,omitempty"`
 	MaxTokens int    `json:"max_tokens,omitempty"`
+	Enabled   *bool  `json:"enabled,omitempty"`
 }
 
 // reasoningFor builds the OpenRouter reasoning payload from the resolved
 // effort directive. The qualitative effort maps to reasoning.effort; the CoT
-// cap and budget map to reasoning.max_tokens. A nil request reasoning config
-// yields nil (field omitted, the pre-existing behavior).
+// cap and budget map to reasoning.max_tokens. Disabled maps to
+// reasoning.enabled=false — the only control reliably honored by models whose
+// gateways ignore the CoT cap (they otherwise spend the whole output budget in
+// the hidden reasoning channel). A nil request reasoning config yields nil
+// (field omitted, the pre-existing behavior).
 func reasoningFor(req ai.Request) *openrouterReasoning {
 	if req.Reasoning == nil {
 		return nil
+	}
+	if req.Reasoning.Disabled {
+		enabled := false
+		return &openrouterReasoning{Enabled: &enabled}
 	}
 	r := &openrouterReasoning{Effort: req.Reasoning.Level}
 	switch {
@@ -418,8 +429,17 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 	return body
 }
 
+// chatRequestStats carries the transport forensics of one logical invocation
+// (Phase 7 P5): attempts is the total number of HTTP round-trips (1 + every
+// retry), rateLimitedRetries how many of those were 429 rate-limit retries.
+type chatRequestStats struct {
+	attempts           int
+	rateLimitedRetries int
+}
+
 // doChatRequest POSTs a chat-completion payload to the OpenRouter gateway and
-// returns the HTTP response (the caller owns the body). When the payload
+// returns the HTTP response (the caller owns the body) plus the transport
+// forensics of the call. When the payload
 // carried a reasoning control and the gateway rejects it with HTTP 400, the
 // reasoning field is stripped and the request is retried exactly once: some
 // OpenRouter models do not accept the reasoning schema, and OpenRouter bills
@@ -434,9 +454,13 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 // deadline-exceeded context surfaces promptly instead of sleeping out the full
 // backoff window. Both the non-streaming Execute path and the streaming
 // ExecuteStream path route through this function, so rate-limited free-tier
-// builds recover instead of aborting on the first 429.
-func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body openrouterRequest, stream bool) (*http.Response, error) {
+// builds recover instead of aborting on the first 429. Every retry is a
+// transport attempt of the SAME logical invocation — recovered 429s never
+// double the invocation count, and their responses carry no billed tokens.
+func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body openrouterRequest, stream bool) (*http.Response, chatRequestStats, error) {
+	var stats chatRequestStats
 	attempt := func(b openrouterRequest) (*http.Response, error) {
+		stats.attempts++
 		payload, err := json.Marshal(b)
 		if err != nil {
 			return nil, fmt.Errorf("openrouter: marshal: %w", err)
@@ -459,7 +483,7 @@ func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body
 
 	resp, err := attempt(body)
 	if err != nil {
-		return nil, fmt.Errorf("openrouter: do: %w", err)
+		return nil, stats, fmt.Errorf("openrouter: do: %w", err)
 	}
 	if resp.StatusCode == http.StatusBadRequest && body.Reasoning != nil {
 		// A non-reasoning model rejected the reasoning schema. Discard the
@@ -468,7 +492,7 @@ func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body
 		body.Reasoning = nil
 		resp, err = attempt(body)
 		if err != nil {
-			return nil, fmt.Errorf("openrouter: do: %w", err)
+			return nil, stats, fmt.Errorf("openrouter: do: %w", err)
 		}
 	}
 
@@ -480,14 +504,15 @@ func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body
 		}
 		_ = resp.Body.Close()
 		if !waitRateLimitRetry(ctx, delay) {
-			return nil, fmt.Errorf("openrouter: rate limited (429): retry aborted: %w", ctx.Err())
+			return nil, stats, fmt.Errorf("openrouter: rate limited (429): retry aborted: %w", ctx.Err())
 		}
 		resp, err = attempt(body)
 		if err != nil {
-			return nil, fmt.Errorf("openrouter: do: %w", err)
+			return nil, stats, fmt.Errorf("openrouter: do: %w", err)
 		}
+		stats.rateLimitedRetries++
 	}
-	return resp, nil
+	return resp, stats, nil
 }
 
 // retryAfterDelay parses the HTTP Retry-After header from a response into the
@@ -772,7 +797,7 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 				reasoningText = delta.Reasoning
 			}
 			if reasoningText != "" {
-				s.usage.recordOutput(len(reasoningText))
+				s.usage.recordReasoning(len(reasoningText))
 				reasoning := []byte(ReasoningSentinel + reasoningText + ReasoningSentinel)
 				n := copy(p, reasoning)
 				if n < len(reasoning) {

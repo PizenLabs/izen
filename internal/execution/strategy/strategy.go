@@ -165,9 +165,15 @@ type Complexity struct {
 // strategy. It bounds the output budget: a SEARCH/REPLACE block never needs the
 // budget of a multi-file plan, and a real-content file is never forced to
 // re-emit its full contents.
+//
+// Kind "search_replace" is the STRICT bounded-patch contract: the executor
+// asks only for SEARCH/REPLACE / unified-diff output and rejects any
+// full-file or unstructured response at the artifact boundary. It is set on
+// truncation recovery (bounded_patch) so the recovery attempt cannot repeat
+// the full-artifact generation under a different label.
 type ArtifactContract struct {
-	// Kind is one of: create_file, replace_block, replace_file, plan,
-	// investigation, explanation.
+	// Kind is one of: create_file, replace_block, replace_file, search_replace,
+	// plan, investigation, explanation.
 	Kind string
 	// Bounded reports whether the artifact is anchored to a located block
 	// rather than a full-file rewrite.

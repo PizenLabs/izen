@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -22,6 +23,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/pkg/capability/policy"
 )
 
 // ── RuntimeExecutor (Steps 1-3 of the authority migration) ─────────────────
@@ -42,6 +44,29 @@ import (
 // The executor is self-contained: it owns its own PatchManager + Verifier +
 // MutationSet transaction boundary. It never shares the UI's execution.Engine
 // mutation state, so the authority is unambiguous.
+
+// StreamEvent represents a streaming event from the provider during execution.
+// It is a domain-level type — no UI framework dependencies.
+type StreamEvent struct {
+	RequestID string
+	// Kind is the event kind: "first_token", "content_delta", "done", "error".
+	Kind string
+	// Content is the text content for content_delta events.
+	Content string
+	// FinishReason is the provider's finish_reason for done events.
+	FinishReason string
+	// Usage is the provider's usage for done events.
+	Usage ai.ProviderUsage
+	// Err is the error for error events.
+	Err error
+}
+
+// StreamCallback is an optional callback invoked during provider streaming.
+// It is called from the executor's streaming goroutine for each content delta,
+// first token, and completion. The callback must be non-blocking and return
+// quickly. It allows the UI to receive incremental streaming progress without
+// the executor depending on any UI framework.
+type StreamCallback func(StreamEvent)
 
 // ExecuteRequest is a user execution submitted to the runtime.
 type ExecuteRequest struct {
@@ -80,6 +105,20 @@ type ExecuteRequest struct {
 	// evidence; the full-file context the runtime reads is supporting context
 	// only (Phase 1 Step 5).
 	Evidence string
+	// RecoveryStrategy / RecoveryAttempt carry the autonomy recovery decision
+	// into the execution contract (same handoff pattern as Intent above).
+	// RecoveryStrategy "bounded_patch" selects the strict bounded-patch
+	// protocol — runtime-derived windowed context and a SEARCH/REPLACE-only
+	// output contract enforced at the artifact boundary. RecoveryAttempt is
+	// the 1-indexed attempt number (0 = initial) used for deterministic
+	// window rotation across repair cycles.
+	RecoveryStrategy string
+	RecoveryAttempt  int
+	// StreamCallback is an optional callback for incremental streaming progress.
+	// When set, the executor invokes it during provider streaming for each
+	// content delta, first token, and completion. This enables the UI to
+	// render streaming output without the executor depending on any UI framework.
+	StreamCallback StreamCallback
 }
 
 // ModelInvocation records one provider call with its authoritative usage.
@@ -93,6 +132,16 @@ type ModelInvocation struct {
 	Known           bool   `json:"known"`
 	CachedTokens    int    `json:"cached_tokens,omitempty"`
 	ReasoningTokens int    `json:"reasoning_tokens,omitempty"`
+	FinishReason    string `json:"finish_reason,omitempty"`
+	// HTTPAttempts is the number of transport round-trips this single LOGICAL
+	// invocation performed (1 + every 429 backoff / 400-schema retry). Retry
+	// forensics (Phase 7 P5): one model invocation may span multiple HTTP
+	// attempts; a rate-limited free-tier build that recovers is still ONE
+	// invocation, never two.
+	HTTPAttempts int `json:"http_attempts,omitempty"`
+	// RateLimitedRetries is how many of HTTPAttempts were 429 rate-limit
+	// retries that succeeded on a later attempt.
+	RateLimitedRetries int `json:"rate_limited_retries,omitempty"`
 }
 
 // GraphStep is one executed node of the execution graph.
@@ -261,10 +310,12 @@ type RuntimeExecutor struct {
 }
 
 // NewRuntimeExecutor wires a self-contained execution authority. When langID is
-// non-empty a language-aware verifier is attached; otherwise verification is
-// attached with the default Go steps. A nil provider makes model-required
-// strategies fail with a deterministic error (the runtime still resolves
-// deterministic strategies without a provider).
+// non-empty a language-aware verifier is attached (resolving that language's
+// own configured steps); when langID is empty a plain verifier is attached with
+// NO implicit steps — verification is Skipped (not applicable) unless explicit
+// steps are configured (Phase 7 P1: no implicit Go fallback). A nil provider
+// makes model-required strategies fail with a deterministic error (the runtime
+// still resolves deterministic strategies without a provider).
 func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, bus *events.Bus, langID language.ID) *RuntimeExecutor {
 	x := &RuntimeExecutor{
 		root:     root,
@@ -330,6 +381,10 @@ var ErrProviderModelMismatch = errors.New("executor: provider/model mismatch")
 // content). The execution outcome is OutcomeArtifactRejected — an artifact
 // existed but was rejected, distinct from a missing artifact.
 var ErrArtifactRejected = errors.New("executor: mutation artifact rejected")
+
+var ErrArtifactRetryableRejected = errors.New("executor: mutation artifact rejected with retry directive")
+
+var ErrOutputTruncated = errors.New("executor: model output truncated")
 
 // openRouterStyleModelIDRe matches OpenRouter's vendor/model schema — the same
 // schema OpenRouter itself requires for every model ID. A model carrying a
@@ -581,8 +636,16 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	}
 
 	// ── 7. Targeted mutation: per-target model invocation ──────────────
-	patches, invs, diffs, err := x.invokeMutation(ctx, req, requestID, targets, g)
+	patches, invs, diffs, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
 	if err != nil {
+		// Retain the invocation evidence on EVERY error return: the provider
+		// billed these tokens whether the run was cancelled, the artifact was
+		// rejected, or the response was empty. Truthful accounting never drops
+		// provider billing because the mutation failed. finalizeResult sums
+		// res.ModelCalls, so the authoritative counts survive into
+		// Completed.OutputTokens and Proof.ModelInvocations.
+		res.ModelCalls = append(res.ModelCalls, invs...)
+		res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, invs...)
 		if errors.Is(err, context.Canceled) {
 			// A user cancellation is a clean terminal outcome: no artifact was
 			// produced, nothing was applied, and no rollback runs.
@@ -603,6 +666,24 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			res.ArtifactKind = ""
 			res.Err = err
 			res.Proof.Outcome = OutcomeArtifactRejected
+			res.Proof.FinishedAt = time.Now()
+			setProofGraph(res, g)
+			return x.finalizeResult(res), err
+		}
+		if errors.Is(err, ErrArtifactRetryableRejected) {
+			g.FailExecution(events.FailureRecoverable, err, "executor.artifact")
+			res.ArtifactKind = ""
+			res.Err = err
+			res.Proof.Outcome = OutcomeArtifactRetryableRejected
+			res.Proof.FinishedAt = time.Now()
+			setProofGraph(res, g)
+			return x.finalizeResult(res), err
+		}
+		if errors.Is(err, ErrOutputTruncated) {
+			g.FailExecution(events.FailureRecoverable, err, "executor.model")
+			res.ArtifactKind = ""
+			res.Err = err
+			res.Proof.Outcome = OutcomeTruncated
 			res.Proof.FinishedAt = time.Now()
 			setProofGraph(res, g)
 			return x.finalizeResult(res), err
@@ -754,7 +835,10 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		// state BEFORE it is copied into the result/proof.
 		x.correctEvidenceAfterRollback(ms, pm.patches)
 		outcome := OutcomeApplyFailed
-		if ms.Verification != nil && !ms.Verification.Passed {
+		if ms.Verification != nil && !ms.Verification.Passed && !ms.Verification.Skipped {
+			// Only a gate that actually ran and failed is a verify failure; a
+			// not-applicable (Skipped) gate never makes an apply failure a
+			// verify failure (Phase 7 P1).
 			outcome = OutcomeVerifyFailed
 		}
 		res.Mutations = append(res.Mutations, ms.Outcomes...)
@@ -770,7 +854,11 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 			g.CompleteMutation(p.File, string(o))
 		}
 		if ms.Verification != nil {
-			g.CompleteVerification(ms.Verification.Passed, verificationSteps)
+			if ms.Verification.Skipped {
+				g.Skip(runtimegraph.StageVerification, ms.Verification.Reason)
+			} else {
+				g.CompleteVerification(ms.Verification.Passed, verificationSteps)
+			}
 		}
 		g.FailExecution(events.FailureRecoverable, applyErr, "executor.mutation")
 		res.Err = applyErr
@@ -799,7 +887,11 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		g.CompleteMutation(p.File, string(o))
 	}
 	if ms.Verification != nil {
-		g.CompleteVerification(ms.Verification.Passed, verificationSteps)
+		if ms.Verification.Skipped {
+			g.Skip(runtimegraph.StageVerification, ms.Verification.Reason)
+		} else {
+			g.CompleteVerification(ms.Verification.Passed, verificationSteps)
+		}
 	} else {
 		g.Skip(runtimegraph.StageVerification, "no verifier gate ran during apply")
 	}
@@ -974,6 +1066,20 @@ func (x *RuntimeExecutor) compileContext(profile strategy.ExecutionStrategyProfi
 	return channels, estimateTokens(b.String())
 }
 
+// effectiveMaxOutput returns the max tokens to use for a request. It prefers
+// the explicitly-set request budget, falling back to the profile budget so that
+// UI callers that omit max_tokens on the wire still receive the strategy-owned
+// bound.
+func effectiveMaxOutput(req int, profile *strategy.ExecutionStrategyProfile) int {
+	if req > 0 {
+		return req
+	}
+	if profile != nil && profile.MaxOutputTokens > 0 {
+		return profile.MaxOutputTokens
+	}
+	return 0
+}
+
 // invokeMutation performs the bounded provider invocation(s) for a targeted
 // mutation — one bounded call per resolved target. It drives the model stage of
 // the execution graph: model.invoked is emitted BEFORE each provider call and
@@ -981,7 +1087,7 @@ func (x *RuntimeExecutor) compileContext(profile strategy.ExecutionStrategyProfi
 // the error and emits neither response nor artifact. The returned patches carry
 // the full resolved content of each target; the diffs are the authoritative
 // unified diffs for rendering.
-func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, requestID string, targets []string, g *runtimegraph.Graph) ([]*Patch, []ModelInvocation, []string, error) {
+func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) ([]*Patch, []ModelInvocation, []string, error) {
 	if len(targets) == 0 {
 		return nil, nil, nil, fmt.Errorf("executor: no mutation target resolved")
 	}
@@ -997,6 +1103,22 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	patches := make([]*Patch, 0, len(targets))
 	invs := make([]ModelInvocation, 0, len(targets))
 	diffs := make([]string, 0, len(targets))
+	// The artifact contract decides the OUTPUT representation the model must
+	// produce AND, for bounded_patch recovery, the INPUT contract too. A
+	// search_replace contract is a different mutation protocol, not a label:
+	// the runtime derives a small deterministic context window (so even a
+	// degenerate echo physically fits the output budget), asks for exactly one
+	// anchored SEARCH/REPLACE block, and rejects everything else at the
+	// artifact boundary.
+	patchOnly := patchOnlyArtifact(profile)
+	attempt := req.RecoveryAttempt
+	if attempt < 1 {
+		attempt = 1
+	}
+	recoveryLabel := req.RecoveryStrategy
+	if recoveryLabel == "" {
+		recoveryLabel = "none"
+	}
 	for _, target := range targets {
 		path := filepath.Join(x.root, target)
 		data, readErr := os.ReadFile(path)
@@ -1009,20 +1131,62 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		x.emitContextActivity(target, len(data))
 
 		system := boundedMutationSystemPrompt()
+		outputContract := "full_file_or_patch"
 		user := buildMutationUserPrompt(req.Prompt, target, original, req.Evidence)
+		contextBytes := len(original)
+		if patchOnly {
+			system = boundedPatchSystemPrompt()
+			outputContract = "search_replace"
+			// Bounded INPUT contract: the runtime — not the model — decides
+			// what crosses. Only one small line-aligned window of the target
+			// is shown as the copyable source; rotating it by attempt gives
+			// every repair cycle materially different content while keeping
+			// the worst-case response far below the output ceiling.
+			window := selectBoundedPatchWindow(original, attempt)
+			user = buildBoundedPatchUserPrompt(req.Prompt, req.Evidence, target, window)
+			contextBytes = len(window.content)
+		}
+		maxOut := effectiveMaxOutput(req.MaxOutputTokens, &profile)
+		disableReasoning := false
+		if patchOnly {
+			// Reasoning models spend the SHARED output budget on hidden
+			// chain-of-thought before emitting any artifact text (the live
+			// OpenRouter repro: cohere/north-mini-code consumed all 1024
+			// output tokens as reasoning with ZERO visible content — and its
+			// gateway IGNORES reasoning.max_tokens, so only an explicit
+			// disable converges). The bounded patch is a deterministic small
+			// artifact; the hidden reasoning pass is disabled for it.
+			disableReasoning = true
+		}
+		reasoningMode := "provider_default"
+		if disableReasoning {
+			reasoningMode = "disabled"
+		}
+		// Truthful wire-contract trace: this line describes what the executor
+		// ACTUALLY sends/expects for this invocation — not what a recovery
+		// field claims.
+		log.Printf("[execution] request=%s attempt=%d target=%s strategy=%s artifact_kind=%s output_contract=%s context_bytes=%d prompt_bytes=%d max_output=%d reasoning=%s recovery=%s",
+			requestID, attempt, target, profile.Strategy, profile.Artifact.Kind, outputContract, contextBytes, len(user), maxOut, reasoningMode, recoveryLabel)
 		aiReq := ai.Request{
 			Model:     model,
 			System:    system,
 			Messages:  []ai.Message{{Role: "user", Content: user}},
-			MaxTokens: req.MaxOutputTokens,
+			MaxTokens: maxOut,
+		}
+		if disableReasoning {
+			aiReq.Reasoning = &ai.ReasoningConfig{Disabled: true}
 		}
 		// model.invoked is emitted when the invocation BEGINS — before the
 		// provider call — so the event stream truthfully records the start.
 		g.BeginModel(model)
-		raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g)
-		if callErr != nil {
-			return nil, nil, nil, fmt.Errorf("executor: model invocation: %w", callErr)
-		}
+		raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
+		// The invocation evidence is built from the stream outcome REGARDLESS
+		// of the artifact result: the provider billed these tokens whether the
+		// stream succeeded, was cancelled mid-flight, or produced a malformed
+		// artifact. Dropping the invocation on any error return erased real
+		// billing from Completed.OutputTokens (the 5,883-token repro: the
+		// artifact was rejected as "unterminated <script> element" and the
+		// provider's authoritative usage vanished from Izen's account).
 		inv := ModelInvocation{Model: model}
 		if usage.Known {
 			inv.Known = true
@@ -1031,22 +1195,48 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			inv.CachedTokens = usage.CachedTokens
 			inv.ReasoningTokens = usage.ReasoningTokens
 		}
+		inv.FinishReason = usage.FinishReason
+		inv.HTTPAttempts = usage.HTTPAttempts
+		inv.RateLimitedRetries = usage.RateLimitedRetries
+		log.Printf("[execution] result request=%s target=%s input=%d output=%d finish_reason=%s",
+			requestID, target, inv.TokenInput, inv.TokenOutput, inv.FinishReason)
+		if callErr != nil {
+			return nil, append(invs, inv), nil, fmt.Errorf("executor: model invocation: %w", callErr)
+		}
 		// provider.response is emitted ONLY on a successful response — the
 		// authoritative usage travels here. No artifact may precede it.
 		g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
 		invs = append(invs, inv)
 
-		modified := ResolveModifiedContent(original, raw)
-		if modified == "" {
-			// The model returned only prose or a fence without content — treat
-			// the full response as the replacement attempt (best-effort).
-			modified = raw
+		var modified string
+		if patchOnly {
+			// Bounded-patch artifact boundary: extract ONLY structured patch
+			// representations. A full-file (or otherwise unstructured)
+			// response can NEVER satisfy this contract — rejecting it here is
+			// what makes recovery semantically different from the initial
+			// full-artifact attempt instead of a relabeled retry.
+			patched, ok := ExtractBoundedPatch(original, raw)
+			if !ok {
+				return nil, invs, nil, fmt.Errorf("%w: %s: bounded patch contract requires SEARCH/REPLACE blocks or unified diff hunks; full-file or unstructured output rejected", ErrArtifactRetryableRejected, target)
+			}
+			modified = patched
+		} else {
+			modified = ResolveModifiedContent(original, raw)
+			if modified == "" {
+				// The model returned only prose or a fence without content — treat
+				// the full response as the replacement attempt (best-effort).
+				modified = raw
+			}
+		}
+		if strings.EqualFold(strings.TrimSpace(inv.FinishReason), "length") {
+			return nil, invs, nil, fmt.Errorf("%w: %s", ErrOutputTruncated, target)
 		}
 		if strings.TrimSpace(modified) == "" {
 			// Phase 1 safety rule: an artifact extraction failure is a FAILURE,
 			// never a proposal staged for approval. The model produced no
 			// usable mutation artifact — abort before any approval surface.
-			return nil, nil, nil, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
+			// The billed invocation is still returned so usage is preserved.
+			return nil, invs, nil, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
 		}
 		// ── ARTIFACT BOUNDARY (Phase 2) ─────────────────────────────
 		// A model response is NOT an artifact until it passes the artifact
@@ -1058,7 +1248,10 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		//nolint:contextcheck // artifact validation is pure content checking, no context needed
 		normalized, gateErr := x.artifactGate(target, modified)
 		if gateErr != nil {
-			return nil, nil, nil, gateErr
+			// The artifact was rejected, but the invocation evidence (and the
+			// real provider billing it carries) must survive: the token count
+			// is provider truth, not a function of artifact validity.
+			return nil, invs, nil, gateErr
 		}
 		modified = normalized
 		patches = append(patches, &Patch{
@@ -1081,6 +1274,9 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 func (x *RuntimeExecutor) artifactGate(target, modified string) (string, error) {
 	gate := v3Artifact.ValidateContent(target, []byte(modified), 0)
 	if !gate.Passed {
+		if gate.Decision == policy.DecisionRetry {
+			return "", fmt.Errorf("%w: %s: %w: %s", ErrArtifactRetryableRejected, target, gate.Error, gate.Directive)
+		}
 		return "", fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, gate.Error)
 	}
 	return string(gate.Normalized), nil
@@ -1146,12 +1342,12 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		Model:     model,
 		System:    readOnlySystemPrompt(profile.Strategy),
 		Messages:  []ai.Message{{Role: "user", Content: b.String()}},
-		MaxTokens: req.MaxOutputTokens,
+		MaxTokens: effectiveMaxOutput(req.MaxOutputTokens, &profile),
 	}
 	// model.invoked is emitted when the invocation BEGINS — before the provider
 	// call — so the event stream truthfully records the invocation start.
 	g.BeginModel(model)
-	raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g)
+	raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
 	if callErr != nil {
 		return "", inv, fmt.Errorf("executor: read-only invocation: %w", callErr)
 	}
@@ -1163,6 +1359,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		inv.CachedTokens = usage.CachedTokens
 		inv.ReasoningTokens = usage.ReasoningTokens
 	}
+	inv.FinishReason = usage.FinishReason
 	// provider.response is emitted ONLY on a successful response — the
 	// authoritative usage travels here. No artifact may precede it.
 	g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
@@ -1181,7 +1378,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 // reasoning.telemetry event on completion. The accumulated visible content and
 // the authoritative provider usage are returned; the authoritative artifact
 // always travels on the ExecutionResult afterwards.
-func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph) (string, ai.ProviderUsage, error) {
+func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback) (string, ai.ProviderUsage, error) {
 	var reasoningStartedAt time.Time
 	var reasoningDuration time.Duration
 	var reasoningSeen bool
@@ -1220,10 +1417,17 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		// stream get the full lifecycle, others stay correct.
 		resp, cerr := x.provider.Execute(ctx, req)
 		if cerr != nil {
+			if streamCb != nil {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
+			}
 			return "", ai.ProviderUsage{}, cerr
 		}
 		if resp == nil {
-			return "", ai.ProviderUsage{}, fmt.Errorf("executor: provider returned an empty response")
+			err := fmt.Errorf("executor: provider returned an empty response")
+			if streamCb != nil {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: err})
+			}
+			return "", ai.ProviderUsage{}, err
 		}
 		usage := resp.Usage
 		if !usage.Known && (resp.TokenInput > 0 || resp.TokenOutput > 0) {
@@ -1234,6 +1438,13 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 				CompletionTokens: resp.TokenOutput,
 				Known:            true,
 			}
+		}
+		if streamCb != nil {
+			streamCb(StreamEvent{RequestID: requestID, Kind: "first_token"})
+			if resp.Content != "" {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "content_delta", Content: resp.Content})
+			}
+			streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: usage.FinishReason, Usage: usage})
 		}
 		return ai.VisibleCompletion(resp.Content), usage, nil
 	}
@@ -1277,6 +1488,9 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		if !firstToken {
 			firstToken = true
 			g.FirstToken(model, time.Since(began))
+			if streamCb != nil {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "first_token"})
+			}
 		}
 		if tok.Kind == stream.TokenKindThinking {
 			reasoningOpen()
@@ -1288,6 +1502,9 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		// stream_delta is evidence transport: a dropped delta never loses
 		// execution truth because the content accumulates here regardless.
 		g.StreamDelta(tok.Text)
+		if streamCb != nil {
+			streamCb(StreamEvent{RequestID: requestID, Kind: "content_delta", Content: tok.Text})
+		}
 	}
 
 	flushStream := func() {
@@ -1301,6 +1518,9 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	for {
 		if cerr := ctx.Err(); cerr != nil {
 			reasoningClose()
+			if streamCb != nil {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
+			}
 			return content.String(), lastUsage, cerr
 		}
 		n, rerr := rawStream.Read(buf)
@@ -1319,7 +1539,13 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			flushStream()
 			reasoningClose()
 			if cerr := ctx.Err(); cerr != nil {
+				if streamCb != nil {
+					streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
+				}
 				return content.String(), lastUsage, cerr
+			}
+			if streamCb != nil {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: rerr})
 			}
 			return content.String(), lastUsage, rerr
 		}
@@ -1338,6 +1564,9 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	visible := ai.VisibleCompletion(content.String())
 	if strings.TrimSpace(visible) == "" && reasoningBuf.Len() > 0 {
 		visible = ai.VisibleCompletion(reasoningBuf.String())
+	}
+	if streamCb != nil {
+		streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: usage.FinishReason, Usage: usage})
 	}
 	return visible, usage, nil
 }
@@ -1561,6 +1790,15 @@ Never explain. Never add markdown outside a single code fence. Preserve every
 unrelated line byte-for-byte.`
 }
 
+// patchOnlyArtifact reports whether the profile's artifact contract demands a
+// structured bounded patch (search_replace) rather than tolerating a full-file
+// replacement. This is the machine-readable recovery signal: when true, the
+// executor asks the model ONLY for SEARCH/REPLACE / unified-diff output and
+// structurally cannot accept a complete-file artifact.
+func patchOnlyArtifact(p strategy.ExecutionStrategyProfile) bool {
+	return p.Artifact.Bounded && p.Artifact.Kind == "search_replace"
+}
+
 func buildMutationUserPrompt(request, target, original, evidence string) string {
 	var b strings.Builder
 	b.WriteString("### USER REQUEST\n")
@@ -1584,6 +1822,136 @@ func buildMutationUserPrompt(request, target, original, evidence string) string 
 		b.WriteString(original)
 		b.WriteString("\n```\n")
 	}
+	return b.String()
+}
+
+// boundedPatchSystemPrompt is the STRICT bounded-patch contract used when the
+// artifact contract demands search_replace (e.g. recovery after an output
+// truncation). Unlike the tolerant mutation prompt it does NOT offer the
+// full-file option and REQUIRES exactly one anchored SEARCH/REPLACE block: the
+// executor rejects any other shape at the artifact boundary.
+func boundedPatchSystemPrompt() string {
+	return `You are the bounded patch engine. You improve a SMALL EXCERPT of one target
+file by emitting EXACTLY ONE minimal SEARCH/REPLACE block. You MUST NOT rewrite or re-emit the
+whole file.
+
+Output format — this block and NOTHING else (no prose, no markdown fences):
+
+<<<<<<< SEARCH
+<1-10 consecutive lines copied BYTE-FOR-BYTE from the provided context window>
+=======
+<your replacement lines>
+>>>>>>>
+
+Rules:
+- The SEARCH text MUST be copied verbatim from the context window and MUST
+  appear exactly once in the file.
+- Keep REPLACE to the minimum lines that satisfy the request.
+- Never emit the full file content. Never explain.`
+}
+
+// maxBoundedPatchContextBytes bounds the runtime-derived context window of a
+// bounded-patch attempt. It is deliberately small enough that even a degenerate
+// model response that echoes the entire window completes far below a 1024-token
+// output ceiling — the recovery invocation can no longer finish with
+// finish_reason=length by construction.
+const maxBoundedPatchContextBytes = 2048
+
+// boundedPatchWindow is one deterministic line-aligned window of the target.
+type boundedPatchWindow struct {
+	content    string // exact bytes shown to the model (the only copyable source)
+	startLine  int    // 1-indexed inclusive
+	endLine    int    // 1-indexed inclusive
+	totalLines int
+}
+
+// selectBoundedPatchWindow splits original into deterministic line-aligned
+// chunks of at most maxBoundedPatchContextBytes and returns the chunk selected
+// by attempt. Rotating windows across repair cycles gives every retry
+// materially different content (never an identical re-send) while keeping each
+// request's copyable source small; attempt 1 (the first patch attempt) anchors
+// at the head of the file.
+func selectBoundedPatchWindow(original string, attempt int) boundedPatchWindow {
+	lines := strings.Split(original, "\n")
+	total := len(lines)
+	if total == 0 || strings.TrimSpace(original) == "" {
+		return boundedPatchWindow{content: "", startLine: 1, endLine: 0, totalLines: 0}
+	}
+	// Greedy chunking on byte size with line alignment.
+	var chunks []boundedPatchWindow
+	start := 0
+	size := 0
+	for i := 0; i < total; i++ {
+		lineSize := len(lines[i]) + 1
+		if size > 0 && size+lineSize > maxBoundedPatchContextBytes {
+			chunks = append(chunks, boundedPatchWindow{
+				content:    strings.Join(lines[start:i], "\n"),
+				startLine:  start + 1,
+				endLine:    i,
+				totalLines: total,
+			})
+			start = i
+			size = 0
+		}
+		size += lineSize
+	}
+	chunks = append(chunks, boundedPatchWindow{
+		content:    strings.Join(lines[start:], "\n"),
+		startLine:  start + 1,
+		endLine:    total,
+		totalLines: total,
+	})
+	// Byte-level clamp: a file with no newline boundaries (or one huge line)
+	// cannot be split along lines, so the window content is truncated to the
+	// cap directly — the copyable source stays bounded by construction.
+	for i := range chunks {
+		if len(chunks[i].content) > maxBoundedPatchContextBytes {
+			chunks[i].content = chunks[i].content[:maxBoundedPatchContextBytes]
+		}
+	}
+	idx := (attempt - 1) % len(chunks)
+	return chunks[idx]
+}
+
+// buildBoundedPatchUserPrompt builds the bounded-patch USER message. The
+// message SCOPES THE TASK, not just the context: without an explicitly
+// bounded task a vague "rewrite it" goal makes small models regenerate an
+// entire document from imagination (the live OpenRouter repro: 898 input /
+// 1024 output / length even with a 2KB window). So the protocol and its hard
+// limits lead, the user goal is demoted to background, the format skeleton is
+// stated up front, and ONLY the runtime-derived window is presented as the
+// mutable region — the complete file never crosses to the model in this mode.
+func buildBoundedPatchUserPrompt(request, evidence, target string, window boundedPatchWindow) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "TASK: improve a SMALL EXCERPT of %s by returning EXACTLY ONE SEARCH/REPLACE block.\n\n", target)
+	b.WriteString("HARD LIMITS:\n")
+	b.WriteString("- Do NOT regenerate the document. Do NOT write a new file. Do NOT continue the page.\n")
+	b.WriteString("- Change AT MOST 5 consecutive lines. Your ENTIRE response is one small block.\n\n")
+	b.WriteString("OUTPUT FORMAT (your entire response):\n")
+	b.WriteString("<<<<<<< SEARCH\n<1-10 consecutive lines copied BYTE-FOR-BYTE from the context window below>\n=======\n<your improved version of those lines>\n>>>>>>>\n\n")
+	b.WriteString("### USER GOAL (background only — apply it to the excerpt, not the whole file)\n")
+	b.WriteString(strings.TrimSpace(request))
+	b.WriteString("\n\n")
+	if trimmed := strings.TrimSpace(evidence); trimmed != "" {
+		b.WriteString("### PRIOR FAILURE EVIDENCE\n")
+		ev := trimmed
+		const maxEvidenceBytes = 1500
+		if len(ev) > maxEvidenceBytes {
+			ev = ev[:maxEvidenceBytes] + "\n...(truncated)"
+		}
+		b.WriteString(ev)
+		b.WriteString("\n\n")
+	}
+	if window.totalLines == 0 {
+		b.WriteString("### TARGET FILE: ")
+		b.WriteString(target)
+		b.WriteString("\n(the file is empty — instead output the FULL new content inside one code fence)\n")
+		return b.String()
+	}
+	fmt.Fprintf(&b, "### CONTEXT WINDOW — %s lines %d-%d of %d (the ONLY lines you may touch)\n",
+		target, window.startLine, window.endLine, window.totalLines)
+	b.WriteString(window.content)
+	b.WriteString("\n\nREMINDERS: pick at most 5 consecutive lines from the window; copy them into SEARCH byte-for-byte (exact match is verified); put the improved lines in REPLACE. No prose. No markdown fences. Never the whole file.")
 	return b.String()
 }
 

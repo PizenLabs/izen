@@ -83,7 +83,14 @@ func TestGatedExecutionCtrlCCancelsProviderCall(t *testing.T) {
 
 	done := make(chan gatedExecutionMsg, 1)
 	go func() {
-		done <- cmd().(gatedExecutionMsg)
+		msgs := drainCmds(t, cmd)
+		for _, m := range msgs {
+			if gem, ok := m.(gatedExecutionMsg); ok {
+				done <- gem
+				return
+			}
+		}
+		t.Fatalf("no gatedExecutionMsg found in command result")
 	}()
 	<-prov.started
 

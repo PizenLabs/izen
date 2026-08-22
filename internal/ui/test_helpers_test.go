@@ -47,8 +47,50 @@ func (m *mockProvider) Execute(_ context.Context, req ai.Request) (*ai.Response,
 	return resp, nil
 }
 
-func (m *mockProvider) ExecuteStream(_ context.Context, _ ai.Request) (io.ReadCloser, error) {
-	return nil, fmt.Errorf("stream not supported in mock")
+type mockStream struct {
+	content []byte
+	usage   ai.ProviderUsage
+	pos     int
+}
+
+func (s *mockStream) Read(p []byte) (int, error) {
+	if s.pos >= len(s.content) {
+		return 0, io.EOF
+	}
+	n := copy(p, s.content[s.pos:])
+	s.pos += n
+	return n, nil
+}
+func (s *mockStream) Close() error { return nil }
+func (s *mockStream) Usage() ai.ProviderUsage { return s.usage }
+func (s *mockStream) FinishReason() string { return s.usage.FinishReason }
+
+func (m *mockProvider) ExecuteStream(_ context.Context, req ai.Request) (io.ReadCloser, error) {
+	if m.callCount >= len(m.responses) {
+		return nil, fmt.Errorf("unexpected call #%d (only %d responses configured)", m.callCount+1, len(m.responses))
+	}
+	m.requests = append(m.requests, req)
+	resp := m.responses[m.callCount]
+	m.callCount++
+	// If the response carries authoritative usage, surface it through the stream
+	// so the executor's streaming path observes the same billing as the non-streaming fallback.
+	if resp.Usage.Known || resp.Usage.FinishReason != "" || resp.TokenInput != 0 || resp.TokenOutput != 0 {
+		usage := resp.Usage
+		if !usage.Known && (resp.TokenInput != 0 || resp.TokenOutput != 0) {
+			usage = ai.ProviderUsage{
+				PromptTokens:     resp.TokenInput,
+				CompletionTokens: resp.TokenOutput,
+				Known:            true,
+				FinishReason:     resp.Usage.FinishReason,
+			}
+		}
+		if usage.FinishReason == "" {
+			usage.FinishReason = resp.Usage.FinishReason
+		}
+		return &mockStream{content: []byte(resp.Content), usage: usage}, nil
+	}
+	// Return a reader that streams the response content
+	return io.NopCloser(strings.NewReader(resp.Content)), nil
 }
 
 // drainCmds executes a tea.Cmd and returns every terminal message it yields,
@@ -72,6 +114,20 @@ func drainCmds(t *testing.T, c tea.Cmd) []tea.Msg {
 		out = append(out, msg)
 	}
 	return out
+}
+
+// extractGatedExecutionMsg executes a command and returns the gatedExecutionMsg
+// from the result, handling both direct messages and batch messages.
+func extractGatedExecutionMsg(t *testing.T, c tea.Cmd) gatedExecutionMsg {
+	t.Helper()
+	msgs := drainCmds(t, c)
+	for _, msg := range msgs {
+		if gem, ok := msg.(gatedExecutionMsg); ok {
+			return gem
+		}
+	}
+	t.Fatalf("no gatedExecutionMsg found in command result, got %v", msgs)
+	return gatedExecutionMsg{}
 }
 
 // recordsText joins every record the model has pushed so tests can assert what

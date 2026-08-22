@@ -270,11 +270,7 @@ func TestPhase6CancelledOperationNotResumable(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("granted hotfix must dispatch")
 	}
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("executor failed: %v", gem.err)
 	}
@@ -339,11 +335,7 @@ func TestPhase6OneActionOneOwnership(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("$hot dispatch returned nil cmd")
 	}
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("got %T, want gatedExecutionMsg", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("gate err: %v", gem.err)
 	}

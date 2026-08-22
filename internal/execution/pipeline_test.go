@@ -76,9 +76,19 @@ func TestRiskClassifierPatch(t *testing.T) {
 }
 
 func TestVerifierDefaultSteps(t *testing.T) {
+	// Phase 7 P1: a plain NewVerifier carries NO implicit steps and MUST NOT
+	// fall back to the Go verification commands. It reports the gate as
+	// Skipped (not applicable) until explicit steps are attached.
 	v := NewVerifier(".")
-	if len(v.steps) != len(defaultVerificationSteps) {
-		t.Fatalf("expected %d default steps, got %d", len(defaultVerificationSteps), len(v.steps))
+	if len(v.steps) != 0 {
+		t.Fatalf("expected 0 default steps (no implicit Go fallback), got %d", len(v.steps))
+	}
+	report := v.RunAll()
+	if !report.Skipped {
+		t.Fatal("expected the no-step verifier to report Skipped, not a pass or failure")
+	}
+	if report.Passed {
+		t.Fatal("a skipped gate must never claim a fabricated pass")
 	}
 }
 

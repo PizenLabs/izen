@@ -15,6 +15,7 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/execution/strategy"
 )
 
 // mockProvider implements ai.Provider for executor tests.
@@ -561,6 +562,98 @@ func TestRuntimeExecutor_ApprovalWithoutPendingFails(t *testing.T) {
 	}
 	if _, err := x.Reject(context.Background(), "ghost", "x"); err == nil {
 		t.Fatal("reject of unknown patch should fail (Rule 3: no fake mutation)")
+	}
+}
+
+func TestRuntimeExecutor_StrategyBudgetSurvivesRequestOmission(t *testing.T) {
+	root := t.TempDir()
+	writeTarget(t, root, "note.txt", sampleOriginal)
+	mock := &mockProvider{responses: []*ai.Response{{Content: sampleReplace}}}
+	x := testExecutor(t, root, mock, events.NewBus(events.DefaultBufferSize))
+	profile := strategy.ExecutionStrategyProfile{
+		Strategy:        strategy.TargetedMutation,
+		ModelRequired:   true,
+		StrategyReason:  "test profile",
+		MaxOutputTokens: 777,
+	}
+
+	_, err := x.Execute(context.Background(), ExecuteRequest{
+		RequestID: "effective-mut",
+		Mode:      "build",
+		Prompt:    "change bar to qux",
+		Target:    "note.txt",
+		Strategy:  &profile,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(mock.requests) != 1 {
+		t.Fatalf("requests = %d, want 1", len(mock.requests))
+	}
+	if got := mock.requests[0].MaxTokens; got != 777 {
+		t.Fatalf("MaxTokens = %d, want strategy budget 777", got)
+	}
+}
+
+func TestRuntimeExecutor_ReadOnlyStrategyBudgetSurvivesRequestOmission(t *testing.T) {
+	root := t.TempDir()
+	mock := &mockProvider{responses: []*ai.Response{{Content: "hello"}}}
+	x := testExecutor(t, root, mock, events.NewBus(events.DefaultBufferSize))
+	profile := strategy.ExecutionStrategyProfile{
+		Strategy:        strategy.DirectResponse,
+		ModelRequired:   true,
+		StrategyReason:  "test profile",
+		MaxOutputTokens: 321,
+	}
+
+	_, err := x.Execute(context.Background(), ExecuteRequest{
+		RequestID: "effective-read",
+		Mode:      "ask",
+		Prompt:    "hi",
+		Strategy:  &profile,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(mock.requests) != 1 {
+		t.Fatalf("requests = %d, want 1", len(mock.requests))
+	}
+	if got := mock.requests[0].MaxTokens; got != 321 {
+		t.Fatalf("MaxTokens = %d, want strategy budget 321", got)
+	}
+}
+
+func TestRuntimeExecutor_FinishReasonLengthBecomesTruncatedOutcome(t *testing.T) {
+	root := t.TempDir()
+	writeTarget(t, root, "note.txt", sampleOriginal)
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: sampleReplace,
+		Usage: ai.ProviderUsage{
+			Known:            true,
+			PromptTokens:     10,
+			CompletionTokens: 20,
+			FinishReason:     "length",
+		},
+	}}}
+	x := testExecutor(t, root, mock, events.NewBus(events.DefaultBufferSize))
+
+	res, err := x.Execute(context.Background(), ExecuteRequest{
+		RequestID: "truncated",
+		Mode:      "build",
+		Prompt:    "change bar to qux",
+		Target:    "note.txt",
+	})
+	if !errors.Is(err, ErrOutputTruncated) {
+		t.Fatalf("err = %v, want ErrOutputTruncated", err)
+	}
+	if res == nil || res.Proof == nil {
+		t.Fatal("expected result proof")
+	}
+	if res.Proof.Outcome != OutcomeTruncated {
+		t.Fatalf("outcome = %q, want %q", res.Proof.Outcome, OutcomeTruncated)
+	}
+	if len(res.Proof.ModelInvocations) != 1 || res.Proof.ModelInvocations[0].FinishReason != "length" {
+		t.Fatalf("finish reason evidence = %+v, want length", res.Proof.ModelInvocations)
 	}
 }
 

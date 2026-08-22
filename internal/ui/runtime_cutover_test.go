@@ -177,11 +177,7 @@ func TestRuntimeCutoverFlagOnRoutesHotThroughExecutor(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("granted $hot must dispatch an execution")
 	}
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("$hot must route through the executor (gatedExecutionMsg), got %T", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("executor failed: %v", gem.err)
 	}
@@ -353,7 +349,7 @@ func TestRuntimeCutoverVerificationFailureIsNotSuccess(t *testing.T) {
 	grantMutationCaps(m)
 
 	cmd := m.handleInput("$prompt read @index.html and remove redundant content")
-	gem := cmd().(gatedExecutionMsg)
+	gem := extractGatedExecutionMsg(t, cmd)
 	res, _ := m.Update(gem)
 	m2 := res.(*model)
 	if m2.executorPendingPatchID == "" {
@@ -400,11 +396,7 @@ func TestRuntimeCutoverEmptyArtifactIsFailure(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("granted mutation must dispatch an execution")
 	}
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err == nil {
 		t.Fatal("an empty model artifact must fail the execution — never a success")
 	}
@@ -467,7 +459,7 @@ func TestRuntimeCutoverApproveAppliesThroughExecutor(t *testing.T) {
 	grantMutationCaps(m)
 
 	cmd := m.handleInput("$prompt read @index.html and remove redundant content")
-	gem := cmd().(gatedExecutionMsg)
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("executor failed: %v", gem.err)
 	}

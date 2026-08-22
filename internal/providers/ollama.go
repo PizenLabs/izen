@@ -409,7 +409,7 @@ func (s *sseReader) Read(p []byte) (int, error) {
 				reasoningText = d.Reasoning
 			}
 			if reasoningText != "" {
-				s.usage.recordOutput(len(reasoningText))
+				s.usage.recordReasoning(len(reasoningText))
 				if s.reasoningHandler != nil {
 					if err := s.reasoningHandler(reasoningText); err != nil {
 						s.closed = true

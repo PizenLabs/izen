@@ -382,11 +382,7 @@ func TestBuildLifecycleNoDuplicateDispatch(t *testing.T) {
 		t.Fatalf("provider invoked %d times before the execution ran, want 0", mock.callCount)
 	}
 
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("gate err: %v", gem.err)
 	}
@@ -592,11 +588,7 @@ func TestBuildLifecycleHotfixBehaviorUnaffected(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("handleInput returned nil for $hot")
 	}
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("gate err: %v", gem.err)
 	}

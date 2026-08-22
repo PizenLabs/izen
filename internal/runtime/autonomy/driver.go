@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/execution"
 )
 
 // Decider maps a bounded observation to the next loop decision. It is
@@ -40,6 +42,26 @@ type Driver struct {
 	req       autonomy.LoopRequest
 	obs       autonomy.Observation
 	published int
+
+	// runCtx is the context for the current run. It is stored so Abort()
+	// can cancel the same context that observeAndRun is watching.
+	runCtx context.Context
+	// runCancel cancels runCtx. Set when a run starts, nil when terminal.
+	runCancel context.CancelFunc
+	// runID is a monotonically increasing identity for each run.
+	// Late results from a previous run cannot overwrite a newer run's state.
+	runID uint64
+
+	// streamCb is an optional callback for incremental streaming progress during
+	// provider invocations. Set by the UI before Run; cleared after each run.
+	streamCb execution.StreamCallback
+
+	// aggregated usage across all logical invocations of the current run.
+	aggInput  int
+	aggOutput int
+	aggKnown  bool
+	// runRequestID is the stable parent request identity for the current run.
+	runRequestID string
 }
 
 // Option configures the Driver during construction.
@@ -66,6 +88,13 @@ func WithRepair(f RepairFunc) Option {
 			d.repair = f
 		}
 	}
+}
+
+// WithStreamCallback sets a callback for incremental streaming progress during
+// provider invocations. The callback is invoked for each content delta, first
+// token, and completion. It is cleared after each run.
+func WithStreamCallback(cb execution.StreamCallback) Option {
+	return func(d *Driver) { d.streamCb = cb }
 }
 
 // NewDriver wires the bounded loop over the executor adapter. bus may be nil
@@ -100,29 +129,53 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	if d.loop != nil && !d.loop.State().IsTerminal() {
 		return d.term(), errors.New("autonomy: a run is already active or parked at a human boundary — resume or abort it first")
 	}
+
+	// Create a new run context with cancellation for this run.
+	// This context is the single cancellation authority for the run.
+	d.runCtx, d.runCancel = context.WithCancel(ctx)
+	d.runID++
+	runID := d.runID
+
 	d.loop = autonomy.NewRuntimeLoop(d.bounds)
 	d.prompt = objective
 	d.obs = autonomy.Observation{}
 	d.published = 0
+	d.aggInput = 0
+	d.aggOutput = 0
+	d.aggKnown = false
+	d.runRequestID = fmt.Sprintf("run-%d", d.runID)
 	d.loop.Start("user objective: " + objective)
-	d.publish(ctx)
+	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 
 	// Target resolution is the gateway's deterministic authority; the loop
 	// never guesses a target. A clarification boundary parks BEFORE any
 	// execution — no model call, no mutation.
 	d.resolved = d.adapter.Resolve(objective)
-	d.req = autonomy.LoopRequest{Prompt: objective, Targets: d.resolved.Targets}
+	d.req = autonomy.LoopRequest{
+		RequestID:      d.runRequestID,
+		Prompt:         objective,
+		Targets:        d.resolved.Targets,
+		StreamCallback: d.streamCb,
+	}
+	// Clear the callback after capturing it for this run.
+	d.streamCb = nil
 	if d.resolved.Ambiguous {
 		d.loop.AwaitHuman(autonomy.HumanBoundary{
 			Reason:  "target clarification required before any execution",
 			Options: d.resolved.Options,
 		})
 		d.enrichBoundary()
-		d.publish(ctx)
+		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 		return d.term(), nil
 	}
 	d.obs = d.contextObservation()
-	return d.observeAndRun(ctx)
+	term, err := d.observeAndRun(d.runCtx, runID) //nolint:contextcheck // runCtx is the run's own cancellation context
+	// Clear run context on terminal completion; preserve when parked.
+	if term != nil && term.State.IsTerminal() {
+		d.runCtx = nil
+		d.runCancel = nil
+	}
+	return term, err
 }
 
 // Abort terminates the current parked or active run as a permanent human
@@ -137,26 +190,75 @@ func (d *Driver) Abort(reason string) (*autonomy.LoopTermination, error) {
 	if d.loop.State().IsTerminal() {
 		return d.term(), nil
 	}
-	term := d.terminateAbort(context.Background(), "aborted by operator: "+reason, autonomy.FailurePermanent)
+	// Cancel the run context so the in-flight observeAndRun/execute sees it.
+	if d.runCancel != nil {
+		d.runCancel()
+	}
+	// Use the run context (now cancelled) for termination so the termination
+	// event carries the correct cancellation context.
+	term := d.terminateAbort(d.runCtx, "aborted by operator: "+reason, autonomy.FailurePermanent)
+	// Clear the run context so a fresh Run can start.
+	d.runCtx = nil
+	d.runCancel = nil
 	return term, nil
 }
 
 // ResumeApprove resolves a parked approval gate: it approves the held patch
 // through the executor and INTERPRETS the terminal result of the SAME
 // execution. It never re-executes the mutation (idempotency).
+//
+// Convergence: the approval decision converges to exactly ONE terminal
+// outcome. A successful apply completes the loop; a failed apply/verify
+// aborts it permanently — the loop NEVER auto-repairs an approved proposal
+// into a second provider invocation (the human approved THIS patch, not a
+// regeneration). A hard approve error (no result, e.g. double-approve)
+// aborts the run so it can never park at a stale awaiting_human.
 func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, error) {
 	pid, err := d.approvalPatchID()
 	if err != nil {
 		return d.term(), err
 	}
 	obs, err := d.adapter.Approve(ctx, pid)
-	if err != nil {
-		return nil, fmt.Errorf("autonomy: approve: %w", err)
+	if obs.RequestID == "" {
+		// Hard approve error: no terminal result exists (the held patch is
+		// gone). Release the human and converge to a permanent abort so the
+		// run never sits at a stale awaiting_human.
+		reason := "approval failed: patch no longer held by the executor"
+		if err != nil {
+			reason = "approval failed: " + err.Error()
+		}
+		if d.loop != nil && !d.loop.State().IsTerminal() {
+			d.loop.ReleaseHuman(reason)
+			d.publish(ctx)
+			term := d.terminateAbort(ctx, reason, autonomy.FailurePermanent)
+			d.runCtx, d.runCancel = nil, nil
+			return term, nil
+		}
+		return d.term(), nil
 	}
 	d.obs = obs
 	d.loop.ReleaseHuman("patch approved")
 	d.publish(ctx)
-	return d.observeAndRun(ctx)
+	if approvalFailureOutcome(obs) {
+		// The approved proposal failed to apply/verify. This is a terminal
+		// human-decision outcome: converge to ONE aborted terminal state and
+		// NEVER re-execute (a repair would regenerate a patch the human did
+		// not see). err, when set, is surfaced via the termination reason.
+		reason := "approved mutation failed: " + string(obs.Outcome)
+		if err != nil {
+			reason += ": " + err.Error()
+		}
+		term := d.terminateAbort(ctx, reason, autonomy.FailurePermanent)
+		d.runCtx, d.runCancel = nil, nil
+		return term, nil
+	}
+	d.runID++
+	term, err := d.observeAndRun(ctx, d.runID)
+	if term != nil && term.State.IsTerminal() {
+		d.runCtx = nil
+		d.runCancel = nil
+	}
+	return term, err
 }
 
 // ResumeReject resolves a parked approval gate by rejecting the held patch
@@ -168,13 +270,33 @@ func (d *Driver) ResumeReject(ctx context.Context, reason string) (*autonomy.Loo
 		return d.term(), err
 	}
 	obs, err := d.adapter.Reject(ctx, pid, reason)
-	if err != nil {
-		return nil, fmt.Errorf("autonomy: reject: %w", err)
+	if obs.RequestID == "" {
+		// Hard reject error: no terminal result exists. Release the human and
+		// converge to a permanent abort so the run never parks at a stale
+		// awaiting_human.
+		r := "rejection failed: patch no longer held by the executor"
+		if err != nil {
+			r = "rejection failed: " + err.Error()
+		}
+		if d.loop != nil && !d.loop.State().IsTerminal() {
+			d.loop.ReleaseHuman(r)
+			d.publish(ctx)
+			term := d.terminateAbort(ctx, r, autonomy.FailurePermanent)
+			d.runCtx, d.runCancel = nil, nil
+			return term, nil
+		}
+		return d.term(), nil
 	}
 	d.obs = obs
 	d.loop.ReleaseHuman("patch rejected")
 	d.publish(ctx)
-	return d.observeAndRun(ctx)
+	d.runID++
+	term, err := d.observeAndRun(ctx, d.runID)
+	if term != nil && term.State.IsTerminal() {
+		d.runCtx = nil
+		d.runCancel = nil
+	}
+	return term, err
 }
 
 // ResumeClarify continues a parked clarification with an explicit human-chosen
@@ -188,7 +310,13 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 	d.obs = d.contextObservation()
 	d.loop.ReleaseHuman("target specified: " + target)
 	d.publish(ctx)
-	return d.observeAndRun(ctx)
+	d.runID++
+	term, err := d.observeAndRun(ctx, d.runID)
+	if term != nil && term.State.IsTerminal() {
+		d.runCtx = nil
+		d.runCancel = nil
+	}
+	return term, err
 }
 
 // State returns the current loop position.
@@ -221,16 +349,45 @@ func (d *Driver) History() []autonomy.RuntimeTransition {
 // LastObservation returns the most recent observation the driver consumed.
 func (d *Driver) LastObservation() autonomy.Observation { return d.obs }
 
+// AggregatedUsage returns the authoritative aggregate provider usage across all
+// logical invocations of the current run (one count per recovery attempt).
+func (d *Driver) AggregatedUsage() (input, output int, known bool) {
+	if d == nil {
+		return 0, 0, false
+	}
+	return d.aggInput, d.aggOutput, d.aggKnown
+}
+
+// RunRequestID returns the stable parent request identity for the current run.
+func (d *Driver) RunRequestID() string {
+	if d == nil {
+		return ""
+	}
+	return d.runRequestID
+}
+
+// SetStreamCallback sets a callback for incremental streaming progress during
+// the next provider invocation. It is called by the UI before Run.
+func (d *Driver) SetStreamCallback(cb execution.StreamCallback) {
+	d.streamCb = cb
+}
+
 // ── drive helpers ───────────────────────────────────────────────────────────
 
 // observeAndRun pushes the current observation through Observe → decide →
 // execute until the loop terminates or parks at AwaitingHuman.
-func (d *Driver) observeAndRun(ctx context.Context) (*autonomy.LoopTermination, error) {
+// runID is the identity of the run that started this observation loop;
+// late results from a different runID are discarded.
+func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.LoopTermination, error) {
 	if got := d.loop.Observe(d.obs); got != autonomy.RuntimeDeciding {
 		return d.term(), fmt.Errorf("autonomy: observe -> %s, want deciding", got)
 	}
 	d.publish(ctx)
 	for !d.loop.State().IsTerminal() {
+		// Late-result guard: if the run was aborted/superseded, exit immediately.
+		if d.runID != runID {
+			return d.term(), nil
+		}
 		if cerr := ctx.Err(); cerr != nil {
 			// Cancellation is a clean permanent abort, not a propagated error.
 			return d.terminateAbort(ctx, "context cancelled", autonomy.FailurePermanent), nil //nolint:nilerr // termination, not a failure
@@ -247,11 +404,30 @@ func (d *Driver) observeAndRun(ctx context.Context) (*autonomy.LoopTermination, 
 				return nil, err
 			}
 		case autonomy.RuntimeExecuting:
+			// Ensure child attempt identity: stable parent runRequestID with attempt suffix.
+			if d.req.RequestID == "" {
+				d.req.RequestID = d.runRequestID
+			}
 			obs, err := d.adapter.Execute(ctx, d.req)
+			// Late-result guard: if the run was aborted/superseded while we were
+			// executing, discard the result and return the terminal state.
+			if d.runID != runID {
+				return d.term(), nil
+			}
 			if err != nil {
 				return nil, fmt.Errorf("autonomy: execute: %w", err)
 			}
 			d.obs = obs
+			// Aggregate authoritative usage exactly once per logical invocation.
+			if obs.UsageKnown {
+				d.aggInput += obs.InputTokens
+				d.aggOutput += obs.OutputTokens
+				d.aggKnown = true
+			} else if obs.TokenUsage > 0 {
+				// Fallback sum when split counts unavailable (should not happen for provider paths).
+				d.aggInput += obs.TokenUsage
+				d.aggKnown = d.aggKnown || obs.UsageKnown
+			}
 			d.loop.ConsumeExecution(obs)
 			d.loop.ConsumeVerification(obs)
 			d.publish(ctx)
@@ -260,10 +436,20 @@ func (d *Driver) observeAndRun(ctx context.Context) (*autonomy.LoopTermination, 
 			if err != nil {
 				return nil, fmt.Errorf("autonomy: repair: %w", err)
 			}
+			// Child attempt identity: parent run ID plus attempt number.
+			if req.RecoveryAttempt > 0 {
+				req.RequestID = fmt.Sprintf("%s-attempt-%d", d.runRequestID, req.RecoveryAttempt)
+			}
+			reason := req.RecoveryReason
+			if reason == "" {
+				reason = "re-scoped — re-execute"
+			} else {
+				reason = fmt.Sprintf("re-scoped [%s] — re-execute", req.RecoveryStrategy)
+			}
 			d.req = req
 			if _, err := d.step(ctx, autonomy.LoopDecision{
 				Action: autonomy.LoopContinue,
-				Reason: "re-scoped — re-execute",
+				Reason: reason,
 			}); err != nil {
 				return nil, err
 			}
@@ -369,7 +555,8 @@ func (d *Driver) terminateAbort(ctx context.Context, reason string, class autono
 //	pending_approval                     → ask_human (approval gate, patch id)
 //	clarification required               → ask_human
 //	cancelled/rejected/artifact_rejected → abort (permanent, never auto-retry)
-//	no_artifact/failed/patch/apply/verify → canonical recovery matrix (bounded)
+//	no_artifact/failed/patch/apply/verify/truncated/retryable_artifact
+//	                                    → canonical recovery matrix (bounded)
 func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopDecision {
 	if o.ClarificationRequired {
 		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
@@ -388,7 +575,7 @@ func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopD
 			Reason: "terminal outcome: " + string(o.Outcome)}
 	case autonomy.OutcomeNoArtifact, autonomy.OutcomeFailed, autonomy.OutcomePatchGenFailed,
 		autonomy.OutcomePatchFailed, autonomy.OutcomeApplyFailed, autonomy.OutcomeVerifyFailed,
-		autonomy.OutcomeSkipped:
+		autonomy.OutcomeSkipped, autonomy.OutcomeArtifactRetryableRejected, autonomy.OutcomeTruncated:
 		return autonomy.RecoverFailure(o, autonomy.ClassifyOutcome(o.Outcome), b)
 	case "":
 		return autonomy.LoopDecision{Action: autonomy.LoopContinue,
@@ -399,11 +586,100 @@ func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopD
 	}
 }
 
-// defaultRepair re-scopes a failed request for a bounded re-execution by
-// appending the failed outcome as evidence. Real re-planning policies inject a
-// RepairFunc; this default only preserves determinism.
+// approvalFailureOutcome reports whether an observation produced by an approval
+// apply is a failure. A success (changed/created/nochange) completes the loop; a
+// failure must converge to a terminal aborted outcome — the loop never
+// auto-repairs an approved proposal into a second provider invocation, because
+// the human approved THIS patch, not a regeneration of it.
+func approvalFailureOutcome(o autonomy.Observation) bool {
+	switch o.Outcome {
+	case autonomy.OutcomeFailed, autonomy.OutcomePatchGenFailed, autonomy.OutcomePatchFailed,
+		autonomy.OutcomeApplyFailed, autonomy.OutcomeVerifyFailed, autonomy.OutcomeSkipped:
+		return true
+	default:
+		return false
+	}
+}
+
+// defaultRepair re-scopes a failed request for a bounded re-execution.
+// It guarantees a MATERIAL execution-contract change on every recovery: the
+// recovery attempt carries explicit failure evidence, a recovery strategy, and
+// a bounded budget decision. A truncation never retries the same full-file
+// generation.
 func defaultRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.LoopRequest, error) {
-	req.Evidence = strings.TrimSpace(req.Evidence + "\n" +
-		"recovery of failed execution (outcome " + string(o.Outcome) + ")")
-	return req, nil
+	target := o.Target
+	if target == "" {
+		target = firstTarget(req.Targets)
+		if target == "" {
+			target = req.Target
+		}
+	}
+	attempt := o.AttemptNum + 1
+	if attempt < 1 {
+		attempt = req.RecoveryAttempt + 1
+		if attempt < 1 {
+			attempt = 1
+		}
+	}
+
+	var strategy string
+	var reason string
+	var budget int
+	var evidenceAdd string
+
+	switch o.Outcome {
+	case autonomy.OutcomeTruncated:
+		strategy = "bounded_patch"
+		reason = fmt.Sprintf("output_budget_exceeded: truncated target %s budget=%d finish_reason=%s", target, o.MaxOutputTokens, o.FinishReason)
+		// Keep budget bounded: do not silently multiply. Prefer patch artifact
+		// over full-file rewrite so it fits the existing ceiling.
+		budget = o.MaxOutputTokens
+		if budget == 0 {
+			budget = req.MaxOutputTokens
+		}
+		evidenceAdd = fmt.Sprintf(
+			"[RECOVERY attempt=%d/%d strategy=%s -> %s target=%s budget=%d finish_reason=%s outcome=%s]\nFailure: model output truncated (finish_reason=length) while generating full artifact for %s.\nRecovery: produce a bounded SEARCH/REPLACE patch (or unified diff hunk) for the minimal change instead of regenerating the entire file. Preserve required target context, trim unrelated output.",
+			o.AttemptNum, attempt, "full_artifact", strategy, target, o.MaxOutputTokens, o.FinishReason, o.Outcome, target)
+	default:
+		if req.RecoveryStrategy == "bounded_patch" {
+			// LATCH: once a truncation moved this run onto the bounded-patch
+			// contract, every later recovery of the run KEEPS it. Reverting
+			// to the full-artifact tolerance would re-run the exact truncated
+			// full-file generation under a different label.
+			strategy = "bounded_patch"
+			reason = fmt.Sprintf("bounded patch contract retained after %s on %s (attempt %d)", o.Outcome, target, attempt)
+			budget = req.MaxOutputTokens
+			evidenceAdd = fmt.Sprintf(
+				"[RECOVERY attempt=%d strategy=%s outcome=%s target=%s finish_reason=%s]\nKeep producing a bounded SEARCH/REPLACE patch (or unified diff hunk) for the minimal change; never regenerate the whole file.",
+				attempt, strategy, o.Outcome, target, o.FinishReason)
+		} else {
+			strategy = "retry_with_evidence"
+			reason = fmt.Sprintf("recoverable failure %s on %s (attempt %d)", o.Outcome, target, attempt)
+			budget = req.MaxOutputTokens
+			evidenceAdd = fmt.Sprintf("[RECOVERY attempt=%d strategy=%s outcome=%s target=%s finish_reason=%s]", attempt, strategy, o.Outcome, target, o.FinishReason)
+		}
+	}
+
+	// Structured recovery trace — the strategy transition with the effective
+	// budget. The authoritative per-invocation [execution] wire-contract
+	// lines are emitted by the executor (what was actually sent/expected);
+	// this line describes the requested recovery contract only.
+	fromStrategy := req.RecoveryStrategy
+	if fromStrategy == "" {
+		fromStrategy = "full_artifact"
+	}
+	log.Printf("[recovery] from_strategy=%s to_strategy=%s reason=%s attempt=%d target=%s effective_budget=%d",
+		fromStrategy, strategy, reason, attempt, target, budget)
+	next := req
+	next.Evidence = strings.TrimSpace(req.Evidence + "\n" + evidenceAdd)
+	next.RecoveryAttempt = attempt
+	next.RecoveryReason = reason
+	next.RecoveryStrategy = strategy
+	next.FinishReason = o.FinishReason
+	if budget > 0 {
+		next.MaxOutputTokens = budget
+	}
+	// Ensure the next executor invocation is not identical: the recovery
+	// strategy and evidence are now materially different.
+	return next, nil
 }

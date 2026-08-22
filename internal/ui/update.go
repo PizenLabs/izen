@@ -1957,7 +1957,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// stopShimmer was never invoked by the terminal handler, the next
 		// frame self-stops. This guarantees the shimmer can never linger on a
 		// dead loading line regardless of which handler resolved the task.
-		if !m.streaming && !m.agentRunning && !m.reviewRunning && !m.pipelineRunning && !m.planPending && !m.shellRunning {
+		// autonomousActive is included so the safety-net never fires while the
+		// autonomous driver Run/Resume command is in flight: autonomous runs are
+		// the ONLY operation that uses shimmerActive without setting any of the
+		// legacy background-producer flags (agentRunning, streaming, etc.).
+		// Without this guard the shimmer self-terminates on the first frame
+		// after startShimmer("", "autonomy") is called, freezing the spinner
+		// for the entire provider invocation.
+		if !m.streaming && !m.agentRunning && !m.reviewRunning && !m.pipelineRunning && !m.planPending && !m.shellRunning && !m.autonomousActive {
 			m.stopShimmer()
 			return m, nil
 		}
@@ -2066,7 +2073,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.streamParser.ProcessChunk(raw)
 		}
 		var cmds []tea.Cmd
-		cmds = append(cmds, m.readStream())
+		if m.execStreaming {
+			cmds = append(cmds, m.readExecStream())
+		} else {
+			cmds = append(cmds, m.readStream())
+		}
 		// Full stream transparency: every content chunk is retained in the
 		// active ThinkingBuffer via the ThoughtBufferUpdatedMsg protocol so the
 		// Ctrl+O thought drawer renders the raw stream live.
@@ -2095,12 +2106,27 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		// The usage message was pulled off the stream channel — chain the next
 		// read so the token/done messages behind it keep flowing.
+		if m.execStreaming {
+			return m, m.readExecStream()
+		}
 		return m, m.readStream()
 
 	case streamDoneMsg:
 		// ── AUTHORITATIVE STAGE: provider stream completed ─────────
 		// A terminal stream is done; the stage can never linger as "streaming".
 		m.setStage("model", m.getActiveModelName(), stageDone)
+
+		// Handle executor streaming (gated path) separately from /ask streaming.
+		// The executor stream is for provider output during patch generation;
+		// the final result arrives via gatedExecutionMsg.
+		if m.execStreaming {
+			m.execStreamCh = nil
+			m.execStreaming = false
+			m.stopShimmer()
+			// The final result will arrive via gatedExecutionMsg -> executionResultUpdate
+			return m, nil
+		}
+
 		m.streamCh = nil
 		m.streaming = false
 		m.streamCancel = nil
@@ -2549,6 +2575,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, m.thoughtUpdateCmd("", true)
 
 	case streamErrMsg:
+		// Handle executor streaming error separately.
+		if m.execStreaming {
+			m.execStreamCh = nil
+			m.execStreaming = false
+			m.setStage("model", m.getActiveModelName(), stageFailed)
+			m.stopShimmer()
+			// The error will be surfaced via gatedExecutionMsg -> executionResultUpdate or autonomousRunMsg
+			return m, nil
+		}
+
 		// OPERATION LIFECYCLE: a stream error must release any in-flight
 		// build-patch operation (defensive; streams normally run without one).
 		m.finalizeBuildOperation(msg.err)
