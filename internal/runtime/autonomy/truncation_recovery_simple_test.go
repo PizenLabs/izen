@@ -23,8 +23,8 @@ func TestTruncationRecoveryChangesStrategySimple(t *testing.T) {
 		UsageKnown:      true,
 	}
 	req := autonomy.LoopRequest{
-		Prompt:  "check @index.html and rewrite it",
-		Targets: []string{"index.html"},
+		Prompt:   "check @index.html and rewrite it",
+		Targets:  []string{"index.html"},
 		Evidence: "initial evidence",
 	}
 	next, err := defaultRepair(obs, req)

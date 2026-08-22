@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -104,6 +105,15 @@ type ExecuteRequest struct {
 	// evidence; the full-file context the runtime reads is supporting context
 	// only (Phase 1 Step 5).
 	Evidence string
+	// RecoveryStrategy / RecoveryAttempt carry the autonomy recovery decision
+	// into the execution contract (same handoff pattern as Intent above).
+	// RecoveryStrategy "bounded_patch" selects the strict bounded-patch
+	// protocol — runtime-derived windowed context and a SEARCH/REPLACE-only
+	// output contract enforced at the artifact boundary. RecoveryAttempt is
+	// the 1-indexed attempt number (0 = initial) used for deterministic
+	// window rotation across repair cycles.
+	RecoveryStrategy string
+	RecoveryAttempt  int
 	// StreamCallback is an optional callback for incremental streaming progress.
 	// When set, the executor invokes it during provider streaming for each
 	// content delta, first token, and completion. This enables the UI to
@@ -1093,6 +1103,22 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	patches := make([]*Patch, 0, len(targets))
 	invs := make([]ModelInvocation, 0, len(targets))
 	diffs := make([]string, 0, len(targets))
+	// The artifact contract decides the OUTPUT representation the model must
+	// produce AND, for bounded_patch recovery, the INPUT contract too. A
+	// search_replace contract is a different mutation protocol, not a label:
+	// the runtime derives a small deterministic context window (so even a
+	// degenerate echo physically fits the output budget), asks for exactly one
+	// anchored SEARCH/REPLACE block, and rejects everything else at the
+	// artifact boundary.
+	patchOnly := patchOnlyArtifact(profile)
+	attempt := req.RecoveryAttempt
+	if attempt < 1 {
+		attempt = 1
+	}
+	recoveryLabel := req.RecoveryStrategy
+	if recoveryLabel == "" {
+		recoveryLabel = "none"
+	}
 	for _, target := range targets {
 		path := filepath.Join(x.root, target)
 		data, readErr := os.ReadFile(path)
@@ -1105,12 +1131,50 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		x.emitContextActivity(target, len(data))
 
 		system := boundedMutationSystemPrompt()
+		outputContract := "full_file_or_patch"
 		user := buildMutationUserPrompt(req.Prompt, target, original, req.Evidence)
+		contextBytes := len(original)
+		if patchOnly {
+			system = boundedPatchSystemPrompt()
+			outputContract = "search_replace"
+			// Bounded INPUT contract: the runtime — not the model — decides
+			// what crosses. Only one small line-aligned window of the target
+			// is shown as the copyable source; rotating it by attempt gives
+			// every repair cycle materially different content while keeping
+			// the worst-case response far below the output ceiling.
+			window := selectBoundedPatchWindow(original, attempt)
+			user = buildBoundedPatchUserPrompt(req.Prompt, req.Evidence, target, window)
+			contextBytes = len(window.content)
+		}
+		maxOut := effectiveMaxOutput(req.MaxOutputTokens, &profile)
+		disableReasoning := false
+		if patchOnly {
+			// Reasoning models spend the SHARED output budget on hidden
+			// chain-of-thought before emitting any artifact text (the live
+			// OpenRouter repro: cohere/north-mini-code consumed all 1024
+			// output tokens as reasoning with ZERO visible content — and its
+			// gateway IGNORES reasoning.max_tokens, so only an explicit
+			// disable converges). The bounded patch is a deterministic small
+			// artifact; the hidden reasoning pass is disabled for it.
+			disableReasoning = true
+		}
+		reasoningMode := "provider_default"
+		if disableReasoning {
+			reasoningMode = "disabled"
+		}
+		// Truthful wire-contract trace: this line describes what the executor
+		// ACTUALLY sends/expects for this invocation — not what a recovery
+		// field claims.
+		log.Printf("[execution] request=%s attempt=%d target=%s strategy=%s artifact_kind=%s output_contract=%s context_bytes=%d prompt_bytes=%d max_output=%d reasoning=%s recovery=%s",
+			requestID, attempt, target, profile.Strategy, profile.Artifact.Kind, outputContract, contextBytes, len(user), maxOut, reasoningMode, recoveryLabel)
 		aiReq := ai.Request{
 			Model:     model,
 			System:    system,
 			Messages:  []ai.Message{{Role: "user", Content: user}},
-			MaxTokens: effectiveMaxOutput(req.MaxOutputTokens, &profile),
+			MaxTokens: maxOut,
+		}
+		if disableReasoning {
+			aiReq.Reasoning = &ai.ReasoningConfig{Disabled: true}
 		}
 		// model.invoked is emitted when the invocation BEGINS — before the
 		// provider call — so the event stream truthfully records the start.
@@ -1134,6 +1198,8 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		inv.FinishReason = usage.FinishReason
 		inv.HTTPAttempts = usage.HTTPAttempts
 		inv.RateLimitedRetries = usage.RateLimitedRetries
+		log.Printf("[execution] result request=%s target=%s input=%d output=%d finish_reason=%s",
+			requestID, target, inv.TokenInput, inv.TokenOutput, inv.FinishReason)
 		if callErr != nil {
 			return nil, append(invs, inv), nil, fmt.Errorf("executor: model invocation: %w", callErr)
 		}
@@ -1142,11 +1208,25 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
 		invs = append(invs, inv)
 
-		modified := ResolveModifiedContent(original, raw)
-		if modified == "" {
-			// The model returned only prose or a fence without content — treat
-			// the full response as the replacement attempt (best-effort).
-			modified = raw
+		var modified string
+		if patchOnly {
+			// Bounded-patch artifact boundary: extract ONLY structured patch
+			// representations. A full-file (or otherwise unstructured)
+			// response can NEVER satisfy this contract — rejecting it here is
+			// what makes recovery semantically different from the initial
+			// full-artifact attempt instead of a relabeled retry.
+			patched, ok := ExtractBoundedPatch(original, raw)
+			if !ok {
+				return nil, invs, nil, fmt.Errorf("%w: %s: bounded patch contract requires SEARCH/REPLACE blocks or unified diff hunks; full-file or unstructured output rejected", ErrArtifactRetryableRejected, target)
+			}
+			modified = patched
+		} else {
+			modified = ResolveModifiedContent(original, raw)
+			if modified == "" {
+				// The model returned only prose or a fence without content — treat
+				// the full response as the replacement attempt (best-effort).
+				modified = raw
+			}
 		}
 		if strings.EqualFold(strings.TrimSpace(inv.FinishReason), "length") {
 			return nil, invs, nil, fmt.Errorf("%w: %s", ErrOutputTruncated, target)
@@ -1710,6 +1790,15 @@ Never explain. Never add markdown outside a single code fence. Preserve every
 unrelated line byte-for-byte.`
 }
 
+// patchOnlyArtifact reports whether the profile's artifact contract demands a
+// structured bounded patch (search_replace) rather than tolerating a full-file
+// replacement. This is the machine-readable recovery signal: when true, the
+// executor asks the model ONLY for SEARCH/REPLACE / unified-diff output and
+// structurally cannot accept a complete-file artifact.
+func patchOnlyArtifact(p strategy.ExecutionStrategyProfile) bool {
+	return p.Artifact.Bounded && p.Artifact.Kind == "search_replace"
+}
+
 func buildMutationUserPrompt(request, target, original, evidence string) string {
 	var b strings.Builder
 	b.WriteString("### USER REQUEST\n")
@@ -1733,6 +1822,136 @@ func buildMutationUserPrompt(request, target, original, evidence string) string 
 		b.WriteString(original)
 		b.WriteString("\n```\n")
 	}
+	return b.String()
+}
+
+// boundedPatchSystemPrompt is the STRICT bounded-patch contract used when the
+// artifact contract demands search_replace (e.g. recovery after an output
+// truncation). Unlike the tolerant mutation prompt it does NOT offer the
+// full-file option and REQUIRES exactly one anchored SEARCH/REPLACE block: the
+// executor rejects any other shape at the artifact boundary.
+func boundedPatchSystemPrompt() string {
+	return `You are the bounded patch engine. You improve a SMALL EXCERPT of one target
+file by emitting EXACTLY ONE minimal SEARCH/REPLACE block. You MUST NOT rewrite or re-emit the
+whole file.
+
+Output format — this block and NOTHING else (no prose, no markdown fences):
+
+<<<<<<< SEARCH
+<1-10 consecutive lines copied BYTE-FOR-BYTE from the provided context window>
+=======
+<your replacement lines>
+>>>>>>>
+
+Rules:
+- The SEARCH text MUST be copied verbatim from the context window and MUST
+  appear exactly once in the file.
+- Keep REPLACE to the minimum lines that satisfy the request.
+- Never emit the full file content. Never explain.`
+}
+
+// maxBoundedPatchContextBytes bounds the runtime-derived context window of a
+// bounded-patch attempt. It is deliberately small enough that even a degenerate
+// model response that echoes the entire window completes far below a 1024-token
+// output ceiling — the recovery invocation can no longer finish with
+// finish_reason=length by construction.
+const maxBoundedPatchContextBytes = 2048
+
+// boundedPatchWindow is one deterministic line-aligned window of the target.
+type boundedPatchWindow struct {
+	content    string // exact bytes shown to the model (the only copyable source)
+	startLine  int    // 1-indexed inclusive
+	endLine    int    // 1-indexed inclusive
+	totalLines int
+}
+
+// selectBoundedPatchWindow splits original into deterministic line-aligned
+// chunks of at most maxBoundedPatchContextBytes and returns the chunk selected
+// by attempt. Rotating windows across repair cycles gives every retry
+// materially different content (never an identical re-send) while keeping each
+// request's copyable source small; attempt 1 (the first patch attempt) anchors
+// at the head of the file.
+func selectBoundedPatchWindow(original string, attempt int) boundedPatchWindow {
+	lines := strings.Split(original, "\n")
+	total := len(lines)
+	if total == 0 || strings.TrimSpace(original) == "" {
+		return boundedPatchWindow{content: "", startLine: 1, endLine: 0, totalLines: 0}
+	}
+	// Greedy chunking on byte size with line alignment.
+	var chunks []boundedPatchWindow
+	start := 0
+	size := 0
+	for i := 0; i < total; i++ {
+		lineSize := len(lines[i]) + 1
+		if size > 0 && size+lineSize > maxBoundedPatchContextBytes {
+			chunks = append(chunks, boundedPatchWindow{
+				content:    strings.Join(lines[start:i], "\n"),
+				startLine:  start + 1,
+				endLine:    i,
+				totalLines: total,
+			})
+			start = i
+			size = 0
+		}
+		size += lineSize
+	}
+	chunks = append(chunks, boundedPatchWindow{
+		content:    strings.Join(lines[start:], "\n"),
+		startLine:  start + 1,
+		endLine:    total,
+		totalLines: total,
+	})
+	// Byte-level clamp: a file with no newline boundaries (or one huge line)
+	// cannot be split along lines, so the window content is truncated to the
+	// cap directly — the copyable source stays bounded by construction.
+	for i := range chunks {
+		if len(chunks[i].content) > maxBoundedPatchContextBytes {
+			chunks[i].content = chunks[i].content[:maxBoundedPatchContextBytes]
+		}
+	}
+	idx := (attempt - 1) % len(chunks)
+	return chunks[idx]
+}
+
+// buildBoundedPatchUserPrompt builds the bounded-patch USER message. The
+// message SCOPES THE TASK, not just the context: without an explicitly
+// bounded task a vague "rewrite it" goal makes small models regenerate an
+// entire document from imagination (the live OpenRouter repro: 898 input /
+// 1024 output / length even with a 2KB window). So the protocol and its hard
+// limits lead, the user goal is demoted to background, the format skeleton is
+// stated up front, and ONLY the runtime-derived window is presented as the
+// mutable region — the complete file never crosses to the model in this mode.
+func buildBoundedPatchUserPrompt(request, evidence, target string, window boundedPatchWindow) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "TASK: improve a SMALL EXCERPT of %s by returning EXACTLY ONE SEARCH/REPLACE block.\n\n", target)
+	b.WriteString("HARD LIMITS:\n")
+	b.WriteString("- Do NOT regenerate the document. Do NOT write a new file. Do NOT continue the page.\n")
+	b.WriteString("- Change AT MOST 5 consecutive lines. Your ENTIRE response is one small block.\n\n")
+	b.WriteString("OUTPUT FORMAT (your entire response):\n")
+	b.WriteString("<<<<<<< SEARCH\n<1-10 consecutive lines copied BYTE-FOR-BYTE from the context window below>\n=======\n<your improved version of those lines>\n>>>>>>>\n\n")
+	b.WriteString("### USER GOAL (background only — apply it to the excerpt, not the whole file)\n")
+	b.WriteString(strings.TrimSpace(request))
+	b.WriteString("\n\n")
+	if trimmed := strings.TrimSpace(evidence); trimmed != "" {
+		b.WriteString("### PRIOR FAILURE EVIDENCE\n")
+		ev := trimmed
+		const maxEvidenceBytes = 1500
+		if len(ev) > maxEvidenceBytes {
+			ev = ev[:maxEvidenceBytes] + "\n...(truncated)"
+		}
+		b.WriteString(ev)
+		b.WriteString("\n\n")
+	}
+	if window.totalLines == 0 {
+		b.WriteString("### TARGET FILE: ")
+		b.WriteString(target)
+		b.WriteString("\n(the file is empty — instead output the FULL new content inside one code fence)\n")
+		return b.String()
+	}
+	fmt.Fprintf(&b, "### CONTEXT WINDOW — %s lines %d-%d of %d (the ONLY lines you may touch)\n",
+		target, window.startLine, window.endLine, window.totalLines)
+	b.WriteString(window.content)
+	b.WriteString("\n\nREMINDERS: pick at most 5 consecutive lines from the window; copy them into SEARCH byte-for-byte (exact match is verified); put the improved lines in REPLACE. No prose. No markdown fences. Never the whole file.")
 	return b.String()
 }
 

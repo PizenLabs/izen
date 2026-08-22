@@ -99,6 +99,10 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 	if req.MaxOutputTokens > 0 {
 		effectiveMax = req.MaxOutputTokens
 	}
+	// The observation must carry the budget the invocation will ACTUALLY be
+	// bounded by (profile default or explicit override) — recovery decisions
+	// and traces read it as the authoritative per-attempt output ceiling.
+	req.MaxOutputTokens = effectiveMax
 	// Recovery prompt augmentation: when a recovery strategy is set, the
 	// objective is annotated with the explicit failure evidence so the next
 	// model invocation does not have to rediscover the truncation.
@@ -119,6 +123,11 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		Scope:            req.Scope,
 		Evidence:         req.Evidence,
 		StreamCallback:   req.StreamCallback,
+		// The recovery decision travels with the request so the executor can
+		// change the ACTUAL execution protocol (bounded-patch windowed
+		// context + strict SEARCH/REPLACE contract), not just annotations.
+		RecoveryStrategy: req.RecoveryStrategy,
+		RecoveryAttempt:  req.RecoveryAttempt,
 		// The strategy-selected output ceiling is a REQUEST budget, not a
 		// reporting change: max_tokens bounds the provider's generation so a
 		// verbose reasoning model cannot spend an unbounded output budget, and
@@ -130,15 +139,15 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		MaxOutputTokens: effectiveMax,
 	}
 	if strategyPtr != nil && req.RecoveryStrategy == "bounded_patch" {
-		// Material strategy change: the recovery attempt produces a bounded
-		// patch artifact rather than a full-file rewrite, so it fits the
-		// fixed output budget.
+		// Material artifact-contract change: the recovery attempt MUST produce
+		// a structured bounded patch. The search_replace kind is enforced by
+		// the executor at the artifact boundary — the model is never asked to
+		// emit the full file and a full-file response is rejected — so a
+		// truncated full-file regeneration can never repeat under a new label.
 		mod := *strategyPtr
 		mod.Artifact.Bounded = true
-		if mod.Artifact.Kind == "" {
-			mod.Artifact.Kind = "replace_block"
-		}
-		mod.StrategyReason = mod.StrategyReason + " [recovery: bounded_patch after truncation]"
+		mod.Artifact.Kind = "search_replace"
+		mod.StrategyReason += " [recovery: bounded_patch after truncation]"
 		execReq.Strategy = &mod
 	}
 	res, err := a.executor.Execute(ctx, execReq)

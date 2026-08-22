@@ -641,19 +641,35 @@ func defaultRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.L
 			"[RECOVERY attempt=%d/%d strategy=%s -> %s target=%s budget=%d finish_reason=%s outcome=%s]\nFailure: model output truncated (finish_reason=length) while generating full artifact for %s.\nRecovery: produce a bounded SEARCH/REPLACE patch (or unified diff hunk) for the minimal change instead of regenerating the entire file. Preserve required target context, trim unrelated output.",
 			o.AttemptNum, attempt, "full_artifact", strategy, target, o.MaxOutputTokens, o.FinishReason, o.Outcome, target)
 	default:
-		strategy = "retry_with_evidence"
-		reason = fmt.Sprintf("recoverable failure %s on %s (attempt %d)", o.Outcome, target, attempt)
-		budget = req.MaxOutputTokens
-		evidenceAdd = fmt.Sprintf("[RECOVERY attempt=%d strategy=%s outcome=%s target=%s finish_reason=%s]", attempt, strategy, o.Outcome, target, o.FinishReason)
+		if req.RecoveryStrategy == "bounded_patch" {
+			// LATCH: once a truncation moved this run onto the bounded-patch
+			// contract, every later recovery of the run KEEPS it. Reverting
+			// to the full-artifact tolerance would re-run the exact truncated
+			// full-file generation under a different label.
+			strategy = "bounded_patch"
+			reason = fmt.Sprintf("bounded patch contract retained after %s on %s (attempt %d)", o.Outcome, target, attempt)
+			budget = req.MaxOutputTokens
+			evidenceAdd = fmt.Sprintf(
+				"[RECOVERY attempt=%d strategy=%s outcome=%s target=%s finish_reason=%s]\nKeep producing a bounded SEARCH/REPLACE patch (or unified diff hunk) for the minimal change; never regenerate the whole file.",
+				attempt, strategy, o.Outcome, target, o.FinishReason)
+		} else {
+			strategy = "retry_with_evidence"
+			reason = fmt.Sprintf("recoverable failure %s on %s (attempt %d)", o.Outcome, target, attempt)
+			budget = req.MaxOutputTokens
+			evidenceAdd = fmt.Sprintf("[RECOVERY attempt=%d strategy=%s outcome=%s target=%s finish_reason=%s]", attempt, strategy, o.Outcome, target, o.FinishReason)
+		}
 	}
 
-	// Structured trace line — concise, per attempt, visible in logs.
-	log.Printf("[execution] attempt=%d strategy=%s target=%s budget=%d", o.AttemptNum, "full_artifact", target, o.MaxOutputTokens)
-	log.Printf("[execution] result=truncated input=%d output=%d finish_reason=%s outcome=%s", o.InputTokens, o.OutputTokens, o.FinishReason, o.Outcome)
-	log.Printf("[recovery] reason=%s", reason)
-	log.Printf("[recovery] strategy=%s", strategy)
-	log.Printf("[execution] attempt=%d strategy=%s target=%s budget=%d", attempt, strategy, target, budget)
-
+	// Structured recovery trace — the strategy transition with the effective
+	// budget. The authoritative per-invocation [execution] wire-contract
+	// lines are emitted by the executor (what was actually sent/expected);
+	// this line describes the requested recovery contract only.
+	fromStrategy := req.RecoveryStrategy
+	if fromStrategy == "" {
+		fromStrategy = "full_artifact"
+	}
+	log.Printf("[recovery] from_strategy=%s to_strategy=%s reason=%s attempt=%d target=%s effective_budget=%d",
+		fromStrategy, strategy, reason, attempt, target, budget)
 	next := req
 	next.Evidence = strings.TrimSpace(req.Evidence + "\n" + evidenceAdd)
 	next.RecoveryAttempt = attempt

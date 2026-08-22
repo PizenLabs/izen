@@ -333,21 +333,29 @@ type openrouterRequest struct {
 }
 
 // openrouterReasoning is OpenRouter's reasoning control payload: an optional
-// qualitative effort (low/medium/high) and an optional max_tokens reasoning
-// cap. OpenRouter relays whichever field is set to the underlying provider's
-// native mechanism.
+// qualitative effort (low/medium/high), an optional max_tokens reasoning cap,
+// and an optional on/off switch. OpenRouter relays whichever field is set to
+// the underlying provider's native mechanism.
 type openrouterReasoning struct {
 	Effort    string `json:"effort,omitempty"`
 	MaxTokens int    `json:"max_tokens,omitempty"`
+	Enabled   *bool  `json:"enabled,omitempty"`
 }
 
 // reasoningFor builds the OpenRouter reasoning payload from the resolved
 // effort directive. The qualitative effort maps to reasoning.effort; the CoT
-// cap and budget map to reasoning.max_tokens. A nil request reasoning config
-// yields nil (field omitted, the pre-existing behavior).
+// cap and budget map to reasoning.max_tokens. Disabled maps to
+// reasoning.enabled=false — the only control reliably honored by models whose
+// gateways ignore the CoT cap (they otherwise spend the whole output budget in
+// the hidden reasoning channel). A nil request reasoning config yields nil
+// (field omitted, the pre-existing behavior).
 func reasoningFor(req ai.Request) *openrouterReasoning {
 	if req.Reasoning == nil {
 		return nil
+	}
+	if req.Reasoning.Disabled {
+		enabled := false
+		return &openrouterReasoning{Enabled: &enabled}
 	}
 	r := &openrouterReasoning{Effort: req.Reasoning.Level}
 	switch {

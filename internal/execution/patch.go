@@ -1808,6 +1808,63 @@ func ResolveModifiedContent(original, rawLLMOutput string) string {
 	return input
 }
 
+// ExtractBoundedPatch extracts a bounded patch from raw LLM output using ONLY
+// the structured patch representations — SEARCH/REPLACE blocks or unified diff
+// hunks — and validates the anchor deterministically:
+//
+//   - every SEARCH block MUST occur EXACTLY ONCE, byte-for-byte, in the
+//     original (a duplicated or missing anchor can never apply unambiguously);
+//   - the applied result MUST differ from the original;
+//   - full-file or otherwise unstructured output NEVER passes.
+//
+// It is the artifact boundary for the search_replace contract (truncation
+// recovery): a verbose or truncated response can never masquerade as the
+// mutation.
+func ExtractBoundedPatch(original, raw string) (string, bool) {
+	input := strings.TrimSpace(raw)
+	if input == "" || original == "" {
+		return "", false
+	}
+
+	// Strip outer markdown code fences if present (the parser explicitly
+	// supports fenced blocks; prose outside them is not part of the artifact).
+	if strings.HasPrefix(input, "```") {
+		if idx := strings.Index(input, "\n"); idx != -1 {
+			input = input[idx+1:]
+		}
+	}
+	input = strings.TrimSuffix(input, "```")
+	input = strings.TrimSpace(input)
+
+	// Structured form 1: SEARCH/REPLACE blocks with exact-once anchor proof.
+	if strings.Contains(input, "<<<<<<< SEARCH") {
+		blocks := ParseSearchReplaceBlocks(input)
+		if len(blocks) == 0 {
+			return "", false
+		}
+		for _, block := range blocks {
+			if block.search == "" || strings.Count(original, block.search) != 1 {
+				return "", false
+			}
+		}
+		if modified, ok := ApplySearchReplaceBlocks(original, blocks); ok && modified != original {
+			return modified, true
+		}
+		return "", false
+	}
+
+	// Structured form 2: unified diff with @@ hunk headers.
+	if strings.Contains(input, "@@") {
+		if modified, err := applyUnifiedPatch(original, input); err == nil && modified != original {
+			return modified, true
+		}
+		return "", false
+	}
+
+	// No structured patch representation present.
+	return "", false
+}
+
 // ExtractCodeBlockContent extracts content from the first markdown code block
 // found in the output. This handles the case where small cloud models output
 // raw file content inside ```<lang> ... ``` fences instead of using the
