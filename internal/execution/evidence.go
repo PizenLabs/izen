@@ -36,8 +36,11 @@ const (
 	// partial mutations flagged tainted on the mutation summary.
 	EvidenceFailed ExecutionOutcome = "FAILED"
 	// EvidenceAbortedOCC is the optimistic-concurrency abort outcome. It is
-	// RESERVED for Phase 3 (workspace source-hash OCC verification); the
-	// current noopSourceHashVerifier baseline never produces it.
+	// produced EXCLUSIVELY by the Phase 3 OCC commit gate (RuntimeExecutor's
+	// pre-commit baseline verification, carried by Proof.OccAborted): the
+	// target state diverged from the admitted baseline immediately before any
+	// write, so the attempt aborted with zero partial writes and tainted
+	// mutations. The coarse outcome mapper never derives it.
 	EvidenceAbortedOCC ExecutionOutcome = "ABORTED_OCC"
 	// EvidenceCancelled is a clean terminal cancellation (user cancel or human
 	// rejection at the approval gate). Nothing was committed.
@@ -265,8 +268,9 @@ func sealEvidence(
 // evidenceOutcomeFor maps a canonical MutationOutcome plus the request-level
 // error onto the coarse terminal vocabulary. The mapping is total and
 // fail-closed: anything not provably committed maps to FAILED, and anything
-// cancelled/rejected maps to CANCELLED. ABORTED_OCC is reserved for Phase 3
-// and never derived here.
+// cancelled/rejected maps to CANCELLED. ABORTED_OCC is never derived here —
+// it is produced exclusively by the Phase 3 OCC commit gate through the
+// Proof.OccAborted flag (see sealTerminalEvidence).
 func evidenceOutcomeFor(outcome MutationOutcome, execErr error) ExecutionOutcome {
 	switch outcome {
 	case OutcomeChanged, OutcomeCreated, OutcomeNoChange, OutcomeCompleted:

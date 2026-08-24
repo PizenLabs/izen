@@ -227,6 +227,11 @@ type ExecutionProof struct {
 	Outcome          MutationOutcome `json:"outcome"`
 	StartedAt        time.Time       `json:"started_at"`
 	FinishedAt       time.Time       `json:"finished_at"`
+	// OccAborted records a Phase 3 OCC commit-gate abort: the pre-commit
+	// verification found the target state diverged from the admitted baseline.
+	// The evidence outcome is ABORTED_OCC (never derived by the coarse outcome
+	// mapper) and the mutations are tainted.
+	OccAborted bool `json:"occ_aborted,omitempty"`
 }
 
 // ContextDecision is one strategy-owned context decision recorded in the
@@ -343,6 +348,11 @@ type pendingMutation struct {
 	// until the gate resolves.
 	contract *ExecutionContract
 	attempt  AttemptID
+	// baseline is the Phase 3 target-scoped workspace snapshot captured at
+	// admission. Approve re-validates it immediately before the commit
+	// pipeline writes anything; a mismatch aborts with ABORTED_OCC and zero
+	// partial writes.
+	baseline *WorkspaceBaseline
 }
 
 // RuntimeExecutor is the runtime-owned execution boundary.
@@ -361,6 +371,10 @@ type RuntimeExecutor struct {
 	// deterministically across retries, and instantiates bounded causal
 	// recovery contracts.
 	contracts *ContractRegistry
+	// occ is the runtime-owned Phase 3 optimistic-concurrency engine: it
+	// fingerprints the resolved targets at admission and re-validates them
+	// immediately before the commit pipeline writes anything.
+	occ *OCCVerifier
 
 	mu      sync.Mutex
 	pending map[string]*pendingMutation
@@ -384,6 +398,7 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 		patches:   NewPatchManager(root),
 		admission: NewAdmissionGateway(nil),
 		contracts: NewContractRegistry(),
+		occ:       NewOCCVerifier(root),
 		pending:   make(map[string]*pendingMutation),
 	}
 	if langID != "" {
@@ -413,6 +428,11 @@ func (x *RuntimeExecutor) AdmittedCapabilities() AdmittedCapabilities {
 // (observability). Callers may read admitted contracts and attempt counters;
 // all mutation authority stays inside the registry.
 func (x *RuntimeExecutor) Contracts() *ContractRegistry { return x.contracts }
+
+// OCC exposes the runtime-owned optimistic-concurrency verifier
+// (observability). Callers may read its operational metrics; the baseline and
+// pre-commit gate authority stays inside the executor's commit pipeline.
+func (x *RuntimeExecutor) OCC() *OCCVerifier { return x.occ }
 
 // SetVerifier overrides the attached verifier (test seam / config wiring).
 func (x *RuntimeExecutor) SetVerifier(v *Verifier) {
@@ -779,6 +799,16 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		return x.finalizeResult(res), nil
 	}
 
+	// ── PHASE 3 OCC BASELINE (target-scoped) ───────────────────────────
+	// Fingerprint EXACTLY the resolved target geometry at admission time —
+	// never a workspace-wide scan. Approve re-validates this baseline
+	// immediately before the commit pipeline writes anything; any out-of-band
+	// divergence in between aborts with ABORTED_OCC and zero partial writes.
+	var occBaseline *WorkspaceBaseline
+	if profile.Strategy == strategy.TargetedMutation {
+		occBaseline = x.occ.SnapshotBaseline(targets)
+	}
+
 	// ── 7. Targeted mutation: per-target model invocation ──────────────
 	patches, invs, diffs, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
 	if err != nil {
@@ -869,6 +899,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		g:              g,
 		contract:       contract,
 		attempt:        attempt,
+		baseline:       occBaseline,
 	}
 	x.mu.Lock()
 	x.pending[patches[0].ID] = pm
@@ -946,6 +977,21 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 
 	g.BeginMutation(pm.targets)
 	setProofGraph(res, g)
+
+	// ── PHASE 3 OCC COMMIT GATE ────────────────────────────────────────
+	// Re-verify the admitted target baseline IMMEDIATELY before the commit
+	// pipeline applies any mutation or executes any final file write. Any
+	// out-of-band divergence (LSP edit, external process, parallel tool) since
+	// admission halts execution here — BEFORE a single byte is written — with
+	// the canonical ABORTED_OCC outcome, tainted mutations and zero partial
+	// writes. This gate is never substituted by Cancel(): an OCC abort is a
+	// first-class terminal evidence outcome.
+	if pm.baseline != nil {
+		if conflict := x.occ.VerifyAgainst(pm.baseline); conflict != nil {
+			err := fmt.Errorf("executor: occ commit gate rejected request %s: %w", pm.requestID, conflict)
+			return x.abortOnStateConflict(res, pm, ms, g, err), err
+		}
+	}
 
 	// ── Apply EVERY held patch inside the single MutationSet transaction ──
 	applyCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
@@ -1082,6 +1128,48 @@ func (x *RuntimeExecutor) correctEvidenceAfterRollback(ms *MutationSet, patches 
 		}
 		ms.Outcomes[i].FilesystemChanged = string(data) != orig
 	}
+}
+
+// abortOnStateConflict is the clean Phase 3 OCC abort path. It runs when the
+// pre-commit verification found a baseline mismatch: NOTHING was applied (the
+// gate precedes the apply stage), so no partial write can exist by
+// construction. The open mutation boundary is terminated cleanly, per-target
+// evidence records the abort without ever claiming an apply, and the proof
+// carries the OccAborted flag that seals ABORTED_OCC tainted evidence.
+func (x *RuntimeExecutor) abortOnStateConflict(
+	res *ExecutionResult,
+	pm *pendingMutation,
+	ms *MutationSet,
+	g *runtimegraph.Graph,
+	abortErr error,
+) *ExecutionResult {
+	// Terminate the open boundary cleanly: nothing was recorded or applied,
+	// so rollback restores nothing — it only closes the transaction so no
+	// staged state survives the abort.
+	_ = ms.RollbackTo(MutationRolledBack)
+
+	res.ArtifactKind = "patch"
+	for _, t := range pm.targets {
+		res.Mutations = append(res.Mutations, MutationEvidence{
+			Stage:   StageApply,
+			File:    t,
+			Outcome: OutcomeOCCAborted,
+			Reason:  abortErr.Error(),
+		})
+		g.CompleteMutation(t, string(OutcomeOCCAborted))
+	}
+	res.Proof.Mutations = res.Mutations
+	res.Proof.OccAborted = true
+	res.Proof.Outcome = OutcomeOCCAborted
+	res.Proof.AffectedFiles = append([]string(nil), pm.targets...)
+	res.Proof.DiffSummary = pm.diffs
+	// The verification gate never ran — the OCC gate aborted before apply.
+	g.Skip(runtimegraph.StageVerification, "occ abort before any apply")
+	g.FailExecution(events.FailurePermanent, abortErr, "executor.occ")
+	res.Err = abortErr
+	res.Proof.FinishedAt = time.Now()
+	setProofGraph(res, g)
+	return x.finalizeResult(res)
 }
 
 // Reject resolves the approval gate negatively: the held patches are never
@@ -1853,7 +1941,15 @@ func (x *RuntimeExecutor) sealTerminalEvidence(res *ExecutionResult) {
 		// gate: the execution has NOT terminated — no evidence exists yet.
 		return
 	}
-	outcome := evidenceOutcomeFor(p.Outcome, res.Err)
+	// Phase 3 OCC commit gate: the abort outcome is NEVER derived by the
+	// coarse mapper — it is produced here, exclusively from the runtime's own
+	// OccAborted flag set by the pre-commit baseline verification.
+	var outcome ExecutionOutcome
+	if p.OccAborted {
+		outcome = EvidenceAbortedOCC
+	} else {
+		outcome = evidenceOutcomeFor(p.Outcome, res.Err)
+	}
 	mutations := p.Mutations
 	if len(mutations) == 0 {
 		mutations = res.Mutations
@@ -1864,6 +1960,12 @@ func (x *RuntimeExecutor) sealTerminalEvidence(res *ExecutionResult) {
 		targets = res.Targets
 	}
 	summary := summarizeMutationSet(p.TransactionID, targets, mutations, p.Outcome, ran, passed)
+	if p.OccAborted && !summary.Tainted {
+		// An OCC abort always taints the attempt: the held proposal is stale,
+		// and every projector must invalidate its tentative state even though
+		// zero bytes reached the workspace.
+		summary.Tainted = true
+	}
 	res.Evidence = sealEvidence(
 		ContractID(p.ContractID), AttemptID(p.AttemptID),
 		x.contracts.Contract(ContractID(p.ContractID)),
