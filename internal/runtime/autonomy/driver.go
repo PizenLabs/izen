@@ -676,6 +676,14 @@ func defaultRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.L
 	next.RecoveryReason = reason
 	next.RecoveryStrategy = strategy
 	next.FinishReason = o.FinishReason
+	// CAUSAL RECOVERY (Phase 2 P2): the repair continues the FAILED contract's
+	// lineage. The executor's admission resolves this pointer — pure retries
+	// keep the same immutable ContractID (attempt++), material changes append
+	// a new causally linked recovery contract — and enforces the bounded
+	// chain limit, so automatic recovery can never loop forever.
+	if o.ContractID != "" {
+		next.ParentContractID = o.ContractID
+	}
 	if budget > 0 {
 		next.MaxOutputTokens = budget
 	}

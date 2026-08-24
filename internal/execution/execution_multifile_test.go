@@ -142,11 +142,17 @@ func TestMultiFileMutationSingleTransaction(t *testing.T) {
 	}
 
 	// ── No synthetic verification: the events came from the real graph ──
+	// Phase 2 P2: execution.finished remains the LAST lifecycle event; only
+	// the authoritative execution.evidence record (sealed at termination) may
+	// follow it.
 	collector.waitCount(events.EventVerificationCompleted, 1, time.Second)
 	types := collector.types()
 	last := types[len(types)-1]
-	if last != events.EventExecutionFinished {
-		t.Fatalf("last event = %s, want execution.finished (terminal)", last)
+	switch {
+	case last == events.EventExecutionFinished:
+	case last == events.EventExecutionEvidence && len(types) >= 2 && types[len(types)-2] == events.EventExecutionFinished:
+	default:
+		t.Fatalf("terminal ordering violated: %v (execution.finished must precede only execution.evidence)", types)
 	}
 }
 

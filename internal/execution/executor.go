@@ -124,6 +124,15 @@ type ExecuteRequest struct {
 	// window rotation across repair cycles.
 	RecoveryStrategy string
 	RecoveryAttempt  int
+	// RecoveryOf declares CAUSAL RECOVERY (Phase 2 P2): the failed parent
+	// ContractID this execution recovers from. The runtime resolves the
+	// recovery at admission — instantiating a NEW contract with an explicit
+	// back-pointer and the parent's full ancestry — and enforces the bounded
+	// chain limit (MaxRecoveryChainDepth). A unknown parent fails closed with
+	// ErrUnknownParentContract; an exhausted chain with
+	// ErrRecoveryChainExhausted. Failed contracts are never rewritten: every
+	// recovery is an append-only causal step.
+	RecoveryOf string
 	// StreamCallback is an optional callback for incremental streaming progress.
 	// When set, the executor invokes it during provider streaming for each
 	// content delta, first token, and completion. This enables the UI to
@@ -203,12 +212,21 @@ type ExecutionProof struct {
 	// its sealed digest and its causal ancestor. Callers cannot inject or
 	// rebuild prompt context mid-execution — the proof names the exact payload
 	// that crossed.
-	ContextID       string          `json:"context_id,omitempty"`
-	ContextDigest   string          `json:"context_digest,omitempty"`
-	ContextParentID string          `json:"context_parent_id,omitempty"`
-	Outcome         MutationOutcome `json:"outcome"`
-	StartedAt       time.Time       `json:"started_at"`
-	FinishedAt      time.Time       `json:"finished_at"`
+	ContextID       string `json:"context_id,omitempty"`
+	ContextDigest   string `json:"context_digest,omitempty"`
+	ContextParentID string `json:"context_parent_id,omitempty"`
+	// Contract identity (Phase 2 P2): WHICH unique execution intent ran and
+	// WHICH invocation attempt of it. The identity is computed at admission
+	// from the sealed context + strategy + targets — retries keep the
+	// ContractID while AttemptID increments; parameter/strategy changes fork a
+	// new contract. Identity is immutable once stamped here.
+	ContractID       string          `json:"contract_id,omitempty"`
+	AttemptID        uint32          `json:"attempt_id,omitempty"`
+	ParentContractID string          `json:"parent_contract_id,omitempty"`
+	CausalAncestry   []string        `json:"causal_ancestry,omitempty"`
+	Outcome          MutationOutcome `json:"outcome"`
+	StartedAt        time.Time       `json:"started_at"`
+	FinishedAt       time.Time       `json:"finished_at"`
 }
 
 // ContextDecision is one strategy-owned context decision recorded in the
@@ -288,6 +306,12 @@ type ExecutionResult struct {
 	Verification VerificationReport
 	// Proof is the evidence account of the whole execution.
 	Proof *ExecutionProof
+	// Evidence is the authoritative IMMUTABLE terminal record of the
+	// execution (Phase 2 P2). It is sealed by the runtime at every terminal
+	// path and is the SOLE artifact downstream projectors may consume to
+	// derive terminal execution truth. It is nil while the execution is still
+	// held at the approval gate (not yet terminated).
+	Evidence *ExecutionEvidence
 	// Completed is the authoritative terminal usage account computed by the
 	// runtime from the provider-reported usage. The renderer reads it for the
 	// footer / EXPANDED token numbers and never re-derives them.
@@ -313,6 +337,12 @@ type pendingMutation struct {
 	// g is the runtime-owned execution graph resumed at approval time. It is
 	// the single lifecycle authority of the whole execution.
 	g *runtimegraph.Graph
+	// contract / attempt carry the immutable identity of the held attempt
+	// (Phase 2 P2): Approve/Reject resolve the SAME contract attempt, never a
+	// new one. The approval gate is not a termination — no evidence exists
+	// until the gate resolves.
+	contract *ExecutionContract
+	attempt  AttemptID
 }
 
 // RuntimeExecutor is the runtime-owned execution boundary.
@@ -326,6 +356,11 @@ type RuntimeExecutor struct {
 	verifier  *Verifier
 	auth      *authorization.MutationAuthorization
 	admission *AdmissionGateway
+	// contracts is the runtime-owned contract identity ledger (Phase 2 P2):
+	// it derives immutable ContractIDs at admission, increments AttemptIDs
+	// deterministically across retries, and instantiates bounded causal
+	// recovery contracts.
+	contracts *ContractRegistry
 
 	mu      sync.Mutex
 	pending map[string]*pendingMutation
@@ -348,6 +383,7 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 		langID:    langID,
 		patches:   NewPatchManager(root),
 		admission: NewAdmissionGateway(nil),
+		contracts: NewContractRegistry(),
 		pending:   make(map[string]*pendingMutation),
 	}
 	if langID != "" {
@@ -372,6 +408,11 @@ func (x *RuntimeExecutor) SetAdmittedCapabilities(caps *AdmittedCapabilities) {
 func (x *RuntimeExecutor) AdmittedCapabilities() AdmittedCapabilities {
 	return x.admission.Capabilities()
 }
+
+// Contracts exposes the runtime-owned contract identity ledger
+// (observability). Callers may read admitted contracts and attempt counters;
+// all mutation authority stays inside the registry.
+func (x *RuntimeExecutor) Contracts() *ContractRegistry { return x.contracts }
 
 // SetVerifier overrides the attached verifier (test seam / config wiring).
 func (x *RuntimeExecutor) SetVerifier(v *Verifier) {
@@ -613,6 +654,27 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		g.CompleteTarget(t, fileExists(filepath.Join(x.root, t)), "strategy")
 	}
 
+	// ── ADMISSION III: CONTRACT IDENTITY RESOLUTION (Phase 2 P2) ──────
+	// The execution's immutable identity is derived from the VERIFIED context
+	// digest, the selected strategy and the RESOLVED target set — never
+	// declared by callers. Retries of one intent resolve to the SAME
+	// ContractID with a deterministically incremented AttemptID; parameter or
+	// strategy changes fork a NEW contract; an explicit causal recovery
+	// instantiates a new contract that back-points at its failed parent under
+	// the bounded chain limit. Resolution failures (unknown parent, exhausted
+	// chain) fail closed here — before any acting stage.
+	contract, attempt, contractErr := x.contracts.Resolve(req, snapshot.Digest(), targets)
+	if contractErr != nil {
+		err := fmt.Errorf("executor: admission rejected request %s: %w", requestID, contractErr)
+		g.FailExecution(events.FailurePermanent, err, "executor.admission")
+		res.Err = err
+		res.Proof.Outcome = OutcomeFailed
+		res.Proof.FinishedAt = time.Now()
+		setProofGraph(res, g)
+		return x.finalizeResult(res), err
+	}
+	stampContractIdentity(res, contract, attempt)
+
 	// ── 3. Human clarification (no model, no mutation) ────────────────
 	// HumanClarification is authoritative and MUST be handled before the
 	// deterministic branch: the strategy carries Deterministic=true but its
@@ -805,6 +867,8 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		modelCalls:     res.ModelCalls,
 		startedAt:      start,
 		g:              g,
+		contract:       contract,
+		attempt:        attempt,
 	}
 	x.mu.Lock()
 	x.pending[patches[0].ID] = pm
@@ -859,6 +923,10 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		g = runtimegraph.New(pm.requestID, x.emit)
 	}
 	setProofGraph(res, g)
+
+	// The approval resolves the SAME contract attempt that was held (Phase 2
+	// P2): identity is immutable across the gate.
+	stampContractIdentity(res, pm.contract, pm.attempt)
 
 	// The runtime owns a fresh mutation boundary for this apply.
 	ms := NewMutationSet()
@@ -1052,6 +1120,9 @@ func (x *RuntimeExecutor) Reject(ctx context.Context, patchID, reason string) (*
 	if g == nil {
 		g = runtimegraph.New(pm.requestID, x.emit)
 	}
+	// The rejection resolves the SAME contract attempt that was held (Phase 2
+	// P2): identity is immutable across the gate.
+	stampContractIdentity(res, pm.contract, pm.attempt)
 	ms := NewMutationSet()
 	for _, p := range pm.patches {
 		_ = ms.Record(p.File)
@@ -1735,12 +1806,108 @@ func setProofGraph(res *ExecutionResult, g *runtimegraph.Graph) {
 	res.Proof.Graph = steps
 }
 
+// stampContractIdentity copies the immutable contract identity onto the
+// execution proof: ContractID, AttemptID, ParentContractID and the causal
+// ancestry chain (root → parent). Identity is stamped once per attempt.
+func stampContractIdentity(res *ExecutionResult, c *ExecutionContract, attempt AttemptID) {
+	if res == nil || res.Proof == nil || c == nil {
+		return
+	}
+	res.Proof.ContractID = c.ID().String()
+	res.Proof.AttemptID = uint32(attempt)
+	res.Proof.ParentContractID = c.ParentID().String()
+	if anc := c.CausalAncestry(); len(anc) > 0 {
+		res.Proof.CausalAncestry = make([]string, 0, len(anc))
+		for _, id := range anc {
+			res.Proof.CausalAncestry = append(res.Proof.CausalAncestry, id.String())
+		}
+	}
+}
+
+// verificationGateState reports whether a real verification gate executed and
+// whether it passed. A zero report or an explicitly Skipped gate never counts
+// as "ran" — a skipped gate is not-applicable, not a pass and not a failure.
+func verificationGateState(r VerificationReport) (ran bool, passed bool) {
+	if r.Skipped {
+		return false, false
+	}
+	ran = len(r.Results) > 0 || r.Passed
+	return ran, r.Passed
+}
+
+// sealTerminalEvidence constructs the IMMUTABLE ExecutionEvidence for one
+// terminated execution attempt from the runtime facts already on the result:
+// contract identity, sealed context digest, canonical outcome, mutation-set
+// summary (with taint rules) and the precise time window. The evidence is
+// attached to res.Evidence exactly once and published on the domain bus so
+// downstream projectors consume it as their sole authoritative terminal
+// artifact. Executions still held at the approval gate are NOT terminated —
+// no evidence exists for them yet.
+func (x *RuntimeExecutor) sealTerminalEvidence(res *ExecutionResult) {
+	if res == nil || res.Proof == nil || res.Evidence != nil {
+		return
+	}
+	p := res.Proof
+	if p.ContractID == "" || res.PendingPatchID != "" {
+		// No identity (pre-admission failure) or still held at the approval
+		// gate: the execution has NOT terminated — no evidence exists yet.
+		return
+	}
+	outcome := evidenceOutcomeFor(p.Outcome, res.Err)
+	mutations := p.Mutations
+	if len(mutations) == 0 {
+		mutations = res.Mutations
+	}
+	ran, passed := verificationGateState(p.Verification)
+	targets := p.Targets
+	if len(targets) == 0 {
+		targets = res.Targets
+	}
+	summary := summarizeMutationSet(p.TransactionID, targets, mutations, p.Outcome, ran, passed)
+	res.Evidence = sealEvidence(
+		ContractID(p.ContractID), AttemptID(p.AttemptID),
+		x.contracts.Contract(ContractID(p.ContractID)),
+		p.ContextDigest, outcome, summary, p.StartedAt, p.FinishedAt,
+	)
+	x.emitEvidenceEvent(res, res.Evidence)
+}
+
+// emitEvidenceEvent publishes the canonical execution.evidence event. The
+// payload carries scalar facts only (no live pointers), so every bus consumer
+// projects from immutable truth.
+func (x *RuntimeExecutor) emitEvidenceEvent(res *ExecutionResult, ev *ExecutionEvidence) {
+	if res == nil || ev == nil {
+		return
+	}
+	ancestry := make([]string, 0, len(ev.CausalAncestry()))
+	for _, id := range ev.CausalAncestry() {
+		ancestry = append(ancestry, id.String())
+	}
+	x.emit(events.NewExecutionEvidence(events.ExecutionEvidencePayload{
+		RequestID:        res.RequestID,
+		ContractID:       ev.ContractID().String(),
+		AttemptID:        uint32(ev.AttemptID()),
+		ParentContractID: ev.ParentContractID().String(),
+		CausalAncestry:   ancestry,
+		ContextDigest:    ev.ContextDigest(),
+		Outcome:          string(ev.Outcome()),
+		Tainted:          ev.Mutations().Tainted,
+		Targets:          ev.Mutations().Targets,
+		FilesMutated:     ev.Mutations().FilesMutated,
+		TransactionID:    ev.Mutations().TransactionID,
+		StartedAt:        ev.StartedAt(),
+		FinishedAt:       ev.FinishedAt(),
+	}))
+}
+
 // finalizeResult stamps the authoritative terminal usage account (provider,
 // model, aggregate input/output tokens, latency, artifact) onto the result. It
 // is the SINGLE place token accounting is computed — from the provider-reported
 // ModelInvocations — so the renderer reads ExecutionResult.Completed and never
 // re-sums usage. It must be called on every terminal return path of the
-// executor (Execute / Approve / Reject).
+// executor (Execute / Approve / Reject). Phase 2 P2: it also seals the
+// immutable ExecutionEvidence on every TERMINAL path — the single authoritative
+// record downstream projectors consume.
 func (x *RuntimeExecutor) finalizeResult(res *ExecutionResult) *ExecutionResult {
 	if res == nil {
 		return nil
@@ -1772,6 +1939,7 @@ func (x *RuntimeExecutor) finalizeResult(res *ExecutionResult) *ExecutionResult 
 	}
 	cc.Artifact = res.ArtifactKind
 	res.Completed = cc
+	x.sealTerminalEvidence(res)
 	return res
 }
 

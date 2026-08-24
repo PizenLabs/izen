@@ -90,7 +90,14 @@ const (
 	EventMutationStarted       = "execution.mutation.started"
 	EventMutationCompleted     = "execution.mutation.completed"
 	EventVerificationCompleted = "execution.verification.completed"
-	EventExecutionFinished     = "execution.finished"
+	// EventExecutionEvidence is the terminal AUTHORITATIVE record of one
+	// execution attempt (Phase 2 P2). It is emitted exactly once per
+	// execution, by the runtime, when the attempt terminates. Downstream
+	// state projectors (UI/queue) MUST derive terminal truth from this event —
+	// never from intermediate lifecycle events, which can never convey a
+	// committed outcome.
+	EventExecutionEvidence = "execution.evidence"
+	EventExecutionFinished = "execution.finished"
 	// EventApprovalRequired is the canonical runtime approval event emitted when
 	// a RuntimeExecutor execution stops at the human-in-the-loop approval gate.
 	// It is distinct from EventApprovalRequested (the patch-engine Tier-4
@@ -418,6 +425,30 @@ type ExecutionFinishedPayload struct {
 	RequestID string
 	Success   bool
 	Outcome   string
+}
+
+// ExecutionEvidencePayload is the authoritative terminal record of one
+// execution attempt (Phase 2 P2). It carries the immutable contract identity
+// (ContractID + AttemptID), the causal recovery lineage, the sealed Phase 1
+// context digest, the canonical outcome (COMMITTED / FAILED / ABORTED_OCC /
+// CANCELLED), the mutation-set summary with its taint flag and the precise
+// time window. Outcome uses the execution.ExecutionOutcome vocabulary;
+// Tainted evidence must never project as success. All fields are scalars —
+// no live pointers cross the bus.
+type ExecutionEvidencePayload struct {
+	RequestID        string
+	ContractID       string
+	AttemptID        uint32
+	ParentContractID string
+	CausalAncestry   []string
+	ContextDigest    string
+	Outcome          string
+	Tainted          bool
+	Targets          []string
+	FilesMutated     int
+	TransactionID    string
+	StartedAt        time.Time
+	FinishedAt       time.Time
 }
 
 // ApprovalRequiredPayload carries a RuntimeExecutor approval-gate request.
@@ -811,6 +842,13 @@ func NewVerificationCompleted(requestID string, passed bool, steps []string) Dom
 // NewExecutionFinished publishes the terminal outcome of a runtime execution.
 func NewExecutionFinished(requestID string, success bool, outcome string) DomainEvent {
 	return newEvent(EventExecutionFinished, ExecutionFinishedPayload{RequestID: requestID, Success: success, Outcome: outcome})
+}
+
+// NewExecutionEvidence publishes the authoritative terminal record of one
+// execution attempt (Phase 2 P2). It is emitted exactly once per execution by
+// the runtime at termination.
+func NewExecutionEvidence(p ExecutionEvidencePayload) DomainEvent {
+	return newEvent(EventExecutionEvidence, p)
 }
 
 // NewApprovalRequired publishes a RuntimeExecutor approval-gate request.
