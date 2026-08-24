@@ -1895,8 +1895,12 @@ func setProofGraph(res *ExecutionResult, g *runtimegraph.Graph) {
 }
 
 // stampContractIdentity copies the immutable contract identity onto the
-// execution proof: ContractID, AttemptID, ParentContractID and the causal
-// ancestry chain (root → parent). Identity is stamped once per attempt.
+// execution proof: ContractID, AttemptID, ParentContractID, the causal
+// ancestry chain (root → parent) and the Phase 1 sealed ContextDigest. The
+// contract carries exactly the verified context digest it was resolved with,
+// so every terminal path that crosses this choke point — Execute, Approve and
+// Reject alike — emits terminal evidence bound to its admitted context
+// snapshot. Identity is stamped once per attempt.
 func stampContractIdentity(res *ExecutionResult, c *ExecutionContract, attempt AttemptID) {
 	if res == nil || res.Proof == nil || c == nil {
 		return
@@ -1904,6 +1908,7 @@ func stampContractIdentity(res *ExecutionResult, c *ExecutionContract, attempt A
 	res.Proof.ContractID = c.ID().String()
 	res.Proof.AttemptID = uint32(attempt)
 	res.Proof.ParentContractID = c.ParentID().String()
+	res.Proof.ContextDigest = c.ContextDigest()
 	if anc := c.CausalAncestry(); len(anc) > 0 {
 		res.Proof.CausalAncestry = make([]string, 0, len(anc))
 		for _, id := range anc {
