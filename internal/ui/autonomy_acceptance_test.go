@@ -358,11 +358,7 @@ func TestAcceptanceCaseFMalformedHTMLEvidence(t *testing.T) {
 		t.Fatalf("autonomy intent = %s, want modification (mutation verb dominates inspection)", res.Intent)
 	}
 
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("expected gatedExecutionMsg, got %T", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("executor failed: %v", gem.err)
 	}

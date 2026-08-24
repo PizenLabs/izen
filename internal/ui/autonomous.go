@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/execution"
 )
 
 // ── PRODUCTION AUTONOMOUS DRIVER BRIDGE (Phase 6) ───────────────────────────
@@ -60,6 +61,8 @@ type autonomousDriver interface {
 	State() autonomy.RuntimeState
 	Boundary() *autonomy.HumanBoundary
 	Termination() *autonomy.LoopTermination
+	SetStreamCallback(cb execution.StreamCallback)
+	AggregatedUsage() (input, output int, known bool)
 }
 
 // autonomousRunMsg carries a driver Run/Resume/Abort outcome back into the
@@ -93,11 +96,54 @@ func (m *model) runAutonomousDriver(objective string) tea.Cmd {
 	m.beginOperation(OpAutonomous)
 	m.agentLabel = ""
 	m.startShimmer("", "autonomy")
-	ctx := m.operationContext()
-	return func() tea.Msg {
-		term, err := m.autonomousDriver.Run(ctx, objective)
-		return autonomousRunMsg{term: term, err: err}
+
+	// Set up executor streaming (same mechanism as $prompt/$hot gateway path)
+	m.execStreamCh = make(chan tea.Msg, 1024)
+	m.execStreaming = true
+	m.spinnerFrame = 0
+	m.startShimmer("Waiting for model...", "autonomy")
+
+	m.autonomousDriver.SetStreamCallback(func(ev execution.StreamEvent) {
+		ch := m.execStreamCh
+		if ch == nil {
+			return
+		}
+		switch ev.Kind {
+		case "first_token":
+			ch <- tokenMsg("")
+		case "content_delta":
+			if ev.Content != "" {
+				ch <- tokenMsg(ev.Content)
+			}
+		case "done":
+			ch <- streamDoneMsg{
+				content:        ev.Content,
+				tokenInput:     ev.Usage.PromptTokens,
+				tokenOutput:    ev.Usage.CompletionTokens,
+				usageEstimated: ev.Usage.Estimated,
+				truncated:      strings.EqualFold(strings.TrimSpace(ev.FinishReason), "length"),
+			}
+		case "error":
+			if ev.Err != nil {
+				ch <- streamErrMsg{err: ev.Err}
+			}
+		}
+	})
+
+	readerCmd := func() tea.Msg {
+		return m.readExecStream()
 	}
+
+	ctx := m.operationContext()
+	return tea.Batch(
+		readerCmd,
+		func() tea.Msg {
+			term, err := m.autonomousDriver.Run(ctx, objective)
+			return autonomousRunMsg{term: term, err: err}
+		},
+		m.smoothStreamTickCmd(),
+		m.shimmerTickCmd(),
+	)
 }
 
 // resumeAutonomousApprove approves the parked approval boundary. It first
@@ -190,12 +236,39 @@ func (m *model) autonomousParked() bool {
 // terminal outcome, and keeps the driver's loop state as the single truth.
 func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 	m.autonomousActive = false
+	// ── STREAMING TERMINALIZATION (spinner contract) ────────────────
+	// The autonomous streaming channel is terminalized here idempotently: every
+	// terminal/parked outcome clears the streaming state, stops the shimmer and
+	// marks the stage done so no spinner can survive the execution lifecycle.
+	m.execStreamCh = nil
+	if m.execStreaming {
+		m.execStreaming = false
+		m.stopShimmer()
+		m.setStage("model", m.getActiveModelName(), stageDone)
+	}
+	// Fetch aggregated authoritative usage from the driver (one count per logical invocation).
+	var aggIn, aggOut int
+	var aggKnown bool
+	if m.autonomousDriver != nil {
+		aggIn, aggOut, aggKnown = m.autonomousDriver.AggregatedUsage()
+	}
+	usageCmd := func() tea.Cmd {
+		if aggKnown {
+			return m.tokenUsageCmdKnown(aggIn, aggOut, true)
+		}
+		return nil
+	}
+
 	if msg.err != nil {
 		m.autonomousBoundary = nil
 		m.finalizeOperation(OpOutcomeFailure, msg.err)
 		m.push(roleError, "[autonomous] "+msg.err.Error())
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
+		cmd := usageCmd()
+		if cmd != nil {
+			return cmd
+		}
 		return nil
 	}
 
@@ -222,6 +295,11 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
+		cmd := usageCmd()
+		if cmd != nil {
+			// Even while parked, the provider usage of completed attempts is authoritative and must reach the footer.
+			return cmd
+		}
 		return nil
 	}
 
@@ -233,10 +311,19 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 	} else {
 		m.finalizeOperation(OpOutcomeFailure, nil)
 		m.push(roleError, "[autonomous] aborted — "+msg.term.Reason)
+		m.push(roleSystem, infoStyle.Render("Interrupted."))
 	}
+	// Restore interactive input for terminal autonomous runs.
+	m.ti.Focus()
+	m.recalcViewportHeight()
+	m.state = StateChat
 	m.resolveApprovalState()
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
+	cmd := usageCmd()
+	if cmd != nil {
+		return cmd
+	}
 	return nil
 }
 
@@ -246,6 +333,11 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 func (m *model) authorizeAutonomousApproval() error {
 	if m.executor == nil || m.authEngine == nil {
 		return nil
+	}
+	// Ensure workflow is in Building/Repairing state for authorization.
+	// Autonomous execution from /model mode starts in Planning; we must transition.
+	if err := m.transitionToBuilding(); err != nil {
+		return fmt.Errorf("workflow transition to building failed: %w", err)
 	}
 	b := m.autonomousBoundary
 	var targets []string

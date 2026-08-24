@@ -64,11 +64,7 @@ func TestConsistencyCase1_HiAnswerOnlyNoTimeline(t *testing.T) {
 	}
 
 	// Run the executor and project the result: the answer lands in the AI role.
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("got %T, want gatedExecutionMsg", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("conversation execution failed: %v", gem.err)
 	}
@@ -181,11 +177,7 @@ func TestConsistencyCase3_MutationOnlyAfterApproval(t *testing.T) {
 	}
 
 	// ── 1. The runtime runs and stops at the approval gate ─────────────
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("got %T, want gatedExecutionMsg", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("execution failed: %v", gem.err)
 	}

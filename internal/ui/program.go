@@ -310,6 +310,13 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 	// derived UI-state projection (presentation.WorkflowViewState): the
 	// AwaitingApproval/Processing presentation states are a pure function of
 	// the canonical workflow state, never independent UI flags.
+	//
+	// ProviderStreamDelta events are throttled through a coalescer (Phase 7
+	// P3): the UI event loop must never be flooded by per-chunk stream deltas,
+	// or the ~100ms spinner frames get starved and the UI freezes. Every other
+	// event type is an authoritative barrier that passes through unchanged.
+	co := newStreamCoalescer(p.Send, uiStreamCoalesceInterval)
+
 	for _, typ := range []string{
 		events.EventPatchAttempted,
 		events.EventEngineTelemetry,
@@ -348,9 +355,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		events.EventLoopTransition,
 		events.EventContextCompiled,
 	} {
-		eventBus.Subscribe(typ, func(ev events.DomainEvent) {
-			p.Send(domainEventMsg{ev: ev})
-		})
+		eventBus.Subscribe(typ, co.Accept)
 	}
 
 	return p

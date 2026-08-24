@@ -78,14 +78,16 @@ const (
 	OutcomePatchGenerationFailed MutationOutcome = "patch_failed"
 	// OutcomeArtifactRejected is the terminal outcome of an execution whose
 	// model output produced an artifact that FAILED the artifact validation
-	// boundary (malformed HTML/JSON/Go, raw patch markers, truncated content).
+	// boundary with an abort decision (malformed HTML/JSON/Go, raw patch markers).
 	// It is distinct from OutcomePatchGenerationFailed: an artifact existed but
 	// was rejected before any approval or mutation surface.
-	OutcomeArtifactRejected MutationOutcome = "artifact_rejected"
-	OutcomeApplyFailed      MutationOutcome = "apply_failed"
-	OutcomeVerifyFailed     MutationOutcome = "verify_failed"
-	OutcomeSkipped          MutationOutcome = "skipped"
-	OutcomeCancelled        MutationOutcome = "cancelled"
+	OutcomeArtifactRejected          MutationOutcome = "artifact_rejected"
+	OutcomeArtifactRetryableRejected MutationOutcome = "artifact_retryable_rejected"
+	OutcomeTruncated                 MutationOutcome = "truncated"
+	OutcomeApplyFailed               MutationOutcome = "apply_failed"
+	OutcomeVerifyFailed              MutationOutcome = "verify_failed"
+	OutcomeSkipped                   MutationOutcome = "skipped"
+	OutcomeCancelled                 MutationOutcome = "cancelled"
 	// OutcomePendingApproval is the outcome of a targeted mutation that stopped
 	// at the human-in-the-loop approval gate with a valid held artifact. It is
 	// NEVER a terminal mutation outcome — the execution is paused, awaiting a
@@ -121,6 +123,10 @@ func (o MutationOutcome) Display() string {
 		return "patch generation failed"
 	case OutcomeArtifactRejected:
 		return "artifact rejected"
+	case OutcomeArtifactRetryableRejected:
+		return "artifact retryable rejected"
+	case OutcomeTruncated:
+		return "truncated"
 	case OutcomeApplyFailed:
 		return "apply failed"
 	case OutcomeVerifyFailed:
@@ -205,6 +211,10 @@ func ParseMutationOutcome(s string) MutationOutcome {
 		return OutcomePatchGenerationFailed
 	case "artifact_rejected", "artifact-rejected", "artifact rejected":
 		return OutcomeArtifactRejected
+	case "artifact_retryable_rejected", "artifact-retryable-rejected", "artifact retryable rejected":
+		return OutcomeArtifactRetryableRejected
+	case "truncated", "output_truncated", "output truncated":
+		return OutcomeTruncated
 	case "apply_failed", "apply-failed", "apply failed":
 		return OutcomeApplyFailed
 	case "verify_failed", "verify-failed", "verify failed":

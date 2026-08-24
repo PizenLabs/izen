@@ -374,7 +374,7 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 				// to the reasoning handler — they must never appear in the
 				// visible response.
 				if part.Thought {
-					s.usage.recordOutput(len(part.Text))
+					s.usage.recordReasoning(len(part.Text))
 					if s.reasoningHandler != nil {
 						if err := s.reasoningHandler(part.Text); err != nil {
 							s.closed = true

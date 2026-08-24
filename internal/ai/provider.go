@@ -77,6 +77,17 @@ type ProviderUsage struct {
 	// authoritative usage chunk was observed. Callers must treat estimated
 	// counts as approximate, never as provider truth.
 	Estimated bool `json:"estimated,omitempty"`
+	// HTTPAttempts is the number of transport attempts this single LOGICAL
+	// invocation made (1 + every retry). Retry forensics: one model
+	// invocation may span multiple HTTP round-trips (429 backoff, 400
+	// reasoning-schema retry) — a rate-limited free-tier build that recovers
+	// still counts as ONE invocation, and 429 responses carry no billed
+	// tokens unless the retried 200 reports usage.
+	HTTPAttempts int `json:"http_attempts,omitempty"`
+	// RateLimitedRetries is the number of those attempts that were HTTP 429
+	// rate-limit retries. Combined with HTTPAttempts it lets consumers
+	// distinguish transport retries from a genuinely re-invoked model call.
+	RateLimitedRetries int `json:"rate_limited_retries,omitempty"`
 }
 
 // Empty reports whether the usage record carries no known provider usage.

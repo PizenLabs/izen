@@ -186,11 +186,7 @@ func TestBuildHotAutonomyAutoContinue(t *testing.T) {
 	if got := m.resolver.Current(); got != modes.ModeBuild {
 		t.Fatalf("workspace = /%s, want /build", got)
 	}
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("authorized hotfix must route through the executor (gatedExecutionMsg), got %T", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("executor failed: %v", gem.err)
 	}
@@ -234,11 +230,7 @@ func TestAutonomyModificationProposalRedundancyEvidence(t *testing.T) {
 	if m.pendingAutonomyProposal != nil {
 		t.Fatal("authorized mutation must not render a proposal")
 	}
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("authorized hotfix must route through the executor (gatedExecutionMsg), got %T", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("executor failed: %v", gem.err)
 	}

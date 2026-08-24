@@ -67,11 +67,7 @@ func TestConversationFlowRendersAnswerOnly(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("conversation dispatch returned nil command")
 	}
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("got %T, want gatedExecutionMsg", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	if gem.err != nil {
 		t.Fatalf("conversation execution failed: %v", gem.err)
 	}
@@ -113,11 +109,7 @@ func TestGatedExecutionDoesNotLeakRuntimeConcepts(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("dispatch returned nil command")
 	}
-	msg := cmd()
-	gem, ok := msg.(gatedExecutionMsg)
-	if !ok {
-		t.Fatalf("got %T, want gatedExecutionMsg", msg)
-	}
+	gem := extractGatedExecutionMsg(t, cmd)
 	res, _ := m.executionResultUpdate(executionResultMsg{res: gem.res})
 	_ = res
 	joined := recordsText(m)

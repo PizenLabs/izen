@@ -81,9 +81,19 @@ func TestGatedExecutionCtrlCCancelsProviderCall(t *testing.T) {
 		t.Fatal("gated execution must bind an active operation")
 	}
 
+	// The drain goroutine must not call t.Fatalf (testinggoroutine): it
+	// reports "not found" through the channel and the test goroutine asserts.
 	done := make(chan gatedExecutionMsg, 1)
+	failure := make(chan struct{}, 1)
 	go func() {
-		done <- cmd().(gatedExecutionMsg)
+		msgs := drainCmds(t, cmd)
+		for _, mm := range msgs {
+			if gem, ok := mm.(gatedExecutionMsg); ok {
+				done <- gem
+				return
+			}
+		}
+		failure <- struct{}{}
 	}()
 	<-prov.started
 
@@ -92,18 +102,22 @@ func TestGatedExecutionCtrlCCancelsProviderCall(t *testing.T) {
 	m.handleEmergencyInterrupt("ctrl-c test")
 	<-prov.cancelled
 
-	msg := <-done
-	if msg.res == nil {
-		t.Fatal("nil execution result after cancellation")
-	}
-	if msg.res.Err != nil {
-		t.Fatalf("cancelled execution returned err = %v, want nil (clean cancellation)", msg.res.Err)
-	}
-	if msg.res.Proof == nil || msg.res.Proof.Outcome != execution.OutcomeCancelled {
-		t.Fatalf("proof outcome = %+v, want %s", msg.res.Proof, execution.OutcomeCancelled)
-	}
-	if msg.res.PendingPatchID != "" {
-		t.Fatal("cancelled execution must not reach the approval gate")
+	select {
+	case <-failure:
+		t.Fatal("no gatedExecutionMsg found in command result")
+	case msg := <-done:
+		if msg.res == nil {
+			t.Fatal("nil execution result after cancellation")
+		}
+		if msg.res.Err != nil {
+			t.Fatalf("cancelled execution returned err = %v, want nil (clean cancellation)", msg.res.Err)
+		}
+		if msg.res.Proof == nil || msg.res.Proof.Outcome != execution.OutcomeCancelled {
+			t.Fatalf("proof outcome = %+v, want %s", msg.res.Proof, execution.OutcomeCancelled)
+		}
+		if msg.res.PendingPatchID != "" {
+			t.Fatal("cancelled execution must not reach the approval gate")
+		}
 	}
 	// The operation was released: no active operation survives the cancel.
 	if m.activeOp != nil {

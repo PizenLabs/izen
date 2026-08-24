@@ -517,6 +517,20 @@ func (m *model) readStream() tea.Cmd {
 	}
 }
 
+// readExecStream reads from the executor streaming channel (used by $prompt/$hot).
+func (m *model) readExecStream() tea.Cmd {
+	return func() tea.Msg {
+		if m.execStreamCh == nil {
+			return nil
+		}
+		msg, ok := <-m.execStreamCh
+		if !ok {
+			return nil
+		}
+		return msg
+	}
+}
+
 // greetingResponses provides variety when responding to a first-turn greeting.
 var greetingResponses = []string{
 	"Hello %s! How can I assist you today?",

@@ -17,19 +17,23 @@ import (
 	"github.com/PizenLabs/izen/internal/execution"
 )
 
-// mockProvider implements ai.Provider for adapter/driver tests.
+// mockProvider implements ai.Provider for adapter/driver tests. It records
+// every ai.Request so tests can assert the ACTUAL contract sent to the model
+// (system prompt, user message, max tokens) — not just recovery metadata.
 type mockProvider struct {
 	mu        sync.Mutex
 	responses []*ai.Response
 	callCount int
+	requests  []ai.Request
 }
 
 func (m *mockProvider) Name() string { return "mock" }
 
-func (m *mockProvider) Execute(_ context.Context, _ ai.Request) (*ai.Response, error) {
+func (m *mockProvider) Execute(_ context.Context, req ai.Request) (*ai.Response, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.callCount++
+	m.requests = append(m.requests, req)
 	if m.callCount > len(m.responses) {
 		return nil, fmt.Errorf("unexpected call #%d", m.callCount)
 	}
@@ -45,6 +49,14 @@ func (m *mockProvider) calls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.callCount
+}
+
+// recordedRequests returns the ai.Request contract of every invocation,
+// oldest first.
+func (m *mockProvider) recordedRequests() []ai.Request {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]ai.Request(nil), m.requests...)
 }
 
 // blockingProvider waits for ctx cancellation inside Execute so a test can

@@ -23,7 +23,13 @@ type streamUsageTracker struct {
 	totalTokens      int
 	hasAuthoritative bool
 	outputChars      int
+	reasoningChars   int
 	interrupted      bool
+	// httpAttempts counts every transport round-trip a single logical
+	// invocation performed (Phase 7 P5 retry forensics: 429 backoff and the
+	// 400 reasoning-schema retry add attempts, never new invocations).
+	httpAttempts       int
+	rateLimitedRetries int
 
 	// RequestStartedAt is set by the provider when the request is dispatched;
 	// FirstTokenAt is latched on the first emitted output byte; CompletedAt is
@@ -72,8 +78,20 @@ func (t *streamUsageTracker) recordOutputTokens(n int) {
 	t.hasAuthoritative = true
 }
 
-// recordOutput accumulates streamed output characters (content + reasoning)
-// that were emitted to the consumer, and latches the first-token timestamp.
+// recordTransport surfaces retry forensics on the usage record (Phase 7 P5):
+// attempts is the total HTTP round-trips the single logical invocation made,
+// rateLimitedRetries how many of them were 429 rate-limit retries. This lets
+// consumers distinguish "the provider recovered from transient throttling
+// inside ONE invocation" from "the model was invoked N times".
+func (t *streamUsageTracker) recordTransport(attempts, rateLimitedRetries int) {
+	t.httpAttempts = attempts
+	t.rateLimitedRetries = rateLimitedRetries
+}
+
+// recordOutput accumulates streamed OUTPUT content characters that were emitted
+// to the consumer (Phase 7 P6: reasoning characters are accounted separately
+// via recordReasoning and must never inflate the output-char estimate). It
+// latches the first-token timestamp.
 func (t *streamUsageTracker) recordOutput(n int) {
 	if n <= 0 {
 		return
@@ -82,6 +100,21 @@ func (t *streamUsageTracker) recordOutput(n int) {
 		t.firstTokenAt = time.Now()
 	}
 	t.outputChars += n
+}
+
+// recordReasoning accumulates streamed REASONING characters separately from the
+// visible output content (Phase 7 P6). Providers may include reasoning tokens
+// inside completion/output usage, so they are part of billed provider usage
+// when reported; the character estimate keeps them separate only to avoid
+// inventing visible-output tokens from hidden reasoning text.
+func (t *streamUsageTracker) recordReasoning(n int) {
+	if n <= 0 {
+		return
+	}
+	if t.firstTokenAt.IsZero() {
+		t.firstTokenAt = time.Now()
+	}
+	t.reasoningChars += n
 }
 
 // markInterrupted flags a non-EOF stream termination (e.g. context deadline).
@@ -107,10 +140,12 @@ func (t *streamUsageTracker) markCompleted(now time.Time, finishReason string) {
 // returns Known=false.
 func (t *streamUsageTracker) Usage() ai.ProviderUsage {
 	u := ai.ProviderUsage{
-		RequestStartedAt: t.requestStartedAt,
-		FirstTokenAt:     t.firstTokenAt,
-		CompletedAt:      t.completedAt,
-		FinishReason:     t.finishReason,
+		RequestStartedAt:   t.requestStartedAt,
+		FirstTokenAt:       t.firstTokenAt,
+		CompletedAt:        t.completedAt,
+		FinishReason:       t.finishReason,
+		HTTPAttempts:       t.httpAttempts,
+		RateLimitedRetries: t.rateLimitedRetries,
 	}
 	if t.hasAuthoritative {
 		u.Known = true
