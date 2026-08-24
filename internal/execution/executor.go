@@ -90,6 +90,16 @@ type ExecuteRequest struct {
 	// the runtime selects it itself. It is the single source of the execution
 	// path decision — never a mode.
 	Strategy *strategy.ExecutionStrategyProfile
+	// Context is the frozen, integrity-sealed execution context snapshot
+	// created at intent time (IntentGateway.Gate). Admission verifies the seal
+	// and its binding to this request's declared context fields BEFORE any
+	// execution stage runs: a snapshot that was modified mid-flight — or a
+	// request whose prompt/targets/evidence diverge from the frozen payload —
+	// fails closed with ErrContextIntegrity. When nil (direct callers that
+	// bypassed the gateway), admission freezes the context fresh from this
+	// request's own declared fields; middleware can never rebuild or substitute
+	// prompt context after that point.
+	Context *ContextSnapshot
 	// ── Autonomy handoff (Phase 1 Step 6) ─────────────────────────────
 	// These fields carry the autonomy decision metadata so an already
 	// classified intent is never re-classified downstream and the decision
@@ -180,13 +190,25 @@ type ExecutionProof struct {
 	// autonomy decision handoff (Phase 1 Step 6): the execution proof carries
 	// the classified intent and its confidence so the runtime never loses the
 	// decision facts between autonomy and execution.
-	Intent           string          `json:"intent,omitempty"`
-	IntentConfidence float64         `json:"intent_confidence,omitempty"`
-	TargetConfidence float64         `json:"target_confidence,omitempty"`
-	Scope            string          `json:"scope,omitempty"`
-	Outcome          MutationOutcome `json:"outcome"`
-	StartedAt        time.Time       `json:"started_at"`
-	FinishedAt       time.Time       `json:"finished_at"`
+	Intent           string  `json:"intent,omitempty"`
+	IntentConfidence float64 `json:"intent_confidence,omitempty"`
+	TargetConfidence float64 `json:"target_confidence,omitempty"`
+	Scope            string  `json:"scope,omitempty"`
+	// RiskScope records the deterministic blast-radius tier the admission
+	// evaluator assigned to the intent (Phase 1 P1). Empty when execution was
+	// rejected before evaluation completed.
+	RiskScope string `json:"risk_scope,omitempty"`
+	// ContextID / ContextDigest / ContextParentID record the verified context
+	// lineage of the execution: which frozen snapshot the executor ran under,
+	// its sealed digest and its causal ancestor. Callers cannot inject or
+	// rebuild prompt context mid-execution — the proof names the exact payload
+	// that crossed.
+	ContextID       string          `json:"context_id,omitempty"`
+	ContextDigest   string          `json:"context_digest,omitempty"`
+	ContextParentID string          `json:"context_parent_id,omitempty"`
+	Outcome         MutationOutcome `json:"outcome"`
+	StartedAt       time.Time       `json:"started_at"`
+	FinishedAt      time.Time       `json:"finished_at"`
 }
 
 // ContextDecision is one strategy-owned context decision recorded in the
@@ -295,14 +317,15 @@ type pendingMutation struct {
 
 // RuntimeExecutor is the runtime-owned execution boundary.
 type RuntimeExecutor struct {
-	root     string
-	cfg      *config.Config
-	provider ai.Provider
-	bus      *events.Bus
-	langID   language.ID
-	patches  *PatchManager
-	verifier *Verifier
-	auth     *authorization.MutationAuthorization
+	root      string
+	cfg       *config.Config
+	provider  ai.Provider
+	bus       *events.Bus
+	langID    language.ID
+	patches   *PatchManager
+	verifier  *Verifier
+	auth      *authorization.MutationAuthorization
+	admission *AdmissionGateway
 
 	mu      sync.Mutex
 	pending map[string]*pendingMutation
@@ -318,13 +341,14 @@ type RuntimeExecutor struct {
 // still resolves deterministic strategies without a provider).
 func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, bus *events.Bus, langID language.ID) *RuntimeExecutor {
 	x := &RuntimeExecutor{
-		root:     root,
-		cfg:      cfg,
-		provider: provider,
-		bus:      bus,
-		langID:   langID,
-		patches:  NewPatchManager(root),
-		pending:  make(map[string]*pendingMutation),
+		root:      root,
+		cfg:       cfg,
+		provider:  provider,
+		bus:       bus,
+		langID:    langID,
+		patches:   NewPatchManager(root),
+		admission: NewAdmissionGateway(nil),
+		pending:   make(map[string]*pendingMutation),
 	}
 	if langID != "" {
 		x.verifier = NewLanguageVerifier(root, langID)
@@ -332,6 +356,21 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 		x.verifier = NewVerifier(root)
 	}
 	return x
+}
+
+// SetAdmittedCapabilities replaces the capability set the runtime's admission
+// boundary checks every intent against (test seam / runtime re-granting). A
+// nil set restores StandardAdmittedCapabilities. Grants are never escalated
+// implicitly: an intent evaluated beyond the admitted scope is rejected at
+// admission and must be re-submitted.
+func (x *RuntimeExecutor) SetAdmittedCapabilities(caps *AdmittedCapabilities) {
+	x.admission.SetCapabilities(caps)
+}
+
+// AdmittedCapabilities returns the currently admitted capability surface
+// (observability).
+func (x *RuntimeExecutor) AdmittedCapabilities() AdmittedCapabilities {
+	return x.admission.Capabilities()
 }
 
 // SetVerifier overrides the attached verifier (test seam / config wiring).
@@ -496,6 +535,29 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	g.Start(req.Mode, req.Prompt)
 	g.CompleteUserIntent()
 
+	// ── ADMISSION I: CONTEXT FIDELITY (Phase 1 P1) ───────────────────
+	// The intent's frozen context snapshot must still match its sealed digest
+	// AND bind to the request's declared context fields. Any mid-flight
+	// modification between caller submission and this boundary fails closed
+	// here — before strategy selection, before any read, before anything.
+	snapshot, ctxErr := verifyIntentContext(req, x.root)
+	if ctxErr != nil {
+		err := fmt.Errorf("executor: admission rejected request %s: %w", requestID, ctxErr)
+		g.FailExecution(events.FailurePermanent, err, "executor.admission")
+		res.Err = err
+		res.Proof.Outcome = OutcomeFailed
+		res.Proof.FinishedAt = time.Now()
+		setProofGraph(res, g)
+		return x.finalizeResult(res), err
+	}
+	// The verified (or freshly synthesized) snapshot is the authoritative
+	// context of THIS execution and is carried forward on the request so no
+	// downstream stage can rebuild or substitute prompt context.
+	req.Context = snapshot
+	res.Proof.ContextID = snapshot.ID
+	res.Proof.ContextDigest = snapshot.Digest()
+	res.Proof.ContextParentID = snapshot.Parent
+
 	// ── 1. Strategy selection ──────────────────────────────────────────
 	profile, err := x.selectStrategy(ctx, req)
 	if err != nil {
@@ -512,6 +574,26 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	res.Proof.StrategyReason = profile.StrategyReason
 	res.Proof.ContextDecisions = contextDecisions(profile)
 	g.CompleteStrategy(res.Strategy, profile.ModelRequired, profile.StrategyReason)
+
+	// ── ADMISSION II: RISK SCOPE GATING (Phase 1 P1) ──────────────────
+	// The intent's blast radius is evaluated deterministically from the
+	// selected strategy and the declared targets, then checked against the
+	// admitted capabilities BEFORE any execution stage that could act on the
+	// world. Out-of-scope intents are rejected here — never escalated
+	// implicitly.
+	decision, admitErr := x.admission.Admit(req, x.root, profile)
+	if admitErr != nil {
+		err := fmt.Errorf("executor: admission rejected request %s: %w", requestID, admitErr)
+		g.FailExecution(events.FailurePermanent, err, "executor.admission")
+		res.Err = err
+		res.Proof.RiskScope = decision.Requested.String()
+		res.Proof.Outcome = OutcomeFailed
+		res.Proof.FinishedAt = time.Now()
+		setProofGraph(res, g)
+		return x.finalizeResult(res), err
+	}
+	req.Context = decision.Snapshot
+	res.Proof.RiskScope = decision.Requested.String()
 
 	// ── 2. Target resolution ───────────────────────────────────────────
 	targets := req.Targets
