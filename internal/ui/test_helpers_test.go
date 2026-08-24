@@ -61,9 +61,9 @@ func (s *mockStream) Read(p []byte) (int, error) {
 	s.pos += n
 	return n, nil
 }
-func (s *mockStream) Close() error { return nil }
+func (s *mockStream) Close() error            { return nil }
 func (s *mockStream) Usage() ai.ProviderUsage { return s.usage }
-func (s *mockStream) FinishReason() string { return s.usage.FinishReason }
+func (s *mockStream) FinishReason() string    { return s.usage.FinishReason }
 
 func (m *mockProvider) ExecuteStream(_ context.Context, req ai.Request) (io.ReadCloser, error) {
 	if m.callCount >= len(m.responses) {

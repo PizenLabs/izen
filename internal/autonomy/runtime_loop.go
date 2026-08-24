@@ -177,7 +177,7 @@ type Observation struct {
 	TokenUsage int
 	// InputTokens / OutputTokens are the authoritative provider-reported
 	// input/output counts for this observation (split for aggregate truth).
-	InputTokens int
+	InputTokens  int
 	OutputTokens int
 	// UsageKnown reports whether the provider reported authoritative usage for
 	// this observation.

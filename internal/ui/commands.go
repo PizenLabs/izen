@@ -275,17 +275,18 @@ func (m *model) handleInput(line string) tea.Cmd {
 			return tea.Batch(m.handleMessageContent(content), switchCmd)
 		}
 		if mode == modes.ModeReview {
-			m.setMode(mode)
-			m.push(roleSystem, infoStyle.Render("Running review pipeline..."))
-			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
 			// ── FAST-PATH EARLY EXIT: CLEAN WORKING TREE ────────────────────
-			// A full-diff /review on a clean tree has nothing to audit. Report
-			// it immediately and reset every processing flag WITHOUT starting
-			// the async pipeline or its spinner — the "Processing file
-			// mutations..." animation must never appear for a run that will
-			// perform zero mutations.
+			// Probe BEFORE any mode-switch side effects: setMode persists the
+			// session to .izen/session.json inside the workspace, which would
+			// itself mark an otherwise pristine tree dirty (untracked .izen/)
+			// and defeat this exact check on machines without a global git
+			// exclude for .izen/. A full-diff /review on a clean tree has
+			// nothing to audit — report it immediately and reset every
+			// processing flag WITHOUT starting the async pipeline or its
+			// spinner; the "Processing file mutations..." animation must never
+			// appear for a run that will perform zero mutations.
 			if rev := review.NewEngine(".", nil, nil); rev.IsCleanWorkingTree() {
+				m.setMode(mode)
 				m.push(roleSystem, infoStyle.Render("no changes to review — working tree is clean"))
 				m.reviewRunning = false
 				m.agentRunning = false
@@ -301,6 +302,10 @@ func (m *model) handleInput(line string) tea.Cmd {
 				// started" to the caller.
 				return nil
 			}
+			m.setMode(mode)
+			m.push(roleSystem, infoStyle.Render("Running review pipeline..."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
 			return tea.Batch(m.runReviewCmd(""), switchCmd)
 		}
 		// ── AUTO-TRIGGER /build EXECUTION ──────────────────────
