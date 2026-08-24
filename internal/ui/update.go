@@ -1189,17 +1189,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// /build invocations see them blocked rather than silently
 		// advancing into corrupted state.
 		if msg.exitCode != 0 {
-			// ── ROLLBACK ON FAILURE ─────────────────────────────────
-			// Any disk mutations performed during this build execution
-			// are rolled back so the workspace is never left in a broken
-			// state. The transaction is then reset for the next attempt.
-			if m.execEng != nil {
-				if errs := m.execEng.RollbackTransaction(); len(errs) > 0 {
-					for _, err := range errs {
-						m.push(roleError, fmt.Sprintf("build rollback error: %v", err))
-					}
-				}
-			}
+			// ── ROLLBACK AUTHORITY ──────────────────────────────────
+			// Rollback authority is owned by the RuntimeExecutor boundary:
+			// its MutationSet restores shadow backups inside Approve/Reject.
+			// The UI records the halt state only.
 			// ── CLEAR DIALOG BUFFER ON TASK FAILURE ────────────────
 			// Wipe the LLM conversation history so the next diagnostic
 			// or restart prompt starts with a clean context scope, never
@@ -1599,13 +1592,6 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.awaitingConfirmation = false
 			m.acceptAll = false
 			if msg.err == nil {
-				// ── COMMIT TRANSACTION ─────────────────────────────────
-				// All mutations approved and applied — clear the snapshot
-				// so the workspace is no longer pinned to the rollback point.
-				if m.execEng != nil {
-					m.execEng.CommitTransaction()
-				}
-
 				outcomeLine := fmt.Sprintf("%s %s • %s", successBannerStyle.Render("[✓]"), msg.file, msg.status)
 				// ── REAL DIFF EVIDENCE (Phase 4) ──────────────────────────
 				// When the runtime captured the compiled diff metrics, surface them
@@ -1746,12 +1732,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		var testCmd tea.Cmd
 		switch {
 		case applied > 0 && failed == 0:
-			// ── COMMIT TRANSACTION ─────────────────────────────────
-			// All mutations approved and applied — clear the snapshot.
-			if m.execEng != nil {
-				m.execEng.CommitTransaction()
-			}
-
+			// Transaction commit authority is owned by the RuntimeExecutor
+			// approval boundary — no UI-owned commit runs here.
 			summary := fmt.Sprintf("%s %d file(s) mutated. Checkpoint created.", successBannerStyle.Render("[✓]"), applied)
 			m.push(roleSystem, summary)
 			m.createBuildCheckpoint(applied)

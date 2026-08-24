@@ -1540,16 +1540,6 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	m.sess.SetMode(mode)
 	_ = m.sess.Save()
 
-	// ── VIRTUAL SNAPSHOT STAGING ───────────────────────────────────────
-	// On every mode switch that may involve file mutations, begin a fresh
-	// virtual transaction. This snapshots the current workspace state so that
-	// if the user rejects a proposal or a build fails, all disk mutations can
-	// be instantly rolled back to this point. The transaction is committed
-	// only on explicit user approval (Alt+A / Alt+L).
-	if m.execEng != nil && (mode == modes.ModeBuild || mode == modes.ModeInvestigate || mode == modes.ModePlan || mode == modes.ModeReview) {
-		m.execEng.BeginTransaction()
-	}
-
 	// ── SILENT MODE TRANSITION ────────────────────────────────────────
 	// Mode switches must not spam the conversation viewport. The active
 	// prompt indicator ("plan )" / "build )") is updated by startModeTransition
@@ -2364,9 +2354,10 @@ func (m *model) findFailedBuildTask() int {
 
 // amendBuildTask resets a failed/stalled task to "idle", appends the user's
 // feedback to its description, saves the updated task list, and re-executes
-// the task with the amendment as additional context. This replaces the old
-// behavior of stubbornly re-running the exact same failed command with no
-// opportunity for the user to provide corrective input.
+// the task with the amendment as additional context. The amended task is an
+// intent only: re-execution crosses the single admission boundary via
+// handleBuildRun → dispatchStagedTask (RuntimeExecutor / shell gate) — never
+// a caller-side mutation path.
 func (m *model) amendBuildTask(stepNum int, feedback string) tea.Cmd {
 	tasks := m.sess.CurrentTasks
 	for i := range tasks {
@@ -2497,22 +2488,17 @@ func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 	}
 }
 
-// buildFirstTokenDirective returns the format-forced first-token instruction
-// for a build task, chosen by the target file's on-disk state:
+// handleBuildRun is the /build queue driver and a pure intent producer. It
+// selects the next staged task, performs session-ledger bookkeeping, and
+// submits the task across the single execution admission boundary:
 //
-//   - existing, non-empty file -> a SEARCH/REPLACE block or unified diff
-//   - new or 0-byte file       -> a complete-file markdown code block
+//	FILE_MUTATE / GIT_ACTION → runRuntimeTaskRequest → RuntimeExecutor.Execute
+//	SHELL_EXEC               → runStagedShellGate    → interactive approval
 //
-// Forcing a patch format onto a non-existent file makes small models loop on a
-// missing "old content" anchor until the request times out; the new-file
-// branch must always permit full content generation instead.
-func buildFirstTokenDirective(target string) string {
-	if data, err := os.ReadFile(target); err == nil && len(data) > 0 {
-		return "A SEARCH/REPLACE BLOCK (<<<<<<< SEARCH) OR A UNIFIED DIFF (--- a/ ... +++ b/ ...) for the existing file."
-	}
-	return "THE OPENING ``` FENCE OF A COMPLETE-FILE MARKDOWN CODE BLOCK (or a FILE: <path> header) containing the FULL new file content. Do NOT use SEARCH/REPLACE or unified diff — the file does not exist yet."
-}
-
+// It owns no provider invocation, no patch creation or application, no
+// workspace writes, and no execution-engine transactions. Every workspace
+// mutation is executed by the RuntimeExecutor; every OS command crosses the
+// interactive shell gate.
 func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// Transition workflow state to Building before any execution
 	// begins. If the transition fails (e.g. missing plan guards
@@ -2522,7 +2508,19 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 		m.push(roleError, fmt.Sprintf("[BUILD HALTED] Workflow state transition failed: %v", err))
 		return nil
 	}
+	targetTask := m.beginStagedTask(stepNum)
+	if targetTask == nil {
+		return nil
+	}
+	return m.dispatchStagedTask(targetTask)
+}
 
+// beginStagedTask selects the staged /build task to execute — stepNum > 0
+// pins an explicit step, otherwise the first idle task is taken — marks it
+// processing in the live session ledger and records the per-task
+// bookkeeping. It returns nil (after surfacing the reason) when nothing is
+// executable right now.
+func (m *model) beginStagedTask(stepNum int) *plan.Task {
 	tasks := m.sess.CurrentTasks
 	if len(tasks) == 0 {
 		m.push(roleStatus, "no tasks staged — use /plan first")
@@ -2572,35 +2570,9 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// The concrete mutation target was resolved and selected — a real stage.
 	m.setStage("target", targetTask.Target, stageDone)
 
-	// Strategy-aware first-token instruction: never force a SEARCH/REPLACE
-	// patch onto a file that does not exist yet. For new/0-byte targets the
-	// model must emit the complete file content instead — forcing a patch
-	// format on a non-existent file makes small models loop on a missing
-	// "old content" anchor until the request times out.
-	content := fmt.Sprintf(
-		"EXECUTION MODE — implement ONLY this task. "+
-			"ZERO conversational text, ZERO explanations, ZERO greetings, ZERO summaries.\n"+
-			"YOUR FIRST OUTPUT TOKEN MUST BE %s\n"+
-			"Do NOT output JSON, do NOT restate the plan, do NOT list other tasks.\n"+
-			"Do NOT ask questions, do NOT ask for clarification, do NOT acknowledge.\n\n"+
-			"Step %d: %s\nTarget: %s\nDescription: %s",
-		buildFirstTokenDirective(targetTask.Target),
-		targetTask.StepNum, targetTask.Type, targetTask.Target, targetTask.Description)
-
-	if m.graph != nil {
-		compressor := retrieval.NewContextCompressorFromGraph(m.graph, m.sess.ObjectiveIntent())
-		compressed := compressor.CompressLines(content)
-		if compressed != "" && compressed != content {
-			content = retrieval.FormatCompressedFrame(compressed) + "\n\n" + content
-		}
-		g := m.graph
-		go retrieval.BuildGlobalCompressor(g, m.sess.ObjectiveIntent())
-	}
-
-	m.responseBuffer.Reset()
-
-	// Bridge the live /plan task ledger into the execution engine: the patch
-	// manager marks task Completed and renders the build summary on commit.
+	// Bridge the live /plan task ledger into the session bookkeeping so the
+	// terminal-result projections mark task completion on authoritative
+	// execution evidence emitted by the RuntimeExecutor.
 	if m.buildLedger == nil {
 		m.buildLedger = ctxpkg.NewTaskLedger()
 	}
@@ -2608,81 +2580,63 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// Per-task execution invalidates any prior fast-track coverage state so a
 	// mixed fast-track/per-task session never mis-detects full coverage.
 	m.fastTrackTargets = nil
-	m.execEng.Patches.SetLedger(m.buildLedger)
-	m.execEng.Patches.SetContextID(m.sess.ContextID)
+	return targetTask
+}
 
-	// ── SHELL_EXEC: INTERACTIVE APPROVAL GATE ──────────────────────────
-	// CRITICAL SECURITY CONSTRAINT: Every SHELL_EXEC command requires
-	// explicit human approval before it reaches the OS shell. A dedicated
-	// visual "Permission Required" box is rendered in the proposal dock,
-	// with single-character key bindings:
-	//   [y] Allow Once    [a] Allow Always    [n] Reject
-	// If the user previously selected "Allow Always" (m.pendingBuildAllowAlways),
-	// the gate is bypassed for the remainder of the session.
-	if targetTask.Type == "SHELL_EXEC" {
-		// ── Allow Always bypass ────────────────────────────────────────
-		if m.pendingBuildAllowAlways {
-			return tea.Batch(
-				func() tea.Msg { return agentStartMsg{label: "shell exec"} },
-				m.runBuildShellExec(targetTask),
-				m.smoothStreamTickCmd(),
-			)
-		}
-
-		// Render the visual permission box via the proposal dock (view layer).
-		m.pendingBuildApproval = true
-		m.pendingBuildTask = targetTask
-		m.enterApprovalState()
-		m.ti.Blur()
-		m.recalcViewportHeight()
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
-		return nil
-	}
-
-	// ── FILE_MUTATE / GIT_ACTION: generate a patch for human approval ────
-	// These tasks mutate the workspace. /build MUST NOT apply any mutation
-	// without explicit human sign-off. The patch is generated by the LLM in a
-	// non-streaming call and returned as buildProposalReadyMsg, which freezes
-	// the pipeline in StateAwaitingApproval and renders a unified diff for
-	// explicit authorization (Alt+A / Alt+L / Alt+R).
-	//
-	// OPERATION LIFECYCLE: every provider-invoking branch below registers the
-	// execution as the single authoritative foreground operation (OpBuild) on
-	// the UI goroutine BEFORE the patch-generation command is dispatched. This
-	// (1) gives Ctrl+C a single cancellation handle into the provider call —
-	// proposeBuildPatch / proposeHybridTemplatePatch derive their request
-	// context from m.operationContext(), so handleEmergencyInterrupt's
-	// activeOp.Cancel() releases the blocked HTTP call immediately instead of
-	// leaving the UI stuck on "Processing file mutations" until the 5-minute
-	// buildGenerationTimeout expires — and (2) enforces single-ownership: a
-	// duplicate dispatch supersedes (cancels) any previous build operation
-	// rather than running two overlapping execution loops. The operation is
-	// finalized by the terminal buildProposalReadyMsg / mutationResultMsg
-	// handlers via finalizeBuildOperation. The deterministic branches below
-	// (trivial template, stdlib fix) perform zero provider work and run under
-	// their own strict apply deadline, so they need no operation.
-	// ── FILE_MUTATE / GIT_ACTION: RuntimeExecutor mutation ─────────────
-	// These tasks mutate the workspace. The mutation is submitted through the
-	// RuntimeExecutor, which owns the model invocation, patch creation, the
-	// approval gate, apply and verification. The executor's approval gate is
-	// the single mutation authorization surface (Alt+A → RuntimeExecutor.Approve).
-	if targetTask.Type == "FILE_MUTATE" || targetTask.Type == "GIT_ACTION" {
+// dispatchStagedTask crosses ONE staged task over the single execution
+// admission boundary. FILE_MUTATE/GIT_ACTION work is submitted to the
+// RuntimeExecutor — which owns provider invocation, context compilation,
+// patch creation, the approval gate, apply and verification — and SHELL_EXEC
+// work crosses the interactive shell gate. Unknown task types FAIL CLOSED:
+// there is deliberately no caller-side fallback that could execute a
+// mutation outside the runtime boundary.
+func (m *model) dispatchStagedTask(task *plan.Task) tea.Cmd {
+	switch task.Type {
+	case "SHELL_EXEC":
+		return m.runStagedShellGate(task)
+	case "FILE_MUTATE", "GIT_ACTION":
 		return tea.Batch(
 			func() tea.Msg { return agentStartMsg{label: "patching"} },
-			m.runRuntimeTaskRequest(targetTask),
+			m.runRuntimeTaskRequest(task),
+			m.smoothStreamTickCmd(),
+		)
+	default:
+		tasks := m.sess.CurrentTasks
+		for i := range tasks {
+			if tasks[i].StepNum == task.StepNum {
+				tasks[i].Status = "stalled"
+				break
+			}
+		}
+		m.sess.StageTaskList(&tasks)
+		_ = m.sess.Save()
+		m.push(roleError, fmt.Sprintf("[BUILD HALTED] Task %d has unsupported type %q — no admitted execution path exists.", task.StepNum, task.Type))
+		return nil
+	}
+}
+
+// runStagedShellGate presents the interactive approval gate for a SHELL_EXEC
+// task. The human decision is part of the admission boundary: until it is
+// granted (or a prior Allow-Always grant exists), nothing reaches the OS
+// shell. The visual "Permission Required" box renders in the proposal dock:
+//
+//	[y] Allow Once    [a] Allow Always    [n] Reject
+func (m *model) runStagedShellGate(task *plan.Task) tea.Cmd {
+	if m.pendingBuildAllowAlways {
+		return tea.Batch(
+			func() tea.Msg { return agentStartMsg{label: "shell exec"} },
+			m.runBuildShellExec(task),
 			m.smoothStreamTickCmd(),
 		)
 	}
-
-	buildTrace := &ctxpkg.CodebaseTrace{
-		MatchedFiles:    []string{targetTask.Target},
-		ResolvedSymbols: []string{targetTask.Target},
-	}
-	return tea.Batch(
-		func() tea.Msg { return traceUpdateMsg{trace: buildTrace} },
-		m.streamCmd(content),
-	)
+	m.pendingBuildApproval = true
+	m.pendingBuildTask = task
+	m.enterApprovalState()
+	m.ti.Blur()
+	m.recalcViewportHeight()
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
+	return nil
 }
 
 func (m *model) handleReviewTestConfirm(line string) tea.Cmd {

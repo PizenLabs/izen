@@ -754,13 +754,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
-			if m.execEng != nil {
-				if errs := m.execEng.RollbackTransaction(); len(errs) > 0 {
-					for _, err := range errs {
-						m.push(roleError, fmt.Sprintf("rollback error: %v", err))
-					}
-				}
-			}
 			if m.sess != nil {
 				m.sess.ClearHistory()
 				_ = m.sess.Save()

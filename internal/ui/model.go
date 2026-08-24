@@ -2469,15 +2469,14 @@ func (m *model) markAllPlanTasksCompleted() {
 }
 
 // completeFastTrackBuild is the build completion sequence invoked when a
-// fast-track batch covered every plan target: it drains the queue, commits the
-// snapshot, clears the patching spinner and restores interactive input focus.
+// fast-track batch covered every plan target: it drains the queue, clears
+// the patching spinner and restores interactive input focus. Transaction
+// commit authority is owned by the RuntimeExecutor approval boundary — the
+// UI performs no execution-engine commit here.
 // It returns the verification command so the build transitions to complete.
 func (m *model) completeFastTrackBuild() (tea.Model, tea.Cmd) {
 	m.markAllPlanTasksCompleted()
 	m.fastTrackTargets = nil
-	if m.execEng != nil {
-		m.execEng.CommitTransaction()
-	}
 	// Release any residual patching/agent flags so the derived presentation
 	// state unwinds to interactive StateChat instead of a stuck spinner.
 	m.agentRunning = false
