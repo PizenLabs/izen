@@ -2,7 +2,6 @@ package ui
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/execution"
@@ -228,18 +227,11 @@ func (m *model) discardPendingAction() {
 	}
 	execution.KillAllOrphans()
 
-	// ── ROLL BACK THE ACTIVE MUTATION BOUNDARY (Phase 9A/9B) ────────
-	// If a mutation already occurred (an apply in flight), /drop restores the
-	// workspace by rolling back exactly the current MutationSet — the one owned
-	// by the operation being discarded. A pending (unapplied) set rolls back as
-	// a clean no-op. This is the /drop counterpart of the Ctrl+C cancel path.
-	if m.execEng != nil {
-		if errs := m.execEng.RollbackTransaction(); len(errs) > 0 {
-			for _, err := range errs {
-				m.push(roleError, fmt.Sprintf("drop rollback error: %v", err))
-			}
-		}
-	}
+	// ── MUTATION ROLLBACK AUTHORITY ─────────────────────────────────
+	// Rollback authority is owned by the RuntimeExecutor boundary: its
+	// MutationSet restores shadow backups inside Approve/Reject. /drop only
+	// discards the pending (unapplied) proposals — no UI-owned transaction
+	// is rolled back here.
 
 	// ── Discard pending proposals / pending actions ─────────────────
 	m.awaitingConfirmation = false

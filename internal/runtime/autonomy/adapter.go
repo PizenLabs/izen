@@ -128,6 +128,12 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		// context + strict SEARCH/REPLACE contract), not just annotations.
 		RecoveryStrategy: req.RecoveryStrategy,
 		RecoveryAttempt:  req.RecoveryAttempt,
+		// CAUSAL RECOVERY (Phase 2 P2): the failed parent contract travels to
+		// the executor's admission boundary, which resolves it into either a
+		// same-contract retry (pure retry) or a new append-only causally
+		// linked recovery contract (material change) under the bounded chain
+		// limit. Failed contracts are never rewritten in place.
+		RecoveryOf: req.ParentContractID,
 		// The strategy-selected output ceiling is a REQUEST budget, not a
 		// reporting change: max_tokens bounds the provider's generation so a
 		// verbose reasoning model cannot spend an unbounded output budget, and
@@ -217,6 +223,7 @@ func (a *ExecutorAdapter) observe(req autonomy.LoopRequest, res *execution.Execu
 	}
 	return autonomy.Observation{
 		RequestID:             res.RequestID,
+		ContractID:            observationContractID(res),
 		Intent:                autonomy.Intent(req.Intent),
 		Target:                firstTarget(res.Targets),
 		Evidence:              req.Evidence,
@@ -238,4 +245,21 @@ func firstTarget(targets []string) string {
 		return ""
 	}
 	return targets[0]
+}
+
+// observationContractID extracts the immutable contract identity of a
+// terminated execution (Phase 2 P2). The authoritative source is the sealed
+// ExecutionEvidence; the proof's stamped identity is the fallback for results
+// that predate evidence sealing.
+func observationContractID(res *execution.ExecutionResult) string {
+	if res == nil {
+		return ""
+	}
+	if res.Evidence != nil && !res.Evidence.ContractID().IsZero() {
+		return res.Evidence.ContractID().String()
+	}
+	if res.Proof != nil {
+		return res.Proof.ContractID
+	}
+	return ""
 }

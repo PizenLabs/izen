@@ -309,14 +309,22 @@ func TestExecutionFinishedAlwaysTerminal(t *testing.T) {
 		if n := collector.count(events.EventExecutionFinished); n != 1 {
 			t.Fatalf("execution.finished count = %d, want exactly 1; types=%v", n, types)
 		}
+		// Phase 2 P2: execution.finished is the last LIFECYCLE event. Only the
+		// authoritative execution.evidence record may follow it — anything else
+		// after a terminal transition is an impossible stream.
 		lastIdx := -1
 		for i, typ := range types {
 			if typ == events.EventExecutionFinished {
 				lastIdx = i
 			}
 		}
-		if lastIdx != len(types)-1 {
-			t.Errorf("execution.finished is not terminal: index=%d len=%d types=%v", lastIdx, len(types), types)
+		if lastIdx < 0 {
+			t.Fatalf("execution.finished missing: %v", types)
+		}
+		for i, typ := range types[lastIdx+1:] {
+			if typ != events.EventExecutionEvidence {
+				t.Errorf("event %s follows execution.finished (only execution.evidence may): index=%d types=%v", typ, lastIdx+1+i, types)
+			}
 		}
 	}
 
@@ -365,9 +373,15 @@ func TestExecutionFinishedAlwaysTerminal(t *testing.T) {
 		if n := collector.count(events.EventExecutionFinished); n != 1 {
 			t.Fatalf("execution.finished count = %d, want 1; types=%v", n, types)
 		}
+		// Phase 2 P2: only the authoritative execution.evidence record may
+		// follow execution.finished.
 		for i, typ := range types {
-			if typ == events.EventExecutionFinished && i != len(types)-1 {
-				t.Errorf("execution.finished not terminal: index=%d len=%d types=%v", i, len(types), types)
+			if typ == events.EventExecutionFinished {
+				for _, after := range types[i+1:] {
+					if after != events.EventExecutionEvidence {
+						t.Errorf("execution.finished not terminal: %s follows it; types=%v", after, types)
+					}
+				}
 			}
 		}
 	})

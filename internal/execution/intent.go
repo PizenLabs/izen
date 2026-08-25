@@ -43,6 +43,11 @@ type IntentResolution struct {
 	Profile strategy.ExecutionStrategyProfile
 	// Targets is the resolved workspace-relative target set.
 	Targets []string
+	// Context is the integrity-sealed snapshot of this intent's execution
+	// context payload, frozen at creation time (Phase 1 P1). It is carried on
+	// the ExecuteRequest and verified at the RuntimeExecutor admission
+	// boundary; any mid-flight modification fails closed there.
+	Context *ContextSnapshot
 }
 
 // IntentGateway is the unified intent resolver. It is stateless beyond its
@@ -65,7 +70,11 @@ func (g *IntentGateway) SelectStrategy(prompt string) strategy.ExecutionStrategy
 }
 
 // Gate resolves one user action into an ExecutionRequest. It never decides the
-// execution path beyond what Strategy.Select decided deterministically.
+// execution path beyond what Strategy.Select decided deterministically. The
+// intent's execution context payload is FROZEN here — at the point of intent
+// creation — into an integrity-sealed ContextSnapshot carried on the request;
+// the RuntimeExecutor admission boundary verifies it fail-closed before
+// anything executes.
 func (g *IntentGateway) Gate(_ context.Context, line string) (ExecuteRequest, IntentResolution, error) {
 	raw := strings.TrimSpace(line)
 	res := IntentResolution{Raw: raw}
@@ -86,7 +95,9 @@ func (g *IntentGateway) Gate(_ context.Context, line string) (ExecuteRequest, In
 		profile := g.SelectStrategy(raw)
 		res.Prompt = raw
 		res.Profile = profile
-		return ExecuteRequest{Prompt: raw, Strategy: &profile}, res, nil
+		req := ExecuteRequest{Prompt: raw, Strategy: &profile}
+		freezeGatewayContext(&req, &res, profile, g.root)
+		return req, res, nil
 	}
 	res.Prompt = prompt
 
@@ -107,5 +118,14 @@ func (g *IntentGateway) Gate(_ context.Context, line string) (ExecuteRequest, In
 		MaxOutputTokens: profile.MaxOutputTokens,
 		Strategy:        &profile,
 	}
+	freezeGatewayContext(&req, &res, profile, g.root)
 	return req, res, nil
+}
+
+// freezeGatewayContext seals the intent context payload onto both the request
+// and its observable resolution. It is the ONLY place intent contexts are born.
+func freezeGatewayContext(req *ExecuteRequest, res *IntentResolution, profile strategy.ExecutionStrategyProfile, root string) {
+	snapshot := freezeIntentContext("", *req, string(profile.Strategy), root)
+	req.Context = snapshot
+	res.Context = snapshot
 }

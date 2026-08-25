@@ -155,6 +155,11 @@ type VerificationOutcome struct {
 type Observation struct {
 	// RequestID correlates the observation to the execution that produced it.
 	RequestID string
+	// ContractID is the immutable contract identity of the observed execution
+	// attempt (Phase 2 P2). Recovery decisions back-point at it: a repair
+	// re-submits with ParentContractID = this ID so the runtime appends a
+	// causally linked recovery contract instead of rewriting history.
+	ContractID string
 	// Intent is the classified intent (authoritative).
 	Intent Intent
 	// Target is the resolved mutation target (authoritative).
@@ -434,6 +439,12 @@ type LoopRequest struct {
 	// RecoveryStrategy is the explicit strategy change for this recovery attempt
 	// (e.g. "bounded_patch" after a truncation). Empty for the initial attempt.
 	RecoveryStrategy string
+	// ParentContractID is the CAUSAL RECOVERY pointer (Phase 2 P2): the failed
+	// parent ContractID this request continues from. The executor resolves it
+	// at admission — pure retries stay under the same contract identity,
+	// material changes append a new causally linked contract — and enforces
+	// the bounded chain limit there.
+	ParentContractID string
 	// MaxOutputTokens is an explicit output budget override for this attempt (0 = use profile default).
 	MaxOutputTokens int
 	// FinishReason carries the previous attempt's finish_reason for observability.

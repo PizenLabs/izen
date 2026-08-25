@@ -11,6 +11,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
+	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/presentation"
 )
@@ -299,6 +300,9 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
+		if mdl, queueCmd, handled := m.projectBuildQueueFromProof(msg.res, execErr); handled {
+			return mdl, tea.Batch(queueCmd, usageCmd)
+		}
 		return m, tea.Batch(m.flushPendingRecords(), usageCmd)
 	}
 	res := msg.res
@@ -344,6 +348,9 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		m.push(roleSystem, infoStyle.Render("  "+Icon.Info+" Mutation applied — no content changed."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
+		if mdl, queueCmd, handled := m.projectBuildQueueFromProof(res, nil); handled {
+			return mdl, tea.Batch(queueCmd, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known))
+		}
 		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
 	}
 
@@ -384,6 +391,9 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		}
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
+		if mdl, queueCmd, handled := m.projectBuildQueueFromProof(res, nil); handled {
+			return mdl, tea.Batch(queueCmd, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known))
+		}
 		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
 	}
 
@@ -418,6 +428,9 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		m.push(roleSystem, infoStyle.Render("No files were modified."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
+		if mdl, queueCmd, handled := m.projectBuildQueueFromProof(res, res.Err); handled {
+			return mdl, tea.Batch(queueCmd, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known))
+		}
 		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
 	}
 
@@ -437,6 +450,9 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		m.push(roleSystem, infoStyle.Render("No files were modified."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
+		if mdl, queueCmd, handled := m.projectBuildQueueFromProof(res, res.Err); handled {
+			return mdl, tea.Batch(queueCmd, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known))
+		}
 		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
 	}
 
@@ -550,4 +566,96 @@ func (m *model) runHotExecution(rawInput string) tea.Cmd {
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
 	return m.runGatedLine("$hot " + rawInput)
+}
+
+// buildQueueTaskOutcome maps a terminal RuntimeExecutor outcome onto staged
+// /build task bookkeeping: "advance" (completed — move to the next task or
+// hand off to verification), "halt" (failed — freeze the remaining queue),
+// or "" (the approval/cancellation surface owns this outcome; no queue
+// projection runs).
+func buildQueueTaskOutcome(outcome execution.MutationOutcome) string {
+	switch {
+	case outcome.MutationSucceeded(), outcome == execution.OutcomeNoChange:
+		return "advance"
+	case outcome == execution.OutcomeRejected,
+		outcome == execution.OutcomeCancelled,
+		outcome == execution.OutcomePendingApproval:
+		return ""
+	default:
+		return "halt"
+	}
+}
+
+// projectBuildQueueFromProof projects a terminal RuntimeExecutor outcome onto
+// the staged /build task ledger and drives the queue forward from the
+// authoritative execution evidence alone (ExecutionProof). The UI never
+// decides mutation truth here: it books exactly the task status the runtime
+// reported, advances to the next idle task across the same admission
+// boundary (handleBuildRun → dispatchStagedTask), and hands off to the
+// verification engine once the plan is drained. It returns handled=false for
+// results that do not belong to a staged per-task build execution.
+func (m *model) projectBuildQueueFromProof(res *execution.ExecutionResult, execErr error) (tea.Model, tea.Cmd, bool) {
+	if m.hotfixActive || m.sess == nil || m.resolver == nil ||
+		m.currentBuildTaskID <= 0 || len(m.sess.CurrentTasks) == 0 ||
+		m.resolver.Current() != modes.ModeBuild {
+		return m, nil, false
+	}
+	// A user cancellation is not a task failure: the queue stays exactly
+	// where it is and the operator decides the next step. The cancellation
+	// may surface through the terminal error alone or as a proof outcome.
+	if execErr != nil && classifyOpErr(execErr) == OpOutcomeCancelled {
+		return m, nil, false
+	}
+	if res != nil && res.Err != nil && classifyOpErr(res.Err) == OpOutcomeCancelled {
+		return m, nil, false
+	}
+	outcome := execution.OutcomeFailed
+	if res != nil && res.Proof != nil {
+		outcome = res.Proof.Outcome
+	}
+	action := buildQueueTaskOutcome(outcome)
+	if action == "" {
+		return m, nil, false
+	}
+	tasks := m.sess.CurrentTasks
+	for i := range tasks {
+		if tasks[i].StepNum == m.currentBuildTaskID {
+			if action == "advance" {
+				tasks[i].Status = "completed"
+			} else {
+				tasks[i].Status = "failed"
+			}
+			break
+		}
+	}
+	m.currentBuildTaskID = 0
+	if action == "halt" {
+		stalled := false
+		for i := range tasks {
+			if tasks[i].Status == "idle" {
+				tasks[i].Status = "stalled"
+				stalled = true
+			}
+		}
+		m.sess.StageTaskList(&tasks)
+		_ = m.sess.Save()
+		if stalled {
+			m.push(roleError, "[BUILD HALTED] Execution failed. Queue frozen — remaining tasks marked stalled. Use /investigate or /plan to re-generate a valid ledger.")
+		}
+		flush := m.flushPendingRecords()
+		return m, flush, true
+	}
+	m.sess.StageTaskList(&tasks)
+	_ = m.sess.Save()
+	for _, t := range tasks {
+		if t.Status == "idle" || t.Status == "processing" {
+			flush := m.flushPendingRecords()
+			return m, tea.Batch(flush, m.handleBuildRun(0)), true
+		}
+	}
+	// Plan drained — run the build verification engine.
+	m.buildVerifyPending = true
+	m.push(roleSystem, "Verifying build...")
+	flush := m.flushPendingRecords()
+	return m, tea.Batch(flush, m.runTestEngine("./...")), true
 }

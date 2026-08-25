@@ -174,29 +174,48 @@ func resolvedTargetsForExecution(profile strategy.ExecutionStrategyProfile, fall
 	return targets
 }
 
-// runStagedBuildViaRuntime routes the staged /build FILE_MUTATE plan through
-// the RuntimeExecutor. The staged task goals combine into a single prompt; the
-// FILE_MUTATE targets become the execution target set. The executor owns the
-// context, model invocation, patch creation, approval gate, apply and
-// verification for the whole batch. Plans that carry SHELL_EXEC (or any other
-// non-file) task fall back to the per-task dispatcher: OS command execution is
-// not a file mutation and the runtime executor does not own it (handleBuildRun
-// routes its FILE_MUTATE tasks through the executor and its SHELL_EXEC tasks
-// through the shell capability).
+// runStagedBuildViaRuntime routes the staged /build plan through the
+// RuntimeExecutor admission boundary.
+//
+//   - Pure file plans (FILE_MUTATE/GIT_ACTION only) combine their goals into
+//     one executor request over the resolved target set.
+//   - Mixed plans (any SHELL_EXEC step) and plans without resolvable file
+//     targets dispatch strictly PER TASK: beginStagedTask selects the next
+//     pending task and dispatchStagedTask crosses it over the single
+//     admission boundary — the RuntimeExecutor for file work, the
+//     interactive shell gate for OS commands. Terminal-result projections
+//     then advance the queue one evidence-backed task at a time. There is no
+//     wholesale legacy fallback: OS command execution is not a file mutation
+//     and the runtime executor does not own it, so mixed plans decompose at
+//     the dispatch seam instead of degrading out of the runtime.
+//
+// Without a wired gateway + RuntimeExecutor the dispatch FAILS CLOSED: there
+// is deliberately no caller-side execution path that could mutate outside
+// the runtime boundary.
 func (m *model) runStagedBuildViaRuntime() tea.Cmd {
 	tasks := m.sess.CurrentTasks
-	if len(tasks) == 0 || m.gateway == nil || m.executor == nil {
-		return m.handleBuildRun(0)
+	if len(tasks) == 0 {
+		m.push(roleStatus, "no tasks staged — use /plan first")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+	if m.gateway == nil || m.executor == nil {
+		m.push(roleError, "execution runtime not wired — cannot execute the staged plan")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
 	}
 	var targets []string
 	var goals []string
 	seen := make(map[string]bool)
+	mixed := false
 	for _, t := range tasks {
 		if t.Type != "FILE_MUTATE" && t.Type != "GIT_ACTION" {
-			// A non-file task (e.g. SHELL_EXEC) is not a RuntimeExecutor file
-			// mutation — dispatch per-task so FILE_MUTATE tasks still execute
-			// through the executor and SHELL_EXEC through the shell capability.
-			return m.handleBuildRun(0)
+			// Non-file tasks (e.g. SHELL_EXEC) force strict per-task
+			// sequential dispatch below — never a caller-side loop.
+			mixed = true
+			continue
 		}
 		if t.Target != "" && !seen[t.Target] {
 			seen[t.Target] = true
@@ -206,33 +225,39 @@ func (m *model) runStagedBuildViaRuntime() tea.Cmd {
 			goals = append(goals, t.Description)
 		}
 	}
-	if len(targets) == 0 {
-		return m.handleBuildRun(0)
-	}
-	prompt := strings.Join(goals, "\n")
-	if strings.TrimSpace(prompt) == "" {
-		prompt = m.lastPlanIntent
-	}
-	if strings.TrimSpace(prompt) == "" {
-		prompt = strings.Join(targets, " ")
-	}
+	if !mixed && len(targets) > 0 {
+		prompt := strings.Join(goals, "\n")
+		if strings.TrimSpace(prompt) == "" {
+			prompt = m.lastPlanIntent
+		}
+		if strings.TrimSpace(prompt) == "" {
+			prompt = strings.Join(targets, " ")
+		}
 
-	// Canonical strategy resolution, then pin the mutation path: a staged
-	// /build plan is already an implementation intent — it is never re-routed
-	// to a read-only plan artifact downstream.
-	profile := m.gateway.SelectStrategy(prompt)
-	profile.Strategy = strategy.TargetedMutation
-	profile.ModelRequired = true
-	profile.StrategyReason = "staged /build FILE_MUTATE plan routed through the runtime executor"
-	m.lastExecutionStrategy = profile
+		// Canonical strategy resolution, then pin the mutation path: a staged
+		// /build plan is already an implementation intent — it is never re-routed
+		// to a read-only plan artifact downstream.
+		profile := m.gateway.SelectStrategy(prompt)
+		profile.Strategy = strategy.TargetedMutation
+		profile.ModelRequired = true
+		profile.StrategyReason = "staged /build FILE_MUTATE plan routed through the runtime executor"
+		m.lastExecutionStrategy = profile
 
-	req := execution.ExecuteRequest{
-		Mode:     modes.ModeBuild.String(),
-		Prompt:   prompt,
-		Targets:  targets,
-		Strategy: &profile,
+		req := execution.ExecuteRequest{
+			Mode:     modes.ModeBuild.String(),
+			Prompt:   prompt,
+			Targets:  targets,
+			Strategy: &profile,
+		}
+		return m.runRuntimeExecuteCmd(req)
 	}
-	return m.runRuntimeExecuteCmd(req)
+	// Mixed plan or unresolvable targets: strict per-task sequential dispatch
+	// across the same admission boundary as every other /build entry point.
+	target := m.beginStagedTask(0)
+	if target == nil {
+		return nil
+	}
+	return m.dispatchStagedTask(target)
 }
 
 // runRuntimeTaskRequest submits a single staged task's FILE_MUTATE/GIT_ACTION
@@ -272,7 +297,12 @@ func (m *model) runRuntimeTaskRequest(task *plan.Task) tea.Cmd {
 // autonomy-decided workspace).
 func (m *model) runRuntimePrompt(content string) tea.Cmd {
 	if m.gateway == nil || m.executor == nil {
-		return m.handleBuildRun(0)
+		// FAIL CLOSED: without the admission gateway and the RuntimeExecutor
+		// there is deliberately no caller-side execution path.
+		m.push(roleError, "execution runtime not wired — cannot execute the mutation")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
 	}
 	profile := m.gateway.SelectStrategy(content)
 	m.lastExecutionStrategy = profile

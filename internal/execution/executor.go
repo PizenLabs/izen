@@ -90,6 +90,16 @@ type ExecuteRequest struct {
 	// the runtime selects it itself. It is the single source of the execution
 	// path decision — never a mode.
 	Strategy *strategy.ExecutionStrategyProfile
+	// Context is the frozen, integrity-sealed execution context snapshot
+	// created at intent time (IntentGateway.Gate). Admission verifies the seal
+	// and its binding to this request's declared context fields BEFORE any
+	// execution stage runs: a snapshot that was modified mid-flight — or a
+	// request whose prompt/targets/evidence diverge from the frozen payload —
+	// fails closed with ErrContextIntegrity. When nil (direct callers that
+	// bypassed the gateway), admission freezes the context fresh from this
+	// request's own declared fields; middleware can never rebuild or substitute
+	// prompt context after that point.
+	Context *ContextSnapshot
 	// ── Autonomy handoff (Phase 1 Step 6) ─────────────────────────────
 	// These fields carry the autonomy decision metadata so an already
 	// classified intent is never re-classified downstream and the decision
@@ -114,6 +124,15 @@ type ExecuteRequest struct {
 	// window rotation across repair cycles.
 	RecoveryStrategy string
 	RecoveryAttempt  int
+	// RecoveryOf declares CAUSAL RECOVERY (Phase 2 P2): the failed parent
+	// ContractID this execution recovers from. The runtime resolves the
+	// recovery at admission — instantiating a NEW contract with an explicit
+	// back-pointer and the parent's full ancestry — and enforces the bounded
+	// chain limit (MaxRecoveryChainDepth). A unknown parent fails closed with
+	// ErrUnknownParentContract; an exhausted chain with
+	// ErrRecoveryChainExhausted. Failed contracts are never rewritten: every
+	// recovery is an append-only causal step.
+	RecoveryOf string
 	// StreamCallback is an optional callback for incremental streaming progress.
 	// When set, the executor invokes it during provider streaming for each
 	// content delta, first token, and completion. This enables the UI to
@@ -180,13 +199,39 @@ type ExecutionProof struct {
 	// autonomy decision handoff (Phase 1 Step 6): the execution proof carries
 	// the classified intent and its confidence so the runtime never loses the
 	// decision facts between autonomy and execution.
-	Intent           string          `json:"intent,omitempty"`
-	IntentConfidence float64         `json:"intent_confidence,omitempty"`
-	TargetConfidence float64         `json:"target_confidence,omitempty"`
-	Scope            string          `json:"scope,omitempty"`
+	Intent           string  `json:"intent,omitempty"`
+	IntentConfidence float64 `json:"intent_confidence,omitempty"`
+	TargetConfidence float64 `json:"target_confidence,omitempty"`
+	Scope            string  `json:"scope,omitempty"`
+	// RiskScope records the deterministic blast-radius tier the admission
+	// evaluator assigned to the intent (Phase 1 P1). Empty when execution was
+	// rejected before evaluation completed.
+	RiskScope string `json:"risk_scope,omitempty"`
+	// ContextID / ContextDigest / ContextParentID record the verified context
+	// lineage of the execution: which frozen snapshot the executor ran under,
+	// its sealed digest and its causal ancestor. Callers cannot inject or
+	// rebuild prompt context mid-execution — the proof names the exact payload
+	// that crossed.
+	ContextID       string `json:"context_id,omitempty"`
+	ContextDigest   string `json:"context_digest,omitempty"`
+	ContextParentID string `json:"context_parent_id,omitempty"`
+	// Contract identity (Phase 2 P2): WHICH unique execution intent ran and
+	// WHICH invocation attempt of it. The identity is computed at admission
+	// from the sealed context + strategy + targets — retries keep the
+	// ContractID while AttemptID increments; parameter/strategy changes fork a
+	// new contract. Identity is immutable once stamped here.
+	ContractID       string          `json:"contract_id,omitempty"`
+	AttemptID        uint32          `json:"attempt_id,omitempty"`
+	ParentContractID string          `json:"parent_contract_id,omitempty"`
+	CausalAncestry   []string        `json:"causal_ancestry,omitempty"`
 	Outcome          MutationOutcome `json:"outcome"`
 	StartedAt        time.Time       `json:"started_at"`
 	FinishedAt       time.Time       `json:"finished_at"`
+	// OccAborted records a Phase 3 OCC commit-gate abort: the pre-commit
+	// verification found the target state diverged from the admitted baseline.
+	// The evidence outcome is ABORTED_OCC (never derived by the coarse outcome
+	// mapper) and the mutations are tainted.
+	OccAborted bool `json:"occ_aborted,omitempty"`
 }
 
 // ContextDecision is one strategy-owned context decision recorded in the
@@ -266,6 +311,12 @@ type ExecutionResult struct {
 	Verification VerificationReport
 	// Proof is the evidence account of the whole execution.
 	Proof *ExecutionProof
+	// Evidence is the authoritative IMMUTABLE terminal record of the
+	// execution (Phase 2 P2). It is sealed by the runtime at every terminal
+	// path and is the SOLE artifact downstream projectors may consume to
+	// derive terminal execution truth. It is nil while the execution is still
+	// held at the approval gate (not yet terminated).
+	Evidence *ExecutionEvidence
 	// Completed is the authoritative terminal usage account computed by the
 	// runtime from the provider-reported usage. The renderer reads it for the
 	// footer / EXPANDED token numbers and never re-derives them.
@@ -291,18 +342,39 @@ type pendingMutation struct {
 	// g is the runtime-owned execution graph resumed at approval time. It is
 	// the single lifecycle authority of the whole execution.
 	g *runtimegraph.Graph
+	// contract / attempt carry the immutable identity of the held attempt
+	// (Phase 2 P2): Approve/Reject resolve the SAME contract attempt, never a
+	// new one. The approval gate is not a termination — no evidence exists
+	// until the gate resolves.
+	contract *ExecutionContract
+	attempt  AttemptID
+	// baseline is the Phase 3 target-scoped workspace snapshot captured at
+	// admission. Approve re-validates it immediately before the commit
+	// pipeline writes anything; a mismatch aborts with ABORTED_OCC and zero
+	// partial writes.
+	baseline *WorkspaceBaseline
 }
 
 // RuntimeExecutor is the runtime-owned execution boundary.
 type RuntimeExecutor struct {
-	root     string
-	cfg      *config.Config
-	provider ai.Provider
-	bus      *events.Bus
-	langID   language.ID
-	patches  *PatchManager
-	verifier *Verifier
-	auth     *authorization.MutationAuthorization
+	root      string
+	cfg       *config.Config
+	provider  ai.Provider
+	bus       *events.Bus
+	langID    language.ID
+	patches   *PatchManager
+	verifier  *Verifier
+	auth      *authorization.MutationAuthorization
+	admission *AdmissionGateway
+	// contracts is the runtime-owned contract identity ledger (Phase 2 P2):
+	// it derives immutable ContractIDs at admission, increments AttemptIDs
+	// deterministically across retries, and instantiates bounded causal
+	// recovery contracts.
+	contracts *ContractRegistry
+	// occ is the runtime-owned Phase 3 optimistic-concurrency engine: it
+	// fingerprints the resolved targets at admission and re-validates them
+	// immediately before the commit pipeline writes anything.
+	occ *OCCVerifier
 
 	mu      sync.Mutex
 	pending map[string]*pendingMutation
@@ -318,13 +390,16 @@ type RuntimeExecutor struct {
 // still resolves deterministic strategies without a provider).
 func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, bus *events.Bus, langID language.ID) *RuntimeExecutor {
 	x := &RuntimeExecutor{
-		root:     root,
-		cfg:      cfg,
-		provider: provider,
-		bus:      bus,
-		langID:   langID,
-		patches:  NewPatchManager(root),
-		pending:  make(map[string]*pendingMutation),
+		root:      root,
+		cfg:       cfg,
+		provider:  provider,
+		bus:       bus,
+		langID:    langID,
+		patches:   NewPatchManager(root),
+		admission: NewAdmissionGateway(nil),
+		contracts: NewContractRegistry(),
+		occ:       NewOCCVerifier(root),
+		pending:   make(map[string]*pendingMutation),
 	}
 	if langID != "" {
 		x.verifier = NewLanguageVerifier(root, langID)
@@ -333,6 +408,31 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 	}
 	return x
 }
+
+// SetAdmittedCapabilities replaces the capability set the runtime's admission
+// boundary checks every intent against (test seam / runtime re-granting). A
+// nil set restores StandardAdmittedCapabilities. Grants are never escalated
+// implicitly: an intent evaluated beyond the admitted scope is rejected at
+// admission and must be re-submitted.
+func (x *RuntimeExecutor) SetAdmittedCapabilities(caps *AdmittedCapabilities) {
+	x.admission.SetCapabilities(caps)
+}
+
+// AdmittedCapabilities returns the currently admitted capability surface
+// (observability).
+func (x *RuntimeExecutor) AdmittedCapabilities() AdmittedCapabilities {
+	return x.admission.Capabilities()
+}
+
+// Contracts exposes the runtime-owned contract identity ledger
+// (observability). Callers may read admitted contracts and attempt counters;
+// all mutation authority stays inside the registry.
+func (x *RuntimeExecutor) Contracts() *ContractRegistry { return x.contracts }
+
+// OCC exposes the runtime-owned optimistic-concurrency verifier
+// (observability). Callers may read its operational metrics; the baseline and
+// pre-commit gate authority stays inside the executor's commit pipeline.
+func (x *RuntimeExecutor) OCC() *OCCVerifier { return x.occ }
 
 // SetVerifier overrides the attached verifier (test seam / config wiring).
 func (x *RuntimeExecutor) SetVerifier(v *Verifier) {
@@ -496,6 +596,29 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	g.Start(req.Mode, req.Prompt)
 	g.CompleteUserIntent()
 
+	// ── ADMISSION I: CONTEXT FIDELITY (Phase 1 P1) ───────────────────
+	// The intent's frozen context snapshot must still match its sealed digest
+	// AND bind to the request's declared context fields. Any mid-flight
+	// modification between caller submission and this boundary fails closed
+	// here — before strategy selection, before any read, before anything.
+	snapshot, ctxErr := verifyIntentContext(req, x.root)
+	if ctxErr != nil {
+		err := fmt.Errorf("executor: admission rejected request %s: %w", requestID, ctxErr)
+		g.FailExecution(events.FailurePermanent, err, "executor.admission")
+		res.Err = err
+		res.Proof.Outcome = OutcomeFailed
+		res.Proof.FinishedAt = time.Now()
+		setProofGraph(res, g)
+		return x.finalizeResult(res), err
+	}
+	// The verified (or freshly synthesized) snapshot is the authoritative
+	// context of THIS execution and is carried forward on the request so no
+	// downstream stage can rebuild or substitute prompt context.
+	req.Context = snapshot
+	res.Proof.ContextID = snapshot.ID
+	res.Proof.ContextDigest = snapshot.Digest()
+	res.Proof.ContextParentID = snapshot.Parent
+
 	// ── 1. Strategy selection ──────────────────────────────────────────
 	profile, err := x.selectStrategy(ctx, req)
 	if err != nil {
@@ -512,6 +635,26 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	res.Proof.StrategyReason = profile.StrategyReason
 	res.Proof.ContextDecisions = contextDecisions(profile)
 	g.CompleteStrategy(res.Strategy, profile.ModelRequired, profile.StrategyReason)
+
+	// ── ADMISSION II: RISK SCOPE GATING (Phase 1 P1) ──────────────────
+	// The intent's blast radius is evaluated deterministically from the
+	// selected strategy and the declared targets, then checked against the
+	// admitted capabilities BEFORE any execution stage that could act on the
+	// world. Out-of-scope intents are rejected here — never escalated
+	// implicitly.
+	decision, admitErr := x.admission.Admit(req, x.root, profile)
+	if admitErr != nil {
+		err := fmt.Errorf("executor: admission rejected request %s: %w", requestID, admitErr)
+		g.FailExecution(events.FailurePermanent, err, "executor.admission")
+		res.Err = err
+		res.Proof.RiskScope = decision.Requested.String()
+		res.Proof.Outcome = OutcomeFailed
+		res.Proof.FinishedAt = time.Now()
+		setProofGraph(res, g)
+		return x.finalizeResult(res), err
+	}
+	req.Context = decision.Snapshot
+	res.Proof.RiskScope = decision.Requested.String()
 
 	// ── 2. Target resolution ───────────────────────────────────────────
 	targets := req.Targets
@@ -530,6 +673,27 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	for _, t := range targets {
 		g.CompleteTarget(t, fileExists(filepath.Join(x.root, t)), "strategy")
 	}
+
+	// ── ADMISSION III: CONTRACT IDENTITY RESOLUTION (Phase 2 P2) ──────
+	// The execution's immutable identity is derived from the VERIFIED context
+	// digest, the selected strategy and the RESOLVED target set — never
+	// declared by callers. Retries of one intent resolve to the SAME
+	// ContractID with a deterministically incremented AttemptID; parameter or
+	// strategy changes fork a NEW contract; an explicit causal recovery
+	// instantiates a new contract that back-points at its failed parent under
+	// the bounded chain limit. Resolution failures (unknown parent, exhausted
+	// chain) fail closed here — before any acting stage.
+	contract, attempt, contractErr := x.contracts.Resolve(req, snapshot.Digest(), targets)
+	if contractErr != nil {
+		err := fmt.Errorf("executor: admission rejected request %s: %w", requestID, contractErr)
+		g.FailExecution(events.FailurePermanent, err, "executor.admission")
+		res.Err = err
+		res.Proof.Outcome = OutcomeFailed
+		res.Proof.FinishedAt = time.Now()
+		setProofGraph(res, g)
+		return x.finalizeResult(res), err
+	}
+	stampContractIdentity(res, contract, attempt)
 
 	// ── 3. Human clarification (no model, no mutation) ────────────────
 	// HumanClarification is authoritative and MUST be handled before the
@@ -635,6 +799,16 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		return x.finalizeResult(res), nil
 	}
 
+	// ── PHASE 3 OCC BASELINE (target-scoped) ───────────────────────────
+	// Fingerprint EXACTLY the resolved target geometry at admission time —
+	// never a workspace-wide scan. Approve re-validates this baseline
+	// immediately before the commit pipeline writes anything; any out-of-band
+	// divergence in between aborts with ABORTED_OCC and zero partial writes.
+	var occBaseline *WorkspaceBaseline
+	if profile.Strategy == strategy.TargetedMutation {
+		occBaseline = x.occ.SnapshotBaseline(targets)
+	}
+
 	// ── 7. Targeted mutation: per-target model invocation ──────────────
 	patches, invs, diffs, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
 	if err != nil {
@@ -723,6 +897,9 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		modelCalls:     res.ModelCalls,
 		startedAt:      start,
 		g:              g,
+		contract:       contract,
+		attempt:        attempt,
+		baseline:       occBaseline,
 	}
 	x.mu.Lock()
 	x.pending[patches[0].ID] = pm
@@ -778,6 +955,10 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 	}
 	setProofGraph(res, g)
 
+	// The approval resolves the SAME contract attempt that was held (Phase 2
+	// P2): identity is immutable across the gate.
+	stampContractIdentity(res, pm.contract, pm.attempt)
+
 	// The runtime owns a fresh mutation boundary for this apply.
 	ms := NewMutationSet()
 	x.patches.SetMutationSet(ms)
@@ -796,6 +977,21 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 
 	g.BeginMutation(pm.targets)
 	setProofGraph(res, g)
+
+	// ── PHASE 3 OCC COMMIT GATE ────────────────────────────────────────
+	// Re-verify the admitted target baseline IMMEDIATELY before the commit
+	// pipeline applies any mutation or executes any final file write. Any
+	// out-of-band divergence (LSP edit, external process, parallel tool) since
+	// admission halts execution here — BEFORE a single byte is written — with
+	// the canonical ABORTED_OCC outcome, tainted mutations and zero partial
+	// writes. This gate is never substituted by Cancel(): an OCC abort is a
+	// first-class terminal evidence outcome.
+	if pm.baseline != nil {
+		if conflict := x.occ.VerifyAgainst(pm.baseline); conflict != nil {
+			err := fmt.Errorf("executor: occ commit gate rejected request %s: %w", pm.requestID, conflict)
+			return x.abortOnStateConflict(res, pm, ms, g, err), err
+		}
+	}
 
 	// ── Apply EVERY held patch inside the single MutationSet transaction ──
 	applyCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
@@ -934,6 +1130,48 @@ func (x *RuntimeExecutor) correctEvidenceAfterRollback(ms *MutationSet, patches 
 	}
 }
 
+// abortOnStateConflict is the clean Phase 3 OCC abort path. It runs when the
+// pre-commit verification found a baseline mismatch: NOTHING was applied (the
+// gate precedes the apply stage), so no partial write can exist by
+// construction. The open mutation boundary is terminated cleanly, per-target
+// evidence records the abort without ever claiming an apply, and the proof
+// carries the OccAborted flag that seals ABORTED_OCC tainted evidence.
+func (x *RuntimeExecutor) abortOnStateConflict(
+	res *ExecutionResult,
+	pm *pendingMutation,
+	ms *MutationSet,
+	g *runtimegraph.Graph,
+	abortErr error,
+) *ExecutionResult {
+	// Terminate the open boundary cleanly: nothing was recorded or applied,
+	// so rollback restores nothing — it only closes the transaction so no
+	// staged state survives the abort.
+	_ = ms.RollbackTo(MutationRolledBack)
+
+	res.ArtifactKind = "patch"
+	for _, t := range pm.targets {
+		res.Mutations = append(res.Mutations, MutationEvidence{
+			Stage:   StageApply,
+			File:    t,
+			Outcome: OutcomeOCCAborted,
+			Reason:  abortErr.Error(),
+		})
+		g.CompleteMutation(t, string(OutcomeOCCAborted))
+	}
+	res.Proof.Mutations = res.Mutations
+	res.Proof.OccAborted = true
+	res.Proof.Outcome = OutcomeOCCAborted
+	res.Proof.AffectedFiles = append([]string(nil), pm.targets...)
+	res.Proof.DiffSummary = pm.diffs
+	// The verification gate never ran — the OCC gate aborted before apply.
+	g.Skip(runtimegraph.StageVerification, "occ abort before any apply")
+	g.FailExecution(events.FailurePermanent, abortErr, "executor.occ")
+	res.Err = abortErr
+	res.Proof.FinishedAt = time.Now()
+	setProofGraph(res, g)
+	return x.finalizeResult(res)
+}
+
 // Reject resolves the approval gate negatively: the held patches are never
 // applied and the mutation boundary is rolled back (restoring any recorded
 // snapshot — none exist yet, since apply never ran). The graph is cancelled
@@ -970,6 +1208,9 @@ func (x *RuntimeExecutor) Reject(ctx context.Context, patchID, reason string) (*
 	if g == nil {
 		g = runtimegraph.New(pm.requestID, x.emit)
 	}
+	// The rejection resolves the SAME contract attempt that was held (Phase 2
+	// P2): identity is immutable across the gate.
+	stampContractIdentity(res, pm.contract, pm.attempt)
 	ms := NewMutationSet()
 	for _, p := range pm.patches {
 		_ = ms.Record(p.File)
@@ -1653,12 +1894,127 @@ func setProofGraph(res *ExecutionResult, g *runtimegraph.Graph) {
 	res.Proof.Graph = steps
 }
 
+// stampContractIdentity copies the immutable contract identity onto the
+// execution proof: ContractID, AttemptID, ParentContractID, the causal
+// ancestry chain (root → parent) and the Phase 1 sealed ContextDigest. The
+// contract carries exactly the verified context digest it was resolved with,
+// so every terminal path that crosses this choke point — Execute, Approve and
+// Reject alike — emits terminal evidence bound to its admitted context
+// snapshot. Identity is stamped once per attempt.
+func stampContractIdentity(res *ExecutionResult, c *ExecutionContract, attempt AttemptID) {
+	if res == nil || res.Proof == nil || c == nil {
+		return
+	}
+	res.Proof.ContractID = c.ID().String()
+	res.Proof.AttemptID = uint32(attempt)
+	res.Proof.ParentContractID = c.ParentID().String()
+	res.Proof.ContextDigest = c.ContextDigest()
+	if anc := c.CausalAncestry(); len(anc) > 0 {
+		res.Proof.CausalAncestry = make([]string, 0, len(anc))
+		for _, id := range anc {
+			res.Proof.CausalAncestry = append(res.Proof.CausalAncestry, id.String())
+		}
+	}
+}
+
+// verificationGateState reports whether a real verification gate executed and
+// whether it passed. A zero report or an explicitly Skipped gate never counts
+// as "ran" — a skipped gate is not-applicable, not a pass and not a failure.
+func verificationGateState(r VerificationReport) (ran bool, passed bool) {
+	if r.Skipped {
+		return false, false
+	}
+	ran = len(r.Results) > 0 || r.Passed
+	return ran, r.Passed
+}
+
+// sealTerminalEvidence constructs the IMMUTABLE ExecutionEvidence for one
+// terminated execution attempt from the runtime facts already on the result:
+// contract identity, sealed context digest, canonical outcome, mutation-set
+// summary (with taint rules) and the precise time window. The evidence is
+// attached to res.Evidence exactly once and published on the domain bus so
+// downstream projectors consume it as their sole authoritative terminal
+// artifact. Executions still held at the approval gate are NOT terminated —
+// no evidence exists for them yet.
+func (x *RuntimeExecutor) sealTerminalEvidence(res *ExecutionResult) {
+	if res == nil || res.Proof == nil || res.Evidence != nil {
+		return
+	}
+	p := res.Proof
+	if p.ContractID == "" || res.PendingPatchID != "" {
+		// No identity (pre-admission failure) or still held at the approval
+		// gate: the execution has NOT terminated — no evidence exists yet.
+		return
+	}
+	// Phase 3 OCC commit gate: the abort outcome is NEVER derived by the
+	// coarse mapper — it is produced here, exclusively from the runtime's own
+	// OccAborted flag set by the pre-commit baseline verification.
+	var outcome ExecutionOutcome
+	if p.OccAborted {
+		outcome = EvidenceAbortedOCC
+	} else {
+		outcome = evidenceOutcomeFor(p.Outcome, res.Err)
+	}
+	mutations := p.Mutations
+	if len(mutations) == 0 {
+		mutations = res.Mutations
+	}
+	ran, passed := verificationGateState(p.Verification)
+	targets := p.Targets
+	if len(targets) == 0 {
+		targets = res.Targets
+	}
+	summary := summarizeMutationSet(p.TransactionID, targets, mutations, p.Outcome, ran, passed)
+	if p.OccAborted && !summary.Tainted {
+		// An OCC abort always taints the attempt: the held proposal is stale,
+		// and every projector must invalidate its tentative state even though
+		// zero bytes reached the workspace.
+		summary.Tainted = true
+	}
+	res.Evidence = sealEvidence(
+		ContractID(p.ContractID), AttemptID(p.AttemptID),
+		x.contracts.Contract(ContractID(p.ContractID)),
+		p.ContextDigest, outcome, summary, p.StartedAt, p.FinishedAt,
+	)
+	x.emitEvidenceEvent(res, res.Evidence)
+}
+
+// emitEvidenceEvent publishes the canonical execution.evidence event. The
+// payload carries scalar facts only (no live pointers), so every bus consumer
+// projects from immutable truth.
+func (x *RuntimeExecutor) emitEvidenceEvent(res *ExecutionResult, ev *ExecutionEvidence) {
+	if res == nil || ev == nil {
+		return
+	}
+	ancestry := make([]string, 0, len(ev.CausalAncestry()))
+	for _, id := range ev.CausalAncestry() {
+		ancestry = append(ancestry, id.String())
+	}
+	x.emit(events.NewExecutionEvidence(events.ExecutionEvidencePayload{
+		RequestID:        res.RequestID,
+		ContractID:       ev.ContractID().String(),
+		AttemptID:        uint32(ev.AttemptID()),
+		ParentContractID: ev.ParentContractID().String(),
+		CausalAncestry:   ancestry,
+		ContextDigest:    ev.ContextDigest(),
+		Outcome:          string(ev.Outcome()),
+		Tainted:          ev.Mutations().Tainted,
+		Targets:          ev.Mutations().Targets,
+		FilesMutated:     ev.Mutations().FilesMutated,
+		TransactionID:    ev.Mutations().TransactionID,
+		StartedAt:        ev.StartedAt(),
+		FinishedAt:       ev.FinishedAt(),
+	}))
+}
+
 // finalizeResult stamps the authoritative terminal usage account (provider,
 // model, aggregate input/output tokens, latency, artifact) onto the result. It
 // is the SINGLE place token accounting is computed — from the provider-reported
 // ModelInvocations — so the renderer reads ExecutionResult.Completed and never
 // re-sums usage. It must be called on every terminal return path of the
-// executor (Execute / Approve / Reject).
+// executor (Execute / Approve / Reject). Phase 2 P2: it also seals the
+// immutable ExecutionEvidence on every TERMINAL path — the single authoritative
+// record downstream projectors consume.
 func (x *RuntimeExecutor) finalizeResult(res *ExecutionResult) *ExecutionResult {
 	if res == nil {
 		return nil
@@ -1690,6 +2046,7 @@ func (x *RuntimeExecutor) finalizeResult(res *ExecutionResult) *ExecutionResult 
 	}
 	cc.Artifact = res.ArtifactKind
 	res.Completed = cc
+	x.sealTerminalEvidence(res)
 	return res
 }
 

@@ -86,8 +86,13 @@ const (
 	OutcomeTruncated                 MutationOutcome = "truncated"
 	OutcomeApplyFailed               MutationOutcome = "apply_failed"
 	OutcomeVerifyFailed              MutationOutcome = "verify_failed"
-	OutcomeSkipped                   MutationOutcome = "skipped"
-	OutcomeCancelled                 MutationOutcome = "cancelled"
+	// OutcomeOCCAborted is the terminal outcome of an execution whose Phase 3
+	// OCC commit gate found the target state diverged from the admitted
+	// baseline. Nothing was applied — the gate precedes the apply stage — and
+	// the sealed evidence outcome is ABORTED_OCC with tainted mutations.
+	OutcomeOCCAborted MutationOutcome = "occ_aborted"
+	OutcomeSkipped    MutationOutcome = "skipped"
+	OutcomeCancelled  MutationOutcome = "cancelled"
 	// OutcomePendingApproval is the outcome of a targeted mutation that stopped
 	// at the human-in-the-loop approval gate with a valid held artifact. It is
 	// NEVER a terminal mutation outcome — the execution is paused, awaiting a
@@ -131,6 +136,8 @@ func (o MutationOutcome) Display() string {
 		return "apply failed"
 	case OutcomeVerifyFailed:
 		return "verify failed"
+	case OutcomeOCCAborted:
+		return "occ aborted"
 	case OutcomeSkipped:
 		return "skipped"
 	case OutcomeCancelled:
@@ -219,6 +226,8 @@ func ParseMutationOutcome(s string) MutationOutcome {
 		return OutcomeApplyFailed
 	case "verify_failed", "verify-failed", "verify failed":
 		return OutcomeVerifyFailed
+	case "occ_aborted", "occ-aborted", "occ aborted":
+		return OutcomeOCCAborted
 	case "skipped":
 		return OutcomeSkipped
 	case "cancelled", "canceled":
