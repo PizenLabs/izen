@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
@@ -78,7 +77,7 @@ func (d *Driver) stageDecomposition() bool {
 	}
 	source, ok := d.adapter.ReadTargetFile(target)
 	if !ok || len(source) == 0 {
-		log.Printf("[boundary2] decomposition skipped: target %s unreadable", target)
+		diagnosticf("[boundary2] decomposition skipped: target %s unreadable", target)
 		return false
 	}
 	base := d.req.WorkspaceDigest
@@ -87,7 +86,7 @@ func (d *Driver) stageDecomposition() bool {
 	}
 	dag, err := d.decompose(d.prompt, target, source, base, maxOut)
 	if err != nil {
-		log.Printf("[boundary2] decomposition unavailable: %v — falling back to explicit re-scope", err)
+		diagnosticf("[boundary2] decomposition unavailable: %v — falling back to explicit re-scope", err)
 		return false
 	}
 	d.dag = dag
@@ -99,7 +98,7 @@ func (d *Driver) stageDecomposition() bool {
 	d.loop.AwaitHuman(b)
 	d.enrichBoundary()
 	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
-	log.Printf("[boundary2] DECOMPOSITION_PROPOSAL staged plan=%s target=%s sub_tasks=%d ceiling=%d tok/sub-task",
+	diagnosticf("[boundary2] DECOMPOSITION_PROPOSAL staged plan=%s target=%s sub_tasks=%d ceiling=%d tok/sub-task",
 		dag.Status, target, len(dag.SubTasks), dag.Budget())
 	return true
 }
@@ -229,7 +228,7 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 		// any out-of-band writer between steps is caught at the top of the
 		// loop. A no-change apply keeps the same digest — still consistent.
 		expected = after
-		log.Printf("[boundary2] sub-task %s applied outcome=%s progress=%d/%d digest=%s…",
+		diagnosticf("[boundary2] sub-task %s applied outcome=%s progress=%d/%d digest=%s…",
 			st.ID, obs.Outcome, i+1, n, short(after))
 	}
 
@@ -307,7 +306,7 @@ func (d *Driver) failDAG(ctx context.Context, dag *planner.ExecutionDAG, origina
 	}
 	dag.Status = planner.DagExecutionFailed
 	dag.FailureReason = reason
-	log.Printf("[boundary2] DAG_EXECUTION_FAILED target=%s applied=%d/%d — workspace rolled back to base digest %s…: %s",
+	diagnosticf("[boundary2] DAG_EXECUTION_FAILED target=%s applied=%d/%d — workspace rolled back to base digest %s…: %s",
 		dag.Target, completed, len(dag.SubTasks), short(dag.BaseTreeDigest), reason)
 	return d.terminateAbort(ctx, "DAG_EXECUTION_FAILED: "+reason, autonomy.FailurePermanent)
 }

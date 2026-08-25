@@ -608,6 +608,17 @@ func Wire(opts ...Option) (*Application, error) {
 		runtimeAutonomy.NewExecutorAdapter(root, a.Gateway, a.Executor),
 		a.Bus,
 	)
+	// ── AUTONOMY BOUNDARY-TELEMETRY SINK ─────────────────────────────────
+	// [boundary2]/[boundary5] diagnostic lines are routed onto the shared
+	// event bus as engine.activity events instead of the standard logger:
+	// raw stderr writes from background goroutines race Bubble Tea's
+	// altscreen renderer and corrupt the live frame. The UI projects them
+	// like every other domain event; zero autonomy bytes ever reach stdio.
+	if a.Bus != nil {
+		runtimeAutonomy.SetDiagnosticLog(func(format string, args ...interface{}) {
+			a.Bus.Publish(events.NewActivity(fmt.Sprintf(format, args...)))
+		})
+	}
 
 	// ── MULTI-TIER PATCH ENGINE ──────────────────────────────────────────
 	// The new patch engine replaces the legacy patch application pipeline in

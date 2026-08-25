@@ -16,7 +16,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -160,7 +159,7 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 	}
 	if req.WorkspaceDigest != "" && len(targets) > 0 {
 		if current := a.WorkspaceVersion(targets); current != "" && current != req.WorkspaceDigest {
-			log.Printf("[boundary5] workspace_drift request=%s targets=%v expected=%s… actual=%s… — halting before execution",
+			diagnosticf("[boundary5] workspace_drift request=%s targets=%v expected=%s… actual=%s… — halting before execution",
 				req.RequestID, targets, short(req.WorkspaceDigest), short(current))
 			return a.driftObservation(req, targets), nil
 		}

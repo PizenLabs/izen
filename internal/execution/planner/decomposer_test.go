@@ -185,8 +185,10 @@ func TestDecompose_GoSource20KB(t *testing.T) {
 	}
 }
 
-// A declaration whose body alone busts the budget yields NO plan.
-func TestDecompose_GoIndivisibleFunctionFailsClosed(t *testing.T) {
+// A declaration whose body alone busts the budget no longer fails closed: the
+// secondary fine-grained line-slicing fallback cuts the indivisible function
+// into contiguous budget-bounded line windows bound to explicit intervals.
+func TestDecompose_GoIndivisibleFunctionFallsBackToLineSlices(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("package x\n\n")
 	b.WriteString("// Giant holds one enormous function.\n")
@@ -199,11 +201,22 @@ func TestDecompose_GoIndivisibleFunctionFailsClosed(t *testing.T) {
 	const maxOutput = 4096
 
 	dag, err := Decompose("rewrite giant func", "giant.go", source, "digest-base", maxOutput)
-	if err == nil || dag != nil {
-		t.Fatalf("want ErrNotDecomposable with nil dag, got dag=%v err=%v", dag, err)
+	if err != nil {
+		t.Fatalf("Decompose: %v", err)
 	}
-	if !strings.Contains(err.Error(), "indivisible") {
-		t.Fatalf("err = %v, want indivisible-section sentinel text", err)
+	requireValidDAG(t, dag, source)
+	if len(dag.SubTasks) < 2 {
+		t.Fatalf("sub-tasks = %d, want the giant function line-sliced into multiple units", len(dag.SubTasks))
+	}
+	// The structural preamble stays ast_structural; every window cut out of
+	// the oversized function carries the bounded-lines contract.
+	if dag.SubTasks[0].Kind != SplitAST {
+		t.Fatalf("first sub-task kind = %s, want %s", dag.SubTasks[0].Kind, SplitAST)
+	}
+	for _, st := range dag.SubTasks[1:] {
+		if st.Kind != SplitBoundedLines {
+			t.Fatalf("%s kind = %s, want %s", st.ID, st.Kind, SplitBoundedLines)
+		}
 	}
 }
 

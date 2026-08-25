@@ -71,13 +71,15 @@ func Decomposable(target string) bool {
 
 // Decompose partitions ONE infeasible objective into a validated ExecutionDAG.
 // It selects the structural or block decomposer for the target's format,
-// splits the source at natural boundaries, greedily groups adjacent sections
-// under the strict sub-task budget, and stages the plan against baseDigest.
+// splits the source at natural boundaries, slices any section that still
+// exceeds the strict sub-task budget into contiguous line-range windows
+// (FallbackLineSlicer), greedily groups adjacent sections under the budget,
+// and stages the plan against baseDigest.
 //
 // The returned DAG satisfies every Validate() invariant and every sub-task
-// passes the Boundary-2 preflight guard individually. When even the finest
-// split cannot fit the budget the error is ErrNotDecomposable — fail-closed,
-// with no partial plan returned.
+// passes the Boundary-2 preflight guard individually. When even single lines
+// cannot fit the budget the error is ErrNotDecomposable — fail-closed, with no
+// partial plan returned.
 func Decompose(objective, target string, source []byte, baseDigest string, maxOutputTokens int) (*ExecutionDAG, error) {
 	if len(strings.TrimSpace(string(source))) == 0 {
 		return nil, ErrEmptySource
@@ -98,6 +100,17 @@ func Decompose(objective, target string, source []byte, baseDigest string, maxOu
 		return nil, ErrEmptySource
 	}
 
+	// ── SECONDARY FALLBACK: fine-grained line slicing ────────────────────
+	// A parser block (AST unit or top-level DOM/config block) whose own token
+	// estimate exceeds safeChunkLimit must NOT fail the objective closed: it
+	// is sliced along clean \n breaks into contiguous budget-bounded windows
+	// bound to explicit line intervals. Only a SINGLE LINE larger than the
+	// ceiling refuses to decompose.
+	sections, err = explodeOversizeSections(source, sections, budget)
+	if err != nil {
+		return nil, err
+	}
+
 	dag := NewExecutionDAG(objective, target, kindOf(d), baseDigest, maxOutputTokens)
 	groups, err := groupSections(sections, func(r Region) int { return EstimateRegionTokens(source, r) }, budget)
 	if err != nil {
@@ -108,7 +121,7 @@ func Decompose(objective, target string, source []byte, baseDigest string, maxOu
 		st := SubTask{
 			ID:              fmt.Sprintf("st-%d", i+1),
 			Index:           i + 1,
-			Kind:            dag.Kind,
+			Kind:            subTaskKind(dag.Kind, g),
 			Target:          target,
 			Description:     describeGroup(g),
 			Region:          region,
@@ -138,9 +151,10 @@ func kindOf(d Decomposer) SplitKind {
 // merged REGION is always re-estimated as a whole (never the sum of its
 // parts): floor division makes token estimates superadditive, so a merged
 // region can cost more than the sum of its sections and must be measured
-// directly against the ceiling. A single indivisible section larger than the
-// ceiling aborts with ErrNotDecomposable — no oversized unit ever joins a
-// plan.
+// directly against the ceiling. Oversize sections were already exploded into
+// line windows by explodeOversizeSections upstream; the indivisible-section
+// abort here remains as the fail-closed defense in depth — no oversized unit
+// ever joins a plan.
 func groupSections(sections []Section, estimate func(Region) int, budget int) ([][]Section, error) {
 	var groups [][]Section
 	var cur []Section
@@ -184,6 +198,92 @@ func groupSections(sections []Section, estimate func(Region) int, budget int) ([
 func indivisibleError(s Section, tok, budget int) error {
 	return fmt.Errorf("%w: %q spans %s (%d lines) and estimates ~%d tokens but the ceiling is %d",
 		ErrNotDecomposable, truncateLabel(s.Label), s.Region, s.Region.Lines(), tok, budget)
+}
+
+// ── Secondary fallback: fine-grained line slicing ───────────────────────────
+
+// FallbackLineSlicer partitions ONE oversize section into contiguous
+// budget-bounded LINE windows. It walks clean \n breaks and greedily
+// accumulates lines until admitting one more would push the window's token
+// estimate past safeChunkLimit (the strict sub-task ceiling,
+// max_output × 0.7); the accumulated range is then emitted as a Section bound
+// to its explicit [StartLine, EndLine] interval. Token estimates use the
+// SAME accounting as Boundary 2 (bytes/4 × FullRewriteTokenMultiplier), so
+// every emitted window passes EvaluatePreflight individually BY CONSTRUCTION.
+//
+// A single line whose own estimate already exceeds safeChunkLimit is truly
+// indivisible: the error is fail-closed ErrNotDecomposable.
+func FallbackLineSlicer(source []byte, s Section, safeChunkLimit int) ([]Section, error) {
+	lines := splitKeepNewline(SliceLines(source, s.Region))
+	if len(lines) == 0 || s.Region.StartLine < 1 || s.Region.EndLine < s.Region.StartLine {
+		return nil, fmt.Errorf("%w: section %q carries no sliceable content", ErrNotDecomposable, truncateLabel(s.Label))
+	}
+	base := s.Region.StartLine
+	var out []Section
+	winStart := 0 // index into lines: first line of the open window
+	winBytes := 0 // bytes of the open window incl. per-line newlines
+	emit := func(last int) {
+		r := Region{StartLine: base + winStart, EndLine: base + last}
+		out = append(out, Section{
+			Region:       r,
+			Label:        fmt.Sprintf("%s [%s]", truncateLabel(s.Label), r),
+			BoundedLines: true,
+		})
+	}
+	for i, line := range lines {
+		n := len(line) + 1
+		if winBytes > 0 && regionTokens(winBytes+n) > safeChunkLimit {
+			emit(i - 1)
+			winStart, winBytes = i, 0
+		}
+		if est := regionTokens(n); est > safeChunkLimit {
+			return nil, fmt.Errorf("%w: %q line %d alone estimates ~%d tokens but the ceiling is %d — no finer split exists",
+				ErrNotDecomposable, truncateLabel(s.Label), base+i, est, safeChunkLimit)
+		}
+		winBytes += n
+	}
+	emit(len(lines) - 1)
+	return out, nil
+}
+
+// explodeOversizeSections replaces every section whose own token estimate
+// exceeds safeChunkLimit with the contiguous line-range windows produced by
+// FallbackLineSlicer. Sections already within budget pass through untouched;
+// ordering and contiguity are preserved, so the union still covers the whole
+// source. Any failure is fail-closed: no oversized unit survives.
+func explodeOversizeSections(source []byte, sections []Section, safeChunkLimit int) ([]Section, error) {
+	var out []Section
+	for _, s := range sections {
+		if regionTokens(len(SliceLines(source, s.Region))) <= safeChunkLimit {
+			out = append(out, s)
+			continue
+		}
+		slices, err := FallbackLineSlicer(source, s, safeChunkLimit)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, slices...)
+	}
+	return out, nil
+}
+
+// regionTokens applies the canonical Boundary-2 accounting to a raw byte
+// count: bytes/4 × FullRewriteTokenMultiplier. It mirrors
+// EstimateRegionTokens for byte counts that have not (yet) become a Region.
+func regionTokens(n int) int {
+	return EstimateTokens(n) * execution.FullRewriteTokenMultiplier
+}
+
+// subTaskKind selects the mutation contract label of one grouped unit: any
+// group containing a line-sliced fragment is bound to the explicit line
+// intervals it was cut into, so it carries SEARCH_REPLACE_BOUNDED_LINES.
+func subTaskKind(defaultKind SplitKind, group []Section) SplitKind {
+	for _, s := range group {
+		if s.BoundedLines {
+			return SplitBoundedLines
+		}
+	}
+	return defaultKind
 }
 
 // describeGroup renders the bounded human description of one group of

@@ -19,8 +19,14 @@
 //     which is STRICTLY inside the Boundary-2 ceiling, so every generated
 //     sub-task passes EvaluatePreflight individually by construction.
 //
-//   - A target whose single indivisible section still exceeds the sub-task
-//     budget yields NO DAG (ErrNotDecomposable) — never an oversized plan.
+//   - A section that no structural or block parser can divide further yet
+//     exceeds the sub-task budget is cut FURTHER by the secondary fine-grained
+//     line-slicing fallback (FallbackLineSlicer) into contiguous budget-bounded
+//     line windows bound to explicit line intervals.
+//
+//   - Only a target whose SINGLE LINE still exceeds the sub-task budget under
+//     the fallback yields NO DAG (ErrNotDecomposable) — never an oversized
+//     plan.
 //
 // The package is pure planning: it never reads the workspace, never invokes a
 // provider, and never mutates anything. The autonomy driver owns execution of
@@ -41,6 +47,14 @@ const (
 	SplitAST SplitKind = "ast_structural"
 	// SplitBlock is top-level block splitting (HTML/MD/Config).
 	SplitBlock SplitKind = "block"
+	// SplitBoundedLines is the secondary fine-grained fallback strategy: a
+	// section that no structural or block parser can divide further yet still
+	// exceeds the strict sub-task ceiling is cut into contiguous
+	// budget-bounded LINE windows. Each sub-task carries the
+	// SEARCH_REPLACE_BOUNDED_LINES contract: its patch must anchor on text
+	// copied verbatim from inside its explicit line interval (SubTask.Region),
+	// never from outside it.
+	SplitBoundedLines SplitKind = "SEARCH_REPLACE_BOUNDED_LINES"
 )
 
 // String returns the canonical label of the split kind.
@@ -105,6 +119,11 @@ func LineCount(source []byte) int {
 type Section struct {
 	Region Region
 	Label  string // e.g. `func (s *Server) Start`, "<section id=\"nav\">", "# Usage"
+	// BoundedLines marks a section produced by the secondary fine-grained
+	// line-slicing fallback (FallbackLineSlicer). Its Region is an arbitrary
+	// contiguous line window, not a natural structural unit, so the bound
+	// sub-task's mutation contract is the explicit line interval itself.
+	BoundedLines bool
 }
 
 // Decomposer partitions one class of artifacts into candidate sections at
@@ -124,8 +143,9 @@ type Decomposer interface {
 var (
 	// ErrNoDecomposer: no registered decomposer handles the target's format.
 	ErrNoDecomposer = errors.New("planner: no decomposer registered for target")
-	// ErrNotDecomposable: a single indivisible section already exceeds the
-	// per-sub-task budget, so no valid DAG can exist for this budget.
+	// ErrNotDecomposable: even the finest split — the line-slicing fallback
+	// cut to single lines — cannot fit the per-sub-task budget, so no valid
+	// DAG can exist for this budget.
 	ErrNotDecomposable = errors.New("planner: indivisible section exceeds the sub-task budget")
 	// ErrInvalidDAG: the staged DAG failed validation (budget, dependency or
 	// ordering invariant). Never execute an invalid DAG.
