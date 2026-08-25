@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/execution/planner"
 )
 
 // ── RuntimeState ────────────────────────────────────────────────────────────
@@ -336,6 +337,12 @@ const (
 	// bounds exhaustion): no resume decision exists — the human may start a
 	// fresh bounded run.
 	HumanBoundaryInform HumanBoundaryAction = "inform"
+	// HumanBoundaryDecomposition is the typed DECOMPOSITION_PROPOSAL gate:
+	// Boundary 2 refused the objective as preflight_infeasible and the
+	// planner staged a validated ExecutionDAG. The human approves the WHOLE
+	// plan (every sub-task listed on the boundary) before the atomic
+	// transaction loop may run; resumable via the driver's proposal surface.
+	HumanBoundaryDecomposition HumanBoundaryAction = "decomposition_proposal"
 )
 
 // String returns the canonical boundary-action label.
@@ -357,7 +364,12 @@ type HumanBoundary struct {
 	// authoritative for the UI: the executor authorization issued on approve
 	// covers exactly these files.
 	Targets []string
-	// Action discriminates the boundary kind (approve/clarify/inform).
+	// Proposal is the staged task-decomposition plan when Action is
+	// HumanBoundaryDecomposition. It lists every sub-task the human is being
+	// asked to authorize; approval covers ALL of them as one atomic plan.
+	Proposal *planner.ExecutionDAG
+	// Action discriminates the boundary kind (approve/clarify/inform/
+	// decomposition_proposal).
 	Action HumanBoundaryAction
 	// Resumable reports whether a Resume* decision exists for this boundary.
 	// An inform boundary is not resumable; only a fresh bounded run continues.
@@ -374,6 +386,9 @@ func DeriveBoundaryAction(b *HumanBoundary) {
 	switch {
 	case b.PatchID != "":
 		b.Action = HumanBoundaryApproval
+		b.Resumable = true
+	case b.Proposal != nil:
+		b.Action = HumanBoundaryDecomposition
 		b.Resumable = true
 	case len(b.Options) > 0:
 		b.Action = HumanBoundaryClarify
@@ -476,6 +491,12 @@ type LoopRequest struct {
 	// out-of-band change between attempts returns a workspace_drift
 	// observation with ZERO provider requests.
 	WorkspaceDigest string
+	// StagedPlan carries the approved decomposition plan when this request is
+	// ONE sub-task of a staged ExecutionDAG. The adapter projects its sub-task
+	// windows onto the executor's Boundary-2 preflight so every unit is
+	// evaluated individually and the monolithic full-rewrite estimation of
+	// the original target is suppressed. Nil for non-DAG requests.
+	StagedPlan *planner.ExecutionDAG
 	// FinishReason carries the previous attempt's finish_reason for observability.
 	FinishReason string
 	// StreamCallback is an optional callback for incremental streaming progress.
@@ -530,6 +551,29 @@ func (l *RuntimeLoop) Bounds() LoopBounds {
 		return DefaultLoopBounds()
 	}
 	return l.bounds
+}
+
+// WidenBounds raises the runtime-owned bounds to at least the given floors.
+// It exists for HUMAN-APPROVED plans (the DECOMPOSITION_PROPOSAL gate): a
+// proposal of N sub-tasks legitimately exceeds the single-objective defaults,
+// and the human consented to exactly that scope when approving. Bounds are
+// never lowered — widening only reserves headroom for the consented plan.
+func (l *RuntimeLoop) WidenBounds(minAttempts, minSteps, minTokens, minIdentical int) {
+	if l == nil {
+		return
+	}
+	if l.bounds.MaxAttempts < minAttempts {
+		l.bounds.MaxAttempts = minAttempts
+	}
+	if l.bounds.MaxExecutionSteps < minSteps {
+		l.bounds.MaxExecutionSteps = minSteps
+	}
+	if l.bounds.MaxTotalTokens < minTokens {
+		l.bounds.MaxTotalTokens = minTokens
+	}
+	if l.bounds.MaxIdenticalDecisions < minIdentical {
+		l.bounds.MaxIdenticalDecisions = minIdentical
+	}
 }
 
 // Attempts returns the execution-attempt counter for the current objective.

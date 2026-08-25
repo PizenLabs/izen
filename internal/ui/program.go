@@ -421,8 +421,18 @@ func runProgram(p *tea.Program, root string, initStage initStage) {
 	// The application must never require tmux kill-pane to recover.
 	stopSignals := installRootSignalBridge(p)
 
+	// ── STANDARD-LOGGER SILENCING (altscreen guard) ──────────────────────
+	// While p.Run() owns the terminal in altscreen mode, redirect the
+	// standard library logger into an in-memory ring buffer. Any raw byte a
+	// background goroutine writes to stdout/stderr races the renderer's ANSI
+	// frames and corrupts the TUI; the ring keeps the diagnostics recoverable
+	// without ever touching the terminal. Restored explicitly below (before
+	// any exit) so post-run error reporting still reaches stderr normally.
+	restoreStdLog := installStdLogCapture()
+
 	_, runErr := p.Run()
 	stopSignals()
+	restoreStdLog()
 	if runErr != nil {
 		fmt.Fprintf(os.Stderr, "Error running Izen: %v\n", runErr)
 		os.Exit(1)

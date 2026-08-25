@@ -9,6 +9,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/execution/planner"
 )
 
 // ── PRODUCTION AUTONOMOUS DRIVER BRIDGE (Phase 6) ───────────────────────────
@@ -57,6 +58,8 @@ type autonomousDriver interface {
 	ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, error)
 	ResumeReject(ctx context.Context, reason string) (*autonomy.LoopTermination, error)
 	ResumeClarify(ctx context.Context, target string) (*autonomy.LoopTermination, error)
+	ResumeApproveProposal(ctx context.Context) (*autonomy.LoopTermination, error)
+	ResumeRejectProposal(ctx context.Context, reason string) (*autonomy.LoopTermination, error)
 	Abort(reason string) (*autonomy.LoopTermination, error)
 	State() autonomy.RuntimeState
 	Boundary() *autonomy.HumanBoundary
@@ -212,6 +215,51 @@ func (m *model) resumeAutonomousClarify() tea.Cmd {
 	}
 }
 
+// resumeAutonomousProposalApprove resolves a parked DECOMPOSITION_PROPOSAL
+// boundary by authorizing the WHOLE plan: the driver runs every approved
+// sub-task as one atomic transaction. The authorization issued here covers
+// exactly the plan's target files, mirroring the plain approval gate.
+func (m *model) resumeAutonomousProposalApprove() tea.Cmd {
+	b := m.autonomousBoundary
+	if b == nil || b.Action != autonomy.HumanBoundaryDecomposition || b.Proposal == nil {
+		return nil
+	}
+	if err := m.authorizeAutonomousApproval(); err != nil {
+		m.push(roleError, "[autonomous] proposal authorization: "+err.Error())
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+	m.autonomousBoundary = nil
+	m.beginOperation(OpAutonomous)
+	m.agentLabel = ""
+	m.startShimmer("", "autonomy dag")
+	ctx := m.operationContext()
+	return func() tea.Msg {
+		term, err := m.autonomousDriver.ResumeApproveProposal(ctx)
+		return autonomousRunMsg{term: term, err: err}
+	}
+}
+
+// resumeAutonomousProposalReject resolves a parked DECOMPOSITION_PROPOSAL by
+// rejecting the whole plan. Nothing was executed; the rejection is a terminal
+// human decision.
+func (m *model) resumeAutonomousProposalReject(reason string) tea.Cmd {
+	b := m.autonomousBoundary
+	if b == nil || b.Action != autonomy.HumanBoundaryDecomposition {
+		return nil
+	}
+	m.autonomousBoundary = nil
+	m.beginOperation(OpAutonomous)
+	m.agentLabel = ""
+	m.startShimmer("", "autonomy cancel")
+	ctx := m.operationContext()
+	return func() tea.Msg {
+		term, err := m.autonomousDriver.ResumeRejectProposal(ctx, reason)
+		return autonomousRunMsg{term: term, err: err}
+	}
+}
+
 // abortAutonomousRun aborts a parked driver run. It is the only UI path to
 // cancel a parked run; an in-flight run is cancelled via its context.
 func (m *model) abortAutonomousRun(reason string) tea.Cmd {
@@ -285,6 +333,12 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 			case autonomy.HumanBoundaryApproval:
 				m.finalizeOperation(OpOutcomeAmbiguous, nil)
 				m.renderAutonomousApprovalBoundary(b)
+			case autonomy.HumanBoundaryDecomposition:
+				// A staged DECOMPOSITION_PROPOSAL (PLAN_STAGED) is a live
+				// human decision: render the interactive proposal card, not
+				// an inform/pause notice.
+				m.finalizeOperation(OpOutcomeAmbiguous, nil)
+				m.renderAutonomousDecompositionBoundary(b)
 			default:
 				m.finalizeOperation(OpOutcomeFailure, nil)
 				m.renderAutonomousInformBoundary(b)
@@ -406,6 +460,62 @@ func (m *model) renderAutonomousInformBoundary(b *autonomy.HumanBoundary) {
 	m.push(roleSystem, mutedStyle.Render("  No further automatic execution. Start a fresh run (Ctrl+C to dismiss)."))
 }
 
+// renderAutonomousDecompositionBoundary renders the parked DECOMPOSITION_
+// PROPOSAL (PLAN_STAGED) status lines: the staged plan, its strategy and its
+// sub-task breakdown, plus the explicit keybindings.
+func (m *model) renderAutonomousDecompositionBoundary(b *autonomy.HumanBoundary) {
+	dag := b.Proposal
+	if dag == nil {
+		m.renderAutonomousInformBoundary(b)
+		return
+	}
+	m.push(roleStatus, fmt.Sprintf(
+		"%s DECOMPOSITION PROPOSAL — %d staged sub-task(s) on %s",
+		boldSapphireStyle.Render(Icon.Blueprint), len(dag.SubTasks), dag.Target))
+	m.push(roleSystem, mutedStyle.Render("  "+b.Reason))
+	m.push(roleSystem, infoStyle.Render("  Enter authorizes & runs the whole DAG · Esc cancels the plan"))
+}
+
+// renderDecompositionProposalBlock renders the staged ExecutionDAG as a
+// framed interactive proposal box: the splitting strategy kind, every sub-task
+// with its line-range window, and the navigation keys.
+func renderDecompositionProposalBlock(dag *planner.ExecutionDAG, width int) string {
+	boxWidth := width - 4
+	if boxWidth < 40 {
+		boxWidth = 40
+	}
+
+	var sb strings.Builder
+	sb.WriteString(decompositionTitleStyle.Render(Icon.Blueprint + " DECOMPOSITION PROPOSAL"))
+	sb.WriteString("\n\n")
+	sb.WriteString(permissionDescStyle.Render("Strategy:"))
+	sb.WriteString(" " + permissionTargetStyle.Render(string(dag.Kind)))
+	sb.WriteString("\n")
+	sb.WriteString(permissionDescStyle.Render("Target:"))
+	sb.WriteString(" " + permissionTargetStyle.Render(dag.Target))
+	sb.WriteString("\n")
+	sb.WriteString(permissionDescStyle.Render(fmt.Sprintf("Sub-tasks (%d):", len(dag.SubTasks))))
+	sb.WriteString("\n")
+	for _, st := range dag.SubTasks {
+		fmt.Fprintf(&sb, "  %s %s %s — %s (~%d tok)\n",
+			decompositionKeyStyle.Render(st.ID),
+			Icon.Chevron,
+			boldTextStyle.Render(st.Region.String()),
+			mutedStyle.Render(truncateDisplay(st.Description, 48)),
+			st.EstimatedTokens)
+	}
+	total := dag.TotalEstimatedTokens()
+	fmt.Fprintf(&sb, "%s ~%d tok total · budget ≤%d tok/sub-task\n",
+		permissionDescStyle.Render("Budget:"), total, dag.Budget())
+
+	sep := strings.Repeat("─", boxWidth-4)
+	sb.WriteString(" " + sep + "\n")
+	sb.WriteString(" " + fmt.Sprintf("%s Authorize & Run DAG   %s Cancel",
+		decompositionKeyStyle.Render("[Enter]"), decompositionKeyStyle.Render("[Esc]")) + "\n")
+
+	return decompositionBoxStyle.Width(boxWidth).Render(sb.String())
+}
+
 // renderAutonomousBoundaryBlock renders the parked driver boundary as an
 // interactive card. It is the ONLY human decision surface for a parked run.
 func (m *model) renderAutonomousBoundaryBlock(width int) string {
@@ -454,6 +564,21 @@ func (m *model) renderAutonomousBoundaryBlock(width int) string {
 		sb.WriteString(" " + infoStyle.Render(b.Reason))
 		sb.WriteString("\n")
 		sb.WriteString(" " + mutedStyle.Render("No further automatic execution. Start a fresh run (Ctrl+C to dismiss).") + "\n")
+		return permissionBoxStyle.Width(boxWidth).Render(sb.String())
+	case autonomy.HumanBoundaryDecomposition:
+		// The staged DECOMPOSITION_PROPOSAL (PLAN_STAGED) decision card.
+		if b.Proposal != nil {
+			return renderDecompositionProposalBlock(b.Proposal, width)
+		}
+		sb.WriteString(permissionTitleStyle.Render(Icon.Warning + " DECOMPOSITION PROPOSAL"))
+		sb.WriteString("\n\n")
+		sb.WriteString(permissionDescStyle.Render("Reason:"))
+		sb.WriteString(" " + infoStyle.Render(b.Reason))
+		sb.WriteString("\n")
+		sep := strings.Repeat("─", boxWidth-4)
+		sb.WriteString(" " + sep + "\n")
+		sb.WriteString(" " + fmt.Sprintf("%s Authorize & Run DAG   %s Cancel",
+			decompositionKeyStyle.Render("[Enter]"), decompositionKeyStyle.Render("[Esc]")) + "\n")
 		return permissionBoxStyle.Width(boxWidth).Render(sb.String())
 	default:
 		return ""

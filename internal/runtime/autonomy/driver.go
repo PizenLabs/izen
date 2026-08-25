@@ -8,6 +8,7 @@ import (
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/execution/planner"
 )
 
 // Decider maps a bounded observation to the next loop decision. It is
@@ -40,6 +41,13 @@ type Driver struct {
 	req       autonomy.LoopRequest
 	obs       autonomy.Observation
 	published int
+
+	// decompose stages a Boundary-2 expansion plan when the preflight guard
+	// refuses an objective (preflight_infeasible). Nil disables decomposition:
+	// the loop then parks at the plain explicit-re-scope boundary.
+	decompose DecomposeFunc
+	// dag is the most recently staged/executed decomposition plan.
+	dag *planner.ExecutionDAG
 
 	// runCtx is the context for the current run. It is stored so Abort()
 	// can cancel the same context that observeAndRun is watching.
@@ -95,15 +103,26 @@ func WithStreamCallback(cb execution.StreamCallback) Option {
 	return func(d *Driver) { d.streamCb = cb }
 }
 
+// WithDecompose overrides the Boundary-2 expansion planner. Passing nil
+// DISABLES decomposition proposals: a preflight_infeasible observation then
+// parks at the plain explicit-re-scope human boundary, exactly as before this
+// expansion existed.
+func WithDecompose(f DecomposeFunc) Option {
+	return func(d *Driver) { d.decompose = f }
+}
+
 // NewDriver wires the bounded loop over the executor adapter. bus may be nil
-// (loop runs headless; transitions are still recorded in History).
+// (loop runs headless; transitions are still recorded in History). By default
+// the driver stages DECOMPOSITION_PROPOSAL plans when Boundary 2 refuses an
+// objective as preflight_infeasible; see WithDecompose to override or disable.
 func NewDriver(adapter *ExecutorAdapter, bus *events.Bus, opts ...Option) *Driver {
 	d := &Driver{
-		adapter: adapter,
-		bus:     bus,
-		bounds:  autonomy.DefaultLoopBounds(),
-		decide:  decideDefault,
-		repair:  typedRepair,
+		adapter:   adapter,
+		bus:       bus,
+		bounds:    autonomy.DefaultLoopBounds(),
+		decide:    decideDefault,
+		repair:    typedRepair,
+		decompose: defaultDecompose,
 	}
 	for _, o := range opts {
 		o(d)
@@ -403,6 +422,16 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			d.obs.AttemptNum = d.loop.Attempts()
 			d.obs.RecoveryCycle = d.loop.RecoveryCycles()
 			decision := d.decide(d.obs, d.loop.Bounds())
+			// ── BOUNDARY 2 EXPANSION (preflight_infeasible) ────────────
+			// Before parking at the generic re-scope gate, try to stage a
+			// typed DECOMPOSITION_PROPOSAL. When staging succeeds the loop is
+			// already parked; when it fails, fall through unchanged — the
+			// user's explicit re-scope decision is never pre-empted.
+			if decision.Action == autonomy.LoopAskHuman &&
+				d.obs.Outcome == autonomy.OutcomePreflightInfeasible &&
+				d.stageDecomposition() {
+				return d.term(), nil
+			}
 			if _, err := d.step(ctx, decision); err != nil {
 				return nil, err
 			}
