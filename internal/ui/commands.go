@@ -1446,6 +1446,16 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	// user mode switch always wins over the logical phase graph (e.g. switching
 	// directly from /review to /plan is not a valid edge).
 	if m.orch != nil {
+		// ── FAST-PATH EPHEMERAL PLAN INJECTION ($hot / "/build" shortcuts) ──
+		// These shortcuts switch the phase ask → build dynamically WITHOUT an
+		// initial LLM plan. Inject an EphemeralPlan wrapper into the
+		// orchestrator state so the workflow guard sees authorized plan
+		// evidence — otherwise Phase lands on building while the guard still
+		// evaluates an uninitialized planning context and rejects the very
+		// execution the user explicitly requested.
+		if mode == modes.ModeBuild && !m.hasStagedBuildWork() && !m.orch.HasAuthorizedPlan() {
+			_ = m.orch.InjectEphemeralPlan("fast-path:" + mode.String())
+		}
 		_ = m.orch.Force(phaseForMode(mode), workflow.TransitionContext{
 			HasPlan:         m.sess != nil && len(m.sess.CurrentTasks) > 0,
 			HasCapabilities: m.caps != nil,

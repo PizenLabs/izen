@@ -249,6 +249,9 @@ func (m *model) resumeAutonomousProposalReject(reason string) tea.Cmd {
 	if b == nil || b.Action != autonomy.HumanBoundaryDecomposition {
 		return nil
 	}
+	// A rejected proposal authorizes nothing: drop any plan authorization the
+	// run carried so the workflow guard stays honest for future runs.
+	m.orch.ClearAuthorizedPlan()
 	m.autonomousBoundary = nil
 	m.beginOperation(OpAutonomous)
 	m.agentLabel = ""
@@ -388,12 +391,24 @@ func (m *model) authorizeAutonomousApproval() error {
 	if m.executor == nil || m.authEngine == nil {
 		return nil
 	}
+	// ── STAGED DAG HANDSHAKE (planning → building guard) ────────────────
+	// An approved DECOMPOSITION_PROPOSAL IS an authorized plan: the staged
+	// ExecutionDAG lives inside the Autonomy Loop context (StagedPlan), so it
+	// must be registered with the orchestrator BEFORE the workflow transition
+	// is requested — otherwise the guard rejects planning → building with
+	// "no authorized plan or micro-plan" even though the human just approved
+	// every sub-task.
+	b := m.autonomousBoundary
+	if m.orch != nil && b != nil && b.Action == autonomy.HumanBoundaryDecomposition && b.Proposal != nil {
+		if err := m.orch.BindAuthorizedMicroPlan(context.Background(), b.Proposal); err != nil {
+			return fmt.Errorf("micro-plan binding failed: %w", err)
+		}
+	}
 	// Ensure workflow is in Building/Repairing state for authorization.
 	// Autonomous execution from /model mode starts in Planning; we must transition.
 	if err := m.transitionToBuilding(); err != nil {
 		return fmt.Errorf("workflow transition to building failed: %w", err)
 	}
-	b := m.autonomousBoundary
 	var targets []string
 	if b != nil {
 		targets = b.Targets

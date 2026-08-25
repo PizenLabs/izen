@@ -108,6 +108,13 @@ type Orchestrator struct {
 	bus      *events.Bus
 	history  []Phase
 	pipeline *pipeline.Engine
+
+	// planAuthorization carries the explicitly authorized execution plan the
+	// workflow guard consults (see plan_authorization.go): a human-approved
+	// DECOMPOSITION_PROPOSAL micro-plan or a fast-path ephemeral plan.
+	planAuthorized bool
+	microPlan      *MicroPlan
+	ephemeral      *EphemeralPlan
 }
 
 // New creates an Orchestrator bound to the shared WorkflowStateMachine and
@@ -222,6 +229,11 @@ func (o *Orchestrator) Transition(next Phase, tctx workflow.TransitionContext) e
 		return &TransitionError{From: o.current, To: next, Msg: "no valid transition"}
 	}
 
+	// The workflow guard evaluates HasPlan through the bound plan
+	// authorization: an approved micro-plan or injected ephemeral plan
+	// satisfies it even when the caller supplies no session-task evidence.
+	tctx = o.authorizeContextLocked(tctx)
+
 	if o.sm != nil {
 		if err := driveSM(o.sm, next, tctx); err != nil {
 			return err
@@ -268,6 +280,7 @@ func (o *Orchestrator) Force(next Phase, tctx workflow.TransitionContext) error 
 				return err
 			}
 		}
+		tctx = o.authorizeContextLocked(tctx)
 		if err := driveSM(o.sm, next, tctx); err != nil {
 			return err
 		}
