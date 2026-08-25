@@ -289,8 +289,9 @@ func TestUsageAggregationDoesNotDoubleCount(t *testing.T) {
 	_ = atomic.LoadInt32
 }
 
-// TestProviderRequestDoesNotAccumulateDuplicateContext verifies that defaultRepair
-// does not create unbounded repetitive context bloat.
+// TestProviderRequestDoesNotAccumulateDuplicateContext verifies that recovery
+// evidence accumulation does not create unbounded repetitive context bloat:
+// each typed repair appends one bounded advisory line to the ledger.
 func TestProviderRequestDoesNotAccumulateDuplicateContext(t *testing.T) {
 	req := autonomy.LoopRequest{
 		Prompt:   "fix index.html",

@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
-	"strings"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/events"
@@ -105,7 +103,7 @@ func NewDriver(adapter *ExecutorAdapter, bus *events.Bus, opts ...Option) *Drive
 		bus:     bus,
 		bounds:  autonomy.DefaultLoopBounds(),
 		decide:  decideDefault,
-		repair:  defaultRepair,
+		repair:  typedRepair,
 	}
 	for _, o := range opts {
 		o(d)
@@ -152,10 +150,11 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	// execution — no model call, no mutation.
 	d.resolved = d.adapter.Resolve(objective)
 	d.req = autonomy.LoopRequest{
-		RequestID:      d.runRequestID,
-		Prompt:         objective,
-		Targets:        d.resolved.Targets,
-		StreamCallback: d.streamCb,
+		RequestID:       d.runRequestID,
+		Prompt:          objective,
+		Targets:         d.resolved.Targets,
+		StreamCallback:  d.streamCb,
+		WorkspaceDigest: d.adapter.WorkspaceVersion(d.resolved.Targets),
 	}
 	// Clear the callback after capturing it for this run.
 	d.streamCb = nil
@@ -306,7 +305,11 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 	if d.loop == nil || d.loop.State() != autonomy.RuntimeAwaitingHuman {
 		return d.term(), errors.New("autonomy: clarify requires a parked clarification boundary")
 	}
-	d.req = autonomy.LoopRequest{Prompt: d.prompt, Targets: []string{target}}
+	d.req = autonomy.LoopRequest{
+		Prompt:          d.prompt,
+		Targets:         []string{target},
+		WorkspaceDigest: d.adapter.WorkspaceVersion([]string{target}),
+	}
 	d.obs = d.contextObservation()
 	d.loop.ReleaseHuman("target specified: " + target)
 	d.publish(ctx)
@@ -434,6 +437,21 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 		case autonomy.RuntimeRecovering:
 			req, err := d.repair(d.obs, d.req)
 			if err != nil {
+				if errors.Is(err, ErrRecoveryHalted) {
+					// The zero-trust matrix forbade any continuation: converge
+					// to a terminal inform boundary — never a raw error and
+					// never an implicit retry.
+					d.loop.ReleaseHuman("recovery halted by invariant matrix")
+					b := &autonomy.HumanBoundary{
+						Reason:  "recovery halted: " + err.Error(),
+						Targets: append([]string(nil), d.req.Targets...),
+					}
+					autonomy.DeriveBoundaryAction(b)
+					d.loop.AwaitHuman(*b)
+					d.enrichBoundary()
+					d.publish(ctx)
+					return d.term(), nil
+				}
 				return nil, fmt.Errorf("autonomy: repair: %w", err)
 			}
 			// Child attempt identity: parent run ID plus attempt number.
@@ -548,15 +566,18 @@ func (d *Driver) terminateAbort(ctx context.Context, reason string, class autono
 
 // ── default policies ────────────────────────────────────────────────────────
 
-// decideDefault maps a bounded observation onto the closed decision vocabulary:
+// decideDefault maps a bounded observation onto the closed decision vocabulary
+// through the ZERO-TRUST RECOVERY MATRIX (see recovery.go):
 //
 //	context observation (no outcome)     → continue (execute)
 //	changed/created/nochange/completed   → complete (objective satisfied)
 //	pending_approval                     → ask_human (approval gate, patch id)
 //	clarification required               → ask_human
-//	cancelled/rejected/artifact_rejected → abort (permanent, never auto-retry)
-//	no_artifact/failed/patch/apply/verify/truncated/retryable_artifact
-//	                                    → canonical recovery matrix (bounded)
+//	cancelled/rejected/artifact_rejected → abort (terminal human/permanent)
+//	every other failure                  → DecideRecovery: retryability is a
+//	                                       function of the canonical FAILURE
+//	                                       SUBTYPE (I4), never of a generic
+//	                                       execution error.
 func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopDecision {
 	if o.ClarificationRequired {
 		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
@@ -573,16 +594,11 @@ func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopD
 	case autonomy.OutcomeCancelled, autonomy.OutcomeRejected, autonomy.OutcomeArtifactRejected:
 		return autonomy.LoopDecision{Action: autonomy.LoopAbort,
 			Reason: "terminal outcome: " + string(o.Outcome)}
-	case autonomy.OutcomeNoArtifact, autonomy.OutcomeFailed, autonomy.OutcomePatchGenFailed,
-		autonomy.OutcomePatchFailed, autonomy.OutcomeApplyFailed, autonomy.OutcomeVerifyFailed,
-		autonomy.OutcomeSkipped, autonomy.OutcomeArtifactRetryableRejected, autonomy.OutcomeTruncated:
-		return autonomy.RecoverFailure(o, autonomy.ClassifyOutcome(o.Outcome), b)
 	case "":
 		return autonomy.LoopDecision{Action: autonomy.LoopContinue,
 			Reason: "objective resolved — execute"}
 	default:
-		return autonomy.LoopDecision{Action: autonomy.LoopAbort,
-			Reason: "unrecognized outcome: " + string(o.Outcome)}
+		return DecideRecovery(o, b)
 	}
 }
 
@@ -599,95 +615,4 @@ func approvalFailureOutcome(o autonomy.Observation) bool {
 	default:
 		return false
 	}
-}
-
-// defaultRepair re-scopes a failed request for a bounded re-execution.
-// It guarantees a MATERIAL execution-contract change on every recovery: the
-// recovery attempt carries explicit failure evidence, a recovery strategy, and
-// a bounded budget decision. A truncation never retries the same full-file
-// generation.
-func defaultRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.LoopRequest, error) {
-	target := o.Target
-	if target == "" {
-		target = firstTarget(req.Targets)
-		if target == "" {
-			target = req.Target
-		}
-	}
-	attempt := o.AttemptNum + 1
-	if attempt < 1 {
-		attempt = req.RecoveryAttempt + 1
-		if attempt < 1 {
-			attempt = 1
-		}
-	}
-
-	var strategy string
-	var reason string
-	var budget int
-	var evidenceAdd string
-
-	switch o.Outcome {
-	case autonomy.OutcomeTruncated:
-		strategy = "bounded_patch"
-		reason = fmt.Sprintf("output_budget_exceeded: truncated target %s budget=%d finish_reason=%s", target, o.MaxOutputTokens, o.FinishReason)
-		// Keep budget bounded: do not silently multiply. Prefer patch artifact
-		// over full-file rewrite so it fits the existing ceiling.
-		budget = o.MaxOutputTokens
-		if budget == 0 {
-			budget = req.MaxOutputTokens
-		}
-		evidenceAdd = fmt.Sprintf(
-			"[RECOVERY attempt=%d/%d strategy=%s -> %s target=%s budget=%d finish_reason=%s outcome=%s]\nFailure: model output truncated (finish_reason=length) while generating full artifact for %s.\nRecovery: produce a bounded SEARCH/REPLACE patch (or unified diff hunk) for the minimal change instead of regenerating the entire file. Preserve required target context, trim unrelated output.",
-			o.AttemptNum, attempt, "full_artifact", strategy, target, o.MaxOutputTokens, o.FinishReason, o.Outcome, target)
-	default:
-		if req.RecoveryStrategy == "bounded_patch" {
-			// LATCH: once a truncation moved this run onto the bounded-patch
-			// contract, every later recovery of the run KEEPS it. Reverting
-			// to the full-artifact tolerance would re-run the exact truncated
-			// full-file generation under a different label.
-			strategy = "bounded_patch"
-			reason = fmt.Sprintf("bounded patch contract retained after %s on %s (attempt %d)", o.Outcome, target, attempt)
-			budget = req.MaxOutputTokens
-			evidenceAdd = fmt.Sprintf(
-				"[RECOVERY attempt=%d strategy=%s outcome=%s target=%s finish_reason=%s]\nKeep producing a bounded SEARCH/REPLACE patch (or unified diff hunk) for the minimal change; never regenerate the whole file.",
-				attempt, strategy, o.Outcome, target, o.FinishReason)
-		} else {
-			strategy = "retry_with_evidence"
-			reason = fmt.Sprintf("recoverable failure %s on %s (attempt %d)", o.Outcome, target, attempt)
-			budget = req.MaxOutputTokens
-			evidenceAdd = fmt.Sprintf("[RECOVERY attempt=%d strategy=%s outcome=%s target=%s finish_reason=%s]", attempt, strategy, o.Outcome, target, o.FinishReason)
-		}
-	}
-
-	// Structured recovery trace — the strategy transition with the effective
-	// budget. The authoritative per-invocation [execution] wire-contract
-	// lines are emitted by the executor (what was actually sent/expected);
-	// this line describes the requested recovery contract only.
-	fromStrategy := req.RecoveryStrategy
-	if fromStrategy == "" {
-		fromStrategy = "full_artifact"
-	}
-	log.Printf("[recovery] from_strategy=%s to_strategy=%s reason=%s attempt=%d target=%s effective_budget=%d",
-		fromStrategy, strategy, reason, attempt, target, budget)
-	next := req
-	next.Evidence = strings.TrimSpace(req.Evidence + "\n" + evidenceAdd)
-	next.RecoveryAttempt = attempt
-	next.RecoveryReason = reason
-	next.RecoveryStrategy = strategy
-	next.FinishReason = o.FinishReason
-	// CAUSAL RECOVERY (Phase 2 P2): the repair continues the FAILED contract's
-	// lineage. The executor's admission resolves this pointer — pure retries
-	// keep the same immutable ContractID (attempt++), material changes append
-	// a new causally linked recovery contract — and enforces the bounded
-	// chain limit, so automatic recovery can never loop forever.
-	if o.ContractID != "" {
-		next.ParentContractID = o.ContractID
-	}
-	if budget > 0 {
-		next.MaxOutputTokens = budget
-	}
-	// Ensure the next executor invocation is not identical: the recovery
-	// strategy and evidence are now materially different.
-	return next, nil
 }

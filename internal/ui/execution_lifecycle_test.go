@@ -494,8 +494,10 @@ func TestBuildLifecycleProcessingStateTerminates(t *testing.T) {
 		// zero-patch short-circuit does not exist on this path. The echoed
 		// content must equal strings.TrimSpace(orig) exactly (no trailing
 		// newline), since ResolveModifiedContent trims the model output.
+		// The fixture stays inside the Boundary-2 feasibility envelope of the
+		// 1024-token strategy budget so the rewrite legitimately executes.
 		var lines []string
-		for i := 0; i < 220; i++ {
+		for i := 0; i < 120; i++ {
 			lines = append(lines, fmt.Sprintf("line %d", i))
 		}
 		large := strings.Join(lines, "\n")

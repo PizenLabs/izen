@@ -328,6 +328,47 @@ func (v *OCCVerifier) VerifyAgainst(b *WorkspaceBaseline) error {
 	return &WorkspaceStateConflict{Conflicts: conflicts}
 }
 
+// TreeDigest computes the canonical workspace version of the declared target
+// set (Boundary 5 — Mutation Authority):
+//
+//	SHA256( Σ path(f) + hash(f) )
+//
+// Paths are sorted and concatenated with their sha256 content hashes
+// (length-prefixed, injection-proof), then hashed once. A digest captured
+// before attempt N MUST equal the digest computed before attempt N+1; any
+// divergence proves an out-of-band writer touched the mutation geometry and
+// the run must abort between attempts. An empty target set hashes the empty
+// input deterministically.
+func (v *OCCVerifier) TreeDigest(targets []string) string {
+	if v == nil {
+		return ""
+	}
+	cleaned := make([]string, 0, len(targets))
+	seen := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		t = filepath.ToSlash(filepath.Clean(strings.TrimSpace(t)))
+		if t == "" || t == "." || seen[t] {
+			continue
+		}
+		seen[t] = true
+		cleaned = append(cleaned, t)
+	}
+	sort.Strings(cleaned)
+
+	var b strings.Builder
+	b.WriteString("izen-workspace-digest-v1")
+	for _, t := range cleaned {
+		fp, _ := v.fingerprint(t)
+		b.WriteByte(0)
+		b.WriteString(strconv.Itoa(len(t)))
+		b.WriteByte(':')
+		b.WriteString(t)
+		b.WriteString(fp.hash) // "" marks an absent target
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
 // fingerprint observes one target: stat + content hash, using the cached hash
 // when size and mtime are unchanged since the last observation. The second
 // return reports whether the cached observation was reused (a telemetry cache

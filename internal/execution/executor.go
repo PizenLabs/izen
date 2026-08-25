@@ -321,6 +321,13 @@ type ExecutionResult struct {
 	// runtime from the provider-reported usage. The renderer reads it for the
 	// footer / EXPANDED token numbers and never re-derives them.
 	Completed ExecutionCompleted
+	// Diagnostics carries the advisory DiagnosticSignals of every boundary
+	// rejection on this execution (Boundary 2 preflight, Boundary 3 output
+	// gate, Boundary 4 artifact gate). Recovery Isolation (I2): signals are
+	// metadata ONLY — a rejected generation's bytes never travel on the
+	// result, so no projector or recovery path can re-inject them into prompt
+	// context.
+	Diagnostics []DiagnosticSignal
 	// Err is the terminal execution error, if any.
 	Err error
 }
@@ -809,6 +816,43 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		occBaseline = x.occ.SnapshotBaseline(targets)
 	}
 
+	// ── BOUNDARY 2 — PREFLIGHT GUARD (I5) ──────────────────────────────
+	// Validate the estimated generation budget against max_output BEFORE any
+	// provider request:
+	//
+	//	EstimatedTokens = TargetFileTokens × FullRewriteTokenMultiplier
+	//
+	// An infeasible full-file rewrite is REJECTED here — never silently
+	// re-scoped, never sent to the provider to be truncated mid-generation.
+	// The caller must explicitly re-scope (reduce scope / raise the budget /
+	// request a bounded patch contract). Zero HTTP requests cross this
+	// boundary on rejection.
+	if profile.Strategy == strategy.TargetedMutation && !patchOnlyArtifact(profile) {
+		for _, target := range targets {
+			verdict := EvaluatePreflight(PreflightRequest{
+				ArtifactBounded: false,
+				TargetBytes:     preflightTargetBytes(x.root, target),
+				MaxOutputTokens: effectiveMaxOutput(req.MaxOutputTokens, &profile),
+			})
+			if verdict.Feasible {
+				continue
+			}
+			err := fmt.Errorf("%w: %s: %s", ErrPreflightInfeasible, target, verdict.Reason)
+			g.FailExecution(events.FailurePermanent, err, "executor.preflight")
+			res.ArtifactKind = ""
+			res.Err = err
+			res.Diagnostics = append(res.Diagnostics, diagnosticSignal(
+				SignalPreflightInfeasible, target,
+				fmt.Sprintf("estimated=%d budget=%d", verdict.EstimatedTokens, verdict.Budget),
+				"re-scope explicitly before retrying", false,
+			))
+			res.Proof.Outcome = OutcomePreflightInfeasible
+			res.Proof.FinishedAt = time.Now()
+			setProofGraph(res, g)
+			return x.finalizeResult(res), err
+		}
+	}
+
 	// ── 7. Targeted mutation: per-target model invocation ──────────────
 	patches, invs, diffs, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
 	if err != nil {
@@ -838,7 +882,9 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			// cannot repair it.
 			g.FailExecution(events.FailurePermanent, err, "executor.artifact")
 			res.ArtifactKind = ""
+			res.Content = "" // Recovery Isolation (I2): rejected bytes never travel
 			res.Err = err
+			res.Diagnostics = append(res.Diagnostics, artifactDiagnostic(firstTarget(targets), err, false))
 			res.Proof.Outcome = OutcomeArtifactRejected
 			res.Proof.FinishedAt = time.Now()
 			setProofGraph(res, g)
@@ -847,8 +893,34 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		if errors.Is(err, ErrArtifactRetryableRejected) {
 			g.FailExecution(events.FailureRecoverable, err, "executor.artifact")
 			res.ArtifactKind = ""
+			res.Content = "" // Recovery Isolation (I2): rejected bytes never travel
 			res.Err = err
+			res.Diagnostics = append(res.Diagnostics, artifactDiagnostic(firstTarget(targets), err, true))
 			res.Proof.Outcome = OutcomeArtifactRetryableRejected
+			res.Proof.FinishedAt = time.Now()
+			setProofGraph(res, g)
+			return x.finalizeResult(res), err
+		}
+		if gateErr := new(OutputGateError); errors.As(err, &gateErr) {
+			// BOUNDARY 3 circuit break (I1): an incomplete or refused
+			// generation strictly halts execution. Nothing was parsed, nothing
+			// is staged, no recovery loop starts here. Only the advisory
+			// DiagnosticSignal crosses toward recovery.
+			g.FailExecution(events.FailureRecoverable, err, "executor.output-gate")
+			res.ArtifactKind = ""
+			res.Content = ""
+			res.Err = err
+			res.Diagnostics = append(res.Diagnostics, diagnosticSignal(
+				gateErr.Outcome.String(), gateErr.Target,
+				fmt.Sprintf("finish_reason=%q output_tokens=%d", gateErr.FinishReason, lastOutputTokens(invs)),
+				"discard the partial generation; a successor attempt must change the execution contract materially",
+				true,
+			))
+			if gateErr.Outcome == CanonicalOutputExhausted {
+				res.Proof.Outcome = OutcomeTruncated
+			} else {
+				res.Proof.Outcome = OutcomeFailed
+			}
 			res.Proof.FinishedAt = time.Now()
 			setProofGraph(res, g)
 			return x.finalizeResult(res), err
@@ -1442,12 +1514,25 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		log.Printf("[execution] result request=%s target=%s input=%d output=%d finish_reason=%s",
 			requestID, target, inv.TokenInput, inv.TokenOutput, inv.FinishReason)
 		if callErr != nil {
+			// The invocation evidence (real billing when usage arrived)
+			// survives even a hard transport failure.
 			return nil, append(invs, inv), nil, fmt.Errorf("executor: model invocation: %w", callErr)
 		}
 		// provider.response is emitted ONLY on a successful response — the
 		// authoritative usage travels here. No artifact may precede it.
 		g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
 		invs = append(invs, inv)
+
+		// ── BOUNDARY 3 — OUTPUT GATE (I1) ───────────────────────────
+		// Normalize the provider terminal reason into a CanonicalOutcome and
+		// enforce it BEFORE anything is parsed. An incomplete generation is
+		// circuit-broken here: its bytes are DISCARDED (never handed to hunk
+		// extraction or full-file resolution), no approval surface opens, and
+		// no recovery loop starts inside the executor. Only a COMPLETE stream
+		// may proceed to Boundary 4.
+		if gate := gateFor(target, inv.FinishReason); gate != nil {
+			return nil, invs, nil, gate
+		}
 
 		var modified string
 		if patchOnly {
@@ -1468,9 +1553,6 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 				// the full response as the replacement attempt (best-effort).
 				modified = raw
 			}
-		}
-		if strings.EqualFold(strings.TrimSpace(inv.FinishReason), "length") {
-			return nil, invs, nil, fmt.Errorf("%w: %s", ErrOutputTruncated, target)
 		}
 		if strings.TrimSpace(modified) == "" {
 			// Phase 1 safety rule: an artifact extraction failure is a FAILURE,
@@ -1504,6 +1586,25 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		diffs = append(diffs, x.compileDiff(raw, target, original))
 	}
 	return patches, invs, diffs, nil
+}
+
+// artifactDiagnostic builds the Boundary-4 advisory signal for a rejected
+// artifact. The signal carries the failure CLASS and corrective directive
+// only — never a byte of the rejected generation (Recovery Isolation, I2).
+func artifactDiagnostic(target string, gateErr error, retryable bool) DiagnosticSignal {
+	return diagnosticSignal(SignalSchemaViolation, target,
+		"artifact failed hunk-schema/syntax validation at the artifact boundary",
+		"produce exactly one anchored SEARCH/REPLACE block (or unified diff hunk); never re-emit the full file",
+		retryable)
+}
+
+// lastOutputTokens returns the provider-reported output tokens of the most
+// recent invocation (0 when usage is unknown).
+func lastOutputTokens(invs []ModelInvocation) int {
+	if len(invs) == 0 {
+		return 0
+	}
+	return invs[len(invs)-1].TokenOutput
 }
 
 // artifactGate validates the resolved mutation artifact against the target's

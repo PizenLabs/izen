@@ -14,6 +14,7 @@ package autonomy
 
 import (
 	"context"
+	"log"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/execution"
@@ -80,12 +81,39 @@ func (a *ExecutorAdapter) Resolve(prompt string) Resolved {
 	return res
 }
 
+// WorkspaceVersion returns the Boundary-5 workspace digest
+// SHA256(Σ path(f)+hash(f)) over the given targets ("" when no executor or no
+// targets are wired). The driver captures it once per run and every attempt
+// re-validates it before executing.
+func (a *ExecutorAdapter) WorkspaceVersion(targets []string) string {
+	if a == nil || a.executor == nil || len(targets) == 0 {
+		return ""
+	}
+	return a.executor.OCC().TreeDigest(targets)
+}
+
 // Execute implements autonomy.Executor. It maps a LoopRequest onto the
 // RuntimeExecutor's canonical ExecuteRequest and maps the resulting
 // ExecutionResult onto a bounded Observation. The executor is the single
 // authority that invokes the provider, produces the patch, holds the approval
 // and runs verification; the adapter only translates.
+//
+// BOUNDARY 5 (pre-submission): when the request carries a workspace version,
+// it is re-validated HERE — before any model call is submitted. A workspace
+// that changed between attempts yields a workspace_drift observation with
+// ZERO provider requests; a stale attempt never re-executes over moved ground.
 func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest) (autonomy.Observation, error) {
+	targets := req.Targets
+	if len(targets) == 0 && req.Target != "" {
+		targets = []string{req.Target}
+	}
+	if req.WorkspaceDigest != "" && len(targets) > 0 {
+		if current := a.WorkspaceVersion(targets); current != "" && current != req.WorkspaceDigest {
+			log.Printf("[boundary5] workspace_drift request=%s targets=%v expected=%s… actual=%s… — halting before execution",
+				req.RequestID, targets, short(req.WorkspaceDigest), short(current))
+			return a.driftObservation(req, targets), nil
+		}
+	}
 	profile := a.gateway.SelectStrategy(req.Prompt)
 	strategyPtr := &profile
 	if (len(req.Targets) > 0 || req.Target != "") && profile.Strategy == strategy.HumanClarification {
@@ -163,6 +191,29 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 	return a.observe(req, res), nil
 }
 
+// driftObservation builds the synthetic Boundary-5 rejection: the workspace
+// moved between attempts, so the attempt is refused WITHOUT any execution.
+// No provider is invoked and no artifact exists.
+func (a *ExecutorAdapter) driftObservation(req autonomy.LoopRequest, targets []string) autonomy.Observation {
+	return autonomy.Observation{
+		RequestID:        req.RequestID,
+		Intent:           autonomy.Intent(req.Intent),
+		Target:           firstTarget(targets),
+		Evidence:         req.Evidence,
+		Outcome:          autonomy.OutcomeWorkspaceDrift,
+		RecoveryStrategy: req.RecoveryStrategy,
+		AttemptNum:       req.RecoveryAttempt,
+	}
+}
+
+// short renders the leading edge of a hex digest for compact evidence.
+func short(digest string) string {
+	if len(digest) > 12 {
+		return digest[:12]
+	}
+	return digest
+}
+
 // Approve resolves an approval gate held by the executor and returns the
 // terminal observation of the SAME execution. It never re-executes the
 // mutation: the held patch was already produced, approval applies it.
@@ -237,6 +288,7 @@ func (a *ExecutorAdapter) observe(req autonomy.LoopRequest, res *execution.Execu
 		UsageKnown:            res.Completed.Known,
 		FinishReason:          finishReason,
 		MaxOutputTokens:       maxOut,
+		RecoveryStrategy:      req.RecoveryStrategy,
 	}
 }
 
