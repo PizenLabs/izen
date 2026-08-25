@@ -22,6 +22,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/execution/planner"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 )
 
@@ -222,6 +223,13 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		// repro: max_tokens was omitted because req.MaxOutputTokens stayed 0).
 		MaxOutputTokens: effectiveMax,
 	}
+	if staged := stagedSubTaskScopes(req.StagedPlan); len(staged) > 0 {
+		// DAG execution is active: hand every approved sub-task window to the
+		// executor so Boundary 2 evaluates each unit individually and never
+		// re-runs the monolithic full-rewrite estimation against the original
+		// target (the false-positive preflight_infeasible leak).
+		execReq.StagedSubTasks = staged
+	}
 	if strategyPtr != nil && req.RecoveryStrategy == "bounded_patch" {
 		// Material artifact-contract change: the recovery attempt MUST produce
 		// a structured bounded patch. The search_replace kind is enforced by
@@ -257,6 +265,26 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		return autonomy.Observation{}, err
 	}
 	return a.observe(req, res), nil
+}
+
+// stagedSubTaskScopes projects a staged decomposition plan onto the executor's
+// Boundary-2 scope view: one entry per sub-task with its identity, change
+// window and generation estimate. A nil or empty plan yields nil (monolithic
+// preflight stays authoritative).
+func stagedSubTaskScopes(dag *planner.ExecutionDAG) []execution.SubTaskScope {
+	if dag == nil || len(dag.SubTasks) == 0 {
+		return nil
+	}
+	scopes := make([]execution.SubTaskScope, 0, len(dag.SubTasks))
+	for _, st := range dag.SubTasks {
+		scopes = append(scopes, execution.SubTaskScope{
+			ID:              st.ID,
+			StartLine:       st.Region.StartLine,
+			EndLine:         st.Region.EndLine,
+			EstimatedTokens: st.EstimatedTokens,
+		})
+	}
+	return scopes
 }
 
 // driftObservation builds the synthetic Boundary-5 rejection: the workspace

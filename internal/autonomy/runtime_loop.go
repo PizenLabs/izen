@@ -491,6 +491,12 @@ type LoopRequest struct {
 	// out-of-band change between attempts returns a workspace_drift
 	// observation with ZERO provider requests.
 	WorkspaceDigest string
+	// StagedPlan carries the approved decomposition plan when this request is
+	// ONE sub-task of a staged ExecutionDAG. The adapter projects its sub-task
+	// windows onto the executor's Boundary-2 preflight so every unit is
+	// evaluated individually and the monolithic full-rewrite estimation of
+	// the original target is suppressed. Nil for non-DAG requests.
+	StagedPlan *planner.ExecutionDAG
 	// FinishReason carries the previous attempt's finish_reason for observability.
 	FinishReason string
 	// StreamCallback is an optional callback for incremental streaming progress.

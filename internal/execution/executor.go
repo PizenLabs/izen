@@ -133,6 +133,13 @@ type ExecuteRequest struct {
 	// ErrRecoveryChainExhausted. Failed contracts are never rewritten: every
 	// recovery is an append-only causal step.
 	RecoveryOf string
+	// StagedSubTasks carries the sub-task windows of an approved decomposition
+	// plan when this execution is ONE unit of a staged ExecutionDAG. When
+	// non-empty, Boundary 2 evaluates every staged sub-task individually and
+	// SUPPRESSES the monolithic full-file rewrite estimation — a plan-scoped
+	// submission can never be refused for the size of the whole target it was
+	// decomposed from.
+	StagedSubTasks []SubTaskScope
 	// StreamCallback is an optional callback for incremental streaming progress.
 	// When set, the executor invokes it during provider streaming for each
 	// content delta, first token, and completion. This enables the UI to
@@ -827,11 +834,20 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// The caller must explicitly re-scope (reduce scope / raise the budget /
 	// request a bounded patch contract). Zero HTTP requests cross this
 	// boundary on rejection.
-	if profile.Strategy == strategy.TargetedMutation && !patchOnlyArtifact(profile) {
+	//
+	// DAG EXECUTION: when the request carries staged decomposition sub-tasks,
+	// every unit is evaluated INDIVIDUALLY and the monolithic full-rewrite
+	// estimation is suppressed — a staged plan is never refused for the size
+	// of the target it was decomposed from. The guard runs even under a
+	// patch-only artifact contract so each approved unit stays provably
+	// budget-feasible.
+	if profile.Strategy == strategy.TargetedMutation &&
+		(!patchOnlyArtifact(profile) || len(req.StagedSubTasks) > 0) {
 		for _, target := range targets {
 			verdict := EvaluatePreflight(PreflightRequest{
 				ArtifactBounded: false,
 				TargetBytes:     preflightTargetBytes(x.root, target),
+				StagedScopes:    req.StagedSubTasks,
 				MaxOutputTokens: effectiveMaxOutput(req.MaxOutputTokens, &profile),
 			})
 			if verdict.Feasible {

@@ -114,13 +114,37 @@ type PreflightRequest struct {
 	// MaxOutputTokens is the output budget enforced on the invocation
 	// (0 = unbounded / provider default).
 	MaxOutputTokens int
+	// StagedScopes carries the sub-task windows of a staged decomposition
+	// plan when DAG execution is active. When non-empty, the monolithic
+	// full_rewrite estimate is SUPPRESSED: each sub-task window is evaluated
+	// individually against the same budget instead.
+	StagedScopes []SubTaskScope
+}
+
+// SubTaskScope is the Boundary-2 view of one staged decomposition sub-task:
+// its identity, its inclusive 1-indexed line window over the target, and its
+// own generation estimate under the canonical accounting
+// (region_bytes/4 × FullRewriteTokenMultiplier). It is plain data so the
+// executor can preflight every unit of an approved ExecutionDAG individually
+// without importing the planner.
+type SubTaskScope struct {
+	// ID is the stable sub-task identity ("st-1", "st-2", ...).
+	ID string
+	// StartLine / EndLine bound the sub-task's change window in the target.
+	StartLine int
+	EndLine   int
+	// EstimatedTokens is this window's generation estimate under the same
+	// accounting as the monolithic formula.
+	EstimatedTokens int
 }
 
 // PreflightVerdict is the Boundary-2 decision record.
 type PreflightVerdict struct {
 	// Feasible reports whether the generation may proceed.
 	Feasible bool
-	// EstimatedTokens = TargetFileTokens × FullRewriteTokenMultiplier.
+	// EstimatedTokens = TargetFileTokens × FullRewriteTokenMultiplier for a
+	// monolithic request, or the largest staged scope's estimate when DAG
+	// execution is active.
 	EstimatedTokens int
 	// Budget is the max_output the invocation would run under.
 	Budget int
@@ -128,13 +152,41 @@ type PreflightVerdict struct {
 	Reason string
 }
 
-// EvaluatePreflight applies invariant I5: EstimatedTokens =
+// EvaluatePreflight applies invariant I5. When the request carries staged
+// decomposition scopes (DAG execution active), the monolithic full-file
+// rewrite estimation is short-circuited and EVERY sub-task window must pass
+// the budget individually — the plan executes as bounded units, never as one
+// monolithic regeneration. Otherwise EstimatedTokens =
 // TargetFileTokens × Multiplier must fit MaxOutputTokens for full-file
 // artifacts. Bounded artifacts fit by construction (their copyable source is
 // capped far below any ceiling) and creations have no estimable baseline —
 // both pass. An infeasible verdict REJECTS the request at this boundary.
 func EvaluatePreflight(req PreflightRequest) PreflightVerdict {
 	switch {
+	case len(req.StagedScopes) > 0:
+		// DAG EXECUTION ACTIVE: judge every staged sub-task individually.
+		// The original monolithic target size is irrelevant evidence here —
+		// no full rewrite will ever be requested under this contract.
+		if req.MaxOutputTokens <= 0 {
+			// Unbounded budget: not provably infeasible at this boundary.
+			return PreflightVerdict{Feasible: true}
+		}
+		largest := 0
+		for _, sc := range req.StagedScopes {
+			if sc.EstimatedTokens <= 0 || sc.EstimatedTokens > req.MaxOutputTokens {
+				return PreflightVerdict{
+					EstimatedTokens: sc.EstimatedTokens,
+					Budget:          req.MaxOutputTokens,
+					Reason: fmt.Sprintf(
+						"staged sub_task %s estimates %d tokens but max_output=%d — every unit of an approved decomposition plan must fit the output budget individually",
+						sc.ID, sc.EstimatedTokens, req.MaxOutputTokens),
+				}
+			}
+			if sc.EstimatedTokens > largest {
+				largest = sc.EstimatedTokens
+			}
+		}
+		return PreflightVerdict{Feasible: true, EstimatedTokens: largest, Budget: req.MaxOutputTokens}
 	case req.ArtifactBounded:
 		// A bounded patch echoes at most its small runtime-derived window;
 		// it fits any workable budget by construction.

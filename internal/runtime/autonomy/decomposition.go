@@ -189,6 +189,10 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 			RecoveryAttempt:  i + 1,
 			RecoveryReason:   fmt.Sprintf("decomposition sub-task %d/%d scoped to %s", i+1, n, st.Region),
 			StreamCallback:   d.streamCb,
+			// The approved plan travels with EVERY unit so the executor's
+			// Boundary-2 guard evaluates each window individually instead of
+			// re-measuring the monolithic target the plan was decomposed from.
+			StagedPlan: dag,
 		}
 		d.streamCb = nil
 

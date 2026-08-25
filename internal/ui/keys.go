@@ -458,6 +458,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
 				return m, m.resumeAutonomousApprove()
+			case b.Action == autonomy.HumanBoundaryDecomposition && msg.Type == tea.KeyEnter:
+				// Authorize the WHOLE staged DAG: every sub-task executes as
+				// one atomic transaction under the plan's own preflight scopes.
+				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Plan authorized — running the staged DAG..."))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, m.resumeAutonomousProposalApprove()
 			case b.Action == autonomy.HumanBoundaryClarify && msg.Type == tea.KeyUp:
 				m.navigateAutonomousBoundary(-1)
 				return m, nil
@@ -486,6 +493,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
 				return m, m.abortAutonomousRun("cancelled by operator")
+			case b.Action == autonomy.HumanBoundaryDecomposition && msg.Type == tea.KeyEscape:
+				// Cancel the whole staged plan: nothing executed, nothing mutated.
+				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Cancelled — decomposition plan discarded. No files were modified."))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, m.resumeAutonomousProposalReject("cancelled by operator")
 			}
 			return m, nil
 		}

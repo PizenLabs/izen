@@ -40,6 +40,9 @@ type fakeAutonomousDriver struct {
 	resumeReject  int
 	resumeClarify int
 	lastClarify   string
+
+	resumeApproveProposal int
+	resumeRejectProposal  int
 }
 
 func (f *fakeAutonomousDriver) Run(_ context.Context, _ string) (*autonomy.LoopTermination, error) {
@@ -63,6 +66,16 @@ func (f *fakeAutonomousDriver) ResumeReject(_ context.Context, _ string) (*auton
 func (f *fakeAutonomousDriver) ResumeClarify(_ context.Context, target string) (*autonomy.LoopTermination, error) {
 	f.resumeClarify++
 	f.lastClarify = target
+	return f.term, f.resumeErr
+}
+
+func (f *fakeAutonomousDriver) ResumeApproveProposal(_ context.Context) (*autonomy.LoopTermination, error) {
+	f.resumeApproveProposal++
+	return f.term, f.resumeErr
+}
+
+func (f *fakeAutonomousDriver) ResumeRejectProposal(_ context.Context, _ string) (*autonomy.LoopTermination, error) {
+	f.resumeRejectProposal++
 	return f.term, f.resumeErr
 }
 

@@ -208,6 +208,22 @@ var (
 				Foreground(lipgloss.Color(colorMauve))
 	permissionDescStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color(colorMuted))
+
+	// ── Decomposition Proposal Card (DECOMPOSITION_PROPOSAL gate) ──────────
+	// The staged ExecutionDAG proposal renders as a yellow-framed interactive
+	// decision box so it is instantly distinguishable from the orange
+	// permission/approval gates while still reading as "human decision here".
+	decompositionBoxStyle = lipgloss.NewStyle().
+				Border(lipgloss.DoubleBorder()).
+				BorderForeground(lipgloss.Color(colorYellow)).
+				Padding(0, 1).
+				Width(60)
+	decompositionTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color(colorYellow))
+	decompositionKeyStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color(colorMauve))
 )
 
 // ── Hotkey Highlight Styles (Keyboard-Only Execution) ─────────────────────────
