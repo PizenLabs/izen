@@ -2,7 +2,6 @@ package autonomy
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -17,8 +16,12 @@ import (
 
 // bigIndexHTML returns deterministic HTML of EXACTLY 7780 bytes (the
 // production repro target) with stable per-line anchors a bounded patch can
-// target. The fixture is built once and reused: it sits at the center of
-// nearly every regression here.
+// target. Since Boundary 2 (preflight guard, invariant I5), an infeasible
+// full rewrite of this file can never reach the provider inside a loop run,
+// so loop-level tests use the feasibility-sized compactIndexHTML; the big
+// fixture remains the reference geometry for the bounded-patch WINDOW tests,
+// which drive the executor directly through its explicit bounded_patch
+// contract (ArtifactBounded ⇒ preflight-exempt by construction).
 var (
 	bigHTMLOnce   sync.Once
 	bigHTMLCached string
@@ -32,12 +35,12 @@ func bigIndexHTML() string {
 		var mid []string
 		for i := 0; ; i++ {
 			cand := append(append([]string{}, head...), mid...)
-			cand = append(cand, fmt.Sprintf(`<p class="line-%d">filler content line %d</p>`, i, i))
+			cand = append(cand, indexHTMLLine(i))
 			cand = append(cand, tail...)
 			if len(strings.Join(cand, "\n"))+1 > want {
 				break
 			}
-			mid = append(mid, fmt.Sprintf(`<p class="line-%d">filler content line %d</p>`, i, i))
+			mid = append(mid, indexHTMLLine(i))
 		}
 		all := append(append([]string{}, head...), mid...)
 		all = append(all, tail...)
@@ -52,13 +55,42 @@ func bigIndexHTML() string {
 }
 
 func indexHTMLLine(n int) string {
-	return fmt.Sprintf(`<p class="line-%d">filler content line %d</p>`, n, n)
+	return "<p class=\"line-" + itoa(n) + "\">filler content line " + itoa(n) + "</p>"
 }
 
-// tailLine is the LAST filler line of the fixture. It appears in the complete
-// document but can never appear inside a bounded-patch context window (windows
-// are capped far below the file size), so it proves whether the whole file
-// crossed to the model.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
+// compactIndexHTML is a feasibility-sized full-rewrite target (~700 bytes):
+// TargetFileTokens × FullRewriteTokenMultiplier fits a 1024-token budget at
+// Boundary 2, so a loop-level FULL_REWRITE attempt legitimately reaches the
+// provider and the typed OUTPUT_EXHAUSTED path stays exercisable end to end.
+func compactIndexHTML() string {
+	head := []string{"<!DOCTYPE html>", "<html>", "<head><title>demo</title></head>", "<body>"}
+	tail := []string{"</body>", "</html>"}
+	all := append([]string{}, head...)
+	for i := 0; i < 12; i++ {
+		all = append(all, indexHTMLLine(i))
+	}
+	all = append(all, tail...)
+	return strings.Join(all, "\n") + "\n"
+}
+
+// tailLine is the LAST filler line of the big fixture. It appears in the
+// complete document but can never appear inside a bounded-patch context
+// window (windows are capped far below the file size), so it proves whether
+// the whole file crossed to the model.
 var tailLine = func() string {
 	s := bigIndexHTML()
 	i := strings.LastIndex(s, "<p ")
@@ -83,7 +115,7 @@ func generousBounds() autonomy.LoopBounds {
 	}
 }
 
-func newDriver(t *testing.T, root string, responses ...*ai.Response) (*mockProvider, *execution.RuntimeExecutor, *Driver) {
+func newCompactDriver(t *testing.T, root string, responses ...*ai.Response) (*mockProvider, *execution.RuntimeExecutor, *Driver) {
 	t.Helper()
 	mock := &mockProvider{responses: responses}
 	bus := events.NewBus(events.DefaultBufferSize)
@@ -92,267 +124,132 @@ func newDriver(t *testing.T, root string, responses ...*ai.Response) (*mockProvi
 	return mock, x, NewDriver(adapter, bus, WithLoopBounds(generousBounds()))
 }
 
-func runObjective(t *testing.T, d *Driver) {
-	t.Helper()
-	if _, err := d.Run(context.Background(), "check this file @index.html and rewrite it"); err != nil {
-		t.Fatalf("Run: %v", err)
+// ── 1. wire contracts of both artifact protocols (adapter-driven) ──────────
+
+// TestTolerantAttemptEmbedsCompleteTarget pins the INITIAL full-artifact wire
+// contract: the tolerant mutation prompt offers the full-file option and the
+// user message embeds the complete target.
+func TestTolerantAttemptEmbedsCompleteTarget(t *testing.T) {
+	root := t.TempDir()
+	writeTarget(t, root, "index.html", compactIndexHTML())
+
+	truncated := &ai.Response{
+		Content: compactIndexHTML(),
+		Usage:   ai.ProviderUsage{PromptTokens: 300, CompletionTokens: 200, Known: true, FinishReason: "stop"},
+	}
+	mock, _, adapter, _ := harnessWithAdapter(t, root, truncated)
+	_, err := adapter.Execute(context.Background(), autonomy.LoopRequest{
+		Prompt:  "check this file @index.html and rewrite it",
+		Targets: []string{"index.html"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	reqs := mock.recordedRequests()
+	if len(reqs) != 1 {
+		t.Fatalf("recorded requests = %d, want 1", len(reqs))
+	}
+	if !strings.Contains(reqs[0].System, "The full modified file content") {
+		t.Fatalf("attempt lost the tolerant full-artifact contract: %q", reqs[0].System)
+	}
+	if !strings.Contains(reqs[0].Messages[0].Content, "</html>") {
+		t.Fatal("tolerant attempt should embed the complete target file")
 	}
 }
 
-// ── 1. wire-contract change between attempt 1 and attempt 2 ────────────────
-
-// TestTruncationChangesWireContract proves the recovery invocation differs
-// MATERIALLY from the initial invocation at the wire level: different system
-// contract, different artifact kind, different output contract, runtime-derived
-// bounded context instead of the full file, unchanged budget, and a distinct
-// attempt identity.
-func TestTruncationChangesWireContract(t *testing.T) {
+// TestBoundedPatchWireContract pins the STRICT bounded-patch wire contract as
+// the executor actually sends it: patch-only system prompt, runtime-derived
+// window instead of the complete file, the patch protocol in the user
+// message, the recovery annotation, and the unchanged budget.
+func TestBoundedPatchWireContract(t *testing.T) {
 	root := t.TempDir()
 	writeTarget(t, root, "index.html", bigIndexHTML())
 
-	truncated := &ai.Response{
-		Content: bigIndexHTML()[:6000],
-		Usage:   ai.ProviderUsage{PromptTokens: 2182, CompletionTokens: 1022, Known: true, FinishReason: "length"},
-	}
 	bounded := &ai.Response{
-		Content: patchForLine(3, `<p class="line-3">rewritten content line 3</p>`),
+		Content: patchForLine(3, "<p class=\"line-3\">rewritten content line 3</p>"),
 		Usage:   ai.ProviderUsage{PromptTokens: 2277, CompletionTokens: 180, Known: true, FinishReason: "stop"},
 	}
-	mock, _, driver := newDriver(t, root, truncated, bounded)
-	runObjective(t, driver)
-
-	reqs := mock.recordedRequests()
-	if len(reqs) != 2 {
-		t.Fatalf("recorded requests = %d, want 2", len(reqs))
-	}
-	a1, a2 := reqs[0], reqs[1]
-
-	// System contracts differ: tolerant full-artifact vs strict patch-only.
-	if !strings.Contains(a1.System, "The full modified file content") {
-		t.Fatalf("attempt 1 lost the tolerant full-artifact contract: %q", a1.System)
-	}
-	if strings.Contains(strings.ToLower(a2.System), "full modified file") {
-		t.Fatal("attempt 2 still offers the full-file option")
-	}
-
-	// The recovery USER message must not carry the complete file: a sentinel
-	// from the deep tail of the document must be absent.
-	u1, u2 := a1.Messages[0].Content, a2.Messages[0].Content
-	if !strings.Contains(u1, tailLine) {
-		t.Fatal("attempt 1 should embed the complete target file")
-	}
-	if strings.Contains(u2, tailLine) {
-		t.Fatal("attempt 2 STILL carries the complete file — input contract unchanged")
-	}
-	if len(u2) >= len(u1) {
-		t.Fatalf("attempt 2 prompt (%d bytes) is not materially smaller than attempt 1 (%d bytes)", len(u2), len(u1))
-	}
-	if !strings.Contains(u2, "OUTPUT FORMAT") || !strings.Contains(u2, "<<<<<<< SEARCH") {
-		t.Fatalf("attempt 2 user message missing the patch protocol: %q", u2[:min(len(u2), 300)])
-	}
-	if !strings.Contains(u2, "[RECOVERY bounded_patch:") {
-		t.Fatal("attempt 2 missing the recovery annotation")
-	}
-
-	// Budget unchanged; only the representation changed.
-	if a2.MaxTokens != 1024 || a1.MaxTokens != 1024 {
-		t.Fatalf("max_tokens a1=%d a2=%d, want both 1024", a1.MaxTokens, a2.MaxTokens)
-	}
-}
-
-// ── 2. bounded request never asks for the full artifact ────────────────────
-
-// TestBoundedPatchDoesNotRequestFullArtifact pins the INPUT side of the
-// bounded contract: no rewrite instruction over the complete file, no
-// full-file option anywhere, an explicitly bounded copyable source, and a
-// one-block-only output format.
-func TestBoundedPatchDoesNotRequestFullArtifact(t *testing.T) {
-	root := t.TempDir()
-	writeTarget(t, root, "index.html", bigIndexHTML())
-
-	truncated := &ai.Response{
-		Content: bigIndexHTML()[:6000],
-		Usage:   ai.ProviderUsage{PromptTokens: 2182, CompletionTokens: 1022, Known: true, FinishReason: "length"},
-	}
-	bounded := &ai.Response{
-		Content: patchForLine(5, `<p class="line-5">patched line 5</p>`),
-		Usage:   ai.ProviderUsage{PromptTokens: 2277, CompletionTokens: 150, Known: true, FinishReason: "stop"},
-	}
-	mock, _, driver := newDriver(t, root, truncated, bounded)
-	runObjective(t, driver)
-
-	reqs := mock.recordedRequests()
-	if len(reqs) < 2 {
-		t.Fatalf("requests = %d, want >=2", len(reqs))
-	}
-	sys, user := reqs[1].System, reqs[1].Messages[0].Content
-
-	lowerSys, lowerUser := strings.ToLower(sys), strings.ToLower(user)
-	for _, forbidden := range []string{"full modified file", "rewrite the file", "provide the full new content"} {
-		if strings.Contains(lowerSys, forbidden) || strings.Contains(lowerUser, forbidden) {
-			t.Fatalf("bounded recovery requests %q — forbidden phrase present", forbidden)
-		}
-	}
-	if !strings.Contains(user, "Do NOT regenerate the document") {
-		t.Fatalf("bounded request does not negate the rewrite instruction: %q", user[:min(len(user), 200)])
-	}
-	if !strings.Contains(user, "the ONLY lines you may touch") {
-		t.Fatal("bounded request does not declare the bounded copyable source")
-	}
-	if strings.Contains(user, tailLine) {
-		t.Fatal("bounded request leaked more than the declared window")
-	}
-}
-
-// ── 3+7. small budget completion and successful end-to-end recovery ────────
-
-// TestBoundedPatchFitsSmallOutputBudget proves a compliant patch completes far
-// below the 1024-token ceiling and stages successfully.
-func TestBoundedPatchFitsSmallOutputBudget(t *testing.T) {
-	root := t.TempDir()
-	writeTarget(t, root, "index.html", bigIndexHTML())
-
-	truncated := &ai.Response{
-		Content: bigIndexHTML()[:6000],
-		Usage:   ai.ProviderUsage{PromptTokens: 2182, CompletionTokens: 1022, Known: true, FinishReason: "length"},
-	}
-	bounded := &ai.Response{
-		Content: patchForLine(6, `<p class="line-6">patched line 6</p>`),
-		Usage:   ai.ProviderUsage{PromptTokens: 2277, CompletionTokens: 96, Known: true, FinishReason: "stop"},
-	}
-	mock, _, driver := newDriver(t, root, truncated, bounded)
-	runObjective(t, driver)
-
-	if mock.calls() != 2 {
-		t.Fatalf("invocations = %d, want 2", mock.calls())
-	}
-	last := mock.responses[1].Usage.CompletionTokens
-	if last >= 1024 {
-		t.Fatalf("patch response used %d tokens — does not fit the small budget", last)
-	}
-	if driver.State() != autonomy.RuntimeAwaitingHuman {
-		t.Fatalf("state = %v, want approval gate", driver.State())
-	}
-	if b := driver.Boundary(); b == nil || b.PatchID == "" {
-		t.Fatalf("boundary = %+v, want held patch", b)
-	}
-}
-
-// TestSuccessfulRecoveryFromRealTruncation is the end-to-end acceptance path:
-// truncate on attempt 1, recover with ONE bounded patch on attempt 2, stage,
-// approve, apply, VERIFY — without exhausting any bound.
-func TestSuccessfulRecoveryFromRealTruncation(t *testing.T) {
-	root := t.TempDir()
-	writeTarget(t, root, "index.html", bigIndexHTML())
-
-	truncated := &ai.Response{
-		Content: bigIndexHTML()[:6000],
-		Usage:   ai.ProviderUsage{PromptTokens: 2182, CompletionTokens: 1022, Known: true, FinishReason: "length"},
-	}
-	bounded := &ai.Response{
-		Content: patchForLine(7, `<p class="line-7">verified rewrite line 7</p>`),
-		Usage:   ai.ProviderUsage{PromptTokens: 2277, CompletionTokens: 120, Known: true, FinishReason: "stop"},
-	}
-	mock, _, driver := newDriver(t, root, truncated, bounded)
-	runObjective(t, driver)
-
-	if mock.calls() > 2 {
-		t.Fatalf("recovery did not converge: %d invocations", mock.calls())
-	}
-	b := driver.Boundary()
-	if b == nil || b.PatchID == "" {
-		t.Fatalf("boundary = %+v, want approval gate holding the recovered patch", b)
-	}
-	term, err := driver.ResumeApprove(context.Background())
+	mock, _, adapter, _ := harnessWithAdapter(t, root, bounded)
+	res, err := adapter.Execute(context.Background(), autonomy.LoopRequest{
+		Prompt:           "check this file @index.html and rewrite it",
+		Targets:          []string{"index.html"},
+		RecoveryStrategy: autonomy.StrategyBoundedPatch,
+		RecoveryAttempt:  2,
+		RecoveryReason:   "output_budget_exhausted: typed transition after finish_reason=length",
+	})
 	if err != nil {
-		t.Fatalf("ResumeApprove: %v", err)
+		t.Fatalf("Execute: %v", err)
 	}
-	if term == nil || term.State != autonomy.RuntimeCompleted {
-		t.Fatalf("termination = %+v, want completed", term)
+	if res.Outcome != autonomy.OutcomePendingApproval {
+		t.Fatalf("outcome = %s, want pending_approval", res.Outcome)
 	}
-	got := readTarget(t, root, "index.html")
-	if !strings.Contains(got, `>verified rewrite line 7<`) {
-		t.Fatal("recovered patch was not applied to the target")
-	}
-	if strings.Count(got, "<!DOCTYPE html>") != 1 {
-		t.Fatal("applied mutation corrupted the document structure")
-	}
-}
-
-// ── 6+10. misbehaving model stays safe and stays bounded ───────────────────
-
-// TestMisbehavingModelDoesNotCorruptFile proves the safety half: when the
-// model keeps ignoring the patch protocol, every recovery attempt remains
-// strictly bounded-patch, the file is never touched, nothing is staged, and
-// the loop parks for a human within its bounds.
-func TestMisbehavingModelDoesNotCorruptFile(t *testing.T) {
-	root := t.TempDir()
-	before := bigIndexHTML()
-	writeTarget(t, root, "index.html", before)
-
-	truncated := &ai.Response{
-		Content: before[:6000],
-		Usage:   ai.ProviderUsage{PromptTokens: 2182, CompletionTokens: 1022, Known: true, FinishReason: "length"},
-	}
-	fullFile := func(in int) *ai.Response {
-		return &ai.Response{
-			Content: "<!DOCTYPE html>\n<html><body>complete replacement</body></html>\n",
-			Usage:   ai.ProviderUsage{PromptTokens: in, CompletionTokens: 300, Known: true, FinishReason: "stop"},
-		}
-	}
-	mock, _, driver := newDriver(t, root, truncated, fullFile(2277), fullFile(2353))
-	runObjective(t, driver)
 
 	reqs := mock.recordedRequests()
-	for i, r := range reqs[1:] {
-		norm := strings.Join(strings.Fields(strings.ToLower(r.System)), " ")
-		if strings.Contains(norm, "full modified file") ||
-			!strings.Contains(r.System, "<<<<<<< SEARCH") {
-			t.Fatalf("recovery request #%d regressed to the full-artifact contract: %q", i+2, r.System)
-		}
-		if strings.Contains(r.Messages[0].Content, tailLine) && len(r.Messages[0].Content) > 4000 {
-			t.Fatalf("recovery request #%d carried the complete file despite bounded context", i+2)
-		}
-		if r.MaxTokens != 1024 {
-			t.Fatalf("recovery request #%d raised the budget to %d", i+2, r.MaxTokens)
-		}
+	if len(reqs) != 1 {
+		t.Fatalf("recorded requests = %d, want 1", len(reqs))
 	}
-	if got := readTarget(t, root, "index.html"); got != before {
-		t.Fatal("a rejected artifact modified the target file")
+	a := reqs[0]
+
+	// Strict system contract: no full-file option, patch protocol required.
+	if strings.Contains(strings.ToLower(a.System), "full modified file") {
+		t.Fatal("bounded attempt still offers the full-file option")
 	}
-	b := driver.Boundary()
-	if b == nil || b.PatchID != "" {
-		t.Fatalf("boundary = %+v, want inform boundary with NO held patch", b)
+	if !strings.Contains(a.System, "<<<<<<< SEARCH") {
+		t.Fatalf("bounded system prompt missing SEARCH/REPLACE requirement: %q", a.System)
+	}
+
+	// The USER message must not carry the complete file: a sentinel from the
+	// deep tail of the document must be absent.
+	u := a.Messages[0].Content
+	if strings.Contains(u, tailLine) {
+		t.Fatal("bounded attempt STILL carries the complete file — input contract unchanged")
+	}
+	if len(u) > 4000 {
+		t.Fatalf("bounded user message is %d bytes — window escaped its cap", len(u))
+	}
+	if !strings.Contains(u, "OUTPUT FORMAT") || !strings.Contains(u, "<<<<<<< SEARCH") {
+		t.Fatalf("bounded user message missing the patch protocol: %q", u[:min(len(u), 300)])
+	}
+	if !strings.Contains(u, "[RECOVERY bounded_patch:") {
+		t.Fatal("bounded attempt missing the recovery annotation")
+	}
+	if a.MaxTokens != 1024 {
+		t.Fatalf("max_tokens=%d, want 1024 (representation change, never a budget raise)", a.MaxTokens)
 	}
 }
 
-// TestAttemptThreeDoesNotRegressToFullArtifact pins the LATCH plus materiality:
-// once bounded_patch engages, attempt 3 keeps the strict contract AND its
-// request content is genuinely different from attempt 2 (rotated runtime
-// window + accumulated failure evidence) — never a re-send of the identical
-// request under a new annotation.
-func TestAttemptThreeDoesNotRegressToFullArtifact(t *testing.T) {
+// TestAttemptRotationMateriallyChangesRequest proves successive bounded-patch
+// attempts are genuinely different requests: rotated runtime windows (the
+// CONTEXT WINDOW header names a different region) — never a re-send of the
+// identical request under a new annotation.
+func TestAttemptRotationMateriallyChangesRequest(t *testing.T) {
 	root := t.TempDir()
 	writeTarget(t, root, "index.html", bigIndexHTML())
 
-	truncated := &ai.Response{
-		Content: bigIndexHTML()[:6000],
-		Usage:   ai.ProviderUsage{PromptTokens: 2182, CompletionTokens: 1022, Known: true, FinishReason: "length"},
-	}
 	junkPatch := func(in int) *ai.Response { // well-formed marker, unmatchable anchor
 		return &ai.Response{
 			Content: "<<<<<<< SEARCH\nNO SUCH LINE IN FILE\n=======\nreplacement\n>>>>>>>",
 			Usage:   ai.ProviderUsage{PromptTokens: in, CompletionTokens: 60, Known: true, FinishReason: "stop"},
 		}
 	}
-	mock, _, driver := newDriver(t, root, truncated, junkPatch(2277), junkPatch(2330))
-	runObjective(t, driver)
+	mock, _, adapter, _ := harnessWithAdapter(t, root, junkPatch(2277), junkPatch(2330))
+	for _, attempt := range []int{2, 3} {
+		if _, err := adapter.Execute(context.Background(), autonomy.LoopRequest{
+			Prompt:           "check this file @index.html and rewrite it",
+			Targets:          []string{"index.html"},
+			RecoveryStrategy: autonomy.StrategyBoundedPatch,
+			RecoveryAttempt:  attempt,
+		}); err != nil {
+			t.Fatalf("attempt %d: %v", attempt, err)
+		}
+	}
 
 	reqs := mock.recordedRequests()
-	if len(reqs) < 3 {
-		t.Fatalf("requests = %d, want >=3", len(reqs))
+	if len(reqs) != 2 {
+		t.Fatalf("requests = %d, want 2", len(reqs))
 	}
-	a2u, a3u := reqs[1].Messages[0].Content, reqs[2].Messages[0].Content
+	a2u, a3u := reqs[0].Messages[0].Content, reqs[1].Messages[0].Content
 	for _, u := range []string{a2u, a3u} {
 		if strings.Contains(u, tailLine) {
 			t.Fatal("bounded attempt carried the complete file")
@@ -383,6 +280,125 @@ func extractWindowHeader(user string) string {
 	return line
 }
 
+// ── 3+7. small budget completion and successful end-to-end recovery ────────
+
+// TestBoundedPatchFitsSmallOutputBudget proves a compliant patch completes far
+// below the 1024-token ceiling and stages successfully.
+func TestBoundedPatchFitsSmallOutputBudget(t *testing.T) {
+	root := t.TempDir()
+	writeTarget(t, root, "index.html", compactIndexHTML())
+
+	truncated := &ai.Response{
+		Content: compactIndexHTML()[:500],
+		Usage:   ai.ProviderUsage{PromptTokens: 2182, CompletionTokens: 1022, Known: true, FinishReason: "length"},
+	}
+	bounded := &ai.Response{
+		Content: patchForLine(6, "<p class=\"line-6\">patched line 6</p>"),
+		Usage:   ai.ProviderUsage{PromptTokens: 2277, CompletionTokens: 96, Known: true, FinishReason: "stop"},
+	}
+	mock, _, driver := newCompactDriver(t, root, truncated, bounded)
+	runObjectiveCompact(t, driver)
+
+	if mock.calls() != 2 {
+		t.Fatalf("invocations = %d, want 2", mock.calls())
+	}
+	last := mock.responses[1].Usage.CompletionTokens
+	if last >= 1024 {
+		t.Fatalf("patch response used %d tokens — does not fit the small budget", last)
+	}
+	if driver.State() != autonomy.RuntimeAwaitingHuman {
+		t.Fatalf("state = %v, want approval gate", driver.State())
+	}
+	if b := driver.Boundary(); b == nil || b.PatchID == "" {
+		t.Fatalf("boundary = %+v, want held patch", b)
+	}
+}
+
+// TestSuccessfulRecoveryFromRealTruncation is the end-to-end acceptance path:
+// truncate on attempt 1, recover with ONE typed bounded-patch transition on
+// attempt 2, stage, approve, apply, VERIFY — without exhausting any bound.
+func TestSuccessfulRecoveryFromRealTruncation(t *testing.T) {
+	root := t.TempDir()
+	writeTarget(t, root, "index.html", compactIndexHTML())
+
+	truncated := &ai.Response{
+		Content: compactIndexHTML()[:500],
+		Usage:   ai.ProviderUsage{PromptTokens: 2182, CompletionTokens: 1022, Known: true, FinishReason: "length"},
+	}
+	bounded := &ai.Response{
+		Content: patchForLine(7, "<p class=\"line-7\">verified rewrite line 7</p>"),
+		Usage:   ai.ProviderUsage{PromptTokens: 2277, CompletionTokens: 120, Known: true, FinishReason: "stop"},
+	}
+	mock, _, driver := newCompactDriver(t, root, truncated, bounded)
+	runObjectiveCompact(t, driver)
+
+	if mock.calls() > 2 {
+		t.Fatalf("recovery did not converge: %d invocations", mock.calls())
+	}
+	b := driver.Boundary()
+	if b == nil || b.PatchID == "" {
+		t.Fatalf("boundary = %+v, want approval gate holding the recovered patch", b)
+	}
+	term, err := driver.ResumeApprove(context.Background())
+	if err != nil {
+		t.Fatalf("ResumeApprove: %v", err)
+	}
+	if term == nil || term.State != autonomy.RuntimeCompleted {
+		t.Fatalf("termination = %+v, want completed", term)
+	}
+	got := readTarget(t, root, "index.html")
+	if !strings.Contains(got, ">verified rewrite line 7<") {
+		t.Fatal("recovered patch was not applied to the target")
+	}
+	if strings.Count(got, "<!DOCTYPE html>") != 1 {
+		t.Fatal("applied mutation corrupted the document structure")
+	}
+}
+
+// ── 6+10. misbehaving model stays safe and stays bounded ───────────────────
+
+// TestMisbehavingModelDoesNotCorruptFile proves the safety half: when the
+// model keeps ignoring the patch protocol, every recovery attempt remains
+// strictly bounded-patch, the file is never touched, nothing is staged, and
+// the loop parks for a human within its bounds.
+func TestMisbehavingModelDoesNotCorruptFile(t *testing.T) {
+	root := t.TempDir()
+	before := compactIndexHTML()
+	writeTarget(t, root, "index.html", before)
+
+	truncated := &ai.Response{
+		Content: before[:500],
+		Usage:   ai.ProviderUsage{PromptTokens: 2182, CompletionTokens: 1022, Known: true, FinishReason: "length"},
+	}
+	fullFile := func(in int) *ai.Response {
+		return &ai.Response{
+			Content: "<!DOCTYPE html>\n<html><body>complete replacement</body></html>\n",
+			Usage:   ai.ProviderUsage{PromptTokens: in, CompletionTokens: 300, Known: true, FinishReason: "stop"},
+		}
+	}
+	mock, _, driver := newCompactDriver(t, root, truncated, fullFile(2277), fullFile(2353))
+	runObjectiveCompact(t, driver)
+
+	reqs := mock.recordedRequests()
+	for i, r := range reqs[1:] {
+		norm := strings.Join(strings.Fields(strings.ToLower(r.System)), " ")
+		if strings.Contains(norm, "full modified file") ||
+			!strings.Contains(r.System, "<<<<<<< SEARCH") {
+			t.Fatalf("recovery request #%d regressed to the full-artifact contract: %q", i+2, r.System)
+		}
+		if r.MaxTokens != 1024 {
+			t.Fatalf("recovery request #%d raised the budget to %d", i+2, r.MaxTokens)
+		}
+	}
+	if got := readTarget(t, root, "index.html"); got != before {
+		t.Fatal("a rejected artifact modified the target file")
+	}
+	b := driver.Boundary()
+	if b == nil || b.PatchID != "" {
+		t.Fatalf("boundary = %+v, want inform boundary with NO held patch", b)
+	}
+}
+
 // ── 8. no duplicate logical invocations ────────────────────────────────────
 
 // TestRecoveryDoesNotDuplicateProviderInvocation proves transport retries are
@@ -390,18 +406,18 @@ func extractWindowHeader(user string) string {
 // call is still exactly ONE ModelInvocation and ONE aggregated count.
 func TestRecoveryDoesNotDuplicateProviderInvocation(t *testing.T) {
 	root := t.TempDir()
-	writeTarget(t, root, "index.html", bigIndexHTML())
+	writeTarget(t, root, "index.html", compactIndexHTML())
 
 	truncated := &ai.Response{
-		Content: bigIndexHTML()[:6000],
+		Content: compactIndexHTML()[:500],
 		Usage:   ai.ProviderUsage{PromptTokens: 1000, CompletionTokens: 500, Known: true, FinishReason: "length", HTTPAttempts: 3, RateLimitedRetries: 2},
 	}
 	bounded := &ai.Response{
-		Content: patchForLine(8, `<p class="line-8">deduped line 8</p>`),
+		Content: patchForLine(8, "<p class=\"line-8\">deduped line 8</p>"),
 		Usage:   ai.ProviderUsage{PromptTokens: 1100, CompletionTokens: 90, Known: true, FinishReason: "stop", HTTPAttempts: 2, RateLimitedRetries: 1},
 	}
-	mock, x, driver := newDriver(t, root, truncated, bounded)
-	runObjective(t, driver)
+	mock, x, driver := newCompactDriver(t, root, truncated, bounded)
+	runObjectiveCompact(t, driver)
 
 	if mock.calls() != 2 {
 		t.Fatalf("provider invocations = %d, want exactly one per loop attempt (2)", mock.calls())
@@ -436,21 +452,21 @@ func TestRecoveryDoesNotDuplicateProviderInvocation(t *testing.T) {
 // of the truncating invocation survives into the observation.
 func TestUsageAggregationAcrossRecovery(t *testing.T) {
 	root := t.TempDir()
-	writeTarget(t, root, "index.html", bigIndexHTML())
+	writeTarget(t, root, "index.html", compactIndexHTML())
 
 	truncated := &ai.Response{
-		Content: bigIndexHTML()[:6000],
+		Content: compactIndexHTML()[:500],
 		Usage:   ai.ProviderUsage{PromptTokens: 2182, CompletionTokens: 1022, Known: true, FinishReason: "length"},
 	}
 	bounded := &ai.Response{
-		Content: patchForLine(9, `<p class="line-9">counted line 9</p>`),
+		Content: patchForLine(9, "<p class=\"line-9\">counted line 9</p>"),
 		Usage:   ai.ProviderUsage{PromptTokens: 2303, CompletionTokens: 140, Known: true, FinishReason: "stop"},
 	}
-	mock, _, driver := newDriver(t, root, truncated, bounded)
+	mock, _, adapter, _ := harnessWithAdapter(t, root, truncated, bounded)
 
 	// Direct first attempt through the adapter: the observation must preserve
 	// the authoritative finish_reason and usage verbatim.
-	obs, err := driver.adapter.Execute(context.Background(), autonomy.LoopRequest{
+	obs, err := adapter.Execute(context.Background(), autonomy.LoopRequest{
 		Prompt:  "check this file @index.html and rewrite it",
 		Targets: []string{"index.html"},
 	})
@@ -460,8 +476,15 @@ func TestUsageAggregationAcrossRecovery(t *testing.T) {
 	if obs.FinishReason != "length" || obs.OutputTokens != 1022 {
 		t.Fatalf("observation = %d toks finish=%q, want 1022/length", obs.OutputTokens, obs.FinishReason)
 	}
+	if obs.RecoveryStrategy != autonomy.StrategyFullArtifact {
+		t.Fatalf("first attempt strategy = %q, want full_artifact", obs.RecoveryStrategy)
+	}
 
-	runObjective(t, driver)
+	bus := events.NewBus(events.DefaultBufferSize)
+	driver := NewDriver(adapter, bus, WithLoopBounds(generousBounds()))
+	if _, err := driver.Run(context.Background(), "check this file @index.html and rewrite it"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
 	// Run started a fresh aggregation: it covers exactly the invocations IT
 	// made (the recovery attempt that staged the patch).
 	in, out, known := driver.AggregatedUsage()
@@ -473,5 +496,22 @@ func TestUsageAggregationAcrossRecovery(t *testing.T) {
 	}
 	if mock.calls() != 2 { // 1 explicit + 1 via Run
 		t.Fatalf("calls = %d, want 2 (one count per logical invocation)", mock.calls())
+	}
+}
+
+// ── shared helpers ──────────────────────────────────────────────────────────
+
+func harnessWithAdapter(t *testing.T, root string, responses ...*ai.Response) (*mockProvider, *execution.RuntimeExecutor, *ExecutorAdapter, *events.Bus) {
+	t.Helper()
+	mock := &mockProvider{responses: responses}
+	bus := events.NewBus(events.DefaultBufferSize)
+	x := testExecutor(t, root, mock, bus)
+	return mock, x, NewExecutorAdapter(root, execution.NewIntentGateway(root), x), bus
+}
+
+func runObjectiveCompact(t *testing.T, d *Driver) {
+	t.Helper()
+	if _, err := d.Run(context.Background(), "check this file @index.html and rewrite it"); err != nil {
+		t.Fatalf("Run: %v", err)
 	}
 }

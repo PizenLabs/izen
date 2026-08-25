@@ -107,6 +107,11 @@ const (
 	// produced, or a non-apply stage failed). It is distinct from the
 	// apply/verify-specific failures so evidence never overclaims a stage.
 	OutcomeFailed MutationOutcome = "failed"
+	// OutcomePreflightInfeasible is the terminal outcome of an execution that
+	// was trapped at Boundary 2 (Preflight Guard, invariant I5): the estimated
+	// generation budget exceeded max_output, so the request was refused BEFORE
+	// any provider request. No artifact existed and none was attempted.
+	OutcomePreflightInfeasible MutationOutcome = "preflight_infeasible"
 	// OutcomeCompleted is the terminal outcome of a read-only execution that
 	// produced an artifact (explanation / plan / investigation) with no
 	// mutation. It never claims a filesystem change.
@@ -146,6 +151,8 @@ func (o MutationOutcome) Display() string {
 		return "pending approval"
 	case OutcomeRejected:
 		return "rejected"
+	case OutcomePreflightInfeasible:
+		return "preflight infeasible"
 	default:
 		return string(o)
 	}

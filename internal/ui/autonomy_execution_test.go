@@ -13,12 +13,15 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 )
 
-// largeRedundantIndexHTML is a >100-line HTML fixture with real redundant
-// content: an orphan text node and a duplicated section.
+// largeRedundantIndexHTML is an HTML fixture with real redundant content: an
+// orphan text node and a duplicated section. Its size is deliberately kept
+// inside the Boundary-2 feasibility envelope of the selected strategy budget
+// (EstimatedTokens ≤ max_output), so the FULL_REWRITE attempt legitimately
+// reaches the provider instead of being preflight-trapped.
 func largeRedundantIndexHTML() string {
 	var b strings.Builder
 	b.WriteString("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Site</title>\n</head>\n<body>\n")
-	for i := 0; i < 110; i++ {
+	for i := 0; i < 22; i++ {
 		b.WriteString("<section class=\"content\"><p>Keep this meaningful section number " + numStr(i) + ".</p></section>\n")
 	}
 	b.WriteString("stray orphan text outside any container\n")

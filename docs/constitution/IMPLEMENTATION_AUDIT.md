@@ -3,8 +3,8 @@
 | Field         | Value        |
 | ------------- | ------------ |
 | Status        | ACTIVE AUDIT |
-| Version       | 0.4.0        |
-| Last Reviewed | 2026-08-24   |
+| Version       | 0.5.0        |
+| Last Reviewed | 2026-08-25   |
 
 ## Purpose
 
@@ -15,6 +15,84 @@ This document is an **implementation and runtime conformance instrument**. It re
 It does not redefine, extend, or replace the Constitution or Canonical System Model.
 
 > **The audit does not invent architecture. It proves, falsifies, or leaves unverified what the architecture already requires.**
+
+---
+
+# 0. Execution Pipeline — 5-Boundary Zero-Trust Architecture (v0.5.0)
+
+## 0.1 Incident Reference ( motivating the v0.5.0 refactor )
+
+A FULL_REWRITE request on `index.html` (7.78 KB) ran under `max_output=1024`.
+The provider returned `finish_reason=length`; the truncated artifact entered
+the recovery pipeline anyway, poisoning prompt context, violating contract
+identity, and driving invalid retry loops. The legacy trial-and-error recovery
+model (`retry_with_evidence` re-scope on any generic failure) was replaced by
+the strict boundary architecture below.
+
+## 0.2 Invariants
+
+| ID | Invariant                    | Requirement                                                                                                                        | Enforcement surface                                                            | Status      |
+| -- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ----------- |
+| I1 | Output Boundary Integrity    | `OUTPUT_EXHAUSTED` strictly halts execution. An incomplete generation is never parsed, staged, or applied.                          | `execution.gateFor` circuit break BEFORE artifact parsing (`executor.go`)       | **VERIFIED** |
+| I2 | Recovery Isolation           | Workspace State = Authoritative; Diagnostics = Advisory; Rejected Artifact = Isolated. Rejected bytes never re-enter prompt context. | `DiagnosticSignal` metadata-only channel; rejected content zeroed on result     | **VERIFIED** |
+| I3 | Typed Execution Transition   | `FULL_REWRITE → BOUNDED_PATCH` requires atomic context rebuilding + new causal contract + workspace version binding.                | `autonomy.typedRepair` transition latch; `ContractRegistry.Resolve` causal edge | **VERIFIED** |
+| I4 | Failure-Class Retryability   | Retryability maps to canonical failure SUBTYPES, never generic execution errors.                                                    | `RecoverySubtype` / `DecideRecovery` matrix (`runtime/autonomy/recovery.go`)    | **VERIFIED** |
+| I5 | Preflight Feasibility        | Generation budget verified pre-execution: `EstimatedTokens = TargetFileTokens × Multiplier ≤ max_output`.                            | `execution.EvaluatePreflight`, wired at Boundary 2 in `Execute()`               | **VERIFIED** |
+
+## 0.3 Boundary Matrix
+
+| # | Boundary            | Owner (implementation)                                   | What enters                                    | What leaves                                                              | Fail-closed behavior                                                                       | Executable evidence |
+| - | ------------------- | -------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ | ------------------- |
+| B1 | Intent Gateway     | `execution.IntentGateway.Gate` + `strategy.Select`       | Raw user payload                               | Resolved intent + strategy profile + frozen context snapshot             | Ambiguity parks before any model call; context integrity seal verified at admission        | §1 audit below      |
+| B2 | Preflight Guard    | `EvaluatePreflight` in `internal/execution/boundaries.go` | Targets + artifact contract + max_output       | Feasible verdict OR typed rejection (`preflight_infeasible`)              | Rejects with ZERO HTTP provider requests; intent never silently altered                    | Test Case A         |
+| B3 | Output Gate        | `gateFor` / `NormalizeFinishReason`                      | Provider stream + authoritative finish_reason  | `CanonicalOutcome`; only COMPLETE proceeds                               | `OUTPUT_EXHAUSTED`/refusal ⇒ transport circuit break; output discarded unparsed            | Test Case B         |
+| B4 | Artifact Gate      | `artifactGate` + `ExtractBoundedPatch` + V3 validators    | COMPLETE generation only                       | Validated normalized artifact OR typed schema rejection                   | Hunk-schema/syntax failures reject before approval; ONLY `DiagnosticSignal`s cross back     | `TestSearchReplaceContractRejectsFullFileOutput`, conformance suite |
+| B5 | Mutation Authority | `OCCVerifier.TreeDigest` + OCC commit gate + adapter drift check | Held patches + baseline fingerprints          | Applied mutation evidence OR `ABORTED_OCC` / `workspace_drift` abort      | Digest `SHA256(Σ path(f)+hash(f))` must match between attempts; commit gate precedes write  | `TestBoundaryFive_WorkspaceDriftAbortsBetweenAttempts`, Phase 3 OCC tests |
+
+## 0.4 Canonical Outcome Vocabulary (B3)
+
+`COMPLETE · OUTPUT_EXHAUSTED · PROVIDER_REFUSAL · TRANSPORT_ERROR · UNKNOWN`
+(`NormalizeFinishReason`). Unreported finish reasons defer to B4; KNOWN
+non-complete reasons are absolute circuit breaks.
+
+## 0.5 Failure-Subtype → Retry Matrix (I4)
+
+| Subtype              | Trigger                                        | Automatic continuation                                                     | Bound                                |
+| -------------------- | ---------------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------ |
+| `output_exhausted`   | finish_reason=length                           | ONE typed `FULL_REWRITE→BOUNDED_PATCH` transition, then STRICT HALT (I1)    | once per lineage (strategy latch)    |
+| `schema_violation`   | B4 hunk/schema rejection                       | Typed transition if unbounded; else one bounded re-issue per remaining cycle | `MaxRecoveryCycles`                  |
+| `transport_error`    | invocation-level transport failure             | Pure retry preserving contract identity (AttemptID increments)              | attempts + cycles                    |
+| `provider_refusal`   | refusal/content-filter terminal reason         | none — abort                                                                | —                                    |
+| `preflight_infeasible` | B2 budget refusal                            | none — explicit human re-scope required                                     | —                                    |
+| `workspace_drift`    | B5 digest mismatch between attempts            | none — abort stale run                                                      | —                                    |
+| `mutation_failure`   | apply/verify gates failed                      | none — human decision over rolled-back ground                               | —                                    |
+
+The generic `retry_with_evidence` re-scope loop is REMOVED. Evidence appended
+by a repair carries `[DIAGNOSTIC subtype=… boundary=…]` advisory signals only
+(I2).
+
+## 0.6 Conformance Test Outcomes
+
+| Test Case                        | Level     | Assertion set (all passing)                                                                                                                                                 |
+| -------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A — Preflight Infeasibility Trapping | executor | `TestConformanceA_PreflightInfeasibilityTrapping` (internal/execution): 7780-byte FULL_REWRITE @ max_output=1024 halts with outcome `preflight_infeasible`, **0** provider requests, no artifact surface, workspace untouched, diagnostic metadata-only. Inverse guard: feasible target executes normally. |
+| A — runtime consequence          | driver    | `TestConformanceA_DriverPreflightInfeasibilityParksWithZeroRequests` (internal/runtime/autonomy): run parks at an inform boundary demanding explicit re-scope; 0 invocations.                                                               |
+| B — Output Exhaustion Circuit Breaking | executor | `TestConformanceB_OutputExhaustionCircuitBreaking`: simulated `finish_reason=length` carrying a parseable hunk is caught at B3, discarded UNPARSED (no pending patch), exactly 1 invocation, billed usage preserved, advisory diagnostic only. Refusal arm covered by `TestConformanceB_RefusalCircuitBreaks`. |
+| B — runtime consequence          | driver    | `TestConformanceB_DriverOutputExhaustionSingleTypedTransitionThenHalt`: exactly 2 invocations (initial + ONE typed transition); transition carries causal parent, workspace digest, diagnostic-only evidence; second exhaustion strictly halts. |
+| B5 drift                         | adapter   | `TestBoundaryFive_WorkspaceDriftAbortsBetweenAttempts`: stale digest refuses submission with 0 requests; fresh digest control executes.                                                                                                      |
+| Unit matrices                    | both      | `TestNormalizeFinishReasonVocabulary`, `TestEvaluatePreflightFormula`, `TestTreeDigestStabilityAndSensitivity`, `TestRecoverySubtypeMatrix`, `TestDecideRecoveryMatrix`.                                                                      |
+
+All tests pass (`go test ./...`), race-clean (`-race`), lint-clean.
+
+## 0.7 Implementation Notes
+
+* Legacy loop-level truncation fixtures that depended on an infeasible full
+  rewrite REACHING the provider were re-based: wire-contract/window assertions
+  now drive the executor's explicit `bounded_patch` contract directly (still
+  exercised against the original 7780-byte geometry); loop-level end-to-end
+  recovery uses feasibility-sized fixtures.
+* The historical sentinel `ErrOutputTruncated` remains discoverable through
+  the new gate-error chain (`ErrOutputExhausted` wraps it).
 
 ---
 
@@ -243,16 +321,16 @@ Sampling and transport adjustments belong to ModelInvocation retries. Contract R
 
 |                          |                                                                                                                                                                                                                            |
 | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Owner                    | `[TO_BE_AUDITED: ExecutionEngine / RecoveryHandler]`                                                                                                                                                                       |
-| What enters              | Model output failure, invocation failure, or execution error.                                                                                                                                                              |
-| What leaves              | Invocation retry payload OR materially altered ExecutionContract.                                                                                                                                                          |
-| What invariant proves it | Transport/sampling retries preserve Contract identity. Recovery changes at least one canonical operational contract dimension.                                                                                             |
-| What test proves it      | `[TO_BE_AUDITED: InvocationRetryDoesNotChangeContractID, InvocationRetryDoesNotChangeMutationScope, InvocationRetryDoesNotChangeCapability, RecoveryChangesContractIdentity, RecoveryChangesRequiredOperationalParameter]` |
+| Owner                    | `RuntimeExecutor` admission (`ContractRegistry.Resolve`) + runtime recovery matrix (`internal/runtime/autonomy/recovery.go`)                                                                                                |
+| What enters              | Model output failure, invocation failure, or execution error (classified into canonical failure SUBTYPES).                                                                                                                  |
+| What leaves              | Pure invocation retry under the SAME ContractID, OR a typed causal recovery contract with a material operational change.                                                                                                    |
+| What invariant proves it | Transport/sampling retries preserve Contract identity. Recovery changes at least one canonical operational contract dimension. Retryability is subtype-keyed (I4), never generic.                                             |
+| What test proves it      | `TestRecoveryDoesNotDuplicateProviderInvocation`, `TestUsageAggregationAcrossRecovery`, `TestConformanceB_DriverOutputExhaustionSingleTypedTransitionThenHalt`, `TestDecideRecoveryMatrix`                                   |
 | Architectural Status     | **CONFIRMED**                                                                                                                                                                                                              |
-| Implementation Status    | **UNKNOWN**                                                                                                                                                                                                                |
+| Implementation Status    | **VERIFIED**                                                                                                                                                                                                               |
 | Operational Status       | **UNMEASURED**                                                                                                                                                                                                             |
-| Test Evidence            | `[TO_BE_AUDITED]`                                                                                                                                                                                                          |
-| Implementation Evidence  | `[TO_BE_AUDITED]`                                                                                                                                                                                                          |
+| Test Evidence            | Named tests above pass on every run; transport retries derive an identical contract identity so the registry increments AttemptID only.                                                                                     |
+| Implementation Evidence  | `typedRepair` emits a pure retry (no prompt/evidence/strategy drift) for `transport_error`; material continuations set `ParentContractID` and resolve through `ContractRegistry.Resolve`'s causal edge under `MaxRecoveryChainDepth`. The legacy generic `retry_with_evidence` re-scope is removed (v0.5.0). |
 
 ### Recovery Parameter Audit Set
 
@@ -610,11 +688,11 @@ A contract-equivalence argument may only clear the gate if it demonstrates:
 ## Gate C — Runtime Truth & Recovery
 
 * [ ] Verify RuntimeHost is the sole production mutation authority.
-* [ ] Verify provider usage comes from authoritative provider/runtime evidence.
-* [ ] Verify UI cannot render mutation success before MutationEvidence.
-* [ ] Verify invocation retries preserve Contract ID.
-* [ ] Verify invocation retries preserve scope/capability/domain.
-* [ ] Verify Contract Recovery changes a canonical operational parameter.
+* [x] Verify provider usage comes from authoritative provider/runtime evidence.
+* [x] Verify UI cannot render mutation success before MutationEvidence.
+* [x] Verify invocation retries preserve Contract ID. (v0.5.0: pure transport retries derive identical contract identity; `TestUsageAggregationAcrossRecovery`.)
+* [x] Verify invocation retries preserve scope/capability/domain. (v0.5.0: pure retries change no operational parameter.)
+* [x] Verify Contract Recovery changes a canonical operational parameter. (v0.5.0: typed transitions change artifact protocol + causal lineage; `TestConformanceB_DriverOutputExhaustionSingleTypedTransitionThenHalt`.)
 * [ ] Verify fresh snapshot creation after terminal contract completion.
 * [ ] Verify re-baselining does not erase concurrency conflicts.
 * [ ] Verify `PARTIALLY_APPLIED` produces explicit domain outcomes.
@@ -699,7 +777,7 @@ At closure, every major boundary MUST have:
 | Intent & Dynamic Surface    | CONFIRMED            | `[STATUS]`            | `[STATUS]`         | `[TESTS / BENCHMARK]` |
 | Context Compiler            | CONFIRMED            | `[STATUS]`            | `[STATUS]`         | `[TESTS]`             |
 | Capability Grant            | CONFIRMED            | `[STATUS]`            | N/A                | `[TESTS]`             |
-| Invocation / Recovery       | CONFIRMED            | `[STATUS]`            | `[STATUS]`         | `[TESTS]`             |
+| Invocation / Recovery       | CONFIRMED            | VERIFIED              | UNMEASURED         | §0.6 test matrix      |
 | Mutation / OCC              | CONFIRMED            | `[STATUS]`            | `[STATUS]`         | `[TESTS / BENCHMARK]` |
 | Runtime Evidence / UI       | CONFIRMED            | `[STATUS]`            | N/A                | `[TESTS]`             |
 | Domain Isolation            | CONFIRMED            | `[STATUS]`            | N/A                | `[TESTS]`             |
@@ -707,6 +785,7 @@ At closure, every major boundary MUST have:
 | Risk Scope                  | CONFIRMED            | `[STATUS]`            | N/A                | `[TESTS]`             |
 | Context Fidelity            | CONFIRMED            | `[STATUS]`            | N/A                | `[TESTS]`             |
 | Partial Application / Taint | CONFIRMED            | `[STATUS]`            | N/A                | `[TESTS]`             |
+| Execution Pipeline (B1–B5, I1–I5) | CONFIRMED      | VERIFIED              | UNMEASURED         | §0.6 conformance suite |
 
 ---
 

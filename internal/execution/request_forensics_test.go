@@ -84,8 +84,11 @@ func marshalBody(body wireBody) string {
 	return string(data)
 }
 
-// reproIndexHTML is a representative index.html (≈6.5KB) so the reconstructed
-// input-token envelope matches the observed 2,185-token repro input.
+// reproIndexHTML is a representative index.html (≈6.5KB) matching the original
+// 2,185-token repro envelope. It is retained as documentation of the incident
+// shape; since Boundary 2 (preflight guard, I5) such a target can never reach
+// the wire under a 1024-token budget, so the wire-forensics test exercises
+// reproIndexHTMLCompact — a feasible full-rewrite target.
 const reproIndexHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -136,6 +139,32 @@ const reproIndexHTML = `<!DOCTYPE html>
 </html>
 `
 
+// reproIndexHTMLCompact is a feasible full-rewrite fixture (~0.9KB): small
+// enough that TargetFileTokens × FullRewriteTokenMultiplier fits the 1024-token
+// strategy budget at Boundary 2, so the wire body is actually produced.
+const reproIndexHTMLCompact = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Landing Page</title>
+  <style>
+    body { font-family:system-ui,sans-serif; background:#0f172a; color:#e2e8f0; }
+    .btn { padding:0.75rem 1.5rem; background:#2563eb; color:#fff; border-radius:8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <nav><div class="logo">Acme</div></nav>
+  </header>
+  <section class="hero">
+    <h1>Build Better Software</h1>
+    <p>The modern platform for teams that ship.</p>
+    <a href="#pricing" class="btn">Get Started</a>
+  </section>
+  <footer>&copy; 2026 Acme Corp</footer>
+</body>
+</html>
+`
+
 // TestForensicWireBody_AutonomousVsBuild reconstructs the exact wire body of
 // the autonomous and /build executions of the repro objective and proves the
 // request-level facts: identical system/user prompts, the strategy budget
@@ -143,7 +172,7 @@ const reproIndexHTML = `<!DOCTYPE html>
 // on either path.
 func TestForensicWireBody_AutonomousVsBuild(t *testing.T) {
 	root := t.TempDir()
-	writeTarget(t, root, "index.html", reproIndexHTML)
+	writeTarget(t, root, "index.html", reproIndexHTMLCompact)
 	bus := events.NewBus(events.DefaultBufferSize)
 
 	model := "cohere/north-mini-code:free"

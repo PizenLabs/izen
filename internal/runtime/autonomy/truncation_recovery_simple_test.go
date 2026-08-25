@@ -21,27 +21,33 @@ func TestTruncationRecoveryChangesStrategySimple(t *testing.T) {
 		InputTokens:     2180,
 		OutputTokens:    1021,
 		UsageKnown:      true,
+		ContractID:      "ct-parent",
 	}
 	req := autonomy.LoopRequest{
 		Prompt:   "check @index.html and rewrite it",
 		Targets:  []string{"index.html"},
 		Evidence: "initial evidence",
 	}
-	next, err := defaultRepair(obs, req)
+	next, err := typedRepair(obs, req)
 	if err != nil {
 		t.Fatalf("repair: %v", err)
 	}
-	if next.RecoveryStrategy != "bounded_patch" {
+	if next.RecoveryStrategy != autonomy.StrategyBoundedPatch {
 		t.Fatalf("RecoveryStrategy = %q, want bounded_patch", next.RecoveryStrategy)
 	}
 	if next.Evidence == req.Evidence {
 		t.Fatal("Evidence unchanged after truncation recovery")
 	}
-	if !strings.Contains(next.Evidence, "bounded_patch") && !strings.Contains(next.Evidence, "SEARCH/REPLACE") {
-		t.Fatalf("Evidence missing bounded_patch hint: %q", next.Evidence)
+	if !strings.Contains(next.Evidence, "OUTPUT_EXHAUSTED") || !strings.Contains(next.Evidence, "SEARCH/REPLACE") {
+		t.Fatalf("Evidence missing the diagnostic signal: %q", next.Evidence)
 	}
-	if next.Prompt == req.Prompt && next.Evidence == req.Evidence && next.MaxOutputTokens == req.MaxOutputTokens {
-		t.Fatal("next LoopRequest is identical to previous — not a material contract change")
+	// Recovery Isolation (I2): only advisory diagnostic metadata crosses —
+	// no raw artifact bytes can be present by construction.
+	if next.ParentContractID == "" {
+		t.Fatal("typed transition lost the causal contract lineage (I3)")
+	}
+	if next.Prompt != req.Prompt {
+		t.Fatal("typed repair must not silently alter user intent")
 	}
 }
 
@@ -78,7 +84,10 @@ func TestBoundedRecoveryExhaustion(t *testing.T) {
 
 func TestUsageAcrossRecoverySimple(t *testing.T) {
 	root := t.TempDir()
-	writeTarget(t, root, "index.html", strings.Repeat("x", 7780))
+	// Feasibility-sized target (I5): a full rewrite of this file fits the
+	// 1024-token budget at Boundary 2, so attempt 1 legitimately reaches the
+	// provider and truncates there.
+	writeTarget(t, root, "index.html", strings.Repeat("x", 700))
 	r1 := &ai.Response{Content: "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>>", Usage: ai.ProviderUsage{PromptTokens: 2180, CompletionTokens: 1021, Known: true, FinishReason: "length"}, TokenInput: 2180, TokenOutput: 1021}
 	r2 := &ai.Response{Content: "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>>", Usage: ai.ProviderUsage{PromptTokens: 2176, CompletionTokens: 1024, Known: true, FinishReason: "stop"}, TokenInput: 2176, TokenOutput: 1024}
 	mock := &mockProvider{responses: []*ai.Response{r1, r2}}

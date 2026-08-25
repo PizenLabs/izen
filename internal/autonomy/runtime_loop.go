@@ -111,6 +111,23 @@ const (
 	OutcomePendingApproval ExecutionOutcome = "pending_approval"
 	OutcomeRejected        ExecutionOutcome = "rejected"
 	OutcomeCompleted       ExecutionOutcome = "completed"
+	// OutcomePreflightInfeasible is the Boundary-2 verdict (I5): the estimated
+	// generation budget exceeded max_output, so execution was refused BEFORE
+	// any provider request. Only an explicit human re-scope continues.
+	OutcomePreflightInfeasible ExecutionOutcome = "preflight_infeasible"
+	// OutcomeWorkspaceDrift is the Boundary-5 verdict: the workspace version
+	// changed between attempts. The run aborts — a stale attempt never
+	// re-executes over moved ground.
+	OutcomeWorkspaceDrift ExecutionOutcome = "workspace_drift"
+)
+
+// RecoveryStrategy names the artifact protocol of the observation's own
+// attempt ("bounded_patch" after a typed FULL_REWRITE → BOUNDED_PATCH
+// transition; "" for the initial full-artifact contract). The recovery matrix
+// reads it as the authoritative transition-latch state.
+const (
+	StrategyFullArtifact = ""
+	StrategyBoundedPatch = "bounded_patch"
 )
 
 // Failed reports whether the outcome represents a failed execution.
@@ -191,6 +208,12 @@ type Observation struct {
 	FinishReason string
 	// MaxOutputTokens is the output budget that was enforced for this attempt.
 	MaxOutputTokens int
+	// RecoveryStrategy names the artifact protocol of THIS attempt
+	// (StrategyBoundedPatch after a typed transition; StrategyFullArtifact for
+	// the initial contract). It is the authoritative I3 transition-latch
+	// state: the matrix refuses a second OUTPUT_EXHAUSTED transition when it
+	// is already set.
+	RecoveryStrategy string
 	// AttemptNum is the attempt counter for the current objective.
 	AttemptNum int
 	// RecoveryCycle is the recovery-cycle counter for the current objective.
@@ -341,10 +364,10 @@ type HumanBoundary struct {
 	Resumable bool
 }
 
-// deriveBoundaryAction computes the canonical Action/Resumable from a boundary's
-// fields. Deterministic: identical boundary facts always yield identical
-// presentation facts.
-func deriveBoundaryAction(b *HumanBoundary) {
+// DeriveBoundaryAction computes the canonical Action/Resumable from a
+// boundary's fields. Deterministic: identical boundary facts always yield
+// identical presentation facts.
+func DeriveBoundaryAction(b *HumanBoundary) {
 	if b == nil {
 		return
 	}
@@ -447,6 +470,12 @@ type LoopRequest struct {
 	ParentContractID string
 	// MaxOutputTokens is an explicit output budget override for this attempt (0 = use profile default).
 	MaxOutputTokens int
+	// WorkspaceDigest is the Boundary-5 workspace version
+	// SHA256(Σ path(f)+hash(f)) captured when the run resolved its targets.
+	// The adapter re-validates it BEFORE submitting the execution: any
+	// out-of-band change between attempts returns a workspace_drift
+	// observation with ZERO provider requests.
+	WorkspaceDigest string
 	// FinishReason carries the previous attempt's finish_reason for observability.
 	FinishReason string
 	// StreamCallback is an optional callback for incremental streaming progress.
@@ -678,7 +707,7 @@ func (l *RuntimeLoop) applyDecision(d LoopDecision) RuntimeState {
 	case LoopAskHuman:
 		l.push(d.Action, RuntimeAwaitingHuman, d.Reason)
 		b := &HumanBoundary{Reason: d.Reason, PatchID: d.PatchID, Options: d.Options}
-		deriveBoundaryAction(b)
+		DeriveBoundaryAction(b)
 		l.boundary = b
 	case LoopAbort:
 		l.terminate(LoopAbort, RuntimeAborted, d.Reason, FailurePermanent)
@@ -692,7 +721,7 @@ func (l *RuntimeLoop) AwaitHuman(b HumanBoundary) RuntimeState {
 	if l == nil || l.state.IsTerminal() {
 		return l.State()
 	}
-	deriveBoundaryAction(&b)
+	DeriveBoundaryAction(&b)
 	l.boundary = &b
 	return l.push(LoopAskHuman, RuntimeAwaitingHuman, b.Reason)
 }
