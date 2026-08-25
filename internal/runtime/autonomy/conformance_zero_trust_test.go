@@ -9,6 +9,7 @@ import (
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/execution/planner"
 )
 
 // ── Conformance verification, runtime side ─────────────────────────────────
@@ -46,49 +47,102 @@ func loopBoundsForConformance() autonomy.LoopBounds {
 
 // TestConformanceA_DriverPreflightInfeasibilityParksWithZeroRequests pins the
 // runtime-level consequence of invariant I5: the run NEVER reaches the
-// provider and parks for an EXPLICIT human re-scope — user intent is not
-// silently rewritten into something else.
+// provider and parks for an EXPLICIT human decision — user intent is not
+// silently rewritten into something else. Since the Boundary-2 expansion, a
+// DECOMPOSABLE target stages a typed DECOMPOSITION_PROPOSAL listing every
+// sub-task; a non-decomposable target falls back to the plain re-scope
+// demand. Both paths trap at Boundary 2 with zero requests.
 func TestConformanceA_DriverPreflightInfeasibilityParksWithZeroRequests(t *testing.T) {
-	root := t.TempDir()
-	writeIncidentTarget(t, root)
+	t.Run("decomposable target stages a decomposition proposal", func(t *testing.T) {
+		root := t.TempDir()
+		writeIncidentTarget(t, root)
 
-	mock := &mockProvider{responses: []*ai.Response{{
-		Content: "should never be requested",
-		Usage:   ai.ProviderUsage{Known: true, FinishReason: "stop"},
-	}}}
-	bus := events.NewBus(events.DefaultBufferSize)
-	x := testExecutor(t, root, mock, bus)
-	driver := NewDriver(
-		NewExecutorAdapter(root, execution.NewIntentGateway(root), x),
-		bus, WithLoopBounds(loopBoundsForConformance()))
+		mock := &mockProvider{responses: []*ai.Response{{
+			Content: "should never be requested",
+			Usage:   ai.ProviderUsage{Known: true, FinishReason: "stop"},
+		}}}
+		bus := events.NewBus(events.DefaultBufferSize)
+		x := testExecutor(t, root, mock, bus)
+		driver := NewDriver(
+			NewExecutorAdapter(root, execution.NewIntentGateway(root), x),
+			bus, WithLoopBounds(loopBoundsForConformance()))
 
-	term, err := driver.Run(context.Background(), "check @index.html and rewrite it")
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
+		term, err := driver.Run(context.Background(), "check @index.html and rewrite it")
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
 
-	// ZERO HTTP provider requests crossed.
-	if got := mock.calls(); got != 0 {
-		t.Fatalf("provider requests = %d, want 0 (Boundary 2 traps before any invocation)", got)
-	}
+		// ZERO HTTP provider requests crossed.
+		if got := mock.calls(); got != 0 {
+			t.Fatalf("provider requests = %d, want 0 (Boundary 2 traps before any invocation)", got)
+		}
 
-	// The loop parked for a human re-scope decision.
-	if driver.State() != autonomy.RuntimeAwaitingHuman {
-		t.Fatalf("state = %s, want awaiting_human", driver.State())
-	}
-	b := driver.Boundary()
-	if b == nil || b.PatchID != "" {
-		t.Fatalf("boundary = %+v, want an inform boundary without a held patch", b)
-	}
-	if !strings.Contains(b.Reason, "preflight infeasible") || !strings.Contains(b.Reason, "re-scope") {
-		t.Fatalf("boundary reason = %q, want an explicit re-scope demand", b.Reason)
-	}
-	_ = term // nil termination = parked
+		// The loop parked at the TYPED decomposition gate.
+		if driver.State() != autonomy.RuntimeAwaitingHuman {
+			t.Fatalf("state = %s, want awaiting_human", driver.State())
+		}
+		b := driver.Boundary()
+		if b == nil || b.PatchID != "" {
+			t.Fatalf("boundary = %+v, want a proposal boundary without a held patch", b)
+		}
+		if b.Action != autonomy.HumanBoundaryDecomposition {
+			t.Fatalf("boundary action = %q, want %q", b.Action, autonomy.HumanBoundaryDecomposition)
+		}
+		dag := driver.Proposal()
+		if dag == nil {
+			t.Fatal("boundary carries no staged ExecutionDAG")
+		}
+		if dag.Status != planner.PlanStaged {
+			t.Fatalf("plan status = %s, want %s", dag.Status, planner.PlanStaged)
+		}
+		for _, st := range dag.SubTasks {
+			if st.EstimatedTokens > dag.Budget() {
+				t.Fatalf("%s estimates %d > strict ceiling %d", st.ID, st.EstimatedTokens, dag.Budget())
+			}
+		}
+		if !strings.Contains(b.Reason, "DECOMPOSITION_PROPOSAL") {
+			t.Fatalf("boundary reason = %q, want the typed proposal header", b.Reason)
+		}
+		_ = term // nil termination = parked
 
-	// The workspace is untouched.
-	if got := readTarget(t, root, "index.html"); len(got) != incidentTargetBytes {
-		t.Fatal("workspace changed on a preflight-rejected objective")
-	}
+		// The workspace is untouched.
+		if got := readTarget(t, root, "index.html"); len(got) != incidentTargetBytes {
+			t.Fatal("workspace changed on a preflight-rejected objective")
+		}
+	})
+
+	t.Run("non-decomposable target demands explicit re-scope", func(t *testing.T) {
+		root := t.TempDir()
+		writeTarget(t, root, "notes.txt", strings.Repeat("filler line\n", 700)) // 8.4KB, no decomposer
+
+		mock := &mockProvider{responses: []*ai.Response{{
+			Content: "should never be requested",
+			Usage:   ai.ProviderUsage{Known: true, FinishReason: "stop"},
+		}}}
+		bus := events.NewBus(events.DefaultBufferSize)
+		x := testExecutor(t, root, mock, bus)
+		driver := NewDriver(
+			NewExecutorAdapter(root, execution.NewIntentGateway(root), x),
+			bus, WithLoopBounds(loopBoundsForConformance()))
+
+		if _, err := driver.Run(context.Background(), "rewrite @notes.txt"); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+
+		if got := mock.calls(); got != 0 {
+			t.Fatalf("provider requests = %d, want 0", got)
+		}
+		if driver.State() != autonomy.RuntimeAwaitingHuman {
+			t.Fatalf("state = %s, want awaiting_human", driver.State())
+		}
+		b := driver.Boundary()
+		if b == nil || b.Proposal != nil {
+			t.Fatalf("boundary = %+v, want a plain boundary without a proposal", b)
+		}
+		if !strings.Contains(b.Reason, "preflight infeasible") || !strings.Contains(b.Reason, "re-scope") {
+			t.Fatalf("boundary reason = %q, want an explicit re-scope demand", b.Reason)
+		}
+	})
 }
 
 // TestConformanceB_DriverOutputExhaustionSingleTypedTransitionThenHalt pins
