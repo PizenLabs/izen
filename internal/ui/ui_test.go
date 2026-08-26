@@ -141,7 +141,7 @@ func TestDecompositionProposalKeyBindings(t *testing.T) {
 	if kcmd == nil {
 		t.Fatal("Enter on a staged proposal must return a command")
 	}
-	kcmd()
+	extractAutonomousRunMsg(t, kcmd())
 	if drv.resumeApproveProposal != 1 {
 		t.Fatalf("Enter must approve the DAG, ResumeApproveProposal calls = %d", drv.resumeApproveProposal)
 	}
@@ -156,7 +156,7 @@ func TestDecompositionProposalKeyBindings(t *testing.T) {
 	if kcmd2 == nil {
 		t.Fatal("Esc on a staged proposal must return a command")
 	}
-	kcmd2()
+	extractAutonomousRunMsg(t, kcmd2())
 	if drv2.resumeRejectProposal != 1 {
 		t.Fatalf("Esc must cancel the DAG, ResumeRejectProposal calls = %d", drv2.resumeRejectProposal)
 	}

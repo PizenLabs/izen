@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"unicode/utf8"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/execution"
@@ -374,6 +375,7 @@ func (a *ExecutorAdapter) observe(req autonomy.LoopRequest, res *execution.Execu
 		Intent:                autonomy.Intent(req.Intent),
 		Target:                firstTarget(res.Targets),
 		Evidence:              req.Evidence,
+		Diagnostic:            diagnosticEvidence(res),
 		Outcome:               autonomy.ExecutionOutcome(outcome),
 		PatchID:               res.PendingPatchID,
 		ClarificationRequired: res.ClarificationRequired,
@@ -393,6 +395,41 @@ func firstTarget(targets []string) string {
 		return ""
 	}
 	return targets[0]
+}
+
+// maxDiagnosticEvidence bounds the diagnostic text an observation carries.
+const maxDiagnosticEvidence = 512
+
+// diagnosticEvidence extracts the bounded validation-error text of a FAILED
+// execution for the observation's Diagnostic field (I2 Recovery Isolation:
+// advisory metadata only — the rejected artifact bytes never travel). The
+// executor's own error is preferred because it names the concrete contract
+// violation; the sealed Boundary-4 advisory signal is the fallback.
+func diagnosticEvidence(res *execution.ExecutionResult) string {
+	if res == nil {
+		return ""
+	}
+	msg := ""
+	if res.Err != nil {
+		msg = res.Err.Error()
+	}
+	if msg == "" {
+		if n := len(res.Diagnostics); n > 0 {
+			d := res.Diagnostics[n-1]
+			msg = d.Subtype + ": " + d.Detail
+			if d.Directive != "" {
+				msg += " — " + d.Directive
+			}
+		}
+	}
+	if len(msg) > maxDiagnosticEvidence {
+		cut := maxDiagnosticEvidence
+		for cut > 0 && !utf8.RuneStart(msg[cut]) {
+			cut--
+		}
+		msg = msg[:cut] + "…"
+	}
+	return msg
 }
 
 // observationContractID extracts the immutable contract identity of a

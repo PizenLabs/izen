@@ -145,8 +145,13 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 
 	// Reserve bounded headroom for exactly the consented scope: N approved
 	// sub-executions must not trip the single-objective defaults mid-plan.
+	// Each sub-task may consume up to maxSubTaskAttempts provider invocations
+	// (intra-DAG artifact-contract retries), so every floor reserves that
+	// worst case explicitly — a retried plan is still a bounded plan.
 	totalEstimated := dag.TotalEstimatedTokens()
-	d.loop.WidenBounds(n+1, n+1, totalEstimated+n*256+1024, n+2)
+	worstExecs := n * maxSubTaskAttempts
+	d.loop.WidenBounds(worstExecs+1, worstExecs+1,
+		totalEstimated*maxSubTaskAttempts+worstExecs*256+1024, worstExecs+2)
 
 	// Atomicity snapshot: the exact bytes every plan target had BEFORE the
 	// first mutation. Rollback restores them verbatim.
@@ -175,34 +180,12 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 					st.ID, i+1, n, short(expected), short(before)))
 		}
 
-		req := autonomy.LoopRequest{
-			RequestID: fmt.Sprintf("%s-%s", d.runRequestID, st.ID),
-			Prompt:    subTaskPrompt(d.prompt, dag, st, i+1, n),
-			Target:    dag.Target,
-			Targets:   append([]string(nil), targets...),
-			Evidence: fmt.Sprintf("[DAG sub_task=%s region=%s estimate=%dtok ceiling=%dtok base_digest=%s]",
-				st.ID, st.Region, st.EstimatedTokens, dag.Budget(), short(dag.BaseTreeDigest)),
-			Intent:           "mutate",
-			MaxOutputTokens:  dag.MaxOutputTokens,
-			WorkspaceDigest:  before,
-			RecoveryStrategy: autonomy.StrategyBoundedPatch,
-			RecoveryAttempt:  i + 1,
-			RecoveryReason:   fmt.Sprintf("decomposition sub-task %d/%d scoped to %s", i+1, n, st.Region),
-			StreamCallback:   d.streamCb,
-			// The approved plan travels with EVERY unit so the executor's
-			// Boundary-2 guard evaluates each window individually instead of
-			// re-measuring the monolithic target the plan was decomposed from.
-			StagedPlan: dag,
-		}
-		d.streamCb = nil
-
-		obs, err := d.executeSubTask(ctx, req)
+		obs, attempts, err := d.executeSubTaskWithRetry(ctx, dag, st, i+1, n, targets, before)
 		if err != nil {
 			return d.failDAG(ctx, dag, originals, i,
 				fmt.Sprintf("sub-task %s (%d/%d) failed at the output/artifact gates: %v", st.ID, i+1, n, err))
 		}
 		d.obs = obs
-		d.aggregateUsage(obs)
 
 		// The proposal approval covers each held patch: resolve the gate.
 		if obs.Outcome == autonomy.OutcomePendingApproval {
@@ -217,9 +200,13 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 		}
 
 		if !dagOutcomeSuccess(obs) {
+			attemptNote := ""
+			if attempts > 1 {
+				attemptNote = fmt.Sprintf(" after %d/%d contract attempts", attempts, maxSubTaskAttempts)
+			}
 			return d.failDAG(ctx, dag, originals, i,
-				fmt.Sprintf("sub-task %s (%d/%d) terminal outcome %s (finish_reason=%q) — boundaries 3/4/5 refused the unit",
-					st.ID, i+1, n, obs.Outcome, obs.FinishReason))
+				fmt.Sprintf("sub-task %s (%d/%d) terminal outcome %s (finish_reason=%q)%s — boundaries 3/4/5 refused the unit",
+					st.ID, i+1, n, obs.Outcome, obs.FinishReason, attemptNote))
 		}
 
 		// ── BOUNDARY 5 — digest AFTER the sub-task ─────────────────────
@@ -317,7 +304,10 @@ func (d *Driver) failDAG(ctx context.Context, dag *planner.ExecutionDAG, origina
 
 // subTaskPrompt renders the bounded per-unit instruction. The recovery
 // strategy travels separately (bounded_patch); the prompt only scopes WHERE
-// the single anchored patch may land.
+// the single anchored patch may land. SEARCH_REPLACE_BOUNDED_LINES units
+// additionally carry the STRICT patch contract: the exact block format the
+// Boundary-4 gate accepts is stated up front so a malformed generation can
+// never claim ambiguity about the artifact structure.
 func subTaskPrompt(objective string, dag *planner.ExecutionDAG, st planner.SubTask, pos, total int) string {
 	var b strings.Builder
 	b.WriteString(strings.TrimSpace(objective))
@@ -325,5 +315,5 @@ func subTaskPrompt(objective string, dag *planner.ExecutionDAG, st planner.SubTa
 	fmt.Fprintf(&b, "Change window: %s.\nScope: %s.\n", st.Region, st.Description)
 	b.WriteString("Produce exactly ONE anchored SEARCH/REPLACE block whose SEARCH text is copied VERBATIM " +
 		"from within this change window of the current file content. Do not modify any other region.")
-	return b.String()
+	return injectPatchContract(b.String(), st.Kind)
 }

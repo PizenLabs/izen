@@ -436,7 +436,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// the next tick. When idle we return nil and the loop stops — no
 		// custom tick-source ownership, no locks, no deadlock.
 		hasActiveWork := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning ||
-			m.shellRunning || m.state == StateProcessing || m.state == StateAwaitingApproval || m.shimmerActive
+			m.shellRunning || m.state == StateProcessing || m.state == StateAwaitingApproval ||
+			m.shimmerActive || m.autonomousActive
 		if hasActiveWork {
 			// Keep the activity heartbeat fresh while any execution indicator
 			// is live. The idle-gate in the reconcile block above relies on
@@ -1836,7 +1837,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// frozen. So the loop must keep self-scheduling whenever a background
 		// producer still owns the flags.
 		backgroundActive := m.streaming || m.agentRunning || m.reviewRunning ||
-			m.pipelineRunning || m.planPending || m.shellRunning
+			m.pipelineRunning || m.planPending || m.shellRunning || m.autonomousActive
 		if backgroundActive {
 			m.lastAgentActivity = time.Now()
 			// GUARD: when the shimmer is active, the shimmerTickCmd already
@@ -1906,8 +1907,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// flight" signals. m.shimmerActive is included so the loop survives
 		// the async /ask context-prep window (shimmer live, stream not yet
 		// started) and any cloud-provider burst that momentarily empties the
-		// stream flags.
-		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.planPending || m.shellRunning || m.shimmerActive {
+		// stream flags. m.autonomousActive keeps the loop armed through the
+		// whole driver run/DAG_EXECUTING even when a mid-run stream event
+		// cleared the shimmer.
+		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.planPending || m.shellRunning || m.shimmerActive || m.autonomousActive {
 			m.streamTickActive = true
 			return m, m.smoothStreamTickCmd()
 		}

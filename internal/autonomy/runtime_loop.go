@@ -184,6 +184,12 @@ type Observation struct {
 	Target string
 	// Evidence is the bounded structural ledger (deterministic, not raw files).
 	Evidence string
+	// Diagnostic carries the bounded advisory of a FAILED attempt (I2
+	// Recovery Isolation): WHAT failed and WHAT to do differently — the
+	// gate/validation error text, never a byte of the rejected artifact. It
+	// feeds self-correction contexts so a successor attempt can repair the
+	// output structure instead of repeating it blind.
+	Diagnostic string
 	// Outcome is the normalized authoritative execution outcome.
 	Outcome ExecutionOutcome
 	// PatchID is the approval-held patch identity when Outcome is

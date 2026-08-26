@@ -49,12 +49,13 @@ var stRe = regexp.MustCompile(`\[DECOMPOSITION (st-\d+)`)
 // a mutate hook runs BEFORE the response is produced (simulates an
 // out-of-band writer between sub-tasks).
 type dagProvider struct {
-	mu     sync.Mutex
-	root   string
-	target string
-	calls  int
-	poison map[int]bool // call number (1-based) → garbage response
-	onCall func(call int)
+	mu      sync.Mutex
+	root    string
+	target  string
+	calls   int
+	poison  map[int]bool // call number (1-based) → garbage response
+	onCall  func(call int)
+	prompts []string // flattened user prompt of every call, oldest first
 }
 
 func (p *dagProvider) Name() string { return "dag-mock" }
@@ -65,6 +66,7 @@ func (p *dagProvider) Execute(_ context.Context, req ai.Request) (*ai.Response, 
 	call := p.calls
 	poison := p.poison[call]
 	hook := p.onCall
+	p.prompts = append(p.prompts, userPrompt(req))
 	p.mu.Unlock()
 
 	if hook != nil {
@@ -105,6 +107,14 @@ func userPrompt(req ai.Request) string {
 
 func (p *dagProvider) ExecuteStream(_ context.Context, _ ai.Request) (io.ReadCloser, error) {
 	return nil, fmt.Errorf("stream not supported")
+}
+
+// recordedPrompts returns the flattened user prompt of every invocation,
+// oldest first.
+func (p *dagProvider) recordedPrompts() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.prompts...)
 }
 
 // windowLine anchors the synthetic patch on the first line of the requested
@@ -223,15 +233,16 @@ func TestDriver_DecompositionApprovalExecutesAllSubTasksAtomically(t *testing.T)
 	}
 }
 
-// ── Boundary-4 failure mid-plan: abort + rollback + DAG_EXECUTION_FAILED ───
+// ── Boundary-4 failure mid-plan: retries exhausted → abort + rollback ───────
 
 func TestDriver_DecompositionArtifactFailureRollsBackToBaseDigest(t *testing.T) {
 	root, driver, dag, p := stageDecompositionRun(t, 60)
 
 	original := readTarget(t, root, "big.go")
 
-	// Sub-task 2 produces garbage: Boundary 4 rejects the artifact.
-	p.poison = map[int]bool{2: true}
+	// Sub-task 2 produces garbage on EVERY attempt: Boundary 4 rejects the
+	// artifact; after maxSubTaskAttempts contract retries the DAG aborts.
+	p.poison = map[int]bool{2: true, 3: true, 4: true}
 
 	term, err := driver.ResumeApproveProposal(context.Background())
 	if err != nil {
@@ -243,6 +254,9 @@ func TestDriver_DecompositionArtifactFailureRollsBackToBaseDigest(t *testing.T) 
 	if !strings.Contains(term.Reason, "DAG_EXECUTION_FAILED") {
 		t.Fatalf("termination reason %q missing DAG_EXECUTION_FAILED", term.Reason)
 	}
+	if !strings.Contains(term.Reason, "artifact_retryable_rejected") {
+		t.Fatalf("termination reason %q should name the exhausted outcome", term.Reason)
+	}
 
 	// The plan is marked failed and names the failing unit.
 	if driver.Plan().Status != planner.DagExecutionFailed {
@@ -252,10 +266,20 @@ func TestDriver_DecompositionArtifactFailureRollsBackToBaseDigest(t *testing.T) 
 		t.Fatalf("failure reason %q should name the failing sub-task", driver.Plan().FailureReason)
 	}
 
-	// ATOMICITY: exactly the first two units ran (1 applied + 1 refused);
-	// remaining sub-tasks NEVER reached the provider.
-	if got := p.calls; got != 2 {
-		t.Fatalf("provider calls = %d, want 2 (abort must not continue the plan)", got)
+	// ATOMICITY: exactly st-1 (1 call) + st-2's full attempt budget
+	// (maxSubTaskAttempts calls) ran; remaining sub-tasks NEVER reached the
+	// provider — exhausted retries abort instead of continuing the plan.
+	if got := p.calls; got != 1+maxSubTaskAttempts {
+		t.Fatalf("provider calls = %d, want %d (st-2 consumed its full attempt budget)", got, 1+maxSubTaskAttempts)
+	}
+	prompts := p.recordedPrompts()
+	if strings.Contains(prompts[1], "[RETRY") {
+		t.Error("st-2 attempt 1 must carry no retry marker")
+	}
+	for i := 3; i <= 4; i++ {
+		if !strings.Contains(prompts[i-1], "[RETRY") {
+			t.Errorf("call %d must be a contract retry carrying feedback context", i)
+		}
 	}
 
 	// The workspace provably rolled back to the BaseTreeDigest.
