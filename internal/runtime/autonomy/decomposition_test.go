@@ -428,7 +428,7 @@ func TestSubTaskPromptIsBoundedAndScoped(t *testing.T) {
 	dag := &planner.ExecutionDAG{Objective: "obj", Target: "f.go", MaxOutputTokens: 1000}
 	st := planner.SubTask{ID: "st-2", Index: 2, Region: planner.Region{StartLine: 10, EndLine: 20},
 		Description: "type Handler1 struct"}
-	got := subTaskPrompt("rewrite @f.go", dag, st, 2, 5)
+	got := subTaskPrompt("rewrite @f.go", dag, st, 2, 5, nil)
 	for _, want := range []string{"st-2", "sub-task 2/5", "lines 10–20", "SEARCH"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("prompt missing %q:\n%s", want, got)

@@ -532,6 +532,15 @@ type LoopRequest struct {
 	// evaluated individually and the monolithic full-rewrite estimation of
 	// the original target is suppressed. Nil for non-DAG requests.
 	StagedPlan *planner.ExecutionDAG
+	// FocusStartLine / FocusEndLine optionally pin the executor's
+	// deterministic bounded-patch context window to THIS unit's assigned
+	// inclusive 1-indexed line interval. Under a staged decomposition plan
+	// each sub-task sets these to its Region: retries can then neither see
+	// nor anchor on another unit's content — the local-context blindness that
+	// produced false NO_CHANGES_REQUIRED claims. Zero values mean "no focus"
+	// (the whole file remains windowable, the pre-DAG behavior).
+	FocusStartLine int
+	FocusEndLine   int
 	// NoOpEscalation marks this request as a NO-OP escalation attempt: the
 	// previous attempt for this unit answered NO_CHANGES_REQUIRED while
 	// structural analysis indicated work remains. The executor widens the

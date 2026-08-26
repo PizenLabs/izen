@@ -31,12 +31,15 @@ import (
 //     marked DAG_EXECUTION_FAILED. Remaining sub-tasks NEVER execute.
 
 // DecomposeFunc stages an ExecutionDAG for one infeasible objective. It is
-// injectable for policy tests; the default wraps planner.Decompose.
+// injectable for policy tests; the default wraps planner.DecomposeTarget
+// (Lea semantic unit splitting with syntactic fallback).
 type DecomposeFunc func(objective, target string, source []byte, baseDigest string, maxOutputTokens int) (*planner.ExecutionDAG, error)
 
-// defaultDecompose delegates to the canonical deterministic planner.
+// defaultDecompose delegates to the canonical deterministic planner: semantic
+// structural units first (HTML/JSX/Go templates), syntactic splitting only as
+// the low_semantic_confidence fallback.
 func defaultDecompose(objective, target string, source []byte, baseDigest string, maxOutputTokens int) (*planner.ExecutionDAG, error) {
-	return planner.Decompose(objective, target, source, baseDigest, maxOutputTokens)
+	return planner.DecomposeTarget(objective, target, source, baseDigest, maxOutputTokens)
 }
 
 // Proposal returns the parked DECOMPOSITION_PROPOSAL plan, or nil while no
@@ -382,15 +385,22 @@ func (d *Driver) failDAG(ctx context.Context, dag *planner.ExecutionDAG, origina
 
 // subTaskPrompt renders the bounded per-unit instruction. The recovery
 // strategy travels separately (bounded_patch); the prompt only scopes WHERE
-// the single anchored patch may land. SEARCH_REPLACE_BOUNDED_LINES units
-// additionally carry the STRICT patch contract: the exact block format the
-// Boundary-4 gate accepts is stated up front so a malformed generation can
-// never claim ambiguity about the artifact structure.
-func subTaskPrompt(objective string, dag *planner.ExecutionDAG, st planner.SubTask, pos, total int) string {
+// the single anchored patch may land. The compressed structural context
+// replaces any raw-source dump: document topology, parent/sibling relations,
+// active references and targeted Lea evidence — never the file bytes.
+// SEARCH_REPLACE_BOUNDED_LINES units additionally carry the STRICT patch
+// contract: the exact block format the Boundary-4 gate accepts is stated up
+// front so a malformed generation can never claim ambiguity about the
+// artifact structure.
+func subTaskPrompt(objective string, dag *planner.ExecutionDAG, st planner.SubTask, pos, total int, compressed *CompressedStructuralContext) string {
 	var b strings.Builder
 	b.WriteString(strings.TrimSpace(objective))
 	fmt.Fprintf(&b, "\n\n[DECOMPOSITION %s — sub-task %d/%d for %s]\n", st.ID, pos, total, dag.Target)
 	fmt.Fprintf(&b, "Change window: %s.\nScope: %s.\n", st.Region, st.Description)
+	if block := compressed.Render(); block != "" {
+		b.WriteByte('\n')
+		b.WriteString(block)
+	}
 	b.WriteString("Produce exactly ONE anchored SEARCH/REPLACE block whose SEARCH text is copied VERBATIM " +
 		"from within this change window of the current file content. Do not modify any other region.")
 	return injectPatchContract(b.String(), st.Kind)

@@ -47,6 +47,10 @@ const (
 	SplitAST SplitKind = "ast_structural"
 	// SplitBlock is top-level block splitting (HTML/MD/Config).
 	SplitBlock SplitKind = "block"
+	// SplitSemantic is Lea structural splitting: units are AST/DOM nodes
+	// ("<head> metadata", "<section#hero> hero") produced by
+	// LeaStructuralScan, never raw line ranges.
+	SplitSemantic SplitKind = "semantic_structural"
 	// SplitBoundedLines is the secondary fine-grained fallback strategy: a
 	// section that no structural or block parser can divide further yet still
 	// exceeds the strict sub-task ceiling is cut into contiguous

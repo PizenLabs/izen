@@ -212,6 +212,11 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		// with structural evidence; the executor widens the boundary window
 		// for the re-hydrated judgment.
 		NoOpEscalation: req.NoOpEscalation,
+		// REGION FOCUS (Phase 2): under a staged decomposition plan each
+		// sub-task pins its own line interval; the executor derives the
+		// bounded-patch copyable window from exactly that region.
+		FocusStartLine: req.FocusStartLine,
+		FocusEndLine:   req.FocusEndLine,
 		// CAUSAL RECOVERY (Phase 2 P2): the failed parent contract travels to
 		// the executor's admission boundary, which resolves it into either a
 		// same-contract retry (pure retry) or a new append-only causally

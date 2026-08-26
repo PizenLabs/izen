@@ -169,6 +169,10 @@ func (d *Driver) executeSubTaskWithRetry(ctx context.Context, dag *planner.Execu
 	pos, total int, targets []string, workspaceDigest string, streamCb execution.StreamCallback) (autonomy.Observation, int, error) {
 	baseEvidence := fmt.Sprintf("[DAG sub_task=%s region=%s estimate=%dtok ceiling=%dtok base_digest=%s]",
 		st.ID, st.Region, st.EstimatedTokens, dag.Budget(), short(dag.BaseTreeDigest))
+	// Compressed structural context: compress the CURRENT target bytes (the
+	// file mutates between units) into topology + targeted evidence. A
+	// read failure degrades gracefully to a context-free scoped prompt.
+	compressed := d.compressedContextFor(dag.Target, st)
 	var (
 		obs      autonomy.Observation
 		err      error
@@ -176,7 +180,7 @@ func (d *Driver) executeSubTaskWithRetry(ctx context.Context, dag *planner.Execu
 	)
 	for attempt := 1; attempt <= maxSubTaskAttempts; attempt++ {
 		attempts = attempt
-		req := d.subTaskRequest(dag, st, pos, total, targets, workspaceDigest, baseEvidence)
+		req := d.subTaskRequest(dag, st, pos, total, targets, workspaceDigest, baseEvidence, compressed)
 		req.StreamCallback = streamCb
 		// RecoveryAttempt rotates the executor's bounded-patch context window:
 		// every retry sees materially different copyable source.
@@ -211,7 +215,7 @@ func (d *Driver) executeSubTaskWithRetry(ctx context.Context, dag *planner.Execu
 		attempts++
 		diagnosticf("[noop-semantics] sub-task %s NO_OP_OBJECTIVE_UNRESOLVED — escalating %d/%d with elevated structural context",
 			st.ID, escalations, maxNoOpEscalations)
-		req := d.subTaskRequest(dag, st, pos, total, targets, workspaceDigest, baseEvidence)
+		req := d.subTaskRequest(dag, st, pos, total, targets, workspaceDigest, baseEvidence, compressed)
 		req.StreamCallback = streamCb
 		req.NoOpEscalation = true
 		// A distinct rotated window: materially different copyable source.
@@ -232,14 +236,31 @@ func (d *Driver) executeSubTaskWithRetry(ctx context.Context, dag *planner.Execu
 	return obs, attempts, nil
 }
 
+// compressedContextFor reads the target's current bytes and compresses them
+// into the sub-task's structural orientation payload. Any read failure or
+// unscannable format returns nil — the prompt simply omits the block.
+func (d *Driver) compressedContextFor(target string, st planner.SubTask) *CompressedStructuralContext {
+	if d == nil || d.adapter == nil || target == "" {
+		return nil
+	}
+	source, ok := d.adapter.ReadTargetFile(target)
+	if !ok || len(source) == 0 {
+		return nil
+	}
+	return buildCompressedStructuralContext(target, source, st)
+}
+
 // subTaskRequest builds the canonical LoopRequest for one sub-task execution
 // attempt: the whole plan travels with EVERY unit so the executor's Boundary-2
-// guard evaluates each window individually.
+// guard evaluates each window individually, the FOCUS region pins the
+// bounded-patch copyable window to THIS unit's assigned lines (a retry can
+// never be shown — nor anchor on — another unit's content), and the prompt
+// carries the compressed structural topology instead of raw source.
 func (d *Driver) subTaskRequest(dag *planner.ExecutionDAG, st planner.SubTask, pos, total int,
-	targets []string, workspaceDigest, evidence string) autonomy.LoopRequest {
+	targets []string, workspaceDigest, evidence string, compressed *CompressedStructuralContext) autonomy.LoopRequest {
 	return autonomy.LoopRequest{
 		RequestID:       fmt.Sprintf("%s-%s", d.runRequestID, st.ID),
-		Prompt:          subTaskPrompt(d.prompt, dag, st, pos, total),
+		Prompt:          subTaskPrompt(d.prompt, dag, st, pos, total, compressed),
 		Target:          dag.Target,
 		Targets:         append([]string(nil), targets...),
 		Evidence:        evidence,
@@ -250,5 +271,9 @@ func (d *Driver) subTaskRequest(dag *planner.ExecutionDAG, st planner.SubTask, p
 		RecoveryStrategy: autonomy.StrategyBoundedPatch,
 		RecoveryReason:   fmt.Sprintf("decomposition sub-task %d/%d scoped to %s", pos, total, st.Region),
 		StagedPlan:       dag,
+		// Region focus: the executor derives its deterministic context window
+		// from exactly this unit's line interval.
+		FocusStartLine: st.Region.StartLine,
+		FocusEndLine:   st.Region.EndLine,
 	}
 }

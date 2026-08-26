@@ -110,6 +110,13 @@ type ExecutionDAG struct {
 	Target string
 	// Kind is the splitting strategy selected for the target's format.
 	Kind SplitKind
+	// LowSemanticConfidence records WHY the plan fell back to syntactic
+	// partitioning: the target carries a Lea structural scanner
+	// (LeaScannable) but its read-only parse failed or yielded fewer than
+	// two trustworthy units (low_semantic_confidence=true). Syntactic line
+	// splitting is retained ONLY as this fallback. False whenever the plan
+	// was split semantically or the format has no Lea scanner at all.
+	LowSemanticConfidence bool
 	// BaseTreeDigest is the workspace SHA256(Σ path+hash) captured before any
 	// sub-task executes. Rollback restores exactly this state.
 	BaseTreeDigest string

@@ -29,7 +29,7 @@ func TestSubTaskPromptInjectsStrictPatchContractForBoundedLines(t *testing.T) {
 		Region:      planner.Region{StartLine: 4, EndLine: 12},
 		Description: `<section id="nav">`,
 	}
-	got := subTaskPrompt("restyle every row @page.html", dag, st, 1, 3)
+	got := subTaskPrompt("restyle every row @page.html", dag, st, 1, 3, nil)
 	for _, want := range []string{
 		"CRITICAL: Output MUST use exact SEARCH/REPLACE block format:",
 		"<<<<<<< SEARCH",
@@ -79,7 +79,7 @@ func TestSubTaskPromptContractGatedToBoundedLines(t *testing.T) {
 		dag := &planner.ExecutionDAG{Objective: "obj", Target: "big.go", MaxOutputTokens: 1000, Kind: kind}
 		st := planner.SubTask{ID: "st-2", Index: 2, Kind: kind,
 			Region: planner.Region{StartLine: 10, EndLine: 20}, Description: "type Handler1 struct"}
-		got := subTaskPrompt("refactor @big.go", dag, st, 2, 5)
+		got := subTaskPrompt("refactor @big.go", dag, st, 2, 5, nil)
 		if strings.Contains(got, "CRITICAL:") {
 			t.Errorf("kind %q must not carry the strict contract block:\n%s", kind, got)
 		}

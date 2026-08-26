@@ -147,6 +147,17 @@ type ExecuteRequest struct {
 	// (broader boundary window) so the re-hydrated attempt sees materially
 	// more of the assigned slice before judging again.
 	NoOpEscalation bool
+	// FocusStartLine / FocusEndLine optionally pin the deterministic
+	// bounded-patch context window to one sub-task's assigned inclusive
+	// 1-indexed line interval (decomposition DAG execution). When both are
+	// positive and start <= end, the copyable source shown to — and anchored
+	// by — the model is derived from exactly that region instead of rotating
+	// across the whole file: a unit can neither see nor patch another unit's
+	// content, which removes the local-context blindness behind false
+	// NO_CHANGES_REQUIRED claims. Zero values keep the pre-existing whole-file
+	// window rotation.
+	FocusStartLine int
+	FocusEndLine   int
 	// StreamCallback is an optional callback for incremental streaming progress.
 	// When set, the executor invokes it during provider streaming for each
 	// content delta, first token, and completion. This enables the UI to
@@ -1588,15 +1599,35 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// what crosses. Only one small line-aligned window of the target
 			// is shown as the copyable source; rotating it by attempt gives
 			// every repair cycle materially different content while keeping
-			// the worst-case response far below the output ceiling. A NO-OP
-			// escalation attempt receives a BROADER boundary window: a claim
-			// that conflicted with structural evidence re-judges against
-			// materially more of the assigned slice.
+			// the worst-case response far below the output ceiling.
+			//
+			// REGION FOCUS: under a staged decomposition plan the rotation is
+			// pinned INSIDE the sub-task's assigned interval (req.Focus*), so a
+			// unit can neither see nor anchor on another unit's content. A NO-OP
+			// escalation attempt receives a BROADER boundary window around that
+			// same region: a claim that conflicted with structural evidence
+			// re-judges against materially more of its assigned slice.
 			windowBound := maxBoundedPatchContextBytes
+			focusStart, focusEnd := req.FocusStartLine, req.FocusEndLine
 			if req.NoOpEscalation {
 				windowBound = maxEscalatedPatchContextBytes
+				margin := (focusEnd - focusStart + 1) / 2
+				if margin < maxNoOpEscalationFocusMargin {
+					margin = maxNoOpEscalationFocusMargin
+				}
+				focusStart, focusEnd = focusStart-margin, focusEnd+margin
 			}
-			window := selectBoundedPatchWindowScaled(original, attempt, windowBound)
+			focusSource, focusOffset := focusSlice(original, focusStart, focusEnd)
+			if focusSource == "" {
+				focusSource, focusOffset = original, 0 // degenerate focus: whole-file rotation
+			}
+			window := selectBoundedPatchWindowScaled(focusSource, attempt, windowBound)
+			window.startLine += focusOffset
+			window.endLine += focusOffset
+			window.totalLines = strings.Count(original, "\n")
+			if !strings.HasSuffix(original, "\n") {
+				window.totalLines++
+			}
 			user = buildBoundedPatchUserPrompt(req.Prompt, req.Evidence, target, window)
 			contextBytes = len(window.content)
 			judgedContent = window.content
@@ -2489,6 +2520,31 @@ const maxBoundedPatchContextBytes = 2048
 // accepts any human escalation. The ceiling stays bounded — escalation widens
 // scrutiny, never the response budget.
 const maxEscalatedPatchContextBytes = maxBoundedPatchContextBytes * 4
+
+// maxNoOpEscalationFocusMargin is the minimum line margin a region-focused
+// NO-OP escalation widens its assigned interval by on each side, so even a
+// single-line sub-task re-judges against real surrounding structure.
+const maxNoOpEscalationFocusMargin = 10
+
+// focusSlice returns the [start,end] inclusive 1-indexed line window of
+// original plus the offset that must be added to relative chunk line numbers
+// to recover absolute document lines. Out-of-range bounds clamp to the file;
+// an empty result (no focus, empty file or inverted range after clamping)
+// signals the caller to fall back to whole-file rotation.
+func focusSlice(original string, start, end int) (string, int) {
+	if strings.TrimSpace(original) == "" || start < 1 || end < start {
+		return "", 0
+	}
+	lines := strings.Split(original, "\n")
+	total := len(lines)
+	if start > total {
+		return "", 0
+	}
+	if end > total {
+		end = total
+	}
+	return strings.Join(lines[start-1:end], "\n"), start - 1
+}
 
 // boundedPatchWindow is one deterministic line-aligned window of the target.
 type boundedPatchWindow struct {
