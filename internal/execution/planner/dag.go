@@ -51,11 +51,18 @@ const (
 	// cancellation); the DAG aborted, the workspace rolled back to the base
 	// tree digest and NO further sub-task executed.
 	DagExecutionFailed PlanStatus = "DAG_EXECUTION_FAILED"
+	// DagEscalated: a sub-task's NO_CHANGES_REQUIRED claim could not be
+	// reconciled with structural evidence (no_op_objective_unresolved after
+	// re-hydration) or fell below the safety threshold
+	// (no_op_no_safe_mutation). The DAG is NOT terminally completed and NOT
+	// failed: already-applied units stay in place, remaining units never
+	// executed, and the decision returns to a human boundary.
+	DagEscalated PlanStatus = "DAG_ESCALATED"
 )
 
 // Terminal reports whether the plan reached a terminal status.
 func (s PlanStatus) Terminal() bool {
-	return s == DagExecutionCompleted || s == DagExecutionFailed
+	return s == DagExecutionCompleted || s == DagExecutionFailed || s == DagEscalated
 }
 
 // SubTask is one executable unit of a decomposed objective. It is scoped to a

@@ -116,12 +116,45 @@ const (
 	// produced an artifact (explanation / plan / investigation) with no
 	// mutation. It never claims a filesystem change.
 	OutcomeCompleted MutationOutcome = "completed"
-	// OutcomeNoOpSuccess is the terminal outcome of a bounded-patch execution
-	// whose model explicitly reported NO_CHANGES_REQUIRED for its assigned
-	// slice: a successful no-op. No patch is staged, no apply runs, and the
-	// artifact gate (Boundary 3/4) never rejects — the contract answered.
-	OutcomeNoOpSuccess MutationOutcome = "no_op_success"
+	// ── NO-OP semantic sub-states ────────────────────────────────────────
+	//
+	// A model answer of NO_CHANGES_REQUIRED is a CLAIM, not a verdict. The
+	// monolithic OutcomeNoOpSuccess treated every raw claim as a terminal
+	// execution success — a false-success boundary: the runtime completed a
+	// DAG cleanly without verifying whether the user's semantic intent was
+	// actually satisfied. The claim is now classified by deterministic
+	// structural analysis into exactly one of three explicit sub-states.
+
+	// OutcomeNoOpObjectiveSatisfied is the TERMINAL SUCCESS sub-state:
+	// structural/semantic analysis confirms zero work is needed — the raw
+	// claim stands uncontradicted by the assigned slice. No patch is staged,
+	// no apply runs, and the artifact gate (Boundary 3/4) never rejects.
+	OutcomeNoOpObjectiveSatisfied MutationOutcome = "no_op_objective_satisfied"
+	// OutcomeNoOpNoSafeMutation is the TERMINAL WARNING sub-state
+	// (requires_review): candidate edit regions were detected, but the
+	// structural confidence is below the safety threshold to auto-confirm
+	// either "nothing needed" or "work remains". The evidence seals as
+	// REQUIRES_REVIEW and can never project as authoritative success.
+	OutcomeNoOpNoSafeMutation MutationOutcome = "no_op_no_safe_mutation"
+	// OutcomeNoOpObjectiveUnresolved is the ESCALATION TRIGGER sub-state: the
+	// model claims no change is required while deterministic structural
+	// heuristics indicate the objective remains unaddressed inside the
+	// assigned window. This outcome NEVER terminates a run as success — the
+	// autonomy runtime must intercept it and escalate (re-hydrated context,
+	// then a human boundary).
+	OutcomeNoOpObjectiveUnresolved MutationOutcome = "no_op_objective_unresolved"
 )
+
+// IsNoOpFamily reports whether the outcome belongs to the NO-OP semantic
+// sub-state family (any classification of a NO_CHANGES_REQUIRED claim).
+func (o MutationOutcome) IsNoOpFamily() bool {
+	switch o {
+	case OutcomeNoOpObjectiveSatisfied, OutcomeNoOpNoSafeMutation, OutcomeNoOpObjectiveUnresolved:
+		return true
+	default:
+		return false
+	}
+}
 
 // Display returns the human-readable outcome label.
 func (o MutationOutcome) Display() string {
@@ -158,8 +191,12 @@ func (o MutationOutcome) Display() string {
 		return "rejected"
 	case OutcomePreflightInfeasible:
 		return "preflight infeasible"
-	case OutcomeNoOpSuccess:
-		return "no-op success"
+	case OutcomeNoOpObjectiveSatisfied:
+		return "no-op objective satisfied"
+	case OutcomeNoOpNoSafeMutation:
+		return "no-op requires review"
+	case OutcomeNoOpObjectiveUnresolved:
+		return "no-op objective unresolved"
 	default:
 		return string(o)
 	}
@@ -254,8 +291,12 @@ func ParseMutationOutcome(s string) MutationOutcome {
 		return OutcomeFailed
 	case "completed", "done":
 		return OutcomeCompleted
-	case "no_op_success", "no-op success", "noop_success":
-		return OutcomeNoOpSuccess
+	case "no_op_objective_satisfied", "no-op objective satisfied", "noop_objective_satisfied":
+		return OutcomeNoOpObjectiveSatisfied
+	case "no_op_no_safe_mutation", "no-op requires review", "no_op_requires_review", "requires_review":
+		return OutcomeNoOpNoSafeMutation
+	case "no_op_objective_unresolved", "no-op objective unresolved", "noop_objective_unresolved":
+		return OutcomeNoOpObjectiveUnresolved
 	default:
 		return OutcomeNoArtifact
 	}

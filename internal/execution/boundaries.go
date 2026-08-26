@@ -311,6 +311,12 @@ const (
 	SignalPreflightInfeasible = "PREFLIGHT_INFEASIBLE"
 	// SignalWorkspaceDrift: Boundary 5 detected workspace divergence (B5).
 	SignalWorkspaceDrift = "WORKSPACE_DRIFT"
+	// SignalNoOpObjectiveUnresolved: a NO_CHANGES_REQUIRED claim was
+	// contradicted by deterministic structural analysis — escalation trigger.
+	SignalNoOpObjectiveUnresolved = "NO_OP_OBJECTIVE_UNRESOLVED"
+	// SignalNoOpRequiresReview: a NO_CHANGES_REQUIRED claim carried candidate
+	// edit regions below the structural safety threshold — review hold.
+	SignalNoOpRequiresReview = "NO_OP_REQUIRES_REVIEW"
 )
 
 // boundaryOf names the architectural boundary that produced a subtype.
@@ -324,6 +330,8 @@ func boundaryOf(subtype string) string {
 		return "B4-artifact-gate"
 	case SignalWorkspaceDrift:
 		return "B5-mutation-authority"
+	case SignalNoOpObjectiveUnresolved, SignalNoOpRequiresReview:
+		return "B4-noop-semantics"
 	default:
 		return "B4-artifact-gate"
 	}

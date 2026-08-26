@@ -55,6 +55,9 @@ const (
 	SubtypeWorkspaceDrift FailureSubtype = "workspace_drift"
 	// SubtypeMutationFailure: apply/verify gates ran and failed.
 	SubtypeMutationFailure FailureSubtype = "mutation_failure"
+	// SubtypeNoOpObjectiveUnresolved: a NO_CHANGES_REQUIRED claim was
+	// contradicted by deterministic structural analysis — escalation trigger.
+	SubtypeNoOpObjectiveUnresolved FailureSubtype = "no_op_objective_unresolved"
 )
 
 // ErrRecoveryHalted is returned by typedRepair when the zero-trust matrix
@@ -89,6 +92,8 @@ func RecoverySubtype(o autonomy.Observation) FailureSubtype {
 		return SubtypePreflightInfeasible
 	case autonomy.OutcomeWorkspaceDrift:
 		return SubtypeWorkspaceDrift
+	case autonomy.OutcomeNoOpObjectiveUnresolved:
+		return SubtypeNoOpObjectiveUnresolved
 	default:
 		return ""
 	}
@@ -155,6 +160,14 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 	case SubtypeWorkspaceDrift:
 		return autonomy.LoopDecision{Action: autonomy.LoopAbort,
 			Reason: "workspace version changed between attempts — aborting stale run"}
+	case SubtypeNoOpObjectiveUnresolved:
+		cyclesLeft := b.MaxRecoveryCycles <= 0 || o.RecoveryCycle < b.MaxRecoveryCycles
+		if !cyclesLeft {
+			return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
+				Reason: "no-op claim still conflicts with structural evidence after re-hydration — ask human"}
+		}
+		return autonomy.LoopDecision{Action: autonomy.LoopRepair,
+			Reason: "NO-OP escalation: re-hydrated judgment over a broader boundary window"}
 	case SubtypeMutationFailure:
 		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
 			Reason: "mutation gate failed — no automatic retry over rolled-back ground"}
@@ -250,6 +263,21 @@ func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.Loo
 		// same contract identity and increments the attempt counter there.
 		next.RecoveryAttempt = attempt
 		next.RecoveryReason = fmt.Sprintf("transport retry for %s (attempt %d)", target, attempt)
+		return next, nil
+
+	case SubtypeNoOpObjectiveUnresolved:
+		// NO-OP ESCALATION: materially different input — a BROADER boundary
+		// window plus elevated structural evidence — so the re-hydrated
+		// judgment sees what the contradicted claim denied.
+		next.NoOpEscalation = true
+		next.ParentContractID = o.ContractID
+		next.RecoveryAttempt = attempt
+		next.RecoveryReason = fmt.Sprintf(
+			"noop_escalation: prior NO_CHANGES_REQUIRED claim for %s conflicted with structural evidence", target)
+		next.Evidence = joinEvidence(req.Evidence, fmt.Sprintf(
+			"[DIAGNOSTIC subtype=NO_OP_OBJECTIVE_UNRESOLVED boundary=B4-noop-semantics target=%s] "+
+				"The previous claim was CONTRADICTED by structural analysis; re-judge over the widened window.",
+			target))
 		return next, nil
 
 	default:

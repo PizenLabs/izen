@@ -141,6 +141,12 @@ type ExecuteRequest struct {
 	// submission can never be refused for the size of the whole target it was
 	// decomposed from.
 	StagedSubTasks []SubTaskScope
+	// NoOpEscalation marks this invocation as a NO-OP escalation attempt: the
+	// previous attempt answered NO_CHANGES_REQUIRED while structural analysis
+	// indicated work remains. The bounded-patch context window is WIDENED
+	// (broader boundary window) so the re-hydrated attempt sees materially
+	// more of the assigned slice before judging again.
+	NoOpEscalation bool
 	// StreamCallback is an optional callback for incremental streaming progress.
 	// When set, the executor invokes it during provider streaming for each
 	// content delta, first token, and completion. This enables the UI to
@@ -500,11 +506,39 @@ var ErrArtifactRejected = errors.New("executor: mutation artifact rejected")
 var ErrArtifactRetryableRejected = errors.New("executor: mutation artifact rejected with retry directive")
 
 // ErrNoOpMutation signals a bounded-patch invocation whose model answered with
-// the NO_CHANGES_REQUIRED sentinel: the assigned slice needs no edit. It is a
-// SUCCESS, not an artifact rejection — the execution converges to
-// OutcomeNoOpSuccess without staging a patch, running an apply or tripping
-// Boundary 3.
+// the NO_CHANGES_REQUIRED sentinel: a raw no-op CLAIM was detected. Detection
+// alone decides nothing terminal — the wrapped NoOpClaimError carries the
+// deterministic semantic classification (see ClassifyNoOpClaim) that maps the
+// claim onto one of the three NO-OP sub-state outcomes.
 var ErrNoOpMutation = errors.New("executor: model reported NO_CHANGES_REQUIRED")
+
+// ErrNoOpObjectiveUnresolved is the deterministic error carried by an
+// execution whose model claimed NO_CHANGES_REQUIRED while structural analysis
+// contradicted the claim: the objective's signature is still present in the
+// assigned slice. The outcome is OutcomeNoOpObjectiveUnresolved — never a
+// success; the autonomy runtime owns escalation from here.
+var ErrNoOpObjectiveUnresolved = errors.New("executor: no-op claim conflicts with structural evidence")
+
+// NoOpClaimError is the typed carrier of a raw model no-op claim plus its
+// deterministic classification. It unwraps to ErrNoOpMutation so existing
+// detection keeps working, and its Assessment field selects the terminal
+// sub-state at the convergence site.
+type NoOpClaimError struct {
+	// Claim is the RAW model claim (sentinel + bounded prose), propagated
+	// verbatim from the response without any terminal interpretation.
+	Claim NoOpRawClaim
+	// Assessment is the deterministic structural classification.
+	Assessment NoOpAssessment
+	// Target is the mutation target the claim was about.
+	Target string
+}
+
+func (e *NoOpClaimError) Error() string {
+	return fmt.Sprintf("%v: %s: %s", ErrNoOpMutation, e.Target, e.Assessment.Verdict)
+}
+
+// Unwrap preserves errors.Is(err, ErrNoOpMutation) for detection sites.
+func (e *NoOpClaimError) Unwrap() error { return ErrNoOpMutation }
 
 var ErrOutputTruncated = errors.New("executor: model output truncated")
 
@@ -889,23 +923,75 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		res.ModelCalls = append(res.ModelCalls, invs...)
 		res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, invs...)
 		if errors.Is(err, ErrNoOpMutation) {
-			// ── NO_OP_SUCCESS ───────────────────────────────────────────
-			// The model explicitly reported NO_CHANGES_REQUIRED for its slice:
-			// a successful contract answer. No patch is staged (no approval
-			// surface opens), no apply runs, and Boundary 3 is never tripped.
-			// The billed invocations still travel on the result so usage stays
-			// authoritative.
-			g.Skip(runtimegraph.StageApprovalGate, "no-op success")
-			g.Skip(runtimegraph.StageMutationTransaction, "no-op success")
-			g.Skip(runtimegraph.StageVerification, "no-op success")
-			g.CompleteExecution(string(OutcomeNoOpSuccess))
-			res.ArtifactKind = ""
-			res.Content = ""
-			res.Err = nil
-			res.Proof.Outcome = OutcomeNoOpSuccess
-			res.Proof.FinishedAt = time.Now()
-			setProofGraph(res, g)
-			return x.finalizeResult(res), nil
+			// ── NO-OP SEMANTIC CONVERGENCE ─────────────────────────────
+			// The model emitted the NO_CHANGES_REQUIRED sentinel. The raw
+			// claim was classified deterministically at detection time; each
+			// verdict converges to a DIFFERENT terminal truth:
+			//
+			//   SATISFIED   → successful no-op unit (historical behavior,
+			//                 now backed by structural analysis).
+			//   NO_SAFE_…   → terminal warning: candidate edits below the
+			//                 safety threshold seal as REQUIRES_REVIEW.
+			//   UNRESOLVED  → escalation trigger: the claim contradicts
+			//                 observable structure — a recoverable failure
+			//                 the autonomy runtime must intercept, never a
+			//                 completed DAG.
+			var claimErr *NoOpClaimError
+			if !errors.As(err, &claimErr) {
+				// Defensive: an ErrNoOpMutation without its typed carrier is
+				// treated as unclassified and held for review.
+				claimErr = &NoOpClaimError{
+					Assessment: NoOpAssessment{
+						Verdict: NoOpNoSafeMutation,
+						Reason:  "no-op claim arrived without a structural assessment",
+					},
+				}
+			}
+			g.Skip(runtimegraph.StageApprovalGate, "no-op convergence")
+			g.Skip(runtimegraph.StageMutationTransaction, "no-op convergence")
+			switch claimErr.Assessment.Verdict {
+			case NoOpObjectiveUnresolved:
+				unresolvedErr := fmt.Errorf("%w: %s: %s",
+					ErrNoOpObjectiveUnresolved, claimErr.Target, claimErr.Assessment.Reason)
+				g.FailExecution(events.FailureRecoverable, unresolvedErr, "executor.noop_semantics")
+				res.ArtifactKind = ""
+				res.Content = ""
+				res.Err = unresolvedErr
+				res.Diagnostics = append(res.Diagnostics, diagnosticSignal(
+					SignalNoOpObjectiveUnresolved, claimErr.Target,
+					claimErr.Assessment.Reason,
+					"re-examine the assigned window with elevated context or escalate to review", false,
+				))
+				res.Proof.Outcome = VerdictToOutcome(claimErr.Assessment.Verdict)
+				res.Proof.FinishedAt = time.Now()
+				setProofGraph(res, g)
+				return x.finalizeResult(res), unresolvedErr
+			case NoOpNoSafeMutation:
+				g.Skip(runtimegraph.StageVerification, "requires review")
+				g.CompleteExecution(string(OutcomeNoOpNoSafeMutation))
+				res.ArtifactKind = ""
+				res.Content = ""
+				res.Err = nil
+				res.Diagnostics = append(res.Diagnostics, diagnosticSignal(
+					SignalNoOpRequiresReview, claimErr.Target,
+					claimErr.Assessment.Reason,
+					"human review required before any further mutation", false,
+				))
+				res.Proof.Outcome = OutcomeNoOpNoSafeMutation
+				res.Proof.FinishedAt = time.Now()
+				setProofGraph(res, g)
+				return x.finalizeResult(res), nil
+			default: // NoOpObjectiveSatisfied
+				g.Skip(runtimegraph.StageVerification, "no-op objective satisfied")
+				g.CompleteExecution(string(OutcomeNoOpObjectiveSatisfied))
+				res.ArtifactKind = ""
+				res.Content = ""
+				res.Err = nil
+				res.Proof.Outcome = OutcomeNoOpObjectiveSatisfied
+				res.Proof.FinishedAt = time.Now()
+				setProofGraph(res, g)
+				return x.finalizeResult(res), nil
+			}
 		}
 		if errors.Is(err, context.Canceled) {
 			// A user cancellation is a clean terminal outcome: no artifact was
@@ -1490,6 +1576,11 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		outputContract := "full_file_or_patch"
 		user := buildMutationUserPrompt(req.Prompt, target, original, req.Evidence)
 		contextBytes := len(original)
+		// judgedContent is exactly the context the model was asked to judge.
+		// Under the bounded patch contract that is the small line-aligned
+		// window — the no-op semantics classifier evaluates the claim against
+		// the same bytes, never against the unseen remainder of the file.
+		judgedContent := original
 		if patchOnly {
 			system = boundedPatchSystemPrompt()
 			outputContract = "search_replace"
@@ -1497,10 +1588,18 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// what crosses. Only one small line-aligned window of the target
 			// is shown as the copyable source; rotating it by attempt gives
 			// every repair cycle materially different content while keeping
-			// the worst-case response far below the output ceiling.
-			window := selectBoundedPatchWindow(original, attempt)
+			// the worst-case response far below the output ceiling. A NO-OP
+			// escalation attempt receives a BROADER boundary window: a claim
+			// that conflicted with structural evidence re-judges against
+			// materially more of the assigned slice.
+			windowBound := maxBoundedPatchContextBytes
+			if req.NoOpEscalation {
+				windowBound = maxEscalatedPatchContextBytes
+			}
+			window := selectBoundedPatchWindowScaled(original, attempt, windowBound)
 			user = buildBoundedPatchUserPrompt(req.Prompt, req.Evidence, target, window)
 			contextBytes = len(window.content)
+			judgedContent = window.content
 		}
 		maxOut := effectiveMaxOutput(req.MaxOutputTokens, &profile)
 		disableReasoning := false
@@ -1580,13 +1679,23 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		var modified string
 		if patchOnly {
 			// NO-OP SENTINEL (pre-validation): a model that answers
-			// NO_CHANGES_REQUIRED has satisfied the contract — its slice needs
-			// no edit. Converge to a successful no-op BEFORE the strict gate:
-			// burning the retry budget on prose-free compliant output is never
-			// the right outcome.
-			if IsNoOpBoundedPatchResponse(raw) {
-				log.Printf("[execution] request=%s target=%s artifact=no_op (%s)", requestID, target, NoOpSentinel)
-				return nil, invs, nil, fmt.Errorf("%w: %s", ErrNoOpMutation, target)
+			// NO_CHANGES_REQUIRED has satisfied the OUTPUT CONTRACT of the
+			// bounded patch — but the claim itself is NOT yet a verdict. The
+			// raw claim is propagated verbatim and classified by deterministic
+			// structural analysis against the exact window the model judged;
+			// the terminal sub-state (satisfied / requires review /
+			// unresolved) is selected at the convergence site. Burning the
+			// retry budget on prose-free compliant output is never the right
+			// outcome.
+			if claim, claimed := ExtractNoOpClaim(raw); claimed {
+				assessment := ClassifyNoOpClaim(req.Prompt, judgedContent)
+				log.Printf("[execution] request=%s target=%s artifact=no_op (%s) verdict=%s reason=%q",
+					requestID, target, claim.Sentinel, assessment.Verdict, assessment.Reason)
+				return nil, invs, nil, &NoOpClaimError{
+					Claim:      claim,
+					Assessment: assessment,
+					Target:     target,
+				}
 			}
 			// Bounded-patch artifact boundary: extract ONLY structured patch
 			// representations. A full-file (or otherwise unstructured)
@@ -2374,6 +2483,13 @@ Rules:
 // finish_reason=length by construction.
 const maxBoundedPatchContextBytes = 2048
 
+// maxEscalatedPatchContextBytes is the BROADER boundary window granted to a
+// NO-OP escalation attempt: a claim that conflicted with structural evidence
+// re-judges against materially more of the assigned slice before the runtime
+// accepts any human escalation. The ceiling stays bounded — escalation widens
+// scrutiny, never the response budget.
+const maxEscalatedPatchContextBytes = maxBoundedPatchContextBytes * 4
+
 // boundedPatchWindow is one deterministic line-aligned window of the target.
 type boundedPatchWindow struct {
 	content    string // exact bytes shown to the model (the only copyable source)
@@ -2389,6 +2505,13 @@ type boundedPatchWindow struct {
 // request's copyable source small; attempt 1 (the first patch attempt) anchors
 // at the head of the file.
 func selectBoundedPatchWindow(original string, attempt int) boundedPatchWindow {
+	return selectBoundedPatchWindowScaled(original, attempt, maxBoundedPatchContextBytes)
+}
+
+// selectBoundedPatchWindowScaled is the byte-bound-parameterized window
+// selector. NO-OP escalation attempts pass maxEscalatedPatchContextBytes so
+// the re-hydrated judgment sees a broader boundary window of the slice.
+func selectBoundedPatchWindowScaled(original string, attempt, maxContextBytes int) boundedPatchWindow {
 	lines := strings.Split(original, "\n")
 	total := len(lines)
 	if total == 0 || strings.TrimSpace(original) == "" {
@@ -2400,7 +2523,7 @@ func selectBoundedPatchWindow(original string, attempt int) boundedPatchWindow {
 	size := 0
 	for i := 0; i < total; i++ {
 		lineSize := len(lines[i]) + 1
-		if size > 0 && size+lineSize > maxBoundedPatchContextBytes {
+		if size > 0 && size+lineSize > maxContextBytes {
 			chunks = append(chunks, boundedPatchWindow{
 				content:    strings.Join(lines[start:i], "\n"),
 				startLine:  start + 1,

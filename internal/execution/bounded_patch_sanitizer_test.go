@@ -102,9 +102,10 @@ func TestIsNoOpBoundedPatchResponse(t *testing.T) {
 }
 
 // TestSearchReplaceContractNoOpSentinelSucceeds drives the full executor: a
-// bounded-patch invocation whose model answers exactly NO_CHANGES_REQUIRED must
-// converge to no_op_success WITHOUT staging a patch, tripping Boundary 3/4 or
-// burning an error — and without touching the filesystem.
+// bounded-patch invocation whose model answers exactly NO_CHANGES_REQUIRED —
+// with an objective carrying no structural directive that contradicts it —
+// must converge to no_op_objective_satisfied WITHOUT staging a patch, tripping
+// Boundary 3/4 or burning an error — and without touching the filesystem.
 func TestSearchReplaceContractNoOpSentinelSucceeds(t *testing.T) {
 	root := t.TempDir()
 	writeTarget(t, root, "note.txt", sampleOriginal)
@@ -125,8 +126,8 @@ func TestSearchReplaceContractNoOpSentinelSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no-op sentinel must not fail execution, got error: %v", err)
 	}
-	if res == nil || res.Proof.Outcome != OutcomeNoOpSuccess {
-		t.Fatalf("proof outcome = %v, want %s", res.Proof.Outcome, OutcomeNoOpSuccess)
+	if res == nil || res.Proof.Outcome != OutcomeNoOpObjectiveSatisfied {
+		t.Fatalf("proof outcome = %v, want %s", res.Proof.Outcome, OutcomeNoOpObjectiveSatisfied)
 	}
 	if res.PendingPatchID != "" {
 		t.Fatal("no-op staged a patch at the approval gate")
@@ -144,9 +145,9 @@ func TestSearchReplaceContractNoOpSentinelSucceeds(t *testing.T) {
 }
 
 // TestSearchReplaceContractNoOpSentinelWithNoise proves the sentinel still
-// converges to no_op_success when the model wraps it in its usual fence/prose
-// noise — but a genuine patch inside the same noise is NEVER swallowed by the
-// no-op path.
+// converges to no_op_objective_satisfied when the model wraps it in its usual
+// fence/prose noise — but a genuine patch inside the same noise is NEVER
+// swallowed by the no-op path.
 func TestSearchReplaceContractNoOpSentinelWithNoise(t *testing.T) {
 	root := t.TempDir()
 	writeTarget(t, root, "note.txt", sampleOriginal)
@@ -164,8 +165,8 @@ func TestSearchReplaceContractNoOpSentinelWithNoise(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no-op with conversational noise must succeed, got: %v", err)
 	}
-	if res.Proof.Outcome != OutcomeNoOpSuccess {
-		t.Fatalf("proof outcome = %s, want %s", res.Proof.Outcome, OutcomeNoOpSuccess)
+	if res.Proof.Outcome != OutcomeNoOpObjectiveSatisfied {
+		t.Fatalf("proof outcome = %s, want %s", res.Proof.Outcome, OutcomeNoOpObjectiveSatisfied)
 	}
 	if errors.Is(res.Err, ErrArtifactRetryableRejected) {
 		t.Fatal("no-op classified as artifact rejection")

@@ -45,6 +45,13 @@ const (
 	// EvidenceCancelled is a clean terminal cancellation (user cancel or human
 	// rejection at the approval gate). Nothing was committed.
 	EvidenceCancelled ExecutionOutcome = "CANCELLED"
+	// EvidenceRequiresReview is the terminal-warning outcome produced
+	// EXCLUSIVELY by the NO-OP semantics gate (no_op_no_safe_mutation): the
+	// model claimed no changes were required while candidate edit regions
+	// matched below the structural safety threshold. Nothing was committed
+	// and nothing failed — the attempt is sealed as requiring human review
+	// and can NEVER project as authoritative success.
+	EvidenceRequiresReview ExecutionOutcome = "REQUIRES_REVIEW"
 )
 
 // Committed reports whether the outcome is the authoritative success.
@@ -56,7 +63,7 @@ func (o ExecutionOutcome) Committed() bool { return o == EvidenceCommitted }
 // projections that switch over it.
 func (o ExecutionOutcome) Terminal() bool {
 	switch o {
-	case EvidenceCommitted, EvidenceFailed, EvidenceAbortedOCC, EvidenceCancelled:
+	case EvidenceCommitted, EvidenceFailed, EvidenceAbortedOCC, EvidenceCancelled, EvidenceRequiresReview:
 		return true
 	default:
 		return false
@@ -273,12 +280,24 @@ func sealEvidence(
 // Proof.OccAborted flag (see sealTerminalEvidence).
 func evidenceOutcomeFor(outcome MutationOutcome, execErr error) ExecutionOutcome {
 	switch outcome {
-	case OutcomeChanged, OutcomeCreated, OutcomeNoChange, OutcomeCompleted, OutcomeNoOpSuccess:
+	case OutcomeChanged, OutcomeCreated, OutcomeNoChange, OutcomeCompleted, OutcomeNoOpObjectiveSatisfied:
 		if execErr != nil {
 			// A result that carries a terminal error is never a soft success.
 			return EvidenceFailed
 		}
 		return EvidenceCommitted
+	case OutcomeNoOpNoSafeMutation:
+		// The NO-OP semantics gate held the claim for review: terminal truth
+		// is "requires review", never committed success — even without an
+		// execution error.
+		if execErr != nil {
+			return EvidenceFailed
+		}
+		return EvidenceRequiresReview
+	case OutcomeNoOpObjectiveUnresolved:
+		// A claim contradicted by structural evidence is not a success and
+		// not a review hold: it failed verification of its own verdict.
+		return EvidenceFailed
 	case OutcomeNoArtifact:
 		// A deterministic zero-mutation completion commits its (empty)
 		// contract truthfully; a no-artifact FAILURE carries the error.

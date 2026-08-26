@@ -246,9 +246,19 @@ func RenderEntry(entry LogEntry, width int, dotFrame int) string {
 		case execution.OutcomeNoChange:
 			icon = dimmedStyle.Render("∅")
 			label = "NoChange"
-		case execution.OutcomeNoOpSuccess:
+		case execution.OutcomeNoOpObjectiveSatisfied:
+			// Structural analysis confirmed the no-op claim: a truthful
+			// nothing-to-do unit, rendered neutral — never as an edit.
 			icon = dimmedStyle.Render("∅")
-			label = "NoOpSuccess"
+			label = "NoOpSatisfied"
+		case execution.OutcomeNoOpNoSafeMutation:
+			// Terminal warning (requires_review): below-threshold candidates.
+			icon = yellowStyle.Render(Icon.Warning)
+			label = "NoOpReview"
+		case execution.OutcomeNoOpObjectiveUnresolved:
+			// Escalation trigger: the claim conflicted with structure.
+			icon = redStyle.Render(Icon.Error)
+			label = "NoOpUnresolved"
 		case execution.OutcomeSkipped:
 			icon = dimmedStyle.Render("↷")
 			label = "Skipped"

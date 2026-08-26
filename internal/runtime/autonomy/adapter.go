@@ -208,6 +208,10 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		// context + strict SEARCH/REPLACE contract), not just annotations.
 		RecoveryStrategy: req.RecoveryStrategy,
 		RecoveryAttempt:  req.RecoveryAttempt,
+		// NO-OP escalation: the previous attempt's sentinel claim conflicted
+		// with structural evidence; the executor widens the boundary window
+		// for the re-hydrated judgment.
+		NoOpEscalation: req.NoOpEscalation,
 		// CAUSAL RECOVERY (Phase 2 P2): the failed parent contract travels to
 		// the executor's admission boundary, which resolves it into either a
 		// same-contract retry (pure retry) or a new append-only causally

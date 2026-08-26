@@ -91,6 +91,8 @@ func ProjectEvidence(ev *execution.ExecutionEvidence) EvidenceProjection {
 			p.BlockReason = "execution was cancelled before committing"
 		case execution.EvidenceAbortedOCC:
 			p.BlockReason = "execution aborted on an optimistic-concurrency conflict"
+		case execution.EvidenceRequiresReview:
+			p.BlockReason = "no-op claim held for review; below-threshold candidates never project as success"
 		default:
 			p.BlockReason = "execution failed; failure must never project as success"
 		}

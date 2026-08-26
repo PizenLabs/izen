@@ -339,12 +339,13 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 
 	// ── NO-CHANGE TERMINAL: the mutation applied but nothing changed ──
 	// A committed OutcomeNoChange is a successful execution that produced no
-	// filesystem change. OutcomeNoOpSuccess is its bounded-patch sibling: the
-	// model explicitly answered NO_CHANGES_REQUIRED, no patch was staged and
-	// nothing applied. Both project distinctly — never the generic
-	// "Completed — nothing produced." fallback.
+	// filesystem change. OutcomeNoOpObjectiveSatisfied is its bounded-patch
+	// sibling: the model answered NO_CHANGES_REQUIRED and structural analysis
+	// CONFIRMED the claim — no patch was staged and nothing applied. Both
+	// project distinctly — never the generic "Completed — nothing produced."
+	// fallback.
 	if res.Proof != nil && (res.Proof.Outcome == execution.OutcomeNoChange ||
-		res.Proof.Outcome == execution.OutcomeNoOpSuccess) {
+		res.Proof.Outcome == execution.OutcomeNoOpObjectiveSatisfied) {
 		m.executorPendingPatchID = ""
 		m.executorPendingTargets = nil
 		m.pendingHotfixTask = nil
@@ -353,6 +354,28 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		m.resolveApprovalState()
 		m.finalizeOperation(OpOutcomeSuccess, nil)
 		m.push(roleSystem, infoStyle.Render("  "+Icon.Info+" Mutation applied — no content changed."))
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		if mdl, queueCmd, handled := m.projectBuildQueueFromProof(res, nil); handled {
+			return mdl, tea.Batch(queueCmd, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known))
+		}
+		return m, m.tokenUsageCmdKnown(tokenInput, tokenOutput, res.Completed.Known)
+	}
+
+	// ── REQUIRES-REVIEW TERMINAL: below-threshold no-op claim ─────────
+	// OutcomeNoOpNoSafeMutation is a TERMINAL WARNING: candidate edits were
+	// detected below the structural safety threshold. It never projects as
+	// success and never as a hard failure — the decision belongs to a human.
+	if res.Proof != nil && res.Proof.Outcome == execution.OutcomeNoOpNoSafeMutation {
+		m.executorPendingPatchID = ""
+		m.executorPendingTargets = nil
+		m.pendingHotfixTask = nil
+		m.pendingHotfixPatch = nil
+		m.pendingProposals = nil
+		m.resolveApprovalState()
+		m.finalizeOperation(OpOutcomeAmbiguous, nil)
+		m.push(roleSystem, warningStyle.Render("  "+Icon.Warning+
+			" No-op claim held for review — candidate edits below the safety threshold. No files were modified."))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		if mdl, queueCmd, handled := m.projectBuildQueueFromProof(res, nil); handled {
@@ -534,6 +557,8 @@ func runtimeExecutionFailureMessage(res *execution.ExecutionResult, err error) s
 			return "Execution stopped: artifact validation requested a model repair, but no recovery invocation was run in this workflow."
 		case execution.OutcomeArtifactRejected:
 			return "Execution failed: artifact rejected."
+		case execution.OutcomeNoOpObjectiveUnresolved:
+			return "Escalated: the model reported no changes required, but structural analysis found the objective still unaddressed. A human must review this objective."
 		}
 	}
 	if err != nil {
@@ -577,19 +602,21 @@ func (m *model) runHotExecution(rawInput string) tea.Cmd {
 
 // buildQueueTaskOutcome maps a terminal RuntimeExecutor outcome onto staged
 // /build task bookkeeping: "advance" (completed — move to the next task or
-// hand off to verification), "halt" (failed — freeze the remaining queue),
-// or "" (the approval/cancellation surface owns this outcome; no queue
-// projection runs).
+// hand off to verification), "halt" (failed or held for review — freeze the
+// remaining queue), or "" (the approval/cancellation surface owns this
+// outcome; no queue projection runs).
 func buildQueueTaskOutcome(outcome execution.MutationOutcome) string {
 	switch {
 	case outcome.MutationSucceeded(), outcome == execution.OutcomeNoChange,
-		outcome == execution.OutcomeNoOpSuccess:
+		outcome == execution.OutcomeNoOpObjectiveSatisfied:
 		return "advance"
 	case outcome == execution.OutcomeRejected,
 		outcome == execution.OutcomeCancelled,
 		outcome == execution.OutcomePendingApproval:
 		return ""
 	default:
+		// Includes the NO-OP warning/escalation sub-states: a review hold or
+		// an unresolved claim NEVER advances the queue.
 		return "halt"
 	}
 }

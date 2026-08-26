@@ -600,9 +600,13 @@ func (d *Driver) terminateAbort(ctx context.Context, reason string, class autono
 //
 //	context observation (no outcome)     → continue (execute)
 //	changed/created/nochange/completed   → complete (objective satisfied)
+//	no_op_objective_satisfied            → complete (claim structurally confirmed)
+//	no_op_no_safe_mutation               → ask_human (requires_review hold)
 //	pending_approval                     → ask_human (approval gate, patch id)
 //	clarification required               → ask_human
 //	cancelled/rejected/artifact_rejected → abort (terminal human/permanent)
+//	no_op_objective_unresolved           → DecideRecovery (recoverable
+//	                                       escalation — never completion)
 //	every other failure                  → DecideRecovery: retryability is a
 //	                                       function of the canonical FAILURE
 //	                                       SUBTYPE (I4), never of a generic
@@ -614,9 +618,16 @@ func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopD
 	}
 	switch o.Outcome {
 	case autonomy.OutcomeChanged, autonomy.OutcomeCreated, autonomy.OutcomeNoChange,
-		autonomy.OutcomeCompleted, autonomy.OutcomeArtifactProduced, autonomy.OutcomeNoOpSuccess:
+		autonomy.OutcomeCompleted, autonomy.OutcomeArtifactProduced,
+		autonomy.OutcomeNoOpObjectiveSatisfied:
 		return autonomy.LoopDecision{Action: autonomy.LoopComplete,
 			Reason: "objective satisfied: " + string(o.Outcome)}
+	case autonomy.OutcomeNoOpNoSafeMutation:
+		// Terminal warning (requires_review): candidate mutations were
+		// detected below the structural safety threshold. The loop NEVER
+		// completes on this outcome — the decision belongs to a human.
+		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
+			Reason: "no-op claim held for review: candidate edits below safety threshold"}
 	case autonomy.OutcomePendingApproval:
 		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
 			Reason: "mutation awaiting approval", PatchID: o.PatchID}
@@ -627,6 +638,9 @@ func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopD
 		return autonomy.LoopDecision{Action: autonomy.LoopContinue,
 			Reason: "objective resolved — execute"}
 	default:
+		// OutcomeNoOpObjectiveUnresolved falls through here: ClassifyOutcome
+		// marks it recoverable, so the matrix escalates through bounded
+		// repair cycles to a human instead of completing or aborting outright.
 		return DecideRecovery(o, b)
 	}
 }
