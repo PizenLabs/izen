@@ -118,6 +118,12 @@ func (m *model) runAutonomousDriver(objective string) tea.Cmd {
 			if ev.Content != "" {
 				ch <- tokenMsg(ev.Content)
 			}
+		case "reasoning_delta":
+			// Sub-task reasoning tokens: forwarded to the main UI loop so the
+			// Ctrl+O thought drawer updates in real time during DAG_EXECUTING.
+			if ev.Content != "" {
+				ch <- ReasoningChunkMsg{Chunk: ev.Content}
+			}
 		case "done":
 			ch <- streamDoneMsg{
 				content:        ev.Content,
@@ -149,6 +155,27 @@ func (m *model) runAutonomousDriver(objective string) tea.Cmd {
 	)
 }
 
+// beginAutonomousResume marks an in-flight RESUME operation (approve/reject/
+// clarify/proposal) and arms the animation layer for it. autonomousActive is
+// set so the shimmer safety-net never kills the loading line while the driver
+// goroutine runs — resume paths previously left it false, which let every
+// tick loop die and froze the spinner for the whole DAG_EXECUTING phase.
+func (m *model) beginAutonomousResume(phase string) {
+	m.autonomousActive = true
+	m.beginOperation(OpAutonomous)
+	m.agentLabel = ""
+	m.startShimmer("", phase)
+}
+
+// autonomousResumeCmds batches the driver-resume command with the spinner/
+// shimmer tick loops. The driver runs in its own non-blocking tea.Cmd
+// goroutine; WITHOUT the batched ticks no message ever re-enters the update
+// loop until the terminal msg lands, so spin.Tick frames starve and the
+// spinner visibly freezes mid-execution.
+func (m *model) autonomousResumeCmds(run tea.Cmd) tea.Cmd {
+	return tea.Batch(run, m.smoothStreamTickCmd(), m.shimmerTickCmd())
+}
+
 // resumeAutonomousApprove approves the parked approval boundary. It first
 // issues a MutationAuthorization over the boundary's target files through the
 // production AuthorizationEngine (the same governance owner every other
@@ -165,14 +192,12 @@ func (m *model) resumeAutonomousApprove() tea.Cmd {
 		return nil
 	}
 	m.autonomousBoundary = nil
-	m.beginOperation(OpAutonomous)
-	m.agentLabel = ""
-	m.startShimmer("", "autonomy apply")
+	m.beginAutonomousResume("autonomy apply")
 	ctx := m.operationContext()
-	return func() tea.Msg {
+	return m.autonomousResumeCmds(func() tea.Msg {
 		term, err := m.autonomousDriver.ResumeApprove(ctx)
 		return autonomousRunMsg{term: term, err: err}
-	}
+	})
 }
 
 // resumeAutonomousReject rejects the parked approval boundary. The rejection
@@ -182,14 +207,12 @@ func (m *model) resumeAutonomousReject(reason string) tea.Cmd {
 		return nil
 	}
 	m.autonomousBoundary = nil
-	m.beginOperation(OpAutonomous)
-	m.agentLabel = ""
-	m.startShimmer("", "autonomy reject")
+	m.beginAutonomousResume("autonomy reject")
 	ctx := m.operationContext()
-	return func() tea.Msg {
+	return m.autonomousResumeCmds(func() tea.Msg {
 		term, err := m.autonomousDriver.ResumeReject(ctx, reason)
 		return autonomousRunMsg{term: term, err: err}
-	}
+	})
 }
 
 // resumeAutonomousClarify resumes a parked clarify boundary with the selected
@@ -205,14 +228,12 @@ func (m *model) resumeAutonomousClarify() tea.Cmd {
 	}
 	target := b.Options[m.autonomousSelect]
 	m.autonomousBoundary = nil
-	m.beginOperation(OpAutonomous)
-	m.agentLabel = ""
-	m.startShimmer("", "autonomy")
+	m.beginAutonomousResume("autonomy")
 	ctx := m.operationContext()
-	return func() tea.Msg {
+	return m.autonomousResumeCmds(func() tea.Msg {
 		term, err := m.autonomousDriver.ResumeClarify(ctx, target)
 		return autonomousRunMsg{term: term, err: err}
-	}
+	})
 }
 
 // resumeAutonomousProposalApprove resolves a parked DECOMPOSITION_PROPOSAL
@@ -231,14 +252,15 @@ func (m *model) resumeAutonomousProposalApprove() tea.Cmd {
 		return nil
 	}
 	m.autonomousBoundary = nil
-	m.beginOperation(OpAutonomous)
-	m.agentLabel = ""
-	m.startShimmer("", "autonomy dag")
+	m.beginAutonomousResume("autonomy dag")
 	ctx := m.operationContext()
-	return func() tea.Msg {
+	// DAG_EXECUTING runs every sub-task inside this non-blocking tea.Cmd
+	// goroutine; the batched spin.Tick loops keep the event loop rendering
+	// (spinner frames + shimmer sweep) for the whole transaction.
+	return m.autonomousResumeCmds(func() tea.Msg {
 		term, err := m.autonomousDriver.ResumeApproveProposal(ctx)
 		return autonomousRunMsg{term: term, err: err}
-	}
+	})
 }
 
 // resumeAutonomousProposalReject resolves a parked DECOMPOSITION_PROPOSAL by
@@ -249,15 +271,16 @@ func (m *model) resumeAutonomousProposalReject(reason string) tea.Cmd {
 	if b == nil || b.Action != autonomy.HumanBoundaryDecomposition {
 		return nil
 	}
+	// A rejected proposal authorizes nothing: drop any plan authorization the
+	// run carried so the workflow guard stays honest for future runs.
+	m.orch.ClearAuthorizedPlan()
 	m.autonomousBoundary = nil
-	m.beginOperation(OpAutonomous)
-	m.agentLabel = ""
-	m.startShimmer("", "autonomy cancel")
+	m.beginAutonomousResume("autonomy cancel")
 	ctx := m.operationContext()
-	return func() tea.Msg {
+	return m.autonomousResumeCmds(func() tea.Msg {
 		term, err := m.autonomousDriver.ResumeRejectProposal(ctx, reason)
 		return autonomousRunMsg{term: term, err: err}
-	}
+	})
 }
 
 // abortAutonomousRun aborts a parked driver run. It is the only UI path to
@@ -267,6 +290,10 @@ func (m *model) abortAutonomousRun(reason string) tea.Cmd {
 		return nil
 	}
 	m.autonomousBoundary = nil
+	// The abort command is in flight: mark the run active so the emergency-
+	// interrupt path never finalizes the operation concurrently with the
+	// driver's own terminal message.
+	m.autonomousActive = true
 	m.beginOperation(OpAutonomous)
 	return func() tea.Msg {
 		term, err := m.autonomousDriver.Abort(reason)
@@ -388,12 +415,24 @@ func (m *model) authorizeAutonomousApproval() error {
 	if m.executor == nil || m.authEngine == nil {
 		return nil
 	}
+	// ── STAGED DAG HANDSHAKE (planning → building guard) ────────────────
+	// An approved DECOMPOSITION_PROPOSAL IS an authorized plan: the staged
+	// ExecutionDAG lives inside the Autonomy Loop context (StagedPlan), so it
+	// must be registered with the orchestrator BEFORE the workflow transition
+	// is requested — otherwise the guard rejects planning → building with
+	// "no authorized plan or micro-plan" even though the human just approved
+	// every sub-task.
+	b := m.autonomousBoundary
+	if m.orch != nil && b != nil && b.Action == autonomy.HumanBoundaryDecomposition && b.Proposal != nil {
+		if err := m.orch.BindAuthorizedMicroPlan(context.Background(), b.Proposal); err != nil {
+			return fmt.Errorf("micro-plan binding failed: %w", err)
+		}
+	}
 	// Ensure workflow is in Building/Repairing state for authorization.
 	// Autonomous execution from /model mode starts in Planning; we must transition.
 	if err := m.transitionToBuilding(); err != nil {
 		return fmt.Errorf("workflow transition to building failed: %w", err)
 	}
-	b := m.autonomousBoundary
 	var targets []string
 	if b != nil {
 		targets = b.Targets

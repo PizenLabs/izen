@@ -1808,6 +1808,112 @@ func ResolveModifiedContent(original, rawLLMOutput string) string {
 	return input
 }
 
+// NoOpSentinel is the exact token the bounded-patch contract instructs a model
+// to emit when its assigned slice requires no edit. A response that sanitizes
+// down to this token is a successful NO-OP, never a contract violation.
+const NoOpSentinel = "NO_CHANGES_REQUIRED"
+
+// SanitizeBoundedPatchResponse is the artifact PRE-VALIDATION cleanup step for
+// raw LLM output under the bounded-patch contract. Contract non-compliant
+// free-tier models frequently wrap perfectly valid SEARCH/REPLACE blocks in
+// markdown code fences (```html, ```diff, ```) and conversational intro/outro
+// prose; without cleanup those responses die at the Boundary-4 gate and burn
+// the retry budget even though a well-formed artifact was present.
+//
+// The sanitizer is deterministic and conservative:
+//
+//   - when <<<<<<< SEARCH markers are present, ONLY the canonical block
+//     regions are kept — every byte of surrounding prose/fence noise is
+//     dropped (this is the intro/outro stripper);
+//   - otherwise outer markdown fences are stripped so unified-diff payloads
+//     survive verbatim;
+//   - clean input passes through unchanged (identity on compliant output).
+func SanitizeBoundedPatchResponse(raw string) string {
+	input := strings.TrimSpace(raw)
+	if input == "" {
+		return ""
+	}
+
+	// Embedded-block extraction: keep only the lines between each
+	// "<<<<<<< SEARCH" opener and its matching ">>>>>>>" closer. Prose before,
+	// between and after blocks is conversational noise, not artifact bytes.
+	if strings.Contains(input, "<<<<<<< SEARCH") {
+		var (
+			kept    []string
+			block   []string
+			inBlock bool
+		)
+		for _, line := range strings.Split(input, "\n") {
+			trimmed := strings.TrimSpace(line)
+			switch {
+			case trimmed == "<<<<<<< SEARCH":
+				inBlock = true
+				block = block[:0]
+				block = append(block, line)
+			case inBlock && (trimmed == ">>>>>>>" || strings.HasPrefix(trimmed, ">>>>>>>")):
+				block = append(block, line)
+				kept = append(kept, strings.Join(block, "\n"))
+				block = block[:0]
+				inBlock = false
+			case inBlock:
+				block = append(block, line)
+			}
+		}
+		if len(kept) > 0 {
+			return strings.Join(kept, "\n")
+		}
+		// Markers present but no complete block: fall through so the strict
+		// gate rejects deterministically instead of the sanitizer inventing one.
+	}
+
+	// Strip an outer markdown code fence (`​```html` / `​```diff` / `​````).
+	if strings.HasPrefix(input, "```") {
+		if idx := strings.Index(input, "\n"); idx != -1 {
+			input = input[idx+1:]
+		} else {
+			return ""
+		}
+	}
+	input = strings.TrimSuffix(input, "```")
+	return strings.TrimSpace(input)
+}
+
+// IsNoOpBoundedPatchResponse reports whether a raw LLM response is the NO-OP
+// sentinel of the bounded-patch contract. It requires the exact NoOpSentinel
+// token on at least one line (fences/quotes/punctuation tolerated) while every
+// other line stays plain conversational prose — a response carrying ANY code or
+// patch structure (SEARCH/REPLACE markers, unified-diff hunks, code punctuation)
+// is NEVER classified as a no-op, so a real artifact can never be swallowed here.
+func IsNoOpBoundedPatchResponse(raw string) bool {
+	input := strings.TrimSpace(raw)
+	if input == "" {
+		return false
+	}
+	if strings.Contains(input, "<<<<<<< SEARCH") || strings.Contains(input, "@@") {
+		return false
+	}
+	input = SanitizeBoundedPatchResponse(input)
+	sawSentinel := false
+	for _, line := range strings.Split(input, "\n") {
+		token := strings.Trim(strings.TrimSpace(line), "`\"' .!*-")
+		if token == "" {
+			continue
+		}
+		if token == NoOpSentinel {
+			sawSentinel = true
+			continue
+		}
+		// A non-sentinel line may only be conversational filler; anything
+		// code-shaped means the model tried to answer with an artifact.
+		if strings.ContainsAny(token, "{}<>=;()[]") ||
+			strings.Contains(token, "<<<<") || strings.Contains(token, ">>>>") ||
+			strings.Contains(token, "=======") {
+			return false
+		}
+	}
+	return sawSentinel
+}
+
 // ExtractBoundedPatch extracts a bounded patch from raw LLM output using ONLY
 // the structured patch representations — SEARCH/REPLACE blocks or unified diff
 // hunks — and validates the anchor deterministically:
@@ -1821,20 +1927,10 @@ func ResolveModifiedContent(original, rawLLMOutput string) string {
 // recovery): a verbose or truncated response can never masquerade as the
 // mutation.
 func ExtractBoundedPatch(original, raw string) (string, bool) {
-	input := strings.TrimSpace(raw)
+	input := SanitizeBoundedPatchResponse(raw)
 	if input == "" || original == "" {
 		return "", false
 	}
-
-	// Strip outer markdown code fences if present (the parser explicitly
-	// supports fenced blocks; prose outside them is not part of the artifact).
-	if strings.HasPrefix(input, "```") {
-		if idx := strings.Index(input, "\n"); idx != -1 {
-			input = input[idx+1:]
-		}
-	}
-	input = strings.TrimSuffix(input, "```")
-	input = strings.TrimSpace(input)
 
 	// Structured form 1: SEARCH/REPLACE blocks with exact-once anchor proof.
 	if strings.Contains(input, "<<<<<<< SEARCH") {

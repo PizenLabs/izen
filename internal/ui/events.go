@@ -94,6 +94,15 @@ type ThoughtBufferUpdatedMsg struct {
 	Done    bool
 }
 
+// ReasoningChunkMsg carries one LLM reasoning/thinking chunk from an async
+// execution stream (autonomous DAG sub-tasks, gated $prompt/$hot runs) into
+// the Bubble Tea event loop. The handler appends it to the active
+// ThinkingBuffer so the Ctrl+O modal updates in real time during
+// DAG_EXECUTING instead of surfacing nothing until the run terminates.
+type ReasoningChunkMsg struct {
+	Chunk string
+}
+
 // ── Event Emitters ────────────────────────────────────────────────────────
 //
 // These functions create tea.Msg values for the Control Plane to send.

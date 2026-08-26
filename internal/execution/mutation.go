@@ -116,6 +116,11 @@ const (
 	// produced an artifact (explanation / plan / investigation) with no
 	// mutation. It never claims a filesystem change.
 	OutcomeCompleted MutationOutcome = "completed"
+	// OutcomeNoOpSuccess is the terminal outcome of a bounded-patch execution
+	// whose model explicitly reported NO_CHANGES_REQUIRED for its assigned
+	// slice: a successful no-op. No patch is staged, no apply runs, and the
+	// artifact gate (Boundary 3/4) never rejects — the contract answered.
+	OutcomeNoOpSuccess MutationOutcome = "no_op_success"
 )
 
 // Display returns the human-readable outcome label.
@@ -153,6 +158,8 @@ func (o MutationOutcome) Display() string {
 		return "rejected"
 	case OutcomePreflightInfeasible:
 		return "preflight infeasible"
+	case OutcomeNoOpSuccess:
+		return "no-op success"
 	default:
 		return string(o)
 	}
@@ -247,6 +254,8 @@ func ParseMutationOutcome(s string) MutationOutcome {
 		return OutcomeFailed
 	case "completed", "done":
 		return OutcomeCompleted
+	case "no_op_success", "no-op success", "noop_success":
+		return OutcomeNoOpSuccess
 	default:
 		return OutcomeNoArtifact
 	}

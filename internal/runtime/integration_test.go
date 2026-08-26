@@ -125,6 +125,15 @@ func TestAskPlanBuildFlow(t *testing.T) {
 
 	// The plan staging must NOT have produced a fabricated task list: the fake
 	// newline-splitting projection was removed.
+	// Ledger delivery is asynchronous (the ledger subscribes to the bus's
+	// dispatch goroutines), so poll for the projection to catch up — phase,
+	// command entries and the two truthful failures all travel the same async
+	// path. Snapshotting immediately races the projector under load and has
+	// flaked CI with `ledger phase = "plan"`.
+	ledgerCaughtUp := waitFor(2*time.Second, func() bool {
+		snap := app.Ledger.Snapshot()
+		return snap.Phase == "build" && len(snap.Commands) > 0 && len(snap.Failures) == 2
+	})
 	snap := app.Ledger.Snapshot()
 	if len(snap.Commands) == 0 {
 		t.Error("ledger: expected command entries")
@@ -136,14 +145,9 @@ func TestAskPlanBuildFlow(t *testing.T) {
 		t.Errorf("ledger plan task count = %d, want 0 (no fake plan)", snap.Plan.TaskCount)
 	}
 	// Two approval attempts were truthfully rejected (no pending mutations), so
-	// the ledger records two failures — never a fabricated success. Delivery is
-	// asynchronous (the ledger subscribes to the bus's dispatch goroutines), so
-	// poll for the projection to catch up rather than snapshotting immediately.
-	ledgerCaughtUp := waitFor(2*time.Second, func() bool {
-		return len(app.Ledger.Snapshot().Failures) == 2
-	})
+	// the ledger records two failures — never a fabricated success.
 	if !ledgerCaughtUp {
-		t.Errorf("ledger failures = %d, want 2 (the two rejected approval attempts)", len(app.Ledger.Snapshot().Failures))
+		t.Errorf("ledger failures = %d, want 2 (the two rejected approval attempts)", len(snap.Failures))
 	}
 }
 

@@ -120,6 +120,11 @@ const (
 	// changed between attempts. The run aborts — a stale attempt never
 	// re-executes over moved ground.
 	OutcomeWorkspaceDrift ExecutionOutcome = "workspace_drift"
+	// OutcomeNoOpSuccess is the bounded-patch contract's NO-OP verdict: the
+	// model explicitly answered NO_CHANGES_REQUIRED for its assigned slice.
+	// It is a successful unit completion — no patch was staged, no apply ran,
+	// and the artifact gates never rejected.
+	OutcomeNoOpSuccess ExecutionOutcome = "no_op_success"
 )
 
 // RecoveryStrategy names the artifact protocol of the observation's own
@@ -142,7 +147,7 @@ func (o ExecutionOutcome) Failed() bool {
 func ClassifyOutcome(o ExecutionOutcome) FailureClass {
 	switch o {
 	case OutcomeNoArtifact, OutcomeArtifactProduced, OutcomeChanged, OutcomeCreated,
-		OutcomeNoChange, OutcomeCompleted, OutcomeSkipped, OutcomePendingApproval:
+		OutcomeNoChange, OutcomeCompleted, OutcomeNoOpSuccess, OutcomeSkipped, OutcomePendingApproval:
 		// Successes and non-failure outcomes are classified as transient
 		// (never permanent): the recovery matrix is only consulted for actual
 		// failures, and the success/human outcomes are decided before it.
@@ -184,6 +189,12 @@ type Observation struct {
 	Target string
 	// Evidence is the bounded structural ledger (deterministic, not raw files).
 	Evidence string
+	// Diagnostic carries the bounded advisory of a FAILED attempt (I2
+	// Recovery Isolation): WHAT failed and WHAT to do differently — the
+	// gate/validation error text, never a byte of the rejected artifact. It
+	// feeds self-correction contexts so a successor attempt can repair the
+	// output structure instead of repeating it blind.
+	Diagnostic string
 	// Outcome is the normalized authoritative execution outcome.
 	Outcome ExecutionOutcome
 	// PatchID is the approval-held patch identity when Outcome is

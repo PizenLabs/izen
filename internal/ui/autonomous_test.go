@@ -231,7 +231,9 @@ func TestAutonomousRunParksAtClarify(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("clarify resume must return a command")
 	}
-	cmd()
+	// The resume is batched with the tick loops; executing the batch runs the
+	// driver command itself.
+	extractAutonomousRunMsg(t, cmd())
 	if drv.resumeClarify != 1 || drv.lastClarify != "b.txt" {
 		t.Fatalf("resumeClarify = %d (%q), want 1 (b.txt)", drv.resumeClarify, drv.lastClarify)
 	}
@@ -383,7 +385,7 @@ func TestAutonomousDriverKeyBindings(t *testing.T) {
 	if kcmd == nil {
 		t.Fatal("Esc on a parked approval must return a command")
 	}
-	kcmd()
+	extractAutonomousRunMsg(t, kcmd())
 	if drv.resumeReject != 1 {
 		t.Fatalf("Esc must reject, resumeReject = %d", drv.resumeReject)
 	}
@@ -417,7 +419,7 @@ func TestAutonomousDriverKeyBindings(t *testing.T) {
 	if kcmd == nil {
 		t.Fatal("Alt+A on a parked approval must return a command")
 	}
-	kcmd()
+	extractAutonomousRunMsg(t, kcmd())
 	if drv2.resumeApprove != 1 {
 		t.Fatalf("Alt+A must approve, resumeApprove = %d", drv2.resumeApprove)
 	}
