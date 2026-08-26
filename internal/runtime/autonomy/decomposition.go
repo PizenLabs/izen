@@ -165,6 +165,13 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 	dag.Status = planner.DagExecuting
 	expected := dag.BaseTreeDigest
 
+	// The UI's streaming callback (content + reasoning deltas for the Ctrl+O
+	// thought drawer) is captured ONCE for the whole DAG transaction and
+	// attached to EVERY sub-task attempt — a unit boundary or an intra-DAG
+	// contract retry must never blind the live thought trace mid-run.
+	streamCb := d.streamCb
+	d.streamCb = nil
+
 	for i := range dag.SubTasks {
 		st := dag.SubTasks[i]
 		if cerr := ctx.Err(); cerr != nil {
@@ -180,7 +187,7 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 					st.ID, i+1, n, short(expected), short(before)))
 		}
 
-		obs, attempts, err := d.executeSubTaskWithRetry(ctx, dag, st, i+1, n, targets, before)
+		obs, attempts, err := d.executeSubTaskWithRetry(ctx, dag, st, i+1, n, targets, before, streamCb)
 		if err != nil {
 			return d.failDAG(ctx, dag, originals, i,
 				fmt.Sprintf("sub-task %s (%d/%d) failed at the output/artifact gates: %v", st.ID, i+1, n, err))
@@ -273,11 +280,13 @@ func (d *Driver) aggregateUsage(obs autonomy.Observation) {
 }
 
 // dagOutcomeSuccess reports whether a terminal sub-task observation counts as
-// an applied unit of the transaction.
+// an applied unit of the transaction. A NO_OP_SUCCESS unit (the model answered
+// NO_CHANGES_REQUIRED for its slice) also counts: the contract was satisfied
+// with no mutation required.
 func dagOutcomeSuccess(o autonomy.Observation) bool {
 	switch o.Outcome {
 	case autonomy.OutcomeChanged, autonomy.OutcomeCreated, autonomy.OutcomeNoChange,
-		autonomy.OutcomeCompleted:
+		autonomy.OutcomeCompleted, autonomy.OutcomeNoOpSuccess:
 		return true
 	default:
 		return false

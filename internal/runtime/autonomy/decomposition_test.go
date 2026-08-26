@@ -54,6 +54,7 @@ type dagProvider struct {
 	target  string
 	calls   int
 	poison  map[int]bool // call number (1-based) → garbage response
+	noop    map[int]bool // call number (1-based) → NO_CHANGES_REQUIRED sentinel
 	onCall  func(call int)
 	prompts []string // flattened user prompt of every call, oldest first
 }
@@ -65,12 +66,19 @@ func (p *dagProvider) Execute(_ context.Context, req ai.Request) (*ai.Response, 
 	p.calls++
 	call := p.calls
 	poison := p.poison[call]
+	noop := p.noop[call]
 	hook := p.onCall
 	p.prompts = append(p.prompts, userPrompt(req))
 	p.mu.Unlock()
 
 	if hook != nil {
 		hook(call)
+	}
+	if noop {
+		return &ai.Response{
+			Content: "NO_CHANGES_REQUIRED",
+			Usage:   ai.ProviderUsage{Known: true, PromptTokens: 10, CompletionTokens: 4, FinishReason: "stop"},
+		}, nil
 	}
 	if poison {
 		return &ai.Response{

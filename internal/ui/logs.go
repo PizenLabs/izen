@@ -246,6 +246,9 @@ func RenderEntry(entry LogEntry, width int, dotFrame int) string {
 		case execution.OutcomeNoChange:
 			icon = dimmedStyle.Render("∅")
 			label = "NoChange"
+		case execution.OutcomeNoOpSuccess:
+			icon = dimmedStyle.Render("∅")
+			label = "NoOpSuccess"
 		case execution.OutcomeSkipped:
 			icon = dimmedStyle.Render("↷")
 			label = "Skipped"

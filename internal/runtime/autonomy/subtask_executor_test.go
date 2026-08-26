@@ -3,9 +3,11 @@ package autonomy
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
 )
 
@@ -46,6 +48,27 @@ func TestSubTaskPromptInjectsStrictPatchContractForBoundedLines(t *testing.T) {
 	}
 	if len(got) > 2048 {
 		t.Errorf("prompt unbounded after injection: %d chars", len(got))
+	}
+}
+
+// TestSubTaskPromptCarriesFewShotAndNoOpSentinel proves the contract block
+// carries the FEW-SHOT templates (one mutation example, one NO-OP example) and
+// mandates the exact NO_CHANGES_REQUIRED sentinel instead of conversational
+// prose when a slice needs no edit.
+func TestSubTaskPromptCarriesFewShotAndNoOpSentinel(t *testing.T) {
+	for _, want := range []string{
+		"MUTATION EXAMPLE:",
+		"<<<<<<< SEARCH\n<div class=\"old\">\n=======\n<div class=\"new\">\n>>>>>>>\n",
+		"NO-OP EXAMPLE",
+		"NO_CHANGES_REQUIRED",
+		"MUST emit exactly NO_CHANGES_REQUIRED",
+	} {
+		if !strings.Contains(patchContractBlock, want) {
+			t.Errorf("patch contract missing few-shot fragment %q:\n%s", want, patchContractBlock)
+		}
+	}
+	if strings.Count(patchContractBlock, "NO_CHANGES_REQUIRED") < 2 {
+		t.Error("sentinel must appear in both the example and the mandate")
 	}
 }
 
@@ -174,6 +197,84 @@ func TestDriver_DecompositionIntraDAGRetryRecoversFromInvalidPatch(t *testing.T)
 	} {
 		if !strings.Contains(retry, want) {
 			t.Errorf("retry prompt missing validation feedback %q:\n%s", want, retry)
+		}
+	}
+}
+
+// ── NO-OP SENTINEL (Task 2, integration) ────────────────────────────────────
+
+// TestDriver_DecompositionNoOpSubTaskSucceeds proves a sub-task whose model
+// answers exactly NO_CHANGES_REQUIRED converges to a SUCCESSFUL unit: the DAG
+// completes, the unit is not retried (no wasted invocations), no patch is
+// staged for it, and the remaining units still land.
+func TestDriver_DecompositionNoOpSubTaskSucceeds(t *testing.T) {
+	root, driver, dag, p := stageDecompositionRun(t, 60)
+	before := readTarget(t, root, "big.go")
+
+	// st-1's slice needs no edit: the model answers with the sentinel.
+	p.noop = map[int]bool{1: true}
+
+	term, err := driver.ResumeApproveProposal(context.Background())
+	if err != nil {
+		t.Fatalf("ResumeApproveProposal: %v", err)
+	}
+	if term == nil || term.State != autonomy.RuntimeCompleted {
+		t.Fatalf("termination = %+v, want completed (no-op unit must not fail the DAG)", term)
+	}
+	if driver.Plan().Status != planner.DagExecutionCompleted {
+		t.Fatalf("plan status = %s, want %s", driver.Plan().Status, planner.DagExecutionCompleted)
+	}
+	// Exactly one invocation per unit — the sentinel never burned a retry.
+	if got := p.calls; got != len(dag.SubTasks) {
+		t.Fatalf("provider calls = %d, want %d (no retries)", got, len(dag.SubTasks))
+	}
+	// The remaining units mutated the file; the no-op unit changed nothing.
+	after := readTarget(t, root, "big.go")
+	if after == before {
+		t.Fatal("remaining units never applied")
+	}
+	for _, st := range dag.SubTasks[1:] {
+		if !strings.Contains(after, "patched-by-"+st.ID) {
+			t.Errorf("%s never applied", st.ID)
+		}
+	}
+}
+
+// ── SUB-TASK STREAM CALLBACK (reasoning trace wiring) ───────────────────────
+
+// TestDriver_SubTaskStreamCallbackSurvivesRetry proves the UI streaming
+// callback captured before ResumeApproveProposal is attached to EVERY
+// intra-DAG attempt — including contract retries — so the Ctrl+O thought
+// drawer stays live through rejected attempts instead of going blind after
+// attempt 1.
+func TestDriver_SubTaskStreamCallbackSurvivesRetry(t *testing.T) {
+	_, driver, dag, p := stageDecompositionRun(t, 60)
+
+	var mu sync.Mutex
+	kinds := map[string]int{}
+	driver.SetStreamCallback(func(ev execution.StreamEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		kinds[ev.Kind]++
+	})
+
+	// st-2's first generation is garbage → one intra-DAG retry.
+	p.poison = map[int]bool{2: true}
+
+	term, err := driver.ResumeApproveProposal(context.Background())
+	if err != nil {
+		t.Fatalf("ResumeApproveProposal: %v", err)
+	}
+	if term == nil || term.State != autonomy.RuntimeCompleted {
+		t.Fatalf("termination = %+v, want completed", term)
+	}
+	wantInvocations := len(dag.SubTasks) + 1 // one retry for st-2
+	mu.Lock()
+	defer mu.Unlock()
+	for _, kind := range []string{"first_token", "content_delta", "done"} {
+		if kinds[kind] < wantInvocations {
+			t.Errorf("stream event %q count = %d, want >= %d (callback must fire on every attempt incl. retry)",
+				kind, kinds[kind], wantInvocations)
 		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
 )
 
@@ -32,16 +33,38 @@ import (
 // execution (1 initial attempt + maxSubTaskAttempts-1 contract retries).
 const maxSubTaskAttempts = 3
 
+// noOpSentinel is the exact token a sub-task model MUST emit when its assigned
+// slice requires no edit. The executor's bounded-patch sanitizer recognizes it
+// and converges the unit to a successful no-op instead of burning the retry
+// budget on prose that can never satisfy the SEARCH/REPLACE gate.
+const noOpSentinel = "NO_CHANGES_REQUIRED"
+
 // patchContractBlock is the STRICT output-format instruction injected into
 // bounded-line sub-task prompts. It mirrors byte-for-byte the block shape the
-// executor's Boundary-4 gate accepts.
+// executor's Boundary-4 gate accepts and carries two FEW-SHOT templates — one
+// mutation example and one NO-OP sentinel example — so weak/free-tier models
+// (finish_reason="stop" + prose) cannot claim ambiguity about what to emit
+// when their slice needs no change.
 const patchContractBlock = "CRITICAL: Output MUST use exact SEARCH/REPLACE block format:\n" +
 	"<<<<<<< SEARCH\n" +
 	"[exact content from target lines]\n" +
 	"=======\n" +
 	"[proposed modification]\n" +
 	">>>>>>>\n" +
-	"Do not output raw code or markdown formatting outside search/replace blocks."
+	"\n" +
+	"MUTATION EXAMPLE:\n" +
+	"<<<<<<< SEARCH\n" +
+	"<div class=\"old\">\n" +
+	"=======\n" +
+	"<div class=\"new\">\n" +
+	">>>>>>>\n" +
+	"\n" +
+	"NO-OP EXAMPLE — if the assigned lines require NO change, output EXACTLY this single line and nothing else:\n" +
+	noOpSentinel + "\n" +
+	"\n" +
+	"Do not output raw code or markdown formatting outside search/replace blocks.\n" +
+	"If a slice needs no edit you MUST emit exactly " + noOpSentinel +
+	" instead of conversational prose, an apology, or an explanation."
 
 // requiresPatchContract reports whether the sub-task's split kind is bound to
 // the explicit line-interval SEARCH_REPLACE_BOUNDED_LINES mutation contract.
@@ -100,7 +123,7 @@ func retryDirective(st planner.SubTask, o autonomy.Observation, attempt int) str
 // error, or exhausted attempts, returns the last observation for the caller's
 // terminal handling.
 func (d *Driver) executeSubTaskWithRetry(ctx context.Context, dag *planner.ExecutionDAG, st planner.SubTask,
-	pos, total int, targets []string, workspaceDigest string) (autonomy.Observation, int, error) {
+	pos, total int, targets []string, workspaceDigest string, streamCb execution.StreamCallback) (autonomy.Observation, int, error) {
 	baseEvidence := fmt.Sprintf("[DAG sub_task=%s region=%s estimate=%dtok ceiling=%dtok base_digest=%s]",
 		st.ID, st.Region, st.EstimatedTokens, dag.Budget(), short(dag.BaseTreeDigest))
 	var (
@@ -111,13 +134,11 @@ func (d *Driver) executeSubTaskWithRetry(ctx context.Context, dag *planner.Execu
 	for attempt := 1; attempt <= maxSubTaskAttempts; attempt++ {
 		attempts = attempt
 		req := d.subTaskRequest(dag, st, pos, total, targets, workspaceDigest, baseEvidence)
+		req.StreamCallback = streamCb
 		// RecoveryAttempt rotates the executor's bounded-patch context window:
 		// every retry sees materially different copyable source.
 		req.RecoveryAttempt = pos + attempt - 1
-		if attempt == 1 {
-			req.StreamCallback = d.streamCb
-			d.streamCb = nil
-		} else {
+		if attempt > 1 {
 			req.RequestID = fmt.Sprintf("%s-retry-%d", req.RequestID, attempt-1)
 			req.Evidence = joinEvidence(baseEvidence, retryEvidenceSignal(st, obs, attempt))
 			req.Prompt += "\n\n" + retryDirective(st, obs, attempt)

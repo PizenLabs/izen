@@ -614,7 +614,7 @@ func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopD
 	}
 	switch o.Outcome {
 	case autonomy.OutcomeChanged, autonomy.OutcomeCreated, autonomy.OutcomeNoChange,
-		autonomy.OutcomeCompleted, autonomy.OutcomeArtifactProduced:
+		autonomy.OutcomeCompleted, autonomy.OutcomeArtifactProduced, autonomy.OutcomeNoOpSuccess:
 		return autonomy.LoopDecision{Action: autonomy.LoopComplete,
 			Reason: "objective satisfied: " + string(o.Outcome)}
 	case autonomy.OutcomePendingApproval:

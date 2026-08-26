@@ -120,6 +120,11 @@ const (
 	// changed between attempts. The run aborts — a stale attempt never
 	// re-executes over moved ground.
 	OutcomeWorkspaceDrift ExecutionOutcome = "workspace_drift"
+	// OutcomeNoOpSuccess is the bounded-patch contract's NO-OP verdict: the
+	// model explicitly answered NO_CHANGES_REQUIRED for its assigned slice.
+	// It is a successful unit completion — no patch was staged, no apply ran,
+	// and the artifact gates never rejected.
+	OutcomeNoOpSuccess ExecutionOutcome = "no_op_success"
 )
 
 // RecoveryStrategy names the artifact protocol of the observation's own
@@ -142,7 +147,7 @@ func (o ExecutionOutcome) Failed() bool {
 func ClassifyOutcome(o ExecutionOutcome) FailureClass {
 	switch o {
 	case OutcomeNoArtifact, OutcomeArtifactProduced, OutcomeChanged, OutcomeCreated,
-		OutcomeNoChange, OutcomeCompleted, OutcomeSkipped, OutcomePendingApproval:
+		OutcomeNoChange, OutcomeCompleted, OutcomeNoOpSuccess, OutcomeSkipped, OutcomePendingApproval:
 		// Successes and non-failure outcomes are classified as transient
 		// (never permanent): the recovery matrix is only consulted for actual
 		// failures, and the success/human outcomes are decided before it.

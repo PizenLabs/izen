@@ -118,6 +118,12 @@ func (m *model) runAutonomousDriver(objective string) tea.Cmd {
 			if ev.Content != "" {
 				ch <- tokenMsg(ev.Content)
 			}
+		case "reasoning_delta":
+			// Sub-task reasoning tokens: forwarded to the main UI loop so the
+			// Ctrl+O thought drawer updates in real time during DAG_EXECUTING.
+			if ev.Content != "" {
+				ch <- ReasoningChunkMsg{Chunk: ev.Content}
+			}
 		case "done":
 			ch <- streamDoneMsg{
 				content:        ev.Content,

@@ -273,7 +273,7 @@ func sealEvidence(
 // Proof.OccAborted flag (see sealTerminalEvidence).
 func evidenceOutcomeFor(outcome MutationOutcome, execErr error) ExecutionOutcome {
 	switch outcome {
-	case OutcomeChanged, OutcomeCreated, OutcomeNoChange, OutcomeCompleted:
+	case OutcomeChanged, OutcomeCreated, OutcomeNoChange, OutcomeCompleted, OutcomeNoOpSuccess:
 		if execErr != nil {
 			// A result that carries a terminal error is never a soft success.
 			return EvidenceFailed

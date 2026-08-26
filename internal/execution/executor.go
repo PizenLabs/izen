@@ -49,7 +49,8 @@ import (
 // It is a domain-level type — no UI framework dependencies.
 type StreamEvent struct {
 	RequestID string
-	// Kind is the event kind: "first_token", "content_delta", "done", "error".
+	// Kind is the event kind: "first_token", "content_delta",
+	// "reasoning_delta", "done", "error".
 	Kind string
 	// Content is the text content for content_delta events.
 	Content string
@@ -498,6 +499,13 @@ var ErrArtifactRejected = errors.New("executor: mutation artifact rejected")
 
 var ErrArtifactRetryableRejected = errors.New("executor: mutation artifact rejected with retry directive")
 
+// ErrNoOpMutation signals a bounded-patch invocation whose model answered with
+// the NO_CHANGES_REQUIRED sentinel: the assigned slice needs no edit. It is a
+// SUCCESS, not an artifact rejection — the execution converges to
+// OutcomeNoOpSuccess without staging a patch, running an apply or tripping
+// Boundary 3.
+var ErrNoOpMutation = errors.New("executor: model reported NO_CHANGES_REQUIRED")
+
 var ErrOutputTruncated = errors.New("executor: model output truncated")
 
 // openRouterStyleModelIDRe matches OpenRouter's vendor/model schema — the same
@@ -880,6 +888,25 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		// Completed.OutputTokens and Proof.ModelInvocations.
 		res.ModelCalls = append(res.ModelCalls, invs...)
 		res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, invs...)
+		if errors.Is(err, ErrNoOpMutation) {
+			// ── NO_OP_SUCCESS ───────────────────────────────────────────
+			// The model explicitly reported NO_CHANGES_REQUIRED for its slice:
+			// a successful contract answer. No patch is staged (no approval
+			// surface opens), no apply runs, and Boundary 3 is never tripped.
+			// The billed invocations still travel on the result so usage stays
+			// authoritative.
+			g.Skip(runtimegraph.StageApprovalGate, "no-op success")
+			g.Skip(runtimegraph.StageMutationTransaction, "no-op success")
+			g.Skip(runtimegraph.StageVerification, "no-op success")
+			g.CompleteExecution(string(OutcomeNoOpSuccess))
+			res.ArtifactKind = ""
+			res.Content = ""
+			res.Err = nil
+			res.Proof.Outcome = OutcomeNoOpSuccess
+			res.Proof.FinishedAt = time.Now()
+			setProofGraph(res, g)
+			return x.finalizeResult(res), nil
+		}
 		if errors.Is(err, context.Canceled) {
 			// A user cancellation is a clean terminal outcome: no artifact was
 			// produced, nothing was applied, and no rollback runs.
@@ -1552,6 +1579,15 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 
 		var modified string
 		if patchOnly {
+			// NO-OP SENTINEL (pre-validation): a model that answers
+			// NO_CHANGES_REQUIRED has satisfied the contract — its slice needs
+			// no edit. Converge to a successful no-op BEFORE the strict gate:
+			// burning the retry budget on prose-free compliant output is never
+			// the right outcome.
+			if IsNoOpBoundedPatchResponse(raw) {
+				log.Printf("[execution] request=%s target=%s artifact=no_op (%s)", requestID, target, NoOpSentinel)
+				return nil, invs, nil, fmt.Errorf("%w: %s", ErrNoOpMutation, target)
+			}
 			// Bounded-patch artifact boundary: extract ONLY structured patch
 			// representations. A full-file (or otherwise unstructured)
 			// response can NEVER satisfy this contract — rejecting it here is
@@ -1853,6 +1889,13 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		if tok.Kind == stream.TokenKindThinking {
 			reasoningOpen()
 			reasoningBuf.WriteString(tok.Text)
+			// Reasoning chunks cross to the caller as a dedicated
+			// reasoning_delta event so an attached UI can render the live
+			// thought trace (Ctrl+O) during DAG_EXECUTING. The executor still
+			// never publishes raw reasoning onto the event bus itself.
+			if streamCb != nil {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "reasoning_delta", Content: tok.Text})
+			}
 			return
 		}
 		reasoningClose()

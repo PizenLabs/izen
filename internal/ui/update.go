@@ -1105,6 +1105,24 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		return m, nil
 
+	case ReasoningChunkMsg:
+		// Sub-task reasoning trace: one thinking chunk from an async executor
+		// stream (autonomous DAG_EXECUTING, gated $prompt/$hot) appended to the
+		// active ThinkingBuffer so Ctrl+O expands a live thought drawer while
+		// the run executes — never an empty overlay.
+		if msg.Chunk == "" {
+			return m, nil
+		}
+		if m.thinkingBuffer == nil {
+			m.thinkingBuffer = NewThinkingBuffer()
+		}
+		m.thinkingBuffer.Append(msg.Chunk)
+		m.refreshViewportContent()
+		if m.Ready && !m.userIsScrollingUp {
+			m.Viewport.GotoBottom()
+		}
+		return m, nil
+
 	case buildResultMsg:
 		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
 		// processing flag so the spinner can never be orphaned on a failed or

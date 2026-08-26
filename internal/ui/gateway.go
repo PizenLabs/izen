@@ -134,6 +134,10 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 			if ev.Content != "" {
 				ch <- tokenMsg(ev.Content)
 			}
+		case "reasoning_delta":
+			if ev.Content != "" {
+				ch <- ReasoningChunkMsg{Chunk: ev.Content}
+			}
 		case "done":
 			ch <- streamDoneMsg{
 				content:        ev.Content,
@@ -335,9 +339,12 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 
 	// ── NO-CHANGE TERMINAL: the mutation applied but nothing changed ──
 	// A committed OutcomeNoChange is a successful execution that produced no
-	// filesystem change. It is projected distinctly — never the generic
+	// filesystem change. OutcomeNoOpSuccess is its bounded-patch sibling: the
+	// model explicitly answered NO_CHANGES_REQUIRED, no patch was staged and
+	// nothing applied. Both project distinctly — never the generic
 	// "Completed — nothing produced." fallback.
-	if res.Proof != nil && res.Proof.Outcome == execution.OutcomeNoChange {
+	if res.Proof != nil && (res.Proof.Outcome == execution.OutcomeNoChange ||
+		res.Proof.Outcome == execution.OutcomeNoOpSuccess) {
 		m.executorPendingPatchID = ""
 		m.executorPendingTargets = nil
 		m.pendingHotfixTask = nil
@@ -575,7 +582,8 @@ func (m *model) runHotExecution(rawInput string) tea.Cmd {
 // projection runs).
 func buildQueueTaskOutcome(outcome execution.MutationOutcome) string {
 	switch {
-	case outcome.MutationSucceeded(), outcome == execution.OutcomeNoChange:
+	case outcome.MutationSucceeded(), outcome == execution.OutcomeNoChange,
+		outcome == execution.OutcomeNoOpSuccess:
 		return "advance"
 	case outcome == execution.OutcomeRejected,
 		outcome == execution.OutcomeCancelled,

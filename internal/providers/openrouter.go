@@ -686,11 +686,105 @@ func (r *OpenRouterStreamResult) FinishReason() string {
 	return ""
 }
 
+// thinkTagSplitter is a stateful inline <think>...</think> extractor for
+// OpenRouter models that return their thinking blocks inside delta.content
+// instead of a dedicated reasoning field. It rewrites contiguous thinking
+// segments into ReasoningSentinel-wrapped runs so EVERY downstream consumer —
+// including ones that never ran the stream classifier — receives reasoning on
+// the sentinel channel and visible content untouched. Partial markers that
+// straddle a chunk boundary ("<thi", "ink>") are held back in a residue buffer
+// until enough bytes arrive, so a marker is consumed exactly once regardless
+// of how the gateway fragments the SSE deltas.
+type thinkTagSplitter struct {
+	inThink bool
+	residue []byte
+}
+
+func (t *thinkTagSplitter) write(chunk []byte) []byte {
+	if len(chunk) == 0 {
+		return nil
+	}
+	data := chunk
+	if len(t.residue) > 0 {
+		data = append(append([]byte(nil), t.residue...), chunk...)
+		t.residue = nil
+	}
+	var out []byte
+	for len(data) > 0 {
+		if t.inThink {
+			idx := bytes.Index(data, []byte("</think>"))
+			if idx < 0 {
+				// Still inside the thinking block: emit what is provably not a
+				// partial closing marker, hold back the ambiguous tail.
+				keep := longestPartialSuffix(data, "</think>")
+				emit := len(data) - keep
+				out = append(out, data[:emit]...)
+				t.residue = append(t.residue[:0], data[emit:]...)
+				return out
+			}
+			out = append(out, data[:idx]...)
+			out = append(out, ReasoningSentinel...)
+			t.inThink = false
+			data = data[idx+len("</think>"):]
+			continue
+		}
+		idx := bytes.Index(data, []byte("<think>"))
+		if idx < 0 {
+			keep := longestPartialSuffix(data, "<think>")
+			emit := len(data) - keep
+			out = append(out, data[:emit]...)
+			t.residue = append(t.residue[:0], data[emit:]...)
+			return out
+		}
+		out = append(out, data[:idx]...)
+		out = append(out, ReasoningSentinel...)
+		t.inThink = true
+		data = data[idx+len("<think>"):]
+	}
+	return out
+}
+
+// takeResidue flushes bytes held back for a possibly-partial marker when the
+// stream terminates: no more bytes can complete the marker, so the tail is
+// delivered verbatim (classified by the state at hold time).
+func (t *thinkTagSplitter) takeResidue() []byte {
+	tail := t.residue
+	t.residue = nil
+	if t.inThink && len(tail) > 0 {
+		wrapped := make([]byte, 0, len(ReasoningSentinel)+len(tail)+len(ReasoningSentinel))
+		wrapped = append(wrapped, ReasoningSentinel...)
+		wrapped = append(wrapped, tail...)
+		wrapped = append(wrapped, ReasoningSentinel...)
+		return wrapped
+	}
+	return tail
+}
+
+// longestPartialSuffix returns the length of the longest proper suffix of data
+// that is a prefix of marker — the number of trailing bytes that MIGHT be the
+// beginning of marker arriving in the next chunk.
+func longestPartialSuffix(data []byte, marker string) int {
+	max := len(marker) - 1
+	if len(data) < max {
+		max = len(data)
+	}
+	for k := max; k > 0; k-- {
+		if bytes.HasSuffix(data, []byte(marker[:k])) {
+			return k
+		}
+	}
+	return 0
+}
+
 type openrouterSSEReader struct {
 	body       io.ReadCloser
 	reader     *bufio.Reader
 	closed     bool
 	finalUsage *openrouterUsage
+
+	// think splits inline <think>…</think> blocks out of delta.content into
+	// sentinel-wrapped reasoning runs (see thinkTagSplitter).
+	think thinkTagSplitter
 
 	// usage tracks cumulative token accounting: the authoritative provider
 	// usage when a usage chunk arrives, plus a character-count estimate when
@@ -758,8 +852,16 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 		data := strings.TrimPrefix(line, "data: ")
 
 		if data == "[DONE]" {
+			if tail := s.think.takeResidue(); len(tail) > 0 {
+				s.pending = append(s.pending, tail...)
+			}
 			s.closed = true
 			s.usage.markCompleted(time.Now(), s.finishReason)
+			if len(s.pending) > 0 {
+				n := copy(p, s.pending)
+				s.pending = s.pending[n:]
+				return n, nil
+			}
 			return 0, io.EOF
 		}
 
@@ -791,26 +893,28 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 			// Read() call — never dropped, and never split without keeping
 			// the remainder for delivery (see s.pending doc comment).
 			// Some models/gateways report reasoning under "reasoning" instead
-			// of "reasoning_content"; both are routed identically.
+			// of "reasoning_content"; both are routed identically. Inline
+			// <think>…</think> blocks inside delta.content are extracted into
+			// the same sentinel channel by s.think.
+			var out []byte
 			reasoningText := delta.ReasoningContent
 			if reasoningText == "" {
 				reasoningText = delta.Reasoning
 			}
 			if reasoningText != "" {
 				s.usage.recordReasoning(len(reasoningText))
-				reasoning := []byte(ReasoningSentinel + reasoningText + ReasoningSentinel)
-				n := copy(p, reasoning)
-				if n < len(reasoning) {
-					s.pending = reasoning[n:]
-				}
-				return n, nil
+				out = append(out, ReasoningSentinel...)
+				out = append(out, reasoningText...)
+				out = append(out, ReasoningSentinel...)
 			}
 			if delta.Content != "" {
 				s.usage.recordOutput(len(delta.Content))
-				content := []byte(delta.Content)
-				n := copy(p, content)
-				if n < len(content) {
-					s.pending = content[n:]
+				out = append(out, s.think.write([]byte(delta.Content))...)
+			}
+			if len(out) > 0 {
+				n := copy(p, out)
+				if n < len(out) {
+					s.pending = out[n:]
 				}
 				return n, nil
 			}
