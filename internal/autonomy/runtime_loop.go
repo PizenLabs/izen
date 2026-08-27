@@ -120,11 +120,23 @@ const (
 	// changed between attempts. The run aborts — a stale attempt never
 	// re-executes over moved ground.
 	OutcomeWorkspaceDrift ExecutionOutcome = "workspace_drift"
-	// OutcomeNoOpSuccess is the bounded-patch contract's NO-OP verdict: the
-	// model explicitly answered NO_CHANGES_REQUIRED for its assigned slice.
-	// It is a successful unit completion — no patch was staged, no apply ran,
-	// and the artifact gates never rejected.
-	OutcomeNoOpSuccess ExecutionOutcome = "no_op_success"
+	// ── NO-OP semantic sub-states ─────────────────────────────────────────
+	// A NO_CHANGES_REQUIRED answer is a model CLAIM, classified by the
+	// executor's deterministic structural analysis into exactly one of three
+	// sub-states. The monolithic no_op_success outcome was retired: a raw
+	// claim can never terminate a run as success by itself.
+
+	// OutcomeNoOpObjectiveSatisfied: structural analysis confirms zero work
+	// is needed — the claim stands uncontradicted. Terminal success.
+	OutcomeNoOpObjectiveSatisfied ExecutionOutcome = "no_op_objective_satisfied"
+	// OutcomeNoOpNoSafeMutation: candidate edits detected below the safety
+	// threshold. Terminal warning (requires_review) — the loop parks at a
+	// human boundary instead of completing.
+	OutcomeNoOpNoSafeMutation ExecutionOutcome = "no_op_no_safe_mutation"
+	// OutcomeNoOpObjectiveUnresolved: the claim conflicts with structural
+	// evidence. Escalation trigger — never terminal completion; the DAG
+	// runtime re-hydrates the sub-task once, then escalates to a human.
+	OutcomeNoOpObjectiveUnresolved ExecutionOutcome = "no_op_objective_unresolved"
 )
 
 // RecoveryStrategy names the artifact protocol of the observation's own
@@ -147,15 +159,23 @@ func (o ExecutionOutcome) Failed() bool {
 func ClassifyOutcome(o ExecutionOutcome) FailureClass {
 	switch o {
 	case OutcomeNoArtifact, OutcomeArtifactProduced, OutcomeChanged, OutcomeCreated,
-		OutcomeNoChange, OutcomeCompleted, OutcomeNoOpSuccess, OutcomeSkipped, OutcomePendingApproval:
+		OutcomeNoChange, OutcomeCompleted, OutcomeNoOpObjectiveSatisfied,
+		OutcomeNoOpNoSafeMutation, OutcomeSkipped, OutcomePendingApproval:
 		// Successes and non-failure outcomes are classified as transient
 		// (never permanent): the recovery matrix is only consulted for actual
 		// failures, and the success/human outcomes are decided before it.
+		// A no_safe_mutation warning parks at a human boundary before the
+		// matrix runs; it is never a failure class.
 		return FailureTransient
 	case OutcomeCancelled, OutcomeRejected, OutcomeArtifactRejected:
 		return FailurePermanent
 	case OutcomeFailed, OutcomePatchGenFailed, OutcomePatchFailed, OutcomeApplyFailed, OutcomeVerifyFailed,
 		OutcomeArtifactRetryableRejected, OutcomeTruncated:
+		return FailureRecoverable
+	case OutcomeNoOpObjectiveUnresolved:
+		// A claim contradicted by structural evidence is a recoverable
+		// condition: the loop escalates (re-hydrated context, then a human)
+		// instead of aborting or — worse — completing.
 		return FailureRecoverable
 	default:
 		return FailurePermanent
@@ -232,6 +252,10 @@ type Observation struct {
 	RecoveryCycle int
 	// LastAction is the previous loop action (identical-decision detection).
 	LastAction LoopAction
+	// Escalated is set by the DAG runtime's NO-OP escalation circuit when a
+	// NO_OP_OBJECTIVE_UNRESOLVED claim survived its re-hydration attempt: the
+	// observation demands human escalation, never terminal completion.
+	Escalated bool
 }
 
 // ── LoopAction / LoopDecision ───────────────────────────────────────────────
@@ -508,6 +532,20 @@ type LoopRequest struct {
 	// evaluated individually and the monolithic full-rewrite estimation of
 	// the original target is suppressed. Nil for non-DAG requests.
 	StagedPlan *planner.ExecutionDAG
+	// FocusStartLine / FocusEndLine optionally pin the executor's
+	// deterministic bounded-patch context window to THIS unit's assigned
+	// inclusive 1-indexed line interval. Under a staged decomposition plan
+	// each sub-task sets these to its Region: retries can then neither see
+	// nor anchor on another unit's content — the local-context blindness that
+	// produced false NO_CHANGES_REQUIRED claims. Zero values mean "no focus"
+	// (the whole file remains windowable, the pre-DAG behavior).
+	FocusStartLine int
+	FocusEndLine   int
+	// NoOpEscalation marks this request as a NO-OP escalation attempt: the
+	// previous attempt for this unit answered NO_CHANGES_REQUIRED while
+	// structural analysis indicated work remains. The executor widens the
+	// bounded-patch context window for the re-hydrated judgment.
+	NoOpEscalation bool
 	// FinishReason carries the previous attempt's finish_reason for observability.
 	FinishReason string
 	// StreamCallback is an optional callback for incremental streaming progress.

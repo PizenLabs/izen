@@ -20,6 +20,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/events"
 	runtimegraph "github.com/PizenLabs/izen/internal/execution/graph"
+	"github.com/PizenLabs/izen/internal/execution/ingestion"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/retrieval"
@@ -141,6 +142,23 @@ type ExecuteRequest struct {
 	// submission can never be refused for the size of the whole target it was
 	// decomposed from.
 	StagedSubTasks []SubTaskScope
+	// NoOpEscalation marks this invocation as a NO-OP escalation attempt: the
+	// previous attempt answered NO_CHANGES_REQUIRED while structural analysis
+	// indicated work remains. The bounded-patch context window is WIDENED
+	// (broader boundary window) so the re-hydrated attempt sees materially
+	// more of the assigned slice before judging again.
+	NoOpEscalation bool
+	// FocusStartLine / FocusEndLine optionally pin the deterministic
+	// bounded-patch context window to one sub-task's assigned inclusive
+	// 1-indexed line interval (decomposition DAG execution). When both are
+	// positive and start <= end, the copyable source shown to — and anchored
+	// by — the model is derived from exactly that region instead of rotating
+	// across the whole file: a unit can neither see nor patch another unit's
+	// content, which removes the local-context blindness behind false
+	// NO_CHANGES_REQUIRED claims. Zero values keep the pre-existing whole-file
+	// window rotation.
+	FocusStartLine int
+	FocusEndLine   int
 	// StreamCallback is an optional callback for incremental streaming progress.
 	// When set, the executor invokes it during provider streaming for each
 	// content delta, first token, and completion. This enables the UI to
@@ -325,6 +343,11 @@ type ExecutionResult struct {
 	// derive terminal execution truth. It is nil while the execution is still
 	// held at the approval gate (not yet terminated).
 	Evidence *ExecutionEvidence
+	// IngestionTrace is the forensic transport-normalization record of the raw
+	// LLM response that produced this execution's artifact. It preserves the
+	// exact unmutated model output and every transport transformation, and is
+	// attached to the sealed ExecutionEvidence for post-mortem traceability.
+	IngestionTrace *ingestion.IngestionTrace
 	// Completed is the authoritative terminal usage account computed by the
 	// runtime from the provider-reported usage. The renderer reads it for the
 	// footer / EXPANDED token numbers and never re-derives them.
@@ -368,6 +391,11 @@ type pendingMutation struct {
 	// pipeline writes anything; a mismatch aborts with ABORTED_OCC and zero
 	// partial writes.
 	baseline *WorkspaceBaseline
+	// ingestionTrace is the forensic transport-normalization record of the raw
+	// LLM response that produced the held artifact. It is carried through the
+	// approval gate so the terminal (committed or rejected) evidence can attach
+	// it for post-mortem traceability.
+	ingestionTrace *ingestion.IngestionTrace
 }
 
 // RuntimeExecutor is the runtime-owned execution boundary.
@@ -500,11 +528,39 @@ var ErrArtifactRejected = errors.New("executor: mutation artifact rejected")
 var ErrArtifactRetryableRejected = errors.New("executor: mutation artifact rejected with retry directive")
 
 // ErrNoOpMutation signals a bounded-patch invocation whose model answered with
-// the NO_CHANGES_REQUIRED sentinel: the assigned slice needs no edit. It is a
-// SUCCESS, not an artifact rejection — the execution converges to
-// OutcomeNoOpSuccess without staging a patch, running an apply or tripping
-// Boundary 3.
+// the NO_CHANGES_REQUIRED sentinel: a raw no-op CLAIM was detected. Detection
+// alone decides nothing terminal — the wrapped NoOpClaimError carries the
+// deterministic semantic classification (see ClassifyNoOpClaim) that maps the
+// claim onto one of the three NO-OP sub-state outcomes.
 var ErrNoOpMutation = errors.New("executor: model reported NO_CHANGES_REQUIRED")
+
+// ErrNoOpObjectiveUnresolved is the deterministic error carried by an
+// execution whose model claimed NO_CHANGES_REQUIRED while structural analysis
+// contradicted the claim: the objective's signature is still present in the
+// assigned slice. The outcome is OutcomeNoOpObjectiveUnresolved — never a
+// success; the autonomy runtime owns escalation from here.
+var ErrNoOpObjectiveUnresolved = errors.New("executor: no-op claim conflicts with structural evidence")
+
+// NoOpClaimError is the typed carrier of a raw model no-op claim plus its
+// deterministic classification. It unwraps to ErrNoOpMutation so existing
+// detection keeps working, and its Assessment field selects the terminal
+// sub-state at the convergence site.
+type NoOpClaimError struct {
+	// Claim is the RAW model claim (sentinel + bounded prose), propagated
+	// verbatim from the response without any terminal interpretation.
+	Claim NoOpRawClaim
+	// Assessment is the deterministic structural classification.
+	Assessment NoOpAssessment
+	// Target is the mutation target the claim was about.
+	Target string
+}
+
+func (e *NoOpClaimError) Error() string {
+	return fmt.Sprintf("%v: %s: %s", ErrNoOpMutation, e.Target, e.Assessment.Verdict)
+}
+
+// Unwrap preserves errors.Is(err, ErrNoOpMutation) for detection sites.
+func (e *NoOpClaimError) Unwrap() error { return ErrNoOpMutation }
 
 var ErrOutputTruncated = errors.New("executor: model output truncated")
 
@@ -787,7 +843,10 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// model.invoked, NO provider.response and NO artifact.produced — a failed
 	// execution must never emit a misleading success artifact.
 	if profile.Strategy != strategy.TargetedMutation {
-		content, inv, err := x.invokeReadOnly(ctx, req, requestID, profile, targets, g)
+		content, inv, ingTrace, err := x.invokeReadOnly(ctx, req, requestID, profile, targets, g)
+		if ingTrace != nil {
+			res.IngestionTrace = ingTrace
+		}
 		if err != nil {
 			// A user cancellation is a clean terminal outcome, never a
 			// failure: the workspace is untouched and no rollback runs.
@@ -878,7 +937,10 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	}
 
 	// ── 7. Targeted mutation: per-target model invocation ──────────────
-	patches, invs, diffs, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
+	patches, invs, diffs, ingTrace, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
+	if ingTrace != nil {
+		res.IngestionTrace = ingTrace
+	}
 	if err != nil {
 		// Retain the invocation evidence on EVERY error return: the provider
 		// billed these tokens whether the run was cancelled, the artifact was
@@ -889,23 +951,75 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		res.ModelCalls = append(res.ModelCalls, invs...)
 		res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, invs...)
 		if errors.Is(err, ErrNoOpMutation) {
-			// ── NO_OP_SUCCESS ───────────────────────────────────────────
-			// The model explicitly reported NO_CHANGES_REQUIRED for its slice:
-			// a successful contract answer. No patch is staged (no approval
-			// surface opens), no apply runs, and Boundary 3 is never tripped.
-			// The billed invocations still travel on the result so usage stays
-			// authoritative.
-			g.Skip(runtimegraph.StageApprovalGate, "no-op success")
-			g.Skip(runtimegraph.StageMutationTransaction, "no-op success")
-			g.Skip(runtimegraph.StageVerification, "no-op success")
-			g.CompleteExecution(string(OutcomeNoOpSuccess))
-			res.ArtifactKind = ""
-			res.Content = ""
-			res.Err = nil
-			res.Proof.Outcome = OutcomeNoOpSuccess
-			res.Proof.FinishedAt = time.Now()
-			setProofGraph(res, g)
-			return x.finalizeResult(res), nil
+			// ── NO-OP SEMANTIC CONVERGENCE ─────────────────────────────
+			// The model emitted the NO_CHANGES_REQUIRED sentinel. The raw
+			// claim was classified deterministically at detection time; each
+			// verdict converges to a DIFFERENT terminal truth:
+			//
+			//   SATISFIED   → successful no-op unit (historical behavior,
+			//                 now backed by structural analysis).
+			//   NO_SAFE_…   → terminal warning: candidate edits below the
+			//                 safety threshold seal as REQUIRES_REVIEW.
+			//   UNRESOLVED  → escalation trigger: the claim contradicts
+			//                 observable structure — a recoverable failure
+			//                 the autonomy runtime must intercept, never a
+			//                 completed DAG.
+			var claimErr *NoOpClaimError
+			if !errors.As(err, &claimErr) {
+				// Defensive: an ErrNoOpMutation without its typed carrier is
+				// treated as unclassified and held for review.
+				claimErr = &NoOpClaimError{
+					Assessment: NoOpAssessment{
+						Verdict: NoOpNoSafeMutation,
+						Reason:  "no-op claim arrived without a structural assessment",
+					},
+				}
+			}
+			g.Skip(runtimegraph.StageApprovalGate, "no-op convergence")
+			g.Skip(runtimegraph.StageMutationTransaction, "no-op convergence")
+			switch claimErr.Assessment.Verdict {
+			case NoOpObjectiveUnresolved:
+				unresolvedErr := fmt.Errorf("%w: %s: %s",
+					ErrNoOpObjectiveUnresolved, claimErr.Target, claimErr.Assessment.Reason)
+				g.FailExecution(events.FailureRecoverable, unresolvedErr, "executor.noop_semantics")
+				res.ArtifactKind = ""
+				res.Content = ""
+				res.Err = unresolvedErr
+				res.Diagnostics = append(res.Diagnostics, diagnosticSignal(
+					SignalNoOpObjectiveUnresolved, claimErr.Target,
+					claimErr.Assessment.Reason,
+					"re-examine the assigned window with elevated context or escalate to review", false,
+				))
+				res.Proof.Outcome = VerdictToOutcome(claimErr.Assessment.Verdict)
+				res.Proof.FinishedAt = time.Now()
+				setProofGraph(res, g)
+				return x.finalizeResult(res), unresolvedErr
+			case NoOpNoSafeMutation:
+				g.Skip(runtimegraph.StageVerification, "requires review")
+				g.CompleteExecution(string(OutcomeNoOpNoSafeMutation))
+				res.ArtifactKind = ""
+				res.Content = ""
+				res.Err = nil
+				res.Diagnostics = append(res.Diagnostics, diagnosticSignal(
+					SignalNoOpRequiresReview, claimErr.Target,
+					claimErr.Assessment.Reason,
+					"human review required before any further mutation", false,
+				))
+				res.Proof.Outcome = OutcomeNoOpNoSafeMutation
+				res.Proof.FinishedAt = time.Now()
+				setProofGraph(res, g)
+				return x.finalizeResult(res), nil
+			default: // NoOpObjectiveSatisfied
+				g.Skip(runtimegraph.StageVerification, "no-op objective satisfied")
+				g.CompleteExecution(string(OutcomeNoOpObjectiveSatisfied))
+				res.ArtifactKind = ""
+				res.Content = ""
+				res.Err = nil
+				res.Proof.Outcome = OutcomeNoOpObjectiveSatisfied
+				res.Proof.FinishedAt = time.Now()
+				setProofGraph(res, g)
+				return x.finalizeResult(res), nil
+			}
 		}
 		if errors.Is(err, context.Canceled) {
 			// A user cancellation is a clean terminal outcome: no artifact was
@@ -917,6 +1031,30 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			res.Proof.FinishedAt = time.Now()
 			setProofGraph(res, g)
 			return x.finalizeResult(res), nil
+		}
+		if errors.Is(err, ingestion.ErrSyntaxInvalid) {
+			// TRANSPORT NORMALIZATION (L1 pre-gate): the normalized payload
+			// failed basic envelope integrity (an unterminated code fence or an
+			// unclosed structural tag). No silent semantic repair is attempted
+			// — the generation is rejected to the contract retry loop with
+			// explicit syntax/parse feedback so a successor attempt changes the
+			// contract materially. The IngestionTrace (Classification =
+			// ClassSyntaxInvalid) preserves the exact unmutated output for
+			// post-mortem forensics.
+			g.FailExecution(events.FailureRecoverable, err, "executor.ingestion")
+			res.ArtifactKind = ""
+			res.Content = "" // Recovery Isolation (I2): rejected bytes never travel
+			res.Err = fmt.Errorf("%w: %w", ErrArtifactRetryableRejected, err)
+			res.Diagnostics = append(res.Diagnostics, diagnosticSignal(
+				SignalSchemaViolation, firstTarget(targets),
+				"transport normalization produced a syntactically invalid payload (unterminated fence or unclosed structural tag)",
+				"regenerate a complete, well-formed artifact; do not rely on silent repair",
+				true,
+			))
+			res.Proof.Outcome = OutcomeArtifactRetryableRejected
+			res.Proof.FinishedAt = time.Now()
+			setProofGraph(res, g)
+			return x.finalizeResult(res), res.Err
 		}
 		if errors.Is(err, ErrArtifactRejected) {
 			// The model produced an artifact that FAILED the artifact
@@ -1015,6 +1153,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		contract:       contract,
 		attempt:        attempt,
 		baseline:       occBaseline,
+		ingestionTrace: res.IngestionTrace,
 	}
 	x.mu.Lock()
 	x.pending[patches[0].ID] = pm
@@ -1063,6 +1202,10 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 			ModelInvocations: pm.modelCalls,
 			StartedAt:        pm.startedAt,
 		},
+		// Forensic continuity: the transport-normalization record of the raw
+		// LLM response travels with the held artifact through the approval gate
+		// to the terminal (committed) evidence.
+		IngestionTrace: pm.ingestionTrace,
 	}
 	g := pm.g
 	if g == nil {
@@ -1443,22 +1586,27 @@ func effectiveMaxOutput(req int, profile *strategy.ExecutionStrategyProfile) int
 // the error and emits neither response nor artifact. The returned patches carry
 // the full resolved content of each target; the diffs are the authoritative
 // unified diffs for rendering.
-func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) ([]*Patch, []ModelInvocation, []string, error) {
+func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) ([]*Patch, []ModelInvocation, []string, *ingestion.IngestionTrace, error) {
 	if len(targets) == 0 {
-		return nil, nil, nil, fmt.Errorf("executor: no mutation target resolved")
+		return nil, nil, nil, nil, fmt.Errorf("executor: no mutation target resolved")
 	}
 	if x.provider == nil {
-		return nil, nil, nil, fmt.Errorf("executor: no provider configured for model invocation")
+		return nil, nil, nil, nil, fmt.Errorf("executor: no provider configured for model invocation")
 	}
 
 	model, modelErr := x.resolveModel()
 	if modelErr != nil {
-		return nil, nil, nil, modelErr
+		return nil, nil, nil, nil, modelErr
 	}
 
 	patches := make([]*Patch, 0, len(targets))
 	invs := make([]ModelInvocation, 0, len(targets))
 	diffs := make([]string, 0, len(targets))
+	// trace carries the forensic transport-normalization record of the most
+	// recent model invocation (nil until the first stream returns). It is
+	// returned so the executor can attach it to the active ExecutionEvidence
+	// even when the artifact is later rejected.
+	var trace *ingestion.IngestionTrace
 	// The artifact contract decides the OUTPUT representation the model must
 	// produce AND, for bounded_patch recovery, the INPUT contract too. A
 	// search_replace contract is a different mutation protocol, not a label:
@@ -1479,7 +1627,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		path := filepath.Join(x.root, target)
 		data, readErr := os.ReadFile(path)
 		if readErr != nil && !os.IsNotExist(readErr) {
-			return nil, nil, nil, fmt.Errorf("executor: read target %s: %w", target, readErr)
+			return nil, nil, nil, nil, fmt.Errorf("executor: read target %s: %w", target, readErr)
 		}
 		original := string(data)
 		// Runtime context activity evidence: the target content actually read
@@ -1490,6 +1638,11 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		outputContract := "full_file_or_patch"
 		user := buildMutationUserPrompt(req.Prompt, target, original, req.Evidence)
 		contextBytes := len(original)
+		// judgedContent is exactly the context the model was asked to judge.
+		// Under the bounded patch contract that is the small line-aligned
+		// window — the no-op semantics classifier evaluates the claim against
+		// the same bytes, never against the unseen remainder of the file.
+		judgedContent := original
 		if patchOnly {
 			system = boundedPatchSystemPrompt()
 			outputContract = "search_replace"
@@ -1498,9 +1651,37 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// is shown as the copyable source; rotating it by attempt gives
 			// every repair cycle materially different content while keeping
 			// the worst-case response far below the output ceiling.
-			window := selectBoundedPatchWindow(original, attempt)
+			//
+			// REGION FOCUS: under a staged decomposition plan the rotation is
+			// pinned INSIDE the sub-task's assigned interval (req.Focus*), so a
+			// unit can neither see nor anchor on another unit's content. A NO-OP
+			// escalation attempt receives a BROADER boundary window around that
+			// same region: a claim that conflicted with structural evidence
+			// re-judges against materially more of its assigned slice.
+			windowBound := maxBoundedPatchContextBytes
+			focusStart, focusEnd := req.FocusStartLine, req.FocusEndLine
+			if req.NoOpEscalation {
+				windowBound = maxEscalatedPatchContextBytes
+				margin := (focusEnd - focusStart + 1) / 2
+				if margin < maxNoOpEscalationFocusMargin {
+					margin = maxNoOpEscalationFocusMargin
+				}
+				focusStart, focusEnd = focusStart-margin, focusEnd+margin
+			}
+			focusSource, focusOffset := focusSlice(original, focusStart, focusEnd)
+			if focusSource == "" {
+				focusSource, focusOffset = original, 0 // degenerate focus: whole-file rotation
+			}
+			window := selectBoundedPatchWindowScaled(focusSource, attempt, windowBound)
+			window.startLine += focusOffset
+			window.endLine += focusOffset
+			window.totalLines = strings.Count(original, "\n")
+			if !strings.HasSuffix(original, "\n") {
+				window.totalLines++
+			}
 			user = buildBoundedPatchUserPrompt(req.Prompt, req.Evidence, target, window)
 			contextBytes = len(window.content)
+			judgedContent = window.content
 		}
 		maxOut := effectiveMaxOutput(req.MaxOutputTokens, &profile)
 		disableReasoning := false
@@ -1535,7 +1716,8 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// model.invoked is emitted when the invocation BEGINS — before the
 		// provider call — so the event stream truthfully records the start.
 		g.BeginModel(model)
-		raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
+		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
+		trace = itrace
 		// The invocation evidence is built from the stream outcome REGARDLESS
 		// of the artifact result: the provider billed these tokens whether the
 		// stream succeeded, was cancelled mid-flight, or produced a malformed
@@ -1559,7 +1741,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		if callErr != nil {
 			// The invocation evidence (real billing when usage arrived)
 			// survives even a hard transport failure.
-			return nil, append(invs, inv), nil, fmt.Errorf("executor: model invocation: %w", callErr)
+			return nil, append(invs, inv), nil, trace, fmt.Errorf("executor: model invocation: %w", callErr)
 		}
 		// provider.response is emitted ONLY on a successful response — the
 		// authoritative usage travels here. No artifact may precede it.
@@ -1574,19 +1756,29 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// no recovery loop starts inside the executor. Only a COMPLETE stream
 		// may proceed to Boundary 4.
 		if gate := gateFor(target, inv.FinishReason); gate != nil {
-			return nil, invs, nil, gate
+			return nil, invs, nil, trace, gate
 		}
 
 		var modified string
 		if patchOnly {
 			// NO-OP SENTINEL (pre-validation): a model that answers
-			// NO_CHANGES_REQUIRED has satisfied the contract — its slice needs
-			// no edit. Converge to a successful no-op BEFORE the strict gate:
-			// burning the retry budget on prose-free compliant output is never
-			// the right outcome.
-			if IsNoOpBoundedPatchResponse(raw) {
-				log.Printf("[execution] request=%s target=%s artifact=no_op (%s)", requestID, target, NoOpSentinel)
-				return nil, invs, nil, fmt.Errorf("%w: %s", ErrNoOpMutation, target)
+			// NO_CHANGES_REQUIRED has satisfied the OUTPUT CONTRACT of the
+			// bounded patch — but the claim itself is NOT yet a verdict. The
+			// raw claim is propagated verbatim and classified by deterministic
+			// structural analysis against the exact window the model judged;
+			// the terminal sub-state (satisfied / requires review /
+			// unresolved) is selected at the convergence site. Burning the
+			// retry budget on prose-free compliant output is never the right
+			// outcome.
+			if claim, claimed := ExtractNoOpClaim(raw); claimed {
+				assessment := ClassifyNoOpClaim(req.Prompt, judgedContent)
+				log.Printf("[execution] request=%s target=%s artifact=no_op (%s) verdict=%s reason=%q",
+					requestID, target, claim.Sentinel, assessment.Verdict, assessment.Reason)
+				return nil, invs, nil, trace, &NoOpClaimError{
+					Claim:      claim,
+					Assessment: assessment,
+					Target:     target,
+				}
 			}
 			// Bounded-patch artifact boundary: extract ONLY structured patch
 			// representations. A full-file (or otherwise unstructured)
@@ -1595,7 +1787,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// full-artifact attempt instead of a relabeled retry.
 			patched, ok := ExtractBoundedPatch(original, raw)
 			if !ok {
-				return nil, invs, nil, fmt.Errorf("%w: %s: bounded patch contract requires SEARCH/REPLACE blocks or unified diff hunks; full-file or unstructured output rejected", ErrArtifactRetryableRejected, target)
+				return nil, invs, nil, trace, fmt.Errorf("%w: %s: bounded patch contract requires SEARCH/REPLACE blocks or unified diff hunks; full-file or unstructured output rejected", ErrArtifactRetryableRejected, target)
 			}
 			modified = patched
 		} else {
@@ -1611,7 +1803,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// never a proposal staged for approval. The model produced no
 			// usable mutation artifact — abort before any approval surface.
 			// The billed invocation is still returned so usage is preserved.
-			return nil, invs, nil, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
+			return nil, invs, nil, trace, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
 		}
 		// ── ARTIFACT BOUNDARY (Phase 2) ─────────────────────────────
 		// A model response is NOT an artifact until it passes the artifact
@@ -1626,7 +1818,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// The artifact was rejected, but the invocation evidence (and the
 			// real provider billing it carries) must survive: the token count
 			// is provider truth, not a function of artifact validity.
-			return nil, invs, nil, gateErr
+			return nil, invs, nil, trace, gateErr
 		}
 		modified = normalized
 		patches = append(patches, &Patch{
@@ -1637,7 +1829,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		})
 		diffs = append(diffs, x.compileDiff(raw, target, original))
 	}
-	return patches, invs, diffs, nil
+	return patches, invs, diffs, trace, nil
 }
 
 // artifactDiagnostic builds the Boundary-4 advisory signal for a rejected
@@ -1699,9 +1891,9 @@ func (x *RuntimeExecutor) compileDiff(raw, target, original string) string {
 // successful response; a failure returns an error and emits neither — the
 // artifact can never precede the response that produced it. The response is
 // owned by the runtime and never reaches the UI raw.
-func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) (content string, inv ModelInvocation, err error) {
+func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) (content string, inv ModelInvocation, trace *ingestion.IngestionTrace, err error) {
 	if x.provider == nil {
-		return "", inv, fmt.Errorf("executor: no provider configured for read-only invocation")
+		return "", inv, nil, fmt.Errorf("executor: no provider configured for read-only invocation")
 	}
 
 	var b strings.Builder
@@ -1730,7 +1922,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 
 	model, modelErr := x.resolveModel()
 	if modelErr != nil {
-		return "", inv, modelErr
+		return "", inv, nil, modelErr
 	}
 	aiReq := ai.Request{
 		Model:     model,
@@ -1741,9 +1933,9 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	// model.invoked is emitted when the invocation BEGINS — before the provider
 	// call — so the event stream truthfully records the invocation start.
 	g.BeginModel(model)
-	raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
+	raw, usage, trace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
 	if callErr != nil {
-		return "", inv, fmt.Errorf("executor: read-only invocation: %w", callErr)
+		return "", inv, trace, fmt.Errorf("executor: read-only invocation: %w", callErr)
 	}
 	inv.Model = model
 	if usage.Known {
@@ -1757,7 +1949,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	// provider.response is emitted ONLY on a successful response — the
 	// authoritative usage travels here. No artifact may precede it.
 	g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
-	return raw, inv, nil
+	return raw, inv, trace, nil
 }
 
 // invokeStream executes one bounded provider invocation through a live
@@ -1772,7 +1964,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 // reasoning.telemetry event on completion. The accumulated visible content and
 // the authoritative provider usage are returned; the authoritative artifact
 // always travels on the ExecutionResult afterwards.
-func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback) (string, ai.ProviderUsage, error) {
+func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback) (string, ai.ProviderUsage, *ingestion.IngestionTrace, error) {
 	var reasoningStartedAt time.Time
 	var reasoningDuration time.Duration
 	var reasoningSeen bool
@@ -1814,14 +2006,14 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			if streamCb != nil {
 				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
 			}
-			return "", ai.ProviderUsage{}, cerr
+			return "", ai.ProviderUsage{}, nil, cerr
 		}
 		if resp == nil {
 			err := fmt.Errorf("executor: provider returned an empty response")
 			if streamCb != nil {
 				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: err})
 			}
-			return "", ai.ProviderUsage{}, err
+			return "", ai.ProviderUsage{}, nil, err
 		}
 		usage := resp.Usage
 		if !usage.Known && (resp.TokenInput > 0 || resp.TokenOutput > 0) {
@@ -1840,7 +2032,29 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			}
 			streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: usage.FinishReason, Usage: usage})
 		}
-		return ai.VisibleCompletion(resp.Content), usage, nil
+		// Transport normalization: preserve the raw response and record every
+		// transformation in an IngestionTrace before the payload reaches the
+		// L1 Execution Gate / artifact parser.
+		trace, procErr := ingestion.Process(resp.Content)
+		visible := ai.VisibleCompletion(trace.NormalizedPayload)
+		if procErr != nil {
+			if errors.Is(procErr, ingestion.ErrSyntaxInvalid) && trace != nil && trace.RepairCandidate != nil {
+				candidate := trace.RepairCandidate
+				if ingestion.IsASTValid(candidate.ProposedPayload) && ingestion.WithinSafetyThreshold(trace.NormalizedPayload, candidate) {
+					ingestion.RecordRepairAccepted()
+					log.Printf("[ingestion] repair candidate accepted rule=%s", candidate.RuleID)
+					if globalActivityLog != nil {
+						globalActivityLog("[ingestion] repair candidate accepted rule=%s", candidate.RuleID)
+					}
+					trace.NormalizedPayload = candidate.ProposedPayload
+					trace.Classification = ingestion.ClassTransportNormalized
+					visible = ai.VisibleCompletion(trace.NormalizedPayload)
+					return visible, usage, trace, nil
+				}
+			}
+			return visible, usage, trace, procErr
+		}
+		return visible, usage, trace, nil
 	}
 	defer func() { _ = rawStream.Close() }()
 
@@ -1922,7 +2136,7 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			if streamCb != nil {
 				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
 			}
-			return content.String(), lastUsage, cerr
+			return content.String(), lastUsage, nil, cerr
 		}
 		n, rerr := rawStream.Read(buf)
 		if n > 0 {
@@ -1943,12 +2157,12 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 				if streamCb != nil {
 					streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
 				}
-				return content.String(), lastUsage, cerr
+				return content.String(), lastUsage, nil, cerr
 			}
 			if streamCb != nil {
 				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: rerr})
 			}
-			return content.String(), lastUsage, rerr
+			return content.String(), lastUsage, nil, rerr
 		}
 	}
 
@@ -1962,14 +2176,40 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	if reasoningSeen && (reasoningDuration > 0 || usage.ReasoningTokens > 0) {
 		g.ReasoningTelemetry(model, reasoningDuration, usage.ReasoningTokens)
 	}
-	visible := ai.VisibleCompletion(content.String())
+	// Transport normalization: preserve the exact raw stream output and record
+	// every transformation in an IngestionTrace before the payload reaches the
+	// L1 Execution Gate / artifact parser.
+	rawVisible := content.String()
+	trace, procErr := ingestion.Process(rawVisible)
+	visible := ai.VisibleCompletion(trace.NormalizedPayload)
 	if strings.TrimSpace(visible) == "" && reasoningBuf.Len() > 0 {
-		visible = ai.VisibleCompletion(reasoningBuf.String())
+		// The entire visible completion was reasoning: ingest the reasoning
+		// text as the raw artifact so forensic traceability survives.
+		reasoningRaw := reasoningBuf.String()
+		trace, procErr = ingestion.Process(reasoningRaw)
+		visible = ai.VisibleCompletion(trace.NormalizedPayload)
 	}
 	if streamCb != nil {
 		streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: usage.FinishReason, Usage: usage})
 	}
-	return visible, usage, nil
+	if procErr != nil {
+		if errors.Is(procErr, ingestion.ErrSyntaxInvalid) && trace != nil && trace.RepairCandidate != nil {
+			candidate := trace.RepairCandidate
+			if ingestion.IsASTValid(candidate.ProposedPayload) && ingestion.WithinSafetyThreshold(trace.NormalizedPayload, candidate) {
+				ingestion.RecordRepairAccepted()
+				log.Printf("[ingestion] repair candidate accepted rule=%s", candidate.RuleID)
+				if globalActivityLog != nil {
+					globalActivityLog("[ingestion] repair candidate accepted rule=%s", candidate.RuleID)
+				}
+				trace.NormalizedPayload = candidate.ProposedPayload
+				trace.Classification = ingestion.ClassTransportNormalized
+				visible = ai.VisibleCompletion(trace.NormalizedPayload)
+				return visible, usage, trace, nil
+			}
+		}
+		return visible, usage, trace, procErr
+	}
+	return visible, usage, trace, nil
 }
 
 // emitContextActivity surfaces a real runtime file read as engine evidence
@@ -2136,6 +2376,11 @@ func (x *RuntimeExecutor) sealTerminalEvidence(res *ExecutionResult) {
 		x.contracts.Contract(ContractID(p.ContractID)),
 		p.ContextDigest, outcome, summary, p.StartedAt, p.FinishedAt,
 	)
+	if res.IngestionTrace != nil {
+		// Forensic invariant: preserve the transport-normalization record on
+		// the immutable evidence for post-mortem debugging.
+		res.Evidence.ingestionTrace = res.IngestionTrace
+	}
 	x.emitEvidenceEvent(res, res.Evidence)
 }
 
@@ -2374,6 +2619,38 @@ Rules:
 // finish_reason=length by construction.
 const maxBoundedPatchContextBytes = 2048
 
+// maxEscalatedPatchContextBytes is the BROADER boundary window granted to a
+// NO-OP escalation attempt: a claim that conflicted with structural evidence
+// re-judges against materially more of the assigned slice before the runtime
+// accepts any human escalation. The ceiling stays bounded — escalation widens
+// scrutiny, never the response budget.
+const maxEscalatedPatchContextBytes = maxBoundedPatchContextBytes * 4
+
+// maxNoOpEscalationFocusMargin is the minimum line margin a region-focused
+// NO-OP escalation widens its assigned interval by on each side, so even a
+// single-line sub-task re-judges against real surrounding structure.
+const maxNoOpEscalationFocusMargin = 10
+
+// focusSlice returns the [start,end] inclusive 1-indexed line window of
+// original plus the offset that must be added to relative chunk line numbers
+// to recover absolute document lines. Out-of-range bounds clamp to the file;
+// an empty result (no focus, empty file or inverted range after clamping)
+// signals the caller to fall back to whole-file rotation.
+func focusSlice(original string, start, end int) (string, int) {
+	if strings.TrimSpace(original) == "" || start < 1 || end < start {
+		return "", 0
+	}
+	lines := strings.Split(original, "\n")
+	total := len(lines)
+	if start > total {
+		return "", 0
+	}
+	if end > total {
+		end = total
+	}
+	return strings.Join(lines[start-1:end], "\n"), start - 1
+}
+
 // boundedPatchWindow is one deterministic line-aligned window of the target.
 type boundedPatchWindow struct {
 	content    string // exact bytes shown to the model (the only copyable source)
@@ -2389,6 +2666,13 @@ type boundedPatchWindow struct {
 // request's copyable source small; attempt 1 (the first patch attempt) anchors
 // at the head of the file.
 func selectBoundedPatchWindow(original string, attempt int) boundedPatchWindow {
+	return selectBoundedPatchWindowScaled(original, attempt, maxBoundedPatchContextBytes)
+}
+
+// selectBoundedPatchWindowScaled is the byte-bound-parameterized window
+// selector. NO-OP escalation attempts pass maxEscalatedPatchContextBytes so
+// the re-hydrated judgment sees a broader boundary window of the slice.
+func selectBoundedPatchWindowScaled(original string, attempt, maxContextBytes int) boundedPatchWindow {
 	lines := strings.Split(original, "\n")
 	total := len(lines)
 	if total == 0 || strings.TrimSpace(original) == "" {
@@ -2400,7 +2684,7 @@ func selectBoundedPatchWindow(original string, attempt int) boundedPatchWindow {
 	size := 0
 	for i := 0; i < total; i++ {
 		lineSize := len(lines[i]) + 1
-		if size > 0 && size+lineSize > maxBoundedPatchContextBytes {
+		if size > 0 && size+lineSize > maxContextBytes {
 			chunks = append(chunks, boundedPatchWindow{
 				content:    strings.Join(lines[start:i], "\n"),
 				startLine:  start + 1,

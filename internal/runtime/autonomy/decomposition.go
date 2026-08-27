@@ -31,12 +31,15 @@ import (
 //     marked DAG_EXECUTION_FAILED. Remaining sub-tasks NEVER execute.
 
 // DecomposeFunc stages an ExecutionDAG for one infeasible objective. It is
-// injectable for policy tests; the default wraps planner.Decompose.
+// injectable for policy tests; the default wraps planner.DecomposeTarget
+// (Lea semantic unit splitting with syntactic fallback).
 type DecomposeFunc func(objective, target string, source []byte, baseDigest string, maxOutputTokens int) (*planner.ExecutionDAG, error)
 
-// defaultDecompose delegates to the canonical deterministic planner.
+// defaultDecompose delegates to the canonical deterministic planner: semantic
+// structural units first (HTML/JSX/Go templates), syntactic splitting only as
+// the low_semantic_confidence fallback.
 func defaultDecompose(objective, target string, source []byte, baseDigest string, maxOutputTokens int) (*planner.ExecutionDAG, error) {
-	return planner.Decompose(objective, target, source, baseDigest, maxOutputTokens)
+	return planner.DecomposeTarget(objective, target, source, baseDigest, maxOutputTokens)
 }
 
 // Proposal returns the parked DECOMPOSITION_PROPOSAL plan, or nil while no
@@ -146,12 +149,13 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 	// Reserve bounded headroom for exactly the consented scope: N approved
 	// sub-executions must not trip the single-objective defaults mid-plan.
 	// Each sub-task may consume up to maxSubTaskAttempts provider invocations
-	// (intra-DAG artifact-contract retries), so every floor reserves that
-	// worst case explicitly — a retried plan is still a bounded plan.
+	// (intra-DAG artifact-contract retries) PLUS maxNoOpEscalations NO-OP
+	// escalations, so every floor reserves that worst case explicitly — a
+	// retried or escalated plan is still a bounded plan.
 	totalEstimated := dag.TotalEstimatedTokens()
-	worstExecs := n * maxSubTaskAttempts
+	worstExecs := n * (maxSubTaskAttempts + maxNoOpEscalations)
 	d.loop.WidenBounds(worstExecs+1, worstExecs+1,
-		totalEstimated*maxSubTaskAttempts+worstExecs*256+1024, worstExecs+2)
+		totalEstimated*(maxSubTaskAttempts+maxNoOpEscalations)+worstExecs*256+1024, worstExecs+2)
 
 	// Atomicity snapshot: the exact bytes every plan target had BEFORE the
 	// first mutation. Rollback restores them verbatim.
@@ -194,6 +198,17 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 		}
 		d.obs = obs
 
+		// ── NO-OP ESCALATION INTERCEPT ─────────────────────────────────
+		// An unresolved no-op claim (contradicted by structural analysis even
+		// after re-hydration) or a below-threshold review hold NEVER marks
+		// the sub-task or DAG terminally completed. The decision returns to
+		// awaiting_human with the plan marked DAG_ESCALATED — a false DAG
+		// success is architecturally impossible from this path.
+		if obs.Outcome == autonomy.OutcomeNoOpObjectiveUnresolved ||
+			obs.Outcome == autonomy.OutcomeNoOpNoSafeMutation {
+			return d.escalateDAG(ctx, dag, st, i, attempts, obs)
+		}
+
 		// The proposal approval covers each held patch: resolve the gate.
 		if obs.Outcome == autonomy.OutcomePendingApproval {
 			approved, aerr := d.adapter.Approve(ctx, obs.PatchID)
@@ -228,6 +243,19 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 		expected = after
 		diagnosticf("[boundary2] sub-task %s applied outcome=%s progress=%d/%d digest=%s…",
 			st.ID, obs.Outcome, i+1, n, short(after))
+	}
+
+	// ── POST-DAG GLOBAL STRUCTURAL VERIFICATION ────────────────────────
+	// Every unit gate passed, yet per-unit isolation is blind to aggregate
+	// regressions (st-1 removes a CSS definition st-4 still uses). Before
+	// the DAG may claim completion, the WHOLE mutated document is audited
+	// against its pre-DAG baseline. A rejected audit overrides completion:
+	// OBJECTIVE_UNRESOLVED, decision returned to awaiting_human, applied
+	// units preserved. The loop is parked — return immediately with NO
+	// termination (a parked run terminates nothing), exactly like the
+	// NO-OP escalation path above.
+	if d.globalVerify != nil && d.verifyGlobalObjective(ctx, dag, originals) {
+		return d.term()
 	}
 
 	dag.Status = planner.DagExecutionCompleted
@@ -280,17 +308,74 @@ func (d *Driver) aggregateUsage(obs autonomy.Observation) {
 }
 
 // dagOutcomeSuccess reports whether a terminal sub-task observation counts as
-// an applied unit of the transaction. A NO_OP_SUCCESS unit (the model answered
-// NO_CHANGES_REQUIRED for its slice) also counts: the contract was satisfied
-// with no mutation required.
+// an applied unit of the transaction. A NO_OP_OBJECTIVE_SATISFIED unit (the
+// model answered NO_CHANGES_REQUIRED and structural analysis confirmed the
+// claim) also counts: the contract was satisfied with no mutation required.
+// The two other NO-OP sub-states NEVER count: no_safe_mutation requires human
+// review, objective_unresolved is the escalation trigger.
 func dagOutcomeSuccess(o autonomy.Observation) bool {
 	switch o.Outcome {
 	case autonomy.OutcomeChanged, autonomy.OutcomeCreated, autonomy.OutcomeNoChange,
-		autonomy.OutcomeCompleted, autonomy.OutcomeNoOpSuccess:
+		autonomy.OutcomeCompleted, autonomy.OutcomeNoOpObjectiveSatisfied:
 		return true
 	default:
 		return false
 	}
+}
+
+// escalateDAG implements the terminal NO-OP escalation path. A sub-task's
+// sentinel claim survived re-hydration (no_op_objective_unresolved) or fell
+// below the safety threshold (no_op_no_safe_mutation): the plan transitions to
+// DAG_ESCALATED and the loop parks at an awaiting_human inform boundary —
+// never a completed DAG, never a silent rollback of already-verified units.
+//
+// Atomicity note: unlike failDAG, applied units are deliberately PRESERVED.
+// Every landed unit passed its own Boundary-5 digest chain; escalation is not
+// a failure verdict, and discarding verified human-approved work would be a
+// second false outcome. The boundary reason names exactly what landed and
+// which unit escalated so the human decides with full evidence.
+func (d *Driver) escalateDAG(ctx context.Context, dag *planner.ExecutionDAG, st planner.SubTask,
+	completed, attempts int, obs autonomy.Observation) *autonomy.LoopTermination {
+	reason := fmt.Sprintf(
+		"sub-task %s (%d/%d) terminal outcome %s after %d attempt(s): the model's NO_CHANGES_REQUIRED claim could not be reconciled with structural evidence (%s)",
+		st.ID, completed+1, len(dag.SubTasks), obs.Outcome, attempts, boundedEvidenceLine(obs.Diagnostic))
+	if obs.Outcome == autonomy.OutcomeNoOpNoSafeMutation {
+		reason = fmt.Sprintf(
+			"sub-task %s (%d/%d) terminal outcome %s: candidate edits detected below the safety threshold — requires_review",
+			st.ID, completed+1, len(dag.SubTasks), obs.Outcome)
+	}
+	dag.Status = planner.DagEscalated
+	dag.FailureReason = reason
+	diagnosticf("[noop-semantics] DAG_ESCALATED target=%s applied=%d/%d sub_task=%s — decision returned to awaiting_human: %s",
+		dag.Target, completed, len(dag.SubTasks), st.ID, reason)
+	b := &autonomy.HumanBoundary{
+		Reason: "DAG_ESCALATED: " + reason +
+			fmt.Sprintf(" — %d/%d approved units are applied and preserved; the remaining plan is held for your decision",
+				completed, len(dag.SubTasks)),
+		Targets: dag.Targets(),
+	}
+	autonomy.DeriveBoundaryAction(b)
+	d.loop.AwaitHuman(*b)
+	d.enrichBoundary()
+	d.publish(ctx)
+	return d.term()
+}
+
+// boundedEvidenceLine extracts the first, bounded line of a diagnostic as
+// escalation evidence (bounded diagnostics travel; raw slices never do).
+func boundedEvidenceLine(diagnostic string) string {
+	line := strings.TrimSpace(diagnostic)
+	if idx := strings.IndexAny(line, "\r\n"); idx >= 0 {
+		line = strings.TrimSpace(line[:idx])
+	}
+	const maxEscalationEvidence = 200
+	if len(line) > maxEscalationEvidence {
+		line = line[:maxEscalationEvidence]
+	}
+	if line == "" {
+		return "no structural detail reported"
+	}
+	return line
 }
 
 // failDAG enforces the atomic invariant: roll the workspace back to the
@@ -313,15 +398,22 @@ func (d *Driver) failDAG(ctx context.Context, dag *planner.ExecutionDAG, origina
 
 // subTaskPrompt renders the bounded per-unit instruction. The recovery
 // strategy travels separately (bounded_patch); the prompt only scopes WHERE
-// the single anchored patch may land. SEARCH_REPLACE_BOUNDED_LINES units
-// additionally carry the STRICT patch contract: the exact block format the
-// Boundary-4 gate accepts is stated up front so a malformed generation can
-// never claim ambiguity about the artifact structure.
-func subTaskPrompt(objective string, dag *planner.ExecutionDAG, st planner.SubTask, pos, total int) string {
+// the single anchored patch may land. The compressed structural context
+// replaces any raw-source dump: document topology, parent/sibling relations,
+// active references and targeted Lea evidence — never the file bytes.
+// SEARCH_REPLACE_BOUNDED_LINES units additionally carry the STRICT patch
+// contract: the exact block format the Boundary-4 gate accepts is stated up
+// front so a malformed generation can never claim ambiguity about the
+// artifact structure.
+func subTaskPrompt(objective string, dag *planner.ExecutionDAG, st planner.SubTask, pos, total int, compressed *CompressedStructuralContext) string {
 	var b strings.Builder
 	b.WriteString(strings.TrimSpace(objective))
 	fmt.Fprintf(&b, "\n\n[DECOMPOSITION %s — sub-task %d/%d for %s]\n", st.ID, pos, total, dag.Target)
 	fmt.Fprintf(&b, "Change window: %s.\nScope: %s.\n", st.Region, st.Description)
+	if block := compressed.Render(); block != "" {
+		b.WriteByte('\n')
+		b.WriteString(block)
+	}
 	b.WriteString("Produce exactly ONE anchored SEARCH/REPLACE block whose SEARCH text is copied VERBATIM " +
 		"from within this change window of the current file content. Do not modify any other region.")
 	return injectPatchContract(b.String(), st.Kind)

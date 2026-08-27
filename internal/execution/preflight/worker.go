@@ -1,0 +1,344 @@
+package preflight
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/execution/cache"
+	"github.com/PizenLabs/izen/internal/execution/planner"
+	"github.com/PizenLabs/izen/internal/planner/scope"
+	"github.com/PizenLabs/izen/internal/telemetry"
+)
+
+// Worker is the BackgroundPreflight async worker. Upon PromptAdmitted it is
+// dispatched as a goroutine and performs — off the UI critical path — the
+// synchronous work that previously regressed prompt admission by ~5s:
+//
+//	a. Read target file(s) and compute SHA256(content).
+//	b. Trigger AST/DOM structural discovery (LeaStructuralScan).
+//	c. Run tokenizer and compute scope budget estimates.
+//	d. Construct StructuralSnapshot and publish to Observation State.
+//	e. Notify PreflightSyncBarrier via channel.
+//
+// All heavy work is bounded by the worker's context; a hung preflight aborts
+// the run at the barrier with PREFLIGHT_TIMEOUT (10s).
+//
+// Content-addressed caching: the cache key is strictly SHA256(file_content),
+// path-agnostic. On hit the worker bypasses LeaStructuralScan/Tokenizer and
+// populates the snapshot from the cache, emitting [cache] hit/sha activity.
+type Worker struct {
+	root      string
+	bus       *events.Bus
+	state     *ObservationState
+	barrier   *PreflightSyncBarrier
+	recorder  *telemetry.Recorder
+	topoCache *cache.TopologyCache
+	scopeEng  *scope.Engine
+	maxOutput int
+
+	mu   sync.Mutex
+	runs int
+}
+
+// Config holds the worker wiring.
+type Config struct {
+	Root      string
+	Bus       *events.Bus
+	State     *ObservationState
+	Barrier   *PreflightSyncBarrier
+	Recorder  *telemetry.Recorder
+	Cache     *cache.TopologyCache
+	CacheSize int // 0 => DefaultCapacity (128)
+	// ScopePolicy overrides the Elastic Scope Scoring Engine policy. A zero
+	// policy (all fields zero) falls back to scope.DefaultPolicy — thresholds
+	// are policy inputs, never fixed constants.
+	ScopePolicy scope.Policy
+	// MaxOutputTokens is the output ceiling the scope engine scores against.
+	// 0 => a conservative default; the real ceiling is supplied by wiring.
+	MaxOutputTokens int
+}
+
+// New creates a worker. A nil Config field degrades safely (no bus/state/
+// barrier emission), matching the headless/CLI invariant.
+func New(cfg Config) *Worker {
+	if cfg.Recorder == nil {
+		cfg.Recorder = telemetry.Default()
+	}
+	c := cfg.Cache
+	if c == nil {
+		sz := cfg.CacheSize
+		if sz <= 0 {
+			sz = cache.DefaultCapacity
+		}
+		c = cache.New(sz)
+	}
+	policy := cfg.ScopePolicy
+	if policy == (scope.Policy{}) {
+		policy = scope.DefaultPolicy()
+	}
+	scopeEng := scope.New(policy, scope.WithLogFn(func(format string, args ...interface{}) {
+		if cfg.Bus != nil {
+			cfg.Bus.Publish(events.NewActivity(fmt.Sprintf(format, args...)))
+		}
+	}))
+	return &Worker{
+		root:      cfg.Root,
+		bus:       cfg.Bus,
+		state:     cfg.State,
+		barrier:   cfg.Barrier,
+		recorder:  cfg.Recorder,
+		topoCache: c,
+		scopeEng:  scopeEng,
+		maxOutput: cfg.MaxOutputTokens,
+	}
+}
+
+// cfgMaxOutput returns the configured output ceiling, defaulting to a
+// conservative bound when none was supplied by wiring.
+func (w *Worker) cfgMaxOutput() int {
+	if w == nil || w.maxOutput <= 0 {
+		return 4096
+	}
+	return w.maxOutput
+}
+
+// Cache returns the topology cache (nil when disabled). Test seam.
+func (w *Worker) Cache() *cache.TopologyCache {
+	if w == nil {
+		return nil
+	}
+	return w.topoCache
+}
+
+// SetCache replaces the topology cache (test seam). A nil cache disables caching.
+func (w *Worker) SetCache(c *cache.TopologyCache) {
+	if w == nil {
+		return
+	}
+	w.topoCache = c
+}
+
+// Start dispatches the background preflight as an async goroutine upon
+// PromptAdmitted. It returns immediately (<10ms) and never performs file IO
+// on the caller goroutine.
+func (w *Worker) Start(ctx context.Context, prompt string, targets []string) {
+	w.mu.Lock()
+	w.runs++
+	w.mu.Unlock()
+	// Log spec sequence via bus activity (never stdout — TUI invariant).
+	if w.bus != nil {
+		w.bus.Publish(events.NewActivity(fmt.Sprintf("[preflight] bg worker started prompt=%q targets=%v", prompt, targets)))
+		w.bus.Publish(events.NewStageCompleted("preflight_start", 0, fmt.Sprintf("bg worker started for prompt %q", prompt)))
+	}
+	go w.run(ctx, prompt, targets)
+}
+
+// StartSync is the synchronous test seam: it runs the preflight on the caller
+// goroutine and returns the snapshot/error directly.
+func (w *Worker) StartSync(ctx context.Context, prompt string, targets []string) (*StructuralSnapshot, error) {
+	return w.execute(ctx, prompt, targets)
+}
+
+func (w *Worker) run(ctx context.Context, prompt string, targets []string) {
+	start := time.Now()
+	snap, err := w.execute(ctx, prompt, targets)
+	elapsed := time.Since(start)
+	telemetry.RecordPreflight(elapsed)
+	if w.recorder != nil {
+		w.recorder.RecordPreflight(elapsed)
+	}
+	if err != nil {
+		if w.bus != nil {
+			w.bus.Publish(events.NewActivity(fmt.Sprintf("[preflight] failed prompt=%q err=%v", prompt, err)))
+			// Publish failure to the bus so the state machine can route to awaiting_human / error.
+			w.bus.Publish(events.NewPreflightFailed(firstTarget(targets), "preflight failed", err))
+		}
+		if w.barrier != nil {
+			w.barrier.Notify(snap, err)
+		}
+		return
+	}
+	if w.state != nil {
+		w.state.Publish(snap)
+	}
+	if w.bus != nil {
+		w.bus.Publish(events.NewActivity(fmt.Sprintf("[preflight] snapshot ready target=%q sha=%s tokens=%d", snap.Target, short(snap.SHA256), snap.EstimatedTokens)))
+		w.bus.Publish(events.NewStructuralSnapshot(snap.Target, snap.SHA256, snap.EstimatedTokens, snap.TotalLines, scanFindings(snap.Scan)))
+		w.bus.Publish(events.NewStageCompleted("preflight_complete", elapsed, fmt.Sprintf("snapshot ready for %s", snap.Target)))
+	}
+	if w.barrier != nil {
+		w.barrier.Notify(snap, nil)
+	}
+}
+
+func (w *Worker) execute(ctx context.Context, _ string, targets []string) (*StructuralSnapshot, error) {
+	// For the spec we handle the first/primary target. Multi-file aggregation
+	// can be added by iterating targets and merging snapshots.
+	target := firstTarget(targets)
+	if target == "" {
+		// No target to scan — publish an empty snapshot (prompt still admitted).
+		return &StructuralSnapshot{Target: target, ReadyAt: time.Now()}, nil
+	}
+	// a. Read file and compute SHA256 (content-addressed — path-agnostic).
+	content, err := w.readTarget(ctx, target)
+	if err != nil {
+		return &StructuralSnapshot{Target: target, ReadyAt: time.Now(), Err: err}, err
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	sha := sha256Hex(content)
+
+	// b. Content-addressed cache lookup. Key MUST be strictly SHA256(content);
+	// file paths, workspace context, or turn IDs MUST NOT influence the key.
+	if w.topoCache != nil {
+		if cached, ok := w.topoCache.Get(sha); ok {
+			// Cache HIT: bypass LeaStructuralScan / Tokenizer, populate
+			// StructuralSnapshot immediately and notify barrier.
+			telemetry.RecordTopologyCacheHit(sha)
+			if w.recorder != nil {
+				w.recorder.RecordCacheHit()
+			}
+			if w.bus != nil {
+				w.bus.Publish(events.NewActivity(telemetry.FormatCacheHit(sha)))
+			}
+			snap := snapshotFromCache(target, cached)
+			return snap, nil
+		}
+		// Cache MISS: fall through to full scan and store.
+		telemetry.RecordTopologyCacheMiss(sha)
+		if w.recorder != nil {
+			w.recorder.RecordCacheMiss()
+		}
+		if w.bus != nil {
+			w.bus.Publish(events.NewActivity(telemetry.FormatCacheMiss(sha)))
+		}
+	}
+
+	// b. AST/DOM structural discovery (miss path only).
+	scan := planner.LeaStructuralScan(target, content)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	// c. Tokenizer + budget estimate.
+	tokens := planner.EstimateTokens(len(content))
+	budget := tokens * 2 // FullRewriteTokenMultiplier ≈2 is applied inside planner; keep conservative
+	if scan != nil {
+		// Prefer scan-derived token refinement if available.
+		tokens = planner.EstimateTokens(len(content))
+	}
+	// Respect max_output-derived budget via planner where possible.
+	totalLines := countLines(content)
+	if scan != nil {
+		totalLines = scan.TotalLines
+	}
+	maxOut := w.cfgMaxOutput()
+	snap := &StructuralSnapshot{
+		Target:          target,
+		SHA256:          sha,
+		Scan:            scan,
+		EstimatedTokens: tokens,
+		BudgetTokens:    budget,
+		TotalLines:      totalLines,
+		MaxOutputTokens: maxOut,
+		ReadyAt:         time.Now(),
+	}
+	// Elastic Scope Scoring: select SinglePass vs DAG from STRUCTURAL
+	// complexity (AST depth, symbol density, dependency fan-out) with file
+	// size only as the TokenToMaxOutputRatio input — never an architecture
+	// invariant. The verdict is published into Observation State for TUI
+	// transparency and never mutates DAG invariants.
+	decision := w.scopeEng.Evaluate(scope.ScopeInput{
+		Scan:            scan,
+		EstimatedTokens: tokens,
+		MaxOutputTokens: maxOut,
+		TotalLines:      totalLines,
+	})
+	snap.Scope = &decision
+	// d. Populate cache on miss.
+	if w.topoCache != nil {
+		cSnap := cache.BuildSnapshot(sha, target, scan, tokens, budget, totalLines, 2.0)
+		w.topoCache.Put(cSnap)
+	}
+	return snap, nil
+}
+
+// snapshotFromCache builds a preflight StructuralSnapshot from a cached topology
+// snapshot without re-running LeaStructuralScan or the tokenizer.
+func snapshotFromCache(target string, c *cache.StructuralSnapshot) *StructuralSnapshot {
+	if c == nil {
+		return &StructuralSnapshot{Target: target, ReadyAt: time.Now()}
+	}
+	return &StructuralSnapshot{
+		Target:          target,
+		SHA256:          c.SHA256,
+		Scan:            c.Scan,
+		EstimatedTokens: c.EstimatedTokens,
+		BudgetTokens:    c.BudgetTokens,
+		TotalLines:      c.TotalLines,
+		ReadyAt:         time.Now(),
+	}
+}
+
+func (w *Worker) readTarget(ctx context.Context, target string) ([]byte, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	var full string
+	if w.root != "" {
+		full = filepath.Join(w.root, filepath.FromSlash(target))
+	} else {
+		full = target
+	}
+	data, err := os.ReadFile(full)
+	if err != nil {
+		return nil, fmt.Errorf("preflight: read %s: %w", target, err)
+	}
+	return data, nil
+}
+
+func firstTarget(targets []string) string {
+	if len(targets) > 0 {
+		return targets[0]
+	}
+	return ""
+}
+
+func sha256Hex(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+func short(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
+}
+
+func scanFindings(scan *planner.LeaScanReport) int {
+	if scan == nil {
+		return 0
+	}
+	return len(scan.Findings)
+}
+
+func countLines(b []byte) int {
+	if len(b) == 0 {
+		return 0
+	}
+	n := 1
+	for _, c := range b {
+		if c == '\n' {
+			n++
+		}
+	}
+	return n
+}

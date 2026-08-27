@@ -8,6 +8,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -196,6 +197,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		shimmerAnim:         shimmer.New(""),
 		tipProvider:         tips.Default(),
 		currentEffort:       EffortAuto,
+		plannerMu:           &sync.Mutex{},
 	}
 	if initStage == initIdentity {
 		m.initIdentityInput = textinput.New()

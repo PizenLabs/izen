@@ -51,11 +51,27 @@ const (
 	// cancellation); the DAG aborted, the workspace rolled back to the base
 	// tree digest and NO further sub-task executed.
 	DagExecutionFailed PlanStatus = "DAG_EXECUTION_FAILED"
+	// DagEscalated: a sub-task's NO_CHANGES_REQUIRED claim could not be
+	// reconciled with structural evidence (no_op_objective_unresolved after
+	// re-hydration) or fell below the safety threshold
+	// (no_op_no_safe_mutation). The DAG is NOT terminally completed and NOT
+	// failed: already-applied units stay in place, remaining units never
+	// executed, and the decision returns to a human boundary.
+	DagEscalated PlanStatus = "DAG_ESCALATED"
+	// ObjectiveUnresolved: every sub-task applied, but the POST-DAG GLOBAL
+	// STRUCTURAL VERIFIER rejected the final document state against the
+	// overarching objective (orphaned references introduced by cross-subtask
+	// interaction, invalid syntax, an unfulfilled removal). Per-unit gates all
+	// passed — the regression only exists in the AGGREGATE — so this is not a
+	// unit failure. Applied units stay in place (they each passed Boundary 5)
+	// and the decision returns to awaiting_human with the audit evidence.
+	ObjectiveUnresolved PlanStatus = "OBJECTIVE_UNRESOLVED"
 )
 
 // Terminal reports whether the plan reached a terminal status.
 func (s PlanStatus) Terminal() bool {
-	return s == DagExecutionCompleted || s == DagExecutionFailed
+	return s == DagExecutionCompleted || s == DagExecutionFailed ||
+		s == DagEscalated || s == ObjectiveUnresolved
 }
 
 // SubTask is one executable unit of a decomposed objective. It is scoped to a
@@ -103,6 +119,13 @@ type ExecutionDAG struct {
 	Target string
 	// Kind is the splitting strategy selected for the target's format.
 	Kind SplitKind
+	// LowSemanticConfidence records WHY the plan fell back to syntactic
+	// partitioning: the target carries a Lea structural scanner
+	// (LeaScannable) but its read-only parse failed or yielded fewer than
+	// two trustworthy units (low_semantic_confidence=true). Syntactic line
+	// splitting is retained ONLY as this fallback. False whenever the plan
+	// was split semantically or the format has no Lea scanner at all.
+	LowSemanticConfidence bool
 	// BaseTreeDigest is the workspace SHA256(Σ path+hash) captured before any
 	// sub-task executes. Rollback restores exactly this state.
 	BaseTreeDigest string

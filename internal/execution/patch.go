@@ -1810,7 +1810,9 @@ func ResolveModifiedContent(original, rawLLMOutput string) string {
 
 // NoOpSentinel is the exact token the bounded-patch contract instructs a model
 // to emit when its assigned slice requires no edit. A response that sanitizes
-// down to this token is a successful NO-OP, never a contract violation.
+// down to this token carries a raw no-op CLAIM (never a contract violation);
+// what the claim semantically means is decided by ClassifyNoOpClaim, not by
+// detection alone.
 const NoOpSentinel = "NO_CHANGES_REQUIRED"
 
 // SanitizeBoundedPatchResponse is the artifact PRE-VALIDATION cleanup step for
@@ -1878,29 +1880,52 @@ func SanitizeBoundedPatchResponse(raw string) string {
 	return strings.TrimSpace(input)
 }
 
-// IsNoOpBoundedPatchResponse reports whether a raw LLM response is the NO-OP
-// sentinel of the bounded-patch contract. It requires the exact NoOpSentinel
-// token on at least one line (fences/quotes/punctuation tolerated) while every
-// other line stays plain conversational prose — a response carrying ANY code or
-// patch structure (SEARCH/REPLACE markers, unified-diff hunks, code punctuation)
-// is NEVER classified as a no-op, so a real artifact can never be swallowed here.
-func IsNoOpBoundedPatchResponse(raw string) bool {
+// maxNoOpClaimProse bounds the conversational prose carried alongside a raw
+// no-op claim so the propagated record stays bounded evidence, never a raw
+// response dump.
+const maxNoOpClaimProse = 200
+
+// NoOpRawClaim is the RAW model claim extracted from a bounded-patch
+// response: the exact sentinel token plus the bounded conversational prose
+// that surrounded it. It is deliberately UNCLASSIFIED — detection propagates
+// the claim upstream; deciding what the claim MEANS (objective satisfied /
+// no safe mutation / objective unresolved) belongs to the deterministic
+// structural classifier (ClassifyNoOpClaim), never to the sanitizer.
+type NoOpRawClaim struct {
+	// Sentinel is the canonical no-op token the model emitted.
+	Sentinel string
+	// Prose is the bounded non-sentinel remainder of the response
+	// (conversational filler). Empty for a bare sentinel answer.
+	Prose string
+}
+
+// ExtractNoOpClaim reports whether a raw LLM response carries the NO-OP
+// sentinel of the bounded-patch contract and returns the RAW claim without
+// forcing any terminal classification. The exact NoOpSentinel token must
+// appear on at least one line (fences/quotes/punctuation tolerated) while
+// every other line stays plain conversational prose — a response carrying ANY
+// code or patch structure (SEARCH/REPLACE markers, unified-diff hunks, code
+// punctuation) yields ok=false, so a real artifact can never be swallowed.
+func ExtractNoOpClaim(raw string) (NoOpRawClaim, bool) {
 	input := strings.TrimSpace(raw)
 	if input == "" {
-		return false
+		return NoOpRawClaim{}, false
 	}
 	if strings.Contains(input, "<<<<<<< SEARCH") || strings.Contains(input, "@@") {
-		return false
+		return NoOpRawClaim{}, false
 	}
 	input = SanitizeBoundedPatchResponse(input)
-	sawSentinel := false
+	var (
+		claim NoOpRawClaim
+		prose []string
+	)
 	for _, line := range strings.Split(input, "\n") {
 		token := strings.Trim(strings.TrimSpace(line), "`\"' .!*-")
 		if token == "" {
 			continue
 		}
 		if token == NoOpSentinel {
-			sawSentinel = true
+			claim.Sentinel = token
 			continue
 		}
 		// A non-sentinel line may only be conversational filler; anything
@@ -1908,10 +1933,28 @@ func IsNoOpBoundedPatchResponse(raw string) bool {
 		if strings.ContainsAny(token, "{}<>=;()[]") ||
 			strings.Contains(token, "<<<<") || strings.Contains(token, ">>>>") ||
 			strings.Contains(token, "=======") {
-			return false
+			return NoOpRawClaim{}, false
 		}
+		prose = append(prose, token)
 	}
-	return sawSentinel
+	if claim.Sentinel == "" {
+		return NoOpRawClaim{}, false
+	}
+	claim.Prose = strings.Join(prose, " ")
+	if len(claim.Prose) > maxNoOpClaimProse {
+		claim.Prose = claim.Prose[:maxNoOpClaimProse]
+	}
+	return claim, true
+}
+
+// IsNoOpBoundedPatchResponse reports whether a raw LLM response is the NO-OP
+// sentinel of the bounded-patch contract. It is the binary DETECTION predicate
+// over ExtractNoOpClaim — classification of WHAT the claim means is a separate,
+// downstream decision (see ClassifyNoOpClaim): detecting a claim never forces a
+// terminal outcome by itself.
+func IsNoOpBoundedPatchResponse(raw string) bool {
+	_, ok := ExtractNoOpClaim(raw)
+	return ok
 }
 
 // ExtractBoundedPatch extracts a bounded patch from raw LLM output using ONLY

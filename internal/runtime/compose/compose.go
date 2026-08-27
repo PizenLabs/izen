@@ -35,9 +35,11 @@ import (
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/events/audit"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/lea"
+	"github.com/PizenLabs/izen/internal/loop"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/patch"
@@ -48,6 +50,7 @@ import (
 	runtimeAutonomy "github.com/PizenLabs/izen/internal/runtime/autonomy"
 	"github.com/PizenLabs/izen/internal/runtime/handlers"
 	"github.com/PizenLabs/izen/internal/session"
+	izentelemetry "github.com/PizenLabs/izen/internal/telemetry"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
 	"github.com/PizenLabs/izen/pkg/engine/layer1"
@@ -428,12 +431,29 @@ func Wire(opts ...Option) (*Application, error) {
 	a.Executor = execution.NewRuntimeExecutor(a.Inputs.Root, a.Inputs.Config, a.provider, a.Bus, a.Inputs.LanguageID)
 	a.Gateway = execution.NewIntentGateway(a.Inputs.Root)
 
+	// ── BACKGROUND PREFLIGHT + SYNC BARRIER (prompt admission invariant) ──
+	// Decouple structural discovery and budget estimation from the UI critical
+	// path: submit_prompt emits PromptAdmitted in <10ms, BackgroundPreflight runs
+	// off the UI goroutine, and the autonomous loop gates observing→deciding on
+	// the PreflightSyncBarrier (10s timeout → PREFLIGHT_TIMEOUT).
+	preflightState := preflight.NewObservationState()
+	loopBarrier := loop.NewBarrier(a.Bus)
+	preflightWorker := preflight.New(preflight.Config{
+		Root:     a.Inputs.Root,
+		Bus:      a.Bus,
+		State:    preflightState,
+		Barrier:  loopBarrier.Inner(),
+		Recorder: izentelemetry.Default(),
+	})
+
 	dispatcher := runtime.NewCommandDispatcher()
 	hs := handlers.New(handlers.HandlerDeps{
-		Workflow: wf,
-		Bus:      a.Bus,
-		Approver: a.Approver,
-		Executor: a.Executor,
+		Workflow:        wf,
+		Bus:             a.Bus,
+		Approver:        a.Approver,
+		Executor:        a.Executor,
+		PreflightWorker: preflightWorker,
+		Telemetry:       izentelemetry.Default(),
 	})
 	if err := hs.Register(dispatcher); err != nil {
 		return nil, err
@@ -607,6 +627,8 @@ func Wire(opts ...Option) (*Application, error) {
 	a.Autonomous = runtimeAutonomy.NewDriver(
 		runtimeAutonomy.NewExecutorAdapter(root, a.Gateway, a.Executor),
 		a.Bus,
+		runtimeAutonomy.WithPreflightBarrier(loopBarrier),
+		runtimeAutonomy.WithPreflightState(preflightState),
 	)
 	// ── AUTONOMY BOUNDARY-TELEMETRY SINK ─────────────────────────────────
 	// [boundary2]/[boundary5] diagnostic lines are routed onto the shared

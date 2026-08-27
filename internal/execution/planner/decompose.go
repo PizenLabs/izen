@@ -1,6 +1,7 @@
 package planner
 
 import (
+	"bytes"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -69,12 +70,16 @@ func Decomposable(target string) bool {
 	return ForTarget(target) != nil
 }
 
-// Decompose partitions ONE infeasible objective into a validated ExecutionDAG.
-// It selects the structural or block decomposer for the target's format,
-// splits the source at natural boundaries, slices any section that still
-// exceeds the strict sub-task budget into contiguous line-range windows
-// (FallbackLineSlicer), greedily groups adjacent sections under the budget,
-// and stages the plan against baseDigest.
+// Decompose partitions ONE infeasible objective into a validated ExecutionDAG
+// using the SYNTACTIC pipeline only: it selects the structural or block
+// decomposer for the target's format, splits the source at natural boundaries,
+// slices any section that still exceeds the strict sub-task budget into
+// contiguous line-range windows (FallbackLineSlicer), greedily groups adjacent
+// sections under the budget, and stages the plan against baseDigest.
+//
+// Decompose is the low_semantic_confidence fallback path of DecomposeTarget;
+// new call sites should prefer DecomposeTarget, which tries Lea's semantic
+// units first and records LowSemanticConfidence when it must fall back here.
 //
 // The returned DAG satisfies every Validate() invariant and every sub-task
 // passes the Boundary-2 preflight guard individually. When even single lines
@@ -88,6 +93,99 @@ func Decompose(objective, target string, source []byte, baseDigest string, maxOu
 	if budget <= 0 {
 		return nil, fmt.Errorf("%w: max_output=%d leaves no per-sub-task budget", ErrNotDecomposable, maxOutputTokens)
 	}
+	return stageSyntacticDAG(objective, target, source, baseDigest, maxOutputTokens, budget)
+}
+
+// kindOf maps a decomposer onto its canonical SplitKind label.
+func kindOf(d Decomposer) SplitKind {
+	switch d.(type) {
+	case ASTDecomposer:
+		return SplitAST
+	default:
+		return SplitBlock
+	}
+}
+
+// ── DecomposeTarget: semantic-first partitioning ────────────────────────────
+
+// DecomposeTarget partitions ONE infeasible objective over ONE target into a
+// validated ExecutionDAG, preferring SEMANTIC UNITS over line ranges.
+//
+// The strategy ladder:
+//
+//  1. SEMANTIC SPLITTING — when the target carries a Lea structural scanner
+//     (HTML / JSX / Go templates), LeaStructuralScan parses the document
+//     read-only and yields units that are structural nodes ("<head>
+//     metadata", "<section#hero> hero") plus targeted findings. Units are
+//     refined along descendant node boundaries until every piece fits the
+//     strict sub-task budget.
+//
+//  2. SYNTACTIC FALLBACK — only when the scan is unavailable for the format,
+//     recovers from malformed structure (LowConfidence) or partitions nothing
+//     (< minSemanticUnits units) does the plan fall back to the syntactic
+//     splitters; the staged DAG records LowSemanticConfidence=true so callers
+//     know the units are line ranges, not semantic nodes.
+//
+// Both paths share the same downstream machinery: oversize sections explode
+// into contiguous budget-bounded line windows (FallbackLineSlicer), adjacent
+// sections group under the budget, and the plan stages against baseDigest.
+// The returned DAG satisfies every Validate() invariant and every sub-task
+// passes the Boundary-2 preflight guard individually. When even single lines
+// cannot fit the budget the error is ErrNotDecomposable — fail-closed, with
+// no partial plan returned.
+func DecomposeTarget(objective, target string, source []byte, baseDigest string, maxOutputTokens int) (*ExecutionDAG, error) {
+	if len(strings.TrimSpace(string(source))) == 0 {
+		return nil, ErrEmptySource
+	}
+	budget := SubTaskBudget(maxOutputTokens)
+	if budget <= 0 {
+		return nil, fmt.Errorf("%w: max_output=%d leaves no per-sub-task budget", ErrNotDecomposable, maxOutputTokens)
+	}
+
+	if scan := LeaStructuralScan(target, source); scan != nil {
+		if !scan.LowConfidence && len(scan.Units) >= minSemanticUnits {
+			return stageSemanticDAG(objective, target, source, baseDigest, maxOutputTokens, budget, scan)
+		}
+		// low_semantic_confidence: syntax parsing failed or partitioned
+		// nothing — retain syntactic splitting as the fallback and record why.
+		dag, err := stageSyntacticDAG(objective, target, source, baseDigest, maxOutputTokens, budget)
+		if err != nil {
+			return nil, err
+		}
+		dag.LowSemanticConfidence = true
+		return dag, nil
+	}
+	// No Lea scanner for this format: the syntactic splitter IS the strategy.
+	return stageSyntacticDAG(objective, target, source, baseDigest, maxOutputTokens, budget)
+}
+
+// stageSemanticDAG builds the DAG from Lea's semantic units: refine oversize
+// units along descendant node boundaries, group what fits together, and stage
+// each group as one sub-task whose description names structural identities.
+func stageSemanticDAG(objective, target string, source []byte, baseDigest string, maxOutputTokens, budget int, scan *LeaScanReport) (*ExecutionDAG, error) {
+	lines := splitKeepNewline(source)
+	sections := refineOversizeUnits(lines, scan.Units, scan.Nodes, budget)
+	var err error
+	// Fail-safe: a unit with no internal structure at all still cannot join a
+	// plan oversized — the line-slicing fallback remains the last resort.
+	sections, err = explodeOversizeSections(lines, sections, budget)
+	if err != nil {
+		return nil, err
+	}
+	dag := NewExecutionDAG(objective, target, SplitSemantic, baseDigest, maxOutputTokens)
+	if err := stageSections(dag, lines, sections); err != nil {
+		return nil, err
+	}
+	if err := dag.Validate(); err != nil {
+		return nil, err
+	}
+	return dag, nil
+}
+
+// stageSyntacticDAG is the pre-existing syntactic pipeline (structural or
+// block splitter + line-slice fallback), factored out of Decompose so both
+// entry points share it verbatim.
+func stageSyntacticDAG(objective, target string, source []byte, baseDigest string, maxOutputTokens, budget int) (*ExecutionDAG, error) {
 	d := ForTarget(target)
 	if d == nil {
 		return nil, fmt.Errorf("%w: %s", ErrNoDecomposer, filepath.Ext(target))
@@ -99,37 +197,14 @@ func Decompose(objective, target string, source []byte, baseDigest string, maxOu
 	if len(sections) == 0 {
 		return nil, ErrEmptySource
 	}
-
-	// ── SECONDARY FALLBACK: fine-grained line slicing ────────────────────
-	// A parser block (AST unit or top-level DOM/config block) whose own token
-	// estimate exceeds safeChunkLimit must NOT fail the objective closed: it
-	// is sliced along clean \n breaks into contiguous budget-bounded windows
-	// bound to explicit line intervals. Only a SINGLE LINE larger than the
-	// ceiling refuses to decompose.
-	sections, err = explodeOversizeSections(source, sections, budget)
+	lines := splitKeepNewline(source)
+	sections, err = explodeOversizeSections(lines, sections, budget)
 	if err != nil {
 		return nil, err
 	}
-
 	dag := NewExecutionDAG(objective, target, kindOf(d), baseDigest, maxOutputTokens)
-	groups, err := groupSections(sections, func(r Region) int { return EstimateRegionTokens(source, r) }, budget)
-	if err != nil {
+	if err := stageSections(dag, lines, sections); err != nil {
 		return nil, err
-	}
-	for i, g := range groups {
-		region := Region{StartLine: g[0].Region.StartLine, EndLine: g[len(g)-1].Region.EndLine}
-		st := SubTask{
-			ID:              fmt.Sprintf("st-%d", i+1),
-			Index:           i + 1,
-			Kind:            subTaskKind(dag.Kind, g),
-			Target:          target,
-			Description:     describeGroup(g),
-			Region:          region,
-			EstimatedTokens: EstimateRegionTokens(source, region),
-		}
-		if err := dag.AddTask(st); err != nil {
-			return nil, err
-		}
 	}
 	if err := dag.Validate(); err != nil {
 		return nil, err
@@ -137,14 +212,108 @@ func Decompose(objective, target string, source []byte, baseDigest string, maxOu
 	return dag, nil
 }
 
-// kindOf maps a decomposer onto its canonical SplitKind label.
-func kindOf(d Decomposer) SplitKind {
-	switch d.(type) {
-	case ASTDecomposer:
-		return SplitAST
-	default:
-		return SplitBlock
+// stageSections groups adjacent sections under the budget and appends one
+// sub-task per group to the DAG.
+func stageSections(dag *ExecutionDAG, lines [][]byte, sections []Section) error {
+	groups, err := groupSections(sections, func(r Region) int { return regionTokensInLines(lines, r) }, dag.Budget())
+	if err != nil {
+		return err
 	}
+	for i, g := range groups {
+		region := Region{StartLine: g[0].Region.StartLine, EndLine: g[len(g)-1].Region.EndLine}
+		est := regionTokensInLines(lines, region)
+		if est <= 0 {
+			est = 1 // a non-empty window always carries at least one token
+		}
+		st := SubTask{
+			ID:              fmt.Sprintf("st-%d", i+1),
+			Index:           i + 1,
+			Kind:            subTaskKind(dag.Kind, g),
+			Target:          dag.Target,
+			Description:     describeGroup(g),
+			Region:          region,
+			EstimatedTokens: est,
+		}
+		if err := dag.AddTask(st); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// refineOversizeUnits replaces every semantic unit whose own estimate exceeds
+// the budget with pieces cut at DESCENDANT NODE BOUNDARIES first: candidate
+// cut lines are the start lines of all scanned nodes strictly inside the
+// unit's region, so pieces remain structural regions rather than arbitrary
+// byte windows. Pieces still too large pass through untouched — the caller's
+// explodeOversizeSections applies the final line-window fallback.
+func refineOversizeUnits(lines [][]byte, units []Section, nodes []DOMNode, budget int) []Section {
+	cutAt := make(map[int]string, len(nodes)) // start line -> unit label
+	for _, n := range nodes {
+		if n.StartLine >= 1 && n.Tag != "" {
+			cutAt[n.StartLine] = nodeUnitLabel(n)
+		}
+	}
+	var out []Section
+	for _, u := range units {
+		if regionTokensInLines(lines, u.Region) <= budget {
+			out = append(out, u)
+			continue
+		}
+		out = append(out, splitUnitAtNodes(lines, u, cutAt, budget)...)
+	}
+	return out
+}
+
+// splitUnitAtNodes cuts one oversize unit at descendant node start lines,
+// greedily accumulating structural pieces while they fit the budget. A piece
+// whose own first inter-node span already exceeds the budget is emitted as
+// far as it can grow (down to a single line) and the remainder continues from
+// the next boundary; any residual oversize piece passes through untouched —
+// the caller's explodeOversizeSections applies the final line-window fallback.
+func splitUnitAtNodes(lines [][]byte, u Section, cutAt map[int]string, budget int) []Section {
+	var bounds []int
+	for line := u.Region.StartLine + 1; line <= u.Region.EndLine; line++ {
+		if _, ok := cutAt[line]; ok {
+			bounds = append(bounds, line)
+		}
+	}
+	if len(bounds) == 0 {
+		return []Section{u} // no internal structure: leave for the line fallback
+	}
+	base := strings.TrimSuffix(truncateLabel(u.Label), "…")
+	var out []Section
+	segStart := u.Region.StartLine
+	k := 0 // next unconsumed boundary index
+	for segStart <= u.Region.EndLine {
+		// Grow to the furthest boundary keeping the segment within budget.
+		bestEnd, bestK := segStart, k
+		for j := k; j < len(bounds); j++ {
+			candEnd := bounds[j] - 1 // segment ends right before the node opens
+			if candEnd < segStart || candEnd > u.Region.EndLine {
+				continue
+			}
+			tok := regionTokensInLines(lines, Region{StartLine: segStart, EndLine: candEnd})
+			if tok > budget && candEnd > segStart {
+				break // this boundary would overflow: keep the last fit
+			}
+			bestEnd, bestK = candEnd, j+1
+		}
+		end := bestEnd
+		if end > u.Region.EndLine {
+			end = u.Region.EndLine
+		}
+		label := u.Label
+		if childLabel, ok := cutAt[end+1]; ok && segStart != u.Region.StartLine && end+1 <= u.Region.EndLine {
+			label = childLabel // piece opens exactly at a known child boundary
+		} else if segStart != u.Region.StartLine {
+			label = base + " (continued)"
+		}
+		out = append(out, Section{Region: Region{StartLine: segStart, EndLine: end}, Label: label})
+		segStart = end + 1
+		k = bestK
+	}
+	return out
 }
 
 // groupSections merges ADJACENT sections into budget-fitted groups. The
@@ -251,20 +420,53 @@ func FallbackLineSlicer(source []byte, s Section, safeChunkLimit int) ([]Section
 // FallbackLineSlicer. Sections already within budget pass through untouched;
 // ordering and contiguity are preserved, so the union still covers the whole
 // source. Any failure is fail-closed: no oversized unit survives.
-func explodeOversizeSections(source []byte, sections []Section, safeChunkLimit int) ([]Section, error) {
+func explodeOversizeSections(lines [][]byte, sections []Section, safeChunkLimit int) ([]Section, error) {
 	var out []Section
 	for _, s := range sections {
-		if regionTokens(len(SliceLines(source, s.Region))) <= safeChunkLimit {
+		if regionTokensInLines(lines, s.Region) <= safeChunkLimit {
 			out = append(out, s)
 			continue
 		}
-		slices, err := FallbackLineSlicer(source, s, safeChunkLimit)
+		slices, err := FallbackLineSlicer(joinLines(lines), s, safeChunkLimit)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, slices...)
 	}
 	return out, nil
+}
+
+// joinLines reassembles a line table into newline-terminated source bytes.
+// It is only called for sections that genuinely need line-window slicing;
+// the hot estimate paths never reassemble.
+func joinLines(lines [][]byte) []byte {
+	var b bytes.Buffer
+	for _, l := range lines {
+		b.Write(l)
+		b.WriteByte('\n')
+	}
+	return b.Bytes()
+}
+
+// regionTokensInLines applies the canonical Boundary-2 accounting to a region
+// measured directly against a pre-split line table — the linear-time
+// equivalent of EstimateRegionTokens(source, r) without re-splitting source
+// per call.
+func regionTokensInLines(lines [][]byte, r Region) int {
+	if r.StartLine < 1 {
+		r.StartLine = 1
+	}
+	if r.EndLine > len(lines) {
+		r.EndLine = len(lines)
+	}
+	if r.StartLine > r.EndLine {
+		return 0
+	}
+	n := 0
+	for i := r.StartLine - 1; i < r.EndLine; i++ {
+		n += len(lines[i]) + 1
+	}
+	return regionTokens(n)
 }
 
 // regionTokens applies the canonical Boundary-2 accounting to a raw byte

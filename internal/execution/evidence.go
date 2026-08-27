@@ -3,6 +3,8 @@ package execution
 import (
 	"strings"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/execution/ingestion"
 )
 
 // ── ExecutionEvidence (Phase 2 P2 — authoritative execution record) ─────────
@@ -45,6 +47,13 @@ const (
 	// EvidenceCancelled is a clean terminal cancellation (user cancel or human
 	// rejection at the approval gate). Nothing was committed.
 	EvidenceCancelled ExecutionOutcome = "CANCELLED"
+	// EvidenceRequiresReview is the terminal-warning outcome produced
+	// EXCLUSIVELY by the NO-OP semantics gate (no_op_no_safe_mutation): the
+	// model claimed no changes were required while candidate edit regions
+	// matched below the structural safety threshold. Nothing was committed
+	// and nothing failed — the attempt is sealed as requiring human review
+	// and can NEVER project as authoritative success.
+	EvidenceRequiresReview ExecutionOutcome = "REQUIRES_REVIEW"
 )
 
 // Committed reports whether the outcome is the authoritative success.
@@ -56,7 +65,7 @@ func (o ExecutionOutcome) Committed() bool { return o == EvidenceCommitted }
 // projections that switch over it.
 func (o ExecutionOutcome) Terminal() bool {
 	switch o {
-	case EvidenceCommitted, EvidenceFailed, EvidenceAbortedOCC, EvidenceCancelled:
+	case EvidenceCommitted, EvidenceFailed, EvidenceAbortedOCC, EvidenceCancelled, EvidenceRequiresReview:
 		return true
 	default:
 		return false
@@ -102,6 +111,11 @@ type ExecutionEvidence struct {
 	mutations     MutationSetSummary
 	startedAt     time.Time
 	finishedAt    time.Time
+	// ingestionTrace is the forensic transport-normalization record of the raw
+	// LLM response that produced this execution's artifact. It is sealed once
+	// at construction (set by the runtime during terminal sealing) and read
+	// only — there is no setter, preserving evidence immutability.
+	ingestionTrace *ingestion.IngestionTrace
 }
 
 // ContractID returns the identity of the contract this attempt belongs to.
@@ -180,6 +194,17 @@ func (e *ExecutionEvidence) FinishedAt() time.Time {
 		return time.Time{}
 	}
 	return e.finishedAt
+}
+
+// IngestionTrace returns the forensic transport-normalization record attached
+// to this evidence, or nil when the execution did not ingest an LLM artifact
+// (e.g. a clean read-only completion without a model call, or a pre-admission
+// failure). It is read-only: evidence is append-only truth.
+func (e *ExecutionEvidence) IngestionTrace() *ingestion.IngestionTrace {
+	if e == nil {
+		return nil
+	}
+	return e.ingestionTrace
 }
 
 // Authoritative reports whether this evidence may drive an authoritative
@@ -273,12 +298,24 @@ func sealEvidence(
 // Proof.OccAborted flag (see sealTerminalEvidence).
 func evidenceOutcomeFor(outcome MutationOutcome, execErr error) ExecutionOutcome {
 	switch outcome {
-	case OutcomeChanged, OutcomeCreated, OutcomeNoChange, OutcomeCompleted, OutcomeNoOpSuccess:
+	case OutcomeChanged, OutcomeCreated, OutcomeNoChange, OutcomeCompleted, OutcomeNoOpObjectiveSatisfied:
 		if execErr != nil {
 			// A result that carries a terminal error is never a soft success.
 			return EvidenceFailed
 		}
 		return EvidenceCommitted
+	case OutcomeNoOpNoSafeMutation:
+		// The NO-OP semantics gate held the claim for review: terminal truth
+		// is "requires review", never committed success — even without an
+		// execution error.
+		if execErr != nil {
+			return EvidenceFailed
+		}
+		return EvidenceRequiresReview
+	case OutcomeNoOpObjectiveUnresolved:
+		// A claim contradicted by structural evidence is not a success and
+		// not a review hold: it failed verification of its own verdict.
+		return EvidenceFailed
 	case OutcomeNoArtifact:
 		// A deterministic zero-mutation completion commits its (empty)
 		// contract truthfully; a no-artifact FAILURE carries the error.
