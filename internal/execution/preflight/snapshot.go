@@ -22,6 +22,15 @@ type StructuralSnapshot struct {
 	BudgetTokens int
 	// TotalLines is the file line count.
 	TotalLines int
+	// MaxOutputTokens is the scope budget ceiling (max_output-derived) the
+	// discovery was scored against. It feeds the scope engine's size/budget
+	// ratio signal. Zero means "unknown ceiling" (engine falls back safely).
+	MaxOutputTokens int
+	// Scope carries the Elastic Scope Scoring Engine verdict for this target
+	// (a *scope.ScopeDecision), published for TUI transparency. It is stored
+	// as interface{} so the preflight store need not import the scope engine;
+	// it never mutates DAG invariants — it is read-only observation metadata.
+	Scope interface{}
 	// ReadyAt is the wall-clock completion time.
 	ReadyAt time.Time
 	// Err carries an unrecoverable IO/parse error when preflight failed.

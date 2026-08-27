@@ -13,6 +13,7 @@ import (
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution/cache"
 	"github.com/PizenLabs/izen/internal/execution/planner"
+	"github.com/PizenLabs/izen/internal/planner/scope"
 	"github.com/PizenLabs/izen/internal/telemetry"
 )
 
@@ -39,6 +40,8 @@ type Worker struct {
 	barrier   *PreflightSyncBarrier
 	recorder  *telemetry.Recorder
 	topoCache *cache.TopologyCache
+	scopeEng  *scope.Engine
+	maxOutput int
 
 	mu   sync.Mutex
 	runs int
@@ -53,6 +56,13 @@ type Config struct {
 	Recorder  *telemetry.Recorder
 	Cache     *cache.TopologyCache
 	CacheSize int // 0 => DefaultCapacity (128)
+	// ScopePolicy overrides the Elastic Scope Scoring Engine policy. A zero
+	// policy (all fields zero) falls back to scope.DefaultPolicy — thresholds
+	// are policy inputs, never fixed constants.
+	ScopePolicy scope.Policy
+	// MaxOutputTokens is the output ceiling the scope engine scores against.
+	// 0 => a conservative default; the real ceiling is supplied by wiring.
+	MaxOutputTokens int
 }
 
 // New creates a worker. A nil Config field degrades safely (no bus/state/
@@ -69,6 +79,15 @@ func New(cfg Config) *Worker {
 		}
 		c = cache.New(sz)
 	}
+	policy := cfg.ScopePolicy
+	if policy == (scope.Policy{}) {
+		policy = scope.DefaultPolicy()
+	}
+	scopeEng := scope.New(policy, scope.WithLogFn(func(format string, args ...interface{}) {
+		if cfg.Bus != nil {
+			cfg.Bus.Publish(events.NewActivity(fmt.Sprintf(format, args...)))
+		}
+	}))
 	return &Worker{
 		root:      cfg.Root,
 		bus:       cfg.Bus,
@@ -76,7 +95,18 @@ func New(cfg Config) *Worker {
 		barrier:   cfg.Barrier,
 		recorder:  cfg.Recorder,
 		topoCache: c,
+		scopeEng:  scopeEng,
+		maxOutput: cfg.MaxOutputTokens,
 	}
+}
+
+// cfgMaxOutput returns the configured output ceiling, defaulting to a
+// conservative bound when none was supplied by wiring.
+func (w *Worker) cfgMaxOutput() int {
+	if w == nil || w.maxOutput <= 0 {
+		return 4096
+	}
+	return w.maxOutput
 }
 
 // Cache returns the topology cache (nil when disabled). Test seam.
@@ -209,6 +239,7 @@ func (w *Worker) execute(ctx context.Context, _ string, targets []string) (*Stru
 	if scan != nil {
 		totalLines = scan.TotalLines
 	}
+	maxOut := w.cfgMaxOutput()
 	snap := &StructuralSnapshot{
 		Target:          target,
 		SHA256:          sha,
@@ -216,8 +247,21 @@ func (w *Worker) execute(ctx context.Context, _ string, targets []string) (*Stru
 		EstimatedTokens: tokens,
 		BudgetTokens:    budget,
 		TotalLines:      totalLines,
+		MaxOutputTokens: maxOut,
 		ReadyAt:         time.Now(),
 	}
+	// Elastic Scope Scoring: select SinglePass vs DAG from STRUCTURAL
+	// complexity (AST depth, symbol density, dependency fan-out) with file
+	// size only as the TokenToMaxOutputRatio input — never an architecture
+	// invariant. The verdict is published into Observation State for TUI
+	// transparency and never mutates DAG invariants.
+	decision := w.scopeEng.Evaluate(scope.ScopeInput{
+		Scan:            scan,
+		EstimatedTokens: tokens,
+		MaxOutputTokens: maxOut,
+		TotalLines:      totalLines,
+	})
+	snap.Scope = &decision
 	// d. Populate cache on miss.
 	if w.topoCache != nil {
 		cSnap := cache.BuildSnapshot(sha, target, scan, tokens, budget, totalLines, 2.0)
