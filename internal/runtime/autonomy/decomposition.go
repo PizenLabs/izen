@@ -386,7 +386,11 @@ func (d *Driver) failDAG(ctx context.Context, dag *planner.ExecutionDAG, origina
 	if err := d.adapter.RestoreTargets(originals); err != nil {
 		reason += "; ROLLBACK FAILED: " + err.Error()
 	}
-	if digest := d.adapter.WorkspaceVersion(dag.Targets()); digest != dag.BaseTreeDigest {
+	digest := d.adapter.WorkspaceVersion(dag.Targets())
+	match := digest == dag.BaseTreeDigest
+	// Strict boundary telemetry: MUST emit canonical trace.
+	diagnosticf("[boundary] state rollback verified digest=%s match=%v", digest, match)
+	if !match {
 		reason += fmt.Sprintf("; post-rollback digest %s… does not match base %s…", short(digest), short(dag.BaseTreeDigest))
 	}
 	dag.Status = planner.DagExecutionFailed

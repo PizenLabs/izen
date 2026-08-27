@@ -418,6 +418,13 @@ type RuntimeExecutor struct {
 	// fingerprints the resolved targets at admission and re-validates them
 	// immediately before the commit pipeline writes anything.
 	occ *OCCVerifier
+	// artifactValidator is the explicit boundary that parses and validates
+	// mutation artifacts. It is injected so P1 NormalizingValidator decorators
+	// can wrap it without modifying execution loops.
+	artifactValidator ArtifactValidator
+	// mutationBoundary is the explicit workspace-integrity assertion surface
+	// used after any rollback to cryptographically verify base digest recovery.
+	mutationBoundary MutationBoundary
 
 	mu      sync.Mutex
 	pending map[string]*pendingMutation
@@ -433,16 +440,17 @@ type RuntimeExecutor struct {
 // still resolves deterministic strategies without a provider).
 func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, bus *events.Bus, langID language.ID) *RuntimeExecutor {
 	x := &RuntimeExecutor{
-		root:      root,
-		cfg:       cfg,
-		provider:  provider,
-		bus:       bus,
-		langID:    langID,
-		patches:   NewPatchManager(root),
-		admission: NewAdmissionGateway(nil),
-		contracts: NewContractRegistry(),
-		occ:       NewOCCVerifier(root),
-		pending:   make(map[string]*pendingMutation),
+		root:             root,
+		cfg:              cfg,
+		provider:         provider,
+		bus:              bus,
+		langID:           langID,
+		patches:          NewPatchManager(root),
+		admission:        NewAdmissionGateway(nil),
+		contracts:        NewContractRegistry(),
+		occ:              NewOCCVerifier(root),
+		artifactValidator: NewDefaultArtifactValidator(),
+		pending:          make(map[string]*pendingMutation),
 	}
 	if langID != "" {
 		x.verifier = NewLanguageVerifier(root, langID)
@@ -480,6 +488,38 @@ func (x *RuntimeExecutor) OCC() *OCCVerifier { return x.occ }
 // SetVerifier overrides the attached verifier (test seam / config wiring).
 func (x *RuntimeExecutor) SetVerifier(v *Verifier) {
 	x.verifier = v
+}
+
+// SetArtifactValidator replaces the artifact validator (P1 extension seam).
+// A nil value restores the default validator.
+func (x *RuntimeExecutor) SetArtifactValidator(v ArtifactValidator) {
+	if v == nil {
+		v = NewDefaultArtifactValidator()
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.artifactValidator = v
+}
+
+// ArtifactValidator returns the currently wired artifact validator.
+func (x *RuntimeExecutor) ArtifactValidator() ArtifactValidator {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.artifactValidator
+}
+
+// SetMutationBoundary replaces the workspace-integrity boundary (test seam).
+func (x *RuntimeExecutor) SetMutationBoundary(b MutationBoundary) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.mutationBoundary = b
+}
+
+// MutationBoundary returns the currently wired mutation boundary.
+func (x *RuntimeExecutor) MutationBoundary() MutationBoundary {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.mutationBoundary
 }
 
 // SetAuthorization attaches the mutation authorization token the runtime uses
@@ -1812,6 +1852,27 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// a malformed artifact can never become a proposal. Unregistered
 		// languages pass normalized (canonical bytes), so the proposal preview
 		// and the eventual disk write agree.
+		//
+		// P1 Decoupling: when the bounded-patch contract is active, the
+		// explicit ArtifactValidator validates the RAW patch before syntax
+		// gating. For full-file artifacts the validator is intentionally NOT
+		// applied to the resolved file content — the V3 pipeline owns syntax
+		// there. This preserves the existing full-file truth matrix.
+		if patchOnly && x != nil && x.artifactValidator != nil {
+			if _, err := x.artifactValidator.ValidateArtifact([]byte(raw), target); err != nil {
+				if errors.Is(err, ErrAmbiguousAnchor) || errors.Is(err, ErrScopeViolation) {
+					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
+				}
+				if errors.Is(err, ErrFormatRejected) {
+					gate := v3Artifact.ValidateContent(target, []byte(modified), 0)
+					if !gate.Passed && gate.Decision == policy.DecisionRetry {
+						return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRetryableRejected, target, err)
+					}
+					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
+				}
+				return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
+			}
+		}
 		//nolint:contextcheck // artifact validation is pure content checking, no context needed
 		normalized, gateErr := x.artifactGate(target, modified)
 		if gateErr != nil {
@@ -1852,11 +1913,12 @@ func lastOutputTokens(invs []ModelInvocation) int {
 }
 
 // artifactGate validates the resolved mutation artifact against the target's
-// language contract using the established V3 artifact pipeline. A
-// registered-language target (go/html/json) that fails validation is rejected
-// deterministically (ErrArtifactRejected) with the validation diagnostic. The
-// canonical normalized content is returned so the proposal and the disk agree.
-// A language with no registered validator passes normalized but unvalidated.
+// language contract using the V3 pipeline. The explicit ArtifactValidator is
+// NOT invoked here — it is applied one layer up when the bounded-patch raw
+// artifact is available, so full-file content never traverses the strict patch
+// format gate. This keeps the validator interface decoupled (P1 decorators
+// wrap it without touching this loop) while preserving the existing truth
+// matrix for full-file rewrites.
 func (x *RuntimeExecutor) artifactGate(target, modified string) (string, error) {
 	gate := v3Artifact.ValidateContent(target, []byte(modified), 0)
 	if !gate.Passed {
