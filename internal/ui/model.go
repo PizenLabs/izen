@@ -702,7 +702,7 @@ type model struct {
 	// ahead of the LLM call. Lazily constructed from the native graph and the
 	// workspace root; nil when no graph is ready.
 	planner   *planner.Planner
-	plannerMu sync.Mutex
+	plannerMu *sync.Mutex
 
 	// Input
 	ti    textinput.Model
@@ -1576,6 +1576,9 @@ func (m *model) isProjectInitialized() bool {
 func (m *model) contextPlanner() *planner.Planner {
 	if m == nil || (m.leaEng == nil && m.graph == nil) {
 		return nil
+	}
+	if m.plannerMu == nil {
+		m.plannerMu = &sync.Mutex{}
 	}
 	m.plannerMu.Lock()
 	defer m.plannerMu.Unlock()
