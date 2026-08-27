@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1085,10 +1086,20 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			g.FailExecution(events.FailureRecoverable, err, "executor.ingestion")
 			res.ArtifactKind = ""
 			res.Content = "" // Recovery Isolation (I2): rejected bytes never travel
-			res.Err = fmt.Errorf("%w: %w", ErrArtifactRetryableRejected, err)
+			detail := "transport normalization produced a syntactically invalid payload (unterminated fence or unclosed structural tag)"
+			// AST STRUCTURAL AUDIT FEEDBACK: the ingestion layer detects the
+			// broken envelope but does not parse line positions; run the V3
+			// pipeline over the preserved payload to resolve the EXACT line of
+			// the offending node and inject it into the retry context.
+			if ingTrace != nil {
+				if audit := structuralAuditForPayload(firstTarget(targets), []byte(ingTrace.NormalizedPayload)); audit != "" { //nolint:contextcheck // artifact validation is pure content checking, no context needed
+					detail = audit
+				}
+			}
+			res.Err = fmt.Errorf("%w: %s", ErrArtifactRetryableRejected, detail)
 			res.Diagnostics = append(res.Diagnostics, diagnosticSignal(
 				SignalSchemaViolation, firstTarget(targets),
-				"transport normalization produced a syntactically invalid payload (unterminated fence or unclosed structural tag)",
+				detail,
 				"regenerate a complete, well-formed artifact; do not rely on silent repair",
 				true,
 			))
@@ -1867,7 +1878,12 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 				if errors.Is(err, ErrFormatRejected) {
 					gate := v3Artifact.ValidateContent(target, []byte(modified), 0)
 					if !gate.Passed && gate.Decision == policy.DecisionRetry {
-						return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRetryableRejected, target, err)
+						// AST STRUCTURAL AUDIT FEEDBACK: surface the exact line +
+						// parse error of the V3 pipeline rejection into the retry
+						// directive so the successor anchors its correction at the
+						// precise defect instead of resending raw code.
+						audit := StructuralAuditDirective(gate.Error.Error())
+						return nil, invs, nil, trace, fmt.Errorf("%w: %s: %s", ErrArtifactRetryableRejected, target, audit)
 					}
 					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
 				}
@@ -1924,7 +1940,14 @@ func (x *RuntimeExecutor) artifactGate(target, modified string) (string, error) 
 	gate := v3Artifact.ValidateContent(target, []byte(modified), 0)
 	if !gate.Passed {
 		if gate.Decision == policy.DecisionRetry {
-			return "", fmt.Errorf("%w: %s: %w: %s", ErrArtifactRetryableRejected, target, gate.Error, gate.Directive)
+			// AST STRUCTURAL AUDIT FEEDBACK: a structural parse rejection
+			// (e.g. "html: unterminated <script> element at line 7") is
+			// rewritten into the targeted [CONTRACT FAILURE] directive so the
+			// retry loop prompt carries the exact line + parse error instead of
+			// resending raw code. Non-structural rejections pass through
+			// unchanged.
+			audit := StructuralAuditDirective(gate.Error.Error())
+			return "", fmt.Errorf("%w: %s: %s: %s", ErrArtifactRetryableRejected, target, audit, gate.Directive)
 		}
 		return "", fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, gate.Error)
 	}
@@ -1944,6 +1967,82 @@ func (x *RuntimeExecutor) compileDiff(raw, target, original string) string {
 		return ""
 	}
 	return string(compiled[0].Diff)
+}
+
+// manifestSystemPrompt is the Pass 1 system prompt. Pass 1 is strictly
+// READ-ONLY: the model emits a lightweight MutationManifest JSON that names the
+// proposed mutation targets and operations. The runtime never treats this pass
+// as a mutation surface — it only informs the DAG strategy (manifest-scoped
+// atomic execution vs. semantic decomposition) that Pass 2 runs under.
+//
+// manifestPassMaxTokens bounds the Pass 1 generation: a manifest is a tiny
+// JSON object, so a small fixed ceiling keeps the read-only pass cheap and
+// cannot starve the bounded execution that follows.
+const (
+	manifestSystemPrompt = "You are the Pass 1 manifest generator of a read-only planning stage. " +
+		"Analyze the target file below against the user's objective and propose the MINIMAL set of mutations that achieve it. " +
+		"Output ONLY a single raw JSON object (no markdown fences, no prose, no commentary) conforming exactly to:\n" +
+		`{"targetFile":"<workspace-relative path>","intent":"<one-line objective>","mutations":[{"selector":"<css selector or symbol, e.g. #hero or section#hero>","action":"delete|modify|insert","estimatedLines":<positive int>}]}` + "\n" +
+		"Rules: every mutation MUST name a selector or symbol that exists in the file; " +
+		"omit any content the objective does not touch; " +
+		"if the objective requires NO change, emit {\"targetFile\":\"<path>\",\"intent\":\"...\",\"mutations\":[]}. " +
+		"This pass never writes to the workspace."
+
+	// manifestPassMaxTokens is the fixed output ceiling of the read-only Pass 1
+	// manifest generation.
+	manifestPassMaxTokens = 256
+)
+
+// InvokeManifestPass performs the lightweight READ-ONLY Pass 1 manifest
+// request: a single bounded provider invocation whose only output is a raw
+// MutationManifest JSON string. It never reads the workspace beyond the
+// caller-provided targetContent bytes, never touches disk, and never mutates
+// anything — its result only informs the DAG strategy Pass 2 decomposes under.
+// The returned string is the verbatim model response; the caller parses it
+// with ParseMutationManifest.
+func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string, targetContent []byte) (string, error) {
+	if x == nil {
+		return "", fmt.Errorf("executor: nil runtime for manifest pass")
+	}
+	x.mu.Lock()
+	p := x.provider
+	x.mu.Unlock()
+	if p == nil {
+		return "", fmt.Errorf("executor: no provider configured for the manifest pass")
+	}
+	model, err := x.resolveModel()
+	if err != nil {
+		return "", err
+	}
+	var user strings.Builder
+	user.WriteString("USER OBJECTIVE:\n")
+	user.WriteString(strings.TrimSpace(prompt))
+	user.WriteString("\n\nTARGET FILE (read-only, " + strconv.Itoa(len(targetContent)) + " bytes):\n")
+	user.WriteString("```\n")
+	user.Write(targetContent)
+	user.WriteString("\n```\n")
+	req := ai.Request{
+		Model:     model,
+		System:    manifestSystemPrompt,
+		Messages:  []ai.Message{{Role: "user", Content: user.String()}},
+		MaxTokens: manifestPassMaxTokens,
+		// The manifest is a tiny JSON object; a hidden reasoning pass would
+		// spend the bounded output budget before any JSON appears.
+		Reasoning: &ai.ReasoningConfig{Disabled: true},
+	}
+	resp, err := p.Execute(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("executor: manifest pass invocation: %w", err)
+	}
+	if resp == nil {
+		return "", fmt.Errorf("executor: manifest pass returned an empty response")
+	}
+	if executionGate := gateFor("", resp.Usage.FinishReason); executionGate != nil {
+		// An incomplete manifest generation can never inform the DAG strategy:
+		// fail closed, the caller falls back to a single-pass bounded inspection.
+		return "", executionGate
+	}
+	return strings.TrimSpace(resp.Content), nil
 }
 
 // invokeReadOnly performs the single bounded provider invocation for read-only

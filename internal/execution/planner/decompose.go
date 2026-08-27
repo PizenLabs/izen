@@ -182,6 +182,70 @@ func stageSemanticDAG(objective, target string, source []byte, baseDigest string
 	return dag, nil
 }
 
+// StageSemanticSections stages a MANIFEST-SCOPED validated ExecutionDAG from
+// explicit semantic sections. The caller (autonomy.Pass 1 manifest hook) has
+// already pruned the Lea scan's units down to exactly the AST/Semantic nodes
+// the MutationManifest marks for modification; this function only stages them
+// under the strict 0.7 sub-task ceiling, applying the line-window fallback to
+// any individual section that still exceeds the budget.
+//
+// The returned DAG is ManifestScoped=true: Validate() does not require its
+// regions to cover the whole file, because unmodified sections were pruned
+// before dispatch — no sub-task is ever created solely to evaluate to
+// no_op_objective_satisfied over an untouched block.
+func StageSemanticSections(objective, target string, source []byte, baseDigest string, maxOutputTokens int, sections []Section) (*ExecutionDAG, error) {
+	if len(sections) == 0 {
+		return nil, ErrEmptySource
+	}
+	budget := SubTaskBudget(maxOutputTokens)
+	if budget <= 0 {
+		return nil, fmt.Errorf("%w: max_output=%d leaves no per-sub-task budget", ErrNotDecomposable, maxOutputTokens)
+	}
+	lines := splitKeepNewline(source)
+	dag := NewExecutionDAG(objective, target, SplitSemantic, baseDigest, maxOutputTokens)
+	dag.ManifestScoped = true
+	for _, s := range sections {
+		if regionTokensInLines(lines, s.Region) > budget {
+			slices, err := FallbackLineSlicer(joinLines(lines), s, budget)
+			if err != nil {
+				return nil, err
+			}
+			for _, sl := range slices {
+				if err := addScopedSubTask(dag, lines, sl); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		if err := addScopedSubTask(dag, lines, s); err != nil {
+			return nil, err
+		}
+	}
+	if err := dag.Validate(); err != nil {
+		return nil, err
+	}
+	return dag, nil
+}
+
+// addScopedSubTask appends one manifest-scoped section as the next sub-task,
+// carrying its semantic label and a measured token estimate under the same
+// accounting as Boundary 2.
+func addScopedSubTask(dag *ExecutionDAG, lines [][]byte, s Section) error {
+	est := regionTokensInLines(lines, s.Region)
+	if est <= 0 {
+		est = 1 // a non-empty window always carries at least one token
+	}
+	return dag.AddTask(SubTask{
+		ID:              fmt.Sprintf("st-%d", len(dag.SubTasks)+1),
+		Index:           len(dag.SubTasks) + 1,
+		Kind:            dag.Kind,
+		Target:          dag.Target,
+		Description:     describeGroup([]Section{s}),
+		Region:          s.Region,
+		EstimatedTokens: est,
+	})
+}
+
 // stageSyntacticDAG is the pre-existing syntactic pipeline (structural or
 // block splitter + line-slice fallback), factored out of Decompose so both
 // entry points share it verbatim.

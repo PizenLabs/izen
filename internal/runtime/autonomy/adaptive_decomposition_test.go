@@ -2,6 +2,7 @@ package autonomy
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -31,15 +32,17 @@ func html10KBFixture() []byte {
 }
 
 // htmlMultiSectionFixture builds a large multi-section HTML file whose total
-// size exceeds max_output but whose individual sections fit the budget.
+// size exceeds max_output but whose individual sections fit the budget. Each
+// section carries a DISTINCT id so the Pass 1 manifest's selectors resolve to
+// unique semantic units under pruning.
 func htmlMultiSectionFixture() []byte {
 	var b strings.Builder
 	b.WriteString("<!DOCTYPE html>\n<html>\n<head><title>big</title></head>\n<body>\n")
 	for i := 0; i < 40; i++ {
 		b.WriteString("<section id=\"section-")
-		b.WriteString(strings.Repeat("s", 2))
+		b.WriteString(strconv.Itoa(i))
 		b.WriteString("\">\n<h2>Section ")
-		b.WriteString(strings.Repeat("s", 1))
+		b.WriteString(strconv.Itoa(i))
 		b.WriteString("</h2>\n<p>")
 		b.WriteString(strings.Repeat("content line ", 15))
 		b.WriteString("</p>\n</section>\n")

@@ -629,6 +629,11 @@ func Wire(opts ...Option) (*Application, error) {
 		a.Bus,
 		runtimeAutonomy.WithPreflightBarrier(loopBarrier),
 		runtimeAutonomy.WithPreflightState(preflightState),
+		// PASS 1 MANIFEST AUTO-HOOK: a preflight-infeasible target issues a
+		// lightweight READ-ONLY manifest request before the DAG strategy is
+		// determined, so the plan is scoped to the mutation surface and
+		// unmodified sections are pruned (never a naive line slicer).
+		runtimeAutonomy.WithManifestPass(runtimeAutonomy.ManifestPassForExecutor(a.Executor)),
 	)
 	// ── AUTONOMY BOUNDARY-TELEMETRY SINK ─────────────────────────────────
 	// [boundary2]/[boundary5] diagnostic lines are routed onto the shared

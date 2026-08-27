@@ -106,6 +106,12 @@ func singleTaskDAG(objective, target string, source []byte, baseDigest string, m
 		est = budget
 	}
 	dag := planner.NewExecutionDAG(objective, target, planner.SplitSemantic, baseDigest, maxOutputTokens)
+	if manifest != nil && len(manifest.Mutations) > 0 {
+		// The atomic unit is scoped by the Pass 1 manifest's mutation surface:
+		// mark the plan manifest-scoped so Validate() does not demand whole-file
+		// contiguous coverage.
+		dag.ManifestScoped = true
+	}
 	totalLines := planner.LineCount(source)
 	if totalLines < 1 {
 		totalLines = 1
@@ -141,26 +147,156 @@ func singleTaskDAG(objective, target string, source []byte, baseDigest string, m
 	return dag, nil
 }
 
-// semanticDecompose constructs sub-tasks grouped by semantic blocks. It first
-// tries the canonical Lea semantic pipeline (DecomposeTarget) which tiles the
-// document by structural nodes (<section id="...">, CSS selectors, Go functions).
-// If the result would be a line-range fallback (SplitBoundedLines / low
-// semantic confidence with arbitrary windows), the manifest's selectors are used
-// to keep grouping semantic. This guarantees no arbitrary line-number splits.
-func semanticDecompose(objective, target string, source []byte, baseDigest string, maxOutputTokens int, _ *MutationManifest) (*planner.ExecutionDAG, error) {
-	dag, err := planner.DecomposeTarget(objective, target, source, baseDigest, maxOutputTokens)
+// semanticDecompose constructs sub-tasks grouped by semantic blocks, PRUNED
+// against the Pass 1 MutationManifest. The target's AST/Semantic units (Lea
+// structural scan: <section id="hero">, <head> metadata, CSS selectors) are
+// filtered against manifest.Mutations:
+//
+//   - A unit carrying a corresponding mutation spec (modify / delete / insert)
+//     KEEPS a sub-task.
+//   - A unit with NO corresponding mutation spec is PRUNED — it must never be
+//     scheduled, because a sub-task over an untouched block can only evaluate
+//     to no_op_objective_satisfied (zero API calls wasted on no-ops).
+//
+// Asserted invariant: no sub-task is ever created solely to evaluate to
+// no_op_objective_satisfied. When the manifest is nil or empty, or the scan
+// yields no trustworthy topology, decomposition degrades to the canonical
+// planner (or a single-pass bounded inspection) — never a naive line slicer.
+func semanticDecompose(objective, target string, source []byte, baseDigest string, maxOutputTokens int, manifest *MutationManifest) (*planner.ExecutionDAG, error) {
+	if manifest == nil || len(manifest.Mutations) == 0 {
+		// No manifest to prune against: full semantic decomposition unchanged.
+		return planner.DecomposeTarget(objective, target, source, baseDigest, maxOutputTokens)
+	}
+	// Candidate semantic blocks: Lea structural units first (HTML/JSX/Go
+	// templates), then the AST/block decomposer's top-level declarations
+	// (Go/Rust/TS). Both are AST/semantic nodes — never arbitrary line ranges.
+	scan := planner.LeaStructuralScan(target, source)
+	sections := semanticCandidateSections(scan, target, source)
+	if len(sections) == 0 {
+		// No trustworthy semantic topology to prune against: degrade to a
+		// single-pass bounded inspection rather than a blind line slicer.
+		return singleTaskDAG(objective, target, source, baseDigest, maxOutputTokens, manifest, planner.SubTaskBudget(maxOutputTokens))
+	}
+	kept := pruneSemanticUnits(manifest, scan, sections)
+	if len(kept) == 0 {
+		// The manifest named no block in the scanned topology: a single bounded
+		// inspection keeps the objective reachable without re-slicing lines.
+		return singleTaskDAG(objective, target, source, baseDigest, maxOutputTokens, manifest, planner.SubTaskBudget(maxOutputTokens))
+	}
+	dag, err := planner.StageSemanticSections(objective, target, source, baseDigest, maxOutputTokens, kept)
 	if err != nil {
 		return nil, err
 	}
-	// If the semantic scan produced a valid DAG with semantic units, return it
-	// directly — it already groups by AST/symbol boundaries, not line numbers.
-	// Only when the DAG fell back to low-semantic-confidence line slicing do we
-	// need to ensure the grouping stays semantic: in that case the caller still
-	// receives a valid DAG but its Kind will be recorded; the invariant is that
-	// we never produce arbitrary line-range windows as the primary strategy.
-	// The Lea scan already guarantees semantic grouping for HTML/Go/CSS, so
-	// returning DecomposeTarget satisfies the requirement.
+	diagnosticf("[preflight] semantic pruning kept %d/%d blocks (manifest mutations=%d) — %d sub-task(s), zero no-op-only units",
+		len(kept), len(sections), len(manifest.Mutations), len(dag.SubTasks))
 	return dag, nil
+}
+
+// semanticCandidateSections returns the AST/semantic blocks a manifest may
+// target: Lea structural units when the format is Lea-scannable, otherwise the
+// registered decomposer's top-level declaration sections.
+func semanticCandidateSections(scan *planner.LeaScanReport, target string, source []byte) []planner.Section {
+	if scan != nil && !scan.LowConfidence && len(scan.Units) > 0 {
+		return scan.Units
+	}
+	d := planner.ForTarget(target)
+	if d == nil {
+		return nil
+	}
+	sections, err := d.Split(target, source)
+	if err != nil {
+		return nil
+	}
+	return sections
+}
+
+// pruneSemanticUnits filters the semantic blocks down to exactly those covered
+// by a mutation spec in the Pass 1 manifest. A block with no corresponding
+// modify/delete/insert is pruned: scheduling it could only yield
+// no_op_objective_satisfied, which wastes a provider invocation.
+func pruneSemanticUnits(manifest *MutationManifest, scan *planner.LeaScanReport, sections []planner.Section) []planner.Section {
+	kept := make([]planner.Section, 0, len(sections))
+	for _, u := range sections {
+		if unitCoveredByManifest(manifest, scan, u) {
+			kept = append(kept, u)
+		}
+	}
+	return kept
+}
+
+// unitCoveredByManifest reports whether any mutation spec targets the semantic
+// unit. Matching is by structural identity: the unit's label or a topology
+// node it contains must carry the mutation's selector/symbol token.
+func unitCoveredByManifest(manifest *MutationManifest, scan *planner.LeaScanReport, u planner.Section) bool {
+	for _, mut := range manifest.Mutations {
+		if unitMatchesMutation(u, mut) {
+			return true
+		}
+		if scan != nil {
+			for i := range scan.Nodes {
+				n := &scan.Nodes[i]
+				if nodeMatchesMutation(*n, mut) && regionsOverlap(u.Region.StartLine, u.Region.EndLine, n.StartLine, n.EndLine) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// unitMatchesMutation matches a semantic unit's rendered label
+// ("<section#hero> hero", "<head> metadata") against a mutation spec's
+// selector/symbol ("#hero", "section#hero", "<section#hero>").
+func unitMatchesMutation(u planner.Section, mut MutationSpec) bool {
+	label := strings.ToLower(strings.TrimSpace(u.Label))
+	for _, raw := range []string{mut.Selector, mut.Symbol} {
+		key := normalizeMutationTarget(raw)
+		if key == "" {
+			continue
+		}
+		if strings.Contains(label, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// nodeMatchesMutation matches a topology node's CSS identity ("section#hero",
+// "div.nav") against a mutation spec's selector/symbol. Both the selector
+// token and the node's own id/class/tag are considered so "#hero",
+// "section#hero" and "hero" all resolve to the same node.
+func nodeMatchesMutation(n planner.DOMNode, mut MutationSpec) bool {
+	css := strings.ToLower(n.CSSSelector())
+	for _, raw := range []string{mut.Selector, mut.Symbol} {
+		key := normalizeMutationTarget(raw)
+		if key == "" {
+			continue
+		}
+		if strings.Contains(css, key) {
+			return true
+		}
+		if n.ID != "" && key == "#"+strings.ToLower(n.ID) {
+			return true
+		}
+		if key == strings.ToLower(n.Tag) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeMutationTarget lowercases a selector/symbol and strips the angle
+// brackets of an HTML identity ("<section#hero>" → "section#hero").
+func normalizeMutationTarget(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimPrefix(s, "<")
+	s = strings.TrimSuffix(s, ">")
+	return strings.TrimSpace(s)
+}
+
+// regionsOverlap reports whether two inclusive 1-indexed intervals intersect.
+func regionsOverlap(aStart, aEnd, bStart, bEnd int) bool {
+	return aStart <= bEnd && bStart <= aEnd
 }
 
 // Proposal returns the parked DECOMPOSITION_PROPOSAL plan, or nil while no
@@ -179,11 +315,12 @@ func (d *Driver) Proposal() *planner.ExecutionDAG {
 func (d *Driver) Plan() *planner.ExecutionDAG { return d.dag }
 
 // stageDecomposition reacts to a preflight_infeasible observation: it reads
-// the target content, asks the planner for a valid ExecutionDAG and parks the
-// loop at the typed proposal boundary. It returns false when decomposition is
-// unavailable or fails — the caller then falls through to the plain human
-// re-scope park (intent is never silently altered).
-func (d *Driver) stageDecomposition() bool {
+// the target content, runs the PASS 1 MANIFEST AUTO-HOOK (when wired) and asks
+// the planner for a valid ExecutionDAG, then parks the loop at the typed
+// proposal boundary. It returns false when decomposition is unavailable or
+// fails — the caller then falls through to the plain human re-scope park
+// (intent is never silently altered).
+func (d *Driver) stageDecomposition(ctx context.Context) bool {
 	if d.decompose == nil || d.adapter == nil || d.loop == nil {
 		return false
 	}
@@ -208,7 +345,12 @@ func (d *Driver) stageDecomposition() bool {
 	if base == "" {
 		base = d.adapter.WorkspaceVersion([]string{target})
 	}
-	dag, err := d.decompose(d.prompt, target, source, base, maxOut)
+	// The preflight autonomy loop decides the DAG strategy through the Pass 1
+	// manifest auto-hook (runPreflight): an infeasible target issues a
+	// read-only manifest request before any decomposition, so unmodified
+	// sections are pruned and a naive line slicer is never the primary
+	// strategy.
+	dag, err := d.runPreflight(ctx, d.prompt, target, source, base, maxOut)
 	if err != nil {
 		diagnosticf("[boundary2] decomposition unavailable: %v — falling back to explicit re-scope", err)
 		return false

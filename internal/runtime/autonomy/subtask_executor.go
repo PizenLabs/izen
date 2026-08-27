@@ -104,7 +104,10 @@ func retryEvidenceSignal(st planner.SubTask, o autonomy.Observation, attempt int
 
 // retryDirective builds the self-correction context appended to a retry
 // attempt's prompt: what was rejected, the concrete validation error, and the
-// strict block contract restated verbatim.
+// strict block contract restated verbatim. A structural audit rejection
+// (unterminated <script>, unbalanced HTML) is rewritten into the AST-aware
+// [CONTRACT FAILURE] Line <N>: <ParseError> directive so the successor
+// anchors its correction at the exact defect instead of resending raw code.
 func retryDirective(st planner.SubTask, o autonomy.Observation, attempt int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
@@ -112,7 +115,7 @@ func retryDirective(st planner.SubTask, o autonomy.Observation, attempt int) str
 		attempt, maxSubTaskAttempts, st.ID, o.Outcome)
 	if detail := strings.TrimSpace(o.Diagnostic); detail != "" {
 		b.WriteString("\nValidation error: ")
-		b.WriteString(detail)
+		b.WriteString(execution.StructuralAuditDirective(detail))
 	}
 	b.WriteString("\n")
 	b.WriteString(patchContractBlock)

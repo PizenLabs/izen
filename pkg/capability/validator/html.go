@@ -73,12 +73,32 @@ func scanWellFormed(data []byte) error {
 			}
 			o += from
 			if !strings.Contains(lower[o:], "</"+re.label) {
-				return fmt.Errorf("unterminated <%s> element", re.label)
+				// The AST structural audit MUST carry the exact opening line of
+				// the unclosed raw-text element so the retry prompt can anchor
+				// the correction at the precise location (Line N diagnostic).
+				return fmt.Errorf("unterminated <%s> element at line %d", re.label, lineAt(lower, o))
 			}
 			from = o + len(re.open)
 		}
 	}
 	return nil
+}
+
+// lineAt returns the 1-indexed line of byte offset o within s.
+func lineAt(s string, o int) int {
+	if o < 0 {
+		o = 0
+	}
+	if o > len(s) {
+		o = len(s)
+	}
+	line := 1
+	for i := 0; i < o; i++ {
+		if s[i] == '\n' {
+			line++
+		}
+	}
+	return line
 }
 
 // scanTagState walks data character by character tracking whether the scan
