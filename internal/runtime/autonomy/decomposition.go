@@ -245,6 +245,19 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 			st.ID, obs.Outcome, i+1, n, short(after))
 	}
 
+	// ── POST-DAG GLOBAL STRUCTURAL VERIFICATION ────────────────────────
+	// Every unit gate passed, yet per-unit isolation is blind to aggregate
+	// regressions (st-1 removes a CSS definition st-4 still uses). Before
+	// the DAG may claim completion, the WHOLE mutated document is audited
+	// against its pre-DAG baseline. A rejected audit overrides completion:
+	// OBJECTIVE_UNRESOLVED, decision returned to awaiting_human, applied
+	// units preserved. The loop is parked — return immediately with NO
+	// termination (a parked run terminates nothing), exactly like the
+	// NO-OP escalation path above.
+	if d.globalVerify != nil && d.verifyGlobalObjective(ctx, dag, originals) {
+		return d.term()
+	}
+
 	dag.Status = planner.DagExecutionCompleted
 	reason := fmt.Sprintf("decomposition executed atomically: %d/%d sub-tasks applied to %s (base digest %s… restored nowhere — all units landed)",
 		n, n, dag.Target, short(dag.BaseTreeDigest))

@@ -58,11 +58,20 @@ const (
 	// failed: already-applied units stay in place, remaining units never
 	// executed, and the decision returns to a human boundary.
 	DagEscalated PlanStatus = "DAG_ESCALATED"
+	// ObjectiveUnresolved: every sub-task applied, but the POST-DAG GLOBAL
+	// STRUCTURAL VERIFIER rejected the final document state against the
+	// overarching objective (orphaned references introduced by cross-subtask
+	// interaction, invalid syntax, an unfulfilled removal). Per-unit gates all
+	// passed — the regression only exists in the AGGREGATE — so this is not a
+	// unit failure. Applied units stay in place (they each passed Boundary 5)
+	// and the decision returns to awaiting_human with the audit evidence.
+	ObjectiveUnresolved PlanStatus = "OBJECTIVE_UNRESOLVED"
 )
 
 // Terminal reports whether the plan reached a terminal status.
 func (s PlanStatus) Terminal() bool {
-	return s == DagExecutionCompleted || s == DagExecutionFailed || s == DagEscalated
+	return s == DagExecutionCompleted || s == DagExecutionFailed ||
+		s == DagEscalated || s == ObjectiveUnresolved
 }
 
 // SubTask is one executable unit of a decomposed objective. It is scoped to a

@@ -147,6 +147,19 @@ const (
 	// compiles a structural understanding of an artifact (HTML structure,
 	// orphan content, invalid regions, code symbols, dependencies).
 	EventContextCompiled = "context.compiled"
+	// EventPromptAdmitted is emitted IMMEDIATELY after intent parsing on the
+	// UI critical path. It MUST NOT carry synchronous file IO, AST/DOM
+	// scanning or budget estimation — those run in BackgroundPreflight. The
+	// emission is the admission barrier (<10ms wall-clock).
+	EventPromptAdmitted = "prompt.admitted"
+	// EventStructuralSnapshot is emitted when BackgroundPreflight completes and
+	// publishes its snapshot to Observation State. The PreflightSyncBarrier
+	// gates observing->deciding on this event.
+	EventStructuralSnapshot = "preflight.snapshot"
+	// EventPreflightFailed is emitted when BackgroundPreflight encounters an
+	// unrecoverable IO/parse error. Execution must halt and route to
+	// awaiting_human / error.
+	EventPreflightFailed = "preflight.failed"
 )
 
 // FailureClassification is the taxonomy used by EventExecutionFailed. It is
@@ -945,5 +958,73 @@ func NewContextCompiledIntel(path, kind string, findingCount int, language, stra
 		Language:     language,
 		Strategy:     strategy,
 		Confidence:   confidence,
+	})
+}
+
+// ── Prompt admission / preflight lifecycle ─────────────────────────────────
+
+// PromptAdmittedPayload carries the prompt admission on the UI critical path.
+// It is emitted IMMEDIATELY after intent parsing, before any file IO, AST/DOM
+// scan or budget estimation. Latency to this event is the UI admission SLO
+// (<10ms).
+type PromptAdmittedPayload struct {
+	Prompt    string
+	Intent    string
+	Timestamp time.Time
+	Latency   time.Duration
+}
+
+// StructuralSnapshotPayload carries the BackgroundPreflight result published to
+// Observation State. It is the gate for the PreflightSyncBarrier between
+// observing and deciding.
+type StructuralSnapshotPayload struct {
+	Target          string
+	SHA256          string
+	EstimatedTokens int
+	TotalLines      int
+	ScanFindings    int
+}
+
+// PreflightFailedPayload carries an unrecoverable preflight error that must
+// halt execution and route to awaiting_human / error.
+type PreflightFailedPayload struct {
+	Target string
+	Reason string
+	Error  string
+}
+
+// NewPromptAdmitted publishes that a prompt was admitted on the UI critical
+// path. Latency is the wall-clock time spent inside submit_prompt.
+func NewPromptAdmitted(prompt, intent string, latency time.Duration) DomainEvent {
+	return newEvent(EventPromptAdmitted, PromptAdmittedPayload{
+		Prompt:    prompt,
+		Intent:    intent,
+		Timestamp: time.Now(),
+		Latency:   latency,
+	})
+}
+
+// NewStructuralSnapshot publishes that BackgroundPreflight completed and the
+// snapshot is available in Observation State.
+func NewStructuralSnapshot(target, sha256 string, tokens, lines, findings int) DomainEvent {
+	return newEvent(EventStructuralSnapshot, StructuralSnapshotPayload{
+		Target:          target,
+		SHA256:          sha256,
+		EstimatedTokens: tokens,
+		TotalLines:      lines,
+		ScanFindings:    findings,
+	})
+}
+
+// NewPreflightFailed publishes that BackgroundPreflight failed unrecoverably.
+func NewPreflightFailed(target, reason string, err error) DomainEvent {
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	return newEvent(EventPreflightFailed, PreflightFailedPayload{
+		Target: target,
+		Reason: reason,
+		Error:  msg,
 	})
 }

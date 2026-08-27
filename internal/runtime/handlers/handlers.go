@@ -19,7 +19,9 @@ import (
 	"github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/runtime"
+	"github.com/PizenLabs/izen/internal/telemetry"
 )
 
 // Sentinel errors returned by the real handlers.
@@ -58,6 +60,18 @@ type HandlerDeps struct {
 	// Now is an injectable clock for deterministic duration telemetry.
 	// Defaults to time.Since at the handler level.
 	Now func() time.Time
+	// PreflightWorker is the BackgroundPreflight async worker. When wired,
+	// SubmitPrompt dispatches preflight off the UI critical path and emits
+	// PromptAdmitted immediately (<10ms). Nil disables background dispatch
+	// (headless/tests remain synchronous but still non-blocking).
+	PreflightWorker *preflight.Worker
+	// PreflightTargets, when set, overrides target resolution for the
+	// background preflight (tests).
+	PreflightTargets []string
+	// Telemetry is the high-precision latency sink for prompt_submit_latency
+	// / preflight_latency / first_stream_latency. Nil defaults to the global
+	// recorder.
+	Telemetry *telemetry.Recorder
 }
 
 // ApprovalResult reports the file a resolved approval maps to and its net
@@ -135,6 +149,13 @@ type SubmitPromptHandler struct {
 func (h *SubmitPromptHandler) Command() runtime.CommandType { return runtime.CommandSubmitPrompt }
 
 // Handle implements runtime.CommandHandler.
+//
+// NON-BLOCKING PROMPT ADMISSION (UI invariant): this method MUST NOT perform
+// synchronous file IO, AST/DOM scanning (LeaStructuralScan), tokenization, or
+// budget estimation. Admission response (PromptAdmitted) is emitted immediately
+// after intent parsing (<10ms wall-clock). Heavy discovery is dispatched as a
+// BackgroundPreflight async goroutine which publishes StructuralSnapshot to
+// Observation State and notifies the PreflightSyncBarrier.
 func (h *SubmitPromptHandler) Handle(ctx context.Context, cmd runtime.RuntimeCommand) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -148,12 +169,42 @@ func (h *SubmitPromptHandler) Handle(ctx context.Context, cmd runtime.RuntimeCom
 	}
 
 	start := h.now()
+	wallStart := time.Now()
 
-	// 1. Intent classification (deterministic, no LLM dependency).
+	// High-precision first_stream accounting: mark user Enter.
+	rec := h.deps.Telemetry
+	if rec == nil {
+		rec = telemetry.Default()
+	}
+	rec.MarkPromptEntered(wallStart)
+
+	// 1. Intent classification (deterministic, no LLM dependency). No IO.
 	intent, confidence := ClassifyIntent(c.Prompt, c.Mode)
+	// Emit intent via bus — UI invariant log stays off stdio (diagnostic sink / bus).
 	h.emit(events.NewIntentParsed(intent, c.Prompt, confidence))
+	h.emit(events.NewActivity(fmt.Sprintf("[submit_prompt] intent parsed intent=%s", intent)))
 
-	// 2. Phase routing: an explicit target mode transitions the domain phase.
+	// 2. Admission: emit PromptAdmitted IMMEDIATELY on the UI critical path.
+	elapsed := time.Since(wallStart)
+	// Use wall-clock elapsed for the PromptAdmitted latency; handler clock
+	// (h.now) is used for stage duration telemetry.
+	handlerElapsed := time.Since(start)
+	if rec != nil {
+		rec.RecordPromptSubmit(elapsed)
+	}
+	telemetry.RecordPromptSubmit(elapsed)
+	h.emit(events.NewPromptAdmitted(c.Prompt, intent, elapsed))
+	h.emit(events.NewActivity(fmt.Sprintf("[event] PromptAdmitted intent=%s latency=%s", intent, elapsed)))
+
+	// 3. Dispatch BackgroundPreflight async — NEVER synchronously read/scan.
+	if w := h.deps.PreflightWorker; w != nil {
+		targets := h.deps.PreflightTargets
+		// Use a detached context so the bg worker outlives the handler's ctx.
+		bgCtx := context.Background()
+		w.Start(bgCtx, c.Prompt, targets) //nolint:contextcheck // detached bg preflight context outlives the handler
+	}
+
+	// 4. Phase routing: an explicit target mode transitions the domain phase.
 	target := intent
 	if ph, ok := ParsePhase(c.Mode); ok {
 		target = ph.String()
@@ -164,7 +215,7 @@ func (h *SubmitPromptHandler) Handle(ctx context.Context, cmd runtime.RuntimeCom
 		return err
 	}
 
-	h.emit(events.NewStageCompleted("submit_prompt", time.Since(start),
+	h.emit(events.NewStageCompleted("submit_prompt", handlerElapsed,
 		fmt.Sprintf("prompt routed to %s", target)))
 	return nil
 }

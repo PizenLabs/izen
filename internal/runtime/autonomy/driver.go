@@ -9,6 +9,8 @@ import (
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
+	"github.com/PizenLabs/izen/internal/execution/preflight"
+	"github.com/PizenLabs/izen/internal/loop"
 )
 
 // Decider maps a bounded observation to the next loop decision. It is
@@ -49,6 +51,13 @@ type Driver struct {
 	// dag is the most recently staged/executed decomposition plan.
 	dag *planner.ExecutionDAG
 
+	// globalVerify is the POST-DAG GLOBAL STRUCTURAL VERIFIER: after every
+	// sub-task of a proposal DAG applied, it audits the whole mutated
+	// document against the pre-DAG baseline. A failed audit overrides the
+	// DAG status to OBJECTIVE_UNRESOLVED and parks at awaiting_human. Nil
+	// disables global verification (pre-verifier behavior).
+	globalVerify GlobalVerifyFunc
+
 	// runCtx is the context for the current run. It is stored so Abort()
 	// can cancel the same context that observeAndRun is watching.
 	runCtx context.Context
@@ -68,6 +77,12 @@ type Driver struct {
 	aggKnown  bool
 	// runRequestID is the stable parent request identity for the current run.
 	runRequestID string
+
+	// preflightBarrier gates observing -> deciding until BackgroundPreflight
+	// completes. Nil disables the barrier (existing tests remain non-blocking).
+	preflightBarrier *loop.Barrier
+	// preflightState is the Observation State where StructuralSnapshot is published.
+	preflightState *preflight.ObservationState
 }
 
 // Option configures the Driver during construction.
@@ -111,18 +126,30 @@ func WithDecompose(f DecomposeFunc) Option {
 	return func(d *Driver) { d.decompose = f }
 }
 
+// WithPreflightBarrier wires the PreflightSyncBarrier that gates observing ->
+// deciding until BackgroundPreflight completes (10s timeout → PREFLIGHT_TIMEOUT).
+func WithPreflightBarrier(b *loop.Barrier) Option {
+	return func(d *Driver) { d.preflightBarrier = b }
+}
+
+// WithPreflightState wires the Observation State where StructuralSnapshot is published.
+func WithPreflightState(s *preflight.ObservationState) Option {
+	return func(d *Driver) { d.preflightState = s }
+}
+
 // NewDriver wires the bounded loop over the executor adapter. bus may be nil
 // (loop runs headless; transitions are still recorded in History). By default
 // the driver stages DECOMPOSITION_PROPOSAL plans when Boundary 2 refuses an
 // objective as preflight_infeasible; see WithDecompose to override or disable.
 func NewDriver(adapter *ExecutorAdapter, bus *events.Bus, opts ...Option) *Driver {
 	d := &Driver{
-		adapter:   adapter,
-		bus:       bus,
-		bounds:    autonomy.DefaultLoopBounds(),
-		decide:    decideDefault,
-		repair:    typedRepair,
-		decompose: defaultDecompose,
+		adapter:      adapter,
+		bus:          bus,
+		bounds:       autonomy.DefaultLoopBounds(),
+		decide:       decideDefault,
+		repair:       typedRepair,
+		decompose:    defaultDecompose,
+		globalVerify: defaultGlobalVerify,
 	}
 	for _, o := range opts {
 		o(d)
@@ -400,9 +427,45 @@ func (d *Driver) SetStreamCallback(cb execution.StreamCallback) {
 // execute until the loop terminates or parks at AwaitingHuman.
 // runID is the identity of the run that started this observation loop;
 // late results from a different runID are discarded.
+//
+// Preflight barrier: when wired, the transition from observing to deciding is
+// gated by PreflightSyncBarrier (10s timeout → PREFLIGHT_TIMEOUT). This is the
+// execution invariant: async discovery never means unverified execution.
 func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.LoopTermination, error) {
+	if d.preflightBarrier != nil {
+		if d.bus != nil {
+			d.bus.Publish(events.NewActivity("[loop] observing (waiting preflight barrier)"))
+		}
+		if _, err := d.preflightBarrier.Wait(ctx); err != nil {
+			// Barrier failed (timeout or unrecoverable preflight error) — halt
+			// gracefully and route to awaiting_human / error state.
+			reason := fmt.Sprintf("preflight failed: %v", err)
+			if errors.Is(err, loop.ErrPreflightTimeout) || errors.Is(err, preflight.ErrPreflightTimeout) {
+				reason = "PREFLIGHT_TIMEOUT: preflight did not complete within 10s"
+			}
+			// Ensure loop is in AwaitingHuman so a human can observe the failure.
+			if d.loop.State() == autonomy.RuntimeObserving {
+				// Move observing -> deciding first so AwaitHuman is legal.
+				_ = d.loop.Observe(d.obs)
+				d.publish(ctx)
+			}
+			if d.loop.State() != autonomy.RuntimeAwaitingHuman {
+				d.loop.AwaitHuman(autonomy.HumanBoundary{Reason: reason})
+				d.publish(ctx)
+			}
+			if errors.Is(err, loop.ErrPreflightTimeout) || errors.Is(err, preflight.ErrPreflightTimeout) {
+				return d.terminateAbort(ctx, reason, autonomy.FailurePermanent), nil
+			}
+			// Unrecoverable IO/parse error: park at awaiting_human (not abort)
+			d.enrichBoundary()
+			return d.term(), nil
+		}
+	}
 	if got := d.loop.Observe(d.obs); got != autonomy.RuntimeDeciding {
 		return d.term(), fmt.Errorf("autonomy: observe -> %s, want deciding", got)
+	}
+	if d.bus != nil {
+		d.bus.Publish(events.NewActivity("[loop] observing -> deciding"))
 	}
 	d.publish(ctx)
 	for !d.loop.State().IsTerminal() {
