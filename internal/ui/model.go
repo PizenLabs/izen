@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -700,7 +701,8 @@ type model struct {
 	// structural context (Lea graph symbols, tool logs, architecture overview)
 	// ahead of the LLM call. Lazily constructed from the native graph and the
 	// workspace root; nil when no graph is ready.
-	planner *planner.Planner
+	planner   *planner.Planner
+	plannerMu sync.Mutex
 
 	// Input
 	ti    textinput.Model
@@ -1575,6 +1577,8 @@ func (m *model) contextPlanner() *planner.Planner {
 	if m == nil || (m.leaEng == nil && m.graph == nil) {
 		return nil
 	}
+	m.plannerMu.Lock()
+	defer m.plannerMu.Unlock()
 	if m.planner != nil {
 		return m.planner
 	}

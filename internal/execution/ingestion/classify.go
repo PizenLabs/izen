@@ -69,7 +69,172 @@ func hasUnterminatedStructuralTag(s string) bool {
 	if countMatch(styleOpen, s) != countMatch(styleClose, s) {
 		return true
 	}
+	if hasUnbalancedGenericHTMLTag(s) {
+		return true
+	}
 	return false
+}
+
+// hasUnbalancedGenericHTMLTag reports whether the payload contains an unclosed
+// non-void HTML element (e.g. <div> without </div>). It is the generic
+// envelope-integrity check that surfaces recoverable AST/HTML errors for the
+// candidate-based repair path. Valid balanced markup returns false.
+func hasUnbalancedGenericHTMLTag(s string) bool {
+	if !strings.Contains(s, "<") || !strings.Contains(s, ">") {
+		return false
+	}
+	// Fast-path: no alphabetic tag present.
+	if !isHTMLLikeClassify(s) {
+		return false
+	}
+	unclosed := detectUnclosedTagsClassify(s)
+	return len(unclosed) > 0
+}
+
+func isHTMLLikeClassify(s string) bool {
+	lower := strings.ToLower(s)
+	tagRe := regexp.MustCompile(`</?[a-zA-Z][a-zA-Z0-9]*[\s>/]`)
+	return tagRe.MatchString(lower)
+}
+
+// detectUnclosedTagsClassify is a local copy of the stack balancer for use
+// inside Classify to avoid importing the full repair heuristic. It mirrors
+// repair.detectUnclosedTags without the confidence/diff machinery.
+func detectUnclosedTagsClassify(s string) []string {
+	type frame struct{ tag string }
+	var stack []frame
+	inComment := false
+	rawText := ""
+	for i := 0; i < len(s); {
+		if inComment {
+			if end := strings.Index(s[i:], "-->"); end >= 0 {
+				inComment = false
+				i += end + 3
+				continue
+			}
+			break
+		}
+		if rawText != "" {
+			j := indexFoldClassify(s, "</"+rawText, i)
+			if j < 0 {
+				break
+			}
+			gt := strings.IndexByte(s[j:], '>')
+			if gt < 0 {
+				break
+			}
+			if len(stack) > 0 && stack[len(stack)-1].tag == rawText {
+				stack = stack[:len(stack)-1]
+			}
+			rawText = ""
+			i = j + gt + 1
+			continue
+		}
+		lt := strings.IndexByte(s[i:], '<')
+		if lt < 0 {
+			break
+		}
+		i += lt
+		rest := s[i:]
+		switch {
+		case strings.HasPrefix(rest, "<!--"):
+			if end := strings.Index(rest, "-->"); end >= 0 {
+				i += end + 3
+			} else {
+				inComment = true
+				i = len(s)
+			}
+			continue
+		case strings.HasPrefix(strings.ToLower(rest), "<!doctype"):
+			gt := strings.IndexByte(rest, '>')
+			if gt < 0 {
+				i = len(s)
+			} else {
+				i += gt + 1
+			}
+			continue
+		case strings.HasPrefix(rest, "<?"):
+			if end := strings.Index(rest, "?>"); end >= 0 {
+				i += end + 2
+			} else {
+				i = len(s)
+			}
+			continue
+		}
+		gt := strings.IndexByte(rest, '>')
+		if gt < 0 {
+			break
+		}
+		interior := strings.TrimSpace(rest[1:gt])
+		selfClosing := strings.HasSuffix(interior, "/")
+		interior = strings.TrimSpace(strings.TrimRight(interior, "/"))
+		closing := strings.HasPrefix(interior, "/")
+		name := strings.ToLower(tagNameClassify(strings.TrimPrefix(interior, "/")))
+		if name == "" {
+			i += gt + 1
+			continue
+		}
+		switch {
+		case closing:
+			found := -1
+			for k := len(stack) - 1; k >= 0; k-- {
+				if stack[k].tag == name {
+					found = k
+					break
+				}
+			}
+			if found >= 0 {
+				stack = stack[:found]
+				if rawText == name {
+					rawText = ""
+				}
+			}
+		case selfClosing || voidElementsClassify[name]:
+			// no stack push
+		default:
+			stack = append(stack, frame{tag: name})
+			if rawTextElementsClassify[name] {
+				rawText = name
+			}
+		}
+		i += gt + 1
+	}
+	out := make([]string, 0, len(stack))
+	for _, f := range stack {
+		out = append(out, f.tag)
+	}
+	return out
+}
+
+var voidElementsClassify = map[string]bool{
+	"area": true, "base": true, "br": true, "col": true, "embed": true,
+	"hr": true, "img": true, "input": true, "link": true, "meta": true,
+	"param": true, "source": true, "track": true, "wbr": true,
+}
+
+var rawTextElementsClassify = map[string]bool{
+	"script": true, "style": true, "textarea": true, "title": true,
+}
+
+func tagNameClassify(tag string) string {
+	tag = strings.TrimSpace(tag)
+	for i, r := range tag {
+		if r == ' ' || r == '\t' || r == '\n' || r == '/' {
+			return tag[:i]
+		}
+	}
+	return tag
+}
+
+func indexFoldClassify(s, sub string, from int) int {
+	if from >= len(s) {
+		return -1
+	}
+	j := strings.Index(strings.ToLower(s[from:]), strings.ToLower(sub))
+	if j < 0 {
+		return -1
+	}
+	return from + j
 }
 
 func countMatch(re *regexp.Regexp, s string) int {

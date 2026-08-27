@@ -12,7 +12,8 @@ type IngestionTrace struct {
 	// line endings and all. It is never altered by normalization.
 	RawOutput string `json:"raw_output"`
 	// NormalizedPayload is the transport-normalized artifact payload handed to
-	// the L1 Execution Gate. It carries NO semantic repair.
+	// the L1 Execution Gate. It carries NO semantic repair unless a
+	// RepairCandidate was accepted (see RepairCandidate).
 	NormalizedPayload string `json:"normalized_payload"`
 	// Classification records the envelope-integrity disposition of the
 	// normalized payload.
@@ -22,4 +23,11 @@ type IngestionTrace struct {
 	Steps []NormalizationStep `json:"steps"`
 	// Timestamp is when the ingestion pass ran.
 	Timestamp time.Time `json:"timestamp"`
+	// RepairCandidate is the explicit, candidate-based semantic repair proposal
+	// for a ClassSyntaxInvalid payload, when one was generated. Nil when no
+	// heuristic applied. When accepted, the repair details (original vs.
+	// repaired diff, heuristic rule applied) are explicitly recorded here and
+	// travel into ExecutionEvidence for forensic audit. The engine MUST NEVER
+	// perform silent semantic fixes — any proposed modification appears here.
+	RepairCandidate *RepairCandidate `json:"repair_candidate,omitempty"`
 }

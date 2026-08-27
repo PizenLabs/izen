@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/retrieval"
 )
@@ -348,6 +349,34 @@ func (p *Planner) routesOrEmpty(ctx context.Context) string {
 	return routes
 }
 
+// isGenericQuery reports whether the input is too generic to yield useful file
+// hits. Generic single-word queries like "what", "hi", "hello" trigger a
+// Lynx subprocess that scans the entire index and stalls for ~4s, while
+// contributing zero signal to the context budget.
+func isGenericQuery(input string) bool {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return true
+	}
+	fields := strings.Fields(trimmed)
+	if len(fields) == 1 {
+		lower := strings.ToLower(fields[0])
+		lower = strings.Trim(lower, ".,!?:;~_-")
+		if len(lower) < 4 {
+			return true
+		}
+		if isFunctionWord(lower) {
+			return true
+		}
+		// Greetings are generic by definition.
+		switch lower {
+		case "hi", "hello", "hey", "yo", "sup", "what", "why", "how", "when", "where", "who":
+			return true
+		}
+	}
+	return false
+}
+
 // gatherFileHits performs a focused search and pulls localized snippets for
 // the best matches. File chunks carry the LOWEST priority so budget
 // enforcement drops raw file reads in favor of graph symbols.
@@ -355,7 +384,17 @@ func (p *Planner) gatherFileHits(ctx context.Context, priority map[SourceType]in
 	if p.files == nil {
 		return nil
 	}
-	hits, err := p.files.Search(ctx, input)
+	if isGenericQuery(input) {
+		p.log("[planner] skip generic file search for %q", input)
+		return nil
+	}
+	// Enforce a tight deadline on the search so a slow Lynx subprocess
+	// (e.g. 4s for "what") can never stall the TUI event loop. The planner
+	// runs on a background goroutine, but a hung subprocess still consumes
+	// the goroutine and delays askStreamPreparedMsg delivery.
+	searchCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	hits, err := p.files.Search(searchCtx, input)
 	if err != nil {
 		p.log("[planner] file source error: %v", err)
 		return nil

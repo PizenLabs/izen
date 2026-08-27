@@ -2038,6 +2038,20 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		trace, procErr := ingestion.Process(resp.Content)
 		visible := ai.VisibleCompletion(trace.NormalizedPayload)
 		if procErr != nil {
+			if errors.Is(procErr, ingestion.ErrSyntaxInvalid) && trace != nil && trace.RepairCandidate != nil {
+				candidate := trace.RepairCandidate
+				if ingestion.IsASTValid(candidate.ProposedPayload) && ingestion.WithinSafetyThreshold(trace.NormalizedPayload, candidate) {
+					ingestion.RecordRepairAccepted()
+					log.Printf("[ingestion] repair candidate accepted rule=%s", candidate.RuleID)
+					if globalActivityLog != nil {
+						globalActivityLog("[ingestion] repair candidate accepted rule=%s", candidate.RuleID)
+					}
+					trace.NormalizedPayload = candidate.ProposedPayload
+					trace.Classification = ingestion.ClassTransportNormalized
+					visible = ai.VisibleCompletion(trace.NormalizedPayload)
+					return visible, usage, trace, nil
+				}
+			}
 			return visible, usage, trace, procErr
 		}
 		return visible, usage, trace, nil
@@ -2179,6 +2193,20 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: usage.FinishReason, Usage: usage})
 	}
 	if procErr != nil {
+		if errors.Is(procErr, ingestion.ErrSyntaxInvalid) && trace != nil && trace.RepairCandidate != nil {
+			candidate := trace.RepairCandidate
+			if ingestion.IsASTValid(candidate.ProposedPayload) && ingestion.WithinSafetyThreshold(trace.NormalizedPayload, candidate) {
+				ingestion.RecordRepairAccepted()
+				log.Printf("[ingestion] repair candidate accepted rule=%s", candidate.RuleID)
+				if globalActivityLog != nil {
+					globalActivityLog("[ingestion] repair candidate accepted rule=%s", candidate.RuleID)
+				}
+				trace.NormalizedPayload = candidate.ProposedPayload
+				trace.Classification = ingestion.ClassTransportNormalized
+				visible = ai.VisibleCompletion(trace.NormalizedPayload)
+				return visible, usage, trace, nil
+			}
+		}
 		return visible, usage, trace, procErr
 	}
 	return visible, usage, trace, nil

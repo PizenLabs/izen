@@ -824,6 +824,16 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 				m.push(roleAI, response)
 				return nil
 			}
+			// ── INSTANT VISUAL FEEDBACK (TUI non-blocking invariant) ─────
+			// The Model · waiting stage MUST be visible in <10ms from Enter,
+			// BEFORE the async Context Planner (Lea + retrieval) runs. The
+			// planner's gatherFileHits / SearchContext can stall for ~5s on a
+			// generic query ("what") via the Lynx subprocess, which previously
+			// gated the waiting state until after the scan. Publish the stage
+			// synchronously here on the UI goroutine so the next View() flush
+			// already contains "Model · waiting" while the background goroutine
+			// assembles context.
+			m.setStage("model", m.getActiveModelName(), stageWaiting)
 			return m.prepareAskStreamCmd(content)
 		}
 
@@ -848,14 +858,17 @@ func (m *model) prepareAskStreamCmd(content string) tea.Cmd {
 	return func() tea.Msg {
 		prepared := content
 		governed := false
-		var trace *ctxpkg.CodebaseTrace
-		if p != nil {
-			if plan, err := p.Plan(context.Background(), content); err == nil && plan != nil && len(plan.Chunks) > 0 {
+		var cbTrace *ctxpkg.CodebaseTrace
+		if p != nil && !isGenericAskContent(content) {
+			ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+			plan, err := p.Plan(ctx, content)
+			cancel()
+			if err == nil && plan != nil && len(plan.Chunks) > 0 {
 				header := fmt.Sprintf("### PLANNED CONTEXT (%s intent, %d tokens)\n\n",
 					plan.Intent, plan.TokenTotal)
 				prepared = header + plan.Assemble() + "\n\n" + content
 				governed = true
-				trace = planToTrace(plan)
+				cbTrace = planToTrace(plan)
 			}
 		}
 		if !governed {
@@ -867,7 +880,7 @@ func (m *model) prepareAskStreamCmd(content string) tea.Cmd {
 			// The fallback attempted resolution, so streamCmd must not re-run it.
 			governed = true
 		}
-		return askStreamPreparedMsg{content: prepared, governed: governed, trace: trace}
+		return askStreamPreparedMsg{content: prepared, governed: governed, trace: cbTrace}
 	}
 }
 
@@ -4469,6 +4482,32 @@ func hasExecutableBuildTarget(content string, m *model) bool {
 }
 
 // extractTodosFromPlan extracts TODO items from a plan-mode LLM response.
+// isGenericAskContent reports whether the ask content is too generic to
+// benefit from workspace context. Generic single-word queries stall the
+// planner's Lynx subprocess for ~4s while yielding zero signal.
+func isGenericAskContent(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return true
+	}
+	fields := strings.Fields(trimmed)
+	if len(fields) == 1 {
+		lower := strings.ToLower(strings.Trim(fields[0], ".,!?:;~_-\"'"))
+		if len(lower) < 4 {
+			return true
+		}
+		switch lower {
+		case "what", "why", "how", "when", "where", "who", "which", "hi", "hello", "hey", "yo", "sup":
+			return true
+		}
+		switch lower {
+		case "the", "and", "for", "with", "why", "how", "what", "when", "does", "is", "are", "this", "that", "from", "into", "about", "will", "can", "explain", "describe", "find", "show", "fix", "debug", "log", "panic", "error", "crash", "test", "tests", "failure", "failing", "refactor", "architecture", "overview", "route", "routes", "function", "func":
+			return true
+		}
+	}
+	return false
+}
+
 func extractTodosFromPlan(content string) []string {
 	tasks := plan.ParseMarkdownToTasks(content)
 	if len(tasks) > 0 {
