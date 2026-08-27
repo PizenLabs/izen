@@ -3,6 +3,8 @@ package execution
 import (
 	"strings"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/execution/ingestion"
 )
 
 // ── ExecutionEvidence (Phase 2 P2 — authoritative execution record) ─────────
@@ -109,6 +111,11 @@ type ExecutionEvidence struct {
 	mutations     MutationSetSummary
 	startedAt     time.Time
 	finishedAt    time.Time
+	// ingestionTrace is the forensic transport-normalization record of the raw
+	// LLM response that produced this execution's artifact. It is sealed once
+	// at construction (set by the runtime during terminal sealing) and read
+	// only — there is no setter, preserving evidence immutability.
+	ingestionTrace *ingestion.IngestionTrace
 }
 
 // ContractID returns the identity of the contract this attempt belongs to.
@@ -187,6 +194,17 @@ func (e *ExecutionEvidence) FinishedAt() time.Time {
 		return time.Time{}
 	}
 	return e.finishedAt
+}
+
+// IngestionTrace returns the forensic transport-normalization record attached
+// to this evidence, or nil when the execution did not ingest an LLM artifact
+// (e.g. a clean read-only completion without a model call, or a pre-admission
+// failure). It is read-only: evidence is append-only truth.
+func (e *ExecutionEvidence) IngestionTrace() *ingestion.IngestionTrace {
+	if e == nil {
+		return nil
+	}
+	return e.ingestionTrace
 }
 
 // Authoritative reports whether this evidence may drive an authoritative

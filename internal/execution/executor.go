@@ -20,6 +20,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/events"
 	runtimegraph "github.com/PizenLabs/izen/internal/execution/graph"
+	"github.com/PizenLabs/izen/internal/execution/ingestion"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/retrieval"
@@ -342,6 +343,11 @@ type ExecutionResult struct {
 	// derive terminal execution truth. It is nil while the execution is still
 	// held at the approval gate (not yet terminated).
 	Evidence *ExecutionEvidence
+	// IngestionTrace is the forensic transport-normalization record of the raw
+	// LLM response that produced this execution's artifact. It preserves the
+	// exact unmutated model output and every transport transformation, and is
+	// attached to the sealed ExecutionEvidence for post-mortem traceability.
+	IngestionTrace *ingestion.IngestionTrace
 	// Completed is the authoritative terminal usage account computed by the
 	// runtime from the provider-reported usage. The renderer reads it for the
 	// footer / EXPANDED token numbers and never re-derives them.
@@ -385,6 +391,11 @@ type pendingMutation struct {
 	// pipeline writes anything; a mismatch aborts with ABORTED_OCC and zero
 	// partial writes.
 	baseline *WorkspaceBaseline
+	// ingestionTrace is the forensic transport-normalization record of the raw
+	// LLM response that produced the held artifact. It is carried through the
+	// approval gate so the terminal (committed or rejected) evidence can attach
+	// it for post-mortem traceability.
+	ingestionTrace *ingestion.IngestionTrace
 }
 
 // RuntimeExecutor is the runtime-owned execution boundary.
@@ -832,7 +843,10 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// model.invoked, NO provider.response and NO artifact.produced — a failed
 	// execution must never emit a misleading success artifact.
 	if profile.Strategy != strategy.TargetedMutation {
-		content, inv, err := x.invokeReadOnly(ctx, req, requestID, profile, targets, g)
+		content, inv, ingTrace, err := x.invokeReadOnly(ctx, req, requestID, profile, targets, g)
+		if ingTrace != nil {
+			res.IngestionTrace = ingTrace
+		}
 		if err != nil {
 			// A user cancellation is a clean terminal outcome, never a
 			// failure: the workspace is untouched and no rollback runs.
@@ -923,7 +937,10 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	}
 
 	// ── 7. Targeted mutation: per-target model invocation ──────────────
-	patches, invs, diffs, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
+	patches, invs, diffs, ingTrace, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
+	if ingTrace != nil {
+		res.IngestionTrace = ingTrace
+	}
 	if err != nil {
 		// Retain the invocation evidence on EVERY error return: the provider
 		// billed these tokens whether the run was cancelled, the artifact was
@@ -1014,6 +1031,30 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			res.Proof.FinishedAt = time.Now()
 			setProofGraph(res, g)
 			return x.finalizeResult(res), nil
+		}
+		if errors.Is(err, ingestion.ErrSyntaxInvalid) {
+			// TRANSPORT NORMALIZATION (L1 pre-gate): the normalized payload
+			// failed basic envelope integrity (an unterminated code fence or an
+			// unclosed structural tag). No silent semantic repair is attempted
+			// — the generation is rejected to the contract retry loop with
+			// explicit syntax/parse feedback so a successor attempt changes the
+			// contract materially. The IngestionTrace (Classification =
+			// ClassSyntaxInvalid) preserves the exact unmutated output for
+			// post-mortem forensics.
+			g.FailExecution(events.FailureRecoverable, err, "executor.ingestion")
+			res.ArtifactKind = ""
+			res.Content = "" // Recovery Isolation (I2): rejected bytes never travel
+			res.Err = fmt.Errorf("%w: %w", ErrArtifactRetryableRejected, err)
+			res.Diagnostics = append(res.Diagnostics, diagnosticSignal(
+				SignalSchemaViolation, firstTarget(targets),
+				"transport normalization produced a syntactically invalid payload (unterminated fence or unclosed structural tag)",
+				"regenerate a complete, well-formed artifact; do not rely on silent repair",
+				true,
+			))
+			res.Proof.Outcome = OutcomeArtifactRetryableRejected
+			res.Proof.FinishedAt = time.Now()
+			setProofGraph(res, g)
+			return x.finalizeResult(res), res.Err
 		}
 		if errors.Is(err, ErrArtifactRejected) {
 			// The model produced an artifact that FAILED the artifact
@@ -1112,6 +1153,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		contract:       contract,
 		attempt:        attempt,
 		baseline:       occBaseline,
+		ingestionTrace: res.IngestionTrace,
 	}
 	x.mu.Lock()
 	x.pending[patches[0].ID] = pm
@@ -1160,6 +1202,10 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 			ModelInvocations: pm.modelCalls,
 			StartedAt:        pm.startedAt,
 		},
+		// Forensic continuity: the transport-normalization record of the raw
+		// LLM response travels with the held artifact through the approval gate
+		// to the terminal (committed) evidence.
+		IngestionTrace: pm.ingestionTrace,
 	}
 	g := pm.g
 	if g == nil {
@@ -1540,22 +1586,27 @@ func effectiveMaxOutput(req int, profile *strategy.ExecutionStrategyProfile) int
 // the error and emits neither response nor artifact. The returned patches carry
 // the full resolved content of each target; the diffs are the authoritative
 // unified diffs for rendering.
-func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) ([]*Patch, []ModelInvocation, []string, error) {
+func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) ([]*Patch, []ModelInvocation, []string, *ingestion.IngestionTrace, error) {
 	if len(targets) == 0 {
-		return nil, nil, nil, fmt.Errorf("executor: no mutation target resolved")
+		return nil, nil, nil, nil, fmt.Errorf("executor: no mutation target resolved")
 	}
 	if x.provider == nil {
-		return nil, nil, nil, fmt.Errorf("executor: no provider configured for model invocation")
+		return nil, nil, nil, nil, fmt.Errorf("executor: no provider configured for model invocation")
 	}
 
 	model, modelErr := x.resolveModel()
 	if modelErr != nil {
-		return nil, nil, nil, modelErr
+		return nil, nil, nil, nil, modelErr
 	}
 
 	patches := make([]*Patch, 0, len(targets))
 	invs := make([]ModelInvocation, 0, len(targets))
 	diffs := make([]string, 0, len(targets))
+	// trace carries the forensic transport-normalization record of the most
+	// recent model invocation (nil until the first stream returns). It is
+	// returned so the executor can attach it to the active ExecutionEvidence
+	// even when the artifact is later rejected.
+	var trace *ingestion.IngestionTrace
 	// The artifact contract decides the OUTPUT representation the model must
 	// produce AND, for bounded_patch recovery, the INPUT contract too. A
 	// search_replace contract is a different mutation protocol, not a label:
@@ -1576,7 +1627,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		path := filepath.Join(x.root, target)
 		data, readErr := os.ReadFile(path)
 		if readErr != nil && !os.IsNotExist(readErr) {
-			return nil, nil, nil, fmt.Errorf("executor: read target %s: %w", target, readErr)
+			return nil, nil, nil, nil, fmt.Errorf("executor: read target %s: %w", target, readErr)
 		}
 		original := string(data)
 		// Runtime context activity evidence: the target content actually read
@@ -1665,7 +1716,8 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// model.invoked is emitted when the invocation BEGINS — before the
 		// provider call — so the event stream truthfully records the start.
 		g.BeginModel(model)
-		raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
+		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
+		trace = itrace
 		// The invocation evidence is built from the stream outcome REGARDLESS
 		// of the artifact result: the provider billed these tokens whether the
 		// stream succeeded, was cancelled mid-flight, or produced a malformed
@@ -1689,7 +1741,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		if callErr != nil {
 			// The invocation evidence (real billing when usage arrived)
 			// survives even a hard transport failure.
-			return nil, append(invs, inv), nil, fmt.Errorf("executor: model invocation: %w", callErr)
+			return nil, append(invs, inv), nil, trace, fmt.Errorf("executor: model invocation: %w", callErr)
 		}
 		// provider.response is emitted ONLY on a successful response — the
 		// authoritative usage travels here. No artifact may precede it.
@@ -1704,7 +1756,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// no recovery loop starts inside the executor. Only a COMPLETE stream
 		// may proceed to Boundary 4.
 		if gate := gateFor(target, inv.FinishReason); gate != nil {
-			return nil, invs, nil, gate
+			return nil, invs, nil, trace, gate
 		}
 
 		var modified string
@@ -1722,7 +1774,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 				assessment := ClassifyNoOpClaim(req.Prompt, judgedContent)
 				log.Printf("[execution] request=%s target=%s artifact=no_op (%s) verdict=%s reason=%q",
 					requestID, target, claim.Sentinel, assessment.Verdict, assessment.Reason)
-				return nil, invs, nil, &NoOpClaimError{
+				return nil, invs, nil, trace, &NoOpClaimError{
 					Claim:      claim,
 					Assessment: assessment,
 					Target:     target,
@@ -1735,7 +1787,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// full-artifact attempt instead of a relabeled retry.
 			patched, ok := ExtractBoundedPatch(original, raw)
 			if !ok {
-				return nil, invs, nil, fmt.Errorf("%w: %s: bounded patch contract requires SEARCH/REPLACE blocks or unified diff hunks; full-file or unstructured output rejected", ErrArtifactRetryableRejected, target)
+				return nil, invs, nil, trace, fmt.Errorf("%w: %s: bounded patch contract requires SEARCH/REPLACE blocks or unified diff hunks; full-file or unstructured output rejected", ErrArtifactRetryableRejected, target)
 			}
 			modified = patched
 		} else {
@@ -1751,7 +1803,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// never a proposal staged for approval. The model produced no
 			// usable mutation artifact — abort before any approval surface.
 			// The billed invocation is still returned so usage is preserved.
-			return nil, invs, nil, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
+			return nil, invs, nil, trace, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
 		}
 		// ── ARTIFACT BOUNDARY (Phase 2) ─────────────────────────────
 		// A model response is NOT an artifact until it passes the artifact
@@ -1766,7 +1818,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// The artifact was rejected, but the invocation evidence (and the
 			// real provider billing it carries) must survive: the token count
 			// is provider truth, not a function of artifact validity.
-			return nil, invs, nil, gateErr
+			return nil, invs, nil, trace, gateErr
 		}
 		modified = normalized
 		patches = append(patches, &Patch{
@@ -1777,7 +1829,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		})
 		diffs = append(diffs, x.compileDiff(raw, target, original))
 	}
-	return patches, invs, diffs, nil
+	return patches, invs, diffs, trace, nil
 }
 
 // artifactDiagnostic builds the Boundary-4 advisory signal for a rejected
@@ -1839,9 +1891,9 @@ func (x *RuntimeExecutor) compileDiff(raw, target, original string) string {
 // successful response; a failure returns an error and emits neither — the
 // artifact can never precede the response that produced it. The response is
 // owned by the runtime and never reaches the UI raw.
-func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) (content string, inv ModelInvocation, err error) {
+func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) (content string, inv ModelInvocation, trace *ingestion.IngestionTrace, err error) {
 	if x.provider == nil {
-		return "", inv, fmt.Errorf("executor: no provider configured for read-only invocation")
+		return "", inv, nil, fmt.Errorf("executor: no provider configured for read-only invocation")
 	}
 
 	var b strings.Builder
@@ -1870,7 +1922,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 
 	model, modelErr := x.resolveModel()
 	if modelErr != nil {
-		return "", inv, modelErr
+		return "", inv, nil, modelErr
 	}
 	aiReq := ai.Request{
 		Model:     model,
@@ -1881,9 +1933,9 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	// model.invoked is emitted when the invocation BEGINS — before the provider
 	// call — so the event stream truthfully records the invocation start.
 	g.BeginModel(model)
-	raw, usage, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
+	raw, usage, trace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
 	if callErr != nil {
-		return "", inv, fmt.Errorf("executor: read-only invocation: %w", callErr)
+		return "", inv, trace, fmt.Errorf("executor: read-only invocation: %w", callErr)
 	}
 	inv.Model = model
 	if usage.Known {
@@ -1897,7 +1949,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	// provider.response is emitted ONLY on a successful response — the
 	// authoritative usage travels here. No artifact may precede it.
 	g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
-	return raw, inv, nil
+	return raw, inv, trace, nil
 }
 
 // invokeStream executes one bounded provider invocation through a live
@@ -1912,7 +1964,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 // reasoning.telemetry event on completion. The accumulated visible content and
 // the authoritative provider usage are returned; the authoritative artifact
 // always travels on the ExecutionResult afterwards.
-func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback) (string, ai.ProviderUsage, error) {
+func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback) (string, ai.ProviderUsage, *ingestion.IngestionTrace, error) {
 	var reasoningStartedAt time.Time
 	var reasoningDuration time.Duration
 	var reasoningSeen bool
@@ -1954,14 +2006,14 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			if streamCb != nil {
 				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
 			}
-			return "", ai.ProviderUsage{}, cerr
+			return "", ai.ProviderUsage{}, nil, cerr
 		}
 		if resp == nil {
 			err := fmt.Errorf("executor: provider returned an empty response")
 			if streamCb != nil {
 				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: err})
 			}
-			return "", ai.ProviderUsage{}, err
+			return "", ai.ProviderUsage{}, nil, err
 		}
 		usage := resp.Usage
 		if !usage.Known && (resp.TokenInput > 0 || resp.TokenOutput > 0) {
@@ -1980,7 +2032,15 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			}
 			streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: usage.FinishReason, Usage: usage})
 		}
-		return ai.VisibleCompletion(resp.Content), usage, nil
+		// Transport normalization: preserve the raw response and record every
+		// transformation in an IngestionTrace before the payload reaches the
+		// L1 Execution Gate / artifact parser.
+		trace, procErr := ingestion.Process(resp.Content)
+		visible := ai.VisibleCompletion(trace.NormalizedPayload)
+		if procErr != nil {
+			return visible, usage, trace, procErr
+		}
+		return visible, usage, trace, nil
 	}
 	defer func() { _ = rawStream.Close() }()
 
@@ -2062,7 +2122,7 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			if streamCb != nil {
 				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
 			}
-			return content.String(), lastUsage, cerr
+			return content.String(), lastUsage, nil, cerr
 		}
 		n, rerr := rawStream.Read(buf)
 		if n > 0 {
@@ -2083,12 +2143,12 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 				if streamCb != nil {
 					streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
 				}
-				return content.String(), lastUsage, cerr
+				return content.String(), lastUsage, nil, cerr
 			}
 			if streamCb != nil {
 				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: rerr})
 			}
-			return content.String(), lastUsage, rerr
+			return content.String(), lastUsage, nil, rerr
 		}
 	}
 
@@ -2102,14 +2162,26 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	if reasoningSeen && (reasoningDuration > 0 || usage.ReasoningTokens > 0) {
 		g.ReasoningTelemetry(model, reasoningDuration, usage.ReasoningTokens)
 	}
-	visible := ai.VisibleCompletion(content.String())
+	// Transport normalization: preserve the exact raw stream output and record
+	// every transformation in an IngestionTrace before the payload reaches the
+	// L1 Execution Gate / artifact parser.
+	rawVisible := content.String()
+	trace, procErr := ingestion.Process(rawVisible)
+	visible := ai.VisibleCompletion(trace.NormalizedPayload)
 	if strings.TrimSpace(visible) == "" && reasoningBuf.Len() > 0 {
-		visible = ai.VisibleCompletion(reasoningBuf.String())
+		// The entire visible completion was reasoning: ingest the reasoning
+		// text as the raw artifact so forensic traceability survives.
+		reasoningRaw := reasoningBuf.String()
+		trace, procErr = ingestion.Process(reasoningRaw)
+		visible = ai.VisibleCompletion(trace.NormalizedPayload)
 	}
 	if streamCb != nil {
 		streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: usage.FinishReason, Usage: usage})
 	}
-	return visible, usage, nil
+	if procErr != nil {
+		return visible, usage, trace, procErr
+	}
+	return visible, usage, trace, nil
 }
 
 // emitContextActivity surfaces a real runtime file read as engine evidence
@@ -2276,6 +2348,11 @@ func (x *RuntimeExecutor) sealTerminalEvidence(res *ExecutionResult) {
 		x.contracts.Contract(ContractID(p.ContractID)),
 		p.ContextDigest, outcome, summary, p.StartedAt, p.FinishedAt,
 	)
+	if res.IngestionTrace != nil {
+		// Forensic invariant: preserve the transport-normalization record on
+		// the immutable evidence for post-mortem debugging.
+		res.Evidence.ingestionTrace = res.IngestionTrace
+	}
 	x.emitEvidenceEvent(res, res.Evidence)
 }
 
