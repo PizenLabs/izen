@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/execution/cache"
 	"github.com/PizenLabs/izen/internal/execution/planner"
 	"github.com/PizenLabs/izen/internal/telemetry"
 )
@@ -27,12 +28,17 @@ import (
 //
 // All heavy work is bounded by the worker's context; a hung preflight aborts
 // the run at the barrier with PREFLIGHT_TIMEOUT (10s).
+//
+// Content-addressed caching: the cache key is strictly SHA256(file_content),
+// path-agnostic. On hit the worker bypasses LeaStructuralScan/Tokenizer and
+// populates the snapshot from the cache, emitting [cache] hit/sha activity.
 type Worker struct {
-	root     string
-	bus      *events.Bus
-	state    *ObservationState
-	barrier  *PreflightSyncBarrier
-	recorder *telemetry.Recorder
+	root      string
+	bus       *events.Bus
+	state     *ObservationState
+	barrier   *PreflightSyncBarrier
+	recorder  *telemetry.Recorder
+	topoCache *cache.TopologyCache
 
 	mu   sync.Mutex
 	runs int
@@ -40,11 +46,13 @@ type Worker struct {
 
 // Config holds the worker wiring.
 type Config struct {
-	Root     string
-	Bus      *events.Bus
-	State    *ObservationState
-	Barrier  *PreflightSyncBarrier
-	Recorder *telemetry.Recorder
+	Root      string
+	Bus       *events.Bus
+	State     *ObservationState
+	Barrier   *PreflightSyncBarrier
+	Recorder  *telemetry.Recorder
+	Cache     *cache.TopologyCache
+	CacheSize int // 0 => DefaultCapacity (128)
 }
 
 // New creates a worker. A nil Config field degrades safely (no bus/state/
@@ -53,13 +61,38 @@ func New(cfg Config) *Worker {
 	if cfg.Recorder == nil {
 		cfg.Recorder = telemetry.Default()
 	}
-	return &Worker{
-		root:     cfg.Root,
-		bus:      cfg.Bus,
-		state:    cfg.State,
-		barrier:  cfg.Barrier,
-		recorder: cfg.Recorder,
+	c := cfg.Cache
+	if c == nil {
+		sz := cfg.CacheSize
+		if sz <= 0 {
+			sz = cache.DefaultCapacity
+		}
+		c = cache.New(sz)
 	}
+	return &Worker{
+		root:      cfg.Root,
+		bus:       cfg.Bus,
+		state:     cfg.State,
+		barrier:   cfg.Barrier,
+		recorder:  cfg.Recorder,
+		topoCache: c,
+	}
+}
+
+// Cache returns the topology cache (nil when disabled). Test seam.
+func (w *Worker) Cache() *cache.TopologyCache {
+	if w == nil {
+		return nil
+	}
+	return w.topoCache
+}
+
+// SetCache replaces the topology cache (test seam). A nil cache disables caching.
+func (w *Worker) SetCache(c *cache.TopologyCache) {
+	if w == nil {
+		return
+	}
+	w.topoCache = c
 }
 
 // Start dispatches the background preflight as an async goroutine upon
@@ -123,7 +156,7 @@ func (w *Worker) execute(ctx context.Context, _ string, targets []string) (*Stru
 		// No target to scan — publish an empty snapshot (prompt still admitted).
 		return &StructuralSnapshot{Target: target, ReadyAt: time.Now()}, nil
 	}
-	// a. Read file and compute SHA256.
+	// a. Read file and compute SHA256 (content-addressed — path-agnostic).
 	content, err := w.readTarget(ctx, target)
 	if err != nil {
 		return &StructuralSnapshot{Target: target, ReadyAt: time.Now(), Err: err}, err
@@ -132,7 +165,34 @@ func (w *Worker) execute(ctx context.Context, _ string, targets []string) (*Stru
 		return nil, ctx.Err()
 	}
 	sha := sha256Hex(content)
-	// b. AST/DOM structural discovery.
+
+	// b. Content-addressed cache lookup. Key MUST be strictly SHA256(content);
+	// file paths, workspace context, or turn IDs MUST NOT influence the key.
+	if w.topoCache != nil {
+		if cached, ok := w.topoCache.Get(sha); ok {
+			// Cache HIT: bypass LeaStructuralScan / Tokenizer, populate
+			// StructuralSnapshot immediately and notify barrier.
+			telemetry.RecordTopologyCacheHit(sha)
+			if w.recorder != nil {
+				w.recorder.RecordCacheHit()
+			}
+			if w.bus != nil {
+				w.bus.Publish(events.NewActivity(telemetry.FormatCacheHit(sha)))
+			}
+			snap := snapshotFromCache(target, cached)
+			return snap, nil
+		}
+		// Cache MISS: fall through to full scan and store.
+		telemetry.RecordTopologyCacheMiss(sha)
+		if w.recorder != nil {
+			w.recorder.RecordCacheMiss()
+		}
+		if w.bus != nil {
+			w.bus.Publish(events.NewActivity(telemetry.FormatCacheMiss(sha)))
+		}
+	}
+
+	// b. AST/DOM structural discovery (miss path only).
 	scan := planner.LeaStructuralScan(target, content)
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -158,7 +218,29 @@ func (w *Worker) execute(ctx context.Context, _ string, targets []string) (*Stru
 		TotalLines:      totalLines,
 		ReadyAt:         time.Now(),
 	}
+	// d. Populate cache on miss.
+	if w.topoCache != nil {
+		cSnap := cache.BuildSnapshot(sha, target, scan, tokens, budget, totalLines, 2.0)
+		w.topoCache.Put(cSnap)
+	}
 	return snap, nil
+}
+
+// snapshotFromCache builds a preflight StructuralSnapshot from a cached topology
+// snapshot without re-running LeaStructuralScan or the tokenizer.
+func snapshotFromCache(target string, c *cache.StructuralSnapshot) *StructuralSnapshot {
+	if c == nil {
+		return &StructuralSnapshot{Target: target, ReadyAt: time.Now()}
+	}
+	return &StructuralSnapshot{
+		Target:          target,
+		SHA256:          c.SHA256,
+		Scan:            c.Scan,
+		EstimatedTokens: c.EstimatedTokens,
+		BudgetTokens:    c.BudgetTokens,
+		TotalLines:      c.TotalLines,
+		ReadyAt:         time.Now(),
+	}
 }
 
 func (w *Worker) readTarget(ctx context.Context, target string) ([]byte, error) {

@@ -23,6 +23,10 @@ type Recorder struct {
 	firstStreamStart    time.Time
 	promptSubmitCount   int64
 	preflightCount      int64
+
+	// Topology cache counters (hits vs misses) for topology_cache_hit_rate.
+	cacheHits   int64
+	cacheMisses int64
 }
 
 // NewRecorder returns an empty recorder.
@@ -103,6 +107,62 @@ func (r *Recorder) Reset() {
 	r.preflightLatency = 0
 	r.firstStreamLatency = 0
 	r.firstStreamStart = time.Time{}
+	r.cacheHits = 0
+	r.cacheMisses = 0
+}
+
+// RecordCacheHit records a topology cache hit.
+func (r *Recorder) RecordCacheHit() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cacheHits++
+}
+
+// RecordCacheMiss records a topology cache miss.
+func (r *Recorder) RecordCacheMiss() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cacheMisses++
+}
+
+// CacheStats returns the cache hit/miss counts.
+func (r *Recorder) CacheStats() (hits, misses int64) {
+	if r == nil {
+		return 0, 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cacheHits, r.cacheMisses
+}
+
+// CacheHitRate returns the cache hit rate in [0,1], or 0 when empty.
+func (r *Recorder) CacheHitRate() float64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	total := r.cacheHits + r.cacheMisses
+	if total == 0 {
+		return 0
+	}
+	return float64(r.cacheHits) / float64(total)
+}
+
+// ResetCacheMetrics clears only the cache counters.
+func (r *Recorder) ResetCacheMetrics() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cacheHits, r.cacheMisses = 0, 0
 }
 
 // Global helpers that delegate to the default recorder.
