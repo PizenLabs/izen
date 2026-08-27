@@ -23,6 +23,11 @@ func NewDefaultArtifactValidator() execution.ArtifactValidator {
 	return execution.NewDefaultArtifactValidator()
 }
 
+// NewNormalizingArtifactValidator constructs the P1 normalizing decorator.
+func NewNormalizingArtifactValidator(inner execution.ArtifactValidator) execution.ArtifactValidator {
+	return execution.NewNormalizingArtifactValidator(inner)
+}
+
 // NewExecutionBoundary constructs the production mutation boundary.
 func NewExecutionBoundary(root string, targets []string) execution.MutationBoundary {
 	return execution.NewExecutionBoundary(root, targets)

@@ -439,6 +439,7 @@ type RuntimeExecutor struct {
 // makes model-required strategies fail with a deterministic error (the runtime
 // still resolves deterministic strategies without a provider).
 func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, bus *events.Bus, langID language.ID) *RuntimeExecutor {
+	validator := NewNormalizingArtifactValidator(NewDefaultArtifactValidator()).WithRoot(root)
 	x := &RuntimeExecutor{
 		root:             root,
 		cfg:              cfg,
@@ -449,7 +450,7 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 		admission:        NewAdmissionGateway(nil),
 		contracts:        NewContractRegistry(),
 		occ:              NewOCCVerifier(root),
-		artifactValidator: NewDefaultArtifactValidator(),
+		artifactValidator: validator,
 		pending:          make(map[string]*pendingMutation),
 	}
 	if langID != "" {
