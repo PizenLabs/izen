@@ -3,6 +3,7 @@ package autonomy
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/execution"
@@ -64,6 +65,35 @@ func (d *Driver) verifyGlobalObjective(ctx context.Context, dag *planner.Executi
 		diagnosticf("[objective-verify] skipped: post-DAG state of %s unreadable", target)
 		return false
 	}
+
+	// ── EXECUTION INERTIA CIRCUIT BREAKER (false-positive resolution) ──────
+	// An ACTIVE MODIFICATION intent whose DAG applied ZERO mutations (every
+	// sub-task evaluated to no_op_objective_satisfied) must NEVER resolve the
+	// objective — even when the pre-DAG baseline was already syntactically
+	// invalid and the baseline-relaxation clause below would have let it
+	// through as OBJECTIVE_RESOLVED with a zero-byte diff. The objective
+	// demanded a change and none was delivered: that is execution inertia, not
+	// success. Fail fast with EXECUTION_INERTIA_NO_OP so the runtime can retry
+	// or the human can escalate scope — the loop is never marked complete.
+	if d.requiresMutation() && len(dag.SubTasks) > 0 &&
+		dag.NoOpSatisfiedSubTasks == len(dag.SubTasks) {
+		reason := "active modification requested but all sub-tasks evaluated to no-op (zero mutations applied)"
+		dag.Status = planner.ExecutionInertiaNoOp
+		dag.FailureReason = reason
+		diagnosticf("[objective-verify] EXECUTION_INERTIA_NO_OP target=%s — intent requires mutation but %d/%d sub-task(s) applied zero bytes; refusing OBJECTIVE_RESOLVED: %s",
+			target, dag.NoOpSatisfiedSubTasks, len(dag.SubTasks), reason)
+		b := &autonomy.HumanBoundary{
+			Reason: "EXECUTION_INERTIA_NO_OP: " + reason +
+				" — no diff was applied; retry with a scoped objective or escalate the change window",
+			Targets: dag.Targets(),
+		}
+		autonomy.DeriveBoundaryAction(b)
+		d.loop.AwaitHuman(*b)
+		d.enrichBoundary()
+		d.publish(ctx)
+		return true
+	}
+
 	intent := verifier.IntentSpec{
 		Objective: boundedEvidenceLine(d.prompt),
 		Target:    target,
@@ -126,4 +156,16 @@ func onlyBaselineSyntaxFailure(v verifier.Verdict) bool {
 		}
 	}
 	return true
+}
+
+// requiresMutation reports whether the driver's objective is an ACTIVE
+// MODIFICATION request (modification or refactoring intent). The post-DAG
+// verifier consults it to distinguish a DAG that was authorized to mutate the
+// workspace from a read-only inspection: an active-modification DAG that
+// applied zero bytes is execution inertia, never a resolved objective.
+func (d *Driver) requiresMutation() bool {
+	if d == nil || strings.TrimSpace(d.prompt) == "" {
+		return false
+	}
+	return autonomy.Classify(d.prompt, nil).RequiresMutation()
 }

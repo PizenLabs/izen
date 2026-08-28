@@ -163,14 +163,18 @@ func singleTaskDAG(objective, target string, source []byte, baseDigest string, m
 // delta — never a full-file rewrite.
 const fallbackWindowMaxLines = 40
 
-// fallbackDecompose stages a bounded window DAG for the manifest-less
-// fallback (manifest_scoped == false): the source is partitioned into
-// contiguous windows of at most fallbackWindowMaxLines lines each, so a
-// 133-line target yields ~4 bounded sub-tasks (1-40, 41-80, 81-120, 121-133)
-// instead of one giant sub-task. Every window is a SplitBoundedLines unit that
-// inherits the strict SEARCH/REPLACE patch contract; each EstimateRegionTokens
-// is clamped to the strict sub-task ceiling so the DAG always validates and
-// every unit passes EvaluatePreflight individually by construction.
+// fallbackDecompose stages a fallback DAG for the manifest-less path
+// (manifest_scoped == false). SEMANTIC BLOCK PRIORITY applies first: the
+// target is partitioned along structural tag/block boundaries (top-level
+// HTML/XML blocks, Go function/struct declarations, JSON members) instead of
+// arbitrary line counts, so a 133-line document yields ~4 semantic sub-tasks
+// (<head>, <header>, <main>, <footer>) rather than blind 40-line windows.
+// Blind line slicing is retained ONLY as the secondary safety net when no
+// trustworthy structural topology exists (unstructured/malformed content) —
+// and even those windows carry the DOCUMENT OUTLINE CONTEXT injected at
+// prompt time, so a line-bounded sub-task never reasons over an isolated byte
+// window. Every sub-task inherits the strict SEARCH/REPLACE patch contract
+// and obeys the strict per-sub-task budget ceiling.
 func fallbackDecompose(objective, target string, source []byte, baseDigest string, maxOutputTokens int) (*planner.ExecutionDAG, error) {
 	if len(bytes.TrimSpace(source)) == 0 {
 		return nil, planner.ErrEmptySource
@@ -182,6 +186,18 @@ func fallbackDecompose(objective, target string, source []byte, baseDigest strin
 	total := planner.LineCount(source)
 	if total < 1 {
 		return nil, planner.ErrEmptySource
+	}
+	// ── SEMANTIC BLOCK PRIORITY ───────────────────────────────────────────
+	// Prefer structural tag/block boundaries over arbitrary line counts: a
+	// bounded sub-task cut at <head>/<header>/<main>/<footer> or function
+	// declaration boundaries carries a document identity, so the model keeps
+	// global context instead of emitting an immediate no-op. When no
+	// trustworthy block topology exists, degrade to the bounded window
+	// slicing below.
+	if dag, ok := fallbackSemanticBlockDecompose(objective, target, source, baseDigest, maxOutputTokens); ok {
+		diagnosticf("[boundary2] fallback decomposition used semantic block boundaries target=%s sub_tasks=%d kind=%s",
+			target, len(dag.SubTasks), dag.Kind)
+		return dag, nil
 	}
 	dag := planner.NewExecutionDAG(objective, target, planner.SplitBoundedLines, baseDigest, maxOutputTokens)
 	for start := 1; start <= total; start += fallbackWindowMaxLines {
@@ -208,6 +224,87 @@ func fallbackDecompose(objective, target string, source []byte, baseDigest strin
 		}); err != nil {
 			return nil, err
 		}
+	}
+	if err := dag.Validate(); err != nil {
+		return nil, err
+	}
+	return dag, nil
+}
+
+// fallbackSemanticBlockDecompose is the PRIMARY manifest-less fallback: it
+// partitions the target along structural block boundaries — Lea semantic
+// units for HTML/JSX/Go templates, top-level XML element spans for .xml, and
+// the registered structural/block decomposers' declaration sections for
+// Go/Rust/TS/JSON/… — instead of arbitrary line counts. It returns ok=false
+// when no trustworthy block topology exists or the semantic plan cannot be
+// staged, so the caller degrades to the bounded line-window safety net (whose
+// sub-task prompts still carry the DOCUMENT OUTLINE CONTEXT).
+func fallbackSemanticBlockDecompose(objective, target string, source []byte, baseDigest string, maxOutputTokens int) (*planner.ExecutionDAG, bool) {
+	if isXMLTarget(target) {
+		sections := xmlTopLevelBlocks(source)
+		if len(sections) >= 2 {
+			dag, err := stageFallbackBlockDAG(objective, target, source, baseDigest, maxOutputTokens, sections, planner.SplitBlock)
+			return dag, err == nil
+		}
+		return nil, false
+	}
+	if !planner.LeaScannable(target) && planner.ForTarget(target) == nil {
+		return nil, false // no structural topology for this format
+	}
+	dag, err := planner.DecomposeTarget(objective, target, source, baseDigest, maxOutputTokens)
+	if err != nil || len(dag.SubTasks) < 2 {
+		return nil, false // degraded (or indivisible): bounded window net handles it
+	}
+	return dag, true
+}
+
+// stageFallbackBlockDAG stages a validated non-manifest-scoped DAG from
+// explicit structural sections, preserving contiguous coverage so the V5
+// invariant holds. Estimates use the canonical Boundary-2 accounting and are
+// clamped to the strict sub-task ceiling.
+func stageFallbackBlockDAG(objective, target string, source []byte, baseDigest string, maxOutputTokens int, sections []planner.Section, kind planner.SplitKind) (*planner.ExecutionDAG, error) {
+	budget := planner.SubTaskBudget(maxOutputTokens)
+	total := planner.LineCount(source)
+	dag := planner.NewExecutionDAG(objective, target, kind, baseDigest, maxOutputTokens)
+	prevEnd := 0
+	for _, s := range sections {
+		r := s.Region
+		if r.StartLine < 1 {
+			r.StartLine = 1
+		}
+		if r.EndLine > total {
+			r.EndLine = total
+		}
+		if r.StartLine > r.EndLine {
+			continue
+		}
+		// Attach any overlap forward to keep contiguous coverage (mirrors the
+		// semantic tiling); a gap that cannot close fails Validate below.
+		if prevEnd > 0 && r.StartLine <= prevEnd {
+			r.StartLine = prevEnd + 1
+		}
+		if r.StartLine > r.EndLine {
+			continue
+		}
+		est := planner.EstimateRegionTokens(source, r)
+		if est > budget {
+			est = budget
+		}
+		if est <= 0 {
+			est = 1
+		}
+		if err := dag.AddTask(planner.SubTask{
+			ID:              fmt.Sprintf("st-%d", len(dag.SubTasks)+1),
+			Index:           len(dag.SubTasks) + 1,
+			Kind:            kind,
+			Target:          target,
+			Description:     s.Label,
+			Region:          r,
+			EstimatedTokens: est,
+		}); err != nil {
+			return nil, err
+		}
+		prevEnd = r.EndLine
 	}
 	if err := dag.Validate(); err != nil {
 		return nil, err
@@ -905,5 +1002,16 @@ func subTaskPrompt(objective string, dag *planner.ExecutionDAG, st planner.SubTa
 	}
 	b.WriteString("Produce exactly ONE anchored SEARCH/REPLACE block whose SEARCH text is copied VERBATIM " +
 		"from within this change window of the current file content. Do not modify any other region.")
-	return injectPatchContract(b.String(), st.Kind)
+	prompt := b.String()
+	// ── DOCUMENT OUTLINE CONTEXT INJECTION ────────────────────────────────
+	// Every bounded sub-task prompt carries the global structure map so a
+	// line-bounded unit retains whole-document awareness — a small model
+	// cannot claim NO_CHANGES_REQUIRED against an isolated byte window it
+	// never understood in context. The outline is injected for bounded-lines
+	// units and semantic/block units alike (all of them execute under the
+	// bounded-patch protocol).
+	if compressed != nil && strings.TrimSpace(compressed.Outline) != "" {
+		prompt += "\n\n" + compressed.Outline
+	}
+	return injectPatchContract(prompt, st.Kind)
 }

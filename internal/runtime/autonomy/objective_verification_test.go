@@ -322,3 +322,130 @@ func driverRoot(t *testing.T, d *Driver) string {
 	t.Helper()
 	return d.adapter.root
 }
+
+// ── EXECUTION INERTIA CIRCUIT BREAKER (false-positive no-op resolution) ─────
+
+// stageInertiaRun parks a run at a DECOMPOSITION_PROPOSAL boundary over a
+// pre-broken 4-sub-task DAG, wired so every sub-task may be answered with the
+// NO_CHANGES_REQUIRED sentinel.
+func stageInertiaRun(t *testing.T) (string, *Driver, *planner.ExecutionDAG, *dagProvider) {
+	t.Helper()
+	root := t.TempDir()
+	source := brokenBaselineFixture()
+	writeTarget(t, root, "index.html", string(source))
+
+	p := &dagProvider{root: root, target: "index.html"}
+	bus := events.NewBus(events.DefaultBufferSize)
+	x := testExecutor(t, root, p, bus)
+	adapter := NewExecutorAdapter(root, execution.NewIntentGateway(root), x)
+
+	decompose := func(objective, target string, src []byte, baseDigest string, maxOutputTokens int) (*planner.ExecutionDAG, error) {
+		dag := planner.NewExecutionDAG(objective, target, planner.SplitBoundedLines, baseDigest, maxOutputTokens)
+		total := len(strings.Split(strings.TrimSuffix(string(src), "\n"), "\n"))
+		const tasks = 4
+		step := total / tasks
+		for i := 0; i < tasks; i++ {
+			start := i*step + 1
+			end := total
+			if i < tasks-1 {
+				end = start + step - 1
+			}
+			if err := dag.AddTask(planner.SubTask{
+				ID:              fmt.Sprintf("st-%d", i+1),
+				Index:           i + 1,
+				Kind:            planner.SplitBoundedLines,
+				Description:     "inertia fixture window",
+				Region:          planner.Region{StartLine: start, EndLine: end},
+				EstimatedTokens: 64,
+			}); err != nil {
+				return nil, err
+			}
+		}
+		if err := dag.Validate(); err != nil {
+			return nil, err
+		}
+		return dag, nil
+	}
+
+	driver := NewDriver(adapter, bus, WithDecompose(decompose))
+	term, err := driver.Run(context.Background(), "check this file @index.html and remove redundant content")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if term != nil {
+		t.Fatalf("run terminated (%+v) instead of parking at the proposal", term)
+	}
+	if driver.Proposal() == nil {
+		t.Fatal("no DECOMPOSITION_PROPOSAL parked at the boundary")
+	}
+	return root, driver, driver.Proposal(), p
+}
+
+// TestVerifyDAG_RejectsAllNoOpOnModificationIntent proves the Active Intent
+// Integrity Invariant: a DAG staged under an ACTIVE MODIFICATION intent whose
+// every sub-task evaluates to no_op_objective_satisfied — ZERO mutated bytes
+// across the plan — must NEVER report OBJECTIVE_RESOLVED, even when the
+// pre-DAG baseline was already syntactically invalid (the pre-existing
+// baseline relaxation is no longer allowed to mask execution inertia). The
+// run fail-fasts with EXECUTION_INERTIA_NO_OP and parks at awaiting_human for
+// a retry or a scope escalation.
+func TestVerifyDAG_RejectsAllNoOpOnModificationIntent(t *testing.T) {
+	root, driver, dag, p := stageInertiaRun(t)
+
+	// The preflight snapshot records the pre-existing defect.
+	if dag.BaselineSyntaxValid {
+		t.Fatal("BaselineSyntaxValid = true, want false — the baseline HTML was already broken at staging time")
+	}
+	before := readTarget(t, root, "index.html")
+
+	// ALL FOUR sub-tasks evaluate to no_op_objective_satisfied (zero mutations).
+	p.noop = map[int]bool{1: true, 2: true, 3: true, 4: true}
+
+	term, err := driver.ResumeApproveProposal(context.Background())
+	if err != nil {
+		t.Fatalf("ResumeApproveProposal: %v", err)
+	}
+
+	// NOT a completion: the decision returns to awaiting_human.
+	if term != nil {
+		t.Fatalf("termination = %+v, want a parked loop (nil term)", term)
+	}
+	if driver.State() != autonomy.RuntimeAwaitingHuman {
+		t.Fatalf("state = %s, want awaiting_human", driver.State())
+	}
+	for _, tr := range driver.History() {
+		if tr.To == autonomy.RuntimeCompleted {
+			t.Fatalf("false completion recorded in history: %+v", tr)
+		}
+	}
+
+	// The DAG is marked EXECUTION_INERTIA_NO_OP — never OBJECTIVE_RESOLVED and
+	// never a completed plan.
+	if dag.Status != planner.ExecutionInertiaNoOp {
+		t.Fatalf("plan status = %s, want %s", dag.Status, planner.ExecutionInertiaNoOp)
+	}
+	if dag.Status == planner.DagExecutionCompleted || dag.Status == planner.ObjectiveUnresolved {
+		t.Fatalf("plan must not resolve as completed/OBJECTIVE_RESOLVED: %s", dag.Status)
+	}
+	if !strings.Contains(dag.FailureReason, "active modification requested but all sub-tasks evaluated to no-op") ||
+		!strings.Contains(dag.FailureReason, "zero mutations applied") {
+		t.Fatalf("failure reason lacks the inertia evidence: %q", dag.FailureReason)
+	}
+	if dag.NoOpSatisfiedSubTasks != 4 {
+		t.Fatalf("NoOpSatisfiedSubTasks = %d, want 4", dag.NoOpSatisfiedSubTasks)
+	}
+
+	// The boundary carries the typed evidence for the human decision.
+	b := driver.Boundary()
+	if b == nil {
+		t.Fatal("no human boundary parked after the inertia halt")
+	}
+	if !strings.Contains(b.Reason, "EXECUTION_INERTIA_NO_OP") {
+		t.Fatalf("boundary reason missing EXECUTION_INERTIA_NO_OP: %q", b.Reason)
+	}
+
+	// Zero diffs applied: the workspace is byte-for-byte unchanged.
+	if got := readTarget(t, root, "index.html"); got != before {
+		t.Fatal("an all-no-op modification run mutated the workspace")
+	}
+}

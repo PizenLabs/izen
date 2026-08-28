@@ -142,9 +142,10 @@ func TestPreflight_AutoManifestTrigger(t *testing.T) {
 
 // TestPreflight_AutoManifestFallbackToBoundedInspection pins the fail-soft
 // path: when the Pass 1 manifest generation fails or returns empty mutations,
-// the loop falls back to the BOUNDED WINDOW DECOMPOSITION — every sub-task
-// window is capped at fallbackWindowMaxLines so no single unit forces a
-// whole-file rewrite. It NEVER stages one giant whole-file sub-task.
+// the loop falls back to the SEMANTIC BLOCK decomposition — sub-tasks are cut
+// at structural boundaries (sections, never blind 40-line windows) so no
+// single unit forces a whole-file rewrite. It NEVER stages one giant
+// whole-file sub-task.
 func TestPreflight_AutoManifestFallbackToBoundedInspection(t *testing.T) {
 	root := t.TempDir()
 	source := preflightManifestFixture()
@@ -177,18 +178,23 @@ func TestPreflight_AutoManifestFallbackToBoundedInspection(t *testing.T) {
 		if dag == nil {
 			t.Fatalf("%s: no proposal staged", name)
 		}
-		if len(dag.SubTasks) == 0 {
-			t.Fatalf("%s: no bounded fallback sub-tasks staged", name)
+		if len(dag.SubTasks) < 2 {
+			t.Fatalf("%s: %d fallback sub-tasks, want >= 2 (never one giant whole-file unit)", name, len(dag.SubTasks))
 		}
 		for _, st := range dag.SubTasks {
-			if st.Kind != planner.SplitBoundedLines {
-				t.Fatalf("%s: fallback sub-task %s kind = %s, want %s (bounded window)",
-					name, st.ID, st.Kind, planner.SplitBoundedLines)
+			// SEMANTIC BLOCK PRIORITY: a structured HTML target is partitioned
+			// along structural sections, never blind 40-line windows.
+			if st.Kind == planner.SplitBoundedLines && strings.HasPrefix(st.Description, "bounded fallback window") {
+				t.Fatalf("%s: fallback sub-task %s is a blind line window over a structured document: %q",
+					name, st.ID, st.Description)
 			}
-			if st.Region.Lines() > fallbackWindowMaxLines {
-				t.Fatalf("%s: fallback sub-task %s window %s exceeds the %d-line ceiling",
-					name, st.ID, st.Region, fallbackWindowMaxLines)
+			if st.EstimatedTokens <= 0 || st.EstimatedTokens > dag.Budget() {
+				t.Fatalf("%s: fallback sub-task %s estimate %d outside the strict ceiling (%d)",
+					name, st.ID, st.EstimatedTokens, dag.Budget())
 			}
+		}
+		if err := dag.Validate(); err != nil {
+			t.Fatalf("%s: fallback DAG Validate: %v", name, err)
 		}
 	}
 }

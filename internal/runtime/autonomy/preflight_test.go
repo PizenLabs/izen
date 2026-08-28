@@ -89,24 +89,21 @@ func stageBrokenBaselineRun(t *testing.T) (*Driver, *planner.ExecutionDAG, *dagP
 
 // TestAudit_PreexistingBaselineSyntaxError drives a DAG over an ALREADY-BROKEN
 // HTML file whose sub-task evaluates to no_op_objective_satisfied (zero
-// mutations). The post-DAG global audit fails on the document's syntax — but
-// that syntax failure PRE-DATES the DAG, the bytes are checksum-identical to
-// the baseline, and the only unit was a satisfied no-op. The run must complete
-// cleanly (never OBJECTIVE_UNRESOLVED / awaiting_human) with the
-// baseline_syntax_preexisting warning.
+// mutations). The objective is an ACTIVE MODIFICATION request ("remove
+// redundant content"), so the EXECUTION INERTIA circuit breaker must fail
+// fast: a modification intent that applied ZERO bytes is a false-positive
+// resolution, never a completion — the pre-existing-baseline relaxation can
+// never let it through as OBJECTIVE_RESOLVED. The run parks at awaiting_human
+// with the plan marked EXECUTION_INERTIA_NO_OP.
 func TestAudit_PreexistingBaselineSyntaxError(t *testing.T) {
 	var (
-		mu     sync.Mutex
-		diags  []string
-		warned bool
+		mu    sync.Mutex
+		diags []string
 	)
 	SetDiagnosticLog(func(format string, args ...interface{}) {
 		line := fmt.Sprintf(format, args...)
 		mu.Lock()
 		diags = append(diags, line)
-		if strings.Contains(line, execution.BaselineSyntaxPreexisting) {
-			warned = true
-		}
 		mu.Unlock()
 	})
 	defer SetDiagnosticLog(nil)
@@ -126,12 +123,27 @@ func TestAudit_PreexistingBaselineSyntaxError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResumeApproveProposal: %v", err)
 	}
-	if term == nil || term.State != autonomy.RuntimeCompleted {
-		t.Fatalf("termination = %+v, want a completed run (never a parked awaiting_human)", term)
+
+	// NOT a completion: an active modification intent that mutated nothing must
+	// never resolve as OBJECTIVE_RESOLVED, even over a pre-broken baseline.
+	if term != nil {
+		t.Fatalf("termination = %+v, want a parked loop (nil term)", term)
 	}
-	if driver.Plan().Status != planner.DagExecutionCompleted {
-		t.Fatalf("plan status = %s, want %s (the pre-existing syntax failure must not override to %s)",
-			driver.Plan().Status, planner.DagExecutionCompleted, planner.ObjectiveUnresolved)
+	if driver.State() != autonomy.RuntimeAwaitingHuman {
+		t.Fatalf("state = %s, want awaiting_human", driver.State())
+	}
+	for _, tr := range driver.History() {
+		if tr.To == autonomy.RuntimeCompleted {
+			t.Fatalf("false completion recorded in history: %+v", tr)
+		}
+	}
+	if driver.Plan().Status != planner.ExecutionInertiaNoOp {
+		t.Fatalf("plan status = %s, want %s (execution inertia must override the pre-existing-baseline relaxation)",
+			driver.Plan().Status, planner.ExecutionInertiaNoOp)
+	}
+	if !strings.Contains(driver.Plan().FailureReason, "no-op") ||
+		!strings.Contains(driver.Plan().FailureReason, "zero mutations") {
+		t.Fatalf("failure reason lacks the inertia evidence: %q", driver.Plan().FailureReason)
 	}
 	if dag.NoOpSatisfiedSubTasks != 1 {
 		t.Fatalf("NoOpSatisfiedSubTasks = %d, want 1", dag.NoOpSatisfiedSubTasks)
@@ -140,11 +152,20 @@ func TestAudit_PreexistingBaselineSyntaxError(t *testing.T) {
 	if got := readTarget(t, p.root, "index.html"); got != before {
 		t.Fatal("a no-op run mutated the workspace")
 	}
-	// The baseline warning was emitted.
+	// The boundary carries the typed inertia evidence for the human decision.
+	b := driver.Boundary()
+	if b == nil {
+		t.Fatal("no human boundary parked after the inertia halt")
+	}
+	if !strings.Contains(b.Reason, "EXECUTION_INERTIA_NO_OP") {
+		t.Fatalf("boundary reason missing EXECUTION_INERTIA_NO_OP: %q", b.Reason)
+	}
+	// The inertia diagnostic was emitted.
 	mu.Lock()
 	defer mu.Unlock()
-	if !warned {
-		t.Fatalf("no baseline_syntax_preexisting warning emitted; diagnostics:\n%s", strings.Join(diags, "\n"))
+	joined := strings.Join(diags, "\n")
+	if !strings.Contains(joined, "EXECUTION_INERTIA_NO_OP") {
+		t.Fatalf("no EXECUTION_INERTIA_NO_OP diagnostic emitted; diagnostics:\n%s", joined)
 	}
 }
 
