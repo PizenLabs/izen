@@ -326,12 +326,15 @@ func driverRoot(t *testing.T, d *Driver) string {
 // ── EXECUTION INERTIA CIRCUIT BREAKER (false-positive no-op resolution) ─────
 
 // stageInertiaRun parks a run at a DECOMPOSITION_PROPOSAL boundary over a
-// pre-broken 4-sub-task DAG, wired so every sub-task may be answered with the
-// NO_CHANGES_REQUIRED sentinel.
+// valid (decomposition-permitted) 4-sub-task DAG, wired so every sub-task may
+// be answered with the NO_CHANGES_REQUIRED sentinel. The baseline is STRUCTURALLY
+// VALID because the strict preflight hard-gate forbids decomposition on a
+// corrupt target — the inertia circuit breaker is exercised only on a baseline
+// the gate permits.
 func stageInertiaRun(t *testing.T) (string, *Driver, *planner.ExecutionDAG, *dagProvider) {
 	t.Helper()
 	root := t.TempDir()
-	source := brokenBaselineFixture()
+	source := validLargeBaselineFixture()
 	writeTarget(t, root, "index.html", string(source))
 
 	p := &dagProvider{root: root, target: "index.html"}
@@ -392,9 +395,11 @@ func stageInertiaRun(t *testing.T) (string, *Driver, *planner.ExecutionDAG, *dag
 func TestVerifyDAG_RejectsAllNoOpOnModificationIntent(t *testing.T) {
 	root, driver, dag, p := stageInertiaRun(t)
 
-	// The preflight snapshot records the pre-existing defect.
-	if dag.BaselineSyntaxValid {
-		t.Fatal("BaselineSyntaxValid = true, want false — the baseline HTML was already broken at staging time")
+	// The preflight snapshot records a VALID baseline: decomposition is only
+	// permitted on a structurally sound target (the strict hard-gate would
+	// otherwise divert a corrupt baseline to the DecisionSurface barrier).
+	if !dag.BaselineSyntaxValid {
+		t.Fatal("BaselineSyntaxValid = false, want true — the baseline HTML is structurally valid at staging time")
 	}
 	before := readTarget(t, root, "index.html")
 

@@ -101,6 +101,16 @@ type Driver struct {
 	// anti-loop guard: when it reaches proposalAntiLoopLimit the run is forced
 	// to ABORTED instead of looping on the same strategy.
 	proposalFails int
+
+	// surface is the Zero-Token DecisionSurface staged when the target's
+	// ExecutionGate is CLOSED (corrupt AST / unresolved deps / over budget) so
+	// DAG decomposition is forbidden. Nil unless the loop parked at the
+	// HumanBoundaryProposal barrier.
+	surface *DecisionSurface
+
+	// subcommand is the policy scope ($prompt / $hot / "") used to tailor the
+	// DecisionSurface option set. Empty is the conservative default.
+	subcommand string
 }
 
 // Option configures the Driver during construction.
@@ -163,6 +173,13 @@ func WithPreflightBarrier(b *loop.Barrier) Option {
 // WithPreflightState wires the Observation State where StructuralSnapshot is published.
 func WithPreflightState(s *preflight.ObservationState) Option {
 	return func(d *Driver) { d.preflightState = s }
+}
+
+// WithSubcommand sets the policy scope ($prompt / $hot) used to tailor the
+// Zero-Token DecisionSurface option set when the preflight hard-gate diverts a
+// corrupt-AST / closed-gate target away from DAG decomposition.
+func WithSubcommand(s string) Option {
+	return func(d *Driver) { d.subcommand = s }
 }
 
 // NewDriver wires the bounded loop over the executor adapter. bus may be nil

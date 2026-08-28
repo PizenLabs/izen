@@ -623,6 +623,17 @@ func (d *Driver) Proposal() *planner.ExecutionDAG {
 // DAG_EXECUTION_FAILED). Nil when no decomposition was ever staged.
 func (d *Driver) Plan() *planner.ExecutionDAG { return d.dag }
 
+// DecisionSurface returns the staged Zero-Token DecisionSurface when the loop
+// parked at the HumanBoundaryProposal barrier (the preflight hard-gate closed:
+// corrupt AST / unresolved dependencies / over budget). Nil while no such
+// barrier is active — notably nil after a normal DECOMPOSITION_PROPOSAL park.
+func (d *Driver) DecisionSurface() *DecisionSurface {
+	if d == nil {
+		return nil
+	}
+	return d.surface
+}
+
 // stageDecomposition reacts to a preflight_infeasible observation: it reads
 // the target content, runs the PASS 1 MANIFEST AUTO-HOOK (when wired) and asks
 // the planner for a valid ExecutionDAG, then parks the loop at the typed
@@ -650,6 +661,25 @@ func (d *Driver) stageDecomposition(ctx context.Context) bool {
 		diagnosticf("[boundary2] decomposition skipped: target %s unreadable", target)
 		return false
 	}
+	// ── STRICT PREFLIGHT HARD-GATE (invariant) ───────────────────────────
+	// The Zero-Token ExecutionGate MUST be consulted BEFORE any DAG
+	// decomposition. When the target's baseline AST is corrupt (or the gate is
+	// otherwise closed for a structural reason) DAG decomposition is STRICTLY
+	// FORBIDDEN: a broken document may never be sliced into semantic-structural
+	// or line-window sub-tasks. The loop diverts to the Zero-Token
+	// DecisionSurface barrier so the human may choose repair-first / cancel.
+	// Over-budget (valid-AST) preflight_infeasible remains the legitimate
+	// Boundary-2 decomposition path and is NOT diverted here.
+	eval := EvaluateScope(ScopeInput{
+		Target:          target,
+		Content:         source,
+		MaxOutputTokens: maxOut,
+		Root:            d.adapter.Root(),
+	})
+	if eval.ASTStatus == ASTCorrupt {
+		diagnosticf("[boundary2] preflight hard-gate CLOSED for corrupt AST target=%s — DAG decomposition forbidden, diverting to DecisionSurface", target)
+		return d.stageDecisionSurface(ctx, eval, target)
+	}
 	base := d.req.WorkspaceDigest
 	if base == "" {
 		base = d.adapter.WorkspaceVersion([]string{target})
@@ -675,6 +705,37 @@ func (d *Driver) stageDecomposition(ctx context.Context) bool {
 	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 	diagnosticf("[boundary2] DECOMPOSITION_PROPOSAL staged plan=%s target=%s sub_tasks=%d ceiling=%d tok/sub-task",
 		dag.Status, target, len(dag.SubTasks), dag.Budget())
+	return true
+}
+
+// stageDecisionSurface parks the loop at the Zero-Token DecisionSurface barrier
+// when the preflight hard-gate is CLOSED (corrupt AST / unresolved dependencies
+// / over budget). DAG decomposition is STRICTLY FORBIDDEN from this state: no
+// ExecutionDAG is ever staged and no sub-task is created. The human resolves the
+// barrier through the pure-data DecisionSurface (repair-first / cancel), which
+// the runtime autonomy package renders and the driver resumes via
+// ResumeWithProposal.
+func (d *Driver) stageDecisionSurface(ctx context.Context, eval PreflightEvaluation, target string) bool {
+	if d.loop == nil {
+		return false
+	}
+	surface := BuildDecisionSurface(eval, d.subcommand)
+	d.surface = &surface
+	b := autonomy.HumanBoundary{
+		Reason:         "Zero-Token DecisionSurface: " + barrierReason(eval),
+		Targets:        []string{target},
+		DecisionSurface: true,
+	}
+	// DeriveBoundaryAction recognizes the DecisionSurface marker and sets the
+	// HumanBoundaryProposal action; the manual assignments are belt-and-
+	// suspenders so the stored boundary is unambiguous even before enrichment.
+	b.Action = autonomy.HumanBoundaryProposal
+	b.Resumable = true
+	d.loop.AwaitHuman(b)
+	d.enrichBoundary()
+	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
+	diagnosticf("[preflight] DecisionSurface barrier staged target=%s ast_status=%s gate_closed=true — DAG decomposition forbidden",
+		target, eval.ASTStatus)
 	return true
 }
 

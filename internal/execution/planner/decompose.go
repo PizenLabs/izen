@@ -137,6 +137,15 @@ func DecomposeTarget(objective, target string, source []byte, baseDigest string,
 	if len(strings.TrimSpace(string(source))) == 0 {
 		return nil, ErrEmptySource
 	}
+	// ── STRICT PREFLIGHT BASELINE SYNTAX GUARD (invariant) ───────────────
+	// DAG decomposition is STRICTLY FORBIDDEN when the target's baseline AST is
+	// corrupt. A broken document must never be sliced into semantic-structural
+	// or line-window sub-tasks: doing so would ask the model to reason over an
+	// unparseable structure and can only yield a regression. The caller must
+	// divert to the Zero-Token DecisionSurface barrier instead.
+	if err := execution.ValidateDocumentSyntax(target, source); err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrDecompositionForbiddenCorruptAST, err)
+	}
 	budget := SubTaskBudget(maxOutputTokens)
 	if budget <= 0 {
 		return nil, fmt.Errorf("%w: max_output=%d leaves no per-sub-task budget", ErrNotDecomposable, maxOutputTokens)
@@ -196,6 +205,13 @@ func stageSemanticDAG(objective, target string, source []byte, baseDigest string
 func StageSemanticSections(objective, target string, source []byte, baseDigest string, maxOutputTokens int, sections []Section) (*ExecutionDAG, error) {
 	if len(sections) == 0 {
 		return nil, ErrEmptySource
+	}
+	// ── STRICT PREFLIGHT BASELINE SYNTAX GUARD (invariant) ───────────────
+	// Manifest-scoped decomposition is equally forbidden on a corrupt baseline:
+	// pruning the manifest surface cannot repair a broken AST, so no sub-task
+	// may be staged against it.
+	if err := execution.ValidateDocumentSyntax(target, source); err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrDecompositionForbiddenCorruptAST, err)
 	}
 	budget := SubTaskBudget(maxOutputTokens)
 	if budget <= 0 {

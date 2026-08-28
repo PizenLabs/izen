@@ -3,6 +3,8 @@ package autonomy
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -13,6 +15,7 @@ import (
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/execution/planner"
 )
 
 // TestDriver_ReadOnlyCompletes proves the happy-path bounded loop: a read-only
@@ -654,5 +657,98 @@ func TestDriver_LateResultSuppression(t *testing.T) {
 	// Verify Run A state is still Aborted (not overwritten by late result)
 	if d.State() != autonomy.RuntimeAborted {
 		t.Fatalf("Run A state after late result = %s, want aborted (late result suppressed)", d.State())
+	}
+}
+
+// ── Strict Preflight Hard-Gate: corrupt AST must NOT stage DAG decomposition ─
+
+// htmlCorruptFixture renders a structurally CORRUPT HTML document: an unclosed
+// <script> element makes the deterministic validator flag the whole target as
+// ASTCorrupt. It is also large enough that the executor's Boundary-2 budget
+// preflight returns OutcomePreflightInfeasible, reproducing the exact routing
+// leak the strict gate must close.
+func htmlCorruptFixture(lines int) []byte {
+	var b bytes.Buffer
+	b.WriteString("<!DOCTYPE html>\n<html>\n<head><title>Broken</title></head>\n<body>\n")
+	b.WriteString("<script>\n  console.log('under construction');\n")
+	for i := 0; i < lines-6; i++ {
+		fmt.Fprintf(&b, "<div class=\"row-%d\"><p>lorem ipsum dolor sit amet consectetur adipiscing elit %d padded block.</p></div>\n", i, i)
+	}
+	// NOTE: the opening <script> is deliberately never closed, so the trailing
+	// </body></html> are swallowed as raw-text script content — a corrupt AST.
+	b.WriteString("</body>\n</html>\n")
+	return b.Bytes()
+}
+
+// TestDriver_CorruptFile_DoesNotStageDAGDecomposition enforces the strict
+// preflight hard-gate: a corrupt target that ALSO trips the preflight guard
+// (preflight_infeasible) MUST NOT be routed to DAG decomposition. The loop must
+// halt at the Zero-Token DecisionSurface barrier with ZERO sub-tasks staged.
+func TestDriver_CorruptFile_DoesNotStageDAGDecomposition(t *testing.T) {
+	root := t.TempDir()
+	writeTarget(t, root, "index.html", string(htmlCorruptFixture(140)))
+
+	// The provider is never reached: the executor returns preflight_infeasible
+	// at Boundary 2 (budget) before any model invocation.
+	bus := events.NewBus(events.DefaultBufferSize)
+	mock := &mockProvider{responses: nil}
+	x := testExecutor(t, root, mock, bus)
+	driver := NewDriver(NewExecutorAdapter(root, execution.NewIntentGateway(root), x), bus)
+
+	term, err := driver.Run(context.Background(), "restyle the broken page @index.html")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Halt at the DecisionSurface barrier — never terminates, never decomposes.
+	if term != nil {
+		t.Fatalf("run terminated (%+v) instead of parking at the DecisionSurface barrier", term)
+	}
+	if driver.State() != autonomy.RuntimeAwaitingHuman {
+		t.Fatalf("state = %s, want awaiting_human", driver.State())
+	}
+	hist := driver.History()
+	if len(hist) == 0 || hist[len(hist)-1].To != autonomy.RuntimeAwaitingHuman {
+		t.Fatalf("loop history must converge on awaiting_human, got %+v", hist)
+	}
+
+	b := driver.Boundary()
+	if b == nil {
+		t.Fatal("no boundary parked")
+	}
+	// The barrier MUST be the Zero-Token DecisionSurface gate, never the
+	// DECOMPOSITION_PROPOSAL gate.
+	if b.Action == autonomy.HumanBoundaryDecomposition {
+		t.Fatal("corrupt target was routed to DECOMPOSITION_PROPOSAL — strict gate violated")
+	}
+	if b.Action != autonomy.HumanBoundaryProposal {
+		t.Fatalf("boundary action = %q, want %q (DecisionSurface barrier)", b.Action, autonomy.HumanBoundaryProposal)
+	}
+	// DECOMPOSITION_PROPOSAL is NEVER rendered: no DAG is ever carried.
+	if b.Proposal != nil {
+		t.Fatalf("boundary carries a staged DAG (sub_tasks=%d) — decomposition must be forbidden on a corrupt target", len(b.Proposal.SubTasks))
+	}
+	// DAG sub-tasks are NEVER created.
+	if driver.Proposal() != nil {
+		t.Fatal("driver.Proposal() returned a staged DAG — forbidden on corrupt AST")
+	}
+	if driver.Plan() != nil {
+		t.Fatal("driver.Plan() returned a staged DAG — forbidden on corrupt AST")
+	}
+	ds := driver.DecisionSurface()
+	if ds == nil {
+		t.Fatal("DecisionSurface barrier must expose a DecisionSurface")
+	} else if ds.ASTStatus != ASTCorrupt {
+		t.Fatalf("DecisionSurface ASTStatus = %q, want corrupt", ds.ASTStatus)
+	}
+
+	// The decomposer itself refuses a corrupt baseline INDEPENDENTLY of the
+	// driver routing, so a future regression cannot silently slice it.
+	src, ok := driver.adapter.ReadTargetFile("index.html")
+	if !ok {
+		t.Fatal("could not read the corrupt target for the decomposer guard check")
+	}
+	if _, gerr := planner.DecomposeTarget("restyle", "index.html", src, "", 4096); !errors.Is(gerr, planner.ErrDecompositionForbiddenCorruptAST) {
+		t.Fatalf("planner.DecomposeTarget on corrupt source err = %v, want ErrDecompositionForbiddenCorruptAST", gerr)
 	}
 }

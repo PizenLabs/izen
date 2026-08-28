@@ -4,13 +4,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
-	"github.com/PizenLabs/izen/internal/execution/planner"
 )
 
 // ── PREFLIGHT BASELINE SYNTAX SNAPSHOT + NO-OP GLOBAL AUDIT RELAXATION ──────
@@ -32,12 +30,28 @@ func brokenBaselineFixture() []byte {
 	return []byte(b.String())
 }
 
-// stageBrokenBaselineRun parks a run at a DECOMPOSITION_PROPOSAL boundary over
-// a pre-broken index.html, with a deterministic ONE-unit DAG (whole file) cut
-// by an injected decompose. It returns the driver and the dagProvider wired to
-// answer each sub-task.
-func stageBrokenBaselineRun(t *testing.T) (*Driver, *planner.ExecutionDAG, *dagProvider) {
-	t.Helper()
+// validLargeBaselineFixture renders a decomposition-sized, STRUCTURALLY VALID
+// HTML document. It is large enough to trip the Boundary-2 budget preflight (so
+// the driver stages a DECOMPOSITION_PROPOSAL) but parses cleanly — used by the
+// execution-inertia and global-audit tests that must run over a baseline the
+// strict preflight hard-gate permits to be decomposed.
+func validLargeBaselineFixture() []byte {
+	var b strings.Builder
+	b.WriteString("<!DOCTYPE html>\n<html>\n<head><title>Valid</title></head>\n<body>\n")
+	for i := 0; i < 80; i++ {
+		fmt.Fprintf(&b, "<section id=\"sec-%d\">\n<h2>Section %d</h2>\n<p>unique filler content number %d lorem ipsum dolor sit amet consectetur</p>\n</section>\n", i, i, i)
+	}
+	b.WriteString("</body>\n</html>\n")
+	return []byte(b.String())
+}
+
+// TestAudit_PreexistingBaselineSyntaxError pins the NEW strict preflight
+// hard-gate: a target whose baseline AST is ALREADY CORRUPT must NEVER be
+// decomposed into a DAG — the pre-existing-baseline relaxation that once let a
+// no-op run slip through on a broken file is GONE. The run must halt at the
+// Zero-Token DecisionSurface barrier with ZERO sub-tasks staged, so the global
+// post-DAG audit never even runs over a broken document.
+func TestAudit_PreexistingBaselineSyntaxError(t *testing.T) {
 	root := t.TempDir()
 	source := brokenBaselineFixture()
 	if len(source) < 8*1024/2 { // sanity: big enough to trip Boundary-2 preflight
@@ -50,122 +64,42 @@ func stageBrokenBaselineRun(t *testing.T) (*Driver, *planner.ExecutionDAG, *dagP
 	x := testExecutor(t, root, p, bus)
 	adapter := NewExecutorAdapter(root, execution.NewIntentGateway(root), x)
 
-	decompose := func(objective, target string, src []byte, baseDigest string, maxOutputTokens int) (*planner.ExecutionDAG, error) {
-		dag := planner.NewExecutionDAG(objective, target, planner.SplitBoundedLines, baseDigest, maxOutputTokens)
-		total := len(strings.Split(strings.TrimSuffix(string(src), "\n"), "\n"))
-		if err := dag.AddTask(planner.SubTask{
-			ID:              "st-1",
-			Index:           1,
-			Kind:            planner.SplitBoundedLines,
-			Description:     "broken baseline window",
-			Region:          planner.Region{StartLine: 1, EndLine: total},
-			EstimatedTokens: 64,
-		}); err != nil {
-			return nil, err
-		}
-		if err := dag.Validate(); err != nil {
-			return nil, err
-		}
-		return dag, nil
-	}
-
-	driver := NewDriver(adapter, bus, WithDecompose(decompose))
+	driver := NewDriver(adapter, bus)
 	term, err := driver.Run(context.Background(), "check this file @index.html and remove redundant content")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+
+	// The run MUST park at the DecisionSurface barrier — never terminate, never
+	// stage a DECOMPOSITION_PROPOSAL DAG over the broken baseline.
 	if term != nil {
-		t.Fatalf("run terminated (%+v) instead of parking at the proposal", term)
-	}
-	dag := driver.Proposal()
-	if dag == nil {
-		t.Fatal("no DECOMPOSITION_PROPOSAL parked at the boundary")
-	}
-	if len(dag.SubTasks) != 1 {
-		t.Fatalf("sub-tasks = %d, want 1", len(dag.SubTasks))
-	}
-	return driver, dag, p
-}
-
-// TestAudit_PreexistingBaselineSyntaxError drives a DAG over an ALREADY-BROKEN
-// HTML file whose sub-task evaluates to no_op_objective_satisfied (zero
-// mutations). The objective is an ACTIVE MODIFICATION request ("remove
-// redundant content"), so the EXECUTION INERTIA circuit breaker must fail
-// fast: a modification intent that applied ZERO bytes is a false-positive
-// resolution, never a completion — the pre-existing-baseline relaxation can
-// never let it through as OBJECTIVE_RESOLVED. The run parks at awaiting_human
-// with the plan marked EXECUTION_INERTIA_NO_OP.
-func TestAudit_PreexistingBaselineSyntaxError(t *testing.T) {
-	var (
-		mu    sync.Mutex
-		diags []string
-	)
-	SetDiagnosticLog(func(format string, args ...interface{}) {
-		line := fmt.Sprintf(format, args...)
-		mu.Lock()
-		diags = append(diags, line)
-		mu.Unlock()
-	})
-	defer SetDiagnosticLog(nil)
-
-	driver, dag, p := stageBrokenBaselineRun(t)
-
-	// The preflight snapshot must have recorded the pre-existing defect.
-	if dag.BaselineSyntaxValid {
-		t.Fatal("BaselineSyntaxValid = true, want false — the baseline HTML was already broken at staging time")
-	}
-
-	before := readTarget(t, p.root, "index.html")
-	// The model answers NO_CHANGES_REQUIRED for the single sub-task.
-	p.noop = map[int]bool{1: true}
-
-	term, err := driver.ResumeApproveProposal(context.Background())
-	if err != nil {
-		t.Fatalf("ResumeApproveProposal: %v", err)
-	}
-
-	// NOT a completion: an active modification intent that mutated nothing must
-	// never resolve as OBJECTIVE_RESOLVED, even over a pre-broken baseline.
-	if term != nil {
-		t.Fatalf("termination = %+v, want a parked loop (nil term)", term)
+		t.Fatalf("run terminated (%+v) instead of parking at the DecisionSurface barrier", term)
 	}
 	if driver.State() != autonomy.RuntimeAwaitingHuman {
 		t.Fatalf("state = %s, want awaiting_human", driver.State())
 	}
-	for _, tr := range driver.History() {
-		if tr.To == autonomy.RuntimeCompleted {
-			t.Fatalf("false completion recorded in history: %+v", tr)
-		}
-	}
-	if driver.Plan().Status != planner.ExecutionInertiaNoOp {
-		t.Fatalf("plan status = %s, want %s (execution inertia must override the pre-existing-baseline relaxation)",
-			driver.Plan().Status, planner.ExecutionInertiaNoOp)
-	}
-	if !strings.Contains(driver.Plan().FailureReason, "no-op") ||
-		!strings.Contains(driver.Plan().FailureReason, "zero mutations") {
-		t.Fatalf("failure reason lacks the inertia evidence: %q", driver.Plan().FailureReason)
-	}
-	if dag.NoOpSatisfiedSubTasks != 1 {
-		t.Fatalf("NoOpSatisfiedSubTasks = %d, want 1", dag.NoOpSatisfiedSubTasks)
-	}
-	// Zero mutations were applied: the workspace is unchanged.
-	if got := readTarget(t, p.root, "index.html"); got != before {
-		t.Fatal("a no-op run mutated the workspace")
-	}
-	// The boundary carries the typed inertia evidence for the human decision.
 	b := driver.Boundary()
 	if b == nil {
-		t.Fatal("no human boundary parked after the inertia halt")
+		t.Fatal("no human boundary parked")
 	}
-	if !strings.Contains(b.Reason, "EXECUTION_INERTIA_NO_OP") {
-		t.Fatalf("boundary reason missing EXECUTION_INERTIA_NO_OP: %q", b.Reason)
+	if b.Action != autonomy.HumanBoundaryProposal {
+		t.Fatalf("boundary action = %q, want %q (DecisionSurface hard-gate)", b.Action, autonomy.HumanBoundaryProposal)
 	}
-	// The inertia diagnostic was emitted.
-	mu.Lock()
-	defer mu.Unlock()
-	joined := strings.Join(diags, "\n")
-	if !strings.Contains(joined, "EXECUTION_INERTIA_NO_OP") {
-		t.Fatalf("no EXECUTION_INERTIA_NO_OP diagnostic emitted; diagnostics:\n%s", joined)
+	if b.Action == autonomy.HumanBoundaryDecomposition {
+		t.Fatal("corrupt baseline was routed to DECOMPOSITION_PROPOSAL — strict gate violated")
+	}
+	// ZERO sub-tasks may be created against a broken document.
+	if driver.Proposal() != nil {
+		t.Fatal("driver.Proposal() returned a staged DAG — decomposition forbidden on a corrupt baseline")
+	}
+	if driver.Plan() != nil {
+		t.Fatal("driver.Plan() returned a staged DAG — decomposition forbidden on a corrupt baseline")
+	}
+	ds := driver.DecisionSurface()
+	if ds == nil {
+		t.Fatal("DecisionSurface barrier must expose a DecisionSurface")
+	} else if ds.ASTStatus != ASTCorrupt {
+		t.Fatalf("DecisionSurface ASTStatus = %q, want corrupt", ds.ASTStatus)
 	}
 }
 

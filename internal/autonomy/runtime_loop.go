@@ -378,6 +378,13 @@ const (
 	// plan (every sub-task listed on the boundary) before the atomic
 	// transaction loop may run; resumable via the driver's proposal surface.
 	HumanBoundaryDecomposition HumanBoundaryAction = "decomposition_proposal"
+	// HumanBoundaryProposal is the ZERO-TOKEN DecisionSurface gate: the
+	// target's ExecutionGate is CLOSED (corrupt AST / unresolved dependencies /
+	// over budget) so DAG decomposition is STRICTLY FORBIDDEN. The loop parks
+	// and the runtime autonomy package renders the pure-data DecisionSurface so
+	// the human may choose a repair-first / cancel strategy. No sub-task is
+	// ever staged. Resumable via the driver's ResumeWithProposal.
+	HumanBoundaryProposal HumanBoundaryAction = "proposal"
 )
 
 // String returns the canonical boundary-action label.
@@ -403,8 +410,14 @@ type HumanBoundary struct {
 	// HumanBoundaryDecomposition. It lists every sub-task the human is being
 	// asked to authorize; approval covers ALL of them as one atomic plan.
 	Proposal *planner.ExecutionDAG
+	// DecisionSurface marks the boundary as the ZERO-TOKEN DecisionSurface
+	// proposal gate (HumanBoundaryProposal). When true, DAG decomposition is
+	// forbidden and the human must choose a repair-first / cancel strategy from
+	// the DecisionSurface the runtime autonomy package renders. The concrete
+	// DecisionSurface value lives on the Driver; this is a pure marker.
+	DecisionSurface bool `json:"decision_surface,omitempty"`
 	// Action discriminates the boundary kind (approve/clarify/inform/
-	// decomposition_proposal).
+	// decomposition_proposal/proposal).
 	Action HumanBoundaryAction
 	// Resumable reports whether a Resume* decision exists for this boundary.
 	// An inform boundary is not resumable; only a fresh bounded run continues.
@@ -424,6 +437,9 @@ func DeriveBoundaryAction(b *HumanBoundary) {
 		b.Resumable = true
 	case b.Proposal != nil:
 		b.Action = HumanBoundaryDecomposition
+		b.Resumable = true
+	case b.DecisionSurface:
+		b.Action = HumanBoundaryProposal
 		b.Resumable = true
 	case len(b.Options) > 0:
 		b.Action = HumanBoundaryClarify

@@ -62,6 +62,16 @@ func NewExecutorAdapter(root string, gateway *execution.IntentGateway, executor 
 	return &ExecutorAdapter{root: root, gateway: gateway, executor: executor}
 }
 
+// Root returns the workspace root the adapter resolves targets against. It is
+// the source of truth for local file-reference resolution in the zero-token
+// preflight evaluation.
+func (a *ExecutorAdapter) Root() string {
+	if a == nil {
+		return ""
+	}
+	return a.root
+}
+
 // Resolve determines the execution target set for an objective WITHOUT
 // executing. It surfaces HumanClarification as an ambiguous resolution so the
 // driver parks before any model call or mutation.
