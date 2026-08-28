@@ -142,8 +142,9 @@ func TestPreflight_AutoManifestTrigger(t *testing.T) {
 
 // TestPreflight_AutoManifestFallbackToBoundedInspection pins the fail-soft
 // path: when the Pass 1 manifest generation fails or returns empty mutations,
-// the loop falls back to a single-pass bounded inspection — it NEVER falls back
-// to the naive line slicer.
+// the loop falls back to the BOUNDED WINDOW DECOMPOSITION — every sub-task
+// window is capped at fallbackWindowMaxLines so no single unit forces a
+// whole-file rewrite. It NEVER stages one giant whole-file sub-task.
 func TestPreflight_AutoManifestFallbackToBoundedInspection(t *testing.T) {
 	root := t.TempDir()
 	source := preflightManifestFixture()
@@ -176,11 +177,18 @@ func TestPreflight_AutoManifestFallbackToBoundedInspection(t *testing.T) {
 		if dag == nil {
 			t.Fatalf("%s: no proposal staged", name)
 		}
-		if len(dag.SubTasks) != 1 {
-			t.Fatalf("%s: sub-tasks = %d, want 1 single-pass bounded inspection", name, len(dag.SubTasks))
+		if len(dag.SubTasks) == 0 {
+			t.Fatalf("%s: no bounded fallback sub-tasks staged", name)
 		}
-		if dag.SubTasks[0].Kind == planner.SplitBoundedLines {
-			t.Fatalf("%s: fell back to the naive line slicer", name)
+		for _, st := range dag.SubTasks {
+			if st.Kind != planner.SplitBoundedLines {
+				t.Fatalf("%s: fallback sub-task %s kind = %s, want %s (bounded window)",
+					name, st.ID, st.Kind, planner.SplitBoundedLines)
+			}
+			if st.Region.Lines() > fallbackWindowMaxLines {
+				t.Fatalf("%s: fallback sub-task %s window %s exceeds the %d-line ceiling",
+					name, st.ID, st.Region, fallbackWindowMaxLines)
+			}
 		}
 	}
 }

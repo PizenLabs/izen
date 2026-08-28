@@ -426,6 +426,11 @@ type RuntimeExecutor struct {
 	// mutationBoundary is the explicit workspace-integrity assertion surface
 	// used after any rollback to cryptographically verify base digest recovery.
 	mutationBoundary MutationBoundary
+	// manifestSystemPromptOverride, when non-empty, replaces the default Pass 1
+	// manifest system prompt. The autonomy layer injects the compact manifest
+	// prompt (buildManifestPrompt) at bootstrap via SetManifestSystemPrompt; a
+	// direct InvokeManifestPass call without injection keeps the default.
+	manifestSystemPromptOverride string
 
 	mu      sync.Mutex
 	pending map[string]*pendingMutation
@@ -1979,9 +1984,18 @@ func (x *RuntimeExecutor) compileDiff(raw, target, original string) string {
 // JSON object, so a small fixed ceiling keeps the read-only pass cheap and
 // cannot starve the bounded execution that follows.
 const (
+	// manifestSystemPrompt is the COMPACT Pass 1 manifest system prompt. Pass 1
+	// is strictly read-only and must emit ONLY a raw MINIFIED MutationManifest
+	// JSON with ZERO prose: weak/free-tier models (Cohere North Mini Code) that
+	// are asked to "analyze" and "propose" ramble past the output budget and
+	// truncate mid-JSON. The directive pins the MAX 200 TOKENS ceiling so a
+	// compliant model completes on the first attempt. The autonomy layer
+	// injects the authoritative buildManifestPrompt() at bootstrap via
+	// SetManifestSystemPrompt; this constant is the pre-injection default.
 	manifestSystemPrompt = "You are the Pass 1 manifest generator of a read-only planning stage. " +
 		"Analyze the target file below against the user's objective and propose the MINIMAL set of mutations that achieve it. " +
-		"Output ONLY a single raw JSON object (no markdown fences, no prose, no commentary) conforming exactly to:\n" +
+		"OUTPUT ONLY VALID MINIFIED JSON ARRAY OF MUTATION TARGETS. DO NOT WRITE CODE, DO NOT EXPLAIN, DO NOT INCLUDE MARKDOWN FENCES. MAX 200 TOKENS.\n" +
+		"Output a single raw JSON object (minified, no newlines) conforming exactly to:\n" +
 		`{"targetFile":"<workspace-relative path>","intent":"<one-line objective>","mutations":[{"selector":"<css selector or symbol, e.g. #hero or section#hero>","action":"delete|modify|insert","estimatedLines":<positive int>}]}` + "\n" +
 		"Rules: every mutation MUST name a selector or symbol that exists in the file; " +
 		"omit any content the objective does not touch; " +
@@ -1989,9 +2003,36 @@ const (
 		"This pass never writes to the workspace."
 
 	// manifestPassMaxTokens is the fixed output ceiling of the read-only Pass 1
-	// manifest generation.
-	manifestPassMaxTokens = 256
+	// manifest generation. It matches the "MAX 200 TOKENS" directive so a
+	// verbose free-tier model cannot ramble past the compact budget.
+	manifestPassMaxTokens = 200
+
+	// manifestPassRejectTokens is the post-hoc rejection threshold: a manifest
+	// response whose token estimate still exceeds this ceiling (a provider that
+	// ignores max_tokens) is rejected as INVALID JSON instead of exhausting the
+	// output gate.
+	manifestPassRejectTokens = 512
 )
+
+// SetManifestSystemPrompt overrides the Pass 1 manifest system prompt (the
+// autonomy layer injects buildManifestPrompt at bootstrap). Passing an empty
+// string restores the default.
+func (x *RuntimeExecutor) SetManifestSystemPrompt(p string) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.manifestSystemPromptOverride = p
+}
+
+// manifestSystemPromptFor returns the effective Pass 1 manifest system prompt:
+// the injected override when present, otherwise the default.
+func (x *RuntimeExecutor) manifestSystemPromptFor() string {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.manifestSystemPromptOverride != "" {
+		return x.manifestSystemPromptOverride
+	}
+	return manifestSystemPrompt
+}
 
 // InvokeManifestPass performs the lightweight READ-ONLY Pass 1 manifest
 // request: a single bounded provider invocation whose only output is a raw
@@ -2000,6 +2041,13 @@ const (
 // anything — its result only informs the DAG strategy Pass 2 decomposes under.
 // The returned string is the verbatim model response; the caller parses it
 // with ParseMutationManifest.
+//
+// An over-long output (a provider ignoring the 200-token ceiling) is rejected
+// as INVALID JSON before it can exhaust the output gate: the error is a plain
+// manifest failure the caller falls back from, never an OUTPUT_EXHAUSTED
+// gate signal. A finish_reason="length" truncated response likewise crosses as
+// raw bytes — ParseMutationManifest rejects the truncated JSON — so the DAG
+// strategy decision falls back silently instead of surfacing exhaustion.
 func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string, targetContent []byte) (string, error) {
 	if x == nil {
 		return "", fmt.Errorf("executor: nil runtime for manifest pass")
@@ -2023,7 +2071,7 @@ func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string,
 	user.WriteString("\n```\n")
 	req := ai.Request{
 		Model:     model,
-		System:    manifestSystemPrompt,
+		System:    x.manifestSystemPromptFor(),
 		Messages:  []ai.Message{{Role: "user", Content: user.String()}},
 		MaxTokens: manifestPassMaxTokens,
 		// The manifest is a tiny JSON object; a hidden reasoning pass would
@@ -2037,12 +2085,16 @@ func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string,
 	if resp == nil {
 		return "", fmt.Errorf("executor: manifest pass returned an empty response")
 	}
-	if executionGate := gateFor("", resp.Usage.FinishReason); executionGate != nil {
-		// An incomplete manifest generation can never inform the DAG strategy:
-		// fail closed, the caller falls back to a single-pass bounded inspection.
-		return "", executionGate
+	raw := strings.TrimSpace(resp.Content)
+	// A manifest is a TINY minified JSON payload; a response that still exceeds
+	// the rejection ceiling (bytes/4 ≈ tokens) is by definition NOT the minimal
+	// schema — reject it as invalid JSON rather than exhausting output gates.
+	if len(raw)/4 > manifestPassRejectTokens {
+		return "", fmt.Errorf(
+			"executor: manifest pass output of ~%d tokens exceeds the %d-token ceiling — rejected as invalid manifest",
+			len(raw)/4, manifestPassRejectTokens)
 	}
-	return strings.TrimSpace(resp.Content), nil
+	return raw, nil
 }
 
 // invokeReadOnly performs the single bounded provider invocation for read-only

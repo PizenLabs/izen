@@ -139,6 +139,17 @@ type ExecutionDAG struct {
 	BaseTreeDigest string
 	// MaxOutputTokens is the per-invocation budget the plan was staged under.
 	MaxOutputTokens int
+	// BaselineSyntaxValid records the PREFLIGHT BASELINE SYNTAX SNAPSHOT: the
+	// target's syntax validity captured BEFORE any sub-task executes. When
+	// false, a post-DAG global audit syntax failure on an UNCHANGED document
+	// is a pre-existing baseline condition, never a mutation regression.
+	BaselineSyntaxValid bool
+	// NoOpSatisfiedSubTasks counts the sub-tasks that evaluated to
+	// no_op_objective_satisfied (the model answered NO_CHANGES_REQUIRED and
+	// deterministic structural analysis confirmed the claim). A DAG whose
+	// EVERY unit no-op'd mutated nothing, so an unchanged pre-broken document
+	// cannot be blamed on it.
+	NoOpSatisfiedSubTasks int
 	// SubTasks are in topological (execution) order.
 	SubTasks []SubTask
 	// Status is the plan lifecycle status.

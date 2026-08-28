@@ -43,6 +43,18 @@ var (
 	// transport layer (the fence delimiters and attribute quotes arrive
 	// backslash-escaped).
 	escapedQuoteRe = regexp.MustCompile(`\\"`)
+	// searchReplaceBlockRe matches ONE complete SEARCH/REPLACE block — the
+	// opening marker, the SEARCH body, the separator, the REPLACE body and the
+	// closing marker. Both closing conventions (">>>>>" with or without a
+	// " REPLACE" suffix) are tolerated. It is the AGGRESSIVE-INGESTION
+	// recovery pattern for free-tier models that wrap the artifact in
+	// conversational prose WITHOUT a markdown fence (e.g. Cohere's
+	// "Here is the fix:" wrapper), so NormalizeTransport cannot rely on fence
+	// extraction alone.
+	searchReplaceBlockRe = regexp.MustCompile(`(?s)<<<<<<< SEARCH\s*(.*?)\s*=======\s*(.*?)\s*>>>>>>>(?: REPLACE)?`)
+	// rawHTMLBlockRe matches the content of an outer ```html ... ``` code block
+	// so preceding/trailing model conversational text is stripped entirely.
+	rawHTMLBlockRe = regexp.MustCompile("(?s)```html[^\n]*\n([\\s\\S]*?)\n?```")
 )
 
 // NormalizeTransport performs TRANSPORT-ONLY normalization of a raw LLM
@@ -103,6 +115,22 @@ func NormalizeTransport(raw string) (string, []NormalizationStep) {
 	// wrapper was damaged.
 	cur = stripResidualFences(cur, &steps)
 
+	// 5b. AGGRESSIVE RAW BLOCK RECOVERY: free-tier models frequently wrap the
+	// artifact in conversational prose without any markdown fence ("Here is the
+	// fix: <<<<<<< SEARCH …"). Fence extraction cannot rescue those, and
+	// Classify would reject the envelope (the prose + unbalanced HTML snippets
+	// of the patch). Scan the residual for a standard SEARCH/REPLACE block or
+	// an outer ```html code block and lift it out directly. A payload that IS a
+	// clean block already extracts to itself (identity — no step recorded).
+	if block, kind, ok := recoverArtifactBlock(cur); ok &&
+		strings.TrimSpace(block) != strings.TrimSpace(cur) {
+		cur = block
+		steps = append(steps, NormalizationStep{
+			Kind:   kind,
+			Detail: "recovered raw artifact block from conversational wrapper",
+		})
+	}
+
 	// 6. Remove surrounding whitespace padding.
 	trimmed := strings.TrimSpace(cur)
 	if trimmed != cur {
@@ -139,6 +167,28 @@ func stripResidualFences(s string, steps *[]NormalizationStep) string {
 		})
 	}
 	return cur
+}
+
+// recoverArtifactBlock scans raw response text for a standard artifact block
+// the transport pipeline failed to rescue from conversational prose:
+//
+//	a. a complete SEARCH/REPLACE block (<<<<<<< SEARCH … ======= … >>>>>>>),
+//	b. the content of an outer ```html … ``` code block.
+//
+// It returns the matched block (whitespace-trimmed, preserved verbatim so the
+// SEARCH anchor stays byte-exact for downstream anchor resolution), the
+// normalization-step Kind to record, and true when a block was found. It is
+// the permissive ingestion fallback BEFORE a transport normalization error:
+// a conversational wrapper is transport noise, never grounds to reject a
+// recoverable artifact.
+func recoverArtifactBlock(raw string) (block, kind string, ok bool) {
+	if m := searchReplaceBlockRe.FindStringSubmatch(raw); m != nil {
+		return strings.TrimSpace(m[0]), "extract_search_replace_block", true
+	}
+	if m := rawHTMLBlockRe.FindStringSubmatch(raw); m != nil {
+		return strings.TrimSpace(m[1]), "extract_raw_html_block", true
+	}
+	return "", "", false
 }
 
 // isFenceLine reports whether a trimmed line is a bare markdown fence marker

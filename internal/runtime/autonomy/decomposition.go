@@ -69,6 +69,12 @@ func AdaptiveDecompose(objective, target string, source []byte, baseDigest strin
 	surface := EstimateMutationSurface(manifest, source)
 	// Pass 2 — Bounded Execution: only split if surface exceeds the budget.
 	if surface <= maxOutputTokens {
+		// No usable manifest surface (nil/empty mutations): the single atomic
+		// unit would be a whole-file rewrite — enforce the bounded fallback
+		// window ceiling instead of staging one giant sub-task.
+		if manifest == nil || len(manifest.Mutations) == 0 {
+			return fallbackDecompose(objective, target, source, baseDigest, maxOutputTokens)
+		}
 		return singleTaskDAG(objective, target, source, baseDigest, maxOutputTokens, manifest, surface)
 	}
 	// Surface exceeds budget — construct semantic sub-tasks grouped by
@@ -77,17 +83,18 @@ func AdaptiveDecompose(objective, target string, source []byte, baseDigest strin
 }
 
 // DecomposeWithRawManifest parses a raw JSON manifest and adaptively
-// decomposes. On corrupt/invalid JSON it safely falls back to a single
-// bounded inspection pass without panicking (fail-open to single task).
+// decomposes. On corrupt/invalid JSON it safely falls back to the bounded
+// fallback window decomposition without panicking (fail-open to bounded
+// windows, never a single whole-file unit).
 func DecomposeWithRawManifest(objective, target string, source []byte, baseDigest string, maxOutputTokens int, raw []byte) (*planner.ExecutionDAG, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
-		return singleTaskDAG(objective, target, source, baseDigest, maxOutputTokens, nil, planner.SubTaskBudget(maxOutputTokens))
+		return fallbackDecompose(objective, target, source, baseDigest, maxOutputTokens)
 	}
 	manifest, err := ParseMutationManifest(raw)
 	if err != nil {
-		// FallbackOnInvalidManifest: corrupt manifest never panics; single
-		// bounded inspection step preserves safety.
-		return singleTaskDAG(objective, target, source, baseDigest, maxOutputTokens, nil, planner.SubTaskBudget(maxOutputTokens))
+		// FallbackOnInvalidManifest: corrupt manifest never panics; bounded
+		// fallback windows preserve safety without one giant sub-task.
+		return fallbackDecompose(objective, target, source, baseDigest, maxOutputTokens)
 	}
 	return AdaptiveDecompose(objective, target, source, baseDigest, maxOutputTokens, manifest)
 }
@@ -140,6 +147,67 @@ func singleTaskDAG(objective, target string, source []byte, baseDigest string, m
 	}
 	if err := dag.AddTask(st); err != nil {
 		return nil, err
+	}
+	if err := dag.Validate(); err != nil {
+		return nil, err
+	}
+	return dag, nil
+}
+
+// fallbackWindowMaxLines is the hard per-sub-task LINE CEILING of the
+// manifest-less fallback decomposition (bounded fallback slicing). When Pass 1
+// manifest generation is unavailable (or yields no usable mutation surface), a
+// whole-file atomic unit would force a weak/free-tier model to consider the
+// entire document in ONE SEARCH/REPLACE block and exhaust its output budget
+// mid-answer. Bounded windows keep every sub-task output a small targeted
+// delta — never a full-file rewrite.
+const fallbackWindowMaxLines = 40
+
+// fallbackDecompose stages a bounded window DAG for the manifest-less
+// fallback (manifest_scoped == false): the source is partitioned into
+// contiguous windows of at most fallbackWindowMaxLines lines each, so a
+// 133-line target yields ~4 bounded sub-tasks (1-40, 41-80, 81-120, 121-133)
+// instead of one giant sub-task. Every window is a SplitBoundedLines unit that
+// inherits the strict SEARCH/REPLACE patch contract; each EstimateRegionTokens
+// is clamped to the strict sub-task ceiling so the DAG always validates and
+// every unit passes EvaluatePreflight individually by construction.
+func fallbackDecompose(objective, target string, source []byte, baseDigest string, maxOutputTokens int) (*planner.ExecutionDAG, error) {
+	if len(bytes.TrimSpace(source)) == 0 {
+		return nil, planner.ErrEmptySource
+	}
+	budget := planner.SubTaskBudget(maxOutputTokens)
+	if budget <= 0 {
+		return nil, fmt.Errorf("%w: max_output=%d leaves no per-sub-task budget", planner.ErrNotDecomposable, maxOutputTokens)
+	}
+	total := planner.LineCount(source)
+	if total < 1 {
+		return nil, planner.ErrEmptySource
+	}
+	dag := planner.NewExecutionDAG(objective, target, planner.SplitBoundedLines, baseDigest, maxOutputTokens)
+	for start := 1; start <= total; start += fallbackWindowMaxLines {
+		end := start + fallbackWindowMaxLines - 1
+		if end > total {
+			end = total
+		}
+		region := planner.Region{StartLine: start, EndLine: end}
+		est := planner.EstimateRegionTokens(source, region)
+		if est > budget {
+			est = budget
+		}
+		if est <= 0 {
+			est = 1
+		}
+		if err := dag.AddTask(planner.SubTask{
+			ID:              fmt.Sprintf("st-%d", len(dag.SubTasks)+1),
+			Index:           len(dag.SubTasks) + 1,
+			Kind:            planner.SplitBoundedLines,
+			Target:          target,
+			Description:     fmt.Sprintf("bounded fallback window %s", region),
+			Region:          region,
+			EstimatedTokens: est,
+		}); err != nil {
+			return nil, err
+		}
 	}
 	if err := dag.Validate(); err != nil {
 		return nil, err
@@ -626,6 +694,16 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 			d.obs = approved
 			d.aggregateUsage(approved)
 			obs = approved
+		}
+
+		// ── NO-OP UNIT ACCOUNTING ──────────────────────────────────────
+		// Count satisfied no-op units so the POST-DAG global audit can tell a
+		// DAG that mutated NOTHING (every unit answered NO_CHANGES_REQUIRED and
+		// structural analysis confirmed it) from a DAG that actually changed
+		// bytes. An all-no-op DAG over a pre-broken baseline cannot be blamed
+		// for a syntax failure that pre-dates it.
+		if obs.Outcome == autonomy.OutcomeNoOpObjectiveSatisfied {
+			dag.NoOpSatisfiedSubTasks++
 		}
 
 		if !dagOutcomeSuccess(obs) {

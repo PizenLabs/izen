@@ -43,6 +43,7 @@ type ManifestPassFunc func(ctx context.Context, objective string, targetContent 
 // provider. It is the production wiring of the Pass 1 auto-hook: the executor
 // remains the single authority that invokes the provider.
 func ManifestPassForExecutor(exec *execution.RuntimeExecutor) ManifestPassFunc {
+	exec.SetManifestSystemPrompt(buildManifestPrompt())
 	return func(ctx context.Context, objective string, targetContent []byte) (*MutationManifest, error) {
 		return ExecuteManifestPass(ctx, exec, objective, targetContent)
 	}
@@ -86,6 +87,48 @@ func PreflightRequiresManifest(targetBytes, maxOutputTokens int) bool {
 	return estimated > maxOutputTokens
 }
 
+// ── Compact Manifest Prompt (Minimal Manifest Schema) ───────────────────────
+//
+// Free-tier / weak models (Cohere North Mini Code and friends) exhaust the
+// Pass 1 output budget when the manifest prompt is verbose: they ramble past
+// max_output, truncate mid-JSON, and the gate surfaces OUTPUT_EXHAUSTED. The
+// compact manifest prompt DEMANDS a MINIFIED JSON payload with ZERO prose and
+// a hard 200-token ceiling, so a compliant model completes with a tiny valid
+// manifest on the first attempt. An output that still exceeds the 512-token
+// rejection threshold is rejected as INVALID JSON (a silent fallback), never
+// routed through the output gate.
+
+// ManifestPassCompactDirective is the strict conciseness instruction injected
+// verbatim into the Pass 1 manifest system prompt.
+const ManifestPassCompactDirective = "OUTPUT ONLY VALID MINIFIED JSON ARRAY OF MUTATION TARGETS. DO NOT WRITE CODE, DO NOT EXPLAIN, DO NOT INCLUDE MARKDOWN FENCES. MAX 200 TOKENS."
+
+// ManifestPassMaxTokens is the fixed output ceiling of the read-only Pass 1
+// manifest generation. It matches the "MAX 200 TOKENS" directive so a verbose
+// model physically cannot ramble past the compact budget.
+const ManifestPassMaxTokens = 200
+
+// ManifestPassRejectTokens is the post-hoc rejection threshold: a manifest
+// response whose token estimate still exceeds this ceiling (a provider that
+// ignores max_tokens) is rejected as invalid JSON instead of exhausting the
+// output gate.
+const ManifestPassRejectTokens = 512
+
+// buildManifestPrompt renders the COMPACT Pass 1 manifest system prompt. It is
+// the single authority on the manifest wire contract: the strict minified-JSON
+// directive, the exact schema, and the hard token budget. ManifestPassForExecutor
+// injects it into the runtime executor at bootstrap.
+func buildManifestPrompt() string {
+	return "You are the Pass 1 manifest generator of a read-only planning stage. " +
+		"Analyze the target file below against the user's objective and propose the MINIMAL set of mutations that achieve it. " +
+		ManifestPassCompactDirective + "\n" +
+		"Output a single raw JSON object (minified, no newlines) conforming exactly to:\n" +
+		`{"targetFile":"<workspace-relative path>","intent":"<one-line objective>","mutations":[{"selector":"<css selector or symbol, e.g. #hero or section#hero>","action":"delete|modify|insert","estimatedLines":<positive int>}]}` + "\n" +
+		"Rules: every mutation MUST name a selector or symbol that exists in the file; " +
+		"omit any content the objective does not touch; " +
+		"if the objective requires NO change, emit {\"targetFile\":\"<path>\",\"intent\":\"...\",\"mutations\":[]}. " +
+		"This pass never writes to the workspace."
+}
+
 // runPreflight is the automatic Pass 1 manifest hook of the preflight autonomy
 // loop. Given a target the Boundary-2 guard refused as infeasible, it decides
 // the DAG strategy:
@@ -102,11 +145,26 @@ func (d *Driver) runPreflight(ctx context.Context, objective, target string, sou
 	if d.decompose == nil {
 		return nil, errors.New("autonomy: decomposition disabled")
 	}
+	// ── PREFLIGHT BASELINE SYNTAX SNAPSHOT ──────────────────────────────
+	// Capture the target's syntax validity BEFORE any sub-task executes and
+	// attach it to the staged DAG. The post-DAG global audit consults it to
+	// distinguish a pre-existing baseline defect (an unchanged no-op document
+	// that was already broken) from a mutation regression — the former must
+	// never fail the run as if the DAG introduced it.
+	baselineValid := execution.ValidateDocumentSyntax(target, source) == nil //nolint:contextcheck // document syntax validation is pure content checking, no context needed
+	// stage attaches the snapshot to whatever DAG the strategy decision yields.
+	stage := func(dag *planner.ExecutionDAG, err error) (*planner.ExecutionDAG, error) {
+		if err == nil && dag != nil {
+			dag.BaselineSyntaxValid = baselineValid
+			diagnosticf("[preflight] baseline syntax snapshot target=%s valid=%v", dag.Target, baselineValid)
+		}
+		return dag, err
+	}
 	if d.manifestPass == nil {
-		return d.decompose(objective, target, source, baseDigest, maxOut)
+		return stage(d.decompose(objective, target, source, baseDigest, maxOut))
 	}
 	if !PreflightRequiresManifest(len(source), maxOut) {
-		return d.decompose(objective, target, source, baseDigest, maxOut)
+		return stage(d.decompose(objective, target, source, baseDigest, maxOut))
 	}
 	// ── AUTOMATIC PASS 1 MANIFEST REQUEST ─────────────────────────────
 	manifest, mErr := d.manifestPass(ctx, objective, source)
@@ -117,16 +175,18 @@ func (d *Driver) runPreflight(ctx context.Context, objective, target string, sou
 		} else {
 			diagnosticf("[preflight] Pass 1 manifest staged manifest_target=%s mutations=%d sub_tasks=%d manifest_scoped=%v",
 				manifest.TargetFile, len(manifest.Mutations), len(dag.SubTasks), dag.ManifestScoped)
-			return dag, nil
+			return stage(dag, nil)
 		}
 	}
-	// Manifest generation failed or returned empty mutations: fall back to a
-	// single-pass bounded inspection. Deliberately NOT the naive line slicer —
-	// pruning discipline must hold even without a usable manifest.
+	// Manifest generation failed or returned empty mutations: fall back to the
+	// bounded window decomposition. Deliberately NOT one whole-file atomic unit —
+	// a manifest-less single task would force the model to rewrite the whole
+	// file in one block; the fallback slices into ≤ fallbackWindowMaxLines
+	// windows so every sub-task stays a small targeted delta.
 	if mErr != nil {
-		diagnosticf("[preflight] Pass 1 manifest unavailable (%v) — single-pass bounded inspection", mErr)
+		diagnosticf("[preflight] Pass 1 manifest unavailable (%v) — bounded window decomposition", mErr)
 	} else {
-		diagnosticf("[preflight] Pass 1 manifest returned no mutations — single-pass bounded inspection")
+		diagnosticf("[preflight] Pass 1 manifest returned no mutations — bounded window decomposition")
 	}
-	return singleTaskDAG(objective, target, source, baseDigest, maxOut, manifest, planner.SubTaskBudget(maxOut))
+	return stage(fallbackDecompose(objective, target, source, baseDigest, maxOut))
 }

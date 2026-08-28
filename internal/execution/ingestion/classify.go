@@ -50,6 +50,19 @@ func Classify(normalized string, steps []NormalizationStep) PayloadClass {
 	if strings.Contains(normalized, "```") {
 		return ClassSyntaxInvalid
 	}
+	// A SEARCH/REPLACE block is a PATCH ARTIFACT, not a document: its
+	// structural integrity is enforced by the patch parser / anchor resolver,
+	// never by document tag balancing. Unbalanced HTML snippets inside the
+	// block (e.g. a SEARCH window carrying only an opening <div>) are
+	// legitimate patch content and must not trip the envelope check — a
+	// conversational-wrapper SEARCH/REPLACE payload recovered by the transport
+	// layer reaches the artifact parser on Attempt 1, never a retry.
+	if isPatchArtifact(normalized) {
+		if len(steps) > 0 {
+			return ClassTransportNormalized
+		}
+		return ClassValidPayload
+	}
 	// An open structural tag without its closing counterpart is a broken
 	// envelope: the payload cannot be parsed into a coherent artifact. We do
 	// NOT complete the tag — we reject it.
@@ -60,6 +73,13 @@ func Classify(normalized string, steps []NormalizationStep) PayloadClass {
 		return ClassTransportNormalized
 	}
 	return ClassValidPayload
+}
+
+// isPatchArtifact reports whether a normalized payload is a structured patch
+// artifact (a SEARCH/REPLACE block) rather than a document. Patch artifacts
+// are exempt from document-level envelope balancing.
+func isPatchArtifact(s string) bool {
+	return strings.Contains(s, "<<<<<<< SEARCH")
 }
 
 func hasUnterminatedStructuralTag(s string) bool {

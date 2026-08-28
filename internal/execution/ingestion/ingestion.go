@@ -61,6 +61,23 @@ func Process(rawOutput string) (*IngestionTrace, error) {
 				}
 			}
 		}
+		// AGGRESSIVE RAW BLOCK RECOVERY: the envelope failure may be a
+		// conversational wrapper NormalizeTransport could not close (no fence,
+		// prose before a SEARCH/REPLACE block, or unbalanced patch snippets).
+		// Scan the raw response directly for a standard artifact block and lift
+		// it into the normalized payload BEFORE raising the transport
+		// normalization error.
+		if block, kind, ok := recoverArtifactBlock(rawOutput); ok {
+			trace.NormalizedPayload = block
+			trace.Steps = append(trace.Steps, NormalizationStep{
+				Kind:   kind,
+				Detail: "recovered raw artifact block from conversational wrapper",
+			})
+			if re := Classify(block, trace.Steps); re != ClassSyntaxInvalid {
+				trace.Classification = re
+				return trace, nil
+			}
+		}
 		return trace, fmt.Errorf("%w: transport normalization produced a syntactically invalid payload", ErrSyntaxInvalid)
 	}
 	return trace, nil

@@ -147,7 +147,61 @@ func (p *dagProvider) windowLine(prompt string) (string, bool) {
 	return lines[start-1], true
 }
 
-// ── test harness ────────────────────────────────────────────────────────────
+// TestDecomposition_FallbackWindowSplitting simulates a Manifest Pass failure
+// over a 133-line file and asserts the bounded fallback decomposition stages
+// AT LEAST 3 contiguous bounded sub-tasks (e.g. 1-40, 41-80, 81-120, 121-133)
+// instead of one giant whole-file sub-task — so every unit's output budget
+// stays a small targeted SEARCH/REPLACE delta.
+func TestDecomposition_FallbackWindowSplitting(t *testing.T) {
+	const totalLines = 133
+	var b strings.Builder
+	for i := 0; i < totalLines; i++ {
+		fmt.Fprintf(&b, "<p class=\"line-%d\">filler content %d</p>\n", i, i)
+	}
+	source := []byte(b.String())
+	if n := planner.LineCount(source); n != totalLines {
+		t.Fatalf("fixture lines = %d, want %d", n, totalLines)
+	}
+
+	const maxOutput = 1024 // <= 2048: the bounded ceiling invariant applies
+	dag, err := fallbackDecompose("check this file @index.html and remove redundant content", "index.html", source, "digest", maxOutput)
+	if err != nil {
+		t.Fatalf("fallbackDecompose: %v", err)
+	}
+	if len(dag.SubTasks) < 3 {
+		t.Fatalf("sub-tasks = %d, want >= 3 bounded sub-tasks (not 1 giant sub-task)", len(dag.SubTasks))
+	}
+	prevEnd := 0
+	for i, st := range dag.SubTasks {
+		if st.Kind != planner.SplitBoundedLines {
+			t.Fatalf("sub-task %s kind = %s, want %s", st.ID, st.Kind, planner.SplitBoundedLines)
+		}
+		if st.Region.Lines() > fallbackWindowMaxLines {
+			t.Fatalf("sub-task %s window %s exceeds the %d-line ceiling", st.ID, st.Region, fallbackWindowMaxLines)
+		}
+		// Contiguous coverage: window i+1 starts exactly where window i ended.
+		if st.Region.StartLine != prevEnd+1 {
+			t.Fatalf("sub-task %d region %s breaks contiguity after line %d", i, st.Region, prevEnd)
+		}
+		prevEnd = st.Region.EndLine
+	}
+	if prevEnd != totalLines {
+		t.Fatalf("last sub-task ends at line %d, want %d (whole file covered)", prevEnd, totalLines)
+	}
+	// Every sub-task must pass the strict per-unit budget ceiling by construction.
+	budget := dag.Budget()
+	if budget <= 0 {
+		t.Fatalf("DAG budget = %d, want > 0", budget)
+	}
+	for _, st := range dag.SubTasks {
+		if st.EstimatedTokens <= 0 || st.EstimatedTokens > budget {
+			t.Fatalf("sub-task %s estimate %d outside the strict ceiling (%d)", st.ID, st.EstimatedTokens, budget)
+		}
+	}
+	if err := dag.Validate(); err != nil {
+		t.Fatalf("DAG Validate: %v", err)
+	}
+}
 
 // stageDecompositionRun drives a fresh run over a decomposition-sized Go
 // fixture until the loop parks at the DECOMPOSITION_PROPOSAL boundary. The

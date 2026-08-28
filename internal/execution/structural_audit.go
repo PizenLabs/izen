@@ -1,6 +1,8 @@
 package execution
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -121,4 +123,76 @@ func parseStructuralError(detail string) (line int, errMsg string, ok bool) {
 		}
 	}
 	return n, errMsg, true
+}
+
+// ── Preflight Baseline Syntax Snapshot ──────────────────────────────────────
+//
+// The post-DAG global structural verifier fails a mutated document whose
+// syntax is broken. When the PRE-DAG baseline was ALREADY broken and the DAG
+// mutated nothing (a no-op run), that failure is a pre-existing condition,
+// never a mutation regression. The preflight baseline snapshot records the
+// target's syntax validity at staging time so the audit can attribute the
+// failure correctly instead of parking a clean no-op run at awaiting_human.
+
+// BaselineSyntaxPreexisting is the canonical warning marker emitted when a
+// post-DAG global audit syntax failure is attributed to the PRE-EXISTING
+// baseline (a broken document the DAG did not change), never to the DAG's own
+// mutations. It names the warning log category for post-mortem searches.
+const BaselineSyntaxPreexisting = "baseline_syntax_preexisting"
+
+// ValidateDocumentSyntax runs the registered syntax validator for target's
+// format over content. It returns nil when the document parses cleanly — or
+// when the format has no registered validator (policy-neutral pass) — and a
+// non-nil error carrying the deterministic parser diagnostics when it does
+// not. It is the preflight baseline snapshot source of truth.
+func ValidateDocumentSyntax(target string, content []byte) error {
+	if len(content) == 0 {
+		return nil // empty/creation target: nothing to validate
+	}
+	gate := v3Artifact.ValidateContent(target, content, 0)
+	if gate.Passed {
+		return nil
+	}
+	if gate.Error != nil {
+		return gate.Error
+	}
+	return errors.New("artifact syntax validation failed")
+}
+
+// SyntaxDiagnostics returns the deterministic syntax diagnostic of a document
+// for its format, or "" when it parses cleanly (or has no registered
+// validator). It backs the "errors match baseline errors exactly" relaxation
+// of the pre-existing-baseline check.
+func SyntaxDiagnostics(target string, content []byte) string {
+	gate := v3Artifact.ValidateContent(target, content, 0)
+	if gate.Passed {
+		return ""
+	}
+	if gate.Error != nil {
+		return gate.Error.Error()
+	}
+	return "syntax validation failed"
+}
+
+// BaselineSyntaxRegression reports whether a post-DAG global audit syntax
+// failure should be attributed to the PRE-DAG baseline rather than to this
+// DAG's mutations. It returns true exactly when the document carries the same
+// broken syntax it had before the DAG ran:
+//
+//   - the post-DAG bytes are IDENTICAL to the baseline (nothing mutated — a
+//     checksum-identical no-op), OR
+//   - the post-DAG document produces EXACTLY the same syntax diagnostics as
+//     the baseline (content drifted elsewhere, the pre-existing defect did not).
+//
+// baselineValid is the preflight snapshot; when the baseline already parsed
+// cleanly a syntax failure is always a regression.
+func BaselineSyntaxRegression(target string, base, mutated []byte, baselineValid bool) bool {
+	if baselineValid {
+		return false
+	}
+	if bytes.Equal(base, mutated) {
+		return true
+	}
+	baseDiag := SyntaxDiagnostics(target, base)
+	return baseDiag != "" && baseDiag == SyntaxDiagnostics(target, mutated)
 }

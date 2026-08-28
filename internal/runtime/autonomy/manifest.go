@@ -50,11 +50,29 @@ type MutationManifest struct {
 // ParseMutationManifest parses raw JSON bytes into a MutationManifest.
 // It is strictly read-only: no filesystem access, no state mutation.
 // Returns error for empty, corrupt, or structurally invalid manifests so the
-// caller can safely fall back to a single bounded inspection pass.
+// caller can safely fall back to a bounded inspection pass.
+//
+// MINIMAL MANIFEST SCHEMA: the compact Pass 1 prompt demands a raw MINIFIED
+// JSON ARRAY of mutation targets, so both wire forms are accepted:
+//
+//   - the bare array form `[{"selector":"#hero","action":"delete","estimatedLines":5}]`
+//     (the minimal schema; targetFile is derived from the execution context);
+//   - the legacy envelope object `{"targetFile":...,"intent":...,"mutations":[...]}`.
 func ParseMutationManifest(raw []byte) (*MutationManifest, error) {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" {
 		return nil, fmt.Errorf("manifest: empty payload")
+	}
+	if strings.HasPrefix(trimmed, "[") {
+		var muts []MutationSpec
+		if err := json.Unmarshal([]byte(trimmed), &muts); err != nil {
+			return nil, fmt.Errorf("manifest: invalid JSON: %w", err)
+		}
+		m := &MutationManifest{Mutations: muts}
+		if err := validateManifestMutations(m); err != nil {
+			return nil, err
+		}
+		return m, nil
 	}
 	var m MutationManifest
 	if err := json.Unmarshal([]byte(trimmed), &m); err != nil {
@@ -63,28 +81,36 @@ func ParseMutationManifest(raw []byte) (*MutationManifest, error) {
 	if strings.TrimSpace(m.TargetFile) == "" {
 		return nil, fmt.Errorf("manifest: targetFile is required")
 	}
-	// Validate mutations if present.
+	if err := validateManifestMutations(&m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// validateManifestMutations enforces the per-mutation structural invariants
+// shared by both wire forms (bare array and envelope object).
+func validateManifestMutations(m *MutationManifest) error {
 	for i, mut := range m.Mutations {
 		act := strings.ToLower(strings.TrimSpace(mut.Action))
 		switch act {
 		case "delete", "modify", "insert":
 			// ok
 		case "":
-			return nil, fmt.Errorf("manifest: mutations[%d] missing action", i)
+			return fmt.Errorf("manifest: mutations[%d] missing action", i)
 		default:
-			return nil, fmt.Errorf("manifest: mutations[%d] invalid action %q (want delete|modify|insert)", i, mut.Action)
+			return fmt.Errorf("manifest: mutations[%d] invalid action %q (want delete|modify|insert)", i, mut.Action)
 		}
 		if mut.Symbol == "" && mut.Selector == "" {
 			// Require at least one identifier for semantic targeting.
-			return nil, fmt.Errorf("manifest: mutations[%d] requires symbol or selector", i)
+			return fmt.Errorf("manifest: mutations[%d] requires symbol or selector", i)
 		}
 		if mut.EstimatedLines < 0 {
-			return nil, fmt.Errorf("manifest: mutations[%d] estimatedLines cannot be negative", i)
+			return fmt.Errorf("manifest: mutations[%d] estimatedLines cannot be negative", i)
 		}
 		// Normalize action to lower case.
 		m.Mutations[i].Action = act
 	}
-	return &m, nil
+	return nil
 }
 
 // EstimateMutationSurface replaces the naive full-file heuristic

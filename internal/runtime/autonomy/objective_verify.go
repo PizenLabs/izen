@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
 	"github.com/PizenLabs/izen/internal/execution/verifier"
 )
@@ -74,6 +75,21 @@ func (d *Driver) verifyGlobalObjective(ctx context.Context, dag *planner.Executi
 			target, v.Base.Nodes, v.Mutated.Nodes, v.Base.References, v.Mutated.References, len(intent.Removals))
 		return false
 	}
+	// ── BASELINE SYNTAX RELAXATION (pre-existing defect, no-op DAG) ─────
+	// A failed syntax audit on a document whose PRE-DAG baseline was ALREADY
+	// syntactically invalid, whose bytes (or syntax diagnostics) are unchanged
+	// by the DAG, and whose sub-tasks ALL evaluated to no_op_objective_satisfied
+	// is a PRE-EXISTING baseline condition — never a mutation regression. The
+	// run completes with a warning instead of parking at awaiting_human with a
+	// false OBJECTIVE_UNRESOLVED.
+	if !dag.BaselineSyntaxValid &&
+		dag.NoOpSatisfiedSubTasks == len(dag.SubTasks) &&
+		onlyBaselineSyntaxFailure(v) &&
+		execution.BaselineSyntaxRegression(target, base, mutated, dag.BaselineSyntaxValid) { //nolint:contextcheck // document syntax validation is pure content checking, no context needed
+		diagnosticf("[objective-verify] %s target=%s — baseline was already syntactically invalid and the DAG mutated nothing (all %d/%d sub-task(s) evaluated to no_op_objective_satisfied); allowing OBJECTIVE_RESOLVED",
+			execution.BaselineSyntaxPreexisting, target, dag.NoOpSatisfiedSubTasks, len(dag.SubTasks))
+		return false
+	}
 	reason := fmt.Sprintf(
 		"global structural audit rejected the mutated %s after all %d sub-tasks applied: %s",
 		target, len(dag.SubTasks), v.Evidence())
@@ -91,5 +107,23 @@ func (d *Driver) verifyGlobalObjective(ctx context.Context, dag *planner.Executi
 	d.loop.AwaitHuman(*b)
 	d.enrichBoundary()
 	d.publish(ctx)
+	return true
+}
+
+// onlyBaselineSyntaxFailure reports whether a failed global audit verdict is
+// attributable to document SYNTAX alone (the pre-existing-baseline relaxation
+// target). The verifier short-circuits on the S1 syntax gate, so a broken
+// mutated document carries exactly FailSyntaxInvalid; a verdict carrying any
+// other failure (orphaned reference, unfulfilled removal, topology) is a real
+// mutation regression and must never be relaxed.
+func onlyBaselineSyntaxFailure(v verifier.Verdict) bool {
+	if v.Pass() || len(v.Failures) == 0 {
+		return false
+	}
+	for _, f := range v.Failures {
+		if f.Code != verifier.FailSyntaxInvalid {
+			return false
+		}
+	}
 	return true
 }

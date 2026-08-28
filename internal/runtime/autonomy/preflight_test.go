@@ -1,0 +1,224 @@
+package autonomy
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/execution/planner"
+)
+
+// ── PREFLIGHT BASELINE SYNTAX SNAPSHOT + NO-OP GLOBAL AUDIT RELAXATION ──────
+
+// brokenBaselineFixture renders a decomposition-sized HTML document whose
+// syntax is ALREADY broken BEFORE the DAG runs: an unterminated <script>
+// element (the exact defect the V3 validator and the Lea scan both flag). Every
+// remaining line is unique so a "remove redundant content" objective carries
+// no structural counter-evidence and the model's NO_CHANGES_REQUIRED claim
+// converges to no_op_objective_satisfied.
+func brokenBaselineFixture() []byte {
+	var b strings.Builder
+	b.WriteString("<!DOCTYPE html>\n<html>\n<head><title>Broken</title></head>\n<body>\n")
+	b.WriteString("<script>\n  console.log('under construction');\n")
+	for i := 0; i < 48; i++ {
+		fmt.Fprintf(&b, "<section id=\"filler-%d\">\n<h2>Filler %d</h2>\n<p>unique filler content number %d lorem ipsum dolor sit amet</p>\n</section>\n", i, i, i)
+	}
+	b.WriteString("</body>\n</html>\n")
+	return []byte(b.String())
+}
+
+// stageBrokenBaselineRun parks a run at a DECOMPOSITION_PROPOSAL boundary over
+// a pre-broken index.html, with a deterministic ONE-unit DAG (whole file) cut
+// by an injected decompose. It returns the driver and the dagProvider wired to
+// answer each sub-task.
+func stageBrokenBaselineRun(t *testing.T) (*Driver, *planner.ExecutionDAG, *dagProvider) {
+	t.Helper()
+	root := t.TempDir()
+	source := brokenBaselineFixture()
+	if len(source) < 8*1024/2 { // sanity: big enough to trip Boundary-2 preflight
+		t.Fatalf("fixture size = %d, too small to be preflight-infeasible", len(source))
+	}
+	writeTarget(t, root, "index.html", string(source))
+
+	p := &dagProvider{root: root, target: "index.html"}
+	bus := events.NewBus(events.DefaultBufferSize)
+	x := testExecutor(t, root, p, bus)
+	adapter := NewExecutorAdapter(root, execution.NewIntentGateway(root), x)
+
+	decompose := func(objective, target string, src []byte, baseDigest string, maxOutputTokens int) (*planner.ExecutionDAG, error) {
+		dag := planner.NewExecutionDAG(objective, target, planner.SplitBoundedLines, baseDigest, maxOutputTokens)
+		total := len(strings.Split(strings.TrimSuffix(string(src), "\n"), "\n"))
+		if err := dag.AddTask(planner.SubTask{
+			ID:              "st-1",
+			Index:           1,
+			Kind:            planner.SplitBoundedLines,
+			Description:     "broken baseline window",
+			Region:          planner.Region{StartLine: 1, EndLine: total},
+			EstimatedTokens: 64,
+		}); err != nil {
+			return nil, err
+		}
+		if err := dag.Validate(); err != nil {
+			return nil, err
+		}
+		return dag, nil
+	}
+
+	driver := NewDriver(adapter, bus, WithDecompose(decompose))
+	term, err := driver.Run(context.Background(), "check this file @index.html and remove redundant content")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if term != nil {
+		t.Fatalf("run terminated (%+v) instead of parking at the proposal", term)
+	}
+	dag := driver.Proposal()
+	if dag == nil {
+		t.Fatal("no DECOMPOSITION_PROPOSAL parked at the boundary")
+	}
+	if len(dag.SubTasks) != 1 {
+		t.Fatalf("sub-tasks = %d, want 1", len(dag.SubTasks))
+	}
+	return driver, dag, p
+}
+
+// TestAudit_PreexistingBaselineSyntaxError drives a DAG over an ALREADY-BROKEN
+// HTML file whose sub-task evaluates to no_op_objective_satisfied (zero
+// mutations). The post-DAG global audit fails on the document's syntax — but
+// that syntax failure PRE-DATES the DAG, the bytes are checksum-identical to
+// the baseline, and the only unit was a satisfied no-op. The run must complete
+// cleanly (never OBJECTIVE_UNRESOLVED / awaiting_human) with the
+// baseline_syntax_preexisting warning.
+func TestAudit_PreexistingBaselineSyntaxError(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		diags  []string
+		warned bool
+	)
+	SetDiagnosticLog(func(format string, args ...interface{}) {
+		line := fmt.Sprintf(format, args...)
+		mu.Lock()
+		diags = append(diags, line)
+		if strings.Contains(line, execution.BaselineSyntaxPreexisting) {
+			warned = true
+		}
+		mu.Unlock()
+	})
+	defer SetDiagnosticLog(nil)
+
+	driver, dag, p := stageBrokenBaselineRun(t)
+
+	// The preflight snapshot must have recorded the pre-existing defect.
+	if dag.BaselineSyntaxValid {
+		t.Fatal("BaselineSyntaxValid = true, want false — the baseline HTML was already broken at staging time")
+	}
+
+	before := readTarget(t, p.root, "index.html")
+	// The model answers NO_CHANGES_REQUIRED for the single sub-task.
+	p.noop = map[int]bool{1: true}
+
+	term, err := driver.ResumeApproveProposal(context.Background())
+	if err != nil {
+		t.Fatalf("ResumeApproveProposal: %v", err)
+	}
+	if term == nil || term.State != autonomy.RuntimeCompleted {
+		t.Fatalf("termination = %+v, want a completed run (never a parked awaiting_human)", term)
+	}
+	if driver.Plan().Status != planner.DagExecutionCompleted {
+		t.Fatalf("plan status = %s, want %s (the pre-existing syntax failure must not override to %s)",
+			driver.Plan().Status, planner.DagExecutionCompleted, planner.ObjectiveUnresolved)
+	}
+	if dag.NoOpSatisfiedSubTasks != 1 {
+		t.Fatalf("NoOpSatisfiedSubTasks = %d, want 1", dag.NoOpSatisfiedSubTasks)
+	}
+	// Zero mutations were applied: the workspace is unchanged.
+	if got := readTarget(t, p.root, "index.html"); got != before {
+		t.Fatal("a no-op run mutated the workspace")
+	}
+	// The baseline warning was emitted.
+	mu.Lock()
+	defer mu.Unlock()
+	if !warned {
+		t.Fatalf("no baseline_syntax_preexisting warning emitted; diagnostics:\n%s", strings.Join(diags, "\n"))
+	}
+}
+
+// TestPreflight_ManifestCompactness pins the MINIMAL MANIFEST SCHEMA wire
+// contract: the Pass 1 manifest prompt must force a concise minified JSON
+// payload with ZERO prose and a hard 200-token ceiling, and the whole prompt
+// must itself stay well under 250 tokens so it never crowds the model's
+// output budget.
+func TestPreflight_ManifestCompactness(t *testing.T) {
+	prompt := buildManifestPrompt()
+	for _, want := range []string{
+		"OUTPUT ONLY VALID MINIFIED JSON ARRAY OF MUTATION TARGETS",
+		"DO NOT WRITE CODE",
+		"DO NOT EXPLAIN",
+		"DO NOT INCLUDE MARKDOWN FENCES",
+		"MAX 200 TOKENS",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("manifest prompt missing the compact directive %q:\n%s", want, prompt)
+		}
+	}
+	if !strings.Contains(prompt, `"mutations":[`) {
+		t.Fatalf("manifest prompt must demand the JSON array of mutation targets:\n%s", prompt)
+	}
+	// The prompt itself stays well under 250 tokens (≈4 bytes/token) so it
+	// never crowds the model's 200-token output budget.
+	if tokens := len(prompt) / 4; tokens >= 250 {
+		t.Fatalf("manifest prompt is ~%d tokens, want < 250", tokens)
+	}
+	// The wire ceiling matches the directive: a model cannot ramble past 200.
+	if ManifestPassMaxTokens > 200 {
+		t.Fatalf("ManifestPassMaxTokens = %d, want <= 200 to enforce the MAX 200 TOKENS directive", ManifestPassMaxTokens)
+	}
+}
+
+// TestManifestPass_RejectVerboseAsInvalidJSON pins the 512-token rejection
+// path of the manifest wire: an over-long payload (a provider ignoring the
+// ceiling) must be surfaced as an invalid-manifest failure, never as an
+// OUTPUT_EXHAUSTED gate signal.
+func TestManifestPass_RejectVerboseAsInvalidJSON(t *testing.T) {
+	verbose := `{"targetFile":"index.html","intent":"remove redundant content","mutations":[{"selector":"#hero","action":"modify","estimatedLines":12}]}` +
+		strings.Repeat(`{"selector":"#pad","action":"modify","estimatedLines":1},`, 4000)
+	if len(verbose)/4 <= ManifestPassRejectTokens {
+		t.Fatalf("verbose fixture is only ~%d tokens, want > %d", len(verbose)/4, ManifestPassRejectTokens)
+	}
+	// ParseMutationManifest must reject the oversized payload as invalid JSON
+	// (the schema ceiling) so the caller falls back, never exhausts a gate.
+	if _, err := ParseMutationManifest([]byte(verbose)); err == nil {
+		t.Fatal("oversized manifest payload must be rejected as invalid")
+	}
+}
+
+// TestParseMutationManifest_MinimalArraySchema pins the MINIMAL MANIFEST
+// SCHEMA: the compact Pass 1 prompt demands a raw JSON array of mutation
+// targets, so a bare array must parse into the same MutationManifest surface
+// as the legacy envelope object.
+func TestParseMutationManifest_MinimalArraySchema(t *testing.T) {
+	raw := `[{"selector":"#hero","action":"delete","estimatedLines":5},{"symbol":"HandlerFoo","action":"modify","estimatedLines":12}]`
+	m, err := ParseMutationManifest([]byte(raw))
+	if err != nil {
+		t.Fatalf("bare array manifest rejected: %v", err)
+	}
+	if len(m.Mutations) != 2 {
+		t.Fatalf("mutations = %d, want 2", len(m.Mutations))
+	}
+	if m.Mutations[0].Selector != "#hero" || m.Mutations[0].Action != "delete" {
+		t.Fatalf("mutation[0] = %+v, want selector #hero action delete", m.Mutations[0])
+	}
+	if m.Mutations[1].Symbol != "HandlerFoo" || m.Mutations[1].Action != "modify" {
+		t.Fatalf("mutation[1] = %+v, want symbol HandlerFoo action modify", m.Mutations[1])
+	}
+	// The surface estimate must agree with the envelope-object form.
+	env := &MutationManifest{Mutations: m.Mutations}
+	if e := EstimateMutationSurface(env, []byte(strings.Repeat("x", 1000))); e <= 0 {
+		t.Fatalf("array-form surface estimate = %d, want > 0", e)
+	}
+}

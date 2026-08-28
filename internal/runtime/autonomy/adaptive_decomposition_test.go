@@ -162,8 +162,8 @@ func TestAdaptiveDecomposition_SemanticASTBoundary(t *testing.T) {
 }
 
 // TestAdaptiveDecomposition_FallbackOnInvalidManifest passes corrupt JSON and
-// asserts the engine safely falls back to a single bounded inspection pass
-// without panicking.
+// asserts the engine safely falls back to the bounded window decomposition
+// without panicking — never one giant whole-file sub-task.
 func TestAdaptiveDecomposition_FallbackOnInvalidManifest(t *testing.T) {
 	source := html10KBFixture()
 	const maxOutput = 4096
@@ -172,16 +172,24 @@ func TestAdaptiveDecomposition_FallbackOnInvalidManifest(t *testing.T) {
 	if _, err := ParseMutationManifest(corrupt); err == nil {
 		t.Fatal("ParseMutationManifest should fail on corrupt JSON")
 	}
-	// Adaptive path via raw manifest must not panic and must return a single task.
+	// Adaptive path via raw manifest must not panic and must stage bounded windows.
 	dag, err := DecomposeWithRawManifest("delete @index.html", "index.html", source, "base-digest", maxOutput, corrupt)
 	if err != nil {
 		t.Fatalf("DecomposeWithRawManifest: %v", err)
 	}
 	if dag == nil {
-		t.Fatal("fallback DAG is nil, want single bounded inspection DAG")
+		t.Fatal("fallback DAG is nil, want bounded window DAG")
 	}
-	if len(dag.SubTasks) != 1 {
-		t.Fatalf("fallback sub_task count = %d, want 1 (single bounded inspection)", len(dag.SubTasks))
+	if len(dag.SubTasks) < 1 {
+		t.Fatalf("fallback sub_task count = %d, want >= 1 bounded window", len(dag.SubTasks))
+	}
+	for _, st := range dag.SubTasks {
+		if st.Kind != planner.SplitBoundedLines {
+			t.Fatalf("fallback sub-task %s kind = %s, want %s", st.ID, st.Kind, planner.SplitBoundedLines)
+		}
+		if st.Region.Lines() > fallbackWindowMaxLines {
+			t.Fatalf("fallback sub-task %s window %s exceeds the %d-line ceiling", st.ID, st.Region, fallbackWindowMaxLines)
+		}
 	}
 	if err := dag.Validate(); err != nil {
 		t.Fatalf("fallback DAG Validate: %v", err)
@@ -194,8 +202,13 @@ func TestAdaptiveDecomposition_FallbackOnInvalidManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("empty raw fallback: %v", err)
 	}
-	if len(dag2.SubTasks) != 1 {
-		t.Fatalf("empty raw fallback count = %d, want 1", len(dag2.SubTasks))
+	if len(dag2.SubTasks) < 1 {
+		t.Fatalf("empty raw fallback count = %d, want >= 1 bounded window", len(dag2.SubTasks))
+	}
+	for _, st := range dag2.SubTasks {
+		if st.Region.Lines() > fallbackWindowMaxLines {
+			t.Fatalf("empty raw fallback sub-task %s window %s exceeds the %d-line ceiling", st.ID, st.Region, fallbackWindowMaxLines)
+		}
 	}
 }
 
