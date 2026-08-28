@@ -256,6 +256,74 @@ func TestPreflight_ValidTarget_PassesGate(t *testing.T) {
 	}
 }
 
+// TestPreflight_TargetedMarkupUsesBoundedPatchMultiplier pins the bounded-patch
+// budget accounting: a TARGETED modification prompt ($prompt / $hot) on an
+// HTML/text target is expected to issue a bounded SEARCH/REPLACE patch, so the
+// estimated cost uses the bounded patch multiplier instead of the full-rewrite
+// multiplier ($3×). A target that exceeds budget under $3× but fits under the
+// bounded multiplier must NOT be flagged over-budget — while the same target
+// under a non-targeted scope stays over-budget.
+func TestPreflight_TargetedMarkupUsesBoundedPatchMultiplier(t *testing.T) {
+	// ~3960 bytes → ~990 tokens: ×3 = 2970 > 2500 (over), ×2 = 1980 ≤ 2500 (fits).
+	big := []byte(strings.Repeat("<section><p>lorem ipsum dolor sit amet consectetur</p></section>\n", 60))
+	if full := len(big) / 4 * execution.FullRewriteTokenMultiplier; full <= 2500 {
+		t.Fatalf("fixture full-rewrite estimate = %d, want > 2500 budget", full)
+	}
+	if bounded := len(big) / 4 * execution.BoundedPatchTokenMultiplier; bounded > 2500 {
+		t.Fatalf("fixture bounded estimate = %d, want <= 2500 budget", bounded)
+	}
+
+	// $prompt on an HTML target: bounded multiplier → within limits.
+	prompt := EvaluateScope(ScopeInput{
+		Target:          "big.html",
+		Content:         big,
+		MaxOutputTokens: 2500,
+		Root:            t.TempDir(),
+		Subcommand:      "$prompt",
+	})
+	if prompt.BudgetStatus != BudgetWithinLimits {
+		t.Fatalf("$prompt markup BudgetStatus = %s, want within_limits (findings: %v)", prompt.BudgetStatus, prompt.Findings)
+	}
+
+	// $hot on an HTML target: bounded multiplier → within limits.
+	hot := EvaluateScope(ScopeInput{
+		Target:          "big.html",
+		Content:         big,
+		MaxOutputTokens: 2500,
+		Root:            t.TempDir(),
+		Subcommand:      "$hot",
+	})
+	if hot.BudgetStatus != BudgetWithinLimits {
+		t.Fatalf("$hot markup BudgetStatus = %s, want within_limits (findings: %v)", hot.BudgetStatus, hot.Findings)
+	}
+
+	// The SAME target without a targeted scope keeps the full-rewrite ($3×)
+	// accounting → over budget.
+	plain := EvaluateScope(ScopeInput{
+		Target:          "big.html",
+		Content:         big,
+		MaxOutputTokens: 2500,
+		Root:            t.TempDir(),
+	})
+	if plain.BudgetStatus != BudgetExceeded {
+		t.Fatalf("non-targeted markup BudgetStatus = %s, want exceeded (full-rewrite accounting)", plain.BudgetStatus)
+	}
+
+	// A non-markup target keeps the full-rewrite ($3×) accounting even under
+	// $prompt — the bounded relaxation is markup-only.
+	goFile := []byte(strings.Repeat("// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", 160))
+	nonMarkup := EvaluateScope(ScopeInput{
+		Target:          "main.go",
+		Content:         goFile,
+		MaxOutputTokens: 2500,
+		Root:            t.TempDir(),
+		Subcommand:      "$prompt",
+	})
+	if nonMarkup.BudgetStatus != BudgetExceeded {
+		t.Fatalf("$prompt Go BudgetStatus = %s, want exceeded (full-rewrite accounting)", nonMarkup.BudgetStatus)
+	}
+}
+
 // TestPreflight_BudgetExceeded_FailsGate drives the zero-token preflight over a
 // target whose estimated generation cost (bytes/4 × FullRewriteTokenMultiplier)
 // exceeds the declared max_output. The BudgetStatus MUST be exceeded and the

@@ -145,6 +145,15 @@ const BaselineSyntaxPreexisting = "baseline_syntax_preexisting"
 // when the format has no registered validator (policy-neutral pass) — and a
 // non-nil error carrying the deterministic parser diagnostics when it does
 // not. It is the preflight baseline snapshot source of truth.
+//
+// MARKUP RELAXATION: for HTML/markup targets, only a CATASTROPHIC syntax
+// failure (severe unclosed structural boundaries such as a truncated <script>
+// or <style> raw-text block, or unparseable content) is surfaced as an error.
+// PERMISSIVE markup — optional closing tags a lenient HTML5 parser silently
+// repairs (missing </li>, </p>, <img>/<br> self-closers, a "<" left in text) —
+// is NOT AST corruption and returns nil. The V3 artifact pipeline
+// (v3Artifact.ValidateContent) that validates model OUTPUT stays strict; this
+// relaxation is scoped to the preflight AST gate only.
 func ValidateDocumentSyntax(target string, content []byte) error {
 	if len(content) == 0 {
 		return nil // empty/creation target: nothing to validate
@@ -154,6 +163,9 @@ func ValidateDocumentSyntax(target string, content []byte) error {
 		return nil
 	}
 	if gate.Error != nil {
+		if ClassifySyntaxFailure(target, gate.Error) == SyntaxFailurePermissive {
+			return nil // loose optional markup: not AST corruption
+		}
 		return gate.Error
 	}
 	return errors.New("artifact syntax validation failed")

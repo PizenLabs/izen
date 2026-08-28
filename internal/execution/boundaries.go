@@ -96,6 +96,14 @@ func NormalizeFinishReason(reason string) CanonicalOutcome {
 // trapped at this boundary instead of being truncated mid-generation.
 const FullRewriteTokenMultiplier = 3
 
+// BoundedPatchTokenMultiplier is the generation expansion factor of a bounded
+// SEARCH/REPLACE patch over an existing file: the model echoes a small
+// runtime-derived window plus its replacement, not a whole-file regeneration.
+// Targeted modification prompts ($prompt / $hot) on markup/text targets issue
+// bounded patches, so their preflight budget uses this multiplier instead of
+// the full-rewrite multiplier ($3×).
+const BoundedPatchTokenMultiplier = 2
+
 // ErrPreflightInfeasible is the deterministic Boundary-2 rejection: the
 // estimated output budget of the requested artifact exceeds max_output. The
 // request is refused BEFORE any provider request; the user must explicitly

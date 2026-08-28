@@ -296,6 +296,11 @@ type ScopeInput struct {
 	MaxOutputTokens int
 	// Root is the workspace root used to resolve local file references.
 	Root string
+	// Subcommand is the policy scope ($prompt / $hot / ""). Targeted
+	// modification prompts ($prompt / $hot) on markup targets are expected to
+	// issue bounded patches, so their budget uses the bounded patch multiplier
+	// instead of the full-rewrite multiplier ($3×).
+	Subcommand string
 }
 
 // EstimateScopeTokens computes the estimated generation cost of a target using
@@ -308,6 +313,24 @@ func EstimateScopeTokens(targetBytes, maxOutputTokens int) (estimated int, excee
 	}
 	estimated = (targetBytes / 4) * execution.FullRewriteTokenMultiplier
 	return estimated, estimated > maxOutputTokens
+}
+
+// EstimateScopeTokensForSubcommand computes the estimated generation cost of a
+// TARGETED modification prompt under a policy scope. A targeted modification
+// prompt ($prompt / $hot) on a markup (HTML/template) target is expected to
+// produce a bounded SEARCH/REPLACE patch — not a whole-file rewrite — so the
+// bounded patch multiplier replaces the full-rewrite multiplier ($3×) for that
+// target class. Every other combination keeps the canonical full-rewrite
+// accounting.
+func EstimateScopeTokensForSubcommand(targetBytes, maxOutputTokens int, target, subcommand string) (estimated int, exceeded bool) {
+	if targetBytes <= 0 || maxOutputTokens <= 0 {
+		return 0, false // creation / unbounded budget: not provably infeasible
+	}
+	if (IsSystemic(subcommand) || IsHot(subcommand)) && execution.IsMarkupTarget(target) {
+		estimated = (targetBytes / 4) * execution.BoundedPatchTokenMultiplier
+		return estimated, estimated > maxOutputTokens
+	}
+	return EstimateScopeTokens(targetBytes, maxOutputTokens)
 }
 
 // localRefRe matches local file references in HTML documents:
@@ -366,11 +389,19 @@ func EvaluateScope(in ScopeInput) PreflightEvaluation {
 	}
 
 	// ── 3. BUDGET ESTIMATION (0 tokens) ────────────────────────────────
+	// Targeted modification prompts ($prompt / $hot) on markup targets are
+	// expected to issue bounded patches, so their estimate uses the bounded
+	// patch multiplier instead of the full-rewrite multiplier ($3×).
 	eval.BudgetStatus = BudgetWithinLimits
-	if estimated, exceeded := EstimateScopeTokens(len(in.Content), in.MaxOutputTokens); exceeded {
+	estimated, exceeded := EstimateScopeTokensForSubcommand(len(in.Content), in.MaxOutputTokens, in.Target, in.Subcommand)
+	if exceeded {
 		eval.BudgetStatus = BudgetExceeded
+		multiplier := execution.FullRewriteTokenMultiplier
+		if (IsSystemic(in.Subcommand) || IsHot(in.Subcommand)) && execution.IsMarkupTarget(in.Target) {
+			multiplier = execution.BoundedPatchTokenMultiplier
+		}
 		eval.AddFinding("target %q estimates ~%d tokens (bytes/4 × %d) but max_output=%d — budget exceeded",
-			in.Target, estimated, execution.FullRewriteTokenMultiplier, in.MaxOutputTokens)
+			in.Target, estimated, multiplier, in.MaxOutputTokens)
 	}
 
 	// ── FAIL-CLOSED BARRIER ────────────────────────────────────────────

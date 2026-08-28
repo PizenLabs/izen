@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // ProposalIntent is the typed, closed vocabulary of a human-selected proposal
@@ -99,6 +101,12 @@ type ProposalModel struct {
 func NewProposalModel(surface DecisionSurface) *ProposalModel {
 	return &ProposalModel{Surface: surface}
 }
+
+// Init implements the Bubble Tea model lifecycle. The proposal modal is a pure
+// value object — it schedules no background command, so Init returns nil. The
+// dispatcher calls it when activating the modal so the view component enters
+// the Bubble Tea loop through the same contract as any other model.
+func (p *ProposalModel) Init() tea.Cmd { return nil }
 
 // OptionCount returns the number of selectable options on the surface.
 func (p *ProposalModel) OptionCount() int {

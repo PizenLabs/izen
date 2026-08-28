@@ -670,11 +670,12 @@ func (d *Driver) stageDecomposition(ctx context.Context) bool {
 	// DecisionSurface barrier so the human may choose repair-first / cancel.
 	// Over-budget (valid-AST) preflight_infeasible remains the legitimate
 	// Boundary-2 decomposition path and is NOT diverted here.
-	eval := EvaluateScope(ScopeInput{
+	eval := EvaluateScope(ScopeInput{ //nolint:contextcheck // document syntax validation is pure content checking, no context needed
 		Target:          target,
 		Content:         source,
 		MaxOutputTokens: maxOut,
 		Root:            d.adapter.Root(),
+		Subcommand:      d.subcommand,
 	})
 	if eval.ASTStatus == ASTCorrupt {
 		diagnosticf("[boundary2] preflight hard-gate CLOSED for corrupt AST target=%s — DAG decomposition forbidden, diverting to DecisionSurface", target)
@@ -722,8 +723,8 @@ func (d *Driver) stageDecisionSurface(ctx context.Context, eval PreflightEvaluat
 	surface := BuildDecisionSurface(eval, d.subcommand)
 	d.surface = &surface
 	b := autonomy.HumanBoundary{
-		Reason:         "Zero-Token DecisionSurface: " + barrierReason(eval),
-		Targets:        []string{target},
+		Reason:          "Zero-Token DecisionSurface: " + barrierReason(eval),
+		Targets:         []string{target},
 		DecisionSurface: true,
 	}
 	// DeriveBoundaryAction recognizes the DecisionSurface marker and sets the
