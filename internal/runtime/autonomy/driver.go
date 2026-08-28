@@ -91,6 +91,16 @@ type Driver struct {
 	preflightBarrier *loop.Barrier
 	// preflightState is the Observation State where StructuralSnapshot is published.
 	preflightState *preflight.ObservationState
+
+	// proposalIntent is the human-selected ProposalIntent injected into the
+	// execution-context constraints for the current run (Phase 2 proposal
+	// gateway). Empty when no interactive proposal was selected.
+	proposalIntent ProposalIntent
+	// proposalFails counts how many times the SAME proposal intent was
+	// selected-and-failed without altering workspace state. It backs the
+	// anti-loop guard: when it reaches proposalAntiLoopLimit the run is forced
+	// to ABORTED instead of looping on the same strategy.
+	proposalFails int
 }
 
 // Option configures the Driver during construction.
@@ -384,6 +394,78 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 		d.runCancel = nil
 	}
 	return term, err
+}
+
+// ResumeWithProposal continues a parked proposal gate with an explicit
+// human-selected ProposalIntent. It is the ONLY route by which an interactive
+// proposal decision reaches execution — the TUI modal never mutates state; it
+// returns a pure ProposalIntent that this method applies across the
+// RuntimeExecutor boundary.
+//
+//   - ProposalCancel → the run transitions to the terminal ABORTED state with
+//     zero spend: no mutation, no further provider invocation.
+//   - Any other valid intent → the intent is injected into the execution-context
+//     constraints and the run re-enters observation so the engine constructs the
+//     authorized DAG bounded by that strategy.
+//
+// Anti-loop protection: the same intent selected-and-failed twice without
+// altering workspace state forces ABORTED instead of looping (invariant 3).
+func (d *Driver) ResumeWithProposal(ctx context.Context, intent ProposalIntent) (*autonomy.LoopTermination, error) {
+	if d.loop == nil || d.loop.State() != autonomy.RuntimeAwaitingHuman {
+		return d.term(), errors.New("autonomy: resume-with-proposal requires a parked human boundary")
+	}
+	// ProposalCancel: ABORTED with $0 spent.
+	if intent.IsCancel() {
+		d.loop.ReleaseHuman("proposal cancelled")
+		d.publish(ctx)
+		term := d.terminateAbort(ctx, "proposal cancelled: "+string(intent), autonomy.FailurePermanent)
+		d.runCtx, d.runCancel = nil, nil
+		return term, nil
+	}
+	if !intent.Valid() {
+		return d.term(), errors.New("autonomy: invalid proposal intent " + string(intent))
+	}
+	// Reset the failure counter when the human selects a DIFFERENT strategy.
+	if intent != d.proposalIntent {
+		d.proposalIntent = intent
+		d.proposalFails = 0
+	}
+	// Anti-loop guard: the SAME strategy was already selected-and-failed enough
+	// times without altering workspace state — force ABORTED instead of looping.
+	if d.proposalFails >= proposalAntiLoopLimit {
+		d.loop.ReleaseHuman("proposal anti-loop guard: " + string(intent))
+		d.publish(ctx)
+		term := d.terminateAbort(ctx, "proposal anti-loop guard: "+string(intent)+" failed without altering state", autonomy.FailurePermanent)
+		d.runCtx, d.runCancel = nil, nil
+		return term, nil
+	}
+	// Inject the proposal intent into the execution-context constraints.
+	d.req.ProposalIntent = string(intent)
+	d.loop.ReleaseHuman("proposal selected: " + string(intent))
+	d.publish(ctx)
+	d.runID++
+	term, err := d.observeAndRun(ctx, d.runID)
+	// Record a state-unchanging failure of the SAME proposal intent so the
+	// anti-loop guard can force ABORTED on a subsequent repeat.
+	if term != nil && term.State == autonomy.RuntimeAborted && proposalIntentFailed(d.obs) {
+		if intent == d.proposalIntent {
+			d.proposalFails++
+		}
+	}
+	if term != nil && term.State.IsTerminal() {
+		d.runCtx = nil
+		d.runCancel = nil
+	}
+	return term, err
+}
+
+// ProposalIntent returns the proposal intent injected into the current run's
+// execution-context constraints, or "" when none.
+func (d *Driver) ProposalIntent() ProposalIntent {
+	if d == nil {
+		return ""
+	}
+	return d.proposalIntent
 }
 
 // State returns the current loop position.
@@ -723,6 +805,22 @@ func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopD
 		// marks it recoverable, so the matrix escalates through bounded
 		// repair cycles to a human instead of completing or aborting outright.
 		return DecideRecovery(o, b)
+	}
+}
+
+// proposalIntentFailed reports whether an observation represents a failure of
+// the selected proposal strategy that did NOT alter workspace state. Only such
+// state-unchanging failures advance the anti-loop guard; a successful outcome
+// never does.
+func proposalIntentFailed(o autonomy.Observation) bool {
+	switch o.Outcome {
+	case autonomy.OutcomeFailed, autonomy.OutcomePatchGenFailed, autonomy.OutcomePatchFailed,
+		autonomy.OutcomeApplyFailed, autonomy.OutcomeVerifyFailed, autonomy.OutcomeSkipped,
+		autonomy.OutcomeNoOpObjectiveUnresolved, autonomy.OutcomeNoOpNoSafeMutation,
+		autonomy.OutcomePreflightInfeasible:
+		return true
+	default:
+		return false
 	}
 }
 

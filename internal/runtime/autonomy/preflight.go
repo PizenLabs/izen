@@ -241,12 +241,12 @@ const (
 	BudgetExceeded BudgetStatus = "exceeded"
 )
 
-// ProposalIntent is a placeholder for a change the evaluation concludes cannot
-// proceed without an explicit human-approved re-scope (a required proposal).
-// The gate treats any non-empty set as a hard barrier: a target that demands a
-// proposal is NOT executable as-is. This is plain data; the autonomy loop
-// renders it on the AWAITING_HUMAN_PROPOSAL boundary.
-type ProposalIntent struct {
+// ProposalRequirement is a placeholder for a change the evaluation concludes
+// cannot proceed without an explicit human-approved re-scope (a required
+// proposal). The gate treats any non-empty set as a hard barrier: a target that
+// demands a proposal is NOT executable as-is. This is plain data; the autonomy
+// loop renders it on the AWAITING_HUMAN_PROPOSAL boundary.
+type ProposalRequirement struct {
 	// Reason is the bounded evidence of WHY a human proposal is required.
 	Reason string `json:"reason"`
 	// Target is the workspace-relative file that needs the proposal.
@@ -257,12 +257,12 @@ type ProposalIntent struct {
 // entirely from deterministic local heuristics — never from model inference —
 // so it is the authoritative input to the fail-closed ExecutionGate.
 type PreflightEvaluation struct {
-	Target            string           `json:"target"`
-	ASTStatus         ASTStatus        `json:"ast_status"`
-	DependencyStatus  DependencyStatus `json:"dependency_status"`
-	BudgetStatus      BudgetStatus     `json:"budget_status"`
-	Findings          []string         `json:"findings"`
-	RequiredProposals []ProposalIntent `json:"required_proposals"`
+	Target            string                `json:"target"`
+	ASTStatus         ASTStatus             `json:"ast_status"`
+	DependencyStatus  DependencyStatus      `json:"dependency_status"`
+	BudgetStatus      BudgetStatus          `json:"budget_status"`
+	Findings          []string              `json:"findings"`
+	RequiredProposals []ProposalRequirement `json:"required_proposals"`
 }
 
 // ExecutionGate is the hard invariant gate. It returns true ONLY when every
@@ -377,7 +377,7 @@ func EvaluateScope(in ScopeInput) PreflightEvaluation {
 	// When any precondition fails, a required human proposal is recorded so the
 	// gate can never pass. The engine diverts to AWAITING_HUMAN_PROPOSAL.
 	if !eval.ExecutionGate() {
-		eval.RequiredProposals = append(eval.RequiredProposals, ProposalIntent{
+		eval.RequiredProposals = append(eval.RequiredProposals, ProposalRequirement{
 			Reason: "scope evaluation barrier: " + barrierReason(eval),
 			Target: in.Target,
 		})

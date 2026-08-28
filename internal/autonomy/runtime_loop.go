@@ -532,6 +532,12 @@ type LoopRequest struct {
 	// evaluated individually and the monolithic full-rewrite estimation of
 	// the original target is suppressed. Nil for non-DAG requests.
 	StagedPlan *planner.ExecutionDAG
+	// ProposalIntent carries the human-selected interactive proposal strategy
+	// (Phase 2 proposal gateway) injected into the execution-context
+	// constraints for this attempt. It is pure data selected on the TUI
+	// decision surface; the runtime consumes it to bound the authorized DAG.
+	// Empty when no interactive proposal was selected.
+	ProposalIntent string
 	// FocusStartLine / FocusEndLine optionally pin the executor's
 	// deterministic bounded-patch context window to THIS unit's assigned
 	// inclusive 1-indexed line interval. Under a staged decomposition plan

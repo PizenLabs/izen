@@ -46,11 +46,16 @@ const (
 	// to DECIDING/STAGING and diverts here for a human proposal. Zero LLM
 	// tokens have been spent.
 	StateAwaitingHumanProposal ScopeState = "AWAITING_HUMAN_PROPOSAL"
+	// StateAborted is the terminal cancellation position reached by a
+	// ProposalCancel or by the anti-loop guard (the same proposal strategy
+	// failed twice without altering workspace state). ABORTED is terminal:
+	// zero further execution, zero further spend.
+	StateAborted ScopeState = "ABORTED"
 )
 
 // IsTerminal reports whether the state is terminal.
 func (s ScopeState) IsTerminal() bool {
-	return s == StateCompleted
+	return s == StateCompleted || s == StateAborted
 }
 
 // String returns the canonical scope-state label.
@@ -98,7 +103,20 @@ func (t ScopeTransition) String() string {
 type ScopeStateMachine struct {
 	state   ScopeState
 	history []ScopeTransition
+
+	// ── Anti-loop protection metadata ──────────────────────────────
+	// proposalStrategy is the last ProposalIntent selected by the human.
+	// proposalFails counts how many times the SAME strategy failed without
+	// altering workspace state. When proposalFails reaches the guard threshold
+	// (2) the machine forces ABORTED instead of re-offering the same strategy.
+	proposalStrategy ProposalIntent
+	proposalFails    int
 }
+
+// proposalAntiLoopLimit is the maximum number of times the SAME proposal
+// strategy may fail without altering workspace state before the guard forces
+// ABORTED. Selecting a DIFFERENT strategy resets the counter.
+const proposalAntiLoopLimit = 2
 
 // NewScopeStateMachine returns a machine positioned at OBSERVING.
 func NewScopeStateMachine() *ScopeStateMachine {
@@ -157,6 +175,79 @@ func (m *ScopeStateMachine) GateBarred(reason string) (ScopeState, error) {
 	return m.SendEvent(EventGateBarred, reason)
 }
 
+// ProposalSelected records the human's selected proposal strategy and, unless
+// it is a cancel, advances AWAITING_HUMAN_PROPOSAL -> DECIDING so the engine
+// constructs the authorized DAG. A ProposalCancel transitions to the terminal
+// ABORTED state with zero spend.
+//
+// Anti-loop protection: the machine tracks how many times the SAME strategy
+// has been selected-and-failed without altering workspace state. Selecting a
+// DIFFERENT strategy resets the failure counter. When the same strategy is
+// re-selected after the guard threshold of failures, the machine forces
+// ABORTED instead of looping.
+func (m *ScopeStateMachine) ProposalSelected(intent ProposalIntent, fail bool) (ScopeState, error) {
+	if m == nil {
+		return StateAborted, fmt.Errorf("scope: nil state machine")
+	}
+	if intent.IsCancel() {
+		return m.abort("proposal cancelled: " + string(intent))
+	}
+	if !intent.Valid() {
+		return m.state, fmt.Errorf("scope: invalid proposal intent %q", intent)
+	}
+	if m.state != StateAwaitingHumanProposal {
+		return m.state, fmt.Errorf("scope: proposal requires parked awaiting_human (state=%s)", m.state)
+	}
+	// Reset the failure counter when the human selects a DIFFERENT strategy.
+	if intent != m.proposalStrategy {
+		m.proposalStrategy = intent
+		m.proposalFails = 0
+	}
+	if fail {
+		m.proposalFails++
+	}
+	// Anti-loop guard: the SAME strategy has failed enough times without
+	// altering state — force ABORTED rather than re-offering it.
+	if m.proposalFails >= proposalAntiLoopLimit {
+		return m.abort(fmt.Sprintf("proposal anti-loop guard: %s failed %d times without altering state",
+			intent, m.proposalFails))
+	}
+	return m.SendEvent(EventDecide, "proposal selected: "+string(intent))
+}
+
+// Repark re-enters the AWAITING_HUMAN_PROPOSAL gate after an execution cycle
+// completed without altering workspace state and the re-evaluation barred the
+// gate again. It models the post-execution scope re-check so the anti-loop
+// guard can observe repeated failures of the SAME strategy. It is refused from
+// the terminal states.
+func (m *ScopeStateMachine) Repark(reason string) (ScopeState, error) {
+	if m == nil {
+		return StateObserving, fmt.Errorf("scope: nil state machine")
+	}
+	if m.state == StateCompleted || m.state == StateAborted {
+		return m.state, fmt.Errorf("scope: cannot repark from terminal state %s", m.state)
+	}
+	if m.state == StateAwaitingHumanProposal {
+		return m.state, nil // already parked
+	}
+	m.push(EventGateBarred, StateAwaitingHumanProposal, reason)
+	return StateAwaitingHumanProposal, nil
+}
+
+// abort force-terminates the machine at the terminal ABORTED state.
+func (m *ScopeStateMachine) abort(reason string) (ScopeState, error) {
+	m.push(EventGateBarred, StateAborted, reason)
+	return StateAborted, nil
+}
+
+// ProposalStrategy returns the last proposal intent the human selected.
+func (m *ScopeStateMachine) ProposalStrategy() ProposalIntent {
+	if m == nil {
+		return ""
+	}
+	return m.proposalStrategy
+}
+
 // lookup resolves the destination for a legal event from the given state.
 // The core invariant is enforced here: DECIDING and STAGING are reachable only
 // via EVALUATING_SCOPE (gate passed) and DECIDING respectively.
@@ -190,7 +281,13 @@ func (m *ScopeStateMachine) lookup(from ScopeState, event ScopeEvent) (ScopeStat
 			return StateCompleted, nil
 		}
 	case StateAwaitingHumanProposal:
-		// Parked: a fresh run must re-enter through OBSERVING. No self-event.
+		// A proposal selection re-enters the decision lane: the human chose a
+		// strategy, so the machine advances to DECIDING to construct the
+		// authorized DAG. A cancel parks at ABORTED via ProposalSelected, never
+		// through a plain event.
+		if event == EventDecide {
+			return StateDeciding, nil
+		}
 	}
 	// Fall through: illegal transition.
 	return from, fmt.Errorf("scope: invalid transition from %s via %s", from, event)
