@@ -354,6 +354,117 @@ func TestPreflight_BudgetExceeded_FailsGate(t *testing.T) {
 	}
 }
 
+// targetedPatchFixture renders a ~7780-byte, STRUCTURALLY VALID HTML document.
+// It is large enough that the full-rewrite estimate (bytes/4 × $3×) exceeds a
+// typical budget while the bounded patch estimate (bytes/4 × $2×) fits — the
+// exact target class whose budget must NOT be falsely deemed infeasible.
+func targetedPatchFixture() []byte {
+	const targetSize = 7780
+	prefix := "<!DOCTYPE html>\n<html>\n<head><title>Targeted</title></head>\n<body>\n"
+	section := "<section><p>lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor</p></section>\n"
+	suffix := "</body>\n</html>\n"
+	remaining := targetSize - len(prefix) - len(suffix)
+	body := strings.Repeat(section, remaining/len(section))
+	if pad := targetSize - len(prefix) - len(body) - len(suffix); pad > 0 {
+		body += strings.Repeat(" ", pad)
+	}
+	return []byte(prefix + body + suffix)
+}
+
+// TestPreflight_TargetedPrompt_UsesBoundedMultiplier pins the budget multiplier
+// resolution for a TARGETED modification prompt: "$prompt check this file
+// @index.html and remove redundant content" is a bounded SEARCH/REPLACE request,
+// so the preflight MUST resolve BoundedPatchTokenMultiplier (2×) — never the
+// premature FullRewriteTokenMultiplier (3×) that would flag a ~7780-byte HTML
+// target as infeasible.
+func TestPreflight_TargetedPrompt_UsesBoundedMultiplier(t *testing.T) {
+	source := targetedPatchFixture()
+	if len(source) != 7780 {
+		t.Fatalf("fixture size = %d, want 7780", len(source))
+	}
+	const budget = 4096
+	if est2 := (len(source) / 4) * execution.BoundedPatchTokenMultiplier; est2 > budget {
+		t.Fatalf("bounded estimate = %d, want <= %d budget", est2, budget)
+	}
+	if est3 := (len(source) / 4) * execution.FullRewriteTokenMultiplier; est3 <= budget {
+		t.Fatalf("full-rewrite estimate = %d, want > %d budget to prove the premature 3× false positive", est3, budget)
+	}
+	prompt := "$prompt check this file @index.html and remove redandant content"
+
+	// The multiplier resolution MUST pick the bounded patch multiplier (2×).
+	if got := PreflightMultiplierForTarget("index.html", "$prompt", prompt); got != execution.BoundedPatchTokenMultiplier {
+		t.Fatalf("multiplier = %d, want %d (BoundedPatchTokenMultiplier)", got, execution.BoundedPatchTokenMultiplier)
+	}
+	// An explicit full-rewrite / scaffolding request keeps $3× — never downgraded.
+	if got := PreflightMultiplierForTarget("index.html", "$prompt", "$prompt rewrite this file @index.html from scratch"); got != execution.FullRewriteTokenMultiplier {
+		t.Fatalf("rewrite multiplier = %d, want %d (FullRewriteTokenMultiplier)", got, execution.FullRewriteTokenMultiplier)
+	}
+
+	// EvaluateScope over the targeted prompt passes the gate cleanly: the
+	// bounded patch scope fits the budget — no premature 3× infeasibility.
+	eval := EvaluateScope(ScopeInput{
+		Target:          "index.html",
+		Content:         source,
+		MaxOutputTokens: budget,
+		Root:            t.TempDir(),
+		Subcommand:      "$prompt",
+		Prompt:          prompt,
+	})
+	if eval.ASTStatus != ASTValid {
+		t.Fatalf("ASTStatus = %s, want valid", eval.ASTStatus)
+	}
+	if eval.BudgetStatus != BudgetWithinLimits {
+		t.Fatalf("BudgetStatus = %s, want within_limits (findings: %v) — the bounded patch scope must pass cleanly", eval.BudgetStatus, eval.Findings)
+	}
+	if !eval.ExecutionGate() {
+		t.Fatalf("ExecutionGate = false for a targeted bounded-patch prompt; findings: %v", eval.Findings)
+	}
+}
+
+// TestPreflight_ValidAST_DoesNotSetCorruptOnBudgetExceed pins the STRICT
+// decoupling of ASTStatus from BudgetStatus: a STRUCTURALLY VALID target that
+// exceeds the output budget is classified BudgetExceeded with the ExecutionGate
+// closed — and its ASTStatus MUST stay ASTValid. It is NEVER mislabeled
+// ASTCorrupt just because the budget check failed.
+func TestPreflight_ValidAST_DoesNotSetCorruptOnBudgetExceed(t *testing.T) {
+	// ~2745 bytes → ~686 tokens × 3 = ~2059 > 512: provably over budget.
+	valid := []byte(strings.Repeat("<section><p>lorem ipsum dolor sit amet consectetur</p></section>\n", 45))
+	if err := execution.ValidateDocumentSyntax("big.html", valid); err != nil {
+		t.Fatalf("fixture must be structurally valid: %v", err)
+	}
+	if (len(valid)/4)*execution.FullRewriteTokenMultiplier <= 512 {
+		t.Fatalf("fixture estimates %d tokens, want > 512 budget", (len(valid)/4)*execution.FullRewriteTokenMultiplier)
+	}
+
+	eval := EvaluateScope(ScopeInput{
+		Target:          "big.html",
+		Content:         valid,
+		MaxOutputTokens: 512,
+		Root:            t.TempDir(),
+	})
+
+	if eval.ASTStatus != ASTValid {
+		t.Fatalf("ASTStatus = %s, want valid — a valid target must never be mislabeled corrupt on budget failure", eval.ASTStatus)
+	}
+	if eval.BudgetStatus != BudgetExceeded {
+		t.Fatalf("BudgetStatus = %s, want exceeded", eval.BudgetStatus)
+	}
+	if eval.ExecutionGate() {
+		t.Fatal("ExecutionGate = true, want false — an over-budget target must fail closed")
+	}
+	if len(eval.RequiredProposals) == 0 {
+		t.Fatal("a closed gate must record a required human proposal")
+	}
+	// The barrier reason names the TRUE cause — never a corrupt-AST label.
+	reason := barrierReason(eval)
+	if !strings.Contains(reason, "output budget exceeded (bounded patch required)") {
+		t.Fatalf("barrier reason = %q, want the bounded-patch budget cause", reason)
+	}
+	if strings.Contains(reason, "corrupt AST") {
+		t.Fatalf("barrier reason = %q must never report corrupt AST for a valid target", reason)
+	}
+}
+
 // TestPreflight_MissingLocalDependency_FailsGate drives the zero-token preflight
 // over an HTML document that references a <script src> file that does not exist.
 // The DependencyStatus MUST be unresolved and the ExecutionGate MUST close.
@@ -390,5 +501,47 @@ func TestPreflight_UnboundedOrEmpty_NotBarred(t *testing.T) {
 	// barrier. Assert the distinction: unknown != corrupt.
 	if empty.ASTStatus == ASTCorrupt {
 		t.Fatal("empty target must not be classified corrupt")
+	}
+}
+
+// TestASTStatus_ZeroValueNeverCorrupt pins the zero-value default invariant:
+// an UNINITIALIZED ASTStatus (the zero value) must read as ASTUnspecified —
+// semantically unknown/unverified — and MUST NEVER be interpreted as
+// ASTCorrupt. This is the anti-deadlock guarantee: a struct built without
+// setting ASTStatus can never strand a run at a bogus "corrupt AST baseline"
+// decision surface.
+func TestASTStatus_ZeroValueNeverCorrupt(t *testing.T) {
+	var zero ASTStatus
+	if zero != ASTUnspecified {
+		t.Fatalf("zero-value ASTStatus = %q, want %q (ASTUnspecified)", zero, ASTUnspecified)
+	}
+	if zero == ASTCorrupt {
+		t.Fatal("zero-value ASTStatus must never equal ASTCorrupt")
+	}
+	if zero == ASTValid {
+		t.Fatal("zero-value ASTStatus must never equal ASTValid")
+	}
+	if zero.Known() {
+		t.Fatal("zero-value ASTStatus must report Known() == false")
+	}
+
+	// An uninitialized PreflightEvaluation carries an unspecified (not corrupt)
+	// status and the barrier reason never names a "corrupt AST baseline".
+	var eval PreflightEvaluation
+	if eval.ASTStatus != ASTUnspecified {
+		t.Fatalf("uninitialized eval ASTStatus = %q, want unspecified", eval.ASTStatus)
+	}
+	reason := barrierReason(eval)
+	if strings.Contains(reason, "corrupt") {
+		t.Fatalf("barrier reason for an unspecified status must never name corruption, got %q", reason)
+	}
+	if !strings.Contains(reason, "unverified") {
+		t.Fatalf("barrier reason for an unspecified status must read unverified, got %q", reason)
+	}
+
+	// A zero-value eval is fail-closed (gate refuses to pass) but that closure
+	// is "unverified AST", never "corrupt AST".
+	if eval.ExecutionGate() {
+		t.Fatal("an uninitialized evaluation must not pass the ExecutionGate")
 	}
 }

@@ -390,6 +390,18 @@ const (
 // String returns the canonical boundary-action label.
 func (a HumanBoundaryAction) String() string { return string(a) }
 
+// HumanProposalOption is one selectable recovery option carried on a
+// DecisionSurface HumanBoundary. It is pure scalar presentation data — no
+// callbacks — so the UI can render the human decision surface directly from
+// the authoritative runtime state without importing the runtime autonomy
+// package and without parsing log strings.
+type HumanProposalOption struct {
+	ID          string
+	Label       string
+	Description string
+	Intent      string
+}
+
 type HumanBoundary struct {
 	Reason string
 	// RequestID identifies the parked execution when the boundary is an
@@ -410,6 +422,23 @@ type HumanBoundary struct {
 	// HumanBoundaryDecomposition. It lists every sub-task the human is being
 	// asked to authorize; approval covers ALL of them as one atomic plan.
 	Proposal *planner.ExecutionDAG
+	// ProposalOptions is the typed recovery option set of the Zero-Token
+	// DecisionSurface when Action is HumanBoundaryProposal. It is the concrete
+	// human decision surface: the UI renders these options and collapses the
+	// selection into one intent (rescope_bounded_patch / retry_with_explicit_
+	// budget / repair_first / inspect / cancel). Every parked
+	// HumanBoundaryProposal MUST carry a non-empty set — an awaiting_human
+	// park with no renderable decision surface is a deadlock by construction.
+	ProposalOptions []HumanProposalOption
+	// SurfaceASTStatus / SurfaceFailureCategory / SurfaceEstimatedTokens /
+	// SurfaceCurrentBudget are the authoritative DecisionSurface facts a
+	// HumanBoundaryProposal park carries so the UI can render the TRUE cause
+	// of the closed gate from typed fields — never by parsing a reason string.
+	SurfaceASTStatus       string
+	SurfaceFailureCategory string
+	SurfaceEstimatedTokens int
+	SurfaceCurrentBudget   int
+	SurfaceExplicitBudget  int
 	// DecisionSurface marks the boundary as the ZERO-TOKEN DecisionSurface
 	// proposal gate (HumanBoundaryProposal). When true, DAG decomposition is
 	// forbidden and the human must choose a repair-first / cancel strategy from

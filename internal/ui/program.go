@@ -356,6 +356,24 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		events.EventCapabilityGranted,
 		events.EventLoopTransition,
 		events.EventContextCompiled,
+		// ── PREFLIGHT / DECISION-SURFACE / AUTONOMY TELEMETRY ──────────
+		// The typed preflight, recovery, decision-surface and autonomy
+		// lifecycle events are projected onto the activity log. The runtime
+		// never relies on log strings for a human decision — these typed events
+		// are the observability + projection contract.
+		events.EventPreflightStarted,
+		events.EventPreflightCompleted,
+		events.EventPreflightRejected,
+		events.EventRecoveryClassified,
+		events.EventRecoveryOptionsCreated,
+		events.EventDecisionSurface,
+		events.EventDecisionSurfaceCreated,
+		events.EventDecisionSurfacePublished,
+		events.EventDecisionSurfaceActivated,
+		events.EventDecisionSurfaceResolved,
+		events.EventAutonomousParked,
+		events.EventAutonomousResumed,
+		events.EventAutonomousAborted,
 	} {
 		eventBus.Subscribe(typ, co.Accept)
 	}

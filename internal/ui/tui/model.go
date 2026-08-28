@@ -48,11 +48,27 @@ func (m ModalMode) String() string {
 // barrier parks on. It carries the pure-data DecisionSurface the interactive
 // ProposalModel renders. A non-nil surface MUST activate the interactive
 // proposal modal — the update loop never degrades it to a static pause card.
+//
+// The dispatcher accepts BOTH the value form and the *HumanBoundaryProposalMsg
+// pointer form so the composition root may deliver the event either way across
+// its event channel; both activate the modal identically.
 type HumanBoundaryProposalMsg struct {
 	DecisionSurface *DecisionSurface
 }
 
 var _ tea.Msg = HumanBoundaryProposalMsg{}
+
+// EngineEvent is the generic wrapped-event container the dispatcher unwraps.
+// A composition root that routes engine events through a single channel may
+// deliver a HumanBoundaryProposalMsg inside Payload (as a value or a pointer).
+// The dispatcher unwraps BOTH shapes so the proposal modal activates regardless
+// of how the event crossed the bus — a wrapped proposal event must never be
+// dropped, or the awaiting_human barrier would deadlock.
+type EngineEvent struct {
+	Payload interface{}
+}
+
+var _ tea.Msg = EngineEvent{}
 
 // ProposalResumedMsg is delivered after a human-selected ProposalIntent has
 // been routed to the engine resumer (Driver.ResumeWithProposal). Err is nil
@@ -118,26 +134,57 @@ func (m *Model) Init() tea.Cmd {
 	return m.proposalModel.Init()
 }
 
+// handleProposal activates the interactive proposal modal from a
+// HumanBoundaryProposalMsg payload. It is the single authority on modal
+// activation: sets m.activeModal = ModalProposal and instantiates the
+// ProposalModel over the carried DecisionSurface. A nil DecisionSurface
+// payload leaves the current modal untouched (no fake surface, no deadlock).
+func (m *Model) handleProposal(msg HumanBoundaryProposalMsg) (*Model, tea.Cmd) {
+	if msg.DecisionSurface == nil {
+		return m, nil
+	}
+	// A DecisionSurface payload is a LIVE human decision gate: switch the
+	// active TUI view component to the interactive ProposalModel and focus
+	// keyboard input on it. It must NEVER degrade to a static pause.
+	m.activeModal = ModalProposal
+	m.proposalModel = NewProposalModel(*msg.DecisionSurface)
+	return m, m.proposalModel.Init()
+}
+
 // Update implements the Bubble Tea event loop. It routes the HumanBoundary
 // proposal event onto the interactive ProposalModel modal and, while that
 // modal is active, collapses every keypress into a ProposalIntent routed to
 // the engine resumer (Driver.ResumeWithProposal).
+//
+// The proposal event is accepted in every delivery shape the composition root
+// may produce: the value form, the pointer form, and an EngineEvent wrapper
+// whose Payload holds either. All shapes MUST activate the modal — a dropped
+// proposal event would strand the run at awaiting_human.
 func (m *Model) Update(msg tea.Msg) (*Model, tea.Cmd) {
 	if m == nil {
 		return m, nil
 	}
 	switch msg := msg.(type) {
 	case HumanBoundaryProposalMsg:
-		// A DecisionSurface payload is a LIVE human decision gate: switch the
-		// active TUI view component to the interactive ProposalModel and focus
-		// keyboard input on it. It must NEVER degrade to a static pause.
-		if msg.DecisionSurface != nil {
-			m.activeModal = ModalProposal
-			m.proposalModel = NewProposalModel(*msg.DecisionSurface)
-			return m, m.proposalModel.Init()
+		return m.handleProposal(msg)
+
+	case *HumanBoundaryProposalMsg:
+		if msg == nil {
+			return m, nil
 		}
-		// No surface: nothing interactive to render — leave the current modal
+		return m.handleProposal(*msg)
+
+	case EngineEvent:
+		// Unwrap the generic event container: the payload may be a value or a
+		// pointer to the proposal message. A non-proposal payload (telemetry,
+		// activity events, ...) is not a live decision gate — leave the modal
 		// untouched and never manufacture a fake surface.
+		if proposal, ok := msg.Payload.(HumanBoundaryProposalMsg); ok {
+			return m.handleProposal(proposal)
+		}
+		if proposalPtr, ok := msg.Payload.(*HumanBoundaryProposalMsg); ok && proposalPtr != nil {
+			return m.handleProposal(*proposalPtr)
+		}
 		return m, nil
 
 	case tea.WindowSizeMsg:

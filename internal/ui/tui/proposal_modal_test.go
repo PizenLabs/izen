@@ -19,6 +19,8 @@ func fromAutonomy(s autonomy.DecisionSurface) DecisionSurface {
 		ExternalRefsCount: s.ExternalRefsCount,
 		EstimatedTokens:   s.EstimatedTokens,
 		CurrentBudget:     s.CurrentBudget,
+		FailureCategory:   string(s.FailureCategory),
+		Reason:            s.Reason,
 		Options:           make([]ProposalOption, 0, len(s.Options)),
 	}
 	for _, opt := range s.Options {

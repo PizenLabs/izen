@@ -189,6 +189,47 @@ func TestBuildDecisionSurface_UnknownSubcommandIsConservative(t *testing.T) {
 	}
 }
 
+// TestBuildDecisionSurface_CorruptGateNeverEmpty pins the deadlock guard: a
+// DecisionSurface staged when the preflight hard-gate is CLOSED (ASTCorrupt,
+// gate_closed == true) MUST NEVER carry an empty action set. An empty surface
+// cannot be resolved via keyboard input, so the awaiting_human barrier would
+// strand the run forever. Every closed-gate surface offers at least the
+// abort/cancel fallback.
+func TestBuildDecisionSurface_CorruptGateNeverEmpty(t *testing.T) {
+	evals := []PreflightEvaluation{
+		{
+			Target:           "index.html",
+			ASTStatus:        ASTCorrupt,
+			DependencyStatus: DependenciesResolved,
+			BudgetStatus:     BudgetWithinLimits,
+		},
+		{
+			Target:           "index.html",
+			ASTStatus:        ASTCorrupt,
+			DependencyStatus: DependenciesUnresolved,
+			BudgetStatus:     BudgetExceeded,
+		},
+	}
+	for i, eval := range evals {
+		for _, sub := range []string{"$prompt", "$hot", "/build", ""} {
+			surface := BuildDecisionSurface(eval, sub)
+			if len(surface.Options) == 0 {
+				t.Fatalf("case %d sub=%q: corrupt-gate surface must never be empty (deadlock)", i, sub)
+			}
+			if !surface.Has(ProposalCancel) {
+				t.Fatalf("case %d sub=%q: corrupt-gate surface must always offer the abort fallback", i, sub)
+			}
+			// A closed gate MUST also offer a proceed strategy (repair-first) so
+			// the barrier is not limited to abort — the human can choose to
+			// continue boundedly. Cancel alone would still resolve the barrier,
+			// but a closed gate with zero proceed options is a degraded surface.
+			if !surface.Has(ProposalRepairFirst) {
+				t.Fatalf("case %d sub=%q: corrupt-gate surface must offer a proceed strategy", i, sub)
+			}
+		}
+	}
+}
+
 // TestProposalIntent_ValidAndIsCancel pins the closed vocabulary.
 func TestProposalIntent_ValidAndIsCancel(t *testing.T) {
 	valid := []ProposalIntent{

@@ -72,6 +72,68 @@ func TestTUI_RendersProposalModalOnDecisionSurfaceEvent(t *testing.T) {
 	}
 }
 
+// TestTUI_ProposalModalHijacksViewportKeys pins the keyboard focus-hijack
+// invariant: while the proposal modal is active, keypresses such as 'j' / 'k'
+// (a viewport scroll binding) MUST be consumed by the proposal modal — they
+// are never forwarded to any other handler (e.g. the workspace viewport). The
+// modal stays active and the key produces no routing command, proving the
+// dispatcher never leaks focus to the underlying view. A leaked key could
+// scroll the viewport and desync the modal from the decision the user is
+// answering; hijacking guarantees every keypress resolves the awaiting_human
+// barrier (or navigates the modal) instead.
+func TestTUI_ProposalModalHijacksViewportKeys(t *testing.T) {
+	surface := fromAutonomy(autonomy.BuildDecisionSurface(autonomy.PreflightEvaluation{
+		Target:           "index.html",
+		ASTStatus:        autonomy.ASTCorrupt,
+		DependencyStatus: autonomy.DependenciesUnresolved,
+		BudgetStatus:     autonomy.BudgetWithinLimits,
+	}, "$prompt"))
+
+	var routed []ProposalIntent
+	resume := func(_ context.Context, intent ProposalIntent) error {
+		routed = append(routed, intent)
+		return nil
+	}
+	model := NewModel(resume)
+	model.Update(HumanBoundaryProposalMsg{DecisionSurface: &surface})
+	if !model.ProposalActive() {
+		t.Fatal("precondition: proposal modal must be active")
+	}
+
+	// Feed the viewport-scroll keys ('j' / 'k') while the modal owns the
+	// keyboard. They must NOT be forwarded to a viewport scroll handler — the
+	// dispatcher routes them only to the proposal modal.
+	for _, key := range []rune{'j', 'k'} {
+		updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{key}})
+		if updated == nil {
+			t.Fatalf("Update must return the dispatcher for key %q", key)
+		}
+		if !updated.ProposalActive() {
+			t.Fatalf("key %q must be consumed by the proposal modal (focus must not leak)", key)
+		}
+		if cmd != nil {
+			t.Fatalf("key %q is a viewport-scroll binding and must NOT route a proposal intent (got a command)", key)
+		}
+	}
+
+	// The modal never routed anything and no viewport scroll happened: the
+	// underlying handler was never reached.
+	if len(routed) != 0 {
+		t.Fatalf("viewport-scroll keys routed %v, want none (focus leaked)", routed)
+	}
+
+	// The modal is still interactive and resolvable: Enter still selects, which
+	// proves keyboard focus remained on the proposal throughout.
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter must still route a selection after j/k hijack")
+	}
+	_ = updated
+	if resumed := cmd().(ProposalResumedMsg); resumed.Intent != surface.Options[0].Intent {
+		t.Fatalf("Enter routed intent=%q, want %q", resumed.Intent, surface.Options[0].Intent)
+	}
+}
+
 // TestTUI_EmptyDecisionSurfaceKeepsModalInactive asserts a HumanBoundary
 // proposal event WITHOUT a surface payload never manufactures a fake modal —
 // the dispatcher stays on the workspace view (no deadlock, no fake decision).

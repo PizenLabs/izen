@@ -40,6 +40,14 @@ const (
 	ProposalRepairFirst ProposalIntent = "repair_first"
 	// ProposalReduceScope narrows the target boundary to stay within budget.
 	ProposalReduceScope ProposalIntent = "reduce_scope"
+	// ProposalRescopeBoundedPatch re-scopes an infeasible full-rewrite contract
+	// into an explicitly authorized bounded SEARCH/REPLACE patch contract.
+	ProposalRescopeBoundedPatch ProposalIntent = "rescope_bounded_patch"
+	// ProposalRetryExplicitBudget re-runs the same objective under an
+	// explicitly authorized, validated output budget.
+	ProposalRetryExplicitBudget ProposalIntent = "retry_with_explicit_budget"
+	// ProposalInspect exposes the diagnostic details and remains safe.
+	ProposalInspect ProposalIntent = "inspect"
 	// ProposalCancel abandons the objective with zero mutation and zero spend.
 	ProposalCancel ProposalIntent = "cancel"
 )
@@ -48,7 +56,8 @@ const (
 func (i ProposalIntent) Valid() bool {
 	switch i {
 	case ProposalInlineDeps, ProposalExpandScope, ProposalRepairFirst,
-		ProposalReduceScope, ProposalCancel:
+		ProposalReduceScope, ProposalRescopeBoundedPatch,
+		ProposalRetryExplicitBudget, ProposalInspect, ProposalCancel:
 		return true
 	}
 	return false
@@ -74,7 +83,13 @@ type DecisionSurface struct {
 	ExternalRefsCount int
 	EstimatedTokens   int
 	CurrentBudget     int
-	Options           []ProposalOption
+	// FailureCategory is the typed preflight failure category the surface was
+	// built from (budget_exceeded / ast_corrupt / ...). It is the semantic key
+	// the modal uses to render the TRUE cause — never a parsed reason string.
+	FailureCategory string
+	// Reason is the true-cause boundary reason (presentation only).
+	Reason  string
+	Options []ProposalOption
 }
 
 // Option returns the first option with the given intent, or nil.
@@ -255,20 +270,54 @@ func (p *ProposalModel) Render(width int) string {
 		}
 	}
 
+	// ── TRUE-CAUSE RESOLUTION ACTIONS ──────────────────────────────────
+	// A VALID-AST target whose estimated output exceeds the budget is NOT a
+	// corrupt document: the gate closed on budget infeasibility, so the modal
+	// renders the targeted resolution actions for a bounded patch — never a
+	// misleading "corrupt AST" repair-first framing.
+	if p.needsBoundedPatch() {
+		sb.WriteString("\n")
+		sb.WriteString("  cause         : valid AST · output budget exceeded (bounded patch required)\n")
+		sb.WriteString("  resolution    :\n")
+		sb.WriteString("                  (1) Enforce Bounded Patch Mode\n")
+		sb.WriteString("                  (2) Increase max_output\n")
+		sb.WriteString("                  (3) Slice Line Window\n")
+	}
+
 	sb.WriteString(" " + strings.Repeat("─", boxWidth-4) + "\n")
 	sb.WriteString(" ↑/↓ navigate · Enter select · 1-9 quick select · Esc cancel\n")
 
 	return box(sb.String(), boxWidth)
 }
 
+// needsBoundedPatch reports whether the surface represents a VALID-AST target
+// whose estimated output exceeds the declared budget — the distinct cause that
+// calls for a bounded SEARCH/REPLACE patch, not AST repair. It branches on the
+// typed FailureCategory (budget_exceeded), never on a parsed reason string.
+func (p *ProposalModel) needsBoundedPatch() bool {
+	if p == nil || p.Surface.ASTStatus != statusValid {
+		return false
+	}
+	return p.Surface.FailureCategory == string(statusBudgetExceeded) ||
+		(p.Surface.EstimatedTokens > 0 && p.Surface.CurrentBudget > 0 && p.Surface.EstimatedTokens > p.Surface.CurrentBudget)
+}
+
+const (
+	statusValid   = "valid"
+	statusCorrupt = "corrupt"
+	statusUnknown = "unknown"
+	// statusBudgetExceeded mirrors the runtime PreflightBudgetExceeded category.
+	statusBudgetExceeded = "budget_exceeded"
+)
+
 func statusLabel(s string) string {
 	switch s {
-	case "corrupt":
-		return "corrupt"
-	case "valid":
-		return "valid"
+	case statusCorrupt:
+		return statusCorrupt
+	case statusValid:
+		return statusValid
 	default:
-		return "unknown"
+		return statusUnknown
 	}
 }
 

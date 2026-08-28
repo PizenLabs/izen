@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution/planner"
 )
 
@@ -670,16 +671,29 @@ func (d *Driver) stageDecomposition(ctx context.Context) bool {
 	// DecisionSurface barrier so the human may choose repair-first / cancel.
 	// Over-budget (valid-AST) preflight_infeasible remains the legitimate
 	// Boundary-2 decomposition path and is NOT diverted here.
+	if d.bus != nil {
+		d.bus.Publish(events.NewPreflightStarted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, maxOut))
+	}
 	eval := EvaluateScope(ScopeInput{ //nolint:contextcheck // document syntax validation is pure content checking, no context needed
 		Target:          target,
 		Content:         source,
 		MaxOutputTokens: maxOut,
 		Root:            d.adapter.Root(),
 		Subcommand:      d.subcommand,
+		Prompt:          d.prompt,
 	})
 	if eval.ASTStatus == ASTCorrupt {
-		diagnosticf("[boundary2] preflight hard-gate CLOSED for corrupt AST target=%s — DAG decomposition forbidden, diverting to DecisionSurface", target)
+		if d.bus != nil {
+			fail := BuildPreflightFailure(eval)
+			d.bus.Publish(events.NewPreflightRejected(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy,
+				string(fail.Category), fail.Reason, eval.EstimatedTokens, maxOut, string(eval.ASTStatus)))
+		}
+		diagnosticf("[boundary2] preflight hard-gate CLOSED for corrupt AST target=%s ast_status=%s budget_status=%s — DAG decomposition forbidden, diverting to DecisionSurface",
+			target, eval.ASTStatus, eval.BudgetStatus)
 		return d.stageDecisionSurface(ctx, eval, target)
+	}
+	if d.bus != nil {
+		d.bus.Publish(events.NewPreflightCompleted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, eval.EstimatedTokens, maxOut))
 	}
 	base := d.req.WorkspaceDigest
 	if base == "" {
@@ -716,16 +730,43 @@ func (d *Driver) stageDecomposition(ctx context.Context) bool {
 // barrier through the pure-data DecisionSurface (repair-first / cancel), which
 // the runtime autonomy package renders and the driver resumes via
 // ResumeWithProposal.
+//
+// LIFECYCLE INVARIANT: the typed proposal payload is published on the bus
+// (decision.surface) BEFORE the loop parks at awaiting_human. The runtime never
+// enters awaiting_human without a renderable human decision surface — the
+// ordering created → published → activated is mandatory.
 func (d *Driver) stageDecisionSurface(ctx context.Context, eval PreflightEvaluation, target string) bool {
 	if d.loop == nil {
 		return false
 	}
 	surface := BuildDecisionSurface(eval, d.subcommand)
 	d.surface = &surface
+	// LIFECYCLE: CREATED. The surface now exists as an authoritative runtime
+	// artifact — zero LLM tokens were required to build it.
+	d.setSurfaceLifecycle(ctx, SurfaceLifecycleCreated, "decision surface created for closed gate")
+	// The typed recovery classification + option set are published as
+	// structured telemetry (never log strings).
+	d.emitRecoveryClassified(ctx, eval, surface)
+	// LIFECYCLE: PUBLISHED. The typed proposal payload crosses the bus BEFORE
+	// the loop parks, so the UI can render the human decision surface.
+	d.emitDecisionSurface(ctx, surface, SurfaceLifecyclePublished)
+	d.setSurfaceLifecycle(ctx, SurfaceLifecyclePublished, "decision surface published before park")
+	// The boundary reason names the TRUE cause: a valid-AST target whose budget
+	// gate closed reports "output budget exceeded (bounded patch required)",
+	// never a misleading "corrupt AST" label (barrierReason is the authority).
 	b := autonomy.HumanBoundary{
-		Reason:          "Zero-Token DecisionSurface: " + barrierReason(eval),
+		Reason:          "Zero-Token DecisionSurface: " + surface.Reason,
 		Targets:         []string{target},
 		DecisionSurface: true,
+		ProposalOptions: optionsFromSurface(surface),
+		// The authoritative surface facts travel on the boundary as typed
+		// scalars so the UI renders the TRUE cause without parsing a reason
+		// string.
+		SurfaceASTStatus:       string(surface.ASTStatus),
+		SurfaceFailureCategory: string(surface.FailureCategory),
+		SurfaceEstimatedTokens: surface.EstimatedTokens,
+		SurfaceCurrentBudget:   surface.CurrentBudget,
+		SurfaceExplicitBudget:  surface.ExplicitBudget,
 	}
 	// DeriveBoundaryAction recognizes the DecisionSurface marker and sets the
 	// HumanBoundaryProposal action; the manual assignments are belt-and-
@@ -734,9 +775,13 @@ func (d *Driver) stageDecisionSurface(ctx context.Context, eval PreflightEvaluat
 	b.Resumable = true
 	d.loop.AwaitHuman(b)
 	d.enrichBoundary()
+	// LIFECYCLE: ACTIVATED. The loop is parked at awaiting_human and the
+	// surface is the live human decision gate.
+	d.setSurfaceLifecycle(ctx, SurfaceLifecycleActivated, "loop parked at decision surface")
+	d.emitAutonomousParked(ctx, "parked at decision surface: "+surface.Reason)
 	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
-	diagnosticf("[preflight] DecisionSurface barrier staged target=%s ast_status=%s gate_closed=true — DAG decomposition forbidden",
-		target, eval.ASTStatus)
+	diagnosticf("[preflight] DecisionSurface barrier staged target=%s ast_status=%s budget_status=%s gate_closed=true — DAG decomposition forbidden",
+		target, eval.ASTStatus, eval.BudgetStatus)
 	return true
 }
 

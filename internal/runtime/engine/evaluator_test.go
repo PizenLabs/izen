@@ -101,3 +101,59 @@ func TestEngine_ValidPreflightAdvancesToDeciding(t *testing.T) {
 		t.Fatalf("TokensSpent = %d, want 0", ctx.TokensSpent)
 	}
 }
+
+// TestEngine_PropagatesPromptToPreflightScope pins the prompt-propagation
+// contract: the executor's background EVALUATING_SCOPE step MUST forward the
+// raw prompt (and subcommand policy) into ScopeInput.Prompt so the budget
+// estimator applies the bounded-patch multiplier for a targeted modification
+// request. Omitting the prompt would silently downgrade every targeted request
+// to full-rewrite ($3×) accounting and falsely close the gate on budget — a
+// bounded patch that fits would be blocked as infeasible.
+func TestEngine_PropagatesPromptToPreflightScope(t *testing.T) {
+	// ~3960 bytes → ~990 tokens: ×3 = 2970 > 2500 (over budget), ×2 = 1980
+	// ≤ 2500 (fits). A targeted modification prompt MUST fit under the bounded
+	// multiplier.
+	big := []byte(strings.Repeat("<section><p>lorem ipsum dolor sit amet consectetur</p></section>\n", 60))
+
+	ctx := &ExecutionContext{
+		Root:            t.TempDir(),
+		Target:          "big.html",
+		Content:         big,
+		MaxOutputTokens: 2500,
+		Subcommand:      "$prompt",
+		Prompt:          "refactor the redundant sections",
+		StateMachine:    autonomy.NewScopeStateMachine(),
+	}
+	if _, err := ctx.StateMachine.Observe("context collected"); err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+
+	if err := RunEvaluatingScopeStep(ctx); err != nil {
+		t.Fatalf("a targeted modification prompt on markup must pass the gate (bounded patch), got error: %v", err)
+	}
+	if ctx.StateMachine.State() != autonomy.StateDeciding {
+		t.Fatalf("state = %s, want deciding", ctx.StateMachine.State())
+	}
+
+	// Control: the SAME target WITHOUT the prompt/subcommand context falls back
+	// to full-rewrite ($3×) accounting and must close the gate as over-budget —
+	// proving the prompt actually reached the preflight estimator.
+	unpropagated := &ExecutionContext{
+		Root:            t.TempDir(),
+		Target:          "big.html",
+		Content:         big,
+		MaxOutputTokens: 2500,
+		StateMachine:    autonomy.NewScopeStateMachine(),
+	}
+	if _, err := unpropagated.StateMachine.Observe("context collected"); err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+	if err := RunEvaluatingScopeStep(unpropagated); err == nil {
+		t.Fatal("without a targeted prompt the same target must close the gate as over-budget")
+	} else if !errors.Is(err, ErrEvaluatingScopeBarrier) {
+		t.Fatalf("error = %v, want ErrEvaluatingScopeBarrier", err)
+	}
+	if unpropagated.StateMachine.State() != autonomy.StateAwaitingHumanProposal {
+		t.Fatalf("state = %s, want awaiting_human_proposal", unpropagated.StateMachine.State())
+	}
+}

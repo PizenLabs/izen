@@ -13,6 +13,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/presentation"
+	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
 )
 
 // isPrintableRunes reports whether a key message is a plain, unmodified
@@ -452,6 +453,30 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.autonomousParked() {
 			b := m.autonomousBoundary
 			switch {
+			case b.Action == autonomy.HumanBoundaryProposal && msg.Type == tea.KeyUp:
+				if m.proposalTUI != nil {
+					m.proposalTUI.Navigate(-1)
+				}
+				return m, nil
+			case b.Action == autonomy.HumanBoundaryProposal && msg.Type == tea.KeyDown:
+				if m.proposalTUI != nil {
+					m.proposalTUI.Navigate(1)
+				}
+				return m, nil
+			case b.Action == autonomy.HumanBoundaryProposal && msg.Type == tea.KeyEnter:
+				intent := proposaltui.ProposalCancel
+				if m.proposalTUI != nil {
+					intent = m.proposalTUI.Select()
+				}
+				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Recovery selected — "+string(intent)+"..."))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, m.resumeAutonomousProposal(string(intent))
+			case b.Action == autonomy.HumanBoundaryProposal && msg.Type == tea.KeyEscape:
+				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Cancelled — autonomous run aborted."))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return m, m.resumeAutonomousProposal("cancel")
 			case b.Action == autonomy.HumanBoundaryApproval &&
 				(msg.String() == "alt+a" || msg.Type == tea.KeyEnter):
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Approved — runtime applying patch..."))

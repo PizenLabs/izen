@@ -14,6 +14,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/execution"
+	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
 )
 
 // ── PHASE 6 DRIVER BRIDGE TESTS ────────────────────────────────────────
@@ -43,6 +44,8 @@ type fakeAutonomousDriver struct {
 
 	resumeApproveProposal int
 	resumeRejectProposal  int
+	resumeProposal        int
+	lastProposalIntent    string
 }
 
 func (f *fakeAutonomousDriver) Run(_ context.Context, _ string) (*autonomy.LoopTermination, error) {
@@ -76,6 +79,12 @@ func (f *fakeAutonomousDriver) ResumeApproveProposal(_ context.Context) (*autono
 
 func (f *fakeAutonomousDriver) ResumeRejectProposal(_ context.Context, _ string) (*autonomy.LoopTermination, error) {
 	f.resumeRejectProposal++
+	return f.term, f.resumeErr
+}
+
+func (f *fakeAutonomousDriver) ResumeWithProposal(_ context.Context, intent string) (*autonomy.LoopTermination, error) {
+	f.resumeProposal++
+	f.lastProposalIntent = intent
 	return f.term, f.resumeErr
 }
 
@@ -502,5 +511,120 @@ func TestAutonomousDuplicateStartGuard(t *testing.T) {
 	}
 	if m.autonomousBoundary == nil || m.autonomousBoundary.PatchID != "p1" {
 		t.Fatal("the parked boundary must survive a refused second start")
+	}
+}
+
+// ── UI projection invariant: awaiting_human ⇒ renderable DecisionSurface ─────
+
+// TestAutonomousDecisionSurfaceProjection pins the projection invariant: when
+// the runtime parks at HumanBoundaryProposal (a Zero-Token DecisionSurface),
+// the UI must render an INTERACTIVE recovery surface from the typed boundary
+// options — never a static pause and never a log-parsed inference. Enter routes
+// the selected intent to ResumeWithProposal; Esc routes cancel.
+func TestAutonomousDecisionSurfaceProjection(t *testing.T) {
+	drv := &fakeAutonomousDriver{
+		state:     autonomy.RuntimeAwaitingHuman,
+		parkOnRun: true,
+		boundary: &autonomy.HumanBoundary{
+			Reason:           "Zero-Token DecisionSurface: corrupt AST baseline, budget exceeded",
+			Action:           autonomy.HumanBoundaryProposal,
+			Resumable:        true,
+			Targets:          []string{"index.html"},
+			SurfaceASTStatus: "corrupt",
+			ProposalOptions: []autonomy.HumanProposalOption{
+				{ID: "rescope_bounded_patch", Label: "Re-scope to bounded SEARCH/REPLACE", Description: "New bounded contract", Intent: "rescope_bounded_patch"},
+				{ID: "inspect", Label: "Inspect diagnostics", Description: "Read-only", Intent: "inspect"},
+				{ID: "cancel", Label: "Cancel", Description: "Abandon", Intent: "cancel"},
+			},
+		},
+	}
+	m := autonomousTestModel(drv)
+
+	cmd := m.runAutonomousDriver("$prompt check this file @index.html and remove redundant content")
+	msg := extractAutonomousRunMsg(t, cmd())
+	m.handleAutonomousRun(msg)
+
+	if !m.autonomousParked() {
+		t.Fatal("model must hold the parked DecisionSurface boundary")
+	}
+	if m.autonomousBoundary == nil || m.autonomousBoundary.Action != autonomy.HumanBoundaryProposal {
+		t.Fatalf("boundary = %+v, want HumanBoundaryProposal", m.autonomousBoundary)
+	}
+	// The interactive proposal model is active (never a static pause).
+	if m.proposalTUI == nil {
+		t.Fatal("a parked DecisionSurface must activate the interactive proposal model")
+	}
+	block := m.renderAutonomousBoundaryBlock(120)
+	if block == "" {
+		t.Fatal("a parked DecisionSurface must render a non-empty interactive block")
+	}
+	for _, want := range []string{"Re-scope to bounded SEARCH/REPLACE", "Inspect diagnostics", "↑/↓ navigate"} {
+		if !strings.Contains(block, want) {
+			t.Fatalf("proposal block missing %q:\n%s", want, block)
+		}
+	}
+	// Navigation moves the highlight; Enter routes the SELECTED intent to the
+	// driver's ResumeWithProposal — the UI never executes anything itself.
+	m.proposalTUI.Reset() // highlight the first option (rescope_bounded_patch)
+	enterCmd := m.resumeAutonomousProposal(string(m.proposalTUI.Select()))
+	if enterCmd == nil {
+		t.Fatal("selecting an option must route a resume command")
+	}
+	// Execute the returned batch so the driver call actually happens (the
+	// Bubble Tea loop does this in production).
+	if batch, ok := enterCmd().(tea.BatchMsg); ok {
+		for _, c := range batch {
+			if c != nil {
+				c()
+			}
+		}
+	}
+	if drv.resumeProposal != 1 {
+		t.Fatalf("ResumeWithProposal calls = %d, want 1", drv.resumeProposal)
+	}
+	if drv.lastProposalIntent != string(proposaltui.ProposalRescopeBoundedPatch) {
+		t.Fatalf("routed intent = %q, want rescope_bounded_patch (the highlighted option)", drv.lastProposalIntent)
+	}
+}
+
+// TestAutonomousDecisionSurfaceEscapeRoutesCancel pins that Esc on a parked
+// DecisionSurface routes the cancel intent (the driver aborts with zero spend —
+// the UI never hard-cancels on its own).
+func TestAutonomousDecisionSurfaceEscapeRoutesCancel(t *testing.T) {
+	drv := &fakeAutonomousDriver{
+		state:     autonomy.RuntimeAwaitingHuman,
+		parkOnRun: true,
+		boundary: &autonomy.HumanBoundary{
+			Reason:    "Zero-Token DecisionSurface: output budget exceeded (bounded patch required)",
+			Action:    autonomy.HumanBoundaryProposal,
+			Resumable: true,
+			Targets:   []string{"index.html"},
+			ProposalOptions: []autonomy.HumanProposalOption{
+				{ID: "rescope_bounded_patch", Label: "Re-scope", Description: "x", Intent: "rescope_bounded_patch"},
+				{ID: "cancel", Label: "Cancel", Description: "y", Intent: "cancel"},
+			},
+		},
+	}
+	m := autonomousTestModel(drv)
+	cmd := m.runAutonomousDriver("fix @index.html")
+	msg := extractAutonomousRunMsg(t, cmd())
+	m.handleAutonomousRun(msg)
+
+	_, kcmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
+	if kcmd == nil {
+		t.Fatal("Esc on a DecisionSurface must route the cancel intent")
+	}
+	if batch, ok := kcmd().(tea.BatchMsg); ok {
+		for _, c := range batch {
+			if c != nil {
+				c()
+			}
+		}
+	}
+	if drv.lastProposalIntent != "cancel" {
+		t.Fatalf("Esc routed intent = %q, want cancel", drv.lastProposalIntent)
+	}
+	if drv.resumeProposal != 1 {
+		t.Fatalf("ResumeWithProposal calls = %d, want 1", drv.resumeProposal)
 	}
 }

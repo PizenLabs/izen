@@ -140,23 +140,63 @@ func parseStructuralError(detail string) (line int, errMsg string, ok bool) {
 // mutations. It names the warning log category for post-mortem searches.
 const BaselineSyntaxPreexisting = "baseline_syntax_preexisting"
 
+// isBinaryCorruption reports whether content carries the two reliable
+// signals of non-text binary encoding: NUL bytes, or a high density of
+// control bytes outside the text/whitespace set. A standard HTML5/JSX/template
+// file never contains NULs; a real binary (image/archive/corrupt file) does.
+func isBinaryCorruption(content []byte) bool {
+	if len(content) == 0 {
+		return false
+	}
+	nulCount := 0
+	ctrlCount := 0
+	for _, b := range content {
+		if b == 0 {
+			nulCount++
+			continue
+		}
+		// Control bytes that never appear in text markup: bell, escape,
+		// form-feed, etc. (tab/newline/CR are legal whitespace.)
+		if b < 0x20 && b != '\t' && b != '\n' && b != '\r' {
+			ctrlCount++
+		}
+	}
+	// Any NUL byte is definitive binary corruption.
+	if nulCount > 0 {
+		return true
+	}
+	// Dense control-byte run: >= 1% of a non-trivial document.
+	return len(content) >= 64 && ctrlCount*100/len(content) >= 1
+}
+
 // ValidateDocumentSyntax runs the registered syntax validator for target's
 // format over content. It returns nil when the document parses cleanly — or
 // when the format has no registered validator (policy-neutral pass) — and a
 // non-nil error carrying the deterministic parser diagnostics when it does
 // not. It is the preflight baseline snapshot source of truth.
 //
+// BINARY CORRUPTION GATE: before any validator runs, non-text binary content
+// (NUL bytes or a dense control-byte run) is ALWAYS a hard failure regardless
+// of format. A binary file is never a relaxable web template — the null-byte
+// signal is the irreducible boundary between AST-corrupt and permissive
+// markup. This gate runs FIRST so a corrupt binary can never slip through a
+// lenient HTML5 parser that would silently accept its bytes.
+//
 // MARKUP RELAXATION: for HTML/markup targets, only a CATASTROPHIC syntax
 // failure (severe unclosed structural boundaries such as a truncated <script>
 // or <style> raw-text block, or unparseable content) is surfaced as an error.
 // PERMISSIVE markup — optional closing tags a lenient HTML5 parser silently
-// repairs (missing </li>, </p>, <img>/<br> self-closers, a "<" left in text) —
-// is NOT AST corruption and returns nil. The V3 artifact pipeline
-// (v3Artifact.ValidateContent) that validates model OUTPUT stays strict; this
-// relaxation is scoped to the preflight AST gate only.
+// repairs (missing </li>, </p>, <img>/<br> self-closers, a "<" left in text,
+// custom/unknown elements a browser tolerates) — is NOT AST corruption and
+// returns nil. The V3 artifact pipeline (v3Artifact.ValidateContent) that
+// validates model OUTPUT stays strict; this relaxation is scoped to the
+// preflight AST gate only.
 func ValidateDocumentSyntax(target string, content []byte) error {
 	if len(content) == 0 {
 		return nil // empty/creation target: nothing to validate
+	}
+	if isBinaryCorruption(content) {
+		return errors.New("content is binary/non-text: contains NUL or dense control bytes — not a valid text document")
 	}
 	gate := v3Artifact.ValidateContent(target, content, 0)
 	if gate.Passed {

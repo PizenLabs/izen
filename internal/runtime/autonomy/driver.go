@@ -107,6 +107,11 @@ type Driver struct {
 	// DAG decomposition is forbidden. Nil unless the loop parked at the
 	// HumanBoundaryProposal barrier.
 	surface *DecisionSurface
+	// surfaceLifecycle is the lifecycle position of the staged DecisionSurface
+	// (created → published → activated → resolved). The driver publishes a
+	// structured event on every transition (§15 observability); the lifecycle
+	// is authoritative runtime state, never a UI flag.
+	surfaceLifecycle SurfaceLifecycle
 
 	// subcommand is the policy scope ($prompt / $hot / "") used to tailor the
 	// DecisionSurface option set. Empty is the conservative default.
@@ -232,6 +237,10 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.aggInput = 0
 	d.aggOutput = 0
 	d.aggKnown = false
+	d.surface = nil
+	d.surfaceLifecycle = ""
+	d.proposalIntent = ""
+	d.proposalFails = 0
 	d.runRequestID = fmt.Sprintf("run-%d", d.runID)
 	d.loop.Start("user objective: " + objective)
 	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
@@ -286,7 +295,12 @@ func (d *Driver) Abort(reason string) (*autonomy.LoopTermination, error) {
 	}
 	// Use the run context (now cancelled) for termination so the termination
 	// event carries the correct cancellation context.
-	term := d.terminateAbort(d.runCtx, "aborted by operator: "+reason, autonomy.FailurePermanent)
+	abortReason := "aborted by operator: " + reason
+	if d.surface != nil {
+		d.resolveSurfaceLifecycle(d.runCtx, abortReason)
+	}
+	term := d.terminateAbort(d.runCtx, abortReason, autonomy.FailurePermanent)
+	d.emitAutonomousAborted(d.runCtx, abortReason)
 	// Clear the run context so a fresh Run can start.
 	d.runCtx = nil
 	d.runCancel = nil
@@ -416,31 +430,65 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 // ResumeWithProposal continues a parked proposal gate with an explicit
 // human-selected ProposalIntent. It is the ONLY route by which an interactive
 // proposal decision reaches execution — the TUI modal never mutates state; it
-// returns a pure ProposalIntent that this method applies across the
+// returns a pure intent (string) that this method applies across the
 // RuntimeExecutor boundary.
 //
 //   - ProposalCancel → the run transitions to the terminal ABORTED state with
 //     zero spend: no mutation, no further provider invocation.
-//   - Any other valid intent → the intent is injected into the execution-context
-//     constraints and the run re-enters observation so the engine constructs the
-//     authorized DAG bounded by that strategy.
+//   - ProposalRescopeBoundedPatch / ProposalRetryExplicitBudget → a NEW
+//     execution contract is created (the rejected contract is NEVER mutated in
+//     place) and preflight runs again; execution proceeds ONLY if the new
+//     contract's preflight succeeds.
+//   - ProposalInspect → a read-only hold: the diagnostics stay exposed and the
+//     run remains parked with zero execution and zero mutation.
+//   - Any other valid intent → the intent is injected into the
+//     execution-context constraints and the run re-enters observation so the
+//     engine constructs the authorized DAG bounded by that strategy.
 //
 // Anti-loop protection: the same intent selected-and-failed twice without
 // altering workspace state forces ABORTED instead of looping (invariant 3).
-func (d *Driver) ResumeWithProposal(ctx context.Context, intent ProposalIntent) (*autonomy.LoopTermination, error) {
+func (d *Driver) ResumeWithProposal(ctx context.Context, intent string) (*autonomy.LoopTermination, error) {
+	return d.resumeWithProposal(ctx, ProposalIntent(intent))
+}
+
+func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) (*autonomy.LoopTermination, error) {
 	if d.loop == nil || d.loop.State() != autonomy.RuntimeAwaitingHuman {
 		return d.term(), errors.New("autonomy: resume-with-proposal requires a parked human boundary")
 	}
+	// Resolve the DecisionSurface lifecycle on every human choice.
+	d.resolveSurfaceLifecycle(ctx, "human choice: "+string(intent))
 	// ProposalCancel: ABORTED with $0 spent.
 	if intent.IsCancel() {
 		d.loop.ReleaseHuman("proposal cancelled")
 		d.publish(ctx)
+		d.emitAutonomousAborted(ctx, "proposal cancelled: "+string(intent))
 		term := d.terminateAbort(ctx, "proposal cancelled: "+string(intent), autonomy.FailurePermanent)
 		d.runCtx, d.runCancel = nil, nil
 		return term, nil
 	}
 	if !intent.Valid() {
 		return d.term(), errors.New("autonomy: invalid proposal intent " + string(intent))
+	}
+	// ProposalInspect is a READ-ONLY HOLD: expose the diagnostics and remain
+	// parked. Zero execution, zero mutation, zero state change — the surface
+	// simply re-activates so the UI can re-render the details.
+	if intent.IsInspect() {
+		d.emitAutonomousParked(ctx, "inspect hold on decision surface: "+d.surfaceReason())
+		if d.surface != nil {
+			b := autonomy.HumanBoundary{
+				Reason:          "Zero-Token DecisionSurface: " + d.surface.Reason,
+				Targets:         []string{d.surface.Target},
+				DecisionSurface: true,
+				ProposalOptions: optionsFromSurface(*d.surface),
+			}
+			b.Action = autonomy.HumanBoundaryProposal
+			b.Resumable = true
+			d.loop.AwaitHuman(b)
+			d.enrichBoundary()
+			d.publish(ctx)
+			d.setSurfaceLifecycle(ctx, SurfaceLifecycleActivated, "inspect hold re-activated")
+		}
+		return d.term(), nil
 	}
 	// Reset the failure counter when the human selects a DIFFERENT strategy.
 	if intent != d.proposalIntent {
@@ -452,14 +500,48 @@ func (d *Driver) ResumeWithProposal(ctx context.Context, intent ProposalIntent) 
 	if d.proposalFails >= proposalAntiLoopLimit {
 		d.loop.ReleaseHuman("proposal anti-loop guard: " + string(intent))
 		d.publish(ctx)
+		d.emitAutonomousAborted(ctx, "proposal anti-loop guard: "+string(intent))
 		term := d.terminateAbort(ctx, "proposal anti-loop guard: "+string(intent)+" failed without altering state", autonomy.FailurePermanent)
 		d.runCtx, d.runCancel = nil, nil
 		return term, nil
 	}
-	// Inject the proposal intent into the execution-context constraints.
-	d.req.ProposalIntent = string(intent)
+	// ── RECOVERY CREATES A NEW EXECUTION CONTRACT (invariant 9) ─────────
+	// The rejected contract is NEVER mutated in place. A bounded-patch or
+	// explicit-budget recovery constructs a materially different request whose
+	// executor admission resolves into a NEW causally linked ContractID, then
+	// re-runs preflight. Execution proceeds ONLY if the new contract's
+	// preflight succeeds.
+	switch intent {
+	case ProposalRescopeBoundedPatch:
+		d.req.RecoveryStrategy = autonomy.StrategyBoundedPatch
+		d.req.RecoveryAttempt = d.obs.AttemptNum + 1
+		d.req.RecoveryReason = "rescope_bounded_patch: explicit human-authorized bounded SEARCH/REPLACE contract"
+		if d.obs.ContractID != "" {
+			d.req.ParentContractID = d.obs.ContractID
+		}
+		d.req.ProposalIntent = string(intent)
+	case ProposalRetryExplicitBudget:
+		// The explicit budget is the ceiling the human authorized. The new
+		// contract carries it; the executor re-runs Boundary-2 under it and
+		// refuses again if even the authorized ceiling is insufficient.
+		if budget := d.surfaceBudget(); budget > 0 {
+			d.req.MaxOutputTokens = budget
+		}
+		d.req.RecoveryAttempt = d.obs.AttemptNum + 1
+		d.req.RecoveryReason = "retry_with_explicit_budget: explicit human-authorized output budget"
+		if d.obs.ContractID != "" {
+			d.req.ParentContractID = d.obs.ContractID
+		}
+		d.req.ProposalIntent = string(intent)
+	default:
+		// Inject the proposal intent into the execution-context constraints.
+		d.req.ProposalIntent = string(intent)
+	}
+	// The surface is resolved and the run re-enters observation.
+	d.surface = nil
 	d.loop.ReleaseHuman("proposal selected: " + string(intent))
 	d.publish(ctx)
+	d.emitAutonomousResumed(ctx, "proposal selected: "+string(intent))
 	d.runID++
 	term, err := d.observeAndRun(ctx, d.runID)
 	// Record a state-unchanging failure of the SAME proposal intent so the
@@ -602,6 +684,21 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			d.obs.AttemptNum = d.loop.Attempts()
 			d.obs.RecoveryCycle = d.loop.RecoveryCycles()
 			decision := d.decide(d.obs, d.loop.Bounds())
+			// ── ZERO-TOKEN PREFLIGHT GATE (invariant I5) ────────────────
+			// On the INITIAL attempt (no human proposal selected, no recovery
+			// strategy in flight) the driver runs the local structural
+			// preflight BEFORE any provider invocation. A corrupt AST baseline
+			// is NEVER executed and NEVER decomposed — the loop diverts to the
+			// Zero-Token DecisionSurface and parks WITHOUT entering executing
+			// or verifying. Budget-only overflow is deliberately NOT diverted
+			// here: the executor's Boundary-2 rejects it inside Execute and the
+			// driver routes that control-plane verdict without faking
+			// verification.
+			if decision.Action == autonomy.LoopContinue &&
+				d.proposalIntent == "" && d.req.RecoveryStrategy == "" &&
+				d.divertPreflightFailure(ctx) {
+				return d.term(), nil
+			}
 			// ── BOUNDARY 2 EXPANSION (preflight_infeasible) ────────────
 			// Before parking at the generic re-scope gate, try to stage a
 			// typed DECOMPOSITION_PROPOSAL. When staging succeeds the loop is
@@ -630,6 +727,30 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 				return nil, fmt.Errorf("autonomy: execute: %w", err)
 			}
 			d.obs = obs
+			// ── CONTROL-PLANE OUTCOME ROUTING ─────────────────────────
+			// preflight_infeasible (Boundary 2) and workspace_drift (Boundary 5)
+			// are CONTROL-PLANE verdicts, NOT execution results: the executor
+			// refused the request BEFORE any provider call, so there is no
+			// artifact, no mutation and no verification. Consuming them as
+			// execution (ConsumeExecution → RuntimeVerifying) would fabricate a
+			// verification of something that never executed.
+			switch obs.Outcome {
+			case autonomy.OutcomePreflightInfeasible:
+				if d.handlePreflightInfeasible(ctx, runID) {
+					return d.term(), nil
+				}
+				continue
+			case autonomy.OutcomeWorkspaceDrift:
+				// Boundary-5: the mutation geometry moved between attempts.
+				// Terminate as a permanent abort — never verified as execution.
+				if _, err := d.step(ctx, autonomy.LoopDecision{
+					Action: autonomy.LoopAbort,
+					Reason: "workspace drift — stale run aborted before execution",
+				}); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			// Aggregate authoritative usage exactly once per logical invocation.
 			if obs.UsageKnown {
 				d.aggInput += obs.InputTokens
@@ -699,11 +820,103 @@ func (d *Driver) step(ctx context.Context, decision autonomy.LoopDecision) (auto
 	return state, nil
 }
 
+// divertPreflightFailure runs the ZERO-TOKEN structural preflight gate on the
+// initial attempt, BEFORE any provider invocation. It returns true and parks
+// the loop at the Zero-Token DecisionSurface when the target's baseline AST is
+// corrupt — decomposition AND execution are both strictly forbidden for a
+// broken document (invariant 10). Budget-only overflow is deliberately NOT
+// diverted here: the executor's Boundary-2 rejects it inside Execute and the
+// driver routes that control-plane verdict without faking verification, which
+// preserves the legitimate DECOMPOSITION_PROPOSAL path for valid-AST
+// over-budget targets.
+func (d *Driver) divertPreflightFailure(ctx context.Context) bool {
+	if d.adapter == nil || d.loop == nil {
+		return false
+	}
+	target := firstTarget(d.req.Targets)
+	if target == "" {
+		target = d.obs.Target
+	}
+	if target == "" || !planner.Decomposable(target) {
+		return false
+	}
+	maxOut := d.obs.MaxOutputTokens
+	if maxOut <= 0 {
+		return false
+	}
+	source, ok := d.adapter.ReadTargetFile(target)
+	if !ok || len(source) == 0 {
+		return false
+	}
+	if d.bus != nil {
+		d.bus.Publish(events.NewPreflightStarted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, maxOut))
+	}
+	eval := EvaluateScope(ScopeInput{ //nolint:contextcheck // document syntax validation is pure content checking, no context needed
+		Target:          target,
+		Content:         source,
+		MaxOutputTokens: maxOut,
+		Root:            d.adapter.Root(),
+		Subcommand:      d.subcommand,
+		Prompt:          d.prompt,
+	})
+	if eval.ASTStatus != ASTCorrupt {
+		if d.bus != nil {
+			d.bus.Publish(events.NewPreflightCompleted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, eval.EstimatedTokens, maxOut))
+		}
+		return false
+	}
+	if d.bus != nil {
+		fail := BuildPreflightFailure(eval)
+		d.bus.Publish(events.NewPreflightRejected(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy,
+			string(fail.Category), fail.Reason, eval.EstimatedTokens, maxOut, string(eval.ASTStatus)))
+	}
+	diagnosticf("[preflight] hard-gate CLOSED for corrupt AST target=%s ast_status=%s — DAG decomposition AND execution forbidden, diverting to DecisionSurface",
+		target, eval.ASTStatus)
+	return d.stageDecisionSurface(ctx, eval, target)
+}
+
+// handlePreflightInfeasible routes a Boundary-2 CONTROL-PLANE rejection
+// (preflight_infeasible) to a typed recovery decision. It returns true when
+// the loop parked at a human boundary. It NEVER consumes the verdict as an
+// execution result: no verifying, no attempt/step/token accounting.
+func (d *Driver) handlePreflightInfeasible(ctx context.Context, runID uint64) bool {
+	// Late-result guard: the run was aborted/superseded while the executor was
+	// evaluating — a late preflight verdict must never resurrect it.
+	if d.runID != runID {
+		return true
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return true
+	}
+	// BOUNDARY 2 EXPANSION: try to stage a typed recovery decision
+	// (DECOMPOSITION_PROPOSAL for valid-AST over-budget, DecisionSurface for a
+	// corrupt / closed-gate target).
+	if d.stageDecomposition(ctx) {
+		return true
+	}
+	// Fallback: the plain explicit re-scope human boundary (never silent
+	// re-scope, never an altered intent).
+	b := &autonomy.HumanBoundary{
+		Reason:  "invariant I5: preflight infeasible — explicit re-scope required (intent unchanged)",
+		Targets: append([]string(nil), d.req.Targets...),
+	}
+	autonomy.DeriveBoundaryAction(b)
+	d.loop.AwaitHuman(*b)
+	d.enrichBoundary()
+	d.publish(ctx)
+	return true
+}
+
 func (d *Driver) contextObservation() autonomy.Observation {
+	maxOut := d.obs.MaxOutputTokens
+	if maxOut <= 0 {
+		maxOut = d.resolved.Profile.MaxOutputTokens
+	}
 	return autonomy.Observation{
-		Intent:   autonomy.ParseIntent(d.prompt),
-		Target:   firstTarget(d.req.Targets),
-		Evidence: d.req.Evidence,
+		Intent:          autonomy.ParseIntent(d.prompt),
+		Target:          firstTarget(d.req.Targets),
+		Evidence:        d.req.Evidence,
+		MaxOutputTokens: maxOut,
 	}
 }
 
@@ -758,6 +971,128 @@ func (d *Driver) publish(_ context.Context) {
 		d.bus.Publish(events.NewLoopTransition(t.From.String(), t.To.String(), string(t.Action), t.Reason))
 	}
 	d.published = len(history)
+}
+
+// ── Structured telemetry emitters (§15) ─────────────────────────────────────
+// Every preflight/recovery/decision-surface/autonomy lifecycle event carries
+// the stable run identity and the bounded facts. The runtime NEVER relies on
+// free-form log strings for a human decision — a log line is not a UI protocol.
+
+// driverFacts assembles the stable identity fields every telemetry event
+// carries.
+func (d *Driver) driverFacts() (runID, contractID, target, workspace string) {
+	runID = d.runRequestID
+	contractID = d.obs.ContractID
+	target = firstTarget(d.req.Targets)
+	if target == "" {
+		target = d.obs.Target
+	}
+	if d.adapter != nil {
+		workspace = d.adapter.Root()
+	}
+	return runID, contractID, target, workspace
+}
+
+// surfaceReason returns the parked surface's true-cause reason ("" when none).
+func (d *Driver) surfaceReason() string {
+	if d.surface == nil {
+		return ""
+	}
+	return d.surface.Reason
+}
+
+// surfaceBudget returns the parked surface's explicitly authorized output
+// ceiling for retry_with_explicit_budget (0 when the gate did not close on
+// budget infeasibility or the surface is nil).
+func (d *Driver) surfaceBudget() int {
+	if d.surface == nil {
+		return 0
+	}
+	return d.surface.ExplicitBudget
+}
+
+// setSurfaceLifecycle transitions the DecisionSurface lifecycle and publishes
+// the structured transition.
+func (d *Driver) setSurfaceLifecycle(ctx context.Context, next SurfaceLifecycle, reason string) {
+	runID, contractID, target, workspace := d.driverFacts()
+	d.surfaceLifecycle = next
+	if d.bus == nil {
+		return
+	}
+	switch next {
+	case SurfaceLifecycleCreated:
+		d.bus.Publish(events.NewDecisionSurfaceCreated(runID, contractID, target, workspace, reason))
+	case SurfaceLifecyclePublished:
+		d.bus.Publish(events.NewDecisionSurfacePublished(runID, contractID, target, workspace, reason))
+	case SurfaceLifecycleActivated:
+		d.bus.Publish(events.NewDecisionSurfaceActivated(runID, contractID, target, workspace, reason))
+	case SurfaceLifecycleResolved:
+		d.bus.Publish(events.NewDecisionSurfaceResolved(runID, contractID, target, workspace, reason))
+	}
+}
+
+// resolveSurfaceLifecycle marks a parked DecisionSurface resolved by a human
+// choice (idempotent: only a parked surface resolves).
+func (d *Driver) resolveSurfaceLifecycle(ctx context.Context, reason string) {
+	if d.surface == nil {
+		return
+	}
+	d.setSurfaceLifecycle(ctx, SurfaceLifecycleResolved, reason)
+}
+
+// emitDecisionSurface publishes the TYPED proposal payload of a DecisionSurface
+// on the bus. This is the transport the UI projects into a
+// HumanBoundaryProposalMsg — the guarantee that awaiting_human always has a
+// renderable decision surface.
+func (d *Driver) emitDecisionSurface(ctx context.Context, s DecisionSurface, state SurfaceLifecycle) {
+	if d.bus == nil {
+		return
+	}
+	runID, contractID, target, workspace := d.driverFacts()
+	d.bus.Publish(events.NewDecisionSurfaceEvent(
+		runID, contractID, target, workspace, string(state),
+		s.Reason, string(s.ASTStatus), s.EstimatedTokens, s.CurrentBudget,
+		surfaceOptionsToEvents(s),
+	))
+}
+
+// emitRecoveryClassified publishes the typed recovery classification + the
+// concrete recovery options of a closed-gate evaluation.
+func (d *Driver) emitRecoveryClassified(ctx context.Context, eval PreflightEvaluation, s DecisionSurface) {
+	if d.bus == nil {
+		return
+	}
+	runID, contractID, target, workspace := d.driverFacts()
+	cat := ClassifyPreflightFailure(eval)
+	d.bus.Publish(events.NewRecoveryClassified(runID, contractID, target, workspace, string(cat), s.Reason))
+	d.bus.Publish(events.NewRecoveryOptionsCreated(runID, contractID, target, workspace, string(cat), surfaceOptionsToEvents(s)))
+}
+
+// emitAutonomousParked publishes the autonomous.parked lifecycle event.
+func (d *Driver) emitAutonomousParked(ctx context.Context, reason string) {
+	if d.bus == nil {
+		return
+	}
+	runID, contractID, target, workspace := d.driverFacts()
+	d.bus.Publish(events.NewAutonomousParked(runID, contractID, target, workspace, reason))
+}
+
+// emitAutonomousResumed publishes the autonomous.resumed lifecycle event.
+func (d *Driver) emitAutonomousResumed(ctx context.Context, reason string) {
+	if d.bus == nil {
+		return
+	}
+	runID, contractID, target, workspace := d.driverFacts()
+	d.bus.Publish(events.NewAutonomousResumed(runID, contractID, target, workspace, reason))
+}
+
+// emitAutonomousAborted publishes the autonomous.aborted lifecycle event.
+func (d *Driver) emitAutonomousAborted(ctx context.Context, reason string) {
+	if d.bus == nil {
+		return
+	}
+	runID, contractID, target, workspace := d.driverFacts()
+	d.bus.Publish(events.NewAutonomousAborted(runID, contractID, target, workspace, reason))
 }
 
 func (d *Driver) term() *autonomy.LoopTermination {

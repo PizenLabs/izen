@@ -31,6 +31,19 @@ type ExecutionContext struct {
 	// MaxOutputTokens is the declared output budget (0 = unbounded).
 	MaxOutputTokens int
 
+	// Subcommand is the policy scope ($prompt / $hot / ""). It is forwarded
+	// verbatim into ScopeInput so the budget estimator applies the correct
+	// multiplier (bounded patch vs full rewrite).
+	Subcommand string
+
+	// Prompt is the raw admitted prompt text. It MUST be propagated into
+	// ScopeInput.Prompt: the budget estimator inspects it to distinguish a
+	// targeted modification request (remove/fix/refactor → bounded patch
+	// multiplier) from an explicit whole-file rewrite (→ full-rewrite
+	// multiplier). An empty prompt silently downgrades every targeted request
+	// to full-rewrite accounting and can falsely close the gate on budget.
+	Prompt string
+
 	// StateMachine is the scope-execution state machine this step drives. It
 	// must be non-nil; the step transitions it to DECIDING or
 	// AWAITING_HUMAN_PROPOSAL.
@@ -67,11 +80,18 @@ func RunEvaluatingScopeStep(ctx *ExecutionContext) error {
 	}
 
 	// ── 0-TOKEN LOCAL PREFLIGHT ───────────────────────────────────────
+	// The raw prompt text and subcommand policy MUST reach ScopeInput so the
+	// budget estimator applies the bounded-patch-vs-full-rewrite multiplier for
+	// the actual request. Omitting them would make every background evaluation
+	// run under empty-prompt full-rewrite accounting, falsely closing the gate
+	// on targeted modification prompts.
 	eval := autonomy.EvaluateScope(autonomy.ScopeInput{
 		Target:          ctx.Target,
 		Content:         ctx.Content,
 		MaxOutputTokens: ctx.MaxOutputTokens,
 		Root:            ctx.Root,
+		Subcommand:      ctx.Subcommand,
+		Prompt:          ctx.Prompt,
 	})
 
 	if !eval.ExecutionGate() {

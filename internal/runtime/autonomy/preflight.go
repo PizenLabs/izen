@@ -209,6 +209,13 @@ func (d *Driver) runPreflight(ctx context.Context, objective, target string, sou
 
 // ASTStatus classifies the target's structural (AST/syntax) validity, judged
 // by the deterministic local validators — never by a model.
+//
+// ZERO-VALUE INVARIANT: ASTStatus is a string type whose zero value is the
+// empty string, declared as the explicit ASTUnspecified constant below. An
+// UNINITIALIZED PreflightEvaluation therefore reads ASTUnspecified — NEVER
+// ASTCorrupt. No code path may ever treat the zero value as corruption; an
+// unspecified status is fail-closed (the ExecutionGate refuses to pass) but is
+// semantically "unknown", not "broken".
 type ASTStatus string
 
 // DependencyStatus classifies whether the target's local file references
@@ -220,6 +227,10 @@ type DependencyStatus string
 type BudgetStatus string
 
 const (
+	// ASTUnspecified is the zero value: an uninitialized ASTStatus. It must
+	// NEVER be read as ASTCorrupt. The gate treats it as unknown — fail-closed
+	// but never labeled "corrupt AST baseline".
+	ASTUnspecified ASTStatus = ""
 	// ASTValid: the target parses cleanly under its registered validator.
 	ASTValid ASTStatus = "valid"
 	// ASTCorrupt: the target fails its structural validator (unclosed tags,
@@ -240,6 +251,17 @@ const (
 	// BudgetExceeded: the estimated cost exceeds the declared budget.
 	BudgetExceeded BudgetStatus = "exceeded"
 )
+
+// Known reports whether the status is one of the explicit vocabulary values
+// (valid / corrupt / unknown) rather than the zero-value ASTUnspecified.
+func (s ASTStatus) Known() bool {
+	switch s {
+	case ASTValid, ASTCorrupt, ASTUnknown:
+		return true
+	default:
+		return false
+	}
+}
 
 // ProposalRequirement is a placeholder for a change the evaluation concludes
 // cannot proceed without an explicit human-approved re-scope (a required
@@ -263,6 +285,14 @@ type PreflightEvaluation struct {
 	BudgetStatus      BudgetStatus          `json:"budget_status"`
 	Findings          []string              `json:"findings"`
 	RequiredProposals []ProposalRequirement `json:"required_proposals"`
+	// EstimatedTokens is the deterministic generation estimate of the evaluated
+	// strategy (0 when the target is empty/absent or the budget is unbounded).
+	// It is the SAME canonical accounting Boundary 2 uses, so the DecisionSurface
+	// can show the human the exact estimate that closed the gate.
+	EstimatedTokens int `json:"estimated_tokens"`
+	// MaxOutputTokens is the declared output ceiling the estimate was judged
+	// against (0 = unbounded).
+	MaxOutputTokens int `json:"max_output_tokens"`
 }
 
 // ExecutionGate is the hard invariant gate. It returns true ONLY when every
@@ -297,10 +327,17 @@ type ScopeInput struct {
 	// Root is the workspace root used to resolve local file references.
 	Root string
 	// Subcommand is the policy scope ($prompt / $hot / ""). Targeted
-	// modification prompts ($prompt / $hot) on markup targets are expected to
-	// issue bounded patches, so their budget uses the bounded patch multiplier
-	// instead of the full-rewrite multiplier ($3×).
+	// modification prompts ($prompt / $hot) are expected to issue bounded
+	// patches, so their budget uses the bounded patch multiplier instead of
+	// the full-rewrite multiplier ($3×) — unless the prompt itself demands an
+	// explicit whole-file rewrite (see PreflightMultiplierForTarget).
 	Subcommand string
+	// Prompt is the raw admitted prompt. The budget estimator inspects it to
+	// distinguish a targeted modification request (remove/fix/refactor →
+	// BoundedPatchTokenMultiplier) from an explicit full-rewrite or
+	// scaffolding request (→ FullRewriteTokenMultiplier). Empty keeps the
+	// subcommand + markup-target default.
+	Prompt string
 }
 
 // EstimateScopeTokens computes the estimated generation cost of a target using
@@ -315,22 +352,69 @@ func EstimateScopeTokens(targetBytes, maxOutputTokens int) (estimated int, excee
 	return estimated, estimated > maxOutputTokens
 }
 
+// fullRewriteSignalRe matches an EXPLICIT whole-file rewrite or scaffolding
+// request. Only such intents reserve the FullRewriteTokenMultiplier ($3×);
+// everything else on a targeted modification scope assumes a bounded patch.
+var fullRewriteSignalRe = regexp.MustCompile(`(?i)\b(rewrite|regenerate|recreate|rebuild|scaffold|from\s+scratch)\b`)
+
+// targetedModificationSignalRe matches the verbs of a TARGETED modification
+// request: remove/fix/refactor/… — the action class whose generation cost is a
+// bounded SEARCH/REPLACE patch, not a whole-file regeneration.
+var targetedModificationSignalRe = regexp.MustCompile(`(?i)\b(remove|delete|fix|refactor|update|modify|change|edit|insert|replace|simplify|trim|strip|clean|reduce|shorten|cut)\b`)
+
+// IsFullRewriteIntent reports whether the raw prompt demands an explicit
+// whole-file rewrite or scaffolding/recreation — the ONLY intent class that
+// keeps the FullRewriteTokenMultiplier ($3×) on a targeted modification scope.
+func IsFullRewriteIntent(prompt string) bool {
+	return fullRewriteSignalRe.MatchString(prompt)
+}
+
+// IsTargetedModificationIntent reports whether the raw prompt is a targeted
+// modification request (remove redundant content, refactor function, fix bug).
+// Such prompts issue bounded SEARCH/REPLACE patches and default to the
+// BoundedPatchTokenMultiplier ($2×).
+func IsTargetedModificationIntent(prompt string) bool {
+	return targetedModificationSignalRe.MatchString(prompt)
+}
+
+// PreflightMultiplierForTarget resolves the generation multiplier a preflight
+// scope uses for the given target under the subcommand policy and raw prompt.
+// It is the single authority on the bounded-patch-vs-full-rewrite split:
+//
+//   - outside $prompt/$hot there is no bounded-patch contract → $3×;
+//   - an explicit full-rewrite / scaffolding prompt keeps $3× even under
+//     $prompt/$hot (IntentFullRewrite is never silently downgraded);
+//   - a markup target under $prompt/$hot defaults to a bounded patch → $2×;
+//   - a non-markup targeted modification prompt (remove/fix/refactor) also
+//     issues a bounded patch → $2×;
+//   - every other combination keeps the canonical full-rewrite accounting.
+func PreflightMultiplierForTarget(target, subcommand, prompt string) int {
+	if !IsSystemic(subcommand) && !IsHot(subcommand) {
+		return execution.FullRewriteTokenMultiplier
+	}
+	if IsFullRewriteIntent(prompt) {
+		return execution.FullRewriteTokenMultiplier
+	}
+	if execution.IsMarkupTarget(target) || IsTargetedModificationIntent(prompt) {
+		return execution.BoundedPatchTokenMultiplier
+	}
+	return execution.FullRewriteTokenMultiplier
+}
+
 // EstimateScopeTokensForSubcommand computes the estimated generation cost of a
-// TARGETED modification prompt under a policy scope. A targeted modification
-// prompt ($prompt / $hot) on a markup (HTML/template) target is expected to
-// produce a bounded SEARCH/REPLACE patch — not a whole-file rewrite — so the
-// bounded patch multiplier replaces the full-rewrite multiplier ($3×) for that
-// target class. Every other combination keeps the canonical full-rewrite
-// accounting.
-func EstimateScopeTokensForSubcommand(targetBytes, maxOutputTokens int, target, subcommand string) (estimated int, exceeded bool) {
+// TARGETED modification prompt under a policy scope and raw prompt context. A
+// targeted modification prompt ($prompt / $hot — remove, fix, refactor) on a
+// markup (HTML/template) target is expected to produce a bounded
+// SEARCH/REPLACE patch — not a whole-file rewrite — so the bounded patch
+// multiplier replaces the full-rewrite multiplier ($3×). An explicit full
+// rewrite / scaffolding request keeps the canonical full-rewrite accounting.
+func EstimateScopeTokensForSubcommand(targetBytes, maxOutputTokens int, target, subcommand, prompt string) (estimated int, exceeded bool) {
 	if targetBytes <= 0 || maxOutputTokens <= 0 {
 		return 0, false // creation / unbounded budget: not provably infeasible
 	}
-	if (IsSystemic(subcommand) || IsHot(subcommand)) && execution.IsMarkupTarget(target) {
-		estimated = (targetBytes / 4) * execution.BoundedPatchTokenMultiplier
-		return estimated, estimated > maxOutputTokens
-	}
-	return EstimateScopeTokens(targetBytes, maxOutputTokens)
+	multiplier := PreflightMultiplierForTarget(target, subcommand, prompt)
+	estimated = (targetBytes / 4) * multiplier
+	return estimated, estimated > maxOutputTokens
 }
 
 // localRefRe matches local file references in HTML documents:
@@ -389,17 +473,17 @@ func EvaluateScope(in ScopeInput) PreflightEvaluation {
 	}
 
 	// ── 3. BUDGET ESTIMATION (0 tokens) ────────────────────────────────
-	// Targeted modification prompts ($prompt / $hot) on markup targets are
-	// expected to issue bounded patches, so their estimate uses the bounded
-	// patch multiplier instead of the full-rewrite multiplier ($3×).
+	// Targeted modification prompts ($prompt / $hot — remove/fix/refactor) are
+	// expected to issue bounded SEARCH/REPLACE patches, so their estimate uses
+	// the bounded patch multiplier instead of the full-rewrite multiplier
+	// ($3×). An explicit full-rewrite / scaffolding request keeps $3×.
 	eval.BudgetStatus = BudgetWithinLimits
-	estimated, exceeded := EstimateScopeTokensForSubcommand(len(in.Content), in.MaxOutputTokens, in.Target, in.Subcommand)
+	eval.MaxOutputTokens = in.MaxOutputTokens
+	estimated, exceeded := EstimateScopeTokensForSubcommand(len(in.Content), in.MaxOutputTokens, in.Target, in.Subcommand, in.Prompt)
+	eval.EstimatedTokens = estimated
 	if exceeded {
 		eval.BudgetStatus = BudgetExceeded
-		multiplier := execution.FullRewriteTokenMultiplier
-		if (IsSystemic(in.Subcommand) || IsHot(in.Subcommand)) && execution.IsMarkupTarget(in.Target) {
-			multiplier = execution.BoundedPatchTokenMultiplier
-		}
+		multiplier := PreflightMultiplierForTarget(in.Target, in.Subcommand, in.Prompt)
 		eval.AddFinding("target %q estimates ~%d tokens (bytes/4 × %d) but max_output=%d — budget exceeded",
 			in.Target, estimated, multiplier, in.MaxOutputTokens)
 	}
@@ -416,23 +500,124 @@ func EvaluateScope(in ScopeInput) PreflightEvaluation {
 	return eval
 }
 
-// barrierReason renders a compact bounded summary of why the gate closed.
+// barrierReason renders a compact bounded summary of why the gate closed. It
+// formats EXACT reason strings from the actual state so a valid-AST target is
+// never mislabeled as corrupt:
+//
+//   - ASTStatus == ASTCorrupt                    → "corrupt AST baseline"
+//   - ASTStatus == ASTValid + BudgetExceeded     → "output budget exceeded
+//     (bounded patch required)" (never "corrupt AST")
 func barrierReason(e PreflightEvaluation) string {
 	var parts []string
 	switch e.ASTStatus {
 	case ASTCorrupt:
-		parts = append(parts, "corrupt AST")
-	case ASTUnknown:
+		parts = append(parts, "corrupt AST baseline")
+	case ASTUnknown, ASTUnspecified:
+		// ASTUnspecified is the zero value: an uninitialized status is
+		// "unverified", NEVER a corrupt baseline.
 		parts = append(parts, "unverified AST")
 	}
 	if e.DependencyStatus == DependenciesUnresolved {
 		parts = append(parts, "unresolved dependencies")
 	}
 	if e.BudgetStatus == BudgetExceeded {
-		parts = append(parts, "budget exceeded")
+		if e.ASTStatus == ASTValid {
+			parts = append(parts, "output budget exceeded (bounded patch required)")
+		} else {
+			parts = append(parts, "budget exceeded")
+		}
 	}
 	if len(parts) == 0 {
 		return "scope not executable as-is"
 	}
 	return strings.Join(parts, ", ")
+}
+
+// ── Typed Preflight Failure (invariant: no stringly-typed control flow) ─────
+//
+// A preflight rejection is a CONTROL-PLANE outcome, never an execution result.
+// The state machine branches on the typed category below — never on log text or
+// on `err.Error()` substring matching.
+
+// PreflightFailureCategory is the typed taxonomy of a preflight rejection.
+type PreflightFailureCategory string
+
+const (
+	// PreflightBudgetExceeded: the estimated generation cost exceeds max_output.
+	PreflightBudgetExceeded PreflightFailureCategory = "budget_exceeded"
+	// PreflightASTCorrupt: the target baseline fails its structural validator.
+	PreflightASTCorrupt PreflightFailureCategory = "ast_corrupt"
+	// PreflightTargetAmbiguous: no unique target was resolved.
+	PreflightTargetAmbiguous PreflightFailureCategory = "target_ambiguous"
+	// PreflightCapabilityDenied: the target's local references do not resolve
+	// (or a capability the mutation requires is not granted).
+	PreflightCapabilityDenied PreflightFailureCategory = "capability_denied"
+	// PreflightRollbackUnavailable: a recovery that requires rollback cannot
+	// be made safe.
+	PreflightRollbackUnavailable PreflightFailureCategory = "rollback_unavailable"
+	// PreflightVerificationInfeasible: the mutation cannot be verified.
+	PreflightVerificationInfeasible PreflightFailureCategory = "verification_infeasible"
+	// PreflightInternalError: the gate closed for an unrecognized reason.
+	PreflightInternalError PreflightFailureCategory = "internal_error"
+	// PreflightCancelled: the run was cancelled before/at the gate.
+	PreflightCancelled PreflightFailureCategory = "cancelled"
+)
+
+// ClassifyPreflightFailure derives the typed failure category from a
+// Zero-Token evaluation. It is deterministic and never inspects log text.
+func ClassifyPreflightFailure(eval PreflightEvaluation) PreflightFailureCategory {
+	switch {
+	case eval.ASTStatus == ASTCorrupt:
+		return PreflightASTCorrupt
+	case eval.DependencyStatus == DependenciesUnresolved:
+		return PreflightCapabilityDenied
+	case eval.BudgetStatus == BudgetExceeded:
+		return PreflightBudgetExceeded
+	case eval.Target == "":
+		return PreflightTargetAmbiguous
+	default:
+		return PreflightInternalError
+	}
+}
+
+// Recoverable reports whether the category can be recovered through an
+// explicit human choice (a typed decision surface action).
+func (c PreflightFailureCategory) Recoverable() bool {
+	switch c {
+	case PreflightBudgetExceeded, PreflightASTCorrupt, PreflightCapabilityDenied:
+		return true
+	default:
+		return false
+	}
+}
+
+// PreflightFailure is the typed record of one preflight rejection. It exposes
+// exactly the bounded facts the human decision surface and the state machine
+// branch on — never a free-form error string.
+type PreflightFailure struct {
+	Category        PreflightFailureCategory
+	Reason          string
+	Target          string
+	Strategy        string
+	EstimatedTokens int
+	MaxOutputTokens int
+	ASTStatus       ASTStatus
+	Recoverable     bool
+	RecoveryOptions []ProposalOption
+}
+
+// BuildPreflightFailure derives a typed PreflightFailure from a closed-gate
+// evaluation. It is pure data: it never emits an event and never runs a policy.
+func BuildPreflightFailure(eval PreflightEvaluation) PreflightFailure {
+	cat := ClassifyPreflightFailure(eval)
+	return PreflightFailure{
+		Category:        cat,
+		Reason:          barrierReason(eval),
+		Target:          eval.Target,
+		EstimatedTokens: eval.EstimatedTokens,
+		MaxOutputTokens: eval.MaxOutputTokens,
+		ASTStatus:       eval.ASTStatus,
+		Recoverable:     cat.Recoverable(),
+		RecoveryOptions: buildProposalOptions(eval, ""),
+	}
 }
