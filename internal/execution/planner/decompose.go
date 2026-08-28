@@ -144,7 +144,7 @@ func DecomposeTarget(objective, target string, source []byte, baseDigest string,
 	// unparseable structure and can only yield a regression. The caller must
 	// divert to the Zero-Token DecisionSurface barrier instead.
 	if err := execution.ValidateDocumentSyntax(target, source); err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrDecompositionForbiddenCorruptAST, err)
+		return nil, fmt.Errorf("%w: %w", ErrDecompositionForbiddenCorruptAST, err)
 	}
 	budget := SubTaskBudget(maxOutputTokens)
 	if budget <= 0 {
@@ -211,7 +211,7 @@ func StageSemanticSections(objective, target string, source []byte, baseDigest s
 	// pruning the manifest surface cannot repair a broken AST, so no sub-task
 	// may be staged against it.
 	if err := execution.ValidateDocumentSyntax(target, source); err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrDecompositionForbiddenCorruptAST, err)
+		return nil, fmt.Errorf("%w: %w", ErrDecompositionForbiddenCorruptAST, err)
 	}
 	budget := SubTaskBudget(maxOutputTokens)
 	if budget <= 0 {
