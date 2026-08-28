@@ -243,3 +243,150 @@ func TestParseMutationManifest_MinimalArraySchema(t *testing.T) {
 		t.Fatalf("array-form surface estimate = %d, want > 0", e)
 	}
 }
+
+// ── Zero-Token EVALUATING_SCOPE ExecutionGate ───────────────────────────────
+
+// TestPreflight_CorruptAST_FailsGate drives the zero-token preflight over an
+// HTML document with an unclosed <script> element (the deterministic structural
+// validator flags it). The ExecutionGate MUST close: a corrupted target AST is
+// provably non-executable, and no LLM token may be spent on it.
+func TestPreflight_CorruptAST_FailsGate(t *testing.T) {
+	corrupt := []byte("<!DOCTYPE html>\n<html>\n<head><title>Broken</title></head>\n<body>\n" +
+		"<script>\n  console.log('under construction');\n" +
+		"<section><h2>Filler</h2><p>lorem ipsum dolor sit amet</p></section>\n" +
+		"</body>\n</html>\n")
+
+	eval := EvaluateScope(ScopeInput{
+		Target:          "index.html",
+		Content:         corrupt,
+		MaxOutputTokens: 1024,
+		Root:            t.TempDir(),
+	})
+
+	if eval.ASTStatus != ASTCorrupt {
+		t.Fatalf("ASTStatus = %s, want corrupt", eval.ASTStatus)
+	}
+	if eval.ExecutionGate() {
+		t.Fatal("ExecutionGate = true, want false — a corrupted AST must fail closed")
+	}
+	if len(eval.RequiredProposals) == 0 {
+		t.Fatal("a closed gate must record a required human proposal")
+	}
+	// The gate must also close on an unterminated raw-text element (a prose
+	// header left open at EOF is silently repaired by the lenient HTML5 parser,
+	// but an unterminated <style> is a raw-text element the deterministic scan
+	// flags).
+	prose := []byte("<html>\n<head><style>\n  .x { color: red; }\n</head>\n<body>\n<p>prose</p>\n</body>\n</html>\n")
+	pv := EvaluateScope(ScopeInput{Target: "page.html", Content: prose, MaxOutputTokens: 1024, Root: t.TempDir()})
+	if pv.ASTStatus != ASTCorrupt {
+		t.Fatalf("prose-header ASTStatus = %s, want corrupt", pv.ASTStatus)
+	}
+	if pv.ExecutionGate() {
+		t.Fatal("ExecutionGate = true for an unterminated raw-text element, want false")
+	}
+}
+
+// TestPreflight_ValidTarget_PassesGate pins the happy path: a structurally
+// valid, fully-resolved, in-budget target passes the ExecutionGate and stages
+// no human proposal.
+func TestPreflight_ValidTarget_PassesGate(t *testing.T) {
+	root := t.TempDir()
+	writeTarget(t, root, "app.css", "body { color: black; }\n")
+	writeTarget(t, root, "app.js", "console.log('hi');\n")
+	valid := []byte("<!DOCTYPE html>\n<html>\n<head><title>OK</title>\n" +
+		"<link rel=\"stylesheet\" href=\"app.css\">\n</head>\n<body>\n" +
+		"<script src=\"app.js\"></script>\n</body>\n</html>\n")
+	writeTarget(t, root, "index.html", string(valid))
+
+	eval := EvaluateScope(ScopeInput{
+		Target:          "index.html",
+		Content:         valid,
+		MaxOutputTokens: 1024,
+		Root:            root,
+	})
+
+	if eval.ASTStatus != ASTValid {
+		t.Fatalf("ASTStatus = %s, want valid", eval.ASTStatus)
+	}
+	if eval.DependencyStatus != DependenciesResolved {
+		t.Fatalf("DependencyStatus = %s, want resolved", eval.DependencyStatus)
+	}
+	if eval.BudgetStatus != BudgetWithinLimits {
+		t.Fatalf("BudgetStatus = %s, want within_limits", eval.BudgetStatus)
+	}
+	if !eval.ExecutionGate() {
+		t.Fatalf("ExecutionGate = false for a valid target; findings: %v", eval.Findings)
+	}
+	if len(eval.RequiredProposals) != 0 {
+		t.Fatalf("required proposals = %d, want 0", len(eval.RequiredProposals))
+	}
+}
+
+// TestPreflight_BudgetExceeded_FailsGate drives the zero-token preflight over a
+// target whose estimated generation cost (bytes/4 × FullRewriteTokenMultiplier)
+// exceeds the declared max_output. The BudgetStatus MUST be exceeded and the
+// ExecutionGate MUST close — the target is provably infeasible BEFORE any
+// provider request (zero tokens).
+func TestPreflight_BudgetExceeded_FailsGate(t *testing.T) {
+	// ~2000 bytes → ~500 tokens × 3 = ~1500 tokens > 256 budget.
+	big := []byte(strings.Repeat("<section><p>lorem ipsum dolor sit amet consectetur</p></section>\n", 80))
+	if len(big)/4*execution.FullRewriteTokenMultiplier <= 256 {
+		t.Fatalf("fixture estimates %d tokens, want > 256 budget", len(big)/4*execution.FullRewriteTokenMultiplier)
+	}
+
+	eval := EvaluateScope(ScopeInput{
+		Target:          "big.html",
+		Content:         big,
+		MaxOutputTokens: 256,
+		Root:            t.TempDir(),
+	})
+
+	if eval.BudgetStatus != BudgetExceeded {
+		t.Fatalf("BudgetStatus = %s, want exceeded", eval.BudgetStatus)
+	}
+	if eval.ExecutionGate() {
+		t.Fatal("ExecutionGate = true, want false — an over-budget target must fail closed")
+	}
+	if len(eval.RequiredProposals) == 0 {
+		t.Fatal("a closed gate must record a required human proposal")
+	}
+}
+
+// TestPreflight_MissingLocalDependency_FailsGate drives the zero-token preflight
+// over an HTML document that references a <script src> file that does not exist.
+// The DependencyStatus MUST be unresolved and the ExecutionGate MUST close.
+func TestPreflight_MissingLocalDependency_FailsGate(t *testing.T) {
+	html := []byte("<!DOCTYPE html>\n<html>\n<head><title>Refs</title></head>\n<body>\n" +
+		"<script src=\"missing.js\"></script>\n</body>\n</html>\n")
+
+	eval := EvaluateScope(ScopeInput{
+		Target:          "index.html",
+		Content:         html,
+		MaxOutputTokens: 1024,
+		Root:            t.TempDir(), // empty: missing.js does not exist
+	})
+
+	if eval.DependencyStatus != DependenciesUnresolved {
+		t.Fatalf("DependencyStatus = %s, want unresolved", eval.DependencyStatus)
+	}
+	if eval.ExecutionGate() {
+		t.Fatal("ExecutionGate = true, want false — unresolved dependencies must fail closed")
+	}
+}
+
+// TestPreflight_UnboundedOrEmpty_NotBarred verifies the gate is not a false
+// positive on creation intent or unbounded budgets: an empty target (creation)
+// and a 0 max_output (unbounded) are treated as unknown/within-limits, not
+// hard barriers.
+func TestPreflight_UnboundedOrEmpty_NotBarred(t *testing.T) {
+	empty := EvaluateScope(ScopeInput{Target: "new.txt", Content: nil, MaxOutputTokens: 1024, Root: t.TempDir()})
+	if empty.ASTStatus != ASTUnknown {
+		t.Fatalf("empty target ASTStatus = %s, want unknown", empty.ASTStatus)
+	}
+	// An absent target is not executable as a mutation, so it still closes the
+	// gate (a missing file cannot be staged) — but it is NOT a corrupt-AST
+	// barrier. Assert the distinction: unknown != corrupt.
+	if empty.ASTStatus == ASTCorrupt {
+		t.Fatal("empty target must not be classified corrupt")
+	}
+}

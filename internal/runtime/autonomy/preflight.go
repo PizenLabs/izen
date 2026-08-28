@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
 
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
@@ -189,4 +193,215 @@ func (d *Driver) runPreflight(ctx context.Context, objective, target string, sou
 		diagnosticf("[preflight] Pass 1 manifest returned no mutations — bounded window decomposition")
 	}
 	return stage(fallbackDecompose(objective, target, source, baseDigest, maxOut))
+}
+
+// ── Zero-Token EVALUATING_SCOPE Contract ────────────────────────────────────
+//
+// The Pre-Execution Feasibility Invariant: NO LLM inference, DAG decomposition,
+// manifest generation, or mutation planning may begin until a LOCAL, ZERO-TOKEN
+// preflight establishes that the target context is structurally valid,
+// sufficiently resolved, and executable within the declared budget. Infeasibility
+// detection MUST occur prior to inference — zero LLM tokens may be spent if the
+// target AST is corrupted, dependencies are unresolved, or the budget is
+// exceeded. Enforcement is fail-closed: if ExecutionGate() returns false the
+// engine MUST halt the transition to DECIDING/STAGING and divert to
+// AWAITING_HUMAN_PROPOSAL.
+
+// ASTStatus classifies the target's structural (AST/syntax) validity, judged
+// by the deterministic local validators — never by a model.
+type ASTStatus string
+
+// DependencyStatus classifies whether the target's local file references
+// (<link href="...">, <script src="...">) resolve to existing files.
+type DependencyStatus string
+
+// BudgetStatus classifies whether the estimated generation cost fits the
+// declared output budget.
+type BudgetStatus string
+
+const (
+	// ASTValid: the target parses cleanly under its registered validator.
+	ASTValid ASTStatus = "valid"
+	// ASTCorrupt: the target fails its structural validator (unclosed tags,
+	// non-code prose headers, unterminated raw-text elements, ...).
+	ASTCorrupt ASTStatus = "corrupt"
+	// ASTUnknown: no structural validator serves the target's format, or the
+	// target is empty/absent — the gate cannot prove validity, so it treats
+	// the target as unknown (not a hard failure).
+	ASTUnknown ASTStatus = "unknown"
+
+	// DependenciesResolved: every referenced local file exists.
+	DependenciesResolved DependencyStatus = "resolved"
+	// DependenciesUnresolved: at least one referenced local file is missing.
+	DependenciesUnresolved DependencyStatus = "unresolved"
+
+	// BudgetWithinLimits: the estimated generation cost fits the budget.
+	BudgetWithinLimits BudgetStatus = "within_limits"
+	// BudgetExceeded: the estimated cost exceeds the declared budget.
+	BudgetExceeded BudgetStatus = "exceeded"
+)
+
+// ProposalIntent is a placeholder for a change the evaluation concludes cannot
+// proceed without an explicit human-approved re-scope (a required proposal).
+// The gate treats any non-empty set as a hard barrier: a target that demands a
+// proposal is NOT executable as-is. This is plain data; the autonomy loop
+// renders it on the AWAITING_HUMAN_PROPOSAL boundary.
+type ProposalIntent struct {
+	// Reason is the bounded evidence of WHY a human proposal is required.
+	Reason string `json:"reason"`
+	// Target is the workspace-relative file that needs the proposal.
+	Target string `json:"target"`
+}
+
+// PreflightEvaluation is the Zero-Token EVALUATING_SCOPE verdict. It is built
+// entirely from deterministic local heuristics — never from model inference —
+// so it is the authoritative input to the fail-closed ExecutionGate.
+type PreflightEvaluation struct {
+	Target            string           `json:"target"`
+	ASTStatus         ASTStatus        `json:"ast_status"`
+	DependencyStatus  DependencyStatus `json:"dependency_status"`
+	BudgetStatus      BudgetStatus     `json:"budget_status"`
+	Findings          []string         `json:"findings"`
+	RequiredProposals []ProposalIntent `json:"required_proposals"`
+}
+
+// ExecutionGate is the hard invariant gate. It returns true ONLY when every
+// precondition of safe, bounded execution is provably satisfied locally:
+// the AST is valid, dependencies resolve, the budget fits, and NO human
+// proposal is required. Any other combination is a fail-closed barrier.
+func (e PreflightEvaluation) ExecutionGate() bool {
+	return e.ASTStatus == ASTValid &&
+		e.DependencyStatus == DependenciesResolved &&
+		e.BudgetStatus == BudgetWithinLimits &&
+		len(e.RequiredProposals) == 0
+}
+
+// AddFinding appends a bounded, human-readable evidence line to the verdict.
+func (e *PreflightEvaluation) AddFinding(format string, args ...interface{}) {
+	if e == nil {
+		return
+	}
+	e.Findings = append(e.Findings, fmt.Sprintf(format, args...))
+}
+
+// ScopeInput carries the local facts the zero-token evaluation inspects. All
+// inputs are workspace-local; nothing here invokes a provider.
+type ScopeInput struct {
+	// Target is the workspace-relative path of the file being evaluated.
+	Target string
+	// Content is the raw bytes of the target (nil/empty when the file is
+	// absent or a creation intent).
+	Content []byte
+	// MaxOutputTokens is the declared output budget (0 = unbounded).
+	MaxOutputTokens int
+	// Root is the workspace root used to resolve local file references.
+	Root string
+}
+
+// EstimateScopeTokens computes the estimated generation cost of a target using
+// the SAME canonical accounting as Boundary 2: target_bytes/4 ×
+// FullRewriteTokenMultiplier. A cost that exceeds MaxOutputTokens is provably
+// infeasible BEFORE any provider request (invariant I5, zero-token boundary).
+func EstimateScopeTokens(targetBytes, maxOutputTokens int) (estimated int, exceeded bool) {
+	if targetBytes <= 0 || maxOutputTokens <= 0 {
+		return 0, false // creation / unbounded budget: not provably infeasible
+	}
+	estimated = (targetBytes / 4) * execution.FullRewriteTokenMultiplier
+	return estimated, estimated > maxOutputTokens
+}
+
+// localRefRe matches local file references in HTML documents:
+// <link href="..."> and <script src="...">. Only same-origin relative or
+// root-relative paths are considered resolvable; absolute URLs are skipped.
+var localRefRe = mustCompileLocalRef()
+
+// mustCompileLocalRef builds the local-reference matcher. It captures the
+// href/src attribute value (group 1) for <link> and <script> elements.
+func mustCompileLocalRef() *regexp.Regexp {
+	return regexp.MustCompile(`(?i)<(?:link|script)\b[^>]*\b(?:href|src)\s*=\s*["']([^"']+)["']`)
+}
+
+// EvaluateScope runs the ZERO-TOKEN preflight over one target. It performs only
+// local, deterministic heuristics: AST/syntax validity, local file-reference
+// resolution, and budget estimation. It NEVER issues an LLM call, builds a DAG,
+// or generates a manifest. The returned PreflightEvaluation feeds the
+// fail-closed ExecutionGate.
+func EvaluateScope(in ScopeInput) PreflightEvaluation {
+	eval := PreflightEvaluation{
+		Target:    in.Target,
+		ASTStatus: ASTValid,
+	}
+	if in.Target == "" {
+		eval.ASTStatus = ASTUnknown
+		eval.DependencyStatus = DependenciesResolved
+		eval.BudgetStatus = BudgetWithinLimits
+		eval.AddFinding("no target resolved — scope evaluation deferred")
+		return eval
+	}
+
+	// ── 1. AST / SYNTAX VALIDITY (0 tokens) ────────────────────────────
+	if len(in.Content) == 0 {
+		// Absent/empty target: creation intent or missing file. Not corrupt by
+		// construction, but not provably valid either — an absent target cannot
+		// be executed as a mutation.
+		eval.ASTStatus = ASTUnknown
+		eval.AddFinding("target %q has no content (creation intent or missing file)", in.Target)
+	} else if err := execution.ValidateDocumentSyntax(in.Target, in.Content); err != nil {
+		eval.ASTStatus = ASTCorrupt
+		eval.AddFinding("target %q is structurally corrupt: %v", in.Target, err)
+	}
+
+	// ── 2. LOCAL FILE REFERENCES (0 tokens) ────────────────────────────
+	eval.DependencyStatus = DependenciesResolved
+	for _, ref := range localRefRe.FindAllStringSubmatch(string(in.Content), -1) {
+		path := ref[1]
+		if path == "" || strings.Contains(path, "://") || strings.HasPrefix(path, "//") {
+			continue // absolute or protocol-relative URL: not a local dependency
+		}
+		abs := filepath.Join(in.Root, filepath.FromSlash(strings.TrimPrefix(path, "/")))
+		if _, err := os.Stat(abs); err != nil {
+			eval.DependencyStatus = DependenciesUnresolved
+			eval.AddFinding("target %q references missing local file %q", in.Target, path)
+		}
+	}
+
+	// ── 3. BUDGET ESTIMATION (0 tokens) ────────────────────────────────
+	eval.BudgetStatus = BudgetWithinLimits
+	if estimated, exceeded := EstimateScopeTokens(len(in.Content), in.MaxOutputTokens); exceeded {
+		eval.BudgetStatus = BudgetExceeded
+		eval.AddFinding("target %q estimates ~%d tokens (bytes/4 × %d) but max_output=%d — budget exceeded",
+			in.Target, estimated, execution.FullRewriteTokenMultiplier, in.MaxOutputTokens)
+	}
+
+	// ── FAIL-CLOSED BARRIER ────────────────────────────────────────────
+	// When any precondition fails, a required human proposal is recorded so the
+	// gate can never pass. The engine diverts to AWAITING_HUMAN_PROPOSAL.
+	if !eval.ExecutionGate() {
+		eval.RequiredProposals = append(eval.RequiredProposals, ProposalIntent{
+			Reason: "scope evaluation barrier: " + barrierReason(eval),
+			Target: in.Target,
+		})
+	}
+	return eval
+}
+
+// barrierReason renders a compact bounded summary of why the gate closed.
+func barrierReason(e PreflightEvaluation) string {
+	var parts []string
+	switch e.ASTStatus {
+	case ASTCorrupt:
+		parts = append(parts, "corrupt AST")
+	case ASTUnknown:
+		parts = append(parts, "unverified AST")
+	}
+	if e.DependencyStatus == DependenciesUnresolved {
+		parts = append(parts, "unresolved dependencies")
+	}
+	if e.BudgetStatus == BudgetExceeded {
+		parts = append(parts, "budget exceeded")
+	}
+	if len(parts) == 0 {
+		return "scope not executable as-is"
+	}
+	return strings.Join(parts, ", ")
 }
