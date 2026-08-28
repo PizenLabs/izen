@@ -447,17 +447,17 @@ type RuntimeExecutor struct {
 func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, bus *events.Bus, langID language.ID) *RuntimeExecutor {
 	validator := NewNormalizingArtifactValidator(NewDefaultArtifactValidator()).WithRoot(root)
 	x := &RuntimeExecutor{
-		root:             root,
-		cfg:              cfg,
-		provider:         provider,
-		bus:              bus,
-		langID:           langID,
-		patches:          NewPatchManager(root),
-		admission:        NewAdmissionGateway(nil),
-		contracts:        NewContractRegistry(),
-		occ:              NewOCCVerifier(root),
+		root:              root,
+		cfg:               cfg,
+		provider:          provider,
+		bus:               bus,
+		langID:            langID,
+		patches:           NewPatchManager(root),
+		admission:         NewAdmissionGateway(nil),
+		contracts:         NewContractRegistry(),
+		occ:               NewOCCVerifier(root),
 		artifactValidator: validator,
-		pending:          make(map[string]*pendingMutation),
+		pending:           make(map[string]*pendingMutation),
 	}
 	if langID != "" {
 		x.verifier = NewLanguageVerifier(root, langID)
@@ -1881,7 +1881,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
 				}
 				if errors.Is(err, ErrFormatRejected) {
-					gate := v3Artifact.ValidateContent(target, []byte(modified), 0)
+					gate := v3Artifact.ValidateContent(target, []byte(modified), 0) //nolint:contextcheck // artifact validation is pure content checking, no context needed
 					if !gate.Passed && gate.Decision == policy.DecisionRetry {
 						// AST STRUCTURAL AUDIT FEEDBACK: surface the exact line +
 						// parse error of the V3 pipeline rejection into the retry

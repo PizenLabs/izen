@@ -14,9 +14,9 @@ import (
 // rejection maps to a single canonical failure subtype and therefore to a
 // single recovery decision.
 //
-//   ErrFormatRejected    raw bytes carry no valid artifact contract
-//   ErrAmbiguousAnchor   SEARCH anchor matches zero or multiple regions
-//   ErrScopeViolation    patch escapes its declared target / region
+//	ErrFormatRejected    raw bytes carry no valid artifact contract
+//	ErrAmbiguousAnchor   SEARCH anchor matches zero or multiple regions
+//	ErrScopeViolation    patch escapes its declared target / region
 var (
 	ErrFormatRejected  = errors.New("artifact: format rejected — no valid contract")
 	ErrAmbiguousAnchor = errors.New("artifact: ambiguous anchor — SEARCH matches zero or multiple regions")

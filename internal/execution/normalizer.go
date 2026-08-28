@@ -364,7 +364,7 @@ func ResolveAnchors(searchLines []string, targetContent string) (int, int, error
 	targetLines := strings.Split(targetContent, "\n")
 	n := len(searchLines)
 	var exact []int
-	for i := 0; i+ n <= len(targetLines); i++ {
+	for i := 0; i+n <= len(targetLines); i++ {
 		match := true
 		for j := 0; j < n; j++ {
 			if targetLines[i+j] != searchLines[j] {
@@ -494,7 +494,7 @@ func synthesizePatch(targetContent, newContent string) ([]byte, error) {
 	ops := backtrack(dp, origLines, newLines)
 
 	type hunk struct {
-		deletes []string
+		deletes   []string
 		inserts   []string
 		origStart int
 	}
@@ -613,19 +613,21 @@ func lcs(a, b []string) [][]int {
 func backtrack(dp [][]int, a, b []string) []op {
 	i, j := len(a), len(b)
 	var rev []op
+backtrackLoop:
 	for i > 0 || j > 0 {
-		if i > 0 && j > 0 && a[i-1] == b[j-1] {
+		switch {
+		case i > 0 && j > 0 && a[i-1] == b[j-1]:
 			rev = append(rev, op{typ: "equal", line: a[i-1]})
 			i--
 			j--
-		} else if j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]) {
+		case j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]):
 			rev = append(rev, op{typ: "insert", line: b[j-1]})
 			j--
-		} else if i > 0 && (j == 0 || dp[i][j-1] < dp[i-1][j]) {
+		case i > 0 && (j == 0 || dp[i][j-1] < dp[i-1][j]):
 			rev = append(rev, op{typ: "delete", line: a[i-1]})
 			i--
-		} else {
-			break
+		default:
+			break backtrackLoop
 		}
 	}
 	// reverse
