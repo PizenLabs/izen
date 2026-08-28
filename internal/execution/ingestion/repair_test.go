@@ -81,13 +81,15 @@ func TestRepairCandidate_ScriptUnclosedGeneratesCandidate(t *testing.T) {
 }
 
 // Test 2: Unrecoverable syntax errors return no repair candidate and reject immediately.
+// Residual markdown fence wrappers are NOT unrecoverable: NormalizeTransport
+// strips a malformed/unterminated wrapper (transport artifact) before envelope
+// validation, so a fenced payload always normalizes. Genuine semantic envelope
+// failures (unclosed structural tags) are the unrecoverable class.
 func TestRepairCandidate_UnrecoverableNoCandidate(t *testing.T) {
 	ResetRepairMetrics()
 	tests := []string{
-		"",                        // empty payload
-		"   \n  ",                 // whitespace only
-		"```\nunterminated fence", // residual fence
-		"```html\nhello\n",        // residual fence with language hint
+		"",        // empty payload
+		"   \n  ", // whitespace only
 	}
 	for _, raw := range tests {
 		trace, err := Process(raw)
@@ -99,6 +101,31 @@ func TestRepairCandidate_UnrecoverableNoCandidate(t *testing.T) {
 		}
 		if trace.RepairCandidate != nil {
 			t.Fatalf("Process(%q) should return no RepairCandidate for unrecoverable error, got %+v", raw, trace.RepairCandidate)
+		}
+	}
+	// Malformed/unterminated markdown fences are TRANSPORT artifacts and are
+	// sanitized away (never a terminal syntax error).
+	recoverable := []struct {
+		raw  string
+		want string
+	}{
+		{"```\nunterminated fence", "unterminated fence"},
+		{"```html\nhello\n", "hello"},
+		{"```json\n{\"a\": 1}\n", `{"a": 1}`},
+	}
+	for _, c := range recoverable {
+		trace, err := Process(c.raw)
+		if err != nil {
+			t.Fatalf("Process(%q) = %v, want nil (malformed fence is a transport artifact)", c.raw, err)
+		}
+		if trace.Classification == ClassSyntaxInvalid {
+			t.Fatalf("Process(%q) classified %s, want valid after transport sanitization", c.raw, trace.Classification)
+		}
+		if strings.Contains(trace.NormalizedPayload, "```") {
+			t.Fatalf("Process(%q) left a fence marker: %q", c.raw, trace.NormalizedPayload)
+		}
+		if strings.TrimSpace(trace.NormalizedPayload) != c.want {
+			t.Fatalf("Process(%q) normalized = %q, want %q", c.raw, trace.NormalizedPayload, c.want)
 		}
 	}
 	// Excessive unclosed tags beyond safety threshold also yields no candidate

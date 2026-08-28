@@ -90,14 +90,17 @@ func TestRepairCandidateAccepted_LeavesForensicAuditTrail(t *testing.T) {
 	}
 }
 
-// TestRepairCandidate_UnrecoverableReturnsNoCandidate ensures unrecoverable
-// syntax errors return no repair candidate and reject immediately.
+// TestRepairCandidate_UnrecoverableReturnsNoCandidate ensures genuinely
+// unrecoverable syntax errors (an empty generation) return no repair candidate
+// and reject immediately. Malformed markdown fences are NOT in this class: they
+// are transport artifacts that NormalizeTransport sanitizes away before envelope
+// validation, so the executor never raises a terminal syntax error for them.
 func TestRepairCandidate_UnrecoverableExecutorRejects(t *testing.T) {
 	ingestion.ResetRepairMetrics()
 	root := t.TempDir()
 	writeTarget(t, root, "index.html", validHTML)
-	// Unrecoverable: empty / whitespace / residual fence.
-	malformed := "```\nunterminated fence"
+	// Unrecoverable: an empty generation carries no artifact to repair or extract.
+	malformed := ""
 	mock := &mockProvider{responses: []*ai.Response{{Content: malformed, Usage: reproUsage}}}
 	x := testExecutor(t, root, mock, events.NewBus(events.DefaultBufferSize))
 

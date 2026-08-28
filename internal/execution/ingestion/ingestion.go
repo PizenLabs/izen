@@ -3,6 +3,7 @@ package ingestion
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -39,6 +40,26 @@ func Process(rawOutput string) (*IngestionTrace, error) {
 		if candidate := ProposeRepair(normalized); candidate != nil {
 			trace.RepairCandidate = candidate
 			RecordRepairGenerated()
+		}
+		// TRANSPORT FALLBACK (last resort): if the envelope failure is caused by
+		// RESIDUAL TRANSPORT ARTIFACTS — an unterminated fence or stray closer
+		// that NormalizeTransport could not close — extract the raw response
+		// content and re-classify before declaring the payload syntactically
+		// invalid. Genuine semantic envelope failures (unclosed structural tags)
+		// carry no fence residue and never reach this path: they are rejected to
+		// the contract retry loop exactly as before.
+		if strings.Contains(normalized, "```") {
+			if extracted := extractTransportContent(rawOutput); extracted != "" && extracted != normalized {
+				trace.NormalizedPayload = extracted
+				trace.Steps = append(trace.Steps, NormalizationStep{
+					Kind:   "extract_raw_content",
+					Detail: "re-extracted raw response content after residual transport markers",
+				})
+				if re := Classify(extracted, trace.Steps); re != ClassSyntaxInvalid {
+					trace.Classification = re
+					return trace, nil
+				}
+			}
 		}
 		return trace, fmt.Errorf("%w: transport normalization produced a syntactically invalid payload", ErrSyntaxInvalid)
 	}

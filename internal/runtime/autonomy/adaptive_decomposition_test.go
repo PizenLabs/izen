@@ -2,10 +2,12 @@ package autonomy
 
 import (
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/PizenLabs/izen/internal/execution/ingestion"
 	"github.com/PizenLabs/izen/internal/execution/planner"
 )
 
@@ -284,5 +286,200 @@ func TestAdaptiveDecompose_GoFunctionsSemanticBoundary(t *testing.T) {
 		if strings.HasPrefix(st.Description, "lines ") {
 			t.Errorf("Go sub-task %s description %q is line-range, want function symbol", st.ID, st.Description)
 		}
+	}
+}
+
+// strictPruneFixture builds a 136-line HTML document whose FIRST 78 lines are
+// an untouched wrapper/anatomy zone (a <div id="shell"> container, header/nav
+// and filler content) and whose lines 79-133 carry EXACTLY THREE mutated AST
+// sections (<section id="a">, #b, #c). The wrapper is a single top-level Lea
+// unit that merely CONTAINS the mutated nodes — the exact shape that lets a
+// naive slice of the kept wrapper leak line-bound sub-tasks over lines 1-78.
+func strictPruneFixture() []byte {
+	var b strings.Builder
+	b.WriteString("<!DOCTYPE html>\n")        // 1
+	b.WriteString("<html>\n")                 // 2
+	b.WriteString("<head>\n")                 // 3
+	b.WriteString("<title>fixture</title>\n") // 4
+	b.WriteString("</head>\n")                // 5
+	b.WriteString("<body>\n")                 // 6
+	b.WriteString("<div id=\"shell\">\n")     // 7
+	b.WriteString("<header id=\"nav\">\n")    // 8
+	b.WriteString("<h1>Nav</h1>\n")           // 9
+	// Lines 10-78: unmapped filler inside the wrapper (no mutation targets them).
+	for i := 10; i <= 78; i++ {
+		b.WriteString("<p>unmapped filler line ")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString("</p>\n")
+	}
+	// Lines 79-133: the three AST mutation targets.
+	b.WriteString("<section id=\"a\">\n") // 79
+	for i := 80; i <= 96; i++ {
+		b.WriteString("<p>a content ")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString("</p>\n")
+	}
+	b.WriteString("</section>\n") // 97
+	b.WriteString("<section id=\"b\">\n")
+	for i := 99; i <= 115; i++ {
+		b.WriteString("<p>b content ")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString("</p>\n")
+	}
+	b.WriteString("</section>\n") // 116
+	b.WriteString("<section id=\"c\">\n")
+	for i := 118; i <= 132; i++ {
+		b.WriteString("<p>c content ")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString("</p>\n")
+	}
+	b.WriteString("</section>\n") // 133
+	b.WriteString("</div>\n")
+	b.WriteString("</body>\n")
+	b.WriteString("</html>\n")
+	return []byte(b.String())
+}
+
+// firstLineOf returns the 1-indexed line on which the exact substring first
+// occurs, or -1 when absent.
+func firstLineOf(content, needle string) int {
+	for i, line := range strings.Split(content, "\n") {
+		if strings.Contains(line, needle) {
+			return i + 1
+		}
+	}
+	return -1
+}
+
+// TestDecomposition_StrictUnmappedLinePruning asserts the ZERO UNMAPPED LINE
+// TASK invariant: a file whose lines 1-78 carry no manifest mutation and whose
+// lines 79-133 carry three AST mutations must stage strictly <= 3 sub-tasks,
+// all of them directly on the mutation surface. Lines 1-78 (and the wrapper
+// that merely CONTAINS the mutations) are completely omitted — the AST
+// fallback slicer must never convert the unmapped range into line-bound
+// sub-tasks like "lines 1-4" or "lines 77-78".
+func TestDecomposition_StrictUnmappedLinePruning(t *testing.T) {
+	source := strictPruneFixture()
+	lines := len(strings.Split(strings.TrimSuffix(string(source), "\n"), "\n"))
+	if lines != 136 {
+		t.Fatalf("fixture line count = %d, want 136 (lines 1-78 unmapped, 79-133 mutated)", lines)
+	}
+	// Sanity: the mutated sections open at exactly lines 79/98/117.
+	for tag, wantLine := range map[string]int{"<section id=\"a\">": 79, "<section id=\"b\">": 98, "<section id=\"c\">": 117} {
+		if line := firstLineOf(string(source), tag); line != wantLine {
+			t.Fatalf("%s opens at line %d, want %d", tag, line, wantLine)
+		}
+	}
+
+	manifest := &MutationManifest{
+		TargetFile: "index.html",
+		Intent:     "modify three sections",
+		Mutations: []MutationSpec{
+			{Selector: "#a", Action: "modify", EstimatedLines: 60},
+			{Selector: "#b", Action: "modify", EstimatedLines: 60},
+			{Selector: "#c", Action: "modify", EstimatedLines: 60},
+		},
+	}
+	const maxOutput = 2048
+	if s := EstimateMutationSurface(manifest, source); s <= maxOutput {
+		t.Fatalf("surface %d must exceed max_output %d to force decomposition", s, maxOutput)
+	}
+	dag, err := AdaptiveDecompose("modify @index.html", "index.html", source, "digest", maxOutput, manifest)
+	if err != nil {
+		t.Fatalf("AdaptiveDecompose: %v", err)
+	}
+	if !dag.ManifestScoped {
+		t.Fatal("plan must be manifest-scoped")
+	}
+	// INVARIANT: strictly <= 3 sub-tasks — the 3 mutation surfaces, nothing else.
+	if len(dag.SubTasks) > 3 {
+		t.Fatalf("sub-tasks = %d, want <= 3 (zero unmapped line windows staged)", len(dag.SubTasks))
+	}
+	// INVARIANT: lines 1-78 are COMPLETELY omitted — every staged region sits
+	// inside the mutated span 79-133.
+	seen := map[planner.Region]bool{}
+	for _, st := range dag.SubTasks {
+		if st.Region.StartLine < 79 || st.Region.EndLine > 133 {
+			t.Fatalf("sub-task %s region %s covers unmapped lines — lines 1-78 must be omitted",
+				st.ID, st.Region)
+		}
+		seen[st.Region] = true
+	}
+	// The three mutation sections must actually be staged.
+	for _, want := range []planner.Region{
+		{StartLine: 79, EndLine: 97},
+		{StartLine: 98, EndLine: 116},
+		{StartLine: 117, EndLine: 133},
+	} {
+		if !seen[want] {
+			t.Fatalf("mutation section %s not staged; staged regions = %v", want, seen)
+		}
+	}
+	// No sub-task may be a pure line-window over an untouched block.
+	for _, st := range dag.SubTasks {
+		if strings.HasPrefix(st.Description, "lines ") {
+			t.Errorf("sub-task %s description %q is a raw line-range over unmapped lines", st.ID, st.Description)
+		}
+	}
+	if err := dag.Validate(); err != nil {
+		t.Fatalf("DAG Validate: %v", err)
+	}
+}
+
+// TestIngestion_SanitizeMalformedTransportEnvelope asserts TRANSPORT LAYER
+// RESILIENCE: a raw LLM frame wrapped in MALFORMED triple-backticks (an
+// unterminated opening fence, a closer that lost a tick, or a payload whose
+// quotes arrived transport-escaped) must be sanitized BEFORE envelope
+// validation. Envelope normalization succeeds — Process must NEVER return the
+// terminal "transport normalization produced a syntactically invalid payload"
+// error for a wrapper that simply failed to close.
+func TestIngestion_SanitizeMalformedTransportEnvelope(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "unterminated opening fence",
+			raw:  "```html\n<html>\n  <body>hello</body>\n</html>\n",
+		},
+		{
+			name: "closing fence lost a backtick",
+			raw:  "```html\n<html>\n  <body>hello</body>\n</html>\n``",
+		},
+		{
+			name: "escaped quotes + json fence",
+			raw:  "```json\n{\"mutations\": [{\"a\": 1}]}\n```\n",
+		},
+		{
+			name: "prose around an unterminated fence",
+			raw:  "Here is the fixed markup:\n```html\n<html><body>ok</body></html>\n",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			trace, err := ingestion.Process(c.raw)
+			if err != nil {
+				t.Fatalf("Process(%q) returned error %v — envelope normalization must succeed after transport sanitization", c.raw, err)
+			}
+			if errors.Is(err, ingestion.ErrSyntaxInvalid) {
+				t.Fatalf("Process(%q) raised the terminal syntax-invalid error", c.raw)
+			}
+			if trace == nil {
+				t.Fatal("Process returned a nil trace")
+			}
+			if trace.Classification == ingestion.ClassSyntaxInvalid {
+				t.Fatalf("classification = %s, want a valid class after transport sanitization", trace.Classification)
+			}
+			if strings.Contains(trace.NormalizedPayload, "```") {
+				t.Fatalf("normalized payload still carries a fence marker: %q", trace.NormalizedPayload)
+			}
+			if strings.TrimSpace(trace.NormalizedPayload) == "" {
+				t.Fatalf("normalized payload emptied by sanitization: %q", trace.RawOutput)
+			}
+			// Raw output is preserved verbatim for forensics.
+			if trace.RawOutput != c.raw {
+				t.Fatalf("RawOutput not preserved: got %q want %q", trace.RawOutput, c.raw)
+			}
+		})
 	}
 }

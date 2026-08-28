@@ -158,6 +158,13 @@ func singleTaskDAG(objective, target string, source []byte, baseDigest string, m
 //     scheduled, because a sub-task over an untouched block can only evaluate
 //     to no_op_objective_satisfied (zero API calls wasted on no-ops).
 //
+// STRICT MANIFEST SCOPING: when a unit matches a mutation only through a
+// contained topology node, it collapses to the matching nodes themselves, so an
+// oversized wrapper region is never sliced into unmapped line windows. The
+// staged DAG is then pruned AGAIN at the line-range granularity: any sub-task
+// whose window intersects no mutation is dropped. ManifestScoped DAGs therefore
+// stage ZERO unmapped line tasks by construction.
+//
 // Asserted invariant: no sub-task is ever created solely to evaluate to
 // no_op_objective_satisfied. When the manifest is nil or empty, or the scan
 // yields no trustworthy topology, decomposition degrades to the canonical
@@ -183,13 +190,31 @@ func semanticDecompose(objective, target string, source []byte, baseDigest strin
 		// inspection keeps the objective reachable without re-slicing lines.
 		return singleTaskDAG(objective, target, source, baseDigest, maxOutputTokens, manifest, planner.SubTaskBudget(maxOutputTokens))
 	}
+	// STRICT MANIFEST SCOPING — collapse every kept unit that matched a mutation
+	// ONLY through a contained topology node down to the matching nodes
+	// themselves. A wrapper unit kept this way (e.g. <div#shell> merely
+	// CONTAINING <section id="a">) is oversized relative to the real mutation
+	// surface: staging it as-is would let the line-slicer fallback cut it into
+	// windows over UNMAPPED lines. After collapsing, every staged unit sits
+	// directly on the manifest's mutation surface.
+	kept = refineToMutationNodes(kept, manifest, scan)
 	dag, err := planner.StageSemanticSections(objective, target, source, baseDigest, maxOutputTokens, kept)
 	if err != nil {
 		return nil, err
 	}
-	diagnosticf("[preflight] semantic pruning kept %d/%d blocks (manifest mutations=%d) — %d sub-task(s), zero no-op-only units",
-		len(kept), len(sections), len(manifest.Mutations), len(dag.SubTasks))
-	return dag, nil
+	// STRICT UNMAPPED LINE-RANGE PRUNING — defense in depth over the STAGED
+	// DAG: any sub-task whose line window intersects no manifest mutation (a
+	// fallback line-range slice over an untouched block) is dropped, then the
+	// plan is renumbered and re-validated. Zero unmapped line tasks may ever be
+	// staged into a ManifestScoped DAG.
+	pruned, err := pruneUnmappedSubTasks(dag, manifest, scan, sections)
+	if err != nil {
+		diagnosticf("[preflight] strict manifest pruning emptied the staged plan — single bounded unit fallback")
+		return singleTaskDAG(objective, target, source, baseDigest, maxOutputTokens, manifest, planner.SubTaskBudget(maxOutputTokens))
+	}
+	diagnosticf("[preflight] semantic pruning kept %d/%d blocks (manifest mutations=%d) — %d sub-task(s), zero no-op-only units, zero unmapped line windows",
+		len(kept), len(sections), len(manifest.Mutations), len(pruned.SubTasks))
+	return pruned, nil
 }
 
 // semanticCandidateSections returns the AST/semantic blocks a manifest may
@@ -297,6 +322,125 @@ func normalizeMutationTarget(s string) string {
 // regionsOverlap reports whether two inclusive 1-indexed intervals intersect.
 func regionsOverlap(aStart, aEnd, bStart, bEnd int) bool {
 	return aStart <= bEnd && bStart <= aEnd
+}
+
+// refineToMutationNodes enforces STRICT manifest scoping on the kept semantic
+// units. A unit that matched a mutation ONLY through a contained topology node
+// (e.g. a whole-document wrapper <div#shell> that merely CONTAINS
+// <section id="a">) is collapsed into the matching nodes themselves. Staging
+// the oversized wrapper as-is would let the line-slicer fallback cut it into
+// windows over UNMAPPED lines; collapsing keeps every staged region directly on
+// the manifest's mutation surface. Units that match by LABEL are the mutation
+// surface already and pass through untouched.
+func refineToMutationNodes(kept []planner.Section, manifest *MutationManifest, scan *planner.LeaScanReport) []planner.Section {
+	if scan == nil {
+		return kept // AST-fallback units match by label only: nothing to collapse
+	}
+	var out []planner.Section
+	seen := make(map[planner.Region]bool, len(kept))
+	for _, u := range kept {
+		if labelMatched(manifest, u) {
+			out = append(out, u)
+			continue
+		}
+		for _, mut := range manifest.Mutations {
+			for i := range scan.Nodes {
+				n := &scan.Nodes[i]
+				if !nodeMatchesMutation(*n, mut) ||
+					!regionsOverlap(u.Region.StartLine, u.Region.EndLine, n.StartLine, n.EndLine) {
+					continue
+				}
+				r := planner.Region{StartLine: n.StartLine, EndLine: n.EndLine}
+				if seen[r] {
+					continue
+				}
+				seen[r] = true
+				out = append(out, planner.Section{Region: r, Label: planner.NodeIdentity(*n)})
+			}
+		}
+	}
+	return out
+}
+
+// labelMatched reports whether any mutation's selector/symbol matches the unit
+// by structural identity — the unit IS the mutation surface.
+func labelMatched(manifest *MutationManifest, u planner.Section) bool {
+	for _, mut := range manifest.Mutations {
+		if unitMatchesMutation(u, mut) {
+			return true
+		}
+	}
+	return false
+}
+
+// pruneUnmappedSubTasks enforces the STRICT ManifestScoped invariant on the
+// STAGED DAG: every sub-task region must intersect at least one manifest
+// mutation surface (a label-matched semantic section or a matched topology
+// node). A fallback line-range window sliced from an oversized kept unit that
+// carries NO mutation is dropped — a sub-task over an untouched block could
+// only evaluate to no_op_objective_satisfied. The surviving sub-tasks are
+// renumbered into a contiguous 1..n plan and re-validated.
+func pruneUnmappedSubTasks(dag *planner.ExecutionDAG, manifest *MutationManifest, scan *planner.LeaScanReport, sections []planner.Section) (*planner.ExecutionDAG, error) {
+	surfaces := mutationSurfaceRegions(manifest, scan, sections)
+	if len(surfaces) == 0 {
+		return dag, nil // no surface evidence: keep the staged plan as-is
+	}
+	kept := make([]planner.SubTask, 0, len(dag.SubTasks))
+	for _, st := range dag.SubTasks {
+		if regionIntersectsAny(st.Region, surfaces) {
+			kept = append(kept, st)
+		}
+	}
+	if len(kept) == 0 {
+		return nil, fmt.Errorf("all %d staged manifest-scoped sub-tasks were unmapped", len(dag.SubTasks))
+	}
+	for i := range kept {
+		kept[i].ID = fmt.Sprintf("st-%d", i+1)
+		kept[i].Index = i + 1
+		if i > 0 {
+			kept[i].Dependencies = []string{kept[i-1].ID}
+		} else {
+			kept[i].Dependencies = nil
+		}
+	}
+	dag.SubTasks = kept
+	if err := dag.Validate(); err != nil {
+		return nil, err
+	}
+	return dag, nil
+}
+
+// mutationSurfaceRegions collects the line regions of every manifest mutation:
+// the label-matched semantic sections and the matched topology nodes. A staged
+// sub-task is "mapped" exactly when its region intersects one of these.
+func mutationSurfaceRegions(manifest *MutationManifest, scan *planner.LeaScanReport, sections []planner.Section) []planner.Region {
+	var out []planner.Region
+	for _, mut := range manifest.Mutations {
+		for _, s := range sections {
+			if unitMatchesMutation(s, mut) {
+				out = append(out, s.Region)
+			}
+		}
+		if scan != nil {
+			for i := range scan.Nodes {
+				n := &scan.Nodes[i]
+				if nodeMatchesMutation(*n, mut) {
+					out = append(out, planner.Region{StartLine: n.StartLine, EndLine: n.EndLine})
+				}
+			}
+		}
+	}
+	return out
+}
+
+// regionIntersectsAny reports whether r overlaps any region in the set.
+func regionIntersectsAny(r planner.Region, regions []planner.Region) bool {
+	for _, o := range regions {
+		if regionsOverlap(r.StartLine, r.EndLine, o.StartLine, o.EndLine) {
+			return true
+		}
+	}
+	return false
 }
 
 // Proposal returns the parked DECOMPOSITION_PROPOSAL plan, or nil while no
