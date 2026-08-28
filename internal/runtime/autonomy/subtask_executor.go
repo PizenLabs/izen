@@ -51,7 +51,9 @@ const noOpSentinel = "NO_CHANGES_REQUIRED"
 // mutation example and one NO-OP sentinel example — so weak/free-tier models
 // (finish_reason="stop" + prose) cannot claim ambiguity about what to emit
 // when their slice needs no change.
-const patchContractBlock = "CRITICAL: Output MUST use exact SEARCH/REPLACE block format:\n" +
+const patchContractBlock = "CRITICAL: DO NOT REWRITE THE FULL FILE/SECTION. Return STRICTLY targeted <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE blocks only for the exact lines needing change.\n" +
+	"\n" +
+	"CRITICAL: Output MUST use exact SEARCH/REPLACE block format:\n" +
 	"<<<<<<< SEARCH\n" +
 	"[exact content from target lines]\n" +
 	"=======\n" +
@@ -74,8 +76,11 @@ const patchContractBlock = "CRITICAL: Output MUST use exact SEARCH/REPLACE block
 
 // requiresPatchContract reports whether the sub-task's split kind is bound to
 // the explicit line-interval SEARCH_REPLACE_BOUNDED_LINES mutation contract.
+// Every sub-task — a bounded fallback window OR a manifest-scoped semantic
+// block — executes under the executor's bounded-patch protocol, so both carry
+// the strict delta-format contract that forbids full-file rewrites.
 func requiresPatchContract(kind planner.SplitKind) bool {
-	return kind == planner.SplitBoundedLines
+	return kind == planner.SplitBoundedLines || kind == planner.SplitSemantic
 }
 
 // injectPatchContract appends the strict artifact-formatting contract when the
@@ -104,7 +109,10 @@ func retryEvidenceSignal(st planner.SubTask, o autonomy.Observation, attempt int
 
 // retryDirective builds the self-correction context appended to a retry
 // attempt's prompt: what was rejected, the concrete validation error, and the
-// strict block contract restated verbatim.
+// strict block contract restated verbatim. A structural audit rejection
+// (unterminated <script>, unbalanced HTML) is rewritten into the AST-aware
+// [CONTRACT FAILURE] Line <N>: <ParseError> directive so the successor
+// anchors its correction at the exact defect instead of resending raw code.
 func retryDirective(st planner.SubTask, o autonomy.Observation, attempt int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
@@ -112,7 +120,7 @@ func retryDirective(st planner.SubTask, o autonomy.Observation, attempt int) str
 		attempt, maxSubTaskAttempts, st.ID, o.Outcome)
 	if detail := strings.TrimSpace(o.Diagnostic); detail != "" {
 		b.WriteString("\nValidation error: ")
-		b.WriteString(detail)
+		b.WriteString(execution.StructuralAuditDirective(detail))
 	}
 	b.WriteString("\n")
 	b.WriteString(patchContractBlock)

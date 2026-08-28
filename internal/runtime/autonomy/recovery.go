@@ -249,10 +249,15 @@ func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.Loo
 		next.RecoveryReason = fmt.Sprintf(
 			"schema_violation: artifact rejected for %s (attempt %d) — rotated bounded window",
 			target, o.AttemptNum)
+		// AST-AWARE RETRY CONTEXT: a structural audit rejection (unterminated
+		// <script>, unbalanced HTML) is injected as the exact [CONTRACT FAILURE]
+		// Line <N>: <ParseError> directive — never the rejected raw code — so
+		// the successor attempt fixes the real defect at its precise line.
+		audit := execution.StructuralAuditDirective(o.Diagnostic)
 		next.Evidence = joinEvidence(req.Evidence, fmt.Sprintf(
-			"[DIAGNOSTIC subtype=SCHEMA_VIOLATION boundary=B4-artifact-gate target=%s] "+
-				"Rejected artifact isolated; produce exactly one anchored SEARCH/REPLACE block.",
-			target))
+			"[DIAGNOSTIC subtype=SCHEMA_VIOLATION boundary=B4-artifact-gate target=%s] %s "+
+				"Produce exactly one anchored SEARCH/REPLACE block.",
+			target, audit))
 		if next.ParentContractID == "" && o.ContractID != "" && next.RecoveryStrategy == autonomy.StrategyBoundedPatch {
 			next.ParentContractID = o.ContractID
 		}

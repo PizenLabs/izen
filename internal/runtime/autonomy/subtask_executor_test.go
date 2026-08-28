@@ -31,6 +31,8 @@ func TestSubTaskPromptInjectsStrictPatchContractForBoundedLines(t *testing.T) {
 	}
 	got := subTaskPrompt("restyle every row @page.html", dag, st, 1, 3, nil)
 	for _, want := range []string{
+		"CRITICAL: DO NOT REWRITE THE FULL FILE/SECTION.",
+		"Return STRICTLY targeted <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE blocks only for the exact lines needing change.",
 		"CRITICAL: Output MUST use exact SEARCH/REPLACE block format:",
 		"<<<<<<< SEARCH",
 		"[exact content from target lines]",

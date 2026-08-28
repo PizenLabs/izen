@@ -51,6 +51,14 @@ type Driver struct {
 	// dag is the most recently staged/executed decomposition plan.
 	dag *planner.ExecutionDAG
 
+	// manifestPass is the automatic Pass 1 manifest generator (read-only). When
+	// wired, a preflight-infeasible target triggers a lightweight manifest
+	// request BEFORE the DAG strategy is determined, so the plan is scoped to
+	// the mutation surface instead of a naive line slicer. Nil disables the
+	// auto-hook (backward-compatible test/CLI paths keep deterministic
+	// decomposition).
+	manifestPass ManifestPassFunc
+
 	// globalVerify is the POST-DAG GLOBAL STRUCTURAL VERIFIER: after every
 	// sub-task of a proposal DAG applied, it audits the whole mutated
 	// document against the pre-DAG baseline. A failed audit overrides the
@@ -124,6 +132,16 @@ func WithStreamCallback(cb execution.StreamCallback) Option {
 // expansion existed.
 func WithDecompose(f DecomposeFunc) Option {
 	return func(d *Driver) { d.decompose = f }
+}
+
+// WithManifestPass wires the automatic Pass 1 manifest generator into the
+// preflight autonomy loop. When wired, a preflight-infeasible target first
+// issues a lightweight READ-ONLY manifest request (ExecuteManifestPass) and
+// feeds the parsed manifest into AdaptiveDecompose, so the staged DAG is
+// scoped to the mutation surface. Passing nil disables the auto-hook and keeps
+// the deterministic decompose fallback (the pre-expansion behavior).
+func WithManifestPass(f ManifestPassFunc) Option {
+	return func(d *Driver) { d.manifestPass = f }
 }
 
 // WithPreflightBarrier wires the PreflightSyncBarrier that gates observing ->
@@ -492,7 +510,7 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// user's explicit re-scope decision is never pre-empted.
 			if decision.Action == autonomy.LoopAskHuman &&
 				d.obs.Outcome == autonomy.OutcomePreflightInfeasible &&
-				d.stageDecomposition() {
+				d.stageDecomposition(ctx) {
 				return d.term(), nil
 			}
 			if _, err := d.step(ctx, decision); err != nil {

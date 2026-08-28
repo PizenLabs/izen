@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -418,6 +419,18 @@ type RuntimeExecutor struct {
 	// fingerprints the resolved targets at admission and re-validates them
 	// immediately before the commit pipeline writes anything.
 	occ *OCCVerifier
+	// artifactValidator is the explicit boundary that parses and validates
+	// mutation artifacts. It is injected so P1 NormalizingValidator decorators
+	// can wrap it without modifying execution loops.
+	artifactValidator ArtifactValidator
+	// mutationBoundary is the explicit workspace-integrity assertion surface
+	// used after any rollback to cryptographically verify base digest recovery.
+	mutationBoundary MutationBoundary
+	// manifestSystemPromptOverride, when non-empty, replaces the default Pass 1
+	// manifest system prompt. The autonomy layer injects the compact manifest
+	// prompt (buildManifestPrompt) at bootstrap via SetManifestSystemPrompt; a
+	// direct InvokeManifestPass call without injection keeps the default.
+	manifestSystemPromptOverride string
 
 	mu      sync.Mutex
 	pending map[string]*pendingMutation
@@ -432,17 +445,19 @@ type RuntimeExecutor struct {
 // makes model-required strategies fail with a deterministic error (the runtime
 // still resolves deterministic strategies without a provider).
 func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, bus *events.Bus, langID language.ID) *RuntimeExecutor {
+	validator := NewNormalizingArtifactValidator(NewDefaultArtifactValidator()).WithRoot(root)
 	x := &RuntimeExecutor{
-		root:      root,
-		cfg:       cfg,
-		provider:  provider,
-		bus:       bus,
-		langID:    langID,
-		patches:   NewPatchManager(root),
-		admission: NewAdmissionGateway(nil),
-		contracts: NewContractRegistry(),
-		occ:       NewOCCVerifier(root),
-		pending:   make(map[string]*pendingMutation),
+		root:              root,
+		cfg:               cfg,
+		provider:          provider,
+		bus:               bus,
+		langID:            langID,
+		patches:           NewPatchManager(root),
+		admission:         NewAdmissionGateway(nil),
+		contracts:         NewContractRegistry(),
+		occ:               NewOCCVerifier(root),
+		artifactValidator: validator,
+		pending:           make(map[string]*pendingMutation),
 	}
 	if langID != "" {
 		x.verifier = NewLanguageVerifier(root, langID)
@@ -480,6 +495,38 @@ func (x *RuntimeExecutor) OCC() *OCCVerifier { return x.occ }
 // SetVerifier overrides the attached verifier (test seam / config wiring).
 func (x *RuntimeExecutor) SetVerifier(v *Verifier) {
 	x.verifier = v
+}
+
+// SetArtifactValidator replaces the artifact validator (P1 extension seam).
+// A nil value restores the default validator.
+func (x *RuntimeExecutor) SetArtifactValidator(v ArtifactValidator) {
+	if v == nil {
+		v = NewDefaultArtifactValidator()
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.artifactValidator = v
+}
+
+// ArtifactValidator returns the currently wired artifact validator.
+func (x *RuntimeExecutor) ArtifactValidator() ArtifactValidator {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.artifactValidator
+}
+
+// SetMutationBoundary replaces the workspace-integrity boundary (test seam).
+func (x *RuntimeExecutor) SetMutationBoundary(b MutationBoundary) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.mutationBoundary = b
+}
+
+// MutationBoundary returns the currently wired mutation boundary.
+func (x *RuntimeExecutor) MutationBoundary() MutationBoundary {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.mutationBoundary
 }
 
 // SetAuthorization attaches the mutation authorization token the runtime uses
@@ -1044,10 +1091,20 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			g.FailExecution(events.FailureRecoverable, err, "executor.ingestion")
 			res.ArtifactKind = ""
 			res.Content = "" // Recovery Isolation (I2): rejected bytes never travel
-			res.Err = fmt.Errorf("%w: %w", ErrArtifactRetryableRejected, err)
+			detail := "transport normalization produced a syntactically invalid payload (unterminated fence or unclosed structural tag)"
+			// AST STRUCTURAL AUDIT FEEDBACK: the ingestion layer detects the
+			// broken envelope but does not parse line positions; run the V3
+			// pipeline over the preserved payload to resolve the EXACT line of
+			// the offending node and inject it into the retry context.
+			if ingTrace != nil {
+				if audit := structuralAuditForPayload(firstTarget(targets), []byte(ingTrace.NormalizedPayload)); audit != "" { //nolint:contextcheck // artifact validation is pure content checking, no context needed
+					detail = audit
+				}
+			}
+			res.Err = fmt.Errorf("%w: %s", ErrArtifactRetryableRejected, detail)
 			res.Diagnostics = append(res.Diagnostics, diagnosticSignal(
 				SignalSchemaViolation, firstTarget(targets),
-				"transport normalization produced a syntactically invalid payload (unterminated fence or unclosed structural tag)",
+				detail,
 				"regenerate a complete, well-formed artifact; do not rely on silent repair",
 				true,
 			))
@@ -1812,6 +1869,32 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// a malformed artifact can never become a proposal. Unregistered
 		// languages pass normalized (canonical bytes), so the proposal preview
 		// and the eventual disk write agree.
+		//
+		// P1 Decoupling: when the bounded-patch contract is active, the
+		// explicit ArtifactValidator validates the RAW patch before syntax
+		// gating. For full-file artifacts the validator is intentionally NOT
+		// applied to the resolved file content — the V3 pipeline owns syntax
+		// there. This preserves the existing full-file truth matrix.
+		if patchOnly && x != nil && x.artifactValidator != nil {
+			if _, err := x.artifactValidator.ValidateArtifact([]byte(raw), target); err != nil {
+				if errors.Is(err, ErrAmbiguousAnchor) || errors.Is(err, ErrScopeViolation) {
+					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
+				}
+				if errors.Is(err, ErrFormatRejected) {
+					gate := v3Artifact.ValidateContent(target, []byte(modified), 0) //nolint:contextcheck // artifact validation is pure content checking, no context needed
+					if !gate.Passed && gate.Decision == policy.DecisionRetry {
+						// AST STRUCTURAL AUDIT FEEDBACK: surface the exact line +
+						// parse error of the V3 pipeline rejection into the retry
+						// directive so the successor anchors its correction at the
+						// precise defect instead of resending raw code.
+						audit := StructuralAuditDirective(gate.Error.Error())
+						return nil, invs, nil, trace, fmt.Errorf("%w: %s: %s", ErrArtifactRetryableRejected, target, audit)
+					}
+					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
+				}
+				return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
+			}
+		}
 		//nolint:contextcheck // artifact validation is pure content checking, no context needed
 		normalized, gateErr := x.artifactGate(target, modified)
 		if gateErr != nil {
@@ -1852,16 +1935,24 @@ func lastOutputTokens(invs []ModelInvocation) int {
 }
 
 // artifactGate validates the resolved mutation artifact against the target's
-// language contract using the established V3 artifact pipeline. A
-// registered-language target (go/html/json) that fails validation is rejected
-// deterministically (ErrArtifactRejected) with the validation diagnostic. The
-// canonical normalized content is returned so the proposal and the disk agree.
-// A language with no registered validator passes normalized but unvalidated.
+// language contract using the V3 pipeline. The explicit ArtifactValidator is
+// NOT invoked here — it is applied one layer up when the bounded-patch raw
+// artifact is available, so full-file content never traverses the strict patch
+// format gate. This keeps the validator interface decoupled (P1 decorators
+// wrap it without touching this loop) while preserving the existing truth
+// matrix for full-file rewrites.
 func (x *RuntimeExecutor) artifactGate(target, modified string) (string, error) {
 	gate := v3Artifact.ValidateContent(target, []byte(modified), 0)
 	if !gate.Passed {
 		if gate.Decision == policy.DecisionRetry {
-			return "", fmt.Errorf("%w: %s: %w: %s", ErrArtifactRetryableRejected, target, gate.Error, gate.Directive)
+			// AST STRUCTURAL AUDIT FEEDBACK: a structural parse rejection
+			// (e.g. "html: unterminated <script> element at line 7") is
+			// rewritten into the targeted [CONTRACT FAILURE] directive so the
+			// retry loop prompt carries the exact line + parse error instead of
+			// resending raw code. Non-structural rejections pass through
+			// unchanged.
+			audit := StructuralAuditDirective(gate.Error.Error())
+			return "", fmt.Errorf("%w: %s: %s: %s", ErrArtifactRetryableRejected, target, audit, gate.Directive)
 		}
 		return "", fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, gate.Error)
 	}
@@ -1881,6 +1972,129 @@ func (x *RuntimeExecutor) compileDiff(raw, target, original string) string {
 		return ""
 	}
 	return string(compiled[0].Diff)
+}
+
+// manifestSystemPrompt is the Pass 1 system prompt. Pass 1 is strictly
+// READ-ONLY: the model emits a lightweight MutationManifest JSON that names the
+// proposed mutation targets and operations. The runtime never treats this pass
+// as a mutation surface — it only informs the DAG strategy (manifest-scoped
+// atomic execution vs. semantic decomposition) that Pass 2 runs under.
+//
+// manifestPassMaxTokens bounds the Pass 1 generation: a manifest is a tiny
+// JSON object, so a small fixed ceiling keeps the read-only pass cheap and
+// cannot starve the bounded execution that follows.
+const (
+	// manifestSystemPrompt is the COMPACT Pass 1 manifest system prompt. Pass 1
+	// is strictly read-only and must emit ONLY a raw MINIFIED MutationManifest
+	// JSON with ZERO prose: weak/free-tier models (Cohere North Mini Code) that
+	// are asked to "analyze" and "propose" ramble past the output budget and
+	// truncate mid-JSON. The directive pins the MAX 200 TOKENS ceiling so a
+	// compliant model completes on the first attempt. The autonomy layer
+	// injects the authoritative buildManifestPrompt() at bootstrap via
+	// SetManifestSystemPrompt; this constant is the pre-injection default.
+	manifestSystemPrompt = "You are the Pass 1 manifest generator of a read-only planning stage. " +
+		"Analyze the target file below against the user's objective and propose the MINIMAL set of mutations that achieve it. " +
+		"OUTPUT ONLY VALID MINIFIED JSON ARRAY OF MUTATION TARGETS. DO NOT WRITE CODE, DO NOT EXPLAIN, DO NOT INCLUDE MARKDOWN FENCES. MAX 200 TOKENS.\n" +
+		"Output a single raw JSON object (minified, no newlines) conforming exactly to:\n" +
+		`{"targetFile":"<workspace-relative path>","intent":"<one-line objective>","mutations":[{"selector":"<css selector or symbol, e.g. #hero or section#hero>","action":"delete|modify|insert","estimatedLines":<positive int>}]}` + "\n" +
+		"Rules: every mutation MUST name a selector or symbol that exists in the file; " +
+		"omit any content the objective does not touch; " +
+		"if the objective requires NO change, emit {\"targetFile\":\"<path>\",\"intent\":\"...\",\"mutations\":[]}. " +
+		"This pass never writes to the workspace."
+
+	// manifestPassMaxTokens is the fixed output ceiling of the read-only Pass 1
+	// manifest generation. It matches the "MAX 200 TOKENS" directive so a
+	// verbose free-tier model cannot ramble past the compact budget.
+	manifestPassMaxTokens = 200
+
+	// manifestPassRejectTokens is the post-hoc rejection threshold: a manifest
+	// response whose token estimate still exceeds this ceiling (a provider that
+	// ignores max_tokens) is rejected as INVALID JSON instead of exhausting the
+	// output gate.
+	manifestPassRejectTokens = 512
+)
+
+// SetManifestSystemPrompt overrides the Pass 1 manifest system prompt (the
+// autonomy layer injects buildManifestPrompt at bootstrap). Passing an empty
+// string restores the default.
+func (x *RuntimeExecutor) SetManifestSystemPrompt(p string) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.manifestSystemPromptOverride = p
+}
+
+// manifestSystemPromptFor returns the effective Pass 1 manifest system prompt:
+// the injected override when present, otherwise the default.
+func (x *RuntimeExecutor) manifestSystemPromptFor() string {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.manifestSystemPromptOverride != "" {
+		return x.manifestSystemPromptOverride
+	}
+	return manifestSystemPrompt
+}
+
+// InvokeManifestPass performs the lightweight READ-ONLY Pass 1 manifest
+// request: a single bounded provider invocation whose only output is a raw
+// MutationManifest JSON string. It never reads the workspace beyond the
+// caller-provided targetContent bytes, never touches disk, and never mutates
+// anything — its result only informs the DAG strategy Pass 2 decomposes under.
+// The returned string is the verbatim model response; the caller parses it
+// with ParseMutationManifest.
+//
+// An over-long output (a provider ignoring the 200-token ceiling) is rejected
+// as INVALID JSON before it can exhaust the output gate: the error is a plain
+// manifest failure the caller falls back from, never an OUTPUT_EXHAUSTED
+// gate signal. A finish_reason="length" truncated response likewise crosses as
+// raw bytes — ParseMutationManifest rejects the truncated JSON — so the DAG
+// strategy decision falls back silently instead of surfacing exhaustion.
+func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string, targetContent []byte) (string, error) {
+	if x == nil {
+		return "", fmt.Errorf("executor: nil runtime for manifest pass")
+	}
+	x.mu.Lock()
+	p := x.provider
+	x.mu.Unlock()
+	if p == nil {
+		return "", fmt.Errorf("executor: no provider configured for the manifest pass")
+	}
+	model, err := x.resolveModel()
+	if err != nil {
+		return "", err
+	}
+	var user strings.Builder
+	user.WriteString("USER OBJECTIVE:\n")
+	user.WriteString(strings.TrimSpace(prompt))
+	user.WriteString("\n\nTARGET FILE (read-only, " + strconv.Itoa(len(targetContent)) + " bytes):\n")
+	user.WriteString("```\n")
+	user.Write(targetContent)
+	user.WriteString("\n```\n")
+	req := ai.Request{
+		Model:     model,
+		System:    x.manifestSystemPromptFor(),
+		Messages:  []ai.Message{{Role: "user", Content: user.String()}},
+		MaxTokens: manifestPassMaxTokens,
+		// The manifest is a tiny JSON object; a hidden reasoning pass would
+		// spend the bounded output budget before any JSON appears.
+		Reasoning: &ai.ReasoningConfig{Disabled: true},
+	}
+	resp, err := p.Execute(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("executor: manifest pass invocation: %w", err)
+	}
+	if resp == nil {
+		return "", fmt.Errorf("executor: manifest pass returned an empty response")
+	}
+	raw := strings.TrimSpace(resp.Content)
+	// A manifest is a TINY minified JSON payload; a response that still exceeds
+	// the rejection ceiling (bytes/4 ≈ tokens) is by definition NOT the minimal
+	// schema — reject it as invalid JSON rather than exhausting output gates.
+	if len(raw)/4 > manifestPassRejectTokens {
+		return "", fmt.Errorf(
+			"executor: manifest pass output of ~%d tokens exceeds the %d-token ceiling — rejected as invalid manifest",
+			len(raw)/4, manifestPassRejectTokens)
+	}
+	return raw, nil
 }
 
 // invokeReadOnly performs the single bounded provider invocation for read-only

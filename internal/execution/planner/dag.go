@@ -126,11 +126,30 @@ type ExecutionDAG struct {
 	// splitting is retained ONLY as this fallback. False whenever the plan
 	// was split semantically or the format has no Lea scanner at all.
 	LowSemanticConfidence bool
+	// ManifestScoped records that the plan was staged from a Pass 1
+	// MutationManifest and ONLY carries sub-tasks for AST/Semantic nodes
+	// explicitly marked for modification. Unmodified sections are pruned
+	// BEFORE dispatch, so the union of sub-task regions covers the mutation
+	// surface — never the whole file. This relaxes the V5 contiguous-coverage
+	// invariant (no sub-task is ever created solely to evaluate to
+	// no_op_objective_satisfied over an untouched block).
+	ManifestScoped bool
 	// BaseTreeDigest is the workspace SHA256(Σ path+hash) captured before any
 	// sub-task executes. Rollback restores exactly this state.
 	BaseTreeDigest string
 	// MaxOutputTokens is the per-invocation budget the plan was staged under.
 	MaxOutputTokens int
+	// BaselineSyntaxValid records the PREFLIGHT BASELINE SYNTAX SNAPSHOT: the
+	// target's syntax validity captured BEFORE any sub-task executes. When
+	// false, a post-DAG global audit syntax failure on an UNCHANGED document
+	// is a pre-existing baseline condition, never a mutation regression.
+	BaselineSyntaxValid bool
+	// NoOpSatisfiedSubTasks counts the sub-tasks that evaluated to
+	// no_op_objective_satisfied (the model answered NO_CHANGES_REQUIRED and
+	// deterministic structural analysis confirmed the claim). A DAG whose
+	// EVERY unit no-op'd mutated nothing, so an unchanged pre-broken document
+	// cannot be blamed on it.
+	NoOpSatisfiedSubTasks int
 	// SubTasks are in topological (execution) order.
 	SubTasks []SubTask
 	// Status is the plan lifecycle status.
@@ -238,6 +257,8 @@ func (d *ExecutionDAG) AddTask(st SubTask) error {
 //	V3  dependencies reference STRICTLY earlier sub-tasks ⇒ acyclic
 //	V4  every estimate obeys the strict 0.7 × max_output ceiling
 //	V5  regions are positive, ordered and cover 1..maxLine contiguously
+//	    (relaxed for ManifestScoped plans: the union only needs to cover the
+//	    mutation surface, never the untouched remainder of the file)
 //
 // A DAG that fails validation must never be proposed, let alone executed.
 func (d *ExecutionDAG) Validate() error {
@@ -270,11 +291,17 @@ func (d *ExecutionDAG) Validate() error {
 				return fmt.Errorf("%w: %s depends on %s which is not an earlier sub-task", ErrInvalidDAG, st.ID, dep)
 			}
 		}
-		if st.Region.StartLine != nextLine || st.Region.EndLine < st.Region.StartLine {
-			return fmt.Errorf("%w: %s region %s breaks contiguous coverage at line %d",
-				ErrInvalidDAG, st.ID, st.Region, nextLine)
+		if st.Region.StartLine < 1 || st.Region.EndLine < st.Region.StartLine {
+			return fmt.Errorf("%w: %s region %s is not a positive interval",
+				ErrInvalidDAG, st.ID, st.Region)
 		}
-		nextLine = st.Region.EndLine + 1
+		if !d.ManifestScoped {
+			if st.Region.StartLine != nextLine {
+				return fmt.Errorf("%w: %s region %s breaks contiguous coverage at line %d",
+					ErrInvalidDAG, st.ID, st.Region, nextLine)
+			}
+			nextLine = st.Region.EndLine + 1
+		}
 		if st.Target != d.Target {
 			return fmt.Errorf("%w: %s targets %q, want plan target %q", ErrInvalidDAG, st.ID, st.Target, d.Target)
 		}
