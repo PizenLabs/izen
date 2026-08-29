@@ -319,7 +319,7 @@ func (m *model) handleCtrlC() (bool, tea.Cmd) {
 		m.armCancelGrace()
 		m.push(roleSystem, infoStyle.Render("  Cancelling the parked autonomous run..."))
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return true, m.abortAutonomousRun("ctrl-c")
 	}
 	if m.activeOp != nil || m.isWorkflowBusy() {
@@ -427,7 +427,7 @@ func (m *model) handleWatchdog(w watchdogMsg) tea.Cmd {
 			m.push(roleActivity, fmt.Sprintf(
 				"  ⚠ watchdog: %s stalled %s without progress — press Ctrl+C to cancel", op.describe(), idle.Round(time.Second)))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			op.LastProgress = w.now // re-arm: warn once per window, never spam
 		}
 	}

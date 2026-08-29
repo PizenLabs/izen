@@ -1470,6 +1470,16 @@ type model struct {
 
 	// Current effort level for generation
 	currentEffort EffortLevel
+
+	// Clipboard abstraction for /copy and yank. Nil uses the default
+	// system clipboard. Tests may inject a fake implementation.
+	clipboard Clipboard
+
+	// ── Mouse selection (orthogonal presentation state) ──────────────────
+	// Execution State, Viewport State, Selection State and Copy State remain
+	// independent concerns. Selection operates on logical records, not terminal
+	// byte offsets.
+	mouseSel mouseSelection
 }
 
 // isProjectInitialized checks whether .izen/ exists AND contains a valid
@@ -3462,9 +3472,12 @@ func (m *model) refreshViewportContent() {
 		content.WriteString(m.renderWorkspaceHeader())
 	}
 
-	if m.inViMode {
+	switch {
+	case m.inViMode:
 		content.WriteString(m.renderRecordsWithCursor())
-	} else if m.PreRenderedHistory != "" {
+	case m.mouseSel.Active:
+		content.WriteString(m.renderRecordsWithMouseSelection())
+	case m.PreRenderedHistory != "":
 		content.WriteString(m.PreRenderedHistory)
 	}
 
@@ -3934,33 +3947,10 @@ func (m *model) getAutocompleteHeight() int {
 }
 
 // computeVpHeight returns the number of terminal rows available for the
-// scrollable viewport. Matches the View() JoinVertical layout — zero gaps:
-//
-//	Status line (renderRuntimeStatus)             → 1 line
-//	Separator below input + input + top separator → 3 lines
-//	Autocomplete dropdown (inputView)              → dynamic (getAutocompleteHeight)
-//	Proposal dock (renderProposalBlock)            → dynamic (getProposalDockCurrentHeight)
-//	m.Viewport.View()                             → remaining height (vpHeight)
-//
-// The viewport always sits at the top, consuming 100% of remaining space.
-// The input line and status bar are rigidly pinned to the terminal bottom edge
-// with zero floating margin between them.
+// scrollable viewport. Delegates to the single authoritative
+// viewportGeometry so rendering and mouse mapping cannot drift.
 func (m *model) computeVpHeight() int {
-	const inputHeight = 3 // separator above + input line + separator below
-	const statusLineHeight = 1
-
-	vpHeight := m.height - inputHeight - statusLineHeight
-	vpHeight -= m.getAutocompleteHeight()
-	if m.state == StateAwaitingApproval || m.state == StateProcessing {
-		vpHeight -= m.getProposalDockCurrentHeight()
-	}
-	// NOTE: capabilities render INLINE on the status bar line (see
-	// renderStatusBar), so they occupy the single statusLineHeight row above
-	// and never add extra rows.
-	if vpHeight < 1 {
-		return 1
-	}
-	return vpHeight
+	return m.viewportGeometry().Height
 }
 
 // recalcViewportHeight recomputes and applies the viewport height when the
@@ -3971,6 +3961,19 @@ func (m *model) recalcViewportHeight() {
 		return
 	}
 	m.Viewport.Height = m.computeVpHeight()
+}
+
+// gotoBottomIfAllowed moves the viewport to the bottom only when no active
+// user inspection owns the viewport. While a mouse drag selection is active
+// the selection controller owns the viewport and streaming must not fight it.
+func (m *model) gotoBottomIfAllowed() {
+	if !m.Ready {
+		return
+	}
+	if m.userIsScrollingUp || m.mouseSel.Dragging {
+		return
+	}
+	m.Viewport.GotoBottom()
 }
 
 // renderFlowingSpinner renders a snowflake character (✻ / ❆) with a subtle

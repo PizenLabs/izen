@@ -14,7 +14,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -116,6 +115,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 	}
 
+	// ── MOUSE SELECTION ESC CANCEL (presentation-only) ─────────────────
+	// Esc clears an active mouse drag selection without affecting execution.
+	// It is handled before the emergency hatch so a selection is dismissed
+	// without aborting a concurrent streaming/tool run.
+	if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.Type == tea.KeyEsc && m.mouseSel.Active {
+		m.mouseSel = mouseSelection{}
+		m.refreshViewportContent()
+		return m, nil
+	}
+
 	// ── UNBLOCKABLE EMERGENCY ESCAPE HATCH ────────────────────────────────
 	// Ctrl+C, Esc, and Ctrl+D are ALWAYS processed here, at the very top of
 	// the update loop, BEFORE any state gating or sub-component intercept. A
@@ -189,7 +198,20 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	}
 
 	// ── HARD KEYBOARD INTERCEPT: Approval/Processing states bypass all sub-components ──
-	if m.state == StateAwaitingApproval || m.state == StateProcessing || m.state == StateHotfixAmbiguous {
+	// Viewport scroll keys are exempt during StateProcessing so the user can
+	// inspect history while streaming/tool execution - presentation-only.
+	// AwaitingApproval keeps its dedicated proposal-diff scrolling.
+	switch m.state { //nolint:staticcheck
+	case StateProcessing:
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			switch keyMsg.Type {
+			case tea.KeyPgUp, tea.KeyPgDown, tea.KeyHome, tea.KeyEnd:
+				// Allow viewport navigation even while processing.
+			default:
+				return m.handleKey(keyMsg)
+			}
+		}
+	case StateAwaitingApproval, StateHotfixAmbiguous:
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
 			return m.handleKey(keyMsg)
 		}
@@ -204,7 +226,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				m.proposalDiffOffset = 0
 				m.recalcViewportHeight()
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 				return m, nil
 			}
 		case "alt+o":
@@ -230,8 +252,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.escCount = 0
 			m.lastEscTime = time.Time{}
 			if !m.inViMode && m.state == StateChat && !m.streaming && !m.agentRunning {
-				m.enterViMode()
-				return m, nil
+				cmd := m.enterViMode()
+				return m, cmd
 			}
 		}
 	} else if _, ok := msg.(tea.KeyMsg); ok {
@@ -342,7 +364,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleError, fmt.Sprintf("command %s failed: %v", msg.typ, msg.err))
 			m.refreshViewportContent()
 			if m.Ready && !m.userIsScrollingUp {
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 			}
 		}
 		return m, nil
@@ -395,7 +417,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.sanitizeInputPrompt()
 			m.push(roleSystem, mutedStyle.Render("[safety] review action timed out — spinner force-cleared"))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 		}
 
 		// SPINNER SANITY: if pipeline crashes mid-stream or a boundary
@@ -499,7 +521,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.sanitizeInputPrompt()
 		m.stopShimmer()
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -523,7 +545,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// so the diagnostic loop can be retried.
 			m.currentResult = investigateResultActions()
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -564,7 +586,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if m.handoffLedgerContent == "" && msg.escalationContent != "" {
 			m.push(roleSystem, "Diagnostics collected. Analyzing...")
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, tea.Batch(flush, m.streamCmd(msg.escalationContent))
 		}
@@ -600,7 +622,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		}
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		cmds = append(cmds, m.flushPendingRecords())
 		return m, tea.Batch(cmds...)
 
@@ -635,7 +657,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// dead viewport and no buttons — they can re-investigate the failure.
 			m.currentResult = failureResult(m.handoffLedgerContent)
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -648,7 +670,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleError, "plan synthesis produced zero tasks — investigation data may be insufficient")
 			m.currentResult = failureResult(m.handoffLedgerContent)
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -679,7 +701,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					m.logActivity("[ScopeGuard] Allowed files: %s", sv.AllowedString())
 					m.push(roleError, fmt.Sprintf("Plan rejected: target %q is not in the workspace file tree", sv.TargetString()))
 					m.refreshViewportContent()
-					m.Viewport.GotoBottom()
+					m.gotoBottomIfAllowed()
 					flush := m.flushPendingRecords()
 					return m, flush
 				}
@@ -772,7 +794,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.buildLedger = ctxpkg.NewTaskLedger()
 		}
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
 		base := []tea.Cmd{flush, m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput)}
 
@@ -812,7 +834,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.indexingStatus = "error"
 			m.pendingArchArgs = ""
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -829,12 +851,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleSystem, infoStyle.Render(args))
 			m.refreshViewportContent()
 			m.push(roleSystem, graphText)
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 		} else {
 			m.pendingArchArgs = ""
 		}
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -863,7 +885,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.err != nil {
 			m.push(roleError, "review error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -876,7 +898,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.currentReviewLedger = msg.ledger
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -1036,7 +1058,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -1101,7 +1123,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.refreshViewportContent()
 		if m.Ready && !m.userIsScrollingUp {
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 		}
 		return m, nil
 
@@ -1119,7 +1141,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.thinkingBuffer.Append(msg.Chunk)
 		m.refreshViewportContent()
 		if m.Ready && !m.userIsScrollingUp {
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 		}
 		return m, nil
 
@@ -1244,7 +1266,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				})
 			}
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -1261,7 +1283,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		}
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
 		if hasNext && m.resolver.Current() == modes.ModeBuild {
 			return m, tea.Batch(flush, m.handleBuildRun(0))
@@ -1288,7 +1310,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.pipelineRunning = false
 			m.push(roleError, "$log: error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -1305,7 +1327,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.pipelineRunning = false
 			m.push(roleError, "silent analysis error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -1323,7 +1345,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.pipelineRunning = false
 			m.push(roleError, "blueprint error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -1339,7 +1361,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.err != nil {
 			m.push(roleError, "prompt handoff error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -1356,7 +1378,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.bridgeAskHandoffToLedger(msg.content)
 		}
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -1370,7 +1392,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.err != nil {
 			m.push(roleError, "fix error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -1391,7 +1413,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.err != nil {
 			m.push(roleError, "env diagnostics error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -1406,7 +1428,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.currentResult = failureResult(msg.content)
 		m.push(roleSystem, msg.content)
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -1461,7 +1483,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.push(roleSystem, infoStyle.Render(statusLine))
 
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -1475,7 +1497,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.err != nil {
 			m.push(roleError, "diagnosis error: "+providers.SanitizeAPIError(msg.err))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			flush := m.flushPendingRecords()
 			return m, flush
 		}
@@ -1507,7 +1529,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		_ = m.sess.Save()
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -1539,7 +1561,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleSystem, infoStyle.Render(line))
 		}
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return m, nil
 
 	case mutationResultMsg:
@@ -1786,7 +1808,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.stopShimmer()
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -1804,7 +1826,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.refreshViewportContent()
 		}
 		if !m.userIsScrollingUp {
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 		}
 		return m, m.readShellCh()
 
@@ -1913,7 +1935,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// auto-scroll so the inspected lines never jump out from under
 			// the user while chunks stream in.
 			if m.streaming && !m.userIsScrollingUp && !m.traceExpanded {
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 			}
 		}
 
@@ -1993,7 +2015,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				planSlowNoticeDelay)))
 			m.refreshViewportContent()
 			if !m.userIsScrollingUp {
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 			}
 			return m, m.flushPendingRecords()
 		}
@@ -2032,7 +2054,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Ctrl+O thought drawer renders it live.
 		m.refreshViewportContent()
 		if m.Ready && !m.userIsScrollingUp && !m.traceExpanded {
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 		}
 		return m, tea.Batch(m.readStream(), m.thoughtUpdateCmd(string(msg), false))
 
@@ -2672,7 +2694,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if !m.activitySurfaceSealed && m.thinkingPanel != nil {
 			m.thinkingPanel.Append(msg.Content)
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 		}
 		return m, m.readStream()
 
@@ -2690,7 +2712,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.liveCodePreview.AddOrUpdate(label, msg.Content, msg.IsTool)
 		}
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return m, m.readStream()
 
 	case buildFailedMsg:
@@ -2719,7 +2741,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// failing with "transition from build to ask".
 		m.unwindBuildFailure()
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
 		return m, tea.Batch(flush, m.tokenUsageCmd(msg.TokenInput, msg.TokenOutput))
 
@@ -2754,7 +2776,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.ti.Focus()
 		m.sanitizeInputPrompt()
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
 		return m, flush
 
@@ -2787,30 +2809,77 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		return m, m.smoothStreamTickCmd()
 
+	case selectionScrollTickMsg:
+		return m, m.handleSelectionAutoScroll(msg)
+
 	case tea.MouseMsg:
-		// HARD GUARD: In destructive states (approval/exec), mouse events are
-		// completely ignored — no viewport scrolling, no coordinate mapping.
-		// This eliminates any possibility of accidental mutation via click.
-		// During processing, wheel events are allowed for scroll inspection.
-		if m.state == StateAwaitingApproval {
+		// ── Viewport + Selection invariant: execution state != viewport state.
+		// Scrolling/selection are presentation-only and remain available while
+		// streaming/processing unless a genuinely modal interaction owns input.
+		if m.isModalForMouse() {
 			return m, nil
 		}
-		if m.state == StateProcessing && msg.Button != tea.MouseButtonWheelUp && msg.Button != tea.MouseButtonWheelDown {
+		// Wheel scroll: always available outside modal states, even while
+		// streaming/tool execution/processing. It only mutates viewport YOffset.
+		if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+			if msg.Button == tea.MouseButtonWheelUp {
+				m.userIsScrollingUp = true
+			}
+			if m.Ready {
+				var vpCmd tea.Cmd
+				m.Viewport, vpCmd = m.Viewport.Update(msg)
+				return m, vpCmd
+			}
 			return m, nil
 		}
-		// Track scroll-up (wheel up) to suppress auto-scroll during
-		// user-inspection. Scroll-down does NOT reset the flag — only
-		// SPACE or a new submission resets it.
-		if msg.Button == tea.MouseButtonWheelUp {
-			m.userIsScrollingUp = true
-		}
-		// Pure O(1) viewport YOffset shift. No refreshViewportContent, no
-		// re-rendering, no string mutation — the viewport internal buffer is
-		// already set and only its scroll origin moves.
-		if m.Ready {
-			var vpCmd tea.Cmd
-			m.Viewport, vpCmd = m.Viewport.Update(msg)
-			return m, vpCmd
+		// Left-button selection lifecycle: Down → drag → Up → auto-copy.
+		// Works in any non-modal state, including during streaming.
+		switch msg.Action {
+		case tea.MouseActionPress:
+			if msg.Button == tea.MouseButtonLeft {
+				pos := m.mousePosToLogical(msg)
+				m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: pos, Cursor: pos, lastY: msg.Y, lastX: msg.X, TickActive: false}
+				// Freeze streaming auto-follow while inspecting via selection.
+				m.userIsScrollingUp = true
+				m.refreshViewportContent()
+				return m, nil
+			}
+		case tea.MouseActionMotion:
+			if m.mouseSel.Dragging {
+				m.mouseSel.lastY = msg.Y
+				m.mouseSel.lastX = msg.X
+				m.mouseSel.Cursor = m.mousePosToLogical(msg)
+				m.refreshViewportContent()
+				// Edge auto-scroll: single loop, velocity-based. Only schedule
+				// if not already active and mouse is in edge zone.
+				geo := m.viewportGeometry()
+				relY := msg.Y - geo.Top
+				inEdge := relY < selectionEdgeRows || relY >= geo.Height-selectionEdgeRows
+				if inEdge && !m.mouseSel.TickActive {
+					m.mouseSel.TickActive = true
+					return m, selectionScrollTickCmd(msg.Y, msg.X)
+				}
+				if !inEdge {
+					m.mouseSel.TickActive = false
+				}
+				return m, nil
+			}
+		case tea.MouseActionRelease:
+			if msg.Button == tea.MouseButtonLeft && m.mouseSel.Dragging {
+				m.mouseSel.Cursor = m.mousePosToLogical(msg)
+				m.mouseSel.Dragging = false
+				m.mouseSel.TickActive = false
+				cmd := m.copyMouseSelection()
+				return m, cmd
+			}
+			// Release with ButtonNone (some terminals) while dragging
+			if m.mouseSel.Dragging {
+				m.mouseSel.Cursor = m.mousePosToLogical(msg)
+				m.mouseSel.Dragging = false
+				m.mouseSel.TickActive = false
+				cmd := m.copyMouseSelection()
+				return m, cmd
+			}
 		}
 		return m, nil
 
@@ -2945,7 +3014,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// user "catches up" to the latest streamed content.
 			m.traceWindowAnchored = false
 			if m.Ready {
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 			}
 		}
 
@@ -2989,7 +3058,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.push(roleSystem, accentStyle.Render(fmt.Sprintf("✓ Model set to %s [%s]", msg.model.Name, msg.model.Provider)))
 		m.push(roleSystem, mutedStyle.Render(fmt.Sprintf("  Effort: %s (%s)", msg.effort, effortLabel)))
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return m, tea.Batch(cmds...)
 	}
 
@@ -3091,10 +3160,11 @@ func containsMutationIntention(content string) bool {
 
 // ── Vi-mode lifecycle ─────────────────────────────────────────────────────────
 
-// enterViMode transitions the UI into navigation mode: blurs the text input,
-// initializes cursor at the last record, resets selection state, and refreshes
-// the viewport with cursor highlighting.
-func (m *model) enterViMode() {
+// enterViMode transitions the UI into navigation/inspection mode: blurs the
+// text input, initializes cursor at the last record, resets selection state,
+// and refreshes the viewport with cursor highlighting. Mouse reporting is now
+// globally enabled, so this returns nil (keeps the shared mouse mode).
+func (m *model) enterViMode() tea.Cmd {
 	m.inViMode = true
 	m.viModeState = ViNormal
 	m.cursorLine = max(0, len(m.records)-1)
@@ -3113,11 +3183,14 @@ func (m *model) enterViMode() {
 	m.viCmdBuf = ""
 	m.ti.Blur()
 	m.refreshViewportContent()
+	m.uiNotice = "Copy mode: j/k scroll, v select, y yank, / search, Esc or :q to exit"
+	return tea.EnableMouseCellMotion
 }
 
 // exitViMode returns the UI to normal interactive mode: clears selection,
-// refocuses the text input, and resets all vi-mode state.
-func (m *model) exitViMode() {
+// refocuses the text input, and resets all vi-mode state. It returns
+// DisableMouse so wheel reporting is scoped to inspection mode only.
+func (m *model) exitViMode() tea.Cmd {
 	m.inViMode = false
 	m.viModeState = ViNormal
 	m.cursorLine = 0
@@ -3134,7 +3207,9 @@ func (m *model) exitViMode() {
 	m.searchQuery = ""
 	m.ti.Focus()
 	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
+	m.gotoBottomIfAllowed()
+	m.uiNotice = ""
+	return nil
 }
 
 // ── Vi-mode key handler ───────────────────────────────────────────────────────
@@ -3168,9 +3243,8 @@ func (m *model) handleViModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// ── Single-key vi-mode actions ──────────────────────────────────────
 	switch msg.String() {
 	// ── Exit / return to normal input ──
-	case "i":
-		m.exitViMode()
-		return m, nil
+	case "i", "esc":
+		return m, m.exitViMode()
 
 	// ── 2D Motions ──
 	case "h":
@@ -3371,7 +3445,7 @@ func (m *model) handleViCmdInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			sub := strings.TrimSpace(cmd[1:])
 			switch sub {
 			case "q", "q!", "quit", "wq", "x":
-				m.exitViMode()
+				return m, m.exitViMode()
 			}
 			return m, nil
 		}
@@ -3496,8 +3570,14 @@ func (m *model) yankSelection() {
 	if text == "" {
 		return
 	}
-	if err := clipboard.WriteAll(text); err != nil {
-		m.push(roleSystem, mutedStyle.Render("clipboard error: "+err.Error()))
+	var werr error
+	if m.clipboard != nil {
+		werr = m.clipboard.WriteAll(text)
+	} else {
+		werr = clipboardWriteAll(text)
+	}
+	if werr != nil {
+		m.push(roleSystem, mutedStyle.Render("clipboard error: "+werr.Error()))
 		m.refreshViewportContent()
 	}
 }

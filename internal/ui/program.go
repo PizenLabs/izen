@@ -253,6 +253,10 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 	investigate.SetForensicLog(activityFn)
 	investigate.SetDispatchLog(activityFn)
 
+	// Mouse reporting is enabled so Izen owns the lightweight selection
+	// interaction: drag to select, edge auto-scroll, release to auto-copy,
+	// and wheel scroll. Native terminal selection remains available via
+	// Shift+drag where the terminal emulator supports it.
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	// ── FORCE-EXIT TERMINAL RESTORE ──────────────────────────────────────

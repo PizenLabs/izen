@@ -123,13 +123,9 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 		borderColor = viBorderStyle
 	}
 
-	// ── Fixed Header: WorkflowState + CapabilitySet + indexing ──
+	// ── Fixed Header / Footer (authoritative geometry source) ──
 	headerView := renderFixedHeader(m.runtimeCtx, m.workflowSM, width, m.indexingStatus)
-	headerLines := strings.Count(headerView, "\n") + 1
-
-	// ── Fixed Footer: Budget counters + notifications ──
 	footerView := renderFixedFooter(m.runtimeCtx, m.uiNotice, width)
-	footerLines := strings.Count(footerView, "\n") + 1
 
 	// ── Input region: autocomplete + separators + prompt ──
 	var inputView strings.Builder
@@ -149,11 +145,9 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 		inputView.WriteString(promptLabel + " " + m.ti.View() + "\n")
 	}
 	inputView.WriteString(rule(width, borderColor))
-	inputLines := strings.Count(inputView.String(), "\n") + 1
 
 	// ── Status bar (telemetry with capabilities inlined) — below Input, above Footer ──
 	statusBarView := m.renderStatusBar(width, actions)
-	statusBarLines := strings.Count(statusBarView, "\n") + 1
 
 	// ── Proposal dock (conditional) — floats above Input ──
 	// NOTE: shimmerActive no longer triggers the proposalDock — the loading
@@ -163,15 +157,10 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
 		proposalDockView = m.renderProposalBlock()
 	}
-	proposalLines := strings.Count(proposalDockView, "\n")
 
-	// ── Size the viewport to fill remaining space between fixed regions ──
-	totalFixed := headerLines + inputLines + statusBarLines + footerLines
-	vpHeight := m.height - totalFixed - proposalLines
-	if vpHeight < 1 {
-		vpHeight = 1
-	}
-	m.Viewport.Height = vpHeight
+	// ── Size the viewport via single authoritative geometry ──
+	geo := m.viewportGeometry()
+	m.Viewport.Height = geo.Height
 
 	return Workspace{
 		Header:       headerView,
@@ -661,19 +650,19 @@ func (m *model) renderHelpOverlay() string {
 		"  " + yellowStyle.Render("/review") + "      " + dimmedStyle.Render("analyze, critique, improve"),
 		"",
 		subtleStyle.Render("  ─── Commands ───"),
-		"  " + dimmedStyle.Render("/help  /?  /objective  /clear  /drop  /undo"),
-		"  " + dimmedStyle.Render("/commit  /checkpoint  /arch  /quit"),
+		"  " + dimmedStyle.Render("/help  /?  /objective  /clear  /drop  /undo  /copy"),
+		"  " + dimmedStyle.Render("/commit  /checkpoint  /arch  /copy-mode  /quit"),
 		"  " + dimmedStyle.Render("!<cmd>          run a shell command"),
 		"  " + dimmedStyle.Render("@<path>         attach a file"),
 		"",
 		subtleStyle.Render("  ─── Shortcuts ───"),
-		"  " + dimmedStyle.Render("Esc (×3)        toggle vi-navigation mode"),
+		"  " + dimmedStyle.Render("Esc (×3)        toggle vi-navigation mode (/copy-mode)"),
 		"  " + dimmedStyle.Render("Esc (×3)        quit IZEN (normal mode)"),
 		"  " + dimmedStyle.Render("↑/↓             history navigation"),
 		"  " + dimmedStyle.Render("Tab/Enter       complete autocomplete"),
 		"  " + dimmedStyle.Render("?               toggle this help overlay"),
 		"",
-		subtleStyle.Render("  ─── Vi Navigation Mode (Esc×3) ───"),
+		subtleStyle.Render("  ─── Vi Navigation Mode (/copy-mode) ───"),
 		"  " + dimmedStyle.Render("j/k             cursor down/up (line-wise)"),
 		"  " + dimmedStyle.Render("h/l             cursor left/right (character-wise)"),
 		"  " + dimmedStyle.Render("0/$             jump to line start/end"),
@@ -684,8 +673,9 @@ func (m *model) renderHelpOverlay() string {
 		"  " + dimmedStyle.Render("n/N             next/previous search result"),
 		"  " + dimmedStyle.Render("v               toggle visual selection (char-level)"),
 		"  " + dimmedStyle.Render("y               yank (copy) selected text"),
-		"  " + dimmedStyle.Render("i               exit vi mode (return to input)"),
+		"  " + dimmedStyle.Render("i / Esc         exit vi mode (return to input)"),
 		"  " + dimmedStyle.Render(":q Enter        exit vi mode"),
+		"  " + dimmedStyle.Render("mouse wheel     scroll viewport (in copy mode)"),
 		"",
 		mutedStyle.Render("  press " + boldTextStyle.Render("Esc") + " or " + boldTextStyle.Render("?") + " to close"),
 		"",
