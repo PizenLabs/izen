@@ -378,10 +378,29 @@ const (
 	// plan (every sub-task listed on the boundary) before the atomic
 	// transaction loop may run; resumable via the driver's proposal surface.
 	HumanBoundaryDecomposition HumanBoundaryAction = "decomposition_proposal"
+	// HumanBoundaryProposal is the ZERO-TOKEN DecisionSurface gate: the
+	// target's ExecutionGate is CLOSED (corrupt AST / unresolved dependencies /
+	// over budget) so DAG decomposition is STRICTLY FORBIDDEN. The loop parks
+	// and the runtime autonomy package renders the pure-data DecisionSurface so
+	// the human may choose a repair-first / cancel strategy. No sub-task is
+	// ever staged. Resumable via the driver's ResumeWithProposal.
+	HumanBoundaryProposal HumanBoundaryAction = "proposal"
 )
 
 // String returns the canonical boundary-action label.
 func (a HumanBoundaryAction) String() string { return string(a) }
+
+// HumanProposalOption is one selectable recovery option carried on a
+// DecisionSurface HumanBoundary. It is pure scalar presentation data — no
+// callbacks — so the UI can render the human decision surface directly from
+// the authoritative runtime state without importing the runtime autonomy
+// package and without parsing log strings.
+type HumanProposalOption struct {
+	ID          string
+	Label       string
+	Description string
+	Intent      string
+}
 
 type HumanBoundary struct {
 	Reason string
@@ -403,8 +422,31 @@ type HumanBoundary struct {
 	// HumanBoundaryDecomposition. It lists every sub-task the human is being
 	// asked to authorize; approval covers ALL of them as one atomic plan.
 	Proposal *planner.ExecutionDAG
+	// ProposalOptions is the typed recovery option set of the Zero-Token
+	// DecisionSurface when Action is HumanBoundaryProposal. It is the concrete
+	// human decision surface: the UI renders these options and collapses the
+	// selection into one intent (rescope_bounded_patch / retry_with_explicit_
+	// budget / repair_first / inspect / cancel). Every parked
+	// HumanBoundaryProposal MUST carry a non-empty set — an awaiting_human
+	// park with no renderable decision surface is a deadlock by construction.
+	ProposalOptions []HumanProposalOption
+	// SurfaceASTStatus / SurfaceFailureCategory / SurfaceEstimatedTokens /
+	// SurfaceCurrentBudget are the authoritative DecisionSurface facts a
+	// HumanBoundaryProposal park carries so the UI can render the TRUE cause
+	// of the closed gate from typed fields — never by parsing a reason string.
+	SurfaceASTStatus       string
+	SurfaceFailureCategory string
+	SurfaceEstimatedTokens int
+	SurfaceCurrentBudget   int
+	SurfaceExplicitBudget  int
+	// DecisionSurface marks the boundary as the ZERO-TOKEN DecisionSurface
+	// proposal gate (HumanBoundaryProposal). When true, DAG decomposition is
+	// forbidden and the human must choose a repair-first / cancel strategy from
+	// the DecisionSurface the runtime autonomy package renders. The concrete
+	// DecisionSurface value lives on the Driver; this is a pure marker.
+	DecisionSurface bool `json:"decision_surface,omitempty"`
 	// Action discriminates the boundary kind (approve/clarify/inform/
-	// decomposition_proposal).
+	// decomposition_proposal/proposal).
 	Action HumanBoundaryAction
 	// Resumable reports whether a Resume* decision exists for this boundary.
 	// An inform boundary is not resumable; only a fresh bounded run continues.
@@ -424,6 +466,9 @@ func DeriveBoundaryAction(b *HumanBoundary) {
 		b.Resumable = true
 	case b.Proposal != nil:
 		b.Action = HumanBoundaryDecomposition
+		b.Resumable = true
+	case b.DecisionSurface:
+		b.Action = HumanBoundaryProposal
 		b.Resumable = true
 	case len(b.Options) > 0:
 		b.Action = HumanBoundaryClarify
@@ -532,6 +577,12 @@ type LoopRequest struct {
 	// evaluated individually and the monolithic full-rewrite estimation of
 	// the original target is suppressed. Nil for non-DAG requests.
 	StagedPlan *planner.ExecutionDAG
+	// ProposalIntent carries the human-selected interactive proposal strategy
+	// (Phase 2 proposal gateway) injected into the execution-context
+	// constraints for this attempt. It is pure data selected on the TUI
+	// decision surface; the runtime consumes it to bound the authorized DAG.
+	// Empty when no interactive proposal was selected.
+	ProposalIntent string
 	// FocusStartLine / FocusEndLine optionally pin the executor's
 	// deterministic bounded-patch context window to THIS unit's assigned
 	// inclusive 1-indexed line interval. Under a staged decomposition plan
@@ -552,6 +603,12 @@ type LoopRequest struct {
 	// When set, the executor invokes it during provider streaming for each
 	// content delta, first token, and completion.
 	StreamCallback execution.StreamCallback
+
+	// ── Recovery Contract Mutation ────────────────────────────────────
+	MutationStrategy     string
+	AllowASTBypass       bool
+	ExplicitOutputBudget int
+	SyntheticSubGoal     string
 }
 
 // Executor is the ONLY authority the loop may invoke. The loop is a consumer

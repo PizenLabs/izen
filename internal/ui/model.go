@@ -50,6 +50,7 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/ui/status"
+	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
 	"github.com/PizenLabs/izen/pkg/engine/ir"
 	"github.com/PizenLabs/izen/pkg/engine/pipeline"
 	"github.com/PizenLabs/izen/pkg/engine/telemetry"
@@ -905,6 +906,12 @@ type model struct {
 	autonomousSelect int
 	// autonomousObjective is the objective of the active/parked driver run.
 	autonomousObjective string
+	// proposalTUI is the interactive Zero-Token DecisionSurface selection model
+	// rendered while the driver parks at HumanBoundaryProposal. It is pure
+	// presentation (navigation + selection over the typed recovery options the
+	// runtime boundary carries); selecting an option routes a pure intent to
+	// Driver.ResumeWithProposal. Nil while no proposal boundary is active.
+	proposalTUI *proposaltui.ProposalModel
 
 	// microkernel is the immutable microkernel pipeline adapter. It primes
 	// plan/investigate command handling for greenfield generation prompts so
@@ -2157,6 +2164,22 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// of an artifact: findings, not raw bytes.
 		m.logActivity("[context] compiled %s (%s): %d finding(s)",
 			p.Path, p.Kind, p.FindingCount)
+	case events.DecisionSurfacePayload:
+		// The TYPED proposal payload of a Zero-Token DecisionSurface. The
+		// runtime published it BEFORE parking, so the UI can project it as a
+		// structured line (never inferred from a log string). The interactive
+		// recovery surface itself renders from the authoritative boundary the
+		// driver parks with — this projection is observability + the guarantee
+		// that awaiting_human always has a published decision surface.
+		m.logActivity("[preflight] decision surface: %s — %s (%d option(s))",
+			p.Target, truncateForActivity(p.Reason), len(p.Options))
+	case events.DecisionSurfaceLifecyclePayload:
+		m.logActivity("[preflight] decision_surface.%s: %s", p.State, truncateForActivity(p.Reason))
+	case events.PreflightEventPayload:
+		m.logActivity("[preflight] %s: %s (target=%s est=%d max=%d)",
+			p.State, truncateForActivity(p.Reason), p.Target, p.EstimatedTokens, p.MaxOutputTokens)
+	case events.AutonomousLifecyclePayload:
+		m.logActivity("[autonomy] %s: %s", strings.TrimPrefix(ev.Type(), "autonomous."), truncateForActivity(p.Reason))
 	}
 }
 

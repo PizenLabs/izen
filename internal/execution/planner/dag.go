@@ -66,12 +66,21 @@ const (
 	// unit failure. Applied units stay in place (they each passed Boundary 5)
 	// and the decision returns to awaiting_human with the audit evidence.
 	ObjectiveUnresolved PlanStatus = "OBJECTIVE_UNRESOLVED"
+	// ExecutionInertiaNoOp: the DAG ran under an ACTIVE MODIFICATION intent
+	// and every sub-task evaluated to no_op_objective_satisfied — zero mutated
+	// bytes across the plan. The objective demanded a change and none was
+	// delivered, so reporting OBJECTIVE_RESOLVED would be a FALSE-POSITIVE
+	// resolution (execution inertia). The plan is neither completed nor
+	// rolled back (there was nothing to roll back): the decision returns to
+	// awaiting_human for a retry or a scope escalation.
+	ExecutionInertiaNoOp PlanStatus = "EXECUTION_INERTIA_NO_OP"
 )
 
 // Terminal reports whether the plan reached a terminal status.
 func (s PlanStatus) Terminal() bool {
 	return s == DagExecutionCompleted || s == DagExecutionFailed ||
-		s == DagEscalated || s == ObjectiveUnresolved
+		s == DagEscalated || s == ObjectiveUnresolved ||
+		s == ExecutionInertiaNoOp
 }
 
 // SubTask is one executable unit of a decomposed objective. It is scoped to a

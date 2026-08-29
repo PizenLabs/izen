@@ -3,6 +3,7 @@ package autonomy
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
@@ -245,8 +246,12 @@ func (d *Driver) executeSubTaskWithRetry(ctx context.Context, dag *planner.Execu
 }
 
 // compressedContextFor reads the target's current bytes and compresses them
-// into the sub-task's structural orientation payload. Any read failure or
-// unscannable format returns nil — the prompt simply omits the block.
+// into the sub-task's structural orientation payload. Unlike
+// buildCompressedStructuralContext, it ALWAYS returns a context for a readable
+// target: formats without a Lea scanner (Go, JSON, XML, …) get a minimal
+// context carrying the DOCUMENT OUTLINE CONTEXT so their bounded sub-task
+// prompts still retain global structure. Any read failure returns nil — the
+// prompt simply omits the block.
 func (d *Driver) compressedContextFor(target string, st planner.SubTask) *CompressedStructuralContext {
 	if d == nil || d.adapter == nil || target == "" {
 		return nil
@@ -255,7 +260,17 @@ func (d *Driver) compressedContextFor(target string, st planner.SubTask) *Compre
 	if !ok || len(source) == 0 {
 		return nil
 	}
-	return buildCompressedStructuralContext(target, source, st)
+	c := buildCompressedStructuralContext(target, source, st)
+	if c == nil {
+		c = &CompressedStructuralContext{
+			Target:     target,
+			TotalLines: planner.LineCount(source),
+			ScopeID:    st.ID,
+			Scope:      st.Region,
+		}
+	}
+	c.Outline = buildTargetOutline(source, target, st.Region)
+	return c
 }
 
 // subTaskRequest builds the canonical LoopRequest for one sub-task execution
@@ -284,4 +299,191 @@ func (d *Driver) subTaskRequest(dag *planner.ExecutionDAG, st planner.SubTask, p
 		FocusStartLine: st.Region.StartLine,
 		FocusEndLine:   st.Region.EndLine,
 	}
+}
+
+// ── DOCUMENT OUTLINE CONTEXT ────────────────────────────────────────────────
+//
+// Blind fallback window slicing (≤40 lines per chunk) strips global context:
+// an individual bounded sub-task is syntactically valid in isolation, so a
+// small LLM (Cohere North Mini Code and friends) answers it with an immediate
+// NO_CHANGES_REQUIRED no-op. buildTargetOutline injects a compact global
+// structure map — the target's top-level blocks with their line ranges plus
+// the sub-task's own position — into every bounded sub-task prompt, so the
+// model reasons over the whole document skeleton instead of an isolated byte
+// window.
+
+// maxOutlineBlocks caps the block list rendered in one outline header. A
+// pathological document degrades by elision, never by unbounded size.
+const maxOutlineBlocks = 12
+
+// buildTargetOutline renders the DOCUMENT OUTLINE CONTEXT header for one
+// sub-task: a bounded global structure map of the WHOLE target (top-level
+// HTML/XML blocks or source-code declaration signatures, each with its line
+// range) plus the sub-task's own line window within it. The rendered header is
+// injected before the strict patch contract so every bounded sub-task retains
+// whole-document awareness.
+func buildTargetOutline(content []byte, path string, scope planner.Region) string {
+	total := planner.LineCount(content)
+	if total < 1 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("DOCUMENT OUTLINE CONTEXT:\n")
+	fmt.Fprintf(&b, "Global Scope Summary: target file has %d total lines containing blocks ", total)
+	blocks := targetOutlineBlocks(path, content)
+	if len(blocks) == 0 {
+		b.WriteString("(no structural blocks detected)")
+	} else {
+		shown := blocks
+		if len(shown) > maxOutlineBlocks {
+			shown = shown[:maxOutlineBlocks]
+		}
+		for i, blk := range shown {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "%s [%s]", blk.label, blk.region)
+		}
+		if len(blocks) > maxOutlineBlocks {
+			fmt.Fprintf(&b, ", … +%d more blocks", len(blocks)-maxOutlineBlocks)
+		}
+	}
+	fmt.Fprintf(&b, ". You are editing %s within this context. Check for redundancies against the overall structure.", scope)
+	return b.String()
+}
+
+// outlineBlock is one structural block of the outline map: an inclusive line
+// region plus its bounded identity ("<head> metadata", "func NewHandler5()").
+type outlineBlock struct {
+	region planner.Region
+	label  string
+}
+
+// targetOutlineBlocks extracts the high-level block map of one target: Lea
+// semantic units when the format is Lea-scannable (HTML/JSX/Go templates),
+// top-level XML element spans for .xml, and the registered structural/block
+// decomposers' sections otherwise (Go/Rust/TS declarations, Markdown/Config
+// blocks). Returns nil when no trustworthy structural topology exists — the
+// outline then reports the absence instead of inventing structure.
+func targetOutlineBlocks(path string, content []byte) []outlineBlock {
+	if scan := planner.LeaStructuralScan(path, content); scan != nil && !scan.LowConfidence && len(scan.Units) >= 2 {
+		blocks := make([]outlineBlock, 0, len(scan.Units))
+		for _, u := range scan.Units {
+			blocks = append(blocks, outlineBlock{region: u.Region, label: u.Label})
+		}
+		return blocks
+	}
+	if isXMLTarget(path) {
+		sections := xmlTopLevelBlocks(content)
+		if len(sections) >= 2 {
+			return sectionsToOutlineBlocks(sections)
+		}
+		return nil
+	}
+	if d := planner.ForTarget(path); d != nil {
+		sections, err := d.Split(path, content)
+		if err == nil && len(sections) >= 2 {
+			return sectionsToOutlineBlocks(sections)
+		}
+	}
+	return nil
+}
+
+// sectionsToOutlineBlocks flattens planner sections into outline blocks.
+func sectionsToOutlineBlocks(sections []planner.Section) []outlineBlock {
+	blocks := make([]outlineBlock, 0, len(sections))
+	for _, s := range sections {
+		blocks = append(blocks, outlineBlock{region: s.Region, label: s.Label})
+	}
+	return blocks
+}
+
+// isXMLTarget reports whether the target is an XML document. XML has no
+// registered planner decomposer, so it is handled by the dedicated top-level
+// tag scanner.
+func isXMLTarget(path string) bool {
+	return strings.EqualFold(filepath.Ext(path), ".xml")
+}
+
+// xmlTopLevelBlocks scans top-level element boundaries of an XML target and
+// lifts each depth-0 element (plus any preamble) into a structural section.
+// It respects <?xml …?> declarations, comments, CDATA and self-closing
+// elements; nested children never qualify as top-level blocks.
+func xmlTopLevelBlocks(content []byte) []planner.Section {
+	lines := strings.Split(string(content), "\n")
+	var (
+		depth  int
+		starts []int // 1-indexed lines where a depth-0 element opens
+	)
+	scan := func(s string, lineNo int) {
+		for x := 0; x < len(s); {
+			// Comments.
+			if strings.HasPrefix(s[x:], "<!--") {
+				if end := strings.Index(s[x:], "-->"); end >= 0 {
+					x += end + 3
+					continue
+				}
+				break
+			}
+			// Declarations and processing instructions (<?xml …?>, <!DOCTYPE …>).
+			if strings.HasPrefix(s[x:], "<?") || strings.HasPrefix(s[x:], "<!") {
+				if end := strings.IndexByte(s[x:], '>'); end >= 0 {
+					x += end + 1
+					continue
+				}
+				break
+			}
+			lt := strings.IndexByte(s[x:], '<')
+			if lt < 0 {
+				break
+			}
+			x += lt
+			gt := strings.IndexByte(s[x:], '>')
+			if gt < 0 {
+				break // multi-line element: resume on the next line
+			}
+			interior := strings.TrimSpace(s[x+1 : x+gt])
+			x += gt + 1
+			switch {
+			case strings.HasPrefix(interior, "/"): // closing tag
+				if depth > 0 {
+					depth--
+				}
+			case strings.HasSuffix(interior, "/"), interior == "": // self-closing / malformed
+			default:
+				if depth == 0 && (len(starts) == 0 || starts[len(starts)-1] != lineNo) {
+					starts = append(starts, lineNo)
+				}
+				depth++
+			}
+		}
+	}
+	for i, line := range lines {
+		scan(line, i+1)
+	}
+	if len(starts) == 0 {
+		return nil
+	}
+	sections := make([]planner.Section, 0, len(starts)+1)
+	if starts[0] > 1 {
+		sections = append(sections, planner.Section{
+			Region: planner.Region{StartLine: 1, EndLine: starts[0] - 1},
+			Label:  "(xml declaration/header)",
+		})
+	}
+	for i, start := range starts {
+		end := len(lines)
+		if i+1 < len(starts) {
+			end = starts[i+1] - 1
+		}
+		label := strings.TrimSpace(lines[start-1])
+		if idx := strings.IndexByte(label, '>'); idx >= 0 && strings.HasPrefix(label, "<") {
+			label = label[:idx+1]
+		}
+		sections = append(sections, planner.Section{
+			Region: planner.Region{StartLine: start, EndLine: end},
+			Label:  label,
+		})
+	}
+	return sections
 }

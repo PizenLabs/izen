@@ -160,6 +160,34 @@ const (
 	// unrecoverable IO/parse error. Execution must halt and route to
 	// awaiting_human / error.
 	EventPreflightFailed = "preflight.failed"
+
+	// ── PREFLIGHT / RECOVERY / DECISION-SURFACE / AUTONOMY TELEMETRY ──────
+	// These are the STRUCTURED lifecycle events of the preflight-failure
+	// recovery path. Every event carries the stable run identity and the
+	// bounded facts (target / strategy / reason / estimates) so this class of
+	// failure is diagnosable WITHOUT reading implementation details or parsing
+	// free-form log strings. The runtime never relies on log lines for human
+	// decisions — a log line is NOT a UI protocol.
+	EventPreflightStarted         = "preflight.started"
+	EventPreflightCompleted       = "preflight.completed"
+	EventPreflightRejected        = "preflight.rejected"
+	EventRecoveryClassified       = "recovery.classified"
+	EventRecoveryOptionsCreated   = "recovery.options_created"
+	EventDecisionSurfaceCreated   = "decision_surface.created"
+	EventDecisionSurfacePublished = "decision_surface.published"
+	EventDecisionSurfaceActivated = "decision_surface.activated"
+	EventDecisionSurfaceResolved  = "decision_surface.resolved"
+	EventAutonomousParked         = "autonomous.parked"
+	EventAutonomousResumed        = "autonomous.resumed"
+	EventAutonomousAborted        = "autonomous.aborted"
+	// EventDecisionSurface is the TYPED proposal payload a Zero-Token
+	// DecisionSurface barrier publishes BEFORE the runtime parks at
+	// awaiting_human. It carries the pure-data surface (target, AST status,
+	// estimates, recovery options) so the UI can render the human decision
+	// surface without importing the runtime autonomy package and without
+	// parsing log strings. It is the guarantee behind the invariant:
+	// awaiting_human ⇒ a renderable HumanBoundaryProposalMsg exists.
+	EventDecisionSurface = "decision.surface"
 )
 
 // FailureClassification is the taxonomy used by EventExecutionFailed. It is
@@ -993,6 +1021,82 @@ type PreflightFailedPayload struct {
 	Error  string
 }
 
+// PreflightEventPayload carries the bounded facts of one preflight evaluation
+// (started / completed / rejected). It is structured telemetry — never a log
+// string — and always carries the stable run identity.
+type PreflightEventPayload struct {
+	RunID           string
+	ContractID      string
+	Target          string
+	Workspace       string
+	State           string
+	Strategy        string
+	Reason          string
+	EstimatedTokens int
+	MaxOutputTokens int
+	ASTStatus       string
+}
+
+// DecisionSurfaceOption is one selectable recovery option on a published
+// DecisionSurface. It is pure scalar presentation data (no callbacks) so it
+// can cross the event bus and be projected by any UI.
+type DecisionSurfaceOption struct {
+	ID          string
+	Label       string
+	Description string
+	Intent      string
+}
+
+// DecisionSurfacePayload is the TYPED proposal payload of a published
+// DecisionSurface. It is the bus transport for the human decision surface:
+// the UI renders it, and the human's choice collapses back into an intent.
+type DecisionSurfacePayload struct {
+	RunID           string
+	ContractID      string
+	Target          string
+	Workspace       string
+	State           string
+	Reason          string
+	ASTStatus       string
+	EstimatedTokens int
+	CurrentBudget   int
+	Options         []DecisionSurfaceOption
+}
+
+// RecoveryEventPayload carries a recovery classification / options-created
+// telemetry event. Category is the typed PreflightFailureCategory; Options are
+// the concrete recovery actions offered to the human.
+type RecoveryEventPayload struct {
+	RunID      string
+	ContractID string
+	Target     string
+	Workspace  string
+	Reason     string
+	Category   string
+	Options    []DecisionSurfaceOption
+}
+
+// DecisionSurfaceLifecyclePayload carries a decision-surface lifecycle
+// transition (created / published / activated / resolved).
+type DecisionSurfaceLifecyclePayload struct {
+	RunID      string
+	ContractID string
+	Target     string
+	Workspace  string
+	State      string
+	Reason     string
+}
+
+// AutonomousLifecyclePayload carries an autonomous-run lifecycle transition
+// (parked / resumed / aborted).
+type AutonomousLifecyclePayload struct {
+	RunID      string
+	ContractID string
+	Target     string
+	Workspace  string
+	Reason     string
+}
+
 // NewPromptAdmitted publishes that a prompt was admitted on the UI critical
 // path. Latency is the wall-clock time spent inside submit_prompt.
 func NewPromptAdmitted(prompt, intent string, latency time.Duration) DomainEvent {
@@ -1026,5 +1130,122 @@ func NewPreflightFailed(target, reason string, err error) DomainEvent {
 		Target: target,
 		Reason: reason,
 		Error:  msg,
+	})
+}
+
+// NewPreflightStarted publishes that a zero-token preflight evaluation began.
+func NewPreflightStarted(runID, contractID, target, workspace, strategy string, maxOutputTokens int) DomainEvent {
+	return newEvent(EventPreflightStarted, PreflightEventPayload{
+		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace,
+		Strategy: strategy, MaxOutputTokens: maxOutputTokens, State: "started",
+	})
+}
+
+// NewPreflightCompleted publishes that a zero-token preflight evaluation
+// passed (the gate is open).
+func NewPreflightCompleted(runID, contractID, target, workspace, strategy string, estimated, maxOutput int) DomainEvent {
+	return newEvent(EventPreflightCompleted, PreflightEventPayload{
+		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace,
+		Strategy: strategy, EstimatedTokens: estimated, MaxOutputTokens: maxOutput, State: "completed",
+	})
+}
+
+// NewPreflightRejected publishes that a zero-token preflight evaluation closed
+// the gate. Category is the typed PreflightFailureCategory; ASTStatus is the
+// structural verdict ("" when unknown).
+func NewPreflightRejected(runID, contractID, target, workspace, strategy, category, reason string, estimated, maxOutput int, astStatus string) DomainEvent {
+	return newEvent(EventPreflightRejected, PreflightEventPayload{
+		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace,
+		Strategy: strategy, Reason: reason, EstimatedTokens: estimated,
+		MaxOutputTokens: maxOutput, ASTStatus: astStatus, State: "rejected",
+	})
+}
+
+// NewRecoveryClassified publishes that a preflight failure was classified into
+// a typed recovery category.
+func NewRecoveryClassified(runID, contractID, target, workspace, category, reason string) DomainEvent {
+	return newEvent(EventRecoveryClassified, RecoveryEventPayload{
+		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace,
+		Reason: reason, Category: category,
+	})
+}
+
+// NewRecoveryOptionsCreated publishes the concrete recovery options offered on
+// a DecisionSurface.
+func NewRecoveryOptionsCreated(runID, contractID, target, workspace, category string, options []DecisionSurfaceOption) DomainEvent {
+	return newEvent(EventRecoveryOptionsCreated, RecoveryEventPayload{
+		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace,
+		Category: category, Options: options,
+	})
+}
+
+// NewDecisionSurfaceCreated publishes that a DecisionSurface was constructed
+// from a closed-gate evaluation (lifecycle: created).
+func NewDecisionSurfaceCreated(runID, contractID, target, workspace, reason string) DomainEvent {
+	return newEvent(EventDecisionSurfaceCreated, DecisionSurfaceLifecyclePayload{
+		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace,
+		State: "created", Reason: reason,
+	})
+}
+
+// NewDecisionSurfacePublished publishes that a DecisionSurface was published
+// on the bus BEFORE the runtime parked (lifecycle: published).
+func NewDecisionSurfacePublished(runID, contractID, target, workspace, reason string) DomainEvent {
+	return newEvent(EventDecisionSurfacePublished, DecisionSurfaceLifecyclePayload{
+		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace,
+		State: "published", Reason: reason,
+	})
+}
+
+// NewDecisionSurfaceActivated publishes that a DecisionSurface became the
+// active human decision gate (lifecycle: activated).
+func NewDecisionSurfaceActivated(runID, contractID, target, workspace, reason string) DomainEvent {
+	return newEvent(EventDecisionSurfaceActivated, DecisionSurfaceLifecyclePayload{
+		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace,
+		State: "activated", Reason: reason,
+	})
+}
+
+// NewDecisionSurfaceResolved publishes that a DecisionSurface was resolved by
+// a human choice (lifecycle: resolved).
+func NewDecisionSurfaceResolved(runID, contractID, target, workspace, reason string) DomainEvent {
+	return newEvent(EventDecisionSurfaceResolved, DecisionSurfaceLifecyclePayload{
+		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace,
+		State: "resolved", Reason: reason,
+	})
+}
+
+// NewDecisionSurfaceEvent publishes the TYPED proposal payload of a
+// DecisionSurface. It is the bus transport the UI projects into a
+// HumanBoundaryProposalMsg.
+func NewDecisionSurfaceEvent(runID, contractID, target, workspace, state, reason string, astStatus string, estimated, budget int, options []DecisionSurfaceOption) DomainEvent {
+	return newEvent(EventDecisionSurface, DecisionSurfacePayload{
+		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace,
+		State: state, Reason: reason, ASTStatus: astStatus,
+		EstimatedTokens: estimated, CurrentBudget: budget, Options: options,
+	})
+}
+
+// NewAutonomousParked publishes that the autonomous run parked at a human
+// boundary (awaiting_human) with a renderable decision surface.
+func NewAutonomousParked(runID, contractID, target, workspace, reason string) DomainEvent {
+	return newEvent(EventAutonomousParked, AutonomousLifecyclePayload{
+		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace, Reason: reason,
+	})
+}
+
+// NewAutonomousResumed publishes that the autonomous run resumed after a human
+// decision.
+func NewAutonomousResumed(runID, contractID, target, workspace, reason string) DomainEvent {
+	return newEvent(EventAutonomousResumed, AutonomousLifecyclePayload{
+		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace, Reason: reason,
+	})
+}
+
+// NewAutonomousAborted publishes that the autonomous run was aborted by a
+// human decision or cancellation.
+func NewAutonomousAborted(runID, contractID, target, workspace, reason string) DomainEvent {
+	return newEvent(EventAutonomousAborted, AutonomousLifecyclePayload{
+		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace, Reason: reason,
 	})
 }

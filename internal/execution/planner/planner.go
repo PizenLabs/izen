@@ -156,4 +156,11 @@ var (
 	ErrInvalidDAG = errors.New("planner: invalid execution dag")
 	// ErrEmptySource: decomposition was requested for empty content.
 	ErrEmptySource = errors.New("planner: empty source content")
+	// ErrDecompositionForbiddenCorruptAST: decomposition was requested for a
+	// target whose baseline AST/syntax is structurally invalid. A broken
+	// document may NEVER be sliced into semantic or line-window sub-tasks — the
+	// strict preflight invariant forbids DAG decomposition when
+	// baseline_syntax.valid == false. The caller must divert to the Zero-Token
+	// DecisionSurface barrier instead of staging any sub-task.
+	ErrDecompositionForbiddenCorruptAST = errors.New("planner: decomposition forbidden — target AST/syntax is corrupt")
 )

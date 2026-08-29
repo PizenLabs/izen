@@ -69,6 +69,14 @@ type CompressedStructuralContext struct {
 	References []string
 	// Evidence lists targeted structural findings overlapping the scope.
 	Evidence []string
+	// Outline is the DOCUMENT OUTLINE CONTEXT header: a bounded global
+	// structure map of the whole target (top-level HTML/XML blocks or
+	// source-code declaration signatures with their line ranges) plus the
+	// sub-task's own line window inside it. It is injected into every bounded
+	// sub-task prompt so a line-bounded unit retains whole-document awareness
+	// and a small model cannot claim NO_CHANGES_REQUIRED against an isolated
+	// byte window it never understood in context.
+	Outline string
 	// Truncated reports that the skeleton was elided under its cap.
 	Truncated bool
 }

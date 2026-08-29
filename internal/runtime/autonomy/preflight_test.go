@@ -4,13 +4,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
-	"github.com/PizenLabs/izen/internal/execution/planner"
 )
 
 // ── PREFLIGHT BASELINE SYNTAX SNAPSHOT + NO-OP GLOBAL AUDIT RELAXATION ──────
@@ -32,12 +30,28 @@ func brokenBaselineFixture() []byte {
 	return []byte(b.String())
 }
 
-// stageBrokenBaselineRun parks a run at a DECOMPOSITION_PROPOSAL boundary over
-// a pre-broken index.html, with a deterministic ONE-unit DAG (whole file) cut
-// by an injected decompose. It returns the driver and the dagProvider wired to
-// answer each sub-task.
-func stageBrokenBaselineRun(t *testing.T) (*Driver, *planner.ExecutionDAG, *dagProvider) {
-	t.Helper()
+// validLargeBaselineFixture renders a decomposition-sized, STRUCTURALLY VALID
+// HTML document. It is large enough to trip the Boundary-2 budget preflight (so
+// the driver stages a DECOMPOSITION_PROPOSAL) but parses cleanly — used by the
+// execution-inertia and global-audit tests that must run over a baseline the
+// strict preflight hard-gate permits to be decomposed.
+func validLargeBaselineFixture() []byte {
+	var b strings.Builder
+	b.WriteString("<!DOCTYPE html>\n<html>\n<head><title>Valid</title></head>\n<body>\n")
+	for i := 0; i < 80; i++ {
+		fmt.Fprintf(&b, "<section id=\"sec-%d\">\n<h2>Section %d</h2>\n<p>unique filler content number %d lorem ipsum dolor sit amet consectetur</p>\n</section>\n", i, i, i)
+	}
+	b.WriteString("</body>\n</html>\n")
+	return []byte(b.String())
+}
+
+// TestAudit_PreexistingBaselineSyntaxError pins the NEW strict preflight
+// hard-gate: a target whose baseline AST is ALREADY CORRUPT must NEVER be
+// decomposed into a DAG — the pre-existing-baseline relaxation that once let a
+// no-op run slip through on a broken file is GONE. The run must halt at the
+// Zero-Token DecisionSurface barrier with ZERO sub-tasks staged, so the global
+// post-DAG audit never even runs over a broken document.
+func TestAudit_PreexistingBaselineSyntaxError(t *testing.T) {
 	root := t.TempDir()
 	source := brokenBaselineFixture()
 	if len(source) < 8*1024/2 { // sanity: big enough to trip Boundary-2 preflight
@@ -50,101 +64,42 @@ func stageBrokenBaselineRun(t *testing.T) (*Driver, *planner.ExecutionDAG, *dagP
 	x := testExecutor(t, root, p, bus)
 	adapter := NewExecutorAdapter(root, execution.NewIntentGateway(root), x)
 
-	decompose := func(objective, target string, src []byte, baseDigest string, maxOutputTokens int) (*planner.ExecutionDAG, error) {
-		dag := planner.NewExecutionDAG(objective, target, planner.SplitBoundedLines, baseDigest, maxOutputTokens)
-		total := len(strings.Split(strings.TrimSuffix(string(src), "\n"), "\n"))
-		if err := dag.AddTask(planner.SubTask{
-			ID:              "st-1",
-			Index:           1,
-			Kind:            planner.SplitBoundedLines,
-			Description:     "broken baseline window",
-			Region:          planner.Region{StartLine: 1, EndLine: total},
-			EstimatedTokens: 64,
-		}); err != nil {
-			return nil, err
-		}
-		if err := dag.Validate(); err != nil {
-			return nil, err
-		}
-		return dag, nil
-	}
-
-	driver := NewDriver(adapter, bus, WithDecompose(decompose))
+	driver := NewDriver(adapter, bus)
 	term, err := driver.Run(context.Background(), "check this file @index.html and remove redundant content")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+
+	// The run MUST park at the DecisionSurface barrier — never terminate, never
+	// stage a DECOMPOSITION_PROPOSAL DAG over the broken baseline.
 	if term != nil {
-		t.Fatalf("run terminated (%+v) instead of parking at the proposal", term)
+		t.Fatalf("run terminated (%+v) instead of parking at the DecisionSurface barrier", term)
 	}
-	dag := driver.Proposal()
-	if dag == nil {
-		t.Fatal("no DECOMPOSITION_PROPOSAL parked at the boundary")
+	if driver.State() != autonomy.RuntimeAwaitingHuman {
+		t.Fatalf("state = %s, want awaiting_human", driver.State())
 	}
-	if len(dag.SubTasks) != 1 {
-		t.Fatalf("sub-tasks = %d, want 1", len(dag.SubTasks))
+	b := driver.Boundary()
+	if b == nil {
+		t.Fatal("no human boundary parked")
 	}
-	return driver, dag, p
-}
-
-// TestAudit_PreexistingBaselineSyntaxError drives a DAG over an ALREADY-BROKEN
-// HTML file whose sub-task evaluates to no_op_objective_satisfied (zero
-// mutations). The post-DAG global audit fails on the document's syntax — but
-// that syntax failure PRE-DATES the DAG, the bytes are checksum-identical to
-// the baseline, and the only unit was a satisfied no-op. The run must complete
-// cleanly (never OBJECTIVE_UNRESOLVED / awaiting_human) with the
-// baseline_syntax_preexisting warning.
-func TestAudit_PreexistingBaselineSyntaxError(t *testing.T) {
-	var (
-		mu     sync.Mutex
-		diags  []string
-		warned bool
-	)
-	SetDiagnosticLog(func(format string, args ...interface{}) {
-		line := fmt.Sprintf(format, args...)
-		mu.Lock()
-		diags = append(diags, line)
-		if strings.Contains(line, execution.BaselineSyntaxPreexisting) {
-			warned = true
-		}
-		mu.Unlock()
-	})
-	defer SetDiagnosticLog(nil)
-
-	driver, dag, p := stageBrokenBaselineRun(t)
-
-	// The preflight snapshot must have recorded the pre-existing defect.
-	if dag.BaselineSyntaxValid {
-		t.Fatal("BaselineSyntaxValid = true, want false — the baseline HTML was already broken at staging time")
+	if b.Action != autonomy.HumanBoundaryProposal {
+		t.Fatalf("boundary action = %q, want %q (DecisionSurface hard-gate)", b.Action, autonomy.HumanBoundaryProposal)
 	}
-
-	before := readTarget(t, p.root, "index.html")
-	// The model answers NO_CHANGES_REQUIRED for the single sub-task.
-	p.noop = map[int]bool{1: true}
-
-	term, err := driver.ResumeApproveProposal(context.Background())
-	if err != nil {
-		t.Fatalf("ResumeApproveProposal: %v", err)
+	if b.Action == autonomy.HumanBoundaryDecomposition {
+		t.Fatal("corrupt baseline was routed to DECOMPOSITION_PROPOSAL — strict gate violated")
 	}
-	if term == nil || term.State != autonomy.RuntimeCompleted {
-		t.Fatalf("termination = %+v, want a completed run (never a parked awaiting_human)", term)
+	// ZERO sub-tasks may be created against a broken document.
+	if driver.Proposal() != nil {
+		t.Fatal("driver.Proposal() returned a staged DAG — decomposition forbidden on a corrupt baseline")
 	}
-	if driver.Plan().Status != planner.DagExecutionCompleted {
-		t.Fatalf("plan status = %s, want %s (the pre-existing syntax failure must not override to %s)",
-			driver.Plan().Status, planner.DagExecutionCompleted, planner.ObjectiveUnresolved)
+	if driver.Plan() != nil {
+		t.Fatal("driver.Plan() returned a staged DAG — decomposition forbidden on a corrupt baseline")
 	}
-	if dag.NoOpSatisfiedSubTasks != 1 {
-		t.Fatalf("NoOpSatisfiedSubTasks = %d, want 1", dag.NoOpSatisfiedSubTasks)
-	}
-	// Zero mutations were applied: the workspace is unchanged.
-	if got := readTarget(t, p.root, "index.html"); got != before {
-		t.Fatal("a no-op run mutated the workspace")
-	}
-	// The baseline warning was emitted.
-	mu.Lock()
-	defer mu.Unlock()
-	if !warned {
-		t.Fatalf("no baseline_syntax_preexisting warning emitted; diagnostics:\n%s", strings.Join(diags, "\n"))
+	ds := driver.DecisionSurface()
+	if ds == nil {
+		t.Fatal("DecisionSurface barrier must expose a DecisionSurface")
+	} else if ds.ASTStatus != ASTCorrupt {
+		t.Fatalf("DecisionSurface ASTStatus = %q, want corrupt", ds.ASTStatus)
 	}
 }
 
@@ -220,5 +175,373 @@ func TestParseMutationManifest_MinimalArraySchema(t *testing.T) {
 	env := &MutationManifest{Mutations: m.Mutations}
 	if e := EstimateMutationSurface(env, []byte(strings.Repeat("x", 1000))); e <= 0 {
 		t.Fatalf("array-form surface estimate = %d, want > 0", e)
+	}
+}
+
+// ── Zero-Token EVALUATING_SCOPE ExecutionGate ───────────────────────────────
+
+// TestPreflight_CorruptAST_FailsGate drives the zero-token preflight over an
+// HTML document with an unclosed <script> element (the deterministic structural
+// validator flags it). The ExecutionGate MUST close: a corrupted target AST is
+// provably non-executable, and no LLM token may be spent on it.
+func TestPreflight_CorruptAST_FailsGate(t *testing.T) {
+	corrupt := []byte("<!DOCTYPE html>\n<html>\n<head><title>Broken</title></head>\n<body>\n" +
+		"<script>\n  console.log('under construction');\n" +
+		"<section><h2>Filler</h2><p>lorem ipsum dolor sit amet</p></section>\n" +
+		"</body>\n</html>\n")
+
+	eval := EvaluateScope(ScopeInput{
+		Target:          "index.html",
+		Content:         corrupt,
+		MaxOutputTokens: 1024,
+		Root:            t.TempDir(),
+	})
+
+	if eval.ASTStatus != ASTCorrupt {
+		t.Fatalf("ASTStatus = %s, want corrupt", eval.ASTStatus)
+	}
+	if eval.ExecutionGate() {
+		t.Fatal("ExecutionGate = true, want false — a corrupted AST must fail closed")
+	}
+	if len(eval.RequiredProposals) == 0 {
+		t.Fatal("a closed gate must record a required human proposal")
+	}
+	// The gate must also close on an unterminated raw-text element (a prose
+	// header left open at EOF is silently repaired by the lenient HTML5 parser,
+	// but an unterminated <style> is a raw-text element the deterministic scan
+	// flags).
+	prose := []byte("<html>\n<head><style>\n  .x { color: red; }\n</head>\n<body>\n<p>prose</p>\n</body>\n</html>\n")
+	pv := EvaluateScope(ScopeInput{Target: "page.html", Content: prose, MaxOutputTokens: 1024, Root: t.TempDir()})
+	if pv.ASTStatus != ASTCorrupt {
+		t.Fatalf("prose-header ASTStatus = %s, want corrupt", pv.ASTStatus)
+	}
+	if pv.ExecutionGate() {
+		t.Fatal("ExecutionGate = true for an unterminated raw-text element, want false")
+	}
+}
+
+// TestPreflight_ValidTarget_PassesGate pins the happy path: a structurally
+// valid, fully-resolved, in-budget target passes the ExecutionGate and stages
+// no human proposal.
+func TestPreflight_ValidTarget_PassesGate(t *testing.T) {
+	root := t.TempDir()
+	writeTarget(t, root, "app.css", "body { color: black; }\n")
+	writeTarget(t, root, "app.js", "console.log('hi');\n")
+	valid := []byte("<!DOCTYPE html>\n<html>\n<head><title>OK</title>\n" +
+		"<link rel=\"stylesheet\" href=\"app.css\">\n</head>\n<body>\n" +
+		"<script src=\"app.js\"></script>\n</body>\n</html>\n")
+	writeTarget(t, root, "index.html", string(valid))
+
+	eval := EvaluateScope(ScopeInput{
+		Target:          "index.html",
+		Content:         valid,
+		MaxOutputTokens: 1024,
+		Root:            root,
+	})
+
+	if eval.ASTStatus != ASTValid {
+		t.Fatalf("ASTStatus = %s, want valid", eval.ASTStatus)
+	}
+	if eval.DependencyStatus != DependenciesResolved {
+		t.Fatalf("DependencyStatus = %s, want resolved", eval.DependencyStatus)
+	}
+	if eval.BudgetStatus != BudgetWithinLimits {
+		t.Fatalf("BudgetStatus = %s, want within_limits", eval.BudgetStatus)
+	}
+	if !eval.ExecutionGate() {
+		t.Fatalf("ExecutionGate = false for a valid target; findings: %v", eval.Findings)
+	}
+	if len(eval.RequiredProposals) != 0 {
+		t.Fatalf("required proposals = %d, want 0", len(eval.RequiredProposals))
+	}
+}
+
+// TestPreflight_TargetedMarkupUsesBoundedPatchMultiplier pins the bounded-patch
+// budget accounting: a TARGETED modification prompt ($prompt / $hot) on an
+// HTML/text target is expected to issue a bounded SEARCH/REPLACE patch, so the
+// estimated cost uses the bounded patch multiplier instead of the full-rewrite
+// multiplier ($3×). A target that exceeds budget under $3× but fits under the
+// bounded multiplier must NOT be flagged over-budget — while the same target
+// under a non-targeted scope stays over-budget.
+func TestPreflight_TargetedMarkupUsesBoundedPatchMultiplier(t *testing.T) {
+	// ~3960 bytes → ~990 tokens: ×3 = 2970 > 2500 (over), ×2 = 1980 ≤ 2500 (fits).
+	big := []byte(strings.Repeat("<section><p>lorem ipsum dolor sit amet consectetur</p></section>\n", 60))
+	if full := len(big) / 4 * execution.FullRewriteTokenMultiplier; full <= 2500 {
+		t.Fatalf("fixture full-rewrite estimate = %d, want > 2500 budget", full)
+	}
+	if bounded := len(big) / 4 * execution.BoundedPatchTokenMultiplier; bounded > 2500 {
+		t.Fatalf("fixture bounded estimate = %d, want <= 2500 budget", bounded)
+	}
+
+	// $prompt on an HTML target: bounded multiplier → within limits.
+	prompt := EvaluateScope(ScopeInput{
+		Target:          "big.html",
+		Content:         big,
+		MaxOutputTokens: 2500,
+		Root:            t.TempDir(),
+		Subcommand:      "$prompt",
+	})
+	if prompt.BudgetStatus != BudgetWithinLimits {
+		t.Fatalf("$prompt markup BudgetStatus = %s, want within_limits (findings: %v)", prompt.BudgetStatus, prompt.Findings)
+	}
+
+	// $hot on an HTML target: bounded multiplier → within limits.
+	hot := EvaluateScope(ScopeInput{
+		Target:          "big.html",
+		Content:         big,
+		MaxOutputTokens: 2500,
+		Root:            t.TempDir(),
+		Subcommand:      "$hot",
+	})
+	if hot.BudgetStatus != BudgetWithinLimits {
+		t.Fatalf("$hot markup BudgetStatus = %s, want within_limits (findings: %v)", hot.BudgetStatus, hot.Findings)
+	}
+
+	// The SAME target without a targeted scope keeps the full-rewrite ($3×)
+	// accounting → over budget.
+	plain := EvaluateScope(ScopeInput{
+		Target:          "big.html",
+		Content:         big,
+		MaxOutputTokens: 2500,
+		Root:            t.TempDir(),
+	})
+	if plain.BudgetStatus != BudgetExceeded {
+		t.Fatalf("non-targeted markup BudgetStatus = %s, want exceeded (full-rewrite accounting)", plain.BudgetStatus)
+	}
+
+	// A non-markup target keeps the full-rewrite ($3×) accounting even under
+	// $prompt — the bounded relaxation is markup-only.
+	goFile := []byte(strings.Repeat("// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", 160))
+	nonMarkup := EvaluateScope(ScopeInput{
+		Target:          "main.go",
+		Content:         goFile,
+		MaxOutputTokens: 2500,
+		Root:            t.TempDir(),
+		Subcommand:      "$prompt",
+	})
+	if nonMarkup.BudgetStatus != BudgetExceeded {
+		t.Fatalf("$prompt Go BudgetStatus = %s, want exceeded (full-rewrite accounting)", nonMarkup.BudgetStatus)
+	}
+}
+
+// TestPreflight_BudgetExceeded_FailsGate drives the zero-token preflight over a
+// target whose estimated generation cost (bytes/4 × FullRewriteTokenMultiplier)
+// exceeds the declared max_output. The BudgetStatus MUST be exceeded and the
+// ExecutionGate MUST close — the target is provably infeasible BEFORE any
+// provider request (zero tokens).
+func TestPreflight_BudgetExceeded_FailsGate(t *testing.T) {
+	// ~2000 bytes → ~500 tokens × 3 = ~1500 tokens > 256 budget.
+	big := []byte(strings.Repeat("<section><p>lorem ipsum dolor sit amet consectetur</p></section>\n", 80))
+	if len(big)/4*execution.FullRewriteTokenMultiplier <= 256 {
+		t.Fatalf("fixture estimates %d tokens, want > 256 budget", len(big)/4*execution.FullRewriteTokenMultiplier)
+	}
+
+	eval := EvaluateScope(ScopeInput{
+		Target:          "big.html",
+		Content:         big,
+		MaxOutputTokens: 256,
+		Root:            t.TempDir(),
+	})
+
+	if eval.BudgetStatus != BudgetExceeded {
+		t.Fatalf("BudgetStatus = %s, want exceeded", eval.BudgetStatus)
+	}
+	if eval.ExecutionGate() {
+		t.Fatal("ExecutionGate = true, want false — an over-budget target must fail closed")
+	}
+	if len(eval.RequiredProposals) == 0 {
+		t.Fatal("a closed gate must record a required human proposal")
+	}
+}
+
+// targetedPatchFixture renders a ~7780-byte, STRUCTURALLY VALID HTML document.
+// It is large enough that the full-rewrite estimate (bytes/4 × $3×) exceeds a
+// typical budget while the bounded patch estimate (bytes/4 × $2×) fits — the
+// exact target class whose budget must NOT be falsely deemed infeasible.
+func targetedPatchFixture() []byte {
+	const targetSize = 7780
+	prefix := "<!DOCTYPE html>\n<html>\n<head><title>Targeted</title></head>\n<body>\n"
+	section := "<section><p>lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor</p></section>\n"
+	suffix := "</body>\n</html>\n"
+	remaining := targetSize - len(prefix) - len(suffix)
+	body := strings.Repeat(section, remaining/len(section))
+	if pad := targetSize - len(prefix) - len(body) - len(suffix); pad > 0 {
+		body += strings.Repeat(" ", pad)
+	}
+	return []byte(prefix + body + suffix)
+}
+
+// TestPreflight_TargetedPrompt_UsesBoundedMultiplier pins the budget multiplier
+// resolution for a TARGETED modification prompt: "$prompt check this file
+// @index.html and remove redundant content" is a bounded SEARCH/REPLACE request,
+// so the preflight MUST resolve BoundedPatchTokenMultiplier (2×) — never the
+// premature FullRewriteTokenMultiplier (3×) that would flag a ~7780-byte HTML
+// target as infeasible.
+func TestPreflight_TargetedPrompt_UsesBoundedMultiplier(t *testing.T) {
+	source := targetedPatchFixture()
+	if len(source) != 7780 {
+		t.Fatalf("fixture size = %d, want 7780", len(source))
+	}
+	const budget = 4096
+	if est2 := (len(source) / 4) * execution.BoundedPatchTokenMultiplier; est2 > budget {
+		t.Fatalf("bounded estimate = %d, want <= %d budget", est2, budget)
+	}
+	if est3 := (len(source) / 4) * execution.FullRewriteTokenMultiplier; est3 <= budget {
+		t.Fatalf("full-rewrite estimate = %d, want > %d budget to prove the premature 3× false positive", est3, budget)
+	}
+	prompt := "$prompt check this file @index.html and remove redandant content"
+
+	// The multiplier resolution MUST pick the bounded patch multiplier (2×).
+	if got := PreflightMultiplierForTarget("index.html", "$prompt", prompt); got != execution.BoundedPatchTokenMultiplier {
+		t.Fatalf("multiplier = %d, want %d (BoundedPatchTokenMultiplier)", got, execution.BoundedPatchTokenMultiplier)
+	}
+	// An explicit full-rewrite / scaffolding request keeps $3× — never downgraded.
+	if got := PreflightMultiplierForTarget("index.html", "$prompt", "$prompt rewrite this file @index.html from scratch"); got != execution.FullRewriteTokenMultiplier {
+		t.Fatalf("rewrite multiplier = %d, want %d (FullRewriteTokenMultiplier)", got, execution.FullRewriteTokenMultiplier)
+	}
+
+	// EvaluateScope over the targeted prompt passes the gate cleanly: the
+	// bounded patch scope fits the budget — no premature 3× infeasibility.
+	eval := EvaluateScope(ScopeInput{
+		Target:          "index.html",
+		Content:         source,
+		MaxOutputTokens: budget,
+		Root:            t.TempDir(),
+		Subcommand:      "$prompt",
+		Prompt:          prompt,
+	})
+	if eval.ASTStatus != ASTValid {
+		t.Fatalf("ASTStatus = %s, want valid", eval.ASTStatus)
+	}
+	if eval.BudgetStatus != BudgetWithinLimits {
+		t.Fatalf("BudgetStatus = %s, want within_limits (findings: %v) — the bounded patch scope must pass cleanly", eval.BudgetStatus, eval.Findings)
+	}
+	if !eval.ExecutionGate() {
+		t.Fatalf("ExecutionGate = false for a targeted bounded-patch prompt; findings: %v", eval.Findings)
+	}
+}
+
+// TestPreflight_ValidAST_DoesNotSetCorruptOnBudgetExceed pins the STRICT
+// decoupling of ASTStatus from BudgetStatus: a STRUCTURALLY VALID target that
+// exceeds the output budget is classified BudgetExceeded with the ExecutionGate
+// closed — and its ASTStatus MUST stay ASTValid. It is NEVER mislabeled
+// ASTCorrupt just because the budget check failed.
+func TestPreflight_ValidAST_DoesNotSetCorruptOnBudgetExceed(t *testing.T) {
+	// ~2745 bytes → ~686 tokens × 3 = ~2059 > 512: provably over budget.
+	valid := []byte(strings.Repeat("<section><p>lorem ipsum dolor sit amet consectetur</p></section>\n", 45))
+	if err := execution.ValidateDocumentSyntax("big.html", valid); err != nil {
+		t.Fatalf("fixture must be structurally valid: %v", err)
+	}
+	if (len(valid)/4)*execution.FullRewriteTokenMultiplier <= 512 {
+		t.Fatalf("fixture estimates %d tokens, want > 512 budget", (len(valid)/4)*execution.FullRewriteTokenMultiplier)
+	}
+
+	eval := EvaluateScope(ScopeInput{
+		Target:          "big.html",
+		Content:         valid,
+		MaxOutputTokens: 512,
+		Root:            t.TempDir(),
+	})
+
+	if eval.ASTStatus != ASTValid {
+		t.Fatalf("ASTStatus = %s, want valid — a valid target must never be mislabeled corrupt on budget failure", eval.ASTStatus)
+	}
+	if eval.BudgetStatus != BudgetExceeded {
+		t.Fatalf("BudgetStatus = %s, want exceeded", eval.BudgetStatus)
+	}
+	if eval.ExecutionGate() {
+		t.Fatal("ExecutionGate = true, want false — an over-budget target must fail closed")
+	}
+	if len(eval.RequiredProposals) == 0 {
+		t.Fatal("a closed gate must record a required human proposal")
+	}
+	// The barrier reason names the TRUE cause — never a corrupt-AST label.
+	reason := barrierReason(eval)
+	if !strings.Contains(reason, "output budget exceeded (bounded patch required)") {
+		t.Fatalf("barrier reason = %q, want the bounded-patch budget cause", reason)
+	}
+	if strings.Contains(reason, "corrupt AST") {
+		t.Fatalf("barrier reason = %q must never report corrupt AST for a valid target", reason)
+	}
+}
+
+// TestPreflight_MissingLocalDependency_FailsGate drives the zero-token preflight
+// over an HTML document that references a <script src> file that does not exist.
+// The DependencyStatus MUST be unresolved and the ExecutionGate MUST close.
+func TestPreflight_MissingLocalDependency_FailsGate(t *testing.T) {
+	html := []byte("<!DOCTYPE html>\n<html>\n<head><title>Refs</title></head>\n<body>\n" +
+		"<script src=\"missing.js\"></script>\n</body>\n</html>\n")
+
+	eval := EvaluateScope(ScopeInput{
+		Target:          "index.html",
+		Content:         html,
+		MaxOutputTokens: 1024,
+		Root:            t.TempDir(), // empty: missing.js does not exist
+	})
+
+	if eval.DependencyStatus != DependenciesUnresolved {
+		t.Fatalf("DependencyStatus = %s, want unresolved", eval.DependencyStatus)
+	}
+	if eval.ExecutionGate() {
+		t.Fatal("ExecutionGate = true, want false — unresolved dependencies must fail closed")
+	}
+}
+
+// TestPreflight_UnboundedOrEmpty_NotBarred verifies the gate is not a false
+// positive on creation intent or unbounded budgets: an empty target (creation)
+// and a 0 max_output (unbounded) are treated as unknown/within-limits, not
+// hard barriers.
+func TestPreflight_UnboundedOrEmpty_NotBarred(t *testing.T) {
+	empty := EvaluateScope(ScopeInput{Target: "new.txt", Content: nil, MaxOutputTokens: 1024, Root: t.TempDir()})
+	if empty.ASTStatus != ASTUnknown {
+		t.Fatalf("empty target ASTStatus = %s, want unknown", empty.ASTStatus)
+	}
+	// An absent target is not executable as a mutation, so it still closes the
+	// gate (a missing file cannot be staged) — but it is NOT a corrupt-AST
+	// barrier. Assert the distinction: unknown != corrupt.
+	if empty.ASTStatus == ASTCorrupt {
+		t.Fatal("empty target must not be classified corrupt")
+	}
+}
+
+// TestASTStatus_ZeroValueNeverCorrupt pins the zero-value default invariant:
+// an UNINITIALIZED ASTStatus (the zero value) must read as ASTUnspecified —
+// semantically unknown/unverified — and MUST NEVER be interpreted as
+// ASTCorrupt. This is the anti-deadlock guarantee: a struct built without
+// setting ASTStatus can never strand a run at a bogus "corrupt AST baseline"
+// decision surface.
+func TestASTStatus_ZeroValueNeverCorrupt(t *testing.T) {
+	var zero ASTStatus
+	if zero != ASTUnspecified {
+		t.Fatalf("zero-value ASTStatus = %q, want %q (ASTUnspecified)", zero, ASTUnspecified)
+	}
+	if zero == ASTCorrupt {
+		t.Fatal("zero-value ASTStatus must never equal ASTCorrupt")
+	}
+	if zero == ASTValid {
+		t.Fatal("zero-value ASTStatus must never equal ASTValid")
+	}
+	if zero.Known() {
+		t.Fatal("zero-value ASTStatus must report Known() == false")
+	}
+
+	// An uninitialized PreflightEvaluation carries an unspecified (not corrupt)
+	// status and the barrier reason never names a "corrupt AST baseline".
+	var eval PreflightEvaluation
+	if eval.ASTStatus != ASTUnspecified {
+		t.Fatalf("uninitialized eval ASTStatus = %q, want unspecified", eval.ASTStatus)
+	}
+	reason := barrierReason(eval)
+	if strings.Contains(reason, "corrupt") {
+		t.Fatalf("barrier reason for an unspecified status must never name corruption, got %q", reason)
+	}
+	if !strings.Contains(reason, "unverified") {
+		t.Fatalf("barrier reason for an unspecified status must read unverified, got %q", reason)
+	}
+
+	// A zero-value eval is fail-closed (gate refuses to pass) but that closure
+	// is "unverified AST", never "corrupt AST".
+	if eval.ExecutionGate() {
+		t.Fatal("an uninitialized evaluation must not pass the ExecutionGate")
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
+	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
 )
 
 // ── PRODUCTION AUTONOMOUS DRIVER BRIDGE (Phase 6) ───────────────────────────
@@ -60,6 +61,11 @@ type autonomousDriver interface {
 	ResumeClarify(ctx context.Context, target string) (*autonomy.LoopTermination, error)
 	ResumeApproveProposal(ctx context.Context) (*autonomy.LoopTermination, error)
 	ResumeRejectProposal(ctx context.Context, reason string) (*autonomy.LoopTermination, error)
+	// ResumeWithProposal routes a human-selected DecisionSurface recovery
+	// intent (rescope_bounded_patch / retry_with_explicit_budget / repair_first
+	// / inspect / cancel) back to the runtime. The intent is a plain string so
+	// this projection never imports the runtime autonomy package.
+	ResumeWithProposal(ctx context.Context, intent string) (*autonomy.LoopTermination, error)
 	Abort(reason string) (*autonomy.LoopTermination, error)
 	State() autonomy.RuntimeState
 	Boundary() *autonomy.HumanBoundary
@@ -236,6 +242,25 @@ func (m *model) resumeAutonomousClarify() tea.Cmd {
 	})
 }
 
+// resumeAutonomousProposal resumes a parked ZERO-TOKEN DecisionSurface with the
+// selected recovery intent (rescope_bounded_patch / retry_with_explicit_budget
+// / repair_first / inspect / cancel). The intent is a pure string routed to
+// Driver.ResumeWithProposal; the runtime creates a NEW execution contract for a
+// recovery and re-runs preflight. Zero files are touched by this call itself.
+func (m *model) resumeAutonomousProposal(intent string) tea.Cmd {
+	if !m.autonomousParked() {
+		return nil
+	}
+	m.autonomousBoundary = nil
+	m.proposalTUI = nil
+	m.beginAutonomousResume("autonomy recovery")
+	ctx := m.operationContext()
+	return m.autonomousResumeCmds(func() tea.Msg {
+		term, err := m.autonomousDriver.ResumeWithProposal(ctx, intent)
+		return autonomousRunMsg{term: term, err: err}
+	})
+}
+
 // resumeAutonomousProposalApprove resolves a parked DECOMPOSITION_PROPOSAL
 // boundary by authorizing the WHOLE plan: the driver runs every approved
 // sub-task as one atomic transaction. The authorization issued here covers
@@ -366,6 +391,14 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 				// an inform/pause notice.
 				m.finalizeOperation(OpOutcomeAmbiguous, nil)
 				m.renderAutonomousDecompositionBoundary(b)
+			case autonomy.HumanBoundaryProposal:
+				// A ZERO-TOKEN DecisionSurface park is a LIVE human decision:
+				// render the interactive recovery surface (bounded patch /
+				// explicit budget / inspect / cancel), NEVER a static pause.
+				// The typed options cross on the boundary itself — the runtime
+				// never relies on log strings for a human decision.
+				m.finalizeOperation(OpOutcomeAmbiguous, nil)
+				m.renderAutonomousProposalBoundary(b)
 			default:
 				m.finalizeOperation(OpOutcomeFailure, nil)
 				m.renderAutonomousInformBoundary(b)
@@ -499,6 +532,56 @@ func (m *model) renderAutonomousInformBoundary(b *autonomy.HumanBoundary) {
 	m.push(roleSystem, mutedStyle.Render("  No further automatic execution. Start a fresh run (Ctrl+C to dismiss)."))
 }
 
+// renderAutonomousProposalBoundary renders the parked ZERO-TOKEN DecisionSurface
+// as an interactive recovery menu. The typed options cross on the boundary
+// (HumanBoundary.ProposalOptions) — never from log strings. The pure
+// presentation ProposalModel owns navigation; a selection routes one intent to
+// Driver.ResumeWithProposal.
+func (m *model) renderAutonomousProposalBoundary(b *autonomy.HumanBoundary) {
+	if len(b.ProposalOptions) == 0 {
+		// Defense-in-depth deadlock guard: a parked DecisionSurface boundary
+		// with no selectable options is a deadlock by construction. Fall back
+		// to the inform card rather than stranding the run invisibly.
+		m.renderAutonomousInformBoundary(b)
+		return
+	}
+	m.proposalTUI = proposaltui.NewProposalModel(proposalSurfaceFromBoundary(b))
+	m.proposalTUI.Reset()
+	m.push(roleStatus, fmt.Sprintf(
+		"%s PREFLIGHT RECOVERY — %s requires a decision",
+		boldSapphireStyle.Render(Icon.Blueprint), b.Targets))
+	m.push(roleSystem, mutedStyle.Render("  "+b.Reason))
+	m.push(roleSystem, infoStyle.Render("  ↑/↓ navigate · Enter select · Esc cancel"))
+}
+
+// proposalSurfaceFromBoundary projects the typed recovery options + surface
+// facts the runtime boundary carries onto the pure-presentation DecisionSurface
+// the modal renders. It is a lossless scalar projection — no runtime import, no
+// log parsing.
+func proposalSurfaceFromBoundary(b *autonomy.HumanBoundary) proposaltui.DecisionSurface {
+	s := proposaltui.DecisionSurface{Options: make([]proposaltui.ProposalOption, 0, len(b.ProposalOptions))}
+	if len(b.Targets) > 0 {
+		s.Target = b.Targets[0]
+	}
+	if b.Proposal != nil {
+		s.Target = b.Proposal.Target
+	}
+	s.ASTStatus = b.SurfaceASTStatus
+	s.FailureCategory = b.SurfaceFailureCategory
+	s.EstimatedTokens = b.SurfaceEstimatedTokens
+	s.CurrentBudget = b.SurfaceCurrentBudget
+	s.Reason = b.Reason
+	for _, opt := range b.ProposalOptions {
+		s.Options = append(s.Options, proposaltui.ProposalOption{
+			ID:          opt.ID,
+			Label:       opt.Label,
+			Description: opt.Description,
+			Intent:      proposaltui.ProposalIntent(opt.Intent),
+		})
+	}
+	return s
+}
+
 // renderAutonomousDecompositionBoundary renders the parked DECOMPOSITION_
 // PROPOSAL (PLAN_STAGED) status lines: the staged plan, its strategy and its
 // sub-task breakdown, plus the explicit keybindings.
@@ -618,6 +701,22 @@ func (m *model) renderAutonomousBoundaryBlock(width int) string {
 		sb.WriteString(" " + sep + "\n")
 		sb.WriteString(" " + fmt.Sprintf("%s Authorize & Run DAG   %s Cancel",
 			decompositionKeyStyle.Render("[Enter]"), decompositionKeyStyle.Render("[Esc]")) + "\n")
+		return permissionBoxStyle.Width(boxWidth).Render(sb.String())
+	case autonomy.HumanBoundaryProposal:
+		// The ZERO-TOKEN DecisionSurface recovery menu. It is a LIVE human
+		// decision surface — the interactive selection model owns rendering so
+		// the options are always selectable (never a static pause).
+		if m.proposalTUI != nil {
+			return m.proposalTUI.Render(width)
+		}
+		sb.WriteString(permissionTitleStyle.Render(Icon.Warning + " PREFLIGHT RECOVERY"))
+		sb.WriteString("\n\n")
+		sb.WriteString(permissionDescStyle.Render("Reason:"))
+		sb.WriteString(" " + infoStyle.Render(b.Reason))
+		sb.WriteString("\n")
+		sep := strings.Repeat("─", boxWidth-4)
+		sb.WriteString(" " + sep + "\n")
+		sb.WriteString(" " + mutedStyle.Render("↑/↓ navigate · Enter select · Esc cancel") + "\n")
 		return permissionBoxStyle.Width(boxWidth).Render(sb.String())
 	default:
 		return ""

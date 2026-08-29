@@ -148,15 +148,19 @@ func (p *dagProvider) windowLine(prompt string) (string, bool) {
 }
 
 // TestDecomposition_FallbackWindowSplitting simulates a Manifest Pass failure
-// over a 133-line file and asserts the bounded fallback decomposition stages
-// AT LEAST 3 contiguous bounded sub-tasks (e.g. 1-40, 41-80, 81-120, 121-133)
-// instead of one giant whole-file sub-task — so every unit's output budget
-// stays a small targeted SEARCH/REPLACE delta.
+// over a NON-STRUCTURED target (plain text: no Lea scanner, no registered
+// decomposer) and asserts the bounded fallback decomposition stages AT LEAST 3
+// contiguous bounded sub-tasks (e.g. 1-40, 41-80, 81-120, 121-133) instead of
+// one giant whole-file sub-task — so every unit's output budget stays a small
+// targeted SEARCH/REPLACE delta. Structured targets prefer semantic block
+// boundaries (see TestDecomposition_FallbackSemanticBlockOrOutline); the
+// bounded window slicing is the safety net that survives when no structural
+// topology exists.
 func TestDecomposition_FallbackWindowSplitting(t *testing.T) {
 	const totalLines = 133
 	var b strings.Builder
 	for i := 0; i < totalLines; i++ {
-		fmt.Fprintf(&b, "<p class=\"line-%d\">filler content %d</p>\n", i, i)
+		fmt.Fprintf(&b, "plain text filler line %d with enough content to pad the window.\n", i)
 	}
 	source := []byte(b.String())
 	if n := planner.LineCount(source); n != totalLines {
@@ -164,7 +168,7 @@ func TestDecomposition_FallbackWindowSplitting(t *testing.T) {
 	}
 
 	const maxOutput = 1024 // <= 2048: the bounded ceiling invariant applies
-	dag, err := fallbackDecompose("check this file @index.html and remove redundant content", "index.html", source, "digest", maxOutput)
+	dag, err := fallbackDecompose("check this file @notes.txt and remove redundant content", "notes.txt", source, "digest", maxOutput)
 	if err != nil {
 		t.Fatalf("fallbackDecompose: %v", err)
 	}
@@ -200,6 +204,145 @@ func TestDecomposition_FallbackWindowSplitting(t *testing.T) {
 	}
 	if err := dag.Validate(); err != nil {
 		t.Fatalf("DAG Validate: %v", err)
+	}
+}
+
+// TestDecomposition_FallbackSemanticBlockOrOutline proves the SEMANTIC BLOCK
+// FALLBACK PRIORITY: a structured 133-line HTML document fed into the
+// manifest-less fallback decomposition is partitioned along structural block
+// boundaries (<head>, <header>, <main>, <footer>) instead of blind 40-line
+// cuts, and the resulting sub-task prompts carry the DOCUMENT OUTLINE CONTEXT
+// header so line-bounded units retain whole-document awareness.
+func TestDecomposition_FallbackSemanticBlockOrOutline(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("<!DOCTYPE html>\n")          // 1
+	b.WriteString("<html>\n")                   // 2
+	b.WriteString("<head>\n")                   // 3
+	b.WriteString("<title>Portfolio</title>\n") // 4
+	b.WriteString("</head>\n")                  // 5
+	b.WriteString("<body>\n")                   // 6
+	b.WriteString("<header id=\"top-nav\">\n")  // 7
+	b.WriteString("<nav><a href=\"#hero\">Home</a></nav>\n")
+	b.WriteString("</header>\n")
+	b.WriteString("<main id=\"hero\">\n")
+	for i := 10; i <= 118; i++ {
+		fmt.Fprintf(&b, "<section class=\"card\"><h2>Card %d</h2><p>content block %d padded.</p></section>\n", i, i)
+	}
+	b.WriteString("</main>\n")
+	b.WriteString("<footer id=\"site-footer\">\n<span>2026</span>\n</footer>\n")
+	b.WriteString("</body>\n</html>\n")
+	source := []byte(b.String())
+	total := planner.LineCount(source)
+	if total < 120 {
+		t.Fatalf("fixture lines = %d, want >= 120 (structured document)", total)
+	}
+
+	const maxOutput = 1024
+	dag, err := fallbackDecompose("check this file @index.html and remove redundant content", "index.html", source, "digest", maxOutput)
+	if err != nil {
+		t.Fatalf("fallbackDecompose: %v", err)
+	}
+	if err := dag.Validate(); err != nil {
+		t.Fatalf("DAG Validate: %v", err)
+	}
+
+	// SEMANTIC BLOCK PRIORITY: at least 2 sub-tasks partitioned along
+	// structural boundaries — never one giant whole-file unit, never pure
+	// 40-line windows over a structured document.
+	if len(dag.SubTasks) < 2 {
+		t.Fatalf("sub-tasks = %d, want >= 2 semantic-block sub-tasks", len(dag.SubTasks))
+	}
+	semanticCount := 0
+	for _, st := range dag.SubTasks {
+		if st.Kind == planner.SplitSemantic || st.Kind == planner.SplitBlock || st.Kind == planner.SplitAST {
+			semanticCount++
+		}
+		if strings.HasPrefix(st.Description, "bounded fallback window") {
+			t.Errorf("sub-task %s is a blind line window over a structured document: %q", st.ID, st.Description)
+		}
+	}
+	if semanticCount == 0 {
+		t.Fatalf("no semantic-block sub-task staged; all are blind line windows")
+	}
+
+	// The DAG surface produced by the semantic fallback is compatible with the
+	// outline: the block map must name the top-level structural landmarks.
+	blocks := targetOutlineBlocks("index.html", source)
+	joined := ""
+	for _, blk := range blocks {
+		joined += blk.label + " "
+	}
+	for _, want := range []string{"head", "header", "main", "footer"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("document outline missing the %q block; blocks: %q", want, joined)
+		}
+	}
+
+	// DOCUMENT OUTLINE CONTEXT: every staged sub-task's prompt carries the
+	// global structure header with the file's total lines and its own window.
+	for _, st := range dag.SubTasks {
+		outline := buildTargetOutline(source, "index.html", st.Region)
+		for _, want := range []string{
+			"DOCUMENT OUTLINE CONTEXT:",
+			"Global Scope Summary:",
+			fmt.Sprintf("has %d total lines", total),
+			fmt.Sprintf("You are editing %s within this context.", st.Region),
+			"Check for redundancies against the overall structure.",
+		} {
+			if !strings.Contains(outline, want) {
+				t.Errorf("sub-task %s outline missing %q:\n%s", st.ID, want, outline)
+			}
+		}
+	}
+}
+
+// TestDecomposition_FallbackXMLBlocks proves the semantic block fallback also
+// serves .xml targets: top-level element spans (plus any preamble) define the
+// sub-task boundaries instead of blind 40-line cuts, and the sub-task prompts
+// carry the DOCUMENT OUTLINE CONTEXT header.
+func TestDecomposition_FallbackXMLBlocks(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("<?xml version=\"1.0\"?>\n") // 1
+	b.WriteString("<catalog>\n")               // 2
+	for i := 0; i < 60; i++ {
+		fmt.Fprintf(&b, "  <book id=\"%d\"><title>Book %d</title><price>%d.00</price></book>\n", i, i, i)
+	}
+	b.WriteString("</catalog>\n") // 63
+	source := []byte(b.String())
+	total := planner.LineCount(source)
+	if total < 60 {
+		t.Fatalf("fixture lines = %d, want >= 60", total)
+	}
+
+	const maxOutput = 1024
+	dag, err := fallbackDecompose("check @catalog.xml and remove redundant content", "catalog.xml", source, "digest", maxOutput)
+	if err != nil {
+		t.Fatalf("fallbackDecompose: %v", err)
+	}
+	if err := dag.Validate(); err != nil {
+		t.Fatalf("DAG Validate: %v", err)
+	}
+	if len(dag.SubTasks) < 2 {
+		t.Fatalf("sub-tasks = %d, want >= 2 (xml header + top-level element)", len(dag.SubTasks))
+	}
+	if dag.Kind != planner.SplitBlock {
+		t.Fatalf("plan kind = %s, want %s", dag.Kind, planner.SplitBlock)
+	}
+	for _, st := range dag.SubTasks {
+		if strings.HasPrefix(st.Description, "bounded fallback window") {
+			t.Errorf("sub-task %s is a blind line window over structured XML: %q", st.ID, st.Description)
+		}
+		// The outline names the top-level block map.
+		outline := buildTargetOutline(source, "catalog.xml", st.Region)
+		for _, want := range []string{
+			"DOCUMENT OUTLINE CONTEXT:",
+			"<catalog>",
+			fmt.Sprintf("You are editing %s within this context.", st.Region),
+		} {
+			if !strings.Contains(outline, want) {
+				t.Errorf("sub-task %s outline missing %q:\n%s", st.ID, want, outline)
+			}
+		}
 	}
 }
 
