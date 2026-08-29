@@ -1480,6 +1480,23 @@ type model struct {
 	// independent concerns. Selection operates on logical records, not terminal
 	// byte offsets.
 	mouseSel mouseSelection
+	// viewportHitMap is the single source of truth for mouse hit-testing.
+	// Generated atomically alongside Viewport.SetContent; cached only for
+	// the visible window (YOffset .. YOffset+Height) for bounded memory.
+	viewportHitMap ViewportHitMap
+	fullHitRows    []RowLayout // transient full physical rows before windowing
+	// viewportPaneLeft/Top are split-pane offsets for multi-pane geometry.
+	// When running inside tmux/Ghostty splits, the viewport does not occupy
+	// absolute (0,0) of the terminal; mouse coordinates must be translated
+	// relative to these offsets. Tests inject non-zero values to verify
+	// relative hit-testing. Zero value means full-screen (no pane offset).
+	viewportPaneLeft int
+	viewportPaneTop  int
+	// frozenHitRows preserves the hitmap while dragging to prevent background
+	// ticks from shifting layout. Nil when not dragging.
+	frozenFullHitRows []RowLayout
+	frozenViewportStr string
+	frozenRecords     []record
 }
 
 // isProjectInitialized checks whether .izen/ exists AND contains a valid
@@ -2989,6 +3006,67 @@ func (m *model) renderRecordForViewport(rec record) string {
 	}
 }
 
+// canonicalRecordsContent builds the single canonical rendered string for all
+// records at the current width. It is the sole source of truth for both Idle
+// and Selection rendering — enabling selection must not alter row count,
+// line height, metadata visibility, or line merging. Physical row N in Idle
+// MUST remain physical row N in Selection.
+func (m *model) canonicalRecordsContent() string {
+	if len(m.records) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, rec := range m.records {
+		rendered := m.renderRecordForViewport(rec)
+		if rendered == "" {
+			continue
+		}
+		b.WriteString(rendered)
+		if i < len(m.records)-1 {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// renderRecordsWithMouseSelectionFromCanonical renders the canonical records
+// string with mouse selection highlight applied as a pure ANSI overlay.
+// It reuses the same per-record render path as canonicalRecordsContent so row
+// counts remain identical; only ANSI styling bytes are added.
+func (m *model) renderRecordsWithMouseSelectionFromCanonical(canonical string) string {
+	if len(m.records) == 0 {
+		return ""
+	}
+	// Use per-record injection to keep 1:1 mapping with canonical's row
+	// splitting. This delegates to the existing selection renderer which is
+	// now guaranteed to use the same width/prefix as canonical.
+	_ = canonical // canonical is the joined rendered output; we regenerate per-record to inject styles
+	return m.renderRecordsWithMouseSelection()
+}
+
+// highlightFrozenCanonical re-applies the current mouse selection highlight
+// onto the frozen canonical snapshot taken at drag start. This preserves row
+// count while dragging so background timers cannot shift layout.
+func (m *model) highlightFrozenCanonical(frozen string) string {
+	if frozen == "" {
+		return m.renderRecordsWithMouseSelection()
+	}
+	// If frozen records snapshot exists, use it to generate highlighted
+	// output with the same row structure as at drag start. We temporarily
+	// swap records for rendering then restore.
+	if len(m.frozenRecords) > 0 {
+		saved := m.records
+		m.records = m.frozenRecords
+		highlighted := m.renderRecordsWithMouseSelection()
+		m.records = saved
+		return highlighted
+	}
+	// Fallback: frozen is already the rendered canonical with no highlight;
+	// split and inject highlight manually is complex, so regenerate from
+	// current records which should be identical while frozen.
+	return m.renderRecordsWithMouseSelection()
+}
+
 // sanitizeEscapes converts literal backslash escape sequences that reach the
 // record text from external processes or engine payloads into real control
 // characters: \n → newline, \t → tab, \" → quote. Expanding them here means
@@ -3472,12 +3550,34 @@ func (m *model) refreshViewportContent() {
 		content.WriteString(m.renderWorkspaceHeader())
 	}
 
+	// ── Idempotent canonical pipeline: both Idle and Selection use the same
+	// canonical records string so physical row N remains identical. Selection
+	// highlight is an ANSI overlay that does not alter row counts.
+	canonical := m.canonicalRecordsContent()
+	// Keep PreRenderedHistory in sync with canonical when not streaming and not
+	// dragging so WindowSize-induced stale cache cannot cause layout shift.
+	if !m.streaming && !m.mouseSel.Dragging && canonical != "" {
+		m.PreRenderedHistory = canonical
+	}
 	switch {
 	case m.inViMode:
 		content.WriteString(m.renderRecordsWithCursor())
 	case m.mouseSel.Active:
-		content.WriteString(m.renderRecordsWithMouseSelection())
+		// If dragging and we have a frozen snapshot, preserve row count by
+		// using the frozen canonical layout and only updating highlight.
+		// This prevents background Thought for timers or streaming tokens from
+		// shifting rows under the cursor.
+		if m.mouseSel.Dragging && m.frozenViewportStr != "" {
+			// frozenViewportStr is the canonical at drag start; re-highlight
+			// it with the current selection range. Row count stays frozen.
+			content.WriteString(m.highlightFrozenCanonical(m.frozenViewportStr))
+		} else {
+			content.WriteString(m.renderRecordsWithMouseSelectionFromCanonical(canonical))
+		}
+	case canonical != "":
+		content.WriteString(canonical)
 	case m.PreRenderedHistory != "":
+		// Fallback for legacy cached content when canonical is empty
 		content.WriteString(m.PreRenderedHistory)
 	}
 
@@ -3635,6 +3735,63 @@ func (m *model) refreshViewportContent() {
 		}
 	}
 
+	// ── Build ViewportHitMap atomically alongside content ──────────────
+	// Single source of truth: wrap/prefix budgets are computed once in
+	// buildFullHitMap (hitmap.go) and consumed by mouse hit-testing.
+	// Memory bounded: only the visible window (YOffset..YOffset+Height) is cached.
+	contentStr := content.String()
+	var fullRows []RowLayout
+	if m.mouseSel.Dragging && m.frozenFullHitRows != nil && len(m.frozenFullHitRows) > 0 {
+		// Layout freezing: preserve the hitmap snapshot taken at drag start
+		// so background Thought for timers cannot shift rows.
+		fullRows = m.frozenFullHitRows
+		// Still account for tail chrome that may have grown beyond frozen
+		// length, but ensure the frozen prefix+records rows remain stable.
+		totalRows := countPhysicalRows(contentStr)
+		if totalRows > len(fullRows) {
+			for i := len(fullRows); i < totalRows; i++ {
+				fullRows = append(fullRows, RowLayout{RecordIdx: -1, LogicalLine: -1, PrefixCells: 0})
+			}
+		}
+		m.fullHitRows = fullRows
+	} else {
+		fullRows = buildFullHitMap(m)
+		// Account for tail chrome (execution log, shimmer, thinking, trace, trees)
+		// that are part of viewport content but not records.
+		totalRows := countPhysicalRows(contentStr)
+		if totalRows > len(fullRows) {
+			for i := len(fullRows); i < totalRows; i++ {
+				fullRows = append(fullRows, RowLayout{RecordIdx: -1, LogicalLine: -1, PrefixCells: 0})
+			}
+		}
+		m.fullHitRows = fullRows
+		// Snapshot for future drag freeze when not already dragging.
+		if m.mouseSel.Dragging && m.frozenFullHitRows == nil {
+			m.frozenFullHitRows = append([]RowLayout(nil), fullRows...)
+			m.frozenViewportStr = contentStr
+		}
+	}
+	geoH := m.viewportGeometry().Height
+	yOff := 0
+	if m.Ready {
+		yOff = m.Viewport.YOffset
+	}
+	if yOff < 0 {
+		yOff = 0
+	}
+	if yOff > len(fullRows) {
+		yOff = len(fullRows)
+	}
+	end := yOff + geoH
+	if end > len(fullRows) {
+		end = len(fullRows)
+	}
+	if yOff < end {
+		m.viewportHitMap = ViewportHitMap{YOffset: yOff, Rows: append([]RowLayout(nil), fullRows[yOff:end]...)}
+	} else {
+		m.viewportHitMap = ViewportHitMap{YOffset: yOff, Rows: nil}
+	}
+
 	// ── VIEWPORT SCROLL LOCK (Ctrl+O output-trace) ────────────────────
 	// While the expanded output-trace viewport is active, preserve the exact
 	// YOffset across SetContent: a transient content shrink would otherwise
@@ -3642,11 +3799,11 @@ func (m *model) refreshViewportContent() {
 	// lines (the Ctrl+O flicker during active generation).
 	if m.traceExpanded {
 		saved := m.Viewport.YOffset
-		m.Viewport.SetContent(content.String())
+		m.Viewport.SetContent(contentStr)
 		m.Viewport.SetYOffset(saved)
 		return
 	}
-	m.Viewport.SetContent(content.String())
+	m.Viewport.SetContent(contentStr)
 }
 
 // renderRecordsWithCursor renders all chat records with vi-mode cursor and

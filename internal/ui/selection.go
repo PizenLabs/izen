@@ -5,7 +5,6 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 )
@@ -51,99 +50,149 @@ func selectionScrollTickCmd(y, x int) tea.Cmd {
 }
 
 // mousePosToLogical maps an absolute terminal MouseMsg coordinate (X,Y) to a
-// logical record position using the authoritative viewport geometry and the
-// physical-to-logical line model already used by vi scrolling. It does NOT
-// guess layout - every offset (header, prefix, gutter) is derived from the
-// same rendering geometry the viewport uses.
+// logical record position using the single-source ViewportHitMap generated
+// atomically alongside Viewport.SetContent. It is O(1) into the visible window
+// (Rows[relY]) and correctly accounts for per-row PrefixCells, wrapping
+// RuneStartIdx, and grapheme cell widths. No wrapping or gutter is re-derived.
 func (m *model) mousePosToLogical(msg tea.MouseMsg) selPos {
 	if len(m.records) == 0 {
 		return selPos{Line: 0, Col: 0}
 	}
 	geo := m.viewportGeometry()
+	// Relative Multi-Pane Geometry: convert absolute terminal coordinates
+	// into viewport-local coordinates. In split panes (tmux/Ghostty),
+	// msg.X/Y are absolute; viewportGeometry.Left/Top are pane offsets.
 	relY := msg.Y - geo.Top
+	relX := msg.X - geo.Left
+	// Clamp bounds strictly: reject/clamp without panic. Outside viewport
+	// horizontally or vertically we clamp to nearest valid edge.
 	if relY < 0 {
 		relY = 0
 	}
 	if relY >= geo.Height {
 		relY = geo.Height - 1
 	}
-	physOffset := 0
+	if relX < 0 {
+		relX = 0
+	}
+	if relX >= geo.Width {
+		relX = geo.Width - 1
+	}
+	_ = relX // preserved for geometry completeness; X mapping uses geo.Left below
+	yOff := 0
 	if m.Ready {
-		physOffset = m.Viewport.YOffset
+		yOff = m.Viewport.YOffset
 	}
-	targetContentRow := physOffset + relY
-
-	// The viewport's SetContent starts with a prefix (workspace header, context
-	// header, banner) before the first record. Remove it so the phys mapping
-	// aligns with the record array.
-	prefix := m.viewportContentPrefixHeight()
-	recordRow := targetContentRow - prefix
-	if recordRow < 0 {
-		recordRow = 0
+	// Ensure hitmap is populated (tests may call before first refresh).
+	if len(m.fullHitRows) == 0 {
+		m.fullHitRows = buildFullHitMap(m)
+		total := countPhysicalRows(m.Viewport.View())
+		_ = total
 	}
-
-	n := len(m.records)
-	phys := make([]int, n+1)
-	for i := 0; i < n; i++ {
-		c := m.renderedLineCount(m.records[i])
-		if c == 0 {
-			c = 1
+	var row RowLayout
+	found := false
+	// Fast path: windowed hitmap Rows[relY] when YOffset matches.
+	if len(m.viewportHitMap.Rows) > 0 && m.viewportHitMap.YOffset == yOff && relY < len(m.viewportHitMap.Rows) {
+		row = m.viewportHitMap.Rows[relY]
+		found = true
+	} else if len(m.fullHitRows) > 0 {
+		target := yOff + relY
+		if target < 0 {
+			target = 0
 		}
-		phys[i+1] = phys[i] + c
-	}
-	// Clamp recordRow to last physical row
-	totalPhys := phys[n]
-	if recordRow >= totalPhys {
-		recordRow = totalPhys - 1
-		if recordRow < 0 {
-			recordRow = 0
+		if target >= len(m.fullHitRows) {
+			target = len(m.fullHitRows) - 1
+		}
+		if target >= 0 && target < len(m.fullHitRows) {
+			row = m.fullHitRows[target]
+			found = true
 		}
 	}
-	idx := n - 1
-	for i := 0; i < n; i++ {
-		if recordRow < phys[i+1] {
-			idx = i
-			break
+	if !found {
+		// Fallback: clamp to last record start when hitmap unavailable (should not happen).
+		return selPos{Line: len(m.records) - 1, Col: 0}
+	}
+	// Chrome rows (prefix / headers / blank separators with no logical line) clamp to nearest record.
+	if row.RecordIdx < 0 || row.LogicalLine < 0 {
+		// Scan outward for nearest record row in fullHitRows.
+		target := yOff + relY
+		// Search backward then forward for a real record.
+		for d := 1; d < len(m.fullHitRows); d++ {
+			for _, candIdx := range []int{target - d, target + d} {
+				if candIdx >= 0 && candIdx < len(m.fullHitRows) {
+					c := m.fullHitRows[candIdx]
+					if c.RecordIdx >= 0 && c.LogicalLine >= 0 {
+						row = c
+						found = true
+						break
+					}
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			// No record rows at all — clamp to first
+			return selPos{Line: 0, Col: 0}
 		}
 	}
-	// ── Horizontal mapping: terminal X -> logical column ──────────
-	// Columns are measured in terminal cells. Strip ANSI from the gutter to
-	// obtain its true cell width, then convert the remaining cell offset into
-	// a rune index using per-rune cell widths (runewidth), so CJK / emoji /
-	// wide runes map correctly.
-	gutterWidth := lipgloss.Width(ansi.Strip(gutterFor(m.records[idx].role)))
-	if gutterWidth < 0 {
-		gutterWidth = 0
+	idx := int(row.RecordIdx)
+	if idx < 0 {
+		idx = 0
 	}
-	cellCol := msg.X - geo.Left - gutterWidth
-	if cellCol < 0 {
-		cellCol = 0
+	if idx >= len(m.records) {
+		idx = len(m.records) - 1
 	}
-	// For wrapped records the physical row may be the 2nd/3rd wrapped segment.
-	// Its base logical offset is wrapRow * wrapWidth.
-	wrapOffset := recordRow - phys[idx]
-	wrapWidth := m.width - 4
-	if wrapWidth < 10 {
-		wrapWidth = 10
+	// Horizontal: content cell offset after stripping per-row PrefixCells.
+	// Use the already-clamped relative X so split-pane offsets cannot drift.
+	cellX := relX
+	if cellX < 0 {
+		cellX = 0
 	}
-	relRune := m.cellToRuneCol(idx, cellCol)
-	var col int
-	if wrapOffset == 0 {
-		col = relRune
-	} else {
-		totalCells := wrapOffset*wrapWidth + cellCol
-		col = m.cellToRuneCol(idx, totalCells)
+	if cellX >= geo.Width {
+		cellX = geo.Width - 1
 	}
-	lineLen := m.lineRuneLen(idx)
-	if lineLen == 0 {
-		col = 0
-	} else if col >= lineLen {
-		col = lineLen - 1
+	prefixCells := int(row.PrefixCells)
+	contentX := cellX - prefixCells
+	if contentX < 0 {
+		contentX = 0
 	}
-	if col < 0 {
-		col = 0
+	// Map contentX (cells) to rune offset within this row's logical line segment,
+	// using runewidth so CJK (2 cells) and emoji (2 cells) map correctly.
+	// The hitmap's RuneStartIdx is the absolute rune index in the logical line
+	// where this physical segment begins.
+	rawLines := strings.Split(sanitizeText(m.records[idx].text), "\n")
+	ll := int(row.LogicalLine)
+	if ll < 0 || ll >= len(rawLines) {
+		// Fallback to whole record text (single logical line)
+		ll = 0
+		if len(rawLines) > 0 {
+			rawLines[0] = sanitizeText(m.records[idx].text)
+		} else {
+			return selPos{Line: idx, Col: 0}
+		}
 	}
-	return selPos{Line: idx, Col: col}
+	lineStr := rawLines[ll]
+	// Clamp contentX to this row's ContentLen so clicks beyond line end map to segment end.
+	if int(row.ContentLen) > 0 && contentX > int(row.ContentLen) {
+		contentX = int(row.ContentLen)
+	}
+	absCol := cellToRuneInString(lineStr, int(row.RuneStartIdx), contentX)
+	// Clamp to line bounds (selPos is inclusive; last index is len-1 for non-empty)
+	lineRunes := []rune(lineStr)
+	if len(lineRunes) == 0 {
+		absCol = 0
+	} else if absCol >= len(lineRunes) {
+		absCol = len(lineRunes) - 1
+		if absCol < 0 {
+			absCol = 0
+		}
+	}
+	if absCol < 0 {
+		absCol = 0
+	}
+	return selPos{Line: idx, Col: absCol}
 }
 
 // cellToRuneCol converts a visual cell offset within a record's plain text
@@ -241,6 +290,9 @@ func (m *model) copyMouseSelection() tea.Cmd {
 	text := m.serializeMouseSelection()
 	if strings.TrimSpace(text) == "" {
 		m.mouseSel = mouseSelection{}
+		m.frozenFullHitRows = nil
+		m.frozenViewportStr = ""
+		m.frozenRecords = nil
 		m.refreshViewportContent()
 		return nil
 	}
@@ -251,6 +303,9 @@ func (m *model) copyMouseSelection() tea.Cmd {
 		werr = clipboardWriteAll(text)
 	}
 	m.mouseSel = mouseSelection{}
+	m.frozenFullHitRows = nil
+	m.frozenViewportStr = ""
+	m.frozenRecords = nil
 	m.refreshViewportContent()
 	if werr != nil {
 		m.uiNotice = "Failed to copy selection: " + werr.Error()
@@ -302,15 +357,20 @@ func (m *model) handleSelectionAutoScroll(msg selectionScrollTickMsg) tea.Cmd {
 		return nil
 	}
 	if m.Ready {
-		// Compute max offset including prefix lines, not just records.
-		n := len(m.records)
-		totalPhys := m.viewportContentPrefixHeight()
-		for i := 0; i < n; i++ {
-			c := m.renderedLineCount(m.records[i])
-			if c == 0 {
-				c = 1
+		// Compute max offset from hitmap (single source) when available.
+		totalPhys := 0
+		if len(m.fullHitRows) > 0 {
+			totalPhys = len(m.fullHitRows)
+		} else {
+			n := len(m.records)
+			totalPhys = m.viewportContentPrefixHeight()
+			for i := 0; i < n; i++ {
+				c := m.renderedLineCount(m.records[i])
+				if c == 0 {
+					c = 1
+				}
+				totalPhys += c
 			}
-			totalPhys += c
 		}
 		maxOff := totalPhys - geo.Height
 		if maxOff < 0 {

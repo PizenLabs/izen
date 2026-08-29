@@ -121,6 +121,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	// without aborting a concurrent streaming/tool run.
 	if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.Type == tea.KeyEsc && m.mouseSel.Active {
 		m.mouseSel = mouseSelection{}
+		m.frozenFullHitRows = nil
+		m.frozenViewportStr = ""
+		m.frozenRecords = nil
 		m.refreshViewportContent()
 		return m, nil
 	}
@@ -400,6 +403,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		m.syncShimmerWidth()
 
+		// Flush and rebuild hitmap immediately on resize; clear any frozen
+		// drag snapshot so new dimensions are reflected.
+		m.frozenFullHitRows = nil
+		m.frozenViewportStr = ""
+		m.frozenRecords = nil
 		m.refreshViewportContent()
 		return m, nil
 
@@ -468,8 +476,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// 1. Physically advance the spinner frame.
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
 			// 2. Repaint the viewport from the live stream/agent buffers.
+			// Layout freezing: while dragging, background ticks must not
+			// trigger re-layout that would shift rows under the cursor.
 			if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.state == StateProcessing || m.shellRunning {
-				m.refreshViewportContent()
+				if !m.mouseSel.Dragging {
+					m.refreshViewportContent()
+				}
 			}
 			// 3. Re-dispatch the smooth tick to keep the render loop alive.
 			return m, m.smoothStreamTickCmd()
@@ -2839,6 +2851,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if msg.Button == tea.MouseButtonLeft {
 				pos := m.mousePosToLogical(msg)
 				m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: pos, Cursor: pos, lastY: msg.Y, lastX: msg.X, TickActive: false}
+				// Freeze layout snapshot at drag start so background ticks
+				// cannot shift rows under the cursor.
+				canonical := m.canonicalRecordsContent()
+				m.frozenRecords = append([]record(nil), m.records...)
+				m.frozenViewportStr = canonical
+				if len(m.fullHitRows) > 0 {
+					m.frozenFullHitRows = append([]RowLayout(nil), m.fullHitRows...)
+				} else {
+					m.frozenFullHitRows = buildFullHitMap(m)
+				}
 				// Freeze streaming auto-follow while inspecting via selection.
 				m.userIsScrollingUp = true
 				m.refreshViewportContent()
@@ -2869,6 +2891,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				m.mouseSel.Cursor = m.mousePosToLogical(msg)
 				m.mouseSel.Dragging = false
 				m.mouseSel.TickActive = false
+				// Clear frozen layout snapshot; next refresh will rebuild
+				// with current content including any background updates.
+				m.frozenFullHitRows = nil
+				m.frozenViewportStr = ""
+				m.frozenRecords = nil
 				cmd := m.copyMouseSelection()
 				return m, cmd
 			}
@@ -2877,6 +2904,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				m.mouseSel.Cursor = m.mousePosToLogical(msg)
 				m.mouseSel.Dragging = false
 				m.mouseSel.TickActive = false
+				m.frozenFullHitRows = nil
+				m.frozenViewportStr = ""
+				m.frozenRecords = nil
 				cmd := m.copyMouseSelection()
 				return m, cmd
 			}

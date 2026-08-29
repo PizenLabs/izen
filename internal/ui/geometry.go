@@ -72,8 +72,8 @@ func (m *model) viewportGeometry() ViewportGeometry {
 	}
 
 	return ViewportGeometry{
-		Top:    headerLines,
-		Left:   0,
+		Top:    headerLines + m.viewportPaneTop,
+		Left:   m.viewportPaneLeft,
 		Width:  m.Viewport.Width,
 		Height: height,
 	}
