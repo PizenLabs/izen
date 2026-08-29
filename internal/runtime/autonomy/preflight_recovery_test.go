@@ -788,6 +788,160 @@ func TestAbortNotResurrectedByLatePreflight(t *testing.T) {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+func TestRecovery_RescopeBoundedPatch_MutatesContractAndPassesPreflight(t *testing.T) {
+	root := t.TempDir()
+	source := e2eCorruptFixture()
+	if len(source) != 0 && len(source)/4*3 <= 2048 {
+		t.Fatalf("fixture must be over budget under 3×: estimated %d", len(source)/4*3)
+	}
+	// Initial zero-token evaluation: full rewrite, corrupt AST, over budget → fail.
+	eval := EvaluateScope(ScopeInput{
+		Target:          "index.html",
+		Content:         source,
+		MaxOutputTokens: 2048,
+		Root:            root,
+	})
+	if eval.ExecutionGate() {
+		t.Fatal("initial Evaluate() must fail (corrupt AST & 5835>2048)")
+	}
+	if eval.ASTStatus != ASTCorrupt {
+		t.Fatalf("initial ASTStatus = %s, want corrupt", eval.ASTStatus)
+	}
+	if eval.BudgetStatus != BudgetExceeded {
+		t.Fatalf("initial BudgetStatus = %s, want exceeded", eval.BudgetStatus)
+	}
+	if eval.EstimatedTokens <= 2048 {
+		t.Fatalf("initial estimated = %d, want >2048", eval.EstimatedTokens)
+	}
+	// Simulate human selecting rescope_bounded_patch via driver: the contract
+	// must mutate to bounded patch (0.8×) and bypass AST, then pass.
+	bus := events.NewBus(events.DefaultBufferSize)
+	p := &patchProvider{}
+	x := testExecutor(t, root, p, bus)
+	writeTarget(t, root, "index.html", string(source))
+	driver := NewDriver(NewExecutorAdapter(root, execution.NewIntentGateway(root), x), bus)
+	if _, err := driver.Run(context.Background(), "$prompt check this file @index.html and remove redundant content"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if driver.State() != autonomy.RuntimeAwaitingHuman {
+		t.Fatalf("state = %s, want awaiting_human", driver.State())
+	}
+	// Mutate contract via recovery.
+	term, err := driver.ResumeWithProposal(context.Background(), "rescope_bounded_patch")
+	if err != nil {
+		t.Fatalf("ResumeWithProposal: %v", err)
+	}
+	// After bounded patch, preflight must be feasible: 1945*0.8=1556 <2048 and AST bypassed.
+	// Check driver mutation fields.
+	if driver.mutationStrategy != StrategyBoundedPatch {
+		t.Fatalf("mutationStrategy = %v, want bounded_patch", driver.mutationStrategy)
+	}
+	if !driver.allowASTBypass {
+		t.Fatal("AllowASTBypass must be true after bounded patch")
+	}
+	// Direct scope evaluation with mutated strategy must pass.
+	mutated := EvaluateScope(ScopeInput{
+		Target:               "index.html",
+		Content:              source,
+		MaxOutputTokens:      2048,
+		Root:                 root,
+		MutationStrategy:     StrategyBoundedPatch,
+		AllowASTBypass:       true,
+		ExplicitOutputBudget: 0,
+	})
+	if !mutated.ExecutionGate() || len(mutated.RequiredProposals) != 0 {
+		t.Fatalf("mutated Evaluate() must pass: gate=%v proposals=%d AST=%s Budget=%s estimated=%d", mutated.ExecutionGate(), len(mutated.RequiredProposals), mutated.ASTStatus, mutated.BudgetStatus, mutated.EstimatedTokens)
+	}
+	if mutated.EstimatedTokens != int(float64(len(source)/4)*0.8) {
+		t.Fatalf("bounded estimated = %d, want %d", mutated.EstimatedTokens, int(float64(len(source)/4)*0.8))
+	}
+	if mutated.EstimatedTokens > 2048 {
+		t.Fatalf("bounded estimated %d must be <2048", mutated.EstimatedTokens)
+	}
+	// The driver should have proceeded to the approval gate (provider called once), not re-park at DecisionSurface.
+	if term != nil {
+		t.Fatalf("bounded patch recovery should park at approval, not terminate: %+v", term)
+	}
+	if driver.State() != autonomy.RuntimeAwaitingHuman {
+		t.Fatalf("state after bounded patch = %s, want awaiting_human at approval", driver.State())
+	}
+	if b := driver.Boundary(); b == nil || b.Action != autonomy.HumanBoundaryApproval {
+		t.Fatalf("boundary after bounded patch = %+v, want approval", b)
+	}
+}
+
+func TestRecovery_RepairFirst_InjectsSyntheticGoal(t *testing.T) {
+	root := t.TempDir()
+	source := e2eCorruptFixture()
+	writeTarget(t, root, "index.html", string(source))
+	bus := events.NewBus(events.DefaultBufferSize)
+	p := &patchProvider{}
+	x := testExecutor(t, root, p, bus)
+	driver := NewDriver(NewExecutorAdapter(root, execution.NewIntentGateway(root), x), bus)
+	if _, err := driver.Run(context.Background(), "$prompt check this file @index.html and remove redundant content"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if driver.State() != autonomy.RuntimeAwaitingHuman {
+		t.Fatalf("state = %s, want awaiting_human", driver.State())
+	}
+	term, err := driver.ResumeWithProposal(context.Background(), "repair_first")
+	if err != nil {
+		t.Fatalf("ResumeWithProposal(repair_first): %v", err)
+	}
+	if driver.mutationStrategy != StrategySyntaxRepair {
+		t.Fatalf("mutationStrategy = %v, want syntax_repair", driver.mutationStrategy)
+	}
+	if driver.syntheticSubGoal != "Inspect and repair closing tags/syntax in target file" {
+		t.Fatalf("syntheticSubGoal = %q, want repair prompt", driver.syntheticSubGoal)
+	}
+	if !driver.allowASTBypass {
+		t.Fatal("repair_first must set AllowASTBypass")
+	}
+	// Repair should also proceed to approval (not re-park at DecisionSurface) with bypass.
+	if term != nil {
+		t.Fatalf("repair_first recovery should park at approval, not terminate: %+v", term)
+	}
+	if driver.State() != autonomy.RuntimeAwaitingHuman {
+		t.Fatalf("state after repair_first = %s, want awaiting_human at approval", driver.State())
+	}
+	if b := driver.Boundary(); b == nil || b.Action != autonomy.HumanBoundaryApproval {
+		t.Fatalf("boundary after repair_first = %+v, want approval", b)
+	}
+	if p.count() != 1 {
+		t.Fatalf("provider calls after repair_first = %d, want 1", p.count())
+	}
+	// Verify the synthetic goal propagates into scope evaluation as a finding and still passes with 0.5×.
+	eval := EvaluateScope(ScopeInput{
+		Target:           "index.html",
+		Content:          source,
+		MaxOutputTokens:  2048,
+		Root:             root,
+		MutationStrategy: driver.mutationStrategy,
+		AllowASTBypass:   driver.allowASTBypass,
+		SyntheticSubGoal: driver.syntheticSubGoal,
+	})
+	if !containsString(eval.Findings, "synthetic sub-goal: Inspect and repair closing tags/syntax in target file") {
+		// Check via substring
+		found := false
+		for _, f := range eval.Findings {
+			if strings.Contains(f, "Inspect and repair closing tags/syntax") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("synthetic sub-goal not found in findings: %v", eval.Findings)
+		}
+	}
+	// 1945*0.5=972 <2048 so budget must pass and AST bypassed.
+	if eval.BudgetStatus != BudgetWithinLimits {
+		t.Fatalf("repair BudgetStatus = %s, want within_limits", eval.BudgetStatus)
+	}
+	if eval.ASTStatus != ASTValid {
+		t.Fatalf("repair ASTStatus = %s, want valid (bypassed)", eval.ASTStatus)
+	}
+}
+
 func containsString(xs []string, want string) bool {
 	for _, x := range xs {
 		if x == want {

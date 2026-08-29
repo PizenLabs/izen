@@ -116,6 +116,12 @@ type Driver struct {
 	// subcommand is the policy scope ($prompt / $hot / "") used to tailor the
 	// DecisionSurface option set. Empty is the conservative default.
 	subcommand string
+
+	// ── Recovery Contract Mutation ────────────────────────────────────
+	mutationStrategy     MutationStrategy
+	allowASTBypass       bool
+	explicitOutputBudget int
+	syntheticSubGoal     string
 }
 
 // Option configures the Driver during construction.
@@ -241,6 +247,10 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.surfaceLifecycle = ""
 	d.proposalIntent = ""
 	d.proposalFails = 0
+	d.mutationStrategy = StrategyFullRewrite
+	d.allowASTBypass = false
+	d.explicitOutputBudget = 0
+	d.syntheticSubGoal = ""
 	d.runRequestID = fmt.Sprintf("run-%d", d.runID)
 	d.loop.Start("user objective: " + objective)
 	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
@@ -455,6 +465,11 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 	if d.loop == nil || d.loop.State() != autonomy.RuntimeAwaitingHuman {
 		return d.term(), errors.New("autonomy: resume-with-proposal requires a parked human boundary")
 	}
+	// Normalize alias that is not in the closed vocabulary but is a
+	// recovery choice string from the DecisionSurface (rescope_textual_patch).
+	if string(intent) == "rescope_textual_patch" {
+		intent = ProposalRescopeBoundedPatch
+	}
 	// Resolve the DecisionSurface lifecycle on every human choice.
 	d.resolveSurfaceLifecycle(ctx, "human choice: "+string(intent))
 	// ProposalCancel: ABORTED with $0 spent.
@@ -473,6 +488,8 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 	// parked. Zero execution, zero mutation, zero state change — the surface
 	// simply re-activates so the UI can re-render the details.
 	if intent.IsInspect() {
+		d.mutationStrategy = StrategyInspectOnly
+		d.req.MutationStrategy = StrategyInspectOnly.String()
 		d.emitAutonomousParked(ctx, "inspect hold on decision surface: "+d.surfaceReason())
 		if d.surface != nil {
 			b := autonomy.HumanBoundary{
@@ -511,21 +528,53 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 	// executor admission resolves into a NEW causally linked ContractID, then
 	// re-runs preflight. Execution proceeds ONLY if the new contract's
 	// preflight succeeds.
+	// Contract mutation (DecisionSurface fix): the active ScopeInput /
+	// ExecutionContext is mutated into a NEW concrete contract before the
+	// next iteration so the evaluator does not re-compute the same 3× estimate
+	// and re-park (1945×3=5835>2048). Bounded patch drops to 0.8× (1556<2048)
+	// and bypasses the AST hard-gate.
+	// Normalize textual alias.
+	if string(intent) == "rescope_textual_patch" {
+		intent = ProposalRescopeBoundedPatch
+	}
 	switch intent {
 	case ProposalRescopeBoundedPatch:
+		d.mutationStrategy = StrategyBoundedPatch
+		d.allowASTBypass = true
 		d.req.RecoveryStrategy = autonomy.StrategyBoundedPatch
+		d.req.MutationStrategy = StrategyBoundedPatch.String()
+		d.req.AllowASTBypass = true
 		d.req.RecoveryAttempt = d.obs.AttemptNum + 1
 		d.req.RecoveryReason = "rescope_bounded_patch: explicit human-authorized bounded SEARCH/REPLACE contract"
 		if d.obs.ContractID != "" {
 			d.req.ParentContractID = d.obs.ContractID
 		}
 		d.req.ProposalIntent = string(intent)
+	case ProposalRepairFirst:
+		d.mutationStrategy = StrategySyntaxRepair
+		d.syntheticSubGoal = "Inspect and repair closing tags/syntax in target file"
+		d.req.MutationStrategy = StrategySyntaxRepair.String()
+		d.req.SyntheticSubGoal = "Inspect and repair closing tags/syntax in target file"
+		d.req.AllowASTBypass = true
+		d.req.RecoveryAttempt = d.obs.AttemptNum + 1
+		d.req.RecoveryReason = "repair_first: synthetic syntax repair sub-goal before main objective"
+		if d.obs.ContractID != "" {
+			d.req.ParentContractID = d.obs.ContractID
+		}
+		d.req.ProposalIntent = string(intent)
+		// Repair also benefits from AST bypass for the preparatory pass.
+		d.allowASTBypass = true
 	case ProposalRetryExplicitBudget:
 		// The explicit budget is the ceiling the human authorized. The new
 		// contract carries it; the executor re-runs Boundary-2 under it and
 		// refuses again if even the authorized ceiling is insufficient.
 		if budget := d.surfaceBudget(); budget > 0 {
 			d.req.MaxOutputTokens = budget
+			d.explicitOutputBudget = budget
+			d.req.ExplicitOutputBudget = budget
+		} else if d.surface != nil && d.surface.ExplicitBudget > 0 {
+			d.explicitOutputBudget = d.surface.ExplicitBudget
+			d.req.ExplicitOutputBudget = d.surface.ExplicitBudget
 		}
 		d.req.RecoveryAttempt = d.obs.AttemptNum + 1
 		d.req.RecoveryReason = "retry_with_explicit_budget: explicit human-authorized output budget"
@@ -848,27 +897,39 @@ func (d *Driver) divertPreflightFailure(ctx context.Context) bool {
 	if !ok || len(source) == 0 {
 		return false
 	}
+	effectiveMax := maxOut
+	if d.explicitOutputBudget > 0 {
+		effectiveMax = d.explicitOutputBudget
+	}
+	prompt := d.prompt
+	if d.syntheticSubGoal != "" {
+		prompt = d.syntheticSubGoal + "\n" + prompt
+	}
 	if d.bus != nil {
-		d.bus.Publish(events.NewPreflightStarted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, maxOut))
+		d.bus.Publish(events.NewPreflightStarted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, effectiveMax))
 	}
 	eval := EvaluateScope(ScopeInput{ //nolint:contextcheck // document syntax validation is pure content checking, no context needed
-		Target:          target,
-		Content:         source,
-		MaxOutputTokens: maxOut,
-		Root:            d.adapter.Root(),
-		Subcommand:      d.subcommand,
-		Prompt:          d.prompt,
+		Target:               target,
+		Content:              source,
+		MaxOutputTokens:      effectiveMax,
+		Root:                 d.adapter.Root(),
+		Subcommand:           d.subcommand,
+		Prompt:               prompt,
+		MutationStrategy:     d.mutationStrategy,
+		AllowASTBypass:       d.allowASTBypass,
+		ExplicitOutputBudget: d.explicitOutputBudget,
+		SyntheticSubGoal:     d.syntheticSubGoal,
 	})
 	if eval.ASTStatus != ASTCorrupt {
 		if d.bus != nil {
-			d.bus.Publish(events.NewPreflightCompleted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, eval.EstimatedTokens, maxOut))
+			d.bus.Publish(events.NewPreflightCompleted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, eval.EstimatedTokens, effectiveMax))
 		}
 		return false
 	}
 	if d.bus != nil {
 		fail := BuildPreflightFailure(eval)
 		d.bus.Publish(events.NewPreflightRejected(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy,
-			string(fail.Category), fail.Reason, eval.EstimatedTokens, maxOut, string(eval.ASTStatus)))
+			string(fail.Category), fail.Reason, eval.EstimatedTokens, effectiveMax, string(eval.ASTStatus)))
 	}
 	diagnosticf("[preflight] hard-gate CLOSED for corrupt AST target=%s ast_status=%s — DAG decomposition AND execution forbidden, diverting to DecisionSurface",
 		target, eval.ASTStatus)

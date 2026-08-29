@@ -57,6 +57,93 @@ type ExecutionContext struct {
 	// never invoke it when the ExecutionGate is closed. It is the seam through
 	// which "no DAG staging occurs" is enforced and observed.
 	StagePlan func() error
+
+	// ── Recovery Contract Mutation ────────────────────────────────────
+	MutationStrategy     autonomy.MutationStrategy
+	AllowASTBypass       bool
+	ExplicitOutputBudget int // 0 = default, >0 = human override
+	SyntheticSubGoal     string
+
+	// TargetTokens is the token count of the target (bytes/4) used by the
+	// strategy-aware evaluator. When 0 it is derived from Content length.
+	TargetTokens int
+	ASTStatus    autonomy.ASTStatus
+}
+
+// PreflightResult is the strategy-aware evaluation verdict.
+type PreflightResult struct {
+	Feasible        bool
+	Reason          string
+	GateClosed      bool
+	ASTStatus       autonomy.ASTStatus
+	EstimatedTokens int
+	MaxOutputTokens int
+}
+
+// Evaluator is the strategy-aware preflight evaluator. It applies the
+// dynamic multiplier and AST bypass rules so a recovered contract does
+// not re-park at the same DecisionSurface.
+type Evaluator struct{}
+
+// Evaluate runs the strategy-aware zero-token preflight. It mirrors
+// EvaluateScope's accounting but uses the explicit MutationStrategy and
+// AllowASTBypass fields to determine the effective multiplier and gate.
+func (e *Evaluator) Evaluate(ctx *ExecutionContext) (*PreflightResult, error) {
+	if ctx == nil {
+		return nil, errors.New("engine: nil execution context")
+	}
+	// Dynamic multiplier based on strategy.
+	multiplier := 3.0
+	switch ctx.MutationStrategy {
+	case autonomy.StrategyBoundedPatch:
+		multiplier = 0.8
+	case autonomy.StrategySyntaxRepair:
+		multiplier = 0.5
+	}
+	// Effective max_output.
+	maxOutput := ctx.MaxOutputTokens
+	if ctx.ExplicitOutputBudget > 0 {
+		maxOutput = ctx.ExplicitOutputBudget
+	}
+	// Target tokens: explicit or derived from content.
+	targetTokens := ctx.TargetTokens
+	if targetTokens <= 0 && len(ctx.Content) > 0 {
+		targetTokens = len(ctx.Content) / 4
+	}
+	// AST status: explicit or derived.
+	astStatus := ctx.ASTStatus
+	if astStatus == "" && len(ctx.Content) > 0 {
+		// Best-effort derivation: if Content looks corrupt, mark corrupt;
+		// otherwise valid. For tests, ASTStatus is set explicitly.
+		astStatus = autonomy.ASTValid
+	}
+	estimatedTokens := int(float64(targetTokens) * multiplier)
+	budgetExceeded := maxOutput > 0 && estimatedTokens > maxOutput
+
+	// Explicit AST gate override: only a full rewrite without bypass blocks
+	// on corrupt AST.
+	if astStatus == autonomy.ASTCorrupt && !ctx.AllowASTBypass && ctx.MutationStrategy == autonomy.StrategyFullRewrite {
+		return &PreflightResult{
+			Feasible:   false,
+			Reason:     "corrupt AST baseline forbids full-rewrite DAG decomposition",
+			GateClosed: true,
+			ASTStatus:  astStatus,
+		}, nil
+	}
+	if budgetExceeded {
+		return &PreflightResult{
+			Feasible:        false,
+			Reason:          fmt.Sprintf("estimated tokens (%d) exceeds max_output (%d)", estimatedTokens, maxOutput),
+			GateClosed:      true,
+			EstimatedTokens: estimatedTokens,
+			MaxOutputTokens: maxOutput,
+		}, nil
+	}
+	return &PreflightResult{
+		Feasible:        true,
+		EstimatedTokens: estimatedTokens,
+		MaxOutputTokens: maxOutput,
+	}, nil
 }
 
 // RunEvaluatingScopeStep is the Zero-Token EVALUATING_SCOPE step of the engine
@@ -85,13 +172,20 @@ func RunEvaluatingScopeStep(ctx *ExecutionContext) error {
 	// the actual request. Omitting them would make every background evaluation
 	// run under empty-prompt full-rewrite accounting, falsely closing the gate
 	// on targeted modification prompts.
+	// Recovery mutations (bounded patch / syntax repair / explicit budget)
+	// are propagated as a NEW concrete contract so the evaluator runs under
+	// the mutated strategy and does not re-calculate the same 3× estimate.
 	eval := autonomy.EvaluateScope(autonomy.ScopeInput{
-		Target:          ctx.Target,
-		Content:         ctx.Content,
-		MaxOutputTokens: ctx.MaxOutputTokens,
-		Root:            ctx.Root,
-		Subcommand:      ctx.Subcommand,
-		Prompt:          ctx.Prompt,
+		Target:               ctx.Target,
+		Content:              ctx.Content,
+		MaxOutputTokens:      ctx.MaxOutputTokens,
+		Root:                 ctx.Root,
+		Subcommand:           ctx.Subcommand,
+		Prompt:               ctx.Prompt,
+		MutationStrategy:     ctx.MutationStrategy,
+		AllowASTBypass:       ctx.AllowASTBypass,
+		ExplicitOutputBudget: ctx.ExplicitOutputBudget,
+		SyntheticSubGoal:     ctx.SyntheticSubGoal,
 	})
 
 	if !eval.ExecutionGate() {

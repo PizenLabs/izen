@@ -338,7 +338,18 @@ type ScopeInput struct {
 	// scaffolding request (→ FullRewriteTokenMultiplier). Empty keeps the
 	// subcommand + markup-target default.
 	Prompt string
+
+	// ── Recovery Contract Mutation (DecisionSurface fix) ─────────────────
+	MutationStrategy     MutationStrategy
+	AllowASTBypass       bool
+	ExplicitOutputBudget int // 0 = default, >0 = human override
+	SyntheticSubGoal     string
 }
+
+// PreflightScope is an alias for ScopeInput used by the contract mutation
+// path (DecisionSurface recovery). It carries the same concrete contract
+// fields so callers may use either name.
+type PreflightScope = ScopeInput
 
 // EstimateScopeTokens computes the estimated generation cost of a target using
 // the SAME canonical accounting as Boundary 2: target_bytes/4 ×
@@ -473,29 +484,92 @@ func EvaluateScope(in ScopeInput) PreflightEvaluation {
 	}
 
 	// ── 3. BUDGET ESTIMATION (0 tokens) ────────────────────────────────
-	// Targeted modification prompts ($prompt / $hot — remove/fix/refactor) are
-	// expected to issue bounded SEARCH/REPLACE patches, so their estimate uses
-	// the bounded patch multiplier instead of the full-rewrite multiplier
-	// ($3×). An explicit full-rewrite / scaffolding request keeps $3×.
+	// Strategy-aware preflight: when a recovery MutationStrategy is active
+	// the multiplier drops (bounded patch 0.8×, syntax repair 0.5×) and the
+	// explicit output budget overrides the declared ceiling. Otherwise the
+	// targeted-modification heuristic (PreflightMultiplierForTarget) applies.
 	eval.BudgetStatus = BudgetWithinLimits
-	eval.MaxOutputTokens = in.MaxOutputTokens
-	estimated, exceeded := EstimateScopeTokensForSubcommand(len(in.Content), in.MaxOutputTokens, in.Target, in.Subcommand, in.Prompt)
+	effectiveMax := in.MaxOutputTokens
+	if in.ExplicitOutputBudget > 0 {
+		effectiveMax = in.ExplicitOutputBudget
+	}
+	eval.MaxOutputTokens = effectiveMax
+	var estimated int
+	var exceeded bool
+	var multiplier float64
+	switch in.MutationStrategy {
+	case StrategyBoundedPatch:
+		multiplier = 0.8
+		if len(in.Content) > 0 && effectiveMax > 0 {
+			estimated = int(float64(len(in.Content)/4) * multiplier)
+			exceeded = estimated > effectiveMax
+		}
+	case StrategySyntaxRepair:
+		multiplier = 0.5
+		if len(in.Content) > 0 && effectiveMax > 0 {
+			estimated = int(float64(len(in.Content)/4) * multiplier)
+			exceeded = estimated > effectiveMax
+		}
+	case StrategyInspectOnly:
+		// Inspect is read-only: never budget-exceeded by construction.
+		estimated = 0
+		exceeded = false
+		multiplier = 0
+	default:
+		// Full rewrite (default): use the subcommand/prompt heuristic.
+		estimated, exceeded = EstimateScopeTokensForSubcommand(len(in.Content), effectiveMax, in.Target, in.Subcommand, in.Prompt)
+		multiplier = float64(PreflightMultiplierForTarget(in.Target, in.Subcommand, in.Prompt))
+	}
 	eval.EstimatedTokens = estimated
 	if exceeded {
 		eval.BudgetStatus = BudgetExceeded
-		multiplier := PreflightMultiplierForTarget(in.Target, in.Subcommand, in.Prompt)
-		eval.AddFinding("target %q estimates ~%d tokens (bytes/4 × %d) but max_output=%d — budget exceeded",
-			in.Target, estimated, multiplier, in.MaxOutputTokens)
+		if multiplier == 0.8 || multiplier == 0.5 {
+			eval.AddFinding("target %q estimates ~%d tokens (bytes/4 × %.1f) but max_output=%d — budget exceeded",
+				in.Target, estimated, multiplier, effectiveMax)
+		} else {
+			eval.AddFinding("target %q estimates ~%d tokens (bytes/4 × %d) but max_output=%d — budget exceeded",
+				in.Target, estimated, int(multiplier), effectiveMax)
+		}
+	}
+	// Synthetic sub-goal is carried as evidence when injected.
+	if in.SyntheticSubGoal != "" {
+		eval.AddFinding("synthetic sub-goal: %s", in.SyntheticSubGoal)
 	}
 
-	// ── FAIL-CLOSED BARRIER ────────────────────────────────────────────
-	// When any precondition fails, a required human proposal is recorded so the
-	// gate can never pass. The engine diverts to AWAITING_HUMAN_PROPOSAL.
-	if !eval.ExecutionGate() {
-		eval.RequiredProposals = append(eval.RequiredProposals, ProposalRequirement{
-			Reason: "scope evaluation barrier: " + barrierReason(eval),
-			Target: in.Target,
-		})
+	// AST bypass: when explicitly allowed or a bounded/syntax strategy is
+	// active, a corrupt baseline is permitted for line-based patches. Keep
+	// the finding but treat the gate as valid so the recovered contract
+	// does not re-park.
+	if eval.ASTStatus == ASTCorrupt && (in.AllowASTBypass || in.MutationStrategy == StrategyBoundedPatch || in.MutationStrategy == StrategySyntaxRepair) {
+		eval.ASTStatus = ASTValid
+		eval.AddFinding("AST gate bypassed for %s strategy — line-based SEARCH/REPLACE permitted on corrupt baseline", in.MutationStrategy)
+	}
+
+	// ── FAIL-CLOSED BARRIER (strategy-aware) ───────────────────────────
+	// The AST hard-gate is bypassed when AllowASTBypass is set or a
+	// bounded-patch / syntax-repair contract is active: a corrupt baseline
+	// is permitted for line-based SEARCH/REPLACE patches.
+	astBlocked := eval.ASTStatus == ASTCorrupt && !in.AllowASTBypass && in.MutationStrategy == StrategyFullRewrite
+	budgetBlocked := eval.BudgetStatus == BudgetExceeded
+	depsBlocked := eval.DependencyStatus == DependenciesUnresolved
+	if astBlocked || budgetBlocked || depsBlocked {
+		if len(eval.RequiredProposals) == 0 {
+			eval.RequiredProposals = append(eval.RequiredProposals, ProposalRequirement{
+				Reason: "scope evaluation barrier: " + barrierReason(eval),
+				Target: in.Target,
+			})
+		}
+	} else {
+		// No strategy-aware block: gate passes. If the legacy ExecutionGate
+		// still reports closed only because of a bypassed AST, clear it.
+		if eval.ASTStatus == ASTCorrupt && (in.AllowASTBypass || in.MutationStrategy == StrategyBoundedPatch || in.MutationStrategy == StrategySyntaxRepair) {
+			eval.RequiredProposals = nil
+		} else if !eval.ExecutionGate() && len(eval.RequiredProposals) == 0 {
+			eval.RequiredProposals = append(eval.RequiredProposals, ProposalRequirement{
+				Reason: "scope evaluation barrier: " + barrierReason(eval),
+				Target: in.Target,
+			})
+		}
 	}
 	return eval
 }

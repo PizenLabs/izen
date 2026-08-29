@@ -196,9 +196,19 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 	// Recovery prompt augmentation: when a recovery strategy is set, the
 	// objective is annotated with the explicit failure evidence so the next
 	// model invocation does not have to rediscover the truncation.
+	// Synthetic sub-goal (repair_first) is prepended so the model fixes
+	// syntax before processing the main objective.
 	prompt := req.Prompt
+	if req.SyntheticSubGoal != "" {
+		prompt = req.SyntheticSubGoal + "\n" + prompt
+	}
 	if req.RecoveryStrategy != "" && req.RecoveryReason != "" {
 		prompt = prompt + "\n\n[RECOVERY " + req.RecoveryStrategy + ": " + req.RecoveryReason + "]"
+	}
+	// Explicit output budget overrides the profile ceiling.
+	if req.ExplicitOutputBudget > 0 {
+		effectiveMax = req.ExplicitOutputBudget
+		req.MaxOutputTokens = effectiveMax
 	}
 	execReq := execution.ExecuteRequest{
 		RequestID:        req.RequestID,
@@ -250,7 +260,7 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		// target (the false-positive preflight_infeasible leak).
 		execReq.StagedSubTasks = staged
 	}
-	if strategyPtr != nil && req.RecoveryStrategy == "bounded_patch" {
+	if strategyPtr != nil && (req.RecoveryStrategy == "bounded_patch" || req.MutationStrategy == "bounded_patch" || req.MutationStrategy == "syntax_repair" || req.AllowASTBypass) {
 		// Material artifact-contract change: the recovery attempt MUST produce
 		// a structured bounded patch. The search_replace kind is enforced by
 		// the executor at the artifact boundary — the model is never asked to
@@ -262,7 +272,7 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		mod.StrategyReason += " [recovery: bounded_patch after truncation]"
 		execReq.Strategy = &mod
 	}
-	if strategyPtr == nil && req.RecoveryStrategy == "bounded_patch" {
+	if strategyPtr == nil && (req.RecoveryStrategy == "bounded_patch" || req.MutationStrategy == "bounded_patch" || req.MutationStrategy == "syntax_repair" || req.AllowASTBypass) {
 		// The raw prompt could not be re-selected (the loop carries an
 		// explicit human/decomposition-scoped target), but the recovery
 		// protocol is still authoritative: hand the executor a minimal

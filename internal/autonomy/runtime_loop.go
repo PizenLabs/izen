@@ -603,6 +603,12 @@ type LoopRequest struct {
 	// When set, the executor invokes it during provider streaming for each
 	// content delta, first token, and completion.
 	StreamCallback execution.StreamCallback
+
+	// ── Recovery Contract Mutation ────────────────────────────────────
+	MutationStrategy     string
+	AllowASTBypass       bool
+	ExplicitOutputBudget int
+	SyntheticSubGoal     string
 }
 
 // Executor is the ONLY authority the loop may invoke. The loop is a consumer

@@ -662,38 +662,44 @@ func (d *Driver) stageDecomposition(ctx context.Context) bool {
 		diagnosticf("[boundary2] decomposition skipped: target %s unreadable", target)
 		return false
 	}
-	// ── STRICT PREFLIGHT HARD-GATE (invariant) ───────────────────────────
-	// The Zero-Token ExecutionGate MUST be consulted BEFORE any DAG
-	// decomposition. When the target's baseline AST is corrupt (or the gate is
-	// otherwise closed for a structural reason) DAG decomposition is STRICTLY
-	// FORBIDDEN: a broken document may never be sliced into semantic-structural
-	// or line-window sub-tasks. The loop diverts to the Zero-Token
-	// DecisionSurface barrier so the human may choose repair-first / cancel.
-	// Over-budget (valid-AST) preflight_infeasible remains the legitimate
-	// Boundary-2 decomposition path and is NOT diverted here.
+	// ── STRATEGY-AWARE PREFLIGHT (DecisionSurface fix) ─────────────────
+	// Propagate the mutated recovery contract so a bounded-patch re-scope
+	// does not re-evaluate under the same 3× full-rewrite estimate.
+	effectiveMax := maxOut
+	if d.explicitOutputBudget > 0 {
+		effectiveMax = d.explicitOutputBudget
+	}
+	prompt := d.prompt
+	if d.syntheticSubGoal != "" {
+		prompt = d.syntheticSubGoal + "\n" + prompt
+	}
 	if d.bus != nil {
-		d.bus.Publish(events.NewPreflightStarted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, maxOut))
+		d.bus.Publish(events.NewPreflightStarted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, effectiveMax))
 	}
 	eval := EvaluateScope(ScopeInput{ //nolint:contextcheck // document syntax validation is pure content checking, no context needed
-		Target:          target,
-		Content:         source,
-		MaxOutputTokens: maxOut,
-		Root:            d.adapter.Root(),
-		Subcommand:      d.subcommand,
-		Prompt:          d.prompt,
+		Target:               target,
+		Content:              source,
+		MaxOutputTokens:      effectiveMax,
+		Root:                 d.adapter.Root(),
+		Subcommand:           d.subcommand,
+		Prompt:               prompt,
+		MutationStrategy:     d.mutationStrategy,
+		AllowASTBypass:       d.allowASTBypass,
+		ExplicitOutputBudget: d.explicitOutputBudget,
+		SyntheticSubGoal:     d.syntheticSubGoal,
 	})
 	if eval.ASTStatus == ASTCorrupt {
 		if d.bus != nil {
 			fail := BuildPreflightFailure(eval)
 			d.bus.Publish(events.NewPreflightRejected(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy,
-				string(fail.Category), fail.Reason, eval.EstimatedTokens, maxOut, string(eval.ASTStatus)))
+				string(fail.Category), fail.Reason, eval.EstimatedTokens, effectiveMax, string(eval.ASTStatus)))
 		}
 		diagnosticf("[boundary2] preflight hard-gate CLOSED for corrupt AST target=%s ast_status=%s budget_status=%s — DAG decomposition forbidden, diverting to DecisionSurface",
 			target, eval.ASTStatus, eval.BudgetStatus)
 		return d.stageDecisionSurface(ctx, eval, target)
 	}
 	if d.bus != nil {
-		d.bus.Publish(events.NewPreflightCompleted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, eval.EstimatedTokens, maxOut))
+		d.bus.Publish(events.NewPreflightCompleted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, eval.EstimatedTokens, effectiveMax))
 	}
 	base := d.req.WorkspaceDigest
 	if base == "" {
@@ -704,7 +710,7 @@ func (d *Driver) stageDecomposition(ctx context.Context) bool {
 	// read-only manifest request before any decomposition, so unmodified
 	// sections are pruned and a naive line slicer is never the primary
 	// strategy.
-	dag, err := d.runPreflight(ctx, d.prompt, target, source, base, maxOut)
+	dag, err := d.runPreflight(ctx, prompt, target, source, base, effectiveMax)
 	if err != nil {
 		diagnosticf("[boundary2] decomposition unavailable: %v — falling back to explicit re-scope", err)
 		return false
