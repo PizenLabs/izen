@@ -83,14 +83,18 @@ func RenderDeterministicPipeline(rawInput string, width int, isStreaming bool) s
 			// would overflow the bound and leave ragged right edges. The wrap
 			// budget therefore reserves the marker width so the styled line
 			// always lands exactly on the boundary, never past it.
+			// Strict 2-cell safety padding: availableWidth = viewport.Width - 4
 			innerW := width - 4
 			if innerW < 10 {
 				innerW = 10
 			}
-			wrapW := innerW - markdownLinePrefixWidth(line)
+			// Reserve additional 2-cell safety so rendered width never exceeds viewport.Width
+			wrapW := innerW - markdownLinePrefixWidth(line) - 2
 			if wrapW < 10 {
 				wrapW = 10
 			}
+			// Ensure preflight delimiter before wrapping so metadata and body are separate physical lines
+			line = ensurePreflightDelimiter(line)
 			wrappedLine := ansi.Wordwrap(line, wrapW, " \t")
 
 			subLines := strings.Split(wrappedLine, "\n")
@@ -378,9 +382,10 @@ func (m *model) renderStreamingContent(content string, width int) string {
 	blocks := parseAIContent(content)
 	var renderedBlocks []string
 
-	// Content width = terminal width − left/right padding. A non-positive
-	// result (degenerate geometry) defaults to 80 cells.
-	availableWidth := width - 2
+	// Content width = terminal width − left/right padding with strict 2-cell safety.
+	// Requirement: availableWidth = viewport.Width - 4 prevents right-edge word clipping.
+	content = ensurePreflightDelimiter(content)
+	availableWidth := width - 4
 	if availableWidth <= 0 {
 		availableWidth = 80
 	}

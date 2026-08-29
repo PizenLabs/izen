@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -1008,6 +1009,125 @@ func TestThinkingBlock_ExpandedNewline(t *testing.T) {
 	if strings.Contains(out, "Thinking..1.") || strings.Contains(out, "[POLICY]1.") {
 		t.Fatalf("expanded thinking shows concatenated header+body without newline: %q", out)
 	}
+}
+
+func TestRender_PreflightNewlineSeparation(t *testing.T) {
+	// Record containing preflight trace metadata and body text must render body
+	// on a new physical line starting after \n.
+	raw := "[preflight] snapshot ready target=\"\" sha= tokens=0 Go, commonly referred to as Golang, is efficient, concurrent and efficient language."
+	m := newGeometryModel(80, 24, []record{{role: roleAI, text: raw}})
+	rendered := m.renderRecordForViewport(m.records[0])
+	stripped := ansi.Strip(rendered)
+	// Defect example was "[preflight] ... tokens=0 Go, commonly..."
+	if strings.Contains(stripped, "tokens=0 Go,") {
+		t.Fatalf("preflight header bleeds into body without newline: %q", stripped)
+	}
+	if !strings.Contains(stripped, "tokens=0") {
+		t.Fatalf("preflight header missing: %q", stripped)
+	}
+	if !strings.Contains(stripped, "Go, commonly") {
+		t.Fatalf("body text missing: %q", stripped)
+	}
+	// Ensure newline separation: body starts on new physical line
+	lines := strings.Split(rendered, "\n")
+	foundHeader := false
+	foundBody := false
+	for _, l := range lines {
+		s := ansi.Strip(l)
+		if strings.Contains(s, "[preflight]") {
+			foundHeader = true
+		}
+		if strings.Contains(s, "Go, commonly") {
+			foundBody = true
+			// Body line must not also contain preflight header on same physical line
+			if strings.Contains(s, "[preflight]") {
+				t.Fatalf("body shares physical line with preflight header: %q", s)
+			}
+		}
+	}
+	if !foundHeader || !foundBody {
+		t.Fatalf("header/body not found in rendered lines: header %v body %v rendered %q", foundHeader, foundBody, stripped)
+	}
+	// HitMap: preflight header must be distinct physical row LogicalLine -1 and body starts on subsequent row with RuneStartIdx 0
+	hasHeaderRow := false
+	hasBodyRow := false
+	for _, r := range m.fullHitRows {
+		if r.RecordIdx == 0 && r.LogicalLine == -1 {
+			hasHeaderRow = true
+		}
+		if r.RecordIdx == 0 && r.LogicalLine >= 0 && r.RuneStartIdx == 0 {
+			// At least one body row starting at 0 indicates proper reset after header
+			hasBodyRow = true
+		}
+	}
+	if !hasHeaderRow {
+		t.Fatalf("hitmap missing preflight header row LogicalLine -1: %+v", m.fullHitRows)
+	}
+	if !hasBodyRow {
+		t.Fatalf("hitmap missing body row with RuneStartIdx 0 after preflight header")
+	}
+	// Also test via streamingContent path
+	m2 := newTestModel()
+	m2.width = 80
+	content := "[preflight] snapshot ready target=\"\" sha= tokens=0 Go, commonly referred to as Golang, is efficient."
+	out := m2.renderStreamingContent(content, 80)
+	outStripped := ansi.Strip(out)
+	if strings.Contains(outStripped, "tokens=0 Go,") {
+		t.Fatalf("streamingContent preflight bleed: %q", outStripped)
+	}
+	if !strings.Contains(out, "\n") {
+		t.Fatalf("streamingContent should contain newline separating preflight and body")
+	}
+}
+
+func TestRender_NoRightMarginTruncation(t *testing.T) {
+	// Render a record with long words near right boundary. Assert no words truncated mid-word
+	// and line lengths strictly satisfy width <= viewport.Width.
+	width := 40
+	longText := "Go, commonly referred to as Golang, is efficient, concurrent and Efficient: It comp is powerful language with many features that require wrapping"
+	m := newGeometryModel(width, 24, []record{{role: roleAI, text: longText}})
+	rendered := m.renderRecordForViewport(m.records[0])
+	lines := strings.Split(rendered, "\n")
+	for i, l := range lines {
+		stripped := ansi.Strip(l)
+		// Use lipgloss.Width for accurate cell count
+		if lipglossWidth(stripped) > width {
+			t.Fatalf("line %d exceeds viewport width %d: %q width %d", i, width, stripped, lipglossWidth(stripped))
+		}
+		// Detect mid-word truncation like "concurren" or "comp"
+		if strings.HasSuffix(strings.TrimSpace(stripped), "concurren") {
+			t.Fatalf("word 'concurrent' truncated mid-word on line %d: %q", i, stripped)
+		}
+		if strings.HasSuffix(strings.TrimSpace(stripped), "comp") && strings.Contains(longText, "comp is") {
+			// "comp" as truncated fragment of "comp" not expected; check not truncated mid-word
+			// More generally, ensure no word fragment without following complete word
+			// Check that line ending fragment is not a prefix of next line's starting word being cut
+			if i+1 < len(lines) {
+				next := ansi.Strip(lines[i+1])
+				if strings.HasPrefix(strings.TrimSpace(next), "Concurrent") || strings.HasPrefix(strings.TrimSpace(next), "ete") {
+					t.Fatalf("mid-word truncation detected line %d %q next %q", i, stripped, next)
+				}
+			}
+		}
+	}
+	// Also ensure no word is sliced: reconstructed stripped text with " " join should contain full words
+	strippedAll := ansi.Strip(rendered)
+	// Original words should appear intact after stripping ANSI and newlines -> spaces
+	// Check key words not truncated
+	for _, word := range []string{"efficient,", "concurrent", "Efficient:"} {
+		if !strings.Contains(strippedAll, word) {
+			// Try with wrapping: word may be at line boundary but should be intact
+			t.Fatalf("word %q missing or truncated in rendered output: %q", word, strippedAll)
+		}
+	}
+	// Direct width check via ansi.Wordwrap simulation: ensure Wordwrap not exceeding width-4
+	if lipglossWidth(strippedAll) == 0 {
+		t.Fatalf("strippedAll empty")
+	}
+}
+
+func lipglossWidth(s string) int {
+	return lipgloss.Width(s)
 }
 
 func makeRecords(n int, txt string) []record {

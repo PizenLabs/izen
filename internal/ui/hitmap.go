@@ -110,7 +110,7 @@ func buildFullHitMap(m *model) []RowLayout {
 // It mirrors renderRecordForViewport exactly so PrefixCells and RuneStartIdx
 // cannot drift.
 func hitMapRowsForRecord(rec record, recordIdx int32, width int) []RowLayout {
-	text := sanitizeText(rec.text)
+	text := ensurePreflightDelimiter(sanitizeText(rec.text))
 	switch rec.role {
 	case roleUser:
 		// User header is a single chrome-like row; content is not wrapped per-line.
@@ -270,6 +270,7 @@ func hitMapSegmentsForDefaultLine(text string, maxWidth int) []segment {
 // hitMapRowsForAI builds rows for roleAI text, mirroring RenderDeterministicPipeline
 // and renderStreamingContent outer gutter composition exactly.
 func hitMapRowsForAI(text string, recordIdx int32, width int) []RowLayout {
+	text = ensurePreflightDelimiter(text)
 	var rows []RowLayout
 	// Outer gutter for AI is always "│ " (2 cells) applied in renderStreamingContent.
 	const outerGutterCells = 2
@@ -360,6 +361,18 @@ func hitMapRowsForAI(text string, recordIdx int32, width int) []RowLayout {
 			})
 			continue
 		}
+		// Preflight header is a distinct physical row (chrome) so response text starts on next row with RuneStartIdx 0
+		if strings.Contains(line, "[preflight]") || strings.Contains(line, "snapshot ready") {
+			rows = append(rows, RowLayout{
+				RecordIdx:    recordIdx,
+				LogicalLine:  -1,
+				PrefixCells:  outerGutterCells,
+				ContentLen:   uint16(lipgloss.Width(strings.TrimSpace(line))),
+				RuneStartIdx: 0,
+				RuneCount:    0,
+			})
+			continue
+		}
 		// Heading leading "\n" blank separator
 		if strings.HasPrefix(trimmed, "# ") || strings.HasPrefix(trimmed, "## ") || strings.HasPrefix(trimmed, "### ") || strings.HasPrefix(trimmed, "#### ") {
 			rows = append(rows, RowLayout{
@@ -371,11 +384,12 @@ func hitMapRowsForAI(text string, recordIdx int32, width int) []RowLayout {
 				RuneCount:    0,
 			})
 		}
+		// Strict 2-cell safety padding: availableWidth = viewport.Width - 4
 		innerW := width - 4
 		if innerW < 10 {
 			innerW = 10
 		}
-		wrapW := innerW - markdownLinePrefixWidth(line)
+		wrapW := innerW - markdownLinePrefixWidth(line) - 2
 		if wrapW < 10 {
 			wrapW = 10
 		}

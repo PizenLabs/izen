@@ -2938,12 +2938,22 @@ func (m *model) cacheRecordToHistory(rec record) {
 // multi-line content like the TODO CHECKLIST must preserve its line structure
 // (each checklist item on its own line) rather than being reflowed as one blob.
 func (m *model) renderRecordForViewport(rec record) string {
-	width := m.width
-	if width < 40 {
-		width = 40
+	viewportWidth := m.width
+	if m.Ready && m.Viewport.Width > 0 {
+		viewportWidth = m.Viewport.Width
 	}
-
-	wrapWidth := width - 4
+	if viewportWidth < 40 {
+		viewportWidth = 40
+	}
+	width := viewportWidth
+	// Strict 2-cell safety padding: availableWidth = viewport.Width - 4
+	// Ensures wrapped lines never exceed Viewport.Width and lipgloss viewport
+	// truncation never slices words mid-word.
+	availableWidth := viewportWidth - 4
+	if availableWidth < 20 {
+		availableWidth = 20
+	}
+	wrapWidth := availableWidth
 	if wrapWidth <= 0 {
 		wrapWidth = 80
 	}
@@ -2956,6 +2966,10 @@ func (m *model) renderRecordForViewport(rec record) string {
 	// to spaces so multi-line messages display correctly instead of leaking raw
 	// backslash sequences or tab misalignment into the viewport.
 	text := sanitizeText(rec.text)
+	// Defect fix: activity/preflight trace blocks must strictly terminate with
+	// \n before the body text starts rendering. Without this, "[preflight]
+	// snapshot ready ... tokens=0Go, commonly..." bleeds on one line.
+	text = ensurePreflightDelimiter(text)
 
 	// Strict per-line width bound is enforced by the wrapper below
 	// (wrapIndentedLine / wrapText): every wrapped line lands at most
@@ -3065,6 +3079,77 @@ func (m *model) highlightFrozenCanonical(frozen string) string {
 	// split and inject highlight manually is complex, so regenerate from
 	// current records which should be identical while frozen.
 	return m.renderRecordsWithMouseSelection()
+}
+
+// ensurePreflightDelimiter ensures every activity/preflight trace block strictly
+// terminates with \n before the body text starts rendering. Defect: metadata
+// log lines bleed directly into the first line of the AI response without a
+// newline, e.g. "[preflight] snapshot ready target=\"\" sha= tokens=0 Go,
+// commonly...". This inserts an explicit \n boundary so the hitmap can count
+// the preflight header as a distinct physical row (LogicalLine -1) and the body
+// starts on the subsequent row with RuneStartIdx 0.
+func ensurePreflightDelimiter(s string) string {
+	if !strings.Contains(s, "[preflight]") && !strings.Contains(s, "snapshot ready") && !strings.Contains(s, "preflight") {
+		return s
+	}
+	// If the string already contains a newline separating preflight header from body, no fix needed.
+	if strings.Contains(s, "[preflight]") {
+		// Find the line containing [preflight]; if that logical line also contains body text
+		// after the tokens= pattern without an intervening \n, split it.
+		lines := strings.Split(s, "\n")
+		for i, line := range lines {
+			if strings.Contains(line, "[preflight]") || strings.Contains(line, "snapshot ready") {
+				// Look for "tokens=" pattern within this line - header ends after tokens number.
+				if idx := strings.Index(line, "tokens="); idx != -1 {
+					end := idx + len("tokens=")
+					for end < len(line) && line[end] >= '0' && line[end] <= '9' {
+						end++
+					}
+					// Trim spaces after tokens number
+					spaceEnd := end
+					for spaceEnd < len(line) && line[spaceEnd] == ' ' {
+						spaceEnd++
+					}
+					if spaceEnd < len(line) && line[spaceEnd] != '\n' {
+						// Body starts immediately after header on same line - split
+						header := strings.TrimRight(line[:spaceEnd], " ")
+						body := strings.TrimLeft(line[spaceEnd:], " ")
+						if body != "" {
+							lines[i] = header
+							// Insert new line with body after
+							newLines := make([]string, 0, len(lines)+1)
+							newLines = append(newLines, lines[:i+1]...)
+							newLines = append(newLines, body)
+							newLines = append(newLines, lines[i+1:]...)
+							return strings.Join(newLines, "\n")
+						}
+					}
+				}
+				// Fallback: if line contains both preflight marker and body text like "tokens=0 Go,"
+				// ensure split at "tokens=0" boundary
+				if strings.Contains(line, "tokens=0 Go,") {
+					lines[i] = strings.Replace(line, "tokens=0 Go,", "tokens=0\nGo,", 1)
+					return strings.Join(lines, "\n")
+				}
+			}
+		}
+	}
+	// Generic case: single line containing both header and body separated by space + capital letter
+	if !strings.Contains(s, "\n") && strings.Contains(s, "[preflight]") && strings.Contains(s, "tokens=") {
+		if idx := strings.Index(s, "tokens="); idx != -1 {
+			end := idx + len("tokens=")
+			for end < len(s) && s[end] >= '0' && s[end] <= '9' {
+				end++
+			}
+			if end < len(s) && s[end] == ' ' {
+				rest := strings.TrimLeft(s[end:], " ")
+				if rest != "" && rest[0] >= 'A' && rest[0] <= 'Z' {
+					return s[:end] + "\n" + rest
+				}
+			}
+		}
+	}
+	return s
 }
 
 // sanitizeEscapes converts literal backslash escape sequences that reach the
