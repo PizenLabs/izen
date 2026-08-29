@@ -2849,7 +2849,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		switch msg.Action {
 		case tea.MouseActionPress:
 			if msg.Button == tea.MouseButtonLeft {
-				pos := m.mousePosToLogical(msg)
+				pos := m.mousePosToGlobal(msg)
 				m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: pos, Cursor: pos, lastY: msg.Y, lastX: msg.X, TickActive: false}
 				// Freeze layout snapshot at drag start so background ticks
 				// cannot shift rows under the cursor.
@@ -2870,25 +2870,29 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if m.mouseSel.Dragging {
 				m.mouseSel.lastY = msg.Y
 				m.mouseSel.lastX = msg.X
-				m.mouseSel.Cursor = m.mousePosToLogical(msg)
+				m.mouseSel.Cursor = m.mousePosToGlobal(msg)
 				m.refreshViewportContent()
-				// Edge auto-scroll: single loop, velocity-based. Only schedule
-				// if not already active and mouse is in edge zone.
+				// Auto-scroll engine: continuous background ticking when mouse held past viewport bounds.
+				// Spec: when mouseSel.Active==true and screen Y outside viewport range
+				// (msg.Y >= topMargin+viewportHeight or msg.Y < topMargin), trigger continuous
+				// AutoScrollTickMsg until mouse release.
 				geo := m.viewportGeometry()
 				relY := msg.Y - geo.Top
+				isOutside := msg.Y >= geo.Top+geo.Height || msg.Y < geo.Top
 				inEdge := relY < selectionEdgeRows || relY >= geo.Height-selectionEdgeRows
-				if inEdge && !m.mouseSel.TickActive {
+				shouldTick := isOutside || inEdge
+				if shouldTick && !m.mouseSel.TickActive {
 					m.mouseSel.TickActive = true
-					return m, selectionScrollTickCmd(msg.Y, msg.X)
+					return m, AutoScrollTickCmd(msg.Y, msg.X)
 				}
-				if !inEdge {
+				if !shouldTick {
 					m.mouseSel.TickActive = false
 				}
 				return m, nil
 			}
 		case tea.MouseActionRelease:
 			if msg.Button == tea.MouseButtonLeft && m.mouseSel.Dragging {
-				m.mouseSel.Cursor = m.mousePosToLogical(msg)
+				m.mouseSel.Cursor = m.mousePosToGlobal(msg)
 				m.mouseSel.Dragging = false
 				m.mouseSel.TickActive = false
 				// Clear frozen layout snapshot; next refresh will rebuild
@@ -2901,7 +2905,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 			// Release with ButtonNone (some terminals) while dragging
 			if m.mouseSel.Dragging {
-				m.mouseSel.Cursor = m.mousePosToLogical(msg)
+				m.mouseSel.Cursor = m.mousePosToGlobal(msg)
 				m.mouseSel.Dragging = false
 				m.mouseSel.TickActive = false
 				m.frozenFullHitRows = nil

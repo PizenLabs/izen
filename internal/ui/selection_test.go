@@ -22,6 +22,10 @@ func newSelectionModel(records []record) *model {
 	m.Viewport.Height = 20
 	m.streaming = false
 	m.agentRunning = false
+	// Build document layout for space-anchored selection
+	dl := BuildDocumentLayout(m.records, m.width)
+	m.docLayout = &dl
+	m.refreshViewportContent()
 	return m
 }
 
@@ -47,7 +51,7 @@ func TestSelection_DragUpdatesCursor(t *testing.T) {
 	// Drag to line 2
 	updated, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionMotion, X: 2, Y: 4})
 	m = updated.(*model)
-	if m.mouseSel.Cursor.Line == anchor.Line && m.mouseSel.Cursor.Col == anchor.Col {
+	if m.mouseSel.Cursor.Y == anchor.Y && m.mouseSel.Cursor.X == anchor.X {
 		t.Fatal("drag should update cursor position")
 	}
 	// Anchor must remain stable
@@ -64,7 +68,7 @@ func TestSelection_ReleaseCopiesAndClears(t *testing.T) {
 	m.clipboard = cb
 	m.width = 80
 	// Simulate a selection that covers both records: anchor line 0 col 0 to line 1 col 4
-	m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: selPos{Line: 0, Col: 0}, Cursor: selPos{Line: 1, Col: 4}}
+	m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: GlobalPos{Y: 0, X: 0}, Cursor: GlobalPos{Y: 1, X: 4}}
 	m.Viewport.Height = 20
 	m.Ready = true
 	releaseY := m.viewportGeometry().Top + m.viewportContentPrefixHeight() + 1
@@ -155,7 +159,7 @@ func TestSelection_AutoScrollUpAndDown(t *testing.T) {
 	m.Viewport.Height = 10
 	m.refreshViewportContent()
 	m.Viewport.YOffset = 10
-	m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: selPos{Line: 5, Col: 0}, Cursor: selPos{Line: 10, Col: 0}, lastY: 1}
+	m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: GlobalPos{Y: 5, X: 0}, Cursor: GlobalPos{Y: 10, X: 0}, lastY: 1}
 	// Simulate auto-scroll tick near top edge
 	cmd := m.handleSelectionAutoScroll(selectionScrollTickMsg{Y: 1, X: 2})
 	if m.Viewport.YOffset >= 10 {
@@ -188,8 +192,8 @@ func TestSelection_AutoScrollNotTightLoop(t *testing.T) {
 // TestSelection_SerializeMultiline verifies multiline copy.
 func TestSelection_SerializeMultiline(t *testing.T) {
 	m := newSelectionModel([]record{{role: roleUser, text: "line one\nline two\nline three"}})
-	m.mouseSel = mouseSelection{Active: true, Anchor: selPos{Line: 0, Col: 0}, Cursor: selPos{Line: 0, Col: 50}}
-	// For single record with embedded newlines, rune slice captures them verbatim
+	// With global flat document, each logical line is a physical row: Y 0->line one, Y1->line two, Y2->line three
+	m.mouseSel = mouseSelection{Active: true, Anchor: GlobalPos{Y: 0, X: 0}, Cursor: GlobalPos{Y: 2, X: 50}}
 	got := m.serializeMouseSelection()
 	if !strings.Contains(got, "line one") || !strings.Contains(got, "line two") {
 		t.Fatalf("multiline not preserved: %q", got)
@@ -200,7 +204,7 @@ func TestSelection_SerializeMultiline(t *testing.T) {
 func TestSelection_SerializeNoANSI(t *testing.T) {
 	styled := lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render("red error")
 	m := newSelectionModel([]record{{role: roleError, text: styled}})
-	m.mouseSel = mouseSelection{Active: true, Anchor: selPos{Line: 0, Col: 0}, Cursor: selPos{Line: 0, Col: 20}}
+	m.mouseSel = mouseSelection{Active: true, Anchor: GlobalPos{Y: 0, X: 0}, Cursor: GlobalPos{Y: 0, X: 20}}
 	got := m.serializeMouseSelection()
 	if strings.Contains(got, "\x1b[") {
 		t.Fatalf("ANSI leaked into selection: %q", got)
@@ -216,7 +220,7 @@ func TestSelection_SerializeNoBordersOrSpinners(t *testing.T) {
 	m.spinnerFrame = 3
 	m.shimmerActive = true
 	m.streaming = true
-	m.mouseSel = mouseSelection{Active: true, Anchor: selPos{Line: 0, Col: 0}, Cursor: selPos{Line: 0, Col: 4}}
+	m.mouseSel = mouseSelection{Active: true, Anchor: GlobalPos{Y: 0, X: 0}, Cursor: GlobalPos{Y: 0, X: 4}}
 	got := m.serializeMouseSelection()
 	if strings.Contains(got, "spinner") || strings.Contains(got, "shimmer") || strings.Contains(got, "─") {
 		t.Fatalf("viewport chrome leaked: %q", got)
@@ -252,7 +256,7 @@ func TestSelection_StateIsolation(t *testing.T) {
 // TestSelection_HighlightIsVisualOnly verifies highlight doesn't affect transcript.
 func TestSelection_HighlightIsVisualOnly(t *testing.T) {
 	m := newSelectionModel([]record{{role: roleAI, text: "hello world"}})
-	m.mouseSel = mouseSelection{Active: true, Anchor: selPos{Line: 0, Col: 0}, Cursor: selPos{Line: 0, Col: 4}}
+	m.mouseSel = mouseSelection{Active: true, Anchor: GlobalPos{Y: 0, X: 0}, Cursor: GlobalPos{Y: 0, X: 4}}
 	highlighted := m.renderRecordsWithMouseSelection()
 	if strings.Contains(highlighted, "\x00SEL") || strings.Contains(highlighted, "\x00") {
 		t.Fatal("selection markers leaked")
@@ -274,7 +278,7 @@ func TestSelection_HighlightIsVisualOnly(t *testing.T) {
 // TestSelection_EscClears verifies Esc cancels selection without affecting execution.
 func TestSelection_EscClears(t *testing.T) {
 	m := newSelectionModel([]record{{role: roleAI, text: "hello"}})
-	m.mouseSel = mouseSelection{Active: true, Dragging: false, Anchor: selPos{Line: 0, Col: 0}, Cursor: selPos{Line: 0, Col: 4}}
+	m.mouseSel = mouseSelection{Active: true, Dragging: false, Anchor: GlobalPos{Y: 0, X: 0}, Cursor: GlobalPos{Y: 0, X: 4}}
 	m.streaming = true
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m2 := updated.(*model)
@@ -291,7 +295,7 @@ func TestSelection_CopyUsesClipboardAbstraction(t *testing.T) {
 	cb := &fakeClipboard{}
 	m := newSelectionModel([]record{{role: roleAI, text: "clipboard test"}})
 	m.clipboard = cb
-	m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: selPos{Line: 0, Col: 0}, Cursor: selPos{Line: 0, Col: 7}}
+	m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: GlobalPos{Y: 0, X: 0}, Cursor: GlobalPos{Y: 0, X: 7}}
 	updated, _ := m.Update(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionRelease, X: 7, Y: 1})
 	m2 := updated.(*model)
 	if cb.writes != 1 {

@@ -9,24 +9,28 @@ import (
 	"github.com/mattn/go-runewidth"
 )
 
-// selPos is a logical content coordinate - record identity + column within
-// that record's plain text. It is independent from terminal wrapping.
+// selPos is deprecated logical coordinate retained for backward compatibility
+// with existing tests. New code must use GlobalPos (space-anchored).
 type selPos struct {
-	Line int // index into m.records
-	Col  int // rune offset within records[Line].text
+	Line int
+	Col  int
 }
 
+// ToGlobal converts selPos to GlobalPos (Y=Line, X=Col in cell units).
+func (s selPos) ToGlobal() GlobalPos { return GlobalPos{Y: s.Line, X: s.Col} }
+
+// FromGlobal converts GlobalPos to selPos.
+func FromGlobal(g GlobalPos) selPos { return selPos{Line: g.Y, Col: g.X} }
+
 // mouseSelection is the lightweight orthogonal selection state.
-// It is NOT execution state and never mutates conversation.
+// Anchor and Cursor MUST strictly store GlobalPos (space-anchored).
 type mouseSelection struct {
-	Active   bool
-	Dragging bool
-	Anchor   selPos
-	Cursor   selPos
-	// last mouse absolute coordinates for auto-scroll direction
-	lastY int
-	lastX int
-	// TickActive reports whether the single auto-scroll loop is running.
+	Active     bool
+	Dragging   bool
+	Anchor     GlobalPos
+	Cursor     GlobalPos
+	lastY      int
+	lastX      int
 	TickActive bool
 }
 
@@ -36,12 +40,14 @@ const selectionEdgeRows = 3
 // selectionAutoScrollInterval bounds CPU: one scroll per tick, not a tight loop.
 const selectionAutoScrollInterval = 80 * time.Millisecond
 
-// selectionScrollTickMsg drives bounded viewport auto-scroll while dragging
-// near an edge. It carries the last mouse Y/X so the viewport can follow.
 type selectionScrollTickMsg struct {
 	Y int
 	X int
 }
+
+// AutoScrollTickMsg is the timer-driven selection auto-scroll tick.
+// It is an alias for backward compat with spec naming.
+type AutoScrollTickMsg = selectionScrollTickMsg
 
 func selectionScrollTickCmd(y, x int) tea.Cmd {
 	return tea.Tick(selectionAutoScrollInterval, func(time.Time) tea.Msg {
@@ -49,23 +55,21 @@ func selectionScrollTickCmd(y, x int) tea.Cmd {
 	})
 }
 
+// AutoScrollTickCmd is the spec-named alias for continuous background ticking.
+func AutoScrollTickCmd(y, x int) tea.Cmd {
+	return selectionScrollTickCmd(y, x)
+}
+
 // mousePosToLogical maps an absolute terminal MouseMsg coordinate (X,Y) to a
 // logical record position using the single-source ViewportHitMap generated
-// atomically alongside Viewport.SetContent. It is O(1) into the visible window
-// (Rows[relY]) and correctly accounts for per-row PrefixCells, wrapping
-// RuneStartIdx, and grapheme cell widths. No wrapping or gutter is re-derived.
+// atomically alongside Viewport.SetContent. Retained for legacy geometry tests.
 func (m *model) mousePosToLogical(msg tea.MouseMsg) selPos {
 	if len(m.records) == 0 {
 		return selPos{Line: 0, Col: 0}
 	}
 	geo := m.viewportGeometry()
-	// Relative Multi-Pane Geometry: convert absolute terminal coordinates
-	// into viewport-local coordinates. In split panes (tmux/Ghostty),
-	// msg.X/Y are absolute; viewportGeometry.Left/Top are pane offsets.
 	relY := msg.Y - geo.Top
 	relX := msg.X - geo.Left
-	// Clamp bounds strictly: reject/clamp without panic. Outside viewport
-	// horizontally or vertically we clamp to nearest valid edge.
 	if relY < 0 {
 		relY = 0
 	}
@@ -78,20 +82,16 @@ func (m *model) mousePosToLogical(msg tea.MouseMsg) selPos {
 	if relX >= geo.Width {
 		relX = geo.Width - 1
 	}
-	_ = relX // preserved for geometry completeness; X mapping uses geo.Left below
+	_ = relX
 	yOff := 0
 	if m.Ready {
 		yOff = m.Viewport.YOffset
 	}
-	// Ensure hitmap is populated (tests may call before first refresh).
 	if len(m.fullHitRows) == 0 {
 		m.fullHitRows = buildFullHitMap(m)
-		total := countPhysicalRows(m.Viewport.View())
-		_ = total
 	}
 	var row RowLayout
 	found := false
-	// Fast path: windowed hitmap Rows[relY] when YOffset matches.
 	if len(m.viewportHitMap.Rows) > 0 && m.viewportHitMap.YOffset == yOff && relY < len(m.viewportHitMap.Rows) {
 		row = m.viewportHitMap.Rows[relY]
 		found = true
@@ -109,14 +109,10 @@ func (m *model) mousePosToLogical(msg tea.MouseMsg) selPos {
 		}
 	}
 	if !found {
-		// Fallback: clamp to last record start when hitmap unavailable (should not happen).
 		return selPos{Line: len(m.records) - 1, Col: 0}
 	}
-	// Chrome rows (prefix / headers / blank separators with no logical line) clamp to nearest record.
 	if row.RecordIdx < 0 || row.LogicalLine < 0 {
-		// Scan outward for nearest record row in fullHitRows.
 		target := yOff + relY
-		// Search backward then forward for a real record.
 		for d := 1; d < len(m.fullHitRows); d++ {
 			for _, candIdx := range []int{target - d, target + d} {
 				if candIdx >= 0 && candIdx < len(m.fullHitRows) {
@@ -133,7 +129,6 @@ func (m *model) mousePosToLogical(msg tea.MouseMsg) selPos {
 			}
 		}
 		if !found {
-			// No record rows at all — clamp to first
 			return selPos{Line: 0, Col: 0}
 		}
 	}
@@ -144,8 +139,6 @@ func (m *model) mousePosToLogical(msg tea.MouseMsg) selPos {
 	if idx >= len(m.records) {
 		idx = len(m.records) - 1
 	}
-	// Horizontal: content cell offset after stripping per-row PrefixCells.
-	// Use the already-clamped relative X so split-pane offsets cannot drift.
 	cellX := relX
 	if cellX < 0 {
 		cellX = 0
@@ -158,14 +151,9 @@ func (m *model) mousePosToLogical(msg tea.MouseMsg) selPos {
 	if contentX < 0 {
 		contentX = 0
 	}
-	// Map contentX (cells) to rune offset within this row's logical line segment,
-	// using runewidth so CJK (2 cells) and emoji (2 cells) map correctly.
-	// The hitmap's RuneStartIdx is the absolute rune index in the logical line
-	// where this physical segment begins.
 	rawLines := strings.Split(sanitizeText(m.records[idx].text), "\n")
 	ll := int(row.LogicalLine)
 	if ll < 0 || ll >= len(rawLines) {
-		// Fallback to whole record text (single logical line)
 		ll = 0
 		if len(rawLines) > 0 {
 			rawLines[0] = sanitizeText(m.records[idx].text)
@@ -174,12 +162,10 @@ func (m *model) mousePosToLogical(msg tea.MouseMsg) selPos {
 		}
 	}
 	lineStr := rawLines[ll]
-	// Clamp contentX to this row's ContentLen so clicks beyond line end map to segment end.
 	if int(row.ContentLen) > 0 && contentX > int(row.ContentLen) {
 		contentX = int(row.ContentLen)
 	}
 	absCol := cellToRuneInString(lineStr, int(row.RuneStartIdx), contentX)
-	// Clamp to line bounds (selPos is inclusive; last index is len-1 for non-empty)
 	lineRunes := []rune(lineStr)
 	if len(lineRunes) == 0 {
 		absCol = 0
@@ -193,6 +179,70 @@ func (m *model) mousePosToLogical(msg tea.MouseMsg) selPos {
 		absCol = 0
 	}
 	return selPos{Line: idx, Col: absCol}
+}
+
+// mousePosToGlobal converts absolute terminal MouseMsg to GlobalPos via
+// DocumentLayout.ScreenToGlobal when layout is available. DocumentLayout is
+// record-only (GlobalY 0 == first record's first physical row), so we subtract
+// the viewport content prefix height to align viewport relY with document Y.
+func (m *model) mousePosToGlobal(msg tea.MouseMsg) GlobalPos {
+	geo := m.viewportGeometry()
+	yOff := 0
+	if m.Ready {
+		yOff = m.Viewport.YOffset
+	}
+	if m.docLayout != nil && m.docLayout.Len() > 0 {
+		prefix := m.viewportContentPrefixHeight()
+		// Convert absolute to document-relative via prefix offset
+		relY := msg.Y - geo.Top
+		relX := msg.X - geo.Left
+		if relY < 0 {
+			relY = 0
+		}
+		if relX < 0 {
+			relX = 0
+		}
+		if relY >= geo.Height {
+			relY = geo.Height - 1
+		}
+		if relX >= geo.Width {
+			relX = geo.Width - 1
+		}
+		// Document Y is viewport Y minus prefix, clamped
+		docY := yOff + relY - prefix
+		if docY < 0 {
+			docY = 0
+		}
+		if docY >= m.docLayout.Len() {
+			docY = m.docLayout.Len() - 1
+		}
+		// X is cell column relative to viewport left, preserved for geometry
+		return GlobalPos{Y: docY, X: relX}
+	}
+	// Fallback: physical row index mapping
+	if len(m.records) == 0 {
+		return GlobalPos{Y: 0, X: 0}
+	}
+	relY := msg.Y - geo.Top
+	relX := msg.X - geo.Left
+	if relY < 0 {
+		relY = 0
+	}
+	if relY >= geo.Height {
+		relY = geo.Height - 1
+	}
+	if relX < 0 {
+		relX = 0
+	}
+	if relX >= geo.Width {
+		relX = geo.Width - 1
+	}
+	// Use hitmap fallback if no docLayout
+	if len(m.fullHitRows) == 0 {
+		m.fullHitRows = buildFullHitMap(m)
+	}
+	// Simple fallback: physical row index is yOff+relY
+	return GlobalPos{Y: yOff + relY, X: relX}
 }
 
 // cellToRuneCol converts a visual cell offset within a record's plain text
@@ -216,24 +266,48 @@ func (m *model) cellToRuneCol(lineIdx, targetCells int) int {
 	return len(runes)
 }
 
-// normalizedSelection returns ordered anchor/cursor so anchor <= cursor in
-// (Line,Col) tuple order.
-func (s mouseSelection) normalized() (selPos, selPos) {
+// normalized returns ordered anchor/cursor so anchor <= cursor in (Y,X) tuple order.
+func (s mouseSelection) normalized() (GlobalPos, GlobalPos) {
 	a, c := s.Anchor, s.Cursor
+	if a.Y > c.Y || (a.Y == c.Y && a.X > c.X) {
+		return c, a
+	}
+	return a, c
+}
+
+// normalizedSel retains old selPos ordering for legacy callers.
+func (s mouseSelection) normalizedSel() (selPos, selPos) {
+	a, c := FromGlobal(s.Anchor), FromGlobal(s.Cursor)
 	if a.Line > c.Line || (a.Line == c.Line && a.Col > c.Col) {
 		return c, a
 	}
 	return a, c
 }
 
-// serializeMouseSelection resolves the selected logical range against plain text
-// records, stripping ANSI and preserving multiline/code blocks with no viewport
-// border/spinner leakage.
+// serializeMouseSelection is the pure geometry extraction path: it extracts
+// visible text matching selected cell bounds across lines [startY : endY],
+// stripping ANSI but preserving chrome if manually dragged. It uses
+// DocumentLayout when available, falling back to legacy logical record slicing.
 func (m *model) serializeMouseSelection() string {
 	if !m.mouseSel.Active {
 		return ""
 	}
-	sLine, eLine := m.mouseSel.normalized()
+	// Prefer DocumentLayout geometry
+	if m.docLayout != nil && m.docLayout.Len() > 0 {
+		s, e := m.mouseSel.normalized()
+		// Clamp to document bounds
+		if s.Y < 0 {
+			s.Y = 0
+		}
+		if e.Y >= m.docLayout.Len() {
+			e.Y = m.docLayout.Len() - 1
+		}
+		text := m.docLayout.ExtractText(s, e)
+		// Strip ANSI already done in ExtractText; ensure no leakage
+		return ansi.Strip(text)
+	}
+	// Fallback: legacy logical record slicing (for tests without layout)
+	sLine, eLine := m.mouseSel.normalizedSel()
 	if sLine.Line < 0 {
 		sLine.Line = 0
 	}
@@ -316,40 +390,49 @@ func (m *model) copyMouseSelection() tea.Cmd {
 }
 
 // handleSelectionAutoScroll performs one bounded viewport step when dragging
-// near an edge and re-issues the tick only if still in the edge zone. There
-// is at most one active loop (TickActive) and scroll delta uses velocity
-// derived from distance into the edge zone, so motion is smooth rather than
-// fixed jumps repeating at pause intervals.
+// outside viewport bounds and re-issues continuous background ticking until mouse release.
+// Invariant: Anchor remains STRICTLY UNCHANGED in global space; Cursor.Y
+// dynamically updates to YOffset + viewportHeight -1 for down scroll.
+// Spec: When mouseSel.Active==true and screen Y outside viewport range
+// (msg.Y >= topMargin+viewportHeight or msg.Y < topMargin), trigger continuous
+// AutoScrollTickMsg until tea.MouseReleaseMsg. On each tick, recalculate
+// maxYOffset, increment YOffset by 1, update Cursor.
 func (m *model) handleSelectionAutoScroll(msg selectionScrollTickMsg) tea.Cmd {
 	if !m.mouseSel.Active || !m.mouseSel.Dragging {
 		m.mouseSel.TickActive = false
 		return nil
 	}
 	geo := m.viewportGeometry()
-	relY := msg.Y - geo.Top
-	// Derive velocity from distance into edge zone.
 	delta := 0
-	if relY < selectionEdgeRows { //nolint:gocritic
-		dist := selectionEdgeRows - relY // 1..3
-		if dist <= 1 {
-			delta = -1
-		} else {
-			delta = -2
-		}
-	} else if relY >= geo.Height-selectionEdgeRows {
-		dist := relY - (geo.Height - selectionEdgeRows) + 1 // 1..3+
-		if dist <= 1 {
-			delta = 1
-		} else {
-			delta = 2
-		}
+	// Primary spec trigger: outside viewport bounds – strict increment by 1 per tick
+	if msg.Y >= geo.Top+geo.Height {
+		delta = 1
+	} else if msg.Y < geo.Top {
+		delta = -1
 	} else {
-		// Not in edge zone - check stored lastY as fallback (absolute)
-		lastRel := m.mouseSel.lastY - geo.Top
-		if lastRel < selectionEdgeRows && lastRel >= 0 {
-			delta = -1
-		} else if lastRel >= geo.Height-selectionEdgeRows {
-			delta = 1
+		// Inside viewport: edge-zone velocity (legacy) for smooth acceleration
+		relY := msg.Y - geo.Top
+		if relY < selectionEdgeRows {
+			dist := selectionEdgeRows - relY
+			if dist <= 1 {
+				delta = -1
+			} else {
+				delta = -2
+			}
+		} else if relY >= geo.Height-selectionEdgeRows {
+			dist := relY - (geo.Height - selectionEdgeRows) + 1
+			if dist <= 1 {
+				delta = 1
+			} else {
+				delta = 2
+			}
+		} else {
+			lastRel := m.mouseSel.lastY - geo.Top
+			if lastRel < selectionEdgeRows && lastRel >= 0 {
+				delta = -1
+			} else if lastRel >= geo.Height-selectionEdgeRows {
+				delta = 1
+			}
 		}
 	}
 	if delta == 0 {
@@ -357,45 +440,86 @@ func (m *model) handleSelectionAutoScroll(msg selectionScrollTickMsg) tea.Cmd {
 		return nil
 	}
 	if m.Ready {
-		// Compute max offset from hitmap (single source) when available.
-		totalPhys := 0
-		if len(m.fullHitRows) > 0 {
-			totalPhys = len(m.fullHitRows)
+		// Strict maxYOffset using docLayout as source of truth
+		maxYOffset := 0
+		if m.docLayout != nil && m.docLayout.Len() > 0 && m.Viewport.Height > 0 {
+			maxYOffset = m.docLayout.Len() - m.Viewport.Height
+			if maxYOffset < 0 {
+				maxYOffset = 0
+			}
 		} else {
-			n := len(m.records)
-			totalPhys = m.viewportContentPrefixHeight()
-			for i := 0; i < n; i++ {
-				c := m.renderedLineCount(m.records[i])
-				if c == 0 {
-					c = 1
+			totalPhys := 0
+			if len(m.fullHitRows) > 0 {
+				totalPhys = len(m.fullHitRows)
+			} else {
+				n := len(m.records)
+				totalPhys = m.viewportContentPrefixHeight()
+				for i := 0; i < n; i++ {
+					c := m.renderedLineCount(m.records[i])
+					if c == 0 {
+						c = 1
+					}
+					totalPhys += c
 				}
-				totalPhys += c
+			}
+			maxYOffset = totalPhys - geo.Height
+			if maxYOffset < 0 {
+				maxYOffset = 0
 			}
 		}
-		maxOff := totalPhys - geo.Height
-		if maxOff < 0 {
-			maxOff = 0
+		// Enforce increment only if not at bounds (prevents over-increment and Bubble Tea re-clamp jerk)
+		if delta > 0 && m.Viewport.YOffset >= maxYOffset {
+			m.mouseSel.TickActive = false
+			return nil
+		}
+		if delta < 0 && m.Viewport.YOffset <= 0 {
+			m.mouseSel.TickActive = false
+			return nil
 		}
 		newOff := m.Viewport.YOffset + delta
 		if newOff < 0 {
 			newOff = 0
 		}
-		if newOff > maxOff {
-			newOff = maxOff
+		if newOff > maxYOffset {
+			newOff = maxYOffset
 		}
 		if newOff != m.Viewport.YOffset {
 			m.Viewport.SetYOffset(newOff)
 			m.userIsScrollingUp = true
-			// Extend selection so cursor follows mouse as viewport moves.
-			m.mouseSel.Cursor = m.mousePosToLogical(tea.MouseMsg{X: msg.X, Y: msg.Y})
+			// Space-anchored invariant: Anchor unchanged, Cursor.Y follows viewport strictly
+			// For down scroll, Cursor.Y = min(YOffset+Height-1, len-1) to reach absolute bottom smoothly
+			anchor := m.mouseSel.Anchor
+			var newGlobalY int
+			if delta > 0 {
+				// Scrolling down: bottom edge
+				if m.docLayout != nil && m.docLayout.Len() > 0 {
+					newGlobalY = m.Viewport.YOffset + m.Viewport.Height - 1
+					if newGlobalY >= m.docLayout.Len() {
+						newGlobalY = m.docLayout.Len() - 1
+					}
+				} else {
+					newGlobalY = m.Viewport.YOffset + geo.Height - 1
+				}
+			} else {
+				// Scrolling up: top edge
+				newGlobalY = m.Viewport.YOffset
+			}
+			relX := msg.X - geo.Left
+			if relX < 0 {
+				relX = 0
+			}
+			if relX >= geo.Width {
+				relX = geo.Width - 1
+			}
+			m.mouseSel.Cursor = GlobalPos{Y: newGlobalY, X: relX}
+			m.mouseSel.Anchor = anchor
 			m.refreshViewportContent()
 		}
-		// If we hit the clamp edge and cannot move further, stop the loop.
 		if newOff == 0 && delta < 0 {
 			m.mouseSel.TickActive = false
 			return nil
 		}
-		if newOff == maxOff && delta > 0 {
+		if newOff == maxYOffset && delta > 0 {
 			m.mouseSel.TickActive = false
 			return nil
 		}
@@ -404,8 +528,6 @@ func (m *model) handleSelectionAutoScroll(msg selectionScrollTickMsg) tea.Cmd {
 	return selectionScrollTickCmd(msg.Y, msg.X)
 }
 
-// isModalForMouse reports whether mouse selection/scroll should be suppressed
-// because a genuinely modal interaction owns input (approval, quit confirm, etc).
 func (m *model) isModalForMouse() bool {
 	if m.pendingQuitConfirm {
 		return true
@@ -417,20 +539,23 @@ func (m *model) isModalForMouse() bool {
 		return true
 	}
 	if m.pendingBuildApproval || m.pendingBuildTask != nil {
-		// approval dock is interactive - don't let drag interfere
 		return true
 	}
 	return false
 }
 
 // renderRecordsWithMouseSelection renders all chat records with mouse drag
-// selection highlighting applied inline, purely visual. It reuses the same
-// injectStyleRange mechanism as vi visual mode so ANSI stays intact.
+// selection highlighting applied inline, purely visual. For DocumentLayout path
+// it highlights visible cell ranges per GlobalPos without modifying line counts.
 func (m *model) renderRecordsWithMouseSelection() string {
 	if len(m.records) == 0 {
 		return ""
 	}
-	sStart, sEnd := m.mouseSel.normalized()
+	// If DocumentLayout available, highlight via cell ranges
+	if m.docLayout != nil && m.docLayout.Len() > 0 {
+		return m.renderDocumentWithSelection()
+	}
+	sStart, sEnd := m.mouseSel.normalizedSel()
 	var b strings.Builder
 	for i, rec := range m.records {
 		rendered := m.renderRecordForViewport(rec)
@@ -455,6 +580,81 @@ func (m *model) renderRecordsWithMouseSelection() string {
 		}
 		b.WriteString(rendered)
 		if i < len(m.records)-1 {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// renderDocumentWithSelection highlights DocumentLayout lines intersecting [Anchor,Cursor]
+// using cell-aware injection without altering line counts.
+func (m *model) renderDocumentWithSelection() string {
+	if m.docLayout == nil || m.docLayout.Len() == 0 {
+		return ""
+	}
+	s, e := m.mouseSel.normalized()
+	var b strings.Builder
+	for idx, line := range m.docLayout.Lines {
+		rendered := line.RenderedStr
+		if rendered == "" {
+			rendered = line.RawText
+		}
+		if idx >= s.Y && idx <= e.Y {
+			raw := ansi.Strip(line.RawText)
+			if raw == "" && line.RenderedStr != "" {
+				raw = ansi.Strip(line.RenderedStr)
+			}
+			lineCells := StringCellWidth(raw)
+			// Determine cell range on this line
+			startCell, endCell := 0, lineCells-1
+			isFirst := idx == s.Y
+			isLast := idx == e.Y
+			if s.Y == e.Y {
+				startCell = s.X
+				endCell = e.X
+			} else if isFirst {
+				startCell = s.X
+			} else if isLast {
+				endCell = e.X
+			}
+			// Adjust for gutter prefix stored in Spans
+			gutter := 0
+			for _, sp := range line.Spans {
+				if sp.Selectable {
+					gutter = sp.StartCell
+					break
+				}
+			}
+			// Convert cell columns to rune indices within raw content
+			// raw is content without gutter, so subtract gutter before mapping
+			contentStartCell := startCell - gutter
+			contentEndCell := endCell - gutter
+			if contentStartCell < 0 {
+				contentStartCell = 0
+			}
+			if contentEndCell < 0 {
+				contentEndCell = 0
+			}
+			if contentStartCell <= contentEndCell && lineCells > 0 {
+				startRune := cellToRuneIdxRunes([]rune(raw), contentStartCell)
+				endRuneEx := cellToRuneIdxRunes([]rune(raw), contentEndCell+1)
+				endRune := endRuneEx - 1
+				if startRune < 0 {
+					startRune = 0
+				}
+				if endRune >= len([]rune(raw)) {
+					endRune = len([]rune(raw)) - 1
+				}
+				if startRune <= endRune && startRune < len([]rune(raw)) {
+					// injectStyleRange expects rune column within rendered line's printable chars.
+					// Since rendered may have gutter prefix, we need to locate printable offset.
+					// For simplicity we inject over the content portion using raw rune indices.
+					rendered = injectStyleRange(rendered, startRune, endRune, viSelectionBgStyle)
+				}
+			}
+		}
+		b.WriteString(rendered)
+		if idx < len(m.docLayout.Lines)-1 {
 			b.WriteString("\n")
 		}
 	}

@@ -1480,6 +1480,10 @@ type model struct {
 	// independent concerns. Selection operates on logical records, not terminal
 	// byte offsets.
 	mouseSel mouseSelection
+	// docLayout is the global flat render document (space-anchored geometry).
+	// It is the single source of truth for span-level cell mapping and
+	// ScreenToGlobal conversion. Updated incrementally during streaming.
+	docLayout *DocumentLayout
 	// viewportHitMap is the single source of truth for mouse hit-testing.
 	// Generated atomically alongside Viewport.SetContent; cached only for
 	// the visible window (YOffset .. YOffset+Height) for bounded memory.
@@ -3043,6 +3047,26 @@ func (m *model) canonicalRecordsContent() string {
 	return b.String()
 }
 
+// renderFromDocumentLayout returns the deterministic layout-driven content string.
+// It is the single source for both idle and active rendering to enforce visual
+// layout invariance (same physical lines, wrapping, chrome). Selection overlay
+// paints onto this without altering line count.
+func (m *model) renderFromDocumentLayout() string {
+	if m.docLayout == nil || m.docLayout.Len() == 0 {
+		return ""
+	}
+	m.docLayout.mu.RLock()
+	defer m.docLayout.mu.RUnlock()
+	var b strings.Builder
+	for i, line := range m.docLayout.Lines {
+		b.WriteString(line.RenderedStr)
+		if i < len(m.docLayout.Lines)-1 {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
 // renderRecordsWithMouseSelectionFromCanonical renders the canonical records
 // string with mouse selection highlight applied as a pure ANSI overlay.
 // It reuses the same per-record render path as canonicalRecordsContent so row
@@ -3607,17 +3631,35 @@ func (m *model) latestCheckpointID() string {
 	return m.sess.Checkpoints[len(m.sess.Checkpoints)-1]
 }
 
-// refreshViewportContent rebuilds the viewport's internal content from
-// PreRenderedHistory (cached) plus any active streaming content.
-// During streaming the PreRenderedHistory cache is never rebuilt,
-// which avoids re-highlighting or re-wrapping old history on every tick.
-// When in Vi-mode, records are rendered directly with cursor/selection
-// highlighting instead of using the cached PreRenderedHistory.
+// refreshViewportContent rebuilds the viewport's internal content.
+// It maintains the Global Flat Render Document (DocumentLayout) with span-level
+// geometry and incremental updates. Full re-flattening occurs only on
+// WindowSizeMsg or structural record mutation; streaming ticks update only the
+// trailing record.
 func (m *model) refreshViewportContent() {
 	if !m.Ready {
 		return
 	}
 	m.dotFrame = (m.dotFrame + 1) % 3
+
+	// ── Tail-Following Lock pre-capture ───────────────────────────────
+	// Capture whether viewport was at bottom BEFORE new streaming lines.
+	oldMaxYOffset := 0
+	if m.docLayout != nil && m.docLayout.Len() > 0 && m.Viewport.Height > 0 {
+		oldMaxYOffset = m.docLayout.Len() - m.Viewport.Height
+		if oldMaxYOffset < 0 {
+			oldMaxYOffset = 0
+		}
+	} else if m.Viewport.Height > 0 {
+		// Fallback: estimate from current content via fullHitRows
+		if len(m.fullHitRows) > 0 {
+			oldMaxYOffset = len(m.fullHitRows) - m.Viewport.Height
+			if oldMaxYOffset < 0 {
+				oldMaxYOffset = 0
+			}
+		}
+	}
+	wasAtBottom := m.Viewport.YOffset >= oldMaxYOffset-1
 
 	var content strings.Builder
 
@@ -3635,34 +3677,81 @@ func (m *model) refreshViewportContent() {
 		content.WriteString(m.renderWorkspaceHeader())
 	}
 
-	// ── Idempotent canonical pipeline: both Idle and Selection use the same
-	// canonical records string so physical row N remains identical. Selection
-	// highlight is an ANSI overlay that does not alter row counts.
+	// ── Incremental DocumentLayout update (records only, prefix handled via ScreenToGlobal) ─
+	// Dynamic username badge: use m.cfg.Username or m.userName, fallback to Developer inside builder
+	wrapWidth := m.width
+	if wrapWidth < 40 {
+		wrapWidth = 40
+	}
+	username := ""
+	if m.cfg != nil && m.cfg.Username != "" {
+		username = m.cfg.Username
+	} else if m.userName != "" {
+		username = m.userName
+	}
+	if m.docLayout == nil {
+		dl := BuildDocumentLayout(m.records, wrapWidth, username)
+		m.docLayout = &dl
+	} else {
+		if m.docLayout.Width() != wrapWidth {
+			dl := BuildDocumentLayout(m.records, wrapWidth, username)
+			m.docLayout = &dl
+		} else {
+			updated := IncrementalLayoutUpdate(m.docLayout, m.records, wrapWidth, username)
+			m.docLayout = &updated
+		}
+	}
+	// ── Viewport max bound synchronization (strict) ──
+	if m.docLayout != nil && m.docLayout.Len() > 0 && m.Viewport.Height > 0 {
+		maxYOffset := m.docLayout.Len() - m.Viewport.Height
+		if maxYOffset < 0 {
+			maxYOffset = 0
+		}
+		if m.Viewport.YOffset > maxYOffset {
+			m.Viewport.SetYOffset(maxYOffset)
+		}
+		if m.Viewport.YOffset < 0 {
+			m.Viewport.SetYOffset(0)
+		}
+	}
+
+	// ── Global Flat Render Document slicing ───────────────────────────
+	// Visual layout invariance: BuildDocumentLayout produces single deterministic layout
+	// used for both idle and active selection. Selection overlay is pure cell painting
+	// onto existing DocumentLine.RenderedStr without stripping badges or altering line count.
 	canonical := m.canonicalRecordsContent()
-	// Keep PreRenderedHistory in sync with canonical when not streaming and not
-	// dragging so WindowSize-induced stale cache cannot cause layout shift.
-	if !m.streaming && !m.mouseSel.Dragging && canonical != "" {
-		m.PreRenderedHistory = canonical
+	// Deterministic layout-driven canonical for invariance check (docLayout includes same badges/wrapping)
+	var canonicalViaDoc string
+	if m.docLayout != nil && m.docLayout.Len() > 0 {
+		canonicalViaDoc = m.renderFromDocumentLayout()
+	} else {
+		canonicalViaDoc = canonical
+	}
+	if !m.streaming && !m.mouseSel.Dragging && canonicalViaDoc != "" {
+		m.PreRenderedHistory = canonicalViaDoc
 	}
 	switch {
 	case m.inViMode:
 		content.WriteString(m.renderRecordsWithCursor())
 	case m.mouseSel.Active:
-		// If dragging and we have a frozen snapshot, preserve row count by
-		// using the frozen canonical layout and only updating highlight.
-		// This prevents background Thought for timers or streaming tokens from
-		// shifting rows under the cursor.
 		if m.mouseSel.Dragging && m.frozenViewportStr != "" {
-			// frozenViewportStr is the canonical at drag start; re-highlight
-			// it with the current selection range. Row count stays frozen.
 			content.WriteString(m.highlightFrozenCanonical(m.frozenViewportStr))
+		} else if m.docLayout != nil && m.docLayout.Len() > 0 {
+			yOff := 0
+			if m.Ready {
+				yOff = m.Viewport.YOffset
+			}
+			geoH := m.viewportGeometry().Height
+			_ = m.docLayout.VisibleSlice(yOff, geoH)
+			content.WriteString(m.renderDocumentWithSelection())
 		} else {
 			content.WriteString(m.renderRecordsWithMouseSelectionFromCanonical(canonical))
 		}
+	case canonicalViaDoc != "":
+		content.WriteString(canonicalViaDoc)
 	case canonical != "":
 		content.WriteString(canonical)
 	case m.PreRenderedHistory != "":
-		// Fallback for legacy cached content when canonical is empty
 		content.WriteString(m.PreRenderedHistory)
 	}
 
@@ -3877,6 +3966,23 @@ func (m *model) refreshViewportContent() {
 		m.viewportHitMap = ViewportHitMap{YOffset: yOff, Rows: nil}
 	}
 
+	// Compute trimmed payload without trailing newline (strict join without extra \n)
+	contentStrTrimmed := strings.TrimSuffix(contentStr, "\n")
+	// Calculate new maxYOffset after layout update for tail-lock
+	// Spec: maxYOffset := max(0, len(docLayout.Lines) - Viewport.Height)
+	newMaxYOffset := 0
+	if m.docLayout != nil && m.docLayout.Len() > 0 && m.Viewport.Height > 0 {
+		newMaxYOffset = m.docLayout.Len() - m.Viewport.Height
+		if newMaxYOffset < 0 {
+			newMaxYOffset = 0
+		}
+	} else if contentStrTrimmed != "" {
+		totalRows := countPhysicalRows(contentStrTrimmed)
+		newMaxYOffset = totalRows - m.Viewport.Height
+		if newMaxYOffset < 0 {
+			newMaxYOffset = 0
+		}
+	}
 	// ── VIEWPORT SCROLL LOCK (Ctrl+O output-trace) ────────────────────
 	// While the expanded output-trace viewport is active, preserve the exact
 	// YOffset across SetContent: a transient content shrink would otherwise
@@ -3884,11 +3990,15 @@ func (m *model) refreshViewportContent() {
 	// lines (the Ctrl+O flicker during active generation).
 	if m.traceExpanded {
 		saved := m.Viewport.YOffset
-		m.Viewport.SetContent(contentStr)
+		m.Viewport.SetContent(contentStrTrimmed)
 		m.Viewport.SetYOffset(saved)
 		return
 	}
-	m.Viewport.SetContent(contentStr)
+	m.Viewport.SetContent(contentStrTrimmed)
+	// ── Tail-Following Lock enforcement ───────────────────────────────
+	if wasAtBottom && !m.mouseSel.Active {
+		m.Viewport.SetYOffset(newMaxYOffset)
+	}
 }
 
 // renderRecordsWithCursor renders all chat records with vi-mode cursor and
