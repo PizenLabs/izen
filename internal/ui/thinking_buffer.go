@@ -311,6 +311,10 @@ func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) stri
 		// NO header: the "Thinking…" status is owned by the parent indicator
 		// (loading dock or collapsed line) — see the NO-DUPLICATE CONTRACT
 		// above. The box starts directly with the reasoning window.
+		// Explicit newline separation: headerStr + "\n" + thinkingBody — the
+		// expanded thought text must render on its own physical line with
+		// consistent indentation and dimmed styling, never concatenated onto
+		// the status/policy header row.
 		for _, line := range allLines[start:end] {
 			if line == "" {
 				linesOut = append(linesOut, thinkingStyle.Render("│"))
