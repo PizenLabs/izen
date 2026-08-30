@@ -161,7 +161,7 @@ func (m *model) mousePosToLogical(msg tea.MouseMsg) selPos {
 			return selPos{Line: idx, Col: 0}
 		}
 	}
-	lineStr := rawLines[ll]
+	lineStr := ansi.Strip(rawLines[ll])
 	if int(row.ContentLen) > 0 && contentX > int(row.ContentLen) {
 		contentX = int(row.ContentLen)
 	}
@@ -193,31 +193,26 @@ func (m *model) mousePosToGlobal(msg tea.MouseMsg) GlobalPos {
 	}
 	if m.docLayout != nil && m.docLayout.Len() > 0 {
 		prefix := m.viewportContentPrefixHeight()
-		// Convert absolute to document-relative via prefix offset
-		relY := msg.Y - geo.Top
-		relX := msg.X - geo.Left
-		if relY < 0 {
-			relY = 0
+		// Use the layout's geometry mapper so viewport left/top offsets are
+		// applied exactly once and never drift from extraction/highlighting.
+		docYOffset := yOff - prefix
+		if docYOffset < 0 {
+			docYOffset = 0
 		}
-		if relX < 0 {
-			relX = 0
+		pos := m.docLayout.ScreenToGlobal(msg.X, msg.Y, docYOffset, geo.Left, geo.Top+prefix)
+		if pos.Y < 0 {
+			pos.Y = 0
 		}
-		if relY >= geo.Height {
-			relY = geo.Height - 1
+		if pos.Y >= m.docLayout.Len() {
+			pos.Y = m.docLayout.Len() - 1
 		}
-		if relX >= geo.Width {
-			relX = geo.Width - 1
+		if pos.X < 0 {
+			pos.X = 0
 		}
-		// Document Y is viewport Y minus prefix, clamped
-		docY := yOff + relY - prefix
-		if docY < 0 {
-			docY = 0
+		if geo.Width > 0 && pos.X >= geo.Width {
+			pos.X = geo.Width - 1
 		}
-		if docY >= m.docLayout.Len() {
-			docY = m.docLayout.Len() - 1
-		}
-		// X is cell column relative to viewport left, preserved for geometry
-		return GlobalPos{Y: docY, X: relX}
+		return pos
 	}
 	// Fallback: physical row index mapping
 	if len(m.records) == 0 {
@@ -298,7 +293,8 @@ func (m *model) serializeMouseSelection() string {
 	}
 	var b strings.Builder
 	if sLine.Line == eLine.Line {
-		runes := []rune(m.records[sLine.Line].text)
+		line := ansi.Strip(m.records[sLine.Line].text)
+		runes := []rune(line)
 		end := eLine.Col + 1
 		if end > len(runes) {
 			end = len(runes)
@@ -313,7 +309,8 @@ func (m *model) serializeMouseSelection() string {
 		return b.String()
 	}
 	for i := sLine.Line; i <= eLine.Line && i < len(m.records); i++ {
-		runes := []rune(m.records[i].text)
+		line := ansi.Strip(m.records[i].text)
+		runes := []rune(line)
 		switch i {
 		case sLine.Line:
 			if sLine.Col < len(runes) {
@@ -328,7 +325,7 @@ func (m *model) serializeMouseSelection() string {
 				b.WriteString(string(runes[:end]))
 			}
 		default:
-			b.WriteString(m.records[i].text)
+			b.WriteString(ansi.Strip(m.records[i].text))
 		}
 		if i < eLine.Line {
 			b.WriteString("\n")
@@ -340,7 +337,7 @@ func (m *model) serializeMouseSelection() string {
 // copyMouseSelection serializes the selection to the clipboard abstraction
 // without requiring Ctrl+C, then clears the visual selection.
 func (m *model) copyMouseSelection() tea.Cmd {
-	text := m.serializeMouseSelection()
+	text := normalizeCopiedText(m.serializeMouseSelection())
 	if strings.TrimSpace(text) == "" {
 		m.mouseSel = mouseSelection{}
 		m.frozenFullHitRows = nil

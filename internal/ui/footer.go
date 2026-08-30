@@ -20,7 +20,7 @@ import (
 // projection of the interaction lifecycle. It has exactly three states:
 //
 //	a. FRESH LAUNCH  (!sessionHasRunPrompts && !isExecuting)
-//	   Clean startup hint: "<active_model_alias>  ·  Alt+E trace  ·  Ctrl+H help".
+//	   Clean startup hint: "<active_model_alias>  ·  Ctrl+H help".
 //	   No token counters, no cost, no zero-value indicators — a brand-new
 //	   session never clutters the footer with idle telemetry.
 //	b. EXECUTING     (isExecuting)
@@ -30,7 +30,7 @@ import (
 //	   'Ctrl+C interrupt' and the '⏸' icon never survive past completion.
 //	c. ACTIVE SESSION IDLE (sessionHasRunPrompts && !isExecuting)
 //	   Persistent refined telemetry anchored on the active model name:
-//	   "<Model>  ·  ↓<in> + ↑<out> tok (<ctx_pct>%)  ·  <Cost>  ·  Alt+E trace".
+//	   "<Model>  ·  ↓<in> + ↑<out> tok (<ctx_pct>%)  ·  <Cost>".
 //	   The Mode Badge belongs EXCLUSIVELY to the Top Bar right side — it never
 //	   appears in the footer.
 //
@@ -98,12 +98,11 @@ func (m *model) renderFixedFooter(width int, actions []Action) string {
 }
 
 // renderFreshLaunchFooter renders the clean startup hint for a brand-new
-// session: "<model>  ·  Alt+E trace  ·  Ctrl+H help". No counters, no cost, no
+// session: "<model>  ·  Ctrl+H help". No counters, no cost, no
 // zero-value indicators.
 func (m *model) renderFreshLaunchFooter() string {
 	return footerSep(
 		footerModelStyle.Render(m.getActiveModelName()),
-		footerHelpStyle.Render("Alt+E trace"),
 		footerHelpStyle.Render("Ctrl+H help"),
 	)
 }
@@ -111,9 +110,9 @@ func (m *model) renderFreshLaunchFooter() string {
 // renderActiveIdleFooter renders the persistent Active-Session IDLE telemetry,
 // anchored on the active model name:
 //
-//	<Model>  ·  ↓<in> + ↑<out> tok (<ctx_pct>%)  ·  <Cost>  ·  Alt+E trace
+//	<Model>  ·  ↓<in> + ↑<out> tok (<ctx_pct>%)  ·  <Cost>
 //
-// e.g. "qwen2.5-coder:7b  ·  ↓0 + ↑170 tok (1%)  ·  $free  ·  Alt+E trace".
+// e.g. "qwen2.5-coder:7b  ·  ↓0 + ↑170 tok (1%)  ·  $free".
 // The Mode Badge is deliberately absent — the Top Bar owns it. 'Ctrl+C
 // interrupt' and the '⏸' icon are never present here.
 func (m *model) renderActiveIdleFooter(width int, actions []Action) string {
@@ -122,7 +121,6 @@ func (m *model) renderActiveIdleFooter(width int, actions []Action) string {
 		footerModelStyle.Render(m.getActiveModelName()),
 		footerTokStyle.Render(status.FormatUsageContext(m.InputTokens, m.OutputTokens, m.TotalTokens, m.activeContextLimit())),
 		footerExecMetaStyle.Render(llm.FormatCost(cost)),
-		footerHelpStyle.Render("Alt+E trace"),
 	)
 
 	chip := renderActions(actions)

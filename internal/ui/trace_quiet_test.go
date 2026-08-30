@@ -162,6 +162,47 @@ func TestAltETogglesTraceVerboseToast(t *testing.T) {
 	}
 }
 
+// TestAltERebuildsViewportLayoutImmediately pins the strict Alt+E contract:
+// toggling to quiet mode must immediately rebuild document layout so any
+// existing EngineTrace rows are removed from the viewport model.
+func TestAltERebuildsViewportLayoutImmediately(t *testing.T) {
+	defer SetTraceVerbose(false)
+	SetTraceVerbose(true)
+
+	m := readyChatModel(newTestModel())
+	m.traceVerbose = true
+	m.wrapWidth = 80
+	m.Viewport.Width = 80
+	m.Viewport.Height = 8
+	m.records = []record{
+		{role: roleStatus, text: "[event] PromptAdmitted intent=modification latency=42ms", turnID: 1},
+		{role: roleAI, text: "done", turnID: 1},
+	}
+	m.rebuildDocumentLayout()
+
+	foundTrace := false
+	for _, l := range m.docLayout.Lines {
+		if l.Kind == LineKindEngineTrace {
+			foundTrace = true
+			break
+		}
+	}
+	if !foundTrace {
+		t.Fatal("precondition failed: verbose layout should contain LineKindEngineTrace")
+	}
+
+	_, _ = m.handleKey(tea.KeyMsg{Alt: true, Type: tea.KeyRunes, Runes: []rune{'e'}})
+	if IsTraceVerbose() {
+		t.Fatal("Alt+E must collapse trace verbosity to quiet mode")
+	}
+
+	for _, l := range m.docLayout.Lines {
+		if l.Kind == LineKindEngineTrace {
+			t.Fatalf("quiet mode leaked LineKindEngineTrace after Alt+E rebuild: %q", ansi.Strip(l.RawText))
+		}
+	}
+}
+
 // TestIncrementalLayoutUpdateSingleTraceSummary pins the strict per-turn
 // dedup: multiple trace records appended incrementally (stream path) yield
 // EXACTLY ONE "▸ Trace:" line and zero raw engine leakage.

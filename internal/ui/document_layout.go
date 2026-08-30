@@ -14,9 +14,9 @@ type LineKind int
 const (
 	LineKindUserPrompt LineKind = iota
 	LineKindAIResponse
-	LineKindEngineTrace   // Internal logs, intents, phase changes, preflight
-	LineKindTraceSummary  // Single "▸ Trace: ..." bar
-	LineKindSystemError   // State transition errors, execution failures
+	LineKindEngineTrace  // Internal logs, intents, phase changes, preflight
+	LineKindTraceSummary // Single "▸ Trace: ..." bar
+	LineKindSystemError  // State transition errors, execution failures
 )
 
 func (k LineKind) String() string {
@@ -276,6 +276,12 @@ func normalizeGlobalPos(a, b GlobalPos) (GlobalPos, GlobalPos) {
 // where endCell is exclusive and -1 means until end of line. It accounts for
 // CJK double-width runes via runewidth.RuneWidth and never splits a wide rune.
 func sliceByCells(s string, startCell, endCell int, spans []RenderSpan) string {
+	if s == "" {
+		return ""
+	}
+	// Selection coordinates are visual cell offsets on the rendered viewport.
+	// Strip ANSI first so escape sequences never skew cell-to-rune mapping.
+	s = ansi.Strip(s)
 	if s == "" {
 		return ""
 	}

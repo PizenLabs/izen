@@ -135,10 +135,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// into the single subtle line
 	// `▸ Trace: direct_response (21ms) · Alt+E to toggle`.
 	// Verbose restores the full multiline logs. The toggle fires a Top Bar
-	// toast (Trace: EXPANDED / Trace: COLLAPSED) and refreshes the viewport.
+	// toast (Trace: EXPANDED / Trace: COLLAPSED), forces a full layout rebuild,
+	// and repaints the viewport immediately.
 	if msg.String() == "alt+e" || msg.String() == "alt+v" {
-		verbose := ToggleTraceVerbose()
+		// Keep model-local and package-global verbosity in lockstep.
+		if m.traceVerbose != IsTraceVerbose() {
+			m.traceVerbose = IsTraceVerbose()
+		}
+		m.traceVerbose = !m.traceVerbose
+		SetTraceVerbose(m.traceVerbose)
+		verbose := m.traceVerbose
 		m.setToast(traceToggleToast(verbose))
+		m.rebuildDocumentLayout()
 		m.refreshViewportContent()
 		if m.Ready && !m.userIsScrollingUp {
 			m.followTail()
