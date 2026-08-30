@@ -158,23 +158,23 @@ func TestSelection_AutoScrollUpAndDown(t *testing.T) {
 	m.Ready = true
 	m.Viewport.Height = 10
 	m.refreshViewportContent()
-	m.Viewport.YOffset = 10
+	m.docScrollOffset = 10
 	m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: GlobalPos{Y: 5, X: 0}, Cursor: GlobalPos{Y: 10, X: 0}, lastY: 1}
 	// Simulate auto-scroll tick near top edge
 	cmd := m.handleSelectionAutoScroll(selectionScrollTickMsg{Y: 1, X: 2})
-	if m.Viewport.YOffset >= 10 {
-		t.Fatalf("auto-scroll up should move viewport, offset %d", m.Viewport.YOffset)
+	if m.docScrollOffset >= 10 {
+		t.Fatalf("auto-scroll up should move viewport, offset %d", m.docScrollOffset)
 	}
 	if cmd == nil {
 		t.Fatal("auto-scroll should schedule next tick while in edge zone")
 	}
 	// Now test down
-	m.Viewport.YOffset = 5
+	m.docScrollOffset = 5
 	m.mouseSel.lastY = m.Viewport.Height - 1
-	before := m.Viewport.YOffset
+	before := m.docScrollOffset
 	_ = m.handleSelectionAutoScroll(selectionScrollTickMsg{Y: m.height - 1, X: 2})
-	if m.Viewport.YOffset <= before {
-		t.Fatalf("auto-scroll down should move viewport, before %d after %d", before, m.Viewport.YOffset)
+	if m.docScrollOffset <= before {
+		t.Fatalf("auto-scroll down should move viewport, before %d after %d", before, m.docScrollOffset)
 	}
 }
 

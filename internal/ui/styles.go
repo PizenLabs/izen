@@ -427,17 +427,27 @@ var (
 	// actual answer/actions read crisp and clear against the dimmed reasoning.
 	// It mirrors the standard bright text style (colorText).
 	brightStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+
+	// streamCursorStyle is the smooth block cursor appended to the active
+	// trailing line while an assistant response streams. Accent Blue matches
+	// the AI gutter (#89b4fa) so the insertion point reads as part of the
+	// answer surface, never as a separate cursor widget.
+	streamCursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
 )
 
 // Pre-compiled Markdown renderer styles (render-path — zero NewStyle).
+// All block/inline styles follow the Catppuccin Mocha palette.
 var (
-	mdEmphasisStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7")).Italic(true)
-	mdStrongStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
-	mdH1Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7"))
-	mdH2Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89dceb"))
-	mdH3Style         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7"))
-	mdH4Style         = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
-	mdCodeSpanStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af")).Background(lipgloss.Color("#313244"))
+	mdEmphasisStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7")).Italic(true)
+	mdStrongStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
+	// Headers: bold Mauve (#cba6f7), with top/bottom line space inserted by
+	// the renderer (the styles themselves are pure color + weight).
+	mdH1Style = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7"))
+	mdH2Style = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7"))
+	mdH3Style = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7"))
+	mdH4Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
+	// Inline code: Pink text (#f5c2e7) on Surface0 background (#313244).
+	mdCodeSpanStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f5c2e7")).Background(lipgloss.Color("#313244"))
 	mdLinkStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Underline(true)
 	mdMutedStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 	mdCodeContStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
@@ -446,7 +456,14 @@ var (
 	mdImageMutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 	mdHeaderBoldCell  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
 	mdCellStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
-	mdBulletStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
+	// Lists/numbers: Peach (#fab387) markers with indented continuation text.
+	mdBulletStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#fab387"))
+
+	// Code block chrome: dimmed border (#45475a), Surface background
+	// (#1e1e2e). Syntax colours come from the chroma Catppuccin Mocha theme
+	// (green keywords #a6e3a1, blue identifiers #89b4fa).
+	mdCodeBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
+	mdCodeBgStyle     = lipgloss.NewStyle().Background(lipgloss.Color(colorSurface))
 
 	// Callout label styles per keyword
 	mdCalloutStyles = map[string]lipgloss.Style{

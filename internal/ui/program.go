@@ -142,6 +142,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 
 	m := &model{
 		cfg:                 cfg,
+		streamingDocStart:   -1,
 		runtimeCtx:          app.RuntimeCtx,
 		workflowSM:          app.WorkflowSM,
 		workflowRT:          app.Workflow,

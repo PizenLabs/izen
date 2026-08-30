@@ -107,6 +107,34 @@ func (d *DocumentLayout) VisibleSlice(yOffset, height int) []DocumentLine {
 	return out
 }
 
+// Slice returns the rendered strings of the visible window
+// [yOffset, yOffset+height), clamped to the document. It is the single slicing
+// primitive used by the manual-slicing viewport contract: the caller passes
+// exactly these lines to Viewport.SetContent and resets Viewport.YOffset to 0
+// so the bubbles viewport can never double-scroll or middle-jump.
+func (d *DocumentLayout) Slice(yOffset, height int) []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if len(d.Lines) == 0 || height <= 0 {
+		return nil
+	}
+	if yOffset < 0 {
+		yOffset = 0
+	}
+	if yOffset >= len(d.Lines) {
+		return nil
+	}
+	end := yOffset + height
+	if end > len(d.Lines) {
+		end = len(d.Lines)
+	}
+	out := make([]string, 0, end-yOffset)
+	for i := yOffset; i < end; i++ {
+		out = append(out, d.Lines[i].RenderedStr)
+	}
+	return out
+}
+
 // ExtractText extracts visible text matching selected cell bounds across lines
 // [startY : endY] with pure geometry. It strips ANSI escape codes but does not
 // drop chrome/log lines. What is visually selected is copied.

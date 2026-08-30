@@ -66,7 +66,7 @@ func (m *model) cycleExecVisibility() bool {
 	}
 	m.refreshViewportContent()
 	if m.Ready && !m.userIsScrollingUp {
-		m.Viewport.GotoBottom()
+		m.followTail()
 	}
 	return true
 }
@@ -89,7 +89,7 @@ func (m *model) toggleThoughtBlock() bool {
 		m.activityTree.ToggleExpanded()
 		m.refreshViewportContent()
 		if m.Ready && !m.userIsScrollingUp {
-			m.Viewport.GotoBottom()
+			m.followTail()
 		}
 		return true
 	}
@@ -114,7 +114,7 @@ func (m *model) toggleThoughtBlock() bool {
 	// preserve the user's scroll position: new chunks must never yank the
 	// viewport to the bottom (the Ctrl+O flicker).
 	if m.Ready && !m.userIsScrollingUp && !m.traceExpanded {
-		m.Viewport.GotoBottom()
+		m.followTail()
 	}
 	return true
 }
@@ -149,7 +149,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if newID >= 0 {
 				m.refreshViewportContent()
 				if m.Ready && !m.userIsScrollingUp {
-					m.Viewport.GotoBottom()
+					m.followTail()
 				}
 			}
 		}
@@ -241,7 +241,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.thinkingBuffer.ResetScroll()
 			m.refreshViewportContent()
 			if m.Ready && !m.userIsScrollingUp {
-				m.Viewport.GotoBottom()
+				m.followTail()
 			}
 			return m, nil
 		}
@@ -286,7 +286,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !hasAskHandoff || handoffContent == "" {
 			m.push(roleError, "No active Context Ledger from /ask. Run $prompt <query> in any mode first to generate a Forensic Context Ledger.")
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.followTail()
 			return m, nil
 		}
 
@@ -329,27 +329,48 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// ── StateProcessing: block input but allow viewport navigation ──────
 	if m.state == StateProcessing {
 		if m.Ready {
+			scrollStep := func() int {
+				step := 1
+				return step
+			}
+			pageStep := func() int {
+				step := m.Viewport.Height / 2
+				if step < 1 {
+					step = 1
+				}
+				return step
+			}
 			switch {
 			case msg.Type == tea.KeyUp || msg.String() == "k" || msg.Type == tea.KeyCtrlU:
-				m.userIsScrollingUp = true
-				var vpCmd tea.Cmd
-				m.Viewport, vpCmd = m.Viewport.Update(msg)
-				return m, vpCmd
+				if msg.Type == tea.KeyCtrlU {
+					m.scrollBy(-pageStep())
+				} else {
+					m.scrollBy(-scrollStep())
+				}
+				return m, nil
 			case msg.Type == tea.KeyDown || msg.String() == "j" || msg.Type == tea.KeyCtrlD:
-				var vpCmd tea.Cmd
-				m.Viewport, vpCmd = m.Viewport.Update(msg)
-				return m, vpCmd
+				if msg.Type == tea.KeyCtrlD {
+					m.scrollBy(pageStep())
+				} else {
+					m.scrollBy(scrollStep())
+				}
+				return m, nil
 			case msg.Type == tea.KeyPgUp || msg.Type == tea.KeyHome:
-				m.Viewport, _ = m.Viewport.Update(msg)
-				m.userIsScrollingUp = true
+				m.scrollBy(-m.Viewport.Height / 2)
+				if m.Viewport.Height/2 == 0 {
+					m.scrollBy(-1)
+				}
 				return m, nil
 			case msg.Type == tea.KeyPgDown || msg.Type == tea.KeyEnd:
-				m.Viewport, _ = m.Viewport.Update(msg)
+				m.scrollBy(m.Viewport.Height / 2)
+				if m.Viewport.Height/2 == 0 {
+					m.scrollBy(1)
+				}
 				return m, nil
 			case msg.Type == tea.KeySpace:
-				m.userIsScrollingUp = false
+				m.setScrollLocked(false)
 				m.traceWindowAnchored = false
-				m.Viewport.GotoBottom()
+				m.followTail()
 				return m, nil
 			}
 		}
@@ -366,18 +387,29 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.Ready {
 			switch {
 			case msg.String() == "k" || msg.Type == tea.KeyCtrlU:
-				m.userIsScrollingUp = true
-				var vpCmd tea.Cmd
-				m.Viewport, vpCmd = m.Viewport.Update(msg)
-				return m, vpCmd
+				step := 1
+				if msg.Type == tea.KeyCtrlU {
+					step = m.Viewport.Height / 2
+					if step < 1 {
+						step = 1
+					}
+				}
+				m.scrollBy(-step)
+				return m, nil
 			case msg.String() == "j" || msg.Type == tea.KeyCtrlD:
-				var vpCmd tea.Cmd
-				m.Viewport, vpCmd = m.Viewport.Update(msg)
-				return m, vpCmd
+				step := 1
+				if msg.Type == tea.KeyCtrlD {
+					step = m.Viewport.Height / 2
+					if step < 1 {
+						step = 1
+					}
+				}
+				m.scrollBy(step)
+				return m, nil
 			case msg.Type == tea.KeySpace:
-				m.userIsScrollingUp = false
+				m.setScrollLocked(false)
 				m.traceWindowAnchored = false
-				m.Viewport.GotoBottom()
+				m.followTail()
 				return m, nil
 			}
 		}
@@ -470,25 +502,25 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Recovery selected — "+string(intent)+"..."))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 				return m, m.resumeAutonomousProposal(string(intent))
 			case b.Action == autonomy.HumanBoundaryProposal && msg.Type == tea.KeyEscape:
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Cancelled — autonomous run aborted."))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 				return m, m.resumeAutonomousProposal("cancel")
 			case b.Action == autonomy.HumanBoundaryApproval &&
 				(msg.String() == "alt+a" || msg.Type == tea.KeyEnter):
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Approved — runtime applying patch..."))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 				return m, m.resumeAutonomousApprove()
 			case b.Action == autonomy.HumanBoundaryDecomposition && msg.Type == tea.KeyEnter:
 				// Authorize the WHOLE staged DAG: every sub-task executes as
 				// one atomic transaction under the plan's own preflight scopes.
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Plan authorized — running the staged DAG..."))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 				return m, m.resumeAutonomousProposalApprove()
 			case b.Action == autonomy.HumanBoundaryClarify && msg.Type == tea.KeyUp:
 				m.navigateAutonomousBoundary(-1)
@@ -499,30 +531,30 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case b.Action == autonomy.HumanBoundaryClarify && msg.Type == tea.KeyEnter:
 				m.push(roleSystem, infoStyle.Render("  target selected — resuming the run..."))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 				return m, m.resumeAutonomousClarify()
 			case b.Action == autonomy.HumanBoundaryApproval &&
 				(msg.String() == "alt+r" || msg.Type == tea.KeyEscape):
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Rejected — runtime finalizing. No files were modified."))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 				return m, m.resumeAutonomousReject("rejected by operator")
 			case b.Action == autonomy.HumanBoundaryInform &&
 				(msg.String() == "alt+r" || msg.Type == tea.KeyEscape):
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Dismissed — autonomous run aborted."))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 				return m, m.abortAutonomousRun("dismissed by operator")
 			case b.Action == autonomy.HumanBoundaryClarify && msg.Type == tea.KeyEscape:
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Cancelled — autonomous run aborted."))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 				return m, m.abortAutonomousRun("cancelled by operator")
 			case b.Action == autonomy.HumanBoundaryDecomposition && msg.Type == tea.KeyEscape:
 				// Cancel the whole staged plan: nothing executed, nothing mutated.
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Cancelled — decomposition plan discarded. No files were modified."))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 				return m, m.resumeAutonomousProposalReject("cancelled by operator")
 			}
 			return m, nil
@@ -539,7 +571,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.recalcViewportHeight()
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.followTail()
 			return m, nil
 		}
 		if msg.Type == tea.KeyRight {
@@ -548,7 +580,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.recalcViewportHeight()
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.followTail()
 			return m, nil
 		}
 
@@ -590,7 +622,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.ti.Focus()
 				m.recalcViewportHeight()
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 
 				// ── EXECUTOR-OWNED APPROVAL (authority migration) ──
 				// When the proposal came from the RuntimeExecutor, the apply,
@@ -618,7 +650,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if patch == nil {
 					m.push(roleSystem, infoStyle.Render("No held patch to approve — the executor owns apply."))
 					m.refreshViewportContent()
-					m.Viewport.GotoBottom()
+					m.followTail()
 					return m, nil
 				}
 				m.appliedHotfixFile = patch.File
@@ -651,7 +683,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					_ = m.sess.Save()
 				}
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 				if executorPatchID != "" {
 					return m, m.runExecutorRejectCmd(executorPatchID, "hotfix rejected by developer")
 				}
@@ -671,7 +703,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.recalcViewportHeight()
 				m.ti.Focus()
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Approved — executing shell command..."))
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
@@ -688,7 +720,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.recalcViewportHeight()
 				m.ti.Focus()
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 				m.push(roleSystem, infoStyle.Render(
 					"  "+Icon.Success+" Approved (always) — executing shell command..."))
 				return m, tea.Batch(
@@ -721,7 +753,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					"[SECURITY] Aborting unauthorized shell execution: %s",
 					task.Target))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 				return m, m.runtimeRejectCmd(task.Target, "shell execution rejected")
 			}
 			return m, nil
@@ -769,7 +801,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.push(roleSystem, infoStyle.Render("No held patch to approve — the executor owns apply."))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.followTail()
 			return m, nil
 		case msg.String() == "alt+l":
 			if m.executorPendingPatchID != "" {
@@ -780,7 +812,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.push(roleSystem, infoStyle.Render("No held patch to approve — the executor owns apply."))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.followTail()
 			return m, nil
 		case msg.String() == "alt+p":
 			if len(m.pendingProposals) > 0 {
@@ -788,7 +820,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.proposalDiffOffset = 0
 				m.recalcViewportHeight()
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.followTail()
 			}
 			return m, nil
 		case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
@@ -970,7 +1002,7 @@ func (m *model) syncInputFromTI() {
 // autocomplete Enter path, which completes a unique whole-line suggestion
 // before handing off here.
 func (m *model) submitEnter() (tea.Model, tea.Cmd) {
-	m.userIsScrollingUp = false
+	m.setScrollLocked(false)
 	// A new user interaction reopens the activity surface sealed by /clear:
 	// everything the user submits from here on is a fresh interaction whose
 	// events belong in the viewport again (see lifecycle.go).
@@ -987,8 +1019,7 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		m.ti.Reset()
 		m.syncInputFromTI()
 		m.push(roleUser, "$ "+cmd)
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.lockTailToNewPrompt()
 		// Live shell execution: start the running exec entry in the
 		// activity tree, activate the loading dock, and dispatch the
 		// shimmer + smooth ticks so the snowflake spinner animates for the
@@ -1063,14 +1094,26 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		// Both loops self-terminate when no background producer owns the
 		// flags, so idle submits leak nothing.
 		cmd = tea.Batch(cmd, m.shimmerTickCmd(), m.smoothStreamTickCmd())
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.lockTailToNewPrompt()
 		return m, cmd
 	}
 	m.ti.SetValue("")
 	m.ti.Reset()
 	m.syncInputFromTI()
-	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
+	m.lockTailToNewPrompt()
 	return m, nil
+}
+
+// lockTailToNewPrompt is the strict auto-scroll tail-lock performed on every
+// prompt submission. It explicitly unlocks any user-scroll state, pins the
+// app-owned scroll offset to the exact bottom tail (docScrollOffset =
+// max(0, total - Viewport.Height) via the manual-slicing contract), and
+// triggers a SYNCHRONOUS viewport flush so the new prompt appears at the
+// bottom of the document instantly — never waiting for an external UI event
+// or a throttled repaint tick.
+func (m *model) lockTailToNewPrompt() {
+	m.userScrolledAway = false
+	m.userIsScrollingUp = false
+	m.followTail()
+	m.refreshViewportContentImmediate()
 }

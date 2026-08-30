@@ -94,7 +94,7 @@ func TestMouseMapping_ScrolledViewport(t *testing.T) {
 	}
 	m := newGeometryModel(80, 24, records)
 	// scroll down 5
-	m.Viewport.YOffset = 5
+	m.docScrollOffset = 5
 	geo := m.viewportGeometry()
 	prefix := m.viewportContentPrefixHeight()
 	// After scroll, viewport top shows recordRow = YOffset - prefix? Actually content row includes prefix
@@ -113,7 +113,7 @@ func TestMouseMapping_ScrolledViewport(t *testing.T) {
 	y2 := geo.Top + geo.Height - 1
 	pos2 := m.mousePosToLogical(tea.MouseMsg{X: 4, Y: y2})
 	// bottom content row = YOffset + Height -1
-	bottomContent := m.Viewport.YOffset + geo.Height - 1
+	bottomContent := m.docScrollOffset + geo.Height - 1
 	bottomRecord := bottomContent - prefix
 	if bottomRecord >= len(records) {
 		bottomRecord = len(records) - 1
@@ -301,25 +301,25 @@ func TestAutoScroll_SingleLoop(t *testing.T) {
 
 func TestAutoScroll_Velocity(t *testing.T) {
 	m := newGeometryModel(80, 24, makeRecords(50, "line"))
-	m.Viewport.YOffset = 10
+	m.docScrollOffset = 10
 	m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: GlobalPos{Y: 10, X: 0}}
 	geo := m.viewportGeometry()
 	// Deep inside top edge (relY 0) should have velocity 2 (larger delta)
 	m.mouseSel.lastY = geo.Top
 	msgDeep := selectionScrollTickMsg{Y: geo.Top, X: 2}
-	before := m.Viewport.YOffset
+	before := m.docScrollOffset
 	_ = m.handleSelectionAutoScroll(msgDeep)
-	afterDeep := m.Viewport.YOffset
+	afterDeep := m.docScrollOffset
 	deepDelta := before - afterDeep
 	// Reset
-	m.Viewport.YOffset = 10
+	m.docScrollOffset = 10
 	m.mouseSel.TickActive = false
 	// Shallow edge (relY = 2, dist=1) should have velocity 1
 	msgShallow := selectionScrollTickMsg{Y: geo.Top + 2, X: 2}
 	m.mouseSel.lastY = geo.Top + 2
-	before = m.Viewport.YOffset
+	before = m.docScrollOffset
 	_ = m.handleSelectionAutoScroll(msgShallow)
-	afterShallow := m.Viewport.YOffset
+	afterShallow := m.docScrollOffset
 	shallowDelta := before - afterShallow
 	if deepDelta <= shallowDelta {
 		t.Fatalf("deep edge velocity should be larger: deep %d shallow %d", deepDelta, shallowDelta)

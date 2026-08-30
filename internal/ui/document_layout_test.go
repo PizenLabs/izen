@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -322,38 +323,29 @@ func TestDocumentLayout_AutoScrollBottomBoundary(t *testing.T) {
 	geo := m.viewportGeometry()
 	// Sync Viewport.Height to geometry for strict max bound (as model does)
 	m.Viewport.Height = geo.Height
-	// Strict maxYOffset using Viewport.Height as per spec (dynamic, recomputed each iteration)
-	m.Viewport.YOffset = 0
+	// Strict max offset using the app-owned scroll offset (manual-slicing contract)
+	m.docScrollOffset = 0
 	// Recompute geo after height sync
 	geo = m.viewportGeometry()
 	m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: GlobalPos{Y: 0, X: 0}, Cursor: GlobalPos{Y: 0, X: 0}, lastY: geo.Top + geo.Height - 1}
 	for i := 0; i < 5000; i++ {
-		curMaxLoop := m.docLayout.Len() - m.Viewport.Height
-		if curMaxLoop < 0 {
-			curMaxLoop = 0
-		}
-		if m.Viewport.YOffset >= curMaxLoop {
+		curMaxLoop := m.maxAppScroll()
+		if m.docScrollOffset >= curMaxLoop {
 			break
 		}
 		_ = m.handleSelectionAutoScroll(selectionScrollTickMsg{Y: geo.Top + geo.Height - 1, X: geo.Left + 2})
-		curMax2 := m.docLayout.Len() - m.Viewport.Height
-		if curMax2 < 0 {
-			curMax2 = 0
-		}
-		if m.Viewport.YOffset > curMax2 {
-			t.Fatalf("YOffset over-incremented %d > max %d at iter %d len=%d height=%d", m.Viewport.YOffset, curMax2, i, m.docLayout.Len(), m.Viewport.Height)
+		curMax2 := m.maxAppScroll()
+		if m.docScrollOffset > curMax2 {
+			t.Fatalf("YOffset over-incremented %d > max %d at iter %d len=%d height=%d", m.docScrollOffset, curMax2, i, m.docLayout.Len(), m.Viewport.Height)
 		}
 		geo = m.viewportGeometry()
 	}
-	curMax := m.docLayout.Len() - m.Viewport.Height
-	if curMax < 0 {
-		curMax = 0
+	curMax := m.maxAppScroll()
+	if m.docScrollOffset != curMax {
+		t.Fatalf("auto-scroll did not reach bottom: got %d want %d len=%d height=%d", m.docScrollOffset, curMax, m.docLayout.Len(), m.Viewport.Height)
 	}
-	if m.Viewport.YOffset != curMax {
-		t.Fatalf("auto-scroll did not reach bottom: got %d want %d len=%d height=%d", m.Viewport.YOffset, curMax, m.docLayout.Len(), m.Viewport.Height)
-	}
-	// Cursor should be at bottom line: min(YOffset+Height-1, len-1)
-	expectedCursorY := m.Viewport.YOffset + m.Viewport.Height - 1
+	// Cursor should be at bottom line: min(docScrollOffset+Height-1, len-1)
+	expectedCursorY := m.docScrollOffset + m.Viewport.Height - 1
 	if expectedCursorY >= dl.Len() {
 		expectedCursorY = dl.Len() - 1
 	}
@@ -376,16 +368,11 @@ func TestDocumentLayout_AutoScrollBottomBoundary(t *testing.T) {
 		}
 	}
 	// Ensure no stutter: YOffset should be exactly max, not re-clamped
-	curMax2 := m.docLayout.Len() - m.Viewport.Height
-	if curMax2 < 0 {
-		curMax2 = 0
-	}
-	if m.Viewport.YOffset < 0 || m.Viewport.YOffset > curMax2 {
+	curMax2 := m.maxAppScroll()
+	if m.docScrollOffset < 0 || m.docScrollOffset > curMax2 {
 		t.Fatalf("YOffset out of bounds after auto-scroll")
 	}
 }
-
-
 
 func TestDocumentLayout_PreflightCollapse(t *testing.T) {
 	width := 40
@@ -529,48 +516,41 @@ func TestDocumentLayout_StreamingTailLock(t *testing.T) {
 	dl := BuildDocumentLayout(records, width)
 	m.docLayout = &dl
 	m.refreshViewportContent()
-	// Tail-locked: YOffset at max
-	maxYOffset := dl.Len() - height
-	if maxYOffset < 0 {
-		maxYOffset = 0
-	}
-	m.Viewport.YOffset = maxYOffset
-	// Capture YOffset before streaming append
-	prevYOffset := m.Viewport.YOffset
-	prevMax := maxYOffset
+	// Tail-locked: app-owned scroll offset at max (manual-slicing contract).
+	m.docScrollOffset = m.maxAppScroll()
+	// Capture offset before streaming append
+	prevOffset := m.docScrollOffset
+	prevMax := prevOffset
 	// Simulate streaming: append new record (new lines)
 	newRec := record{role: roleAI, text: "streaming appended line " + strings.Repeat("extra ", 10)}
 	m.records = append(m.records, newRec)
 	// Trigger incremental update via refresh (which will rebuild docLayout)
 	m.refreshViewportContent()
-	newMax := m.docLayout.Len() - height
-	if newMax < 0 {
-		newMax = 0
-	}
+	newMax := m.maxAppScroll()
 	if newMax <= prevMax {
 		t.Fatalf("expected newMax %d > prevMax %d after appending", newMax, prevMax)
 	}
-	if m.Viewport.YOffset != newMax {
-		t.Fatalf("tail-lock failed: YOffset %d != newMax %d (prev %d) without jitter", m.Viewport.YOffset, newMax, prevYOffset)
+	if m.docScrollOffset != newMax {
+		t.Fatalf("tail-lock failed: offset %d != newMax %d (prev %d) without jitter", m.docScrollOffset, newMax, prevOffset)
 	}
-	// Ensure no jitter: calling again without new content should keep YOffset stable
-	stableYOffset := m.Viewport.YOffset
+	// Ensure no jitter: calling again without new content should keep offset stable
+	stableOffset := m.docScrollOffset
 	m.refreshViewportContent()
-	if m.Viewport.YOffset != stableYOffset {
-		t.Fatalf("jitter detected: YOffset changed from %d to %d without new content", stableYOffset, m.Viewport.YOffset)
+	if m.docScrollOffset != stableOffset {
+		t.Fatalf("jitter detected: offset changed from %d to %d without new content", stableOffset, m.docScrollOffset)
 	}
 	// If user is dragging selection, tail-lock must NOT auto-scroll
 	m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: GlobalPos{Y: 0, X: 0}, Cursor: GlobalPos{Y: 0, X: 0}}
-	m.Viewport.YOffset = newMax - 2
-	if m.Viewport.YOffset < 0 {
-		m.Viewport.YOffset = 0
+	m.docScrollOffset = newMax - 2
+	if m.docScrollOffset < 0 {
+		m.docScrollOffset = 0
 	}
-	saved := m.Viewport.YOffset
+	saved := m.docScrollOffset
 	// Append another line while selection active
 	m.records = append(m.records, record{role: roleAI, text: "another streaming line " + strings.Repeat("more ", 10)})
 	m.refreshViewportContent()
-	if m.Viewport.YOffset != saved {
-		t.Fatalf("tail-lock should not auto-scroll while mouseSel.Active=true: got %d want %d", m.Viewport.YOffset, saved)
+	if m.docScrollOffset != saved {
+		t.Fatalf("tail-lock should not auto-scroll while mouseSel.Active=true: got %d want %d", m.docScrollOffset, saved)
 	}
 }
 
@@ -596,37 +576,28 @@ func TestDocumentLayout_AutoScrollToAbsoluteBottom(t *testing.T) {
 	geo := m.viewportGeometry()
 	m.Viewport.Height = geo.Height
 	geo = m.viewportGeometry()
-	m.Viewport.YOffset = 0
+	m.docScrollOffset = 0
 	m.mouseSel = mouseSelection{Active: true, Dragging: true, Anchor: GlobalPos{Y: 0, X: 0}, Cursor: GlobalPos{Y: 0, X: 0}, lastY: geo.Top + geo.Height - 1}
 	// Simulate dragging past bottom boundary: continuous ticks
 	for i := 0; i < 5000; i++ {
-		curMax := m.docLayout.Len() - m.Viewport.Height
-		if curMax < 0 {
-			curMax = 0
-		}
-		if m.Viewport.YOffset >= curMax {
+		curMax := m.maxAppScroll()
+		if m.docScrollOffset >= curMax {
 			break
 		}
 		// Tick with Y outside bottom (geo.Top+Height)
 		_ = m.handleSelectionAutoScroll(selectionScrollTickMsg{Y: geo.Top + geo.Height, X: geo.Left + 2})
 		// Alternative also test with exactly at bottom edge
-		curMax2 := m.docLayout.Len() - m.Viewport.Height
-		if curMax2 < 0 {
-			curMax2 = 0
-		}
-		if m.Viewport.YOffset > curMax2 {
-			t.Fatalf("YOffset over-incremented %d > max %d at iter %d", m.Viewport.YOffset, curMax2, i)
+		curMax2 := m.maxAppScroll()
+		if m.docScrollOffset > curMax2 {
+			t.Fatalf("YOffset over-incremented %d > max %d at iter %d", m.docScrollOffset, curMax2, i)
 		}
 		geo = m.viewportGeometry()
 	}
-	curMax := m.docLayout.Len() - m.Viewport.Height
-	if curMax < 0 {
-		curMax = 0
+	curMax := m.maxAppScroll()
+	if m.docScrollOffset != curMax {
+		t.Fatalf("auto-scroll did not reach absolute bottom: got %d want %d len=%d height=%d", m.docScrollOffset, curMax, m.docLayout.Len(), m.Viewport.Height)
 	}
-	if m.Viewport.YOffset != curMax {
-		t.Fatalf("auto-scroll did not reach absolute bottom: got %d want %d len=%d height=%d", m.Viewport.YOffset, curMax, m.docLayout.Len(), m.Viewport.Height)
-	}
-	expectedCursorY := m.Viewport.YOffset + m.Viewport.Height - 1
+	expectedCursorY := m.docScrollOffset + m.Viewport.Height - 1
 	if expectedCursorY >= dl.Len() {
 		expectedCursorY = dl.Len() - 1
 	}
@@ -645,7 +616,369 @@ func TestDocumentLayout_AutoScrollToAbsoluteBottom(t *testing.T) {
 		t.Fatalf("policy line not found in layout")
 	}
 	// Ensure no stutter loops: YOffset stays exactly at max and not re-clamped
-	if m.Viewport.YOffset < 0 || m.Viewport.YOffset > curMax {
+	if m.docScrollOffset < 0 || m.docScrollOffset > curMax {
 		t.Fatalf("YOffset out of bounds after auto-scroll")
+	}
+}
+
+// TestDocumentLayout_AssistantNewlineSeparation pins the block-boundary
+// newline enforcement: appending the first token of a new roleAI record after
+// preflight/activity logs MUST start on a fresh line at column 0 — it can
+// never concatenate onto the preflight line.
+func TestDocumentLayout_AssistantNewlineSeparation(t *testing.T) {
+	width := 60
+	m := newTestModel()
+	m.width = width
+	m.records = []record{
+		{role: roleActivity, text: "[preflight] snapshot ready target=\"\" sha= tokens=0 Go, commonly referred to as Golang is efficient."},
+	}
+	dl := BuildDocumentLayout(m.records, width)
+	m.docLayout = &dl
+	m.streaming = true
+	m.currentStreamContent = "Here is the assistant answer."
+
+	// Simulate the first token of a new roleAI record being appended to the
+	// layout (syncStreamingSegment enforces the separator).
+	m.syncStreamingSegment()
+
+	preflightIdx := -1
+	assistantIdx := -1
+	for i, l := range m.docLayout.Lines {
+		if strings.Contains(l.RawText, "[preflight]") && preflightIdx < 0 {
+			preflightIdx = i
+		}
+		if strings.Contains(l.RawText, "Here is the assistant answer") && assistantIdx < 0 {
+			assistantIdx = i
+		}
+	}
+	if preflightIdx < 0 {
+		t.Fatalf("preflight line not found: %v", m.docLayout.Lines)
+	}
+	if assistantIdx < 0 {
+		t.Fatalf("assistant content not found: %v", m.docLayout.Lines)
+	}
+	// Token #1 must be on a strictly separate physical line.
+	if assistantIdx == preflightIdx {
+		t.Fatalf("assistant token shares a physical line with the preflight log: %q", m.docLayout.Lines[preflightIdx].RawText)
+	}
+	if strings.Contains(m.docLayout.Lines[preflightIdx].RawText, "Here is the assistant answer") {
+		t.Fatalf("preflight line must not contain the assistant token: %q", m.docLayout.Lines[preflightIdx].RawText)
+	}
+	// Column 0: the first assistant line begins with the first token.
+	if got := m.docLayout.Lines[assistantIdx].RawText; !strings.HasPrefix(got, "Here is") {
+		t.Fatalf("first assistant token does not start at column 0 of a fresh line: %q", got)
+	}
+}
+
+// TestDocumentLayout_CompletedMessagePreservesFormatting pins the unified
+// render engine: completing a streamed message must retain ANSI-styled lines
+// (headers, inline code, code blocks) and must NEVER revert to raw markdown
+// syntax strings (fences/backticks).
+func TestDocumentLayout_CompletedMessagePreservesFormatting(t *testing.T) {
+	width := 60
+	text := "## Title\n\n```go\nfunc main() {}\n```\n\nInline `code` here."
+
+	// Completed-history path: a committed roleAI record rendered via
+	// BuildDocumentLayout (the same unified engine the streaming tail uses).
+	rec := record{role: roleAI, text: text}
+	dl := BuildDocumentLayout([]record{rec}, width)
+
+	styled := false
+	codeFound := false
+	for _, l := range dl.Lines {
+		if strings.Contains(l.RenderedStr, "\x1b[") {
+			styled = true
+		}
+		// Raw markdown must never leak into the completed rendering.
+		if strings.Contains(l.RenderedStr, "```") || strings.Contains(l.RawText, "```") {
+			t.Fatalf("raw code fence leaked after completion: %q", l.RenderedStr)
+		}
+		if strings.Contains(l.RenderedStr, "`code`") || strings.Contains(l.RawText, "`code`") {
+			t.Fatalf("raw inline backticks leaked after completion: %q", l.RenderedStr)
+		}
+		if strings.Contains(l.RawText, "func main()") {
+			codeFound = true
+		}
+	}
+	if !styled {
+		t.Fatal("completed message rendered with zero ANSI styling — raw fallback")
+	}
+	if !codeFound {
+		t.Fatal("code block content missing after completion")
+	}
+
+	// Streaming → completion continuity: the live streaming tail renders via
+	// the SAME unified engine, so committing the record produces byte-identical
+	// lines minus the active block cursor (never a raw re-dump).
+	m := newTestModel()
+	m.width = width
+	m.records = []record{}
+	empty := BuildDocumentLayout(nil, width)
+	m.docLayout = &empty
+	m.streaming = true
+	m.currentStreamContent = text
+	m.syncStreamingSegment()
+	streamed := m.docLayout.Slice(0, m.docLayout.Len())
+	for _, l := range streamed {
+		if strings.Contains(l, "```") {
+			t.Fatalf("streaming tail leaked a raw code fence: %q", l)
+		}
+	}
+
+	// Complete the stream: strip the cursor, commit the record, rebuild.
+	m.streaming = false
+	m.push(roleAI, text)
+	m.refreshViewportContent()
+	final := m.docLayout.Slice(0, m.docLayout.Len())
+	for _, l := range final {
+		if strings.Contains(l, "```") {
+			t.Fatalf("completion reverted to raw markdown fences: %q", l)
+		}
+		if strings.Contains(l, streamCursorStyle.Render("▋")) {
+			t.Fatalf("streaming cursor leaked into the completed message: %q", l)
+		}
+	}
+	// The completed message keeps its structured content.
+	var finalCode bool
+	for _, l := range final {
+		if strings.Contains(ansi.Strip(l), "func main()") {
+			finalCode = true
+		}
+	}
+	if !finalCode {
+		t.Fatal("completed message lost its code block content")
+	}
+}
+
+// TestDocumentLayout_ViewportManualSlicingZeroOffset pins the Manual Slicing
+// Contract: the bubbles viewport always receives exactly the pre-sliced
+// visible window and therefore operates with Viewport.YOffset == 0 — it can
+// never double-scroll or middle-jump. Tail-lock pins the app-owned offset to
+// the tail, and followTail re-locks after the user scrolls away.
+func TestDocumentLayout_ViewportManualSlicingZeroOffset(t *testing.T) {
+	width, height := 40, 5
+	m := newTestModel()
+	m.width = width
+	m.height = 24
+	m.Ready = true
+	m.Viewport.Width = width
+	m.Viewport.Height = height
+	m.records = make([]record, 12)
+	for i := range m.records {
+		m.records[i] = record{role: roleAI, text: fmt.Sprintf("line-%d %s", i, strings.Repeat("word ", 4))}
+	}
+	m.refreshViewportContent()
+
+	// Pre-sliced content ⇒ Viewport.YOffset MUST be 0.
+	if m.Viewport.YOffset != 0 {
+		t.Fatalf("Viewport.YOffset = %d, want 0 (pre-sliced content contract)", m.Viewport.YOffset)
+	}
+	// Tail-lock: not scrolled away => offset pinned to the tail.
+	if m.docScrollOffset != m.maxAppScroll() {
+		t.Fatalf("tail-lock failed: docScrollOffset %d != tail %d", m.docScrollOffset, m.maxAppScroll())
+	}
+	view := ansi.Strip(m.Viewport.View())
+	if !strings.Contains(view, "line-11") {
+		t.Fatalf("tail content not visible in viewport:\n%s", view)
+	}
+
+	// User scrolls away: the offset moves off the tail, YOffset stays 0.
+	m.scrollBy(-2)
+	if m.Viewport.YOffset != 0 {
+		t.Fatalf("Viewport.YOffset after scroll = %d, want 0", m.Viewport.YOffset)
+	}
+	if m.docScrollOffset >= m.maxAppScroll() {
+		t.Fatalf("scrolled-away offset %d should be < tail %d", m.docScrollOffset, m.maxAppScroll())
+	}
+
+	// followTail re-locks to the tail, still with YOffset pinned at 0.
+	m.followTail()
+	if m.docScrollOffset != m.maxAppScroll() {
+		t.Fatalf("followTail did not re-lock: %d != %d", m.docScrollOffset, m.maxAppScroll())
+	}
+	if m.Viewport.YOffset != 0 {
+		t.Fatalf("Viewport.YOffset after followTail = %d, want 0", m.Viewport.YOffset)
+	}
+}
+
+// TestDocumentLayout_StreamDoneTriggersImmediateFlush pins the MANDATORY
+// synchronous viewport flush on LLM stream completion. After token streaming
+// ends with StreamDoneMsg, the completed response must be rendered into
+// m.Viewport IMMEDIATELY — never deferred to an async repaintTickMsg. The
+// stream cursor (▋) is stripped, the single-flight repaint gate is cancelled,
+// and no pending repaint tick is left in flight.
+func TestDocumentLayout_StreamDoneTriggersImmediateFlush(t *testing.T) {
+	m := newTestModel()
+	m.width = 60
+	m.height = 24
+	m.state = StateChat
+	m.awaitingConfirmation = false
+	m.pendingProposals = nil
+	m.Viewport.Width = 60
+	m.Viewport.Height = 8
+	m.userScrolledAway = false
+
+	// Seed the conversation with a user prompt and establish the live streaming
+	// tail exactly as a provider stream does (first content token appended to
+	// the incremental renderer, streamingDocStart attached to docLayout).
+	m.records = []record{{role: roleUser, text: "explain this"}}
+	dl := BuildDocumentLayout(m.records, m.width)
+	m.docLayout = &dl
+	m.streaming = true
+	m.streamTickActive = true
+
+	finalText := "Here is the completed answer that must appear instantly."
+	m.emitVisibleContent(finalText)
+
+	// The live streaming tail carries the active Accent-Blue block cursor.
+	tail := m.docLayout.Lines[m.streamingDocStart:]
+	lastRendered := tail[len(tail)-1].RenderedStr
+	if !strings.Contains(lastRendered, "▋") {
+		t.Fatalf("expected a streaming cursor on the live tail, got: %q", lastRendered)
+	}
+
+	// Simulate a single-flight repaint armed mid-stream: the gate MUST be
+	// cancelled by the synchronous flush on completion.
+	m.refreshScheduled = true
+
+	nm, cmd := m.Update(streamDoneMsg{
+		content:     finalText,
+		tokenInput:  10,
+		tokenOutput: 20,
+	})
+	m2 := nm.(*model)
+
+	// 1. The repaint gate is cancelled: NO repaintTickMsg remains in flight.
+	if m2.refreshScheduled {
+		t.Fatal("stream completion left the 30FPS repaint gate armed")
+	}
+	// 2. The completed frame is already in the viewport — nothing waits for an
+	//    external UI event or a queued repaint tick to make it visible.
+	view := ansi.Strip(m2.Viewport.View())
+	if !strings.Contains(view, "completed answer") {
+		t.Fatalf("completed response not rendered synchronously after StreamDoneMsg:\n%s", view)
+	}
+	// 3. The stream cursor was stripped from the final frame.
+	if strings.Contains(view, "▋") {
+		t.Fatalf("stream cursor leaked into the completed viewport:\n%s", view)
+	}
+	// 4. The returned cmd is the next pending command (thought completion) —
+	//    NOT a repaint tick. The flush is fully synchronous by construction.
+	if cmd == nil {
+		t.Fatal("expected the thought-completion cmd after StreamDoneMsg")
+	}
+}
+
+// TestDocumentLayout_PromptSubmitLocksTail pins the strict auto-scroll tail
+// lock on prompt submission: a user who scrolled away from the tail has their
+// userScrolledAway state reset and the app-owned docScrollOffset anchored to
+// the exact bottom tail (max(0, len - Viewport.Height)) so the new prompt is
+// visible at the bottom of the document instantly.
+func TestDocumentLayout_PromptSubmitLocksTail(t *testing.T) {
+	width, height := 40, 5
+	m := newTestModel()
+	m.width = width
+	m.height = 24
+	m.Ready = true
+	m.Viewport.Width = width
+	m.Viewport.Height = height
+	m.records = make([]record, 12)
+	for i := range m.records {
+		m.records[i] = record{role: roleAI, text: fmt.Sprintf("line-%d %s", i, strings.Repeat("word ", 4))}
+	}
+	m.refreshViewportContent()
+
+	// Precondition: the user scrolled away from the tail.
+	m.scrollBy(-2)
+	if !m.userScrolledAway {
+		t.Fatal("precondition failed: userScrolledAway should be true after scrollBy")
+	}
+	if !m.userIsScrollingUp {
+		t.Fatal("precondition failed: userIsScrollingUp should mirror userScrolledAway")
+	}
+	if m.docScrollOffset >= m.maxAppScroll() {
+		t.Fatalf("precondition failed: offset %d should be off the tail %d", m.docScrollOffset, m.maxAppScroll())
+	}
+
+	// Simulate prompt submission (the canonical Enter path on an empty input
+	// exercises lockTailToNewPrompt without dispatching any work).
+	nm, cmd := m.submitEnter()
+	m2 := nm.(*model)
+	if cmd != nil {
+		t.Fatalf("empty-input submit should return no cmd, got non-nil")
+	}
+
+	// 1. userScrolledAway is reset to false.
+	if m2.userScrolledAway {
+		t.Fatal("prompt submit did not reset userScrolledAway")
+	}
+	if m2.userIsScrollingUp {
+		t.Fatal("prompt submit did not clear userIsScrollingUp")
+	}
+	// 2. docScrollOffset is anchored to the exact bottom tail.
+	if m2.docScrollOffset != m2.maxAppScroll() {
+		t.Fatalf("prompt submit did not anchor docScrollOffset to the bottom tail: got %d want %d",
+			m2.docScrollOffset, m2.maxAppScroll())
+	}
+	// 3. The tail content is visible at the bottom of the viewport.
+	view := ansi.Strip(m2.Viewport.View())
+	if !strings.Contains(view, "line-11") {
+		t.Fatalf("tail content not visible after prompt submit:\n%s", view)
+	}
+	// 4. The synchronous flush cancelled the repaint gate.
+	if m2.refreshScheduled {
+		t.Fatal("prompt submit left the repaint gate armed")
+	}
+}
+
+// TestDocumentLayout_IncrementalStreamMatchesOneShot pins the zero-bottleneck
+// streaming engine: feeding a response token-by-token through the incremental
+// renderer (with mid-stream refresh cycles that trim and re-attach the tail)
+// must produce byte-identical physical rows to a single one-shot render of the
+// same content. It also asserts the no-change fast path never bumps the repaint
+// sequence (no redundant work on frames that carried no token).
+func TestDocumentLayout_IncrementalStreamMatchesOneShot(t *testing.T) {
+	width := 60
+	m := newTestModel()
+	m.width = width
+	m.height = 24
+	m.Viewport.Width = width
+	m.Viewport.Height = 8
+	m.records = []record{{role: roleUser, text: "hi"}}
+	dl := BuildDocumentLayout(m.records, width)
+	m.docLayout = &dl
+	m.streaming = true
+
+	// Token-by-token streaming (markdown headers, fenced code, bold text) with
+	// an unrelated refresh after every token so the tail is trimmed and
+	// re-attached exactly as live repaint frames do.
+	text := "## Title\n\n```go\nfunc main() {\n\tprintln(\"hello world this is a long line\")\n}\n```\n\nAnd then some **bold** trailing text that wraps around the viewport boundary."
+	for _, p := range strings.Split(text, " ") {
+		m.emitVisibleContent(p + " ")
+		m.refreshViewportContent()
+	}
+
+	// Strip the active block cursor from the live tail before comparing.
+	tail := m.docLayout.Lines[m.streamingDocStart:]
+	last := &tail[len(tail)-1]
+	cursor := streamCursorStyle.Render("▋")
+	last.RenderedStr = strings.TrimSuffix(last.RenderedStr, cursor)
+
+	got := m.docLayout.Lines[m.streamingDocStart:]
+	want := renderAIBlockLines(m.currentStreamContent, width)
+	if len(got) != len(want) {
+		t.Fatalf("incremental renderer produced %d lines, one-shot %d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i].RawText != want[i].RawText {
+			t.Fatalf("line %d differs: incremental=%q one-shot=%q", i, got[i].RawText, want[i].RawText)
+		}
+	}
+
+	// A no-change refresh (no new token) must not advance the repaint sequence.
+	seqBefore := m.repaintSeq
+	m.refreshViewportContent()
+	if m.repaintSeq != seqBefore {
+		t.Fatalf("no-change refresh advanced repaintSeq %d → %d — redundant re-parse", seqBefore, m.repaintSeq)
 	}
 }

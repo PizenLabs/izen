@@ -1865,6 +1865,28 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		flush := m.flushPendingRecords()
 		return m, flush
 
+	case repaintTickMsg:
+		// ── SINGLE-FLIGHT 30FPS REPAINT GATE ──────────────────────────
+		// Incoming tokens were appended to docLayout in memory instantly; this
+		// tick renders exactly one visible frame and resets the gate. It is
+		// NEVER chained recursively — a fresh repaint is only scheduled when
+		// new tokens actually arrive.
+		m.refreshScheduled = false
+		m.refreshViewportContent()
+		// ── NO-TOKEN-LEFT-BEHIND GUARANTEE ──────────────────────────
+		// If new streaming tokens were spliced into docLayout while this
+		// repaint was armed (repaintSeq advanced past the captured value), the
+		// frame just rendered is one emission stale. Re-arm exactly ONE final
+		// repaint so no token buffer is ever left unrendered in memory; the
+		// sequence stops advancing once the stream ends, so the gate cannot
+		// cascade indefinitely.
+		if m.repaintSeq != m.repaintScheduledAt {
+			if repaint := m.scheduleRepaint(); repaint != nil {
+				return m, repaint
+			}
+		}
+		return m, nil
+
 	case smoothStreamTickMsg:
 		// ── PHYSICALLY ADVANCE THE SPINNER FRAME ───────────────────────────
 		// This 20ms smooth-tick loop drives token-stream rendering, but it is
@@ -1888,6 +1910,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// re-renders, no Ctrl+C responsiveness, no slow-notice — the UI appears
 		// frozen. So the loop must keep self-scheduling whenever a background
 		// producer still owns the flags.
+		//
+		// frameAdvanced tracks whether any visual state changed this tick
+		// (new token OR spinner-frame advance); it drives the single-flight
+		// 30FPS repaint gate so an idle loop never schedules repaints.
+		frameAdvanced := false
 		backgroundActive := m.streaming || m.agentRunning || m.reviewRunning ||
 			m.pipelineRunning || m.planPending || m.shellRunning || m.autonomousActive
 		if backgroundActive {
@@ -1898,6 +1925,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if !m.shimmerActive && time.Since(m.lastSpinnerAdvance) >= 100*time.Millisecond {
 				m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
 				m.lastSpinnerAdvance = time.Now()
+				frameAdvanced = true
 			}
 		}
 
@@ -1935,19 +1963,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.streamBuffer = m.streamBuffer[emit:]
 		}
 		if emitContent != "" {
+			// Tokens are appended to docLayout in memory INSTANTLY (the
+			// streaming tail is spliced inside emitVisibleContent); the
+			// viewport repaint is throttled separately to 30FPS.
 			m.emitVisibleContent(emitContent)
+			frameAdvanced = true
 		}
 
-		// Refresh viewport with streaming content.
-		if m.Ready {
-			m.refreshViewportContent()
-			// Only auto-scroll to bottom if the user hasn't explicitly
-			// scrolled up — respects user-inspect position during streaming.
-			// The expanded output-trace viewport (Ctrl+O) also disables
-			// auto-scroll so the inspected lines never jump out from under
-			// the user while chunks stream in.
-			if m.streaming && !m.userIsScrollingUp && !m.traceExpanded {
-				m.gotoBottomIfAllowed()
+		// ── SINGLE-FLIGHT 30FPS REPAINT ───────────────────────────────
+		// Do NOT force a refresh here: refreshViewportContent is gated behind
+		// scheduleRepaint (one repaintTickMsg at a time, never chained). Only
+		// visual changes (a new token or a spinner-frame advance) request a
+		// repaint; an idle tick loop re-schedules itself but never repaints.
+		if m.Ready && frameAdvanced {
+			if repaint := m.scheduleRepaint(); repaint != nil {
+				m.streamTickActive = true
+				return m, tea.Batch(m.smoothStreamTickCmd(), repaint)
 			}
 		}
 
@@ -2063,12 +2094,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.ensureStreamBlocks().Append(KindThinking, string(msg))
 		// Full stream transparency: the reasoning chunk is also retained in the
 		// active ThinkingBuffer via the ThoughtBufferUpdatedMsg protocol so the
-		// Ctrl+O thought drawer renders it live.
-		m.refreshViewportContent()
-		if m.Ready && !m.userIsScrollingUp && !m.traceExpanded {
-			m.gotoBottomIfAllowed()
+		// Ctrl+O thought drawer renders it live. The repaint is throttled to
+		// the single-flight 30FPS gate — never a per-token refresh.
+		var cmds []tea.Cmd
+		cmds = append(cmds, m.readStream(), m.thoughtUpdateCmd(string(msg), false))
+		if repaint := m.scheduleRepaint(); repaint != nil {
+			cmds = append(cmds, repaint)
 		}
-		return m, tea.Batch(m.readStream(), m.thoughtUpdateCmd(string(msg), false))
+		return m, tea.Batch(cmds...)
 
 	case tokenMsg:
 		// LOCK-FREE CONSUMER: this per-token handler MUST NOT acquire any
@@ -2394,7 +2427,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					m.streaming = false
 					m.streamParser = nil
 					flush := m.flushPendingRecords()
-					m.refreshViewportContent()
+					m.refreshViewportContentImmediate()
 					return m, tea.Batch(flush, m.streamCmd(recoveryPrompt))
 				}
 
@@ -2407,7 +2440,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				m.push(roleSystem, infoStyle.Render(
 					"Mutation proposals detected. Use the capability chip or /plan to formulate an execution plan."))
 				flush := m.flushPendingRecords()
-				m.refreshViewportContent()
+				m.refreshViewportContentImmediate()
 				return m, flush
 			}
 		}
@@ -2606,7 +2639,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Clear planPending flag to prevent spinner lock on plan mode completion.
 		m.planPending = false
 
-		m.refreshViewportContent()
+		// ── MANDATORY SYNCHRONOUS FLUSH (STREAM COMPLETION) ─────────
+		// The final frame must render NOW, on this turn — never deferred to a
+		// pending repaintTickMsg that could be dropped, starved, or processed
+		// after the viewport went idle. refreshViewportContentImmediate resets
+		// the single-flight repaint gate, strips the stream cursor (▋) from the
+		// tail, and renders the completed response directly into m.Viewport so
+		// it is visible instantly without requiring an external UI event (the
+		// "prompt response invisible until the second prompt" regression).
+		m.refreshViewportContentImmediate()
 		// Full stream transparency: mark the live thought block complete so the
 		// Ctrl+O drawer collapses to its "▸ Thought for Xs (N tokens)" summary.
 		return m, m.thoughtUpdateCmd("", true)
@@ -2832,15 +2873,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			return m, nil
 		}
 		// Wheel scroll: always available outside modal states, even while
-		// streaming/tool execution/processing. It only mutates viewport YOffset.
+		// streaming/tool execution/processing. It mutates the single app-owned
+		// scroll offset (the bubbles viewport is a pure pre-sliced render
+		// surface, so wheel input can never double-scroll).
 		if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
-			if msg.Button == tea.MouseButtonWheelUp {
-				m.userIsScrollingUp = true
-			}
 			if m.Ready {
-				var vpCmd tea.Cmd
-				m.Viewport, vpCmd = m.Viewport.Update(msg)
-				return m, vpCmd
+				if msg.Button == tea.MouseButtonWheelUp {
+					m.scrollBy(-3)
+				} else {
+					m.scrollBy(3)
+				}
+				return m, nil
 			}
 			return m, nil
 		}
@@ -2862,7 +2905,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					m.frozenFullHitRows = buildFullHitMap(m)
 				}
 				// Freeze streaming auto-follow while inspecting via selection.
-				m.userIsScrollingUp = true
+				m.setScrollLocked(true)
 				m.refreshViewportContent()
 				return m, nil
 			}
@@ -3032,18 +3075,25 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if m.Ready {
 			switch msg.Type {
 			case tea.KeyPgUp, tea.KeyHome:
-				m.Viewport, _ = m.Viewport.Update(msg)
-				m.userIsScrollingUp = true
+				step := m.Viewport.Height / 2
+				if step < 1 {
+					step = 1
+				}
+				m.scrollBy(-step)
 				return m, nil
 			case tea.KeyPgDown, tea.KeyEnd:
-				m.Viewport, _ = m.Viewport.Update(msg)
+				step := m.Viewport.Height / 2
+				if step < 1 {
+					step = 1
+				}
+				m.scrollBy(step)
 				return m, nil
 			}
 		}
 
 		// ── SPACE snap-to-bottom (resets user scroll-lock) ─────────────────
 		if msg.Type == tea.KeySpace && !m.autocompleteActive {
-			m.userIsScrollingUp = false
+			m.setScrollLocked(false)
 			// Re-anchor the expanded output-trace window to the tail so the
 			// user "catches up" to the latest streamed content.
 			m.traceWindowAnchored = false
@@ -3099,13 +3149,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	// ── Viewport scroll keys (any state) ─────────────────────────────────────
 	if m.Ready {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			step := m.Viewport.Height / 2
+			if step < 1 {
+				step = 1
+			}
 			switch keyMsg.Type {
 			case tea.KeyPgUp, tea.KeyHome:
-				m.Viewport, _ = m.Viewport.Update(keyMsg)
-				m.userIsScrollingUp = true
+				m.scrollBy(-step)
 				return m, nil
 			case tea.KeyPgDown, tea.KeyEnd:
-				m.Viewport, _ = m.Viewport.Update(keyMsg)
+				m.scrollBy(step)
 				return m, nil
 			}
 		}
@@ -3444,7 +3497,7 @@ func (m *model) handleViModeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var vpCmd tea.Cmd
 		if m.Ready {
 			m.Viewport, vpCmd = m.Viewport.Update(tea.KeyMsg{Type: tea.KeyUp})
-			m.userIsScrollingUp = true
+			m.setScrollLocked(true)
 		}
 		return m, vpCmd
 
@@ -3704,9 +3757,11 @@ func (m *model) syncViewportToCursor() {
 
 	m.refreshViewportContent()
 
-	// Sync Bubble Tea viewport YOffset using cumulative physical line counts.
+	// Sync the single app-owned scroll offset using cumulative physical line
+	// counts (vi-mode keeps its own viewport scroll via Viewport.YOffset).
 	if m.Ready {
 		m.Viewport.YOffset = yOffset
+		m.docScrollOffset = yOffset + m.renderChromePrefixHeight()
 	}
 }
 

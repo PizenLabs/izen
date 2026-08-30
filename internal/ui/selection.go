@@ -85,7 +85,7 @@ func (m *model) mousePosToLogical(msg tea.MouseMsg) selPos {
 	_ = relX
 	yOff := 0
 	if m.Ready {
-		yOff = m.Viewport.YOffset
+		yOff = m.docScrollOffset
 	}
 	if len(m.fullHitRows) == 0 {
 		m.fullHitRows = buildFullHitMap(m)
@@ -189,7 +189,7 @@ func (m *model) mousePosToGlobal(msg tea.MouseMsg) GlobalPos {
 	geo := m.viewportGeometry()
 	yOff := 0
 	if m.Ready {
-		yOff = m.Viewport.YOffset
+		yOff = m.docScrollOffset
 	}
 	if m.docLayout != nil && m.docLayout.Len() > 0 {
 		prefix := m.viewportContentPrefixHeight()
@@ -440,14 +440,17 @@ func (m *model) handleSelectionAutoScroll(msg selectionScrollTickMsg) tea.Cmd {
 		return nil
 	}
 	if m.Ready {
-		// Strict maxYOffset using docLayout as source of truth
-		maxYOffset := 0
-		if m.docLayout != nil && m.docLayout.Len() > 0 && m.Viewport.Height > 0 {
+		// Strict maxYOffset using the cached full-document scroll height as
+		// source of truth (consistent with the manual-slicing contract).
+		maxYOffset := m.maxAppScroll()
+		if maxYOffset == 0 && m.docLayout != nil && m.docLayout.Len() > 0 && m.Viewport.Height > 0 {
+			// Fallback: derive from docLayout when no refresh has run yet.
 			maxYOffset = m.docLayout.Len() - m.Viewport.Height
 			if maxYOffset < 0 {
 				maxYOffset = 0
 			}
-		} else {
+		}
+		if maxYOffset == 0 && m.lastScrollTotal <= 0 {
 			totalPhys := 0
 			if len(m.fullHitRows) > 0 {
 				totalPhys = len(m.fullHitRows)
@@ -468,24 +471,24 @@ func (m *model) handleSelectionAutoScroll(msg selectionScrollTickMsg) tea.Cmd {
 			}
 		}
 		// Enforce increment only if not at bounds (prevents over-increment and Bubble Tea re-clamp jerk)
-		if delta > 0 && m.Viewport.YOffset >= maxYOffset {
+		if delta > 0 && m.docScrollOffset >= maxYOffset {
 			m.mouseSel.TickActive = false
 			return nil
 		}
-		if delta < 0 && m.Viewport.YOffset <= 0 {
+		if delta < 0 && m.docScrollOffset <= 0 {
 			m.mouseSel.TickActive = false
 			return nil
 		}
-		newOff := m.Viewport.YOffset + delta
+		newOff := m.docScrollOffset + delta
 		if newOff < 0 {
 			newOff = 0
 		}
 		if newOff > maxYOffset {
 			newOff = maxYOffset
 		}
-		if newOff != m.Viewport.YOffset {
-			m.Viewport.SetYOffset(newOff)
-			m.userIsScrollingUp = true
+		if newOff != m.docScrollOffset {
+			m.docScrollOffset = newOff
+			m.setScrollLocked(true)
 			// Space-anchored invariant: Anchor unchanged, Cursor.Y follows viewport strictly
 			// For down scroll, Cursor.Y = min(YOffset+Height-1, len-1) to reach absolute bottom smoothly
 			anchor := m.mouseSel.Anchor
@@ -493,16 +496,16 @@ func (m *model) handleSelectionAutoScroll(msg selectionScrollTickMsg) tea.Cmd {
 			if delta > 0 {
 				// Scrolling down: bottom edge
 				if m.docLayout != nil && m.docLayout.Len() > 0 {
-					newGlobalY = m.Viewport.YOffset + m.Viewport.Height - 1
+					newGlobalY = m.docScrollOffset + m.Viewport.Height - 1
 					if newGlobalY >= m.docLayout.Len() {
 						newGlobalY = m.docLayout.Len() - 1
 					}
 				} else {
-					newGlobalY = m.Viewport.YOffset + geo.Height - 1
+					newGlobalY = m.docScrollOffset + geo.Height - 1
 				}
 			} else {
 				// Scrolling up: top edge
-				newGlobalY = m.Viewport.YOffset
+				newGlobalY = m.docScrollOffset
 			}
 			relX := msg.X - geo.Left
 			if relX < 0 {

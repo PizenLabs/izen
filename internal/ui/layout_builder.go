@@ -166,6 +166,27 @@ func BuildDocumentLayoutWithUsername(records []record, wrapWidth int, username s
 				continue
 			}
 		}
+		// ── UNIFIED MARKDOWN/ANSI ENGINE ──────────────────────────────
+		// roleAI records (both completed history and the live streaming tail)
+		// render through renderAIBlockLines — the single Catppuccin Mocha
+		// engine for headers, inline code, fenced code blocks, lists and
+		// numbered items. This guarantees stream completion never reverts to
+		// raw markdown syntax: the trailing lines are byte-identical to the
+		// streamed ones, minus the active block cursor.
+		if rec.role == roleAI {
+			aiLines := renderAIBlockLines(text, wrapWidth)
+			for i := range aiLines {
+				aiLines[i].GlobalY = globalY
+				aiLines[i].RecordIdx = idx
+				lines = append(lines, aiLines[i])
+				globalY++
+			}
+			if len(aiLines) == 0 {
+				lines = append(lines, DocumentLine{GlobalY: globalY, Spans: []RenderSpan{{StartCell: 0, EndCell: 2, SourceStart: 0, SourceEnd: 0, Selectable: false}}, RawText: "", RenderedStr: dimmedStyle.Render("│ "), RecordIdx: idx})
+				globalY++
+			}
+			continue
+		}
 		// For AI markdown responses and plain text records: effectiveWidth = wrapWidth - gutterWidth
 		gutterWidth := 2 // "│ " is 2 cells
 		effectiveWidth := wrapWidth - gutterWidth
@@ -393,6 +414,195 @@ func renderRecordForLayout(rec record, text string, width int, username ...strin
 	}
 }
 
+// ── Unified Markdown / ANSI rendering engine ──────────────────────────────────
+// renderAIBlockLines converts a markdown/text AI record into physical
+// DocumentLines with Catppuccin Mocha ANSI styling. It is the SINGLE unified
+// engine shared by:
+//   - the completed-history path (BuildDocumentLayout roleAI branch), and
+//   - the live streaming tail (syncStreamingSegment in model.go).
+//
+// Both paths therefore produce byte-identical RenderedStr/Spans, so stream
+// completion NEVER reverts to raw markdown syntax (fences, backticks) — the
+// only difference is the trailing active cursor appended while streaming.
+
+// aiBlockRenderer is the STATEFUL markdown→DocumentLine engine. It consumes
+// logical lines one at a time so a long-lived LLM stream can render
+// incrementally: complete logical lines are committed exactly once and cached,
+// and only the partial trailing line is re-rendered as it grows. The code-block
+// and list state (inCode / lang / codeLines) persists across lines so an open
+// fence or multi-line markdown construct carries its context between ticks
+// without re-parsing its head. renderAIBlockLines is the one-shot wrapper.
+type aiBlockRenderer struct {
+	out       []DocumentLine
+	inCode    bool
+	lang      string
+	codeLines []string
+}
+
+// renderLine consumes one LOGICAL line (no embedded "\n") and appends its
+// rendered DocumentLines to out. It is the exact per-line state machine of the
+// legacy renderAIBlockLines loop, extracted so streaming ticks can feed only
+// the delta.
+func (r *aiBlockRenderer) renderLine(rl string, wrapWidth int) {
+	if wrapWidth < 20 {
+		wrapWidth = 20
+	}
+	trimmed := strings.TrimSpace(rl)
+	if strings.HasPrefix(trimmed, "```") {
+		if r.inCode {
+			r.flushCode(wrapWidth)
+			r.inCode = false
+		} else {
+			r.inCode = true
+			r.lang = strings.TrimPrefix(trimmed, "```")
+		}
+		return
+	}
+	if r.inCode {
+		r.codeLines = append(r.codeLines, rl)
+		return
+	}
+	if trimmed == "" {
+		r.out = append(r.out, gutterDocumentLine(wrapWidth))
+		return
+	}
+	// Word-wrap the raw logical line before styling (marker width is reserved
+	// on the first wrapped line so the styled line lands exactly on the
+	// boundary, never past it).
+	innerW := wrapWidth - 2
+	if innerW < 10 {
+		innerW = 10
+	}
+	wrapW := innerW - markdownLinePrefixWidth(rl) - 2
+	if wrapW < 10 {
+		wrapW = 10
+	}
+	wrapped := ansi.Wordwrap(rl, wrapW, " \t")
+	for _, sub := range strings.Split(wrapped, "\n") {
+		rendered := renderDeterministicInlineMarkdown(sub, wrapWidth)
+		r.out = append(r.out, renderedTextToDocumentLines("│ ", rendered, wrapWidth)...)
+	}
+}
+
+// flushCode emits the buffered code-block lines (Chromatised, Catppuccin
+// Mocha) at the closing fence or EOF.
+func (r *aiBlockRenderer) flushCode(wrapWidth int) {
+	if len(r.codeLines) > 0 {
+		r.out = append(r.out, renderCodeBlockToLines(r.lang, r.codeLines, wrapWidth)...)
+	}
+	r.codeLines = nil
+	r.lang = ""
+}
+
+// finish flushes any unclosed code block left at the end of the input so a
+// stream that ends mid-fence still renders its buffered lines exactly as the
+// completed-history path does.
+func (r *aiBlockRenderer) finish(wrapWidth int) {
+	if r.inCode {
+		r.flushCode(wrapWidth)
+	}
+}
+
+// renderAIBlockLines renders an AI record's text to physical DocumentLines.
+func renderAIBlockLines(text string, wrapWidth int) []DocumentLine {
+	if wrapWidth < 20 {
+		wrapWidth = 20
+	}
+	text = ensurePreflightDelimiter(sanitizeText(text))
+	r := &aiBlockRenderer{}
+	for _, rl := range strings.Split(text, "\n") {
+		r.renderLine(rl, wrapWidth)
+	}
+	r.finish(wrapWidth)
+	return r.out
+}
+
+// renderedTextToDocumentLines converts a rendered (ANSI-styled, possibly
+// multi-line) markdown block into DocumentLines with an outer AI gutter and
+// span-level cell geometry. Header leading-separator newlines become empty
+// gutter rows so headings always start on a fresh physical line.
+func renderedTextToDocumentLines(gutter string, rendered string, wrapWidth int) []DocumentLine {
+	if rendered == "" {
+		return nil
+	}
+	var out []DocumentLine
+	parts := strings.Split(strings.TrimSuffix(rendered, "\n"), "\n")
+	gutterCells := runewidth.StringWidth(ansi.Strip(gutter))
+	for _, p := range parts {
+		if p == "" {
+			out = append(out, gutterDocumentLine(wrapWidth))
+			continue
+		}
+		raw := ansi.Strip(p)
+		contentCells := runewidth.StringWidth(raw)
+		spans := []RenderSpan{
+			{StartCell: 0, EndCell: gutterCells, SourceStart: 0, SourceEnd: 0, Selectable: false},
+			{StartCell: gutterCells, EndCell: gutterCells + contentCells, SourceStart: 0, SourceEnd: len([]rune(raw)), Selectable: true},
+		}
+		out = append(out, DocumentLine{
+			Spans:       spans,
+			RawText:     raw,
+			RenderedStr: dimmedStyle.Render(gutter) + p,
+		})
+	}
+	return out
+}
+
+// renderCodeBlockToLines renders a fenced code block (Chromatised, Catppuccin
+// Mocha) into DocumentLines with the outer AI gutter plus the inner code
+// gutter, mirroring the streaming pipeline's double-gutter composition. Code
+// lines carry the Surface background (#1e1e2e) and the gutters use the dimmed
+// border colour (#45475a); syntax colours (green keywords / blue identifiers)
+// come from the chroma Catppuccin Mocha theme.
+func renderCodeBlockToLines(lang string, codeLines []string, wrapWidth int) []DocumentLine {
+	if len(codeLines) == 0 {
+		return nil
+	}
+	rendered := renderCodeBlock(lang, codeLines, wrapWidth)
+	if rendered == "" {
+		return nil
+	}
+	outerGutter := "│ "
+	outerCells := runewidth.StringWidth(ansi.Strip(outerGutter))
+	var out []DocumentLine
+	for _, p := range strings.Split(strings.TrimSuffix(rendered, "\n"), "\n") {
+		if p == "" {
+			out = append(out, gutterDocumentLine(wrapWidth))
+			continue
+		}
+		stripped := ansi.Strip(p)
+		prefixCells, content := splitGutterPrefix(stripped)
+		contentCells := runewidth.StringWidth(content)
+		innerStart := outerCells + prefixCells
+		spans := []RenderSpan{
+			{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false},
+			{StartCell: outerCells, EndCell: innerStart, SourceStart: 0, SourceEnd: 0, Selectable: false},
+			{StartCell: innerStart, EndCell: innerStart + contentCells, SourceStart: 0, SourceEnd: len([]rune(content)), Selectable: true},
+		}
+		out = append(out, DocumentLine{
+			Spans:       spans,
+			RawText:     content,
+			RenderedStr: mdCodeBgStyle.Render(mdCodeBorderStyle.Render(outerGutter)) + codeSurfaceBG + p + ansiReset,
+		})
+	}
+	return out
+}
+
+// codeSurfaceBG is the Catppuccin Surface (#1e1e2e) background applied to
+// fenced code block rows. It is emitted as raw ANSI so the chroma foreground
+// colours inside the line are preserved (a lipgloss background re-render would
+// strip them). Zero render-path style construction.
+const codeSurfaceBG = "\x1b[48;2;30;30;46m"
+
+// gutterDocumentLine builds an empty AI gutter row (blank physical line).
+func gutterDocumentLine(wrapWidth int) DocumentLine {
+	return DocumentLine{
+		Spans:       []RenderSpan{{StartCell: 0, EndCell: 2, SourceStart: 0, SourceEnd: 0, Selectable: false}},
+		RawText:     "",
+		RenderedStr: dimmedStyle.Render("│ "),
+	}
+}
+
 // wrapForContentWidth wraps text strictly at maxWidth using cell-aware logic.
 // It delegates to wrapIndentedLine which handles CJK double-width and chunking.
 func wrapForContentWidth(text string, maxWidth int) []string {
@@ -458,19 +668,6 @@ func IncrementalLayoutUpdate(prev *DocumentLayout, records []record, wrapWidth i
 				maxIdx = l.RecordIdx
 			}
 		}
-		if maxIdx == len(records)-2 && len(records) >= 2 {
-			// Previous max was second last, so new record appended
-			added := BuildDocumentLayout(records[len(records)-1:], wrapWidth, uname)
-			// Adjust GlobalY and RecordIdx (sub-build uses 0, need original index)
-			base := prevLen
-			origIdx := len(records) - 1
-			for i := range added.Lines {
-				added.Lines[i].GlobalY = base + i
-				added.Lines[i].RecordIdx = origIdx
-			}
-			newLines := append(append([]DocumentLine(nil), prev.Lines...), added.Lines...)
-			return DocumentLayout{Lines: newLines, width: wrapWidth}
-		}
 		if maxIdx == len(records)-1 {
 			// Streaming: last record mutated, rebuild only its lines if text changed
 			startIdx := -1
@@ -512,6 +709,26 @@ func IncrementalLayoutUpdate(prev *DocumentLayout, records []record, wrapWidth i
 				newLines := append(kept, newRecLines.Lines...)
 				return DocumentLayout{Lines: newLines, width: wrapWidth}
 			}
+		}
+		// ── MULTI-RECORD APPEND (stream-completion) ────────────────
+		// Records routinely grow by MORE than one between refreshes: stream
+		// completion lands the committed assistant record AND the terminal
+		// "✔ done · +N tok" telemetry record in the same turn. Append ALL
+		// records after the last committed index instead of assuming exactly one
+		// new record — otherwise every record after the first new one is silently
+		// dropped from the layout (the completed answer disappears while only the
+		// status line renders).
+		if maxIdx < len(records)-1 {
+			added := BuildDocumentLayout(records[maxIdx+1:], wrapWidth, uname)
+			// Adjust GlobalY and RecordIdx (sub-build uses 0-relative indices).
+			base := prevLen
+			baseIdx := maxIdx + 1
+			for i := range added.Lines {
+				added.Lines[i].GlobalY = base + i
+				added.Lines[i].RecordIdx = baseIdx + added.Lines[i].RecordIdx
+			}
+			newLines := append(append([]DocumentLine(nil), prev.Lines...), added.Lines...)
+			return DocumentLayout{Lines: newLines, width: wrapWidth}
 		}
 		// Fallback: if line count differs drastically or records shrunk, full rebuild
 		if len(records) < maxIdx+1 {
