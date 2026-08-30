@@ -120,6 +120,16 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 		return ""
 	}
 
+	// Key structural headers/prefixes get Catppuccin Blue highlight before generic heading logic.
+	if hl := highlightKeyHeaders(line); hl != "" {
+		// For markdown headings (# Summary etc.) preserve leading newline
+		// semantics so headings still start on fresh line.
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			return "\n" + hl
+		}
+		return hl
+	}
+
 	trimmed := strings.TrimSpace(line)
 
 	switch {
@@ -147,8 +157,12 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 		return "\n" + mdH1Style.Render(strings.TrimSpace(line[2:]))
 	}
 
-	if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
+	if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") || strings.HasPrefix(trimmed, "+ ") {
 		content := strings.TrimSpace(trimmed[2:])
+		if hl := highlightKeyHeaders(content); hl != "" {
+			// Preserve bullet icon with highlighted content (hl is without bullet for content-only)
+			return mdBulletStyle.Render(Icon.Bullet) + " " + hl
+		}
 		return mdBulletStyle.Render(Icon.Bullet) + " " + applyInlineStyles(content)
 	}
 

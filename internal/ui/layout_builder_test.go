@@ -211,6 +211,68 @@ func TestCodeBlock_GoCodeKeepsFrame(t *testing.T) {
 	}
 }
 
+// TestTable_InlineMarkdownParsedInCells verifies inline markdown inside table cells
+// is parsed to ANSI and no raw delimiters remain.
+func TestTable_InlineMarkdownParsedInCells(t *testing.T) {
+	const width = 60
+	md := "| **Community** | ***Fast*** performance |\n|---|---|\n| hello | world |"
+	out := renderAIBlockLines(md, width)
+	if len(out) == 0 {
+		t.Fatal("expected rendered table lines")
+	}
+	var joined strings.Builder
+	for _, l := range out {
+		joined.WriteString(l.RenderedStr)
+		joined.WriteString("\n")
+	}
+	s := joined.String()
+	if !strings.Contains(s, "\x1b[1m") {
+		t.Fatalf("table cell should contain Bold ANSI \\x1b[1m, got:\n%s", s)
+	}
+	if strings.Contains(s, "**") {
+		t.Fatalf("table cell must not contain raw **, got:\n%s", s)
+	}
+	if strings.Contains(s, "***") {
+		t.Fatalf("table cell must not contain raw ***, got:\n%s", s)
+	}
+	plain := ansi.Strip(s)
+	if !strings.Contains(plain, "Community") || !strings.Contains(plain, "Fast") {
+		t.Fatalf("table plain should contain Community and Fast, got %q", plain)
+	}
+}
+
+// TestHeader_KeyTitlesHighlightedInBlue verifies key structural headers/prefixes are highlighted blue.
+func TestHeader_KeyTitlesHighlightedInBlue(t *testing.T) {
+	cases := []string{
+		"Summary",
+		"Follow-up:",
+		"### Note",
+		"Summary - Go offers a smaller...",
+		"Summary — Go offers...",
+		"- Summary: Go offers...",
+		"* **Follow-up** - Are you evaluating...",
+	}
+	for _, c := range cases {
+		out := renderAIBlockLines(c, 60)
+		var joined strings.Builder
+		for _, l := range out {
+			joined.WriteString(l.RenderedStr)
+		}
+		s := joined.String()
+		if !strings.Contains(s, "38;2;137;180;250") {
+			t.Fatalf("line %q should contain Blue 38;2;137;180;250, got %q", c, s)
+		}
+		// Also direct highlight helper
+		hl := highlightKeyHeaders(c)
+		if hl == "" {
+			t.Fatalf("highlightKeyHeaders(%q) returned empty", c)
+		}
+		if !strings.Contains(hl, "38;2;137;180;250") {
+			t.Fatalf("highlightKeyHeaders(%q) missing blue, got %q", c, hl)
+		}
+	}
+}
+
 // TestTable_ResponsiveColumnWrapping verifies responsive column budgeting and
 // intra-cell wrapping: a wide markdown table with wrapWidth=50 must shrink
 // columns, wrap long cell text into multiple lines, and keep vertical borders

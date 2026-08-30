@@ -857,6 +857,163 @@ func renderTableCell(cell string) string {
 	return rendered
 }
 
+// highlightKeyHeaders detects key structural headers/prefixes at line start
+// (Summary, Follow-up, Note, Important, TL;DR, Recommendation, Key Takeaways,
+// Pros/Cons) and applies Catppuccin Blue bold (#89b4fa / 38;2;137;180;250)
+// to the title/prefix. Supports:
+//   - Optional leading markdown list bullet or header: ^(\s*[-*+]\s+|\s*#{1,6}\s+)?
+//   - Optional leading bold formatting: (\*\*)?
+//   - Case-insensitive keyword
+//   - Separators: colon `:`, hyphens/dashes `-`, `–`, `—` with optional spaces,
+//     or standalone trailing space/EOL.
+// The matched keyword and its trailing delimiter (e.g. `Summary -` or `Summary:`)
+// receive the Blue ANSI, remainder resets to standard style.
+func highlightKeyHeaders(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return ""
+	}
+	// ── Strip optional leading bullet or heading ─────────────────────
+	core := trimmed
+	hadBullet := false
+	if strings.HasPrefix(trimmed, "#") {
+		i := 0
+		for i < len(trimmed) && trimmed[i] == '#' {
+			i++
+		}
+		if i > 0 && i <= 6 && i < len(trimmed) && trimmed[i] == ' ' {
+			core = strings.TrimSpace(trimmed[i+1:])
+		} else {
+			core = trimmed
+		}
+	} else if len(trimmed) >= 2 && (trimmed[0] == '-' || trimmed[0] == '*' || trimmed[0] == '+') && (trimmed[1] == ' ' || trimmed[1] == '\t') {
+		// Bullet: "- ", "* ", "+ " with any trailing spaces
+		hadBullet = true
+		j := 1
+		for j < len(trimmed) && (trimmed[j] == ' ' || trimmed[j] == '\t') {
+			j++
+		}
+		core = strings.TrimSpace(trimmed[j:])
+	} else {
+		core = trimmed
+	}
+	_ = hadBullet
+	// ── Strip optional leading bold ─────────────────────────────────
+	norm := strings.TrimSpace(core)
+	if strings.HasPrefix(norm, "**") {
+		norm = strings.TrimSpace(strings.TrimPrefix(norm, "**"))
+	}
+	norm = strings.TrimSpace(norm)
+	if norm == "" {
+		return ""
+	}
+	lowerNorm := strings.ToLower(norm)
+	keywords := []string{"key takeaways", "recommendation", "pros/cons", "follow-up", "follow up", "important", "summary", "note", "tl;dr"}
+	var matched string
+	var matchedLower string
+	var matchedRestOrig string
+	// Find longest keyword whose delimiter is valid (colon, dash, space, EOL, closing bold)
+	for _, kw := range keywords {
+		kwLower := strings.ToLower(kw)
+		if !strings.HasPrefix(lowerNorm, kwLower) {
+			continue
+		}
+		// Extract raw matched prefix preserving original case
+		matchedRaw := norm[:len(kw)]
+		restOrig := norm[len(kw):]
+		// Handle optional closing bold immediately after keyword (e.g. **Follow-up**)
+		if strings.HasPrefix(restOrig, "**") {
+			restOrig = restOrig[2:]
+		}
+		restTrim := strings.TrimLeft(restOrig, " \t")
+		// Validate delimiter: colon, dash variants, space, or EOL
+		valid := false
+		if restOrig == "" || strings.TrimSpace(restOrig) == "" {
+			valid = true
+		} else if strings.HasPrefix(restTrim, ":") {
+			valid = true
+		} else if strings.HasPrefix(restTrim, "-") || strings.HasPrefix(restTrim, "–") || strings.HasPrefix(restTrim, "—") {
+			valid = true
+		} else if strings.HasPrefix(restOrig, " ") || strings.HasPrefix(restOrig, "\t") {
+			valid = true
+		}
+		if !valid {
+			continue
+		}
+		if len(kw) > len(matchedLower) {
+			matchedLower = kwLower
+			matched = matchedRaw
+			matchedRestOrig = restOrig
+		}
+	}
+	if matched == "" {
+		return ""
+	}
+	// ── Build prefix with delimiter ──────────────────────────────────
+	prefix := matched
+	restOrig := matchedRestOrig
+	// Consume optional closing bold already handled in matchedRestOrig, but restOrig still may start with spaces+marker
+	// Actually matchedRestOrig already has closing bold stripped, so use it.
+	// Determine delimiter to include in blue prefix.
+	restTrimForDelim := strings.TrimLeft(restOrig, " \t")
+	var remainder string
+	if strings.HasPrefix(restTrimForDelim, ":") {
+		prefix += ":"
+		// remainder is after colon
+		afterColon := strings.TrimPrefix(restTrimForDelim, ":")
+		remainder = strings.TrimSpace(afterColon)
+	} else if strings.HasPrefix(restTrimForDelim, "-") || strings.HasPrefix(restTrimForDelim, "–") || strings.HasPrefix(restTrimForDelim, "—") {
+		var dashStr string
+		if strings.HasPrefix(restTrimForDelim, "-") {
+			dashStr = "-"
+		} else if strings.HasPrefix(restTrimForDelim, "–") {
+			dashStr = "–"
+		} else if strings.HasPrefix(restTrimForDelim, "—") {
+			dashStr = "—"
+		}
+		// Include dash with one surrounding space in blue (e.g. "Summary -" / "Summary —")
+		prefix = prefix + " " + dashStr
+		afterDash := strings.TrimPrefix(restTrimForDelim, dashStr)
+		remainder = strings.TrimSpace(afterDash)
+	} else {
+		// No colon/dash, remainder is trimmed rest
+		remainder = strings.TrimSpace(restOrig)
+	}
+	// ── Render ────────────────────────────────────────────────────────
+	const blueBoldStart = "\x1b[1;38;2;137;180;250m"
+	const reset = "\x1b[0m"
+	styledPrefix := blueBoldStart + prefix + reset
+	// Preserve bullet prefix if original was a list item
+	bulletPrefix := ""
+	if hadBullet {
+		bp := mdBulletStyle.Render(Icon.Bullet)
+		if bp == Icon.Bullet {
+			bp = "\x1b[38;2;250;179;135m" + Icon.Bullet + "\x1b[0m"
+		}
+		bulletPrefix = bp + " "
+	}
+	if remainder == "" {
+		if hadBullet {
+			return bulletPrefix + styledPrefix
+		}
+		return styledPrefix
+	}
+	var remainderStyled string
+	if strings.ContainsAny(remainder, "*`") {
+		remainderStyled = applyInlineStyles(remainder)
+	} else {
+		r := textStyle.Render(remainder)
+		if r == remainder {
+			r = "\x1b[38;2;205;214;244m" + remainder + reset
+		}
+		remainderStyled = r
+	}
+	if hadBullet {
+		return bulletPrefix + styledPrefix + " " + remainderStyled
+	}
+	return styledPrefix + " " + remainderStyled
+}
+
 // renderMarkdownTableToLines renders a buffered pipe-delimited markdown table
 // as a structured Unicode box grid with responsive column budgeting and
 // intra-cell word wrapping:
@@ -1102,37 +1259,70 @@ func renderMarkdownTableToLines(rows []string, wrapWidth int) []DocumentLine {
 	sepBorder := horiz("├", "┼", "┤")
 	botBorder := horiz("└", "┴", "┘")
 
-	// Helper: wrap a plain cell to width.
-	wrapPlainCell := func(cell string, w int) []string {
+	// Helper: wrap a styled cell to width using ANSI-aware Wordwrap.
+	// FIRST: Convert raw inline markdown (**bold**, *italic*, `code`) into ANSI
+	// via renderTableCell BEFORE width calculation.
+	// SECOND: Pass ANSI-styled string into ANSI-aware wrapper using W_i_alloc.
+	// THIRD: Guarantee no raw ** / *** delimiters survive.
+	wrapStyledCell := func(cell string, w int) []string {
 		if w < 1 {
 			w = 1
 		}
 		if strings.TrimSpace(cell) == "" {
 			return []string{""}
 		}
-		return wrapForContentWidth(cell, w)
+		styled := renderTableCell(cell)
+		if styled == "" {
+			return []string{""}
+		}
+		// Safety: ensure delimiters stripped (renderTableCell already does)
+		if strings.Contains(styled, "**") {
+			styled = strings.ReplaceAll(styled, "**", "")
+		}
+		if strings.Contains(styled, "***") {
+			styled = strings.ReplaceAll(styled, "***", "")
+		}
+		wrapped := ansi.Wordwrap(styled, w, " ")
+		lines := strings.Split(wrapped, "\n")
+		var out []string
+		for _, ln := range lines {
+			if ansi.StringWidth(ln) > w {
+				chunks := chunkWord(ln, w)
+				if len(chunks) == 0 {
+					out = append(out, ln)
+				} else {
+					out = append(out, chunks...)
+				}
+			} else {
+				out = append(out, ln)
+			}
+		}
+		if len(out) == 0 {
+			out = []string{""}
+		}
+		return out
 	}
 
 	// Build a row string for visual line k of a wrapped logical row.
+	// wrapped already contains ANSI-styled, wrapped lines (not plain).
 	buildRow := func(wrapped [][]string, k int, isHeader bool) string {
 		var b strings.Builder
 		b.WriteString("│")
 		for i := 0; i < ncols; i++ {
-			contentPlain := ""
+			contentStyled := ""
 			if i < len(wrapped) && k < len(wrapped[i]) {
-				contentPlain = wrapped[i][k]
+				contentStyled = wrapped[i][k]
 			}
-			rendered := renderTableCell(contentPlain)
-			w := ansi.StringWidth(rendered)
+			w := ansi.StringWidth(contentStyled)
 			pad := colWidths[i] - w
 			if pad < 0 {
 				pad = 0
 			}
 			b.WriteString(" ")
-			if isHeader && rendered != "" {
-				b.WriteString(headerFg + rendered + reset)
+			if isHeader && contentStyled != "" {
+				b.WriteString(headerFg + contentStyled + reset)
 			} else {
-				b.WriteString(rendered)
+				b.WriteString(contentStyled)
 			}
 			b.WriteString(strings.Repeat(" ", pad))
 			b.WriteString(" │")
@@ -1178,7 +1368,7 @@ func renderMarkdownTableToLines(rows []string, wrapWidth int) []DocumentLine {
 		wrappedHeader := make([][]string, ncols)
 		maxK := 0
 		for i := 0; i < ncols; i++ {
-			wrappedHeader[i] = wrapPlainCell(plainHeader[i], colWidths[i])
+			wrappedHeader[i] = wrapStyledCell(plainHeader[i], colWidths[i])
 			if len(wrappedHeader[i]) > maxK {
 				maxK = len(wrappedHeader[i])
 			}
@@ -1202,7 +1392,7 @@ func renderMarkdownTableToLines(rows []string, wrapWidth int) []DocumentLine {
 		wrappedCols := make([][]string, ncols)
 		maxK := 0
 		for i := 0; i < ncols; i++ {
-			wrappedCols[i] = wrapPlainCell(plainCols[i], colWidths[i])
+			wrappedCols[i] = wrapStyledCell(plainCols[i], colWidths[i])
 			if len(wrappedCols[i]) > maxK {
 				maxK = len(wrappedCols[i])
 			}
