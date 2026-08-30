@@ -80,3 +80,133 @@ func TestColorizeNoBg_NoBackground(t *testing.T) {
 		}
 	}
 }
+
+// TestCodeBlock_ShellSnippetFramelessYellow verifies a markdown shell snippet
+// (```sh / go run hello.go / ```) renders frameless: no box borders, a dimmed
+// "$ " prompt, Catppuccin Yellow command foreground, and no background fill.
+func TestCodeBlock_ShellSnippetFramelessYellow(t *testing.T) {
+	const width = 60
+	out := renderCodeBlockToLines("sh", []string{"go run hello.go"}, width)
+	if len(out) == 0 {
+		t.Fatal("expected rendered lines for shell snippet")
+	}
+	var joined strings.Builder
+	for _, l := range out {
+		joined.WriteString(l.RenderedStr)
+		joined.WriteString("\n")
+	}
+	s := joined.String()
+
+	for _, border := range []string{"┌", "└"} {
+		if strings.Contains(s, border) {
+			t.Fatalf("shell snippet must be frameless (no %q box border), got:\n%s", border, s)
+		}
+	}
+	if !strings.Contains(s, "$ ") {
+		t.Fatalf("shell snippet must contain a \"$ \" prompt, got:\n%s", s)
+	}
+	if !strings.Contains(s, "38;2;249;226;175") {
+		t.Fatalf("shell snippet must apply Catppuccin Yellow 38;2;249;226;175 to command, got:\n%s", s)
+	}
+	if strings.Contains(s, "48;2;") {
+		t.Fatalf("shell snippet must not contain background codes, got:\n%s", s)
+	}
+	if plain := ansi.Strip(s); !strings.Contains(plain, "go run hello.go") {
+		t.Fatalf("shell snippet must preserve the command text, got:\n%s", s)
+	}
+}
+
+// TestTable_RendersUnicodeBoxGrid verifies a pipe-delimited markdown table
+// renders as a structured Unicode box grid (┌─┬─┐ / ├─┼─┤ / └─┴─┘ / │) with no
+// background fill.
+func TestTable_RendersUnicodeBoxGrid(t *testing.T) {
+	const width = 60
+	md := "| Col1 | Col2 |\n|---|---|\n| A | B |"
+	out := renderAIBlockLines(md, width)
+	if len(out) == 0 {
+		t.Fatal("expected rendered table lines")
+	}
+	var joined strings.Builder
+	for _, l := range out {
+		joined.WriteString(l.RenderedStr)
+		joined.WriteString("\n")
+	}
+	s := joined.String()
+
+	for _, frag := range []string{"┌", "┬", "┐", "├", "┼", "┤", "└", "┴", "┘", "│"} {
+		if !strings.Contains(s, frag) {
+			t.Fatalf("table grid must contain %q, got:\n%s", frag, s)
+		}
+	}
+	if strings.Contains(s, "48;2;") {
+		t.Fatalf("table grid must not contain background codes, got:\n%s", s)
+	}
+
+	// Exactly 2 columns: a body row is 3 cell separators plus the outer AI
+	// gutter ("│ "), i.e. 4 '│' glyphs after stripping ANSI. A buggy column
+	// count would emit extra empty columns.
+	plain := ansi.Strip(s)
+	for _, line := range strings.Split(plain, "\n") {
+		if strings.Contains(line, "A") && strings.Contains(line, "B") {
+			if got := strings.Count(line, "│"); got != 4 {
+				t.Fatalf("expected 2 table columns (4 pipe glyphs), got %d in %q", got, line)
+			}
+		}
+	}
+}
+
+// TestShellSnippet_CommentIsGreen verifies shell snippets color full-line and
+// inline comments in Catppuccin Green (#a6e3a1) while commands stay Catppuccin
+// Yellow (#f9e2af).
+func TestShellSnippet_CommentIsGreen(t *testing.T) {
+	const width = 60
+	out := renderCodeBlockToLines("sh", []string{"# Comment", "go run .", "mkdir -p cmd # create dir"}, width)
+	if len(out) == 0 {
+		t.Fatal("expected rendered shell snippet lines")
+	}
+	var joined strings.Builder
+	for _, l := range out {
+		joined.WriteString(l.RenderedStr)
+		joined.WriteString("\n")
+	}
+	s := joined.String()
+
+	if !strings.Contains(s, "38;2;166;227;161") {
+		t.Fatalf("comments must render green 38;2;166;227;161, got:\n%s", s)
+	}
+	if !strings.Contains(s, "38;2;249;226;175") {
+		t.Fatalf("commands must render yellow 38;2;249;226;175, got:\n%s", s)
+	}
+	if strings.Contains(s, "48;2;") {
+		t.Fatalf("shell snippet must not contain background codes, got:\n%s", s)
+	}
+	if plain := ansi.Strip(s); !strings.Contains(plain, "# Comment") || !strings.Contains(plain, "go run .") || !strings.Contains(plain, "# create dir") {
+		t.Fatalf("shell snippet must preserve comment/command text, got:\n%s", s)
+	}
+}
+
+// TestCodeBlock_GoCodeKeepsFrame verifies a programming-language code block
+// (e.g. go) keeps the framed box container with its language label and side
+// borders.
+func TestCodeBlock_GoCodeKeepsFrame(t *testing.T) {
+	const width = 60
+	out := renderCodeBlockToLines("go", []string{"func main() {}", "    fmt.Println(\"hi\")"}, width)
+	if len(out) == 0 {
+		t.Fatal("expected rendered lines for go code block")
+	}
+	var joined strings.Builder
+	for _, l := range out {
+		joined.WriteString(l.RenderedStr)
+		joined.WriteString("\n")
+	}
+	s := joined.String()
+
+	for _, fragment := range []string{"┌─ go", "│", "└"} {
+		if !strings.Contains(s, fragment) {
+			t.Fatalf("go code block must contain %q box frame, got:\n%s", fragment, s)
+		}
+	}
+	if strings.Contains(s, "$ ") {
+		t.Fatalf("go code block must not render a shell prompt, got:\n%s", s)
+	}
+}

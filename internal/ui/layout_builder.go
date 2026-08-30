@@ -439,6 +439,8 @@ type aiBlockRenderer struct {
 	inCode    bool
 	lang      string
 	codeLines []string
+	inTable   bool
+	tableRows []string
 }
 
 // renderLine consumes one LOGICAL line (no embedded "\n") and appends its
@@ -463,6 +465,20 @@ func (r *aiBlockRenderer) renderLine(rl string, wrapWidth int) {
 	if r.inCode {
 		r.codeLines = append(r.codeLines, rl)
 		return
+	}
+	// Pipe-delimited table detection: a trimmed line that starts with '|'
+	// and contains another '|' is a table row (header, separator, or body).
+	// Rows are buffered so the full grid (column widths) can be computed on
+	// flush, exactly like fenced code blocks.
+	if isTableRowLine(trimmed) {
+		if !r.inTable {
+			r.inTable = true
+		}
+		r.tableRows = append(r.tableRows, rl)
+		return
+	}
+	if r.inTable {
+		r.flushTable(wrapWidth)
 	}
 	if trimmed == "" {
 		r.out = append(r.out, gutterDocumentLine(wrapWidth))
@@ -503,6 +519,21 @@ func (r *aiBlockRenderer) finish(wrapWidth int) {
 	if r.inCode {
 		r.flushCode(wrapWidth)
 	}
+	if r.inTable {
+		r.flushTable(wrapWidth)
+	}
+}
+
+// flushTable emits the buffered table rows as a Unicode box grid at the closing
+// blank line or EOF. Rows are parsed, column widths computed, and the structured
+// border container (┌─┬─┐ / ├─┼─┤ / └─┴─┘) rendered with native transparent
+// background preserved.
+func (r *aiBlockRenderer) flushTable(wrapWidth int) {
+	if len(r.tableRows) > 0 {
+		r.out = append(r.out, renderMarkdownTableToLines(r.tableRows, wrapWidth)...)
+	}
+	r.tableRows = nil
+	r.inTable = false
 }
 
 // renderAIBlockLines renders an AI record's text to physical DocumentLines.
@@ -566,6 +597,14 @@ func renderCodeBlockToLines(lang string, codeLines []string, wrapWidth int) []Do
 	if len(codeLines) == 0 {
 		return nil
 	}
+	// Shell/command snippets from response text are informational copy — they
+	// render frameless (no ┌─┐ box), indented with a dimmed "$ " prompt and
+	// Catppuccin Yellow command foreground. Actual Tool Execution panels never
+	// pass through here (they use renderExecutionFrame), so this branch cannot
+	// touch them.
+	if isShellLang(lang) {
+		return renderShellSnippetToLines(codeLines, wrapWidth)
+	}
 	outerGutter := "│ "
 	outerCells := runewidth.StringWidth(ansi.Strip(outerGutter))
 	boxWidth := wrapWidth - outerCells
@@ -578,12 +617,12 @@ func renderCodeBlockToLines(lang string, codeLines []string, wrapWidth int) []Do
 	if lang != "" {
 		label := "─ " + lang + " "
 		labelCells := runewidth.StringWidth(label)
-		// ┌ + ─ + label + dashes + ┐  => total boxWidth
-		remaining := boxWidth - 1 - 1 - labelCells - 1
+		// ┌ + label + dashes + ┐  => total boxWidth ("┌─ go ──┐")
+		remaining := boxWidth - 2 - labelCells
 		if remaining < 0 {
 			remaining = 0
 		}
-		topBorder = "┌─" + label + strings.Repeat("─", remaining) + "┐"
+		topBorder = "┌" + label + strings.Repeat("─", remaining) + "┐"
 	} else {
 		topBorder = "┌" + strings.Repeat("─", boxWidth-2) + "┐"
 	}
@@ -658,6 +697,355 @@ func renderCodeBlockToLines(lang string, codeLines []string, wrapWidth int) []Do
 		RawText:     "",
 		RenderedStr: "\x1b[38;2;88;91;112m" + outerGutter + "\x1b[0m" + "\x1b[38;2;88;91;112m" + bottomBorder + "\x1b[0m",
 	})
+	return out
+}
+
+// renderShellSnippetToLines renders a shell/command snippet from response text
+// WITHOUT a framed box container. Each line is indented, prefixed with a dimmed
+// "$ " prompt (Overlay0 #6c7086), and the command string itself is painted with
+// Catppuccin Yellow (#f9e2af) 24-bit foreground. No background fill is applied.
+// The outer AI gutter ("│ ") is kept for consistent cell geometry.
+func renderShellSnippetToLines(codeLines []string, wrapWidth int) []DocumentLine {
+	outerGutter := "│ "
+	outerCells := runewidth.StringWidth(ansi.Strip(outerGutter))
+	indent := "  "
+	indentCells := runewidth.StringWidth(indent)
+	prompt := "$ "
+	promptCells := runewidth.StringWidth(prompt)
+	prefixCells := outerCells + indentCells + promptCells
+	innerWidth := wrapWidth - prefixCells
+	if innerWidth < 10 {
+		innerWidth = 10
+	}
+	const (
+		gutterFg = "\x1b[38;2;88;91;112m"   // #585b70
+		promptFg = "\x1b[38;2;108;112;134m" // #6c7086 dimmed prompt
+		reset    = "\x1b[0m"
+	)
+	var out []DocumentLine
+	for _, rawLine := range codeLines {
+		if strings.TrimSpace(rawLine) == "" {
+			rendered := gutterFg + outerGutter + reset + indent + strings.Repeat(" ", promptCells) + reset
+			out = append(out, DocumentLine{
+				Spans: []RenderSpan{
+					{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false},
+					{StartCell: outerCells, EndCell: outerCells + indentCells, SourceStart: 0, SourceEnd: 0, Selectable: false},
+				},
+				RawText:     "",
+				RenderedStr: rendered,
+			})
+			continue
+		}
+		wrapped := wrapForContentWidth(rawLine, innerWidth)
+		if len(wrapped) == 0 {
+			wrapped = []string{rawLine}
+		}
+		for wi, piece := range wrapped {
+			cmd := shellColorCommand(piece)
+			cmdCells := runewidth.StringWidth(piece)
+			padding := ""
+			if cmdCells < innerWidth {
+				padding = strings.Repeat(" ", innerWidth-cmdCells)
+			}
+			cmdStart := outerCells + indentCells + promptCells
+			spanCmd := RenderSpan{StartCell: cmdStart, EndCell: cmdStart + cmdCells, SourceStart: 0, SourceEnd: len([]rune(piece)), Selectable: true}
+			if wi == 0 {
+				rendered := gutterFg + outerGutter + reset + indent + promptFg + prompt + reset + cmd + padding + reset
+				out = append(out, DocumentLine{
+					Spans: []RenderSpan{
+						{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false},
+						{StartCell: outerCells, EndCell: cmdStart, SourceStart: 0, SourceEnd: 0, Selectable: false},
+						spanCmd,
+					},
+					RawText:     piece,
+					RenderedStr: rendered,
+				})
+			} else {
+				contIndent := strings.Repeat(" ", indentCells+promptCells)
+				rendered := gutterFg + outerGutter + reset + contIndent + cmd + padding + reset
+				out = append(out, DocumentLine{
+					Spans: []RenderSpan{
+						{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false},
+						{StartCell: outerCells, EndCell: cmdStart, SourceStart: 0, SourceEnd: 0, Selectable: false},
+						spanCmd,
+					},
+					RawText:     piece,
+					RenderedStr: rendered,
+				})
+			}
+		}
+	}
+	return out
+}
+
+// shellColorCommand styles one shell command piece. Standard commands render in
+// Catppuccin Yellow (#f9e2af); full-line and inline comments render in
+// Catppuccin Green (#a6e3a1). An inline comment is the first '#' preceded by
+// whitespace, so '#' inside quoted arguments or URLs is left as command text.
+func shellColorCommand(piece string) string {
+	const (
+		cmdYellow = "\x1b[38;2;249;226;175m" // #f9e2af Catppuccin Yellow
+		cmdGreen  = "\x1b[38;2;166;227;161m" // #a6e3a1 Catppuccin Green
+		reset     = "\x1b[0m"
+	)
+	if strings.HasPrefix(strings.TrimSpace(piece), "#") {
+		return cmdGreen + piece + reset
+	}
+	idx := -1
+	for i := 0; i < len(piece); i++ {
+		if piece[i] == '#' && i > 0 && (piece[i-1] == ' ' || piece[i-1] == '\t') {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return cmdYellow + piece + reset
+	}
+	return cmdYellow + piece[:idx] + reset + cmdGreen + piece[idx:] + reset
+}
+
+// isTableRowLine reports whether a trimmed line is a pipe-delimited markdown
+// table row: it must start with '|' and contain at least one further '|'.
+func isTableRowLine(trimmed string) bool {
+	if !strings.HasPrefix(trimmed, "|") {
+		return false
+	}
+	return strings.Contains(strings.TrimPrefix(trimmed, "|"), "|")
+}
+
+// splitTableRowCells splits one pipe-delimited row into its cells, dropping the
+// leading/trailing pipes and trimming each cell.
+func splitTableRowCells(rl string) []string {
+	s := strings.TrimSpace(rl)
+	s = strings.TrimPrefix(s, "|")
+	s = strings.TrimSuffix(s, "|")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, "|")
+	cells := make([]string, 0, len(parts))
+	for _, p := range parts {
+		cells = append(cells, strings.TrimSpace(p))
+	}
+	return cells
+}
+
+// isTableSepCell reports whether a cell is a GFM header separator fragment
+// (e.g. "---", ":---", "---:", ":---:").
+func isTableSepCell(c string) bool {
+	if c == "" {
+		return false
+	}
+	c = strings.TrimLeft(c, ":")
+	c = strings.TrimRight(c, ":")
+	return c != "" && strings.Trim(c, "-") == ""
+}
+
+// renderTableCell renders a single table cell's inline markdown (code, bold)
+// with background codes stripped so the native terminal background shows
+// through.
+func renderTableCell(cell string) string {
+	if strings.TrimSpace(cell) == "" {
+		return ""
+	}
+	rendered := applyInlineStyles(cell)
+	if strings.Contains(rendered, "48;2;") {
+		rendered = stripBackgroundANSI(rendered)
+	}
+	return rendered
+}
+
+// renderMarkdownTableToLines renders a buffered pipe-delimited markdown table
+// as a structured Unicode box grid:
+//
+//	┌─────────┬─────────┐
+//	│ Col1    │ Col2    │
+//	├─────────┼─────────┤
+//	│ A       │ B       │
+//	└─────────┴─────────┘
+//
+// Column widths are the maximum visual cell width across the header and all
+// body rows. Borders use #585b70 (38;2;88;91;112), header titles are bold
+// Catppuccin Green (#a6e3a1), and no background fill is ever applied.
+func renderMarkdownTableToLines(rows []string, wrapWidth int) []DocumentLine {
+	type parsedRow struct {
+		isSep bool
+		cells []string
+	}
+	var parsed = make([]parsedRow, 0, len(rows))
+	for _, rl := range rows {
+		cells := splitTableRowCells(rl)
+		isSep := true
+		for _, c := range cells {
+			if !isTableSepCell(c) {
+				isSep = false
+				break
+			}
+		}
+		parsed = append(parsed, parsedRow{isSep: isSep, cells: cells})
+	}
+
+	var headerCells []string
+	var bodyRows [][]string
+	sepSeen := false
+	hasSep := false
+	for _, pr := range parsed {
+		if pr.isSep {
+			if !sepSeen {
+				sepSeen = true
+				hasSep = true
+			}
+			continue
+		}
+		if !sepSeen {
+			headerCells = pr.cells
+		} else {
+			bodyRows = append(bodyRows, pr.cells)
+		}
+	}
+	if !hasSep {
+		headerCells = nil
+		bodyRows = nil
+		for _, pr := range parsed {
+			if !pr.isSep {
+				bodyRows = append(bodyRows, pr.cells)
+			}
+		}
+	}
+
+	ncols := len(headerCells)
+	for _, row := range bodyRows {
+		if len(row) > ncols {
+			ncols = len(row)
+		}
+	}
+	if ncols == 0 {
+		return nil
+	}
+
+	colWidths := make([]int, ncols)
+	renderHeader := make([]string, len(headerCells))
+	for i, c := range headerCells {
+		renderHeader[i] = renderTableCell(c)
+		if i < ncols {
+			if w := ansi.StringWidth(renderHeader[i]); w > colWidths[i] {
+				colWidths[i] = w
+			}
+		}
+	}
+	renderBody := make([][]string, len(bodyRows))
+	for ri, row := range bodyRows {
+		renderBody[ri] = make([]string, len(row))
+		for ci, c := range row {
+			renderBody[ri][ci] = renderTableCell(c)
+			if ci < ncols {
+				if w := ansi.StringWidth(renderBody[ri][ci]); w > colWidths[ci] {
+					colWidths[ci] = w
+				}
+			}
+		}
+	}
+	for i := range colWidths {
+		if colWidths[i] < 3 {
+			colWidths[i] = 3
+		}
+	}
+
+	const (
+		borderFg = "\x1b[38;2;88;91;112m"     // #585b70
+		headerFg = "\x1b[1;38;2;166;227;161m" // bold #a6e3a1
+		gutterFg = "\x1b[38;2;88;91;112m"
+		reset    = "\x1b[0m"
+	)
+	outerGutter := "│ "
+	outerCells := runewidth.StringWidth(outerGutter)
+
+	seg := make([]int, ncols)
+	totalWidth := 1
+	for i := range colWidths {
+		seg[i] = colWidths[i] + 2
+		totalWidth += seg[i]
+	}
+	totalWidth += ncols - 1
+	totalWidth += 1
+
+	horiz := func(left, mid, right string) string {
+		var b strings.Builder
+		b.WriteString(left)
+		for i := 0; i < ncols; i++ {
+			if i > 0 {
+				b.WriteString(mid)
+			}
+			b.WriteString(strings.Repeat("─", seg[i]))
+		}
+		b.WriteString(right)
+		return b.String()
+	}
+	topBorder := horiz("┌", "┬", "┐")
+	sepBorder := horiz("├", "┼", "┤")
+	botBorder := horiz("└", "┴", "┘")
+
+	rowLine := func(cells []string, isHeader bool) string {
+		var b strings.Builder
+		b.WriteString("│")
+		for i := 0; i < ncols; i++ {
+			content := ""
+			if i < len(cells) {
+				content = cells[i]
+			}
+			w := ansi.StringWidth(content)
+			pad := 0
+			if w < colWidths[i] {
+				pad = colWidths[i] - w
+			}
+			b.WriteString(" ")
+			if isHeader {
+				b.WriteString(headerFg + content + reset)
+			} else {
+				b.WriteString(content)
+			}
+			b.WriteString(strings.Repeat(" ", pad))
+			b.WriteString(" │")
+		}
+		return b.String()
+	}
+
+	borderLine := func(border string) DocumentLine {
+		return DocumentLine{
+			Spans: []RenderSpan{
+				{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false},
+				{StartCell: outerCells, EndCell: outerCells + totalWidth, SourceStart: 0, SourceEnd: 0, Selectable: false},
+			},
+			RawText:     "",
+			RenderedStr: gutterFg + outerGutter + reset + borderFg + border + reset,
+		}
+	}
+
+	contentLine := func(cells []string, isHeader bool) DocumentLine {
+		rendered := rowLine(cells, isHeader)
+		raw := ansi.Strip(rendered)
+		return DocumentLine{
+			Spans: []RenderSpan{
+				{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false},
+				{StartCell: outerCells, EndCell: outerCells + totalWidth, SourceStart: 0, SourceEnd: len([]rune(raw)), Selectable: true},
+			},
+			RawText:     raw,
+			RenderedStr: gutterFg + outerGutter + reset + rendered,
+		}
+	}
+
+	out := []DocumentLine{borderLine(topBorder)}
+	if len(renderHeader) > 0 {
+		out = append(out, contentLine(renderHeader, true))
+	}
+	if hasSep {
+		out = append(out, borderLine(sepBorder))
+	}
+	for _, rc := range renderBody {
+		out = append(out, contentLine(rc, false))
+	}
+	out = append(out, borderLine(botBorder))
 	return out
 }
 
