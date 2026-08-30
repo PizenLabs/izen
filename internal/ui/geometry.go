@@ -33,7 +33,7 @@ func (m *model) viewportGeometry() ViewportGeometry {
 	headerView := renderFixedHeader(m.runtimeCtx, m.workflowSM, width, m.indexingStatus)
 	headerLines := countLines(headerView)
 
-	footerView := renderFixedFooter(m.runtimeCtx, m.uiNotice, width)
+	footerView := renderFixedFooter(m.runtimeCtx, m.resolver.Current(), m.uiNotice, width)
 	footerLines := countLines(footerView)
 
 	// Input + status + proposal heights use the same helpers as assembleScreen.
