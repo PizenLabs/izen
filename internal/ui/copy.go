@@ -70,6 +70,11 @@ func SerializeTranscript(records []record) string {
 	return b.String()
 }
 
+// normalizeCopiedText guarantees clipboard output is plain text without ANSI.
+func normalizeCopiedText(s string) string {
+	return ansi.Strip(s)
+}
+
 // handleCopy executes the /copy command: serializes the complete canonical
 // transcript and writes it to the system clipboard.
 //
@@ -77,7 +82,7 @@ func SerializeTranscript(records []record) string {
 // surfaces a transient footer notice on success or failure without inserting a
 // permanent record (so the notice is never recursively copied).
 func (m *model) handleCopy() {
-	serialized := SerializeTranscript(m.records)
+	serialized := normalizeCopiedText(SerializeTranscript(m.records))
 	if strings.TrimSpace(serialized) == "" {
 		m.setToast("Nothing to copy — conversation is empty")
 		return

@@ -569,6 +569,8 @@ func buildDocumentLayoutWithTurns(records []record, wrapWidth int, username stri
 		}
 	}
 
+	lines = dropEngineTraceLinesWhenQuiet(lines)
+
 	return DocumentLayout{
 		Lines:               lines,
 		width:               wrapWidth,
@@ -1860,6 +1862,12 @@ func IncrementalLayoutUpdate(prev *DocumentLayout, records []record, wrapWidth i
 	if wrapWidth < 20 {
 		wrapWidth = 20
 	}
+	// Strict quiet-mode invariant: once trace verbosity is collapsed, no
+	// previously built EngineTrace rows are allowed to survive in incremental
+	// output, even if the previous layout was created in verbose mode.
+	if !TraceVerbose && hasEngineTraceLines(prev.Lines) {
+		return buildDocumentLayout(records, wrapWidth, uname, prev.traceSummaryEmitted)
+	}
 	if prev.width != wrapWidth {
 		// Width changed: full rebuild, but preserve the per-turn trace-summary
 		// dedup so a width resize mid-turn can never duplicate "▸ Trace:".
@@ -1987,4 +1995,28 @@ func mergeRenderedTurns(a, b map[uint64]bool) map[uint64]bool {
 		}
 	}
 	return out
+}
+
+func hasEngineTraceLines(lines []DocumentLine) bool {
+	for _, l := range lines {
+		if l.Kind == LineKindEngineTrace {
+			return true
+		}
+	}
+	return false
+}
+
+func dropEngineTraceLinesWhenQuiet(lines []DocumentLine) []DocumentLine {
+	if TraceVerbose || len(lines) == 0 {
+		return lines
+	}
+	filtered := make([]DocumentLine, 0, len(lines))
+	for _, l := range lines {
+		if l.Kind == LineKindEngineTrace {
+			continue
+		}
+		l.GlobalY = len(filtered)
+		filtered = append(filtered, l)
+	}
+	return filtered
 }

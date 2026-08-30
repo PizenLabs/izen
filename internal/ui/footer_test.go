@@ -15,8 +15,8 @@ import (
 func stripANSIFooter(s string) string { return stripANSITest(s) }
 
 // TestFooterFreshLaunchState pins the FRESH LAUNCH state: before any prompt has
-// been submitted the footer shows the clean startup hint — model alias, trace
-// toggle and help — with NO token counters, cost metrics or zero-value
+// been submitted the footer shows the clean startup hint — model alias and
+// help — with NO token counters, cost metrics or zero-value
 // indicators.
 func TestFooterFreshLaunchState(t *testing.T) {
 	m := readyChatModel(newTestModel())
@@ -24,7 +24,7 @@ func TestFooterFreshLaunchState(t *testing.T) {
 
 	footer := stripANSIFooter(m.renderFixedFooter(width, nil))
 
-	for _, want := range []string{"qwen2.5-coder:7b", "Alt+E trace", "Ctrl+H help"} {
+	for _, want := range []string{"qwen2.5-coder:7b", "Ctrl+H help"} {
 		if !strings.Contains(footer, want) {
 			t.Errorf("fresh-launch footer missing %q:\n%q", want, footer)
 		}
@@ -80,7 +80,7 @@ func TestFooterExecutingStateLiveBar(t *testing.T) {
 
 // TestFooterActiveIdleState pins the ACTIVE SESSION IDLE state: after prompts
 // have run the footer shows persistent refined telemetry anchored on the model
-// name (<Model> · ↓in + ↑out tok (pct%) · <Cost> · Alt+E trace) WITHOUT any
+// name (<Model> · ↓in + ↑out tok (pct%) · <Cost>) WITHOUT any
 // stale execution controls ('Ctrl+C interrupt', '⏸') or a mode badge.
 func TestFooterActiveIdleState(t *testing.T) {
 	m := readyChatModel(newTestModel())
@@ -102,7 +102,6 @@ func TestFooterActiveIdleState(t *testing.T) {
 		"↓2.9k + ↑2.0k tok", // in + out usage split
 		"(", "%)",           // context percentage
 		"$0.0123", // accumulated cost
-		"Alt+E trace",
 	} {
 		if !strings.Contains(footer, want) {
 			t.Errorf("active-idle footer missing %q:\n%q", want, footer)
@@ -176,7 +175,7 @@ func TestFooterCompletedStateRevertsToIdle(t *testing.T) {
 		}
 	}
 	// Fresh-launch (no prompts run yet): clean startup hint returns.
-	if !strings.Contains(idle, "Alt+E trace") {
+	if !strings.Contains(idle, "Ctrl+H help") {
 		t.Errorf("completed footer missing fresh-launch hint:\n%q", idle)
 	}
 	if strings.Contains(idle, "\n") {
@@ -215,9 +214,9 @@ func TestFooterIdleChipsRightAligned(t *testing.T) {
 	if !strings.Contains(stripped, "Approve Plan") {
 		t.Errorf("active-idle footer missing capability chip:\n%q", stripped)
 	}
-	// Base idle hint must survive alongside the chip.
-	if !strings.Contains(stripped, "Alt+E trace") {
-		t.Errorf("active-idle footer lost trace hint with chips:\n%q", stripped)
+	// Base idle telemetry must survive alongside the chip.
+	if !strings.Contains(stripped, "tok (") {
+		t.Errorf("active-idle footer lost telemetry with chips:\n%q", stripped)
 	}
 	if strings.Contains(stripped, "\n") {
 		t.Errorf("chips wrapped the footer to a second row:\n%q", stripped)

@@ -746,6 +746,9 @@ type model struct {
 	traceBuffer strings.Builder
 	// traceExpanded is the Ctrl+O expansion state of the output-trace viewport.
 	traceExpanded bool
+	// traceVerbose is the model-local verbosity toggle mirrored into the
+	// package-level TraceVerbose flag used by layout/stream renderers.
+	traceVerbose bool
 	// traceWindowStart anchors the output-trace window while the trace is
 	// expanded and streaming: it is frozen once anchored so new chunks never
 	// slide the inspected lines out from under the user (the Ctrl+O viewport
@@ -971,7 +974,7 @@ type model struct {
 	// sessionHasRunPrompts marks whether the user has submitted at least one
 	// prompt this session. It drives the footer's Fresh-Launch vs Active-Session
 	// IDLE states: before the first submission the footer shows the clean
-	// startup hint (`<model> · Alt+E trace · Ctrl+H help`); afterwards it shows
+	// startup hint (`<model> · Ctrl+H help`); afterwards it shows
 	// the persistent usage telemetry. Never reset by /clear (session-durable).
 	sessionHasRunPrompts bool
 
@@ -4003,18 +4006,9 @@ func (m *model) applySelectionToLine(idx int, rendered string) string {
 		contentEndCell = 0
 	}
 	if contentStartCell <= contentEndCell && lineCells > 0 {
-		startRune := cellToRuneIdxRunes([]rune(raw), contentStartCell)
-		endRuneEx := cellToRuneIdxRunes([]rune(raw), contentEndCell+1)
-		endRune := endRuneEx - 1
-		if startRune < 0 {
-			startRune = 0
-		}
-		if endRune >= len([]rune(raw)) {
-			endRune = len([]rune(raw)) - 1
-		}
-		if startRune <= endRune && startRune < len([]rune(raw)) {
-			rendered = injectStyleRange(rendered, startRune, endRune, viSelectionBgStyle)
-		}
+		// Use visual-cell highlighting directly on the ANSI-rendered line so
+		// viewport highlight and copied extraction share the same coordinates.
+		rendered = injectHighlightByCells(rendered, startCell, endCell, "\x1b[48;2;42;34;64m")
 	}
 	return rendered
 }
