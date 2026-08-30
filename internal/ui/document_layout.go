@@ -77,10 +77,8 @@ func (d *DocumentLayout) ScreenToGlobal(screenX, screenY, yOffset, leftMargin, t
 		if globalY < 0 {
 			globalY = 0
 		}
-	} else {
-		if globalY < 0 {
-			globalY = 0
-		}
+	} else if globalY < 0 {
+		globalY = 0
 	}
 	return GlobalPos{Y: globalY, X: relX}
 }
@@ -163,16 +161,17 @@ func (d *DocumentLayout) ExtractText(start, end GlobalPos) string {
 		if raw == "" && line.RenderedStr != "" {
 			raw = ansi.Strip(line.RenderedStr)
 		}
-		if s.Y == e.Y {
+		switch {
+		case s.Y == e.Y:
 			// Single line: slice between s.X and e.X inclusive
 			b.WriteString(sliceByCells(raw, s.X, e.X+1, line.Spans))
-		} else if y == s.Y {
+		case y == s.Y:
 			// First line: from s.X to end of line
 			b.WriteString(sliceByCells(raw, s.X, -1, line.Spans))
-		} else if y == e.Y {
+		case y == e.Y:
 			// Last line: from 0 to e.X inclusive
 			b.WriteString(sliceByCells(raw, 0, e.X+1, line.Spans))
-		} else {
+		default:
 			// Middle lines: full line
 			b.WriteString(raw)
 		}

@@ -344,79 +344,6 @@ func BuildDocumentLayoutWithChrome(chromeLines []string, records []record, wrapW
 	}
 }
 
-// renderRecordForLayout mirrors renderRecordForViewport but returns rendered string
-// without requiring a model instance. It uses sanitizeText already applied.
-func renderRecordForLayout(rec record, text string, width int, username ...string) string {
-	var uname string
-	if len(username) > 0 {
-		uname = username[0]
-	}
-	// For layout building we need to simulate same wrapping as renderRecordForViewport.
-	// We delegate to a lightweight version that uses the same pipeline.
-	// To avoid importing model methods, we replicate logic inline.
-	wrapWidth := width - 4
-	if wrapWidth < 20 {
-		wrapWidth = 20
-	}
-	switch rec.role {
-	case roleUser:
-		displayName := config.SanitizeUsername(uname)
-		headerPlain := "@" + displayName + "  "
-		headerRendered := dimmedStyle.Render(headerPlain)
-		lines := strings.Split(text, "\n")
-		var out []string
-		for i, l := range lines {
-			if i == 0 {
-				out = append(out, headerRendered+userBgStyle.Render(" "+l))
-			} else {
-				out = append(out, wrapIndentedLine(l, wrapWidth)...)
-			}
-		}
-		return strings.Join(out, "\n")
-	case roleAI:
-		// Use deterministic pipeline that handles markdown/code blocks, then add outer gutter "│ "
-		// to match renderStreamingContent's gutter for accurate cell geometry.
-		pipeline := RenderDeterministicPipeline(text, width, false)
-		lines := strings.Split(pipeline, "\n")
-		for i, l := range lines {
-			trimmed := strings.TrimSpace(l)
-			if trimmed == "" {
-				// Preserve empty line as gutter-only
-				lines[i] = "│ "
-				continue
-			}
-			if strings.HasPrefix(strings.TrimLeft(l, " "), "│") {
-				// Already has gutter (code block lines)
-				continue
-			}
-			lines[i] = "│ " + l
-		}
-		return strings.Join(lines, "\n")
-	default:
-		var b strings.Builder
-		for _, srcLine := range strings.Split(text, "\n") {
-			wrapped := wrapIndentedLine(srcLine, wrapWidth)
-			for i, wl := range wrapped {
-				b.WriteString(wl)
-				if i < len(wrapped)-1 || srcLine != strings.Split(text, "\n")[len(strings.Split(text, "\n"))-1] {
-					// Add newline between wrapped parts and logical lines
-					// We'll handle outer join
-					b.WriteString("\n")
-				}
-			}
-		}
-		s := b.String()
-		// Trim trailing newline added by loop
-		s = strings.TrimSuffix(s, "\n")
-		// Re-split to ensure per-logical-line wrapping preserved correctly
-		// Fallback to simple re-wrap if empty
-		if s == "" {
-			return text
-		}
-		return s
-	}
-}
-
 // ── Unified Markdown / ANSI rendering engine ──────────────────────────────────
 // renderAIBlockLines converts a markdown/text AI record into physical
 // DocumentLines with Catppuccin Mocha ANSI styling. It is the SINGLE unified
@@ -866,6 +793,7 @@ func renderTableCell(cell string) string {
 //   - Case-insensitive keyword
 //   - Separators: colon `:`, hyphens/dashes `-`, `–`, `—` with optional spaces,
 //     or standalone trailing space/EOL.
+//
 // The matched keyword and its trailing delimiter (e.g. `Summary -` or `Summary:`)
 // receive the Blue ANSI, remainder resets to standard style.
 func highlightKeyHeaders(line string) string {
@@ -874,9 +802,10 @@ func highlightKeyHeaders(line string) string {
 		return ""
 	}
 	// ── Strip optional leading bullet or heading ─────────────────────
-	core := trimmed
+	var core string
 	hadBullet := false
-	if strings.HasPrefix(trimmed, "#") {
+	switch {
+	case strings.HasPrefix(trimmed, "#"):
 		i := 0
 		for i < len(trimmed) && trimmed[i] == '#' {
 			i++
@@ -886,7 +815,7 @@ func highlightKeyHeaders(line string) string {
 		} else {
 			core = trimmed
 		}
-	} else if len(trimmed) >= 2 && (trimmed[0] == '-' || trimmed[0] == '*' || trimmed[0] == '+') && (trimmed[1] == ' ' || trimmed[1] == '\t') {
+	case len(trimmed) >= 2 && (trimmed[0] == '-' || trimmed[0] == '*' || trimmed[0] == '+') && (trimmed[1] == ' ' || trimmed[1] == '\t'):
 		// Bullet: "- ", "* ", "+ " with any trailing spaces
 		hadBullet = true
 		j := 1
@@ -894,7 +823,7 @@ func highlightKeyHeaders(line string) string {
 			j++
 		}
 		core = strings.TrimSpace(trimmed[j:])
-	} else {
+	default:
 		core = trimmed
 	}
 	_ = hadBullet
@@ -922,19 +851,18 @@ func highlightKeyHeaders(line string) string {
 		matchedRaw := norm[:len(kw)]
 		restOrig := norm[len(kw):]
 		// Handle optional closing bold immediately after keyword (e.g. **Follow-up**)
-		if strings.HasPrefix(restOrig, "**") {
-			restOrig = restOrig[2:]
-		}
+		restOrig = strings.TrimPrefix(restOrig, "**")
 		restTrim := strings.TrimLeft(restOrig, " \t")
 		// Validate delimiter: colon, dash variants, space, or EOL
 		valid := false
-		if restOrig == "" || strings.TrimSpace(restOrig) == "" {
+		switch {
+		case restOrig == "" || strings.TrimSpace(restOrig) == "":
 			valid = true
-		} else if strings.HasPrefix(restTrim, ":") {
+		case strings.HasPrefix(restTrim, ":"):
 			valid = true
-		} else if strings.HasPrefix(restTrim, "-") || strings.HasPrefix(restTrim, "–") || strings.HasPrefix(restTrim, "—") {
+		case strings.HasPrefix(restTrim, "-") || strings.HasPrefix(restTrim, "–") || strings.HasPrefix(restTrim, "—"):
 			valid = true
-		} else if strings.HasPrefix(restOrig, " ") || strings.HasPrefix(restOrig, "\t") {
+		case strings.HasPrefix(restOrig, " ") || strings.HasPrefix(restOrig, "\t"):
 			valid = true
 		}
 		if !valid {
@@ -957,25 +885,27 @@ func highlightKeyHeaders(line string) string {
 	// Determine delimiter to include in blue prefix.
 	restTrimForDelim := strings.TrimLeft(restOrig, " \t")
 	var remainder string
-	if strings.HasPrefix(restTrimForDelim, ":") {
+	switch {
+	case strings.HasPrefix(restTrimForDelim, ":"):
 		prefix += ":"
 		// remainder is after colon
 		afterColon := strings.TrimPrefix(restTrimForDelim, ":")
 		remainder = strings.TrimSpace(afterColon)
-	} else if strings.HasPrefix(restTrimForDelim, "-") || strings.HasPrefix(restTrimForDelim, "–") || strings.HasPrefix(restTrimForDelim, "—") {
+	case strings.HasPrefix(restTrimForDelim, "-") || strings.HasPrefix(restTrimForDelim, "–") || strings.HasPrefix(restTrimForDelim, "—"):
 		var dashStr string
-		if strings.HasPrefix(restTrimForDelim, "-") {
+		switch {
+		case strings.HasPrefix(restTrimForDelim, "-"):
 			dashStr = "-"
-		} else if strings.HasPrefix(restTrimForDelim, "–") {
+		case strings.HasPrefix(restTrimForDelim, "–"):
 			dashStr = "–"
-		} else if strings.HasPrefix(restTrimForDelim, "—") {
+		case strings.HasPrefix(restTrimForDelim, "—"):
 			dashStr = "—"
 		}
 		// Include dash with one surrounding space in blue (e.g. "Summary -" / "Summary —")
 		prefix = prefix + " " + dashStr
 		afterDash := strings.TrimPrefix(restTrimForDelim, dashStr)
 		remainder = strings.TrimSpace(afterDash)
-	} else {
+	default:
 		// No colon/dash, remainder is trimmed rest
 		remainder = strings.TrimSpace(restOrig)
 	}
@@ -1025,16 +955,18 @@ func highlightKeyHeaders(line string) string {
 //	└─────────┴─────────┘
 //
 // Responsive budgeting:
-//   W_i_nat = natural content width per column
-//   A = wrapWidth - outerGutter - (N_cols+1) - 2*N_cols  (available for content)
-//   T = sum W_i_nat
-//   IF T > A: allocated widths W_i_alloc use proportional scaling with
-//             minWidth floor (10 cells).
-//   ELSE: W_i_alloc = W_i_nat
+//
+//	W_i_nat = natural content width per column
+//	A = wrapWidth - outerGutter - (N_cols+1) - 2*N_cols  (available for content)
+//	T = sum W_i_nat
+//	IF T > A: allocated widths W_i_alloc use proportional scaling with
+//	          minWidth floor (10 cells).
+//	ELSE: W_i_alloc = W_i_nat
 //
 // Intra-cell wrapping:
-//   Each cell text is wrapped to W_i_alloc. A logical table row expands to
-//   K = max(lines in cell) visual lines with vertical borders "│" on every line.
+//
+//	Each cell text is wrapped to W_i_alloc. A logical table row expands to
+//	K = max(lines in cell) visual lines with vertical borders "│" on every line.
 func renderMarkdownTableToLines(rows []string, wrapWidth int) []DocumentLine {
 	if wrapWidth < 20 {
 		wrapWidth = 20
@@ -1406,10 +1338,6 @@ func renderMarkdownTableToLines(rows []string, wrapWidth int) []DocumentLine {
 	return out
 }
 
-// codeSurfaceBG is retained for backward compat but no longer used for code
-// containers — background fills are forbidden (native terminal background).
-const codeSurfaceBG = ""
-
 // stripBackgroundANSI removes any background color escapes (48;2;...) from an
 // ANSI string to preserve native transparent terminal backgrounds.
 func stripBackgroundANSI(s string) string {
@@ -1519,13 +1447,14 @@ func colorizeShellFallback(line string) string {
 		}
 		token := line[i:j]
 		var sgr string
-		if tokenIdx == 0 {
+		switch {
+		case tokenIdx == 0:
 			sgr = colCmd
-		} else if strings.HasPrefix(token, "-") {
+		case strings.HasPrefix(token, "-"):
 			sgr = colFlag
-		} else if strings.Contains(token, ".") || strings.Contains(token, "/") {
+		case strings.Contains(token, ".") || strings.Contains(token, "/"):
 			sgr = colArg
-		} else {
+		default:
 			// subcommand like "run", "build"
 			sgr = colFlag
 		}
@@ -1637,31 +1566,6 @@ func wrapForContentWidth(text string, maxWidth int) []string {
 	return wrapIndentedLine(text, maxWidth)
 }
 
-// splitGutterPrefix detects gutter prefix cells like "│ " and returns prefix cell count and content without prefix.
-// It handles AI outer gutter (2 cells) and code block inner gutter (additional 2).
-func splitGutterPrefix(stripped string) (prefixCells int, content string) {
-	trimmed := stripped
-	count := 0
-	for {
-		if strings.HasPrefix(trimmed, "│ ") {
-			count += 2
-			// "│ " is 3 bytes for │ plus 1 for space = 4 bytes
-			trimmed = strings.TrimPrefix(trimmed, "│ ")
-		} else if strings.HasPrefix(trimmed, "│") {
-			w := runewidth.RuneWidth('│')
-			count += w
-			trimmed = strings.TrimPrefix(trimmed, "│")
-			if strings.HasPrefix(trimmed, " ") {
-				count++
-				trimmed = strings.TrimPrefix(trimmed, " ")
-			}
-		} else {
-			break
-		}
-	}
-	return count, trimmed
-}
-
 // IncrementalLayoutUpdate appends or invalidates ONLY the trailing record/line
 // currently streaming. Returns updated layout. Full re-flattening is done only
 // when width changes or record count shrinks.
@@ -1731,7 +1635,9 @@ func IncrementalLayoutUpdate(prev *DocumentLayout, records []record, wrapWidth i
 					newRecLines.Lines[i].GlobalY = base + i
 					newRecLines.Lines[i].RecordIdx = origIdx
 				}
-				newLines := append(kept, newRecLines.Lines...)
+				newLines := make([]DocumentLine, 0, len(kept)+len(newRecLines.Lines))
+				newLines = append(newLines, kept...)
+				newLines = append(newLines, newRecLines.Lines...)
 				return DocumentLayout{Lines: newLines, width: wrapWidth}
 			}
 		}

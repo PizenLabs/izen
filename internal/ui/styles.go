@@ -464,7 +464,6 @@ var (
 	// colours come from the chroma Catppuccin Mocha theme (green keywords
 	// #a6e3a1, blue identifiers #89b4fa).
 	mdCodeBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
-	mdCodeBgStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 
 	// Callout label styles per keyword
 	mdCalloutStyles = map[string]lipgloss.Style{

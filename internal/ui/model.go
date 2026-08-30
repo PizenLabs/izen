@@ -3939,11 +3939,12 @@ func (m *model) applySelectionToLine(idx int, rendered string) string {
 	startCell, endCell := 0, lineCells-1
 	isFirst := idx == s.Y
 	isLast := idx == e.Y
-	if s.Y == e.Y {
+	switch {
+	case s.Y == e.Y:
 		startCell, endCell = s.X, e.X
-	} else if isFirst {
+	case isFirst:
 		startCell = s.X
-	} else if isLast {
+	case isLast:
 		endCell = e.X
 	}
 	gutter := 0

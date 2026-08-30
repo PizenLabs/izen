@@ -29,12 +29,6 @@ type ViewportHitMap struct {
 	Rows    []RowLayout // length == viewport height (visible window)
 }
 
-// fullHitMap holds the complete physical row layout before windowing.
-// It is transient during refreshViewportContent and then sliced to YOffset window.
-type fullHitMap struct {
-	Rows []RowLayout // all physical rows including chrome prefix
-}
-
 // cellToRuneInString converts content cell offset to rune index within raw string s
 // starting at rune offset startIdx, using runewidth for CJK/emoji/wide safety.
 func cellToRuneInString(s string, startIdx int, contentCells int) int {
@@ -65,16 +59,6 @@ func cellToRuneInString(s string, startIdx int, contentCells int) int {
 // stripANSI returns plain text without ANSI escapes, without modifying content.
 func stripANSI(s string) string {
 	return ansi.Strip(s)
-}
-
-// logicalLineRuneLen returns visible rune length of a raw logical line (ANSI-stripped).
-func logicalLineRuneLen(rawLine string) int {
-	return len([]rune(stripANSI(rawLine)))
-}
-
-// contentCellWidth returns visible cell width of content string (ANSI-aware via lipgloss.Width).
-func contentCellWidth(s string) int {
-	return lipgloss.Width(s)
 }
 
 // countPhysicalRows returns number of physical rows in rendered string s.

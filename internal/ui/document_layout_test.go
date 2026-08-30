@@ -41,9 +41,6 @@ func TestDocumentLayout_SpaceAnchoredSelection(t *testing.T) {
 	// Simulate scroll down by 2
 	m.Viewport.YOffset = 2
 	// Anchor must remain unchanged
-	if m.mouseSel.Active {
-		// if selection active, anchor should be stable; test direct anchor stability via layout
-	}
 	if anchor.Y != startGlobal.Y || anchor.X != startGlobal.X {
 		t.Fatalf("anchor drift: was %v now %v", startGlobal, anchor)
 	}
@@ -150,7 +147,7 @@ func TestDocumentLayout_CrossBoundaryExtraction(t *testing.T) {
 		t.Fatalf("layout too small for cross-boundary: %d", dl.Len())
 	}
 	// Find Y for user prompt, code block, final AI
-	var userY, codeY, finalY int = -1, -1, -1
+	var userY, codeY, finalY = -1, -1, -1
 	for _, l := range dl.Lines {
 		if strings.Contains(l.RawText, "user prompt") && userY == -1 {
 			userY = l.GlobalY
@@ -302,16 +299,15 @@ func TestDocumentLayout_DynamicUsernameBadge(t *testing.T) {
 
 func TestDocumentLayout_AutoScrollBottomBoundary(t *testing.T) {
 	// Multi-record document with many lines to test auto-scroll to bottom
-	records := make([]record, 20)
-	for i := range records {
-		records[i] = record{role: roleAI, text: "line content number " + strings.Repeat("word ", 5)}
+	records := make([]record, 0, 21)
+	for i := 0; i < 20; i++ {
+		records = append(records, record{role: roleAI, text: "line content number " + strings.Repeat("word ", 5)})
 	}
 	width := 40
-	dl := BuildDocumentLayout(records, width, "")
 	// Find a line containing "[POLICY]" to simulate bottom policy line
 	policyRec := record{role: roleAI, text: "[POLICY] This is the final policy line at the very bottom of document for testing bottom boundary handling"}
 	records = append(records, policyRec)
-	dl = BuildDocumentLayout(records, width, "")
+	dl := BuildDocumentLayout(records, width, "")
 	m := newTestModel()
 	m.width = width
 	m.height = 24
@@ -558,9 +554,9 @@ func TestDocumentLayout_StreamingTailLock(t *testing.T) {
 func TestDocumentLayout_AutoScrollToAbsoluteBottom(t *testing.T) {
 	width := 40
 	height := 5
-	records := make([]record, 20)
-	for i := range records {
-		records[i] = record{role: roleAI, text: "line content number " + strings.Repeat("word ", 5)}
+	records := make([]record, 0, 21)
+	for i := 0; i < 20; i++ {
+		records = append(records, record{role: roleAI, text: "line content number " + strings.Repeat("word ", 5)})
 	}
 	policyRec := record{role: roleAI, text: "[POLICY] This is the final policy line at the very bottom of document for testing bottom boundary handling"}
 	records = append(records, policyRec)

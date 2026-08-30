@@ -398,7 +398,7 @@ func (m *model) renderStreamingContent(content string, width int) string {
 
 	// Content width = terminal width − left/right padding with strict 2-cell safety.
 	// Requirement: availableWidth = viewport.Width - 4 prevents right-edge word clipping.
-	content = ensurePreflightDelimiter(content)
+	_ = ensurePreflightDelimiter(content)
 	availableWidth := width - 4
 	if availableWidth <= 0 {
 		availableWidth = 80
