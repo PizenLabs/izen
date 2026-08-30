@@ -125,7 +125,7 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 
 	// ── Fixed Header / Footer (authoritative geometry source) ──
 	headerView := renderFixedHeader(m.runtimeCtx, m.workflowSM, width, m.indexingStatus)
-	footerView := renderFixedFooter(m.runtimeCtx, m.uiNotice, width)
+	footerView := renderFixedFooter(m.runtimeCtx, m.resolver.Current(), m.uiNotice, width)
 
 	// ── Input region: autocomplete + separators + prompt ──
 	var inputView strings.Builder

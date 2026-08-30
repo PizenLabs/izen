@@ -1,10 +1,34 @@
 package ui
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/x/ansi"
 )
+
+// orderedListPrefixRe matches an ordered-list marker at the start of a line:
+// optional indentation, one or more digits, a period, then whitespace
+// (^\s*\d+\.\s+). Unlike the legacy single-digit "N. " probe, it correctly
+// recognises multi-digit and indented items so their content is ALWAYS routed
+// through the inline markdown pipeline instead of leaking raw "N." markers.
+var orderedListPrefixRe = regexp.MustCompile(`^\s*\d+\.\s+`)
+
+// splitOrderedList splits a line into its ordered-list marker (e.g. "1.") and
+// the content following it. Returns ok=false when the line is not an
+// ordered-list item.
+func splitOrderedList(line string) (marker, content string, ok bool) {
+	loc := orderedListPrefixRe.FindStringIndex(line)
+	if loc == nil {
+		return "", "", false
+	}
+	end := loc[1]
+	dot := strings.Index(line[:end], ".")
+	if dot < 0 {
+		return "", "", false
+	}
+	return line[:dot+1], strings.TrimSpace(line[end:]), true
+}
 
 type LexerState int
 
@@ -148,10 +172,8 @@ func (p *IncrementalStreamParser) processTextLine(line string) string {
 		return mdBulletStyle.Render(Icon.Bullet) + " " + applyInlineStyles(content)
 	}
 
-	if len(trimmed) > 2 && trimmed[0] >= '0' && trimmed[0] <= '9' && trimmed[1] == '.' && trimmed[2] == ' ' {
-		prefix := trimmed[:2]
-		content := strings.TrimSpace(trimmed[3:])
-		return mdBulletStyle.Render(prefix) + " " + applyInlineStyles(content)
+	if marker, content, ok := splitOrderedList(trimmed); ok {
+		return mdBulletStyle.Render(marker) + " " + applyInlineStyles(content)
 	}
 
 	if strings.HasPrefix(trimmed, "- [ ]") {
@@ -346,8 +368,18 @@ func parseInlineSegments(line string) []inlineSegment {
 				}
 			}
 			if end >= start {
-				segs = append(segs, inlineSegment{text: string(runes[start:end]), style: segBold})
-				i = end + 2
+				text := string(runes[start:end])
+				advance := end + 2
+				// `**Bold:**` — a closing `**` immediately followed by a colon
+				// keeps the colon inside the bold segment (pattern
+				// \*\*([^*]+)\*\*:) so "Text:" renders as ONE bold unit with
+				// zero `**` residue and no ANSI gap before the colon.
+				if advance < n && runes[advance] == ':' {
+					text += ":"
+					advance++
+				}
+				segs = append(segs, inlineSegment{text: text, style: segBold})
+				i = advance
 				continue
 			}
 			// No closing **: emit opening ** as plain text and advance

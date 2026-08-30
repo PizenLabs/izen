@@ -166,10 +166,8 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 		return mdBulletStyle.Render(Icon.Bullet) + " " + applyInlineStyles(content)
 	}
 
-	if len(trimmed) > 2 && trimmed[0] >= '0' && trimmed[0] <= '9' && trimmed[1] == '.' && trimmed[2] == ' ' {
-		prefix := trimmed[:2]
-		content := strings.TrimSpace(trimmed[3:])
-		return mdBulletStyle.Render(prefix) + " " + applyInlineStyles(content)
+	if marker, content, ok := splitOrderedList(trimmed); ok {
+		return mdBulletStyle.Render(marker) + " " + applyInlineStyles(content)
 	}
 
 	if strings.HasPrefix(trimmed, "- [ ]") {
