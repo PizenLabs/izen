@@ -41,6 +41,54 @@ func RenderDeterministicPipeline(rawInput string, width int, isStreaming bool) s
 	if rawInput == "" {
 		return ""
 	}
+	// ── Quiet / Accordion Mode for Engine Logs ──────────────────────
+	// In non-verbose (quiet) mode, raw internal engine lines ([AUTONOMY
+	// DECISION], intent :, required :, workspace :, decision :, [preflight],
+	// [event], …) are suppressed and collapsed into the single subtle line
+	// `▸ Trace: direct_response (21ms) · Alt+E to toggle`. Verbose mode
+	// (TraceVerbose=true, toggled via Alt+E / Alt+V) restores the full logs.
+	if !TraceVerbose && isQuietTraceText(rawInput) {
+		split := strings.Split(rawInput, "\n")
+		var traceLines []string
+		var keepLines []string
+		for _, ll := range split {
+			if isQuietTraceText(ll) {
+				traceLines = append(traceLines, ll)
+			} else {
+				keepLines = append(keepLines, ll)
+			}
+		}
+		if len(traceLines) > 0 {
+			collapsed := buildQuietTraceLine(strings.Join(traceLines, "\n"))
+			// Preserve non-trace content after the collapsed trace line.
+			keep := strings.TrimSpace(strings.Join(keepLines, "\n"))
+			if keep != "" {
+				rawInput = collapsed + "\n" + keep
+			} else {
+				rawInput = collapsed
+			}
+		}
+	}
+	// ── Workflow Error Deduplication (stream path) ──────────────────
+	if isWorkflowErrorText(rawInput) {
+		// Deduplicate consecutive duplicate error lines within the same input.
+		split := strings.Split(rawInput, "\n")
+		seen := make(map[string]bool)
+		var filtered []string
+		for _, ll := range split {
+			if isWorkflowErrorText(ll) {
+				k := strings.ToLower(strings.TrimSpace(ll))
+				if seen[k] {
+					continue
+				}
+				seen[k] = true
+				filtered = append(filtered, workflowErrorRendered(ll))
+			} else {
+				filtered = append(filtered, ll)
+			}
+		}
+		rawInput = strings.Join(filtered, "\n")
+	}
 
 	var result strings.Builder
 
@@ -166,10 +214,8 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 		return mdBulletStyle.Render(Icon.Bullet) + " " + applyInlineStyles(content)
 	}
 
-	if len(trimmed) > 2 && trimmed[0] >= '0' && trimmed[0] <= '9' && trimmed[1] == '.' && trimmed[2] == ' ' {
-		prefix := trimmed[:2]
-		content := strings.TrimSpace(trimmed[3:])
-		return mdBulletStyle.Render(prefix) + " " + applyInlineStyles(content)
+	if marker, content, ok := splitOrderedList(trimmed); ok {
+		return mdBulletStyle.Render(marker) + " " + applyInlineStyles(content)
 	}
 
 	if strings.HasPrefix(trimmed, "- [ ]") {

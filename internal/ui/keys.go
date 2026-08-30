@@ -129,6 +129,31 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// ── GLOBAL: Alt+E / Alt+V toggles trace verbosity (quiet ↔ verbose) ──
+	// Quiet (default): raw internal engine lines ([AUTONOMY DECISION], intent :,
+	// required :, workspace :, decision :, [preflight], [event], …) collapse
+	// into the single subtle line
+	// `▸ Trace: direct_response (21ms) · Alt+E to toggle`.
+	// Verbose restores the full multiline logs. The toggle fires a Top Bar
+	// toast (Trace: EXPANDED / Trace: COLLAPSED), forces a full layout rebuild,
+	// and repaints the viewport immediately.
+	if msg.String() == "alt+e" || msg.String() == "alt+v" {
+		// Keep model-local and package-global verbosity in lockstep.
+		if m.traceVerbose != IsTraceVerbose() {
+			m.traceVerbose = IsTraceVerbose()
+		}
+		m.traceVerbose = !m.traceVerbose
+		SetTraceVerbose(m.traceVerbose)
+		verbose := m.traceVerbose
+		m.setToast(traceToggleToast(verbose))
+		m.rebuildDocumentLayout()
+		m.refreshViewportContent()
+		if m.Ready && !m.userIsScrollingUp {
+			m.followTail()
+		}
+		return m, nil
+	}
+
 	// ── GLOBAL: Ctrl+O toggles the active thought block ──────────────
 	// Expands/collapses the reasoning block for the currently active message
 	// (ThinkingBuffer). When no thought block is active, falls back to cycling
@@ -1038,6 +1063,16 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 
 	if userInput != "" {
 		m.currentPrompt = userInput
+		// First submission transitions the footer from Fresh-Launch to the
+		// Active-Session IDLE telemetry state.
+		m.sessionHasRunPrompts = true
+		m.currentTurnID++
+		// A new turn resets the per-turn trace-summary dedup: the next quiet
+		// "▸ Trace:" line (and exactly one) is emitted for THIS turn.
+		m.traceSummaryShown = false
+		if m.docLayout != nil {
+			m.docLayout.traceSummaryEmitted = false
+		}
 		if m.showBanner {
 			m.showBanner = false
 		}

@@ -8,6 +8,34 @@ import (
 	"github.com/mattn/go-runewidth"
 )
 
+// LineKind identifies the semantic category of a document line.
+type LineKind int
+
+const (
+	LineKindUserPrompt LineKind = iota
+	LineKindAIResponse
+	LineKindEngineTrace  // Internal logs, intents, phase changes, preflight
+	LineKindTraceSummary // Single "▸ Trace: ..." bar
+	LineKindSystemError  // State transition errors, execution failures
+)
+
+func (k LineKind) String() string {
+	switch k {
+	case LineKindUserPrompt:
+		return "UserPrompt"
+	case LineKindAIResponse:
+		return "AIResponse"
+	case LineKindEngineTrace:
+		return "EngineTrace"
+	case LineKindTraceSummary:
+		return "TraceSummary"
+	case LineKindSystemError:
+		return "SystemError"
+	default:
+		return "Unknown"
+	}
+}
+
 // GlobalPos is a physical row + visual cell coordinate in the flattened
 // rendered document (0-indexed, space-anchored).
 type GlobalPos struct {
@@ -28,6 +56,8 @@ type RenderSpan struct {
 // DocumentLine is one physical terminal row in global document space.
 type DocumentLine struct {
 	GlobalY     int          // Row index in global document space
+	Kind        LineKind     // Category of line for filtering and styling
+	TurnID      uint64       // Turn identifier for turn-bound operations
 	Spans       []RenderSpan // Cell spans for hit-testing and extraction
 	RawText     string       // Plain text string without ANSI codes
 	RenderedStr string       // ANSI-styled string for display
@@ -40,6 +70,12 @@ type DocumentLayout struct {
 	mu    sync.RWMutex
 	Lines []DocumentLine
 	width int // wrap width used to build layout
+	// traceSummaryEmitted reports whether this layout already carries the
+	// single per-turn quiet-mode "▸ Trace:" summary. It persists across
+	// IncrementalLayoutUpdate merges so a `▸ Trace:` line is NEVER repeated
+	// sequentially within a turn. Reset at each prompt submission.
+	traceSummaryEmitted bool
+	renderedTurns       map[uint64]bool
 }
 
 // Clone returns a shallow copy without copying the mutex.
@@ -48,7 +84,19 @@ func (d *DocumentLayout) Clone() DocumentLayout {
 	defer d.mu.RUnlock()
 	lines := make([]DocumentLine, len(d.Lines))
 	copy(lines, d.Lines)
-	return DocumentLayout{Lines: lines, width: d.width}
+	var renderedTurns map[uint64]bool
+	if d.renderedTurns != nil {
+		renderedTurns = make(map[uint64]bool, len(d.renderedTurns))
+		for k, v := range d.renderedTurns {
+			renderedTurns[k] = v
+		}
+	}
+	return DocumentLayout{
+		Lines:               lines,
+		width:               d.width,
+		traceSummaryEmitted: d.traceSummaryEmitted,
+		renderedTurns:       renderedTurns,
+	}
 }
 
 // ScreenToGlobal maps viewport-relative coordinates directly to GlobalPos.
@@ -228,6 +276,12 @@ func normalizeGlobalPos(a, b GlobalPos) (GlobalPos, GlobalPos) {
 // where endCell is exclusive and -1 means until end of line. It accounts for
 // CJK double-width runes via runewidth.RuneWidth and never splits a wide rune.
 func sliceByCells(s string, startCell, endCell int, spans []RenderSpan) string {
+	if s == "" {
+		return ""
+	}
+	// Selection coordinates are visual cell offsets on the rendered viewport.
+	// Strip ANSI first so escape sequences never skew cell-to-rune mapping.
+	s = ansi.Strip(s)
 	if s == "" {
 		return ""
 	}

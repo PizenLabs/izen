@@ -199,6 +199,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		tipProvider:         tips.Default(),
 		currentEffort:       EffortAuto,
 		plannerMu:           &sync.Mutex{},
+		traceVerbose:        IsTraceVerbose(),
 	}
 	if initStage == initIdentity {
 		m.initIdentityInput = textinput.New()

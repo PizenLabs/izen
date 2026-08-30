@@ -169,8 +169,8 @@ func TestPlanResultMsgReleasesStaleProcessingState(t *testing.T) {
 		t.Errorf("processing flags still set after planResultMsg: streaming=%v agent=%v planPending=%v",
 			m.streaming, m.agentRunning, m.planPending)
 	}
-	if m.uiNotice == "" || !strings.Contains(m.uiNotice, "Microkernel") {
-		t.Errorf("uiNotice = %q, want microkernel staging announcement", m.uiNotice)
+	if m.toast == "" || !strings.Contains(m.toast, "Microkernel") {
+		t.Errorf("toast = %q, want microkernel staging announcement", m.toast)
 	}
 }
 

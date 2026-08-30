@@ -70,15 +70,15 @@ func (m *model) View() string {
 // renderWorkspace is the ONLY rendering primitive. It projects a Workspace
 // onto the terminal with no awareness of mode, workflow, or UI logic.
 // The screen is partitioned into three vertical regions:
-//   - Fixed top region: Header (WorkflowState + CapabilitySet)
-//   - Scrollable middle region: Viewport + ProposalDock + Input + StatusBar
-//   - Fixed bottom region: Footer (Budget + notifications)
+//   - Fixed top region: Header (WorkflowState + toast overlay)
+//   - Scrollable middle region: Viewport + ProposalDock + Input
+//   - Fixed bottom region: Footer (single-line lifecycle bar)
 func renderWorkspace(ws Workspace) string {
 	if ws.Overlay != "" {
 		return ws.Overlay
 	}
 
-	// Build the scrollable content body (viewport + proposal + input + status).
+	// Build the scrollable content body (viewport + proposal + input).
 	var bodyParts []string
 	if ws.Viewport != "" {
 		bodyParts = append(bodyParts, ws.Viewport)
@@ -88,9 +88,6 @@ func renderWorkspace(ws Workspace) string {
 	}
 	if ws.Input != "" {
 		bodyParts = append(bodyParts, ws.Input)
-	}
-	if ws.StatusBar != "" {
-		bodyParts = append(bodyParts, ws.StatusBar)
 	}
 	body := lipgloss.JoinVertical(lipgloss.Left, bodyParts...)
 
@@ -124,8 +121,8 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 	}
 
 	// ── Fixed Header / Footer (authoritative geometry source) ──
-	headerView := renderFixedHeader(m.runtimeCtx, m.workflowSM, width, m.indexingStatus)
-	footerView := renderFixedFooter(m.runtimeCtx, m.uiNotice, width)
+	headerView := m.renderTopBar(width)
+	footerView := m.renderFixedFooter(width, actions)
 
 	// ── Input region: autocomplete + separators + prompt ──
 	var inputView strings.Builder
@@ -146,9 +143,6 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 	}
 	inputView.WriteString(rule(width, borderColor))
 
-	// ── Status bar (telemetry with capabilities inlined) — below Input, above Footer ──
-	statusBarView := m.renderStatusBar(width, actions)
-
 	// ── Proposal dock (conditional) — floats above Input ──
 	// NOTE: shimmerActive no longer triggers the proposalDock — the loading
 	// indicator is rendered inside the viewport body (refreshViewportContent)
@@ -167,7 +161,6 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 		Viewport:     m.Viewport.View(),
 		ProposalDock: proposalDockView,
 		Input:        inputView.String(),
-		StatusBar:    statusBarView,
 		Footer:       footerView,
 		Actions:      actions,
 	}
@@ -801,42 +794,6 @@ func (m *model) renderRuntimeStatus(width int) string {
 	return b.String()
 }
 
-// renderStatusBar renders the runtime telemetry line — the lowest visual
-// priority element, pinned to the bottom. When capabilities are exposed by the
-// current workflow context, they are rendered INLINE on the same line,
-// right-aligned, so the bar never grows an extra row and the prompt above
-// stays perfectly still. The renderer never decides which capabilities exist;
-// it only projects the slice handed to it by the workflow layer.
-//
-// Layout (capability active):
-//
-//	qwen2.5-coder · 9 tok · cp-1784040                     ⌥A Investigate Root Cause
-//
-// Layout (no capability):
-//
-//	qwen2.5-coder · 9 tok · cp-1784040
-func (m *model) renderStatusBar(width int, actions []Action) string {
-	chip := renderActions(actions)
-	if chip == "" {
-		return m.renderRuntimeStatus(width)
-	}
-	// Reserve the chip's width on the right and let the status line shrink its
-	// own segments to fit the remaining budget, so the two never collide.
-	gap := 2
-	chipW := lipgloss.Width(chip)
-	statusBudget := width - chipW - gap
-	if statusBudget < 0 {
-		statusBudget = 0
-	}
-	status := m.renderRuntimeStatus(statusBudget)
-	// Right-align the chip with at least `gap` spaces of breathing room.
-	pad := width - lipgloss.Width(status) - chipW
-	if pad < gap {
-		pad = gap
-	}
-	return status + strings.Repeat(" ", pad) + chip
-}
-
 // renderActions renders the currently available capabilities as inline,
 // right-aligned tokens: a hotkey + label pair. It is a pure projection of the
 // Action slice — it inspects no mode, no handoff state, and no engine flag.
@@ -1157,6 +1114,18 @@ func failureCategoryStyle(category string) lipgloss.Style {
 // TUI markdown pipeline so the viewport never shows raw asterisks
 // or dashes from the LLM's system summary.
 func (m *model) styleActivityLine(line string) string {
+	// ── QUIET TRACE SUPPRESSION (per-line activity path) ──────────
+	// In quiet mode a raw engine line collapses to the single per-turn
+	// "▸ Trace:" summary; any subsequent engine line for the same turn is
+	// dropped entirely so the summary is never repeated sequentially.
+	if !TraceVerbose && isQuietTraceText(line) {
+		if m.traceSummaryShown {
+			return ""
+		}
+		m.traceSummaryShown = true
+		return dimmedStyle.Render(buildQuietTraceLine(line))
+	}
+
 	// ── SELF-HEALING BADGES ────────────────────────────────────────
 	// Distinct retry / exhausted indicators with the attempt count and
 	// failure category colorized deterministically.

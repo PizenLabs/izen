@@ -30,19 +30,21 @@ func (m *model) viewportGeometry() ViewportGeometry {
 	}
 
 	// Header height: rendered fixed header line count (0 when no runtime ctx).
-	headerView := renderFixedHeader(m.runtimeCtx, m.workflowSM, width, m.indexingStatus)
+	headerView := m.renderTopBar(width)
 	headerLines := countLines(headerView)
 
-	footerView := renderFixedFooter(m.runtimeCtx, m.uiNotice, width)
+	footerView := m.renderFixedFooter(width, nil)
 	footerLines := countLines(footerView)
 
-	// Input + status + proposal heights use the same helpers as assembleScreen.
-	// We must reconstruct the same inputView/status/proposal heights without
+	// Input + proposal heights use the same helpers as assembleScreen.
+	// We must reconstruct the same inputView/proposal heights without
 	// duplicating the view strings arbitrarily.
 	// Autocomplete dropdown height when active.
 	autoH := m.getAutocompleteHeight()
-	// Status bar is always 1 line.
-	statusH := 1
+	// The old idle-telemetry status bar row is gone: the prompt bar anchors
+	// directly above the single-line lifecycle footer, so no separate status
+	// height is reserved here.
+	statusH := 0
 	// Proposal dock height when present.
 	proposalH := 0
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
@@ -55,12 +57,12 @@ func (m *model) viewportGeometry() ViewportGeometry {
 	// Similarly proposal is separate.
 	//
 	// Total fixed height outside the viewport:
-	// header + footer + input (3 + autoH) + status + proposal
+	// header + footer + input (3 + autoH) + proposal
 	//
 	// assembleScreen computes:
-	//   totalFixed = headerLines + inputLines + statusBarLines + footerLines
+	//   totalFixed = headerLines + inputLines + footerLines
 	//   where inputLines = countLines(inputView) which already includes autoH
-	//   and statusBarLines =1, header/footer as above.
+	//   and the footer is the single-line lifecycle bar (no status row).
 	// So we replicate that:
 	inputLines := 3 + autoH
 	// When we are in a narrow mode where header/footer may be empty we already

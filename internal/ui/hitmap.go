@@ -35,6 +35,7 @@ func cellToRuneInString(s string, startIdx int, contentCells int) int {
 	if contentCells <= 0 {
 		return startIdx
 	}
+	s = ansi.Strip(s)
 	runes := []rune(s)
 	if startIdx < 0 {
 		startIdx = 0

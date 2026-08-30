@@ -111,8 +111,9 @@ const (
 )
 
 type record struct {
-	role role
-	text string
+	role   role
+	text   string
+	turnID uint64
 }
 
 type tokenMsg string
@@ -745,6 +746,9 @@ type model struct {
 	traceBuffer strings.Builder
 	// traceExpanded is the Ctrl+O expansion state of the output-trace viewport.
 	traceExpanded bool
+	// traceVerbose is the model-local verbosity toggle mirrored into the
+	// package-level TraceVerbose flag used by layout/stream renderers.
+	traceVerbose bool
 	// traceWindowStart anchors the output-trace window while the trace is
 	// expanded and streaming: it is frozen once anchored so new chunks never
 	// slide the inspected lines out from under the user (the Ctrl+O viewport
@@ -967,6 +971,23 @@ type model struct {
 	// Cached prompt text for logging (set on submit, cleared after stream completion)
 	currentPrompt string
 
+	// sessionHasRunPrompts marks whether the user has submitted at least one
+	// prompt this session. It drives the footer's Fresh-Launch vs Active-Session
+	// IDLE states: before the first submission the footer shows the clean
+	// startup hint (`<model> · Ctrl+H help`); afterwards it shows
+	// the persistent usage telemetry. Never reset by /clear (session-durable).
+	sessionHasRunPrompts bool
+
+	// traceSummaryShown tracks whether the current turn already emitted its
+	// single quiet-mode "▸ Trace:" summary on the per-line activity path
+	// (styleActivityLine). Reset at each prompt submission so every turn gets
+	// exactly one summary. The document-layout path carries its own persistent
+	// dedup in DocumentLayout.traceSummaryEmitted.
+	traceSummaryShown bool
+
+	// currentTurnID tracks the monotonically incrementing turn counter.
+	currentTurnID uint64
+
 	// lastPlanIntent is the raw user intent captured when /plan staged its task
 	// list. It survives mode transitions (the current prompt is overwritten by
 	// the later "/build" invocation) so /build can reconstruct the rewrite
@@ -979,8 +1000,14 @@ type model struct {
 	microBudget    *budget.MicroBudget
 	caps           *capability.CapabilitySet
 
-	// Focus objective UI notifications (non-chat)
-	uiNotice string
+	// ── Transient toast overlay (Top Bar) ─────────────────────────
+	// toast is the transient top-bar notification message. It renders as a
+	// "[✓ <msg>]" overlay on the far-right boundary of the fixed Top Bar and
+	// auto-clears toastDuration after it was set. toastSetAt anchors that
+	// display window. The footer NEVER renders toasts — they belong to the
+	// Top Bar overlay (lifecycle-driven footer).
+	toast      string
+	toastSetAt time.Time
 
 	// Proposal widget diff scroll offset
 	proposalDiffOffset int
@@ -2170,6 +2197,21 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		if m.viewState != nil {
 			m.viewState.Project(ev)
 		}
+		if m.resolver != nil {
+			toLower := strings.ToLower(p.To)
+			switch {
+			case strings.Contains(toLower, "build"):
+				m.resolver.Set(modes.ModeBuild)
+			case strings.Contains(toLower, "plan"):
+				m.resolver.Set(modes.ModePlan)
+			case strings.Contains(toLower, "investigat"):
+				m.resolver.Set(modes.ModeInvestigate)
+			case strings.Contains(toLower, "review"):
+				m.resolver.Set(modes.ModeReview)
+			case strings.Contains(toLower, "ask"):
+				m.resolver.Set(modes.ModeAsk)
+			}
+		}
 		m.syncUIState()
 	case events.PatchParsedPayload:
 		m.logActivity("[patch] parsed %s (strategy=%s, tier=%d)", p.File, p.Strategy, p.Tier)
@@ -2856,8 +2898,9 @@ func (m *model) push(r role, text string) {
 		return
 	}
 	text = sanitizeIngressANSI(text)
-	m.records = append(m.records, record{role: r, text: text})
-	m.cacheRecordToHistory(record{role: r, text: text})
+	rec := record{role: r, text: text, turnID: m.currentTurnID}
+	m.records = append(m.records, rec)
+	m.cacheRecordToHistory(rec)
 }
 
 // sanitizeIngressANSI is the ingress filter for external stream ingestion.
@@ -3963,18 +4006,9 @@ func (m *model) applySelectionToLine(idx int, rendered string) string {
 		contentEndCell = 0
 	}
 	if contentStartCell <= contentEndCell && lineCells > 0 {
-		startRune := cellToRuneIdxRunes([]rune(raw), contentStartCell)
-		endRuneEx := cellToRuneIdxRunes([]rune(raw), contentEndCell+1)
-		endRune := endRuneEx - 1
-		if startRune < 0 {
-			startRune = 0
-		}
-		if endRune >= len([]rune(raw)) {
-			endRune = len([]rune(raw)) - 1
-		}
-		if startRune <= endRune && startRune < len([]rune(raw)) {
-			rendered = injectStyleRange(rendered, startRune, endRune, viSelectionBgStyle)
-		}
+		// Use visual-cell highlighting directly on the ANSI-rendered line so
+		// viewport highlight and copied extraction share the same coordinates.
+		rendered = injectHighlightByCells(rendered, startCell, endCell, "\x1b[48;2;42;34;64m")
 	}
 	return rendered
 }
