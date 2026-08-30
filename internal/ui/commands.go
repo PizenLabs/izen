@@ -664,7 +664,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 				if icErr != nil {
 					m.reconcileSpinner()
 					m.push(roleError, icErr.Error())
-					m.uiNotice = icErr.Error()
+					m.setToast(icErr.Error())
 					m.refreshViewportContent()
 					m.gotoBottomIfAllowed()
 					return m.flushPendingRecords()
@@ -693,7 +693,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 				if mkErr != nil {
 					m.reconcileSpinner()
 					m.push(roleError, mkErr.Error())
-					m.uiNotice = mkErr.Error()
+					m.setToast(mkErr.Error())
 					m.refreshViewportContent()
 					m.gotoBottomIfAllowed()
 					return m.flushPendingRecords()
@@ -1571,7 +1571,7 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	// Mode switches must not spam the conversation viewport. The active
 	// prompt indicator ("plan )" / "build )") is updated by startModeTransition
 	// above; only a transient footer notice confirms the switch.
-	m.uiNotice = fmt.Sprintf("Switched to /%s", mode)
+	m.setToast(fmt.Sprintf("Switched to /%s", mode))
 
 	// ── SYNCHRONOUS LEDGER RELOAD (1-TURN LATENCY FIX) ────────────────
 	// CleanContextTransitions above purged transient in-memory handoff buffers
@@ -1937,7 +1937,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		objArg := strings.TrimSpace(strings.TrimPrefix(cmd, "/objective"))
 		if strings.EqualFold(objArg, "approve") {
 			if m.sess.ObjectiveState == nil {
-				m.uiNotice = "No active objective to approve."
+				m.setToast("No active objective to approve.")
 				return nil
 			}
 			m.sess.ObjectiveState.HumanConfirmed = true
@@ -1946,7 +1946,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			}
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
 			_ = m.sess.Save()
-			m.uiNotice = "Objective approved for outbound pipelines."
+			m.setToast("Objective approved for outbound pipelines.")
 			return nil
 		}
 		if objArg != "" {
@@ -1955,10 +1955,10 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			obj.CurrentStatus = domain.ObjectiveAnalyzing
 			m.sess.SetObjectiveState(obj)
 			_ = m.sess.Save()
-			m.uiNotice = "Objective analysis started."
+			m.setToast("Objective analysis started.")
 			return m.analyzeObjectiveCmd(obj)
 		} else {
-			m.uiNotice = "Usage: /objective <description>"
+			m.setToast("Usage: /objective <description>")
 		}
 		return nil
 
@@ -2073,11 +2073,11 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 	case cmd == "/copy-mode", cmd == "/copy_mode", cmd == "/inspect":
 		if m.inViMode {
-			m.uiNotice = "Already in copy mode"
+			m.setToast("Already in copy mode")
 			return nil
 		}
 		if m.state == StateProcessing || m.state == StateAwaitingApproval || m.streaming || m.agentRunning {
-			m.uiNotice = "Cannot enter copy mode while a task is running"
+			m.setToast("Cannot enter copy mode while a task is running")
 			return nil
 		}
 		return m.enterViMode()

@@ -18,8 +18,8 @@ func TestCopyMode_EnterViaCommand(t *testing.T) {
 	if !m.inViMode {
 		t.Fatal("m.inViMode should be true after /copy-mode")
 	}
-	if m.uiNotice == "" || !strings.Contains(strings.ToLower(m.uiNotice), "copy mode") {
-		t.Fatalf("uiNotice should describe copy mode, got %q", m.uiNotice)
+	if m.toast == "" || !strings.Contains(strings.ToLower(m.toast), "copy mode") {
+		t.Fatalf("toast should describe copy mode, got %q", m.toast)
 	}
 }
 

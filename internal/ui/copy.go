@@ -79,7 +79,7 @@ func SerializeTranscript(records []record) string {
 func (m *model) handleCopy() {
 	serialized := SerializeTranscript(m.records)
 	if strings.TrimSpace(serialized) == "" {
-		m.uiNotice = "Nothing to copy — conversation is empty"
+		m.setToast("Nothing to copy — conversation is empty")
 		return
 	}
 	var err error
@@ -89,8 +89,8 @@ func (m *model) handleCopy() {
 		err = clipboardWriteAll(serialized)
 	}
 	if err != nil {
-		m.uiNotice = "Failed to copy conversation: clipboard unavailable"
+		m.setToast("Failed to copy conversation: clipboard unavailable")
 		return
 	}
-	m.uiNotice = "Copied conversation to clipboard"
+	m.setToast("Copied conversation to clipboard")
 }

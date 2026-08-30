@@ -42,10 +42,11 @@ func RenderDeterministicPipeline(rawInput string, width int, isStreaming bool) s
 		return ""
 	}
 	// ── Quiet / Accordion Mode for Engine Logs ──────────────────────
-	// In non-verbose (quiet) mode, full multiline [AUTONOMY DECISION],
-	// [preflight] and [stage completed] traces are suppressed and collapsed
-	// into the single subtle line `▸ Execution Trace: ...`. Verbose mode
-	// (TraceVerbose=true, toggled via Alt+V) restores the full logs.
+	// In non-verbose (quiet) mode, raw internal engine lines ([AUTONOMY
+	// DECISION], intent :, required :, workspace :, decision :, [preflight],
+	// [event], …) are suppressed and collapsed into the single subtle line
+	// `▸ Trace: direct_response (21ms) · Alt+E to toggle`. Verbose mode
+	// (TraceVerbose=true, toggled via Alt+E / Alt+V) restores the full logs.
 	if !TraceVerbose && isQuietTraceText(rawInput) {
 		split := strings.Split(rawInput, "\n")
 		var traceLines []string

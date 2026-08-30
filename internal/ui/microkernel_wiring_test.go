@@ -48,11 +48,11 @@ func TestPlanResultMsgMicrokernelRejectionSurfacesReason(t *testing.T) {
 	reason := errors.New("microkernel plan rejected by policy: permitted_path on \"outside.tmp\" — target outside every permitted root")
 	m.Update(planResultMsg{Err: reason, Microkernel: true})
 
-	if m.uiNotice == "" {
-		t.Fatal("rejection reason must be surfaced in the status-bar footer")
+	if m.toast == "" {
+		t.Fatal("rejection reason must be surfaced in the top-bar toast")
 	}
-	if !strings.Contains(m.uiNotice, "permitted_path") {
-		t.Fatalf("uiNotice = %q, want explicit policy reason", m.uiNotice)
+	if !strings.Contains(m.toast, "permitted_path") {
+		t.Fatalf("toast = %q, want explicit policy reason", m.toast)
 	}
 }
 
@@ -69,10 +69,10 @@ func TestPlanResultMsgMicrokernelStaging(t *testing.T) {
 	}
 	m.Update(planResultMsg{Tasks: tasks, Microkernel: true})
 
-	if m.uiNotice == "" {
-		t.Fatal("microkernel staging must set a footer notice")
+	if m.toast == "" {
+		t.Fatal("microkernel staging must set a top-bar toast")
 	}
-	if !strings.Contains(m.uiNotice, "Microkernel") || !strings.Contains(m.uiNotice, "3") {
-		t.Fatalf("uiNotice = %q, want microkernel staging announcement", m.uiNotice)
+	if !strings.Contains(m.toast, "Microkernel") || !strings.Contains(m.toast, "3") {
+		t.Fatalf("toast = %q, want microkernel staging announcement", m.toast)
 	}
 }
