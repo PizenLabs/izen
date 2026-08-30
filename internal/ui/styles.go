@@ -459,11 +459,12 @@ var (
 	// Lists/numbers: Peach (#fab387) markers with indented continuation text.
 	mdBulletStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#fab387"))
 
-	// Code block chrome: dimmed border (#45475a), Surface background
-	// (#1e1e2e). Syntax colours come from the chroma Catppuccin Mocha theme
-	// (green keywords #a6e3a1, blue identifiers #89b4fa).
-	mdCodeBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
-	mdCodeBgStyle     = lipgloss.NewStyle().Background(lipgloss.Color(colorSurface))
+	// Code block chrome: thin-line box with dimmed border (#585b70 Surface2)
+	// and NO background fill — preserves native terminal background. Syntax
+	// colours come from the chroma Catppuccin Mocha theme (green keywords
+	// #a6e3a1, blue identifiers #89b4fa).
+	mdCodeBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
+	mdCodeBgStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 
 	// Callout label styles per keyword
 	mdCalloutStyles = map[string]lipgloss.Style{

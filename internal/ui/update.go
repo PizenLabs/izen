@@ -2185,6 +2185,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// ── AUTHORITATIVE STAGE: provider stream completed ─────────
 		// A terminal stream is done; the stage can never linger as "streaming".
 		m.setStage("model", m.getActiveModelName(), stageDone)
+		// Freeze Thought duration timer upon stream completion.
+		if m.thoughtEndTime.IsZero() {
+			m.thoughtEndTime = time.Now()
+		}
+		if m.thinkingPanel != nil {
+			m.thinkingPanel.Freeze()
+		}
+		if m.thinkingBuffer != nil && !m.thinkingBuffer.Complete() {
+			m.thinkingBuffer.MarkComplete()
+		}
 
 		// Handle executor streaming (gated path) separately from /ask streaming.
 		// The executor stream is for provider output during patch generation;

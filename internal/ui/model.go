@@ -1027,6 +1027,10 @@ type model struct {
 	// stream completes to compute this-turn latency for the status line.
 	streamStartTime time.Time
 
+	// Thought duration timer: start on prompt submit, frozen on StreamDoneMsg / StateIdle.
+	thoughtStartTime time.Time
+	thoughtEndTime   time.Time
+
 	// AI Interrupt Engine: cancel function for active stream, set by streamCmd.
 	streamCancel       context.CancelFunc
 	interruptRequested bool

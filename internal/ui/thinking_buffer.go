@@ -26,6 +26,7 @@ type ThinkingBuffer struct {
 	builder  strings.Builder
 	complete bool
 	started  time.Time
+	ended    time.Time
 	maxLines int
 	// reasoningTokens is the provider-reported reasoning-token count for the
 	// captured thinking block. It is set ONLY from the authoritative
@@ -67,6 +68,7 @@ func (tb *ThinkingBuffer) Append(chunk string) {
 		tb.builder.Reset()
 		tb.complete = false
 		tb.started = time.Now()
+		tb.ended = time.Time{}
 	}
 	tb.builder.WriteString(chunk)
 }
@@ -76,6 +78,9 @@ func (tb *ThinkingBuffer) Append(chunk string) {
 func (tb *ThinkingBuffer) MarkComplete() {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
+	if !tb.complete {
+		tb.ended = time.Now()
+	}
 	tb.complete = true
 }
 
@@ -146,6 +151,7 @@ func (tb *ThinkingBuffer) Reset() {
 	tb.expanded = false
 	tb.reasoningTokens = 0
 	tb.started = time.Now()
+	tb.ended = time.Time{}
 	tb.scrollOffset = 0
 	tb.scrolledUp = false
 	tb.lastLineCount = 0
@@ -250,7 +256,12 @@ func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) stri
 	complete := tb.complete
 	expanded := tb.expanded
 	reasoningTokens := tb.reasoningTokens
-	elapsed := time.Since(tb.started)
+	var elapsed time.Duration
+	if complete && !tb.ended.IsZero() {
+		elapsed = tb.ended.Sub(tb.started)
+	} else {
+		elapsed = time.Since(tb.started)
+	}
 	scrollOffset := tb.scrollOffset
 	scrolledUp := tb.scrolledUp
 	tb.mu.Unlock()

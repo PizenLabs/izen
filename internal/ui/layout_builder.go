@@ -3,6 +3,8 @@ package ui
 import (
 	"strings"
 
+	"github.com/alecthomas/chroma/v2"
+	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 
@@ -548,51 +550,211 @@ func renderedTextToDocumentLines(gutter string, rendered string, wrapWidth int) 
 	return out
 }
 
-// renderCodeBlockToLines renders a fenced code block (Chromatised, Catppuccin
-// Mocha) into DocumentLines with the outer AI gutter plus the inner code
-// gutter, mirroring the streaming pipeline's double-gutter composition. Code
-// lines carry the Surface background (#1e1e2e) and the gutters use the dimmed
-// border colour (#45475a); syntax colours (green keywords / blue identifiers)
-// come from the chroma Catppuccin Mocha theme.
+// renderCodeBlockToLines renders a fenced code block as an elegant thin-line
+// framed box container with native terminal background preserved. The outer AI
+// gutter ("│ ") is kept, then a box is drawn:
+//
+//	┌─ lang ──────────────────────────────────────────┐
+//	│ code line 1                                      │
+//	│ code line 2                                      │
+//	└─────────────────────────────────────────────────┘
+//
+// Border style is dimmed subtle color (Surface2 #585b70 / Overlay0 #6c7086)
+// via mdCodeBorderStyle, with NO Background(...) fill so the user's native
+// terminal background shows through. Syntax colours are foreground-only.
 func renderCodeBlockToLines(lang string, codeLines []string, wrapWidth int) []DocumentLine {
 	if len(codeLines) == 0 {
 		return nil
 	}
-	rendered := renderCodeBlock(lang, codeLines, wrapWidth)
-	if rendered == "" {
-		return nil
-	}
 	outerGutter := "│ "
 	outerCells := runewidth.StringWidth(ansi.Strip(outerGutter))
+	boxWidth := wrapWidth - outerCells
+	if boxWidth < 10 {
+		boxWidth = 10
+	}
+	boxStyle := mdCodeBorderStyle // dimmed, no background
+	// Top border: ┌─ lang ──────┐
+	var topBorder string
+	if lang != "" {
+		label := "─ " + lang + " "
+		labelCells := runewidth.StringWidth(label)
+		// ┌ + ─ + label + dashes + ┐  => total boxWidth
+		remaining := boxWidth - 1 - 1 - labelCells - 1
+		if remaining < 0 {
+			remaining = 0
+		}
+		topBorder = "┌─" + label + strings.Repeat("─", remaining) + "┐"
+	} else {
+		topBorder = "┌" + strings.Repeat("─", boxWidth-2) + "┐"
+	}
+	bottomBorder := "└" + strings.Repeat("─", boxWidth-2) + "┘"
+	// Content width inside box: between "│ " and " │" (4 cells total).
+	innerWidth := boxWidth - 4
+	if innerWidth < 4 {
+		innerWidth = 4
+	}
 	var out []DocumentLine
-	for _, p := range strings.Split(strings.TrimSuffix(rendered, "\n"), "\n") {
-		if p == "" {
-			out = append(out, gutterDocumentLine(wrapWidth))
+	// Use raw ANSI for border to guarantee ANSI in test (lipgloss may be disabled in test)
+	const borderFg = "\x1b[38;2;88;91;112m" // colorDimmed #585b70
+	const borderReset = "\x1b[0m"
+	const gutterFg = "\x1b[38;2;88;91;112m"
+	_ = boxStyle
+	// Top border line (non-selectable)
+	out = append(out, DocumentLine{
+		Spans:       []RenderSpan{{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false}, {StartCell: outerCells, EndCell: outerCells + boxWidth, SourceStart: 0, SourceEnd: 0, Selectable: false}},
+		RawText:     "",
+		RenderedStr: gutterFg + outerGutter + borderReset + borderFg + topBorder + borderReset,
+	})
+	// Each code line, wrapped to innerWidth, with side borders
+	for _, rawLine := range codeLines {
+		// Preserve empty lines as empty boxed rows
+		if rawLine == "" {
+			emptyContent := strings.Repeat(" ", innerWidth)
+			rendered := gutterFg + outerGutter + borderReset + borderFg + "│ " + borderReset + emptyContent + borderFg + " │" + borderReset
+			out = append(out, DocumentLine{
+				Spans:       []RenderSpan{{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false}, {StartCell: outerCells, EndCell: outerCells + 2, SourceStart: 0, SourceEnd: 0, Selectable: false}, {StartCell: outerCells + 2, EndCell: outerCells + 2 + innerWidth, SourceStart: 0, SourceEnd: 0, Selectable: true}},
+				RawText:     "",
+				RenderedStr: rendered,
+			})
 			continue
 		}
-		stripped := ansi.Strip(p)
-		prefixCells, content := splitGutterPrefix(stripped)
-		contentCells := runewidth.StringWidth(content)
-		innerStart := outerCells + prefixCells
-		spans := []RenderSpan{
-			{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false},
-			{StartCell: outerCells, EndCell: innerStart, SourceStart: 0, SourceEnd: 0, Selectable: false},
-			{StartCell: innerStart, EndCell: innerStart + contentCells, SourceStart: 0, SourceEnd: len([]rune(content)), Selectable: true},
+		// Wrap long lines at innerWidth (cell-aware, no ANSI in raw)
+		wrapped := wrapForContentWidth(rawLine, innerWidth)
+		if len(wrapped) == 0 {
+			wrapped = []string{rawLine}
 		}
-		out = append(out, DocumentLine{
-			Spans:       spans,
-			RawText:     content,
-			RenderedStr: mdCodeBgStyle.Render(mdCodeBorderStyle.Render(outerGutter)) + codeSurfaceBG + p + ansiReset,
-		})
+		for _, piece := range wrapped {
+			// Colorize with Chroma/Catppuccin foreground only, explicitly stripping background codes
+			colorized := colorizeNoBg(lang, piece)
+			// Ensure no background escapes leak (defensive strip)
+			if strings.Contains(colorized, "48;2;") {
+				colorized = stripBackgroundANSI(colorized)
+			}
+			// Calculate visual width with ANSI-aware width
+			colorizedWidth := ansi.StringWidth(colorized)
+			_ = colorizedWidth
+			pieceCells := runewidth.StringWidth(piece)
+			// Use raw piece width for padding (same as colorized width)
+			padding := ""
+			if pieceCells < innerWidth {
+				padding = strings.Repeat(" ", innerWidth-pieceCells)
+			}
+			rendered := gutterFg + outerGutter + borderReset + borderFg + "│ " + borderReset + colorized + padding + borderFg + " │" + borderReset
+			contentCells := runewidth.StringWidth(piece)
+			out = append(out, DocumentLine{
+				Spans: []RenderSpan{
+					{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false},
+					{StartCell: outerCells, EndCell: outerCells + 2, SourceStart: 0, SourceEnd: 0, Selectable: false},
+					{StartCell: outerCells + 2, EndCell: outerCells + 2 + contentCells, SourceStart: 0, SourceEnd: len([]rune(piece)), Selectable: true},
+				},
+				RawText:     piece,
+				RenderedStr: rendered,
+			})
+		}
 	}
+	// Bottom border line (non-selectable)
+	out = append(out, DocumentLine{
+		Spans:       []RenderSpan{{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false}, {StartCell: outerCells, EndCell: outerCells + boxWidth, SourceStart: 0, SourceEnd: 0, Selectable: false}},
+		RawText:     "",
+		RenderedStr: "\x1b[38;2;88;91;112m" + outerGutter + "\x1b[0m" + "\x1b[38;2;88;91;112m" + bottomBorder + "\x1b[0m",
+	})
 	return out
 }
 
-// codeSurfaceBG is the Catppuccin Surface (#1e1e2e) background applied to
-// fenced code block rows. It is emitted as raw ANSI so the chroma foreground
-// colours inside the line are preserved (a lipgloss background re-render would
-// strip them). Zero render-path style construction.
-const codeSurfaceBG = "\x1b[48;2;30;30;46m"
+// codeSurfaceBG is retained for backward compat but no longer used for code
+// containers — background fills are forbidden (native terminal background).
+const codeSurfaceBG = ""
+
+// stripBackgroundANSI removes any background color escapes (48;2;...) from an
+// ANSI string to preserve native transparent terminal backgrounds.
+func stripBackgroundANSI(s string) string {
+	if !strings.Contains(s, "48;2;") {
+		return s
+	}
+	// Replace SGR sequences containing background codes.
+	// We scan for \x1b[...m and filter out 48;2;r;g;b segments.
+	var out strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && s[j] != 'm' {
+				j++
+			}
+			if j < len(s) {
+				j++
+			}
+			seq := s[i:j]
+			// Filter background codes inside seq
+			inner := seq[2 : len(seq)-1] // between [ and m
+			parts := strings.Split(inner, ";")
+			var filtered []string
+			k := 0
+			for k < len(parts) {
+				if parts[k] == "48" && k+4 < len(parts) && parts[k+1] == "2" {
+					k += 5
+					continue
+				}
+				filtered = append(filtered, parts[k])
+				k++
+			}
+			if len(filtered) == 0 {
+				// If only background was present, emit reset instead of empty
+				out.WriteString("\x1b[0m")
+			} else {
+				out.WriteString("\x1b[" + strings.Join(filtered, ";") + "m")
+			}
+			i = j
+			continue
+		}
+		out.WriteByte(s[i])
+		i++
+	}
+	return out.String()
+}
+
+// colorizeNoBg returns Chroma/Catppuccin syntax-highlighted line with foreground
+// colors (38;2;...) for keywords, identifiers, strings, etc., explicitly stripping
+// any background (48;2;...) to keep terminal background transparent.
+func colorizeNoBg(lang, line string) string {
+	if strings.TrimSpace(line) == "" {
+		return line
+	}
+	lexer := lexers.Get(lang)
+	if lexer == nil {
+		lexer = lexers.Fallback
+	}
+	lexer = chroma.Coalesce(lexer)
+	it, err := lexer.Tokenise(nil, line)
+	if err != nil {
+		return line
+	}
+	var buf strings.Builder
+	for _, tok := range it.Tokens() {
+		if tok.Value == "" {
+			continue
+		}
+		// Token value may contain internal newlines (should not for single line)
+		parts := strings.Split(tok.Value, "\n")
+		for pi, part := range parts {
+			if pi > 0 {
+				buf.WriteString("\n")
+			}
+			if part == "" {
+				continue
+			}
+			sgr := sgrForToken(tok.Type)
+			sgr = stripBackgroundANSI(sgr)
+			buf.WriteString(sgr)
+			buf.WriteString(part)
+			buf.WriteString("\x1b[0m")
+		}
+	}
+	if buf.Len() == 0 {
+		return line
+	}
+	return buf.String()
+}
 
 // gutterDocumentLine builds an empty AI gutter row (blank physical line).
 func gutterDocumentLine(wrapWidth int) DocumentLine {

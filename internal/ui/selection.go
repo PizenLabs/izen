@@ -589,38 +589,136 @@ func (m *model) renderRecordsWithMouseSelection() string {
 	return b.String()
 }
 
+// MapCellToByteIndex scans an ANSI-encoded line and returns a mapping from
+// visual display cell -> byte offset in the raw string. ANSI escapes (\x1b[...m)
+// are zero-width and skipped, CJK double-width runes are counted via
+// runewidth.RuneWidth, ensuring pixel-perfect visual column to byte mapping.
+func MapCellToByteIndex(s string, targetCell int) int {
+	if targetCell <= 0 {
+		return 0
+	}
+	cells := 0
+	i := 0
+	for i < len(s) && cells < targetCell {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && s[j] != 'm' {
+				j++
+			}
+			if j < len(s) {
+				j++
+			}
+			i = j
+			continue
+		}
+		// Decode rune
+		r, size := 0, 1
+		if s[i] < 0x80 {
+			r = int(s[i])
+			size = 1
+		} else {
+			// Use utf8 decode
+			ru, sz := decodeRune(s[i:])
+			r = int(ru)
+			size = sz
+		}
+		w := runewidth.RuneWidth(rune(r))
+		if w < 0 {
+			w = 0
+		}
+		if cells+w > targetCell {
+			return i
+		}
+		cells += w
+		i += size
+	}
+	return i
+}
+
+func decodeRune(s string) (rune, int) {
+	// Inline utf8 decode without importing unicode/utf8 for speed
+	if len(s) == 0 {
+		return 0, 0
+	}
+	b0 := s[0]
+	if b0 < 0x80 {
+		return rune(b0), 1
+	}
+	if len(s) >= 2 && b0&0xE0 == 0xC0 {
+		return rune(b0&0x1F)<<6 | rune(s[1]&0x3F), 2
+	}
+	if len(s) >= 3 && b0&0xF0 == 0xE0 {
+		return rune(b0&0x0F)<<12 | rune(s[1]&0x3F)<<6 | rune(s[2]&0x3F), 3
+	}
+	if len(s) >= 4 && b0&0xF8 == 0xF0 {
+		return rune(b0&0x07)<<18 | rune(s[1]&0x3F)<<12 | rune(s[2]&0x3F)<<6 | rune(s[3]&0x3F), 4
+	}
+	return rune(b0), 1
+}
+
+// lastANSI returns the last SGR ANSI sequence in s, or "" if none.
+func lastANSI(s string) string {
+	idx := strings.LastIndex(s, "\x1b[")
+	if idx < 0 {
+		return ""
+	}
+	end := strings.Index(s[idx:], "m")
+	if end < 0 {
+		return ""
+	}
+	return s[idx : idx+end+1]
+}
+
+// injectHighlightByCells highlights visual cells [startCell, endCell] inclusive
+// in an ANSI-encoded line by slicing at exact byte offsets derived from
+// MapCellToByteIndex and wrapping the slice with background highlight codes.
+// Internal \x1b[0m resets inside the highlighted slice are patched to re-apply
+// the selection background so highlight persists across color switches.
+func injectHighlightByCells(s string, startCell, endCell int, bg string) string {
+	if startCell < 0 {
+		startCell = 0
+	}
+	if endCell < startCell {
+		return s
+	}
+	startByte := MapCellToByteIndex(s, startCell)
+	endByte := MapCellToByteIndex(s, endCell+1)
+	if startByte >= len(s) || startByte >= endByte {
+		return s
+	}
+	if endByte > len(s) {
+		endByte = len(s)
+	}
+	before := s[:startByte]
+	middle := s[startByte:endByte]
+	after := s[endByte:]
+	const reset = "\x1b[0m"
+	restore := lastANSI(s[:startByte])
+	// Preserve highlight across internal resets: re-apply bg after each \x1b[0m inside middle
+	if strings.Contains(middle, "\x1b[0m") {
+		middle = strings.ReplaceAll(middle, "\x1b[0m", "\x1b[0m"+bg)
+	}
+	return before + bg + middle + reset + restore + after
+}
+
 // renderDocumentWithSelection highlights DocumentLayout lines intersecting [Anchor,Cursor]
-// using cell-aware injection without altering line counts.
+// using strict Cell-to-Byte index mapping for ANSI-styled text. It parses ANSI escapes
+// character-by-character, tracks visual cells with runewidth, and slices at exact byte
+// offsets to guarantee 100% pixel-perfect highlighting.
 func (m *model) renderDocumentWithSelection() string {
 	if m.docLayout == nil || m.docLayout.Len() == 0 {
 		return ""
 	}
 	s, e := m.mouseSel.normalized()
 	var b strings.Builder
+	const selBg = "\x1b[48;2;42;34;64m"
 	for idx, line := range m.docLayout.Lines {
 		rendered := line.RenderedStr
 		if rendered == "" {
 			rendered = line.RawText
 		}
 		if idx >= s.Y && idx <= e.Y {
-			raw := ansi.Strip(line.RawText)
-			if raw == "" && line.RenderedStr != "" {
-				raw = ansi.Strip(line.RenderedStr)
-			}
-			lineCells := StringCellWidth(raw)
-			// Determine cell range on this line
-			startCell, endCell := 0, lineCells-1
-			isFirst := idx == s.Y
-			isLast := idx == e.Y
-			if s.Y == e.Y {
-				startCell = s.X
-				endCell = e.X
-			} else if isFirst {
-				startCell = s.X
-			} else if isLast {
-				endCell = e.X
-			}
-			// Adjust for gutter prefix stored in Spans
+			// Determine gutter and content width for clamping
 			gutter := 0
 			for _, sp := range line.Spans {
 				if sp.Selectable {
@@ -628,32 +726,65 @@ func (m *model) renderDocumentWithSelection() string {
 					break
 				}
 			}
-			// Convert cell columns to rune indices within raw content
-			// raw is content without gutter, so subtract gutter before mapping
-			contentStartCell := startCell - gutter
-			contentEndCell := endCell - gutter
-			if contentStartCell < 0 {
-				contentStartCell = 0
+			if gutter == 0 && len(line.Spans) == 0 {
+				stripped := ansi.Strip(rendered)
+				if strings.HasPrefix(stripped, "│ ") {
+					gutter = 2
+					if strings.HasPrefix(stripped, "│ │ ") {
+						gutter = 4
+					}
+				}
 			}
-			if contentEndCell < 0 {
-				contentEndCell = 0
+			contentCells := 0
+			raw := ansi.Strip(line.RawText)
+			if raw == "" && line.RenderedStr != "" {
+				raw = ansi.Strip(line.RenderedStr)
 			}
-			if contentStartCell <= contentEndCell && lineCells > 0 {
-				startRune := cellToRuneIdxRunes([]rune(raw), contentStartCell)
-				endRuneEx := cellToRuneIdxRunes([]rune(raw), contentEndCell+1)
-				endRune := endRuneEx - 1
-				if startRune < 0 {
-					startRune = 0
+			if raw != "" {
+				contentCells = StringCellWidth(raw)
+			} else {
+				contentCells = StringCellWidth(ansi.Strip(rendered)) - gutter
+				if contentCells < 0 {
+					contentCells = 0
 				}
-				if endRune >= len([]rune(raw)) {
-					endRune = len([]rune(raw)) - 1
+			}
+			renderedCells := StringCellWidth(ansi.Strip(rendered))
+			var startCell, endCell int
+			if s.Y == e.Y {
+				startCell = s.X
+				endCell = e.X
+			} else if idx == s.Y {
+				startCell = s.X
+				endCell = renderedCells - 1
+				// Clamp end to content end
+				if gutter+contentCells-1 < endCell {
+					endCell = gutter + contentCells - 1
 				}
-				if startRune <= endRune && startRune < len([]rune(raw)) {
-					// injectStyleRange expects rune column within rendered line's printable chars.
-					// Since rendered may have gutter prefix, we need to locate printable offset.
-					// For simplicity we inject over the content portion using raw rune indices.
-					rendered = injectStyleRange(rendered, startRune, endRune, viSelectionBgStyle)
+			} else if idx == e.Y {
+				startCell = gutter
+				endCell = e.X
+			} else {
+				startCell = gutter
+				endCell = gutter + contentCells - 1
+			}
+			// Clamp to valid content range
+			if startCell < gutter {
+				startCell = gutter
+			}
+			if endCell < gutter {
+				endCell = gutter
+			}
+			if contentCells > 0 {
+				maxCell := gutter + contentCells - 1
+				if startCell > maxCell {
+					startCell = maxCell
 				}
+				if endCell > maxCell {
+					endCell = maxCell
+				}
+			}
+			if startCell <= endCell && renderedCells > 0 {
+				rendered = injectHighlightByCells(rendered, startCell, endCell, selBg)
 			}
 		}
 		b.WriteString(rendered)

@@ -1072,6 +1072,8 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		m.startShimmer("Working...", "analyze")
 
 		m.streamStartTime = time.Now()
+		m.thoughtStartTime = time.Now()
+		m.thoughtEndTime = time.Time{}
 		cmd := m.handleInput(userInput)
 		// ── CLEANUP: stop shimmer on non-streaming early returns ────
 		// If handleInput returned nil or a non-stream command (error,

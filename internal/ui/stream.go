@@ -126,6 +126,9 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	} else {
 		m.thinkingBuffer.Reset()
 	}
+	// Thought duration timer: reset start, clear end on new prompt.
+	m.thoughtStartTime = time.Now()
+	m.thoughtEndTime = time.Time{}
 	if m.activityTree == nil {
 		m.activityTree = NewActivityTree()
 	} else {
