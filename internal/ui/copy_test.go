@@ -34,7 +34,7 @@ func buildModelForCopy(records []record, cb *fakeClipboard) *model {
 	if cb != nil {
 		m.clipboard = cb
 	}
-	m.uiNotice = ""
+	m.toast = ""
 	return m
 }
 
@@ -222,8 +222,8 @@ func TestHandleCopy_Success(t *testing.T) {
 	if strings.Contains(cb.content, "\x1b[") {
 		t.Fatalf("clipboard contains ANSI: %q", cb.content)
 	}
-	if m.uiNotice != "Copied conversation to clipboard" {
-		t.Fatalf("uiNotice = %q, want Copied conversation to clipboard", m.uiNotice)
+	if m.toast != "Copied conversation to clipboard" {
+		t.Fatalf("uiNotice = %q, want Copied conversation to clipboard", m.toast)
 	}
 	// Must not mutate conversation state.
 	if len(m.records) != preLen {
@@ -259,8 +259,8 @@ func TestHandleCopy_ClipboardFailure(t *testing.T) {
 	m := buildModelForCopy(records, cb)
 	preLen := len(m.records)
 	m.handleCopy()
-	if !strings.Contains(m.uiNotice, "Failed to copy") {
-		t.Fatalf("failure notice not surfaced, uiNotice=%q", m.uiNotice)
+	if !strings.Contains(m.toast, "Failed to copy") {
+		t.Fatalf("failure notice not surfaced, uiNotice=%q", m.toast)
 	}
 	if len(m.records) != preLen {
 		t.Fatalf("clipboard failure mutated records: %d -> %d", preLen, len(m.records))
@@ -278,8 +278,8 @@ func TestHandleCopy_EmptyConversation(t *testing.T) {
 	if cb.writes != 0 {
 		t.Fatalf("empty conversation should not write to clipboard, writes=%d", cb.writes)
 	}
-	if m.uiNotice != "Nothing to copy — conversation is empty" {
-		t.Fatalf("empty notice = %q", m.uiNotice)
+	if m.toast != "Nothing to copy — conversation is empty" {
+		t.Fatalf("empty notice = %q", m.toast)
 	}
 }
 
@@ -292,8 +292,8 @@ func TestHandleCopy_ViaHandleCommand(t *testing.T) {
 	if cb.writes != 1 {
 		t.Fatalf("/copy via handleCommand did not write clipboard, writes=%d", cb.writes)
 	}
-	if m.uiNotice != "Copied conversation to clipboard" {
-		t.Fatalf("uiNotice after /copy = %q", m.uiNotice)
+	if m.toast != "Copied conversation to clipboard" {
+		t.Fatalf("uiNotice after /copy = %q", m.toast)
 	}
 }
 

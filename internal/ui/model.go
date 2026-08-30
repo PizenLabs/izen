@@ -967,6 +967,20 @@ type model struct {
 	// Cached prompt text for logging (set on submit, cleared after stream completion)
 	currentPrompt string
 
+	// sessionHasRunPrompts marks whether the user has submitted at least one
+	// prompt this session. It drives the footer's Fresh-Launch vs Active-Session
+	// IDLE states: before the first submission the footer shows the clean
+	// startup hint (`<model> · Alt+E trace · Ctrl+H help`); afterwards it shows
+	// the persistent usage telemetry. Never reset by /clear (session-durable).
+	sessionHasRunPrompts bool
+
+	// traceSummaryShown tracks whether the current turn already emitted its
+	// single quiet-mode "▸ Trace:" summary on the per-line activity path
+	// (styleActivityLine). Reset at each prompt submission so every turn gets
+	// exactly one summary. The document-layout path carries its own persistent
+	// dedup in DocumentLayout.traceSummaryEmitted.
+	traceSummaryShown bool
+
 	// lastPlanIntent is the raw user intent captured when /plan staged its task
 	// list. It survives mode transitions (the current prompt is overwritten by
 	// the later "/build" invocation) so /build can reconstruct the rewrite
@@ -979,8 +993,14 @@ type model struct {
 	microBudget    *budget.MicroBudget
 	caps           *capability.CapabilitySet
 
-	// Focus objective UI notifications (non-chat)
-	uiNotice string
+	// ── Transient toast overlay (Top Bar) ─────────────────────────
+	// toast is the transient top-bar notification message. It renders as a
+	// "[✓ <msg>]" overlay on the far-right boundary of the fixed Top Bar and
+	// auto-clears toastDuration after it was set. toastSetAt anchors that
+	// display window. The footer NEVER renders toasts — they belong to the
+	// Top Bar overlay (lifecycle-driven footer).
+	toast      string
+	toastSetAt time.Time
 
 	// Proposal widget diff scroll offset
 	proposalDiffOffset int

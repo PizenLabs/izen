@@ -673,7 +673,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// lowering failure) must surface their explicit reason in the
 			// status-bar footer.
 			if msg.Microkernel || msg.IntentCompiler {
-				m.uiNotice = msg.Err.Error()
+				m.setToast(msg.Err.Error())
 			}
 			// Retain a baseline Action Chip so the user is never left with a
 			// dead viewport and no buttons — they can re-investigate the failure.
@@ -767,11 +767,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		if msg.Microkernel {
 			// Deterministic microkernel plans consumed no model tokens.
-			m.uiNotice = fmt.Sprintf("Microkernel plan: %d deterministic task(s), no model call", len(msg.Tasks))
+			m.setToast(fmt.Sprintf("Microkernel plan: %d deterministic task(s), no model call", len(msg.Tasks)))
 		}
 		if msg.IntentCompiler {
 			// IR-driven intent compiler plans consumed no model tokens.
-			m.uiNotice = fmt.Sprintf("Intent compiler plan: %d task(s) from IR lowerer — no model call", len(msg.Tasks))
+			m.setToast(fmt.Sprintf("Intent compiler plan: %d task(s) from IR lowerer — no model call", len(msg.Tasks)))
 		}
 		// Render the staged task list into the viewport so the developer can
 		// see exactly what /build will execute — Principal Engineer format.
@@ -1557,7 +1557,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 	case objectiveAnalyzedMsg:
 		if msg.err != nil {
-			m.uiNotice = "Objective analysis failed: " + msg.err.Error()
+			m.setToast("Objective analysis failed: " + msg.err.Error())
 			if m.sess.ObjectiveState != nil {
 				m.sess.ObjectiveState.CurrentStatus = domain.ObjectiveIdle
 				m.sess.SetObjectiveState(m.sess.ObjectiveState)
@@ -1566,15 +1566,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			return m, nil
 		}
 		if msg.objective == nil {
-			m.uiNotice = "Objective analysis failed: empty objective result."
+			m.setToast("Objective analysis failed: empty objective result.")
 			return m, nil
 		}
 		m.sess.SetObjectiveState(msg.objective)
 		_ = m.sess.Save()
 		if msg.objective.TokenBudget.RequiresApproval {
-			m.uiNotice = "Objective needs manual approval. Run /objective approve."
+			m.setToast("Objective needs manual approval. Run /objective approve.")
 		} else {
-			m.uiNotice = "Objective planned and active."
+			m.setToast("Objective planned and active.")
 		}
 		return m, nil
 
@@ -2984,11 +2984,18 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		// ── PRIORITY 1: ACTIVE TEXT INPUT ────────────────────────────
 		// A printable character typed into the focused input is ALWAYS text.
-		// It can never be hijacked by a capability hotkey, the '?' help
-		// toggle, or any other single-character keybinding. Explicit
-		// keybinding mechanisms (Enter, Esc, arrows, alt+…, ctrl+…) fall
-		// through to the handlers below.
+		// It can never be hijacked by a capability hotkey or any other
+		// single-character keybinding. Explicit keybinding mechanisms (Enter,
+		// Esc, arrows, alt+…, ctrl+…) fall through to the handlers below.
+		//
+		// EXCEPTION: a '?' typed into a COMPLETELY EMPTY input buffer opens the
+		// command palette / help modal instead of inserting '?' — the char is
+		// consumed and never reaches the text input.
 		if m.ti.Focused() && isPrintableRunes(msg) {
+			if msg.String() == "?" && strings.TrimSpace(m.ti.Value()) == "" {
+				m.showHelpOverlay = !m.showHelpOverlay
+				return m, nil
+			}
 			return m, m.forwardToInput(msg)
 		}
 
@@ -3290,7 +3297,7 @@ func (m *model) enterViMode() tea.Cmd {
 	m.viCmdBuf = ""
 	m.ti.Blur()
 	m.refreshViewportContent()
-	m.uiNotice = "Copy mode: j/k scroll, v select, y yank, / search, Esc or :q to exit"
+	m.setToast("Copy mode: j/k scroll, v select, y yank, / search, Esc or :q to exit")
 	return tea.EnableMouseCellMotion
 }
 
@@ -3315,7 +3322,7 @@ func (m *model) exitViMode() tea.Cmd {
 	m.ti.Focus()
 	m.refreshViewportContent()
 	m.gotoBottomIfAllowed()
-	m.uiNotice = ""
+	m.clearToast()
 	return nil
 }
 

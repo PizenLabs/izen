@@ -5,9 +5,9 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/core/runtime"
 	"github.com/PizenLabs/izen/internal/core/workflow"
+	"github.com/PizenLabs/izen/internal/modes"
 )
 
 // Fixed header styles
@@ -21,12 +21,6 @@ var (
 	workflowStateStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(lipgloss.Color(colorMauve))
-	capBadgeEnabledStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color(colorGreen)).
-				Padding(0, 1)
-	capBadgeDisabledStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color(colorDimmed)).
-				Padding(0, 1)
 	indexingStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color(colorYellow)).
 			Bold(true)
@@ -35,11 +29,18 @@ var (
 			Bold(true)
 )
 
-// renderFixedHeader renders the anchored top bar: WorkflowState badge,
-// indexing status Indicator, and CapabilitySet flags in a single
-// compact, high-density line. This maximizes scrollable viewport space
-// by eliminating redundant mode/context info.
-func renderFixedHeader(runtimeCtx *runtime.RuntimeContext, wfSM *workflow.WorkflowStateMachine, width int, indexingStatus string) string {
+// renderFixedHeader renders the anchored top bar as a single compact,
+// high-density line with exactly two regions:
+//
+//	Left:  ● <WORKFLOW_STATE>  ● Indexed   (state + indexing status)
+//	Right: Toast Overlay "[✓ <msg>]" when active, otherwise the Mode Badge
+//	       ("[READ-ONLY]" / "[WRITE]" / "[EXECUTE]").
+//
+// The static R W X T P C B capability flags are gone — the Mode Badge is the
+// sole right-side indicator. A transient toast (toast != "") owns the far-right
+// boundary for its window, so the bar never grows a row for notifications. See
+// internal/ui/topbar.go for the toast lifecycle.
+func renderFixedHeader(runtimeCtx *runtime.RuntimeContext, wfSM *workflow.WorkflowStateMachine, mode modes.Mode, width int, indexingStatus string, toast string) string {
 	if runtimeCtx == nil || wfSM == nil || width < 20 {
 		return ""
 	}
@@ -48,9 +49,9 @@ func renderFixedHeader(runtimeCtx *runtime.RuntimeContext, wfSM *workflow.Workfl
 
 	var b strings.Builder
 
+	// ── Left region: workflow state + indexing status ──────────────
 	b.WriteString(workflowStateStyle.Render(Icon.Check + " " + strings.ToUpper(ws.String())))
 
-	// Indexing status indicator
 	switch indexingStatus {
 	case "indexing":
 		b.WriteString("  ")
@@ -63,36 +64,13 @@ func renderFixedHeader(runtimeCtx *runtime.RuntimeContext, wfSM *workflow.Workfl
 		b.WriteString(indexingStyle.Render(Icon.Error + " Index error"))
 	}
 
-	if runtimeCtx.Caps != nil {
-		b.WriteString("  ")
-		b.WriteString(renderCapabilities(runtimeCtx.Caps))
+	// ── Right region: toast overlay (active) or mode badge (idle) ──
+	right := toast
+	if right == "" {
+		right = renderModeBadge(mode)
 	}
-
-	return headerBorderStyle.Width(width).Render(b.String())
-}
-
-// renderCapabilities renders the enabled capability badges inline.
-func renderCapabilities(caps *capability.CapabilitySet) string {
-	type capDef struct {
-		key  capability.Capability
-		icon string
+	if right == "" {
+		return headerBorderStyle.Width(width).Render(b.String())
 	}
-	all := []capDef{
-		{capability.CapabilityRead, "R"},
-		{capability.CapabilityWrite, "W"},
-		{capability.CapabilityExecute, "X"},
-		{capability.CapabilityTest, "T"},
-		{capability.CapabilityPatch, "P"},
-		{capability.CapabilityCheckpoint, "C"},
-		{capability.CapabilityRollback, "B"},
-	}
-	var badges []string
-	for _, c := range all {
-		if caps.Has(c.key) {
-			badges = append(badges, capBadgeEnabledStyle.Render(c.icon))
-		} else {
-			badges = append(badges, capBadgeDisabledStyle.Render(c.icon))
-		}
-	}
-	return strings.Join(badges, " ")
+	return headerBorderStyle.Width(width).Render(padRightOverlay(b.String(), right, width))
 }

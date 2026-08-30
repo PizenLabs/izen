@@ -162,7 +162,7 @@ func (m *model) resetTransientInteraction() {
 	m.lastTestFailed = false
 	m.lastTestTarget = ""
 	m.pendingFileRefs = nil
-	m.uiNotice = ""
+	m.clearToast()
 
 	// ── Unwind transient busy flags + spinner to interactive chat ──
 	// clearBusyFlags ONLY clears transient processing flags — it never cancels

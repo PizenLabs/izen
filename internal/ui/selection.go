@@ -361,9 +361,9 @@ func (m *model) copyMouseSelection() tea.Cmd {
 	m.frozenRecords = nil
 	m.refreshViewportContent()
 	if werr != nil {
-		m.uiNotice = "Failed to copy selection: " + werr.Error()
+		m.setToast("Failed to copy selection: " + werr.Error())
 	} else {
-		m.uiNotice = "Copied selection to clipboard"
+		m.setToast("Copied selection to clipboard")
 	}
 	return nil
 }

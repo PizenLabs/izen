@@ -40,6 +40,11 @@ type DocumentLayout struct {
 	mu    sync.RWMutex
 	Lines []DocumentLine
 	width int // wrap width used to build layout
+	// traceSummaryEmitted reports whether this layout already carries the
+	// single per-turn quiet-mode "▸ Trace:" summary. It persists across
+	// IncrementalLayoutUpdate merges so a `▸ Trace:` line is NEVER repeated
+	// sequentially within a turn. Reset at each prompt submission.
+	traceSummaryEmitted bool
 }
 
 // Clone returns a shallow copy without copying the mutex.
@@ -48,7 +53,7 @@ func (d *DocumentLayout) Clone() DocumentLayout {
 	defer d.mu.RUnlock()
 	lines := make([]DocumentLine, len(d.Lines))
 	copy(lines, d.Lines)
-	return DocumentLayout{Lines: lines, width: d.width}
+	return DocumentLayout{Lines: lines, width: d.width, traceSummaryEmitted: d.traceSummaryEmitted}
 }
 
 // ScreenToGlobal maps viewport-relative coordinates directly to GlobalPos.

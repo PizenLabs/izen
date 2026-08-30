@@ -25,15 +25,16 @@ type Section struct {
 // by the renderer:
 //   - Overlay:      full-screen replacement (init / help / loading). Non-empty
 //     => the renderer shows only this.
-//   - Header:       fixed top region — WorkflowState + CapabilitySet + Artifact info.
-//     Derived from RuntimeContext + WorkflowStateMachine; never stored/cached.
+//   - Header:       fixed top region — WorkflowState + CapabilitySet + toast
+//     overlay. Derived from RuntimeContext + WorkflowStateMachine; never
+//     stored/cached.
 //   - Viewport:     main scrollable content (height-sized by the assembler).
 //   - ProposalDock: optional mutation/processing dock ("" = none).
-//   - Input:        autocomplete + separators + prompt region (precomposed).
-//   - StatusBar:    telemetry line (mode + elapsed + action hints), between
-//     Input and the fixed Footer.
-//   - Footer:       fixed bottom region — Budget counters + notifications.
-//     Derived from RuntimeContext; never stored/cached.
+//   - Input:        autocomplete + separators + prompt region (precomposed),
+//     anchored directly above the single-line lifecycle Footer.
+//   - Footer:       fixed bottom region — single-line lifecycle bar
+//     (IDLE "? help · <model>" / EXECUTING streaming metrics). Derived from
+//     the interaction lifecycle; never stored/cached.
 //   - Actions:      capabilities exposed by the current workflow.
 //   - Sections:     mode-owned content sections.
 type Workspace struct {
@@ -42,7 +43,6 @@ type Workspace struct {
 	Viewport     string
 	ProposalDock string
 	Input        string
-	StatusBar    string
 	Footer       string
 	Actions      []Action
 	Sections     []Section

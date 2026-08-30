@@ -151,17 +151,37 @@ func TestPhase6PrintableCharInStateChatIsText(t *testing.T) {
 	}
 }
 
-func TestPhase6QuestionMarkTypesInsteadOfHelp(t *testing.T) {
+func TestPhase6QuestionMarkEmptyInputOpensHelp(t *testing.T) {
 	m := initializedChatModel(t)
 	m.ti.Focus()
 	m.ti.SetValue("")
 
 	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
-	if m.showHelpOverlay {
-		t.Fatal("'?' must be text, not a help-toggle hotkey")
+	if !m.showHelpOverlay {
+		t.Fatal("'?' on an empty input must open the help overlay, not type text")
 	}
-	if got := m.ti.Value(); got != "?" {
-		t.Fatalf("input value = %q, want %q", got, "?")
+	if got := m.ti.Value(); got != "" {
+		t.Fatalf("input value = %q, want empty (the '?' must not be inserted)", got)
+	}
+
+	// A second '?' on the still-empty input closes the overlay.
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	if m.showHelpOverlay {
+		t.Fatal("second '?' should close the help overlay")
+	}
+}
+
+func TestPhase6QuestionMarkWithTextStillTypes(t *testing.T) {
+	m := initializedChatModel(t)
+	m.ti.Focus()
+	m.ti.SetValue("hello")
+
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	if m.showHelpOverlay {
+		t.Fatal("'?' with non-empty input must NOT open help")
+	}
+	if got := m.ti.Value(); got != "hello?" {
+		t.Fatalf("input value = %q, want %q", got, "hello?")
 	}
 }
 
