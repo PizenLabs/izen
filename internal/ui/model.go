@@ -191,6 +191,14 @@ type tickMsg time.Time
 
 type smoothStreamTickMsg time.Time
 
+// repaintTickMsg is the single-flight 30FPS viewport repaint gate. During
+// token streaming, incoming tokens are appended to docLayout in memory
+// instantly, but at most ONE repaintTickMsg is scheduled at a time; on arrival
+// refreshScheduled is reset and exactly one visible frame is rendered. It is
+// never chained recursively — a fresh frame is only scheduled when new tokens
+// actually arrive.
+type repaintTickMsg time.Time
+
 type spinnerTickMsg time.Time
 
 type proTipTickMsg time.Time
@@ -713,8 +721,9 @@ type model struct {
 	showBanner bool
 
 	// Window dimensions
-	width  int
-	height int
+	width     int
+	height    int
+	wrapWidth int
 
 	// Viewport for scrollable chat history
 	Viewport           viewport.Model
@@ -1018,6 +1027,10 @@ type model struct {
 	// Latency telemetry: marked when a turn is submitted, read back when the
 	// stream completes to compute this-turn latency for the status line.
 	streamStartTime time.Time
+
+	// Thought duration timer: start on prompt submit, frozen on StreamDoneMsg / StateIdle.
+	thoughtStartTime time.Time
+	thoughtEndTime   time.Time
 
 	// AI Interrupt Engine: cancel function for active stream, set by streamCmd.
 	streamCancel       context.CancelFunc
@@ -1470,6 +1483,87 @@ type model struct {
 
 	// Current effort level for generation
 	currentEffort EffortLevel
+
+	// Clipboard abstraction for /copy and yank. Nil uses the default
+	// system clipboard. Tests may inject a fake implementation.
+	clipboard Clipboard
+
+	// ── Mouse selection (orthogonal presentation state) ──────────────────
+	// Execution State, Viewport State, Selection State and Copy State remain
+	// independent concerns. Selection operates on logical records, not terminal
+	// byte offsets.
+	mouseSel mouseSelection
+	// docLayout is the global flat render document (space-anchored geometry).
+	// It is the single source of truth for span-level cell mapping and
+	// ScreenToGlobal conversion. Updated incrementally during streaming.
+	docLayout *DocumentLayout
+	// streamingDocStart is the index into docLayout.Lines where the active
+	// streaming AI record's trailing segment begins. -1 when no streaming
+	// segment is attached (idle, or before the first token arrives).
+	streamingDocStart int
+	// aiStreamRenderer is the persistent markdown state machine that consumes
+	// COMPLETE logical lines of the live streaming record. It carries
+	// code-block / list state across ticks so each streaming tick re-renders
+	// ONLY the partial trailing line instead of re-parsing the whole response
+	// (zero-bottleneck O(delta) streaming — never an O(response) re-parse per
+	// token tick).
+	aiStreamRenderer *aiBlockRenderer
+	// aiStreamConsumed is the byte length of the sanitized streaming content
+	// whose complete logical lines have already been committed to
+	// aiStreamRenderer. It is the offset the next tick feeds from.
+	aiStreamConsumed int
+	// aiStreamTailCache memoizes the last computed visible streaming tail
+	// (committed + partial lines, without GlobalY/RecordIdx/cursor) so frames
+	// where no new token arrived never re-render at all.
+	aiStreamTailCache []DocumentLine
+	// aiStreamTailContent is the sanitized streaming content that produced
+	// aiStreamTailCache. It is the no-change fast-path key and the prefix
+	// anchor for the incremental extension check.
+	aiStreamTailContent string
+	// docScrollOffset is the app-owned single scroll position into the
+	// scrollable document. The bubbles viewport is a pure render surface
+	// (content is pre-sliced to exactly the visible window and
+	// Viewport.YOffset is always 0), so all scrolling — wheel, selection
+	// auto-scroll, vi-mode, Space-to-tail — flows through this one offset.
+	docScrollOffset int
+	// refreshScheduled is the single-flight 30FPS repaint gate: at most one
+	// repaintTickMsg is in flight during token streaming.
+	refreshScheduled bool
+	// repaintSeq is a monotonic counter bumped every time new streaming tokens
+	// are spliced into docLayout's streaming tail. It lets the repaintTickMsg
+	// handler detect tokens that arrived while the single-flight gate was armed
+	// and re-arm exactly one final repaint so no token buffer is ever left
+	// unrendered in memory.
+	repaintSeq uint64
+	// repaintScheduledAt is the repaintSeq value captured when the gate was
+	// armed (scheduleRepaint). The repaint tick compares it to the live
+	// repaintSeq to decide whether a final frame is still owed.
+	repaintScheduledAt uint64
+	// userScrolledAway mirrors userIsScrollingUp: true when the user has
+	// manually scrolled away from the tail, suppressing auto-tail-lock.
+	userScrolledAway bool
+	// lastScrollTotal caches the full scrollable document height (chrome +
+	// records/streaming + tail panels) from the most recent refresh so
+	// scroll-bounds helpers (selection auto-scroll, wheel) stay consistent
+	// with the manual-slicing contract without re-rendering the document.
+	lastScrollTotal int
+	// viewportHitMap is the single source of truth for mouse hit-testing.
+	// Generated atomically alongside Viewport.SetContent; cached only for
+	// the visible window (YOffset .. YOffset+Height) for bounded memory.
+	viewportHitMap ViewportHitMap
+	fullHitRows    []RowLayout // transient full physical rows before windowing
+	// viewportPaneLeft/Top are split-pane offsets for multi-pane geometry.
+	// When running inside tmux/Ghostty splits, the viewport does not occupy
+	// absolute (0,0) of the terminal; mouse coordinates must be translated
+	// relative to these offsets. Tests inject non-zero values to verify
+	// relative hit-testing. Zero value means full-screen (no pane offset).
+	viewportPaneLeft int
+	viewportPaneTop  int
+	// frozenHitRows preserves the hitmap while dragging to prevent background
+	// ticks from shifting layout. Nil when not dragging.
+	frozenFullHitRows []RowLayout
+	frozenViewportStr string
+	frozenRecords     []record
 }
 
 // isProjectInitialized checks whether .izen/ exists AND contains a valid
@@ -2178,6 +2272,16 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	case events.PreflightEventPayload:
 		m.logActivity("[preflight] %s: %s (target=%s est=%d max=%d)",
 			p.State, truncateForActivity(p.Reason), p.Target, p.EstimatedTokens, p.MaxOutputTokens)
+		// ── PREFLIGHT COMPLETE: MANDATORY SYNCHRONOUS LAYOUT SYNC ──
+		// A completed preflight collapses its multi-line trace to a single
+		// "✓ preflight completed" summary and must appear instantly (the
+		// state-transition analog of StreamDoneMsg). Re-pin the tail and flush
+		// the final frame synchronously — a pending repaint tick can never gate
+		// a state-transition frame.
+		if p.State == "completed" {
+			m.followTail()
+			m.refreshViewportContentImmediate()
+		}
 	case events.AutonomousLifecyclePayload:
 		m.logActivity("[autonomy] %s: %s", strings.TrimPrefix(ev.Type(), "autonomous."), truncateForActivity(p.Reason))
 	}
@@ -2911,12 +3015,22 @@ func (m *model) cacheRecordToHistory(rec record) {
 // multi-line content like the TODO CHECKLIST must preserve its line structure
 // (each checklist item on its own line) rather than being reflowed as one blob.
 func (m *model) renderRecordForViewport(rec record) string {
-	width := m.width
-	if width < 40 {
-		width = 40
+	viewportWidth := m.width
+	if m.Ready && m.Viewport.Width > 0 {
+		viewportWidth = m.Viewport.Width
 	}
-
-	wrapWidth := width - 4
+	if viewportWidth < 40 {
+		viewportWidth = 40
+	}
+	width := viewportWidth
+	// Strict 2-cell safety padding: availableWidth = viewport.Width - 4
+	// Ensures wrapped lines never exceed Viewport.Width and lipgloss viewport
+	// truncation never slices words mid-word.
+	availableWidth := viewportWidth - 4
+	if availableWidth < 20 {
+		availableWidth = 20
+	}
+	wrapWidth := availableWidth
 	if wrapWidth <= 0 {
 		wrapWidth = 80
 	}
@@ -2929,6 +3043,10 @@ func (m *model) renderRecordForViewport(rec record) string {
 	// to spaces so multi-line messages display correctly instead of leaking raw
 	// backslash sequences or tab misalignment into the viewport.
 	text := sanitizeText(rec.text)
+	// Defect fix: activity/preflight trace blocks must strictly terminate with
+	// \n before the body text starts rendering. Without this, "[preflight]
+	// snapshot ready ... tokens=0Go, commonly..." bleeds on one line.
+	text = ensurePreflightDelimiter(text)
 
 	// Strict per-line width bound is enforced by the wrapper below
 	// (wrapIndentedLine / wrapText): every wrapped line lands at most
@@ -2977,6 +3095,120 @@ func (m *model) renderRecordForViewport(rec record) string {
 		}
 		return strings.TrimSuffix(b.String(), "\n")
 	}
+}
+
+// canonicalRecordsContent builds the single canonical rendered string for all
+// records at the current width. It is the sole source of truth for both Idle
+// and Selection rendering — enabling selection must not alter row count,
+// line height, metadata visibility, or line merging. Physical row N in Idle
+// MUST remain physical row N in Selection.
+func (m *model) canonicalRecordsContent() string {
+	if len(m.records) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, rec := range m.records {
+		rendered := m.renderRecordForViewport(rec)
+		if rendered == "" {
+			continue
+		}
+		b.WriteString(rendered)
+		if i < len(m.records)-1 {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// renderFromDocumentLayout returns the deterministic layout-driven content string.
+// It is the single source for both idle and active rendering to enforce visual
+// layout invariance (same physical lines, wrapping, chrome). Selection overlay
+// paints onto this without altering line count.
+func (m *model) renderFromDocumentLayout() string {
+	if m.docLayout == nil || m.docLayout.Len() == 0 {
+		return ""
+	}
+	m.docLayout.mu.RLock()
+	defer m.docLayout.mu.RUnlock()
+	var b strings.Builder
+	for i, line := range m.docLayout.Lines {
+		b.WriteString(line.RenderedStr)
+		if i < len(m.docLayout.Lines)-1 {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// ensurePreflightDelimiter ensures every activity/preflight trace block strictly
+// terminates with \n before the body text starts rendering. Defect: metadata
+// log lines bleed directly into the first line of the AI response without a
+// newline, e.g. "[preflight] snapshot ready target=\"\" sha= tokens=0 Go,
+// commonly...". This inserts an explicit \n boundary so the hitmap can count
+// the preflight header as a distinct physical row (LogicalLine -1) and the body
+// starts on the subsequent row with RuneStartIdx 0.
+func ensurePreflightDelimiter(s string) string {
+	if !strings.Contains(s, "[preflight]") && !strings.Contains(s, "snapshot ready") && !strings.Contains(s, "preflight") {
+		return s
+	}
+	// If the string already contains a newline separating preflight header from body, no fix needed.
+	if strings.Contains(s, "[preflight]") {
+		// Find the line containing [preflight]; if that logical line also contains body text
+		// after the tokens= pattern without an intervening \n, split it.
+		lines := strings.Split(s, "\n")
+		for i, line := range lines {
+			if strings.Contains(line, "[preflight]") || strings.Contains(line, "snapshot ready") {
+				// Look for "tokens=" pattern within this line - header ends after tokens number.
+				if idx := strings.Index(line, "tokens="); idx != -1 {
+					end := idx + len("tokens=")
+					for end < len(line) && line[end] >= '0' && line[end] <= '9' {
+						end++
+					}
+					// Trim spaces after tokens number
+					spaceEnd := end
+					for spaceEnd < len(line) && line[spaceEnd] == ' ' {
+						spaceEnd++
+					}
+					if spaceEnd < len(line) && line[spaceEnd] != '\n' {
+						// Body starts immediately after header on same line - split
+						header := strings.TrimRight(line[:spaceEnd], " ")
+						body := strings.TrimLeft(line[spaceEnd:], " ")
+						if body != "" {
+							lines[i] = header
+							// Insert new line with body after
+							newLines := make([]string, 0, len(lines)+1)
+							newLines = append(newLines, lines[:i+1]...)
+							newLines = append(newLines, body)
+							newLines = append(newLines, lines[i+1:]...)
+							return strings.Join(newLines, "\n")
+						}
+					}
+				}
+				// Fallback: if line contains both preflight marker and body text like "tokens=0 Go,"
+				// ensure split at "tokens=0" boundary
+				if strings.Contains(line, "tokens=0 Go,") {
+					lines[i] = strings.Replace(line, "tokens=0 Go,", "tokens=0\nGo,", 1)
+					return strings.Join(lines, "\n")
+				}
+			}
+		}
+	}
+	// Generic case: single line containing both header and body separated by space + capital letter
+	if !strings.Contains(s, "\n") && strings.Contains(s, "[preflight]") && strings.Contains(s, "tokens=") {
+		if idx := strings.Index(s, "tokens="); idx != -1 {
+			end := idx + len("tokens=")
+			for end < len(s) && s[end] >= '0' && s[end] <= '9' {
+				end++
+			}
+			if end < len(s) && s[end] == ' ' {
+				rest := strings.TrimLeft(s[end:], " ")
+				if rest != "" && rest[0] >= 'A' && rest[0] <= 'Z' {
+					return s[:end] + "\n" + rest
+				}
+			}
+		}
+	}
+	return s
 }
 
 // sanitizeEscapes converts literal backslash escape sequences that reach the
@@ -3089,6 +3321,7 @@ func (m *model) resetStreamingState() {
 	m.streamCh = nil
 	m.streamCancel = nil
 	m.streamTickActive = false
+	m.refreshScheduled = false
 	m.agentRunning = false
 	m.agentLabel = ""
 	m.planPending = false
@@ -3217,6 +3450,13 @@ func (m *model) emitVisibleContent(raw string) {
 	if visible != "" {
 		m.currentStreamContent += visible
 		m.ensureStreamBlocks().Append(KindContent, visible)
+		// ── INSTANT IN-MEMORY TAIL UPDATE ──────────────────────────
+		// Append the new token to docLayout's streaming segment immediately
+		// (O(streaming record), never the whole document) so the throttled
+		// 30FPS repaint always renders the current frame.
+		if m.docLayout != nil && m.streaming {
+			m.syncStreamingSegment()
+		}
 	}
 }
 
@@ -3434,206 +3674,797 @@ func (m *model) latestCheckpointID() string {
 	return m.sess.Checkpoints[len(m.sess.Checkpoints)-1]
 }
 
-// refreshViewportContent rebuilds the viewport's internal content from
-// PreRenderedHistory (cached) plus any active streaming content.
-// During streaming the PreRenderedHistory cache is never rebuilt,
-// which avoids re-highlighting or re-wrapping old history on every tick.
-// When in Vi-mode, records are rendered directly with cursor/selection
-// highlighting instead of using the cached PreRenderedHistory.
+// refreshViewportContent rebuilds the viewport's internal content.
+// It maintains the Global Flat Render Document (DocumentLayout) with span-level
+// geometry and incremental updates. Full re-flattening occurs only on
+// WindowSizeMsg or structural record mutation; streaming ticks update only the
+// trailing record.
 func (m *model) refreshViewportContent() {
 	if !m.Ready {
 		return
 	}
 	m.dotFrame = (m.dotFrame + 1) % 3
 
-	var content strings.Builder
-
+	// ── Chrome prefix (banner / context header / workspace header) ─────
+	// These rows are rendered fresh every frame (they are small and carry
+	// live mode/banner state) and prepended to the scrollable document.
+	var chrome strings.Builder
 	if m.showBanner && len(m.records) == 0 {
-		content.WriteString(m.renderStartupBanner(m.width))
+		if b := m.renderStartupBanner(m.width); b != "" {
+			chrome.WriteString(b)
+			chrome.WriteString("\n")
+		}
+	}
+	if ctx := m.renderContextHeader(); ctx != "" {
+		chrome.WriteString(ctx)
+	}
+	if !m.showBanner || len(m.records) > 0 {
+		chrome.WriteString(m.renderWorkspaceHeader())
+	}
+	chromeLines := splitContentLines(chrome.String())
+
+	// ── Incremental DocumentLayout update (records + streaming tail) ───
+	// Dynamic username badge: use m.cfg.Username or m.userName, fallback to
+	// Developer inside builder.
+	wrapWidth := m.wrapWidth
+	if wrapWidth == 0 {
+		wrapWidth = m.width
+	}
+	if wrapWidth < 20 {
+		wrapWidth = 20
+	}
+	// Keep wrapWidth in sync for incremental checks.
+	m.wrapWidth = wrapWidth
+	username := ""
+	if m.cfg != nil && m.cfg.Username != "" {
+		username = m.cfg.Username
+	} else if m.userName != "" {
+		username = m.userName
+	}
+	m.updateConversationLayout(wrapWidth, username)
+
+	// ── Tail panels (execution log, shimmer, thinking, trace, trees) ───
+	tailLines := m.renderTailPanelLines()
+
+	// ── VI-MODE special path (self-contained scroll via Viewport.YOffset) ──
+	if m.inViMode {
+		m.renderVIModeViewport(chromeLines, tailLines)
+		return
+	}
+
+	// ── MANUAL SLICING CONTRACT (single-offset, pre-sliced content) ────
+	// The bubbles viewport is a pure render surface: it always receives
+	// exactly the visible window and Viewport.YOffset is pinned to 0, so it
+	// can never double-scroll or clamp-jump (the viewport middle-jumping bug).
+	recStart := len(chromeLines)
+	total := recStart + m.docLayout.Len() + len(tailLines)
+	yOffset := m.calculateEffectiveYOffset(total)
+	if yOffset < 0 {
+		yOffset = 0
+	}
+	if maxOff := total - m.Viewport.Height; maxOff < 0 {
+		maxOff = 0
+		if yOffset > maxOff {
+			yOffset = maxOff
+		}
+	} else if yOffset > maxOff {
+		yOffset = maxOff
+	}
+	m.docScrollOffset = yOffset
+	m.lastScrollTotal = total
+
+	var visible []string
+	if m.mouseSel.Active {
+		visible = m.composeSelectionWindow(chromeLines, tailLines, recStart, yOffset, m.Viewport.Height, total)
+	} else {
+		visible = m.composeDefaultWindow(chromeLines, tailLines, recStart, yOffset, m.Viewport.Height, total)
+	}
+	contentStr := strings.Join(visible, "\n")
+	m.Viewport.SetContent(contentStr)
+	m.Viewport.YOffset = 0 // MANDATORY: 0 when passing pre-sliced content
+
+	// ── Visual layout invariance: deterministic canonical (records only) ──
+	var canonicalViaDoc string
+	if m.docLayout != nil && m.docLayout.Len() > 0 {
+		canonicalViaDoc = m.renderFromDocumentLayout()
+	} else {
+		canonicalViaDoc = m.canonicalRecordsContent()
+	}
+	if !m.streaming && !m.mouseSel.Dragging && canonicalViaDoc != "" {
+		m.PreRenderedHistory = canonicalViaDoc
+	}
+
+	// ── Build ViewportHitMap atomically alongside content ──────────────
+	// Single source of truth: wrap/prefix budgets are computed once in
+	// buildFullHitMap (hitmap.go) and consumed by mouse hit-testing.
+	// Memory bounded: only the visible window (YOffset..YOffset+Height) is cached.
+	var fullRows []RowLayout
+	if m.mouseSel.Dragging && m.frozenFullHitRows != nil && len(m.frozenFullHitRows) > 0 {
+		fullRows = m.frozenFullHitRows
+		if total > len(fullRows) {
+			for i := len(fullRows); i < total; i++ {
+				fullRows = append(fullRows, RowLayout{RecordIdx: -1, LogicalLine: -1, PrefixCells: 0})
+			}
+		}
+		m.fullHitRows = fullRows
+	} else {
+		fullRows = buildFullHitMap(m)
+		if total > len(fullRows) {
+			for i := len(fullRows); i < total; i++ {
+				fullRows = append(fullRows, RowLayout{RecordIdx: -1, LogicalLine: -1, PrefixCells: 0})
+			}
+		}
+		m.fullHitRows = fullRows
+		if m.mouseSel.Dragging && m.frozenFullHitRows == nil {
+			m.frozenFullHitRows = append([]RowLayout(nil), fullRows...)
+			m.frozenViewportStr = contentStr
+		}
+	}
+	geoH := m.viewportGeometry().Height
+	yOff := yOffset
+	if yOff < 0 {
+		yOff = 0
+	}
+	if yOff > len(fullRows) {
+		yOff = len(fullRows)
+	}
+	end := yOff + geoH
+	if end > len(fullRows) {
+		end = len(fullRows)
+	}
+	if yOff < end {
+		m.viewportHitMap = ViewportHitMap{YOffset: yOff, Rows: append([]RowLayout(nil), fullRows[yOff:end]...)}
+	} else {
+		m.viewportHitMap = ViewportHitMap{YOffset: yOff, Rows: nil}
+	}
+}
+
+// refreshViewportContentImmediate is the mandatory SYNCHRONOUS viewport flush
+// used on stream completion and terminal state transitions (StreamDoneMsg,
+// preflight-complete, prompt submit). Unlike a throttled scheduleRepaint —
+// which defers the frame to a repaintTickMsg and can be starved or dropped —
+// it renders the final frame into m.Viewport RIGHT NOW, on the calling turn:
+//
+//   - it cancels any armed single-flight repaint gate (refreshScheduled=false)
+//     so a queued stale tick can never paint over the completed frame, and
+//   - it strips the live streaming block cursor (▋) from the document tail so
+//     the completed response is never shown with a residual stream marker.
+//
+// Callers MUST use this instead of refreshViewportContent when the current
+// turn ends an async operation, otherwise the final content stays invisible
+// until an external UI event forces a repaint (the "prompt response invisible
+// until the second prompt" regression).
+func (m *model) refreshViewportContentImmediate() {
+	if !m.Ready {
+		return
+	}
+	m.refreshScheduled = false
+	m.stripStreamCursor()
+	m.refreshViewportContent()
+}
+
+// stripStreamCursor removes the active Accent-Blue block cursor (▋) from the
+// trailing physical line of the streaming segment. It is defensive: the
+// regular refresh path already strips the tail when m.streaming flips false,
+// but stream-completion turns must guarantee the marker is gone even if a
+// streaming tail is still attached to docLayout.
+func (m *model) stripStreamCursor() {
+	if m.docLayout == nil || m.streamingDocStart < 0 || m.streamingDocStart >= len(m.docLayout.Lines) {
+		return
+	}
+	last := &m.docLayout.Lines[len(m.docLayout.Lines)-1]
+	last.RenderedStr = strings.TrimSuffix(last.RenderedStr, streamCursorStyle.Render("▋"))
+	last.RenderedStr = strings.TrimSuffix(last.RenderedStr, "▋")
+}
+
+// splitContentLines splits a rendered content string into physical lines,
+// dropping a single trailing empty line (an artifact of trailing "\n").
+func splitContentLines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, "\n")
+	if len(parts) > 0 && parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
+	return parts
+}
+
+// renderChromePrefixHeight returns the number of physical chrome rows
+// (banner/context/workspace header) at the top of the scrollable document.
+func (m *model) renderChromePrefixHeight() int {
+	return m.viewportContentPrefixHeight()
+}
+
+// composeDefaultWindow builds the visible window for the idle path with
+// O(Height) cost: it indexes into the chrome / docLayout / tail line arrays
+// without materializing the whole document.
+func (m *model) composeDefaultWindow(chromeLines, tailLines []string, recStart, yOffset, height, total int) []string {
+	recEnd := recStart + m.docLayout.Len()
+	visible := make([]string, 0, height)
+	for i := yOffset; i < total && i < yOffset+height; i++ {
+		switch {
+		case i < recStart:
+			visible = append(visible, chromeLines[i])
+		case i < recEnd:
+			visible = append(visible, m.docLayout.Lines[i-recStart].RenderedStr)
+		default:
+			visible = append(visible, tailLines[i-recEnd])
+		}
+	}
+	return visible
+}
+
+// composeSelectionWindow is composeDefaultWindow with cell-accurate selection
+// highlighting applied to the visible docLayout rows (never altering line
+// count — the layout invariance guarantee).
+func (m *model) composeSelectionWindow(chromeLines, tailLines []string, recStart, yOffset, height, total int) []string {
+	recEnd := recStart + m.docLayout.Len()
+	visible := make([]string, 0, height)
+	for i := yOffset; i < total && i < yOffset+height; i++ {
+		switch {
+		case i < recStart:
+			visible = append(visible, chromeLines[i])
+		case i < recEnd:
+			docIdx := i - recStart
+			rendered := m.docLayout.Lines[docIdx].RenderedStr
+			if rendered == "" {
+				rendered = m.docLayout.Lines[docIdx].RawText
+			}
+			visible = append(visible, m.applySelectionToLine(docIdx, rendered))
+		default:
+			visible = append(visible, tailLines[i-recEnd])
+		}
+	}
+	return visible
+}
+
+// applySelectionToLine paints the active mouse selection onto a single
+// docLayout row. The per-line logic is extracted from renderDocumentWithSelection
+// so the visible window can be highlighted without rendering the whole document.
+func (m *model) applySelectionToLine(idx int, rendered string) string {
+	if !m.mouseSel.Active || m.docLayout == nil || idx < 0 || idx >= m.docLayout.Len() {
+		return rendered
+	}
+	s, e := m.mouseSel.normalized()
+	if idx < s.Y || idx > e.Y {
+		return rendered
+	}
+	line := m.docLayout.Lines[idx]
+	raw := ansi.Strip(line.RawText)
+	if raw == "" && line.RenderedStr != "" {
+		raw = ansi.Strip(line.RenderedStr)
+	}
+	lineCells := StringCellWidth(raw)
+	startCell, endCell := 0, lineCells-1
+	isFirst := idx == s.Y
+	isLast := idx == e.Y
+	if s.Y == e.Y {
+		startCell, endCell = s.X, e.X
+	} else if isFirst {
+		startCell = s.X
+	} else if isLast {
+		endCell = e.X
+	}
+	gutter := 0
+	for _, sp := range line.Spans {
+		if sp.Selectable {
+			gutter = sp.StartCell
+			break
+		}
+	}
+	contentStartCell := startCell - gutter
+	contentEndCell := endCell - gutter
+	if contentStartCell < 0 {
+		contentStartCell = 0
+	}
+	if contentEndCell < 0 {
+		contentEndCell = 0
+	}
+	if contentStartCell <= contentEndCell && lineCells > 0 {
+		startRune := cellToRuneIdxRunes([]rune(raw), contentStartCell)
+		endRuneEx := cellToRuneIdxRunes([]rune(raw), contentEndCell+1)
+		endRune := endRuneEx - 1
+		if startRune < 0 {
+			startRune = 0
+		}
+		if endRune >= len([]rune(raw)) {
+			endRune = len([]rune(raw)) - 1
+		}
+		if startRune <= endRune && startRune < len([]rune(raw)) {
+			rendered = injectStyleRange(rendered, startRune, endRune, viSelectionBgStyle)
+		}
+	}
+	return rendered
+}
+
+// renderVIModeViewport renders the full document (chrome + records with the
+// vi-mode cursor/selection painted inline + tail panels) using the legacy
+// full-content SetContent + Viewport.YOffset contract. vi-mode owns its scroll
+// position directly; leaving the mode returns refreshViewportContent to the
+// manual-slicing contract.
+func (m *model) renderVIModeViewport(chromeLines, tailLines []string) {
+	var content strings.Builder
+	for _, l := range chromeLines {
+		content.WriteString(l)
 		content.WriteString("\n")
 	}
-
-	ctxHeader := m.renderContextHeader()
-	if ctxHeader != "" {
-		content.WriteString(ctxHeader)
+	content.WriteString(m.renderRecordsWithCursor())
+	if len(tailLines) > 0 {
+		content.WriteString("\n")
+		for _, l := range tailLines {
+			content.WriteString(l)
+			content.WriteString("\n")
+		}
 	}
+	contentStr := strings.TrimSuffix(content.String(), "\n")
+	m.Viewport.SetContent(contentStr)
+	// The vi-mode caller (update.go) syncs Viewport.YOffset after this refresh;
+	// vi-mode owns its scroll position directly on the full-content viewport.
+}
 
-	if !m.showBanner || len(m.records) > 0 {
-		content.WriteString(m.renderWorkspaceHeader())
+// rebuildDocumentLayout clears the document layout and fully re-runs the layout
+// pass over all committed records using the updated wrapWidth. It re-anchors
+// docScrollOffset so the view does not jump out of bounds after a resize.
+func (m *model) rebuildDocumentLayout() {
+	if m.wrapWidth < 20 {
+		m.wrapWidth = 20
 	}
+	username := ""
+	if m.cfg != nil && m.cfg.Username != "" {
+		username = m.cfg.Username
+	} else if m.userName != "" {
+		username = m.userName
+	}
+	// Clear existing layout.
+	m.docLayout = nil
+	m.streamingDocStart = -1
+	m.resetStreamingRenderer()
+	dl := BuildDocumentLayout(m.records, m.wrapWidth, username)
+	m.docLayout = &dl
+	m.syncStreamingSegment()
+	// Re-anchor scroll offset: clamp to valid range based on new layout + chrome + tail.
+	chrome := m.viewportContentPrefixHeight()
+	tail := len(m.renderTailPanelLines())
+	total := chrome + dl.Len() + tail
+	maxOff := total - m.Viewport.Height
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if m.docScrollOffset > maxOff {
+		m.docScrollOffset = maxOff
+	}
+	if m.docScrollOffset < 0 {
+		m.docScrollOffset = 0
+	}
+}
 
-	if m.inViMode {
-		content.WriteString(m.renderRecordsWithCursor())
-	} else if m.PreRenderedHistory != "" {
-		content.WriteString(m.PreRenderedHistory)
+// updateConversationLayout incrementally updates the records-only DocumentLayout
+// (width changes and structural record mutations trigger full rebuilds; during
+// streaming only the trailing record is re-flattened) and then splices the live
+// streaming tail as the trailing segment via the unified markdown engine.
+func (m *model) updateConversationLayout(wrapWidth int, username string) {
+	if wrapWidth < 40 {
+		wrapWidth = 40
 	}
+	if m.docLayout == nil {
+		dl := BuildDocumentLayout(m.records, wrapWidth, username)
+		m.docLayout = &dl
+		m.streamingDocStart = -1
+		m.syncStreamingSegment()
+		return
+	}
+	if m.docLayout.Width() != wrapWidth {
+		dl := BuildDocumentLayout(m.records, wrapWidth, username)
+		m.docLayout = &dl
+		m.streamingDocStart = -1
+		m.syncStreamingSegment()
+		return
+	}
+	// Trim any previous streaming segment so the records incremental update
+	// runs on a clean records-only layout (the streaming tail never forces a
+	// full re-flatten of history).
+	if m.streamingDocStart >= 0 && m.streamingDocStart <= len(m.docLayout.Lines) {
+		m.docLayout.Lines = m.docLayout.Lines[:m.streamingDocStart]
+		m.docLayout.width = wrapWidth
+		m.streamingDocStart = -1
+	}
+	updated := IncrementalLayoutUpdate(m.docLayout, m.records, wrapWidth, username)
+	m.docLayout = &updated
+	m.syncStreamingSegment()
+}
+
+// syncStreamingSegment maintains the active assistant stream as the trailing
+// segment of docLayout. It:
+//   - enforces a newline separator before token #1 (fresh line, column 0) so a
+//     new assistant record never concatenates onto a preflight/activity log;
+//   - re-renders ONLY the streaming segment through the unified markdown engine
+//     (byte-identical styling to the completed-history path), never the whole
+//     document; and
+//   - appends the Accent-Blue block cursor (▋) to the active trailing line.
+func (m *model) syncStreamingSegment() {
+	if m.docLayout == nil {
+		m.streamingDocStart = -1
+		m.resetStreamingRenderer()
+		return
+	}
+	if !m.streaming {
+		// Stream ended (or was cancelled): strip the stale streaming tail so a
+		// residual cursor block can never linger in the rendered document.
+		if m.streamingDocStart >= 0 && m.streamingDocStart <= len(m.docLayout.Lines) {
+			m.docLayout.Lines = m.docLayout.Lines[:m.streamingDocStart]
+		}
+		m.streamingDocStart = -1
+		m.resetStreamingRenderer()
+		return
+	}
+	content := ensurePreflightDelimiter(sanitizeText(m.currentStreamContent))
+	if content == "" {
+		return
+	}
+	wrapWidth := m.docLayout.Width()
+	if wrapWidth < 20 {
+		wrapWidth = 20
+	}
+	if m.streamingDocStart < 0 {
+		m.streamingDocStart = m.docLayout.Len()
+		// NOTE: the incremental renderer is NOT reset here. streamingDocStart
+		// drops below zero on every trim+re-attach of the same live stream
+		// (refreshViewportContent trims the tail, then syncStreamingSegment
+		// re-attaches it), so a reset here would re-parse the whole response on
+		// every repaint frame. The renderer is reset only at genuine stream
+		// boundaries: streamCmd() start and the !m.streaming end branch below.
+		// ── BLOCK-BOUNDARY NEWLINE ENFORCEMENT ──────────────────────
+		// Token #1 of the assistant response MUST start at column 0 on a fresh
+		// line, strictly separated from preflight logs like "[preflight]
+		// snapshot ready...". Insert an empty gutter row when the preceding
+		// physical line carries actual content (RawText — separator rows
+		// themselves are empty and never double-insert).
+		if m.streamingDocStart > 0 {
+			if prev := m.docLayout.Lines[m.streamingDocStart-1]; prev.RawText != "" {
+				sep := gutterDocumentLine(wrapWidth)
+				sep.GlobalY = m.streamingDocStart
+				// The separator is a SPACER, not a record: it must never carry a
+				// record index, or IncrementalLayoutUpdate mistakes it for the
+				// committed assistant record and drops the completed response
+				// from the layout (the "invisible answer" bug).
+				sep.RecordIdx = -1
+				m.docLayout.Lines = append(m.docLayout.Lines, sep)
+				m.streamingDocStart++
+			}
+		}
+	}
+	// ── INCREMENTAL UNIFIED ENGINE (O(streaming delta), never the document) ──
+	// Only the active tail slice of docLayout is mutated. Completed logical
+	// lines are committed once through the persistent markdown state machine;
+	// each tick re-renders ONLY the partial trailing line — no full-document or
+	// full-response re-parse, no redundant allocations on frames that carried
+	// no new token (the no-change fast path reuses the memoized tail).
+	newLines := m.renderStreamingTail(content, wrapWidth)
+	if len(newLines) == 0 {
+		newLines = []DocumentLine{gutterDocumentLine(wrapWidth)}
+	}
+	base := m.streamingDocStart
+	for i := range newLines {
+		newLines[i].GlobalY = base + i
+		newLines[i].RecordIdx = len(m.records)
+	}
+	// Active smooth block cursor on the trailing line.
+	last := &newLines[len(newLines)-1]
+	last.RenderedStr += streamCursorStyle.Render("▋")
+	m.docLayout.Lines = append(m.docLayout.Lines[:m.streamingDocStart], newLines...)
+}
+
+// renderStreamingTail renders (or reuses) the visible streaming tail for the
+// given sanitized content. It is the O(delta) core of the streaming renderer:
+//
+//   - no-change fast path: if content is byte-identical to the last rendered
+//     content, the memoized tail is returned without a single re-parse or
+//     allocation (repaint frames with no new token cost nothing);
+//   - extension path: complete logical lines that arrived since the last
+//     commit are fed to the persistent aiBlockRenderer (carrying code-block /
+//     list state), and only the partial trailing line is rendered through a
+//     temporary clone of that state — so a growing response never re-parses
+//     its own head;
+//   - drift fallback: if sanitization rewrote earlier bytes (content is no
+//     longer a strict prefix extension), the renderer resets and re-parses the
+//     full content once, guaranteeing the tail can never desync from the
+//     committed record.
+func (m *model) renderStreamingTail(content string, wrapWidth int) []DocumentLine {
+	// Fast path: nothing changed since the last render — reuse the memoized
+	// tail without re-parsing anything.
+	if content == m.aiStreamTailContent {
+		if m.aiStreamTailCache != nil {
+			return append([]DocumentLine(nil), m.aiStreamTailCache...)
+		}
+		// Fall through to a rebuild when the cache is empty but content isn't.
+	}
+	if m.aiStreamRenderer == nil {
+		m.aiStreamRenderer = &aiBlockRenderer{}
+		m.aiStreamConsumed = 0
+	}
+	if !strings.HasPrefix(content, m.aiStreamTailContent) {
+		// Sanitization rewrote earlier bytes: rebuild the persistent state from
+		// the full content so the tail can never desync from the record.
+		m.aiStreamRenderer = &aiBlockRenderer{}
+		m.aiStreamConsumed = 0
+		m.aiStreamTailContent = ""
+	}
+	lastNL := strings.LastIndex(content, "\n")
+	completePart := ""
+	if lastNL >= 0 {
+		completePart = content[:lastNL]
+	}
+	partialLine := content[lastNL+1:]
+	// Commit new complete logical lines to the persistent renderer. consumed
+	// always points at a logical-line boundary, so any feed starts exactly at a
+	// separator newline whose leading Split element is spurious — drop it.
+	if m.aiStreamConsumed > len(completePart) {
+		m.aiStreamRenderer = &aiBlockRenderer{}
+		m.aiStreamConsumed = 0
+	}
+	if m.aiStreamConsumed <= len(completePart) {
+		feed := completePart[m.aiStreamConsumed:]
+		// An empty feed means NO new complete logical lines arrived since the
+		// last commit — Split("", "\n") would yield [""] and commit a spurious
+		// gutter line, so skip it entirely.
+		if feed != "" {
+			parts := strings.Split(feed, "\n")
+			if m.aiStreamConsumed > 0 && len(parts) > 0 && parts[0] == "" {
+				parts = parts[1:]
+			}
+			for _, p := range parts {
+				m.aiStreamRenderer.renderLine(p, wrapWidth)
+			}
+		}
+		m.aiStreamConsumed = len(completePart)
+	}
+	// Render the partial trailing line through a temporary clone of the
+	// renderer state so the persistent state is never advanced past the
+	// still-growing line (it is re-rendered fresh every tick until it
+	// completes, then committed exactly once).
+	partial := &aiBlockRenderer{
+		inCode:    m.aiStreamRenderer.inCode,
+		lang:      m.aiStreamRenderer.lang,
+		codeLines: append([]string(nil), m.aiStreamRenderer.codeLines...),
+	}
+	partial.renderLine(partialLine, wrapWidth)
+	tail := append(append([]DocumentLine(nil), m.aiStreamRenderer.out...), partial.out...)
+	m.aiStreamTailContent = content
+	m.aiStreamTailCache = append([]DocumentLine(nil), tail...)
+	// New tokens were spliced into the streaming tail: advance the repaint
+	// sequence so the single-flight gate can detect a stale frame and re-arm
+	// one final repaint (no token left unrendered in memory).
+	m.repaintSeq++
+	return tail
+}
+
+// resetStreamingRenderer drops the persistent streaming-tail renderer state.
+// It must be called when a stream starts, ends, or the tail segment is
+// re-established so the incremental engine never carries stale lines across
+// records.
+func (m *model) resetStreamingRenderer() {
+	m.aiStreamRenderer = nil
+	m.aiStreamConsumed = 0
+	m.aiStreamTailCache = nil
+	m.aiStreamTailContent = ""
+}
+
+// renderTailPanelLines renders the fixed tail panels that follow the
+// conversation: foldable execution log, inline loading dock, execution
+// narrative, streaming/persisted thinking, output trace, control tree and the
+// activity tree. They are re-rendered each frame (cheap) and participate in
+// the scrollable document so live status stays reachable.
+func (m *model) renderTailPanelLines() []string {
+	var b strings.Builder
 
 	// ── Foldable execution log entries ─────────────────────────────
 	if m.logStore != nil {
-		entries := m.logStore.Entries()
-		if len(entries) > 0 {
-			content.WriteString("\n")
-			content.WriteString(dimmedStyle.Render("── Execution Log ──"))
-			content.WriteString("\n")
+		if entries := m.logStore.Entries(); len(entries) > 0 {
+			b.WriteString("\n")
+			b.WriteString(dimmedStyle.Render("── Execution Log ──"))
+			b.WriteString("\n")
 			for _, entry := range entries {
-				rendered := RenderEntry(entry, m.width, m.dotFrame)
-				content.WriteString(rendered)
-				content.WriteString("\n")
+				b.WriteString(RenderEntry(entry, m.width, m.dotFrame))
+				b.WriteString("\n")
 			}
 		}
 	}
 
-	// ── Inline Loading Dock (scrolls with content) ─────────────────
-	// The shimmer loading indicator is rendered INSIDE the viewport body,
-	// placed immediately below the latest streamed output or submitted
-	// prompt. It scrolls dynamically with the text content during
-	// streaming, rather than remaining fixed at the bottom above the
-	// prompt bar. Clears smoothly when the first primary output token
-	// arrives (tokenMsg handler calls stopShimmer).
-	//
-	// BUG FIX: the original condition was `shimmerActive && !m.streaming`,
-	// but m.streaming is set true immediately in streamCmd(), so the dock
-	// never rendered. Now we render whenever shimmerActive is true — the
-	// shimmer lifecycle (startShimmer/stopShimmer) handles visibility.
+	// ── Inline Loading Dock (shimmer) ──────────────────────────────
 	if m.shimmerActive {
 		if dock := m.renderLoadingDock(); dock != "" {
-			content.WriteString(dock)
+			b.WriteString(dock)
 		}
 	}
 
 	// ── Execution narrative panel (Phase 5/6) ─────────────────────
-	// The gated RuntimeExecutor path renders its human narrative EXCLUSIVELY
-	// from the execution-view projection (ExecutionNarrative) — never from raw
-	// machine events and never from UI-authored progress text. The active
-	// visibility layer (Normal/Expanded/Debug) selects what the frame carries.
 	if panel := m.renderExecutionLayered(); panel != "" {
-		content.WriteString(panel)
+		b.WriteString(panel)
 	}
 
+	// ── Streaming reasoning (typed thinking blocks + inline thinking) ──
 	if m.streaming {
-		// ── Differential typed stream rendering ─────────────────────
-		// The structured buffer renders KindThinking blocks dimmed (faint +
-		// italic) and KindContent blocks bright, in arrival order. When no
-		// typed blocks exist (legacy non-throttle paths) it falls back to the
-		// flat content string through the deterministic pipeline.
-		streamed := m.renderStreamBlocks(m.width)
-		if streamed == "" && m.currentStreamContent != "" {
-			// SANITIZE BEFORE VIEWPORT: raw streamed text may still carry
-			// literal \n / \t / \" escapes (preserved verbatim through the
-			// rune-safe ingestion). They are expanded to real control
-			// characters here so the deterministic pipeline never renders
-			// backslash noise or drops words next to escaped punctuation.
-			streamed = m.renderStreamingContent(sanitizeText(m.currentStreamContent), m.width)
-		}
-		if streamed != "" {
-			content.WriteString(streamed)
-			content.WriteString("\n")
-		}
-
-		// ── Inline thinking block (faint, collapsible) ───────────────
-		// Live reasoning tokens are rendered inside the viewport body so
-		// the user sees thinking in real-time. Ctrl+O / Alt+O toggles
-		// expansion during active streaming without waiting for completion.
-		//
-		// SINGLE-SOURCE-OF-TRUTH DEDUP: while the bottom loading dock is
-		// active (shimmerActive), the dock itself already carries the live
-		// thinking status ("✻ Thinking... (Xs)"). Rendering the collapsed
-		// one-liner here as well would ghost two "Thinking…" lines, so the
-		// inline block is suppressed while the dock is live — it only appears
-		// once the dock has handed off to the first content token, or when
-		// the user expands it via Ctrl+O mid-stream (inspection overrides).
-		//
-		// When the typed buffer already renders thinking inline (streamThinking
-		// blocks), that IS the live thinking display — the separate collapsible
-		// box is suppressed to avoid duplicating the same reasoning text.
-		dockActive := m.shimmerActive
+		// Content blocks already render through docLayout's streaming tail;
+		// only the dimmed KindThinking blocks are appended here.
 		inlineThinking := m.streamBlocks != nil && m.streamBlocks.HasThinking()
+		dockActive := m.shimmerActive
+		if inlineThinking {
+			if r := m.renderStreamThinkingOnly(m.width); r != "" {
+				b.WriteString(r)
+				b.WriteString("\n")
+			}
+		}
 		if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
 			if !inlineThinking && (m.thinkingBuffer.Expanded() || !dockActive) {
-				thoughts := m.renderLiveThinking(m.width)
-				if thoughts != "" {
-					content.WriteString(thoughts)
-					content.WriteString("\n")
+				if thoughts := m.renderLiveThinking(m.width); thoughts != "" {
+					b.WriteString(thoughts)
+					b.WriteString("\n")
 				}
 			}
 		} else if !dockActive {
-			// Fallback: legacy ThinkingPanel for agent-style runs
-			reasoningBlock := m.renderReasoningBlock(m.width)
-			if reasoningBlock != "" {
-				content.WriteString(reasoningBlock)
-				content.WriteString("\n")
+			if reasoningBlock := m.renderReasoningBlock(m.width); reasoningBlock != "" {
+				b.WriteString(reasoningBlock)
+				b.WriteString("\n")
 			}
 		}
 	}
 
-	// ── Persisted collapsible thought block ────────────────────────────
-	// After streaming ends the reasoning block is no longer rendered inline by
-	// renderStreamingContent, so it is re-rendered here as a collapsed
-	// single-line summary ("▸ Thought for Xs (N tokens)"). The user can expand
-	// the full dimmed reasoning text with Ctrl+O / Alt+O at any time.
+	// ── Persisted collapsible thought block (after streaming) ──────
 	if !m.streaming && m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
 		if thoughts := m.renderLiveThinking(m.width); thoughts != "" {
-			content.WriteString(thoughts)
-			content.WriteString("\n")
+			b.WriteString(thoughts)
+			b.WriteString("\n")
 		}
 	}
 
-	// ── Unified output trace viewport (Ctrl+O) ─────────────────────────
-	// Models without a formal reasoning channel never feed the ThinkingBuffer,
-	// so Ctrl+O had nothing to expand. The raw streamed response is captured in
-	// traceBuffer instead; when the user expands it, the full output trace
-	// renders in a dimmed collapsible box for inspection.
+	// ── Unified output trace viewport (Ctrl+O) ─────────────────────
 	if m.traceExpanded && m.traceBuffer.Len() > 0 {
 		if trace := m.renderOutputTrace(m.width); trace != "" {
-			content.WriteString(trace)
-			content.WriteString("\n")
+			b.WriteString(trace)
+			b.WriteString("\n")
 		}
 	}
 
-	// ── Fact-only Execution Tree ────────────────────────────────────
-	// The Dynamic IR projection rendered from control.iteration /
-	// control.node_observed facts. Placed above the bottom dock so the live
-	// execution tree reads as the pipeline's current state while tool steps
-	// stream beneath it. It is a pure projection: the facts are read-only
-	// and the tree never performs retries or state mutations.
+	// ── Fact-only Execution Tree ───────────────────────────────────
 	if m.controlSnapshot != nil && len(m.controlSnapshot.NodeStates) > 0 {
 		if treeView := ProjectSnapshotToView(m.controlSnapshot, nil); treeView != "" {
-			content.WriteString(treeView)
-			content.WriteString("\n")
+			b.WriteString(treeView)
+			b.WriteString("\n")
 		}
 	}
 
-	// ── Activity Tree: structured tool call view ──────────────────────
-	// Rendered outside the streaming block so it appears during /build
-	// execution (non-streaming patch proposal) and persists through
-	// approval states. Only renders when the tree has active entries.
-	// The last entry carries a braille spinner status while any background
-	// stage is still in flight, so the execution tree reads as a live
-	// pipeline rather than a static log dump.
+	// ── Activity Tree: structured tool call view ───────────────────
 	if m.activityTree != nil {
 		treeActive := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.shellRunning || m.state == StateProcessing
-		// Pass the live spinner frame so the running exec snowflake cycles the
-		// full 4-frame sequence (✻ ❅ ❆ ✦) and the status column cycles the
-		// single-width braille spinner.
-		treeView := m.activityTree.RenderActive(m.width, treeActive, m.spinnerFrame)
-		if treeView != "" {
-			content.WriteString(treeView)
-			content.WriteString("\n")
+		if treeView := m.activityTree.RenderActive(m.width, treeActive, m.spinnerFrame); treeView != "" {
+			b.WriteString(treeView)
+			b.WriteString("\n")
 		}
 	}
 
-	// ── VIEWPORT SCROLL LOCK (Ctrl+O output-trace) ────────────────────
-	// While the expanded output-trace viewport is active, preserve the exact
-	// YOffset across SetContent: a transient content shrink would otherwise
-	// make the bubbles viewport clamp to the bottom and yank the inspected
-	// lines (the Ctrl+O flicker during active generation).
-	if m.traceExpanded {
-		saved := m.Viewport.YOffset
-		m.Viewport.SetContent(content.String())
-		m.Viewport.SetYOffset(saved)
+	return splitContentLines(b.String())
+}
+
+// renderStreamThinkingOnly renders only the dimmed KindThinking blocks of the
+// typed stream buffer (content blocks are rendered through docLayout's
+// streaming tail, never duplicated here).
+func (m *model) renderStreamThinkingOnly(width int) string {
+	if m.streamBlocks == nil || m.streamBlocks.Len() == 0 {
+		return ""
+	}
+	var rendered []string
+	for _, blk := range m.streamBlocks.Blocks() {
+		if blk.Kind == KindThinking {
+			if r := m.renderThinkingBlock(blk.Text, width); r != "" {
+				rendered = append(rendered, r)
+			}
+		}
+	}
+	return strings.Join(rendered, vspace(Spacing.Section))
+}
+
+// calculateEffectiveYOffset returns the effective viewport offset over the
+// full scrollable document. When the user has NOT scrolled away from the tail
+// (!m.userScrolledAway), it is continuously pinned to the tail:
+//
+//	yOffset = max(0, total - Viewport.Height)
+//
+// Otherwise it is the app-owned scroll offset clamped to the document. An
+// active mouse drag owns the viewport: the offset is preserved exactly so the
+// selection controller (handleSelectionAutoScroll) can move it without the
+// tail-lock fighting it.
+func (m *model) calculateEffectiveYOffset(total int) int {
+	maxOff := total - m.Viewport.Height
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if m.mouseSel.Active && m.mouseSel.Dragging {
+		off := m.docScrollOffset
+		if off < 0 {
+			off = 0
+		}
+		if off > maxOff {
+			off = maxOff
+		}
+		return off
+	}
+	if !m.userScrolledAway {
+		return maxOff
+	}
+	off := m.docScrollOffset
+	if off < 0 {
+		off = 0
+	}
+	if off > maxOff {
+		off = maxOff
+	}
+	return off
+}
+
+// maxAppScroll returns the maximum app-owned scroll offset cached from the
+// last refresh (consistent with the manual-slicing contract). Callers that
+// need bounds outside a refresh cycle (selection auto-scroll, wheel) use this
+// so they can never overscroll or drift from the rendered document.
+func (m *model) maxAppScroll() int {
+	if m.lastScrollTotal <= 0 {
+		return 0
+	}
+	maxOff := m.lastScrollTotal - m.Viewport.Height
+	if maxOff < 0 {
+		return 0
+	}
+	return maxOff
+}
+
+// setScrollLocked flips the single tail-lock flag. userScrolledAway is the
+// authoritative "user left the tail" state; userIsScrollingUp is kept in sync
+// for the legacy callers that still read it.
+func (m *model) setScrollLocked(locked bool) {
+	m.userScrolledAway = locked
+	m.userIsScrollingUp = locked
+}
+
+// followTail re-engages auto-tail-lock and pins the viewport to the tail. It
+// replaces every legacy m.Viewport.GotoBottom() call under the manual-slicing
+// contract.
+func (m *model) followTail() {
+	if !m.Ready {
 		return
 	}
-	m.Viewport.SetContent(content.String())
+	m.setScrollLocked(false)
+	m.refreshViewportContent()
+}
+
+// scrollBy moves the app-owned scroll offset by delta rows and flags the user
+// as having scrolled away from the tail (re-lock via Space / followTail). The
+// offset is clamped to the document by refreshViewportContent on the same
+// pass, so wheel input can never overscroll.
+func (m *model) scrollBy(delta int) {
+	if !m.Ready {
+		return
+	}
+	if delta == 0 {
+		return
+	}
+	m.setScrollLocked(true)
+	m.docScrollOffset += delta
+	m.refreshViewportContent()
+}
+
+// scheduleRepaint is the single-flight 30FPS repaint gate: at most one
+// repaintTickMsg is in flight during token streaming. Incoming tokens are
+// appended to docLayout in memory instantly; the next repaint tick renders one
+// visible frame and resets the gate. It never chains recursively.
+func (m *model) scheduleRepaint() tea.Cmd {
+	if m.refreshScheduled {
+		return nil
+	}
+	m.refreshScheduled = true
+	m.repaintScheduledAt = m.repaintSeq
+	return tea.Tick(33*time.Millisecond, func(time.Time) tea.Msg {
+		return repaintTickMsg{}
+	})
 }
 
 // renderRecordsWithCursor renders all chat records with vi-mode cursor and
@@ -3934,33 +4765,10 @@ func (m *model) getAutocompleteHeight() int {
 }
 
 // computeVpHeight returns the number of terminal rows available for the
-// scrollable viewport. Matches the View() JoinVertical layout — zero gaps:
-//
-//	Status line (renderRuntimeStatus)             → 1 line
-//	Separator below input + input + top separator → 3 lines
-//	Autocomplete dropdown (inputView)              → dynamic (getAutocompleteHeight)
-//	Proposal dock (renderProposalBlock)            → dynamic (getProposalDockCurrentHeight)
-//	m.Viewport.View()                             → remaining height (vpHeight)
-//
-// The viewport always sits at the top, consuming 100% of remaining space.
-// The input line and status bar are rigidly pinned to the terminal bottom edge
-// with zero floating margin between them.
+// scrollable viewport. Delegates to the single authoritative
+// viewportGeometry so rendering and mouse mapping cannot drift.
 func (m *model) computeVpHeight() int {
-	const inputHeight = 3 // separator above + input line + separator below
-	const statusLineHeight = 1
-
-	vpHeight := m.height - inputHeight - statusLineHeight
-	vpHeight -= m.getAutocompleteHeight()
-	if m.state == StateAwaitingApproval || m.state == StateProcessing {
-		vpHeight -= m.getProposalDockCurrentHeight()
-	}
-	// NOTE: capabilities render INLINE on the status bar line (see
-	// renderStatusBar), so they occupy the single statusLineHeight row above
-	// and never add extra rows.
-	if vpHeight < 1 {
-		return 1
-	}
-	return vpHeight
+	return m.viewportGeometry().Height
 }
 
 // recalcViewportHeight recomputes and applies the viewport height when the
@@ -3971,6 +4779,21 @@ func (m *model) recalcViewportHeight() {
 		return
 	}
 	m.Viewport.Height = m.computeVpHeight()
+}
+
+// gotoBottomIfAllowed re-engages auto-tail-lock and pins the viewport to the
+// tail only when no active user inspection owns the viewport. While a mouse
+// drag selection is active the selection controller owns the viewport and
+// streaming must not fight it. Under the manual-slicing contract this is the
+// app-side tail-pin (the bubbles viewport never scrolls internally).
+func (m *model) gotoBottomIfAllowed() {
+	if !m.Ready {
+		return
+	}
+	if m.userIsScrollingUp || m.mouseSel.Dragging {
+		return
+	}
+	m.followTail()
 }
 
 // renderFlowingSpinner renders a snowflake character (✻ / ❆) with a subtle

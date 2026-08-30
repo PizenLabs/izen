@@ -278,6 +278,9 @@ func officialCommands() []CommandDescriptor {
 		{Marker: MarkerSlash, Name: "commit", Kind: KindGlobal, RequiredPerms: PermissionSet(PermWrite), Description: "persist the runtime timeline into git"},
 		{Marker: MarkerSlash, Name: "checkpoint", Kind: KindGlobal, RequiredPerms: PermissionSet(PermWrite), Description: "create or restore git checkpoints"},
 		{Marker: MarkerSlash, Name: "quit", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "exit the current session cleanly"},
+		{Marker: MarkerSlash, Name: "copy", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "copy the canonical transcript to clipboard"},
+		{Marker: MarkerSlash, Name: "copy-mode", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "enter scrollable inspection mode for precise fragment copy (j/k, / search, v/y)"},
+		{Marker: MarkerSlash, Name: "inspect", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "alias for /copy-mode"},
 
 		// Directives ($).
 		directive("prompt", CategoryActivation, PermissionSet(PermRead), true, "route a raw idea into /ask and refine it"),

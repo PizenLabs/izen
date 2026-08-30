@@ -35,6 +35,7 @@ type ThinkingPanel struct {
 	mu        sync.Mutex
 	buffer    strings.Builder
 	startTime time.Time
+	endTime   time.Time
 	expanded  bool
 	maxHeight int
 }
@@ -74,6 +75,16 @@ func (tp *ThinkingPanel) Reset() {
 	defer tp.mu.Unlock()
 	tp.buffer.Reset()
 	tp.startTime = time.Now()
+	tp.endTime = time.Time{}
+}
+
+// Freeze marks the panel as complete and freezes elapsed at now.
+func (tp *ThinkingPanel) Freeze() {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	if tp.endTime.IsZero() {
+		tp.endTime = time.Now()
+	}
 }
 
 // Toggle switches between expanded and collapsed.
@@ -104,7 +115,12 @@ func (tp *ThinkingPanel) Render(width int, spinnerText string) string {
 	tp.mu.Lock()
 	content := tp.buffer.String()
 	expanded := tp.expanded
-	elapsed := time.Since(tp.startTime)
+	var elapsed time.Duration
+	if !tp.endTime.IsZero() {
+		elapsed = tp.endTime.Sub(tp.startTime)
+	} else {
+		elapsed = time.Since(tp.startTime)
+	}
 	tp.mu.Unlock()
 
 	if content == "" {

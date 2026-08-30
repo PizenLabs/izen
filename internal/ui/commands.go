@@ -81,6 +81,10 @@ var validSystemCommands = map[string]struct{}{
 	"/arch":             {},
 	"/explain-decision": {},
 	"/decide":           {},
+	"/copy":             {},
+	"/copy-mode":        {},
+	"/copy_mode":        {},
+	"/inspect":          {},
 }
 
 // ansiRe strips terminal ANSI escape color codes (e.g. \x1b[31m) that can
@@ -157,7 +161,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 		if !strings.HasPrefix(line, "$inspect") {
 			m.push(roleSystem, "Input blocked: task active.")
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return nil
 		}
 	}
@@ -177,7 +181,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 		if decideContent == "" {
 			m.push(roleSystem, infoStyle.Render("[Usage] $decide <prompt> — run the intent → workspace → autonomy decision trace"))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return nil
 		}
 		return m.runAutonomyDecideCmd(decideContent)
@@ -188,14 +192,14 @@ func (m *model) handleInput(line string) tea.Cmd {
 		if shellCmd == "" {
 			m.push(roleSystem, "usage: !<shell command>")
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return nil
 		}
 		currentMode := m.resolver.Current()
 		if !currentMode.CanShell() {
 			m.push(roleError, fmt.Sprintf("shell execution blocked in /%s mode (no CapShell)", currentMode))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return nil
 		}
 
@@ -206,7 +210,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.agentLabel = ""
 			m.push(roleError, fmt.Sprintf("[SECURITY ALERT] Dangerous shell mutation blocked: Executing '%s' is strictly forbidden in this mode.", shellCmd))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return nil
 		}
 
@@ -220,7 +224,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.push(roleSystem, scanner.Text())
 		}
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return nil
 	}
 
@@ -237,7 +241,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 	if err != nil {
 		m.push(roleError, err.Error())
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return nil
 	}
 
@@ -293,7 +297,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 				m.lastActionTime = time.Time{}
 				m.syncUIState()
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 				// No command is returned on this path — not even the runtime
 				// SwitchModeCmd. A clean-tree review performs zero work, so the
 				// fast-path must be fully synchronous: the mode switch already
@@ -305,7 +309,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 			m.setMode(mode)
 			m.push(roleSystem, infoStyle.Render("Running review pipeline..."))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return tea.Batch(m.runReviewCmd(""), switchCmd)
 		}
 		// ── AUTO-TRIGGER /build EXECUTION ──────────────────────
@@ -345,7 +349,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 		if failedStep := m.findFailedBuildTask(); failedStep > 0 {
 			m.push(roleStatus, fmt.Sprintf("Amending task %d with feedback: %s", failedStep, line))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return m.amendBuildTask(failedStep, line)
 		}
 	}
@@ -465,7 +469,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.push(roleError, fmt.Sprintf("max investigate invocations (%d) reached", maxInvestigateInvocations))
 			m.push(roleSystem, infoStyle.Render("start a new session with /objective <desc> or restart"))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return nil
 		}
 		// Graceful handoff guard: if the ContextLedger's ask_handoff payload
@@ -483,7 +487,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		if !hasHandoff && (trimmed == "" || len(trimmed) < 15) {
 			m.push(roleSystem, infoStyle.Render("No handoff context in ledger. Describe what to investigate (e.g. a test failure, error log, or crash report):"))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return nil
 		}
 
@@ -566,7 +570,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		if handoffSource == "" && m.sess.ContextLedger != nil && m.sess.ContextLedger.Diagnostics != "" {
 			m.push(roleError, "[SYSTEM ERROR] Context ledger has diagnostics but handoff source is empty after sanitization. Data flow regression detected.")
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return nil
 		}
 
@@ -628,7 +632,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 					"0 pending TODOs — synthesizing from forensic ledger. If your local model is stuck, this aborts within ~150s instead of hanging."))
 			}
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 
 			// Start the smooth tick loop. It repaints the viewport AND (since
 			// the frozen-spinner fix) physically advances m.spinnerFrame while
@@ -662,7 +666,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 					m.push(roleError, icErr.Error())
 					m.uiNotice = icErr.Error()
 					m.refreshViewportContent()
-					m.Viewport.GotoBottom()
+					m.gotoBottomIfAllowed()
 					return m.flushPendingRecords()
 				}
 				if len(tasks) > 0 {
@@ -691,7 +695,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 					m.push(roleError, mkErr.Error())
 					m.uiNotice = mkErr.Error()
 					m.refreshViewportContent()
-					m.Viewport.GotoBottom()
+					m.gotoBottomIfAllowed()
 					return m.flushPendingRecords()
 				}
 				if len(tasks) > 0 {
@@ -718,7 +722,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		if assembly.RawContext == "" && m.sess.ContextLedger != nil && m.sess.ContextLedger.Diagnostics != "" {
 			m.push(roleError, "[SYSTEM ERROR] Context ledger has diagnostics but generated prompt is empty. This indicates a data flow regression.")
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return nil
 		}
 
@@ -741,7 +745,7 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.push(roleSystem, infoStyle.Render("No context packets found in ledger. Run /investigate or $test first, then /plan to synthesize an execution plan."))
 			m.reconcileSpinner()
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return m.flushPendingRecords()
 		}
 
@@ -1482,7 +1486,7 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	if !m.modeChangeAuthorized && !m.planApproved && mode == modes.ModeBuild && m.resolver.Current() != modes.ModeBuild {
 		m.push(roleError, "State Transition Blocked: File modifications are only allowed inside /build mode after /plan approval. Please run /plan first, then use /build.")
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return nil
 	}
 	m.modeChangeAuthorized = false
@@ -1607,7 +1611,7 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	if !m.streaming && !m.agentRunning && !m.pipelineRunning {
 		if m.buildHandoffTriggerContent(mode) != "" {
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return tea.Batch(
 				m.smoothStreamTickCmd(),
 				func() tea.Msg {
@@ -1628,7 +1632,7 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	}
 
 	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
+	m.gotoBottomIfAllowed()
 	return nil
 }
 
@@ -1804,7 +1808,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	if command.IsReviewTestComposite(cmd) {
 		m.push(roleSystem, accentStyle.Render(Icon.Index+" [IZEN Shortcut] Running dynamic test suite before auditing commit risks..."))
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return m.runReviewTestComposite()
 	}
 
@@ -1823,7 +1827,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	if _, ok := validSystemCommands[name[0]]; !ok {
 		m.push(roleError, "unknown command: "+cmd)
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return nil
 	}
 
@@ -1841,8 +1845,10 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  $decide <prompt>     run the intent → workspace → decision trace"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
-		m.push(roleSystem, infoStyle.Render("  /help  /usage  /model  /objective  /drop  /clear  /quit"))
-		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>"))
+		m.push(roleSystem, infoStyle.Render("  /help  /usage  /model  /objective  /drop  /clear  /quit  /copy"))
+		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>  /copy-mode"))
+		m.push(roleSystem, infoStyle.Render("  /copy          copy full canonical transcript to clipboard"))
+		m.push(roleSystem, infoStyle.Render("  /copy-mode     scrollable inspection mode (j/k, / search, v/y yank, wheel)"))
 		m.push(roleSystem, infoStyle.Render("  /explain-decision  inspect why a tech stack was chosen"))
 		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
 		m.push(roleSystem, infoStyle.Render("  /usage           inspect token usage and provider status"))
@@ -1887,7 +1893,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		if content == "" {
 			m.push(roleSystem, infoStyle.Render("usage: /decide <prompt>  — run the intent → workspace → decision trace"))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return nil
 		}
 		return m.runAutonomyDecideCmd(content)
@@ -2032,7 +2038,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		if m.resolver.Current() != modes.ModeBuild {
 			m.push(roleError, "commit error: /commit is only available in /build mode")
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return nil
 		}
 		msg := strings.TrimSpace(strings.TrimPrefix(cmd, "/commit"))
@@ -2061,11 +2067,26 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	case cmd == "/explain-decision":
 		return m.runExplainDecisionCmd()
 
+	case cmd == "/copy", strings.HasPrefix(cmd, "/copy "):
+		m.handleCopy()
+		return nil
+
+	case cmd == "/copy-mode", cmd == "/copy_mode", cmd == "/inspect":
+		if m.inViMode {
+			m.uiNotice = "Already in copy mode"
+			return nil
+		}
+		if m.state == StateProcessing || m.state == StateAwaitingApproval || m.streaming || m.agentRunning {
+			m.uiNotice = "Cannot enter copy mode while a task is running"
+			return nil
+		}
+		return m.enterViMode()
+
 	}
 
 	m.push(roleError, "unknown command: "+cmd)
 	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
+	m.gotoBottomIfAllowed()
 	return nil
 }
 
@@ -2119,7 +2140,7 @@ func (m *model) switchModelDirect(modelName string) tea.Cmd {
 			if _, ok := m.cfg.AI.Providers[resolvedProvider]; ok || resolvedProvider == "ollama" {
 				m.push(roleSystem, infoStyle.Render(fmt.Sprintf("switching to provider %q for model %q...", resolvedProvider, modelName)))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 				return tea.Batch(
 					m.switchProvider(resolvedProvider),
 					func() tea.Msg {
@@ -2133,7 +2154,7 @@ func (m *model) switchModelDirect(modelName string) tea.Cmd {
 	m.ti.Focus()
 	m.push(roleSystem, accentStyle.Render(fmt.Sprintf("✓ Model set to %s", modelName)))
 	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
+	m.gotoBottomIfAllowed()
 	return nil
 }
 
@@ -2658,7 +2679,7 @@ func (m *model) runStagedShellGate(task *plan.Task) tea.Cmd {
 	m.ti.Blur()
 	m.recalcViewportHeight()
 	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
+	m.gotoBottomIfAllowed()
 	return nil
 }
 
@@ -2709,7 +2730,7 @@ func (m *model) runTestCmd(target string) tea.Cmd {
 			)
 			m.push(roleSystem, warningStyle.Render(warning))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			m.pendingTestConfirm = true
 			m.pendingTestTarget = "./..."
 			return nil
@@ -2741,7 +2762,7 @@ func (m *model) runRunCmd(target string) tea.Cmd {
 			)
 			m.push(roleSystem, warningStyle.Render(warning))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			m.pendingTestConfirm = true
 			m.pendingTestTarget = "./..."
 			return nil
@@ -2948,14 +2969,14 @@ func (m *model) runFixCmd(target string) tea.Cmd {
 		m.cancelStaleAgentOps()
 		m.push(roleSystem, mutedStyle.Render("Write access required. Switch to /build."))
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return nil
 	}
 
 	if m.lastTestOutput == "" {
 		m.push(roleError, "no previous test/run output available — run $test or $run first")
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return nil
 	}
 
@@ -3042,7 +3063,7 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 		if err != nil {
 			m.push(roleStatus, "No mutations found.")
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return agentDoneMsg{}
 		}
 
@@ -3197,7 +3218,7 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 			}
 			m.push(roleStatus, msg)
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 			return agentDoneMsg{}
 		}
 
@@ -3232,7 +3253,7 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 		}
 
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return agentDoneMsg{}
 	}
 }
@@ -3344,7 +3365,7 @@ func (m *model) handleLogInput(msg logInputMsg) tea.Cmd {
 		m.agentRunning = false
 		m.push(roleError, "$log: execution error: "+providers.SanitizeAPIError(msg.err))
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return m.flushPendingRecords()
 	}
 
@@ -3370,7 +3391,7 @@ func (m *model) handleInvestigateComplete(msg investigateCompleteMsg) tea.Cmd {
 		m.agentRunning = false
 		m.push(roleError, "fix pipeline: analysis failed: "+providers.SanitizeAPIError(msg.err))
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return m.flushPendingRecords()
 	}
 
@@ -3396,7 +3417,7 @@ func (m *model) handleBlueprintReady(msg blueprintReadyMsg) tea.Cmd {
 		m.agentRunning = false
 		m.push(roleError, "fix pipeline: blueprint error: "+providers.SanitizeAPIError(msg.err))
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return m.flushPendingRecords()
 	}
 
@@ -3542,7 +3563,7 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 		m.cancelStaleAgentOps()
 		m.push(roleSystem, mutedStyle.Render("Write access required. Switch to /build."))
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return nil
 	}
 
@@ -3551,7 +3572,7 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 		m.cancelStaleAgentOps()
 		m.push(roleError, "unknown investigate action: $fix")
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return nil
 	}
 
@@ -3615,7 +3636,7 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 				m.lastActionTime = time.Time{}
 				m.push(roleError, "[System Error] No active Context ID found. Please run $test first to execute diagnostic verification and generate a context session.")
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 				return nil
 			}
 			logPath := m.sess.TestRunLogPath()
@@ -3625,7 +3646,7 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 				m.lastActionTime = time.Time{}
 				m.push(roleError, fmt.Sprintf("[System Error] Failed to read log at %s: %v", logPath, err))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 				return nil
 			}
 			if len(data) == 0 {
@@ -3633,7 +3654,7 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 				m.lastActionTime = time.Time{}
 				m.push(roleError, "[System Error] Log file located but 0 stack trace frames parsed. Raw log size: 0 bytes.")
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 				return nil
 			}
 			logStr := string(data)
@@ -3643,7 +3664,7 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 				m.lastActionTime = time.Time{}
 				m.push(roleError, fmt.Sprintf("[System Error] Log file located but 0 stack trace frames parsed. Raw log size: %d bytes.", len(data)))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 				return nil
 			}
 			logStr = ansiRe.ReplaceAllString(logStr, "")
@@ -3670,7 +3691,7 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 			m.push(roleError, fmt.Sprintf("$ sub-commands not available in /%s mode", mode))
 		}
 		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		m.gotoBottomIfAllowed()
 		return nil
 	}
 
@@ -3893,7 +3914,7 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 			if m.sess.ContextID == "" {
 				m.push(roleError, "[System Error] No active diagnostic context found. Run $test or $trace first.")
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 				return agentDoneMsg{}
 			}
 
@@ -3903,13 +3924,13 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 			if err != nil {
 				m.push(roleError, fmt.Sprintf("[System Error] Failed to read error log at %s: %v", logPath, err))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 				return agentDoneMsg{}
 			}
 			if len(logData) == 0 {
 				m.push(roleError, "[System Error] Error log is empty — no diagnostic data to analyze.")
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 				return agentDoneMsg{}
 			}
 
@@ -3923,7 +3944,7 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 			if m.provider == nil {
 				m.push(roleError, "[System Error] No AI provider is configured. Run /model to select one.")
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 				return agentDoneMsg{}
 			}
 
@@ -3943,7 +3964,7 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 			if err != nil {
 				m.push(roleError, fmt.Sprintf("[System Error] Diagnosis failed: %v", err))
 				m.refreshViewportContent()
-				m.Viewport.GotoBottom()
+				m.gotoBottomIfAllowed()
 				return agentDoneMsg{}
 			}
 			diagnosis := ""
@@ -3958,7 +3979,7 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 			// Render the diagnosis on the TUI.
 			m.push(roleSystem, fmt.Sprintf("[Local SLM Diagnosis] %s", diagnosis))
 			m.refreshViewportContent()
-			m.Viewport.GotoBottom()
+			m.gotoBottomIfAllowed()
 
 			// Also store in handoff context for downstream mode pipelines.
 			m.handoffCtx.LastFailurePayload = diagnosis
@@ -4212,7 +4233,7 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 	m.push(roleUser, action.Command)
 	m.push(roleSystem, fmt.Sprintf("Activated: %s", action.Label))
 	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
+	m.gotoBottomIfAllowed()
 
 	// Consuming a result capability ends the current result's relevance.
 	m.currentResult = nil

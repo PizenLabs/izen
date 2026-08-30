@@ -98,6 +98,10 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streamCh = make(chan tea.Msg, 1024)
 	m.streaming = true
 	m.spinnerFrame = 0
+	// A fresh stream starts a new assistant record: the streaming tail is
+	// re-established (with a fresh block-boundary separator) on the first token.
+	m.streamingDocStart = -1
+	m.resetStreamingRenderer()
 	// TRUTHFUL PROVIDER STATUS: the loading dock derives its indicator from
 	// the authoritative stage — a provider round-trip before the first byte
 	// renders as "Model ● waiting", never as "Thinking...".
@@ -122,6 +126,9 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	} else {
 		m.thinkingBuffer.Reset()
 	}
+	// Thought duration timer: reset start, clear end on new prompt.
+	m.thoughtStartTime = time.Now()
+	m.thoughtEndTime = time.Time{}
 	if m.activityTree == nil {
 		m.activityTree = NewActivityTree()
 	} else {

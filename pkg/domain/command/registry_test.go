@@ -353,7 +353,7 @@ func TestAllEnumeration(t *testing.T) {
 	if !equalStrings(wsNames, []string{"ask", "build", "investigate", "plan", "review"}) {
 		t.Errorf("workspace surface = %v", wsNames)
 	}
-	if !equalStrings(globalNames, []string{"arch", "checkpoint", "clear", "commit", "drop", "explain-decision", "help", "model", "objective", "provider", "quit", "session", "undo", "usage"}) {
+	if !equalStrings(globalNames, []string{"arch", "checkpoint", "clear", "commit", "copy", "copy-mode", "drop", "explain-decision", "help", "inspect", "model", "objective", "provider", "quit", "session", "undo", "usage"}) {
 		t.Errorf("global surface = %v", globalNames)
 	}
 	if !equalStrings(dollarNames, []string{"diagnose", "env", "fix", "hot", "inspect", "log", "prompt", "run", "test", "trace"}) {

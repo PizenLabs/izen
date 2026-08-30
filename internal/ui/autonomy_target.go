@@ -115,7 +115,7 @@ func (m *model) reportAutonomyTargetNotFound(trace autonomy.Trace, raw string) t
 	m.push(roleSystem, infoStyle.Render("  why the current strategy failed: the objective mutates an existing file, but no such file exists"))
 	m.push(roleSystem, mutedStyle.Render("  next: name an existing file (@<path>) or create one (e.g. \"create @index.html\")"))
 	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
+	m.gotoBottomIfAllowed()
 	return nil
 }
 
@@ -130,7 +130,7 @@ func (m *model) stageAutonomyTargetSelector(trace autonomy.Trace, candidates []s
 	m.enterApprovalState()
 	m.push(roleStatus, "[autonomy] target is ambiguous — select the file to modify (↑/↓ + Enter, Esc cancels)")
 	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
+	m.gotoBottomIfAllowed()
 }
 
 // navigateAutonomyTarget moves the selector highlight. delta is -1 (up) or +1
@@ -163,7 +163,7 @@ func (m *model) activateAutonomyTarget() tea.Cmd {
 	trace.Intent.Targets = []string{selected}
 	m.push(roleStatus, fmt.Sprintf("[autonomy] target resolved: %s", selected))
 	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
+	m.gotoBottomIfAllowed()
 	// The selected candidate resumes on the RuntimeExecutor path — never the
 	// legacy build staging.
 	return m.executeAutonomyViaRuntime(trace)
@@ -179,7 +179,7 @@ func (m *model) cancelAutonomyTargetSelector() tea.Cmd {
 	m.resolveApprovalState()
 	m.push(roleSystem, infoStyle.Render("[autonomy] target selection cancelled — no file was modified."))
 	m.refreshViewportContent()
-	m.Viewport.GotoBottom()
+	m.gotoBottomIfAllowed()
 	return nil
 }
 

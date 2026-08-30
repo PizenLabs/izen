@@ -18,6 +18,10 @@ func makeTraceModel(traceLines int) *model {
 	m.thinkingBuffer = nil
 	m.thinkingPanel = nil
 	m.activityTree = nil
+	m.records = make([]record, 30)
+	for i := range m.records {
+		m.records[i] = record{role: roleAI, text: "history line " + strings.Repeat("word ", 8)}
+	}
 	m.PreRenderedHistory = strings.Repeat("history line\n", 60)
 	return m
 }
@@ -86,9 +90,10 @@ func TestTraceWindowReanchorsOnStreamEnd(t *testing.T) {
 }
 
 // TestStreamingTickPreservesOffsetWhileTraceExpanded pins the viewport scroll
-// lock at the tick level: a smoothStreamTickMsg during an active stream MUST
-// NOT yank the viewport to the bottom while the Ctrl+O output-trace viewport
-// is expanded. Collapsing the trace restores auto-scroll.
+// lock at the tick level: a repaint during an active stream MUST NOT yank the
+// viewport to the tail while the Ctrl+O output-trace viewport is expanded and
+// the user has scrolled away from the tail. Collapsing the trace (and
+// re-engaging tail-lock) restores auto-scroll.
 func TestStreamingTickPreservesOffsetWhileTraceExpanded(t *testing.T) {
 	m := makeTraceModel(30)
 	m.streaming = true
@@ -96,41 +101,43 @@ func TestStreamingTickPreservesOffsetWhileTraceExpanded(t *testing.T) {
 	m.currentStreamContent = "streaming output\n"
 
 	// Seed a mid scroll offset the user has settled on.
-	m.Viewport.SetContent(strings.Repeat("seed line\n", 60))
-	m.Viewport.SetYOffset(25)
-	if m.Viewport.YOffset != 25 {
-		t.Fatalf("test precondition: could not set YOffset=25, got %d", m.Viewport.YOffset)
+	m.setScrollLocked(true)
+	m.docScrollOffset = 25
+	m.refreshViewportContent()
+	if m.docScrollOffset != 25 {
+		t.Fatalf("test precondition: could not set offset 25, got %d", m.docScrollOffset)
 	}
 
-	// Expanded trace: the streaming tick must preserve the offset.
-	m.Update(smoothStreamTickMsg(time.Now()))
-	if m.Viewport.YOffset != 25 {
-		t.Errorf("streaming tick with traceExpanded changed YOffset 25 -> %d (scroll lock violated)", m.Viewport.YOffset)
+	// Expanded trace: the repaint must preserve the offset.
+	m.Update(repaintTickMsg(time.Now()))
+	if m.docScrollOffset != 25 {
+		t.Errorf("streaming repaint with traceExpanded changed offset 25 -> %d (scroll lock violated)", m.docScrollOffset)
 	}
 
-	// Collapsed trace: auto-scroll returns and the viewport follows the tail.
+	// Collapsed trace + tail-lock: auto-scroll returns and follows the tail.
 	m.traceExpanded = false
-	m.Viewport.SetYOffset(25)
-	m.Update(smoothStreamTickMsg(time.Now()))
-	if m.Viewport.YOffset == 25 {
+	m.setScrollLocked(false)
+	m.docScrollOffset = 25
+	m.Update(repaintTickMsg(time.Now()))
+	if m.docScrollOffset == 25 {
 		t.Error("collapsed trace should allow auto-scroll to the bottom")
 	}
 }
 
 // TestToggleThoughtBlockPreservesOffsetWhileTraceExpanded pins the Ctrl+O
 // handler itself: toggling the trace open mid-stream must not force the
-// viewport to the bottom.
+// viewport to the bottom while the user is scrolled away from the tail.
 func TestToggleThoughtBlockPreservesOffsetWhileTraceExpanded(t *testing.T) {
 	m := makeTraceModel(30)
 	m.streaming = true
 	m.traceBuffer.Reset()
 	m.traceBuffer.WriteString("raw output line 1\nraw output line 2\n")
-	m.Viewport.SetContent(strings.Repeat("seed line\n", 60))
-	m.Viewport.SetYOffset(10)
-	if m.Viewport.YOffset != 10 {
-		t.Fatalf("test precondition: could not set YOffset=10, got %d", m.Viewport.YOffset)
+	m.setScrollLocked(true)
+	m.docScrollOffset = 10
+	m.refreshViewportContent()
+	if m.docScrollOffset != 10 {
+		t.Fatalf("test precondition: could not set offset 10, got %d", m.docScrollOffset)
 	}
-	m.userIsScrollingUp = true
 
 	if !m.toggleThoughtBlock() {
 		t.Fatal("toggleThoughtBlock should expand the output trace")
@@ -138,7 +145,7 @@ func TestToggleThoughtBlockPreservesOffsetWhileTraceExpanded(t *testing.T) {
 	if !m.traceExpanded {
 		t.Fatal("trace should be expanded")
 	}
-	if m.Viewport.YOffset != 10 {
-		t.Errorf("Ctrl+O expansion changed YOffset 10 -> %d (viewport jumped)", m.Viewport.YOffset)
+	if m.docScrollOffset != 10 {
+		t.Errorf("Ctrl+O expansion changed offset 10 -> %d (viewport jumped)", m.docScrollOffset)
 	}
 }
