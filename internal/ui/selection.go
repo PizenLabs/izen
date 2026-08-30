@@ -245,27 +245,6 @@ func (m *model) mousePosToGlobal(msg tea.MouseMsg) GlobalPos {
 	return GlobalPos{Y: yOff + relY, X: relX}
 }
 
-// cellToRuneCol converts a visual cell offset within a record's plain text
-// into a rune index, using per-rune widths so wide glyphs map correctly.
-func (m *model) cellToRuneCol(lineIdx, targetCells int) int {
-	if targetCells <= 0 {
-		return 0
-	}
-	if lineIdx < 0 || lineIdx >= len(m.records) {
-		return 0
-	}
-	text := ansi.Strip(m.records[lineIdx].text)
-	runes := []rune(text)
-	cells := 0
-	for i, r := range runes {
-		if cells >= targetCells {
-			return i
-		}
-		cells += runewidth.RuneWidth(r)
-	}
-	return len(runes)
-}
-
 // normalized returns ordered anchor/cursor so anchor <= cursor in (Y,X) tuple order.
 func (s mouseSelection) normalized() (GlobalPos, GlobalPos) {
 	a, c := s.Anchor, s.Cursor
@@ -405,28 +384,32 @@ func (m *model) handleSelectionAutoScroll(msg selectionScrollTickMsg) tea.Cmd {
 	geo := m.viewportGeometry()
 	delta := 0
 	// Primary spec trigger: outside viewport bounds – strict increment by 1 per tick
-	if msg.Y >= geo.Top+geo.Height {
+	switch {
+	case msg.Y >= geo.Top+geo.Height:
 		delta = 1
-	} else if msg.Y < geo.Top {
+	case msg.Y < geo.Top:
 		delta = -1
-	} else {
+	default:
 		// Inside viewport: edge-zone velocity (legacy) for smooth acceleration
 		relY := msg.Y - geo.Top
-		if relY < selectionEdgeRows {
+		switch {
+		case relY < selectionEdgeRows:
 			dist := selectionEdgeRows - relY
-			if dist <= 1 {
+			switch {
+			case dist <= 1:
 				delta = -1
-			} else {
+			default:
 				delta = -2
 			}
-		} else if relY >= geo.Height-selectionEdgeRows {
+		case relY >= geo.Height-selectionEdgeRows:
 			dist := relY - (geo.Height - selectionEdgeRows) + 1
-			if dist <= 1 {
+			switch {
+			case dist <= 1:
 				delta = 1
-			} else {
+			default:
 				delta = 2
 			}
-		} else {
+		default:
 			lastRel := m.mouseSel.lastY - geo.Top
 			if lastRel < selectionEdgeRows && lastRel >= 0 {
 				delta = -1
@@ -612,7 +595,8 @@ func MapCellToByteIndex(s string, targetCell int) int {
 			continue
 		}
 		// Decode rune
-		r, size := 0, 1
+		var r int
+		var size int
 		if s[i] < 0x80 {
 			r = int(s[i])
 			size = 1
@@ -773,20 +757,21 @@ func (m *model) renderDocumentWithSelection() string {
 			}
 			renderedCells := StringCellWidth(ansi.Strip(rendered))
 			var startCell, endCell int
-			if s.Y == e.Y {
+			switch {
+			case s.Y == e.Y:
 				startCell = s.X
 				endCell = e.X
-			} else if idx == s.Y {
+			case idx == s.Y:
 				startCell = s.X
 				endCell = renderedCells - 1
 				// Clamp end to content end
 				if gutter+contentCells-1 < endCell {
 					endCell = gutter + contentCells - 1
 				}
-			} else if idx == e.Y {
+			case idx == e.Y:
 				startCell = gutter
 				endCell = e.X
-			} else {
+			default:
 				startCell = gutter
 				endCell = gutter + contentCells - 1
 			}

@@ -379,7 +379,7 @@ func TestSelection_CodeBlockIndentation(t *testing.T) {
 	geo := m.viewportGeometry()
 	// Find the physical row for the indented line "    fmt.Println..."
 	// Locate via hitmap.
-	var targetY int = -1
+	var targetY = -1
 	var targetRow RowLayout
 	for y, r := range m.fullHitRows {
 		if r.RecordIdx == 0 && r.LogicalLine >= 0 {
@@ -401,9 +401,8 @@ func TestSelection_CodeBlockIndentation(t *testing.T) {
 	}
 	// Click exactly on 'f' of fmt after prefix+indent (4 prefix + 4 indent = 8 cells offset)
 	// The raw line is "    fmt.Println(...)" — 'f' at rune index 4.
-	x := 2 + 4 + 4 // geo.Left 0 + prefix 4 + indent 4
 	// Actually prefix 4 already includes outer+inner gutters; indent 4 is part of content, so we need X = prefixCells + indentCells
-	x = int(targetRow.PrefixCells) + 4
+	x := int(targetRow.PrefixCells) + 4
 	pos := m.mousePosToLogical(tea.MouseMsg{X: x, Y: targetY})
 	if pos.Line != 0 {
 		t.Fatalf("code block should map to record 0, got %d", pos.Line)
@@ -437,7 +436,7 @@ func TestSelection_MarkdownListsAndHeadings(t *testing.T) {
 		t.Fatalf("heading blank separator row not found in hitmap")
 	}
 	// Find ordered list row "1. Install Go"
-	var orderedY int = -1
+	var orderedY = -1
 	var orderedRow RowLayout
 	for y, r := range m.fullHitRows {
 		if r.RecordIdx == 0 && r.LogicalLine >= 0 {
@@ -456,7 +455,7 @@ func TestSelection_MarkdownListsAndHeadings(t *testing.T) {
 		t.Fatalf("ordered list row PrefixCells should be 5 (2+3), got %d", orderedRow.PrefixCells)
 	}
 	// Bullet row
-	var bulletY int = -1
+	var bulletY = -1
 	var bulletRow RowLayout
 	for y, r := range m.fullHitRows {
 		if r.RecordIdx == 0 && r.LogicalLine >= 0 {
@@ -475,7 +474,7 @@ func TestSelection_MarkdownListsAndHeadings(t *testing.T) {
 		t.Fatalf("bullet row PrefixCells should be 4 (2+2), got %d", bulletRow.PrefixCells)
 	}
 	// Blockquote
-	var bqY int = -1
+	var bqY = -1
 	var bqRow RowLayout
 	for y, r := range m.fullHitRows {
 		if r.RecordIdx == 0 && r.LogicalLine >= 0 {
@@ -510,7 +509,7 @@ func TestSelection_CJKAndEmoji(t *testing.T) {
 	m := newGeometryModel(80, 30, []record{{role: roleAI, text: text}})
 	geo := m.viewportGeometry()
 	// Find the row containing this text (single logical line, likely not wrapped at 80)
-	var y int = -1
+	var y = -1
 	for idx, r := range m.fullHitRows {
 		if r.RecordIdx == 0 && r.LogicalLine == 0 {
 			y = geo.Top + (idx - m.Viewport.YOffset)
@@ -544,13 +543,10 @@ func TestSelection_CJKAndEmoji(t *testing.T) {
 		// Use actual runewidth for accurate
 		// We re-use runewidth lib via manual width: CJK/emoji 2 else 1
 		w := 1
-		// Import runewidth width for correctness
-		// Use same as cellToRuneInString logic
-		cells += w
 		if runes[i] == '你' || runes[i] == '好' || runes[i] == '世' || runes[i] == '界' || runes[i] == '😀' {
-			cells++ // second cell for wide
 			w = 2
 		}
+		cells += w
 	}
 	// Emoji check: find '😀' index
 	emojiIdx := -1
@@ -584,19 +580,13 @@ func TestSelection_ClipboardInvariant(t *testing.T) {
 	geo := m.viewportGeometry()
 	// Simulate click/drag across wrapped content and verify highlight == clipboard.
 	// Use hitmap to find sequential physical rows for this long wrapped line.
-	var firstY, secondY int = -1, -1
+	var firstY = -1
 	var firstRow RowLayout
-	var secondRow RowLayout
-	_ = secondRow
 	for idx, r := range m.fullHitRows {
 		if r.RecordIdx == 0 && r.LogicalLine == 0 {
 			if firstY < 0 {
 				firstY = geo.Top + (idx - m.Viewport.YOffset)
 				firstRow = r
-			} else if secondY < 0 && r.RuneStartIdx != firstRow.RuneStartIdx {
-				secondY = geo.Top + (idx - m.Viewport.YOffset)
-				secondRow = r
-				break
 			}
 		}
 	}
