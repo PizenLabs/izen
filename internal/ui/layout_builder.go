@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/alecthomas/chroma/v2"
@@ -857,7 +858,8 @@ func renderTableCell(cell string) string {
 }
 
 // renderMarkdownTableToLines renders a buffered pipe-delimited markdown table
-// as a structured Unicode box grid:
+// as a structured Unicode box grid with responsive column budgeting and
+// intra-cell word wrapping:
 //
 //	┌─────────┬─────────┐
 //	│ Col1    │ Col2    │
@@ -865,10 +867,21 @@ func renderTableCell(cell string) string {
 //	│ A       │ B       │
 //	└─────────┴─────────┘
 //
-// Column widths are the maximum visual cell width across the header and all
-// body rows. Borders use #585b70 (38;2;88;91;112), header titles are bold
-// Catppuccin Green (#a6e3a1), and no background fill is ever applied.
+// Responsive budgeting:
+//   W_i_nat = natural content width per column
+//   A = wrapWidth - outerGutter - (N_cols+1) - 2*N_cols  (available for content)
+//   T = sum W_i_nat
+//   IF T > A: allocated widths W_i_alloc use proportional scaling with
+//             minWidth floor (10 cells).
+//   ELSE: W_i_alloc = W_i_nat
+//
+// Intra-cell wrapping:
+//   Each cell text is wrapped to W_i_alloc. A logical table row expands to
+//   K = max(lines in cell) visual lines with vertical borders "│" on every line.
 func renderMarkdownTableToLines(rows []string, wrapWidth int) []DocumentLine {
+	if wrapWidth < 20 {
+		wrapWidth = 20
+	}
 	type parsedRow struct {
 		isSep bool
 		cells []string
@@ -924,31 +937,30 @@ func renderMarkdownTableToLines(rows []string, wrapWidth int) []DocumentLine {
 		return nil
 	}
 
-	colWidths := make([]int, ncols)
-	renderHeader := make([]string, len(headerCells))
+	// Natural content widths.
+	natWidths := make([]int, ncols)
 	for i, c := range headerCells {
-		renderHeader[i] = renderTableCell(c)
+		rendered := renderTableCell(c)
 		if i < ncols {
-			if w := ansi.StringWidth(renderHeader[i]); w > colWidths[i] {
-				colWidths[i] = w
+			if w := ansi.StringWidth(rendered); w > natWidths[i] {
+				natWidths[i] = w
 			}
 		}
 	}
-	renderBody := make([][]string, len(bodyRows))
-	for ri, row := range bodyRows {
-		renderBody[ri] = make([]string, len(row))
+	for _, row := range bodyRows {
 		for ci, c := range row {
-			renderBody[ri][ci] = renderTableCell(c)
-			if ci < ncols {
-				if w := ansi.StringWidth(renderBody[ri][ci]); w > colWidths[ci] {
-					colWidths[ci] = w
-				}
+			if ci >= ncols {
+				continue
+			}
+			rendered := renderTableCell(c)
+			if w := ansi.StringWidth(rendered); w > natWidths[ci] {
+				natWidths[ci] = w
 			}
 		}
 	}
-	for i := range colWidths {
-		if colWidths[i] < 3 {
-			colWidths[i] = 3
+	for i := range natWidths {
+		if natWidths[i] < 3 {
+			natWidths[i] = 3
 		}
 	}
 
@@ -959,7 +971,111 @@ func renderMarkdownTableToLines(rows []string, wrapWidth int) []DocumentLine {
 		reset    = "\x1b[0m"
 	)
 	outerGutter := "│ "
-	outerCells := runewidth.StringWidth(outerGutter)
+	outerCells := runewidth.StringWidth(ansi.Strip(outerGutter))
+
+	// Responsive column budgeting.
+	// Available width for content: wrapWidth minus outer gutter, borders and padding.
+	// Spec: A = wrapWidth - (N_cols+1); we use true available to guarantee fit.
+	boxAvailable := wrapWidth - outerCells
+	if boxAvailable < 10 {
+		boxAvailable = 10
+	}
+	overhead := 3*ncols + 1 // 2 pad per col + N+1 borders = 3N+1
+	contentAvail := boxAvailable - overhead
+	if contentAvail < ncols*3 {
+		contentAvail = ncols * 3
+	}
+	totalNat := 0
+	for _, w := range natWidths {
+		totalNat += w
+	}
+	// Spec formulas for reference: A_spec = wrapWidth - (ncols+1), T = totalNat
+	// We budget against contentAvail (true available) to guarantee no overflow.
+	allocWidths := make([]int, ncols)
+	copy(allocWidths, natWidths)
+	minWidth := 10
+	if totalNat > contentAvail {
+		if contentAvail < ncols*minWidth {
+			// Not enough for minWidth each -> distribute evenly.
+			per := contentAvail / ncols
+			rem := contentAvail % ncols
+			for i := range allocWidths {
+				allocWidths[i] = per
+				if i < rem {
+					allocWidths[i]++
+				}
+				if allocWidths[i] < 1 {
+					allocWidths[i] = 1
+				}
+			}
+		} else {
+			remaining := contentAvail - ncols*minWidth
+			totalExcess := totalNat - ncols*minWidth
+			if totalExcess < 0 {
+				totalExcess = 0
+			}
+			for i := range allocWidths {
+				allocWidths[i] = minWidth
+				if totalExcess > 0 {
+					extra := (natWidths[i] - minWidth) * remaining / totalExcess
+					allocWidths[i] += extra
+				}
+			}
+			// Fix rounding to exactly fill contentAvail.
+			sumAlloc := 0
+			for _, w := range allocWidths {
+				sumAlloc += w
+			}
+			diff := contentAvail - sumAlloc
+			if diff != 0 {
+				// Order columns by descending nat width for fair distribution.
+				indices := make([]int, ncols)
+				for i := range indices {
+					indices[i] = i
+				}
+				sort.Slice(indices, func(a, b int) bool {
+					return natWidths[indices[a]] > natWidths[indices[b]]
+				})
+				if diff > 0 {
+					for diff > 0 {
+						for _, idx := range indices {
+							if diff <= 0 {
+								break
+							}
+							allocWidths[idx]++
+							diff--
+						}
+					}
+				} else {
+					for diff < 0 {
+						for _, idx := range indices {
+							if diff >= 0 {
+								break
+							}
+							if allocWidths[idx] > minWidth {
+								allocWidths[idx]--
+								diff++
+							}
+						}
+						// Avoid infinite loop if cannot reduce further.
+						if diff < 0 {
+							breakLoop := true
+							for _, idx := range indices {
+								if allocWidths[idx] > minWidth {
+									breakLoop = false
+									break
+								}
+							}
+							if breakLoop {
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	colWidths := allocWidths
 
 	seg := make([]int, ncols)
 	totalWidth := 1
@@ -986,24 +1102,37 @@ func renderMarkdownTableToLines(rows []string, wrapWidth int) []DocumentLine {
 	sepBorder := horiz("├", "┼", "┤")
 	botBorder := horiz("└", "┴", "┘")
 
-	rowLine := func(cells []string, isHeader bool) string {
+	// Helper: wrap a plain cell to width.
+	wrapPlainCell := func(cell string, w int) []string {
+		if w < 1 {
+			w = 1
+		}
+		if strings.TrimSpace(cell) == "" {
+			return []string{""}
+		}
+		return wrapForContentWidth(cell, w)
+	}
+
+	// Build a row string for visual line k of a wrapped logical row.
+	buildRow := func(wrapped [][]string, k int, isHeader bool) string {
 		var b strings.Builder
 		b.WriteString("│")
 		for i := 0; i < ncols; i++ {
-			content := ""
-			if i < len(cells) {
-				content = cells[i]
+			contentPlain := ""
+			if i < len(wrapped) && k < len(wrapped[i]) {
+				contentPlain = wrapped[i][k]
 			}
-			w := ansi.StringWidth(content)
-			pad := 0
-			if w < colWidths[i] {
-				pad = colWidths[i] - w
+			rendered := renderTableCell(contentPlain)
+			w := ansi.StringWidth(rendered)
+			pad := colWidths[i] - w
+			if pad < 0 {
+				pad = 0
 			}
 			b.WriteString(" ")
-			if isHeader {
-				b.WriteString(headerFg + content + reset)
+			if isHeader && rendered != "" {
+				b.WriteString(headerFg + rendered + reset)
 			} else {
-				b.WriteString(content)
+				b.WriteString(rendered)
 			}
 			b.WriteString(strings.Repeat(" ", pad))
 			b.WriteString(" │")
@@ -1022,8 +1151,7 @@ func renderMarkdownTableToLines(rows []string, wrapWidth int) []DocumentLine {
 		}
 	}
 
-	contentLine := func(cells []string, isHeader bool) DocumentLine {
-		rendered := rowLine(cells, isHeader)
+	contentLineFromStr := func(rendered string) DocumentLine {
 		raw := ansi.Strip(rendered)
 		return DocumentLine{
 			Spans: []RenderSpan{
@@ -1035,15 +1163,54 @@ func renderMarkdownTableToLines(rows []string, wrapWidth int) []DocumentLine {
 		}
 	}
 
-	out := []DocumentLine{borderLine(topBorder)}
-	if len(renderHeader) > 0 {
-		out = append(out, contentLine(renderHeader, true))
+	var out []DocumentLine
+	out = append(out, borderLine(topBorder))
+
+	// Header row with wrapping.
+	if len(headerCells) > 0 {
+		// Normalize header to ncols.
+		plainHeader := make([]string, ncols)
+		for i := 0; i < ncols; i++ {
+			if i < len(headerCells) {
+				plainHeader[i] = headerCells[i]
+			}
+		}
+		wrappedHeader := make([][]string, ncols)
+		maxK := 0
+		for i := 0; i < ncols; i++ {
+			wrappedHeader[i] = wrapPlainCell(plainHeader[i], colWidths[i])
+			if len(wrappedHeader[i]) > maxK {
+				maxK = len(wrappedHeader[i])
+			}
+		}
+		for k := 0; k < maxK; k++ {
+			rowStr := buildRow(wrappedHeader, k, true)
+			out = append(out, contentLineFromStr(rowStr))
+		}
 	}
 	if hasSep {
 		out = append(out, borderLine(sepBorder))
 	}
-	for _, rc := range renderBody {
-		out = append(out, contentLine(rc, false))
+	// Body rows with wrapping.
+	for _, row := range bodyRows {
+		plainCols := make([]string, ncols)
+		for i := 0; i < ncols; i++ {
+			if i < len(row) {
+				plainCols[i] = row[i]
+			}
+		}
+		wrappedCols := make([][]string, ncols)
+		maxK := 0
+		for i := 0; i < ncols; i++ {
+			wrappedCols[i] = wrapPlainCell(plainCols[i], colWidths[i])
+			if len(wrappedCols[i]) > maxK {
+				maxK = len(wrappedCols[i])
+			}
+		}
+		for k := 0; k < maxK; k++ {
+			rowStr := buildRow(wrappedCols, k, false)
+			out = append(out, contentLineFromStr(rowStr))
+		}
 	}
 	out = append(out, borderLine(botBorder))
 	return out

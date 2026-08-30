@@ -721,8 +721,9 @@ type model struct {
 	showBanner bool
 
 	// Window dimensions
-	width  int
-	height int
+	width     int
+	height    int
+	wrapWidth int
 
 	// Viewport for scrollable chat history
 	Viewport           viewport.Model
@@ -3705,10 +3706,15 @@ func (m *model) refreshViewportContent() {
 	// ── Incremental DocumentLayout update (records + streaming tail) ───
 	// Dynamic username badge: use m.cfg.Username or m.userName, fallback to
 	// Developer inside builder.
-	wrapWidth := m.width
-	if wrapWidth < 40 {
-		wrapWidth = 40
+	wrapWidth := m.wrapWidth
+	if wrapWidth == 0 {
+		wrapWidth = m.width
 	}
+	if wrapWidth < 20 {
+		wrapWidth = 20
+	}
+	// Keep wrapWidth in sync for incremental checks.
+	m.wrapWidth = wrapWidth
 	username := ""
 	if m.cfg != nil && m.cfg.Username != "" {
 		username = m.cfg.Username
@@ -3995,6 +4001,42 @@ func (m *model) renderVIModeViewport(chromeLines, tailLines []string) {
 	m.Viewport.SetContent(contentStr)
 	// The vi-mode caller (update.go) syncs Viewport.YOffset after this refresh;
 	// vi-mode owns its scroll position directly on the full-content viewport.
+}
+
+// rebuildDocumentLayout clears the document layout and fully re-runs the layout
+// pass over all committed records using the updated wrapWidth. It re-anchors
+// docScrollOffset so the view does not jump out of bounds after a resize.
+func (m *model) rebuildDocumentLayout() {
+	if m.wrapWidth < 20 {
+		m.wrapWidth = 20
+	}
+	username := ""
+	if m.cfg != nil && m.cfg.Username != "" {
+		username = m.cfg.Username
+	} else if m.userName != "" {
+		username = m.userName
+	}
+	// Clear existing layout.
+	m.docLayout = nil
+	m.streamingDocStart = -1
+	m.resetStreamingRenderer()
+	dl := BuildDocumentLayout(m.records, m.wrapWidth, username)
+	m.docLayout = &dl
+	m.syncStreamingSegment()
+	// Re-anchor scroll offset: clamp to valid range based on new layout + chrome + tail.
+	chrome := m.viewportContentPrefixHeight()
+	tail := len(m.renderTailPanelLines())
+	total := chrome + dl.Len() + tail
+	maxOff := total - m.Viewport.Height
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if m.docScrollOffset > maxOff {
+		m.docScrollOffset = maxOff
+	}
+	if m.docScrollOffset < 0 {
+		m.docScrollOffset = 0
+	}
 }
 
 // updateConversationLayout incrementally updates the records-only DocumentLayout

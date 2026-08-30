@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 )
@@ -980,5 +981,52 @@ func TestDocumentLayout_IncrementalStreamMatchesOneShot(t *testing.T) {
 	m.refreshViewportContent()
 	if m.repaintSeq != seqBefore {
 		t.Fatalf("no-change refresh advanced repaintSeq %d → %d — redundant re-parse", seqBefore, m.repaintSeq)
+	}
+}
+
+func TestDocument_RelayoutOnWindowSizeMsg(t *testing.T) {
+	m := newTestModel()
+	m.width = 120
+	m.height = 24
+	m.wrapWidth = 120 - 4
+	m.records = []record{
+		{role: roleAI, text: strings.Repeat("word ", 30) + "\n\n| H1 | H2 | H3 |\n|---|---|---|\n| " + strings.Repeat("longcontent ", 10) + " | " + strings.Repeat("data ", 10) + " | " + strings.Repeat("more ", 10) + " |"},
+		{role: roleUser, text: strings.Repeat("hello ", 20)},
+		{role: roleAI, text: "## Title\n\nSome paragraph with enough text to test wrapping at different widths " + strings.Repeat("extra ", 20)},
+	}
+	m.Ready = true
+	m.Viewport.Width = 120
+	m.Viewport.Height = 10
+	dl120 := BuildDocumentLayout(m.records, 120)
+	m.docLayout = &dl120
+	m.refreshViewportContent()
+	msg := tea.WindowSizeMsg{Width: 60, Height: 24}
+	nm, _ := m.Update(msg)
+	m2 := nm.(*model)
+	if m2.docLayout == nil {
+		t.Fatalf("docLayout nil after resize")
+	}
+	if m2.wrapWidth != 56 {
+		t.Fatalf("wrapWidth %d want 56", m2.wrapWidth)
+	}
+	if m2.width != 60 {
+		t.Fatalf("width %d want 60", m2.width)
+	}
+	for i, l := range m2.docLayout.Lines {
+		w := runewidth.StringWidth(ansi.Strip(l.RenderedStr))
+		if w > 60 {
+			t.Fatalf("line %d width %d exceeds 60 after relayout: %q", i, w, ansi.Strip(l.RenderedStr))
+		}
+	}
+	if m2.docLayout.Width() != m2.wrapWidth {
+		t.Fatalf("docLayout width %d != wrapWidth %d", m2.docLayout.Width(), m2.wrapWidth)
+	}
+	total := m2.viewportContentPrefixHeight() + m2.docLayout.Len() + len(m2.renderTailPanelLines())
+	maxOff := total - m2.Viewport.Height
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if m2.docScrollOffset < 0 || m2.docScrollOffset > maxOff {
+		t.Fatalf("docScrollOffset %d out of bounds [0,%d] total %d", m2.docScrollOffset, maxOff, total)
 	}
 }

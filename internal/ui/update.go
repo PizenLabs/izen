@@ -375,6 +375,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		padding := 4
+		w := msg.Width - padding
+		if w < 20 {
+			w = 20
+		}
+		m.wrapWidth = w
 		m.ti.Width = msg.Width - 8
 
 		// NOTE: the model picker's own size is NOT set here. It's derived
@@ -402,6 +408,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 
 		m.syncShimmerWidth()
+
+		// Full layout re-hydration on resize: clear and rebuild document layout
+		// using the updated wrapWidth, then re-anchor scroll offset.
+		m.rebuildDocumentLayout()
 
 		// Flush and rebuild hitmap immediately on resize; clear any frozen
 		// drag snapshot so new dimensions are reflected.

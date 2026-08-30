@@ -210,3 +210,55 @@ func TestCodeBlock_GoCodeKeepsFrame(t *testing.T) {
 		t.Fatalf("go code block must not render a shell prompt, got:\n%s", s)
 	}
 }
+
+// TestTable_ResponsiveColumnWrapping verifies responsive column budgeting and
+// intra-cell wrapping: a wide markdown table with wrapWidth=50 must shrink
+// columns, wrap long cell text into multiple lines, and keep vertical borders
+// aligned without overflowing 50 cells.
+func TestTable_ResponsiveColumnWrapping(t *testing.T) {
+	md := "| ColumnOneWithLongHeader | ColumnTwoWithLongHeader | ColumnThreeWithLongHeader |\n|---|---|---|\n| This is a very long cell content that should wrap into multiple lines because it exceeds the allocated width | Short | Another very long cell content that needs wrapping across multiple visual lines to stay within budget |"
+	wrapWidth := 50
+	out := renderAIBlockLines(md, wrapWidth)
+	if len(out) == 0 {
+		t.Fatalf("no lines")
+	}
+	for i, l := range out {
+		w := ansi.StringWidth(ansi.Strip(l.RenderedStr))
+		if w > wrapWidth {
+			t.Fatalf("line %d width %d exceeds %d: %q", i, w, wrapWidth, ansi.Strip(l.RenderedStr))
+		}
+	}
+	if len(out) < 5 {
+		t.Fatalf("expected wrapping to produce multiple lines per row, got %d lines", len(out))
+	}
+	var pipeCount = -1
+	for _, l := range out {
+		plain := ansi.Strip(l.RenderedStr)
+		if strings.Contains(plain, "┌") || strings.Contains(plain, "├") || strings.Contains(plain, "└") {
+			continue
+		}
+		c := strings.Count(plain, "│")
+		if pipeCount == -1 {
+			pipeCount = c
+		} else if c != pipeCount && c != 0 {
+			t.Fatalf("vertical borders misaligned: expected %d pipes, got %d in %q", pipeCount, c, plain)
+		}
+	}
+	sepIdx := -1
+	botIdx := -1
+	for i, l := range out {
+		plain := ansi.Strip(l.RenderedStr)
+		if strings.Contains(plain, "├") {
+			sepIdx = i
+		}
+		if strings.Contains(plain, "└") {
+			botIdx = i
+		}
+	}
+	if sepIdx >= 0 && botIdx > sepIdx {
+		bodyLines := botIdx - sepIdx - 1
+		if bodyLines < 2 {
+			t.Fatalf("expected body row to wrap into multiple lines, got bodyLines=%d total %d", bodyLines, len(out))
+		}
+	}
+}
