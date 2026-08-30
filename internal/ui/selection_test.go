@@ -319,3 +319,58 @@ func TestSelection_ModalBlocksSelection(t *testing.T) {
 		t.Fatal("selection should be blocked in modal approval state")
 	}
 }
+
+// TestSelection_ExactCellBoundsNoTrailingBleed verifies off-by-one fix: selecting
+// "the following" in "run the following commands:" must highlight exactly up to 'g'
+// without bleeding into trailing space or 'c' of "commands:".
+func TestSelection_ExactCellBoundsNoTrailingBleed(t *testing.T) {
+	s := "run the following commands:"
+	// "run " = 4 cells, "the following" = 13 chars (4..16 inclusive), 'g' at cell 16
+	startCell := 4
+	endCell := 16 // inclusive last cell of 'g'
+	bg := "\x1b[48;2;42;34;64m"
+	out := injectHighlightByCells(s, startCell, endCell, bg)
+	// startByte should be 4, endByte should be 17 (exclusive after 'g')
+	startByte := MapCellToByteIndex(s, startCell)
+	endByte := MapCellToByteIndex(s, endCell+1)
+	if startByte != 4 {
+		t.Fatalf("startByte %d want 4", startByte)
+	}
+	if endByte != 17 {
+		t.Fatalf("endByte %d want 17 (byte after 'g') got %d middle %q", 17, endByte, s[startByte:endByte])
+	}
+	expectedMiddle := "the following"
+	if s[startByte:endByte] != expectedMiddle {
+		t.Fatalf("middle %q want %q", s[startByte:endByte], expectedMiddle)
+	}
+	// out must contain highlighted "the following" and not include trailing space or 'c'
+	if !strings.Contains(out, bg+expectedMiddle) {
+		t.Fatalf("highlight missing expected middle: %q", out)
+	}
+	if strings.Contains(out, bg+expectedMiddle+" ") {
+		t.Fatalf("highlight bleeds into trailing space: %q", out)
+	}
+	if strings.Contains(out, "commands:") {
+		// commands: should be outside highlight (after reset)
+		// Ensure highlight does not cover 'c'
+		// Extract between bg and reset
+		bgIdx := strings.Index(out, bg)
+		resetIdx := strings.Index(out[bgIdx:], "\x1b[0m")
+		if bgIdx >= 0 && resetIdx >= 0 {
+			seg := out[bgIdx+len(bg) : bgIdx+resetIdx]
+			// seg may contain ANSI restores but stripped should be exactly "the following"
+			if strings.Contains(seg, "c") && strings.Contains(seg, "commands") {
+				t.Fatalf("highlight bleeds into 'c' of commands: seg %q out %q", seg, out)
+			}
+			plain := ansi.Strip(seg)
+			if plain != expectedMiddle {
+				t.Fatalf("highlighted plain %q want %q", plain, expectedMiddle)
+			}
+		}
+	}
+	// Also verify that explicitly selecting trailing space does include it
+	outWithSpace := injectHighlightByCells(s, startCell, 17, bg) // inclusive space
+	if !strings.Contains(outWithSpace, expectedMiddle+" ") {
+		t.Fatalf("explicit trailing space selection should include space: %q", outWithSpace)
+	}
+}

@@ -713,6 +713,89 @@ func stripBackgroundANSI(s string) string {
 	return out.String()
 }
 
+// normalizeShellLang maps shell-like identifiers to Chroma's bash lexer name.
+func normalizeShellLang(lang string) string {
+	l := strings.ToLower(strings.TrimSpace(lang))
+	switch l {
+	case "sh", "shell", "zsh", "bash", "console", "cmd", "terminal":
+		return "bash"
+	default:
+		return lang
+	}
+}
+
+// isShellLang reports whether lang is a shell/command language needing fallback.
+func isShellLang(lang string) bool {
+	l := strings.ToLower(strings.TrimSpace(lang))
+	switch l {
+	case "sh", "shell", "zsh", "bash", "console", "cmd", "terminal":
+		return true
+	default:
+		return false
+	}
+}
+
+// colorizeShellFallback is a custom tokenizer for shell/command lines when
+// Chroma's lexer emits uncolored Text for command tokens (e.g. "go", "build").
+// It emits 24-bit foreground codes without background fill:
+//   - first token (command): #a6e3a1 (green) or #89dceb (cyan)
+//   - flags/subcommands (-v, --flag, run): #cba6f7 (mauve) or #89b4fa (blue)
+//   - args/paths (hello.go): #fab387 (peach) or #f9e2af (yellow)
+func colorizeShellFallback(line string) string {
+	const (
+		colCmd  = "\x1b[38;2;166;227;161m" // #a6e3a1 green
+		colFlag = "\x1b[38;2;203;166;247m" // #cba6f7 mauve
+		colArg  = "\x1b[38;2;250;179;135m" // #fab387 peach
+		reset   = "\x1b[0m"
+	)
+	var buf strings.Builder
+	i := 0
+	tokenIdx := 0
+	for i < len(line) {
+		if line[i] == ' ' || line[i] == '\t' {
+			buf.WriteByte(line[i])
+			i++
+			continue
+		}
+		j := i
+		if j < len(line) && (line[j] == '"' || line[j] == '\'') {
+			quote := line[j]
+			j++
+			for j < len(line) && line[j] != quote {
+				j++
+			}
+			if j < len(line) {
+				j++ // include closing quote
+			}
+		} else {
+			for j < len(line) && line[j] != ' ' && line[j] != '\t' {
+				j++
+			}
+		}
+		token := line[i:j]
+		var sgr string
+		if tokenIdx == 0 {
+			sgr = colCmd
+		} else if strings.HasPrefix(token, "-") {
+			sgr = colFlag
+		} else if strings.Contains(token, ".") || strings.Contains(token, "/") {
+			sgr = colArg
+		} else {
+			// subcommand like "run", "build"
+			sgr = colFlag
+		}
+		buf.WriteString(sgr)
+		buf.WriteString(token)
+		buf.WriteString(reset)
+		tokenIdx++
+		i = j
+	}
+	if buf.Len() == 0 {
+		return line
+	}
+	return buf.String()
+}
+
 // colorizeNoBg returns Chroma/Catppuccin syntax-highlighted line with foreground
 // colors (38;2;...) for keywords, identifiers, strings, etc., explicitly stripping
 // any background (48;2;...) to keep terminal background transparent.
@@ -720,21 +803,30 @@ func colorizeNoBg(lang, line string) string {
 	if strings.TrimSpace(line) == "" {
 		return line
 	}
-	lexer := lexers.Get(lang)
+	normalized := normalizeShellLang(lang)
+	lexer := lexers.Get(normalized)
 	if lexer == nil {
 		lexer = lexers.Fallback
 	}
 	lexer = chroma.Coalesce(lexer)
 	it, err := lexer.Tokenise(nil, line)
 	if err != nil {
+		if isShellLang(lang) {
+			return colorizeShellFallback(line)
+		}
 		return line
 	}
 	var buf strings.Builder
+	hasColored := false
 	for _, tok := range it.Tokens() {
 		if tok.Value == "" {
 			continue
 		}
-		// Token value may contain internal newlines (should not for single line)
+		// Detect whether Chroma produced any colored token beyond plain Text.
+		// Shell lexers often emit a single Text token for unknown commands.
+		if tok.Type != chroma.Text && tok.Type != 0 {
+			hasColored = true
+		}
 		parts := strings.Split(tok.Value, "\n")
 		for pi, part := range parts {
 			if pi > 0 {
@@ -751,9 +843,35 @@ func colorizeNoBg(lang, line string) string {
 		}
 	}
 	if buf.Len() == 0 {
+		if isShellLang(lang) {
+			return colorizeShellFallback(line)
+		}
 		return line
 	}
-	return buf.String()
+	// If shell language produced only uncolored Text (e.g. "go run hello.go"
+	// as a single Text token), fall back to custom tokenizer to ensure
+	// command elements are colorized with 38;2; codes.
+	if isShellLang(lang) && !hasColored {
+		// Check if buffer contains only the default foreground color (#cdd6f4)
+		// without distinct command/flag/arg colors.
+		s := buf.String()
+		// If s contains only one distinct color or is equivalent to plain,
+		// use fallback for richer shell highlighting.
+		if strings.Count(s, "\x1b[38;2;") <= 1 {
+			return colorizeShellFallback(line)
+		}
+		// Also if lexer emitted single Text token covering whole line, fallback
+		toks := it.Tokens()
+		if len(toks) == 1 && strings.TrimSpace(toks[0].Value) == strings.TrimSpace(line) {
+			return colorizeShellFallback(line)
+		}
+	}
+	// Ensure no background codes leak
+	res := buf.String()
+	if strings.Contains(res, "48;2;") {
+		res = stripBackgroundANSI(res)
+	}
+	return res
 }
 
 // gutterDocumentLine builds an empty AI gutter row (blank physical line).

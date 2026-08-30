@@ -674,6 +674,12 @@ func lastANSI(s string) string {
 // MapCellToByteIndex and wrapping the slice with background highlight codes.
 // Internal \x1b[0m resets inside the highlighted slice are patched to re-apply
 // the selection background so highlight persists across color switches.
+//
+// Boundary semantics: startCell inclusive, endCell inclusive (last selected
+// visual cell, 0-indexed). The exclusive byte offset is therefore at
+// endCell+1 cells. If sel.EndColumn were already exclusive (boundary after
+// selection), callers must pass endCell-1 or use exclusive variant; this
+// function treats C_end as inclusive to avoid off-by-one trailing bleed.
 func injectHighlightByCells(s string, startCell, endCell int, bg string) string {
 	if startCell < 0 {
 		startCell = 0
@@ -681,13 +687,30 @@ func injectHighlightByCells(s string, startCell, endCell int, bg string) string 
 	if endCell < startCell {
 		return s
 	}
-	startByte := MapCellToByteIndex(s, startCell)
-	endByte := MapCellToByteIndex(s, endCell+1)
-	if startByte >= len(s) || startByte >= endByte {
+	// Clamp to visual content width to prevent bleeding into adjacent cells
+	// (e.g. selecting "the following" must stop at 'g' without including
+	// the following space or 'c' of "commands:").
+	plainWidth := StringCellWidth(ansi.Strip(s))
+	if plainWidth == 0 {
 		return s
 	}
+	if startCell >= plainWidth {
+		return s
+	}
+	if endCell >= plainWidth {
+		endCell = plainWidth - 1
+	}
+	if endCell < startCell {
+		return s
+	}
+	startByte := MapCellToByteIndex(s, startCell)
+	// endCell inclusive => exclusive byte at endCell+1 cells
+	endByte := MapCellToByteIndex(s, endCell+1)
 	if endByte > len(s) {
 		endByte = len(s)
+	}
+	if startByte >= len(s) || startByte >= endByte {
+		return s
 	}
 	before := s[:startByte]
 	middle := s[startByte:endByte]
