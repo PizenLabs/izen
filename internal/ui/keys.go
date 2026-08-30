@@ -129,6 +129,20 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// ── GLOBAL: Alt+V toggles trace verbosity (quiet/accordion ↔ verbose) ──
+	// Quiet (default): [AUTONOMY DECISION], [preflight] and [stage completed]
+	// traces collapse into the single subtle line
+	// `▸ Execution Trace: direct_response (21ms) · preflight ok`.
+	// Verbose restores the full multiline logs.
+	if msg.String() == "alt+v" {
+		ToggleTraceVerbose()
+		m.refreshViewportContent()
+		if m.Ready && !m.userIsScrollingUp {
+			m.followTail()
+		}
+		return m, nil
+	}
+
 	// ── GLOBAL: Ctrl+O toggles the active thought block ──────────────
 	// Expands/collapses the reasoning block for the currently active message
 	// (ThinkingBuffer). When no thought block is active, falls back to cycling
