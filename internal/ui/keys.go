@@ -1058,6 +1058,7 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		// First submission transitions the footer from Fresh-Launch to the
 		// Active-Session IDLE telemetry state.
 		m.sessionHasRunPrompts = true
+		m.currentTurnID++
 		// A new turn resets the per-turn trace-summary dedup: the next quiet
 		// "▸ Trace:" line (and exactly one) is emitted for THIS turn.
 		m.traceSummaryShown = false

@@ -65,9 +65,21 @@ func renderFixedHeader(runtimeCtx *runtime.RuntimeContext, wfSM *workflow.Workfl
 	}
 
 	// ── Right region: toast overlay (active) or mode badge (idle) ──
+	effectiveMode := mode
+	switch ws {
+	case workflow.StateBuilding:
+		effectiveMode = modes.ModeBuild
+	case workflow.StateInvestigating:
+		effectiveMode = modes.ModeInvestigate
+	case workflow.StatePlanning:
+		effectiveMode = modes.ModePlan
+	case workflow.StateReviewing:
+		effectiveMode = modes.ModeReview
+	}
+
 	right := toast
 	if right == "" {
-		right = renderModeBadge(mode)
+		right = renderModeBadge(effectiveMode)
 	}
 	if right == "" {
 		return headerBorderStyle.Width(width).Render(b.String())

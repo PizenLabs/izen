@@ -93,6 +93,16 @@ func isEngineTraceLine(s string) bool {
 		return true
 	case strings.HasPrefix(lower, "[stage"):
 		return true
+	case strings.HasPrefix(lower, "[phase"):
+		return true
+	case strings.HasPrefix(lower, "[runtime"):
+		return true
+	case strings.HasPrefix(lower, "[intent"):
+		return true
+	case strings.HasPrefix(lower, "[approval"):
+		return true
+	case strings.HasPrefix(lower, "[patch"):
+		return true
 	case strings.HasPrefix(lower, "intent parsed:"):
 		return true
 	case strings.HasPrefix(lower, "command received:"):
@@ -163,7 +173,13 @@ func isWorkflowErrorText(s string) bool {
 	if strings.Contains(lower, "state error") {
 		return true
 	}
+	if strings.Contains(lower, "state transition") {
+		return true
+	}
 	if strings.Contains(lower, "transition from") && strings.Contains(lower, "not allowed") {
+		return true
+	}
+	if strings.Contains(lower, "execution failure") || strings.Contains(lower, "execution failed") {
 		return true
 	}
 	return false
@@ -171,6 +187,7 @@ func isWorkflowErrorText(s string) bool {
 
 func formatWorkflowError(s string) string {
 	trimmed := strings.TrimSpace(s)
+	trimmed = ansi.Strip(trimmed)
 	// Extract Transition clause if present.
 	if idx := strings.Index(trimmed, "Transition from"); idx >= 0 {
 		trimmed = trimmed[idx:]
@@ -184,6 +201,9 @@ func formatWorkflowError(s string) string {
 		if origIdx >= 0 {
 			trimmed = strings.TrimSpace(trimmed[origIdx+len("failed:"):])
 		}
+	}
+	if strings.HasPrefix(strings.ToLower(trimmed), "state transition blocked:") {
+		trimmed = strings.TrimSpace(trimmed[len("State Transition Blocked:"):])
 	}
 	// Ensure prefix State Error
 	if !strings.HasPrefix(strings.ToLower(trimmed), "state error") {
@@ -199,6 +219,23 @@ func workflowErrorRendered(s string) string {
 	formatted := formatWorkflowError(s)
 	// Catppuccin Red #f38ba8 -> 38;2;243;139;168 with bold for callout.
 	return "\x1b[1;38;2;243;139;168m" + formatted + "\x1b[0m"
+}
+
+// classifyLine categorizes an individual text line into its strongly-typed LineKind.
+func classifyLine(text string, r role) LineKind {
+	if r == roleUser {
+		return LineKindUserPrompt
+	}
+	if r == roleError || isWorkflowErrorText(text) {
+		return LineKindSystemError
+	}
+	if strings.HasPrefix(strings.TrimSpace(text), "▸ Trace:") {
+		return LineKindTraceSummary
+	}
+	if isEngineTraceLine(text) || (r == roleActivity && isQuietTraceText(text)) {
+		return LineKindEngineTrace
+	}
+	return LineKindAIResponse
 }
 
 // BuildDocumentLayout flattens records into physical rows with word-wrapping and
@@ -223,19 +260,44 @@ func BuildDocumentLayoutWithUsername(records []record, wrapWidth int, username s
 // per-build quiet-trace dedup so IncrementalLayoutUpdate sub-builds can never
 // emit a second "▸ Trace:" summary when the previous layout already carries one.
 func buildDocumentLayout(records []record, wrapWidth int, username string, traceAlreadyEmitted bool) DocumentLayout {
+	var turns map[uint64]bool
+	if traceAlreadyEmitted {
+		turns = map[uint64]bool{0: true, 1: true}
+	}
+	return buildDocumentLayoutWithTurns(records, wrapWidth, username, turns)
+}
+
+func buildDocumentLayoutWithTurns(records []record, wrapWidth int, username string, initialTurns map[uint64]bool) DocumentLayout {
 	if wrapWidth < 20 {
 		wrapWidth = 20
 	}
 	var lines []DocumentLine
 	globalY := 0
 	seenErrors := make(map[string]bool)
-	traceCollapsedEmitted := traceAlreadyEmitted
+	renderedTurns := make(map[uint64]bool)
+	for k, v := range initialTurns {
+		if v {
+			renderedTurns[k] = true
+		}
+	}
+
+	currentTurnID := uint64(1)
 
 	// Chrome prefix rows (banner/workspace headers) are handled in model.go's
 	// content assembly; here we focus on record rows. Callers that need chrome
 	// can prepend via BuildDocumentLayoutWithChrome or let model add them.
 
 	for idx, rec := range records {
+		turnID := rec.turnID
+		if turnID == 0 {
+			if rec.role == roleUser && idx > 0 {
+				currentTurnID++
+			}
+			turnID = currentTurnID
+		} else {
+			currentTurnID = turnID
+		}
+
 		// Special handling for User to keep badge stable (visual invariance) with dynamic username.
 		// Implements mandatory word wrapping: contentWidth = wrapWidth - headerWidth.
 		if rec.role == roleUser {
@@ -251,15 +313,10 @@ func buildDocumentLayout(records []record, wrapWidth int, username string, trace
 			isFirstPhysical := true
 			for _, origLine := range origLines {
 				// Wrap each logical line strictly at contentWidth.
-				// Use wrapPlainLine for strict cell-aware wrapping; empty lines produce single "".
 				var wrapped []string
 				if strings.TrimSpace(origLine) == "" {
 					wrapped = []string{origLine}
 				} else {
-					// Use wrapIndentedLine with contentWidth but without extra indent handling for user;
-					// for user prompts we want plain word wrap at contentWidth.
-					// We use wrapPlainLine-style logic via wrapIndentedLine with no leading whitespace preservation.
-					// To keep CJK correctness, delegate to wrapPlainLike helper.
 					wrapped = wrapForContentWidth(origLine, contentWidth)
 				}
 				if len(wrapped) == 0 {
@@ -305,7 +362,7 @@ func buildDocumentLayout(records []record, wrapWidth int, username string, trace
 									}
 								}
 							}
-							dl := DocumentLine{GlobalY: globalY, Spans: spans, RawText: rawText, RenderedStr: renderedLine, RecordIdx: idx}
+							dl := DocumentLine{GlobalY: globalY, Kind: LineKindUserPrompt, TurnID: turnID, Spans: spans, RawText: rawText, RenderedStr: renderedLine, RecordIdx: idx}
 							lines = append(lines, dl)
 							globalY++
 						}
@@ -331,11 +388,10 @@ func buildDocumentLayout(records []record, wrapWidth int, username string, trace
 					}
 					// Ensure invariant: rendered width <= wrapWidth
 					if runewidth.StringWidth(ansi.Strip(renderedLine)) > wrapWidth {
-						// Safety: truncate (should not happen with correct contentWidth)
 						trimmed := ansi.Truncate(renderedLine, wrapWidth, "")
 						renderedLine = trimmed
 					}
-					dl := DocumentLine{GlobalY: globalY, Spans: spans, RawText: rawText, RenderedStr: renderedLine, RecordIdx: idx}
+					dl := DocumentLine{GlobalY: globalY, Kind: LineKindUserPrompt, TurnID: turnID, Spans: spans, RawText: rawText, RenderedStr: renderedLine, RecordIdx: idx}
 					lines = append(lines, dl)
 					globalY++
 				}
@@ -348,7 +404,7 @@ func buildDocumentLayout(records []record, wrapWidth int, username string, trace
 					{StartCell: 0, EndCell: headerWidth, SourceStart: 0, SourceEnd: 0, Selectable: false},
 					{StartCell: headerWidth, EndCell: headerWidth, SourceStart: 0, SourceEnd: 0, Selectable: true},
 				}
-				dl := DocumentLine{GlobalY: globalY, Spans: spans, RawText: rawText, RenderedStr: renderedLine, RecordIdx: idx}
+				dl := DocumentLine{GlobalY: globalY, Kind: LineKindUserPrompt, TurnID: turnID, Spans: spans, RawText: rawText, RenderedStr: renderedLine, RecordIdx: idx}
 				lines = append(lines, dl)
 				globalY++
 			}
@@ -365,210 +421,159 @@ func buildDocumentLayout(records []record, wrapWidth int, username string, trace
 			formatted := workflowErrorRendered(text)
 			raw := ansi.Strip(formatted)
 			spans := []RenderSpan{{StartCell: 0, EndCell: runewidth.StringWidth(raw), SourceStart: 0, SourceEnd: len([]rune(raw)), Selectable: true}}
-			dl := DocumentLine{GlobalY: globalY, Spans: spans, RawText: raw, RenderedStr: formatted, RecordIdx: idx}
+			dl := DocumentLine{GlobalY: globalY, Kind: LineKindSystemError, TurnID: turnID, Spans: spans, RawText: raw, RenderedStr: formatted, RecordIdx: idx}
 			lines = append(lines, dl)
 			globalY++
 			continue
 		}
-		// ── Quiet / Accordion Mode for Engine Logs ────────────────
-		if !TraceVerbose && isQuietTraceText(text) {
-			if traceCollapsedEmitted {
-				// Suppress duplicate trace blocks; if the record is purely trace, drop it.
-				hasNonTrace := false
-				for _, ll := range strings.Split(text, "\n") {
-					if strings.TrimSpace(ll) == "" {
-						continue
-					}
-					if !isQuietTraceText(ll) {
-						hasNonTrace = true
-						break
-					}
-				}
-				if !hasNonTrace {
-					continue
-				}
-				// Mixed record: keep only non-trace lines, suppress trace portion.
-				var kept []string
-				for _, ll := range strings.Split(text, "\n") {
-					if !isQuietTraceText(ll) {
-						kept = append(kept, ll)
-					}
-				}
-				if len(kept) == 0 {
-					continue
-				}
-				text = strings.Join(kept, "\n")
-			} else {
-				collapsed := buildQuietTraceLine(text)
-				rawCollapsed := collapsed
-				renderedCollapsed := dimmedStyle.Render(rawCollapsed)
-				if renderedCollapsed == rawCollapsed {
-					renderedCollapsed = "\x1b[38;2;108;112;134m" + rawCollapsed + "\x1b[0m"
-				}
-				spans := []RenderSpan{{StartCell: 0, EndCell: runewidth.StringWidth(rawCollapsed), SourceStart: 0, SourceEnd: len([]rune(rawCollapsed)), Selectable: true}}
-				dl := DocumentLine{GlobalY: globalY, Spans: spans, RawText: rawCollapsed, RenderedStr: renderedCollapsed, RecordIdx: idx}
-				lines = append(lines, dl)
-				globalY++
-				traceCollapsedEmitted = true
-				// If the record was purely trace, we're done. Otherwise render the
-				// leftover non-trace body (e.g. preflight header + body split).
-				var kept []string
-				hasNonTrace := false
-				for _, ll := range strings.Split(text, "\n") {
-					if strings.TrimSpace(ll) == "" {
-						continue
-					}
-					if !isQuietTraceText(ll) {
-						kept = append(kept, ll)
-						hasNonTrace = true
-					}
-				}
-				if !hasNonTrace {
-					continue
-				}
-				text = strings.Join(kept, "\n")
-			}
-		}
-		// Deterministic preflight handling: if completed, collapse to single summary
-		// (only reached when verbose mode is active or text was not a quiet trace)
-		if rec.role == roleActivity && strings.Contains(text, "[preflight]") {
-			if strings.Contains(text, "completed") || strings.Contains(text, "✓ preflight") {
-				rawCollapsed := "✓ preflight completed"
-				renderedCollapsed := dimmedStyle.Render(rawCollapsed)
-				spans := []RenderSpan{{StartCell: 0, EndCell: runewidth.StringWidth(rawCollapsed), SourceStart: 0, SourceEnd: len([]rune(rawCollapsed)), Selectable: true}}
-				dl := DocumentLine{GlobalY: globalY, Spans: spans, RawText: rawCollapsed, RenderedStr: renderedCollapsed, RecordIdx: idx}
-				lines = append(lines, dl)
-				globalY++
-				continue
-			}
-		}
+
 		// ── UNIFIED MARKDOWN/ANSI ENGINE ──────────────────────────────
 		// roleAI records (both completed history and the live streaming tail)
-		// render through renderAIBlockLines — the single Catppuccin Mocha
-		// engine for headers, inline code, fenced code blocks, lists and
-		// numbered items. This guarantees stream completion never reverts to
-		// raw markdown syntax: the trailing lines are byte-identical to the
-		// streamed ones, minus the active block cursor.
+		// render through renderAIBlockLines.
 		if rec.role == roleAI {
 			aiLines := renderAIBlockLines(text, wrapWidth)
 			for i := range aiLines {
 				aiLines[i].GlobalY = globalY
+				aiLines[i].Kind = LineKindAIResponse
+				aiLines[i].TurnID = turnID
 				aiLines[i].RecordIdx = idx
 				lines = append(lines, aiLines[i])
 				globalY++
 			}
 			if len(aiLines) == 0 {
-				lines = append(lines, DocumentLine{GlobalY: globalY, Spans: []RenderSpan{{StartCell: 0, EndCell: 2, SourceStart: 0, SourceEnd: 0, Selectable: false}}, RawText: "", RenderedStr: dimmedStyle.Render("│ "), RecordIdx: idx})
+				lines = append(lines, DocumentLine{GlobalY: globalY, Kind: LineKindAIResponse, TurnID: turnID, Spans: []RenderSpan{{StartCell: 0, EndCell: 2, SourceStart: 0, SourceEnd: 0, Selectable: false}}, RawText: "", RenderedStr: dimmedStyle.Render("│ "), RecordIdx: idx})
 				globalY++
 			}
 			continue
 		}
-		// For AI markdown responses and plain text records: effectiveWidth = wrapWidth - gutterWidth
-		gutterWidth := 2 // "│ " is 2 cells
-		effectiveWidth := wrapWidth - gutterWidth
-		if effectiveWidth < 10 {
-			effectiveWidth = 10
-		}
-		isAI := rec.role == roleAI
+
 		logicalLines := strings.Split(text, "\n")
 		if len(logicalLines) == 0 {
 			logicalLines = []string{""}
 		}
 		for _, ll := range logicalLines {
-			if strings.TrimSpace(ll) == "" {
-				// Empty logical line: preserve as single physical empty row with gutter for AI
-				if isAI {
-					rendered := dimmedStyle.Render("│ ")
-					// Empty content but gutter present
-					spans := []RenderSpan{
-						{StartCell: 0, EndCell: gutterWidth, SourceStart: 0, SourceEnd: 0, Selectable: false},
+			kind := classifyLine(ll, rec.role)
+			if kind == LineKindSystemError {
+				var formatted string
+				var raw string
+				if isWorkflowErrorText(ll) {
+					formatted = workflowErrorRendered(ll)
+					raw = ansi.Strip(formatted)
+				} else {
+					raw = ansi.Strip(ll)
+					formatted = "\x1b[38;2;243;139;168m" + raw + "\x1b[0m"
+				}
+				spans := []RenderSpan{{StartCell: 0, EndCell: runewidth.StringWidth(raw), SourceStart: 0, SourceEnd: len([]rune(raw)), Selectable: true}}
+				dl := DocumentLine{GlobalY: globalY, Kind: LineKindSystemError, TurnID: turnID, Spans: spans, RawText: raw, RenderedStr: formatted, RecordIdx: idx}
+				lines = append(lines, dl)
+				globalY++
+				continue
+			}
+
+			if kind == LineKindEngineTrace {
+				if !TraceVerbose {
+					if !renderedTurns[turnID] {
+						summary := buildQuietTraceLine(ll)
+						rawSummary := summary
+						renderedSummary := dimmedStyle.Render(rawSummary)
+						if renderedSummary == rawSummary {
+							renderedSummary = "\x1b[38;2;108;112;134m" + rawSummary + "\x1b[0m"
+						}
+						spans := []RenderSpan{{StartCell: 0, EndCell: runewidth.StringWidth(rawSummary), SourceStart: 0, SourceEnd: len([]rune(rawSummary)), Selectable: true}}
+						dl := DocumentLine{GlobalY: globalY, Kind: LineKindTraceSummary, TurnID: turnID, Spans: spans, RawText: rawSummary, RenderedStr: renderedSummary, RecordIdx: idx}
+						lines = append(lines, dl)
+						globalY++
+						renderedTurns[turnID] = true
 					}
-					dl := DocumentLine{GlobalY: globalY, Spans: spans, RawText: "", RenderedStr: rendered, RecordIdx: idx}
+					// Drop all LineKindEngineTrace lines completely in quiet mode
+					continue
+				} else {
+					raw := ll
+					rendered := dimmedStyle.Render(raw)
+					spans := []RenderSpan{{StartCell: 0, EndCell: runewidth.StringWidth(raw), SourceStart: 0, SourceEnd: len([]rune(raw)), Selectable: true}}
+					dl := DocumentLine{GlobalY: globalY, Kind: LineKindEngineTrace, TurnID: turnID, Spans: spans, RawText: raw, RenderedStr: rendered, RecordIdx: idx}
 					lines = append(lines, dl)
 					globalY++
+					continue
+				}
+			}
+
+			if kind == LineKindTraceSummary {
+				if !TraceVerbose {
+					if !renderedTurns[turnID] {
+						raw := ll
+						rendered := dimmedStyle.Render(raw)
+						spans := []RenderSpan{{StartCell: 0, EndCell: runewidth.StringWidth(raw), SourceStart: 0, SourceEnd: len([]rune(raw)), Selectable: true}}
+						dl := DocumentLine{GlobalY: globalY, Kind: LineKindTraceSummary, TurnID: turnID, Spans: spans, RawText: raw, RenderedStr: rendered, RecordIdx: idx}
+						lines = append(lines, dl)
+						globalY++
+						renderedTurns[turnID] = true
+					}
 				} else {
-					spans := []RenderSpan{{StartCell: 0, EndCell: 0, SourceStart: 0, SourceEnd: 0, Selectable: true}}
-					dl := DocumentLine{GlobalY: globalY, Spans: spans, RawText: "", RenderedStr: "", RecordIdx: idx}
+					raw := ll
+					rendered := dimmedStyle.Render(raw)
+					spans := []RenderSpan{{StartCell: 0, EndCell: runewidth.StringWidth(raw), SourceStart: 0, SourceEnd: len([]rune(raw)), Selectable: true}}
+					dl := DocumentLine{GlobalY: globalY, Kind: LineKindTraceSummary, TurnID: turnID, Spans: spans, RawText: raw, RenderedStr: rendered, RecordIdx: idx}
 					lines = append(lines, dl)
 					globalY++
 				}
 				continue
 			}
-			// Strict wrapping at effectiveWidth (preserve indent via wrapIndentedLine)
+
+			// Preflight completed summary
+			if rec.role == roleActivity && strings.Contains(ll, "[preflight]") && (strings.Contains(ll, "completed") || strings.Contains(ll, "✓ preflight")) {
+				rawCollapsed := "✓ preflight completed"
+				renderedCollapsed := dimmedStyle.Render(rawCollapsed)
+				spans := []RenderSpan{{StartCell: 0, EndCell: runewidth.StringWidth(rawCollapsed), SourceStart: 0, SourceEnd: len([]rune(rawCollapsed)), Selectable: true}}
+				dl := DocumentLine{GlobalY: globalY, Kind: LineKindAIResponse, TurnID: turnID, Spans: spans, RawText: rawCollapsed, RenderedStr: renderedCollapsed, RecordIdx: idx}
+				lines = append(lines, dl)
+				globalY++
+				continue
+			}
+
+			if strings.TrimSpace(ll) == "" {
+				spans := []RenderSpan{{StartCell: 0, EndCell: 0, SourceStart: 0, SourceEnd: 0, Selectable: true}}
+				dl := DocumentLine{GlobalY: globalY, Kind: LineKindAIResponse, TurnID: turnID, Spans: spans, RawText: "", RenderedStr: "", RecordIdx: idx}
+				lines = append(lines, dl)
+				globalY++
+				continue
+			}
+
+			effectiveWidth := wrapWidth - 2
+			if effectiveWidth < 10 {
+				effectiveWidth = 10
+			}
 			wrapped := wrapForContentWidth(ll, effectiveWidth)
 			if len(wrapped) == 0 {
 				wrapped = []string{ll}
 			}
 			for _, wl := range wrapped {
-				// Ensure wl cell width <= effectiveWidth (chunk if needed)
-				if runewidth.StringWidth(wl) > effectiveWidth {
-					for _, piece := range chunkWord(wl, effectiveWidth) {
-						contentRaw := piece
-						var renderedLine string
-						var spans []RenderSpan
-						if isAI {
-							renderedLine = dimmedStyle.Render("│ ") + piece
-							spans = []RenderSpan{
-								{StartCell: 0, EndCell: gutterWidth, SourceStart: 0, SourceEnd: 0, Selectable: false},
-								{StartCell: gutterWidth, EndCell: gutterWidth + runewidth.StringWidth(contentRaw), SourceStart: 0, SourceEnd: len([]rune(contentRaw)), Selectable: true},
-							}
-						} else {
-							renderedLine = piece
-							spans = []RenderSpan{{StartCell: 0, EndCell: runewidth.StringWidth(contentRaw), SourceStart: 0, SourceEnd: len([]rune(contentRaw)), Selectable: true}}
-						}
-						// Final invariant: ensure rendered width <= wrapWidth
-						if runewidth.StringWidth(ansi.Strip(renderedLine)) > wrapWidth {
-							renderedLine = ansi.Truncate(renderedLine, wrapWidth, "")
-						}
-						dl := DocumentLine{GlobalY: globalY, Spans: spans, RawText: contentRaw, RenderedStr: renderedLine, RecordIdx: idx}
-						lines = append(lines, dl)
-						globalY++
-					}
-					continue
-				}
 				contentRaw := wl
-				var renderedLine string
-				var spans []RenderSpan
-				if isAI {
-					renderedLine = dimmedStyle.Render("│ ") + wl
-					spans = []RenderSpan{
-						{StartCell: 0, EndCell: gutterWidth, SourceStart: 0, SourceEnd: 0, Selectable: false},
-						{StartCell: gutterWidth, EndCell: gutterWidth + runewidth.StringWidth(contentRaw), SourceStart: 0, SourceEnd: len([]rune(contentRaw)), Selectable: true},
-					}
-				} else {
-					renderedLine = wl
-					spans = []RenderSpan{{StartCell: 0, EndCell: runewidth.StringWidth(contentRaw), SourceStart: 0, SourceEnd: len([]rune(contentRaw)), Selectable: true}}
-				}
+				renderedLine := wl
+				spans := []RenderSpan{{StartCell: 0, EndCell: runewidth.StringWidth(contentRaw), SourceStart: 0, SourceEnd: len([]rune(contentRaw)), Selectable: true}}
 				if runewidth.StringWidth(ansi.Strip(renderedLine)) > wrapWidth {
 					renderedLine = ansi.Truncate(renderedLine, wrapWidth, "")
 				}
-				// Also ensure RawText width invariant (without ANSI)
-				if runewidth.StringWidth(contentRaw) > wrapWidth {
-					// Should not happen because contentRaw <= effectiveWidth < wrapWidth
-					contentRaw = string([]rune(contentRaw)[:wrapWidth])
-				}
-				dl := DocumentLine{GlobalY: globalY, Spans: spans, RawText: contentRaw, RenderedStr: renderedLine, RecordIdx: idx}
+				dl := DocumentLine{GlobalY: globalY, Kind: LineKindAIResponse, TurnID: turnID, Spans: spans, RawText: contentRaw, RenderedStr: renderedLine, RecordIdx: idx}
 				lines = append(lines, dl)
 				globalY++
 			}
 		}
-		if len(logicalLines) == 0 {
-			lines = append(lines, DocumentLine{
-				GlobalY:     globalY,
-				Spans:       []RenderSpan{{StartCell: 0, EndCell: 0, SourceStart: 0, SourceEnd: 0, Selectable: true}},
-				RawText:     "",
-				RenderedStr: "",
-				RecordIdx:   idx,
-			})
-			globalY++
+	}
+
+	anyTurnEmitted := false
+	for _, v := range renderedTurns {
+		if v {
+			anyTurnEmitted = true
+			break
 		}
 	}
 
-	// If records empty, still return empty layout (no chrome here)
 	return DocumentLayout{
 		Lines:               lines,
 		width:               wrapWidth,
-		traceSummaryEmitted: traceCollapsedEmitted,
+		traceSummaryEmitted: anyTurnEmitted,
+		renderedTurns:       renderedTurns,
 	}
 }
 
@@ -588,6 +593,7 @@ func BuildDocumentLayoutWithChrome(chromeLines []string, records []record, wrapW
 				// Still count as a physical row for GlobalY
 				lines = append(lines, DocumentLine{
 					GlobalY:     globalY,
+					Kind:        LineKindAIResponse,
 					Spans:       []RenderSpan{{StartCell: 0, EndCell: 0, SourceStart: 0, SourceEnd: 0, Selectable: false}},
 					RawText:     "",
 					RenderedStr: "",
@@ -599,6 +605,7 @@ func BuildDocumentLayoutWithChrome(chromeLines []string, records []record, wrapW
 			raw := ansi.Strip(p)
 			lines = append(lines, DocumentLine{
 				GlobalY:     globalY,
+				Kind:        LineKindAIResponse,
 				Spans:       []RenderSpan{{StartCell: 0, EndCell: StringCellWidth(raw), SourceStart: 0, SourceEnd: len([]rune(raw)), Selectable: false}},
 				RawText:     raw,
 				RenderedStr: p,
@@ -616,6 +623,7 @@ func BuildDocumentLayoutWithChrome(chromeLines []string, records []record, wrapW
 		Lines:               lines,
 		width:               wrapWidth,
 		traceSummaryEmitted: recLayout.traceSummaryEmitted,
+		renderedTurns:       recLayout.renderedTurns,
 	}
 }
 
@@ -1857,11 +1865,15 @@ func IncrementalLayoutUpdate(prev *DocumentLayout, records []record, wrapWidth i
 		// dedup so a width resize mid-turn can never duplicate "▸ Trace:".
 		return buildDocumentLayout(records, wrapWidth, uname, prev.traceSummaryEmitted)
 	}
+	var prevTurns map[uint64]bool
+	if prev.traceSummaryEmitted {
+		prevTurns = prev.renderedTurns
+	}
 	prevLen := len(prev.Lines)
 	// Count expected lines for records up to len-1
 	// If records length unchanged but last record's text changed (streaming), invalidate trailing lines.
 	if len(records) == 0 {
-		return DocumentLayout{Lines: nil, width: wrapWidth, traceSummaryEmitted: prev.traceSummaryEmitted}
+		return DocumentLayout{Lines: nil, width: wrapWidth, traceSummaryEmitted: prev.traceSummaryEmitted, renderedTurns: prevTurns}
 	}
 	// Heuristic: if records length same as before's record count estimate, only rebuild last record
 	// We don't store record count in layout, so we estimate: if number of lines decreased/increased by more than one record's worth, do full rebuild.
@@ -1900,11 +1912,16 @@ func IncrementalLayoutUpdate(prev *DocumentLayout, records []record, wrapWidth i
 				// Compare stripped lastRaw vs sanitized text's first line? For simplicity, compare via rendered
 				// If lengths match and no streaming flag, skip rebuild
 				if lastRaw.String() == lastRecText || lastRaw.String() == ansi.Strip(lastRecText) {
-					return DocumentLayout{Lines: append([]DocumentLine(nil), prev.Lines...), width: wrapWidth, traceSummaryEmitted: prev.traceSummaryEmitted}
+					return DocumentLayout{
+						Lines:               append([]DocumentLine(nil), prev.Lines...),
+						width:               wrapWidth,
+						traceSummaryEmitted: prev.traceSummaryEmitted,
+						renderedTurns:       prevTurns,
+					}
 				}
 				// Build new lines for last record — seed the per-turn trace-summary
 				// dedup so a trace record is never re-summarized.
-				newRecLines := buildDocumentLayout(records[len(records)-1:], wrapWidth, uname, prev.traceSummaryEmitted)
+				newRecLines := buildDocumentLayoutWithTurns(records[len(records)-1:], wrapWidth, uname, prevTurns)
 				// Replace trailing segment and fix RecordIdx
 				kept := append([]DocumentLine(nil), prev.Lines[:startIdx]...)
 				base := len(kept)
@@ -1920,6 +1937,7 @@ func IncrementalLayoutUpdate(prev *DocumentLayout, records []record, wrapWidth i
 					Lines:               newLines,
 					width:               wrapWidth,
 					traceSummaryEmitted: prev.traceSummaryEmitted || newRecLines.traceSummaryEmitted,
+					renderedTurns:       mergeRenderedTurns(prevTurns, newRecLines.renderedTurns),
 				}
 			}
 		}
@@ -1932,7 +1950,7 @@ func IncrementalLayoutUpdate(prev *DocumentLayout, records []record, wrapWidth i
 		// dropped from the layout (the completed answer disappears while only the
 		// status line renders).
 		if maxIdx < len(records)-1 {
-			added := buildDocumentLayout(records[maxIdx+1:], wrapWidth, uname, prev.traceSummaryEmitted)
+			added := buildDocumentLayoutWithTurns(records[maxIdx+1:], wrapWidth, uname, prevTurns)
 			// Adjust GlobalY and RecordIdx (sub-build uses 0-relative indices).
 			base := prevLen
 			baseIdx := maxIdx + 1
@@ -1945,6 +1963,7 @@ func IncrementalLayoutUpdate(prev *DocumentLayout, records []record, wrapWidth i
 				Lines:               newLines,
 				width:               wrapWidth,
 				traceSummaryEmitted: prev.traceSummaryEmitted || added.traceSummaryEmitted,
+				renderedTurns:       mergeRenderedTurns(prevTurns, added.renderedTurns),
 			}
 		}
 		// Fallback: if line count differs drastically or records shrunk, full rebuild
@@ -1953,4 +1972,19 @@ func IncrementalLayoutUpdate(prev *DocumentLayout, records []record, wrapWidth i
 		}
 	}
 	return buildDocumentLayout(records, wrapWidth, uname, prev.traceSummaryEmitted)
+}
+
+func mergeRenderedTurns(a, b map[uint64]bool) map[uint64]bool {
+	out := make(map[uint64]bool)
+	for k, v := range a {
+		if v {
+			out[k] = true
+		}
+	}
+	for k, v := range b {
+		if v {
+			out[k] = true
+		}
+	}
+	return out
 }

@@ -111,8 +111,9 @@ const (
 )
 
 type record struct {
-	role role
-	text string
+	role   role
+	text   string
+	turnID uint64
 }
 
 type tokenMsg string
@@ -980,6 +981,9 @@ type model struct {
 	// exactly one summary. The document-layout path carries its own persistent
 	// dedup in DocumentLayout.traceSummaryEmitted.
 	traceSummaryShown bool
+
+	// currentTurnID tracks the monotonically incrementing turn counter.
+	currentTurnID uint64
 
 	// lastPlanIntent is the raw user intent captured when /plan staged its task
 	// list. It survives mode transitions (the current prompt is overwritten by
@@ -2190,6 +2194,21 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		if m.viewState != nil {
 			m.viewState.Project(ev)
 		}
+		if m.resolver != nil {
+			toLower := strings.ToLower(p.To)
+			switch {
+			case strings.Contains(toLower, "build"):
+				m.resolver.Set(modes.ModeBuild)
+			case strings.Contains(toLower, "plan"):
+				m.resolver.Set(modes.ModePlan)
+			case strings.Contains(toLower, "investigat"):
+				m.resolver.Set(modes.ModeInvestigate)
+			case strings.Contains(toLower, "review"):
+				m.resolver.Set(modes.ModeReview)
+			case strings.Contains(toLower, "ask"):
+				m.resolver.Set(modes.ModeAsk)
+			}
+		}
 		m.syncUIState()
 	case events.PatchParsedPayload:
 		m.logActivity("[patch] parsed %s (strategy=%s, tier=%d)", p.File, p.Strategy, p.Tier)
@@ -2876,8 +2895,9 @@ func (m *model) push(r role, text string) {
 		return
 	}
 	text = sanitizeIngressANSI(text)
-	m.records = append(m.records, record{role: r, text: text})
-	m.cacheRecordToHistory(record{role: r, text: text})
+	rec := record{role: r, text: text, turnID: m.currentTurnID}
+	m.records = append(m.records, rec)
+	m.cacheRecordToHistory(rec)
 }
 
 // sanitizeIngressANSI is the ingress filter for external stream ingestion.
