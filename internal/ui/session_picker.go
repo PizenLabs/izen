@@ -8,22 +8,35 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/PizenLabs/izen/internal/session"
 )
 
 // ── Session picker layout constants ──────────────────────────────────────────
-
+// Responsive engine: supports Tmux panes down to 45x10 without border wrapping.
+// Preferred 88 allows W>=85 full-column layout on 120-wide terminals; min 36
+// fits ultra-narrow 45-width panes (modalWidth = max(36, min(parent-2,88))).
 const (
-	sessionPickerPreferredWidth  = 78
+	sessionPickerPreferredWidth  = 88
 	sessionPickerPreferredHeight = 18
-	sessionPickerMinWidth        = 58
-	sessionPickerMinHeight       = 12
+	sessionPickerMinWidth        = 36
+	sessionPickerMinHeight       = 8
 	sessionPickerListMinRows     = 3
 	sessionPickerChromeLines     = 10
 )
 
+const sessionPickerCompactChromeLines = 7
+
 const sessionPickerDefaultBudget = 7
+
+// Fixed cell widths for strict truncation (guarantee zero wrapping).
+const (
+	sessionPickerStatusWidth  = 10
+	sessionPickerSlotWidth    = 6
+	sessionPickerDirtyWidth   = 10
+	sessionPickerLastActWidth = 12
+)
 
 // SessionPickerModal is the centered interactive overlay for session lifecycle
 // management. It is the TUI analogue of `/session` (bare) — a focused surface
@@ -122,8 +135,10 @@ func (sp *SessionPickerModal) Selected() *session.SlotInfo {
 	return nil
 }
 
-// SetSize adapts the modal to the terminal dimensions. It mirrors
-// ModelPickerModal.SetSize: hard floors prevent zero-size, scroll is re-clamped.
+// SetSize adapts the modal to the terminal dimensions. It enforces safety
+// bounds: modalWidth = max(minWidth, min(parentWidth-2, preferredWidth)) is
+// computed by the caller (workspace.go); here we apply the floor and re-clamp
+// scroll. Ultra-narrow panes (45) and short panes (10) are supported.
 func (sp *SessionPickerModal) SetSize(w, h int) {
 	if w < sessionPickerMinWidth {
 		w = sessionPickerMinWidth
@@ -141,13 +156,29 @@ func (sp *SessionPickerModal) SetSize(w, h int) {
 	sp.clampScrollOffset()
 }
 
+func (sp *SessionPickerModal) isCompact() bool { return sp.height < 18 }
+
+func (sp *SessionPickerModal) chromeLines() int {
+	if sp.isCompact() {
+		return sessionPickerCompactChromeLines
+	}
+	return sessionPickerChromeLines
+}
+
 func (sp *SessionPickerModal) listRowBudget() int {
 	if sp.height <= 0 {
 		return sessionPickerDefaultBudget
 	}
-	budget := sp.height - sessionPickerChromeLines
-	if budget < sessionPickerListMinRows {
-		budget = sessionPickerListMinRows
+	budget := sp.height - sp.chromeLines()
+	floor := sessionPickerListMinRows
+	if sp.isCompact() {
+		floor = 1
+	}
+	if budget < floor {
+		budget = floor
+	}
+	if budget < 1 {
+		budget = 1
 	}
 	return budget
 }
@@ -345,23 +376,37 @@ func (sp *SessionPickerModal) View() string {
 
 func (sp *SessionPickerModal) renderListView() string {
 	var b strings.Builder
+	compact := sp.isCompact()
 
-	// ── Header ──────────────────────────────────────────────────────────
-	title := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color(colorMauve)).
-		Render(" Session Manager ")
-	b.WriteString(title)
-	b.WriteString("\n")
-	b.WriteString(mutedStyle.Render(fmt.Sprintf(" %d session(s) · %d total · j/k navigate", len(sp.sessions), len(sp.sessions))))
-	b.WriteString("\n\n")
+	// ── Header: title + count ──────────────────────────────────────────
+	if compact {
+		// Single collapsed line per spec.
+		title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMauve)).Render(fmt.Sprintf(" Session Manager (%d) ", len(sp.sessions)))
+		b.WriteString(title)
+		b.WriteString("\n")
+	} else {
+		title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorMauve)).Render(" Session Manager ")
+		b.WriteString(title)
+		b.WriteString("\n")
+		b.WriteString(mutedStyle.Render(fmt.Sprintf(" %d session(s) · %d total · j/k navigate", len(sp.sessions), len(sp.sessions))))
+		b.WriteString("\n")
+		b.WriteString("\n")
+	}
 
 	// ── Column header ───────────────────────────────────────────────────
-	header := subtleStyle.Render(fmt.Sprintf("  %-10s %-6s %-24s %-10s %s",
-		"STATUS", "SLOT", "TITLE / GOAL", "DIRTY", "LAST ACTIVE"))
-	b.WriteString(header)
+	showSlot, showDirty, showLast := sp.visibleColumns()
+	headerLine := sp.renderHeader(showSlot, showDirty, showLast)
+	b.WriteString(subtleStyle.Render(headerLine))
 	b.WriteString("\n")
-	b.WriteString(dimmedStyle.Render("  ──────────────────────────────────────────────────────────────────────"))
+	// Separator truncated to content width to avoid wrapping.
+	sepWidth := sp.contentWidth()
+	if sepWidth < 1 {
+		sepWidth = 1
+	}
+	sep := strings.Repeat("─", sepWidth-2)
+	// Ensure strictly within width via ANSI-safe Truncate.
+	sep = ansi.Truncate(sep, sepWidth-2, "…")
+	b.WriteString(dimmedStyle.Render("  " + sep))
 	b.WriteString("\n")
 
 	// ── Scrollable list ─────────────────────────────────────────────────
@@ -385,7 +430,7 @@ func (sp *SessionPickerModal) renderListView() string {
 		b.WriteString(sp.renderRow(info, isCursor))
 		b.WriteString("\n")
 	}
-	// Pad blank lines for constant height.
+	// Pad blank lines for constant height (deterministic across resizes).
 	for i := len(window); i < budget; i++ {
 		b.WriteString("\n")
 	}
@@ -393,17 +438,32 @@ func (sp *SessionPickerModal) renderListView() string {
 
 	// ── Status line ─────────────────────────────────────────────────────
 	if sp.statusMsg != "" {
+		// Truncate status to avoid wrapping (ANSI-safe).
+		maxStatus := sepWidth
+		statusText := "  " + sp.statusMsg
+		statusText = ansi.Truncate(statusText, maxStatus, "…")
 		if sp.statusIsError {
-			b.WriteString(redStyle.Render("  " + sp.statusMsg))
+			b.WriteString(redStyle.Render(statusText))
 		} else {
-			b.WriteString(greenStyle.Render("  " + sp.statusMsg))
+			b.WriteString(greenStyle.Render(statusText))
 		}
 		b.WriteString("\n")
 	}
 
 	// ── Footer ──────────────────────────────────────────────────────────
-	footer := mutedStyle.Render("↵ resume  n new  r rename  a archive  d delete  c compact  Esc/q close  ↑↓/j/k nav")
-	b.WriteString(footer)
+	if compact {
+		footer := mutedStyle.Render("[Enter] switch · [n] new · [d] del · [Esc] close")
+		footer = ansi.Truncate(footer, sepWidth, "…")
+		b.WriteString(footer)
+	} else {
+		footer1 := mutedStyle.Render("↵ resume  n new  r rename  a archive")
+		footer2 := mutedStyle.Render("d delete  c compact  Esc/q close  ↑↓/j/k nav")
+		footer1 = ansi.Truncate(footer1, sepWidth, "…")
+		footer2 = ansi.Truncate(footer2, sepWidth, "…")
+		b.WriteString(footer1)
+		b.WriteString("\n")
+		b.WriteString(footer2)
+	}
 
 	content := b.String()
 	return lipgloss.NewStyle().
@@ -414,6 +474,69 @@ func (sp *SessionPickerModal) renderListView() string {
 		Render(content)
 }
 
+// visibleColumns returns dynamic visibility per W thresholds.
+func (sp *SessionPickerModal) visibleColumns() (showSlot, showDirty, showLast bool) {
+	w := sp.width
+	showLast = w >= 85
+	showDirty = w >= 65
+	showSlot = w >= 50
+	return
+}
+
+func (sp *SessionPickerModal) contentWidth() int {
+	// Inner usable width after outer Width(width-4) + Padding(1,3) (6) + border(2).
+	// Conservative estimate: width - 12 ensures zero wrapping even in ultra-narrow.
+	w := sp.width - 12
+	if w < 10 {
+		w = 10
+	}
+	return w
+}
+
+func (sp *SessionPickerModal) renderHeader(showSlot, showDirty, showLast bool) string {
+	// Build header cells with strict Truncate per cell.
+	var cols []string
+	cols = append(cols, cellWithWidth("STATUS", sessionPickerStatusWidth))
+	if showSlot {
+		cols = append(cols, cellWithWidth("SLOT", sessionPickerSlotWidth))
+	}
+	// TITLE is flexible; width computed after fixed cols.
+	fixed := sessionPickerStatusWidth
+	if showSlot {
+		fixed += 1 + sessionPickerSlotWidth
+	}
+	if showDirty {
+		fixed += 1 + sessionPickerDirtyWidth
+	}
+	if showLast {
+		fixed += 1 + sessionPickerLastActWidth
+	}
+	available := sp.contentWidth() - fixed - 2 // 2 for cursor prefix
+	if available < 8 {
+		available = 8
+	}
+	cols = append(cols, cellWithWidth("TITLE / GOAL", available))
+	if showDirty {
+		cols = append(cols, cellWithWidth("DIRTY", sessionPickerDirtyWidth))
+	}
+	if showLast {
+		cols = append(cols, cellWithWidth("LAST ACTIVE", sessionPickerLastActWidth))
+	}
+	return "  " + strings.Join(cols, " ")
+}
+
+func cellWithWidth(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	trunc := ansi.Truncate(s, w, "…")
+	// Pad to exact width for deterministic row width (ansi.Truncate does not pad).
+	if cur := lipgloss.Width(trunc); cur < w {
+		trunc += strings.Repeat(" ", w-cur)
+	}
+	return trunc
+}
+
 func (sp *SessionPickerModal) renderRow(info session.SlotInfo, isCursor bool) string {
 	cursor := "  "
 	rowStyle := dimmedStyle
@@ -422,113 +545,106 @@ func (sp *SessionPickerModal) renderRow(info session.SlotInfo, isCursor bool) st
 		rowStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Bold(true)
 	}
 
-	// Status badge
-	var badge string
+	showSlot, showDirty, showLast := sp.visibleColumns()
+
+	// Status badge (always visible, strict width).
+	var badgePlain string
 	switch {
 	case info.Active:
-		badge = greenStyle.Bold(true).Render("ACTIVE")
+		badgePlain = "ACTIVE"
 	case info.Lifecycle == "archived" || info.Lifecycle == string(session.LifecycleArchived):
-		badge = yellowStyle.Bold(true).Render("archived")
+		badgePlain = "archived"
 	default:
-		badge = mutedStyle.Render("dormant")
+		badgePlain = "dormant"
 	}
-	// Normalize badge width visually.
-	badgeVisible := "dormant"
-	if info.Active {
-		badgeVisible = "ACTIVE"
-	} else if info.Lifecycle == "archived" || info.Lifecycle == string(session.LifecycleArchived) {
-		badgeVisible = "archived"
+	leftBadge := cellWithWidth(badgePlain, sessionPickerStatusWidth)
+	// Re-apply badge color after width calc (cellWithWidth is plain, now style).
+	switch {
+	case info.Active:
+		leftBadge = greenStyle.Bold(true).Render(leftBadge)
+	case info.Lifecycle == "archived" || info.Lifecycle == string(session.LifecycleArchived):
+		leftBadge = yellowStyle.Bold(true).Render(leftBadge)
+	default:
+		leftBadge = mutedStyle.Render(leftBadge)
 	}
-	_ = badgeVisible
 
-	slotStr := string(info.Slot)
-
+	// Title / goal (flexible, fills remaining).
 	title := info.Objective
 	if title == "" {
 		title = info.SessionID
-		if len(title) > 20 {
-			title = title[:20]
-		}
 	}
-	maxTitleWidth := sp.width - 38
-	if maxTitleWidth < 10 {
-		maxTitleWidth = 10
+	// Compute available width for title after fixed columns.
+	fixed := sessionPickerStatusWidth
+	if showSlot {
+		fixed += 1 + sessionPickerSlotWidth
 	}
-	title = truncateWithEllipsis(title, maxTitleWidth)
+	if showDirty {
+		fixed += 1 + sessionPickerDirtyWidth
+	}
+	if showLast {
+		fixed += 1 + sessionPickerLastActWidth
+	}
+	available := sp.contentWidth() - fixed - 2 // 2 for cursor prefix
+	if available < 8 {
+		available = 8
+	}
+	titleCell := cellWithWidth(title, available)
 
 	ts := "—"
 	if !info.UpdatedAt.IsZero() {
 		ts = info.UpdatedAt.Format("01-02 15:04")
 	}
 
-	// Use plain row for non-cursor to avoid bright styling bleeding; cursor
-	// row uses accent style for the whole line except badge which is already colored.
-	line := fmt.Sprintf("%s%-10s %-6s %-24s %-10s %s",
-		cursor,
-		// badge is already styled; we embed it but need to pad manually
-		// Use non-styled badge text for width calculation then replace with styled version
-		"", slotStr, truncateWithEllipsis(title, 24), "", ts)
-
-	// Reconstruct with styled badge and dirty status.
-	// We render badge separately to keep its color.
-	badgePlain := "dormant"
-	if info.Active {
-		badgePlain = "ACTIVE"
-	} else if info.Lifecycle == "archived" || info.Lifecycle == string(session.LifecycleArchived) {
-		badgePlain = "archived"
-	}
-	// Build styled line piecewise to preserve badge color when cursor is active.
-	_ = line
-	_ = rowStyle
-
-	// For correct lipgloss width while preserving badge color, render badge via its style
-	// and the rest of the columns via rowStyle.
-	leftBadge := badge
-	// Pad badge to 10 visible chars.
-	badgeWidth := lipgloss.Width(badgePlain)
-	if badgeWidth < 10 {
-		leftBadge += strings.Repeat(" ", 10-badgeWidth)
-	}
-	// Remaining columns
-	slotCol := slotStr
-	if len(slotCol) < 6 {
-		slotCol += strings.Repeat(" ", 6-len(slotCol))
-	}
-	titleCol := truncateWithEllipsis(title, 24)
-	if w := lipgloss.Width(titleCol); w < 24 {
-		titleCol += strings.Repeat(" ", 24-w)
-	}
-	dirtyVisible := "—"
-	if info.DirtyCount > 0 {
-		dirtyVisible = fmt.Sprintf("⚠ %d", info.DirtyCount)
-	}
-	dirtyCol := dirtyVisible
-	if w := len([]rune(dirtyVisible)); w < 10 {
-		dirtyCol += strings.Repeat(" ", 10-w)
-	}
-	// Apply rowStyle to non-badge columns when cursor.
-	if isCursor {
-		slotCol = rowStyle.Render(slotCol)
-		titleCol = rowStyle.Render(titleCol)
-		dirtyCol = rowStyle.Render(dirtyCol)
-		ts = rowStyle.Render(ts)
-	} else {
-		slotCol = dimmedStyle.Render(slotCol)
-		titleCol = dimmedStyle.Render(titleCol)
-		// dirty already has its own style when DirtyCount>0; keep as is for cursor case
-		if info.DirtyCount > 0 {
-			// dirtyCol already orange, but dim when not cursor handled above
-			dirtyCol = orangeStyle.Render(dirtyVisible)
-			if len([]rune(dirtyVisible)) < 10 {
-				dirtyCol += strings.Repeat(" ", 10-len([]rune(dirtyVisible)))
-			}
+	// Build row piecewise to keep badge color and guarantee no wrapping.
+	var parts []string
+	parts = append(parts, leftBadge)
+	if showSlot {
+		slotStr := string(info.Slot)
+		slotCell := cellWithWidth(slotStr, sessionPickerSlotWidth)
+		if isCursor {
+			slotCell = rowStyle.Render(slotCell)
 		} else {
-			dirtyCol = dimmedStyle.Render(dirtyCol)
+			slotCell = dimmedStyle.Render(slotCell)
 		}
-		ts = mutedStyle.Render(ts)
+		parts = append(parts, slotCell)
+	}
+	// Title cell styling.
+	if isCursor {
+		titleCell = rowStyle.Render(titleCell)
+	} else {
+		titleCell = dimmedStyle.Render(titleCell)
+	}
+	parts = append(parts, titleCell)
+	if showDirty {
+		dirtyVisible := "—"
+		if info.DirtyCount > 0 {
+			dirtyVisible = fmt.Sprintf("⚠ %d", info.DirtyCount)
+		}
+		dirtyCell := cellWithWidth(dirtyVisible, sessionPickerDirtyWidth)
+		switch {
+		case isCursor:
+			dirtyCell = rowStyle.Render(dirtyCell)
+		case info.DirtyCount > 0:
+			dirtyCell = orangeStyle.Render(dirtyCell)
+		default:
+			dirtyCell = dimmedStyle.Render(dirtyCell)
+		}
+		parts = append(parts, dirtyCell)
+	}
+	if showLast {
+		tsCell := cellWithWidth(ts, sessionPickerLastActWidth)
+		if isCursor {
+			tsCell = rowStyle.Render(tsCell)
+		} else {
+			tsCell = mutedStyle.Render(tsCell)
+		}
+		parts = append(parts, tsCell)
 	}
 
-	return cursor + leftBadge + " " + slotCol + " " + titleCol + " " + dirtyCol + " " + ts
+	row := cursor + strings.Join(parts, " ")
+	// Final safety: truncate entire row to content width to prevent ANSI overflow.
+	row = ansi.Truncate(row, sp.contentWidth()+2, "…")
+	return row
 }
 
 func (sp *SessionPickerModal) renderRenameView() string {
@@ -557,7 +673,10 @@ func (sp *SessionPickerModal) renderConfirmDeleteView() string {
 	b.WriteString("\n\n")
 	b.WriteString(redStyle.Render(fmt.Sprintf(" Delete session slot %s ?", sp.confirmTarget)))
 	b.WriteString("\n")
-	b.WriteString(mutedStyle.Render(" This will purge session-owned state. Project config and audit log are preserved."))
+	cw := sp.contentWidth()
+	long := " This will purge session-owned state. Project config and audit log are preserved."
+	long = ansi.Truncate(long, cw, "…")
+	b.WriteString(mutedStyle.Render(long))
 	b.WriteString("\n\n")
 	b.WriteString(mutedStyle.Render(" Press "))
 	b.WriteString(greenStyle.Bold(true).Render("y"))

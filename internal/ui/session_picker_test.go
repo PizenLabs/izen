@@ -2,11 +2,14 @@ package ui
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/session"
 )
@@ -457,4 +460,199 @@ func TestSessionPickerFormatTableFallback(t *testing.T) {
 	}
 	_ = m
 	_ = time.Now
+}
+
+// ── Responsive split-pane layout tests (STEP 3 verification) ───────────────
+
+func assertNoWrapping(t *testing.T, view string, maxWidth int) {
+	t.Helper()
+	lines := strings.Split(view, "\n")
+	for i, l := range lines {
+		w := lipgloss.Width(l)
+		if w > maxWidth {
+			t.Errorf("line %d width %d exceeds max %d: %q", i, w, maxWidth, l)
+		}
+	}
+}
+
+// TestSessionPickerLayoutFull120x40 verifies W>=85 full-column layout.
+func TestSessionPickerLayoutFull120x40(t *testing.T) {
+	sp := NewSessionPickerModal(mockSlotInfos())
+	sp.SetSize(88, 40) // dialog for 120 pane (parent-2 clamped to 88)
+	if sp.isCompact() {
+		t.Fatal("120x40 should be standard mode (H>=18)")
+	}
+	showSlot, showDirty, showLast := sp.visibleColumns()
+	if !showSlot || !showDirty || !showLast {
+		t.Fatalf("120x40 should show all columns, got slot=%v dirty=%v last=%v", showSlot, showDirty, showLast)
+	}
+	if got := sp.listRowBudget(); got < 1 {
+		t.Fatalf("row budget %d <1", got)
+	}
+	view := sp.View()
+	if strings.Contains(view, "…") && lipgloss.Width(view) > 88 {
+		t.Error("full layout should not truncate excessively")
+	}
+	assertNoWrapping(t, view, 88+4) // allow outer border/padding slack
+	header := sp.renderHeader(showSlot, showDirty, showLast)
+	if !strings.Contains(header, "LAST ACTIVE") || !strings.Contains(header, "DIRTY") || !strings.Contains(header, "SLOT") {
+		t.Fatalf("full header missing columns: %q", header)
+	}
+	// Deterministic: second render identical.
+	if view2 := sp.View(); view != view2 {
+		t.Error("render must be deterministic across calls")
+	}
+}
+
+// TestSessionPickerLayoutMedium60x30 verifies 65>W>=50 style: LAST ACTIVE dropped.
+func TestSessionPickerLayoutMedium60x30(t *testing.T) {
+	sp := NewSessionPickerModal(mockSlotInfos())
+	sp.SetSize(58, 30) // dialog for 60 pane (58)
+	showSlot, showDirty, showLast := sp.visibleColumns()
+	// W=58 falls in 50-65 => hide LAST and DIRTY per matrix.
+	if !showSlot {
+		t.Error("60x30 should show SLOT (W>=50)")
+	}
+	if showDirty {
+		t.Error("60x30 should hide DIRTY (W<65)")
+	}
+	if showLast {
+		t.Error("60x30 should hide LAST ACTIVE (W<65)")
+	}
+	if sp.isCompact() {
+		t.Fatal("60x30 height 30 should be standard mode")
+	}
+	view := sp.View()
+	if strings.Contains(view, "LAST ACTIVE") {
+		t.Error("medium layout should not render LAST ACTIVE header/row")
+	}
+	// Title/goal must remain readable (not fully truncated).
+	if !strings.Contains(view, "dormant") && !strings.Contains(view, "ACTIVE") {
+		t.Error("medium layout should still show status badge")
+	}
+	assertNoWrapping(t, view, 58+4)
+	// Deterministic across resize.
+	sp2 := NewSessionPickerModal(mockSlotInfos())
+	sp2.SetSize(58, 30)
+	if view != sp2.View() {
+		t.Error("deterministic render failed for 60x30")
+	}
+}
+
+// TestSessionPickerLayoutCompact100x12 verifies compact chrome: H<18, non-zero budget.
+func TestSessionPickerLayoutCompact100x12(t *testing.T) {
+	sp := NewSessionPickerModal(mockSlotInfos())
+	sp.SetSize(88, 12) // dialog for 100 pane height 12 (compact)
+	if !sp.isCompact() {
+		t.Fatal("100x12 should be compact mode (H<18)")
+	}
+	if got := sp.listRowBudget(); got < 1 {
+		t.Fatalf("compact row budget %d must be >=1", got)
+	}
+	if chrome := sp.chromeLines(); chrome != sessionPickerCompactChromeLines {
+		t.Fatalf("compact chrome %d want %d", chrome, sessionPickerCompactChromeLines)
+	}
+	view := sp.View()
+	if !strings.Contains(view, "Session Manager (") {
+		t.Error("compact mode should collapse title+count into single line")
+	}
+	if !strings.Contains(view, "[Enter] switch") {
+		t.Error("compact mode should use single compact legend")
+	}
+	assertNoWrapping(t, view, 88+4)
+	// Zero border overflow: picker view must fit dialog; overlay is centered via lipgloss.Place
+	// and may include 1-2 chars of border/padding slack — allow pane+4.
+	m := sessionCLITestModelForSize(t, 100, 12)
+	m.handleCommand("/session")
+	overlay := m.BuildWorkspace().Overlay
+	for i, l := range strings.Split(overlay, "\n") {
+		if lipgloss.Width(l) > 104 {
+			t.Errorf("overlay line %d width %d > pane 100+slack: %q", i, lipgloss.Width(l), l)
+		}
+	}
+}
+
+// TestSessionPickerLayoutUltraNarrow45x10 verifies minimalist mode, zero panic.
+func TestSessionPickerLayoutUltraNarrow45x10(t *testing.T) {
+	sp := NewSessionPickerModal(mockSlotInfos())
+	sp.SetSize(43, 10) // dialog for 45 pane (43)
+	showSlot, showDirty, showLast := sp.visibleColumns()
+	if showSlot || showDirty || showLast {
+		t.Fatalf("45x10 should hide SLOT/DIRTY/LAST, got slot=%v dirty=%v last=%v", showSlot, showDirty, showLast)
+	}
+	if !sp.isCompact() {
+		t.Fatal("45x10 should be compact")
+	}
+	if got := sp.listRowBudget(); got < 1 {
+		t.Fatalf("ultra-narrow budget %d <1", got)
+	}
+	// Must not panic and must truncate cleanly.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panic on 45x10 render: %v", r)
+		}
+	}()
+	view := sp.View()
+	if view == "" {
+		t.Fatal("ultra-narrow view empty")
+	}
+	assertNoWrapping(t, view, 43+4)
+	header := sp.renderHeader(showSlot, showDirty, showLast)
+	if strings.Contains(header, "SLOT") || strings.Contains(header, "DIRTY") || strings.Contains(header, "LAST") {
+		t.Fatalf("minimalist header should hide extra cols: %q", header)
+	}
+	if !strings.Contains(header, "STATUS") || !strings.Contains(header, "TITLE") {
+		t.Fatalf("minimalist header missing STATUS/TITLE: %q", header)
+	}
+	// Row must contain status + truncated title, no panic on width 43.
+	row := sp.renderRow(sp.sessions[0], false)
+	if lipgloss.Width(row) > sp.contentWidth()+2 {
+		t.Errorf("row width %d exceeds content %d: %q", lipgloss.Width(row), sp.contentWidth()+2, row)
+	}
+	// Full overlay via model must also fit pane 45x10 (allow small border slack).
+	m := sessionCLITestModelForSize(t, 45, 10)
+	m.handleCommand("/session")
+	overlay := m.BuildWorkspace().Overlay
+	for i, l := range strings.Split(overlay, "\n") {
+		if lipgloss.Width(l) > 48 {
+			t.Errorf("ultra-narrow overlay line %d width %d >45+slack: %q", i, lipgloss.Width(l), l)
+		}
+	}
+}
+
+// Helpers for layout tests.
+
+func mockSlotInfos() []session.SlotInfo {
+	return []session.SlotInfo{
+		{Slot: session.SlotA, Active: true, Lifecycle: "active", Objective: "Build responsive picker for ultra-wide goals that must truncate cleanly", SessionID: "sess-aaa-very-long-id-123456", UpdatedAt: time.Now(), DirtyCount: 2},
+		{Slot: session.SlotB, Active: false, Lifecycle: "dormant", Objective: "Second session with another very long objective title for truncation", SessionID: "sess-bbb-very-long-id-789012", UpdatedAt: time.Now().Add(-time.Hour), DirtyCount: 0},
+	}
+}
+
+func sessionCLITestModelForSize(t *testing.T, w, h int) *model {
+	t.Helper()
+	m, sm, root := sessionCLITestModel(t)
+	if err := ensureTestProjectInitialized(root); err != nil {
+		t.Fatalf("ensure project initialized: %v", err)
+	}
+	m.initStage = initComplete
+	m.Ready = true
+	// Use WindowSizeMsg so viewport/wrapWidth are recomputed (direct assignment
+	// would leave bg width 100 and cause overlay overflow).
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: h})
+	m = updated.(*model)
+	_ = sm
+	return m
+}
+
+func ensureTestProjectInitialized(root string) error {
+	dir := filepath.Join(root, ".izen")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"username":"test"}`), 0o644); err != nil {
+		return err
+	}
+	return nil
 }
