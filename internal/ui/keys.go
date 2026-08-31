@@ -154,6 +154,64 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// ── PASTE FOLDING: multi-line paste → atomic pill badge ──────────
+	// Intercept paste events (KeyRunes containing newlines) that meet the
+	// folding threshold and collapse them into a single atomic token.
+	if m.ti.Focused() && msg.Type == tea.KeyRunes && strings.Contains(string(msg.Runes), "\n") {
+		raw := string(msg.Runes)
+		if ShouldFoldPaste(raw) {
+			if m.HandlePasteInput(raw) {
+				m.updateSuggestions()
+				return m, nil
+			}
+		}
+	}
+	// Atomic deletion: Backspace/Delete immediately adjacent to a pill badge
+	// removes the entire paste block rather than a single character.
+	if m.ti.Focused() && (msg.Type == tea.KeyBackspace || msg.Type == tea.KeyDelete || msg.Type == tea.KeyCtrlH) {
+		if m.handlePasteBackspace(msg.Type) {
+			m.updateSuggestions()
+			return m, nil
+		}
+	}
+	// Atomic navigation: Left/Right skips over a pill badge as a single cell.
+	if m.ti.Focused() && (msg.Type == tea.KeyLeft || msg.Type == tea.KeyRight) {
+		val := m.ti.Value()
+		pos := m.ti.Position()
+		if start, end, found := PasteBadgeAt(val, pos); found {
+			if msg.Type == tea.KeyLeft && pos == end {
+				m.ti.SetCursor(start)
+				m.syncInputFromTI()
+				return m, nil
+			}
+			if msg.Type == tea.KeyRight && pos == start {
+				m.ti.SetCursor(end)
+				m.syncInputFromTI()
+				return m, nil
+			}
+		}
+		// Also check adjacent badge when moving into it.
+		if msg.Type == tea.KeyLeft {
+			// If the character before cursor is end of a badge, jump to start.
+			for _, idx := range pasteBadgeRe.FindAllStringIndex(val, -1) {
+				if idx[1] == pos {
+					m.ti.SetCursor(idx[0])
+					m.syncInputFromTI()
+					return m, nil
+				}
+			}
+		}
+		if msg.Type == tea.KeyRight {
+			for _, idx := range pasteBadgeRe.FindAllStringIndex(val, -1) {
+				if idx[0] == pos {
+					m.ti.SetCursor(idx[1])
+					m.syncInputFromTI()
+					return m, nil
+				}
+			}
+		}
+	}
+
 	// ── GLOBAL: Ctrl+O toggles the active thought block ──────────────
 	// Expands/collapses the reasoning block for the currently active message
 	// (ThinkingBuffer). When no thought block is active, falls back to cycling
@@ -1033,7 +1091,7 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 	// events belong in the viewport again (see lifecycle.go).
 	m.unsealActivitySurface()
 
-	userInput := m.ti.Value()
+	userInput := m.ExpandPasteTokens(m.ti.Value())
 	m.dismissSuggestions()
 
 	// ── Proposed shell command checkpoint ──────────────────────────────

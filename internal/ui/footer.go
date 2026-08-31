@@ -89,12 +89,74 @@ func (m *model) renderFixedFooter(width int, actions []Action) string {
 	default:
 		s = m.renderActiveIdleFooter(width, actions)
 	}
-	// Never let a busy execution bar overflow a narrow split pane: truncate to
-	// the available width instead of wrapping to a second row.
-	if lipgloss.Width(s) > width {
-		s = ansi.Truncate(s, width, "…")
+	// Strictly enforce width: truncate if over, pad if under, so the footer
+	// never wraps under split-pane layouts. lipgloss.Width is cell-aware and
+	// ansi.Truncate is ANSI-safe (never splits an SGR sequence).
+	s = fitToWidth(s, width)
+	return s
+}
+
+// fitToWidth ensures s is exactly width cells: truncate with ellipsis if
+// longer, pad with spaces if shorter. ANSI escapes are stripped for width
+// measurement but preserved via ansi.Truncate.
+func fitToWidth(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	w := lipgloss.Width(s)
+	if w > width {
+		return ansi.Truncate(s, width, "…")
+	}
+	if w < width {
+		return s + strings.Repeat(" ", width-w)
 	}
 	return s
+}
+
+// truncateModelName shortens a model name to max cells, adding an ellipsis if
+// truncated. Cell-aware, not byte-aware, so wide glyphs are handled correctly.
+func truncateModelName(name string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if lipgloss.Width(name) <= max {
+		return name
+	}
+	if max <= 1 {
+		return "…"
+	}
+	// Use ansi.Truncate with ellipsis; it is ANSI-safe though model names
+	// are plain. The ellipsis itself occupies one cell.
+	return ansi.Truncate(name, max, "…")
+}
+
+// renderActiveIdleFooterResponsive is the width-responsive, tiered footer
+// core specified in the task. It is a pure function that strictly respects
+// the available terminal width (termWidth):
+//
+//	Tier 1: Full Width >= 100  →  model  ·  ↓in + ↑out tok (pct%)  ·  cost  ·  [mode]
+//	Tier 2: Standard 70..99     →  model  ·  ↓in + ↑out tok (pct%)  ·  cost
+//	Tier 3: Compact 45..69      →  shortModel  ·  ↓in + ↑out tok
+//	Tier 4: Minimal <45         →  ↓in + ↑out tok
+//
+// The returned string is strictly truncated or padded to exactly width.
+func renderActiveIdleFooter(width int, modelName string, inTok, outTok int, ctxPct float64, cost string, mode string) string {
+	var s string
+	switch {
+	case width >= 100:
+		s = fmt.Sprintf("%s  ·  ↓%d + ↑%d tok (%d%%)  ·  %s  ·  [%s]", modelName, inTok, outTok, int(ctxPct), cost, mode)
+	case width >= 70:
+		s = fmt.Sprintf("%s  ·  ↓%d + ↑%d tok (%d%%)  ·  %s", modelName, inTok, outTok, int(ctxPct), cost)
+	default:
+		// Compact and minimal share the shortModel helper for 45..69.
+		if width >= 45 {
+			shortModel := truncateModelName(modelName, 12)
+			s = fmt.Sprintf("%s  ·  ↓%d + ↑%d tok", shortModel, inTok, outTok)
+		} else {
+			s = fmt.Sprintf("↓%d + ↑%d tok", inTok, outTok)
+		}
+	}
+	return fitToWidth(s, width)
 }
 
 // renderFreshLaunchFooter renders the clean startup hint for a brand-new
@@ -107,24 +169,51 @@ func (m *model) renderFreshLaunchFooter() string {
 	)
 }
 
-// renderActiveIdleFooter renders the persistent Active-Session IDLE telemetry,
-// anchored on the active model name:
+// renderActiveIdleFooter renders the persistent Active-Session IDLE telemetry
+// with width-responsive tiers. It strictly respects the available terminal
+// width so split-pane layouts never cause wrapping:
 //
-//	<Model>  ·  ↓<in> + ↑<out> tok (<ctx_pct>%)  ·  <Cost>
+//	Tier 1 >=100: full model + usage (with pct) + cost
+//	Tier 2 70-99: same as tier 1 (standard)
+//	Tier 3 45-69: short model (12 cells) + compact tok (no pct, no cost)
+//	Tier 4 <45:   minimal tok only
 //
-// e.g. "qwen2.5-coder:7b  ·  ↓0 + ↑170 tok (1%)  ·  $free".
 // The Mode Badge is deliberately absent — the Top Bar owns it. 'Ctrl+C
-// interrupt' and the '⏸' icon are never present here.
+// interrupt' and the '⏸' icon are never present here. The caller
+// (renderFixedFooter) enforces the final exact-width fit via fitToWidth.
 func (m *model) renderActiveIdleFooter(width int, actions []Action) string {
 	cost := llm.EnforceFreeModelOverride(m.cfg.ActiveModelName(), m.AccumulatedCost)
-	base := footerSep(
-		footerModelStyle.Render(m.getActiveModelName()),
-		footerTokStyle.Render(status.FormatUsageContext(m.InputTokens, m.OutputTokens, m.TotalTokens, m.activeContextLimit())),
-		footerExecMetaStyle.Render(llm.FormatCost(cost)),
-	)
+	costStr := llm.FormatCost(cost)
+	modelName := m.getActiveModelName()
+	fullUsage := status.FormatUsageContext(m.InputTokens, m.OutputTokens, m.TotalTokens, m.activeContextLimit())
+	compactTok := "↓" + status.FormatTokens(m.InputTokens) + " + ↑" + status.FormatTokens(m.OutputTokens) + " tok"
+
+	var base string
+	switch {
+	case width >= 70:
+		// Tiers 1 and 2: full telemetry (model + usage with pct + cost)
+		base = footerSep(
+			footerModelStyle.Render(modelName),
+			footerTokStyle.Render(fullUsage),
+			footerExecMetaStyle.Render(costStr),
+		)
+	case width >= 45:
+		shortModel := truncateModelName(modelName, 12)
+		base = footerSep(
+			footerModelStyle.Render(shortModel),
+			footerTokStyle.Render(compactTok),
+		)
+	default:
+		base = footerTokStyle.Render(compactTok)
+	}
 
 	chip := renderActions(actions)
 	if chip == "" {
+		return base
+	}
+	// In minimal or compact tiers, chips would overflow; only overlay when
+	// there is enough width to show them alongside telemetry.
+	if width < 70 {
 		return base
 	}
 	return padRightOverlay(base, chip, width)

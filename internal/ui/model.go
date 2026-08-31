@@ -718,6 +718,10 @@ type model struct {
 	ti    textinput.Model
 	input strings.Builder // kept in sync with ti for suggestions.go
 
+	// Multi-line paste folding (atomic pill badges)
+	pasteCounter int
+	pasteTokens  map[int]string // id -> raw pasted text
+
 	// Banner visibility state
 	showBanner bool
 
@@ -1591,6 +1595,10 @@ type model struct {
 	frozenFullHitRows []RowLayout
 	frozenViewportStr string
 	frozenRecords     []record
+	// framebuffer is the flat 2D Cell grid rasterized from DocumentLayout.
+	// It is the O(1) source for selection and copy. Re-rasterized only on
+	// WindowSizeMsg or document buffer updates, never on mouse movement.
+	framebuffer *Framebuffer
 }
 
 // isProjectInitialized checks whether .izen/ exists AND contains a valid
@@ -3764,7 +3772,26 @@ func (m *model) refreshViewportContent() {
 	} else if m.userName != "" {
 		username = m.userName
 	}
+	// Track whether DocumentLayout changed to decide framebuffer invalidation.
+	prevLayoutLen := 0
+	prevLayoutWidth := 0
+	if m.docLayout != nil {
+		prevLayoutLen = m.docLayout.Len()
+		prevLayoutWidth = m.docLayout.Width()
+	}
 	m.updateConversationLayout(wrapWidth, username)
+	// ── Framebuffer invalidation (Performance Safeguards §4) ──────────
+	// Re-rasterize ONLY on document buffer updates or WindowSizeMsg, NEVER
+	// on mouse movement. While dragging we keep the frozen framebuffer to
+	// avoid layout shifts; a new raster is built after drag ends.
+	layoutChanged := m.docLayout == nil || m.docLayout.Len() != prevLayoutLen || m.docLayout.Width() != prevLayoutWidth
+	if !m.mouseSel.Dragging && (layoutChanged || m.framebuffer == nil) {
+		m.framebuffer = Rasterize(m.docLayout, m.wrapWidth)
+		// Cap memory: if height exceeds viewport+buffer, slice to windowed version.
+		if m.framebuffer != nil && m.framebuffer.Height > m.Viewport.Height+2*FramebufferBufferLines {
+			m.framebuffer = RasterizeViewport(m.docLayout, m.wrapWidth, m.docScrollOffset, m.Viewport.Height)
+		}
+	}
 
 	// ── Tail panels (execution log, shimmer, thinking, trace, trees) ───
 	tailLines := m.renderTailPanelLines()
@@ -3797,9 +3824,13 @@ func (m *model) refreshViewportContent() {
 	m.lastScrollTotal = total
 
 	var visible []string
-	if m.mouseSel.Active {
+	switch {
+	case m.mouseSel.Active && m.framebuffer != nil && len(m.framebuffer.Grid) > 0:
+		// Lightweight framebuffer overlay path (O(1) selection, no string scans).
+		visible = m.composeFramebufferSelectionWindow(chromeLines, tailLines, recStart, yOffset, m.Viewport.Height, total)
+	case m.mouseSel.Active:
 		visible = m.composeSelectionWindow(chromeLines, tailLines, recStart, yOffset, m.Viewport.Height, total)
-	} else {
+	default:
 		visible = m.composeDefaultWindow(chromeLines, tailLines, recStart, yOffset, m.Viewport.Height, total)
 	}
 	contentStr := strings.Join(visible, "\n")
@@ -3962,6 +3993,40 @@ func (m *model) composeSelectionWindow(chromeLines, tailLines []string, recStart
 	return visible
 }
 
+// composeFramebufferSelectionWindow renders the visible window with selection
+// highlight overlay while preserving all existing ANSI foreground colors,
+// syntax highlighting, and text attributes. It does NOT strip ANSI code
+// sequences or fallback to raw/unstyled strings when Dragging==true.
+// Instead it preserves the original RenderedStr and ONLY injects the
+// background color attribute (SGR \x1b[48;...m) for cells bounded by
+// (s.Y,s.X) to (e.Y,e.X). This guarantees syntax highlighting remains
+// 100% intact while dragging.
+func (m *model) composeFramebufferSelectionWindow(chromeLines, tailLines []string, recStart, yOffset, height, total int) []string {
+	recEnd := recStart + m.docLayout.Len()
+	visible := make([]string, 0, height)
+	for i := yOffset; i < total && i < yOffset+height; i++ {
+		switch {
+		case i < recStart:
+			visible = append(visible, chromeLines[i])
+		case i < recEnd:
+			docIdx := i - recStart
+			if docIdx < 0 || docIdx >= len(m.docLayout.Lines) {
+				visible = append(visible, "")
+				continue
+			}
+			rendered := m.docLayout.Lines[docIdx].RenderedStr
+			if rendered == "" {
+				rendered = m.docLayout.Lines[docIdx].RawText
+			}
+			// Preserve all foreground/styles; only inject background for selection range.
+			visible = append(visible, m.applySelectionToLine(docIdx, rendered))
+		default:
+			visible = append(visible, tailLines[i-recEnd])
+		}
+	}
+	return visible
+}
+
 // applySelectionToLine paints the active mouse selection onto a single
 // docLayout row. The per-line logic is extracted from renderDocumentWithSelection
 // so the visible window can be highlighted without rendering the whole document.
@@ -4058,6 +4123,8 @@ func (m *model) rebuildDocumentLayout() {
 	dl := BuildDocumentLayout(m.records, m.wrapWidth, username)
 	m.docLayout = &dl
 	m.syncStreamingSegment()
+	// Invalidate framebuffer on WindowSizeMsg rebuild (spec §4).
+	m.framebuffer = nil
 	// Re-anchor scroll offset: clamp to valid range based on new layout + chrome + tail.
 	chrome := m.viewportContentPrefixHeight()
 	tail := len(m.renderTailPanelLines())

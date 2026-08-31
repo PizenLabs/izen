@@ -139,7 +139,7 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 		inputView.WriteString(viStatusStyle.Render("-- "+m.viModeLabel()+" --") + "\n")
 	default:
 		promptLabel := modeColor.Render(mode.String() + " " + Icon.Command)
-		inputView.WriteString(promptLabel + " " + m.ti.View() + "\n")
+		inputView.WriteString(promptLabel + " " + m.renderPromptView() + "\n")
 	}
 	inputView.WriteString(rule(width, borderColor))
 
