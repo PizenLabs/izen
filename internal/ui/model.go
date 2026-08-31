@@ -718,6 +718,10 @@ type model struct {
 	ti    textinput.Model
 	input strings.Builder // kept in sync with ti for suggestions.go
 
+	// Multi-line paste folding (atomic pill badges)
+	pasteCounter int
+	pasteTokens  map[int]string // id -> raw pasted text
+
 	// Banner visibility state
 	showBanner bool
 
