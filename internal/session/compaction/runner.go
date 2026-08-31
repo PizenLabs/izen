@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -196,6 +197,27 @@ func (r *Runner) run(ctx context.Context, j Job) {
 	r.mu.Lock()
 	r.processed++
 	r.mu.Unlock()
+}
+
+// Compact synchronously runs the Generational Compactor over one job and
+// returns the produced generation WITHOUT sinking it. It is the manual
+// `/session compact <id>` seam: the caller (the presentation layer) persists
+// the generation through the SessionManager's SetCompactContext and reports the
+// result. It never touches the async worker's queue, so a manual run and the
+// background runner cannot interleave on the same slot's state.
+func (r *Runner) Compact(ctx context.Context, j Job) (*session.CompactContext, error) {
+	if r == nil || r.engine == nil {
+		return nil, errors.New("compaction: runner not wired")
+	}
+	meta := GenerationMeta{
+		SessionID:  j.SessionID,
+		Objective:  j.Objective,
+		Mode:       j.Mode,
+		Checkpoint: j.Checkpoint,
+		RunNumber:  j.RunNumber,
+		CreatedAt:  j.CreatedAt,
+	}
+	return r.engine.RebuildFromLog(j.Base, j.History, meta)
 }
 
 func (r *Runner) countDrop() {

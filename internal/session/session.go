@@ -39,6 +39,21 @@ type Session struct {
 	CreatedAt          time.Time         `json:"created_at"`
 	UpdatedAt          time.Time         `json:"updated_at"`
 	History            []Message         `json:"history,omitempty"`
+	// Title is the mutable human-readable session title (SESSION.md §7). It is
+	// distinct from the immutable SessionID. When empty, the objective is the
+	// effective title.
+	Title string `json:"title,omitempty"`
+	// Lifecycle is the explicit session lifecycle state (SESSION.md §28).
+	// Active/Dormant are pointer-derived; Archived is the explicit transition
+	// applied via /session archive. Only explicit lifecycle commands may move a
+	// session into or out of Archived.
+	Lifecycle Lifecycle `json:"lifecycle,omitempty"`
+	// WorkspaceDirtyFiles names the workspace-relative files with uncommitted
+	// changes that were present when this session became active. They are
+	// injected into the session's Context Compiler view so the model never
+	// silently overwrites work left by another session (workspace boundary
+	// guard).
+	WorkspaceDirtyFiles []string `json:"workspace_dirty_files,omitempty"`
 	// ContextLedger is the serialized handoff state, mirrored from the
 	// on-disk .izen/context_ledger.json so the session record remains the
 	// single durable source of truth across mode transitions.
@@ -53,11 +68,37 @@ type Session struct {
 	recovered bool
 }
 
+// Lifecycle is the explicit lifecycle state of a session (SESSION.md §28).
+type Lifecycle string
+
+const (
+	// LifecycleActive marks the currently attached interactive session.
+	LifecycleActive Lifecycle = "active"
+	// LifecycleDormant marks a preserved session that was switched away from.
+	LifecycleDormant Lifecycle = "dormant"
+	// LifecycleArchived marks a session that is no longer active but remains
+	// inspectable and resumable unless explicitly deleted (SESSION.md §25).
+	LifecycleArchived Lifecycle = "archived"
+)
+
+// EffectiveTitle returns the mutable session title, falling back to the
+// objective when no explicit title is set.
+func (s *Session) EffectiveTitle() string {
+	if s == nil {
+		return ""
+	}
+	if s.Title != "" {
+		return s.Title
+	}
+	return s.ObjectiveIntent()
+}
+
 // New creates a new session.
 func New() *Session {
 	now := time.Now()
 	s := &Session{
 		Mode:      modes.ModeAsk,
+		Lifecycle: LifecycleActive,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -334,6 +375,9 @@ func (s *Session) Purge() {
 	s.DiagnosticsSummary = ""
 	s.History = nil
 	s.ContextLedger = nil
+	s.Title = ""
+	s.Lifecycle = LifecycleActive
+	s.WorkspaceDirtyFiles = nil
 }
 
 // WriteToGlobalLog appends a log entry to the global history log file.

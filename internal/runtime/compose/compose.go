@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"strings"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
@@ -444,6 +445,7 @@ func Wire(opts ...Option) (*Application, error) {
 	if a.Inputs.Session == nil {
 		if a.Inputs.Root != "" {
 			sm := session.NewManager(a.Inputs.Root,
+				session.WithWorkspaceGuard(newGitWorkspaceGuard(func() *git.Engine { return a.Git })),
 				session.WithBoundaryHook(session.BoundaryHookFunc(func(ctx context.Context, prev, next session.SlotID) error {
 					if a.Executor == nil {
 						return nil
@@ -525,6 +527,15 @@ func Wire(opts ...Option) (*Application, error) {
 		if err != nil {
 			return nil, fmt.Errorf("wire: audit logger: %w", err)
 		}
+		// INV-SESSION-10: stamp every persisted audit record with the active
+		// session id so mutation traces, token usage and tool invocations map
+		// strictly to their originating session.
+		logger.SetSessionResolver(func() string {
+			if a.Sessions != nil {
+				return a.Sessions.ActiveSessionID()
+			}
+			return ""
+		})
 		if err := logger.Start(); err != nil {
 			return nil, fmt.Errorf("wire: start audit logger: %w", err)
 		}
@@ -543,6 +554,14 @@ func Wire(opts ...Option) (*Application, error) {
 	// it, so approving a patch applies a REAL mutation.
 	a.Executor = execution.NewRuntimeExecutor(a.Inputs.Root, a.Inputs.Config, a.provider, a.Bus, a.Inputs.LanguageID)
 	a.Gateway = execution.NewIntentGateway(a.Inputs.Root)
+	// INV-SESSION-10: resolve the originating session for every execution at
+	// admission so the proof, terminal evidence and lifecycle events correlate
+	// with the active session — including autonomous/headless submissions.
+	if a.Sessions != nil {
+		a.Executor.SetSessionResolver(func() string {
+			return a.Sessions.ActiveSessionID()
+		})
+	}
 
 	// ── BACKGROUND PREFLIGHT + SYNC BARRIER (prompt admission invariant) ──
 	// Decouple structural discovery and budget estimation from the UI critical
@@ -876,6 +895,54 @@ func pipelineClient(p ai.Provider) *pipeline.FuncClient {
 		}
 		return resp.Content, layer3.TokenUsage{Input: resp.TokenInput, Output: resp.TokenOutput}, nil
 	})
+}
+
+// gitWorkspaceGuard is the WorkspaceGuard adapter for the composition root. It
+// reports the workspace-relative paths with uncommitted changes (git status)
+// that a session switch must surface in the target session's Context Compiler
+// view — the Session Manager never executes git itself (INV-SESSION-09).
+// resolve is called lazily because the Git engine is wired AFTER the session
+// manager in Wire; by switch time it is always set.
+type gitWorkspaceGuard struct {
+	resolve func() *git.Engine
+}
+
+func newGitWorkspaceGuard(resolve func() *git.Engine) *gitWorkspaceGuard {
+	return &gitWorkspaceGuard{resolve: resolve}
+}
+
+// DirtyFiles implements session.WorkspaceGuard. Only the workspace's own
+// changes are reported; .izen/ internal state is never surfaced as workspace
+// dirt. A missing/erroring git repo degrades to "no dirty files" so a session
+// switch can never be blocked by git absence.
+func (g *gitWorkspaceGuard) DirtyFiles(_ context.Context) ([]string, error) {
+	if g == nil || g.resolve == nil {
+		return nil, nil
+	}
+	eng := g.resolve()
+	if eng == nil {
+		return nil, nil
+	}
+	// A non-git workspace carries no uncommitted changes to guard against.
+	if !eng.IsRepo() {
+		return nil, nil
+	}
+	entries, err := eng.Status() //nolint:contextcheck // git.Engine.Status has no ctx parameter; the guard ctx is a switch-lifecycle signal
+	if err != nil {
+		return nil, err
+	}
+	var dirty []string
+	for _, e := range entries {
+		p := e.Path
+		if p == "" {
+			continue
+		}
+		if p == ".izen" || strings.HasPrefix(p, ".izen/") {
+			continue
+		}
+		dirty = append(dirty, p)
+	}
+	return dirty, nil
 }
 
 // composedCapabilityGraph is the PolicyEngine's physical-facts surface: the

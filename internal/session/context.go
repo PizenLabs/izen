@@ -73,6 +73,12 @@ type CompactContext struct {
 	// CompactedAt records when the last checkpoint was sealed.
 	CompactedAt time.Time `json:"compacted_at,omitempty"`
 
+	// DirtyFiles names the workspace-relative files with uncommitted changes
+	// present when the session became active. They are injected into the
+	// Context Compiler view (workspace boundary guard) so a resumed session
+	// never silently overwrites work left by another session.
+	DirtyFiles []string `json:"dirty_files,omitempty"`
+
 	// Structured session-compaction categories (SESSION.md §13.1): what the
 	// session must remember to continue correctly. Populated best-effort from
 	// the durable record; future compaction passes may enrich them. They are
@@ -104,6 +110,7 @@ func deriveCompactContext(s *Session) *CompactContext {
 		Recent:       append([]Message(nil), s.History...),
 		Unresolved:   append([]string(nil), s.Questions...),
 		Artifacts:    append([]string(nil), s.Checkpoints...),
+		DirtyFiles:   append([]string(nil), s.WorkspaceDirtyFiles...),
 	}
 	cc.Summary = compactSummary(s)
 	return cc
@@ -198,6 +205,9 @@ func hydrateSession(cc *CompactContext) *Session {
 				s.Checkpoints = append(s.Checkpoints, a)
 			}
 		}
+	}
+	if len(cc.DirtyFiles) > 0 {
+		s.WorkspaceDirtyFiles = append([]string(nil), cc.DirtyFiles...)
 	}
 	return s
 }

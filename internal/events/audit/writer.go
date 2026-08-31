@@ -37,6 +37,23 @@ type AuditLogger struct {
 	dropped  atomic.Uint64
 	accepted atomic.Uint64
 	writeErr atomic.Value // stores the first error from the disk worker
+
+	// sessionID returns the active session id to stamp onto every persisted
+	// record (INV-SESSION-10). It is resolved at event-handling time — the
+	// moment the event crosses the bus — so each audit line maps to the session
+	// that produced it. A nil resolver leaves session_id empty (harness mode).
+	sessionID func() string
+}
+
+// SetSessionResolver wires the active-session correlation source
+// (INV-SESSION-10). The resolver is invoked on the bus dispatch goroutine when
+// an event is accepted; it must be fast and non-blocking. It is typically the
+// SessionManager's active-session accessor.
+func (l *AuditLogger) SetSessionResolver(fn func() string) {
+	if l == nil {
+		return
+	}
+	l.sessionID = fn
 }
 
 // NewLogger creates an audit logger rooted at dir that persists envelopes
@@ -123,6 +140,16 @@ func (l *AuditLogger) Accepted() uint64 {
 	return l.accepted.Load()
 }
 
+// Flush pushes buffered NDJSON lines to the underlying file without stopping
+// the logger. It is the observability seam for operators and tests that must
+// read the audit log while the process is still running.
+func (l *AuditLogger) Flush() error {
+	if l == nil || l.store == nil {
+		return nil
+	}
+	return l.store.Flush()
+}
+
 // Path returns the NDJSON log file path, or "" when the logger is nil.
 func (l *AuditLogger) Path() string {
 	if l == nil || l.store == nil {
@@ -147,10 +174,29 @@ func (l *AuditLogger) Err() error {
 // the internal channel with a non-blocking push so a stalled disk worker can
 // never block the publisher or the TUI projection. The channel is never
 // closed, so a late handler invocation can never send on a closed channel.
+//
+// Every event — typed domain events AND envelopes — is persisted: typed events
+// are wrapped into envelopes with their canonical Type() preserved in Source,
+// so the NDJSON audit log is a complete, session-correlated record of the
+// whole stream.
 func (l *AuditLogger) handle(ev events.DomainEvent) {
+	if ev == nil {
+		return
+	}
 	env, ok := events.EnvelopeFromEvent(ev)
 	if !ok {
-		return
+		env = events.Envelope{
+			ID:        events.NewEnvelopeID(),
+			Timestamp: ev.Timestamp(),
+			Source:    ev.Type(),
+			Kind:      events.DomainKindSystem,
+			Payload:   ev.Payload(),
+		}
+	}
+	if l.sessionID != nil {
+		if sid := l.sessionID(); sid != "" {
+			env.SessionID = sid
+		}
 	}
 	select {
 	case l.ch <- env:

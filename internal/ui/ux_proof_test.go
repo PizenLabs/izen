@@ -22,7 +22,7 @@ func TestUXProofLog(t *testing.T) {
 	m2.execView.Begin("p")
 	m2.executionResolving = true
 	m2.execVisibility = presentation.VisibilityNormal
-	m2.handleDomainEvent(events.NewExecutionStarted("p", "build", "inspect index.html"))
+	m2.handleDomainEvent(events.NewExecutionStarted("p", "build", "inspect index.html", ""))
 	m2.handleDomainEvent(events.NewStrategySelected("p", "targeted_mutation", true, "x"))
 	m2.handleDomainEvent(events.NewTargetResolved("p", "index.html", true, "strategy"))
 	m2.handleDomainEvent(events.NewContextPrepared("p", []string{"user_intent", "target_content"}, 42))

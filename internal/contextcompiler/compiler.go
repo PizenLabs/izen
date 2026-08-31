@@ -286,6 +286,15 @@ func renderCompact(cc *session.CompactContext) string {
 		}
 		b.WriteString("summary: " + cc.Summary)
 	}
+	// Workspace boundary guard: surface uncommitted changes left by another
+	// session so the model never silently overwrites them.
+	if len(cc.DirtyFiles) > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("uncommitted workspace changes (from a previous session): " +
+			strings.Join(cc.DirtyFiles, ", "))
+	}
 	for _, m := range cc.Recent {
 		b.WriteString("\n" + m.Role + ": " + m.Content)
 	}
@@ -320,6 +329,10 @@ func (c *Compiler) fingerprint(in Input) string {
 		write(in.SessionCompact.Summary)
 		write(in.SessionCompact.Objective)
 		write(fmt.Sprintf("%d", len(in.SessionCompact.Recent)))
+		write(fmt.Sprintf("%d", len(in.SessionCompact.DirtyFiles)))
+		for _, d := range in.SessionCompact.DirtyFiles {
+			write(d)
+		}
 	} else {
 		write("")
 	}

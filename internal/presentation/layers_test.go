@@ -21,7 +21,7 @@ import (
 
 func fullProjection() *ExecutionProjection {
 	return runProjection(
-		events.NewExecutionStarted("r1", "build", "fix index.html"),
+		events.NewExecutionStarted("r1", "build", "fix index.html", ""),
 		events.NewStrategySelected("r1", "targeted_mutation", true, "explicit target"),
 		events.NewTargetResolved("r1", "index.html", true, "strategy"),
 		events.NewContextPrepared("r1", []string{"user_intent", "target_content"}, 40),
@@ -124,7 +124,7 @@ func TestFrameDebugShowsEvents(t *testing.T) {
 // Current (no live step after completion).
 func TestFrameTerminal(t *testing.T) {
 	p := runProjection(
-		events.NewExecutionStarted("r1", "build", "x"),
+		events.NewExecutionStarted("r1", "build", "x", ""),
 		events.NewExecutionFinished("r1", true, "completed"),
 	)
 	f := p.Frame(VisibilityNormal)

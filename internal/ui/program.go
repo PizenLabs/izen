@@ -152,6 +152,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		caps:                app.Caps,
 		sess:                app.Session(),
 		sessionManager:      app.SessionManager(),
+		compactionRunner:    app.CompactionRunner(),
 		provider:            provider,
 		mgr:                 app.Manager(),
 		gitEng:              app.Git,

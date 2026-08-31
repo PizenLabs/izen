@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -49,6 +50,7 @@ type Manager struct {
 	maxTurns int
 	hook     BoundaryHook
 	cpEngine CheckpointValidator
+	guard    WorkspaceGuard
 
 	// crash is the test-only fault-injection seam. It is invoked at
 	// deterministic points inside NewSession/ResumeSession so tests can
@@ -108,6 +110,17 @@ func WithCheckpointValidator(v CheckpointValidator) Option {
 	}
 }
 
+// WithWorkspaceGuard wires the workspace-boundary safety seam: on every session
+// switch (/new, /session resume) the guard's dirty files are injected into the
+// target session's Context Compiler view so uncommitted work from another
+// session is never silently overwritten. A nil guard disables the boundary
+// check.
+func WithWorkspaceGuard(g WorkspaceGuard) Option {
+	return func(m *Manager) {
+		m.guard = g
+	}
+}
+
 // withCrashHook installs the test-only fault-injection seam.
 func withCrashHook(fn func(CrashPoint) error) Option {
 	return func(m *Manager) {
@@ -155,6 +168,30 @@ func (f BoundaryHookFunc) OnSessionSwitch(ctx context.Context, prev, next SlotID
 type CheckpointValidator interface {
 	// Valid reports whether the checkpoint id is present and loadable.
 	Valid(id string) bool
+}
+
+// WorkspaceGuard is the workspace-boundary safety seam (workspace guard). It
+// reports the workspace-relative files with uncommitted changes (Git status /
+// checkpoint baseline divergence) that a session switch must surface instead of
+// silently overwriting. It is wired by the composition root to the Git engine;
+// the Session Manager only consumes its output and never executes mutations
+// (INV-SESSION-09).
+type WorkspaceGuard interface {
+	// DirtyFiles returns the workspace-relative paths of files with uncommitted
+	// changes (excluding .izen/). An error is non-fatal: the switch proceeds and
+	// the failure is recorded as the last boundary error.
+	DirtyFiles(ctx context.Context) ([]string, error)
+}
+
+// WorkspaceGuardFunc adapts a function to WorkspaceGuard.
+type WorkspaceGuardFunc func(ctx context.Context) ([]string, error)
+
+// DirtyFiles implements WorkspaceGuard.
+func (f WorkspaceGuardFunc) DirtyFiles(ctx context.Context) ([]string, error) {
+	if f == nil {
+		return nil, nil
+	}
+	return f(ctx)
 }
 
 // CrashPoint identifies the deterministic fault-injection boundary inside a
@@ -241,6 +278,19 @@ func (m *Manager) Session() *Session {
 	return m.session
 }
 
+// ActiveSessionID returns the SessionID of the currently active session, or ""
+// before Open / when no session is loaded. It is the INV-SESSION-10 correlation
+// source the audit logger and the RuntimeExecutor resolve the active session
+// from.
+func (m *Manager) ActiveSessionID() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.session == nil {
+		return ""
+	}
+	return m.session.SessionID
+}
+
 // PointerRecovered reports whether the active pointer required repair at Open.
 func (m *Manager) PointerRecovered() bool {
 	m.mu.RLock()
@@ -274,7 +324,21 @@ func (m *Manager) NewSession(ctx context.Context) (*Session, error) {
 	}
 	defer func() { _ = m.lock.release() }()
 
-	// 1. Persist current active session.
+	// 1. Persist current active session (transitioned to dormant). Only
+	//    explicit lifecycle commands may overwrite an archived session, so a
+	//    dormant slot holding an archived session must be surfaced, never
+	//    silently replaced.
+	next := prev.Other()
+	if m.slotLifecycle(next) == LifecycleArchived {
+		return nil, fmt.Errorf("session: slot %s holds an ARCHIVED session — resume or delete it before /new (only explicit lifecycle commands may overwrite archived state)", next)
+	}
+
+	// 2. Persist the current active session as dormant.
+	m.mu.RLock()
+	if cur := m.session; cur != nil {
+		cur.Lifecycle = LifecycleDormant
+	}
+	m.mu.RUnlock()
 	if err := m.persistActiveLocked(); err != nil {
 		return nil, err
 	}
@@ -284,10 +348,14 @@ func (m *Manager) NewSession(ctx context.Context) (*Session, error) {
 		}
 	}
 
-	// 2. Create the new session in the dormant slot (prepare-before-commit).
-	next := prev.Other()
+	// 3. Create the new session in the dormant slot (prepare-before-commit).
 	fresh := New()
 	fresh.SessionID = newSessionID(next)
+	fresh.Lifecycle = LifecycleActive
+	dirty := m.resolveDirtyFiles(ctx)
+	if len(dirty) > 0 {
+		fresh.WorkspaceDirtyFiles = dirty
+	}
 	m.attachSessionPaths(fresh, next)
 	if err := m.persistSlotLocked(next, fresh); err != nil {
 		return nil, err
@@ -345,7 +413,12 @@ func (m *Manager) ResumeSession(ctx context.Context, target SlotID) (*Session, e
 	}
 	defer func() { _ = m.lock.release() }()
 
-	// Persist active A.
+	// Persist active A (transitioned to dormant).
+	m.mu.RLock()
+	if cur := m.session; cur != nil {
+		cur.Lifecycle = LifecycleDormant
+	}
+	m.mu.RUnlock()
 	if err := m.persistActiveLocked(); err != nil {
 		return nil, err
 	}
@@ -361,6 +434,20 @@ func (m *Manager) ResumeSession(ctx context.Context, target SlotID) (*Session, e
 		return nil, err
 	}
 	m.attachSessionPaths(targetSess, target)
+	targetSess.Lifecycle = LifecycleActive
+	// Workspace boundary guard: inject the current uncommitted changes into the
+	// target session's Context Compiler view so work left by the previous
+	// session is never silently overwritten. Guard errors are non-fatal and
+	// recorded as the last boundary error; the switch still commits.
+	if dirty := m.resolveDirtyFiles(ctx); len(dirty) > 0 {
+		targetSess.WorkspaceDirtyFiles = dirty
+	}
+	// Persist the prepared target so the injected dirty files (and the active
+	// lifecycle) survive into the durable record and the derived compact
+	// context — the Context Compiler's view — before the pointer commits.
+	if err := m.persistSlotLocked(target, targetSess); err != nil {
+		return nil, err
+	}
 	if m.crash != nil {
 		if err := m.crash(CrashAfterPrepareNew); err != nil {
 			return nil, err
@@ -422,15 +509,17 @@ func (m *Manager) SetCompactContext(ctx context.Context, s SlotID, cc *CompactCo
 
 // SlotInfo is a read-only projection of one slot for /session listing.
 type SlotInfo struct {
-	Slot      SlotID    `json:"slot"`
-	Active    bool      `json:"active"`
-	Exists    bool      `json:"exists"`
-	Objective string    `json:"objective,omitempty"`
-	SessionID string    `json:"session_id,omitempty"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
-	TurnCount int       `json:"turn_count"`
-	Recovered bool      `json:"recovered,omitempty"`
-	Error     string    `json:"error,omitempty"`
+	Slot       SlotID    `json:"slot"`
+	Active     bool      `json:"active"`
+	Exists     bool      `json:"exists"`
+	Lifecycle  string    `json:"lifecycle,omitempty"`
+	Objective  string    `json:"objective,omitempty"`
+	SessionID  string    `json:"session_id,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at,omitempty"`
+	TurnCount  int       `json:"turn_count"`
+	DirtyCount int       `json:"dirty_count"`
+	Recovered  bool      `json:"recovered,omitempty"`
+	Error      string    `json:"error,omitempty"`
 }
 
 // List projects both slots for observability. It never mutates state and
@@ -455,6 +544,15 @@ func (m *Manager) List(ctx context.Context) []SlotInfo {
 			info.UpdatedAt = sess.UpdatedAt
 			info.TurnCount = len(sess.History)
 			info.Recovered = sess.recoveredFromRawHistory()
+			info.DirtyCount = len(sess.WorkspaceDirtyFiles)
+			switch {
+			case sess.Lifecycle != "":
+				info.Lifecycle = string(sess.Lifecycle)
+			case s == active:
+				info.Lifecycle = string(LifecycleActive)
+			default:
+				info.Lifecycle = string(LifecycleDormant)
+			}
 		default:
 			// Slot has durable data but no authoritative record.
 			if cc, cerr := m.readCompactContext(s); cerr == nil && cc != nil {
@@ -473,7 +571,245 @@ func (m *Manager) List(ctx context.Context) []SlotInfo {
 	return infos
 }
 
+// Inspect returns the full session record of a slot for `/session inspect`.
+// It never mutates state. The returned session is detached from the manager
+// (a value copy of the durable record) so the caller can render it freely.
+func (m *Manager) Inspect(s SlotID) (*Session, error) {
+	if !validSlot(s) {
+		return nil, fmt.Errorf("session: invalid slot %q (expected A or B)", s)
+	}
+	sess, err := m.sessionData(s)
+	if err != nil {
+		return nil, err
+	}
+	// Present a detached read-only projection: never hand out the live pointer.
+	cp := *sess
+	cp.path = ""
+	cp.slotDir = ""
+	cp.recovered = false
+	return &cp, nil
+}
+
+// Rename atomically updates the mutable session title in the slot's
+// session.json (SESSION.md §7: the title is mutable, the ID is not). It is a
+// crash-resilient transactional write through the two-tier lock.
+func (m *Manager) Rename(ctx context.Context, s SlotID, title string) error {
+	if !validSlot(s) {
+		return fmt.Errorf("session: invalid slot %q (expected A or B)", s)
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return errors.New("session: rename requires a non-empty title")
+	}
+	if err := m.lock.acquire(ctx); err != nil {
+		return err
+	}
+	defer func() { _ = m.lock.release() }()
+
+	sess, err := m.liveSessionFor(s)
+	if err != nil {
+		return err
+	}
+	sess.Title = title
+	if err := m.persistSlotLocked(s, sess); err != nil {
+		return err
+	}
+	// Mirror the rename into the live in-memory session when it is active.
+	m.mu.Lock()
+	if m.active == s && m.session != nil {
+		m.session.Title = title
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+// Archive transitions a session's explicit lifecycle to ARCHIVED (SESSION.md
+// §25/§28). An archived session remains inspectable and resumable unless
+// explicitly deleted; only explicit lifecycle commands may move it back or
+// overwrite it. Archiving is idempotent.
+func (m *Manager) Archive(ctx context.Context, s SlotID) error {
+	if !validSlot(s) {
+		return fmt.Errorf("session: invalid slot %q (expected A or B)", s)
+	}
+	if err := m.lock.acquire(ctx); err != nil {
+		return err
+	}
+	defer func() { _ = m.lock.release() }()
+
+	sess, err := m.liveSessionFor(s)
+	if err != nil {
+		return err
+	}
+	if sess.Lifecycle == LifecycleArchived {
+		return nil
+	}
+	sess.Lifecycle = LifecycleArchived
+	if err := m.persistSlotLocked(s, sess); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if m.active == s && m.session != nil {
+		m.session.Lifecycle = LifecycleArchived
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+// Delete explicitly purges the session-owned state of a slot — and ONLY that
+// state (INV-SESSION-12). It never touches project configuration, the project
+// graph, project knowledge, or the global audit log. Deleting the active slot
+// atomically moves the pointer to the sibling slot BEFORE the directory is
+// removed (crash-safe: a leftover directory is a dormant leftover, never a
+// dangling pointer). Deleting a dormant slot is a plain directory removal.
+// Audit evidence for the deleted session remains in .izen/audit/events.ndjson
+// for forensic integrity.
+func (m *Manager) Delete(ctx context.Context, s SlotID) error {
+	if !validSlot(s) {
+		return fmt.Errorf("session: invalid slot %q (expected A or B)", s)
+	}
+	if err := m.lock.acquire(ctx); err != nil {
+		return err
+	}
+	defer func() { _ = m.lock.release() }()
+
+	m.mu.RLock()
+	active := m.active
+	m.mu.RUnlock()
+
+	// Deleting the active slot: commit the pointer to the sibling first so no
+	// committed pointer can ever name a removed slot.
+	if s == active {
+		other := s.Other()
+		// The sibling must be a real, recoverable session; a bare sibling is
+		// bootstrapped so the pointer always lands on durable state.
+		if err := m.validateSlot(other); err != nil {
+			if err := m.bootstrapSlot(other); err != nil {
+				return err
+			}
+		}
+		if err := m.commitPointer(other); err != nil {
+			return err
+		}
+		otherSess, err := m.loadSlot(other)
+		if err != nil {
+			return err
+		}
+		otherSess.Lifecycle = LifecycleActive
+		if err := m.persistSlotLocked(other, otherSess); err != nil {
+			return err
+		}
+		m.mu.Lock()
+		m.active = other
+		m.session = otherSess
+		m.mu.Unlock()
+	}
+
+	if err := os.RemoveAll(m.slotDir(s)); err != nil {
+		return fmt.Errorf("session: delete slot %s: %w", s, err)
+	}
+	return nil
+}
+
+// CompactContext returns the slot's current compact context generation, or nil
+// when none exists. It is the read seam for the manual `/session compact`
+// trigger, which combines it with the raw history through the Generational
+// Compactor.
+func (m *Manager) CompactContext(s SlotID) (*CompactContext, error) {
+	if !validSlot(s) {
+		return nil, fmt.Errorf("session: invalid slot %q (expected A or B)", s)
+	}
+	return m.readCompactContext(s)
+}
+
+// bootstrapSlot materializes a fresh durable session in an empty sibling slot
+// so a pointer commit never lands on a nonexistent slot. Caller must hold the
+// session lock.
+func (m *Manager) bootstrapSlot(s SlotID) error {
+	fresh := New()
+	fresh.SessionID = newSessionID(s)
+	fresh.Lifecycle = LifecycleActive
+	m.attachSessionPaths(fresh, s)
+	return m.persistSlotLocked(s, fresh)
+}
+
 // ── internals ──────────────────────────────────────────────────────────────
+
+// resolveDirtyFiles queries the workspace guard for uncommitted changes. Guard
+// errors are non-fatal (the switch still commits) and recorded as the last
+// boundary error so operators can observe the degraded boundary check. It is
+// called with the session lock held; the guard must be fast and non-blocking.
+func (m *Manager) resolveDirtyFiles(ctx context.Context) []string {
+	if m.guard == nil {
+		return nil
+	}
+	dirty, err := m.guard.DirtyFiles(ctx)
+	if err != nil {
+		m.mu.Lock()
+		m.lastBoundaryErr = fmt.Errorf("workspace guard: %w", err)
+		m.mu.Unlock()
+		return nil
+	}
+	return dirty
+}
+
+// slotLifecycle reads the explicit lifecycle recorded on a slot's authoritative
+// session record, falling back to the compact context. A slot with no durable
+// data is treated as LifecycleActive (fresh bootstrap).
+func (m *Manager) slotLifecycle(s SlotID) Lifecycle {
+	sess, err := m.readSessionRecord(s)
+	if err == nil && sess != nil {
+		if sess.Lifecycle != "" {
+			return sess.Lifecycle
+		}
+		return LifecycleActive
+	}
+	if cc, cerr := m.readCompactContext(s); cerr == nil && cc != nil {
+		return LifecycleActive
+	}
+	return LifecycleActive
+}
+
+// liveSessionFor returns the session record a management write should mutate:
+// the LIVE in-memory session when the slot is active (preserving unpersisted
+// presentation state), otherwise the durable record. Caller must hold the
+// session lock.
+func (m *Manager) liveSessionFor(s SlotID) (*Session, error) {
+	m.mu.RLock()
+	active := m.active
+	live := m.session
+	m.mu.RUnlock()
+	if s == active && live != nil {
+		return live, nil
+	}
+	return m.sessionData(s)
+}
+
+// sessionData loads the authoritative session record of a slot for management
+// operations (inspect / rename / archive / compact). It errors when the slot
+// holds no recoverable session data.
+func (m *Manager) sessionData(s SlotID) (*Session, error) {
+	sess, err := m.readSessionRecord(s)
+	if err != nil {
+		return nil, err
+	}
+	if sess != nil {
+		return sess, nil
+	}
+	cc, cerr := m.readCompactContext(s)
+	if cerr == nil && cc != nil {
+		return hydrateSession(cc), nil
+	}
+	if _, statErr := os.Stat(filepath.Join(m.slotDir(s), RawHistoryFileName)); statErr == nil {
+		rebuilt, _, rerr := m.rebuildFromRawHistory(s)
+		if rerr != nil {
+			return nil, rerr
+		}
+		if rebuilt != nil {
+			return rebuilt, nil
+		}
+	}
+	return nil, fmt.Errorf("session: slot %q contains no recoverable session data", s)
+}
 
 // persistActiveLocked flushes the current in-memory active session to its slot.
 // Caller must hold the session lock.

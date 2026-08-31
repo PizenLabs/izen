@@ -44,6 +44,16 @@ import (
 	cmdreg "github.com/PizenLabs/izen/pkg/domain/command"
 )
 
+// isSlashInput reports whether the trimmed input is a Slash Command — a
+// leading "/" marks the input as the EXCLUSIVE property of the Slash Command
+// surface (strict input router rule). Such input is never submitted as a
+// free-form prompt: an unknown or malformed slash command fails fast on the UI
+// and the turn terminates without emitting submit_prompt, without reaching the
+// IntentGateway, and without dispatching background prompt workers.
+func isSlashInput(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), "/")
+}
+
 // resolveCommandToken canonicalizes a typed '/token' through the command
 // registry: registered aliases ("/q" → quit, "/?" → help) and unambiguous
 // prefixes ("/qu" → quit) resolve to the canonical command when that command
@@ -326,7 +336,13 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return tea.Batch(m.setMode(mode), switchCmd)
 	}
 
-	if strings.HasPrefix(line, "/") {
+	// ── SLASH COMMAND FALLTHROUGH GUARD (terminal) ────────────────────
+	// Any slash-prefixed input that reaches this point is a Slash Command and
+	// is terminated HERE with its FULL original line so subcommand arguments
+	// survive (/session resume A). It can never fall through to the free-text
+	// IntentGateway / submit_prompt path below — unknown commands fail fast
+	// with "unknown command: <cmd>" and zero side effects.
+	if isSlashInput(line) {
 		return m.handleCommand(line)
 	}
 
@@ -1848,6 +1864,17 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
 		m.push(roleSystem, infoStyle.Render("  /help  /usage  /models  /objective  /drop  /clear  /quit  /copy"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>  /copy-mode"))
+		m.push(roleSystem, "")
+		m.push(roleSystem, labelBoldStyle.Render("sessions"))
+		m.push(roleSystem, infoStyle.Render("  /new                       create and activate a fresh session"))
+		m.push(roleSystem, infoStyle.Render("  /session                   list sessions"))
+		m.push(roleSystem, infoStyle.Render("  /session resume <A|B>      switch to a session"))
+		m.push(roleSystem, infoStyle.Render("  /session inspect <A|B>     show session metadata (goal, decisions, artifacts)"))
+		m.push(roleSystem, infoStyle.Render("  /session rename <A|B> <t>  retitle a session"))
+		m.push(roleSystem, infoStyle.Render("  /session archive <A|B>     archive a session"))
+		m.push(roleSystem, infoStyle.Render("  /session delete <A|B>     purge session-owned state"))
+		m.push(roleSystem, infoStyle.Render("  /session compact <A|B>     run the Generational Compactor"))
+		m.push(roleSystem, "")
 		m.push(roleSystem, infoStyle.Render("  /copy          copy full canonical transcript to clipboard"))
 		m.push(roleSystem, infoStyle.Render("  /copy-mode     scrollable inspection mode (j/k, / search, v/y yank, wheel)"))
 		m.push(roleSystem, infoStyle.Render("  /explain-decision  inspect why a tech stack was chosen"))

@@ -89,6 +89,54 @@ func TestStatusWithChange(t *testing.T) {
 	}
 }
 
+// TestStatusPreservesFullPorcelainPaths pins that a worktree-modified file's
+// path is reported verbatim: git porcelain uses FIXED columns (XY <path>), so
+// trimming the leading index column shifts the path by one char. This is the
+// path the workspace-boundary guard feeds the Context Compiler, so a mangled
+// path would break dirty-file injection on session switch.
+func TestStatusPreservesFullPorcelainPaths(t *testing.T) {
+	dir := setupTestRepo(t)
+	e := NewEngine(dir)
+
+	// Stage a new file so status carries BOTH an index change (no leading
+	// space) and a worktree modification (leading space on the first line).
+	if err := os.WriteFile(filepath.Join(dir, "alpha.txt"), []byte("one"), 0644); err != nil {
+		t.Fatalf("write alpha: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "beta.txt"), []byte("two"), 0644); err != nil {
+		t.Fatalf("write beta: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gamma.txt"), []byte("three"), 0644); err != nil {
+		t.Fatalf("write gamma: %v", err)
+	}
+	if err := e.StageAll(); err != nil {
+		t.Fatalf("StageAll: %v", err)
+	}
+	// Modify beta AFTER staging: worktree-dirty, index-clean -> " M beta.txt".
+	if err := os.WriteFile(filepath.Join(dir, "beta.txt"), []byte("two!"), 0644); err != nil {
+		t.Fatalf("write beta dirty: %v", err)
+	}
+
+	status, err := e.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	byPath := map[string]StatusEntry{}
+	for _, s := range status {
+		byPath[s.Path] = s
+	}
+	if _, ok := byPath["beta.txt"]; !ok {
+		t.Fatalf("worktree-modified path mangled by parsing; got %v", status)
+	}
+	if byPath["beta.txt"].Worktree != "M" {
+		t.Errorf("beta worktree column = %q, want M", byPath["beta.txt"].Worktree)
+	}
+	// The staged file must also be reported with its full path.
+	if _, ok := byPath["alpha.txt"]; !ok {
+		t.Errorf("staged path alpha.txt missing from status: %v", status)
+	}
+}
+
 func TestCheckpoint(t *testing.T) {
 	dir := setupTestRepo(t)
 	e := NewEngine(dir)

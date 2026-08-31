@@ -48,6 +48,7 @@ import (
 	riview "github.com/PizenLabs/izen/internal/review"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
+	"github.com/PizenLabs/izen/internal/session/compaction"
 	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/ui/status"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
@@ -701,11 +702,14 @@ type model struct {
 	// active session. Nil in harnesses that never construct a model via
 	// NewProgramWithApp with a wired manager.
 	sessionManager *session.Manager
-	provider       ai.Provider
-	mgr            *ai.Manager
-	resolver       *modes.Resolver
-	gitEng         *git.Engine
-	graph          *lea.FileGraph
+	// compactionRunner is the async Generational Compactor. It backs the manual
+	// /session compact <id> trigger; its worker never runs on the UI loop.
+	compactionRunner *compaction.Runner
+	provider         ai.Provider
+	mgr              *ai.Manager
+	resolver         *modes.Resolver
+	gitEng           *git.Engine
+	graph            *lea.FileGraph
 	// leaEng is the Phase 3 Lea structural engine (canonical index for
 	// architecture, call chains, routes and symbol lookups). It backs the
 	// context planner's graph source and the /arch analysis. Nil only in

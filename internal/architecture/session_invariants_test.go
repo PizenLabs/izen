@@ -153,3 +153,29 @@ func TestNewSessionBoundaryDrainsThroughExecutor(t *testing.T) {
 		t.Error("architecture: the UI must never construct raw sessions directly — the SessionManager owns the lifecycle")
 	}
 }
+
+// TestSessionCLISurfaceComplete pins the Phase 3 /session control surface
+// (SESSION.md §10): every subcommand — inspect, rename, archive, delete,
+// compact — must dispatch through the SessionManager in the UI command layer.
+func TestSessionCLISurfaceComplete(t *testing.T) {
+	root := repoRoot(t)
+	src, err := os.ReadFile(filepath.Join(root, "internal/ui/session_cmds.go"))
+	if err != nil {
+		t.Fatalf("internal/ui/session_cmds.go missing; /session wiring moved")
+	}
+	// The command router must recognize each subcommand verb.
+	for _, sub := range []string{
+		"\"inspect\"", "\"rename\"", "\"archive\"",
+		"\"delete\"", "\"compact\"", "\"resume\"", "\"list\"",
+	} {
+		if !strings.Contains(string(src), sub) {
+			t.Errorf("architecture: /session %s is not dispatched in session_cmds.go", sub)
+		}
+	}
+	// Each management verb must reach a SessionManager authority method.
+	for _, method := range []string{"Inspect", "Rename", "Archive", "Delete", "Compact", "CompactContext"} {
+		if !strings.Contains(string(src), method) {
+			t.Errorf("architecture: /session surface must call SessionManager.%s", method)
+		}
+	}
+}
