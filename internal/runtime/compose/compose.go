@@ -22,6 +22,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/contextcompiler"
 	"github.com/PizenLabs/izen/internal/control"
 	"github.com/PizenLabs/izen/internal/core/artifact"
 	"github.com/PizenLabs/izen/internal/core/authorization"
@@ -37,6 +38,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/git"
+	"github.com/PizenLabs/izen/internal/knowledge"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/loop"
@@ -50,6 +52,7 @@ import (
 	runtimeAutonomy "github.com/PizenLabs/izen/internal/runtime/autonomy"
 	"github.com/PizenLabs/izen/internal/runtime/handlers"
 	"github.com/PizenLabs/izen/internal/session"
+	compaction "github.com/PizenLabs/izen/internal/session/compaction"
 	izentelemetry "github.com/PizenLabs/izen/internal/telemetry"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
@@ -142,6 +145,21 @@ type Application struct {
 	// single owner of the process session record; Inputs.Session mirrors its
 	// active session. Wired whenever a workspace root is provided.
 	Sessions *session.Manager
+	// ── Phase 2 decoupled context subsystems ───────────────────────────
+	// Compaction is the async Session Compaction authority: it runs on a
+	// background goroutine (never the main execution loop) and sinks
+	// generational compact contexts into the session manager.
+	Compaction *compaction.Runner
+	// Knowledge is the granular Project Knowledge store (INV-SESSION-15:
+	// independently addressable chunks, never a monolithic project summary).
+	Knowledge *knowledge.Store
+	// Promotion is the Knowledge Lifecycle engine (candidate → validated →
+	// evaluated → promoted → deprecated/tombstoned).
+	Promotion *knowledge.PromotionEngine
+	// Compiler is the Context Compilation runtime engine: it decides what
+	// context is injected into the LLM prompt under a strict token budget and
+	// re-compiles only when underlying state mutates.
+	Compiler *contextcompiler.Compiler
 	// Gateway is the unified IntentGateway: the single entry point every user
 	// action (bare text, $prompt, $hot) crosses to produce an ExecuteRequest
 	// with an unconditional Strategy.Select profile. The UI never routes by
@@ -331,6 +349,40 @@ func (a *Application) SessionManager() *session.Manager {
 	return a.Sessions
 }
 
+// CompactionRunner returns the async Session Compaction runner (nil when no
+// workspace root is wired). It runs on a background goroutine; Submit never
+// blocks the main loop.
+func (a *Application) CompactionRunner() *compaction.Runner {
+	if a == nil {
+		return nil
+	}
+	return a.Compaction
+}
+
+// KnowledgeStore returns the granular Project Knowledge store (INV-SESSION-15).
+func (a *Application) KnowledgeStore() *knowledge.Store {
+	if a == nil {
+		return nil
+	}
+	return a.Knowledge
+}
+
+// PromotionEngine returns the Knowledge Lifecycle engine.
+func (a *Application) PromotionEngine() *knowledge.PromotionEngine {
+	if a == nil {
+		return nil
+	}
+	return a.Promotion
+}
+
+// ContextCompiler returns the Context Compilation runtime engine.
+func (a *Application) ContextCompiler() *contextcompiler.Compiler {
+	if a == nil {
+		return nil
+	}
+	return a.Compiler
+}
+
 // Manager returns the AI provider manager the engine tree was wired from.
 // Never nil after Wire.
 func (a *Application) Manager() *ai.Manager {
@@ -424,6 +476,28 @@ func Wire(opts ...Option) (*Application, error) {
 	if a.Inputs.Username == "" {
 		a.Inputs.Username = resolveUsername()
 	}
+
+	// ── PHASE 2 DECOUPLED CONTEXT SUBSYSTEMS ───────────────────────────
+	// Three independent authorities with absolute separation:
+	//   Compaction  — single-session continuity (async, non-blocking).
+	//   Knowledge   — durable cross-session knowledge (granular, INV-SESSION-15).
+	//   Compiler    — LLM prompt context under a strict token budget.
+	// Each is wired independently; none shares state with the others or with
+	// the RuntimeExecutor execution engine.
+	if a.Sessions != nil {
+		runner := compaction.NewRunner(compaction.DefaultPolicy(),
+			func(ctx context.Context, j compaction.Job, cc *session.CompactContext) error {
+				if a.Sessions == nil {
+					return nil
+				}
+				return a.Sessions.SetCompactContext(ctx, j.Slot, cc)
+			})
+		runner.Start()
+		a.Compaction = runner
+	}
+	a.Knowledge = knowledge.NewStore(a.Inputs.Root)
+	a.Promotion = knowledge.NewPromotionEngine(a.Knowledge, knowledge.DefaultPolicy())
+	a.Compiler = contextcompiler.New()
 	if a.provider == nil {
 		if def, ok := a.Inputs.Manager.Default(); ok {
 			a.provider = def
@@ -710,11 +784,15 @@ func Wire(opts ...Option) (*Application, error) {
 }
 
 // Close tears down the Application: it stops the audit logger, the ledger
-// projection, the runtime presentation projection and the telemetry bridge.
-// Idempotent.
+// projection, the runtime presentation projection, the telemetry bridge and
+// the async compaction runner. Idempotent.
 func (a *Application) Close() {
 	if a == nil {
 		return
+	}
+	if a.Compaction != nil {
+		a.Compaction.Close()
+		a.Compaction = nil
 	}
 	if a.Audit != nil {
 		_ = a.Audit.Close()

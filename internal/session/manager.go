@@ -400,6 +400,26 @@ func (m *Manager) AppendHistory(ctx context.Context, role, content string) error
 	return m.appendRawHistory(active, role, content)
 }
 
+// SetCompactContext atomically replaces the slot's compact context with a
+// compaction-engine generation. It is the integration seam the asynchronous
+// Compaction Runner sinks into: the runner computes a generation off the
+// history log and this method persists it without touching the authoritative
+// session record or the raw history. Returns an error when the manager is not
+// opened or the slot is invalid.
+func (m *Manager) SetCompactContext(ctx context.Context, s SlotID, cc *CompactContext) error {
+	if !validSlot(s) {
+		return fmt.Errorf("session: invalid slot %q", s)
+	}
+	if err := m.lock.acquire(ctx); err != nil {
+		return err
+	}
+	defer func() { _ = m.lock.release() }()
+	if cc == nil {
+		return nil
+	}
+	return m.writeCompactContextValue(s, cc)
+}
+
 // SlotInfo is a read-only projection of one slot for /session listing.
 type SlotInfo struct {
 	Slot      SlotID    `json:"slot"`

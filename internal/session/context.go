@@ -57,6 +57,22 @@ type CompactContext struct {
 	TurnCount    int    `json:"turn_count"`
 	Checkpoint   string `json:"checkpoint,omitempty"`
 	RunNumber    int    `json:"run_number"`
+
+	// ── Compaction generation tracking (Phase 2) ──────────────────────
+	// Generation is the monotonic compaction checkpoint counter. Each sealed
+	// checkpoint advances it; incremental compaction refreshes the recent
+	// window without advancing it (adaptive, event-driven — never a fixed
+	// turn limit).
+	Generation int `json:"generation,omitempty"`
+	// EventCount is the cumulative history-event (turn) count folded into this
+	// generation, used by the adaptive policy to decide the next checkpoint.
+	EventCount int `json:"event_count,omitempty"`
+	// Recent carries the verbatim turns since the last sealed checkpoint — the
+	// "recent context" tier (SESSION.md §12.3). It is never the full transcript.
+	Recent []Message `json:"recent,omitempty"`
+	// CompactedAt records when the last checkpoint was sealed.
+	CompactedAt time.Time `json:"compacted_at,omitempty"`
+
 	// Structured session-compaction categories (SESSION.md §13.1): what the
 	// session must remember to continue correctly. Populated best-effort from
 	// the durable record; future compaction passes may enrich them. They are
@@ -83,6 +99,9 @@ func deriveCompactContext(s *Session) *CompactContext {
 		CreatedAt:    s.CreatedAt,
 		UpdatedAt:    s.UpdatedAt,
 		LastUserTurn: lastUserTurn(s),
+		Generation:   1,
+		EventCount:   len(s.History),
+		Recent:       append([]Message(nil), s.History...),
 		Unresolved:   append([]string(nil), s.Questions...),
 		Artifacts:    append([]string(nil), s.Checkpoints...),
 	}
@@ -130,7 +149,9 @@ func compactSummary(s *Session) string {
 
 // hydrateSession reconstructs a minimal Session from a compact context. It is
 // the fast-path fallback of the load ladder; it intentionally does NOT
-// reconstruct windowed history (raw-history rebuild does that).
+// reconstruct full windowed history (raw-history rebuild does that), but it
+// DOES restore the generation's carried Recent turns (SESSION.md §12.3) so a
+// hydrated session keeps the freshest verbatim context.
 func hydrateSession(cc *CompactContext) *Session {
 	now := time.Now()
 	s := New()
@@ -143,7 +164,9 @@ func hydrateSession(cc *CompactContext) *Session {
 	if m, ok := modes.Parse(cc.Mode); ok {
 		s.Mode = m
 	}
-	if cc.LastUserTurn != "" {
+	if len(cc.Recent) > 0 {
+		s.History = append(s.History, cc.Recent...)
+	} else if cc.LastUserTurn != "" {
 		s.History = append(s.History, Message{
 			Role: "user", Content: cc.LastUserTurn, Timestamp: now,
 		})
@@ -181,7 +204,16 @@ func hydrateSession(cc *CompactContext) *Session {
 
 // writeCompactContext persists the derived compact context atomically.
 func (m *Manager) writeCompactContext(s SlotID, sess *Session) error {
-	cc := deriveCompactContext(sess)
+	return m.writeCompactContextValue(s, deriveCompactContext(sess))
+}
+
+// writeCompactContextValue persists an arbitrary compaction-generation payload
+// atomically. It is the persistence primitive used by both the derived
+// fast-path context and the asynchronous Compaction Runner sink.
+func (m *Manager) writeCompactContextValue(s SlotID, cc *CompactContext) error {
+	if cc == nil {
+		return nil
+	}
 	data, err := json.MarshalIndent(cc, "", "  ")
 	if err != nil {
 		return err
