@@ -185,7 +185,12 @@ func (m *model) mousePosToLogical(msg tea.MouseMsg) selPos {
 // DocumentLayout.ScreenToGlobal when layout is available. DocumentLayout is
 // record-only (GlobalY 0 == first record's first physical row), so we subtract
 // the viewport content prefix height to align viewport relY with document Y.
+// This is the legacy path retained for tests without a framebuffer. New code
+// prefers mousePosToFramebufferGlobal which is O(1) against Framebuffer.Grid.
 func (m *model) mousePosToGlobal(msg tea.MouseMsg) GlobalPos {
+	if m.framebuffer != nil && len(m.framebuffer.Grid) > 0 {
+		return m.mousePosToFramebufferGlobal(msg)
+	}
 	geo := m.viewportGeometry()
 	yOff := 0
 	if m.Ready {
@@ -193,26 +198,38 @@ func (m *model) mousePosToGlobal(msg tea.MouseMsg) GlobalPos {
 	}
 	if m.docLayout != nil && m.docLayout.Len() > 0 {
 		prefix := m.viewportContentPrefixHeight()
-		// Use the layout's geometry mapper so viewport left/top offsets are
-		// applied exactly once and never drift from extraction/highlighting.
-		docYOffset := yOff - prefix
-		if docYOffset < 0 {
-			docYOffset = 0
+		relY := msg.Y - geo.Top
+		relX := msg.X - geo.Left
+		if relY < 0 {
+			relY = 0
 		}
-		pos := m.docLayout.ScreenToGlobal(msg.X, msg.Y, docYOffset, geo.Left, geo.Top+prefix)
-		if pos.Y < 0 {
-			pos.Y = 0
+		if relY >= geo.Height {
+			relY = geo.Height - 1
 		}
-		if pos.Y >= m.docLayout.Len() {
-			pos.Y = m.docLayout.Len() - 1
+		if relX < 0 {
+			relX = 0
 		}
-		if pos.X < 0 {
-			pos.X = 0
+		if relX >= geo.Width {
+			relX = geo.Width - 1
 		}
-		if geo.Width > 0 && pos.X >= geo.Width {
-			pos.X = geo.Width - 1
+		// Correct mapping: combined viewport index is yOff+relY,
+		// document GlobalY is combined minus prefix (chrome lines before records).
+		// Exact formula: framebufferY = (mouseY - viewportTopMargin) + scrollOffset - prefix
+		docY := yOff + relY - prefix
+		if docY < 0 {
+			docY = 0
 		}
-		return pos
+		if docY >= m.docLayout.Len() {
+			docY = m.docLayout.Len() - 1
+		}
+		x := relX
+		if x < 0 {
+			x = 0
+		}
+		if geo.Width > 0 && x >= geo.Width {
+			x = geo.Width - 1
+		}
+		return GlobalPos{Y: docY, X: x}
 	}
 	// Fallback: physical row index mapping
 	if len(m.records) == 0 {
@@ -240,6 +257,99 @@ func (m *model) mousePosToGlobal(msg tea.MouseMsg) GlobalPos {
 	return GlobalPos{Y: yOff + relY, X: relX}
 }
 
+// mousePosToFramebufferGlobal performs O(1) direct array index lookup against
+// Framebuffer.Grid[y][x] to convert a MouseMsg to GlobalPos. It does NOT call
+// rebuildDocumentLayout(), string scans, or ANSI stripping for the X handling –
+// only geometry math plus a bounds-checked Grid access for continuation.
+// Y is derived via the viewport geometry with prefix correction to keep
+// prefix alignment exact. Exact formula: framebufferY = (mouseY - viewportTopMargin) + scrollOffset - prefix.
+func (m *model) mousePosToFramebufferGlobal(msg tea.MouseMsg) GlobalPos {
+	geo := m.viewportGeometry()
+	yOff := 0
+	if m.Ready {
+		yOff = m.docScrollOffset
+	}
+	var globalY, globalX int
+	if m.docLayout != nil && m.docLayout.Len() > 0 {
+		prefix := m.viewportContentPrefixHeight()
+		relY := msg.Y - geo.Top
+		relX := msg.X - geo.Left
+		if relY < 0 {
+			relY = 0
+		}
+		if relY >= geo.Height {
+			relY = geo.Height - 1
+		}
+		if relX < 0 {
+			relX = 0
+		}
+		if relX >= geo.Width {
+			relX = geo.Width - 1
+		}
+		// Correct mapping: combined = relY + yOff; doc GlobalY = combined - prefix
+		globalY = yOff + relY - prefix
+		globalX = relX
+		if globalY < 0 {
+			globalY = 0
+		}
+		if globalY >= m.docLayout.Len() {
+			globalY = m.docLayout.Len() - 1
+		}
+		if globalX < 0 {
+			globalX = 0
+		}
+		if geo.Width > 0 && globalX >= geo.Width {
+			globalX = geo.Width - 1
+		}
+	} else {
+		relY := msg.Y - geo.Top
+		relX := msg.X - geo.Left
+		if relY < 0 {
+			relY = 0
+		}
+		if relY >= geo.Height {
+			relY = geo.Height - 1
+		}
+		if relX < 0 {
+			relX = 0
+		}
+		if relX >= geo.Width {
+			relX = geo.Width - 1
+		}
+		globalY = yOff + relY
+		globalX = relX
+		if m.docLayout != nil && m.docLayout.Len() > 0 {
+			if globalY < 0 {
+				globalY = 0
+			}
+			if globalY >= m.docLayout.Len() {
+				globalY = m.docLayout.Len() - 1
+			}
+		}
+	}
+	// O(1) Grid lookup to handle continuation cells for wide CJK/emoji
+	// without string scans. Also clamps X to row's visual width.
+	if m.framebuffer != nil && len(m.framebuffer.Grid) > 0 {
+		if globalY >= 0 && globalY < len(m.framebuffer.Grid) {
+			row := m.framebuffer.Grid[globalY]
+			if len(row) > 0 {
+				if globalX >= len(row) {
+					globalX = len(row) - 1
+				}
+				if globalX >= 0 && globalX < len(row) && row[globalX].IsContinuation {
+					globalX--
+					if globalX < 0 {
+						globalX = 0
+					}
+				}
+			} else {
+				globalX = 0
+			}
+		}
+	}
+	return GlobalPos{Y: globalY, X: globalX}
+}
+
 // normalized returns ordered anchor/cursor so anchor <= cursor in (Y,X) tuple order.
 func (s mouseSelection) normalized() (GlobalPos, GlobalPos) {
 	a, c := s.Anchor, s.Cursor
@@ -260,11 +370,19 @@ func (s mouseSelection) normalizedSel() (selPos, selPos) {
 
 // serializeMouseSelection is the pure geometry extraction path: it extracts
 // visible text matching selected cell bounds across lines [startY : endY],
-// stripping ANSI but preserving chrome if manually dragged. It uses
-// DocumentLayout when available, falling back to legacy logical record slicing.
+// stripping ANSI but preserving chrome if manually dragged. It prefers the
+// flat Framebuffer Grid (O(1) cell iteration skipping IsPadding/IsContinuation
+// and handling IsSoftWrapped), falling back to DocumentLayout and then legacy
+// logical record slicing.
 func (m *model) serializeMouseSelection() string {
 	if !m.mouseSel.Active {
 		return ""
+	}
+	// Prefer Framebuffer O(1) extraction when rasterized (spec §3).
+	// Extraction iterates Grid cells skipping IsPadding/IsContinuation per copy.go pseudocode.
+	if m.framebuffer != nil && len(m.framebuffer.Grid) > 0 {
+		text := m.extractSelectionViaFramebuffer()
+		return ansi.Strip(text)
 	}
 	// Prefer DocumentLayout geometry
 	if m.docLayout != nil && m.docLayout.Len() > 0 {
