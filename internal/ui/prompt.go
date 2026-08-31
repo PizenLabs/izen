@@ -156,7 +156,7 @@ func (m *model) HandlePasteInput(raw string) bool {
 // performed by regex-matching plain badges and looking up the id in the
 // session store; badges with no stored raw are left unchanged.
 func (m *model) ExpandPasteTokens(text string) string {
-	if m.pasteTokens == nil || len(m.pasteTokens) == 0 {
+	if len(m.pasteTokens) == 0 {
 		return text
 	}
 	return pasteBadgeRe.ReplaceAllStringFunc(text, func(match string) string {
@@ -165,7 +165,7 @@ func (m *model) ExpandPasteTokens(text string) string {
 			return match
 		}
 		var id int
-		fmt.Sscanf(sub[1], "%d", &id)
+		_, _ = fmt.Sscanf(sub[1], "%d", &id)
 		if raw, ok := m.pasteTokens[id]; ok {
 			return raw
 		}
@@ -176,7 +176,7 @@ func (m *model) ExpandPasteTokens(text string) string {
 // ExpandPasteTokensStatic is a package-level helper for tests that operate
 // without a full model: it expands badges using the provided store map.
 func ExpandPasteTokensStatic(text string, store map[int]string) string {
-	if store == nil || len(store) == 0 {
+	if len(store) == 0 {
 		return text
 	}
 	return pasteBadgeRe.ReplaceAllStringFunc(text, func(match string) string {
@@ -185,7 +185,7 @@ func ExpandPasteTokensStatic(text string, store map[int]string) string {
 			return match
 		}
 		var id int
-		fmt.Sscanf(sub[1], "%d", &id)
+		_, _ = fmt.Sscanf(sub[1], "%d", &id)
 		if raw, ok := store[id]; ok {
 			return raw
 		}
@@ -263,8 +263,8 @@ func RenderPasteBadgesStyled(text string) string {
 			return match
 		}
 		var id, lines int
-		fmt.Sscanf(sub[1], "%d", &id)
-		fmt.Sscanf(sub[2], "%d", &lines)
+		_, _ = fmt.Sscanf(sub[1], "%d", &id)
+		_, _ = fmt.Sscanf(sub[2], "%d", &lines)
 		return FormatPasteBadge(id, lines)
 	})
 }

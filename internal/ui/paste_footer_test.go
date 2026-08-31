@@ -105,8 +105,9 @@ func TestPasteFolding_AtomicDeletion(t *testing.T) {
 	// Also test that non-foldable short text is NOT folded.
 	m.ti.SetValue("hello")
 	m.syncInputFromTI()
-	if ShouldFoldPaste("hello\nalready 2 lines only") && strings.Count("hello\nalready 2 lines only", "\n")+1 >= 3 {
-		// This would be true if 2 lines? Actually 2 lines should NOT fold.
+	// Verify non-foldable short text is NOT folded.
+	if ShouldFoldPaste("hello\nalready 2 lines only") {
+		t.Fatalf("2 lines should NOT trigger folding (threshold >=3)")
 	}
 	if ShouldFoldPaste("short\ntwo lines") {
 		t.Fatalf("2 lines should NOT trigger folding (threshold >=3)")
@@ -177,33 +178,33 @@ func TestResponsiveFooterTiers(t *testing.T) {
 	mode := "build"
 
 	tests := []struct {
-		width        int
-		shouldContain []string
+		width          int
+		shouldContain  []string
 		mustNotContain []string
-		description  string
+		description    string
 	}{
 		{
-			width: 120,
+			width:         120,
 			shouldContain: []string{modelName, "↓100", "↑50", "10%", cost, "[build]"},
-			description: "Tier1 Full >=100 contains all fields",
+			description:   "Tier1 Full >=100 contains all fields",
 		},
 		{
-			width: 85,
-			shouldContain: []string{modelName, "↓100", "↑50", "10%", cost},
+			width:          85,
+			shouldContain:  []string{modelName, "↓100", "↑50", "10%", cost},
 			mustNotContain: []string{"[build]"},
-			description:   "Tier2 Standard 70-99 contains tok+ctx+cost without mode",
+			description:    "Tier2 Standard 70-99 contains tok+ctx+cost without mode",
 		},
 		{
-			width: 55,
-			shouldContain: []string{"↓100", "↑50"},
+			width:          55,
+			shouldContain:  []string{"↓100", "↑50"},
 			mustNotContain: []string{cost, "10%"},
-			description:  "Tier3 Compact 45-69 contains short model + tok only",
+			description:    "Tier3 Compact 45-69 contains short model + tok only",
 		},
 		{
-			width: 35,
-			shouldContain: []string{"↓100", "↑50"},
+			width:          35,
+			shouldContain:  []string{"↓100", "↑50"},
 			mustNotContain: []string{cost},
-			description:  "Tier4 Minimal <45 contains only tok",
+			description:    "Tier4 Minimal <45 contains only tok",
 		},
 	}
 
