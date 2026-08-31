@@ -90,7 +90,7 @@ func TestQuietModeDropsEngineTraceAndSingleSummaryPerTurn(t *testing.T) {
 		"[autonomy decision]\n  intent: modification\n  decision: direct_response (15ms)",
 	}
 
-	var recs []record
+	recs := make([]record, 0, 1+len(traces)+1)
 	recs = append(recs, record{role: roleUser, text: "plan architecture", turnID: 1})
 	for _, tr := range traces {
 		recs = append(recs, record{role: roleActivity, text: tr, turnID: 1})
@@ -126,10 +126,11 @@ func TestTurnBoundTraceDeduplicationStreamingUpdates(t *testing.T) {
 	defer SetTraceVerbose(false)
 	SetTraceVerbose(false)
 
-	recs := []record{
+	recs := make([]record, 0, 8)
+	recs = append(recs, []record{
 		{role: roleUser, text: "create a file", turnID: 10},
 		{role: roleActivity, text: "[event] PromptAdmitted intent=mutate latency=15ms", turnID: 10},
-	}
+	}...)
 
 	dl := BuildDocumentLayout(recs, 100, "Developer")
 
