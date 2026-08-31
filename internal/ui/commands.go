@@ -70,7 +70,7 @@ var validSystemCommands = map[string]struct{}{
 	"/quit":             {},
 	"/usage":            {},
 	"/provider":         {},
-	"/model":            {},
+	"/models":           {},
 	"/objective":        {},
 	"/clear":            {},
 	"/drop":             {},
@@ -1817,7 +1817,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	// Resolve registered aliases and unambiguous prefixes to their canonical
 	// command so "/q" executes as "/quit" instead of dumping "unknown
 	// command: /q" to the output. Args are preserved for prefixed commands
-	// ("/m claude" → "/model claude"); the trailing separator is trimmed so
+	// ("/m claude" → "/models claude"); the trailing separator is trimmed so
 	// exact-match cases still fire for bare commands.
 	if resolved := resolveCommandToken(name[0]); resolved != name[0] {
 		cmd = resolved + " " + strings.Join(name[1:], " ")
@@ -1846,15 +1846,15 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  $decide <prompt>     run the intent → workspace → decision trace"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
-		m.push(roleSystem, infoStyle.Render("  /help  /usage  /model  /objective  /drop  /clear  /quit  /copy"))
+		m.push(roleSystem, infoStyle.Render("  /help  /usage  /models  /objective  /drop  /clear  /quit  /copy"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>  /copy-mode"))
 		m.push(roleSystem, infoStyle.Render("  /copy          copy full canonical transcript to clipboard"))
 		m.push(roleSystem, infoStyle.Render("  /copy-mode     scrollable inspection mode (j/k, / search, v/y yank, wheel)"))
 		m.push(roleSystem, infoStyle.Render("  /explain-decision  inspect why a tech stack was chosen"))
 		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
 		m.push(roleSystem, infoStyle.Render("  /usage           inspect token usage and provider status"))
-		m.push(roleSystem, infoStyle.Render("  /model        interactive model picker (fuzzy search)"))
-		m.push(roleSystem, infoStyle.Render("  /model <name> switch active model directly (e.g. /model claude-3-5-sonnet)"))
+		m.push(roleSystem, infoStyle.Render("  /models      interactive model picker (fuzzy search)"))
+		m.push(roleSystem, infoStyle.Render("  /models <name> switch active model directly (e.g. /models claude-3-5-sonnet)"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("ask sub-commands ($)"))
@@ -1904,14 +1904,14 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		if len(parts) >= 2 {
 			// Still allow provider switching via /provider for backwards
 			// compatibility, but show a deprecation hint.
-			m.push(roleSystem, mutedStyle.Render("💡 Tip: Use /model to pick models across any provider. Provider switching happens automatically."))
+			m.push(roleSystem, mutedStyle.Render("💡 Tip: Use /models to pick models across any provider. Provider switching happens automatically."))
 			return m.switchProvider(parts[1])
 		}
 		// Bare /provider: redirect to /usage
-		m.push(roleSystem, mutedStyle.Render("💡 Tip: Provider switching is automatic! Use /model to pick any model, or /usage to inspect provider API keys."))
+		m.push(roleSystem, mutedStyle.Render("💡 Tip: Provider switching is automatic! Use /models to pick any model, or /usage to inspect provider API keys."))
 		return m.runUsageCmd()
 
-	case cmd == "/model":
+	case cmd == "/models":
 		m.showModelPicker = true
 		m.modelPicker = NewModelPickerModal()
 		m.modelPicker.SetSize(m.width, m.height)
@@ -1926,10 +1926,10 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 		return m.modelPicker.LoadModels(providers)
 
-	case strings.HasPrefix(cmd, "/model "):
-		modelArg := strings.TrimSpace(strings.TrimPrefix(cmd, "/model"))
+	case strings.HasPrefix(cmd, "/models "):
+		modelArg := strings.TrimSpace(strings.TrimPrefix(cmd, "/models"))
 		if modelArg == "" {
-			m.push(roleSystem, infoStyle.Render("usage: /model <model_name>  — switch active model directly"))
+			m.push(roleSystem, infoStyle.Render("usage: /models <model_name>  — switch active model directly"))
 			return nil
 		}
 		return m.switchModelDirect(modelArg)
@@ -3943,7 +3943,7 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 			// binding (m.routeModel("investigate")), and base URL context that
 			// lets /ask execute successfully.
 			if m.provider == nil {
-				m.push(roleError, "[System Error] No AI provider is configured. Run /model to select one.")
+				m.push(roleError, "[System Error] No AI provider is configured. Run /models to select one.")
 				m.refreshViewportContent()
 				m.gotoBottomIfAllowed()
 				return agentDoneMsg{}

@@ -1332,7 +1332,7 @@ type model struct {
 	// Model Picker Modal
 	showModelPicker bool
 	modelPicker     *ModelPickerModal
-	sessionModel    string // user-selected model override via /model
+	sessionModel    string // user-selected model override via /models
 
 	// Foldable execution logs
 	logStore *LogStore
@@ -1642,7 +1642,7 @@ func (m *model) routeModel(mode string) string {
 
 // syncPipelineTiers re-pins the layered pipeline router's per-intent models to
 // the current configuration. It MUST be called whenever the active provider or
-// model tier changes at runtime (provider switch, /model selection, config
+// model tier changes at runtime (provider switch, /models selection, config
 // reload) so intent routing never serves a model that was pinned to a provider
 // which is no longer active — an Ollama model leaking into an OpenRouter
 // request fails with HTTP 400 "not a valid model ID".

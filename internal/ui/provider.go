@@ -76,7 +76,7 @@ func (m *model) runUsageCmd() tea.Cmd {
 		m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  %s %s — %s%s", status, name, detail, marker)))
 	}
 	m.push(roleSystem, "")
-	m.push(roleSystem, mutedStyle.Render("  Provider switching is automatic via /model."))
+	m.push(roleSystem, mutedStyle.Render("  Provider switching is automatic via /models."))
 
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
