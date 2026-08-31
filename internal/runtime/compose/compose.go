@@ -137,6 +137,11 @@ type Application struct {
 	// approves/rejects via this boundary — it never calls a provider or a
 	// PatchManager directly on those paths.
 	Executor *execution.RuntimeExecutor
+	// Sessions is the dual-slot session authority (crash-resilient
+	// active-pointer + two-tier locking + INV-SESSION-14 recovery). It is the
+	// single owner of the process session record; Inputs.Session mirrors its
+	// active session. Wired whenever a workspace root is provided.
+	Sessions *session.Manager
 	// Gateway is the unified IntentGateway: the single entry point every user
 	// action (bare text, $prompt, $hot) crosses to produce an ExecuteRequest
 	// with an unconditional Strategy.Select profile. The UI never routes by
@@ -317,6 +322,15 @@ func (a *Application) Session() *session.Session {
 	return a.Inputs.Session
 }
 
+// SessionManager returns the dual-slot session authority wired by Wire. It is
+// nil only when no workspace root was provided (harness mode).
+func (a *Application) SessionManager() *session.Manager {
+	if a == nil {
+		return nil
+	}
+	return a.Sessions
+}
+
 // Manager returns the AI provider manager the engine tree was wired from.
 // Never nil after Wire.
 func (a *Application) Manager() *ai.Manager {
@@ -367,14 +381,39 @@ func Wire(opts ...Option) (*Application, error) {
 	}
 
 	// ── PROCESS BOOTSTRAP: session + AI provider manager ──────────────
-	// The session is loaded once per process; the composition root may inject
-	// an explicit session (e.g. the legacy rollback path) via WithSession.
+	// When a workspace root is wired, the dual-slot SessionManager is the
+	// single session authority: it recovers the active pointer (crash
+	// protocol), loads the active session through the INV-SESSION-14 ladder,
+	// and mirrors it into Inputs.Session so the whole engine tree and the
+	// presentation layer share the manager's canonical record. The boundary
+	// hook drains the RuntimeExecutor at every session switch — execution
+	// state never leaves that single authority. Without a root (harness
+	// mode), the legacy single-file session path is kept.
 	if a.Inputs.Session == nil {
-		sess, err := session.Load()
-		if err != nil {
-			sess = session.New()
+		if a.Inputs.Root != "" {
+			sm := session.NewManager(a.Inputs.Root,
+				session.WithBoundaryHook(session.BoundaryHookFunc(func(ctx context.Context, prev, next session.SlotID) error {
+					if a.Executor == nil {
+						return nil
+					}
+					errs := a.Executor.RejectAllPending(ctx, "session boundary: active "+string(prev)+" -> "+string(next))
+					if len(errs) > 0 {
+						return fmt.Errorf("session boundary drain: %w", errs[0])
+					}
+					return nil
+				})))
+			if err := sm.Open(context.Background()); err != nil {
+				return nil, fmt.Errorf("wire: open session manager: %w", err)
+			}
+			a.Sessions = sm
+			a.Inputs.Session = sm.Session()
+		} else {
+			sess, err := session.Load()
+			if err != nil {
+				sess = session.New()
+			}
+			a.Inputs.Session = sess
 		}
-		a.Inputs.Session = sess
 	}
 	if a.Inputs.Manager == nil {
 		mgr := ai.NewManager()

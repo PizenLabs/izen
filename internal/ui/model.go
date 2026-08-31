@@ -694,13 +694,18 @@ type TaskFinishedMsg struct{}
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 type model struct {
-	cfg      *config.Config
-	sess     *session.Session
-	provider ai.Provider
-	mgr      *ai.Manager
-	resolver *modes.Resolver
-	gitEng   *git.Engine
-	graph    *lea.FileGraph
+	cfg  *config.Config
+	sess *session.Session
+	// sessionManager is the dual-slot session authority wired by the
+	// composition root. It owns /new and /session resume; sess mirrors its
+	// active session. Nil in harnesses that never construct a model via
+	// NewProgramWithApp with a wired manager.
+	sessionManager *session.Manager
+	provider       ai.Provider
+	mgr            *ai.Manager
+	resolver       *modes.Resolver
+	gitEng         *git.Engine
+	graph          *lea.FileGraph
 	// leaEng is the Phase 3 Lea structural engine (canonical index for
 	// architecture, call chains, routes and symbol lookups). It backs the
 	// context planner's graph source and the /arch analysis. Nil only in

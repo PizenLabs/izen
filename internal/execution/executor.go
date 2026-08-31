@@ -1553,6 +1553,21 @@ func (x *RuntimeExecutor) PendingPatchIDs() []string {
 	return out
 }
 
+// RejectAllPending deterministically rejects every approval-held mutation. It
+// is the session-boundary drain: /new and /session resume cross the execution
+// lifecycle through this single RuntimeExecutor authority — never through a
+// second state engine. It returns a per-patch error slice; the drain is
+// best-effort cleanup and must never fail a session switch.
+func (x *RuntimeExecutor) RejectAllPending(ctx context.Context, reason string) []error {
+	var errs []error
+	for _, id := range x.PendingPatchIDs() {
+		if _, err := x.Reject(ctx, id, reason); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
 // ── internals ──────────────────────────────────────────────────────────────
 
 func (x *RuntimeExecutor) selectStrategy(_ context.Context, req ExecuteRequest) (strategy.ExecutionStrategyProfile, error) {

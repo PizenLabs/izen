@@ -20,6 +20,10 @@ type Message struct {
 
 // Session represents a user session.
 type Session struct {
+	// SessionID is a stable identity for the session record. It is assigned at
+	// creation and preserved across persists; a recovered session re-derives
+	// it from the raw-history/checkpoint ladder when the record is lost.
+	SessionID          string            `json:"session_id,omitempty"`
 	Objective          string            `json:"objective"`
 	ObjectiveState     *domain.Objective `json:"objective_state,omitempty"`
 	Mode               modes.Mode        `json:"mode"`
@@ -40,6 +44,13 @@ type Session struct {
 	// single durable source of truth across mode transitions.
 	ContextLedger *ContextLedger `json:"context_ledger,omitempty"`
 	path          string
+	// slotDir is the session-manager slot directory this session is bound to.
+	// When non-empty, Save() additionally refreshes the slot's compact context
+	// so the INV-SESSION-14 ladder stays current. Never serialized.
+	slotDir string
+	// recovered marks a Session reconstructed by the INV-SESSION-14 raw-history
+	// rebuild ladder. It is never serialized.
+	recovered bool
 }
 
 // New creates a new session.
@@ -100,7 +111,10 @@ func Load() (*Session, error) {
 	return &s, nil
 }
 
-// Save saves the session to disk.
+// Save saves the session to disk atomically. When the session is bound to a
+// session-manager slot (path under .izen/sessions/<slot>/), the derived
+// compact context is refreshed alongside so the INV-SESSION-14 ladder always
+// has a current fast-path fallback.
 func (s *Session) Save() error {
 	if s.path == "" {
 		s.path = filepath.Join(".izen", "session.json")
@@ -108,17 +122,22 @@ func (s *Session) Save() error {
 
 	s.UpdatedAt = time.Now()
 
-	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
+	if err := writeFileAtomic(s.path, data); err != nil {
+		return err
+	}
 
-	return os.WriteFile(s.path, data, 0644)
+	// Refresh the derived compact context when slot-bound.
+	if s.slotDir != "" {
+		ccData, ccErr := json.MarshalIndent(deriveCompactContext(s), "", "  ")
+		if ccErr == nil {
+			_ = writeFileAtomic(filepath.Join(s.slotDir, compactContextFileName), ccData)
+		}
+	}
+	return nil
 }
 
 // Reload re-reads the session state from disk, overwriting all in-memory

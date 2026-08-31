@@ -75,6 +75,7 @@ var validSystemCommands = map[string]struct{}{
 	"/clear":            {},
 	"/drop":             {},
 	"/new":              {},
+	"/session":          {},
 	"/undo":             {},
 	"/commit":           {},
 	"/checkpoint":       {},
@@ -2021,15 +2022,15 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return nil
 
 	case cmd == "/new":
-		// ── /NEW = FUTURE session boundary ─────────────────────────
-		// Reserved semantic: "Start somewhere NEW" — a new session, new
-		// conversation context, reset transient state, fresh presentation
-		// (workspace may remain the same; the old session becomes
-		// recoverable/history). Deliberately NOT implemented in this phase;
-		// /clear is NOT /new (it keeps the session, context and history).
-		// See lifecycle.go for the full command contract.
-		m.push(roleSystem, infoStyle.Render("/new is the future session boundary — not yet implemented. Use /clear to clear the view (keeps session & context) or /drop to discard a pending action."))
-		return nil
+		// ── /NEW = SESSION BOUNDARY (Session Management System) ─────────
+		// Start a NEW session: the current session is persisted to its slot
+		// and becomes dormant/resumable via /session resume A|B; the active
+		// pointer is atomically switched (rename) to a fresh session. All
+		// execution state drains through the single RuntimeExecutor boundary.
+		return m.runNewSessionCmd()
+
+	case cmd == "/session", strings.HasPrefix(cmd, "/session "):
+		return m.runSessionCmd(cmd)
 
 	case strings.HasPrefix(cmd, "/undo"):
 		return m.runUndoCmd(cmd)
