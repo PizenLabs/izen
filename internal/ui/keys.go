@@ -1177,11 +1177,17 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		if cmd == nil && !shimmerAlreadyActive && m.shimmerActive {
 			m.stopShimmer()
 		}
-		// ── APPLICATION-LAYER COMMAND RECORD ──────────────────────
-		// The same submission is routed through the Runtime facade as a
-		// SubmitPromptCmd so the canonical command/event contract observes
-		// it. Nil-safe when no runtime is wired.
-		cmd = tea.Batch(cmd, m.runtimeSubmitCmd(userInput))
+		// ── SLASH COMMAND FALLTHROUGH GUARD (strict input router rule) ──
+		// Slash-prefixed input is owned EXCLUSIVELY by the Slash Command
+		// surface (handleInput/handleCommand). It must NEVER cross the
+		// Application-layer runtime as a submit_prompt: an unknown or
+		// malformed slash command already terminated the turn with its UI
+		// error, and batching a SubmitPromptCmd here would degrade it into an
+		// intent=ask classification plus background preflight workers. Only
+		// non-slash input is submitted as a prompt.
+		if !isSlashInput(userInput) {
+			cmd = tea.Batch(cmd, m.runtimeSubmitCmd(userInput))
+		}
 		// ── INSTANT ANIMATION AT T=0MS ────────────────────────────
 		// Dispatch the shimmer + smooth ticks alongside the submission so
 		// the loading dock animates immediately, regardless of what the

@@ -32,48 +32,48 @@ func TestNarrativeTransitionDerivation(t *testing.T) {
 	}{
 		{
 			name: "strategy.selected (no human step — deterministic plumbing)",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewStrategySelected("r", "targeted_mutation", true, "reason")},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x", ""), events.NewStrategySelected("r", "targeted_mutation", true, "reason")},
 			want: "",
 		},
 		{
 			name: "target.resolved",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewTargetResolved("r", "index.html", true, "strategy")},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x", ""), events.NewTargetResolved("r", "index.html", true, "strategy")},
 			want: "Reading index.html",
 		},
 		{
 			name: "context.prepared",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewContextPrepared("r", []string{"user_intent"}, 40)},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x", ""), events.NewContextPrepared("r", []string{"user_intent"}, 40)},
 			want: "Gathering context",
 		},
 		{
 			name: "context.prepared zero channels (no context gathered → no step)",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewContextPrepared("r", nil, 0)},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x", ""), events.NewContextPrepared("r", nil, 0)},
 			want: "",
 		},
 		{
 			name: "provider.invoked",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewModelInvoked("r", "mock", 0, 0)},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x", ""), events.NewModelInvoked("r", "mock", 0, 0)},
 			want: "Analyzing",
 		},
 		{
 			name: "provider.waiting",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewProviderWaiting("r", "mock")},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x", ""), events.NewProviderWaiting("r", "mock")},
 			want: "Waiting for model",
 		},
 		{
 			name: "provider.first_token",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewProviderFirstToken("r", "mock", time.Second)},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x", ""), events.NewProviderFirstToken("r", "mock", time.Second)},
 			want: "Model responding",
 		},
 		{
 			name: "provider.response is machine-only (never re-adds Analyzing)",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewModelInvoked("r", "mock", 0, 0), events.NewProviderResponse("r", "mock", 5, 7)},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x", ""), events.NewModelInvoked("r", "mock", 0, 0), events.NewProviderResponse("r", "mock", 5, 7)},
 			want: "Analyzing",
 		},
 		{
 			name: "model lifecycle dedups to one Analyzing",
 			evs: []events.DomainEvent{
-				events.NewExecutionStarted("r", "build", "x"),
+				events.NewExecutionStarted("r", "build", "x", ""),
 				events.NewModelInvoked("r", "mock", 0, 0),
 				events.NewProviderWaiting("r", "mock"),
 				events.NewProviderFirstToken("r", "mock", time.Second),
@@ -83,22 +83,22 @@ func TestNarrativeTransitionDerivation(t *testing.T) {
 		},
 		{
 			name: "artifact.produced",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewArtifactProduced("r", "patch", "index.html")},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x", ""), events.NewArtifactProduced("r", "patch", "index.html")},
 			want: "Preparing result",
 		},
 		{
 			name: "verification.completed",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewVerificationCompleted("r", true, []string{"build"})},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x", ""), events.NewVerificationCompleted("r", true, []string{"build"})},
 			want: "Verified changes",
 		},
 		{
 			name: "approval.required",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewApprovalRequired("r", "index.html", "<d>")},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x", ""), events.NewApprovalRequired("r", "index.html", "<d>")},
 			want: "Waiting for approval",
 		},
 		{
 			name: "mutation.started",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x"), events.NewMutationStarted("r", []string{"index.html"})},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("r", "build", "x", ""), events.NewMutationStarted("r", []string{"index.html"})},
 			want: "Applying changes",
 		},
 	}
@@ -124,7 +124,7 @@ func TestNarrativeNoFakeStaticSteps(t *testing.T) {
 	// narrative must contain NO steps at all — nothing is claimed before the
 	// engine actually does something.
 	n := NewExecutionNarrative()
-	n.Project(events.NewExecutionStarted("r", "build", "fix index.html"))
+	n.Project(events.NewExecutionStarted("r", "build", "fix index.html", ""))
 	n.Project(events.NewStrategySelected("r", "targeted_mutation", true, "x"))
 
 	got := n.Human()
@@ -144,7 +144,7 @@ func TestNarrativeNoFakeStaticSteps(t *testing.T) {
 // ACTUAL graph state: the more transitions occur, the longer the narrative.
 func TestNarrativeChangesWithGraphState(t *testing.T) {
 	stream := []events.DomainEvent{
-		events.NewExecutionStarted("r", "build", "fix index.html"),
+		events.NewExecutionStarted("r", "build", "fix index.html", ""),
 		events.NewStrategySelected("r", "targeted_mutation", true, "x"),
 		events.NewTargetResolved("r", "index.html", true, "strategy"),
 		events.NewModelInvoked("r", "mock", 0, 0),
@@ -172,7 +172,7 @@ func TestNarrativeChangesWithGraphState(t *testing.T) {
 // yields the same narrative.
 func TestNarrativeDeterministic(t *testing.T) {
 	stream := []events.DomainEvent{
-		events.NewExecutionStarted("r", "build", "fix index.html"),
+		events.NewExecutionStarted("r", "build", "fix index.html", ""),
 		events.NewStrategySelected("r", "targeted_mutation", true, "x"),
 		events.NewTargetResolved("r", "index.html", true, "strategy"),
 		events.NewModelInvoked("r", "mock", 0, 0),
@@ -208,7 +208,7 @@ func TestNarrativeDeterministic(t *testing.T) {
 // records carry raw event types, the human records carry sentences only.
 func TestNarrativeMachineSeparated(t *testing.T) {
 	n := NewExecutionNarrative()
-	n.Project(events.NewExecutionStarted("r", "build", "x"))
+	n.Project(events.NewExecutionStarted("r", "build", "x", ""))
 	n.Project(events.NewTargetResolved("r", "index.html", true, "strategy"))
 	n.Project(events.NewExecutionFinished("r", true, "completed"))
 
@@ -246,7 +246,7 @@ func TestNarrativeTerminalSentences(t *testing.T) {
 	}
 	for _, tc := range cases {
 		n := NewExecutionNarrative()
-		n.Project(events.NewExecutionStarted("r", "", "x"))
+		n.Project(events.NewExecutionStarted("r", "", "x", ""))
 		n.Project(events.NewExecutionFinished("r", tc.success, tc.outcome))
 		if got := n.CurrentHuman(); got != tc.want {
 			t.Errorf("finished(success=%t, %s) → %q, want %q", tc.success, tc.outcome, got, tc.want)
@@ -259,7 +259,7 @@ func TestNarrativeTerminalSentences(t *testing.T) {
 // can inspect to prove the narrative is graph-derived.
 func TestNarrativeStepsCarryTransitions(t *testing.T) {
 	n := NewExecutionNarrative()
-	n.Project(events.NewExecutionStarted("r", "build", "x"))
+	n.Project(events.NewExecutionStarted("r", "build", "x", ""))
 	n.Project(events.NewStrategySelected("r", "targeted_mutation", true, "reason"))
 	n.Project(events.NewTargetResolved("r", "index.html", true, "strategy"))
 
@@ -279,7 +279,7 @@ func TestNarrativeStepsCarryTransitions(t *testing.T) {
 	// does not flag it. Verify via the projection's running frame.
 	p := NewExecutionProjection()
 	for _, ev := range []events.DomainEvent{
-		events.NewExecutionStarted("r", "build", "x"),
+		events.NewExecutionStarted("r", "build", "x", ""),
 		events.NewStrategySelected("r", "targeted_mutation", true, "reason"),
 		events.NewTargetResolved("r", "index.html", true, "strategy"),
 	} {

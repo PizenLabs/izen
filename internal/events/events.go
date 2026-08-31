@@ -375,11 +375,13 @@ type StreamUsagePayload struct {
 }
 
 // ExecutionStartedPayload opens a runtime execution. RequestID links every
-// subsequent lifecycle event of the same execution.
+// subsequent lifecycle event of the same execution. SessionID correlates the
+// execution with its originating session (INV-SESSION-10).
 type ExecutionStartedPayload struct {
 	RequestID string
 	Mode      string
 	Prompt    string
+	SessionID string
 }
 
 // StrategySelectedPayload records the deterministic strategy decision the
@@ -478,6 +480,7 @@ type ExecutionFinishedPayload struct {
 // no live pointers cross the bus.
 type ExecutionEvidencePayload struct {
 	RequestID        string
+	SessionID        string
 	ContractID       string
 	AttemptID        uint32
 	ParentContractID string
@@ -824,9 +827,11 @@ func NewStreamUsage(model string, inputTokens, outputTokens int, interrupted boo
 
 // ── Runtime execution lifecycle constructors ────────────────────────────────
 
-// NewExecutionStarted publishes the start of a runtime execution.
-func NewExecutionStarted(requestID, mode, prompt string) DomainEvent {
-	return newEvent(EventExecutionStarted, ExecutionStartedPayload{RequestID: requestID, Mode: mode, Prompt: prompt})
+// NewExecutionStarted publishes the start of a runtime execution. sessionID is
+// the originating session (INV-SESSION-10); it may be empty when no session
+// authority is wired.
+func NewExecutionStarted(requestID, mode, prompt, sessionID string) DomainEvent {
+	return newEvent(EventExecutionStarted, ExecutionStartedPayload{RequestID: requestID, Mode: mode, Prompt: prompt, SessionID: sessionID})
 }
 
 // NewStrategySelected publishes the deterministic strategy decision.

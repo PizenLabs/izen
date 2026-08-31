@@ -195,7 +195,7 @@ func TestCoalescerNeverDropsAuthoritativeEvents(t *testing.T) {
 	co, send := newTestCoalescer(sched)
 
 	authoritative := []events.DomainEvent{
-		events.NewExecutionStarted("req-1", "autonomy", "do the thing"),
+		events.NewExecutionStarted("req-1", "autonomy", "do the thing", ""),
 		events.NewExecutionFinished("req-1", true, "changed"),
 		events.NewMutationStarted("req-1", []string{"a.txt"}),
 		events.NewProviderUsageUpdate("req-1", "model", 10, 5, 2),

@@ -152,7 +152,7 @@ func TestProjectSlashSuggestionsAskHidesMutation(t *testing.T) {
 			t.Errorf("ask '/' menu must not show %s", forbidden)
 		}
 	}
-	for _, present := range []string{"/ask", "/plan", "/build", "/investigate", "/review", "/arch", "/clear", "/drop", "/usage", "/model", "/help"} {
+	for _, present := range []string{"/ask", "/plan", "/build", "/investigate", "/review", "/arch", "/clear", "/drop", "/usage", "/models", "/help"} {
 		if !seen[present] {
 			got := make([]string, 0, len(seen))
 			for k := range seen {
@@ -304,7 +304,7 @@ func TestUpdateSuggestionsSlashAskHidesMutation(t *testing.T) {
 			t.Errorf("ask '/' menu must not show %s", forbidden)
 		}
 	}
-	for _, present := range []string{"/arch", "/clear", "/usage", "/model", "/help"} {
+	for _, present := range []string{"/arch", "/clear", "/usage", "/models", "/help"} {
 		if !seen[present] {
 			t.Errorf("ask '/' menu must show %s", present)
 		}

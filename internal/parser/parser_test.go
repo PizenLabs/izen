@@ -242,6 +242,49 @@ func TestParseGlobalCommandDeduplication(t *testing.T) {
 	}
 }
 
+// TestParseNewAndSessionCommands verifies the Session Architecture control
+// surface (SESSION.md §9/§10) is FIRST-CLASS in the Command AST: /new and
+// /session resolve as top-level global command routes, and /session subcommand
+// arguments survive as the intent goal — never "parser: unknown command".
+func TestParseNewAndSessionCommands(t *testing.T) {
+	// /new is a registered top-level route.
+	ast := parseOK(t, "/new")
+	if len(ast.GlobalCommands) != 1 || ast.GlobalCommands[0].Name != "new" {
+		t.Errorf("Parse(/new) GlobalCommands = %+v, want [/new]", ast.GlobalCommands)
+	}
+
+	// /session with subcommand arguments: the global command is resolved and
+	// the arguments are preserved as the goal (the UI routes the full line to
+	// the session handler).
+	ast = parseOK(t, "/session resume A")
+	if len(ast.GlobalCommands) != 1 || ast.GlobalCommands[0].Name != "session" {
+		t.Errorf("Parse(/session resume A) GlobalCommands = %+v, want [/session]", ast.GlobalCommands)
+	}
+	if ast.Goal != "resume A" {
+		t.Errorf("Parse(/session resume A) Goal = %q, want %q", ast.Goal, "resume A")
+	}
+
+	// Unambiguous prefix: /n resolves to /new, /s resolves to /session.
+	if got := parseOK(t, "/n"); len(got.GlobalCommands) != 1 || got.GlobalCommands[0].Name != "new" {
+		t.Errorf("Parse(/n) GlobalCommands = %+v, want [/new]", got.GlobalCommands)
+	}
+	if got := parseOK(t, "/s list"); len(got.GlobalCommands) != 1 || got.GlobalCommands[0].Name != "session" {
+		t.Errorf("Parse(/s list) GlobalCommands = %+v, want [/session]", got.GlobalCommands)
+	}
+}
+
+// TestParseNewAllowedInReadOnlyWorkspace verifies /new is available in the
+// read-only ask workspace (a session-boundary command, not a mutation).
+func TestParseNewAllowedInReadOnlyWorkspace(t *testing.T) {
+	ast := parseOK(t, "/ask /new")
+	if ast.Workspace != command.WorkspaceAsk {
+		t.Errorf("Workspace = %v, want ask", ast.Workspace)
+	}
+	if len(ast.GlobalCommands) != 1 || ast.GlobalCommands[0].Name != "new" {
+		t.Errorf("GlobalCommands = %+v, want [/new]", ast.GlobalCommands)
+	}
+}
+
 // TestParseGlobalCommandCanonicalString verifies global commands render in the
 // canonical interaction-language form.
 func TestParseGlobalCommandCanonicalString(t *testing.T) {

@@ -1,8 +1,10 @@
 package ui
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -402,25 +404,114 @@ func TestDropCancelsActiveOperation(t *testing.T) {
 	}
 }
 
-// TestNewIsFutureBoundaryNotClear pins that /new is a reserved future session
-// boundary, is NOT a visual clear, and does NOT create anything.
-func TestNewIsFutureBoundaryNotClear(t *testing.T) {
+// TestNewWithoutManagerRefusesCleanly pins that /new on a model with no wired
+// SessionManager refuses cleanly (no panic, no session churn).
+func TestNewWithoutManagerRefusesCleanly(t *testing.T) {
 	m := clearTestModel()
-	beforeRecords := len(m.records)
 	sessBefore := m.sess
 
 	m.handleCommand("/new")
 
 	if m.sess != sessBefore {
-		t.Fatal("/new must not create or replace a session in this phase")
+		t.Fatal("/new must not create or replace a session when no session manager is wired")
 	}
-	// /new is a future boundary — it must not wipe the conversation records.
-	if len(m.records) < beforeRecords {
-		t.Error("/new must not clear the visible records (it is a future boundary, not /clear)")
-	}
-	// /new must not seal the activity surface.
 	if m.activitySurfaceSealed {
 		t.Error("/new must not seal the activity surface")
+	}
+}
+
+// TestNewWithManagerSwitchesSession is the implemented /new session boundary: a
+// wired SessionManager persists the current session, creates a fresh one, and
+// atomically switches the active pointer. The model must adopt the fresh
+// session and reset the transient presentation.
+func TestNewWithManagerSwitchesSession(t *testing.T) {
+	root := t.TempDir()
+	sm := session.NewManager(root, session.WithLockConfig(session.LockConfig{Timeout: 2 * time.Second, Backoff: 5 * time.Millisecond}))
+	if err := sm.Open(context.Background()); err != nil {
+		t.Fatalf("open session manager: %v", err)
+	}
+	t.Cleanup(func() { _ = sm.Close() })
+	sm.Session().Objective = "seed"
+
+	m := clearTestModel()
+	m.sessionManager = sm
+	m.sess = sm.Session()
+	// clearTestModel deliberately sets streaming=true to model a stale stream
+	// /clear must erase; a session boundary requires a non-busy model.
+	m.streaming = false
+	m.agentRunning = false
+	sessBefore := m.sess
+
+	m.handleCommand("/new")
+
+	if m.sess == sessBefore {
+		t.Fatal("/new must switch the active session when a session manager is wired")
+	}
+	if sm.Active() != session.SlotB {
+		t.Errorf("manager active slot = %q, want B after /new", sm.Active())
+	}
+	if m.sess.Objective != "" {
+		t.Errorf("fresh session objective = %q, want empty", m.sess.Objective)
+	}
+	// The previous session must be preserved (dormant, resumable).
+	if _, err := sm.ResumeSession(context.Background(), session.SlotA); err != nil {
+		t.Errorf("previous session not resumable after /new: %v", err)
+	}
+}
+
+// TestSessionResumeSwitchesSlot pins the `/session resume <slot>` handshake:
+// the model adopts the target session, the manager pointer switches, and the
+// dormant slot remains resumable.
+func TestSessionResumeSwitchesSlot(t *testing.T) {
+	root := t.TempDir()
+	sm := session.NewManager(root, session.WithLockConfig(session.LockConfig{Timeout: 2 * time.Second, Backoff: 5 * time.Millisecond}))
+	if err := sm.Open(context.Background()); err != nil {
+		t.Fatalf("open session manager: %v", err)
+	}
+	t.Cleanup(func() { _ = sm.Close() })
+	sm.Session().Objective = "objective-A"
+	if err := sm.Persist(context.Background()); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	if _, err := sm.NewSession(context.Background()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	sm.Session().Objective = "objective-B"
+	if err := sm.Persist(context.Background()); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+
+	m := clearTestModel()
+	m.sessionManager = sm
+	m.sess = sm.Session() // active: B with objective-B
+	m.streaming = false
+	m.agentRunning = false
+
+	// /session list must render both slots.
+	m.runSessionCmd("/session")
+	foundList := false
+	for _, r := range m.records {
+		if roleSystem == r.role && strings.Contains(r.text, "slot A") && strings.Contains(r.text, "slot B") {
+			foundList = true
+		}
+	}
+	if !foundList {
+		t.Error("/session list must project both slots")
+	}
+
+	// Resume A.
+	m.runSessionResumeCmd(session.SlotA)
+	if sm.Active() != session.SlotA {
+		t.Errorf("manager active = %q, want A", sm.Active())
+	}
+	if m.sess.Objective != "objective-A" {
+		t.Errorf("resumed session objective = %q, want objective-A", m.sess.Objective)
+	}
+
+	// Resuming an unknown slot must not disturb the active session.
+	m.runSessionResumeCmd(session.SlotID("C"))
+	if sm.Active() != session.SlotA {
+		t.Errorf("active after failed resume = %q, want A (INV-SESSION-11)", sm.Active())
 	}
 }
 

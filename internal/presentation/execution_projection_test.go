@@ -39,7 +39,7 @@ func runProjection(evs ...events.DomainEvent) *ExecutionProjection {
 // meaningful human progress appears when the runtime touches a target).
 func TestReducerHumanNarrative(t *testing.T) {
 	p := runProjection(
-		events.NewExecutionStarted("r1", "build", "fix index.html"),
+		events.NewExecutionStarted("r1", "build", "fix index.html", ""),
 		events.NewStrategySelected("r1", "targeted_mutation", true, "explicit target"),
 		events.NewTargetResolved("r1", "index.html", true, "strategy"),
 		events.NewContextPrepared("r1", []string{"user_intent", "target_content"}, 40),
@@ -88,7 +88,7 @@ func TestReducerHumanNarrative(t *testing.T) {
 // token usage, duration, and artifacts.
 func TestReducerAccumulatesDetails(t *testing.T) {
 	p := runProjection(
-		events.NewExecutionStarted("r1", "build", "fix index.html"),
+		events.NewExecutionStarted("r1", "build", "fix index.html", ""),
 		events.NewStrategySelected("r1", "targeted_mutation", true, "explicit target"),
 		events.NewContextPrepared("r1", []string{"user_intent", "target_content"}, 40),
 		events.NewModelInvoked("r1", "mock", 0, 0),
@@ -123,7 +123,7 @@ func TestReducerAccumulatesDetails(t *testing.T) {
 // completion).
 func TestReducerDetailsSurviveTerminal(t *testing.T) {
 	p := runProjection(
-		events.NewExecutionStarted("r1", "build", "fix index.html"),
+		events.NewExecutionStarted("r1", "build", "fix index.html", ""),
 		events.NewStrategySelected("r1", "targeted_mutation", true, "explicit target"),
 		events.NewModelInvoked("r1", "mock", 0, 0),
 		events.NewProviderResponse("r1", "mock", 12, 6),
@@ -139,7 +139,7 @@ func TestReducerDetailsSurviveTerminal(t *testing.T) {
 // canonical machine event is surfaced in order.
 func TestReducerDebugProjection(t *testing.T) {
 	p := runProjection(
-		events.NewExecutionStarted("r2", "build", "fix index.html"),
+		events.NewExecutionStarted("r2", "build", "fix index.html", ""),
 		events.NewStrategySelected("r2", "targeted_mutation", true, "explicit target"),
 		events.NewContextPrepared("r2", []string{"user_intent", "target_content"}, 40),
 		events.NewModelInvoked("r2", "mock", 0, 0),
@@ -175,23 +175,23 @@ func TestReducerTerminalEventAlwaysTransitions(t *testing.T) {
 	}{
 		{
 			name: "success finished",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("a", "", "x"), events.NewExecutionFinished("a", true, "completed")},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("a", "", "x", ""), events.NewExecutionFinished("a", true, "completed")},
 			want: PhaseCompleted,
 		},
 		{
 			name: "failure finished",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("b", "", "x"), events.NewExecutionFinished("b", false, "failed")},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("b", "", "x", ""), events.NewExecutionFinished("b", false, "failed")},
 			want: PhaseFailed,
 		},
 		{
 			name: "cancelled finished",
-			evs:  []events.DomainEvent{events.NewExecutionStarted("c", "", "x"), events.NewExecutionFinished("c", false, "cancelled")},
+			evs:  []events.DomainEvent{events.NewExecutionStarted("c", "", "x", ""), events.NewExecutionFinished("c", false, "cancelled")},
 			want: PhaseCompleted,
 		},
 		{
 			name: "failed event while running",
 			evs: []events.DomainEvent{
-				events.NewExecutionStarted("d", "", "x"),
+				events.NewExecutionStarted("d", "", "x", ""),
 				events.NewExecutionFailed(events.FailureRecoverable, errors.New("boom"), "executor.model"),
 			},
 			want: PhaseFailed,
@@ -199,7 +199,7 @@ func TestReducerTerminalEventAlwaysTransitions(t *testing.T) {
 		{
 			name: "failed then finished",
 			evs: []events.DomainEvent{
-				events.NewExecutionStarted("e", "", "x"),
+				events.NewExecutionStarted("e", "", "x", ""),
 				events.NewExecutionFailed(events.FailureRecoverable, errors.New("boom"), "executor.model"),
 				events.NewExecutionFinished("e", false, "patch_failed"),
 			},
@@ -236,7 +236,7 @@ func TestReducerNoImpossibleStates(t *testing.T) {
 	// Artifact without any invocation is impossible: the reducer must not
 	// fabricate it into the human narrative from the raw payload alone.
 	p := runProjection(
-		events.NewExecutionStarted("r3", "", "x"),
+		events.NewExecutionStarted("r3", "", "x", ""),
 		events.NewArtifactProduced("r3", "patch", "index.html"),
 	)
 	// The reducer records what the runtime emitted — but a lone artifact event
@@ -250,7 +250,7 @@ func TestReducerNoImpossibleStates(t *testing.T) {
 
 	// A verification without a mutation must not fabricate "✓ Applied".
 	p2 := runProjection(
-		events.NewExecutionStarted("r4", "", "x"),
+		events.NewExecutionStarted("r4", "", "x", ""),
 		events.NewVerificationCompleted("r4", true, []string{"build"}),
 	)
 	for _, line := range p2.HumanTimeline() {
@@ -262,7 +262,7 @@ func TestReducerNoImpossibleStates(t *testing.T) {
 	// After a terminal phase, a stray running event for the same request must
 	// not resurrect a running step.
 	p3 := runProjection(
-		events.NewExecutionStarted("r5", "", "x"),
+		events.NewExecutionStarted("r5", "", "x", ""),
 		events.NewExecutionFinished("r5", true, "completed"),
 		events.NewArtifactProduced("r5", "patch", "index.html"),
 	)
@@ -278,11 +278,11 @@ func TestReducerNoImpossibleStates(t *testing.T) {
 // request) resets the projection — a new execution is a clean slate.
 func TestReducerResetOnNewExecution(t *testing.T) {
 	p := runProjection(
-		events.NewExecutionStarted("old", "", "x"),
+		events.NewExecutionStarted("old", "", "x", ""),
 		events.NewTargetResolved("old", "a.go", true, "strategy"),
 		events.NewExecutionFinished("old", true, "completed"),
 		// A brand-new execution.
-		events.NewExecutionStarted("new", "", "hi"),
+		events.NewExecutionStarted("new", "", "hi", ""),
 	)
 	st := p.State()
 	if st.RequestID != "new" {
@@ -303,7 +303,7 @@ func TestReducerResetOnNewExecution(t *testing.T) {
 // execution are ignored once a request is bound.
 func TestReducerStaleRequestIgnored(t *testing.T) {
 	p := runProjection(
-		events.NewExecutionStarted("r6", "", "x"),
+		events.NewExecutionStarted("r6", "", "x", ""),
 		events.NewTargetResolved("other", "ghost.go", true, "strategy"),
 		events.NewExecutionFinished("other", true, "completed"),
 	)
@@ -338,7 +338,7 @@ func TestReducerBeginHasNoFabricatedState(t *testing.T) {
 	}
 	// The projection activates and derives its narrative ONLY from the real
 	// event stream.
-	p.Project(events.NewExecutionStarted("req-1", "build", "fix x"))
+	p.Project(events.NewExecutionStarted("req-1", "build", "fix x", ""))
 	st = p.State()
 	if st.Phase != PhaseRunning {
 		t.Fatalf("phase after execution.started = %s, want running", st.Phase)
@@ -359,7 +359,7 @@ func TestReducerBeginHasNoFabricatedState(t *testing.T) {
 // telemetry — all derived from canonical events, never inferred by the UI.
 func TestReducerProviderStreamLifecycle(t *testing.T) {
 	p := NewExecutionProjection()
-	p.Project(events.NewExecutionStarted("s1", "build", "fix x"))
+	p.Project(events.NewExecutionStarted("s1", "build", "fix x", ""))
 	p.Project(events.NewStrategySelected("s1", "targeted_mutation", true, "x"))
 	p.Project(events.NewTargetResolved("s1", "index.html", true, "strategy"))
 	p.Project(events.NewModelInvoked("s1", "mock", 0, 0))

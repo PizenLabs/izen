@@ -20,6 +20,10 @@ type Message struct {
 
 // Session represents a user session.
 type Session struct {
+	// SessionID is a stable identity for the session record. It is assigned at
+	// creation and preserved across persists; a recovered session re-derives
+	// it from the raw-history/checkpoint ladder when the record is lost.
+	SessionID          string            `json:"session_id,omitempty"`
 	Objective          string            `json:"objective"`
 	ObjectiveState     *domain.Objective `json:"objective_state,omitempty"`
 	Mode               modes.Mode        `json:"mode"`
@@ -35,11 +39,58 @@ type Session struct {
 	CreatedAt          time.Time         `json:"created_at"`
 	UpdatedAt          time.Time         `json:"updated_at"`
 	History            []Message         `json:"history,omitempty"`
+	// Title is the mutable human-readable session title (SESSION.md §7). It is
+	// distinct from the immutable SessionID. When empty, the objective is the
+	// effective title.
+	Title string `json:"title,omitempty"`
+	// Lifecycle is the explicit session lifecycle state (SESSION.md §28).
+	// Active/Dormant are pointer-derived; Archived is the explicit transition
+	// applied via /session archive. Only explicit lifecycle commands may move a
+	// session into or out of Archived.
+	Lifecycle Lifecycle `json:"lifecycle,omitempty"`
+	// WorkspaceDirtyFiles names the workspace-relative files with uncommitted
+	// changes that were present when this session became active. They are
+	// injected into the session's Context Compiler view so the model never
+	// silently overwrites work left by another session (workspace boundary
+	// guard).
+	WorkspaceDirtyFiles []string `json:"workspace_dirty_files,omitempty"`
 	// ContextLedger is the serialized handoff state, mirrored from the
 	// on-disk .izen/context_ledger.json so the session record remains the
 	// single durable source of truth across mode transitions.
 	ContextLedger *ContextLedger `json:"context_ledger,omitempty"`
 	path          string
+	// slotDir is the session-manager slot directory this session is bound to.
+	// When non-empty, Save() additionally refreshes the slot's compact context
+	// so the INV-SESSION-14 ladder stays current. Never serialized.
+	slotDir string
+	// recovered marks a Session reconstructed by the INV-SESSION-14 raw-history
+	// rebuild ladder. It is never serialized.
+	recovered bool
+}
+
+// Lifecycle is the explicit lifecycle state of a session (SESSION.md §28).
+type Lifecycle string
+
+const (
+	// LifecycleActive marks the currently attached interactive session.
+	LifecycleActive Lifecycle = "active"
+	// LifecycleDormant marks a preserved session that was switched away from.
+	LifecycleDormant Lifecycle = "dormant"
+	// LifecycleArchived marks a session that is no longer active but remains
+	// inspectable and resumable unless explicitly deleted (SESSION.md §25).
+	LifecycleArchived Lifecycle = "archived"
+)
+
+// EffectiveTitle returns the mutable session title, falling back to the
+// objective when no explicit title is set.
+func (s *Session) EffectiveTitle() string {
+	if s == nil {
+		return ""
+	}
+	if s.Title != "" {
+		return s.Title
+	}
+	return s.ObjectiveIntent()
 }
 
 // New creates a new session.
@@ -47,6 +98,7 @@ func New() *Session {
 	now := time.Now()
 	s := &Session{
 		Mode:      modes.ModeAsk,
+		Lifecycle: LifecycleActive,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -100,7 +152,10 @@ func Load() (*Session, error) {
 	return &s, nil
 }
 
-// Save saves the session to disk.
+// Save saves the session to disk atomically. When the session is bound to a
+// session-manager slot (path under .izen/sessions/<slot>/), the derived
+// compact context is refreshed alongside so the INV-SESSION-14 ladder always
+// has a current fast-path fallback.
 func (s *Session) Save() error {
 	if s.path == "" {
 		s.path = filepath.Join(".izen", "session.json")
@@ -108,17 +163,22 @@ func (s *Session) Save() error {
 
 	s.UpdatedAt = time.Now()
 
-	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
+	if err := writeFileAtomic(s.path, data); err != nil {
+		return err
+	}
 
-	return os.WriteFile(s.path, data, 0644)
+	// Refresh the derived compact context when slot-bound.
+	if s.slotDir != "" {
+		ccData, ccErr := json.MarshalIndent(deriveCompactContext(s), "", "  ")
+		if ccErr == nil {
+			_ = writeFileAtomic(filepath.Join(s.slotDir, compactContextFileName), ccData)
+		}
+	}
+	return nil
 }
 
 // Reload re-reads the session state from disk, overwriting all in-memory
@@ -315,6 +375,9 @@ func (s *Session) Purge() {
 	s.DiagnosticsSummary = ""
 	s.History = nil
 	s.ContextLedger = nil
+	s.Title = ""
+	s.Lifecycle = LifecycleActive
+	s.WorkspaceDirtyFiles = nil
 }
 
 // WriteToGlobalLog appends a log entry to the global history log file.

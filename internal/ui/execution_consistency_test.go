@@ -108,7 +108,7 @@ func TestConsistencyCase2_InspectShowsEventDerivedSteps(t *testing.T) {
 	// The runtime drives the canonical event stream (as the executor emits it
 	// for a targeted mutation).
 	rid := "case2"
-	m.handleDomainEvent(events.NewExecutionStarted(rid, "build", "inspect index.html"))
+	m.handleDomainEvent(events.NewExecutionStarted(rid, "build", "inspect index.html", ""))
 	m.handleDomainEvent(events.NewStrategySelected(rid, "targeted_mutation", true, "resolved target"))
 	m.handleDomainEvent(events.NewTargetResolved(rid, "index.html", true, "strategy"))
 	m.handleDomainEvent(events.NewContextPrepared(rid, []string{"user_intent", "target_content"}, 42))
@@ -137,7 +137,7 @@ func TestConsistencyCase2_InspectShowsEventDerivedSteps(t *testing.T) {
 	m2.execView.Begin("case2b")
 	m2.executionResolving = true
 	m2.execVisibility = presentation.VisibilityNormal
-	m2.handleDomainEvent(events.NewExecutionStarted("case2b", "build", "inspect index.html"))
+	m2.handleDomainEvent(events.NewExecutionStarted("case2b", "build", "inspect index.html", ""))
 	m2.handleDomainEvent(events.NewTargetResolved("case2b", "index.html", true, "strategy"))
 	partial := stripANSITest(m2.renderExecutionLayered())
 	if !strings.Contains(partial, "Reading index.html") {

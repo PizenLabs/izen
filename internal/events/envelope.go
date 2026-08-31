@@ -39,6 +39,11 @@ type Envelope struct {
 	Source    string     `json:"source"`
 	Kind      DomainKind `json:"kind"`
 	Payload   any        `json:"payload"`
+	// SessionID is the originating session correlation (INV-SESSION-10). It is
+	// stamped by the AuditLogger from the active session at persistence time so
+	// every line of the NDJSON audit log maps to the session that produced it.
+	// Empty when no session authority is wired (harness/headless).
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // Type derives the granular bus discriminator for the envelope:
@@ -107,6 +112,12 @@ func EnvelopeFromEvent(ev DomainEvent) (Envelope, bool) {
 	}
 	return ee.env, true
 }
+
+// NewEnvelopeID returns a fresh unique envelope identifier (16 hex chars). It
+// is the exported form of the internal generator so downstream projects
+// (e.g. the audit logger) can mint stable envelope ids when wrapping typed
+// domain events.
+func NewEnvelopeID() string { return newEnvelopeID() }
 
 // newEnvelopeID returns a random 16-hex-character identifier. On the
 // practically-impossible crypto/rand failure it falls back to a

@@ -173,6 +173,19 @@ func (m *model) dispatchASTIntent(ast *parser.IntentAST, line string) tea.Cmd {
 
 	// ── 2. GLOBAL COMMANDS ──────────────────────────────────────────────
 	for _, g := range ast.GlobalCommands {
+		// Slash Command Fallthrough Guard: a SINGLE slash command is routed
+		// with its FULL original line so subcommand arguments survive
+		// (/session resume A, /session inspect B, /session rename A <title>).
+		// Routing the bare command name would strip the arguments and silently
+		// degrade the command to its bare form. The first-field guard keeps
+		// exact-match commands (/help) unchanged when they carry trailing text.
+		if len(ast.GlobalCommands) == 1 && isSlashInput(line) {
+			fields := strings.Fields(line)
+			if len(fields) > 0 && "/"+g.Name == fields[0] {
+				cmds = append(cmds, m.handleCommand(strings.TrimSpace(line)))
+				continue
+			}
+		}
 		cmds = append(cmds, m.handleCommand("/"+g.Name))
 	}
 

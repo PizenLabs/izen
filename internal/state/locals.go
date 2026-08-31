@@ -24,6 +24,12 @@ const (
 	CheckpointsDir    = "checkpoints"
 	PatchesDir        = "patches"
 	ContextLedgerFile = "context_ledger.json"
+	// SessionsDir is the dual-slot session store owned by the session
+	// Manager. It holds the active-pointer file, the flock lockfile, and the
+	// per-slot session/context/history records. It is DURABLE — never touched
+	// by CleanupLocalState, which only clears the legacy transient
+	// session.json / context_ledger.json files.
+	SessionsDir = "sessions"
 )
 
 type RuntimeMeta struct {

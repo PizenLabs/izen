@@ -17,11 +17,13 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"strings"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/contextcompiler"
 	"github.com/PizenLabs/izen/internal/control"
 	"github.com/PizenLabs/izen/internal/core/artifact"
 	"github.com/PizenLabs/izen/internal/core/authorization"
@@ -37,6 +39,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/git"
+	"github.com/PizenLabs/izen/internal/knowledge"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/loop"
@@ -50,6 +53,7 @@ import (
 	runtimeAutonomy "github.com/PizenLabs/izen/internal/runtime/autonomy"
 	"github.com/PizenLabs/izen/internal/runtime/handlers"
 	"github.com/PizenLabs/izen/internal/session"
+	compaction "github.com/PizenLabs/izen/internal/session/compaction"
 	izentelemetry "github.com/PizenLabs/izen/internal/telemetry"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
@@ -137,6 +141,26 @@ type Application struct {
 	// approves/rejects via this boundary — it never calls a provider or a
 	// PatchManager directly on those paths.
 	Executor *execution.RuntimeExecutor
+	// Sessions is the dual-slot session authority (crash-resilient
+	// active-pointer + two-tier locking + INV-SESSION-14 recovery). It is the
+	// single owner of the process session record; Inputs.Session mirrors its
+	// active session. Wired whenever a workspace root is provided.
+	Sessions *session.Manager
+	// ── Phase 2 decoupled context subsystems ───────────────────────────
+	// Compaction is the async Session Compaction authority: it runs on a
+	// background goroutine (never the main execution loop) and sinks
+	// generational compact contexts into the session manager.
+	Compaction *compaction.Runner
+	// Knowledge is the granular Project Knowledge store (INV-SESSION-15:
+	// independently addressable chunks, never a monolithic project summary).
+	Knowledge *knowledge.Store
+	// Promotion is the Knowledge Lifecycle engine (candidate → validated →
+	// evaluated → promoted → deprecated/tombstoned).
+	Promotion *knowledge.PromotionEngine
+	// Compiler is the Context Compilation runtime engine: it decides what
+	// context is injected into the LLM prompt under a strict token budget and
+	// re-compiles only when underlying state mutates.
+	Compiler *contextcompiler.Compiler
 	// Gateway is the unified IntentGateway: the single entry point every user
 	// action (bare text, $prompt, $hot) crosses to produce an ExecuteRequest
 	// with an unconditional Strategy.Select profile. The UI never routes by
@@ -317,6 +341,49 @@ func (a *Application) Session() *session.Session {
 	return a.Inputs.Session
 }
 
+// SessionManager returns the dual-slot session authority wired by Wire. It is
+// nil only when no workspace root was provided (harness mode).
+func (a *Application) SessionManager() *session.Manager {
+	if a == nil {
+		return nil
+	}
+	return a.Sessions
+}
+
+// CompactionRunner returns the async Session Compaction runner (nil when no
+// workspace root is wired). It runs on a background goroutine; Submit never
+// blocks the main loop.
+func (a *Application) CompactionRunner() *compaction.Runner {
+	if a == nil {
+		return nil
+	}
+	return a.Compaction
+}
+
+// KnowledgeStore returns the granular Project Knowledge store (INV-SESSION-15).
+func (a *Application) KnowledgeStore() *knowledge.Store {
+	if a == nil {
+		return nil
+	}
+	return a.Knowledge
+}
+
+// PromotionEngine returns the Knowledge Lifecycle engine.
+func (a *Application) PromotionEngine() *knowledge.PromotionEngine {
+	if a == nil {
+		return nil
+	}
+	return a.Promotion
+}
+
+// ContextCompiler returns the Context Compilation runtime engine.
+func (a *Application) ContextCompiler() *contextcompiler.Compiler {
+	if a == nil {
+		return nil
+	}
+	return a.Compiler
+}
+
 // Manager returns the AI provider manager the engine tree was wired from.
 // Never nil after Wire.
 func (a *Application) Manager() *ai.Manager {
@@ -367,14 +434,40 @@ func Wire(opts ...Option) (*Application, error) {
 	}
 
 	// ── PROCESS BOOTSTRAP: session + AI provider manager ──────────────
-	// The session is loaded once per process; the composition root may inject
-	// an explicit session (e.g. the legacy rollback path) via WithSession.
+	// When a workspace root is wired, the dual-slot SessionManager is the
+	// single session authority: it recovers the active pointer (crash
+	// protocol), loads the active session through the INV-SESSION-14 ladder,
+	// and mirrors it into Inputs.Session so the whole engine tree and the
+	// presentation layer share the manager's canonical record. The boundary
+	// hook drains the RuntimeExecutor at every session switch — execution
+	// state never leaves that single authority. Without a root (harness
+	// mode), the legacy single-file session path is kept.
 	if a.Inputs.Session == nil {
-		sess, err := session.Load()
-		if err != nil {
-			sess = session.New()
+		if a.Inputs.Root != "" {
+			sm := session.NewManager(a.Inputs.Root,
+				session.WithWorkspaceGuard(newGitWorkspaceGuard(func() *git.Engine { return a.Git })),
+				session.WithBoundaryHook(session.BoundaryHookFunc(func(ctx context.Context, prev, next session.SlotID) error {
+					if a.Executor == nil {
+						return nil
+					}
+					errs := a.Executor.RejectAllPending(ctx, "session boundary: active "+string(prev)+" -> "+string(next))
+					if len(errs) > 0 {
+						return fmt.Errorf("session boundary drain: %w", errs[0])
+					}
+					return nil
+				})))
+			if err := sm.Open(context.Background()); err != nil {
+				return nil, fmt.Errorf("wire: open session manager: %w", err)
+			}
+			a.Sessions = sm
+			a.Inputs.Session = sm.Session()
+		} else {
+			sess, err := session.Load()
+			if err != nil {
+				sess = session.New()
+			}
+			a.Inputs.Session = sess
 		}
-		a.Inputs.Session = sess
 	}
 	if a.Inputs.Manager == nil {
 		mgr := ai.NewManager()
@@ -385,6 +478,28 @@ func Wire(opts ...Option) (*Application, error) {
 	if a.Inputs.Username == "" {
 		a.Inputs.Username = resolveUsername()
 	}
+
+	// ── PHASE 2 DECOUPLED CONTEXT SUBSYSTEMS ───────────────────────────
+	// Three independent authorities with absolute separation:
+	//   Compaction  — single-session continuity (async, non-blocking).
+	//   Knowledge   — durable cross-session knowledge (granular, INV-SESSION-15).
+	//   Compiler    — LLM prompt context under a strict token budget.
+	// Each is wired independently; none shares state with the others or with
+	// the RuntimeExecutor execution engine.
+	if a.Sessions != nil {
+		runner := compaction.NewRunner(compaction.DefaultPolicy(),
+			func(ctx context.Context, j compaction.Job, cc *session.CompactContext) error {
+				if a.Sessions == nil {
+					return nil
+				}
+				return a.Sessions.SetCompactContext(ctx, j.Slot, cc)
+			})
+		runner.Start()
+		a.Compaction = runner
+	}
+	a.Knowledge = knowledge.NewStore(a.Inputs.Root)
+	a.Promotion = knowledge.NewPromotionEngine(a.Knowledge, knowledge.DefaultPolicy())
+	a.Compiler = contextcompiler.New()
 	if a.provider == nil {
 		if def, ok := a.Inputs.Manager.Default(); ok {
 			a.provider = def
@@ -412,6 +527,15 @@ func Wire(opts ...Option) (*Application, error) {
 		if err != nil {
 			return nil, fmt.Errorf("wire: audit logger: %w", err)
 		}
+		// INV-SESSION-10: stamp every persisted audit record with the active
+		// session id so mutation traces, token usage and tool invocations map
+		// strictly to their originating session.
+		logger.SetSessionResolver(func() string {
+			if a.Sessions != nil {
+				return a.Sessions.ActiveSessionID()
+			}
+			return ""
+		})
 		if err := logger.Start(); err != nil {
 			return nil, fmt.Errorf("wire: start audit logger: %w", err)
 		}
@@ -430,6 +554,14 @@ func Wire(opts ...Option) (*Application, error) {
 	// it, so approving a patch applies a REAL mutation.
 	a.Executor = execution.NewRuntimeExecutor(a.Inputs.Root, a.Inputs.Config, a.provider, a.Bus, a.Inputs.LanguageID)
 	a.Gateway = execution.NewIntentGateway(a.Inputs.Root)
+	// INV-SESSION-10: resolve the originating session for every execution at
+	// admission so the proof, terminal evidence and lifecycle events correlate
+	// with the active session — including autonomous/headless submissions.
+	if a.Sessions != nil {
+		a.Executor.SetSessionResolver(func() string {
+			return a.Sessions.ActiveSessionID()
+		})
+	}
 
 	// ── BACKGROUND PREFLIGHT + SYNC BARRIER (prompt admission invariant) ──
 	// Decouple structural discovery and budget estimation from the UI critical
@@ -671,11 +803,15 @@ func Wire(opts ...Option) (*Application, error) {
 }
 
 // Close tears down the Application: it stops the audit logger, the ledger
-// projection, the runtime presentation projection and the telemetry bridge.
-// Idempotent.
+// projection, the runtime presentation projection, the telemetry bridge and
+// the async compaction runner. Idempotent.
 func (a *Application) Close() {
 	if a == nil {
 		return
+	}
+	if a.Compaction != nil {
+		a.Compaction.Close()
+		a.Compaction = nil
 	}
 	if a.Audit != nil {
 		_ = a.Audit.Close()
@@ -759,6 +895,54 @@ func pipelineClient(p ai.Provider) *pipeline.FuncClient {
 		}
 		return resp.Content, layer3.TokenUsage{Input: resp.TokenInput, Output: resp.TokenOutput}, nil
 	})
+}
+
+// gitWorkspaceGuard is the WorkspaceGuard adapter for the composition root. It
+// reports the workspace-relative paths with uncommitted changes (git status)
+// that a session switch must surface in the target session's Context Compiler
+// view — the Session Manager never executes git itself (INV-SESSION-09).
+// resolve is called lazily because the Git engine is wired AFTER the session
+// manager in Wire; by switch time it is always set.
+type gitWorkspaceGuard struct {
+	resolve func() *git.Engine
+}
+
+func newGitWorkspaceGuard(resolve func() *git.Engine) *gitWorkspaceGuard {
+	return &gitWorkspaceGuard{resolve: resolve}
+}
+
+// DirtyFiles implements session.WorkspaceGuard. Only the workspace's own
+// changes are reported; .izen/ internal state is never surfaced as workspace
+// dirt. A missing/erroring git repo degrades to "no dirty files" so a session
+// switch can never be blocked by git absence.
+func (g *gitWorkspaceGuard) DirtyFiles(_ context.Context) ([]string, error) {
+	if g == nil || g.resolve == nil {
+		return nil, nil
+	}
+	eng := g.resolve()
+	if eng == nil {
+		return nil, nil
+	}
+	// A non-git workspace carries no uncommitted changes to guard against.
+	if !eng.IsRepo() {
+		return nil, nil
+	}
+	entries, err := eng.Status() //nolint:contextcheck // git.Engine.Status has no ctx parameter; the guard ctx is a switch-lifecycle signal
+	if err != nil {
+		return nil, err
+	}
+	var dirty []string
+	for _, e := range entries {
+		p := e.Path
+		if p == "" {
+			continue
+		}
+		if p == ".izen" || strings.HasPrefix(p, ".izen/") {
+			continue
+		}
+		dirty = append(dirty, p)
+	}
+	return dirty, nil
 }
 
 // composedCapabilityGraph is the PolicyEngine's physical-facts surface: the

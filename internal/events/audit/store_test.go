@@ -129,15 +129,17 @@ func TestAuditLoggerPersistsEnvelopes(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// Typed domain events must be filtered out; envelopes must be persisted.
+	// Typed domain events are wrapped and persisted too (the audit log is a
+	// complete, session-correlated record of the whole stream); envelopes are
+	// persisted verbatim.
 	bus.Publish(events.NewCommandReceived("/plan", "plan"))
 	bus.PublishEnvelope(events.NewEnvelope(events.DomainKindTelemetry, "telemetry.pipeline", "raw"))
 	bus.PublishEnvelope(events.NewSignalEnvelope(
 		signal.New(signal.SignalBuildHalted, "investigate", nil), "investigate"))
 
-	// Delivery is asynchronous through the bus; wait until both envelopes are
-	// accepted before teardown so the assertion is deterministic.
-	waitAccepted(t, l, 2)
+	// Delivery is asynchronous through the bus; wait until all three records
+	// are accepted before teardown so the assertion is deterministic.
+	waitAccepted(t, l, 3)
 	if l.Dropped() != 0 {
 		t.Fatalf("Dropped = %d, want 0", l.Dropped())
 	}
@@ -146,21 +148,27 @@ func TestAuditLoggerPersistsEnvelopes(t *testing.T) {
 	}
 
 	lines := readNDJSON(t, filepath.Join(dir, DefaultFileName))
-	if len(lines) != 2 {
-		t.Fatalf("expected 2 envelope lines (typed event filtered), got %d", len(lines))
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 envelope lines (typed event wrapped), got %d", len(lines))
 	}
 	var back events.Envelope
 	if err := json.Unmarshal(lines[0], &back); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if back.Kind != events.DomainKindTelemetry {
-		t.Fatalf("first line kind = %q", back.Kind)
+	if back.Kind != events.DomainKindSystem || back.Source != events.EventCommandReceived {
+		t.Fatalf("first line = kind %q source %q, want wrapped typed event", back.Kind, back.Source)
 	}
 	if err := json.Unmarshal(lines[1], &back); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if back.Kind != events.DomainKindSignal {
+	if back.Kind != events.DomainKindTelemetry {
 		t.Fatalf("second line kind = %q", back.Kind)
+	}
+	if err := json.Unmarshal(lines[2], &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.Kind != events.DomainKindSignal {
+		t.Fatalf("third line kind = %q", back.Kind)
 	}
 	if l.Dropped() != 0 {
 		t.Fatalf("Dropped = %d, want 0", l.Dropped())

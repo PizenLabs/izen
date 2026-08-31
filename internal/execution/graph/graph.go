@@ -138,6 +138,10 @@ type Graph struct {
 	ID string
 	// RequestID correlates the graph with its lifecycle events.
 	RequestID string
+	// SessionID correlates the execution with its originating session
+	// (INV-SESSION-10). It is stamped onto every canonical lifecycle event the
+	// graph emits.
+	SessionID string
 	// Phase is the graph lifecycle phase.
 	Phase Phase
 	// Stages is the deterministic, compile-ordered stage sequence.
@@ -278,6 +282,15 @@ func (g *Graph) Begin(kind StageKind) {
 	}
 }
 
+// SetSessionID correlates the graph (and every event it emits) with the
+// originating session (INV-SESSION-10).
+func (g *Graph) SetSessionID(sessionID string) {
+	if g == nil {
+		return
+	}
+	g.SessionID = sessionID
+}
+
 // Start opens the execution: the graph enters running and emits
 // execution.started. It is the first transition of every execution.
 func (g *Graph) Start(mode, prompt string) {
@@ -286,7 +299,7 @@ func (g *Graph) Start(mode, prompt string) {
 	}
 	g.Phase = PhaseRunning
 	g.StartedAt = time.Now()
-	g.emitEvent(events.NewExecutionStarted(g.RequestID, mode, prompt))
+	g.emitEvent(events.NewExecutionStarted(g.RequestID, mode, prompt, g.SessionID))
 }
 
 // CompleteUserIntent closes the user-intent stage (no canonical event — the

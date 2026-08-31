@@ -70,7 +70,7 @@ func TestGatedProjectionFollowsRuntimeEvents(t *testing.T) {
 	}
 
 	// The runtime events arrive through handleDomainEvent (the bus projection).
-	m.handleDomainEvent(events.NewExecutionStarted("g1", "hot", "fix typo in @index.html"))
+	m.handleDomainEvent(events.NewExecutionStarted("g1", "hot", "fix typo in @index.html", ""))
 	m.handleDomainEvent(events.NewTargetResolved("g1", "index.html", true, "strategy"))
 
 	if m.execView.HumanStep() != "Reading index.html" {
@@ -133,7 +133,7 @@ func TestGatedProjectionTerminalClearsLoading(t *testing.T) {
 	}
 
 	// Terminal success event → projection terminal + loading state released.
-	m.handleDomainEvent(events.NewExecutionStarted("g2", "hot", "change bar to qux"))
+	m.handleDomainEvent(events.NewExecutionStarted("g2", "hot", "change bar to qux", ""))
 	m.handleDomainEvent(events.NewArtifactProduced("g2", "patch", "note.txt"))
 	m.handleDomainEvent(events.NewExecutionFinished("g2", true, "completed"))
 
@@ -167,7 +167,7 @@ func TestUIProjectionNeverRendersImpossibleStates(t *testing.T) {
 		t.Fatal("gated execution returned nil command")
 	}
 
-	m.handleDomainEvent(events.NewExecutionStarted("g3", "hot", "change bar to qux"))
+	m.handleDomainEvent(events.NewExecutionStarted("g3", "hot", "change bar to qux", ""))
 	m.handleDomainEvent(events.NewExecutionFinished("g3", true, "completed"))
 	// A stray running event for the SAME request after the terminal event.
 	m.handleDomainEvent(events.NewArtifactProduced("g3", "patch", "note.txt"))
@@ -205,7 +205,7 @@ func TestNarrativePanelRendersProjection(t *testing.T) {
 	}
 
 	// Advancing runtime events project the next narrative steps.
-	m.handleDomainEvent(events.NewExecutionStarted("n1", "hot", "fix typo in @index.html"))
+	m.handleDomainEvent(events.NewExecutionStarted("n1", "hot", "fix typo in @index.html", ""))
 	m.handleDomainEvent(events.NewTargetResolved("n1", "index.html", true, "strategy"))
 	panel := m.renderExecutionNarrative()
 	if !strings.Contains(panel, "Reading index.html") {

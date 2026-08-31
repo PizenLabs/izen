@@ -76,6 +76,12 @@ type ExecuteRequest struct {
 	// RequestID correlates every lifecycle event of this execution. Empty
 	// yields a deterministic auto-generated ID.
 	RequestID string
+	// SessionID is the originating session correlation (INV-SESSION-10). When
+	// empty, the runtime resolves it from the wired session resolver at
+	// admission. It is stamped onto the execution proof, the terminal evidence
+	// and the canonical lifecycle events so mutation traces, token usage and
+	// tool invocations map strictly to their originating session.
+	SessionID string
 	// Mode is a PRESENTATION context label only ("ask", "build", ...). It never
 	// selects the execution path — the strategy does.
 	Mode string
@@ -205,6 +211,10 @@ type ExecutionProof struct {
 	StrategyReason string      `json:"strategy_reason"`
 	Targets        []string    `json:"targets"`
 	Graph          []GraphStep `json:"graph"`
+	// SessionID correlates the execution with its originating session
+	// (INV-SESSION-10). It is stamped at admission from the request or the
+	// wired session resolver.
+	SessionID string `json:"session_id,omitempty"`
 	// RuntimeGraph is the runtime-owned execution graph evidence: the ordered,
 	// per-stage lifecycle record produced by graph transitions. It is the
 	// authoritative execution timeline; Graph is its compact projection.
@@ -285,6 +295,8 @@ type ContextItemDecision struct {
 type ExecutionCompleted struct {
 	// Provider is the provider that served the execution.
 	Provider string
+	// SessionID is the originating session correlation (INV-SESSION-10).
+	SessionID string
 	// Model is the model the execution invoked (first invocation's model).
 	Model string
 	// InputTokens is the aggregate provider-reported input usage of every
@@ -315,6 +327,8 @@ type ExecutionResult struct {
 	Strategy       string
 	StrategyReason string
 	Targets        []string
+	// SessionID is the originating session correlation (INV-SESSION-10).
+	SessionID string
 	// ModelCalls lists every provider invocation performed by the runtime.
 	ModelCalls []ModelInvocation
 	// ArtifactKind names the produced artifact ("patch", "explanation", ...).
@@ -367,6 +381,7 @@ type ExecutionResult struct {
 // pendingMutation is the approval-held state of a targeted mutation.
 type pendingMutation struct {
 	requestID      string
+	sessionID      string
 	mode           string
 	target         string
 	original       string
@@ -410,6 +425,10 @@ type RuntimeExecutor struct {
 	verifier  *Verifier
 	auth      *authorization.MutationAuthorization
 	admission *AdmissionGateway
+	// sessionID resolves the active originating session at admission when the
+	// request does not carry one (INV-SESSION-10). It is wired by the
+	// composition root to the SessionManager's active-session accessor.
+	sessionID func() string
 	// contracts is the runtime-owned contract identity ledger (Phase 2 P2):
 	// it derives immutable ContractIDs at admission, increments AttemptIDs
 	// deterministically across retries, and instantiates bounded causal
@@ -534,6 +553,31 @@ func (x *RuntimeExecutor) MutationBoundary() MutationBoundary {
 // the runtime never applies without an authorization token.
 func (x *RuntimeExecutor) SetAuthorization(a *authorization.MutationAuthorization) {
 	x.auth = a
+}
+
+// SetSessionResolver wires the active-session correlation source
+// (INV-SESSION-10). The resolver is consulted at admission when a request does
+// not carry an explicit SessionID, so every execution — including autonomous
+// and headless submissions — is correlated with the session that produced it.
+func (x *RuntimeExecutor) SetSessionResolver(fn func() string) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.sessionID = fn
+}
+
+// resolveSessionID returns the originating session for a request: the explicit
+// request value wins, otherwise the wired session resolver ("" when neither).
+func (x *RuntimeExecutor) resolveSessionID(req ExecuteRequest) string {
+	if req.SessionID != "" {
+		return req.SessionID
+	}
+	x.mu.Lock()
+	fn := x.sessionID
+	x.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
+	return ""
 }
 
 // SetProvider re-binds the provider (provider switching is a runtime concern).
@@ -700,11 +744,14 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	if requestID == "" {
 		requestID = x.nextID()
 	}
+	sid := x.resolveSessionID(req)
 	res := &ExecutionResult{
 		RequestID: requestID,
 		Mode:      req.Mode,
+		SessionID: sid,
 		Proof:     &ExecutionProof{RequestID: requestID, StrategyReason: "", StartedAt: time.Now()},
 	}
+	res.Proof.SessionID = sid
 	// Preserve the autonomy decision handoff (Phase 1 Step 6) so the intent,
 	// confidence, target confidence and scope survive into the execution proof.
 	res.Proof.Intent = req.Intent
@@ -717,6 +764,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// Every execution drives the explicit graph. Transitions generate events;
 	// stage evidence becomes the proof timeline. The UI only projects.
 	g := runtimegraph.New(requestID, x.emit)
+	g.SetSessionID(sid)
 	setProofGraph(res, g)
 	g.Start(req.Mode, req.Prompt)
 	g.CompleteUserIntent()
@@ -1196,6 +1244,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// ── 9. Approval gate ───────────────────────────────────────────────
 	pm := &pendingMutation{
 		requestID:      requestID,
+		sessionID:      res.SessionID,
 		mode:           req.Mode,
 		target:         target,
 		original:       res.Original,
@@ -1244,6 +1293,7 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 
 	res := &ExecutionResult{
 		RequestID:      pm.requestID,
+		SessionID:      pm.sessionID,
 		Mode:           pm.mode,
 		Strategy:       pm.strategy,
 		StrategyReason: pm.strategyReason,
@@ -1253,6 +1303,7 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		Content:        pm.patches[0].Modified,
 		Proof: &ExecutionProof{
 			RequestID:        pm.requestID,
+			SessionID:        pm.sessionID,
 			Strategy:         pm.strategy,
 			StrategyReason:   pm.strategyReason,
 			Targets:          pm.targets,
@@ -1551,6 +1602,21 @@ func (x *RuntimeExecutor) PendingPatchIDs() []string {
 		out = append(out, id)
 	}
 	return out
+}
+
+// RejectAllPending deterministically rejects every approval-held mutation. It
+// is the session-boundary drain: /new and /session resume cross the execution
+// lifecycle through this single RuntimeExecutor authority — never through a
+// second state engine. It returns a per-patch error slice; the drain is
+// best-effort cleanup and must never fail a session switch.
+func (x *RuntimeExecutor) RejectAllPending(ctx context.Context, reason string) []error {
+	var errs []error
+	for _, id := range x.PendingPatchIDs() {
+		if _, err := x.Reject(ctx, id, reason); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
 }
 
 // ── internals ──────────────────────────────────────────────────────────────
@@ -2611,6 +2677,7 @@ func (x *RuntimeExecutor) emitEvidenceEvent(res *ExecutionResult, ev *ExecutionE
 	}
 	x.emit(events.NewExecutionEvidence(events.ExecutionEvidencePayload{
 		RequestID:        res.RequestID,
+		SessionID:        res.SessionID,
 		ContractID:       ev.ContractID().String(),
 		AttemptID:        uint32(ev.AttemptID()),
 		ParentContractID: ev.ParentContractID().String(),
@@ -2640,6 +2707,7 @@ func (x *RuntimeExecutor) finalizeResult(res *ExecutionResult) *ExecutionResult 
 	}
 	cc := res.Completed
 	cc.Provider = x.providerName()
+	cc.SessionID = res.SessionID
 	for _, inv := range res.ModelCalls {
 		if cc.Model == "" {
 			cc.Model = inv.Model

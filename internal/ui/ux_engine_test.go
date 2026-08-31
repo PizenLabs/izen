@@ -133,7 +133,7 @@ func TestExpandedFrameShowsStepSources(t *testing.T) {
 	m.executionResolving = true
 	m.execVisibility = presentation.VisibilityExpanded
 
-	m.handleDomainEvent(events.NewExecutionStarted("ux", "build", "fix index.html"))
+	m.handleDomainEvent(events.NewExecutionStarted("ux", "build", "fix index.html", ""))
 	m.handleDomainEvent(events.NewTargetResolved("ux", "index.html", true, "strategy"))
 
 	panel := stripANSITest(m.renderExecutionLayered())
@@ -154,7 +154,7 @@ func TestNormalFrameHasNoStepSources(t *testing.T) {
 	m.executionResolving = true
 	m.execVisibility = presentation.VisibilityNormal
 
-	m.handleDomainEvent(events.NewExecutionStarted("ux", "build", "fix index.html"))
+	m.handleDomainEvent(events.NewExecutionStarted("ux", "build", "fix index.html", ""))
 	m.handleDomainEvent(events.NewTargetResolved("ux", "index.html", true, "strategy"))
 
 	panel := stripANSITest(m.renderExecutionLayered())

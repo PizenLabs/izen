@@ -213,6 +213,7 @@ func NewDefault() *Registry {
 	r.RegisterAll(officialCommands())
 	r.RegisterAlias(MarkerSlash, "q", "quit")
 	r.RegisterAlias(MarkerSlash, "?", "help")
+	r.RegisterAlias(MarkerSlash, "model", "models")
 	return r
 }
 
@@ -266,10 +267,11 @@ func officialCommands() []CommandDescriptor {
 		// Global commands (/).
 		{Marker: MarkerSlash, Name: "help", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "render the mode and command reference"},
 		{Marker: MarkerSlash, Name: "usage", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "display runtime usage, tokens, and provider status"},
-		{Marker: MarkerSlash, Name: "model", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "switch or pick the active model/provider"},
-		{Marker: MarkerSlash, Name: "provider", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "switch provider (deprecated, use /model)"},
+		{Marker: MarkerSlash, Name: "models", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "switch or pick the active model/provider"},
+		{Marker: MarkerSlash, Name: "provider", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "switch provider (deprecated, use /models)"},
 		{Marker: MarkerSlash, Name: "objective", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "create a budget-guarded session objective"},
-		{Marker: MarkerSlash, Name: "session", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "list or resume workspace sessions"},
+		{Marker: MarkerSlash, Name: "new", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "create and activate a fresh session (SESSION.md §9) — the previous session stays resumable"},
+		{Marker: MarkerSlash, Name: "session", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "manage sessions: list · resume <A|B> · inspect <A|B> · rename <A|B> <title> · archive <A|B> · delete <A|B> · compact <A|B>"},
 		{Marker: MarkerSlash, Name: "clear", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "reset the workspace session"},
 		{Marker: MarkerSlash, Name: "drop", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "detach context files"},
 		{Marker: MarkerSlash, Name: "arch", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "explore the workspace architecture"},

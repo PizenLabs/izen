@@ -261,11 +261,11 @@ func (e *Engine) git(args ...string) (string, error) {
 
 func parseStatus(out string) []StatusEntry {
 	var entries []StatusEntry
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
+	for _, line := range strings.Split(out, "\n") {
+		// Porcelain lines have FIXED columns: XY <path>. The leading index
+		// column (' ' or 'M'/'A'/...) must NOT be trimmed before slicing or the
+		// path shifts left by one char. Only trailing whitespace is removed.
+		line = strings.TrimRight(line, " \t\r")
 		if len(line) < 4 {
 			continue
 		}

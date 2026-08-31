@@ -27,7 +27,7 @@ import (
 // model's bus projection.
 func feedFullExecution(m *model) {
 	rid := "p6"
-	m.handleDomainEvent(events.NewExecutionStarted(rid, "build", "fix index.html"))
+	m.handleDomainEvent(events.NewExecutionStarted(rid, "build", "fix index.html", ""))
 	m.handleDomainEvent(events.NewStrategySelected(rid, "targeted_mutation", true, "explicit target"))
 	m.handleDomainEvent(events.NewTargetResolved(rid, "index.html", true, "strategy"))
 	m.handleDomainEvent(events.NewContextPrepared(rid, []string{"user_intent", "target_content"}, 40))
@@ -162,7 +162,7 @@ func TestCtrlOCyclesVisibility(t *testing.T) {
 	m.execVisibility = presentation.VisibilityNormal
 	// The projection becomes Active only when a real execution event arrives —
 	// Ctrl+O must not cycle a projection with no runtime truth behind it.
-	m.handleDomainEvent(events.NewExecutionStarted("p6", "build", "x"))
+	m.handleDomainEvent(events.NewExecutionStarted("p6", "build", "x", ""))
 
 	if !m.cycleExecVisibility() || m.execVisibility != presentation.VisibilityExpanded {
 		t.Fatalf("first Ctrl+O must go to EXPANDED, got %s", m.execVisibility)
@@ -193,7 +193,7 @@ func TestNarrativeChangesAccordingToGraphState(t *testing.T) {
 	// Partial graph: only started + strategy. Neither transition is human-
 	// visible progress, so the rendered view must be EMPTY — never a canned
 	// "Understanding request" step and never the later static steps.
-	m.handleDomainEvent(events.NewExecutionStarted("p6", "build", "fix index.html"))
+	m.handleDomainEvent(events.NewExecutionStarted("p6", "build", "fix index.html", ""))
 	m.handleDomainEvent(events.NewStrategySelected("p6", "targeted_mutation", true, "x"))
 	panel := stripANSITest(m.renderExecutionLayered())
 	if panel != "" {
@@ -225,7 +225,7 @@ func TestNoFakeStaticSteps(t *testing.T) {
 	m.executionResolving = true
 	m.execVisibility = presentation.VisibilityNormal
 
-	m.handleDomainEvent(events.NewExecutionStarted("p6", "build", "fix index.html"))
+	m.handleDomainEvent(events.NewExecutionStarted("p6", "build", "fix index.html", ""))
 	m.handleDomainEvent(events.NewStrategySelected("p6", "targeted_mutation", true, "x"))
 	m.handleDomainEvent(events.NewTargetResolved("p6", "index.html", true, "strategy"))
 	m.handleDomainEvent(events.NewExecutionFinished("p6", true, "completed"))

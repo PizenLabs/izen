@@ -48,6 +48,7 @@ import (
 	riview "github.com/PizenLabs/izen/internal/review"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/session"
+	"github.com/PizenLabs/izen/internal/session/compaction"
 	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/ui/status"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
@@ -694,13 +695,21 @@ type TaskFinishedMsg struct{}
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 type model struct {
-	cfg      *config.Config
-	sess     *session.Session
-	provider ai.Provider
-	mgr      *ai.Manager
-	resolver *modes.Resolver
-	gitEng   *git.Engine
-	graph    *lea.FileGraph
+	cfg  *config.Config
+	sess *session.Session
+	// sessionManager is the dual-slot session authority wired by the
+	// composition root. It owns /new and /session resume; sess mirrors its
+	// active session. Nil in harnesses that never construct a model via
+	// NewProgramWithApp with a wired manager.
+	sessionManager *session.Manager
+	// compactionRunner is the async Generational Compactor. It backs the manual
+	// /session compact <id> trigger; its worker never runs on the UI loop.
+	compactionRunner *compaction.Runner
+	provider         ai.Provider
+	mgr              *ai.Manager
+	resolver         *modes.Resolver
+	gitEng           *git.Engine
+	graph            *lea.FileGraph
 	// leaEng is the Phase 3 Lea structural engine (canonical index for
 	// architecture, call chains, routes and symbol lookups). It backs the
 	// context planner's graph source and the /arch analysis. Nil only in
@@ -1327,7 +1336,7 @@ type model struct {
 	// Model Picker Modal
 	showModelPicker bool
 	modelPicker     *ModelPickerModal
-	sessionModel    string // user-selected model override via /model
+	sessionModel    string // user-selected model override via /models
 
 	// Foldable execution logs
 	logStore *LogStore
@@ -1637,7 +1646,7 @@ func (m *model) routeModel(mode string) string {
 
 // syncPipelineTiers re-pins the layered pipeline router's per-intent models to
 // the current configuration. It MUST be called whenever the active provider or
-// model tier changes at runtime (provider switch, /model selection, config
+// model tier changes at runtime (provider switch, /models selection, config
 // reload) so intent routing never serves a model that was pinned to a provider
 // which is no longer active — an Ollama model leaking into an OpenRouter
 // request fails with HTTP 400 "not a valid model ID".
