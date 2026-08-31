@@ -136,6 +136,67 @@ func (m *model) modelPickerDialogSize() (int, int) {
 	return w, h
 }
 
+func (m *model) sessionPickerDialogSize() (int, int) {
+	w := sessionPickerPreferredWidth
+	h := sessionPickerPreferredHeight
+
+	if m.width > 0 {
+		if maxW := m.width - modelPickerEdgeMargin; maxW < w {
+			w = maxW
+		}
+	}
+	if m.height > 0 {
+		if maxH := m.height - modelPickerEdgeMargin; maxH < h {
+			h = maxH
+		}
+	}
+	if w < sessionPickerMinWidth {
+		w = sessionPickerMinWidth
+	}
+	if h < sessionPickerMinHeight {
+		h = sessionPickerMinHeight
+	}
+	return w, h
+}
+
+// renderSessionPickerModal renders the session picker as a centered modal.
+func (m *model) renderSessionPickerModal() string {
+	var normalWS Workspace
+	if m.Ready && m.viewRegistry != nil {
+		if v, ok := m.viewRegistry.For(m.resolver.Current()); ok {
+			normalWS = v.BuildWorkspace(m)
+		}
+	}
+	var parts []string
+	if normalWS.Viewport != "" {
+		parts = append(parts, normalWS.Viewport)
+	}
+	if normalWS.ProposalDock != "" {
+		parts = append(parts, normalWS.ProposalDock)
+	}
+	if normalWS.Input != "" {
+		parts = append(parts, normalWS.Input)
+	}
+	if normalWS.Footer != "" {
+		parts = append(parts, normalWS.Footer)
+	}
+	normalContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	dialogW, dialogH := m.sessionPickerDialogSize()
+	m.sessionPicker.SetSize(dialogW, dialogH)
+	spView := m.sessionPicker.View()
+
+	modalBox := lipgloss.NewStyle().
+		Width(dialogW+2).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(colorMauve)).
+		Padding(0, 1).
+		Render(spView)
+
+	centered := lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modalBox)
+	return overlayOn(normalContent, centered, m.width, m.height)
+}
+
 // renderModelPickerModal renders the model picker as a compact, centered
 // floating dialog over the normal workspace background.
 func (m *model) renderModelPickerModal() string {
@@ -289,6 +350,9 @@ func (m *model) BuildWorkspace() Workspace {
 	}
 	if m.showModelPicker && m.modelPicker != nil {
 		return Workspace{Overlay: m.renderModelPickerModal()}
+	}
+	if m.showSessionPicker && m.sessionPicker != nil {
+		return Workspace{Overlay: m.renderSessionPickerModal()}
 	}
 	if !m.Ready {
 		return Workspace{Overlay: "Loading IZEN..."}

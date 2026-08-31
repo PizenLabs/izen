@@ -65,10 +65,36 @@ func lastErrorText(m *model) string {
 	return ""
 }
 
-// TestSessionListRendersBothSlots pins /session list through the manager.
+// TestSessionListRendersBothSlots pins bare /session toggles the picker modal
+// without emitting raw text to chat history (Step 3 Verification #1).
 func TestSessionListRendersBothSlots(t *testing.T) {
 	m, _, _ := sessionCLITestModel(t)
+	before := len(m.records)
 	m.handleCommand("/session")
+	if !m.showSessionPicker || m.sessionPicker == nil {
+		t.Fatalf("bare /session should open session picker modal")
+	}
+	if len(m.records) != before {
+		t.Fatalf("bare /session should not emit raw text to chat history, got %d new records", len(m.records)-before)
+	}
+	// Modal should contain both slots.
+	if len(m.sessionPicker.sessions) != 2 {
+		t.Fatalf("session picker sessions = %d, want 2", len(m.sessionPicker.sessions))
+	}
+	hasA, hasB := false, false
+	for _, s := range m.sessionPicker.sessions {
+		if s.Slot == session.SlotA {
+			hasA = true
+		}
+		if s.Slot == session.SlotB {
+			hasB = true
+		}
+	}
+	if !hasA || !hasB {
+		t.Fatalf("session picker missing slots: hasA=%v hasB=%v", hasA, hasB)
+	}
+	// /session list still emits the clean text table (backward compatible CLI path).
+	m.handleCommand("/session list")
 	text := lastSystemText(m)
 	if !strings.Contains(text, "slot A") || !strings.Contains(text, "slot B") {
 		t.Fatalf("/session list output missing slots: %q", text)

@@ -1338,6 +1338,10 @@ type model struct {
 	modelPicker     *ModelPickerModal
 	sessionModel    string // user-selected model override via /models
 
+	// Session Picker Modal — interactive /session overlay
+	showSessionPicker bool
+	sessionPicker     *SessionPickerModal
+
 	// Foldable execution logs
 	logStore *LogStore
 

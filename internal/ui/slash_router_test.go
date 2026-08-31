@@ -262,15 +262,26 @@ func TestSlashRouterSessionSubcommandsPreserveArguments(t *testing.T) {
 	}
 }
 
-// TestSlashRouterBareSessionLists pins that a bare /session still routes to the
-// list handler.
+// TestSlashRouterBareSessionLists pins that a bare /session opens the
+// interactive picker modal without emitting raw text (Step 3 Verification #1).
 func TestSlashRouterBareSessionLists(t *testing.T) {
 	m, _, _, _ := slashRouterTestModel(t)
+	before := len(m.records)
 	if cmd := m.handleInput("/session"); cmd != nil {
 		t.Fatalf("handleInput(/session) returned a cmd, want nil")
 	}
+	if !m.showSessionPicker || m.sessionPicker == nil {
+		t.Fatal("bare /session should open session picker modal")
+	}
+	if len(m.records) != before {
+		t.Fatalf("bare /session should not emit records, got %d new", len(m.records)-before)
+	}
+	// /session list still emits the clean text table (backward compatible CLI path).
+	if cmd := m.handleInput("/session list"); cmd != nil {
+		t.Fatalf("handleInput(/session list) returned a cmd, want nil")
+	}
 	text := lastSystemText(m)
 	if !strings.Contains(text, "slot A") {
-		t.Fatalf("/session output missing slot listing: %q", text)
+		t.Fatalf("/session list output missing slot listing: %q", text)
 	}
 }

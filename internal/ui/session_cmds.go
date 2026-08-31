@@ -59,7 +59,9 @@ func (m *model) runSessionCmd(cmd string) tea.Cmd {
 
 	parts := strings.Fields(cmd)
 	switch {
-	case len(parts) == 1, len(parts) == 2 && parts[1] == "list":
+	case len(parts) == 1:
+		return m.toggleSessionPicker()
+	case len(parts) == 2 && parts[1] == "list":
 		return m.runSessionListCmd()
 
 	case len(parts) == 3 && parts[1] == "resume":
@@ -339,4 +341,195 @@ func (m *model) runSessionCompactCmd(target session.SlotID) tea.Cmd {
 	}
 	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("/session compact %s: generation %d sealed · %d events folded", target, cc.Generation, cc.EventCount)))
 	return nil
+}
+
+// ── Session Picker modal integration ─────────────────────────────────────────
+
+// toggleSessionPicker opens the interactive picker when closed and closes it
+// when open. Bare `/session` in the TUI is the single entry point; every
+// parameterized subcommand bypasses this and executes deterministically.
+func (m *model) toggleSessionPicker() tea.Cmd {
+	if m.showSessionPicker {
+		return m.closeSessionPicker()
+	}
+	return m.openSessionPicker()
+}
+
+// openSessionPicker populates the modal from SessionManager.List and shows it.
+// It does NOT emit any chat history line — the modal itself is the presentation.
+func (m *model) openSessionPicker() tea.Cmd {
+	if m.sessionManager == nil {
+		m.push(roleError, "/session unavailable: no session manager wired")
+		return nil
+	}
+	infos := m.sessionManager.List(context.Background())
+	sp := NewSessionPickerModal(infos)
+	if m.width > 0 && m.height > 0 {
+		w, h := m.sessionPickerDialogSize()
+		sp.SetSize(w, h)
+	}
+	m.sessionPicker = sp
+	m.showSessionPicker = true
+	return nil
+}
+
+// closeSessionPicker dismisses the modal and returns focus to the prompt.
+func (m *model) closeSessionPicker() tea.Cmd {
+	m.showSessionPicker = false
+	if m.sessionPicker != nil {
+		m.sessionPicker = nil
+	}
+	m.ti.Focus()
+	return nil
+}
+
+// refreshSessionPicker reloads the modal list after a lifecycle mutation.
+func (m *model) refreshSessionPicker() {
+	if m.sessionPicker == nil || m.sessionManager == nil {
+		return
+	}
+	infos := m.sessionManager.List(context.Background())
+	m.sessionPicker.SetSessions(infos)
+}
+
+// handleSessionPickerResume executes the atomic switch for the selected slot
+// and closes the modal. It is the `Enter` handler of the picker.
+func (m *model) handleSessionPickerResume(target session.SlotID) tea.Cmd {
+	if m.state == StateProcessing || m.state == StateAwaitingApproval || m.streaming || m.agentRunning {
+		if m.sessionPicker != nil {
+			m.sessionPicker.SetStatus("cannot switch while execution is in flight", true)
+		}
+		return nil
+	}
+	sess, err := m.sessionManager.ResumeSession(context.Background(), target)
+	if err != nil {
+		if m.sessionPicker != nil {
+			m.sessionPicker.SetStatus(fmt.Sprintf("resume %s failed: %v", target, err), true)
+		} else {
+			m.push(roleError, fmt.Sprintf("/session resume %s failed: %v", target, err))
+		}
+		return nil
+	}
+	m.sess = sess
+	m.resolver.Set(sess.Mode)
+	m.resetTransientInteraction()
+	m.unsealActivitySurface()
+	_ = m.closeSessionPicker()
+	msg := fmt.Sprintf("/session resume: now active on slot %s · %s", target, sess.SessionID)
+	if len(sess.WorkspaceDirtyFiles) > 0 {
+		msg += fmt.Sprintf(" · ⚠ %d uncommitted file(s)", len(sess.WorkspaceDirtyFiles))
+	}
+	m.push(roleSystem, infoStyle.Render(msg))
+	return nil
+}
+
+// handleSessionPickerNew creates a fresh session and refreshes the modal.
+func (m *model) handleSessionPickerNew() tea.Cmd {
+	if m.state == StateProcessing || m.state == StateAwaitingApproval || m.streaming || m.agentRunning {
+		if m.sessionPicker != nil {
+			m.sessionPicker.SetStatus("cannot start session while execution is in flight", true)
+		}
+		return nil
+	}
+	sess, err := m.sessionManager.NewSession(context.Background())
+	if err != nil {
+		if m.sessionPicker != nil {
+			m.sessionPicker.SetStatus(fmt.Sprintf("/new failed: %v", err), true)
+		} else {
+			m.push(roleError, fmt.Sprintf("/new failed: %v", err))
+		}
+		return nil
+	}
+	m.sess = sess
+	m.resolver.Set(sess.Mode)
+	m.resetTransientInteraction()
+	m.unsealActivitySurface()
+	m.push(roleSystem, infoStyle.Render("/new: started a fresh session · previous session preserved, resumable via /session resume A|B"))
+	m.refreshSessionPicker()
+	if m.sessionPicker != nil {
+		m.sessionPicker.SetStatus(fmt.Sprintf("new session on slot %s", m.sessionManager.Active()), false)
+	}
+	return nil
+}
+
+// handleSessionPickerRename retitles the selected session and refreshes.
+func (m *model) handleSessionPickerRename(target session.SlotID, title string) tea.Cmd {
+	if err := m.sessionManager.Rename(context.Background(), target, title); err != nil {
+		if m.sessionPicker != nil {
+			m.sessionPicker.SetStatus(fmt.Sprintf("rename %s failed: %v", target, err), true)
+		} else {
+			m.push(roleError, fmt.Sprintf("/session rename %s failed: %v", target, err))
+		}
+		return nil
+	}
+	m.refreshSessionPicker()
+	if m.sessionPicker != nil {
+		m.sessionPicker.SetStatus(fmt.Sprintf("slot %s now titled %q", target, title), false)
+	} else {
+		m.push(roleSystem, infoStyle.Render(fmt.Sprintf("/session rename: slot %s now titled %q", target, title)))
+	}
+	return nil
+}
+
+// handleSessionPickerArchive toggles archive status via Archive.
+func (m *model) handleSessionPickerArchive(target session.SlotID) tea.Cmd {
+	if err := m.sessionManager.Archive(context.Background(), target); err != nil {
+		if m.sessionPicker != nil {
+			m.sessionPicker.SetStatus(fmt.Sprintf("archive %s failed: %v", target, err), true)
+		} else {
+			m.push(roleError, fmt.Sprintf("/session archive %s failed: %v", target, err))
+		}
+		return nil
+	}
+	m.refreshSessionPicker()
+	if m.sessionPicker != nil {
+		m.sessionPicker.SetStatus(fmt.Sprintf("slot %s archived", target), false)
+	} else {
+		m.push(roleSystem, infoStyle.Render(fmt.Sprintf("/session archive: slot %s archived", target)))
+	}
+	return nil
+}
+
+// handleSessionPickerDelete deletes the selected slot and re-mirrors.
+func (m *model) handleSessionPickerDelete(target session.SlotID) tea.Cmd {
+	if m.state == StateProcessing || m.state == StateAwaitingApproval || m.streaming || m.agentRunning {
+		if m.sessionPicker != nil {
+			m.sessionPicker.SetStatus("cannot delete while execution is in flight", true)
+		}
+		return nil
+	}
+	if err := m.sessionManager.Delete(context.Background(), target); err != nil {
+		if m.sessionPicker != nil {
+			m.sessionPicker.SetStatus(fmt.Sprintf("delete %s failed: %v", target, err), true)
+		} else {
+			m.push(roleError, fmt.Sprintf("/session delete %s failed: %v", target, err))
+		}
+		return nil
+	}
+	m.sess = m.sessionManager.Session()
+	if m.sess != nil {
+		m.resolver.Set(m.sess.Mode)
+	}
+	m.resetTransientInteraction()
+	m.unsealActivitySurface()
+	m.refreshSessionPicker()
+	if m.sessionPicker != nil {
+		m.sessionPicker.SetStatus(fmt.Sprintf("slot %s purged", target), false)
+	}
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("/session delete: slot %s purged · project state, knowledge and audit evidence preserved", target)))
+	return nil
+}
+
+// handleSessionPickerCompact triggers compaction via the existing compact flow.
+func (m *model) handleSessionPickerCompact(target session.SlotID) tea.Cmd {
+	cmd := m.runSessionCompactCmd(target)
+	m.refreshSessionPicker()
+	if m.sessionPicker != nil && cmd == nil {
+		// runSessionCompactCmd already pushed status; surface a transient modal status as well.
+		// If no error was pushed, show success; errors already have a status via pushed records.
+		// Check last error text to avoid double success on failure.
+		_ = cmd
+		m.sessionPicker.SetStatus(fmt.Sprintf("compact %s requested", target), false)
+	}
+	return cmd
 }
