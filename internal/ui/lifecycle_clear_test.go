@@ -487,8 +487,8 @@ func TestSessionResumeSwitchesSlot(t *testing.T) {
 	m.streaming = false
 	m.agentRunning = false
 
-	// /session list must render both slots.
-	m.runSessionCmd("/session")
+	// /session list must render both slots (bare /session opens modal, list emits table).
+	m.runSessionCmd("/session list")
 	foundList := false
 	for _, r := range m.records {
 		if roleSystem == r.role && strings.Contains(r.text, "slot A") && strings.Contains(r.text, "slot B") {
@@ -498,6 +498,17 @@ func TestSessionResumeSwitchesSlot(t *testing.T) {
 	if !foundList {
 		t.Error("/session list must project both slots")
 	}
+	// Bare /session should toggle the picker without emitting text.
+	before := len(m.records)
+	m.runSessionCmd("/session")
+	if !m.showSessionPicker {
+		t.Error("bare /session should open session picker modal")
+	}
+	if len(m.records) != before {
+		t.Error("bare /session should not emit raw text to history")
+	}
+	// Close picker for remainder of test.
+	m.runSessionCmd("/session")
 
 	// Resume A.
 	m.runSessionResumeCmd(session.SlotA)

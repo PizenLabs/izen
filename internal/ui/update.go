@@ -268,6 +268,23 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m.handleViModeKey(keyMsg)
 	}
 
+	// ── SESSION PICKER ROUTING: intercept key events during session selection ──
+	if m.showSessionPicker && m.sessionPicker != nil {
+		if _, ok := msg.(tea.KeyMsg); ok {
+			var cmd tea.Cmd
+			m.sessionPicker, cmd = m.sessionPicker.Update(msg)
+			return m, cmd
+		}
+		switch msg.(type) {
+		case sessionPickerResumeMsg, sessionPickerNewMsg, sessionPickerRenameMsg, sessionPickerArchiveMsg, sessionPickerDeleteMsg, sessionPickerCompactMsg, sessionPickerCloseMsg:
+			// fall through to main switch
+		case tea.WindowSizeMsg:
+			// fall through to main switch (resize adapts modal via render)
+		default:
+			return m, nil
+		}
+	}
+
 	// ── MODEL PICKER ROUTING: intercept key events during model selection ──
 	if m.showModelPicker && m.modelPicker != nil {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
@@ -358,6 +375,21 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// goroutine, so all model mutation here is race-free.
 		m.handlePresentationEvent(msg.ev)
 		return m, nil
+
+	case sessionPickerResumeMsg:
+		return m, m.handleSessionPickerResume(msg.slot)
+	case sessionPickerNewMsg:
+		return m, m.handleSessionPickerNew()
+	case sessionPickerRenameMsg:
+		return m, m.handleSessionPickerRename(msg.slot, msg.title)
+	case sessionPickerArchiveMsg:
+		return m, m.handleSessionPickerArchive(msg.slot)
+	case sessionPickerDeleteMsg:
+		return m, m.handleSessionPickerDelete(msg.slot)
+	case sessionPickerCompactMsg:
+		return m, m.handleSessionPickerCompact(msg.slot)
+	case sessionPickerCloseMsg:
+		return m, m.closeSessionPicker()
 
 	case runtimeResultMsg:
 		// Outcome of a RuntimeCommand executed through the facade. Only

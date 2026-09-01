@@ -41,8 +41,9 @@ func TestOpenRouterReasoningOmittedForNonReasoningModel(t *testing.T) {
 	}
 }
 
-// TestOpenRouterModelSupportsReasoning asserts the denylist gating and that
-// unknown/reasoning-capable models pass through.
+// TestOpenRouterModelSupportsReasoning asserts the strict whitelist gating:
+// only verified reasoning families (openai/o1*, openai/o3*, anthropic/claude-3-7-sonnet*,
+// deepseek/deepseek-r1*) are reasoning-capable; all others are false.
 func TestOpenRouterModelSupportsReasoning(t *testing.T) {
 	cases := []struct {
 		model string
@@ -51,9 +52,12 @@ func TestOpenRouterModelSupportsReasoning(t *testing.T) {
 		{"google/gemma-4-26b-a4b", false},
 		{"gemma", false},
 		{"openai/o3", true},
-		{"anthropic/claude-3.5-sonnet", true},
-		{"cohere/north-mini-code", true},
-		{"mistralai/mistral-7b-instruct", true},
+		{"openai/o1", true},
+		{"anthropic/claude-3-7-sonnet-20250219", true},
+		{"deepseek/deepseek-r1", true},
+		{"anthropic/claude-3.5-sonnet", false},
+		{"cohere/north-mini-code", false},
+		{"mistralai/mistral-7b-instruct", false},
 	}
 	for _, tc := range cases {
 		if got := openRouterModelSupportsReasoning(tc.model); got != tc.want {
