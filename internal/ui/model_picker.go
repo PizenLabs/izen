@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -630,9 +631,15 @@ func (mp *ModelPickerModal) clampScrollOffset() {
 	}
 }
 
+// applyFilter re-filters mp.filtered from mp.models using the current
+// text-input query. It supports multi-token AND matching against a
+// normalized search corpus built from every row's visible metadata
+// (model ID, provider name, context-window badge, capability badges).
+// Matching provider groups are auto-expanded so their rows are visible.
 func (mp *ModelPickerModal) applyFilter() {
 	query := mp.ti.Value()
-	if query == "" {
+	tokens := tokenizeQuery(query)
+	if len(tokens) == 0 {
 		mp.filtered = mp.models
 		// Reset cursor to first row, keep collapsed state as user left it.
 		mp.cursor = 0
@@ -641,12 +648,9 @@ func (mp *ModelPickerModal) applyFilter() {
 		return
 	}
 
-	lower := strings.ToLower(query)
 	var results []llm.ModelInfo
 	for _, m := range mp.models {
-		if strings.Contains(strings.ToLower(m.ID), lower) ||
-			strings.Contains(strings.ToLower(m.Name), lower) ||
-			strings.Contains(strings.ToLower(m.Provider), lower) {
+		if matchModel(m, tokens) {
 			results = append(results, m)
 		}
 	}
@@ -654,6 +658,10 @@ func (mp *ModelPickerModal) applyFilter() {
 	if len(results) > 100 {
 		results = results[:100]
 	}
+	// Stable ordering so repeated queries produce identical results.
+	sort.SliceStable(results, func(i, j int) bool {
+		return results[i].ID < results[j].ID
+	})
 	mp.filtered = results
 
 	// Auto-expand groups containing search matches.
@@ -669,6 +677,74 @@ func (mp *ModelPickerModal) applyFilter() {
 	mp.cursor = 0
 	mp.scrollOffset = 0
 	mp.clampScrollOffset()
+}
+
+// tokenizeQuery splits user input into lowercased, non-empty tokens.
+// Empty input yields no tokens, which applyFilter treats as "show all".
+func tokenizeQuery(query string) []string {
+	fields := strings.Fields(strings.ToLower(query))
+	if len(fields) == 0 {
+		return nil
+	}
+	// Deduplicate tokens while preserving first-seen order.
+	seen := make(map[string]bool, len(fields))
+	tokens := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if f == "" || seen[f] {
+			continue
+		}
+		seen[f] = true
+		tokens = append(tokens, f)
+	}
+	return tokens
+}
+
+// buildSearchCorpus constructs a normalized, lowercased text corpus for a
+// model row so multi-token substring matching can index every visible
+// attribute (ID, provider, context-window badge, capability badges).
+func buildSearchCorpus(m llm.ModelInfo) string {
+	var b strings.Builder
+	b.WriteString(strings.ToLower(m.ID))
+	if m.Name != "" {
+		b.WriteByte(' ')
+		b.WriteString(strings.ToLower(m.Name))
+	}
+	if m.Provider != "" {
+		b.WriteByte(' ')
+		b.WriteString(strings.ToLower(m.Provider))
+	}
+
+	ctxWindow := m.ContextWindow
+	if ctxWindow == 0 {
+		ctxWindow = llm.ContextWindowFor(m.ID)
+	}
+	if badge := llm.FormatContextWindow(ctxWindow); badge != "" {
+		b.WriteByte(' ')
+		b.WriteString(strings.ToLower(badge))
+	}
+
+	for _, c := range llm.ModelCapabilities(m.ID) {
+		b.WriteByte(' ')
+		b.WriteString(strings.ToLower(c))
+	}
+
+	return b.String()
+}
+
+// matchModel reports whether every token in tokens appears as a substring
+// within the model's normalized search corpus. Order of tokens does not
+// matter; an empty tokens slice is handled by the caller (show all).
+func matchModel(m llm.ModelInfo, tokens []string) bool {
+	if len(tokens) == 0 {
+		return true
+	}
+	corpus := buildSearchCorpus(m)
+	for _, tok := range tokens {
+		if !strings.Contains(corpus, tok) {
+			return false
+		}
+	}
+	return true
 }
 
 func (mp *ModelPickerModal) View() string {
@@ -785,6 +861,7 @@ func (mp *ModelPickerModal) renderList() string {
 	window := rows[mp.scrollOffset:end]
 
 	query := mp.ti.Value()
+	tokens := tokenizeQuery(query)
 	for idx, row := range window {
 		absRow := mp.scrollOffset + idx
 		isSelected := absRow == mp.cursor
@@ -880,8 +957,8 @@ func (mp *ModelPickerModal) renderList() string {
 			truncatedRaw := truncateWithEllipsis(rawID, maxIDWidth)
 			// Re-apply highlight on truncated raw
 			styledID := truncatedRaw
-			if query != "" {
-				styledID = highlightMatch(truncatedRaw, query)
+			if len(tokens) > 0 {
+				styledID = highlightMatch(truncatedRaw, tokens)
 			}
 
 			// Combine: styled ID + muted badges
@@ -930,46 +1007,80 @@ func (mp *ModelPickerModal) renderList() string {
 		Render(content)
 }
 
-// highlightMatch wraps occurrences of query in the text with an underline accent style.
-// It operates on plain strings (no ANSI) and returns a lipgloss-styled string.
-func highlightMatch(text, query string) string {
-	if query == "" || text == "" {
+// highlightMatch wraps every occurrence of every token in tokens with an
+// underline accent style. It operates on plain strings (no ANSI) and
+// returns a lipgloss-styled string. Tokens are matched case-insensitively
+// and rune-safe; overlapping tokens are merged so the highlighter never
+// emits nested or broken ANSI tags.
+func highlightMatch(text string, tokens []string) string {
+	if text == "" || len(tokens) == 0 {
 		return text
 	}
+	// Build a lowercased copy for case-insensitive scanning.
 	lowerText := strings.ToLower(text)
-	lowerQuery := strings.ToLower(query)
-	idx := strings.Index(lowerText, lowerQuery)
-	if idx < 0 {
-		return text
-	}
-	// Highlight only first occurrence for simplicity; handles rune-safe slicing via rune indices.
 	runes := []rune(text)
 	lowerRunes := []rune(lowerText)
-	queryRunes := []rune(lowerQuery)
-	qLen := len(queryRunes)
-	// Find rune index
-	rIdx := -1
-	for i := 0; i+qLen <= len(lowerRunes); i++ {
-		match := true
-		for j := 0; j < qLen; j++ {
-			if lowerRunes[i+j] != queryRunes[j] {
-				match = false
-				break
+
+	// Collect every [start,end) rune interval that matches any token.
+	type interval struct{ start, end int }
+	var intervals []interval
+	for _, tok := range tokens {
+		if tok == "" {
+			continue
+		}
+		qRunes := []rune(tok)
+		qLen := len(qRunes)
+		if qLen == 0 {
+			continue
+		}
+		for i := 0; i+qLen <= len(lowerRunes); i++ {
+			match := true
+			for j := 0; j < qLen; j++ {
+				if lowerRunes[i+j] != qRunes[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				intervals = append(intervals, interval{start: i, end: i + qLen})
 			}
 		}
-		if match {
-			rIdx = i
-			break
-		}
 	}
-	if rIdx < 0 {
+	if len(intervals) == 0 {
 		return text
 	}
-	before := string(runes[:rIdx])
-	matched := string(runes[rIdx : rIdx+qLen])
-	after := string(runes[rIdx+qLen:])
-	hl := lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Bold(true).Underline(true).Render(matched)
-	return before + hl + after
+	// Sort by start; merge overlapping/adjacent intervals so consecutive
+	// highlighted runs never split a single styled segment.
+	sort.Slice(intervals, func(i, j int) bool {
+		return intervals[i].start < intervals[j].start
+	})
+	merged := intervals[:0]
+	for _, iv := range intervals {
+		if len(merged) == 0 || iv.start > merged[len(merged)-1].end {
+			merged = append(merged, iv)
+		} else if iv.end > merged[len(merged)-1].end {
+			merged[len(merged)-1].end = iv.end
+		}
+	}
+
+	var b strings.Builder
+	prev := 0
+	for _, iv := range merged {
+		if iv.start < prev {
+			// Should not happen after merge, but guard anyway.
+			iv.start = prev
+		}
+		if iv.start > prev {
+			b.WriteString(string(runes[prev:iv.start]))
+		}
+		hl := lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Bold(true).Underline(true).Render(string(runes[iv.start:iv.end]))
+		b.WriteString(hl)
+		prev = iv.end
+	}
+	if prev < len(runes) {
+		b.WriteString(string(runes[prev:]))
+	}
+	return b.String()
 }
 
 // renderEffortSlider renders the interactive effort/intent slider.
