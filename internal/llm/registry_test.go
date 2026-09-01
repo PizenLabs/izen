@@ -16,10 +16,7 @@ func TestFetchOpenRouterModels(t *testing.T) {
 			return
 		}
 		resp := openRouterResponse{
-			Data: []struct {
-				ID   string `json:"id"`
-				Name string `json:"name,omitempty"`
-			}{
+			Data: []openRouterModel{
 				{ID: "anthropic/claude-3.5-sonnet", Name: "Claude 3.5 Sonnet"},
 				{ID: "openai/gpt-4o", Name: "GPT-4o"},
 				{ID: "google/gemini-pro"},

@@ -233,7 +233,7 @@ func TestContextWindowFor(t *testing.T) {
 		{"gpt-4o", 128000},
 		{"claude-3-5-sonnet-20241022", 200000},
 		{"gemini-1.5-pro", 1000000},
-		{"deepseek-chat", 64000},
+		{"deepseek-chat", 128000},
 		// OpenRouter-style provider/model slugs (not in the curated catalog).
 		{"anthropic/claude-3.5-sonnet", 200000},
 		{"cohere/north-mini-code", 128000},

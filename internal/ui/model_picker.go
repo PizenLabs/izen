@@ -37,19 +37,22 @@ func (e EffortLevel) String() string {
 	}
 }
 
-// Description returns a human-readable description of the effort level.
+// Description returns the provider-spec conformant label for the effort level.
+// It strictly uses the official API values ("auto","low","medium","high") without
+// fabricated marketing strings. Anthropic thinking budgets are mapped from these
+// levels via the decision engine (low=1024, medium=4096, high=8192).
 func (e EffortLevel) Description() string {
 	switch e {
 	case EffortAuto:
-		return "Auto / Let model decide"
+		return "auto"
 	case EffortLow:
-		return "Fast-Track / Direct Mutation"
+		return "low"
 	case EffortMedium:
-		return "Hybrid Mutation + Local Templates"
+		return "medium"
 	case EffortHigh:
-		return "Full Senior Architect Mode"
+		return "high"
 	default:
-		return "Auto / Let model decide"
+		return "auto"
 	}
 }
 
@@ -70,9 +73,6 @@ func (e EffortLevel) ConfigTier() string {
 }
 
 // Style returns the pre-compiled render-path style for this effort level:
-// low is green (fast/low-risk), medium is yellow (moderate), high is red
-// (heaviest/highest-risk mode) — reusing the shared Catppuccin styles from
-// styles.go rather than declaring new ones.
 func (e EffortLevel) Style() lipgloss.Style {
 	switch e {
 	case EffortAuto:
@@ -97,47 +97,39 @@ const (
 )
 
 // modelListLineBudget is the *default* number of lines the scrollable
-// model list body occupies when no terminal size is known yet (i.e.
-// before the first SetSize call). Once SetSize has run, the real budget
-// is computed per-render by listRowBudget(), which shrinks or grows the
-// list to fit the space actually available — this is what keeps the
-// modal from being clipped when the user is running Izen in a narrow
-// tmux/terminal split pane.
-//
-// Regardless of which value is in play, the list stays windowed/padded
-// in terms of *rendered rows* rather than filtered items, so renderList()'s
-// total output height is still perfectly constant for any given terminal
-// size (cursor movement, filtering, refresh never change it) — only a
-// resize event changes it. That's what lets the outer modal box in
-// workspace.go (renderModelPickerModal) auto-size around it instead of
-// hardcoding its own Height/MaxHeight.
+// model list body occupies when no terminal size is known yet.
 const modelListLineBudget = 7
 
 // modelListMinRows is the smallest the scrollable list body is ever
-// allowed to shrink to, even in a very short split pane. Below this the
-// picker stops being usable, so we'd rather show a cramped-but-functional
-// list than one that's silently cut off.
+// allowed to shrink to, even in a very short split pane.
 const modelListMinRows = 3
 
-// modelPickerChromeLines is the number of fixed, non-list-body lines
-// renderList() always emits: title + blank, search input, count/refresh
-// line + blank, effort description + effort track + blank, the gap before
-// the footer, and the footer itself — plus the outer border (2) and
-// Padding(1, 3) (2). Kept in sync with renderList(); see the comment
-// there if either changes.
-const modelPickerChromeLines = 8 + 2 + 2 + 2
+// modelPickerMaxListRows caps the viewport at 20 rows as per spec
+// (min(70% height, 20 rows)).
+const modelPickerMaxListRows = 20
 
-// modelPickerMinWidth/Height are floors applied in SetSize so a very
-// aggressively split pane doesn't hand us a zero or negative size.
+// Strict height allocations per spec 2A.
+const modelPickerHeaderAndSearchArea = 5
+const modelPickerFooterArea = 3
+const modelPickerEffortBlockArea = 4
+const modelPickerBordersAndPadding = 2
+
+// modelPickerChromeLines is the base chrome when Effort is VISIBLE.
+const modelPickerChromeLines = modelPickerHeaderAndSearchArea + modelPickerFooterArea + modelPickerEffortBlockArea + modelPickerBordersAndPadding // 14
+const modelPickerChromeLinesWithoutEffort = modelPickerHeaderAndSearchArea + modelPickerFooterArea + modelPickerBordersAndPadding                 // 10
+
+// modelPickerMinWidth/Height are floors applied in SetSize. The height floor
+// uses the hidden-effort chrome (smallest possible) so a pane that can fit
+// the list without effort is not rejected as too small when effort is hidden.
 const modelPickerMinWidth = 28
-const modelPickerMinHeight = modelPickerChromeLines + modelListMinRows
+const modelPickerMinHeight = modelPickerChromeLinesWithoutEffort + modelListMinRows
 
 type ModelPickerModal struct {
 	ti       textinput.Model
 	state    modelPickerState
 	models   []llm.ModelInfo
 	filtered []llm.ModelInfo
-	cursor   int
+	cursor   int // row index into visibleRows (headers + items) — keyboard-first, headers selectable
 	loading  bool
 	errMsg   string
 	width    int
@@ -145,7 +137,16 @@ type ModelPickerModal struct {
 	registry *llm.ModelRegistry
 
 	effortIdx    int // 0=auto, 1=low, 2=medium, 3=high
-	scrollOffset int // row-based offset into buildRows(), NOT an item index
+	scrollOffset int // row-based offset into visibleRows()
+
+	// Collapsible provider groups: true = collapsed.
+	collapsed map[string]bool
+
+	// Interactive auth overlay (Ctrl+A).
+	authOverlay  bool
+	authProvider string
+	authInput    textinput.Model
+	authErr      string
 }
 
 func (mp *ModelPickerModal) CurrentEffort() EffortLevel {
@@ -181,10 +182,19 @@ func NewModelPickerModal() *ModelPickerModal {
 	ti.Width = 40
 	ti.Focus()
 
+	authTI := textinput.New()
+	authTI.Prompt = "› "
+	authTI.Placeholder = "API key..."
+	authTI.CharLimit = 256
+	authTI.EchoMode = textinput.EchoPassword
+	authTI.Width = 40
+
 	return &ModelPickerModal{
-		ti:       ti,
-		state:    mpLoading,
-		registry: llm.NewModelRegistry(),
+		ti:        ti,
+		state:     mpLoading,
+		registry:  llm.NewModelRegistry(),
+		collapsed: make(map[string]bool),
+		authInput: authTI,
 	}
 }
 
@@ -219,6 +229,138 @@ type modelSelectedMsg struct {
 	effort EffortLevel
 }
 
+// ── Helpers for selection / effort / auth ────────────────────────────────────
+
+func (mp *ModelPickerModal) visibleRows() []mpRow {
+	return mp.buildRows()
+}
+
+func (mp *ModelPickerModal) selectedRow() *mpRow {
+	rows := mp.visibleRows()
+	if len(rows) == 0 || mp.cursor < 0 || mp.cursor >= len(rows) {
+		return nil
+	}
+	return &rows[mp.cursor]
+}
+
+func (mp *ModelPickerModal) selectedModel() *llm.ModelInfo {
+	row := mp.selectedRow()
+	if row == nil || row.kind != mpRowItem {
+		return nil
+	}
+	if row.itemIndex < 0 || row.itemIndex >= len(mp.filtered) {
+		return nil
+	}
+	return &mp.filtered[row.itemIndex]
+}
+
+func (mp *ModelPickerModal) selectedProvider() string {
+	row := mp.selectedRow()
+	if row == nil {
+		return ""
+	}
+	if row.kind == mpRowHeader {
+		return row.provider
+	}
+	if row.kind == mpRowItem {
+		if m := mp.selectedModel(); m != nil {
+			return m.Provider
+		}
+	}
+	return ""
+}
+
+func (mp *ModelPickerModal) supportsEffortForSelected() bool {
+	// Strict cursor context validation per spec: only RowTypeModel with
+	// SupportsEffort == true qualifies. Provider headers are never effort-capable.
+	row := mp.selectedRow()
+	if row == nil || row.kind != mpRowItem {
+		return false
+	}
+	if m := mp.selectedModel(); m != nil {
+		// Prefer dynamic SupportsReasoning from registry discovery (API supported_parameters)
+		if m.SupportsReasoning != nil {
+			return *m.SupportsReasoning
+		}
+		return llm.ModelSupportsEffortWithProvider(m.Provider, m.ID)
+	}
+	return false
+}
+
+// shouldShowEffort reports whether the Effort UI should be allocated at all.
+// When false the TUI hides the component with 0-row height and reclaims space
+// for the model list viewport.
+func (mp *ModelPickerModal) shouldShowEffort() bool {
+	return mp.supportsEffortForSelected()
+}
+
+// chromeLines returns the current chrome budget based on Effort visibility.
+func (mp *ModelPickerModal) chromeLines() int {
+	if mp.shouldShowEffort() {
+		return modelPickerChromeLines
+	}
+	return modelPickerChromeLinesWithoutEffort
+}
+
+func (mp *ModelPickerModal) needsAuthForSelected() bool {
+	prov := mp.selectedProvider()
+	if prov == "" {
+		return false
+	}
+	if prov == "ollama" {
+		return false
+	}
+	return !config.HasCredentials(prov)
+}
+
+func (mp *ModelPickerModal) openAuthOverlay() {
+	prov := mp.selectedProvider()
+	if prov == "" {
+		// Fallback to first filtered model's provider if cursor on blank.
+		if len(mp.filtered) > 0 {
+			prov = mp.filtered[0].Provider
+		}
+	}
+	if prov == "" || prov == "ollama" {
+		return
+	}
+	mp.authOverlay = true
+	mp.authProvider = prov
+	mp.authInput.SetValue("")
+	mp.authInput.Focus()
+	mp.authErr = ""
+}
+
+func (mp *ModelPickerModal) closeAuthOverlay() {
+	mp.authOverlay = false
+	mp.authProvider = ""
+	mp.authErr = ""
+	mp.ti.Focus()
+}
+
+func (mp *ModelPickerModal) toggleCollapsed(provider string) {
+	if provider == "" {
+		return
+	}
+	mp.collapsed[provider] = !mp.collapsed[provider]
+	// After toggling, clamp cursor to stay within bounds and keep scroll in view.
+	rows := mp.visibleRows()
+	if len(rows) == 0 {
+		mp.cursor = 0
+		mp.scrollOffset = 0
+		return
+	}
+	if mp.cursor >= len(rows) {
+		mp.cursor = len(rows) - 1
+	}
+	if mp.cursor < 0 {
+		mp.cursor = 0
+	}
+	mp.clampScrollOffset()
+}
+
+// ── Update ───────────────────────────────────────────────────────────────────
+
 func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
 	switch msg := msg.(type) {
 	case modelPickerLoadedMsg:
@@ -246,9 +388,41 @@ func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
 		return mp, nil
 
 	case tea.KeyMsg:
+		// Auth overlay has priority.
+		if mp.authOverlay {
+			switch msg.Type {
+			case tea.KeyEscape:
+				mp.closeAuthOverlay()
+				return mp, nil
+			case tea.KeyEnter:
+				key := strings.TrimSpace(mp.authInput.Value())
+				if key == "" {
+					mp.authErr = "API key cannot be empty"
+					return mp, nil
+				}
+				// Persist via config.SaveProviderToken; on success close overlay and refresh status.
+				if err := config.SaveProviderToken(mp.authProvider, key); err != nil {
+					mp.authErr = err.Error()
+					return mp, nil
+				}
+				mp.closeAuthOverlay()
+				return mp, nil
+			default:
+				var cmd tea.Cmd
+				mp.authInput, cmd = mp.authInput.Update(msg)
+				return mp, cmd
+			}
+		}
+
 		switch msg.Type {
 		case tea.KeyCtrlR:
 			return mp, mp.RefreshModels(providerConfigsFromModel(mp.models))
+
+		case tea.KeyCtrlA:
+			if mp.needsAuthForSelected() {
+				mp.openAuthOverlay()
+			}
+			return mp, nil
 
 		case tea.KeyUp:
 			if mp.cursor > 0 {
@@ -258,30 +432,48 @@ func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
 			return mp, nil
 
 		case tea.KeyDown:
-			if mp.cursor < len(mp.filtered)-1 {
+			rows := mp.visibleRows()
+			if mp.cursor < len(rows)-1 {
 				mp.cursor++
 			}
 			mp.clampScrollOffset()
 			return mp, nil
 
 		case tea.KeyLeft:
+			if !mp.supportsEffortForSelected() {
+				return mp, nil
+			}
 			if mp.effortIdx > 0 {
 				mp.effortIdx--
 			}
 			return mp, nil
 
 		case tea.KeyRight:
+			if !mp.supportsEffortForSelected() {
+				return mp, nil
+			}
 			if mp.effortIdx < 3 {
 				mp.effortIdx++
 			}
 			return mp, nil
 
 		case tea.KeyEnter:
-			if mp.cursor >= 0 && mp.cursor < len(mp.filtered) {
-				selected := mp.filtered[mp.cursor]
-				effort := mp.CurrentEffort()
-				return mp, func() tea.Msg {
-					return modelSelectedMsg{model: selected, effort: effort}
+			row := mp.selectedRow()
+			if row == nil {
+				return mp, nil
+			}
+			if row.kind == mpRowHeader {
+				// Enter on header toggles collapse.
+				mp.toggleCollapsed(row.provider)
+				return mp, nil
+			}
+			if row.kind == mpRowItem {
+				if m := mp.selectedModel(); m != nil {
+					selected := *m
+					effort := mp.CurrentEffort()
+					return mp, func() tea.Msg {
+						return modelSelectedMsg{model: selected, effort: effort}
+					}
 				}
 			}
 			return mp, nil
@@ -289,11 +481,20 @@ func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
 		case tea.KeyEscape:
 			return mp, nil
 
+		case tea.KeyTab:
+			// Tab toggles collapse for selected provider (header or item's provider).
+			prov := mp.selectedProvider()
+			if prov != "" {
+				mp.toggleCollapsed(prov)
+			}
+			return mp, nil
+
 		default:
+			// Space is reserved for the search filter input and MUST NOT toggle collapse.
+			// Tab is the sole keybinding for collapsing provider groups (see case tea.KeyTab).
 			if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace || msg.Type == tea.KeyBackspace || msg.Type == tea.KeyDelete {
 				var cmd tea.Cmd
 				mp.ti, cmd = mp.ti.Update(msg)
-				mp.cursor = 0
 				mp.applyFilter()
 				return mp, cmd
 			}
@@ -318,36 +519,43 @@ func (mp *ModelPickerModal) SetSize(w, h int) {
 		tiWidth = 10
 	}
 	mp.ti.Width = tiWidth
+	// Keep auth input in sync
+	authW := w - 16
+	if authW < 10 {
+		authW = 10
+	}
+	mp.authInput.Width = authW
 
-	// Re-clamp the current scroll position: shrinking the pane can put
-	// the previous offset past the new (smaller) row budget.
 	mp.clampScrollOffset()
 }
 
-// listRowBudget returns how many rows the scrollable list body should
-// render this frame. It's derived from the last known terminal size
-// (via SetSize) minus the fixed chrome around it, floored at
-// modelListMinRows so the list never fully disappears in a tiny pane,
-// and falls back to the static modelListLineBudget default before the
-// first SetSize call has happened (e.g. mid-startup).
+// listRowBudget returns the strict AvailableListRows per spec 2A.
+// ModalHeight is fixed (min(0.75*termHeight,26)); AvailableListRows is
+// ModalHeight - (HeaderAndSearchArea + FooterArea + BordersAndPadding + EffortBlockArea?).
+// This ensures the list strictly terminates before the footer boundary and
+// the outer modal never jitters when hovering between reasoning/non-reasoning.
 func (mp *ModelPickerModal) listRowBudget() int {
 	if mp.height <= 0 {
 		return modelListLineBudget
 	}
-	budget := mp.height - modelPickerChromeLines
-	if budget < modelListMinRows {
-		budget = modelListMinRows
+	available := mp.height - mp.chromeLines()
+	if available < modelListMinRows {
+		available = modelListMinRows
 	}
-	return budget
+	if available > modelPickerMaxListRows {
+		available = modelPickerMaxListRows
+	}
+	// `visibleItems = items[scrollOffset : min(scrollOffset+AvailableListRows, len(items))]`
+	// is enforced in renderList via budget truncation.
+	return available
+}
+
+// AvailableListRows is the public strict budget per spec, alias for listRowBudget.
+func (mp *ModelPickerModal) AvailableListRows() int {
+	return mp.listRowBudget()
 }
 
 // ── Row model ────────────────────────────────────────────────────────────
-//
-// The list body is windowed and padded in terms of *rendered lines*, not
-// filtered items. A provider boundary produces a blank separator row plus
-// a header row in addition to the item rows — all of those now count
-// against the same fixed modelListLineBudget, so the body height (and
-// therefore the modal's outer border) never changes as the cursor moves.
 
 type mpRowKind int
 
@@ -369,52 +577,45 @@ func (mp *ModelPickerModal) buildRows() []mpRow {
 	for i, m := range mp.filtered {
 		if m.Provider != prevProvider {
 			if prevProvider != "" {
-				rows = append(rows, mpRow{kind: mpRowBlank})
+				// Only insert blank separator if previous provider wasn't collapsed
+				// (collapsed groups have no item rows, so blank would be spurious).
+				if !mp.collapsed[prevProvider] {
+					rows = append(rows, mpRow{kind: mpRowBlank})
+				}
 			}
 			rows = append(rows, mpRow{kind: mpRowHeader, provider: m.Provider})
 			prevProvider = m.Provider
+		}
+		if mp.collapsed[m.Provider] {
+			continue
 		}
 		rows = append(rows, mpRow{kind: mpRowItem, itemIndex: i})
 	}
 	return rows
 }
 
-func rowIndexForItem(rows []mpRow, itemIndex int) int {
-	for i, r := range rows {
-		if r.kind == mpRowItem && r.itemIndex == itemIndex {
-			return i
-		}
-	}
-	return 0
-}
-
 func (mp *ModelPickerModal) clampScrollOffset() {
-	if len(mp.filtered) == 0 {
-		mp.scrollOffset = 0
-		return
-	}
-	if mp.cursor >= len(mp.filtered) {
-		mp.cursor = len(mp.filtered) - 1
-	}
-	if mp.cursor < 0 {
-		mp.cursor = 0
-	}
-
 	rows := mp.buildRows()
 	total := len(rows)
 	if total == 0 {
 		mp.scrollOffset = 0
+		if mp.cursor < 0 {
+			mp.cursor = 0
+		}
 		return
 	}
-
-	cursorRow := rowIndexForItem(rows, mp.cursor)
+	if mp.cursor >= total {
+		mp.cursor = total - 1
+	}
+	if mp.cursor < 0 {
+		mp.cursor = 0
+	}
 	budget := mp.listRowBudget()
 
-	// Keep the cursor's row inside the visible window.
-	if cursorRow < mp.scrollOffset {
-		mp.scrollOffset = cursorRow
-	} else if cursorRow >= mp.scrollOffset+budget {
-		mp.scrollOffset = cursorRow - budget + 1
+	if mp.cursor < mp.scrollOffset {
+		mp.scrollOffset = mp.cursor
+	} else if mp.cursor >= mp.scrollOffset+budget {
+		mp.scrollOffset = mp.cursor - budget + 1
 	}
 
 	maxOffset := total - budget
@@ -430,11 +631,13 @@ func (mp *ModelPickerModal) clampScrollOffset() {
 }
 
 func (mp *ModelPickerModal) applyFilter() {
-	mp.scrollOffset = 0
-	mp.cursor = 0
 	query := mp.ti.Value()
 	if query == "" {
 		mp.filtered = mp.models
+		// Reset cursor to first row, keep collapsed state as user left it.
+		mp.cursor = 0
+		mp.scrollOffset = 0
+		mp.clampScrollOffset()
 		return
 	}
 
@@ -452,6 +655,20 @@ func (mp *ModelPickerModal) applyFilter() {
 		results = results[:100]
 	}
 	mp.filtered = results
+
+	// Auto-expand groups containing search matches.
+	matchedProviders := make(map[string]bool)
+	for _, m := range results {
+		matchedProviders[m.Provider] = true
+	}
+	for prov := range matchedProviders {
+		mp.collapsed[prov] = false
+	}
+	// Optionally collapse groups with no matches? They have no rows anyway, so no effect.
+
+	mp.cursor = 0
+	mp.scrollOffset = 0
+	mp.clampScrollOffset()
 }
 
 func (mp *ModelPickerModal) View() string {
@@ -460,6 +677,9 @@ func (mp *ModelPickerModal) View() string {
 	}
 	if mp.state == mpErr {
 		return mp.renderError()
+	}
+	if mp.authOverlay {
+		return mp.renderAuthOverlay()
 	}
 	return mp.renderList()
 }
@@ -482,6 +702,37 @@ func (mp *ModelPickerModal) renderError() string {
 		BorderForeground(lipgloss.Color(colorRed)).
 		Align(lipgloss.Center, lipgloss.Center).
 		Render(fmt.Sprintf("Error: %s", mp.errMsg))
+}
+
+func (mp *ModelPickerModal) renderAuthOverlay() string {
+	var b strings.Builder
+	title := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color(colorMauve)).
+		Render(fmt.Sprintf(" Authenticate %s ", strings.ToUpper(mp.authProvider)))
+	b.WriteString(title)
+	b.WriteString("\n\n")
+	b.WriteString(mutedStyle.Render(fmt.Sprintf("Provider %q needs credentials.", mp.authProvider)))
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render("Enter API key (input hidden) — Enter to save, Esc to cancel"))
+	b.WriteString("\n\n")
+	b.WriteString(mp.authInput.View())
+	b.WriteString("\n")
+	if mp.authErr != "" {
+		b.WriteString(redStyle.Render("  " + mp.authErr))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+	footer := mutedStyle.Render("↵ save  Esc cancel")
+	b.WriteString(footer)
+
+	content := b.String()
+	return lipgloss.NewStyle().
+		Width(mp.width-4).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(colorOrange)).
+		Padding(1, 3).
+		Render(content)
 }
 
 func (mp *ModelPickerModal) renderList() string {
@@ -509,17 +760,16 @@ func (mp *ModelPickerModal) renderList() string {
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Faint(true).Render("Ctrl+R refresh"))
 	b.WriteString("\n\n")
 
-	// ── Effort / Intent Slider ───────────────────────────────────────────
-	effortRow := mp.renderEffortSlider()
-	b.WriteString(effortRow)
-	b.WriteString("\n\n")
+	// ── Effort / Intent Slider (hidden when not applicable — 0-row height) ───────
+	if mp.shouldShowEffort() {
+		effortRow := mp.renderEffortSlider()
+		b.WriteString(effortRow)
+		b.WriteString("\n\n")
+	}
 
 	// ── Resizable, row-based scrolling list ─────────────────────────────
-	// budget is recomputed from the last known terminal size (see
-	// listRowBudget) rather than a hardcoded constant, so a narrow/short
-	// tmux split pane shrinks the list instead of clipping the modal.
 	budget := mp.listRowBudget()
-	rows := mp.buildRows()
+	rows := mp.visibleRows()
 	total := len(rows)
 
 	if mp.scrollOffset > total {
@@ -534,24 +784,55 @@ func (mp *ModelPickerModal) renderList() string {
 	}
 	window := rows[mp.scrollOffset:end]
 
-	for _, row := range window {
+	query := mp.ti.Value()
+	for idx, row := range window {
+		absRow := mp.scrollOffset + idx
+		isSelected := absRow == mp.cursor
 		switch row.kind {
 		case mpRowBlank:
 			b.WriteString("\n")
 
 		case mpRowHeader:
+			collapsed := mp.collapsed[row.provider]
+			arrow := "▼"
+			if collapsed {
+				arrow = "▶"
+			}
 			providerStyle := lipgloss.NewStyle().
 				Bold(true).
 				Foreground(lipgloss.Color(colorSapphire))
-			header := " " + strings.ToUpper(row.provider)
+			// Highlight header when selected (keyboard-first).
+			if isSelected {
+				providerStyle = providerStyle.Background(lipgloss.Color(colorSurface)).Foreground(lipgloss.Color(colorAccent))
+			}
+			prefix := " "
+			if isSelected {
+				prefix = Icon.Chevron + " "
+			}
+			header := prefix + arrow + " " + strings.ToUpper(row.provider)
+			if collapsed {
+				// Count hidden models for hint
+				hidden := 0
+				for _, m := range mp.filtered {
+					if m.Provider == row.provider {
+						hidden++
+					}
+				}
+				if hidden > 0 {
+					header += mutedStyle.Render(fmt.Sprintf(" (%d)", hidden))
+				}
+			}
 
 			authLabel := providerAuthStatus(row.provider)
 			if authLabel != "" {
-				if strings.Contains(authLabel, "✓") {
+				if strings.Contains(authLabel, "✓") || strings.Contains(authLabel, "Logged") {
 					header += "  " + greenStyle.Render(authLabel)
 				} else {
 					header += "  " + redStyle.Render(authLabel)
 				}
+			}
+			if collapsed {
+				header += dimmedStyle.Render("  [collapsed]")
 			}
 			b.WriteString(providerStyle.Render(header))
 			b.WriteString("\n")
@@ -560,32 +841,82 @@ func (mp *ModelPickerModal) renderList() string {
 			m := mp.filtered[row.itemIndex]
 			cursor := "  "
 			itemStyle := dimmedStyle
-			if row.itemIndex == mp.cursor {
+			if isSelected {
 				cursor = Icon.Chevron + " "
 				itemStyle = lipgloss.NewStyle().
 					Foreground(lipgloss.Color(colorAccent)).
 					Bold(true)
 			}
-			// Truncate long model IDs in narrow panes instead of letting
-			// them wrap and blow out the fixed row budget.
-			maxIDWidth := mp.width - 12
-			id := truncateWithEllipsis(m.ID, maxIDWidth)
-			fmt.Fprintf(&b, "%s%s", cursor, itemStyle.Render(id))
+			// Build line with badges: "model-id  •  200k  [Vision] [Tools]"
+			// Use ModelInfo.ContextWindow when available (accurate API value: 128k for DeepSeek),
+			// fallback to heuristic only if registry did not populate it.
+			ctxWindow := m.ContextWindow
+			if ctxWindow == 0 {
+				ctxWindow = llm.ContextWindowFor(m.ID)
+			}
+			badgeCtx := llm.FormatContextWindow(ctxWindow)
+			caps := llm.ModelCapabilities(m.ID)
+
+			// Assemble badge suffix (un-styled for width calc)
+			var badgeParts []string
+			if badgeCtx != "" {
+				badgeParts = append(badgeParts, badgeCtx)
+			}
+			for _, c := range caps {
+				badgeParts = append(badgeParts, "["+c+"]")
+			}
+			badgeStr := ""
+			if len(badgeParts) > 0 {
+				badgeStr = "  •  " + strings.Join(badgeParts, " ")
+			}
+
+			// Truncation: ensure line fits within mp.width.
+			// Reserve: cursor (2) + padding/border slack (approx 8) + badges
+			maxIDWidth := mp.width - 14 - lipgloss.Width(badgeStr)
+			if maxIDWidth < 8 {
+				maxIDWidth = 8
+			}
+			rawID := m.ID
+			truncatedRaw := truncateWithEllipsis(rawID, maxIDWidth)
+			// Re-apply highlight on truncated raw
+			styledID := truncatedRaw
+			if query != "" {
+				styledID = highlightMatch(truncatedRaw, query)
+			}
+
+			// Combine: styled ID + muted badges
+			var line string
+			if isSelected {
+				accentID := lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Bold(true).Render(styledID)
+				line = accentID + mutedStyle.Render(badgeStr)
+			} else {
+				line = itemStyle.Render(styledID) + mutedStyle.Render(badgeStr)
+			}
+
+			fmt.Fprintf(&b, "%s%s", cursor, line)
 			b.WriteString("\n")
 		}
 	}
 
-	// Pad blank lines so the body — and therefore the whole modal — never
-	// changes height for a given terminal size, no matter how many
-	// header/blank rows were in view. (It *does* change across a resize,
-	// since budget itself is resize-driven — that's the point.)
+	// Pad blank lines so the body never changes height for a given terminal size.
 	for i := len(window); i < budget; i++ {
 		b.WriteString("\n")
 	}
 	b.WriteString("\n")
 
 	// ── Footer ──────────────────────────────────────────────────────────
-	footer := mutedStyle.Render("↑↓ navigate  ↵ select  ←→ effort  Esc close")
+	footerParts := []string{"↑↓ navigate", "↵ select", "Esc close"}
+	if mp.supportsEffortForSelected() {
+		footerParts = append([]string{"←→ effort"}, footerParts...)
+	}
+	// Tab hint - Space is reserved for search input
+	footerParts = append(footerParts, "Tab collapse")
+	if mp.needsAuthForSelected() {
+		footerParts = append(footerParts, lipgloss.NewStyle().Foreground(lipgloss.Color(colorOrange)).Bold(true).Render("Ctrl+A auth"))
+	} else {
+		footerParts = append(footerParts, "Ctrl+R refresh")
+	}
+	footer := mutedStyle.Render(strings.Join(footerParts, "  •  "))
 	b.WriteString(footer)
 
 	borderColor := lipgloss.Color(colorMauve)
@@ -599,30 +930,92 @@ func (mp *ModelPickerModal) renderList() string {
 		Render(content)
 }
 
+// highlightMatch wraps occurrences of query in the text with an underline accent style.
+// It operates on plain strings (no ANSI) and returns a lipgloss-styled string.
+func highlightMatch(text, query string) string {
+	if query == "" || text == "" {
+		return text
+	}
+	lowerText := strings.ToLower(text)
+	lowerQuery := strings.ToLower(query)
+	idx := strings.Index(lowerText, lowerQuery)
+	if idx < 0 {
+		return text
+	}
+	// Highlight only first occurrence for simplicity; handles rune-safe slicing via rune indices.
+	runes := []rune(text)
+	lowerRunes := []rune(lowerText)
+	queryRunes := []rune(lowerQuery)
+	qLen := len(queryRunes)
+	// Find rune index
+	rIdx := -1
+	for i := 0; i+qLen <= len(lowerRunes); i++ {
+		match := true
+		for j := 0; j < qLen; j++ {
+			if lowerRunes[i+j] != queryRunes[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			rIdx = i
+			break
+		}
+	}
+	if rIdx < 0 {
+		return text
+	}
+	before := string(runes[:rIdx])
+	matched := string(runes[rIdx : rIdx+qLen])
+	after := string(runes[rIdx+qLen:])
+	hl := lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Bold(true).Underline(true).Render(matched)
+	return before + hl + after
+}
+
 // renderEffortSlider renders the interactive effort/intent slider.
-// Visual layout: auto ───○─── low ────── medium ────── high
+// Caller guarantees shouldShowEffort() == true; the component is hidden
+// otherwise with 0-row height so vertical space is reclaimed for the list.
+// It also displays real-time token info per spec: "Effort: medium (Thinking Budget: 16k | Total Max: 20k tokens)"
 func (mp *ModelPickerModal) renderEffortSlider() string {
 	levels := []struct {
 		label string
 		desc  string
 	}{
-		{"auto", "Let model decide"},
-		{"low", "Fast-Track"},
-		{"medium", "Hybrid"},
-		{"high", "Senior Arch"},
+		{"auto", "auto"},
+		{"low", "low"},
+		{"medium", "medium"},
+		{"high", "high"},
 	}
 
 	trackLen := 4
 	var b strings.Builder
 
-	// Description line — tinted to match the selected level, so the
-	// color reads as "how heavy is this effort" at a glance.
 	effort := mp.CurrentEffort()
 	levelStyle := effort.Style()
-	desc := levelStyle.Render(effort.Description())
+	// Base effort label
+	baseDesc := effort.Description()
+	// Enrich with token info via TokenManager when model is known
+	if m := mp.selectedModel(); m != nil {
+		tm := llm.NewTokenManager()
+		info := tm.InfoFor(m.Provider, m.ID, effort.String())
+		thinkingStr := llm.FormatTokenCount(info.ThinkingBudget)
+		totalStr := llm.FormatTokenCount(info.TotalMax)
+		if effort == EffortAuto {
+			// Auto has no thinking budget, show total only
+			if info.TotalMax > 0 {
+				baseDesc = fmt.Sprintf("%s (Total Max: %s tokens)", baseDesc, totalStr)
+			}
+		} else {
+			if info.ThinkingBudget > 0 && info.TotalMax > 0 {
+				baseDesc = fmt.Sprintf("%s (Thinking Budget: %s | Total Max: %s tokens)", baseDesc, thinkingStr, totalStr)
+			} else if info.TotalMax > 0 {
+				baseDesc = fmt.Sprintf("%s (Total Max: %s tokens)", baseDesc, totalStr)
+			}
+		}
+	}
+	desc := levelStyle.Render(baseDesc)
 	b.WriteString("  " + mutedStyle.Render("Effort:") + " " + desc + "\n")
 
-	// Slider track
 	b.WriteString("  ")
 	for i, lvl := range levels {
 		if i == mp.effortIdx {
@@ -650,9 +1043,7 @@ func (mp *ModelPickerModal) renderEffortSlider() string {
 }
 
 // truncateWithEllipsis shortens s to fit within max runes, replacing the
-// tail with "…" when it doesn't fit. Operates on the raw (unstyled)
-// string, so callers should truncate before applying lipgloss styling.
-// A non-positive max is treated as "no room" and returns "".
+// tail with "…" when it doesn't fit.
 func truncateWithEllipsis(s string, max int) string {
 	if max <= 0 {
 		return ""
@@ -689,6 +1080,10 @@ func providerConfigsFromModel(models []llm.ModelInfo) map[string]string {
 			seen["anthropic"] = ""
 		case "openai":
 			seen["openai"] = ""
+		case "gemini":
+			seen["gemini"] = ""
+		case "groq":
+			seen["groq"] = ""
 		}
 	}
 	return seen

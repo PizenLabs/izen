@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/llm"
 )
 
 // ErrOpenRouterAuth is returned when OpenRouter authentication fails (HTTP 401
@@ -318,14 +319,15 @@ type openrouterMessage struct {
 }
 
 type openrouterRequest struct {
-	Model         string              `json:"model"`
-	Messages      []openrouterMessage `json:"messages"`
-	MaxTokens     int                 `json:"max_tokens,omitempty"`
-	Temperature   float64             `json:"temperature,omitempty"`
-	Stop          []string            `json:"stop,omitempty"`
-	Stream        bool                `json:"stream"`
-	StreamOptions *streamOptions      `json:"stream_options,omitempty"`
-	Tools         []json.RawMessage   `json:"tools,omitempty"`
+	Model               string              `json:"model"`
+	Messages            []openrouterMessage `json:"messages"`
+	MaxTokens           int                 `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int                 `json:"max_completion_tokens,omitempty"`
+	Temperature         float64             `json:"temperature,omitempty"`
+	Stop                []string            `json:"stop,omitempty"`
+	Stream              bool                `json:"stream"`
+	StreamOptions       *streamOptions      `json:"stream_options,omitempty"`
+	Tools               []json.RawMessage   `json:"tools,omitempty"`
 	// Reasoning carries OpenRouter's provider-agnostic reasoning control. It
 	// is injected from the dynamically resolved effort directive; a nil value
 	// omits the field entirely.
@@ -370,36 +372,23 @@ func reasoningFor(req ai.Request) *openrouterReasoning {
 	return r
 }
 
-// openRouterNonReasoningModels lists model-family markers known to reject
-// OpenRouter's provider-agnostic reasoning payload. Injecting the reasoning
-// object into these models makes the gateway reject the entire request with
-// HTTP 400 (tokens are billed at the gateway before the stream dies). Add a
-// family here when it is observed to reject the reasoning schema so the
-// payload is sanitized up front instead of relying on the retry in
-// doChatRequest.
-var openRouterNonReasoningModels = []string{
-	"gemma",
-}
-
 // openRouterModelSupportsReasoning reports whether the target model accepts
-// OpenRouter's reasoning control. Reasoning is only injected for models known
-// to expose a native reasoning mechanism; unknown models are treated as
-// reasoning-capable and fall back to the HTTP 400 retry in doChatRequest when
-// the gateway disagrees, so a false positive never fails the request.
+// OpenRouter's reasoning control. It delegates to the strict explicit
+// whitelist in llm.ModelSupportsEffortWithProvider — only verified
+// reasoning families (openai/o1*, openai/o3*, anthropic/claude-3-7-sonnet*,
+// deepseek/deepseek-r1*) return true. All other models (qwen2.5,
+// aion-labs/aion-3.0, gemma, etc.) return false so the reasoning payload is
+// never injected and the gateway never rejects with HTTP 400.
 func openRouterModelSupportsReasoning(model string) bool {
-	name := strings.ToLower(strings.TrimSpace(model))
-	for _, marker := range openRouterNonReasoningModels {
-		if strings.Contains(name, marker) {
-			return false
-		}
-	}
-	return true
+	return llm.ModelSupportsEffortWithProvider("openrouter", model)
 }
 
 // buildRequest assembles the OpenRouter chat-completion payload for a request.
 // The reasoning control is injected only when the target model supports the
 // reasoning schema (see openRouterModelSupportsReasoning), so a non-reasoning
 // model never receives a payload the gateway rejects with HTTP 400.
+// It also enforces provider-specific token contracts via TokenManager:
+// OpenAI => reasoning_effort + max_completion_tokens, Anthropic => max_tokens = budget+4096.
 func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage, req ai.Request, stream bool) openrouterRequest {
 	body := openrouterRequest{
 		Model:       model,
@@ -415,6 +404,52 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 	}
 	if !openRouterModelSupportsReasoning(model) {
 		body.Reasoning = nil
+	} else if body.Reasoning != nil {
+		// Enforce token contracts via TokenManager
+		tm := llm.NewTokenManager()
+		effort := body.Reasoning.Effort
+		// For openrouter vendor-prefixed IDs, infer effective provider
+		payload := tm.BuildPayload("openrouter", model, effort)
+		lowerModel := strings.ToLower(model)
+		switch {
+		case strings.HasPrefix(lowerModel, "openai/o1") || strings.HasPrefix(lowerModel, "openai/o3"):
+			// OpenAI: reasoning_effort + max_completion_tokens
+			if payload.ReasoningEffort != "" {
+				body.Reasoning.Effort = payload.ReasoningEffort
+			}
+			body.Reasoning.MaxTokens = 0
+			if payload.MaxCompletionTokens > 0 {
+				body.MaxCompletionTokens = payload.MaxCompletionTokens
+				// Also keep MaxTokens for compatibility; some gateways map it
+				if body.MaxTokens == 0 || body.MaxTokens < payload.MaxCompletionTokens {
+					body.MaxTokens = payload.MaxCompletionTokens
+				}
+			}
+		case strings.HasPrefix(lowerModel, "anthropic/claude-3-7"):
+			// Anthropic: thinking.budget_tokens + max_tokens = budget+4096
+			body.Reasoning.Effort = ""
+			if payload.ThinkingBudget > 0 {
+				body.Reasoning.MaxTokens = payload.ThinkingBudget
+			}
+			if payload.MaxTokens > 0 {
+				body.MaxTokens = payload.MaxTokens
+				body.MaxCompletionTokens = 0
+			}
+		default:
+			// Generic: apply thinking budget if present
+			if payload.ThinkingBudget > 0 {
+				body.Reasoning.MaxTokens = payload.ThinkingBudget
+			}
+			if payload.MaxTokens > 0 && body.MaxTokens == 0 {
+				body.MaxTokens = payload.MaxTokens
+			}
+		}
+		// Ensure Anthropic max_tokens > budget_tokens
+		if strings.HasPrefix(lowerModel, "anthropic/") && body.Reasoning != nil && body.Reasoning.MaxTokens > 0 {
+			if body.MaxTokens <= body.Reasoning.MaxTokens {
+				body.MaxTokens = body.Reasoning.MaxTokens + 4096
+			}
+		}
 	}
 	if len(req.Tools) > 0 {
 		rawTools := make([]json.RawMessage, 0, len(req.Tools))

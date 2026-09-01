@@ -129,7 +129,7 @@ func TestOpenRouterReasoningEffortInjected(t *testing.T) {
 
 func TestOpenRouterReasoningCoTLimitInjected(t *testing.T) {
 	client, body := captureClient(t)
-	p := NewOpenRouterProvider("key", "cohere/north-mini-code", "https://openrouter.example.com/api/v1")
+	p := NewOpenRouterProvider("key", "deepseek/deepseek-r1", "https://openrouter.example.com/api/v1")
 	p.client = client
 	_, err := p.Execute(context.Background(), ai.Request{Reasoning: &ai.ReasoningConfig{CoTLimit: 512}})
 	if err != nil {

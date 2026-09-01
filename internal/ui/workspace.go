@@ -86,52 +86,57 @@ func (r *Registry) For(mode modes.Mode) (ViewMode, bool) {
 // it resolves UI lifecycle overlays (init / help / loading) and otherwise
 // delegates to the registered ViewMode for the current mode. The renderer
 // never sees mode, banner, prompt, footer, or action logic.
-// modelPickerPreferredWidth/Height are the "comfortable" dialog size used
-// whenever the terminal (or tmux/split pane) has room for it.
-const modelPickerPreferredWidth = 68
-const modelPickerPreferredHeight = 18
+// modelPickerPreferredWidth/Height are kept for backward compat but the
+// strict viewport spec now governs dimensions deterministically.
+const modelPickerPreferredWidth = 84
+const modelPickerPreferredHeight = 26
 
 // modelPickerEdgeMargin is the minimum gap kept between the modal's own
-// border and the raw edge of the terminal/pane, so the border never sits
-// flush against (or past) the boundary.
+// border and the raw edge of the terminal/pane.
 const modelPickerEdgeMargin = 2
 
 // modelPickerDialogSize computes the size to hand to ModelPickerModal.SetSize
-// for the *current* terminal dimensions (m.width/m.height, kept up to date by
-// the tea.WindowSizeMsg handler in update.go).
-//
-// This used to be hardcoded as SetSize(68, 18) here, unconditionally, on
-// every single render. That's what caused the modal to get its border
-// sliced off in a narrow tmux/terminal split: no matter how small the pane
-// actually was, this call re-stamped the picker's width/height back to a
-// fixed 68x18 immediately before every View(), overwriting whatever
-// correct, pane-aware size had just been computed. The picker's own
-// internal resizing logic (ModelPickerModal.listRowBudget, etc.) never got
-// a chance to run, because it was never told the real size in the first
-// place.
-//
-// Now the preferred 68x18 is only used when it actually fits; otherwise we
-// shrink to the available space, floored at the picker's own
-// modelPickerMinWidth/modelPickerMinHeight so the two never disagree.
+// deterministically per spec: ModalHeight = min(0.75*termHeight,26),
+// ModalWidth = min(0.80*termWidth,84). Outer height is fixed and never
+// jitters when hovering between reasoning/non-reasoning models; only
+// AvailableListRows inside shifts by EffortBlockArea (4 rows).
 func (m *model) modelPickerDialogSize() (int, int) {
-	w := modelPickerPreferredWidth
-	h := modelPickerPreferredHeight
-
-	if m.width > 0 {
-		if maxW := m.width - modelPickerEdgeMargin; maxW < w {
-			w = maxW
+	termH := m.height
+	termW := m.width
+	// Fixed outer dimensions per spec. Use terminal size when known, fallback to preferred.
+	var h, w int
+	if termH > 0 {
+		h = int(float64(termH) * 0.75)
+		if h > 26 {
+			h = 26
 		}
-	}
-	if m.height > 0 {
-		if maxH := m.height - modelPickerEdgeMargin; maxH < h {
+		// Ensure modal fits inside terminal with edge margin and respects floor.
+		if maxH := termH - modelPickerEdgeMargin; maxH < h {
 			h = maxH
 		}
+		if h < modelPickerMinHeight {
+			h = modelPickerMinHeight
+		}
+		// Also ensure at least header+footer+borders fits (without effort =10 + minRows)
+		if h < modelPickerHeaderAndSearchArea+modelPickerFooterArea+modelPickerBordersAndPadding+modelListMinRows {
+			h = modelPickerHeaderAndSearchArea + modelPickerFooterArea + modelPickerBordersAndPadding + modelListMinRows
+		}
+	} else {
+		h = modelPickerPreferredHeight
 	}
-	if w < modelPickerMinWidth {
-		w = modelPickerMinWidth
-	}
-	if h < modelPickerMinHeight {
-		h = modelPickerMinHeight
+	if termW > 0 {
+		w = int(float64(termW) * 0.80)
+		if w > 84 {
+			w = 84
+		}
+		if maxW := termW - modelPickerEdgeMargin; maxW < w {
+			w = maxW
+		}
+		if w < modelPickerMinWidth {
+			w = modelPickerMinWidth
+		}
+	} else {
+		w = modelPickerPreferredWidth
 	}
 	return w, h
 }
