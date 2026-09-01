@@ -42,6 +42,7 @@ func printMinimalistHelp() {
 	fmt.Println("  izen memory optimize    Alias for izen compact")
 	fmt.Println("  izen rollback           Review recent file mutations")
 	fmt.Println("  izen run \"<prompt>\"      Execute a prompt through the v3 agent runtime")
+	fmt.Println("  izen orchestrate \"<target>\"  Run the control-plane orchestrator on a target")
 	fmt.Println("  izen [path]             Start TUI at the given project path")
 	fmt.Println()
 	fmt.Println("Interactive Commands (inside TUI):")
@@ -95,6 +96,12 @@ func main() {
 			os.Exit(0)
 		case "run":
 			if err := runRuntimeCommand(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		case "orchestrate":
+			if err := runOrchestrateCommand(os.Args[2:]); err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				os.Exit(1)
 			}
