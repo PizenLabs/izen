@@ -37,6 +37,13 @@ var (
 	// candidate is REJECTED — never passed to safety barriers.
 	ErrASTDegradation = errors.New("rmah: candidate degrades baseline AST")
 
+	// ErrDestructiveTruncation is returned by Tier 2 when a whole-file
+	// extraction candidate silently truncates a structurally sound baseline
+	// file (retains less than the retention floor of the baseline byte size).
+	// The candidate is REJECTED — it would destroy the majority of the target
+	// content even though it passes AST syntax validation.
+	ErrDestructiveTruncation = errors.New("RMAH Tier 2: candidate rejected due to potential destructive truncation (retains < 60% of target content)")
+
 	// ErrNoExtractableContent is returned by Tier 2 when no raw code content
 	// could be extracted from fenced blocks (e.g., prose-only output).
 	ErrNoExtractableContent = errors.New("rmah: no extractable code content")
@@ -138,6 +145,13 @@ func NewPipelineWithLimit(maxBytes int) *Pipeline {
 // cannot flood the safety barriers with a multi-megabyte payload.
 const defaultMaxCandidateBytes = 50 * 1024
 
+// retentionFloorRatio is the minimum fraction of the baseline byte size a
+// whole-file Tier 2 candidate must retain. A candidate below this floor
+// silently truncates a structurally sound baseline (an LLM emitting a partial
+// snippet instead of a full document rewrite) and is rejected even though it
+// passes AST syntax validation.
+const retentionFloorRatio = 0.60
+
 // Process runs the full RMAH pipeline over rawLLMOutput for the given target
 // file. original is the current content of the target file (the baseline).
 //
@@ -173,6 +187,8 @@ func (p *Pipeline) Process(rawLLMOutput, target, original string) TierResult {
 //   - Candidate exceeds maxCandidateBytes → reject (token bounds).
 //   - Baseline was clean and candidate degrades to corrupt → reject with
 //     ErrASTDegradation.
+//   - Baseline was clean and candidate retains < 60% of the baseline byte
+//     size → reject with ErrDestructiveTruncation (Content Retention Floor).
 //   - Candidate produces a valid AST or resolves corruption → pass to safety
 //     barriers.
 func (p *Pipeline) tier2ConservativeExtract(rawLLMOutput, target, original string) TierResult {
@@ -206,6 +222,23 @@ func (p *Pipeline) tier2ConservativeExtract(rawLLMOutput, target, original strin
 			return TierResult{
 				Rejected:     true,
 				RejectReason: fmt.Sprintf("%v: baseline %q is parseable but candidate is not", ErrASTDegradation, target),
+			}
+		}
+
+		// CONTENT RETENTION FLOOR RATIO: a whole-file extraction candidate for
+		// a structurally sound baseline must retain at least 60% of the
+		// baseline byte size. An LLM that emits a partial snippet (e.g., 20
+		// lines) instead of a full document rewrite passes AST syntax
+		// validation while silently truncating the majority of the target.
+		// Fail-closed: the candidate is rejected.
+		baselineBytes := len(original)
+		if baselineBytes > 0 {
+			ratio := float64(len(candidate)) / float64(baselineBytes)
+			if ratio < retentionFloorRatio {
+				return TierResult{
+					Rejected:     true,
+					RejectReason: fmt.Sprintf("%v: target %q", ErrDestructiveTruncation, target),
+				}
 			}
 		}
 	}

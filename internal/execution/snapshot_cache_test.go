@@ -44,7 +44,7 @@ func TestSnapshotCache_InvalidatedAfterApply(t *testing.T) {
 		ExpiresAt: time.Now().Add(1 * time.Hour),
 	})
 	pm.SetOnMutation(func(t string, written []byte) {
-		x.invalidateSnapshot(t, written)
+		x.invalidateSnapshot(t)
 	})
 
 	patch := &Patch{
@@ -86,7 +86,7 @@ func TestSnapshotCache_UpdatedAfterFileCreate(t *testing.T) {
 		ExpiresAt: time.Now().Add(1 * time.Hour),
 	})
 	pm.SetOnMutation(func(t string, written []byte) {
-		x.invalidateSnapshot(t, written)
+		x.invalidateSnapshot(t)
 	})
 
 	patch := &Patch{
@@ -126,12 +126,35 @@ func TestSnapshotCache_InvalidationIsExplicit(t *testing.T) {
 		t.Fatalf("precondition failed: cache should have original")
 	}
 
-	// Explicit invalidation with nil written bytes (deletion).
-	x.invalidateSnapshot(target, nil)
+	// Explicit invalidation purges the cache keys (key erasure).
+	x.invalidateSnapshot(target)
 
-	// ── ASSERT: cache entry is removed. ──
-	if _, ok := x.getSnapshotContent(target); ok {
-		t.Fatal("cache entry should be removed after explicit invalidation")
+	// ── ASSERT: every path alias is purged from the cache map. ──
+	x.observeSnapshotMu.RLock()
+	purged := func() bool {
+		_, rel := x.observeSnapshot[target]
+		_, base := x.observeSnapshot[filepath.Base(target)]
+		_, abs := x.observeSnapshot[filepath.Join(dir, target)]
+		return !rel && !base && !abs
+	}()
+	x.observeSnapshotMu.RUnlock()
+	if !purged {
+		t.Fatal("cache keys should be purged after invalidation (key erasure, not value update)")
+	}
+
+	// ── ASSERT: the next observation pulls through disk truth. ──
+	// Rewrite the file on disk to a NEW value AFTER invalidation; the
+	// pull-through must observe the new disk state, never the stale cache.
+	updated := `{"key": "new"}`
+	if err := os.WriteFile(filepath.Join(dir, target), []byte(updated), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data, ok := x.getSnapshotContent(target)
+	if !ok {
+		t.Fatal("pull-through: cache should be re-populated from disk after invalidation")
+	}
+	if string(data) != updated {
+		t.Fatalf("stale pull-through: got %q, want %q (fresh disk read)", string(data), updated)
 	}
 }
 
@@ -156,7 +179,7 @@ func TestSnapshotCache_NoStaleReadAfterMutation(t *testing.T) {
 		ExpiresAt: time.Now().Add(1 * time.Hour),
 	})
 	pm.SetOnMutation(func(t string, written []byte) {
-		x.invalidateSnapshot(t, written)
+		x.invalidateSnapshot(t)
 	})
 
 	// Apply the patch.

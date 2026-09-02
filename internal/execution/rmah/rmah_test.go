@@ -1,6 +1,7 @@
 package rmah
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -111,6 +112,51 @@ func TestTier2_RejectsOversizedCandidate(t *testing.T) {
 	}
 	if !strings.Contains(result.RejectReason, "exceeds max size") {
 		t.Fatalf("reject reason should mention size, got: %s", result.RejectReason)
+	}
+}
+
+// TestTier2_RejectsDestructiveTruncation verifies the Content Retention Floor
+// guard: a partial snippet (15 lines) replacing a structurally sound 200-line
+// clean HTML target passes AST syntax validation but silently truncates the
+// majority of the file. Tier 2 MUST reject it.
+func TestTier2_RejectsDestructiveTruncation(t *testing.T) {
+	var baseline strings.Builder
+	baseline.WriteString("<!DOCTYPE html>\n<html>\n<head><title>App</title></head>\n<body>\n")
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&baseline, "<div class=\"row-%d\">content-%d</div>\n", i, i)
+	}
+	baseline.WriteString("</body>\n</html>\n")
+
+	var snippet strings.Builder
+	snippet.WriteString("<!DOCTYPE html>\n<html>\n<body>\n")
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&snippet, "<p>snippet-%d</p>\n", i)
+	}
+	snippet.WriteString("</body>\n</html>\n")
+
+	p := NewPipeline().
+		WithStrictExtractor(func(raw, orig string) (string, bool) {
+			return "", false // Tier 1 fails (no SEARCH/REPLACE)
+		}).
+		WithCodeExtractor(func(raw string) (string, bool) {
+			return snippet.String(), true
+		}).
+		WithBaselineVerifier(func(content, target string) bool {
+			// Both baseline and candidate are structurally sound HTML.
+			return strings.Contains(content, "<html>") && strings.Contains(content, "</html>")
+		})
+
+	result := p.Process("```html\n"+snippet.String()+"\n```", "index.html", baseline.String())
+
+	if result.Passed {
+		t.Fatal("Tier 2 MUST reject a partial snippet replacing a full clean document")
+	}
+	if !result.Rejected {
+		t.Fatal("destructive truncation should be explicitly rejected")
+	}
+	if !strings.Contains(result.RejectReason, "destructive truncation") ||
+		!strings.Contains(result.RejectReason, "retains < 60% of target content") {
+		t.Fatalf("reject reason should cite the retention floor guard, got: %s", result.RejectReason)
 	}
 }
 

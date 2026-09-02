@@ -496,12 +496,14 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 		return "", os.ErrNotExist
 	})
 	// Wire the mutation cache invalidation hook: after every successful file
-	// write the PatchManager updates the observe snapshot cache with the
-	// freshly written bytes. This eliminates stale-read conditions where
-	// post-mutation verification or re-validation reads pre-mutation bytes
-	// from memory after a file has been modified on disk.
-	x.patches.SetOnMutation(func(target string, written []byte) {
-		x.invalidateSnapshot(target, written)
+	// write the PatchManager purges the observe snapshot cache keys for the
+	// target. The next observation performs a single pull-through os.ReadFile
+	// and re-populates the cache with verified disk truth. This eliminates
+	// stale-read conditions where post-mutation verification or re-validation
+	// reads pre-mutation bytes from memory after a file has been modified on
+	// disk.
+	x.patches.SetOnMutation(func(target string, _ []byte) {
+		x.invalidateSnapshot(target)
 	})
 	if langID != "" {
 		x.verifier = NewLanguageVerifier(root, langID)
@@ -511,28 +513,35 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 	return x
 }
 
-// invalidateSnapshot updates the observe snapshot cache for target with the
-// freshly written bytes. It is the callback wired to PatchManager.onMutation
-// and is called immediately after every successful file write. By updating
-// the cache (rather than just deleting it), subsequent getSnapshotContent
-// calls fetch the newly written file state without an os.ReadFile round-trip.
-// When written is nil it deletes the cache entry (explicit invalidation).
-func (x *RuntimeExecutor) invalidateSnapshot(target string, written []byte) {
+// invalidateSnapshot purges the observe snapshot cache keys for target. It is
+// the callback wired to PatchManager.onMutation and is called immediately
+// after every successful file write. The path key is DELETED (never
+// re-populated with caller-supplied bytes): writing updated byte slices
+// directly into the cache risks path-alias divergence because PatchManager
+// uses canonical absolute paths while the observe cache is keyed by relative
+// workspace paths. After deletion the next getSnapshotContent performs a
+// single pull-through os.ReadFile and re-populates the cache with verified
+// disk truth.
+func (x *RuntimeExecutor) invalidateSnapshot(target string) {
 	x.observeSnapshotMu.Lock()
 	defer x.observeSnapshotMu.Unlock()
 	if x.observeSnapshot == nil {
 		return
 	}
-	if written == nil {
-		delete(x.observeSnapshot, target)
-		delete(x.observeSnapshot, filepath.Base(target))
-		path := filepath.Join(x.root, target)
-		delete(x.observeSnapshot, path)
-		return
+	normalizedPath := x.resolveSnapshotPath(target)
+	delete(x.observeSnapshot, target)
+	delete(x.observeSnapshot, filepath.Base(target))
+	delete(x.observeSnapshot, normalizedPath)
+}
+
+// resolveSnapshotPath returns the canonical absolute path for a target. It
+// treats an already-absolute target as canonical (the PatchManager spelling)
+// and joins relative workspace targets against the executor root.
+func (x *RuntimeExecutor) resolveSnapshotPath(target string) string {
+	if filepath.IsAbs(target) {
+		return filepath.Clean(target)
 	}
-	x.observeSnapshot[target] = written
-	x.observeSnapshot[filepath.Base(target)] = written
-	x.observeSnapshot[filepath.Join(x.root, target)] = written
+	return filepath.Join(x.root, target)
 }
 
 // SetAdmittedCapabilities replaces the capability set the runtime's admission
@@ -622,7 +631,7 @@ func (x *RuntimeExecutor) SetSessionResolver(fn func() string) {
 func (x *RuntimeExecutor) observeTargets(targets []string) {
 	cache := make(map[string][]byte)
 	for _, t := range targets {
-		path := filepath.Join(x.root, t)
+		path := x.resolveSnapshotPath(t)
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
@@ -637,23 +646,50 @@ func (x *RuntimeExecutor) observeTargets(targets []string) {
 	x.observeSnapshotMu.Unlock()
 }
 
+// getSnapshotContent returns the snapshot bytes for a target. On a cache hit
+// it returns the cached bytes; on a miss it performs a single pull-through
+// os.ReadFile against the canonical absolute path and re-populates the cache
+// with verified disk truth. The pull-through guarantees that a target purged
+// by invalidateSnapshot is re-observed from disk exactly once — a
+// path-alias divergence can never resurrect stale bytes.
 func (x *RuntimeExecutor) getSnapshotContent(target string) ([]byte, bool) {
 	x.observeSnapshotMu.RLock()
-	defer x.observeSnapshotMu.RUnlock()
-	if x.observeSnapshot == nil {
+	if x.observeSnapshot != nil {
+		if data, ok := x.observeSnapshot[target]; ok {
+			x.observeSnapshotMu.RUnlock()
+			return data, true
+		}
+		if data, ok := x.observeSnapshot[filepath.Base(target)]; ok {
+			x.observeSnapshotMu.RUnlock()
+			return data, true
+		}
+		path := x.resolveSnapshotPath(target)
+		if data, ok := x.observeSnapshot[path]; ok {
+			x.observeSnapshotMu.RUnlock()
+			return data, true
+		}
+	}
+	x.observeSnapshotMu.RUnlock()
+
+	// ── Pull-through: verified disk truth on a miss ────────────────────
+	path := x.resolveSnapshotPath(target)
+	data, err := os.ReadFile(path)
+	if err != nil {
 		return nil, false
 	}
-	if data, ok := x.observeSnapshot[target]; ok {
-		return data, true
+	x.observeSnapshotMu.Lock()
+	if x.observeSnapshot == nil {
+		x.observeSnapshot = make(map[string][]byte)
 	}
-	if data, ok := x.observeSnapshot[filepath.Base(target)]; ok {
-		return data, true
+	if d, ok := x.observeSnapshot[path]; ok {
+		data = d
+	} else {
+		x.observeSnapshot[target] = data
+		x.observeSnapshot[filepath.Base(target)] = data
+		x.observeSnapshot[path] = data
 	}
-	path := filepath.Join(x.root, target)
-	if data, ok := x.observeSnapshot[path]; ok {
-		return data, true
-	}
-	return nil, false
+	x.observeSnapshotMu.Unlock()
+	return data, true
 }
 
 func (x *RuntimeExecutor) clearObserveSnapshot() {
