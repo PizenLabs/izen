@@ -71,6 +71,10 @@ type CandidateArtifact struct {
 	RawPatch []byte `json:"raw_patch"`
 	// Diff is the normalized unified diff string, when derivable.
 	Diff string `json:"diff"`
+	// ReplaceWholeFile reports that RawPatch is the complete post-mutation
+	// content of the target (a full-file replacement contract) and must not be
+	// applied as a diff. Set by Tier 1 structured artifact blocks.
+	ReplaceWholeFile bool `json:"replace_whole_file"`
 	// Evidence describes how this candidate was recovered.
 	Evidence ArtifactEvidence `json:"evidence"`
 }

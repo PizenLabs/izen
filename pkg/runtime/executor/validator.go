@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/pkg/projection/diff"
+	"github.com/PizenLabs/izen/pkg/runtime/harness"
 )
 
 // hunkHeaderRe matches a unified-diff hunk header and captures the old-file
@@ -137,6 +138,60 @@ func materializeContent(proposal ProposedMutation, base string) (string, error) 
 		return applyUnifiedDiff(base, proposal.RawPatch)
 	}
 	return proposal.RawPatch, nil
+}
+
+// materializeCandidate derives the post-mutation target content of an approved
+// harness.CandidateArtifact against the in-memory snapshot bytes. It is the
+// tier-aware translation of the RMAH candidate:
+//
+//   - ReplaceWholeFile candidates (structured artifact blocks) replace the
+//     entire file content with RawPatch.
+//   - Tier 2 anchored candidates replace their anchored source range with
+//     RawPatch.
+//   - Everything else applies the candidate's unified diff against the base.
+//
+// It never reads the disk: base is the Observation-phase memory snapshot.
+func materializeCandidate(candidate harness.CandidateArtifact, base []byte) (string, error) {
+	switch {
+	case candidate.ReplaceWholeFile:
+		if len(candidate.RawPatch) == 0 {
+			return "", errors.New("executor: full-replacement candidate carries no content")
+		}
+		return string(candidate.RawPatch), nil
+	case candidate.Evidence.Tier == harness.Tier2Evidence:
+		return replaceSourceRange(base, candidate.Evidence.SourceRange, string(candidate.RawPatch)), nil
+	default:
+		if candidate.Diff == "" {
+			return "", errors.New("executor: candidate carries no applicable diff")
+		}
+		return applyUnifiedDiff(string(base), candidate.Diff)
+	}
+}
+
+// replaceSourceRange swaps the [StartLine, EndLine] span of base (1-based,
+// inclusive) for replacement. Out-of-range coordinates are clamped; an
+// unanchored candidate yields the base verbatim.
+func replaceSourceRange(base []byte, rng harness.SourceRange, replacement string) string {
+	lines := strings.Split(string(base), "\n")
+	start := rng.StartLine - 1
+	if start < 0 {
+		start = 0
+	}
+	if start > len(lines) {
+		start = len(lines)
+	}
+	end := rng.EndLine
+	if end < start {
+		end = start
+	}
+	if end > len(lines) {
+		end = len(lines)
+	}
+	out := make([]string, 0, len(lines)-end+start)
+	out = append(out, lines[:start]...)
+	out = append(out, strings.Split(replacement, "\n")...)
+	out = append(out, lines[end:]...)
+	return strings.Join(out, "\n")
 }
 
 // materializeFromLines assembles post-mutation content from typed patch

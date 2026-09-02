@@ -50,9 +50,10 @@ func (s *StrictExtractor) Extract(raw []byte) (CandidateArtifact, error) {
 		body := string(m[2])
 		body = strings.TrimSpace(body)
 		cand = CandidateArtifact{
-			TargetFile: path,
-			RawPatch:   []byte(body),
-			Diff:       formatSimpleDiff(path, body),
+			TargetFile:       path,
+			RawPatch:         []byte(body),
+			Diff:             formatSimpleDiff(path, body),
+			ReplaceWholeFile: true,
 			Evidence: ArtifactEvidence{
 				Tier:       Tier1Strict,
 				Confidence: 1.0,

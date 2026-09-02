@@ -1,11 +1,14 @@
 package executor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"github.com/PizenLabs/izen/pkg/runtime/harness"
 )
 
 // defaultCommitMode is applied to committed files that carry a zero
@@ -88,19 +91,62 @@ func (e *RuntimeExecutor) Commit(proposal ProposedMutation, backup *FileBackup) 
 		return e.failWithRollback(backup, err)
 	}
 
+	mode := fs.FileMode(backup.FileMode)
+	if mode == 0 {
+		mode = defaultCommitMode
+	}
+
+	if err := e.atomicWrite(targetPath, final, mode); err != nil {
+		return e.failWithRollback(backup, err)
+	}
+	return nil
+}
+
+// CommitMutation is the Sole-Authority commit path of the closed execution
+// loop (Model Output -> RMAH -> Gate -> RuntimeExecutor). It materializes an
+// approved harness.CandidateArtifact against the Observation-phase memory
+// snapshot bytes — never a disk read — and writes the result atomically.
+//
+// The memory snapshot is the only base: RMAH, the gate pipeline, and this
+// method consume the same []byte captured once per cycle at the Observation
+// phase (zero disk-read redundancy).
+func (e *RuntimeExecutor) CommitMutation(ctx context.Context, candidate harness.CandidateArtifact, memorySnapshot []byte) error {
+	if e == nil {
+		return errors.New("executor: nil RuntimeExecutor")
+	}
+	if candidate.TargetFile == "" {
+		return errors.New("executor: commit requires a candidate target file")
+	}
+
+	final, err := materializeCandidate(candidate, memorySnapshot)
+	if err != nil {
+		return fmt.Errorf("executor: materialize candidate: %w", err)
+	}
+	return e.atomicWrite(candidate.TargetFile, final, defaultCommitMode)
+}
+
+// atomicWrite writes content to targetPath atomically: content is written to a
+// same-directory temp file (.tmp.izen.*), fsynced, and renamed over targetPath.
+// On any failure the temp file is removed (zero-orphan guard). It never reads
+// the target, so it may be driven purely from an in-memory snapshot.
+func (e *RuntimeExecutor) atomicWrite(targetPath, content string, mode fs.FileMode) error {
+	if targetPath == "" {
+		return errors.New("executor: atomic write requires a target path")
+	}
+
 	dir := filepath.Dir(targetPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return e.failWithRollback(backup, fmt.Errorf("executor: create directory for %q: %w", targetPath, err))
+		return fmt.Errorf("executor: create directory for %q: %w", targetPath, err)
 	}
 
 	tmp, err := os.CreateTemp(dir, ".tmp.izen.*")
 	if err != nil {
-		return e.failWithRollback(backup, fmt.Errorf("executor: create temp for %q: %w", targetPath, err))
+		return fmt.Errorf("executor: create temp for %q: %w", targetPath, err)
 	}
 	tmpName := tmp.Name()
 
 	// Zero-orphan guard: unless the temp was atomically renamed into place,
-	// it is removed when Commit returns.
+	// it is removed when the write returns.
 	committed := false
 	defer func() {
 		if !committed {
@@ -108,29 +154,24 @@ func (e *RuntimeExecutor) Commit(proposal ProposedMutation, backup *FileBackup) 
 		}
 	}()
 
-	mode := fs.FileMode(backup.FileMode)
-	if mode == 0 {
-		mode = defaultCommitMode
-	}
-
-	if _, err := tmp.Write([]byte(final)); err != nil {
+	if _, err := tmp.Write([]byte(content)); err != nil {
 		_ = tmp.Close()
-		return e.failWithRollback(backup, fmt.Errorf("executor: write temp for %q: %w", targetPath, err))
+		return fmt.Errorf("executor: write temp for %q: %w", targetPath, err)
 	}
 	if err := tmp.Chmod(mode); err != nil {
 		_ = tmp.Close()
-		return e.failWithRollback(backup, fmt.Errorf("executor: chmod temp for %q: %w", targetPath, err))
+		return fmt.Errorf("executor: chmod temp for %q: %w", targetPath, err)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return e.failWithRollback(backup, fmt.Errorf("executor: sync temp for %q: %w", targetPath, err))
+		return fmt.Errorf("executor: sync temp for %q: %w", targetPath, err)
 	}
 	if err := tmp.Close(); err != nil {
-		return e.failWithRollback(backup, fmt.Errorf("executor: close temp for %q: %w", targetPath, err))
+		return fmt.Errorf("executor: close temp for %q: %w", targetPath, err)
 	}
 
 	if err := os.Rename(tmpName, targetPath); err != nil {
-		return e.failWithRollback(backup, fmt.Errorf("executor: rename temp to %q: %w", targetPath, err))
+		return fmt.Errorf("executor: rename temp to %q: %w", targetPath, err)
 	}
 	committed = true
 

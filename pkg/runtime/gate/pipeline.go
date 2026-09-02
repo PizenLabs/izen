@@ -5,6 +5,7 @@
 package gate
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -62,6 +63,139 @@ type AuthorizationDecision struct {
 	Rejected bool
 	// Reason is a human-readable justification.
 	Reason string
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline (composed gate)
+// ---------------------------------------------------------------------------
+
+// GateResult is the composed outcome of the full gate pipeline for one
+// candidate.
+type GateResult struct {
+	// Authorized reports that the candidate may be committed automatically.
+	Authorized bool
+	// Rejected reports a hard rejection (ambiguous evidence or structural
+	// corruption). A Rejected result with FormatError set is a schema/syntax
+	// failure of the model output and feeds the recovery-loop fast-fail
+	// budget.
+	Rejected bool
+	// EscalationRequired reports that the candidate is valid but needs an
+	// explicit human decision before execution.
+	EscalationRequired bool
+	// FormatError reports that the candidate was rejected for a format /
+	// syntax / schema reason (structural corruption, truncation, ambiguity).
+	FormatError bool
+	// Reason is a bounded human-readable justification.
+	Reason string
+	// Risk is the classified mutation risk of the candidate.
+	Risk MutationRisk
+	// Scope is the scope-drift measurement of the candidate.
+	Scope ScopeDriftResult
+	// Decision is the underlying authorization boundary decision.
+	Decision AuthorizationDecision
+}
+
+// Pipeline is the composed gate: structural validity, scope drift, risk
+// classification, and the authorization boundary. It is the single
+// enforcement point of the closed execution path
+//
+//	Model Output -> RMAH Extractor -> Gate Pipeline -> RuntimeExecutor.
+//
+// Evaluate is fail-closed: format/schema failures and ambiguous evidence are
+// rejected immediately; anything not explicitly authorized never reaches the
+// executor.
+type Pipeline struct {
+	structural *StructuralGate
+	scope      *ScopeGate
+	auth       *AuthorizationBoundary
+}
+
+// NewPipeline returns a Pipeline with the default stage components.
+func NewPipeline() *Pipeline {
+	return &Pipeline{
+		structural: NewStructuralGate(),
+		scope:      NewScopeGate(),
+		auth:       NewAuthorizationBoundary(),
+	}
+}
+
+// Evaluate runs the full gate pipeline over candidate anchored against the
+// original memory bytes (never a disk read):
+//
+//  1. Ambiguous evidence is a first-class rejection (fail-closed).
+//  2. Truncated model output is a schema/format failure: partial content must
+//     never reach the filesystem.
+//  3. The StructuralGate rejects candidates whose application would corrupt
+//     the target's syntax (a FormatError).
+//  4. Scope drift and mutation risk are measured deterministically.
+//  5. The AuthorizationBoundary maps evidence, risk, and drift to the final
+//     decision.
+func (p *Pipeline) Evaluate(ctx context.Context, original []byte, candidate harness.CandidateArtifact) *GateResult {
+	if candidate.Evidence.Ambiguous {
+		return &GateResult{
+			Rejected:    true,
+			FormatError: true,
+			Reason:      "gate: ambiguous evidence, refusing to guess",
+			Decision: AuthorizationDecision{
+				Rejected: true,
+				Reason:   "ambiguous evidence, refusing to guess",
+			},
+		}
+	}
+
+	if candidate.Evidence.Truncated {
+		return &GateResult{
+			Rejected:    true,
+			FormatError: true,
+			Reason:      "gate: truncated model output — refusing to execute partial content",
+			Decision: AuthorizationDecision{
+				Rejected: true,
+				Reason:   "truncated model output",
+			},
+		}
+	}
+
+	if err := p.structural.Validate(candidate, original); err != nil {
+		return &GateResult{
+			Rejected:    true,
+			FormatError: true,
+			Reason:      err.Error(),
+			Decision: AuthorizationDecision{
+				Rejected: true,
+				Reason:   err.Error(),
+			},
+		}
+	}
+
+	drift := p.scope.Evaluate(candidate, original)
+	risk := classifyRisk(candidate, drift)
+	decision := p.auth.Decision(candidate.Evidence, risk, drift)
+
+	return &GateResult{
+		Authorized:         decision.Approved,
+		Rejected:           decision.Rejected,
+		EscalationRequired: decision.EscalationRequired,
+		Reason:             decision.Reason,
+		Risk:               risk,
+		Scope:              drift,
+		Decision:           decision,
+	}
+}
+
+// classifyRisk derives a deterministic MutationRisk from the candidate's
+// evidence and scope drift. Inferred/truncated reconstruction is the highest
+// risk; any node deletion or heavy drift elevates a clean candidate.
+func classifyRisk(candidate harness.CandidateArtifact, drift ScopeDriftResult) MutationRisk {
+	if candidate.Evidence.Inferred || candidate.Evidence.Truncated {
+		return RiskHigh
+	}
+	if drift.NodeDeletions > 0 {
+		return RiskMedium
+	}
+	if drift.ScopeDriftScore > 0.5 {
+		return RiskMedium
+	}
+	return RiskLow
 }
 
 // ---------------------------------------------------------------------------

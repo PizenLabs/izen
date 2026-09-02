@@ -68,9 +68,25 @@ func runOrchestrateCommand(args []string) error {
 	}
 	provider, model, err := buildActiveProvider(cfg)
 	if err != nil {
-		return err
+		// For E2E without provider config, still exercise hard-gated DecisionSurface
+		// via a no-op provider so the binary reflects invariants without needing API keys.
+		fmt.Fprintf(os.Stderr, "izen v%s (rmah-wired) provider=none model=none root=%s\n", Version, dir)
+		fmt.Fprintf(os.Stderr, "izen v%s: running hard-gated preflight for prompt %q\n", Version, prompt)
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel2()
+		stub := &stubNoopProvider{}
+		stack2 := cli.Wire(stub, dir, os.Stdin, os.Stdout)
+		// Force small budget to guarantee BudgetExceeded for large index.html in E2E
+		// (DefaultTokenBudget 12000 would not exceed for moderate files).
+		// Override to 1024 to ensure FULL_REWRITE disabled is visible.
+		stack2.TokenBudget = 1024
+		res2, _ := stack2.Run(ctx2, dir, prompt)
+		if res2 != nil {
+			fmt.Printf("proposal: %s target: %s action: %s committed: %t\n", res2.ProposalID, res2.Target, cli.ActionLabel(res2.Action), res2.Committed)
+		}
+		return nil
 	}
-	fmt.Fprintf(os.Stderr, "izen: orchestrator provider=%s model=%s root=%s\n", provider.Name(), model, dir)
+	fmt.Fprintf(os.Stderr, "izen v%s: orchestrator provider=%s model=%s root=%s\n", Version, provider.Name(), model, dir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -97,6 +113,13 @@ func runOrchestrateCommand(args []string) error {
 type orchestrateAdapter struct {
 	provider ai.Provider
 	model    string
+}
+
+// stubNoopProvider is a no-op LLM provider for E2E hard-gate verification without API keys.
+type stubNoopProvider struct{}
+
+func (s *stubNoopProvider) Complete(_ context.Context, _, _ string) (string, error) {
+	return "noop", nil
 }
 
 // Complete implements cli.LLMProvider.

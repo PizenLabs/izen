@@ -20,12 +20,16 @@ const (
 	// preserves the surrounding structure. It needs a fraction of the output
 	// budget of a full rewrite.
 	StrategyBoundedPatch ExecutionStrategy = "BOUNDED_PATCH"
+	// StrategyChunkedRepair mutates the target in bounded, sequential chunks
+	// (the model emits each chunk against the current snapshot). It is the
+	// budget-gate fallback when a FULL_REWRITE is forbidden.
+	StrategyChunkedRepair ExecutionStrategy = "CHUNKED_REPAIR"
 )
 
 // Valid reports whether s is a canonical execution strategy.
 func (s ExecutionStrategy) Valid() bool {
 	switch s {
-	case StrategyFullRewrite, StrategyBoundedPatch:
+	case StrategyFullRewrite, StrategyBoundedPatch, StrategyChunkedRepair:
 		return true
 	default:
 		return false
@@ -62,6 +66,9 @@ const (
 	// boundedPatchFactor scales the file token count for a BOUNDED_PATCH (the
 	// model emits only the changed regions).
 	boundedPatchFactor = 0.35
+	// chunkedRepairFactor scales the file token count for a CHUNKED_REPAIR
+	// (the model re-emits each mutated chunk, not the whole file).
+	chunkedRepairFactor = 0.5
 )
 
 // BudgetAdvisor is the deterministic adaptive preflight budget engine. It
@@ -93,10 +100,13 @@ func (a *BudgetAdvisor) EstimateFileTokens(fileSizeBytes int) int {
 //
 //	FULL_REWRITE:  FileSizeInTokens × 1.25 + 256
 //	BOUNDED_PATCH: FileSizeInTokens × 0.35 + 256
+//	CHUNKED_REPAIR: FileSizeInTokens × 0.5 + 256
 func (a *BudgetAdvisor) EstimateRequiredTokens(strategy ExecutionStrategy, fileSizeTokens int) int {
 	switch strategy {
 	case StrategyBoundedPatch:
 		return int(float64(fileSizeTokens)*boundedPatchFactor) + baseOutputTokens
+	case StrategyChunkedRepair:
+		return int(float64(fileSizeTokens)*chunkedRepairFactor) + baseOutputTokens
 	default: // StrategyFullRewrite and unknown strategies default to the rewrite contract.
 		return int(float64(fileSizeTokens)*fullRewriteFactor) + baseOutputTokens
 	}

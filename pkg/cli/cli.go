@@ -21,12 +21,16 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/pkg/projection/diff"
+	"github.com/PizenLabs/izen/pkg/provider/capability"
 	"github.com/PizenLabs/izen/pkg/runtime/authorization"
 	runtimectx "github.com/PizenLabs/izen/pkg/runtime/context"
 	"github.com/PizenLabs/izen/pkg/runtime/executor"
+	"github.com/PizenLabs/izen/pkg/runtime/gate"
+	"github.com/PizenLabs/izen/pkg/runtime/harness"
 	"github.com/PizenLabs/izen/pkg/runtime/orchestrator"
 	"github.com/PizenLabs/izen/pkg/runtime/preflight"
 	"github.com/PizenLabs/izen/pkg/runtime/target"
+	"github.com/PizenLabs/izen/pkg/runtime/ui/decision"
 )
 
 // DefaultTokenBudget is the default context token budget applied by Stack.Run.
@@ -169,6 +173,22 @@ func (b *TerminalBridge) RenderProposal(evidence diff.MutationEvidence, cfg diff
 	return nil
 }
 
+// RenderDecisionSurface renders the annotated decision surface with explicit
+// risk hierarchy. It is the sole UI entry for the hard-gated DecisionSurface.
+func (b *TerminalBridge) RenderDecisionSurface(surface decision.Surface) error {
+	if b == nil {
+		return errors.New("cli: nil terminal bridge")
+	}
+	if b.out == nil {
+		return errors.New("cli: terminal bridge has no output writer")
+	}
+	rendered := surface.Render(80)
+	if _, err := fmt.Fprintln(b.out, rendered); err != nil {
+		return fmt.Errorf("cli: render decision surface: %w", err)
+	}
+	return nil
+}
+
 // diffMarker returns the one-cell gutter marker for a mutation type.
 func diffMarker(t diff.MutationType) string {
 	switch t {
@@ -273,6 +293,14 @@ type Stack struct {
 	Orchestrator *orchestrator.Orchestrator
 	TokenBudget  int
 	Viewport     diff.ViewportConfig
+
+	// New runtime invariants (wired for DI audit and hard-gate enforcement).
+	BudgetGate      *preflight.Gate
+	HarnessPipeline *harness.ExtractorPipeline
+	GatePipeline    *gate.Pipeline
+	Loop            *orchestrator.Loop
+	SnapshotReader  orchestrator.SnapshotReader
+	DecisionSurface *decision.Surface
 }
 
 // Wire assembles the full control-plane stack: the preflight engine (resolver
@@ -280,21 +308,45 @@ type Stack struct {
 // terminal UI bridge over in/out, the deterministic validator, the atomic
 // executor, and a zero-delay approval gate so authorization decisions are
 // honored immediately.
+//
+// It also wires the new runtime invariants: preflight.NewGate with
+// EvaluateBudgetGate, decision.NewSurface with AnnotateStrategies,
+// harness.NewExtractorPipeline, gate.NewPipeline, and
+// orchestrator.NewLoop with SnapshotReader dependency injection.
 func Wire(llm LLMProvider, root string, in io.Reader, out io.Writer) *Stack {
-	gate := authorization.NewGate(authorization.WithMinDelayWindow(0))
+	apGate := authorization.NewGate(authorization.WithMinDelayWindow(0))
 	pf := preflight.NewEngine(target.NewTargetResolver(), runtimectx.NewCompiler())
 	val := executor.NewValidator()
 	exec := executor.NewExecutor()
+
+	// New invariants wiring (DI audit).
+	budgetGate := preflight.NewGate()
+	harnessPipeline := harness.NewExtractorPipeline()
+	gatePipeline := gate.NewPipeline()
+	snapshotReader := orchestrator.FSSnapshotReader{}
+	// Loop is wired with SnapshotReader DI; harness extractor is adapted per-target at Run time.
+	loop := orchestrator.NewLoop(
+		&orchestrator.MemoryBackedExtractor{Pipeline: harnessPipeline, TargetFile: ""},
+		gatePipeline,
+		exec,
+		snapshotReader,
+	)
+
 	return &Stack{
-		Preflight:    pf,
-		Validator:    val,
-		Executor:     exec,
-		Gate:         gate,
-		Provider:     NewProposalProvider(llm, root),
-		Bridge:       NewTerminalBridge(in, out),
-		Orchestrator: orchestrator.NewOrchestrator(pf, val, exec, gate),
-		TokenBudget:  DefaultTokenBudget,
-		Viewport:     DefaultViewport(),
+		Preflight:       pf,
+		Validator:       val,
+		Executor:        exec,
+		Gate:            apGate,
+		Provider:        NewProposalProvider(llm, root),
+		Bridge:          NewTerminalBridge(in, out),
+		Orchestrator:    orchestrator.NewOrchestrator(pf, val, exec, apGate),
+		TokenBudget:     DefaultTokenBudget,
+		Viewport:        DefaultViewport(),
+		BudgetGate:      budgetGate,
+		HarnessPipeline: harnessPipeline,
+		GatePipeline:    gatePipeline,
+		Loop:            loop,
+		SnapshotReader:  snapshotReader,
 	}
 }
 
@@ -310,6 +362,9 @@ func DefaultViewport() diff.ViewportConfig {
 
 // Run executes one prompt through the full control-loop cycle. The prompt is
 // treated as the target file reference (for example "README.md").
+// It enforces the hard-gate invariant: if EvaluateBudgetGate returns
+// BudgetExceeded, the loop parks at the DecisionSurface with FULL_REWRITE
+// explicitly disabled, and never invokes the model.
 func (s *Stack) Run(ctx context.Context, root, prompt string) (*orchestrator.ExecutionResult, error) {
 	if s == nil {
 		return nil, errors.New("cli: nil stack")
@@ -321,11 +376,155 @@ func (s *Stack) Run(ctx context.Context, root, prompt string) (*orchestrator.Exe
 	if budget <= 0 {
 		budget = DefaultTokenBudget
 	}
+
+	// --- Hard-gate preflight: single snapshot read, no repetitive disk I/O ---
+	var targetState preflight.TargetState
+	var gateResult preflight.BudgetGateResult
+	var astStatus preflight.ASTStatus
+	var snapshotContent []byte
+	var targetPath string
+
+	if s.BudgetGate != nil && s.SnapshotReader != nil {
+		// Resolve target without re-reading file multiple times.
+		// Handle free-form prompts like "check this file @index.html and rewrite it".
+		effectivePrompt := prompt
+		if extracted := extractTargetFromPrompt(root, prompt); extracted != "" {
+			effectivePrompt = extracted
+		}
+		if ref, err := target.NewTargetResolver().Resolve(root, effectivePrompt); err == nil && ref != nil && ref.Canonical != "" { //nolint:contextcheck
+			canonical := ref.Canonical
+			if !filepath.IsAbs(canonical) {
+				targetPath = filepath.Join(root, canonical)
+			} else {
+				targetPath = canonical
+			}
+			// Single snapshot read per cycle (Observation phase).
+			if data, err := s.SnapshotReader.ReadSnapshot(ctx, targetPath); err == nil {
+				snapshotContent = data
+			} else {
+				// Treat missing or error as empty for gate purposes (conservative).
+				snapshotContent = nil
+			}
+			astStatus = preflight.InferASTStatus(snapshotContent, targetPath)
+			targetState = preflight.TargetState{
+				Path:      targetPath,
+				Content:   snapshotContent,
+				ASTStatus: astStatus,
+			}
+			caps := capability.ModelCapabilities{
+				MaxOutputTokens: budget,
+			}
+			gateResult = s.BudgetGate.EvaluateBudgetGate(targetState, caps)
+			// Hard-gate enforcement: park at DecisionSurface if AST corrupt or budget exceeded.
+			if astStatus == preflight.ASTCorrupt || gateResult.BudgetStatus == preflight.BudgetExceeded || gateResult.FullRewrite == preflight.StrategyForbidden {
+				surface := decision.NewSurface(targetPath, astStatus, &gateResult)
+				decision.AnnotateStrategies(&surface)
+				if s.Bridge != nil {
+					_ = s.Bridge.RenderDecisionSurface(surface)
+				} else {
+					// Fallback direct render to Bridge.out if Bridge is nil (should not happen)
+					fmt.Fprintln(os.Stderr, surface.Render(80))
+				}
+				// Ensure FULL_REWRITE is explicitly disabled in the parked surface.
+				// The surface already carries the [DISABLED: Exceeds Model Output Budget] annotation.
+				// Return a parked result without invoking the model.
+				return &orchestrator.ExecutionResult{
+					Target: targetPath,
+					Action: authorization.ActionCancel,
+					Evidence: diff.MutationEvidence{
+						TargetFile: targetPath,
+					},
+				}, nil
+			}
+		}
+	}
+
+	// Build candidate units from the single snapshot (zero repetitive reads).
+	var units []runtimectx.ContextUnit
+	if len(snapshotContent) > 0 && targetPath != "" {
+		// Use snapshot content directly; do not re-read target file.
+		rel := targetPath
+		if !filepath.IsAbs(rel) {
+			rel = targetPath
+		} else if relPath, err := filepath.Rel(root, targetPath); err == nil {
+			rel = relPath
+		}
+		units = append(units, runtimectx.ContextUnit{
+			ID:        "target",
+			Kind:      runtimectx.KindTargetState,
+			Source:    rel,
+			Content:   string(snapshotContent),
+			TokenCost: tokenEstimate(len(snapshotContent)),
+			Relevance: 1.0,
+		})
+	} else {
+		units = candidateUnits(root, prompt) //nolint:contextcheck // target resolver API predates context propagation
+		// If we already have snapshot content, we already accounted for target;
+		// candidateUnits would re-read target — filter it out to preserve zero redundancy.
+		// Keep only manifest units.
+		if len(snapshotContent) > 0 {
+			filtered := make([]runtimectx.ContextUnit, 0, len(units))
+			for _, u := range units {
+				if u.Kind != runtimectx.KindTargetState {
+					filtered = append(filtered, u)
+				}
+			}
+			// Prepend snapshot-based target unit.
+			if len(filtered) < len(units) {
+				units = filtered
+				// Re-add snapshot unit at front
+				rel := targetPath
+				if rp, err := filepath.Rel(root, targetPath); err == nil {
+					rel = rp
+				}
+				units = append([]runtimectx.ContextUnit{{
+					ID:        "target",
+					Kind:      runtimectx.KindTargetState,
+					Source:    rel,
+					Content:   string(snapshotContent),
+					TokenCost: tokenEstimate(len(snapshotContent)),
+					Relevance: 1.0,
+				}}, units...)
+			}
+		}
+	}
+	// Append manifest units (not repetitive target reads) if not already included.
+	if len(units) == 0 || (len(snapshotContent) == 0) {
+		// Fallback to original helper for non-target cases
+		units = candidateUnits(root, prompt) //nolint:contextcheck // target resolver API predates context propagation
+	} else {
+		// Ensure manifests are included
+		for _, name := range manifestNames {
+			manifestPath := filepath.Join(root, name)
+			// Skip if already present
+			already := false
+			for _, u := range units {
+				if u.Source == name {
+					already = true
+					break
+				}
+			}
+			if already {
+				continue
+			}
+			if data, err := os.ReadFile(manifestPath); err == nil {
+				units = append(units, runtimectx.ContextUnit{
+					ID:        "manifest-" + name,
+					Kind:      runtimectx.KindManifest,
+					Source:    name,
+					Content:   string(data),
+					TokenCost: tokenEstimate(len(data)),
+					Relevance: 0.8,
+				})
+			}
+		}
+	}
+
 	req := preflight.PreflightRequest{
 		RawInput:       prompt,
 		WorkDir:        root,
 		TokenBudget:    budget,
-		CandidateUnits: candidateUnits(root, prompt), //nolint:contextcheck // target resolver API predates context propagation
+		CandidateUnits: units,
 	}
 	return s.Orchestrator.RunCycle(ctx, req, s.Provider, s.Bridge, orchestrator.OrchestratorConfig{
 		TokenBudget:    budget,
@@ -333,11 +532,48 @@ func (s *Stack) Run(ctx context.Context, root, prompt string) (*orchestrator.Exe
 	})
 }
 
+// extractTargetFromPrompt extracts a file path from a free-form prompt that may
+// contain "@index.html" or "index.html" mentions. It returns the first file-like
+// token that resolves to an existing file, or the raw @-mentioned token, or "".
+func extractTargetFromPrompt(root, prompt string) string {
+	// Prefer @-mentioned file.
+	for _, tok := range strings.Fields(prompt) {
+		if strings.HasPrefix(tok, "@") {
+			clean := strings.Trim(tok, "\"'`.,;:!?()[]{}")
+			clean = strings.TrimPrefix(clean, "@")
+			if clean != "" {
+				return clean
+			}
+		}
+	}
+	// Fallback: any token that looks like a file with extension and exists.
+	for _, tok := range strings.Fields(prompt) {
+		clean := strings.Trim(tok, "\"'`.,;:!?()[]{}")
+		if strings.Contains(clean, ".") && !strings.Contains(clean, "://") {
+			// Check if file exists in workspace.
+			if _, err := os.Stat(filepath.Join(root, clean)); err == nil {
+				return clean
+			}
+			// Also check basename match.
+			if filepath.Ext(clean) != "" {
+				return clean
+			}
+		}
+	}
+	return ""
+}
+
 // candidateUnits scans root for a minimal set of context units: the resolved
 // target file state (when it exists) and any dependency manifests.
+// It is kept for backward compatibility; new Run path uses snapshot-based units.
 func candidateUnits(root, prompt string) []runtimectx.ContextUnit {
 	units := make([]runtimectx.ContextUnit, 0, 5)
-	if ref, err := target.NewTargetResolver().Resolve(root, prompt); err == nil && ref.Exists { //nolint:contextcheck // target resolver API predates context propagation
+	// Use extracted target if prompt is a sentence.
+	effectivePrompt := prompt
+	if extracted := extractTargetFromPrompt(root, prompt); extracted != "" {
+		effectivePrompt = extracted
+	}
+	if ref, err := target.NewTargetResolver().Resolve(root, effectivePrompt); err == nil && ref.Exists { //nolint:contextcheck // target resolver API predates context propagation
 		if data, err := os.ReadFile(filepath.Join(root, ref.Canonical)); err == nil {
 			units = append(units, runtimectx.ContextUnit{
 				ID:        "target",
