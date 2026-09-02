@@ -175,12 +175,14 @@ func TestProgressRetryReadsAreRealAndDistinguishable(t *testing.T) {
 			reads++
 		}
 	}
-	// The runtime performs exactly 2 REAL disk reads on the targeted-mutation
-	// path (context compile + mutation invocation) — every row corresponds to a
-	// real read and the renderer never adds or removes one. The executor has no
-	// retry loop, so a retry badge would be a fabricated claim.
-	if reads != 2 {
-		t.Fatalf("activity tree shows %d read rows, want 2 real reads", reads)
+	// The runtime performs exactly 1 REAL disk read on the targeted-mutation
+	// path: the Observe-phase snapshot captures each target's bytes ONCE and
+	// compileContext + invokeMutation consume that cached []byte (no rereads).
+	// Every row corresponds to a real read and the renderer never adds or
+	// removes one. The executor has no retry loop, so a retry badge would be a
+	// fabricated claim.
+	if reads != 1 {
+		t.Fatalf("activity tree shows %d read rows, want 1 real read", reads)
 	}
 
 	// The renderer distinguishes real repeated reads from fresh reads and never
@@ -195,8 +197,8 @@ func TestProgressRetryReadsAreRealAndDistinguishable(t *testing.T) {
 			freshRows++
 		}
 	}
-	if freshRows != 2 {
-		t.Fatalf("render shows %d plain fresh-read rows, want exactly 2 (one per real disk read, no UI duplication):\n%s", freshRows, rendered)
+	if freshRows != 1 {
+		t.Fatalf("render shows %d plain fresh-read rows, want exactly 1 (one per real disk read, no UI duplication):\n%s", freshRows, rendered)
 	}
 }
 
