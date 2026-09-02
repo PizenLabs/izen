@@ -51,12 +51,23 @@ const (
 type PreflightEngine struct {
 	resolver target.Resolver
 	compiler *context.ContextCompiler
+	advisor  *BudgetAdvisor
 }
 
 // NewEngine returns a PreflightEngine wired to the given resolver and context
 // compiler. A nil resolver or compiler is rejected at Execute time.
 func NewEngine(resolver target.Resolver, compiler *context.ContextCompiler) *PreflightEngine {
 	return &PreflightEngine{resolver: resolver, compiler: compiler}
+}
+
+// WithBudgetAdvisor wires an explicit budget advisor into the engine. When
+// none is wired, the engine lazily creates a default advisor for requests that
+// activate the advisory stage.
+func (e *PreflightEngine) WithBudgetAdvisor(advisor *BudgetAdvisor) *PreflightEngine {
+	if e != nil {
+		e.advisor = advisor
+	}
+	return e
 }
 
 // Execute resolves the target for req.RawInput, assesses its risk, infers an
@@ -108,11 +119,25 @@ func (e *PreflightEngine) Execute(req PreflightRequest) (*CompiledRequest, error
 		return nil, fmt.Errorf("preflight: format prompt: %w", err)
 	}
 
+	// Adaptive budget advisory stage. When activated, the advisor evaluates
+	// the requested strategy against the model's output budget and attaches a
+	// DecisionSurface proposal to the compiled request — it never fails the
+	// cycle.
+	var advice BudgetAdvice
+	if req.BudgetAdvisory.Strategy != "" {
+		advisor := e.advisor
+		if advisor == nil {
+			advisor = NewBudgetAdvisor()
+		}
+		advice = advisor.Advise(req.BudgetAdvisory)
+	}
+
 	return &CompiledRequest{
 		TargetRef:       ref,
 		Context:         compiled,
 		Risk:            risk,
 		FormattedPrompt: prompt,
+		BudgetAdvice:    advice,
 	}, nil
 }
 

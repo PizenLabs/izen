@@ -49,13 +49,20 @@ type PreflightRequest struct {
 	WorkDir        string
 	TokenBudget    int
 	CandidateUnits []context.ContextUnit
+	// BudgetAdvisory optionally activates the adaptive budget advisor. When
+	// its Strategy is empty the advisory stage is skipped entirely.
+	BudgetAdvisory BudgetAdvisoryRequest
 }
 
 // CompiledRequest is the output of the preflight engine: the resolved target,
-// the compiled context, the assessed risk, and the formatted XML prompt.
+// the compiled context, the assessed risk, and the formatted XML prompt. When
+// the request carried a budget advisory, BudgetAdvice holds the deterministic
+// evaluation result (a DecisionSurface proposal when overflow was detected —
+// execution is never failed here).
 type CompiledRequest struct {
 	TargetRef       *target.TargetRef
 	Context         *context.CompiledContext
 	Risk            RiskLevel
 	FormattedPrompt string
+	BudgetAdvice    BudgetAdvice
 }
