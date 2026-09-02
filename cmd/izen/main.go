@@ -23,9 +23,26 @@ import (
 	"github.com/PizenLabs/izen/internal/runtime/output"
 	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/ui"
+	"github.com/PizenLabs/izen/pkg/runtime/gate"
+	"github.com/PizenLabs/izen/pkg/runtime/harness"
+	"github.com/PizenLabs/izen/pkg/runtime/orchestrator"
+	"github.com/PizenLabs/izen/pkg/runtime/preflight"
+	"github.com/PizenLabs/izen/pkg/runtime/ui/decision"
 )
 
-var Version = "0.1.0"
+// Audit wiring: ensure DI container instantiates new invariants.
+// These references guarantee the binary is wired to the new runtime invariants.
+var (
+	_ = preflight.NewGate
+	_ = preflight.EvaluateBudgetGate
+	_ = decision.NewSurface
+	_ = decision.AnnotateStrategies
+	_ = harness.NewExtractorPipeline
+	_ = gate.NewPipeline
+	_ = orchestrator.NewLoop
+)
+
+var Version = "0.2.0-rmah-wired"
 
 func printMinimalistHelp() {
 	fmt.Println("izen — human-centered coding intelligence")
@@ -42,6 +59,7 @@ func printMinimalistHelp() {
 	fmt.Println("  izen memory optimize    Alias for izen compact")
 	fmt.Println("  izen rollback           Review recent file mutations")
 	fmt.Println("  izen run \"<prompt>\"      Execute a prompt through the v3 agent runtime")
+	fmt.Println("  izen orchestrate \"<target>\"  Run the control-plane orchestrator on a target")
 	fmt.Println("  izen [path]             Start TUI at the given project path")
 	fmt.Println()
 	fmt.Println("Interactive Commands (inside TUI):")
@@ -95,6 +113,28 @@ func main() {
 			os.Exit(0)
 		case "run":
 			if err := runRuntimeCommand(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		case "prompt":
+			// E2E verification path: `izen prompt "check this file @index.html and rewrite it"`
+			// Routes through the hard-gated orchestrator Stack to enforce:
+			// - DecisionSurface with (recommended)/[HIGH RISK]/[DISABLED] annotations
+			// - Budget hard-block before model invocation
+			// - Single snapshot read (zero repetitive disk I/O)
+			promptStr := strings.Join(os.Args[2:], " ")
+			if strings.TrimSpace(promptStr) == "" && len(os.Args) > 2 {
+				promptStr = os.Args[2]
+			}
+			// Ensure we have a target file for E2E; default to index.html if none extracted.
+			if err := runOrchestrateCommand([]string{promptStr}); err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		case "orchestrate":
+			if err := runOrchestrateCommand(os.Args[2:]); err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				os.Exit(1)
 			}

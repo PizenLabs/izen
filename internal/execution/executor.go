@@ -454,6 +454,13 @@ type RuntimeExecutor struct {
 	mu      sync.Mutex
 	pending map[string]*pendingMutation
 	counter int
+
+	// observeSnapshot is the Observation-phase memory cache: target → content.
+	// It is populated ONCE per Execute via observeTargets and is the single
+	// byte source for compileContext, invokeMutation, and verification — no
+	// repetitive os.ReadFile occurs. It is cleared at the end of Execute.
+	observeSnapshot   map[string][]byte
+	observeSnapshotMu sync.RWMutex
 }
 
 // NewRuntimeExecutor wires a self-contained execution authority. When langID is
@@ -563,6 +570,63 @@ func (x *RuntimeExecutor) SetSessionResolver(fn func() string) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	x.sessionID = fn
+}
+
+// observeTargets captures each target's bytes ONCE (Observation phase) and
+// caches them as the single byte source for the execution. It emits the
+// "[runtime] reading %s" log exactly once per target — verification and
+// extraction consume the cached []byte via SnapshotContent without repeating
+// os.ReadFile.
+func (x *RuntimeExecutor) observeTargets(targets []string) {
+	cache := make(map[string][]byte)
+	for _, t := range targets {
+		path := filepath.Join(x.root, t)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		x.emitContextActivity(t, len(data))
+		cache[t] = data
+		cache[path] = data
+		cache[filepath.Base(t)] = data
+	}
+	x.observeSnapshotMu.Lock()
+	x.observeSnapshot = cache
+	x.observeSnapshotMu.Unlock()
+}
+
+func (x *RuntimeExecutor) getSnapshotContent(target string) ([]byte, bool) {
+	x.observeSnapshotMu.RLock()
+	defer x.observeSnapshotMu.RUnlock()
+	if x.observeSnapshot == nil {
+		return nil, false
+	}
+	if data, ok := x.observeSnapshot[target]; ok {
+		return data, true
+	}
+	if data, ok := x.observeSnapshot[filepath.Base(target)]; ok {
+		return data, true
+	}
+	path := filepath.Join(x.root, target)
+	if data, ok := x.observeSnapshot[path]; ok {
+		return data, true
+	}
+	return nil, false
+}
+
+func (x *RuntimeExecutor) clearObserveSnapshot() {
+	x.observeSnapshotMu.Lock()
+	x.observeSnapshot = nil
+	x.observeSnapshotMu.Unlock()
+}
+
+// SnapshotContent returns the snapshot bytes for a target, if observed.
+// It is the verification consumption point — no os.ReadFile.
+func (x *RuntimeExecutor) SnapshotContent(target string) []byte {
+	if data, ok := x.getSnapshotContent(target); ok {
+		return data
+	}
+	return nil
 }
 
 // resolveSessionID returns the originating session for a request: the explicit
@@ -846,6 +910,13 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	for _, t := range targets {
 		g.CompleteTarget(t, fileExists(filepath.Join(x.root, t)), "strategy")
 	}
+
+	// ── OBSERVE PHASE: single snapshot read (the ONLY disk read) ─────
+	// The target file's bytes are captured ONCE via Observe and cached as the
+	// single byte source for compileContext, invokeMutation, and verification.
+	// All downstream stages consume SnapshotContent() without repeating os.ReadFile.
+	x.observeTargets(targets)
+	defer x.clearObserveSnapshot()
 
 	// ── ADMISSION III: CONTRACT IDENTITY RESOLUTION (Phase 2 P2) ──────
 	// The execution's immutable identity is derived from the VERIFIED context
@@ -1671,14 +1742,20 @@ func (x *RuntimeExecutor) compileContext(profile strategy.ExecutionStrategyProfi
 	}
 	var b strings.Builder
 	for _, t := range targets {
-		path := filepath.Join(x.root, t)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
+		var data []byte
+		if cached, ok := x.getSnapshotContent(t); ok {
+			data = cached
+			// Snapshot already emitted in Observe phase — do not re-emit.
+		} else {
+			path := filepath.Join(x.root, t)
+			d, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			// Fallback read only when no snapshot was observed.
+			x.emitContextActivity(t, len(d))
+			data = d
 		}
-		// Runtime context activity evidence: the target content actually read
-		// by the runtime crosses only when it really happens.
-		x.emitContextActivity(t, len(data))
 		if len(data) > maxExecutorContextBytes {
 			data = data[:maxExecutorContextBytes]
 		}
@@ -1747,15 +1824,24 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		recoveryLabel = "none"
 	}
 	for _, target := range targets {
-		path := filepath.Join(x.root, target)
-		data, readErr := os.ReadFile(path)
-		if readErr != nil && !os.IsNotExist(readErr) {
-			return nil, nil, nil, nil, fmt.Errorf("executor: read target %s: %w", target, readErr)
+		var data []byte
+		var readErr error
+		if cached, ok := x.getSnapshotContent(target); ok {
+			data = cached
+			// Snapshot already emitted in Observe phase — consume []byte slice reference, no os.ReadFile
+		} else {
+			path := filepath.Join(x.root, target)
+			d, err := os.ReadFile(path)
+			if err != nil && !os.IsNotExist(err) {
+				return nil, nil, nil, nil, fmt.Errorf("executor: read target %s: %w", target, err)
+			}
+			data = d
+			readErr = err
+			// Only emit when actually reading from disk (fallback, no snapshot)
+			x.emitContextActivity(target, len(data))
 		}
+		_ = readErr
 		original := string(data)
-		// Runtime context activity evidence: the target content actually read
-		// by the runtime crosses only when it really happens.
-		x.emitContextActivity(target, len(data))
 
 		system := boundedMutationSystemPrompt()
 		outputContract := "full_file_or_patch"
@@ -2179,14 +2265,19 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	var b strings.Builder
 	b.WriteString(readOnlySystemPrompt(profile.Strategy))
 	for _, t := range targets {
-		path := filepath.Join(x.root, t)
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			continue
+		var data []byte
+		if cached, ok := x.getSnapshotContent(t); ok {
+			data = cached
+			// Snapshot already emitted in Observe phase — consume []byte slice, no os.ReadFile
+		} else {
+			path := filepath.Join(x.root, t)
+			d, readErr := os.ReadFile(path)
+			if readErr != nil {
+				continue
+			}
+			x.emitContextActivity(t, len(d))
+			data = d
 		}
-		// Runtime context activity evidence: the file content the runtime
-		// actually read crosses only when it really happens.
-		x.emitContextActivity(t, len(data))
 		if len(data) > maxExecutorContextBytes {
 			data = data[:maxExecutorContextBytes]
 		}

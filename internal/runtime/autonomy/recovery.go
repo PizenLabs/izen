@@ -3,6 +3,7 @@ package autonomy
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/execution"
@@ -116,6 +117,16 @@ func transitionAvailable(o autonomy.Observation) bool {
 //	I5  PreflightInfeasible → AskHuman (explicit re-scope; never silent)
 //	B5  WorkspaceDrift → Abort
 func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopDecision {
+	// HARD-BLOCK: FormatFailureCount >=2 or Ambiguous == true → park at DecisionSurface awaiting_human
+	// Do NOT issue a re-scoped [bounded_patch] retry. Immediately park.
+	if o.AttemptNum >= 2 || o.RecoveryCycle >= 2 {
+		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
+			Reason: "hard-block: format failures >=2 — park at DecisionSurface awaiting_human, no bounded_patch retry"}
+	}
+	if o.ClarificationRequired || strings.Contains(strings.ToLower(o.Diagnostic), "ambiguous") {
+		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
+			Reason: "hard-block: ambiguous — park at DecisionSurface awaiting_human, no bounded_patch retry"}
+	}
 	sub := RecoverySubtype(o)
 	attemptsLeft := b.MaxAttempts <= 0 || o.AttemptNum < b.MaxAttempts
 
@@ -193,6 +204,13 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 //     strategy so the executor's admission resolves the SAME ContractID and
 //     deterministically increments AttemptID.
 func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.LoopRequest, error) {
+	// HARD-BLOCK: FormatFailureCount >=2 or Ambiguous → no bounded_patch retry
+	if o.AttemptNum >= 2 || o.RecoveryCycle >= 2 {
+		return req, fmt.Errorf("%w: hard-block format failures >=2 for %s — park at DecisionSurface awaiting_human", ErrRecoveryHalted, o.Target)
+	}
+	if o.ClarificationRequired || strings.Contains(strings.ToLower(o.Diagnostic), "ambiguous") {
+		return req, fmt.Errorf("%w: hard-block ambiguous for %s — park at DecisionSurface awaiting_human", ErrRecoveryHalted, o.Target)
+	}
 	sub := RecoverySubtype(o)
 	target := o.Target
 	if target == "" {

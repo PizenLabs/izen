@@ -67,7 +67,7 @@ func TestTUIBridge_HandlesPointerAndWrappedEvents(t *testing.T) {
 			}
 			// The modal must actually render the interactive menu, proving the
 			// DecisionSurface payload survived the unwrap.
-			if out := updated.View(); out == "" || !containsAll(out, "PROPOSAL STRATEGY", "Esc cancel") {
+			if out := updated.View(); out == "" || !containsAll(out, "STRATEGY DECISION", "Esc cancel") {
 				t.Fatalf("modal must render the interactive proposal menu, got %q", out)
 			}
 			// Activating a pure value modal schedules no background command.

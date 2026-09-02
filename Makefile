@@ -1,5 +1,5 @@
 BINARY_NAME=izen
-VERSION=0.1.1
+VERSION=0.2.0-rmah-wired
 BUILD_DIR=bin
 
 .PHONY: all build install test clean
