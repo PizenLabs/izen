@@ -102,20 +102,6 @@ func NewDecisionSurfaceAdapterFromState(state preflight.TargetState, maxTokens i
 // constructed with a target/snapshot but an empty ViewModel. It is the
 // BubbleTea Init entry per spec.
 func (m DecisionSurfaceAdapter) Init() tea.Cmd {
-	// If ViewModel is empty but source snapshot is present, (re)build it.
-	if len(m.ViewModel.Options) == 0 && m.targetPath != "" {
-		astStatus := preflight.InferASTStatus(m.snapshot, m.targetPath)
-		targetState := preflight.TargetState{
-			Path:      m.targetPath,
-			Content:   m.snapshot,
-			ASTStatus: astStatus,
-		}
-		caps := capability.ModelCapabilities{MaxOutputTokens: m.maxTokens}
-		gateResult := preflight.EvaluateBudgetGate(targetState, caps)
-		vm := decision.BuildViewModel(m.targetPath, astStatus, &gateResult)
-		m.ViewModel = vm
-		m.cursor = m.firstSelectable()
-	}
 	return nil
 }
 
@@ -184,6 +170,7 @@ func (m DecisionSurfaceAdapter) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 //   - IsRecommended → green "(recommended)"
 //   - Risk == HIGH   → red "[HIGH RISK]"
 //   - IsDisabled     → grayed-out "[DISABLED: reason]"
+//
 // The cursor never rests on a disabled option.
 func (m DecisionSurfaceAdapter) View() string {
 	if len(m.ViewModel.Options) == 0 {
@@ -235,9 +222,6 @@ func (m DecisionSurfaceAdapter) View() string {
 			line += " " + dimmedStyle.Render(disabledLabel)
 			// Gray out the whole line for disabled options
 			line = dimmedStyle.Render(line) + dimmedStyle.Render(" (grayed out)")
-		} else if opt.IsRecommended {
-			// Keep recommended path green-tinted (the label itself is green)
-			// but do not dim the whole line.
 		}
 
 		fmt.Fprintln(&b, line)

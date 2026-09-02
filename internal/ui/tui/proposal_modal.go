@@ -170,13 +170,14 @@ func surfaceToViewModel(s DecisionSurface) decision.DecisionViewModel {
 		BudgetMaxTok: s.CurrentBudget,
 	}
 	// Map BudgetStatus to preflight naming when needed
-	if s.FailureCategory == string(statusBudgetExceeded) {
+	switch {
+	case s.FailureCategory == string(statusBudgetExceeded):
 		vm.BudgetStatus = string(preflight.BudgetExceeded)
-	} else if s.FailureCategory != "" {
+	case s.FailureCategory != "":
 		vm.BudgetStatus = s.FailureCategory
-	} else if s.CurrentBudget > 0 && s.EstimatedTokens > s.CurrentBudget {
+	case s.CurrentBudget > 0 && s.EstimatedTokens > s.CurrentBudget:
 		vm.BudgetStatus = string(preflight.BudgetExceeded)
-	} else if vm.BudgetStatus == "" {
+	case vm.BudgetStatus == "":
 		vm.BudgetStatus = string(preflight.BudgetWithinLimits)
 	}
 	if vm.ASTStatus == "" {
@@ -535,11 +536,12 @@ func (p *ProposalModel) renderViewModel(width, boxWidth int) string {
 		if riskLabel == "" {
 			riskLabel = "low"
 		}
-		if opt.IsDisabled {
+		switch {
+		case opt.IsDisabled:
 			riskLabel = disabledStyle.Render(riskLabel)
-		} else if opt.Risk == decision.RiskHigh {
+		case opt.Risk == decision.RiskHigh:
 			riskLabel = highRiskStyle.Render(riskLabel)
-		} else if opt.IsRecommended {
+		case opt.IsRecommended:
 			riskLabel = greenStyle.Render(riskLabel)
 		}
 		fmt.Fprintf(&sb, "      Risk: %s", riskLabel)
@@ -562,6 +564,8 @@ func (p *ProposalModel) renderViewModel(width, boxWidth int) string {
 // whose estimated output exceeds the declared budget — the distinct cause that
 // calls for a bounded SEARCH/REPLACE patch, not AST repair. It branches on the
 // typed FailureCategory (budget_exceeded), never on a parsed reason string.
+//
+//nolint:unused
 func (p *ProposalModel) needsBoundedPatch() bool {
 	if p == nil {
 		// Check ViewModel fallback
@@ -614,6 +618,7 @@ func box(body string, width int) string {
 	return sb.String()
 }
 
+//nolint:unused
 func runeLen(s string) int {
 	return len([]rune(s))
 }

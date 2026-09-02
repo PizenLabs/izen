@@ -115,7 +115,7 @@ func transitionAvailable(o autonomy.Observation) bool {
 //	I3  OUTPUT_EXHAUSTED with the transition available → Repair (typed)
 //	I4  TransportError → bounded Retry, everything else → human or abort
 //	I5  PreflightInfeasible → AskHuman (explicit re-scope; never silent)
-	//	B5  WorkspaceDrift → Abort
+//	B5  WorkspaceDrift → Abort
 func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopDecision {
 	// HARD-BLOCK: FormatFailureCount >=2 or Ambiguous == true → park at DecisionSurface awaiting_human
 	// Do NOT issue a re-scoped [bounded_patch] retry. Immediately park.
