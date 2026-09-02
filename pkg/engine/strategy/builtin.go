@@ -2,36 +2,22 @@ package strategy
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 
 	stdctx "context"
 
 	"github.com/PizenLabs/izen/pkg/engine/context"
 	"github.com/PizenLabs/izen/pkg/engine/intent"
+	"github.com/PizenLabs/izen/pkg/runtime/target"
 )
 
-// extractTargetRE matches explicit @path references in a prompt.
-var extractTargetRE = regexp.MustCompile(`@([A-Za-z0-9_./\-]+)`)
-
-// extractTargets pulls explicit @file references from a prompt. It makes no
-// assumptions about the files existing — existence checks belong to the
-// execution preconditions stage.
+// extractTargets pulls explicit @file references from a prompt. It delegates to
+// the canonical target extraction lexer (target.ExtractReferences) so quoted
+// and standard @path references behave identically across admission and
+// strategy phases. It makes no assumptions about the files existing —
+// existence checks belong to the execution preconditions stage.
 func extractTargets(prompt string) []string {
-	seen := make(map[string]bool)
-	var out []string
-	for _, m := range extractTargetRE.FindAllStringSubmatch(prompt, -1) {
-		ref := strings.TrimSpace(m[1])
-		if ref == "" || ref == "/" {
-			continue
-		}
-		if seen[ref] {
-			continue
-		}
-		seen[ref] = true
-		out = append(out, ref)
-	}
-	return out
+	return target.ExtractReferencePaths(prompt)
 }
 
 // baseGoal builds the shared skeleton of a goal from the classified intent:

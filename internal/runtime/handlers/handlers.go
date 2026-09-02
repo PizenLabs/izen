@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +24,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/telemetry"
+	"github.com/PizenLabs/izen/pkg/runtime/target"
 )
 
 // Sentinel errors returned by the real handlers.
@@ -500,32 +500,31 @@ func containsAny(s string, keywords []string) bool {
 	return false
 }
 
-// extractTargetRE matches explicit @path references in a prompt.
-var extractTargetRE = regexp.MustCompile(`@([A-Za-z0-9_./\-]+)`)
-
 // resolveTargets extracts @-referenced file targets from a prompt and returns
-// workspace-relative paths. It is the synchronous admission-time target
-// resolution that runs BEFORE the preflight background worker is spawned,
-// ensuring the initial snapshot is generated for the explicit target.
+// workspace-relative paths. It delegates to the canonical target extraction
+// lexer (target.ExtractReferences) so quoted paths (@"src/my component.tsx")
+// and standard @path references behave identically across admission and
+// strategy phases. It is the synchronous admission-time target resolution
+// that runs BEFORE the preflight background worker is spawned, ensuring the
+// initial snapshot is generated for the explicit target.
 func resolveTargets(root, prompt string) []string {
-	seen := make(map[string]bool)
+	refs := target.ExtractReferences(prompt)
+	if len(refs) == 0 {
+		return nil
+	}
 	var out []string
-	for _, m := range extractTargetRE.FindAllStringSubmatch(prompt, -1) {
-		ref := strings.TrimSpace(m[1])
-		if ref == "" || ref == "/" {
+	for _, ref := range refs {
+		raw := ref.Raw
+		if raw == "" || raw == "/" {
 			continue
 		}
-		if seen[ref] {
-			continue
-		}
-		seen[ref] = true
 		// Verify the target exists in the workspace when root is provided.
 		if root != "" {
-			if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(ref))); err != nil {
+			if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(raw))); err != nil {
 				continue
 			}
 		}
-		out = append(out, ref)
+		out = append(out, raw)
 	}
 	return out
 }

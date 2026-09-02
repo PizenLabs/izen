@@ -495,12 +495,44 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 		}
 		return "", os.ErrNotExist
 	})
+	// Wire the mutation cache invalidation hook: after every successful file
+	// write the PatchManager updates the observe snapshot cache with the
+	// freshly written bytes. This eliminates stale-read conditions where
+	// post-mutation verification or re-validation reads pre-mutation bytes
+	// from memory after a file has been modified on disk.
+	x.patches.SetOnMutation(func(target string, written []byte) {
+		x.invalidateSnapshot(target, written)
+	})
 	if langID != "" {
 		x.verifier = NewLanguageVerifier(root, langID)
 	} else {
 		x.verifier = NewVerifier(root)
 	}
 	return x
+}
+
+// invalidateSnapshot updates the observe snapshot cache for target with the
+// freshly written bytes. It is the callback wired to PatchManager.onMutation
+// and is called immediately after every successful file write. By updating
+// the cache (rather than just deleting it), subsequent getSnapshotContent
+// calls fetch the newly written file state without an os.ReadFile round-trip.
+// When written is nil it deletes the cache entry (explicit invalidation).
+func (x *RuntimeExecutor) invalidateSnapshot(target string, written []byte) {
+	x.observeSnapshotMu.Lock()
+	defer x.observeSnapshotMu.Unlock()
+	if x.observeSnapshot == nil {
+		return
+	}
+	if written == nil {
+		delete(x.observeSnapshot, target)
+		delete(x.observeSnapshot, filepath.Base(target))
+		path := filepath.Join(x.root, target)
+		delete(x.observeSnapshot, path)
+		return
+	}
+	x.observeSnapshot[target] = written
+	x.observeSnapshot[filepath.Base(target)] = written
+	x.observeSnapshot[filepath.Join(x.root, target)] = written
 }
 
 // SetAdmittedCapabilities replaces the capability set the runtime's admission
@@ -2006,9 +2038,30 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// full-artifact attempt instead of a relabeled retry.
 			patched, ok := ExtractBoundedPatch(original, raw)
 			if !ok {
-				return nil, invs, nil, trace, fmt.Errorf("%w: %s: bounded patch contract requires SEARCH/REPLACE blocks or unified diff hunks; full-file or unstructured output rejected", ErrArtifactRetryableRejected, target)
+				// RMAH Tier 2 fallback: free-tier models may return raw code
+				// fences instead of SEARCH/REPLACE blocks. Attempt the RMAH
+				// pipeline (Tier 1 already failed via ExtractBoundedPatch;
+				// Tier 2 extracts from fenced blocks + AST baseline check).
+				rmahResult := rmahPipeline.Process(raw, target, original)
+				if rmahResult.Passed {
+					// RMAH Tier 2 produced a candidate that passed AST
+					// verification — route it through the pre-existing
+					// artifact boundary before accepting it.
+					modified = rmahResult.Candidate
+				} else {
+					// RMAH did not produce a usable candidate (Tier 1 failed,
+					// Tier 2 rejected or found nothing). The bounded patch
+					// contract is unsatisfied — the retry loop gets the
+					// strict contract feedback.
+					detail := "bounded patch contract requires SEARCH/REPLACE blocks or unified diff hunks; full-file or unstructured output rejected"
+					if rmahResult.Rejected && rmahResult.RejectReason != "" {
+						detail = fmt.Sprintf("%s; RMAH: %s", detail, rmahResult.RejectReason)
+					}
+					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %s", ErrArtifactRetryableRejected, target, detail)
+				}
+			} else {
+				modified = patched
 			}
-			modified = patched
 		} else {
 			modified = ResolveModifiedContent(original, raw)
 			if modified == "" {

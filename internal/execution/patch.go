@@ -111,6 +111,14 @@ type PatchManager struct {
 	// driven by the engine/UI terminal handlers, never by PatchManager).
 	// Apply records each target into the set before mutating the filesystem.
 	mutationSet *MutationSet
+
+	// onMutation is an optional callback invoked after every successful file
+	// write (both FILE_CREATE and regular patch applies). It receives the
+	// workspace-relative file path and the freshly written bytes so the
+	// caller's observation cache can be invalidated or updated. This
+	// eliminates stale-read conditions where post-mutation verification or
+	// re-validation reads from memory after a file has been modified on disk.
+	onMutation func(target string, written []byte)
 }
 
 func NewPatchManager(root string) *PatchManager {
@@ -151,6 +159,16 @@ func (pm *PatchManager) SetMutationSet(ms *MutationSet) {
 // MutationSet returns the boundary currently attached to this manager.
 func (pm *PatchManager) MutationSet() *MutationSet {
 	return pm.mutationSet
+}
+
+// SetOnMutation sets an optional callback invoked after every successful file
+// write (FILE_CREATE and regular patch applies). The callback receives the
+// workspace-relative target path and the freshly written bytes. It is the
+// hook the RuntimeExecutor uses to invalidate its observeSnapshot cache
+// immediately upon mutation, preventing stale-read conditions where
+// post-mutation verification reads pre-mutation bytes from memory.
+func (pm *PatchManager) SetOnMutation(fn func(target string, written []byte)) {
+	pm.onMutation = fn
 }
 
 // recordTransaction snapshots a target into the owned mutation boundary before
@@ -572,8 +590,15 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 			return fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
 		}
 		// Write the new file directly — skip diff/SEARCH/REPLACE flow.
-		if err := os.WriteFile(fullPath, []byte(patch.Modified), 0644); err != nil {
+		writeBytes := []byte(patch.Modified)
+		if err := os.WriteFile(fullPath, writeBytes, 0644); err != nil {
 			return fmt.Errorf("write %s: %w", patch.File, err)
+		}
+		// Invalidate the observation cache for this target immediately upon a
+		// successful write so post-mutation verification reads the NEW file
+		// state, not the pre-mutation snapshot.
+		if pm.onMutation != nil {
+			pm.onMutation(patch.File, writeBytes)
 		}
 		if globalActivityLog != nil {
 			lineCount := len(strings.Split(patch.Modified, "\n"))
@@ -697,11 +722,18 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		}
 	}
 
-	if err := os.WriteFile(fullPath, []byte(final), 0644); err != nil {
+	finalBytes := []byte(final)
+	if err := os.WriteFile(fullPath, finalBytes, 0644); err != nil {
 		if globalActivityLog != nil {
 			globalActivityLog("[FAIL] patch rejected on %s: write failed: %v", patch.File, err)
 		}
 		return fmt.Errorf("write %s: %w", patch.File, err)
+	}
+	// Invalidate the observation cache for this target immediately upon a
+	// successful write so post-mutation verification reads the NEW file
+	// state, not the pre-mutation snapshot.
+	if pm.onMutation != nil {
+		pm.onMutation(patch.File, finalBytes)
 	}
 
 	// ── Deterministic Verification Gate ──────────────────────────────────
