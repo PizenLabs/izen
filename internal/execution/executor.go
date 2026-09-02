@@ -485,6 +485,16 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 		artifactValidator: validator,
 		pending:           make(map[string]*pendingMutation),
 	}
+	// Wire the normalizer to consume the observe snapshot cache, eliminating
+	// redundant os.ReadFile disk hits during artifact validation. The closure
+	// captures x but is only called during Execute (after x is fully
+	// constructed and observeTargets has populated the cache).
+	validator.SetTargetLoader(func(target string) (string, error) {
+		if data, ok := x.getSnapshotContent(target); ok {
+			return string(data), nil
+		}
+		return "", os.ErrNotExist
+	})
 	if langID != "" {
 		x.verifier = NewLanguageVerifier(root, langID)
 	} else {

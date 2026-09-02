@@ -12,6 +12,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -68,6 +71,11 @@ type HandlerDeps struct {
 	// PreflightTargets, when set, overrides target resolution for the
 	// background preflight (tests).
 	PreflightTargets []string
+	// Root is the workspace root directory used for synchronous target
+	// resolution at prompt admission. When set, the handler extracts
+	// @-referenced targets from the prompt and passes them to the preflight
+	// worker so the initial snapshot is generated for the explicit target.
+	Root string
 	// Telemetry is the high-precision latency sink for prompt_submit_latency
 	// / preflight_latency / first_stream_latency. Nil defaults to the global
 	// recorder.
@@ -199,6 +207,12 @@ func (h *SubmitPromptHandler) Handle(ctx context.Context, cmd runtime.RuntimeCom
 	// 3. Dispatch BackgroundPreflight async — NEVER synchronously read/scan.
 	if w := h.deps.PreflightWorker; w != nil {
 		targets := h.deps.PreflightTargets
+		// Synchronous target resolution: extract @-referenced targets from
+		// the prompt BEFORE spawning the bg worker so the initial snapshot
+		// is generated for the explicit target (eliminating target="").
+		if len(targets) == 0 {
+			targets = resolveTargets(h.deps.Root, c.Prompt)
+		}
 		// Use a detached context so the bg worker outlives the handler's ctx.
 		bgCtx := context.Background()
 		w.Start(bgCtx, c.Prompt, targets) //nolint:contextcheck // detached bg preflight context outlives the handler
@@ -484,6 +498,36 @@ func containsAny(s string, keywords []string) bool {
 		}
 	}
 	return false
+}
+
+// extractTargetRE matches explicit @path references in a prompt.
+var extractTargetRE = regexp.MustCompile(`@([A-Za-z0-9_./\-]+)`)
+
+// resolveTargets extracts @-referenced file targets from a prompt and returns
+// workspace-relative paths. It is the synchronous admission-time target
+// resolution that runs BEFORE the preflight background worker is spawned,
+// ensuring the initial snapshot is generated for the explicit target.
+func resolveTargets(root, prompt string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, m := range extractTargetRE.FindAllStringSubmatch(prompt, -1) {
+		ref := strings.TrimSpace(m[1])
+		if ref == "" || ref == "/" {
+			continue
+		}
+		if seen[ref] {
+			continue
+		}
+		seen[ref] = true
+		// Verify the target exists in the workspace when root is provided.
+		if root != "" {
+			if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(ref))); err != nil {
+				continue
+			}
+		}
+		out = append(out, ref)
+	}
+	return out
 }
 
 // ── Handlers bundle + registration ───────────────────────────────────────────
