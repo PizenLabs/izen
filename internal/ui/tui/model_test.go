@@ -53,7 +53,7 @@ func TestTUI_RendersProposalModalOnDecisionSurfaceEvent(t *testing.T) {
 	if out == "" {
 		t.Fatal("View must render a non-empty frame while the proposal modal is active")
 	}
-	for _, want := range []string{"PROPOSAL STRATEGY", "Enter select", "1-9 quick select", "Esc cancel"} {
+	for _, want := range []string{"STRATEGY DECISION", "Enter select", "1-9 quick select", "Esc cancel"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output frame must include interactive hint %q", want)
 		}

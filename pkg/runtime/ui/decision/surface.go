@@ -18,18 +18,18 @@ import (
 type RiskLevel int
 
 const (
-	// RiskLow marks the safest path: structural repair with validation.
-	RiskLow RiskLevel = iota
-	// RiskHigh marks an escape hatch that bypasses a safety gate.
-	RiskHigh
+	// RiskLevelLow marks the safest path: structural repair with validation.
+	RiskLevelLow RiskLevel = iota
+	// RiskLevelHigh marks an escape hatch that bypasses a safety gate.
+	RiskLevelHigh
 )
 
 // String returns a stable lowercase label for the risk level.
 func (r RiskLevel) String() string {
 	switch r {
-	case RiskLow:
+	case RiskLevelLow:
 		return "low"
-	case RiskHigh:
+	case RiskLevelHigh:
 		return "high"
 	default:
 		return "unknown"
@@ -125,7 +125,7 @@ func AnnotateStrategies(s *Surface) {
 				opt.Label = ensureRecommended(opt.Label)
 				opt.Recommended = true
 			}
-			opt.RiskLevel = RiskLow
+			opt.RiskLevel = RiskLevelLow
 		case OptionBoundedSearchReplace:
 			if !strings.Contains(opt.Label, "[HIGH RISK]") {
 				opt.Label += " [HIGH RISK]"
@@ -133,13 +133,13 @@ func AnnotateStrategies(s *Surface) {
 			if opt.Description == "" {
 				opt.Description = "Bypasses AST validation. May introduce syntax errors."
 			}
-			opt.RiskLevel = RiskHigh
+			opt.RiskLevel = RiskLevelHigh
 		case OptionFullRewrite:
 			if opt.Disabled && !strings.Contains(opt.Label, "[DISABLED: Exceeds Model Output Budget]") {
 				opt.Label = "FULL_REWRITE [DISABLED: Exceeds Model Output Budget]"
 			}
 			if opt.Disabled {
-				opt.RiskLevel = RiskHigh
+				opt.RiskLevel = RiskLevelHigh
 			}
 		}
 	}
@@ -179,14 +179,14 @@ func Build(target string, ast preflight.ASTStatus, gate *preflight.BudgetGateRes
 				ID:          OptionRepairAST,
 				Label:       "Repair AST first (recommended)",
 				Description: "Repair the structurally corrupt target before mutating.",
-				RiskLevel:   RiskLow,
+				RiskLevel:   RiskLevelLow,
 				Recommended: true,
 			},
 			StrategyOption{
 				ID:          OptionBoundedSearchReplace,
 				Label:       "Bounded textual SEARCH/REPLACE [HIGH RISK]",
 				Description: "Bypasses AST validation. May introduce syntax errors.",
-				RiskLevel:   RiskHigh,
+				RiskLevel:   RiskLevelHigh,
 			},
 		)
 	}
@@ -196,7 +196,7 @@ func Build(target string, ast preflight.ASTStatus, gate *preflight.BudgetGateRes
 			ID:          OptionChunkedRepair,
 			Label:       "ChunkedRepair",
 			Description: "Mutate the target in bounded sequential chunks to fit the model output budget.",
-			RiskLevel:   RiskLow,
+			RiskLevel:   RiskLevelLow,
 			Recommended: true,
 			Disabled:    !gate.ChunkedRepairAvailable,
 		}
@@ -212,7 +212,7 @@ func Build(target string, ast preflight.ASTStatus, gate *preflight.BudgetGateRes
 				ID:          OptionFullRewrite,
 				Label:       "FULL_REWRITE [DISABLED: Exceeds Model Output Budget]",
 				Description: "Whole-file rewrite requires more output tokens than the model permits.",
-				RiskLevel:   RiskHigh,
+				RiskLevel:   RiskLevelHigh,
 				Disabled:    true,
 			},
 		)
@@ -221,7 +221,7 @@ func Build(target string, ast preflight.ASTStatus, gate *preflight.BudgetGateRes
 				ID:          OptionModelSwitch,
 				Label:       "Switch model [REQUIRED]",
 				Description: "No strategy fits the current model's output budget. Select a model with a larger maximum output.",
-				RiskLevel:   RiskLow,
+				RiskLevel:   RiskLevelLow,
 				Recommended: false,
 			})
 		}
@@ -231,7 +231,7 @@ func Build(target string, ast preflight.ASTStatus, gate *preflight.BudgetGateRes
 		ID:          OptionCancel,
 		Label:       "Cancel",
 		Description: "Abandon the objective with zero mutation and zero spend.",
-		RiskLevel:   RiskLow,
+		RiskLevel:   RiskLevelLow,
 	})
 	return s
 }

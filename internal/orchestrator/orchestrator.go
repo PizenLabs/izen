@@ -12,6 +12,7 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/pkg/engine/pipeline"
+	runtimeOrchestrator "github.com/PizenLabs/izen/pkg/runtime/orchestrator"
 )
 
 // Phase is a logical execution phase within the workflow.
@@ -109,6 +111,12 @@ type Orchestrator struct {
 	history  []Phase
 	pipeline *pipeline.Engine
 
+	// runtimeLoop is the injected pkg/runtime/orchestrator.Loop closed
+	// execution controller. It owns the Observe → RMAH → Gate → Commit path
+	// with a single Observation-phase snapshot []byte that is passed to
+	// verification without repeating os.ReadFile.
+	runtimeLoop *runtimeOrchestrator.Loop
+
 	// planAuthorization carries the explicitly authorized execution plan the
 	// workflow guard consults (see plan_authorization.go): a human-approved
 	// DECOMPOSITION_PROPOSAL micro-plan or a fast-path ephemeral plan.
@@ -148,6 +156,89 @@ func (o *Orchestrator) WithPipeline(pe *pipeline.Engine) *Orchestrator {
 		o.pipeline = pe
 	}
 	return o
+}
+
+// WithRuntimeLoop injects the pkg/runtime/orchestrator.Loop closed execution
+// controller into the primary orchestrator. The loop's Observe phase is the
+// single disk-read authority; its snapshot []byte is passed to verification
+// without repeating os.ReadFile.
+func (o *Orchestrator) WithRuntimeLoop(loop *runtimeOrchestrator.Loop) *Orchestrator {
+	if o != nil {
+		o.mu.Lock()
+		o.runtimeLoop = loop
+		o.mu.Unlock()
+	}
+	return o
+}
+
+// RuntimeLoop returns the injected runtime loop, if any.
+func (o *Orchestrator) RuntimeLoop() *runtimeOrchestrator.Loop {
+	if o == nil {
+		return nil
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.runtimeLoop
+}
+
+// Observe captures the target file's bytes into the runtime loop's memory
+// snapshot (Observation phase). It is the ONLY disk read of the cycle — the
+// returned snapshot []byte is the single source for RMAH extraction and gate
+// verification.
+func (o *Orchestrator) Observe(ctx context.Context, path string) error {
+	if o == nil {
+		return fmt.Errorf("orchestrator: nil receiver")
+	}
+	o.mu.RLock()
+	loop := o.runtimeLoop
+	o.mu.RUnlock()
+	if loop == nil {
+		return fmt.Errorf("orchestrator: no runtime loop wired — call WithRuntimeLoop first")
+	}
+	return loop.Observe(ctx, path)
+}
+
+// Snapshot returns the current memory snapshot from the runtime loop, or nil
+// before Observe. The snapshot.Content []byte is consumed by verification
+// without repeating os.ReadFile.
+func (o *Orchestrator) Snapshot() *runtimeOrchestrator.MemorySnapshot {
+	if o == nil {
+		return nil
+	}
+	o.mu.RLock()
+	loop := o.runtimeLoop
+	o.mu.RUnlock()
+	if loop == nil {
+		return nil
+	}
+	return loop.Snapshot()
+}
+
+// SnapshotContent returns the snapshot's raw bytes for verification. It is
+// the state-machine's consumption point: verification receives this []byte
+// directly, never re-reading the file from disk.
+func (o *Orchestrator) SnapshotContent() []byte {
+	snap := o.Snapshot()
+	if snap == nil {
+		return nil
+	}
+	return snap.Content
+}
+
+// ExecuteCycle runs one model-output cycle over the Observation-phase snapshot
+// via the runtime loop. The snapshot []byte from Observe is passed through
+// unchanged — no os.ReadFile occurs during extraction or verification.
+func (o *Orchestrator) ExecuteCycle(ctx context.Context, rawModelOutput []byte) (*runtimeOrchestrator.CycleOutcome, error) {
+	if o == nil {
+		return nil, fmt.Errorf("orchestrator: nil receiver")
+	}
+	o.mu.RLock()
+	loop := o.runtimeLoop
+	o.mu.RUnlock()
+	if loop == nil {
+		return nil, fmt.Errorf("orchestrator: no runtime loop wired")
+	}
+	return loop.ExecuteCycle(ctx, rawModelOutput)
 }
 
 // Pipeline returns the wired layered Pipeline Engine, if any.

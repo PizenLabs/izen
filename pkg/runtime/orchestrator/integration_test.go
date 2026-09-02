@@ -98,7 +98,7 @@ func TestCase1CorruptASTBudgetExceeded(t *testing.T) {
 	if !repair.Recommended {
 		t.Error("Repair AST first must be the recommended option")
 	}
-	if repair.RiskLevel != decision.RiskLow {
+	if repair.RiskLevel != decision.RiskLevelLow {
 		t.Errorf("Repair risk = %v, want low", repair.RiskLevel)
 	}
 	if !strings.Contains(repair.Label, "(recommended)") {
@@ -109,7 +109,7 @@ func TestCase1CorruptASTBudgetExceeded(t *testing.T) {
 	if escape == nil {
 		t.Fatal("surface must offer Bounded textual SEARCH/REPLACE")
 	}
-	if escape.RiskLevel != decision.RiskHigh {
+	if escape.RiskLevel != decision.RiskLevelHigh {
 		t.Errorf("SEARCH/REPLACE risk = %v, want high", escape.RiskLevel)
 	}
 	if !strings.Contains(escape.Label, "[HIGH RISK]") {
