@@ -458,7 +458,8 @@ type RuntimeExecutor struct {
 	// observeSnapshot is the Observation-phase memory cache: target → content.
 	// It is populated ONCE per Execute via observeTargets and is the single
 	// byte source for compileContext, invokeMutation, and verification — no
-	// repetitive os.ReadFile occurs. It is cleared at the end of Execute.
+	// repetitive os.ReadFile occurs. It survives recovery attempts and is
+	// invalidated after mutations.
 	observeSnapshot   map[string][]byte
 	observeSnapshotMu sync.RWMutex
 }
@@ -623,27 +624,14 @@ func (x *RuntimeExecutor) SetSessionResolver(fn func() string) {
 	x.sessionID = fn
 }
 
-// observeTargets captures each target's bytes ONCE (Observation phase) and
-// caches them as the single byte source for the execution. It emits the
-// "[runtime] reading %s" log exactly once per target — verification and
-// extraction consume the cached []byte via SnapshotContent without repeating
-// os.ReadFile.
+// observeTargets captures each target's bytes during Observation and caches
+// them as the single byte source for the execution. The cache persists across
+// recovery attempts; mutation invalidation is the explicit boundary that
+// permits a fresh disk read.
 func (x *RuntimeExecutor) observeTargets(targets []string) {
-	cache := make(map[string][]byte)
 	for _, t := range targets {
-		path := x.resolveSnapshotPath(t)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		x.emitContextActivity(t, len(data))
-		cache[t] = data
-		cache[path] = data
-		cache[filepath.Base(t)] = data
+		x.getSnapshotContent(t)
 	}
-	x.observeSnapshotMu.Lock()
-	x.observeSnapshot = cache
-	x.observeSnapshotMu.Unlock()
 }
 
 // getSnapshotContent returns the snapshot bytes for a target. On a cache hit
@@ -657,15 +645,18 @@ func (x *RuntimeExecutor) getSnapshotContent(target string) ([]byte, bool) {
 	if x.observeSnapshot != nil {
 		if data, ok := x.observeSnapshot[target]; ok {
 			x.observeSnapshotMu.RUnlock()
+			x.emitSnapshotActivity(target, len(data), false)
 			return data, true
 		}
 		if data, ok := x.observeSnapshot[filepath.Base(target)]; ok {
 			x.observeSnapshotMu.RUnlock()
+			x.emitSnapshotActivity(target, len(data), false)
 			return data, true
 		}
 		path := x.resolveSnapshotPath(target)
 		if data, ok := x.observeSnapshot[path]; ok {
 			x.observeSnapshotMu.RUnlock()
+			x.emitSnapshotActivity(target, len(data), false)
 			return data, true
 		}
 	}
@@ -677,6 +668,7 @@ func (x *RuntimeExecutor) getSnapshotContent(target string) ([]byte, bool) {
 	if err != nil {
 		return nil, false
 	}
+	x.emitSnapshotActivity(target, len(data), true)
 	x.observeSnapshotMu.Lock()
 	if x.observeSnapshot == nil {
 		x.observeSnapshot = make(map[string][]byte)
@@ -690,12 +682,6 @@ func (x *RuntimeExecutor) getSnapshotContent(target string) ([]byte, bool) {
 	}
 	x.observeSnapshotMu.Unlock()
 	return data, true
-}
-
-func (x *RuntimeExecutor) clearObserveSnapshot() {
-	x.observeSnapshotMu.Lock()
-	x.observeSnapshot = nil
-	x.observeSnapshotMu.Unlock()
 }
 
 // SnapshotContent returns the snapshot bytes for a target, if observed.
@@ -994,7 +980,6 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// single byte source for compileContext, invokeMutation, and verification.
 	// All downstream stages consume SnapshotContent() without repeating os.ReadFile.
 	x.observeTargets(targets)
-	defer x.clearObserveSnapshot()
 
 	// ── ADMISSION III: CONTRACT IDENTITY RESOLUTION (Phase 2 P2) ──────
 	// The execution's immutable identity is derived from the VERIFIED context
@@ -1823,16 +1808,8 @@ func (x *RuntimeExecutor) compileContext(profile strategy.ExecutionStrategyProfi
 		var data []byte
 		if cached, ok := x.getSnapshotContent(t); ok {
 			data = cached
-			// Snapshot already emitted in Observe phase — do not re-emit.
 		} else {
-			path := filepath.Join(x.root, t)
-			d, err := os.ReadFile(path)
-			if err != nil {
-				continue
-			}
-			// Fallback read only when no snapshot was observed.
-			x.emitContextActivity(t, len(d))
-			data = d
+			continue
 		}
 		if len(data) > maxExecutorContextBytes {
 			data = data[:maxExecutorContextBytes]
@@ -1903,22 +1880,9 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	}
 	for _, target := range targets {
 		var data []byte
-		var readErr error
 		if cached, ok := x.getSnapshotContent(target); ok {
 			data = cached
-			// Snapshot already emitted in Observe phase — consume []byte slice reference, no os.ReadFile
-		} else {
-			path := filepath.Join(x.root, target)
-			d, err := os.ReadFile(path)
-			if err != nil && !os.IsNotExist(err) {
-				return nil, nil, nil, nil, fmt.Errorf("executor: read target %s: %w", target, err)
-			}
-			data = d
-			readErr = err
-			// Only emit when actually reading from disk (fallback, no snapshot)
-			x.emitContextActivity(target, len(data))
 		}
-		_ = readErr
 		original := string(data)
 
 		system := boundedMutationSystemPrompt()
@@ -2367,15 +2331,8 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		var data []byte
 		if cached, ok := x.getSnapshotContent(t); ok {
 			data = cached
-			// Snapshot already emitted in Observe phase — consume []byte slice, no os.ReadFile
 		} else {
-			path := filepath.Join(x.root, t)
-			d, readErr := os.ReadFile(path)
-			if readErr != nil {
-				continue
-			}
-			x.emitContextActivity(t, len(d))
-			data = d
+			continue
 		}
 		if len(data) > maxExecutorContextBytes {
 			data = data[:maxExecutorContextBytes]
@@ -2682,15 +2639,18 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	return visible, usage, trace, nil
 }
 
-// emitContextActivity surfaces a real runtime file read as engine evidence
-// through the existing activity/event loggers (wired by the UI at startup).
-// It fires ONLY when the runtime actually reads the file, and is a no-op when
-// no logger is attached (headless/harness).
-func (x *RuntimeExecutor) emitContextActivity(target string, bytes int) {
+// emitSnapshotActivity surfaces whether snapshot content came from physical
+// disk or the in-memory observation cache through the existing activity/event
+// loggers (wired by the UI at startup).
+func (x *RuntimeExecutor) emitSnapshotActivity(target string, bytes int, disk bool) {
 	if globalActivityLog != nil {
-		globalActivityLog("[runtime] reading %s (%d bytes)", target, bytes)
+		if disk {
+			globalActivityLog("[runtime] reading disk %s (%d bytes)", target, bytes)
+		} else {
+			globalActivityLog("[runtime] snapshot cache hit %s (%d bytes)", target, bytes)
+		}
 	}
-	if globalEventLog != nil {
+	if disk && globalEventLog != nil {
 		globalEventLog(retrieval.FileReadEvent{File: target, Bytes: int64(bytes)})
 	}
 }

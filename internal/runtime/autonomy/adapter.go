@@ -115,11 +115,11 @@ func (a *ExecutorAdapter) ReadTargetFile(target string) ([]byte, bool) {
 	if a == nil || a.root == "" || target == "" {
 		return nil, false
 	}
-	data, err := os.ReadFile(filepath.Join(a.root, filepath.FromSlash(target)))
-	if err != nil {
+	if a.executor == nil {
 		return nil, false
 	}
-	return data, true
+	data := a.executor.SnapshotContent(target)
+	return data, data != nil
 }
 
 // RestoreTargets restores exact file contents under the workspace root. It is
