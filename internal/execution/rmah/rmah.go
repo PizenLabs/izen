@@ -5,7 +5,7 @@
 // raw code fences instead of strict SEARCH/REPLACE blocks. Without RMAH, such
 // outputs cause immediate execution rejection and early hard-block.
 //
-// The pipeline has two tiers:
+// The pipeline has three tiers:
 //
 //	Tier 1 (Strict Schema Parser): validates input against strict SEARCH/REPLACE
 //	blocks or unified diff contracts. If valid, emits a mutation candidate.
@@ -15,6 +15,9 @@
 //	verification. Fail-closed: a candidate that degrades a clean baseline to
 //	corrupt is REJECTED immediately.
 //
+//	Tier 3 (Myers Diff Synthesizer): compares unstructured raw output with the
+//	baseline and emits context-padded SEARCH/REPLACE blocks.
+//
 // Both tiers feed into the pre-existing safety barriers (artifact boundary,
 // verifier). RMAH never bypasses those barriers — it only expands the set of
 // outputs that can reach them.
@@ -23,6 +26,7 @@ package rmah
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -176,7 +180,55 @@ func (p *Pipeline) Process(rawLLMOutput, target, original string) TierResult {
 	}
 
 	// ── Tier 2: Conservative Code Extractor (fallback) ──────────────────
-	return p.tier2ConservativeExtract(rawLLMOutput, target, original)
+	tier2 := p.tier2ConservativeExtract(rawLLMOutput, target, original)
+	if tier2.Passed || !tier2.Rejected || tier2.RejectReason != ErrNoExtractableContent.Error() {
+		return tier2
+	}
+
+	// ── Tier 3: in-memory Myers synthesis ───────────────────────────────
+	return p.tier3Synthesize(rawLLMOutput, target, original)
+}
+
+// ProcessArtifact is the explicit Tier 1 -> Tier 2 -> Tier 3 entry point.
+func (p *Pipeline) ProcessArtifact(rawLLMOutput, target, baseline string) TierResult {
+	return p.Process(rawLLMOutput, target, baseline)
+}
+
+func (p *Pipeline) tier3Synthesize(raw, target, baseline string) TierResult {
+	// Without the structural gate there is no safe way to distinguish raw code
+	// from prose. Tier 3 is therefore fail-closed when no verifier is wired.
+	if p.verifyBaseline == nil || !tier3ASTTarget(target) || strings.TrimSpace(raw) == "" || baseline == "" {
+		return TierResult{Rejected: true, RejectReason: ErrNoExtractableContent.Error()}
+	}
+	if p.verifyBaseline(baseline, target) {
+		ratio := float64(len(strings.TrimSpace(raw))) / float64(len(baseline))
+		if ratio < retentionFloorRatio {
+			return TierResult{Rejected: true, RejectReason: ErrTier3DestructiveTruncation.Error()}
+		}
+	}
+	patch, err := synthesizeDiffPatch(baseline, strings.TrimSpace(raw))
+	if err != nil {
+		return TierResult{Rejected: true, RejectReason: err.Error()}
+	}
+	// Apply the generated blocks in-memory and verify the actual resulting file,
+	// rather than validating an isolated REPLACE payload.
+	result, ok := applySynthesizedPatch(baseline, patch)
+	if !ok {
+		return TierResult{Rejected: true, RejectReason: "rmah tier 3: synthesized patch rejected due to ambiguous anchors"}
+	}
+	if p.verifyBaseline(baseline, target) && !p.verifyBaseline(result, target) {
+		return TierResult{Rejected: true, RejectReason: ErrASTDegradation.Error()}
+	}
+	return TierResult{Candidate: patch, Passed: true}
+}
+
+func tier3ASTTarget(target string) bool {
+	switch strings.ToLower(filepath.Ext(target)) {
+	case ".go", ".html", ".htm", ".xhtml", ".json":
+		return true
+	default:
+		return false
+	}
 }
 
 // tier2ConservativeExtract is the Tier 2 fallback. It extracts raw code

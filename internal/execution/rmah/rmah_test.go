@@ -245,6 +245,58 @@ func TestPipeline_FullFallback_BothTiersFail(t *testing.T) {
 	}
 }
 
+func TestPipeline_Tier3SynthesizesRawOutputWithContext(t *testing.T) {
+	baseline := "package main\n\nfunc main() {\n\tprintln(\"old\")\n}\n"
+	raw := "package main\n\nfunc main() {\n\tprintln(\"new\")\n}\n"
+	p := NewPipeline().
+		WithStrictExtractor(func(raw, orig string) (string, bool) { return "", false }).
+		WithCodeExtractor(func(raw string) (string, bool) { return "", false }).
+		WithBaselineVerifier(func(content, target string) bool {
+			return strings.Contains(content, "package main") && strings.Contains(content, "func main")
+		})
+
+	result := p.ProcessArtifact(raw, "main.go", baseline)
+	if !result.Passed {
+		t.Fatalf("Tier 3 should synthesize raw output: %s", result.RejectReason)
+	}
+	if !strings.Contains(result.Candidate, "<<<<<<< SEARCH") || !strings.Contains(result.Candidate, "new") {
+		t.Fatalf("candidate is not a SEARCH/REPLACE patch: %q", result.Candidate)
+	}
+	patched, ok := applySynthesizedPatch(baseline, result.Candidate)
+	if !ok || patched != raw {
+		t.Fatalf("synthesized patch result = %q, want %q", patched, raw)
+	}
+}
+
+func TestPipeline_Tier3RejectsDestructiveTruncation(t *testing.T) {
+	baseline := "package main\n\nfunc main() {\n\tprintln(\"old\")\n}\n"
+	p := NewPipeline().
+		WithStrictExtractor(func(raw, orig string) (string, bool) { return "", false }).
+		WithCodeExtractor(func(raw string) (string, bool) { return "", false }).
+		WithBaselineVerifier(func(content, target string) bool { return true })
+
+	result := p.Process("package main\n", "main.go", baseline)
+	if result.Passed || !strings.Contains(result.RejectReason, "RMAH Tier 3: synthesized patch rejected due to destructive truncation (<60% retention)") {
+		t.Fatalf("expected Tier 3 truncation rejection, got %+v", result)
+	}
+}
+
+func TestPipeline_Tier3RejectsASTCorruption(t *testing.T) {
+	baseline := "<html>\n<body>\n<p>old</p>\n</body>\n</html>\n"
+	raw := "<html>\n<body>\n<p>new\n</body>\n</html>\n"
+	p := NewPipeline().
+		WithStrictExtractor(func(raw, orig string) (string, bool) { return "", false }).
+		WithCodeExtractor(func(raw string) (string, bool) { return "", false }).
+		WithBaselineVerifier(func(content, target string) bool {
+			return strings.Contains(content, "</p>") && strings.Contains(content, "</html>")
+		})
+
+	result := p.Process(raw, "index.html", baseline)
+	if result.Passed || !strings.Contains(result.RejectReason, "candidate degrades baseline AST") {
+		t.Fatalf("expected Tier 3 AST rejection, got %+v", result)
+	}
+}
+
 // ── Nil function safety ───────────────────────────────────────────────────
 
 func TestPipeline_NilFunctionsDoNotPanic(t *testing.T) {
