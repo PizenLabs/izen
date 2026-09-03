@@ -133,6 +133,7 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 			profile.ContextPolicy = ContextPolicyTargetFileOnly
 			return profile
 		}
+
 	}
 
 	// ── 2. Ambiguity / unresolved target → human clarification ────────
@@ -308,6 +309,19 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 // so a filename like @architecture.md can never trigger the architectural
 // signal. The operation family steers the strategy and the complexity base; it
 // never alone decides complexity (see complexity.go).
+// ResolveConstraints applies local AST and output-budget facts to an already
+// selected strategy. These facts never create an authorization surface:
+// infeasible whole-file output is silently converted to the strict textual
+// patch contract.
+func ResolveConstraints(profile ExecutionStrategyProfile, astCorrupt bool, requiredOutputTokens, maxOutputTokens int) ExecutionStrategyProfile {
+	if astCorrupt || (maxOutputTokens > 0 && requiredOutputTokens > maxOutputTokens) {
+		profile.Artifact.Kind = "search_replace"
+		profile.Artifact.Bounded = true
+		profile.StrategyReason += "; strict patch selected for local constraints"
+	}
+	return profile
+}
+
 func classifyOperation(raw string, parsed *parser.IntentAST) OperationKind {
 	text := raw
 	if parsed != nil && parsed.Goal != "" {

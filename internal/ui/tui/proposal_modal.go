@@ -235,7 +235,7 @@ type ProposalModel struct {
 // NewProposalModel returns a modal positioned at the first selectable option.
 // It binds the legacy Surface to the new DecisionViewModel adapter.
 func NewProposalModel(surface DecisionSurface) *ProposalModel {
-	vm := surfaceToViewModel(surface)
+	vm := normalizeOptionOrder(surfaceToViewModel(surface))
 	// Ensure cursor lands on first selectable (skip disabled)
 	sel := 0
 	for i, opt := range vm.Options {
@@ -251,6 +251,7 @@ func NewProposalModel(surface DecisionSurface) *ProposalModel {
 // pkg/runtime/ui/decision.DecisionViewModel. This is the preferred constructor
 // for the adapter path — the view model is the single source of truth.
 func NewProposalModelFromViewModel(vm decision.DecisionViewModel) *ProposalModel {
+	vm = normalizeOptionOrder(vm)
 	sel := 0
 	for i, opt := range vm.Options {
 		if !opt.IsDisabled {
@@ -300,7 +301,7 @@ func surfaceToViewModel(s DecisionSurface) decision.DecisionViewModel {
 		if opt.Intent == ProposalRescopeBoundedPatch {
 			risk = decision.RiskHigh
 		}
-		title := opt.Label
+		title := cleanOptionLabel(opt.Label)
 		if isRec && !strings.Contains(title, "(recommended)") {
 			title += " (recommended)"
 		}
@@ -641,7 +642,7 @@ func (p *ProposalModel) renderViewModel(width, boxWidth int) string {
 			prefix = "▶ "
 		}
 		// Build line with dynamic labels and lipgloss colors
-		label := opt.Title
+		label := cleanOptionLabel(opt.Title)
 		// Ensure labels are present (already ensured in surfaceToViewModel, but double-check)
 		// Render with colors: green for recommended, red for HIGH RISK, dim for disabled
 		displayLabel := label
@@ -667,7 +668,7 @@ func (p *ProposalModel) renderViewModel(width, boxWidth int) string {
 			displayLabel += disabledStyle.Render(" (grayed out)")
 		}
 		_ = suffix
-		fmt.Fprintf(&sb, "  %s[%d] %s\n", prefix, opt.ID, displayLabel)
+		fmt.Fprintf(&sb, "  %s[%d] %s\n", prefix, i+1, displayLabel)
 		if opt.Description != "" {
 			desc := opt.Description
 			if opt.IsDisabled {

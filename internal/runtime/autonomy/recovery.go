@@ -150,8 +150,12 @@ func isNonRetryableAmbiguous(o autonomy.Observation) bool {
 func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopDecision {
 	// ── CIRCUIT BREAKER: N=0 Hallucinated (zero match) ───
 	if isHallucinatedAnchor(o) {
-		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
-			Reason: "circuit-breaker: HallucinatedAnchorError (zero match) — park at DecisionSurface awaiting_human [1] Fall back to full-file write authorization [2] Re-prompt model with full text context"}
+		if o.AttemptNum < 1 {
+			return autonomy.LoopDecision{Action: autonomy.LoopRepair,
+				Reason: "strict line-anchor recovery: one automatic re-prompt"}
+		}
+		return autonomy.LoopDecision{Action: autonomy.LoopAbort,
+			Reason: "Physical Output Budget Breach: strict line-anchor recovery exhausted"}
 	}
 	// ── CIRCUIT BREAKER: NonRetryableArtifactError (ambiguous anchors N>1) ───
 	if isNonRetryableAmbiguous(o) {
@@ -247,7 +251,13 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.LoopRequest, error) {
 	// CIRCUIT BREAKER: Hallucinated (N=0) — distinct options.
 	if isHallucinatedAnchor(o) {
-		return req, fmt.Errorf("%w: circuit-breaker HallucinatedAnchorError zero match for %s — park at DecisionSurface awaiting_human [1] Fall back to full-file write authorization [2] Re-prompt model with full text context", ErrRecoveryHalted, o.Target)
+		if o.AttemptNum >= 1 {
+			return req, fmt.Errorf("%w: Physical Output Budget Breach after strict line-anchor retry for %s", ErrRecoveryHalted, o.Target)
+		}
+		req.RecoveryStrategy = autonomy.StrategyBoundedPatch
+		req.RecoveryAttempt = 1
+		req.RecoveryReason = "strict line-anchor recovery: one automatic re-prompt"
+		return req, nil
 	}
 	// CIRCUIT BREAKER: NonRetryableArtifactError (ambiguous anchors N>1) — park immediately.
 	if isNonRetryableAmbiguous(o) {

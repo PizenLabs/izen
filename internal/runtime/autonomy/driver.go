@@ -577,56 +577,6 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 		}
 		d.req.ProposalIntent = string(intent)
 	case ProposalRepairFirst:
-		// TASK 3: Strict pre-flight AST repair guardrail — intercept repair_first when
-		// targetTokens > modelOutputBudget (e.g. 5835 > 1024) to prevent
-		// HallucinatedAnchorError loops. FULL_REWRITE is guaranteed to truncate,
-		// so we force BOUNDED_PATCH on the AST error offset instead.
-		{
-			targetTokens := 0
-			maxBudget := 0
-			if d.surface != nil {
-				targetTokens = d.surface.EstimatedTokens
-				maxBudget = d.surface.CurrentBudget
-				if maxBudget == 0 {
-					maxBudget = d.surface.ExplicitBudget
-				}
-			}
-			if maxBudget == 0 {
-				maxBudget = d.obs.MaxOutputTokens
-			}
-			if targetTokens == 0 {
-				if target := firstTarget(d.req.Targets); target != "" {
-					if source, ok := d.adapter.ReadTargetFile(target); ok {
-						targetTokens = len(source) / 4
-					}
-				}
-			}
-			if targetTokens > 0 && maxBudget > 0 && targetTokens > maxBudget {
-				log.Printf("[autonomy] repair_first intercepted: target %d > budget %d — falling back to BOUNDED_PATCH on AST error offset", targetTokens, maxBudget)
-				if d.bus != nil {
-					d.bus.Publish(events.NewActivity(fmt.Sprintf("repair_first intercepted: target ~%d tokens exceeds model max_output=%d — falling back to BOUNDED_PATCH on AST error offset", targetTokens, maxBudget)))
-				}
-				// Force BOUNDED_PATCH: chunked window fits any budget.
-				d.mutationStrategy = StrategyBoundedPatch
-				d.allowASTBypass = true
-				d.req.RecoveryStrategy = StrategyBoundedPatch.String()
-				d.req.MutationStrategy = StrategyBoundedPatch.String()
-				d.req.AllowASTBypass = true
-				d.req.RecoveryAttempt = d.obs.AttemptNum + 1
-				d.req.RecoveryReason = "repair_first intercepted: target exceeds output budget — fallback to BOUNDED_PATCH on AST error offset"
-				if d.obs.ContractID != "" {
-					d.req.ParentContractID = d.obs.ContractID
-				}
-				d.req.ProposalIntent = string(intent)
-				if d.req.Evidence == "" {
-					d.req.Evidence = "[repair_first intercepted] target exceeds budget — BOUNDED_PATCH on AST error offset"
-				} else {
-					d.req.Evidence += "\n[repair_first intercepted] target exceeds budget — BOUNDED_PATCH on AST error offset"
-				}
-				// Skip the normal repair_first handling; proceed to common post-switch.
-				break
-			}
-		}
 		d.mutationStrategy = StrategySyntaxRepair
 		d.syntheticSubGoal = "Inspect and repair closing tags/syntax in target file"
 		d.req.MutationStrategy = StrategySyntaxRepair.String()
@@ -928,11 +878,6 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// here: the executor's Boundary-2 rejects it inside Execute and the
 			// driver routes that control-plane verdict without faking
 			// verification.
-			if decision.Action == autonomy.LoopContinue &&
-				d.proposalIntent == "" && d.req.RecoveryStrategy == "" &&
-				d.divertPreflightFailure(ctx) {
-				return d.term(), nil
-			}
 			// ── BOUNDARY 2 EXPANSION (preflight_infeasible) ────────────
 			// Before parking at the generic re-scope gate, try to stage a
 			// typed DECOMPOSITION_PROPOSAL. When staging succeeds the loop is
@@ -998,26 +943,16 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			d.loop.ConsumeExecution(obs)
 			d.loop.ConsumeVerification(obs)
 			d.publish(ctx)
+			if isPhysicalOutputBudgetBreach(obs) {
+				return d.terminateAbort(ctx, "Physical Output Budget Breach", autonomy.FailurePermanent), nil
+			}
 			// ── CIRCUIT BREAKER: NonRetryableArtifactError
 			// Differentiate N=0 (hallucinated) vs N>1 (ambiguous).
 			// Bypass interpreting -> recovering -> executing. Transition
 			// IMMEDIATELY from verifying to awaiting_human on DecisionSurface.
 			// Guarantees max 1 API request.
 			if isHallucinatedInDriver(obs) {
-				b := autonomy.HumanBoundary{
-					Reason:          "circuit-breaker: HallucinatedAnchorError (zero match) — park at DecisionSurface awaiting_human [1] Fall back to full-file write authorization [2] Re-prompt model with full text context",
-					Targets:         append([]string(nil), d.req.Targets...),
-					DecisionSurface: true,
-					ProposalOptions: []autonomy.HumanProposalOption{
-						{ID: "full_file_fallback", Label: "[1] Fall back to full-file write authorization", Description: "Authorize full-file write as fallback"},
-						{ID: "reprompt_full_text", Label: "[2] Re-prompt model with full text context", Description: "Re-prompt model with full text context"},
-					},
-				}
-				autonomy.DeriveBoundaryAction(&b)
-				d.loop.AwaitHuman(b)
-				d.enrichBoundary()
-				d.publish(ctx)
-				return d.term(), nil
+				return d.terminateAbort(ctx, "Physical Output Budget Breach: strict line-anchor recovery exhausted", autonomy.FailurePermanent), nil
 			}
 			if isNonRetryableInDriver(obs) {
 				b := autonomy.HumanBoundary{
@@ -1101,61 +1036,63 @@ func (d *Driver) step(ctx context.Context, decision autonomy.LoopDecision) (auto
 // preserves the legitimate DECOMPOSITION_PROPOSAL path for valid-AST
 // over-budget targets.
 func (d *Driver) divertPreflightFailure(ctx context.Context) bool {
-	if d.adapter == nil || d.loop == nil {
-		return false
-	}
-	target := firstTarget(d.req.Targets)
-	if target == "" {
-		target = d.obs.Target
-	}
-	if target == "" || !planner.Decomposable(target) {
-		return false
-	}
-	maxOut := d.obs.MaxOutputTokens
-	if maxOut <= 0 {
-		return false
-	}
-	source, ok := d.adapter.ReadTargetFile(target)
-	if !ok || len(source) == 0 {
-		return false
-	}
-	effectiveMax := maxOut
-	if d.explicitOutputBudget > 0 {
-		effectiveMax = d.explicitOutputBudget
-	}
-	prompt := d.prompt
-	if d.syntheticSubGoal != "" {
-		prompt = d.syntheticSubGoal + "\n" + prompt
-	}
-	if d.bus != nil {
-		d.bus.Publish(events.NewPreflightStarted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, effectiveMax))
-	}
-	eval := EvaluateScope(ScopeInput{ //nolint:contextcheck // document syntax validation is pure content checking, no context needed
-		Target:               target,
-		Content:              source,
-		MaxOutputTokens:      effectiveMax,
-		Root:                 d.adapter.Root(),
-		Subcommand:           d.subcommand,
-		Prompt:               prompt,
-		MutationStrategy:     d.mutationStrategy,
-		AllowASTBypass:       d.allowASTBypass,
-		ExplicitOutputBudget: d.explicitOutputBudget,
-		SyntheticSubGoal:     d.syntheticSubGoal,
-	})
-	if eval.ASTStatus != ASTCorrupt {
-		if d.bus != nil {
-			d.bus.Publish(events.NewPreflightCompleted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, eval.EstimatedTokens, effectiveMax))
+	// AST and output-budget findings are resolved by the execution strategy.
+	// They must never be converted into a human DecisionSurface.
+	return false
+	/*
+		target := firstTarget(d.req.Targets)
+		if target == "" {
+			target = d.obs.Target
 		}
-		return false
-	}
-	if d.bus != nil {
-		fail := BuildPreflightFailure(eval)
-		d.bus.Publish(events.NewPreflightRejected(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy,
-			string(fail.Category), fail.Reason, eval.EstimatedTokens, effectiveMax, string(eval.ASTStatus)))
-	}
-	diagnosticf("[preflight] hard-gate CLOSED for corrupt AST target=%s ast_status=%s — DAG decomposition AND execution forbidden, diverting to DecisionSurface",
-		target, eval.ASTStatus)
-	return d.stageDecisionSurface(ctx, eval, target)
+		if target == "" || !planner.Decomposable(target) {
+			return false
+		}
+		maxOut := d.obs.MaxOutputTokens
+		if maxOut <= 0 {
+			return false
+		}
+		source, ok := d.adapter.ReadTargetFile(target)
+		if !ok || len(source) == 0 {
+			return false
+		}
+		effectiveMax := maxOut
+		if d.explicitOutputBudget > 0 {
+			effectiveMax = d.explicitOutputBudget
+		}
+		prompt := d.prompt
+		if d.syntheticSubGoal != "" {
+			prompt = d.syntheticSubGoal + "\n" + prompt
+		}
+		if d.bus != nil {
+			d.bus.Publish(events.NewPreflightStarted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, effectiveMax))
+		}
+		eval := EvaluateScope(ScopeInput{ //nolint:contextcheck // document syntax validation is pure content checking, no context needed
+			Target:               target,
+			Content:              source,
+			MaxOutputTokens:      effectiveMax,
+			Root:                 d.adapter.Root(),
+			Subcommand:           d.subcommand,
+			Prompt:               prompt,
+			MutationStrategy:     d.mutationStrategy,
+			AllowASTBypass:       d.allowASTBypass,
+			ExplicitOutputBudget: d.explicitOutputBudget,
+			SyntheticSubGoal:     d.syntheticSubGoal,
+		})
+		if eval.ASTStatus != ASTCorrupt {
+			if d.bus != nil {
+				d.bus.Publish(events.NewPreflightCompleted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, eval.EstimatedTokens, effectiveMax))
+			}
+			return false
+		}
+		if d.bus != nil {
+			fail := BuildPreflightFailure(eval)
+			d.bus.Publish(events.NewPreflightRejected(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy,
+				string(fail.Category), fail.Reason, eval.EstimatedTokens, effectiveMax, string(eval.ASTStatus)))
+		}
+		diagnosticf("[preflight] hard-gate CLOSED for corrupt AST target=%s ast_status=%s — DAG decomposition AND execution forbidden, diverting to DecisionSurface",
+			target, eval.ASTStatus)
+		return d.stageDecisionSurface(ctx, eval, target)
+	*/
 }
 
 // handlePreflightInfeasible routes a Boundary-2 CONTROL-PLANE rejection
@@ -1512,6 +1449,10 @@ func isHallucinatedInDriver(o autonomy.Observation) bool {
 		return true
 	}
 	return false
+}
+
+func isPhysicalOutputBudgetBreach(o autonomy.Observation) bool {
+	return strings.Contains(strings.ToLower(o.Diagnostic), "physical output budget breach")
 }
 
 // isNonRetryableInDriver reports whether an observation is a

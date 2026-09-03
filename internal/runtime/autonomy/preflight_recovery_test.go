@@ -231,7 +231,23 @@ func TestZeroTokenDecisionSurfaceEmitsProposal(t *testing.T) {
 	}
 
 	// The lifecycle events followed created → published → activated.
-	states := collector.lifecycleStates()
+	// Bus delivery is async; poll until all states appear.
+	deadline := time.Now().Add(2 * time.Second)
+	var states []string
+	for time.Now().Before(deadline) {
+		states = collector.lifecycleStates()
+		ok := true
+		for _, want := range []string{"created", "published", "activated"} {
+			if !containsString(states, want) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	for _, want := range []string{"created", "published", "activated"} {
 		if !containsString(states, want) {
 			t.Fatalf("decision-surface lifecycle must include %q, got %v", want, states)

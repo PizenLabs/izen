@@ -17,7 +17,40 @@
 //	Switch Model                        → ProposalSwitchModel ("switch_model")
 package tui
 
-import "fmt"
+import (
+	"fmt"
+	"regexp"
+	"strings"
+
+	"github.com/PizenLabs/izen/pkg/runtime/ui/decision"
+)
+
+var optionIndexPrefix = regexp.MustCompile(`^\s*\[\d+\]\s*`)
+
+func cleanOptionLabel(label string) string {
+	return strings.TrimSpace(optionIndexPrefix.ReplaceAllString(label, ""))
+}
+
+// normalizeOptionOrder puts the single recommended option at index zero and
+// removes display indices embedded in labels before the view is rendered.
+func normalizeOptionOrder(vm decision.DecisionViewModel) decision.DecisionViewModel {
+	recommended := -1
+	for i := range vm.Options {
+		vm.Options[i].Title = cleanOptionLabel(vm.Options[i].Title)
+		if vm.Options[i].IsRecommended && recommended < 0 {
+			recommended = i
+		}
+	}
+	if recommended > 0 {
+		opt := vm.Options[recommended]
+		vm.Options = append([]decision.StrategyViewOption{opt},
+			append(vm.Options[:recommended], vm.Options[recommended+1:]...)...)
+	}
+	for i := range vm.Options {
+		vm.Options[i].ID = i + 1
+	}
+	return vm
+}
 
 // decisionSurfaceOptionIDs is the authoritative mapping from display index to
 // canonical intent IDs. It is the single source for the adapter's Option.Key
@@ -70,6 +103,19 @@ func decisionSurfaceOptionIDFor(intent ProposalIntent) string {
 	return string(intent)
 }
 
+// BuildPublishedSurface enforces single-pass complete state construction
+// before returning to the Bubble Tea loop. It builds the ProposalModel from
+// the DecisionSurface in one atomic construction, pinning index 0 to the
+// (recommended) option and ensuring default Selected is 0. Callers must use
+// this instead of incremental mutation to avoid partial TUI state.
+func BuildPublishedSurface(surface DecisionSurface) *ProposalModel {
+	m := NewProposalModel(surface)
+	if m != nil {
+		m.Selected = 0
+	}
+	return m
+}
+
 // Ensure the explicit bindings are referenced so the mapping is not dead code.
 // This also provides a compile-time check that the constants exist.
 var (
@@ -83,4 +129,5 @@ var (
 	_ = resolveDecisionSurfaceIntent
 	_ = resolveDecisionSurfaceIntentWithFallback
 	_ = decisionSurfaceOptionIDFor
+	_ = BuildPublishedSurface
 )

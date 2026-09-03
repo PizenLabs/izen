@@ -759,9 +759,12 @@ var ErrNonRetryableArtifactError = errors.New("executor: non-retryable artifact 
 
 // ErrHallucinatedAnchorError is the sentinel for N=0 hallucinated anchor
 // failures (strings.Count == 0). It is the zero-match counterpart to the
-// ambiguous (N>1) sentinel. DecisionSurface options: [1] Fall back to
-// full-file write authorization [2] Re-prompt model with full text context.
+// ambiguous (N>1) sentinel and is handled by one strict automatic retry.
 var ErrHallucinatedAnchorError = errors.New("executor: hallucinated anchor — zero match")
+
+// ErrPhysicalOutputBudgetBreach is terminal: a strict-patch recovery has
+// already consumed its single retry and must not open a full-file fallback.
+var ErrPhysicalOutputBudgetBreach = errors.New("executor: Physical Output Budget Breach")
 
 // IsNonRetryableArtifactError reports whether err is a non-retryable
 // artifact failure (ambiguous anchors without line-offset context).
@@ -1236,6 +1239,32 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 
 	// ── 7. Targeted mutation: per-target model invocation ──────────────
 	patches, invs, diffs, ingTrace, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
+	if err != nil && IsHallucinatedAnchorError(err) && req.RecoveryAttempt < 1 {
+		// A zero-match SEARCH is an engine-recoverable anchor hallucination.
+		// Re-prompt exactly once under the strict line-anchor contract; this
+		// path never offers or spends on a full-file fallback.
+		retryReq := req
+		retryReq.RecoveryAttempt = 1
+		retryReq.RecoveryStrategy = "strict_patch"
+		retryProfile := profile
+		retryProfile.Artifact.Kind = "search_replace"
+		retryProfile.Artifact.Bounded = true
+		retryProfile.StrategyReason += "; strict line-anchor recovery"
+		retryPatches, retryInvs, retryDiffs, retryTrace, retryErr := x.invokeMutation(ctx, retryReq, requestID, retryProfile, targets, g)
+		invs = append(invs, retryInvs...)
+		if retryTrace != nil {
+			ingTrace = retryTrace
+		}
+		if retryErr != nil {
+			err = fmt.Errorf("%w: strict line-anchor retry failed: %v", ErrPhysicalOutputBudgetBreach, retryErr)
+			patches, diffs = nil, nil
+		} else {
+			patches, diffs, err = retryPatches, retryDiffs, nil
+		}
+	}
+	if err != nil && IsHallucinatedAnchorError(err) && req.RecoveryAttempt >= 1 {
+		err = fmt.Errorf("%w: strict line-anchor attempt exhausted: %v", ErrPhysicalOutputBudgetBreach, err)
+	}
 	if ingTrace != nil {
 		res.IngestionTrace = ingTrace
 	}
@@ -1833,24 +1862,42 @@ func (x *RuntimeExecutor) selectStrategy(_ context.Context, req ExecuteRequest) 
 		if req.MaxOutputTokens > 0 {
 			profile.MaxOutputTokens = req.MaxOutputTokens
 		}
-		return profile, nil
+		return x.resolveLocalConstraints(profile, req), nil
 	}
 	// Direct runtime callers that resolved an explicit target without a
 	// gateway profile target a bounded mutation.
 	if req.Target != "" || len(req.Targets) > 0 {
-		return strategy.ExecutionStrategyProfile{
+		return x.resolveLocalConstraints(strategy.ExecutionStrategyProfile{
 			Strategy:        strategy.TargetedMutation,
 			ModelRequired:   true,
 			StrategyReason:  "explicit resolved target submitted to the runtime",
 			MaxOutputTokens: req.MaxOutputTokens,
-		}, nil
+		}, req), nil
 	}
 	deps := strategy.Deps{Root: x.root, Workspace: executorWorkspace{root: x.root}}
 	profile := strategy.Select(req.Prompt, deps)
 	if req.MaxOutputTokens > 0 {
 		profile.MaxOutputTokens = req.MaxOutputTokens
 	}
-	return profile, nil
+	return x.resolveLocalConstraints(profile, req), nil
+}
+
+func (x *RuntimeExecutor) resolveLocalConstraints(profile strategy.ExecutionStrategyProfile, req ExecuteRequest) strategy.ExecutionStrategyProfile {
+	maxOut := effectiveMaxOutput(req.MaxOutputTokens, &profile)
+	target := req.Target
+	if target == "" && len(req.Targets) > 0 {
+		target = req.Targets[0]
+	}
+	if target == "" {
+		return profile
+	}
+	data, err := os.ReadFile(filepath.Join(x.root, target))
+	if err != nil || len(data) == 0 {
+		return profile
+	}
+	required := (len(data) / 4) * FullRewriteTokenMultiplier
+	astCorrupt := ValidateDocumentSyntax(target, data) != nil
+	return strategy.ResolveConstraints(profile, astCorrupt, required, maxOut)
 }
 
 // compileContext assembles the minimum-sufficient context envelope for the
@@ -2165,7 +2212,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 							if b.search != "" {
 								if cnt := strings.Count(original, b.search); cnt != 1 {
 									if cnt == 0 {
-										return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: hallucinated anchor — zero match — SEARCH matches 0 regions — [1] Fall back to full-file write authorization [2] Re-prompt model with full text context", ErrHallucinatedAnchorError, ErrArtifactRejected, target)
+										return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: hallucinated anchor — zero match — SEARCH matches 0 regions", ErrHallucinatedAnchorError, ErrArtifactRejected, target)
 									}
 									return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: ambiguous anchor — SEARCH matches %d regions — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrNonRetryableArtifactError, ErrArtifactRejected, target, cnt)
 								}
@@ -2181,7 +2228,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 										// Zero-match via ResolveAnchors (format rejected = not found)
 										lower := strings.ToLower(aerr.Error())
 										if strings.Contains(lower, "anchor not found") || strings.Contains(lower, "empty search") {
-											return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: hallucinated anchor — zero match — %w — [1] Fall back to full-file write authorization [2] Re-prompt model with full text context", ErrHallucinatedAnchorError, ErrArtifactRejected, target, aerr)
+											return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: hallucinated anchor — zero match — %w", ErrHallucinatedAnchorError, ErrArtifactRejected, target, aerr)
 										}
 									}
 								}
@@ -2213,7 +2260,6 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					if rmahResult.Rejected && rmahResult.RejectReason != "" {
 						lower := strings.ToLower(rmahResult.RejectReason)
 						if strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated anchor") {
-							detail += " — [1] Fall back to full-file write authorization [2] Re-prompt model with full text context"
 							return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %s", ErrHallucinatedAnchorError, ErrArtifactRejected, target, detail)
 						}
 						if strings.Contains(lower, "ambiguous anchor") && !strings.Contains(lower, "line-offset") {
