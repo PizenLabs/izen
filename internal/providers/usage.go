@@ -50,7 +50,16 @@ func (t *streamUsageTracker) markRequestStarted(now time.Time) {
 
 // recordUsageFull stores the full provider-reported usage object including
 // cached and reasoning token splits when the provider exposes them.
+// TASK: Fix 2x double-counting — this is EXCLUSIVE assignment, not additive.
+// When the final API response.Usage arrives, it REPLACES any intermediate
+// character-count estimates (outputChars/4). The estimate is discarded; the
+// authoritative provider counts are the ground truth (single-source event).
 func (t *streamUsageTracker) recordUsageFull(u ai.ProviderUsage) {
+	// FIX: Replace additive accumulator with explicit assignment (single-source).
+	// Discard intermediate stream estimates — do NOT add final Usage on top.
+	if u.PromptTokens == 0 && u.CompletionTokens == 0 && u.TotalTokens == 0 && !u.Known {
+		return
+	}
 	t.promptTokens = u.PromptTokens
 	t.completionTokens = u.CompletionTokens
 	t.cachedTokens = u.CachedTokens
@@ -61,6 +70,21 @@ func (t *streamUsageTracker) recordUsageFull(u ai.ProviderUsage) {
 	}
 	t.finishReason = u.FinishReason
 	t.hasAuthoritative = true
+	// Discard character-count estimate so Usage() never double-counts.
+	// The authoritative provider usage is the single source of truth.
+	t.outputChars = 0
+	t.reasoningChars = 0
+}
+
+// SetUsage is the explicit assignment API the telemetry layer must use.
+// It replaces any prior estimate; it never accumulates.
+func (t *streamUsageTracker) SetUsage(prompt, completion int) {
+	t.promptTokens = prompt
+	t.completionTokens = completion
+	t.totalTokens = prompt + completion
+	t.hasAuthoritative = true
+	t.outputChars = 0
+	t.reasoningChars = 0
 }
 
 // recordInputTokens stores only the authoritative input-token count (used by

@@ -746,6 +746,75 @@ var ErrArtifactRejected = errors.New("executor: mutation artifact rejected")
 
 var ErrArtifactRetryableRejected = errors.New("executor: mutation artifact rejected with retry directive")
 
+// ErrNonRetryableArtifactError is the circuit-breaker sentinel for
+// ambiguous-anchor failures that cannot be resolved without explicit
+// line-offset context. It wraps ErrArtifactRejected but signals the
+// autonomy driver to BYPASS the retry/recovery loop and park at
+// DecisionSurface awaiting_human with options:
+// [1] Inject line-offset bounds to prompt
+// [2] Fall back to full-file write authorization.
+// Unless line-offset context is injected, an ambiguous anchor MUST NOT
+// trigger a duplicate LLM call (max 1 API request).
+var ErrNonRetryableArtifactError = errors.New("executor: non-retryable artifact error — ambiguous anchors require line-offset")
+
+// ErrHallucinatedAnchorError is the sentinel for N=0 hallucinated anchor
+// failures (strings.Count == 0). It is the zero-match counterpart to the
+// ambiguous (N>1) sentinel. DecisionSurface options: [1] Fall back to
+// full-file write authorization [2] Re-prompt model with full text context.
+var ErrHallucinatedAnchorError = errors.New("executor: hallucinated anchor — zero match")
+
+// IsNonRetryableArtifactError reports whether err is a non-retryable
+// artifact failure (ambiguous anchors without line-offset context).
+func IsNonRetryableArtifactError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrNonRetryableArtifactError) || errors.Is(err, ErrHallucinatedAnchorError) {
+		return true
+	}
+	// Ambiguous anchor is non-retryable unless the error already carries
+	// line-offset injection.
+	if errors.Is(err, ErrAmbiguousAnchor) {
+		lower := strings.ToLower(err.Error())
+		return !strings.Contains(lower, "line-offset")
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "ambiguous anchor") {
+		return !strings.Contains(lower, "line-offset")
+	}
+	if strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated anchor") {
+		return true
+	}
+	return false
+}
+
+// IsHallucinatedAnchorError reports whether err is the N=0 zero-match sentinel.
+func IsHallucinatedAnchorError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrHallucinatedAnchorError) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated anchor")
+}
+
+// IsAmbiguousAnchorsError reports whether err is the N>1 ambiguous sentinel.
+func IsAmbiguousAnchorsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrNonRetryableArtifactError) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "ambiguous anchor") || strings.Contains(lower, "ambiguous anchors") {
+		return !strings.Contains(lower, "zero match")
+	}
+	return false
+}
+
 // ErrNoOpMutation signals a bounded-patch invocation whose model answered with
 // the NO_CHANGES_REQUIRED sentinel: a raw no-op CLAIM was detected. Detection
 // alone decides nothing terminal — the wrapped NoOpClaimError carries the
@@ -1878,12 +1947,60 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	if recoveryLabel == "" {
 		recoveryLabel = "none"
 	}
+	// Resolve the per-target output budget up front. The guardrail reads the
+	// same value the provider call will use, so a refusal here is
+	// deterministic and the recovery matrix can re-derive the ceiling from
+	// the same source.
+	maxOut := effectiveMaxOutput(req.MaxOutputTokens, &profile)
 	for _, target := range targets {
 		var data []byte
 		if cached, ok := x.getSnapshotContent(target); ok {
 			data = cached
 		}
 		original := string(data)
+
+		// ── HARD OUTPUT-BUDGET GUARDRAIL (Task 1) ───────────────────
+		// A FULL_REWRITE-shaped strategy is REFUSED when the target's
+		// estimated output tokens exceed the model's max_output ceiling.
+		// Dispatching in that state is GUARANTEED to truncate at the
+		// output gate (Boundary 3 finish_reason=length) — every attempt
+		// is wasted, the run cycles, and the surface republishes. The
+		// executor raises ErrOutputBudgetExceeded as a typed sentinel;
+		// the runtime recovery matrix classifies it as
+		// SubtypeOutputExhausted and switches to BOUNDED_PATCH on the
+		// AST error offset. Bounded-patch and inspect-only dispatches
+		// are NEVER refused (their worst-case response fits any budget).
+		//
+		// The guardrail is also SKIPPED for staged-decomposition
+		// submissions: Boundary 2 already judged every sub-task
+		// individually and approved the per-unit budget, so the
+		// monolithic target estimate is not authoritative for the run.
+		if len(req.StagedSubTasks) == 0 {
+			shape := ShapeBoundedPatch
+			if !patchOnly {
+				shape = ShapeFullRewrite
+			}
+			if guardErr := (BudgetGuardrail{
+				TargetTokens:    EstimateTargetTokens(original),
+				MaxOutputTokens: maxOut,
+				Shape:           shape,
+				Target:          target,
+			}).Check(); guardErr != nil {
+				// Per-target guardrail refusal: surface a typed outcome
+				// so the recovery matrix's SubtypeOutputExhausted
+				// branch transitions the contract to BOUNDED_PATCH. We
+				// never silently re-dispatch as full_rewrite.
+				if errors.Is(guardErr, ErrOutputBudgetExceeded) {
+					log.Printf("[execution] request=%s target=%s guardrail=BUDGET_EXCEEDED estimated_tokens=%d max_output=%d shape=%s — refusing FULL_REWRITE dispatch",
+						requestID, target, EstimateTargetTokens(original), maxOut, shape)
+					return nil, nil, nil, trace, guardErr
+				}
+				if errors.Is(guardErr, ErrTargetEmpty) {
+					return nil, nil, nil, trace, guardErr
+				}
+				return nil, nil, nil, trace, guardErr
+			}
+		}
 
 		system := boundedMutationSystemPrompt()
 		outputContract := "full_file_or_patch"
@@ -1934,7 +2051,6 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			contextBytes = len(window.content)
 			judgedContent = window.content
 		}
-		maxOut := effectiveMaxOutput(req.MaxOutputTokens, &profile)
 		disableReasoning := false
 		if patchOnly {
 			// Reasoning models spend the SHARED output budget on hidden
@@ -2038,6 +2154,41 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// full-artifact attempt instead of a relabeled retry.
 			patched, ok := ExtractBoundedPatch(original, raw)
 			if !ok {
+				// Circuit breaker: if the SEARCH anchor match is 0 (hallucinated)
+				// or >1 (ambiguous) without line-offset, fail fast without
+				// invoking RMAH retry. This prevents duplicate LLM calls.
+				// N=0 → HallucinatedAnchorError: [1] Fall back to full-file + [2] Re-prompt full text
+				// N>1 → NonRetryable (ambiguous): [1] Inject line-offset + [2] full-file fallback
+				if strings.Contains(raw, "<<<<<<< SEARCH") && !strings.Contains(strings.ToLower(raw), "line-offset") {
+					if blocks := ParseSearchReplaceBlocks(raw); len(blocks) > 0 {
+						for _, b := range blocks {
+							if b.search != "" {
+								if cnt := strings.Count(original, b.search); cnt != 1 {
+									if cnt == 0 {
+										return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: hallucinated anchor — zero match — SEARCH matches 0 regions — [1] Fall back to full-file write authorization [2] Re-prompt model with full text context", ErrHallucinatedAnchorError, ErrArtifactRejected, target)
+									}
+									return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: ambiguous anchor — SEARCH matches %d regions — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrNonRetryableArtifactError, ErrArtifactRejected, target, cnt)
+								}
+								// Also check trimmed match via ResolveAnchors path.
+								if _, _, aerr := func() (int, int, error) {
+									lines := strings.Split(b.search, "\n")
+									return ResolveAnchors(lines, original)
+								}(); aerr != nil {
+									if errors.Is(aerr, ErrAmbiguousAnchor) {
+										return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %w — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrNonRetryableArtifactError, ErrArtifactRejected, target, aerr)
+									}
+									if errors.Is(aerr, ErrFormatRejected) {
+										// Zero-match via ResolveAnchors (format rejected = not found)
+										lower := strings.ToLower(aerr.Error())
+										if strings.Contains(lower, "anchor not found") || strings.Contains(lower, "empty search") {
+											return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: hallucinated anchor — zero match — %w — [1] Fall back to full-file write authorization [2] Re-prompt model with full text context", ErrHallucinatedAnchorError, ErrArtifactRejected, target, aerr)
+										}
+									}
+								}
+							}
+						}
+					}
+				}
 				// RMAH Tier 2 fallback: free-tier models may return raw code
 				// fences instead of SEARCH/REPLACE blocks. Attempt the RMAH
 				// pipeline (Tier 1 already failed via ExtractBoundedPatch;
@@ -2056,6 +2207,19 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					detail := "bounded patch contract requires SEARCH/REPLACE blocks or unified diff hunks; full-file or unstructured output rejected"
 					if rmahResult.Rejected && rmahResult.RejectReason != "" {
 						detail = fmt.Sprintf("%s; RMAH: %s", detail, rmahResult.RejectReason)
+					}
+					// Circuit breaker: classify N=0 (hallucinated) vs N>1 (ambiguous)
+					// Both are NON-RETRYABLE but with distinct DecisionSurface options.
+					if rmahResult.Rejected && rmahResult.RejectReason != "" {
+						lower := strings.ToLower(rmahResult.RejectReason)
+						if strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated anchor") {
+							detail += " — [1] Fall back to full-file write authorization [2] Re-prompt model with full text context"
+							return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %s", ErrHallucinatedAnchorError, ErrArtifactRejected, target, detail)
+						}
+						if strings.Contains(lower, "ambiguous anchor") && !strings.Contains(lower, "line-offset") {
+							detail += " — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization"
+							return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %s", ErrNonRetryableArtifactError, ErrArtifactRejected, target, detail)
+						}
 					}
 					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %s", ErrArtifactRetryableRejected, target, detail)
 				}
@@ -2092,7 +2256,16 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// there. This preserves the existing full-file truth matrix.
 		if patchOnly && x != nil && x.artifactValidator != nil {
 			if _, err := x.artifactValidator.ValidateArtifact([]byte(raw), target); err != nil {
-				if errors.Is(err, ErrAmbiguousAnchor) || errors.Is(err, ErrScopeViolation) {
+				if errors.Is(err, ErrAmbiguousAnchor) {
+					lower := strings.ToLower(err.Error())
+					if !strings.Contains(lower, "line-offset") {
+						// Non-retryable ambiguous anchor — circuit breaker.
+						wrapped := fmt.Errorf("%w: %w: %s: %w — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrNonRetryableArtifactError, ErrArtifactRejected, target, err)
+						return nil, invs, nil, trace, wrapped
+					}
+					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
+				}
+				if errors.Is(err, ErrScopeViolation) {
 					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
 				}
 				if errors.Is(err, ErrFormatRejected) {

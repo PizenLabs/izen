@@ -9,6 +9,27 @@ import (
 // most of an otherwise valid baseline.
 var ErrTier3DestructiveTruncation = fmt.Errorf("RMAH Tier 3: synthesized patch rejected due to destructive truncation (<60%% retention)")
 
+// ErrAmbiguousAnchors is the sentinel for Tier 3 ambiguous anchor failures
+// that could not be resolved even after dynamic context expansion. It is
+// classified as NonRetryableArtifactError unless line-offset context is injected.
+// Returned ONLY when strings.Count(baseline, searchBlock) > 1 after maxRadius.
+var ErrAmbiguousAnchors = fmt.Errorf("RMAH Tier 3: ambiguous anchors")
+
+// ErrZeroMatchAnchor is the sentinel for Tier 3 hallucinated anchor failures
+// where the synthesized SEARCH matches zero regions in the baseline. It is
+// classified as HallucinatedAnchorError and offers distinct DecisionSurface
+// options (full-file fallback + full-text re-prompt).
+// Returned when strings.Count(baseline, searchBlock) == 0 after maxRadius.
+var ErrZeroMatchAnchor = fmt.Errorf("RMAH Tier 3: hallucinated anchor — zero match")
+
+// minRadius and maxRadius bound the dynamic context expansion for anchor
+// resolution. The synthesizer expands SEARCH context iteratively until
+// strings.Count(baseline, searchBlock) == 1 or maxRadius is exhausted.
+const (
+	minRadius = 2
+	maxRadius = 15
+)
+
 type diffOperation struct {
 	kind byte
 	line string
@@ -18,6 +39,12 @@ type diffOperation struct {
 // as anchored SEARCH/REPLACE blocks. The returned patch is intentionally
 // self-contained: every SEARCH side contains two unchanged lines where they
 // exist, which prevents repeated snippets from becoming fuzzy anchors.
+//
+// Dynamic context expansion (RMAH Tier 3): when a static 2-line context is
+// ambiguous (strings.Count(baseline, searchBlock) > 1) the synthesizer
+// iteratively expands the context radius from minRadius to maxRadius until
+// the SEARCH block is unique. Expansion is symmetric first (top+bottom);
+// when BOF/EOF is hit the remaining expansion is applied unilaterally.
 func synthesizeDiffPatch(baseline, candidate string) (string, error) {
 	oldLines := diffLines(baseline)
 	newLines := diffLines(candidate)
@@ -25,23 +52,71 @@ func synthesizeDiffPatch(baseline, candidate string) (string, error) {
 		return "", fmt.Errorf("rmah tier 3: no synthesizable change")
 	}
 	ops := myersDiff(oldLines, newLines)
-	runs := editRuns(ops)
-	if len(runs) == 0 {
+	starts, ends := editRunsWithIndices(ops)
+	if len(starts) == 0 {
 		return "", fmt.Errorf("rmah tier 3: no diff hunks synthesized")
 	}
 
-	blocks := make([]string, 0, len(runs))
-	for _, run := range runs {
-		oldText, newText := renderRun(run)
-		if strings.TrimSpace(oldText) == "" {
-			return "", fmt.Errorf("rmah tier 3: ambiguous empty anchor")
+	baselineStr := strings.Join(oldLines, "\n")
+	blocks := make([]string, 0, len(starts))
+	for idx := range starts {
+		start, end := starts[idx], ends[idx]
+		var resolvedSearch, resolvedReplace string
+		found := false
+		lastCount := -1
+		// Iterative expansion loop: radius := minRadius … maxRadius
+		for radius := minRadius; radius <= maxRadius; radius++ {
+			run := paddedRunWithRadius(ops, start, end, radius)
+			oldText, newText := renderRun(run)
+			if strings.TrimSpace(oldText) == "" {
+				continue
+			}
+			searchBlock := oldText
+			matchCount := strings.Count(baselineStr, searchBlock)
+			lastCount = matchCount
+			// Fall back to line-exact count when substring count diverges
+			// due to overlapping matches or delimiter differences.
+			if matchCount != 1 {
+				if countExactLines(oldLines, strings.Split(searchBlock, "\n")) != 1 {
+					continue
+				}
+				// Line-exact uniqueness is sufficient when substring count
+				// is polluted by partial overlaps.
+				resolvedSearch, resolvedReplace = oldText, newText
+				found = true
+				break
+			}
+			if countExactLines(oldLines, strings.Split(searchBlock, "\n")) != 1 {
+				lastCount = countExactLines(oldLines, strings.Split(searchBlock, "\n"))
+				continue
+			}
+			resolvedSearch, resolvedReplace = oldText, newText
+			found = true
+			break
 		}
-		if countExactLines(oldLines, strings.Split(oldText, "\n")) != 1 {
-			return "", fmt.Errorf("rmah tier 3: ambiguous anchor")
+		if !found {
+			// Explicit classification: N=0 vs N>1 after maxRadius expansion.
+			if lastCount == 0 {
+				return "", ErrZeroMatchAnchor
+			}
+			return "", ErrAmbiguousAnchors
 		}
-		blocks = append(blocks, fmt.Sprintf("<<<<<<< SEARCH\n%s\n=======\n%s\n>>>>>>> REPLACE", oldText, newText))
+		blocks = append(blocks, fmt.Sprintf("<<<<<<< SEARCH\n%s\n=======\n%s\n>>>>>>> REPLACE", resolvedSearch, resolvedReplace))
 	}
 	return strings.Join(blocks, "\n"), nil
+}
+
+// buildSearchBlock is the exported helper used by the spec's pseudocode and
+// tests: it builds a SEARCH block from baseline lines for the given edit hunk
+// at the requested radius. It is a thin wrapper over paddedRunWithRadius +
+// renderRun for external callers.
+//
+//nolint:unused
+func buildSearchBlock(baselineLines []string, ops []diffOperation, start, end, radius int) string {
+	run := paddedRunWithRadius(ops, start, end, radius)
+	oldText, _ := renderRun(run)
+	_ = baselineLines
+	return oldText
 }
 
 func diffLines(s string) []string {
@@ -136,6 +211,10 @@ func cloneInts(src map[int]int) map[int]int {
 }
 
 // editRuns groups edits whose two-line context windows would overlap.
+// Legacy wrapper retained for external callers; synthesizeDiffPatch now uses
+// editRunsWithIndices + paddedRunWithRadius for dynamic expansion.
+//
+//nolint:unused
 func editRuns(ops []diffOperation) [][]diffOperation {
 	var runs [][]diffOperation
 	start := -1
@@ -161,14 +240,94 @@ func editRuns(ops []diffOperation) [][]diffOperation {
 	return runs
 }
 
+//nolint:unused
 func paddedRun(ops []diffOperation, start, end int) []diffOperation {
-	for n := 0; n < 2 && start > 0 && ops[start-1].kind == '='; n++ {
-		start--
+	return paddedRunWithRadius(ops, start, end, minRadius)
+}
+
+// editRunsWithIndices returns the start/end indices of each edit run before
+// padding, so the caller can iteratively expand context radius.
+func editRunsWithIndices(ops []diffOperation) (starts, ends []int) {
+	start := -1
+	lastEdit := -1
+	equalAfter := 0
+	for i, op := range ops {
+		if op.kind != '=' {
+			if start < 0 {
+				start = i
+			} else if equalAfter > 4 {
+				starts = append(starts, start)
+				ends = append(ends, lastEdit)
+				start = i
+			}
+			lastEdit = i
+			equalAfter = 0
+		} else if start >= 0 {
+			equalAfter++
+		}
 	}
-	for n := 0; n < 2 && end+1 < len(ops) && ops[end+1].kind == '='; n++ {
-		end++
+	if start >= 0 {
+		starts = append(starts, start)
+		ends = append(ends, lastEdit)
 	}
-	return append([]diffOperation(nil), ops[start:end+1]...)
+	return starts, ends
+}
+
+// paddedRunWithRadius expands the [start,end] edit window by radius lines of
+// context in each direction. It expands symmetrically first (top + bottom);
+// if one side hits BOF/EOF the remaining budget is applied unilaterally to
+// the other side.
+func paddedRunWithRadius(ops []diffOperation, start, end, radius int) []diffOperation {
+	if radius < 0 {
+		radius = minRadius
+	}
+	if radius > maxRadius {
+		radius = maxRadius
+	}
+	topAvail := 0
+	for i := start - 1; i >= 0 && ops[i].kind == '='; i-- {
+		topAvail++
+	}
+	bottomAvail := 0
+	for i := end + 1; i < len(ops) && ops[i].kind == '='; i++ {
+		bottomAvail++
+	}
+	// Symmetric baseline.
+	topWant := radius
+	if topWant > topAvail {
+		topWant = topAvail
+	}
+	bottomWant := radius
+	if bottomWant > bottomAvail {
+		bottomWant = bottomAvail
+	}
+	// Unilateral compensation: if one side hit its boundary, give its
+	// shortfall to the other side.
+	if topAvail < radius && bottomAvail > radius {
+		shortfall := radius - topAvail
+		extra := bottomAvail - radius
+		if extra > shortfall {
+			extra = shortfall
+		}
+		bottomWant += extra
+	}
+	if bottomAvail < radius && topAvail > radius {
+		shortfall := radius - bottomAvail
+		extra := topAvail - radius
+		if extra > shortfall {
+			extra = shortfall
+		}
+		topWant += extra
+	}
+	newStart := start - topWant
+	if newStart < 0 {
+		newStart = 0
+	}
+	newEnd := end + bottomWant
+	if newEnd >= len(ops) {
+		newEnd = len(ops) - 1
+	}
+	return append([]diffOperation(nil), ops[newStart:newEnd+1]...)
 }
 
 func renderRun(run []diffOperation) (string, string) {

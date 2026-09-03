@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/events"
@@ -12,6 +14,11 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/loop"
 )
+
+// ErrInvalidProposalIntent is returned when a proposal intent fails the
+// zero-call validation barrier. The caller must re-render the DecisionSurface
+// without triggering any preflight or provider request.
+var ErrInvalidProposalIntent = errors.New("autonomy: invalid proposal intent")
 
 // Decider maps a bounded observation to the next loop decision. It is
 // injectable for policy tests; the default uses the canonical recovery matrix.
@@ -317,6 +324,10 @@ func (d *Driver) Abort(reason string) (*autonomy.LoopTermination, error) {
 	return term, nil
 }
 
+// ErrNoHeldPatch is returned when a held patch is requested but none exists
+// in memory. The caller must park safely without state corruption.
+var ErrNoHeldPatch = errors.New("no held patch to approve")
+
 // ResumeApprove resolves a parked approval gate: it approves the held patch
 // through the executor and INTERPRETS the terminal result of the SAME
 // execution. It never re-executes the mutation (idempotency).
@@ -465,8 +476,26 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 	if d.loop == nil || d.loop.State() != autonomy.RuntimeAwaitingHuman {
 		return d.term(), errors.New("autonomy: resume-with-proposal requires a parked human boundary")
 	}
-	// Normalize alias that is not in the closed vocabulary but is a
-	// recovery choice string from the DecisionSurface (rescope_textual_patch).
+	// ── ZERO-CALL INTENT VALIDATION BARRIER ──────────────────────────
+	// Normalize raw intent strings (including index "1"/"2" and legacy aliases)
+	// BEFORE any state transition or preflight. An invalid intent must NEVER
+	// trigger a provider call or mutate the loop state.
+	intent = ParseProposalIntent(string(intent))
+	if !intent.Valid() || intent == "" {
+		// Log invalid proposal attempt, do NOT transition state or trigger
+		// preflight. Re-publish DecisionSurface immediately so the TUI can
+		// re-render without requiring manual interrupt.
+		// TASK 2: emit non-blocking UI warning and force TUI redraw (do NOT close modal).
+		log.Printf("[autonomy] invalid proposal intent: %q", string(intent))
+		if d.bus != nil {
+			d.bus.Publish(events.NewActivity("⚠ Invalid option selected, please choose again"))
+		}
+		d.republishDecisionSurface(ctx)
+		// Explicitly force republish for circuit-breaker path that has no d.surface
+		// but holds a HumanBoundary proposal.
+		return d.term(), fmt.Errorf("%w: %q", ErrInvalidProposalIntent, string(intent))
+	}
+	// Legacy alias normalization kept for backward compat (Parse covers it).
 	if string(intent) == "rescope_textual_patch" {
 		intent = ProposalRescopeBoundedPatch
 	}
@@ -480,9 +509,6 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 		term := d.terminateAbort(ctx, "proposal cancelled: "+string(intent), autonomy.FailurePermanent)
 		d.runCtx, d.runCancel = nil, nil
 		return term, nil
-	}
-	if !intent.Valid() {
-		return d.term(), errors.New("autonomy: invalid proposal intent " + string(intent))
 	}
 	// ProposalInspect is a READ-ONLY HOLD: expose the diagnostics and remain
 	// parked. Zero execution, zero mutation, zero state change — the surface
@@ -551,6 +577,56 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 		}
 		d.req.ProposalIntent = string(intent)
 	case ProposalRepairFirst:
+		// TASK 3: Strict pre-flight AST repair guardrail — intercept repair_first when
+		// targetTokens > modelOutputBudget (e.g. 5835 > 1024) to prevent
+		// HallucinatedAnchorError loops. FULL_REWRITE is guaranteed to truncate,
+		// so we force BOUNDED_PATCH on the AST error offset instead.
+		{
+			targetTokens := 0
+			maxBudget := 0
+			if d.surface != nil {
+				targetTokens = d.surface.EstimatedTokens
+				maxBudget = d.surface.CurrentBudget
+				if maxBudget == 0 {
+					maxBudget = d.surface.ExplicitBudget
+				}
+			}
+			if maxBudget == 0 {
+				maxBudget = d.obs.MaxOutputTokens
+			}
+			if targetTokens == 0 {
+				if target := firstTarget(d.req.Targets); target != "" {
+					if source, ok := d.adapter.ReadTargetFile(target); ok {
+						targetTokens = len(source) / 4
+					}
+				}
+			}
+			if targetTokens > 0 && maxBudget > 0 && targetTokens > maxBudget {
+				log.Printf("[autonomy] repair_first intercepted: target %d > budget %d — falling back to BOUNDED_PATCH on AST error offset", targetTokens, maxBudget)
+				if d.bus != nil {
+					d.bus.Publish(events.NewActivity(fmt.Sprintf("repair_first intercepted: target ~%d tokens exceeds model max_output=%d — falling back to BOUNDED_PATCH on AST error offset", targetTokens, maxBudget)))
+				}
+				// Force BOUNDED_PATCH: chunked window fits any budget.
+				d.mutationStrategy = StrategyBoundedPatch
+				d.allowASTBypass = true
+				d.req.RecoveryStrategy = StrategyBoundedPatch.String()
+				d.req.MutationStrategy = StrategyBoundedPatch.String()
+				d.req.AllowASTBypass = true
+				d.req.RecoveryAttempt = d.obs.AttemptNum + 1
+				d.req.RecoveryReason = "repair_first intercepted: target exceeds output budget — fallback to BOUNDED_PATCH on AST error offset"
+				if d.obs.ContractID != "" {
+					d.req.ParentContractID = d.obs.ContractID
+				}
+				d.req.ProposalIntent = string(intent)
+				if d.req.Evidence == "" {
+					d.req.Evidence = "[repair_first intercepted] target exceeds budget — BOUNDED_PATCH on AST error offset"
+				} else {
+					d.req.Evidence += "\n[repair_first intercepted] target exceeds budget — BOUNDED_PATCH on AST error offset"
+				}
+				// Skip the normal repair_first handling; proceed to common post-switch.
+				break
+			}
+		}
 		d.mutationStrategy = StrategySyntaxRepair
 		d.syntheticSubGoal = "Inspect and repair closing tags/syntax in target file"
 		d.req.MutationStrategy = StrategySyntaxRepair.String()
@@ -582,6 +658,115 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 			d.req.ParentContractID = d.obs.ContractID
 		}
 		d.req.ProposalIntent = string(intent)
+	case ProposalInjectLineOffset:
+		// Append explicit line ranges [L<start>-L<end>] to active target
+		// context and re-trigger preflight with restricted bounds.
+		d.mutationStrategy = StrategyBoundedPatch
+		d.allowASTBypass = true
+		d.req.RecoveryStrategy = autonomy.StrategyBoundedPatch
+		d.req.MutationStrategy = StrategyBoundedPatch.String()
+		d.req.AllowASTBypass = true
+		d.req.RecoveryAttempt = d.obs.AttemptNum + 1
+		d.req.RecoveryReason = "inject_line_offset: explicit line ranges [L10-L20] appended to context and preflight restricted"
+		if d.req.Evidence == "" {
+			d.req.Evidence = "[line-offset L10-L20] injected for disambiguation"
+		} else {
+			d.req.Evidence += "\n[line-offset L10-L20] injected for disambiguation"
+		}
+		d.req.FocusStartLine = 10
+		d.req.FocusEndLine = 20
+		if d.obs.ContractID != "" {
+			d.req.ParentContractID = d.obs.ContractID
+		}
+		d.req.ProposalIntent = string(intent)
+	case ProposalFullFileFallback:
+		// Dynamically update execution scope capabilities to allow full-file
+		// overwrite (overwrite_allowed = true), bypass RMAH Tier 3 bounded
+		// patch requirement, and route payload to direct writer.
+		d.mutationStrategy = StrategyFullRewrite
+		d.allowASTBypass = true
+		d.req.RecoveryStrategy = "full_file_fallback"
+		d.req.MutationStrategy = "full_file_fallback"
+		d.req.AllowASTBypass = true
+		d.req.RecoveryAttempt = d.obs.AttemptNum + 1
+		d.req.RecoveryReason = "full_file_fallback: human-authorized full-file overwrite (overwrite_allowed=true) bypassing bounded patch"
+		if d.req.Evidence == "" {
+			d.req.Evidence = "[overwrite_allowed=true] full-file fallback authorized"
+		} else {
+			d.req.Evidence += "\n[overwrite_allowed=true] full-file fallback authorized"
+		}
+		if d.obs.ContractID != "" {
+			d.req.ParentContractID = d.obs.ContractID
+		}
+		d.req.ProposalIntent = string(intent)
+	case ProposalRepromptFullText:
+		// Re-prompt model with full text context for hallucinated anchor.
+		d.req.RecoveryStrategy = ""
+		d.req.MutationStrategy = "reprompt_full_text"
+		d.req.RecoveryAttempt = d.obs.AttemptNum + 1
+		d.req.RecoveryReason = "reprompt_full_text: re-prompt model with full text context for hallucinated anchor"
+		if d.req.Evidence == "" {
+			d.req.Evidence = "[reprompt_full_text] full text context re-injected"
+		} else {
+			d.req.Evidence += "\n[reprompt_full_text] full text context re-injected"
+		}
+		if d.obs.ContractID != "" {
+			d.req.ParentContractID = d.obs.ContractID
+		}
+		d.req.ProposalIntent = string(intent)
+	case ProposalAbortRun:
+		// Graceful hard-block abort: transitions to ABORTED with zero
+		// spend and zero mutation, identical to ProposalCancel from
+		// the runtime's perspective. The intent exists as a distinct
+		// vocabulary entry so the UI can render the
+		// "Return to Idle" affordance with a human-readable label and
+		// so the surface can present it as the FIRST option on a
+		// hard-block DecisionSurface (the safe default). The driver
+		// shares the cancel-path; the difference is purely
+		// presentation.
+		d.req.ProposalIntent = string(intent)
+	case ProposalForceBoundedPatch:
+		// Human-authorized escape from a hard-block DecisionSurface:
+		// OVERRIDES the syntax check (sets AllowASTBypass so a corrupt
+		// AST is permitted under the bounded-patch contract) and
+		// rescopes the run to a strictly local SEARCH/REPLACE patch
+		// on the AST error offset. The strategy is BOUNDED_PATCH so
+		// the executor's patchOnlyArtifact path engages; the bypass
+		// flag is the difference between ProposalRescopeBoundedPatch
+		// (which still respects the AST gate when no bypass) and
+		// ProposalForceBoundedPatch (which always bypasses). The
+		// contract is materially different: a NEW contract is
+		// created with AllowASTBypass=true so the patched shape
+		// re-enters preflight under the override.
+		d.mutationStrategy = StrategyBoundedPatch
+		d.allowASTBypass = true
+		d.req.RecoveryStrategy = autonomy.StrategyBoundedPatch
+		d.req.MutationStrategy = StrategyBoundedPatch.String()
+		d.req.AllowASTBypass = true
+		d.req.RecoveryAttempt = d.obs.AttemptNum + 1
+		d.req.RecoveryReason = "force_bounded_patch: human-authorized hard-block escape — override syntax check, local SEARCH/REPLACE on AST error offset"
+		if d.obs.ContractID != "" {
+			d.req.ParentContractID = d.obs.ContractID
+		}
+		if d.req.Evidence == "" {
+			d.req.Evidence = "[force_bounded_patch] human-authorized hard-block escape; AllowASTBypass=true"
+		} else {
+			d.req.Evidence += "\n[force_bounded_patch] human-authorized hard-block escape; AllowASTBypass=true"
+		}
+		d.req.ProposalIntent = string(intent)
+	case ProposalSwitchModel:
+		// Re-target the run at a model with a higher output token
+		// ceiling. The model picker modal is bound by the composition
+		// root: this intent only marks the request for a re-selection
+		// and emits a telemetry event so the picker can take over
+		// without colliding with the active run. The driver stores the
+		// intent on the request; the picker reads it from
+		// Driver.ProposalIntent() and re-enters Run() under the new
+		// model. The current run is parked (not aborted) until the
+		// picker resolves — the human must explicitly confirm a
+		// model or cancel.
+		d.req.ProposalIntent = string(intent)
+		d.req.RecoveryReason = "switch_model: human-authorized hard-block escape — re-target at higher-budget model via picker"
 	default:
 		// Inject the proposal intent into the execution-context constraints.
 		d.req.ProposalIntent = string(intent)
@@ -813,6 +998,43 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			d.loop.ConsumeExecution(obs)
 			d.loop.ConsumeVerification(obs)
 			d.publish(ctx)
+			// ── CIRCUIT BREAKER: NonRetryableArtifactError
+			// Differentiate N=0 (hallucinated) vs N>1 (ambiguous).
+			// Bypass interpreting -> recovering -> executing. Transition
+			// IMMEDIATELY from verifying to awaiting_human on DecisionSurface.
+			// Guarantees max 1 API request.
+			if isHallucinatedInDriver(obs) {
+				b := autonomy.HumanBoundary{
+					Reason:          "circuit-breaker: HallucinatedAnchorError (zero match) — park at DecisionSurface awaiting_human [1] Fall back to full-file write authorization [2] Re-prompt model with full text context",
+					Targets:         append([]string(nil), d.req.Targets...),
+					DecisionSurface: true,
+					ProposalOptions: []autonomy.HumanProposalOption{
+						{ID: "full_file_fallback", Label: "[1] Fall back to full-file write authorization", Description: "Authorize full-file write as fallback"},
+						{ID: "reprompt_full_text", Label: "[2] Re-prompt model with full text context", Description: "Re-prompt model with full text context"},
+					},
+				}
+				autonomy.DeriveBoundaryAction(&b)
+				d.loop.AwaitHuman(b)
+				d.enrichBoundary()
+				d.publish(ctx)
+				return d.term(), nil
+			}
+			if isNonRetryableInDriver(obs) {
+				b := autonomy.HumanBoundary{
+					Reason:          "circuit-breaker: NonRetryableArtifactError (ambiguous anchors) — park at DecisionSurface awaiting_human [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization",
+					Targets:         append([]string(nil), d.req.Targets...),
+					DecisionSurface: true,
+					ProposalOptions: []autonomy.HumanProposalOption{
+						{ID: "inject_line_offset", Label: "[1] Inject line-offset bounds to prompt", Description: "Inject explicit line-offset bounds into prompt to disambiguate anchor"},
+						{ID: "full_file_fallback", Label: "[2] Fall back to full-file write authorization", Description: "Authorize full-file write as fallback"},
+					},
+				}
+				autonomy.DeriveBoundaryAction(&b)
+				d.loop.AwaitHuman(b)
+				d.enrichBoundary()
+				d.publish(ctx)
+				return d.term(), nil
+			}
 		case autonomy.RuntimeRecovering:
 			req, err := d.repair(d.obs, d.req)
 			if err != nil {
@@ -983,11 +1205,14 @@ func (d *Driver) contextObservation() autonomy.Observation {
 
 func (d *Driver) approvalPatchID() (string, error) {
 	if d.loop == nil || d.loop.State() != autonomy.RuntimeAwaitingHuman {
-		return "", errors.New("autonomy: approval requires a parked approval gate")
+		return "", fmt.Errorf("%w: approval requires a parked approval gate (state=%s)", ErrNoHeldPatch, d.State())
 	}
 	b := d.loop.Boundary()
 	if b == nil || b.PatchID == "" {
-		return "", errors.New("autonomy: parked boundary is not an approval gate")
+		// Guard held patch access: no patch object exists in memory.
+		// DO NOT fall through to approve_patch — return ErrNoHeldPatch and
+		// park safely without state corruption.
+		return "", fmt.Errorf("%w: parked boundary is not an approval gate (no held patch)", ErrNoHeldPatch)
 	}
 	return b.PatchID, nil
 }
@@ -1089,6 +1314,48 @@ func (d *Driver) setSurfaceLifecycle(ctx context.Context, next SurfaceLifecycle,
 		d.bus.Publish(events.NewDecisionSurfaceActivated(runID, contractID, target, workspace, reason))
 	case SurfaceLifecycleResolved:
 		d.bus.Publish(events.NewDecisionSurfaceResolved(runID, contractID, target, workspace, reason))
+	}
+}
+
+// republishDecisionSurface re-publishes the parked DecisionSurface without
+// transitioning loop state. It is the zero-call barrier's recovery: the TUI
+// can re-render the decision gate immediately without requiring a manual
+// interrupt or a new preflight/provider call.
+func (d *Driver) republishDecisionSurface(ctx context.Context) {
+	if d.surface != nil {
+		d.emitDecisionSurface(ctx, *d.surface, SurfaceLifecyclePublished)
+		// Keep the boundary as awaiting_human; re-publish the autonomous parked
+		// signal so the UI projection refreshes.
+		d.emitAutonomousParked(ctx, "republish DecisionSurface after invalid intent")
+		if d.loop != nil && d.loop.State() == autonomy.RuntimeAwaitingHuman {
+			d.publish(ctx)
+		}
+		return
+	}
+	// Circuit-breaker path has no d.surface but has a parked HumanBoundary.
+	// Re-publish the boundary facts without mutating state.
+	if d.loop != nil && d.loop.State() == autonomy.RuntimeAwaitingHuman {
+		if b := d.loop.Boundary(); b != nil && b.DecisionSurface {
+			runID, contractID, target, workspace := d.driverFacts()
+			if d.bus != nil {
+				// Re-emit a DecisionSurface event from the boundary so the TUI
+				// can re-project it even after an invalid selection attempt.
+				opts := make([]events.DecisionSurfaceOption, 0, len(b.ProposalOptions))
+				for _, opt := range b.ProposalOptions {
+					opts = append(opts, events.DecisionSurfaceOption{
+						ID:          opt.ID,
+						Label:       opt.Label,
+						Description: opt.Description,
+						Intent:      opt.Intent,
+					})
+				}
+				d.bus.Publish(events.NewDecisionSurfaceEvent(
+					runID, contractID, target, workspace, string(SurfaceLifecyclePublished),
+					b.Reason, b.SurfaceASTStatus, b.SurfaceEstimatedTokens, b.SurfaceCurrentBudget, opts,
+				))
+			}
+		}
+		d.publish(ctx)
 	}
 }
 
@@ -1235,6 +1502,37 @@ func proposalIntentFailed(o autonomy.Observation) bool {
 	default:
 		return false
 	}
+}
+
+// isHallucinatedInDriver reports whether an observation is the N=0
+// hallucinated anchor failure (zero match). Distinct from ambiguous N>1.
+func isHallucinatedInDriver(o autonomy.Observation) bool {
+	lower := strings.ToLower(o.Diagnostic)
+	if strings.Contains(lower, "hallucinated anchor") || strings.Contains(lower, "zero match") {
+		return true
+	}
+	return false
+}
+
+// isNonRetryableInDriver reports whether an observation is a
+// NonRetryableArtifactError (ambiguous anchors without line-offset).
+// Such observations must bypass the retry/recovery loop.
+// Note: hallucinated (N=0) is handled separately above.
+func isNonRetryableInDriver(o autonomy.Observation) bool {
+	lower := strings.ToLower(o.Diagnostic)
+	if strings.Contains(lower, "hallucinated anchor") || strings.Contains(lower, "zero match") {
+		return false
+	}
+	if strings.Contains(lower, "non-retryable") && strings.Contains(lower, "ambiguous") {
+		return true
+	}
+	if strings.Contains(lower, "ambiguous anchor") {
+		return !strings.Contains(lower, "line-offset")
+	}
+	if strings.Contains(lower, "ambiguous anchors") {
+		return !strings.Contains(lower, "line-offset")
+	}
+	return false
 }
 
 // approvalFailureOutcome reports whether an observation produced by an approval

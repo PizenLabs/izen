@@ -59,6 +59,42 @@ const (
 	ProposalInspect ProposalIntent = "inspect"
 	// ProposalCancel abandons the objective with zero mutation and zero spend.
 	ProposalCancel ProposalIntent = "cancel"
+	// ProposalInjectLineOffset appends explicit line ranges [L<start>-L<end>]
+	// to the active target context and re-triggers preflight with restricted
+	// bounds.
+	ProposalInjectLineOffset ProposalIntent = "inject_line_offset"
+	// ProposalFullFileFallback dynamically updates execution scope capabilities
+	// to allow full-file overwrite (overwrite_allowed = true), bypasses RMAH
+	// Tier 3 bounded patch requirement, and routes payload to the direct writer.
+	ProposalFullFileFallback ProposalIntent = "full_file_fallback"
+	// ProposalRepromptFullText re-prompts the model with full text context
+	// for N=0 hallucinated anchor failures (zero match).
+	ProposalRepromptFullText ProposalIntent = "reprompt_full_text"
+	// ProposalAbortRun is the human-friendly hard-block abort: it cancels
+	// the run gracefully (no SIGINT/Ctrl+C required) and returns the
+	// session to a clean idle state. It is offered on HARD-BLOCK
+	// DecisionSurfaces (output budget exhausted twice, format
+	// failures >=2, ambiguous anchors). Distinct from ProposalCancel
+	// (the fail-fast path on every preflight closure) so the UI can
+	// render it with a human-readable label that promises "Return to
+	// Idle" semantics.
+	ProposalAbortRun ProposalIntent = "abort_run"
+	// ProposalForceBoundedPatch is the human-authorized escape from a
+	// hard-block DecisionSurface: it OVERRIDES the syntax check and
+	// forces the executor to attempt a strictly local SEARCH/REPLACE
+	// patch on the AST error offset, even when the structural
+	// validator would otherwise refuse. It creates a NEW execution
+	// contract and re-runs preflight under the patched shape; the
+	// safety gate is bypassed ONLY because the human explicitly
+	// authorized it.
+	ProposalForceBoundedPatch ProposalIntent = "force_bounded_patch"
+	// ProposalSwitchModel opens the model picker modal so the human
+	// can re-target the current run at a model with a higher output
+	// token ceiling. It is offered on HARD-BLOCK DecisionSurfaces
+	// where the only viable path is a different model. The
+	// composition root binds the picker — the runtime never resolves
+	// a model outside the explicitly authorized human choice.
+	ProposalSwitchModel ProposalIntent = "switch_model"
 )
 
 // Valid reports whether the intent is a member of the closed vocabulary.
@@ -66,14 +102,85 @@ func (i ProposalIntent) Valid() bool {
 	switch i {
 	case ProposalInlineDeps, ProposalExpandScope, ProposalRepairFirst,
 		ProposalReduceScope, ProposalRescopeBoundedPatch,
-		ProposalRetryExplicitBudget, ProposalInspect, ProposalCancel:
+		ProposalRetryExplicitBudget, ProposalInspect, ProposalCancel,
+		ProposalInjectLineOffset, ProposalFullFileFallback, ProposalRepromptFullText,
+		ProposalAbortRun, ProposalForceBoundedPatch, ProposalSwitchModel:
 		return true
 	}
 	return false
 }
 
+// ParseProposalIntent normalizes a raw TUI intent string into a ProposalIntent.
+// It mirrors the autonomy.ParseProposalIntent contract: exact values, index
+// strings ("1","2"), and raw ID strings all resolve to the canonical vocabulary.
+func ParseProposalIntent(raw string) ProposalIntent {
+	s := strings.TrimSpace(raw)
+	switch ProposalIntent(s) {
+	case ProposalInlineDeps, ProposalExpandScope, ProposalRepairFirst,
+		ProposalReduceScope, ProposalRescopeBoundedPatch,
+		ProposalRetryExplicitBudget, ProposalInspect, ProposalCancel,
+		ProposalInjectLineOffset, ProposalFullFileFallback, ProposalRepromptFullText,
+		ProposalAbortRun, ProposalForceBoundedPatch, ProposalSwitchModel:
+		return ProposalIntent(s)
+	}
+	lower := strings.ToLower(s)
+	switch lower {
+	case "1", "full_file_fallback", "intentfullfilefallback", "proposalfullfilefallback":
+		return ProposalFullFileFallback
+	case "2", "reprompt_full_text", "intentrepromptfulltext", "proposalrepromptfulltext":
+		return ProposalRepromptFullText
+	case "inject_line_offset", "intentinjectlineoffset", "proposalinjectlineoffset":
+		return ProposalInjectLineOffset
+	case "inline_deps":
+		return ProposalInlineDeps
+	case "expand_scope":
+		return ProposalExpandScope
+	case "repair_first":
+		return ProposalRepairFirst
+	case "reduce_scope":
+		return ProposalReduceScope
+	case "rescope_bounded_patch", "rescope_textual_patch":
+		return ProposalRescopeBoundedPatch
+	case "retry_with_explicit_budget":
+		return ProposalRetryExplicitBudget
+	case "inspect":
+		return ProposalInspect
+	case "cancel":
+		return ProposalCancel
+	case "abort_run", "intentabort_run", "intentabortrun":
+		return ProposalAbortRun
+	case "force_bounded_patch", "intentforce_bounded_patch", "intentforceboundedpatch":
+		return ProposalForceBoundedPatch
+	case "switch_model", "intentswitch_model", "intentswitchmodel":
+		return ProposalSwitchModel
+	}
+	for _, valid := range []ProposalIntent{
+		ProposalInlineDeps, ProposalExpandScope, ProposalRepairFirst,
+		ProposalReduceScope, ProposalRescopeBoundedPatch,
+		ProposalRetryExplicitBudget, ProposalInspect, ProposalCancel,
+		ProposalInjectLineOffset, ProposalFullFileFallback, ProposalRepromptFullText,
+		ProposalAbortRun, ProposalForceBoundedPatch, ProposalSwitchModel,
+	} {
+		if strings.EqualFold(string(valid), s) {
+			return valid
+		}
+	}
+	return ProposalIntent(s)
+}
+
 // IsCancel reports whether the intent abandons the objective.
-func (i ProposalIntent) IsCancel() bool { return i == ProposalCancel }
+func (i ProposalIntent) IsCancel() bool { return i == ProposalCancel || i == ProposalAbortRun }
+
+// IsRecovery reports whether the intent is a recovery action that creates a
+// NEW execution contract. It mirrors autonomy.ProposalIntent.IsRecovery.
+func (i ProposalIntent) IsRecovery() bool {
+	return i == ProposalRescopeBoundedPatch || i == ProposalRetryExplicitBudget ||
+		i == ProposalInjectLineOffset || i == ProposalFullFileFallback || i == ProposalRepromptFullText ||
+		i == ProposalForceBoundedPatch || i == ProposalSwitchModel
+}
+
+// IsInspect reports whether the intent is the read-only diagnostic hold.
+func (i ProposalIntent) IsInspect() bool { return i == ProposalInspect }
 
 // ProposalOption is one selectable entry on the decision surface. It carries
 // only presentation + intent data — NO functional callback.
@@ -323,12 +430,33 @@ func (p *ProposalModel) Select() ProposalIntent {
 			return ProposalCancel
 		}
 		key := p.ViewModel.Options[p.Selected].Key
+		// TASK 1: ensure non-empty intent serialization — fallback to index string
+		// when Action/Key is empty (circuit-breaker surfaces with empty Action).
+		if strings.TrimSpace(key) == "" {
+			key = fmt.Sprintf("%d", p.Selected+1)
+		}
+		// Normalize through ParseProposalIntent so "1"/"2" map to canonical intents.
+		pi := ParseProposalIntent(key)
+		if pi.Valid() {
+			return pi
+		}
+		// Fallback: if normalized intent is still invalid but ViewModel has entry,
+		// return index-mapped intent to avoid empty payload.
+		if p.Selected < len(p.ViewModel.Options) {
+			if fallback := ParseProposalIntent(fmt.Sprintf("%d", p.Selected+1)); fallback.Valid() {
+				return fallback
+			}
+		}
 		return ProposalIntent(key)
 	}
 	if p.Selected < 0 || p.Selected >= len(p.Surface.Options) {
 		return ProposalCancel
 	}
-	return p.Surface.Options[p.Selected].Intent
+	intent := p.Surface.Options[p.Selected].Intent
+	if strings.TrimSpace(string(intent)) == "" {
+		intent = ParseProposalIntent(fmt.Sprintf("%d", p.Selected+1))
+	}
+	return intent
 }
 
 // SelectIndex returns the ProposalIntent of the option at the given 0-based
@@ -346,13 +474,29 @@ func (p *ProposalModel) SelectIndex(i int) (ProposalIntent, bool) {
 			return "", false
 		}
 		p.Selected = i
-		return ProposalIntent(p.ViewModel.Options[i].Key), true
+		key := p.ViewModel.Options[i].Key
+		if strings.TrimSpace(key) == "" {
+			key = fmt.Sprintf("%d", i+1)
+		}
+		pi := ParseProposalIntent(key)
+		if pi.Valid() {
+			return pi, true
+		}
+		// Fallback to index string mapping if key was empty/invalid
+		if fallback := ParseProposalIntent(fmt.Sprintf("%d", i+1)); fallback.Valid() {
+			return fallback, true
+		}
+		return ProposalIntent(key), true
 	}
 	if i < 0 || i >= len(p.Surface.Options) {
 		return "", false
 	}
 	p.Selected = i
-	return p.Surface.Options[i].Intent, true
+	intent := p.Surface.Options[i].Intent
+	if strings.TrimSpace(string(intent)) == "" {
+		intent = ParseProposalIntent(fmt.Sprintf("%d", i+1))
+	}
+	return intent, true
 }
 
 // Cancel always returns the ProposalCancel intent. Esc and Ctrl+C route here.

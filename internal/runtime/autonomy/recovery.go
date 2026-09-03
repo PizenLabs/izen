@@ -108,6 +108,37 @@ func transitionAvailable(o autonomy.Observation) bool {
 	return o.RecoveryStrategy != autonomy.StrategyBoundedPatch
 }
 
+// isHallucinatedAnchor reports whether the observation is an N=0
+// hallucinated anchor failure (zero match). Distinct from ambiguous N>1.
+func isHallucinatedAnchor(o autonomy.Observation) bool {
+	lower := strings.ToLower(o.Diagnostic)
+	return strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated anchor")
+}
+
+// isNonRetryableAmbiguous reports whether the observation is an ambiguous-
+// anchor failure (N>1) that is classified as NonRetryableArtifactError unless
+// line-offset context was injected. Such failures MUST bypass the
+// retry/recovery loop and park at DecisionSurface.
+func isNonRetryableAmbiguous(o autonomy.Observation) bool {
+	lower := strings.ToLower(o.Diagnostic)
+	if isHallucinatedAnchor(o) {
+		return false
+	}
+	// Check for the Task 2 sentinel message including line-offset guard.
+	if strings.Contains(lower, "non-retryable") && strings.Contains(lower, "ambiguous") {
+		return true
+	}
+	if strings.Contains(lower, "ambiguous anchor") {
+		// If line-offset was already injected, allow retry.
+		return !strings.Contains(lower, "line-offset")
+	}
+	// Also treat generic ambiguous with non-retryable marker.
+	if strings.Contains(lower, "ambiguous anchors") {
+		return !strings.Contains(lower, "line-offset")
+	}
+	return false
+}
+
 // DecideRecovery is the runtime-owned decision of the zero-trust recovery
 // matrix. It returns the loop decision for a FAILED observation:
 //
@@ -117,6 +148,16 @@ func transitionAvailable(o autonomy.Observation) bool {
 //	I5  PreflightInfeasible → AskHuman (explicit re-scope; never silent)
 //	B5  WorkspaceDrift → Abort
 func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopDecision {
+	// ── CIRCUIT BREAKER: N=0 Hallucinated (zero match) ───
+	if isHallucinatedAnchor(o) {
+		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
+			Reason: "circuit-breaker: HallucinatedAnchorError (zero match) — park at DecisionSurface awaiting_human [1] Fall back to full-file write authorization [2] Re-prompt model with full text context"}
+	}
+	// ── CIRCUIT BREAKER: NonRetryableArtifactError (ambiguous anchors N>1) ───
+	if isNonRetryableAmbiguous(o) {
+		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
+			Reason: "circuit-breaker: NonRetryableArtifactError (ambiguous anchors) — park at DecisionSurface awaiting_human [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization"}
+	}
 	// HARD-BLOCK: FormatFailureCount >=2 or Ambiguous == true → park at DecisionSurface awaiting_human
 	// Do NOT issue a re-scoped [bounded_patch] retry. Immediately park.
 	if o.AttemptNum >= 2 || o.RecoveryCycle >= 2 {
@@ -125,7 +166,7 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 	}
 	if o.ClarificationRequired || strings.Contains(strings.ToLower(o.Diagnostic), "ambiguous") {
 		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
-			Reason: "hard-block: ambiguous — park at DecisionSurface awaiting_human, no bounded_patch retry"}
+			Reason: "hard-block: ambiguous — park at DecisionSurface awaiting_human, no bounded_patch retry [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization"}
 	}
 	sub := RecoverySubtype(o)
 	attemptsLeft := b.MaxAttempts <= 0 || o.AttemptNum < b.MaxAttempts
@@ -204,12 +245,20 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 //     strategy so the executor's admission resolves the SAME ContractID and
 //     deterministically increments AttemptID.
 func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.LoopRequest, error) {
+	// CIRCUIT BREAKER: Hallucinated (N=0) — distinct options.
+	if isHallucinatedAnchor(o) {
+		return req, fmt.Errorf("%w: circuit-breaker HallucinatedAnchorError zero match for %s — park at DecisionSurface awaiting_human [1] Fall back to full-file write authorization [2] Re-prompt model with full text context", ErrRecoveryHalted, o.Target)
+	}
+	// CIRCUIT BREAKER: NonRetryableArtifactError (ambiguous anchors N>1) — park immediately.
+	if isNonRetryableAmbiguous(o) {
+		return req, fmt.Errorf("%w: circuit-breaker NonRetryableArtifactError ambiguous anchors for %s — park at DecisionSurface awaiting_human [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrRecoveryHalted, o.Target)
+	}
 	// HARD-BLOCK: FormatFailureCount >=2 or Ambiguous → no bounded_patch retry
 	if o.AttemptNum >= 2 || o.RecoveryCycle >= 2 {
 		return req, fmt.Errorf("%w: hard-block format failures >=2 for %s — park at DecisionSurface awaiting_human", ErrRecoveryHalted, o.Target)
 	}
 	if o.ClarificationRequired || strings.Contains(strings.ToLower(o.Diagnostic), "ambiguous") {
-		return req, fmt.Errorf("%w: hard-block ambiguous for %s — park at DecisionSurface awaiting_human", ErrRecoveryHalted, o.Target)
+		return req, fmt.Errorf("%w: hard-block ambiguous for %s — park at DecisionSurface awaiting_human [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrRecoveryHalted, o.Target)
 	}
 	sub := RecoverySubtype(o)
 	target := o.Target

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -677,4 +678,80 @@ func mustRead(t *testing.T, root, name string) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+// TestRecovery_AmbiguousAnchorCircuitBreaker verifies the fail-fast circuit
+// breaker: a mock LLM returning an ambiguous SEARCH (single line that matches
+// multiple regions) must halt at Attempt 1 without firing Attempt 2, and the
+// token counter must stop at Attempt 1 totals.
+func TestRecovery_AmbiguousAnchorCircuitBreaker(t *testing.T) {
+	root := t.TempDir()
+	// Baseline with repeated "bar" lines so SEARCH "bar" is ambiguous.
+	repeated := "foo\nbar\nbar\nbar\nbaz\n"
+	writeTarget(t, root, "note.txt", repeated)
+
+	// Mock returns an ambiguous SEARCH — "bar" appears 3 times.
+	ambiguousPatch := "<<<<<<< SEARCH\nbar\n=======\nqux\n>>>>>>>"
+	mock := &mockProvider{responses: []*ai.Response{
+		{Content: ambiguousPatch, Usage: ai.ProviderUsage{PromptTokens: 700, CompletionTokens: 600, TotalTokens: 1300, Known: true}},
+		{Content: ambiguousPatch, Usage: ai.ProviderUsage{PromptTokens: 700, CompletionTokens: 600, TotalTokens: 1300, Known: true}},
+	}}
+	x := testExecutor(t, root, mock, events.NewBus(events.DefaultBufferSize))
+	// Force bounded-patch contract so the SEARCH is validated via the
+	// normalizing validator (which checks anchor uniqueness with ResolveAnchors).
+	profile := strategy.ExecutionStrategyProfile{
+		Strategy:       strategy.TargetedMutation,
+		ModelRequired:  true,
+		StrategyReason: "test bounded patch",
+		Artifact:       strategy.ArtifactContract{Kind: "search_replace", Bounded: true},
+	}
+
+	res, err := x.Execute(context.Background(), ExecuteRequest{
+		RequestID: "r-ambiguous-circuit",
+		Mode:      "build",
+		Prompt:    "change bar to qux",
+		Target:    "note.txt",
+		Strategy:  &profile,
+	})
+	// Execution must fail with an artifact error (ambiguous anchor).
+	if err == nil {
+		t.Fatalf("expected error for ambiguous anchor, got nil (res=%+v)", res)
+	}
+	if !errors.Is(err, ErrArtifactRejected) && !errors.Is(err, ErrNonRetryableArtifactError) {
+		// Also accept wrapped ErrAmbiguousAnchor.
+		if !errors.Is(err, ErrAmbiguousAnchor) {
+			t.Fatalf("err = %v, want ErrArtifactRejected or ErrNonRetryableArtifactError", err)
+		}
+	}
+	// Circuit breaker: only ONE provider call despite having a second response queued.
+	if mock.callCount != 1 {
+		t.Fatalf("provider calls = %d, want 1 (circuit breaker must prevent Attempt 2)", mock.callCount)
+	}
+	// Token counter must reflect Attempt 1 only.
+	if res != nil && res.Proof != nil && len(res.Proof.ModelInvocations) > 1 {
+		t.Fatalf("model invocations = %d, want 1", len(res.Proof.ModelInvocations))
+	}
+	if res != nil {
+		if res.Completed.InputTokens != 700 || res.Completed.OutputTokens != 600 {
+			t.Fatalf("Completed tokens = %d/%d, want 700/600 (Attempt 1 only)", res.Completed.InputTokens, res.Completed.OutputTokens)
+		}
+	}
+	// The error message must contain the DecisionSurface options.
+	lower := ""
+	if err != nil {
+		lower = err.Error()
+	}
+	if res != nil && res.Err != nil {
+		lower = res.Err.Error()
+	}
+	if !strings.Contains(strings.ToLower(lower), "line-offset") && !strings.Contains(strings.ToLower(lower), "full-file") {
+		t.Fatalf("error should contain DecisionSurface options [1] line-offset [2] full-file, got: %q", lower)
+	}
+	// The error must be classified as NonRetryable.
+	if err != nil && !IsNonRetryableArtifactError(err) {
+		// Also check res.Err
+		if res == nil || res.Err == nil || !IsNonRetryableArtifactError(res.Err) {
+			t.Fatalf("ambiguous anchor error must be classified as NonRetryableArtifactError, got %v", err)
+		}
+	}
 }

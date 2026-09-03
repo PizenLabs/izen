@@ -360,6 +360,43 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 	}
 
 	if msg.err != nil {
+		// TASK 2: Preserve DecisionSurface on invalid proposal intent — do NOT drop to empty prompt bar.
+		// The driver republished the surface; the UI must re-render it and stay responsive.
+		if strings.Contains(msg.err.Error(), "invalid proposal intent") {
+			m.autonomousActive = false
+			// Restore the parked boundary from the driver if we cleared it.
+			if m.autonomousBoundary == nil && m.autonomousDriver != nil {
+				if b := m.autonomousDriver.Boundary(); b != nil {
+					m.autonomousBoundary = b
+				}
+			}
+			// If we still have a proposal boundary, re-render the surface without finalizing.
+			if b := m.autonomousBoundary; b != nil && b.Action == autonomy.HumanBoundaryProposal {
+				// Re-create proposal TUI if it was cleared by resumeAutonomousProposal.
+				if m.proposalTUI == nil {
+					m.proposalTUI = proposaltui.NewProposalModel(proposalSurfaceFromBoundary(b))
+					m.proposalTUI.Reset()
+				}
+				m.push(roleSystem, infoStyle.Render("⚠ Invalid option selected, please choose again"))
+				m.refreshViewportContent()
+				m.Viewport.GotoBottom()
+				return nil
+			}
+			// Fallback: treat as warning, not hard failure — keep awaiting_human active.
+			m.push(roleSystem, infoStyle.Render("⚠ Invalid option selected, please choose again"))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			// Re-publish driver boundary if available.
+			if m.autonomousDriver != nil {
+				if b := m.autonomousDriver.Boundary(); b != nil {
+					m.autonomousBoundary = b
+					m.renderAutonomousProposalBoundary(b)
+					m.refreshViewportContent()
+					m.Viewport.GotoBottom()
+				}
+			}
+			return nil
+		}
 		m.autonomousBoundary = nil
 		m.finalizeOperation(OpOutcomeFailure, msg.err)
 		m.push(roleError, "[autonomous] "+msg.err.Error())

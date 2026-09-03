@@ -51,7 +51,95 @@ var (
 	// ErrNoExtractableContent is returned by Tier 2 when no raw code content
 	// could be extracted from fenced blocks (e.g., prose-only output).
 	ErrNoExtractableContent = errors.New("rmah: no extractable code content")
+
+	// ErrAmbiguousAnchors is re-exported from diff_synthesizer for callers
+	// that need typed classification. Kept here for pipeline-level imports
+	// that do not import diff_synthesizer directly.
+	// ErrAmbiguousAnchors is classified as NonRetryableArtifactError
+	// unless line-offset context is injected into the prompt.
+	// (diff_synthesizer.go defines the canonical sentinel.)
 )
+
+// IsNonRetryableArtifactError reports whether err is an ambiguous-anchor
+// failure that MUST NOT be retried without explicit line-offset context.
+// It is the circuit-breaker predicate used by the execution and autonomy
+// layers to bypass the retry/recovery loop and park at DecisionSurface.
+func IsNonRetryableArtifactError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// ErrAmbiguousAnchors is the Tier 3 sentinel; it is non-retryable
+	// unless the calling prompt already carries line-offset bounds.
+	if errors.Is(err, ErrAmbiguousAnchors) {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "line-offset") || strings.Contains(msg, "line:") {
+			return false
+		}
+		return true
+	}
+	if errors.Is(err, ErrZeroMatchAnchor) {
+		// Hallucinated anchor is also non-retryable (requires full-file fallback).
+		return true
+	}
+	// String fallback for wrapped errors that preserve the message but not
+	// the sentinel (e.g. fmt.Errorf wrapping via RejectReason).
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "ambiguous anchor") {
+		return !strings.Contains(lower, "line-offset")
+	}
+	if strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated anchor") {
+		return true
+	}
+	return false
+}
+
+// IsZeroMatchAnchorError reports whether err is the N=0 hallucinated anchor
+// sentinel (strings.Count == 0). Distinct from ambiguous (N>1).
+func IsZeroMatchAnchorError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrZeroMatchAnchor) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated anchor")
+}
+
+// IsAmbiguousAnchorsError reports whether err is the N>1 ambiguous sentinel.
+func IsAmbiguousAnchorsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrAmbiguousAnchors) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	// Must be ambiguous but not zero-match.
+	if strings.Contains(lower, "ambiguous anchor") || strings.Contains(lower, "ambiguous anchors") {
+		return !strings.Contains(lower, "zero match")
+	}
+	return false
+}
+
+// IsNonRetryableRejectReason is the string-based variant for TierResult
+// rejectReasons that may have lost sentinel wrapping.
+func IsNonRetryableRejectReason(reason string) bool {
+	lower := strings.ToLower(reason)
+	if strings.Contains(lower, "ambiguous anchor") {
+		return !strings.Contains(lower, "line-offset")
+	}
+	if strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated") {
+		return true
+	}
+	return false
+}
+
+// IsZeroMatchRejectReason reports whether a reject reason is N=0.
+func IsZeroMatchRejectReason(reason string) bool {
+	lower := strings.ToLower(reason)
+	return strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated")
+}
 
 // TierResult is the outcome of one RMAH tier.
 type TierResult struct {
@@ -214,7 +302,7 @@ func (p *Pipeline) tier3Synthesize(raw, target, baseline string) TierResult {
 	// rather than validating an isolated REPLACE payload.
 	result, ok := applySynthesizedPatch(baseline, patch)
 	if !ok {
-		return TierResult{Rejected: true, RejectReason: "rmah tier 3: synthesized patch rejected due to ambiguous anchors"}
+		return TierResult{Rejected: true, RejectReason: ErrAmbiguousAnchors.Error()}
 	}
 	if p.verifyBaseline(baseline, target) && !p.verifyBaseline(result, target) {
 		return TierResult{Rejected: true, RejectReason: ErrASTDegradation.Error()}
