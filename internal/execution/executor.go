@@ -1256,14 +1256,14 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			ingTrace = retryTrace
 		}
 		if retryErr != nil {
-			err = fmt.Errorf("%w: strict line-anchor retry failed: %v", ErrPhysicalOutputBudgetBreach, retryErr)
+			err = fmt.Errorf("%w: strict line-anchor retry failed: %w", ErrPhysicalOutputBudgetBreach, retryErr)
 			patches, diffs = nil, nil
 		} else {
 			patches, diffs, err = retryPatches, retryDiffs, nil
 		}
 	}
 	if err != nil && IsHallucinatedAnchorError(err) && req.RecoveryAttempt >= 1 {
-		err = fmt.Errorf("%w: strict line-anchor attempt exhausted: %v", ErrPhysicalOutputBudgetBreach, err)
+		err = fmt.Errorf("%w: strict line-anchor attempt exhausted: %w", ErrPhysicalOutputBudgetBreach, err)
 	}
 	if ingTrace != nil {
 		res.IngestionTrace = ingTrace
@@ -1862,12 +1862,12 @@ func (x *RuntimeExecutor) selectStrategy(_ context.Context, req ExecuteRequest) 
 		if req.MaxOutputTokens > 0 {
 			profile.MaxOutputTokens = req.MaxOutputTokens
 		}
-		return x.resolveLocalConstraints(profile, req), nil
+		return x.resolveLocalConstraints(profile, req), nil //nolint:contextcheck // document syntax validation is pure content checking, no context needed
 	}
 	// Direct runtime callers that resolved an explicit target without a
 	// gateway profile target a bounded mutation.
 	if req.Target != "" || len(req.Targets) > 0 {
-		return x.resolveLocalConstraints(strategy.ExecutionStrategyProfile{
+		return x.resolveLocalConstraints(strategy.ExecutionStrategyProfile{ //nolint:contextcheck // document syntax validation is pure content checking, no context needed
 			Strategy:        strategy.TargetedMutation,
 			ModelRequired:   true,
 			StrategyReason:  "explicit resolved target submitted to the runtime",
@@ -1879,7 +1879,7 @@ func (x *RuntimeExecutor) selectStrategy(_ context.Context, req ExecuteRequest) 
 	if req.MaxOutputTokens > 0 {
 		profile.MaxOutputTokens = req.MaxOutputTokens
 	}
-	return x.resolveLocalConstraints(profile, req), nil
+	return x.resolveLocalConstraints(profile, req), nil //nolint:contextcheck // document syntax validation is pure content checking, no context needed
 }
 
 func (x *RuntimeExecutor) resolveLocalConstraints(profile strategy.ExecutionStrategyProfile, req ExecuteRequest) strategy.ExecutionStrategyProfile {
