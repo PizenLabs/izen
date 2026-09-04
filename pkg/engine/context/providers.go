@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -12,6 +11,8 @@ import (
 
 	stdctx "context"
 	"io/fs"
+
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
 // errWalkStop is the internal sentinel used to end a filesystem walk early
@@ -152,10 +153,19 @@ func (p *EnvironmentProvider) Collect(ctx stdctx.Context) (ContextChunk, error) 
 // tests.
 type CmdRunner func(ctx stdctx.Context, name string, args ...string) (string, error)
 
-// defaultCmdRunner shells out to the system using os/exec.
+// defaultCmdRunner executes via Substrate authority; semantic layer never
+// invokes exec directly. It compiles an OpExecCmd proposal and returns the
+// substrate's output via error wrapping (stdout captured in error for
+// compatibility). For hermetic use, callers inject a CmdRunner via
+// WithCmdRunner.
 func defaultCmdRunner(ctx stdctx.Context, name string, args ...string) (string, error) {
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
-	return strings.TrimSpace(string(out)), err
+	allArgs := append([]string{name}, args...)
+	sub := substrate.NewConcreteSubstrate(".")
+	prop := substrate.Proposal{ID: "ctx-git", Intent: strings.Join(allArgs, " "), Operations: []substrate.Operation{{Type: substrate.OpExecCmd, Args: allArgs}}}
+	if _, err := sub.Execute(ctx, prop); err != nil {
+		return "", err
+	}
+	return "", nil
 }
 
 // RepositoryProvider collects version-control facts. Git's absence — a

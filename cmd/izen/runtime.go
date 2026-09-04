@@ -11,6 +11,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/providers"
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 	"github.com/PizenLabs/izen/pkg/app"
 	"github.com/PizenLabs/izen/pkg/app/compiler"
 	"github.com/PizenLabs/izen/pkg/event"
@@ -158,6 +159,7 @@ func runRuntimeCommand(args []string) error {
 		app.WithGenerator(&cliGenerator{provider: provider, model: model}),
 		app.WithKnowledgeGraph(kg),
 		app.WithIntentCompiler(intentCompiler),
+		app.WithSubstrate(substrate.NewConcreteSubstrate(dir)),
 		// The interactive "Questions Before Implementation" component unblocks
 		// the pipeline when an ambiguous intent asks its questions.
 		app.WithClarifier(app.ClarifierFunc(func(ctx context.Context, questions []ir.ClarificationQuestion, resp chan<- ir.ClarificationResponse) error {

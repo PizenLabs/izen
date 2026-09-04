@@ -122,7 +122,11 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 				proof.Error = err
 				return proof, err
 			}
-			target := filepath.Join(s.root, filepath.Clean(op.Target))
+			cleanTarget := filepath.Clean(op.Target)
+			target := cleanTarget
+			if !filepath.IsAbs(cleanTarget) {
+				target = filepath.Join(s.root, cleanTarget)
+			}
 			if err := record(target); err != nil {
 				rollback()
 				proof.Status = "failed"
@@ -150,7 +154,11 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 				proof.Error = err
 				return proof, err
 			}
-			target := filepath.Join(s.root, filepath.Clean(op.Target))
+			cleanTarget := filepath.Clean(op.Target)
+			target := cleanTarget
+			if !filepath.IsAbs(cleanTarget) {
+				target = filepath.Join(s.root, cleanTarget)
+			}
 			if err := record(target); err != nil {
 				rollback()
 				proof.Status = "failed"

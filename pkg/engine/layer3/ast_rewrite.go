@@ -9,12 +9,12 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 	"github.com/PizenLabs/izen/pkg/engine/layer2"
 )
 
@@ -618,12 +618,20 @@ type ApplyResult struct {
 	Applied int
 }
 
-// ApplyPatches writes the proposed file contents to disk relative to root.
-// It is the only writer in this package: every mutation returns a PatchResult
-// and application is an explicit, deterministic step. Patches whose paths
-// escape root are rejected.
+// ApplyPatches compiles patches into an immutable substrate.Proposal and
+// executes it via the Substrate authority. It is the ONLY writer in this
+// package: every mutation returns a PatchResult and application is via
+// Substrate.Execute. Patches whose paths escape root are rejected.
 func ApplyPatches(ctx context.Context, root string, patches []FilePatch) (*ApplyResult, error) {
+	return ApplyPatchesWithSubstrate(ctx, root, patches, substrate.NewConcreteSubstrate(root))
+}
+
+// ApplyPatchesWithSubstrate compiles patches into a Proposal and executes via
+// the provided Substrate. When sub is nil an in-memory validation pass is
+// performed without committing, preserving pure-compiler semantics for tests.
+func ApplyPatchesWithSubstrate(ctx context.Context, root string, patches []FilePatch, sub substrate.Substrate) (*ApplyResult, error) {
 	applied := 0
+	ops := make([]substrate.Operation, 0, len(patches))
 	for _, p := range patches {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -631,19 +639,38 @@ func ApplyPatches(ctx context.Context, root string, patches []FilePatch) (*Apply
 		if !p.Changed || p.Path == "" {
 			continue
 		}
-		abs, err := resolveWithin(root, p.Path)
-		if err != nil {
+		if _, err := resolveWithin(root, p.Path); err != nil {
 			return nil, err
 		}
-		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-			return nil, err
-		}
-		if err := os.WriteFile(abs, []byte(p.New), 0o644); err != nil {
-			return nil, err
-		}
+		ops = append(ops, substrate.Operation{Type: substrate.OpFileWrite, Target: p.Path, Content: []byte(p.New)})
 		applied++
 	}
+	if len(ops) == 0 {
+		return &ApplyResult{Applied: applied}, nil
+	}
+	if sub == nil {
+		// Pure compilation without execution (test harness).
+		return &ApplyResult{Applied: applied}, nil
+	}
+	prop := substrate.Proposal{ID: fmt.Sprintf("ast-%d", applied), Intent: "ast-rewrite", Operations: ops}
+	if _, err := sub.Execute(ctx, prop); err != nil {
+		return nil, err
+	}
 	return &ApplyResult{Applied: applied}, nil
+}
+
+// CompileProposal converts FilePatches into an immutable substrate.Proposal
+// without executing it. Callers (strategies) emit the proposal; Substrate
+// executes.
+func CompileProposal(patches []FilePatch, id string) substrate.Proposal {
+	ops := make([]substrate.Operation, 0, len(patches))
+	for _, p := range patches {
+		if !p.Changed || p.Path == "" {
+			continue
+		}
+		ops = append(ops, substrate.Operation{Type: substrate.OpFileWrite, Target: p.Path, Content: []byte(p.New)})
+	}
+	return substrate.Proposal{ID: id, Intent: "ast-rewrite", Operations: ops}
 }
 
 // resolveWithin resolves a relative path against root and rejects escapes.

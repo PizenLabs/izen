@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"go/parser"
 	"go/token"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 
 	"github.com/PizenLabs/izen/pkg/engine/layer2"
 )
@@ -617,21 +618,23 @@ func (v CommandValidator) Validate(ctx context.Context, patches []FilePatch) (*V
 	return v.run(ctx), nil
 }
 
-// run executes the configured command and folds its exit status into a result.
+// run executes via substrate helper; semantic layer never invokes exec directly.
 func (v CommandValidator) run(ctx context.Context) *ValidationResult {
 	fields := strings.Fields(v.Cmd)
 	if len(fields) == 0 {
 		return &ValidationResult{OK: false, Output: "no validation command configured"}
 	}
-	cmd := exec.CommandContext(ctx, fields[0], fields[1:]...)
-	if v.Root != "" {
-		cmd.Dir = v.Root
+	res := substrate.ExecCommand(ctx, v.Root, nil, fields)
+	if res.Err != nil {
+		if res.ExitCode == -1 {
+			return &ValidationResult{OK: false, Output: res.Err.Error()}
+		}
+		return &ValidationResult{OK: false, Output: res.Stdout + res.Stderr}
 	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return &ValidationResult{OK: false, Output: string(out)}
+	if res.ExitCode != 0 {
+		return &ValidationResult{OK: false, Output: res.Stdout + res.Stderr}
 	}
-	return &ValidationResult{OK: true, Output: string(out)}
+	return &ValidationResult{OK: true, Output: res.Stdout}
 }
 
 func goParses(src string) bool {

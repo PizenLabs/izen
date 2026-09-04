@@ -4,11 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 	"github.com/PizenLabs/izen/pkg/engine/layer1"
 	"github.com/PizenLabs/izen/pkg/engine/layer3"
 )
@@ -81,9 +80,12 @@ func (r *ValidationResult) WithStage(s Stage) *ValidationResult {
 // SourceReader reads a file's content relative to the repository root.
 type SourceReader func(root, path string) ([]byte, error)
 
-// DefaultSourceReader reads from disk relative to root.
+// DefaultSourceReader reads via ReadScope abstraction relative to root.
+// It uses substrate.FSReadScope to remain pure: no direct os access in
+// semantic layer; substrate owns I/O.
 func DefaultSourceReader(root, path string) ([]byte, error) {
-	return os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
+	rs := substrate.NewFSReadScope(root)
+	return rs.ReadFile(filepath.FromSlash(path))
 }
 
 // FuncValidator adapts a plain function to the Validator interface. It is
@@ -206,7 +208,8 @@ func (v *CommandValidator) Name() string {
 	return v.Label
 }
 
-// Validate implements Validator by running the configured command.
+// Validate implements Validator via substrate helper; semantic layer never
+// invokes exec directly.
 func (v *CommandValidator) Validate(ctx context.Context, patches []Patch) (*ValidationResult, error) {
 	if v == nil {
 		return nil, ErrNoValidator
@@ -218,35 +221,22 @@ func (v *CommandValidator) Validate(ctx context.Context, patches []Patch) (*Vali
 	if len(fields) == 0 {
 		return nil, fmt.Errorf("%w: stage %s", ErrEmptyCommand, v.Stage)
 	}
-	cmd := exec.CommandContext(ctx, fields[0], fields[1:]...)
-	if v.Root != "" {
-		cmd.Dir = v.Root
-	}
-	if len(v.Env) > 0 {
-		cmd.Env = append(os.Environ(), v.Env...)
-	}
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	code := 0
-	if err != nil {
+	res := substrate.ExecCommand(ctx, v.Root, v.Env, fields)
+	if res.Err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			code = exitErr.ExitCode()
-		} else {
-			return nil, fmt.Errorf("%w: stage %s: %w", ErrValidationFailed, v.Stage, err)
+		// Missing binary or execution error surfaces as transport error per contract.
+		if res.ExitCode == -1 {
+			return nil, fmt.Errorf("%w: stage %s: %w", ErrValidationFailed, v.Stage, res.Err)
 		}
 	}
-	if code != 0 {
-		res := resultFail(v.Stage, "", stdout.String(), stderr.String(), "exit status "+itoa(code))
-		res.ExitCode = code
-		return res, nil
+	if res.ExitCode != 0 {
+		r := resultFail(v.Stage, "", res.Stdout, res.Stderr, "exit status "+itoa(res.ExitCode))
+		r.ExitCode = res.ExitCode
+		return r, nil
 	}
-	return resultPassWithOutput(v.Stage, stdout.String(), stderr.String(), code, "command succeeded"), nil
+	return resultPassWithOutput(v.Stage, res.Stdout, res.Stderr, 0, "command succeeded"), nil
 }
 
 // capabilityValidators resolve capability-gated command validators. Each

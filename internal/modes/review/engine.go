@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/lea"
@@ -405,8 +406,9 @@ func (e *Engine) validateChangedFiles(files []DiffFile) (*pipeline.ValidationRes
 		return nil, nil
 	}
 	patches := make([]layer3.FilePatch, 0, len(files))
+	rs := substrate.NewFSReadScope(e.root)
 	for _, df := range files {
-		content, err := os.ReadFile(filepath.Join(e.root, df.Path))
+		content, err := rs.ReadFile(df.Path)
 		if err != nil {
 			continue
 		}
@@ -684,16 +686,15 @@ func (e *Engine) generateRecommendations(result *ReviewResult) []string {
 }
 
 func SaveReport(result *ReviewResult, dir string) error {
-	reportDir := filepath.Join(dir, ".izen", "reviews")
-	if err := os.MkdirAll(reportDir, 0755); err != nil {
-		return err
-	}
-
+	reportDir := ".izen/reviews"
 	timestamp := time.Now().Format("2006-01-02_150405")
 	path := filepath.Join(reportDir, fmt.Sprintf("review_%s.json", timestamp))
 
 	data := marshalReport(result)
-	return os.WriteFile(path, data, 0644)
+	sub := substrate.NewConcreteSubstrate(dir)
+	prop := substrate.Proposal{ID: "review-report", Intent: "save review", Operations: []substrate.Operation{{Type: substrate.OpFileWrite, Target: path, Content: data}}}
+	_, err := sub.Execute(context.Background(), prop)
+	return err
 }
 
 func marshalReport(result *ReviewResult) []byte {

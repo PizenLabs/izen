@@ -2,13 +2,11 @@ package investigate
 
 import (
 	"context"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
 // ForensicsRetriever is the subset of retrieval.Retriever that /investigate
@@ -109,7 +107,8 @@ func NewShellTestExecutor(root string) *ShellTestExecutor {
 
 func (e *ShellTestExecutor) run(ctx context.Context, args ...string) (*TestResultSummary, error) {
 	if len(args) > 0 && args[0] == "test" {
-		if _, err := os.Stat(filepath.Join(e.root, "go.mod")); os.IsNotExist(err) {
+		rs := substrate.NewFSReadScope(e.root)
+		if _, err := rs.ReadFile("go.mod"); err != nil {
 			return &TestResultSummary{
 				Output:  "go.mod not found — skipping go test (non-Go workspace or unsupported module system)",
 				Passed:  true,
@@ -121,11 +120,22 @@ func (e *ShellTestExecutor) run(ctx context.Context, args ...string) (*TestResul
 	ctx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "go", args...)
-	if e.root != "" {
-		cmd.Dir = e.root
+	allArgs := append([]string{"go"}, args...)
+	res := substrate.ExecCommand(ctx, e.root, nil, allArgs)
+	raw := []byte(res.Stdout + res.Stderr)
+	var err error
+	if res.Err != nil {
+		// Surface combined output as raw and retain error for decision.
+		if res.ExitCode == -1 {
+			err = res.Err
+		} else {
+			// Non-zero exit is not an execution error for test summaries.
+			err = nil
+			if len(raw) == 0 && res.Err != nil {
+				raw = []byte(res.Err.Error())
+			}
+		}
 	}
-	raw, err := cmd.CombinedOutput()
 
 	summary := &TestResultSummary{Output: string(raw)}
 

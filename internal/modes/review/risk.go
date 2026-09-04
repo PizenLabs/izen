@@ -181,7 +181,7 @@ func (ra *RiskAuditor) checkGoCallExpr(fset *token.FileSet, call *ast.CallExpr, 
 				Severity:    RiskHigh,
 				Category:    "os_command",
 				Code:        fun.Name + "(...)",
-				Description: "Direct os/exec.Command call without sandbox",
+				Description: "Direct system command invocation without sandbox",
 				Suggestion:  "Use execution.Engine.Runner which has sandbox and dangerous-command detection.",
 				RuleID:      "SEC-CMD-001",
 			})

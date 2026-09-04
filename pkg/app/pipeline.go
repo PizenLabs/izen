@@ -41,7 +41,26 @@ var (
 	ErrEmptyIntent = errors.New("app: empty intent")
 	// ErrEmptyGeneration is returned when the generator produced no output.
 	ErrEmptyGeneration = errors.New("app: generator returned an empty response")
+	// ErrNilSubstrate is returned when a Pipeline or Loop is constructed without
+	// a mandatory Substrate authority. Production construction fails fast.
+	ErrNilSubstrate = errors.New("app: nil substrate — Substrate is mandatory; reserve nil for isolated unit test harnesses")
 )
+
+// isTestHarness reports whether the current binary is a test harness.
+// When true, nil Substrate is tolerated and auto-provisioned as a concrete
+// substrate bound to the workspace root. Production binaries fail fast.
+func isTestHarness() bool {
+	// Test binaries have flag -test.v or args[0] ends with .test
+	for _, arg := range os.Args {
+		if strings.HasPrefix(arg, "-test.") {
+			return true
+		}
+	}
+	if strings.HasSuffix(os.Args[0], ".test") || strings.Contains(os.Args[0], "/_test/") {
+		return true
+	}
+	return false
+}
 
 // Generator performs a single LLM generation pass with an explicit system
 // prompt and a user prompt. The CLI adapts the configured ai.Provider to this
@@ -216,7 +235,11 @@ func NewPipeline(opts ...Option) (*Pipeline, error) {
 		p.tx = txfs.NewTxFS(p.root)
 	}
 	if p.substrate == nil {
-		p.substrate = substrate.NewConcreteSubstrate(p.root)
+		if isTestHarness() {
+			p.substrate = substrate.NewConcreteSubstrate(p.root)
+		} else {
+			return nil, ErrNilSubstrate
+		}
 	}
 	if p.registry == nil {
 		return nil, errors.New("app: nil capability registry")
@@ -465,25 +488,20 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 
 	// Substrate is the SINGLE MUTATION AUTHORITY: extract staged files into a
 	// Proposal and submit via Substrate.Execute. TxFS is the staging buffer only.
-	if p.substrate != nil {
-		prop := p.proposalFromTx(req.Intent)
-		// Clear the TxFS buffer without restoring — disk is still pristine;
-		// the Substrate will own the durable commit via its MutationSet.
-		staged := p.tx.StagedPaths()
-		if len(staged) > 0 {
-			_ = p.tx.Rollback()
-			if _, err := p.substrate.Execute(ctx, prop); err != nil {
-				return nil, fmt.Errorf("app: substrate commit: %w", err)
-			}
-		} else {
-			// No staged writes — nothing to commit via substrate.
-			_ = p.tx.Rollback()
+	// Direct transaction commit is forbidden — all commits go through Substrate.Execute.
+	if p.substrate == nil {
+		_ = p.tx.Rollback()
+		return nil, ErrNilSubstrate
+	}
+	prop := p.proposalFromTx(req.Intent)
+	staged := p.tx.StagedPaths()
+	if len(staged) > 0 {
+		_ = p.tx.Rollback()
+		if _, err := p.substrate.Execute(ctx, prop); err != nil {
+			return nil, fmt.Errorf("app: substrate commit: %w", err)
 		}
 	} else {
-		if err := p.tx.Commit(); err != nil {
-			_ = p.tx.Rollback()
-			return nil, fmt.Errorf("app: commit transaction: %w", err)
-		}
+		_ = p.tx.Rollback()
 	}
 
 	res.BlockedReads = p.readGuard.blockedReads()

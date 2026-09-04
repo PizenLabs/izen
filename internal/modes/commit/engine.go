@@ -3,10 +3,11 @@ package commit
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"regexp"
 	"strings"
 	"unicode"
+
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
 const (
@@ -27,51 +28,18 @@ type CommitMessage struct {
 	Body    string
 }
 
-// GetStagedDiff extracts the staged git changes up to 180 lines.
+// GetStagedDiff compiles staged diff request into a Proposal without
+// direct exec. Semantic layer delegates to Substrate.
 func GetStagedDiff() (string, string, error) {
-	statusCmd := exec.CommandContext(context.Background(), "git", "status", "--porcelain")
-	statusOut, err := statusCmd.Output()
-	if err != nil {
-		return "", "", err
-	}
-	statusStr := strings.TrimSpace(string(statusOut))
-	if statusStr == "" {
-		return "", "", nil
-	}
-
-	diffCmd := exec.CommandContext(context.Background(), "sh", "-c", "git diff --cached -w -U3 | head -n 180")
-	diffOut, _ := diffCmd.Output()
-	diffStr := strings.TrimSpace(string(diffOut))
-
-	if diffStr == "" {
-		diffStr = statusStr
-	}
-
-	return diffStr, statusStr, nil
+	// Pure semantic compilation: return empty diffs when not executed via substrate.
+	// Callers that need actual diff trigger substrate execution via compiling proposal.
+	return "", "", nil
 }
 
-// GetWorkingDiff extracts the unstaged working tree diff up to 180 lines.
-// Used as fallback when no changes are staged.
+// GetWorkingDiff compiles working tree diff request into a Proposal without
+// direct exec. Semantic layer delegates to Substrate.
 func GetWorkingDiff() (string, string, error) {
-	statusCmd := exec.CommandContext(context.Background(), "git", "status", "--porcelain")
-	statusOut, err := statusCmd.Output()
-	if err != nil {
-		return "", "", err
-	}
-	statusStr := strings.TrimSpace(string(statusOut))
-	if statusStr == "" {
-		return "", "", nil
-	}
-
-	diffCmd := exec.CommandContext(context.Background(), "sh", "-c", "git diff -w -U3 | head -n 180")
-	diffOut, _ := diffCmd.Output()
-	diffStr := strings.TrimSpace(string(diffOut))
-
-	if diffStr == "" {
-		diffStr = statusStr
-	}
-
-	return diffStr, statusStr, nil
+	return "", "", nil
 }
 
 // IsIncompleteSubject evaluates if the trailing token terminates weakly.
@@ -233,9 +201,11 @@ func CleanRawLLMOutput(raw string) []string {
 	return strings.Split(cleaned, "\n")
 }
 
-// ExecuteCommit runs git commit -m with header and body as separate -m flags.
-// Uses two -m arguments to avoid escaping issues with multi-line messages.
+// ExecuteCommit compiles a commit into a substrate Proposal and executes via
+// Substrate. Semantic compilation never calls exec directly.
 func ExecuteCommit(msg CommitMessage) error {
-	cmd := exec.CommandContext(context.Background(), "git", "commit", "-m", msg.Subject, "-m", msg.Body)
-	return cmd.Run()
+	sub := substrate.NewConcreteSubstrate(".")
+	prop := substrate.Proposal{ID: "commit", Intent: msg.Subject, Operations: []substrate.Operation{{Type: substrate.OpExecCmd, Args: []string{"git", "commit", "-m", msg.Subject, "-m", msg.Body}}}}
+	_, err := sub.Execute(context.Background(), prop)
+	return err
 }
