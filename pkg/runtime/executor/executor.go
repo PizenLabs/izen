@@ -1,14 +1,11 @@
 package executor
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
-
-	"github.com/PizenLabs/izen/pkg/runtime/harness"
 )
 
 // defaultCommitMode is applied to committed files that carry a zero
@@ -100,29 +97,6 @@ func (e *RuntimeExecutor) Commit(proposal ProposedMutation, backup *FileBackup) 
 		return e.failWithRollback(backup, err)
 	}
 	return nil
-}
-
-// CommitMutation is the Sole-Authority commit path of the closed execution
-// loop (Model Output -> RMAH -> Gate -> RuntimeExecutor). It materializes an
-// approved harness.CandidateArtifact against the Observation-phase memory
-// snapshot bytes — never a disk read — and writes the result atomically.
-//
-// The memory snapshot is the only base: RMAH, the gate pipeline, and this
-// method consume the same []byte captured once per cycle at the Observation
-// phase (zero disk-read redundancy).
-func (e *RuntimeExecutor) CommitMutation(ctx context.Context, candidate harness.CandidateArtifact, memorySnapshot []byte) error {
-	if e == nil {
-		return errors.New("executor: nil RuntimeExecutor")
-	}
-	if candidate.TargetFile == "" {
-		return errors.New("executor: commit requires a candidate target file")
-	}
-
-	final, err := materializeCandidate(candidate, memorySnapshot)
-	if err != nil {
-		return fmt.Errorf("executor: materialize candidate: %w", err)
-	}
-	return e.atomicWrite(candidate.TargetFile, final, defaultCommitMode)
 }
 
 // atomicWrite writes content to targetPath atomically: content is written to a

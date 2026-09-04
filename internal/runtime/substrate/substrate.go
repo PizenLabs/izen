@@ -2,7 +2,13 @@ package substrate
 
 import (
 	"context"
+	"errors"
 )
+
+// ErrVerificationFailed is returned when the mandatory pre-commit AST
+// symbol re-anchoring verification fails. Substrate must rollback staged
+// operations and return this error explicitly.
+var ErrVerificationFailed = errors.New("substrate: verification failed: symbol re-anchoring check failed")
 
 // ReadScope provides read-only access to workspace and state snapshotting.
 // It MUST NOT contain any Write, Apply, Mutate, or Commit methods.
