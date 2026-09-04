@@ -636,6 +636,11 @@ type RuntimeLoop struct {
 	termination     *LoopTermination
 	boundary        *HumanBoundary
 	lastObservation Observation
+	// substrate is the execution target reference. The loop never executes
+	// directly; strategies emit Proposals that execute via Substrate.
+	substrate interface {
+		Execute(ctx context.Context, prop interface{}) (interface{}, error)
+	}
 }
 
 // NewRuntimeLoop returns a loop at Idle with the given runtime-owned bounds.

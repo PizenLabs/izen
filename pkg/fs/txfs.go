@@ -182,6 +182,47 @@ func (t *TxFS) RemoveFile(path string) error {
 	return nil
 }
 
+// IsStagedDelete reports whether the staged entry for path is a deletion.
+func (t *TxFS) IsStagedDelete(path string) bool {
+	if t == nil {
+		return false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if entry, ok := t.staged[path]; ok {
+		return entry.action == actionRemove
+	}
+	return false
+}
+
+// StagedWriteContent returns the staged write content for path, if it is a
+// pending write. The boolean reports whether a staged write exists.
+func (t *TxFS) StagedWriteContent(path string) ([]byte, bool) {
+	if t == nil {
+		return nil, false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if entry, ok := t.staged[path]; ok && entry.action == actionWrite {
+		return append([]byte(nil), entry.content...), true
+	}
+	return nil, false
+}
+
+// Clear discards all staged operations without restoring files. It is the
+// staging-buffer reset used when the Substrate authority takes ownership of
+// the staged proposal — the TxFS never commits directly to disk.
+func (t *TxFS) Clear() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.active = false
+	t.staged = make(map[string]*stagedFile)
+	t.createdDirs = make(map[string]struct{})
+}
+
 // ReadFile returns the staged content of a pending write, or the live content
 // when the path is not staged.
 func (t *TxFS) ReadFile(path string) ([]byte, error) {

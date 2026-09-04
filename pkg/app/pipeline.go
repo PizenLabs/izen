@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 	"github.com/PizenLabs/izen/pkg/app/compiler"
 	"github.com/PizenLabs/izen/pkg/capability"
 	"github.com/PizenLabs/izen/pkg/event"
@@ -168,10 +169,17 @@ type Pipeline struct {
 	compiler IntentCompiler
 
 	// tx is the transactional file system every artifact application stages
-	// through. It is created bound to the workspace root and is reusable
-	// across runs: Begin opens a transaction, Commit applies it atomically and
-	// Rollback restores the workspace after a rejection or failure.
+	// through. It is relegated to an in-memory staging/working buffer under
+	// the Substrate authority: staged writes never reach disk via TxFS.Commit
+	// directly — they are extracted into a substrate.Proposal and submitted to
+	// Substrate.Execute which owns the shared MutationSet transaction ledger
+	// and ExecutionProof.
 	tx *txfs.TxFS
+
+	// substrate is the SINGLE MUTATION AUTHORITY. All file mutations,
+	// regardless of entrypoint, pass through it and share the same ledger
+	// and ExecutionProof.
+	substrate substrate.Substrate
 
 	// readGuard is the enforcement seam for workspace file reads. Under a
 	// full-overwrite context it sanitizes every read so obsolete content can
@@ -207,6 +215,9 @@ func NewPipeline(opts ...Option) (*Pipeline, error) {
 	if p.tx == nil {
 		p.tx = txfs.NewTxFS(p.root)
 	}
+	if p.substrate == nil {
+		p.substrate = substrate.NewConcreteSubstrate(p.root)
+	}
 	if p.registry == nil {
 		return nil, errors.New("app: nil capability registry")
 	}
@@ -215,6 +226,35 @@ func NewPipeline(opts ...Option) (*Pipeline, error) {
 	}
 	p.bus.Subscribe(nil, func(e event.Event) { p.recordEvent(e) })
 	return p, nil
+}
+
+// WithSubstrate overrides the mutation substrate. Defaults to a
+// ConcreteSubstrate bound to the pipeline workspace root. When set, all
+// staged TxFS writes are extracted into a substrate.Proposal and executed via
+// Substrate.Execute, sharing the single MutationSet ledger and ExecutionProof.
+func WithSubstrate(s substrate.Substrate) Option {
+	return func(p *Pipeline) {
+		if s != nil {
+			p.substrate = s
+		}
+	}
+}
+
+// proposalFromTx extracts staged TxFS state into a substrate.Proposal.
+// TxFS is the in-memory staging buffer; Substrate is the commit authority.
+func (p *Pipeline) proposalFromTx(intent string) substrate.Proposal {
+	id := fmt.Sprintf("pipeline-%d", time.Now().UnixNano())
+	ops := make([]substrate.Operation, 0, p.tx.StagedCount())
+	for _, path := range p.tx.StagedPaths() {
+		if p.tx.IsStagedDelete(path) {
+			ops = append(ops, substrate.Operation{Type: substrate.OpFileDelete, Target: path})
+			continue
+		}
+		if data, ok := p.tx.StagedWriteContent(path); ok {
+			ops = append(ops, substrate.Operation{Type: substrate.OpFileWrite, Target: path, Content: data})
+		}
+	}
+	return substrate.Proposal{ID: id, Intent: intent, Operations: ops}
 }
 
 // Bus returns the shared event bus the pipeline and the kernel publish on.
@@ -415,16 +455,35 @@ func (p *Pipeline) Run(ctx context.Context, req Request) (*Result, error) {
 	res.Mode = planMode
 
 	// Stage 7 — Kernel engine execution. Greenfield writes are staged through
-	// the transaction and become visible only when the plan commits atomically.
+	// the in-memory TxFS buffer and become visible only when the Substrate
+	// executes the proposal atomically via its MutationSet ledger.
 	p.emitStage(ctx, "execute")
 	if err := p.execute(ctx, planResult, planMode, bfPlanner); err != nil {
 		_ = p.tx.Rollback()
 		return nil, fmt.Errorf("app: execute: %w", err)
 	}
 
-	if err := p.tx.Commit(); err != nil {
-		_ = p.tx.Rollback()
-		return nil, fmt.Errorf("app: commit transaction: %w", err)
+	// Substrate is the SINGLE MUTATION AUTHORITY: extract staged files into a
+	// Proposal and submit via Substrate.Execute. TxFS is the staging buffer only.
+	if p.substrate != nil {
+		prop := p.proposalFromTx(req.Intent)
+		// Clear the TxFS buffer without restoring — disk is still pristine;
+		// the Substrate will own the durable commit via its MutationSet.
+		staged := p.tx.StagedPaths()
+		if len(staged) > 0 {
+			_ = p.tx.Rollback()
+			if _, err := p.substrate.Execute(ctx, prop); err != nil {
+				return nil, fmt.Errorf("app: substrate commit: %w", err)
+			}
+		} else {
+			// No staged writes — nothing to commit via substrate.
+			_ = p.tx.Rollback()
+		}
+	} else {
+		if err := p.tx.Commit(); err != nil {
+			_ = p.tx.Rollback()
+			return nil, fmt.Errorf("app: commit transaction: %w", err)
+		}
 	}
 
 	res.BlockedReads = p.readGuard.blockedReads()

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 	"github.com/PizenLabs/izen/pkg/runtime/executor"
 	"github.com/PizenLabs/izen/pkg/runtime/gate"
 	"github.com/PizenLabs/izen/pkg/runtime/harness"
@@ -150,6 +151,7 @@ type Loop struct {
 	gatePipeline     GatePipeline
 	executor         *executor.RuntimeExecutor
 	reader           SnapshotReader
+	substrate        substrate.Substrate
 
 	snapshot *MemorySnapshot
 
@@ -170,6 +172,32 @@ func NewLoop(extractor ModelOutputExtractor, gp GatePipeline, exec *executor.Run
 		gatePipeline:     gp,
 		executor:         exec,
 		reader:           reader,
+		state:            StateIdle,
+	}
+}
+
+// WithSubstrate wires the Substrate authority. When set, ExecuteCycle builds a
+// Proposal and submits via Substrate.Execute instead of calling
+// executor.CommitMutation directly. CommitMutation is deprecated.
+func WithSubstrate(s substrate.Substrate) func(*Loop) {
+	return func(l *Loop) {
+		if s != nil {
+			l.substrate = s
+		}
+	}
+}
+
+// NewLoopWithSubstrate wires the closed path with a Substrate authority.
+func NewLoopWithSubstrate(extractor ModelOutputExtractor, gp GatePipeline, exec *executor.RuntimeExecutor, reader SnapshotReader, sub substrate.Substrate) *Loop {
+	if reader == nil {
+		reader = FSSnapshotReader{}
+	}
+	return &Loop{
+		harnessExtractor: extractor,
+		gatePipeline:     gp,
+		executor:         exec,
+		reader:           reader,
+		substrate:        sub,
 		state:            StateIdle,
 	}
 }
@@ -282,16 +310,35 @@ func (l *Loop) ExecuteCycle(ctx context.Context, rawModelOutput []byte) (*CycleO
 		return l.handleGateRejection(candidate, gateResult)
 	}
 
-	// ── 3. Commit only via the Sole Authority (RuntimeExecutor). ───────
-	if err := l.executor.CommitMutation(ctx, candidate, l.snapshot.Content); err != nil {
-		l.state = StateFailed
-		return &CycleOutcome{
-			State:      StateFailed,
-			Candidate:  &candidate,
-			Evidence:   candidate.Evidence,
-			GateResult: gateResult,
-			Reason:     err.Error(),
-		}, err
+	// ── 3. Commit via Substrate Proposal (or deprecated direct executor). ─
+	// Build a Proposal from the candidate and submit through Substrate when
+	// wired. Direct executor.CommitMutation is deprecated — strategies must
+	// emit Proposals, the Substrate executes them.
+	if l.substrate != nil {
+		prop := l.buildProposal(candidate)
+		if _, err := l.substrate.Execute(ctx, prop); err != nil {
+			l.state = StateFailed
+			return &CycleOutcome{
+				State:      StateFailed,
+				Candidate:  &candidate,
+				Evidence:   candidate.Evidence,
+				GateResult: gateResult,
+				Reason:     err.Error(),
+			}, err
+		}
+	} else {
+		// Deprecated: direct mutation delegation. Preserved for backward
+		// compat when no Substrate is wired; new callers must wire Substrate.
+		if err := l.executor.CommitMutation(ctx, candidate, l.snapshot.Content); err != nil {
+			l.state = StateFailed
+			return &CycleOutcome{
+				State:      StateFailed,
+				Candidate:  &candidate,
+				Evidence:   candidate.Evidence,
+				GateResult: gateResult,
+				Reason:     err.Error(),
+			}, err
+		}
 	}
 	l.state = StateCommitted
 	l.formatFailures = 0
@@ -301,6 +348,28 @@ func (l *Loop) ExecuteCycle(ctx context.Context, rawModelOutput []byte) (*CycleO
 		Evidence:   candidate.Evidence,
 		GateResult: gateResult,
 	}, nil
+}
+
+// buildProposal converts a candidate into a substrate.Proposal. The caller
+// owns Proposal emission; Substrate owns execution.
+func (l *Loop) buildProposal(candidate harness.CandidateArtifact) substrate.Proposal {
+	content := candidate.RawPatch
+	if len(content) == 0 && candidate.Diff != "" {
+		content = []byte(candidate.Diff)
+	}
+	return substrate.Proposal{
+		ID:     fmt.Sprintf("orch-%s-%d", candidate.TargetFile, l.formatFailures),
+		Intent: candidate.TargetFile,
+		Operations: []substrate.Operation{
+			{Type: substrate.OpFileWrite, Target: candidate.TargetFile, Content: content},
+		},
+	}
+}
+
+// BuildProposal is the pure strategy seam: it builds and returns a Proposal
+// without executing it. Strategies emit Proposals; the Substrate executes.
+func (l *Loop) BuildProposal(candidate harness.CandidateArtifact) substrate.Proposal {
+	return l.buildProposal(candidate)
 }
 
 // handleExtractionFailure routes an RMAH translation failure. Ambiguity halts
