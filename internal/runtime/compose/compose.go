@@ -585,6 +585,7 @@ func Wire(opts ...Option) (*Application, error) {
 		Approver:        a.Approver,
 		Executor:        a.Executor,
 		PreflightWorker: preflightWorker,
+		Root:            a.Inputs.Root,
 		Telemetry:       izentelemetry.Default(),
 	})
 	if err := hs.Register(dispatcher); err != nil {

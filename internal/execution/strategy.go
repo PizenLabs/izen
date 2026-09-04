@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"fmt"
 	"os"
 	"strings"
 )
@@ -150,6 +151,45 @@ RULES:
 - Do NOT output full file content — only the changed region.
 - No conversational text, explanations, or markdown outside the block.
 - Output ends immediately after the last block.`
+}
+
+// ExecutionConstraint isolates strategy handling from Authorization DecisionSurface.
+// It carries the model output budget and strategy shape without coupling to UI.
+type ExecutionConstraint struct {
+	Strategy        FileMutationStrategy
+	MaxOutputTokens int
+	Shape           BudgetShape
+}
+
+// DegradeStrategy silently degrades FULL_REWRITE -> BOUNDED_PATCH -> STRICT_PATCH
+// on model output budget shortfall. Returns the degraded constraint.
+func DegradeStrategy(c ExecutionConstraint, requiredOutputTokens int) ExecutionConstraint {
+	if c.Shape == ShapeFullRewrite && requiredOutputTokens > c.MaxOutputTokens && c.MaxOutputTokens > 0 {
+		c.Shape = ShapeBoundedPatch
+		return c
+	}
+	if c.Shape == ShapeBoundedPatch && requiredOutputTokens > c.MaxOutputTokens && c.MaxOutputTokens > 0 {
+		c.Shape = ShapeInspectOnly // strict patch maps to inspect-only shape here
+		return c
+	}
+	return c
+}
+
+// PolicyTransitionForLength implements the finish_reason == "length" transition table:
+// Attempt 1 Normal -> retry with StrategyStrictPatch (strip commentary),
+// Attempt 2 StrictPatch + length -> Strict Halt with Physical Budget Failure.
+func PolicyTransitionForLength(attempt int, currentShape BudgetShape, finishReason string) (nextShape BudgetShape, halt bool, err error) {
+	if finishReason != "length" {
+		return currentShape, false, nil
+	}
+	switch attempt {
+	case 1:
+		return ShapeBoundedPatch, false, nil
+	case 2:
+		return currentShape, true, fmt.Errorf("physical budget failure: output exhausted twice (finish_reason=length)")
+	default:
+		return currentShape, true, fmt.Errorf("physical budget failure: output exhausted")
+	}
 }
 
 func ExistingFileSmallFallbackSystemPrompt() string {

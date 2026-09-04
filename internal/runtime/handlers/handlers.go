@@ -12,6 +12,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +24,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/telemetry"
+	"github.com/PizenLabs/izen/pkg/runtime/target"
 )
 
 // Sentinel errors returned by the real handlers.
@@ -68,6 +71,11 @@ type HandlerDeps struct {
 	// PreflightTargets, when set, overrides target resolution for the
 	// background preflight (tests).
 	PreflightTargets []string
+	// Root is the workspace root directory used for synchronous target
+	// resolution at prompt admission. When set, the handler extracts
+	// @-referenced targets from the prompt and passes them to the preflight
+	// worker so the initial snapshot is generated for the explicit target.
+	Root string
 	// Telemetry is the high-precision latency sink for prompt_submit_latency
 	// / preflight_latency / first_stream_latency. Nil defaults to the global
 	// recorder.
@@ -199,6 +207,12 @@ func (h *SubmitPromptHandler) Handle(ctx context.Context, cmd runtime.RuntimeCom
 	// 3. Dispatch BackgroundPreflight async — NEVER synchronously read/scan.
 	if w := h.deps.PreflightWorker; w != nil {
 		targets := h.deps.PreflightTargets
+		// Synchronous target resolution: extract @-referenced targets from
+		// the prompt BEFORE spawning the bg worker so the initial snapshot
+		// is generated for the explicit target (eliminating target="").
+		if len(targets) == 0 {
+			targets = resolveTargets(h.deps.Root, c.Prompt)
+		}
 		// Use a detached context so the bg worker outlives the handler's ctx.
 		bgCtx := context.Background()
 		w.Start(bgCtx, c.Prompt, targets) //nolint:contextcheck // detached bg preflight context outlives the handler
@@ -484,6 +498,35 @@ func containsAny(s string, keywords []string) bool {
 		}
 	}
 	return false
+}
+
+// resolveTargets extracts @-referenced file targets from a prompt and returns
+// workspace-relative paths. It delegates to the canonical target extraction
+// lexer (target.ExtractReferences) so quoted paths (@"src/my component.tsx")
+// and standard @path references behave identically across admission and
+// strategy phases. It is the synchronous admission-time target resolution
+// that runs BEFORE the preflight background worker is spawned, ensuring the
+// initial snapshot is generated for the explicit target.
+func resolveTargets(root, prompt string) []string {
+	refs := target.ExtractReferences(prompt)
+	if len(refs) == 0 {
+		return nil
+	}
+	var out []string
+	for _, ref := range refs {
+		raw := ref.Raw
+		if raw == "" || raw == "/" {
+			continue
+		}
+		// Verify the target exists in the workspace when root is provided.
+		if root != "" {
+			if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(raw))); err != nil {
+				continue
+			}
+		}
+		out = append(out, raw)
+	}
+	return out
 }
 
 // ── Handlers bundle + registration ───────────────────────────────────────────

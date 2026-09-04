@@ -90,6 +90,43 @@ const (
 	ProposalInspect ProposalIntent = "inspect"
 	// ProposalCancel abandons the objective with zero mutation and zero spend.
 	ProposalCancel ProposalIntent = "cancel"
+	// ProposalInjectLineOffset appends explicit line ranges [L<start>-L<end>]
+	// to the active target context and re-triggers preflight with restricted
+	// bounds. It is the N>1 ambiguous-anchor recovery that disambiguates
+	// via line-offset injection.
+	ProposalInjectLineOffset ProposalIntent = "inject_line_offset"
+	// ProposalFullFileFallback dynamically updates execution scope capabilities
+	// to allow full-file overwrite (overwrite_allowed = true), bypasses RMAH
+	// Tier 3 bounded patch requirement, and routes payload to the direct writer.
+	ProposalFullFileFallback ProposalIntent = "full_file_fallback"
+	// ProposalRepromptFullText re-prompts the model with full text context
+	// for N=0 hallucinated anchor failures (zero match).
+	ProposalRepromptFullText ProposalIntent = "reprompt_full_text"
+	// ProposalAbortRun is the human-friendly hard-block abort: it cancels
+	// the run gracefully (no SIGINT/Ctrl+C required) and returns the
+	// session to a clean idle state. It is offered on HARD-BLOCK
+	// DecisionSurfaces (output budget exhausted twice, format
+	// failures >=2, ambiguous anchors). Distinct from ProposalCancel
+	// (the fail-fast path on every preflight closure) so the UI can
+	// render it with a human-readable label that promises "Return to
+	// Idle" semantics.
+	ProposalAbortRun ProposalIntent = "abort_run"
+	// ProposalForceBoundedPatch is the human-authorized escape from a
+	// hard-block DecisionSurface: it OVERRIDES the syntax check and
+	// forces the executor to attempt a strictly local SEARCH/REPLACE
+	// patch on the AST error offset, even when the structural
+	// validator would otherwise refuse. It creates a NEW execution
+	// contract and re-runs preflight under the patched shape; the
+	// safety gate is bypassed ONLY because the human explicitly
+	// authorized it.
+	ProposalForceBoundedPatch ProposalIntent = "force_bounded_patch"
+	// ProposalSwitchModel opens the model picker modal so the human
+	// can re-target the current run at a model with a higher output
+	// token ceiling. It is offered on HARD-BLOCK DecisionSurfaces
+	// where the only viable path is a different model. The
+	// composition root binds the picker — the runtime never resolves
+	// a model outside the explicitly authorized human choice.
+	ProposalSwitchModel ProposalIntent = "switch_model"
 )
 
 // Valid reports whether the intent is a member of the closed vocabulary.
@@ -97,7 +134,9 @@ func (i ProposalIntent) Valid() bool {
 	switch i {
 	case ProposalInlineDeps, ProposalExpandScope, ProposalRepairFirst,
 		ProposalReduceScope, ProposalRescopeBoundedPatch,
-		ProposalRetryExplicitBudget, ProposalInspect, ProposalCancel:
+		ProposalRetryExplicitBudget, ProposalInspect, ProposalCancel,
+		ProposalInjectLineOffset, ProposalFullFileFallback, ProposalRepromptFullText,
+		ProposalAbortRun, ProposalForceBoundedPatch, ProposalSwitchModel:
 		return true
 	}
 	return false
@@ -106,14 +145,81 @@ func (i ProposalIntent) Valid() bool {
 // IsRecovery reports whether the intent is a recovery action that creates a
 // NEW execution contract (as opposed to a terminal/abort or a read-only hold).
 func (i ProposalIntent) IsRecovery() bool {
-	return i == ProposalRescopeBoundedPatch || i == ProposalRetryExplicitBudget
+	return i == ProposalRescopeBoundedPatch || i == ProposalRetryExplicitBudget ||
+		i == ProposalInjectLineOffset || i == ProposalFullFileFallback || i == ProposalRepromptFullText ||
+		i == ProposalForceBoundedPatch || i == ProposalSwitchModel
 }
 
 // IsCancel reports whether the intent abandons the objective.
-func (i ProposalIntent) IsCancel() bool { return i == ProposalCancel }
+func (i ProposalIntent) IsCancel() bool {
+	return i == ProposalCancel || i == ProposalAbortRun
+}
 
 // IsInspect reports whether the intent is the read-only diagnostic hold.
 func (i ProposalIntent) IsInspect() bool { return i == ProposalInspect }
+
+// ParseProposalIntent normalizes a raw intent string into a ProposalIntent.
+// It accepts exact String values, option index strings ("1", "2"), and raw ID
+// strings, mapping them to the canonical closed vocabulary. It handles the TUI
+// DecisionSurface Option IDs ("full_file_fallback", "reprompt_full_text",
+// "inject_line_offset") and legacy alias variants.
+func ParseProposalIntent(raw string) ProposalIntent {
+	s := strings.TrimSpace(raw)
+	// Direct canonical match is the fast path.
+	switch ProposalIntent(s) {
+	case ProposalInlineDeps, ProposalExpandScope, ProposalRepairFirst,
+		ProposalReduceScope, ProposalRescopeBoundedPatch,
+		ProposalRetryExplicitBudget, ProposalInspect, ProposalCancel,
+		ProposalInjectLineOffset, ProposalFullFileFallback, ProposalRepromptFullText,
+		ProposalAbortRun, ProposalForceBoundedPatch, ProposalSwitchModel:
+		return ProposalIntent(s)
+	}
+	lower := strings.ToLower(s)
+	// Normalized alias handling.
+	switch lower {
+	case "1", "full_file_fallback", "intentfullfilefallback", "proposalfullfilefallback":
+		return ProposalFullFileFallback
+	case "2", "reprompt_full_text", "intentrepromptfulltext", "proposalrepromptfulltext":
+		return ProposalRepromptFullText
+	case "inject_line_offset", "intentinjectlineoffset", "proposalinjectlineoffset":
+		return ProposalInjectLineOffset
+	case "inline_deps", "intentinline_deps", "intentinlineDeps":
+		return ProposalInlineDeps
+	case "expand_scope", "intentexpand_scope":
+		return ProposalExpandScope
+	case "repair_first", "intentrepair_first":
+		return ProposalRepairFirst
+	case "reduce_scope", "intentreduce_scope":
+		return ProposalReduceScope
+	case "rescope_bounded_patch", "rescope_textual_patch", "intentrescopeboundedpatch":
+		return ProposalRescopeBoundedPatch
+	case "retry_with_explicit_budget", "intentretryexplicitbudget":
+		return ProposalRetryExplicitBudget
+	case "inspect", "intentinspect":
+		return ProposalInspect
+	case "cancel", "intentcancel":
+		return ProposalCancel
+	case "abort_run", "intentabort_run", "intentabortrun":
+		return ProposalAbortRun
+	case "force_bounded_patch", "intentforce_bounded_patch", "intentforceboundedpatch":
+		return ProposalForceBoundedPatch
+	case "switch_model", "intentswitch_model", "intentswitchmodel":
+		return ProposalSwitchModel
+	}
+	// Fallback: case-insensitive canonical check.
+	for _, valid := range []ProposalIntent{
+		ProposalInlineDeps, ProposalExpandScope, ProposalRepairFirst,
+		ProposalReduceScope, ProposalRescopeBoundedPatch,
+		ProposalRetryExplicitBudget, ProposalInspect, ProposalCancel,
+		ProposalInjectLineOffset, ProposalFullFileFallback, ProposalRepromptFullText,
+		ProposalAbortRun, ProposalForceBoundedPatch, ProposalSwitchModel,
+	} {
+		if strings.EqualFold(string(valid), s) {
+			return valid
+		}
+	}
+	return ProposalIntent(s)
+}
 
 // ProposalOption is one selectable entry on the decision surface. It carries
 // only presentation + intent data — NO functional callback.
@@ -385,6 +491,23 @@ func explicitBudgetFor(estimated int) int {
 // the TRUE cause of the closed gate.
 func BuildDecisionSurface(eval PreflightEvaluation, subcommand string) DecisionSurface {
 	opts := buildProposalOptions(eval, subcommand)
+	// HARD-BLOCK OPTION ENFORCEMENT (Task 2): when the runtime parks
+	// awaiting_human on a HARD-BLOCK failure (output exhausted twice,
+	// format failures >=2, ambiguous anchors, output-budget guardrail
+	// refusal), the surface MUST offer at least the three recovery
+	// options so the UI can never deadlock:
+	//   1) Abort Run & Return to Idle — graceful exit, no SIGINT
+	//   2) Force Bounded Patch — local SEARCH/REPLACE, bypass checks
+	//   3) Switch Model — re-target the run at a higher-budget model
+	// The function appends the missing ones idempotently (never
+	// duplicates an already-present intent), guaranteeing the surface
+	// is resolvable from the keyboard no matter what the policy
+	// produced. The hard-block options are policy-neutral: they are
+	// offered on every failure category that the recovery matrix
+	// can park awaiting_human on.
+	if isHardBlockCategory(ClassifyPreflightFailure(eval)) {
+		opts = appendHardBlockOptions(opts)
+	}
 	// MANDATORY INTERACTIVE FALLBACK (deadlock guard): the DecisionSurface is
 	// the ONLY resolution path for a parked awaiting_human barrier. It must
 	// NEVER carry an empty action set — an empty surface cannot be resolved via
@@ -457,4 +580,94 @@ func surfaceOptionsToEvents(s DecisionSurface) []events.DecisionSurfaceOption {
 		})
 	}
 	return out
+}
+
+// ── Hard-Block Recovery Options (Task 2) ───────────────────────────────────
+//
+// A HARD-BLOCK parking is one the recovery matrix cannot resolve
+// automatically: output exhausted twice, format failures >=2, ambiguous
+// anchors, output-budget guardrail refusal. The runtime parks at
+// awaiting_human with a typed HumanBoundaryProposal. An empty or
+// unresolvable surface would deadlock the run — the human would have no
+// way to recover short of SIGINT. The runtime's contract is:
+//
+//	1. The DecisionSurface MUST carry at least one selectable option.
+//	2. The three hard-block recovery options MUST be available on every
+//	   hard-block parking so the human can always:
+//	     - Abort Run & Return to Idle (no SIGINT required)
+//	     - Force Bounded Patch on the AST error offset
+//	     - Switch Model to one with a higher output token ceiling
+//	3. The options are appended idempotently: an already-present intent
+//	   is never duplicated, so callers may invoke the helper on a
+//	   pre-populated surface without surprises.
+
+// isHardBlockCategory reports whether the typed preflight failure category
+// is one the runtime parks awaiting_human on without an automatic
+// recovery. The classification is a closed taxonomy: budget_exceeded,
+// ast_corrupt, capability_denied, and the catch-all internal_error all
+// can park. The hard-block guarantee fires on the entire recoverable
+// surface so the human always sees the escape options.
+func isHardBlockCategory(c PreflightFailureCategory) bool {
+	switch c {
+	case PreflightBudgetExceeded, PreflightASTCorrupt,
+		PreflightCapabilityDenied, PreflightInternalError:
+		return true
+	default:
+		return false
+	}
+}
+
+// appendHardBlockOptions PREPENDS the three hard-block recovery options
+// to an existing option list, preserving the original ordering of the
+// policy-derived options, and skipping any intent that is already
+// present. It is the canonical helper the BuildDecisionSurface caller
+// and the recovery matrix both reach for when they need to ensure a
+// parked surface is keyboard-resolvable.
+//
+// The options are prepended — not appended — so the human sees the safe
+// default (Abort Run & Return to Idle) as Option [1] on the TUI modal,
+// exactly as the directive specifies. The original policy options
+// follow, retaining the $prompt/$hot semantics the policy layer chose.
+func appendHardBlockOptions(opts []ProposalOption) []ProposalOption {
+	hardBlockOptions := []ProposalOption{
+		{
+			ID:          "abort_run",
+			Label:       "Abort Run & Return to Idle",
+			Description: "Gracefully cancel the objective and return the session to a clean idle state — no SIGINT required.",
+			Intent:      ProposalAbortRun,
+		},
+		{
+			ID:          "force_bounded_patch",
+			Label:       "Force Bounded Patch",
+			Description: "Override the syntax check and attempt a strictly local SEARCH/REPLACE patch on the AST error offset.",
+			Intent:      ProposalForceBoundedPatch,
+		},
+		{
+			ID:          "switch_model",
+			Label:       "Switch Model",
+			Description: "Open the model picker to re-target the run at a model with a higher output token ceiling.",
+			Intent:      ProposalSwitchModel,
+		},
+	}
+	existing := make(map[ProposalIntent]struct{}, len(opts))
+	for _, opt := range opts {
+		existing[opt.Intent] = struct{}{}
+	}
+	out := make([]ProposalOption, 0, len(opts)+len(hardBlockOptions))
+	for _, hbo := range hardBlockOptions {
+		if _, ok := existing[hbo.Intent]; ok {
+			continue
+		}
+		out = append(out, hbo)
+	}
+	out = append(out, opts...)
+	return out
+}
+
+// EnsureHardBlockOptions is the public entry point. It is exported so the
+// recovery matrix, the surface builder, and the test suite share one
+// vocabulary for the hard-block guarantee. Callers may pass any surface
+// state; the function is idempotent.
+func EnsureHardBlockOptions(opts []ProposalOption) []ProposalOption {
+	return appendHardBlockOptions(opts)
 }

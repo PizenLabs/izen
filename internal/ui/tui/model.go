@@ -16,6 +16,7 @@ package tui
 
 import (
 	"context"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -93,6 +94,10 @@ type Model struct {
 	proposalModel *ProposalModel
 	resume        ResumeProposalFunc
 	width         int
+	// lastSurface is the last DecisionSurface that activated the modal. It is
+	// retained so an invalid proposal intent can re-publish the surface and
+	// force an immediate redraw without dropping to an empty prompt bar.
+	lastSurface *DecisionSurface
 }
 
 // NewModel returns a dispatcher with no active modal. resume is the
@@ -148,7 +153,22 @@ func (m *Model) handleProposal(msg HumanBoundaryProposalMsg) (*Model, tea.Cmd) {
 	// keyboard input on it. It must NEVER degrade to a static pause.
 	m.activeModal = ModalProposal
 	m.proposalModel = NewProposalModel(*msg.DecisionSurface)
+	// Retain surface for TASK 2 republish on invalid intent.
+	m.lastSurface = msg.DecisionSurface
 	return m, m.proposalModel.Init()
+}
+
+// PublishDecisionSurface forces an immediate TUI redraw of the active
+// DecisionSurface. It is the explicit republish the driver calls after an
+// ErrInvalidProposalIntent so the modal stays rendered and responsive
+// without requiring a manual interrupt.
+func (m *Model) PublishDecisionSurface(surface *DecisionSurface) {
+	if m == nil || surface == nil {
+		return
+	}
+	m.activeModal = ModalProposal
+	m.proposalModel = NewProposalModel(*surface)
+	m.lastSurface = surface
 }
 
 // Update implements the Bubble Tea event loop. It routes the HumanBoundary
@@ -217,6 +237,23 @@ func (m *Model) Update(msg tea.Msg) (*Model, tea.Cmd) {
 				}
 			}
 		}
+		return m, nil
+
+	case ProposalResumedMsg:
+		// TASK 2: Guarantee DecisionSurface stays rendered on ErrInvalidProposalIntent.
+		// The driver republished the surface; the TUI must force an immediate redraw
+		// and stay responsive (do NOT drop to empty prompt bar).
+		if msg.Err != nil && strings.Contains(msg.Err.Error(), "invalid proposal intent") {
+			if m.lastSurface != nil {
+				m.activeModal = ModalProposal
+				m.proposalModel = NewProposalModel(*m.lastSurface)
+				// Keep the surface retained for subsequent retries.
+			}
+			// The error is handled as a non-blocking warning; the modal stays active
+			// so the human can choose again. No state transition or preflight occurred.
+			return m, nil
+		}
+		// For successful intents, the modal stays dismissed (already ModalNone).
 		return m, nil
 	}
 	return m, nil

@@ -115,11 +115,11 @@ func (a *ExecutorAdapter) ReadTargetFile(target string) ([]byte, bool) {
 	if a == nil || a.root == "" || target == "" {
 		return nil, false
 	}
-	data, err := os.ReadFile(filepath.Join(a.root, filepath.FromSlash(target)))
-	if err != nil {
+	if a.executor == nil {
 		return nil, false
 	}
-	return data, true
+	data := a.executor.SnapshotContent(target)
+	return data, data != nil
 }
 
 // RestoreTargets restores exact file contents under the workspace root. It is
@@ -260,7 +260,7 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		// target (the false-positive preflight_infeasible leak).
 		execReq.StagedSubTasks = staged
 	}
-	if strategyPtr != nil && (req.RecoveryStrategy == "bounded_patch" || req.MutationStrategy == "bounded_patch" || req.MutationStrategy == "syntax_repair" || req.AllowASTBypass) {
+	if strategyPtr != nil && (req.RecoveryStrategy == "bounded_patch" || req.MutationStrategy == "bounded_patch" || req.MutationStrategy == "syntax_repair" || req.AllowASTBypass || req.MutationStrategy == string(ProposalInjectLineOffset) || req.RecoveryStrategy == string(ProposalInjectLineOffset)) {
 		// Material artifact-contract change: the recovery attempt MUST produce
 		// a structured bounded patch. The search_replace kind is enforced by
 		// the executor at the artifact boundary — the model is never asked to
@@ -270,16 +270,10 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		mod.Artifact.Bounded = true
 		mod.Artifact.Kind = "search_replace"
 		mod.StrategyReason += " [recovery: bounded_patch after truncation]"
+		// Inject line-offset evidence is already appended to req.Evidence above.
 		execReq.Strategy = &mod
 	}
-	if strategyPtr == nil && (req.RecoveryStrategy == "bounded_patch" || req.MutationStrategy == "bounded_patch" || req.MutationStrategy == "syntax_repair" || req.AllowASTBypass) {
-		// The raw prompt could not be re-selected (the loop carries an
-		// explicit human/decomposition-scoped target), but the recovery
-		// protocol is still authoritative: hand the executor a minimal
-		// targeted-mutation profile whose artifact contract is the bounded
-		// patch itself. Without this the request would fall back to the
-		// unbounded full-artifact protocol and re-trip the Boundary-2
-		// preflight guard the recovery is escaping.
+	if strategyPtr == nil && (req.RecoveryStrategy == "bounded_patch" || req.MutationStrategy == "bounded_patch" || req.MutationStrategy == "syntax_repair" || req.AllowASTBypass || req.MutationStrategy == string(ProposalInjectLineOffset)) {
 		execReq.Strategy = &strategy.ExecutionStrategyProfile{
 			Strategy:       strategy.TargetedMutation,
 			ModelRequired:  true,
@@ -289,6 +283,42 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 			ContextPolicy:   strategy.ContextPolicyTargetFileOnly,
 			MaxOutputTokens: effectiveMax,
 		}
+	}
+	// Full-file fallback: human-authorized overwrite (overwrite_allowed=true).
+	// Bypass RMAH Tier 3 bounded patch requirement and route to direct writer.
+	if req.RecoveryStrategy == "full_file_fallback" || req.MutationStrategy == "full_file_fallback" || req.MutationStrategy == string(ProposalFullFileFallback) {
+		if strategyPtr != nil {
+			mod := *strategyPtr
+			mod.Artifact.Bounded = false
+			mod.Artifact.Kind = "full_file"
+			mod.StrategyReason += " [full-file fallback authorized: overwrite_allowed=true]"
+			execReq.Strategy = &mod
+		} else {
+			execReq.Strategy = &strategy.ExecutionStrategyProfile{
+				Strategy:        strategy.TargetedMutation,
+				ModelRequired:   true,
+				StrategyReason:  "full-file fallback on explicit human authorization (overwrite_allowed=true)",
+				Artifact:        strategy.ArtifactContract{Kind: "full_file", Bounded: false, Description: "human-authorized full-file overwrite"},
+				ContextPolicy:   strategy.ContextPolicyTargetFileOnly,
+				MaxOutputTokens: effectiveMax,
+			}
+		}
+		// Propagate the focus lines if set, but do not enforce bounded patch.
+	}
+	// Reprompt with full text context for hallucinated anchor.
+	if req.MutationStrategy == "reprompt_full_text" || req.MutationStrategy == string(ProposalRepromptFullText) {
+		if strategyPtr != nil {
+			mod := *strategyPtr
+			mod.Artifact.Bounded = false
+			mod.Artifact.Kind = "full_file"
+			mod.StrategyReason += " [reprompt full text context for hallucinated anchor]"
+			execReq.Strategy = &mod
+		}
+	}
+	// Propagate line-offset focus bounds for inject_line_offset recovery.
+	if req.FocusStartLine > 0 && req.FocusEndLine >= req.FocusStartLine {
+		execReq.FocusStartLine = req.FocusStartLine
+		execReq.FocusEndLine = req.FocusEndLine
 	}
 	res, err := a.executor.Execute(ctx, execReq)
 	if err != nil && res == nil {

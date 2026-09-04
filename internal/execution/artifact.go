@@ -143,6 +143,16 @@ func (p *V3ArtifactPipeline) InspectReasoning(raw string) {
 	}
 }
 
+// ValidateContentForPath validates content for the given file path using the
+// shared V3 pipeline. It is the public entry point for callers outside this
+// package (e.g., the RMAH Tier 2 AST baseline verifier) that need to check
+// whether content parses cleanly for a registered language. attempts is the
+// number of prior retries (0 = first attempt). Unregistered languages pass
+// unvalidated.
+func ValidateContentForPath(path string, content []byte, attempts int) ArtifactGateResult {
+	return v3Artifact.ValidateContent(path, content, attempts)
+}
+
 // ParseContracts runs the strict contract parser over raw and returns the
 // extracted artifacts, or extractor.ErrContractViolation when raw carries no
 // valid artifact contract.

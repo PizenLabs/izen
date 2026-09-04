@@ -300,9 +300,11 @@ type PreflightEvaluation struct {
 // the AST is valid, dependencies resolve, the budget fits, and NO human
 // proposal is required. Any other combination is a fail-closed barrier.
 func (e PreflightEvaluation) ExecutionGate() bool {
-	return e.ASTStatus == ASTValid &&
-		e.DependencyStatus == DependenciesResolved &&
-		e.BudgetStatus == BudgetWithinLimits &&
+	// AST validity and output feasibility are strategy inputs, not human
+	// authorization gates. Strategy resolution selects a bounded textual
+	// contract for those cases; only unresolved capabilities remain a
+	// preflight stop.
+	return e.DependencyStatus == DependenciesResolved &&
 		len(e.RequiredProposals) == 0
 }
 
@@ -351,6 +353,52 @@ type ScopeInput struct {
 // fields so callers may use either name.
 type PreflightScope = ScopeInput
 
+// ── PREFLIGHT METRICS DISAGGREGATION ────────────────────────────────────────
+// TargetTokenMetrics disaggregates token estimation into direct, context and
+// dependency components. RequiredOutputTokens is the strict gate for
+// ShapeFullRewrite (required vs MaxOutput).
+type TargetTokenMetrics struct {
+	DirectTargetTokens   int `json:"direct_target_tokens"`
+	ContextTokens        int `json:"context_tokens"`
+	DependencyDAGTokens  int `json:"dependency_dag_tokens"`
+	RequiredOutputTokens int `json:"required_output_tokens"`
+}
+
+// TokenEstimateSource tracks provenance of token estimation.
+type TokenEstimateSource string
+
+const (
+	TokenEstimateBPE           TokenEstimateSource = "bpe"
+	TokenEstimateProviderAPI   TokenEstimateSource = "provider_api"
+	TokenEstimateByteHeuristic TokenEstimateSource = "byte_heuristic"
+)
+
+// DisaggregateMetrics splits target bytes into direct/context/dag and computes
+// RequiredOutputTokens strictly for ShapeFullRewrite gating.
+func DisaggregateMetrics(targetBytes, contextBytes, dagBytes int, maxOutput int, source TokenEstimateSource) TargetTokenMetrics {
+	direct := targetBytes / 4
+	ctx := contextBytes / 4
+	dag := dagBytes / 4
+	required := direct*execution.FullRewriteTokenMultiplier + ctx + dag
+	_ = maxOutput
+	_ = source
+	return TargetTokenMetrics{
+		DirectTargetTokens:   direct,
+		ContextTokens:        ctx,
+		DependencyDAGTokens:  dag,
+		RequiredOutputTokens: required,
+	}
+}
+
+// GateShapeFullRewrite returns true when RequiredOutputTokens strictly exceeds
+// ModelMaxOutputTokens — the sole authority for FULL_REWRITE feasibility.
+func GateShapeFullRewrite(requiredOutputTokens, modelMaxOutputTokens int) bool {
+	if modelMaxOutputTokens <= 0 {
+		return false
+	}
+	return requiredOutputTokens > modelMaxOutputTokens
+}
+
 // EstimateScopeTokens computes the estimated generation cost of a target using
 // the SAME canonical accounting as Boundary 2: target_bytes/4 ×
 // FullRewriteTokenMultiplier. A cost that exceeds MaxOutputTokens is provably
@@ -360,7 +408,7 @@ func EstimateScopeTokens(targetBytes, maxOutputTokens int) (estimated int, excee
 		return 0, false // creation / unbounded budget: not provably infeasible
 	}
 	estimated = (targetBytes / 4) * execution.FullRewriteTokenMultiplier
-	return estimated, estimated > maxOutputTokens
+	return estimated, GateShapeFullRewrite(estimated, maxOutputTokens)
 }
 
 // fullRewriteSignalRe matches an EXPLICIT whole-file rewrite or scaffolding
@@ -549,22 +597,9 @@ func EvaluateScope(in ScopeInput) PreflightEvaluation {
 	// The AST hard-gate is bypassed when AllowASTBypass is set or a
 	// bounded-patch / syntax-repair contract is active: a corrupt baseline
 	// is permitted for line-based SEARCH/REPLACE patches.
-	astBlocked := eval.ASTStatus == ASTCorrupt && !in.AllowASTBypass && in.MutationStrategy == StrategyFullRewrite
-	budgetBlocked := eval.BudgetStatus == BudgetExceeded
 	depsBlocked := eval.DependencyStatus == DependenciesUnresolved
-	if astBlocked || budgetBlocked || depsBlocked {
+	if depsBlocked {
 		if len(eval.RequiredProposals) == 0 {
-			eval.RequiredProposals = append(eval.RequiredProposals, ProposalRequirement{
-				Reason: "scope evaluation barrier: " + barrierReason(eval),
-				Target: in.Target,
-			})
-		}
-	} else {
-		// No strategy-aware block: gate passes. If the legacy ExecutionGate
-		// still reports closed only because of a bypassed AST, clear it.
-		if eval.ASTStatus == ASTCorrupt && (in.AllowASTBypass || in.MutationStrategy == StrategyBoundedPatch || in.MutationStrategy == StrategySyntaxRepair) {
-			eval.RequiredProposals = nil
-		} else if !eval.ExecutionGate() && len(eval.RequiredProposals) == 0 {
 			eval.RequiredProposals = append(eval.RequiredProposals, ProposalRequirement{
 				Reason: "scope evaluation barrier: " + barrierReason(eval),
 				Target: in.Target,

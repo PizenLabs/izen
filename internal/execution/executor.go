@@ -458,7 +458,8 @@ type RuntimeExecutor struct {
 	// observeSnapshot is the Observation-phase memory cache: target → content.
 	// It is populated ONCE per Execute via observeTargets and is the single
 	// byte source for compileContext, invokeMutation, and verification — no
-	// repetitive os.ReadFile occurs. It is cleared at the end of Execute.
+	// repetitive os.ReadFile occurs. It survives recovery attempts and is
+	// invalidated after mutations.
 	observeSnapshot   map[string][]byte
 	observeSnapshotMu sync.RWMutex
 }
@@ -485,12 +486,63 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 		artifactValidator: validator,
 		pending:           make(map[string]*pendingMutation),
 	}
+	// Wire the normalizer to consume the observe snapshot cache, eliminating
+	// redundant os.ReadFile disk hits during artifact validation. The closure
+	// captures x but is only called during Execute (after x is fully
+	// constructed and observeTargets has populated the cache).
+	validator.SetTargetLoader(func(target string) (string, error) {
+		if data, ok := x.getSnapshotContent(target); ok {
+			return string(data), nil
+		}
+		return "", os.ErrNotExist
+	})
+	// Wire the mutation cache invalidation hook: after every successful file
+	// write the PatchManager purges the observe snapshot cache keys for the
+	// target. The next observation performs a single pull-through os.ReadFile
+	// and re-populates the cache with verified disk truth. This eliminates
+	// stale-read conditions where post-mutation verification or re-validation
+	// reads pre-mutation bytes from memory after a file has been modified on
+	// disk.
+	x.patches.SetOnMutation(func(target string, _ []byte) {
+		x.invalidateSnapshot(target)
+	})
 	if langID != "" {
 		x.verifier = NewLanguageVerifier(root, langID)
 	} else {
 		x.verifier = NewVerifier(root)
 	}
 	return x
+}
+
+// invalidateSnapshot purges the observe snapshot cache keys for target. It is
+// the callback wired to PatchManager.onMutation and is called immediately
+// after every successful file write. The path key is DELETED (never
+// re-populated with caller-supplied bytes): writing updated byte slices
+// directly into the cache risks path-alias divergence because PatchManager
+// uses canonical absolute paths while the observe cache is keyed by relative
+// workspace paths. After deletion the next getSnapshotContent performs a
+// single pull-through os.ReadFile and re-populates the cache with verified
+// disk truth.
+func (x *RuntimeExecutor) invalidateSnapshot(target string) {
+	x.observeSnapshotMu.Lock()
+	defer x.observeSnapshotMu.Unlock()
+	if x.observeSnapshot == nil {
+		return
+	}
+	normalizedPath := x.resolveSnapshotPath(target)
+	delete(x.observeSnapshot, target)
+	delete(x.observeSnapshot, filepath.Base(target))
+	delete(x.observeSnapshot, normalizedPath)
+}
+
+// resolveSnapshotPath returns the canonical absolute path for a target. It
+// treats an already-absolute target as canonical (the PatchManager spelling)
+// and joins relative workspace targets against the executor root.
+func (x *RuntimeExecutor) resolveSnapshotPath(target string) string {
+	if filepath.IsAbs(target) {
+		return filepath.Clean(target)
+	}
+	return filepath.Join(x.root, target)
 }
 
 // SetAdmittedCapabilities replaces the capability set the runtime's admission
@@ -572,52 +624,64 @@ func (x *RuntimeExecutor) SetSessionResolver(fn func() string) {
 	x.sessionID = fn
 }
 
-// observeTargets captures each target's bytes ONCE (Observation phase) and
-// caches them as the single byte source for the execution. It emits the
-// "[runtime] reading %s" log exactly once per target — verification and
-// extraction consume the cached []byte via SnapshotContent without repeating
-// os.ReadFile.
+// observeTargets captures each target's bytes during Observation and caches
+// them as the single byte source for the execution. The cache persists across
+// recovery attempts; mutation invalidation is the explicit boundary that
+// permits a fresh disk read.
 func (x *RuntimeExecutor) observeTargets(targets []string) {
-	cache := make(map[string][]byte)
 	for _, t := range targets {
-		path := filepath.Join(x.root, t)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		x.emitContextActivity(t, len(data))
-		cache[t] = data
-		cache[path] = data
-		cache[filepath.Base(t)] = data
+		x.getSnapshotContent(t)
 	}
-	x.observeSnapshotMu.Lock()
-	x.observeSnapshot = cache
-	x.observeSnapshotMu.Unlock()
 }
 
+// getSnapshotContent returns the snapshot bytes for a target. On a cache hit
+// it returns the cached bytes; on a miss it performs a single pull-through
+// os.ReadFile against the canonical absolute path and re-populates the cache
+// with verified disk truth. The pull-through guarantees that a target purged
+// by invalidateSnapshot is re-observed from disk exactly once — a
+// path-alias divergence can never resurrect stale bytes.
 func (x *RuntimeExecutor) getSnapshotContent(target string) ([]byte, bool) {
 	x.observeSnapshotMu.RLock()
-	defer x.observeSnapshotMu.RUnlock()
-	if x.observeSnapshot == nil {
+	if x.observeSnapshot != nil {
+		if data, ok := x.observeSnapshot[target]; ok {
+			x.observeSnapshotMu.RUnlock()
+			x.emitSnapshotActivity(target, len(data), false)
+			return data, true
+		}
+		if data, ok := x.observeSnapshot[filepath.Base(target)]; ok {
+			x.observeSnapshotMu.RUnlock()
+			x.emitSnapshotActivity(target, len(data), false)
+			return data, true
+		}
+		path := x.resolveSnapshotPath(target)
+		if data, ok := x.observeSnapshot[path]; ok {
+			x.observeSnapshotMu.RUnlock()
+			x.emitSnapshotActivity(target, len(data), false)
+			return data, true
+		}
+	}
+	x.observeSnapshotMu.RUnlock()
+
+	// ── Pull-through: verified disk truth on a miss ────────────────────
+	path := x.resolveSnapshotPath(target)
+	data, err := os.ReadFile(path)
+	if err != nil {
 		return nil, false
 	}
-	if data, ok := x.observeSnapshot[target]; ok {
-		return data, true
-	}
-	if data, ok := x.observeSnapshot[filepath.Base(target)]; ok {
-		return data, true
-	}
-	path := filepath.Join(x.root, target)
-	if data, ok := x.observeSnapshot[path]; ok {
-		return data, true
-	}
-	return nil, false
-}
-
-func (x *RuntimeExecutor) clearObserveSnapshot() {
+	x.emitSnapshotActivity(target, len(data), true)
 	x.observeSnapshotMu.Lock()
-	x.observeSnapshot = nil
+	if x.observeSnapshot == nil {
+		x.observeSnapshot = make(map[string][]byte)
+	}
+	if d, ok := x.observeSnapshot[path]; ok {
+		data = d
+	} else {
+		x.observeSnapshot[target] = data
+		x.observeSnapshot[filepath.Base(target)] = data
+		x.observeSnapshot[path] = data
+	}
 	x.observeSnapshotMu.Unlock()
+	return data, true
 }
 
 // SnapshotContent returns the snapshot bytes for a target, if observed.
@@ -681,6 +745,78 @@ var ErrProviderModelMismatch = errors.New("executor: provider/model mismatch")
 var ErrArtifactRejected = errors.New("executor: mutation artifact rejected")
 
 var ErrArtifactRetryableRejected = errors.New("executor: mutation artifact rejected with retry directive")
+
+// ErrNonRetryableArtifactError is the circuit-breaker sentinel for
+// ambiguous-anchor failures that cannot be resolved without explicit
+// line-offset context. It wraps ErrArtifactRejected but signals the
+// autonomy driver to BYPASS the retry/recovery loop and park at
+// DecisionSurface awaiting_human with options:
+// [1] Inject line-offset bounds to prompt
+// [2] Fall back to full-file write authorization.
+// Unless line-offset context is injected, an ambiguous anchor MUST NOT
+// trigger a duplicate LLM call (max 1 API request).
+var ErrNonRetryableArtifactError = errors.New("executor: non-retryable artifact error — ambiguous anchors require line-offset")
+
+// ErrHallucinatedAnchorError is the sentinel for N=0 hallucinated anchor
+// failures (strings.Count == 0). It is the zero-match counterpart to the
+// ambiguous (N>1) sentinel and is handled by one strict automatic retry.
+var ErrHallucinatedAnchorError = errors.New("executor: hallucinated anchor — zero match")
+
+// ErrPhysicalOutputBudgetBreach is terminal: a strict-patch recovery has
+// already consumed its single retry and must not open a full-file fallback.
+var ErrPhysicalOutputBudgetBreach = errors.New("executor: Physical Output Budget Breach")
+
+// IsNonRetryableArtifactError reports whether err is a non-retryable
+// artifact failure (ambiguous anchors without line-offset context).
+func IsNonRetryableArtifactError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrNonRetryableArtifactError) || errors.Is(err, ErrHallucinatedAnchorError) {
+		return true
+	}
+	// Ambiguous anchor is non-retryable unless the error already carries
+	// line-offset injection.
+	if errors.Is(err, ErrAmbiguousAnchor) {
+		lower := strings.ToLower(err.Error())
+		return !strings.Contains(lower, "line-offset")
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "ambiguous anchor") {
+		return !strings.Contains(lower, "line-offset")
+	}
+	if strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated anchor") {
+		return true
+	}
+	return false
+}
+
+// IsHallucinatedAnchorError reports whether err is the N=0 zero-match sentinel.
+func IsHallucinatedAnchorError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrHallucinatedAnchorError) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated anchor")
+}
+
+// IsAmbiguousAnchorsError reports whether err is the N>1 ambiguous sentinel.
+func IsAmbiguousAnchorsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrNonRetryableArtifactError) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "ambiguous anchor") || strings.Contains(lower, "ambiguous anchors") {
+		return !strings.Contains(lower, "zero match")
+	}
+	return false
+}
 
 // ErrNoOpMutation signals a bounded-patch invocation whose model answered with
 // the NO_CHANGES_REQUIRED sentinel: a raw no-op CLAIM was detected. Detection
@@ -916,7 +1052,6 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// single byte source for compileContext, invokeMutation, and verification.
 	// All downstream stages consume SnapshotContent() without repeating os.ReadFile.
 	x.observeTargets(targets)
-	defer x.clearObserveSnapshot()
 
 	// ── ADMISSION III: CONTRACT IDENTITY RESOLUTION (Phase 2 P2) ──────
 	// The execution's immutable identity is derived from the VERIFIED context
@@ -1104,6 +1239,32 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 
 	// ── 7. Targeted mutation: per-target model invocation ──────────────
 	patches, invs, diffs, ingTrace, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
+	if err != nil && IsHallucinatedAnchorError(err) && req.RecoveryAttempt < 1 {
+		// A zero-match SEARCH is an engine-recoverable anchor hallucination.
+		// Re-prompt exactly once under the strict line-anchor contract; this
+		// path never offers or spends on a full-file fallback.
+		retryReq := req
+		retryReq.RecoveryAttempt = 1
+		retryReq.RecoveryStrategy = "strict_patch"
+		retryProfile := profile
+		retryProfile.Artifact.Kind = "search_replace"
+		retryProfile.Artifact.Bounded = true
+		retryProfile.StrategyReason += "; strict line-anchor recovery"
+		retryPatches, retryInvs, retryDiffs, retryTrace, retryErr := x.invokeMutation(ctx, retryReq, requestID, retryProfile, targets, g)
+		invs = append(invs, retryInvs...)
+		if retryTrace != nil {
+			ingTrace = retryTrace
+		}
+		if retryErr != nil {
+			err = fmt.Errorf("%w: strict line-anchor retry failed: %w", ErrPhysicalOutputBudgetBreach, retryErr)
+			patches, diffs = nil, nil
+		} else {
+			patches, diffs, err = retryPatches, retryDiffs, nil
+		}
+	}
+	if err != nil && IsHallucinatedAnchorError(err) && req.RecoveryAttempt >= 1 {
+		err = fmt.Errorf("%w: strict line-anchor attempt exhausted: %w", ErrPhysicalOutputBudgetBreach, err)
+	}
 	if ingTrace != nil {
 		res.IngestionTrace = ingTrace
 	}
@@ -1701,24 +1862,42 @@ func (x *RuntimeExecutor) selectStrategy(_ context.Context, req ExecuteRequest) 
 		if req.MaxOutputTokens > 0 {
 			profile.MaxOutputTokens = req.MaxOutputTokens
 		}
-		return profile, nil
+		return x.resolveLocalConstraints(profile, req), nil //nolint:contextcheck // document syntax validation is pure content checking, no context needed
 	}
 	// Direct runtime callers that resolved an explicit target without a
 	// gateway profile target a bounded mutation.
 	if req.Target != "" || len(req.Targets) > 0 {
-		return strategy.ExecutionStrategyProfile{
+		return x.resolveLocalConstraints(strategy.ExecutionStrategyProfile{ //nolint:contextcheck // document syntax validation is pure content checking, no context needed
 			Strategy:        strategy.TargetedMutation,
 			ModelRequired:   true,
 			StrategyReason:  "explicit resolved target submitted to the runtime",
 			MaxOutputTokens: req.MaxOutputTokens,
-		}, nil
+		}, req), nil
 	}
 	deps := strategy.Deps{Root: x.root, Workspace: executorWorkspace{root: x.root}}
 	profile := strategy.Select(req.Prompt, deps)
 	if req.MaxOutputTokens > 0 {
 		profile.MaxOutputTokens = req.MaxOutputTokens
 	}
-	return profile, nil
+	return x.resolveLocalConstraints(profile, req), nil //nolint:contextcheck // document syntax validation is pure content checking, no context needed
+}
+
+func (x *RuntimeExecutor) resolveLocalConstraints(profile strategy.ExecutionStrategyProfile, req ExecuteRequest) strategy.ExecutionStrategyProfile {
+	maxOut := effectiveMaxOutput(req.MaxOutputTokens, &profile)
+	target := req.Target
+	if target == "" && len(req.Targets) > 0 {
+		target = req.Targets[0]
+	}
+	if target == "" {
+		return profile
+	}
+	data, err := os.ReadFile(filepath.Join(x.root, target))
+	if err != nil || len(data) == 0 {
+		return profile
+	}
+	required := (len(data) / 4) * FullRewriteTokenMultiplier
+	astCorrupt := ValidateDocumentSyntax(target, data) != nil
+	return strategy.ResolveConstraints(profile, astCorrupt, required, maxOut)
 }
 
 // compileContext assembles the minimum-sufficient context envelope for the
@@ -1745,16 +1924,8 @@ func (x *RuntimeExecutor) compileContext(profile strategy.ExecutionStrategyProfi
 		var data []byte
 		if cached, ok := x.getSnapshotContent(t); ok {
 			data = cached
-			// Snapshot already emitted in Observe phase — do not re-emit.
 		} else {
-			path := filepath.Join(x.root, t)
-			d, err := os.ReadFile(path)
-			if err != nil {
-				continue
-			}
-			// Fallback read only when no snapshot was observed.
-			x.emitContextActivity(t, len(d))
-			data = d
+			continue
 		}
 		if len(data) > maxExecutorContextBytes {
 			data = data[:maxExecutorContextBytes]
@@ -1823,25 +1994,60 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	if recoveryLabel == "" {
 		recoveryLabel = "none"
 	}
+	// Resolve the per-target output budget up front. The guardrail reads the
+	// same value the provider call will use, so a refusal here is
+	// deterministic and the recovery matrix can re-derive the ceiling from
+	// the same source.
+	maxOut := effectiveMaxOutput(req.MaxOutputTokens, &profile)
 	for _, target := range targets {
 		var data []byte
-		var readErr error
 		if cached, ok := x.getSnapshotContent(target); ok {
 			data = cached
-			// Snapshot already emitted in Observe phase — consume []byte slice reference, no os.ReadFile
-		} else {
-			path := filepath.Join(x.root, target)
-			d, err := os.ReadFile(path)
-			if err != nil && !os.IsNotExist(err) {
-				return nil, nil, nil, nil, fmt.Errorf("executor: read target %s: %w", target, err)
-			}
-			data = d
-			readErr = err
-			// Only emit when actually reading from disk (fallback, no snapshot)
-			x.emitContextActivity(target, len(data))
 		}
-		_ = readErr
 		original := string(data)
+
+		// ── HARD OUTPUT-BUDGET GUARDRAIL (Task 1) ───────────────────
+		// A FULL_REWRITE-shaped strategy is REFUSED when the target's
+		// estimated output tokens exceed the model's max_output ceiling.
+		// Dispatching in that state is GUARANTEED to truncate at the
+		// output gate (Boundary 3 finish_reason=length) — every attempt
+		// is wasted, the run cycles, and the surface republishes. The
+		// executor raises ErrOutputBudgetExceeded as a typed sentinel;
+		// the runtime recovery matrix classifies it as
+		// SubtypeOutputExhausted and switches to BOUNDED_PATCH on the
+		// AST error offset. Bounded-patch and inspect-only dispatches
+		// are NEVER refused (their worst-case response fits any budget).
+		//
+		// The guardrail is also SKIPPED for staged-decomposition
+		// submissions: Boundary 2 already judged every sub-task
+		// individually and approved the per-unit budget, so the
+		// monolithic target estimate is not authoritative for the run.
+		if len(req.StagedSubTasks) == 0 {
+			shape := ShapeBoundedPatch
+			if !patchOnly {
+				shape = ShapeFullRewrite
+			}
+			if guardErr := (BudgetGuardrail{
+				TargetTokens:    EstimateTargetTokens(original),
+				MaxOutputTokens: maxOut,
+				Shape:           shape,
+				Target:          target,
+			}).Check(); guardErr != nil {
+				// Per-target guardrail refusal: surface a typed outcome
+				// so the recovery matrix's SubtypeOutputExhausted
+				// branch transitions the contract to BOUNDED_PATCH. We
+				// never silently re-dispatch as full_rewrite.
+				if errors.Is(guardErr, ErrOutputBudgetExceeded) {
+					log.Printf("[execution] request=%s target=%s guardrail=BUDGET_EXCEEDED estimated_tokens=%d max_output=%d shape=%s — refusing FULL_REWRITE dispatch",
+						requestID, target, EstimateTargetTokens(original), maxOut, shape)
+					return nil, nil, nil, trace, guardErr
+				}
+				if errors.Is(guardErr, ErrTargetEmpty) {
+					return nil, nil, nil, trace, guardErr
+				}
+				return nil, nil, nil, trace, guardErr
+			}
+		}
 
 		system := boundedMutationSystemPrompt()
 		outputContract := "full_file_or_patch"
@@ -1892,7 +2098,6 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			contextBytes = len(window.content)
 			judgedContent = window.content
 		}
-		maxOut := effectiveMaxOutput(req.MaxOutputTokens, &profile)
 		disableReasoning := false
 		if patchOnly {
 			// Reasoning models spend the SHARED output budget on hidden
@@ -1996,9 +2201,77 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// full-artifact attempt instead of a relabeled retry.
 			patched, ok := ExtractBoundedPatch(original, raw)
 			if !ok {
-				return nil, invs, nil, trace, fmt.Errorf("%w: %s: bounded patch contract requires SEARCH/REPLACE blocks or unified diff hunks; full-file or unstructured output rejected", ErrArtifactRetryableRejected, target)
+				// Circuit breaker: if the SEARCH anchor match is 0 (hallucinated)
+				// or >1 (ambiguous) without line-offset, fail fast without
+				// invoking RMAH retry. This prevents duplicate LLM calls.
+				// N=0 → HallucinatedAnchorError: [1] Fall back to full-file + [2] Re-prompt full text
+				// N>1 → NonRetryable (ambiguous): [1] Inject line-offset + [2] full-file fallback
+				if strings.Contains(raw, "<<<<<<< SEARCH") && !strings.Contains(strings.ToLower(raw), "line-offset") {
+					if blocks := ParseSearchReplaceBlocks(raw); len(blocks) > 0 {
+						for _, b := range blocks {
+							if b.search != "" {
+								if cnt := strings.Count(original, b.search); cnt != 1 {
+									if cnt == 0 {
+										return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: hallucinated anchor — zero match — SEARCH matches 0 regions", ErrHallucinatedAnchorError, ErrArtifactRejected, target)
+									}
+									return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: ambiguous anchor — SEARCH matches %d regions — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrNonRetryableArtifactError, ErrArtifactRejected, target, cnt)
+								}
+								// Also check trimmed match via ResolveAnchors path.
+								if _, _, aerr := func() (int, int, error) {
+									lines := strings.Split(b.search, "\n")
+									return ResolveAnchors(lines, original)
+								}(); aerr != nil {
+									if errors.Is(aerr, ErrAmbiguousAnchor) {
+										return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %w — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrNonRetryableArtifactError, ErrArtifactRejected, target, aerr)
+									}
+									if errors.Is(aerr, ErrFormatRejected) {
+										// Zero-match via ResolveAnchors (format rejected = not found)
+										lower := strings.ToLower(aerr.Error())
+										if strings.Contains(lower, "anchor not found") || strings.Contains(lower, "empty search") {
+											return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: hallucinated anchor — zero match — %w", ErrHallucinatedAnchorError, ErrArtifactRejected, target, aerr)
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+				// RMAH Tier 2 fallback: free-tier models may return raw code
+				// fences instead of SEARCH/REPLACE blocks. Attempt the RMAH
+				// pipeline (Tier 1 already failed via ExtractBoundedPatch;
+				// Tier 2 extracts from fenced blocks + AST baseline check).
+				rmahResult := rmahPipeline.Process(raw, target, original)
+				if rmahResult.Passed {
+					// RMAH Tier 2 produced a candidate that passed AST
+					// verification — route it through the pre-existing
+					// artifact boundary before accepting it.
+					modified = rmahResult.Candidate
+				} else {
+					// RMAH did not produce a usable candidate (Tier 1 failed,
+					// Tier 2 rejected or found nothing). The bounded patch
+					// contract is unsatisfied — the retry loop gets the
+					// strict contract feedback.
+					detail := "bounded patch contract requires SEARCH/REPLACE blocks or unified diff hunks; full-file or unstructured output rejected"
+					if rmahResult.Rejected && rmahResult.RejectReason != "" {
+						detail = fmt.Sprintf("%s; RMAH: %s", detail, rmahResult.RejectReason)
+					}
+					// Circuit breaker: classify N=0 (hallucinated) vs N>1 (ambiguous)
+					// Both are NON-RETRYABLE but with distinct DecisionSurface options.
+					if rmahResult.Rejected && rmahResult.RejectReason != "" {
+						lower := strings.ToLower(rmahResult.RejectReason)
+						if strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated anchor") {
+							return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %s", ErrHallucinatedAnchorError, ErrArtifactRejected, target, detail)
+						}
+						if strings.Contains(lower, "ambiguous anchor") && !strings.Contains(lower, "line-offset") {
+							detail += " — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization"
+							return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %s", ErrNonRetryableArtifactError, ErrArtifactRejected, target, detail)
+						}
+					}
+					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %s", ErrArtifactRetryableRejected, target, detail)
+				}
+			} else {
+				modified = patched
 			}
-			modified = patched
 		} else {
 			modified = ResolveModifiedContent(original, raw)
 			if modified == "" {
@@ -2029,7 +2302,16 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// there. This preserves the existing full-file truth matrix.
 		if patchOnly && x != nil && x.artifactValidator != nil {
 			if _, err := x.artifactValidator.ValidateArtifact([]byte(raw), target); err != nil {
-				if errors.Is(err, ErrAmbiguousAnchor) || errors.Is(err, ErrScopeViolation) {
+				if errors.Is(err, ErrAmbiguousAnchor) {
+					lower := strings.ToLower(err.Error())
+					if !strings.Contains(lower, "line-offset") {
+						// Non-retryable ambiguous anchor — circuit breaker.
+						wrapped := fmt.Errorf("%w: %w: %s: %w — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrNonRetryableArtifactError, ErrArtifactRejected, target, err)
+						return nil, invs, nil, trace, wrapped
+					}
+					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
+				}
+				if errors.Is(err, ErrScopeViolation) {
 					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
 				}
 				if errors.Is(err, ErrFormatRejected) {
@@ -2268,15 +2550,8 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		var data []byte
 		if cached, ok := x.getSnapshotContent(t); ok {
 			data = cached
-			// Snapshot already emitted in Observe phase — consume []byte slice, no os.ReadFile
 		} else {
-			path := filepath.Join(x.root, t)
-			d, readErr := os.ReadFile(path)
-			if readErr != nil {
-				continue
-			}
-			x.emitContextActivity(t, len(d))
-			data = d
+			continue
 		}
 		if len(data) > maxExecutorContextBytes {
 			data = data[:maxExecutorContextBytes]
@@ -2583,15 +2858,18 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	return visible, usage, trace, nil
 }
 
-// emitContextActivity surfaces a real runtime file read as engine evidence
-// through the existing activity/event loggers (wired by the UI at startup).
-// It fires ONLY when the runtime actually reads the file, and is a no-op when
-// no logger is attached (headless/harness).
-func (x *RuntimeExecutor) emitContextActivity(target string, bytes int) {
+// emitSnapshotActivity surfaces whether snapshot content came from physical
+// disk or the in-memory observation cache through the existing activity/event
+// loggers (wired by the UI at startup).
+func (x *RuntimeExecutor) emitSnapshotActivity(target string, bytes int, disk bool) {
 	if globalActivityLog != nil {
-		globalActivityLog("[runtime] reading %s (%d bytes)", target, bytes)
+		if disk {
+			globalActivityLog("[runtime] reading disk %s (%d bytes)", target, bytes)
+		} else {
+			globalActivityLog("[runtime] snapshot cache hit %s (%d bytes)", target, bytes)
+		}
 	}
-	if globalEventLog != nil {
+	if disk && globalEventLog != nil {
 		globalEventLog(retrieval.FileReadEvent{File: target, Bytes: int64(bytes)})
 	}
 }

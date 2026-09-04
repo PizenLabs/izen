@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/PizenLabs/izen/pkg/projection/diff"
@@ -93,9 +94,14 @@ func (p *ProposalProviderCLI) GenerateProposal(ctx context.Context, req *preflig
 	}, nil
 }
 
+// proposalSeq is a monotonic atomic sequence appended to the nanosecond clock
+// so NewProposalID never collides even under rapid concurrent generation.
+var proposalSeq atomic.Uint64
+
 // NewProposalID returns a fresh, collision-resistant proposal ID.
 func NewProposalID() string {
-	return fmt.Sprintf("cli-%d", time.Now().UnixNano())
+	seq := proposalSeq.Add(1)
+	return fmt.Sprintf("cli-%d-%d", time.Now().UnixNano(), seq)
 }
 
 // systemPrompt instructs the model to emit exactly the post-mutation target

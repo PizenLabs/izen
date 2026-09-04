@@ -352,4 +352,19 @@ func TestDecideRecoveryMatrix(t *testing.T) {
 	if d := DecideRecovery(autonomy.Observation{Outcome: autonomy.OutcomeVerifyFailed}, b); d.Action != autonomy.LoopAskHuman {
 		t.Fatalf("verify failure → %+v, want ask_human", d)
 	}
+	// Truncation rejection (RMAH Tier 2 retention floor / schema violation) on
+	// the FIRST attempt keeps the single typed repair available...
+	if d := DecideRecovery(autonomy.Observation{
+		Outcome: autonomy.OutcomeArtifactRetryableRejected, AttemptNum: 1,
+	}, b); d.Action != autonomy.LoopRepair {
+		t.Fatalf("first truncation rejection → %+v, want repair", d)
+	}
+	// ...but on AttemptNum >= 2 it IMMEDIATELY diverts to the DecisionSurface
+	// (AskHuman) — no bounded_patch retry is ever re-issued over a second
+	// destructive truncation.
+	if d := DecideRecovery(autonomy.Observation{
+		Outcome: autonomy.OutcomeArtifactRetryableRejected, AttemptNum: 2,
+	}, b); d.Action != autonomy.LoopAskHuman {
+		t.Fatalf("second truncation rejection → %+v, want ask_human (DecisionSurface)", d)
+	}
 }
