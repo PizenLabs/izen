@@ -3,6 +3,7 @@ package substrate
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 )
@@ -37,7 +38,8 @@ func ExecCommand(ctx context.Context, dir string, env []string, args []string) E
 		if ctx.Err() != nil {
 			return ExecResult{Stdout: outBuf.String(), Stderr: errBuf.String(), ExitCode: -1, Err: ctx.Err()}
 		}
-		if ee, ok := err.(*exec.ExitError); ok {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
 			code = ee.ExitCode()
 		} else {
 			return ExecResult{Stdout: outBuf.String(), Stderr: errBuf.String(), ExitCode: -1, Err: err}

@@ -300,11 +300,9 @@ type PreflightEvaluation struct {
 // the AST is valid, dependencies resolve, the budget fits, and NO human
 // proposal is required. Any other combination is a fail-closed barrier.
 func (e PreflightEvaluation) ExecutionGate() bool {
-	// AST validity and output feasibility are strategy inputs, not human
-	// authorization gates. Strategy resolution selects a bounded textual
-	// contract for those cases; only unresolved capabilities remain a
-	// preflight stop.
-	return e.DependencyStatus == DependenciesResolved &&
+	return e.ASTStatus == ASTValid &&
+		e.DependencyStatus == DependenciesResolved &&
+		e.BudgetStatus == BudgetWithinLimits &&
 		len(e.RequiredProposals) == 0
 }
 
@@ -597,9 +595,22 @@ func EvaluateScope(in ScopeInput) PreflightEvaluation {
 	// The AST hard-gate is bypassed when AllowASTBypass is set or a
 	// bounded-patch / syntax-repair contract is active: a corrupt baseline
 	// is permitted for line-based SEARCH/REPLACE patches.
+	astBlocked := eval.ASTStatus == ASTCorrupt && !in.AllowASTBypass && in.MutationStrategy == StrategyFullRewrite
+	budgetBlocked := eval.BudgetStatus == BudgetExceeded
 	depsBlocked := eval.DependencyStatus == DependenciesUnresolved
-	if depsBlocked {
+	if astBlocked || budgetBlocked || depsBlocked {
 		if len(eval.RequiredProposals) == 0 {
+			eval.RequiredProposals = append(eval.RequiredProposals, ProposalRequirement{
+				Reason: "scope evaluation barrier: " + barrierReason(eval),
+				Target: in.Target,
+			})
+		}
+	} else {
+		// No strategy-aware block: gate passes. If the legacy ExecutionGate
+		// still reports closed only because of a bypassed AST, clear it.
+		if eval.ASTStatus == ASTCorrupt && (in.AllowASTBypass || in.MutationStrategy == StrategyBoundedPatch || in.MutationStrategy == StrategySyntaxRepair) {
+			eval.RequiredProposals = nil
+		} else if !eval.ExecutionGate() && len(eval.RequiredProposals) == 0 {
 			eval.RequiredProposals = append(eval.RequiredProposals, ProposalRequirement{
 				Reason: "scope evaluation barrier: " + barrierReason(eval),
 				Target: in.Target,

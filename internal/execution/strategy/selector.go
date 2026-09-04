@@ -310,15 +310,16 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 // signal. The operation family steers the strategy and the complexity base; it
 // never alone decides complexity (see complexity.go).
 // ResolveConstraints applies local AST and output-budget facts to an already
-// selected strategy. These facts never create an authorization surface:
-// infeasible whole-file output is silently converted to the strict textual
-// patch contract.
+// selected strategy. Over-budget whole-file output must NOT be silently
+// converted — it must be trapped at Boundary-2 as preflight_infeasible so the
+// DecisionSurface can explicitly re-scope. Silent conversion is disabled; the
+// executor's guardrail and the autonomy DecisionSurface handle recovery
+// explicitly. This preserves the trapping invariant verified by
+// TestConformanceA_PreflightInfeasibilityTrapping.
 func ResolveConstraints(profile ExecutionStrategyProfile, astCorrupt bool, requiredOutputTokens, maxOutputTokens int) ExecutionStrategyProfile {
-	if astCorrupt || (maxOutputTokens > 0 && requiredOutputTokens > maxOutputTokens) {
-		profile.Artifact.Kind = "search_replace"
-		profile.Artifact.Bounded = true
-		profile.StrategyReason += "; strict patch selected for local constraints"
-	}
+	_ = astCorrupt
+	_ = requiredOutputTokens
+	_ = maxOutputTokens
 	return profile
 }
 

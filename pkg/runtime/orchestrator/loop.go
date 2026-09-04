@@ -23,10 +23,7 @@ func isTestHarness() bool {
 			return true
 		}
 	}
-	if strings.HasSuffix(os.Args[0], ".test") {
-		return true
-	}
-	return false
+	return strings.HasSuffix(os.Args[0], ".test")
 }
 
 // LoopState enumerates the states of the closed execution loop.

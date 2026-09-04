@@ -31,20 +31,14 @@ func cleanOptionLabel(label string) string {
 	return strings.TrimSpace(optionIndexPrefix.ReplaceAllString(label, ""))
 }
 
-// normalizeOptionOrder puts the single recommended option at index zero and
-// removes display indices embedded in labels before the view is rendered.
+// normalizeOptionOrder removes display indices embedded in labels and reassigns
+// IDs. It intentionally preserves the kernel's authoritative ordering: hard-block
+// options (abort_run, force_bounded_patch, switch_model) remain at the front
+// so digit-key 1 always maps to abort_run. Previously this moved the recommended
+// option to index 0, which broke the hard-block invariant and the TUI tests.
 func normalizeOptionOrder(vm decision.DecisionViewModel) decision.DecisionViewModel {
-	recommended := -1
 	for i := range vm.Options {
 		vm.Options[i].Title = cleanOptionLabel(vm.Options[i].Title)
-		if vm.Options[i].IsRecommended && recommended < 0 {
-			recommended = i
-		}
-	}
-	if recommended > 0 {
-		opt := vm.Options[recommended]
-		vm.Options = append([]decision.StrategyViewOption{opt},
-			append(vm.Options[:recommended], vm.Options[recommended+1:]...)...)
 	}
 	for i := range vm.Options {
 		vm.Options[i].ID = i + 1
