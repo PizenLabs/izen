@@ -201,6 +201,11 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		return LLMResponse{}, fmt.Errorf("openai: no choices")
 	}
 
+	// Task 1: truncated payload handling — intercept BEFORE envelope parsing.
+	if openaiResp.Choices[0].FinishReason == "length" {
+		return LLMResponse{}, fmt.Errorf("%w: finish_reason=length", ErrPayloadTruncated)
+	}
+
 	content := ""
 	if openaiResp.Choices[0].Message != nil {
 		msg := openaiResp.Choices[0].Message
@@ -279,12 +284,23 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("openai: do: %w", err)
 	}
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
 		return LLMResponse{}, fmt.Errorf("openai: status %d: %s", resp.StatusCode, string(respBody))
 	}
+	// Task 2: strict cancellation — force-close SSE body when context is cancelled.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = resp.Body.Close()
+		case <-done:
+		}
+	}()
 
 	var full strings.Builder
 	var reasoning strings.Builder
@@ -294,6 +310,7 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	// can be estimated when the request is interrupted (context deadline)
 	// before the provider delivers its final usage chunk.
 	outputChars := 0
+	truncated := false
 	reader := newOpenAIStreamReader(resp.Body)
 
 	// resolveUsage returns the authoritative token counts when a usage chunk
@@ -336,6 +353,10 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 			}
 		}
 
+		// Task 1: intercept finish_reason == "length" BEFORE any envelope parsing.
+		if len(chunk.Choices) > 0 && chunk.Choices[0].FinishReason == "length" {
+			truncated = true
+		}
 		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil {
 			delta := chunk.Choices[0].Delta
 			// Reasoning content (thinking process) is routed to the reasoning
@@ -370,6 +391,11 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		}
 	}
 
+	// Fail fast on truncated payload — do NOT attempt envelope parsing.
+	if truncated {
+		_ = resp.Body.Close()
+		return LLMResponse{TokenInput: tokenIn, TokenOutput: tokenOut}, fmt.Errorf("%w: finish_reason=length", ErrPayloadTruncated)
+	}
 	content := full.String()
 	if strings.TrimSpace(content) == "" {
 		// Reasoning fallback: the model emitted only thinking content.
@@ -395,7 +421,7 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		}
 		llmResp.TotalCostUSD = EnforceFreeModelOverride(modelID, llmResp.TotalCostUSD)
 	}
-
+	_ = resp.Body.Close()
 	return llmResp, nil
 }
 

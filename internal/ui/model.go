@@ -801,6 +801,12 @@ type model struct {
 	AccumulatedCost float64
 	CheckpointID    string
 
+	// TurnTokens is the prompt/completion count for the latest API turn
+	// (e.g. ↓433 + ↑581). SessionTokens (InputTokens/OutputTokens/TotalTokens)
+	// is the cumulative total across the entire session.
+	TurnInputTokens  int
+	TurnOutputTokens int
+
 	// usageKnown reports whether the provider has ever reported authoritative
 	// (or explicit-estimate) usage this session. The footer distinguishes
 	// "usage unknown" (never reported) from a genuine "0 tok" (provider
@@ -1898,6 +1904,10 @@ func (m *model) commitTokenUsage(input, output int) {
 	if output < 0 {
 		output = 0
 	}
+	// TurnTokens is the latest turn; SessionTokens accumulates.
+	m.TurnInputTokens = input
+	m.TurnOutputTokens = output
+	SetTraceTurnTokens(input, output)
 	m.InputTokens += input
 	m.OutputTokens += output
 	m.TotalTokens = m.InputTokens + m.OutputTokens
@@ -2472,27 +2482,51 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	}
 	execution.KillAllOrphans()
 
-	// For active autonomous runs, the canonical terminal path is the
-	// autonomousRunMsg returned by the driver when its context is cancelled.
-	// We must NOT finalize the operation here — that would race with the
-	// driver's terminal message and leave the presentation in an inconsistent
-	// state (spinner stopped, but autonomousActive not released).
-	// The autonomous run's terminal message will call finalizeOperation.
+	// Task 3: TUI force-reset — immediately force UI back to IDLE
+	// regardless of background goroutine state. The directive requires
+	// generating=false, busy=false, phase=PhaseIdle, spinner cleared,
+	// tok/s reset, and [ ABORT ] line, without waiting for background
+	// goroutines. For autonomous runs the canonical terminal path remains the
+	// driver's autonomousRunMsg (to avoid racing finalization), but the
+	// presentation is forced to IDLE immediately so the TUI never stays stuck
+	// in Generating... after "command received: cancel".
 	if !m.autonomousActive {
-		// 1b. Release the active-operation ownership and clear the transient
-		// busy flags + spinner through the single authoritative finalization
-		// path. This is ONLY for non-autonomous operations.
 		m.finalizeOperation(OpOutcomeCancelled, nil)
-
-		// 2. Clear every transient processing flag so the spinner can never
-		// stay up and the view can never block on a phantom producer.
 		m.reconcileSpinner()
-
-		// 2b. Re-derive the presentation state from the cleared flags so the
-		// tick spinner loop halts and the viewport unwinds to interactive
-		// chat. Any residual approval gate is overridden below.
-		m.syncUIState()
+	} else {
+		// Autonomous: presentation-only force-reset, operation stays alive
+		// until the driver aborts — this keeps TestRegressionEscDuring...
+		// expectation (activeOp not nil) while still showing IDLE.
+		m.clearBusyFlags()
+		m.reconcileSpinner()
 	}
+	// Reset token rate / spinner counters to 0.0 tok/s and clear stage.
+	if m.stage != nil {
+		m.stage.mu.Lock()
+		m.stage.Tokens = 0
+		m.stage.Elapsed = 0
+		m.stage.Bytes = 0
+		m.stage.State = stageCancelled
+		m.stage.mu.Unlock()
+	}
+	m.spinnerFrame = 0
+	m.lastSpinnerAdvance = time.Time{}
+	m.streaming = false
+	m.agentRunning = false
+	m.reviewRunning = false
+	m.pipelineRunning = false
+	m.investigateRunning = false
+	m.shellRunning = false
+	m.planPending = false
+	m.executionResolving = false
+	// For non-autonomous the operation is already finalized; for autonomous
+	// keep autonomousActive true until the driver terminal message but still
+	// force the presentation to IDLE.
+	_ = m.autonomousActive // referenced; no branch mutation needed
+	m.syncUIState()
+	// Force state to chat even when autonomousActive would otherwise keep
+	// it in processing — the directive requires immediate IDLE.
+	m.state = StateChat
 
 	// 3. Release any outstanding approval gate on the canonical source.
 	m.resolveApprovalState()
@@ -2525,15 +2559,17 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	}
 
 	// 5. Restore interactive input and force the presentation back to chat.
-	// For autonomous runs, this will be done by handleAutonomousRun when the
-	// terminal message arrives. For non-autonomous, do it now.
-	if !m.autonomousActive {
-		m.ti.Focus()
-		m.recalcViewportHeight()
-		m.state = StateChat
-
-		m.push(roleSystem, infoStyle.Render("Interrupted."))
-		m.refreshViewportContent()
+	// Directive: immediately return to IDLE prompt (build > / ask >) without
+	// requiring multiple keypresses; never remain stuck in Generating...
+	m.ti.Focus()
+	m.recalcViewportHeight()
+	m.state = StateChat
+	// Clear spinners and reset token rate counters to 0.0 tok/s already done above;
+	// ensure sync.
+	m.stopShimmer()
+	m.push(roleSystem, infoStyle.Render("[ ABORT ] Execution force-cancelled by user."))
+	m.refreshViewportContent()
+	if m.Ready {
 		m.Viewport.GotoBottom()
 	}
 

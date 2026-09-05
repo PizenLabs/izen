@@ -13,6 +13,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/planner"
 	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/loop"
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
 // ErrInvalidProposalIntent is returned when a proposal intent fails the
@@ -129,6 +130,10 @@ type Driver struct {
 	allowASTBypass       bool
 	explicitOutputBudget int
 	syntheticSubGoal     string
+
+	// substrate is the execution target — the single authority that executes
+	// Proposals. The Driver never mutates the filesystem directly.
+	substrate substrate.Substrate
 }
 
 // Option configures the Driver during construction.
@@ -193,11 +198,30 @@ func WithPreflightState(s *preflight.ObservationState) Option {
 	return func(d *Driver) { d.preflightState = s }
 }
 
+// WithSubstrate wires the Substrate execution target. When set, the Driver
+// holds the Substrate as its mutation authority; Strategies emit Proposals
+// that execute via Substrate, never directly.
+func WithSubstrate(s substrate.Substrate) Option {
+	return func(d *Driver) {
+		if s != nil {
+			d.substrate = s
+		}
+	}
+}
+
 // WithSubcommand sets the policy scope ($prompt / $hot) used to tailor the
 // Zero-Token DecisionSurface option set when the preflight hard-gate diverts a
 // corrupt-AST / closed-gate target away from DAG decomposition.
 func WithSubcommand(s string) Option {
 	return func(d *Driver) { d.subcommand = s }
+}
+
+// Substrate returns the execution target.
+func (d *Driver) Substrate() substrate.Substrate {
+	if d == nil {
+		return nil
+	}
+	return d.substrate
 }
 
 // NewDriver wires the bounded loop over the executor adapter. bus may be nil
@@ -272,6 +296,15 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		Targets:         d.resolved.Targets,
 		StreamCallback:  d.streamCb,
 		WorkspaceDigest: d.adapter.WorkspaceVersion(d.resolved.Targets),
+	}
+	// Adaptive heuristic (Task 1): bypass FULL_REWRITE for large targets
+	// or small model budgets; force BOUNDED_PATCH as initial strategy.
+	if len(d.resolved.Targets) > 0 && d.resolved.Targets[0] != "" {
+		targetFile := d.resolved.Targets[0]
+		fileSize := autonomy.FileSizeBytes(targetFile)
+		if adaptive := autonomy.AdaptiveSelectStrategy(targetFile, fileSize, d.resolved.Profile.MaxOutputTokens); adaptive == autonomy.StrategyBoundedPatch {
+			d.mutationStrategy = StrategyBoundedPatch
+		}
 	}
 	// Clear the callback after capturing it for this run.
 	d.streamCb = nil

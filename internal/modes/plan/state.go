@@ -1,8 +1,10 @@
 package plan
 
 import (
-	"os"
+	"context"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
 // PlanStore manages plan data, providing markdown storage and task progression operations.
@@ -16,42 +18,34 @@ func NewPlanStore() *PlanStore {
 	return &PlanStore{}
 }
 
-// SaveRawMarkdown writes the raw LLM output directly to .izen/plans/plan-<id>.md
-// and overrides .izen/plans/current.md.
+// SaveRawMarkdown compiles the raw LLM output into a Proposal and executes
+// via Substrate. The semantic layer never performs direct file writes.
 func (s *PlanStore) SaveRawMarkdown(id string, content string) error {
 	if s == nil {
 		return nil
 	}
-
-	planDir := ".izen/plans"
-	if err := os.MkdirAll(planDir, 0755); err != nil {
-		return err
+	sub := substrate.NewConcreteSubstrate(".")
+	prop := substrate.Proposal{
+		ID:     "plan-" + id,
+		Intent: "save plan markdown",
+		Operations: []substrate.Operation{
+			{Type: substrate.OpFileWrite, Target: ".izen/plans/plan-" + id + ".md", Content: []byte(content)},
+			{Type: substrate.OpFileWrite, Target: ".izen/plans/current.md", Content: []byte(content)},
+		},
 	}
-
-	// Save to plan-<id>.md
-	targetPath := planDir + "/plan-" + id + ".md"
-	if err := os.WriteFile(targetPath, []byte(content), 0644); err != nil {
-		return err
-	}
-
-	// Override current.md
-	if err := os.WriteFile(planDir+"/current.md", []byte(content), 0644); err != nil {
-		return err
-	}
-
-	return nil
+	_, err := sub.Execute(context.Background(), prop)
+	return err
 }
 
-// TickTaskHoanThanh reads .izen/plans/current.md line by line, finds the exact N-th task item,
-// replaces - [ ] with - [x], and flushes the update back to the file without destroying
-// other prose/headers.
+// TickTaskHoanThanh reads current plan via ReadScope, finds the N-th task,
+// and compiles a Proposal to update it. No direct file writes.
 func (s *PlanStore) TickTaskHoanThanh(stepNum int) error {
 	if stepNum <= 0 {
 		return nil
 	}
-
 	currentPath := ".izen/plans/current.md"
-	content, err := os.ReadFile(currentPath)
+	rs := substrate.NewFSReadScope(".")
+	content, err := rs.ReadFile(currentPath)
 	if err != nil {
 		return err
 	}
@@ -64,7 +58,6 @@ func (s *PlanStore) TickTaskHoanThanh(stepNum int) error {
 		if strings.HasPrefix(line, "- [ ]") || strings.HasPrefix(line, "- [x]") {
 			taskCount++
 			if taskCount == stepNum {
-				// Replace - [ ] with - [x]
 				if strings.HasPrefix(line, "- [ ]") {
 					lines[i] = "- [x]" + strings.TrimPrefix(line, "- [ ]")
 					modified = true
@@ -78,5 +71,8 @@ func (s *PlanStore) TickTaskHoanThanh(stepNum int) error {
 	}
 
 	updatedContent := strings.Join(lines, "\n")
-	return os.WriteFile(currentPath, []byte(updatedContent), 0644)
+	sub := substrate.NewConcreteSubstrate(".")
+	prop := substrate.Proposal{ID: "tick-task", Intent: "tick task", Operations: []substrate.Operation{{Type: substrate.OpFileWrite, Target: currentPath, Content: []byte(updatedContent)}}}
+	_, err = sub.Execute(context.Background(), prop)
+	return err
 }

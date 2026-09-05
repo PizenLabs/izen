@@ -2,7 +2,14 @@ package llm
 
 import (
 	"context"
+	"errors"
 )
+
+// ErrPayloadTruncated is returned when finish_reason == "length" is observed.
+// It matches the directive's required message and must be returned BEFORE any
+// envelope/JSON parsing, without attempting a FULL_REWRITE->BOUNDED_PATCH
+// transition.
+var ErrPayloadTruncated = errors.New("model output exceeded max_tokens limit: ErrPayloadTruncated")
 
 type PromptRequest struct {
 	Model       string

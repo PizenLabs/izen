@@ -593,7 +593,7 @@ func (m *model) runReviewCmd(target string) tea.Cmd {
 				records:      recs,
 				sessionKey:   sessionKey,
 				ledger:       result.Ledger,
-				saveReportFn: func() { _ = review.SaveReport(savedResult, ".") },
+				saveReportFn: func() { _ = review.SaveReport(savedResult, ".") }, //nolint:contextcheck // SaveReport is a substrate wrapper managing its own context
 			}
 		},
 	)

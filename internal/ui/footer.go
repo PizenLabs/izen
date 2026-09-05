@@ -191,7 +191,7 @@ func (m *model) renderActiveIdleFooter(width int, actions []Action) string {
 	var base string
 	switch {
 	case width >= 70:
-		// Tiers 1 and 2: full telemetry (model + usage with pct + cost)
+		// Tiers 1 and 2: full telemetry (model + usage with pct + cost) — Session Total only
 		base = footerSep(
 			footerModelStyle.Render(modelName),
 			footerTokStyle.Render(fullUsage),

@@ -298,6 +298,16 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			return
 		}
 		defer func() { _ = rawStream.Close() }()
+		// Task 2: strict context cancellation — force-close SSE body on interrupt.
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = rawStream.Close()
+			case <-done:
+			}
+		}()
 
 		// ── AUTHORITATIVE LIVE USAGE ───────────────────────────────────
 		// The streaming indicator must never display a character-count

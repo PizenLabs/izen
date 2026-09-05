@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 	"github.com/PizenLabs/izen/pkg/engine/decision"
 	"github.com/PizenLabs/izen/pkg/engine/ir"
 	"github.com/PizenLabs/izen/pkg/engine/telemetry"
@@ -90,6 +91,17 @@ func WithClock(now func() time.Time) Option {
 	}
 }
 
+// WithSubstrate wires the Substrate authority. When set, external patch
+// generation is wrapped into a Proposal and passed to Substrate; session.Apply
+// remains restricted to internal state/variable updates.
+func WithSubstrate(s substrate.Substrate) Option {
+	return func(o *ControlLoopOrchestrator) {
+		if s != nil {
+			o.substrate = s
+		}
+	}
+}
+
 // WithMaxIterations bounds the reconciliation iterations (livelock guard).
 // Values <= 0 disable the bound.
 func WithMaxIterations(n int) Option {
@@ -118,6 +130,7 @@ type ControlLoopOrchestrator struct {
 	pool          *WorkerPool
 	approvals     ApprovalRequester
 	bus           *telemetry.EventBus
+	substrate     substrate.Substrate
 	now           func() time.Time
 	maxIterations int
 }
@@ -224,7 +237,9 @@ func (o *ControlLoopOrchestrator) Run(ctx context.Context) (*Result, error) {
 }
 
 // dispatch executes the given nodes strictly through the worker pool and folds
-// the observations back into the session.
+// the observations back into the session. session.Apply is restricted to
+// internal state/variable updates; any external patch generation is wrapped
+// into a Proposal and passed to Substrate.
 func (o *ControlLoopOrchestrator) dispatch(ctx context.Context, runID string, nodeIDs []string) error {
 	snap := o.session.Observe()
 	vars := cloneVars(snap.Variables)
@@ -241,11 +256,36 @@ func (o *ControlLoopOrchestrator) dispatch(ctx context.Context, runID string, no
 	}
 	for obs := range o.pool.Submit(ctx, items) {
 		o.emitNodeObserved(runID, obs)
+		// External patch generation must be wrapped into a Proposal when
+		// Substrate is wired; the execution is via Substrate only.
+		if o.substrate != nil && len(obs.FileMutations) > 0 {
+			prop := proposalForMutations(obs)
+			if _, err := o.substrate.Execute(ctx, prop); err != nil {
+				return err
+			}
+			// After substrate commit, still fold the observation for state
+			// tracking; Apply remains restricted to internal state.
+		}
 		if err := o.session.Apply(obs); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func proposalForMutations(obs ir.ObservationPayload) substrate.Proposal {
+	ops := make([]substrate.Operation, 0, len(obs.FileMutations))
+	for _, m := range obs.FileMutations {
+		switch m.Action {
+		case ir.ActionCreated, ir.ActionModified:
+			ops = append(ops, substrate.Operation{Type: substrate.OpFileWrite, Target: m.Path, Content: []byte(m.Content)})
+		case ir.ActionDeleted:
+			ops = append(ops, substrate.Operation{Type: substrate.OpFileDelete, Target: m.Path})
+		default:
+			ops = append(ops, substrate.Operation{Type: substrate.OpFileWrite, Target: m.Path, Content: []byte(m.Content)})
+		}
+	}
+	return substrate.Proposal{ID: fmt.Sprintf("control-%s", obs.NodeID), Intent: obs.NodeID, Operations: ops}
 }
 
 // terminate records the final facts, publishes the termination event and

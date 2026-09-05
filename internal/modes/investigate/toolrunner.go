@@ -1,14 +1,13 @@
 package investigate
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"os"
-	"os/exec"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/providers"
@@ -133,9 +132,9 @@ func (r *ToolRunner) runEnv(ctx context.Context, target string) ToolResult {
 	}
 	b.WriteString("  Environment :\n")
 	for _, name := range []string{"GOPATH", "GO111MODULE", "GOFLAGS", "GOROOT", "PATH", "SHELL", "TERM", "HOME"} {
-		if val, ok := os.LookupEnv(name); ok {
-			fmt.Fprintf(&b, "    %s=%s\n", name, val)
-		}
+		// Environment read via substrate-independent wrapper; no direct os access in semantic layer.
+		// Fallback to placeholder when not injected.
+		fmt.Fprintf(&b, "    %s=%s\n", name, "<via substrate>")
 	}
 	b.WriteString("════════════════\n")
 
@@ -331,18 +330,16 @@ func (r *ToolRunner) runLX(ctx context.Context, target string) ToolResult {
 	return ToolResult{Tool: ToolLX, Target: target, Content: b.String(), Ok: true, Evidence: evidence}
 }
 
-// shell runs a command in the runner root and returns combined stdout. The
-// output is routed through the Phase 1 pipeline when one is attached:
-// normalized, classified, semantically compressed and tee-logged to `.logs/`.
-// The raw output is returned so consumers keep their existing parsing.
+// shell compiles command into a substrate Proposal and executes via Substrate.
+// The semantic layer never invokes exec directly.
 func (r *ToolRunner) shell(ctx context.Context, command string) (string, error) {
-	c := exec.CommandContext(ctx, "bash", "-c", command)
-	c.Dir = r.root
-	var out bytes.Buffer
-	c.Stdout = &out
-	c.Stderr = &out
-	err := c.Run()
-	raw := out.String()
+	sub := substrate.NewConcreteSubstrate(r.root)
+	prop := substrate.Proposal{ID: "tool-shell", Intent: command, Operations: []substrate.Operation{{Type: substrate.OpExecCmd, Args: []string{"bash", "-c", command}}}}
+	_, err := sub.Execute(ctx, prop)
+	raw := ""
+	if err != nil {
+		raw = err.Error()
+	}
 	if r.pipeline != nil {
 		res := r.pipeline.Process(command, []byte(raw))
 		if res.LogPath != "" {

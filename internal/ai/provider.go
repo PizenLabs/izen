@@ -2,10 +2,18 @@ package ai
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"time"
 )
+
+// ErrPayloadTruncated is the transport-level signal that the provider
+// truncated the response at its max_tokens ceiling (finish_reason ==
+// "length"). Callers must fail fast with this error before any JSON or
+// envelope parsing and must NOT attempt a FULL_REWRITE -> BOUNDED_PATCH
+// transition on the truncated bytes.
+var ErrPayloadTruncated = errors.New("model output exceeded max_tokens limit: ErrPayloadTruncated")
 
 type Message struct {
 	Role    string `json:"role"`

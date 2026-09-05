@@ -1123,6 +1123,9 @@ func (m *model) styleActivityLine(line string) string {
 			return ""
 		}
 		m.traceSummaryShown = true
+		if m.TurnInputTokens > 0 || m.TurnOutputTokens > 0 {
+			return dimmedStyle.Render(buildQuietTraceLineWithTokens(line, m.TurnInputTokens, m.TurnOutputTokens))
+		}
 		return dimmedStyle.Render(buildQuietTraceLine(line))
 	}
 

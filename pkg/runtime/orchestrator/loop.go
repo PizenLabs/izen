@@ -6,11 +6,25 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 	"github.com/PizenLabs/izen/pkg/runtime/executor"
 	"github.com/PizenLabs/izen/pkg/runtime/gate"
 	"github.com/PizenLabs/izen/pkg/runtime/harness"
 )
+
+// ErrNilSubstrate is returned when a Loop is constructed without mandatory Substrate in production.
+var ErrNilSubstrate = errors.New("orchestrator: nil substrate — Substrate is mandatory; reserve nil for isolated unit test harnesses")
+
+func isTestHarness() bool {
+	for _, arg := range os.Args {
+		if strings.HasPrefix(arg, "-test.") {
+			return true
+		}
+	}
+	return strings.HasSuffix(os.Args[0], ".test")
+}
 
 // LoopState enumerates the states of the closed execution loop.
 type LoopState int
@@ -90,14 +104,15 @@ type SnapshotReader interface {
 	ReadSnapshot(ctx context.Context, path string) ([]byte, error)
 }
 
-// FSSnapshotReader reads target bytes through os.ReadFile. It is the default
+// FSSnapshotReader reads target bytes via ReadScope. It is the default
 // production reader; tests substitute a counting reader to prove zero
 // disk-read redundancy during the extraction and verification sub-cycles.
 type FSSnapshotReader struct{}
 
-// ReadSnapshot reads path via os.ReadFile.
+// ReadSnapshot reads path via substrate ReadScope (no direct os access).
 func (FSSnapshotReader) ReadSnapshot(_ context.Context, path string) ([]byte, error) {
-	return os.ReadFile(path)
+	rs := substrate.NewFSReadScope(".")
+	return rs.ReadFile(path)
 }
 
 // MemoryBackedExtractor adapts the RMAH ExtractorPipeline to the loop boundary.
@@ -150,6 +165,7 @@ type Loop struct {
 	gatePipeline     GatePipeline
 	executor         *executor.RuntimeExecutor
 	reader           SnapshotReader
+	substrate        substrate.Substrate
 
 	snapshot *MemorySnapshot
 
@@ -160,8 +176,43 @@ type Loop struct {
 }
 
 // NewLoop wires the closed execution path. A nil reader defaults to the
-// filesystem reader.
+// filesystem reader. Substrate is mandatory in production; test harnesses may
+// wire via WithSubstrate or NewLoopWithSubstrate. If no Substrate is set and
+// not in a test harness, Loop initialization fails fast.
 func NewLoop(extractor ModelOutputExtractor, gp GatePipeline, exec *executor.RuntimeExecutor, reader SnapshotReader) *Loop {
+	if reader == nil {
+		reader = FSSnapshotReader{}
+	}
+	l := &Loop{
+		harnessExtractor: extractor,
+		gatePipeline:     gp,
+		executor:         exec,
+		reader:           reader,
+		state:            StateIdle,
+	}
+	if l.substrate == nil && !isTestHarness() {
+		// Fail fast in production: loop requires substrate.
+		panic(ErrNilSubstrate)
+	}
+	return l
+}
+
+// WithSubstrate wires the Substrate authority. When set, ExecuteCycle builds a
+// Proposal and submits via Substrate.Execute. Direct mutation is forbidden.
+func WithSubstrate(s substrate.Substrate) func(*Loop) {
+	return func(l *Loop) {
+		if s != nil {
+			l.substrate = s
+		}
+	}
+}
+
+// NewLoopWithSubstrate wires the closed path with a Substrate authority.
+// It is the mandatory production constructor; nil Substrate panics.
+func NewLoopWithSubstrate(extractor ModelOutputExtractor, gp GatePipeline, exec *executor.RuntimeExecutor, reader SnapshotReader, sub substrate.Substrate) *Loop {
+	if sub == nil {
+		panic(ErrNilSubstrate)
+	}
 	if reader == nil {
 		reader = FSSnapshotReader{}
 	}
@@ -170,6 +221,7 @@ func NewLoop(extractor ModelOutputExtractor, gp GatePipeline, exec *executor.Run
 		gatePipeline:     gp,
 		executor:         exec,
 		reader:           reader,
+		substrate:        sub,
 		state:            StateIdle,
 	}
 }
@@ -282,8 +334,22 @@ func (l *Loop) ExecuteCycle(ctx context.Context, rawModelOutput []byte) (*CycleO
 		return l.handleGateRejection(candidate, gateResult)
 	}
 
-	// ── 3. Commit only via the Sole Authority (RuntimeExecutor). ───────
-	if err := l.executor.CommitMutation(ctx, candidate, l.snapshot.Content); err != nil {
+	// ── 3. Commit via Substrate Proposal (mandatory). ─
+	// All workspace mutations go through Substrate.Execute; direct
+	// mutation is forbidden.
+	if l.substrate == nil {
+		l.state = StateFailed
+		err := ErrNilSubstrate
+		return &CycleOutcome{
+			State:      StateFailed,
+			Candidate:  &candidate,
+			Evidence:   candidate.Evidence,
+			GateResult: gateResult,
+			Reason:     err.Error(),
+		}, err
+	}
+	prop := l.buildProposal(candidate)
+	if _, err := l.substrate.Execute(ctx, prop); err != nil {
 		l.state = StateFailed
 		return &CycleOutcome{
 			State:      StateFailed,
@@ -301,6 +367,44 @@ func (l *Loop) ExecuteCycle(ctx context.Context, rawModelOutput []byte) (*CycleO
 		Evidence:   candidate.Evidence,
 		GateResult: gateResult,
 	}, nil
+}
+
+// buildProposal converts a candidate into a substrate.Proposal. The caller
+// owns Proposal emission; Substrate owns execution.
+func (l *Loop) buildProposal(candidate harness.CandidateArtifact) substrate.Proposal {
+	content := l.finalContent(candidate)
+	return substrate.Proposal{
+		ID:     fmt.Sprintf("orch-%s-%d", candidate.TargetFile, l.formatFailures),
+		Intent: candidate.TargetFile,
+		Operations: []substrate.Operation{
+			{Type: substrate.OpFileWrite, Target: candidate.TargetFile, Content: []byte(content)},
+		},
+	}
+}
+
+// finalContent materializes the candidate against the observation-phase snapshot
+// via the executor's canonical materializer. Semantic layer compiles; Substrate executes.
+func (l *Loop) finalContent(candidate harness.CandidateArtifact) string {
+	base := []byte{}
+	if l.snapshot != nil {
+		base = l.snapshot.Content
+	}
+	if content, err := executor.MaterializeCandidateExported(candidate, base); err == nil {
+		return content
+	}
+	if len(candidate.RawPatch) > 0 {
+		return string(candidate.RawPatch)
+	}
+	if candidate.Diff != "" {
+		return candidate.Diff
+	}
+	return string(base)
+}
+
+// BuildProposal is the pure strategy seam: it builds and returns a Proposal
+// without executing it. Strategies emit Proposals; the Substrate executes.
+func (l *Loop) BuildProposal(candidate harness.CandidateArtifact) substrate.Proposal {
+	return l.buildProposal(candidate)
 }
 
 // handleExtractionFailure routes an RMAH translation failure. Ambiguity halts

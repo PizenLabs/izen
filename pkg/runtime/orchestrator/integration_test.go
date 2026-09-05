@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 	"github.com/PizenLabs/izen/pkg/provider/capability"
 	"github.com/PizenLabs/izen/pkg/runtime/executor"
 	"github.com/PizenLabs/izen/pkg/runtime/gate"
@@ -51,15 +52,18 @@ func readTarget(t *testing.T, path string) string {
 }
 
 // newLoop wires a real Loop: memory-backed RMAH pipeline, real gate pipeline,
-// real executor, and the given snapshot reader.
+// real executor, and the given snapshot reader, with mandatory substrate.
 func newLoop(t *testing.T, targetPath string, reader SnapshotReader) *Loop {
 	t.Helper()
-	return NewLoop(
+	sub := substrate.NewConcreteSubstrate(filepath.Dir(targetPath))
+	l := NewLoop(
 		NewMemoryBackedExtractor(targetPath),
 		gate.NewPipeline(),
 		executor.NewExecutor(),
 		reader,
 	)
+	l.substrate = sub
+	return l
 }
 
 // TestCase1CorruptASTBudgetExceeded renders the DecisionSurface with the

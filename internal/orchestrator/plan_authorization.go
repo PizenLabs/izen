@@ -48,6 +48,26 @@ type EphemeralPlan struct {
 	InjectedAt time.Time
 }
 
+// SyntheticMicroPlan is the direct-mutation authorization for single-file
+// rewrites and $hot hotfixes that have no formal DAG. It carries the
+// resolved target files, the classified intent (e.g. "modification"), and
+// the scope capabilities that the proposal was authorized under. Registering
+// it satisfies the workflow guard's "no authorized plan or micro-plan"
+// check for the planning → building transition without requiring a full
+// DECOMPOSITION_PROPOSAL DAG.
+type SyntheticMicroPlan struct {
+	// Targets is the resolved workspace-relative target set.
+	Targets []string
+	// Intent is the classified intent (e.g. "modification").
+	Intent string
+	// Scope is the capability scope the grant was issued under.
+	Scope string
+	// Capabilities is the granted capability vector.
+	Capabilities []string
+	// BoundAt is when the synthetic authorization was registered.
+	BoundAt time.Time
+}
+
 // BindAuthorizedMicroPlan registers an explicitly human-approved staged
 // ExecutionDAG as the authorized execution plan in the Orchestrator's
 // workflow context. Callers MUST invoke it before requesting the
@@ -76,6 +96,7 @@ func (o *Orchestrator) BindAuthorizedMicroPlan(ctx context.Context, dag *planner
 		BoundAt:         time.Now(),
 	}
 	o.ephemeral = nil
+	o.synthetic = nil
 	o.planAuthorized = true
 	return nil
 }
@@ -96,13 +117,80 @@ func (o *Orchestrator) InjectEphemeralPlan(source string) error {
 	defer o.mu.Unlock()
 	o.microPlan = nil
 	o.ephemeral = &EphemeralPlan{Source: source, InjectedAt: time.Now()}
+	o.synthetic = nil
 	o.planAuthorized = true
 	return nil
 }
 
+// RegisterSyntheticMicroPlan registers a direct-mutation authorization for
+// $hot and single-file rewrites that have no formal DAG. It is the synthetic
+// micro-plan handshake: the target files, classified intent, and granted scope
+// capabilities are recorded so the workflow guard permits the planning →
+// building transition without a DECOMPOSITION_PROPOSAL. It replaces any
+// previous authorization; the newest human decision wins.
+func (o *Orchestrator) RegisterSyntheticMicroPlan(targets []string, intent, scope string, capabilities []string) error {
+	if o == nil {
+		return fmt.Errorf("orchestrator: nil receiver")
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("orchestrator: synthetic micro-plan requires at least one target")
+	}
+	if intent == "" {
+		intent = "modification"
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	cpTargets := make([]string, len(targets))
+	copy(cpTargets, targets)
+	cpCaps := make([]string, len(capabilities))
+	copy(cpCaps, capabilities)
+	o.synthetic = &SyntheticMicroPlan{
+		Targets:      cpTargets,
+		Intent:       intent,
+		Scope:        scope,
+		Capabilities: cpCaps,
+		BoundAt:      time.Now(),
+	}
+	o.microPlan = nil
+	o.ephemeral = nil
+	o.planAuthorized = true
+	return nil
+}
+
+// EnsureSyntheticMicroPlan registers a synthetic micro-plan only when no
+// authorized plan is currently bound. It is the guard-sync seam for direct
+// proposals: before a proposal transitions to awaiting_human or auto-execution
+// the caller checks HasAuthorizedPlan; when false it injects a synthetic plan
+// covering the direct mutation targets so the subsequent planning → building
+// transition passes the guard. When a plan is already authorized it is a no-op.
+func (o *Orchestrator) EnsureSyntheticMicroPlan(targets []string, intent, scope string, capabilities []string) error {
+	if o == nil {
+		return fmt.Errorf("orchestrator: nil receiver")
+	}
+	o.mu.RLock()
+	authorized := o.planAuthorized
+	o.mu.RUnlock()
+	if authorized {
+		return nil
+	}
+	return o.RegisterSyntheticMicroPlan(targets, intent, scope, capabilities)
+}
+
+// SyntheticMicroPlan returns the bound synthetic direct-mutation plan, or nil
+// when no synthetic plan is currently authorized.
+func (o *Orchestrator) SyntheticMicroPlan() *SyntheticMicroPlan {
+	if o == nil {
+		return nil
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.synthetic
+}
+
 // HasAuthorizedPlan reports whether an explicitly authorized execution plan
-// (a human-approved DECOMPOSITION_PROPOSAL micro-plan or a fast-path
-// ephemeral plan) is currently bound to the workflow context.
+// (a human-approved DECOMPOSITION_PROPOSAL micro-plan, a fast-path
+// ephemeral plan, or a synthetic direct-mutation micro-plan) is currently
+// bound to the workflow context.
 func (o *Orchestrator) HasAuthorizedPlan() bool {
 	if o == nil {
 		return false
@@ -146,6 +234,7 @@ func (o *Orchestrator) ClearAuthorizedPlan() {
 	defer o.mu.Unlock()
 	o.microPlan = nil
 	o.ephemeral = nil
+	o.synthetic = nil
 	o.planAuthorized = false
 }
 

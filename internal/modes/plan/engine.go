@@ -932,7 +932,7 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	}
 
 	// Persist raw plan output to disk.
-	_ = e.store.SaveRawMarkdown("plan", resp.Content)
+	_ = e.store.SaveRawMarkdown("plan", resp.Content) //nolint:contextcheck // SaveRawMarkdown is a substrate wrapper that manages its own context
 
 	if fastTrack && len(fastPrompt) > 0 {
 		// Fast-track: the model returns a minimal markdown shell checklist. A
@@ -996,7 +996,7 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 			if resp == nil || resp.Content == "" {
 				continue
 			}
-			_ = e.store.SaveRawMarkdown("plan", resp.Content)
+			_ = e.store.SaveRawMarkdown("plan", resp.Content) //nolint:contextcheck // substrate wrapper manages its own context
 		}
 
 		jsonResult := ParseJSONPlan(resp.Content)
@@ -1945,7 +1945,7 @@ func (e *Engine) ProcessPlan(ctx context.Context, modelName string, objective st
 		return fmt.Errorf("plan engine: provider returned a nil response")
 	}
 
-	return e.store.SaveRawMarkdown("plan", resp.Content)
+	return e.store.SaveRawMarkdown("plan", resp.Content) //nolint:contextcheck // substrate wrapper manages its own context
 }
 
 // Parse parses plan content (JSON or markdown) into tasks.

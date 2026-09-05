@@ -154,6 +154,10 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	if len(openaiResp.Choices) == 0 {
 		return nil, fmt.Errorf("openai: no choices in response")
 	}
+	// Task 1: fail fast on truncated payload before envelope parsing.
+	if openaiResp.Choices[0].FinishReason == "length" {
+		return nil, fmt.Errorf("%w: finish_reason=length", ai.ErrPayloadTruncated)
+	}
 
 	content := ""
 	if openaiResp.Choices[0].Message != nil {

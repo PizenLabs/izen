@@ -150,6 +150,12 @@ func materializeContent(proposal ProposedMutation, base string) (string, error) 
 //     RawPatch.
 //   - Everything else applies the candidate's unified diff against the base.
 //
+// MaterializeCandidateExported is the exported wrapper for the orchestrator's
+// pure compilation path. Semantic layers compile via this; Substrate executes.
+func MaterializeCandidateExported(candidate harness.CandidateArtifact, base []byte) (string, error) {
+	return materializeCandidate(candidate, base)
+}
+
 // It never reads the disk: base is the Observation-phase memory snapshot.
 func materializeCandidate(candidate harness.CandidateArtifact, base []byte) (string, error) {
 	switch {

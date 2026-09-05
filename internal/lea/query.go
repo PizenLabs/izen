@@ -87,7 +87,7 @@ func layerFor(dir string) string {
 	case dir == "api" || strings.HasPrefix(dir, "api/"):
 		return "entry"
 	case strings.HasPrefix(dir, "internal/ui"), strings.HasPrefix(dir, "internal/modes"),
-		strings.HasPrefix(dir, "internal/agent"), strings.HasPrefix(dir, "internal/agents"):
+		strings.HasPrefix(dir, "internal/agents"):
 		return "interface"
 	case dir == "internal/core" || strings.HasPrefix(dir, "internal/core/"):
 		return "domain"

@@ -8,6 +8,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/core/classifier"
+	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
@@ -192,6 +194,29 @@ func (m *model) resumeAutonomousApprove() tea.Cmd {
 		return nil
 	}
 	if err := m.authorizeAutonomousApproval(); err != nil {
+		// ── Guard rejection: dismiss modal immediately, abort session ────
+		// The workflow guard rejected the planning → building transition
+		// (e.g. "no authorized plan or micro-plan"). The awaiting_human
+		// modal must close on the FIRST failure — not stack duplicate error
+		// lines on every subsequent Alt+A / Enter. Transition to Failed/
+		// Aborted and clear the parked boundary so the next keypress is a
+		// no-op (duplicate ApproveMsg prevention).
+		if strings.Contains(err.Error(), "guard rejected") {
+			m.autonomousBoundary = nil
+			m.resolveApprovalState()
+			m.clearAutonomousRun()
+			m.autonomousActive = false
+			if m.orch != nil {
+				_ = m.orch.Fail(classifier.FailureUnknownClass)
+			} else if m.workflowSM != nil {
+				_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{FailureClass: classifier.FailureUnknownClass})
+			}
+			m.push(roleError, "[autonomous] guard rejected transition — run aborted")
+			m.push(roleSystem, infoStyle.Render("Interrupted."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
 		m.push(roleError, "[autonomous] authorization: "+err.Error())
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -271,6 +296,22 @@ func (m *model) resumeAutonomousProposalApprove() tea.Cmd {
 		return nil
 	}
 	if err := m.authorizeAutonomousApproval(); err != nil {
+		if strings.Contains(err.Error(), "guard rejected") {
+			m.autonomousBoundary = nil
+			m.resolveApprovalState()
+			m.clearAutonomousRun()
+			m.autonomousActive = false
+			if m.orch != nil {
+				_ = m.orch.Fail(classifier.FailureUnknownClass)
+			} else if m.workflowSM != nil {
+				_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{FailureClass: classifier.FailureUnknownClass})
+			}
+			m.push(roleError, "[autonomous] guard rejected transition — run aborted")
+			m.push(roleSystem, infoStyle.Render("Interrupted."))
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
 		m.push(roleError, "[autonomous] proposal authorization: "+err.Error())
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -496,6 +537,34 @@ func (m *model) authorizeAutonomousApproval() error {
 	if m.orch != nil && b != nil && b.Action == autonomy.HumanBoundaryDecomposition && b.Proposal != nil {
 		if err := m.orch.BindAuthorizedMicroPlan(context.Background(), b.Proposal); err != nil {
 			return fmt.Errorf("micro-plan binding failed: %w", err)
+		}
+	}
+	// ── SYNTHETIC MICRO-PLAN HANDSHAKE (direct $hot / single-file) ─────
+	// A direct mutation proposal has no formal DAG plan. Before transitioning
+	// to building, ensure the orchestrator carries an authorized plan so the
+	// guard permits planning → building. This is idempotent: when a formal
+	// plan or ephemeral plan is already authorized it is a no-op.
+	if m.orch != nil && !m.orch.HasAuthorizedPlan() {
+		switch {
+		case b != nil && len(b.Targets) > 0:
+			intent := "modification"
+			if m.autonomousObjective != "" && m.autonomy != nil {
+				intent = string(m.autonomy.Classify(m.autonomousObjective).Intent)
+				if intent == "" {
+					intent = "modification"
+				}
+			}
+			scope := ""
+			if m.autonomy != nil {
+				scope = m.autonomy.Scope()
+			}
+			caps := []string{"read", "analyze", "propose", "mutate", "verify"}
+			_ = m.orch.EnsureSyntheticMicroPlan(b.Targets, intent, scope, caps)
+		case m.autonomousObjective != "":
+			// Fallback: objective without resolved targets (clarify not yet done).
+			_ = m.orch.EnsureSyntheticMicroPlan([]string{"direct-mutation"}, "modification", "", []string{"mutate"})
+		default:
+			_ = m.orch.InjectEphemeralPlan("$hot:direct")
 		}
 	}
 	// Ensure workflow is in Building/Repairing state for authorization.

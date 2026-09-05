@@ -119,10 +119,12 @@ type Orchestrator struct {
 
 	// planAuthorization carries the explicitly authorized execution plan the
 	// workflow guard consults (see plan_authorization.go): a human-approved
-	// DECOMPOSITION_PROPOSAL micro-plan or a fast-path ephemeral plan.
+	// DECOMPOSITION_PROPOSAL micro-plan, a fast-path ephemeral plan, or a
+	// synthetic direct-mutation micro-plan ($hot / single-file rewrite).
 	planAuthorized bool
 	microPlan      *MicroPlan
 	ephemeral      *EphemeralPlan
+	synthetic      *SyntheticMicroPlan
 }
 
 // New creates an Orchestrator bound to the shared WorkflowStateMachine and

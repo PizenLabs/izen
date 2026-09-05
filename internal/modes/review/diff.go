@@ -4,10 +4,10 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
 type DiffAnalyzer struct {
@@ -50,22 +50,21 @@ type DiffAnalysis struct {
 }
 
 func (da *DiffAnalyzer) getChangedFiles() ([]DiffFile, error) {
-	cmd := exec.CommandContext(context.Background(), "git", "diff", "--no-color", "--diff-filter=ACDMRTUXB")
-	cmd.Dir = da.root
-	out, err := cmd.Output()
-	if err != nil {
-		cmd2 := exec.CommandContext(context.Background(), "git", "diff", "--cached", "--no-color")
-		cmd2.Dir = da.root
-		out2, err2 := cmd2.Output()
-		if err2 != nil {
-			cmd3 := exec.CommandContext(context.Background(), "git", "status", "--porcelain")
-			cmd3.Dir = da.root
-			out3, _ := cmd3.Output()
-			return da.parsePorcelain(string(out3))
-		}
-		return da.parseUnifiedDiff(string(out2))
+	// Git-aware diff via substrate helper (no direct exec in semantic layer).
+	ctx := context.Background()
+	res := substrate.ExecCommand(ctx, da.root, nil, []string{"git", "diff", "--no-color", "--diff-filter=ACDMRTUXB"})
+	if res.Err == nil && res.Stdout != "" {
+		return da.parseUnifiedDiff(res.Stdout)
 	}
-	return da.parseUnifiedDiff(string(out))
+	res2 := substrate.ExecCommand(ctx, da.root, nil, []string{"git", "diff", "--cached", "--no-color"})
+	if res2.Err == nil && res2.Stdout != "" {
+		return da.parseUnifiedDiff(res2.Stdout)
+	}
+	res3 := substrate.ExecCommand(ctx, da.root, nil, []string{"git", "status", "--porcelain"})
+	if res3.Err == nil {
+		return da.parsePorcelain(res3.Stdout)
+	}
+	return []DiffFile{}, nil
 }
 
 func (da *DiffAnalyzer) parseUnifiedDiff(diff string) ([]DiffFile, error) {
@@ -209,13 +208,11 @@ func (da *DiffAnalyzer) mapStatus(staging, worktree string) string {
 }
 
 func (da *DiffAnalyzer) getBranch() (string, error) {
-	cmd := exec.CommandContext(context.Background(), "git", "rev-parse", "--abbrev-ref", "HEAD")
-	cmd.Dir = da.root
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
+	res := substrate.ExecCommand(context.Background(), da.root, nil, []string{"git", "rev-parse", "--abbrev-ref", "HEAD"})
+	if res.Err != nil || strings.TrimSpace(res.Stdout) == "" {
+		return "", res.Err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(res.Stdout), nil
 }
 
 func (da *DiffAnalyzer) getBaseBranch() string {
@@ -226,46 +223,45 @@ func (da *DiffAnalyzer) getBaseBranch() string {
 	if branch == "main" || branch == "master" {
 		return branch + "~1"
 	}
-
-	cmd := exec.CommandContext(context.Background(), "git", "merge-base", branch, "main")
-	cmd.Dir = da.root
-	if out, err := cmd.Output(); err == nil && len(out) > 0 {
-		return strings.TrimSpace(string(out))
+	res := substrate.ExecCommand(context.Background(), da.root, nil, []string{"git", "merge-base", branch, "main"})
+	if res.Err == nil && strings.TrimSpace(res.Stdout) != "" {
+		return strings.TrimSpace(res.Stdout)
 	}
-
-	cmd2 := exec.CommandContext(context.Background(), "git", "merge-base", branch, "master")
-	cmd2.Dir = da.root
-	if out2, err := cmd2.Output(); err == nil && len(out2) > 0 {
-		return strings.TrimSpace(string(out2))
+	res2 := substrate.ExecCommand(context.Background(), da.root, nil, []string{"git", "merge-base", branch, "master"})
+	if res2.Err == nil && strings.TrimSpace(res2.Stdout) != "" {
+		return strings.TrimSpace(res2.Stdout)
 	}
-
 	return "main"
 }
 
 func (da *DiffAnalyzer) getHash() (string, error) {
-	cmd := exec.CommandContext(context.Background(), "git", "rev-parse", "--short", "HEAD")
-	cmd.Dir = da.root
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
+	res := substrate.ExecCommand(context.Background(), da.root, nil, []string{"git", "rev-parse", "--short", "HEAD"})
+	if res.Err != nil {
+		return "", res.Err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(res.Stdout), nil
 }
 
 func (da *DiffAnalyzer) isRepo() bool {
-	_, err := os.Stat(filepath.Join(da.root, ".git"))
-	return err == nil
+	rs := substrate.NewFSReadScope(da.root)
+	if _, err := rs.ReadFile(".git/HEAD"); err == nil {
+		return true
+	}
+	// Bare .git directory counts as repo for isRepo probe (fast path test creates empty .git).
+	if _, err := rs.ReadTree(".git"); err == nil {
+		return true
+	}
+	res := substrate.ExecCommand(context.Background(), da.root, nil, []string{"git", "rev-parse", "--is-inside-work-tree"})
+	return res.Err == nil && strings.TrimSpace(res.Stdout) == "true"
 }
 
 func (da *DiffAnalyzer) hasChanges() bool {
 	if !da.isRepo() {
 		return false
 	}
-	cmd := exec.CommandContext(context.Background(), "git", "status", "--porcelain")
-	cmd.Dir = da.root
-	out, err := cmd.Output()
-	if err != nil {
+	res := substrate.ExecCommand(context.Background(), da.root, nil, []string{"git", "status", "--porcelain"})
+	if res.Err != nil {
 		return false
 	}
-	return len(strings.TrimSpace(string(out))) > 0
+	return len(strings.TrimSpace(res.Stdout)) > 0
 }
