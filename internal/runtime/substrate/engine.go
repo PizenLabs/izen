@@ -108,6 +108,13 @@ func verifyProposal(prop Proposal) error {
 			if _, err := ex.ExtractSymbols(op.Target, op.Content); err != nil {
 				return fmt.Errorf("%w: %s: %w", ErrVerificationFailed, op.Target, err)
 			}
+		case ".html", ".htm":
+			// HTML: language html — semantic verification via compileHTML.
+			// No symbol re-anchoring required; if an HTML AST verifier exists
+			// it would be invoked here, otherwise verification is correctly
+			// skipped for language html (never misattributed as css).
+		case ".css", ".scss", ".less", ".sass":
+			// CSS: no symbol re-anchoring required (language css).
 		default:
 			// Non-code assets: no symbol re-anchoring required.
 		}

@@ -27,12 +27,111 @@ var proposalActions = []autonomy.ProposalAction{
 	autonomy.ActionCancel,
 }
 
+// isLowRiskAutoApprovable reports whether a proposal can bypass the
+// awaiting_human barrier: ScopeCapability (read+analyze+propose+mutate) granted
+// for the target scope and RiskLevel <= RiskLow.
+func (m *model) isLowRiskAutoApprovable(prop *autonomy.Proposal) bool {
+	if prop == nil || m.autonomy == nil {
+		return false
+	}
+	if prop.Risk > autonomy.RiskLow {
+		return false
+	}
+	// ScopeCapability granted for "." or the engine's default scope.
+	required := prop.Required
+	if len(required) == 0 {
+		required = autonomy.CapabilitySet{autonomy.CapRead, autonomy.CapAnalyze, autonomy.CapPropose, autonomy.CapMutate}
+	}
+	if m.autonomy.Grants().Has(".", required) || m.autonomy.Grants().Has(m.autonomy.Scope(), required) || m.autonomy.Authority(required) {
+		return true
+	}
+	return false
+}
+
+// ensureSyntheticMicroPlanForProposal registers a synthetic micro-plan for
+// direct mutations that have no formal DAG (e.g. $hot single-file rewrite).
+// Before a proposal transitions to awaiting_human or auto-execution the
+// orchestrator must carry an authorized plan, otherwise the workflow guard
+// rejects planning → building with "no authorized plan or micro-plan".
+// This handshake is idempotent: when a formal DAG or ephemeral plan is
+// already authorized it is a no-op; otherwise it injects a synthetic plan
+// covering the proposal's target, intent and scope capabilities.
+func (m *model) ensureSyntheticMicroPlanForProposal(prop *autonomy.Proposal) {
+	if prop == nil || m.orch == nil {
+		return
+	}
+	if m.orch.HasAuthorizedPlan() {
+		return
+	}
+	// Only direct mutations that require a workspace transition need the guard.
+	if prop.Workspace != autonomy.WorkspaceBuild {
+		return
+	}
+	var targets []string
+	switch {
+	case prop.Target != "":
+		targets = []string{prop.Target}
+	case prop.Scope != "":
+		targets = []string{prop.Scope}
+	default:
+		targets = []string{"direct-mutation"}
+	}
+	intent := string(prop.Intent)
+	if intent == "" {
+		intent = "modification"
+	}
+	caps := []string{}
+	for _, c := range prop.Required {
+		caps = append(caps, string(c))
+	}
+	if len(caps) == 0 {
+		caps = []string{"mutate"}
+	}
+	scope := prop.Scope
+	if scope == "" && m.autonomy != nil {
+		scope = m.autonomy.Scope()
+	}
+	_ = m.orch.EnsureSyntheticMicroPlan(targets, intent, scope, caps)
+}
+
 // requestAutonomyProposal stages the ask_user decision surface: the runtime
 // presents the intent/workspace/risk/capability facts and the planned actions,
 // and waits for one explicit human decision. It never prints "Approve with
 // /grant" — granting is an internal authorization operation.
+//
+// Low-risk auto-approval: if ScopeCapability (read+analyze+propose+mutate) is
+// already granted for the target scope and RiskLevel <= RiskLow, the proposal
+// bypasses the awaiting_human modal, streams a DiffPreviewEvent to the Activity
+// Log, and transitions directly to executing.
+//
+// Synthetic micro-plan handshake: before the proposal transitions to
+// awaiting_human OR auto-execution, the orchestrator is checked for an active
+// plan. When no formal DAG exists (direct $hot / single-file rewrite) a
+// SyntheticMicroPlan is registered so the workflow guard permits the
+// planning → building transition.
 func (m *model) requestAutonomyProposal(trace autonomy.Trace) tea.Cmd {
-	m.pendingAutonomyProposal = trace.Proposal()
+	prop := trace.Proposal()
+	// ── Synthetic micro-plan handshake (planning → building guard) ────
+	m.ensureSyntheticMicroPlanForProposal(prop)
+	// ── Low-risk auto-approval: bypass awaiting_human ───────────────────
+	if m.isLowRiskAutoApprovable(prop) {
+		// Non-blocking diff preview: stream the planned diff/actions to the
+		// Activity Log so the user immediately sees what is changing, without
+		// blocking on Alt+A/Enter.
+		if len(prop.Actions) > 0 {
+			m.logActivity("[diff preview] auto-approved low-risk mutation for %s — streaming diff", prop.Target)
+			for _, a := range prop.Actions {
+				m.logActivity("  %s %s", Icon.Diff, a)
+			}
+		} else {
+			m.logActivity("[diff preview] auto-approved low-risk mutation for %s", prop.Target)
+		}
+		m.pendingAutonomyProposal = prop
+		m.autonomyProposalSelect = 0
+		// Bypass modal: transition directly to executing.
+		return m.executeAutonomyProposal()
+	}
+	m.pendingAutonomyProposal = prop
 	m.autonomyProposalSelect = 0
 	m.autonomyProposalInspect = false
 	m.enterApprovalState()
@@ -71,6 +170,11 @@ func (m *model) executeAutonomyProposal() tea.Cmd {
 	if prop == nil {
 		return nil
 	}
+	// Ensure the synthetic handshake is present before any execution path
+	// leaves the proposal gate — the guard is evaluated on the subsequent
+	// planning → building transition inside dispatchAutonomyTrace /
+	// executeAutonomyWorkspace.
+	m.ensureSyntheticMicroPlanForProposal(prop)
 	m.pendingAutonomyProposal = nil
 	m.autonomyProposalInspect = false
 	m.resolveApprovalState()

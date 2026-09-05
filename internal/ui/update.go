@@ -2279,6 +2279,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
 			_ = m.sess.Save()
 		}
+		m.TurnInputTokens = msg.tokenInput
+		m.TurnOutputTokens = msg.tokenOutput
+		SetTraceTurnTokens(msg.tokenInput, msg.tokenOutput)
 		m.InputTokens += msg.tokenInput
 		m.OutputTokens += msg.tokenOutput
 		m.TotalTokens = m.InputTokens + m.OutputTokens

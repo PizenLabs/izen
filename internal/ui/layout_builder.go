@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -159,6 +160,36 @@ func buildQuietTraceLine(s string) string {
 	}
 	return "▸ Trace: " + decision + " (" + dur + ") · Alt+E to toggle"
 }
+
+// buildQuietTraceLineWithTokens is the Turn-aware variant. When TurnTokens >0
+// it appends ` · ↓in + ↑out tok` before the toggle hint. Zero means no API call.
+func buildQuietTraceLineWithTokens(s string, turnIn, turnOut int) string {
+	base := buildQuietTraceLine(s)
+	if turnIn <= 0 && turnOut <= 0 {
+		return base
+	}
+	// Insert tokens before the final " · Alt+E to toggle"
+	const suffix = " · Alt+E to toggle"
+	if strings.HasSuffix(base, suffix) {
+		prefix := strings.TrimSuffix(base, suffix)
+		return fmt.Sprintf("%s · ↓%s + ↑%s tok%s", prefix, formatTokensCompact(turnIn), formatTokensCompact(turnOut), suffix)
+	}
+	return base
+}
+
+// formatTokensCompact mirrors status.FormatTokens for layout_builder without import cycle.
+func formatTokensCompact(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	if n < 10_000 {
+		return fmt.Sprintf("%.1fk", float64(n)/1000)
+	}
+	return fmt.Sprintf("%dk", n/1000)
+}
+
+// SetTraceTurnTokens is kept for compatibility; turn tokens are now passed explicitly.
+func SetTraceTurnTokens(in, out int) {}
 
 // ── Structured Workflow Error Callout ───────────────────────────────────
 
