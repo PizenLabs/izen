@@ -16,6 +16,7 @@ var (
 	ErrFormatRejected  = execution.ErrFormatRejected
 	ErrAmbiguousAnchor = execution.ErrAmbiguousAnchor
 	ErrScopeViolation  = execution.ErrScopeViolation
+	ErrPayloadTruncated = execution.ErrPayloadTruncated
 )
 
 // NewDefaultArtifactValidator constructs the production validator.

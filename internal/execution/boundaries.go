@@ -244,6 +244,13 @@ func preflightTargetBytes(root, target string) int {
 // classification keeps working.
 var ErrOutputExhausted = fmt.Errorf("%w — discarded at the output gate", ErrOutputTruncated)
 
+// ErrPayloadTruncated is the explicit truncation signal required by the
+// LLM stream deadlock fix: finish_reason == "length" must fail fast before
+// JSON/envelope parsing. It wraps the legacy ErrOutputTruncated sentinel so
+// errors.Is checks for both succeed, but its message matches the directive's
+// required string.
+var ErrPayloadTruncated = fmt.Errorf("%w: model output exceeded max_tokens limit", ErrOutputTruncated)
+
 // ErrProviderRefused is the canonical refusal circuit break: the provider
 // refused or filtered the generation. Nothing was parsed or staged.
 var ErrProviderRefused = errors.New("executor: provider refused generation")

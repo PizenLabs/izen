@@ -2678,6 +2678,11 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			}
 			streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: usage.FinishReason, Usage: usage})
 		}
+		// Task 1: intercept truncated payload BEFORE ingestion.
+		if NormalizeFinishReason(usage.FinishReason) == CanonicalOutputExhausted {
+			gate := &OutputGateError{Outcome: CanonicalOutputExhausted, Target: "", FinishReason: usage.FinishReason}
+			return "", usage, nil, errors.Join(gate, ErrPayloadTruncated)
+		}
 		// Transport normalization: preserve the raw response and record every
 		// transformation in an IngestionTrace before the payload reaches the
 		// L1 Execution Gate / artifact parser.
@@ -2703,6 +2708,16 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		return visible, usage, trace, nil
 	}
 	defer func() { _ = rawStream.Close() }()
+	// Task 2: strict HTTP context cancellation — force-close SSE body on interrupt.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = rawStream.Close()
+		case <-done:
+		}
+	}()
 
 	// Authoritative live usage: only provider-reported counts (Known &&
 	// !Estimated) are ever emitted as provider.usage_update.
@@ -2821,6 +2836,17 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	// Reasoning telemetry: duration + provider-reported token count only.
 	if reasoningSeen && (reasoningDuration > 0 || usage.ReasoningTokens > 0) {
 		g.ReasoningTelemetry(model, reasoningDuration, usage.ReasoningTokens)
+	}
+	// Task 1: truncated payload handling — intercept BEFORE ingestion/JSON parsing.
+	// A finish_reason == "length" payload is an incomplete prefix by definition
+	// (I1); it must fail fast with ErrPayloadTruncated and never enter the
+	// ingestion repair loop or the FULL_REWRITE->BOUNDED_PATCH transition.
+	if NormalizeFinishReason(usage.FinishReason) == CanonicalOutputExhausted {
+		if streamCb != nil {
+			streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: usage.FinishReason, Usage: usage})
+		}
+		gate := &OutputGateError{Outcome: CanonicalOutputExhausted, Target: "", FinishReason: usage.FinishReason}
+		return "", usage, nil, errors.Join(gate, ErrPayloadTruncated)
 	}
 	// Transport normalization: preserve the exact raw stream output and record
 	// every transformation in an IngestionTrace before the payload reaches the
