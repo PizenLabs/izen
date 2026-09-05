@@ -297,6 +297,15 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		StreamCallback:  d.streamCb,
 		WorkspaceDigest: d.adapter.WorkspaceVersion(d.resolved.Targets),
 	}
+	// Adaptive heuristic (Task 1): bypass FULL_REWRITE for large targets
+	// or small model budgets; force BOUNDED_PATCH as initial strategy.
+	if len(d.resolved.Targets) > 0 && d.resolved.Targets[0] != "" {
+		targetFile := d.resolved.Targets[0]
+		fileSize := autonomy.FileSizeBytes(targetFile)
+		if adaptive := autonomy.AdaptiveSelectStrategy(targetFile, fileSize, d.resolved.Profile.MaxOutputTokens); adaptive == autonomy.StrategyBoundedPatch {
+			d.mutationStrategy = StrategyBoundedPatch
+		}
+	}
 	// Clear the callback after capturing it for this run.
 	d.streamCb = nil
 	if d.resolved.Ambiguous {

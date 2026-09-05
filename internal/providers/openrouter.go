@@ -399,6 +399,11 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 		Stream:      stream,
 		Reasoning:   reasoningFor(req),
 	}
+	// Default max output tokens for code generation tasks if not explicitly
+	// limited by the provider or user request.
+	if body.MaxTokens == 0 {
+		body.MaxTokens = 4096
+	}
 	if stream {
 		body.StreamOptions = &streamOptions{IncludeUsage: true}
 	}
