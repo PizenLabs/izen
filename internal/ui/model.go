@@ -2522,12 +2522,7 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	// For non-autonomous the operation is already finalized; for autonomous
 	// keep autonomousActive true until the driver terminal message but still
 	// force the presentation to IDLE.
-	if !m.autonomousActive {
-		// already handled
-	} else {
-		// keep autonomousActive true until driver abort, but force state
-		// to chat via sync below — the spinner/flags are already cleared.
-	}
+	_ = m.autonomousActive // referenced; no branch mutation needed
 	m.syncUIState()
 	// Force state to chat even when autonomousActive would otherwise keep
 	// it in processing — the directive requires immediate IDLE.

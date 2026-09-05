@@ -284,10 +284,11 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("openai: do: %w", err)
 	}
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
 		return LLMResponse{}, fmt.Errorf("openai: status %d: %s", resp.StatusCode, string(respBody))
 	}
 	// Task 2: strict cancellation — force-close SSE body when context is cancelled.
