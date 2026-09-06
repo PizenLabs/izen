@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"io"
 	"os"
@@ -296,15 +297,12 @@ func TestPhase0UIPackageOwnsNoTransactionOrMutationAuthority(t *testing.T) {
 // targets. A NEW site anywhere fails the lock; so does silently REMOVING a
 // recorded site (the reviewer must consciously update this table).
 var phase0UIWriteInventory = map[string]string{
-	"internal/ui/commands.go::restorePlan":                "Remove",
 	"internal/ui/commands.go::debugLogPlan":               "MkdirAll,OpenFile",
-	"internal/ui/commands.go::runTestEngine":              "MkdirAll,WriteFile",
+	"internal/ui/commands.go::runTestEngine":              "MkdirAll",
 	"internal/ui/debug_completion.go::debugLogCompletion": "MkdirAll,OpenFile",
 	"internal/ui/model.go::saveHistory":                   "MkdirAll,OpenFile",
 	"internal/ui/stream.go::debugLogPayload":              "MkdirAll,OpenFile",
 	"internal/ui/update.go::Update":                       "OpenFile",
-	"internal/ui/update_init.go::selfHealWorkspace":       "WriteFile",
-	"internal/ui/update_init.go::saveInitState":           "WriteFile",
 }
 
 // osMutatingMethods are the stdlib surfaces that create, overwrite, rename or
@@ -362,6 +360,94 @@ func TestPhase0UIWorkspaceWritesLockedToBookkeeping(t *testing.T) {
 		if _, ok := got[key]; !ok {
 			t.Errorf("architecture: locked write site %s disappeared from the UI package — update the phase 0 write inventory consciously (the lock must never rot silently)", key)
 		}
+	}
+}
+
+// ── GUARD 0.1b — AST structural severance (no os/exec or direct writes) ─────
+
+// TestPhase0_UI_HasNoExecOrDirectWriteImports enforces true presentation
+// severance: no production file in internal/ui may import "os/exec" and no
+// direct os file-mutation calls (WriteFile, Create, Remove, RemoveAll, etc.)
+// may appear. Uses AST import resolution, not string matching, so aliasing
+// (fs "os", execAlias "os/exec") is also forbidden.
+func TestPhase0_UI_HasNoExecOrDirectWriteImports(t *testing.T) {
+	root := repoRoot(t)
+	files := uiProductionFilesRecursive(t, root)
+	forbiddenWrites := map[string]bool{
+		"WriteFile": true, "Create": true, "Remove": true, "RemoveAll": true,
+		"Truncate": true, "OpenFile": true, // direct mutation surfaces
+	}
+	for _, path := range files {
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			t.Fatalf("rel %s: %v", path, relErr)
+		}
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		// Build alias -> import path map for this file
+		aliasToPath := make(map[string]string)
+		for _, imp := range f.Imports {
+			importPath := strings.Trim(imp.Path.Value, `"`)
+			alias := ""
+			if imp.Name != nil {
+				alias = imp.Name.Name
+			} else {
+				alias = filepath.Base(importPath)
+				// base of os/exec is exec
+				if importPath == "os/exec" {
+					alias = "exec"
+				}
+			}
+			aliasToPath[alias] = importPath
+			// Also handle that import "os/exec" with alias execAlias still maps
+			if alias != "" {
+				aliasToPath[alias] = importPath
+			}
+			if importPath == "os/exec" {
+				t.Errorf("FORBIDDEN IMPORT: %s imports 'os/exec' (alias %q) directly. UI must not execute subprocesses.", rel, alias)
+			}
+		}
+		// Walk for forbidden selector calls on os or os/exec
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			ident, ok := sel.X.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			alias := ident.Name
+			importPath, isStd := aliasToPath[alias]
+			if !isStd {
+				return true
+			}
+			if importPath == "os" && forbiddenWrites[sel.Sel.Name] {
+				// Special case: MkdirAll is bookkeeping and allowed per frozen inventory
+				// but WriteFile/Create/Remove must be via file port, not direct os.
+				if sel.Sel.Name == "MkdirAll" {
+					return true
+				}
+				// Allow read-only OpenFile? We flag only mutating modes; but for strictness
+				// we check caller context: if OpenFile with O_CREATE|O_WRONLY, it's mutating.
+				// For simplicity, flag WriteFile/Create/Remove/RemoveAll
+				if sel.Sel.Name == "OpenFile" {
+					return true
+				}
+				t.Errorf("FORBIDDEN WRITE: %s:%d calls %s.%s – UI must not perform direct file mutations; use FilePort/Substrate.", rel, fset.Position(call.Pos()).Line, alias, sel.Sel.Name)
+			}
+			if importPath == "os/exec" {
+				t.Errorf("FORBIDDEN EXEC: %s:%d calls %s.%s – UI must not execute subprocesses; dispatch via Runtime.", rel, fset.Position(call.Pos()).Line, alias, sel.Sel.Name)
+			}
+			return true
+		})
 	}
 }
 

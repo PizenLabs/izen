@@ -107,6 +107,8 @@ type FilePort interface {
 	List(ctx context.Context, dir string) ([]string, error)
 	// Exists reports whether the file at path exists.
 	Exists(ctx context.Context, path string) bool
+	// Remove deletes the file at path.
+	Remove(ctx context.Context, path string) error
 }
 
 // Message is a single conversational turn sent to an LLM.

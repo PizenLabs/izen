@@ -4,12 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -419,17 +417,30 @@ func resolveUsername(root string, localCfg *config.LocalConfig) string {
 }
 
 func gitUsername(root string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "config", "user.name")
-	cmd.Dir = root
-	out, err := cmd.Output()
+	// No subprocess in presentation layer – read git config directly.
+	// This is best-effort; empty on failure.
+	data, err := os.ReadFile(filepath.Join(root, ".git", "config"))
 	if err != nil {
 		return ""
 	}
-	val := strings.TrimSpace(string(out))
-	if val != "" {
-		return val
+	inUser := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, "[") && strings.HasSuffix(trim, "]") {
+			inUser = trim == "[user]"
+			continue
+		}
+		if inUser {
+			if strings.HasPrefix(trim, "name") {
+				parts := strings.SplitN(trim, "=", 2)
+				if len(parts) == 2 {
+					val := strings.TrimSpace(parts[1])
+					if val != "" {
+						return val
+					}
+				}
+			}
+		}
 	}
 	return ""
 }
