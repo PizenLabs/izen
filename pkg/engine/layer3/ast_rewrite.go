@@ -629,7 +629,7 @@ func ApplyPatches(ctx context.Context, root string, patches []FilePatch) (*Apply
 // ApplyPatchesWithSubstrate compiles patches into a Proposal and executes via
 // the provided Substrate. When sub is nil an in-memory validation pass is
 // performed without committing, preserving pure-compiler semantics for tests.
-func ApplyPatchesWithSubstrate(ctx context.Context, root string, patches []FilePatch, sub substrate.Substrate) (*ApplyResult, error) {
+func ApplyPatchesWithSubstrate(ctx context.Context, root string, patches []FilePatch, sub substrate.ProposalExecutor) (*ApplyResult, error) {
 	applied := 0
 	ops := make([]substrate.Operation, 0, len(patches))
 	for _, p := range patches {

@@ -198,7 +198,7 @@ type Pipeline struct {
 	// substrate is the SINGLE MUTATION AUTHORITY. All file mutations,
 	// regardless of entrypoint, pass through it and share the same ledger
 	// and ExecutionProof.
-	substrate substrate.Substrate
+	substrate substrate.ProposalExecutor
 
 	// readGuard is the enforcement seam for workspace file reads. Under a
 	// full-overwrite context it sanitizes every read so obsolete content can
@@ -255,7 +255,7 @@ func NewPipeline(opts ...Option) (*Pipeline, error) {
 // ConcreteSubstrate bound to the pipeline workspace root. When set, all
 // staged TxFS writes are extracted into a substrate.Proposal and executed via
 // Substrate.Execute, sharing the single MutationSet ledger and ExecutionProof.
-func WithSubstrate(s substrate.Substrate) Option {
+func WithSubstrate(s substrate.ProposalExecutor) Option {
 	return func(p *Pipeline) {
 		if s != nil {
 			p.substrate = s

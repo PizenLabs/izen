@@ -94,7 +94,7 @@ func WithClock(now func() time.Time) Option {
 // WithSubstrate wires the Substrate authority. When set, external patch
 // generation is wrapped into a Proposal and passed to Substrate; session.Apply
 // remains restricted to internal state/variable updates.
-func WithSubstrate(s substrate.Substrate) Option {
+func WithSubstrate(s substrate.ProposalExecutor) Option {
 	return func(o *ControlLoopOrchestrator) {
 		if s != nil {
 			o.substrate = s
@@ -130,7 +130,7 @@ type ControlLoopOrchestrator struct {
 	pool          *WorkerPool
 	approvals     ApprovalRequester
 	bus           *telemetry.EventBus
-	substrate     substrate.Substrate
+	substrate     substrate.ProposalExecutor
 	now           func() time.Time
 	maxIterations int
 }
