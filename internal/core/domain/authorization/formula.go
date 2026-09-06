@@ -108,9 +108,6 @@ type CapabilityGuard interface {
 // SimpleCapabilityGuard is a deterministic implementation of CapabilityGuard.
 type SimpleCapabilityGuard struct{}
 
-// NewCapabilityGuard returns a new guard.
-func NewCapabilityGuard() *SimpleCapabilityGuard { return &SimpleCapabilityGuard{} }
-
 // Evaluate returns Permit or Deny with the first failing clause.
 func (g *SimpleCapabilityGuard) Evaluate(_ context.Context, in AuthorizationInput) AuthorizationDecision {
 	frameID := domain.FrameID("")

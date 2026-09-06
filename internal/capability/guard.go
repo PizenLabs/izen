@@ -6,8 +6,3 @@ import "github.com/PizenLabs/izen/internal/core/domain/authorization"
 
 // CapabilityGuard is the authorization gate for the execution pipeline.
 type CapabilityGuard = authorization.CapabilityGuard
-
-// NewGuard creates a new capability guard.
-func NewGuard() *authorization.SimpleCapabilityGuard {
-	return authorization.NewCapabilityGuard()
-}
