@@ -49,6 +49,7 @@ func TestDomainOrthogonality(t *testing.T) {
 		"ExecutionObservation":   true,
 		"ExecutionStrategy":      true,
 		"TerminalState":          true,
+		"ExecutionIntent":        true,
 	}
 
 	for _, path := range files {

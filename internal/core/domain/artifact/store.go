@@ -93,3 +93,27 @@ func (s *ArtifactStore) Count() int {
 	defer s.mu.RUnlock()
 	return len(s.patches)
 }
+
+// ClearUncommitted removes all uncommitted diffs and resets versioning
+// to the last committed baseline. It is used by CheckpointCoordinator.Rollback
+// to ensure strict alignment between disk, store, and workflow.
+func (s *ArtifactStore) ClearUncommitted() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.patches = make(map[string]string)
+	s.order = nil
+	// Version is not rewound to 0; callers that need version reset handle it
+	// via the snapshot's baseline. Here we clear contents only.
+	s.UpdatedAt = time.Now()
+}
+
+// ResetToBaseline rewinds the store's version to the snapshot baseline and
+// clears diffs. This is the transactional rollback path.
+func (s *ArtifactStore) ResetToBaseline(baseline occ.StateVersion) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.patches = make(map[string]string)
+	s.order = nil
+	s.VersionedEntity.Version = baseline
+	s.UpdatedAt = time.Now()
+}

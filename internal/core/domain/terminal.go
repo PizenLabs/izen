@@ -35,8 +35,27 @@ type TerminalState struct {
 
 // Valid enforces the forbidden-combination rules (INV:11, INV:8, INV:9).
 func (t TerminalState) Valid() bool {
+	// INV:8 — Only COMPLETED may be VERIFIED. FAILED/INCOMPLETE/ABORTED can never be VERIFIED.
+	// INV:11 — Forbidden matrices: INCOMPLETE·VERIFIED, FAILED·VERIFIED, ABORTED·VERIFIED.
 	if t.Evidence == EvidenceVerified && t.Outcome != OutcomeCompleted {
 		return false
+	}
+	// INV:9 — Resource exhaustion / failure semantics: FAILED must not be VERIFIED (already covered)
+	// but also INCOMPLETE must not be VERIFIED. The above already handles all non-COMPLETED.
+	// Keep explicit checks for clarity and to catch future outcome additions.
+	switch t.Outcome {
+	case OutcomeIncomplete:
+		if t.Evidence == EvidenceVerified {
+			return false
+		}
+	case OutcomeFailed:
+		if t.Evidence == EvidenceVerified {
+			return false
+		}
+	case OutcomeAborted:
+		if t.Evidence == EvidenceVerified {
+			return false
+		}
 	}
 	return true
 }

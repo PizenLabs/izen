@@ -7,6 +7,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/core/domain/authorization"
 	"github.com/PizenLabs/izen/internal/core/domain/checkpoint"
+	"github.com/PizenLabs/izen/internal/core/domain/evidence"
 	"github.com/PizenLabs/izen/internal/core/domain/occ"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
@@ -189,10 +190,29 @@ func (e *RuntimeExecutor) Execute(ctx context.Context, intent domain.ExecutionIn
 		}
 	}
 
-	// Step 6: Record ExecutionObservation and advance state version via OCCGate (already advanced in step 1).
-	// The version was advanced optimistically at step 1; if substrate failed we would have rolled back
-	// logically but version already moved. For the domain model, version advances only on success.
+	// Step 6: Evidence collection & transactional rollback (Phase 5).
+	// Aggregate stdout/exit codes/test logs into EvidenceVector and derive terminal state.
+	// If verification fails, trigger CheckpointCoordinator.Rollback before returning Failed.
+	requiredLevel := evidence.L3_UnitTests
+	if intent.Unit.Verification.RequiredLevel > domain.LevelNone {
+		requiredLevel = evidence.EvidenceLevel(intent.Unit.Verification.RequiredLevel)
+	}
+	vec := BuildEvidenceVector(result, "", 0, "", intent.HumanApproved)
+	evState := e.EvaluateEvidenceAndRollback(trackedCtx, vec, requiredLevel, intent.CheckpointID, domain.RollbackLocal)
+	if evState == evidence.VerdictFailed {
+		obs := domain.ExecutionObservation{
+			UnitID:          intent.Unit.UnitID,
+			ProposalOutcome: domain.ProposalRejected,
+			MutationResult:  &result,
+			OutputStatus:    domain.OutputComplete,
+			BudgetUsage:     e.tracker.Usage(),
+			DependencyFresh: domain.FreshnessValid,
+			FailureSignals:  []domain.FailureSignal{{Class: domain.FailureTest, Message: "evidence verification failed: required level not met"}},
+		}
+		return obs, fmt.Errorf("evidence: verification failed at required level %s", requiredLevel.String())
+	}
 
+	// Step 7: Record ExecutionObservation and advance state version via OCCGate (already advanced in step 1).
 	obs := domain.ExecutionObservation{
 		UnitID:          intent.Unit.UnitID,
 		ProposalOutcome: domain.ProposalAccepted,

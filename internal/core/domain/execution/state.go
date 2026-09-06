@@ -93,3 +93,23 @@ func (s *ExecutionState) Count() int {
 	defer s.mu.RUnlock()
 	return len(s.steps)
 }
+
+// ResetToBaseline rewinds versioning to the frame's baseline version and
+// clears recorded steps. It is idempotent and used by CheckpointCoordinator.Rollback.
+func (s *ExecutionState) ResetToBaseline(baseline occ.StateVersion) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.steps = make(map[string]string)
+	s.order = nil
+	s.VersionedEntity.Version = baseline
+	s.UpdatedAt = time.Now()
+}
+
+// Clear removes all steps without resetting version.
+func (s *ExecutionState) Clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.steps = make(map[string]string)
+	s.order = nil
+	s.UpdatedAt = time.Now()
+}
