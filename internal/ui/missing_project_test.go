@@ -1,7 +1,7 @@
 package ui
 
 import (
-	"os"
+	fs "os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -41,7 +41,7 @@ func writeInitializedWorkspace(t *testing.T, root string) {
 		t.Fatalf("SaveLocalConfig = %v", err)
 	}
 	sessPath := filepath.Join(root, ".izen", state.SessionFile)
-	if err := os.WriteFile(sessPath, []byte("{}"), 0644); err != nil {
+	if err := fs.WriteFile(sessPath, []byte("{}"), 0644); err != nil {
 		t.Fatalf("WriteFile session.json = %v", err)
 	}
 }
@@ -81,7 +81,7 @@ func TestStaleInitCompleteWithoutProjectRoutesToWizard(t *testing.T) {
 	// self-healing is forced to fail — exactly the degraded recovery path.
 	parent := t.TempDir()
 	blocker := filepath.Join(parent, "blocker")
-	if err := os.WriteFile(blocker, []byte("not a dir"), 0644); err != nil {
+	if err := fs.WriteFile(blocker, []byte("not a dir"), 0644); err != nil {
 		t.Fatalf("WriteFile = %v", err)
 	}
 
@@ -141,7 +141,7 @@ func TestSelfHealRecreatesDeletedIzen(t *testing.T) {
 	m.userName = "Jaky"
 
 	// Simulate the deletion.
-	if err := os.RemoveAll(filepath.Join(root, ".izen")); err != nil {
+	if err := fs.RemoveAll(filepath.Join(root, ".izen")); err != nil {
 		t.Fatalf("RemoveAll .izen = %v", err)
 	}
 	if m.isProjectInitialized() {
@@ -159,7 +159,7 @@ func TestSelfHealRecreatesDeletedIzen(t *testing.T) {
 		t.Errorf("initStage = %v, want initComplete (interactive) after self-heal", m2.initStage)
 	}
 	for _, f := range []string{"config.json", "session.json"} {
-		if _, err := os.Stat(filepath.Join(root, ".izen", f)); err != nil {
+		if _, err := fs.Stat(filepath.Join(root, ".izen", f)); err != nil {
 			t.Errorf(".izen/%s not recreated: %v", f, err)
 		}
 	}
@@ -207,7 +207,7 @@ func TestOnboardingFlowCreatesIzenAndReachesInteractive(t *testing.T) {
 	}
 
 	// .izen/ must now exist (identity is persisted) even before provider select.
-	if _, err := os.Stat(filepath.Join(root, ".izen")); err != nil {
+	if _, err := fs.Stat(filepath.Join(root, ".izen")); err != nil {
 		t.Fatalf(".izen/ was not created during onboarding: %v", err)
 	}
 
@@ -217,7 +217,7 @@ func TestOnboardingFlowCreatesIzenAndReachesInteractive(t *testing.T) {
 	if m.initStage != initComplete {
 		t.Fatalf("initStage = %v, want initComplete", m.initStage)
 	}
-	if _, err := os.Stat(filepath.Join(root, ".izen", "config.json")); err != nil {
+	if _, err := fs.Stat(filepath.Join(root, ".izen", "config.json")); err != nil {
 		t.Fatalf(".izen/config.json was not written on onboarding completion: %v", err)
 	}
 	if !m.isProjectInitialized() {

@@ -50,7 +50,7 @@ func (b *blockingProvider) ExecuteStream(context.Context, ai.Request) (io.ReadCl
 // ── D. Subprocess cancellation ────────────────────────────────────────────
 
 // TestRegressionSubprocessCancellation asserts Ctrl+C terminates a running
-// child process (context-aware exec.CommandContext) and the runtime survives.
+// child process (context-aware execAlias.CommandContext) and the runtime survives.
 func TestRegressionSubprocessCancellation(t *testing.T) {
 	m := newTestModel()
 	// `exec sleep` replaces bash with the sleep process so the direct child IS

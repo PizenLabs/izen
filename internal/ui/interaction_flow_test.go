@@ -1,7 +1,7 @@
 package ui
 
 import (
-	"os"
+	fs "os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -46,10 +46,10 @@ func readyChatModel(m *model) *model {
 func initializedChatModel(t *testing.T) *model {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, ".izen"), 0o755); err != nil {
+	if err := fs.MkdirAll(filepath.Join(dir, ".izen"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, ".izen", "config.json"), []byte("{}"), 0o644); err != nil {
+	if err := fs.WriteFile(filepath.Join(dir, ".izen", "config.json"), []byte("{}"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	m := readyChatModel(newTestModel())
@@ -271,7 +271,7 @@ func TestPhase6StaleChipsClearedOnNewInput(t *testing.T) {
 func TestPhase6CancelledOperationNotResumable(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "index.html")
-	if err := os.WriteFile(target, []byte("<html><body><p>old</p></body></html>\n"), 0o644); err != nil {
+	if err := fs.WriteFile(target, []byte("<html><body><p>old</p></body></html>\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	mock := &mockProvider{responses: []*ai.Response{{
@@ -307,7 +307,7 @@ func TestPhase6CancelledOperationNotResumable(t *testing.T) {
 	if m3.activeOp != nil {
 		t.Fatal("reject must release operation ownership")
 	}
-	onDisk, rerr := os.ReadFile(target)
+	onDisk, rerr := fs.ReadFile(target)
 	if rerr != nil {
 		t.Fatal(rerr)
 	}

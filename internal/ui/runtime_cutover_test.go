@@ -1,7 +1,7 @@
 package ui
 
 import (
-	"os"
+	fs "os"
 	"strings"
 	"sync"
 	"testing"
@@ -195,7 +195,7 @@ func TestRuntimeCutoverFlagOnRoutesHotThroughExecutor(t *testing.T) {
 func TestRuntimeCutoverFlagOnAmbiguousTargetStaysExplicit(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := os.WriteFile("README.md", []byte("# repo\n"), 0o644); err != nil {
+	if err := fs.WriteFile("README.md", []byte("# repo\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	mock := &mockProvider{responses: []*ai.Response{{Content: "x"}}}
@@ -323,7 +323,7 @@ func TestRuntimeCutoverVerificationFailureIsNotSuccess(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 	orig := "<!DOCTYPE html>\n<html>\n<body>\n  <h1>Home</h1>\n  <p>body</p>\n</body>\n</html>\n"
-	if err := os.WriteFile("index.html", []byte(orig), 0o644); err != nil {
+	if err := fs.WriteFile("index.html", []byte(orig), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	mock := &mockProvider{responses: []*ai.Response{{
@@ -371,7 +371,7 @@ func TestRuntimeCutoverVerificationFailureIsNotSuccess(t *testing.T) {
 		t.Fatalf("verifier failure must not report a successful mutation, outcome=%q", mr.res.Proof.Outcome)
 	}
 	// The failed apply must not leave the mutation on disk.
-	onDisk, rerr := os.ReadFile("index.html")
+	onDisk, rerr := fs.ReadFile("index.html")
 	if rerr != nil {
 		t.Fatal(rerr)
 	}
@@ -415,7 +415,7 @@ func TestRuntimeCutoverApproveAppliesThroughExecutor(t *testing.T) {
 	// matching the executor's bounded-mutation apply contract for existing
 	// files.
 	orig := "<!DOCTYPE html>\n<html>\n<body>\n  <h1>Home</h1>\n  <p>body</p>\n</body>\n</html>\n"
-	if err := os.WriteFile("index.html", []byte(orig), 0o644); err != nil {
+	if err := fs.WriteFile("index.html", []byte(orig), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	mock := &mockProvider{responses: []*ai.Response{{
@@ -490,7 +490,7 @@ func TestRuntimeCutoverApproveAppliesThroughExecutor(t *testing.T) {
 	}
 
 	// The filesystem actually changed.
-	onDisk, rerr := os.ReadFile("index.html")
+	onDisk, rerr := fs.ReadFile("index.html")
 	if rerr != nil {
 		t.Fatal(rerr)
 	}

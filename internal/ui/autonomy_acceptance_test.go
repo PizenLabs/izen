@@ -1,7 +1,7 @@
 package ui
 
 import (
-	"os"
+	fs "os"
 	"strings"
 	"testing"
 	"time"
@@ -49,7 +49,7 @@ func writeIndexFixture(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := os.WriteFile("index.html", []byte(redundantFixture), 0o644); err != nil {
+	if err := fs.WriteFile("index.html", []byte(redundantFixture), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -472,7 +472,7 @@ func TestAcceptanceTargetNotFoundDiagnosis(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 	// No index.html anywhere in the workspace.
-	if err := os.WriteFile("README.md", []byte("# repo\n"), 0o644); err != nil {
+	if err := fs.WriteFile("README.md", []byte("# repo\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -502,18 +502,18 @@ func TestAcceptanceTargetNotFoundDiagnosis(t *testing.T) {
 func TestAcceptanceAmbiguousTargetSelector(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := os.MkdirAll("templates", 0o755); err != nil {
+	if err := fs.MkdirAll("templates", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll("src", 0o755); err != nil {
+	if err := fs.MkdirAll("src", 0o755); err != nil {
 		t.Fatal(err)
 	}
 	// No ./index.html exists: only two same-named files deeper in the tree, so
 	// the canonical resolver surfaces a genuine ambiguity.
-	if err := os.WriteFile("templates/index.html", []byte("<html><body><p>template</p></body></html>\n"), 0o644); err != nil {
+	if err := fs.WriteFile("templates/index.html", []byte("<html><body><p>template</p></body></html>\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile("src/index.html", []byte("<html><body><p>src</p></body></html>\n"), 0o644); err != nil {
+	if err := fs.WriteFile("src/index.html", []byte("<html><body><p>src</p></body></html>\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

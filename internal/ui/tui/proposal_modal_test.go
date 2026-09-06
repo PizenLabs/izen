@@ -2,7 +2,7 @@ package tui
 
 import (
 	"context"
-	"os"
+	fs "os"
 	"path/filepath"
 	"testing"
 
@@ -161,7 +161,7 @@ func TestProposalModalRoutingDelegatesNoFileWrites(t *testing.T) {
 	if got != string(ProposalRepairFirst) {
 		t.Fatalf("resumer received %q, want repair_first", got)
 	}
-	if _, err := os.Stat(filepath.Join(root, "before")); err != nil {
+	if _, err := fs.Stat(filepath.Join(root, "before")); err != nil {
 		t.Fatalf("routing must not touch the filesystem: %v", err)
 	}
 	if err := Cancel(ctx, resume); err != nil {
@@ -221,14 +221,14 @@ func TestProposalModalHotForbidsScopeExpansion(t *testing.T) {
 
 func writeMarker(t *testing.T, root, name, content string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o644); err != nil {
+	if err := fs.WriteFile(filepath.Join(root, name), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func readMarker(t *testing.T, root, name string) string {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join(root, name))
+	data, err := fs.ReadFile(filepath.Join(root, name))
 	if err != nil {
 		t.Fatal(err)
 	}

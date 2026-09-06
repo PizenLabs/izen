@@ -1,7 +1,7 @@
 package ui
 
 import (
-	"os"
+	fs "os"
 	"strings"
 	"testing"
 
@@ -82,7 +82,7 @@ func TestAutonomyValidationCase2InspectRoutesToInvestigate(t *testing.T) {
 func TestAutonomyValidationCase3MutationProposalThenExecutes(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := os.WriteFile("index.html", []byte("<html><body><main><p>keep</p></main>stray text</body></html>\n"), 0o644); err != nil {
+	if err := fs.WriteFile("index.html", []byte("<html><body><main><p>keep</p></main>stray text</body></html>\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -185,7 +185,7 @@ func TestAutonomyProposalKeyboardNavigation(t *testing.T) {
 func TestAutonomyGrantNoRepeatedApproval(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := os.WriteFile("index.html", []byte("<html><body><main><p>keep</p></main>stray text</body></html>\n"), 0o644); err != nil {
+	if err := fs.WriteFile("index.html", []byte("<html><body><main><p>keep</p></main>stray text</body></html>\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -303,7 +303,7 @@ func TestAutonomyOwnsIntentAfterBoundary(t *testing.T) {
 func TestAutonomyConfirmationGateNoLoop(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := os.WriteFile("index.html", []byte("<html><body><main><p>keep</p></main>stray text</body></html>\n"), 0o644); err != nil {
+	if err := fs.WriteFile("index.html", []byte("<html><body><main><p>keep</p></main>stray text</body></html>\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -358,7 +358,7 @@ func TestAutonomyContextEvidenceLedger(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 	indexHTML := "<html><body><main><p>keep</p></main>stray text</body></html>\n"
-	if err := os.WriteFile("index.html", []byte(indexHTML), 0o644); err != nil {
+	if err := fs.WriteFile("index.html", []byte(indexHTML), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

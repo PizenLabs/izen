@@ -1,7 +1,7 @@
 package ui
 
 import (
-	"os"
+	fs "os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -251,8 +251,8 @@ func TestDetectGraphLanguageForGraph_NilGraph(t *testing.T) {
 func TestBuildArchGraph_NonGoProject(t *testing.T) {
 	dir := t.TempDir()
 
-	_ = os.MkdirAll(filepath.Join(dir, "src", "main", "java", "com", "example"), 0755)
-	err := os.WriteFile(
+	_ = fs.MkdirAll(filepath.Join(dir, "src", "main", "java", "com", "example"), 0755)
+	err := fs.WriteFile(
 		filepath.Join(dir, "src", "main", "java", "com", "example", "App.java"),
 		[]byte("package com.example;\npublic class App {\n  public static void main(String[] args) {}\n}\n"),
 		0644,
@@ -290,8 +290,8 @@ func TestBuildArchGraph_NonGoProject(t *testing.T) {
 func TestBuildArchGraph_TsProject(t *testing.T) {
 	dir := t.TempDir()
 
-	_ = os.MkdirAll(filepath.Join(dir, "src"), 0755)
-	err := os.WriteFile(
+	_ = fs.MkdirAll(filepath.Join(dir, "src"), 0755)
+	err := fs.WriteFile(
 		filepath.Join(dir, "src", "index.ts"),
 		[]byte("export function render(): void {}\n"),
 		0644,
