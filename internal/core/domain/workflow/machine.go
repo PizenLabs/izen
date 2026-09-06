@@ -15,8 +15,8 @@ type WorkflowState = domain.WorkflowState
 // The actual machine delegates to the core/workflow implementation but
 // exposes the domain contracts for Phase 2 alignment.
 type Machine struct {
-	current     domain.WorkflowState
-	coordinator checkpoint.CheckpointCoordinator
+	current         domain.WorkflowState
+	coordinator     checkpoint.CheckpointCoordinator
 	pendingApproval bool
 }
 
