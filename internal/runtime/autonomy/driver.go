@@ -133,7 +133,7 @@ type Driver struct {
 
 	// substrate is the execution target — the single authority that executes
 	// Proposals. The Driver never mutates the filesystem directly.
-	substrate substrate.Substrate
+	substrate substrate.ProposalExecutor
 }
 
 // Option configures the Driver during construction.
@@ -201,7 +201,7 @@ func WithPreflightState(s *preflight.ObservationState) Option {
 // WithSubstrate wires the Substrate execution target. When set, the Driver
 // holds the Substrate as its mutation authority; Strategies emit Proposals
 // that execute via Substrate, never directly.
-func WithSubstrate(s substrate.Substrate) Option {
+func WithSubstrate(s substrate.ProposalExecutor) Option {
 	return func(d *Driver) {
 		if s != nil {
 			d.substrate = s
@@ -217,7 +217,7 @@ func WithSubcommand(s string) Option {
 }
 
 // Substrate returns the execution target.
-func (d *Driver) Substrate() substrate.Substrate {
+func (d *Driver) Substrate() substrate.ProposalExecutor {
 	if d == nil {
 		return nil
 	}

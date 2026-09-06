@@ -37,6 +37,10 @@ func (s *staticAdapter) Exists(ctx context.Context, path string) bool {
 	return false
 }
 
+func (s *staticAdapter) Remove(ctx context.Context, path string) error {
+	return nil
+}
+
 func TestCapabilityBits(t *testing.T) {
 	cases := []struct {
 		bit  Capability

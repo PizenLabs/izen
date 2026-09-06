@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"syscall"
+	"time"
 )
 
 // ExecResult captures stdout, stderr and exit code of a command.
@@ -18,6 +20,8 @@ type ExecResult struct {
 
 // ExecCommand runs args[0] with args[1:] in dir with env augmentation.
 // It is the sole exec site; semantic layers delegate via this helper.
+// Process-group isolation ensures a context cancellation kills the entire
+// descendant tree (no orphaned children on budget timeout).
 func ExecCommand(ctx context.Context, dir string, env []string, args []string) ExecResult {
 	if len(args) == 0 {
 		return ExecResult{ExitCode: -1, Err: exec.ErrNotFound}
@@ -29,6 +33,14 @@ func ExecCommand(ctx context.Context, dir string, env []string, args []string) E
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
 	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = 100 * time.Millisecond
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf

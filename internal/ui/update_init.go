@@ -1,12 +1,15 @@
 package ui
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/PizenLabs/izen/internal/infrastructure/capabilities"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -139,9 +142,10 @@ func (m *model) selfHealWorkspace() bool {
 
 	// Session marker anchors HasLocalState so restart never re-enters
 	// onboarding for a workspace that was already initialized.
+	// Routed via file port (no direct write in presentation layer).
 	sessPath := filepath.Join(m.workspaceRoot, ".izen", state.SessionFile)
 	if _, statErr := os.Stat(sessPath); os.IsNotExist(statErr) {
-		if writeErr := os.WriteFile(sessPath, []byte("{}"), 0644); writeErr != nil {
+		if writeErr := capabilities.NewOSFile("").Write(context.Background(), sessPath, "{}"); writeErr != nil {
 			return false
 		}
 	}
@@ -463,10 +467,10 @@ func (m *model) saveInitState() error {
 	if err := config.SaveLocalConfig(root, &config.LocalConfig{Username: m.userName}); err != nil {
 		return err
 	}
-	// Write a minimal session.json to anchor HasLocalState
+	// Write a minimal session.json via file port (no direct write)
 	sessPath := filepath.Join(root, ".izen", "session.json")
 	if _, err := os.Stat(sessPath); os.IsNotExist(err) {
-		if err := os.WriteFile(sessPath, []byte("{}"), 0644); err != nil {
+		if err := capabilities.NewOSFile("").Write(context.Background(), sessPath, "{}"); err != nil {
 			return err
 		}
 	}

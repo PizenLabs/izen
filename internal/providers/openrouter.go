@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
@@ -135,11 +136,17 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 
 	body := p.buildRequest(model, msgs, req, false)
 
-	resp, stats, err := p.doChatRequest(ctx, key, body, false)
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	resp, stats, err := p.doChatRequest(reqCtx, key, body, false)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -219,23 +226,29 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 
 	body := p.buildRequest(model, msgs, req, true)
 
-	resp, stats, err := p.doChatRequest(ctx, key, body, true)
+	reqCtx, cancel := context.WithCancel(ctx)
+	resp, stats, err := p.doChatRequest(reqCtx, key, body, true)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		_ = resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
+		cancel()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("%w: server returned 401: %s", ErrOpenRouterAuth, strings.TrimSpace(string(respBody)))
 	}
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
+		cancel()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("openrouter: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	sr := &openrouterSSEReader{body: resp.Body}
+	sr := &openrouterSSEReader{body: resp.Body, cancel: cancel}
 	sr.usage.markRequestStarted(time.Now())
 	sr.usage.recordTransport(stats.attempts, stats.rateLimitedRetries)
 	return &OpenRouterStreamResult{ReadCloser: sr, sr: sr}, nil
@@ -325,7 +338,7 @@ type openrouterRequest struct {
 	MaxCompletionTokens int                 `json:"max_completion_tokens,omitempty"`
 	Temperature         float64             `json:"temperature,omitempty"`
 	Stop                []string            `json:"stop,omitempty"`
-	Stream              bool                `json:"stream"`
+	Stream              bool                `json:"stream,omitempty"`
 	StreamOptions       *streamOptions      `json:"stream_options,omitempty"`
 	Tools               []json.RawMessage   `json:"tools,omitempty"`
 	// Reasoning carries OpenRouter's provider-agnostic reasoning control. It
@@ -516,6 +529,7 @@ func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body
 		}
 		httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
 		httpReq.Header.Set("X-OpenRouter-Title", "izen")
+		httpReq.Header.Set("X-Title", "izen")
 		httpReq.Header.Set("X-OpenRouter-Categories", "agent-runtime")
 		httpReq.Header.Set("X-OpenRouter-Description", "AI amplifies human judgment. Humans remain in control.")
 		return p.client.Do(httpReq)
@@ -817,9 +831,11 @@ func longestPartialSuffix(data []byte, marker string) int {
 }
 
 type openrouterSSEReader struct {
+	cancel     context.CancelFunc
 	body       io.ReadCloser
 	reader     *bufio.Reader
 	closed     bool
+	closeOnce  sync.Once
 	finalUsage *openrouterUsage
 
 	// think splits inline <think>…</think> blocks out of delta.content into
@@ -892,11 +908,24 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 		data := strings.TrimPrefix(line, "data: ")
 
 		if data == "[DONE]" {
+			if s.cancel != nil {
+				s.cancel()
+			}
 			if tail := s.think.takeResidue(); len(tail) > 0 {
 				s.pending = append(s.pending, tail...)
 			}
 			s.closed = true
 			s.usage.markCompleted(time.Now(), s.finishReason)
+			// IMMEDIATE ZERO-DEFER TEARDOWN: close the underlying HTTP body
+			// synchronously the instant [DONE] is parsed. Discard+Close
+			// signals completion to OpenRouter's edge while returning the TCP
+			// connection to Go's idle pool (Keep-Alive preserved). Pending
+			// bytes are already buffered in-memory, so closing now does not
+			// drop data — next Read drains pending then returns EOF.
+			s.closeOnce.Do(func() {
+				_, _ = io.Copy(io.Discard, s.body)
+				_ = s.body.Close()
+			})
 			if len(s.pending) > 0 {
 				n := copy(p, s.pending)
 				s.pending = s.pending[n:]
@@ -996,5 +1025,13 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 
 func (s *openrouterSSEReader) Close() error {
 	s.closed = true
-	return s.body.Close()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	var err error
+	s.closeOnce.Do(func() {
+		_, _ = io.Copy(io.Discard, s.body)
+		err = s.body.Close()
+	})
+	return err
 }

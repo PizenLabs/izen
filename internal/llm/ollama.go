@@ -66,7 +66,10 @@ func (c *OllamaClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		return LLMResponse{}, fmt.Errorf("ollama: marshal: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(payload))
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("ollama: new request: %w", err)
 	}
@@ -79,7 +82,10 @@ func (c *OllamaClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("ollama: do: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -140,7 +146,10 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		return LLMResponse{}, fmt.Errorf("ollama: marshal: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(payload))
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("ollama: new request: %w", err)
 	}
@@ -155,9 +164,12 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("ollama: do: %w", err)
 	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
 		return LLMResponse{}, fmt.Errorf("ollama: status %d: %s", resp.StatusCode, string(respBody))
 	}
@@ -169,10 +181,12 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	for {
 		chunk, err := reader.ReadChunk()
 		if errors.Is(err, io.EOF) {
+			cancel()
+			_, _ = io.Copy(io.Discard, resp.Body)
 			break
 		}
 		if err != nil {
-			_ = resp.Body.Close()
+			cancel()
 			return LLMResponse{}, fmt.Errorf("ollama: stream: %w", err)
 		}
 
@@ -186,7 +200,7 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 			if delta.ReasoningContent != "" {
 				if req.ReasoningHandler != nil {
 					if err := req.ReasoningHandler(delta.ReasoningContent); err != nil {
-						_ = resp.Body.Close()
+						cancel()
 						return LLMResponse{}, err
 					}
 				}
@@ -195,7 +209,7 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 				full.WriteString(delta.Content)
 				if handler != nil {
 					if err := handler(delta.Content); err != nil {
-						_ = resp.Body.Close()
+						cancel()
 						return LLMResponse{}, err
 					}
 				}
@@ -203,6 +217,8 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		}
 	}
 
+	cancel()
+	_, _ = io.Copy(io.Discard, resp.Body)
 	if tokenIn == 0 && tokenOut == 0 {
 		promptLen := 0
 		for _, m := range req.Messages {

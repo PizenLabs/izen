@@ -165,7 +165,7 @@ type Loop struct {
 	gatePipeline     GatePipeline
 	executor         *executor.RuntimeExecutor
 	reader           SnapshotReader
-	substrate        substrate.Substrate
+	substrate        substrate.ProposalExecutor
 
 	snapshot *MemorySnapshot
 
@@ -199,7 +199,7 @@ func NewLoop(extractor ModelOutputExtractor, gp GatePipeline, exec *executor.Run
 
 // WithSubstrate wires the Substrate authority. When set, ExecuteCycle builds a
 // Proposal and submits via Substrate.Execute. Direct mutation is forbidden.
-func WithSubstrate(s substrate.Substrate) func(*Loop) {
+func WithSubstrate(s substrate.ProposalExecutor) func(*Loop) {
 	return func(l *Loop) {
 		if s != nil {
 			l.substrate = s
@@ -209,7 +209,7 @@ func WithSubstrate(s substrate.Substrate) func(*Loop) {
 
 // NewLoopWithSubstrate wires the closed path with a Substrate authority.
 // It is the mandatory production constructor; nil Substrate panics.
-func NewLoopWithSubstrate(extractor ModelOutputExtractor, gp GatePipeline, exec *executor.RuntimeExecutor, reader SnapshotReader, sub substrate.Substrate) *Loop {
+func NewLoopWithSubstrate(extractor ModelOutputExtractor, gp GatePipeline, exec *executor.RuntimeExecutor, reader SnapshotReader, sub substrate.ProposalExecutor) *Loop {
 	if sub == nil {
 		panic(ErrNilSubstrate)
 	}

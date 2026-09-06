@@ -99,3 +99,14 @@ func (f *OSFile) Exists(ctx context.Context, path string) bool {
 	_, err := os.Stat(f.resolve(path))
 	return err == nil
 }
+
+// Remove deletes the file at path.
+func (f *OSFile) Remove(ctx context.Context, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Remove(f.resolve(path)); err != nil {
+		return fmt.Errorf("osfile: remove %s: %w", path, err)
+	}
+	return nil
+}

@@ -64,14 +64,17 @@ type openAIMessage struct {
 	Content string `json:"content"`
 }
 
-type streamOptions struct {
+type StreamOptions struct {
 	IncludeUsage bool `json:"include_usage"`
 }
+
+// streamOptions is an alias for backward compatibility.
+type streamOptions = StreamOptions
 
 type openAIReq struct {
 	Model         string          `json:"model"`
 	Messages      []openAIMessage `json:"messages"`
-	Stream        bool            `json:"stream"`
+	Stream        bool            `json:"stream,omitempty"`
 	MaxTokens     int             `json:"max_tokens,omitempty"`
 	Temperature   float64         `json:"temperature,omitempty"`
 	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
@@ -168,7 +171,10 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		return LLMResponse{}, fmt.Errorf("openai: marshal: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.resolveEndpoint(), bytes.NewReader(payload))
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.resolveEndpoint(), bytes.NewReader(payload))
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("openai: new request: %w", err)
 	}
@@ -177,6 +183,7 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 	if strings.Contains(c.baseURL, "openrouter") {
 		httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
 		httpReq.Header.Set("X-OpenRouter-Title", "izen")
+		httpReq.Header.Set("X-Title", "izen")
 		httpReq.Header.Set("X-OpenRouter-Categories", "agent-runtime")
 		httpReq.Header.Set("X-OpenRouter-Description", "AI amplifies human judgment. Humans remain in control.")
 	}
@@ -185,7 +192,10 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("openai: do: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -265,7 +275,10 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		return LLMResponse{}, fmt.Errorf("openai: marshal: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.resolveEndpoint(), bytes.NewReader(payload))
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.resolveEndpoint(), bytes.NewReader(payload))
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("openai: new request: %w", err)
 	}
@@ -276,6 +289,7 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	if strings.Contains(c.baseURL, "openrouter") {
 		httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
 		httpReq.Header.Set("X-OpenRouter-Title", "izen")
+		httpReq.Header.Set("X-Title", "izen")
 		httpReq.Header.Set("X-OpenRouter-Categories", "agent-runtime")
 		httpReq.Header.Set("X-OpenRouter-Description", "AI amplifies human judgment. Humans remain in control.")
 	}
@@ -284,19 +298,24 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("openai: do: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
 		return LLMResponse{}, fmt.Errorf("openai: status %d: %s", resp.StatusCode, string(respBody))
 	}
-	// Task 2: strict cancellation — force-close SSE body when context is cancelled.
+	// Ensure the underlying TCP connection is closed immediately when the
+	// parent context is cancelled (context timeout / user abort).
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
 		select {
 		case <-ctx.Done():
+			cancel()
+			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 		case <-done:
 		}
@@ -328,6 +347,10 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	for {
 		chunk, err := reader.ReadChunk()
 		if errors.Is(err, io.EOF) {
+			// Clean SSE termination: data: [DONE] consumed, drain remaining
+			// buffer to io.EOF and signal transport to close immediately.
+			cancel()
+			_, _ = io.Copy(io.Discard, resp.Body)
 			break
 		}
 		if err != nil {
@@ -337,10 +360,10 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				estIn, estOut := resolveUsage()
 				c.publishStreamUsage(c.resolveModel(req.Model), estIn, estOut, true, ctxErr.Error())
-				_ = resp.Body.Close()
+				cancel()
 				return LLMResponse{TokenInput: estIn, TokenOutput: estOut}, fmt.Errorf("openai: stream: %w", err)
 			}
-			_ = resp.Body.Close()
+			cancel()
 			return LLMResponse{}, fmt.Errorf("openai: stream: %w", err)
 		}
 
@@ -373,7 +396,7 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 				reasoning.WriteString(reasoningText)
 				if req.ReasoningHandler != nil {
 					if err := req.ReasoningHandler(reasoningText); err != nil {
-						_ = resp.Body.Close()
+						cancel()
 						return LLMResponse{}, err
 					}
 				}
@@ -383,7 +406,7 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 				full.WriteString(delta.Content)
 				if handler != nil {
 					if err := handler(delta.Content); err != nil {
-						_ = resp.Body.Close()
+						cancel()
 						return LLMResponse{}, err
 					}
 				}
@@ -393,7 +416,7 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 
 	// Fail fast on truncated payload — do NOT attempt envelope parsing.
 	if truncated {
-		_ = resp.Body.Close()
+		cancel()
 		return LLMResponse{TokenInput: tokenIn, TokenOutput: tokenOut}, fmt.Errorf("%w: finish_reason=length", ErrPayloadTruncated)
 	}
 	content := full.String()
@@ -421,7 +444,11 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		}
 		llmResp.TotalCostUSD = EnforceFreeModelOverride(modelID, llmResp.TotalCostUSD)
 	}
-	_ = resp.Body.Close()
+	// Explicit cancel signals the transport to send TCP FIN immediately;
+	// deferred drain ensures connection reuse and prevents OpenRouter's
+	// 5-minute idle timeout.
+	cancel()
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return llmResp, nil
 }
 

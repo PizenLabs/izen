@@ -2,19 +2,19 @@ package ui
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/infrastructure/capabilities"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -27,7 +27,6 @@ import (
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	objengine "github.com/PizenLabs/izen/internal/engine"
-	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/gateway"
 	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/modes"
@@ -141,9 +140,10 @@ func (m *model) restorePlan() ([]plan.Task, error) {
 	if err := json.Unmarshal(data, &tasks); err != nil {
 		return nil, fmt.Errorf("parse stashed plan: %w", err)
 	}
-	// Delete the stash file immediately after successful read so the LLM
-	// never sees it — the restoration is purely a Go-level operation.
-	_ = os.Remove(stashedPlanPath)
+	// Delete the stash file via file port so the LLM never sees it —
+	// restoration is a Go-level operation routed through the substrate
+	// file port (no direct os.Remove in the presentation layer).
+	_ = capabilities.NewOSFile("").Remove(context.Background(), stashedPlanPath)
 	return tasks, nil
 }
 
@@ -2872,12 +2872,13 @@ func (m *model) runTestEngine(target string) tea.Cmd {
 			_ = m.sess.Save()
 		}
 
-		// Persist test output to context log file for auto-trace ($trace without args)
+		// Persist test output via file port (substrate) for auto-trace
+		// ($trace without args). No direct file write in presentation layer.
 		if m.sess != nil && m.sess.ContextID != "" {
 			logPath := m.sess.TestRunLogPath()
 			if logDir := filepath.Dir(logPath); logDir != "" {
 				if mkErr := os.MkdirAll(logDir, 0755); mkErr == nil {
-					_ = os.WriteFile(logPath, []byte(output), 0644)
+					_ = capabilities.NewOSFile("").Write(context.Background(), logPath, output)
 				}
 			}
 		}
@@ -2953,34 +2954,21 @@ func (r *executionRunner) Run(command string) (*executionRunResult, error) {
 	return r.RunContext(context.Background(), command)
 }
 
-// RunContext executes a shell command under ctx so a cancelled operation
-// context (Ctrl+C / Esc / mode transition) cancels the subprocess promptly via
-// the context in addition to the global orphan-kill list. It is the
-// cancellation-complete variant of Run.
+// RunContext executes a shell command via the control-plane shell port.
+// No direct exec in the presentation layer – delegated to the substrate
+// shell port which enforces authorization before execution.
 //
 //nolint:contextcheck // ctx is the caller-supplied cancellation scope, never a fresh one
 func (r *executionRunner) RunContext(ctx context.Context, command string) (*executionRunResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	c := exec.CommandContext(ctx, "bash", "-c", command)
-	c.Dir = r.root
-	var stdout, stderr bytes.Buffer
-	c.Stdout = &stdout
-	c.Stderr = &stderr
-	execution.TrackProcess(c)
-	defer execution.UntrackProcess(c)
-	err := c.Run()
+	shell := capabilities.NewExecShell(0)
+	res, err := shell.ExecuteIn(ctx, r.root, command)
 	result := &executionRunResult{
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-		ExitCode: 0,
-	}
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			result.ExitCode = exitErr.ExitCode()
-		}
+		Stdout:   res.Stdout,
+		Stderr:   res.Stderr,
+		ExitCode: res.ExitCode,
 	}
 	return result, err
 }
@@ -4076,17 +4064,14 @@ func (m *model) shellFirewall(cmd string) (bool, string) {
 }
 
 func execShell(cmd string) (string, error) {
-	c := exec.CommandContext(context.Background(), "bash", "-c", cmd)
-	var stdout, stderr bytes.Buffer
-	c.Stdout = &stdout
-	c.Stderr = &stderr
-	err := c.Run()
-	out := stdout.String()
-	if stderr.Len() > 0 {
+	shell := capabilities.NewExecShell(0)
+	res, err := shell.Execute(context.Background(), cmd)
+	out := res.Stdout
+	if res.Stderr != "" {
 		if out != "" {
 			out += "\n"
 		}
-		out += stderr.String()
+		out += res.Stderr
 	}
 	return out, err
 }
