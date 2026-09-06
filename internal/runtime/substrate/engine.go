@@ -8,7 +8,6 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,23 +16,21 @@ import (
 	"github.com/PizenLabs/izen/internal/runtime/substrate/store"
 )
 
-// ConcreteSubstrate is the ONLY component allowed to execute side-effects.
-// It owns the engine-like transaction ledger and ensures os.WriteFile /
-// MutationSet.Commit()-equivalent are ONLY invoked via Substrate.Execute().
-// Strategies emit Proposals; Substrate executes.
-// It exclusively owns the unified EvidenceStore and ArtifactLedger under
-// internal/runtime/substrate/store — every Execute automatically logs a
-// structured ExecutionProof and updates the artifact ledger without relying
-// on external execution helpers.
+// ConcreteSubstrate is the legacy proposal execution surface. It no longer
+// performs direct side-effects: every mutation is delegated to the single
+// Substrate mutation pipe (Substrate.ExecuteUnit via the port layer) so that
+// 100% of writes originate from internal/runtime/compose and execute via
+// RuntimeExecutor → Substrate. Strategies emit Proposals; Substrate executes.
 type ConcreteSubstrate struct {
-	root  string
-	store *store.Store
+	root     string
+	store    *store.Store
+	delegate *Substrate
 }
 
 // NewConcreteSubstrate creates a substrate bound to workspace root.
 func NewConcreteSubstrate(root string) *ConcreteSubstrate {
 	clean := filepath.Clean(root)
-	return &ConcreteSubstrate{root: clean, store: store.New(clean)}
+	return &ConcreteSubstrate{root: clean, store: store.New(clean), delegate: NewSubstrate(clean, nil, nil)}
 }
 
 // EvidenceStore returns the substrate-owned evidence store (thread-safe).
@@ -168,7 +165,9 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 		Status:        "committed",
 	}
 
-	// Track originals for rollback.
+	// Track originals for rollback. Reads are via os (read-only scope);
+	// writes/removals during rollback are delegated to the Substrate's
+	// FilePort so the single mutation pipe invariant holds.
 	type snap struct {
 		path    string
 		content []byte
@@ -200,9 +199,17 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 	rollback := func() {
 		for _, sp := range snaps {
 			if sp.exists {
-				_ = os.WriteFile(sp.path, sp.content, sp.mode)
+				if s.delegate != nil && s.delegate.file != nil {
+					_ = s.delegate.file.Write(context.Background(), sp.path, string(sp.content))
+				} else {
+					_ = os.WriteFile(sp.path, sp.content, sp.mode)
+				}
 			} else {
-				_ = os.Remove(sp.path)
+				if s.delegate != nil && s.delegate.file != nil {
+					_ = s.delegate.file.Remove(context.Background(), sp.path)
+				} else {
+					_ = os.Remove(sp.path)
+				}
 			}
 		}
 	}
@@ -263,20 +270,31 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 				s.recordProof(proof)
 				return proof, err
 			}
-			dir := filepath.Dir(target)
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				rollback()
-				proof.Status = "failed"
-				proof.Error = err
-				s.recordProof(proof)
-				return proof, err
-			}
-			if err := os.WriteFile(target, op.Content, 0o644); err != nil {
-				rollback()
-				proof.Status = "failed"
-				proof.Error = err
-				s.recordProof(proof)
-				return proof, err
+			// Delegate mutation through the single Substrate pipe (FilePort).
+			if s.delegate != nil && s.delegate.file != nil {
+				if err := s.delegate.file.Write(ctx, target, string(op.Content)); err != nil {
+					rollback()
+					proof.Status = "failed"
+					proof.Error = err
+					s.recordProof(proof)
+					return proof, err
+				}
+			} else {
+				dir := filepath.Dir(target)
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					rollback()
+					proof.Status = "failed"
+					proof.Error = err
+					s.recordProof(proof)
+					return proof, err
+				}
+				if err := os.WriteFile(target, op.Content, 0o644); err != nil {
+					rollback()
+					proof.Status = "failed"
+					proof.Error = err
+					s.recordProof(proof)
+					return proof, err
+				}
 			}
 		case OpFileDelete:
 			if op.Target == "" {
@@ -299,12 +317,22 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 				s.recordProof(proof)
 				return proof, err
 			}
-			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-				rollback()
-				proof.Status = "failed"
-				proof.Error = err
-				s.recordProof(proof)
-				return proof, err
+			if s.delegate != nil && s.delegate.file != nil {
+				if err := s.delegate.file.Remove(ctx, target); err != nil && !os.IsNotExist(err) {
+					rollback()
+					proof.Status = "failed"
+					proof.Error = err
+					s.recordProof(proof)
+					return proof, err
+				}
+			} else {
+				if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+					rollback()
+					proof.Status = "failed"
+					proof.Error = err
+					s.recordProof(proof)
+					return proof, err
+				}
 			}
 		case OpExecCmd:
 			if len(op.Args) == 0 {
@@ -315,14 +343,27 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 				s.recordProof(proof)
 				return proof, err
 			}
-			cmd := exec.CommandContext(ctx, op.Args[0], op.Args[1:]...)
-			cmd.Dir = s.root
-			if output, err := cmd.CombinedOutput(); err != nil {
-				rollback()
-				proof.Status = "failed"
-				proof.Error = fmt.Errorf("substrate: exec %v: %w (output: %s)", op.Args, err, string(output))
-				s.recordProof(proof)
-				return proof, proof.Error
+			// Delegate shell execution through the Substrate's ShellPort
+			// (single mutation pipe) so process-group isolation is enforced.
+			shellCmd := strings.Join(op.Args, " ")
+			if s.delegate != nil && s.delegate.shell != nil {
+				if _, err := s.delegate.shell.Execute(ctx, shellCmd); err != nil {
+					rollback()
+					proof.Status = "failed"
+					proof.Error = fmt.Errorf("substrate: exec %v: %w", op.Args, err)
+					s.recordProof(proof)
+					return proof, proof.Error
+				}
+			} else {
+				// Fallback through the shared exec helper (also enforces Setpgid)
+				res := ExecCommand(ctx, s.root, nil, op.Args)
+				if res.Err != nil {
+					rollback()
+					proof.Status = "failed"
+					proof.Error = fmt.Errorf("substrate: exec %v: %w (output: %s)", op.Args, res.Err, res.Stdout+res.Stderr)
+					s.recordProof(proof)
+					return proof, proof.Error
+				}
 			}
 		default:
 			rollback()
@@ -335,8 +376,13 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 	}
 
 	proof.EvidencePath = filepath.Join(s.root, ".izen", "substrate", prop.ID+".proof")
-	if err := os.MkdirAll(filepath.Dir(proof.EvidencePath), 0o755); err == nil {
-		_ = os.WriteFile(proof.EvidencePath, []byte(fmt.Sprintf("proposal=%s tx=%s at=%s ops=%d\n", prop.ID, txID, time.Now().UTC().Format(time.RFC3339), len(prop.Operations))), 0o644)
+	evidenceContent := fmt.Sprintf("proposal=%s tx=%s at=%s ops=%d\n", prop.ID, txID, time.Now().UTC().Format(time.RFC3339), len(prop.Operations))
+	if s.delegate != nil && s.delegate.file != nil {
+		_ = s.delegate.file.Write(context.Background(), proof.EvidencePath, evidenceContent)
+	} else {
+		if err := os.MkdirAll(filepath.Dir(proof.EvidencePath), 0o755); err == nil {
+			_ = os.WriteFile(proof.EvidencePath, []byte(evidenceContent), 0o644)
+		}
 	}
 	s.recordProof(proof)
 	return proof, nil

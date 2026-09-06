@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/core/domain"
@@ -255,8 +256,16 @@ func (s *Substrate) ExecuteUnit(ctx context.Context, unit domain.ExecutionUnit) 
 				return domain.MutationResult{}, fmt.Errorf("%w: output budget exceeded", authorization.ErrBudgetExceeded)
 			}
 		} else if unit.CapabilityBoundary.Has(domain.CapExecRestricted) {
-			// Fallback direct exec (still isolated to substrate).
+			// Fallback direct exec (still isolated to substrate) with process-group isolation.
 			cmd := exec.CommandContext(ctx, "echo", "substrate: "+tgt)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			cmd.Cancel = func() error {
+				if cmd.Process == nil {
+					return nil
+				}
+				return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+			cmd.WaitDelay = 100 * time.Millisecond
 			var o, e bytes.Buffer
 			cmd.Stdout = &o
 			cmd.Stderr = &e
@@ -293,18 +302,28 @@ func withBudgetTimeout(ctx context.Context, unit domain.ExecutionUnit) (context.
 
 // osShellPort is the direct OS-backed ShellPort adapter. It lives ONLY in
 // internal/runtime/substrate so the pipeline isolation invariant holds.
+// Every command runs in its own process group (Setpgid: true) so a budget
+// cancellation or timeout kills the entire descendant tree — no orphaned
+// children survive a timeout.
 type osShellPort struct{ root string }
 
 func (p *osShellPort) Execute(ctx context.Context, command string) (ports.ShellResult, error) {
 	if strings.TrimSpace(command) == "" {
 		return ports.ShellResult{}, fmt.Errorf("shell: empty command")
 	}
-	// Split command naively; real parsing belongs to the caller.
 	args := strings.Fields(command)
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	if p.root != "" {
 		cmd.Dir = p.root
 	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = 100 * time.Millisecond
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errBuf
@@ -335,6 +354,14 @@ func (p *osShellPort) ExecuteIn(ctx context.Context, dir, command string) (ports
 	} else if p.root != "" {
 		cmd.Dir = p.root
 	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = 100 * time.Millisecond
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errBuf

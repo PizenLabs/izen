@@ -23,7 +23,9 @@ type CheckpointCoordinator interface {
 
 // DiskCheckpointCoordinator implements CheckpointCoordinator with filesystem
 // snapshotting. It is concurrency-safe via sync.Mutex + OCCGate and idempotent
-// for Rollback/Clear.
+// for Rollback/Clear. On any mid-rollback I/O failure the workspace is flagged
+// as tainted (WorkflowStateFailed) and subsequent mutations are blocked until
+// a clean recovery.
 type DiskCheckpointCoordinator struct {
 	mu        sync.Mutex
 	gate      occ.OCCGate
@@ -33,6 +35,8 @@ type DiskCheckpointCoordinator struct {
 	// clears uncommitted diffs and resets versioning.
 	artifactStore artifactStore
 	execState     executionState
+	tainted       bool
+	taintErr      error
 }
 
 type artifactStore interface {
@@ -151,12 +155,18 @@ func (d *DiskCheckpointCoordinator) HasRef() bool {
 
 // Rollback restores disk files to snapshot state, clears uncommitted
 // ArtifactStore diffs, and resets ExecutionState versioning. It is idempotent
-// and concurrency-safe under OCCGate (via internal mutex).
+// and concurrency-safe under OCCGate (via internal mutex). If any file
+// write fails mid-rollback the workspace is flagged tainted and the error
+// is returned; the coordinator blocks further mutations until Recover is called.
 func (d *DiskCheckpointCoordinator) Rollback(ctx context.Context, id domain.CheckpointID, _ domain.RollbackBoundary) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	d.mu.Lock()
+	if d.tainted {
+		d.mu.Unlock()
+		return fmt.Errorf("checkpoint: workspace tainted (rollback previously failed): %w", d.taintErr)
+	}
 	snap, ok := d.snapshots[id]
 	// Idempotent: if snapshot not found, treat as already cleared/rolled back.
 	if !ok {
@@ -174,14 +184,18 @@ func (d *DiskCheckpointCoordinator) Rollback(ctx context.Context, id domain.Chec
 		}
 		abs := filepath.Join(d.root, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-			return fmt.Errorf("checkpoint rollback mkdir %q: %w", rel, err)
+			d.tainted = true
+			d.taintErr = fmt.Errorf("checkpoint rollback mkdir %q: %w", rel, err)
+			return d.taintErr
 		}
 		mode := snap.fileModes[rel]
 		if mode == 0 {
 			mode = 0o644
 		}
 		if err := os.WriteFile(abs, content, mode); err != nil {
-			return fmt.Errorf("checkpoint rollback write %q: %w", rel, err)
+			d.tainted = true
+			d.taintErr = fmt.Errorf("checkpoint rollback write %q: %w", rel, err)
+			return d.taintErr
 		}
 	}
 
@@ -227,6 +241,31 @@ func (d *DiskCheckpointCoordinator) Clear(_ context.Context, id domain.Checkpoin
 	defer d.mu.Unlock()
 	delete(d.snapshots, id)
 	return nil
+}
+
+// IsTainted reports whether a previous Rollback failed mid-way and left the
+// workspace in an inconsistent state (WorkflowStateFailed semantics). When
+// tainted, subsequent Rollback attempts fail fast until Recover is called.
+func (d *DiskCheckpointCoordinator) IsTainted() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.tainted
+}
+
+// TaintError returns the error that caused the taint, if any.
+func (d *DiskCheckpointCoordinator) TaintError() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.taintErr
+}
+
+// Recover clears the taint flag after a manual or secondary clean recovery.
+// It allows subsequent checkpoint operations to proceed.
+func (d *DiskCheckpointCoordinator) Recover() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.tainted = false
+	d.taintErr = nil
 }
 
 func sortedKeys(m map[string][]byte) []string {
