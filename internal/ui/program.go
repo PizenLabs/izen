@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	execAlias "os/exec"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strings"
@@ -421,7 +421,7 @@ func resolveUsername(root string, localCfg *config.LocalConfig) string {
 func gitUsername(root string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := execAlias.CommandContext(ctx, "git", "config", "user.name")
+	cmd := exec.CommandContext(ctx, "git", "config", "user.name")
 	cmd.Dir = root
 	out, err := cmd.Output()
 	if err != nil {

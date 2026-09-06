@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	execAlias "os/exec"
+	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
@@ -108,7 +108,7 @@ func (m *model) streamShellCmd(cmd string) tea.Cmd {
 		defer close(shellCh)
 
 		start := time.Now()
-		c := execAlias.CommandContext(ctx, "bash", "-c", cmd)
+		c := exec.CommandContext(ctx, "bash", "-c", cmd)
 		stdout, err := c.StdoutPipe()
 		if err != nil {
 			shellCh <- shellExitMsg{cmd: cmd, exitCode: -1, elapsed: 0, err: err}
@@ -206,7 +206,7 @@ func (m *model) streamShellCmd(cmd string) tea.Cmd {
 
 		exitCode := 0
 		if runErr != nil {
-			var exitErr *execAlias.ExitError
+			var exitErr *exec.ExitError
 			if errors.As(runErr, &exitErr) {
 				exitCode = exitErr.ExitCode()
 			} else {

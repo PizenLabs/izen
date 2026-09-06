@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
-	fs "os"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -51,7 +51,7 @@ func (b *blockingGateProvider) ExecuteStream(context.Context, ai.Request) (io.Re
 // outcome is a CLEAN cancellation, never a fabricated failure.
 func TestGatedExecutionCtrlCCancelsProviderCall(t *testing.T) {
 	dir := t.TempDir()
-	if err := fs.WriteFile(filepath.Join(dir, "index.html"), []byte("<html></html>"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<html></html>"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Chdir(dir)

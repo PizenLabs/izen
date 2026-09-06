@@ -2,7 +2,7 @@ package ui
 
 import (
 	"context"
-	fs "os"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -647,11 +647,11 @@ func sessionCLITestModelForSize(t *testing.T, w, h int) *model {
 
 func ensureTestProjectInitialized(root string) error {
 	dir := filepath.Join(root, ".izen")
-	if err := fs.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	path := filepath.Join(dir, "config.json")
-	if err := fs.WriteFile(path, []byte(`{"username":"test"}`), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"username":"test"}`), 0o644); err != nil {
 		return err
 	}
 	return nil

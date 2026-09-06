@@ -1,7 +1,7 @@
 package ui
 
 import (
-	fs "os"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -24,10 +24,10 @@ func gatedHarness(t *testing.T, files map[string]string, mock *mockProvider) (*m
 	dir := t.TempDir()
 	for name, content := range files {
 		p := filepath.Join(dir, name)
-		if err := fs.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := fs.WriteFile(p, []byte(content), 0o644); err != nil {
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}

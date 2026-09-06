@@ -1,7 +1,7 @@
 package ui
 
 import (
-	fs "os"
+	"os"
 	"strings"
 	"testing"
 
@@ -52,7 +52,7 @@ func numStr(i int) string {
 func TestBuildHotAutonomyExecution(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := fs.WriteFile("index.html", []byte(largeRedundantIndexHTML()), 0o644); err != nil {
+	if err := os.WriteFile("index.html", []byte(largeRedundantIndexHTML()), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -157,7 +157,7 @@ func TestBuildHotAutonomyExecution(t *testing.T) {
 func TestBuildHotAutonomyAutoContinue(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := fs.WriteFile("index.html", []byte(largeRedundantIndexHTML()), 0o644); err != nil {
+	if err := os.WriteFile("index.html", []byte(largeRedundantIndexHTML()), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -204,7 +204,7 @@ func TestBuildHotAutonomyAutoContinue(t *testing.T) {
 func TestAutonomyModificationProposalRedundancyEvidence(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := fs.WriteFile("index.html", []byte(largeRedundantIndexHTML()), 0o644); err != nil {
+	if err := os.WriteFile("index.html", []byte(largeRedundantIndexHTML()), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

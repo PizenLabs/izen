@@ -7,8 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	fs "os"
-	execAlias "os/exec"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -130,9 +130,9 @@ const stashedPlanPath = ".izen/stashed_plan.json"
 // re-hydrates the active /build execution queue. The cache file is deleted
 // after a successful read. Returns nil, nil if no stash exists.
 func (m *model) restorePlan() ([]plan.Task, error) {
-	data, err := fs.ReadFile(stashedPlanPath)
+	data, err := os.ReadFile(stashedPlanPath)
 	if err != nil {
-		if fs.IsNotExist(err) {
+		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("read stashed plan: %w", err)
@@ -143,7 +143,7 @@ func (m *model) restorePlan() ([]plan.Task, error) {
 	}
 	// Delete the stash file immediately after successful read so the LLM
 	// never sees it — the restoration is purely a Go-level operation.
-	_ = fs.Remove(stashedPlanPath)
+	_ = os.Remove(stashedPlanPath)
 	return tasks, nil
 }
 
@@ -945,7 +945,7 @@ const buildGenerationTimeout = 5 * time.Minute
 //  2. ctx (180s) — overall synthesis budget for a slow-but-alive model.
 
 // debugLogPlan writes plan-synthesis trace lines to .izen/debug/plan.log
-// instead of fs.Stderr. Bubble Tea owns the terminal exclusively while
+// instead of os.Stderr. Bubble Tea owns the terminal exclusively while
 // tea.WithAltScreen() is active — any direct stdout/stderr write from a
 // background goroutine races the renderer's own ANSI redraw sequences on the
 // same TTY and corrupts the visible frame (cursor jumps, dropped redraws,
@@ -954,11 +954,11 @@ const buildGenerationTimeout = 5 * time.Minute
 // tracing stays diagnostic without ever touching the live terminal.
 func debugLogPlan(line string) {
 	dir := filepath.Join(".izen", "debug")
-	if err := fs.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}
 	entry := time.Now().Format(time.RFC3339Nano) + " " + line + "\n"
-	f, err := fs.OpenFile(filepath.Join(dir, "plan.log"), fs.O_APPEND|fs.O_CREATE|fs.O_WRONLY, 0o644)
+	f, err := os.OpenFile(filepath.Join(dir, "plan.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}
@@ -2724,7 +2724,7 @@ func (m *model) handleReviewTestConfirm(line string) tea.Cmd {
 // excluding vendor/, .izen/, node_modules/, and other generated directories.
 func countGoFiles(root string) int {
 	count := 0
-	_ = filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -2876,8 +2876,8 @@ func (m *model) runTestEngine(target string) tea.Cmd {
 		if m.sess != nil && m.sess.ContextID != "" {
 			logPath := m.sess.TestRunLogPath()
 			if logDir := filepath.Dir(logPath); logDir != "" {
-				if mkErr := fs.MkdirAll(logDir, 0755); mkErr == nil {
-					_ = fs.WriteFile(logPath, []byte(output), 0644)
+				if mkErr := os.MkdirAll(logDir, 0755); mkErr == nil {
+					_ = os.WriteFile(logPath, []byte(output), 0644)
 				}
 			}
 		}
@@ -2963,7 +2963,7 @@ func (r *executionRunner) RunContext(ctx context.Context, command string) (*exec
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	c := execAlias.CommandContext(ctx, "bash", "-c", command)
+	c := exec.CommandContext(ctx, "bash", "-c", command)
 	c.Dir = r.root
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
@@ -2977,7 +2977,7 @@ func (r *executionRunner) RunContext(ctx context.Context, command string) (*exec
 		ExitCode: 0,
 	}
 	if err != nil {
-		var exitErr *execAlias.ExitError
+		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
 		}
@@ -3087,7 +3087,7 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 			}
 		}()
 		logPath := filepath.Join(".izen", "audit", "mutations.log")
-		data, err := fs.ReadFile(logPath)
+		data, err := os.ReadFile(logPath)
 		if err != nil {
 			m.push(roleStatus, "No mutations found.")
 			m.refreshViewportContent()
@@ -3668,7 +3668,7 @@ func (m *model) handleReviewDollar(line string) tea.Cmd {
 				return nil
 			}
 			logPath := m.sess.TestRunLogPath()
-			data, err := fs.ReadFile(logPath)
+			data, err := os.ReadFile(logPath)
 			if err != nil {
 				m.reviewRunning = false
 				m.lastActionTime = time.Time{}
@@ -3775,7 +3775,7 @@ func (m *model) runEnvCmd() tea.Cmd {
 			b.WriteString("  Environment :\n")
 			relevantVars := []string{"GOPATH", "GO111MODULE", "GOFLAGS", "GOROOT", "PATH", "SHELL", "TERM", "HOME"}
 			for _, name := range relevantVars {
-				if val, ok := fs.LookupEnv(name); ok {
+				if val, ok := os.LookupEnv(name); ok {
 					fmt.Fprintf(&b, "    %s=%s\n", name, val)
 				}
 			}
@@ -3948,7 +3948,7 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 
 			// Read the error log for the active context.
 			logPath := m.sess.TestRunLogPath()
-			logData, err := fs.ReadFile(logPath)
+			logData, err := os.ReadFile(logPath)
 			if err != nil {
 				m.push(roleError, fmt.Sprintf("[System Error] Failed to read error log at %s: %v", logPath, err))
 				m.refreshViewportContent()
@@ -4076,7 +4076,7 @@ func (m *model) shellFirewall(cmd string) (bool, string) {
 }
 
 func execShell(cmd string) (string, error) {
-	c := execAlias.CommandContext(context.Background(), "bash", "-c", cmd)
+	c := exec.CommandContext(context.Background(), "bash", "-c", cmd)
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr

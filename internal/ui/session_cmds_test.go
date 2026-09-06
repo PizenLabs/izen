@@ -3,7 +3,7 @@ package ui
 import (
 	"context"
 	"encoding/json"
-	fs "os"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -204,10 +204,10 @@ func TestSessionDeleteViaCLI(t *testing.T) {
 	m, sm, root := sessionCLITestModel(t)
 
 	cfgPath := filepath.Join(root, ".izen", "config.json")
-	if err := fs.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := fs.WriteFile(cfgPath, []byte(`{"provider":"ollama"}`), 0o644); err != nil {
+	if err := os.WriteFile(cfgPath, []byte(`{"provider":"ollama"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -220,7 +220,7 @@ func TestSessionDeleteViaCLI(t *testing.T) {
 	if errText := lastErrorText(m); errText != "" {
 		t.Fatalf("delete error: %s", errText)
 	}
-	if _, err := fs.Stat(filepath.Join(root, ".izen", "sessions", "A")); !fs.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, ".izen", "sessions", "A")); !os.IsNotExist(err) {
 		t.Fatalf("slot A still exists after delete: %v", err)
 	}
 	if got := readTestFile(t, cfgPath); got != `{"provider":"ollama"}` {
@@ -248,7 +248,7 @@ func TestSessionInvalidSlotRefusesCleanly(t *testing.T) {
 
 func readTestFile(t *testing.T, path string) string {
 	t.Helper()
-	data, err := fs.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}

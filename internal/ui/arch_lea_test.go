@@ -2,7 +2,7 @@ package ui
 
 import (
 	"context"
-	fs "os"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -39,10 +39,10 @@ func Build() *aapi.Service { return aapi.NewService() }
 	}
 	for path, content := range files {
 		full := filepath.Join(root, path)
-		if err := fs.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", path, err)
 		}
-		if err := fs.WriteFile(full, []byte(content), 0o644); err != nil {
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
 			t.Fatalf("write %s: %v", path, err)
 		}
 	}

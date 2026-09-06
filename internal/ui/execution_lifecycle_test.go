@@ -2,7 +2,7 @@ package ui
 
 import (
 	"fmt"
-	fs "os"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -38,7 +38,7 @@ func buildRunModel(t *testing.T, provider ai.Provider, tasks []plan.Task, fileCo
 	dir := t.TempDir()
 	t.Chdir(dir)
 	if fileContent != "" {
-		if err := fs.WriteFile("index.html", []byte(fileContent), 0o644); err != nil {
+		if err := os.WriteFile("index.html", []byte(fileContent), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}

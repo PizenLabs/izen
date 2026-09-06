@@ -1,7 +1,7 @@
 package ui
 
 import (
-	fs "os"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -50,7 +50,7 @@ func (m *model) configLoadedCmd() tea.Cmd {
 	root := m.workspaceRoot
 	return func() tea.Msg {
 		if root == "" {
-			root, _ = fs.Getwd()
+			root, _ = os.Getwd()
 		}
 		localCfg, err := config.EnsureLocalWorkspace(root)
 		return configLoadedMsg{localCfg: localCfg, err: err}
@@ -117,7 +117,7 @@ func (m *model) selfHealWorkspace() bool {
 	// Anchor config.json when it is missing (the app was already onboarded, so
 	// fabricating default project settings is safe and correct).
 	cfgPath := filepath.Join(m.workspaceRoot, ".izen", "config.json")
-	if _, statErr := fs.Stat(cfgPath); fs.IsNotExist(statErr) {
+	if _, statErr := os.Stat(cfgPath); os.IsNotExist(statErr) {
 		if localCfg == nil {
 			localCfg = &config.LocalConfig{}
 		}
@@ -140,8 +140,8 @@ func (m *model) selfHealWorkspace() bool {
 	// Session marker anchors HasLocalState so restart never re-enters
 	// onboarding for a workspace that was already initialized.
 	sessPath := filepath.Join(m.workspaceRoot, ".izen", state.SessionFile)
-	if _, statErr := fs.Stat(sessPath); fs.IsNotExist(statErr) {
-		if writeErr := fs.WriteFile(sessPath, []byte("{}"), 0644); writeErr != nil {
+	if _, statErr := os.Stat(sessPath); os.IsNotExist(statErr) {
+		if writeErr := os.WriteFile(sessPath, []byte("{}"), 0644); writeErr != nil {
 			return false
 		}
 	}
@@ -160,7 +160,7 @@ func (m *model) handleInitNone(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case msg.Type == tea.KeyEnter:
 		// Advance to the correct first-run stage based on git status
 		gitPath := filepath.Join(m.workspaceRoot, ".git")
-		if _, err := fs.Stat(gitPath); fs.IsNotExist(err) {
+		if _, err := os.Stat(gitPath); os.IsNotExist(err) {
 			m.initStage = initGitCheck
 		} else {
 			m.initStage = initIdentity
@@ -270,7 +270,7 @@ func (m *model) handleInitIdentity(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// 3) first in list (ollama or default).
 		if m.initPrefillProvider != "" {
 			envVar := envVarForProvider(m.initPrefillProvider)
-			if envVar != "" && fs.Getenv(envVar) != "" {
+			if envVar != "" && os.Getenv(envVar) != "" {
 				for i, name := range m.initProviderItems {
 					if name == m.initPrefillProvider {
 						m.initProviderIdx = i
@@ -384,8 +384,8 @@ func (m *model) buildProviderList() []string {
 	}
 	// Sort: providers with env vars set first, then ollama, then the rest
 	sort.SliceStable(unique, func(i, j int) bool {
-		envI := envVarForProvider(unique[i]) != "" && fs.Getenv(envVarForProvider(unique[i])) != ""
-		envJ := envVarForProvider(unique[j]) != "" && fs.Getenv(envVarForProvider(unique[j])) != ""
+		envI := envVarForProvider(unique[i]) != "" && os.Getenv(envVarForProvider(unique[i])) != ""
+		envJ := envVarForProvider(unique[j]) != "" && os.Getenv(envVarForProvider(unique[j])) != ""
 		if envI != envJ {
 			return envI
 		}
@@ -455,7 +455,7 @@ func (m *model) activeContextLimit() int {
 func (m *model) saveInitState() error {
 	root := m.workspaceRoot
 	if root == "" {
-		root, _ = fs.Getwd()
+		root, _ = os.Getwd()
 	}
 	if err := state.InitLocalState(root); err != nil {
 		return err
@@ -465,8 +465,8 @@ func (m *model) saveInitState() error {
 	}
 	// Write a minimal session.json to anchor HasLocalState
 	sessPath := filepath.Join(root, ".izen", "session.json")
-	if _, err := fs.Stat(sessPath); fs.IsNotExist(err) {
-		if err := fs.WriteFile(sessPath, []byte("{}"), 0644); err != nil {
+	if _, err := os.Stat(sessPath); os.IsNotExist(err) {
+		if err := os.WriteFile(sessPath, []byte("{}"), 0644); err != nil {
 			return err
 		}
 	}

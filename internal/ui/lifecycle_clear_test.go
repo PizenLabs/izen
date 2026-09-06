@@ -2,7 +2,7 @@ package ui
 
 import (
 	"context"
-	fs "os"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -562,10 +562,10 @@ func TestClearErrorOutput(t *testing.T) {
 	// The real Enter flow routes through handleInitKeyMsg unless the workspace
 	// is initialized on disk; provision a minimal .izen/config.json.
 	ws := t.TempDir()
-	if err := fs.MkdirAll(filepath.Join(ws, ".izen"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(ws, ".izen"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := fs.WriteFile(filepath.Join(ws, ".izen", "config.json"), []byte(`{}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(ws, ".izen", "config.json"), []byte(`{}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	m.workspaceRoot = ws

@@ -2,8 +2,8 @@ package ui
 
 import (
 	"errors"
-	fs "os"
-	execAlias "os/exec"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -207,9 +207,9 @@ func TestReviewCleanTreeInputFastPathSkipsSpinner(t *testing.T) {
 func initGitRepo(t *testing.T, root string) {
 	t.Helper()
 	run := func(args ...string) {
-		cmd := execAlias.CommandContext(t.Context(), "git", args...)
+		cmd := exec.CommandContext(t.Context(), "git", args...)
 		cmd.Dir = root
-		cmd.Env = append(fs.Environ(),
+		cmd.Env = append(os.Environ(),
 			"GIT_AUTHOR_NAME=izen test", "GIT_AUTHOR_EMAIL=test@izen.dev",
 			"GIT_COMMITTER_NAME=izen test", "GIT_COMMITTER_EMAIL=test@izen.dev",
 		)
@@ -218,7 +218,7 @@ func initGitRepo(t *testing.T, root string) {
 		}
 	}
 	run("init", "-b", "main")
-	if err := fs.WriteFile(filepath.Join(root, "base.go"), []byte("package main\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "base.go"), []byte("package main\n"), 0644); err != nil {
 		t.Fatalf("write base.go: %v", err)
 	}
 	run("add", "base.go")
