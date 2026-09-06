@@ -103,7 +103,7 @@ func NewOpenRouterProvider(apiKey, model, baseURL string) *OpenRouterProvider {
 		apiKey:  apiKey,
 		model:   model,
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{},
+		client:  &http.Client{Timeout: 30 * time.Second},
 	}
 }
 

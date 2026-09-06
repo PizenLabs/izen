@@ -95,6 +95,8 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		return nil
 	}
 
+	// Execution heartbeat: mark when the execution lifecycle starts.
+	m.executionStartedAt = time.Now()
 	m.streamCh = make(chan tea.Msg, 1024)
 	m.streaming = true
 	m.spinnerFrame = 0
@@ -259,7 +261,9 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// 5-minute ceiling applies. m.streamCancel is the handle
 	// handleEmergencyInterrupt and cancelStaleAgentOps already invoke to tear
 	// the stream down.
-	ctx, cancel := context.WithTimeout(m.operationContext(), 5*time.Minute)
+	// Two-phase timeout: TTFT (20s) before first token, then inter-token
+	// (15s) between subsequent tokens. Prevents unbounded 3-minute hangs.
+	ctx, cancel := context.WithTimeout(m.operationContext(), 25*time.Second)
 	m.streamCancel = cancel
 
 	// STREAM CONSUMER CONTRACT (deadlock-free):

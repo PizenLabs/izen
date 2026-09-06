@@ -231,6 +231,25 @@ func (m *model) renderActiveIdleFooter(width int, actions []Action) string {
 // 'Ctrl+C interrupt' / '⏸' can never linger.
 func (m *model) renderExecutingFooter() string {
 	st := m.stageSnapshot()
+	// P1 Live Telemetry Heartbeat: when no tokens have arrived yet, render
+	// linear connection-pulse telemetry (elapsed seconds) instead of static 0.0 tok/s.
+	if st.Tokens == 0 && !m.executionStartedAt.IsZero() && m.isExecuting() {
+		elapsed := time.Since(m.executionStartedAt)
+		modelName := m.getActiveModelName()
+		var pulse string
+		switch {
+		case elapsed < 5*time.Second:
+			pulse = fmt.Sprintf("⠋ Connecting to provider... · %ds · [%s]", int(elapsed.Seconds()), truncateModelName(modelName, 16))
+		case elapsed < 20*time.Second:
+			pulse = fmt.Sprintf("⠙ Waiting for first byte... · %ds · [%s]", int(elapsed.Seconds()), truncateModelName(modelName, 16))
+		default:
+			pulse = fmt.Sprintf("⠇ Waiting for first byte... · %ds · [%s]", int(elapsed.Seconds()), truncateModelName(modelName, 16))
+		}
+		return footerSep(
+			m.executingSpinner()+" "+footerExecLabelStyle.Render(pulse),
+			interruptLabelStyle.Render(Icon.Interrupt+" Ctrl+C interrupt"),
+		)
+	}
 	return footerSep(
 		m.executingSpinner()+" "+footerExecLabelStyle.Render("Generating..."),
 		footerTokStyle.Render("↓"+status.FormatTokens(st.Tokens)+" tok"),

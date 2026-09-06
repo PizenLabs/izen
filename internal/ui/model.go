@@ -1078,12 +1078,19 @@ type model struct {
 	// stream completes to compute this-turn latency for the status line.
 	streamStartTime time.Time
 
+	// Execution heartbeat: set when any foreground operation begins so the
+	// footer can render live connection-pulse telemetry (elapsed seconds)
+	// even when no provider tokens have arrived yet.
+	executionStartedAt time.Time
+
 	// Thought duration timer: start on prompt submit, frozen on StreamDoneMsg / StateIdle.
 	thoughtStartTime time.Time
 	thoughtEndTime   time.Time
 
 	// AI Interrupt Engine: cancel function for active stream, set by streamCmd.
 	streamCancel       context.CancelFunc
+	streamInterTokenTimer *time.Timer
+	streamInterTokenDeadline time.Time
 	interruptRequested bool
 
 	// Background context registry: tracks all in-flight background contexts
@@ -3481,6 +3488,13 @@ func (m *model) clearBusyFlags() {
 	m.pipelineRunning = false
 	m.planPending = false
 	m.shellRunning = false
+	// Clean up inter-token timeout timer and deadline so they never leak.
+	if m.streamInterTokenTimer != nil {
+		m.streamInterTokenTimer.Stop()
+		m.streamInterTokenTimer = nil
+	}
+	m.streamInterTokenDeadline = time.Time{}
+	m.executionStartedAt = time.Time{}
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 }

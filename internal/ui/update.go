@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -510,6 +511,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		hasActiveWork := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning ||
 			m.shellRunning || m.state == StateProcessing || m.state == StateAwaitingApproval ||
 			m.shimmerActive || m.autonomousActive
+		// Inter-token timeout check: if the rolling 15s deadline has passed
+		// without a new token, cancel the stream and emit a fast-fail message.
+		if !m.streamInterTokenDeadline.IsZero() && time.Now().After(m.streamInterTokenDeadline) {
+			if m.streamCancel != nil {
+				m.streamCancel()
+			}
+			m.push(roleError, errorStyle.Render(
+				"✗ provider response stalled: inter-token timeout exceeded (15s exceeded without new token). Try switching models or retrying."))
+			m.streamInterTokenDeadline = time.Time{}
+		}
+
 		if hasActiveWork {
 			// Keep the activity heartbeat fresh while any execution indicator
 			// is live. The idle-gate in the reconcile block above relies on
@@ -534,7 +546,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case spinnerTickMsg:
 		m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
 		m.refreshViewportContent()
-		if m.indexingStatus == "indexing" || m.pendingArchArgs != "" {
+		// Continuously re-arm the spinner tick whenever any execution work
+		// is active — this prevents frozen spinners during model invocation,
+		// long-running tool execution, or any background producer.
+		if m.isExecuting() || m.streaming || m.agentRunning || m.reviewRunning ||
+			m.pipelineRunning || m.shellRunning || m.planPending || m.autonomousActive ||
+			m.indexingStatus == "indexing" || m.pendingArchArgs != "" {
 			return m, m.spinnerTickCmd()
 		}
 		return m, nil
@@ -2172,6 +2189,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// streaming. The token count is NEVER derived from the response
 		// buffer length — it is populated only by the producer's authoritative
 		// streamUsageMsg (provider-reported usage).
+		// Inter-token timeout: once first byte arrives, arm a rolling 15s deadline.
+		if raw != "" && m.streamCancel != nil && m.streamInterTokenDeadline.IsZero() {
+			m.streamInterTokenDeadline = time.Now().Add(15 * time.Second)
+		} else if raw != "" && !m.streamInterTokenDeadline.IsZero() {
+			m.streamInterTokenDeadline = time.Now().Add(15 * time.Second)
+		}
+
 		if raw != "" {
 			m.setStage("model", m.getActiveModelName(), stageStreaming)
 		}
@@ -2252,6 +2276,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streamCh = nil
 		m.streaming = false
 		m.streamCancel = nil
+		// Clean up the inter-token timeout timer and deadline.
+		if m.streamInterTokenTimer != nil {
+			m.streamInterTokenTimer.Stop()
+			m.streamInterTokenTimer = nil
+		}
+		m.streamInterTokenDeadline = time.Time{}
 		m.stopShimmer()
 
 		if m.streamParser != nil {
@@ -2729,6 +2759,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streaming = false
 		m.streamParser = nil
 		m.streamCancel = nil
+		if m.streamInterTokenTimer != nil {
+			m.streamInterTokenTimer.Stop()
+			m.streamInterTokenTimer = nil
+		}
+		m.streamInterTokenDeadline = time.Time{}
 		m.planPending = false
 		m.stopShimmer()
 
@@ -2756,7 +2791,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleSystem, infoStyle.Render("  export OPENROUTER_API_KEY=<your_key>"))
 		} else {
 			sanitized := providers.SanitizeAPIError(msg.err)
-			m.push(roleError, "stream error: "+sanitized)
+			// P0 TTFT Timeout: if the provider stalled, surface a clear actionable
+			// error instead of a raw context deadline exceeded message.
+			if isContextDeadline(msg.err) || errors.Is(msg.err, context.DeadlineExceeded) {
+				m.push(roleError, errorStyle.Render(
+					"✗ provider response stalled: Time-To-First-Token (TTFT) timeout (20s exceeded). Try switching models or retrying."))
+			} else {
+				m.push(roleError, "stream error: "+sanitized)
+			}
 		}
 
 		// ── TOKEN ACCOUNTING ON FAILURE ────────────────────────────────
