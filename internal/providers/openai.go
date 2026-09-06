@@ -46,7 +46,7 @@ type openaiRequest struct {
 	MaxTokens     int             `json:"max_tokens,omitempty"`
 	Temperature   float64         `json:"temperature,omitempty"`
 	Stop          []string        `json:"stop,omitempty"`
-	Stream        bool            `json:"stream"`
+	Stream        bool            `json:"stream,omitempty"`
 	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
 	// ReasoningEffort is the native OpenAI qualitative reasoning control
 	// (low / medium / high / xhigh). It is injected from the dynamically
@@ -77,9 +77,12 @@ type openaiDelta struct {
 	Reasoning        string `json:"reasoning,omitempty"`
 }
 
-type streamOptions struct {
+type StreamOptions struct {
 	IncludeUsage bool `json:"include_usage"`
 }
+
+// streamOptions is an alias for backward compatibility within the package.
+type streamOptions = StreamOptions
 
 type openaiUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
@@ -128,7 +131,10 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		return nil, fmt.Errorf("openai: marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/chat/completions", bytes.NewReader(payload))
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, "https://api.openai.com/v1/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("openai: create request: %w", err)
 	}
@@ -139,7 +145,10 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	if err != nil {
 		return nil, fmt.Errorf("openai: do request: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -207,31 +216,39 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		ReasoningEffort: req.Reasoning.LevelOrDefault(),
 	}
 
+	reqCtx, cancel := context.WithCancel(ctx)
+
 	payload, err := json.Marshal(body)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("openai: marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/chat/completions", bytes.NewReader(payload))
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, "https://api.openai.com/v1/chat/completions", bytes.NewReader(payload))
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("openai: create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("X-Title", "izen")
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("openai: do request: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
+		cancel()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("openai: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	sr := &openaiSSEReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
+	sr := &openaiSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
 	sr.usage.markRequestStarted(time.Now())
 	return &OpenAIStreamResult{ReadCloser: sr, sr: sr}, nil
 }
@@ -258,6 +275,7 @@ func (r *OpenAIStreamResult) FinishReason() string {
 }
 
 type openaiSSEReader struct {
+	cancel           context.CancelFunc
 	body             io.ReadCloser
 	reader           *bufio.Reader
 	closed           bool
@@ -299,6 +317,10 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 		data := strings.TrimPrefix(line, "data: ")
 
 		if data == "[DONE]" {
+			if s.cancel != nil {
+				s.cancel()
+			}
+			_, _ = io.Copy(io.Discard, s.body)
 			s.closed = true
 			s.usage.markCompleted(time.Now(), s.finishReason)
 			return 0, io.EOF
@@ -360,5 +382,9 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 
 func (s *openaiSSEReader) Close() error {
 	s.closed = true
+	if s.cancel != nil {
+		s.cancel()
+	}
+	_, _ = io.Copy(io.Discard, s.body)
 	return s.body.Close()
 }

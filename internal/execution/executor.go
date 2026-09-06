@@ -2707,17 +2707,24 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		}
 		return visible, usage, trace, nil
 	}
-	defer func() { _ = rawStream.Close() }()
-	// Task 2: strict HTTP context cancellation — force-close SSE body on interrupt.
+	// ZERO-DEFER STREAM TEARDOWN: explicit Close the instant the SSE
+	// loop terminates, before any pipeline post-processing. No defer
+	// rawStream.Close() at function scope — the body must not stay open
+	// while classifier/budget/event channels join, otherwise OpenRouter's
+	// edge holds the session until 5-min idle timeout.
+	var closeOnce sync.Once
+	closeStream := func() {
+		closeOnce.Do(func() { _ = rawStream.Close() })
+	}
 	done := make(chan struct{})
-	defer close(done)
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = rawStream.Close()
+			closeStream()
 		case <-done:
 		}
 	}()
+	defer func() { close(done) }()
 
 	// Authoritative live usage: only provider-reported counts (Known &&
 	// !Estimated) are ever emitted as provider.usage_update.
@@ -2794,6 +2801,7 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	for {
 		if cerr := ctx.Err(); cerr != nil {
 			reasoningClose()
+			closeStream()
 			if streamCb != nil {
 				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
 			}
@@ -2809,11 +2817,17 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		if rerr == io.EOF {
 			flushStream()
 			reasoningClose()
+			// Body already closed synchronously inside openrouterSSEReader.Read
+			// on [DONE]; this explicit Close is the ZERO-DEFER guarantee that
+			// the HTTP session is torn down BEFORE any budget/classifier/event
+			// post-processing below. Keep-Alive is preserved via Discard+Close.
+			closeStream()
 			break
 		}
 		if rerr != nil {
 			flushStream()
 			reasoningClose()
+			closeStream()
 			if cerr := ctx.Err(); cerr != nil {
 				if streamCb != nil {
 					streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})

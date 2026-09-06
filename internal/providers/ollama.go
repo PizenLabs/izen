@@ -41,12 +41,13 @@ type ollamaMessage struct {
 }
 
 type ollamaRequest struct {
-	Model     string          `json:"model"`
-	Messages  []ollamaMessage `json:"messages"`
-	Stream    bool            `json:"stream"`
-	Format    string          `json:"format,omitempty"` // "json" for structured output
-	MaxTokens *int            `json:"max_tokens,omitempty"`
-	Options   *struct {
+	Model         string          `json:"model"`
+	Messages      []ollamaMessage `json:"messages"`
+	Stream        bool            `json:"stream,omitempty"`
+	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
+	Format        string          `json:"format,omitempty"` // "json" for structured output
+	MaxTokens     *int            `json:"max_tokens,omitempty"`
+	Options       *struct {
 		NumPredict  int     `json:"num_predict"`
 		Temperature float64 `json:"temperature,omitempty"`
 	} `json:"options,omitempty"`
@@ -176,7 +177,10 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		return nil, fmt.Errorf("ollama: marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("ollama: create request: %w", err)
 	}
@@ -189,7 +193,10 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	if err != nil {
 		return nil, fmt.Errorf("ollama: do request: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -265,23 +272,28 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		maxTokens = 4096
 	}
 	body := ollamaRequest{
-		Model:     model,
-		Messages:  msgs,
-		Stream:    true,
-		MaxTokens: &maxTokens,
+		Model:         model,
+		Messages:      msgs,
+		Stream:        true,
+		StreamOptions: &streamOptions{IncludeUsage: true},
+		MaxTokens:     &maxTokens,
 		Options: &struct {
 			NumPredict  int     `json:"num_predict"`
 			Temperature float64 `json:"temperature,omitempty"`
 		}{NumPredict: maxTokens, Temperature: req.Temperature},
 	}
 
+	reqCtx, cancel := context.WithCancel(ctx)
+
 	payload, err := json.Marshal(body)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("ollama: marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("ollama: create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -289,19 +301,23 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 	}
 	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("X-Title", "izen")
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("ollama: do request: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
+		cancel()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("ollama: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	sr := &sseReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
+	sr := &sseReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
 	sr.usage.markRequestStarted(time.Now())
 	return &StreamResult{ReadCloser: sr, sr: sr}, nil
 }
@@ -328,6 +344,7 @@ func (r *StreamResult) FinishReason() string {
 }
 
 type sseReader struct {
+	cancel           context.CancelFunc
 	body             io.ReadCloser
 	reader           *bufio.Reader
 	closed           bool
@@ -373,6 +390,10 @@ func (s *sseReader) Read(p []byte) (int, error) {
 		data := strings.TrimPrefix(line, "data: ")
 
 		if data == "[DONE]" {
+			if s.cancel != nil {
+				s.cancel()
+			}
+			_, _ = io.Copy(io.Discard, s.body)
 			s.closed = true
 			s.usage.markCompleted(time.Now(), s.finishReason)
 			return 0, io.EOF
@@ -434,6 +455,10 @@ func (s *sseReader) Read(p []byte) (int, error) {
 
 func (s *sseReader) Close() error {
 	s.closed = true
+	if s.cancel != nil {
+		s.cancel()
+	}
+	_, _ = io.Copy(io.Discard, s.body)
 	return s.body.Close()
 }
 
@@ -447,7 +472,7 @@ type ollamaGenerateRequest struct {
 	Model   string `json:"model"`
 	Prompt  string `json:"prompt"`
 	System  string `json:"system,omitempty"`
-	Stream  bool   `json:"stream"`
+	Stream  bool   `json:"stream,omitempty"`
 	Options *struct {
 		NumPredict int `json:"num_predict"`
 	} `json:"options,omitempty"`
@@ -489,7 +514,10 @@ func (p *OllamaProvider) Generate(ctx context.Context, system, prompt string) (s
 	if err != nil {
 		return "", fmt.Errorf("ollama generate: connection failed: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)

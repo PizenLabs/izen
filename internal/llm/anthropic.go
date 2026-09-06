@@ -131,7 +131,10 @@ func (c *AnthropicClient) GenerateResponse(ctx context.Context, req PromptReques
 		return LLMResponse{}, fmt.Errorf("anthropic: marshal: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(payload))
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.baseURL, bytes.NewReader(payload))
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("anthropic: new request: %w", err)
 	}
@@ -146,7 +149,10 @@ func (c *AnthropicClient) GenerateResponse(ctx context.Context, req PromptReques
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("anthropic: do: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -203,7 +209,10 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 		return LLMResponse{}, fmt.Errorf("anthropic: marshal: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(payload))
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.baseURL, bytes.NewReader(payload))
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("anthropic: new request: %w", err)
 	}
@@ -219,9 +228,12 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("anthropic: do: %w", err)
 	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
 		return LLMResponse{}, fmt.Errorf("anthropic: status %d: %s", resp.StatusCode, string(respBody))
 	}
@@ -233,10 +245,12 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 	for {
 		event, err := reader.ReadEvent()
 		if errors.Is(err, io.EOF) {
+			cancel()
+			_, _ = io.Copy(io.Discard, resp.Body)
 			break
 		}
 		if err != nil {
-			_ = resp.Body.Close()
+			cancel()
 			return LLMResponse{}, fmt.Errorf("anthropic: stream read: %w", err)
 		}
 
@@ -256,7 +270,7 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 			if event.Delta.Type == "thinking_delta" {
 				if event.Delta.Thinking != "" && req.ReasoningHandler != nil {
 					if err := req.ReasoningHandler(event.Delta.Thinking); err != nil {
-						_ = resp.Body.Close()
+						cancel()
 						return LLMResponse{}, err
 					}
 				}
@@ -266,7 +280,7 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 				full.WriteString(event.Delta.Text)
 				if handler != nil {
 					if err := handler(event.Delta.Text); err != nil {
-						_ = resp.Body.Close()
+						cancel()
 						return LLMResponse{}, err
 					}
 				}
@@ -276,7 +290,8 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 				tokenOut = event.Usage.OutputTokens
 			}
 		case "message_stop":
-			_ = resp.Body.Close()
+			cancel()
+			_, _ = io.Copy(io.Discard, resp.Body)
 			return LLMResponse{
 				Content:          SanitizeOutput(full.String()),
 				TokenInput:       tokenIn,
@@ -287,6 +302,8 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 		}
 	}
 
+	cancel()
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return LLMResponse{
 		Content:          SanitizeOutput(full.String()),
 		TokenInput:       tokenIn,

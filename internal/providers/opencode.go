@@ -103,7 +103,10 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 		return nil, fmt.Errorf("opencode: marshal: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("opencode: new request: %w", err)
 	}
@@ -114,7 +117,10 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 	if err != nil {
 		return nil, fmt.Errorf("opencode: do: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -208,31 +214,39 @@ func (p *OpenCodeProvider) ExecuteStream(ctx context.Context, req ai.Request) (i
 		body.Tools = rawTools
 	}
 
+	reqCtx, cancel := context.WithCancel(ctx)
+
 	payload, err := json.Marshal(body)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("opencode: marshal: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("opencode: new request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+key)
 	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("X-Title", "izen")
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("opencode: do: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
+		cancel()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("opencode: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	sr := &opencodeSSEReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
+	sr := &opencodeSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
 	sr.usage.markRequestStarted(time.Now())
 	return &OpenCodeStreamResult{ReadCloser: sr, sr: sr}, nil
 }
@@ -248,7 +262,7 @@ type opencodeRequest struct {
 	MaxTokens     int               `json:"max_tokens,omitempty"`
 	Temperature   float64           `json:"temperature,omitempty"`
 	Stop          []string          `json:"stop,omitempty"`
-	Stream        bool              `json:"stream"`
+	Stream        bool              `json:"stream,omitempty"`
 	StreamOptions *streamOptions    `json:"stream_options,omitempty"`
 	Tools         []json.RawMessage `json:"tools,omitempty"`
 }
@@ -337,6 +351,7 @@ func (r *OpenCodeStreamResult) FinishReason() string {
 }
 
 type opencodeSSEReader struct {
+	cancel           context.CancelFunc
 	body             io.ReadCloser
 	reader           *bufio.Reader
 	closed           bool
@@ -393,6 +408,10 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 		data := strings.TrimPrefix(line, "data: ")
 
 		if data == "[DONE]" {
+			if s.cancel != nil {
+				s.cancel()
+			}
+			_, _ = io.Copy(io.Discard, s.body)
 			s.closed = true
 			s.usage.markCompleted(time.Now(), s.finishReason)
 			return 0, io.EOF
@@ -480,5 +499,9 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 
 func (s *opencodeSSEReader) Close() error {
 	s.closed = true
+	if s.cancel != nil {
+		s.cancel()
+	}
+	_, _ = io.Copy(io.Discard, s.body)
 	return s.body.Close()
 }

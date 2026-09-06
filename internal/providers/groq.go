@@ -60,7 +60,10 @@ func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respons
 		return nil, fmt.Errorf("groq: marshal: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("groq: new request: %w", err)
 	}
@@ -71,7 +74,10 @@ func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respons
 	if err != nil {
 		return nil, fmt.Errorf("groq: do: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -124,39 +130,48 @@ func (p *GroqProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.Re
 	msgs := p.buildMessages(req)
 
 	body := groqRequest{
-		Model:       model,
-		Messages:    msgs,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stop:        req.Stop,
-		Stream:      true,
+		Model:         model,
+		Messages:      msgs,
+		MaxTokens:     req.MaxTokens,
+		Temperature:   req.Temperature,
+		Stop:          req.Stop,
+		Stream:        true,
+		StreamOptions: &streamOptions{IncludeUsage: true},
 	}
+
+	reqCtx, cancel := context.WithCancel(ctx)
 
 	payload, err := json.Marshal(body)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("groq: marshal: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("groq: new request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("X-Title", "izen")
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("groq: do: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
+		cancel()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("groq: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	sr := &groqSSEReader{body: resp.Body, reasoningHandler: req.ReasoningHandler}
+	sr := &groqSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
 	sr.usage.markRequestStarted(time.Now())
 	return &GroqStreamResult{ReadCloser: sr, sr: sr}, nil
 }
@@ -179,12 +194,13 @@ type groqMessage struct {
 }
 
 type groqRequest struct {
-	Model       string        `json:"model"`
-	Messages    []groqMessage `json:"messages"`
-	MaxTokens   int           `json:"max_tokens,omitempty"`
-	Temperature float64       `json:"temperature,omitempty"`
-	Stop        []string      `json:"stop,omitempty"`
-	Stream      bool          `json:"stream"`
+	Model         string         `json:"model"`
+	Messages      []groqMessage  `json:"messages"`
+	MaxTokens     int            `json:"max_tokens,omitempty"`
+	Temperature   float64        `json:"temperature,omitempty"`
+	Stop          []string       `json:"stop,omitempty"`
+	Stream        bool           `json:"stream,omitempty"`
+	StreamOptions *streamOptions `json:"stream_options,omitempty"`
 }
 
 type groqResponse struct {
@@ -249,6 +265,7 @@ func (r *GroqStreamResult) FinishReason() string {
 }
 
 type groqSSEReader struct {
+	cancel           context.CancelFunc
 	body             io.ReadCloser
 	reader           *bufio.Reader
 	closed           bool
@@ -290,6 +307,10 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 		data := strings.TrimPrefix(line, "data: ")
 
 		if data == "[DONE]" {
+			if s.cancel != nil {
+				s.cancel()
+			}
+			_, _ = io.Copy(io.Discard, s.body)
 			s.closed = true
 			s.usage.markCompleted(time.Now(), s.finishReason)
 			return 0, io.EOF
@@ -351,5 +372,9 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 
 func (s *groqSSEReader) Close() error {
 	s.closed = true
+	if s.cancel != nil {
+		s.cancel()
+	}
+	_, _ = io.Copy(io.Discard, s.body)
 	return s.body.Close()
 }

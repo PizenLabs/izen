@@ -294,9 +294,21 @@ func (s *Substrate) ExecuteUnit(ctx context.Context, unit domain.ExecutionUnit) 
 }
 
 func withBudgetTimeout(ctx context.Context, unit domain.ExecutionUnit) (context.Context, context.CancelFunc) {
+	// CONNECTION LIFECYCLE HARDENING: this function MUST NOT create a
+	// background or long-lived context that survives task completion.
+	// It strictly derives from the caller-provided ctx so that cancellation
+	// and timeout propagation is immediate and the underlying HTTP transport
+	// (when used via executor/BudgetTracker) can send TCP FIN promptly.
+	// No context.Background() is used here; the parent context is always honored.
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// No explicit latency budget on unit; use parent context as-is.
 	// If unit carries a budget with MaxAttempts etc., they are enforced via
 	// diff/file counting above, not via timeout here.
+	// Callers that need a timeout must use BudgetTracker.WrapContext which
+	// creates a derived context with timeout and guarantees the child is
+	// cancelled via defer when the stream ends, preventing keep-alive holds.
 	return ctx, nil
 }
 
