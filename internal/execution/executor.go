@@ -1999,6 +1999,16 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	// deterministic and the recovery matrix can re-derive the ceiling from
 	// the same source.
 	maxOut := effectiveMaxOutput(req.MaxOutputTokens, &profile)
+	// Hard API token caps: mutation/build = 1200; ask/plan/read-only = 800.
+	if profile.Strategy == strategy.TargetedMutation {
+		if maxOut == 0 || maxOut > 1200 {
+			maxOut = 1200
+		}
+	} else {
+		if maxOut == 0 || maxOut > 800 {
+			maxOut = 800
+		}
+	}
 	for _, target := range targets {
 		var data []byte
 		if cached, ok := x.getSnapshotContent(target); ok {
@@ -2049,7 +2059,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			}
 		}
 
-		system := boundedMutationSystemPrompt()
+		system := boundedMutationSystemPrompt() + "\nSystem: You are strictly modifying ONE file: " + target + ". Do NOT output code or patches for any other files in this response."
 		outputContract := "full_file_or_patch"
 		user := buildMutationUserPrompt(req.Prompt, target, original, req.Evidence)
 		contextBytes := len(original)
@@ -2059,7 +2069,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// the same bytes, never against the unseen remainder of the file.
 		judgedContent := original
 		if patchOnly {
-			system = boundedPatchSystemPrompt()
+			system = boundedPatchSystemPrompt() + "\nSystem: You are strictly modifying ONE file: " + target + ". Do NOT output code or patches for any other files in this response."
 			outputContract = "search_replace"
 			// Bounded INPUT contract: the runtime — not the model — decides
 			// what crosses. Only one small line-aligned window of the target
@@ -2570,11 +2580,16 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	if modelErr != nil {
 		return "", inv, nil, modelErr
 	}
+	maxRead := effectiveMaxOutput(req.MaxOutputTokens, &profile)
+	// Hard cap for read-only / ask / plan: 800 tokens max.
+	if maxRead == 0 || maxRead > 800 {
+		maxRead = 800
+	}
 	aiReq := ai.Request{
 		Model:     model,
 		System:    readOnlySystemPrompt(profile.Strategy),
 		Messages:  []ai.Message{{Role: "user", Content: b.String()}},
-		MaxTokens: effectiveMaxOutput(req.MaxOutputTokens, &profile),
+		MaxTokens: maxRead,
 	}
 	// model.invoked is emitted when the invocation BEGINS — before the provider
 	// call — so the event stream truthfully records the invocation start.
@@ -2813,6 +2828,18 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 				classifier.Write(text, emitFrame)
 			}
 			emitUsage()
+			// D. Real-time streaming token accounting: emit estimated usage
+			// increments on every chunk so TUI counters update dynamically.
+			if usageUp != nil {
+				u := usageUp.Usage()
+				if streamCb != nil {
+					streamCb(StreamEvent{
+						RequestID: requestID,
+						Kind: "stream_token",
+						Usage: u,
+					})
+				}
+			}
 		}
 		if rerr == io.EOF {
 			flushStream()

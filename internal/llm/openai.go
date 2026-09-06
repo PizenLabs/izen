@@ -162,8 +162,12 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
 	}
+	// Hard cap: never send unconstrained max_tokens (0 or null).
 	if body.MaxTokens <= 0 {
-		body.MaxTokens = 4096
+		body.MaxTokens = 1200
+	}
+	if body.MaxTokens > 1200 {
+		body.MaxTokens = 1200
 	}
 
 	payload, err := json.Marshal(body)
@@ -266,8 +270,12 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		Temperature:   req.Temperature,
 		StreamOptions: &streamOptions{IncludeUsage: true},
 	}
+	// Hard cap: never send unconstrained max_tokens (0 or null).
 	if body.MaxTokens <= 0 {
-		body.MaxTokens = 4096
+		body.MaxTokens = 1200
+	}
+	if body.MaxTokens > 1200 {
+		body.MaxTokens = 1200
 	}
 
 	payload, err := json.Marshal(body)

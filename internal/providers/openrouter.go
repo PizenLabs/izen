@@ -107,6 +107,15 @@ func NewOpenRouterProvider(apiKey, model, baseURL string) *OpenRouterProvider {
 	}
 }
 
+func (p *OpenRouterProvider) closeIdleConnections() {
+	if p.client == nil || p.client.Transport == nil {
+		return
+	}
+	if t, ok := p.client.Transport.(*http.Transport); ok {
+		t.CloseIdleConnections()
+	}
+}
+
 func (p *OpenRouterProvider) Name() string {
 	return "openrouter"
 }
@@ -248,7 +257,11 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		return nil, fmt.Errorf("openrouter: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	sr := &openrouterSSEReader{body: resp.Body, cancel: cancel}
+	sr := &openrouterSSEReader{
+		body: resp.Body,
+		cancel: cancel,
+		closeTransport: p.closeIdleConnections,
+	}
 	sr.usage.markRequestStarted(time.Now())
 	sr.usage.recordTransport(stats.attempts, stats.rateLimitedRetries)
 	return &OpenRouterStreamResult{ReadCloser: sr, sr: sr}, nil
@@ -412,10 +425,13 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 		Stream:      stream,
 		Reasoning:   reasoningFor(req),
 	}
-	// Default max output tokens for code generation tasks if not explicitly
-	// limited by the provider or user request.
+	// Hard API token cap — never send unconstrained max_tokens.
+	// BUILD / MUTATION: 1200; ASK / PLAN / read-only: 800.
 	if body.MaxTokens == 0 {
-		body.MaxTokens = 4096
+		body.MaxTokens = 1200
+	}
+	if body.MaxTokens > 1200 {
+		body.MaxTokens = 1200
 	}
 	if stream {
 		body.StreamOptions = &streamOptions{IncludeUsage: true}
@@ -837,6 +853,7 @@ type openrouterSSEReader struct {
 	closed     bool
 	closeOnce  sync.Once
 	finalUsage *openrouterUsage
+	closeTransport func()
 
 	// think splits inline <think>…</think> blocks out of delta.content into
 	// sentinel-wrapped reasoning runs (see thinkTagSplitter).
@@ -1033,5 +1050,8 @@ func (s *openrouterSSEReader) Close() error {
 		_, _ = io.Copy(io.Discard, s.body)
 		err = s.body.Close()
 	})
+	if s.closeTransport != nil {
+		s.closeTransport()
+	}
 	return err
 }
