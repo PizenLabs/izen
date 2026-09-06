@@ -3016,6 +3016,18 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// P0 SGR 1006 guard: drop control sequences before they reach textinput.
+		// Fast-path: a runes slice beginning with '[' '<' is an orphan mouse
+		// fragment — drop it WITHOUT allocating msg.String() / string(Runes).
+		if msg.Type == tea.KeyRunes && len(msg.Runes) >= 2 && msg.Runes[0] == '[' && msg.Runes[1] == '<' {
+			return m, nil
+		}
+		if msg.Type == tea.KeyRunes && isControlSequence(msg.Runes) {
+			return m, nil
+		}
+		if msg.Type == tea.KeyRunes && IsSGRMouseFragmentRunes(msg.Runes) {
+			return m, nil
+		}
 
 		// ── PRIORITY 1: ACTIVE TEXT INPUT ────────────────────────────
 		// A printable character typed into the focused input is ALWAYS text.

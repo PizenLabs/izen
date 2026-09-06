@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 )
@@ -307,9 +308,9 @@ func (m *model) clearAutonomyProposal() {
 	m.clearAutonomyTargetSelector()
 }
 
-// renderAutonomyProposalBlock renders the ask_user decision surface. It is the
-// ONLY user-facing authorization gate — there is no /grant command anywhere in
-// the surface.
+// renderAutonomyProposalBlock renders the compact action banner (4-5 lines max)
+// positioned directly above the input prompt region. It is the ONLY user-facing
+// authorization gate — there is no /grant command anywhere in the surface.
 func (m *model) renderAutonomyProposalBlock(width int) string {
 	prop := m.pendingAutonomyProposal
 	if prop == nil {
@@ -320,110 +321,102 @@ func (m *model) renderAutonomyProposalBlock(width int) string {
 		boxWidth = 40
 	}
 
-	var b strings.Builder
-	b.WriteString(permissionTitleStyle.Render(Icon.Warning + " AUTONOMY PROPOSAL"))
-	b.WriteString("\n\n")
-
-	b.WriteString(permissionDescStyle.Render("Intent:"))
-	b.WriteString(" " + permissionTargetStyle.Render(prop.Intent.String()))
-	b.WriteString("\n")
-	b.WriteString(permissionDescStyle.Render("Workspace:"))
-	b.WriteString(" " + permissionTargetStyle.Render(prop.Workspace.String()))
-	b.WriteString("\n")
-	if prop.Target != "" {
-		b.WriteString(permissionDescStyle.Render("Target:"))
-		b.WriteString(" " + permissionTargetStyle.Render(prop.Target))
-		b.WriteString("\n")
+	target := prop.Target
+	if target == "" {
+		if prop.Scope != "" {
+			target = prop.Scope
+		} else {
+			target = prop.Intent.String()
+		}
 	}
-	riskStyle := tracerStyle
+
+	riskStr := strings.ToUpper(prop.Risk.String())
+	if riskStr == "" {
+		riskStr = "LOW"
+	}
+	var riskStyled string
 	switch prop.Risk {
 	case autonomy.RiskHigh, autonomy.RiskCritical:
-		riskStyle = redStyle
+		riskStyled = redStyle.Render(riskStr)
 	case autonomy.RiskMedium:
-		riskStyle = infoStyle
+		riskStyled = infoStyle.Render(riskStr)
+	default:
+		riskStyled = greenStyle.Render(riskStr)
 	}
-	b.WriteString(permissionDescStyle.Render("Risk:"))
-	b.WriteString(" " + riskStyle.Render(prop.Risk.String()))
-	b.WriteString("\n")
-	b.WriteString(permissionDescStyle.Render("Capabilities:"))
-	b.WriteString(" " + permissionTargetStyle.Render(prop.CapabilityLabel()))
-	b.WriteString("\n")
-	rollback := greenStyle.Render("available")
-	if !prop.Rollback {
-		rollback = redStyle.Render("unavailable")
-	}
-	b.WriteString(permissionDescStyle.Render("Rollback:"))
-	b.WriteString(" " + rollback)
-	b.WriteString("\n")
+
+	scopeStr := "1 file"
 	if prop.AffectedScope > 0 {
-		b.WriteString(permissionDescStyle.Render("Affected scope:"))
-		b.WriteString(" " + permissionTargetStyle.Render(fmt.Sprintf("%d file(s)", prop.AffectedScope)))
-		b.WriteString("\n")
+		scopeStr = fmt.Sprintf("%d file(s)", prop.AffectedScope)
 	}
-	b.WriteString(permissionDescStyle.Render("Reason:"))
-	b.WriteString(" " + infoStyle.Render(prop.Reason))
-	b.WriteString("\n")
 
-	// Planned high-level actions.
+	planStr := "Read -> Propose -> Mutate -> Verify"
 	if len(prop.Actions) > 0 {
-		b.WriteString("\n")
-		b.WriteString(permissionTitleStyle.Render("Planned actions"))
-		b.WriteString("\n")
-		for _, a := range prop.Actions {
-			b.WriteString("  " + Icon.Chevron + " " + mutedStyle.Render(a))
-			b.WriteString("\n")
-		}
+		planStr = strings.Join(prop.Actions, " -> ")
 	}
 
-	// Inspect detail view: the full decision facts, read-only.
+	rollbackStr := "OK"
+	if !prop.Rollback {
+		rollbackStr = "NO"
+	}
+
+	var b strings.Builder
+	// Line 1: Target, Risk, Scope, Rollback info
+	modeStr := strings.ToLower(prop.Workspace.String())
+	intentStr := strings.ToLower(prop.Intent.String())
+	fmt.Fprintf(&b, "Target: %s │ Risk: %s │ Scope: %s │ %s/%s (Rollback: %s)\n",
+		permissionTargetStyle.Render(target),
+		riskStyled,
+		permissionTargetStyle.Render(scopeStr),
+		intentStr,
+		modeStr,
+		rollbackStr,
+	)
+
+	// Line 2: Plan
+	fmt.Fprintf(&b, "Plan:   %s\n", mutedStyle.Render(planStr))
+
+	// Line 3: Actions
+	actionExec := permissionKeyStyle.Render("[Enter]") + " " + boldTextStyle.Render("Approve & Run (Execute)")
+	actionInspect := permissionKeyStyle.Render("[I]") + " " + boldTextStyle.Render("Inspect Diff")
+	actionReject := permissionKeyStyle.Render("[Esc]") + " " + boldTextStyle.Render("Reject (Cancel)")
+	fmt.Fprintf(&b, "Action: %s   %s   %s", actionExec, actionInspect, actionReject)
+
+	// Inspect detail expansion (toggled via I)
 	if m.autonomyProposalInspect {
-		b.WriteString("\n")
-		b.WriteString(permissionTitleStyle.Render("Decision detail"))
-		b.WriteString("\n")
-		fmt.Fprintf(&b, "  objective   : %s\n", prop.Input)
-		req := prop.Required.String()
-		if req == "" {
-			req = "none"
-		}
-		fmt.Fprintf(&b, "  required    : %s\n", req)
-		missing := prop.Missing.String()
-		if missing == "" {
-			missing = "none"
-		}
-		fmt.Fprintf(&b, "  missing     : %s\n", missing)
-		fmt.Fprintf(&b, "  scope       : %s\n", prop.Scope)
-		b.WriteString("  " + mutedStyle.Render("Inspect is read-only — it grants nothing and executes nothing."))
-		b.WriteString("\n")
+		b.WriteString("\n" + permissionDescStyle.Render("Decision detail:") + " " + mutedStyle.Render(fmt.Sprintf("objective=%s required=%s missing=%s scope=%s",
+			truncateDisplay(prop.Input, 40), prop.Required.String(), prop.Missing.String(), prop.Scope)))
 	}
 
-	sep := strings.Repeat("─", boxWidth-4)
-	b.WriteString(" " + sep + "\n")
-
-	// Action menu (↑/↓ + Enter, Esc cancels).
-	for i, action := range proposalActions {
-		label := actionLabel(action)
-		if i == m.autonomyProposalSelect {
-			b.WriteString("  " + permissionKeyStyle.Render("[▶]") + " " + boldTextStyle.Render(label))
-		} else {
-			b.WriteString("    " + mutedStyle.Render(label))
-		}
-		b.WriteString("\n")
-	}
-	b.WriteString(" " + mutedStyle.Render("↑/↓ navigate · Enter execute · Esc cancel") + "\n")
-
-	return permissionBoxStyle.Width(boxWidth).Render(b.String())
+	headerTitle := fmt.Sprintf(" %s AUTONOMY REQUEST: %s ", Icon.Warning, prop.Intent.String())
+	return renderBoxWithTitle(headerTitle, b.String(), boxWidth)
 }
 
-// actionLabel renders a human label for a proposal action.
-func actionLabel(a autonomy.ProposalAction) string {
-	switch a {
-	case autonomy.ActionExecute:
-		return "Execute — authorize and run"
-	case autonomy.ActionInspect:
-		return "Inspect — review decision detail"
-	default:
-		return "Cancel — abandon objective"
+func renderBoxWithTitle(title, content string, boxWidth int) string {
+	const (
+		borderFg = "\x1b[38;2;88;91;112m" // #585b70
+		reset    = "\x1b[0m"
+	)
+	var b strings.Builder
+	titleCells := lipgloss.Width(title)
+	dashLen := boxWidth - 2 - titleCells - 1
+	if dashLen < 0 {
+		dashLen = 0
 	}
+	// ┌─ [TITLE] ───┐
+	b.WriteString(borderFg + "┌─" + reset + title + borderFg + strings.Repeat("─", dashLen) + "┐" + reset + "\n")
+
+	lines := strings.Split(content, "\n")
+	for _, l := range lines {
+		lCells := lipgloss.Width(l)
+		pad := boxWidth - 4 - lCells
+		if pad < 0 {
+			pad = 0
+		}
+		b.WriteString(borderFg + "│ " + reset + l + strings.Repeat(" ", pad) + borderFg + " │" + reset + "\n")
+	}
+
+	b.WriteString(borderFg + "└" + strings.Repeat("─", boxWidth-2) + "┘" + reset)
+	return b.String()
 }
 
 // truncateDisplay bounds a string to n runes for compact status lines.

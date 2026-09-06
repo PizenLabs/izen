@@ -259,6 +259,37 @@ func (m *model) renderModelPickerModal() string {
 	return overlayOn(normalContent, centered, m.width, m.height)
 }
 
+// renderTraceOverlayModal renders the telemetry trace buffer modal overlay.
+func (m *model) renderTraceOverlayModal() string {
+	var normalWS Workspace
+	if m.Ready && m.viewRegistry != nil {
+		if v, ok := m.viewRegistry.For(m.resolver.Current()); ok {
+			normalWS = v.BuildWorkspace(m)
+		}
+	}
+	var parts []string
+	if normalWS.Viewport != "" {
+		parts = append(parts, normalWS.Viewport)
+	}
+	if normalWS.ProposalDock != "" {
+		parts = append(parts, normalWS.ProposalDock)
+	}
+	if normalWS.Input != "" {
+		parts = append(parts, normalWS.Input)
+	}
+	if normalWS.Footer != "" {
+		parts = append(parts, normalWS.Footer)
+	}
+	normalContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	if m.telemetryDemuxer == nil {
+		return normalContent
+	}
+	overlayContent := m.telemetryDemuxer.RenderOverlay(m.width, m.height)
+	centered := lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, overlayContent)
+	return overlayOn(normalContent, centered, m.width, m.height)
+}
+
 // overlayOn renders bg as a full-screen string with fg centered on top.
 // ANSI codes from both strings are preserved via line-level composition.
 // ANSI reset codes are inserted at segment boundaries to prevent background
@@ -358,6 +389,9 @@ func (m *model) BuildWorkspace() Workspace {
 	}
 	if m.showSessionPicker && m.sessionPicker != nil {
 		return Workspace{Overlay: m.renderSessionPickerModal()}
+	}
+	if m.showTraceOverlay && m.telemetryDemuxer != nil {
+		return Workspace{Overlay: m.renderTraceOverlayModal()}
 	}
 	if !m.Ready {
 		return Workspace{Overlay: "Loading IZEN..."}

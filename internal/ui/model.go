@@ -759,6 +759,10 @@ type model struct {
 	traceBuffer strings.Builder
 	// traceExpanded is the Ctrl+O expansion state of the output-trace viewport.
 	traceExpanded bool
+	// showTraceOverlay is the modal/drawer overlay for debugging execution telemetry.
+	showTraceOverlay bool
+	// telemetryDemuxer isolates internal execution loop events into a Trace Buffer.
+	telemetryDemuxer *TelemetryDemuxer
 	// traceVerbose is the model-local verbosity toggle mirrored into the
 	// package-level TraceVerbose flag used by layout/stream renderers.
 	traceVerbose bool
@@ -2955,6 +2959,14 @@ func (m *model) push(r role, text string) {
 		return
 	}
 	text = sanitizeIngressANSI(text)
+	if isBoundedPatchRecovery(text) {
+		text = RenderBoundedPatchRecoveryBadge()
+	}
+	if m.telemetryDemuxer == nil {
+		m.telemetryDemuxer = NewTelemetryDemuxer()
+	}
+	m.telemetryDemuxer.Ingest(text)
+
 	rec := record{role: r, text: text, turnID: m.currentTurnID}
 	m.records = append(m.records, rec)
 	m.cacheRecordToHistory(rec)
@@ -4232,7 +4244,9 @@ func (m *model) updateConversationLayout(wrapWidth int, username string) {
 //   - re-renders ONLY the streaming segment through the unified markdown engine
 //     (byte-identical styling to the completed-history path), never the whole
 //     document; and
-//   - appends the Accent-Blue block cursor (▋) to the active trailing line.
+//   - renders streaming content with a muted satin tone (#A6ADC8) for calm
+//     low-glare flow, transitioning to full contrast (#CDD6F4) on completion
+//     (satin-smooth streaming UX — no trailing cursor glyph).
 func (m *model) syncStreamingSegment() {
 	if m.docLayout == nil {
 		m.streamingDocStart = -1
@@ -4300,9 +4314,6 @@ func (m *model) syncStreamingSegment() {
 		newLines[i].GlobalY = base + i
 		newLines[i].RecordIdx = len(m.records)
 	}
-	// Active smooth block cursor on the trailing line.
-	last := &newLines[len(newLines)-1]
-	last.RenderedStr += streamCursorStyle.Render("▋")
 	m.docLayout.Lines = append(m.docLayout.Lines[:m.streamingDocStart], newLines...)
 }
 
@@ -4999,13 +5010,44 @@ func (m *model) renderWorkspaceHeader() string {
 	}
 	modeNameStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(modeAccentStr))
 
-	var b strings.Builder
-	b.WriteString("\n")
-	b.WriteString("  ")
-	b.WriteString(modeNameStyle.Render(Icon.Check + " " + modeName))
-	b.WriteString("  " + dimmedStyle.Render(mode.Description()))
-	b.WriteString("\n\n")
-	return b.String()
+	// Resolve workspace directory
+	cwd, _ := os.Getwd()
+	home := os.Getenv("HOME")
+	if home != "" && strings.HasPrefix(cwd, home) {
+		cwd = "~" + strings.TrimPrefix(cwd, home)
+	}
+
+	// Resolve git branch
+	branch := "main"
+	if m.gitEng != nil {
+		if b, err := m.gitEng.Branch(); err == nil && b != "" {
+			branch = b
+		}
+	}
+
+	version := "0.1.0"
+
+	// Single compact status line anchoring system state:
+	// ─ [izen v0.1.0] ── ~/workspace ── git:(main) ── [BUILD Mode] ─
+	ruleDashes := dimmedStyle.Render("──")
+	appTag := boldAccentStyle.Render(fmt.Sprintf("[izen v%s]", version))
+	wsTag := dimmedStyle.Render(cwd)
+	gitTag := boldMauveStyle.Render(fmt.Sprintf("git:(%s)", branch))
+	modeTag := modeNameStyle.Render(fmt.Sprintf("[%s Mode]", modeName))
+
+	line := fmt.Sprintf("%s %s %s %s %s %s %s %s %s",
+		dimmedStyle.Render("─"),
+		appTag,
+		ruleDashes,
+		wsTag,
+		ruleDashes,
+		gitTag,
+		ruleDashes,
+		modeTag,
+		dimmedStyle.Render("─"),
+	)
+
+	return line + "\n\n"
 }
 
 // ── History persistence ───────────────────────────────────────────────────────

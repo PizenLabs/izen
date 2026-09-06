@@ -458,6 +458,7 @@ func (m *model) renderStreamingContent(content string, width int) string {
 	}
 
 	gutter := gutterAIStyle.Render("│") + " "
+	_ = gutter // preserved for structured widget paths; satin-smooth path uses renderAssistantResponse
 
 	for _, block := range blocks {
 		var rendered string
@@ -694,16 +695,13 @@ func (m *model) renderStreamingContent(content string, width int) string {
 				break
 			}
 
-			// UNIFIED PATH: deterministic pipeline — identical for streaming and history.
-			// Replaces the goldmark-based MarkdownRenderer to eliminate layout flicker.
-			blockRendered := RenderDeterministicPipeline(block.raw, availableWidth, true)
+			// UNIFIED PATH: deterministic pipeline — identical styling logic.
+			// Streaming uses muted satin (#A6ADC8, faint); completed uses full
+			// contrast (#CDD6F4). Removes the flickering trailing cursor glyph
+			// (▋) for satin-smooth flow (P0 + P1).
+			blockRendered := RenderDeterministicPipeline(block.raw, availableWidth, m.streaming)
 			if blockRendered != "" {
-				mdLines := strings.Split(strings.TrimRight(blockRendered, "\n"), "\n")
-				var styledLines []string
-				for _, line := range mdLines {
-					styledLines = append(styledLines, gutter+line)
-				}
-				rendered = strings.Join(styledLines, "\n")
+				rendered = m.renderAssistantResponse(blockRendered, m.streaming)
 			}
 		}
 

@@ -270,10 +270,13 @@ func RenderPasteBadgesStyled(text string) string {
 }
 
 // renderPromptView returns the textinput view string with paste badges
-// rendered as styled pill badges.
+// rendered as styled pill badges. This is a PURE projection function — it
+// performs zero string manipulation, zero regex matching, and zero state
+// mutation. SGR mouse-fragment sanitization happens exclusively on write
+// (Update → textinput.Write), never here, so scrolling and the per-tick
+// View() flush remain GC-free and never block the Bubble Tea event queue.
 func (m *model) renderPromptView() string {
-	raw := m.ti.View()
-	return RenderPasteBadgesStyled(raw)
+	return RenderPasteBadgesStyled(m.ti.View())
 }
 
 // expandPromptForSubmit expands all paste badges in the current prompt value
