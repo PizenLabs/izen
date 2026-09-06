@@ -19,9 +19,10 @@ type TerminalState struct {
 }
 
 // Valid enforces the forbidden-combination rules (INV:11, INV:8, INV:9).
-//   INV:8  State Verified requires Completed == true and Verdict == VerdictPass.
-//   INV:9  State Failed requires Verdict != VerdictPass.
-//   INV:11 Forbidden matrices (e.g., Incomplete · VERIFIED, FAILED · VERIFIED) return false.
+//
+//	INV:8  State Verified requires Completed == true and Verdict == VerdictPass.
+//	INV:9  State Failed requires Verdict != VerdictPass.
+//	INV:11 Forbidden matrices (e.g., Incomplete · VERIFIED, FAILED · VERIFIED) return false.
 func (t TerminalState) Valid() bool {
 	// INV:8 — Verified requires completed + pass.
 	if t.Workflow == domain.StateVerified {
@@ -45,8 +46,8 @@ func (t TerminalState) Valid() bool {
 		return false
 	}
 	// Aborted cannot be verified either (spec table: ABORTED·VERIFIED forbidden).
-	if t.Workflow == domain.StateFailed || t.Workflow == domain.StateVerified {
-		// no extra check; above already handles
+	if t.Workflow == domain.StateFailed || t.Workflow == domain.StateVerified { //nolint:staticcheck // no extra check; above already handles
+		_ = t.Workflow
 	}
 	// Additional INV:11 guard: any incomplete (not Completed) state that claims
 	// PASS verdict while workflow is terminal verified must be rejected.

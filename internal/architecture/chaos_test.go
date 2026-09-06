@@ -44,7 +44,7 @@ func TestChaos_ConcurrentOCCContention(t *testing.T) {
 				_, err := ws.Transition(domain.StatePlanning, initial)
 				versionMu.Lock()
 				defer versionMu.Unlock()
-				if err == nil {
+				if err == nil { //nolint:gocritic
 					success.Add(1)
 					versions = append(versions, ws.CurrentVersion())
 				} else if errors.Is(err, occ.ErrStaleDependency) {
@@ -81,7 +81,7 @@ func TestChaos_ConcurrentOCCContention(t *testing.T) {
 			go func(idx int) {
 				defer wg.Done()
 				_, err := store.StagePatch("artifact-concurrent", "content", initial)
-				if err == nil {
+				if err == nil { //nolint:gocritic
 					success.Add(1)
 				} else if errors.Is(err, occ.ErrStaleDependency) {
 					stale.Add(1)
@@ -113,7 +113,7 @@ func TestChaos_ConcurrentOCCContention(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				_, err := es.RecordStep("step-concurrent", "result", initial)
-				if err == nil {
+				if err == nil { //nolint:gocritic
 					success.Add(1)
 				} else if errors.Is(err, occ.ErrStaleDependency) {
 					stale.Add(1)

@@ -76,7 +76,7 @@ func (v EvidenceVerdict) String() string {
 type EvidenceState uint8
 
 const (
-	VerdictPassed      EvidenceState = iota // all required levels PASS contiguously
+	VerdictPassed       EvidenceState = iota // all required levels PASS contiguously
 	VerdictFailed                            // any required level FAIL or monotonic gap
 	VerdictInconclusive                      // any required level UNKNOWN/SKIP or missing
 )

@@ -10,11 +10,11 @@ import (
 
 // AuthorizationDecision is the single verdict of the CapabilityGuard.
 type AuthorizationDecision struct {
-	Permitted    bool              `json:"permitted"`
-	Reason       string            `json:"reason"`
-	FailedClause Clause            `json:"failed_clause,omitempty"`
-	FrameID      domain.FrameID    `json:"frame_id"`
-	UnitID       domain.UnitID     `json:"unit_id"`
+	Permitted    bool           `json:"permitted"`
+	Reason       string         `json:"reason"`
+	FailedClause Clause         `json:"failed_clause,omitempty"`
+	FrameID      domain.FrameID `json:"frame_id"`
+	UnitID       domain.UnitID  `json:"unit_id"`
 }
 
 // Clause enumerates the eight conjuncts of the formula.
@@ -57,28 +57,28 @@ func (c Clause) String() string {
 // Sentinel errors for each clause.
 // These map to the failure sentinels described in 02_SYSTEM_MODEL_2.md Sec 2.2.
 var (
-	ErrInvalidIntent      = errors.New("authorization: invalid intent")
-	ErrScopeViolation     = errors.New("authorization: scope violation")
-	ErrNoAuthorizedPlan   = errors.New("authorization: no authorized plan")
-	ErrNoCheckpoint       = errors.New("authorization: no checkpoint")
-	ErrStaleDependency    = errors.New("authorization: stale dependency")
-	ErrBudgetExceeded     = errors.New("authorization: budget exceeded")
-	ErrCapabilityDenied   = errors.New("authorization: capability denied")
-	ErrApprovalRequired   = errors.New("authorization: approval required")
+	ErrInvalidIntent    = errors.New("authorization: invalid intent")
+	ErrScopeViolation   = errors.New("authorization: scope violation")
+	ErrNoAuthorizedPlan = errors.New("authorization: no authorized plan")
+	ErrNoCheckpoint     = errors.New("authorization: no checkpoint")
+	ErrStaleDependency  = errors.New("authorization: stale dependency")
+	ErrBudgetExceeded   = errors.New("authorization: budget exceeded")
+	ErrCapabilityDenied = errors.New("authorization: capability denied")
+	ErrApprovalRequired = errors.New("authorization: approval required")
 )
 
 // AuthorizationInput is the complete evidence bundle the guard evaluates.
 type AuthorizationInput struct {
-	Objective    domain.Objective    `json:"objective"`
-	Scope        domain.Scope        `json:"scope"`
-	Artifact     ArtifactRef         `json:"artifact"`
-	CheckpointID domain.CheckpointID `json:"checkpoint_id"`
-	SourceState  domain.SourceState  `json:"source_state"`
-	Budget       domain.ResourceBudget `json:"budget"`
-	Capabilities domain.DomainCapabilitySet `json:"capabilities"`
-	Approval     ApprovalToken       `json:"approval"`
-	Proposal     ProposalRef         `json:"proposal"`
-	HasCheckpoint bool               `json:"has_checkpoint"`
+	Objective     domain.Objective           `json:"objective"`
+	Scope         domain.Scope               `json:"scope"`
+	Artifact      ArtifactRef                `json:"artifact"`
+	CheckpointID  domain.CheckpointID        `json:"checkpoint_id"`
+	SourceState   domain.SourceState         `json:"source_state"`
+	Budget        domain.ResourceBudget      `json:"budget"`
+	Capabilities  domain.DomainCapabilitySet `json:"capabilities"`
+	Approval      ApprovalToken              `json:"approval"`
+	Proposal      ProposalRef                `json:"proposal"`
+	HasCheckpoint bool                       `json:"has_checkpoint"`
 }
 
 type ArtifactRef struct {
@@ -135,7 +135,7 @@ func (g *SimpleCapabilityGuard) Evaluate(_ context.Context, in AuthorizationInpu
 
 	// ClausePlan: ValidPlan ∨ ValidMicroPlan — artifact must be AUTHORIZED or VALIDATED with pre-approval
 	if in.Artifact.State != "AUTHORIZED" && in.Artifact.State != "StateAuthorized" {
-		if !(in.Approval.BudgetIsPreApproval && (in.Artifact.State == "VALIDATED" || in.Artifact.State == "StateValidated")) {
+		if !in.Approval.BudgetIsPreApproval || (in.Artifact.State != "VALIDATED" && in.Artifact.State != "StateValidated") { //nolint:staticcheck
 			return AuthorizationDecision{Permitted: false, Reason: ErrNoAuthorizedPlan.Error(), FailedClause: ClausePlan, FrameID: frameID, UnitID: unitID}
 		}
 	}

@@ -4,10 +4,10 @@ package domain
 type ExecutionOutcome uint8
 
 const (
-	OutcomeCompleted ExecutionOutcome = iota // terminated normally per policy
-	OutcomeIncomplete                        // budget/time exhausted, not failed
-	OutcomeFailed                            // failure classified, recovery exhausted
-	OutcomeAborted                           // cancelled, OCC abort, or scope violation rollback
+	OutcomeCompleted  ExecutionOutcome = iota // terminated normally per policy
+	OutcomeIncomplete                         // budget/time exhausted, not failed
+	OutcomeFailed                             // failure classified, recovery exhausted
+	OutcomeAborted                            // cancelled, OCC abort, or scope violation rollback
 )
 
 func (o ExecutionOutcome) String() string {

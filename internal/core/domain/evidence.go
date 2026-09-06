@@ -68,8 +68,8 @@ type EvidenceState uint8
 
 const (
 	EvidenceUnverified        EvidenceState = iota // no verifier or all SKIP
-	EvidencePartiallyVerified                       // some PASS, not all required
-	EvidenceVerified                                // HighestPassed >= RequiredLevel
+	EvidencePartiallyVerified                      // some PASS, not all required
+	EvidenceVerified                               // HighestPassed >= RequiredLevel
 )
 
 func (s EvidenceState) String() string {
@@ -151,7 +151,7 @@ func DeriveEvidenceState(v EvidenceVector, required EvidenceLevel) EvidenceState
 			if v.Levels[lvl] == VerdictFail {
 				// FAIL at or below required overrides PASS
 				// If fail is below required, highest should reflect gap.
-				if lvl <= required {
+				if lvl <= required { //nolint
 					// Derive should not be VERIFIED if any required level failed
 					// We keep highest as computed (will be below fail)
 				}

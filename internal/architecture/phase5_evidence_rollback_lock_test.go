@@ -32,10 +32,10 @@ func testTerminalStateValidMatrix(t *testing.T) {
 	// These must be INVALID:
 	invalid := []evidence.TerminalState{
 		{Workflow: domain.StateVerified, Verdict: evidence.VerdictPass, Completed: false}, // Incomplete·Verified
-		{Workflow: domain.StateVerified, Verdict: evidence.VerdictFail, Completed: true},   // Verified but FAIL verdict
-		{Workflow: domain.StateVerified, Verdict: evidence.VerdictSkip, Completed: true},   // Verified but SKIP
-		{Workflow: domain.StateFailed, Verdict: evidence.VerdictPass, Completed: true},     // Failed·Verified
-		{Workflow: domain.StateFailed, Verdict: evidence.VerdictPass, Completed: false},    // Failed·Verified incomplete
+		{Workflow: domain.StateVerified, Verdict: evidence.VerdictFail, Completed: true},  // Verified but FAIL verdict
+		{Workflow: domain.StateVerified, Verdict: evidence.VerdictSkip, Completed: true},  // Verified but SKIP
+		{Workflow: domain.StateFailed, Verdict: evidence.VerdictPass, Completed: true},    // Failed·Verified
+		{Workflow: domain.StateFailed, Verdict: evidence.VerdictPass, Completed: false},   // Failed·Verified incomplete
 	}
 	for i, tc := range invalid {
 		if tc.Valid() {

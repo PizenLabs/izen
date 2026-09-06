@@ -111,11 +111,11 @@ func TestRollbackErrorHandlingWhenFileLocksPreventWrite(t *testing.T) {
 	if err := os.Chmod(root, 0o500); err != nil {
 		t.Skip("cannot chmod for lock simulation")
 	}
-	defer os.Chmod(root, 0o755)
+	defer func() { _ = os.Chmod(root, 0o755) }() //nolint:errcheck
 
 	// Modify file content before rollback to trigger restore attempt
 	// Need to make file writable again briefly, then lock again
-	_ = os.Chmod(root, 0o755)
+	_ = os.Chmod(root, 0o755) //nolint:errcheck
 	_ = os.WriteFile(target, []byte("modified"), 0o644)
 	_ = os.Chmod(root, 0o500)
 

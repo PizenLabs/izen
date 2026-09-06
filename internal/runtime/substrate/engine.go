@@ -196,17 +196,17 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 		snaps[target] = &snap{path: target, content: append([]byte(nil), data...), exists: true, mode: mode}
 		return nil
 	}
-	rollback := func() {
+	rollback := func(rollbackCtx context.Context) {
 		for _, sp := range snaps {
 			if sp.exists {
 				if s.delegate != nil && s.delegate.file != nil {
-					_ = s.delegate.file.Write(context.Background(), sp.path, string(sp.content))
+					_ = s.delegate.file.Write(rollbackCtx, sp.path, string(sp.content)) //nolint:contextcheck // rollback uses the Execute ctx, not a new background
 				} else {
 					_ = os.WriteFile(sp.path, sp.content, sp.mode)
 				}
 			} else {
 				if s.delegate != nil && s.delegate.file != nil {
-					_ = s.delegate.file.Remove(context.Background(), sp.path)
+					_ = s.delegate.file.Remove(rollbackCtx, sp.path) //nolint:contextcheck // rollback context
 				} else {
 					_ = os.Remove(sp.path)
 				}
@@ -216,7 +216,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 
 	// ── Mandatory pre-commit symbol re-anchoring verification ──────────
 	if err := verifyProposal(prop); err != nil {
-		rollback()
+		rollback(ctx)
 		proof.Status = "failed"
 		if !errors.Is(err, ErrVerificationFailed) {
 			err = fmt.Errorf("%w: %w", ErrVerificationFailed, err)
@@ -231,7 +231,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 			continue
 		}
 		if err := ctx.Err(); err != nil {
-			rollback()
+			rollback(ctx)
 			proof.Status = "failed"
 			proof.Error = err
 			s.recordProof(proof)
@@ -242,7 +242,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 
 	for _, op := range prop.Operations {
 		if err := ctx.Err(); err != nil {
-			rollback()
+			rollback(ctx)
 			proof.Status = "failed"
 			proof.Error = err
 			s.recordProof(proof)
@@ -251,7 +251,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 		switch op.Type {
 		case OpFileWrite:
 			if op.Target == "" {
-				rollback()
+				rollback(ctx)
 				err := fmt.Errorf("substrate: FILE_WRITE requires target")
 				proof.Status = "failed"
 				proof.Error = err
@@ -264,7 +264,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 				target = filepath.Join(s.root, cleanTarget)
 			}
 			if err := record(target); err != nil {
-				rollback()
+				rollback(ctx)
 				proof.Status = "failed"
 				proof.Error = err
 				s.recordProof(proof)
@@ -273,7 +273,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 			// Delegate mutation through the single Substrate pipe (FilePort).
 			if s.delegate != nil && s.delegate.file != nil {
 				if err := s.delegate.file.Write(ctx, target, string(op.Content)); err != nil {
-					rollback()
+					rollback(ctx)
 					proof.Status = "failed"
 					proof.Error = err
 					s.recordProof(proof)
@@ -282,14 +282,14 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 			} else {
 				dir := filepath.Dir(target)
 				if err := os.MkdirAll(dir, 0o755); err != nil {
-					rollback()
+					rollback(ctx)
 					proof.Status = "failed"
 					proof.Error = err
 					s.recordProof(proof)
 					return proof, err
 				}
 				if err := os.WriteFile(target, op.Content, 0o644); err != nil {
-					rollback()
+					rollback(ctx)
 					proof.Status = "failed"
 					proof.Error = err
 					s.recordProof(proof)
@@ -298,7 +298,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 			}
 		case OpFileDelete:
 			if op.Target == "" {
-				rollback()
+				rollback(ctx)
 				err := fmt.Errorf("substrate: FILE_DELETE requires target")
 				proof.Status = "failed"
 				proof.Error = err
@@ -311,7 +311,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 				target = filepath.Join(s.root, cleanTarget)
 			}
 			if err := record(target); err != nil {
-				rollback()
+				rollback(ctx)
 				proof.Status = "failed"
 				proof.Error = err
 				s.recordProof(proof)
@@ -319,7 +319,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 			}
 			if s.delegate != nil && s.delegate.file != nil {
 				if err := s.delegate.file.Remove(ctx, target); err != nil && !os.IsNotExist(err) {
-					rollback()
+					rollback(ctx)
 					proof.Status = "failed"
 					proof.Error = err
 					s.recordProof(proof)
@@ -327,7 +327,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 				}
 			} else {
 				if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-					rollback()
+					rollback(ctx)
 					proof.Status = "failed"
 					proof.Error = err
 					s.recordProof(proof)
@@ -336,7 +336,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 			}
 		case OpExecCmd:
 			if len(op.Args) == 0 {
-				rollback()
+				rollback(ctx)
 				err := fmt.Errorf("substrate: EXEC_CMD requires args")
 				proof.Status = "failed"
 				proof.Error = err
@@ -348,7 +348,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 			shellCmd := strings.Join(op.Args, " ")
 			if s.delegate != nil && s.delegate.shell != nil {
 				if _, err := s.delegate.shell.Execute(ctx, shellCmd); err != nil {
-					rollback()
+					rollback(ctx)
 					proof.Status = "failed"
 					proof.Error = fmt.Errorf("substrate: exec %v: %w", op.Args, err)
 					s.recordProof(proof)
@@ -358,7 +358,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 				// Fallback through the shared exec helper (also enforces Setpgid)
 				res := ExecCommand(ctx, s.root, nil, op.Args)
 				if res.Err != nil {
-					rollback()
+					rollback(ctx)
 					proof.Status = "failed"
 					proof.Error = fmt.Errorf("substrate: exec %v: %w (output: %s)", op.Args, res.Err, res.Stdout+res.Stderr)
 					s.recordProof(proof)
@@ -366,7 +366,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 				}
 			}
 		default:
-			rollback()
+			rollback(ctx)
 			err := fmt.Errorf("substrate: unknown operation type %q", op.Type)
 			proof.Status = "failed"
 			proof.Error = err
@@ -378,7 +378,7 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 	proof.EvidencePath = filepath.Join(s.root, ".izen", "substrate", prop.ID+".proof")
 	evidenceContent := fmt.Sprintf("proposal=%s tx=%s at=%s ops=%d\n", prop.ID, txID, time.Now().UTC().Format(time.RFC3339), len(prop.Operations))
 	if s.delegate != nil && s.delegate.file != nil {
-		_ = s.delegate.file.Write(context.Background(), proof.EvidencePath, evidenceContent)
+		_ = s.delegate.file.Write(ctx, proof.EvidencePath, evidenceContent) //nolint:contextcheck
 	} else {
 		if err := os.MkdirAll(filepath.Dir(proof.EvidencePath), 0o755); err == nil {
 			_ = os.WriteFile(proof.EvidencePath, []byte(evidenceContent), 0o644)

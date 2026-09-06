@@ -2,7 +2,7 @@ package domain
 
 // ExecutionUnit is the atomic payload the Runtime hands to the Execution Plane.
 type ExecutionUnit struct {
-	UnitID             UnitID              `json:"unit_id"`       // "unit_<ulid>"
+	UnitID             UnitID              `json:"unit_id"` // "unit_<ulid>"
 	FrameID            FrameID             `json:"frame_id"`
 	ObjectiveSlice     ObjectiveSlice      `json:"objective_slice"` // bounded slice of Objective
 	InputContext       CompiledContext     `json:"input_context"`   // output of ContextCompiler
@@ -27,7 +27,7 @@ type CompiledContext struct {
 }
 
 type ContextChannel struct {
-	Name    string `json:"name"`    // e.g., "symbol_graph", "dependency_graph", "evidence"
+	Name    string `json:"name"` // e.g., "symbol_graph", "dependency_graph", "evidence"
 	Tokens  int    `json:"tokens"`
 	Explain string `json:"explain"` // why this channel is included — strict compiler (V5-C)
 }

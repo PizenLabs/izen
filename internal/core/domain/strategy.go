@@ -15,7 +15,7 @@ type ExecutionStrategy struct {
 type ContextPolicy uint8
 
 const (
-	ContextNone         ContextPolicy = iota // trivial $prompt hi
+	ContextNone ContextPolicy = iota // trivial $prompt hi
 	ContextFull
 	ContextStructural
 	ContextRegional
@@ -52,7 +52,7 @@ type ProgressPolicy struct {
 type ProgressSignal uint8
 
 const (
-	SignalStateChanged       ProgressSignal = iota
+	SignalStateChanged ProgressSignal = iota
 	SignalConstraintSatisfied
 	SignalEvidenceImproved
 	SignalDependencyResolved

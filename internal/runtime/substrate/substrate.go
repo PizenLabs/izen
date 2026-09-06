@@ -440,5 +440,3 @@ func (p *osFilePort) Remove(ctx context.Context, path string) error {
 	}
 	return os.Remove(abs)
 }
-
-

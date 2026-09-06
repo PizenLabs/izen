@@ -4,7 +4,7 @@ package domain
 // Frames form a DAG (parent lineage), but the single-frame case is the common
 // degenerate form.
 type ExecutionFrame struct {
-	FrameID      FrameID                `json:"frame_id"`      // globally unique, non-sequential
+	FrameID      FrameID                `json:"frame_id"` // globally unique, non-sequential
 	ParentID     *FrameID               `json:"parent_id,omitempty"`
 	Lineage      FrameLineage           `json:"lineage"`       // causal ancestry chain
 	Scope        Scope                  `json:"scope"`         // frozen at frame creation
@@ -17,8 +17,8 @@ type ExecutionFrame struct {
 	Observations []ExecutionObservation `json:"observations"`
 }
 
-type FrameID string        // "frame_<ulid>" — globally unique
-type CheckpointID string   // "chkpt_<sha256>" — content-addressed
+type FrameID string         // "frame_<ulid>" — globally unique
+type CheckpointID string    // "chkpt_<sha256>" — content-addressed
 type FrameLineage []FrameID // root → parent chain
 
 type AttemptCounter struct {
@@ -35,7 +35,7 @@ type Dependency struct {
 type FrameStatus uint8
 
 const (
-	FramePending   FrameStatus = iota
+	FramePending FrameStatus = iota
 	FrameRunning
 	FrameCompleted
 	FrameFailed
@@ -47,7 +47,7 @@ const (
 type RollbackBoundary uint8
 
 const (
-	RollbackLocal    RollbackBoundary = iota // this frame only
-	RollbackAncestral                        // parent chain per dependency graph
-	RollbackTask                             // entire objective
+	RollbackLocal     RollbackBoundary = iota // this frame only
+	RollbackAncestral                         // parent chain per dependency graph
+	RollbackTask                              // entire objective
 )

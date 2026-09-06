@@ -40,16 +40,16 @@ func TestDomainOrthogonality(t *testing.T) {
 	// carriers (e.g., AuthorizationInput bundles evidence for a single decision).
 	allowlist := map[string]bool{
 		// Authorization decision bundles are single-purpose inputs, not state fusion
-		"AuthorizationInput":     true,
-		"AuthorizationDecision":  true,
-		"AuthorityRule":          true,
-		"ExecutionEnvironment":   true,
-		"ExecutionUnit":          true,
-		"ExecutionFrame":         true,
-		"ExecutionObservation":   true,
-		"ExecutionStrategy":      true,
-		"TerminalState":          true,
-		"ExecutionIntent":        true,
+		"AuthorizationInput":    true,
+		"AuthorizationDecision": true,
+		"AuthorityRule":         true,
+		"ExecutionEnvironment":  true,
+		"ExecutionUnit":         true,
+		"ExecutionFrame":        true,
+		"ExecutionObservation":  true,
+		"ExecutionStrategy":     true,
+		"TerminalState":         true,
+		"ExecutionIntent":       true,
 	}
 
 	for _, path := range files {
@@ -124,8 +124,8 @@ func typeString(expr ast.Expr) string {
 	}
 }
 
-func keys(m map[string]bool) []string {
-	var out []string
+func keys(m map[string]bool) []string { //nolint:prealloc
+	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
 	}

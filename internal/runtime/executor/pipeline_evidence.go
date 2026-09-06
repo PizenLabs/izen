@@ -1,3 +1,4 @@
+//nolint:gocritic
 package executor
 
 import (
@@ -10,12 +11,13 @@ import (
 
 // BuildEvidenceVector aggregates stdout, exit codes, and test logs into an
 // EvidenceVector covering L0..L5. The mapping is deterministic:
-//   L0 Execution       — PASS if mutation applied and no execution error
-//   L1 Syntax          — PASS if stdout does not contain "syntax error"
-//   L2 StaticAnalysis  — PASS if stdout does not contain "lint" failures
-//   L3 UnitTests       — PASS if test logs do not contain "FAIL"
-//   L4 IntegrationTests— PASS if test logs indicate integration PASS or empty
-//   L5 HumanSignoff    — SKIP unless humanApproved true (then PASS)
+//
+//	L0 Execution       — PASS if mutation applied and no execution error
+//	L1 Syntax          — PASS if stdout does not contain "syntax error"
+//	L2 StaticAnalysis  — PASS if stdout does not contain "lint" failures
+//	L3 UnitTests       — PASS if test logs do not contain "FAIL"
+//	L4 IntegrationTests— PASS if test logs indicate integration PASS or empty
+//	L5 HumanSignoff    — SKIP unless humanApproved true (then PASS)
 func BuildEvidenceVector(result domain.MutationResult, stdout string, exitCode int, testLogs string, humanApproved bool) evidence.EvidenceVector {
 	v := evidence.EvidenceVector{}
 	lower := strings.ToLower(stdout + " " + testLogs)

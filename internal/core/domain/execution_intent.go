@@ -7,19 +7,19 @@ import "github.com/PizenLabs/izen/internal/core/domain/occ"
 // authorization evidence bundle so the 6-clause formula can be evaluated
 // atomically before any side-effect reaches Substrate.
 type ExecutionIntent struct {
-	Objective Objective `json:"objective"`
-	Unit      ExecutionUnit `json:"unit"`
+	Objective Objective      `json:"objective"`
+	Unit      ExecutionUnit  `json:"unit"`
 	Budget    ResourceBudget `json:"budget"`
 	// Capabilities is the scoped capability grant for this unit.
 	Capabilities DomainCapabilitySet `json:"capabilities"`
 	// SourceState is the workspace source fingerprint observed before execution.
 	SourceState SourceState `json:"source_state"`
 	// ArtifactRef describes the plan/patch artifact that authorizes the mutation.
-	Artifact ArtifactRef `json:"artifact"`
-	CheckpointID CheckpointID `json:"checkpoint_id"`
-	HasCheckpoint bool `json:"has_checkpoint"`
-	HumanApproved bool `json:"human_approved"`
-	BudgetIsPreApproval bool `json:"budget_is_pre_approval"`
+	Artifact            ArtifactRef  `json:"artifact"`
+	CheckpointID        CheckpointID `json:"checkpoint_id"`
+	HasCheckpoint       bool         `json:"has_checkpoint"`
+	HumanApproved       bool         `json:"human_approved"`
+	BudgetIsPreApproval bool         `json:"budget_is_pre_approval"`
 	// ExpectedVersion is the OCC version the caller observed at intent creation.
 	ExpectedVersion occ.StateVersion `json:"expected_version"`
 	// WorkflowState indicates the current workflow phase; building/repairing

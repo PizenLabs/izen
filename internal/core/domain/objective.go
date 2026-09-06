@@ -5,11 +5,11 @@ import "fmt"
 // Objective is the sole authoritative input to execution. It is immutable
 // after IntentGateway validation.
 type Objective struct {
-	Intent              Intent       `json:"intent"`
-	TargetScope         Scope        `json:"target_scope"`
-	NegativeScope       Scope        `json:"negative_scope"`
-	ConstraintChecklist []Constraint `json:"constraints"`
-	RiskClass           RiskClass    `json:"risk_class"`
+	Intent              Intent        `json:"intent"`
+	TargetScope         Scope         `json:"target_scope"`
+	NegativeScope       Scope         `json:"negative_scope"`
+	ConstraintChecklist []Constraint  `json:"constraints"`
+	RiskClass           RiskClass     `json:"risk_class"`
 	EvidenceRequirement EvidenceState `json:"evidence_requirement"`
 }
 

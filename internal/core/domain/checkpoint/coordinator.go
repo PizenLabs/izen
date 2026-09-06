@@ -28,7 +28,7 @@ type CheckpointCoordinator interface {
 // a clean recovery.
 type DiskCheckpointCoordinator struct {
 	mu        sync.Mutex
-	gate      occ.OCCGate
+	gate      occ.OCCGate //nolint:unused // reserved for future OCC validation
 	root      string
 	snapshots map[domain.CheckpointID]*snapshot
 	// Optional stores for transactional alignment. When set, Rollback
@@ -51,11 +51,11 @@ type executionState interface {
 }
 
 type snapshot struct {
-	files             map[string][]byte // relPath -> content (nil if dir)
-	fileModes         map[string]os.FileMode
-	baselineArtVer    occ.StateVersion
-	baselineExecVer   occ.StateVersion
-	existingRelPaths  map[string]bool // set of rel paths at snapshot time
+	files            map[string][]byte // relPath -> content (nil if dir)
+	fileModes        map[string]os.FileMode
+	baselineArtVer   occ.StateVersion
+	baselineExecVer  occ.StateVersion
+	existingRelPaths map[string]bool // set of rel paths at snapshot time
 }
 
 // NewDiskCheckpointCoordinator creates a coordinator bound to workspace root.
@@ -203,7 +203,7 @@ func (d *DiskCheckpointCoordinator) Rollback(ctx context.Context, id domain.Chec
 	// Walk current disk and delete any file not in existingRelPaths.
 	_ = filepath.Walk(d.root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			return nil //nolint:nilerr // walk error intentionally swallowed to continue traversal
 		}
 		if info.IsDir() {
 			if info.Name() == ".git" {
@@ -213,7 +213,7 @@ func (d *DiskCheckpointCoordinator) Rollback(ctx context.Context, id domain.Chec
 		}
 		rel, relErr := filepath.Rel(d.root, path)
 		if relErr != nil {
-			return nil
+			return nil //nolint:nilerr // rel error swallowed
 		}
 		rel = filepath.ToSlash(rel)
 		if !snap.existingRelPaths[rel] {
@@ -293,4 +293,3 @@ func sortStrings(s []string) []string {
 
 // Ensure DiskCheckpointCoordinator implements CheckpointCoordinator.
 var _ CheckpointCoordinator = (*DiskCheckpointCoordinator)(nil)
-

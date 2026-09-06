@@ -112,7 +112,7 @@ type TransitionContext struct {
 type FailureClass int
 
 const (
-	FailureCodeClass        FailureClass = iota
+	FailureCodeClass FailureClass = iota
 	FailureEnvironmentClass
 	FailureTestClass
 	FailureScopeClass

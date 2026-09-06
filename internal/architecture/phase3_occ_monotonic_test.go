@@ -33,7 +33,7 @@ func TestPhase3OCCLock(t *testing.T) {
 				_, err := store.StagePatch("patch-1", "content", baseVer)
 				mu.Lock()
 				defer mu.Unlock()
-				if err == nil {
+				if err == nil { //nolint:gocritic
 					success++
 				} else if errors.Is(err, occ.ErrStaleDependency) {
 					stale++
@@ -69,7 +69,7 @@ func TestPhase3OCCLock(t *testing.T) {
 				_, err := ws.Transition(domain.StatePlanning, baseVer)
 				mu.Lock()
 				defer mu.Unlock()
-				if err == nil {
+				if err == nil { //nolint:gocritic
 					success++
 				} else if errors.Is(err, occ.ErrStaleDependency) {
 					stale++
@@ -101,7 +101,7 @@ func TestPhase3OCCLock(t *testing.T) {
 				_, err := es.RecordStep("step-1", "result", baseVer)
 				mu.Lock()
 				defer mu.Unlock()
-				if err == nil {
+				if err == nil { //nolint:gocritic
 					success++
 				} else if errors.Is(err, occ.ErrStaleDependency) {
 					stale++
@@ -133,7 +133,7 @@ func TestPhase3OCCLock(t *testing.T) {
 				_, err := gate.ValidateAndAdvance(&cur, 0)
 				mu.Lock()
 				defer mu.Unlock()
-				if err == nil {
+				if err == nil { //nolint:gocritic
 					success++
 				} else if errors.Is(err, occ.ErrStaleDependency) {
 					stale++
@@ -155,7 +155,7 @@ func TestPhase3OCCLock(t *testing.T) {
 		proj := runtime.NewVersionedProjection(5)
 		// Stale observed version 3 should be rejected.
 		err := proj.Validate(3)
-		if err == nil {
+		if err == nil { //nolint:gocritic
 			t.Fatal("expected ErrStaleProjection for stale version")
 		}
 		if !errors.Is(err, runtime.ErrStaleProjection) {
