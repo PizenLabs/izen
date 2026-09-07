@@ -53,6 +53,7 @@ func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respons
 		Temperature: req.Temperature,
 		Stop:        req.Stop,
 		Stream:      false,
+		ExtraParams: req.ExtraParams,
 	}
 
 	payload, err := json.Marshal(body)
@@ -81,7 +82,7 @@ func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respons
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("groq: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("groq", resp.StatusCode, respBody)
 	}
 
 	var groqResp groqResponse
@@ -137,6 +138,7 @@ func (p *GroqProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.Re
 		Stop:          req.Stop,
 		Stream:        true,
 		StreamOptions: &streamOptions{IncludeUsage: true},
+		ExtraParams:   req.ExtraParams,
 	}
 
 	reqCtx, cancel := context.WithCancel(ctx)
@@ -168,7 +170,7 @@ func (p *GroqProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.Re
 		cancel()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("groq: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("groq", resp.StatusCode, respBody)
 	}
 
 	sr := &groqSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
@@ -201,6 +203,15 @@ type groqRequest struct {
 	Stop          []string       `json:"stop,omitempty"`
 	Stream        bool           `json:"stream,omitempty"`
 	StreamOptions *streamOptions `json:"stream_options,omitempty"`
+	// ExtraParams carries arbitrary provider-native JSON fields merged
+	// directly into the HTTP POST body (generic passthrough).
+	ExtraParams map[string]any `json:"-"`
+}
+
+// MarshalJSON merges ExtraParams into the top-level object. Native keys win.
+func (r groqRequest) MarshalJSON() ([]byte, error) {
+	type alias groqRequest
+	return marshalWithExtra(alias(r), r.ExtraParams)
 }
 
 type groqResponse struct {

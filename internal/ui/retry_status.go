@@ -35,6 +35,8 @@ func formatRetryBanner(info *retryStatusInfo) string {
 // onRetryStateChange is the UI callback invoked by the retry engine before
 // sleeping for backoff. It stores the RetryInfo so the status bar can render
 // the banner instead of hanging on "Synthesizing plan...".
+//
+//nolint:unused // public contract kept for future engine wiring
 func (m *model) onRetryStateChange(info retryStatusInfo) {
 	m.retryInfo = &info
 	if m.Ready {

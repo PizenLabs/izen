@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -64,8 +65,12 @@ func TestHangingSocketFailsAtHeaderBound(t *testing.T) {
 
 	client := &http.Client{Transport: StrictTransport(150 * time.Millisecond)}
 	start := time.Now()
-	_, err := client.Get(hung.URL)
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, hung.URL, nil)
+	resp, err := client.Do(req)
 	elapsed := time.Since(start)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
 	if err == nil {
 		t.Fatal("expected header-timeout error from hanging socket, got nil")
 	}
@@ -87,7 +92,8 @@ func TestSlowProviderInsideBoundSucceeds(t *testing.T) {
 	defer slow.Close()
 
 	client := &http.Client{Transport: StrictTransport(5 * time.Second)}
-	resp, err := client.Get(slow.URL)
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, slow.URL, nil)
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("slow provider inside bound failed: %v", err)
 	}

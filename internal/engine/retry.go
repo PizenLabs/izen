@@ -10,11 +10,11 @@ import (
 type EngineState int
 
 const (
-	StateIdle        EngineState = iota // idle, no synthesis in progress
-	StateSynthesizing                   // actively synthesizing (provider call in flight)
-	StateRetrying                       // failed, backing off before next attempt
-	StateFailed                         // exhausted all retries
-	StateSuccess                        // synthesis succeeded
+	StateIdle         EngineState = iota // idle, no synthesis in progress
+	StateSynthesizing                    // actively synthesizing (provider call in flight)
+	StateRetrying                        // failed, backing off before next attempt
+	StateFailed                          // exhausted all retries
+	StateSuccess                         // synthesis succeeded
 )
 
 func (s EngineState) String() string {
@@ -44,8 +44,8 @@ type RetryInfo struct {
 
 // Default retry constants.
 const (
-	DefaultMaxAttempts   = 5
-	DefaultTTFTTimeout   = 15 * time.Second // maximum wait time for first token
+	DefaultMaxAttempts       = 5
+	DefaultTTFTTimeout       = 15 * time.Second // maximum wait time for first token
 	DefaultInterTokenTimeout = 5 * time.Second  // maximum wait time between subsequent tokens
 )
 

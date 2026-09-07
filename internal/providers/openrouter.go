@@ -175,11 +175,12 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("%w: server returned 401: %s", ErrOpenRouterAuth, strings.TrimSpace(string(respBody)))
+		pe := NewProviderError("openrouter", resp.StatusCode, respBody)
+		return nil, fmt.Errorf("%w: %s", ErrOpenRouterAuth, pe.Error())
 	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("openrouter: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("openrouter", resp.StatusCode, respBody)
 	}
 
 	var openaiResp openrouterResponse
@@ -263,14 +264,15 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		cancel()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("%w: server returned 401: %s", ErrOpenRouterAuth, strings.TrimSpace(string(respBody)))
+		pe := NewProviderError("openrouter", resp.StatusCode, respBody)
+		return nil, fmt.Errorf("%w: %s", ErrOpenRouterAuth, pe.Error())
 	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		cancel()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("openrouter: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("openrouter", resp.StatusCode, respBody)
 	}
 
 	sr := &openrouterSSEReader{
@@ -374,6 +376,15 @@ type openrouterRequest struct {
 	// is injected from the dynamically resolved effort directive; a nil value
 	// omits the field entirely.
 	Reasoning *openrouterReasoning `json:"reasoning,omitempty"`
+	// ExtraParams carries arbitrary provider-native JSON fields merged
+	// directly into the HTTP POST body (generic passthrough).
+	ExtraParams map[string]any `json:"-"`
+}
+
+// MarshalJSON merges ExtraParams into the top-level object. Native keys win.
+func (r openrouterRequest) MarshalJSON() ([]byte, error) {
+	type alias openrouterRequest
+	return marshalWithExtra(alias(r), r.ExtraParams)
 }
 
 // openrouterReasoning is OpenRouter's reasoning control payload: an optional
@@ -529,6 +540,7 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 		}
 		body.Tools = rawTools
 	}
+	body.ExtraParams = req.ExtraParams
 	return body
 }
 

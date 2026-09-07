@@ -2085,28 +2085,28 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				emitContent, _ = m.streamThrottle.Flush()
 			}
 			if emitContent == "" && len(m.streamBuffer) > 0 {
-			// Legacy fallback: emit directly from streamBuffer, up to the
-			// first word boundary (capped), keeping the remainder buffered for
-			// the next tick.
-			emit := 0
-			minChars := 3
-			for i, c := range m.streamBuffer {
-				if i >= minChars && (c == ' ' || c == '\n') {
-					emit = i + 1
-					break
+				// Legacy fallback: emit directly from streamBuffer, up to the
+				// first word boundary (capped), keeping the remainder buffered for
+				// the next tick.
+				emit := 0
+				minChars := 3
+				for i, c := range m.streamBuffer {
+					if i >= minChars && (c == ' ' || c == '\n') {
+						emit = i + 1
+						break
+					}
 				}
-			}
-			if emit == 0 {
-				emit = len(m.streamBuffer)
-			}
-			if emit > 80 {
-				emit = 80
-				for emit > 0 && !utf8.RuneStart(m.streamBuffer[emit]) {
-					emit--
+				if emit == 0 {
+					emit = len(m.streamBuffer)
 				}
-			}
-			emitContent = m.streamBuffer[:emit]
-			m.streamBuffer = m.streamBuffer[emit:]
+				if emit > 80 {
+					emit = 80
+					for emit > 0 && !utf8.RuneStart(m.streamBuffer[emit]) {
+						emit--
+					}
+				}
+				emitContent = m.streamBuffer[:emit]
+				m.streamBuffer = m.streamBuffer[emit:]
 			}
 		}
 		if emitContent != "" {
@@ -2303,11 +2303,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// never additionally to the throttle/legacy buffers — so no byte
 		// can be emitted twice. The throttle/legacy paths are strictly
 		// fallbacks for harnesses with no utf8 buffer.
-		if m.utf8StreamBuf != nil {
+		switch {
+		case m.utf8StreamBuf != nil:
 			m.utf8StreamBuf.Append([]byte(raw))
-		} else if m.streamThrottle != nil {
+		case m.streamThrottle != nil:
 			m.streamThrottle.Write(raw)
-		} else {
+		default:
 			m.streamBuffer += raw
 		}
 		if m.streamParser != nil {
@@ -2429,10 +2430,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				// Diverged non-empty currentStreamContent + non-prefix tail:
 				// emit nothing — the content is already on screen.
 			}
-		} else {
-			if m.streamThrottle != nil {
-				m.streamBuffer += m.streamThrottle.Drain()
-			}
+		} else if m.streamThrottle != nil {
+			m.streamBuffer += m.streamThrottle.Drain()
 		}
 		if m.streamTickActive || len(m.streamBuffer) > 0 {
 			m.emitVisibleContent(m.streamBuffer)
@@ -3003,15 +3002,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if m.streamThrottle != nil {
 				_ = m.streamThrottle.Drain()
 			}
-			if strings.HasPrefix(msg.content, m.currentStreamContent) {
+			switch {
+			case strings.HasPrefix(msg.content, m.currentStreamContent):
 				if delta := msg.content[len(m.currentStreamContent):]; delta != "" {
 					m.currentStreamContent = msg.content
 					m.ensureStreamBlocks().Append(KindContent, delta)
 				}
-			} else if m.currentStreamContent == "" {
+			case m.currentStreamContent == "":
 				m.currentStreamContent = msg.content
 				m.ensureStreamBlocks().Append(KindContent, msg.content)
-			} else {
+			default:
 				m.currentStreamContent = msg.content
 			}
 			m.extractReasoningContent()

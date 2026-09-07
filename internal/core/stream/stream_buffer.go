@@ -18,9 +18,9 @@ import (
 // beyond what they already rendered — NEVER `view += fullText`. Reset() fully
 // flushes the buffer to empty at the start of a new prompt submission.
 type StreamBuffer struct {
-	mu       sync.RWMutex
-	buf      []byte
-	lastLen  int // length of last valid prefix returned (for updated detection)
+	mu      sync.RWMutex
+	buf     []byte
+	lastLen int // length of last valid prefix returned (for updated detection)
 }
 
 // Append appends a raw network chunk thread-safely.

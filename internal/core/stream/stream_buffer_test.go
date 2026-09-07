@@ -16,9 +16,9 @@ func TestStreamBufferVietnameseSplit(t *testing.T) {
 	// input bytes: t i ế (3 bytes) n g (1) space (1) V i ệ (3) t etc.
 	// Choose splits: [0:3], [3:7], [7:]
 	chunks := [][]byte{
-		raw[0:3],  // may split inside ế
-		raw[3:7],  // middle
-		raw[7:],   // remainder
+		raw[0:3], // may split inside ế
+		raw[3:7], // middle
+		raw[7:],  // remainder
 	}
 
 	b := &StreamBuffer{}
@@ -36,10 +36,9 @@ func TestStreamBufferVietnameseSplit(t *testing.T) {
 				t.Fatalf("chunk %d: returned string contains U+FFFD replacement char: %q", i, s)
 			}
 			last = s
-		} else {
-			// updated==false is allowed when chunk only completed partial rune tails without new valid prefix growth
-			// but ensure we didn't lose data
 		}
+		// updated==false is allowed when chunk only completed partial rune tails
+		// without new valid prefix growth.
 		_ = last
 		// Also collect incremental valid prefix; final should equal input
 		if s != "" {

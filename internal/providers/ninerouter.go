@@ -85,6 +85,7 @@ func (p *NineRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 		Temperature: req.Temperature,
 		Stop:        req.Stop,
 		Stream:      false,
+		ExtraParams: req.ExtraParams,
 	}
 
 	if len(req.Tools) > 0 {
@@ -124,7 +125,7 @@ func (p *NineRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("9router: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("ninerouter", resp.StatusCode, respBody)
 	}
 
 	var nrResp ninerouterResponse
@@ -199,6 +200,7 @@ func (p *NineRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		Stop:          req.Stop,
 		Stream:        true,
 		StreamOptions: &streamOptions{IncludeUsage: true},
+		ExtraParams:   req.ExtraParams,
 	}
 
 	if len(req.Tools) > 0 {
@@ -241,7 +243,7 @@ func (p *NineRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		cancel()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("9router: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("ninerouter", resp.StatusCode, respBody)
 	}
 
 	sr := &ninerouterSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
@@ -263,6 +265,15 @@ type ninerouterRequest struct {
 	Stream        bool                `json:"stream,omitempty"`
 	StreamOptions *streamOptions      `json:"stream_options,omitempty"`
 	Tools         []json.RawMessage   `json:"tools,omitempty"`
+	// ExtraParams carries arbitrary provider-native JSON fields merged
+	// directly into the HTTP POST body (generic passthrough).
+	ExtraParams map[string]any `json:"-"`
+}
+
+// MarshalJSON merges ExtraParams into the top-level object. Native keys win.
+func (r ninerouterRequest) MarshalJSON() ([]byte, error) {
+	type alias ninerouterRequest
+	return marshalWithExtra(alias(r), r.ExtraParams)
 }
 
 type ninerouterResponse struct {

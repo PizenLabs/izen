@@ -52,6 +52,15 @@ type ollamaRequest struct {
 		NumPredict  int     `json:"num_predict"`
 		Temperature float64 `json:"temperature,omitempty"`
 	} `json:"options,omitempty"`
+	// ExtraParams carries arbitrary provider-native JSON fields merged
+	// directly into the HTTP POST body (generic passthrough).
+	ExtraParams map[string]any `json:"-"`
+}
+
+// MarshalJSON merges ExtraParams into the top-level object. Native keys win.
+func (r ollamaRequest) MarshalJSON() ([]byte, error) {
+	type alias ollamaRequest
+	return marshalWithExtra(alias(r), r.ExtraParams)
 }
 
 type ollamaResponse struct {
@@ -160,10 +169,11 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		maxTokens = 4096
 	}
 	body := ollamaRequest{
-		Model:     model,
-		Messages:  msgs,
-		Stream:    false,
-		MaxTokens: &maxTokens,
+		Model:       model,
+		Messages:    msgs,
+		Stream:      false,
+		MaxTokens:   &maxTokens,
+		ExtraParams: req.ExtraParams,
 		Options: &struct {
 			NumPredict  int     `json:"num_predict"`
 			Temperature float64 `json:"temperature,omitempty"`
@@ -201,7 +211,7 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("ollama: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("ollama", resp.StatusCode, respBody)
 	}
 
 	var ollamaResp ollamaResponse
@@ -278,6 +288,7 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		Stream:        true,
 		StreamOptions: &streamOptions{IncludeUsage: true},
 		MaxTokens:     &maxTokens,
+		ExtraParams:   req.ExtraParams,
 		Options: &struct {
 			NumPredict  int     `json:"num_predict"`
 			Temperature float64 `json:"temperature,omitempty"`
@@ -315,7 +326,7 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		cancel()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("ollama: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("ollama", resp.StatusCode, respBody)
 	}
 
 	sr := &sseReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
@@ -522,7 +533,7 @@ func (p *OllamaProvider) Generate(ctx context.Context, system, prompt string) (s
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("ollama generate: status %d: %s", resp.StatusCode, string(respBody))
+		return "", NewProviderError("ollama", resp.StatusCode, respBody)
 	}
 
 	var genResp ollamaGenerateResponse

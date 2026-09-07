@@ -48,6 +48,15 @@ type geminiRequest struct {
 	SystemInstruction *geminiSystemInstruction `json:"systemInstruction,omitempty"`
 	GenerationConfig  *geminiGenerationConfig  `json:"generationConfig,omitempty"`
 	Stream            bool                     `json:"stream"`
+	// ExtraParams carries arbitrary provider-native JSON fields merged
+	// directly into the HTTP POST body (generic passthrough).
+	ExtraParams map[string]any `json:"-"`
+}
+
+// MarshalJSON merges ExtraParams into the top-level object. Native keys win.
+func (r geminiRequest) MarshalJSON() ([]byte, error) {
+	type alias geminiRequest
+	return marshalWithExtra(alias(r), r.ExtraParams)
 }
 
 type geminiSystemInstruction struct {
@@ -165,6 +174,7 @@ func (p *GeminiProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 			MaxOutputTokens: maxTokens,
 			Temperature:     req.Temperature,
 		},
+		ExtraParams: req.ExtraParams,
 	}
 
 	if req.System != "" {
@@ -198,7 +208,7 @@ func (p *GeminiProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("gemini: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("gemini", resp.StatusCode, respBody)
 	}
 
 	var geminiResp geminiResponse
@@ -255,6 +265,7 @@ func (p *GeminiProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 			MaxOutputTokens: maxTokens,
 			Temperature:     req.Temperature,
 		},
+		ExtraParams: req.ExtraParams,
 	}
 
 	if req.System != "" {
@@ -290,7 +301,7 @@ func (p *GeminiProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		cancel()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("gemini: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("gemini", resp.StatusCode, respBody)
 	}
 
 	sr := &geminiSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}

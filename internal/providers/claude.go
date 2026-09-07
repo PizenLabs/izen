@@ -56,6 +56,15 @@ type claudeRequest struct {
 	System        string          `json:"system,omitempty"`
 	StopSequences []string        `json:"stop_sequences,omitempty"`
 	Thinking      *claudeThinking `json:"thinking,omitempty"`
+	// ExtraParams carries arbitrary provider-native JSON fields merged
+	// directly into the HTTP POST body (generic passthrough).
+	ExtraParams map[string]any `json:"-"`
+}
+
+// MarshalJSON merges ExtraParams into the top-level object. Native keys win.
+func (r claudeRequest) MarshalJSON() ([]byte, error) {
+	type alias claudeRequest
+	return marshalWithExtra(alias(r), r.ExtraParams)
 }
 
 type claudeResponse struct {
@@ -165,6 +174,7 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		System:        req.System,
 		StopSequences: req.Stop,
 		Thinking:      thinkingFor(req),
+		ExtraParams:   req.ExtraParams,
 	}
 
 	payload, err := json.Marshal(body)
@@ -194,7 +204,7 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("claude: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("anthropic", resp.StatusCode, respBody)
 	}
 
 	var claudeResp claudeResponse
@@ -253,6 +263,7 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		System:        req.System,
 		StopSequences: req.Stop,
 		Thinking:      thinkingFor(req),
+		ExtraParams:   req.ExtraParams,
 	}
 
 	reqCtx, cancel := context.WithCancel(ctx)
@@ -284,7 +295,7 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		cancel()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("claude: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("anthropic", resp.StatusCode, respBody)
 	}
 
 	sr := &claudeSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
