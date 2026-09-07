@@ -49,6 +49,9 @@ import (
 
 // clearPresentation clears the transient presentation surface: stream buffers,
 // thinking buffers, loading shimmer, trace/output buffers, and streaming flags.
+// STREAM CONTRACT: every byte buffer (utf8StreamBuf, throttle, legacy string,
+// accumulated content) is flushed to empty so a new prompt submission starts
+// from "" — never with stale bytes that FrameTick would re-emit as duplicates.
 // It never touches execution-activity stores or durable session/workspace state.
 func (m *model) clearPresentation() {
 	m.currentPrompt = ""
@@ -56,6 +59,9 @@ func (m *model) clearPresentation() {
 	m.reasoningBuffer.Reset()
 	m.streamBuffer = ""
 	m.currentStreamContent = ""
+	if m.utf8StreamBuf != nil {
+		m.utf8StreamBuf.Reset()
+	}
 	m.traceBuffer.Reset()
 	m.traceExpanded = false
 	m.traceWindowStart = 0
@@ -200,6 +206,34 @@ func (m *model) sealActivitySurface() {
 // its events are welcome in the viewport again.
 func (m *model) unsealActivitySurface() {
 	m.activitySurfaceSealed = false
+}
+
+// pruneFailedPromptFromHistory rolls back the last user message from SessionHistory
+// when it was not followed by an assistant response (TTFT timeout / execution
+// failure). In ASK mode or single-shot prompts, this prevents a stale failed
+// prompt from polluting the next turn's context window.
+func (m *model) pruneFailedPromptFromHistory() {
+	if m.sess == nil {
+		return
+	}
+	// Prefer pruning by currentPrompt content when available.
+	if m.currentPrompt != "" {
+		if m.sess.PruneLastUserMessage(m.currentPrompt) {
+			_ = m.sess.Save()
+			m.currentPrompt = ""
+			return
+		}
+	}
+	// Fallback: if history ends with an unanswered user message (no assistant), prune it.
+	// This covers cases where currentPrompt was already cleared.
+	if len(m.sess.History) > 0 {
+		last := m.sess.History[len(m.sess.History)-1]
+		if last.Role == "user" {
+			// Check if there's no assistant after it (i.e., history tail is user)
+			m.sess.History = m.sess.History[:len(m.sess.History)-1]
+			_ = m.sess.Save()
+		}
+	}
 }
 
 // discardPendingAction is the /drop entry point: "Discard what I am ABOUT TO

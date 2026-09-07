@@ -219,41 +219,111 @@ func (m *model) renderActiveIdleFooter(width int, actions []Action) string {
 	return padRightOverlay(base, chip, width)
 }
 
+// ttftBudget is the Time-To-First-Token deadline the live connection
+// stopwatch counts against (rendered as "/ 15.0s"). It mirrors the 15s
+// request context bound in streamCmd and DefaultTTFTTimeout: the transport
+// header bound (10s cloud) fires first, the context fires at 15s.
+const ttftBudget = 15 * time.Second
+
+// firstTokenReceived reports whether the first stream token has arrived.
+// The UTF-8 byte buffer is primary: the instant it holds the first valid
+// byte the TTFT countdown stops. The authoritative provider token count,
+// the streaming stage, and the already-emitted content are fallbacks for
+// paths that bypass the byte buffer (local models without usage metadata).
+// While false the footer shows the connection stopwatch; the instant it
+// flips true the timer stops and the bar switches to live token metrics.
+func (m *model) firstTokenReceived(st stageView) bool {
+	if m.utf8StreamBuf != nil && m.utf8StreamBuf.Len() > 0 {
+		return true
+	}
+	if st.Tokens > 0 {
+		return true
+	}
+	if st.State == stageStreaming {
+		return true
+	}
+	if len(m.currentStreamContent) > 0 {
+		return true
+	}
+	if m.responseBuffer.Len() > 0 {
+		return true
+	}
+	return false
+}
+
+// noFirstByteReceived reports whether no provider byte (content or
+// reasoning) has arrived this turn. It gates the TTFT-timeout diagnosis:
+// an error before the first byte is a connection-phase stall (DNS / TCP /
+// TLS / response headers); the same error after bytes arrived is a
+// mid-stream failure and must not be mislabeled as TTFT.
+func (m *model) noFirstByteReceived() bool {
+	if m.utf8StreamBuf != nil && m.utf8StreamBuf.Len() > 0 {
+		return false
+	}
+	if len(m.currentStreamContent) > 0 || m.responseBuffer.Len() > 0 {
+		return false
+	}
+	if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
+		return false
+	}
+	return true
+}
+
 // renderExecutingFooter renders the live EXECUTING bar:
 //
-//	⠋ Generating...  ·  ↓<tok> tok  ·  <rate> tok/s  ·  Ctrl+C interrupt
+//	pre-TTFT (no first token yet):
+//	  ⠋ Connecting to provider... 4.2s / 15.0s · [model]  ·  Ctrl+C interrupt
+//	post-first-token:
+//	  ⠋ Generating...  ·  ↓<tok> tok  ·  <rate> tok/s  ·  [model]  ·  Ctrl+C interrupt
 //
+// The pre-TTFT stopwatch re-renders on every FrameTickMsg (30ms) while the
+// first byte is awaited and freezes the moment it arrives. The "/ 15.0s"
+// budget is the internal TTFT threshold; phase details (DNS/TLS/headers)
+// appear exclusively in the TTFTTimeout error event log.
 // The tok count is ONLY the authoritative provider-reported stage count (fed
 // via setStageMetrics from the stream's ProviderUsage) — never a character
 // estimate. The rate is derived from that authoritative count over the
 // stream's wall-clock elapsed time. This bar exists strictly while an
 // operation is in flight; on completion it is replaced wholesale, so
 // 'Ctrl+C interrupt' / '⏸' can never linger.
+// When in StateRetrying (retryInfo != nil), an explicit retry banner is shown
+// instead of hanging on "Generating...": "[Retry N/M] <error>. Retrying in Xs..."
 func (m *model) renderExecutingFooter() string {
+	// Retry state takes precedence: show explicit banner, not stale generating.
+	if m.retryInfo != nil {
+		banner := formatRetryBanner(m.retryInfo)
+		return footerSep(
+			m.executingSpinner()+" "+footerExecLabelStyle.Render(banner),
+			interruptLabelStyle.Render(Icon.Interrupt+" Ctrl+C interrupt"),
+		)
+	}
 	st := m.stageSnapshot()
-	// P1 Live Telemetry Heartbeat: when no tokens have arrived yet, render
-	// linear connection-pulse telemetry (elapsed seconds) instead of static 0.0 tok/s.
-	if st.Tokens == 0 && !m.executionStartedAt.IsZero() && m.isExecuting() {
-		elapsed := time.Since(m.executionStartedAt)
-		modelName := m.getActiveModelName()
-		var pulse string
-		switch {
-		case elapsed < 5*time.Second:
-			pulse = fmt.Sprintf("Connecting to provider... · %ds · [%s]", int(elapsed.Seconds()), truncateModelName(modelName, 16))
-		case elapsed < 20*time.Second:
-			pulse = fmt.Sprintf("Waiting for first byte... · %ds · [%s]", int(elapsed.Seconds()), truncateModelName(modelName, 16))
-		default:
-			pulse = fmt.Sprintf("Waiting for first byte... · %ds · [%s]", int(elapsed.Seconds()), truncateModelName(modelName, 16))
+	// Pre-TTFT connection phase: live stopwatch against the TTFT budget.
+	// The timer stops the instant the first token arrives (see
+	// firstTokenReceived) and the bar transitions to token metrics below.
+	if !m.firstTokenReceived(st) && !m.executionStartedAt.IsZero() && m.isExecuting() {
+		start := m.executionStartedAt
+		if start.IsZero() {
+			start = m.streamStartTime
 		}
+		elapsed := time.Since(start)
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		modelName := m.getActiveModelName()
+		pulse := fmt.Sprintf("Connecting to provider... %.1fs / %.1fs · [%s]",
+			elapsed.Seconds(), ttftBudget.Seconds(), truncateModelName(modelName, 16))
 		return footerSep(
 			m.executingSpinner()+" "+footerExecLabelStyle.Render(pulse),
 			interruptLabelStyle.Render(Icon.Interrupt+" Ctrl+C interrupt"),
 		)
 	}
+	modelName := m.getActiveModelName()
 	return footerSep(
 		m.executingSpinner()+" "+footerExecLabelStyle.Render("Generating..."),
 		footerTokStyle.Render("↓"+status.FormatTokens(st.Tokens)+" tok"),
 		footerExecMetaStyle.Render(formatTokenRate(m.streamTokenRate(st))+" tok/s"),
+		footerModelStyle.Render("["+truncateModelName(modelName, 16)+"]"),
 		interruptLabelStyle.Render(Icon.Interrupt+" Ctrl+C interrupt"),
 	)
 }

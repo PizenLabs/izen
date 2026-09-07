@@ -30,7 +30,7 @@ func NewGroqProvider(apiKey, model, baseURL string) *GroqProvider {
 		apiKey:  apiKey,
 		model:   model,
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{},
+		client:  &http.Client{Transport: StrictTransport(CloudResponseHeaderTimeout)},
 	}
 }
 

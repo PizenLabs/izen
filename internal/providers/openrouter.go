@@ -99,11 +99,16 @@ func NewOpenRouterProvider(apiKey, model, baseURL string) *OpenRouterProvider {
 	if baseURL == "" {
 		baseURL = "https://openrouter.ai/api/v1"
 	}
+	// Strict TTFT watchdog: the transport carries explicit per-phase socket
+	// timeouts (dial 5s, TLS handshake 5s, response headers 10s) so OS-level
+	// I/O unblocks with a phase-identifiable error instead of hanging, and
+	// the 10s header bound sits strictly inside the 15s request context to
+	// avoid channel-select drift to 27s on blocked http.Body.Read.
 	return &OpenRouterProvider{
 		apiKey:  apiKey,
 		model:   model,
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{Timeout: 30 * time.Second},
+		client:  &http.Client{Transport: StrictTransport(CloudResponseHeaderTimeout)},
 	}
 }
 
@@ -526,6 +531,11 @@ type chatRequestStats struct {
 // builds recover instead of aborting on the first 429. Every retry is a
 // transport attempt of the SAME logical invocation — recovered 429s never
 // double the invocation count, and their responses carry no billed tokens.
+//
+// Strict TTFT watchdog: each HTTP attempt is wrapped in context.WithTimeout
+// (15s) directly on the Request and the transport enforces a 10s response-
+// header bound, so the OS-level I/O unblocks with a phase-identifiable error
+// instead of drifting to 27s via blocked http.Body.Read select.
 func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body openrouterRequest, stream bool) (*http.Response, chatRequestStats, error) {
 	var stats chatRequestStats
 	attempt := func(b openrouterRequest) (*http.Response, error) {

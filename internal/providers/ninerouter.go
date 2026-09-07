@@ -35,7 +35,7 @@ func NewNineRouterProvider(apiKey, model, baseURL string) *NineRouterProvider {
 		apiKey:  apiKey,
 		model:   model,
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{},
+		client:  &http.Client{Transport: StrictTransport(CloudResponseHeaderTimeout)},
 	}
 }
 

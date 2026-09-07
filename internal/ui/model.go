@@ -40,6 +40,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/patch"
+	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/planner"
 	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
@@ -820,6 +821,8 @@ type model struct {
 	streamParser     *IncrementalStreamParser
 	streamBuffer     string // buffered tokens for smooth tick emission
 	streamTickActive bool   // whether smooth-stream tick is active
+	frameTickActive  bool   // whether FrameTickMsg loop is active (30ms debounced)
+	utf8StreamBuf    *stream.StreamBuffer
 	userName         string // dynamic system username (set at init)
 
 	// Agent state
@@ -1092,6 +1095,9 @@ type model struct {
 	streamInterTokenTimer    *time.Timer
 	streamInterTokenDeadline time.Time
 	interruptRequested       bool
+
+	// Retry state machine (engine.RetryInfo projection for status bar)
+	retryInfo *retryStatusInfo
 
 	// Background context registry: tracks all in-flight background contexts
 	// so they can be cancelled on mode transitions or Ctrl+C.
@@ -1933,6 +1939,25 @@ func (m *model) commitTokenUsage(input, output int) {
 // session, transitioning the footer from "usage unknown" to a real count.
 func (m *model) markUsageKnown() {
 	m.usageKnown = true
+}
+
+// resetTokenMetrics resets all token counters and UI cost to zero.
+// Called by /new to ensure the footer instantly shows ↓0 + ↑0 tok (0%).
+func (m *model) resetTokenMetrics() {
+	m.InputTokens = 0
+	m.OutputTokens = 0
+	m.TotalTokens = 0
+	m.TurnInputTokens = 0
+	m.TurnOutputTokens = 0
+	m.AccumulatedCost = 0
+	m.usageKnown = false
+	m.ContextLimit = 0
+	status.Default.Reset()
+	m.clearRetryState()
+	// Force footer refresh; status bar reads from these fields.
+	if m.Ready {
+		m.refreshViewportContent()
+	}
 }
 
 // tokenUsageCmd returns a command that dispatches the provider-reported token

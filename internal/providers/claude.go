@@ -25,7 +25,7 @@ func NewClaudeProvider(apiKey, model string) *ClaudeProvider {
 	return &ClaudeProvider{
 		apiKey: apiKey,
 		model:  model,
-		client: &http.Client{},
+		client: &http.Client{Transport: StrictTransport(CloudResponseHeaderTimeout)},
 	}
 }
 

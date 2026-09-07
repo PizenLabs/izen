@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/httpx"
 )
 
 type AnthropicClient struct {
@@ -27,7 +28,7 @@ func NewAnthropicClient(apiKey, model string) *AnthropicClient {
 		apiKey:  apiKey,
 		model:   model,
 		baseURL: "https://api.anthropic.com/v1/messages",
-		client:  &http.Client{},
+		client:  &http.Client{Transport: httpx.StrictTransport(httpx.CloudResponseHeaderTimeout)},
 	}
 }
 

@@ -2333,6 +2333,12 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 	m.responseBuffer.Reset()
 	m.streamBuffer = ""
 	m.currentStreamContent = ""
+	if m.utf8StreamBuf != nil {
+		m.utf8StreamBuf.Reset()
+	}
+	if m.streamThrottle != nil {
+		m.streamThrottle.Reset()
+	}
 	m.resetStreamBlocks()
 	m.lastTestOutput = ""
 	m.lastTestFailed = false
@@ -3532,6 +3538,12 @@ func (m *model) cancelStaleAgentOps() {
 	m.streamTickActive = false
 	m.streamBuffer = ""
 	m.currentStreamContent = ""
+	if m.utf8StreamBuf != nil {
+		m.utf8StreamBuf.Reset()
+	}
+	if m.streamThrottle != nil {
+		m.streamThrottle.Reset()
+	}
 	m.resetStreamBlocks()
 	m.interruptRequested = false
 

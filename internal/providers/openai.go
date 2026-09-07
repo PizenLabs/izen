@@ -25,7 +25,7 @@ func NewOpenAIProvider(apiKey, model string) *OpenAIProvider {
 	return &OpenAIProvider{
 		apiKey: apiKey,
 		model:  model,
-		client: &http.Client{},
+		client: &http.Client{Transport: StrictTransport(CloudResponseHeaderTimeout)},
 	}
 }
 

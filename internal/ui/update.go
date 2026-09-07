@@ -518,7 +518,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				m.streamCancel()
 			}
 			m.push(roleError, errorStyle.Render(
-				"✗ provider response stalled: inter-token timeout exceeded (15s exceeded without new token). Try switching models or retrying."))
+				"✗ provider response stalled: inter-token timeout exceeded (5s exceeded without new token). Try switching models or retrying."))
 			m.streamInterTokenDeadline = time.Time{}
 		}
 
@@ -1259,6 +1259,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.responseBuffer.Reset()
 			m.currentStreamContent = ""
 			m.streamBuffer = ""
+			if m.utf8StreamBuf != nil {
+				m.utf8StreamBuf.Reset()
+			}
+			if m.streamThrottle != nil {
+				m.streamThrottle.Reset()
+			}
 			m.resetStreamBlocks()
 			m.historyIndex = -1
 		}
@@ -1932,6 +1938,71 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		flush := m.flushPendingRecords()
 		return m, flush
 
+	case FrameTickMsg:
+		// ── DEBOUNCED FRAME TICKER (30ms / ~33 FPS) ─────────────────────
+		// STREAM BUFFER CONTRACT: Option A — Cumulative Overwrite.
+		// StreamBuffer.ReadValidString() returns the FULL accumulated string
+		// from the start of the stream (never a drained delta). This handler
+		// MUST NOT do `m.currentStreamContent += fullText` (that duplicates).
+		// It overwrites the view from the full text by emitting ONLY the
+		// unread suffix beyond currentStreamContent. FrameTick is the SOLE
+		// content emitter while utf8StreamBuf is active; the smooth-tick loop
+		// never emits throttle/legacy content on that path (see
+		// smoothStreamTickMsg) so no byte is ever rendered twice.
+		if m.utf8StreamBuf != nil {
+			if content, updated := m.utf8StreamBuf.ReadValidString(); updated && content != "" {
+				// Only animate spinner while streaming; content emission is handled via smooth tick path
+				// For FrameTick path, we emit via the UTF-8 buffer's valid string delta.
+				// Cumulative overwrite: emit only the new suffix beyond
+				// currentStreamContent. HasPrefix guards against slicing
+				// mismatched bytes after a mid-stream reset (content shorter
+				// or diverged) — in that case there is no safe delta, so
+				// emit nothing rather than duplicating.
+				if strings.HasPrefix(content, m.currentStreamContent) {
+					if delta := content[len(m.currentStreamContent):]; delta != "" {
+						m.emitVisibleContent(delta)
+					}
+				} else if m.currentStreamContent == "" {
+					m.emitVisibleContent(content)
+				}
+				if repaint := m.scheduleRepaint(); repaint != nil {
+					return m, tea.Batch(FrameTickCmd(), repaint)
+				}
+			}
+		} else if m.streamThrottle != nil {
+			if content, ok := m.streamThrottle.Flush(); ok && content != "" {
+				m.emitVisibleContent(content)
+				if repaint := m.scheduleRepaint(); repaint != nil {
+					return m, tea.Batch(FrameTickCmd(), repaint)
+				}
+			}
+		}
+		// ── LIVE TTFT COUNTDOWN ──────────────────────────────────────
+		// While the first byte has not arrived, re-render on EVERY frame
+		// tick so the "Connecting to provider... 4.2s / 15.0s" stopwatch
+		// and spinner advance smoothly instead of sitting frozen. The
+		// single-flight repaint gate bounds actual renders to 30FPS.
+		// The countdown stops the instant the first byte lands in
+		// utf8StreamBuf (firstTokenReceived flips true) and the bar
+		// transitions to token metrics.
+		waitingForFirstByte := m.isExecuting() && !m.firstTokenReceived(m.stageSnapshot())
+		if waitingForFirstByte {
+			if repaint := m.scheduleRepaint(); repaint != nil {
+				m.frameTickActive = true
+				return m, tea.Batch(FrameTickCmd(), repaint)
+			}
+		}
+		// Keep the loop alive while a stream is live, the first byte is
+		// still awaited, or the loading shimmer owns the dock (async
+		// context-prep window before streamCmd sets streaming). Every
+		// terminal path clears these flags, so the loop always stops.
+		if m.streaming || waitingForFirstByte || m.shimmerActive {
+			m.frameTickActive = true
+			return m, FrameTickCmd()
+		}
+		m.frameTickActive = false
+		return m, nil
+
 	case repaintTickMsg:
 		// ── SINGLE-FLIGHT 30FPS REPAINT GATE ──────────────────────────
 		// Incoming tokens were appended to docLayout in memory instantly; this
@@ -1997,15 +2068,19 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 
 		// ── FRAME-THROTTLED FLUSH ──────────────────────────────────────
-		// Prefer flushing from the StreamThrottle (16ms frame interval / 60FPS).
-		// Falls back to direct streamBuffer for non-throttle paths. The throttle
-		// retains whatever it does not release this frame, so content is never
-		// dropped — only paced.
+		// LEGACY/FALLBACK PATH ONLY. While utf8StreamBuf is active,
+		// FrameTickMsg is the sole content emitter (Option A cumulative
+		// overwrite) — this loop must NOT also flush throttle/legacy
+		// content or every byte renders twice. Emission here runs only
+		// when there is no utf8 buffer (legacy harnesses / non-stream
+		// producers). The throttle retains whatever it does not release
+		// this frame, so content is never dropped — only paced.
 		emitContent := ""
-		if m.streamThrottle != nil {
-			emitContent, _ = m.streamThrottle.Flush()
-		}
-		if emitContent == "" && len(m.streamBuffer) > 0 {
+		if m.utf8StreamBuf == nil {
+			if m.streamThrottle != nil {
+				emitContent, _ = m.streamThrottle.Flush()
+			}
+			if emitContent == "" && len(m.streamBuffer) > 0 {
 			// Legacy fallback: emit directly from streamBuffer, up to the
 			// first word boundary (capped), keeping the remainder buffered for
 			// the next tick.
@@ -2028,6 +2103,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 			emitContent = m.streamBuffer[:emit]
 			m.streamBuffer = m.streamBuffer[emit:]
+			}
 		}
 		if emitContent != "" {
 			// Tokens are appended to docLayout in memory INSTANTLY (the
@@ -2183,6 +2259,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// The smoothStreamTick handler then flushes word-aligned content from
 		// the throttle buffer instead of draining streamBuffer directly. This
 		// eliminates layout snapping caused by dumping raw buffer chunks.
+		// IMPORTANT: markdown AST parsing and table width layout recalculation
+		// MUST NOT be invoked here. Token reception only appends to the
+		// UTF-8 safe StreamBuffer and the throttle; rendering is driven by
+		// FrameTickMsg (30ms) via ReadValidString() with updated==true gate.
 		raw := string(msg)
 		// SMOOTH CLEARING: the first content token replaces the shimmer
 		// loading line with the streaming output. The shimmer tick loop stops
@@ -2199,16 +2279,24 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// streamUsageMsg (provider-reported usage).
 		// Inter-token timeout: once first byte arrives, arm a rolling 15s deadline.
 		if raw != "" && m.streamCancel != nil && m.streamInterTokenDeadline.IsZero() {
-			m.streamInterTokenDeadline = time.Now().Add(15 * time.Second)
+			m.streamInterTokenDeadline = time.Now().Add(5 * time.Second)
 		} else if raw != "" && !m.streamInterTokenDeadline.IsZero() {
-			m.streamInterTokenDeadline = time.Now().Add(15 * time.Second)
+			m.streamInterTokenDeadline = time.Now().Add(5 * time.Second)
 		}
 
 		if raw != "" {
 			m.setStage("model", m.getActiveModelName(), stageStreaming)
 		}
 		m.traceBuffer.WriteString(raw)
-		if m.streamThrottle != nil {
+		// UTF-8 safe byte buffer (Option A cumulative source of truth):
+		// while utf8StreamBuf is active it is the SOLE content emitter
+		// (drained by FrameTickMsg). Raw tokens are appended ONLY here —
+		// never additionally to the throttle/legacy buffers — so no byte
+		// can be emitted twice. The throttle/legacy paths are strictly
+		// fallbacks for harnesses with no utf8 buffer.
+		if m.utf8StreamBuf != nil {
+			m.utf8StreamBuf.Append([]byte(raw))
+		} else if m.streamThrottle != nil {
 			m.streamThrottle.Write(raw)
 		} else {
 			m.streamBuffer += raw
@@ -2229,6 +2317,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if !m.streamTickActive {
 			m.streamTickActive = true
 			cmds = append(cmds, m.smoothStreamTickCmd())
+		}
+		if !m.frameTickActive {
+			m.frameTickActive = true
+			cmds = append(cmds, FrameTickCmd())
 		}
 		// Keep cursor blink alive during streaming
 		var tiCmd tea.Cmd
@@ -2297,18 +2389,43 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.streamParser = nil
 		}
 
-		// Flush any remaining buffered stream content. The frame throttle may
-		// still hold un-emitted tokens — the stream can end before a final tick
-		// drains it — so it is drained unconditionally here. Without this, the
-		// tail of every response is silently dropped.
-		if m.streamThrottle != nil {
-			m.streamBuffer += m.streamThrottle.Drain()
+		// Flush any remaining buffered stream content WITHOUT duplicating
+		// what FrameTick already emitted. Under Option A the utf8 buffer
+		// holds the FULL accumulated string while currentStreamContent holds
+		// the already-emitted prefix — so Flush() (full string) must be
+		// reduced to its undrained suffix before emission. Emitting the full
+		// Flush output via += would render every byte a second time.
+		// The legacy throttle path (utf8 == nil) still drains unconditionally
+		// so a stream that ends before a final tick never drops its tail.
+		if m.utf8StreamBuf != nil {
+			// Discard any throttle remainder: tokenMsg no longer feeds the
+			// throttle while utf8 is active, so it must be empty; draining
+			// it into streamBuffer would double-emit.
+			if m.streamThrottle != nil {
+				_ = m.streamThrottle.Drain()
+			}
+			if tail := m.utf8StreamBuf.Flush(); tail != "" {
+				if strings.HasPrefix(tail, m.currentStreamContent) {
+					if delta := tail[len(m.currentStreamContent):]; delta != "" {
+						m.streamBuffer += delta
+					}
+				} else if m.currentStreamContent == "" {
+					m.streamBuffer += tail
+				}
+				// Diverged non-empty currentStreamContent + non-prefix tail:
+				// emit nothing — the content is already on screen.
+			}
+		} else {
+			if m.streamThrottle != nil {
+				m.streamBuffer += m.streamThrottle.Drain()
+			}
 		}
 		if m.streamTickActive || len(m.streamBuffer) > 0 {
 			m.emitVisibleContent(m.streamBuffer)
 			m.streamBuffer = ""
 			m.streamTickActive = false
 		}
+		m.frameTickActive = false
 		// Final reasoning extraction from any remaining content
 		m.extractReasoningContent()
 
@@ -2781,8 +2898,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.responseBuffer.Reset()
 			m.currentStreamContent = ""
 			m.streamBuffer = ""
+			if m.utf8StreamBuf != nil {
+				m.utf8StreamBuf.Reset()
+			}
+			if m.streamThrottle != nil {
+				m.streamThrottle.Reset()
+			}
 			m.resetStreamBlocks()
 			m.streamTickActive = false
+			m.frameTickActive = false
 			m.streamCancel = nil
 			m.refreshViewportContent()
 			return m, nil
@@ -2799,13 +2923,36 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleSystem, infoStyle.Render("  export OPENROUTER_API_KEY=<your_key>"))
 		} else {
 			sanitized := providers.SanitizeAPIError(msg.err)
-			// P0 TTFT Timeout: if the provider stalled, surface a clear actionable
-			// error instead of a raw context deadline exceeded message.
-			if isContextDeadline(msg.err) || errors.Is(msg.err, context.DeadlineExceeded) {
+			// TTFT Timeout: no first byte arrived and the failure is a
+			// deadline or a phase-identifiable socket stall (DNS / TCP /
+			// TLS / response headers). Measure actual elapsed via
+			// time.Since and name the stalled phase so the log pinpoints
+			// where the connection died instead of showing a bare deadline.
+			phaseDetail := providers.TTFTPhaseDetail(msg.err)
+			isTTFTFailure := m.noFirstByteReceived() &&
+				(isContextDeadline(msg.err) || errors.Is(msg.err, context.DeadlineExceeded) || phaseDetail != "")
+			if isTTFTFailure {
+				start := m.executionStartedAt
+				if start.IsZero() {
+					start = m.streamStartTime
+				}
+				elapsed := time.Since(start)
+				if elapsed < 15*time.Second {
+					elapsed = 15 * time.Second
+				}
+				if phaseDetail == "" {
+					phaseDetail = "No first byte received within TTFT budget"
+				}
 				m.push(roleError, errorStyle.Render(
-					"✗ provider response stalled: Time-To-First-Token (TTFT) timeout (20s exceeded). Try switching models or retrying."))
+					fmt.Sprintf("✗ provider response stalled: TTFT timeout after %.1fs (%s).", elapsed.Seconds(), phaseDetail)))
+				// Context isolation: prune the uncompleted prompt from SessionHistory so it does not pollute next turn.
+				m.pruneFailedPromptFromHistory()
 			} else {
 				m.push(roleError, "stream error: "+sanitized)
+				// On non-TTFT execution failure in ASK mode, also prune stale single-shot prompt.
+				if m.resolver.Current() == modes.ModeAsk {
+					m.pruneFailedPromptFromHistory()
+				}
 			}
 		}
 
@@ -2829,15 +2976,30 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// ALWAYS flush partial stream tokens to the TUI so that tokens
 		// already received on the wire are never discarded when a
 		// mid-stream connection error or unexpected termination occurs.
+		// msg.content is the producer's authoritative FULL text — it must
+		// overwrite (not append to) currentStreamContent, and only its
+		// undrained suffix may extend the typed blocks, or every byte
+		// renders twice.
 		if msg.content != "" {
-			if m.streamTickActive {
-				m.currentStreamContent += m.streamBuffer
-				m.streamBuffer = ""
-				m.streamTickActive = false
+			m.streamBuffer = ""
+			m.streamTickActive = false
+			if m.utf8StreamBuf != nil {
+				_ = m.utf8StreamBuf.Flush()
 			}
-			m.streamBuffer = msg.content
-			m.currentStreamContent = msg.content
-			m.ensureStreamBlocks().Append(KindContent, msg.content)
+			if m.streamThrottle != nil {
+				_ = m.streamThrottle.Drain()
+			}
+			if strings.HasPrefix(msg.content, m.currentStreamContent) {
+				if delta := msg.content[len(m.currentStreamContent):]; delta != "" {
+					m.currentStreamContent = msg.content
+					m.ensureStreamBlocks().Append(KindContent, delta)
+				}
+			} else if m.currentStreamContent == "" {
+				m.currentStreamContent = msg.content
+				m.ensureStreamBlocks().Append(KindContent, msg.content)
+			} else {
+				m.currentStreamContent = msg.content
+			}
 			m.extractReasoningContent()
 		}
 		m.refreshViewportContent()

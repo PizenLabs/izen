@@ -25,7 +25,7 @@ func NewGeminiProvider(apiKey, model string) *GeminiProvider {
 	return &GeminiProvider{
 		apiKey: apiKey,
 		model:  model,
-		client: &http.Client{},
+		client: &http.Client{Transport: StrictTransport(CloudResponseHeaderTimeout)},
 	}
 }
 

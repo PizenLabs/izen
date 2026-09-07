@@ -1246,6 +1246,23 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		m.ti.Reset()
 		m.syncInputFromTI()
 
+		// ── STREAM CONTRACT: reset at submit (T=0) ───────────────────
+		// Flush every stream byte buffer to empty synchronously at prompt
+		// submission — BEFORE any async context prep or streamCmd dispatch
+		// — so FrameTick (cumulative overwrite) can never re-emit stale
+		// bytes from the previous turn as duplicates. streamCmd repeats
+		// this reset when the stream actually starts; this covers the prep
+		// window in between.
+		m.streamBuffer = ""
+		m.currentStreamContent = ""
+		if m.utf8StreamBuf != nil {
+			m.utf8StreamBuf.Reset()
+		}
+		if m.streamThrottle != nil {
+			m.streamThrottle.Reset()
+		}
+		m.resetStreamBlocks()
+
 		m.history = append(m.history, userInput)
 		m.historyIndex = len(m.history)
 		m.saveHistory()
@@ -1297,11 +1314,18 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 			cmd = tea.Batch(cmd, m.runtimeSubmitCmd(userInput))
 		}
 		// ── INSTANT ANIMATION AT T=0MS ────────────────────────────
-		// Dispatch the shimmer + smooth ticks alongside the submission so
-		// the loading dock animates immediately, regardless of what the
-		// submitted command does next (async prep, stream, engine run).
-		// Both loops self-terminate when no background producer owns the
-		// flags, so idle submits leak nothing.
+		// Dispatch the shimmer + smooth + frame ticks alongside the submission
+		// so the loading dock AND the TTFT countdown animate immediately,
+		// regardless of what the submitted command does next (async prep,
+		// stream, engine run). The frame loop is what re-renders the live
+		// "Connecting to provider... 4.2s / 15.0s" stopwatch during the
+		// first-byte wait — without it the footer would sit frozen until
+		// the first token arrives. All loops self-terminate when no
+		// background producer owns the flags, so idle submits leak nothing.
+		if !m.frameTickActive {
+			m.frameTickActive = true
+			cmd = tea.Batch(cmd, FrameTickCmd())
+		}
 		cmd = tea.Batch(cmd, m.shimmerTickCmd(), m.smoothStreamTickCmd())
 		m.lockTailToNewPrompt()
 		return m, cmd

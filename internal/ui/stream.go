@@ -22,6 +22,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/prompt"
+	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/workspace"
 )
 
@@ -141,6 +142,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	} else {
 		m.streamThrottle.Reset()
 	}
+	if m.utf8StreamBuf == nil {
+		m.utf8StreamBuf = &stream.StreamBuffer{}
+	} else {
+		m.utf8StreamBuf.Reset()
+	}
 	// ── TRANSIENT BUFFER RESET (1-TURN LATENCY FIX) ───────────────────
 	// Explicitly clear all accumulated raw-string buffers before launching the
 	// stream so the rendering pipeline cannot leak or re-send leftover bytes
@@ -154,6 +160,25 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		m.sess.ObjectiveState.CurrentStatus = domain.ObjectiveExecuting
 		m.sess.SetObjectiveState(m.sess.ObjectiveState)
 		_ = m.sess.Save()
+	}
+
+	// Context isolation: ASK single-shot prompts must not carry stale failed history.
+	// If the previous turn failed with TTFT timeout (history ends with two consecutive
+	// user messages: stale failed prompt + new prompt), prune the stale one before
+	// building the LLM context window. This prevents a failed/timeout prompt from
+	// polluting the next turn's context unless explicitly in a multi-turn thread.
+	if m.sess != nil && len(m.sess.History) >= 2 && m.resolver.Current() == modes.ModeAsk {
+		if m.sess.History[len(m.sess.History)-1].Role == "user" && m.sess.History[len(m.sess.History)-2].Role == "user" {
+			stale := m.sess.History[len(m.sess.History)-2]
+			if stale.Content != content {
+				// Remove stale failed user message (second last), keep newest.
+				newHist := make([]session.Message, 0, len(m.sess.History)-1)
+				newHist = append(newHist, m.sess.History[:len(m.sess.History)-2]...)
+				newHist = append(newHist, m.sess.History[len(m.sess.History)-1])
+				m.sess.History = newHist
+				_ = m.sess.Save()
+			}
+		}
 	}
 
 	var msgs []ai.Message
@@ -261,9 +286,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// 5-minute ceiling applies. m.streamCancel is the handle
 	// handleEmergencyInterrupt and cancelStaleAgentOps already invoke to tear
 	// the stream down.
-	// Two-phase timeout: TTFT (20s) before first token, then inter-token
-	// (15s) between subsequent tokens. Prevents unbounded 3-minute hangs.
-	ctx, cancel := context.WithTimeout(m.operationContext(), 25*time.Second)
+	// Two-phase timeout: TTFT (15s) before first token, then inter-token
+	// (5s) between subsequent tokens. Prevents unbounded hangs and stale
+	// connections. Each attempt is wrapped in its own bounded context with
+	// mandatory defer cancel() to force-close OS sockets before retry.
+	ctx, cancel := context.WithTimeout(m.operationContext(), 15*time.Second)
 	m.streamCancel = cancel
 
 	// STREAM CONSUMER CONTRACT (deadlock-free):

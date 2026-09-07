@@ -346,6 +346,29 @@ func (s *Session) ClearHistory() {
 	s.History = []Message{}
 }
 
+// PruneLastUserMessage removes the most recent user message from history if it
+// matches the given content (or the last entry if content is empty). It returns
+// true when a message was removed. Used to roll back uncompleted prompts after
+// a TTFT timeout or execution failure so stale prompts do not pollute the next turn.
+func (s *Session) PruneLastUserMessage(content string) bool {
+	if s == nil || len(s.History) == 0 {
+		return false
+	}
+	lastIdx := len(s.History) - 1
+	last := s.History[lastIdx]
+	if last.Role != "user" {
+		return false
+	}
+	if content != "" && last.Content != content {
+		// Content mismatch: still prune if the last message is an unanswered user prompt
+		// (no assistant follow-up) — this indicates a failed turn that should not carry over.
+		// But strictly match when content is provided to avoid pruning unrelated history.
+		return false
+	}
+	s.History = s.History[:lastIdx]
+	return true
+}
+
 // LogDir returns the directory where session logs should be stored
 func (s *Session) LogDir() string {
 	path := s.path

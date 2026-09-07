@@ -27,7 +27,8 @@ func NewOllamaProvider(baseURL, apiKey, model string) *OllamaProvider {
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
 		model:   model,
-		client:  &http.Client{},
+		// Local bound: cold model loads can legitimately exceed 10s TTFT.
+		client: &http.Client{Transport: StrictTransport(LocalResponseHeaderTimeout)},
 	}
 }
 

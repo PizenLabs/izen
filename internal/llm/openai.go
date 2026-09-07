@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/httpx"
 )
 
 type OpenAIClient struct {
@@ -29,7 +30,7 @@ func NewOpenAIClient(apiKey, model, baseURL string) *OpenAIClient {
 		apiKey:  apiKey,
 		model:   model,
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{},
+		client:  &http.Client{Transport: httpx.StrictTransport(httpx.CloudResponseHeaderTimeout)},
 	}
 }
 

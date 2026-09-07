@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/httpx"
 )
 
 type OllamaClient struct {
@@ -26,7 +27,8 @@ func NewOllamaClient(baseURL, apiKey, model string) *OllamaClient {
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
 		model:   model,
-		client:  &http.Client{},
+		// Local bound: cold model loads can legitimately exceed 10s TTFT.
+		client: &http.Client{Transport: httpx.StrictTransport(httpx.LocalResponseHeaderTimeout)},
 	}
 }
 

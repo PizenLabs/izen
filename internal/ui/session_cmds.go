@@ -37,6 +37,9 @@ func (m *model) runNewSessionCmd() tea.Cmd {
 	m.resolver.Set(sess.Mode)
 	m.resetTransientInteraction()
 	m.unsealActivitySurface()
+	// MANDATORY: Reset all Token Metrics and UI Counters
+	m.resetTokenMetrics()
+	m.push(roleSystem, infoStyle.Render("New conversation session started. Context and token metrics reset."))
 	m.push(roleSystem, infoStyle.Render("/new: started a fresh session · previous session preserved, resumable via /session resume A|B"))
 	return nil
 }
@@ -444,6 +447,8 @@ func (m *model) handleSessionPickerNew() tea.Cmd {
 	m.resolver.Set(sess.Mode)
 	m.resetTransientInteraction()
 	m.unsealActivitySurface()
+	m.resetTokenMetrics()
+	m.push(roleSystem, infoStyle.Render("New conversation session started. Context and token metrics reset."))
 	m.push(roleSystem, infoStyle.Render("/new: started a fresh session · previous session preserved, resumable via /session resume A|B"))
 	m.refreshSessionPicker()
 	if m.sessionPicker != nil {
