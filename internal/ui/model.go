@@ -1936,8 +1936,8 @@ func (m *model) markUsageKnown() {
 }
 
 // tokenUsageCmd returns a command that dispatches the provider-reported token
-// usage of an execution path to the Bubble Tea event loop as a TokenUsageMsg.
-// The TokenUsageMsg handler in update.go accumulates the counts into the
+// usage of an execution path to the Bubble Tea event loop as a UsageUpdateMsg.
+// The UsageUpdateMsg handler in update.go accumulates the counts into the
 // session counters and forces syncUIState so the status bar footer refreshes
 // the token counters immediately — even when the underlying execution failed,
 // was aborted, or was truncated mid-stream. Zero usage produces a nil command
@@ -1958,7 +1958,7 @@ func (m *model) tokenUsageCmdKnown(input, output int, known bool) tea.Cmd {
 		model = m.cfg.ActiveModelName()
 	}
 	return func() tea.Msg {
-		return TokenUsageMsg{
+		return UsageUpdateMsg{
 			PromptTokens:     input,
 			CompletionTokens: output,
 			Model:            model,

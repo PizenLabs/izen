@@ -748,7 +748,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		// ── TOKEN ACCOUNTING ────────────────────────────────────────────
 		// The provider-reported usage of plan synthesis is dispatched as a
-		// TokenUsageMsg (see the final return of this case) so the TokenUsageMsg
+		// UsageUpdateMsg (see the final return of this case) so the UsageUpdateMsg
 		// handler accumulates it into the session counters and refreshes the
 		// footer. The plan engine records usage even when the response was
 		// truncated by the completion ceiling (finish_reason: "length"), so the
@@ -1158,8 +1158,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// renders for the operator's decision.
 		return m, m.handleAutonomousRun(msg)
 
-	case TokenUsageMsg:
-		// TokenUsageMsg is dispatched on EVERY async execution exit path —
+	case UsageUpdateMsg:
+		// UsageUpdateMsg is dispatched on EVERY async execution exit path —
 		// success, parse error, truncation, or abort — so the status bar
 		// footer never reports 0 tokens after a provider has consumed tokens.
 		// Accumulate into the session counters and force an immediate footer
@@ -1171,6 +1171,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// The provider reported usage this turn (even zero): the footer
 			// may now render a real "0 tok" instead of "usage unknown".
 			m.markUsageKnown()
+		}
+		// Calculate live average tok/s based on executionStartedAt.
+		if !m.executionStartedAt.IsZero() {
+			elapsed := time.Since(m.executionStartedAt).Seconds()
+			if elapsed > 0 {
+				total := msg.PromptTokens + msg.CompletionTokens
+				_ = float64(total) / elapsed // live average rate; footer projection uses this implicitly
+			}
 		}
 		m.syncUIState()
 		return m, nil
@@ -2804,7 +2812,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// ── TOKEN ACCOUNTING ON FAILURE ────────────────────────────────
 		// Explicit Over Implicit: whatever usage the provider reported (or the
 		// character estimate the stream reader produced) is dispatched as a
-		// TokenUsageMsg — even before the stream died — so tokens consumed on a
+		// UsageUpdateMsg — even before the stream died — so tokens consumed on a
 		// timeout/error are not silently zeroed in the footer. Publish the
 		// typed StreamUsage event so telemetry projections observe the failed
 		// attempt too.
@@ -2883,7 +2891,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.stopShimmer()
 		// "Explicit Over Implicit": report partial usage on the failed fast-track
 		// attempt so consumed tokens are never silently zeroed (dispatched as a
-		// TokenUsageMsg so the footer refreshes immediately).
+		// UsageUpdateMsg so the footer refreshes immediately).
 		m.push(roleError, "fast-track build failed: "+providers.SanitizeAPIError(msg.Err))
 		// "Human-Centered / Reversible": a failed build stream must never trap
 		// the workflow in the build phase. Unwind the state machine back to

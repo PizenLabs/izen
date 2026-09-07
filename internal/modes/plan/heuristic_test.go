@@ -22,11 +22,11 @@ by removing the duplicate DOM node. The styles.css also needs a new class
 for the focus state, and script.js should toggle the navigation menu.
 After that I would run go build but this is not a Go project.`
 
-// TestProcessFromLedger_HeuristicProseFallbackKilled is the regression guard
-// for the hard-kill: a model that emits pure narrative prose must NOT recover
-// FILE_MUTATE tasks via heuristic extraction, and must NOT emit the
-// plan.synthesize.fallback presentation event. Instead it returns an explicit
-// error the TUI surfaces as an escalation.
+// TestProcessFromLedger_HeuristicProseFallbackKilled verifies the
+// spec-mandated fallback invariant: a model that emits pure narrative prose
+// MUST NOT crash with an unmarshaling error. Instead it returns a non-nil
+// fallback plan containing a single FILE_MUTATE task targeting raw prompt
+// context files.
 func TestProcessFromLedger_HeuristicProseFallbackKilled(t *testing.T) {
 	e := NewEngine(NewPlanStore())
 	e.SetProvider(func(ctx context.Context, req ai.Request) (*ai.Response, error) {
@@ -34,14 +34,20 @@ func TestProcessFromLedger_HeuristicProseFallbackKilled(t *testing.T) {
 	})
 
 	tasks, err := e.ProcessFromLedger(context.Background(), "", "fix the duplicated hero section", "command-r-08-2024")
-	if err == nil {
-		t.Fatal("narrative prose must produce an explicit error, not a heuristic plan")
+	if err != nil {
+		t.Fatalf("narrative prose must not produce an error with fallback invariant, got %v", err)
 	}
-	if len(tasks) != 0 {
-		t.Fatalf("prose must not yield heuristic tasks: %+v", tasks)
+	if tasks == nil {
+		t.Fatal("fallback plan must be non-nil")
 	}
-	if strings.Contains(err.Error(), "heuristic") || strings.Contains(err.Error(), "extraction") {
-		t.Errorf("error should not reference the heuristic fallback: %v", err)
+	if len(tasks) != 1 {
+		t.Fatalf("fallback plan must contain exactly 1 task, got %d: %+v", len(tasks), tasks)
+	}
+	if tasks[0].Type != "FILE_MUTATE" {
+		t.Errorf("fallback task Type = %q, want FILE_MUTATE", tasks[0].Type)
+	}
+	if strings.TrimSpace(tasks[0].Target) == "" {
+		t.Error("fallback FILE_MUTATE task must target a raw prompt context file, got empty target")
 	}
 }
 
@@ -83,9 +89,9 @@ func TestProcessFromLedger_HeuristicProseFallbackEmitsNoEvent(t *testing.T) {
 	}
 }
 
-// TestProcessFromLedger_RootContextFallbackKilled verifies that a narrative
-// response with no detectable file produces an error, NOT the root-context
-// CODE_MOD [Target 1/1] fallback task.
+// TestProcessFromLedger_RootContextFallbackKilled verifies the fallback
+// invariant for undetectable prose: even with no detectable file, the engine
+// MUST return a default 1-task fallback plan instead of a hard error.
 func TestProcessFromLedger_RootContextFallbackKilled(t *testing.T) {
 	e := NewEngine(NewPlanStore())
 	e.SetProvider(func(ctx context.Context, req ai.Request) (*ai.Response, error) {
@@ -93,17 +99,26 @@ func TestProcessFromLedger_RootContextFallbackKilled(t *testing.T) {
 	})
 
 	tasks, err := e.ProcessFromLedger(context.Background(), "", "address the reported issue", "test-model")
-	if err == nil {
-		t.Fatal("undetectable prose must produce an explicit error, not a root-context fallback task")
+	if err != nil {
+		t.Fatalf("undetectable prose must not produce an error with fallback invariant, got %v", err)
 	}
-	if len(tasks) != 0 {
-		t.Fatalf("got %d tasks, want 0: %+v", len(tasks), tasks)
+	if tasks == nil {
+		t.Fatal("fallback plan must be non-nil")
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("fallback plan must contain exactly 1 task, got %d: %+v", len(tasks), tasks)
+	}
+	if tasks[0].Type != "FILE_MUTATE" {
+		t.Errorf("fallback task Type = %q, want FILE_MUTATE", tasks[0].Type)
+	}
+	if strings.TrimSpace(tasks[0].Target) == "" {
+		t.Error("fallback FILE_MUTATE task must have a non-empty target derived from prompt context")
 	}
 }
 
-// TestProcessFromLedger_StreamedProseError confirms the hard-kill also applies
-// on the streaming path: prose arriving through accumulateStream yields an
-// explicit error, never heuristic tasks.
+// TestProcessFromLedger_StreamedProseError verifies the fallback invariant
+// on the streaming path: prose arriving through accumulateStream MUST yield
+// a fallback plan, never a hard error.
 func TestProcessFromLedger_StreamedProseError(t *testing.T) {
 	streamed := &mockStreamResult{data: cohereNorthMiniProse, finish: "stop"}
 	e := NewEngine(NewPlanStore())
@@ -112,17 +127,23 @@ func TestProcessFromLedger_StreamedProseError(t *testing.T) {
 	})
 
 	tasks, err := e.ProcessFromLedger(context.Background(), "", "fix the duplicated hero section", "test-model")
-	if err == nil {
-		t.Fatal("streamed prose must produce an explicit error")
+	if err != nil {
+		t.Fatalf("streamed prose must not produce an error with fallback invariant, got %v", err)
 	}
-	if len(tasks) != 0 {
-		t.Fatalf("got %d tasks, want 0: %+v", len(tasks), tasks)
+	if tasks == nil {
+		t.Fatal("fallback plan must be non-nil")
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("fallback plan must contain exactly 1 task, got %d: %+v", len(tasks), tasks)
+	}
+	if tasks[0].Type != "FILE_MUTATE" {
+		t.Errorf("fallback task Type = %q, want FILE_MUTATE", tasks[0].Type)
 	}
 }
 
-// TestProcessFromLedger_ProseFilesNoRootFallback is the regression guard for
-// the empty-workspace case: prose naming files that do not exist on disk must
-// produce an error, NOT fall back to a hardcoded root-context task.
+// TestProcessFromLedger_ProseFilesNoRootFallback verifies the fallback
+// invariant for empty workspaces: prose naming files that do not exist on
+// disk MUST still yield a fallback FILE_MUTATE plan.
 func TestProcessFromLedger_ProseFilesNoRootFallback(t *testing.T) {
 	root := t.TempDir() // empty — no styles.css / script.js on disk
 	e := NewEngine(NewPlanStore())
@@ -132,11 +153,17 @@ func TestProcessFromLedger_ProseFilesNoRootFallback(t *testing.T) {
 	})
 
 	tasks, err := e.ProcessFromLedger(context.Background(), "", "fix the duplicated hero section", "test-model")
-	if err == nil {
-		t.Fatal("prose targeting non-existent files must produce an explicit error")
+	if err != nil {
+		t.Fatalf("fallback invariant: prose targeting non-existent files must not error, got %v", err)
 	}
-	if len(tasks) != 0 {
-		t.Fatalf("got %d tasks, want 0: %+v", len(tasks), tasks)
+	if tasks == nil {
+		t.Fatal("fallback plan must be non-nil")
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("fallback plan must contain exactly 1 task, got %d: %+v", len(tasks), tasks)
+	}
+	if tasks[0].Type != "FILE_MUTATE" {
+		t.Errorf("fallback task Type = %q, want FILE_MUTATE", tasks[0].Type)
 	}
 }
 

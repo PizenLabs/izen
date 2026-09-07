@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/events"
 )
 
 type AnthropicClient struct {
@@ -17,6 +19,7 @@ type AnthropicClient struct {
 	model   string
 	baseURL string
 	client  *http.Client
+	bus     *events.Bus
 }
 
 func NewAnthropicClient(apiKey, model string) *AnthropicClient {
@@ -80,6 +83,11 @@ type anthropicDelta struct {
 
 func (c *AnthropicClient) Name() string {
 	return "anthropic"
+}
+
+func (c *AnthropicClient) WithEventBus(bus *events.Bus) *AnthropicClient {
+	c.bus = bus
+	return c
 }
 
 func (c *AnthropicClient) buildSystemContent(req PromptRequest) []anthropicContent {
@@ -180,13 +188,17 @@ func (c *AnthropicClient) GenerateResponse(ctx context.Context, req PromptReques
 		cacheRead = claudeResp.Usage.CacheReadTokens
 	}
 
-	return LLMResponse{
+	llmResp := LLMResponse{
 		Content:          content,
 		TokenInput:       tokenIn,
 		TokenOutput:      tokenOut,
 		CacheWriteTokens: cacheWrite,
 		CacheReadTokens:  cacheRead,
-	}, nil
+	}
+	if c.bus != nil {
+		c.bus.Publish(events.NewProviderUsageUpdate("", c.resolveModel(req.Model), tokenIn, tokenOut, 0))
+	}
+	return llmResp, nil
 }
 
 func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest, handler StreamHandler) (LLMResponse, error) {

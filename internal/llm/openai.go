@@ -258,6 +258,9 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		llmResp.TotalCostUSD = EnforceFreeModelOverride(modelID, llmResp.TotalCostUSD)
 	}
 
+	if c.bus != nil {
+		c.bus.Publish(events.NewProviderUsageUpdate("", c.resolveModel(req.Model), tokenIn, tokenOut, 0))
+	}
 	return llmResp, nil
 }
 

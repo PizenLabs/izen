@@ -239,11 +239,11 @@ func (m *model) renderExecutingFooter() string {
 		var pulse string
 		switch {
 		case elapsed < 5*time.Second:
-			pulse = fmt.Sprintf("⠋ Connecting to provider... · %ds · [%s]", int(elapsed.Seconds()), truncateModelName(modelName, 16))
+			pulse = fmt.Sprintf("Connecting to provider... · %ds · [%s]", int(elapsed.Seconds()), truncateModelName(modelName, 16))
 		case elapsed < 20*time.Second:
-			pulse = fmt.Sprintf("⠙ Waiting for first byte... · %ds · [%s]", int(elapsed.Seconds()), truncateModelName(modelName, 16))
+			pulse = fmt.Sprintf("Waiting for first byte... · %ds · [%s]", int(elapsed.Seconds()), truncateModelName(modelName, 16))
 		default:
-			pulse = fmt.Sprintf("⠇ Waiting for first byte... · %ds · [%s]", int(elapsed.Seconds()), truncateModelName(modelName, 16))
+			pulse = fmt.Sprintf("Waiting for first byte... · %ds · [%s]", int(elapsed.Seconds()), truncateModelName(modelName, 16))
 		}
 		return footerSep(
 			m.executingSpinner()+" "+footerExecLabelStyle.Render(pulse),

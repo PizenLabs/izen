@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/events"
 )
 
 type OllamaClient struct {
@@ -16,6 +18,7 @@ type OllamaClient struct {
 	apiKey  string
 	model   string
 	client  *http.Client
+	bus     *events.Bus
 }
 
 func NewOllamaClient(baseURL, apiKey, model string) *OllamaClient {
@@ -25,6 +28,11 @@ func NewOllamaClient(baseURL, apiKey, model string) *OllamaClient {
 		model:   model,
 		client:  &http.Client{},
 	}
+}
+
+func (c *OllamaClient) WithEventBus(bus *events.Bus) *OllamaClient {
+	c.bus = bus
+	return c
 }
 
 func (c *OllamaClient) Name() string {
@@ -121,12 +129,16 @@ func (c *OllamaClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		tokenOut = len(text) / 4
 	}
 
-	return LLMResponse{
+	llmResp := LLMResponse{
 		Content:      text,
 		TokenInput:   tokenIn,
 		TokenOutput:  tokenOut,
 		TotalCostUSD: 0,
-	}, nil
+	}
+	if c.bus != nil {
+		c.bus.Publish(events.NewProviderUsageUpdate("", c.resolveModel(req.Model), tokenIn, tokenOut, 0))
+	}
+	return llmResp, nil
 }
 
 func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, handler StreamHandler) (LLMResponse, error) {

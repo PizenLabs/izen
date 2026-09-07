@@ -68,12 +68,12 @@ type AuthorizationStatusMsg struct {
 	Reason   string
 }
 
-// TokenUsageMsg carries provider-reported token usage from an async execution
+// UsageUpdateMsg carries provider-reported token usage from an async execution
 // path (hotfix, build, plan, investigate) to the Bubble Tea event loop. It is
 // dispatched on EVERY exit path — success, parse error, truncation, or abort —
 // so the status bar footer never reports 0 tokens after a cloud model has
 // consumed tokens (e.g. OpenRouter prompt + completion usage during $hot).
-type TokenUsageMsg struct {
+type UsageUpdateMsg struct {
 	PromptTokens     int
 	CompletionTokens int
 	Model            string

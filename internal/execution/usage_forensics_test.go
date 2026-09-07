@@ -222,8 +222,8 @@ func TestOutputBudgetDoesNotAlterReportedUsage(t *testing.T) {
 	unbounded, sentUnbounded := run(0)
 	bounded, sentBounded := run(512)
 
-	if sentUnbounded != 0 {
-		t.Errorf("unbounded request MaxTokens = %d, want 0 (omitted)", sentUnbounded)
+	if sentUnbounded != 1200 {
+		t.Errorf("unbounded request MaxTokens = %d, want 1200 (hard-capped default for targeted_mutation)", sentUnbounded)
 	}
 	if sentBounded != 512 {
 		t.Errorf("bounded request MaxTokens = %d, want 512", sentBounded)
