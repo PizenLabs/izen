@@ -1214,6 +1214,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.Chunk == "" {
 			return m, nil
 		}
+		// Sub-task reasoning is real streamed output: advance the live tok/s
+		// estimate (estimate only — the authoritative stage count is
+		// untouched).
+		m.streamLiveTokens += estimateStreamTokens(msg.Chunk)
 		if m.thinkingBuffer == nil {
 			m.thinkingBuffer = NewThinkingBuffer()
 		}
@@ -2233,6 +2237,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// "streaming" (never "thinking"), without exposing the reasoning text.
 		// NO token count is asserted here: only the producer's authoritative
 		// streamUsageMsg (provider-reported usage) may populate the count.
+		// The live tok/s estimate advances on every reasoning chunk so the
+		// footer rate meter stays live while thinking streams.
+		m.streamLiveTokens += estimateStreamTokens(string(msg))
 		m.setStage("model", m.getActiveModelName(), stageStreaming)
 		m.ensureStreamBlocks().Append(KindThinking, string(msg))
 		// Full stream transparency: the reasoning chunk is also retained in the
@@ -2276,7 +2283,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Only content bytes received from the provider mark the stage as
 		// streaming. The token count is NEVER derived from the response
 		// buffer length — it is populated only by the producer's authoritative
-		// streamUsageMsg (provider-reported usage).
+		// streamUsageMsg (provider-reported usage). The live tok/s estimate
+		// advances on every content chunk (estimate only, never the count).
+		m.streamLiveTokens += estimateStreamTokens(raw)
 		// Inter-token timeout: once first byte arrives, arm a rolling 15s deadline.
 		if raw != "" && m.streamCancel != nil && m.streamInterTokenDeadline.IsZero() {
 			m.streamInterTokenDeadline = time.Now().Add(5 * time.Second)
@@ -2335,8 +2344,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// character-count estimate. A zero/unknown usage leaves the count
 		// empty so the renderer shows plain "streaming". The reasoning split
 		// also backs the compact thought summary so its "N tokens" is
-		// provider-reported, not estimated.
+		// provider-reported, not estimated. The live tok/s estimate is
+		// floored by the authoritative total (output + reasoning) so the
+		// rate meter reflects reasoning tokens too.
 		m.setStageMetrics(0, 0, msg.output)
+		if total := msg.output + msg.reasoning; total > m.streamLiveTokens {
+			m.streamLiveTokens = total
+		}
 		if m.thinkingBuffer != nil && msg.reasoning > 0 {
 			m.thinkingBuffer.SetReasoningTokens(msg.reasoning)
 		}

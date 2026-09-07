@@ -126,6 +126,9 @@ func (m *model) resetStage(kind OperationKind) {
 	m.stage.Elapsed = 0
 	m.stage.Tokens = 0
 	m.stage.mu.Unlock()
+	// A new operation resets the live tok/s estimate alongside the
+	// authoritative stage count.
+	m.streamLiveTokens = 0
 }
 
 // setStage records a real execution-stage transition. It is safe to call from

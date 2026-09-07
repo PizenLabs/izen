@@ -26,6 +26,13 @@ import (
 	"github.com/PizenLabs/izen/internal/workspace"
 )
 
+// askCodingMaxTokens is the explicit max_tokens output budget for technical /
+// coding prompts issued from the interactive stream. 4096 keeps long
+// code-generation answers clear of the completion ceiling (finish_reason
+// "length"); casual chat keeps its own smaller budget via
+// gateway.CasualChatMaxTokens.
+const askCodingMaxTokens = 4096
+
 // debugLogPayload writes the exact outgoing LLM payload to
 // .izen/debug/payload.log so we can prove what the model actually receives on
 // each /ask turn. This is purely diagnostic — it appends one JSON line per
@@ -98,6 +105,8 @@ func (m *model) streamCmd(content string) tea.Cmd {
 
 	// Execution heartbeat: mark when the execution lifecycle starts.
 	m.executionStartedAt = time.Now()
+	// A fresh turn resets the live tok/s estimate (content + reasoning).
+	m.streamLiveTokens = 0
 	m.streamCh = make(chan tea.Msg, 1024)
 	m.streaming = true
 	m.spinnerFrame = 0
@@ -237,7 +246,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	}
 
 	var systemPrompt string
-	var maxTokens int
+	// Technical / coding prompts carry an explicit 4096-token output budget
+	// so long answers complete without hitting the provider's completion
+	// ceiling (finish_reason "length") — never rely on provider defaults
+	// (often ~1500-2048 tokens) for code generation.
+	maxTokens := askCodingMaxTokens
 
 	if gateway.IsCasualChat(content) {
 		systemPrompt = gateway.CasualChatSystemPrompt()

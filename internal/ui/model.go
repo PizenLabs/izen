@@ -1081,6 +1081,16 @@ type model struct {
 	// stream completes to compute this-turn latency for the status line.
 	streamStartTime time.Time
 
+	// streamLiveTokens is the live per-turn streamed-token estimate backing
+	// the footer tok/s meter. It increments on EVERY incoming stream chunk —
+	// content and reasoning/thinking alike — via estimateStreamTokens, and is
+	// floored by the provider's authoritative usage (output + reasoning)
+	// when a streamUsageMsg arrives. It never feeds the authoritative stage
+	// token count (stage.Tokens stays provider-reported only); it exists so
+	// the rate meter stays live (>0) while reasoning tokens stream before
+	// any authoritative usage chunk arrives. Reset per turn in streamCmd.
+	streamLiveTokens int
+
 	// Execution heartbeat: set when any foreground operation begins so the
 	// footer can render live connection-pulse telemetry (elapsed seconds)
 	// even when no provider tokens have arrived yet.

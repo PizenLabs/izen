@@ -29,6 +29,17 @@ var ErrOpenRouterAuth = errors.New("openrouter: authorization failed (HTTP 401):
 // carries no model resolvable to OpenRouter's vendor/model schema.
 const DefaultOpenRouterModel = "anthropic/claude-3.5-sonnet"
 
+// defaultOpenRouterMaxTokens is the output limit applied when a request
+// carries no explicit MaxTokens. 4096 keeps long code-generation answers
+// (e.g. /ask technical prompts) clear of the completion ceiling
+// (finish_reason "length") instead of relying on provider defaults
+// (often ~1500-2048 tokens).
+const defaultOpenRouterMaxTokens = 4096
+
+// maxOpenRouterMaxTokens is the hard ceiling for an explicit MaxTokens
+// budget: larger requests are clamped, never sent unconstrained.
+const maxOpenRouterMaxTokens = 8192
+
 // openRouterMaxRateLimitRetries bounds how many times a request answered with
 // HTTP 429 (Too Many Requests / rate limit) is retried before the error is
 // surfaced to the caller. Each retry waits longer (exponential backoff), so the
@@ -375,6 +386,14 @@ type openrouterReasoning struct {
 	Enabled   *bool  `json:"enabled,omitempty"`
 }
 
+// defaultReasoningMaxTokens caps the hidden reasoning channel when reasoning
+// is enabled without an explicit CoT cap or thinking budget. Without a cap a
+// reasoning model can spend the entire shared output budget on hidden
+// chain-of-thought and emit zero visible content (truncating the answer at
+// finish_reason "length"), so the uncapped case defaults here and the maximum
+// token budget goes to the actual response output.
+const defaultReasoningMaxTokens = 1024
+
 // reasoningFor builds the OpenRouter reasoning payload from the resolved
 // effort directive. The qualitative effort maps to reasoning.effort; the CoT
 // cap and budget map to reasoning.max_tokens. Disabled maps to
@@ -396,6 +415,12 @@ func reasoningFor(req ai.Request) *openrouterReasoning {
 		r.MaxTokens = req.Reasoning.CoTLimit
 	case req.Reasoning.BudgetTokens > 0:
 		r.MaxTokens = req.Reasoning.BudgetTokens
+	default:
+		// Enabled reasoning without an explicit cap: bound the hidden channel
+		// so it cannot consume the whole output budget.
+		if r.Effort != "" {
+			r.MaxTokens = defaultReasoningMaxTokens
+		}
 	}
 	if r.Effort == "" && r.MaxTokens == 0 {
 		return nil
@@ -430,13 +455,17 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 		Stream:      stream,
 		Reasoning:   reasoningFor(req),
 	}
-	// Hard API token cap — never send unconstrained max_tokens.
-	// BUILD / MUTATION: 1200; ASK / PLAN / read-only: 800.
+	// Default output limit — never send unconstrained max_tokens. The default
+	// is 4096 so long code-generation answers complete without hitting the
+	// completion ceiling (finish_reason "length"); explicit larger budgets
+	// are honored up to the 8192 hard cap. Callers with tighter budgets
+	// (bounded-patch mutation, read-only plans) pass their own smaller
+	// MaxTokens, which is preserved verbatim below the cap.
 	if body.MaxTokens == 0 {
-		body.MaxTokens = 1200
+		body.MaxTokens = defaultOpenRouterMaxTokens
 	}
-	if body.MaxTokens > 1200 {
-		body.MaxTokens = 1200
+	if body.MaxTokens > maxOpenRouterMaxTokens {
+		body.MaxTokens = maxOpenRouterMaxTokens
 	}
 	if stream {
 		body.StreamOptions = &streamOptions{IncludeUsage: true}

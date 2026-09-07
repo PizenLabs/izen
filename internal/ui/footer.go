@@ -343,10 +343,35 @@ func (m *model) executingSpinner() string {
 	return SpinnerStyle.Foreground(interpolateColor(from, to, t)).Render(frameStr)
 }
 
+// estimateStreamTokens converts one streamed text chunk into a token estimate
+// (~4 characters per token, minimum 1 per non-empty chunk) so EVERY chunk —
+// content or reasoning/thinking — advances the live tok/s meter. Empty chunks
+// contribute nothing.
+func estimateStreamTokens(chunk string) int {
+	if chunk == "" {
+		return 0
+	}
+	n := len(chunk) / 4
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
 // streamTokenRate returns the live token-per-second rate of the active stream,
-// derived from the authoritative stage token count over wall-clock elapsed time.
+// derived from the token count over wall-clock elapsed time. The count is the
+// maximum of the authoritative provider-reported stage count and the live
+// per-chunk estimate (m.streamLiveTokens, which includes reasoning/thinking
+// chunks that arrive before any authoritative usage chunk). The authoritative
+// stage count itself is never estimated — this live estimate feeds ONLY the
+// rate meter, so the footer never shows 0.0 tok/s while tokens are actively
+// streaming.
 func (m *model) streamTokenRate(st stageView) float64 {
-	if st.Tokens <= 0 {
+	tokens := st.Tokens
+	if m.streamLiveTokens > tokens {
+		tokens = m.streamLiveTokens
+	}
+	if tokens <= 0 {
 		return 0
 	}
 	start := m.streamStartTime
@@ -357,7 +382,7 @@ func (m *model) streamTokenRate(st stageView) float64 {
 	if elapsed <= 0 {
 		return 0
 	}
-	return float64(st.Tokens) / elapsed.Seconds()
+	return float64(tokens) / elapsed.Seconds()
 }
 
 // formatTokenRate renders a tok/s rate compactly: integers at 100+, one
