@@ -14,7 +14,7 @@ require (
 	github.com/mattn/go-runewidth v0.0.28
 	github.com/muesli/termenv v0.16.0
 	github.com/pmezard/go-difflib v1.0.0
-	github.com/yuin/goldmark v1.8.5
+	github.com/yuin/goldmark v1.8.6
 	go.uber.org/goleak v1.3.0
 	golang.org/x/net v0.58.0
 	golang.org/x/sync v0.22.0
