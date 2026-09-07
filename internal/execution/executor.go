@@ -2835,8 +2835,8 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 				if streamCb != nil {
 					streamCb(StreamEvent{
 						RequestID: requestID,
-						Kind: "stream_token",
-						Usage: u,
+						Kind:      "stream_token",
+						Usage:     u,
 					})
 				}
 			}

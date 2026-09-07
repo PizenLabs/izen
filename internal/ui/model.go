@@ -1088,10 +1088,10 @@ type model struct {
 	thoughtEndTime   time.Time
 
 	// AI Interrupt Engine: cancel function for active stream, set by streamCmd.
-	streamCancel       context.CancelFunc
-	streamInterTokenTimer *time.Timer
+	streamCancel             context.CancelFunc
+	streamInterTokenTimer    *time.Timer
 	streamInterTokenDeadline time.Time
-	interruptRequested bool
+	interruptRequested       bool
 
 	// Background context registry: tracks all in-flight background contexts
 	// so they can be cancelled on mode transitions or Ctrl+C.

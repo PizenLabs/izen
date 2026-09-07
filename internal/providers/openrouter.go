@@ -258,8 +258,8 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 	}
 
 	sr := &openrouterSSEReader{
-		body: resp.Body,
-		cancel: cancel,
+		body:           resp.Body,
+		cancel:         cancel,
 		closeTransport: p.closeIdleConnections,
 	}
 	sr.usage.markRequestStarted(time.Now())
@@ -847,12 +847,12 @@ func longestPartialSuffix(data []byte, marker string) int {
 }
 
 type openrouterSSEReader struct {
-	cancel     context.CancelFunc
-	body       io.ReadCloser
-	reader     *bufio.Reader
-	closed     bool
-	closeOnce  sync.Once
-	finalUsage *openrouterUsage
+	cancel         context.CancelFunc
+	body           io.ReadCloser
+	reader         *bufio.Reader
+	closed         bool
+	closeOnce      sync.Once
+	finalUsage     *openrouterUsage
 	closeTransport func()
 
 	// think splits inline <think>…</think> blocks out of delta.content into
