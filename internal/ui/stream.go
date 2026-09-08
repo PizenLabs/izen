@@ -33,6 +33,25 @@ import (
 // gateway.CasualChatMaxTokens.
 const askCodingMaxTokens = 4096
 
+// Stream context lifecycle (decoupled TTFT vs active-stream deadlines).
+//
+//	pre-TTFT:  the transport ResponseHeaderTimeout (10s cloud / 15s local)
+//	          bounds the wait for the first response byte; the footer TTFT
+//	          countdown renders against ttftBudget (15s).
+//	post-TTFT: once the first byte arrives the stream is alive. Liveness is
+//	          governed by the inter-token idle timeout (reset on every chunk)
+//	          under a generous absolute stream-max ceiling — never by the old
+//	          fixed 15s total request deadline that expired mid-generation.
+const (
+	// streamTTFTBudget mirrors the footer countdown + transport backstop.
+	streamTTFTBudget = 15 * time.Second
+	// streamInterTokenIdle is the post-TTFT liveness bound: any chunk
+	// within this window proves the stream alive and resets the deadline.
+	streamInterTokenIdle = 30 * time.Second
+	// streamMaxDuration is the generous absolute ceiling for one stream.
+	streamMaxDuration = 10 * time.Minute
+)
+
 // debugLogPayload writes the exact outgoing LLM payload to
 // .izen/debug/payload.log so we can prove what the model actually receives on
 // each /ask turn. This is purely diagnostic — it appends one JSON line per
@@ -295,15 +314,22 @@ func (m *model) streamCmd(content string) tea.Cmd {
 
 	// The request context is derived from the active operation (when one is
 	// registered, e.g. a build-context stream) so Ctrl+C cancels the provider
-	// stream; otherwise it falls back to a plain background parent and only the
-	// 5-minute ceiling applies. m.streamCancel is the handle
-	// handleEmergencyInterrupt and cancelStaleAgentOps already invoke to tear
-	// the stream down.
-	// Two-phase timeout: TTFT (15s) before first token, then inter-token
-	// (5s) between subsequent tokens. Prevents unbounded hangs and stale
-	// connections. Each attempt is wrapped in its own bounded context with
-	// mandatory defer cancel() to force-close OS sockets before retry.
-	ctx, cancel := context.WithTimeout(m.operationContext(), 15*time.Second)
+	// stream; otherwise it falls back to a plain background parent.
+	// m.streamCancel is the handle handleEmergencyInterrupt and
+	// cancelStaleAgentOps already invoke to tear the stream down.
+	//
+	// DECOUPLED LIFECYCLE (no fixed total deadline):
+	//   pre-TTFT  — the transport ResponseHeaderTimeout (10s cloud / 15s
+	//               local) bounds the wait for the first response byte and
+	//               fails fast with a phase-identifiable error.
+	//   post-TTFT — once bytes flow, liveness is governed by the inter-token
+	//               idle watchdog (reset on every chunk) wrapped around the
+	//               SSE body below. The context here carries only the generous
+	//               stream-max ceiling (10m) so a slow-but-continuous
+	//               generation (e.g. 45s of steady tokens) completes instead
+	//               of dying to a fixed 15s "context deadline exceeded".
+	// Each attempt still defers cancel() so OS sockets force-close on exit.
+	ctx, cancel := context.WithTimeout(m.operationContext(), streamMaxDuration)
 	m.streamCancel = cancel
 
 	// STREAM CONSUMER CONTRACT (deadlock-free):
@@ -342,13 +368,21 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			return
 		}
 		defer func() { _ = rawStream.Close() }()
+		// INTER-TOKEN IDLE WATCHDOG (post-TTFT liveness): every Read that
+		// carries bytes resets the idle deadline. A slow-but-continuous
+		// generation never trips it; a stalled socket is force-closed with
+		// an identifiable ErrStreamIdleTimeout instead of hanging to the
+		// stream-max ceiling. Usage/finish-reason assertions below keep
+		// reading from rawStream (the wrapper only carries the byte path).
+		idleBody := stream.NewIdleTimeoutReader(rawStream, streamInterTokenIdle)
+		defer func() { _ = idleBody.Close() }()
 		// Task 2: strict context cancellation — force-close SSE body on interrupt.
 		done := make(chan struct{})
 		defer close(done)
 		go func() {
 			select {
 			case <-ctx.Done():
-				_ = rawStream.Close()
+				_ = idleBody.Close()
 			case <-done:
 			}
 		}()
@@ -383,7 +417,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			streamCh <- streamUsageMsg{input: u.PromptTokens, output: u.CompletionTokens, reasoning: u.ReasoningTokens}
 		}
 
-		full, ingestErr := ingestLLMStream(rawStream, m.bus, func(text string) {
+		full, ingestErr := ingestLLMStream(idleBody, m.bus, func(text string) {
 			streamCh <- tokenMsg(text)
 			emitUsage()
 		}, func(text string) {

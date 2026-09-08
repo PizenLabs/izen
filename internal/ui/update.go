@@ -511,14 +511,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		hasActiveWork := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning ||
 			m.shellRunning || m.state == StateProcessing || m.state == StateAwaitingApproval ||
 			m.shimmerActive || m.autonomousActive
-		// Inter-token timeout check: if the rolling 15s deadline has passed
-		// without a new token, cancel the stream and emit a fast-fail message.
+		// Inter-token idle check: if the rolling idle deadline (reset on every
+		// chunk in the tokenMsg handler) has passed without a new token, the
+		// stream stalled mid-generation — cancel it and emit a fast-fail
+		// message. The window matches streamInterTokenIdle (30s) so a
+		// slow-but-alive model never trips it.
 		if !m.streamInterTokenDeadline.IsZero() && time.Now().After(m.streamInterTokenDeadline) {
 			if m.streamCancel != nil {
 				m.streamCancel()
 			}
 			m.push(roleError, errorStyle.Render(
-				"✗ provider response stalled: inter-token timeout exceeded (5s exceeded without new token). Try switching models or retrying."))
+				"✗ provider response stalled: inter-token timeout exceeded (30s exceeded without new token). Try switching models or retrying."))
 			m.streamInterTokenDeadline = time.Time{}
 		}
 
@@ -2286,11 +2289,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// streamUsageMsg (provider-reported usage). The live tok/s estimate
 		// advances on every content chunk (estimate only, never the count).
 		m.streamLiveTokens += estimateStreamTokens(raw)
-		// Inter-token timeout: once first byte arrives, arm a rolling 15s deadline.
+		// Inter-token idle deadline: once the first byte arrives, arm a
+		// rolling streamInterTokenIdle (30s) deadline, reset on every chunk.
+		// A continuous generation never trips it; only a stalled socket
+		// does (mirrors the IdleTimeoutReader watchdog on the byte path).
 		if raw != "" && m.streamCancel != nil && m.streamInterTokenDeadline.IsZero() {
-			m.streamInterTokenDeadline = time.Now().Add(5 * time.Second)
+			m.streamInterTokenDeadline = time.Now().Add(streamInterTokenIdle)
 		} else if raw != "" && !m.streamInterTokenDeadline.IsZero() {
-			m.streamInterTokenDeadline = time.Now().Add(5 * time.Second)
+			m.streamInterTokenDeadline = time.Now().Add(streamInterTokenIdle)
 		}
 
 		if raw != "" {
@@ -2930,19 +2936,30 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
 			_ = m.sess.Save()
 		}
+		// NON-DESTRUCTIVE SNAPSHOT: capture whether the first token was already
+		// rendered BEFORE any error bookkeeping. A mid-stream failure must
+		// preserve every rendered byte; only a pre-first-token failure may
+		// authoritatively set the stream content.
+		hasPartialContent := len(m.currentStreamContent) > 0 ||
+			(m.utf8StreamBuf != nil && m.utf8StreamBuf.Len() > 0) ||
+			m.responseBuffer.Len() > 0
+		sanitizedErr := ""
+		if msg.err != nil {
+			sanitizedErr = providers.SanitizeAPIError(msg.err)
+		}
 		if errors.Is(msg.err, providers.ErrOpenRouterAuth) {
 			m.push(roleError, errorStyle.Render("✗ OpenRouter Authorization Failed"))
 			m.push(roleSystem, infoStyle.Render("Invalid or missing OPENROUTER_API_KEY. Please check your environment variables or run:"))
 			m.push(roleSystem, infoStyle.Render("  export OPENROUTER_API_KEY=<your_key>"))
 		} else {
-			sanitized := providers.SanitizeAPIError(msg.err)
+			sanitized := sanitizedErr
 			// TTFT Timeout: no first byte arrived and the failure is a
 			// deadline or a phase-identifiable socket stall (DNS / TCP /
 			// TLS / response headers). Measure actual elapsed via
 			// time.Since and name the stalled phase so the log pinpoints
 			// where the connection died instead of showing a bare deadline.
 			phaseDetail := providers.TTFTPhaseDetail(msg.err)
-			isTTFTFailure := m.noFirstByteReceived() &&
+			isTTFTFailure := m.noFirstByteReceived() && !hasPartialContent &&
 				(isContextDeadline(msg.err) || errors.Is(msg.err, context.DeadlineExceeded) || phaseDetail != "")
 			if isTTFTFailure {
 				start := m.executionStartedAt
@@ -2986,35 +3003,67 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		}
 
-		// ALWAYS flush partial stream tokens to the TUI so that tokens
-		// already received on the wire are never discarded when a
-		// mid-stream connection error or unexpected termination occurs.
-		// msg.content is the producer's authoritative FULL text — it must
-		// overwrite (not append to) currentStreamContent, and only its
-		// undrained suffix may extend the typed blocks, or every byte
-		// renders twice.
+		// NON-DESTRUCTIVE PARTIAL FLUSH: tokens already rendered to the screen
+		// are never discarded or overwritten on a mid-stream failure.
+		//   - pre-first-token (utf8StreamBuf.Len() == 0, nothing rendered):
+		//     msg.content may authoritatively become the stream content.
+		//   - mid-stream (partial already rendered): retain every rendered
+		//     byte, extend only by the undrained suffix, then dock the
+		//     failure banner directly below the partial response so the 200
+		//     rendered tokens stay intact on screen.
 		if msg.content != "" {
-			m.streamBuffer = ""
-			m.streamTickActive = false
-			if m.utf8StreamBuf != nil {
-				_ = m.utf8StreamBuf.Flush()
-			}
-			if m.streamThrottle != nil {
-				_ = m.streamThrottle.Drain()
-			}
-			switch {
-			case strings.HasPrefix(msg.content, m.currentStreamContent):
-				if delta := msg.content[len(m.currentStreamContent):]; delta != "" {
-					m.currentStreamContent = msg.content
-					m.ensureStreamBlocks().Append(KindContent, delta)
-				}
-			case m.currentStreamContent == "":
+			if !hasPartialContent {
+				// Authoritative pre-first-token path: nothing rendered yet,
+				// so the producer's full text may initialize the content.
+				m.streamBuffer = ""
+				m.streamTickActive = false
 				m.currentStreamContent = msg.content
 				m.ensureStreamBlocks().Append(KindContent, msg.content)
-			default:
-				m.currentStreamContent = msg.content
+			} else {
+				// Mid-stream: extend by suffix only, never overwrite.
+				switch {
+				case strings.HasPrefix(msg.content, m.currentStreamContent):
+					if delta := msg.content[len(m.currentStreamContent):]; delta != "" {
+						m.currentStreamContent = msg.content
+						m.ensureStreamBlocks().Append(KindContent, delta)
+					}
+				case m.currentStreamContent == "":
+					m.currentStreamContent = msg.content
+					m.ensureStreamBlocks().Append(KindContent, msg.content)
+				default:
+					// Diverged producer tail with rendered content on
+					// screen: keep the rendered bytes verbatim. Overwriting
+					// here would wipe the viewport mid-generation.
+				}
 			}
 			m.extractReasoningContent()
+		} else if hasPartialContent {
+			// No producer tail, but the byte buffer may hold an undrained
+			// suffix not yet emitted to currentStreamContent (FrameTick
+			// drains via ReadValidString). Recover it without resetting the
+			// buffer so nothing already received is lost.
+			if m.utf8StreamBuf != nil {
+				if tail := m.utf8StreamBuf.String(); tail != "" {
+					if strings.HasPrefix(tail, m.currentStreamContent) {
+						if delta := tail[len(m.currentStreamContent):]; delta != "" {
+							m.currentStreamContent = tail
+							m.ensureStreamBlocks().Append(KindContent, delta)
+						}
+					} else if m.currentStreamContent == "" {
+						m.currentStreamContent = tail
+						m.ensureStreamBlocks().Append(KindContent, tail)
+					}
+				}
+			}
+		}
+		// Dock the interruption banner directly below the retained partial
+		// response. hasPartialContent gates this: a pre-first-token failure
+		// already pushed its TTFT/stream-error record above and has no
+		// partial to annotate.
+		if hasPartialContent && sanitizedErr != "" {
+			banner := "\n\n[INTERRUPTED] Stream ended prematurely: " + sanitizedErr
+			m.currentStreamContent += banner
+			m.ensureStreamBlocks().Append(KindContent, banner)
 		}
 		m.refreshViewportContent()
 		flush := m.flushPendingRecords()
