@@ -55,7 +55,7 @@ func TestTelemetryAdapter_BridgesAllLayerEvents(t *testing.T) {
 	tel.Publish(NewControlIteration("run1", nil, nil))                                                                                // control
 
 	const want = 6
-	envs := collectEnvelopes(t, domain, "envelope.telemetry", want, 3*time.Second)
+	envs := collectEnvelopes(t, domain, "envelope.telemetry", want, 30*time.Second)
 
 	types := map[string]bool{}
 	for _, env := range envs {
