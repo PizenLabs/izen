@@ -14,17 +14,17 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/core/stream"
+	"github.com/PizenLabs/izen/internal/discovery/recon"
 	"github.com/PizenLabs/izen/internal/domain/signal"
 	"github.com/PizenLabs/izen/internal/domain/task"
+	"github.com/PizenLabs/izen/internal/engine/v3/layer3"
+	"github.com/PizenLabs/izen/internal/engine/v3/pipeline"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	"github.com/PizenLabs/izen/internal/retrieval/grounding"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
-	"github.com/PizenLabs/izen/pkg/engine/layer3"
-	"github.com/PizenLabs/izen/pkg/engine/pipeline"
-	"github.com/PizenLabs/izen/pkg/grounding"
-	"github.com/PizenLabs/izen/pkg/recon"
 )
 
 // synthesisFailureMode classifies why the most recent plan-synthesis attempt was

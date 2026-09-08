@@ -8,12 +8,12 @@ import (
 
 	stdctx "context"
 
-	"github.com/PizenLabs/izen/pkg/engine/adapter"
-	"github.com/PizenLabs/izen/pkg/engine/inference"
-	ir "github.com/PizenLabs/izen/pkg/engine/ir/logical"
-	"github.com/PizenLabs/izen/pkg/engine/lowerer"
-	"github.com/PizenLabs/izen/pkg/engine/planner"
-	"github.com/PizenLabs/izen/pkg/engine/strategy"
+	"github.com/PizenLabs/izen/internal/engine/v3/adapter"
+	"github.com/PizenLabs/izen/internal/engine/v3/inference"
+	ir "github.com/PizenLabs/izen/internal/engine/v3/ir/logical"
+	"github.com/PizenLabs/izen/internal/engine/v3/lowerer"
+	"github.com/PizenLabs/izen/internal/engine/v3/planner"
+	"github.com/PizenLabs/izen/internal/engine/v3/strategy"
 )
 
 // verificationPrompt is the exact TUI verification scenario: a greenfield

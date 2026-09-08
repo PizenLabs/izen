@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/capability/v3/policy"
 	"github.com/PizenLabs/izen/internal/changeset"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/core/authorization"
@@ -25,7 +26,6 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/retrieval"
-	"github.com/PizenLabs/izen/pkg/capability/policy"
 )
 
 // ── RuntimeExecutor (Steps 1-3 of the authority migration) ─────────────────

@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/PizenLabs/izen/pkg/domain/command"
+	"github.com/PizenLabs/izen/internal/domain/command"
 )
 
 func parseOK(t *testing.T, input string) *IntentAST {

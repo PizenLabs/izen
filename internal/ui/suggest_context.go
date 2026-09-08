@@ -4,9 +4,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/PizenLabs/izen/internal/domain/command"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/parser"
-	"github.com/PizenLabs/izen/pkg/domain/command"
 )
 
 // CursorContext is the lexical context around the caret in the prompt input

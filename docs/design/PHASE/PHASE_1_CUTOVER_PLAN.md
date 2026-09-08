@@ -70,7 +70,7 @@ Autonomy Decision → RuntimeExecutor → Provider → Artifact → MutationSet 
 - **Verify:** `go vet`, full `-race` suite, and a manual `$prompt`/`$hot` smoke test confirming canonical events appear in the UI projection.
 
 ### Step 8 — Reconcile buses and observability (final cleanup)
-- Decide `pkg/event` (`izen run`) fate: retire or explicitly document as separate product.
+- Decide `internal/events` (`izen run`) fate: retire or explicitly document as separate product.
 - Bridge telemetry bus is already one-way (compose.go:509); keep. Remove write-only audit collision (patch.go:584 vs audit.go JSON) by routing audit writes through `internal/events/audit` only.
 - **Verify:** `golangci-lint` clean; audit replay still functional.
 

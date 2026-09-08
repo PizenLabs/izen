@@ -1,7 +1,7 @@
 # IZEN — Command & Mode Operational Specification
 
 > **Static architecture audit of Izen's CLI & TUI command surface.**
-> Primary sources: `cmd/izen/`, `internal/ui/`, `pkg/app/`, `pkg/planner/`, `pkg/capability/`,
+> Primary sources: `cmd/izen/`, `internal/ui/`, `internal/app/v3/`, `internal/planner/v3/`, `internal/capability/v3/`,
 > `internal/modes/`, `internal/core/workflow/`, `internal/presentation/`.
 > Every command, mode transition, and hotkey in this document is traced to its exact
 > implementation site. Line references point to the current source.
@@ -15,11 +15,11 @@ Izen is a human-centered coding agent with two surfaces:
 | Surface | Entry point | Runtime |
 |---|---|---|
 | **Interactive TUI** (primary) | `cmd/izen/main.go` → `ui.RunMainDashboardWithApp` / `ui.RunRollbackEngine` | Bubble Tea event loop, modal UI states, 5 workflow modes |
-| **Headless CLI / V3 Agent Runtime** | `cmd/izen/main.go` → `runRuntimeCommand` (`izen run`) | `pkg/app.Pipeline` (IntentCompiler → StrategyRegistry → Planner → TxFS) |
+| **Headless CLI / V3 Agent Runtime** | `cmd/izen/main.go` → `runRuntimeCommand` (`izen run`) | `internal/app/v3.Pipeline` (IntentCompiler → StrategyRegistry → Planner → TxFS) |
 
 The TUI and the headless pipeline are architecturally separated: the TUI drives the
 `internal/` engines (ask/investigate/plan/build/review), while `izen run` drives the
-`pkg/` V3 pipeline. The two share the `internal/command`, `internal/modes` and provider
+`internal/` V3 pipeline. The two share the `internal/command`, `internal/modes` and provider
 layers only.
 
 ```
@@ -28,7 +28,7 @@ layers only.
 │  handleKey / Update → hotkeys, approval gates, vi-mode, pickers          │
 │  WorkflowStateMachine (idle→investigating→planning→building→reviewing)   │
 └──────────────────────────────────────────────────────────────────────────┘
-┌───────────────────────── V3 Pipeline (pkg/app) ─────────────────────────┐
+┌───────────────────────── V3 Pipeline (internal/app/v3) ─────────────────────────┐
 │  Request → IntentCompiler → ir.IntentIR → ClarificationGate →            │
 │  Capability Registry → StrategyRegistry → ContextPolicy → PromptBuilder  │
 │  → Extractors → Semantic Alignment Gate → Capability Validation Gate     │
@@ -194,7 +194,7 @@ phase onto `StateChat` / `StateProcessing` / `StateAwaitingApproval`. A pending 
   `CanWrite/CanShell/CanPatch`. `$fix` is blocked in `/review` and `/investigate`
   (`commands.go:5696-5712`) with "Write access required. Switch to /build.".
 
-### 1.4 V3 Planning Modes (`pkg/planner/mode.go`, `pkg/app/plan.go`)
+### 1.4 V3 Planning Modes (`internal/planner/v3/mode.go`, `internal/app/v3/plan.go`)
 
 The headless runtime has a second, orthogonal mode axis:
 
@@ -205,9 +205,9 @@ The headless runtime has a second, orthogonal mode axis:
 | `ModeBrownfield` | interactive edit-and-verify repair graph | existing workspace; verify command toolchain-aware (`go build ./… && go test ./…` etc.) |
 
 `ExecutionModeForPolicy(rewritePolicy, preserveWorkspace)` is the single decision seam
-(`pkg/planner/mode.go:36-44`).
+(`internal/planner/v3/mode.go:36-44`).
 
-### 1.5 Context Policies (`pkg/op/policy.go`) — "Context Handling Rules"
+### 1.5 Context Policies (`internal/op/policy.go`) — "Context Handling Rules"
 
 The `StrategyRegistry` (Open/Closed — `Register` extensible resolvers) maps
 `OperationSemantics` → `ContextPolicy`. This is the governance that Section 1's "Context
@@ -240,7 +240,7 @@ Default (no resolver matches) = `PolicyEdit` — the conservative choice that ne
 | `izen compact [-n\|--dry-run] [path…]` | — | `AGENTS.md/RULES.md/CLAUDE.md/GEMINI.md/README.md/docs/*.md` | In-place compress prompt-overhead prose; reports byte/token savings; `compact.Optimize` |
 | `izen memory optimize` | — | alias | Alias for `izen compact` (`runMemoryCommand`) |
 | `izen debug [path]` | — | on-demand engine report | Materialize Lea index, Context Governance plan, Output pipeline `.logs/` report (`runDebugCommand`, main.go:389) |
-| `izen run [-dir <path>] [-target <path>] "<prompt>"` | V3 pipeline | `-dir` workspace root (default `.`) | Full audit-trail execution through `app.Pipeline`; interactive Clarifier (`pkg/tui/components/ask`); conversational prompts short-circuit to chat; on failure returns exit 1 (`runtime.go:100`) |
+| `izen run [-dir <path>] [-target <path>] "<prompt>"` | V3 pipeline | `-dir` workspace root (default `.`) | Full audit-trail execution through `app.Pipeline`; interactive Clarifier (`internal/tui/components/ask`); conversational prompts short-circuit to chat; on failure returns exit 1 (`runtime.go:100`) |
 | `izen rollback` | Rollback engine | workspace | Boots `ui.RunRollbackEngine` (recent file-mutation review; `isRollbackMode`) |
 
 ### 2.2 Interactive Slash Commands (`internal/ui/commands.go`)
@@ -408,7 +408,7 @@ clipboard). Command line: `:` (`q` to quit), `/` search prompt. `Esc` in cmd mod
 `Esc` closes; all other keys forwarded to the picker model. `Enter` on a highlighted model →
 `modelSelectedMsg`.
 
-### 3.7 Clarification AskModel (`pkg/tui/components/ask`)
+### 3.7 Clarification AskModel (`internal/tui/components/ask`)
 
 `izen run`'s clarification gate runs the standalone Ask component. `Esc` resolves to the default
 answers so a headless/CI run never deadlocks; `Enter` confirms selections.
@@ -479,7 +479,7 @@ answers so a headless/CI run never deadlocks; `Enter` confirms selections.
 - `$hot` prefix in message → `runBuildCmd` (fast-track build).
 - `/build` message → `retrieval` context compressor (graph-aware) applied to content.
 
-### 4.6 V3 Headless Execution Flow (`izen run` → `pkg/app/pipeline.go`)
+### 4.6 V3 Headless Execution Flow (`izen run` → `internal/app/v3/pipeline.go`)
 
 ```
 Request{Intent, Targets}
@@ -530,17 +530,17 @@ reach disk**.
 
 ### 5.1 Clarification Gate (`AskModel`)
 
-- **Where:** `pkg/app/pipeline.go` `clarifyGate` (V3); TUI equivalent = route-confirm dock.
+- **Where:** `internal/app/v3/pipeline.go` `clarifyGate` (V3); TUI equivalent = route-confirm dock.
 - **Behavior:** ambiguous intent (`IntentIR.DecisionAmbiguity`) → publish
   `TypeClarificationRequired` with `[]ir.ClarificationQuestion` → block on a buffered response
-  channel → `Clarifier` (interactive `pkg/tui/components/ask` in `izen run`) resolves.
+  channel → `Clarifier` (interactive `internal/tui/components/ask` in `izen run`) resolves.
 - **Fallbacks:** no Clarifier → `ir.DefaultAnswers(questions)` auto-select (headless never
   hangs); failing Clarifier degrades to defaults + `TypeTaskFailed` event; `Esc` in AskModel =
   defaults; cancelled context surfaces `ctx.Err()`.
 - **Reconciliation:** answers fold back via `applyClarification` — `OptionReplaceWorkspace`
   → `PreserveWorkspace=false`; `OptionBuildAlongside/MergeSelective/TypeYourOwn` → `true`.
 
-### 5.2 ReadGuard (`pkg/app/readguard.go`)
+### 5.2 ReadGuard (`internal/app/v3/readguard.go`)
 
 - **Where:** pipeline read boundary + `PromptBuilder.readBaseline` (`prompt.go:262-290`).
 - **Behavior:** two modes — `readAllowed` (PolicyEdit/Patch baseline injection) and
@@ -549,7 +549,7 @@ reach disk**.
   small model.
 - **Path safety:** `ReadWorkspaceFile` refuses paths that escape the workspace root.
 
-### 5.3 Semantic Alignment Gate (`pkg/capability/alignment.go`, pipeline.go:368-383)
+### 5.3 Semantic Alignment Gate (`internal/capability/v3/alignment.go`, pipeline.go:368-383)
 
 - **Where:** before capability validation, before any write.
 - **Trigger:** `IntentIR.TargetType` set + `CheckAlignment` fails → `ErrSemanticMismatch`.
@@ -560,11 +560,11 @@ reach disk**.
   explicit REGENERATE directive; after `maxRepairs` → `SemanticMismatchError` (wraps
   `ErrSemanticMismatch`), nothing written.
 
-### 5.4 TxFS Rollback Boundaries (`pkg/fs/txfs.go`, pipeline.go)
+### 5.4 TxFS Rollback Boundaries (`internal/fs/txfs.go`, pipeline.go)
 
 - **Boundary open:** `p.tx.Begin()` after prompts are built, before the first generation.
 - **Boundary close:** `p.tx.Commit()` only after the executed plan succeeds — greenfield writes
-  reach disk only here (`pkg/planner/greenfield` is TxFS-backed).
+  reach disk only here (`internal/planner/v3/greenfield` is TxFS-backed).
 - **Rollback triggers:** generation error, extraction rejection (after `maxAttempts`),
   alignment gate, validation gate, context cancellation, plan/execute failure, commit failure.
 - **Repair loop:** each rejection calls `restartTx()` (rollback + fresh Begin) so the next round
@@ -587,7 +587,7 @@ reach disk**.
 | **Emergency escape hatches** | `update.go:94-110`, `handleEmergencyInterrupt` | Ctrl+C / Esc / Ctrl+D unblockable in locked states; full deterministic reset to `StateChat` |
 | **`unwindBuildFailure`** | `model.go:1769-1790` | on stream/engine failure: release approval gate → `EventReset` → `workflowRT.Reset()` → re-derive `StateChat` |
 | **Scope Guard (plan tasks)** | `commands.go:1304-1347` | `control.ValidateStagedPlan` vs `AllowedFiles`; one retry with `FormatRepromptInstruction`, else annotated error |
-| **ReadGuard + budget enforcement** | `pkg/app` + `plan.CheckTokenBudget` | context governance on both surfaces |
+| **ReadGuard + budget enforcement** | `internal/app/v3` + `plan.CheckTokenBudget` | context governance on both surfaces |
 
 ---
 
@@ -607,7 +607,7 @@ These match the implementation 1:1 and are recorded for completeness:
 
 ---
 
-*Generated by static audit of `cmd/izen`, `internal/ui`, `pkg/app`, `pkg/planner`,
-`pkg/capability` (plus `internal/modes`, `internal/core/workflow`, `internal/presentation`,
-`internal/command`, `pkg/op`, `pkg/fs`). Cross-checked against `go build ./...` and
+*Generated by static audit of `cmd/izen`, `internal/ui`, `internal/app/v3`, `internal/planner/v3`,
+`internal/capability/v3` (plus `internal/modes`, `internal/core/workflow`, `internal/presentation`,
+`internal/command`, `internal/op`, `internal/fs`). Cross-checked against `go build ./...` and
 `go test ./... -race`.*

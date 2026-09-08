@@ -149,6 +149,10 @@ func (m *model) resetTransientInteraction() {
 	m.hotfixCandidatesMode = false
 	m.appliedHotfixFile = ""
 	m.clearAutonomyProposal()
+	m.denyPendingPermission("cleared")
+	if m.permissionWhitelist != nil {
+		m.permissionWhitelist.Clear()
+	}
 	m.currentBuildTaskID = 0
 	m.pendingTestConfirm = false
 	m.pendingTestTarget = ""
@@ -283,6 +287,7 @@ func (m *model) discardPendingAction() {
 	// owned was rolled back above.
 	m.activeGraph = nil
 	m.clearAutonomyProposal()
+	m.denyPendingPermission("dropped")
 	m.pendingTestConfirm = false
 	m.pendingTestTarget = ""
 	// Discard unresolved mutations pending in the tool-call buffer.

@@ -30,6 +30,9 @@ import (
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	domainworkflow "github.com/PizenLabs/izen/internal/domain/workflow"
+	"github.com/PizenLabs/izen/internal/engine/v3/ir"
+	"github.com/PizenLabs/izen/internal/engine/v3/pipeline"
+	"github.com/PizenLabs/izen/internal/engine/v3/telemetry"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	runtimegraph "github.com/PizenLabs/izen/internal/execution/graph"
@@ -42,6 +45,7 @@ import (
 	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/patch"
 	"github.com/PizenLabs/izen/internal/planner"
+	"github.com/PizenLabs/izen/internal/policy"
 	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/retrieval"
@@ -51,13 +55,13 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/session/compaction"
 	"github.com/PizenLabs/izen/internal/state"
+	"github.com/PizenLabs/izen/internal/tui/components/shimmer"
+	"github.com/PizenLabs/izen/internal/tui/tips"
+	"github.com/PizenLabs/izen/internal/ui/diff"
+	uiplan "github.com/PizenLabs/izen/internal/ui/plan"
 	"github.com/PizenLabs/izen/internal/ui/status"
+	uitool "github.com/PizenLabs/izen/internal/ui/tool"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
-	"github.com/PizenLabs/izen/pkg/engine/ir"
-	"github.com/PizenLabs/izen/pkg/engine/pipeline"
-	"github.com/PizenLabs/izen/pkg/engine/telemetry"
-	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
-	"github.com/PizenLabs/izen/pkg/tui/tips"
 )
 
 // ── Init stage types ──────────────────────────────────────────────────────────
@@ -1038,6 +1042,10 @@ type model struct {
 	// Proposal widget diff scroll offset
 	proposalDiffOffset int
 
+	// Unified diff viewer modal (nil when closed). Opened via ShowDiffMsg,
+	// dismissed via Esc/q. While non-nil it owns j/k/c/Esc/q keybindings.
+	diffView *diff.Model
+
 	// Project type detection
 	detection project.Detection
 
@@ -1156,6 +1164,21 @@ type model struct {
 	// option, skips the approval gate for subsequent SHELL_EXEC tasks for the
 	// remainder of the session. Reset on mode transitions or /clear.
 	pendingBuildAllowAlways bool
+
+	// ── Interactive security permission interceptor ─────────────
+	// pendingPermission holds the tool call awaiting explicit human
+	// authorization ([y] Allow Once / [a] Always Allow / [n] Deny /
+	// [e] Edit Command). While non-nil the TUI renders the centered
+	// risk-colored modal overlay and every key routes to
+	// handlePermissionModalKey. permissionRespCh is the agent goroutine's
+	// release: it always receives exactly one PermissionResponse.
+	pendingPermission   *policy.PermissionRequest
+	permissionRespCh    chan policy.PermissionResponse
+	permissionEditing   bool
+	permissionEditValue string
+	// permissionWhitelist records "[a] Always Allow for Session" grants by
+	// request pattern (tool:command-head). Nil until the first grant.
+	permissionWhitelist *policy.SessionWhitelist
 
 	// Hotfix approval gate: $hot MUST NOT apply structural patches to disk
 	// silently. After the model synthesizes the patch, the engine freezes in
@@ -1396,6 +1419,16 @@ type model struct {
 
 	// Activity tree — structured tool call logging
 	activityTree *ActivityTree
+
+	// ── Agent Execution Plan card (docked below the prompt header) ──
+	// execPlan is the current multi-step resolution strategy; nil = hidden.
+	execPlan *uiplan.ExecutionPlan
+
+	// ── Live Tool Output cards (inline in the chat stream thread) ───
+	// toolCards maps card ID → card; toolOrder preserves spawn order for
+	// deterministic rendering and Tab-toggle targeting.
+	toolCards map[string]*uitool.ToolCard
+	toolOrder []string
 
 	// Authoritative execution-stage record — the single source of truth for
 	// "what is the runtime doing right now". Every progress indicator derives
@@ -2485,6 +2518,7 @@ func (m *model) unwindBuildFailure() {
 	m.acceptAll = false
 
 	m.clearAutonomyProposal()
+	m.denyPendingPermission("unwound")
 	if m.workflowSM != nil {
 		// From StateBuilding/StateFailed/StateRepairing the canonical exit is
 		// a reset back to StateIdle, from which every forward phase is reachable.
@@ -2591,6 +2625,10 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	if m.toolCallBuffer != nil {
 		m.toolCallBuffer.Reject()
 	}
+	// 4a. Release a blocked permission gate: the agent goroutine waits on
+	// the modal's response channel, so an interrupt must deny-deliver rather
+	// than orphan it (leak-proof authorization).
+	m.denyPendingPermission("interrupted")
 
 	// 4b. Abort any in-flight hotfix: restore the stashed plan and clear the
 	// hotfixActive flag so a subsequent buildResultMsg can NEVER wrongly
@@ -4468,6 +4506,20 @@ func (m *model) resetStreamingRenderer() {
 // the scrollable document so live status stays reachable.
 func (m *model) renderTailPanelLines() []string {
 	var b strings.Builder
+
+	// ── Agent Execution Plan card (docked top of viewport tail) ──
+	// Rendered first so it sits immediately below the conversation content
+	// during multi-step execution and stays pinned via tail auto-scroll.
+	if dock := m.renderPlanDock(m.width); dock != "" {
+		b.WriteString(dock)
+		b.WriteString("\n")
+	}
+
+	// ── Live Tool Output cards (inline in the chat stream thread) ──
+	if dock := m.renderToolDock(m.width); dock != "" {
+		b.WriteString(dock)
+		b.WriteString("\n")
+	}
 
 	// ── Foldable execution log entries ─────────────────────────────
 	if m.logStore != nil {

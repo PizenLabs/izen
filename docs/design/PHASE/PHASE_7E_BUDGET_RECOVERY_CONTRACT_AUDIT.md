@@ -52,9 +52,9 @@ Every claim below carries a source/wire evidence chain. `req_forensics` =
 | E6 | Executor sends `req.MaxOutputTokens` on the wire, not the merged profile value | `internal/execution/executor.go:1043-1047` (`invokeMutation`), `:1188-1192` (`invokeReadOnly`); `selectStrategy` merges req→profile one-way (`if req.MaxOutputTokens > 0`) | PROVEN |
 | E7 | `artifactGate` calls `ValidateContent(target, data, 0)`; checks only `gate.Passed`; ignores `Decision`/`Directive` | `internal/execution/executor.go:1124-1130` | PROVEN |
 | E8 | `ValidateContent` has exactly one caller (`artifactGate`), always `attempts=0` | repo-wide grep (single match outside policy tests) | PROVEN |
-| E9 | Syntax errors in HTML produce `DecisionRetry` in `StandardFailurePolicy` | `pkg/capability/policy/standard.go` (`isSyntaxError`, `maxRetryAttempts=3`); `pkg/capability/policy/policy.go` (`DecisionRetry`) | PROVEN |
+| E9 | Syntax errors in HTML produce `DecisionRetry` in `StandardFailurePolicy` | `internal/capability/v3/policy/standard.go` (`isSyntaxError`, `maxRetryAttempts=3`); `internal/capability/v3/policy/policy.go` (`DecisionRetry`) | PROVEN |
 | E10 | `ErrArtifactRejected` → `OutcomeArtifactRejected` → `FailurePermanent` → `LoopAbort` | `internal/execution/mutation.go` (`OutcomeArtifactRejected`); `internal/execution/executor.go:614-625` (`FailExecution(events.FailurePermanent)`); `internal/autonomy/runtime_loop.go` (`ClassifyOutcome`); `internal/runtime/autonomy/driver.go:494-496` (`decideDefault` hardcodes LoopAbort) | PROVEN |
-| E11 | Original design contract re-prompts on failed validation | `pkg/app/pipeline.go:316-347` (validation gate re-prompts with rejection reasons; `p.maxAttempts` cap); `pkg/engine/decision/engine.go` (`DirectiveRetry`); `internal/modes/plan/engine.go:970` (`maxSilentRetries := 2`) — pattern still live in plan mode | PROVEN |
+| E11 | Original design contract re-prompts on failed validation | `internal/app/v3/pipeline.go:316-347` (validation gate re-prompts with rejection reasons; `p.maxAttempts` cap); `internal/engine/v3/decision/engine.go` (`DirectiveRetry`); `internal/modes/plan/engine.go:970` (`maxSilentRetries := 2`) — pattern still live in plan mode | PROVEN |
 | E12 | Executor never inspects `finish_reason` on the mutation path | `internal/execution/executor.go` (no `FinishReason` read); only `ui/stream.go:366` and `internal/modes/plan/engine.go:525` check `=="length"` | PROVEN |
 | E13 | Repro usage ledger | `usage_forensics`: prompt 2181, completion 5883, reasoning 5000, total 7064, Known=true | PROVEN |
 | E14 | `completion_tokens` includes `completion_tokens_details.reasoning_tokens` on the wire | `internal/providers/openrouter.go` `openrouterUsage`; OpenRouter docs | PROVEN |
@@ -193,7 +193,7 @@ if !gate.Passed {
 ```
 
 `ValidateContent` (only caller: `artifactGate`) resolves a deterministic
-capability validator (e.g. `pkg/capability/validator/html.go` — real HTML5 parse +
+capability validator (e.g. `internal/capability/v3/validator/html.go` — real HTML5 parse +
 well-formedness scan; `json.go` — `json.Valid`) and feeds the error into
 `StandardFailurePolicy`. For syntax degradation the policy computes
 `DecisionRetry` (`standard.go`, `maxRetryAttempts=3`).
@@ -219,9 +219,9 @@ repair, no narrower re-attempt.
 
 ### 6.4 The design contract it diverged from
 
-The original V3 pipeline re-prompted the model on validation failure: `pkg/app/pipeline.go:316-347`
+The original V3 pipeline re-prompted the model on validation failure: `internal/app/v3/pipeline.go:316-347`
 ("validation gate (failed artifacts re-prompt with rejection reasons)"), capped
-by `WithMaxAttempts`/`WithMaxRepairs`; `pkg/engine/decision/engine.go` exposes
+by `WithMaxAttempts`/`WithMaxRepairs`; `internal/engine/v3/decision/engine.go` exposes
 `DirectiveRetry`; and plan mode still runs `maxSilentRetries := 2` with
 prompt-augmentation retries (`modes/plan/engine.go:970-984`). The runtime
 executor's permanent-abort is therefore a **policy regression** relative to the
@@ -370,7 +370,7 @@ separated on the mutation-path ledger.
                        +----------------------------+----------------------------+
                        v                                                         v
         +--------------------------------+                     +------------------------------------------+
-        | F7: approval path classifies   |                     | Original design (pkg/app:316-347,         |
+        | F7: approval path classifies   |                     | Original design (internal/app/v3:316-347,         |
         |     apply/verify failure as    |                     | plan engine:970) re-prompts on failure;   |
         |     permanent; contradicts     |                     | runtime divergence = policy regression     |
         |     executor FailureRecoverable|                     +------------------------------------------+
@@ -405,7 +405,7 @@ Ordered by leverage (audit-scope recommendations only — **no code was changed*
 
 1. **Executor seam fix (kills F2, F6 budget half, F8):** in `invokeMutation`/`invokeReadOnly`, when `req.MaxOutputTokens == 0`, use `profile.MaxOutputTokens`; when `req.Reasoning` is nil and `profile` carries a reasoning budget, forward it. This makes the strategy contract authoritative regardless of caller, fixing all UI cutover paths at one point.
 2. **`finish_reason="length"` handling (kills F5):** read the normalized finish reason on the mutation path; treat `"length"` as a distinct outcome (`OutcomeTruncated`) with its own classification and a narrow re-attempt (higher budget or `create_file` fallback), never as a syntax failure.
-3. **Artifact-gate retry (kills F3/F4):** honor `gate.Decision` in `artifactGate`; on `DecisionRetry` with remaining budget, re-run the *same* deterministic extraction/validation with the gate error appended to the prompt (the `pkg/app:316-347` contract) before any permanent classification.
+3. **Artifact-gate retry (kills F3/F4):** honor `gate.Decision` in `artifactGate`; on `DecisionRetry` with remaining budget, re-run the *same* deterministic extraction/validation with the gate error appended to the prompt (the `internal/app/v3:316-347` contract) before any permanent classification.
 4. **Unify approval-path classification (kills F7):** make the driver's `approvalFailureOutcome` emit/respect the executor's `FailureRecoverable` classification instead of `terminateAbort(FailurePermanent)`.
 5. **Correct the usage.go comment (kills the misleading half of F6):** document that reasoning tokens are billed output tokens and are inside `completion_tokens`.
 6. **Add an `Estimated` flag** to the recorded `ModelInvocation` when the usage estimate replaces authoritative usage.
@@ -465,7 +465,7 @@ them live.
 4. Vendor enforcement of the `max_tokens > reasoning budget` constraint for Anthropic-family models on the live gateway.
 
 **REQUIRES DESIGN DECISION**
-1. Should artifact rejection re-prompt/repair (per the original `pkg/app:316-347` contract and plan-mode precedent) instead of permanent abort?
+1. Should artifact rejection re-prompt/repair (per the original `internal/app/v3:316-347` contract and plan-mode precedent) instead of permanent abort?
 2. Should `finish_reason="length"` be detected and recovered as a truncation outcome distinct from syntax failure?
 3. Should the executor forward `profile.MaxOutputTokens` and `profile` reasoning budget when `req` omits them (making the strategy layer authoritative)?
 4. Should the approval-path apply/verify failure respect the executor's `FailureRecoverable` classification?

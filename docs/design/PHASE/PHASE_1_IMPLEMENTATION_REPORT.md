@@ -247,7 +247,7 @@ model.invoked → artifact.produced → mutation.started → mutation.completed 
 verification.completed → execution.finished` on the cutover path. The UI
 remains a pure projection — no fabricated progress events are emitted.
 
-`pkg/event` (7 types) serves the `izen run` product lineage and is documented
+`internal/events` (7 types) serves the `izen run` product lineage and is documented
 as a separate product stack (Phase 0 §15); it was not touched. The
 `.izen/audit/mutations.log` write (`patch.go appendMutationLog`) is retained:
 `guardrail.go` parses it for the infinite-autofix-loop guard, so routing audit

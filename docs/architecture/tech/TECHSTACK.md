@@ -110,7 +110,7 @@ izen/
 │   ├── mcp/            # Stdio-based MCP server abstractions
 │   ├── hooks/          # Lifecycle triggers and automation hooks
 │   └── ui/             # Bubble Tea views and Lip Gloss styles
-└── pkg/                # Reusable, non-domain utility packages
+└── internal/           # Application packages, private to this module (the former pkg/ tree was merged here)
 
 ```
 

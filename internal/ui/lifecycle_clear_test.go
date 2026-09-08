@@ -17,7 +17,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/session"
-	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
+	"github.com/PizenLabs/izen/internal/tui/components/shimmer"
 )
 
 // clearTestModel builds a model pre-populated with every surface /clear must

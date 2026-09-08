@@ -17,20 +17,20 @@ Itemized inventory of dead, legacy, or overlapping lineages to be frozen in Phas
 
 ## LEGACY_REACHABLE (Reachable but logically deprecated — none definitively identified)
 
-No package meets the strict definition of "old code still reachable from production paths due to uncleaned references, but logically deprecated." `internal/agent` is unreachable (`DEAD_LINEAGE`), not legacy-reachable. The `pkg/engine/control/loop.go` (`ControlLoopOrchestrator`) is actively used (`RunAdaptive`) and is not deprecated.
+No package meets the strict definition of "old code still reachable from production paths due to uncleaned references, but logically deprecated." `internal/agent` is unreachable (`DEAD_LINEAGE`), not legacy-reachable. The `internal/engine/v3/control/loop.go` (`ControlLoopOrchestrator`) is actively used (`RunAdaptive`) and is not deprecated.
 
 ---
 
 ## OVERLAPPING / COMPETING LINEAGES (Must be frozen in Phase 1)
 
-### 1. Dual Mutation Authority (`internal/execution` vs `pkg/app/txfs`)
-- **Overlap**: Both `internal/execution/patch.go` (`PatchManager.Apply`) and `pkg/app/pipeline.go` (`txfs.TxFS.Commit`) can write workspace files.
-- **Risk**: No shared rollback mechanism. `MutationSet.Rollback()` (`internal/execution`) and `txfs.Rollback()` (`pkg/app`) are independent. A mutation committed via `cmd/izen/main.go` (execution boundary) is invisible to `cmd/izen/runtime.go` (app pipeline), and vice versa.
-- **Freeze action**: Freeze `pkg/app` mutation pipeline (`Pipeline.Run` stages 6-7) from being invoked in the same process as `compose.Wire` without an explicit authorization gate that selects one authority.
-- **Elimination action (Phase 4)**: Unify mutation authority by making `pkg/app` pipeline delegate all file writes to `PatchManager` (through `RuntimeExecutor`), or eliminate `txfs.TxFS` in favor of `MutationSet`.
+### 1. Dual Mutation Authority (`internal/execution` vs `internal/app/v3/txfs`)
+- **Overlap**: Both `internal/execution/patch.go` (`PatchManager.Apply`) and `internal/app/v3/pipeline.go` (`txfs.TxFS.Commit`) can write workspace files.
+- **Risk**: No shared rollback mechanism. `MutationSet.Rollback()` (`internal/execution`) and `txfs.Rollback()` (`internal/app/v3`) are independent. A mutation committed via `cmd/izen/main.go` (execution boundary) is invisible to `cmd/izen/runtime.go` (app pipeline), and vice versa.
+- **Freeze action**: Freeze `internal/app/v3` mutation pipeline (`Pipeline.Run` stages 6-7) from being invoked in the same process as `compose.Wire` without an explicit authorization gate that selects one authority.
+- **Elimination action (Phase 4)**: Unify mutation authority by making `internal/app/v3` pipeline delegate all file writes to `PatchManager` (through `RuntimeExecutor`), or eliminate `txfs.TxFS` in favor of `MutationSet`.
 
 ### 2. Triple Loop Competition (`RuntimeLoop` + `orchestrator.Loop` + `ControlLoopOrchestrator`)
-- **Overlap**: `internal/autonomy/runtime_loop.go`, `pkg/runtime/orchestrator/loop.go`, and `pkg/engine/control/loop.go` all manage bounded execution cycles with different state vocabularies and termination criteria.
+- **Overlap**: `internal/autonomy/runtime_loop.go`, `internal/runtime/v3/orchestrator/loop.go`, and `internal/engine/v3/control/loop.go` all manage bounded execution cycles with different state vocabularies and termination criteria.
 - **Risk**: Concurrent activation produces conflicting observations (`RuntimeLoop` consumes `Observation` from adapter; `Loop` consumes `MemorySnapshot`; `ControlLoopOrchestrator` consumes `ExecutionSnapshot`). A single user objective could trigger divergent recovery decisions (e.g., `LoopRepair` in runtime loop vs `DirectiveRetry` in control loop vs `Retry` in orchestrator loop).
 - **Freeze action**: Freeze additional loop wiring in `compose.Wire` so that only one loop authority is active per process. If `Driver` is wired, do not also wire `orchestrator.Loop` independently unless explicitly coordinated through a shared `Executor` adapter.
 - **Elimination action (Phase 4)**: Consolidate loop state vocabularies: either extend `RuntimeLoop` to absorb `MemorySnapshot` behavior (replacing `orchestrator.Loop`), or eliminate `RuntimeLoop` and make `Driver` delegate directly to `Loop`.
@@ -47,11 +47,11 @@ No package meets the strict definition of "old code still reachable from product
 | Package | Status | Phase 1 Freeze | Phase 4 Elimination |
 |---|---|---|---|
 | `internal/agent` (loop + checkpoint + bridge) | DEAD_LINEAGE (unreachable, stub mutation) | Freeze — do not wire into compose/app | Delete package |
-| `internal/autonomy` (`RuntimeLoop`) | PRODUCTION_COORDINATOR (active) | Keep active; freeze additional loop wiring conflicts | Consolidate state vocabulary with `pkg/runtime/orchestrator` |
+| `internal/autonomy` (`RuntimeLoop`) | PRODUCTION_COORDINATOR (active) | Keep active; freeze additional loop wiring conflicts | Consolidate state vocabulary with `internal/runtime/v3/orchestrator` |
 | `internal/runtime/autonomy/driver.go` (`Driver`) | PRODUCTION_COORDINATOR (active) | Keep active; coordinate with single loop authority | Consolidate loop delegation |
-| `internal/execution` (`RuntimeExecutor`) | PRODUCTION_AUTHORITY (active) | Keep active; freeze second mutation authority (`pkg/app`) from concurrent activation | Unify mutation audit trail |
-| `pkg/app` (`Pipeline` + `txfs.TxFS`) | PRODUCTION_COORDINATOR / SECONDARY AUTHORITY | Freeze concurrent mutation activation without explicit gate | Unify with `internal/execution` mutation boundary |
-| `pkg/engine/control/loop.go` (`ControlLoopOrchestrator`) | PRODUCTION_COORDINATOR (active via adaptive pipeline) | Freeze concurrent activation with `RuntimeLoop` or `Loop` | Consolidate adaptive control into single loop |
-| `pkg/runtime/orchestrator/loop.go` (`Loop`) | PRODUCTION_COORDINATOR (active) | Freeze concurrent activation with `RuntimeLoop` or `ControlLoopOrchestrator` | Consolidate loop state vocabulary |
-| `pkg/kernel` | INFRASTRUCTURE_SDK | No freeze needed | No elimination needed |
+| `internal/execution` (`RuntimeExecutor`) | PRODUCTION_AUTHORITY (active) | Keep active; freeze second mutation authority (`internal/app/v3`) from concurrent activation | Unify mutation audit trail |
+| `internal/app/v3` (`Pipeline` + `txfs.TxFS`) | PRODUCTION_COORDINATOR / SECONDARY AUTHORITY | Freeze concurrent mutation activation without explicit gate | Unify with `internal/execution` mutation boundary |
+| `internal/engine/v3/control/loop.go` (`ControlLoopOrchestrator`) | PRODUCTION_COORDINATOR (active via adaptive pipeline) | Freeze concurrent activation with `RuntimeLoop` or `Loop` | Consolidate adaptive control into single loop |
+| `internal/runtime/v3/orchestrator/loop.go` (`Loop`) | PRODUCTION_COORDINATOR (active) | Freeze concurrent activation with `RuntimeLoop` or `ControlLoopOrchestrator` | Consolidate loop state vocabulary |
+| `internal/kernel` | INFRASTRUCTURE_SDK | No freeze needed | No elimination needed |
 | `internal/core/runtime` | INFRASTRUCTURE_SDK | No freeze needed | No elimination needed |

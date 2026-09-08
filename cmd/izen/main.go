@@ -21,13 +21,13 @@ import (
 	"github.com/PizenLabs/izen/internal/retrieval"
 	compose "github.com/PizenLabs/izen/internal/runtime/compose"
 	"github.com/PizenLabs/izen/internal/runtime/output"
+	"github.com/PizenLabs/izen/internal/runtime/v3/gate"
+	"github.com/PizenLabs/izen/internal/runtime/v3/harness"
+	"github.com/PizenLabs/izen/internal/runtime/v3/orchestrator"
+	"github.com/PizenLabs/izen/internal/runtime/v3/preflight"
+	"github.com/PizenLabs/izen/internal/runtime/v3/ui/decision"
 	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/ui"
-	"github.com/PizenLabs/izen/pkg/runtime/gate"
-	"github.com/PizenLabs/izen/pkg/runtime/harness"
-	"github.com/PizenLabs/izen/pkg/runtime/orchestrator"
-	"github.com/PizenLabs/izen/pkg/runtime/preflight"
-	"github.com/PizenLabs/izen/pkg/runtime/ui/decision"
 )
 
 // Audit wiring: ensure DI container instantiates new invariants.

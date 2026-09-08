@@ -3,7 +3,7 @@ package parser
 import (
 	"strings"
 
-	"github.com/PizenLabs/izen/pkg/domain/command"
+	"github.com/PizenLabs/izen/internal/domain/command"
 )
 
 // Parse converts raw input into an IntentAST using the given registry. When

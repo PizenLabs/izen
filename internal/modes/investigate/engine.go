@@ -10,15 +10,15 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/discovery/recon"
 	"github.com/PizenLabs/izen/internal/domain/signal"
+	"github.com/PizenLabs/izen/internal/engine/v3/layer3"
+	"github.com/PizenLabs/izen/internal/engine/v3/pipeline"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/runtime/output"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
-	"github.com/PizenLabs/izen/pkg/engine/layer3"
-	"github.com/PizenLabs/izen/pkg/engine/pipeline"
-	"github.com/PizenLabs/izen/pkg/recon"
 )
 
 // forensicLog is the activity sink for /investigate. It defaults to the

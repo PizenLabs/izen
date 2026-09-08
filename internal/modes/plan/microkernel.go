@@ -7,10 +7,10 @@ import (
 
 	stdctx "context"
 
-	ectx "github.com/PizenLabs/izen/pkg/engine/context"
-	eintent "github.com/PizenLabs/izen/pkg/engine/intent"
-	eplan "github.com/PizenLabs/izen/pkg/engine/plan"
-	estrate "github.com/PizenLabs/izen/pkg/engine/strategy"
+	ectx "github.com/PizenLabs/izen/internal/engine/v3/context"
+	eintent "github.com/PizenLabs/izen/internal/engine/v3/intent"
+	eplan "github.com/PizenLabs/izen/internal/engine/v3/plan"
+	estrate "github.com/PizenLabs/izen/internal/engine/v3/strategy"
 
 	"github.com/PizenLabs/izen/internal/domain/task"
 )

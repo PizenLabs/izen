@@ -6,10 +6,10 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/PizenLabs/izen/internal/engine/v3/telemetry"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/session"
-	"github.com/PizenLabs/izen/pkg/engine/telemetry"
 )
 
 // controlFactMsg carries one fact-only control event (control.iteration or

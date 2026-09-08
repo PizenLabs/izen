@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
+	control "github.com/PizenLabs/izen/internal/boundary/scopeguard"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/core/classifier"
@@ -29,12 +30,12 @@ import (
 	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/policy"
 	"github.com/PizenLabs/izen/internal/providers"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/ui/status"
 	verification "github.com/PizenLabs/izen/internal/verification"
-	"github.com/PizenLabs/izen/pkg/control"
 )
 
 // stripModePrefix removes a leading mode command (e.g. "/plan", "/build",
@@ -102,6 +103,29 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if !m.selfHealWorkspace() {
 			m.initStage = initNone
 			m.ti.Blur()
+		}
+	}
+
+	// ── SECURITY PERMISSION MODAL INTERCEPT ──────────────────────────
+	// While the permission interceptor holds a tool call, every key routes
+	// to the modal handler: [y] Allow Once / [a] Always Allow / [n] Deny /
+	// [e] Edit Command. It runs before quit-confirm so a pending security
+	// decision can never be bypassed by exiting, and before the emergency
+	// hatch so Ctrl+C denies (releasing the blocked agent goroutine) instead
+	// of orphaning its response channel.
+	if m.pendingPermission != nil {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			return m, m.handlePermissionModalKey(keyMsg)
+		}
+		// Non-key messages (ticks, resizes) must not dismiss the modal; the
+		// blocked executor waits for an explicit human decision.
+		if _, ok := msg.(tea.KeyMsg); !ok {
+			switch msg.(type) {
+			case tea.WindowSizeMsg:
+				// fall through to the main switch so resize still applies
+			default:
+				return m, nil
+			}
 		}
 	}
 
@@ -377,6 +401,51 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.handlePresentationEvent(msg.ev)
 		return m, nil
 
+	case PermissionPromptMsg:
+		// Interactive security interceptor: stage the modal and freeze the
+		// approval gate. Session "[a]" grants bypass the modal entirely so
+		// repeat tool calls pass without prompting; the response is
+		// delivered on the request's channel either way so the blocked
+		// agent goroutine is always released.
+		if msg.RespCh == nil {
+			return m, nil
+		}
+		if m.isPermissionAllowedBySession(msg.Req) {
+			resp := policy.PermissionResponse{RequestID: msg.Req.ID, Allowed: true}
+			select {
+			case msg.RespCh <- resp:
+			default:
+			}
+			return m, func() tea.Msg { return PermissionResolvedMsg{Resp: resp} }
+		}
+		m.openPermissionModal(msg)
+		return m, nil
+
+	case PermissionResolvedMsg:
+		// Forward the human decision to the blocked executor channel
+		// (non-blocking — the waiter may have timed out) and log the
+		// authorization outcome. The modal state was already cleared by
+		// deliverPermissionResponse; this is the observable terminal event.
+		m.logActivity("[permission] %s allowed=%t remember=%t edited=%t",
+			msg.Resp.RequestID, msg.Resp.Allowed, msg.Resp.Remember, msg.Resp.Edited)
+		return m, nil
+
+	case ShowDiffMsg:
+		// Full-screen unified diff viewer modal.
+		m.openDiffView(msg.DiffText, msg.Title)
+		return m, nil
+
+	case ToggleDiffCollapseMsg:
+		// Programmatic fold toggle: specific hunk, or global when negative.
+		if m.diffView != nil {
+			if msg.FileIdx < 0 && msg.HunkIdx < 0 {
+				m.diffView.ToggleAll()
+			} else {
+				m.diffView.ToggleHunk(msg.FileIdx, msg.HunkIdx)
+			}
+		}
+		return m, nil
+
 	case sessionPickerResumeMsg:
 		return m, m.handleSessionPickerResume(msg.slot)
 	case sessionPickerNewMsg:
@@ -452,6 +521,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.frozenViewportStr = ""
 		m.frozenRecords = nil
 		m.refreshViewportContent()
+		// Keep the diff viewer width-safe: re-truncate to the new width.
+		if m.diffView != nil {
+			vh := msg.Height - 4
+			if vh < 8 {
+				vh = 8
+			}
+			m.diffView.SetSize(msg.Width-2, vh)
+		}
 		return m, nil
 
 	case tickMsg:
@@ -1945,6 +2022,33 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		flush := m.flushPendingRecords()
 		return m, flush
 
+	case PlanUpdateMsg:
+		m.handlePlanUpdate(msg)
+		return m, nil
+
+	case PlanStepMsg:
+		m.handlePlanStep(msg)
+		return m, nil
+
+	case ToolStartMsg:
+		m.handleToolStart(msg)
+		return m, nil
+
+	case ToolChunkMsg:
+		m.handleToolChunk(msg)
+		return m, nil
+
+	case ToolEndMsg:
+		return m, m.handleToolEnd(msg)
+
+	case toolCollapseMsg:
+		m.handleToolCollapse(msg)
+		return m, nil
+
+	case ToolToggleMsg:
+		m.toggleToolCard(msg.ID)
+		return m, nil
+
 	case FrameTickMsg:
 		// ── DEBOUNCED FRAME TICKER (30ms / ~33 FPS) ─────────────────────
 		// STREAM BUFFER CONTRACT: Option A — Cumulative Overwrite.
@@ -3304,6 +3408,18 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			return m, nil
 		}
 
+		// ── UNIFIED DIFF VIEWER MODAL ────────────────────────────────
+		// While open it owns its keybindings: j/k or ↑/↓ scroll the diff
+		// viewport, c folds the focused hunk, Esc/q closes and returns
+		// focus to chat. All other keys are swallowed so typing never
+		// leaks into the prompt bar behind the modal.
+		if m.diffActive() {
+			if consumed, cmd := m.handleDiffKey(msg); consumed {
+				return m, cmd
+			}
+			return m, nil
+		}
+
 		// ── PRIORITY 1: ACTIVE TEXT INPUT ────────────────────────────
 		// A printable character typed into the focused input is ALWAYS text.
 		// It can never be hijacked by a capability hotkey or any other
@@ -3392,6 +3508,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		if !m.autocompleteActive && !m.streaming && !m.agentRunning {
 			switch msg.Type {
+			case tea.KeyTab:
+				// Toggle the most recent terminal tool card's historical log.
+				if len(m.toolOrder) > 0 {
+					m.toggleToolCard("")
+					return m, nil
+				}
 			case tea.KeyUp:
 				if len(m.history) > 0 {
 					if m.historyIndex == -1 {

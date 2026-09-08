@@ -7,7 +7,7 @@ The **definitive active production pipeline** is the path through `cmd/izen/main
 Why this is the definitive path:
 - `cmd/izen/main.go` is the primary binary entry point (line 78 `main()`).
 - It creates the concrete `App` through `compose.Wire` (line 217), which is the only composition root that wires `RuntimeExecutor`, `PatchManager`, `MutationSet`, `Driver`, and the event bus.
-- `cmd/izen/orchestrate.go` and `cmd/izen/runtime.go` are secondary subcommands (`orchestrate` and `run`). They use different pipelines (`pkg/cli` and `pkg/app`) and do not share the same mutation authority boundary as the main TUI/app path.
+- `cmd/izen/orchestrate.go` and `cmd/izen/runtime.go` are secondary subcommands (`orchestrate` and `run`). They use different pipelines (`internal/cli` and `internal/app/v3`) and do not share the same mutation authority boundary as the main TUI/app path.
 - The `cmd/diagnostic` entry point performs zero mutations.
 
 Exact pipeline path:
@@ -39,7 +39,7 @@ cmd/izen/main.go (main)
   - `FILE_CREATE` protocol (`os.WriteFile` at `patch.go:594`)
 - **Audit trail**: `ExecutionProof` (contract identity, mutation evidence, verification report, diff summary, transaction ID).
 
-### Authority 2: `pkg/app` (`Pipeline` + `txfs.TxFS`)
+### Authority 2: `internal/app/v3` (`Pipeline` + `txfs.TxFS`)
 - **Path**: `cmd/izen/runtime.go` (`runRuntimeCommand`) → `app.NewPipeline` → `Pipeline.Run`
 - **Mutation mechanisms**:
   - `txfs.TxFS.Commit()` (`p.tx.Commit()` at `pipeline.go:425`)
@@ -60,19 +60,19 @@ During runtime execution, **three loops can compete for control**:
 - Enforces termination bounds (`LoopBounds`): max attempts, recovery cycles, execution steps, identical decisions, total tokens.
 - Delegates mutation to `Executor` interface (`adapter.Execute`).
 
-### 2. `pkg/runtime/orchestrator` `Loop` (`pkg/runtime/orchestrator/loop.go`)
+### 2. `internal/runtime/v3/orchestrator` `Loop` (`internal/runtime/v3/orchestrator/loop.go`)
 - Owns execution cycle state (`LoopState`: Idle → Executing → Verifying → AwaitingHuman → Committed/Failed).
 - Manages `MemorySnapshot` (single observation-phase disk read), `formatFailures`, and fast-fail budget (`maxFormatFailures = 2`).
 - Delegates commit to `executor.CommitMutation()` (`RuntimeExecutor`).
 - If both `RuntimeLoop` and `Loop` are active (e.g., autonomy driver wired with `WithRuntimeLoop` while orchestrator loop runs independently), the same model output can trigger conflicting state transitions.
 
-### 3. `pkg/engine/control` `ControlLoopOrchestrator` (`pkg/engine/control/loop.go`)
+### 3. `internal/engine/v3/control` `ControlLoopOrchestrator` (`internal/engine/v3/control/loop.go`)
 - Owns adaptive reconciliation loop (`Observe` → `Decide` → `Execute`) over `Dynamic IR` (`ExecutionSnapshot`).
 - Applies mechanical state changes (`session.Apply`) and dispatches through `WorkerPool`.
-- If active alongside `pkg/runtime/orchestrator/loop`, the adaptive loop manages its own `ExecutionSnapshot` (variable/state mutations) independently of the orchestrator's `MemorySnapshot`.
+- If active alongside `internal/runtime/v3/orchestrator/loop`, the adaptive loop manages its own `ExecutionSnapshot` (variable/state mutations) independently of the orchestrator's `MemorySnapshot`.
 
 ### Competition Scenario
-When `cmd/izen/main.go` creates an `App` via `compose.Wire`, it does not explicitly disable `pkg/engine/control` or `pkg/runtime/orchestrator` loops. The `App` uses `pipeline.Run` (`pkg/app`) which can trigger `RunAdaptive` (`pkg/engine/pipeline/adaptive.go`), which creates a `ControlLoopOrchestrator`. At the same time, `compose.Wire` may wire a `Driver` (`internal/runtime/autonomy`) with a `RuntimeLoop`, and the CLI (`cmd/izen/orchestrate.go`) explicitly creates an `orchestrator.Loop` (`pkg/runtime/orchestrator`).
+When `cmd/izen/main.go` creates an `App` via `compose.Wire`, it does not explicitly disable `internal/engine/v3/control` or `internal/runtime/v3/orchestrator` loops. The `App` uses `pipeline.Run` (`internal/app/v3`) which can trigger `RunAdaptive` (`internal/engine/v3/pipeline/adaptive.go`), which creates a `ControlLoopOrchestrator`. At the same time, `compose.Wire` may wire a `Driver` (`internal/runtime/autonomy`) with a `RuntimeLoop`, and the CLI (`cmd/izen/orchestrate.go`) explicitly creates an `orchestrator.Loop` (`internal/runtime/v3/orchestrator`).
 
 If any of these loops are activated simultaneously on the same workspace target, the following conflicts occur:
 - **State divergence**: `RuntimeLoop` records `RuntimeState`; `Loop` records `LoopState`; `ControlLoopOrchestrator` records `ExecutionSnapshot`. There is no shared state synchronization.
@@ -85,6 +85,6 @@ If any of these loops are activated simultaneously on the same workspace target,
 
 **Active production pipeline**: `cmd/izen/main.go` → `compose.Wire` → `App` (runtime/autonomy adapter + execution boundary).
 
-**Distinct mutation authorities**: **2** (`internal/execution` and `pkg/app/txfs`).
+**Distinct mutation authorities**: **2** (`internal/execution` and `internal/app/v3/txfs`).
 
 **Loops competing for control**: **3** (`RuntimeLoop`, `orchestrator.Loop`, `ControlLoopOrchestrator`). The `AgentLoop` (`internal/agent`) is dead lineage and does not compete.

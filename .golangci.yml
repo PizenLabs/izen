@@ -25,8 +25,15 @@ linters:
     - misspell
 
     - revive
+    - depguard
 
   settings:
+    depguard:
+      rules:
+        no-pkg-tree:
+          deny:
+            - pkg: github.com/PizenLabs/izen/pkg
+              desc: "pkg/ was eliminated by the architectural migration; place shared code under internal/ instead"
     revive:
       rules:
         - name: exported

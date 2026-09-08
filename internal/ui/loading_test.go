@@ -6,7 +6,7 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
+	"github.com/PizenLabs/izen/internal/tui/components/shimmer"
 )
 
 func TestStartShimmerActivates(t *testing.T) {

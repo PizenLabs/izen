@@ -9,15 +9,15 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/app/v3"
+	"github.com/PizenLabs/izen/internal/app/v3/compiler"
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/ir"
+	"github.com/PizenLabs/izen/internal/knowledge/v3"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
-	"github.com/PizenLabs/izen/pkg/app"
-	"github.com/PizenLabs/izen/pkg/app/compiler"
-	"github.com/PizenLabs/izen/pkg/event"
-	"github.com/PizenLabs/izen/pkg/ir"
-	"github.com/PizenLabs/izen/pkg/knowledge"
-	"github.com/PizenLabs/izen/pkg/tui/components/ask"
+	"github.com/PizenLabs/izen/internal/tui/components/ask"
 )
 
 // runRuntimeUsage describes the `izen run` subcommand.
@@ -184,11 +184,11 @@ func runRuntimeCommand(args []string) error {
 
 	// Attach a terminal status observer rendering kernel task and pipeline
 	// stage updates on stderr as they happen. A TUI subscribes with the same
-	// event.EventBus contract.
-	unsub := pipeline.Bus().Subscribe(nil, func(e event.Event) {
-		fmt.Fprintln(os.Stderr, app.StatusLine(e))
+	// events.Bus contract.
+	unsub := pipeline.Bus().SubscribeAll(func(ev events.DomainEvent) {
+		fmt.Fprintln(os.Stderr, app.StatusLine(ev))
 	})
-	defer unsub()
+	defer unsub.Cancel()
 
 	res, runErr := pipeline.Run(ctx, app.Request{Intent: prompt, Targets: targets})
 
@@ -248,12 +248,12 @@ func runRuntimeCommand(args []string) error {
 
 		var started, completed, failed int
 		for _, e := range res.Events {
-			switch e.Type {
-			case event.TypeTaskStarted:
+			switch e.Type() {
+			case events.EventTaskStarted:
 				started++
-			case event.TypeTaskCompleted:
+			case events.EventTaskCompleted:
 				completed++
-			case event.TypeTaskFailed:
+			case events.EventTaskFailed:
 				failed++
 			}
 		}

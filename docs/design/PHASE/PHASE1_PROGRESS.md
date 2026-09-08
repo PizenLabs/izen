@@ -48,7 +48,7 @@ preserved verbatim (mode engines → direct provider → PatchManager).
 | 5 — bounded evidence | done | autonomy evidence ledger is the authoritative model contract; full-file context is supporting/bounded |
 | 6 — autonomy handoff | done | `targetConfidence` preserved on `Trace`; intent/confidence/scope flow into `ExecutionProof` |
 | 7 — retire shadows | **deferred to Phase 3** | legacy paths are the flag-off rollback boundary; one-way deletion happens only after the flag is the default and soaked |
-| 8 — canonical events | done (executor path) | executor emits the lifecycle stream; UI subscribes; E2E test asserts the full event sequence. `pkg/event` documented as a separate product; audit collision left as Phase 3 (guardrail reads the log) |
+| 8 — canonical events | done (executor path) | executor emits the lifecycle stream; UI subscribes; E2E test asserts the full event sequence. `internal/events` documented as a separate product; audit collision left as Phase 3 (guardrail reads the log) |
 
 ## Definition-of-Done gaps (deliberate)
 

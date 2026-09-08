@@ -22,7 +22,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/PizenLabs/izen/pkg/runtime/ui/decision"
+	"github.com/PizenLabs/izen/internal/runtime/v3/ui/decision"
 )
 
 var optionIndexPrefix = regexp.MustCompile(`^\s*\[\d+\]\s*`)

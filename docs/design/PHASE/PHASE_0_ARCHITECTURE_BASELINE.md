@@ -12,7 +12,7 @@
 The interactive TUI (`izen`) runs one real execution stack: **autonomy decides → legacy UI mode engines execute → direct provider calls → `m.execEng.Patches.ApplyContext` → `os.WriteFile`**. Two competing stacks are fully built and wired but never execute in the TUI:
 
 1. **RuntimeExecutor** (`internal/execution/executor.go`) — the declared "single execution authority" (compose.go:132-142) — is reachable only via `runGatedLine`/`runPromptExecution`/`runHotExecution`, all gated on `m.autonomy == nil`. Autonomy is always wired (compose.go:642, program.go:188). **Dormant.**
-2. **`izen run`** (`cmd/izen/runtime.go`) — a parallel `pkg/app` lineage. **Separate product stack.**
+2. **`izen run`** (`cmd/izen/runtime.go`) — a parallel `internal/app/v3` lineage. **Separate product stack.**
 
 The production mutation path has **no verification gate** (PatchManager.verifier is nil) and emits **no canonical runtime lifecycle events**. The target invariant for Phase 1:
 
@@ -162,8 +162,8 @@ program.go:312-348 — subscribes to all 7 mode-engine types + the full canonica
 
 ### Event bus (3 parallel)
 - `internal/events.Bus` (42+ types) — canonical, TUI + engines
-- `pkg/event.MemoryEventBus` (7 types) — `izen run` only
-- `pkg/engine/telemetry.EventBus` (8 types) — bridged one-way into domain bus (compose.go:509)
+- `internal/events.MemoryEventBus` (7 types) — `izen run` only
+- `internal/engine/v3/telemetry.EventBus` (8 types) — bridged one-way into domain bus (compose.go:509)
 
 ---
 
@@ -279,5 +279,5 @@ program.go:312-348 — subscribes to all 7 mode-engine types + the full canonica
 |---|---|---|---|---|---|
 | Legacy UI + execution.Engine | handleInput | no | no | PatchManager.Apply | **YES** |
 | RuntimeExecutor | gateway gated path | yes | yes | own PatchManager + MutationSet | no (autonomy always wired) |
-| `izen run` pkg/app | cmd/izen/runtime.go | pkg/event only | capability validator | TxFS | separate product |
+| `izen run` internal/app/v3 | cmd/izen/runtime.go | internal/events only | capability validator | TxFS | separate product |
 | LEA layered engine | compose.go:508 | bridged telemetry | layer4 (review) | none | dormant executor |
