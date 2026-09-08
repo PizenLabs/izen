@@ -7,9 +7,9 @@ import (
 
 	stdctx "context"
 
-	"github.com/PizenLabs/izen/internal/engine/v3/intent"
-	eplan "github.com/PizenLabs/izen/internal/engine/v3/plan"
-	"github.com/PizenLabs/izen/internal/engine/v3/strategy"
+	"github.com/PizenLabs/izen/internal/engine/intent"
+	eplan "github.com/PizenLabs/izen/internal/engine/plan"
+	"github.com/PizenLabs/izen/internal/engine/strategy"
 )
 
 // greenfieldPrompt is the verification prompt: a greenfield static website

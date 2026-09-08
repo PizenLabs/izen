@@ -31,9 +31,11 @@ import (
 	"go/ast"
 	"go/token"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -554,6 +556,34 @@ func TestPhase3CreationIntentCommitsWhenUncontended(t *testing.T) {
 	}
 }
 
+// p3AtomicWriteTarget performs one hostile out-of-band write as an atomic
+// temp+rename replacement. The hostile writer must never be the SOURCE of a
+// partial-state artifact: an in-place os.WriteFile overlapping the executor's
+// own apply write could interleave bytes and manufacture a mixed file that is
+// a harness artifact, not an OCC gate property. rename(2) replacement keeps
+// every writer landing state complete by construction, so a PARTIAL final
+// state can only mean the OCC gate leaked — the invariant this suite pins.
+func p3AtomicWriteTarget(root, name, content string) {
+	target := filepath.Join(root, name)
+	tmp := target + ".p3writer.tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	_ = os.Rename(tmp, target)
+}
+
+// p3WriterYield paces writer retries with an explicit jittered backoff. A
+// zero-delay hot loop is a timing hazard under -race: back-to-back write
+// retries starve the Approve path and collide with the executor's in-place
+// apply write byte-for-byte. The bounded jitter keeps MANY hostile writes
+// landing inside the execute→approve window (both sides of the gate are still
+// exercised on every iteration) while decoupling the writer's cadence from the
+// apply window. Returns nothing; used by the hostile-writer goroutine.
+func p3WriterYield() {
+	time.Sleep(time.Duration(20+rand.Int63n(80)) * time.Microsecond)
+}
+
 // ── behavioral: concurrency ────────────────────────────────────────────────
 
 // TestPhase3ConcurrentOutBandWriterNeverPersistsPartialState races a hostile
@@ -561,7 +591,10 @@ func TestPhase3CreationIntentCommitsWhenUncontended(t *testing.T) {
 // interleavings land on both sides of the gate. The invariant under test: the
 // final workspace is ALWAYS a complete state — either the executor's full
 // committed truth or the writer's content — NEVER a partial mix, and every
-// conflicted attempt terminates as tainted ABORTED_OCC evidence.
+// conflicted attempt terminates as tainted ABORTED_OCC evidence. The writer
+// is stopped via an atomic flag (no rendezvous channel) and its retries are
+// paced by p3WriterYield's jittered backoff so the race stays live without
+// manufacturing harness-level partial writes.
 func TestPhase3ConcurrentOutBandWriterNeverPersistsPartialState(t *testing.T) {
 	for i := 0; i < 12; i++ {
 		root := t.TempDir()
@@ -573,23 +606,23 @@ func TestPhase3ConcurrentOutBandWriterNeverPersistsPartialState(t *testing.T) {
 			t.Fatalf("iteration %d execute: %v / pending=%q", i, err, res.PendingPatchID)
 		}
 
-		stop := make(chan struct{})
+		stop := atomic.Bool{} // atomic stop flag (no un-buffered rendezvous
+		// channel: channel shutdown couples to scheduler timing under -race)
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for {
-				select {
-				case <-stop:
+				if stop.Load() {
 					return
-				default:
-					_ = os.WriteFile(filepath.Join(root, lockTargetFile), []byte(p3ExternalEdit), 0o644)
 				}
+				p3AtomicWriteTarget(root, lockTargetFile, p3ExternalEdit)
+				p3WriterYield()
 			}
 		}()
 
 		approveRes, approveErr := x.Approve(context.Background(), res.PendingPatchID)
-		close(stop)
+		stop.Store(true)
 		wg.Wait()
 
 		got := lockReadTarget(t, root)

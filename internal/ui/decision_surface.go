@@ -8,8 +8,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/providers/capability"
-	"github.com/PizenLabs/izen/internal/runtime/v3/preflight"
-	"github.com/PizenLabs/izen/internal/runtime/v3/ui/decision"
+	"github.com/PizenLabs/izen/internal/runtime/preflight"
+	"github.com/PizenLabs/izen/internal/runtime/ui/decision"
 )
 
 // DecisionSurfaceAdapter is the TUI Adapter that bridges pkg/runtime/ domain

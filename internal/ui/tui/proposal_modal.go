@@ -28,8 +28,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/PizenLabs/izen/internal/runtime/v3/preflight"
-	"github.com/PizenLabs/izen/internal/runtime/v3/ui/decision"
+	"github.com/PizenLabs/izen/internal/runtime/preflight"
+	"github.com/PizenLabs/izen/internal/runtime/ui/decision"
 )
 
 // ProposalIntent is the typed, closed vocabulary of a human-selected proposal

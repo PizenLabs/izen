@@ -23,7 +23,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/runtime"
-	"github.com/PizenLabs/izen/internal/runtime/v3/target"
+	"github.com/PizenLabs/izen/internal/runtime/target"
 	"github.com/PizenLabs/izen/internal/telemetry"
 )
 

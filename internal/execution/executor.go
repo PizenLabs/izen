@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
-	"github.com/PizenLabs/izen/internal/capability/v3/policy"
+	"github.com/PizenLabs/izen/internal/capability/policy"
 	"github.com/PizenLabs/izen/internal/changeset"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/core/authorization"

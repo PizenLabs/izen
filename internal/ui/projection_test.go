@@ -6,7 +6,7 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/PizenLabs/izen/internal/engine/v3/ir"
+	"github.com/PizenLabs/izen/internal/engine/ir"
 )
 
 func mustAddNode(t *testing.T, g *ir.ExecutionGraph, id string, kind ir.NodeKind, desc string, deps ...string) {

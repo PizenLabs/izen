@@ -11,7 +11,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/cli"
 	"github.com/PizenLabs/izen/internal/config"
-	"github.com/PizenLabs/izen/internal/runtime/v3/orchestrator"
+	"github.com/PizenLabs/izen/internal/runtime/orchestrator"
 )
 
 // orchestrateUsage describes the `izen orchestrate` subcommand.

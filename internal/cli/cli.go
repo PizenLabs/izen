@@ -23,15 +23,15 @@ import (
 
 	"github.com/PizenLabs/izen/internal/presentation/diff"
 	"github.com/PizenLabs/izen/internal/providers/capability"
-	"github.com/PizenLabs/izen/internal/runtime/v3/authorization"
-	runtimectx "github.com/PizenLabs/izen/internal/runtime/v3/context"
-	"github.com/PizenLabs/izen/internal/runtime/v3/executor"
-	"github.com/PizenLabs/izen/internal/runtime/v3/gate"
-	"github.com/PizenLabs/izen/internal/runtime/v3/harness"
-	"github.com/PizenLabs/izen/internal/runtime/v3/orchestrator"
-	"github.com/PizenLabs/izen/internal/runtime/v3/preflight"
-	"github.com/PizenLabs/izen/internal/runtime/v3/target"
-	"github.com/PizenLabs/izen/internal/runtime/v3/ui/decision"
+	"github.com/PizenLabs/izen/internal/runtime/authorization"
+	runtimectx "github.com/PizenLabs/izen/internal/runtime/context"
+	"github.com/PizenLabs/izen/internal/runtime/executor"
+	"github.com/PizenLabs/izen/internal/runtime/gate"
+	"github.com/PizenLabs/izen/internal/runtime/harness"
+	"github.com/PizenLabs/izen/internal/runtime/orchestrator"
+	"github.com/PizenLabs/izen/internal/runtime/preflight"
+	"github.com/PizenLabs/izen/internal/runtime/target"
+	"github.com/PizenLabs/izen/internal/runtime/ui/decision"
 )
 
 // DefaultTokenBudget is the default context token budget applied by Stack.Run.
@@ -292,7 +292,7 @@ func approvalEventForInput(epoch authorization.InteractionEpoch, line string) au
 type Stack struct {
 	Preflight    *preflight.PreflightEngine
 	Validator    *executor.ProposalValidator
-	Executor     *executor.RuntimeExecutor
+	Executor     *executor.FileExecutor
 	Gate         *authorization.ApprovalGate
 	Provider     *ProposalProviderCLI
 	Bridge       *TerminalBridge

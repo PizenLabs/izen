@@ -6,9 +6,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/PizenLabs/izen/internal/engine/v3/inference"
-	ir "github.com/PizenLabs/izen/internal/engine/v3/ir/logical"
-	"github.com/PizenLabs/izen/internal/engine/v3/lowerer"
+	"github.com/PizenLabs/izen/internal/engine/inference"
+	ir "github.com/PizenLabs/izen/internal/engine/ir/logical"
+	"github.com/PizenLabs/izen/internal/engine/lowerer"
 )
 
 // runExplainDecisionCmd is the /explain-decision evidence inspector. It

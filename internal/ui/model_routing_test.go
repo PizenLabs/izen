@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/config"
-	"github.com/PizenLabs/izen/internal/engine/v3/pipeline"
+	"github.com/PizenLabs/izen/internal/engine/pipeline"
 	"github.com/PizenLabs/izen/internal/modes"
 )
 

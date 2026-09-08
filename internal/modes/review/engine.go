@@ -10,8 +10,8 @@ import (
 
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 
-	"github.com/PizenLabs/izen/internal/engine/v3/layer3"
-	"github.com/PizenLabs/izen/internal/engine/v3/pipeline"
+	"github.com/PizenLabs/izen/internal/engine/layer3"
+	"github.com/PizenLabs/izen/internal/engine/pipeline"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes"
